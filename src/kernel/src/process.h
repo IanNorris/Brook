@@ -344,6 +344,7 @@ struct Process
     uint32_t kernelRegionDepth;
     bool kernelOperationProtected;
     bool terminalPending;
+    bool interruptibleWait; // readyLock: registered wait may unwind on terminalPending
     int pendingWaitStatus;
 
     // Mutex wait-queue linkage (used by KMutex when process is blocked on a lock)
@@ -368,12 +369,6 @@ struct Process
     // ELF binary info is task-local; mappings and allocation cursors belong to AS.
     ElfBinary elf;
     uint64_t initialEntry;
-    static constexpr uint32_t MAX_MEMFD_MAPS = AddressSpaceState::MAX_MEMFD_MAPS;
-    static constexpr uint32_t MAX_FILE_MAPS = AddressSpaceState::MAX_FILE_MAPS;
-    static constexpr uint32_t MAX_FB_MAPS = AddressSpaceState::MAX_FB_MAPS;
-    using MemFdMap = AddressSpaceState::MemFdMap;
-    using FileMap = AddressSpaceState::FileMap;
-    using FbMap = AddressSpaceState::FbMap;
     // Per-thread transient fault backing; never inherited by fork/clone.
     Vnode* activeFileFaultVnode;
 
@@ -395,6 +390,8 @@ struct Process
     // Per-process virtual framebuffer (for compositor)
     // When non-null, fb mmap maps this buffer instead of the physical FB.
     uint32_t* fbVirtual;        // Kernel-mapped virtual framebuffer
+    MappingBacking* fbBacking; // retained immutable source snapshot
+    KMutex framebufferLock; // source lifetime/geometry, independent of exec AS replacement
     uint32_t  fbVirtualSize;    // Size in bytes
     uint32_t  fbVfbWidth;       // VFB width in pixels
     uint32_t  fbVfbHeight;      // VFB height in pixels

@@ -3311,6 +3311,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  mem             - memory statistics (PMM + heap summary)\n"
             "  mem heap        - detailed heap block breakdown\n"
             "  heap poison on|off - runtime alloc/free poison (default off)\n"
+            "  heap timing on|off|reset|status - allocator raw-cycle counters (default off)\n"
             "  heap check      - validate heap block metadata\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
             "  uptime          - system uptime + wall clock\n"
@@ -3517,6 +3518,16 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         bool enable = NetStrEq(cmd, "heap poison on");
         HeapSetPoison(enable);
         DebugChannelSend(enable ? "heap poison: on\n" : "heap poison: off\n");
+    }
+    else if (NetStrEq(cmd, "heap timing") || NetStrEq(cmd, "heap timing status") ||
+             NetStrEq(cmd, "heap timing on") || NetStrEq(cmd, "heap timing off") ||
+             NetStrEq(cmd, "heap timing reset")) {
+        if (NetStrEq(cmd, "heap timing on")) HeapTimingEnable(true);
+        else if (NetStrEq(cmd, "heap timing off")) HeapTimingEnable(false);
+        else if (NetStrEq(cmd, "heap timing reset")) HeapTimingReset();
+        char report[768];
+        HeapTimingFormat(report, sizeof(report));
+        DebugChannelSend(report);
     }
     else if (NetStrEq(cmd, "heap check")) {
         DebugChannelSend(HeapCheckIntegrity() ? "heap integrity: OK\n" : "heap integrity: CORRUPT\n");

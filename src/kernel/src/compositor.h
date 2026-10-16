@@ -6,6 +6,12 @@ namespace brook {
 
 struct Process;
 struct AddressSpaceState;
+struct CompositorVfbAllocation;
+// Reserve retirement storage before publishing a native VFB. Retiring cannot
+// allocate/fail and waits for compositor epochs without blocking its renderer.
+CompositorVfbAllocation* CompositorPrepareVfbRetirement(uint64_t address,uint64_t pages);
+void CompositorCancelVfbRetirement(CompositorVfbAllocation* item);
+void CompositorRetireVfb(CompositorVfbAllocation* item);
 
 // Initialise the compositor (caches physical FB info).
 // Must be called after TtyInit().

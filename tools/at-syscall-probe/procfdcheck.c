@@ -29,13 +29,15 @@ static void protection_splits(int capacity) {
  char *mapping=mmap(NULL,12288,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
  CHECK(mapping!=MAP_FAILED);if(mapping==MAP_FAILED){close(fd);return;}
  if(capacity){
-  void *fill[300];unsigned count=0;
-  while(count<300){void *p=mmap(NULL,4096,PROT_READ,MAP_SHARED,fd,0);if(p==MAP_FAILED)break;fill[count++]=p;}
-  CHECK(count==255);errno=0;CHECK(mprotect(mapping+4096,4096,PROT_NONE)==-1&&errno==ENOMEM);
+  enum { FILL_COUNT=768 };void *fill[FILL_COUNT];unsigned count=0;
+  // Exercise metadata splits beyond the retired 256-entry table limit.
   mapping[0]='L';mapping[4096]='M';mapping[8192]='R';
-  CHECK(mapping[0]=='L'&&mapping[4096]=='M'&&mapping[8192]=='R');
-  if(count>=2){CHECK(!munmap(fill[--count],4096));errno=0;CHECK(mprotect(mapping+4096,4096,PROT_NONE)==-1&&errno==ENOMEM);CHECK(!munmap(fill[--count],4096));}
+  while(count<FILL_COUNT){void *p=mmap(NULL,4096,PROT_READ,MAP_SHARED,fd,0);if(p==MAP_FAILED)break;fill[count++]=p;}
+  CHECK(count==FILL_COUNT);
+  for(unsigned i=0;i<count;i+=17)CHECK(*(volatile char*)fill[i]=='L');
   CHECK(!mprotect(mapping+4096,4096,PROT_NONE));
+  CHECK(mapping[0]=='L'&&mapping[8192]=='R');
+  printf("PROCFDCHECK dynamic mappings=%u\n",count);
   while(count)CHECK(!munmap(fill[--count],4096));
  }else{
   // Outside pages remain cold until after the middle permission change.

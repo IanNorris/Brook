@@ -24,26 +24,18 @@ struct AddressSpaceState {
     volatile uint64_t tlbCpuMask;
     uint64_t programBreak;
     uint64_t mmapNext;
-    static constexpr uint32_t MAX_MEMFD_MAPS = 256;
-    struct MemFdMap { uint64_t vaddr, length, offset, vmmFlags; void* mfd; uint32_t prot, maxProt; };
-    MemFdMap memfdMaps[MAX_MEMFD_MAPS];
-    static constexpr uint32_t MAX_FILE_MAPS = 4096;
-    struct FileMap { uint64_t vaddr, length, offset, vmmFlags; Vnode* vnode; };
-    FileMap fileMaps[MAX_FILE_MAPS];
-    SpinLock fileMapLock;
-    static constexpr uint32_t MAX_FB_MAPS = 4;
-    struct FbMap { uint64_t vaddr, length; };
-    FbMap fbMaps[MAX_FB_MAPS];
     CompositorVfbAllocation* fbAllocations; // legacy graphics backing owned by this AS
     AddressSpaceState* cleanupNext;
     uint64_t programBreakLow, programBreakHigh; // bounds of this image, independent of leader exec
-    MappingRangeTable ranges; // migration target; legacy writers not switched yet
+    MappingRangeTable ranges; // authoritative mapping extents, permissions and ownership
 };
 
 void AddressSpaceKernelInit();
 AddressSpaceState* AddressSpaceKernel(); // Immortal; initialized before APs/tasks.
 AddressSpaceState* AddressSpaceCreate(uint16_t allocationPid);
 void AddressSpaceRef(AddressSpaceState* space);
+// Raw pointer lifetime must be protected (e.g. file registry lock). Never resurrects zero.
+bool AddressSpaceTryRef(AddressSpaceState* space);
 // Final release queues destruction to process context; never performs FS I/O.
 void AddressSpaceUnref(AddressSpaceState* space);
 // Execute at most one queued finalizer, exclusively from process context.

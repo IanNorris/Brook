@@ -87,7 +87,7 @@ static inline uint64_t IrqSpinLockAcquireImpl(IrqSpinLock* lock,
                                                const char* file, uint32_t line)
 {
     uint64_t flags = 0;
-#ifndef BROOK_HOST_TEST
+#if !defined(BROOK_HOST_TEST) || defined(BROOK_STANDALONE_TEST)
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
 #endif
 
@@ -122,7 +122,7 @@ static inline void IrqSpinLockRelease(IrqSpinLock* lock, uint64_t savedFlags)
 
     __atomic_fetch_add(&lock->serving, 1, __ATOMIC_RELEASE);
 
-#ifndef BROOK_HOST_TEST
+#if !defined(BROOK_HOST_TEST) || defined(BROOK_STANDALONE_TEST)
     if (savedFlags & 0x200)
         __asm__ volatile("sti" ::: "memory");
 #else

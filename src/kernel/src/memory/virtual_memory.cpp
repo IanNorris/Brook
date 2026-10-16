@@ -76,7 +76,7 @@ static VmmAllocation* FindFreeSlot()
 static inline uint64_t ReadCR3()
 {
     uint64_t cr3;
-#ifdef BROOK_HOST_TEST
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
     cr3 = 0;
 #else
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
@@ -86,7 +86,7 @@ static inline uint64_t ReadCR3()
 
 static inline void Invlpg(VirtualAddress virtAddr)
 {
-#ifdef BROOK_HOST_TEST
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
     (void)virtAddr;
 #else
     __asm__ volatile("invlpg (%0)" : : "r"(virtAddr.raw()) : "memory");
@@ -304,12 +304,12 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
     // BRO-176 map accounting: if we are REPLACING a present USER PTE, drop the
     // old frame's mapcount first (this VA no longer maps it).
     uint64_t oldPte = *pte;
-    if ((oldPte & VMM_PRESENT) && (oldPte & VMM_USER))
+    if (VmmLeafBacked(oldPte) && (oldPte & VMM_USER))
         PmmMapDec(PhysicalAddress(oldPte & PHYS_MASK));
 
     *pte = (physAddr.raw() & PHYS_MASK)
          | VMM_PRESENT
-         | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_COW_BIT | PTE_PID_MASK | VMM_NO_EXEC))
+         | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_COW_BIT | PTE_PID_MASK | VMM_NO_EXEC | PTE_HIDDEN_BIT))
          | (((uint64_t)(uint8_t)tag & 0x7) << PTE_TAG_SHIFT)
          | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT)
          | (flags & VMM_NO_EXEC);
@@ -325,8 +325,10 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
 
 VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
                            PhysicalAddress physAddr, uint64_t flags,
-                           MemTag tag, uint16_t pid)
+                           MemTag tag, uint16_t pid, bool accessible)
 {
+    if ((flags & (PTE_COW_BIT | VMM_WRITABLE)) == (PTE_COW_BIT | VMM_WRITABLE))
+        return VmmMapResult::InvalidAddress;
     if (!(flags & VMM_FORCE_MAP) && virtAddr.raw() < VIRTUAL_NULL_GUARD)
         return VmmMapResult::InvalidAddress;
     flags &= ~VMM_FORCE_MAP;
@@ -336,7 +338,7 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
     // An occupied result must not even promote ancestor USER permissions.
     // Probe without creation before preparing any missing intermediate tables.
     uint64_t* pte = WalkToPtr(pt, virtAddr, false, 0, &large);
-    if (large || (pte && (*pte & VMM_PRESENT))) {
+    if (large || (pte && VmmLeafBacked(*pte))) {
         IrqSpinLockRelease(&lock, saved);
         return VmmMapResult::Occupied;
     }
@@ -346,8 +348,8 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
     VmmMapResult result;
     if (!pte) result = VmmMapResult::OutOfMemory;
     else {
-        *pte = (physAddr.raw() & PHYS_MASK) | VMM_PRESENT
-             | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_COW_BIT | PTE_PID_MASK | VMM_NO_EXEC))
+        *pte = (physAddr.raw() & PHYS_MASK) | (accessible ? VMM_PRESENT : PTE_HIDDEN_BIT)
+             | (flags & ~(VMM_PRESENT | PTE_TAG_MASK | PTE_PID_MASK | VMM_NO_EXEC | PTE_HIDDEN_BIT))
              | (((uint64_t)(uint8_t)tag & 0x7) << PTE_TAG_SHIFT)
              | (((uint64_t)pid & 0x3FF) << PTE_PID_SHIFT)
              | (flags & VMM_NO_EXEC);
@@ -370,10 +372,20 @@ VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
 }
 
 PhysicalAddress VmmLeafPhysical(uint64_t leaf) { return PhysicalAddress(leaf & PHYS_MASK); }
+uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address) {
+    IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
+    uint64_t irq = IrqSpinLockAcquire(&lock);
+    bool large = false;
+    auto* entry = WalkToPtr(pt,address,false,0,&large);
+    uint64_t leaf = !large && entry ? *entry : 0;
+    IrqSpinLockRelease(&lock,irq); return leaf;
+}
 
+using LeafUpdate = uint64_t (*)(VirtualAddress,uint64_t,void*);
 static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
                            uint64_t begin, uint64_t end, bool detach,
-                           VmmRetireLeaf retire, void* context, uint64_t& count)
+                           VmmRetireLeaf retire, void* context, uint64_t& count,
+                           LeafUpdate update = nullptr)
 {
     const unsigned shift = 12 + 9 * (level - 1);
     const uint64_t size = uint64_t{1} << shift;
@@ -382,20 +394,23 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
     if (last > 511) last = 511;
     for (uint64_t i = first; i <= last; ++i) {
         uint64_t leaf = table[i];
-        if (!(leaf & VMM_PRESENT)) continue;
+        if (level == 1 ? !VmmLeafBacked(leaf) : !(leaf & VMM_PRESENT)) continue;
         uint64_t address = base + i*size;
         if (level > 1) {
             if (leaf & (1ULL << 7)) return false;
             auto* child = reinterpret_cast<uint64_t*>(PhysToVirt(VmmLeafPhysical(leaf)).raw());
             const uint64_t low = begin > address ? begin : address;
             const uint64_t high = end < address+size ? end : address+size;
-            if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count)) return false;
+            if (!WalkLeafRange(child,level-1,address,low,high,detach,retire,context,count,update)) return false;
         } else {
             ++count;
             if (detach) {
                 retire(VirtualAddress(address),leaf,context);
                 if (leaf & VMM_USER) PmmMapDec(VmmLeafPhysical(leaf));
                 table[i] = 0; Invlpg(VirtualAddress(address));
+            } else if (update) {
+                const uint64_t updated=update(VirtualAddress(address),leaf,context);
+                if (updated!=leaf) { table[i]=updated;Invlpg(VirtualAddress(address)); }
             }
         }
     }
@@ -403,6 +418,67 @@ static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
 }
 static bool ValidLeafRange(PageTable pt, uint64_t begin, uint64_t end) {
     return pt && begin < end && end <= 0x0000800000000000ULL && !(begin & 4095) && !(end & 4095);
+}
+bool VmmPrepareRange(PageTable pt, uint64_t begin, uint64_t end) {
+    if (!ValidLeafRange(pt,begin,end)) return false;
+    uint64_t irq = IrqSpinLockAcquire(&g_userPtLock);
+    bool result = true;
+    for (uint64_t address = begin; address < end;) {
+        bool large = false;
+        auto* leaf = WalkToPtr(pt,VirtualAddress(address),false,0,&large);
+        if (large || (!leaf && !WalkToPtr(pt,VirtualAddress(address),true,0))) { result = false; break; }
+        address = (address | uint64_t{0x1fffff}) + 1;
+    }
+    IrqSpinLockRelease(&g_userPtLock,irq); return result;
+}
+struct MoveLeaves { PageTable table;uint64_t source,destination;bool prepare,occupied,move,failed; };
+static uint64_t MoveLeaf(VirtualAddress address,uint64_t leaf,void* opaque) {
+    auto& context=*static_cast<MoveLeaves*>(opaque);
+    if (context.failed) return leaf;
+    const VirtualAddress destination(context.destination+address.raw()-context.source);
+    bool large=false;auto* target=WalkToPtr(context.table,destination,false,0,&large);
+    if (!large && !target && context.prepare) target=WalkToPtr(context.table,destination,true,0);
+    if (large || !target || (!context.occupied && VmmLeafBacked(*target))) { context.failed=true;return leaf; }
+    if (!context.move) return leaf;
+    *target=leaf;
+    if (leaf & VMM_USER) {
+        auto* table=reinterpret_cast<uint64_t*>(PhysToVirt(context.table.pml4).raw());
+        const uint64_t indices[]={Pml4Index(destination.raw()),PdptIndex(destination.raw()),PdIndex(destination.raw())};
+        for (uint64_t index:indices) { table[index]|=VMM_USER;table=reinterpret_cast<uint64_t*>(PhysToVirt(VmmLeafPhysical(table[index])).raw()); }
+    }
+    Invlpg(destination);return 0; // transfer the PTE-owned reference, no ref/map-count change
+}
+static bool MoveLeafRange(PageTable pt,uint64_t begin,uint64_t end,uint64_t destination,
+                           bool prepare,bool occupied,bool move) {
+    if (!ValidLeafRange(pt,begin,end) || !ValidLeafRange(pt,destination,destination+(end-begin)) ||
+        (destination<end && begin<destination+(end-begin))) return false;
+    uint64_t irq=IrqSpinLockAcquire(&g_userPtLock);
+    auto* table=reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
+    uint64_t count=0;
+    MoveLeaves context{pt,begin,destination,prepare,occupied,false,false};
+    bool result=WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,count);
+    if (result && !occupied) {
+        count=0;
+        result=WalkLeafRange(table,4,0,destination,destination+(end-begin),false,nullptr,nullptr,count) && !count;
+    }
+    if (result) {
+        count=0;
+        result=WalkLeafRange(table,4,0,begin,end,false,nullptr,&context,count,MoveLeaf) && !context.failed;
+    }
+    if (result && move) {
+        context.move=true;count=0;
+        if (!WalkLeafRange(table,4,0,begin,end,false,nullptr,&context,count,MoveLeaf) || context.failed) __builtin_trap();
+    }
+    IrqSpinLockRelease(&g_userPtLock,irq);return result;
+}
+bool VmmPrepareMove(PageTable pt,uint64_t begin,uint64_t end,uint64_t destination) {
+    return MoveLeafRange(pt,begin,end,destination,true,true,false);
+}
+bool VmmCanMoveRange(PageTable pt,uint64_t begin,uint64_t end,uint64_t destination,bool occupiedDestination) {
+    return MoveLeafRange(pt,begin,end,destination,false,occupiedDestination,false);
+}
+bool VmmMoveRange(PageTable pt,uint64_t begin,uint64_t end,uint64_t destination) {
+    return MoveLeafRange(pt,begin,end,destination,false,false,true);
 }
 bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* count)
 {
@@ -432,13 +508,40 @@ bool VmmDetachRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t capacit
     IrqSpinLockRelease(&g_userPtLock,irq);
     return result;
 }
+struct ProtectLeaves { uint32_t protection; VmmPrivateLeafQuery query; void* context; };
+static uint64_t ProtectLeaf(VirtualAddress address, uint64_t leaf, void* opaque) {
+    auto& update = *static_cast<ProtectLeaves*>(opaque);
+    if (!update.protection) return (leaf & ~VMM_PRESENT) | PTE_HIDDEN_BIT;
+    uint64_t result = (leaf & ~(PTE_HIDDEN_BIT | VMM_WRITABLE | VMM_NO_EXEC | PTE_COW_BIT)) | VMM_PRESENT;
+    if (!(update.protection & 4)) result |= VMM_NO_EXEC;
+    if (update.protection & 2) {
+        bool privatePage = update.query && update.query(address,leaf,update.context);
+        if (privatePage && ((leaf & PTE_COW_BIT) || PmmGetRefCount(VmmLeafPhysical(leaf)) > 1))
+            result |= PTE_COW_BIT;
+        else result = (result & ~PTE_COW_BIT) | VMM_WRITABLE;
+    }
+    return result;
+}
+bool VmmProtectRange(PageTable pt, uint64_t begin, uint64_t end, uint32_t protection,
+                     VmmPrivateLeafQuery query, void* context) {
+    if ((protection & ~7u) || !ValidLeafRange(pt,begin,end)) return false;
+    uint64_t irq = IrqSpinLockAcquire(&g_userPtLock);
+    auto* table = reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
+    uint64_t count = 0; ProtectLeaves update{protection,query,context};
+    bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,count);
+    if (result) {
+        count = 0;
+        if (!WalkLeafRange(table,4,0,begin,end,false,nullptr,&update,count,ProtectLeaf)) __builtin_trap();
+    }
+    IrqSpinLockRelease(&g_userPtLock,irq); return result;
+}
 
 uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr)
 {
     IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
     uint64_t saved = IrqSpinLockAcquire(&lock);
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
-    uint64_t old = pte && (*pte & VMM_PRESENT) ? *pte : 0;
+    uint64_t old = pte && VmmLeafBacked(*pte) ? *pte : 0;
     if (old) {
         if (old & VMM_USER) PmmMapDec(VmmLeafPhysical(old));
         *pte = 0;
@@ -453,7 +556,7 @@ uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalA
     IrqSpinLock& lock = !pt ? g_kernelPtLock : g_userPtLock;
     uint64_t saved = IrqSpinLockAcquire(&lock);
     uint64_t* pte = WalkToPtr(pt, virtAddr, false);
-    uint64_t old = pte && (*pte & VMM_PRESENT) && VmmLeafPhysical(*pte) == expected ? *pte : 0;
+    uint64_t old = pte && VmmLeafBacked(*pte) && VmmLeafPhysical(*pte) == expected ? *pte : 0;
     if (old) {
         if (old & VMM_USER) PmmMapDec(expected);
         *pte = 0;
@@ -787,7 +890,7 @@ VmmCowResolution VmmCowResolveWrite(PageTable pt, VirtualAddress faultAddr, uint
     // unmatched op — rather than thousands of forks later when a child reads the
     // recycled page's poison (SIG1) or a reused page-table page faults reserved-bit
     // (the kernel #PF in VmmGetPte). One PmmGetRefCount call: low perturbation.
-    uint8_t oldRc = PmmGetRefCount(oldPhys);
+    uint32_t oldRc = PmmGetRefCount(oldPhys);
     if (oldRc == 0)
     {
         SerialPrintf("BRO176-COWUAF: COW source phys=0x%lx refcount=0 while "
@@ -994,7 +1097,7 @@ static void FreeTableLevel(PhysicalAddress tablePhys, int level, bool preserveBo
         // Leaf level (PT): unref data pages (handles COW shared pages)
         for (uint64_t i = 0; i < 512; i++)
         {
-            if (!(table[i] & VMM_PRESENT)) continue;
+            if (!VmmLeafBacked(table[i])) continue;
             PhysicalAddress pagePhys(table[i] & PHYS_MASK);
             // BRO-176 map accounting: this process's USER PTE for the frame is
             // being torn down — drop its mapcount in lockstep with the unref so

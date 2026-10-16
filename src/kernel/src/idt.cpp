@@ -17,6 +17,7 @@
 #include "build_info.h"
 #include "tty.h"
 #include "memory/virtual_memory.h"
+#include "memory/user_mapping.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
 #include "string.h"
@@ -226,21 +227,6 @@ static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
 {
     if (!p) return;
 
-    ExcPutsRaw(tag); ExcPutsRaw("  --- BRO-194 addr-space map (CR2=");
-    ExcPutHex(addr); ExcPutsRaw(") ---\n");
-
-    // Arena classification.
-    ExcPutsRaw(tag); ExcPutsRaw("    arena: ");
-    if (addr >= p->stackBase && addr < p->stackTop)            ExcPutsRaw("STACK\n");
-    else if (addr >= p->elf.programBreakLow && addr < p->addressSpace->programBreak) ExcPutsRaw("HEAP/brk\n");
-    else if (addr >= brook::USER_MMAP_BASE && addr < p->addressSpace->mmapNext)  ExcPutsRaw("MMAP-ARENA (below high-water)\n");
-    else if (addr >= brook::USER_MMAP_BASE && addr < brook::USER_MMAP_END) ExcPutsRaw("MMAP-ARENA (ABOVE high-water — never allocated)\n");
-    else                                                       ExcPutsRaw("UNCLASSIFIED (outside heap/stack/mmap)\n");
-    ExcPutsRaw(tag); ExcPutsRaw("    brk=["); ExcPutHex(p->elf.programBreakLow);
-    ExcPutsRaw(".."); ExcPutHex(p->addressSpace->programBreak); ExcPutsRaw(") stack=[");
-    ExcPutHex(p->stackBase); ExcPutsRaw(".."); ExcPutHex(p->stackTop);
-    ExcPutsRaw(") mmapNext="); ExcPutHex(p->addressSpace->mmapNext); ExcPutsRaw("\n");
-
     // Scan a list of {vaddr,length} mappings, tracking: a mapping containing
     // `addr` (sanity), the nearest below (by end), the nearest above (by start),
     // and the mapping containing `rip`.
@@ -258,21 +244,40 @@ static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
         if (rip >= vaddr && rip < end) { ripKind = kind; ripStart = vaddr; ripInode = inode; }
     };
 
-    for (uint32_t i = 0; i < brook::Process::MAX_FILE_MAPS; ++i) {
-        const auto& m = p->addressSpace->fileMaps[i];
-        uint64_t inode = (m.vnode) ? m.vnode->cacheId : 0;
-        consider(m.vaddr, m.length, "file", inode);
+    // Fatal exception context must not sleep or traverse a mutable linked list.
+    // Keep only scalar summaries, then release the lock before serial output.
+    auto* space=p->addressSpace;
+    if (!brook::KMutexTryLock(&space->mutation)) {
+        ExcPutsRaw("  addr-space map unavailable: mutation lock busy\n");return;
     }
-    for (uint32_t i = 0; i < brook::Process::MAX_MEMFD_MAPS; ++i)
-        consider(p->addressSpace->memfdMaps[i].vaddr, p->addressSpace->memfdMaps[i].length, "memfd", 0);
-    for (uint32_t i = 0; i < brook::Process::MAX_FB_MAPS; ++i)
-        consider(p->addressSpace->fbMaps[i].vaddr, p->addressSpace->fbMaps[i].length, "fb", 0);
+    const uint64_t programBreak=space->programBreak,mmapNext=space->mmapNext;
+    const char* kinds[]={"anonymous","file","memfd","device","image","stack","heap"};
+    for (auto* node=space->ranges.head;node;node=node->next) {
+        const auto& range=node->range;unsigned kind=static_cast<unsigned>(range.kind);
+        consider(range.begin,range.end-range.begin,kind<7?kinds[kind]:"unknown",range.identity);
+    }
+    brook::KMutexUnlock(&space->mutation);
+
+    ExcPutsRaw(tag); ExcPutsRaw("  --- BRO-194 addr-space map (CR2=");
+    ExcPutHex(addr); ExcPutsRaw(") ---\n");
+
+    // Arena classification.
+    ExcPutsRaw(tag); ExcPutsRaw("    arena: ");
+    if (addr >= p->stackBase && addr < p->stackTop)            ExcPutsRaw("STACK\n");
+    else if (addr >= p->elf.programBreakLow && addr < programBreak) ExcPutsRaw("HEAP/brk\n");
+    else if (addr >= brook::USER_MMAP_BASE && addr < mmapNext)  ExcPutsRaw("MMAP-ARENA (below high-water)\n");
+    else if (addr >= brook::USER_MMAP_BASE && addr < brook::USER_MMAP_END) ExcPutsRaw("MMAP-ARENA (ABOVE high-water — never allocated)\n");
+    else                                                       ExcPutsRaw("UNCLASSIFIED (outside heap/stack/mmap)\n");
+    ExcPutsRaw(tag); ExcPutsRaw("    brk=["); ExcPutHex(p->elf.programBreakLow);
+    ExcPutsRaw(".."); ExcPutHex(programBreak); ExcPutsRaw(") stack=[");
+    ExcPutHex(p->stackBase); ExcPutsRaw(".."); ExcPutHex(p->stackTop);
+    ExcPutsRaw(") mmapNext="); ExcPutHex(mmapNext); ExcPutsRaw("\n");
 
     if (containKind) {
         ExcPutsRaw(tag); ExcPutsRaw("    CR2 INSIDE a tracked ");
         ExcPutsRaw(containKind); ExcPutsRaw(" map ["); ExcPutHex(containStart);
         ExcPutsRaw(".."); ExcPutHex(containStart + containLen);
-        ExcPutsRaw(") — demand-page/COW gap, not an overrun\n");
+        ExcPutsRaw(") — tracked extent; check mapping permissions and fault flags\n");
     } else {
         ExcPutsRaw(tag); ExcPutsRaw("    CR2 in a HOLE (no tracked file/memfd/fb map covers it)\n");
     }
@@ -294,7 +299,7 @@ static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
     if (ripKind) {
         ExcPutsRaw(" in "); ExcPutsRaw(ripKind); ExcPutsRaw(" map @");
         ExcPutHex(ripStart); ExcPutsRaw(" off="); ExcPutHex(rip - ripStart);
-        ExcPutsRaw(" cacheId="); ExcPutHex(ripInode);
+        ExcPutsRaw(" mappingId="); ExcPutHex(ripInode);
         ExcPutsRaw("\n");
     } else {
         ExcPutsRaw(" (not in any tracked file map)\n");
@@ -938,78 +943,27 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         bool isUserAddr = (cr2cow < 0x0000800000000000ULL);
 
         brook::Process* cowProc = brook::ProcessCurrent();
-        if (pfPresent && pfWrite && isUserAddr && cowProc)
-        {
-            using namespace brook;
-            uint64_t* pte = VmmGetPte(cowProc->addressSpace->pageTable,
-                                      VirtualAddress(cr2cow & ~0xFFFULL));
-            if (pte && (*pte & PTE_COW_BIT))
-            {
-                // Resolve the COW page atomically under g_userPtLock (closes the
-                // refcount TOCTOU / torn-PTE races — BRO-155). The TLB shootdown
-                // is issued here, AFTER the lock is dropped inside the helper,
-                // because it busy-waits for remote IPI ACKs.
-                VmmCowResolution cow = VmmCowResolveWrite(
-                    cowProc->addressSpace->pageTable, VirtualAddress(cr2cow), ProcessAddressSpacePid(cowProc));
-
-                if (cow.result == VmmCowResult::Resolved)
-                {
-                    __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
-                    brook::TlbShootdown(cowProc->addressSpace->pageTable.pml4.raw(),
-                                        cr2cow & ~0xFFFULL,
-                                        *brook::AddressSpaceTlbMaskPtr(cowProc));
-                    if (cow.retired) PmmUnrefPage(cow.retired);
-                    __asm__ volatile("sti");
-                    return;
-                }
-                // OutOfMemory or NotCow (e.g. another CPU resolved it first):
-                // fall through to the safety net / normal fault handling.
+        if (pfPresent && pfWrite && isUserAddr && cowProc) {
+            auto status=brook::UserMappingPageAccess(cowProc,cowProc->addressSpace,cr2cow,2,true);
+            if (fromUser && brook::SchedulerKernelOperationBoundary()) {
+                brook::SchedulerYield();__builtin_trap();
+            }
+            if (status==brook::UserPageAccess::Ready) {
+                __asm__ volatile("invlpg (%0)"::"r"(cr2cow&~0xFFFULL):"memory");
+                __asm__ volatile("sti");return;
             }
         }
 
-        // Safety net: present + write + user page without COW bit.
-        // The PTE is already writable but the CPU has a stale TLB entry
-        // from before a COW resolution. This can happen when multiple
-        // processes share a page table (e.g. fork chain) and another
-        // process resolved the COW first, tagging the PTE with its PID.
-        // Since the PTE is in this process's page table and is already
-        // present+writable+user, an invlpg is always safe.
-        if (pfPresent && pfWrite && isUserAddr && cowProc)
-        {
-            using namespace brook;
-            uint64_t* pte = VmmGetPte(cowProc->addressSpace->pageTable,
-                                       VirtualAddress(cr2cow & ~0xFFFULL));
-            if (pte && (*pte & VMM_PRESENT) && !(*pte & PTE_COW_BIT)
-                && (*pte & VMM_USER) && (*pte & VMM_WRITABLE))
-            {
-                // PTE is already writable — just flush the stale TLB entry
-                __asm__ volatile("invlpg (%0)" :: "r"(cr2cow & ~0xFFFULL) : "memory");
-                __asm__ volatile("sti");
-                return;
-            }
-            // PTE is present+user but NOT writable (and no COW bit) —
-            // this is a genuine protection fault, fall through to kill.
-        }
-
-        // --- MemFd lazy-page-in (user faults only) ---
-        // wl_shm and gdk-wayland MAP_SHARED a memfd; the mapping is recorded
-        // in proc->addressSpace->memfdMaps but no PTEs are installed until first access.
-        // Allocate the backing page via the mfd's index and install the PTE.
+        // Fault transactions finish before the user boundary, including failed
+        // captures. Kernel-origin faults retain their outer operation boundary.
         if (fromUser && !pfPresent && isUserAddr && cowProc) {
-            extern bool MemFdHandleUserFault(uint64_t, uint64_t);
-            if (MemFdHandleUserFault(cr2cow, ef->errorCode)) {
-                __asm__ volatile("sti");
-                return;
+            extern bool MemFdHandleUserFault(uint64_t,uint64_t);
+            extern bool FileMapHandleUserFault(uint64_t,uint64_t);
+            bool resolved=MemFdHandleUserFault(cr2cow,ef->errorCode) || FileMapHandleUserFault(cr2cow,ef->errorCode);
+            if (brook::SchedulerKernelOperationBoundary()) {
+                brook::SchedulerYield();__builtin_trap();
             }
-            extern bool FileMapHandleUserFault(uint64_t, uint64_t);
-            if (FileMapHandleUserFault(cr2cow, ef->errorCode)) {
-                if (brook::SchedulerKernelOperationBoundary()) {
-                    brook::SchedulerYield();
-                    __builtin_trap();
-                }
-                __asm__ volatile("sti");
-                return;
-            }
+            if (resolved) { __asm__ volatile("sti");return; }
         }
 
         // Kernel syscalls still copy some user buffers directly.  Until the
@@ -1556,8 +1510,14 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // BRO-194: classify the faulting user address against every tracked mapping
     // (overrun-past-a-mapping vs wild pointer) for the rare gltron AVX-memcpy
     // crash. Runs once per fatal user fault, before signal delivery / exit.
-    if (vector == 14 && fromUser && cr2 < 0x800000000000ULL)
+    if (vector == 14 && fromUser && cr2 < 0x800000000000ULL) {
         ExcDumpUserAddrSpace(proc, cr2, ef->rip, "");
+        // Even an unsuccessful diagnostic try-lock has completed a kernel
+        // operation. Clear its cancellation latch before signal/crash handling.
+        if (brook::SchedulerKernelOperationBoundary()) {
+            brook::SchedulerYield();__builtin_trap();
+        }
+    }
 
     // BRO-176 diagnostic: on a fatal user fault, sweep the faulting process's
     // entire user page table and look up every mapped frame in the PMM free-log.
@@ -1953,6 +1913,12 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 leader, leader->crashEntry, 128 * 1024,
                 &ctx, sizeof(ctx));
 
+            // Remote stack preparation owns cancellation protection through
+            // publication/retirement. Release its completed-operation latch
+            // before parking, on both construction success and failure.
+            if (brook::SchedulerKernelOperationBoundary()) {
+                brook::SchedulerYield();__builtin_trap();
+            }
             if (wtid) {
                 SerialPrintf("CRASHDUMP: spawned writer tid=%u for pid=%u "
                              "('%s') sig=%d vec=%lu addr=0x%lx\n",

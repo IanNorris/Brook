@@ -28,6 +28,10 @@ void SchedulerRemoveProcess(Process* proc);
 
 // Block the current process. Triggers an immediate reschedule.
 void SchedulerBlock(Process* proc);
+// Current-thread wait with terminal-cancellation wakeup. Caller must unregister
+// its wait records and unwind resources after return, then reach the ordinary
+// kernel-operation boundary. Never use for mutex/ownership-grant waits.
+void SchedulerBlockInterruptible(Process* proc);
 
 // Unblock a process — move it from Blocked back to Ready queue.
 void SchedulerUnblock(Process* proc);

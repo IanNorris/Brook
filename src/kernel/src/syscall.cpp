@@ -21,6 +21,10 @@
 #include "string.h"
 #include "memory/virtual_memory.h"
 #include "memory/mapping_transaction.h"
+#include "memory/file_page_cache.h"
+#include "memory/file_object.h"
+#include "memory/user_mapping.h"
+#include "memory/mapping_fault_test.h"
 #include "memory/physical_memory.h"
 #include "vfs.h"
 #include "ext2_vfs.h"
@@ -54,99 +58,44 @@ extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode);
 // pointers before kernel reads, so a malicious/buggy user program can't
 // fault the kernel.
 // ---------------------------------------------------------------------------
-static bool UserBufferReadable(uint64_t addr, uint64_t len)
-{
-    if (len == 0) return true;
-    // Reject kernel addresses outright.
-    if (addr >= 0x0000800000000000ULL) return false;
-    uint64_t end;
-    if (__builtin_add_overflow(addr, len, &end)) return false;
-    if (end > 0x0000800000000000ULL) return false;
-
-    brook::Process* proc = brook::ProcessCurrent();
-    if (!proc) return false;
-
-    uint64_t first = addr & ~0xFFFULL;
-    uint64_t last  = (end - 1) & ~0xFFFULL;
-    for (uint64_t pg = first; pg <= last; pg += 4096)
-    {
-        if (!brook::VmmVirtToPhys(proc->addressSpace->pageTable, brook::VirtualAddress(pg))) {
-            if (!MemFdHandleUserFault(pg, 0x4) &&
-                !FileMapHandleUserFault(pg, 0x4))
-                return false;
-            if (!brook::VmmVirtToPhys(proc->addressSpace->pageTable, brook::VirtualAddress(pg)))
-                return false;
-        }
+static bool EnsureUserPage(brook::Process* process,uint64_t page,uint32_t access) {
+    using namespace brook;
+    auto result=UserMappingPageAccess(process,process->addressSpace,page,access,true);
+    if (result==UserPageAccess::Missing) {
+        uint64_t error=4|((access&2)?2:0)|((access&4)?16:0);
+        if (!MemFdHandleUserFault(page,error) && !FileMapHandleUserFault(page,error)) return false;
+        result=UserMappingPageAccess(process,process->addressSpace,page,access,true);
     }
+    return result==UserPageAccess::Ready;
+}
+static bool CheckUserBuffer(uint64_t address,uint64_t length,uint32_t access) {
+    if (!length) return true;
+    constexpr uint64_t limit=0x0000800000000000ULL;
+    if (address>=limit || length>limit-address) return false;
+    auto* process=brook::ProcessCurrent();if (!process) return false;
+    const uint64_t end=address+length;
+    for (uint64_t page=address&~uint64_t{4095};page<end;page+=4096)
+        if (!EnsureUserPage(process,page,access)) return false;
     return true;
 }
+static bool UserBufferReadable(uint64_t address,uint64_t length) { return CheckUserBuffer(address,length,1); }
+static bool UserBufferWritable(uint64_t address,uint64_t length) { return CheckUserBuffer(address,length,2); }
 
-static bool UserBufferWritable(uint64_t addr, uint64_t len)
-{
-    if (len == 0) return true;
-    if (addr >= 0x0000800000000000ULL) return false;
-    uint64_t end;
-    if (__builtin_add_overflow(addr, len, &end)) return false;
-    if (end > 0x0000800000000000ULL) return false;
-
-    brook::Process* proc = brook::ProcessCurrent();
-    if (!proc) return false;
-
-    uint64_t first = addr & ~0xFFFULL;
-    uint64_t last  = (end - 1) & ~0xFFFULL;
-    for (uint64_t pg = first; pg <= last; pg += 4096)
-    {
-        uint64_t* pte = brook::VmmGetPte(proc->addressSpace->pageTable, brook::VirtualAddress(pg));
-        if ((!pte || !(*pte & brook::VMM_PRESENT)) &&
-            (MemFdHandleUserFault(pg, 0x6) || FileMapHandleUserFault(pg, 0x6)))
-            pte = brook::VmmGetPte(proc->addressSpace->pageTable, brook::VirtualAddress(pg));
-        // A fork-protected writable page is a valid syscall output buffer.
-        // Resolve COW before checking write permission, just as a user store
-        // would do; genuinely read-only mappings must still fail.
-        if (pte && (*pte & (brook::VMM_PRESENT | brook::VMM_USER | brook::PTE_COW_BIT)) ==
-                   (brook::VMM_PRESENT | brook::VMM_USER | brook::PTE_COW_BIT)) {
-            uint32_t owner = brook::ProcessAddressSpacePid(proc);
-            // Keep displaced-frame ownership on this CPU through shootdown.
-            // There is no blocking I/O here; the CoW PTE update and shootdown
-            // already run with interrupts disabled. Restore the caller's IF
-            // without leaving a kernel-operation latch in a generic validator.
-            uint64_t cowFlags;
-            __asm__ volatile("pushfq; pop %0; cli" : "=r"(cowFlags) :: "memory");
-            auto result = brook::VmmCowResolveWrite(proc->addressSpace->pageTable,
-                                                   brook::VirtualAddress(pg), owner);
-            if (result.result == brook::VmmCowResult::OutOfMemory) {
-                if (cowFlags & 0x200) __asm__ volatile("sti" ::: "memory");
-                return false;
-            }
-            if (result.result == brook::VmmCowResult::Resolved) {
-                __asm__ volatile("invlpg (%0)" :: "r"(pg) : "memory");
-                brook::TlbShootdown(proc->addressSpace->pageTable.pml4.raw(), pg,
-                                   *brook::AddressSpaceTlbMaskPtr(proc));
-                if (result.retired) brook::PmmUnrefPage(result.retired);
-            }
-            if (cowFlags & 0x200) __asm__ volatile("sti" ::: "memory");
-            pte = brook::VmmGetPte(proc->addressSpace->pageTable, brook::VirtualAddress(pg));
+static bool CopyUserCString(uint64_t address,char* out,uint32_t capacity) {
+    if (!out || !capacity) return false;
+    uint32_t copied=0;
+    while (copied<capacity) {
+        uint64_t current;
+        if (__builtin_add_overflow(address,static_cast<uint64_t>(copied),&current)) return false;
+        uint32_t chunk=4096-static_cast<uint32_t>(current&4095);
+        if (chunk>capacity-copied) chunk=capacity-copied;
+        if (!UserBufferReadable(current,chunk)) return false;
+        for (uint32_t i=0;i<chunk;++i) {
+            char value=*reinterpret_cast<const char*>(current+i);
+            out[copied++]=value;if (!value) return true;
         }
-        if (!pte) return false;
-        if ((*pte & (brook::VMM_PRESENT | brook::VMM_USER | brook::VMM_WRITABLE)) !=
-            (brook::VMM_PRESENT | brook::VMM_USER | brook::VMM_WRITABLE))
-            return false;
     }
-    return true;
-}
-
-static bool CopyUserCString(uint64_t addr, char* out, uint32_t outSize)
-{
-    if (!out || outSize == 0) return false;
-    for (uint32_t i = 0; i < outSize; ++i)
-    {
-        if (!UserBufferReadable(addr + i, 1)) return false;
-        char c = *reinterpret_cast<const char*>(addr + i);
-        out[i] = c;
-        if (c == '\0') return true;
-    }
-    out[outSize - 1] = '\0';
-    return false;
+    out[capacity-1]=0;return false;
 }
 
 static bool CopyToUser(uint64_t addr, const void* src, uint64_t len)
@@ -505,11 +454,6 @@ static void WakeProcess(Process* proc)
     SchedulerUnblock(proc);
 }
 
-static Process* MemoryMapOwner(Process* proc)
-{
-    return proc && proc->addressSpace ? proc : nullptr;
-}
-
 // EventFd data structure (used in read/write/poll/close)
 struct EventFdData {
     volatile uint64_t counter;
@@ -770,7 +714,7 @@ static inline void VnodeRef(Vnode* vn)
                      vn, vn->ops, vn->refCount);
         return; // refuse to ref a dead vnode
     }
-    __atomic_fetch_add(&vn->refCount, 1, __ATOMIC_RELEASE);
+    VfsRetain(vn);
 }
 
 // Try to take a reference on a vnode that might be concurrently freed.
@@ -893,47 +837,16 @@ void* DevTtyDeepCopy(void* handle)
     return dst;
 }
 
-// Demand-page a memfd-backed user mapping. Called from the user #PF path
-// in idt.cpp before the kill flow. Returns true if the fault was on a
-// memfd VMA and was successfully resolved (PTE installed).
-extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode)
-{
-    if (errCode & 1) return false;
-    Process* proc = MemoryMapOwner(ProcessCurrent());
-    if (!proc) return false;
-    uint64_t pageVA = cr2 & ~uint64_t{0xFFF};
-
-    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
-        auto& m = proc->addressSpace->memfdMaps[i];
-        if (m.length == 0 || !m.mfd) continue;
-        if (pageVA < m.vaddr || pageVA >= m.vaddr + m.length) continue;
-
-        if (!m.prot || ((errCode & 2) && !(m.prot & 2)) ||
-            ((errCode & 16) && !(m.prot & 4))) return false;
-        auto* mfd = static_cast<MemFdData*>(m.mfd);
-        uint64_t offsetInVma = pageVA - m.vaddr;
-        uint64_t mfdOffset = m.offset + offsetInVma;
-        uint64_t pageIdx = mfdOffset / 4096;
-        if (mfdOffset >= __atomic_load_n(&mfd->size, __ATOMIC_ACQUIRE)) return false;
-
-        PhysicalAddress phys = MemFdGetOrAllocPage(mfd, pageIdx, proc->pid);
-        if (!phys) return false;
-
-        // Install a writable user PTE. We don't tag with PTE_TAG/PTE_PID
-        // ownership bits because the page is owned by the mfd's pageMap,
-        // not by this process's page table — VmmDestroyUserPageTable must
-        // not free it. process.cpp::ProcessDestroy explicitly VmmUnmapPage's
-        // every memfd VMA before destroying the page table, which clears
-        // these PTEs and prevents the unref-on-destroy walk from touching
-        // mfd-owned pages.
-        if (VmmTryMapPage(proc->addressSpace->pageTable, VirtualAddress(pageVA), phys,
-                        VMM_PRESENT | m.vmmFlags,
-                        MemTag::User, ProcessAddressSpacePid(proc)) != VmmMapResult::Mapped) {
-            return static_cast<bool>(VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(pageVA)));
-        }
-        return true;
-    }
-    return false;
+struct FileMappingBacking {
+    Vnode* vnode;
+    uint64_t size;
+    bool pinned;
+};
+// Historical fault entrypoints share one resolver: the mapping's backing kind
+// may change while preparation sleeps, so retries must dispatch afresh.
+static bool ResolveMappingFault(uint64_t address,uint64_t error);
+extern "C" bool MemFdHandleUserFault(uint64_t address,uint64_t error) {
+    return ResolveMappingFault(address,error);
 }
 
 // ---------------------------------------------------------------------------
@@ -942,73 +855,6 @@ extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode)
 // Used by demand-paged MAP_PRIVATE file mappings to share identical read-only
 // pages across processes and enable 64KB read-ahead batches.
 // ---------------------------------------------------------------------------
-
-struct PageCacheEntry {
-    uint64_t        cacheId;     // file identity (0 = empty slot)
-    uint64_t        pageIndex;   // file offset / 4096
-    PhysicalAddress phys;        // cached physical page
-    Vnode*          vnode;       // vnode holding a ref (lifecycle only, not used as key)
-};
-
-static constexpr uint32_t PAGE_CACHE_SLOTS = 65536;
-static PageCacheEntry g_pageCache[PAGE_CACHE_SLOTS];
-static SpinLock g_pageCacheLock;
-
-static inline uint32_t PageCacheHash(uint64_t cacheId, uint64_t pageIdx)
-{
-    uint64_t key = cacheId ^ (pageIdx * 2654435761ULL);
-    return static_cast<uint32_t>(key % PAGE_CACHE_SLOTS);
-}
-
-// Look up a cached page by file identity. Returns valid PhysicalAddress if found (bumps refcount).
-static PhysicalAddress PageCacheLookup(Vnode* vn, uint64_t pageIdx)
-{
-    uint64_t cid = vn->cacheId;
-    if (!cid) return PhysicalAddress(0); // no cache identity
-    SpinLockAcquire(&g_pageCacheLock);
-    uint32_t slot = PageCacheHash(cid, pageIdx);
-    for (uint32_t i = 0; i < 32; ++i) {
-        uint32_t s = (slot + i) % PAGE_CACHE_SLOTS;
-        auto& e = g_pageCache[s];
-        if (e.cacheId == cid && e.pageIndex == pageIdx) {
-            PmmRefPage(e.phys);
-            SpinLockRelease(&g_pageCacheLock);
-            return e.phys;
-        }
-        if (!e.cacheId) break;
-    }
-    SpinLockRelease(&g_pageCacheLock);
-    return PhysicalAddress(0);
-}
-
-// Insert a page into the cache. Caller transfers ownership of one ref to the cache.
-static void PageCacheInsert(Vnode* vn, uint64_t pageIdx, PhysicalAddress phys)
-{
-    uint64_t cid = vn->cacheId;
-    if (!cid) { PmmUnrefPage(phys); return; } // no cache identity
-    SpinLockAcquire(&g_pageCacheLock);
-    uint32_t slot = PageCacheHash(cid, pageIdx);
-    for (uint32_t i = 0; i < 32; ++i) {
-        uint32_t s = (slot + i) % PAGE_CACHE_SLOTS;
-        auto& e = g_pageCache[s];
-        if (!e.cacheId) {
-            VnodeRef(vn);
-            e.cacheId = cid;
-            e.vnode = vn;
-            e.pageIndex = pageIdx;
-            e.phys = phys;
-            SpinLockRelease(&g_pageCacheLock);
-            return;
-        }
-        if (e.cacheId == cid && e.pageIndex == pageIdx) {
-            SpinLockRelease(&g_pageCacheLock);
-            PmmUnrefPage(phys);
-            return;
-        }
-    }
-    SpinLockRelease(&g_pageCacheLock);
-    PmmUnrefPage(phys);
-}
 
 // Preload file pages into the cache in bulk.
 // Reads directly into physical pages via 64KB VfsRead chunks, avoiding a
@@ -1031,7 +877,7 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
         maxPages = static_cast<uint32_t>(maxFilePages - startPageIdx);
 
     // Fast check: if first page is already cached, entire file likely is
-    PhysicalAddress probe = PageCacheLookup(vn, startPageIdx);
+    PhysicalAddress probe = FilePageCacheLookup(vn, startPageIdx);
     if (probe) { PmmUnrefPage(probe); return maxPages; }
 
     // 64KB bounce buffer for disk reads
@@ -1072,7 +918,9 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
             } else {
                 __builtin_memset(kp, 0, 4096);
             }
-            PageCacheInsert(vn, startPageIdx + base + i, pages[i]);
+            // Preload needs only the cache's reference, not a caller alias.
+            auto canonical = FilePageCacheAdopt(vn, startPageIdx + base + i, pages[i], false);
+            if (canonical) PmmUnrefPage(canonical);
         }
         totalCached += chunkPages;
     }
@@ -1082,413 +930,91 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
     return totalCached;
 }
 
-// Demand-page a private file-backed mapping.  File VMAs own a Vnode reference,
+// Demand-page the current user mapping. File VMAs own a Vnode reference,
 // so the backing remains valid even after userspace closes the original fd.
 // Uses the global page cache for sharing and 64KB read-ahead.
-extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode)
-{
-    static constexpr uint64_t PF_PRESENT = 0x1;
-    static constexpr uint64_t PF_WRITE   = 0x2;
-
-    if (errCode & PF_PRESENT)
-        return false;
-
-    Process* faultThread = ProcessCurrent();
-    Process* proc = MemoryMapOwner(faultThread);
-    if (!proc || !faultThread) return false;
-    // A thread has one synchronous fault context. Never overwrite ownership
-    // if kernel code unexpectedly tries to recurse through this handler.
-    if (__atomic_load_n(&faultThread->activeFileFaultVnode, __ATOMIC_ACQUIRE)) return false;
-
-    uint64_t pageVA = cr2 & ~uint64_t{0xFFF};
-
-    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
-        auto& m = proc->addressSpace->fileMaps[i];
-        if (m.length == 0) continue;
-        if (pageVA < m.vaddr || pageVA >= m.vaddr + m.length) continue;
-
-        // Hold the fileMapLock to safely load vnode and take a ref.
-        // Unmap clears entries under the same lock, preventing the vnode
-        // from being freed between our load and reference acquisition.
-        SpinLockAcquire(&proc->addressSpace->fileMapLock);
-        Vnode* vn = m.vnode;
-        if (!vn) {
-            SpinLockRelease(&proc->addressSpace->fileMapLock);
-            continue;
+// No metadata pointer survives unlocking. The transaction owns both prepared
+// frames and the immutable backing pin through I/O, validation and retirement.
+static bool ResolveMappingFault(uint64_t address,uint64_t error) {
+    if (error & 1) return false;
+    Process* actor=ProcessCurrent();if (!actor) return false;
+    const uint64_t page=address&~uint64_t{4095};
+    const uint32_t access=(error&2)?2u:((error&16)?4u:1u);
+    for (;;) {
+        MappingTransaction operation(actor,actor->addressSpace);
+        if(!operation.Lock())return false;MappingFaultSnapshot snapshot{};
+        if (!operation.CaptureRange(page,access,snapshot)) return false;
+        // A peer may have resolved this fault or replaced its range while we
+        // prepared I/O. Use the current range and leaf, not the original fault
+        // backend. Returning retries the instruction (including a subsequent
+        // ordinary CoW fault), without publishing any stale prepared page.
+        const uint64_t leaf=VmmReadLeaf(operation.Space()->pageTable,VirtualAddress(page));
+        if (leaf & VMM_PRESENT) {
+            const bool cow=(leaf&PTE_COW_BIT) && snapshot.range.sharing==MappingSharing::Private &&
+                snapshot.range.leafOwnership==MappingLeafOwnership::Managed;
+            return (leaf&VMM_USER) && (!(access&4) || !(leaf&VMM_NO_EXEC)) &&
+                (!(access&2) || (leaf&VMM_WRITABLE) || cow);
         }
-        uint32_t preRef = __atomic_load_n(&vn->refCount, __ATOMIC_ACQUIRE);
-        uintptr_t opsCheck = reinterpret_cast<uintptr_t>(vn->ops);
-        if (opsCheck == 0xdfdfdfdfdfdfdfdfULL || preRef == 0) {
-            SpinLockRelease(&proc->addressSpace->fileMapLock);
-            SerialPrintf("BUG: FileMapHandleUserFault got stale vnode %p "
-                         "refCount_was=%u pid=%u i=%u\n",
-                         vn, preRef, proc->pid, i);
-            return false;
-        }
-        VnodeRef(vn);
-        VfsFileMapClone(vn);
-        // Publish before releasing the mapping lock or reaching blocking I/O.
-        // Kernel execution is not timer-preemptible; teardown cannot run until
-        // this thread is off CPU. Normal return and cancellation consume the
-        // same ownership slot exactly once, including the vnode reference.
-        __atomic_store_n(&faultThread->activeFileFaultVnode, vn, __ATOMIC_RELEASE);
-        SpinLockRelease(&proc->addressSpace->fileMapLock);
-        struct FaultBackingPin {
-            Process* thread;
-            ~FaultBackingPin() { ProcessReleaseFileFault(thread); }
-        } backingPin{faultThread};
-
-        if ((errCode & PF_WRITE) && !(m.vmmFlags & VMM_WRITABLE)) {
-            return false;
-        }
-
-        // Already mapped (race with another thread/CPU)
-        PhysicalAddress existing = VmmVirtToPhys(proc->addressSpace->pageTable,
-                                                  VirtualAddress(pageVA));
-        if (existing) {
-            return true;
-        }
-
-        uint64_t fileOff = m.offset + (pageVA - m.vaddr);
-        uint64_t filePageIdx = fileOff / 4096;
-
-        // Check page cache first (another process may have loaded this page)
-        PhysicalAddress cached = PageCacheLookup(vn, filePageIdx);
-        if (cached) {
-            __atomic_fetch_add(&g_profCacheHit, 1, __ATOMIC_RELAXED);
-            if (VmmTryMapPage(proc->addressSpace->pageTable, VirtualAddress(pageVA), cached,
-                            VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc)) != VmmMapResult::Mapped) {
-                PmmUnrefPage(cached);
-                if (VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(pageVA)))
-                    return true;
-                return false;
-            }
-
-            // Speculative batch: map adjacent cached pages to avoid future
-            // faults.  Only look at pages within this VMA that are already
-            // in the page cache — no I/O, no allocation, just PTE installs.
-            static constexpr uint32_t BATCH_AHEAD = 15;
-            uint64_t mapEnd = m.vaddr + m.length;
-            for (uint32_t b = 1; b <= BATCH_AHEAD; ++b) {
-                uint64_t adjVA = pageVA + b * 4096;
-                if (adjVA >= mapEnd) break;
-                if (VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(adjVA)))
-                    continue; // already mapped
-                uint64_t adjFileIdx = filePageIdx + b;
-                PhysicalAddress adjPhys = PageCacheLookup(vn, adjFileIdx);
-                if (!adjPhys) continue;
-                __atomic_fetch_add(&g_profCacheHit, 1, __ATOMIC_RELAXED);
-                if (VmmTryMapPage(proc->addressSpace->pageTable, VirtualAddress(adjVA), adjPhys,
-                                VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc)) != VmmMapResult::Mapped) {
-                    PmmUnrefPage(adjPhys);
+        const auto kind=snapshot.range.kind;
+        if (kind!=MappingKind::File && kind!=MappingKind::MemFd && kind!=MappingKind::Anonymous &&
+            kind!=MappingKind::Stack && kind!=MappingKind::Heap && kind!=MappingKind::Image) return false;
+        const uint64_t batch=kind==MappingKind::File?16:1;
+        operation.Unlock();
+        if (!operation.Prepare(0,batch,1)) return false;
+        bool cachedPrivate=false;
+        if (!MappingFaultTestBarrier(operation.Space(),page,1)) return false;
+        if (kind==MappingKind::File) {
+            const auto* file=static_cast<FileMappingBacking*>(snapshot.range.backing->object);
+            VnodeStat stat{};if (VfsStat(file->vnode,&stat)) return false;
+            for (uint64_t i=0;i<batch && page+i*4096<snapshot.range.end;++i) {
+                const uint64_t offset=snapshot.range.offset+(page+i*4096-snapshot.range.begin);
+                if (offset>=stat.size) { if (!i) return false; break; }
+                FileObject* object=file->vnode->ops->file_object ? file->vnode->ops->file_object(file->vnode) : nullptr;
+                int pageError=0;bool loaded=false;
+                auto physical=object ? FileObjectGetPage(object,file->vnode,offset/4096,i==0,&pageError,&loaded) :
+                    FilePageCacheLookup(file->vnode,offset/4096);
+                if(object && !physical && (!i || pageError))return false;
+                if (physical) {
+                    __atomic_fetch_add(loaded?&g_profCacheMiss:&g_profCacheHit,1,__ATOMIC_RELAXED);
+                    if (!operation.StagePage(i,physical,true)) { PmmUnrefPage(physical);return false; }
+                } else if (!i) {
+                    __atomic_fetch_add(&g_profCacheMiss,1,__ATOMIC_RELAXED);
+                    physical=PmmAllocPage(MemTag::User,operation.Space()->allocationPid);
+                    if (!physical) return false;
+                    auto* bytes=reinterpret_cast<void*>(PhysToVirt(physical).raw());memset(bytes,0,4096);
+                    uint64_t readOffset=offset;
+                    if (VfsRead(file->vnode,bytes,4096,&readOffset)<0) { PmmUnrefPage(physical);return false; }
+                    // Preparation is cancellation-protected by the transaction.
+                    // Stage the canonical winner only after competing inserts
+                    // converge, rather than retaining an uncached losing frame.
+                    physical=FilePageCacheAdopt(file->vnode,offset/4096,physical,
+                        snapshot.range.sharing==MappingSharing::Private ||
+                        !(snapshot.range.maximumProtection&2));
+                    if (!physical) return false;
+                    if (!operation.StagePage(i,physical,true)) { PmmUnrefPage(physical);return false; }
                 }
             }
-            return true;
-        }
-
-        // Cache miss — demand-page from disk.
-        // Single-page read to avoid large kmalloc inside the fault handler.
-        // The page cache + PageCachePreload at mmap time handle bulk loading.
-        uint64_t missN = __atomic_fetch_add(&g_profCacheMiss, 1, __ATOMIC_RELAXED);
-        if (missN < 20 || (missN % 1000 == 0)) {
-            SerialPrintf("[PROFILE] cache_miss #%lu cacheId=%lu page=%lu\n",
-                         missN, vn->cacheId, filePageIdx);
-        }
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
-        if (!phys) {
-            return false;
-        }
-
-        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        kp = reinterpret_cast<uint8_t*>(
-            reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
-        memset(kp, 0, 4096);
-
-        uint64_t readOff = fileOff;
-        int got = VfsRead(vn, kp, 4096, &readOff);
-        if (got < 0) {
-            PmmFreePage(phys);
-            return false;
-        }
-
-        // Insert into cache (cache adopts one ref) and take extra ref for PTE
-        PmmRefPage(phys);
-        PageCacheInsert(vn, filePageIdx, phys);
-
-        if (VmmTryMapPage(proc->addressSpace->pageTable, VirtualAddress(pageVA), phys,
-                        VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc)) != VmmMapResult::Mapped) {
-            if (VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(pageVA))) {
-                PmmUnrefPage(phys);
-                return true;
-            }
-            PmmUnrefPage(phys);
-            return false;
-        }
+            cachedPrivate=snapshot.range.sharing==MappingSharing::Private;
+        } else if (kind==MappingKind::MemFd) {
+            auto* backing=static_cast<MemFdData*>(snapshot.range.backing->object);
+            const uint64_t offset=snapshot.range.offset+page-snapshot.range.begin;
+            if (offset>=__atomic_load_n(&backing->size,__ATOMIC_ACQUIRE)) return false;
+            auto physical=MemFdGetOrAllocPage(backing,offset/4096,actor->pid);
+            if (!physical || !operation.StagePage(0,physical,false)) return false;
+        } else if (!operation.PrepareZeroed(MemTag::User,operation.Space()->allocationPid)) return false;
+        if (!MappingFaultTestBarrier(operation.Space(),page,2)) return false;
+        if(!operation.Lock())return false;
+        if (!operation.ValidateRange(snapshot,page,access)) continue;
+        auto result=operation.PublishFault(snapshot,0,VirtualAddress(page),access,cachedPrivate);
+        if (result==MappingFaultCommit::Stale) continue;
+        if (result==MappingFaultCommit::Failed) return false;
+        for (uint64_t i=1;i<batch;++i)
+            if (operation.PreparedPage(i)) (void)operation.PublishFault(snapshot,i,VirtualAddress(page+i*4096),access,cachedPrivate);
         return true;
     }
-    return false;
 }
-
-// Metadata-only preflight; no references or permissions change on exhaustion.
-static bool MemFdMapsCapacity(Process* proc, uint64_t addr, uint64_t length, bool protect)
-{
-    uint64_t end = addr + length;
-    uint32_t free = 0, needed = 0;
-    for (const auto& m : proc->addressSpace->memfdMaps) {
-        if (!m.length) { ++free; continue; }
-        uint64_t begin = addr > m.vaddr ? addr : m.vaddr;
-        uint64_t stop = end < m.vaddr + m.length ? end : m.vaddr + m.length;
-        if (begin >= stop) continue;
-        if (protect) needed += (begin > m.vaddr) + (stop < m.vaddr + m.length);
-        else if (begin > m.vaddr && stop < m.vaddr + m.length) ++needed;
-    }
-    return needed <= free;
-}
-
-static bool MemFdMapAppend(Process* proc, const Process::MemFdMap& source,
-                            uint64_t begin, uint64_t end)
-{
-    for (auto& slot : proc->addressSpace->memfdMaps) {
-        if (slot.length) continue;
-        slot = source;
-        slot.vaddr = begin;
-        slot.offset += begin - source.vaddr;
-        slot.length = end - begin;
-        MemFdRef(static_cast<MemFdData*>(slot.mfd));
-        return true;
-    }
-    return false;
-}
-
-static bool MemFdMapsProtect(Process* proc, uint64_t addr, uint64_t length,
-                              uint64_t flags, uint32_t prot)
-{
-    uint64_t end = addr + length;
-    SpinLockAcquire(&proc->addressSpace->fileMapLock);
-    if (!MemFdMapsCapacity(proc, addr, length, true)) {
-        SpinLockRelease(&proc->addressSpace->fileMapLock);
-        return false;
-    }
-    for (auto& m : proc->addressSpace->memfdMaps) {
-        if (!m.length) continue;
-        uint64_t begin = addr > m.vaddr ? addr : m.vaddr;
-        uint64_t stop = end < m.vaddr + m.length ? end : m.vaddr + m.length;
-        if (begin >= stop) continue;
-        if (prot & ~m.maxProt) {
-            SpinLockRelease(&proc->addressSpace->fileMapLock);
-            return false;
-        }
-        Process::MemFdMap original = m;
-        // Keep this slot as the changed middle; side fragments retain both
-        // original permissions and their own backing-object references.
-        if (begin > original.vaddr && !MemFdMapAppend(proc, original, original.vaddr, begin)) {
-            SpinLockRelease(&proc->addressSpace->fileMapLock);
-            return false;
-        }
-        if (stop < original.vaddr + original.length &&
-            !MemFdMapAppend(proc, original, stop, original.vaddr + original.length)) {
-            SpinLockRelease(&proc->addressSpace->fileMapLock);
-            return false;
-        }
-        m.vaddr = begin;
-        m.offset = original.offset + begin - original.vaddr;
-        m.length = stop - begin;
-        m.vmmFlags = flags;
-        m.prot = prot;
-    }
-    SpinLockRelease(&proc->addressSpace->fileMapLock);
-    return true;
-}
-
-// Removed objects remain retained until old PTEs and remote translations are
-// gone. Returned references are consumed by the caller after its shootdown.
-struct MemFdRemovedRange { uint64_t begin, end; };
-static bool MemFdMapsRemove(Process* proc, uint64_t addr, uint64_t length,
-                            MemFdData** retired, uint32_t* retiredCount,
-                            MemFdRemovedRange* ranges, uint32_t* rangeCount)
-{
-    uint32_t count = 0;
-    *rangeCount = 0;
-    uint64_t end = addr + length;
-    SpinLockAcquire(&proc->addressSpace->fileMapLock);
-    if (!MemFdMapsCapacity(proc, addr, length, false)) {
-        SpinLockRelease(&proc->addressSpace->fileMapLock);
-        return false;
-    }
-    for (auto& m : proc->addressSpace->memfdMaps) {
-        if (!m.length) continue;
-        uint64_t begin = addr > m.vaddr ? addr : m.vaddr;
-        uint64_t stop = end < m.vaddr + m.length ? end : m.vaddr + m.length;
-        if (begin >= stop) continue;
-        ranges[(*rangeCount)++] = {begin, stop};
-        uint64_t oldEnd = m.vaddr + m.length;
-        if (begin == m.vaddr && stop == oldEnd) {
-            retired[count++] = static_cast<MemFdData*>(m.mfd);
-            m = {};
-        } else if (begin == m.vaddr) {
-            m.offset += stop - m.vaddr;
-            m.vaddr = stop;
-            m.length = oldEnd - stop;
-        } else {
-            if (stop < oldEnd && !MemFdMapAppend(proc, m, stop, oldEnd)) {
-                SpinLockRelease(&proc->addressSpace->fileMapLock);
-                return false;
-            }
-            m.length = begin - m.vaddr;
-        }
-    }
-    *retiredCount = count;
-    SpinLockRelease(&proc->addressSpace->fileMapLock);
-    return true;
-}
-
-static bool FileMapsApplyProtection(Process* proc, uint64_t addr, uint64_t length,
-                                    uint64_t newFlags)
-{
-    if (!proc) return false;
-    uint64_t end = addr + length;
-    uint32_t neededSlots = 0;
-    uint32_t freeSlots = 0;
-
-    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
-        auto& m = proc->addressSpace->fileMaps[i];
-        if (m.length == 0) {
-            freeSlots++;
-            continue;
-        }
-        uint64_t mEnd = m.vaddr + m.length;
-        uint64_t os = (addr > m.vaddr) ? addr : m.vaddr;
-        uint64_t oe = (end < mEnd) ? end : mEnd;
-        if (os >= oe) continue;
-        if (os > m.vaddr) neededSlots++;
-        if (oe < mEnd) neededSlots++;
-    }
-    if (neededSlots > freeSlots)
-        return false;
-
-    auto allocFileMap = [&](uint64_t vaddr, uint64_t len, uint64_t off,
-                            uint64_t flags, Vnode* vnode) -> bool {
-        for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
-            auto& dst = proc->addressSpace->fileMaps[i];
-            if (dst.length != 0) continue;
-            dst.vaddr = vaddr;
-            dst.length = len;
-            dst.offset = off;
-            dst.vmmFlags = flags;
-            dst.vnode = vnode;
-            VfsFileMapClone(vnode);
-            VnodeRef(vnode);
-            return true;
-        }
-        return false;
-    };
-
-    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
-        auto& m = proc->addressSpace->fileMaps[i];
-        if (m.length == 0 || !m.vnode) continue;
-        uint64_t mStart = m.vaddr;
-        uint64_t mEnd = m.vaddr + m.length;
-        uint64_t os = (addr > mStart) ? addr : mStart;
-        uint64_t oe = (end < mEnd) ? end : mEnd;
-        if (os >= oe) continue;
-
-        uint64_t oldOffset = m.offset;
-        uint64_t oldFlags = m.vmmFlags;
-        Vnode* vnode = m.vnode;
-
-        if (os == mStart && oe == mEnd) {
-            m.vmmFlags = newFlags;
-        } else if (os == mStart) {
-            if (!allocFileMap(oe, mEnd - oe, oldOffset + (oe - mStart),
-                              oldFlags, vnode))
-                return false;
-            m.length = oe - mStart;
-            m.vmmFlags = newFlags;
-        } else if (oe == mEnd) {
-            if (!allocFileMap(os, mEnd - os, oldOffset + (os - mStart),
-                              newFlags, vnode))
-                return false;
-            m.length = os - mStart;
-        } else {
-            if (!allocFileMap(os, oe - os, oldOffset + (os - mStart),
-                              newFlags, vnode))
-                return false;
-            if (!allocFileMap(oe, mEnd - oe, oldOffset + (oe - mStart),
-                              oldFlags, vnode))
-                return false;
-            m.length = os - mStart;
-        }
-    }
-    return true;
-}
-
-static bool FileMapsUnmapRange(Process* proc, uint64_t addr, uint64_t length)
-{
-    if (!proc) return false;
-    uint64_t end = addr + length;
-    uint32_t neededSplits = 0;
-    uint32_t freeSlots = 0;
-
-    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
-        auto& m = proc->addressSpace->fileMaps[i];
-        if (m.length == 0) {
-            freeSlots++;
-            continue;
-        }
-        uint64_t mEnd = m.vaddr + m.length;
-        uint64_t os = (addr > m.vaddr) ? addr : m.vaddr;
-        uint64_t oe = (end < mEnd) ? end : mEnd;
-        if (os >= oe) continue;
-        if (os > m.vaddr && oe < mEnd)
-            neededSplits++;
-    }
-    if (neededSplits > freeSlots)
-        return false;
-
-    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
-        auto& m = proc->addressSpace->fileMaps[i];
-        if (m.length == 0 || !m.vnode) continue;
-        uint64_t mEnd = m.vaddr + m.length;
-        uint64_t os = (addr > m.vaddr) ? addr : m.vaddr;
-        uint64_t oe = (end < mEnd) ? end : mEnd;
-        if (os >= oe) continue;
-
-        if (os <= m.vaddr && oe >= mEnd) {
-            SpinLockAcquire(&proc->addressSpace->fileMapLock);
-            Vnode* vn = static_cast<Vnode*>(
-                __atomic_exchange_n(reinterpret_cast<void**>(&m.vnode),
-                                    nullptr, __ATOMIC_ACQ_REL));
-            m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
-            SpinLockRelease(&proc->addressSpace->fileMapLock);
-            VfsFileMapUnpin(vn);
-            VnodeUnref(vn);
-        } else if (os <= m.vaddr) {
-            uint64_t delta = oe - m.vaddr;
-            m.vaddr = oe;
-            m.offset += delta;
-            m.length = mEnd - oe;
-        } else if (oe >= mEnd) {
-            m.length = os - m.vaddr;
-        } else {
-            uint64_t rightVaddr = oe;
-            uint64_t rightLength = mEnd - oe;
-            uint64_t rightOffset = m.offset + (oe - m.vaddr);
-            for (uint32_t j = 0; j < Process::MAX_FILE_MAPS; j++) {
-                auto& dst = proc->addressSpace->fileMaps[j];
-                if (dst.length != 0) continue;
-                dst.vaddr = rightVaddr;
-                dst.length = rightLength;
-                dst.offset = rightOffset;
-                dst.vmmFlags = m.vmmFlags;
-                dst.vnode = m.vnode;
-                VfsFileMapClone(dst.vnode);
-                VnodeRef(dst.vnode);
-                break;
-            }
-            m.length = os - m.vaddr;
-        }
-    }
-    return true;
+extern "C" bool FileMapHandleUserFault(uint64_t address,uint64_t error) {
+    return ResolveMappingFault(address,error);
 }
 
 // ---------------------------------------------------------------------------
@@ -1697,6 +1223,7 @@ static void UnixFdQueueUnref(UnixFdQueue* q)
 static inline void PipeWakeEpollRaw(PipeBuffer* pipe)
 {
     if (!pipe) return;
+    if (pipe->terminalReader) WakeProcess(pipe->terminalReader);
     Process* ew = pipe->epollWaiter;
     if (ew) {
         pipe->epollWaiter = nullptr;
@@ -1704,7 +1231,7 @@ static inline void PipeWakeEpollRaw(PipeBuffer* pipe)
     }
 }
 
-static void PipeReleaseEnd(PipeBuffer* pipe, bool writer)
+void PipeReleaseEnd(PipeBuffer* pipe, bool writer)
 {
     if (!pipe) return;
     // Finish every access before surrendering this endpoint. An opposite-end
@@ -1783,11 +1310,7 @@ static int UnixInstallSocket(Process* process, UnixSocketData* socket, uint32_t 
 static inline void PipeWakeEpoll(PipeBuffer* pipe)
 {
     if (!pipe) return;
-    Process* ew = pipe->epollWaiter;
-    if (ew) {
-        pipe->epollWaiter = nullptr;
-        WakeProcess(ew);
-    }
+    SpinLockAcquire(&pipe->lock);PipeWakeEpollRaw(pipe);SpinLockRelease(&pipe->lock);
 }
 
 // Same for a listening AF_UNIX socket: wake epoll waiter when a new
@@ -3090,6 +2613,12 @@ struct DrmCtx {
     volatile uint32_t refCount; // descriptor/fork ownership of the shared context
     int32_t   ctxId;   // GpuApp virgl context (0 = not yet created)
     DrmGemObj gem[DRM_MAX_GEM];   // index i -> bo_handle (i+1); 0 is invalid
+    KMutex mappingLock;
+};
+struct DrmMappingGuard {
+    DrmCtx* context;
+    explicit DrmMappingGuard(DrmCtx* value) : context(value) { KMutexLock(&context->mappingLock); }
+    ~DrmMappingGuard() { KMutexUnlock(&context->mappingLock); }
 };
 
 // Allocate a GEM handle (1-based) for a freshly created resource. Returns 0 on
@@ -3241,6 +2770,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         auto* dctx = static_cast<DrmCtx*>(kmalloc(sizeof(DrmCtx)));
         if (!dctx) return -ENOMEM;
         memset(dctx, 0, sizeof(DrmCtx));
+        KMutexInit(&dctx->mappingLock);
         dctx->refCount = 1;
         int fd = FdAlloc(proc, FdType::DevDri, dctx);
         if (fd < 0) { kfree(dctx); return -EMFILE; }
@@ -4025,56 +3555,9 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
 // sys_brk (12)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_brk(uint64_t newBreak, uint64_t, uint64_t,
-                        uint64_t, uint64_t, uint64_t)
-{
-    Process* proc = ProcessCurrent();
-    if (!proc) return -ENOMEM;
-    for (;;) {
-        MappingTransaction transaction(proc, proc->addressSpace);
-        auto* space = transaction.Space();
-        PmmThrottleForDrain();
-        transaction.Lock();
-        const uint64_t previous = space->programBreak;
-        if (!newBreak || newBreak < space->programBreakLow || newBreak > space->programBreakHigh)
-            return static_cast<int64_t>(previous);
-        const uint64_t generation = space->generation;
-        const uint64_t oldPage = (previous + 4095) & ~4095ULL;
-        const uint64_t newPage = (newBreak + 4095) & ~4095ULL;
-        const uint64_t grow = newPage > oldPage ? (newPage - oldPage) / 4096 : 0;
-        const uint64_t shrink = oldPage > newPage ? (oldPage - newPage) / 4096 : 0;
-        transaction.Unlock();
-
-        // All storage and zeroing precedes publication. The transaction owns
-        // candidates across allocation waits and owns rollback/retirement until
-        // stale translations have acknowledged their removal.
-        if (!transaction.Prepare(grow ? grow : shrink, grow) ||
-            !transaction.PrepareZeroed(MemTag::User, space->allocationPid)) {
-            transaction.Lock();
-            return static_cast<int64_t>(space->programBreak);
-        }
-        transaction.Lock();
-        if (space->generation != generation || space->programBreak != previous)
-            continue; // Discard prepared candidates unlocked, then snapshot again.
-
-        if (shrink) {
-            for (uint64_t address = newPage; address < oldPage; address += 4096)
-                if (!transaction.Detach(VirtualAddress(address)))
-                    KernelPanic("brk: retirement preflight mismatch");
-        }
-        for (uint64_t i = 0; i < grow; ++i) {
-            auto result = transaction.Publish(i, VirtualAddress(oldPage + i * 4096),
-                                               VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
-                                               MemTag::User, space->allocationPid);
-            if (result != VmmMapResult::Mapped && result != VmmMapResult::Occupied) {
-                transaction.RollbackPublished();
-                return static_cast<int64_t>(previous);
-            }
-        }
-        space->programBreak = newBreak;
-        transaction.Changed(false);
-        return static_cast<int64_t>(newBreak);
-    }
+static int64_t sys_brk(uint64_t requested,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) {
+    Process* proc=ProcessCurrent();if (!proc) return -ENOMEM;
+    return UserMappingBreak(proc,proc->addressSpace,requested);
 }
 
 // ---------------------------------------------------------------------------
@@ -4095,750 +3578,175 @@ enum MmapProt : uint64_t {
     PROT_EXEC     = 0x4,
 };
 
-// Convert prot flags to VMM page flags.
-static uint64_t ProtToVmmFlags(uint64_t prot)
-{
-    uint64_t f = VMM_USER;
-    if (prot & PROT_WRITE) f |= VMM_WRITABLE;
-    if (!(prot & PROT_EXEC)) f |= VMM_NO_EXEC;
-    return f;
+struct DeviceMappingBacking {
+    uint64_t kernelBase, physicalBase;
+    bool firmware;
+};
+struct MappingBackingGuard {
+    MappingBacking* value = nullptr;
+    ~MappingBackingGuard() { MappingBackingUnref(value); }
+};
+static void ReleaseFileMapping(void* object) {
+    auto* backing = static_cast<FileMappingBacking*>(object);
+    if (backing->pinned) VfsFileMapUnpin(backing->vnode);
+    VnodeUnref(backing->vnode); kfree(backing);
 }
-
+static int PrepareAnonymousMapping(MappingTransaction& operation, const UserMappingRequest&, void*) {
+    return operation.PrepareZeroed(MemTag::User,operation.Space()->allocationPid) ? 0 : -ENOMEM;
+}
+static int PrepareFileMapping(MappingTransaction& operation, const UserMappingRequest& request, void*) {
+    if (!operation.PrepareZeroed(MemTag::User,operation.Space()->allocationPid)) return -ENOMEM;
+    auto* backing = static_cast<FileMappingBacking*>(request.range.backing->object);
+    uint64_t offset = request.range.offset;
+    for (uint64_t page=0;page<request.preparedPages;++page) {
+        auto* bytes = reinterpret_cast<uint8_t*>(PhysToVirt(operation.PreparedPage(page)).raw());
+        int got = VfsRead(backing->vnode,bytes,4096,&offset);
+        if (got < 0) return got;
+        if (got < 4096) break; // candidates are already zeroed, including EOF tails
+    }
+    return 0;
+}
+static int PrepareDeviceMapping(MappingTransaction& operation, const UserMappingRequest& request, void*) {
+    const auto* source = static_cast<DeviceMappingBacking*>(request.range.backing->object);
+    for (uint64_t page=0;page<request.preparedPages;++page) {
+        auto physical = source->firmware ? PhysicalAddress(source->physicalBase+page*4096) :
+            VmmVirtToPhys(KernelPageTable,VirtualAddress(source->kernelBase+page*4096));
+        if (!physical) return -ENOMEM;
+        if (!source->firmware) PmmRefPage(physical);
+        if (!operation.StagePage(page,physical,!source->firmware)) {
+            if (!source->firmware) PmmUnrefPage(physical);
+            return -ENOMEM;
+        }
+    }
+    return 0;
+}
+static void ReleaseDeviceMapping(void* object) { kfree(object); }
 static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t offset)
 {
-    __atomic_fetch_add(&g_profMmapCount, 1, __ATOMIC_RELAXED);
-    if (length == 0) return -EINVAL;
-
-    // File-backed mmaps require page-aligned offset (Linux ABI)
-    if (!(flags & MAP_ANONYMOUS) && (offset & 0xFFFULL))
-        return -EINVAL;
-
-    Process* proc = ProcessCurrent();
-    if (!proc) return -ENOMEM;
-    KernelOperationGuard operation(proc);
-
-    // BRO-206: back-pressure. A large anonymous mmap eagerly allocates its
-    // frames and a later munmap retires them all; throttling the allocator under
-    // quarantine pressure bounds the churn that feeds the drain backlog.
-    PmmThrottleForDrain();
-
-    uint64_t pages = (length + 4095) / 4096;
-    uint64_t vmmFlags = ProtToVmmFlags(prot);
-
-    // Threads share the address-space allocation cursor directly. Never
-    // route through a leader that may have installed a new AS through exec.
-    Process* leader = proc;
-    static SpinLock s_mmapLock;
-
-    // Determine virtual address.  The critical section covers the
-    // read-modify-write of leader->addressSpace->mmapNext AND any unmap-in-place
-    // operation for MAP_FIXED, so two threads can't race on the same range.
-    auto pickAddr = [&]() -> uint64_t {
-        SpinLockAcquire(&s_mmapLock);
-        uint64_t result = 0;
-        if (flags & MAP_FIXED) {
-            if (addr == 0) { SpinLockRelease(&s_mmapLock); return 0; }
-            // Warn if MAP_FIXED overlaps the interpreter region
-            constexpr uint64_t INTERP_BASE = 0x7F0000000000ULL;
-            constexpr uint64_t INTERP_END  = INTERP_BASE + 0x40000; // ~256KB for ld-linux
-            uint64_t mapEnd = addr + pages * 4096;
-            if (addr < INTERP_END && mapEnd > INTERP_BASE) {
-                SerialPrintf("[MMAP] WARNING: MAP_FIXED pid=%u addr=0x%lx len=0x%lx OVERLAPS INTERP [0x%lx-0x%lx]\n",
-                             proc->pid, addr, pages * 4096, INTERP_BASE, INTERP_END);
-            }
-            for (uint64_t i = 0; i < pages; i++) {
-                VirtualAddress va(addr + i * 4096);
-                PhysicalAddress existing = VmmVirtToPhys(proc->addressSpace->pageTable, va);
-                if (existing) {
-                    VmmUnmapPage(proc->addressSpace->pageTable, va);
-                    PmmUnrefPage(existing);
-                }
-            }
-            result = addr;
-        } else {
-            uint64_t base = leader->addressSpace->mmapNext;
-            if (addr >= USER_MMAP_BASE && addr + pages * 4096 <= USER_MMAP_END) {
-                bool free = true;
-                for (uint64_t i = 0; i < pages && free; i++)
-                    if (VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(addr + i * 4096)))
-                        free = false;
-                if (free) base = addr;
-            }
-            if (base + pages * 4096 > USER_MMAP_END) {
-                SpinLockRelease(&s_mmapLock);
-                return 0;
-            }
-            if (base >= leader->addressSpace->mmapNext)
-                leader->addressSpace->mmapNext = base + pages * 4096;
-            result = base;
+    __atomic_fetch_add(&g_profMmapCount,1,__ATOMIC_RELAXED);
+    constexpr uint64_t userEnd = 0x0000800000000000ULL;
+    if (!length || length > userEnd || (prot & ~7ULL) ||
+        (!(flags & MAP_PRIVATE) == !(flags & MAP_SHARED)) ||
+        ((flags & MAP_FIXED) && ((addr & 4095) || addr < VIRTUAL_NULL_GUARD || addr>=userEnd || length > userEnd-addr)) ||
+        (!(flags & MAP_ANONYMOUS) && (offset & 4095))) return -EINVAL;
+    length = (length+4095)&~uint64_t{4095};
+    if (!(flags & MAP_ANONYMOUS) && offset > ~uint64_t{0}-length) return -EINVAL;
+    Process* proc = ProcessCurrent(); if (!proc) return -ESRCH;
+    KernelOperationGuard protectedOperation(proc);
+    MappingBackingGuard backing;
+    UserMappingRequest request{};
+    request.hint = addr; request.length = length; request.fixed = (flags & MAP_FIXED) != 0;
+    request.range = {0,length,offset,0,nullptr,static_cast<uint32_t>(prot),7,MappingKind::Anonymous,
+                     (flags & MAP_SHARED) ? MappingSharing::Shared : MappingSharing::Private,MappingLeafOwnership::Managed};
+    if (flags & MAP_ANONYMOUS) {
+        request.range.offset = 0;
+        if (flags & MAP_SHARED) {
+            auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
+            if (!mfd) return -ENOMEM;
+            memset(mfd,0,sizeof(*mfd));mfd->inode=NextMemFdInode();mfd->refCount=1;
+            if (!MemFdGrow(mfd,length)) { MemFdUnref(mfd); return -ENOMEM; }
+            mfd->size=length;
+            backing.value=MappingBackingCreate(mfd,MemFdHandleUnref);
+            if (!backing.value) { MemFdUnref(mfd); return -ENOMEM; }
+            request.range.kind=MappingKind::MemFd;request.range.leafOwnership=MappingLeafOwnership::Borrowed;
+            request.range.backing=backing.value;
+        } else if (prot) {
+            request.preparedPages=length/4096;request.prepare=PrepareAnonymousMapping;
         }
-        SpinLockRelease(&s_mmapLock);
+        return UserMappingCreate(proc,proc->addressSpace,request);
+    }
+    FdRef descriptor(proc,static_cast<int>(fd));
+    if (!descriptor) return -EBADF;
+    auto* entry=descriptor.get();
+    if (entry->type == FdType::MemFd && entry->handle) {
+        if ((entry->statusFlags & 3) == 1 ||
+            ((flags & MAP_SHARED) && (prot & 2) && (entry->statusFlags & 3) == 0)) return -13;
+        if ((flags & MAP_PRIVATE) && (prot & 2)) return -95;
+        auto* mfd=static_cast<MemFdData*>(entry->handle);
+        if (!MemFdGrow(mfd,offset+length)) return -ENOMEM;
+        MemFdRef(mfd);backing.value=MappingBackingCreate(mfd,MemFdHandleUnref);
+        if (!backing.value) { MemFdUnref(mfd);return -ENOMEM; }
+        request.range.kind=MappingKind::MemFd;request.range.leafOwnership=MappingLeafOwnership::Borrowed;
+        request.range.maximumProtection=5u|(((flags & MAP_SHARED) && (entry->statusFlags & 3) != 0)?2u:0u);
+        request.range.backing=backing.value;
+        return UserMappingCreate(proc,proc->addressSpace,request);
+    }
+    if (entry->type == FdType::DevDri || entry->type == FdType::DevFramebuf) {
+        auto* source=static_cast<DeviceMappingBacking*>(kmalloc(sizeof(DeviceMappingBacking)));
+        if (!source) return -ENOMEM;
+        *source={};backing.value=MappingBackingCreate(source,ReleaseDeviceMapping);
+        if (!backing.value) { kfree(source);return -ENOMEM; }
+        uint64_t available=0;
+        if (entry->type == FdType::DevDri) {
+            auto* context=static_cast<DrmCtx*>(entry->handle);if (!context) return -ENODEV;
+            DrmMappingGuard guard(context);
+            auto* gem=DrmGemGet(context,static_cast<uint32_t>(offset>>32));
+            if (!gem || !gem->backingKva) return -EINVAL;
+            source->kernelBase=gem->backingKva;available=(gem->backingBytes+4095)&~uint64_t{4095};
+        } else {
+            uint32_t width,height,stride;uint64_t physical;
+            if (!TtyGetFramebufferPhys(&physical,&width,&height,&stride)) return -ENODEV;
+            KMutexLock(&proc->framebufferLock);
+            MappingBacking* framebuffer=proc->fbBacking;MappingBackingRef(framebuffer);
+            source->kernelBase=reinterpret_cast<uint64_t>(proc->fbVirtual);
+            available=source->kernelBase ? proc->fbVirtualSize : static_cast<uint64_t>(stride)*height;
+            KMutexUnlock(&proc->framebufferLock);
+            if (framebuffer) {
+                if (request.length>((available+4095)&~uint64_t{4095})) request.length=(available+4095)&~uint64_t{4095};
+                MappingBackingUnref(backing.value);backing.value=framebuffer;
+                request.range.offset=0;
+                if (!UserMappingConfigureBuffer(request,framebuffer)) return -EINVAL;
+                return UserMappingCreate(proc,proc->addressSpace,request);
+            }
+            source->firmware=!source->kernelBase;source->physicalBase=physical;
+            available=(available+4095)&~uint64_t{4095};
+        }
+        if (!available) return -EINVAL;
+        if (request.length > available) request.length=available;
+        request.range.kind=MappingKind::Device;request.range.sharing=MappingSharing::Shared;
+        request.range.offset=0;request.range.backing=backing.value;
+        request.range.leafOwnership=source->firmware?MappingLeafOwnership::Borrowed:MappingLeafOwnership::Managed;
+        request.preparedPages=request.length/4096;request.prepare=PrepareDeviceMapping;
+        return UserMappingCreate(proc,proc->addressSpace,request);
+    }
+    if (entry->type != FdType::Vnode || !entry->handle || static_cast<Vnode*>(entry->handle)->type != VnodeType::File) return -ENODEV;
+    if ((entry->statusFlags & 3) == 1) return -13;
+    if ((flags & MAP_SHARED) && (prot & 2))
+        return (entry->statusFlags & 3) == 0 ? -13 : -95; // no coherent regular-file writeback yet
+    auto fileFailure=[&](const char* stage,int64_t result) -> int64_t {
+        // Only selected errors-only tracing emits this setup-stage evidence.
+        // The mapping core reports its own detailed failure after unlocking.
+        if (proc->straceEnabled && proc->straceErrorsOnly)
+            SerialPrintf("[mmap-file-error:%u] stage=%s error=%ld fd=%lu offset=0x%lx length=%lu prot=0x%lx flags=0x%lx\n",
+                         proc->pid,stage,result,fd,offset,length,prot,flags);
         return result;
     };
-
-    // Helper: allocate pages at a specific address.
-    auto allocAt = [&](uint64_t vaddr, MemTag tag) -> bool {
-        for (uint64_t i = 0; i < pages; i++) {
-            PhysicalAddress phys = PmmAllocPage(tag, ProcessAddressSpacePid(proc));
-            if (!phys) return false;
-            if (!VmmMapPage(proc->addressSpace->pageTable, VirtualAddress(vaddr + i * 4096), phys,
-                            vmmFlags, tag, ProcessAddressSpacePid(proc))) {
-                PmmFreePage(phys);
-                return false;
-            }
-        }
-        return true;
-    };
-
-    // Helper: zero a user page via the kernel direct physical map (works
-    // regardless of user-space page permissions).
-    auto zeroUserPage = [&](uint64_t userVA) {
-        PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable,
-                                             VirtualAddress(userVA));
-        if (!phys) return;
-        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        // PhysToVirt includes page offset; align to page start
-        kp = reinterpret_cast<uint8_t*>(
-            reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
-        for (uint64_t b = 0; b < 4096; ++b) kp[b] = 0;
-    };
-
-    if (flags & MAP_ANONYMOUS)
-    {
-        uint64_t vaddr = pickAddr();
-        if (!vaddr) return -ENOMEM;
-
-        // MAP_FIXED anonymous mappings may overlay existing file-backed VMAs
-        // (e.g. BSS anonymous mmap over the tail of a library reservation).
-        // Remove any stale fileMap entries so the demand-page handler doesn't
-        // incorrectly serve file data for these now-anonymous pages.
-        if (flags & MAP_FIXED) {
-            Process* mmOwner = MemoryMapOwner(proc);
-            if (mmOwner)
-                FileMapsUnmapRange(mmOwner, vaddr, pages * 4096);
-        }
-
-        // Trace mmaps in Go's arena range so we can correlate with later faults.
-        if (vaddr >= 0x2d7700000000ULL && vaddr < 0x2d8000000000ULL) {
-            SerialPrintf("MMAP: pid=%u vaddr=0x%lx pages=%lu prot=0x%lx flags=0x%lx (anon)\n",
-                         proc->pid, vaddr, pages, prot, flags);
-        }
-
-        // PROT_NONE anonymous mappings are pure reservations: do NOT back
-        // them with physical pages.  Go's runtime reserves multi-GB arenas
-        // up front with PROT_NONE and then mprotects sub-ranges to commit.
-        // Allocating backing pages eagerly would immediately OOM, AND would
-        // defeat the PROT_NONE guard-page contract (reads should fault).
-        // sys_mprotect lazily backs pages when prot upgrades to non-zero.
-        if (prot == 0)
-            return static_cast<int64_t>(vaddr);
-
-        if (!allocAt(vaddr, MemTag::User)) return -ENOMEM;
-
-        // Zero via direct map (safe even for PROT_NONE / read-only pages).
-        for (uint64_t p = 0; p < pages; ++p)
-            zeroUserPage(vaddr + p * 4096);
-
-        // Log large mmap allocations for debugging
-        if (pages >= 32) {
-            [[maybe_unused]] PhysicalAddress firstPhys = VmmVirtToPhys(proc->addressSpace->pageTable,
-                                                       VirtualAddress(vaddr));
-            [[maybe_unused]] PhysicalAddress lastPhys = VmmVirtToPhys(proc->addressSpace->pageTable,
-                                                      VirtualAddress(vaddr + (pages-1) * 4096));
-            DbgPrintf("mmap: pid=%u virt=0x%lx pages=%lu firstPhys=0x%lx lastPhys=0x%lx\n",
-                         proc->pid, vaddr, pages,
-                         firstPhys.raw() & ~0xFFFULL,
-                         lastPhys.raw() & ~0xFFFULL);
-        }
-
-        return static_cast<int64_t>(vaddr);
-    }
-
-    // Device or file-backed mmap
-    FdRef mmapFdRef(proc, static_cast<int>(fd));
-    FdEntry* fde = mmapFdRef.get();
-    if (!fde) return -EBADF;
-
-    // virtio-gpu DRM render node: map a resource's guest backing (allocated by
-    // the VIRTGPU_MAP ioctl) into user space. The mmap offset encodes the GEM
-    // handle in its high 32 bits. The same physical pages are attached to the
-    // host virgl resource, so TRANSFER_FROM_HOST DMAs land in this mapping.
-    if (fde->type == FdType::DevDri)
-    {
-        auto* dctx = static_cast<DrmCtx*>(fde->handle);
-        if (!dctx) return -ENODEV;
-        uint32_t bo = static_cast<uint32_t>(offset >> 32);
-        DrmGemObj* g = DrmGemGet(dctx, bo);
-        if (!g || g->backingKva == 0) return -EINVAL;
-        uint64_t bpages = (g->backingBytes + 4095) / 4096;
-        if (pages > bpages) pages = bpages;
-        uint64_t vaddr = pickAddr();
-        if (!vaddr) return -ENOMEM;
-        for (uint64_t i = 0; i < pages; ++i)
-        {
-            PhysicalAddress phys = VmmVirtToPhys(KernelPageTable,
-                VirtualAddress(g->backingKva + i * 4096));
-            if (!phys) return -ENOMEM;
-            if (!VmmMapPage(proc->addressSpace->pageTable, VirtualAddress(vaddr + i * 4096),
-                            phys, VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
-                            MemTag::Device, proc->pid))
-                return -ENOMEM;
-        }
-        // Record as a device map so munmap leaves the backing pages alone
-        // (they are owned by the GEM object / virgl context, freed on close).
-        for (uint32_t i = 0; i < Process::MAX_FB_MAPS; ++i) {
-            if (proc->addressSpace->fbMaps[i].length == 0) {
-                proc->addressSpace->fbMaps[i].vaddr  = vaddr;
-                proc->addressSpace->fbMaps[i].length = pages * 4096;
-                break;
-            }
-        }
-        return static_cast<int64_t>(vaddr);
-    }
-
-    // Framebuffer device: map physical framebuffer memory into user space
-    if (fde->type == FdType::DevFramebuf)
-    {
-        uint64_t physBase;
-        uint32_t fbW, fbH, fbStride;
-        if (!TtyGetFramebufferPhys(&physBase, &fbW, &fbH, &fbStride))
-            return -ENODEV;
-
-        bool useVirtFb = (proc->fbVirtual != nullptr);
-        uint64_t fbSize = useVirtFb
-            ? proc->fbVirtualSize
-            : static_cast<uint64_t>(fbStride) * fbH;
-
-        uint64_t fbPages = (fbSize + 4095) / 4096;
-        if (pages > fbPages) pages = fbPages;
-
-        uint64_t vaddr = pickAddr();
-        if (!vaddr) return -ENOMEM;
-
-        for (uint64_t i = 0; i < pages; ++i)
-        {
-            PhysicalAddress pagePhys;
-            if (useVirtFb)
-            {
-                auto kernVirt = VirtualAddress(
-                    reinterpret_cast<uint64_t>(proc->fbVirtual) + i * 4096);
-                pagePhys = VmmVirtToPhys(KernelPageTable, kernVirt);
-            }
-            else
-            {
-                pagePhys = PhysicalAddress(physBase + i * 4096);
-            }
-
-            if (!VmmMapPage(proc->addressSpace->pageTable, VirtualAddress(vaddr + i * 4096),
-                            pagePhys,
-                            VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
-                            MemTag::Device, proc->pid))
-            {
-                SerialPrintf("sys_mmap: failed to map fb page %lu\n", i);
-                return -ENOMEM;
-            }
-        }
-
-        SerialPrintf("sys_mmap: fb mapped %lu pages at virt 0x%lx..0x%lx pid=%u (%s, vfb=%ux%u)\n",
-                     pages, vaddr, vaddr + pages * 4096 - 1,
-                     proc->pid,
-                     useVirtFb ? "virtual" : "physical",
-                     proc->fbVfbWidth, proc->fbVfbHeight);
-
-        // Record the fb mmap so sys_munmap leaves the physical pages
-        // alone (they're owned by proc->fbVirtual when useVirtFb=true,
-        // and by the firmware framebuffer when not).
-        for (uint32_t i = 0; i < Process::MAX_FB_MAPS; ++i) {
-            if (proc->addressSpace->fbMaps[i].length == 0) {
-                proc->addressSpace->fbMaps[i].vaddr  = vaddr;
-                proc->addressSpace->fbMaps[i].length = pages * 4096;
-                break;
-            }
-        }
-        return static_cast<int64_t>(vaddr);
-    }
-
-    // MemFd-backed mmap (MAP_SHARED) — used by wl_shm.
-    //
-    // We DO NOT install PTEs eagerly. The user's virtual range is left
-    // unmapped; the first access on each page traps to MemFdHandleUserFault
-    // (idt.cpp), which calls MemFdGetOrAllocPage and installs the PTE. This
-    // is the lazy/sparse semantics gdk-wayland depends on: ftruncate(700MB)
-    // and mmap(700MB) consume only the index array (≈1.4 MB) until pages
-    // are actually touched.
-    if (fde->type == FdType::MemFd && fde->handle)
-    {
-        if ((fde->statusFlags & 3) == 1) return -13;
-        if ((flags & MAP_SHARED) && (prot & PROT_WRITE) && (fde->statusFlags & 3) == 0) return -13;
-        if ((flags & MAP_PRIVATE) && (prot & PROT_WRITE)) return -95;
-        auto* mfd = static_cast<MemFdData*>(fde->handle);
-
-        // Grow the page index array to cover [offset, offset+length). Pages
-        // remain unbacked until first access.
-        uint64_t needed = offset + length;
-        if (needed > mfd->capacity) {
-            if (!MemFdGrow(mfd, needed)) return -ENOMEM;
-        }
-        // Mapping reserves address space, never extends the logical file size.
-
-        uint64_t vaddr = pickAddr();
-        if (!vaddr) return -ENOMEM;
-
-        // Record the mapping (with page-aligned mfd offset) so the PF handler
-        // can resolve faults, and so munmap can tear it down without freeing
-        // the mfd-owned phys pages. Take a VMA-lifetime ref on the MemFdData
-        // so close(fd) doesn't drop the backing while the mapping is live.
-        bool tracked = false;
-        Process* mmOwner = MemoryMapOwner(proc);
-        if (!mmOwner) return -ESRCH;
-        SpinLockAcquire(&mmOwner->addressSpace->fileMapLock);
-        for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
-            if (mmOwner->addressSpace->memfdMaps[i].length == 0) {
-                mmOwner->addressSpace->memfdMaps[i].vaddr  = vaddr;
-                mmOwner->addressSpace->memfdMaps[i].length = pages * 4096;
-                mmOwner->addressSpace->memfdMaps[i].offset = offset;
-                mmOwner->addressSpace->memfdMaps[i].vmmFlags = vmmFlags;
-                mmOwner->addressSpace->memfdMaps[i].mfd    = mfd;
-                mmOwner->addressSpace->memfdMaps[i].prot = static_cast<uint32_t>(prot);
-                mmOwner->addressSpace->memfdMaps[i].maxProt = 5u |
-                    (((flags & MAP_SHARED) && (fde->statusFlags & 3) != 0) ? 2u : 0u);
-                MemFdRef(mfd);
-                tracked = true;
-                break;
-            }
-        }
-        SpinLockRelease(&mmOwner->addressSpace->fileMapLock);
-        if (!tracked) {
-            SerialPrintf("sys_mmap: WARNING MAX_MEMFD_MAPS (%u) exhausted for pid=%u\n",
-                         Process::MAX_MEMFD_MAPS, proc->pid);
-            return -ENOMEM;
-        }
-        return static_cast<int64_t>(vaddr);
-    }
-
-    // Trace file-backed mmaps during early process startup (ld-linux loading
-    // shared libraries).  Rate-limited to first 200 per process.
-    // MMAP tracing disabled for now — too noisy during Ladybird loading.
-    // Re-enable when debugging specific mmap issues.
-#if 0
-    {
-        static uint32_t s_mmapTraceCount[256];
-        uint16_t tid = proc->pid;
-        if (tid < 256 && s_mmapTraceCount[tid] < 200) {
-            s_mmapTraceCount[tid]++;
-            auto* vn = static_cast<Vnode*>(fde->handle);
-            SerialPrintf("MMAP_TRACE: pid=%u fd=%d off=0x%lx len=0x%lx prot=0x%lx flags=0x%lx cacheId=%lu\n",
-                         proc->pid, static_cast<int>(fd), offset, length,
-                         prot, flags, vn->cacheId);
-        }
-    }
-#endif
-
-    // Regular files have no shared dirty-page/writeback implementation.
-    // Returning an eager private copy here falsely reports successful output
-    // to mmap-based writers (e.g. LLD) while leaving the file empty. Report
-    // the missing capability so callers can fall back to ordinary writes.
-    // MemFd and framebuffer mappings were handled above and remain supported.
-    if ((flags & MAP_SHARED) && (prot & PROT_WRITE) &&
-        fde->type == FdType::Vnode && fde->handle &&
-        static_cast<Vnode*>(fde->handle)->type == VnodeType::File)
-        return -95; // EOPNOTSUPP
-
-    // Private, non-writable file mappings are demand-paged.  This avoids
-    // synchronously reading large shared libraries/resources at mmap() time.
-    // Writable private and read-only shared mappings use the eager copy path.
-    bool lazyFileMap = (flags & MAP_PRIVATE) && !(flags & MAP_SHARED) && !(prot & PROT_WRITE);
-    if (lazyFileMap) {
-        int pin = VfsFileMapPin(static_cast<Vnode*>(fde->handle));
-        if (pin == -95) lazyFileMap = false; // no stable inode lifetime: eager copy
-        else if (pin) return pin;
-    }
-    if (lazyFileMap && (flags & MAP_PRIVATE) && !(flags & MAP_SHARED) && !(prot & PROT_WRITE))
-    {
-        uint64_t vaddr = pickAddr();
-        if (!vaddr) { VfsFileMapUnpin(static_cast<Vnode*>(fde->handle)); return -ENOMEM; }
-
-        auto* vn = static_cast<Vnode*>(fde->handle);
-        bool tracked = false;
-        Process* mmOwner = MemoryMapOwner(proc);
-        if (!mmOwner) { VfsFileMapUnpin(vn); return -ESRCH; }
-        if ((flags & MAP_FIXED) && !FileMapsUnmapRange(mmOwner, vaddr, pages * 4096)) {
-            VfsFileMapUnpin(vn); return -ENOMEM;
-        }
-        for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
-            if (mmOwner->addressSpace->fileMaps[i].length == 0) {
-                mmOwner->addressSpace->fileMaps[i].vaddr = vaddr;
-                mmOwner->addressSpace->fileMaps[i].length = pages * 4096;
-                mmOwner->addressSpace->fileMaps[i].offset = offset;
-                mmOwner->addressSpace->fileMaps[i].vmmFlags = vmmFlags;
-                mmOwner->addressSpace->fileMaps[i].vnode = vn;
-                VnodeRef(vn);
-                tracked = true;
-                break;
-            }
-        }
-        if (!tracked) {
-            SerialPrintf("sys_mmap: WARNING MAX_FILE_MAPS (%u) exhausted for pid=%u, "
-                         "falling back to eager read\n",
-                         Process::MAX_FILE_MAPS, proc->pid);
-            VfsFileMapUnpin(vn);
-            return -ENOMEM;
-        }
-
-        // Preload mapped region into page cache.
-        // Eagerly loads the mapped region to convert future page faults into
-        // bulk disk reads. Handles files up to 16MB per mapping.
-        static constexpr uint32_t MAX_REGION_PRELOAD = 4096;           // 16MB region
-        VnodeStat st;
-        if (VfsStat(vn, &st) == 0 && st.size > 0) {
-            uint64_t startPage = offset / 4096;
-            uint32_t mapPages = static_cast<uint32_t>(pages);
-            if (mapPages <= MAX_REGION_PRELOAD) {
-                PageCachePreload(vn, startPage, st.size, mapPages);
-            }
-        }
-
-        return static_cast<int64_t>(vaddr);
-    }
-
-    static constexpr uint64_t MMAP_FILE_READ_CHUNK = 64 * 1024;
-    uint64_t readBufLen = (length < MMAP_FILE_READ_CHUNK) ? length : MMAP_FILE_READ_CHUNK;
-    auto* readBuf = static_cast<uint8_t*>(kmalloc(static_cast<uint32_t>(readBufLen)));
-    if (!readBuf) return -ENOMEM;
-
-    uint64_t vaddr = pickAddr();
-    if (!vaddr) {
-        kfree(readBuf);
-        return -ENOMEM;
-    }
-    if (flags & MAP_FIXED) {
-        Process* mmOwner = MemoryMapOwner(proc);
-        if (!mmOwner || !FileMapsUnmapRange(mmOwner, vaddr, pages * 4096)) {
-            kfree(readBuf);
-            return -ENOMEM;
-        }
-    }
-    if (!allocAt(vaddr, MemTag::User)) {
-        kfree(readBuf);
-        return -ENOMEM;
-    }
-
-    // Zero then read file data (via direct map for permission safety)
-    for (uint64_t pg = 0; pg < pages; ++pg)
-        zeroUserPage(vaddr + pg * 4096);
-
-    auto* vn = static_cast<Vnode*>(fde->handle);
-    uint64_t readOff = offset;
-
-    uint64_t bytesLeft = length;
-    uint64_t dstOff = 0;
-    while (bytesLeft > 0)
-    {
-        uint64_t chunk = (bytesLeft > readBufLen) ? readBufLen : bytesLeft;
-        int got = VfsRead(vn, readBuf, chunk, &readOff);
-        if (got <= 0) break;
-
-        uint64_t copied = 0;
-        bool scatterOk = true;
-        while (copied < static_cast<uint64_t>(got))
-        {
-            uint64_t userVA = vaddr + dstOff + copied;
-            PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable,
-                                                 VirtualAddress(userVA & ~0xFFFULL));
-            if (!phys) {
-                SerialPrintf("sys_mmap: missing mapped page while loading file at 0x%lx\n", userVA);
-                scatterOk = false;
-                break;
-            }
-
-            uint64_t pageOff = userVA & 0xFFFULL;
-            uint64_t toCopy = static_cast<uint64_t>(got) - copied;
-            if (toCopy > 4096 - pageOff) toCopy = 4096 - pageOff;
-
-            auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-            kp = reinterpret_cast<uint8_t*>(
-                reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
-            __builtin_memcpy(kp + pageOff, readBuf + copied, toCopy);
-            copied += toCopy;
-        }
-        if (!scatterOk) break;
-
-        dstOff += static_cast<uint64_t>(got);
-        bytesLeft -= static_cast<uint64_t>(got);
-    }
-
-    kfree(readBuf);
-
-    return static_cast<int64_t>(vaddr);
+    auto* vnode=static_cast<Vnode*>(entry->handle);
+    int pin=VfsFileMapPin(vnode);if (pin && pin != -95) return fileFailure("mapping-pin",pin);
+    VnodeStat stat{};int error=VfsStat(vnode,&stat);
+    if (error) { if (!pin) VfsFileMapUnpin(vnode);return fileFailure("stat",error); }
+    auto* file=static_cast<FileMappingBacking*>(kmalloc(sizeof(FileMappingBacking)));
+    if (!file) { if (!pin) VfsFileMapUnpin(vnode);return fileFailure("file-backing-storage",-ENOMEM); }
+    VnodeRef(vnode);*file={vnode,stat.size,pin==0};
+    backing.value=MappingBackingCreate(file,ReleaseFileMapping);
+    if (!backing.value) { ReleaseFileMapping(file);return fileFailure("backing-descriptor-storage",-ENOMEM); }
+    backing.value->file=vnode->ops->file_object ? vnode->ops->file_object(vnode) : nullptr;
+    request.range.kind=MappingKind::File;request.range.backing=backing.value;
+    if (flags & MAP_SHARED) request.range.maximumProtection=5;
+    if (pin == -95) { request.preparedPages=length/4096;request.prepare=PrepareFileMapping; }
+    else if (length<=16*1024*1024 && stat.size>offset)
+        PageCachePreload(vnode,offset/4096,stat.size,static_cast<uint32_t>(length/4096));
+    return UserMappingCreate(proc,proc->addressSpace,request);
 }
-
-// ---------------------------------------------------------------------------
-// sys_mprotect (10) -- stub
-// ---------------------------------------------------------------------------
-
-static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
-                             uint64_t, uint64_t, uint64_t)
-{
-    if (len == 0) return 0;
-    if (addr & 0xFFF) return -EINVAL;
-
-    Process* proc = ProcessCurrent();
-    if (!proc) return -ESRCH;
-    KernelOperationGuard operation(proc);
-
-    uint64_t pages = (len + 4095) / 4096;
-    uint64_t newFlags = ProtToVmmFlags(prot);
-    Process* mmOwnerForProtect = MemoryMapOwner(proc);
-    if (!mmOwnerForProtect) return -ESRCH;
-    for (const auto& m : mmOwnerForProtect->addressSpace->memfdMaps) {
-        if (m.length && addr < m.vaddr + m.length && m.vaddr < addr + pages * 4096 &&
-            (prot & ~static_cast<uint64_t>(m.maxProt))) return -13;
-    }
-    if (!MemFdMapsCapacity(mmOwnerForProtect, addr, pages * 4096, true)) return -ENOMEM;
-    if (!FileMapsApplyProtection(mmOwnerForProtect, addr, pages * 4096, newFlags))
-        return -ENOMEM;
-
-    if (!MemFdMapsProtect(mmOwnerForProtect, addr, pages * 4096, newFlags,
-                          static_cast<uint32_t>(prot))) return -ENOMEM;
-
-    if (addr >= 0x2d7700000000ULL && addr < 0x2d8000000000ULL) {
-        SerialPrintf("MPROTECT: pid=%u addr=0x%lx pages=%lu prot=0x%lx\n",
-                     proc->pid, addr, pages, prot);
-    }
-
-    for (uint64_t i = 0; i < pages; ++i)
-    {
-        VirtualAddress va(addr + i * 4096);
-        PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable, va);
-        Process* mmOwner = mmOwnerForProtect;
-        Process::MemFdMap* memfdMap = nullptr;
-        Process::FileMap* fileMap = nullptr;
-        for (uint32_t mi = 0; mi < Process::MAX_MEMFD_MAPS; ++mi)
-        {
-            auto& m = mmOwner->addressSpace->memfdMaps[mi];
-            if (m.length == 0 || !m.mfd) continue;
-            if (va.raw() >= m.vaddr && va.raw() < m.vaddr + m.length)
-            {
-                memfdMap = &m;
-                break;
-            }
-        }
-        for (uint32_t fi = 0; fi < Process::MAX_FILE_MAPS; ++fi)
-        {
-            auto& m = mmOwner->addressSpace->fileMaps[fi];
-            if (m.length == 0 || !m.vnode) continue;
-            if (va.raw() >= m.vaddr && va.raw() < m.vaddr + m.length)
-            {
-                fileMap = &m;
-                break;
-            }
-        }
-
-        if (memfdMap)
-        {
-            if (!phys)
-                continue;
-            VmmUnmapPage(proc->addressSpace->pageTable, va);
-            if (prot != 0)
-                VmmMapPage(proc->addressSpace->pageTable, va, phys, newFlags, MemTag::User, ProcessAddressSpacePid(proc));
-            continue;
-        }
-
-        if (fileMap)
-        {
-            fileMap->vmmFlags = newFlags;
-            if (!phys)
-                continue;
-            VmmUnmapPage(proc->addressSpace->pageTable, va);
-            VmmMapPage(proc->addressSpace->pageTable, va, phys, newFlags, MemTag::User, ProcessAddressSpacePid(proc));
-            continue;
-        }
-
-        if (!phys)
-        {
-            // Page not mapped.  If the caller is upgrading to a real
-            // protection (non-PROT_NONE), this is a lazy-backing request
-            // — allocate and zero a fresh page.  This is the pattern Go's
-            // runtime uses: reserve a large region with PROT_NONE, then
-            // mprotect sub-ranges to commit.
-            if (prot == 0)
-                continue;
-
-            PhysicalAddress newPhys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
-            if (!newPhys) return -ENOMEM;
-
-            if (!VmmMapPage(proc->addressSpace->pageTable, va, newPhys, newFlags,
-                            MemTag::User, ProcessAddressSpacePid(proc)))
-            {
-                PmmFreePage(newPhys);
-                return -ENOMEM;
-            }
-
-            // Zero via kernel direct map (safe even for RO/NX pages).
-            auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(newPhys).raw());
-            kp = reinterpret_cast<uint8_t*>(
-                reinterpret_cast<uint64_t>(kp) & ~0xFFFULL);
-            for (uint64_t b = 0; b < 4096; ++b) kp[b] = 0;
-            continue;
-        }
-
-        // Remap the existing page with the new flags.
-        VmmUnmapPage(proc->addressSpace->pageTable, va);
-        VmmMapPage(proc->addressSpace->pageTable, va, phys, newFlags, MemTag::User, ProcessAddressSpacePid(proc));
-    }
-
-    // Permission changes may leave stale TLB entries on remote CPUs
-    if (pages > 0)
-        TlbShootdownFull(proc->addressSpace->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
-
-    return 0;
+static int64_t sys_mprotect(uint64_t addr,uint64_t length,uint64_t prot,uint64_t,uint64_t,uint64_t) {
+    Process* proc=ProcessCurrent();if (!proc) return -ESRCH;
+    if (prot & ~7ULL) return -EINVAL;
+    return UserMappingProtect(proc,proc->addressSpace,addr,length,static_cast<uint32_t>(prot));
 }
-
-// ---------------------------------------------------------------------------
-// sys_munmap (11) -- stub
-// ---------------------------------------------------------------------------
-
-static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
-                           uint64_t, uint64_t, uint64_t)
-{
-    if (addr & 0xFFF) return -EINVAL;
-    if (length == 0) return 0;
-
-    Process* proc = ProcessCurrent();
-    if (!proc) return -ESRCH;
-    KernelOperationGuard operation(proc);
-
-    // BRO-206: back-pressure before we retire this range's frames into the
-    // quarantine — bounds the quarantine under heavy munmap load.
-    PmmThrottleForDrain();
-
-    uint64_t pages = (length + 4095) / 4096;
-
-    if (addr >= 0x2d7700000000ULL && addr < 0x2d8000000000ULL) {
-        SerialPrintf("MUNMAP: pid=%u addr=0x%lx pages=%lu\n", proc->pid, addr, pages);
-    }
-
-    // Is this range a MemFd mmap? If so, unmap only — the physical pages
-    // are kernel heap pages owned by the MemFd, not by the process.
-    MemFdData* retiredMemFds[Process::MAX_MEMFD_MAPS];
-    uint32_t retiredMemFdCount = 0, memFdRangeCount = 0;
-    MemFdRemovedRange memFdRanges[Process::MAX_MEMFD_MAPS];
-    Process* mmOwner = MemoryMapOwner(proc);
-    if (!mmOwner) return -ESRCH;
-    uint64_t unmapLen = pages * 4096;
-    uint64_t unmapEnd = addr + unmapLen;
-
-    if (!MemFdMapsCapacity(mmOwner, addr, unmapLen, false)) return -ENOMEM;
-
-    uint32_t neededFileMapSplits = 0;
-    uint32_t freeFileMapSlots = 0;
-    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
-        auto& m = mmOwner->addressSpace->fileMaps[i];
-        if (m.length == 0) {
-            freeFileMapSlots++;
-            continue;
-        }
-        uint64_t mEnd = m.vaddr + m.length;
-        uint64_t overlapStart = (addr > m.vaddr) ? addr : m.vaddr;
-        uint64_t overlapEnd = (unmapEnd < mEnd) ? unmapEnd : mEnd;
-        if (overlapStart >= overlapEnd) continue;
-        if (overlapStart > m.vaddr && overlapEnd < mEnd)
-            neededFileMapSplits++;
-    }
-    if (neededFileMapSplits > freeFileMapSlots)
-        return -ENOMEM;
-
-    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; i++) {
-        auto& m = mmOwner->addressSpace->fileMaps[i];
-        if (m.length == 0 || !m.vnode) continue;
-        uint64_t mEnd = m.vaddr + m.length;
-        uint64_t overlapStart = (addr > m.vaddr) ? addr : m.vaddr;
-        uint64_t overlapEnd = (unmapEnd < mEnd) ? unmapEnd : mEnd;
-        if (overlapStart >= overlapEnd) continue;
-
-        if (overlapStart <= m.vaddr && overlapEnd >= mEnd) {
-            // Hold the lock while clearing the entry to prevent
-            // FileMapHandleUserFault from loading a stale vnode pointer.
-            SpinLockAcquire(&mmOwner->addressSpace->fileMapLock);
-            Vnode* vn = m.vnode;
-            m.vnode = nullptr;
-            m.vaddr = 0; m.length = 0; m.offset = 0; m.vmmFlags = 0;
-            SpinLockRelease(&mmOwner->addressSpace->fileMapLock);
-            VfsFileMapUnpin(vn);
-            VnodeUnref(vn);
-        } else if (overlapStart <= m.vaddr) {
-            uint64_t delta = overlapEnd - m.vaddr;
-            m.vaddr = overlapEnd;
-            m.offset += delta;
-            m.length = mEnd - overlapEnd;
-        } else if (overlapEnd >= mEnd) {
-            m.length = overlapStart - m.vaddr;
-        } else {
-            uint64_t rightVaddr = overlapEnd;
-            uint64_t rightLength = mEnd - overlapEnd;
-            uint64_t rightOffset = m.offset + (overlapEnd - m.vaddr);
-            for (uint32_t j = 0; j < Process::MAX_FILE_MAPS; j++) {
-                auto& dst = mmOwner->addressSpace->fileMaps[j];
-                if (dst.length != 0) continue;
-                dst.vaddr = rightVaddr;
-                dst.length = rightLength;
-                dst.offset = rightOffset;
-                dst.vmmFlags = m.vmmFlags;
-                dst.vnode = m.vnode;
-                VfsFileMapClone(dst.vnode);
-                VnodeRef(dst.vnode);
-                break;
-            }
-            m.length = overlapStart - m.vaddr;
-        }
-    }
-
-    if (!MemFdMapsRemove(mmOwner, addr, unmapLen, retiredMemFds,
-                         &retiredMemFdCount, memFdRanges, &memFdRangeCount)) return -ENOMEM;
-
-    // Is this range a /dev/fb0 mmap?  If so, unmap only — the physical
-    // pages are owned by proc->fbVirtual (or the firmware FB) and
-    // freeing them here would corrupt the compositor's view of the VFB
-    // and leave dangling references in fbVirtual's PT entries.
-    bool isFbMap = false;
-    for (uint32_t i = 0; i < Process::MAX_FB_MAPS; i++) {
-        auto& m = proc->addressSpace->fbMaps[i];
-        if (m.length == 0) continue;
-        if (addr >= m.vaddr && addr + length <= m.vaddr + m.length) {
-            isFbMap = true;
-            if (addr == m.vaddr && length == m.length) {
-                m.vaddr = 0; m.length = 0;
-            }
-            break;
-        }
-    }
-
-    for (uint64_t i = 0; i < pages; ++i)
-    {
-        VirtualAddress va(addr + i * 4096);
-        PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable, va);
-        if (phys)
-        {
-            bool isMemFd = false;
-            for (uint32_t mi = 0; mi < memFdRangeCount; ++mi) {
-                if (va.raw() >= memFdRanges[mi].begin && va.raw() < memFdRanges[mi].end) {
-                    isMemFd = true;
-                    break;
-                }
-            }
-            VmmUnmapPage(proc->addressSpace->pageTable, va);
-            if (!isMemFd && !isFbMap) PmmUnrefPage(phys);
-        }
-    }
-
-    // Flush stale TLB entries on remote CPUs after bulk unmap
-    if (pages > 0)
-        TlbShootdownFull(proc->addressSpace->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
-
-    for (uint32_t i = 0; i < retiredMemFdCount; ++i) MemFdUnref(retiredMemFds[i]);
-
-    return 0;
+static int64_t sys_munmap(uint64_t addr,uint64_t length,uint64_t,uint64_t,uint64_t,uint64_t) {
+    Process* proc=ProcessCurrent();if (!proc) return -ESRCH;
+    return UserMappingRemove(proc,proc->addressSpace,addr,length);
 }
 
 // ---------------------------------------------------------------------------
@@ -4853,157 +3761,17 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t,
 // We don't honour MREMAP_FIXED; if userspace passes new_addr we ignore it.
 // ---------------------------------------------------------------------------
 
-static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size,
-                           uint64_t flags, uint64_t /*new_addr*/, uint64_t)
-{
-    constexpr uint64_t MREMAP_MAYMOVE = 1;
-
-    if (old_addr & 0xFFF) return -EINVAL;
-    if (old_size == 0 || new_size == 0) return -EINVAL;
-
-    Process* proc = ProcessCurrent();
-    if (!proc) return -ESRCH;
-    KernelOperationGuard operation(proc);
-
-    // BRO-206: back-pressure — mremap can free the old mapping's frames.
-    PmmThrottleForDrain();
-
-    uint64_t oldPages = (old_size + 4095) / 4096;
-    uint64_t newPages = (new_size + 4095) / 4096;
-
-    if (newPages == oldPages) return static_cast<int64_t>(old_addr);
-
-    // Check if this is a MemFd-backed mapping. If so, we must NOT free the
-    // underlying physical pages (they're owned by the MemFdData) and must
-    // keep the new mapping connected to the same MemFdData so that shared
-    // memory continues to work (wl_shm_pool resize depends on this).
-    Process* mmOwner = MemoryMapOwner(proc);
-    if (!mmOwner) return -ESRCH;
-    int32_t memfdMapIdx = -1;
-    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; i++) {
-        auto& m = mmOwner->addressSpace->memfdMaps[i];
-        if (m.length == 0 || !m.mfd) continue;
-        if (old_addr >= m.vaddr && old_addr < m.vaddr + m.length) {
-            memfdMapIdx = static_cast<int32_t>(i);
-            break;
-        }
+static int PrepareUserRemap(const MappingRange& range,uint64_t length,void*) {
+    if (range.kind==MappingKind::MemFd) {
+        if (range.offset>~uint64_t{0}-length) return -EINVAL;
+        return MemFdGrow(static_cast<MemFdData*>(range.backing->object),range.offset+length)?0:-ENOMEM;
     }
-
-    if (memfdMapIdx >= 0) {
-        // MemFd-backed mremap: keep the mapping connected to the MemFdData.
-        auto& m = mmOwner->addressSpace->memfdMaps[memfdMapIdx];
-        if (old_addr != m.vaddr || oldPages * 4096 != m.length) return -EINVAL;
-        auto* mfd = static_cast<MemFdData*>(m.mfd);
-
-        if (newPages < oldPages) {
-            // Shrink: unmap tail PTEs (don't free pages — they belong to mfd).
-            for (uint64_t i = newPages; i < oldPages; ++i) {
-                VirtualAddress va(old_addr + i * 4096);
-                VmmUnmapPage(proc->addressSpace->pageTable, va);
-            }
-            TlbShootdownFull(proc->addressSpace->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
-            SpinLockAcquire(&mmOwner->addressSpace->fileMapLock);
-            m.length = newPages * 4096;
-            SpinLockRelease(&mmOwner->addressSpace->fileMapLock);
-            return static_cast<int64_t>(old_addr);
-        }
-
-        // Grow: ensure the MemFd has enough capacity for the new size.
-        uint64_t neededBytes = m.offset + newPages * 4096;
-        if (neededBytes > mfd->capacity) {
-            if (!MemFdGrow(mfd, neededBytes)) return -ENOMEM;
-        }
-        // Remapping changes virtual extent, not the backing file's size.
-
-        if (!(flags & MREMAP_MAYMOVE)) return -ENOMEM;
-
-        // Allocate a new virtual address range (no physical pages — lazy fault).
-        Process* leader = proc;
-        uint64_t newAddr = leader->addressSpace->mmapNext;
-        leader->addressSpace->mmapNext += newPages * 4096;
-
-        // Move any already-faulted PTEs from old range to new range.
-        // Pages remain owned by the MemFdData; we just remap the same phys.
-        for (uint64_t i = 0; i < oldPages; ++i) {
-            VirtualAddress oldVA(old_addr + i * 4096);
-            PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable, oldVA);
-            if (phys) {
-                VirtualAddress newVA(newAddr + i * 4096);
-                VmmMapPage(proc->addressSpace->pageTable, newVA, phys,
-                           VMM_PRESENT | m.vmmFlags, MemTag::User, ProcessAddressSpacePid(proc));
-                VmmUnmapPage(proc->addressSpace->pageTable, oldVA);
-            }
-        }
-        TlbShootdownFull(proc->addressSpace->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
-
-        // Update the memfdMaps entry to reflect the new address and size.
-        SpinLockAcquire(&mmOwner->addressSpace->fileMapLock);
-        m.vaddr  = newAddr;
-        m.length = newPages * 4096;
-        SpinLockRelease(&mmOwner->addressSpace->fileMapLock);
-
-        return static_cast<int64_t>(newAddr);
-    }
-
-    // --- Anonymous / file-backed mapping (non-MemFd) ---
-
-    // Shrink: unmap the tail.
-    if (newPages < oldPages)
-    {
-        for (uint64_t i = newPages; i < oldPages; ++i)
-        {
-            VirtualAddress va(old_addr + i * 4096);
-            PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable, va);
-            if (phys)
-            {
-                VmmUnmapPage(proc->addressSpace->pageTable, va);
-                PmmUnrefPage(phys);
-            }
-        }
-        TlbShootdownFull(proc->addressSpace->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
-        return static_cast<int64_t>(old_addr);
-    }
-
-    // Grow.  Refuse if caller can't tolerate the move.
-    if (!(flags & MREMAP_MAYMOVE)) return -ENOMEM;
-
-    // Allocate a fresh anonymous region of newPages.  We reuse sys_mmap to
-    // avoid duplicating the address-picking + page-allocation logic.
-    int64_t mmRet = sys_mmap(0, newPages * 4096,
-                             3 /*PROT_READ|PROT_WRITE*/,
-                             0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/,
-                             static_cast<uint64_t>(-1), 0);
-    if (mmRet < 0) return mmRet;
-    uint64_t newAddr = static_cast<uint64_t>(mmRet);
-
-    // Copy old contents into the new region.
-    for (uint64_t i = 0; i < oldPages; ++i)
-    {
-        VirtualAddress src(old_addr + i * 4096);
-        VirtualAddress dst(newAddr + i * 4096);
-        PhysicalAddress sp = VmmVirtToPhys(proc->addressSpace->pageTable, src);
-        PhysicalAddress dp = VmmVirtToPhys(proc->addressSpace->pageTable, dst);
-        if (!sp || !dp) continue;
-        __builtin_memcpy(reinterpret_cast<void*>(newAddr + i * 4096),
-                         reinterpret_cast<void*>(old_addr + i * 4096), 4096);
-    }
-
-    // Unmap the old range and free its pages.
-    for (uint64_t i = 0; i < oldPages; ++i)
-    {
-        VirtualAddress va(old_addr + i * 4096);
-        PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable, va);
-        if (phys)
-        {
-            VmmUnmapPage(proc->addressSpace->pageTable, va);
-            PmmUnrefPage(phys);
-        }
-    }
-    TlbShootdownFull(proc->addressSpace->pageTable.pml4.raw(), *AddressSpaceTlbMaskPtr(proc));
-
-    DbgPrintf("sys_mremap: 0x%lx (%lu) -> 0x%lx (%lu)\n",
-              old_addr, oldPages, newAddr, newPages);
-    return static_cast<int64_t>(newAddr);
+    if (range.kind==MappingKind::File && !static_cast<FileMappingBacking*>(range.backing->object)->pinned) return -95;
+    return 0;
+}
+static int64_t sys_mremap(uint64_t source,uint64_t oldLength,uint64_t newLength,uint64_t flags,uint64_t destination,uint64_t) {
+    Process* proc=ProcessCurrent();if (!proc) return -ESRCH;
+    return UserMappingResize(proc,proc->addressSpace,source,oldLength,newLength,flags,destination,PrepareUserRemap,nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -6725,6 +5493,7 @@ static bool DrmEnsureBacking(DrmCtx* dctx, DrmGemObj* g)
 
 static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
 {
+    DrmMappingGuard guard(dctx);
     switch (nr)
     {
     case DRM_NR_VERSION:
@@ -7329,11 +6098,12 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         {
             if (!UserBufferWritable(arg, 4 * sizeof(uint16_t))) return -EFAULT;
             auto* ws = reinterpret_cast<uint16_t*>(arg);
-            Terminal* term = TerminalFindByProcess(proc);
-            ws[0] = term ? static_cast<uint16_t>(term->rows) : 25;
-            ws[1] = term ? static_cast<uint16_t>(term->cols) : 80;
-            ws[2] = term ? static_cast<uint16_t>(term->vfbW) : 0;
-            ws[3] = term ? static_cast<uint16_t>(term->vfbH) : 0;
+            TerminalGeometry geometry{25,80,0,0};
+            TerminalSnapshotGeometry(proc,&geometry);
+            ws[0] = static_cast<uint16_t>(geometry.rows);
+            ws[1] = static_cast<uint16_t>(geometry.cols);
+            ws[2] = static_cast<uint16_t>(geometry.width);
+            ws[3] = static_cast<uint16_t>(geometry.height);
             return 0;
         }
 
@@ -7446,11 +6216,12 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         struct winsize { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; };
         if (!UserBufferWritable(arg, sizeof(winsize))) return -EFAULT;
         auto* ws = reinterpret_cast<winsize*>(arg);
-        Terminal* term = TerminalFindByProcess(proc);
-        ws->ws_row = term ? static_cast<uint16_t>(term->rows) : 25;
-        ws->ws_col = term ? static_cast<uint16_t>(term->cols) : 80;
-        ws->ws_xpixel = term ? static_cast<uint16_t>(term->vfbW) : 0;
-        ws->ws_ypixel = term ? static_cast<uint16_t>(term->vfbH) : 0;
+        TerminalGeometry geometry{25,80,0,0};
+        TerminalSnapshotGeometry(proc,&geometry);
+        ws->ws_row = static_cast<uint16_t>(geometry.rows);
+        ws->ws_col = static_cast<uint16_t>(geometry.cols);
+        ws->ws_xpixel = static_cast<uint16_t>(geometry.width);
+        ws->ws_ypixel = static_cast<uint16_t>(geometry.height);
         return 0;
     }
 
@@ -9061,48 +7832,9 @@ retry_poll:
             // checks also service timerfds and descriptors without wait hooks.
             self->wakeupTick = WaitWakeupTick(deadline, 50);
             if (!HasPendingSignals() && (infinite || ClockNowNs(1) < deadline))
-                SchedulerBlock(self);
+                SchedulerBlockInterruptible(self);
 
-            if (HasPendingSignals())
-            {
-                // Clean up waiters before returning
-                InputRemoveWaiter(self);
-                for (uint64_t i = 0; i < waiterCap; i++)
-                {
-                    if (fds[i].fd < 0) continue;
-                    FdRef fde2_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
-                    FdEntry* fde2 = fde2_ref.get();
-                    if (!fde2) continue;
-                    if (fde2->type == FdType::Pipe && fde2->handle && (fds[i].events & POLLIN))
-                    {
-                        auto* pb2 = static_cast<PipeBuffer*>(fde2->handle);
-                        if (!(fde2->flags & 1) && pb2->readerWaiter == self)
-                            pb2->readerWaiter = nullptr;
-                    }
-                    if (fde2->type == FdType::Socket && fde2->handle)
-                    {
-                        int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde2->handle)) - 1;
-                        brook::SockSetPollWaiter(si, nullptr);
-                    }
-                    if (fde2->type == FdType::UnixSocket && fde2->handle)
-                    {
-                        auto* usd = static_cast<UnixSocketData*>(fde2->handle);
-                        if (usd->rxPipe && usd->rxPipe->readerWaiter == self)
-                            usd->rxPipe->readerWaiter = nullptr;
-                        if (usd->txPipe && usd->txPipe->writerWaiter == self)
-                            usd->txPipe->writerWaiter = nullptr;
-                        if (usd->epollWaiter == self)
-                            usd->epollWaiter = nullptr;
-                    }
-                    if (fde2->type == FdType::EventFd && fde2->handle)
-                    {
-                        auto* efd2 = static_cast<EventFdData*>(fde2->handle);
-                        if (efd2->readerWaiter == self)
-                            efd2->readerWaiter = nullptr;
-                    }
-                }
-                return -EINTR;
-            }
+
         }
 
         // Clean up waiters
@@ -9154,6 +7886,10 @@ retry_poll:
                 brook::SockSetPollWaiter(si, nullptr);
             }
         }
+
+        // Both ordinary signal interruption and terminal cancellation use the
+        // complete common unregister path (including DevTty) before unwinding.
+        if (HasPendingSignals()) return -EINTR;
 
         // Always use the same readiness scan before/after sleeping, including
         // timerfds, sockets and eventfds. Expiry is checked after that scan.
@@ -9807,7 +8543,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         // A signal may already be pending when the wait begins (including
         // after a mask change); do not sleep before returning it to userspace.
         if (!HasPendingSignals() && (timeout_ms < 0 || ClockNowNs(1) < deadline))
-            SchedulerBlock(proc);
+            SchedulerBlockInterruptible(proc);
         unregisterWaiters();
         if (HasPendingSignals()) {
             ep->waiter = nullptr;
@@ -12734,7 +11470,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
 
         // Block until FUTEX_WAKE removes our waiter, a signal arrives, or an
         // optional timeout expires and the scheduler wakes us.
-        SchedulerBlock(proc);
+        SchedulerBlockInterruptible(proc);
 
         if (FutexRemoveWaiter(owner, uaddrVal, proc))
         {
@@ -14249,6 +12985,9 @@ void SyscallTableInit()
     g_syscallTable[0xB01]                = sys_brook_wm_set_app_id;
     g_syscallTable[0xB02]                = sys_brook_wm_theme;
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
+#ifdef BROOK_MAPPING_TEST_HOOKS
+    g_syscallTable[0xB30]                = MappingFaultTestControl;
+#endif
     // App-GPU (per-process virgl) syscalls for userspace GL rendering.
     g_syscallTable[0xB10]                = sys_brook_gpu_ctx_create;       // GPU_CTX_CREATE
     g_syscallTable[0xB11]                = sys_brook_gpu_resource_create;  // GPU_RESOURCE_CREATE

@@ -355,11 +355,16 @@ both guest-installed apps, the current boot shortcuts, and a fresh data disk
 with the original private Quake assets and 720p video fixture. From Brook:
 
 ```sh
-nix-shell --run './scripts/run_installed_apps.sh'
+BROOK_SMP=1 nix-shell --run './scripts/run_installed_apps.sh build/experiments/results/apps-ready-20261014'
 ```
 
-This opens a native SDL VM window with one vCPU, silent host audio and the
-bridge enabled. Start Ladybird first, then the VLC media player shortcut, matching the verified
+This is a historical one-vCPU browser/player baseline. It predates the current
+native icons and launcher assets; do not use it to review today's desktop.
+The helper now defaults to eight vCPUs and 4 GiB RAM. Select a prepared image
+explicitly with its directory argument or `BROOK_APPS_RUN`; otherwise it uses
+`build/experiments/current-apps`, a local pointer maintained when a new app
+checkpoint is prepared. It opens a native SDL window with silent host audio and
+the bridge enabled. Start Ladybird first, then the VLC media player shortcut, matching the verified
 dual-app launch sequence. In the
 guest terminal:
 

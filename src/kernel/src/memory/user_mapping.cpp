@@ -1,0 +1,535 @@
+#include "user_mapping.h"
+#include "physical_memory.h"
+#include "process.h"
+#include "panic.h"
+#include "string.h"
+#include "heap.h"
+#include "serial.h"
+
+namespace brook {
+// Source metadata and leaves are stable under AS.mutation. Destination is not
+// published to the scheduler until the operation's parent shootdown completes.
+static bool CloneLeaves(MappingTransaction& operation, AddressSpaceState* destination, uint16_t pid) {
+    auto* source = operation.Space();
+    constexpr uint64_t physicalMask = 0x000FFFFFFFFFF000ULL;
+    auto* pml4 = reinterpret_cast<uint64_t*>(PhysToVirt(source->pageTable.pml4).raw());
+    auto* range = source->ranges.head;
+    for (uint64_t i4=0; i4<256; ++i4) {
+        if (!(pml4[i4]&VMM_PRESENT)) continue;
+        auto* pdpt = reinterpret_cast<uint64_t*>(PhysToVirt(PhysicalAddress(pml4[i4]&physicalMask)).raw());
+        for (uint64_t i3=0; i3<512; ++i3) {
+            if (!(pdpt[i3]&VMM_PRESENT)) continue;
+            if (pdpt[i3]&(1ULL<<7)) return false;
+            auto* pd = reinterpret_cast<uint64_t*>(PhysToVirt(PhysicalAddress(pdpt[i3]&physicalMask)).raw());
+            for (uint64_t i2=0; i2<512; ++i2) {
+                if (!(pd[i2]&VMM_PRESENT)) continue;
+                if (pd[i2]&(1ULL<<7)) return false;
+                auto* pt = reinterpret_cast<uint64_t*>(PhysToVirt(PhysicalAddress(pd[i2]&physicalMask)).raw());
+                for (uint64_t i1=0; i1<512; ++i1) {
+                    uint64_t raw = pt[i1];
+                    if (!VmmLeafBacked(raw)) continue;
+                    uint64_t address=(i4<<39)|(i3<<30)|(i2<<21)|(i1<<12);
+                    while (range && range->range.end<=address) range=range->next;
+                    // Every populated user leaf must have authoritative metadata.
+                    if (!range || range->range.begin>address) return false;
+                    const auto& mapping=range->range;
+                    bool managed=mapping.leafOwnership==MappingLeafOwnership::Managed;
+                    bool cow=managed && mapping.sharing==MappingSharing::Private &&
+                        (raw&(VMM_WRITABLE|PTE_COW_BIT));
+                    uint64_t childFlags=raw&(VMM_USER|VMM_WRITABLE|VMM_NO_EXEC|PTE_COW_BIT);
+                    if (cow) childFlags=(childFlags&~VMM_WRITABLE)|PTE_COW_BIT;
+                    else if (mapping.sharing==MappingSharing::Shared) childFlags&=~PTE_COW_BIT;
+                    PhysicalAddress physical(raw&physicalMask);
+                    // Pin before publication. The locked CoW commit supplies its
+                    // own child reference, replacing this anticipatory pin.
+                    if (managed) PmmRefPage(physical);
+                    auto result=VmmTryMapPage(destination->pageTable,VirtualAddress(address),physical,
+                        childFlags,managed?MemTag::User:MemTag::Device,pid,(raw&VMM_PRESENT)!=0);
+                    if (result!=VmmMapResult::Mapped) {
+                        if (managed) PmmUnrefPage(physical);
+                        return false;
+                    }
+                    if (cow) {
+                        operation.RequireShootdown();
+                        auto* childTable=reinterpret_cast<uint64_t*>(PhysToVirt(destination->pageTable.pml4).raw());
+                        const uint64_t indices[]={i4,i3,i2};
+                        for (uint64_t index:indices)
+                            childTable=reinterpret_cast<uint64_t*>(PhysToVirt(PhysicalAddress(childTable[index]&physicalMask)).raw());
+                        auto* childLeaf=&childTable[i1];
+                        VmmForkCommitCowShare(&pt[i1],childLeaf,*childLeaf,physical);
+                        PmmUnrefPage(physical);
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceState* destination, uint16_t pid) {
+    if (!actor || !source || !destination || source->kernel || destination->kernel ||
+        source==destination || destination->ranges.head) return false;
+    for (;;) {
+        MappingTransaction operation(actor,source);
+        if(!operation.Lock())return false;
+        uint64_t count=0, generation=source->generation;
+        for (auto* node=source->ranges.head; node; node=node->next) ++count;
+        operation.Unlock();
+        MappingRangePlan plan;
+        if (!plan.Prepare(count)) return false;
+        if(!operation.Lock())return false;
+        if (source->generation!=generation) { operation.Unlock(); continue; }
+        for (auto* node=source->ranges.head; node; node=node->next)
+            if (!plan.Insert(destination->ranges,node->range))
+                KernelPanic("mapping: preallocated fork metadata failed");
+        destination->programBreak=source->programBreak;
+        destination->programBreakLow=source->programBreakLow;
+        destination->programBreakHigh=source->programBreakHigh;
+        destination->mmapNext=source->mmapNext;
+        bool copied=CloneLeaves(operation,destination,pid);
+        operation.Unlock();
+        return copied;
+    }
+}
+struct BufferFrame { PhysicalAddress physical; uint64_t retired; };
+struct BufferMapping { KMutex retirementLock;uint64_t pages;BufferFrame frames[1]; };
+static void ReleaseBufferMapping(void* object) {
+    auto* buffer=static_cast<BufferMapping*>(object);
+    for (uint64_t i=0;i<buffer->pages;++i) PmmUnrefPage(buffer->frames[i].physical);
+    kfree(buffer);
+}
+MappingBacking* UserMappingBufferSnapshot(uint64_t kernelAddress,uint64_t length) {
+    if (!kernelAddress || (kernelAddress&4095) || !length || (length&4095) ||
+        length>~uint64_t{0}-kernelAddress) return nullptr;
+    uint64_t pages=length/4096;
+    if (pages>(~uint64_t{0}-sizeof(BufferMapping))/sizeof(BufferFrame)) return nullptr;
+    auto* buffer=static_cast<BufferMapping*>(kmalloc(sizeof(BufferMapping)+(pages-1)*sizeof(BufferFrame)));
+    if (!buffer) return nullptr;
+    KMutexInit(&buffer->retirementLock);buffer->pages=0;
+    for (uint64_t i=0;i<pages;++i) {
+        auto physical=VmmVirtToPhys(KernelPageTable,VirtualAddress(kernelAddress+i*4096));
+        if (!physical || !PmmRefPageIfAlive(physical)) { ReleaseBufferMapping(buffer);return nullptr; }
+        buffer->frames[buffer->pages++]={physical,0};
+    }
+    auto* descriptor=MappingBackingCreate(buffer,ReleaseBufferMapping);
+    if (!descriptor) ReleaseBufferMapping(buffer);
+    return descriptor;
+}
+static int PrepareBufferAlias(MappingTransaction& operation,const UserMappingRequest& request,void*) {
+    auto* buffer=static_cast<BufferMapping*>(request.range.backing->object);
+    for (uint64_t i=0;i<request.preparedPages;++i) {
+        auto physical=buffer->frames[request.range.offset/4096+i].physical;PmmRefPage(physical);
+        if (!operation.StagePage(i,physical,true)) { PmmUnrefPage(physical);return -12; }
+    }
+    return 0;
+}
+bool UserMappingConfigureBuffer(UserMappingRequest& request,MappingBacking* descriptor) {
+    if (!descriptor || descriptor->release!=ReleaseBufferMapping || !request.length ||
+        (request.length&4095) || (request.range.offset&4095) || (request.range.protection&~3u)) return false;
+    auto* buffer=static_cast<BufferMapping*>(descriptor->object);
+    uint64_t bytes=buffer->pages*4096;
+    if (request.range.offset>=bytes || request.length>bytes-request.range.offset) return false;
+    request.range.backing=descriptor;request.range.kind=MappingKind::Device;
+    request.range.sharing=MappingSharing::Shared;request.range.leafOwnership=MappingLeafOwnership::Managed;
+    request.range.maximumProtection&=3u;
+    request.preparedPages=request.length/4096;request.prepare=PrepareBufferAlias;
+    return true;
+}
+void UserFramebufferPublish(Process* process,MappingBacking* descriptor,uint32_t* pixels,uint32_t bytes,
+                             uint32_t width,uint32_t height,uint32_t stride) {
+    if (descriptor && descriptor->release!=ReleaseBufferMapping) KernelPanic("mapping: invalid framebuffer descriptor");
+    if (descriptor) {
+        auto* buffer=static_cast<BufferMapping*>(descriptor->object);
+        if (!pixels || !bytes || !width || !height || stride<width ||
+            static_cast<uint64_t>(stride)*4>bytes/height || bytes>buffer->pages*4096)
+            KernelPanic("mapping: invalid framebuffer geometry");
+    } else if (pixels || bytes || width || height || stride) KernelPanic("mapping: unretained framebuffer source");
+    MappingBackingRef(descriptor);
+    KMutexLock(&process->framebufferLock);
+    auto* previous=process->fbBacking;process->fbBacking=descriptor;
+    process->fbVirtual=pixels;process->fbVirtualSize=bytes;
+    process->fbVfbWidth=width;process->fbVfbHeight=height;process->fbVfbStride=stride;process->fbDirty=1;
+    KMutexUnlock(&process->framebufferLock);MappingBackingUnref(previous);
+}
+int64_t UserMappingBufferAlias(Process* actor,AddressSpaceState* space,MappingBacking* descriptor,uint32_t protection) {
+    if (!descriptor || descriptor->release!=ReleaseBufferMapping || !protection || (protection&~3u)) return -22;
+    auto* buffer=static_cast<BufferMapping*>(descriptor->object);
+    UserMappingRequest request{};
+    request.length=buffer->pages*4096;request.preparedPages=buffer->pages;request.prepare=PrepareBufferAlias;
+    request.range={0,request.length,0,0,descriptor,protection,protection,MappingKind::Device,
+                   MappingSharing::Shared,MappingLeafOwnership::Managed};
+    if (!UserMappingConfigureBuffer(request,descriptor)) return -22;
+    return UserMappingCreate(actor,space,request);
+}
+struct BufferRetirementGuard {
+    BufferMapping* buffer;
+    explicit BufferRetirementGuard(BufferMapping* value):buffer(value) { KMutexLock(&buffer->retirementLock); }
+    ~BufferRetirementGuard() {
+        // Constructed before the mapping transaction: its destructor/ACK always
+        // runs first, including early returns after a partial committed removal.
+        for (uint64_t i=0;i<buffer->pages;++i) {
+            auto& frame=buffer->frames[i];
+            while (frame.retired) { --frame.retired;PmmUnrefPage(frame.physical); }
+        }
+        KMutexUnlock(&buffer->retirementLock);
+    }
+};
+struct BufferRetirementContext { AddressSpaceState* space;BufferMapping* buffer;MappingBacking* descriptor; };
+static void RetireBufferLeaf(VirtualAddress address,uint64_t raw,void* opaque) {
+    auto& context=*static_cast<BufferRetirementContext*>(opaque);
+    const auto* range=MappingRangeFind(context.space->ranges,address.raw());
+    if (!range || range->backing!=context.descriptor) KernelPanic("mapping: buffer retirement range changed");
+    uint64_t index=(range->offset+address.raw()-range->begin)/4096;
+    if (index>=context.buffer->pages || context.buffer->frames[index].physical!=VmmLeafPhysical(raw))
+        KernelPanic("mapping: buffer retirement frame changed");
+    auto& count=context.buffer->frames[index].retired;
+    if (count==~uint64_t{0}) KernelPanic("mapping: buffer retirement count exhausted");
+    ++count;
+}
+static int64_t RemoveBufferMappings(Process* actor,AddressSpaceState* space,MappingBacking* descriptor) {
+    auto* buffer=static_cast<BufferMapping*>(descriptor->object);
+    BufferRetirementGuard retirement(buffer);
+    MappingTransaction operation(actor,space,nullptr,descriptor);
+    // Exact whole-node removals use no split nodes. Per-frame retirement counters
+    // were reserved with the immutable source snapshot, so exit needs no heap.
+    if (!operation.PrepareRanges(0)) return -12;
+    if(!operation.Lock())return -12;
+    for (auto* node=space->ranges.head;node;node=node->next) if (node->range.backing==descriptor) {
+        uint64_t count=0;
+        if (!operation.RangeLeafCount(node->range.begin,node->range.end,count) ||
+            !operation.CanReplaceRange(node->range.begin,node->range.end)) return -22;
+    }
+    BufferRetirementContext context{space,buffer,descriptor};
+    for (auto* node=space->ranges.head;node;) {
+        auto* next=node->next;
+        if (node->range.backing==descriptor &&
+            !operation.RemoveMappingWithRetirer(node->range.begin,node->range.end,RetireBufferLeaf,&context))
+            KernelPanic("mapping: preflighted buffer removal failed");
+        node=next;
+    }
+    return 0;
+}
+int64_t UserMappingRemoveBacking(Process* actor,AddressSpaceState* space,MappingBacking* backing) {
+    if (!actor || !space || !backing) return -22;
+    if (backing->release==ReleaseBufferMapping) return RemoveBufferMappings(actor,space,backing);
+    for (;;) {
+        MappingTransaction operation(actor,space);if(!operation.Lock())return -12;
+        uint64_t count=0,generation=space->generation;
+        for (auto* node=space->ranges.head;node;node=node->next) if (node->range.backing==backing) {
+            uint64_t leaves=0;
+            if (!operation.RangeLeafCount(node->range.begin,node->range.end,leaves)) return -22;
+            if (leaves>~uint64_t{0}-count) return -12;
+            count+=leaves;
+        }
+        operation.Unlock();
+        if (!operation.Prepare(count,0) || !operation.PrepareRanges(0)) return -12;
+        if(!operation.Lock())return -12;if (space->generation!=generation) continue;
+        uint64_t required=0;
+        for (auto* node=space->ranges.head;node;node=node->next) if (node->range.backing==backing) {
+            uint64_t leaves=0;
+            if (!operation.RangeLeafCount(node->range.begin,node->range.end,leaves) ||
+                !operation.CanReplaceRange(node->range.begin,node->range.end)) return -22;
+            if (leaves>count-required) { required=count+1;break; }
+            required+=leaves;
+        }
+        if (required>count) continue;
+        for (auto* node=space->ranges.head;node;) {
+            auto* next=node->next;
+            if (node->range.backing==backing && !operation.ReplaceMapping(node->range.begin,node->range.end))
+                KernelPanic("mapping: preflighted backing removal failed");
+            node=next;
+        }
+        return 0;
+    }
+}
+struct StackPreparation { const uint8_t* arguments; uint64_t length,offset; };
+static int PrepareStack(MappingTransaction& operation,const UserMappingRequest& request,void* opaque) {
+    if (!operation.PrepareZeroed(MemTag::User,operation.Space()->allocationPid)) return -12;
+    auto& preparation=*static_cast<StackPreparation*>(opaque);
+    uint64_t copied=0;
+    while (copied<preparation.length) {
+        uint64_t position=preparation.offset+copied,offset=position&4095;
+        uint64_t count=4096-offset;
+        if (count>preparation.length-copied) count=preparation.length-copied;
+        if (position/4096>=request.preparedPages) return -22;
+        auto physical=operation.PreparedPage(position/4096);
+        memcpy(reinterpret_cast<void*>(PhysToVirt(physical).raw()+offset),preparation.arguments+copied,count);
+        copied+=count;
+    }
+    return 0;
+}
+int64_t UserMappingStack(Process* actor,AddressSpaceState* space,uint64_t size,
+                          const void* arguments,uint64_t argumentLength,uint64_t* argumentAddress) {
+    if (!size || (size&4095) || size>(1u<<20) || argumentLength>size/2 ||
+        (argumentLength && !arguments) || !argumentAddress) return -22;
+    StackPreparation preparation{static_cast<const uint8_t*>(arguments),argumentLength,(size-argumentLength)&~uint64_t{15}};
+    UserMappingRequest request{};
+    request.range={0,size,0,0,nullptr,3,3,MappingKind::Stack,MappingSharing::Private,MappingLeafOwnership::Managed};
+    request.length=size;request.preparedPages=size/4096;request.prepare=PrepareStack;request.context=&preparation;
+    int64_t base=UserMappingCreate(actor,space,request);
+    if (base>=0) *argumentAddress=argumentLength?static_cast<uint64_t>(base)+preparation.offset:0;
+    return base;
+}
+static bool UserInterval(uint64_t address, uint64_t length, uint64_t& end) {
+    constexpr uint64_t limit = 0x0000800000000000ULL;
+    if ((address & 4095) || !length || length > limit || address >= limit) return false;
+    length = (length + 4095) & ~uint64_t{4095};
+    if (length > limit-address) return false;
+    end = address+length; return true;
+}
+static uint64_t PickMappingAddress(AddressSpaceState* space, const UserMappingRequest& request) {
+    if (request.fixed) return request.hint;
+    uint64_t start = request.hint >= USER_MMAP_BASE && request.hint < USER_MMAP_END ?
+        request.hint & ~uint64_t{4095} : space->mmapNext;
+    if (start < USER_MMAP_BASE || start >= USER_MMAP_END) start = USER_MMAP_BASE;
+    auto found = MappingRangeFindGap(space->ranges,start,request.length,USER_MMAP_BASE,USER_MMAP_END);
+    return found ? found : MappingRangeFindGap(space->ranges,USER_MMAP_BASE,request.length,USER_MMAP_BASE,USER_MMAP_END);
+}
+int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMappingRequest& request) {
+    // Declared before every transaction so errors are printed only after AS /
+    // file gates and transaction retirement have unwound. No successful calls
+    // emit diagnostics; no backing pointers are inspected by the destructor.
+    struct FailureTrace {
+        Process* actor;
+        const UserMappingRequest& request;
+        const char* stage = nullptr;
+        int64_t error = 0;
+        uint64_t retired = 0, attempts = 0;
+        int64_t Fail(const char* where,int64_t result) { stage=where;error=result;return result; }
+        ~FailureTrace() {
+            if (stage && actor && actor->straceEnabled && actor->straceErrorsOnly)
+                SerialPrintf("[mapping-create-error:%u] stage=%s error=%ld hint=0x%lx length=%lu fixed=%u kind=%u prepared=%lu retired=%lu attempts=%lu\n",
+                    actor->pid,stage,error,request.hint,request.length,unsigned(request.fixed),
+                    unsigned(request.range.kind),request.preparedPages,retired,attempts);
+        }
+    } failure{actor,request};
+    uint64_t checkedEnd;
+    MappingRange checked = request.range;
+    checked.begin = 0; checked.end = request.length;
+    if (!actor || !space || (request.length & 4095) ||
+        !UserInterval(request.fixed ? request.hint : 0,request.length,checkedEnd) ||
+        (request.fixed && request.hint < VIRTUAL_NULL_GUARD) ||
+        (request.range.protection & ~request.range.maximumProtection) ||
+        (request.range.maximumProtection & ~7u) ||
+        !MappingRangeValid(checked) ||
+        (request.preparedPages && (request.preparedPages != request.length/4096 || !request.prepare))) return failure.Fail("request-validation",-22);
+    for (;;) {
+        ++failure.attempts;
+        MappingTransaction operation(actor,space,request.range.backing);
+        PmmThrottleForDrain();
+        if(!operation.Lock())return failure.Fail("gate-set-snapshot",-12);
+        const uint64_t address = PickMappingAddress(space,request);
+        if (!address) return failure.Fail("address-gap",-12);
+        const uint64_t end = address+request.length;
+        uint64_t retired = 0;
+        if (request.fixed && !operation.RangeLeafCount(address,end,retired)) return failure.Fail("retirement-count",-22);
+        failure.retired=retired;
+        const uint64_t generation = space->generation;
+        operation.Unlock();
+        if (!operation.Prepare(retired,request.preparedPages)) return failure.Fail("page-record-storage",-12);
+        if (!operation.PrepareRanges(3)) return failure.Fail("range-node-storage",-12);
+        if (request.prepare) {
+            int result = request.prepare(operation,request,request.context);
+            if (result) return failure.Fail("backing-prepare",result);
+        }
+        for (uint64_t i=0;i<request.preparedPages;++i)
+            if (!operation.PreparedPage(i)) return failure.Fail("prepared-page-missing",-12);
+        if (request.preparedPages && !VmmPrepareRange(space->pageTable,address,end)) return failure.Fail("page-table-prepare",-12);
+        if(!operation.Lock())return failure.Fail("gate-set-commit",-12);
+        if (space->generation != generation) continue;
+        MappingRange range = request.range;
+        range.begin = address; range.end = end; range.identity = 0;
+        if (request.fixed) {
+            if (!operation.CanReplaceRange(address,end,&range)) return failure.Fail("range-replace-preflight",-12);
+            // A fault may have populated another leaf without changing topology
+            // while preparation was unlocked. Capacity failure changes nothing.
+            if (!operation.ReplaceMapping(address,end,&range)) continue;
+        } else if (!operation.InsertRange(range)) return failure.Fail("range-insert",-12);
+        uint64_t flags = VMM_USER;
+        if (!(range.protection & 4)) flags |= VMM_NO_EXEC;
+        if (range.protection & 2) flags |= VMM_WRITABLE;
+        MemTag tag = range.kind == MappingKind::Device && range.leafOwnership == MappingLeafOwnership::Borrowed ?
+            MemTag::Device : MemTag::User;
+        for (uint64_t i=0;i<request.preparedPages;++i)
+            if (operation.Publish(i,VirtualAddress(address+i*4096),flags,tag,space->allocationPid,
+                                  range.protection != 0) != VmmMapResult::Mapped)
+                KernelPanic("mapping: preflighted page publication failed");
+        if (!request.fixed && end > space->mmapNext) space->mmapNext = end;
+        return static_cast<int64_t>(address);
+    }
+}
+int64_t UserMappingRemove(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length) {
+    uint64_t end;
+    if (!actor || !space || !UserInterval(address,length,end)) return -22;
+    for (;;) {
+        MappingTransaction operation(actor,space);
+        PmmThrottleForDrain(); if(!operation.Lock())return -12;
+        uint64_t count = 0;
+        if (!operation.RangeLeafCount(address,end,count)) return -22;
+        uint64_t generation = space->generation;
+        operation.Unlock();
+        if (!operation.Prepare(count,0) || !operation.PrepareRanges(2)) return -12;
+        if(!operation.Lock())return -12;
+        if (space->generation != generation) continue;
+        if (!operation.CanReplaceRange(address,end)) return -12;
+        if (!operation.ReplaceMapping(address,end)) continue;
+        return 0;
+    }
+}
+int64_t UserMappingProtect(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length, uint32_t protection) {
+    uint64_t end;
+    if (!actor || !space || (address & 4095) || (protection & ~7u)) return -22;
+    if (!length) return 0;
+    if (!UserInterval(address,length,end)) return -22;
+    MappingTransaction operation(actor,space);
+    if (!operation.PrepareRanges(2)) return -12;
+    if(!operation.Lock())return -12;
+    for (uint64_t at=address;at<end;) {
+        const auto* range = MappingRangeFind(space->ranges,at);
+        if (!range) return -12;
+        if (protection & ~range->maximumProtection) return -13;
+        at = range->end < end ? range->end : end;
+    }
+    return operation.ProtectMapping(address,end,protection) ? 0 : -12;
+}
+static UserPageAccess CheckPage(AddressSpaceState* space,uint64_t address,uint32_t access,bool& cow) {
+    cow = false;
+    const auto* range=MappingRangeFind(space->ranges,address);
+    if (!range || !access || (access & ~range->protection)) return UserPageAccess::Denied;
+    uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(address));
+    if (!(leaf & VMM_PRESENT)) return UserPageAccess::Missing;
+    if (!(leaf & VMM_USER) || ((access & 4) && (leaf & VMM_NO_EXEC))) return UserPageAccess::Denied;
+    if ((access & 2) && !(leaf & VMM_WRITABLE)) {
+        cow = (leaf & PTE_COW_BIT) && range->sharing == MappingSharing::Private &&
+            range->leafOwnership == MappingLeafOwnership::Managed;
+        return UserPageAccess::Denied;
+    }
+    return UserPageAccess::Ready;
+}
+UserPageAccess UserMappingPageAccess(Process* actor, AddressSpaceState* space, uint64_t address,
+                                     uint32_t access, bool resolveCow) {
+    if (!actor || !space || address >= 0x0000800000000000ULL) return UserPageAccess::Denied;
+    MappingTransaction operation(actor,space);if(!operation.Lock())return UserPageAccess::OutOfMemory;
+    bool cow=false;auto status=CheckPage(space,address,access,cow);
+    if (!resolveCow || !cow) return status;
+    operation.Unlock();
+    if (!operation.Prepare(1,0)) return UserPageAccess::OutOfMemory;
+    if(!operation.Lock())return UserPageAccess::OutOfMemory;status=CheckPage(space,address,access,cow);
+    if (!cow) return status;
+    auto result=VmmCowResolveWrite(space->pageTable,VirtualAddress(address),space->allocationPid);
+    if (result.result == VmmCowResult::OutOfMemory) return UserPageAccess::OutOfMemory;
+    if (result.result != VmmCowResult::Resolved) return CheckPage(space,address,access,cow);
+    operation.RequireShootdown();
+    if (result.retired && !operation.RetireFrame(result.retired)) KernelPanic("mapping: CoW retirement preflight mismatch");
+    return UserPageAccess::Ready;
+}
+static int64_t SnapshotProgramBreak(AddressSpaceState* space) {
+    KMutexLock(&space->mutation);auto value=space->programBreak;KMutexUnlock(&space->mutation);
+    return static_cast<int64_t>(value);
+}
+int64_t UserMappingBreak(Process* actor,AddressSpaceState* space,uint64_t requested) {
+    if (!actor || !space) return -12;
+    for (;;) {
+        MappingTransaction operation(actor,space);PmmThrottleForDrain();if(!operation.Lock())return SnapshotProgramBreak(space);
+        const uint64_t previous=space->programBreak;
+        if (!requested || requested<space->programBreakLow || requested>space->programBreakHigh || requested==previous)
+            return static_cast<int64_t>(previous);
+        const uint64_t oldEnd=(previous+4095)&~uint64_t{4095},newEnd=(requested+4095)&~uint64_t{4095};
+        if (oldEnd==newEnd) { space->programBreak=requested;operation.Changed(false);return static_cast<int64_t>(requested); }
+        uint64_t growth=newEnd>oldEnd?(newEnd-oldEnd)/4096:0,retired=0,extend=0;
+        if (growth) {
+            for (auto* node=space->ranges.head;node && node->range.begin<newEnd;node=node->next)
+                if (node->range.end>oldEnd) return static_cast<int64_t>(previous);
+            const auto* tail=MappingRangeFind(space->ranges,oldEnd-1);
+            if (tail && tail->end==oldEnd && tail->kind==MappingKind::Heap && tail->protection==3 &&
+                tail->maximumProtection==7 && tail->leafOwnership==MappingLeafOwnership::Managed &&
+                tail->sharing==MappingSharing::Private && !tail->backing) extend=tail->identity;
+        } else if (!operation.RangeLeafCount(newEnd,oldEnd,retired)) return static_cast<int64_t>(previous);
+        const uint64_t generation=space->generation;operation.Unlock();
+        if (!operation.Prepare(growth?growth:retired,growth) || !operation.PrepareRanges(3) ||
+            (growth && (!operation.PrepareZeroed(MemTag::User,space->allocationPid) || !VmmPrepareRange(space->pageTable,oldEnd,newEnd)))) {
+            if(!operation.Lock())return SnapshotProgramBreak(space);return static_cast<int64_t>(space->programBreak);
+        }
+        if(!operation.Lock())return SnapshotProgramBreak(space);if (space->generation!=generation || space->programBreak!=previous) continue;
+        if (growth) {
+            MappingRange heap{oldEnd,newEnd,0,0,nullptr,3,7,MappingKind::Heap,MappingSharing::Private,MappingLeafOwnership::Managed};
+            if (extend ? !operation.ExtendRange(extend,newEnd) : !operation.InsertRange(heap)) return static_cast<int64_t>(previous);
+            for (uint64_t i=0;i<growth;++i)
+                if (operation.Publish(i,VirtualAddress(oldEnd+i*4096),VMM_USER|VMM_WRITABLE|VMM_NO_EXEC,
+                                      MemTag::User,space->allocationPid)!=VmmMapResult::Mapped)
+                    KernelPanic("mapping: preflighted heap publication failed");
+        } else {
+            if (!operation.CanReplaceRange(newEnd,oldEnd)) return static_cast<int64_t>(previous);
+            if (!operation.ReplaceMapping(newEnd,oldEnd)) continue;
+        }
+        space->programBreak=requested;operation.Changed(false);return static_cast<int64_t>(requested);
+    }
+}
+int64_t UserMappingResize(Process* actor,AddressSpaceState* space,uint64_t source,uint64_t oldLength,
+                          uint64_t newLength,uint64_t flags,uint64_t destination,
+                          UserRemapPreparation prepare,void* context) {
+    constexpr uint64_t mayMove=1,fixed=2;
+    uint64_t oldEnd,newEnd;
+    if (!actor || !space || (flags & ~(mayMove|fixed)) || ((flags&fixed) && !(flags&mayMove)) ||
+        !UserInterval(source,oldLength,oldEnd) || !UserInterval(0,newLength,newEnd)) return -22;
+    oldLength=oldEnd-source;newLength=newEnd;
+    const uint64_t movedLength=oldLength<newLength?oldLength:newLength;
+    if (flags&fixed) {
+        if (!UserInterval(destination,newLength,newEnd) || destination<VIRTUAL_NULL_GUARD ||
+            (destination<oldEnd && source<newEnd)) return -22;
+    }
+    for (;;) {
+        MappingTransaction operation(actor,space);PmmThrottleForDrain();if(!operation.Lock())return -12;
+        MappingFaultSnapshot snapshot{};
+        if (!operation.CaptureMapping(source,snapshot) || snapshot.range.begin!=source || snapshot.range.end!=oldEnd) return -14;
+        if (snapshot.range.kind==MappingKind::Device && newLength>oldLength) return -22;
+        if (newLength==oldLength && !(flags&fixed)) return static_cast<int64_t>(source);
+        bool shrink=newLength<oldLength && !(flags&fixed),inPlace=false;
+        uint64_t target=source,count=0;
+        if (shrink) {
+            if (!operation.RangeLeafCount(source+newLength,oldEnd,count)) return -22;
+        } else if (!(flags&fixed)) {
+            inPlace=newLength<=0x0000800000000000ULL-source;
+            for (auto* node=space->ranges.head;inPlace && node && node->range.begin<source+newLength;node=node->next)
+                if (node->range.begin>=oldEnd) { inPlace=false;break; }
+            if (!inPlace) {
+                if (!(flags&mayMove)) return -12;
+                UserMappingRequest request{};request.length=newLength;
+                target=PickMappingAddress(space,request);if (!target) return -12;
+            }
+        } else {
+            target=destination;
+            if (!operation.RangeLeafCount(target,target+newLength,count)) return -22;
+        }
+        if (!shrink && !inPlace && newLength<oldLength) {
+            uint64_t tail=0;if (!operation.RangeLeafCount(source+newLength,oldEnd,tail)) return -22;
+            count+=tail;
+        }
+        operation.Unlock();
+        if (!operation.Prepare(count,0) || !operation.PrepareRanges(3)) return -12;
+        if (newLength>oldLength && prepare) {
+            int error=prepare(snapshot.range,newLength,context);if (error) return error;
+        }
+        if (!shrink && !inPlace && !VmmPrepareMove(space->pageTable,source,source+movedLength,target)) return -12;
+        if(!operation.Lock())return -12;if (!operation.ValidateMapping(snapshot,source)) continue;
+        if (shrink) {
+            if (!operation.CanReplaceRange(source+newLength,oldEnd)) return -12;
+            if (!operation.ReplaceMapping(source+newLength,oldEnd)) continue;
+            return static_cast<int64_t>(source);
+        }
+        if (inPlace) return operation.ExtendRange(snapshot.range.identity,source+newLength)?static_cast<int64_t>(source):-12;
+        if (!VmmCanMoveRange(space->pageTable,source,source+movedLength,target,(flags&fixed)!=0)) continue;
+        uint64_t destinationLeaves=0,tailLeaves=0;
+        if (!operation.RangeLeafCount(target,target+newLength,destinationLeaves) ||
+            (newLength<oldLength && !operation.RangeLeafCount(source+newLength,oldEnd,tailLeaves))) return -22;
+        if (destinationLeaves+tailLeaves>count) continue;
+        MappingRange replacement=snapshot.range;replacement.begin=target;replacement.end=target+newLength;replacement.identity=0;
+        if (!operation.CanReplaceRange(target,target+newLength,&replacement) || !operation.CanReplaceRange(source,oldEnd)) return -12;
+        if (!operation.ReplaceMapping(target,target+newLength,&replacement)) continue;
+        if (!VmmMoveRange(space->pageTable,source,source+movedLength,target)) KernelPanic("mapping: preflighted move failed");
+        if (!operation.ReplaceMapping(source,oldEnd)) KernelPanic("mapping: source retirement changed under lock");
+        operation.RequireShootdown();
+        if (target+newLength>space->mmapNext) space->mmapNext=target+newLength;
+        return static_cast<int64_t>(target);
+    }
+}
+}

@@ -31,6 +31,10 @@ static constexpr uint64_t VMM_FORCE_MAP    = (1ULL << 62); // bypass null guard 
 static constexpr uint64_t PTE_TAG_SHIFT  = 9;
 static constexpr uint64_t PTE_TAG_MASK   = (0x7ULL   << PTE_TAG_SHIFT);
 static constexpr uint64_t PTE_COW_BIT    = (1ULL << 52); // COW: page was writable, now RO-shared
+// Bit 8 is software-only while PRESENT=0. User leaves never use GLOBAL. A
+// hidden leaf retains its frame reference/map count but grants no CPU access.
+static constexpr uint64_t PTE_HIDDEN_BIT = (1ULL << 8);
+inline bool VmmLeafBacked(uint64_t leaf) { return (leaf & (VMM_PRESENT | PTE_HIDDEN_BIT)) != 0; }
 static constexpr uint64_t PTE_PID_SHIFT  = 53;
 static constexpr uint64_t PTE_PID_MASK   = (0x3FFULL << PTE_PID_SHIFT); // 10 bits = max 1024 PIDs
 
@@ -39,7 +43,7 @@ static constexpr uint64_t VMALLOC_BASE  = 0xFFFFC00000000000ULL;
 static constexpr uint64_t VMALLOC_SIZE  = 32ULL * 1024 * 1024 * 1024; // 32GB
 
 // Direct physical map: all physical RAM mapped here by the bootloader (2MB pages).
-#ifdef BROOK_HOST_TEST
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
 // Hosted VMM tests use aligned host allocations as physical frames.
 static constexpr uint64_t DIRECT_MAP_BASE = 0;
 #else
@@ -89,7 +93,8 @@ bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,
 enum class VmmMapResult { Mapped, Occupied, OutOfMemory, InvalidAddress };
 VmmMapResult VmmTryMapPage(PageTable pt, VirtualAddress virtAddr,
                            PhysicalAddress physAddr, uint64_t flags,
-                           MemTag tag = MemTag::KernelData, uint16_t pid = KernelPid);
+                           MemTag tag = MemTag::KernelData, uint16_t pid = KernelPid,
+                           bool accessible = true);
 
 // Atomically detach a present 4KB leaf and return its complete PTE. Its frame
 // reference (if managed by the caller) transfers to the caller WITHOUT unref.
@@ -100,6 +105,7 @@ uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr);
 // Conditional detach for rollback; a replacement frame is left untouched.
 uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected);
 PhysicalAddress VmmLeafPhysical(uint64_t leaf);
+uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address); // locked value snapshot, including hidden leaves
 // Visit only allocated user page tables intersecting [begin,end), never each
 // virtual page of an empty reservation. Huge user leaves are unsupported and
 // cause false before any mutation. Detach preflights capacity under the same
@@ -110,6 +116,17 @@ using VmmRetireLeaf = void (*)(VirtualAddress, uint64_t leaf, void* context);
 bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* count);
 bool VmmDetachRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t capacity,
                     VmmRetireLeaf retire, void* context, uint64_t* count);
+using VmmPrivateLeafQuery = bool (*)(VirtualAddress, uint64_t leaf, void* context);
+// Preserve backing and ownership through PROT_NONE. Writable private shared
+// frames keep/get CoW; borrowed/shared-object leaves must return false in query.
+bool VmmProtectRange(PageTable pt, uint64_t begin, uint64_t end, uint32_t protection,
+                     VmmPrivateLeafQuery query, void* context);
+// Prepare intermediate tables without changing leaves. Empty tables left by
+// failure remain AS-owned. Used before a destructive fixed replacement commit.
+bool VmmPrepareRange(PageTable pt, uint64_t begin, uint64_t end);
+bool VmmPrepareMove(PageTable pt, uint64_t begin, uint64_t end, uint64_t destination);
+bool VmmCanMoveRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t destination, bool occupiedDestination);
+bool VmmMoveRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t destination);
 
 // Unmap a single 4KB page. Issues INVLPG. No-op if not mapped.
 void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr);

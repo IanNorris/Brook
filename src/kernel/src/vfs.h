@@ -16,6 +16,7 @@ namespace brook {
 enum class VnodeType : uint8_t { File, Dir, Device };
 
 struct Vnode;
+struct FileObject;
 struct DirEntry;
 struct VnodeStat;
 
@@ -52,6 +53,8 @@ struct VnodeOps {
     int (*chmod)(Vnode* vn, uint16_t mode) = nullptr;
     // Resize a regular file without changing any open-file-description offset.
     int (*truncate)(Vnode* vn, uint64_t size) = nullptr;
+    // Borrowed stable live-inode object; caller retains vn through use.
+    FileObject* (*file_object)(Vnode* vn) = nullptr;
 };
 
 struct Vnode {
@@ -61,6 +64,12 @@ struct Vnode {
     uint32_t        refCount; // reference count for fork/dup sharing
     uint64_t        cacheId;  // global file identity for page cache; 0 disables caching (not st_ino)
 };
+
+// Caller must already own a live vnode reference. This is retention, not a
+// safe way to acquire a reference from an unprotected raw pointer.
+inline void VfsRetain(Vnode* vn) {
+    __atomic_fetch_add(&vn->refCount, 1, __ATOMIC_RELEASE);
+}
 
 struct DirEntry {
     char     name[256];

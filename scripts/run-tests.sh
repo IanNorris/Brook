@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Usage: run-tests.sh [debug|release] [test_heap test_vfs ...]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -140,8 +141,15 @@ EOF
 found_any=0
 for test_elf in "${BUILD_DIR}/tests/"*.elf; do
     [ -f "${test_elf}" ] || continue
-    found_any=1
     TEST_NAME="$(basename "${test_elf}" .elf)"
+    if [ "$#" -gt 1 ]; then
+        selected=0
+        for requested in "${@:2}"; do
+            if [ "$requested" = "$TEST_NAME" ]; then selected=1; break; fi
+        done
+        if [ "$selected" -eq 0 ]; then continue; fi
+    fi
+    found_any=1
     run_test "${TEST_NAME}"
 done
 

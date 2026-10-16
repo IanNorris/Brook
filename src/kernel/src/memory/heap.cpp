@@ -109,7 +109,9 @@ struct BlockHeader
     uint32_t size;   // total block size including header + footer
     uint32_t free;   // 1 = free, 0 = allocated
     uint32_t _pad;
-    uint8_t  _alignPad[48];
+    BlockHeader* freePrev; // valid only while indexed as free
+    BlockHeader* freeNext;
+    uint8_t  _alignPad[32];
 };
 
 struct BlockFooter
@@ -118,6 +120,8 @@ struct BlockFooter
     uint32_t magic;
     uint8_t  _alignPad[56];
 };
+
+static_assert(sizeof(BlockHeader) == 64 && sizeof(BlockFooter) == 64, "heap boundary-tag ABI");
 
 static constexpr uint64_t HEADER_SIZE   = sizeof(BlockHeader);
 static constexpr uint64_t FOOTER_SIZE   = sizeof(BlockFooter);
@@ -131,15 +135,104 @@ static constexpr uint64_t MIN_BLOCK     = OVERHEAD + ALIGN; // smallest useful b
 static uint8_t* g_heapStart   = nullptr;
 static uint8_t* g_heapEnd     = nullptr;  // exclusive
 static uint64_t g_freeBytes   = 0;
+static BlockHeader* g_freeBins[32] = {};
+static uint32_t g_freeBinMask = 0;
 
 // SMP lock protecting all heap metadata.
 // IrqSpinLock: prevents preemption deadlock when timer interrupt
 // fires while a CPU holds the lock.
 static IrqSpinLock g_heapLock;
 
+// Runtime-off fast path uses the existing IRQ lock unchanged. Generation drops
+// acquisitions that straddle enable/reset, so an old waiter cannot pollute a
+// fresh measurement interval. All counters are protected by g_heapLock.
+static bool g_heapTimingEnabled = false;
+static uint64_t g_heapTimingGeneration = 0;
+static HeapTimingStats g_heapTiming;
+
+static uint64_t HeapTimingTsc()
+{
+    uint32_t lo, hi;
+    __asm__ volatile("lfence; rdtsc; lfence" : "=a"(lo), "=d"(hi) :: "memory");
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+class HeapTimedLock {
+    uint64_t flags = 0, acquired = 0, wait = 0;
+    bool locked = true;
+public:
+    bool measured = false;
+    uint64_t headers = 0;
+    explicit HeapTimedLock(unsigned operation)
+    {
+        if (!__atomic_load_n(&g_heapTimingEnabled, __ATOMIC_RELAXED)) {
+            flags = IrqSpinLockAcquire(&g_heapLock);
+            return;
+        }
+#if !defined(BROOK_HOST_TEST) || defined(BROOK_STANDALONE_TEST)
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+#endif
+        const uint64_t generation = __atomic_load_n(&g_heapTimingGeneration, __ATOMIC_RELAXED);
+        const uint64_t start = HeapTimingTsc();
+        // Already IF=0; retain the original caller flags for the final release.
+        (void)IrqSpinLockAcquire(&g_heapLock);
+        acquired = HeapTimingTsc();
+        measured = __atomic_load_n(&g_heapTimingEnabled, __ATOMIC_RELAXED) &&
+                   generation == __atomic_load_n(&g_heapTimingGeneration, __ATOMIC_RELAXED);
+        if (measured) {
+            wait = acquired - start;
+            if (operation == 0) ++g_heapTiming.allocations;
+            else if (operation == 1) ++g_heapTiming.frees;
+            else ++g_heapTiming.reallocations;
+        }
+    }
+    void Unlock()
+    {
+        if (!locked) return;
+        if (measured) {
+            const uint64_t hold = HeapTimingTsc() - acquired;
+            g_heapTiming.headers += headers;
+            if (headers > g_heapTiming.maxHeaders) g_heapTiming.maxHeaders = headers;
+            g_heapTiming.waitCycles += wait;
+            if (wait > g_heapTiming.maxWaitCycles) g_heapTiming.maxWaitCycles = wait;
+            g_heapTiming.holdCycles += hold;
+            if (hold > g_heapTiming.maxHoldCycles) g_heapTiming.maxHoldCycles = hold;
+        }
+        locked = false;
+        IrqSpinLockRelease(&g_heapLock, flags);
+    }
+    ~HeapTimedLock() { Unlock(); }
+};
+
+class HeapExpansionTiming {
+    bool measured;
+    uint64_t start;
+public:
+    explicit HeapExpansionTiming(bool enabled) : measured(enabled), start(enabled ? HeapTimingTsc() : 0)
+    { if (measured) ++g_heapTiming.expansions; }
+    ~HeapExpansionTiming() {
+        if (!measured) return;
+        const uint64_t cycles = HeapTimingTsc() - start;
+        g_heapTiming.expansionCycles += cycles;
+        if (cycles > g_heapTiming.maxExpansionCycles) g_heapTiming.maxExpansionCycles = cycles;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+// Boundary tags have uint32 sizes, and every block is ALIGN-aligned.
+static constexpr uint64_t MAX_BLOCK_SIZE = (0xFFFFFFFFULL & ~(ALIGN - 1));
+static bool RequestBlockSize(uint64_t requested, uint32_t* needed)
+{
+    // Check before adding either alignment slack or metadata.
+    if (requested == 0 || requested > MAX_BLOCK_SIZE - OVERHEAD) return false;
+    const uint64_t rounded = (requested + ALIGN - 1) & ~(ALIGN - 1);
+    const uint64_t total = rounded + OVERHEAD;
+    *needed = static_cast<uint32_t>(total < MIN_BLOCK ? MIN_BLOCK : total);
+    return true;
+}
 
 static inline BlockHeader* ToHeader(void* userPtr)
 {
@@ -178,6 +271,47 @@ static inline bool IsValidHeader(BlockHeader* h)
     return h != nullptr && h->magic == HEADER_MAGIC;
 }
 
+// Floor-log2 classes. Only the requested class may contain undersized
+// blocks; every block in a larger class is large enough. Links live outside
+// the poisoned payload. All index operations require g_heapLock.
+static unsigned FreeBin(uint32_t size)
+{
+    return 31u - static_cast<unsigned>(__builtin_clz(size));
+}
+
+static void FreeInsert(BlockHeader* h)
+{
+    const unsigned bin = FreeBin(h->size);
+    h->freePrev = nullptr;
+    h->freeNext = g_freeBins[bin];
+    if (h->freeNext) h->freeNext->freePrev = h;
+    g_freeBins[bin] = h;
+    g_freeBinMask |= uint32_t{1} << bin;
+}
+
+static void FreeRemove(BlockHeader* h)
+{
+    const unsigned bin = FreeBin(h->size);
+    if (h->freePrev) h->freePrev->freeNext = h->freeNext;
+    else g_freeBins[bin] = h->freeNext;
+    if (h->freeNext) h->freeNext->freePrev = h->freePrev;
+    if (!g_freeBins[bin]) g_freeBinMask &= ~(uint32_t{1} << bin);
+    h->freePrev = h->freeNext = nullptr;
+}
+
+static BlockHeader* FreeFind(uint32_t needed, HeapTimedLock& timing)
+{
+    const unsigned bin = FreeBin(needed);
+    for (BlockHeader* h = g_freeBins[bin]; h; h = h->freeNext) {
+        if (timing.measured) ++timing.headers;
+        if (h->size >= needed) return h;
+    }
+    const uint32_t larger = bin == 31 ? 0 : g_freeBinMask & (~uint32_t{0} << (bin + 1));
+    if (!larger) return nullptr;
+    if (timing.measured) ++timing.headers;
+    return g_freeBins[__builtin_ctz(larger)];
+}
+
 static void WriteBlock(uint8_t* base, uint32_t size, uint32_t free)
 {
 #ifndef BROOK_HOST_TEST
@@ -189,6 +323,8 @@ static void WriteBlock(uint8_t* base, uint32_t size, uint32_t free)
     h->size   = size;
     h->free   = free;
     h->_pad   = 0;
+    // Free-block reseeding (HeapSetPoison) must preserve existing index links.
+    if (!free) h->freePrev = h->freeNext = nullptr;
     auto* f   = GetFooter(h);
     f->size   = size;
     f->magic  = FOOTER_MAGIC;
@@ -230,30 +366,49 @@ static void WriteBlock(uint8_t* base, uint32_t size, uint32_t free)
 // Returns true on success.
 static bool HeapMapPages(uint64_t virtStart, uint64_t pageCount)
 {
-    for (uint64_t i = 0; i < pageCount; i++)
+    // The range remains unpublished: g_heapEnd and all boundary tags stay
+    // unchanged until every page is mapped. Neither this CPU nor any allocator
+    // client accesses these new addresses before success. Thus rollback needs
+    // local invalidation, but no remote shootdown (there are no remote users).
+    uint64_t mapped = 0;
+    for (; mapped < pageCount; ++mapped)
     {
-        uint64_t virt = virtStart + i * 4096;
+        const uint64_t virt = virtStart + mapped * 4096;
         PhysicalAddress phys = PmmAllocPage(MemTag::Heap, KernelPid);
-        if (!phys) return false;
-        if (!VmmMapPage(KernelPageTable, VirtualAddress(virt), phys, VMM_WRITABLE, MemTag::Heap, KernelPid))
+        if (!phys) break;
+        if (VmmTryMapPage(KernelPageTable, VirtualAddress(virt), phys,
+                         VMM_WRITABLE, MemTag::Heap, KernelPid) != VmmMapResult::Mapped)
         {
             PmmFreePage(phys);
-            return false;
+            break;
         }
     }
-    return true;
+    if (mapped == pageCount) return true;
+    while (mapped) {
+        const uint64_t leaf = VmmDetachPage(KernelPageTable,
+            VirtualAddress(virtStart + --mapped * 4096));
+        if (leaf) PmmUnrefPage(VmmLeafPhysical(leaf));
+    }
+    // Empty intermediate tables are still owned by the kernel page table and
+    // reusable by a subsequent attempt; all newly installed leaf refs are gone.
+    return false;
 }
 
 // Expand the heap by at least minBytes (rounded up to page granularity).
 // Always contiguous since we control the virtual address region.
-static bool ExpandHeap(uint64_t minBytes = 0)
+static bool ExpandHeap(uint64_t minBytes, bool measured)
 {
-    uint64_t expandPages = EXPAND_PAGES;
-    if (minBytes > expandPages * 4096)
-        expandPages = (minBytes + 4095) / 4096;
-
-    uint64_t expandVirt = reinterpret_cast<uint64_t>(g_heapEnd);
-    if (expandVirt + expandPages * 4096 > HEAP_VIRT_MAX)
+    HeapExpansionTiming timing(measured);
+    if (minBytes > MAX_BLOCK_SIZE) return false;
+    uint64_t extra = EXPAND_PAGES * 4096;
+    if (minBytes > extra) extra = (minBytes + 4095) & ~uint64_t{4095};
+    // A page-rounded maximum-size request can require more than one block.
+    // Ensure its second block has room for both boundary tags and payload.
+    if (extra > MAX_BLOCK_SIZE && extra - MAX_BLOCK_SIZE < MIN_BLOCK)
+        extra += 4096;
+    const uint64_t expandPages = extra / 4096;
+    const uint64_t expandVirt = reinterpret_cast<uint64_t>(g_heapEnd);
+    if (expandVirt > HEAP_VIRT_MAX || extra > HEAP_VIRT_MAX - expandVirt)
     {
         SerialPuts("Heap: expansion would exceed max virtual region\n");
         return false;
@@ -265,31 +420,38 @@ static bool ExpandHeap(uint64_t minBytes = 0)
         return false;
     }
 
-    // Always contiguous — merge with the last block or add a new free block.
-    BlockHeader* cur  = reinterpret_cast<BlockHeader*>(g_heapStart);
-    BlockHeader* prev = nullptr;
-    while (reinterpret_cast<uint8_t*>(cur) < g_heapEnd - HEADER_SIZE
-           && IsValidHeader(cur))
-    {
-        prev = cur;
-        cur  = NextBlock(cur);
-    }
+    // Boundary footer finds the tail in O(1), without scanning live blocks.
+    BlockHeader* prev = g_heapEnd > g_heapStart
+        ? PrevBlock(reinterpret_cast<BlockHeader*>(g_heapEnd)) : nullptr;
+    if (measured && prev) ++g_heapTiming.expansionHeaders;
 
-    uint32_t extra = static_cast<uint32_t>(expandPages * 4096);
-    bool merged = prev && prev->free;
+    const bool merged = prev && prev->free && extra <= MAX_BLOCK_SIZE - prev->size;
     if (merged)
     {
-        WriteBlock(reinterpret_cast<uint8_t*>(prev), prev->size + extra, 1);
+        FreeRemove(prev);
+        WriteBlock(reinterpret_cast<uint8_t*>(prev),
+                   static_cast<uint32_t>(prev->size + extra), 1);
+        FreeInsert(prev);
+        g_freeBytes += extra;
+    }
+    else if (extra <= MAX_BLOCK_SIZE)
+    {
+        WriteBlock(g_heapEnd, static_cast<uint32_t>(extra), 1);
+        FreeInsert(reinterpret_cast<BlockHeader*>(g_heapEnd));
+        g_freeBytes += extra - OVERHEAD;
     }
     else
     {
-        WriteBlock(g_heapEnd, extra, 1);
+        WriteBlock(g_heapEnd, static_cast<uint32_t>(MAX_BLOCK_SIZE), 1);
+        WriteBlock(g_heapEnd + MAX_BLOCK_SIZE,
+                   static_cast<uint32_t>(extra - MAX_BLOCK_SIZE), 1);
+        FreeInsert(reinterpret_cast<BlockHeader*>(g_heapEnd));
+        FreeInsert(reinterpret_cast<BlockHeader*>(g_heapEnd + MAX_BLOCK_SIZE));
+        g_freeBytes += extra - 2 * OVERHEAD;
     }
-    g_heapEnd   += extra;
-    // A separate free block needs its own header and footer.
-    g_freeBytes += extra - (merged ? 0 : OVERHEAD);
+    g_heapEnd += extra;
 
-    DbgPrintf("Heap: expanded by %u KB (total %lu KB)\n",
+    DbgPrintf("Heap: expanded by %lu KB (total %lu KB)\n",
                  extra / 1024,
                  (unsigned long)(g_heapEnd - g_heapStart) / 1024);
     return true;
@@ -313,6 +475,9 @@ void HeapInit()
     // Write a single free block filling the entire region.
     uint32_t blockSize = static_cast<uint32_t>(INITIAL_PAGES * 4096);
     WriteBlock(g_heapStart, blockSize, 1);
+    for (auto& bin : g_freeBins) bin = nullptr;
+    g_freeBinMask = 0;
+    FreeInsert(reinterpret_cast<BlockHeader*>(g_heapStart));
     g_freeBytes = blockSize - OVERHEAD;
 
     SerialPrintf("Heap: %u KB initial region at 0x%p\n",
@@ -324,19 +489,17 @@ void* kmalloc(uint64_t size)
 {
     if (size == 0 || g_heapStart == nullptr) return nullptr;
 
-    uint64_t heapFlags = IrqSpinLockAcquire(&g_heapLock);
+    HeapTimedLock timing(0);
 
-    // Round size up to alignment, then account for overhead.
-    uint64_t aligned = (size + ALIGN - 1) & ~(ALIGN - 1);
-    uint32_t needed  = static_cast<uint32_t>(aligned + OVERHEAD);
-    if (needed < MIN_BLOCK) needed = static_cast<uint32_t>(MIN_BLOCK);
+    uint32_t needed;
+    if (!RequestBlockSize(size, &needed)) return nullptr;
 
-    // First-fit search.
+    // Search free blocks only; retain one retry after expansion.
     for (int pass = 0; pass < 2; pass++)
     {
-        BlockHeader* cur = reinterpret_cast<BlockHeader*>(g_heapStart);
+        BlockHeader* cur = FreeFind(needed, timing);
 
-        while (reinterpret_cast<uint8_t*>(cur) < g_heapEnd)
+        if (cur)
         {
             if (!IsValidHeader(cur)) break;
 
@@ -368,14 +531,16 @@ void* kmalloc(uint64_t size)
                     }
                 }
 
+                FreeRemove(cur);
                 uint32_t allocSize = cur->size; // consume entire free block
                 // Remove the old free block's usable-byte contribution.
                 g_freeBytes -= (cur->size - OVERHEAD);
-                if (cur->size >= needed + static_cast<uint32_t>(MIN_BLOCK))
+                if (cur->size - needed >= MIN_BLOCK)
                 {
                     // Split: remainder is large enough to be its own block
                     uint32_t remSize = cur->size - needed;
                     WriteBlock(reinterpret_cast<uint8_t*>(cur) + needed, remSize, 1);
+                    FreeInsert(reinterpret_cast<BlockHeader*>(reinterpret_cast<uint8_t*>(cur) + needed));
                     g_freeBytes += remSize - OVERHEAD;
                     allocSize = needed;
                 }
@@ -392,18 +557,17 @@ void* kmalloc(uint64_t size)
                         dst[i] = POISON_ALLOC;
                 }
 
-                IrqSpinLockRelease(&g_heapLock, heapFlags);
+                timing.Unlock();
                 return result;
             }
 
-            cur = NextBlock(cur);
         }
 
         // First pass exhausted — try to expand with enough room.
-        if (pass == 0 && !ExpandHeap(needed)) { IrqSpinLockRelease(&g_heapLock, heapFlags); return nullptr; }
+        if (pass == 0 && !ExpandHeap(needed, timing.measured)) { timing.Unlock(); return nullptr; }
     }
 
-    IrqSpinLockRelease(&g_heapLock, heapFlags);
+    timing.Unlock();
     return nullptr;
 }
 
@@ -411,23 +575,25 @@ void kfree(void* ptr)
 {
     if (ptr == nullptr) return;
 
-    uint64_t heapFlags = IrqSpinLockAcquire(&g_heapLock);
+    HeapTimedLock timing(1);
 
     BlockHeader* h = ToHeader(ptr);
 #ifndef BROOK_HOST_TEST
     UnixLifeHeap(ptr, 0, UnixLifeEvent::HeapAttempt, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 #endif
-    if (!IsValidHeader(h)) { IrqSpinLockRelease(&g_heapLock, heapFlags); return; }
-    if (h->free) { IrqSpinLockRelease(&g_heapLock, heapFlags); return; }
+    if (!IsValidHeader(h)) { timing.Unlock(); return; }
+    if (h->free) { timing.Unlock(); return; }
 
     g_freeBytes += h->size - OVERHEAD;
 
     // Coalesce with next block if free.
     BlockHeader* next = NextBlock(h);
     uint32_t totalSize = h->size;
-    if (reinterpret_cast<uint8_t*>(next) < g_heapEnd && IsValidHeader(next) && next->free)
+    if (reinterpret_cast<uint8_t*>(next) < g_heapEnd && IsValidHeader(next) && next->free
+        && next->size <= MAX_BLOCK_SIZE - totalSize)
     {
         // Merging recovers one header/footer pair as usable free payload.
+        FreeRemove(next);
         g_freeBytes += OVERHEAD;
         totalSize += next->size;
     }
@@ -444,42 +610,43 @@ void kfree(void* ptr)
     if (reinterpret_cast<uint8_t*>(h) > g_heapStart)
     {
         BlockHeader* prev = PrevBlock(h);
-        if (IsValidHeader(prev) && prev->free)
+        if (IsValidHeader(prev) && prev->free && prev->size <= MAX_BLOCK_SIZE - h->size)
         {
+            FreeRemove(prev);
             g_freeBytes += OVERHEAD;
 #ifndef BROOK_HOST_TEST
             UnixLifeHeap(prev, prev->size + h->size, UnixLifeEvent::HeapFree,
                          reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 #endif
             WriteBlock(reinterpret_cast<uint8_t*>(prev), prev->size + h->size, 1);
+            h = prev;
         }
     }
+    FreeInsert(h);
 
-    IrqSpinLockRelease(&g_heapLock, heapFlags);
+    timing.Unlock();
 }
 void* krealloc(void* ptr, uint64_t newSize)
 {
     if (ptr == nullptr) return kmalloc(newSize);
     if (newSize == 0) { kfree(ptr); return nullptr; }
 
-    uint64_t heapFlags = IrqSpinLockAcquire(&g_heapLock);
+    HeapTimedLock timing(2);
 
     BlockHeader* h = ToHeader(ptr);
-    if (!IsValidHeader(h)) { IrqSpinLockRelease(&g_heapLock, heapFlags); return nullptr; }
+    if (!IsValidHeader(h)) { timing.Unlock(); return nullptr; }
 
-    uint64_t aligned = (newSize + ALIGN - 1) & ~(ALIGN - 1);
-    uint32_t needed  = static_cast<uint32_t>(aligned + OVERHEAD);
-    if (needed < static_cast<uint32_t>(MIN_BLOCK))
-        needed = static_cast<uint32_t>(MIN_BLOCK);
+    uint32_t needed;
+    if (!RequestBlockSize(newSize, &needed)) return nullptr;
 
     // Block is already large enough.
-    if (h->size >= needed) { IrqSpinLockRelease(&g_heapLock, heapFlags); return ptr; }
+    if (h->size >= needed) { timing.Unlock(); return ptr; }
 
     // Snapshot the copy size while we still hold the lock and the block is valid.
     uint64_t copyBytes = h->size - OVERHEAD;
     if (copyBytes > newSize) copyBytes = newSize;
 
-    IrqSpinLockRelease(&g_heapLock, heapFlags);
+    timing.Unlock();
 
     // Allocate new block, copy, free old.
     void* newPtr = kmalloc(newSize);
@@ -504,6 +671,7 @@ bool HeapCheckIntegrity()
 
     uint32_t blockCount = 0;
     uint64_t freeBytes = 0;
+    uint64_t freeCounts[32] = {};
     BlockHeader* cur = reinterpret_cast<BlockHeader*>(g_heapStart);
 
     while (reinterpret_cast<uint8_t*>(cur) < g_heapEnd)
@@ -517,7 +685,7 @@ bool HeapCheckIntegrity()
             return false;
         }
 
-        if (cur->size < MIN_BLOCK || cur->size > static_cast<uint32_t>(g_heapEnd - g_heapStart))
+        if (cur->size < MIN_BLOCK || (cur->size & (ALIGN - 1)) || cur->size > static_cast<uint64_t>(g_heapEnd - reinterpret_cast<uint8_t*>(cur)))
         {
             uint64_t off = reinterpret_cast<uint8_t*>(cur) - g_heapStart;
             SerialPrintf("HeapCheck: invalid size %u at block #%u offset 0x%lx\n",
@@ -537,9 +705,52 @@ bool HeapCheckIntegrity()
             return false;
         }
 
-        if (cur->free) freeBytes += cur->size - OVERHEAD;
+        if (cur->free) {
+            freeBytes += cur->size - OVERHEAD;
+            ++freeCounts[FreeBin(cur->size)];
+            cur->_pad = 1; // diagnostic visitation mark, not allocator state
+        } else if (cur->freePrev || cur->freeNext) {
+            SerialPuts("HeapCheck: allocated block has free-index links\n");
+            IrqSpinLockRelease(&g_heapLock, heapFlags);
+            return false;
+        }
         blockCount++;
         cur = NextBlock(cur);
+    }
+
+    // A bounded walk catches cycles/duplicates, missing nodes, wrong classes,
+    // broken backlinks and stale bitmap entries without allocating scratch.
+    for (unsigned bin = 0; bin < 32; ++bin) {
+        uint64_t count = 0;
+        BlockHeader* prev = nullptr;
+        bool valid = bool(g_freeBinMask & (uint32_t{1} << bin)) == bool(g_freeBins[bin]);
+        for (BlockHeader* node = g_freeBins[bin]; valid && node; node = node->freeNext) {
+            const uint64_t address = reinterpret_cast<uint64_t>(node);
+            if (++count > freeCounts[bin] || address < reinterpret_cast<uint64_t>(g_heapStart) ||
+                address > reinterpret_cast<uint64_t>(g_heapEnd) - MIN_BLOCK ||
+                (address & (ALIGN - 1)) || !IsValidHeader(node) || !node->free ||
+                node->size < MIN_BLOCK || (node->size & (ALIGN - 1)) ||
+                FreeBin(node->size) != bin || node->freePrev != prev || node->_pad != 1) {
+                valid = false;
+                break;
+            }
+            node->_pad = 0;
+            prev = node;
+        }
+        if (!valid || count != freeCounts[bin]) {
+            SerialPrintf("HeapCheck: free-index mismatch in bin %u\n", bin);
+            IrqSpinLockRelease(&g_heapLock, heapFlags);
+            return false;
+        }
+    }
+
+    for (cur = reinterpret_cast<BlockHeader*>(g_heapStart);
+         reinterpret_cast<uint8_t*>(cur) < g_heapEnd; cur = NextBlock(cur)) {
+        if (cur->free && cur->_pad != 0) {
+            SerialPuts("HeapCheck: physical free block missing from index\n");
+            IrqSpinLockRelease(&g_heapLock, heapFlags);
+            return false;
+        }
     }
 
     if (freeBytes != g_freeBytes) {
@@ -550,6 +761,57 @@ bool HeapCheckIntegrity()
     }
     IrqSpinLockRelease(&g_heapLock, heapFlags);
     return true;
+}
+
+void HeapTimingEnable(bool enabled)
+{
+    const uint64_t flags = IrqSpinLockAcquire(&g_heapLock);
+    __atomic_add_fetch(&g_heapTimingGeneration, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_heapTimingEnabled, enabled, __ATOMIC_RELAXED);
+    IrqSpinLockRelease(&g_heapLock, flags);
+}
+
+void HeapTimingReset()
+{
+    const uint64_t flags = IrqSpinLockAcquire(&g_heapLock);
+    g_heapTiming = {};
+    __atomic_add_fetch(&g_heapTimingGeneration, 1, __ATOMIC_RELAXED);
+    IrqSpinLockRelease(&g_heapLock, flags);
+}
+
+void HeapTimingSnapshot(HeapTimingStats* out)
+{
+    if (!out) return;
+    const uint64_t flags = IrqSpinLockAcquire(&g_heapLock);
+    *out = g_heapTiming;
+    out->enabled = __atomic_load_n(&g_heapTimingEnabled, __ATOMIC_RELAXED);
+    IrqSpinLockRelease(&g_heapLock, flags);
+}
+
+void HeapTimingFormat(char* out, uint64_t capacity)
+{
+    if (!out || !capacity) return;
+    HeapTimingStats stats;
+    HeapTimingSnapshot(&stats);
+    uint64_t used = 0;
+    auto append = [&](const char* text) {
+        while (*text) { if (used + 1 < capacity) out[used++] = *text; ++text; }
+    };
+    auto value = [&](const char* name, uint64_t number) {
+        append(name);
+        char digits[20]; unsigned count = 0;
+        do { digits[count++] = static_cast<char>('0' + number % 10); number /= 10; } while (number);
+        while (count) { char text[2] = {digits[--count], 0}; append(text); }
+    };
+    append(stats.enabled ? "heap timing: on (raw TSC cycles)\n" : "heap timing: off (raw TSC cycles)\n");
+    value("alloc=", stats.allocations); value(" free=", stats.frees); value(" realloc=", stats.reallocations);
+    value(" expand_attempts=", stats.expansions); append("\n");
+    value("search_headers=", stats.headers); value(" max_search_headers=", stats.maxHeaders);
+    value(" expand_headers=", stats.expansionHeaders); append("\n");
+    value("irqoff_wait_cycles=", stats.waitCycles); value(" max=", stats.maxWaitCycles); append("\n");
+    value("hold_cycles=", stats.holdCycles); value(" max=", stats.maxHoldCycles); append("\n");
+    value("expand_cycles=", stats.expansionCycles); value(" max=", stats.maxExpansionCycles); append("\n");
+    out[used] = 0;
 }
 
 void HeapSetPoison(bool enable)

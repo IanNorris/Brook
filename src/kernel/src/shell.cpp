@@ -130,7 +130,9 @@ const char* const g_defaultEnvp[] = {
     "GSETTINGS_BACKEND=memory",
     "GIO_USE_VFS=local",
     "NO_AT_BRIDGE=1",
-    "GIMP3_PLUGINDIR=/nix/share/gimp-lite",
+    // Reduced GIMP plugin trees are optional image assets. Legacy lite
+    // scenarios select them through an explicit gimprc; ordinary package
+    // launches must use the package's own plugin directory.
     "LIBVA_DRIVERS_PATH=/nonexistent",
     "VDPAU_DRIVER=none",
     "SAL_USE_VCLPLUGIN=gtk3",
@@ -1267,6 +1269,18 @@ static int ExecCommand(int argc, const char* const* argv)
         {
             bool ok = HeapCheckIntegrity();
             KPrintf("Heap integrity: %s\n", ok ? "OK" : "CORRUPT");
+        }
+        else if (argc >= 2 && StrEq(argv[1], "timing"))
+        {
+            if (argc >= 3) {
+                if (StrEq(argv[2], "on")) HeapTimingEnable(true);
+                else if (StrEq(argv[2], "off")) HeapTimingEnable(false);
+                else if (StrEq(argv[2], "reset")) HeapTimingReset();
+                else if (!StrEq(argv[2], "status")) return -1;
+            }
+            char report[768];
+            HeapTimingFormat(report, sizeof(report));
+            KPrintf("%s", report);
         }
         else if (argc >= 3 && StrEq(argv[1], "poison"))
         {

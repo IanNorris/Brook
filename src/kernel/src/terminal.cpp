@@ -9,12 +9,64 @@
 #include "input.h"
 #include "memory/heap.h"
 #include "memory/virtual_memory.h"
+#include "memory/user_mapping.h"
 #include "serial.h"
 #include "serial_writer.h"
 #include "vfs.h"
 #include "string.h"
 
 namespace brook {
+
+static KMutex g_terminalStateLock{};
+struct TerminalStateGuard {
+    TerminalStateGuard() { KMutexLock(&g_terminalStateLock); }
+    ~TerminalStateGuard() { KMutexUnlock(&g_terminalStateLock); }
+};
+static bool AllocateTerminalPixels(uint32_t width,uint32_t height,uint32_t** pixels,
+                                   MappingBacking** backing,CompositorVfbAllocation** retirement) {
+    if (!width || !height || static_cast<uint64_t>(width)*height>0xFFFFFFFFu/4) return false;
+    uint64_t bytes=static_cast<uint64_t>(width)*height*4;
+    uint64_t pages=(bytes+4095)/4096;
+    auto address=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,KernelPid);
+    if (!address) return false;
+    memset(reinterpret_cast<void*>(address.raw()),0,pages*4096);
+    auto* reserved=CompositorPrepareVfbRetirement(address.raw(),pages);
+    auto* descriptor=reserved?UserMappingBufferSnapshot(address.raw(),pages*4096):nullptr;
+    if (!descriptor) {
+        CompositorCancelVfbRetirement(reserved);VmmFreePages(address,pages);return false;
+    }
+    *pixels=reinterpret_cast<uint32_t*>(address.raw());*backing=descriptor;*retirement=reserved;
+    return true;
+}
+static void ReleaseTerminalPixels(Terminal* terminal,bool published) {
+    if (!terminal->vfb) return;
+    auto address=VirtualAddress(reinterpret_cast<uint64_t>(terminal->vfb));
+    uint64_t pages=(static_cast<uint64_t>(terminal->vfbW)*terminal->vfbH*4+4095)/4096;
+    MappingBackingUnref(terminal->vfbBacking);terminal->vfbBacking=nullptr;
+    if (published) CompositorRetireVfb(terminal->vfbRetirement);
+    else { CompositorCancelVfbRetirement(terminal->vfbRetirement);VmmFreePages(address,pages); }
+    terminal->vfbRetirement=nullptr;terminal->vfb=nullptr;
+}
+
+struct TerminalCreationGuard {
+    Terminal* terminal;PipeBuffer* input=nullptr;PipeBuffer* output=nullptr;Process* child=nullptr;bool committed=false;
+    explicit TerminalCreationGuard(Terminal* value):terminal(value) {}
+    ~TerminalCreationGuard() {
+        if (committed) return;
+        terminal->active=false;terminal->child=nullptr;
+        if (child) {
+            // Child is unpublished. Queue teardown without waiting while the
+            // GUI state mutex is held; the child's descriptors own their ends.
+            ProcessQueueDestroy(child);
+            PipeReleaseEnd(input,true);PipeReleaseEnd(output,false);
+        } else { PipeBufferDestroy(input);PipeBufferDestroy(output); }
+        ReleaseTerminalPixels(terminal,false);
+        kfree(terminal->altVfb);terminal->altVfb=nullptr;terminal->inAltScreen=false;
+        kfree(terminal->cells);terminal->cells=nullptr;
+        kfree(terminal->scrollback);terminal->scrollback=nullptr;
+        terminal->stdinPipe=nullptr;terminal->stdoutPipe=nullptr;terminal->thread=nullptr;
+    }
+};
 
 extern volatile uint64_t g_lapicTickCount;
 
@@ -755,23 +807,27 @@ static void TerminalThreadFn(void* arg)
     auto* outPipe = static_cast<PipeBuffer*>(t->stdoutPipe);
 
     Process* self = ProcessCurrent();
+    ProcessRef(self);
+    SpinLockAcquire(&outPipe->lock);outPipe->terminalReader=self;SpinLockRelease(&outPipe->lock);
     AnsiState ansiState = AnsiState::Normal;
     char csiBuf[32];
     int csiLen = 0;
 
+    {
+    TerminalStateGuard state;
     // Clear VFB to background color
-    for (uint32_t i = 0; i < t->vfbW * t->vfbH; i++)
+    if (t->active && t->vfb) for (uint32_t i = 0; i < t->vfbW * t->vfbH; i++)
         t->vfb[i] = t->bgColor;
     t->dirty = true;
+    }
 
     SerialPrintf("TERMINAL: thread started for pid %u, reading from pipe\n", self->pid);
 
-    while (t->active)
+    while (true)
     {
+        { TerminalStateGuard state;if (!t->active) break; }
         char buf[256];
 
-        // Register as reader waiter so pipe writers wake us immediately
-        outPipe->readerWaiter = self;
         uint32_t n = outPipe->read(buf, sizeof(buf));
 
         if (n == 0)
@@ -786,6 +842,8 @@ static void TerminalThreadFn(void* arg)
             // the output pipe. Checking writers prevents premature close
             // when bash is alive but a background child just exited and
             // caused a transient pipe-empty condition.
+            TerminalStateGuard state;
+            if (!t->active) break;
             if (t->child && t->child->state == ProcessState::Terminated
                 && outPipe->writers == 0)
             {
@@ -796,7 +854,6 @@ static void TerminalThreadFn(void* arg)
             continue;
         }
 
-        outPipe->readerWaiter = nullptr;
 
         // Mirror raw terminal output (bash stdout/stderr) to the serial log
         // so post-mortem debugging can see what the user saw on screen,
@@ -804,6 +861,8 @@ static void TerminalThreadFn(void* arg)
         // and drops excess if the ring fills, which is fine for a mirror.
         brook::SerialWriterEnqueue(buf, n);
 
+        TerminalStateGuard state;
+        if (!t->active) continue;
         // Process each byte
         for (uint32_t i = 0; i < n; i++)
         {
@@ -857,16 +916,18 @@ static void TerminalThreadFn(void* arg)
         }
     }
 
-    // Terminal thread is exiting — detach from compositor.
-    // Clear child's VFB pointer so compositor won't blit stale memory.
-    Process* child = t->child;
-    if (child)
+    SpinLockAcquire(&outPipe->lock);
+    if (outPipe->terminalReader==self) outPipe->terminalReader=nullptr;
+    SpinLockRelease(&outPipe->lock);
+    ProcessUnref(self);
+    TerminalClose(t);
     {
-        __atomic_store_n(&child->fbVirtual, static_cast<uint32_t*>(nullptr), __ATOMIC_RELEASE);
-        child->fbVfbWidth = 0;
+        TerminalStateGuard state;
+        auto* input=static_cast<PipeBuffer*>(t->stdinPipe);
+        t->stdinPipe=nullptr;t->stdoutPipe=nullptr;
+        PipeReleaseEnd(input,true);PipeReleaseEnd(outPipe,false);
+        t->thread=nullptr;
     }
-
-    t->active = false;
     DbgPrintf("TERMINAL: thread exiting\n");
 }
 
@@ -876,13 +937,14 @@ static void TerminalThreadFn(void* arg)
 
 int TerminalCreate(uint32_t clientW, uint32_t clientH)
 {
+    TerminalStateGuard state;
     SerialPrintf("TERMINAL: creating %ux%u\n", clientW, clientH);
 
     // Find a free slot (reuse closed terminals)
     int idx = -1;
     for (uint32_t i = 0; i < MAX_TERMINALS; i++)
     {
-        if (!g_terminals[i].active && !g_terminals[i].vfb)
+        if (!g_terminals[i].active && !g_terminals[i].vfb && !g_terminals[i].thread)
         {
             idx = static_cast<int>(i);
             break;
@@ -890,11 +952,14 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     }
     if (idx < 0) { SerialPrintf("TERMINAL: max terminals reached\n"); return -1; }
     Terminal* t = &g_terminals[idx];
+    TerminalCreationGuard creation(t);
 
     // Allocate VFB
     uint32_t vfbSize = clientW * clientH * 4;
-    t->vfb = static_cast<uint32_t*>(kmalloc(vfbSize));
-    if (!t->vfb) { SerialPrintf("TERMINAL: vfb alloc failed (%u bytes)\n", vfbSize); return -1; }
+    t->child=nullptr;t->thread=nullptr;
+    if (!AllocateTerminalPixels(clientW,clientH,&t->vfb,&t->vfbBacking,&t->vfbRetirement)) {
+        SerialPuts("TERMINAL: vfb page allocation failed\n");return -1;
+    }
 
     t->vfbW = clientW;
     t->vfbH = clientH;
@@ -933,19 +998,16 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     // Create pipes
     auto* stdinPipe = PipeBufferCreate(PIPE_BUF_DEFAULT_SIZE);
     auto* stdoutPipe = PipeBufferCreate(PIPE_BUF_DEFAULT_SIZE);
+    creation.input=stdinPipe;creation.output=stdoutPipe;
     if (!stdinPipe || !stdoutPipe)
     {
         SerialPrintf("TERMINAL: pipe alloc failed\n");
-        if (stdinPipe) PipeBufferDestroy(stdinPipe);
-        if (stdoutPipe) PipeBufferDestroy(stdoutPipe);
-        kfree(t->vfb);
-        t->vfb = nullptr;
         return -1;
     }
     stdinPipe->readers = 1;
     stdinPipe->writers = 1;
     stdoutPipe->readers = 1;
-    stdoutPipe->writers = 1;
+    stdoutPipe->writers = 2; // distinct fd1 and fd2 ownership
 
     t->stdinPipe = stdinPipe;
     t->stdoutPipe = stdoutPipe;
@@ -985,10 +1047,6 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     if (!bashPath)
     {
         SerialPrintf("TERMINAL: bash not found at any known path\n");
-        PipeBufferDestroy(stdinPipe);
-        PipeBufferDestroy(stdoutPipe);
-        kfree(t->vfb);
-        t->vfb = nullptr;
         return -1;
     }
 
@@ -1051,10 +1109,6 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
         kmalloc((baseN + kExtra + 1) * sizeof(const char*)));
     if (!bashEnvp) {
         kfree(elfData);
-        PipeBufferDestroy(stdinPipe);
-        PipeBufferDestroy(stdoutPipe);
-        kfree(t->vfb);
-        t->vfb = nullptr;
         return -1;
     }
 
@@ -1088,14 +1142,10 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     if (!child)
     {
         SerialPrintf("TERMINAL: failed to spawn bash\n");
-        PipeBufferDestroy(stdinPipe);
-        PipeBufferDestroy(stdoutPipe);
-        kfree(t->vfb);
-        t->vfb = nullptr;
         return -1;
     }
 
-    t->child = child;
+    t->child = child;creation.child=child;
     t->foregroundPgid = child->pgid; // default: bash's own group
 
     // Create the terminal's kernel thread
@@ -1103,22 +1153,18 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     if (!thread)
     {
         SerialPrintf("TERMINAL: failed to create thread\n");
-        // child is already created, we'd need to clean up...
         return -1;
     }
 
     t->thread = thread;
+    ProcessRef(child); // terminal accesses are serialized until TerminalClose drops this pin
 
     // Important: the child process needs a VFB for the compositor
     // but in WM mode we set it up differently — the terminal VFB
     // is managed by the terminal thread, not the child process.
     // We point the child's fbPixels at the terminal's VFB so the
     // compositor can blit it.
-    child->fbVirtual = t->vfb;
-    child->fbVfbWidth = clientW;
-    child->fbVfbHeight = clientH;
-    child->fbVfbStride = clientW;
-    child->fbDirty = 1;
+    UserFramebufferPublish(child,t->vfbBacking,t->vfb,vfbSize,clientW,clientH,clientW);
     // Mark as compositor-registered so pages aren't freed while blitting.
     // BRO-173/175: take a matching liveness ref (CAS false→true) so the later
     // CompositorUnregisterProcess (on terminal child exit) balances it.
@@ -1138,11 +1184,13 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     SerialPrintf("TERMINAL: created terminal %d, bash pid=%u, thread pid=%u\n",
               idx, child->pid, thread->pid);
 
+    creation.committed=true;
     return idx;
 }
 
 void TerminalWriteInput(int termIdx, const char* data, uint32_t len)
 {
+    TerminalStateGuard state;
     if (termIdx < 0 || termIdx >= static_cast<int>(g_terminalCount)) return;
     Terminal* t = &g_terminals[termIdx];
     if (!t->active) return;
@@ -1228,7 +1276,7 @@ Terminal* TerminalGetByThread(Process* proc)
     return nullptr;
 }
 
-Terminal* TerminalFindByProcess(Process* proc)
+static Terminal* FindByProcessLocked(Process* proc)
 {
     if (!proc) return nullptr;
     for (uint32_t i = 0; i < g_terminalCount; i++)
@@ -1251,9 +1299,41 @@ Terminal* TerminalFindByProcess(Process* proc)
     return nullptr;
 }
 
+Terminal* TerminalFindByProcess(Process* proc)
+{
+    TerminalStateGuard state;
+    return FindByProcessLocked(proc);
+}
+
+bool TerminalSnapshotGeometry(Process* proc,TerminalGeometry* result)
+{
+    TerminalStateGuard state;
+    auto* terminal=FindByProcessLocked(proc);
+    if (!terminal || !terminal->active) return false;
+    *result={terminal->rows,terminal->cols,terminal->vfbW,terminal->vfbH};
+    return true;
+}
+
+void TerminalRestoreAfterExec(Process* proc)
+{
+    TerminalStateGuard state;
+    for (uint32_t i=0;i<g_terminalCount;++i) {
+        auto& terminal=g_terminals[i];
+        if (!terminal.active || terminal.child!=proc || !terminal.vfbBacking) continue;
+        UserFramebufferPublish(proc,terminal.vfbBacking,terminal.vfb,
+            terminal.vfbW*terminal.vfbH*4,terminal.vfbW,terminal.vfbH,terminal.vfbW);
+        KMutexLock(&proc->framebufferLock);proc->fbScale=1;KMutexUnlock(&proc->framebufferLock);
+        proc->fbDirty=1;
+        CompositorWake();
+        return;
+    }
+}
+
 void TerminalClose(Terminal* t)
 {
-    if (!t || !t->active) return;
+    if (!t) return;
+    TerminalStateGuard state;
+    if (!t->active && !t->vfb) return;
 
     SerialPrintf("TERMINAL: closing terminal (bash pid=%u)\n",
             t->child ? t->child->pid : 0);
@@ -1267,19 +1347,10 @@ void TerminalClose(Terminal* t)
         ProcessSendSignal(t->child, 9); // SIGKILL
     }
 
-    // Clear child's VFB pointer so compositor won't blit stale data
-    if (t->child)
-    {
-        __atomic_store_n(&t->child->fbVirtual, static_cast<uint32_t*>(nullptr), __ATOMIC_RELEASE);
-        t->child->fbVfbWidth = 0;
-    }
-
-    // Free VFB memory to mark slot as reusable
-    if (t->vfb)
-    {
-        kfree(t->vfb);
-        t->vfb = nullptr;
-    }
+    if (t->child) UserFramebufferPublish(t->child,nullptr,nullptr,0,0,0,0);
+    ReleaseTerminalPixels(t,true);
+    Process* child=t->child;t->child=nullptr;
+    if (child) ProcessUnref(child);
     if (t->altVfb)
     {
         kfree(t->altVfb);
@@ -1301,19 +1372,33 @@ void TerminalClose(Terminal* t)
     t->viewOffset = 0;
 
     // Wake the terminal thread so it can exit its loop
-    if (t->thread)
+    if (t->thread && t->thread!=ProcessCurrent())
         SchedulerUnblock(t->thread);
 }
 
 void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
 {
+    TerminalStateGuard state;
     if (!t || !t->active || newW == 0 || newH == 0) return;
     if (newW == t->vfbW && newH == t->vfbH) return; // no change
 
+    uint32_t newCols=newW/static_cast<uint32_t>(g_fontAtlas.glyphs[0].advance);
+    uint32_t newRows=newH/static_cast<uint32_t>(g_fontAtlas.lineHeight);
+    if (!newCols) newCols=1;
+    if (!newRows) newRows=1;
+    TermCell* preparedCells=t->cells?static_cast<TermCell*>(kmalloc(static_cast<uint64_t>(newCols)*newRows*sizeof(TermCell))):nullptr;
+    bool reflow=newCols!=t->cols && t->scrollback && t->scrollbackRows;
+    TermCell* preparedRing=reflow?static_cast<TermCell*>(kmalloc(static_cast<uint64_t>(t->scrollbackRows)*newCols*sizeof(TermCell))):nullptr;
+    if ((t->cells && !preparedCells) || (reflow && !preparedRing)) {
+        kfree(preparedCells);kfree(preparedRing);return;
+    }
+
     // Allocate new VFB
+    uint32_t* newVfb=nullptr;MappingBacking* newBacking=nullptr;CompositorVfbAllocation* newRetirement=nullptr;
+    if (!AllocateTerminalPixels(newW,newH,&newVfb,&newBacking,&newRetirement)) {
+        kfree(preparedCells);kfree(preparedRing);return;
+    }
     uint32_t newSize = newW * newH * 4;
-    auto* newVfb = static_cast<uint32_t*>(kmalloc(newSize));
-    if (!newVfb) return;
 
     // Fill with background colour
     for (uint32_t i = 0; i < newW * newH; i++)
@@ -1337,62 +1422,18 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
         t->inAltScreen = false;
     }
 
-    // If the child has user-space mappings of the OLD vfb pages, those
-    // PTEs still point at the kernel pages we're about to free.  After
-    // kfree(t->vfb) those pages may be reused for unrelated allocations,
-    // and the next user write through the stale mapping silently
-    // corrupts kernel state — Ian observed btop crashing the WM on
-    // resize because of this.  Re-point each user PTE at the matching
-    // page of newVfb (up to min(oldPages, newPages, mapPages)) before
-    // freeing.  Pages beyond the new vfb are unmapped so a stray write
-    // takes a clean #PF instead of a UAF.
-    if (t->child)
-    {
-        uint64_t newKernVa = reinterpret_cast<uint64_t>(newVfb);
-        uint64_t newPages = (newSize + 4095) / 4096;
-        for (uint32_t mi = 0; mi < Process::MAX_FB_MAPS; ++mi)
-        {
-            auto& m = t->child->addressSpace->fbMaps[mi];
-            if (m.length == 0) continue;
-            uint64_t mapPages = m.length / 4096;
-            for (uint64_t i = 0; i < mapPages; ++i)
-            {
-                VirtualAddress uva(m.vaddr + i * 4096);
-                if (i < newPages)
-                {
-                    VirtualAddress newKva(newKernVa + i * 4096);
-                    PhysicalAddress np = VmmVirtToPhys(KernelPageTable, newKva);
-                    if (!np) continue;
-                    VmmUnmapPage(t->child->addressSpace->pageTable, uva);
-                    VmmMapPage(t->child->addressSpace->pageTable, uva, np,
-                               VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
-                               MemTag::Device, t->child->pid);
-                }
-                else
-                {
-                    VmmUnmapPage(t->child->addressSpace->pageTable, uva);
-                }
-            }
-            // Truncate the recorded mapping so munmap doesn't try to
-            // unmap pages beyond the new VFB.
-            if (mapPages > newPages) m.length = newPages * 4096;
-        }
-    }
-
-    kfree(t->vfb);
+    auto* oldBacking=t->vfbBacking;auto* oldRetirement=t->vfbRetirement;
 
     // Install new VFB
     t->vfb  = newVfb;
+    t->vfbBacking=newBacking;t->vfbRetirement=newRetirement;
     t->vfbW = newW;
     t->vfbH = newH;
 
     // Recalculate character grid
     uint32_t oldCols = t->cols;
     uint32_t oldRows = t->rows;
-    t->cols = newW / static_cast<uint32_t>(g_fontAtlas.glyphs[0].advance);
-    t->rows = newH / static_cast<uint32_t>(g_fontAtlas.lineHeight);
-    if (t->cols == 0) t->cols = 1;
-    if (t->rows == 0) t->rows = 1;
+    t->cols=newCols;t->rows=newRows;
 
     // Clamp cursor to new dimensions
     if (t->curX >= t->cols) t->curX = t->cols - 1;
@@ -1403,8 +1444,7 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
     // where the user expects when shrinking.
     if (t->cells)
     {
-        TermCell* newCells = static_cast<TermCell*>(
-            kmalloc(t->cols * t->rows * sizeof(TermCell)));
+        TermCell* newCells=preparedCells;
         if (newCells)
         {
             CellFillBlank(t, newCells, t->cols * t->rows);
@@ -1433,8 +1473,7 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
         uint32_t  oldHead = t->scrollbackHead;
         uint32_t  oldUsed = t->scrollbackUsed;
 
-        TermCell* newRing = static_cast<TermCell*>(
-            kmalloc(t->scrollbackRows * t->cols * sizeof(TermCell)));
+        TermCell* newRing=preparedRing;
         if (newRing)
         {
             CellFillBlank(t, newRing, t->scrollbackRows * t->cols);
@@ -1464,16 +1503,11 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
     // longer makes sense against the new geometry.
     t->viewOffset = 0;
 
-    // Update child process VFB pointer
-    if (t->child)
-    {
-        t->child->fbVirtual    = t->vfb;
-        t->child->fbVirtualSize = newSize;
-        t->child->fbVfbWidth   = newW;
-        t->child->fbVfbHeight  = newH;
-        t->child->fbVfbStride  = newW;
-        t->child->fbDirty      = 1;
-    }
+    if (t->child) UserFramebufferPublish(t->child,newBacking,newVfb,newSize,newW,newH,newW);
+    MappingBackingUnref(oldBacking);
+    // Old user aliases keep their page/descriptor references. Their kernel
+    // source allocation retires only after coherent source publication + epochs.
+    CompositorRetireVfb(oldRetirement);
 
     t->dirty = true;
 
@@ -1491,6 +1525,7 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
 
 void TerminalScroll(Terminal* t, int32_t dy)
 {
+    TerminalStateGuard state;
     if (!t || !t->active || dy == 0) return;
     if (!t->cells) return;
 

@@ -75,11 +75,12 @@ ownership tracking for process resource accounting and COW.
 In BSS (zeroed), then explicitly set to all-ones in `PmmInit()` before
 selectively freeing usable regions from the boot memory map.
 
-**PageDescriptor** (12 bytes per page):
+**PageDescriptor** (20 bytes per page):
 - `next`/`prev`: doubly-linked list indices within a PID's page list
 - `pid`: owning PID
 - `tag`: `MemTag` value (KernelData, Heap, PageTable, UserData, etc.)
-- `refCount`: COW reference count (0=untracked, 1=exclusive, 2+=shared)
+- `refCount`: 32-bit frame reference count (0=untracked, 1=exclusive, 2+=shared)
+- `mapCount`: 32-bit count of present user PTEs, maintained atomically
 
 **PidList** (per PID): head/tail indices + page count.
 
@@ -95,9 +96,9 @@ selectively freeing usable regions from the boot memory map.
 | ~~`PmmSetOwner`~~ | — | Removed (was dead code). |
 | `PmmGetTag` | `(PhysicalAddress) → MemTag` | Read-only tag query. No lock held (acceptable for single-word reads). |
 | `PmmGetPid` | `(PhysicalAddress) → uint16_t` | Read-only PID query. Same note. |
-| `PmmRefPage` | `(PhysicalAddress)` | Increment COW refcount. Legacy pages (refCount=0) jump to 2. Capped at 255. |
+| `PmmRefPage` | `(PhysicalAddress)` | Increment COW refcount. Legacy pages (refCount=0) jump to 2. Overflow fails loudly; references never silently saturate. |
 | `PmmUnrefPage` | `(PhysicalAddress)` | Decrement refcount. If last ref (0 or 1), actually frees the page. |
-| `PmmGetRefCount` | `(PhysicalAddress) → uint8_t` | Read current refcount. |
+| `PmmGetRefCount` | `(PhysicalAddress) → uint32_t` | Read current refcount. |
 | `PmmKillPid` | `(uint16_t pid)` | Free all pages owned by PID. No-op for KernelPid. Handles COW: shared pages are decremented, exclusive pages freed. |
 | `PmmFreeByTag` | `(uint16_t pid, MemTag tag)` | Free pages matching specific tag. Inline list surgery (doesn't use ListRemove helper). |
 | `PmmEnumeratePid` | `(pid, callback, ctx)` | Walk PID's page list, call callback for each. |
@@ -396,3 +397,47 @@ interrupt-disabling).
 4. **Direct map cap**: 16GB direct physical map. If QEMU is given >16GB RAM, pages above
    the direct map will fault when the kernel tries to write them via `PhysToVirt()`.
    A comment in VmmInit notes this must be >= QEMU -m size.
+
+
+## Heap diagnostic checkpoint (2026-10-16)
+
+Some observations above describe older implementations: allocation now subtracts
+an original free block before adding its split remainder, and integrity checks
+hold the heap IRQ lock. Runtime poison is disabled by default.
+
+Use `heap timing on`, `heap timing reset`, `heap timing status`, and
+`heap timing off` through the shell or VM debug channel. Enable preserves prior
+counts; reset clears counts while preserving enabled state. Reports include
+allocation/free/reallocation counts, examined allocation headers, expansion
+attempts, IRQ-disabled lock wait cycles and lock hold cycles. Timestamps use raw
+serialized TSC units. Aggregate totals cover all CPUs and are not wall-clock
+percentages. Off preserves counters; normal off-path allocation avoids timestamp
+reads. Formatting copies a snapshot under the lock and formats after unlocking.
+Avoid screenshot/debug tools that pause all CPUs while collecting these timings.
+
+Standalone memory tests run on real QEMU CPU/page tables using
+`BROOK_STANDALONE_TEST`; `BROOK_HOST_TEST` alone selects userspace stubs. The
+standalone flag retains scheduler/quarantine stubs while restoring CR3, direct
+map, invalidation and IRQ instructions. The real heap test covers IF-disabled
+preservation, timing state, expansion and oversized request rejection.
+
+Boundary-tag sizes remain uint32. Requests above `0xffffff40` payload bytes are
+rejected before mapping. Coalescing skips sums that cannot be represented, and
+page-rounded expansions can be represented as two blocks. Partial expansion
+failure detaches installed leaves and releases their frames without publishing a
+new heap extent; empty intermediate page tables remain reusable kernel state.
+
+
+The current allocator uses 32 floor-log2 free-block bins and a bitmap of nonempty
+bins. A request scans its own class for a fitting free block, then takes the first
+node of the lowest larger nonempty class. It does not visit allocated blocks.
+Removing a block precedes any size change; split remainders and final coalesced
+blocks are inserted once. Expansion locates the physical tail through its footer.
+Links occupy previously unused header padding and stay outside poisoned payload.
+This removes the old first-fit/live-block and expansion-tail scans described above;
+within-class fragmentation can still require examining several free blocks.
+
+`HeapCheckIntegrity` validates physical tags, alignment and free-byte accounting,
+then validates classes, bitmap, backlinks and exact free-block membership using a
+temporary header-padding visitation mark while holding the heap lock. It is a
+slow diagnostic, not part of ordinary allocation timing.

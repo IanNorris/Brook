@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "file_mapping_registry.h"
 
 namespace brook {
 // A descriptor pin is created before publication. Retaining it cannot enter
@@ -8,6 +9,7 @@ struct MappingBacking {
     uint32_t references;
     void* object;
     void (*release)(void*);
+    FileObject* file = nullptr; // borrowed; object pin retains the live inode
 };
 // Adopts one existing object pin on success; on allocation failure the caller
 // still owns that pin. The descriptor's final callback consumes it exactly once.
@@ -15,7 +17,7 @@ MappingBacking* MappingBackingCreate(void* object, void (*release)(void*));
 void MappingBackingRef(MappingBacking* backing);
 void MappingBackingUnref(MappingBacking* backing);
 
-enum class MappingKind : uint8_t { Anonymous, File, MemFd, Device, Image, Stack };
+enum class MappingKind : uint8_t { Anonymous, File, MemFd, Device, Image, Stack, Heap };
 enum class MappingSharing : uint8_t { Private, Shared };
 enum class MappingLeafOwnership : uint8_t { Managed, Borrowed };
 struct MappingRange {
@@ -26,10 +28,12 @@ struct MappingRange {
     MappingSharing sharing;
     MappingLeafOwnership leafOwnership;
 };
-struct MappingRangeNode { MappingRange range; MappingRangeNode* next; };
+bool MappingRangeValid(const MappingRange& range);
+struct MappingRangeNode { MappingRange range; MappingRangeNode* next; FileMappingRegistration fileRegistration; };
 struct MappingRangeTable {
     MappingRangeNode* head;
     uint64_t nextIdentity;
+    AddressSpaceState* owner = nullptr;
 };
 
 // All table access is protected by AS.mutation, except unpublished AS creation
@@ -54,6 +58,9 @@ public:
     // affected range. Preserves backing bytes/offsets and leaf ownership.
     bool Protect(MappingRangeTable& table, uint64_t begin, uint64_t end,
                  uint32_t protection);
+    bool CanProtect(const MappingRangeTable& table, uint64_t begin, uint64_t end,
+                    uint32_t protection) const;
+    bool Extend(MappingRangeTable& table, uint64_t identity, uint64_t end);
     void Finish(); // after unlock + acknowledgement; idempotent
 private:
     MappingRangeNode* Take(const MappingRange& source, uint64_t begin,

@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(brook-kernel C CXX ASM)
+option(BROOK_MAPPING_TEST_HOOKS "Enable guest-controlled mapping fault barriers (test kernels only)" OFF)
 
 if(NOT DEFINED BROOK_ROOT)
     set(BROOK_ROOT "${CMAKE_SOURCE_DIR}/../..")
@@ -184,7 +185,12 @@ add_executable(kernel
     src/process.cpp
     src/memory/address_space.cpp
     src/memory/mapping_transaction.cpp
+    src/memory/file_page_cache.cpp
+    src/memory/file_object.cpp
+    src/memory/file_mapping_registry.cpp
+    src/memory/mapping_pin_registry.cpp
     src/memory/mapping_ranges.cpp
+    src/memory/user_mapping.cpp
     src/scheduler.cpp
     src/compositor.cpp
     src/window.cpp
@@ -365,6 +371,10 @@ target_compile_definitions(kernel PRIVATE
     BROOK_BUILD_DATE="${BROOK_BUILD_DATE}"
     __BROOK_KERNEL__=1
 )
+if(BROOK_MAPPING_TEST_HOOKS)
+    target_sources(kernel PRIVATE src/memory/mapping_fault_test.cpp)
+    target_compile_definitions(kernel PRIVATE BROOK_MAPPING_TEST_HOOKS=1)
+endif()
 
 # Interrupt handler files and panic must NOT use SSE/FPU registers.
 # -mgeneral-regs-only overrides the global -msse2/-mfpmath=sse for these files.

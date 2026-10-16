@@ -5,6 +5,8 @@
 namespace brook {
 
 struct Process;
+struct MappingBacking;
+struct CompositorVfbAllocation;
 
 // Maximum number of terminal windows
 static constexpr uint32_t MAX_TERMINALS = 8;
@@ -29,7 +31,9 @@ struct Terminal
 {
     Process*  thread;          // kernel thread running this terminal
     Process*  child;           // bash process
-    uint32_t* vfb;             // virtual framebuffer (owned)
+    uint32_t* vfb;             // dedicated page allocation (owned)
+    MappingBacking* vfbBacking;
+    CompositorVfbAllocation* vfbRetirement;
     uint32_t  vfbW, vfbH;     // VFB dimensions
     uint32_t  curX, curY;     // cursor position (in glyph cells)
     uint32_t  cols, rows;      // terminal size in characters
@@ -81,6 +85,12 @@ Terminal* TerminalGetByThread(Process* proc);
 // Get the terminal whose child (bash) is the given process or whose
 // child is an ancestor of the given process.
 Terminal* TerminalFindByProcess(Process* proc);
+struct TerminalGeometry { uint32_t rows,cols,width,height; };
+// Copies geometry under the terminal state lock; no terminal pointer escapes.
+bool TerminalSnapshotGeometry(Process* proc,TerminalGeometry* result);
+// Reattach the terminal's kernel-owned source after its owning shell execs.
+// Descendant processes keep their independent framebuffer setup.
+void TerminalRestoreAfterExec(Process* proc);
 
 // Shut down a terminal: kill child, stop thread, clean up.
 void TerminalClose(Terminal* t);

@@ -41,7 +41,7 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 - `programBreak`: Current brk() position
 - `mmapNext`: Next free user mmap virtual address
 - `kernelStackBase/Top`: Per-process kernel stack (256KB with guard pages)
-- `memfdMaps[256]`, `fileMaps[4096]`, `fbMaps[4]`: Lazy mapping records
+- `addressSpace->ranges`: Shared, dynamically allocated range records with permissions, retained backings and explicit leaf ownership
 
 **File Descriptors:**
 - `fds` (FdEntry*): Heap-allocated array of MAX_FDS (256) entries

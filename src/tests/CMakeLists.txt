@@ -17,6 +17,8 @@ function(add_brook_test TEST_NAME)
     add_executable(${TEST_NAME}
         ${TEST_NAME}/main.cpp
         "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
+        "${BROOK_ROOT}/src/tests/common/panic.cpp"
+        "${BROOK_ROOT}/src/kernel/src/runtime.cpp"
         ${ARGN}
     )
     target_include_directories(${TEST_NAME} PRIVATE
@@ -58,9 +60,10 @@ add_brook_test(test_heap
 # BRO-179: the PMM quarantine drain thread references scheduler/apic symbols
 # (KernelThreadCreate, SchedulerSleepMs, TlbFlushAllCpusBarrier) that host
 # tests don't link. BROOK_HOST_TEST compiles it out and defaults quarantine off.
-target_compile_definitions(test_pmm  PRIVATE BROOK_HOST_TEST)
-target_compile_definitions(test_vmm  PRIVATE BROOK_HOST_TEST)
-target_compile_definitions(test_heap PRIVATE BROOK_HOST_TEST)
+# Standalone tests still execute real CR3/direct-map/IRQ operations inside QEMU.
+target_compile_definitions(test_pmm  PRIVATE BROOK_HOST_TEST BROOK_STANDALONE_TEST)
+target_compile_definitions(test_vmm  PRIVATE BROOK_HOST_TEST BROOK_STANDALONE_TEST)
+target_compile_definitions(test_heap PRIVATE BROOK_HOST_TEST BROOK_STANDALONE_TEST)
 
 add_brook_test(test_string)
 
@@ -84,6 +87,8 @@ file(COPY "${BROOK_ROOT}/src/kernel/src/ffconf.h" DESTINATION "${FATFS_TEST_BUIL
 
 add_brook_test(test_vfs
     "${BROOK_ROOT}/src/kernel/src/vfs.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/file_object.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/mapping_pin_registry.cpp"
     "${BROOK_ROOT}/src/kernel/src/fatfs_glue.cpp"
     "${BROOK_ROOT}/src/kernel/src/device.cpp"
     "${BROOK_ROOT}/src/kernel/src/ramdisk.cpp"
@@ -95,7 +100,7 @@ add_brook_test(test_vfs
 target_include_directories(test_vfs PRIVATE
     "${FATFS_TEST_BUILD_DIR}"
 )
-target_compile_definitions(test_vfs PRIVATE BROOK_HOST_TEST)
+target_compile_definitions(test_vfs PRIVATE BROOK_HOST_TEST BROOK_STANDALONE_TEST)
 target_sources(test_vfs PRIVATE
     "${FATFS_TEST_BUILD_DIR}/ff.c"
     "${FATFS_TEST_BUILD_DIR}/ffunicode.c"

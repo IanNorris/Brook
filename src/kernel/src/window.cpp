@@ -13,11 +13,13 @@
 #include "font_atlas.h"
 #include "input.h"
 #include "serial.h"
+#include "panic.h"
 #include "rtc.h"
 #include "terminal.h"
 #include "display.h"
 #include "vfs.h"
 #include "memory/virtual_memory.h"
+#include "memory/user_mapping.h"
 #include "memory/physical_memory.h"
 #include "memory/address.h"
 #include "memory/heap.h"
@@ -30,6 +32,13 @@ namespace brook {
 // State
 // ---------------------------------------------------------------------------
 
+// Serializes VFB source publication, source pinning, resize and destruction.
+// Rendering continues to use the compositor epoch to retire kernel readers.
+static KMutex g_vfbLock{};
+struct VfbGuard {
+    VfbGuard() { KMutexLock(&g_vfbLock); }
+    ~VfbGuard() { KMutexUnlock(&g_vfbLock); }
+};
 static uint32_t g_themeId = BROOK_THEME_BROOK;
 static bool g_themeSettingsLoaded = false;
 uint32_t WmGetTheme() { return __atomic_load_n(&g_themeId, __ATOMIC_ACQUIRE); }
@@ -440,7 +449,7 @@ void WmSetActive(bool active)
         SerialPuts("WM: window manager mode enabled\n");
 }
 
-int WmCreateWindow(Process* proc, int16_t x, int16_t y,
+static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
                    uint16_t clientW, uint16_t clientH,
                    const char* title, uint8_t upscale,
                    bool focusable)
@@ -483,12 +492,13 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     w.vfbBytes  = 0;
     w.vfbUser   = nullptr;
     w.vfbAddressSpace = nullptr;
+    w.vfbBacking = nullptr;
+    w.vfbRetirement = nullptr;
     w.vfbDirty  = 0;
     w.wmId      = static_cast<uint16_t>(idx + 1);
     w.inputHead = 0;
     w.inputTail = 0;
     w.inputDropCount = 0;
-    w.closeRequestedAt = 0;
     WmStrCopy(w.title, title ? title : "Window", sizeof(w.title));
 
     SerialPrintf("WM: created window %d '%s' at (%d,%d) %ux%u scale=%u for pid %u\n",
@@ -504,7 +514,13 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
     return idx;
 }
 
-void WmDestroyWindow(int idx)
+int WmCreateWindow(Process* proc,int16_t x,int16_t y,uint16_t clientW,uint16_t clientH,
+                   const char* title,uint8_t upscale,bool focusable) {
+    VfbGuard guard;
+    return CreateWindowLocked(proc,x,y,clientW,clientH,title,upscale,focusable);
+}
+
+static void DestroyWindowLocked(int idx)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
@@ -517,24 +533,23 @@ void WmDestroyWindow(int idx)
     // after a later compositor epoch.
     if (w.vfb)
     {
-        uint32_t* oldVfb = w.vfb;
-        uint64_t pageCount = (w.vfbBytes + 4095) / 4096;
+        auto* retirement=w.vfbRetirement;
+        w.vfbRetirement=nullptr;
         AddressSpaceState* space = w.vfbAddressSpace;
-        if (space && space->pageTable && w.vfbUser)
-        {
-            uint64_t userBase = reinterpret_cast<uint64_t>(w.vfbUser);
-            for (uint64_t i = 0; i < pageCount; ++i)
-                VmmUnmapPage(space->pageTable, VirtualAddress(userBase + i * 4096));
-            TlbShootdownFull(space->pageTable.pml4.raw(), space->tlbCpuMask);
-        }
+        auto* backing=w.vfbBacking;
+        w.vfbBacking = nullptr;
         w.vfbAddressSpace = nullptr;
-        AddressSpaceUnref(space);
         w.vfb       = nullptr;
         w.vfbStride = 0;
         w.vfbBytes  = 0;
         w.vfbUser   = nullptr;
         w.vfbDirty  = 0;
-        CompositorDeferFreePages(reinterpret_cast<uint64_t>(oldVfb), pageCount);
+        // Buffer-specific removal uses preallocated retirement counters and
+        // cannot fail allocation. Complete AS cleanup before renderer retirement.
+        if (space && backing && UserMappingRemoveBacking(ProcessCurrent(),space,backing)<0)
+            KernelPanic("WM: invalid framebuffer mappings during destruction");
+        MappingBackingUnref(backing);AddressSpaceUnref(space);
+        CompositorRetireVfb(retirement);
     }
     w.wmId = 0;
     w.proc = nullptr;
@@ -561,14 +576,19 @@ void WmDestroyWindow(int idx)
     CompositorMarkDirty();
 }
 
+void WmDestroyWindow(int idx) {
+    VfbGuard guard;DestroyWindowLocked(idx);
+}
+
 void WmDestroyWindowForProcess(Process* proc)
 {
     if (!proc) return;
+    VfbGuard guard;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         if (g_windows[i].proc == proc)
         {
-            WmDestroyWindow(static_cast<int>(i));
+            DestroyWindowLocked(static_cast<int>(i));
             // Don't return — a single process may own multiple windows
             // (e.g. waylandd hosting several xdg_toplevels).
         }
@@ -2042,6 +2062,7 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
                                                bool focusable)
 {
     WmCreateWindowResult res = {};
+    VfbGuard guard;
 
     if (!proc || clientW == 0 || clientH == 0) return res;
     if (clientW < WM_MIN_WIDTH)  clientW = WM_MIN_WIDTH;
@@ -2053,7 +2074,7 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     int16_t winY = static_cast<int16_t>(40 + (s_cascade % 8) * 30);
     s_cascade++;
 
-    int idx = WmCreateWindow(proc, winX, winY, clientW, clientH, title, 1,
+    int idx = CreateWindowLocked(proc, winX, winY, clientW, clientH, title, 1,
                              focusable);
     if (idx < 0) return res;
 
@@ -2070,50 +2091,23 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     {
         SerialPrintf("WM: VFB alloc failed for window '%s' (%ux%u)\n",
                      w.title, clientW, clientH);
-        WmDestroyWindow(idx);
+        DestroyWindowLocked(idx);
         return res;
     }
     auto* kVfb = reinterpret_cast<uint32_t*>(kAddr.raw());
     memset(kVfb, 0, bytes);
 
-    // Map the same physical pages into the calling process's address
-    // space, user-readable.  Reuse the user-mmap window allocator
-    // (mmapNext) — pick a contiguous free range.
-    uint64_t userBase = proc->addressSpace->mmapNext;
-    if (userBase + pages * 4096 > USER_MMAP_END)
-    {
-        SerialPrintf("WM: user mmap window exhausted for VFB\n");
-        VmmFreePages(kAddr, pages);
-        WmDestroyWindow(idx);
-        return res;
+    auto* retirement=CompositorPrepareVfbRetirement(kAddr.raw(),pages);
+    if (!retirement) { VmmFreePages(kAddr,pages);DestroyWindowLocked(idx);return res; }
+    auto* backing=UserMappingBufferSnapshot(kAddr.raw(),pages*4096);
+    int64_t mapped=backing?UserMappingBufferAlias(ProcessCurrent(),proc->addressSpace,backing,3):-12;
+    if (mapped<0) {
+        MappingBackingUnref(backing);CompositorCancelVfbRetirement(retirement);
+        VmmFreePages(kAddr,pages);DestroyWindowLocked(idx);return res;
     }
-    proc->addressSpace->mmapNext = userBase + pages * 4096;
-
-    bool mapOk = true;
-    for (uint64_t i = 0; i < pages; ++i)
-    {
-        VirtualAddress kPage(kAddr.raw() + i * 4096);
-        PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, kPage);
-        if (!phys) { mapOk = false; break; }
-        if (!VmmMapPage(proc->addressSpace->pageTable, VirtualAddress(userBase + i * 4096),
-                        phys,
-                        VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
-                        MemTag::Device, proc->pid))
-        {
-            mapOk = false;
-            break;
-        }
-    }
-    if (!mapOk)
-    {
-        SerialPrintf("WM: failed to map VFB into user space\n");
-        // Best-effort unmap of any partial pages.
-        for (uint64_t i = 0; i < pages; ++i)
-            VmmUnmapPage(proc->addressSpace->pageTable, VirtualAddress(userBase + i * 4096));
-        VmmFreePages(kAddr, pages);
-        WmDestroyWindow(idx);
-        return res;
-    }
+    uint64_t userBase=static_cast<uint64_t>(mapped);
+    w.vfbBacking=backing;
+    w.vfbRetirement=retirement;
 
     w.vfb       = kVfb;
     w.vfbStride = stride;
@@ -2135,10 +2129,11 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
 
 void WmDestroyWindowById(Process* proc, uint32_t wmId)
 {
+    VfbGuard guard;
     Window* w = WmFindWindowById(proc, wmId);
     if (!w) return;
     int idx = static_cast<int>(wmId) - 1;
-    WmDestroyWindow(idx);
+    DestroyWindowLocked(idx);
 }
 
 int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
@@ -2149,6 +2144,7 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     if (newW < WM_MIN_WIDTH)  newW = WM_MIN_WIDTH;
     if (newH < WM_MIN_HEIGHT) newH = WM_MIN_HEIGHT;
 
+    VfbGuard guard;
     Window* w = WmFindWindowById(proc, wmId);
     if (!w) return -2; // -ENOENT
     if (!w->vfb) return -22; // -EINVAL — only for WM-API windows
@@ -2170,53 +2166,27 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     auto* newKVfb = reinterpret_cast<uint32_t*>(newKAddr.raw());
     memset(newKVfb, 0, roundedBytes);
 
-    // Carve a fresh user-VA range for the new mapping (we don't try to
-    // reuse the old userBase to avoid TLB races; we unmap the old one
-    // afterwards).
-    uint64_t newUserBase = proc->addressSpace->mmapNext;
-    if (newUserBase + newPages * 4096 > USER_MMAP_END)
-    {
-        SerialPrintf("WM: resize_vfb wm=%u user mmap exhausted\n", wmId);
-        VmmFreePages(newKAddr, newPages);
-        return -12;
+    auto* retirement=CompositorPrepareVfbRetirement(newKAddr.raw(),newPages);
+    if (!retirement) { VmmFreePages(newKAddr,newPages);return -12; }
+    auto* newBacking=UserMappingBufferSnapshot(newKAddr.raw(),newPages*4096);
+    int64_t mapped=newBacking?UserMappingBufferAlias(ProcessCurrent(),proc->addressSpace,newBacking,3):-12;
+    if (mapped<0) {
+        MappingBackingUnref(newBacking);CompositorCancelVfbRetirement(retirement);
+        VmmFreePages(newKAddr,newPages);return -12;
     }
-    proc->addressSpace->mmapNext = newUserBase + newPages * 4096;
-
-    bool mapOk = true;
-    for (uint64_t i = 0; i < newPages; ++i)
-    {
-        VirtualAddress kPage(newKAddr.raw() + i * 4096);
-        PhysicalAddress phys = VmmVirtToPhys(KernelPageTable, kPage);
-        if (!phys) { mapOk = false; break; }
-        if (!VmmMapPage(proc->addressSpace->pageTable, VirtualAddress(newUserBase + i * 4096),
-                        phys,
-                        VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
-                        MemTag::Device, proc->pid))
-        {
-            mapOk = false;
-            break;
-        }
-    }
-    if (!mapOk)
-    {
-        SerialPrintf("WM: resize_vfb wm=%u map failed\n", wmId);
-        for (uint64_t i = 0; i < newPages; ++i)
-            VmmUnmapPage(proc->addressSpace->pageTable, VirtualAddress(newUserBase + i * 4096));
-        VmmFreePages(newKAddr, newPages);
-        return -12;
-    }
+    uint64_t newUserBase=static_cast<uint64_t>(mapped);
 
     // Snapshot old mapping so the compositor can finish any in-flight
     // blit using w->vfb before we tear it down.
-    uint32_t* oldKVfb       = w->vfb;
-    uint64_t  oldVfbBytes   = w->vfbBytes;
-    void*     oldVfbUser    = w->vfbUser;
+    auto* oldRetirement=w->vfbRetirement;
+    MappingBacking* oldBacking = w->vfbBacking;
     AddressSpaceState* oldSpace = w->vfbAddressSpace;
-    uint64_t  oldPages      = (oldVfbBytes + 4095) / 4096;
 
     // Atomically swap the kernel VFB pointer + sizes so the compositor
     // sees a consistent view from this point on.  Mark dirty so the
     // first blit at the new size happens before any client commit.
+    w->vfbRetirement = retirement;
+    w->vfbBacking = newBacking;
     w->vfb       = newKVfb;
     w->vfbStride = newStride;
     w->vfbBytes  = roundedBytes;
@@ -2227,23 +2197,11 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     w->clientH   = newH;
     w->vfbDirty  = 1;
 
-    // Wait for any in-flight compositor blit using the old VFB to retire
-    // before we unmap the old user pages and free the old kernel pages.
-    CompositorWaitFrame();
-
-    if (oldSpace && oldVfbUser && oldVfbBytes)
-    {
-        uint64_t oldUserBase = reinterpret_cast<uint64_t>(oldVfbUser);
-        for (uint64_t i = 0; i < oldPages; ++i)
-            VmmUnmapPage(oldSpace->pageTable, VirtualAddress(oldUserBase + i * 4096));
-        TlbShootdownFull(oldSpace->pageTable.pml4.raw(), oldSpace->tlbCpuMask);
-    }
-    AddressSpaceUnref(oldSpace);
-    if (oldKVfb && oldPages)
-    {
-        VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(oldKVfb)),
-                     oldPages);
-    }
+    if (oldSpace && oldBacking && UserMappingRemoveBacking(ProcessCurrent(),oldSpace,oldBacking)<0)
+        KernelPanic("WM: invalid framebuffer mappings during resize");
+    MappingBackingUnref(oldBacking);AddressSpaceUnref(oldSpace);
+    // Only the independent kernel-buffer owner waits for renderer retirement.
+    CompositorRetireVfb(oldRetirement);
 
     SerialPrintf("WM: resize_vfb wm=%u -> %ux%u stride=%u kvfb=0x%lx user=0x%lx\n",
                  wmId, newW, newH, newStride,
@@ -2252,6 +2210,25 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     outResult->wmId      = wmId;
     outResult->vfbUser   = w->vfbUser;
     outResult->vfbStride = w->vfbStride;
+    return 0;
+}
+
+bool WmSnapshotVfb(const Window* window,uint32_t** pixels,uint32_t* stride,uint64_t* bytes) {
+    VfbGuard guard;
+    *pixels=window->vfb;*stride=window->vfbStride;*bytes=window->vfbBytes;
+    return *pixels && *stride && *bytes;
+}
+
+uint64_t WmMapWindowVfb(Process* caller,uint32_t wmId) {
+    if (!caller) return 0;
+    VfbGuard guard;
+    for (uint32_t i=0;i<WM_MAX_WINDOWS;++i) {
+        const auto& window=g_windows[i];
+        if (window.proc && window.wmId==wmId && window.vfbBacking) {
+            int64_t mapped=UserMappingBufferAlias(ProcessCurrent(),caller->addressSpace,window.vfbBacking,1);
+            return mapped<0?0:static_cast<uint64_t>(mapped);
+        }
+    }
     return 0;
 }
 

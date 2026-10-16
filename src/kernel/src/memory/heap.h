@@ -20,6 +20,9 @@ extern "C" void HeapInit();
 
 // Allocate at least 'size' bytes. Returns a 64-byte-aligned pointer, or
 // nullptr on failure. Requesting 0 bytes returns nullptr.
+// uint32 boundary tags limit an aligned total block to 0xffffffc0 bytes;
+// with the current 128-byte header/footer, the largest request is 0xffffff40.
+// Larger requests fail before mapping pages; the heap itself may span more.
 extern "C" void* kmalloc(uint64_t size);
 
 // Free a pointer returned by kmalloc. No-op on nullptr.
@@ -42,6 +45,21 @@ bool HeapCheckIntegrity();
 // Enabling reseeds existing free regions; live allocations are left intact.
 // The shell and debug channel accept "heap poison on|off" at runtime.
 void HeapSetPoison(bool enable);
+
+// Opt-in allocator timing; no heap walk or allocation in these controls.
+// on preserves counters; reset clears them without changing enabled state.
+struct HeapTimingStats {
+    bool enabled;
+    uint64_t allocations, frees, reallocations, expansions;
+    uint64_t headers, maxHeaders, expansionHeaders;
+    uint64_t waitCycles, maxWaitCycles, holdCycles, maxHoldCycles;
+    uint64_t expansionCycles, maxExpansionCycles;
+};
+void HeapTimingEnable(bool enabled);
+void HeapTimingReset();
+void HeapTimingSnapshot(HeapTimingStats* out);
+// Writes a bounded NUL-terminated report; cycles are raw TSC units.
+void HeapTimingFormat(char* out, uint64_t capacity);
 
 // Dump heap statistics to serial: total blocks, free/used counts, sizes.
 void HeapDumpStats();

@@ -26,6 +26,7 @@ void AddressSpaceKernelInit() {
     memset(&g_kernelSpace, 0, sizeof(g_kernelSpace));
     g_kernelSpace.kernel = true;
     g_kernelSpace.references = 1;
+    g_kernelSpace.ranges.owner = &g_kernelSpace;
     g_kernelSpace.pageTable = VmmKernelCR3();
     KMutexInit(&g_kernelSpace.mutation);
 }
@@ -37,16 +38,26 @@ AddressSpaceState* AddressSpaceCreate(uint16_t pid) {
     space->references = 1;
     space->identity = __atomic_add_fetch(&g_identity, 1, __ATOMIC_RELAXED);
     space->generation = 1;
+    space->ranges.owner = space;
+    if(!space->identity)KernelPanic("AS: identity exhausted");
     space->allocationPid = pid;
     KMutexInit(&space->mutation);
     space->pageTable = VmmCreateUserPageTable();
     if (!space->pageTable) { kfree(space); return nullptr; }
     return space;
 }
+bool AddressSpaceTryRef(AddressSpaceState* space) {
+    if(!space)return false;
+    if(space->kernel)return true;
+    auto count=__atomic_load_n(&space->references,__ATOMIC_ACQUIRE);
+    while(count) {
+        if(count==~uint32_t{0})KernelPanic("AS: reference overflow");
+        if(__atomic_compare_exchange_n(&space->references,&count,count+1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return true;
+    }
+    return false;
+}
 void AddressSpaceRef(AddressSpaceState* space) {
-    if (!space || space->kernel) return;
-    if (!__atomic_fetch_add(&space->references, 1, __ATOMIC_ACQ_REL))
-        KernelPanic("AS: reference to retired space");
+    if(space && !AddressSpaceTryRef(space))KernelPanic("AS: reference to retired space");
 }
 static void WakeCleanupWorker() {
     if (g_cleanupWorker) SchedulerUnblock(g_cleanupWorker);
@@ -83,19 +94,15 @@ void ProcessDestroyAndWait(Process* process) {
     while (!__atomic_load_n(&completion.done, __ATOMIC_ACQUIRE))
         SchedulerBlock(waiter);
 }
-struct TeardownRanges { AddressSpaceState* space; const MappingRangeNode* cursor; };
-static bool BorrowedTeardownLeaf(VirtualAddress address, uint64_t leaf, void* opaque) {
+struct TeardownRanges { const MappingRangeNode* cursor; };
+static bool BorrowedTeardownLeaf(VirtualAddress address, uint64_t, void* opaque) {
     auto& ranges = *static_cast<TeardownRanges*>(opaque);
     while (ranges.cursor && ranges.cursor->range.end <= address.raw()) ranges.cursor = ranges.cursor->next;
     if (ranges.cursor && ranges.cursor->range.begin <= address.raw())
         return ranges.cursor->range.leafOwnership == MappingLeafOwnership::Borrowed;
-    // Compatibility during migration. Once the last legacy writer is removed,
-    // all ownership comes from ranges. No filesystem work occurs in this query.
-    for (const auto& map : ranges.space->memfdMaps)
-        if (map.length && map.mfd && address.raw() >= map.vaddr && address.raw()-map.vaddr < map.length) return true;
-    for (const auto& map : ranges.space->fbMaps)
-        if (map.length && address.raw() >= map.vaddr && address.raw()-map.vaddr < map.length) return true;
-    return ((leaf & PTE_TAG_MASK) >> PTE_TAG_SHIFT) == static_cast<uint64_t>(MemTag::Device);
+    // Unpublished constructor failure may leave ordinary managed leaves before
+    // its range record exists; borrowed leaves always publish metadata first.
+    return false;
 }
 static void DestroyAddressSpace(AddressSpaceState* space) {
     // Refcount zero: no task/fault/job can enter this page table again. No
@@ -103,17 +110,9 @@ static void DestroyAddressSpace(AddressSpaceState* space) {
     TlbShootdownFull(space->pageTable.pml4.raw(), space->tlbCpuMask);
     // Walk populated page tables, not the potentially multi-TiB virtual extents
     // of sparse reservations. Backing descriptors stay live through this walk.
-    TeardownRanges ranges{space,space->ranges.head};
+    TeardownRanges ranges{space->ranges.head};
     VmmDestroyUserPageTable(space->pageTable,true,BorrowedTeardownLeaf,&ranges);
     CompositorReleaseAddressSpaceBuffers(space);
-    for (const auto& map : space->memfdMaps)
-        if (map.length && map.mfd) MemFdHandleUnref(map.mfd);
-    for (const auto& map : space->fileMaps) {
-        if (!map.length || !map.vnode) continue;
-        VfsFileMapUnpin(map.vnode);
-        if (__atomic_fetch_sub(&map.vnode->refCount, 1, __ATOMIC_ACQ_REL) == 1)
-            VfsClose(map.vnode);
-    }
     MappingRangeDestroy(space->ranges);
     // Never sweep by allocationPid: exec and PID reuse can own newer resources.
     kfree(space);

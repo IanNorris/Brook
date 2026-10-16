@@ -28,6 +28,9 @@ struct PipeBuffer
     // Waiter processes (set before blocking, cleared on wake)
     Process* volatile readerWaiter = nullptr;
     Process* volatile writerWaiter = nullptr;
+    // Dedicated kernel terminal reader. Registration/removal and wake execute
+    // under lock, with the terminal thread retaining itself until removal.
+    Process* terminalReader = nullptr;
 
     // Process currently blocked inside epoll_wait watching this pipe for
     // readability. Set by epoll_wait_impl before it blocks, cleared on wake.
@@ -132,5 +135,7 @@ static inline void PipeBufferDestroy(PipeBuffer* pipe)
         kfree(pipe->data);
     kfree(pipe);
 }
+
+void PipeReleaseEnd(PipeBuffer* pipe,bool writer);
 
 } // namespace brook

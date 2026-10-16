@@ -7,7 +7,7 @@ static constexpr uint64_t UserEnd = 0x0000800000000000ULL;
 static bool ValidRange(uint64_t begin, uint64_t end) {
     return begin < end && end <= UserEnd && !(begin & 4095) && !(end & 4095);
 }
-static bool ValidDescriptor(const MappingRange& range) {
+bool MappingRangeValid(const MappingRange& range) {
     return ValidRange(range.begin, range.end) && !(range.offset & 4095) &&
            range.offset <= ~uint64_t{0} - (range.end - range.begin) &&
            !(range.maximumProtection & ~7u) && !(range.protection & ~range.maximumProtection) &&
@@ -34,6 +34,7 @@ void MappingBackingUnref(MappingBacking* backing) {
 static void ReleaseNodes(MappingRangeNode* node) {
     while (node) {
         auto* next = node->next;
+        FileMappingUnregister(&node->fileRegistration);
         MappingBackingUnref(node->range.backing); kfree(node); node = next;
     }
 }
@@ -49,7 +50,7 @@ bool MappingRangePlan::Prepare(uint64_t nodes) {
     for (uint64_t i = 0; i < nodes; ++i) {
         auto* node = static_cast<MappingRangeNode*>(kmalloc(sizeof(MappingRangeNode)));
         if (!node) return false;
-        *node = {{}, spare_}; spare_ = node; ++available_;
+        *node = {{}, spare_, {}}; spare_ = node; ++available_;
     }
     return true;
 }
@@ -60,6 +61,7 @@ MappingRangeNode* MappingRangePlan::Take(const MappingRange& source, uint64_t be
     node->range.begin = begin; node->range.end = end;
     node->range.identity = ++table.nextIdentity; node->next = nullptr;
     MappingBackingRef(node->range.backing);
+    FileMappingRegister(&node->fileRegistration,table.owner,node->range.backing);
     return node;
 }
 bool MappingRangePlan::Replace(MappingRangeTable& table, uint64_t begin, uint64_t end,
@@ -83,6 +85,7 @@ bool MappingRangePlan::Replace(MappingRangeTable& table, uint64_t begin, uint64_
     if (right) append(Take(*right,end,right->end,table));
     auto* old = *first;
     while (old != stop) {
+        FileMappingRetire(&old->fileRegistration);
         auto* next = old->next; old->next = retired_; retired_ = old; old = next;
     }
     *tail = stop; *first = chain ? chain : stop;
@@ -91,7 +94,7 @@ bool MappingRangePlan::Replace(MappingRangeTable& table, uint64_t begin, uint64_
 bool MappingRangePlan::CanReplace(const MappingRangeTable& table, uint64_t begin, uint64_t end,
                                   const MappingRange* replacement) const {
     if (!prepared_ || !ValidRange(begin,end) || (replacement &&
-        (!ValidDescriptor(*replacement) || replacement->begin != begin || replacement->end != end))) return false;
+        (!MappingRangeValid(*replacement) || replacement->begin != begin || replacement->end != end))) return false;
     uint64_t needed = replacement != nullptr;
     for (auto* node = table.head; node && node->range.begin < end; node = node->next) {
         if (node->range.end <= begin) continue;
@@ -100,13 +103,13 @@ bool MappingRangePlan::CanReplace(const MappingRangeTable& table, uint64_t begin
     return available_ >= needed && table.nextIdentity <= ~uint64_t{0} - needed;
 }
 bool MappingRangePlan::Insert(MappingRangeTable& table, const MappingRange& range) {
-    if (!ValidDescriptor(range)) return false;
+    if (!MappingRangeValid(range)) return false;
     for (auto* node = table.head; node && node->range.begin < range.end; node = node->next)
         if (node->range.end > range.begin) return false;
     return Replace(table,range.begin,range.end,&range);
 }
-bool MappingRangePlan::Protect(MappingRangeTable& table, uint64_t begin, uint64_t end,
-                               uint32_t protection) {
+bool MappingRangePlan::CanProtect(const MappingRangeTable& table, uint64_t begin, uint64_t end,
+                                  uint32_t protection) const {
     if (!prepared_ || !ValidRange(begin,end) || (protection & ~7u)) return false;
     auto* first = table.head;
     while (first && first->range.end <= begin) first = first->next;
@@ -120,6 +123,11 @@ bool MappingRangePlan::Protect(MappingRangeTable& table, uint64_t begin, uint64_
     }
     if (covered < end || available_ < splits ||
         table.nextIdentity > ~uint64_t{0} - splits - changed) return false;
+    return true;
+}
+bool MappingRangePlan::Protect(MappingRangeTable& table, uint64_t begin, uint64_t end,
+                               uint32_t protection) {
+    if (!CanProtect(table,begin,end,protection)) return false;
     MappingRangeNode** link = &table.head;
     while (*link && (*link)->range.end <= begin) link = &(*link)->next;
     while (*link && (*link)->range.begin < end) {
@@ -142,6 +150,17 @@ const MappingRange* MappingRangeFind(const MappingRangeTable& table, uint64_t ad
     for (auto* node = table.head; node && node->range.begin <= address; node = node->next)
         if (address < node->range.end) return &node->range;
     return nullptr;
+}
+bool MappingRangePlan::Extend(MappingRangeTable& table,uint64_t identity,uint64_t end) {
+    if (!prepared_) return false;
+    for (auto* node=table.head;node;node=node->next) {
+        if (node->range.identity!=identity) continue;
+        auto extended=node->range;extended.end=end;
+        if (end<node->range.end || !MappingRangeValid(extended) ||
+            (node->next && end>node->next->range.begin) || table.nextIdentity==~uint64_t{0}) return false;
+        extended.identity=++table.nextIdentity;node->range=extended;return true;
+    }
+    return false;
 }
 uint64_t MappingRangeFindGap(const MappingRangeTable& table, uint64_t hint,
                             uint64_t length, uint64_t floor, uint64_t ceiling) {

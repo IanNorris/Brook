@@ -145,6 +145,12 @@ def resolve_rip(rip, syms, sorted_addrs):
         else:
             hi = mid - 1
     addr = sorted_addrs[lo]
+    # Kernel modules occupy a separate mapping arena (virtual_memory.h).
+    # A kernel-only map must not label module code as a huge offset into
+    # the kernel's final function. Explicit module symbols still resolve.
+    module_base = 0xFFFFFFFF90000000
+    if rip >= module_base and addr < module_base:
+        return f"0x{rip:016x}"
     offset = rip - addr
     name = syms[addr]
     if offset == 0:

@@ -6,6 +6,7 @@
 #include "smp.h"
 #include "apic.h"
 #include "memory/virtual_memory.h"
+#include "memory/user_mapping.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
 #include "memory/address.h"
@@ -1082,7 +1083,7 @@ void SchedulerRemoveProcess(Process* proc)
     SchedulerFreePid(proc->pid);
 }
 
-void SchedulerBlock(Process* proc)
+static void SchedulerBlockImpl(Process* proc, bool interruptible)
 {
     // UAF guard — same rationale as in DoSwitch.
     {
@@ -1098,6 +1099,17 @@ void SchedulerBlock(Process* proc)
         }
     }
 
+    struct WaitRegistration {
+        Process* proc;
+        bool active;
+        ~WaitRegistration() {
+            if (!active) return;
+            const uint64_t flags = SchedLockAcquire(g_readyLock);
+            proc->interruptibleWait = false;
+            SchedLockRelease(g_readyLock, flags);
+        }
+    } registration{proc, interruptible};
+
     // Disable interrupts across the entire block+yield sequence to prevent
     // SchedulerTimerTick from firing between setting Blocked and yielding,
     // which would overwrite the Blocked state with Ready.
@@ -1105,6 +1117,18 @@ void SchedulerBlock(Process* proc)
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
 
     uint64_t rlf3 = SchedLockAcquire(g_readyLock);
+
+    // Registration and cancellation check are atomic with terminal publication.
+    // If publication won before registration, return for caller-owned cleanup;
+    // if it wins after, SchedulerMarkTerminated wakes this registered wait.
+    if (interruptible) {
+        proc->interruptibleWait = true;
+        if (proc->terminalPending) {
+            SchedLockRelease(g_readyLock, rlf3);
+            if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+            return;
+        }
+    }
 
     // Terminal state is irreversible. A remote exit_group can win while this
     // syscall is preparing to sleep; retire on our own stack-switch path,
@@ -1159,6 +1183,20 @@ void SchedulerBlock(Process* proc)
     // to restore).
     if (flags & 0x200)
         __asm__ volatile("sti" ::: "memory");
+}
+
+void SchedulerBlock(Process* proc)
+{
+    SchedulerBlockImpl(proc, false);
+}
+
+void SchedulerBlockInterruptible(Process* proc)
+{
+    // Keep even otherwise-unprotected waits alive until their caller unwinds.
+    // Leave retains the latch until syscall return; it is not a terminal boundary.
+    SchedulerKernelRegionEnter(proc);
+    SchedulerBlockImpl(proc, true);
+    SchedulerKernelRegionLeave(proc);
 }
 
 void SchedulerMarkStopped(Process* proc, int signal)
@@ -1247,9 +1285,9 @@ void SchedulerMarkTerminated(Process* proc, int waitStatus)
         (proc->kernelRegionDepth || proc->kernelOperationProtected)) {
         if (!proc->terminalPending) proc->pendingWaitStatus = waitStatus;
         proc->terminalPending = true;
-        bool resume = proc->state == ProcessState::Stopped;
+        bool resume = proc->state == ProcessState::Stopped || proc->interruptibleWait;
         SchedLockReleaseRaw(g_readyLock);
-        // A stopped owner/waiter must be allowed to finish its operation.
+        // A stopped owner or explicitly interruptible waiter must unwind.
         // Ordinary blocked mutex waiters still wait for an ownership grant.
         if (resume) SchedulerUnblock(proc);
         ProcessUnref(proc);
@@ -2225,8 +2263,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         // Signal the compositor
         if (proc->fbVfbWidth > 0)
             proc->fbExitColor = (status < 0) ? 0x00CC0000u : 0x00001A3Au;
-        proc->fbVirtual = nullptr;
-        proc->fbVirtualSize = 0;
+        UserFramebufferPublish(proc,nullptr,nullptr,0,0,0,0);
     }
 
     SchedulerKernelOperationBoundary(); // Exit cleanup has finished, including closes.
@@ -2713,7 +2750,7 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
     // kernel-lock state and mark it reapable.
     //
     // The quiesce wait is required so the caller (leader) doesn't proceed to
-    // ProcessDestroy and free the shared page table / fileMaps while a sibling
+    // ProcessDestroy and free the shared page table / mapping backings while a sibling
     // is still running on those shared resources.  Performing the rwlock
     // cleanup only after runningOnCpu < 0 also closes the BRO-157 race: the
     // thread is now parked at a stable point, so its heldWriteLock /

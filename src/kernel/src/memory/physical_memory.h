@@ -23,20 +23,22 @@ static constexpr uint32_t PMM_NULL_PAGE = 0xFFFFFFFFu;
 // Maximum number of PIDs tracked simultaneously.
 static constexpr uint32_t PMM_MAX_PIDS  = 1024;
 
-// Per-page ownership record.  12 bytes, doubly-linked within its PID's list.
+// Per-page ownership record. 20 bytes, doubly-linked within its PID's list.
 struct PageDescriptor
 {
     uint32_t next;   // next page index in PID's list (PMM_NULL_PAGE = tail)
     uint32_t prev;   // prev page index in PID's list (PMM_NULL_PAGE = head)
     uint16_t pid;    // owning PID
     uint8_t  tag;    // MemTag value
-    uint8_t  refCount; // COW reference count (0=untracked, 1=exclusive, 2+=shared)
-    uint16_t mapCount; // BRO-176: # of present USER PTEs mapping this frame.
+    uint32_t refCount; // COW reference count (0=untracked, 1=exclusive, 2+=shared)
+    uint32_t mapCount; // BRO-176: # of present USER PTEs mapping this frame.
                        // Maintained O(1) at PTE install/remove. Invariant: when a
                        // User page is freed (refCount→0) mapCount MUST be 0; a
                        // nonzero value means a PTE outlived its reference (the
                        // stale-mapping bug). See PmmMapInc/PmmMapDec.
 };
+
+static_assert(sizeof(PageDescriptor)==20, "PMM descriptor layout");
 
 // Head/tail/count for one PID's page list.
 struct PidList
@@ -93,7 +95,7 @@ void     PmmUnrefPage(PhysicalAddress physAddr);
 // Returns true (and increments) if alive, false if already free (never
 // resurrects). Used to pin a COW source across the copy.
 bool     PmmRefPageIfAlive(PhysicalAddress physAddr);
-uint8_t  PmmGetRefCount(PhysicalAddress physAddr);
+uint32_t PmmGetRefCount(PhysicalAddress physAddr);
 
 // BRO-176 stale-mapping detector: track the number of present USER PTEs that
 // map a physical frame. Call PmmMapInc when installing a present USER PTE and

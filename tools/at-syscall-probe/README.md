@@ -482,15 +482,35 @@ and shm O_TRUNC is rejected because freeing mapped pages is unsafe.
 The procfd probe also changes a cold three-page memfd mapping's middle page to
 PROT_NONE/PROT_READ, checks that the outside pages retain their permissions,
 checks expected child faults inside, restores access, and unmaps all fragments.
-`--brook-capacity` additionally fills Brook's 256 memfd mapping slots and verifies
-that a two-fragment split fails without permission changes until two slots are
-available; this capacity assertion is Brook-specific and is not run on Linux.
+`--brook-capacity` additionally creates 768 memfd mappings and verifies that
+protection splits succeed beyond the retired 256-entry mapping-table limit.
+It checks the protected middle page, both outside pages, restored access and
+cleanup; the larger coverage run is Brook-specific and is not run on Linux.
 Partial protection/unmap metadata is split with backing references retained;
-this does not establish the separate concurrent metadata/PTE transaction protocol.
+the capacity probe alone does not establish concurrent metadata/PTE correctness.
 Remapping a range spanning distinct memfd fragments is explicitly rejected.
 F_ADD_SEALS/F_GET_SEALS and unsupported memfd_create flag bits return EINVAL;
 no immutability or cross-sandbox isolation claim is made. Firefox experiments can
 use its upstream-supported MOZ_SHM_NO_SEALS=1 setting while sealing remains absent.
+
+`mappingracecheck.c` requires an explicitly configured test kernel with
+`-DBROOK_MAPPING_TEST_HOOKS=ON` (default OFF), and runs as guest root. Build the
+probe with `-pthread`; invoke it with a disposable FAT or ext2 file pathname.
+The test-only scalar syscall `0xB30` arms a barrier for the caller's address-space
+identity and VA interval, queries arrivals/waiters, or releases waiting faults.
+The query/release controls are global so a parent can cancel its child. Neither
+the control syscall nor barrier waits are included in ordinary kernels.
+
+The actual file/memfd resolver stops outside all mapping/backing locks, either
+after retaining its range snapshot or after preparing pages before publication.
+The probe requires both competing faults to arrive before release, checks
+same-page and adjacent-page loads, replaces the mapping with MAP_FIXED and
+verifies replacement bytes survive, and requires SIGSEGV after unmap or write
+permission removal. Cancellation cases require EBUSY while a stopped file fault
+holds its pin, SIGKILL completion after release, and successful truncate after
+consuming wait. A missed barrier or timeout fails. This covers cancellation at
+the preparation boundaries, not cancellation while a disk request is blocked.
+It does not establish regular-file MAP_SHARED write coherence or writeback.
 
 `unixfdcheck.c` is a bounded pthread/fork socket ownership regression. Four
 threads repeatedly duplicate and close one socket endpoint, including racing
@@ -611,3 +631,66 @@ guest under a host watchdog. It checks the current detached nonleader-exec
 model, separate new-image heap growth and continued sharing by old-AS tasks;
 it does not assert Linux exec semantics. Internal pipe polls have five-second
 bounds. It passes both the pre-transaction baseline and transaction candidate.
+
+
+`wmfilewaitcheck.c` runs 32 native-window exits with a private file mapping,
+consuming wait and immediate truncate. Its optional `--delayed-renderer` mode
+requires the opt-in mapping test kernel and keeps the compositor parked at frame
+entry through wait and truncate; state checks reject early release or timeout.
+Run against both `/data/WMWAIT.TST` and `/boot/WMWAIT.TST`. It does not test an
+old compositor pixel snapshot or in-flight GPU submission.
+
+`terminalstresscheck.c` must replace the actual native terminal's owner using
+`exec /boot/TERMCHK /data/TERMCHK.OK`. Compile static with musl, `-O2 -Wall
+-Wextra -Werror`. It requires the opt-in mapping test kernel for epoch queries,
+checks the retained source immediately after exec, writes exactly 256 KiB,
+then prompts for two GUI resizes. Choose sizes whose pixel byte lengths leave
+at least four bytes of page padding. An old alias canary must survive the second
+resize and three epochs, while the new allocation's padding must be zero.
+Initial dimensions must differ from fallback 640×480. The durable result file
+records completion after the terminal closes; a launch acknowledgement is not
+success. A 150-second POSIX timer bounds the run, including blocked output.
+
+
+`filesharedcheck.c` is a Linux-contract probe for writable regular-file sharing.
+Compile static with musl and `-O2 -Wall -Wextra -Werror`, and supply a fresh path
+(created O_EXCL). It checks aliases across separate opens and fork, ordinary I/O
+coherence, private CoW, msync/fsync/reopen, truncate/EOF SIGBUS, shrink/regrow
+zeroing and lifetime after unlink/close. A 60-second POSIX timer bounds the run.
+Run the Linux reference with core dumps disabled because one child deliberately
+accesses a whole page beyond EOF. It currently passes Linux; Brook's unsupported
+shared-write path is an expected failing baseline, not a permitted success.
+This does not prove simultaneous same-page misses or durability across reboot.
+See `docs/file-shared-mappings.md` for the implementation and remaining gates.
+
+
+`framealiascheck.c` is a Brook framebuffer regression for managed frame sharing.
+Compile static with musl and `-O2 -Wall -Wextra -Werror`, then run `/boot/FRMALIAS`.
+It maps the first framebuffer page 512 times, closes the fd, verifies a shared
+canary through every alias and removes aliases while checking the survivors.
+The final alias is unmapped before exit. A 60-second POSIX timer bounds the run.
+This exercises real guest mappings above the old 255-reference limit, not file
+writeback. The separate hosted `test_pmm_refs` uses actual PMM code to verify
+70,000 references/mapping counts and final freeing with exact count assertions.
+
+
+`filecoherencecheck.c` checks the ordinary-I/O stage of ext2 coherent mappings.
+Build static musl with `-O2 -Wall -Wextra -Werror -pthread` and run
+`/boot/FILECOH /data/FILECOH.TST` against a fresh path (O_EXCL). It checks pwrite
+visibility through read-only shared aliases across opens/threads, private CoW,
+file-backed user buffers, an untouched mapped write source, unmapped truncate/
+regrow invalidation, and unlink/close lifetime. It passes Linux and Brook. The
+60-second timer bounds the run. This does not test writable shared stores, mapped
+truncate, msync, or deterministic simultaneous kernel misses. Brook's syscall
+validation populates the untouched source before the file write operation.
+
+
+`futexexitcheck.c` reproduces protected-operation cancellation with four untimed
+private futex waiters and no normal waker. Each child touches 32 MiB, observes all
+four workers sleeping through procfs, then invokes exit_group. The parent requires
+each group to be reaped within five seconds for 32 rounds and checks free-memory
+recovery after warming caches (one footprint of tolerance). Build static musl with
+`-O2 -Wall -Wextra -Werror -pthread`; run `/boot/FUTXCHK` on an otherwise idle guest.
+Memory is a bounded growth check, not an exact PMM-reference audit. A host run
+sanity-checks probe logic; only the actual Brook guest demonstrates cancellation.
+The pre-fix kernel 2582aece fails on round zero with retained off-CPU futex threads.

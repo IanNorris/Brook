@@ -13,11 +13,13 @@
 #include "pipe.h"
 #include "net.h"
 #include "memory/virtual_memory.h"
+#include "memory/user_mapping.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "compositor.h"
+#include "terminal.h"
 #include "window.h"
 #include "gpu_app.h"
 #include "ext2_vfs.h"
@@ -98,6 +100,7 @@ static inline void FreeProcessStruct(Process* p)
                          haveSym ? sym : "?", off);
         }
 
+        MappingBackingUnref(p->fbBacking);p->fbBacking=nullptr;
         AddressSpaceUnref(p->addressSpace);
         p->addressSpace = nullptr;
         p->magic = 0;
@@ -285,14 +288,22 @@ static uint64_t RandomU64()
 // SetupTLS -- Allocate and initialize a TLS block for a process.
 // Called by both ProcessCreate and ProcessExec.
 // ---------------------------------------------------------------------------
-static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
+static bool RegisterInitialRange(Process* proc, uint64_t begin, uint64_t end,
+                                  uint32_t protection, MappingKind kind) {
+    MappingRangePlan plan;
+    MappingRange range{begin,end,0,0,nullptr,protection,7,kind,
+                       MappingSharing::Private,MappingLeafOwnership::Managed};
+    return plan.Prepare(1) && plan.Insert(proc->addressSpace->ranges,range);
+}
+static bool SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
 {
     proc->fsBase = 0;
     proc->savedCtx.gsBase = 0;
-    if (proc->elf.tlsTotalSize == 0) return;
+    if (proc->elf.tlsTotalSize == 0) return true;
 
     uint64_t tlsPages = (proc->elf.tlsTotalSize + 64 + 4095) / 4096;
     uint64_t tlsBase = stackVirtBase - guardPages * 4096 - tlsPages * 4096;
+    if (!RegisterInitialRange(proc,tlsBase,tlsBase+tlsPages*4096,3,MappingKind::Anonymous)) return false;
 
     auto tlsToKernel = [&](uint64_t userAddr) -> uint8_t* {
         PhysicalAddress phys = VmmVirtToPhys(proc->addressSpace->pageTable, VirtualAddress(userAddr));
@@ -305,7 +316,7 @@ static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
         VirtualAddress vaddr(tlsBase + i * 4096);
         PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
         if (!phys || !VmmMapPage(proc->addressSpace->pageTable, vaddr, phys,
-                                  VMM_WRITABLE | VMM_USER,
+                                  VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
                                   MemTag::User, ProcessAddressSpacePid(proc)))
         {
             if (phys) PmmUnrefPage(phys);
@@ -316,7 +327,7 @@ static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
         memset(p, 0, 4096);
     }
 
-    if (!tlsOk) return;
+    if (!tlsOk) return false;
 
     // Copy initial TLS data via direct map, page-at-a-time to avoid
     // a VmmVirtToPhys page-table walk per byte.
@@ -334,7 +345,8 @@ static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
 
             uint8_t* src = tlsToKernel(srcAddr + off);
             uint8_t* dst = tlsToKernel(tlsBase + off);
-            if (src && dst) memcpy(dst, src, chunk);
+            if (!src || !dst) return false;
+            memcpy(dst, src, chunk);
 
             off += chunk;
             remaining -= chunk;
@@ -346,7 +358,8 @@ static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
     tcbAddr = (tcbAddr + 15) & ~15ULL;
 
     auto* tcbSlot = reinterpret_cast<uint64_t*>(tlsToKernel(tcbAddr));
-    if (tcbSlot) *tcbSlot = tcbAddr;
+    if (!tcbSlot) return false;
+    *tcbSlot = tcbAddr;
 
     // Stack canary at offset 40 (0x28) from FS base
     uint64_t canary = RandomU64();
@@ -358,6 +371,7 @@ static void SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
     }
 
     proc->fsBase = tcbAddr;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -503,9 +517,9 @@ static uint64_t SetupUserStack(Process* proc,
 
 // Forward declaration — implemented in elf_loader.cpp
 bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
-             PageTable pt, uint16_t pid);
+             AddressSpaceState* space, uint16_t pid);
 uint64_t ElfLoadAt(const uint8_t* data, uint64_t size,
-                   uint64_t base, PageTable pt, uint16_t pid);
+                   uint64_t base, AddressSpaceState* space, uint16_t pid);
 
 // Base address where the dynamic linker / interpreter is loaded.
 // Placed above USER_MMAP_END so it can never collide with sys_mmap allocations.
@@ -574,7 +588,7 @@ static uint64_t LoadInterpreter(Process* proc)
     }
     SerialPrintf("INTERP: opened '%s' size=%lu\n", whichPath, image.size);
     uint64_t entry = ElfLoadAt(image.data, image.size, INTERP_LOAD_BASE,
-                               proc->addressSpace->pageTable, proc->pid);
+                               proc->addressSpace, proc->pid);
     FreeExecutableImage(&image);
 
     if (!entry)
@@ -663,7 +677,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     // Load ELF binary into the process's page table (no CR3 switch needed —
     // ElfLoad writes via the direct physical map).
-    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->addressSpace->pageTable, proc->pid))
+    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->addressSpace, proc->pid))
     {
         SerialPuts("PROC: ELF load failed\n");
 
@@ -755,13 +769,14 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     uint64_t stackVirtTop = USER_STACK_TOP;            // 0x7FFFFFFFE000
     uint64_t stackVirtBase = stackVirtTop - totalStackPages * 4096;
 
-    bool stackOk = true;
-    for (uint64_t i = guardPages; i < totalStackPages; i++)
+    bool stackOk = RegisterInitialRange(proc,stackVirtBase,stackVirtBase+guardPages*4096,0,MappingKind::Stack) &&
+                   RegisterInitialRange(proc,stackVirtBase+guardPages*4096,stackVirtTop,3,MappingKind::Stack);
+    for (uint64_t i = guardPages; stackOk && i < totalStackPages; i++)
     {
         VirtualAddress vaddr(stackVirtBase + i * 4096);
         PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
         if (!phys || !VmmMapPage(proc->addressSpace->pageTable, vaddr, phys,
-                                  VMM_WRITABLE | VMM_USER,
+                                  VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
                                   MemTag::User, ProcessAddressSpacePid(proc)))
         {
             if (phys) PmmUnrefPage(phys);
@@ -784,6 +799,10 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     // Guard page (first page) is left unmapped — faults on stack overflow.
     proc->stackBase = stackVirtBase + guardPages * 4096;
     proc->stackTop  = stackVirtTop - 8;
+    if (!SetupTLS(proc,stackVirtBase,guardPages)) {
+        VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase),KERNEL_STACK_PAGES);
+        kfree(proc->fds); SchedulerFreePid(proc->pid); FreeProcessStruct(proc); return nullptr;
+    }
 
     // Set up standard file descriptors
     if (stdFds)
@@ -819,8 +838,7 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     // Store the final SP for SwitchToUserMode
     proc->stackTop = userSP;
 
-    // Set up TLS if the ELF has a PT_TLS segment
-    SetupTLS(proc, stackVirtBase, guardPages);
+    // TLS was constructed before accepting caller-owned standard descriptors.
 
     // Set actual initial entry point (interpreter entry if dynamically linked).
     proc->initialEntry = interpEntry ? interpEntry : proc->elf.entryPoint;
@@ -1035,246 +1053,6 @@ void ProcessDestroyNow(Process* proc)
 // The child inherits open file descriptors (shallow copy).
 // The child's trampoline returns to user mode with RAX=0 (fork return value).
 
-// Helper: walk a 4-level page table and copy all leaf pages.
-static bool ForkCopyUserPages(PageTable srcPt, PageTable dstPt,
-                              uint16_t srcPid, uint16_t dstPid,
-                              volatile uint64_t& srcTlbCpuMask, const Process* mappings)
-{
-    static constexpr uint64_t PTE_PHYS_MASK = 0x000FFFFFFFFFF000ULL;
-
-    auto* srcPml4 = reinterpret_cast<uint64_t*>(
-        PhysToVirt(srcPt.pml4).raw());
-
-    [[maybe_unused]] uint64_t sharedCount = 0;
-    uint64_t copiedCount = 0;
-
-    extern volatile uint64_t g_lapicTickCount;
-    uint64_t forkStartTick = g_lapicTickCount;
-
-    // Only copy user-half (PML4 entries 0..255)
-    for (uint64_t i4 = 0; i4 < 256; i4++)
-    {
-        if (!(srcPml4[i4] & VMM_PRESENT)) continue;
-
-        auto* srcPdpt = reinterpret_cast<uint64_t*>(
-            PhysToVirt(PhysicalAddress(srcPml4[i4] & PTE_PHYS_MASK)).raw());
-
-        for (uint64_t i3 = 0; i3 < 512; i3++)
-        {
-            if (!(srcPdpt[i3] & VMM_PRESENT)) continue;
-            if (srcPdpt[i3] & (1ULL << 7)) continue; // 1GB huge page, skip
-
-            auto* srcPd = reinterpret_cast<uint64_t*>(
-                PhysToVirt(PhysicalAddress(srcPdpt[i3] & PTE_PHYS_MASK)).raw());
-
-            for (uint64_t i2 = 0; i2 < 512; i2++)
-            {
-                if (!(srcPd[i2] & VMM_PRESENT)) continue;
-                if (srcPd[i2] & (1ULL << 7)) continue; // 2MB huge page, skip
-
-                auto* srcPt4 = reinterpret_cast<uint64_t*>(
-                    PhysToVirt(PhysicalAddress(srcPd[i2] & PTE_PHYS_MASK)).raw());
-
-                for (uint64_t i1 = 0; i1 < 512; i1++)
-                {
-                    if (!(srcPt4[i1] & VMM_PRESENT)) continue;
-
-                    // Reconstruct the virtual address
-                    uint64_t vaddr = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
-
-                    PhysicalAddress srcPhys(srcPt4[i1] & PTE_PHYS_MASK);
-                    uint64_t pteFlags = srcPt4[i1] & ~PTE_PHYS_MASK;
-                    bool memfdPage = false;
-                    for (uint32_t m = 0; m < Process::MAX_MEMFD_MAPS; ++m) {
-                        const auto& map = mappings->addressSpace->memfdMaps[m];
-                        if (map.mfd && map.length && vaddr >= map.vaddr &&
-                            vaddr - map.vaddr < map.length) {
-                            memfdPage = true;
-                            break;
-                        }
-                    }
-                    if (memfdPage) {
-                        // Memfd VMAs borrow object-owned pages. Their copied
-                        // VMA holds an object ref; neither COW nor a per-PTE
-                        // page reference belongs here. COW disconnects parent
-                        // writes from the compositor and can retire the backing.
-                        if (!VmmMapPage(dstPt, VirtualAddress(vaddr), srcPhys,
-                                        pteFlags & ~PTE_COW_BIT, MemTag::User, dstPid))
-                            return false;
-                        sharedCount++;
-                        continue;
-                    }
-                    if (((pteFlags & PTE_TAG_MASK) >> PTE_TAG_SHIFT) ==
-                        static_cast<uint64_t>(MemTag::Device)) {
-                        // The parent borrows kernel-owned graphics backing. The
-                        // child retains its own reference; never COW-downgrade
-                        // the parent's borrowed leaf or retire the owner's ref.
-                        PmmRefPage(srcPhys);
-                        if (!VmmMapPage(dstPt, VirtualAddress(vaddr), srcPhys,
-                                        pteFlags & ~PTE_COW_BIT, MemTag::User, dstPid)) {
-                            PmmUnrefPage(srcPhys);
-                            return false;
-                        }
-                        sharedCount++;
-                        continue;
-                    }
-                    bool wasWritable = (pteFlags & VMM_WRITABLE) != 0;
-                    bool alreadyCow  = (pteFlags & PTE_COW_BIT) != 0;
-                    bool privateWritable = wasWritable || alreadyCow;
-
-                    // COW fork: share writable pages between parent and
-                    // child instead of copying.  Mark both PTEs read-only
-                    // with PTE_COW_BIT set.  The page fault handler (idt.cpp)
-                    // copies on first write.  TlbShootdownFull after the
-                    // loop flushes stale writable TLB entries on all CPUs.
-                    if (privateWritable)
-                    {
-                        // Build child PTE: same physical page, read-only + COW.
-                        // Do NOT touch the parent PTE yet — that happens
-                        // atomically with the child leaf write and refcount bump
-                        // inside VmmForkCommitCowShare (BRO-155).
-                        uint64_t childPte = (srcPhys.raw() & PTE_PHYS_MASK)
-                                          | VMM_PRESENT
-                                          | (pteFlags & VMM_USER)
-                                          | (pteFlags & VMM_NO_EXEC)
-                                          | (pteFlags & PTE_TAG_MASK)
-                                          | PTE_COW_BIT
-                                          | (((uint64_t)dstPid & 0x3FF) << PTE_PID_SHIFT);
-
-                        // BRO-176: pin the shared frame BEFORE the child mapping
-                        // becomes reachable. Publishing the child's leaf PTE
-                        // (VmmMapPage below) adds a second mapper, but the refcount
-                        // is not bumped until the commit. In that window a
-                        // concurrent teardown of the parent's address space (a
-                        // sibling thread's exit_group) could unref the frame to
-                        // zero and free it while the child maps it — the cross-AS
-                        // COW double-free. Taking an anticipatory reference here
-                        // holds the frame at >=1 across the whole share, so it can
-                        // never be freed mid-share. The matching unref (unpin)
-                        // runs after the commit's own ref is in place. This also
-                        // strengthens BRO-155: refcount is >=2 throughout the
-                        // share window, so the COW write-fault handler always
-                        // observes "shared" and copies, never upgrading in place.
-                        PmmRefPage(srcPhys);
-
-                        // Create intermediate page table entries in child FIRST.
-                        // VmmMapPage takes g_userPtLock internally, so it must
-                        // run BEFORE the locked commit (calling it under the lock
-                        // would deadlock). The leaf PTE it writes here is
-                        // overwritten by the commit below.
-                        uint64_t childMapFlags = VMM_USER;
-                        if (pteFlags & VMM_NO_EXEC)
-                            childMapFlags |= VMM_NO_EXEC;
-                        if (!VmmMapPage(dstPt, VirtualAddress(vaddr), srcPhys,
-                                        childMapFlags, MemTag::User, dstPid))
-                        {
-                            SerialPrintf("FORK: failed to map COW page at vaddr 0x%lx\n", vaddr);
-                            // Parent PTE was not modified — nothing to restore.
-                            // Drop the anticipatory pin taken above.
-                            PmmUnrefPage(srcPhys);
-                            return false;
-                        }
-
-                        // Locate the child's leaf PTE (intermediate tables now
-                        // exist) and commit the COW share atomically: downgrade
-                        // parent, install child leaf, bump refcount under
-                        // g_userPtLock so the COW write-fault handler can't
-                        // observe a half-shared state.
-                        auto* dstPml4 = reinterpret_cast<uint64_t*>(
-                            PhysToVirt(dstPt.pml4).raw());
-                        auto* dstPdpt = reinterpret_cast<uint64_t*>(
-                            PhysToVirt(PhysicalAddress(dstPml4[i4] & PTE_PHYS_MASK)).raw());
-                        auto* dstPd = reinterpret_cast<uint64_t*>(
-                            PhysToVirt(PhysicalAddress(dstPdpt[i3] & PTE_PHYS_MASK)).raw());
-                        auto* dstPt4 = reinterpret_cast<uint64_t*>(
-                            PhysToVirt(PhysicalAddress(dstPd[i2] & PTE_PHYS_MASK)).raw());
-
-                        VmmForkCommitCowShare(&srcPt4[i1], &dstPt4[i1],
-                                              childPte, srcPhys);
-
-                        // Unpin: the commit's own ref now accounts for the child
-                        // mapper, so drop the anticipatory reference. Net effect of
-                        // pin + commit-ref + unpin is exactly +1 (the child), but
-                        // the frame was never freeable during the share.
-                        PmmUnrefPage(srcPhys);
-
-                        copiedCount++;
-                        continue;
-                    }
-
-                    // Build child PTE: same physical page and read-only flags.
-                    uint64_t childPte = (srcPhys.raw() & PTE_PHYS_MASK)
-                                      | VMM_PRESENT
-                                      | (pteFlags & VMM_USER)
-                                      | (pteFlags & VMM_NO_EXEC);
-                    // Preserve tag bits
-                    childPte |= (pteFlags & PTE_TAG_MASK);
-                    // Set child PID
-                    childPte |= (((uint64_t)dstPid & 0x3FF) << PTE_PID_SHIFT);
-
-                    // BRO-176: ref the shared frame BEFORE publishing the child
-                    // mapping. VmmMapPage below makes the child a second mapper of
-                    // srcPhys; if the refcount bump came after (as it used to), a
-                    // concurrent parent-AS teardown could free the frame to zero in
-                    // the window while the child maps it. Referencing first holds
-                    // the frame across the publish.
-                    PmmRefPage(srcPhys);
-
-                    // Map into child's page table via WalkToPtr (need intermediate tables)
-                    // Use VmmMapPage to create intermediates, then override leaf PTE.
-                    uint64_t childMapFlags = VMM_USER;
-                    if (pteFlags & VMM_NO_EXEC)
-                        childMapFlags |= VMM_NO_EXEC;
-
-                    // We need to create intermediate page table entries.
-                    // VmmMapPage will create them, then we overwrite the leaf PTE.
-                    if (!VmmMapPage(dstPt, VirtualAddress(vaddr), srcPhys,
-                                    childMapFlags, MemTag::User, dstPid))
-                    {
-                        SerialPrintf("FORK: failed to map shared page at vaddr 0x%lx\n", vaddr);
-                        // Drop the reference taken above for the child that never mapped.
-                        PmmUnrefPage(srcPhys);
-                        return false;
-                    }
-
-                    // Now overwrite the child's leaf PTE with our carefully
-                    // constructed one preserving Brook's metadata bits.
-                    {
-                        // Walk to the PTE we just created
-                        auto* dstPml4 = reinterpret_cast<uint64_t*>(
-                            PhysToVirt(dstPt.pml4).raw());
-                        auto* dstPdpt = reinterpret_cast<uint64_t*>(
-                            PhysToVirt(PhysicalAddress(dstPml4[i4] & PTE_PHYS_MASK)).raw());
-                        auto* dstPd = reinterpret_cast<uint64_t*>(
-                            PhysToVirt(PhysicalAddress(dstPdpt[i3] & PTE_PHYS_MASK)).raw());
-                        auto* dstPt4 = reinterpret_cast<uint64_t*>(
-                            PhysToVirt(PhysicalAddress(dstPd[i2] & PTE_PHYS_MASK)).raw());
-                        dstPt4[i1] = childPte;
-                    }
-
-                    sharedCount++;
-                }
-            }
-        }
-    }
-
-    [[maybe_unused]] uint64_t forkElapsed = g_lapicTickCount - forkStartTick;
-    DbgPrintf("[PROFILE] fork_pages t=%lums pid=%u->%u cow=%lu shared=%lu elapsed=%lums\n",
-              g_lapicTickCount,
-              static_cast<uint32_t>(srcPid), static_cast<uint32_t>(dstPid),
-              copiedCount, sharedCount, forkElapsed);
-
-    // Flush all TLB entries for the parent's address space. Parent PTEs
-    // were downgraded from writable to RO+COW, so any stale writable
-    // entry on any CPU must be flushed.
-    if (copiedCount > 0)
-    {
-        TlbShootdownFull(srcPt.pml4.raw(), srcTlbCpuMask);
-    }
-
-    return true;
-}
-
 Process* ProcessFork(Process* parent, uint64_t userRip,
                      uint64_t userRsp, uint64_t userRflags)
 {
@@ -1287,6 +1065,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // Copy entire parent process struct as a starting point
     memcpy(child, parent, sizeof(Process));
     child->addressSpace = nullptr;
+    child->fbBacking = nullptr;
+    child->framebufferLock = {};
     child->destroyNext = nullptr;
     child->destroyCompletion = nullptr;
     child->activeFileFaultVnode = nullptr;
@@ -1350,6 +1130,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->wakeupTick = 0;
     child->kernelRegionDepth = 0;
     child->kernelOperationProtected = false;
+    child->interruptibleWait = false;
     child->terminalPending = false;
     child->pendingWaitStatus = 0;
     child->syncNext = nullptr;
@@ -1403,30 +1184,9 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         return nullptr;
     }
 
-    // Metadata and page tables must come from the same shared AS. The group
-    // leader may already have installed a different address space via exec.
-    Process* mapOwner = parent;
-    child->addressSpace->programBreak = mapOwner->addressSpace->programBreak;
-    child->addressSpace->programBreakLow = mapOwner->addressSpace->programBreakLow;
-    child->addressSpace->programBreakHigh = mapOwner->addressSpace->programBreakHigh;
-    child->addressSpace->mmapNext = mapOwner->addressSpace->mmapNext;
-    SpinLockAcquire(&mapOwner->addressSpace->fileMapLock);
-    memcpy(child->addressSpace->memfdMaps, mapOwner->addressSpace->memfdMaps, sizeof(child->addressSpace->memfdMaps));
-    memcpy(child->addressSpace->fileMaps, mapOwner->addressSpace->fileMaps, sizeof(child->addressSpace->fileMaps));
-    for (uint32_t i = 0; i < Process::MAX_MEMFD_MAPS; ++i)
-        if (child->addressSpace->memfdMaps[i].length && child->addressSpace->memfdMaps[i].mfd)
-            brook::MemFdHandleRef(child->addressSpace->memfdMaps[i].mfd);
-    for (uint32_t i = 0; i < Process::MAX_FILE_MAPS; ++i)
-        if (child->addressSpace->fileMaps[i].length && child->addressSpace->fileMaps[i].vnode) {
-            VfsFileMapClone(child->addressSpace->fileMaps[i].vnode);
-            __atomic_fetch_add(&child->addressSpace->fileMaps[i].vnode->refCount, 1, __ATOMIC_RELEASE);
-        }
-    SpinLockRelease(&mapOwner->addressSpace->fileMapLock);
-
-    // Copy writable private pages; shared memfd pages retain object backing.
-    if (!ForkCopyUserPages(parent->addressSpace->pageTable, child->addressSpace->pageTable,
-                           parent->pid, child->pid,
-                           *AddressSpaceTlbMaskPtr(parent), child))
+    // Snapshot ranges and populated leaves under the shared AS mutation lock.
+    // The clone returns only after parent writable translations are invalidated.
+    if (!UserMappingClone(parent, parent->addressSpace, child->addressSpace, child->pid))
     {
         SerialPuts("FORK: address space copy failed\n");
 
@@ -1501,6 +1261,8 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     // Copy parent process struct as starting point
     memcpy(thread, parent, sizeof(Process));
     thread->addressSpace = nullptr;
+    thread->fbBacking = nullptr;
+    thread->framebufferLock = {};
     thread->destroyNext = nullptr;
     thread->destroyCompletion = nullptr;
     thread->activeFileFaultVnode = nullptr;
@@ -1574,6 +1336,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->wakeupTick = 0;
     thread->kernelRegionDepth = 0;
     thread->kernelOperationProtected = false;
+    thread->interruptibleWait = false;
     thread->terminalPending = false;
     thread->pendingWaitStatus = 0;
     thread->syncNext = nullptr;
@@ -1680,120 +1443,33 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
     if (!entry) return 0;
     if (stackSize < 4096) stackSize = 4096;
     // Round up to 4K and clamp to 1 MiB (defensive)
-    stackSize = (stackSize + 4095) & ~uint32_t(4095);
     if (stackSize > (1u << 20)) stackSize = 1u << 20;
+    stackSize = (stackSize + 4095) & ~uint32_t(4095);
 
     // argBytes must fit in top of stack, leaving room for alignment + a
     // small amount of spare so the entry function doesn't immediately
     // clobber its own argument when it pushes stack frames.
     if (argLen > stackSize / 2) return 0;
 
-    // Reserve a VA range in the target's shared address space.  Use a dedicated lock
-    // to avoid clashing with sys_mmap — overlap would be catastrophic.
-    // We intentionally don't share the sys_mmap spinlock (different TU).
-    static SpinLock s_remoteStackLock;
-    uint64_t stackBase = 0;
-    uint32_t pages = stackSize / 4096;
-    {
-        SpinLockAcquire(&s_remoteStackLock);
-        stackBase = target->addressSpace->mmapNext;
-        if (stackBase + stackSize > USER_MMAP_END) {
-            SpinLockRelease(&s_remoteStackLock);
-            SerialPrintf("CRT: out of user VA (pid %u)\n", target->pid);
-            return 0;
-        }
-        target->addressSpace->mmapNext = stackBase + stackSize;
-        SpinLockRelease(&s_remoteStackLock);
-    }
-
-    // Allocate + map pages as User/RW.  NX is set via the architecture
-    // default for non-executable; user stack must not be executable.
-    uint64_t vmmFlags = VMM_WRITABLE | VMM_USER;
-    uint32_t mapped = 0;
-    for (uint32_t i = 0; i < pages; ++i) {
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(target));
-        if (!phys) break;
-        if (!VmmMapPage(target->addressSpace->pageTable,
-                        VirtualAddress(stackBase + i * 4096),
-                        phys, vmmFlags, MemTag::User, ProcessAddressSpacePid(target))) {
-            PmmFreePage(phys);
-            break;
-        }
-        // Zero the page via the direct physmap (stack hygiene).
-        auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        for (uint32_t b = 0; b < 4096; ++b) kp[b] = 0;
-        ++mapped;
-    }
-    if (mapped < pages) {
-        // Partial mapping — roll back what we did and fail.
-        for (uint32_t i = 0; i < mapped; ++i) {
-            VirtualAddress va(stackBase + i * 4096);
-            PhysicalAddress p = VmmVirtToPhys(target->addressSpace->pageTable, va);
-            VmmUnmapPage(target->addressSpace->pageTable, va);
-            if (p) PmmFreePage(p);
-        }
-        SerialPrintf("CRT: stack alloc failed (%u/%u pages) for pid %u\n",
-                     mapped, pages, target->pid);
+    Process* actor=ProcessCurrent();
+    if (!actor) return 0;
+    ProcessOperationGuard operation(actor);
+    // Construct the unpublished thread first: its AS reference remains stable
+    // even if the target later execs. Stack construction uses that exact AS.
+    Process* thread=ProcessCreateThread(target,entry,0,0x202,target->fsBase);
+    if (!thread) return 0;
+    uint64_t argVA=0;
+    int64_t mapped=UserMappingStack(actor,thread->addressSpace,stackSize,argBytes,argLen,&argVA);
+    if (mapped<0) {
+        VmmFreeKernelStack(VirtualAddress(thread->kernelStackBase),KERNEL_STACK_PAGES);
+        SchedulerFreePid(thread->pid);
+        FreeProcessStruct(thread);
         return 0;
     }
-
-    uint64_t stackTop = stackBase + stackSize;
-
-    // Place argBytes at the very top of the stack.  Align the arg buffer
-    // to 16 bytes so the entry function gets an aligned RSP.
-    uint64_t argVA = 0;
-    if (argBytes && argLen > 0) {
-        uint64_t argStart = (stackTop - argLen) & ~uint64_t(0xF);
-        argVA = argStart;
-
-        // Copy via the direct physmap.  The buffer may cross page
-        // boundaries, so walk page-by-page.
-        const auto* src = static_cast<const uint8_t*>(argBytes);
-        uint32_t remaining = argLen;
-        uint64_t cursor = argStart;
-        while (remaining > 0) {
-            uint64_t pageVA = cursor & ~uint64_t(0xFFF);
-            uint64_t pageOff = cursor & 0xFFF;
-            uint32_t thisPage = 4096u - static_cast<uint32_t>(pageOff);
-            if (thisPage > remaining) thisPage = remaining;
-            PhysicalAddress phys = VmmVirtToPhys(target->addressSpace->pageTable,
-                                                  VirtualAddress(pageVA));
-            if (!phys) {
-                SerialPrintf("CRT: arg copy hit unmapped page 0x%lx pid %u\n",
-                             pageVA, target->pid);
-                return 0;
-            }
-            auto* dst = reinterpret_cast<uint8_t*>(
-                PhysToVirt(phys).raw() + pageOff);
-            memcpy(dst, src, thisPage);
-            src += thisPage;
-            cursor += thisPage;
-            remaining -= thisPage;
-        }
-    }
-
-    // Pick the user RSP.  Leave 16 bytes of headroom below the arg area
-    // for alignment + a sentinel return address (function prologue will
-    // push RBP onto this).  Linux ABI: at function entry RSP % 16 == 8.
-    uint64_t userRsp = argVA ? (argVA - 16) : (stackTop - 16);
-    userRsp &= ~uint64_t(0xF);
-    userRsp -= 8;   // so that (rsp + 8) is 16-aligned = ABI pre-call state
-
-    // Create the thread using the existing CLONE_VM|CLONE_FILES machinery.
-    // Pass target's fs base as the TLS — the entry code must tolerate
-    // whatever fs is pointing at (or re-initialise it explicitly).
-    Process* thread = ProcessCreateThread(target, entry, userRsp, 0x202,
-                                          target->fsBase);
-    if (!thread) {
-        // Roll back the stack mapping.
-        for (uint32_t i = 0; i < pages; ++i) {
-            VirtualAddress va(stackBase + i * 4096);
-            PhysicalAddress p = VmmVirtToPhys(target->addressSpace->pageTable, va);
-            VmmUnmapPage(target->addressSpace->pageTable, va);
-            if (p) PmmFreePage(p);
-        }
-        return 0;
-    }
+    uint64_t stackBase=static_cast<uint64_t>(mapped),stackTop=stackBase+stackSize;
+    // Linux ABI: at function entry (RSP + 8) is 16-byte aligned.
+    uint64_t userRsp=((argVA?argVA-16:stackTop-16)&~uint64_t{15})-8;
+    thread->forkReturnRsp=userRsp;
 
     // Override caller-saved registers: entry gets only RDI = argVA, all
     // others cleared.  Callee-saved (RBX, RBP, R12-R15) also cleared so
@@ -1863,6 +1539,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     }
     PosixTimersCleanup(proc, true);
     AddressSpaceState* previous = proc->addressSpace;
+    UserFramebufferPublish(proc,nullptr,nullptr,0,0,0,0);
     PageTable kernelPt = VmmKernelCR3();
     __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
     proc->addressSpace = replacement;
@@ -1878,17 +1555,8 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
         proc->threadLeader = proc;
         proc->leaderIncarnation = 0;
     }
-    // Stop publishing old graphics backing before its AS can be finalized.
-    proc->fbVirtual = nullptr;
-    proc->fbVirtualSize = 0;
-    proc->fbVfbWidth = 0;
-    proc->fbVfbHeight = 0;
-    proc->fbVfbStride = 0;
-    proc->fbDestX = 0;
-    proc->fbDestY = 0;
-    proc->fbScale = 0;
-    proc->fbDirty = 0;
-    proc->fbExitColor = 0;
+    // The source was cleared through framebufferLock before AS replacement.
+    proc->fbDestX = 0;proc->fbDestY = 0;proc->fbScale = 0;proc->fbExitColor = 0;
 
     AddressSpaceUnref(previous);
 
@@ -1902,7 +1570,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     proc->crashInProgress = false;
 
     // 3. Load the new ELF binary
-    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->addressSpace->pageTable, proc->pid))
+    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->addressSpace, proc->pid))
     {
         SerialPuts("EXEC: ELF load failed\n");
         return 0;
@@ -1937,12 +1605,15 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     uint64_t stackVirtTop = USER_STACK_TOP;
     uint64_t stackVirtBase = stackVirtTop - totalStackPages * 4096;
 
+    if (!RegisterInitialRange(proc,stackVirtBase,stackVirtBase+guardPages*4096,0,MappingKind::Stack) ||
+        !RegisterInitialRange(proc,stackVirtBase+guardPages*4096,stackVirtTop,3,MappingKind::Stack)) return 0;
+
     for (uint64_t i = guardPages; i < totalStackPages; i++)
     {
         VirtualAddress vaddr(stackVirtBase + i * 4096);
         PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
         if (!phys || !VmmMapPage(proc->addressSpace->pageTable, vaddr, phys,
-                                  VMM_WRITABLE | VMM_USER,
+                                  VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
                                   MemTag::User, ProcessAddressSpacePid(proc)))
         {
             if (phys) PmmUnrefPage(phys);
@@ -1960,7 +1631,7 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     proc->stackTop = userSP;
 
     // 6. Set up TLS
-    SetupTLS(proc, stackVirtBase, guardPages);
+    if (!SetupTLS(proc, stackVirtBase, guardPages)) return 0;
 
     // 8. Close FD_CLOEXEC file descriptors — POSIX execve semantics require
     //    that any fd opened with O_CLOEXEC / FD_CLOEXEC is closed when the
@@ -1988,6 +1659,11 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
 
     *outStackPtr = userSP;
 
+    // The terminal owns its pixels independently of the replaced AS. Keep an
+    // owning shell's display attached across exec, without restoring old user
+    // mappings or publishing its source to a forked descendant.
+    TerminalRestoreAfterExec(proc);
+
     // If dynamically linked, start at the interpreter's entry point;
     // otherwise, start at the main binary's entry.
     return interpEntry ? interpEntry : proc->elf.entryPoint;
@@ -2013,8 +1689,6 @@ int ProcessSendSignal(Process* proc, int signum)
         // Running on another CPU — it may execute a few more instructions
         // before the next timer tick preempts it. This is acceptable for a
         // hobby OS; a production kernel would use an IPI to force-preempt.
-        proc->fbVirtual = nullptr;
-        proc->fbVirtualSize = 0;
         SchedulerMarkTerminated(proc, SIGKILL);
         // BRO-173/175: reapable is decoupled from holders; the reaper requires
         // refCount==0 before freeing, so it is safe to mark reapable here.
@@ -2088,8 +1762,6 @@ int ProcessSendSignal(Process* proc, int signum)
                                    signum == 15);
         if (sa.handler == 0 && defaultIsTerminate)
         {
-            proc->fbVirtual = nullptr;
-            proc->fbVirtualSize = 0;
             SchedulerMarkTerminated(proc, signum);
             // BRO-173/175: reapable decoupled from holders (reaper requires
             // refCount==0), so it is safe to mark reapable unconditionally.

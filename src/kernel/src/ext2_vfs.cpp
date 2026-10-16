@@ -7,6 +7,7 @@
 
 #include "ext2_vfs.h"
 #include "vfs.h"
+#include "memory/file_object.h"
 #include "device.h"
 #include "process.h"
 #include "memory/heap.h"
@@ -277,6 +278,7 @@ struct Ext2OpenInode {
     uint32_t holders;
     bool orphan;
     Ext2OpenInode* next;
+    FileObject file;
 };
 
 // Final vnode close can run in the timer's reaper. This lock protects only
@@ -289,7 +291,8 @@ static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
 {
     auto* candidate = static_cast<Ext2OpenInode*>(kmalloc(sizeof(Ext2OpenInode)));
     if (!candidate) return nullptr;
-    *candidate = {mnt, inode, 1, false, nullptr};
+    *candidate = {mnt, inode, 1, false, nullptr, {}};
+    FileObjectInit(&candidate->file);
     uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
     for (auto* p = g_ext2OpenInodes; p; p = p->next) {
         if (p->mnt == mnt && p->inode == inode) {
@@ -319,7 +322,7 @@ static void Ext2ReleaseInode(Ext2OpenInode* inode)
     // Zero-holder orphans remain queued until a filesystem writer/sync can
     // reclaim them. Closing from an IRQ never acquires a sleeping lock.
     IrqSpinLockRelease(&g_ext2OpenLock, flags);
-    if (dispose) kfree(inode);
+    if (dispose) { FileObjectDispose(&inode->file);kfree(inode); }
 }
 
 static bool Ext2MarkOpenOrphan(Ext2Mount* mnt, uint32_t inode)
@@ -1425,6 +1428,7 @@ static int Ext2DrainOrphans(Ext2Mount* mnt)
             SerialPrintf("ext2: failed reclaiming orphan inode %u\n", orphan->inode);
             return -5;
         }
+        FileObjectDispose(&orphan->file);
         kfree(orphan);
     }
 }
@@ -2469,6 +2473,10 @@ static int Ext2VnodeFsync(Vnode* vn)
     return Ext2FsSync(mnt);
 }
 
+static FileObject* Ext2FileObject(Vnode* vn) {
+    return &static_cast<Ext2FilePriv*>(vn->priv)->hold->file;
+}
+
 static const VnodeOps g_ext2FileOps = {
     .open    = Ext2FileOpen,
     .read    = Ext2FileRead,
@@ -2480,6 +2488,7 @@ static const VnodeOps g_ext2FileOps = {
     .set_times = Ext2VnodeSetTimes,
     .chmod   = Ext2VnodeChmod,
     .truncate = Ext2FileTruncate,
+    .file_object = Ext2FileObject,
 };
 
 static const VnodeOps g_ext2DirOps = {

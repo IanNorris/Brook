@@ -36,7 +36,9 @@ namespace brook {
 // ABI 10 adds per-thread user GS base to SavedContext in Process.
 // ABI 11 adds child stop/continue event state to Process.
 // ABI 12 moves task mappings into a shared AddressSpaceState.
-static constexpr uint32_t MODULE_ABI_VERSION = 12;
+// ABI 13 appends a stable file-object accessor to VnodeOps.
+// ABI 14 adds file registrations to range tables and file identity to mapping backings.
+static constexpr uint32_t MODULE_ABI_VERSION = 14;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

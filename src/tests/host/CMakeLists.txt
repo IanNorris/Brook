@@ -137,7 +137,10 @@ add_host_test(test_vmm_leaf
     "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/address_space.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/mapping_transaction.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/file_mapping_registry.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/file_object.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/mapping_ranges.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/user_mapping.cpp"
 )
 target_compile_options(test_vmm_leaf PRIVATE
     -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
@@ -146,3 +149,47 @@ target_compile_options(test_vmm_leaf PRIVATE
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
 target_link_options(test_vmm_leaf PRIVATE -Wl,--gc-sections)
+
+# Actual canonical cache adoption under simultaneous independent-open misses.
+add_host_test(test_file_page_cache
+    "${BROOK_ROOT}/src/kernel/src/memory/file_page_cache.cpp"
+)
+target_compile_options(test_file_page_cache PRIVATE
+    -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+
+# Real PMM counters/bitmap, with a bounded descriptor fixture and no real TLBs.
+add_host_test(test_pmm_refs
+    "${BROOK_ROOT}/src/kernel/src/memory/physical_memory.cpp"
+)
+target_compile_options(test_pmm_refs PRIVATE
+    -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+target_link_options(test_pmm_refs PRIVATE -Wl,--gc-sections)
+
+add_host_test(test_file_object
+    "${BROOK_ROOT}/src/kernel/src/memory/file_object.cpp"
+)
+target_compile_options(test_file_object PRIVATE
+    -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+
+# Dynamic VFS pin bindings and identity aggregation; actual registry core.
+add_host_test(test_mapping_pins
+    "${BROOK_ROOT}/src/kernel/src/memory/mapping_pin_registry.cpp"
+)
+target_compile_options(test_mapping_pins PRIVATE
+    -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)

@@ -196,9 +196,13 @@ def main():
     os.makedirs(icons_dir, exist_ok=True)
     # Brook's own vector icons are always available, including on a sparse
     # image with no desktop applications installed.
-    for source in sorted((Path(__file__).resolve().parent.parent/'data/icons').glob('*.svg')):
-        if not convert_icon_to_rgba(source,os.path.join(icons_dir,source.stem+'.rgba')):
-            raise RuntimeError(f'Cannot convert built-in icon {source}')
+    root = Path(__file__).resolve().parent.parent
+    for source in sorted((root/'data/icons').glob('*.svg')):
+        # Use the same transparent Brook mark as the README for the launcher.
+        # Keep the existing output name consumed by the native window manager.
+        asset = root/'data/branding/brook-mark-draft.png' if source.stem == 'applications' else source
+        if not convert_icon_to_rgba(asset,os.path.join(icons_dir,source.stem+'.rgba')):
+            raise RuntimeError(f'Cannot convert built-in icon {asset}')
 
     # Scan for .desktop files
     profile_apps = Path(store_dir).parent/'profile/share/applications'

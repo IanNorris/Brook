@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(Brook NONE)
+option(BROOK_MAPPING_TEST_HOOKS "Enable mapping fault barriers in test kernels only" OFF)
 
 include(ExternalProject)
 
@@ -30,6 +31,7 @@ ExternalProject_Add(kernel
         -DCMAKE_TOOLCHAIN_FILE=${BROOK_ROOT}/cmake/toolchains/kernel-x86_64-clang.cmake
         -DCMAKE_BUILD_TYPE=${BROOK_BUILD_TYPE}
         -DBROOK_ROOT=${BROOK_ROOT}
+        -DBROOK_MAPPING_TEST_HOOKS=${BROOK_MAPPING_TEST_HOOKS}
     BUILD_ALWAYS  TRUE
     INSTALL_COMMAND ""
 )

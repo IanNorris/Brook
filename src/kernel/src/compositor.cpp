@@ -1,9 +1,11 @@
 #include "compositor.h"
+#include "memory/mapping_fault_test.h"
 #include "process.h"
 #include "scheduler.h"
 #include "tty.h"
 #include "serial.h"
 #include "memory/virtual_memory.h"
+#include "memory/user_mapping.h"
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
 #include "memory/address.h"
@@ -20,6 +22,13 @@
 #include "string.h"
 
 namespace brook {
+
+static KMutex g_scanoutMappingLock{};
+struct CompositorMutexGuard {
+    KMutex* mutex;
+    explicit CompositorMutexGuard(KMutex* value):mutex(value) { KMutexLock(mutex); }
+    ~CompositorMutexGuard() { KMutexUnlock(mutex); }
+};
 
 extern volatile uint64_t g_lapicTickCount;
 
@@ -67,6 +76,9 @@ static uint32_t g_compositedCount = 0;
 // Frame epoch — incremented at the START of each compositor frame.
 // ProcessDestroy uses this to wait until any in-progress blit has finished.
 static volatile uint64_t g_compositorEpoch = 0;
+#ifdef BROOK_MAPPING_TEST_HOOKS
+uint64_t MappingRendererTestEpoch() { return __atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE); }
+#endif
 
 struct CompositorVfbAllocation {
     VirtualAddress address;
@@ -142,10 +154,24 @@ static void DrainDeferredPageFrees(uint64_t epoch)
         VmmFreePages(VirtualAddress(freeVirt[i]), freePages[i]);
     while (ready) {
         auto* next = ready->next;
-        VmmFreePages(ready->address, ready->pages);
+        VmmFreePages(ready->address,ready->pages);
         kfree(ready);
         ready = next;
     }
+}
+
+CompositorVfbAllocation* CompositorPrepareVfbRetirement(uint64_t address,uint64_t pages) {
+    auto* item=static_cast<CompositorVfbAllocation*>(kmalloc(sizeof(CompositorVfbAllocation)));
+    if (item) *item={VirtualAddress(address),pages,0,nullptr};
+    return item;
+}
+void CompositorCancelVfbRetirement(CompositorVfbAllocation* item) { kfree(item); }
+void CompositorRetireVfb(CompositorVfbAllocation* item) {
+    if (!item) return;
+    item->readyEpoch=__atomic_load_n(&g_compositorEpoch,__ATOMIC_ACQUIRE)+2;
+    uint64_t flags=DeferredFreeLockAcquire();
+    item->next=g_retiredVfbs;g_retiredVfbs=item;
+    DeferredFreeLockRelease(flags);CompositorWake();
 }
 
 void CompositorDeferFreePages(uint64_t virtAddr, uint64_t pageCount)
@@ -634,11 +660,8 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
 
     if (vfbWidth == 0 || vfbHeight == 0)
     {
-        proc->fbVirtual     = nullptr;
-        proc->fbVirtualSize = 0;
-        proc->fbVfbWidth    = 0;
-        proc->fbVfbHeight   = 0;
-        proc->fbVfbStride   = 0;
+        UserFramebufferPublish(proc,nullptr,nullptr,0,0,0,0);
+        CompositorMutexGuard publication(&proc->framebufferLock);
         proc->fbDestX       = 0;
         proc->fbDestY       = 0;
         proc->fbScale       = 0;
@@ -647,6 +670,7 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
 
     uint32_t stride = vfbWidth;
     uint64_t fbSizeBytes = static_cast<uint64_t>(stride) * vfbHeight * 4;
+    if (fbSizeBytes>0xFFFFFFFFu) return false;
     uint64_t fbPages     = (fbSizeBytes + 4095) / 4096;
 
     VirtualAddress vfbAddr = AllocateProcessVfb(proc, fbPages);
@@ -660,15 +684,17 @@ bool CompositorSetupProcess(Process* proc, int16_t destX, int16_t destY,
     auto* vfbPtr = reinterpret_cast<uint32_t*>(vfbAddr.raw());
     memset(vfbPtr, 0, fbSizeBytes);
 
-    proc->fbVirtual     = vfbPtr;
-    proc->fbVirtualSize = static_cast<uint32_t>(fbSizeBytes);
-    proc->fbVfbWidth    = vfbWidth;
-    proc->fbVfbHeight   = vfbHeight;
-    proc->fbVfbStride   = stride;
+    auto* backing=UserMappingBufferSnapshot(vfbAddr.raw(),fbPages*4096);
+    if (!backing) return false; // allocation remains owned by the AS
+    UserFramebufferPublish(proc,backing,vfbPtr,static_cast<uint32_t>(fbSizeBytes),vfbWidth,vfbHeight,stride);
+    MappingBackingUnref(backing);
+    {
+    CompositorMutexGuard publication(&proc->framebufferLock);
     proc->fbDestX       = destX;
     proc->fbDestY       = destY;
     proc->fbScale       = (scale > 0) ? scale : 1;
     proc->fbDirty       = 1;  // ensure first composite renders
+    }
 
     if (g_compositedCount < MAX_COMPOSITED)
     {
@@ -704,11 +730,14 @@ bool CompositorResizeVfb(Process* proc, uint32_t newWidth, uint32_t newHeight)
     if (newWidth  > g_physFbWidth)  newWidth  = g_physFbWidth;
     if (newHeight > g_physFbHeight) newHeight = g_physFbHeight;
 
-    if (proc->fbVfbWidth == newWidth && proc->fbVfbHeight == newHeight)
-        return true;
+    {
+        CompositorMutexGuard snapshot(&proc->framebufferLock);
+        if (proc->fbVfbWidth == newWidth && proc->fbVfbHeight == newHeight) return true;
+    }
 
     uint32_t stride = newWidth;
     uint64_t fbSizeBytes = static_cast<uint64_t>(stride) * newHeight * 4;
+    if (fbSizeBytes>0xFFFFFFFFu) return false;
     uint64_t fbPages     = (fbSizeBytes + 4095) / 4096;
 
     VirtualAddress vfbAddr = AllocateProcessVfb(proc, fbPages);
@@ -722,16 +751,10 @@ bool CompositorResizeVfb(Process* proc, uint32_t newWidth, uint32_t newHeight)
     auto* newVfb = reinterpret_cast<uint32_t*>(vfbAddr.raw());
     memset(newVfb, 0, fbSizeBytes);
 
-    // Wait for any in-progress blit using the old VFB pointer to retire.
-    CompositorWaitFrame();
-
-    // Swap in the new VFB atomically; blits fetch fbVirtual atomically.
-    __atomic_store_n(&proc->fbVirtual, newVfb, __ATOMIC_RELEASE);
-    proc->fbVirtualSize = static_cast<uint32_t>(fbSizeBytes);
-    proc->fbVfbWidth    = newWidth;
-    proc->fbVfbHeight   = newHeight;
-    proc->fbVfbStride   = stride;
-    proc->fbDirty       = 1;
+    auto* backing=UserMappingBufferSnapshot(vfbAddr.raw(),fbPages*4096);
+    if (!backing) return false; // allocation remains owned by the AS
+    UserFramebufferPublish(proc,backing,newVfb,static_cast<uint32_t>(fbSizeBytes),newWidth,newHeight,stride);
+    MappingBackingUnref(backing);
 
     // Old VFB pages stay in the AS allocation list: existing user aliases
     // may still refer to them after a resize.
@@ -740,12 +763,22 @@ bool CompositorResizeVfb(Process* proc, uint32_t newWidth, uint32_t newHeight)
     return true;
 }
 
+struct ProcessFramebufferSnapshot {
+    const uint32_t* pixels;uint32_t width,height,stride,scale;int x,y;
+};
+static ProcessFramebufferSnapshot SnapshotProcessFramebuffer(Process* process) {
+    CompositorMutexGuard snapshot(&process->framebufferLock);
+    return {process->fbVirtual,process->fbVfbWidth,process->fbVfbHeight,
+            process->fbVfbStride,process->fbScale?process->fbScale:1u,process->fbDestX,process->fbDestY};
+}
+
 // Blit a process's VFB onto the physical FB with optional downscaling.
 // If forceAll is true, blit regardless of dirty flag (periodic refresh).
 static void BlitProcess(Process* proc, bool forceAll)
 {
-    const uint32_t* src = __atomic_load_n(&proc->fbVirtual, __ATOMIC_ACQUIRE);
-    if (!src || proc->fbVfbWidth == 0) return;
+    auto snapshot=SnapshotProcessFramebuffer(proc);
+    const uint32_t* src=snapshot.pixels;
+    if (!src || !snapshot.width || !snapshot.height || snapshot.stride<snapshot.width) return;
     if (proc->state == ProcessState::Terminated) return;
     if (!forceAll && !proc->fbDirty) return;
     __atomic_store_n(&proc->fbDirty, 0, __ATOMIC_RELAXED);
@@ -762,13 +795,13 @@ static void BlitProcess(Process* proc, bool forceAll)
     }
 
     // Use the atomically-snapshotted src pointer (don't re-read fbVirtual)
-    const uint32_t  srcW = proc->fbVfbWidth;
-    const uint32_t  srcH = proc->fbVfbHeight;
-    const uint32_t  srcStride = proc->fbVfbStride;
-    const uint32_t  scale = proc->fbScale;
+    const uint32_t  srcW = snapshot.width;
+    const uint32_t  srcH = snapshot.height;
+    const uint32_t  srcStride = snapshot.stride;
+    const uint32_t  scale = snapshot.scale;
 
-    const int dstX0 = proc->fbDestX;
-    const int dstY0 = proc->fbDestY;
+    const int dstX0 = snapshot.x;
+    const int dstY0 = snapshot.y;
 
     // Destination dimensions after downscale.
     const uint32_t dstW = srcW / scale;
@@ -837,15 +870,16 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
 {
     // Snapshot VFB pointer atomically to avoid TOCTOU race with process exit
     // (another CPU may null fbVirtual between check and use).
-    const uint32_t* src = __atomic_load_n(&proc->fbVirtual, __ATOMIC_ACQUIRE);
-    if (!src || proc->fbVfbWidth == 0) return;
+    auto snapshot=SnapshotProcessFramebuffer(proc);
+    const uint32_t* src=snapshot.pixels;
+    if (!src || !snapshot.width || !snapshot.height || snapshot.stride<snapshot.width) return;
     if (proc->state == ProcessState::Terminated) return;
     if (!forceAll && !proc->fbDirty) return;
     __atomic_store_n(&proc->fbDirty, 0, __ATOMIC_RELAXED);
 
-    const uint32_t  srcW = proc->fbVfbWidth;
-    const uint32_t  srcH = proc->fbVfbHeight;
-    const uint32_t  srcStride = proc->fbVfbStride;
+    const uint32_t  srcW = snapshot.width;
+    const uint32_t  srcH = snapshot.height;
+    const uint32_t  srcStride = snapshot.stride;
 
     uint32_t*       dstBase   = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     const uint32_t  dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
@@ -1356,36 +1390,6 @@ static void CompositorLoopWM()
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
 
-    // Close-request escalation: if a Wayland client hasn't responded to
-    // a close request within the grace period, escalate to signals.
-    static constexpr uint64_t CLOSE_GRACE_MS  = 3000; // SIGTERM after 3s
-    static constexpr uint64_t CLOSE_KILL_MS   = 5000; // SIGKILL after 5s
-    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
-    {
-        Window* w = WmGetWindow(i);
-        if (!w || !w->proc || w->closeRequestedAt == 0) continue;
-
-        uint64_t elapsed = now - w->closeRequestedAt;
-        if (elapsed >= CLOSE_KILL_MS)
-        {
-            SerialPrintf("WM: force-killing window %d '%s' (timeout %llums)\n",
-                         i, w->title, elapsed);
-            ProcessSendSignal(w->proc, 9); // SIGKILL
-            w->closeRequestedAt = 0;
-        }
-        else if (elapsed >= CLOSE_GRACE_MS)
-        {
-            // Send SIGTERM once (use a high bit to mark "already sent")
-            if (!(w->closeRequestedAt & (1ULL << 63)))
-            {
-                SerialPrintf("WM: sending SIGTERM to window %d '%s' (timeout %llums)\n",
-                             i, w->title, elapsed);
-                ProcessSendSignal(w->proc, 15); // SIGTERM
-                w->closeRequestedAt |= (1ULL << 63); // mark SIGTERM sent
-            }
-        }
-    }
-
     // Determine if we need a full scene repaint (wallpaper + all windows)
     // or can get away with only re-blitting windows whose VFB content changed.
     bool fullRepaint = forceAll
@@ -1502,10 +1506,8 @@ static void CompositorLoopWM()
         // Blit content then chrome per-window so z-order is respected.
         // Snapshot VFB fields once to avoid TOCTOU: waylandd can destroy
         // the window (nullifying vfb/vfbStride/vfbBytes) concurrently.
-        uint32_t* localVfb = w->vfb;
-        uint32_t  localStride = w->vfbStride;
-        uint64_t  localBytes  = w->vfbBytes;
-        __asm__ volatile("" ::: "memory"); // compiler barrier
+        uint32_t* localVfb=nullptr;uint32_t localStride=0;uint64_t localBytes=0;
+        WmSnapshotVfb(w,&localVfb,&localStride,&localBytes);
 
         if (localVfb && localStride)
         {
@@ -2193,23 +2195,12 @@ static void CompositorHandleMouseWM()
                     SerialPrintf("WM: close window %d '%s'\n", hit.windowIndex, w->title);
                     if (w->vfb)
                     {
-                        // WM-API window: push CloseRequested so the client
-                        // can do its own teardown (close wl_clients, free
-                        // resources, then call WM_DESTROY_WINDOW).
-                        // If the client ignores it, the compositor loop
-                        // will escalate to SIGTERM after 3s, SIGKILL after 5s.
-                        if (w->closeRequestedAt == 0)
-                        {
-                            w->closeRequestedAt = g_lapicTickCount;
-                            WmPushWmEvent(w, WM_EVT_CLOSE_REQUESTED, 0, 0);
-                        }
-                        else
-                        {
-                            // Second click while waiting — force kill immediately
-                            SerialPrintf("WM: force-killing window %d '%s' (second close click)\n",
-                                         hit.windowIndex, w->title);
-                            ProcessSendSignal(w->proc, 9); // SIGKILL
-                        }
+                        // Closing is a request: the client may show a save
+                        // dialog or cancel it. Neither elapsed time nor a
+                        // repeated click authorizes terminating the process.
+                        // Deliver each request so closing works again after
+                        // cancellation; the client owns its eventual teardown.
+                        WmPushWmEvent(w, WM_EVT_CLOSE_REQUESTED, 0, 0);
                     }
                     else
                     {
@@ -2675,9 +2666,8 @@ static void EnsureOverlayTex(const GpuCompositorOps* gpu)
 static bool WindowContentSource(Window* w, uint64_t* vaddr,
                                 uint32_t* srcW, uint32_t* srcH)
 {
-    uint32_t* vfb = w->vfb;
-    uint32_t  stride = w->vfbStride;
-    uint64_t  bytes  = w->vfbBytes;
+    uint32_t* vfb=nullptr;uint32_t stride=0;uint64_t bytes=0;
+    WmSnapshotVfb(w,&vfb,&stride,&bytes);
     if (vfb && stride && bytes)
     {
         *vaddr = reinterpret_cast<uint64_t>(vfb);
@@ -2686,12 +2676,12 @@ static bool WindowContentSource(Window* w, uint64_t* vaddr,
         return (*srcW && *srcH);
     }
     Process* p = w->proc;
-    if (p && p->fbVirtual && p->fbVfbWidth && p->fbVfbHeight)
-    {
-        *vaddr = reinterpret_cast<uint64_t>(p->fbVirtual);
-        *srcW  = p->fbVfbWidth;
-        *srcH  = p->fbVfbHeight;
-        return true;
+    if (p) {
+        CompositorMutexGuard snapshot(&p->framebufferLock);
+        if (p->fbVirtual && p->fbVfbWidth && p->fbVfbHeight) {
+            *vaddr=reinterpret_cast<uint64_t>(p->fbVirtual);
+            *srcW=p->fbVfbWidth;*srcH=p->fbVfbHeight;return true;
+        }
     }
     return false;
 }
@@ -2965,6 +2955,10 @@ static void CompositorLoop()
     // in-progress blits.
     uint64_t epoch = __atomic_add_fetch(&g_compositorEpoch, 1, __ATOMIC_ACQ_REL);
     DrainDeferredPageFrees(epoch);
+
+    // Test builds can stop epoch advancement before acquiring any scene/source
+    // snapshot. Exit/wait/file-pin cleanup must not depend on renderer progress.
+    (void)MappingRendererTestBarrier();
 
     // Restore pixels under the old cursor position before blitting. Skipped in
     // GPU mode — the cursor is composited as a separate GPU sprite, never drawn
@@ -3282,39 +3276,31 @@ void CompositorWaitFrame()
     // Timeout (~50ms) — compositor may be halted, proceed anyway
 }
 
-void CompositorRemap(uint64_t fbPhys, uint32_t w, uint32_t h, uint32_t stridePixels)
+void CompositorRemap(uint64_t fbPhys,uint32_t w,uint32_t h,uint32_t stridePixels)
 {
-    // Map the MMIO framebuffer from its physical address via the direct map.
-    // We must NOT use TtyGetFramebuffer() here because it returns the
-    // backbuffer pointer (already redirected), not the real MMIO address.
-    g_physFb       = reinterpret_cast<volatile uint32_t*>(PhysToVirt(PhysicalAddress(fbPhys)).raw());
-    g_physFbWidth  = w;
-    g_physFbHeight = h;
-    g_physFbStride = stridePixels;
-
-    // Reallocate backbuffer for new resolution.
-    // (old backbuffer leaked — acceptable for rare resolution changes)
-    g_backBufStride = stridePixels;
-    uint64_t bbSizeBytes = static_cast<uint64_t>(stridePixels) * h * 4;
-    uint64_t bbPages = (bbSizeBytes + 4095) / 4096;
-    VirtualAddress bbAddr = VmmAllocPages(bbPages, VMM_WRITABLE, MemTag::Device, 0);
-    if (bbAddr)
-    {
-        g_backBuffer = reinterpret_cast<uint32_t*>(bbAddr.raw());
-        // Seed from MMIO to preserve current screen content.
-        for (uint32_t y = 0; y < h; ++y)
-            __builtin_memcpy(
-                g_backBuffer + y * stridePixels,
-                const_cast<uint32_t*>(g_physFb + y * stridePixels),
-                w * 4);
-        TtyRedirectToBackbuffer(g_backBuffer);
+    if (!w || !h || stridePixels<w) return;
+    uint64_t bytes=static_cast<uint64_t>(stridePixels)*h*4;
+    uint64_t pages=(bytes+4095)/4096;
+    VirtualAddress replacement=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,0);
+    if (!replacement) {
+        SerialPuts("COMPOSITOR: remap backbuffer allocation failed; retaining previous geometry\n");
+        return;
     }
-
-    // Update mouse cursor bounds to match new resolution.
-    MouseSetBounds(w, h);
-    MarkAllDirty();
-
-    SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n", w, h, stridePixels);
+    auto* physical=reinterpret_cast<volatile uint32_t*>(PhysToVirt(PhysicalAddress(fbPhys)).raw());
+    auto* buffer=reinterpret_cast<uint32_t*>(replacement.raw());
+    for (uint32_t y=0;y<h;++y)
+        memcpy(buffer+static_cast<uint64_t>(y)*stridePixels,
+               const_cast<uint32_t*>(physical+static_cast<uint64_t>(y)*stridePixels),w*4);
+    {
+        CompositorMutexGuard publication(&g_scanoutMappingLock);
+        // Previous backbuffers remain allocated for existing scanout aliases.
+        // Commit storage and geometry together only after successful preparation.
+        g_physFb=physical;g_physFbWidth=w;g_physFbHeight=h;g_physFbStride=stridePixels;
+        g_backBuffer=buffer;g_backBufStride=stridePixels;
+        TtyRedirectToBackbuffer(buffer);
+    }
+    MouseSetBounds(w,h);MarkAllDirty();
+    SerialPrintf("COMPOSITOR: remapped to %ux%u stride=%u\n",w,h,stridePixels);
 }
 
 void CompositorSetWallpaper(uint32_t* pixels, uint32_t w, uint32_t h)
@@ -3331,49 +3317,19 @@ void CompositorSetWallpaper(uint32_t* pixels, uint32_t w, uint32_t h)
 // it can composite frames directly, then call ScanoutFlip to push to MMIO.
 // ---------------------------------------------------------------------------
 
-uint64_t CompositorScanoutMap(Process* proc, ScanoutMapResult* out)
+uint64_t CompositorScanoutMap(Process* proc,ScanoutMapResult* out)
 {
+    CompositorMutexGuard snapshot(&g_scanoutMappingLock);
     if (!proc || !out || !g_backBuffer) return 0;
-
-    uint64_t bufSize = static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4;
-    uint64_t pages = (bufSize + 4095) / 4096;
-
-    // Allocate user-space virtual range from the process's mmap window.
-    uint64_t userBase = proc->addressSpace->mmapNext;
-    if (userBase + pages * 4096 > USER_MMAP_END) {
-        SerialPrintf("COMPOSITOR: scanout_map: mmap window exhausted\n");
-        return 0;
-    }
-    proc->addressSpace->mmapNext = userBase + pages * 4096;
-
-    // Map each page of the kernel backbuffer into the user page table.
-    VirtualAddress bbKernAddr(reinterpret_cast<uint64_t>(g_backBuffer));
-    for (uint64_t i = 0; i < pages; i++) {
-        PhysicalAddress phys = VmmVirtToPhys(KernelPageTable,
-                                             VirtualAddress(bbKernAddr.raw() + i * 4096));
-        if (!phys) {
-            SerialPrintf("COMPOSITOR: scanout_map: failed to get phys for page %lu\n", i);
-            return 0;
-        }
-        if (!VmmMapPage(proc->addressSpace->pageTable,
-                        VirtualAddress(userBase + i * 4096),
-                        phys,
-                        VMM_PRESENT | VMM_WRITABLE | VMM_USER | VMM_NO_EXEC,
-                        MemTag::Device, proc->pid)) {
-            SerialPrintf("COMPOSITOR: scanout_map: failed to map page %lu\n", i);
-            return 0;
-        }
-    }
-
-    out->userAddr    = userBase;
-    out->width       = g_physFbWidth;
-    out->height      = g_physFbHeight;
-    out->stride      = g_backBufStride;
-    out->bufferBytes = static_cast<uint32_t>(bufSize);
-
-    SerialPrintf("COMPOSITOR: scanout mapped %lu pages at user 0x%lx (%ux%u stride=%u)\n",
-                 pages, userBase, g_physFbWidth, g_physFbHeight, g_backBufStride);
-    return userBase;
+    uint64_t bytes=static_cast<uint64_t>(g_backBufStride)*g_physFbHeight*4;
+    auto* backing=UserMappingBufferSnapshot(reinterpret_cast<uint64_t>(g_backBuffer),(bytes+4095)&~uint64_t{4095});
+    if (!backing) return 0;
+    int64_t mapped=UserMappingBufferAlias(ProcessCurrent(),proc->addressSpace,backing,3);
+    MappingBackingUnref(backing);
+    if (mapped<0) return 0;
+    out->userAddr=static_cast<uint64_t>(mapped);out->width=g_physFbWidth;out->height=g_physFbHeight;
+    out->stride=g_backBufStride;out->bufferBytes=static_cast<uint32_t>(bytes);
+    return out->userAddr;
 }
 
 int CompositorScanoutFlip(uint32_t minY, uint32_t maxY)
@@ -3442,47 +3398,9 @@ uint32_t CompositorGetWindows(Process* caller, WmWindowDesc* out, uint32_t maxCo
     return written;
 }
 
-uint64_t CompositorMapWindowVfb(Process* caller, uint32_t wmId)
+uint64_t CompositorMapWindowVfb(Process* caller,uint32_t wmId)
 {
-    if (!caller) return 0;
-
-    // Find the window by wmId
-    const Window* w = nullptr;
-    for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
-    {
-        const Window* candidate = WmGetWindow(static_cast<int>(i));
-        if (candidate && candidate->wmId == wmId)
-        {
-            w = candidate;
-            break;
-        }
-    }
-    if (!w || !w->vfb || w->vfbBytes == 0) return 0;
-
-    // Allocate user-space virtual range
-    uint64_t pages = (w->vfbBytes + 4095) / 4096;
-    uint64_t userBase = caller->addressSpace->mmapNext;
-    if (userBase + pages * 4096 > USER_MMAP_END) {
-        SerialPrintf("COMPOSITOR: map_window_vfb: mmap window exhausted for wm=%u\n", wmId);
-        return 0;
-    }
-    caller->addressSpace->mmapNext = userBase + pages * 4096;
-
-    // Map VFB pages read-only into compositor process
-    VirtualAddress vfbKernAddr(reinterpret_cast<uint64_t>(w->vfb));
-    for (uint64_t i = 0; i < pages; i++) {
-        PhysicalAddress phys = VmmVirtToPhys(KernelPageTable,
-                                             VirtualAddress(vfbKernAddr.raw() + i * 4096));
-        if (!phys) continue;
-        PmmRefPage(phys);
-        if (!VmmMapPage(caller->addressSpace->pageTable,
-                        VirtualAddress(userBase + i * 4096), phys,
-                        VMM_PRESENT | VMM_USER | VMM_NO_EXEC,
-                        MemTag::User, caller->pid))
-            PmmUnrefPage(phys);
-    }
-
-    return userBase;
+    return WmMapWindowVfb(caller,wmId);
 }
 
 } // namespace brook

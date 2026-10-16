@@ -1,4 +1,7 @@
 #include "vfs.h"
+#include "memory/file_object.h"
+#include "memory/mapping_pin_registry.h"
+#include "panic.h"
 #include "procfs.h"
 #include "memory/heap.h"
 #include "serial.h"
@@ -638,82 +641,42 @@ int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
         return -1;
     }
     if (!vn->ops->read) return -1;
-    int r = vn->ops->read(vn, buf, len, offset);
-    return r;
+    if(vn->ops->file_object)
+        return FileObjectRead(vn->ops->file_object(vn),vn,buf,len,offset);
+    return vn->ops->read(vn, buf, len, offset);
 }
 
 int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
 {
     if (!vn || !vn->ops->write) return -1;
+    if(vn->ops->file_object)
+        return FileObjectWrite(vn->ops->file_object(vn),vn,buf,len,offset);
     return vn->ops->write(vn, buf, len, offset);
 }
 
-// Lazy mappings hold their vnode independently of file descriptors. Keep a
-// bounded identity registry so another open of the inode cannot resize it
-// while a fault is in flight. No filesystem I/O occurs under this spinlock.
-struct VfsMappedBacking {
-    Vnode* vnode;
-    uint64_t dev, ino;
-    uint32_t pins;
-    bool resizing;
-};
-static VfsMappedBacking g_mappedBackings[1024];
-static IrqSpinLock g_mappedBackingLock;
+// Mapping descriptors retain their vnode. Dynamic bindings aggregate separate
+// opens by stable identity without a fixed number of simultaneous mappings.
+static MappingPinRegistry g_mappingPins;
 
 int VfsFileMapPin(Vnode* vn)
 {
-    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
-    for (auto& entry : g_mappedBackings) {
-        if (entry.vnode == vn && entry.pins) {
-            ++entry.pins;
-            IrqSpinLockRelease(&g_mappedBackingLock, irq);
-            return 0;
-        }
-    }
-    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+    if (g_mappingPins.RetainIfPinned(vn)) return 0;
     FileMutationGuard mutation;
     VnodeStat st;
     int result = VfsStat(vn, &st);
     if (result) return result;
-    // Namespace operations reject moving/removing a mapped FAT identity.
-    if (!st.dev || !st.ino) return -95;
-    irq = IrqSpinLockAcquire(&g_mappedBackingLock);
-    VfsMappedBacking* free = nullptr;
-    for (auto& entry : g_mappedBackings) {
-        if (!entry.vnode) { if (!free) free = &entry; continue; }
-        if (entry.dev == st.dev && entry.ino == st.ino && entry.resizing) {
-            IrqSpinLockRelease(&g_mappedBackingLock, irq);
-            return -16;
-        }
-        if (entry.vnode == vn) free = &entry;
-    }
-    if (free) {
-        if (!free->vnode) *free = {vn, st.dev, st.ino, 0, false};
-        ++free->pins;
-    }
-    IrqSpinLockRelease(&g_mappedBackingLock, irq);
-    return free ? 0 : -12;
+    return g_mappingPins.Pin(vn,st.dev,st.ino);
 }
 
-// Called only when splitting/copying a mapping that already owns a pin. It
-// cannot allocate, fail, or enter filesystem code (fork holds fileMapLock).
+// Existing descriptor pin required; no allocation, filesystem I/O or mutex.
 void VfsFileMapClone(Vnode* vn)
 {
-    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
-    for (auto& entry : g_mappedBackings)
-        if (entry.vnode == vn && entry.pins) { ++entry.pins; break; }
-    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+    if (!g_mappingPins.RetainIfPinned(vn)) KernelPanic("VFS: cloning absent mapping pin");
 }
 
 void VfsFileMapUnpin(Vnode* vn)
 {
-    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
-    for (auto& entry : g_mappedBackings) {
-        if (entry.vnode != vn || !entry.pins) continue;
-        if (!--entry.pins) entry = {};
-        break;
-    }
-    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+    g_mappingPins.Unpin(vn);
 }
 
 static int VfsTruncateLocked(Vnode* vn, uint64_t size)
@@ -725,22 +688,12 @@ static int VfsTruncateLocked(Vnode* vn, uint64_t size)
     VnodeStat st;
     int result = VfsStat(vn, &st);
     if (result) return result;
-    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
-    VfsMappedBacking* slot = nullptr;
-    for (auto& entry : g_mappedBackings) {
-        if (!entry.vnode) { if (!slot) slot = &entry; continue; }
-        if (entry.dev == st.dev && entry.ino == st.ino) {
-            IrqSpinLockRelease(&g_mappedBackingLock, irq);
-            return -16;
-        }
-    }
-    if (slot) *slot = {vn, st.dev, st.ino, 0, true};
-    IrqSpinLockRelease(&g_mappedBackingLock, irq);
-    if (!slot) return -12;
-    result = vn->ops->truncate(vn, size);
-    irq = IrqSpinLockAcquire(&g_mappedBackingLock);
-    *slot = {};
-    IrqSpinLockRelease(&g_mappedBackingLock, irq);
+    // FileMutationGuard excludes first-pin publication through backend resize.
+    // The allocation-free fast path can only retain an already pinned binding,
+    // which would make this identity busy. No resize placeholder is necessary.
+    if (g_mappingPins.Busy(st.dev,st.ino)) return -16;
+    result = vn->ops->file_object ?
+        FileObjectTruncateUnmapped(vn->ops->file_object(vn),vn,size) : vn->ops->truncate(vn,size);
     return result;
 }
 
@@ -757,13 +710,7 @@ static bool VfsMappedPathBusy(const char* path)
     // ext2 open-inode holders preserve deleted/renamed backing. FAT has no
     // persistent inode and must retain its physical directory entry instead.
     if (((st.dev >> 8) & 0xfff) != 253) return false;
-    uint64_t irq = IrqSpinLockAcquire(&g_mappedBackingLock);
-    bool busy = false;
-    for (auto& entry : g_mappedBackings)
-        if (entry.vnode && entry.dev == st.dev &&
-            (st.isDir || entry.ino == st.ino)) { busy = true; break; }
-    IrqSpinLockRelease(&g_mappedBackingLock, irq);
-    return busy;
+    return g_mappingPins.Busy(st.dev,st.ino,st.isDir);
 }
 
 

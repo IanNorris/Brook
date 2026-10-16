@@ -76,11 +76,14 @@ enum : uint8_t {
 // (they read 0 when a PTE is actually live); ground-truth callstacks cannot.
 static constexpr uint8_t REFLOG_STACK_DEPTH = 6;
 struct FreeRec {
-    uint64_t phys; uint32_t seq; uint16_t ownerPid; uint8_t op; uint8_t count;
+    uint64_t phys;
     const char* site;
     uint64_t stack[REFLOG_STACK_DEPTH];   // [0]=leaf caller .. via RBP chain
-    uint8_t  stackDepth;
+    uint32_t seq, count;
+    uint16_t ownerPid;
+    uint8_t op, stackDepth;
 };
+static_assert(sizeof(FreeRec)==80, "keep the fixed provenance ring's BSS footprint");
 // BRO-179: logging ALL alloc/free tags (not just User) ~triples record volume,
 // so a frame's cross-domain history is held for a shorter seq window than the
 // old User-only log — but recent kernel use of a frame (the SIG1 gap) still
@@ -117,7 +120,7 @@ static inline uint8_t CaptureKernelStack(uint64_t startRbp, uint64_t* out, uint8
 
 // Caller MUST hold g_pmmLock.
 static inline void RefLogRecord(uint64_t phys, uint16_t ownerPid, uint8_t op,
-                                uint8_t count, const char* site)
+                                uint32_t count, const char* site)
 {
     if (!g_freeLogOn) return;
     uint32_t i = g_freeLogSeq & (FREELOG_SIZE - 1);
@@ -254,7 +257,7 @@ static inline void TrackAlloc(uint32_t pageIdx, MemTag tag, uint16_t pid)
     // process's generation and the doomed process's later teardown MapDec brings
     // the count back to 0. Catch it HERE, at the instant of the colliding
     // allocation, before we reset — naming both the new owner and the frame.
-    uint16_t preMap = __atomic_load_n(&Desc(pageIdx).mapCount, __ATOMIC_RELAXED);
+    uint32_t preMap = __atomic_load_n(&Desc(pageIdx).mapCount, __ATOMIC_RELAXED);
     if (preMap != 0)
     {
         SerialPrintf("BRO176-ALLOCMAPPED: phys=0x%lx handed to pid=%u but mapCount=%u "
@@ -869,8 +872,10 @@ void PmmRefPage(PhysicalAddress physAddr)
     }
     if (d.refCount == 0)
         d.refCount = 2;  // legacy page: count existing owner + new sharer
-    else if (d.refCount < 255)
-        d.refCount++;
+    else {
+        if (d.refCount == ~uint32_t{0}) KernelPanic("PMM: frame reference overflow");
+        ++d.refCount;
+    }
     if (d.tag == static_cast<uint8_t>(MemTag::User))
         RefLogRecord(physAddr.raw(), d.pid, REFOP_REF, d.refCount, "PmmRefPage");
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
@@ -900,8 +905,8 @@ bool PmmRefPageIfAlive(PhysicalAddress physAddr)
         IrqSpinLockRelease(&g_pmmLock, pmmFlags);
         return false;  // already free — do NOT resurrect
     }
-    if (d.refCount < 255)
-        d.refCount++;
+    if (d.refCount == ~uint32_t{0}) KernelPanic("PMM: frame pin overflow");
+    ++d.refCount;
     if (d.tag == static_cast<uint8_t>(MemTag::User))
         RefLogRecord(physAddr.raw(), d.pid, REFOP_REF, d.refCount, "PmmRefPin");
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
@@ -975,7 +980,7 @@ void PmmUnrefPage(PhysicalAddress physAddr)
 static inline void MapLeakCheckLocked(uint32_t idx, const char* site)
 {
     PageDescriptor& d = Desc(idx);
-    uint16_t mc = __atomic_load_n(&d.mapCount, __ATOMIC_RELAXED);
+    uint32_t mc = __atomic_load_n(&d.mapCount, __ATOMIC_RELAXED);
     if (mc != 0)
     {
         static const char* kTagName[8] = {
@@ -998,7 +1003,8 @@ void PmmMapInc(PhysicalAddress physAddr)
     if (!g_pageDescs || !physAddr) return;
     uint64_t idx = physAddr.raw() / PAGE_SIZE;
     if (idx >= g_totalPages) return;
-    __atomic_add_fetch(&Desc(static_cast<uint32_t>(idx)).mapCount, 1, __ATOMIC_RELAXED);
+    if (__atomic_add_fetch(&Desc(static_cast<uint32_t>(idx)).mapCount, 1, __ATOMIC_RELAXED)==0)
+        KernelPanic("PMM: frame mapping count overflow");
 }
 
 void PmmMapDec(PhysicalAddress physAddr)
@@ -1018,7 +1024,7 @@ void PmmMapDec(PhysicalAddress physAddr)
     __atomic_sub_fetch(&d.mapCount, 1, __ATOMIC_RELAXED);
 }
 
-uint8_t PmmGetRefCount(PhysicalAddress physAddr)
+uint32_t PmmGetRefCount(PhysicalAddress physAddr)
 {
     if (!g_pageDescs || !physAddr) return 0;
     uint64_t idx64 = physAddr.raw() / PAGE_SIZE;
@@ -1053,7 +1059,7 @@ extern "C" void PmmDescribe(uint64_t phys, uint32_t* used, uint32_t* refCount,
 void PmmEnableTracking()
 {
     // Allocate descriptor array via VmmAllocPages — too large for a single
-    // kmalloc call (g_totalPages * 12B can be ~768KB). As a permanent
+    // kmalloc call (20 MiB per 4 GiB physical). As a permanent
     // system-lifetime allocation, bypassing the heap is appropriate.
     static constexpr uint64_t PAGE_SIZE_LOCAL = 4096;
     static constexpr uint64_t VMM_WRITABLE_LOCAL = (1ULL << 1);
@@ -1231,7 +1237,7 @@ static int PmmDumpFreeLogLocked(uint64_t phys)
 // half carries the 0xDFDF marker, print the embedded owner PID / free-seq and
 // dump that frame's full provenance. `addrParity` (bit 3 of the field's address,
 // i.e. which 8-byte slot) disambiguates which half is pid vs seq when known;
-// pass UINT32_MAX if unknown (both interpretations are printed). Caller must hold
+// pass ~uint32_t{0} if unknown (both interpretations are printed). Caller must hold
 // g_pmmLock (it calls PmmDumpFreeLogLocked).
 static bool PmmDecodePoisonLocked(uint64_t qword)
 {
@@ -1436,3 +1442,20 @@ uint64_t PmmGetTotalPageCount() { return g_totalPages; }
 uint64_t PmmGetRamPageCount() { return g_ramPages; }
 
 } // namespace brook
+
+#ifdef BROOK_HOST_TEST
+namespace brook {
+// Host fixture supplies descriptor storage; allocation, ownership, reference
+// counting and bitmap transitions remain the actual PMM implementation.
+void PmmHostTestInit(PageDescriptor* descriptors, uint32_t pages) {
+    g_totalPages = pages; g_ramPages = pages; g_freePages = 0; g_nextHint = 1;
+    g_pageDescs = descriptors;
+    g_quarantineOn = false; g_framePoisonOn = false; g_freeLogOn = false;
+    for (uint64_t i=0;i<BITMAP_WORDS;++i) g_bitmap[i]=~uint64_t{0};
+    for (uint32_t i=0;i<PMM_MAX_PIDS;++i) g_pidLists[i]={PMM_NULL_PAGE,PMM_NULL_PAGE,0,0};
+    for (uint32_t i=0;i<pages;++i)
+        descriptors[i]={PMM_NULL_PAGE,PMM_NULL_PAGE,0,static_cast<uint8_t>(MemTag::Free),0,0};
+    if (pages>1) MarkRangeFree(4096,pages-1);
+}
+}
+#endif

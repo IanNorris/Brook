@@ -8,6 +8,7 @@
 #include "process.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
+#include "memory/address_space.h"
 #include "serial.h"
 #include "string.h"
 
@@ -158,8 +159,9 @@ bool ElfValidateMainImage(const uint8_t* data, uint64_t size)
 }
 
 bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
-             PageTable pt, uint16_t pid)
+             AddressSpaceState* space, uint16_t pid)
 {
+    PageTable pt = space->pageTable;
     ElfLayout image;
     uint64_t slide;
     if (!out || !PrepareMainImage(data, size, &image, &slide))
@@ -171,6 +173,13 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
     const auto* phdrs = image.segments;
     const uint64_t loadBase = image.first + slide;
     const uint64_t loadEnd = image.end + slide;
+    // The AS is unpublished: construction owns it exclusively and may prepare
+    // metadata without the runtime mutation mutex. Match the loader's existing
+    // contiguous RWX allocation, including holes; segment hardening is separate.
+    MappingRangePlan ranges;
+    MappingRange mapped{loadBase,loadEnd,0,0,nullptr,7,7,MappingKind::Image,
+                        MappingSharing::Private,MappingLeafOwnership::Managed};
+    if (!ranges.Prepare(1) || !ranges.Insert(space->ranges,mapped)) return false;
 
     uint64_t loadSize = loadEnd - loadBase;
     uint64_t loadPages = loadSize / 4096;
@@ -331,8 +340,9 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
 // ---------------------------------------------------------------------------
 
 uint64_t ElfLoadAt(const uint8_t* data, uint64_t size,
-                   uint64_t base, PageTable pt, uint16_t pid)
+                   uint64_t base, AddressSpaceState* space, uint16_t pid)
 {
+    PageTable pt = space->pageTable;
     ElfLayout image;
     if (!ValidateElf(data, size, &image) || (base & 4095) || base < image.first)
     {
@@ -363,6 +373,11 @@ uint64_t ElfLoadAt(const uint8_t* data, uint64_t size,
         uint64_t segStart  = AlignDown(phdr.p_vaddr + slide, 4096);
         uint64_t segEnd    = AlignUp(phdr.p_vaddr + slide + phdr.p_memsz, 4096);
         uint64_t segPages  = (segEnd - segStart) / 4096;
+        MappingRangePlan ranges;
+        MappingRange mapped{segStart,segEnd,0,0,nullptr,7,7,MappingKind::Image,
+                            MappingSharing::Private,MappingLeafOwnership::Managed};
+        // PT_LOAD segments can share a boundary page in this unpublished image.
+        if (!ranges.Prepare(3) || !ranges.Replace(space->ranges,segStart,segEnd,&mapped)) return 0;
 
         uint64_t flags = VMM_WRITABLE | VMM_USER;
 

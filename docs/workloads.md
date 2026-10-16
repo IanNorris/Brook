@@ -623,3 +623,458 @@ Evidence: `build/workloads/mapping-ranges-20261016/audit.json` and adjacent logs
 The final run used eight vCPUs and 4 GiB with disk-backed isolated clones because
 available host memory was below the RAM-disk guard. This is focused validation,
 not a fresh two-path bootstrap acceptance run or a browser performance result.
+
+
+## Integrated mapping candidate (16 October 2026, worktree)
+
+Candidate kernel `83cf2e491bf95ffe777e4655ae67b42a8ce23d3cba9671c744d65b0197f71543`
+integrates the live range/mutation protocol across syscalls, faults, fork/CoW,
+image construction, remote stacks and graphics. Fixed legacy mapping arrays are
+removed. This supersedes the earlier foundation-only status for the current
+worktree; the implementation remains uncommitted pending broader acceptance.
+
+With eight vCPUs, 4 GiB RAM and isolated disk-backed clones, the candidate booted,
+verified a 229-file source manifest, rebuilt the hosted tests inside Brook and
+passed all 14 targets. Existing heap/CoW, expanded wait, graphics resize/fork/exec,
+five filesystem checks and twelve compatibility checks passed. The thirteenth
+check initially assumed the retired 256-mapping limit and deliberately wrote to
+memory after an unexpectedly successful PROT_NONE operation. Its updated source
+was compiled inside Brook and passed with 768 mappings, protection splits,
+expected read/write faults, byte preservation and cleanup. The test harness also
+needed an explicit probe-bundle install step for fresh disks.
+
+A new child-with-native-window-and-private-file-map test passed 32 exit/wait/
+immediate-truncate rounds on each of FAT and ext2. It did not inject a compositor
+stall. Native terminal launch, typed input, shell exit and slot reuse passed;
+resize-under-mapping and output exceeding pipe capacity remain untested. VM text
+injection produced `#` for a requested backslash, so keyboard-layout agreement
+still needs investigation before a live-coding showcase.
+
+Heap integrity passed. The VM stopped with checked filesystem/device flush,
+the launcher exited zero, and all three offline filesystem checks returned zero.
+Evidence: `build/workloads/live-mapping-20261016/audit.json` and adjacent logs.
+This is focused integration validation, not renewed two-path bootstrap acceptance
+or Chromium/Codium acceptance. Deterministic real-fault races, cancellation,
+delayed-renderer consuming-wait coverage and coherent regular-file shared writes
+are still required; regular-file writable MAP_SHARED remains disabled.
+
+## Deterministic guest fault races (16 October 2026, worktree)
+
+The opt-in `BROOK_MAPPING_TEST_HOOKS` kernel runs barriers in the actual fault
+resolver after capturing a retained range and after preparing its pages, outside
+mapping/backing locks. The guest `mappingracecheck` probe exposed a real failure:
+when MAP_FIXED replaced a file range with an anonymous range during preparation,
+the file-only retry rejected the new kind and killed a valid reader. Retries now
+dispatch from the current mapping kind and accept an already accessible leaf
+only after checking the current range permissions. Existing private managed CoW
+leaves retry into ordinary CoW handling. Astra reviewed the fix and hook locks.
+
+Candidate `8da11f6ce21034ac763fd406fe43bad2b3f540038321b23fda3c42ced8487ce5`
+passed all 22 cases on ext2 and all 22 on FAT, in approximately 0.93 and 0.90
+seconds respectively. Cases cover both phases, file and memfd backings,
+same/adjacent-page faults, replacement-byte preservation, expected SIGSEGV after
+unmap/write-permission removal, and SIGKILL with immediate truncate after
+consuming wait. Five I/O and all thirteen compatibility gates passed, with a
+rebuilt 768-mapping capacity probe. Cache/CoW, native graphics lifecycle and
+expanded wait probes also passed. Both kernel configurations build; the ordinary
+configuration excludes the hook syscall and waits. All fourteen hosted tests pass.
+
+The first two instrumentation attempts stalled because the test wait did not
+restore interrupts at entry and after yielding; those failed results are retained.
+Astra also identified a plain-spinlock preemption risk, corrected with short
+IRQ-disabled state sections. These are test-harness corrections, separate from
+the reproduced and fixed stale-mapping fault. The passing candidate used fresh
+isolated disk clones, eight vCPUs and 4 GiB RAM. Its source manifest was verified,
+heap integrity passed, checked shutdown completed, the launcher exited zero and
+all three offline filesystem checks returned zero. Evidence:
+`build/workloads/mapping-races-fixed-20261016/audit.json` and adjacent logs.
+
+This covers cancellation at preparation boundaries, not inside a blocked disk
+request or retirement. The following checkpoint adds delayed-renderer and
+terminal resize/large-output evidence. Coherent regular-file MAP_SHARED
+writes/writeback, renewed full bootstrap tests and browser/editor acceptance
+remain outstanding. No Chromium/Codium success or
+performance result is implied by this focused gate.
+
+
+### Terminal exec, resize and delayed-renderer checkpoint (2026-10-16)
+
+Candidate `4f4e74ddd1c4439e4073d31cd059b39fd0574f84416b536df66228bec11cdfaf`
+fixes two terminal lifecycle issues found during acceptance. TIOCGWINSZ now
+copies rows, columns and pixel geometry under the terminal state lock, so a
+resize cannot expose partially updated geometry. Successful exec of the owning
+shell republishes the terminal-owned pixel source after replacing the process
+image; previously its window showed wallpaper until a resize. This restoration
+matches only the terminal owner, not a forked descendant.
+
+The real native terminal ran `exec /boot/TERMCHK /data/TERMCHK.OK` using VM
+keyboard input. The probe verified its original framebuffer immediately after
+exec, wrote exactly 262,144 bytes in 379 ms, then accepted two GUI resizes to
+77×29 and 74×28 characters. It retained a user alias to the old pixel allocation
+through the second resize and three compositor epochs, checked its tail canary,
+and verified zero padding in the new allocation before writing a distinct
+canary. The source remained visible before either resize. Its watchdog uses a
+POSIX timer, and its initial dimensions must differ from the fallback 640×480
+framebuffer. This is one software-rendered run, not a terminal throughput study.
+
+The opt-in hook also pauses the compositor at frame entry, before taking scene
+or source snapshots. All 32 native-window/file-exit cases on ext2 and all 32 on
+FAT completed consuming wait and immediate truncate while the compositor was
+still parked. This verifies file cleanup does not depend on advancing renderer
+epochs. It does not hold an old pixel snapshot or an in-flight GPU submission.
+
+On the same eight-vCPU, 4 GiB VM, all 44 mapping-race cases, five I/O gates,
+thirteen compatibility gates, native graphics lifecycle and expanded wait tests
+passed. Fourteen hosted tests passed; both kernel configurations build. The
+source manifest matched, heap integrity passed, checked filesystem/device flush
+completed, and all three offline filesystem checks returned zero. Evidence:
+`build/workloads/terminal-exec-fixed-20261016/audit.json`, adjacent serial logs
+and the pre-resize screenshot recorded in `terminal-results.json`. The previous
+renderer/terminal candidate retains the reproduced exec-display failure.
+
+Cancellation during blocked disk I/O or retirement, coherent regular-file
+MAP_SHARED writes/writeback, both renewed full bootstrap runs and browser/editor
+acceptance remain required. These focused checks do not establish those results.
+
+
+### Canonical page adoption and PMM reference capacity (2026-10-16)
+
+The reusable clean cache now returns the canonical winning frame after concurrent
+inserts. Fault preparation stages that frame, and read-ahead releases its caller
+reference while leaving the cache reference intact. Private and read-only
+mappings retain the existing uncached fallback. This does not enable writable
+regular-file MAP_SHARED or add ordinary-I/O coherence. Ext2 regular files and FAT
+still opt out of the cache; its convergence is demonstrated by the actual module
+hosted test with eight simultaneous separate-open contenders.
+
+Astra's review exposed physical-page references silently saturating at 255. The
+real PMM regression reproduced count 255 instead of 256, then passed after
+widening references and user-PTE mapping counts to 32 bits. The CoW consumer and
+provenance counters are widened too; overflow fails explicitly. The descriptor
+array grows by four bytes per physical frame, or 4 MiB at 4 GiB RAM. Reordering
+the provenance record preserves its existing 80-byte size. Standalone test
+kernels now link an invariant panic handler that reports failure through the
+QEMU test exit port. Their build caught this missing dependency.
+
+Candidate `ccf132cf1e6a4941ce103b639ec881ead0bbe26dcaecca34335d9421381a4944`
+passes sixteen hosted tests, including actual PMM accounting for 70,000 logical
+aliases, 16,384 concurrent pins/releases and final freeing. This fixture uses
+real PMM locking, lists and bitmap transitions; it does not execute hardware
+page tables or TLB shootdowns. A separate VM probe created 512 real writable
+aliases to one framebuffer page, verified their shared canary, closed the fd,
+and removed aliases while checking the survivors.
+
+On the same isolated eight-vCPU/4-GiB VM, all 44 mapping race cases, 64 delayed
+renderer cleanup cases, five I/O gates, thirteen compatibility gates, native
+graphics and expanded wait checks passed. The actual terminal exec/resize probe
+passed again (262,144 bytes in 429 ms, old-alias canary preserved after three
+epochs). Heap integrity passed; the 373-file kernel/probe/test manifest matched,
+checked shutdown completed and all three offline filesystem checks returned
+zero. Both kernel configurations and standalone test binaries build. Evidence:
+`build/workloads/file-cache-pmm-20261016/audit.json` and adjacent logs.
+
+The Linux-contract file-sharing probe passed host Linux and was then run inside
+Brook: the first writable shared mapping fails with errno 95 (ENOTSUP). That is
+a recorded failure baseline, not an acceptance pass. Coherent regular-file I/O,
+writeback, resize/EOF semantics, both renewed full bootstrap paths and browser
+acceptance remain required; see `file-shared-mappings.md`.
+
+
+### Ext2 live-inode file objects and ordinary I/O coherence (2026-10-16)
+
+Ext2 now shares canonical mapped pages through its retained live-inode holder,
+with VnodeOps ABI 13. Separate opens share completed pages without a vnode
+reference cycle or cache identity surviving inode reuse. Ordinary I/O passes
+through the same per-file gate; successful write prefixes update resident pages,
+and reads overlay them onto backend data. User copy happens through bounded
+resident staging outside file/filesystem locks. Unmapped resize drops cached
+pages only on backend success. Failed or incomplete page loads are never cached.
+Writable shared stores, writeback/msync and mapped truncate remain unsupported.
+
+The actual-module hosted test verifies a single backend page load under eight
+contending opens, I/O visibility, short-read recovery, premature zero/error with
+successful retry, partial write errors, EOF tails and final cleanup. The Linux
+reference and actual Brook `filecoherencecheck` both pass. Guest cases cover
+separate opens, parallel first touches, read-only alias visibility after pwrite,
+private CoW, file-backed source/destination buffers, unmapped truncate/regrow,
+and unlink/close lifetime. An additional run uses a previously untouched mapped
+source page. Syscall validation populates that source; no fault inside the later
+copy is claimed, and the guest barrier is not a deterministic same-miss hook.
+
+Candidate `1860fb1984d7a5b841a7ccc59c2a8ecdceb043bf02dbdb94880fc75174917282`
+passes seventeen hosted tests, both kernel configurations and standalone test
+builds. The same eight-vCPU/4-GiB VM passes all 44 mapping races, 64 frame-entry
+paused renderer cleanup cases, five I/O gates, thirteen compatibility gates and
+native graphics/wait lifecycle tests. The source manifests match, heap checks
+pass, shutdown completes checked filesystem/device flush and all three offline
+filesystem checks return zero. Evidence: `build/workloads/file-object-20261016/audit.json`
+and the strengthened probe run `build/workloads/file-object-cold-20261016/audit.json`.
+The cold-source run uses the identical kernel hash; focused gates were not
+unnecessarily repeated for the probe-only change.
+
+This is the ordinary-I/O portion of coherent file mappings. FAT retains its prior
+uncached path. Ordered file gates and per-AS registrations, mapped resize/EOF,
+dirty writeback/msync, both renewed full bootstrap paths and browser acceptance
+remain required. The design and deterministic acceptance cases are recorded in
+`file-shared-mappings.md`.
+
+
+### File registration checkpoint (2026-10-16)
+
+The ABI-14 candidate in `build/workloads/file-registry-20261016` passes the same
+focused coherence, 44 mapping-race, 64 renderer-cleanup, five I/O and thirteen
+compatibility gates, plus graphics/wait lifecycle checks. Seventeen hosted tests
+also cover weak registrations through split/fork/failed fork, ref-zero teardown,
+delayed TLB acknowledgement and allocation failures. All three offline filesystem
+checks and heap integrity pass; see its `audit.json` and source manifest.
+
+A bounded native-window probe sends two close requests and survives ten seconds
+after the last one, then exits itself. Normal close no longer escalates to forced
+termination. This does not yet prove an actual editor's unsaved-document dialog.
+Mapped truncate, writable regular-file MAP_SHARED, dirty writeback and both full
+bootstrap reruns remain pending.
+
+For the user's desktop test, `build/experiments/results/manual-20261016/run.sh`
+uses a frozen production kernel (test hooks off), matching ABI-14 drivers and
+clones of the full `apps-ready-20261014` images. All clones passed offline checks.
+It selects native SDL graphics, virgl, PipeWire audio, eight CPUs and 4 GiB RAM.
+This combined desktop checkpoint has not yet been boot-tested. Do not run builds
+or another VM while the user is exploring it.
+
+
+### User desktop smoke test (2026-10-16, in progress)
+
+The first manual checkpoint accidentally paired the current kernel with the older
+`apps-ready-20261014` image. The user observed missing icons and apparently dead
+launcher entries, then confirmed GIMP eventually opened after a long delay.
+Process/window inspection confirms applications launch; this is not evidence that
+all shortcuts fail. LibreOffice logs show a DeploymentException and exit status 1,
+plus pending-thread teardown timeouts. Keep this separate from GIMP latency.
+
+The prepared replacement `manual-apps-20261016` uses the later
+`icons-theme-20261015` images, matching ABI-14 modules and the same frozen
+production kernel. The icon directory contains the expected 2304-byte RGBA
+assets and all three offline filesystem checks return zero. It has not yet been
+boot-tested, so launcher and application acceptance remain unproven.
+
+A live non-intrusive stats sample from the first session at guest tick 351759 ms
+reported 44 processes, roughly 2.04 GB used and 2.21 GB free. Recent 256
+compositor-loop intervals were p50 21 ms, p90 39 ms, p95 56 ms and max 3100 ms.
+These are guest-loop intervals, not application GPU or scanout frame times, and
+neither isolate startup cost nor establish its cause. Preserve the old run for
+controlled comparison rather than treating the replacement assets as a fix for
+all application failures.
+
+
+### Corrected desktop verification (2026-10-16)
+
+`build/workloads/desktop-smoke-20261016/audit.json` records the corrected full-app
+image with production kernel `96d5fdadead4b39372c5bbf10294f52d61266620ba815cbfd53ae55d791575e6`
+(ABI 14, mapping test hooks off). The resize error-path host test passes and the
+production kernel builds. In the accelerated eight-vCPU/4-GiB guest, the native
+launcher, taskbar and titlebar show icons. Mousepad launched through the actual
+menu and displayed the exact two injected lines. Its unsaved-document dialog
+survived beyond five seconds and Cancel restored the edited document. Final
+normal application exit was not verified; the VM then stopped with checked
+filesystem/device flush and all three offline filesystem checks returned zero.
+
+Startup remains slow. A five-second idle-editor profile contains 4071 samples,
+7324 context switches and no dropped records. Of 282 non-idle samples, 247 are at
+the `virtio_gpu` SubmitCommand polling loop. This establishes a small reproduction
+for command-wait overhead; it does not explain all application startup costs.
+The earlier multi-app capture and exact-module disassembly are preserved in
+`build/experiments/results/manual-20261016/slow-capture/`.
+
+The profiler converter no longer labels module addresses as enormous offsets
+into the kernel's last function. Without explicit module symbols those addresses
+remain numeric. The saved multi-app capture has a corrected Speedscope export.
+Neither the IRQ-disabled allocator sampling bias nor full module symbolization
+is solved by that correction.
+
+The local `build/experiments/current-apps` pointer now selects this verified
+checkpoint. `run_installed_apps.sh` accepts an explicit directory and uses frozen
+artifacts when present, with eight CPUs and 4 GiB RAM by default. The older
+`apps-ready-20261014` recipe is labelled historical. Writable file MAP_SHARED,
+mapped truncate, the two renewed full bootstrap paths and full workload acceptance
+remain unfinished.
+
+
+### Full-plugin GIMP run: loader ENOMEM under investigation
+
+The isolated `gimp-full-20261016` candidate uses production kernel
+`33a6162e31bc48cabcf52c90018ebde8b51f2a1c16c958a2e8bc338c55d20473`, with the stale
+global reduced-plugin override removed and explicit persistent HOME/XDG paths.
+GIMP reaches its startup window, but many queried plugin processes fail loading
+libgimp/libgimpui/libc and exit 127. A separately traced sparkle process reproduces
+`mmap(0,571960,1,0x802,4,0) = -12`. This is a failure, not GIMP acceptance.
+
+At a later all-vCPU-paused snapshot, the old vnode-keyed mapping-pin registry held
+596/1024 entries, 2191 pins, zero resizing entries and 286 distinct inode identities.
+This snapshot does not prove occupancy at the failing instruction, so table
+exhaustion remains unconfirmed. Guest physical memory had roughly 2.5 GiB free;
+heap integrity passed, with roughly 20 MiB of heap, 21005 blocks, 4.6 MB free and
+a 3.6 MB largest free block. Opt-in mmap failure-stage diagnostics are the next
+step, rather than increasing a limit without attribution.
+
+The startup capture has 13087 CPU samples, 26931 context-switch records and no
+dropped records. File-gate collection and allocator paths stand out in GIMP;
+IRQ-disabled sampling bias still limits allocator attribution. The guest also
+reported one saturated compositor-interval maximum (`4294967295` ms); investigate
+clock/interval arithmetic before treating that sample as a real stall duration.
+The VM stopped with checked filesystem/device flush and all three offline checks
+passed. Evidence is in that candidate's `outcome.json`, `mapping-pin-capacity.json`,
+`fsck.json` and preserved serial log.
+
+
+### Mapping-pin exhaustion confirmed and corrected in source
+
+The errors-only diagnostic run `gimp-mmap-trace-20261016` identified
+`mmap-file-error ... stage=mapping-pin error=-12` for libgimp/libgimpui. In that
+source version, the only such VfsFileMapPin failure was exhausting its fixed
+1024 vnode slots. A clean standalone sparkle plugin loaded those libraries before
+the full GIMP run filled the registry. This supersedes the earlier inconclusive
+post-failure occupancy snapshot; see `diagnosis.json` and `failure-stages.log`.
+
+The replacement `MappingPinRegistry` dynamically indexes vnode bindings and
+aggregates identities by device/inode. Clone/unpin allocate nothing, allocation
+and free occur outside the registry IRQ lock, and existing namespace/resize
+exclusion and conservative FAT directory checks remain. The new hosted actual-
+module test covers 4096 bindings/identities, concurrency, allocation failure and
+external mutation exclusion. All eighteen hosted tests pass.
+
+File-gate snapshots also now hash distinct files and heapsort unique pins outside
+AS mutation, preserving the inline eight-file path, lifetime pins, ordered file
+gates and generation revalidation. Tests cover repeated aliases, different backing
+descriptors for the same file and dynamic-buffer reuse. Production and standalone
+test builds pass after adding the registry dependency to standalone test_vfs.
+Actual full-plugin GIMP acceptance and new startup timing remain in progress in
+`gimp-mapping-fixed-20261016`; passing source/host gates alone does not establish
+that GIMP or both full bootstrap paths now work.
+
+
+### Heap measurements during full-package GIMP startup
+
+`heap-timing-20261016` freezes kernel
+`7cef04045077b1b733a3cff9288e6a5fdd4fba267c75d909d751c31855d7eb36`
+(ABI 14), using the same source images as the preceding mapping-fix run. The
+8-vCPU, 4-GiB VM used virgl with audio disabled. Heap timing is opt-in and uses
+raw serialized TSC cycles; these totals have not been converted into wall time.
+No host build or other VM ran concurrently, and no screenshot/debug pause occurred
+inside either measured interval.
+
+| Measurement | Idle, 10 seconds | GIMP startup, first 30 seconds |
+| --- | ---: | ---: |
+| Allocations | 597 | 154019 |
+| Frees | 597 | 141200 |
+| Allocation search headers | 40931 | 1434673087 |
+| Maximum search headers | 317 | 23586 |
+| IRQ-disabled lock wait cycles | 102137 | 2721946670 |
+| Lock hold cycles | 10018545 | 33767004072 |
+| Maximum lock hold cycles | 111895 | 3214671 |
+| Expansion attempts | 0 | 2 |
+| Expansion cycles | 0 | 827542 |
+
+The loaded run examined about 9315 headers per allocation; hold cycles were about
+12.4 times wait cycles. The two expansion attempts contributed little to hold
+cycles. This directly supports replacing the allocator's scan of every physical
+block with a free-block index. Totals cover the whole VM, including debug
+transport, and the enabled instrumentation adds overhead. They are not a
+per-process CPU percentage or proof of the complete startup critical path.
+
+Default-off, enable/reset, disable with unchanged subsequent counters and heap
+integrity passed on the live VM. The actual standalone QEMU tests for heap, PMM,
+VMM and VFS pass after repairing the standalone build's accidental use of hosted
+CR3/direct-map/IRQ stubs. Heap tests exercise IF-disabled preservation, timing
+counters, real expansion, oversize rejection and failed-realloc data retention.
+All eighteen hosted suites pass. Heap arithmetic now rejects requests that cannot
+fit boundary tags, and a failed expansion releases its installed leaf frames.
+
+GIMP was still querying plugins when this bounded measurement ended. The VM was
+stopped with checked filesystem/device flush; this is performance evidence,
+not completed image-edit/export acceptance. Raw reports are in
+`build/workloads/heap-timing-20261016/{idle-timing,gimp-30s-timing,post-measurement}.json`.
+
+
+### Free-block index comparison and remaining GIMP failure
+
+`heap-index-20261016` freezes kernel
+`2582aecebe22c0b071cb37ec1b8b6e2d90ca14c0577e0551fc54816c6c2c5f58`.
+Both candidates cloned `gimp-mapping-fixed-20261016` and used the same launch
+command/configuration and measurement windows. The new 32-bin free-block index
+uses existing header padding; headers and footers remain 64 bytes each. Allocation
+examines only free blocks, with ordered size classes and a nonempty bitmap;
+boundary tags still drive coalescing. Integrity checks verify both the physical
+chain and exact free-index membership.
+
+The indexed 30-second run made 620791 allocations and examined 845904 headers
+(maximum 54), about 1.36 per allocation versus 9315 in the baseline. Total lock
+hold cycles fell from 33767004072 to 387567875 (87.1-fold), despite four times as
+many allocations. This is not an 87-fold app startup improvement: the fixed windows
+contain different amounts of work. Sixteen expansion attempts cost 152587891
+cycles, including one large outlier; raw TSC can include host descheduling.
+The idle run made 603 allocations, each examining one header. Heap integrity
+passed during plugin discovery. Actual standalone heap/PMM/VMM/VFS tests and all
+18 hosted suites pass; allocator tests include 4096 live blocks, one-header reuse,
+class boundaries, coalescing, poison reseeding and 12000 mixed byte-oracle operations.
+
+Full GIMP acceptance still **fails**. Faster plugin discovery exposed retained
+blocked helper threads: 136 processes consumed about 3.36 GiB at one snapshot.
+Later forks failed and GIMP faulted inside a tracked anonymous mapping. Preserve
+this as a separate OOM/lifecycle investigation, not proof the fault itself is
+fully explained. Many helper threads remained blocked after exit_group timeouts.
+Source review found untimed futex waits can retain a protected-operation latch
+from user-buffer validation, defer terminal publication, and never wake to reach
+the syscall cleanup boundary. A focused cancellation repair and deterministic
+guest regression are being validated. The VM stopped with checked flush; logs,
+profile, process snapshot and numerical comparison are retained in the candidate.
+
+
+### Untimed futex cancellation regression
+
+The focused `futexexitcheck` fails on preserved kernel `2582aece` in round zero:
+exit_group leaves four off-CPU waiters pending and the parent cannot reap the
+group. Repaired kernel
+`737efba78760ca34c7f701542cb0a3d4566ec3c10f731aa17a31eacb1a5e1f39`
+passes all 32 rounds in Brook, with four untimed private futex waiters and 32 MiB
+of touched anonymous memory per group. MemFree changes from 3932484 KiB after
+warm-up to 3932412 KiB at the end (72 KiB difference); process count returns to
+10. This bounded recovery check does not establish every individual PMM reference.
+The existing mixed futex/pipe/sleep exitgroupcheck also passes 32 rounds.
+
+Explicit `SchedulerBlockInterruptible` registration and the pending-cancellation
+check share the scheduler ready lock. Terminal publication wakes only registered
+interruptible waits (or stopped protected owners), letting the syscall remove
+its own waiter/registrations and unwind before the terminal boundary. Ordinary
+mutex/filesystem ownership waits retain their prior blocking behavior. Futex,
+poll/select and epoll use this mode; common poll interruption cleanup now also
+removes DevTty registration. Successful source builds and 18 hosted suites are
+recorded in `interruptible-wait-validation.log`. Full GIMP retry remains separate.
+
+
+### GIMP basic workflow and reboot persistence pass
+
+On `interruptible-wait-20261016` with kernel `737efba78760ca34...`, the full
+package reached its main window. Via VM mouse/keyboard input, the test created a
+1920×1080 image, painted a stroke, saved `/data/home/brook-gimp-acceptance.xcf`,
+and exported `/data/home/brook-gimp-acceptance.png` through the PNG plugin dialog.
+Normal quit returned process count to the ten-process desktop baseline; heap
+integrity passed. Relaunching the XCF preserved the stroke, and importing the
+exported PNG through GIMP also preserved it. Both runs quit normally.
+
+All three offline filesystem checks passed. Read-only extraction independently
+verified the PNG decodes at 1920×1080, contains the nonwhite stroke, and is 50732
+bytes (SHA256 `f6d8fbbc5688d6273475c1436c939bb0ccbf5ef939a2c2b66e6ac0964a6b99bb`).
+The XCF is 224951 bytes with a valid XCF header; its decoding was verified in
+GIMP itself. A complete VM restart of the same disks reopened the XCF with the
+stroke intact and preserved the disabled welcome-screen setting. Both VM sessions
+stopped with checked filesystem/device flush. This establishes the basic workflow,
+not complete GIMP compatibility: several optional plugins still fault during
+initial discovery on writes to tracked file mappings. Preserve those diagnostics
+for the next mapping investigation.
+
+Evidence includes `gimp-workflow.json`, `saved-files-verification.json`,
+`gimp-png-reopened-1920x1080.png`, both serial logs and saved documents in the
+ignored candidate directory. The screenshot is a native 1080p capture; no showcase
+production has begun. Final source review found no blocking issue in the
+interruptible registration/lifetime/unwind paths; zombie address-space retention
+until parent reaping remains a separate improvement opportunity.

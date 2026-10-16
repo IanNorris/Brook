@@ -7,6 +7,8 @@ namespace brook {
 
 struct Process;
 struct AddressSpaceState;
+struct MappingBacking;
+struct CompositorVfbAllocation;
 struct InputEvent;
 
 // Window manager constants
@@ -72,6 +74,8 @@ struct Window
     uint64_t    vfbBytes;       // total allocation size (page-aligned)
     void*       vfbUser;        // user-space address in vfbAddressSpace
     AddressSpaceState* vfbAddressSpace; // retained original mapping identity
+    MappingBacking* vfbBacking; // retained page snapshot; aliases own independent refs
+    CompositorVfbAllocation* vfbRetirement; // reserved before publication
     uint8_t     vfbDirty;       // set by syscall on each commit; cleared after blit
     uint16_t    wmId;           // (idx + 1); 0 reserved for "invalid"
 
@@ -106,11 +110,6 @@ struct Window
     // Pre-maximise geometry (for restore)
     int16_t     savedX, savedY;
     uint16_t    savedW, savedH;
-
-    // Close-request escalation: timestamp (lapic ticks) of last close
-    // request.  If the process is still alive after the grace period,
-    // the compositor escalates to SIGTERM then SIGKILL.
-    uint64_t    closeRequestedAt;  // 0 = no pending close
 
     // Outer dimensions including chrome.  CSD (noChrome) windows have
     // no kernel chrome, so outer == client.
@@ -163,6 +162,9 @@ int WmCreateWindow(Process* proc, int16_t x, int16_t y,
 
 // Remove a window (process exited or closed).
 void WmDestroyWindow(int idx);
+uint64_t WmMapWindowVfb(Process* caller,uint32_t wmId);
+// Compositor-epoch readers only: captures one coherent native source tuple.
+bool WmSnapshotVfb(const Window* window,uint32_t** pixels,uint32_t* stride,uint64_t* bytes);
 
 // Remove the window owned by a specific process (safety net for ProcessDestroy).
 void WmDestroyWindowForProcess(Process* proc);

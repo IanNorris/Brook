@@ -352,36 +352,38 @@ Astra's source review identified a prerequisite to Codium's regular-file
 generation check alone cannot cover anonymous/device replacement or COW.
 
 - The separately referenced address-space object and process-context cleanup
-  worker are implemented and passed targeted host/guest lifetime acceptance.
-  Threads retain it; fork creates independent state; exec swaps references.
-  The mutex/generation now serve the first `brk` transaction consumer;
-  record/frame preparation, rollback and post-ACK retirement have targeted
-  host/guest coverage. Serialize mmap/MAP_FIXED, munmap,
-  mprotect, mremap, fork, memfd, CoW and GUI writers through one protocol next.
-  Keep final filesystem work outside scheduler interrupt context. Consuming
-  waits now finish a finite worker cleanup batch before returning; add a
+  worker are implemented. The current worktree now integrates one transaction
+  protocol across mmap/MAP_FIXED, munmap, mprotect, mremap, brk, fork, memfd,
+  file faults, CoW, remote stacks and graphics aliases. The legacy fixed arrays
+  are removed. Candidate `83cf2e49` passed focused guest validation; this does
+  not replace the deterministic concurrent-fault/cancellation gate below.
+  Consuming waits finish a finite worker cleanup batch before returning; add a
   deterministic cancellation test paused inside this cleanup wait.
-- Common range helpers now represent reservations, protections, sharing and
-  explicit leaf ownership with retained backing descriptors. Prepared split
-  plans, generation-validated snapshots, sparse removal and descriptor-aware
-  final teardown passed host/guest helper tests. Live mapping/fault/GUI writers
-  are not migrated yet; retire the legacy arrays when switching them instead
-  of keeping duplicate authoritative range tables. Add retained inaccessible
-  leaves for PROT_NONE data preservation, cached/borrowed page publication,
-  and consistent unpublished ELF/interpreter/stack/TLS range registration.
-  Keep removal proportional to populated leaves; its count must be revalidated
-  at commit because ordinary fault population does not change topology generation.
-  Use an ascending descriptor cursor for bulk retirement to avoid repeated
-  O(leaves × ranges) lookup while holding the global PT lock. Huge user leaves
-  remain unsupported by the common range-removal preflight.
-- Faults snapshot and pin backing identity/range/offset/protection under that
-  mutex, release it for I/O, then validate the generation before committing.
-  Every speculative adjacent-page installation needs the same validation.
-- Integrate `VmmTryMapPage` and `VmmDetachPage` into the common transaction.
-  The leaf operations and CoW retirement reference now exist; legacy mapping
-  mutation paths still need coordinated ownership and generation validation.
-  Keep every detached frame alive until remote TLB acknowledgement, and release
-  final filesystem references outside mapping locks.
+- Authoritative ranges represent reservations, permissions, sharing and retained
+  backing/leaf ownership. PROT_NONE preserves inaccessible populated leaves;
+  sparse removal and remapping operate on allocated tables. ELF/interpreter,
+  stack and TLS constructors register their ranges. Native and terminal pixel
+  sources use retained page descriptors and coherent source snapshots. Native
+  mapping removal completes TLB acknowledgement before releasing AS ownership;
+  only the independent kernel-buffer owner waits for compositor epochs.
+  Host and guest-rebuilt helper tests cover interval oracles, OOM, hidden pages,
+  CoW, sharing, sparse remap, backing-selected cleanup and delayed ACK. Use an
+  ascending descriptor cursor for bulk retirement to avoid O(leaves × ranges)
+  lookup under the PT lock. Huge user leaves remain unsupported.
+- File/memfd faults retain a complete range snapshot while preparing outside
+  the mutation lock, then validate before primary and adjacent publication.
+  `VmmTryMapPage`, sparse detach and permission-checked CoW are integrated;
+  detached managed references survive remote TLB acknowledgement and final
+  filesystem callbacks run outside mapping locks. An opt-in test kernel now
+  passes actual file/memfd fault barriers at retained-snapshot and prepared-page
+  boundaries: competing same/adjacent faults, MAP_FIXED, permission removal,
+  unmap and cancellation followed by consuming wait/file-pin release, on FAT
+  and ext2. This caught and fixed a real stale file-to-anonymous retry failure.
+  Frame-entry compositor pauses now pass 64 file-cleanup cases; actual terminal
+  exec, 256 KiB output and two resizes pass with an old-alias canary surviving
+  retirement. This found and fixed exec pixel-source loss and incoherent TTY
+  geometry snapshots. Cancellation inside blocked disk I/O or retirement and
+  old renderer-snapshot/in-flight GPU retention remain outstanding.
 - Keep lock order mutation mutex, page-table lock, then short PMM internals.
   No filesystem I/O or user-buffer access under the mutation mutex, and no TLB
   acknowledgement wait under an IRQ-disabled page-table lock.
@@ -555,3 +557,84 @@ restoration, including fchmodat2 (452). Data overwrite passes with explicit
 semantics or document filesystem-specific extraction policy separately.
 General path resolution/backend errno propagation remains limited; this fix
 is not comprehensive Linux open/pathwalk acceptance.
+
+
+The shared-file foundation now has canonical ext2 live-inode pages, ordinary-I/O
+coherence, weak per-range file registrations and ordered file-gate publication.
+PMM counters use checked 32-bit counts, with 70,000 hosted aliases and 512 guest
+framebuffer aliases covered. The ABI-14 registration checkpoint passes seventeen
+hosted tests, focused guest coherence, 44 mapping races, 64 renderer cleanup cases
+and the I/O/compatibility/lifecycle gates. See `file-shared-mappings.md` and
+`build/workloads/file-registry-20261016/audit.json` for scope and limits.
+
+Next implement mapped resize/EOF invalidation, including retiring registrations,
+then dirty writeback/msync and durability/error tests. Regular-file writable
+MAP_SHARED remains disabled; mapped resize still returns EBUSY. Renew both full
+bootstrap paths and browser acceptance after the connected implementation.
+FAT retains its prior uncached path.
+
+
+## Current real-workload and desktop follow-ups (2026-10-16)
+
+Preserve this scope while the mapping/I/O work and both bootstrap acceptance paths
+are completed. A prior pass is not acceptance of the current candidate.
+
+- Exercise shell editors and Rust/C++ compilers, then Codium, Blender,
+  Firefox/Chromium, GIMP and OpenTTD. Record exact package, launch command,
+  observable interaction, failure and cleanup for each; a visible window alone
+  is insufficient. OpenTTD follows the user's named game request.
+- Put the existing Brook mark on the launcher. Investigate corruption during
+  boot display transitions. Complete Quake relative mouse/capture work in RUN-04.
+- Implement fastfetch with the Brook mark; test zsh, kitty and starship. Change
+  shell/terminal defaults only after successful interactive verification.
+- Prepare direct VM recording and a rough one-take tour script, with readable
+  editor text, progressively more demanding applications and deliberate window
+  activation. Music is the user's local `Brook 2000.mp3`. Do not start showcase
+  production yet; no copyrighted game data or private media enters git.
+- Apply the Astra chrome review in `ui-chrome-concepts.md`: separate proportional
+  UI font atlas, clear controls, consistent spacing, file-browser icons/text,
+  caption release/cancel semantics, nearby taskbar tooltips and UTF-8 titles.
+  The rendered design sheet is a concept rather than a running desktop capture.
+- Investigate GTK/Qt theme exports after resolving actual HOME/XDG config paths.
+  Check GTK3, GTK4/libadwaita and Qt separately; do not assume one CSS file or
+  environment variable provides live, identical styling across toolkits. Native
+  settings preview should reflect the same semantic palette.
+
+Normal caption-close no longer automatically kills a WM client. A bounded guest
+probe survived two real close clicks and ten seconds afterward. Still test an
+actual unsaved document's confirmation, cancellation and eventual normal exit.
+
+
+Fresh-image environment follow-up: remove the unconditional
+`GIMP3_PLUGINDIR=/nix/share/gimp-lite` from default process environment. Experiment
+images and guest installation do not stage that optional reduced tree. Legacy
+lite scenarios already select an explicit gimprc; ordinary package tests should
+exercise the package's own plugins. Source correction is staged; full GIMP
+startup, plugin discovery and image editing/export acceptance must be rerun.
+Persistent HOME/XDG consistency remains separate: without a dedicated home
+volume, `/home` resolves to the writable FAT ramdisk, whereas native settings
+persist under `/data/home` on ext2. Existing wrappers differ in how completely
+they redirect HOME and XDG paths. See `ui-chrome-concepts.md` for the source audit.
+
+
+Observed diagnostic limits to revisit: the bridge's 220-byte guest command line
+includes its internal prefix, leaving less room for the user's launch command.
+Return the usable size clearly or add a guest script-transfer/execution path.
+During full GIMP startup, one compositor interval saturated at UINT32_MAX;
+distinguish clock discontinuity/underflow from actual long refresh gaps instead
+of presenting an unexplained saturated value as a measured frame time.
+
+
+GIMP follow-up after allocator indexing: full plugin discovery still reports
+`exit_group timeout ... cpu=-1, retaining pending thread` for some helper
+processes. Inspect pending protected kernel operations and their wakeups; do not
+release filesystem/mapping state just because the bounded quiesce wait elapsed.
+The diagnostic source intentionally defers termination until protected operations
+unwind. Separate this from the now-attributed allocator search cost.
+
+
+GIMP basic workflow now passes on the interruptible-wait checkpoint: new image,
+brush editing, XCF save/reopen, PNG export/import, normal quit, and reboot
+persistence. Next: optional-plugin file-mapping write faults during discovery;
+separate zombie address-space retirement from wait metadata to reduce transient
+memory pressure. Mainline full bootstrap pair must be rerun on this checkpoint.
