@@ -36,7 +36,8 @@
   taskbar, chrome, launcher, fonts, icons and hit targets together; coordinate
   Wayland output scale and buffer geometry for applications. Test at 1080p and
   4K, including multi-window input and settings preview.
-- Establish persistent single-account HOME/XDG and matching passwd identity,
+- Identity/authorization audit: [current implementation and acceptance gates](identity.md).
+  Persistent HOME/XDG now passes a fresh-volume reboot test; establish matching passwd identity,
   then audit access/open/stat/chmod/chown, supplementary groups, UID changes,
   fork/exec credentials, runtime directories and saved settings before implementing
   login/accounts. Several identity syscalls still stub success; a UID field alone
