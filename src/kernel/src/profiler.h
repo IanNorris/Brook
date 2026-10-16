@@ -42,6 +42,8 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
 // oldPid: PID of the process being switched away from (0xFFFF = idle).
 // newPid: PID of the process being switched to.
 // Must be safe for scheduler context: no locks, no memory allocation.
-void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid);
+// Explicit outgoing bounds: ProcessCurrent already names the incoming task.
+void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid,
+                           uint64_t oldStackBase, uint64_t oldStackTop);
 
 } // namespace brook

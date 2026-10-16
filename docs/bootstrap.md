@@ -13,10 +13,12 @@ that does not imply that Nix or the compiler was rebuilt inside Brook.
 
 ## Next acceptance goal
 
-The shared-library startup and native compatibility gate now passes all 13
+The shared-library startup and native compatibility gate now contains 19
 tests. The filesystem gate also passes the expanded guest lifetime probe and
 offline fsck after a clean shutdown. Both the prepared-SDK and clean-image
-paths passed the full sequence at the same revision, most recently `e70ff31`.
+paths passed the full sequence at the same revision, most recently `507e504`
+with the then-current 18-test suite. The added profiler stack-walker test still
+needs both full acceptance paths at its new revision.
 
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
 revision, SDK closure and VM configuration:
@@ -72,7 +74,7 @@ rather than the host store's 0444/0555, so mode-dependent mmap cache behavior
 matches. Base transport paths keep the same host-prepared modes in both images.
 The harness runs the real guest installer, performs an HTTPS clone and pinned
 submodule update, and builds kernel/EFI/modules/bare-metal/native artifacts.
-It validates module imports and requires 18/18 CTest results twice, before and
+It validates module imports and requires 19/19 CTest results twice, before and
 after a clean native rebuild with warm caches. The incremental kernel stage
 is labelled separately from a full compilation.
 
@@ -95,7 +97,7 @@ owned runtime directory after confirming every associated VM is stopped.
 Lower the host reserve explicitly only for a host with an appropriate budget.
 
 `--resume-completed-build` only resumes host verification after a guest build
-already exited zero with both 13-test summaries and artifact markers. It does
+already exited zero with both expected native-test summaries and artifact markers. It does
 not turn a failed or hung guest build into acceptance. Shutdown evidence records
 whether sync was acknowledged live or came from an already completed script
 and a normal launcher-recorded exit.
@@ -829,3 +831,35 @@ and passed all 18 native tests in 18.82 seconds, followed by checked flush and
 zero-error filesystem checks. That matches the original-kernel control closely;
 the growing index remains an unapplied experiment. Evidence:
 `build/workloads/fault-address-native-20261016/result.json`.
+
+### Recover compiler profiler call chains (2026-10-16)
+
+The previous frame walker confused kernel code addresses with readable stack
+storage. Heap-allocated process stacks lie below the kernel image, so compiler
+context-switch captures often stopped at DoSwitch. The walker now validates
+complete aligned frames within one owned outgoing-task or permanent CPU stack
+range, and checks return PCs separately against kernel text or the conservative
+module arena. It rejects backward/cyclic/overflowing chains and skips the one
+return slot already recorded at context-switch capture. It does not deduplicate
+legitimate recursive PCs or change scheduling policy. The new hosted test uses
+the actual shared walker; the bootstrap harness now expects 19 native tests.
+
+A live 30-second capture during the controlled native rebuild recorded 12829
+CPU samples and 638037 context switches, with 3186577 dropped records. All
+recorded switch chains now contain at least two frames. The largest complete
+chain (210732 records) blocks in KMutexLock from FileObjectGetPage during mapping
+fault resolution. Another 84792 records reach the mapping gate set from fault
+resolution, and 43502 reach it from user mapping access. These are counts of
+recorded events, not fractions of elapsed time or an unbiased population.
+Timer sampling misses IRQ-masked work; recording itself performs FAT writes.
+The older apparent dominance of bare DoSwitch/interrupt frames was insufficient
+evidence for an IPI-storm diagnosis.
+
+The pinned `507e504` native source rebuilt in 54.91 seconds and passed its 18 tests
+in 17.60 seconds during this instrumented run. This verifies the walker on real
+compiler stacks, not a speed improvement or full 19-test bootstrap acceptance.
+The VM stopped with checked flush; all three offline filesystem checks passed.
+Matching frozen symbols, raw/Speedscope profiles, register snapshots and the
+stack aggregation are retained under the ignored directories
+`build/workloads/debug-tcp-final-production-20261016/artifacts` and
+`build/workloads/native-fixed-walker-profile-20261016`.

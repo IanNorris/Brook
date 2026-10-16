@@ -93,3 +93,6 @@ void GdtWriteProtect();
 // user-mode base when the NMI lands).  Stride is exactly 4096 bytes.
 extern "C" uint64_t GdtNmiStacksBase();
 static constexpr uint64_t GDT_NMI_STACK_STRIDE = 4096;
+
+// Immutable bootstrap/IST storage bounds; no locks or allocation.
+bool GdtProfilerStackBounds(uint32_t cpu, uint64_t frame, uint64_t& base, uint64_t& end);

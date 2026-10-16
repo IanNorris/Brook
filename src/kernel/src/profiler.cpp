@@ -15,6 +15,10 @@
 // the serial log and converts to Speedscope JSON.
 
 #include "profiler.h"
+#include "profiler_stack_walk.h"
+#include "gdt.h"
+#include "memory/virtual_memory.h"
+
 #include "process.h"
 #include "scheduler.h"
 #include "smp.h"
@@ -23,10 +27,41 @@
 #include "rtc.h"
 #include "memory/heap.h"
 
+extern "C" uint8_t __text_start[], __text_end[];
+
 // LAPIC tick counter (defined in apic.cpp).
 namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
 namespace brook {
+
+// Both callers run with IRQs disabled, on storage owned by the outgoing task
+// or permanent per-CPU stacks. Never infer readable stack memory from code VA.
+static uint8_t CaptureCallers(uint32_t cpu, uint64_t rbp, uint64_t base,
+                              uint64_t end, uint64_t* output, uint8_t capacity,
+                              bool skipFirstReturn)
+{
+    ProfilerStackBounds bounds{base, end};
+    if (!bounds.ContainsFrame(rbp)) {
+        if (GdtProfilerStackBounds(cpu, rbp, base, end)) {
+            bounds = {base, end};
+        } else if (SmpBootstrapStackBounds(cpu, base, end)) {
+            bounds = {base, end};
+        } else {
+            return 0;
+        }
+    }
+    return ProfilerWalkFrames(rbp, bounds, output, capacity, skipFirstReturn,
+        [](uint64_t address, uint64_t& next, uint64_t& pc) {
+            const auto* frame = reinterpret_cast<const uint64_t*>(address);
+            next = frame[0];
+            pc = frame[1];
+        }, [](uint64_t pc) {
+            return ProfilerReturnAddress(pc,
+                reinterpret_cast<uint64_t>(__text_start),
+                reinterpret_cast<uint64_t>(__text_end),
+                MODULE_BASE, MODULE_BASE + MODULE_SIZE);
+        });
+}
 
 // ---------------------------------------------------------------------------
 // Event record — either a sample (P) or context-switch (CS)
@@ -139,27 +174,11 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
     s.rip[0] = interruptedRip;
     uint8_t depth = 1;
 
-    // Walk frame pointer chain for kernel-mode samples only.
-    // User-mode RBP might be invalid or in a different address space.
+    // Do not dereference a user RBP or any unproven kernel stack storage.
     if (!userMode && interruptedRbp != 0) {
-        uint64_t rbp = interruptedRbp;
-        // Kernel addresses are >= 0xffffffff80000000
-        constexpr uint64_t KERNEL_BASE = 0xffffffff80000000ULL;
-        constexpr uint64_t KERNEL_END  = 0xffffffffffffffffULL;
-        while (depth < MAX_STACK_DEPTH) {
-            // Validate RBP is in kernel range and aligned
-            if (rbp < KERNEL_BASE || rbp >= KERNEL_END - 16 || (rbp & 7) != 0)
-                break;
-            // RBP points to: [saved_rbp, return_addr]
-            const uint64_t* frame = reinterpret_cast<const uint64_t*>(rbp);
-            uint64_t retAddr = frame[1];
-            if (retAddr < KERNEL_BASE || retAddr >= KERNEL_END)
-                break;
-            s.rip[depth++] = retAddr;
-            uint64_t nextRbp = frame[0];
-            if (nextRbp <= rbp) break; // stack grows down; prevent loops
-            rbp = nextRbp;
-        }
+        depth += CaptureCallers(cpu, interruptedRbp,
+            proc ? proc->kernelStackBase : 0, proc ? proc->kernelStackTop : 0,
+            s.rip + depth, MAX_STACK_DEPTH - depth, false);
     }
     s.depth = depth;
 
@@ -177,7 +196,8 @@ static const char kHexDigits[] = "0123456789abcdef";
 // Context-switch hook — emits a CS event into the calling CPU's ring buffer
 // ---------------------------------------------------------------------------
 
-void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid)
+void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid,
+                           uint64_t oldStackBase, uint64_t oldStackTop)
 {
     if (!g_profilerEnabled) return;
     if (oldPid == newPid) return; // no actual switch (e.g. same idle process)
@@ -213,20 +233,8 @@ void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid)
     s.rip[0] = leafRip;
     uint8_t depth = 1;
 
-    constexpr uint64_t KERNEL_BASE = 0xffffffff80000000ULL;
-    constexpr uint64_t KERNEL_END  = 0xffffffffffffffffULL;
-    while (depth < MAX_STACK_DEPTH) {
-        if (rbp < KERNEL_BASE || rbp >= KERNEL_END - 16 || (rbp & 7) != 0)
-            break;
-        const uint64_t* frame = reinterpret_cast<const uint64_t*>(rbp);
-        uint64_t retAddr = frame[1];
-        if (retAddr < KERNEL_BASE || retAddr >= KERNEL_END)
-            break;
-        s.rip[depth++] = retAddr;
-        uint64_t nextRbp = frame[0];
-        if (nextRbp <= rbp) break;
-        rbp = nextRbp;
-    }
+    depth += CaptureCallers(cpu, rbp, oldStackBase, oldStackTop,
+                            s.rip + depth, MAX_STACK_DEPTH - depth, true);
     s.depth = depth;
 
     __atomic_store_n(&buf.writeIdx, nextWi, __ATOMIC_RELEASE);

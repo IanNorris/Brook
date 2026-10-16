@@ -44,10 +44,21 @@ struct APDataBlock {
 // State
 // ---------------------------------------------------------------------------
 
+static constexpr uint64_t AP_STACK_PAGES = 16;
 static CpuInfo     g_cpus[MAX_CPUS];
 static uint32_t    g_cpuCount    = 0;
 static uint32_t    g_onlineCount = 0;
 static bool        g_smpReady    = false;
+
+bool SmpBootstrapStackBounds(uint32_t cpu, uint64_t& base, uint64_t& end)
+{
+    if (cpu >= g_cpuCount || g_cpus[cpu].isBsp || !g_cpus[cpu].kernelStack)
+        return false;
+    // AP allocation reserves the final 16 bytes above its initial RSP.
+    end = g_cpus[cpu].kernelStack + 16;
+    base = end - AP_STACK_PAGES * 4096;
+    return true;
+}
 
 // Volatile signal: set by AP to tell BSP it's alive.
 static volatile uint32_t g_apSignal = 0;
@@ -344,7 +355,6 @@ uint32_t SmpInit()
         // Scheduler and interrupt frames can exceed the old unguarded 16 KiB;
         // AP1 then spilled into the preceding framebuffer mapping. Match the
         // dedicated 64 KiB idle-stack capacity and reserve unmapped guards.
-        static constexpr uint64_t AP_STACK_PAGES = 16;
         VirtualAddress stackBase = VmmAllocKernelStack(AP_STACK_PAGES,
             MemTag::KernelData, KernelPid);
         if (!stackBase)

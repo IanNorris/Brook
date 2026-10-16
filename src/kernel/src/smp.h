@@ -36,6 +36,9 @@ const CpuInfo* SmpGetCpu(uint32_t index);
 // Get the current CPU's index (based on LAPIC ID).
 uint32_t SmpCurrentCpuIndex();
 
+// Immutable AP bootstrap stack bounds (also used by the initial AP idle loop).
+bool SmpBootstrapStackBounds(uint32_t cpu, uint64_t& base, uint64_t& end);
+
 // Update per-CPU CR3 tracking (called from scheduler context switch).
 void SmpSetCurrentCr3(uint32_t cpuIndex, uint64_t cr3);
 

@@ -1808,7 +1808,8 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     // are running a given address space (critical for CoW fork correctness).
     SmpSetCurrentCr3(cpu, newProc->savedCtx.cr3);
 
-    ProfilerContextSwitch(oldProc->pid, newProc->pid);
+    ProfilerContextSwitch(oldProc->pid, newProc->pid,
+                          oldProc->kernelStackBase, oldProc->kernelStackTop);
 
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave,
@@ -2332,7 +2333,8 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // stays 0 across the switch (the resumed thread restores its own IF).
     SchedLockReleaseRaw(g_readyLock);
 
-    ProfilerContextSwitch(proc->pid, next->pid);
+    ProfilerContextSwitch(proc->pid, next->pid,
+                          proc->kernelStackBase, proc->kernelStackTop);
     context_switch(&proc->savedCtx, &next->savedCtx,
                    &proc->fxsave, &next->fxsave,
                    &proc->runningOnCpu);

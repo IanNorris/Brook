@@ -193,3 +193,10 @@ target_compile_options(test_mapping_pins PRIVATE
     "-iquote${BROOK_ROOT}/src/shared"
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
+
+# Same bounded frame walker used by timer and context-switch profiling.
+add_host_test(test_profiler_stack)
+target_compile_options(test_profiler_stack PRIVATE
+    -UNDEBUG
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+)

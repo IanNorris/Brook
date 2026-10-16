@@ -53,6 +53,21 @@ extern "C" uint64_t GdtNmiStacksBase()
     return reinterpret_cast<uint64_t>(&g_nmiStacks[0][0]);
 }
 
+bool GdtProfilerStackBounds(uint32_t cpu, uint64_t frame, uint64_t& base, uint64_t& end)
+{
+    auto contains = [&](const uint8_t* stack, uint64_t size) {
+        uint64_t start = reinterpret_cast<uint64_t>(stack);
+        if (frame < start || frame - start >= size) return false;
+        base = start;
+        end = start + size;
+        return true;
+    };
+    if (cpu == 0 && contains(g_kernelStack, sizeof(g_kernelStack))) return true;
+    if (cpu >= GDT_MAX_CPUS) return false;
+    return contains(g_dfStacks[cpu], sizeof(g_dfStacks[cpu])) ||
+           contains(g_nmiStacks[cpu], sizeof(g_nmiStacks[cpu]));
+}
+
 // Track how many CPUs have been initialized.
 static uint32_t g_cpuTssCount = 0;
 
