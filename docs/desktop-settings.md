@@ -71,3 +71,35 @@ server-side decorations, passed maximize/restore and dragging, applied Midnight
 to its actual title bar and the taskbar, and closed/reopened successfully.
 Mousepad explicitly requested client-side decorations and retained a single
 header bar. Full 1920×1080 captures are retained in that session's artifacts.
+
+## Launcher refresh and native identity repair, 16 October 2026
+
+A validated installed desktop entry now replaces a same-title legacy shortcut's
+command and icon identity. Previously refresh kept its stale script path even
+when the active profile exposed the correct package. Missing executable targets
+remain filtered before publication. Native shortcuts can declare `# app_id:`
+and `# executable:` alongside their title, so Files (`brook-files`), Calculator
+(`brook.calc`) and Player (`brook-player`) match their windows without title
+heuristics. Header metadata is read once into the unpublished launcher snapshot.
+
+The custom GIMP shortcut now requires the installed profile's `gimp-3.0` and
+launches the full package with its accepted persistent `/data/home` profile.
+It no longer requests the old reduced plugin tree or disables fonts. This
+changes that custom shortcut; generic desktop entries retain the shell's
+default home environment.
+
+An isolated eight-core, 4-GiB, silent software VM at native 1920×1080 verified
+visible launcher icons, Files and Calculator title-bar/taskbar identity, the
+GIMP custom shortcut, and Mousepad's installed desktop entry. GIMP reopened the
+existing XCF with its saved stroke intact. Mousepad accepted two lines of text
+and saved exactly 62 expected bytes to `/data/home/launcher-mousepad.txt`.
+Both applications closed normally; only the expected kernel/Wayland processes
+remained, and heap integrity passed. Checked shutdown and all three offline
+filesystem checks passed.
+
+Evidence and unscaled captures are retained in
+`build/workloads/launcher-repair-20261016/acceptance.json` and bridge session
+`0a2f08b339ca4e3c93ce26d19623b89f`. Kernel SHA256:
+`d195b0b8c09943732bd410fc35d9b61443729f6f44c9900fbe8c396ddd02bb47`.
+The file browser still uses its bitmap font, and the app-launcher button still
+uses the existing application glyph; these remain separate polish tasks.

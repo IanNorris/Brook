@@ -1,4 +1,6 @@
 # title: GIMP
-# Requires: /nix/bin/gimp
+# Requires: /nix/profile/bin/gimp-3.0
+# Requires: /nix/profile/bin/env
+# Requires: /nix/bin/waylandd
 # desc: GNU Image Manipulation Program
 source /boot/SCRIPTS/wayland_gimp.rc

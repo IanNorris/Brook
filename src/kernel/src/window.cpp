@@ -1373,47 +1373,53 @@ static void LauncherDrawIcon(uint32_t* buf, uint32_t stride,
                item->iconPixels ? item->iconPixels : launcher.applicationIcon);
 }
 
-// Parse "# title: Something" from a script file's first few lines
-static bool ParseShortcutTitle(const char* path, char* titleOut, uint32_t titleMax)
+// Read title and explicit window identity from a shortcut's comment header.
+// Identity metadata matches Wayland app_id/executable without guessing by title.
+static bool ParseShortcutMetadata(const char* path, LauncherItem& item)
 {
     Vnode* vn = VfsOpen(path, 0);
     if (!vn) return false;
-
-    char buf[512];
-    uint64_t offset = 0;
+    char buf[512]; uint64_t offset = 0;
     int rd = VfsRead(vn, buf, sizeof(buf) - 1, &offset);
     VfsClose(vn);
     if (rd <= 0) return false;
-    buf[rd] = '\0';
-
-    // Search for "# title:" in the buffer
-    const char* p = buf;
-    while (*p)
+    buf[rd] = 0;
+    struct Field { const char* key; char* output; uint32_t capacity; };
+    const Field fields[] = {
+        {"title:", item.title, sizeof(item.title)},
+        {"app_id:", item.appId, sizeof(item.appId)},
+        {"executable:", item.executable, sizeof(item.executable)},
+    };
+    for (char* line = buf; *line;)
     {
-        // Skip to start of line
-        while (*p && (*p == '\n' || *p == '\r')) ++p;
-        if (*p != '#') break; // only check comment lines at the top
-
-        // Look for "# title:"
-        const char* line = p;
-        while (*p && *p != '\n') ++p;
-
-        // Check for "# title:" prefix
-        const char* t = line + 1;
-        while (*t == ' ') ++t;
-        if (t[0] == 't' && t[1] == 'i' && t[2] == 't' && t[3] == 'l' &&
-            t[4] == 'e' && t[5] == ':')
-        {
-            t += 6;
-            while (*t == ' ') ++t;
-            uint32_t i = 0;
-            while (*t && *t != '\n' && *t != '\r' && i < titleMax - 1)
-                titleOut[i++] = *t++;
-            titleOut[i] = '\0';
-            return true;
+        char* end = line;
+        while (*end && *end != '\n') ++end;
+        const bool more = *end != 0; *end = 0;
+        char* text = line;
+        while (*text == ' ' || *text == '\t') ++text;
+        if (!*text || *text == '\r') {
+            if (!more) break;
+            line = end + 1;
+            continue;
         }
+        if (*text != '#') break;
+        ++text; while (*text == ' ' || *text == '\t') ++text;
+        for (const auto& field : fields)
+        {
+            const uint32_t length = strlen(field.key);
+            if (strncmp(text, field.key, length) != 0) continue;
+            char* value = text + length;
+            while (*value == ' ' || *value == '\t') ++value;
+            char* tail = value + strlen(value);
+            while (tail > value && (tail[-1] == ' ' || tail[-1] == '\t' || tail[-1] == '\r')) --tail;
+            *tail = 0;
+            WmStrCopy(field.output, value, field.capacity);
+            break;
+        }
+        if (!more) break;
+        line = end + 1;
     }
-    return false;
+    return item.title[0] != 0;
 }
 
 // Asset files are 24x24 straight-alpha pixels encoded as little-endian ARGB.
@@ -1608,13 +1614,17 @@ static bool LauncherLoadDesktopEntries(LauncherSnapshot& launcher)
             {
                 if (launcher.count == WM_LAUNCHER_MAX_ITEMS) { ok = false; break; }
                 item = &launcher.items[launcher.count++];
-                item->valid = true; item->isDesktopEntry = true;
-                WmStrCopy(item->title, fields[0], sizeof(item->title));
-                WmStrCopy(item->scriptPath, fields[1], sizeof(item->scriptPath));
             }
+            // The installed executable has passed profile validation. A
+            // same-title legacy shortcut must not retain its stale command.
+            // This candidate is unpublished; its icon can be replaced here.
+            item->valid = true; item->isDesktopEntry = true;
+            WmStrCopy(item->title, fields[0], sizeof(item->title));
+            WmStrCopy(item->scriptPath, fields[1], sizeof(item->scriptPath));
             WmStrCopy(item->executable, executable, sizeof(item->executable));
-            if (count >= 5) WmStrCopy(item->appId, fields[4], sizeof(item->appId));
-            if (!item->iconPixels && count >= 3) item->iconPixels = LoadIconFile(fields[2]);
+            WmStrCopy(item->appId, count >= 5 ? fields[4] : "", sizeof(item->appId));
+            kfree(item->iconPixels);item->iconPixels = nullptr;
+            if (count >= 3) item->iconPixels = LoadIconFile(fields[2]);
             if (!item->iconPixels) LauncherLoadIcon(item);
         }
         if (!more) break;
@@ -1658,7 +1668,7 @@ static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
             WmStrCopy(item.scriptPath + prefixLen, de.name, sizeof(item.scriptPath) - prefixLen);
             if (!ShortcutRequirementsMet(item.scriptPath)) continue;
             if (snapshot->count == WM_LAUNCHER_MAX_ITEMS) { ok = false; break; }
-            if (!ParseShortcutTitle(item.scriptPath, item.title, sizeof(item.title)))
+            if (!ParseShortcutMetadata(item.scriptPath, item))
             {
                 uint32_t ti = 0;
                 for (uint32_t j = 0; de.name[j] && de.name[j] != '.' && ti + 1 < sizeof(item.title); ++j)

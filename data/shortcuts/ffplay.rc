@@ -1,4 +1,6 @@
 # title: Video Player
+# app_id: brook-player
+# executable: brook-player
 # Requires: /nix/bin/brook-player
 # desc: Brook video player (wl_shm)
 source /boot/SCRIPTS/wayland_brookplayer.rc
