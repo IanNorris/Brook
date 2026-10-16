@@ -860,6 +860,23 @@ extern "C" uint32_t HdaGetPosition()
     return queued;
 }
 
+// A cyclic HDA descriptor list keeps playing after the last submitted byte.
+// Writers cannot be responsible for noticing that transition: the application
+// may have paused, closed or died. The mixer calls this in thread context even
+// when its software queue is empty. Serialize with writers before stopping DMA
+// and clearing the ring; the next write performs a fresh stream setup.
+static void HdaService()
+{
+    if (!g_initialized) return;
+    PlayLock();
+    if (g_streamRunning && QueuedBytesLocked() == 0)
+    {
+        ResetPlaybackQueueLocked(false);
+        g_streamConfigured = false;
+    }
+    PlayUnlock();
+}
+
 // ---------------------------------------------------------------------------
 // Module init / exit
 // ---------------------------------------------------------------------------
@@ -989,6 +1006,7 @@ static int IntelHdaInit()
         HdaStop,
         HdaIsPlaying,
         HdaGetPosition,
+        HdaService,
     };
     AudioRegister(&hdaAudioDriver);
 

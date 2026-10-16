@@ -31,6 +31,10 @@ struct AudioDriver {
 
     // Current playback position in bytes.
     uint32_t (*getPosition)();
+
+    // Periodic maintenance, including draining an idle DMA queue. Called in
+    // thread context even when applications have stopped submitting samples.
+    void (*service)() = nullptr;
 };
 
 // Register an audio driver.  Only one can be active at a time.

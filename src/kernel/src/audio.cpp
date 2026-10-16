@@ -176,6 +176,8 @@ void AudioMixerTick()
 {
     if (!g_mixerReady) return;
     AudioMixerFlush();
+    if (g_audioDriver && g_audioDriver->service)
+        g_audioDriver->service();
 }
 
 // --- Driver registration ---
@@ -239,7 +241,7 @@ static void AudioMixerThreadFn(void* /*arg*/)
 
         // Flush whatever has accumulated
         if (g_mixerReady && g_audioDriver && g_audioDriver->play)
-            AudioMixerFlush();
+            AudioMixerTick();
     }
 }
 
