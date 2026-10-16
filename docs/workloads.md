@@ -1156,3 +1156,25 @@ Nix evaluation resolves these selectors to Blender 5.1.1, GIMP 3.0.8, OpenTTD
 package selection, not guest compatibility or installation of those new apps.
 The existing GIMP acceptance above remains a separate result. No default shell
 or terminal has changed; interactive acceptance is required first.
+
+### Files typography and OpenTTD, 16 October
+
+The Files package now bundles Noto Sans Mono and rasterizes its ASCII glyphs
+once with FreeType. Drawing blends the cached coverage; it does not open fonts
+or rasterize glyphs on each frame. The original bitmap font remains the fallback.
+The native Files, Calculator and media-player launch scripts now resolve their
+executables through `/nix/profile/bin`, so guest package upgrades take effect.
+
+An isolated eight-core, 4-GiB VM installed Files 0.2 and stock OpenTTD 15.3 through
+the guest installer in 79.2 host seconds. Files reported the Noto font ready and
+passed pointer directory navigation. OpenTTD rendered a new 256×256 world with
+the software SDL backend, opened the town directory, maximized, saved a game
+and loaded it again. Sound and music were explicitly disabled for this run.
+Both applications closed normally; checked shutdown and FAT/ext2 checks passed.
+Evidence is in ignored `build/workloads/desktop-font-workloads-20261016`.
+
+OpenTTD is not yet fully accepted: character keys reach SDL, but text events
+are absent because SDL 3.4.2 requires `zwp_text_input_v3` to activate text input.
+The save dialog also reports zero free bytes because Brook's `statfs` is a
+zero-filled stub. Scheduler watchdog messages during package decompression need
+separate investigation; both installations completed without intervention.

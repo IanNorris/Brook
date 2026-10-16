@@ -1,6 +1,6 @@
 # title: Calculator
 # app_id: brook.calc
 # executable: wayland-calc
-# Requires: /nix/bin/wayland-calc
+# Requires: /nix/profile/bin/wayland-calc
 # desc: Brook native calculator demo
 source /boot/SCRIPTS/wayland_calc.rc

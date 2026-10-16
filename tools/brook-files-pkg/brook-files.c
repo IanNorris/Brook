@@ -4,8 +4,8 @@
  * Two-pane layout: tree view on the left, file/directory list on the
  * right, with a status bar showing file size and modified date.
  *
- * Pure C, depends only on libwayland-client + xdg-shell-protocol.
- * No font/cairo/pango — uses a built-in 6x10 bitmap font.
+ * Pure C with Wayland and a one-time FreeType glyph cache.
+ * Noto Sans Mono is bundled; the bitmap font remains a fallback.
  *
  * Navigation: arrow keys (up/down to select, Enter to open dir / go
  * into tree node, Backspace to go up), pointer click to select.
@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -265,6 +267,53 @@ static const uint8_t g_font6x10[][10] = {
 #define CHAR_W (FONT_W * FONT_SCALE)
 #define CHAR_H (FONT_H * FONT_SCALE)
 
+#ifndef BROOK_UI_FONT
+#define BROOK_UI_FONT ""
+#endif
+static uint8_t g_glyph_alpha[95][CHAR_H][CHAR_W];
+static int g_smooth_font;
+
+/* Rasterize once. Painting never reads a font file or calls FreeType. */
+static void init_font(void) {
+    FT_Library library;
+    FT_Face face;
+    if (FT_Init_FreeType(&library)) return;
+    if (FT_New_Face(library, BROOK_UI_FONT, 0, &face)) {
+        FT_Done_FreeType(library);
+        fprintf(stderr, "brook-files: font unavailable; using bitmap fallback\n");
+        return;
+    }
+    int ready = FT_Set_Pixel_Sizes(face, 0, 16) == 0;
+    for (unsigned ch = 32; ready && ch <= 126; ++ch) {
+        if (FT_Load_Char(face, ch, FT_LOAD_RENDER | FT_LOAD_NO_BITMAP | FT_LOAD_TARGET_NORMAL)) {
+            ready = 0;
+            break;
+        }
+        const FT_GlyphSlot glyph = face->glyph;
+        const FT_Bitmap *bitmap = &glyph->bitmap;
+        if (bitmap->rows && bitmap->pixel_mode != FT_PIXEL_MODE_GRAY) {
+            ready = 0;
+            break;
+        }
+        int left = (CHAR_W - (int)(glyph->advance.x / 64)) / 2 + glyph->bitmap_left;
+        int top = 16 - glyph->bitmap_top;
+        for (unsigned row = 0; row < bitmap->rows; ++row) {
+            const uint8_t *pixels = bitmap->pitch >= 0
+                ? bitmap->buffer + row * bitmap->pitch
+                : bitmap->buffer + (bitmap->rows - row - 1) * -bitmap->pitch;
+            for (unsigned col = 0; col < bitmap->width; ++col) {
+                int x = left + (int)col, y = top + (int)row;
+                if (x >= 0 && x < CHAR_W && y >= 0 && y < CHAR_H)
+                    g_glyph_alpha[ch - 32][y][x] = pixels[col];
+            }
+        }
+    }
+    FT_Done_Face(face);
+    FT_Done_FreeType(library);
+    g_smooth_font = ready;
+    fprintf(stderr, "brook-files: %s\n", ready ? "Noto Sans Mono 16px ready" : "bitmap font fallback");
+}
+
 static uint32_t *g_px;
 
 static inline void put_px(int x, int y, uint32_t c) {
@@ -281,6 +330,24 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c) {
 static void draw_char(int cx, int cy, char ch, uint32_t colour) {
     if (ch < 32 || ch > 126) ch = '?';
     int idx = ch - 32;
+    if (g_smooth_font) {
+        for (int row = 0; row < CHAR_H; ++row) {
+            int y = cy + row;
+            if (y < 0 || y >= WIN_H) continue;
+            for (int col = 0; col < CHAR_W; ++col) {
+                int x = cx + col;
+                unsigned alpha = g_glyph_alpha[idx][row][col];
+                if (!alpha || x < 0 || x >= WIN_W) continue;
+                uint32_t background = g_px[y * WIN_W + x];
+                unsigned inverse = 255 - alpha;
+                unsigned r = (((colour >> 16) & 255) * alpha + ((background >> 16) & 255) * inverse + 127) / 255;
+                unsigned g = (((colour >> 8) & 255) * alpha + ((background >> 8) & 255) * inverse + 127) / 255;
+                unsigned b = ((colour & 255) * alpha + (background & 255) * inverse + 127) / 255;
+                g_px[y * WIN_W + x] = 0xff000000u | (r << 16) | (g << 8) | b;
+            }
+        }
+        return;
+    }
     const uint8_t *glyph = g_font6x10[idx];
     for (int row = 0; row < FONT_H; row++) {
         uint8_t bits = glyph[row];
@@ -1238,6 +1305,7 @@ static void on_frame(void *data, struct wl_callback *cb, uint32_t time) {
 int main(int argc, char *argv[]) {
     const char *start_dir = "/";
     if (argc > 1) start_dir = argv[1];
+    init_font();
 
     struct wl_display *dpy = NULL;
     /* Retry connection — waylandd may not have bound the socket yet */
