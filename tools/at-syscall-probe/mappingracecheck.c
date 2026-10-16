@@ -61,6 +61,12 @@ static void replaced(int fd,int memfd,unsigned phase) {
     REQUIRE(pthread_join(thread,NULL)==0 && observed[0]=='Z');
     REQUIRE(mapping[4096]=='Y');REQUIRE(munmap((void *)mapping,8192)==0);
 }
+/* Fault resolution may sleep while other threads fault on the same CPU.
+ * Require the delivered address to remain the originally denied access. */
+static void denied_signal(int signal, siginfo_t *info, void *context) {
+    (void)context;
+    _exit(signal==SIGSEGV && info && info->si_addr==(void *)mapping ? 86 : 87);
+}
 static int remove_mapping;
 static void *mutator(void *unused) {
     (void)unused;await_faults(1);
@@ -72,13 +78,15 @@ static void denied(int fd,int memfd,unsigned phase,int remove) {
     pid_t child=fork();REQUIRE(child>=0);
     if (!child) {
         setup(fd,memfd,phase,1);remove_mapping=remove;
+        struct sigaction action={0};action.sa_sigaction=denied_signal;action.sa_flags=SA_SIGINFO;
+        REQUIRE(sigemptyset(&action.sa_mask)==0 && sigaction(SIGSEGV,&action,NULL)==0);
         pthread_t thread;REQUIRE(pthread_create(&thread,NULL,mutator,NULL)==0);
         if (remove) { volatile unsigned char byte=mapping[0];(void)byte; }
         else mapping[0]='X';
         _exit(9); /* A stale successful fault would reach this line. */
     }
     int status;REQUIRE(waitpid(child,&status,0)==child);
-    REQUIRE(WIFSIGNALED(status) && WTERMSIG(status)==SIGSEGV);
+    REQUIRE(WIFEXITED(status) && WEXITSTATUS(status)==86);
     long state=control(1,NULL,0,0,0);REQUIRE(state==1);
 }
 static void cancelled(int fd,unsigned phase) {

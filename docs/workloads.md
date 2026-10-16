@@ -1078,3 +1078,34 @@ ignored candidate directory. The screenshot is a native 1080p capture; no showca
 production has begun. Final source review found no blocking issue in the
 interruptible registration/lifetime/unwind paths; zombie address-space retention
 until parent reaping remains a separate improvement opportunity.
+
+### Preserve synchronous fault addresses during diagnostics (2026-10-16)
+
+The actual mapping-race probe now installs a SIGSEGV `SA_SIGINFO` handler and
+requires the denied access's exact address before exiting. This exposed a
+previously missed failure: the faulting access targeted `0x1016a000`, but its
+signal frame reported `0x40d9b4`. A recoverable nested kernel CoW fault while
+resolving or diagnosing the original exception can overwrite CR2 even with IRQs
+disabled. Reading CR2 again after the register/stack dump therefore loses the
+original address. The earlier unhandled-signal check only verified SIGSEGV.
+
+Both exception handlers now snapshot CR2 before helper calls. The full handler
+uses that saved address for resolution, diagnostics, panic metadata, `si_addr`,
+ucontext and crash metadata, and passes it to the fallback reporter. This
+changes no IRQ policy. The separate user-page-fault interruptibility experiment
+remains unapplied; its slower rebuild measurements are in [bootstrap.md](bootstrap.md).
+
+The combined test candidate passed eight complete race-probe invocations (176 cases)
+across data and Nix disks, plus ordinary-I/O coherence, filesystem exit,
+32-round futex and mixed-wait exit checks, fatal SIGSEGV reaping and heap
+integrity. Checked device flush and all three offline filesystem checks passed.
+This candidate also includes the separately evaluated growing file-page index;
+its benchmark results must not be inferred from these correctness checks.
+Evidence: `build/workloads/file-index-races-20261016/audit.json`; the original
+failing `pre-cr2-fix-serial.log` is retained alongside it.
+
+The framebuffer alias probe now queries geometry before mapping `/dev/fb0`,
+which creates its own composited window buffer. Previously it wrote a canary
+into live firmware scanout memory and could race compositor redraws. The
+corrected probe passed 512 writable aliases, descriptor close and progressive
+unmapping while checking surviving aliases.

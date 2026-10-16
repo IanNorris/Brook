@@ -316,9 +316,13 @@ extern "C" bool PmmDecodePoison(uint64_t qword);  // BRO-179 forensic (physical_
 extern "C" int  PmmDumpFreeLogNoLock(uint64_t phys);   // BRO-179 fault-context (no g_pmmLock)
 extern "C" bool PmmDecodePoisonNoLock(uint64_t qword); // BRO-179 fault-context (no g_pmmLock)
 
-static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode, bool swapgsDone = false)
+static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode, bool swapgsDone = false,
+                            const uint64_t* capturedFaultAddress = nullptr)
 {
     __asm__ volatile("cli");
+    uint64_t cr2 = 0;
+    if (capturedFaultAddress) cr2 = *capturedFaultAddress;
+    else __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
 
     // BRO-178: decide SWAPGS by the ACTUAL GS base, not the saved CS RPL.
     // The __attribute__((interrupt)) stubs do NOT perform SWAPGS, so this C path
@@ -392,9 +396,6 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
     // from multiple CPUs can be disambiguated.
     char cpuTag[6] = {'[','C','0',']',' ','\0'};
     cpuTag[2] = static_cast<char>('0' + cpuSlot % 10);
-
-    uint64_t cr2 = 0;
-    __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
 
     uint64_t rbp = 0;
     __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
@@ -913,6 +914,11 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 {
     // The assembly stub has already done SWAPGS if needed.
     __asm__ volatile("cli");
+    // Nested, recoverable faults while resolving or diagnosing this exception
+    // can overwrite CR2, even with IRQs disabled (for example a user-stack CoW
+    // fault during a register dump). Retain this exception's original address.
+    uint64_t cr2 = 0;
+    __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
 
     // If a panic is already active, this CPU must not produce output or
     // render a panic screen — it would garble the panicking CPU's work.
@@ -934,8 +940,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     {
         __atomic_fetch_add(&brook::g_profFaultCount, 1, __ATOMIC_RELAXED);
 
-        uint64_t cr2cow = 0;
-        __asm__ volatile("movq %%cr2, %0" : "=r"(cr2cow));
+        const uint64_t cr2cow = cr2;
 
         bool pfPresent = (ef->errorCode & 1) != 0;
         bool pfWrite   = (ef->errorCode & 2) != 0;
@@ -1029,8 +1034,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ExcPutsRaw("  R14 "); ExcPutHex(ef->r14); ExcPutsRaw("  R15 "); ExcPutHex(ef->r15); ExcPutsRaw("\n");
         // CR2 is essential for #PF diagnosis
         {
-            uint64_t cr2val;
-            __asm__ volatile("movq %%cr2, %0" : "=r"(cr2val));
+            const uint64_t cr2val = cr2;
             ExcPutsRaw("  CR2 "); ExcPutHex(cr2val); ExcPutsRaw("\n");
         }
         // Symbolicate faulting RIP
@@ -1074,8 +1078,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         // (which is why these crashes have produced no QR). vector 14 == #PF.
         if (vector == 14 && (ef->errorCode & 0x8))
         {
-            uint64_t cr2val;
-            __asm__ volatile("movq %%cr2, %0" : "=r"(cr2val));
+            const uint64_t cr2val = cr2;
             constexpr uint64_t kDirectMapBase = 0xFFFF800000000000ULL;
             constexpr uint64_t kDirectMapEnd  = 0xFFFFC00000000000ULL;
             ExcPutsRaw("  RSVD-BIT #PF — corrupt paging entry (reused page-table frame?)\n");
@@ -1175,7 +1178,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                 pregs.cs  = static_cast<uint16_t>(ef->cs);
                 pregs.ss  = static_cast<uint16_t>(ef->ss);
                 __asm__ volatile("movq %%cr0, %0" : "=r"(pregs.cr0));
-                __asm__ volatile("movq %%cr2, %0" : "=r"(pregs.cr2));
+                pregs.cr2 = cr2;
                 __asm__ volatile("movq %%cr3, %0" : "=r"(pregs.cr3));
                 __asm__ volatile("movq %%cr4, %0" : "=r"(pregs.cr4));
 
@@ -1301,7 +1304,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ifrm.flags = ef->rflags;
         ifrm.sp    = ef->rsp;
         ifrm.ss    = ef->ss;
-        HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true);
+        HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true, false, &cr2);
         // HandleException never returns for kernel faults.
         for (;;) __asm__ volatile("cli; hlt");
     }
@@ -1503,9 +1506,6 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
     brook::Process* proc = brook::ProcessCurrent();
     int signum = ExceptionToSignal(static_cast<uint8_t>(vector));
-
-    uint64_t cr2 = 0;
-    __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
 
     // BRO-194: classify the faulting user address against every tracked mapping
     // (overrun-past-a-mapping vs wild pointer) for the rare gltron AVX-memcpy
@@ -1949,7 +1949,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     ifrm.flags = ef->rflags;
     ifrm.sp    = ef->rsp;
     ifrm.ss    = ef->ss;
-    HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true, true /*swapgsDone*/);
+    HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true, true /*swapgsDone*/, &cr2);
     // HandleException never returns for user-mode faults (it exits the process).
     for (;;) __asm__ volatile("cli; pause");
 }

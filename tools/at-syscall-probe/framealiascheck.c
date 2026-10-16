@@ -1,10 +1,12 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fb.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -16,6 +18,11 @@ int main(void) {
     CHECK(timer_create(CLOCK_MONOTONIC,&event,&timer)==0);
     struct itimerspec deadline={0}; deadline.it_value.tv_sec=60; CHECK(timer_settime(timer,0,&deadline,NULL)==0);
     int fd=open("/dev/fb0",O_RDWR); CHECK(fd>=0);
+    // Querying geometry first gives this process its own composited pixel
+    // buffer in WM mode. Mapping the firmware scanout directly races redraws
+    // from the compositor and makes the shared-canary assertion meaningless.
+    struct fb_var_screeninfo geometry={0};
+    CHECK(ioctl(fd,FBIOGET_VSCREENINFO,&geometry)==0);
     enum { count=512 }; volatile uint32_t *aliases[count];
     for(unsigned i=0;i<count;++i) {
         aliases[i]=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
