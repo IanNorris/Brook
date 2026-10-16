@@ -1122,6 +1122,8 @@ static void targetFileInvalidation() {
 
 static void pageAccessWithoutUnrelatedGate() {
     auto root=table();VmmHostSetKernelRoot(root);AddressSpaceKernelInit();
+    Process kernelActor{};kernelActor.addressSpace=AddressSpaceKernel();
+    CHECK(UserMappingPageAccess(&kernelActor,kernelActor.addressSpace,0x7020,1,true)==UserPageAccess::Denied);
     auto* space=AddressSpaceCreate(46);CHECK(space);
     Process actor{};actor.addressSpace=space;
     FileObject unrelated{};FileObjectInit(&unrelated);unsigned released=0;
@@ -1199,6 +1201,53 @@ static void pageAccessWithoutUnrelatedGate() {
     std::puts("PAGE ACCESS PASS unrelated-gate/no-allocation/read-statuses/CoW-revalidation/lifetime");
 }
 
+static void anonymousDiscard() {
+    auto root=table();VmmHostSetKernelRoot(root);
+    auto* space=AddressSpaceCreate(40);auto* child=AddressSpaceCreate(41);CHECK(space&&child);
+    Process actor{};actor.addressSpace=space;
+    uint64_t argument=0;
+    auto base=UserMappingStack(&actor,space,2*pageSize,nullptr,0,&argument);CHECK(base>0);
+    const VirtualAddress first(base),second(base+pageSize);
+    auto original=VmmLeafPhysical(VmmReadLeaf(space->pageTable,first));
+    auto hidden=VmmLeafPhysical(VmmReadLeaf(space->pageTable,second));
+    std::memset(reinterpret_cast<void*>(original.raw()),0x5a,pageSize);
+    std::memset(reinterpret_cast<void*>(hidden.raw()),0x6b,pageSize);
+    CHECK(UserMappingProtect(&actor,space,second.raw(),pageSize,0)==0);
+    CHECK(UserMappingClone(&actor,space,child,41));
+    auto beforeFirst=VmmReadLeaf(space->pageTable,first),beforeSecond=VmmReadLeaf(space->pageTable,second);
+    uint64_t addresses[2]={123,456},count=99;
+    CHECK(!VmmCollectRangeAddresses(space->pageTable,first.raw(),second.raw()+pageSize,addresses,1,&count));
+    CHECK(count==0&&addresses[0]==123&&addresses[1]==456);
+    CHECK(VmmCollectRangeAddresses(space->pageTable,first.raw(),second.raw()+pageSize,addresses,2,&count));
+    CHECK(count==2&&addresses[0]==first.raw()&&addresses[1]==second.raw());
+    failFrameAfter=1;
+    CHECK(UserMappingDiscardAnonymous(&actor,space,first.raw(),2*pageSize)==-12);
+    CHECK(VmmReadLeaf(space->pageTable,first)==beforeFirst&&VmmReadLeaf(space->pageTable,second)==beforeSecond);
+    CHECK(PmmGetRefCount(original)==2&&PmmGetRefCount(hidden)==2);
+    Gate ack;pendingAcknowledgement=&ack;std::atomic<bool> returned{false};
+    std::thread discarder([&] {
+        CHECK(UserMappingDiscardAnonymous(&actor,space,first.raw(),2*pageSize)==0);returned=true;
+    });
+    ack.wait(1);
+    CHECK(!returned&&PmmGetRefCount(original)==2&&PmmGetRefCount(hidden)==2);
+    CHECK(maps(original)==1&&maps(hidden)==1);
+    CHECK(*reinterpret_cast<unsigned char*>(original.raw())==0x5a);
+    CHECK(*reinterpret_cast<unsigned char*>(hidden.raw())==0x6b);
+    auto newFirst=VmmReadLeaf(space->pageTable,first),newSecond=VmmReadLeaf(space->pageTable,second);
+    CHECK(VmmLeafPhysical(newFirst)!=original&&(newFirst&VMM_WRITABLE)&&!(newFirst&PTE_COW_BIT));
+    CHECK(VmmLeafPhysical(newSecond)!=hidden&&(newSecond&PTE_HIDDEN_BIT)&&!(newSecond&VMM_PRESENT));
+    for (auto raw:{newFirst,newSecond}) for (size_t i=0;i<pageSize;++i)
+        CHECK(reinterpret_cast<unsigned char*>(VmmLeafPhysical(raw).raw())[i]==0);
+    CHECK(VmmLeafPhysical(VmmReadLeaf(child->pageTable,first))==original);
+    ack.release();discarder.join();pendingAcknowledgement=nullptr;
+    CHECK(returned&&PmmGetRefCount(original)==1&&PmmGetRefCount(hidden)==1);
+    CHECK(!actor.kernelRegionDepth&&!actor.refCount);
+    AddressSpaceUnref(child);CHECK(ProcessCleanupStep());
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("ANONYMOUS DISCARD PASS zero/hidden/CoW-isolation/OOM-atomicity/delayed-ACK/bounded-snapshot");
+}
+
 int main() {
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
@@ -1206,5 +1255,6 @@ int main() {
     liveMappingClone();sharedMappingClone();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();targetFileInvalidation();
     pageAccessWithoutUnrelatedGate();
+    anonymousDiscard();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

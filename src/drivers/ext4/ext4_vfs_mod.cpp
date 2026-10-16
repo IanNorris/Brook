@@ -656,7 +656,10 @@ static int ext4_fs_unlink(void* mountPriv, uint8_t pdrv, const char* relPath) {
     return (r == 0) ? 0 : -EIO;
 }
 
-static int ext4_fs_mkdir(void* mountPriv, uint8_t pdrv, const char* relPath) {
+static int ext4_fs_mkdir(void* mountPriv, uint8_t pdrv, const char* relPath, uint16_t /*mode*/) {
+    // This experimental adapter still uses lwext4's default creation mode.
+    // Ext2 implements atomic requested-mode/umask publication; do not emulate
+    // that with a later chmod here, which would briefly expose broader access.
     (void)pdrv;
     auto* m = find_mount_by_priv(mountPriv);
     if (!m || !m->mounted) return -ENOENT;

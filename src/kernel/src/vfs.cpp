@@ -179,10 +179,18 @@ static int VfsLstatPathRaw(const char* path, VnodeStat* st)
 
 static int VfsReadlinkRaw(const char* path, char* buf, uint64_t bufsiz)
 {
-    if (!path || !buf || bufsiz == 0) return -1;
+    if (!path || !buf || bufsiz == 0) return -22;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(path, &relPath);
-    if (!mount || !mount->fsOps || !mount->fsOps->readlink) return -1;
+    if (!mount || !mount->fsOps) return -2;
+    // A filesystem root is a directory, including when reached through a
+    // mountpoint like /data. Backend parent/name lookup cannot represent it.
+    if (relPath[0]=='/' && !relPath[1]) return -22;
+    if (!mount->fsOps->readlink) {
+        VnodeStat stat{};
+        const int result=VfsLstatPathRaw(path,&stat);
+        return result ? (result==-1?-2:result) : -22;
+    }
     return mount->fsOps->readlink(mount->mountPriv, mount->pdrv, relPath, buf, bufsiz);
 }
 
@@ -849,14 +857,14 @@ int VfsRemovePath(const char* path, bool directory)
     return mount->fsOps->unlink(mount->mountPriv, mount->pdrv, relPath);
 }
 
-int VfsMkdir(const char* path)
+int VfsMkdir(const char* path, uint16_t mode)
 {
     FileMutationGuard mutation;
     if (!path || !path[0]) return -1;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(path, &relPath);
     if (!mount || !mount->fsOps || !mount->fsOps->mkdir) return -1;
-    return mount->fsOps->mkdir(mount->mountPriv, mount->pdrv, relPath);
+    return mount->fsOps->mkdir(mount->mountPriv, mount->pdrv, relPath, mode);
 }
 
 int VfsRename(const char* oldPath, const char* newPath)
@@ -886,7 +894,7 @@ int VfsSymlink(const char* target, const char* linkPath)
 
 int VfsReadlink(const char* path, char* buf, uint64_t bufsiz)
 {
-    if (!path || !buf || bufsiz == 0) return -1;
+    if (!path || !buf || bufsiz == 0) return -22;
 
     char resolved[512];
     const char* lookup = path;

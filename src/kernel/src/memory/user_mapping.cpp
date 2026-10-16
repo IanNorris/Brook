@@ -391,6 +391,53 @@ int64_t UserMappingProtect(Process* actor, AddressSpaceState* space, uint64_t ad
     }
     return operation.ProtectMapping(address,end,protection) ? 0 : -12;
 }
+int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length) {
+    uint64_t end;
+    if (!actor || !space || (address & 4095)) return -22;
+    if (!length) return 0;
+    if (!UserInterval(address,length,end)) return -22;
+    for (;;) {
+        struct Addresses { uint64_t* data=nullptr; ~Addresses() { kfree(data); } } addresses;
+        MappingTransaction operation(actor,space);
+        if (!operation.Lock()) return -12;
+        for (uint64_t at=address;at<end;) {
+            const auto* range=MappingRangeFind(space->ranges,at);
+            if (!range) return -12;
+            if ((range->kind != MappingKind::Anonymous && range->kind != MappingKind::Heap &&
+                 range->kind != MappingKind::Stack) || range->backing ||
+                range->sharing != MappingSharing::Private ||
+                range->leafOwnership != MappingLeafOwnership::Managed) return -95;
+            at=range->end<end?range->end:end;
+        }
+        uint64_t count=0;
+        if (!operation.RangeLeafCount(address,end,count)) return -22;
+        if (!count) return 0;
+        const uint64_t generation=space->generation;
+        operation.Unlock();
+        if (count>~uint64_t{0}/sizeof(uint64_t)) return -12;
+        addresses.data=static_cast<uint64_t*>(kmalloc(count*sizeof(uint64_t)));
+        if (!addresses.data || !operation.Prepare(count,count) ||
+            !operation.PrepareZeroed(MemTag::User,space->allocationPid)) return -12;
+        if (!operation.Lock()) return -12;
+        if (space->generation!=generation) continue;
+        uint64_t actual=0;
+        if (!VmmCollectRangeAddresses(space->pageTable,address,end,addresses.data,count,&actual)) continue;
+        // Every replacement has storage and an existing page-table path before
+        // the first detach. Never zero a shared CoW frame in place.
+        for (uint64_t i=0;i<actual;++i) {
+            const uint64_t at=addresses.data[i];
+            const auto* range=MappingRangeFind(space->ranges,at);
+            uint64_t flags=VMM_USER;
+            if (range->protection & 2) flags|=VMM_WRITABLE;
+            if (!(range->protection & 4)) flags|=VMM_NO_EXEC;
+            if (!operation.Detach(VirtualAddress(at)) ||
+                operation.Publish(i,VirtualAddress(at),flags,MemTag::User,space->allocationPid,
+                                  range->protection!=0)!=VmmMapResult::Mapped)
+                KernelPanic("mapping: preflighted anonymous discard failed");
+        }
+        return 0;
+    }
+}
 static UserPageAccess CheckPage(AddressSpaceState* space,uint64_t address,uint32_t access,bool& cow) {
     cow = false;
     const auto* range=MappingRangeFind(space->ranges,address);
@@ -407,7 +454,7 @@ static UserPageAccess CheckPage(AddressSpaceState* space,uint64_t address,uint32
 }
 UserPageAccess UserMappingPageAccess(Process* actor, AddressSpaceState* space, uint64_t address,
                                      uint32_t access, bool resolveCow) {
-    if (!actor || !space || address >= 0x0000800000000000ULL) return UserPageAccess::Denied;
+    if (!actor || !space || space->kernel || address >= 0x0000800000000000ULL) return UserPageAccess::Denied;
     // Pin AS lifetime and cancellation protection before a potentially
     // blocking mutation lock. Read-only PTE/range checks need no file gates.
     MappingTransaction operation(actor,space);

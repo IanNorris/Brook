@@ -114,6 +114,10 @@ uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address); // locked value snap
 // reentry into VMM/AS locks. References are released by caller after shootdown.
 using VmmRetireLeaf = void (*)(VirtualAddress, uint64_t leaf, void* context);
 bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* count);
+// Bounded snapshot of populated addresses; caller stabilizes AS topology.
+// Capacity failure never writes beyond the supplied array or changes leaves.
+bool VmmCollectRangeAddresses(PageTable pt, uint64_t begin, uint64_t end,
+                              uint64_t* addresses, uint64_t capacity, uint64_t* count);
 bool VmmDetachRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t capacity,
                     VmmRetireLeaf retire, void* context, uint64_t* count);
 using VmmPrivateLeafQuery = bool (*)(VirtualAddress, uint64_t leaf, void* context);

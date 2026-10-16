@@ -2,6 +2,49 @@
 
 ## Workload findings, 16 October
 
+- Chromium streaming playback: direct HTTP H.264/AAC video and nonzero audio pass,
+  but YouTube remains at media time zero. A local fragmented MP4 MediaSource
+  control reproduces a stall (four initial frames, then time zero on a fresh
+  guest; sometimes no sourceopen on later navigation). The identical fixture
+  plays on host Linux. Diagnose the blocked pipeline before treating this as
+  codec or network failure; the first YouTube media response is HTTP 200, and
+  its sampled stall is mostly idle. Guest-only Chromium diagnostic forwarding
+  is available in the isolated experiment, without using the host desktop.
+
+- Fix kernel-symbol table generation on incremental/fresh builds: the current
+  post-link generator writes addresses for the next link. Chromium's preserved
+  panic labeled RIP `0xffffffff800af838` as KRwLockReadLock, while the exact
+  frozen ELF proves KMutexUnlock's owner assertion. Use that ELF for attribution
+  until the table is generated and validated against the final linked layout.
+- Complete Unix socket contracts beyond automatic sender credentials: connected
+  SOCK_SEQPACKET currently uses stream storage without full record boundaries;
+  explicit SCM_CREDENTIALS and passing pipe/eventfd descriptors remain unsupported.
+  Keep these distinct from the now-tested automatic SO_PASSCRED path. Replace
+  remaining success-only setsockopt stubs with implemented semantics or errors.
+- Extend MADV_DONTNEED beyond private anonymous/heap/stack ranges, and reclaim
+  resident anonymous memory lazily instead of replacing populated frames eagerly.
+  File/shared/device discard must remain unsupported until backing invalidation
+  and fault repopulation are coordinated. Other content-changing/inheritance
+  advice must not return false success.
+- Chromium now passes the basic software-rendered local/HTTPS workflow; next
+  investigate missing/delayed GitHub stylesheets and images (Google and Wikipedia
+  render), client-side maximize placement extending beyond the display, longer
+  sessions, hardware rendering and sandbox support. Capture actual per-resource
+  network failures before attributing them to DNS, TLS or HTTP. Keep the existing
+  regular-file writable MAP_SHARED guard until its full acceptance is complete.
+- Chromium YouTube/DevTools on the 4-GiB candidate exhausted memory while loading
+  another 477-MiB helper ELF (`ELF: out of memory at page 47517`). Subsequent user
+  faults reached an unchecked signal-frame `memset` in HandleExceptionFull and
+  panicked the kernel. Make exec failure transactional and signal-frame writes
+  safe for unmapped/read-only/CoW/OOM alternate stacks; exercise both synchronous
+  and syscall-return delivery. The failed disks are preserved and not reused.
+  This invalidates full stability acceptance for that candidate, despite the
+  preceding clean Chromium and Firefox workflow/quit results.
+- Panic observability: simultaneous raw user-fault dumps interleaved with the
+  kernel fault text, so the bridge's serial regex missed the panic and observation
+  attempted a dead guest TCP query. Preserve structured panic state independently
+  of serial text and serialize recoverable crash dumps without forcing UART
+  ownership. Raw QMP register/memory reads still worked for this failure.
 - Firefox rerun on `4e53a2a`: local page JavaScript executes (confirmed by its
   dynamically set Wayland title), but visible content stays blank and address-bar
   typing does not appear. Investigate display/update and input responsiveness

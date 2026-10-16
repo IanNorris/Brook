@@ -1353,3 +1353,145 @@ fresh-boot normal quit does not close that follow-up. Evidence remains separatel
 in build/workloads/firefox-input-20261016/acceptance.json. Maximized client-side
 decoration geometry also needs polish; this pass does not establish hardware
 rendering, video playback, long-session stability or general browser compatibility.
+
+### Chromium startup and anonymous discard (16 October)
+
+The pinned stock Chromium 148.0.7778.96 closure now reaches its normal Wayland
+browser window on the eight-vCPU, 4-GiB software-graphics candidate. The launch
+uses `--no-sandbox --disable-gpu --ozone-platform=wayland`, a private data-backed
+profile/TMPDIR and native `/dev/shm`. It does not use `--no-zygote`, single-process
+mode or `--disable-dev-shm-usage`. The default current-apps checkpoint is unchanged.
+
+The compatibility work fixes several independent startup failures:
+
+- `readlink` distinguishes missing paths (ENOENT) from existing nonlinks
+  (EINVAL), including filesystem roots, and resolves relative syscall paths.
+- `mkdir` passes the requested creation mode through the filesystem interface;
+  ext2 publishes private 0700 directories with the correct umask and reports
+  EEXIST. The filesystem module ABI is now 15. FAT and the experimental lwext4
+  adapter do not acquire ext2's permission contract. Linux `creat` is dispatched
+  through ordinary write-only create/truncate handling.
+- The initrd provides `/dev/shm`. Named shared-memory open/unlink uses dynamic
+  namespace entries with independent backing references: unlink/recreate does
+  not invalidate old descriptors or mappings. Path stat/readdir and complete
+  tmpfs permissions remain outside this subset; mapped truncation is unsupported.
+- `execve("/proc/self/exe",...)` resolves the process's recorded executable
+  pathname. This is not an inode-pinned magic link surviving rename/unlink.
+- Invalid eventfd2 flags return EINVAL before allocating a descriptor. Chromium
+  intentionally probes invalid flags; the old false success caused a Mojo
+  fatal check. FD_CLOEXEC/status flags are published with the descriptor, and
+  counter reads use compare/exchange so concurrent writes cannot be lost.
+- Automatic SO_PASSCRED credentials are attached to queued bytes using the
+  actual sender's PID/real UID/GID. An inherited socket's connection-time peer
+  PID is insufficient for Chromium's child-PID oracle. Credential spans and
+  descriptor ownership share the pipe lock. Explicit user-supplied credentials
+  remain EOPNOTSUPP; full SEQPACKET boundaries remain follow-up work.
+
+Chromium then reproducibly faulted in the pinned libgobject's `g_closure_unref`
+with a `0xbadbad00badbad20` notifier pointer. Brook's madvise was a success-only
+stub: a guest Python negative control wrote `POISON!!`, called MADV_DONTNEED,
+and read the same bytes. Private anonymous discard now replaces populated frames
+with zeroed frames under an address-space transaction, preserving permissions,
+hidden PROT_NONE leaves and fork peers. It preallocates before mutation and
+retains detached frame references until full TLB acknowledgement. Sparse empty
+reservations are walked by allocated page tables. It currently replaces resident
+frames eagerly; it does not promise RSS reclamation. File/shared/device discard
+is unsupported. Other content-changing/fork-inheritance advice returns an error.
+With this correction, the GObject crash no longer occurs in the recorded run.
+Writable regular-file MAP_SHARED remains disabled; this work does not expose
+the pending shared-write/writeback foundation.
+
+One failed Chromium startup also exposed a scheduler ownership assertion. Exit
+cleanup could block/migrate but retained a CPU index captured before cleanup.
+Final exit dispatch now obtains that index under the ready lock; yield selects
+CPU/current process under the same lock, including its idle fallback. The public
+current-process helper uses the existing single GS-relative lookup. The failed
+VM and raw memory captures are preserved separately; forced-stop fsck returns 4
+on its data/Nix disks, which were never reused. The following scheduler candidate
+passes 16 filesystem/exit rounds and 32 mixed thread-group exit rounds, and both
+failed application launches clean up to ten processes without a kernel panic.
+
+All 19 hosted suites were rebuilt and pass, including an actual-VMM discard
+test covering allocation failure before publication, fork isolation, hidden
+leaves, bounded snapshots and delayed TLB acknowledgement. In Brook, that
+candidate passes `discardcheck` (60 checks, eight readers, 32 rounds),
+`passcredcheck` (887 checks), named SHM with 96 live names, eventfd concurrency,
+six executable-identity cases, permission checks on data/Nix, thirteen readlink
+cases, file coherence and 512/512 concurrent SCM_RIGHTS transfers. The new
+discard/credentials probes also pass on Linux.
+
+The local page visibly executes JavaScript, counts a click and echoes exactly
+`Chromium inside Brook`. Google HTTPS search renders and its consent dialog
+responds to input. Wikipedia renders text and images; clicking its History
+contents link updates the fragment and scroll position. The Brook GitHub page
+loads but some stylesheets/images are missing or delayed, so full GitHub visual
+acceptance remains open. No TLS bypass, account sign-in or purchase was used.
+Normal Ctrl+Shift+W quit returns `CHROMIUM_APP_EXIT_0`, ten desktop processes,
+about 3.97 GB guest free memory and a healthy heap. Recent compositor intervals
+are around 16 ms; those are not browser rendering benchmarks. Maximizing still
+leaves the client displaced beyond the screen and needs compositor geometry work.
+
+Evidence is under ignored `build/workloads/chromium-discard-20261016/`, session
+`4f61644ed2ef403dac8e36acce28c59c`, kernel
+`67ed71997f0a607a8705e77a667bb03ae14bc17b14a5598f53b4e9d3d0f17c7c`.
+Native screenshots include the local interaction result and Wikipedia's History
+section. Earlier negative controls remain in the chromium-* candidate folders.
+
+
+### YouTube playback and descriptor capacity (16 October)
+
+Firefox renders actual YouTube video at 854×480 on the software-rendered guest.
+Distinct decoded movie frames and media times of 42.72, 83.98 and 121.24 seconds
+establish playback beyond the player thumbnail. The unmuted media element reports
+an audio track, but Firefox logs `OpenCubeb() failed to init cubeb` and
+`OnMediaSinkAudioError`; audio output is not accepted. Silent-backend PCM capture
+is independently verified with a guest test tone: 136,193 stereo frames at
+44,100 Hz, about 3.09 seconds, with nonzero signal. This capture does not use the
+host microphone or speakers.
+
+The earlier 4-GiB candidate subsequently exhausted memory while loading another
+Chromium helper after opening YouTube/DevTools, then panicked in an unchecked
+signal-frame write. Its preceding normal Chromium/Firefox quits remain useful
+workflow evidence, but the whole candidate fails stability acceptance. Its disks
+are preserved and are not reused. Further video testing uses clean cloned disks,
+6 GiB of guest memory and eight vCPUs, with at least 8 GiB host memory headroom.
+
+Chromium renders YouTube's page and player thumbnail. The first 6-GiB attempt
+aborted when its 256-descriptor table filled and a shared-memory allocation
+returned EMFILE. Descriptor and epoll capacities are now 1,024. The larger table
+exposed an existing kernel-task exit bug: tasks without an FD table scanned a
+null pointer. Exit/close-on-exec cleanup now skips absent tables, and kernel-AS
+faults no longer enter user-mapping transactions. After this correction, the
+guest boots and passes `fdcapacitycheck`: 512 eventfds, 512 poll/epoll watches,
+unique readiness/drain checks and F_DUPFD_CLOEXEC at descriptor 900. The same
+probe passes on Linux; all 19 hosted tests pass, including kernel-AS page-access
+rejection. Chromium YouTube playback remains unverified after the retry.
+
+Evidence: ignored `build/workloads/chromium-youtube-clean-20261016/` (thumbnail,
+EMFILE and positive audio control), `chromium-youtube-fdcapacity-20261016/`
+(preserved boot panic, no guest capacity test), and
+`chromium-youtube-fdexit-20261016/` (corrected boot and capacity probe).
+
+
+The corrected candidate closes normally (`CHROMIUM_APP_EXIT_0`), returns to ten
+baseline processes, passes heap integrity, completes checked filesystem/device
+flushes and passes all offline FAT/ext2 checks. A direct HTTP MP4 control decodes
+320×180 H.264 frames and plays AAC audio through the existing ALSA-to-`/dev/dsp`
+configuration. Media times advance through the five-second clip and loop; decoded
+frame counts rise from 227 to 397. A three-second silent-backend capture contains
+136,151 stereo PCM frames, RMS 0.038. This is browser-produced audio, independently
+of the earlier kernel test tone. ALSA fallback warnings alone do not establish
+failure. Firefox's cubeb failure remains a separate open finding.
+
+YouTube's AV1/Opus attempt still stays at media time zero with no decoded
+resolution. Resource Timing records HTTP 200 and 1,073,775 transferred bytes for
+`/videoplayback`; this does not establish that all subsequent media requests work.
+A local fragmented H.264/AAC MediaSource fixture also stalls. The identical file
+and page on host Linux reach readyState 4 and 295 decoded frames in ten real
+seconds. A fresh isolated guest run reaches readyState 4 and four decoded frames,
+then remains at media time zero. A later navigation may fail to dispatch
+`sourceopen`. These distinguish the streaming pipeline failure from the accepted
+direct-file decode/audio path; they do not yet identify its syscall root cause.
+The initial YouTube stall profile has 781 idle samples out of 802, rather than
+sustained decoding CPU pressure. The focused rerun is preserved under ignored
+`build/workloads/chromium-mse-20261016/`.

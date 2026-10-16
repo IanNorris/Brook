@@ -1416,8 +1416,9 @@ uint32_t SchedulerReadyCount()
 
 Process* SchedulerCurrentProcess()
 {
-    uint32_t cpu = ThisCpu();
-    return g_perCpu[cpu].currentProcess;
+    // A preemption between reading the CPU index and indexing g_perCpu may
+    // migrate this thread. Use the single GS-relative process lookup instead.
+    return ProcessCurrent();
 }
 
 // ---------------------------------------------------------------------------
@@ -2143,16 +2144,18 @@ void SchedulerTimerTick(bool allowPreempt)
 
 void SchedulerYield()
 {
+    // Keep CPU selection and dispatch in the same non-preemptible region.
+    uint64_t rlf9 = SchedLockAcquire(g_readyLock);
     uint32_t cpu = ThisCpu();
     Process* old = g_perCpu[cpu].currentProcess;
-    if (!old)
+    if (!old) {
+        SchedLockRelease(g_readyLock, rlf9);
         return;
-    uint64_t rlf9 = SchedLockAcquire(g_readyLock);
+    }
     Process* next = PickNextLocked(cpu);
 
     if (!next)
     {
-        SchedLockRelease(g_readyLock, rlf9);
         // If the process is Blocked/Terminated, it must NOT continue running.
         // Switch to the idle process so the CPU is available for other work
         // and the blocked process can be properly rescheduled when unblocked.
@@ -2161,11 +2164,10 @@ void SchedulerYield()
             old->state == ProcessState::Stopped)
         {
             next = g_perCpu[cpu].idleProcess;
-            DoSwitch(old, next);
+        } else {
+            SchedLockRelease(g_readyLock, rlf9);
             return;
         }
-        // Nothing else to run — keep current.
-        return;
     }
 
     // Re-enqueue old process after context_switch saves its state.
@@ -2199,8 +2201,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 
 [[noreturn]] void SchedulerExitCurrentProcess(int status, int terminationSignal)
 {
-    uint32_t cpu = ThisCpu();
-    Process* proc = g_perCpu[cpu].currentProcess;
+    Process* proc = ProcessCurrent();
 
     // Release any held kernel rwlocks / remove from wait queues.
     KRwLockCleanupOnExit(proc);
@@ -2284,6 +2285,10 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     }
 
     SchedLockAcquire(g_readyLock);
+    // FD close and exit cleanup above may block and resume on another CPU.
+    // A CPU index captured before that cleanup would overwrite another CPU's
+    // current process/GS environment and choose the wrong idle stack.
+    uint32_t cpu = ThisCpu();
     ReadyQueueRemoveLocked(proc);
     Process* next = PickNextLocked(cpu);
 

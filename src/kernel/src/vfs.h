@@ -131,8 +131,9 @@ struct VfsFsOps {
     // Delete a file.  Returns 0 on success.
     int (*unlink)(void* mountPriv, uint8_t pdrv, const char* relPath);
 
-    // Create a directory.  Returns 0 on success.
-    int (*mkdir)(void* mountPriv, uint8_t pdrv, const char* relPath);
+    // Create a directory. POSIX-capable backends apply mode and caller umask
+    // before publishing the inode, and report EEXIST for an occupied name.
+    int (*mkdir)(void* mountPriv, uint8_t pdrv, const char* relPath, uint16_t mode);
 
     // Rename.  Returns 0 on success.
     int (*rename)(void* mountPriv, uint8_t pdrv,
@@ -252,7 +253,7 @@ int VfsUnlink(const char* path);
 int VfsRemovePath(const char* path, bool directory);
 
 // Create a directory.
-int VfsMkdir(const char* path);
+int VfsMkdir(const char* path, uint16_t mode = 0777);
 
 // Rename a file or directory.
 int VfsRename(const char* oldPath, const char* newPath);

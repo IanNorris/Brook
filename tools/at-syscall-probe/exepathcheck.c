@@ -27,8 +27,8 @@ static int run(const char *name, const char *expected, int script) {
     pid_t child = fork();
     if (child < 0) die("fork");
     if (!child) {
-        char *argv[] = {(char *)name, script ? (char *)expected : "--report", (char *)expected, NULL};
-        if (script) argv[2] = NULL;
+        char *argv[] = {(char *)name, script==1 ? (char *)expected : script==2 ? "--reexec-self" : "--report", (char *)expected, NULL};
+        if (script==1) argv[2] = NULL;
         execv(name, argv);
         perror("execv"); _exit(2);
     }
@@ -38,6 +38,11 @@ static int run(const char *name, const char *expected, int script) {
 }
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--report")) return report(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--reexec-self")) {
+        char *args[] = {"brook-self-exec", "--report", argv[2], NULL};
+        execv("/proc/self/exe",args);
+        die("self execv");
+    }
     if (argc == 4 && !strcmp(argv[1], "--interpreter")) {
         // Kernel supplied script spelling must survive interpreter resolution.
         if (!strstr(argv[2], "script-link")) return 3;
@@ -73,6 +78,8 @@ int main(int argc, char **argv) {
     int failures=run(rel,real,0)+run(abs,real,0);
     path(dir,root,"alias/payload"); failures+=run(dir,real,0);
     failures+=run(scriptlink,real,1);
-    printf("EXEPATHCHECK %s cases=4 root=%s\n",failures?"FAIL":"PASS",root);
+    failures+=run("/proc/self/exe",source,0);
+    failures+=run(rel,real,2);
+    printf("EXEPATHCHECK %s cases=6 root=%s\n",failures?"FAIL":"PASS",root);
     return failures != 0;
 }

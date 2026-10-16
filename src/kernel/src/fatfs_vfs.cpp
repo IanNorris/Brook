@@ -903,14 +903,14 @@ static int FatFsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
     return (res == FR_OK) ? 0 : -1;
 }
 
-static int FatFsMkdir(void* /*mountPriv*/, uint8_t pdrv, const char* relPath)
+static int FatFsMkdir(void* /*mountPriv*/, uint8_t pdrv, const char* relPath, uint16_t /*mode*/)
 {
     char fatPath[256];
     BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
     KMutexLock(&g_fatLock);
     FRESULT res = f_mkdir(fatPath);
     KMutexUnlock(&g_fatLock);
-    return (res == FR_OK || res == FR_EXIST) ? 0 : -1;
+    return res == FR_OK ? 0 : (res == FR_EXIST ? -17 : -1);
 }
 
 static int FatFsRename(void* mountPriv, uint8_t pdrv,

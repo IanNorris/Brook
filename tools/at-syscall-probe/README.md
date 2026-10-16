@@ -35,12 +35,16 @@ and SIGKILL/SIGSTOP must remain unblockable. Each case has a 15-second
 fork/wait/monotonic-clock watchdog. Expect 32 checks and
 `WAITMASKCHECK PASS failures=0` on Linux and Brook.
 
-`symlinkcheck.c DIRECTORY` creates or reopens links with target lengths around
+`symlinkcheck.c DIRECTORY [MOUNT_ROOT]` creates or reopens links with target lengths around
 the ext2 inline boundary. It checks exact lstat size, readlink bytes without a
 copied terminator. Inspect the inodes offline to require data-block storage for
 targets of 60 bytes or more (Brook's generic stat block count is estimated). Keep
 the links through checked shutdown and offline fsck, then run again after boot
-to check persistence. Expect six checks and `SYMLINKCHECK PASS failures=0`.
+to check persistence. Missing paths must return ENOENT, regular files/directories
+EINVAL; relative and dirfd reads of dangling links retain their target bytes,
+including truncated buffers. An optional mount root must
+also report EINVAL (thirteen checks with that argument). Expect
+`SYMLINKCHECK PASS failures=0`.
 
 - `devicecheck.c`: takes two different mount roots (Brook: `/data /nix`;
   Linux: `/ /proc`). Verifies device identity across stat/fstat/lstat/fstatat
@@ -708,3 +712,68 @@ recovery after warming caches (one footprint of tolerance). Build static musl wi
 Memory is a bounded growth check, not an exact PMM-reference audit. A host run
 sanity-checks probe logic; only the actual Brook guest demonstrates cancellation.
 The pre-fix kernel 2582aece fails on round zero with retained off-CPU futex threads.
+
+
+`namedshmcheck.c` exercises /dev/shm with unique disposable names and a 60-second
+watchdog. It holds 96 names simultaneously, checks independent opens and stable
+backing identity/CLOEXEC, unlink/recreate isolation while old mappings stay valid,
+fork sharing after descriptor close, and an eight-thread exclusive-create race.
+Require `NAMEDSHMCHECK PASS`; errors are failures rather than an accepted fallback.
+This checks named-open/unlink and descriptor/mapping lifetime, not a complete
+tmpfs implementation (directory enumeration, path stat and permission ownership
+remain separate). The initrd provides /dev/shm for fresh application discovery.
+
+`modecheck.c` additionally checks creat's write-only access, umask and existing
+inode truncation/mode preservation; mkdir/mkdirat check private, zero and sticky
+modes, umask and EEXIST for occupied names. Run the permissions probe on ext2.
+FAT and the experimental lwext4 adapter do not offer ext2's creation-mode contract.
+
+
+`exepathcheck.c` now includes direct execution of /proc/self/exe and a second
+self-reexec after launching through a symlink to a copied ELF. All six cases
+require the resolved executable identity from readlink. The self-reexec supplies
+a custom argv[0]. Brook currently resolves the recorded
+pathname for exec; this is not an inode-pinned magic link surviving unlink or
+rename, and does not implement opening /proc/self/exe as an ordinary descriptor.
+
+
+`eventfdcheck.c` has a 60-second watchdog and checks invalid eventfd2 flags,
+nonblocking empty reads, semaphore reads, descriptor/status flags, close-on-exec
+through a real self-reexec, and concurrent producers while the counter is drained.
+Require `EVENTFDCHECK PASS`; this does not establish overflow or every blocking
+waiter behavior. Chromium's Mojo eventfd feature probe intentionally supplies
+invalid flags, so a successful descriptor there is a startup-fatal false result.
+
+`passcredcheck.c` checks automatic SO_PASSCRED/SCM_CREDENTIALS delivery on a
+connected Unix stream. Ninety-six forked writers use an inherited endpoint;
+the receiver requires each child's actual PID after it has exited, including
+partial reads, rather than the connection-time SO_PEERCRED PID. It also checks
+enable/disable and getsockopt, short setsockopt values, simultaneous memfd rights
+with CLOEXEC, and truncated ancillary output. Build static musl with
+`-O2 -Wall -Wextra -Werror`; expect 887 checks and zero failures on Linux and
+Brook. Automatic credentials use the sender's real UID/GID. Explicit user-supplied
+SCM_CREDENTIALS remains EOPNOTSUPP. The bounded metadata ring backpressures
+writers after 63 pending distinct credential spans; adjacent identical senders
+coalesce. This does not establish datagram/SEQPACKET record boundaries or
+credential-namespace translation. Pipe descriptor passing remains unsupported;
+the rights case deliberately uses a supported memfd.
+
+`discardcheck.c` requires `-pthread` and checks private anonymous
+MADV_DONTNEED: rounded lengths, untouched neighboring pages, zeroed read-only
+and PROT_NONE pages after restoring access, fork isolation, invalid arguments,
+and a sparse 1-GiB reservation. Eight synchronized readers warm translations
+before each of 32 discards and require zero bytes after return. Expect
+`DISCARDCHECK PASS checks=60 failures=0 reader_errors=0 rounds=32` on Linux and
+Brook. Brook currently replaces populated frames eagerly; this verifies content
+and lifetime, not RSS reclamation. File/shared/device discard is unsupported.
+The hosted VMM test separately covers pre-publication OOM rollback, hidden
+leaves, bounded address collection and retirement after a delayed TLB ACK.
+
+`fdcapacitycheck.c` requires RLIMIT_NOFILE >=1024, opens 512 eventfds, registers
+all of them with one epoll instance, writes each, and requires all 512 readiness
+notifications through poll and epoll without duplicates. It drains all counters,
+checks readiness clears, and verifies F_DUPFD_CLOEXEC at descriptor 900. Build
+static musl with `-O2 -Wall -Wextra -Werror`; expect
+`FDCAPACITYCHECK PASS descriptors=512 poll=512 epoll=512 high_fd=900`.
+This checks capacity and descriptor lifecycle, not whether a browser leaks
+descriptors over time.

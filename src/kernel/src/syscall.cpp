@@ -463,7 +463,7 @@ struct EventFdData {
     Process* epollWaiter;  // process blocked in epoll_wait watching this eventfd
 };
 static constexpr uint32_t EFD_SEMAPHORE = 0x01;
-[[maybe_unused]] static constexpr uint32_t EFD_CLOEXEC = 0x80000;
+static constexpr uint32_t EFD_CLOEXEC = 0x80000;
 static constexpr uint32_t EFD_NONBLOCK  = 0x800;
 
 // timerfd constants and data — defined here so sys_read/sys_poll can use them
@@ -492,7 +492,7 @@ struct EpollEvent {
     } data;
 } __attribute__((packed)); // Linux x86_64 ABI: packed to 12 bytes
 
-static constexpr int EPOLL_MAX_FDS = 256;
+static constexpr int EPOLL_MAX_FDS = MAX_FDS;
 
 struct EpollEntry {
     int      fd;      // watched fd (-1 = free)
@@ -937,7 +937,8 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
 // frames and the immutable backing pin through I/O, validation and retirement.
 static bool ResolveMappingFault(uint64_t address,uint64_t error) {
     if (error & 1) return false;
-    Process* actor=ProcessCurrent();if (!actor) return false;
+    Process* actor=ProcessCurrent();
+    if (!actor || !actor->addressSpace || actor->addressSpace->kernel) return false;
     const uint64_t page=address&~uint64_t{4095};
     const uint32_t access=(error&2)?2u:((error&16)?4u:1u);
     for (;;) {
@@ -1061,11 +1062,26 @@ struct UnixFdSnap {
 
 static void UnixFdSnapRelease(const UnixFdSnap* snap);
 
+struct UnixCredentials {
+    int32_t pid;
+    uint32_t uid;
+    uint32_t gid;
+};
+static_assert(sizeof(UnixCredentials) == 12, "Linux ucred ABI");
+static UnixCredentials UnixCurrentCredentials(Process* process)
+{
+    return {static_cast<int32_t>((process->tgid ? process->tgid : process->pid)), process->euid, process->egid};
+}
+
 // FIFO of in-flight fds for one direction of a connected AF_UNIX pair.
 // Shared between sender (enqueue) and receiver (dequeue).
 struct UnixFdQueue {
     UnixFdSnap   msgs[UNIX_FD_QUEUE_CAP];
     uint64_t offsets[UNIX_FD_QUEUE_CAP];
+    // Sender identity belongs to bytes, not the socket's connection-time peer.
+    // Forked children can send through an inherited endpoint.
+    struct CredentialSpan { uint64_t end; UnixCredentials sender; } credentials[UNIX_FD_QUEUE_CAP];
+    uint32_t credentialHead, credentialTail;
     uint64_t written, read;
     volatile int head;
     volatile int tail;
@@ -1078,10 +1094,20 @@ struct UnixFdQueue {
 static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
                                   const char* bytes, uint64_t length,
                                   const UnixFdSnap* descriptors=nullptr, int count=0) {
+    auto* process = ProcessCurrent();
+    const UnixCredentials sender{static_cast<int32_t>(process->tgid ? process->tgid : process->pid),
+        process->uid, process->gid};
     SpinLockAcquire(&pipe->lock);
+    bool merge = false;
+    if (queue && queue->credentialHead != queue->credentialTail) {
+        auto& previous = queue->credentials[(queue->credentialHead + UNIX_FD_QUEUE_CAP - 1) % UNIX_FD_QUEUE_CAP];
+        merge = previous.sender.pid == sender.pid && previous.sender.uid == sender.uid && previous.sender.gid == sender.gid;
+    }
+    const bool credentialRoom = !queue || merge ||
+        (queue->credentialHead + 1) % UNIX_FD_QUEUE_CAP != queue->credentialTail;
     int64_t result=-EAGAIN;
     if (!pipe->readers) result=-EPIPE;
-    else if (pipe->space() &&
+    else if (pipe->space() && credentialRoom &&
              (!count || (queue && (queue->head-queue->tail+UNIX_FD_QUEUE_CAP)%UNIX_FD_QUEUE_CAP+count<UNIX_FD_QUEUE_CAP))) {
         uint32_t n=pipe->space();if (length<n)n=static_cast<uint32_t>(length);
         if (n) {
@@ -1094,7 +1120,14 @@ static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
             memcpy(pipe->data+pipe->head,bytes,first);
             if(n>first)memcpy(pipe->data,bytes+first,n-first);
             pipe->head=(pipe->head+n)%pipe->capacity;
-            if(queue)queue->written+=n;
+            if(queue) {
+                queue->written += n;
+                if (merge) queue->credentials[(queue->credentialHead + UNIX_FD_QUEUE_CAP - 1) % UNIX_FD_QUEUE_CAP].end = queue->written;
+                else {
+                    queue->credentials[queue->credentialHead] = {queue->written, sender};
+                    queue->credentialHead = (queue->credentialHead + 1) % UNIX_FD_QUEUE_CAP;
+                }
+            }
         }
         result=n;
     }
@@ -1102,10 +1135,15 @@ static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
 }
 static uint32_t UnixStreamTryRead(PipeBuffer* pipe, UnixFdQueue* queue,
                                   char* bytes, uint64_t length,
-                                  UnixFdSnap* descriptors, int& count) {
+                                  UnixFdSnap* descriptors, int& count, UnixCredentials* sender) {
     count=0;SpinLockAcquire(&pipe->lock);
     uint32_t n=pipe->count();if(length<n)n=static_cast<uint32_t>(length);
     if(queue && n) {
+        if (sender && queue->credentialTail != queue->credentialHead) {
+            auto& span = queue->credentials[queue->credentialTail];
+            *sender = span.sender;
+            if (span.end - queue->read < n) n = static_cast<uint32_t>(span.end - queue->read);
+        }
         // Stop before the next distinct descriptor group. A one-byte receive
         // must never collect rights attached to a later byte in the stream.
         bool first=true;uint64_t offset=0;
@@ -1122,6 +1160,9 @@ static uint32_t UnixStreamTryRead(PipeBuffer* pipe, UnixFdQueue* queue,
             queue->tail=(queue->tail+1)%UNIX_FD_QUEUE_CAP;
         }
         queue->read+=n;
+        while (queue->credentialTail != queue->credentialHead &&
+               queue->credentials[queue->credentialTail].end <= queue->read)
+            queue->credentialTail = (queue->credentialTail + 1) % UNIX_FD_QUEUE_CAP;
     }
     uint32_t first=pipe->capacity-pipe->tail;if(first>n)first=n;
     if(n)memcpy(bytes,pipe->data+pipe->tail,first);
@@ -1137,17 +1178,6 @@ static inline int UnixFdQueueCount(const UnixFdQueue* q)
 [[maybe_unused]] static inline bool UnixFdQueueFull(const UnixFdQueue* q)
 {
     return UnixFdQueueCount(q) >= UNIX_FD_QUEUE_CAP - 1;
-}
-
-struct UnixCredentials {
-    int32_t pid;
-    uint32_t uid;
-    uint32_t gid;
-};
-static_assert(sizeof(UnixCredentials) == 12, "Linux ucred ABI");
-static UnixCredentials UnixCurrentCredentials(Process* process)
-{
-    return {static_cast<int32_t>((process->tgid ? process->tgid : process->pid)), process->euid, process->egid};
 }
 
 struct UnixPendingConn {
@@ -1166,6 +1196,7 @@ struct UnixSocketData {
     enum class State : uint8_t { Unbound, Listening, Connected };
     State   state;
     bool    nonblock;
+    bool    passCredentials; // SO_PASSCRED; accessed atomically through shared fds
     volatile uint32_t refCount; // +1 per fd pointing at this struct
     uint32_t socketType;       // creation type (without NONBLOCK/CLOEXEC flags)
     UnixCredentials peerCredentials; // connection/listen snapshot; registry lock protects copies
@@ -1485,13 +1516,14 @@ static int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
     }
 }
 static int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
-                                  char* bytes,uint64_t length,UnixFdSnap* descriptors,int& count) {
+                                  char* bytes,uint64_t length,UnixFdSnap* descriptors,int& count,
+                                  UnixCredentials* sender=nullptr) {
     count=0;
     if(socket->state!=UnixSocketData::State::Connected || !socket->rxPipe)return -ENOTCONN;
     if(!length)return 0;
     auto* pipe=socket->rxPipe;
     for(;;) {
-        auto n=UnixStreamTryRead(pipe,socket->incomingFds,bytes,length,descriptors,count);
+        auto n=UnixStreamTryRead(pipe,socket->incomingFds,bytes,length,descriptors,count,sender);
         if(n) {
             if(auto* writer=pipe->writerWaiter) {pipe->writerWaiter=nullptr;WakeProcess(writer);}
             PipeWakeEpoll(pipe);return n;
@@ -2405,12 +2437,12 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             uint64_t val = __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE);
             if (val > 0)
             {
-                if (efd->flags & EFD_SEMAPHORE) {
-                    __atomic_fetch_sub(&efd->counter, 1, __ATOMIC_ACQ_REL);
-                    val = 1;
-                } else {
-                    __atomic_store_n(&efd->counter, 0ULL, __ATOMIC_RELEASE);
-                }
+                const bool semaphore=(efd->flags&EFD_SEMAPHORE)!=0;
+                const uint64_t next=semaphore?val-1:0;
+                // A concurrent write must not disappear between the old load
+                // and reset, nor may competing semaphore readers underflow.
+                if(!__atomic_compare_exchange_n(&efd->counter,&val,next,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))continue;
+                if(semaphore)val=1;
                 *reinterpret_cast<uint64_t*>(bufAddr) = val;
                 return 8;
             }
@@ -2567,6 +2599,68 @@ static bool StrEq(const char* a, const char* b)
 {
     while (*a && *b) { if (*a++ != *b++) return false; }
     return *a == *b;
+}
+
+// A name owns one backing reference independently of descriptors/mappings.
+// Open and unlink serialize the name-to-object binding; final backing release
+// happens after dropping this namespace lock. Names are dynamically allocated.
+struct NamedShmEntry { char name[256]; MemFdData* backing; NamedShmEntry* next; };
+static NamedShmEntry* g_namedShm;
+static KMutex g_namedShmLock{};
+struct NamedShmGuard {
+    NamedShmGuard() { KMutexLock(&g_namedShmLock); }
+    ~NamedShmGuard() { KMutexUnlock(&g_namedShmLock); }
+};
+static int NamedShmValidate(const char* name) {
+    const uint64_t length=strlen(name);
+    if(!length)return -EINVAL;
+    if(length>=sizeof(NamedShmEntry::name))return -36;
+    if(StrEq(name,".") || StrEq(name,".."))return -21; // EISDIR
+    for(uint64_t i=0;i<length;++i)if(name[i]=='/')return -EINVAL;
+    return 0;
+}
+static int NamedShmOpen(Process* proc,const char* name,uint32_t flags) {
+    KernelOperationGuard operation(proc);
+    int error=NamedShmValidate(name);if(error)return error;
+    if((flags&3)==3)return -EINVAL;
+    if(flags&0x10000u)return -ENOTDIR;
+    if(flags&0x200u)return -95; // mapped truncate needs coordinated invalidation
+    NamedShmEntry* discard=nullptr;int fd;
+    {
+        NamedShmGuard held;
+        NamedShmEntry* entry=g_namedShm;
+        while(entry && !StrEq(entry->name,name))entry=entry->next;
+        const bool create=(flags&0x40u)!=0;
+        if(entry && create && (flags&0x80u))return -17;
+        if(!entry && !create)return -ENOENT;
+        const bool fresh=!entry;
+        if(fresh) {
+            entry=static_cast<NamedShmEntry*>(kmalloc(sizeof(NamedShmEntry)));
+            if(!entry)return -ENOMEM;
+            auto* backing=static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
+            if(!backing) { kfree(entry);return -ENOMEM; }
+            *backing={NextMemFdInode(),nullptr,0,0,0,0,1};
+            memcpy(entry->name,name,strlen(name)+1);
+            entry->backing=backing;entry->next=g_namedShm;g_namedShm=entry;
+        }
+        fd=MemFdInstall(proc,entry->backing,flags);
+        if(fd<0 && fresh) { g_namedShm=entry->next;discard=entry; }
+    }
+    if(discard) { MemFdUnref(discard->backing);kfree(discard); }
+    return fd;
+}
+static int NamedShmUnlink(const char* name) {
+    KernelOperationGuard operation(ProcessCurrent());
+    int error=NamedShmValidate(name);if(error)return error;
+    NamedShmEntry* removed;
+    {
+        NamedShmGuard held;auto** link=&g_namedShm;
+        while(*link && !StrEq((*link)->name,name))link=&(*link)->next;
+        if(!*link)return -ENOENT;
+        removed=*link;*link=removed->next;
+    }
+    MemFdUnref(removed->backing);kfree(removed);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2994,68 +3088,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         lookupPath[4] == '/' && lookupPath[5] == 's' && lookupPath[6] == 'h' &&
         lookupPath[7] == 'm' && lookupPath[8] == '/')
     {
-        static constexpr int SHM_MAX = 32;
-        struct ShmEntry { char name[64]; MemFdData* mfd; bool used; };
-        static ShmEntry s_shm[SHM_MAX];
-        static KMutex namespaceLock{};
-        struct NamespaceGuard {
-            KMutex* lock;
-            explicit NamespaceGuard(KMutex* p) : lock(p) { KMutexLock(lock); }
-            ~NamespaceGuard() { KMutexUnlock(lock); }
-        } namespaceGuard(&namespaceLock);
-
-        const char* shmName = lookupPath + 9; // skip "/dev/shm/"
-        uint32_t nameLength = strlen(shmName);
-        if (!nameLength) return -EINVAL;
-        if (nameLength >= sizeof(ShmEntry::name)) return -36;
-        for (uint32_t i = 0; i < nameLength; ++i) if (shmName[i] == '/') return -EINVAL;
-        static constexpr uint64_t LINUX_O_CREAT_SHM  = 0x40;
-        static constexpr uint64_t LINUX_O_TRUNC_SHM  = 0x200;
-        bool create = (flags & LINUX_O_CREAT_SHM) != 0;
-        bool trunc  = (flags & LINUX_O_TRUNC_SHM) != 0;
-        if ((flags & 3) == 3) return -EINVAL;
-        if (trunc) return -95; // Needs mapped-object invalidation, not page freeing.
-
-
-        // Find existing entry
-        ShmEntry* entry = nullptr;
-        for (int i = 0; i < SHM_MAX; i++) {
-            if (!s_shm[i].used) continue;
-            const char* a = s_shm[i].name; const char* b = shmName;
-            bool match = true;
-            while (*a || *b) { if (*a++ != *b++) { match = false; break; } }
-            if (match) { entry = &s_shm[i]; break; }
-        }
-
-        if (entry && create && (flags & 0x80)) return -17;
-        if (!entry && !create) return -ENOENT;
-
-        if (!entry) {
-            // Allocate new shm entry
-            for (int i = 0; i < SHM_MAX; i++) {
-                if (!s_shm[i].used) { entry = &s_shm[i]; break; }
-            }
-            if (!entry) return -ENOMEM;
-            for (int i = 0; i < 63 && shmName[i]; i++) entry->name[i] = shmName[i];
-            entry->name[nameLength] = 0;
-            entry->mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
-            if (!entry->mfd) return -ENOMEM;
-            entry->mfd->inode = NextMemFdInode();
-            entry->mfd->pageMap = nullptr;
-            entry->mfd->pageMapCount = 0;
-            entry->mfd->size = 0;
-            entry->mfd->capacity = 0;
-            entry->mfd->lock = 0;
-            // The bounded namespace owns a reference independently of open
-            // descriptors; otherwise closing the last fd leaves a dangling entry.
-            entry->mfd->refCount = 1;
-            entry->used = true;
-        }
-
-        int fd = MemFdInstall(proc, entry->mfd, static_cast<uint32_t>(flags));
-        if (fd < 0) return fd;
-        SerialPrintf("shm_open: '%s' fd=%d size=%llu\n", shmName, fd, entry->mfd->size);
-        return fd;
+        return NamedShmOpen(proc,lookupPath+9,static_cast<uint32_t>(flags));
     }
 
     // Translate Linux open flags to VFS flags
@@ -3190,6 +3223,12 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     }
 
     return fd;
+}
+
+// Linux creat is precisely open(O_WRONLY|O_CREAT|O_TRUNC), including mode,
+// umask, descriptor access and the regular-file truncate/mapping safeguards.
+static int64_t sys_creat(uint64_t path,uint64_t mode,uint64_t,uint64_t,uint64_t,uint64_t) {
+    return sys_open(path,0x1u|0x40u|0x200u,mode,0,0,0);
 }
 
 // ---------------------------------------------------------------------------
@@ -4471,6 +4510,16 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
         kArgv[argc++] = argBuf;
     }
 resolve_path:
+    // Procfs exposes executable identity as a virtual path. Resolve self before
+    // opening an ELF; reading procfs' path-text entry is not an executable image.
+    // Keep argv unchanged, including a caller-provided argv[0]. This path-based
+    // lookup does not yet retain an executable inode across unlink/rename.
+    if(StrEq(kPath,"/proc/self/exe")) {
+        if(!proc->exePath[0])return -ENOENT;
+        const uint64_t bytes=strlen(proc->exePath)+1;
+        if(bytes>sizeof(kPath))return -36;
+        memcpy(kPath,proc->exePath,bytes);
+    }
     char resolvedPath[256];
     bool found = false;
 
@@ -8147,7 +8196,7 @@ static int64_t DoReadlink(const char* path, uint64_t bufAddr, uint64_t bufsiz)
     if (r >= 0 && !CopyToUser(bufAddr, linkTarget, static_cast<uint64_t>(r)))
         return -EFAULT;
     if (r >= 0) return static_cast<int64_t>(r);
-    return -EINVAL;
+    return r;
 }
 
 static int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz,
@@ -8156,7 +8205,9 @@ static int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz
     char path[256];
     if (!CopyUserCString(pathAddr, path, sizeof(path)))
         return -EFAULT;
-    return DoReadlink(path, bufAddr, bufsiz);
+    char resolved[256];
+    if (!ResolveAtPath(-100,path,resolved,sizeof(resolved))) return -ENOENT;
+    return DoReadlink(resolved, bufAddr, bufsiz);
 }
 
 static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAddr,
@@ -8240,20 +8291,24 @@ static int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
     Process* proc = ProcessCurrent();
     if (!proc) return -EMFILE;
 
+    const uint32_t flags=static_cast<uint32_t>(flagsVal);
+    if(flags & ~(EFD_SEMAPHORE|EFD_CLOEXEC|EFD_NONBLOCK))return -EINVAL;
+    KernelOperationGuard operation(proc);
+
     auto* efd = static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
     if (!efd) return -ENOMEM;
 
-    efd->counter = initval;
-    efd->flags = static_cast<uint32_t>(flagsVal);
+    efd->counter = static_cast<uint32_t>(initval);
+    efd->flags = flags;
     efd->refCount = 1;
     efd->readerWaiter = nullptr;
     efd->epollWaiter = nullptr;
 
-    int fd = FdAlloc(proc, FdType::EventFd, efd);
+    FdEntry entry{};entry.type=FdType::EventFd;entry.handle=efd;
+    entry.statusFlags=2u|((flags&EFD_NONBLOCK)?0x800u:0u);
+    entry.fdFlags=(flags&EFD_CLOEXEC)?1:0;
+    int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
     if (fd < 0) { kfree(efd); return -EMFILE; }
-
-    if (flagsVal & EFD_NONBLOCK)
-        proc->fds[fd].statusFlags = 0x800; // O_NONBLOCK
 
     DbgPrintf("sys_eventfd2: fd=%d initval=%lu flags=0x%lx\n", fd, initval, flagsVal);
     return fd;
@@ -9187,10 +9242,7 @@ static int64_t DoUnlink(const char* path, bool directory)
     // /dev/shm/<name> — shm_unlink: mark entry as free
     if (!directory && path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' &&
         path[4]=='/' && path[5]=='s' && path[6]=='h' && path[7]=='m' && path[8]=='/') {
-        // Leave the MemFdData alive (other fds may still reference it)
-        // Just make it invisible to future shm_open calls
-        SerialPrintf("shm_unlink: '%s' (ignored — fds stay valid)\n", path + 9);
-        return 0;
+        return NamedShmUnlink(path+9);
     }
 
     // Try as-is first, then with /boot prefix
@@ -9253,32 +9305,33 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
     return -ENOENT;
 }
 
-static int64_t DoMkdir(const char* path)
+static int64_t DoMkdir(const char* path, uint16_t mode)
 {
     char resolved[256];
     if (!ResolveAtPath(-100, path, resolved, sizeof(resolved))) return -ENOENT;
     path = resolved;
 
-    int rc = VfsMkdir(path);
+    int rc = VfsMkdir(path,mode);
     if (rc == 0) return 0;
+    if (rc != -1 && rc != -ENOENT) return rc;
 
     char bootPath[256] = "/boot";
     uint32_t bi = 5;
     for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
         bootPath[bi++] = *p;
     bootPath[bi] = '\0';
-    rc = VfsMkdir(bootPath);
+    rc = VfsMkdir(bootPath,mode);
     if (rc == 0) return 0;
 
-    return -ENOENT;
+    return rc == -1 ? -ENOENT : rc;
 }
 
-static int64_t sys_mkdir(uint64_t pathAddr, uint64_t, uint64_t,
+static int64_t sys_mkdir(uint64_t pathAddr, uint64_t mode, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
     char pathBuf[256];
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    return DoMkdir(pathBuf);
+    return DoMkdir(pathBuf,static_cast<uint16_t>(mode));
 }
 
 // ---------------------------------------------------------------------------
@@ -9294,8 +9347,7 @@ static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
     char resolved[256];
     if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
         return -EBADF;
-    (void)mode;
-    return DoMkdir(resolved);
+    return DoMkdir(resolved,static_cast<uint16_t>(mode));
 }
 
 // ---------------------------------------------------------------------------
@@ -9865,13 +9917,20 @@ static int64_t sys_mincore(uint64_t addr, uint64_t length, uint64_t vecAddr,
 }
 
 // ---------------------------------------------------------------------------
-// sys_madvise (28) — memory advice (stub: succeed)
+// sys_madvise (28) — private anonymous discard plus optional locality hints
 // ---------------------------------------------------------------------------
 
-static int64_t sys_madvise(uint64_t, uint64_t, uint64_t,
+static int64_t sys_madvise(uint64_t address, uint64_t length, uint64_t advice,
                             uint64_t, uint64_t, uint64_t)
 {
-    return 0; // no-op
+    auto* proc=ProcessCurrent();
+    if (!proc) return -EINVAL;
+    if (advice==4) return UserMappingDiscardAnonymous(proc,proc->addressSpace,address,length);
+    constexpr uint64_t limit=0x0000800000000000ULL;
+    if ((address&4095) || address>=limit || length>limit-address) return -EINVAL;
+    // Optional locality / hugepage hints do not promise changed contents.
+    if (advice<=3 || advice==14 || advice==15) return 0;
+    return -EINVAL; // Never claim FREE/REMOVE/fork-inheritance semantics.
 }
 
 static int64_t sys_fadvise64(uint64_t, uint64_t, uint64_t,
@@ -11933,10 +11992,24 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     return static_cast<int64_t>(ret);
 }
 
-static int64_t sys_setsockopt(uint64_t, uint64_t, uint64_t,
-                               uint64_t, uint64_t, uint64_t)
+static int64_t sys_setsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optionVal,
+                               uint64_t valueAddr, uint64_t length, uint64_t)
 {
-    return 0; // stub — pretend success
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc, static_cast<int>(fdVal));
+    if (!descriptor) return -EBADF;
+    if (descriptor->type != FdType::UnixSocket && descriptor->type != FdType::Socket) return -88;
+    if (descriptor->type == FdType::UnixSocket && levelVal == 1 && optionVal == 16) {
+        if (length < sizeof(int32_t)) return -EINVAL;
+        if (!UserBufferReadable(valueAddr, sizeof(int32_t))) return -EFAULT;
+        auto* socket = static_cast<UnixSocketData*>(descriptor->handle);
+        __atomic_store_n(&socket->passCredentials,
+            *reinterpret_cast<const int32_t*>(valueAddr) != 0, __ATOMIC_RELEASE);
+        return 0;
+    }
+    return 0; // Existing unsupported socket options still use the legacy stub.
 }
 
 static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnameVal,
@@ -11969,6 +12042,9 @@ static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnam
     if (entry->type == FdType::UnixSocket) {
         auto* socket = static_cast<UnixSocketData*>(entry->handle);
         switch (option) {
+        case 16: // SO_PASSCRED
+            value = __atomic_load_n(&socket->passCredentials, __ATOMIC_ACQUIRE) ? 1 : 0;
+            break;
         case 17: // SO_PEERCRED (struct ucred), immutable connection identity.
             SpinLockAcquire(&g_unixRegistryLock);
             credentials = socket->peerCredentials;
@@ -12481,6 +12557,12 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
             if (cm->cmsg_len < sizeof(CmsgHdr) || cm->cmsg_len > msg->msg_controllen - off)
                 break;
 
+            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == 2) {
+                // Automatic sender credentials are supported. Explicit user
+                // credentials require separate identity/capability validation.
+                for (int j = 0; j < pendingCount; ++j) UnixFdSnapRelease(&pendingSnaps[j]);
+                return -95;
+            }
             if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
                 uint64_t dataLen = cm->cmsg_len - sizeof(CmsgHdr);
                 uint64_t nFds    = dataLen / sizeof(int);
@@ -12599,6 +12681,8 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         const uint64_t capacity=msg->msg_controllen;
         UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;
         int64_t total=0;
+        const bool passCredentials = __atomic_load_n(&usd->passCredentials, __ATOMIC_ACQUIRE);
+        UnixCredentials sender{};
         for(uint64_t i=0;i<msg->msg_iovlen;++i) {
             auto& iov=msg->msg_iov[i];if(!iov.iov_len)continue;
             if(!UserBufferWritable(reinterpret_cast<uint64_t>(iov.iov_base),iov.iov_len)) {
@@ -12607,32 +12691,47 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
             }
             int count=0;
             auto n=UnixSocketReadSome(usd,dontwait || total>0 || (fde->statusFlags&0x800),
-                static_cast<char*>(iov.iov_base),iov.iov_len,descriptors,count);
+                static_cast<char*>(iov.iov_base),iov.iov_len,descriptors,count,passCredentials ? &sender : nullptr);
             received=count;
             if(n<0 && !total)return n;
             if(n>0)total+=n;
-            if(n<=0 || static_cast<uint64_t>(n)<iov.iov_len || received)break;
+            if(n<=0 || static_cast<uint64_t>(n)<iov.iov_len || received || passCredentials)break;
         }
         msg->msg_flags=0;msg->msg_controllen=0;
-        uint64_t maxFds=capacity>=sizeof(CmsgHdr)?(capacity-sizeof(CmsgHdr))/sizeof(int):0;
+        uint64_t controlUsed = 0;
+        if (passCredentials && total > 0) {
+            const uint64_t required = sizeof(CmsgHdr) + sizeof(sender);
+            if (capacity >= sizeof(CmsgHdr)) {
+                auto* header = static_cast<CmsgHdr*>(msg->msg_control);
+                uint64_t copied = capacity < required ? capacity : required;
+                header->cmsg_len = copied;
+                header->cmsg_level = SOL_SOCKET; header->cmsg_type = 2; // SCM_CREDENTIALS
+                if (copied > sizeof(CmsgHdr)) memcpy(header + 1, &sender, copied - sizeof(CmsgHdr));
+                controlUsed = CmsgAlign(copied); if (controlUsed > capacity) controlUsed = capacity;
+                msg->msg_controllen = controlUsed;
+            }
+            if (capacity < required) msg->msg_flags |= 0x8;
+        }
+        const uint64_t remaining = capacity - controlUsed;
+        uint64_t maxFds=remaining>=sizeof(CmsgHdr)?(remaining-sizeof(CmsgHdr))/sizeof(int):0;
         int installed=0;
         for(int i=0;i<received;++i) {
             if(static_cast<uint64_t>(installed)<maxFds) {
                 descriptors[i].fdFlags=(flagsVal&0x40000000ULL)?1:0;
                 int installedFd=UnixFdSnapInstall(proc,&descriptors[i]);
                 if(installedFd>=0) {
-                    auto* slots=reinterpret_cast<int*>(reinterpret_cast<uint64_t>(msg->msg_control)+sizeof(CmsgHdr));
+                    auto* slots=reinterpret_cast<int*>(reinterpret_cast<uint64_t>(msg->msg_control)+controlUsed+sizeof(CmsgHdr));
                     slots[installed++]=installedFd;continue;
                 }
             }
             msg->msg_flags|=0x8;UnixFdSnapRelease(&descriptors[i]);
         }
         if(installed) {
-            auto* header=static_cast<CmsgHdr*>(msg->msg_control);
+            auto* header=reinterpret_cast<CmsgHdr*>(reinterpret_cast<uint64_t>(msg->msg_control)+controlUsed);
             header->cmsg_len=sizeof(CmsgHdr)+installed*sizeof(int);
             header->cmsg_level=SOL_SOCKET;header->cmsg_type=SCM_RIGHTS;
             uint64_t used=CmsgAlign(header->cmsg_len);
-            msg->msg_controllen=used<capacity?used:capacity;
+            msg->msg_controllen=controlUsed+(used<remaining?used:remaining);
         }
         return total;
     }
@@ -12725,6 +12824,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_READ]            = sys_read;
     g_syscallTable[SYS_WRITE]           = sys_write;
     g_syscallTable[SYS_OPEN]            = sys_open;
+    g_syscallTable[SYS_CREAT]           = sys_creat;
     g_syscallTable[SYS_CLOSE]           = sys_close;
     g_syscallTable[SYS_STAT]            = sys_stat;
     g_syscallTable[SYS_FSTAT]           = sys_fstat;
@@ -13097,7 +13197,7 @@ static const char* SyscallName(uint64_t num)
     case 79: return "getcwd";     case 80: return "chdir";
     case 81: return "fchdir";     case 82: return "rename";
     case 83: return "mkdir";      case 84: return "rmdir";      case 87: return "unlink";
-    case 88: return "symlink";    case 89: return "readlink";   case 95: return "umask";
+    case 85: return "creat";       case 88: return "symlink";    case 89: return "readlink";   case 95: return "umask";
     case 96: return "gettimeofday"; case 97: return "getrlimit";
     case 98: return "getrusage";  case 99: return "sysinfo";
     case 102: return "getuid";    case 104: return "getgid";

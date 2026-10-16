@@ -490,6 +490,27 @@ bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* c
     IrqSpinLockRelease(&g_userPtLock,irq);
     return result;
 }
+struct CollectAddresses { uint64_t* addresses; uint64_t count; };
+static uint64_t CollectAddress(VirtualAddress address, uint64_t leaf, void* opaque) {
+    auto& collected = *static_cast<CollectAddresses*>(opaque);
+    collected.addresses[collected.count++] = address.raw();
+    return leaf;
+}
+bool VmmCollectRangeAddresses(PageTable pt, uint64_t begin, uint64_t end,
+                              uint64_t* addresses, uint64_t capacity, uint64_t* count) {
+    if (!count || (capacity && !addresses) || !ValidLeafRange(pt,begin,end)) return false;
+    *count = 0;
+    uint64_t irq = IrqSpinLockAcquire(&g_userPtLock);
+    auto* table = reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
+    uint64_t required = 0;
+    bool result = WalkLeafRange(table,4,0,begin,end,false,nullptr,nullptr,required) && required <= capacity;
+    if (result && required) {
+        CollectAddresses collected{addresses,0};
+        result = WalkLeafRange(table,4,0,begin,end,false,nullptr,&collected,*count,CollectAddress);
+    }
+    IrqSpinLockRelease(&g_userPtLock,irq);
+    return result;
+}
 bool VmmDetachRange(PageTable pt, uint64_t begin, uint64_t end, uint64_t capacity,
                     VmmRetireLeaf retire, void* context, uint64_t* count)
 {

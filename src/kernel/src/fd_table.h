@@ -27,7 +27,9 @@
 namespace brook {
 
 // Maximum number of open file descriptors per process.
-static constexpr uint32_t MAX_FDS = 256;
+// Stock browsers exceed 256 descriptors with a single media-heavy tab. Keep
+// this capacity consistent with the reported RLIMIT_NOFILE and poll/select.
+static constexpr uint32_t MAX_FDS = 1024;
 
 enum class FdType : uint8_t
 {

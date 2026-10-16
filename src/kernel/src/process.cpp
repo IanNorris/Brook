@@ -925,7 +925,7 @@ static void CloseFdEntry(Process* proc, uint32_t i)
 void ProcessCloseCloexecFds(Process* proc)
 {
     ProcessOperationGuard operation(ProcessCurrent());
-    if (!proc) return;
+    if (!proc || !proc->fds) return;
     SpinLockAcquire(ProcessFdLock(proc));
     for (uint32_t i = 0; i < MAX_FDS; ++i)
     {
@@ -942,7 +942,9 @@ void ProcessCloseCloexecFds(Process* proc)
 void ProcessCloseAllFds(Process* proc)
 {
     ProcessOperationGuard operation(ProcessCurrent());
-    if (!proc) return;
+    // Kernel tasks have no descriptor table. Never scan through a null table
+    // on exit (small tables previously hid this behind low identity mappings).
+    if (!proc || !proc->fds) return;
 
     SpinLockAcquire(ProcessFdLock(proc));
     for (uint32_t i = 0; i < MAX_FDS; ++i)

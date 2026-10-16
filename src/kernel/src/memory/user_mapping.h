@@ -15,6 +15,9 @@ struct UserMappingRequest {
 int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMappingRequest& request);
 int64_t UserMappingRemove(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length);
 int64_t UserMappingProtect(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length, uint32_t protection);
+// Replace populated private anonymous pages with zeroed frames, preserving
+// metadata/protections and fork peers. Old references retire after full TLB ACK.
+int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length);
 // Destination must be a fresh, unpublished user AS. Failure leaves its partial
 // clone owned by destination teardown, which the caller must destroy. Parent
 // CoW downgrades may remain after failure; they are acknowledged before return.

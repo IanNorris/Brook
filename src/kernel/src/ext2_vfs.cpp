@@ -3108,7 +3108,7 @@ static int Ext2FsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
     return Ext2FsRemovePath(mountPriv, pdrv, relPath, false);
 }
 
-static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
+static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath, uint16_t mode)
 {
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
@@ -3128,7 +3128,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     // Check if already exists
     if (Ext2DirLookup(mnt, parentIno, &parentData, name)) {
         KRwLockWriteUnlock(&g_ext2Lock);
-        return 0; // Already exists, not an error (like FAT driver)
+        return -17; // EEXIST; never claim to have created an existing name.
     }
 
     // Allocate inode
@@ -3141,7 +3141,7 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath)
     {
         Process* cur = ProcessCurrent();
         uint16_t mask = cur ? cur->umask : 022;
-        newData.i_mode = EXT2_S_IFDIR | (0777 & ~mask);
+        newData.i_mode = EXT2_S_IFDIR | (mode & 01777 & ~mask);
         newData.i_uid = cur ? static_cast<uint16_t>(cur->euid) : 0;
         newData.i_gid = cur ? static_cast<uint16_t>(cur->egid) : 0;
     }
@@ -3476,16 +3476,16 @@ static int Ext2FsReadlink(void* mountPriv, uint8_t pdrv,
     // then look up the name directly in the parent directory.
     char name[256];
     uint32_t parentIno = Ext2ResolveParent(mnt, relPath, name, sizeof(name));
-    if (!parentIno || !name[0]) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
+    if (!parentIno || !name[0]) { KRwLockReadUnlock(&g_ext2Lock); return -2; }
 
     Ext2Inode parentData;
-    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockReadUnlock(&g_ext2Lock); return -5; }
 
     uint32_t ino = Ext2DirLookup(mnt, parentIno, &parentData, name);
-    if (!ino) { KRwLockReadUnlock(&g_ext2Lock); return -22; } // -EINVAL
+    if (!ino) { KRwLockReadUnlock(&g_ext2Lock); return -2; } // -ENOENT
 
     Ext2Inode inodeData;
-    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
+    if (!Ext2ReadInode(mnt, ino, &inodeData)) { KRwLockReadUnlock(&g_ext2Lock); return -5; }
 
     if ((inodeData.i_mode & EXT2_S_IFMT) != EXT2_S_IFLNK) {
         KRwLockReadUnlock(&g_ext2Lock);
@@ -3493,7 +3493,7 @@ static int Ext2FsReadlink(void* mountPriv, uint8_t pdrv,
     }
 
     char* target = Ext2ReadSymlink(mnt, &inodeData);
-    if (!target) { KRwLockReadUnlock(&g_ext2Lock); return -1; }
+    if (!target) { KRwLockReadUnlock(&g_ext2Lock); return -5; }
 
     uint32_t targetLen = 0;
     for (const char* p = target; *p; ++p) ++targetLen;

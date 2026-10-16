@@ -38,7 +38,8 @@ namespace brook {
 // ABI 12 moves task mappings into a shared AddressSpaceState.
 // ABI 13 appends a stable file-object accessor to VnodeOps.
 // ABI 14 adds file registrations to range tables and file identity to mapping backings.
-static constexpr uint32_t MODULE_ABI_VERSION = 14;
+// ABI 15 carries the requested creation mode through VfsFsOps::mkdir.
+static constexpr uint32_t MODULE_ABI_VERSION = 15;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

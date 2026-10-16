@@ -95,8 +95,51 @@ static void fixture(const char *directory)
     mode_is(path, fd, 0000, "new zero-mode inode can be opened by creator");
     close(fd);
     unlink(path);
+    umask(0027);
+    fd=creat(path,0666);if(fd<0)fatal("creat new");
+    mode_is(path,fd,0640,"creat applies requested mode and umask");
+    check((fcntl(fd,F_GETFL)&O_ACCMODE)==O_WRONLY,"creat opens write-only");
+    if(write(fd,"payload",7)!=7)fatal("creat write");
+    close(fd);
+    fd=creat(path,0777);if(fd<0)fatal("creat truncate");
+    struct stat truncated;if(fstat(fd,&truncated))fatal("creat fstat");
+    check(truncated.st_size==0&&(truncated.st_mode&07777)==0640,
+          "creat existing truncates contents and preserves inode mode");
+    close(fd);unlink(path);
     close(dir);
     umask(oldmask);
+}
+static void directory_fixture(const char *directory)
+{
+    char path[512],name[64];
+    snprintf(name,sizeof(name),"mkdir-mode-%ld",(long)getpid());
+    if(snprintf(path,sizeof(path),"%s/%s",directory,name)>=(int)sizeof(path))exit(2);
+    mode_t oldmask=umask(0022);struct stat st;
+    if(mkdir(path,0700))fatal("mkdir 0700");
+    check(!stat(path,&st)&&S_ISDIR(st.st_mode)&&(st.st_mode&07777)==0700,
+          "mkdir preserves private 0700 before publication");
+    errno=0;int result=mkdir(path,0777);
+    check(result==-1&&errno==EEXIST&&!stat(path,&st)&&(st.st_mode&07777)==0700,
+          "existing directory returns EEXIST and keeps mode");
+    if(rmdir(path))fatal("rmdir private");
+    umask(0027);
+    int dir=open(directory,O_RDONLY|O_DIRECTORY);if(dir<0)fatal("mkdirat directory");
+    if(mkdirat(dir,name,0777))fatal("mkdirat umask");
+    check(!fstatat(dir,name,&st,0)&&S_ISDIR(st.st_mode)&&(st.st_mode&07777)==0750,
+          "mkdirat applies requested mode and umask");
+    if(unlinkat(dir,name,AT_REMOVEDIR))fatal("unlinkat directory");
+    if(mkdirat(dir,name,0000))fatal("mkdirat zero mode");
+    check(!fstatat(dir,name,&st,0)&&(st.st_mode&07777)==0000,"mkdirat preserves zero mode");
+    if(unlinkat(dir,name,AT_REMOVEDIR))fatal("unlinkat zero mode");
+    umask(0022);
+    if(mkdirat(dir,name,01777))fatal("mkdirat sticky mode");
+    check(!fstatat(dir,name,&st,0)&&(st.st_mode&07777)==01755,"mkdirat preserves sticky bit");
+    if(unlinkat(dir,name,AT_REMOVEDIR))fatal("unlinkat sticky mode");
+    int regular=openat(dir,name,O_CREAT|O_EXCL|O_WRONLY,0600);if(regular<0)fatal("create occupied name");
+    close(regular);errno=0;result=mkdirat(dir,name,0700);
+    check(result==-1&&errno==EEXIST,"mkdirat existing regular file returns EEXIST");
+    if(unlinkat(dir,name,0))fatal("unlink occupied name");
+    close(dir);umask(oldmask);
 }
 int main(int argc, char **argv)
 {
@@ -107,6 +150,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         if (argv[i][0] != '/') return 2;
         fixture(argv[i]);
+        directory_fixture(argv[i]);
     }
     printf("MODECHECK %s failures=%d\n", failures ? "FAIL" : "PASS", failures);
     return failures != 0;
