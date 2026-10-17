@@ -44,7 +44,8 @@
   Persistent HOME/XDG now passes a fresh-volume reboot test; establish matching passwd identity,
   then audit access/open/stat/chmod/chown, supplementary groups, UID changes,
   fork/exec credentials, runtime directories and saved settings before implementing
-  login/accounts. Several identity syscalls still stub success; a UID field alone
+  login/accounts. Credential queries, saved IDs and supplementary-list changes now
+  pass guest tests; filesystem and capability enforcement remain unfinished. A UID field alone
   must not be described as user isolation. Avoid migrating/deleting existing home
   files without preserving their data and ownership.
 

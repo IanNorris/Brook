@@ -13,6 +13,7 @@
 #include "exec_image.h"
 #include "vfs.h"
 #include "process.h"
+#include "desktop_identity.h"
 #include "scheduler.h"
 #include "compositor.h"
 #include "window.h"
@@ -392,7 +393,8 @@ static bool PeekShebang(const char* path, char* outInterp, uint32_t interpSize,
 // ---------------------------------------------------------------------------
 
 static Process* SpawnProcess(const char* path, int argc, const char* const* argv,
-                             int32_t uidOverride = -1)
+                             uint32_t uidOverride = CredentialUnchanged,
+                             uint32_t gidOverride = CredentialUnchanged)
 {
     ExecutableImage image{};
     char executablePath[sizeof(Process::exePath)];
@@ -417,8 +419,19 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     int envc = 0;
     while (g_defaultEnvp[envc]) ++envc;
 
+    const uint32_t uid = uidOverride == CredentialUnchanged ? 0 : uidOverride;
+    const uint32_t gid = gidOverride == CredentialUnchanged ? LaunchPrimaryGroup(uid) : gidOverride;
+    const char* launchEnv[sizeof(g_defaultEnvp) / sizeof(g_defaultEnvp[0])];
+    char userEnv[32], loginEnv[32];
+    LaunchIdentityEnvironment(userEnv, false, uid);
+    LaunchIdentityEnvironment(loginEnv, true, uid);
+    for (int i = 0; i <= envc; ++i) {
+        launchEnv[i] = g_defaultEnvp[i];
+        if (g_defaultEnvp[i] && StrEq(g_defaultEnvp[i], "USER=root")) launchEnv[i] = userEnv;
+        if (g_defaultEnvp[i] && StrEq(g_defaultEnvp[i], "LOGNAME=root")) launchEnv[i] = loginEnv;
+    }
     Process* proc = ProcessCreate(elfBuf, elfSize, argc, argv,
-                                   envc, g_defaultEnvp);
+                                   envc, launchEnv, nullptr, uid, gid);
 
     __asm__ volatile("sti");
 
@@ -437,15 +450,6 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
         ++ei;
     }
     proc->exePath[ei] = '\0';
-
-    if (uidOverride >= 0)
-    {
-        uint32_t uid = static_cast<uint32_t>(uidOverride);
-        proc->uid = uid;
-        proc->euid = uid;
-        proc->gid = uid;
-        proc->egid = uid;
-    }
 
     // Name the process after the binary
     const char* baseName = path;
@@ -956,13 +960,14 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
-    // Built-in: run [--as <name>] [--uid <uid>] <path> [args...] — explicit run command
+    // Built-in: run [--as <name>] [--uid <uid>] [--gid <gid>] <path> [args...] — explicit run command
     // --as overrides argv[0] for the spawned process (useful for busybox applets)
     if (StrEq(cmd, "run") && argc >= 2)
     {
         int pathIdx = 1;
         const char* argv0Override = nullptr;
-        int32_t uidOverride = -1;
+        uint32_t uidOverride = CredentialUnchanged;
+        uint32_t gidOverride = CredentialUnchanged;
         bool strace = false;
         bool straceErrors = false;
         bool runOnce = false;
@@ -973,8 +978,14 @@ static int ExecCommand(int argc, const char* const* argv)
             if (StrEq(argv[pathIdx], "--as") && pathIdx + 1 < argc) {
                 argv0Override = argv[pathIdx + 1];
                 pathIdx += 2;
-            } else if (StrEq(argv[pathIdx], "--uid") && pathIdx + 1 < argc) {
-                uidOverride = static_cast<int32_t>(ParseUint(argv[pathIdx + 1]));
+            } else if ((StrEq(argv[pathIdx], "--uid") || StrEq(argv[pathIdx], "--gid")) && pathIdx + 1 < argc) {
+                uint32_t id;
+                if (!ParseLaunchId(argv[pathIdx + 1], &id)) {
+                    KPrintf("run: invalid %s value '%s'\n", argv[pathIdx], argv[pathIdx + 1]);
+                    return -1;
+                }
+                if (StrEq(argv[pathIdx], "--uid")) uidOverride = id;
+                else gidOverride = id;
                 pathIdx += 2;
             } else if (StrEq(argv[pathIdx], "--strace")) {
                 strace = true;
@@ -999,7 +1010,7 @@ static int ExecCommand(int argc, const char* const* argv)
 
         if (pathIdx >= argc)
         {
-            KPrintf("usage: run [--as <name>] [--uid <uid>] [--strace] [--quiet] [--once] <path> [args...]\n");
+            KPrintf("usage: run [--as <name>] [--uid <uid>] [--gid <gid>] [--strace] [--quiet] [--once] <path> [args...]\n");
             return -1;
         }
 
@@ -1085,11 +1096,11 @@ static int ExecCommand(int argc, const char* const* argv)
             newArgv[0] = argv0Override;
             for (int i = 1; i < effArgc && i < 31; ++i)
                 newArgv[i] = effArgv[i];
-            proc = SpawnProcess(shebangPath, effArgc, newArgv, uidOverride);
+            proc = SpawnProcess(shebangPath, effArgc, newArgv, uidOverride, gidOverride);
         }
         else
         {
-            proc = SpawnProcess(shebangPath, effArgc, effArgv, uidOverride);
+            proc = SpawnProcess(shebangPath, effArgc, effArgv, uidOverride, gidOverride);
         }
 
         // Propagate shell CWD to spawned process

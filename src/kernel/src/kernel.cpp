@@ -1,3 +1,4 @@
+#include "desktop_identity.h"
 #include "boot_protocol/boot_protocol.h"
 #include "serial.h"
 #include "kprintf.h"
@@ -779,7 +780,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         {
             // Match experiment-image ownership for the current desktop UID.
             // Preserve existing home ownership; this is not account migration.
-            uint32_t homeUid = 1000, homeGid = 100;
+            uint32_t homeUid = brook::DesktopUid, homeGid = brook::DesktopGid;
             const char* directories[] = {"/data/home", "/data/home/.cache",
                 "/data/home/.config", "/data/home/.local", "/data/home/.local/share"};
             for (const char* directory : directories)

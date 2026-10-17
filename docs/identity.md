@@ -1,18 +1,25 @@
 # Desktop identity and permission audit
 
-Audit baseline: `811de61`, 17 October 2026. This records the implementation
-before adding login or accounts. Brook currently provides a shared experimental
+Initial audit baseline: `811de61`, updated 17 October 2026 with credential
+and signal regression results. Brook currently provides a shared experimental
 desktop; its UID support does not establish isolation between users.
 
 ## Current desktop
 
-The shell launches applications as root by default. `run --uid N` sets real and
-effective UID and GID to N. The default environment still says `USER=root` and
-`LOGNAME=root`; `/etc/passwd` contains only root. The default HOME and all three
-XDG state directories point into persistent `/data/home`. A new home is owned by
-1000:100, matching existing experiment images, while the Firefox menu entry uses
-UID/GID 1000. These are compatibility choices, not a consistent account model.
-Existing homes retain their ownership at boot.
+The shell still launches applications as root by default. `run --uid 1000`
+selects the named compatibility identity `brook`, with primary GID 100 (`users`),
+matching new-home ownership and its synthetic passwd/group entries. Other UIDs
+retain the numeric UID-as-GID default unless `--gid` is supplied. All three IDs
+are set before ELF auxiliary-vector construction. USER/LOGNAME are root, brook,
+or a numeric UID as appropriate; malformed, overflowing and sentinel IDs fail
+before launch. `/etc/passwd` contains root and brook. HOME and all three XDG
+state directories point into persistent `/data/home`.
+
+Existing homes and preferences retain their ownership at boot. Root and brook
+still share this home and runtime directory; named launch metadata does not
+resolve mixed-owner application profiles or establish an account boundary.
+Default desktop launch policy and a migration preserving existing state remain
+unfinished.
 
 Root and UID 1000 each wrote, fsynced and reopened a 90,112-byte file under HOME
 on an empty data volume, and verified it after a complete reboot. GIMP's generic
@@ -23,16 +30,16 @@ desktop entry also launched and saved settings there on the reboot. See the
 
 | Area | Current behavior and evidence | Required before accounts |
 | --- | --- | --- |
-| Identity queries | `sys_getuid/geteuid/getgid/getegid` return task fields. `sys_getresuid/getresgid` instead return zero for every result. | Track saved IDs and return consistent real/effective/saved values; test after launch, fork, exec and credential changes. |
-| Credential changes | `sys_setuid/setgid` implement a simplified root/own-real-ID rule and update real/effective fields. No saved-ID fields exist in `Process`. | Define the supported Linux credential contract, including per-thread kernel credentials and libc's thread-group coordination; reject unsupported operations accurately. |
-| Groups and capabilities | `getgroups` always reports supplementary group 0. `setgroups` and `capset` return success without recording changes. `capget` always writes a V3-sized zero result, without proper version/PID handling. | Store supplementary groups or return an explicit unsupported error; implement correct buffer validation and capability probes before allowing callers to rely on privilege drops. |
-| Inheritance | Fork and thread creation copy `Process`, including UID/GID and umask. Shell creation explicitly supplies the default environment and optional UID override. | Verify credentials and environment together through fork/clone/exec, including failure paths. Define set-ID executable behavior separately. |
+| Identity queries | All UID/GID queries return the real/effective/saved task credentials. ELF auxiliary vectors reflect launch/exec credentials and mark mismatched real/effective IDs with AT_SECURE. Required result pointers are validated. | Keep launch, fork, exec and credential-change regressions passing. |
+| Credential changes | setuid/setgid, setreuid/setregid and setresuid/setresgid track saved IDs and validate the old tuple before changing it. Raw syscalls change the calling thread; libc coordinates changes with SIGSETXID. Root authorization currently means effective UID 0. | Capability-aware authorization and set-ID executable handling remain unsupported; do not describe this as full Linux credential support. |
+| Groups and capabilities | Immutable, reference-counted supplementary lists are inherited by fork/clone and independently replaced; getgroups/setgroups validate buffers and the Linux 65536-entry limit. capget/capset return ENOSYS without writing buffers. Unsupported capability/security prctl options return EINVAL. | Use supplementary groups in filesystem authorization. Audit the remaining prctl options: several legacy options still return success without implementing behavior. Filesystem IDs are coupled to effective IDs; setfsuid/setfsgid are unsupported. |
+| Inheritance | Fork and thread creation retain an owned group-list reference and snapshot all six IDs under the credential lock. Ordinary exec saves effective IDs and preserves real IDs/groups. Teardown releases the list, including failed creation paths. | Keep matching launch environment/passwd entries and verify repeated failure/cancellation cleanup. Define set-ID executable behavior separately. |
 | File open | `Ext2FsOpen` checks existing-file read OR write mode for a nonroot effective UID/primary GID, unless the mount skips checks. O_RDWR does not require both bits. Creation skips this leaf check. | Require the appropriate access bits, check ancestor search and parent mutation permissions, preserve meaningful EACCES/EPERM errors and enforce mount policy. |
 | Path traversal and mutation | Path resolution and parent lookup have no complete directory search/mutation authorization contract. Nix can explicitly skip permission checks. | Audit mkdir, create, unlink, rmdir, rename, symlink, hard links, sticky directories and directory-relative operations; restrict the writable Nix service deliberately. |
 | Access checks | `AccessAt` validates flags and resolves paths, but implements existence rather than R/W/X permission evaluation, including AT_EACCESS. | Use real/effective credentials as requested and apply the same traversal rules as open/exec; cover descriptor and symlink variants. |
-| Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Ext2 ownership is currently 16-bit and rejects larger chown IDs. | Test mode/ownership through every mutation path and all filesystems. Resolve 32-bit ownership and accurate nonroot group-change rules before exposing account creation. |
+| Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Ext2 ownership is currently 16-bit and rejects larger chown IDs, but file/directory creation still truncates larger effective IDs to 16 bits. | Test mode/ownership through every mutation path and all filesystems. Resolve 32-bit ownership and accurate nonroot group-change rules before exposing account creation. |
 | Runtime directory | Every shell application inherits `XDG_RUNTIME_DIR=/tmp`. Wayland and other IPC endpoints are shared. | Give a named desktop identity an owned, mode-0700 runtime directory with a defined lifetime; audit IPC peer credentials and access policy. |
-| Persistent preferences | HOME/XDG is persistent, but root apps and compatibility-UID apps share it. Browser wrappers explicitly select their own profiles. | Choose one desktop UID/GID/name and matching environment, passwd/group entries and owned state. Preserve existing data during any migration; report conflicts rather than silently replacing ownership. |
+| Persistent preferences | HOME/XDG is persistent, but root apps and compatibility-UID apps share it. Browser wrappers explicitly select their own profiles. | Use the named desktop identity consistently in the default launcher and owned application state. Preserve existing data during any migration; report conflicts rather than silently replacing ownership. |
 
 Primary implementation locations: `src/kernel/src/process.h`, `process.cpp`,
 `shell.cpp`, `syscall.cpp` (`AccessAt`, credential syscalls, chmod/chown), and
@@ -40,18 +47,92 @@ Primary implementation locations: `src/kernel/src/process.h`, `process.cpp`,
 ownership regression is `scripts/workloads/ownership.py`; persistent storage is
 checked by `scripts/workloads/home.py`. Neither test asserts full authorization.
 
-## Runtime spot check
+## Runtime evidence
 
-In session `5be7052708c044be92e4ede7cae33442`, a bounded Python query launched
-with `run --uid 1000` printed:
+The original audit in session `5be7052708c044be92e4ede7cae33442` found a
+UID-1000 process reporting getresuid/getresgid `(0,0,0)` and supplementary `[0]`.
+That contradiction is now covered by `scripts/workloads/identity.py`.
 
-```text
-IDENTITY_AUDIT 1000 1000 (0, 0, 0) 1000 (0, 0, 0) [0]
-```
+With kernel SHA-256 `fd332b684dcc883b6f28c795c673fe1f86df195d225367c5234ef5dfd2e29eab`,
+session `b67d52f73e6a4f54b657bb50c37bf9e7` passed thirteen root-run groups:
+query/auxv consistency, required buffers, thread-signal metadata, rejected
+parent-TID pointers before thread allocation, temporary/permanent UID changes,
+real/effective/saved permutation rules, supplementary-list validation and
+inheritance, raw per-thread UID changes, libc pthread coordination, ordinary
+exec, mismatched-ID secure exec and explicit unsupported capability errors.
+A separate `run --uid 1000` passed the five nonprivileged groups; all UID/GID
+queries and auxiliary entries reported 1000, with an empty supplementary list.
+The 21 hosted test groups also passed, including the credential transition table.
+Host Linux comparison passed query/buffer/thread-signal cases as an ordinary
+user; privileged cases were skipped, not compared as root. Brook's rejected
+parent-TID-pointer test is guest-only: Linux may publish the child despite an
+unwritable parent-TID destination, so that test must not run on the host.
 
-The fields are getuid, geteuid, getresuid, getgid, getresgid and getgroups.
-This directly confirms the contradictory query results and fixed group list;
-it is a failing identity-consistency observation, not an authorization pass.
+The libc test exposed two existing signal defects: tgkill silently dropped
+SA_ONSTACK signals without an alternate stack, and delivery omitted SI_TKILL
+sender metadata. It now falls back to the normal stack and preserves sender
+TGID/real UID through delivery or sigtimedwait. Thread-directed lookup pins the
+process and validates its TGID/TID before sending, including signal-zero probes.
+This does not yet enforce cross-user signal permissions. Pending non-timer
+signals still coalesce in the existing bitmask; this is not full realtime queue
+semantics. Fork clears inherited pending signals. The original hung test and
+fix are recorded under `build/workloads/identity-20261017` (local artifacts).
+
+The supported transition rules follow the Linux
+[setuid](https://man7.org/linux/man-pages/man2/setuid.2.html),
+[setreuid](https://man7.org/linux/man-pages/man2/setreuid.2.html),
+[setresuid](https://man7.org/linux/man-pages/man2/setresuid.2.html) and
+[getgroups](https://man7.org/linux/man-pages/man2/getgroups.2.html) contracts
+within the root-only privilege model above. libc's coordination is described by
+its [pthread initialization](https://github.com/bminor/glibc/blob/master/nptl/pthread_create.c)
+and [setxid handler](https://github.com/bminor/glibc/blob/master/nptl/nptl_setxid.c).
+These checks establish credential consistency, not filesystem authorization or
+multi-user isolation. Named desktop identity and permission enforcement remain
+unfinished. GIMP renders and exits normally on the credential candidate. Codium's
+standard launcher initially failed before renderer startup: Chromium's zygote
+always drops capabilities using capset and fatally checks ENOSYS, even with
+--no-sandbox. The --no-zygote direct-spawn attempt instead hit Electron's renderer root guard;
+adding --disable-chromium-sandbox or ELECTRON_DISABLE_SANDBOX did not resolve
+that diagnostic. A separate UID-1000 profile attempt stalled before mapping a
+window; its stacks are saved locally as codium-nonroot-blocked-stacks.json.
+Neither attempt is acceptance. Accepting an empty capset while retaining root
+privileges is not a valid fix.
+
+### Named identity and native editor follow-up
+
+Kernel `9fd7b1acae6040ce33ca8bfe89cca1ab521126cfb3924d6482d6dbedc120d62c`
+in session `cd6e269839314e00bf8ab5ebda1537ea` passed all fourteen root-run
+probe groups and all six nonprivileged groups after reboot. The added group
+verifies passwd/group lookup, USER/LOGNAME/HOME, primary GID and matching
+stat/lstat/fstat/read lengths. Before the metadata fix, the guest reported
+`NSS_SIZE_BEFORE 64 91 91` for pathname stat, descriptor stat and passwd bytes.
+Pathname stat and lstat now use the exact passwd/group string lengths. Other
+synthetic files' placeholder stat metadata remains a separate audit item.
+Explicit `--uid 1000 --gid 123` returned UID `(1000,1000,1000)` and GID
+`(123,123,123)`, with USER brook. Invalid negative, suffixed, overflowing and
+sentinel launch IDs all returned no launched process. The 21 hosted groups
+passed again, including parser boundaries and environment formatting.
+
+With the named identity, a direct Codium launch in session
+`dd0da1e66df545b3851f4b375824dfaf` rendered, accepted native typing and Ctrl+S,
+and reopened the saved document through Ctrl+P. Independent Python reads
+confirmed exact contents and owner 1000:100. Normal window close returned to
+ten tasks with heap integrity OK. A checked shutdown and reboot preserved the
+document and ownership; the rebooted native editor reopened it and again
+closed normally to ten tasks with heap integrity OK. All three offline
+filesystem checks returned zero after checked shutdown. Electron's Node mode
+independently returned username
+brook, UID 1000, GID 100 and home /data/home from os.userInfo().
+
+This run used the installed Electron binary with its Nix wrapper environment,
+--no-sandbox, --no-zygote, --disable-chromium-sandbox, --disable-gpu,
+--disable-crash-reporter and --ozone-platform=wayland. Config, extensions,
+state and temporary directories were fresh private codium-brook-test paths
+under the persistent home. This is an accepted explicit nonroot configuration;
+it does not prove the default root wrapper or mixed-owner existing profiles.
+The effects of NSS correction and the changed profile/launch configuration have
+not been isolated. Integrate the tested identity and configuration into the
+standard launcher and rerun GIMP/browsers before accepting the desktop candidate.
 
 ## Delivery order and acceptance
 

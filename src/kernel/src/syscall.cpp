@@ -11,6 +11,7 @@
 #include "serial.h"
 #include "panic.h"
 #include "process.h"
+#include "desktop_identity.h"
 #include "exec_limits.h"
 #include "exec_image.h"
 #include "fpu_irq.h"
@@ -441,7 +442,7 @@ static bool HasReadInterruptSignal()
     if ((proc->sigPending & ~proc->sigMask & childBit) && proc->tgid < MAX_PROCESSES) {
         uint64_t handler = g_sigHandlers[proc->tgid][17 - 1].handler;
         if (handler == 0 || handler == 1)
-            __atomic_and_fetch(&proc->sigPending, ~childBit, __ATOMIC_RELEASE);
+            ProcessDequeueSignal(proc, 17, nullptr);
     }
     return HasPendingSignals();
 }
@@ -3056,8 +3057,8 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     {
         struct SyntheticFile { const char* path; const char* content; };
         static const SyntheticFile syntheticFiles[] = {
-            { "/etc/passwd", "root:x:0:0:root:/data/home:/boot/BIN/BASH\n" },
-            { "/etc/group",  "root:x:0:\n" },
+            { "/etc/passwd", DesktopPasswd },
+            { "/etc/group",  DesktopGroup },
             { "/etc/shells", "/boot/BIN/BASH\n" },
             { "/etc/hostname", "brook\n" },
             { "/etc/os-release", "NAME=Brook\nID=brook\nPRETTY_NAME=Brook\n" },
@@ -4189,6 +4190,9 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     Process* parent = ProcessCurrent();
     if (!parent) return -ENOSYS;
 
+    if ((flags & CLONE_THREAD) && (flags & CLONE_PARENT_SETTID) &&
+        !UserBufferWritable(parentTidAddr, sizeof(int32_t))) return -EFAULT;
+
     uint64_t userRip = parent->syscallUserRip;
     uint64_t userRsp = parent->syscallUserRsp;
     uint64_t userRflags = parent->syscallUserRflags;
@@ -4207,9 +4211,8 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
         if (!child) return -ENOMEM;
 
         // CLONE_PARENT_SETTID: write child TID to parent's user space
-        if ((flags & CLONE_PARENT_SETTID) && parentTidAddr)
+        if (flags & CLONE_PARENT_SETTID)
         {
-            if (!UserBufferWritable(parentTidAddr, sizeof(int32_t))) return -EFAULT;
             auto* tidPtr = reinterpret_cast<volatile int32_t*>(parentTidAddr);
             *tidPtr = static_cast<int32_t>(child->pid);
         }
@@ -4372,7 +4375,7 @@ static bool ChildWaitInterrupted(Process* caller)
         // Default/ignored SIGCHLD is a wait wakeup. A caught SIGCHLD must reach
         // its handler through normal syscall signal delivery instead of vanishing.
         if (g_sigHandlers[caller->tgid][16].handler > 1) return true;
-        __atomic_fetch_and(&caller->sigPending, ~childBit, __ATOMIC_ACQ_REL);
+        ProcessDequeueSignal(caller, 17, nullptr);
     }
     return false;
 }
@@ -5321,10 +5324,7 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
             int signum = __builtin_ctzll(matched) + 1;
             SignalInfo info{};
             if (!PosixTimerDequeue(proc, 1ULL << (signum - 1), &info)) {
-                uint64_t previous = __atomic_fetch_and(&proc->sigPending,
-                    ~(1ULL << (signum - 1)), __ATOMIC_ACQ_REL);
-                if (!(previous & (1ULL << (signum - 1)))) continue;
-                info.si_signo = signum;
+                if (!ProcessDequeueSignal(proc, signum, &info)) continue;
             }
             if (infoAddr && !CopyToUser(infoAddr, &info, sizeof(info))) return -EFAULT;
             return signum;
@@ -6773,7 +6773,8 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr)
             __builtin_memset(st, 0, sizeof(*st));
             st->st_mode = 0100444; // regular file, read-only
             st->st_nlink = 1;
-            st->st_size = 64;
+            st->st_size = StrEq(lookup, "/etc/passwd") ? sizeof(DesktopPasswd) - 1 :
+                          StrEq(lookup, "/etc/group") ? sizeof(DesktopGroup) - 1 : 64;
             st->st_blksize = 4096;
             st->st_blocks = 1;
             return 0;
@@ -6842,7 +6843,8 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
             __builtin_memset(st, 0, sizeof(*st));
             st->st_mode = 0100444;
             st->st_nlink = 1;
-            st->st_size = 64;
+            st->st_size = StrEq(lookup, "/etc/passwd") ? sizeof(DesktopPasswd) - 1 :
+                          StrEq(lookup, "/etc/group") ? sizeof(DesktopGroup) - 1 : 64;
             st->st_blksize = 4096;
             st->st_blocks = 1;
             return 0;
@@ -7220,76 +7222,93 @@ static int64_t sys_getegid(uint64_t, uint64_t, uint64_t,
     Process* proc = ProcessCurrent();
     return proc ? proc->egid : 0;
 }
-static int64_t sys_setuid(uint64_t uid, uint64_t, uint64_t,
-                           uint64_t, uint64_t, uint64_t)
-{
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EINVAL;
-    uint32_t newUid = static_cast<uint32_t>(uid);
-    // Non-root can only set euid to real uid or saved uid (simplified: only own uid)
-    if (proc->euid != 0 && newUid != proc->uid)
-        return -EPERM;
-    proc->uid = newUid;
-    proc->euid = newUid;
-    return 0;
+static int64_t ChangeIds(bool group, CredentialChange operation,
+                         uint64_t real, uint64_t effective = CredentialUnchanged,
+                         uint64_t saved = CredentialUnchanged) {
+    auto* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    return ProcessChangeIds(proc, group, operation, static_cast<uint32_t>(real),
+                            static_cast<uint32_t>(effective), static_cast<uint32_t>(saved));
 }
-static int64_t sys_setgid(uint64_t gid, uint64_t, uint64_t,
-                           uint64_t, uint64_t, uint64_t)
-{
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EINVAL;
-    uint32_t newGid = static_cast<uint32_t>(gid);
-    if (proc->euid != 0 && newGid != proc->gid)
-        return -EPERM;
-    proc->gid = newGid;
-    proc->egid = newGid;
-    return 0;
+static int64_t sys_setuid(uint64_t id, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+    return ChangeIds(false, CredentialChange::Single, id);
 }
-
-// capget(125): probe / fetch process capabilities. We have no capability
-// model — pretend the caller has nothing set. glibc/libcap calls this to
-// detect kernel version support; on non-NULL datap we must write the
-// effective/permitted/inheritable triple (zeroed) so userland doesn't
-// read uninitialised stack.
-static int64_t sys_capget(uint64_t hdrAddr, uint64_t dataAddr,
-                           uint64_t, uint64_t, uint64_t, uint64_t)
-{
-    if (hdrAddr) {
-        // header is { __u32 version; int pid; }. Echo back the version
-        // userland gave us; that's what Linux does on a successful probe.
-        // Leave version unchanged; nothing else to do.
-        (void)hdrAddr;
-    }
-    if (dataAddr) {
-        // V3 layout: two `struct __user_cap_data_struct` (12 bytes each).
-        // Zero 24 bytes covering both halves; harmless if caller used V1/V2.
-        auto* p = reinterpret_cast<uint32_t*>(dataAddr);
-        for (int i = 0; i < 6; ++i) p[i] = 0;
-    }
-    return 0;
+static int64_t sys_setgid(uint64_t id, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) {
+    return ChangeIds(true, CredentialChange::Single, id);
+}
+static int64_t sys_setreuid(uint64_t real, uint64_t effective, uint64_t, uint64_t, uint64_t, uint64_t) {
+    return ChangeIds(false, CredentialChange::Re, real, effective);
+}
+static int64_t sys_setregid(uint64_t real, uint64_t effective, uint64_t, uint64_t, uint64_t, uint64_t) {
+    return ChangeIds(true, CredentialChange::Re, real, effective);
+}
+static int64_t sys_setresuid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t) {
+    return ChangeIds(false, CredentialChange::Res, real, effective, saved);
+}
+static int64_t sys_setresgid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t) {
+    return ChangeIds(true, CredentialChange::Res, real, effective, saved);
 }
 
-// capset(126): silently succeed. We don't track caps.
-static int64_t sys_capset(uint64_t, uint64_t,
-                           uint64_t, uint64_t, uint64_t, uint64_t) { return 0; }
+// No capability model is implemented. Do not fabricate capability queries or
+// claim that a privilege drop happened. In particular, never write a V3-sized
+// result into an unchecked pointer or a smaller V1 buffer.
+static int64_t sys_capget(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { return -ENOSYS; }
+static int64_t sys_capset(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { return -ENOSYS; }
 
-// getgroups(115): return supplementary group list
 static int64_t sys_getgroups(uint64_t size, uint64_t listAddr, uint64_t,
-                              uint64_t, uint64_t, uint64_t)
-{
-    // Root has one supplementary group: 0
-    if (size == 0) return 1;  // just return count
-    if (size >= 1 && listAddr)
-    {
-        auto* list = reinterpret_cast<uint32_t*>(listAddr);
-        list[0] = 0;
-    }
-    return 1;
+                              uint64_t, uint64_t, uint64_t) {
+    auto* proc = ProcessCurrent(); if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    struct Snapshot {
+        SupplementaryGroups* groups;
+        ~Snapshot() { ProcessGroupsRelease(groups); }
+    } snapshot{ProcessGroupsAcquire(proc)};
+    const uint32_t count = snapshot.groups ? snapshot.groups->count : 0;
+    const int capacity = static_cast<int32_t>(size);
+    if (capacity < 0 || (capacity && static_cast<uint32_t>(capacity) < count)) return -EINVAL;
+    if (!capacity) return count;
+    if (!UserBufferWritable(listAddr, uint64_t(count) * sizeof(uint32_t))) return -EFAULT;
+    if (count) memcpy(reinterpret_cast<void*>(listAddr), snapshot.groups->ids, count * sizeof(uint32_t));
+    return count;
 }
-
-// setgroups(116): stub — always succeed
-static int64_t sys_setgroups(uint64_t, uint64_t, uint64_t,
-                              uint64_t, uint64_t, uint64_t) { return 0; }
+static void SortGroupIds(uint32_t* ids, uint32_t count) {
+    auto sift = [&](uint32_t root, uint32_t end) {
+        while (root < end / 2) {
+            uint32_t child = root * 2 + 1;
+            if (child + 1 < end && ids[child] < ids[child + 1]) ++child;
+            if (ids[root] >= ids[child]) break;
+            uint32_t tmp = ids[root]; ids[root] = ids[child]; ids[child] = tmp;
+            root = child;
+        }
+    };
+    for (uint32_t start = count / 2; start; --start) sift(start - 1, count);
+    for (uint32_t end = count; end > 1; --end) {
+        uint32_t tmp = ids[0]; ids[0] = ids[end - 1]; ids[end - 1] = tmp;
+        sift(0, end - 1);
+    }
+}
+static int64_t sys_setgroups(uint64_t size, uint64_t listAddr, uint64_t,
+                              uint64_t, uint64_t, uint64_t) {
+    auto* proc = ProcessCurrent(); if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if (ProcessReadIds(proc, false).effective != 0) return -EPERM;
+    const uint32_t count = static_cast<uint32_t>(size);
+    if (count > MAX_SUPPLEMENTARY_GROUPS) return -EINVAL;
+    if (!UserBufferReadable(listAddr, uint64_t(count) * sizeof(uint32_t))) return -EFAULT;
+    SupplementaryGroups* groups = nullptr;
+    if (count) {
+        groups = static_cast<SupplementaryGroups*>(kmalloc(sizeof(SupplementaryGroups) + (count - 1) * sizeof(uint32_t)));
+        if (!groups) return -ENOMEM;
+        groups->references = 1; groups->count = count;
+        memcpy(groups->ids, reinterpret_cast<const void*>(listAddr), count * sizeof(uint32_t));
+        for (uint32_t i = 0; i < count; ++i) {
+            if (groups->ids[i] == CredentialUnchanged) { kfree(groups); return -EINVAL; }
+        }
+        SortGroupIds(groups->ids, count); // keep duplicates, like Linux
+    }
+    ProcessGroupsReplace(proc, groups);
+    return 0;
+}
 
 // ---------------------------------------------------------------------------
 // Signal: rt_sigaction (13), rt_sigprocmask (14)
@@ -10244,36 +10263,49 @@ static int64_t sys_gettid(uint64_t, uint64_t, uint64_t,
     return proc ? proc->pid : 1;
 }
 
+// Thread-directed signals retain their Linux sender metadata. In particular,
+// NPTL validates SI_TKILL and the sender TGID before applying setxid requests.
+static int64_t SendThreadSignal(uint64_t tgid, uint64_t tid, uint64_t sig, bool checkGroup)
+{
+    int32_t group = static_cast<int32_t>(tgid), thread = static_cast<int32_t>(tid);
+    int32_t signal = static_cast<int32_t>(sig);
+    if (thread <= 0 || (checkGroup && group <= 0) || signal < 0 || signal > 64)
+        return -EINVAL;
+    if (thread > 0xffff || (checkGroup && group > 0xffff)) return -ESRCH;
+    Process* self = ProcessCurrent();
+    SchedulerKernelRegionEnter(self);
+    Process* target = SchedulerFindProcessReference(static_cast<uint16_t>(thread));
+    int result = -ESRCH;
+    if (target && (!checkGroup || target->tgid == group)) {
+        result = 0;
+        if (signal) {
+            SignalInfo info{};
+            info.si_signo = signal;
+            info.si_code = -6; // SI_TKILL
+            int32_t sender = self ? self->tgid : 0;
+            uint32_t uid = self ? ProcessReadIds(self, false).real : 0;
+            memcpy(info._data, &sender, sizeof(sender));
+            memcpy(info._data + 4, &uid, sizeof(uid));
+            // SA_ONSTACK without an enabled alternate stack uses the normal
+            // stack. Silently discarding it deadlocks libc's setxid protocol.
+            result = ProcessSendSignal(target, signal, &info);
+        }
+    }
+    if (target) ProcessUnref(target);
+    SchedulerKernelRegionLeave(self);
+    return result;
+}
+
 static int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig,
                            uint64_t, uint64_t, uint64_t)
 {
-    (void)tgid;
-    if (sig == 0) return 0; // Signal 0 = check permissions only
-    Process* target = ProcessFindByPid(static_cast<uint16_t>(tid));
-    if (!target) return -ESRCH;
-    // If the handler asks for SA_ONSTACK but the target thread hasn't
-    // configured a signal alt stack, dropping the signal is safer than
-    // delivering on the regular stack — Go's runtime panics with
-    // "non-Go code set up signal handler without SA_ONSTACK flag" if
-    // SP isn't on the gsignal stack at delivery time. This bites SIGURG
-    // (used for goroutine preemption) on threads that haven't reached
-    // minit() yet.
-    if (sig >= 1 && sig <= 64 && target->tgid < MAX_PROCESSES)
-    {
-        const KernelSigaction& sa = g_sigHandlers[target->tgid][sig - 1];
-        if ((sa.flags & SA_ONSTACK) && target->sigAltstackSp == 0)
-            return 0;
-    }
-    return ProcessSendSignal(target, static_cast<int>(sig));
+    return SendThreadSignal(tgid, tid, sig, true);
 }
 
 static int64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    if (sig == 0) return 0;
-    Process* target = ProcessFindByPid(static_cast<uint16_t>(tid));
-    if (!target) return -ESRCH;
-    return ProcessSendSignal(target, static_cast<int>(sig));
+    return SendThreadSignal(0, tid, sig, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -11221,28 +11253,21 @@ static int64_t sys_enosys_quiet(uint64_t, uint64_t, uint64_t,
 // sys_getresuid (118) / sys_getresgid (120)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_getresuid(uint64_t ruidAddr, uint64_t euidAddr, uint64_t suidAddr,
-                              uint64_t, uint64_t, uint64_t)
-{
-    if (ruidAddr && !UserBufferWritable(ruidAddr, sizeof(uint32_t))) return -EFAULT;
-    if (euidAddr && !UserBufferWritable(euidAddr, sizeof(uint32_t))) return -EFAULT;
-    if (suidAddr && !UserBufferWritable(suidAddr, sizeof(uint32_t))) return -EFAULT;
-    if (ruidAddr) *reinterpret_cast<uint32_t*>(ruidAddr) = 0;
-    if (euidAddr) *reinterpret_cast<uint32_t*>(euidAddr) = 0;
-    if (suidAddr) *reinterpret_cast<uint32_t*>(suidAddr) = 0;
+static int64_t GetResIds(bool group, uint64_t real, uint64_t effective, uint64_t saved) {
+    auto* proc = ProcessCurrent(); if (!proc) return -ESRCH;
+    if (!UserBufferWritable(real, 4) || !UserBufferWritable(effective, 4) || !UserBufferWritable(saved, 4))
+        return -EFAULT;
+    const auto ids = ProcessReadIds(proc, group);
+    *reinterpret_cast<uint32_t*>(real) = ids.real;
+    *reinterpret_cast<uint32_t*>(effective) = ids.effective;
+    *reinterpret_cast<uint32_t*>(saved) = ids.saved;
     return 0;
 }
-
-static int64_t sys_getresgid(uint64_t rgidAddr, uint64_t egidAddr, uint64_t sgidAddr,
-                              uint64_t, uint64_t, uint64_t)
-{
-    if (rgidAddr && !UserBufferWritable(rgidAddr, sizeof(uint32_t))) return -EFAULT;
-    if (egidAddr && !UserBufferWritable(egidAddr, sizeof(uint32_t))) return -EFAULT;
-    if (sgidAddr && !UserBufferWritable(sgidAddr, sizeof(uint32_t))) return -EFAULT;
-    if (rgidAddr) *reinterpret_cast<uint32_t*>(rgidAddr) = 0;
-    if (egidAddr) *reinterpret_cast<uint32_t*>(egidAddr) = 0;
-    if (sgidAddr) *reinterpret_cast<uint32_t*>(sgidAddr) = 0;
-    return 0;
+static int64_t sys_getresuid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t) {
+    return GetResIds(false, real, effective, saved);
+}
+static int64_t sys_getresgid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t) {
+    return GetResIds(true, real, effective, saved);
 }
 
 // ---------------------------------------------------------------------------
@@ -11283,7 +11308,17 @@ static int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 static int64_t sys_prctl(uint64_t option, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    (void)option;
+    // Capability/secure-exec operations are unsupported, not successful no-ops.
+    switch (option) {
+        case 7: case 8:   // GET/SET_KEEPCAPS
+        case 21: case 22: // GET/SET_SECCOMP
+        case 23: case 24: // CAPBSET_READ/DROP
+        case 27: case 28: // GET/SET_SECUREBITS
+        case 38: case 39: // SET/GET_NO_NEW_PRIVS
+        case 47:         // CAP_AMBIENT
+            return -EINVAL;
+        default: break;
+    }
     // Most prctl options are not relevant for Brook.
     // Return success for harmless ones, EINVAL for unknown.
     return 0;
@@ -12966,6 +13001,10 @@ void SyscallTableInit()
     g_syscallTable[SYS_GETGID]          = sys_getgid;
     g_syscallTable[SYS_SETUID]          = sys_setuid;
     g_syscallTable[SYS_SETGID]          = sys_setgid;
+    g_syscallTable[113] = sys_setreuid;
+    g_syscallTable[114] = sys_setregid;
+    g_syscallTable[117] = sys_setresuid;
+    g_syscallTable[119] = sys_setresgid;
     g_syscallTable[SYS_CAPGET]          = sys_capget;
     g_syscallTable[SYS_CAPSET]          = sys_capset;
     // inotify: deliberately unimplemented. Glibc/GLib fall back to
@@ -13305,7 +13344,9 @@ static const char* SyscallName(uint64_t num)
     case 109: return "setpgid";   case 110: return "getppid";
     case 111: return "getpgrp";   case 112: return "setsid";
     case 115: return "getgroups"; case 116: return "setgroups";
-    case 117: return "getresuid"; case 120: return "getresgid";
+    case 113: return "setreuid"; case 114: return "setregid";
+    case 117: return "setresuid"; case 118: return "getresuid";
+    case 119: return "setresgid"; case 120: return "getresgid";
     case 121: return "getpgid";   case 124: return "getsid";
     case 222: return "timer_create"; case 223: return "timer_settime";
     case 224: return "timer_gettime"; case 225: return "timer_getoverrun";

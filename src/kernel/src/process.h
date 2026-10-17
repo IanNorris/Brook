@@ -6,11 +6,18 @@
 #include "input.h"
 #include "spinlock.h"
 #include "fd_table.h"
+#include "credential_ids.h"
 
 namespace brook {
 
 struct Vnode;
 struct KRwLock;
+struct SupplementaryGroups {
+    volatile uint32_t references;
+    uint32_t count;
+    uint32_t ids[1]; // immutable after publication, variable allocation
+};
+static constexpr uint32_t MAX_SUPPLEMENTARY_GROUPS = 65536;
 void FdReleaseOwnedEntry(const FdEntry& entry);
 
 // MAX_FDS, FdType and FdEntry are defined in fd_table.h (extracted for
@@ -250,6 +257,9 @@ struct Process
     uint32_t euid;               // Effective user ID
     uint32_t gid;                // Real group ID
     uint32_t egid;               // Effective group ID
+    uint32_t suid;               // Saved set-user-ID
+    uint32_t sgid;               // Saved set-group-ID
+    SupplementaryGroups* groups; // per-task immutable shared list, owns one ref
     ProcessState state;
     uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
     uint16_t umask;              // File creation mask (default 022)
@@ -432,6 +442,7 @@ struct Process
     // Signal state
     uint64_t sigMask;           // Blocked signals bitmask (bit N = signal N+1)
     uint64_t sigPending;        // Pending signals bitmask
+    struct PendingSignalSender { int32_t pid; uint32_t uid; int32_t code; } sigSenders[64];
     uint64_t sigSavedMask;      // Signal mask saved before handler (restored by sigreturn)
 
     // Signal alternate stack
@@ -570,7 +581,16 @@ Process* ProcessFindByPid(uint16_t pid);
 Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                        int argc, const char* const* argv,
                        int envc, const char* const* envp,
-                       const FdEntry* stdFds = nullptr);
+                       const FdEntry* stdFds = nullptr,
+                       uint32_t launchUid = 0, uint32_t launchGid = 0);
+
+CredentialIds ProcessReadIds(Process* proc, bool group);
+int ProcessChangeIds(Process* proc, bool group, CredentialChange operation,
+                     uint32_t real, uint32_t effective = CredentialUnchanged,
+                     uint32_t saved = CredentialUnchanged);
+SupplementaryGroups* ProcessGroupsAcquire(Process* proc);
+void ProcessGroupsRelease(SupplementaryGroups* groups);
+void ProcessGroupsReplace(Process* proc, SupplementaryGroups* owned);
 
 // Create a kernel-mode thread. Runs `fn(arg)` in ring 0 with the kernel's
 // page table. Has its own kernel stack and is scheduled like any process.
@@ -669,7 +689,8 @@ void ProcessCloseCloexecFds(Process* proc); // close FD_CLOEXEC fds on execve
 
 // Signal delivery: send a signal to a process.
 // Returns 0 on success, -ESRCH if not found, -EINVAL if bad signal.
-int ProcessSendSignal(Process* proc, int signum);
+int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info = nullptr);
+bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info);
 
 // Send a signal to all processes in the given process group.
 // Returns the number of processes signalled.

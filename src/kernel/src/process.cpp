@@ -32,9 +32,6 @@
 
 namespace brook {
 
-// Copies own references before publication; implemented with fd finalizers.
-bool FdRetainCopy(FdEntry* copy);
-
 struct ProcessOperationGuard {
     Process* process;
     explicit ProcessOperationGuard(Process* p) : process(p) {
@@ -42,6 +39,60 @@ struct ProcessOperationGuard {
     }
     ~ProcessOperationGuard() { if (process) SchedulerKernelRegionLeave(process); }
 };
+
+// No credential lock is held across allocation, user copies or scheduling.
+static SpinLock g_credentialsLock;
+CredentialIds ProcessReadIds(Process* proc, bool group) {
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
+    SpinLockAcquire(&g_credentialsLock);
+    CredentialIds ids = group ? CredentialIds{proc->gid, proc->egid, proc->sgid}
+                              : CredentialIds{proc->uid, proc->euid, proc->suid};
+    SpinLockRelease(&g_credentialsLock); return ids;
+}
+int ProcessChangeIds(Process* proc, bool group, CredentialChange operation,
+                     uint32_t real, uint32_t effective, uint32_t saved) {
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
+    SpinLockAcquire(&g_credentialsLock);
+    CredentialIds ids = group ? CredentialIds{proc->gid, proc->egid, proc->sgid}
+                              : CredentialIds{proc->uid, proc->euid, proc->suid};
+    int error = ChangeCredentialIds(ids, operation, proc->euid == 0, real, effective, saved);
+    if (!error) {
+        if (group) { proc->gid = ids.real; proc->egid = ids.effective; proc->sgid = ids.saved; }
+        else { proc->uid = ids.real; proc->euid = ids.effective; proc->suid = ids.saved; }
+    }
+    SpinLockRelease(&g_credentialsLock); return error;
+}
+SupplementaryGroups* ProcessGroupsAcquire(Process* proc) {
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
+    SpinLockAcquire(&g_credentialsLock);
+    auto* groups = proc->groups;
+    if (groups) __atomic_fetch_add(&groups->references, 1, __ATOMIC_RELAXED);
+    SpinLockRelease(&g_credentialsLock); return groups;
+}
+void ProcessGroupsRelease(SupplementaryGroups* groups) {
+    if (groups && __atomic_fetch_sub(&groups->references, 1, __ATOMIC_ACQ_REL) == 1) kfree(groups);
+}
+void ProcessGroupsReplace(Process* proc, SupplementaryGroups* owned) {
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
+    SpinLockAcquire(&g_credentialsLock);
+    auto* old = proc->groups; proc->groups = owned;
+    SpinLockRelease(&g_credentialsLock); ProcessGroupsRelease(old);
+}
+// Immediately after memcpy: the copied pointer is borrowed until this retains
+// it. This same lock protects a concurrently running remote-thread target.
+static void InheritCredentials(Process* child, Process* parent) {
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
+    SpinLockAcquire(&g_credentialsLock);
+    child->uid = parent->uid; child->euid = parent->euid; child->suid = parent->suid;
+    child->gid = parent->gid; child->egid = parent->egid; child->sgid = parent->sgid;
+    child->groups = parent->groups;
+    if (child->groups) __atomic_fetch_add(&child->groups->references, 1, __ATOMIC_RELAXED);
+    SpinLockRelease(&g_credentialsLock);
+}
+
+// Copies own references before publication; implemented with fd finalizers.
+bool FdRetainCopy(FdEntry* copy);
+
 
 // ProcessCurrent() is now in scheduler.cpp (g_currentProcess lives there).
 
@@ -100,6 +151,7 @@ static inline void FreeProcessStruct(Process* p)
                          haveSym ? sym : "?", off);
         }
 
+        ProcessGroupsRelease(p->groups); p->groups = nullptr;
         MappingBackingUnref(p->fbBacking);p->fbBacking=nullptr;
         AddressSpaceUnref(p->addressSpace);
         p->addressSpace = nullptr;
@@ -177,7 +229,7 @@ static FdEntry* AllocFdTable()
 
 int FdAlloc(Process* proc, FdType type, void* handle)
 {
-    ProcessOperationGuard operation(ProcessCurrent());
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return -24; // EMFILE
     int fd = FdTableAlloc(proc->fds, ProcessFdLock(proc), type, handle);
     if (fd < 0)
@@ -190,35 +242,35 @@ int FdAlloc(Process* proc, FdType type, void* handle)
 
 void FdFree(Process* proc, int fd)
 {
-    ProcessOperationGuard operation(ProcessCurrent());
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return;
     FdTableFree(proc->fds, ProcessFdLock(proc), fd);
 }
 
 FdEntry* FdGet(Process* proc, int fd)
 {
-    ProcessOperationGuard operation(ProcessCurrent());
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return nullptr;
     return FdTableGet(proc->fds, ProcessFdLock(proc), fd);
 }
 
 bool FdClaim(Process* proc, int fd, FdClaimResult* out)
 {
-    ProcessOperationGuard operation(ProcessCurrent());
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return false;
     return FdTableClaim(proc->fds, ProcessFdLock(proc), fd, out);
 }
 
 FdEntry* FdGetRef(Process* proc, int fd)
 {
-    ProcessOperationGuard operation(ProcessCurrent());
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return nullptr;
     return FdTablePin(proc->fds, ProcessFdLock(proc), fd);
 }
 
 void FdPut(Process* proc, int fd)
 {
-    ProcessOperationGuard operation(ProcessCurrent());
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return;
     FdClaimResult c;
     // If this drops the last pin on a slot whose close() was deferred, the core
@@ -231,7 +283,7 @@ void FdPut(Process* proc, int fd)
 
 FdCloseResult FdClose(Process* proc, int fd, FdClaimResult* out)
 {
-    ProcessOperationGuard operation(ProcessCurrent());
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return FdCloseResult::NotFound;
     return FdTableClose(proc->fds, ProcessFdLock(proc), fd, out);
 }
@@ -479,14 +531,14 @@ static uint64_t SetupUserStack(Process* proc,
     pushU64(execfnAddr); pushU64(AT_EXECFN);                    // AT_EXECFN
     pushU64(0); pushU64(AT_HWCAP2);                             // AT_HWCAP2 = 0
     pushU64(randomAddr); pushU64(AT_RANDOM);                    // AT_RANDOM
-    pushU64(0); pushU64(AT_SECURE);                             // AT_SECURE = 0 (not setuid)
+    pushU64(proc->uid != proc->euid || proc->gid != proc->egid); pushU64(AT_SECURE);                             // AT_SECURE: differing real/effective credentials
     pushU64(100); pushU64(AT_CLKTCK);                           // AT_CLKTCK = 100
     pushU64(0); pushU64(AT_HWCAP);                              // AT_HWCAP = 0 (conservative; some IFUNC libs may need real bits)
     pushU64(platformAddr); pushU64(AT_PLATFORM);                // AT_PLATFORM = "x86_64"
-    pushU64(0); pushU64(AT_EGID);                               // AT_EGID = 0 (root)
-    pushU64(0); pushU64(AT_GID);                                // AT_GID = 0
-    pushU64(0); pushU64(AT_EUID);                               // AT_EUID = 0
-    pushU64(0); pushU64(AT_UID);                                // AT_UID = 0
+    pushU64(proc->egid); pushU64(AT_EGID);                               // AT_EGID
+    pushU64(proc->gid); pushU64(AT_GID);                                // AT_GID
+    pushU64(proc->euid); pushU64(AT_EUID);                               // AT_EUID
+    pushU64(proc->uid); pushU64(AT_UID);                                // AT_UID
     pushU64(proc->elf.entryPoint); pushU64(AT_ENTRY);           // AT_ENTRY
     pushU64(0); pushU64(AT_FLAGS);                              // AT_FLAGS = 0
     pushU64(interpBase); pushU64(AT_BASE);                       // AT_BASE (interpreter load addr, 0 if static)
@@ -600,7 +652,7 @@ static uint64_t LoadInterpreter(Process* proc)
 Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                        int argc, const char* const* argv,
                        int envc, const char* const* envp,
-                       const FdEntry* stdFds)
+                       const FdEntry* stdFds, uint32_t launchUid, uint32_t launchGid)
 {
     if (!ExecArgumentsFit(argc, argv, envc, envp)) return nullptr;
     auto* proc = static_cast<Process*>(kmalloc(sizeof(Process)));
@@ -611,6 +663,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
     memset(raw, 0, sizeof(Process));
     proc->magic = PROCESS_MAGIC;
     proc->incarnation = NextIncarnation();
+    proc->uid = proc->euid = proc->suid = launchUid;
+    proc->gid = proc->egid = proc->sgid = launchGid;
     proc->leaderIncarnation = 0;
 
     // Initialize FPU/SSE state with safe defaults so fxrstor works correctly
@@ -924,7 +978,7 @@ static void CloseFdEntry(Process* proc, uint32_t i)
 // Close all FDs with FD_CLOEXEC set — called by ProcessExec (execve semantics).
 void ProcessCloseCloexecFds(Process* proc)
 {
-    ProcessOperationGuard operation(ProcessCurrent());
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return;
     SpinLockAcquire(ProcessFdLock(proc));
     for (uint32_t i = 0; i < MAX_FDS; ++i)
@@ -941,7 +995,7 @@ void ProcessCloseCloexecFds(Process* proc)
 
 void ProcessCloseAllFds(Process* proc)
 {
-    ProcessOperationGuard operation(ProcessCurrent());
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
     // Kernel tasks have no descriptor table. Never scan through a null table
     // on exit (small tables previously hid this behind low identity mappings).
     if (!proc || !proc->fds) return;
@@ -1066,6 +1120,9 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
 
     // Copy entire parent process struct as a starting point
     memcpy(child, parent, sizeof(Process));
+    InheritCredentials(child, parent);
+    child->sigPending = 0;
+    memset(child->sigSenders, 0, sizeof(child->sigSenders));
     child->addressSpace = nullptr;
     child->fbBacking = nullptr;
     child->framebufferLock = {};
@@ -1256,12 +1313,14 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
                              uint64_t tlsBase)
 {
     if (!parent || parent->isKernelThread) return nullptr;
+    ProcessOperationGuard credentialOperation(ProcessCurrent());
 
     auto* thread = static_cast<Process*>(kmalloc(sizeof(Process)));
     if (!thread) return nullptr;
 
     // Copy parent process struct as starting point
     memcpy(thread, parent, sizeof(Process));
+    InheritCredentials(thread, parent);
     thread->addressSpace = nullptr;
     thread->fbBacking = nullptr;
     thread->framebufferLock = {};
@@ -1396,6 +1455,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
 
     // Signal state: inherit mask, clear pending
     thread->sigPending = 0;
+    memset(thread->sigSenders, 0, sizeof(thread->sigSenders));
     thread->inSignalHandler = false;
     thread->inSignalHandlerOnAltStack = false;
     thread->sigReturnPending = false;
@@ -1659,6 +1719,10 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
         }
     }
 
+    // Ordinary exec preserves real IDs/groups and snapshots effective IDs.
+    SpinLockAcquire(&g_credentialsLock);
+    proc->suid = proc->euid; proc->sgid = proc->egid;
+    SpinLockRelease(&g_credentialsLock);
     *outStackPtr = userSP;
 
     // The terminal owns its pixels independently of the replaced AS. Keep an
@@ -1679,7 +1743,45 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
 static constexpr int SIGKILL = 9;
 [[maybe_unused]] static constexpr int SIGSTOP = 19;
 
-int ProcessSendSignal(Process* proc, int signum)
+// Publish sender information and the pending bit together. Dequeue clears both
+// under this short IRQ lock; no allocation or scheduler locks are taken here.
+static IrqSpinLock g_signalSenderLock;
+static void QueueSignal(Process* proc, int signum, const SignalInfo* info)
+{
+    uint64_t flags = IrqSpinLockAcquire(&g_signalSenderLock);
+    uint64_t bit = 1ULL << (signum - 1);
+    if (!(__atomic_load_n(&proc->sigPending, __ATOMIC_ACQUIRE) & bit)) {
+        auto& sender = proc->sigSenders[signum - 1];
+        sender = {};
+        sender.code = info ? info->si_code : 128; // SI_KERNEL
+        if (info) {
+            memcpy(&sender.pid, info->_data, sizeof(sender.pid));
+            memcpy(&sender.uid, info->_data + 4, sizeof(sender.uid));
+        }
+    }
+    __atomic_or_fetch(&proc->sigPending, bit, __ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_signalSenderLock, flags);
+}
+
+bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info)
+{
+    uint64_t flags = IrqSpinLockAcquire(&g_signalSenderLock);
+    uint64_t bit = 1ULL << (signum - 1);
+    uint64_t previous = __atomic_fetch_and(&proc->sigPending, ~bit, __ATOMIC_ACQ_REL);
+    auto& sender = proc->sigSenders[signum - 1];
+    if (info) {
+        *info = {};
+        info->si_signo = signum;
+        info->si_code = sender.code;
+        memcpy(info->_data, &sender.pid, sizeof(sender.pid));
+        memcpy(info->_data + 4, &sender.uid, sizeof(sender.uid));
+    }
+    sender = {};
+    IrqSpinLockRelease(&g_signalSenderLock, flags);
+    return (previous & bit) != 0;
+}
+
+int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
 {
     if (!proc) return -3; // ESRCH
     if (signum < 1 || signum > 64) return -22; // EINVAL
@@ -1717,8 +1819,7 @@ int ProcessSendSignal(Process* proc, int signum)
             DbgPrintf("SIGNAL: SIGCONT -> pid %u resumed\n", proc->pid);
         }
         // Still deliver SIGCONT if a handler is registered
-        uint64_t bit = 1ULL << (signum - 1);
-        __atomic_or_fetch(&proc->sigPending, bit, __ATOMIC_RELEASE);
+        QueueSignal(proc, signum, info);
         return 0;
     }
 
@@ -1774,8 +1875,7 @@ int ProcessSendSignal(Process* proc, int signum)
         }
     }
 
-    uint64_t bit = 1ULL << (signum - 1);
-    __atomic_or_fetch(&proc->sigPending, bit, __ATOMIC_RELEASE);
+    QueueSignal(proc, signum, info);
 
     // Wake blocked processes so they can handle the signal
     if (proc->state == ProcessState::Blocked)
@@ -1891,10 +1991,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
 
     SignalInfo signalInfo{};
     if (!PosixTimerDequeue(proc, 1ULL << (signum - 1), &signalInfo)) {
-        uint64_t previous = __atomic_fetch_and(&proc->sigPending,
-            ~(1ULL << (signum - 1)), __ATOMIC_ACQ_REL);
-        if (!(previous & (1ULL << (signum - 1)))) return syscallResult;
-        signalInfo.si_signo = signum;
+        if (!ProcessDequeueSignal(proc, signum, &signalInfo)) return syscallResult;
     }
 
     uint16_t pid = proc->tgid;

@@ -202,3 +202,6 @@ target_compile_options(test_profiler_stack PRIVATE
     -UNDEBUG
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )
+
+# Saved-ID transitions and all-or-nothing unprivileged credential changes.
+add_host_test(test_credential_ids)
