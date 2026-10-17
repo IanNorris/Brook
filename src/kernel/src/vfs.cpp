@@ -602,8 +602,15 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
     if (!mount->fsOps) return nullptr;
     // O_TRUNC must use the same resize gate and alias invalidation as truncate.
     int openFlags = flags & ~(VFS_O_TRUNC | VFS_O_EXCL);
+    if (flags & VFS_O_TRUNC) {
+        if (!(openFlags & VFS_O_WRITE)) openFlags |= VFS_O_READWRITE;
+        openFlags |= VFS_O_WRITE;
+    }
     Vnode* vn = nullptr;
-    if (mount->fsOps->open_mode)
+    if (mount->fsOps->open_mode_checked)
+        vn = mount->fsOps->open_mode_checked(mount->mountPriv, mount->pdrv,
+                                              relPath, openFlags, mode, error);
+    else if (mount->fsOps->open_mode)
         vn = mount->fsOps->open_mode(mount->mountPriv, mount->pdrv, relPath, openFlags, mode);
     else if (mount->fsOps->open)
         vn = mount->fsOps->open(mount->mountPriv, mount->pdrv, relPath, openFlags);

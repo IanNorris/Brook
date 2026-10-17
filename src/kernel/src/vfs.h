@@ -100,6 +100,8 @@ static constexpr int VFS_O_CREATE = 0x02;  // Create file if it doesn't exist
 static constexpr int VFS_O_TRUNC  = 0x04;  // Truncate existing file
 static constexpr int VFS_O_EXCL   = 0x10;  // With CREATE, fail if the directory entry exists
 static constexpr int VFS_O_APPEND = 0x08;  // Seek to end after open
+// WRITE alone is write-only; retain Linux O_RDWR's read requirement separately.
+static constexpr int VFS_O_READWRITE = 0x20;
 
 // ---- Filesystem driver interface ----
 //
@@ -166,6 +168,10 @@ struct VfsFsOps {
     bool (*can_unmount)(void* mountPriv) = nullptr;
     int (*chown)(void* mountPriv, uint8_t pdrv, const char* relPath,
                  uint32_t uid, uint32_t gid, bool nofollow) = nullptr;
+    // Optional open with a precise error (e.g. EACCES). Checked under the
+    // filesystem's own inode lock, rather than a racy stat/open preflight.
+    Vnode* (*open_mode_checked)(void* mountPriv, uint8_t pdrv, const char* relPath,
+                               int flags, uint16_t mode, int* error) = nullptr;
 };
 
 // Register a filesystem driver with the VFS.

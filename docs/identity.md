@@ -32,9 +32,9 @@ desktop entry also launched and saved settings there on the reboot. See the
 | --- | --- | --- |
 | Identity queries | All UID/GID queries return the real/effective/saved task credentials. ELF auxiliary vectors reflect launch/exec credentials and mark mismatched real/effective IDs with AT_SECURE. Required result pointers are validated. | Keep launch, fork, exec and credential-change regressions passing. |
 | Credential changes | setuid/setgid, setreuid/setregid and setresuid/setresgid track saved IDs and validate the old tuple before changing it. Raw syscalls change the calling thread; libc coordinates changes with SIGSETXID. Root authorization currently means effective UID 0. | Capability-aware authorization and set-ID executable handling remain unsupported; do not describe this as full Linux credential support. |
-| Groups and capabilities | Immutable, reference-counted supplementary lists are inherited by fork/clone and independently replaced; getgroups/setgroups validate buffers and the Linux 65536-entry limit. capget/capset return ENOSYS without writing buffers. Unsupported capability/security prctl options return EINVAL. | Use supplementary groups in filesystem authorization. Audit the remaining prctl options: several legacy options still return success without implementing behavior. Filesystem IDs are coupled to effective IDs; setfsuid/setfsgid are unsupported. |
+| Groups and capabilities | Immutable, reference-counted supplementary lists are inherited by fork/clone and independently replaced; getgroups/setgroups validate buffers and the Linux 65536-entry limit. capget/capset return ENOSYS without writing buffers. Unsupported capability/security prctl options return EINVAL. | Ext2 existing-file opens now use supplementary groups; other filesystem and operation paths remain to audit. Audit the remaining prctl options: several legacy options still return success without implementing behavior. Filesystem IDs are coupled to effective IDs; setfsuid/setfsgid are unsupported. |
 | Inheritance | Fork and thread creation retain an owned group-list reference and snapshot all six IDs under the credential lock. Ordinary exec saves effective IDs and preserves real IDs/groups. Teardown releases the list, including failed creation paths. | Keep matching launch environment/passwd entries and verify repeated failure/cancellation cleanup. Define set-ID executable behavior separately. |
-| File open | `Ext2FsOpen` checks existing-file read OR write mode for a nonroot effective UID/primary GID, unless the mount skips checks. O_RDWR does not require both bits. Creation skips this leaf check. | Require the appropriate access bits, check ancestor search and parent mutation permissions, preserve meaningful EACCES/EPERM errors and enforce mount policy. |
+| File open | `Ext2FsOpenModeChecked` requires both access bits for O_RDWR and uses effective UID, primary GID and supplementary groups. Denials return EACCES without alias fallback; O_TRUNC requires write access. Creation skips the new leaf inode check, and the explicit Nix bypass remains. | Check ancestor search and parent mutation permissions, audit other filesystems, and define the writable Nix mount policy. |
 | Path traversal and mutation | Path resolution and parent lookup have no complete directory search/mutation authorization contract. Nix can explicitly skip permission checks. | Audit mkdir, create, unlink, rmdir, rename, symlink, hard links, sticky directories and directory-relative operations; restrict the writable Nix service deliberately. |
 | Access checks | `AccessAt` validates flags and resolves paths, but implements existence rather than R/W/X permission evaluation, including AT_EACCESS. | Use real/effective credentials as requested and apply the same traversal rules as open/exec; cover descriptor and symlink variants. |
 | Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Ext2 ownership is currently 16-bit and rejects larger chown IDs, but file/directory creation still truncates larger effective IDs to 16 bits. | Test mode/ownership through every mutation path and all filesystems. Resolve 32-bit ownership and accurate nonroot group-change rules before exposing account creation. |
@@ -158,6 +158,46 @@ passed. Evidence is in `build/workloads/identity-20261017/`, with native capture
 This menu integration was tested in one boot; the earlier explicit configuration
 also passed reboot persistence. Extensions, debugger workflows, performance and
 broader authorization enforcement remain unaccepted.
+
+## Existing-file open authorization follow-up
+
+Kernel `e9509a774719a2f47cb5cd256de84fd2835c05e6217bf319208eedd95020a198`
+passed the new `scripts/workloads/permissions.py` matrix in isolated session
+`6f29385055e9445a9a95915e9798b6e5`: 686 opens across fourteen modes and seven
+identity/group combinations. The probe covers read-only, write-only, read/write,
+O_CREAT on an existing file, and truncation with read-only, write-only and
+read/write descriptors, requiring EACCES for denied
+operations. It also checks that each identity can use the descriptor returned
+when creating a mode-000 file. Owner bits take precedence over matching group
+or other bits; mixed supplementary lists include an unsorted input and duplicate.
+
+The pre-fix kernel reproduced both false O_RDWR success on write-only files and
+wrong supplementary-group selection. Ordinary denied opens returned ENOENT.
+Linux O_RDWR is now retained as a separate VFS flag, while existing WRITE callers
+remain write-only. A checked filesystem-open callback returns ext2's EACCES from
+under its inode lock, preventing legacy alias lookup after denial. Supplementary
+membership and effective IDs are inspected under the credential lock. O_TRUNC
+retains its write-access requirement before VFS performs the resize. These rules
+follow the Linux [open contract](https://man7.org/linux/man-pages/man2/open.2.html).
+All loadable filesystem drivers were rebuilt against the extended VFS interface.
+
+On the patched kernel, all 21 hosted suites, all fourteen current root credential
+probe groups and six nonroot groups passed. The ownership regression across
+/data and /nix passed in session `494b7d655a3c4bf297f2c782821e82e9`. Codium launched
+through Applications after reboot, reopened its persisted file, accepted native
+edits and saved the independently verified result as UID 1000. Normal Alt+F4
+close eventually returned to ten tasks with heap integrity OK. The first
+injected text batch repeated a character during a stall; a second native edit
+saved the intended text exactly. Input timing remains a separate issue to audit.
+All three patched runs completed checked shutdown and all three offline filesystem
+checks with zero errors. Logs, before/after matrices and the final summary are
+under `build/workloads/identity-20261017/permissions-*.json`.
+
+This is existing-file leaf authorization on the checked /data ext2 mount.
+The [directory search rules](https://man7.org/linux/man-pages/man7/path_resolution.7.html),
+parent mutation checks, sticky/setgid rules, access/faccessat, execution, other
+filesystems and the explicit Nix permission bypass remain open audit items.
+Accounts and multi-user isolation are not accepted by these results.
 
 ## Delivery order and acceptance
 

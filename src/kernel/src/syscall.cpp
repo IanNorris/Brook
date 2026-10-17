@@ -3141,6 +3141,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     static constexpr uint64_t LINUX_O_APPEND = 0x400;
     static constexpr uint64_t LINUX_O_DIRECTORY = 0x10000;
     if (flags & LINUX_O_WRONLY || flags & LINUX_O_RDWR) vfsFlags |= VFS_O_WRITE;
+    if ((flags & 3) == LINUX_O_RDWR) vfsFlags |= VFS_O_READWRITE;
     if (flags & LINUX_O_CREAT)  vfsFlags |= VFS_O_CREATE;
     if (flags & LINUX_O_EXCL)   vfsFlags |= VFS_O_EXCL;
     if (flags & LINUX_O_TRUNC)  vfsFlags |= VFS_O_TRUNC;

@@ -591,6 +591,9 @@ int ProcessChangeIds(Process* proc, bool group, CredentialChange operation,
 SupplementaryGroups* ProcessGroupsAcquire(Process* proc);
 void ProcessGroupsRelease(SupplementaryGroups* groups);
 void ProcessGroupsReplace(Process* proc, SupplementaryGroups* owned);
+// Read effective IDs and supplementary membership atomically. Root receives
+// read/write access here; executable authorization needs its own root rules.
+uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, uint16_t mode);
 
 // Create a kernel-mode thread. Runs `fn(arg)` in ring 0 with the kernel's
 // page table. Has its own kernel stack and is scheduled like any process.

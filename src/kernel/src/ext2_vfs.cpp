@@ -2803,9 +2803,10 @@ static int Ext2FsSync(void* mountPriv)
     return result;
 }
 
-static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
-                            const char* relPath, int flags, uint16_t createMode)
+static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
+                            const char* relPath, int flags, uint16_t createMode, int* error)
 {
+    if (error) *error = 0;
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
 
@@ -2897,26 +2898,16 @@ static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
     // Only applies to existing files — newly created files skip this.
     if (!created) {
         Process* cur = ProcessCurrent();
-        if (cur && cur->euid != 0 && !mnt->skipPermChecks) {
-            uint16_t fmode = inodeData.i_mode & 07777;
-            uint16_t perm;
-            if (cur->euid == inodeData.i_uid)
-                perm = (fmode >> 6) & 7;
-            else if (cur->egid == inodeData.i_gid)
-                perm = (fmode >> 3) & 7;
-            else
-                perm = fmode & 7;
-
-            bool denied = false;
-            if (flags & VFS_O_WRITE)
-                denied = !(perm & 2);
-            else
-                denied = !(perm & 4);  // read access
-
-            if (denied) {
+        if (!mnt->skipPermChecks) {
+            uint8_t perm = ProcessFilePermissions(cur, inodeData.i_uid, inodeData.i_gid,
+                                                  inodeData.i_mode);
+            uint8_t required = (flags & VFS_O_WRITE) ? 2 : 4;
+            if (flags & VFS_O_READWRITE) required |= 4;
+            if ((perm & required) != required) {
                 if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
                 else            KRwLockReadUnlock(&g_ext2Lock);
-                return nullptr;  // EACCES (caller sees null = open failed)
+                if (error) *error = -13; // EACCES; prevent alias fallback on denial.
+                return nullptr;
             }
         }
     }
@@ -2986,6 +2977,12 @@ static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
 
     // Symlinks should have been resolved during path resolution
     return nullptr;
+}
+
+static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
+                            const char* relPath, int flags, uint16_t mode)
+{
+    return Ext2FsOpenModeChecked(mountPriv, pdrv, relPath, flags, mode, nullptr);
 }
 
 static Vnode* Ext2FsOpen(void* mountPriv, uint8_t pdrv, const char* relPath, int flags)
@@ -3633,6 +3630,7 @@ static const VfsFsOps g_ext2FsOps = {
     .remove_path = Ext2FsRemovePath,
     .can_unmount = Ext2FsCanUnmount,
     .chown      = Ext2FsChown,
+    .open_mode_checked = Ext2FsOpenModeChecked,
 };
 
 // ---------------------------------------------------------------------------
