@@ -26,6 +26,7 @@
 #include "memory/file_page_cache.h"
 #include "memory/file_object.h"
 #include "memory/user_mapping.h"
+#include "memory/mapping_fault.h"
 #include "memory/mapping_fault_test.h"
 #include "memory/physical_memory.h"
 #include "vfs.h"
@@ -847,9 +848,9 @@ struct FileMappingBacking {
 };
 // Historical fault entrypoints share one resolver: the mapping's backing kind
 // may change while preparation sleeps, so retries must dispatch afresh.
-static bool ResolveMappingFault(uint64_t address,uint64_t error);
+
 extern "C" bool MemFdHandleUserFault(uint64_t address,uint64_t error) {
-    return ResolveMappingFault(address,error);
+    return ResolveUserMappingFault(address,error)==MappingFaultResult::Resolved;
 }
 
 // ---------------------------------------------------------------------------
@@ -940,16 +941,16 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
 // Uses the global page cache for sharing and 64KB read-ahead.
 // No metadata pointer survives unlocking. The transaction owns both prepared
 // frames and the immutable backing pin through I/O, validation and retirement.
-static bool ResolveMappingFault(uint64_t address,uint64_t error) {
-    if (error & 1) return false;
+MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error) {
+    if (error & 1) return MappingFaultResult::Unhandled;
     Process* actor=ProcessCurrent();
-    if (!actor || !actor->addressSpace || actor->addressSpace->kernel) return false;
+    if (!actor || !actor->addressSpace || actor->addressSpace->kernel) return MappingFaultResult::Unhandled;
     const uint64_t page=address&~uint64_t{4095};
     const uint32_t access=(error&2)?2u:((error&16)?4u:1u);
     for (;;) {
         MappingTransaction operation(actor,actor->addressSpace);
-        if(!operation.Lock())return false;MappingFaultSnapshot snapshot{};
-        if (!operation.CaptureRange(page,access,snapshot)) return false;
+        if(!operation.Lock())return MappingFaultResult::Unhandled;MappingFaultSnapshot snapshot{};
+        if (!operation.CaptureRange(page,access,snapshot)) return MappingFaultResult::Unhandled;
         // A peer may have resolved this fault or replaced its range while we
         // prepared I/O. Use the current range and leaf, not the original fault
         // backend. Returning retries the instruction (including a subsequent
@@ -958,20 +959,20 @@ static bool ResolveMappingFault(uint64_t address,uint64_t error) {
         if (leaf & VMM_PRESENT) {
             const bool cow=(leaf&PTE_COW_BIT) && snapshot.range.sharing==MappingSharing::Private &&
                 snapshot.range.leafOwnership==MappingLeafOwnership::Managed;
-            return (leaf&VMM_USER) && (!(access&4) || !(leaf&VMM_NO_EXEC)) &&
-                (!(access&2) || (leaf&VMM_WRITABLE) || cow);
+            return ((leaf&VMM_USER) && (!(access&4) || !(leaf&VMM_NO_EXEC)) &&
+                (!(access&2) || (leaf&VMM_WRITABLE) || cow))?MappingFaultResult::Resolved:MappingFaultResult::Unhandled;
         }
         const auto kind=snapshot.range.kind;
         if (kind!=MappingKind::File && kind!=MappingKind::MemFd && kind!=MappingKind::Anonymous &&
-            kind!=MappingKind::Stack && kind!=MappingKind::Heap && kind!=MappingKind::Image) return false;
+            kind!=MappingKind::Stack && kind!=MappingKind::Heap && kind!=MappingKind::Image) return MappingFaultResult::Unhandled;
         const uint64_t batch=kind==MappingKind::File?FILE_OBJECT_PAGE_BATCH:1;
         operation.Unlock();
-        if (!operation.Prepare(0,batch,1)) return false;
+        if (!operation.Prepare(0,batch,1)) return MappingFaultResult::OutOfMemory;
         bool cachedPrivate=false;
-        if (!MappingFaultTestBarrier(operation.Space(),page,1)) return false;
+        auto prepared=MappingFaultResult::Resolved;
+        if (!MappingFaultTestBarrier(operation.Space(),page,1)) return MappingFaultResult::Unhandled;
         if (kind==MappingKind::File) {
             const auto* file=static_cast<FileMappingBacking*>(snapshot.range.backing->object);
-            VnodeStat stat{};if (VfsStat(file->vnode,&stat)) return false;
             FileObject* object=file->vnode->ops->file_object ? file->vnode->ops->file_object(file->vnode) : nullptr;
             if(object) {
                 // These references remain cancellation-owned until staged;
@@ -980,65 +981,73 @@ static bool ResolveMappingFault(uint64_t address,uint64_t error) {
                     PhysicalAddress pages[FILE_OBJECT_PAGE_BATCH]{};
                     ~BatchPins() { for(auto physical:pages)if(physical)PmmUnrefPage(physical); }
                 } pins;
-                uint32_t count=0;
                 const uint64_t offset=snapshot.range.offset+page-snapshot.range.begin;
-                for(uint64_t i=0;i<batch && page+i*4096<snapshot.range.end;++i) {
-                    if(offset+i*4096>=stat.size)break;
-                    ++count;
-                }
-                if(!count)return false;
+                uint64_t remaining=(snapshot.range.end-page)/4096;
+                const uint32_t count=remaining<batch?static_cast<uint32_t>(remaining):batch;
                 bool loaded=false;
-                if(FileObjectGetPages(object,file->vnode,offset/4096,count,pins.pages,&loaded))return false;
+                prepared=FileObjectFaultPages(object,file->vnode,offset/4096,count,pins.pages,&loaded);
                 for(uint32_t i=0;i<count;++i)if(pins.pages[i]) {
                     __atomic_fetch_add(i==0&&loaded?&g_profCacheMiss:&g_profCacheHit,1,__ATOMIC_RELAXED);
-                    if(!operation.StagePage(i,pins.pages[i],true))return false;
+                    if(!operation.StagePage(i,pins.pages[i],true))return MappingFaultResult::Unhandled;
                     pins.pages[i]=PhysicalAddress{}; // transaction owns the pin
                 }
-            } else for (uint64_t i=0;i<batch && page+i*4096<snapshot.range.end;++i) {
+            } else {
+              VnodeStat stat{};
+              const int statResult=VfsStat(file->vnode,&stat);
+              if(statResult)prepared=statResult==-ENOMEM?MappingFaultResult::OutOfMemory:MappingFaultResult::IoError;
+              for (uint64_t i=0;prepared==MappingFaultResult::Resolved && i<batch && page+i*4096<snapshot.range.end;++i) {
                 const uint64_t offset=snapshot.range.offset+(page+i*4096-snapshot.range.begin);
-                if (offset>=stat.size) { if (!i) return false; break; }
+                if (offset>=stat.size) { if (!i)prepared=MappingFaultResult::EndOfFile;break; }
                 auto physical=FilePageCacheLookup(file->vnode,offset/4096);
                 if (physical) {
                     __atomic_fetch_add(&g_profCacheHit,1,__ATOMIC_RELAXED);
-                    if (!operation.StagePage(i,physical,true)) { PmmUnrefPage(physical);return false; }
+                    if (!operation.StagePage(i,physical,true)) { PmmUnrefPage(physical);return MappingFaultResult::Unhandled; }
                 } else if (!i) {
                     __atomic_fetch_add(&g_profCacheMiss,1,__ATOMIC_RELAXED);
                     physical=PmmAllocPage(MemTag::User,operation.Space()->allocationPid);
-                    if (!physical) return false;
+                    if (!physical) { prepared=MappingFaultResult::OutOfMemory;break; }
                     auto* bytes=reinterpret_cast<void*>(PhysToVirt(physical).raw());memset(bytes,0,4096);
                     uint64_t readOffset=offset;
-                    if (VfsRead(file->vnode,bytes,4096,&readOffset)<0) { PmmUnrefPage(physical);return false; }
+                    const int readResult=VfsRead(file->vnode,bytes,4096,&readOffset);
+                    if (readResult<0) {
+                        PmmUnrefPage(physical);
+                        prepared=readResult==-ENOMEM?MappingFaultResult::OutOfMemory:MappingFaultResult::IoError;break;
+                    }
                     // Preparation is cancellation-protected by the transaction.
                     // Stage the canonical winner only after competing inserts
                     // converge, rather than retaining an uncached losing frame.
                     physical=FilePageCacheAdopt(file->vnode,offset/4096,physical,
                         snapshot.range.sharing==MappingSharing::Private ||
                         !(snapshot.range.maximumProtection&2));
-                    if (!physical) return false;
-                    if (!operation.StagePage(i,physical,true)) { PmmUnrefPage(physical);return false; }
+                    if (!physical) { prepared=MappingFaultResult::OutOfMemory;break; }
+                    if (!operation.StagePage(i,physical,true)) { PmmUnrefPage(physical);return MappingFaultResult::Unhandled; }
                 }
+              }
             }
             cachedPrivate=snapshot.range.sharing==MappingSharing::Private;
         } else if (kind==MappingKind::MemFd) {
             auto* backing=static_cast<MemFdData*>(snapshot.range.backing->object);
             const uint64_t offset=snapshot.range.offset+page-snapshot.range.begin;
-            if (offset>=__atomic_load_n(&backing->size,__ATOMIC_ACQUIRE)) return false;
+            if (offset>=__atomic_load_n(&backing->size,__ATOMIC_ACQUIRE)) return MappingFaultResult::Unhandled;
             auto physical=MemFdGetOrAllocPage(backing,offset/4096,actor->pid);
-            if (!physical || !operation.StagePage(0,physical,false)) return false;
-        } else if (!operation.PrepareZeroed(MemTag::User,operation.Space()->allocationPid)) return false;
-        if (!MappingFaultTestBarrier(operation.Space(),page,2)) return false;
-        if(!operation.Lock())return false;
+            if (!physical || !operation.StagePage(0,physical,false)) return MappingFaultResult::Unhandled;
+        } else if (!operation.PrepareZeroed(MemTag::User,operation.Space()->allocationPid)) return MappingFaultResult::Unhandled;
+        if (!MappingFaultTestBarrier(operation.Space(),page,2)) return MappingFaultResult::Unhandled;
+        if(!operation.Lock())return MappingFaultResult::OutOfMemory;
         if (!operation.ValidateRange(snapshot,page,access)) continue;
+        // EOF/IO observations are only authoritative for this same VMA and file
+        // generation. A remap, protection change or resize retries preparation.
+        if(prepared!=MappingFaultResult::Resolved)return prepared;
         auto result=operation.PublishFault(snapshot,0,VirtualAddress(page),access,cachedPrivate);
         if (result==MappingFaultCommit::Stale) continue;
-        if (result==MappingFaultCommit::Failed) return false;
+        if (result==MappingFaultCommit::Failed) return MappingFaultResult::Unhandled;
         for (uint64_t i=1;i<batch;++i)
             if (operation.PreparedPage(i)) (void)operation.PublishFault(snapshot,i,VirtualAddress(page+i*4096),access,cachedPrivate);
-        return true;
+        return MappingFaultResult::Resolved;
     }
 }
 extern "C" bool FileMapHandleUserFault(uint64_t address,uint64_t error) {
-    return ResolveMappingFault(address,error);
+    return ResolveUserMappingFault(address,error)==MappingFaultResult::Resolved;
 }
 
 // ---------------------------------------------------------------------------

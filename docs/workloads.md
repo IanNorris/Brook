@@ -1995,3 +1995,19 @@ lock query/protocol stage but fails with SQLITE_IOERR_SHMMAP: writable shared
 regular-file mappings are still explicitly unsupported. This is not Firefox
 profile/audio acceptance. See the [record-lock report](record-locks.md) for
 implementation invariants, exact guest/build evidence and remaining work.
+
+
+### Typed file EOF faults (17 October)
+
+File EOF now reaches user handlers as SIGBUS/BUS_ADRERR with the original fault
+address, and default termination preserves SIGBUS in wait status. The same
+static musl probe passes 10/10 on Linux, fails seven EOF cases on the unchanged
+Brook baseline (3/10), and passes 10/10 on the production candidate. A separate
+test kernel passes 13/13, including deterministic stale-EOF races with file
+growth, MAP_FIXED replacement and protection changes. All 30 hosted suites pass.
+
+The production terminal renders the native 10/10 result; Chromium navigation and
+Codium edit/save/ownership/normal-close smoke checks also pass. All three guests
+stop with checked sync and clean offline filesystems. Writable shared mappings,
+mapped truncate and raw kernel-uaccess recovery remain open; this does not
+accept SQLite WAL or Firefox audio. See the [fault-outcome report](file-fault-outcomes.md).

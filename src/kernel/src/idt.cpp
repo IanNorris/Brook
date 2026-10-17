@@ -18,6 +18,7 @@
 #include "tty.h"
 #include "memory/virtual_memory.h"
 #include "memory/user_mapping.h"
+#include "memory/mapping_fault.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
 #include "string.h"
@@ -317,7 +318,7 @@ extern "C" int  PmmDumpFreeLogNoLock(uint64_t phys);   // BRO-179 fault-context 
 extern "C" bool PmmDecodePoisonNoLock(uint64_t qword); // BRO-179 fault-context (no g_pmmLock)
 
 static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t errorCode, bool hasErrorCode, bool swapgsDone = false,
-                            const uint64_t* capturedFaultAddress = nullptr)
+                            const uint64_t* capturedFaultAddress = nullptr,int signalOverride = 0)
 {
     __asm__ volatile("cli");
     uint64_t cr2 = 0;
@@ -730,6 +731,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         else if (vector == 1 || vector == 3) faultSignal = 5; // SIGTRAP
         else if (vector == 6) faultSignal = 4; // SIGILL
         else if (vector == 17) faultSignal = 7; // SIGBUS (alignment check)
+        if(signalOverride)faultSignal=signalOverride;
         if (diagProc)
             brook::SchedulerKillThreadGroup(diagProc->tgid, diagProc,
                                             -static_cast<int>(vector), faultSignal);
@@ -903,6 +905,7 @@ static constexpr int32_t SEGV_ACCERR = 2;
 
 extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 {
+    int mappingSignal=0,mappingSignalCode=0;
     // The assembly stub has already done SWAPGS if needed.
     __asm__ volatile("cli");
     // Nested, recoverable faults while resolving or diagnosing this exception
@@ -953,13 +956,15 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         // Fault transactions finish before the user boundary, including failed
         // captures. Kernel-origin faults retain their outer operation boundary.
         if (fromUser && !pfPresent && isUserAddr && cowProc) {
-            extern bool MemFdHandleUserFault(uint64_t,uint64_t);
-            extern bool FileMapHandleUserFault(uint64_t,uint64_t);
-            bool resolved=MemFdHandleUserFault(cr2cow,ef->errorCode) || FileMapHandleUserFault(cr2cow,ef->errorCode);
+            const auto outcome=brook::ResolveUserMappingFault(cr2cow,ef->errorCode);
             if (brook::SchedulerKernelOperationBoundary()) {
                 brook::SchedulerYield();__builtin_trap();
             }
-            if (resolved) { __asm__ volatile("sti");return; }
+            if (outcome==brook::MappingFaultResult::Resolved) { __asm__ volatile("sti");return; }
+            if(outcome==brook::MappingFaultResult::EndOfFile || outcome==brook::MappingFaultResult::IoError) {
+                mappingSignal=7; // SIGBUS: BUS_ADRERR=2 / BUS_OBJERR=3
+                mappingSignalCode=outcome==brook::MappingFaultResult::EndOfFile?2:3;
+            }
         }
 
         // Kernel syscalls still copy some user buffers directly.  Until the
@@ -1496,7 +1501,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     }
 
     brook::Process* proc = brook::ProcessCurrent();
-    int signum = ExceptionToSignal(static_cast<uint8_t>(vector));
+    int signum = mappingSignal?mappingSignal:ExceptionToSignal(static_cast<uint8_t>(vector));
 
     // BRO-194: classify the faulting user address against every tracked mapping
     // (overrun-past-a-mapping vs wild pointer) for the rare gltron AVX-memcpy
@@ -1710,7 +1715,9 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         // Fill siginfo
         sf->info.si_signo = signum;
         sf->info.si_errno = 0;
-        if (vector == 14)
+        if(mappingSignal)
+            sf->info.si_code=mappingSignalCode;
+        else if (vector == 14)
             sf->info.si_code = (ef->errorCode & 1) ? SEGV_ACCERR : SEGV_MAPERR;
         else
             sf->info.si_code = SI_KERNEL;
@@ -1940,7 +1947,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     ifrm.flags = ef->rflags;
     ifrm.sp    = ef->rsp;
     ifrm.ss    = ef->ss;
-    HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true, true /*swapgsDone*/, &cr2);
+    HandleException(static_cast<uint8_t>(vector), &ifrm, ef->errorCode, true, true /*swapgsDone*/, &cr2,mappingSignal);
     // HandleException never returns for user-mode faults (it exits the process).
     for (;;) __asm__ volatile("cli; pause");
 }

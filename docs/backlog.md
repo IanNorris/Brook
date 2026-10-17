@@ -10,6 +10,10 @@
   Complete coherent regular-file MAP_SHARED writes, mapped resize coordination,
   writeback/error recovery and teardown before accepting WAL/browser profiles.
   Do not bypass that guard with private mappings or discard database writes.
+  [Typed EOF user-fault delivery](file-fault-outcomes.md) is now verified, including
+  stale EOF versus growth/remap/protection. Mapped resize still needs phased
+  invalidation, post-ACK flushing, private-prefix/quarantine recovery and safe
+  kernel uaccess when a mapping changes after buffer validation.
 
 ## VM bridge findings, 17 October
 

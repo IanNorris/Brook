@@ -2,6 +2,7 @@
 #include "address.h"
 #include "sync/kmutex.h"
 #include "record_locks.h"
+#include "mapping_fault.h"
 
 namespace brook {
 struct Vnode;
@@ -40,6 +41,11 @@ PhysicalAddress FileObjectGetPage(FileObject* object,Vnode* vnode,uint64_t index
 static constexpr uint32_t FILE_OBJECT_PAGE_BATCH = 16;
 int FileObjectGetPages(FileObject* object,Vnode* vnode,uint64_t index,uint32_t count,
                        PhysicalAddress* pages,bool* loaded = nullptr);
+// Fault preparation: primary EOF classification and neighbor bounds are sampled
+// under the same inode gate as loading. All slots are cleared on entry; owned
+// references returned on success. Caller must revalidate its VMA/file epoch.
+MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t index,
+                                       uint32_t capacity,PhysicalAddress* pages,bool* loaded=nullptr);
 int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset);
 int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset);
 // Kernel-staged buffer only. Fresh EOF selection, backend write and resident

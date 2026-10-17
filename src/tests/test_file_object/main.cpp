@@ -31,13 +31,14 @@ struct Backend {
     unsigned reads=0;
     unsigned writes=0,errorAtWrite=0,zeroAtWrite=0;
     bool failRead=false,failWrite=false,failTruncate=false,failAfterTruncate=false,failStat=false;
+    int readError=-5,statError=-5;
     unsigned char* redirty=nullptr;
     bool blockWrite=false;
     unsigned writeLimit=~0u,readLimit=~0u,zeroAtRead=0,errorAtRead=0;
 };
 int read_backend(Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset) {
     auto* backend=static_cast<Backend*>(vnode->priv);++backend->reads;
-    if(backend->failRead || backend->reads==backend->errorAtRead)return -5;
+    if(backend->failRead || backend->reads==backend->errorAtRead)return backend->readError;
     if(backend->reads==backend->zeroAtRead)return 0;
     if(*offset>=backend->bytes.size())return 0;
     size_t count=backend->bytes.size()-*offset;if(count>length)count=length;
@@ -62,7 +63,7 @@ int write_backend(Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offs
     std::memcpy(backend->bytes.data()+*offset,buffer,length);*offset+=length;return static_cast<int>(length);
 }
 int stat_backend(Vnode* vnode,VnodeStat* stat) {
-    auto* backend=static_cast<Backend*>(vnode->priv);if(backend->failStat)return -5;
+    auto* backend=static_cast<Backend*>(vnode->priv);if(backend->failStat)return backend->statError;
     stat->size=backend->bytes.size();return 0;
 }
 int truncate_backend(Vnode* vnode,uint64_t length) {
@@ -354,6 +355,40 @@ static void BatchPages() {
     FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
 }
 
+static void FaultPages() {
+    CHECK(refs.empty() && heapBlocks==0);
+    Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(4097,0x5a);
+    Vnode vnode{&operations,VnodeType::File,&backend,1,0};
+    PhysicalAddress pages[4];bool loaded=true;
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,2,4,pages,&loaded)==MappingFaultResult::EndOfFile);
+    CHECK(!loaded && backend.reads==0 && refs.empty());for(auto page:pages)CHECK(!page);
+    backend.failStat=true;
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::IoError);
+    backend.statError=-12;
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::OutOfMemory);
+    backend.statError=-5;
+    backend.failStat=false;failHeap=true;
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::OutOfMemory);
+    failHeap=false;backend.failRead=true;
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::IoError);
+    backend.readError=-6;
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::IoError);
+    backend.readError=-12;
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::OutOfMemory);
+    backend.readError=-5;
+    backend.failRead=false;CHECK(refs.empty() && heapBlocks==0);
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,1,4,pages,&loaded)==MappingFaultResult::Resolved);
+    CHECK(loaded && pages[0] && !pages[1] && !pages[2] && !pages[3]);
+    auto* tail=reinterpret_cast<unsigned char*>(pages[0].raw());
+    CHECK(tail[0]==0x5a && tail[1]==0 && tail[4095]==0);PmmUnrefPage(pages[0]);
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::Resolved);
+    CHECK(pages[0] && pages[1] && !pages[2] && !pages[3]);
+    for(auto page:pages)if(page)PmmUnrefPage(page);
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,~uint64_t{0}/4096+1,4,pages)==MappingFaultResult::EndOfFile);
+    for(auto page:pages)CHECK(!page);
+    FileObjectDispose(&backend.object);CHECK(refs.empty() && heapBlocks==0);
+    std::puts("FILE FAULT PREP PASS EOF/IO/OOM/partial-tail/bounded-neighbors/reference-cleanup");
+}
 int main() {
     Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(8192,0x31);
     Vnode first{&operations,VnodeType::File,&backend,1,0},second=first;
@@ -412,5 +447,6 @@ int main() {
     WritebackPages();
     WritebackLifetime();
     AppendTransactions();
+    FaultPages();
     std::puts("FILE_OBJECT PASS batch/sparse-pins/one-gate/failure-cleanup/concurrent-load/io-coherence/partial-error/truncate/zero-tail/lifetime/writeback-range/snapshot/redirty/error-retry");
 }

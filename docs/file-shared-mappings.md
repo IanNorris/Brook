@@ -4,14 +4,14 @@ Implementation target following the mapping-transaction checkpoint of
 2026-10-16. Writable regular-file MAP_SHARED remains disabled until the connected
 path below passes. The work must cover ordinary I/O as well as mmap.
 
-## Current gaps
+## Current implementation and remaining gaps
 
 Ext2 now embeds a `FileObject` in its existing retained live-inode holder.
 Separate opens share that object; mappings retain a vnode and therefore its
 inode holder. Quiescent last-holder/orphan disposal drops cached frames without
 a sleeping lock or filesystem I/O. There is no permanent vnode/object cycle,
 and a reused inode gets a fresh object. `VnodeOps::file_object` exposes the
-borrowed object while a caller retains its vnode; modules use ABI 13.
+borrowed object while a caller retains its vnode.
 
 File faults now prepare canonical pages through that object outside AS mutation.
 One per-inode gate serializes loading, so concurrent faults retain one completed
@@ -23,17 +23,22 @@ VfsRead and VfsWrite now use the same gate and cached frames for ext2. Reads
 currently fetch backend bytes and overlay resident pages. Successful ordinary
 writes update only their written prefix in resident pages; errors preserve the
 cached data. User buffers use bounded 64-KiB staging with copyin/copyout outside
-file and filesystem locks. Unmapped truncate invalidates cached pages after a
-successful backend resize. These are write-through operations; mapped stores,
-dirty writeback and msync are not implemented.
+file and filesystem locks. Unmapped truncate invalidates cached pages after any
+backend resize attempt, including failures after mutation. Ordinary writes are
+write-through. Conservative writable exposure, retained dirty backing and
+snapshot writeback primitives are implemented, as are fsync/fdatasync/global
+flush callers. Production mappings do not yet expose writable aliases; msync
+and periodic flushing remain unimplemented. Later sections retain the historical
+implementation evidence for these stages.
 
 The older clean cache in `memory/file_page_cache.{h,cpp}` remains the fallback
 for other filesystems. Both ext2 regular files and FAT still set the old cacheId
 to zero; ext2 now uses its live-inode object instead. FAT has no file-object
 accessor and does not acquire ext2's new coherence guarantees.
 VfsTruncate still returns EBUSY while any file mapping pin exists. There is no
-msync implementation. The existing boolean fault result cannot distinguish
-EOF/SIGBUS from an invalid address/SIGSEGV.
+msync implementation. [Typed user-fault outcomes](file-fault-outcomes.md) now pass
+baseline/candidate and deterministic stale-EOF checks as a prerequisite for mapped
+resize; kernel raw-copy fault recovery remains separate.
 
 Review also exposed PMM reference saturation at 255. A real-PMM hosted test
 reproduced count 255 where 256 was required. Reference and mapping counts are now
@@ -47,9 +52,10 @@ regular-file sharing. Candidate evidence:
 
 ## Required structure and ordering
 
-The live-inode object and canonical loading are implemented for ext2. Next add
-mapping registrations, size/publication coordination and dirty writeback to that
-object. Its inode-holder references provide the lifetime shared across opens. FAT's current directory-entry identity is valid
+The live-inode object, canonical loading, mapping registrations, publication
+gates and retained writeback are implemented for ext2. Next connect mapped resize,
+writable publication and msync. Its inode-holder references provide the lifetime
+shared across opens. FAT's current directory-entry identity is valid
 only while that entry remains allocated; rename/unlink/reuse require explicit
 lifetime support before offering the complete contract on that filesystem.
 

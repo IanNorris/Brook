@@ -101,13 +101,15 @@ void FileObjectDispose(FileObject* object) {
         KernelPanic("file object: disposing retained inode");
     for(auto& bucket:object->pages) { auto* pages=bucket;bucket=nullptr;Release(pages); }
 }
-static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t index,bool load,int* error,bool* loaded) {
+static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t index,bool load,int* error,bool* loaded,
+                                     const VnodeStat* knownStat=nullptr) {
     if(error)*error=0;
     if(loaded)*loaded=false;
     if(index>~uint64_t{0}/4096) { if(error)*error=-22;return PhysicalAddress{}; }
     if(auto* page=Find(object,index)) { PmmRefPage(page->physical);return page->physical; }
     if(!load)return PhysicalAddress{};
-    VnodeStat stat{};int result=vnode->ops->stat(vnode,&stat);
+    VnodeStat stat{};int result=0;
+    if(knownStat)stat=*knownStat;else result=vnode->ops->stat(vnode,&stat);
     if(result || index*4096>=stat.size) { if(error)*error=result?result:-6;return PhysicalAddress{}; }
     auto* page=static_cast<FileObjectPage*>(kmalloc(sizeof(FileObjectPage)));
     if(!page) { if(error)*error=-12;return PhysicalAddress{}; }
@@ -155,6 +157,27 @@ int FileObjectGetPages(FileObject* object,Vnode* vnode,uint64_t index,uint32_t c
             PmmRefPage(page->physical);pages[i]=page->physical;
         }
     return 0;
+}
+MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t index,
+                                       uint32_t capacity,PhysicalAddress* pages,bool* loaded) {
+    [[maybe_unused]] Operation operation;
+    if(loaded)*loaded=false;
+    if(!pages || !capacity || capacity>FILE_OBJECT_PAGE_BATCH)return MappingFaultResult::Unhandled;
+    for(uint32_t i=0;i<capacity;++i)pages[i]=PhysicalAddress{};
+    if(index>~uint64_t{0}/4096)return MappingFaultResult::EndOfFile;
+    Gate held(object);
+    VnodeStat stat{};
+    const int statResult=vnode->ops->stat(vnode,&stat);
+    if(statResult)return statResult==-12?MappingFaultResult::OutOfMemory:MappingFaultResult::IoError;
+    if(index*4096>=stat.size)return MappingFaultResult::EndOfFile;
+    int error=0;pages[0]=GetPageLocked(object,vnode,index,true,&error,loaded,&stat);
+    if(!pages[0])return error==-12?MappingFaultResult::OutOfMemory:
+                       MappingFaultResult::IoError;
+    for(uint32_t i=1;i<capacity;++i) {
+        if(index+i>~uint64_t{0}/4096 || (index+i)*4096>=stat.size)break;
+        if(auto* page=Find(object,index+i)) { PmmRefPage(page->physical);pages[i]=page->physical; }
+    }
+    return MappingFaultResult::Resolved;
 }
 int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset) {
     [[maybe_unused]] Operation operation;
