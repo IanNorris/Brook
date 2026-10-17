@@ -1151,6 +1151,8 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
         return -1;
     }
 
+    Process* launcher = ProcessCurrent();
+    child->launchId = launcher ? launcher->launchId : 0;
     t->child = child;creation.child=child;
     t->foregroundPgid = child->pgid; // default: bash's own group
 

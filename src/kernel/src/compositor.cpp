@@ -2136,6 +2136,10 @@ static void CompositorHandleMouseWM()
             // "+" button — spawn new terminal
             WmSpawnTerminal();
         }
+        else if (tbIdx <= -10)
+        {
+            WmTaskbarPendingClick(tbIdx);
+        }
         else if (tbIdx >= 0)
         {
             Window* tw = WmGetWindow(tbIdx);
@@ -2974,6 +2978,7 @@ static void CompositorLoop()
     // Branch: WM mode vs legacy mode
     if (WmIsActive())
     {
+        WmLaunchFeedbackPoll();
         CompositorLoopWM();
     }
     else

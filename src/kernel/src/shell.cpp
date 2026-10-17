@@ -35,6 +35,7 @@
 #include "module.h"
 #include "audio.h"
 #include "debug_overlay.h"
+#include "sync/kmutex.h"
 
 // Strace control (defined in syscall.cpp)
 bool StraceEnablePid(uint32_t pid, bool enable, uint32_t filter = 0);
@@ -51,6 +52,29 @@ static constexpr uint32_t MAX_LINE    = 256;
 // Match run's 32-entry argv: the GL3 experiment needs 25 shell arguments.
 static constexpr uint32_t MAX_ARGS    = 32;
 
+
+// All shell entrypoints share layout/CWD and shebang storage. Nested `source`
+// calls on the same kernel thread reuse the outer dispatch lock. Early boot
+// has no current process and is single-threaded, so it needs no sleeping lock.
+static KMutex g_dispatchLock{};
+static Process* g_dispatchOwner = nullptr;
+class ShellDispatchGuard {
+public:
+    ShellDispatchGuard() {
+        Process* self = ProcessCurrent();
+        if (!self || __atomic_load_n(&g_dispatchOwner, __ATOMIC_ACQUIRE) == self) return;
+        KMutexLock(&g_dispatchLock);
+        __atomic_store_n(&g_dispatchOwner, self, __ATOMIC_RELEASE);
+        held = true;
+    }
+    ~ShellDispatchGuard() {
+        if (!held) return;
+        __atomic_store_n(&g_dispatchOwner, static_cast<Process*>(nullptr), __ATOMIC_RELEASE);
+        KMutexUnlock(&g_dispatchLock);
+    }
+private:
+    bool held = false;
+};
 
 // Auto-tiling grid state
 static uint32_t g_gridCols  = 0;    // 0 = auto-compute
@@ -392,9 +416,11 @@ static bool PeekShebang(const char* path, char* outInterp, uint32_t interpSize,
 // Spawn a process from a binary path with arguments
 // ---------------------------------------------------------------------------
 
-static Process* SpawnProcess(const char* path, int argc, const char* const* argv,
+static int SpawnProcess(const char* path, int argc, const char* const* argv,
                              uint32_t uidOverride = CredentialUnchanged,
-                             uint32_t gidOverride = CredentialUnchanged)
+                             uint32_t gidOverride = CredentialUnchanged,
+                             bool strace = false, bool straceErrors = false,
+                             bool quiet = false, bool trackLaunch = true)
 {
     ExecutableImage image{};
     char executablePath[sizeof(Process::exePath)];
@@ -405,7 +431,7 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     if (readResult != 0)
     {
         KPrintf("shell: cannot load '%s'\n", path);
-        return nullptr;
+        return -1;
     }
 
     DbgPrintf("SHELL: loaded '%s' (%lu bytes)\n", path, image.size);
@@ -438,7 +464,7 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     if (!proc)
     {
         KPrintf("shell: failed to create process from '%s'\n", path);
-        return nullptr;
+        return -1;
     }
 
     uint32_t ei = 0;
@@ -465,6 +491,20 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     if (g_spawnCount >= 10) proc->name[ni++] = static_cast<char>('0' + (g_spawnCount / 10) % 10);
     proc->name[ni++] = static_cast<char>('0' + g_spawnCount % 10);
     proc->name[ni] = '\0';
+
+    // Configure the unpublished child completely. Once SchedulerAddProcess
+    // makes it runnable, even the next instruction may race its final reaping.
+    if (g_shellCwd[0]) StrCopy(proc->cwd, g_shellCwd, sizeof(proc->cwd));
+    proc->straceEnabled = strace || straceErrors;
+    proc->straceErrorsOnly = straceErrors;
+    if (quiet) {
+        proc->fds[1].type = FdType::DevNull;
+        proc->fds[1].handle = nullptr;
+        proc->fds[2].type = FdType::DevNull;
+        proc->fds[2].handle = nullptr;
+    }
+    Process* launcher = ProcessCurrent();
+    proc->launchId = trackLaunch && launcher ? launcher->launchId : 0;
 
     // Set up compositor placement
     bool skipVfb = g_ttyFull || g_vfbNone;
@@ -519,11 +559,13 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
                           proc->name, proc->pid, destX, destY, cols, rows, g_scale);
         }
     }
-    SchedulerAddProcess(proc);
+    const int pid = static_cast<int>(proc->pid);
     KPrintf("  → %s (pid %u)\n", proc->name, proc->pid);
-
+    if (straceErrors) KPrintf("[strace-errors enabled for pid %u]\n", proc->pid);
+    else if (strace) KPrintf("[strace enabled for pid %u]\n", proc->pid);
     ++g_spawnCount;
-    return proc;
+    SchedulerAddProcess(proc);
+    return pid;
 }
 
 // ---------------------------------------------------------------------------
@@ -673,8 +715,7 @@ static int ExecCommand(int argc, const char* const* argv)
                 resolved[i + 1] = argv[1][i];
             resolved[i + 1] = '\0';
         }
-        ShellExecScript(resolved);
-        return 0;
+        return ShellExecScript(resolved);
     }
 
     // Built-in: ps
@@ -1087,49 +1128,17 @@ static int ExecCommand(int argc, const char* const* argv)
             StrCopy(shebangPath, interpStore[depth], sizeof(shebangPath));
         }
 
-        Process* proc = nullptr;
         if (argv0Override)
         {
             const char* newArgv[32];
             newArgv[0] = argv0Override;
             for (int i = 1; i < effArgc && i < 31; ++i)
                 newArgv[i] = effArgv[i];
-            proc = SpawnProcess(shebangPath, effArgc, newArgv, uidOverride, gidOverride);
+            return SpawnProcess(shebangPath, effArgc, newArgv, uidOverride, gidOverride,
+                                strace, straceErrors, quiet, !runOnce);
         }
-        else
-        {
-            proc = SpawnProcess(shebangPath, effArgc, effArgv, uidOverride, gidOverride);
-        }
-
-        // Propagate shell CWD to spawned process
-        if (proc && g_shellCwd[0])
-        {
-            uint32_t ci = 0;
-            while (g_shellCwd[ci] && ci < sizeof(proc->cwd) - 1)
-            {
-                proc->cwd[ci] = g_shellCwd[ci];
-                ci++;
-            }
-            proc->cwd[ci] = '\0';
-        }
-
-        if (proc && strace) {
-            proc->straceEnabled = true;
-            KPrintf("[strace enabled for pid %u]\n", proc->pid);
-        }
-        if (proc && straceErrors) {
-            proc->straceEnabled = true;
-            proc->straceErrorsOnly = true;
-            KPrintf("[strace-errors enabled for pid %u]\n", proc->pid);
-        }
-        if (proc && quiet) {
-            // Redirect stdout/stderr to /dev/null
-            proc->fds[1].type = FdType::DevNull;
-            proc->fds[1].handle = nullptr;
-            proc->fds[2].type = FdType::DevNull;
-            proc->fds[2].handle = nullptr;
-        }
-        return proc ? static_cast<int>(proc->pid) : -1;
+        return SpawnProcess(shebangPath, effArgc, effArgv, uidOverride, gidOverride,
+                            strace, straceErrors, quiet, !runOnce);
     }
 
     // Built-in: wait — block until all user processes finish
@@ -1511,8 +1520,7 @@ static int ExecCommand(int argc, const char* const* argv)
     char resolved[128];
     if (ResolveBinaryPath(cmd, resolved, sizeof(resolved)))
     {
-        SpawnProcess(resolved, argc, argv);
-        return 0;
+        return SpawnProcess(resolved, argc, argv);
     }
 
     KPrintf("shell: unknown command '%s'\n", cmd);
@@ -1679,6 +1687,7 @@ static int ReadInteractiveLine(char* buf, uint32_t maxLen)
 
 int ShellLaunchCommand(const char* command)
 {
+    ShellDispatchGuard dispatch;
     if (!command || StrLen(command) >= MAX_LINE) return -1;
     char line[MAX_LINE];
     StrCopy(line, command, sizeof(line));
@@ -1690,6 +1699,7 @@ int ShellLaunchCommand(const char* command)
 
 int ShellExecScript(const char* path)
 {
+    ShellDispatchGuard dispatch;
     Vnode* vn = VfsOpen(path, 0);
     if (!vn)
     {
@@ -1699,7 +1709,9 @@ int ShellExecScript(const char* path)
 
     KPrintf("Executing %s\n", path);
     SerialPrintf("SHELL: executing script '%s'\n", path);
+    const bool previousScriptMode = g_scriptMode;
     g_scriptMode = true;
+    int result = 0;
 
     char line[MAX_LINE];
     uint64_t offset = 0;
@@ -1720,23 +1732,26 @@ int ShellExecScript(const char* path)
         int argc = ParseLine(line, argv, MAX_ARGS);
         if (argc > 0)
         {
-            ExecCommand(argc, argv);
+            if (ExecCommand(argc, argv) < 0) result = -1;
         }
     }
 
     VfsClose(vn);
-    g_scriptMode = false;
+    g_scriptMode = previousScriptMode;
 
     SerialPrintf("SHELL: script '%s' finished\n", path);
-    return 0;
+    return result;
 }
 
 int ShellExecString(const char* script)
 {
+    ShellDispatchGuard dispatch;
     if (!script || !script[0]) return -1;
 
     SerialPrintf("SHELL: executing inline script\n");
+    const bool previousScriptMode = g_scriptMode;
     g_scriptMode = true;
+    int result = 0;
 
     char line[MAX_LINE];
     [[maybe_unused]] uint32_t lineNum = 0;
@@ -1763,13 +1778,13 @@ int ShellExecString(const char* script)
         int argc = ParseLine(line, argv, MAX_ARGS);
         if (argc > 0)
         {
-            ExecCommand(argc, argv);
+            if (ExecCommand(argc, argv) < 0) result = -1;
         }
     }
 
-    g_scriptMode = false;
+    g_scriptMode = previousScriptMode;
     SerialPrintf("SHELL: inline script finished\n");
-    return 0;
+    return result;
 }
 
 [[noreturn]] void ShellInteractive()
@@ -1786,6 +1801,7 @@ int ShellExecString(const char* script)
         int len = ReadInteractiveLine(line, MAX_LINE);
         if (len <= 0) continue;
 
+        ShellDispatchGuard dispatch;
         const char* argv[MAX_ARGS];
         int argc = ParseLine(line, argv, MAX_ARGS);
         if (argc > 0)

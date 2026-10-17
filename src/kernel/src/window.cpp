@@ -6,6 +6,8 @@
 
 #include "window.h"
 #include "launcher_command.h"
+#include "launch_feedback.h"
+#include "shell.h"
 #include "process.h"
 #include "scheduler.h"
 #include "apic.h"
@@ -113,6 +115,8 @@ static void WmRestoreTheme()
 static Window   g_windows[WM_MAX_WINDOWS] = {};
 static bool     g_wmActive = false;
 static int      g_focusedIdx = -1;
+static uint64_t g_windowIdentity = 0;
+static int g_taskbarPageTarget = -1;
 static uint32_t g_nextZOrder = 1;  // 0 = backmost, higher = front
 
 // Immutable launcher payloads. Only refs change after publication. The single
@@ -136,8 +140,83 @@ static uint32_t g_launcherRequested = 1;
 static bool g_launcherWorkerStarted = false;
 static bool g_launcherLoaded = false;
 static bool g_launcherOpen = false;
+static bool g_launcherQueueFull = false;
 static uint32_t g_launcherScroll = 0;
 static void LauncherStartWorker();
+
+// Requests own all metadata/icon pixels, never launcher snapshot pointers.
+struct LauncherRequest {
+    char command[128];
+    bool desktop, hasIcon;
+    uint32_t icon[LAUNCHER_ICON_PX * LAUNCHER_ICON_PX];
+};
+static SpinLock g_launchLock;
+static LaunchFeedbackTable g_launches;
+static LauncherRequest g_launchRequests[LaunchFeedbackTable::Capacity];
+static bool g_launchBusy = false;
+
+bool WmLaunchBusy() { return __atomic_load_n(&g_launchBusy, __ATOMIC_ACQUIRE); }
+
+void WmLaunchFeedbackPoll()
+{
+    static uint64_t lastPoll = 0;
+    const uint64_t now = ApicTickCount();
+    if (now - lastPoll < 100) return;
+    lastPoll = now;
+    // Window/process lookups may take sleeping/scheduler locks. Never hold the
+    // feedback spinlock while acquiring them. Completion is versioned by token.
+    bool hadEntries = false;
+    SpinLockAcquire(&g_launchLock);
+    for (const auto& e : g_launches.entries) hadEntries |= e.phase != LaunchPhase::Empty;
+    SpinLockRelease(&g_launchLock);
+    if (!hadEntries) {
+        if (__atomic_exchange_n(&g_launchBusy, false, __ATOMIC_ACQ_REL)) CompositorMarkDirty();
+        return;
+    }
+    {
+        VfbGuard windows;
+        for (const auto& w : g_windows) {
+            if (!w.proc || !w.visible || !w.focusable) continue;
+            SpinLockAcquire(&g_launchLock);
+            g_launches.Window(w.proc->launchId, w.creationIdentity, w.appId);
+            SpinLockRelease(&g_launchLock);
+        }
+    }
+    for (unsigned i = 0; i < LaunchFeedbackTable::Capacity; ++i) {
+        LaunchFeedback entry;
+        SpinLockAcquire(&g_launchLock);
+        entry = g_launches.entries[i];
+        SpinLockRelease(&g_launchLock);
+        if (entry.phase == LaunchPhase::Empty) continue;
+        // A worker may complete Dispatching -> Waiting while the lock is
+        // released. Only a sampled Waiting phase can supply a negative result.
+        const bool live = entry.phase != LaunchPhase::Waiting || SchedulerLaunchHasLiveProcesses(entry.token);
+        SpinLockAcquire(&g_launchLock);
+        g_launches.Advance(entry.token, now, live);
+        SpinLockRelease(&g_launchLock);
+    }
+    bool busy = false;
+    SpinLockAcquire(&g_launchLock);
+    for (const auto& e : g_launches.entries) busy |= e.busy();
+    SpinLockRelease(&g_launchLock);
+    __atomic_store_n(&g_launchBusy, busy, __ATOMIC_RELEASE);
+    CompositorMarkDirty(); // Also erase the final expired notice.
+}
+
+void WmTaskbarPendingClick(int target)
+{
+    const bool navigation = target <= -100;
+    if (navigation) target += 90;
+    if (target > -10 || target <= -10 - static_cast<int>(LaunchFeedbackTable::Capacity)) return;
+    const unsigned slot = static_cast<unsigned>(-10 - target);
+    if (!navigation) {
+        SpinLockAcquire(&g_launchLock);
+        g_launches.Dismiss(slot); // Active launch is not cancellation.
+        SpinLockRelease(&g_launchLock);
+    }
+    g_taskbarPageTarget = target;
+    CompositorMarkDirty();
+}
 
 class LauncherReadGuard {
     LauncherSnapshot* snapshot;
@@ -469,6 +548,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
 
     Window& w = g_windows[idx];
     w.proc = proc;
+    w.creationIdentity = __atomic_add_fetch(&g_windowIdentity, 1, __ATOMIC_ACQ_REL);
     w.appId[0] = 0;
     w.x = x;
     w.y = y;
@@ -719,6 +799,7 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
 
 void WmSetFocus(int idx)
 {
+    g_taskbarPageTarget = -1;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     if (!g_windows[idx].proc) return;
     if (!g_windows[idx].focusable) return;
@@ -1151,8 +1232,8 @@ struct TaskbarLayout
 {
     int y, textY;
     WmRect apps, terminal, next, clock, gpu, fps;
-    WmRect buttons[WM_MAX_WINDOWS];
-    int indices[WM_MAX_WINDOWS];
+    WmRect buttons[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
+    int indices[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int count, nextIndex;
     char clockText[32];
 };
@@ -1192,7 +1273,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
         if (width > digitW) digitW = width;
     }
     reserve(l.fps, digitW * 3 + WmTextWidth(" FPS"));
-    int ids[WM_MAX_WINDOWS], total = 0, focused = 0;
+    int ids[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity], total = 0, focused = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
         const Window& w = g_windows[i];
@@ -1200,6 +1281,13 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
         if (w.focused) focused = total;
         ids[total++] = static_cast<int>(i);
     }
+    SpinLockAcquire(&g_launchLock);
+    for (unsigned i = 0; i < LaunchFeedbackTable::Capacity; ++i) {
+        if (g_launches.entries[i].phase == LaunchPhase::Empty) continue;
+        if (g_taskbarPageTarget == -10 - static_cast<int>(i)) focused = total;
+        ids[total++] = -10 - static_cast<int>(i);
+    }
+    SpinLockRelease(&g_launchLock);
     int available = right - x;
     if (!total || available <= 0) return l;
     int capacity = (available + WM_TASKBAR_PADDING) / (WM_TASKBAR_BTN_WIDTH + WM_TASKBAR_PADDING);
@@ -1233,7 +1321,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
 
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,
-                     uint64_t /*uptimeMs*/, int32_t mouseX, int32_t mouseY)
+                     uint64_t uptimeMs, int32_t mouseX, int32_t mouseY)
 {
     if (!g_wmActive || !backBuffer) return;
     LauncherReadGuard icons;
@@ -1257,19 +1345,56 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                l.apps.y + (l.apps.h - 24) / 2, 24, icons.get().appsIcon);
     WmDrawIcon(backBuffer, stride, screenW, screenH, l.terminal.x + (l.terminal.w - 24) / 2,
                l.terminal.y + (l.terminal.h - 24) / 2, 24, icons.get().terminalIcon);
+    char launchTitle[80]{};
     const char* hoverTitle = l.apps.contains(mouseX, mouseY) ? "Applications" :
         l.terminal.contains(mouseX, mouseY) ? "New terminal" : nullptr;
     for (int i = 0; i < l.count; ++i)
     {
-        const Window& w = g_windows[l.indices[i]];
         const WmRect& r = l.buttons[i];
+        if (l.indices[i] <= -10) {
+            const unsigned slot = static_cast<unsigned>(-10 - l.indices[i]);
+            LaunchFeedback e;
+            uint32_t icon[LAUNCHER_ICON_PX * LAUNCHER_ICON_PX];
+            bool hasIcon;
+            SpinLockAcquire(&g_launchLock);
+            e = g_launches.entries[slot];
+            hasIcon = g_launchRequests[slot].hasIcon;
+            if (hasIcon) memcpy(icon, g_launchRequests[slot].icon, sizeof(icon));
+            SpinLockRelease(&g_launchLock);
+            button(r, "", false, false);
+            if (r.w >= 24 && r.h >= 24)
+                WmDrawIcon(backBuffer, stride, screenW, screenH, r.x + (r.w - 24) / 2,
+                           r.y + (r.h - 24) / 2, 24, hasIcon ? icon : icons.get().applicationIcon);
+            if (e.busy()) {
+                // Eight positions form a bounded animated progress ring.
+                static const int dx[8] = {0, 3, 4, 3, 0, -3, -4, -3};
+                static const int dy[8] = {-4, -3, 0, 3, 4, 3, 0, -3};
+                unsigned step = (uptimeMs / 100) % 8;
+                for (unsigned dot = 0; dot < 8; ++dot)
+                    WmFillRect(backBuffer, stride, screenW, screenH, r.x + r.w - 8 + dx[dot],
+                               r.y + r.h - 8 + dy[dot], 2, 2,
+                               dot == step ? WmCurrentPalette().taskText : WmCurrentPalette().minimized);
+            } else {
+                WmRenderString(backBuffer, stride, screenW, screenH, r.x + r.w - 10,
+                               l.textY, "!", WmCurrentPalette().taskText, WmCurrentPalette().taskButton, 10);
+            }
+            if (r.contains(mouseX, mouseY)) {
+                WmStrCopy(launchTitle, e.busy() ? "Starting: " :
+                    e.phase == LaunchPhase::TimedOut ? "Still waiting: " : "Launch failed: ", sizeof(launchTitle));
+                size_t n = strlen(launchTitle);
+                WmStrCopy(launchTitle + n, e.title, sizeof(launchTitle) - n);
+                hoverTitle = launchTitle;
+            }
+            continue;
+        }
+        const Window& w = g_windows[l.indices[i]];
         button(r, "", w.focused && !w.minimized, w.minimized);
         if (r.w >= 24 && r.h >= 24)
             WmDrawIcon(backBuffer, stride, screenW, screenH, r.x + (r.w - 24) / 2,
                        r.y + (r.h - 24) / 2, 24, WindowIcon(w, icons.get()));
         if (r.contains(mouseX, mouseY)) hoverTitle = w.title;
     }
-    if (l.nextIndex >= 0) {
+    if (l.next.w > 0) {
         button(l.next, ">", false, false);
         if (l.next.contains(mouseX, mouseY)) hoverTitle = "More windows";
     }
@@ -1308,7 +1433,7 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
     const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
     if (l.apps.contains(mx, my)) return -3;
     if (l.terminal.contains(mx, my)) return -2;
-    if (l.next.contains(mx, my)) return l.nextIndex;
+    if (l.next.contains(mx, my)) return l.nextIndex <= -10 ? l.nextIndex - 90 : l.nextIndex;
     for (int i = 0; i < l.count; ++i)
         if (l.buttons[i].contains(mx, my)) return l.indices[i];
     return -1;
@@ -1726,6 +1851,41 @@ static void LauncherWorker(void*)
                 CompositorWake();
             }
         }
+        char command[128];
+        bool desktop = false;
+        uint64_t token = 0;
+        SpinLockAcquire(&g_launchLock);
+        int launch = g_launches.Take(ApicTickCount());
+        if (launch >= 0) {
+            token = g_launches.entries[launch].token;
+            WmStrCopy(command, g_launchRequests[launch].command, sizeof(command));
+            desktop = g_launchRequests[launch].desktop;
+        }
+        SpinLockRelease(&g_launchLock);
+        if (token) {
+            Process* self = ProcessCurrent();
+            const uint64_t previous = self->launchId;
+            self->launchId = token;
+            int result;
+            if (desktop) {
+                char script[512];
+                const char* hdr = "set wm\nset vfb none\nrun --once /nix/bin/waylandd\nrun ";
+                uint32_t si = 0;
+                while (*hdr && si < sizeof(script) - 2) script[si++] = *hdr++;
+                const char* exec = command;
+                while (*exec && si < sizeof(script) - 2) script[si++] = *exec++;
+                script[si++] = '\n';
+                script[si] = 0;
+                result = ShellExecString(script);
+            } else result = ShellExecScript(command);
+            self->launchId = previous;
+            SpinLockAcquire(&g_launchLock);
+            g_launches.Complete(token, result >= 0, ApicTickCount());
+            SpinLockRelease(&g_launchLock);
+            SerialPrintf("WM: launch token %lu dispatch %s\n", token, result >= 0 ? "complete" : "failed");
+            CompositorMarkDirty();
+            CompositorWake();
+        }
         // One worker, coalesced requests, no busy waiting or retained rebuild
         // list. A slow reader delays reclamation and subsequent builds.
         SchedulerSleepMs(250);
@@ -1893,7 +2053,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
     if (pw > 56) WmRenderString(backBuffer, stride, screenW, screenH,
                    px + static_cast<int32_t>(LAUNCHER_PADDING) + 4,
                    iy + static_cast<int32_t>(textYOff),
-                   "Applications", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - 56);
+                   g_launcherQueueFull ? "Launch queue full" : "Applications", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - 56);
     iy += LAUNCHER_ITEM_HEIGHT;
 
     // Separator line below header
@@ -2012,46 +2172,34 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
 
 void WmLauncherExec(int itemIdx)
 {
-    char title[48], command[128];
-    bool desktop;
+    LauncherStartWorker();
+    if (!__atomic_load_n(&g_launcherWorkerStarted, __ATOMIC_ACQUIRE)) return;
+    int slot;
     {
         LauncherReadGuard guard;
         const auto& launcher = guard.get();
         if (itemIdx < 0 || itemIdx >= static_cast<int>(launcher.count) || !launcher.items[itemIdx].valid) return;
-        WmStrCopy(title, launcher.items[itemIdx].title, sizeof(title));
-        WmStrCopy(command, launcher.items[itemIdx].scriptPath, sizeof(command));
-        desktop = launcher.items[itemIdx].isDesktopEntry;
+        const auto& item = launcher.items[itemIdx];
+        SpinLockAcquire(&g_launchLock);
+        slot = g_launches.Begin(ApicTickCount(), __atomic_load_n(&g_windowIdentity, __ATOMIC_ACQUIRE),
+                               item.title, item.appId, item.executable);
+        if (slot >= 0 && g_launches.entries[slot].phase == LaunchPhase::Queued) {
+            auto& request = g_launchRequests[slot];
+            WmStrCopy(request.command, item.scriptPath, sizeof(request.command));
+            request.desktop = item.isDesktopEntry;
+            request.hasIcon = item.iconPixels != nullptr;
+            if (request.hasIcon) memcpy(request.icon, item.iconPixels, sizeof(request.icon));
+        }
+        SpinLockRelease(&g_launchLock);
     }
-
-    SerialPrintf("WM: launching '%s' via %s%s\n",
-                 title,
-                 command,
-                 desktop ? " [desktop]" : "");
-
-    g_launcherOpen = false;
-
-    if (desktop)
-    {
-        // For .desktop entries: build an inline script that launches
-        // waylandd + the app in WM mode, then exec directly from memory.
-        const char* exec = command;
-        char script[512];
-        uint32_t si = 0;
-        const char* hdr = "set wm\nset vfb none\nrun --once /nix/bin/waylandd\nrun ";
-        while (*hdr && si < sizeof(script) - 2) script[si++] = *hdr++;
-        while (*exec && si < sizeof(script) - 2) script[si++] = *exec++;
-        script[si++] = '\n';
-        script[si] = '\0';
-
-        extern int ShellExecString(const char* script);
-        ShellExecString(script);
-    }
-    else
-    {
-        // Traditional .rc shortcut script
-        extern int ShellExecScript(const char* path);
-        ShellExecScript(command);
-    }
+    g_launcherQueueFull = slot < 0;
+    g_launcherOpen = slot < 0;
+    if (slot >= 0) {
+        g_taskbarPageTarget = -10 - slot;
+        __atomic_store_n(&g_launchBusy, true, __ATOMIC_RELEASE);
+    } else SerialPuts("WM: launcher request queue full\n");
+    CompositorMarkDirty();
+    CompositorWake();
 }
 
 // ---------------------------------------------------------------------------
@@ -2268,6 +2416,7 @@ bool WmPresentExternalById(Process* proc, uint32_t wmId, uint32_t gres,
 
 bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId)
 {
+    VfbGuard guard;
     Window* w = WmFindWindowById(proc, wmId);
     if (!w || !appId) return false;
     WmStrCopy(w->appId, appId, sizeof(w->appId));

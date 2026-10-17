@@ -5,7 +5,7 @@ enum class LaunchPhase : uint8_t { Empty, Queued, Dispatching, Waiting, Failed, 
 struct LaunchFeedback {
     uint64_t token=0, requested=0, changed=0, windowCeiling=0;
     LaunchPhase phase=LaunchPhase::Empty;
-    bool dispatched=false;
+    bool started=false, dispatched=false;
     char title[48]{}, appId[128]{}, executable[64]{};
     bool busy() const {return phase==LaunchPhase::Queued||phase==LaunchPhase::Dispatching||phase==LaunchPhase::Waiting;}
 };
@@ -35,7 +35,8 @@ public:
         for(unsigned i=0;i<Capacity;++i) {
             const auto& e=entries[i];
             if(e.busy()&&((appId&&*appId&&Equal(e.appId,appId))||
-                ((!appId||!*appId)&&Equal(e.title,title)&&Equal(e.executable,executable))))return i;
+                ((!appId||!*appId)&&Equal(e.title,title)&&
+                 ((!e.executable[0]&&(!executable||!*executable))||Equal(e.executable,executable)))))return i;
         }
         for(unsigned i=0;i<Capacity;++i)if(entries[i].phase==LaunchPhase::Empty) {
             auto& e=entries[i];e={};e.token=++nextToken;if(!e.token)e.token=++nextToken;
@@ -53,11 +54,11 @@ public:
             if(now-e.requested>=TimeoutMs){e.phase=LaunchPhase::TimedOut;e.changed=now;continue;}
             if(oldest<0||e.token<entries[oldest].token)oldest=i;
         }
-        if(oldest>=0)entries[oldest].phase=LaunchPhase::Dispatching;
+        if(oldest>=0){entries[oldest].phase=LaunchPhase::Dispatching;entries[oldest].started=true;}
         return oldest;
     }
     void Complete(uint64_t token,bool success,uint64_t now) {
-        int i=Find(token);if(i<0)return;auto& e=entries[i];e.dispatched=true;
+        int i=Find(token);if(i<0)return;auto& e=entries[i];e.dispatched=success;
         if(e.phase==LaunchPhase::TimedOut)return;
         e.phase=success?LaunchPhase::Waiting:LaunchPhase::Failed;e.changed=now;
     }
@@ -67,7 +68,7 @@ public:
             // A known native launch token beats identity guesses. Wayland
             // application identity is presence evidence, not process ownership.
             bool match=token?token==e.token:
-                ((birth>e.windowCeiling||e.dispatched)&&
+                (e.started&&(birth>e.windowCeiling||e.dispatched)&&
                  (Equal(appId,e.appId)||Equal(appId,e.executable)));
             if(match){e={};return true;}
         }return false;

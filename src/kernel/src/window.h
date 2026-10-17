@@ -48,6 +48,7 @@ enum class WindowState : uint8_t
 
 struct Window
 {
+    uint64_t    creationIdentity; // Monotonic identity across reused window slots.
     Process*    proc;           // owning process (nullptr = unused slot)
     int16_t     x, y;           // window position (outer top-left, including chrome)
     uint16_t    clientW;        // client area width (= VFB width * upscale)
@@ -259,6 +260,10 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint64_t uptimeMs, int32_t mouseX, int32_t mouseY);
 
 // Hit-test the taskbar. Returns the window index if a button was clicked, -1 otherwise.
+void WmLaunchFeedbackPoll();
+void WmTaskbarPendingClick(int target);
+bool WmLaunchBusy();
+
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH);
 
 // Get the usable desktop height (screen height minus taskbar).

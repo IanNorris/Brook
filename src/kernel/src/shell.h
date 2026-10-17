@@ -26,8 +26,11 @@
 namespace brook {
 
 // Execute a boot script from a VFS path.
-// Returns 0 on success, -1 if the file could not be opened.
+// Returns 0 on success, -1 if the file could not be opened or a command failed.
 int ShellExecScript(const char* path);
+
+// Execute an inline script under the same serialized dispatch rules.
+int ShellExecString(const char* script);
 
 // Launch one command using the boot shell's environment/argument conventions.
 // The line must begin with run; returns the spawned PID or a negative error.
