@@ -86,6 +86,8 @@ int WriteResident(FileObject* object,Vnode* vnode,const void* buffer,uint64_t le
 }
 void FileObjectInit(FileObject* object) {
     static uint64_t nextIdentity;
+    object->recordLocks.lock.next=object->recordLocks.lock.serving=0;
+    object->recordLocks.head=nullptr;
     KMutexInit(&object->gate);object->generation=1;
     object->orderId=__atomic_add_fetch(&nextIdentity,1,__ATOMIC_RELAXED);
     if(!object->orderId)KernelPanic("file object: ordering identity exhausted");
@@ -94,6 +96,7 @@ void FileObjectInit(FileObject* object) {
     for(auto& bucket:object->pages)bucket=nullptr;
 }
 void FileObjectDispose(FileObject* object) {
+    if(object->recordLocks.head)KernelPanic("file object: disposing record locks");
     if(object->mappings || object->mappingRegistrations || object->writebackVnode)
         KernelPanic("file object: disposing retained inode");
     for(auto& bucket:object->pages) { auto* pages=bucket;bucket=nullptr;Release(pages); }

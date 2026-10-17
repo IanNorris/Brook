@@ -1,6 +1,7 @@
 #pragma once
 #include "address.h"
 #include "sync/kmutex.h"
+#include "record_locks.h"
 
 namespace brook {
 struct Vnode;
@@ -13,6 +14,7 @@ struct FileMappingRegistration;
 // Ordinary writes are write-through. Writable mappings remain disabled while
 // resize coordination, msync and background writeback are incomplete.
 struct FileObject {
+    RecordLockTable recordLocks;
     KMutex gate;
     uint64_t generation,orderId;
     FileMappingRegistration* mappings;

@@ -1,4 +1,5 @@
 #include "signal_defaults.h"
+#include "file_locks.h"
 #include "unix_lifetime_trace.h"
 // process.cpp -- Process creation, fd table, user stack setup.
 //
@@ -282,7 +283,8 @@ bool FdClaim(Process* proc, int fd, FdClaimResult* out)
 {
     ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return false;
-    return FdTableClaim(proc->fds, ProcessFdLock(proc), fd, out);
+    FileLockCloseContext context(proc);
+    return FdTableClaim(proc->fds, ProcessFdLock(proc), fd, out,FileLockCloseContext::Closing,&context);
 }
 
 FdEntry* FdGetRef(Process* proc, int fd)
@@ -309,7 +311,8 @@ FdCloseResult FdClose(Process* proc, int fd, FdClaimResult* out)
 {
     ProcessOperationGuard credentialOperation(ProcessCurrent());
     if (!proc || !proc->fds) return FdCloseResult::NotFound;
-    return FdTableClose(proc->fds, ProcessFdLock(proc), fd, out);
+    FileLockCloseContext context(proc);
+    return FdTableClose(proc->fds, ProcessFdLock(proc), fd, out,FileLockCloseContext::Closing,&context);
 }
 
 // ---------------------------------------------------------------------------

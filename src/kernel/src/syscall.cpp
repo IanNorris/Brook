@@ -1,4 +1,5 @@
 #include "unix_lifetime_trace.h"
+#include "file_locks.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
 //
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
@@ -3623,8 +3624,10 @@ static int64_t DuplicateFd(Process* proc, int oldfd, int target,
     if (!retained) return -ENOMEM;
     owned.fdFlags = fdFlags;
     FdClaimResult retired{};
+    FileLockCloseContext lockClose(proc);
     int result = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), owned,
-                                     minimum, target, &retired, UnixLifePublished);
+                                     minimum, target, &retired, UnixLifePublished,
+                                     FileLockCloseContext::Closing,&lockClose);
     if (result < 0)
         FinalizeClosedFd({owned.type, owned.handle, owned.flags});
     else if (retired.type != FdType::None) {
@@ -7703,9 +7706,70 @@ static constexpr int FD_CLOEXEC = 1;
 [[maybe_unused]] static constexpr int O_NONBLOCK  = 0x800;
 [[maybe_unused]] static constexpr int O_CLOEXEC   = 0x80000;
 
+struct LinuxFlock {
+    int16_t type,whence;
+    uint32_t padding;
+    int64_t start,length;
+    int32_t pid;
+    uint32_t tailPadding;
+};
+static_assert(sizeof(LinuxFlock)==32 && __builtin_offsetof(LinuxFlock,start)==8);
+// Caller pins the descriptor and owns a kernel-operation guard throughout.
+static int64_t FileRecordLock(Process* proc,FdEntry* entry,uint64_t cmd,uint64_t address) {
+    if(entry->type!=FdType::Vnode || !entry->handle)return -EBADF;
+    auto* vnode=static_cast<Vnode*>(entry->handle);
+    if(vnode->type!=VnodeType::File || !vnode->ops->file_object)return -95;
+    auto* object=vnode->ops->file_object(vnode);
+    if(!object)return -95;
+    if(!UserBufferReadable(address,sizeof(LinuxFlock)) ||
+       (cmd==5 && !UserBufferWritable(address,sizeof(LinuxFlock))))return -EFAULT;
+    LinuxFlock input;memcpy(&input,reinterpret_cast<void*>(address),sizeof(input));
+    if(input.type<0 || input.type>2 || (cmd==5 && input.type==2))return -EINVAL;
+    uint64_t size=0;
+    if(input.whence==2) {
+        VnodeStat stat{};int result=VfsStat(vnode,&stat);if(result)return result;size=stat.size;
+    }
+    RecordLockPlan plan;
+    if(cmd!=5 && !plan.Prepare(input.type==2?1:2))return -37; // ENOLCK
+    const auto owner=FileLockOwner(proc);
+    RecordLockRange range{};RecordLockNode conflict{};
+    // Lock acquisition is ordered against every logical close and dup2
+    // replacement, including close of a different FD for this inode.
+    SpinLockAcquire(ProcessFdLock(proc));
+    int result=entry->closing?-EBADF:RecordLockNormalize(input.whence,input.start,input.length,
+                                                       entry->seekPos,size,&range);
+    if(!result && cmd!=5 && input.type!=2) {
+        const auto mode=entry->statusFlags&3;
+        if((input.type==0 && mode!=0 && mode!=2) || (input.type==1 && mode!=1 && mode!=2))result=-EBADF;
+    }
+    bool found=false;
+    if(!result) {
+        if(cmd==5)found=RecordLockQuery(object->recordLocks,owner,range,input.type,&conflict);
+        else {
+            result=plan.Set(object->recordLocks,owner,range,input.type);
+            // Explicit interim limit: do not pretend contended SETLKW waited.
+            if(result==-11 && cmd==7)result=-95;
+        }
+    }
+    SpinLockRelease(ProcessFdLock(proc));
+    if(result)return result;
+    if(cmd==5) {
+        if(found) {
+            input.type=conflict.type;input.whence=0;input.start=conflict.range.begin;
+            input.length=conflict.range.end==0x7fffffffffffffffULL?0:
+                         conflict.range.end-conflict.range.begin+1;
+            input.pid=conflict.owner.pid;
+        } else input.type=2;
+        memcpy(reinterpret_cast<void*>(address),&input,sizeof(input));
+    }
+    return 0;
+}
+
 static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
                           uint64_t, uint64_t, uint64_t)
 {
+    fd=static_cast<uint32_t>(fd);cmd=static_cast<uint32_t>(cmd);
+    if(fd>=MAX_FDS)return -EBADF;
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
     KernelOperationGuard operation(proc);
@@ -7718,6 +7782,14 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
 
     switch (static_cast<int>(cmd))
     {
+    case 5: // F_GETLK
+    case 6: // F_SETLK
+    case 7: // F_SETLKW: immediate acquisition only until cancellable waits exist.
+        return FileRecordLock(proc,fde,cmd,arg);
+    case 36: // F_OFD_GETLK: requires shared open-file-description ownership.
+    case 37: // F_OFD_SETLK
+    case 38: // F_OFD_SETLKW
+        return -EINVAL;
     case 1033: // F_ADD_SEALS: no write/truncate/sandbox seal enforcement yet.
     case 1034: // F_GET_SEALS: never report fictional successful sealing.
         return -EINVAL;
@@ -7743,7 +7815,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
         fde->statusFlags = (fde->statusFlags & 0x3) | (static_cast<uint32_t>(arg) & ~0x3u);
         return 0;
     default:
-        return 0; // Unknown command, pretend success
+        return -EINVAL;
     }
 }
 

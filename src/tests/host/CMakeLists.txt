@@ -78,6 +78,16 @@ target_compile_options(test_futex_pool PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )
 add_host_test(test_fd_table)
+add_host_test(test_record_locks
+    "${BROOK_ROOT}/src/kernel/src/record_locks.cpp"
+    "${BROOK_ROOT}/src/kernel/src/file_locks.cpp"
+)
+target_compile_options(test_record_locks PRIVATE
+    -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
 target_compile_options(test_fd_table PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )

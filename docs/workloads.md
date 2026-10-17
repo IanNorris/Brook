@@ -1978,3 +1978,20 @@ fcntl path, and SQLite WAL fails with SQLITE_PROTOCOL even on a fresh database.
 Firefox audio and the wider database/record-locking work remain open. See the
 [lookup and browser diagnostic report](mapping-lookup-cache.md) for exact
 identities, evidence, limitations and the required locking lifecycle.
+
+
+### Process-associated file locks (17 October)
+
+Ext2 regular files now implement real GETLK/SETLK reader/writer exclusion,
+range conversion/splitting and inode-based ownership. Logical close releases
+locks before deferred descriptor resource cleanup, including independent opens,
+dup2, CLOEXEC and group exit. All 30 hosted suites and all 14 final guest
+record-lock cases pass. The guest hard-link case uses an offline-prepared alias
+pair because guest link creation remains unimplemented. Blocking SETLKW, OFD
+locks and nonleader-exec semantics remain incomplete.
+
+Fresh SQLite rollback-journal transactions pass. WAL now passes the earlier
+lock query/protocol stage but fails with SQLITE_IOERR_SHMMAP: writable shared
+regular-file mappings are still explicitly unsupported. This is not Firefox
+profile/audio acceptance. See the [record-lock report](record-locks.md) for
+implementation invariants, exact guest/build evidence and remaining work.

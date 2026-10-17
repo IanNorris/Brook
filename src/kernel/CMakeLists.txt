@@ -206,6 +206,8 @@ add_executable(kernel
     src/memory/file_page_cache.cpp
     src/memory/exec_page_cache.cpp
     src/memory/file_object.cpp
+    src/record_locks.cpp
+    src/file_locks.cpp
     src/memory/file_mapping_registry.cpp
     src/memory/mapping_pin_registry.cpp
     src/memory/mapping_ranges.cpp

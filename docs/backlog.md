@@ -1,11 +1,15 @@
 # Recovery and VM-control backlog
 
-- Implement real POSIX record locking for regular files. A fresh ext2 `F_GETLK`
-  query currently succeeds without replacing `F_WRLCK` with `F_UNLCK`; fresh
-  SQLite WAL fails with `SQLITE_PROTOCOL` while rollback journal passes.
-  See [lookup/browser diagnostics](mapping-lookup-cache.md) for evidence and
-  required inode identity, range conversion, process ownership and logical-close
-  lifecycle coverage. Do not replace this with fictional unlocked success.
+- Ext2 process-associated GETLK/SETLK now use real inode-based record locks and
+  logical-close cleanup. See [record-lock evidence and limits](record-locks.md).
+  Complete cancellation-safe blocking SETLKW/deadlock detection, OFD ownership,
+  BSD flock (currently a separate success stub), other filesystem identities
+  and nonleader-exec semantics separately.
+- SQLite WAL now gets beyond the earlier fake-GETLK protocol error and fails at
+  writable shared-file mmap (`SQLITE_IOERR_SHMMAP`, underlying `EOPNOTSUPP`).
+  Complete coherent regular-file MAP_SHARED writes, mapped resize coordination,
+  writeback/error recovery and teardown before accepting WAL/browser profiles.
+  Do not bypass that guard with private mappings or discard database writes.
 
 ## VM bridge findings, 17 October
 

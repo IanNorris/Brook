@@ -91,6 +91,10 @@ struct FdClaimResult
     uint8_t  flags;
 };
 
+// Runs at logical close under the FD lock, before the slot becomes closing or
+// is replaced. Must not sleep/allocate/free. Resource finalization is separate.
+using FdLogicalClose = void (*)(const FdEntry&,void*);
+
 // Reset a slot to the unused state. Caller must hold the table lock.
 inline void FdSlotClear(FdEntry& e)
 {
@@ -157,7 +161,8 @@ inline int FdTableDuplicatePinned(FdEntry* fds, SpinLock* lock, const FdEntry* s
 // caller. A pinned destination cannot be replaced while pins name its slot.
 inline int FdTablePublishOwned(FdEntry* fds, SpinLock* lock, const FdEntry& owned,
                               uint32_t minimum, int replacement, FdClaimResult* retired,
-                              void (*published)(int, const FdEntry&) = nullptr)
+                              void (*published)(int, const FdEntry&) = nullptr,
+                              FdLogicalClose closing = nullptr,void* context = nullptr)
 {
     SpinLockAcquire(lock);
     int target = replacement;
@@ -172,6 +177,7 @@ inline int FdTablePublishOwned(FdEntry* fds, SpinLock* lock, const FdEntry& owne
         SpinLockRelease(lock); return -16;
     }
     if (retired) *retired = {fds[target].type, fds[target].handle, fds[target].flags};
+    if (closing && fds[target].type!=FdType::None) closing(fds[target],context);
     FdEntry copy = owned;
     copy.pinCount = 0;
     copy.closing = 0;
@@ -232,7 +238,8 @@ inline FdEntry* FdTableGet(FdEntry* fds, SpinLock* lock, int fd)
 // across concurrent callers racing on the same fd; all other callers see the
 // slot already None and return false. This makes close() safe against a
 // sibling thread closing the same fd: only the winner unref's the handle.
-inline bool FdTableClaim(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* out)
+inline bool FdTableClaim(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* out,
+                         FdLogicalClose closing = nullptr,void* context = nullptr)
 {
     if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return false;
     SpinLockAcquire(lock);
@@ -241,6 +248,7 @@ inline bool FdTableClaim(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* ou
         SpinLockRelease(lock);
         return false;
     }
+    if (closing && !fds[fd].closing) closing(fds[fd],context);
     if (out)
     {
         out->type   = fds[fd].type;
@@ -325,7 +333,8 @@ inline bool FdTableUnpin(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* ou
 // last FdTableUnpin can finalize it (Deferred). If already unused or closing,
 // return NotFound. Exactly one caller across racing close()s observes a live,
 // non-closing slot, so the handle is torn down exactly once.
-inline FdCloseResult FdTableClose(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* out)
+inline FdCloseResult FdTableClose(FdEntry* fds, SpinLock* lock, int fd, FdClaimResult* out,
+                                 FdLogicalClose closing = nullptr,void* context = nullptr)
 {
     if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return FdCloseResult::NotFound;
     SpinLockAcquire(lock);
@@ -334,6 +343,7 @@ inline FdCloseResult FdTableClose(FdEntry* fds, SpinLock* lock, int fd, FdClaimR
         SpinLockRelease(lock);
         return FdCloseResult::NotFound;
     }
+    if (closing) closing(fds[fd],context);
     if (fds[fd].pinCount > 0)
     {
         fds[fd].closing = 1;
