@@ -584,6 +584,15 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                        const FdEntry* stdFds = nullptr,
                        uint32_t launchUid = 0, uint32_t launchGid = 0);
 
+struct ExecutableImage;
+// Explicit dedicated-image variants preserve the raw-buffer API and ABI.
+Process* ProcessCreateExecutable(const ExecutableImage& image,
+    int argc, const char* const* argv, int envc, const char* const* envp,
+    const FdEntry* stdFds, uint32_t launchUid, uint32_t launchGid);
+uint64_t ProcessExecExecutable(Process* proc, const ExecutableImage& image,
+    int argc, const char* const* argv, int envc, const char* const* envp,
+    uint64_t* outStackPtr);
+
 CredentialIds ProcessReadIds(Process* proc, bool group);
 int ProcessChangeIds(Process* proc, bool group, CredentialChange operation,
                      uint32_t real, uint32_t effective = CredentialUnchanged,

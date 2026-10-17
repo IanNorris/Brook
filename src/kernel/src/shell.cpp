@@ -408,9 +408,7 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
         return nullptr;
     }
 
-    uint8_t* elfBuf = image.data;
-    uint64_t elfSize = image.size;
-    DbgPrintf("SHELL: loaded '%s' (%lu bytes)\n", path, elfSize);
+    DbgPrintf("SHELL: loaded '%s' (%lu bytes)\n", path, image.size);
 
     // Disable interrupts during process creation to avoid timer ISR interference
     __asm__ volatile("cli");
@@ -430,7 +428,7 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
         if (g_defaultEnvp[i] && StrEq(g_defaultEnvp[i], "USER=root")) launchEnv[i] = userEnv;
         if (g_defaultEnvp[i] && StrEq(g_defaultEnvp[i], "LOGNAME=root")) launchEnv[i] = loginEnv;
     }
-    Process* proc = ProcessCreate(elfBuf, elfSize, argc, argv,
+    Process* proc = ProcessCreateExecutable(image, argc, argv,
                                    envc, launchEnv, nullptr, uid, gid);
 
     __asm__ volatile("sti");

@@ -1893,3 +1893,15 @@ package executable. The host's bare Python lacks CairoSVG; use `nix-shell` for
 these tests, as the development shell supplies it. Shell/Python syntax checks
 also pass. The candidate VM is stopped; the main checkpoint images were not
 modified by these isolated runs.
+
+### Brook-user concurrent browser/editor memory acceptance
+
+The subsequent [browser memory investigation](browser-memory-checkpoint-20261017.md)
+covers sparse ELF loading, COW reuse of dedicated executable staging pages and
+demand-zero private anonymous mmap. The focused 256 MiB reservation cost fell
+from about 259 MiB to 96 KiB, with eight guest semantic checks passing. All 22
+hosted suites pass. Codium and Chromium passed native input, file save/reopen,
+normal exits and reboot persistence in an 8-CPU, 8 GiB software-Wayland VM.
+The same combination still exhausts a 4 GiB guest; startup speed and memory
+efficiency remain open. The linked report preserves the failing controls,
+kernel hashes, filesystem checks and an unmodified 1080p capture.

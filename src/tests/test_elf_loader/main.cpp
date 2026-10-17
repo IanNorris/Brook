@@ -6,6 +6,8 @@
 #include <unordered_set>
 #include <vector>
 #include "elf.h"
+#include "exec_image.h"
+#include <sys/mman.h>
 #include "process.h"
 #include "memory/address_space.h"
 #include "memory/physical_memory.h"
@@ -15,7 +17,8 @@
 using namespace brook;
 namespace {
 std::unordered_map<uint64_t, PhysicalAddress> leaves;
-std::unordered_set<uint64_t> frames;
+std::unordered_map<uint64_t,unsigned> frames;
+std::unordered_map<uint64_t,uint64_t> staging, leafFlags;
 unsigned heapBlocks=0, allocations=0;
 unsigned failAllocation=0, failMapping=0, mappingCalls=0;
 bool failHeap=false;
@@ -46,7 +49,8 @@ uint8_t byte(uint64_t address) {
 void clean(AddressSpaceState& space) {
     MappingRangeDestroy(space.ranges);
     for(auto leaf:leaves)PmmFreePage(leaf.second);
-    leaves.clear();CHECK(frames.empty()&&heapBlocks==0);
+    leaves.clear();leafFlags.clear();CHECK(frames.size()==staging.size()&&heapBlocks==0);
+    for(auto entry:staging)CHECK(frames.at(entry.first)==1);
     allocations=mappingCalls=failAllocation=failMapping=0;failHeap=false;
 }
 }
@@ -64,17 +68,42 @@ extern "C" void kfree(void* memory) { if(memory){CHECK(heapBlocks);--heapBlocks;
 PhysicalAddress PmmAllocPage(MemTag tag,uint16_t) {
     CHECK(tag==MemTag::User);++allocations;
     if(allocations==failAllocation)return PhysicalAddress{};
-    void* frame=nullptr;CHECK(posix_memalign(&frame,4096,4096)==0);
-    std::memset(frame,0xCC,4096);frames.insert(reinterpret_cast<uint64_t>(frame));
+    void* frame=mmap(nullptr,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(frame!=MAP_FAILED);
+    std::memset(frame,0xCC,4096);frames.emplace(reinterpret_cast<uint64_t>(frame),1);
     return PhysicalAddress(reinterpret_cast<uint64_t>(frame));
 }
-void PmmFreePage(PhysicalAddress page) { CHECK(frames.erase(page.raw())==1);std::free(reinterpret_cast<void*>(page.raw())); }
+void PmmUnrefPage(PhysicalAddress page) {
+    auto found=frames.find(page.raw());CHECK(found!=frames.end()&&found->second);
+    if(!--found->second){frames.erase(found);CHECK(munmap(reinterpret_cast<void*>(page.raw()),4096)==0);}
+}
+void PmmFreePage(PhysicalAddress page) { PmmUnrefPage(page); }
+bool PmmRefPageIfAlive(PhysicalAddress page) {
+    auto found=frames.find(page.raw());if(found==frames.end())return false;
+    ++found->second;return true;
+}
 bool VmmMapPage(PageTable,VirtualAddress address,PhysicalAddress frame,uint64_t flags,MemTag,uint16_t) {
     ++mappingCalls;CHECK(flags==(VMM_WRITABLE|VMM_USER));
     if(mappingCalls==failMapping || leaves.count(address.raw()))return false;
-    leaves.emplace(address.raw(),frame);return true;
+    leaves.emplace(address.raw(),frame);leafFlags.emplace(address.raw(),flags|VMM_PRESENT);return true;
 }
+VmmMapResult VmmTryMapPage(PageTable,VirtualAddress address,PhysicalAddress frame,
+                           uint64_t flags,MemTag tag,uint16_t pid,bool accessible) {
+    ++mappingCalls;CHECK(flags==(VMM_USER|PTE_COW_BIT)&&tag==MemTag::User&&pid==7&&accessible);
+    if(mappingCalls==failMapping)return VmmMapResult::OutOfMemory;
+    if(leaves.count(address.raw()))return VmmMapResult::Occupied;
+    leaves.emplace(address.raw(),frame);leafFlags.emplace(address.raw(),flags|VMM_PRESENT);
+    return VmmMapResult::Mapped;
+}
+uint64_t VmmReadLeaf(PageTable,VirtualAddress address) {
+    const uint64_t va=address.raw()&~uint64_t{4095};
+    auto stage=staging.find(va);if(stage!=staging.end())return va|stage->second;
+    auto found=leaves.find(va);return found==leaves.end()?0:found->second.raw()|leafFlags.at(va);
+}
+PhysicalAddress VmmLeafPhysical(uint64_t leaf) {return PhysicalAddress(leaf&0x000FFFFFFFFFF000ULL);}
 PhysicalAddress VmmVirtToPhys(PageTable,VirtualAddress address) {
+    auto stage=staging.find(address.raw()&~uint64_t{4095});
+    if(stage!=staging.end())return PhysicalAddress(address.raw());
     auto found=leaves.find(address.raw()&~uint64_t{4095});
     return found==leaves.end()?PhysicalAddress{}:found->second+(address.raw()&4095);
 }
@@ -85,6 +114,115 @@ void FileMappingRetire(FileMappingRegistration*) {}
 void FileMappingUnregister(FileMappingRegistration*) {}
 }
 extern "C" [[noreturn]] void KernelPanic(const char*,...) { std::abort(); }
+
+namespace {
+std::vector<uint8_t> fullFixture(bool alias=false) {
+    auto bytes=fixture();auto* h=reinterpret_cast<Elf64_Ehdr*>(bytes.data());
+    auto* ph=reinterpret_cast<Elf64_Phdr*>(bytes.data()+h->e_phoff);
+    ph[0].p_filesz=ph[0].p_memsz=0x2000;
+    ph[1].p_vaddr=0x402000;ph[1].p_offset=0x2000;
+    ph[1].p_filesz=0x1000;ph[1].p_memsz=0x1800;
+    std::memset(bytes.data()+0x1000,0xA3,0x1000);
+    std::memset(bytes.data()+0x2000,0xB4,0x1000);
+    if(alias){h->e_phnum=3;ph[2]=ph[1];ph[2].p_offset=0x1000;
+        ph[2].p_vaddr=0x600000;ph[2].p_filesz=ph[2].p_memsz=0x1000;}
+    return bytes;
+}
+ExecutableImage stageImage(const std::vector<uint8_t>& bytes) {
+    CHECK(staging.empty()&&frames.empty());
+    const size_t pages=(bytes.size()+4095)/4096;
+    void* data=mmap(nullptr,pages*4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    CHECK(data!=MAP_FAILED);std::memcpy(data,bytes.data(),bytes.size());
+    for(size_t i=0;i<pages;++i){const uint64_t va=reinterpret_cast<uint64_t>(data)+i*4096;
+        frames.emplace(va,1);staging.emplace(va,VMM_PRESENT|VMM_WRITABLE);}
+    // Any zero/copy through a reused physical frame now faults on the host.
+    CHECK(mprotect(data,pages*4096,PROT_READ)==0);
+    return {static_cast<uint8_t*>(data),bytes.size(),pages};
+}
+void dropImage(ExecutableImage& image) {
+    for(uint64_t i=0;i<image.pages;++i){const uint64_t va=reinterpret_cast<uint64_t>(image.data)+i*4096;
+        CHECK(staging.erase(va)==1);PmmUnrefPage(PhysicalAddress(va));}
+    image={};
+}
+// Models the existing VMM COW ownership contract; actual fork/write behavior
+// still needs a guest probe. The loader itself is compiled without a model.
+void cowWrite(uint64_t va,uint8_t value) {
+    const uint64_t page=va&~uint64_t{4095};auto old=leaves.at(page);
+    CHECK(leafFlags.at(page)&PTE_COW_BIT);
+    if(frames.at(old.raw())>1){auto fresh=PmmAllocPage(MemTag::User,7);CHECK(fresh);
+        std::memcpy(reinterpret_cast<void*>(fresh.raw()),reinterpret_cast<void*>(old.raw()),4096);
+        PmmUnrefPage(old);leaves[page]=fresh;
+    }else CHECK(mprotect(reinterpret_cast<void*>(old.raw()),4096,PROT_READ|PROT_WRITE)==0);
+    leafFlags[page]=(leafFlags.at(page)&~PTE_COW_BIT)|VMM_WRITABLE;
+    *reinterpret_cast<uint8_t*>(leaves.at(page).raw()+(va&4095))=value;
+}
+void ownedTests() {
+    // Three initialized pages reused; BSS tail is private zeroed allocation.
+    // Exercise both cleanup orders, and source immutability while the AS lives.
+    for(bool sourceFirst:{false,true}) {
+        auto bytes=fullFixture(true);auto image=stageImage(bytes);AddressSpaceState space{};ElfBinary binary{};
+        CHECK(ElfLoadExecutable(image,&binary,&space,7));CHECK(allocations==1&&leaves.size()==5);
+        for(uint64_t va:{0x200000ULL,0x201000ULL,0x602000ULL,0x800000ULL})
+            CHECK((leafFlags.at(va)&(PTE_COW_BIT|VMM_WRITABLE))==PTE_COW_BIT);
+        CHECK(leaves.at(0x201000)==leaves.at(0x800000));
+        cowWrite(0x201100,0x55);CHECK(byte(0x201100)==0x55&&byte(0x800100)==0xA3);
+        CHECK(std::memcmp(image.data,bytes.data(),bytes.size())==0);
+        CHECK(byte(0x603000)==0&&byte(0x6037ff)==0);
+        if(sourceFirst){
+            dropImage(image);CHECK(byte(0x800100)==0xA3);
+            const auto unique=leaves.at(0x602000);CHECK(frames.at(unique.raw())==1);
+            cowWrite(0x602100,0x66);CHECK(leaves.at(0x602000)==unique&&byte(0x602100)==0x66);
+            clean(space);
+        }
+        else{clean(space);dropImage(image);}
+        CHECK(frames.empty()&&staging.empty());
+    }
+    // Raw buffers never share pages, even if backed by an owned staging region.
+    {
+        auto image=stageImage(fullFixture());AddressSpaceState space{};ElfBinary binary{};
+        CHECK(ElfLoad(image.data,image.size,&binary,&space,7));CHECK(allocations==4);
+        for(auto flags:leafFlags)CHECK(!(flags.second&PTE_COW_BIT));
+        clean(space);dropImage(image);
+    }
+    // Partial, source-noncongruent and overlapping segments must stay private.
+    for(unsigned mode=0;mode<4;++mode)for(bool reverse:{false,true}) {
+        auto bytes=fullFixture();auto* h=reinterpret_cast<Elf64_Ehdr*>(bytes.data());
+        auto* ph=reinterpret_cast<Elf64_Phdr*>(bytes.data()+h->e_phoff);
+        if(mode==0)ph[0].p_filesz=0x1800;
+        if(mode==1){ph[1].p_align=1;ph[1].p_offset=0x2001;ph[1].p_filesz=0xfff;}
+        if(mode>=2){h->e_phnum=3;ph[2]=ph[0];ph[2].p_vaddr=0x1000;
+            ph[2].p_offset=0x1000;ph[2].p_filesz=mode==2?0x100:0;ph[2].p_memsz=0x100;}
+        if(reverse)std::swap(ph[0],ph[1]);
+        auto image=stageImage(bytes);AddressSpaceState space{};ElfBinary binary{};
+        CHECK(ElfLoadExecutable(image,&binary,&space,7));
+        CHECK(!(leafFlags.at(mode==1?0x602000:0x201000)&PTE_COW_BIT));
+        CHECK(std::memcmp(image.data,bytes.data(),bytes.size())==0);
+        clean(space);dropImage(image);
+    }
+    // Every publication failure returns its acquired reference; already
+    // published pages remain managed and are reclaimed by caller teardown.
+    for(unsigned failure=1;failure<=4;++failure){
+        auto image=stageImage(fullFixture());AddressSpaceState space{};ElfBinary binary{};
+        failMapping=failure;CHECK(!ElfLoadExecutable(image,&binary,&space,7));
+        CHECK(leaves.size()==failure-1);clean(space);dropImage(image);CHECK(frames.empty());
+    }
+    {
+        auto image=stageImage(fullFixture());AddressSpaceState space{};ElfBinary binary{};
+        failAllocation=1;CHECK(!ElfLoadExecutable(image,&binary,&space,7));CHECK(leaves.size()==3);
+        clean(space);dropImage(image);CHECK(frames.empty());
+    }
+    {
+        auto image=stageImage(fullFixture());AddressSpaceState space{};ElfBinary binary{};
+        auto invalid=image;invalid.pages=0;CHECK(!ElfLoadExecutable(invalid,&binary,&space,7));
+        invalid=image;invalid.data++;CHECK(!ElfLoadExecutable(invalid,&binary,&space,7));
+        CHECK(!allocations&&leaves.empty());
+        // Dedicated kernel source must be a present supervisor mapping.
+        staging.at(reinterpret_cast<uint64_t>(image.data))|=VMM_USER;
+        CHECK(!ElfLoadExecutable(image,&binary,&space,7));CHECK(leaves.empty());
+        clean(space);dropImage(image);
+    }
+}
+}
 
 int main() {
     for(bool reverse:{false,true})for(bool overlap:{false,true}) {
@@ -174,5 +312,6 @@ int main() {
         if(!overlap)CHECK(!MappingRangeFind(space.ranges,0x802000));
         clean(space);
     }
+    ownedTests();
     std::puts("ELF_LOADER PASS sparse/overlap/reversed-phdrs/BSS/metadata/malformed/OOM/map-failure");
 }

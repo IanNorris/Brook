@@ -5,6 +5,7 @@
 // Supports dynamic linking via PT_INTERP (see LoadInterpreter in process.cpp).
 
 #include "elf.h"
+#include "exec_image.h"
 #include "process.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -123,7 +124,7 @@ static bool RelocatedElfFits(const ElfLayout& image, uint64_t slide, uint64_t li
 
 // Physical pages need not be contiguous. Translate once per destination page,
 // and never silently skip an unmapped byte of an otherwise successful image.
-static bool CopyElfBytes(PageTable pt, uint64_t dest, const uint8_t* source, uint64_t size)
+static bool CopyElfBytes(PageTable pt, uint64_t dest, const uint8_t* source, uint64_t size, bool reused = false)
 {
     while (size)
     {
@@ -131,7 +132,13 @@ static bool CopyElfBytes(PageTable pt, uint64_t dest, const uint8_t* source, uin
         if (!phys) return false;
         uint64_t chunk = 4096 - (dest & 4095);
         if (chunk > size) chunk = size;
-        memcpy(reinterpret_cast<void*>(PhysToVirt(phys).raw()), source, chunk);
+        // Reused full pages are immutable staging data. Direct-map writes
+        // bypass COW, so never memcpy even identical bytes into those frames.
+        const bool sameFrame = reused && chunk == 4096 && !(dest & 4095) &&
+            !(reinterpret_cast<uint64_t>(source) & 4095) &&
+            VmmVirtToPhys(KernelPageTable,VirtualAddress(reinterpret_cast<uint64_t>(source))) == phys;
+        if (!sameFrame)
+            memcpy(reinterpret_cast<void*>(PhysToVirt(phys).raw()), source, chunk);
         dest += chunk; source += chunk; size -= chunk;
     }
     return true;
@@ -158,8 +165,55 @@ bool ElfValidateMainImage(const uint8_t* data, uint64_t size)
     return PrepareMainImage(data, size, &image, &slide);
 }
 
-bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
-             AddressSpaceState* space, uint16_t pid)
+// A dedicated owned image is the only eligible source: raw callers may pass
+// kmalloc buffers sharing a page with unrelated kernel data.
+static bool OwnedImageValid(const ExecutableImage& image)
+{
+    return image.data && !(reinterpret_cast<uint64_t>(image.data) & 4095) &&
+        image.size && image.size <= MAX_EXEC_IMAGE_BYTES &&
+        image.pages >= (image.size + 4095) / 4096;
+}
+
+enum class ReuseResult { Copy, Mapped, Failed };
+static ReuseResult ReuseImagePage(const ExecutableImage* owned,
+                                 const ElfLayout& image, uint16_t segment,
+                                 uint64_t slide, uint64_t va,
+                                 PageTable pt, uint16_t pid)
+{
+    if (!owned) return ReuseResult::Copy;
+    const auto& p = image.segments[segment];
+    const uint64_t start = p.p_vaddr + slide;
+    if (va < start || va - start > p.p_filesz ||
+        p.p_filesz - (va - start) < 4096) return ReuseResult::Copy;
+    const uint64_t offset = p.p_offset + (va - start);
+    if ((offset & 4095) || offset > owned->size || owned->size - offset < 4096)
+        return ReuseResult::Copy;
+    // Decide eligibility against ALL segments, before any header's copy pass.
+    // Even a BSS/partial-page overlap must use a private zeroed frame.
+    for (uint16_t i = 0; i < image.header->e_phnum; ++i) {
+        const auto& other = image.segments[i];
+        if (i == segment || other.p_type != PT_LOAD || !other.p_memsz) continue;
+        if (AlignDown(other.p_vaddr + slide,4096) < va + 4096 &&
+            AlignUp(other.p_vaddr + slide + other.p_memsz,4096) > va)
+            return ReuseResult::Copy;
+    }
+    const VirtualAddress source(reinterpret_cast<uint64_t>(owned->data) + offset);
+    const uint64_t leaf = VmmReadLeaf(KernelPageTable,source);
+    if (!(leaf & VMM_PRESENT) || (leaf & VMM_USER)) return ReuseResult::Failed;
+    const PhysicalAddress frame = VmmLeafPhysical(leaf);
+    if (!frame || !PmmRefPageIfAlive(frame)) return ReuseResult::Failed;
+    // VmmMapPage strips COW; this API preserves it and never replaces a leaf.
+    if (VmmTryMapPage(pt,VirtualAddress(va),frame,VMM_USER | PTE_COW_BIT,
+                      MemTag::User,pid) != VmmMapResult::Mapped) {
+        PmmUnrefPage(frame);
+        return ReuseResult::Failed;
+    }
+    return ReuseResult::Mapped;
+}
+
+static bool ElfLoadImpl(const uint8_t* data, uint64_t size, ElfBinary* out,
+                        AddressSpaceState* space, uint16_t pid,
+                        const ExecutableImage* owned)
 {
     PageTable pt = space->pageTable;
     ElfLayout image;
@@ -206,6 +260,9 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
         {
             const VirtualAddress vaddr(va);
             if (VmmVirtToPhys(pt,vaddr)) continue; // Shared segment boundary.
+            const ReuseResult reused = ReuseImagePage(owned,image,i,slide,va,pt,pid);
+            if (reused == ReuseResult::Failed) return false;
+            if (reused == ReuseResult::Mapped) { ++mappedPages; continue; }
             PhysicalAddress phys = PmmAllocPage(MemTag::User, pid);
             if (!phys)
             {
@@ -251,7 +308,7 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
                 return false;
             }
 
-            if (!CopyElfBytes(pt, phdr.p_vaddr + slide, data + phdr.p_offset, phdr.p_filesz))
+            if (!CopyElfBytes(pt, phdr.p_vaddr + slide, data + phdr.p_offset, phdr.p_filesz, owned != nullptr))
                 return false;
 
             // BSS (p_memsz > p_filesz) is already zeroed from page init above
@@ -343,6 +400,18 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
     __asm__ volatile("mfence" ::: "memory");
 
     return true;
+}
+
+bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
+             AddressSpaceState* space, uint16_t pid)
+{
+    return ElfLoadImpl(data,size,out,space,pid,nullptr);
+}
+
+bool ElfLoadExecutable(const ExecutableImage& image, ElfBinary* out,
+                       AddressSpaceState* space, uint16_t pid)
+{
+    return OwnedImageValid(image) && ElfLoadImpl(image.data,image.size,out,space,pid,&image);
 }
 
 // ---------------------------------------------------------------------------

@@ -56,7 +56,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Wayland browsing, JavaScript/input, Google/Amazon HTTPS and 480p YouTube video verified; Brook-user menu launch and normal exit rechecked; audio under investigation |
 | [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
 | [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation, text input, save/load verified; music and two bounded exit tests pass; longer-session exit testing remains |
-| [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Native text editing, save/reopen and normal exit verified with software Wayland; startup remains slow, Electron sandbox disabled |
+| [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, save/reopen and normal exit verified alongside Chromium in an 8 GiB VM; startup is slow, 4 GiB concurrent runs exhaust memory; Electron sandbox disabled |
 | [Blender](https://www.blender.org/) | 5.1.1 | 🚧 Blocked | Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
@@ -116,7 +116,7 @@ the table distinguishes tested behavior from remaining limitations.
 - **UEFI bootloader** — custom bootloader loads ELF kernel at high virtual addresses
 - **SMP** — symmetric multiprocessing with per-CPU run queues and load balancing
 - **MLFQ scheduler** — multi-level feedback queue loaded as a kernel module, with configurable policy
-- **Virtual memory** — 4-level paging, per-PID ownership tracking, guard pages, lazy mmap w/ PROT_NONE + on-demand mprotect (needed for Go binaries)
+- **Virtual memory** — 4-level paging, per-PID ownership tracking, guard pages, demand-zero private anonymous mmap, on-demand mprotect, sparse ELF segments and COW reuse of initialized executable pages
 - **Kernel heap** — first-fit kmalloc/kfree allocator with coalescing; kmutex, krwlock, ksemaphore
 - **Loadable kernel modules** — drivers compiled separately and loaded from disk at boot (Phase 1 from initrd, Phase 2 from /boot/drivers)
 - **VFS with FAT and ext2** — virtio-blk backed storage with full read/write support, metadata cache, mount points
@@ -205,6 +205,12 @@ New captures use native 1920×1080 without upscaling. See
 </p>
 
 <p align="center"><em>VSCodium — native editing and file persistence, captured at 1920×1080 with 130% editor zoom</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_chromium_codium_1080.png"><img src="docs/images/brook_chromium_codium_1080.png" alt="Chromium browsing Google beside VSCodium with a document saved as the Brook user" width="960"></a>
+</p>
+
+<p align="center"><em>Chromium and VSCodium together — Brook user, software Wayland, 8 GiB VM and native 1920×1080 capture. The 4 GiB memory limit remains under investigation.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_gimp_workflow_1080.png"><img src="docs/images/brook_gimp_workflow_1080.png" alt="GIMP 3 running as Brook with the transparent B image saved as XCF and exported as PNG" width="960"></a>

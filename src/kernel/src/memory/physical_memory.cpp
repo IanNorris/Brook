@@ -713,7 +713,15 @@ PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
             return PhysicalAddress(idx * PAGE_SIZE);
         }
     }
+    const uint64_t freeAtFailure = g_freePages;
+    const uint64_t totalAtFailure = g_totalPages;
+    static uint32_t reports = 0;
+    const bool report = reports < 8;
+    if (report) ++reports;
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+    if (report)
+        SerialPrintf("PMM: allocation failed pid=%u tag=%u free_pages=%lu total_pages=%lu\n",
+                     static_cast<unsigned>(pid),static_cast<unsigned>(tag),freeAtFailure,totalAtFailure);
     return PhysicalAddress{}; // out of memory
 }
 

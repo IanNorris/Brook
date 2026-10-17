@@ -672,10 +672,10 @@ static uint64_t LoadInterpreter(Process* proc)
     return entry;
 }
 
-Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
+static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
                        int argc, const char* const* argv,
                        int envc, const char* const* envp,
-                       const FdEntry* stdFds, uint32_t launchUid, uint32_t launchGid)
+                       const FdEntry* stdFds, uint32_t launchUid, uint32_t launchGid, const ExecutableImage* owned)
 {
     if (!ExecArgumentsFit(argc, argv, envc, envp)) return nullptr;
     auto* proc = static_cast<Process*>(kmalloc(sizeof(Process)));
@@ -754,7 +754,8 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
 
     // Load ELF binary into the process's page table (no CR3 switch needed —
     // ElfLoad writes via the direct physical map).
-    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->addressSpace, proc->pid))
+    if (!(owned ? ElfLoadExecutable(*owned,&proc->elf,proc->addressSpace,proc->pid) :
+                  ElfLoad(elfData,elfSize,&proc->elf,proc->addressSpace,proc->pid)))
     {
         SerialPuts("PROC: ELF load failed\n");
 
@@ -925,6 +926,21 @@ Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
                  proc->addressSpace->programBreak, proc->addressSpace->pageTable.pml4.raw());
 
     return proc;
+}
+
+Process* ProcessCreate(const uint8_t* elfData, uint64_t elfSize,
+                       int argc, const char* const* argv,
+                       int envc, const char* const* envp,
+                       const FdEntry* stdFds, uint32_t launchUid, uint32_t launchGid)
+{
+    return ProcessCreateImpl(elfData,elfSize,argc,argv,envc,envp,stdFds,launchUid,launchGid,nullptr);
+}
+
+Process* ProcessCreateExecutable(const ExecutableImage& image, int argc, const char* const* argv,
+    int envc, const char* const* envp, const FdEntry* stdFds,
+    uint32_t launchUid, uint32_t launchGid)
+{
+    return ProcessCreateImpl(image.data,image.size,argc,argv,envc,envp,stdFds,launchUid,launchGid,&image);
 }
 
 Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
@@ -1596,10 +1612,10 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
 // ProcessExec -- replace a process's address space with a new ELF binary.
 // ---------------------------------------------------------------------------
 
-uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
+static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t elfSize,
                      int argc, const char* const* argv,
                      int envc, const char* const* envp,
-                     uint64_t* outStackPtr)
+                     uint64_t* outStackPtr, const ExecutableImage* owned)
 {
     if (!proc || proc->isKernelThread) return 0;
     if (!ExecArgumentsFit(argc, argv, envc, envp)) return 0;
@@ -1655,7 +1671,8 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     proc->crashInProgress = false;
 
     // 3. Load the new ELF binary
-    if (!ElfLoad(elfData, elfSize, &proc->elf, proc->addressSpace, proc->pid))
+    if (!(owned ? ElfLoadExecutable(*owned,&proc->elf,proc->addressSpace,proc->pid) :
+                  ElfLoad(elfData,elfSize,&proc->elf,proc->addressSpace,proc->pid)))
     {
         SerialPuts("EXEC: ELF load failed\n");
         return 0;
@@ -1756,6 +1773,20 @@ uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
     // If dynamically linked, start at the interpreter's entry point;
     // otherwise, start at the main binary's entry.
     return interpEntry ? interpEntry : proc->elf.entryPoint;
+}
+
+uint64_t ProcessExec(Process* proc, const uint8_t* elfData, uint64_t elfSize,
+                     int argc, const char* const* argv,
+                     int envc, const char* const* envp,
+                     uint64_t* outStackPtr)
+{
+    return ProcessExecImpl(proc,elfData,elfSize,argc,argv,envc,envp,outStackPtr,nullptr);
+}
+
+uint64_t ProcessExecExecutable(Process* proc, const ExecutableImage& image,
+    int argc, const char* const* argv, int envc, const char* const* envp, uint64_t* outStackPtr)
+{
+    return ProcessExecImpl(proc,image.data,image.size,argc,argv,envc,envp,outStackPtr,&image);
 }
 
 // ---------------------------------------------------------------------------

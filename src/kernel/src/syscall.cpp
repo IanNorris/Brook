@@ -864,9 +864,11 @@ extern "C" bool MemFdHandleUserFault(uint64_t address,uint64_t error) {
 static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
                                   uint64_t fileSize, uint32_t maxPages)
 {
-    // An uncached vnode must not allocate/read batches that Insert will
-    // immediately discard. Its pages are read on demand by the fault path.
-    if (!vn->cacheId) return 0;
+    // FileObject-backed faults use that inode's coherent resident cache and
+    // never consult this legacy cache. Preloading here would create unused
+    // duplicate pages and pin the vnode (and its resident cache) indefinitely.
+    // Uncached vnodes likewise must not read batches that Adopt will discard.
+    if (!vn->cacheId || (vn->ops->file_object && vn->ops->file_object(vn))) return 0;
     static constexpr uint32_t MAX_PRELOAD_PAGES = 4096; // 16MB
     static constexpr uint32_t CHUNK_PAGES = 16;         // 64KB per VfsRead
 
@@ -3730,6 +3732,7 @@ enum MmapFlags : uint64_t {
     MAP_FIXED     = 0x10,
     MAP_ANONYMOUS = 0x20,
     MAP_DENYWRITE = 0x0800,
+    MAP_POPULATE  = 0x8000,
 };
 
 enum MmapProt : uint64_t {
@@ -3811,7 +3814,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             if (!backing.value) { MemFdUnref(mfd); return -ENOMEM; }
             request.range.kind=MappingKind::MemFd;request.range.leafOwnership=MappingLeafOwnership::Borrowed;
             request.range.backing=backing.value;
-        } else if (prot) {
+        } else if (prot && (flags & MAP_POPULATE)) {
+            // Ordinary private anonymous mappings reserve address space;
+            // ResolveMappingFault supplies zeroed pages on first access.
+            // Keep explicit population requests eager.
             request.preparedPages=length/4096;request.prepare=PrepareAnonymousMapping;
         }
         return UserMappingCreate(proc,proc->addressSpace,request);
@@ -4917,7 +4923,7 @@ resolve_path:
 
     // --- Replace the process image ---
     uint64_t newStackPtr = 0;
-    uint64_t newEntry = ProcessExec(proc, elfBuf, elfSize,
+    uint64_t newEntry = ProcessExecExecutable(proc, image,
                                      argc, kArgv, envc, kEnvp,
                                      &newStackPtr);
 
