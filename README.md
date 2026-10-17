@@ -56,7 +56,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Wayland browsing, JavaScript/input, Google/Amazon HTTPS and 480p YouTube video verified; audio and normal-quit investigation in progress |
 | [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
 | [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation, text input, save/load verified; music and two bounded exit tests pass; longer-session exit testing remains |
-| [VSCodium](https://vscodium.com/) | 1.112.01907 | 🚧 Blocked | Gets past the field-trial shared-memory breakpoint; startup still waits without an editor window |
+| [VSCodium](https://vscodium.com/) | 1.112.01907 | 🚧 Blocked | Reaches window creation and workbench startup after shared-memory and nested-epoll fixes; client area remains blank |
 | [Blender](https://www.blender.org/) | 5.1.1 | 🚧 Blocked | Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified across reboot; optional plugin discovery still has faults |

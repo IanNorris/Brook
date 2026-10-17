@@ -135,9 +135,13 @@
   finding; the reproduced Firefox teardown free came from descriptor close.
 - Codium follow-up (17 October): removing `--disable-dev-shm-usage` gets past
   its field-trial allocation breakpoint using the supported `/dev/shm` backend.
-  It still starts helpers without an editor window; a ten-second profile is
-  about 99% idle. Diagnose the startup/IPC wait next. Both control boots passed
-  cleanup, heap and offline disk checks; no regular-file MAP_SHARED enabled.
+  Matched Electron symbols and a guest probe identified missing nested-epoll
+  readiness. The fix reaches window creation and workbench JavaScript loading;
+  the first comparison still showed a blank client area, so editor acceptance
+  remains open. Nested wakeup/timer, graph limits and close-during-wait probes
+  pass. Closed numeric watches also produced persistent orphan ERR/HUP events;
+  the follow-up retires those when scanned. Keep investigating rendering/input
+  and exit; no regular-file MAP_SHARED enabled. See `docs/workloads.md`.
 - Codium's earlier clean-boot rerun fails its 256-KiB writable file MAP_SHARED
   request with EOPNOTSUPP and reaches the same startup INT3. Complete coherent
   shared writes/writeback; rerunning without that feature did not yield an editor.

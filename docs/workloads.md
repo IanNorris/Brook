@@ -1763,3 +1763,94 @@ and scripts; session `5be7052708c044be92e4ede7cae33442`. The grey-window diagnos
 capture is `artifacts/130a986ce2244525b4553a68888d9804.png` under that session.
 Audio initialization and EGL context/presentation are separate remaining bugs
 to diagnose before deciding whether missing graphics functionality is involved.
+
+### Electron's nested epoll wait (17 October)
+
+Matched the installed Electron 39.8.0 ELF build ID against its official
+Breakpad symbols. Saved userspace stacks put the embedding thread in
+`electron::NodeBindingsLinux::PollEvents`. The corresponding Electron source
+registers libuv's epoll descriptor in another epoll descriptor. A guest Python
+control reproduced the missing behavior: the inner epoll returned its readable
+pipe, while the outer returned no events.
+
+The kernel now propagates nested read readiness without consuming inner
+notifications, flattens pinned leaf registrations for wakeups and timer
+scheduling, and rescans after registration. Graph mutation and traversal share
+a mutex; cycle and five-object depth checks include caller-visible ancestors.
+Runtime guards and memoization bound walks even when numeric descriptor reuse
+changes a graph. `poll`/`select` no longer report empty epoll descriptors as
+readable/writable. Cleanup uses the pinned descriptors actually registered,
+including when another thread removes a watch while waiting.
+
+`scripts/probe_nested_epoll.py` passes on host Linux and guest kernel SHA
+`f62da03d39f0467b820e2190f5a8a4df5350e6791648d073ef28e363f555c6a4`,
+session `add082cee91041109e96aa7a76bb2393`: non-consuming readiness and drain,
+poll/select masks, invalid controls, duplicate/self aliases, cycles, depth
+limits in both insertion orders, pipe/eventfd wakeups, nested timer expiry,
+shared-child diamonds, removal/close during a blocked wait, and concurrent
+opposing additions. Guest pipe/eventfd/timer wakeups were approximately
+19–20 ms, ahead of the 100 ms safety poll. All 20 existing host suites pass.
+Diagnostic artifacts are under ignored
+`build/workloads/codium-startup-20261017/epoll-{host,guest}.json`.
+
+This retains existing numeric-fd watch identity and single-slot leaf waiters;
+full Linux close/reuse/fork semantics and multiple simultaneous waiters remain
+separate work. Blocking `poll` on an epoll fd retains its 50 ms fallback;
+the direct nested wakeup acceptance above exercises `epoll_wait`.
+
+
+The first Codium comparison on that kernel created an 800×600 Wayland window,
+loaded workbench JavaScript and extension services, and answered an Electron
+inspector query (`app.isReady() == true`, one window). The client area remained
+blank and a native-input edit/save attempt did not change the acceptance file.
+A five-second profile contains 2,936 samples, 2,372 idle, with mapping faults,
+block IO and mapping lookup among active samples; this is continued startup
+work rather than the earlier 99%-idle no-window stall. Normal close did not
+complete during the observation; targeted cleanup returned to ten tasks,
+heap integrity passed, checked stop succeeded and all three disk checks passed.
+Session/profile: `add082cee91041109e96aa7a76bb2393` /
+`f88be441fb4946728fd64989a1e1eb77`.
+
+Review then found an orphan-event defect: after a watched descriptor was closed,
+`epoll_wait(0)` returned persistent `ERR|HUP` (24). The new target validation
+correctly rejects `DEL` of a closed descriptor, but without automatic close
+cleanup this prevents libuv's orphan-event cleanup from removing it. The
+follow-up scan retires invalid numeric watches and reports no readiness for
+closed targets. This is a concrete probe finding, not proof of the blank
+window's cause. It retains the documented limitations around duplicated open
+file descriptions and close/reuse before a scan.
+
+The expanded eight-group probe also checks all 64 bits of outer user data
+through the packed syscall ABI and verifies closed targets do not generate
+orphan events. It passes on Linux and on guest kernel SHA
+`477590e9f861406d1ee0c49431439160261425717dc9f30e069a80691589a5df`,
+session `23b28996f3ec4380b8704c9d5814ab04`. Wakeups again took approximately
+19–20 ms. Results: `epoll-host-closed.json` and `epoll-guest-closed.json` in the
+same ignored diagnostic directory. All 20 existing host suites passed again.
+
+An explicitly owned kernel-operation guard now covers walk allocation through
+pin/storage cleanup. Earlier `FdGetRef` calls already establish the persistent
+operation latch; this makes local ownership explicit rather than fixing a
+proven allocation leak. The cancellation probe forks eight children blocked in
+nested epoll, kills and reaps each, then checks normal responsiveness.
+
+The first final-kernel attempt timed out joining a watch-removal waiter; the
+immediate rerun passed all nine groups. Both results are retained in
+`epoll-guest-final-attempts.json`. Review found a real ordering race: the wait
+armed `wakeupTick` before the post-registration scan, but that scan can sleep on
+the graph mutex. `SchedulerUnblock` clears `wakeupTick`, so contention can erase
+both a user timeout and the fallback before the subsequent epoll sleep. The
+fix arms the recalculated deadline/timer minimum immediately before the final
+interruptible block, after the readiness scan. The observed intermittent
+failure is consistent with this race; the test alone does not prove causality.
+
+The timeout correction passed six full probe repetitions on Linux and twelve
+on the guest (two runs of six): 108 guest checks, including 96 killed blocked
+waiters. Both guest runs returned to ten tasks and exactly the same settled
+heap usage, 10,864,832 bytes; heap integrity passed. This bounds the cleanup
+claim to the repeated probe. Final tested kernel SHA:
+`66e6dda64c1f778d74f78bd8a31b12289b23095602a09693c573f15c610aeaef`,
+session `659c1072ce88407abf1fe876419313a7`;
+`epoll-guest-repeated-all.json` preserves both runs, and
+`epoll-timeout-heap-{1,2}.json` their heap snapshots. All 20 existing host suites
+passed on this kernel build. This does not establish Codium editor acceptance.

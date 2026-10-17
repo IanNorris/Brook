@@ -354,6 +354,7 @@ static volatile uint64_t g_profPreloadPages = 0;
 // ---------------------------------------------------------------------------
 
 static constexpr int64_t ENOENT  = 2;
+static constexpr int64_t EEXIST  = 17;
 static constexpr int64_t ESRCH   = 3;
 static constexpr int64_t E2BIG   = 7;
 static constexpr int64_t EPERM   = 1;
@@ -7637,6 +7638,8 @@ static uint64_t WaitWakeupTick(uint64_t deadlineNs, uint64_t safetyMs)
 }
 
 // Trusted kernel array; syscall wrappers validate/copy user memory separately.
+static int EpollPollReady(Process* proc, EpollInstance* ep);
+
 static int64_t PollWait(pollfd* fds, uint64_t nfds, uint64_t timeout_ms, bool selectMode = false)
 {
     Process* proc = ProcessCurrent();
@@ -7712,6 +7715,17 @@ retry_poll:
                     fds[i].revents |= (pb->readers > 0) ? POLLOUT : POLLERR;
                     ready++;
                 }
+            }
+            continue;
+        }
+
+        // An epoll fd is readable when a watched event is available, and is
+        // never writable. Do not fall through to synthetic device readiness.
+        if (fde->type == FdType::EpollFd && fde->handle) {
+            if (fds[i].events & POLLIN) {
+                int result = EpollPollReady(proc, static_cast<EpollInstance*>(fde->handle));
+                if (result < 0) return result;
+                if (result) { fds[i].revents = POLLIN; ready++; }
             }
             continue;
         }
@@ -8355,13 +8369,22 @@ static constexpr uint32_t EPOLLHUP     = 0x010;
 static constexpr int EPOLL_CTL_DEL = 2;
 static constexpr int EPOLL_CTL_MOD = 3;
 
+// Serialize interest-list mutation and traversals, including graph validation.
+// Never acquired by fd finalization, and never held across a userspace wait.
+static KMutex g_epollGraphLock{};
+struct EpollGraphGuard {
+    EpollGraphGuard() { KMutexLock(&g_epollGraphLock); }
+    ~EpollGraphGuard() { KMutexUnlock(&g_epollGraphLock); }
+};
+static constexpr int EPOLL_MAX_DEPTH = 5; // four epoll-to-epoll edges
+
 // Check if a single fd is ready given the requested events mask.
 // Returns the set of events that are actually ready.
-static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
+static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
 {
-    FdRef fde_ref(proc, fd);
-    FdEntry* fde = fde_ref.get();
-    if (!fde) return EPOLLERR | EPOLLHUP;
+    // A closed watch is not an fd producing a hangup event. In particular,
+    // do not feed libuv orphan ERR|HUP notifications forever after close.
+    if (!fde) return 0;
 
     uint32_t ready = 0;
     if (fde->type == FdType::Socket && fde->handle) {
@@ -8425,22 +8448,124 @@ static uint32_t EpollFdReady(Process* proc, int fd, uint32_t events)
     return ready;
 }
 
-// Scan interest list and fill events[]. Returns count of ready fds.
-static int EpollScanReady(Process* proc, EpollInstance* ep,
-                           EpollEvent* events, int maxevents)
-{
-    int n = 0;
-    for (int i = 0; i < ep->count && n < maxevents; i++) {
-        EpollEntry& e = ep->entries[i];
-        if (e.fd < 0) continue;
-        uint32_t ready = EpollFdReady(proc, e.fd, e.events);
-        if (ready) {
-            events[n].events = ready;
-            events[n].data.u64 = e.data;
-            n++;
+// Heap-backed walk state: recursive kernel stacks must not contain MAX_FDS
+// arrays. Pins survive registration/sleep/cleanup, even if ctl DEL or close
+// changes the graph. Entries still use Brook's existing numeric-fd identity.
+struct EpollWalk {
+    Process* proc;
+    FdEntry* pins[MAX_FDS];
+    bool attempted[MAX_FDS];
+    uint32_t masks[MAX_FDS];
+    struct Node {
+        EpollInstance* ep;
+        uint8_t ready[EPOLL_MAX_DEPTH]; // 0 unknown, 1 false, 2 true
+        bool active;
+        uint8_t collectedDepth;
+        int height;
+    } nodes[EPOLL_MAX_FDS + 1];
+    int count;
+    FdEntry* pin(int fd) {
+        if (fd < 0 || fd >= EPOLL_MAX_FDS) return nullptr;
+        if (!attempted[fd]) {
+            attempted[fd] = true;
+            pins[fd] = FdGetRef(proc, fd);
+        }
+        return pins[fd];
+    }
+    Node* node(EpollInstance* ep) {
+        for (int i = 0; i < count; i++) if (nodes[i].ep == ep) return &nodes[i];
+        if (count >= EPOLL_MAX_FDS + 1) return nullptr;
+        auto* n = &nodes[count++]; n->ep = ep; return n;
+    }
+    bool any(EpollInstance* ep, int depth = 0) {
+        if (depth >= EPOLL_MAX_DEPTH) return false;
+        auto* n = node(ep);
+        if (!n || n->active) return false; // guard fd-reuse-created cycles too
+        if (n->ready[depth]) return n->ready[depth] == 2;
+        n->active = true;
+        bool result = false;
+        for (int i = 0; i < ep->count && !result; i++) {
+            auto e = ep->entries[i];
+            if (e.fd >= 0) {
+                if (!pin(e.fd)) { ep->entries[i].fd = -1; continue; }
+                result = ready(e.fd, e.events, depth);
+            }
+        }
+        n->active = false; n->ready[depth] = result ? 2 : 1;
+        return result;
+    }
+    uint32_t ready(int fd, uint32_t events, int depth) {
+        auto* fde = pin(fd);
+        if (fde && fde->type == FdType::EpollFd && fde->handle)
+            return (events & EPOLLIN) && any(static_cast<EpollInstance*>(fde->handle), depth + 1) ? EPOLLIN : 0;
+        return EpollLeafReady(fde, events);
+    }
+    void collect(EpollInstance* ep, int depth = 0) {
+        if (depth >= EPOLL_MAX_DEPTH) return;
+        auto* n = node(ep);
+        if (!n || n->collectedDepth >= EPOLL_MAX_DEPTH - depth) return;
+        n->collectedDepth = EPOLL_MAX_DEPTH - depth;
+        for (int i = 0; i < ep->count; i++) {
+            auto e = ep->entries[i];
+            auto* fde = pin(e.fd);
+            if (!fde || !fde->handle) continue;
+            if (fde->type == FdType::EpollFd) {
+                if (e.events & EPOLLIN) collect(static_cast<EpollInstance*>(fde->handle), depth + 1);
+            } else masks[e.fd] |= e.events | EPOLLERR | EPOLLHUP;
         }
     }
+    // All edges participate in cycle/depth validation, regardless of masks.
+    int height(EpollInstance* ep, int depth = 0) {
+        if (depth >= EPOLL_MAX_DEPTH) return EPOLL_MAX_DEPTH + 1;
+        auto* n = node(ep);
+        if (!n || n->active) return EPOLL_MAX_DEPTH + 1;
+        if (n->height) return n->height;
+        n->active = true;
+        int h = 1;
+        for (int i = 0; i < ep->count; i++) {
+            auto* fde = pin(ep->entries[i].fd);
+            if (!fde || fde->type != FdType::EpollFd || !fde->handle) continue;
+            int child = height(static_cast<EpollInstance*>(fde->handle), depth + 1) + 1;
+            if (child > h) h = child;
+            if (h > EPOLL_MAX_DEPTH) break;
+        }
+        n->active = false; n->height = h; return h;
+    }
+    void clearMemo() {
+        __builtin_memset(nodes, 0, sizeof(nodes)); count = 0;
+    }
+};
+struct EpollWalkOwner {
+    KernelOperationGuard operation; // unwind pins/storage before fatal cancellation
+    EpollWalk* walk;
+    explicit EpollWalkOwner(Process* proc) : operation(proc), walk(static_cast<EpollWalk*>(kmalloc(sizeof(EpollWalk)))) {
+        if (walk) { __builtin_memset(walk, 0, sizeof(*walk)); walk->proc = proc; }
+    }
+    ~EpollWalkOwner() {
+        if (!walk) return;
+        for (int fd = 0; fd < EPOLL_MAX_FDS; fd++) if (walk->pins[fd]) FdPut(walk->proc, fd);
+        kfree(walk);
+    }
+};
+static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
+                          EpollEvent* events, int maxevents) {
+    EpollGraphGuard guard;
+    walk->clearMemo();
+    int n = 0;
+    for (int i = 0; i < ep->count && n < maxevents; i++) {
+        auto e = ep->entries[i];
+        if (e.fd < 0) continue;
+        if (!walk->pin(e.fd)) { ep->entries[i].fd = -1; continue; }
+        uint32_t ready = walk->ready(e.fd, e.events, 0);
+        if (ready) { events[n].events = ready; events[n++].data.u64 = e.data; }
+    }
     return n;
+}
+static int EpollPollReady(Process* proc, EpollInstance* ep) {
+    EpollWalkOwner state(proc);
+    if (!state.walk) return -ENOMEM;
+    EpollGraphGuard guard;
+    return state.walk->any(ep) ? 1 : 0;
 }
 
 static int64_t epoll_create_impl(uint64_t flagsVal)
@@ -8450,7 +8575,7 @@ static int64_t epoll_create_impl(uint64_t flagsVal)
 
     auto* ep = static_cast<EpollInstance*>(kmalloc(sizeof(EpollInstance)));
     if (!ep) return -ENOMEM;
-    for (int i = 0; i < EPOLL_MAX_FDS; i++) ep->entries[i].fd = -1;
+    for (int i = 0; i < EPOLL_MAX_FDS; i++) ep->entries[i] = {-1, 0, 0};
     ep->count = 0;
     ep->refCount = 1;
     ep->waiter = nullptr;
@@ -8485,188 +8610,147 @@ static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-
-    FdEntry* epfde = FdGet(proc, static_cast<int>(epfd));
-    if (!epfde || epfde->type != FdType::EpollFd || !epfde->handle) {
-        SerialPrintf("sys_epoll_ctl: EBADF epfd=%lu pid=%u op=%lu "
-                     "fde=%p type=%d handle=%p\n",
-                     epfd, proc->pid, op, epfde,
-                     epfde ? static_cast<int>(epfde->type) : -1,
-                     epfde ? epfde->handle : nullptr);
-        return -EBADF;
+    FdRef epref(proc, static_cast<int>(epfd));
+    FdRef watchref(proc, static_cast<int>(watchfd));
+    if (!epref || !watchref) return -EBADF;
+    if (epref->type != FdType::EpollFd || !epref->handle) return -EINVAL;
+    if (op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD && op != EPOLL_CTL_DEL) return -EINVAL;
+    auto* ep = static_cast<EpollInstance*>(epref->handle);
+    if (watchref->type == FdType::EpollFd && watchref->handle == ep) return -EINVAL;
+    EpollEvent ev{};
+    if (op != EPOLL_CTL_DEL) {
+        if (!UserBufferReadable(eventAddr, sizeof(ev))) return -EFAULT;
+        __builtin_memcpy(&ev, reinterpret_cast<const void*>(eventAddr), sizeof(ev));
     }
-    auto* ep = static_cast<EpollInstance*>(epfde->handle);
-
-    int wfd = static_cast<int>(watchfd);
-
-    if (op == EPOLL_CTL_DEL) {
-        for (int i = 0; i < ep->count; i++) {
-            if (ep->entries[i].fd == wfd) {
-                ep->entries[i].fd = -1;
-
-                return 0;
-            }
-        }
-        return -ENOENT;
-    }
-
-    // ADD or MOD — read the epoll_event from userspace
-    EpollEvent ev = {};
-    if (eventAddr < 0x1000) return -EFAULT;
-    __builtin_memcpy(&ev, reinterpret_cast<const void*>(eventAddr), sizeof(ev));
-
-    if (op == EPOLL_CTL_MOD) {
-        for (int i = 0; i < ep->count; i++) {
-            if (ep->entries[i].fd == wfd) {
-                ep->entries[i].events = ev.events;
-                ep->entries[i].data   = ev.data.u64;
-
-                return 0;
-            }
-        }
-        return -ENOENT;
-    }
-
-    // EPOLL_CTL_ADD
-    if (ep->count >= EPOLL_MAX_FDS) return -ENOMEM;
-
-    // Find free slot (may have gaps from DEL)
+    EpollWalkOwner state(proc);
+    if (!state.walk) return -ENOMEM;
+    EpollGraphGuard guard;
+    int existing = -1, free = -1;
     for (int i = 0; i < EPOLL_MAX_FDS; i++) {
-        if (ep->entries[i].fd < 0) {
-            ep->entries[i].fd     = wfd;
-            ep->entries[i].events = ev.events;
-            ep->entries[i].data   = ev.data.u64;
-            if (i >= ep->count) ep->count = i + 1;
-
-            return 0;
-        }
+        if (ep->entries[i].fd == static_cast<int>(watchfd)) existing = i;
+        if (ep->entries[i].fd < 0 && free < 0) free = i;
     }
-    return -ENOMEM;
+    if (op == EPOLL_CTL_DEL) {
+        if (existing < 0) return -ENOENT;
+        ep->entries[existing].fd = -1;
+        return 0;
+    }
+    if (op == EPOLL_CTL_MOD && existing < 0) return -ENOENT;
+    if (op == EPOLL_CTL_ADD && existing >= 0) return -EEXIST;
+    int slot = op == EPOLL_CTL_MOD ? existing : free;
+    if (slot < 0) return -ENOMEM;
+    const int oldCount = ep->count;
+    const auto old = ep->entries[slot];
+    ep->entries[slot] = {static_cast<int>(watchfd), ev.events, ev.data.u64};
+    if (slot >= ep->count) ep->count = slot + 1;
+    if (op == EPOLL_CTL_ADD && watchref->type == FdType::EpollFd) {
+        // Include ancestors: adding at the bottom can also exceed the limit.
+        bool valid = state.walk->height(ep) <= EPOLL_MAX_DEPTH;
+        for (int fd = 0; fd < EPOLL_MAX_FDS && valid; fd++) {
+            auto* fde = state.walk->pin(fd);
+            if (fde && fde->type == FdType::EpollFd && fde->handle)
+                valid = state.walk->height(static_cast<EpollInstance*>(fde->handle)) <= EPOLL_MAX_DEPTH;
+        }
+        if (!valid) { ep->entries[slot] = old; ep->count = oldCount; return -ELOOP; }
+    }
+    return 0;
 }
 
 static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                                 EpollEvent* kEvents, int maxevents,
                                 int timeout_ms)
 {
-    // Immediate scan
-    int n = EpollScanReady(proc, ep, kEvents, maxevents);
-    if (n > 0 || timeout_ms == 0) return n;
-
-    // Block until something is ready (or timeout)
-    extern volatile uint64_t g_lapicTickCount;
-    uint64_t deadline = WaitDeadlineNs(timeout_ms < 0 ? ~0ULL : static_cast<uint64_t>(timeout_ms));
-
-    ep->waiter = proc;
-
-    // Register proc as the epoll waiter on every watched pipe / listen
-    // socket / eventfd / timerfd / TCP socket so writers/receivers can
-    // SchedulerUnblock us directly — no more polling needed.
-    auto registerWaiters = [&]() {
-        for (int i = 0; i < ep->count; i++) {
-            int wfd = ep->entries[i].fd;
-            if (wfd < 0) continue;
-            FdRef fde_ref(proc, wfd);  // BRO-156: pin across handle deref
-            FdEntry* fde = fde_ref.get();
-            if (!fde || !fde->handle) continue;
-            if (fde->type == FdType::Pipe) {
-                static_cast<PipeBuffer*>(fde->handle)->epollWaiter = proc;
-            } else if (fde->type == FdType::EventFd) {
-                static_cast<EventFdData*>(fde->handle)->epollWaiter = proc;
-            } else if (fde->type == FdType::TimerFd) {
-                static_cast<TimerFdData*>(fde->handle)->waiter = proc;
-            } else if (fde->type == FdType::Socket) {
-                int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-                brook::SockSetPollWaiter(si, proc);
-            } else if (fde->type == FdType::UnixSocket) {
-                auto* usd = static_cast<UnixSocketData*>(fde->handle);
-                uint32_t events = ep->entries[i].events;
-                if ((events & EPOLLIN) && usd->state == UnixSocketData::State::Listening) {
-                    usd->epollWaiter = proc;
-                } else if ((events & (EPOLLIN | EPOLLRDHUP)) &&
-                           usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
-                    usd->rxPipe->epollWaiter = proc;
+    const uint64_t deadline = WaitDeadlineNs(timeout_ms < 0 ? ~0ULL : static_cast<uint64_t>(timeout_ms));
+    for (;;) {
+        EpollWalkOwner state(proc);
+        auto* walk = state.walk;
+        if (!walk) return -ENOMEM;
+        int n = EpollScanReady(walk, ep, kEvents, maxevents);
+        if (n > 0 || timeout_ms == 0) return n;
+        {
+            EpollGraphGuard guard;
+            walk->clearMemo();
+            walk->collect(ep);
+        }
+        auto registerWaiters = [&]() {
+            for (int wfd = 0; wfd < EPOLL_MAX_FDS; wfd++) {
+                FdEntry* fde = walk->pins[wfd];
+                if (!walk->masks[wfd]) continue;
+                if (!fde || !fde->handle) continue;
+                if (fde->type == FdType::Pipe) {
+                    static_cast<PipeBuffer*>(fde->handle)->epollWaiter = proc;
+                } else if (fde->type == FdType::EventFd) {
+                    static_cast<EventFdData*>(fde->handle)->epollWaiter = proc;
+                } else if (fde->type == FdType::TimerFd) {
+                    static_cast<TimerFdData*>(fde->handle)->waiter = proc;
+                } else if (fde->type == FdType::Socket) {
+                    int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+                    brook::SockSetPollWaiter(si, proc);
+                } else if (fde->type == FdType::UnixSocket) {
+                    auto* usd = static_cast<UnixSocketData*>(fde->handle);
+                    uint32_t events = walk->masks[wfd];
+                    if ((events & EPOLLIN) && usd->state == UnixSocketData::State::Listening) {
+                        usd->epollWaiter = proc;
+                    } else if ((events & (EPOLLIN | EPOLLRDHUP)) &&
+                               usd->state == UnixSocketData::State::Connected && usd->rxPipe) {
+                        usd->rxPipe->epollWaiter = proc;
+                    }
+                    if ((events & EPOLLOUT) &&
+                        usd->state == UnixSocketData::State::Connected && usd->txPipe)
+                        usd->txPipe->epollWaiter = proc;
                 }
-                if ((events & EPOLLOUT) &&
-                    usd->state == UnixSocketData::State::Connected && usd->txPipe)
-                    usd->txPipe->epollWaiter = proc;
             }
-        }
-    };
-    auto unregisterWaiters = [&]() {
-        for (int i = 0; i < ep->count; i++) {
-            int wfd = ep->entries[i].fd;
-            if (wfd < 0) continue;
-            FdRef fde_ref(proc, wfd);  // BRO-156: pin across handle deref
-            FdEntry* fde = fde_ref.get();
-            if (!fde || !fde->handle) continue;
-            if (fde->type == FdType::Pipe) {
-                auto* pb = static_cast<PipeBuffer*>(fde->handle);
-                if (pb->epollWaiter == proc) pb->epollWaiter = nullptr;
-            } else if (fde->type == FdType::EventFd) {
-                auto* efd = static_cast<EventFdData*>(fde->handle);
-                if (efd->epollWaiter == proc) efd->epollWaiter = nullptr;
-            } else if (fde->type == FdType::TimerFd) {
-                auto* tfd = static_cast<TimerFdData*>(fde->handle);
-                if (tfd->waiter == proc) tfd->waiter = nullptr;
-            } else if (fde->type == FdType::Socket) {
-                int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-                brook::SockSetPollWaiter(si, nullptr);
-            } else if (fde->type == FdType::UnixSocket) {
-                auto* usd = static_cast<UnixSocketData*>(fde->handle);
-                if (usd->epollWaiter == proc) usd->epollWaiter = nullptr;
-                if (usd->rxPipe && usd->rxPipe->epollWaiter == proc)
-                    usd->rxPipe->epollWaiter = nullptr;
-                if (usd->txPipe && usd->txPipe->epollWaiter == proc)
-                    usd->txPipe->epollWaiter = nullptr;
+        };
+        auto unregisterWaiters = [&]() {
+            for (int wfd = 0; wfd < EPOLL_MAX_FDS; wfd++) {
+                FdEntry* fde = walk->pins[wfd];
+                if (!walk->masks[wfd]) continue;
+                if (!fde || !fde->handle) continue;
+                if (fde->type == FdType::Pipe) {
+                    auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                    if (pb->epollWaiter == proc) pb->epollWaiter = nullptr;
+                } else if (fde->type == FdType::EventFd) {
+                    auto* efd = static_cast<EventFdData*>(fde->handle);
+                    if (efd->epollWaiter == proc) efd->epollWaiter = nullptr;
+                } else if (fde->type == FdType::TimerFd) {
+                    auto* tfd = static_cast<TimerFdData*>(fde->handle);
+                    if (tfd->waiter == proc) tfd->waiter = nullptr;
+                } else if (fde->type == FdType::Socket) {
+                    int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+                    brook::SockSetPollWaiter(si, nullptr);
+                } else if (fde->type == FdType::UnixSocket) {
+                    auto* usd = static_cast<UnixSocketData*>(fde->handle);
+                    if (usd->epollWaiter == proc) usd->epollWaiter = nullptr;
+                    if (usd->rxPipe && usd->rxPipe->epollWaiter == proc)
+                        usd->rxPipe->epollWaiter = nullptr;
+                    if (usd->txPipe && usd->txPipe->epollWaiter == proc)
+                        usd->txPipe->epollWaiter = nullptr;
+                }
             }
-        }
-    };
+        };
 
-    while (true) {
         registerWaiters();
-
-        // Compute the earliest wakeup needed:
-        // 1. TimerFd expiry deadlines (wake precisely when timer fires)
-        // 2. User-specified timeout
-        // All fd types now have direct wake wiring, so the safety poll is
-        // only needed as a fallback for edge cases (e.g. closed fd race).
-        uint64_t wakeAt = WaitWakeupTick(deadline, 100);
-
-        for (int i = 0; i < ep->count; i++) {
-            int wfd = ep->entries[i].fd;
-            if (wfd < 0) continue;
-            FdRef fde_ref(proc, wfd);  // BRO-156: pin across handle deref
-            FdEntry* fde = fde_ref.get();
-            if (!fde || !fde->handle) continue;
-            if (fde->type == FdType::TimerFd) {
-                auto* tfd = static_cast<TimerFdData*>(fde->handle);
-                if (tfd->armed && tfd->nextExpiry < wakeAt)
-                    wakeAt = tfd->nextExpiry;
+        // The graph mutex can sleep. Arm the timeout only after this scan:
+        // SchedulerUnblock clears wakeupTick when granting a contended mutex.
+        n = EpollScanReady(walk, ep, kEvents, maxevents);
+        if (!n && !HasPendingSignals() && (timeout_ms < 0 || ClockNowNs(1) < deadline)) {
+            uint64_t wakeAt = WaitWakeupTick(deadline, 100);
+            for (int fd = 0; fd < EPOLL_MAX_FDS; fd++) {
+                auto* fde = walk->pins[fd];
+                if (!walk->masks[fd] || !fde || fde->type != FdType::TimerFd) continue;
+                auto* timer = static_cast<TimerFdData*>(fde->handle);
+                if (timer->armed && timer->nextExpiry < wakeAt) wakeAt = timer->nextExpiry;
             }
-        }
-
-        proc->wakeupTick = wakeAt;
-
-        // A signal may already be pending when the wait begins (including
-        // after a mask change); do not sleep before returning it to userspace.
-        if (!HasPendingSignals() && (timeout_ms < 0 || ClockNowNs(1) < deadline))
+            proc->wakeupTick = wakeAt;
             SchedulerBlockInterruptible(proc);
+        }
         unregisterWaiters();
-        if (HasPendingSignals()) {
-            ep->waiter = nullptr;
-            return -EINTR;
-        }
-
-        n = EpollScanReady(proc, ep, kEvents, maxevents);
-        if (n > 0) { ep->waiter = nullptr; return n; }
-
-        if (timeout_ms >= 0 && ClockNowNs(1) >= deadline) {
-            ep->waiter = nullptr;
-            return 0; // timeout
-        }
-
-        // Re-arm for another wait cycle
-        ep->waiter = proc;
+        if (HasPendingSignals()) return -EINTR;
+        if (n > 0) return n;
+        n = EpollScanReady(walk, ep, kEvents, maxevents);
+        if (n > 0) return n;
+        if (timeout_ms >= 0 && ClockNowNs(1) >= deadline) return 0;
+        // Release pins only after unregistering the exact flattened leaves.
     }
 }
 
@@ -8705,19 +8789,6 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
 
     if (maxevents <= 0 || maxevents > 1024) return -EINVAL;
 
-    // Check if this epoll watches any inet sockets (for NET_DIAG)
-    bool watchesInetSock = false;
-    for (int i = 0; i < ep->count; i++) {
-        if (ep->entries[i].fd < 0) continue;
-        FdEntry* wfde = FdGet(proc, ep->entries[i].fd);
-        if (wfde && wfde->type == FdType::Socket) { watchesInetSock = true; break; }
-    }
-    // Only log blocking epoll_wait (timeout != 0) to avoid tight-poll spam
-    bool logEpoll = watchesInetSock && static_cast<int64_t>(timeout_ms) != 0;
-    if (logEpoll) {
-        extern volatile uint64_t g_lapicTickCount;
-    }
-
     // Allocate kernel-side event buffer
     auto* kEvents = static_cast<EpollEvent*>(
         kmalloc(sizeof(EpollEvent) * static_cast<uint32_t>(maxevents)));
@@ -8726,10 +8797,6 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
     int n = epoll_wait_impl(proc, ep, kEvents,
                              static_cast<int>(maxevents),
                              static_cast<int>(static_cast<int64_t>(timeout_ms)));
-
-    if (logEpoll) {
-        extern volatile uint64_t g_lapicTickCount;
-    }
 
     if (n > 0) {
         if (eventsAddr < 0x1000) { kfree(kEvents); return -EFAULT; }
