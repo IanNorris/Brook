@@ -20,16 +20,19 @@ def main():
     parser.add_argument("session")
     parser.add_argument("output", type=Path)
     parser.add_argument("--binary", default="/boot/REGCHK")
+    parser.add_argument("--kernel", action="store_true", help="Also run root-only test-kernel probes")
     args = parser.parse_args()
     output = args.output.resolve()
     if not output.is_relative_to(ROOT / "build"):
         parser.error("Keep runtime evidence under this repository's build directory")
     output.mkdir(parents=True, exist_ok=True)
     request_path = output / "request.json"
-    identity = {"session": args.session, "binary": args.binary, "uid": 1000}
+    identity = {"session": args.session, "binary": args.binary, "uid": 0 if args.kernel else 1000,
+                "kernel": args.kernel}
     if request_path.exists():
         request = json.loads(request_path.read_text())
-        if any(request[key] != value for key, value in identity.items()):
+        if any(request.get(key, False if key == "kernel" else None) != value
+               for key, value in identity.items()):
             parser.error("Output belongs to a different session/binary; use a fresh directory")
     else:
         request = {**identity, "request_id": uuid.uuid4().hex}
@@ -37,7 +40,8 @@ def main():
             json.dump(request, stream, indent=2)
     # A timeout is not terminal. Rerunning with this output resumes the same ID.
     print("REGISTER_JOB", request["request_id"], flush=True)
-    result = server.guest_run(args.session, argv=[args.binary], uid=1000,
+    argv = [args.binary] + (["--kernel"] if args.kernel else [])
+    result = server.guest_run(args.session, argv=argv, uid=identity["uid"],
                               request_id=request["request_id"], wait_s=15)
     deadline = time.monotonic() + 90
     terminal = {"completed", "failed", "rejected", "lost", "cancelled"}
@@ -56,7 +60,7 @@ def main():
         print(error, file=sys.stderr, end="")
     exit_info = result.get("exit") or {}
     passed = (result["state"] == "completed" and exit_info.get("code") == 0
-              and "REGISTER_RESULT 10/10" in text.splitlines())
+              and f"REGISTER_RESULT {11 if args.kernel else 10}/{11 if args.kernel else 10}" in text.splitlines())
     print("REGISTER_ACCEPTANCE", "PASS" if passed else "FAIL", result["state"])
     return 0 if passed else 1
 

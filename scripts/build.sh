@@ -46,6 +46,12 @@ cmake \
 echo "Building..."
 cmake --build "${BUILD_DIR}"
 
+echo "Auditing compiled entry/return templates..."
+python3 "${ROOT_DIR}/scripts/audit_entry_state.py" \
+    "${BUILD_DIR}/kernel/BROOK.elf" --mutations \
+    --output "${BUILD_DIR}/entry-state-audit.json" >"${BUILD_DIR}/entry-state-audit.log"
+echo "Entry audit passed for supported templates (coverage: ${BUILD_DIR}/entry-state-audit.json)."
+
 # Build host-native tests (uses nix-wrapped clang++ with standard host libs).
 # HOST_CXX is set by shell.nix to the wrapped Clang+libc++ toolchain;
 # CC/CXX remain the unwrapped Clang used for kernel cross-compilation.

@@ -906,6 +906,15 @@ See `register-state-tests.md`. Complete controlled CPL0/IST, IRQ/IPI/NMI,
 nested/migration, kernel-stack/canary and signal FPU-frame coverage before claiming
 all handlers preserve their required state.
 
+Controlled CPL0 probes now pass the shared IRQ-wrapper template (synthetic
+frame), real UD/GP/PF stubs, exact kernel RSP, upper stack guards, GPR/vector
+state and C-entry alignment. The root-only interface is test-build-only and
+UID 1000 is denied. A Capstone ELF audit is now in the normal build script:
+nine production entry templates and 39 byte mutations pass; six return paths
+remain explicitly unsupported. Full-coverage mode must still fail. NMI/IST,
+hardware device delivery, nested/preempted entry windows, TLS and signal FPU
+state remain open; see `register-state-tests.md` for the supported contracts.
+
 
 ## Current real-workload and desktop follow-ups (2026-10-16)
 

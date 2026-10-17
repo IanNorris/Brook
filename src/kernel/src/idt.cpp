@@ -40,16 +40,7 @@ static IdtDescriptor g_idtDesc;
 // ---- Full exception frame (matches exception_stubs.S push order) ----
 // Assembly stubs for vectors 13/14 push all GPRs before calling
 // HandleExceptionFull, allowing signal delivery to modify return registers.
-struct FullExceptionFrame {
-    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
-    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
-    uint64_t errorCode;
-    uint64_t rip;
-    uint64_t cs;
-    uint64_t rflags;
-    uint64_t rsp;
-    uint64_t ss;
-};
+#include "register_test.h"
 
 // ---- Helper to fill one IDT entry ----
 static void SetIdtEntry(uint8_t vector, void* handler, uint8_t ist = 0,
@@ -793,6 +784,7 @@ static void HandleDoubleFault(InterruptFrame* frame, uint64_t errorCode)
     uint64_t rbp = 0;
     uint64_t currentProcRaw = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
+
     __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
     __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
     __asm__ volatile("movq %%gs:184, %0" : "=r"(currentProcRaw));
@@ -914,6 +906,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // fault during a register dump). Retain this exception's original address.
     uint64_t cr2 = 0;
     __asm__ volatile("movq %%cr2, %0" : "=r"(cr2));
+
+    if(brook::RegisterTestException(ef,vector,cr2))return;
 
     // If a panic is already active, this CPU must not produce output or
     // render a panic screen — it would garble the panicking CPU's work.

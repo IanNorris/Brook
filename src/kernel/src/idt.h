@@ -25,6 +25,17 @@ struct InterruptFrame {
     uint64_t ss;
 };
 
+// exception_stubs.S: 15 saved GPRs, real/synthetic error code, hardware frame.
+struct FullExceptionFrame {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t errorCode, rip, cs, rflags, rsp, ss;
+};
+static_assert(sizeof(FullExceptionFrame)==168);
+static_assert(__builtin_offsetof(FullExceptionFrame,errorCode)==120);
+static_assert(__builtin_offsetof(FullExceptionFrame,rip)==128);
+static_assert(__builtin_offsetof(FullExceptionFrame,rsp)==152);
+
 // Set up 32 exception handlers and 16 IRQ stubs, then load the IDT via lidt.
 void IdtInit(brook::Framebuffer* fb);
 

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <stdint.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
@@ -68,7 +69,10 @@ static void syscall_case(const char* label,long number,long result) {
     expected[0]=(uint64_t)result;expected[2]=(uintptr_t)register_syscall_resume;expected[10]=register_flags;
     register_probe_syscall();check(label,register_flags,1);
 }
-int main(void) {
+int main(int argc,char** argv) {
+    const int kernel=argc==2&&!strcmp(argv[1],"--kernel");
+    const int denied=argc==2&&!strcmp(argv[1],"--kernel-denied");
+    if(argc>1&&!kernel&&!denied)return 64;
     setvbuf(stdout,NULL,_IONBF,0);
     alarm(30);
     seed();syscall_case("getpid",SYS_getpid,getpid());
@@ -96,6 +100,12 @@ int main(void) {
        LOOP changes RCX only; it leaves the seeded arithmetic flags intact. */
     seed();register_seed[2]=50000000;memcpy(expected,register_seed,sizeof expected);expected[2]=0;
     register_probe_timer();check("timer-exposure",register_flags,1);
+    if(kernel||denied) {
+        errno=0;long result=syscall(0xb31,0ul,0ul,0ul,0ul,0ul,0ul);
+        const int ok=kernel?result==4:(result==-1&&errno==EPERM);
+        ++total;passed+=ok;
+        printf("REGISTER_CASE %s %s result=%ld errno=%d\n",kernel?"kernel-entry":"kernel-permission",ok?"PASS":"FAIL",result,errno);
+    }
     printf("REGISTER_RESULT %u/%u\n",passed,total);
     return passed==total?0:1;
 }

@@ -158,7 +158,12 @@ ExceptionStub\vector:
     // Remove synthetic error code
     addq $8, %rsp
 
+    // Normalize live flags, preserving the interrupted frame's flags for IRET.
+    pushfq
+    andq $0xfffffffffffbbbff, (%rsp)
+    popfq
     iretq
+.size ExceptionStub\vector, .-ExceptionStub\vector
 .endm
 
 // Macro for an exception with error code.
@@ -227,7 +232,11 @@ ExceptionStub\vector:
     // Remove error code
     addq $8, %rsp
 
+    pushfq
+    andq $0xfffffffffffbbbff, (%rsp)
+    popfq
     iretq
+.size ExceptionStub\vector, .-ExceptionStub\vector
 .endm
 
 // Generate stubs for exceptions that need full register capture / QR panic.

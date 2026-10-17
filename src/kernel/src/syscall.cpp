@@ -28,6 +28,7 @@
 #include "memory/user_mapping.h"
 #include "memory/mapping_fault.h"
 #include "memory/mapping_fault_test.h"
+#include "register_test.h"
 #include "memory/physical_memory.h"
 #include "vfs.h"
 #include "ext2_vfs.h"
@@ -13434,6 +13435,9 @@ void SyscallTableInit()
     g_syscallTable[0xB04]                = sys_brook_wm_scale;
 #ifdef BROOK_MAPPING_TEST_HOOKS
     g_syscallTable[0xB30]                = MappingFaultTestControl;
+#endif
+#ifdef BROOK_REGISTER_TEST_HOOKS
+    g_syscallTable[0xB31]                = RegisterTestControl;
 #endif
     // App-GPU (per-process virgl) syscalls for userspace GL rendering.
     g_syscallTable[0xB10]                = sys_brook_gpu_ctx_create;       // GPU_CTX_CREATE
