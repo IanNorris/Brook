@@ -186,6 +186,7 @@ add_executable(kernel
     src/memory/address_space.cpp
     src/memory/mapping_transaction.cpp
     src/memory/file_page_cache.cpp
+    src/memory/exec_page_cache.cpp
     src/memory/file_object.cpp
     src/memory/file_mapping_registry.cpp
     src/memory/mapping_pin_registry.cpp

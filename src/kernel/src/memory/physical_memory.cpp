@@ -1042,6 +1042,15 @@ uint32_t PmmGetMapCount(PhysicalAddress physAddr)
     return __atomic_load_n(&Desc(static_cast<uint32_t>(index)).mapCount,__ATOMIC_RELAXED);
 }
 
+bool PmmHasSingleReference(PhysicalAddress frame)
+{
+    if (!g_pageDescs || !frame || frame.raw()/PAGE_SIZE >= g_totalPages) return false;
+    const uint64_t irq = IrqSpinLockAcquire(&g_pmmLock);
+    const bool single = Desc(static_cast<uint32_t>(frame.raw()/PAGE_SIZE)).refCount == 1;
+    IrqSpinLockRelease(&g_pmmLock, irq);
+    return single;
+}
+
 uint32_t PmmGetRefCount(PhysicalAddress physAddr)
 {
     if (!g_pageDescs || !physAddr) return 0;

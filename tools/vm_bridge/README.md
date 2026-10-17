@@ -174,3 +174,17 @@ bridge, not the deferred GL3 rendering, ext2 or audio-stutter fixes.
 
 See [VM design](../../docs/vm-control-mcp.md),
 [backlog](../../docs/backlog.md) and [month roadmap](../../docs/roadmap.md).
+
+
+### Executable-sharing counters
+
+The guest debug command `mem exec-cache` reports entries, capacity, hits,
+misses, admissions, full/probe refusals, exact-comparison hash collisions and
+trimmed entries. The immutable executable cache holds at most 131,072 frames
+(512 MiB), with a 4 MiB fixed table and at most 32 probes per adoption.
+Every user alias is COW; unequal bytes never share a frame even on hash collision.
+AS teardown and executable-staging release trim idle entries in bounded lock
+batches. Capacity exhaustion leaves a normal uncached COW mapping. Hits include
+same-frame aliases, so `hits * 4096` is **not** a memory-saving measurement.
+Use physical free-memory measurements and the rolling census together. Active
+entries survive trimming; released frames may await PMM quarantine drainage.

@@ -7,6 +7,7 @@
 #include <vector>
 #include "elf.h"
 #include "exec_image.h"
+#include "memory/exec_page_cache.h"
 #include <sys/mman.h>
 #include "process.h"
 #include "memory/address_space.h"
@@ -49,7 +50,7 @@ uint8_t byte(uint64_t address) {
 void clean(AddressSpaceState& space) {
     MappingRangeDestroy(space.ranges);
     for(auto leaf:leaves)PmmFreePage(leaf.second);
-    leaves.clear();leafFlags.clear();CHECK(frames.size()==staging.size()&&heapBlocks==0);
+    leaves.clear();leafFlags.clear();ExecPageCacheClearForTest();CHECK(frames.size()==staging.size()&&heapBlocks==0);
     for(auto entry:staging)CHECK(frames.at(entry.first)==1);
     allocations=mappingCalls=failAllocation=failMapping=0;failHeap=false;
 }
@@ -78,6 +79,8 @@ void PmmUnrefPage(PhysicalAddress page) {
     if(!--found->second){frames.erase(found);CHECK(munmap(reinterpret_cast<void*>(page.raw()),4096)==0);}
 }
 void PmmFreePage(PhysicalAddress page) { PmmUnrefPage(page); }
+bool PmmHasSingleReference(PhysicalAddress p) {return frames.at(p.raw())==1;}
+void PmmRefPage(PhysicalAddress p) {CHECK(PmmRefPageIfAlive(p));}
 bool PmmRefPageIfAlive(PhysicalAddress page) {
     auto found=frames.find(page.raw());if(found==frames.end())return false;
     ++found->second;return true;
@@ -124,7 +127,8 @@ std::vector<uint8_t> fullFixture(bool alias=false) {
     ph[1].p_filesz=0x1000;ph[1].p_memsz=0x1800;
     std::memset(bytes.data()+0x1000,0xA3,0x1000);
     std::memset(bytes.data()+0x2000,0xB4,0x1000);
-    if(alias){h->e_phnum=3;ph[2]=ph[1];ph[2].p_offset=0x1000;
+    if(alias){h->e_phnum=3;ph[2]=ph[1];ph[2].p_offset=0x3000;
+        std::memcpy(bytes.data()+0x3000,bytes.data()+0x1000,4096);
         ph[2].p_vaddr=0x600000;ph[2].p_filesz=ph[2].p_memsz=0x1000;}
     return bytes;
 }
@@ -165,11 +169,13 @@ void ownedTests() {
         for(uint64_t va:{0x200000ULL,0x201000ULL,0x602000ULL,0x800000ULL})
             CHECK((leafFlags.at(va)&(PTE_COW_BIT|VMM_WRITABLE))==PTE_COW_BIT);
         CHECK(leaves.at(0x201000)==leaves.at(0x800000));
+        CHECK(leaves.at(0x800000).raw()!=reinterpret_cast<uint64_t>(image.data)+0x3000);
         cowWrite(0x201100,0x55);CHECK(byte(0x201100)==0x55&&byte(0x800100)==0xA3);
         CHECK(std::memcmp(image.data,bytes.data(),bytes.size())==0);
         CHECK(byte(0x603000)==0&&byte(0x6037ff)==0);
         if(sourceFirst){
             dropImage(image);CHECK(byte(0x800100)==0xA3);
+            ExecPageCacheClearForTest();
             const auto unique=leaves.at(0x602000);CHECK(frames.at(unique.raw())==1);
             cowWrite(0x602100,0x66);CHECK(leaves.at(0x602000)==unique&&byte(0x602100)==0x66);
             clean(space);

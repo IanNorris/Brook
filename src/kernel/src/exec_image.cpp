@@ -1,4 +1,5 @@
 #include "exec_image.h"
+#include "memory/exec_page_cache.h"
 #include "vfs.h"
 #include "memory/virtual_memory.h"
 #include "process.h"
@@ -7,9 +8,12 @@
 namespace brook {
 void FreeExecutableImage(ExecutableImage* image)
 {
-    if (image->data)
+    const bool released = image->data != nullptr;
+    if (released)
         VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(image->data)), image->pages);
     *image = {};
+    // Covers failed construction whose AS teardown preceded staging release.
+    if (released) ExecPageCacheTrimIdle();
 }
 
 int ReadExecutableImage(Vnode* vnode, ExecutableImage* image)

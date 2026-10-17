@@ -11,6 +11,7 @@
 #include "process.h"
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
+#include "memory/exec_page_cache.h"
 #include "memory/address_space.h"
 #include "memory/virtual_memory.h"
 #include "klog.h"
@@ -3426,6 +3427,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap poison on|off - runtime alloc/free poison (default off)\n"
             "  heap timing on|off|reset|status - allocator raw-cycle counters (default off)\n"
             "  heap check      - validate heap block metadata\n"
+            "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
             "  uptime          - system uptime + wall clock\n"
@@ -3687,6 +3689,17 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     // -----------------------------------------------------------------------
     // mem pids — per-PID page counts (PMM)
     // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "mem exec-cache")) {
+        const auto stats=ExecPageCacheGetStats();
+        BridgeReply r;r.text("{");r.field("entries",stats.entries);
+        r.text(",");r.field("capacity",stats.capacity);
+        r.text(",");r.field("hits",stats.hits);
+        r.text(",");r.field("misses",stats.misses);
+        r.text(",");r.field("admissions",stats.admissions);
+        r.text(",");r.field("full",stats.full);
+        r.text(",");r.field("collisions",stats.collisions);
+        r.text(",");r.field("trimmed",stats.trimmed);r.text("}\n");r.send();
+    }
     else if (NetStrEq(cmd, "mem census")) { DebugMemoryCensus(); }
     else if (NetStrEq(cmd, "mem pids")) {
         PmmDumpPidStats();

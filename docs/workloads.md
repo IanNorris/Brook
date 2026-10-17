@@ -1905,3 +1905,30 @@ normal exits and reboot persistence in an 8-CPU, 8 GiB software-Wayland VM.
 The same combination still exhausts a 4 GiB guest; startup speed and memory
 efficiency remain open. The linked report preserves the failing controls,
 kernel hashes, filesystem checks and an unmodified 1080p capture.
+
+
+### Bounded executable-page sharing (17 October)
+
+The follow-up immutable content cache reduces independent exec duplication.
+Every eligible full initialized ELF page is hashed and compared byte-for-byte;
+all resulting user mappings remain COW. Admission is bounded to 131,072 frames
+(512 MiB), with a 4 MiB table, bounded probes and batched idle reclamation.
+Partial/BSS/overlap pages retain the private-copy path.
+
+The 8-CPU **4 GiB** software-Wayland VM passed Chromium Google search/back and
+Codium edit/save/reopen together, then both native window exits. The saved file
+belongs to Brook (`1000:100`). Image-attributed proportional memory measured
+about 646 MB, versus 2.97 GB in the preceding non-cache run. These rolling
+snapshots are workload evidence, not a controlled timing benchmark. Physical
+used memory after editing was about 1.92 GB; desktop-only after native exits
+was about 277 MB with 14 active desktop cache entries. Another 100 native
+fork/COW probes passed; heap integrity and all three offline filesystem checks
+passed. All 23 hosted suites pass, including actual cache and loader regression
+coverage. See the [memory report](browser-memory-checkpoint-20261017.md) for
+session/kernel identities, limitations and local evidence.
+
+Reboot preserved the file hash/owner and Codium rendered the restored document.
+A second native exit, however, left a terminated shutdown-launched helper leader
+and four live threads. Repeated exit cleanup remains open; the memory cache
+correctly retains frames while those threads still own mappings. The linked
+report records the hang dump and a fatal-signal-delivery hypothesis.

@@ -211,3 +211,119 @@ eviction, avoid PMM-lock inversion or quarantine waits, and preserve raw-buffer,
 partial-page, BSS and overlap behavior. Cache admission must avoid sequential
 scan thrashing; existing fork sharing must not be counted as additional savings.
 This cache is not implemented by the census checkpoint.
+
+## Immutable executable-page cache follow-up
+
+A fixed content cache now shares eligible full initialized ELF pages across
+independent launches. It owns a reference to each canonical frame; each user
+mapping owns a separate reference and remains COW. Hashing happens outside the
+cache lock, and a complete 4096-byte comparison is required before reuse.
+The loader skips direct-map copying into full reused COW pages even when the
+canonical frame differs from the staging source. Raw-buffer loaders, interpreter
+loading, partial pages, BSS and overlapping PT_LOAD pages retain their existing
+copy/zero behavior.
+
+The table uses 262,144 slots (4 MiB), permits 131,072 canonical frames (512 MiB)
+and probes at most 32 slots. It scans beyond holes before admission. There is
+no active-entry eviction during sequential image scans; capacity/probe refusal
+returns the uncached owned frame successfully. Trimming scans at most 128 slots
+and unlinks at most 32 entries per IRQ-lock hold, releasing frame references
+outside the cache lock. A synchronized PMM sole-reference snapshot gates idle
+reclamation. Cleanup runs after AS destruction and after dedicated image
+release, covering either failed-construction cleanup order. No filesystem
+operation, allocation or quarantine wait runs under the cache lock. Astra's
+read-only review found no blocking lifetime/lock-order issue.
+
+All **23 hosted suites pass**, including the actual cache implementation under
+8 concurrent adopters and a trimmer (8,000 equal candidates), forced unequal
+hash collisions, probe/capacity refusal, holes before a canonical match, same
+frame adoption, cache clearing with live users and both external-release orders.
+The actual ELF loader test protects staging memory read-only and now aliases
+equal bytes from different source physical pages; the canonical-copy shortcut
+must preserve that protection. Existing partial/BSS/overlap, mapping/allocation
+failure and raw-buffer cases remain covered. Two-pass release kernel/module
+build passed.
+
+### 4 GiB workload acceptance
+
+Session `095fbc0782cb43629905803e5710dcaa`, 8 CPUs, **4 GiB**, software Wayland,
+audio disabled. Kernel SHA-256:
+`3af99054fd37878cd881fec57197511857a50bb8c00dc4420afcdd4e9f9480dd`.
+Disks were cloned from the clean census checkpoint; profiles were already
+populated. Chromium loaded Google, accepted a search and returned via native
+Back. Codium edited, saved, closed its tab and reopened the file while Chromium
+remained running. Both applications then exited through native window controls.
+
+Representative rolling samples:
+
+| Measurement | Previous census run (8 GiB) | Cache run (4 GiB) |
+|---|---:|---:|
+| Global physical used | 4,191,510,528 B | 1,921,335,296 B |
+| Image proportional bytes | 2,973,323,261 B | 646,025,200 B |
+| Anonymous proportional bytes | 654,811,133 B | 706,940,928 B |
+| Stack proportional bytes | 126,402,559 B | 126,541,822 B |
+
+These are representative workload snapshots, **not** matched controlled timing
+or peak-memory benchmarks. The census is rolling; stats and attribution are
+queried sequentially, and constructions/staging/quarantine are excluded. The
+cache run's earlier combined sample reported 1,933,066,240 physical used and
+645,238,769 image proportional bytes. The later sample contained 20 address
+spaces. Cache hits include existing same-frame aliases and must not be turned
+into a saving figure. There were 1,003 successful uncached fallbacks as the
+bounded cache filled during transient load; no PMM allocation-failure reports
+were observed. Startups remain slow.
+
+After native exits: 10 tasks (desktop plus kernel services), one user AS,
+276,959,232 physical bytes used and 14 desktop cache entries. Another **100
+native fork/COW probes passed**, then 10 tasks, 277,082,112 bytes used and the
+same 14 entries remained. Heap integrity was OK. Checked guest sync/stop and
+all three offline filesystem checks returned zero. One debug-channel read timed
+out during Codium shutdown; a later read confirmed its complete exit and normal
+browser operation. A scheduler `Ready`/not-enqueued diagnostic was also observed
+for a Codium task during the live run; it did not prevent the tested save/reopen
+or native exits and remains a follow-up diagnostic, not a clean bill of health
+for all scheduling races.
+
+Saved `/data/home/codium menu acceptance.txt`: 192 bytes, UID/GID `1000:100`,
+SHA-256 `25f84de257c1aad6b7a6ee5ef349a0209c8c872296e20b5e7ab5c4d49ede8795`.
+Unmodified 1920×1080 screenshot:
+`docs/images/brook_chromium_codium_4g_1080.png`, source artifact
+`e2585ed22caa4b94b04784610ed12a88.png`.
+
+Local evidence: `build/workloads/exec-cache-20261017/` (`metadata.json`,
+`combined-startup.json`, `combined-later.json`, `combined-edited.json`,
+`codium-closed.json`, `apps-closed.json`, `stress-final.json`,
+`filesystem-results.json`, `acceptance-serial.log`). Hosted/build logs:
+`build/exec-cache-host-tests.log`, `build/exec-cache-kernel-build.log`.
+
+
+Reboot session `468ac11ea0cf4dc0ac28d01158eb254c` used the same kernel and 4 GiB
+disks. Independent guest readback preserved the 192-byte file, `1000:100`
+ownership and the SHA-256 above. Codium restored and displayed all six saved
+lines in its native window (artifact `cc222ef4e4cf4c2f86401d6b6a4544b8.png`).
+
+
+The reboot's **second native exit did not fully clean up**: four blocked threads
+(TIDs 37, 52, 53, 88; TGID 143) and a terminated/reapable leader 143 remained.
+The window's original process had exited; PID 143 was forked by TID 36 during
+shutdown, then exec'd Codium. `/proc/cmdline` is synthetic and does not establish
+its helper role. A non-destructive Ctrl+F12 dump showed an identity-matched
+leader with `asLiveThreads=4`, syscall 202, refcount zero, and live threads
+blocked in futex/epoll. Two ASes remained, including about 201 MB of image
+proportional bytes for group 143; physical use was 478,638,080 B and the cache
+held 47,066 entries. Those entries were correctly retained for live users.
+This is an outstanding app-exit regression, **not repeated-exit acceptance**.
+The immediate default-fatal-signal path currently marks a single task terminated,
+unlike deferred fatal delivery's group cancellation; this is a source-backed
+hypothesis for follow-up, not a proven cause. Preserve
+`reboot-closed.json`, `reboot-closed-later.json` and the reboot serial hang dump.
+An explicit guest SIGKILL to a surviving group member was requested for cleanup.
+
+The explicit SIGKILL cleaned the complete helper group: 10 tasks, 243,580,928
+physical bytes used, 14 desktop cache entries and heap integrity OK. Checked
+shutdown and the reboot's three offline filesystem checks all returned zero.
+This forced cleanup is recorded separately from native app-exit acceptance.
+Astra confirmed that synchronous group-kill cannot be called from every signal
+sender: timer/terminal callers may hold IRQ/terminal locks. Follow-up needs a
+non-waiting fatal-group request with proper snapshot references, birth latch,
+masked-signal behavior and cooperative waiter cancellation.

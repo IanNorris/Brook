@@ -1,4 +1,5 @@
 #include "address_space.h"
+#include "exec_page_cache.h"
 #include "virtual_memory.h"
 #include "physical_memory.h"
 #include "heap.h"
@@ -156,6 +157,8 @@ static void DestroyAddressSpace(AddressSpaceState* space) {
     MappingRangeDestroy(space->ranges);
     // Never sweep by allocationPid: exec and PID reuse can own newer resources.
     kfree(space);
+    // No AS, page-table, range or filesystem locks remain held here.
+    ExecPageCacheTrimIdle();
 }
 bool ProcessCleanupStep() {
     uint64_t flags = IrqSpinLockAcquire(&g_cleanupLock);

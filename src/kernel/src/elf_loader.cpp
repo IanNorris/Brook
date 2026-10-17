@@ -6,6 +6,7 @@
 
 #include "elf.h"
 #include "exec_image.h"
+#include "memory/exec_page_cache.h"
 #include "process.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -132,12 +133,13 @@ static bool CopyElfBytes(PageTable pt, uint64_t dest, const uint8_t* source, uin
         if (!phys) return false;
         uint64_t chunk = 4096 - (dest & 4095);
         if (chunk > size) chunk = size;
-        // Reused full pages are immutable staging data. Direct-map writes
-        // bypass COW, so never memcpy even identical bytes into those frames.
-        const bool sameFrame = reused && chunk == 4096 && !(dest & 4095) &&
+        // Only reuse publishes COW leaves in this unpublished owned-image AS.
+        // Canonical frames can differ from staging; direct-map writes bypass
+        // COW, so never copy into any of these full initialized pages.
+        const bool immutablePage = reused && chunk == 4096 && !(dest & 4095) &&
             !(reinterpret_cast<uint64_t>(source) & 4095) &&
-            VmmVirtToPhys(KernelPageTable,VirtualAddress(reinterpret_cast<uint64_t>(source))) == phys;
-        if (!sameFrame)
+            (VmmReadLeaf(pt, VirtualAddress(dest)) & PTE_COW_BIT);
+        if (!immutablePage)
             memcpy(reinterpret_cast<void*>(PhysToVirt(phys).raw()), source, chunk);
         dest += chunk; source += chunk; size -= chunk;
     }
@@ -200,8 +202,9 @@ static ReuseResult ReuseImagePage(const ExecutableImage* owned,
     const VirtualAddress source(reinterpret_cast<uint64_t>(owned->data) + offset);
     const uint64_t leaf = VmmReadLeaf(KernelPageTable,source);
     if (!(leaf & VMM_PRESENT) || (leaf & VMM_USER)) return ReuseResult::Failed;
-    const PhysicalAddress frame = VmmLeafPhysical(leaf);
+    PhysicalAddress frame = VmmLeafPhysical(leaf);
     if (!frame || !PmmRefPageIfAlive(frame)) return ReuseResult::Failed;
+    frame = ExecPageCacheAdopt(frame);
     // VmmMapPage strips COW; this API preserves it and never replaces a leaf.
     if (VmmTryMapPage(pt,VirtualAddress(va),frame,VMM_USER | PTE_COW_BIT,
                       MemTag::User,pid) != VmmMapResult::Mapped) {

@@ -137,6 +137,7 @@ add_test(NAME test_ext2
 add_host_test(test_vmm_leaf
     "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/address_space.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/exec_page_cache.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/mapping_transaction.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/file_mapping_registry.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/file_object.cpp"
@@ -209,6 +210,7 @@ add_host_test(test_credential_ids)
 # Actual ELF loader/range metadata; host frames model the user page table.
 add_host_test(test_elf_loader
     "${BROOK_ROOT}/src/kernel/src/elf_loader.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/exec_page_cache.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/mapping_ranges.cpp"
 )
 target_compile_options(test_elf_loader PRIVATE
@@ -217,3 +219,14 @@ target_compile_options(test_elf_loader PRIVATE
     "-iquote${BROOK_ROOT}/src/shared"
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
+
+add_host_test(test_exec_page_cache
+    "${BROOK_ROOT}/src/kernel/src/memory/exec_page_cache.cpp"
+)
+target_compile_options(test_exec_page_cache PRIVATE
+    -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+set_tests_properties(test_exec_page_cache PROPERTIES TIMEOUT 30)

@@ -4774,8 +4774,6 @@ resolve_path:
     int readResult = ReadExecutableImage(vn, &image);
     VfsClose(vn);
     if (readResult != 0) return readResult;
-    uint64_t bufPages = image.pages;
-    VirtualAddress bufAddr(reinterpret_cast<uint64_t>(image.data));
     uint8_t* elfBuf = image.data;
     uint64_t elfSize = image.size;
     DbgPrintf("sys_execve: read '%s' %lu bytes (pid %u)\n",
@@ -4791,7 +4789,7 @@ resolve_path:
     if (elfSize >= 2 && elfBuf[0] == '#' && elfBuf[1] == '!')
     {
         if (++shebangDepth > MAX_SHEBANG_DEPTH) {
-            VmmFreePages(bufAddr, bufPages);
+            FreeExecutableImage(&image);
             SerialPrintf("sys_execve: shebang depth exceeded for '%s'\n", lookupPath);
             return -ELOOP;
         }
@@ -4804,7 +4802,7 @@ resolve_path:
         while (terminator < lineEnd && *terminator != '\n' && *terminator != '\0')
             ++terminator;
         if (terminator == lineEnd && elfSize >= 256) {
-            VmmFreePages(bufAddr, bufPages);
+            FreeExecutableImage(&image);
             return -ENOEXEC; // Never execute a truncated interpreter line.
         }
 
@@ -4816,7 +4814,7 @@ resolve_path:
         while (p < lineEnd && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && *p != '\0')
         {
             if (interpLen == sizeof(interpPath) - 1) {
-                VmmFreePages(bufAddr, bufPages);
+                FreeExecutableImage(&image);
                 return -E2BIG;
             }
             interpPath[interpLen++] = *p;
@@ -4832,7 +4830,7 @@ resolve_path:
         while (p < lineEnd && *p != '\n' && *p != '\r' && *p != '\0')
         {
             if (interpArgLen == sizeof(interpArg) - 1) {
-                VmmFreePages(bufAddr, bufPages);
+                FreeExecutableImage(&image);
                 return -E2BIG;
             }
             interpArg[interpArgLen++] = *p;
@@ -4840,7 +4838,7 @@ resolve_path:
         }
         interpArg[interpArgLen] = '\0';
 
-        VmmFreePages(bufAddr, bufPages);
+        FreeExecutableImage(&image);
         if (interpLen == 0) return -ENOEXEC;
 
         SerialPrintf("sys_execve: shebang interp='%s' arg='%s' script='%s'\n",
@@ -4889,7 +4887,7 @@ resolve_path:
 
     if (elfSize < 64) // Too small to be a valid ELF
     {
-        VmmFreePages(bufAddr, bufPages);
+        FreeExecutableImage(&image);
         DbgPrintf("sys_execve: file too small (%lu bytes)\n", elfSize);
         return -ENOEXEC;
     }
@@ -4897,7 +4895,7 @@ resolve_path:
     // Reject malformed/truncated headers while the old image and siblings
     // still exist. Allocation failures after commitment remain fatal.
     if (!ElfValidateMainImage(elfBuf, elfSize)) {
-        VmmFreePages(bufAddr, bufPages);
+        FreeExecutableImage(&image);
         return -ENOEXEC;
     }
 
@@ -4928,7 +4926,7 @@ resolve_path:
                                      &newStackPtr);
 
     // Free ELF buffer
-    VmmFreePages(bufAddr, bufPages);
+    FreeExecutableImage(&image);
 
     if (!newEntry)
     {

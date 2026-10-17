@@ -139,4 +139,6 @@ void PmmThrottleForDrain();
 // callstack history. Returns true if the qword carried the poison marker.
 extern "C" bool PmmDecodePoison(uint64_t qword);
 
+// Synchronized snapshot for cache eviction; caller retains its own frame ref.
+bool PmmHasSingleReference(PhysicalAddress);
 } // namespace brook
