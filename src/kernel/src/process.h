@@ -210,7 +210,7 @@ struct TtyDevicePair {
 struct ElfBinary
 {
     uint64_t baseAddress;       // Virtual base where binary was loaded
-    uint64_t allocatedSize;     // Total bytes mapped
+    uint64_t allocatedSize;     // Image virtual span; may contain unmapped holes
     uint64_t entryPoint;        // e_entry
     uint64_t programBreakLow;   // End of loaded segments (heap starts here)
     uint64_t programBreakHigh;  // programBreakLow + PROGRAM_BREAK_SIZE

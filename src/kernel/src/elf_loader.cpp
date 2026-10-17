@@ -173,44 +173,57 @@ bool ElfLoad(const uint8_t* data, uint64_t size, ElfBinary* out,
     const auto* phdrs = image.segments;
     const uint64_t loadBase = image.first + slide;
     const uint64_t loadEnd = image.end + slide;
-    // The AS is unpublished: construction owns it exclusively and may prepare
-    // metadata without the runtime mutation mutex. Match the loader's existing
-    // contiguous RWX allocation, including holes; segment hardening is separate.
-    MappingRangePlan ranges;
-    MappingRange mapped{loadBase,loadEnd,0,0,nullptr,7,7,MappingKind::Image,
-                        MappingSharing::Private,MappingLeafOwnership::Managed};
-    if (!ranges.Prepare(1) || !ranges.Insert(space->ranges,mapped)) return false;
-
     uint64_t loadSize = loadEnd - loadBase;
-    uint64_t loadPages = loadSize / 4096;
-
-    DbgPrintf("ELF: loading at 0x%lx-0x%lx (%lu pages)\n",
-                 loadBase, loadEnd, loadPages);
-
-    // Allocate pages for the binary segments only.
-    // Program break pages are allocated lazily by sys_brk.
-    for (uint64_t page = 0; page < loadPages; ++page)
+    // Construction owns this unpublished AS. Reject existing segment mappings
+    // before mutating metadata; only boundary pages from this image may overlap.
+    for (uint16_t i = 0; i < ehdr->e_phnum; ++i)
     {
-        VirtualAddress vaddr(loadBase + page * 4096);
-        PhysicalAddress phys = PmmAllocPage(MemTag::User, pid);
-        if (!phys)
-        {
-            SerialPrintf("ELF: out of memory at page %lu\n", page);
-            return false;
-        }
-
-        uint64_t flags = VMM_WRITABLE | VMM_USER;
-
-        if (!VmmMapPage(pt, vaddr, phys, flags, MemTag::User, pid))
-        {
-            SerialPrintf("ELF: failed to map vaddr 0x%lx\n", vaddr.raw());
-            PmmFreePage(phys);
-            return false;
-        }
-
-        auto* p = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
-        memset(p, 0, 4096);
+        const auto& p = phdrs[i];
+        if (p.p_type != PT_LOAD || !p.p_memsz) continue;
+        const uint64_t begin = AlignDown(p.p_vaddr + slide, 4096);
+        const uint64_t end = AlignUp(p.p_vaddr + slide + p.p_memsz, 4096);
+        for (auto* node = space->ranges.head; node; node = node->next)
+            if (node->range.begin < end && node->range.end > begin) return false;
+        for (uint64_t va = begin; va < end; va += 4096)
+            if (VmmVirtToPhys(pt, VirtualAddress(va))) return false;
     }
+    uint64_t mappedPages = 0;
+    // Allocate the union of page-aligned PT_LOAD extents, not their bounding
+    // span. A patchelf-relocated segment can leave hundreds of MiB of holes.
+    // Holes have neither PTEs nor Image ranges, so faults cannot create zero
+    // pages there. Keep existing RWX policy; segment hardening is separate.
+    for (uint16_t i = 0; i < ehdr->e_phnum; ++i)
+    {
+        const auto& p = phdrs[i];
+        if (p.p_type != PT_LOAD || !p.p_memsz) continue;
+        const uint64_t begin = AlignDown(p.p_vaddr + slide, 4096);
+        const uint64_t end = AlignUp(p.p_vaddr + slide + p.p_memsz, 4096);
+        MappingRangePlan ranges;
+        MappingRange mapped{begin,end,0,0,nullptr,7,7,MappingKind::Image,
+                            MappingSharing::Private,MappingLeafOwnership::Managed};
+        if (!ranges.Prepare(3) || !ranges.Replace(space->ranges,begin,end,&mapped)) return false;
+        for (uint64_t va = begin; va < end; va += 4096)
+        {
+            const VirtualAddress vaddr(va);
+            if (VmmVirtToPhys(pt,vaddr)) continue; // Shared segment boundary.
+            PhysicalAddress phys = PmmAllocPage(MemTag::User, pid);
+            if (!phys)
+            {
+                SerialPrintf("ELF: out of memory after %lu image pages\n", mappedPages);
+                return false;
+            }
+            if (!VmmMapPage(pt,vaddr,phys,VMM_WRITABLE | VMM_USER,MemTag::User,pid))
+            {
+                SerialPrintf("ELF: failed to map vaddr 0x%lx\n", va);
+                PmmFreePage(phys);
+                return false;
+            }
+            memset(reinterpret_cast<void*>(PhysToVirt(phys).raw()),0,4096);
+            ++mappedPages;
+        }
+    }
+    DbgPrintf("ELF: loading 0x%lx-0x%lx (%lu mapped pages, %lu span pages)\n",
+              loadBase, loadEnd, mappedPages, loadSize / 4096);
 
     // Second pass: load PT_LOAD segments, extract PT_TLS and PT_INTERP.
     out->tlsInitData  = nullptr;

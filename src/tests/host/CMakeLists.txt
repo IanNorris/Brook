@@ -205,3 +205,15 @@ target_compile_options(test_profiler_stack PRIVATE
 
 # Saved-ID transitions and all-or-nothing unprivileged credential changes.
 add_host_test(test_credential_ids)
+
+# Actual ELF loader/range metadata; host frames model the user page table.
+add_host_test(test_elf_loader
+    "${BROOK_ROOT}/src/kernel/src/elf_loader.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/mapping_ranges.cpp"
+)
+target_compile_options(test_elf_loader PRIVATE
+    -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
