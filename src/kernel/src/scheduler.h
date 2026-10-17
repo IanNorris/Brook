@@ -210,4 +210,7 @@ Process* PanicGetProcess(uint32_t index);
 // Dump all thread states to serial (for debugging hangs).
 void SchedulerDumpThreadStates();
 
+// Bounded launch-feedback liveness query; excludes kernel worker threads.
+bool SchedulerLaunchHasLiveProcesses(uint64_t launchId);
+
 } // namespace brook

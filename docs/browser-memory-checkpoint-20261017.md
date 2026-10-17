@@ -426,3 +426,29 @@ The matching final candidate session `d7cd0fd4c80e41b99aa1cef5c2fb330c` passes
 all 48 strengthened cases, returning to 9 kernel tasks and zero cache entries
 with heap integrity OK. Checked shutdown and three offline filesystem checks
 all pass (`strengthened-final-results.json`, `strengthened-filesystem-results.json`).
+
+
+### Remote checkpoint: launch-feedback groundwork (unfinished)
+
+The next work item is launch feedback and display scaling. This checkpoint
+adds a bounded, value-only launch-feedback state machine, a hosted suite for
+identity matching, duplicate requests, stale completions, slot exhaustion and
+timeouts, plus a process launch token and scheduler liveness query. These
+foundations are not wired into the shell, launcher, compositor or taskbar yet;
+there is no new visible launch indicator in this checkpoint.
+
+Remaining integration includes moving executable loading off the compositor
+thread, serializing shell dispatch, propagating launch tokens before process
+publication, matching native and Wayland windows, and rendering pending and
+failed launches. Process options must be installed before scheduler publication
+to avoid accessing an already-exited child. Display scaling, App Gallery, VM
+recording and the remaining workload checks stay open in the active goal.
+
+The previously accepted VM kernel and clean disks remain under
+`build/workloads/fatal-signals-20261017/`; this groundwork has not been booted
+for VM acceptance. No copyrighted game data or runtime disk images are included
+in the checkpoint.
+
+Validation for this groundwork checkpoint: all 24 hosted suites pass, including
+the new state-machine suite, and the two-pass release kernel build passes with
+all 12 driver modules resolving their imports.

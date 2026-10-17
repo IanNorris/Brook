@@ -2558,6 +2558,21 @@ Process* ProcessCurrent()
     return g_perCpu[ThisCpu()].currentProcess;
 }
 
+bool SchedulerLaunchHasLiveProcesses(uint64_t launchId)
+{
+    if (!launchId) return false;
+    const uint64_t flags = SchedLockAcquire(g_allProcLock);
+    bool found = false;
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        const Process* p = g_allProcesses[i];
+        if (!p->isKernelThread && p->launchId == launchId && p->state != ProcessState::Terminated) {
+            found = true;break;
+        }
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return found;
+}
+
 Process* SchedulerFindProcessReference(uint16_t pid)
 {
     uint64_t flags = SchedLockAcquire(g_allProcLock);

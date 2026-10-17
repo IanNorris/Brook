@@ -315,6 +315,8 @@ struct Process
     // in bits 0..6. Store the cause explicitly; exit(128) is not a signal.
     int32_t waitStatus;
 
+    uint64_t launchId; // UI launch token; inherited by fork/threads and preserved across exec
+
     // CPU time accounting (in LAPIC ticks, ~1ms each)
     volatile uint64_t userTicks;     // Ticks spent in user mode
     volatile uint64_t sysTicks;      // Ticks spent in kernel mode
