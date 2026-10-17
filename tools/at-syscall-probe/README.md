@@ -842,3 +842,17 @@ nix-shell --run '"$MUSL_CC" -O2 -Wall -Wextra -Werror -static tools/at-syscall-p
 Stage on a stopped disposable disk, open Terminal, and execute the staged path.
 Compare the previous and candidate kernels, capture the visible result, and
 finish each run with checked shutdown and offline filesystem checks.
+
+
+`wmdesktopscalecheck.c` is Brook-only (custom syscall `0xB04`). With no argument
+it checks current requested/applied scale and invalid requests; with `100`, `150`
+or `200` it requests that native desktop scale and waits up to five seconds for
+application. Run while the compositor is active, and inspect `SCALECHECK PASS`
+in guest/serial output. It does not save settings or test toolkit content scale.
+
+```sh
+nix-shell --run '"$MUSL_CC" -O2 -Wall -Wextra -Werror -static tools/at-syscall-probe/wmdesktopscalecheck.c -o build/io-bench/wmdesktopscalecheck'
+```
+
+Stage only on a stopped disposable VM disk. Use Settings for save/reboot
+acceptance, and check window controls against fresh screenshot coordinates.

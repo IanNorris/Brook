@@ -4,8 +4,9 @@ The remote checkpoint now wires 100%, 150% and 200% native desktop scaling
 through Settings, boot configuration and frame-boundary application. Native
 chrome, launcher and taskbar select matching immutable metrics and final-size
 16/24/32px font atlases. Terminal text and application content retain their
-existing scale. **This integration is build-tested, but has not yet passed live
-VM acceptance.** The resize-ownership evidence below predates this integration.
+existing scale. The native path has bounded CPU and GPU VM acceptance below. Toolkit content
+scaling and the broader edge-case matrix remain incomplete. The resize-ownership
+evidence also predates this integration.
 
 Settings saves `[Desktop] scale=100`, `150` or `200` beside the theme in the
 existing user settings file. A save failure restores the previous requested
@@ -77,6 +78,40 @@ Both comparison runs completed checked shutdown and all three offline filesystem
 checks passed. Local captures, frozen artifacts, metadata and disks live under
 `build/workloads/desktop-scale-20261017/` and the corresponding session registries.
 The test is a bounded resize-ownership regression, not acceptance of live scaling.
+
+## Live native scaling acceptance
+
+Kernel SHA-256 `43dc04619efc8113639fc59567f3e4d17a96238bd84cb78c1a930b939b1d9db8`
+and the rebuilt Settings package ran on isolated 8-core, 4 GiB VMs at 1920×1080.
+The Brook-only `wmdesktopscalecheck.c` queries requested/applied state, optionally
+requests a scale with a five-second application deadline, and verifies that an
+unsupported percentage and invalid operation return EINVAL without changing the
+request. Launch acknowledgement alone is not its completion evidence; inspect
+`SCALECHECK PASS` in serial output.
+
+- CPU session `949de67a10e043e59b437aca5875af2c`: Settings selected, applied and
+  saved 200%. Further probe requests exercised 100%, 150% and 200% in both
+  directions. Terminal maximized at 200% to 1912×912, with a 48×191 grid;
+  switching to 150% resized it to 1914×954 and 50×191. Restore returned to
+  800×600 and 31×80. Mousepad accepted typing, maximize/restore and
+  minimize/restore across scale changes.
+- GPU session `0db878d9ae3c46be90bfbdd073cf5b28`: rebooting the same disks
+  restored requested/applied 200% before Settings launched. Serial confirmed
+  `GPU DRAW composition active`. Further scale transitions, dragging, reachable
+  caption clamping, launcher hit testing, Mousepad maximize/restore and
+  minimize/restore passed. At 150%, its maximized client was 1914×954; restore
+  returned to 800×600. Both apps closed through native window controls, leaving
+  no windows.
+
+Both runs completed checked filesystem/device flush shutdown; all three offline
+filesystem checks returned zero after each run. Frozen artifacts, scripts, disks
+and `results.json` remain under `build/workloads/desktop-scale-live-20261017/`.
+The new Settings store output was staged offline with debugfs because this host
+rejects FUSE mounting. This does not validate the full image-refresh workflow.
+
+The screenshot is the GPU run at native 1920×1080 and 200% desktop scale:
+
+![Native desktop scaling at 200%](images/brook_desktop_scale_200_1080.png)
 
 ## Remaining acceptance and integration
 

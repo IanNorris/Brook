@@ -91,7 +91,9 @@ the table distinguishes tested behavior from remaining limitations.
 
 - **Desktop appearance:** application icons in window chrome, an icon taskbar,
   and a launcher that updates after package installation/removal. Settings
-  previews and saves three desktop themes, and uses Brook's native titlebar.
+  previews and saves three desktop themes and native desktop scaling at
+  100%, 150% or 200%, and uses Brook's native titlebar. Application content
+  retains its existing scale; see [scaling status](docs/desktop-scaling.md).
   Launcher loading now runs on a worker, with animated pending taskbar entries,
   a busy cursor badge and visible failure notices. See [desktop settings](docs/desktop-settings.md)
   and [launch feedback](docs/launch-feedback.md).
@@ -228,6 +230,12 @@ New captures use native 1920×1080 without upscaling. See
 </p>
 
 <p align="center"><em>Settings with native Brook chrome and the Midnight theme — captured at 1920×1080</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_desktop_scale_200_1080.png"><img src="docs/images/brook_desktop_scale_200_1080.png" alt="Brook launcher, taskbar and Settings titlebar at 200 percent native desktop scale" width="960"></a>
+</p>
+
+<p align="center"><em>Native desktop at 200% scale with GPU composition — captured at 1920×1080; application content retains its existing scale</em></p>
 
 <p align="center">
   <a href="docs/images/brook_libreoffice_writer_1080.png"><img src="docs/images/brook_libreoffice_writer_1080.png" alt="A real document typed in LibreOffice Writer running on Brook, without debug windows" width="960"></a>
