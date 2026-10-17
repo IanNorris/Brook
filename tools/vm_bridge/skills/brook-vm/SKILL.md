@@ -7,7 +7,10 @@ Start with vm_sessions and vm_doctor; select an explicit live session. Attach
 to user-started runs without restarting them. vm_start makes new disk clones.
 Keep speaker playback off unless the user requests it.
 
-Use vm_observe to get a full-resolution image and frame_id. Coordinate input
+Use vm_observe to get a full-resolution completed-frame image and frame_id.
+Normal capture requires the updated kernel and bridge (capture API 2); reload
+an older running MCP process after source updates. Captures lease a snapshot
+and briefly pause QEMU; do not loop this tool as a video recorder. Coordinate input
 must reference that frame. vm_input supports ordered key/mouse actions,
 US-ASCII text and bounded waits; holds last only within a batch. An injection
 acknowledgement does not prove the guest reacted: observe again or check logs.

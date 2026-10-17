@@ -310,17 +310,98 @@ CompositorTiming CompositorGetTiming()
 }
 
 bool CompositorGpuActive();
-const uint32_t* CompositorDebugFrame(uint32_t* w, uint32_t* h, uint32_t* stride)
+static KMutex g_debugFrameLock{};
+static DebugFrameSnapshot g_debugFrame{};
+static uint32_t g_debugFrameNextToken;
+static uint64_t g_debugFrameDeadline;
+static VirtualAddress g_debugFrameBuffer{};
+static uint64_t g_debugFramePages;
+static constexpr uint64_t DEBUG_FRAME_LEASE_MS=30000;
+
+static void ExpireDebugFrameLocked()
 {
-    if (CompositorGpuActive()) {
-        const GpuCompositorOps* gpu = GpuCompositorGet();
-        if (!gpu || !gpu->CaptureFull) return nullptr;
-        const uint32_t* frame = gpu->CaptureFull(w, h);
-        *stride = *w;
-        return frame;
+    if (g_debugFrame.token && g_lapicTickCount>=g_debugFrameDeadline)
+        g_debugFrame={};
+}
+
+DebugFrameSnapshot CompositorRequestDebugFrame()
+{
+    CompositorMutexGuard guard(&g_debugFrameLock);
+    ExpireDebugFrameLocked();
+    if (g_debugFrame.token) {
+        DebugFrameSnapshot busy{};busy.state=DebugFrameState::Busy;return busy;
     }
-    *w = g_physFbWidth; *h = g_physFbHeight; *stride = g_backBufStride;
-    return g_backBuffer;
+    // Never recycle a token within this boot, including wraparound.
+    if (g_debugFrameNextToken==0xffffffffU) {
+        DebugFrameSnapshot failed{};failed.state=DebugFrameState::Failed;return failed;
+    }
+    g_debugFrame={};g_debugFrame.token=++g_debugFrameNextToken;
+    g_debugFrame.state=DebugFrameState::Pending;
+    g_debugFrameDeadline=g_lapicTickCount+DEBUG_FRAME_LEASE_MS;
+    CompositorWake();
+    return g_debugFrame;
+}
+
+DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token)
+{
+    CompositorMutexGuard guard(&g_debugFrameLock);
+    ExpireDebugFrameLocked();
+    if (!token || token!=g_debugFrame.token) {
+        DebugFrameSnapshot expired{};expired.token=token;expired.state=DebugFrameState::Expired;return expired;
+    }
+    return g_debugFrame;
+}
+
+bool CompositorReleaseDebugFrame(uint32_t token)
+{
+    CompositorMutexGuard guard(&g_debugFrameLock);
+    if (!token || token!=g_debugFrame.token) return false;
+    g_debugFrame={};return true;
+}
+
+// Sole writer: compositor, after a complete presentation. The debug command
+// never waits for a frame: it can itself be dispatched on this same thread.
+struct DebugFrameGeometry {
+    const volatile uint32_t* pixels;
+    uint32_t width,height,stride;
+};
+static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& presented)
+{
+    CompositorMutexGuard guard(&g_debugFrameLock);
+    ExpireDebugFrameLocked();
+    if (g_debugFrame.state!=DebugFrameState::Pending) return;
+    g_debugFrame.state=DebugFrameState::Failed;
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
+    // Reject a runtime remap since frame start rather than tagging a new,
+    // unpresented buffer with this frame's epoch.
+    if (presented.pixels!=g_physFb || presented.width!=g_physFbWidth ||
+        presented.height!=g_physFbHeight || presented.stride!=g_physFbStride) return;
+    uint32_t width=presented.width,height=presented.height,stride=presented.stride;
+    // Read the presented CPU front buffer, not the mutable backbuffer (which
+    // can also be written by legacy TTY/scanout aliases outside the renderer).
+    const uint32_t* source=const_cast<const uint32_t*>(presented.pixels);
+    if (CompositorGpuActive()) {
+        const auto* gpu=GpuCompositorGet();
+        if (!gpu || !gpu->CaptureFull) return;
+        source=gpu->CaptureFull(&width,&height);stride=width;
+        if (width!=presented.width || height!=presented.height) return;
+    }
+    if (!source || !width || !height || width>4096 || height>2160 || stride<width || stride>8192) return;
+    const uint64_t bytes=static_cast<uint64_t>(width)*height*4;
+    const uint64_t pages=(bytes+4095)/4096;
+    if (pages>g_debugFramePages) {
+        auto buffer=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,0);
+        if (!buffer) return;
+        if (g_debugFramePages) VmmFreePages(g_debugFrameBuffer,g_debugFramePages);
+        g_debugFrameBuffer=buffer;g_debugFramePages=pages;
+    }
+    auto* destination=reinterpret_cast<uint32_t*>(g_debugFrameBuffer.raw());
+    for (uint32_t y=0;y<height;++y)
+        memcpy(destination+static_cast<uint64_t>(y)*width,source+static_cast<uint64_t>(y)*stride,width*4);
+    g_debugFrame.width=width;g_debugFrame.height=height;g_debugFrame.stride=width;
+    g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=g_lapicTickCount;g_debugFrame.epoch=epoch;
+    g_debugFrameDeadline=g_lapicTickCount+DEBUG_FRAME_LEASE_MS;
+    g_debugFrame.state=DebugFrameState::Ready;
 }
 
 static void PresentStatsReport()
@@ -2923,6 +3004,11 @@ static void CompositorLoop()
 {
     if (!g_physFb)
         return;
+    DebugFrameGeometry presented;
+    {
+        CompositorMutexGuard geometry(&g_scanoutMappingLock);
+        presented={g_physFb,g_physFbWidth,g_physFbHeight,g_physFbStride};
+    }
     const bool cursorVisibleThisFrame =
         __atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) != 0;
 
@@ -3088,6 +3174,7 @@ static void CompositorLoop()
     // Flip: copy only dirty scanlines from backbuffer → MMIO framebuffer.
     else if (g_backBuffer && g_dirtyMinY < g_dirtyMaxY)
     {
+        CompositorMutexGuard geometry(&g_scanoutMappingLock);
         uint32_t minY = g_dirtyMinY;
         uint32_t maxY = g_dirtyMaxY;
         if (maxY > g_physFbHeight) maxY = g_physFbHeight;
@@ -3106,6 +3193,8 @@ static void CompositorLoop()
         // dirty rect to the host here.
         brook::DisplayFlush(minY, maxY);
     }
+
+    CaptureCompletedDebugFrame(epoch,presented);
 
     // One-shot full-resolution frame dump (parity check), once the desktop has
     // settled (~15s uptime). Works in both GPU mode (GPUFULL via scanout
@@ -3320,6 +3409,7 @@ uint64_t CompositorScanoutMap(Process* proc,ScanoutMapResult* out)
 
 int CompositorScanoutFlip(uint32_t minY, uint32_t maxY)
 {
+    CompositorMutexGuard geometry(&g_scanoutMappingLock);
     if (!g_physFb || !g_backBuffer) return -1;
     if (minY >= g_physFbHeight) return -1;
     if (maxY > g_physFbHeight) maxY = g_physFbHeight;

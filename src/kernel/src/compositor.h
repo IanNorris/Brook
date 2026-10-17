@@ -33,8 +33,17 @@ struct CompositorTiming {
     uint64_t tick;
 };
 CompositorTiming CompositorGetTiming();
-const uint32_t* CompositorDebugFrame(uint32_t* width, uint32_t* height,
-                                     uint32_t* stride);
+// Debug captures are copied only after presentation, then leased unchanged.
+// The caller must release its token. A timeout/status mismatch invalidates it.
+enum class DebugFrameState : uint32_t { Idle, Pending, Ready, Failed, Busy, Expired };
+struct DebugFrameSnapshot {
+    uint32_t token, width, height, stride;
+    uint64_t address, tick, epoch;
+    DebugFrameState state;
+};
+DebugFrameSnapshot CompositorRequestDebugFrame();
+DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token);
+bool CompositorReleaseDebugFrame(uint32_t token);
 
 // Allocate a per-process virtual framebuffer of size vfbWidth × vfbHeight.
 // The process sees this as its screen. The compositor blits it 1:1 at

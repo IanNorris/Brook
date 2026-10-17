@@ -15,14 +15,11 @@
   ownership warnings. Keep this as failed normal-quit acceptance; capture the
   blocked shutdown phase and investigate Glean/profile initialization instead
   of disabling the watchdog or describing window disappearance as clean exit.
-- Bridge captures occasionally show a partially painted launcher/window even
-  when subsequent frames are complete. Verify capture reads a completed front
-  frame or synchronizes publication before adding VM recording. Source audit
-  confirms `CompositorDebugFrame` returns the CPU backbuffer and the bridge pauses
-  QEMU later, allowing capture midway through the same mutable frame. Publish
-  an immutable completed-frame snapshot through a compositor request, including
-  GPU readback at the frame boundary; do not upscale
-  or touch up incomplete frames as evidence of correct rendering.
+- Completed-frame capture now replaces the mutable render-buffer screenshot
+  path. CPU/GPU lease ownership, expiry and recovery passed isolated acceptance;
+  see [capture evidence](completed-frame-capture.md). Existing MCP processes need
+  a reload alongside the updated kernel. Continuous recording, audio sync and
+  encoding remain open; do not loop intrusive still captures as a video recorder.
 
 - OpenTTD 15.3 hung during the user's confirmed in-game exit, with music
   continuing until SIGKILL. On the revised persistent-home/idle-DMA build, both

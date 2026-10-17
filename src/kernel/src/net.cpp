@@ -3396,14 +3396,32 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("p95_ms",t.p95Ms);r.text(",");r.field("max_ms",t.maxMs);
         r.text("}}\n");r.send();return;
     }
-    if (NetStrEq(cmd, "bridge frame")) {
-        uint32_t w=0,h=0,stride=0,panicStride=0;
-        const uint32_t* frame = CompositorDebugFrame(&w,&h,&stride);
-        auto* panicFrame = CompositorGetPhysFb(&panicStride);
-        BridgeReply r;r.text("{\"address\":\"0x");r.number(reinterpret_cast<uint64_t>(frame),true);
-        r.text("\",");r.field("width",w);r.text(",");r.field("height",h);r.text(",");r.field("stride",stride);
+    if (NetStrEq(cmd,"bridge frame") || NetStrEq(cmd,"bridge frame request") ||
+        StrStartsWith(cmd,"bridge frame status ")) {
+        DebugFrameSnapshot frame{};
+        if (StrStartsWith(cmd,"bridge frame status ")) {
+            uint32_t token=0;const char* argument=cmd+20;
+            int consumed=ParseUint(argument,&token);
+            if (consumed<=0 || argument[consumed]) token=0;
+            frame=CompositorDebugFrameStatus(token);
+        } else frame=CompositorRequestDebugFrame();
+        uint32_t panicStride=0;
+        auto* panicFrame=CompositorGetPhysFb(&panicStride);
+        BridgeReply r;r.text("{\"capture_api\":2,");r.field("token",frame.token);
+        r.text(",");r.field("state",static_cast<uint32_t>(frame.state));
+        r.text(",\"address\":\"0x");r.number(frame.address,true);r.text("\",");
+        r.field("width",frame.width);r.text(",");r.field("height",frame.height);r.text(",");r.field("stride",frame.stride);
+        r.text(",");r.field("frame_tick_ms",frame.tick);r.text(",");r.field("frame_epoch",frame.epoch);
         r.text(",\"panic_address\":\"0x");r.number(reinterpret_cast<uint64_t>(panicFrame),true);
         r.text("\",");r.field("panic_stride",panicStride);r.text("}\n");r.send();return;
+    }
+    if (StrStartsWith(cmd,"bridge frame release ")) {
+        uint32_t token=0;const char* argument=cmd+21;
+        int consumed=ParseUint(argument,&token);
+        bool valid=consumed>0 && !argument[consumed];
+        BridgeReply r;r.text("{\"released\":");
+        r.text(valid && CompositorReleaseDebugFrame(token)?"true":"false");
+        r.text("}\n");r.send();return;
     }
     if (StrStartsWith(cmd,"bridge run ")) {
         int pid=ShellLaunchCommand(cmd+11);

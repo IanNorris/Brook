@@ -44,7 +44,9 @@ interactive: visually inspect each image and exercise the application before
 publishing it. Copy only selected PNGs into `docs/images/`; do not copy disk
 images, game packs, soundtracks, guest memory or private session metadata.
 
-The bridge's GPU readback briefly pauses the VM and is useful for stills.
+The bridge now leases a completed-frame snapshot, avoiding mutable render-buffer
+captures; see [capture acceptance](completed-frame-capture.md). Its GPU readback
+and brief VM pause are useful for stills.
 Repeated readbacks are unsuitable for measuring rendering performance or
 recording a smooth video.
 

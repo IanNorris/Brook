@@ -5,6 +5,7 @@ No host desktop APIs, input daemons, clipboard, or arbitrary host shell tool.
 """
 import argparse
 import base64
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -96,19 +97,45 @@ def png_rgb(width, height, rgb):
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
-def capture(session, data, crop=None, max_width=None):
-    """Guest GPU readback + paused QEMU RAM snapshot; CPU fallback is identical."""
-    metadata_path = REGISTRY / session / "frame-source.json"
-    panic = panic_state(data)
-    if panic:
-        if not metadata_path.exists():
-            raise RuntimeError("No pre-panic framebuffer metadata; memory/register inspection is available")
-        source = json.loads(metadata_path.read_text())
-        source["address"] = source["panic_address"]
-        source["stride"] = source["panic_stride"]
-    else:
-        source = guest(data, "bridge frame", timeout=20)
-        write_json(metadata_path, source)
+@contextlib.contextmanager
+def completed_frame_source(session, data):
+    """A guest-owned immutable frame lease, never a mutable render buffer."""
+    source = guest(data, "bridge frame request", timeout=10)
+    if not isinstance(source, dict) or source.get("capture_api") != 2:
+        raise RuntimeError("Kernel lacks completed-frame capture; boot a current build")
+    token = source.get("token")
+    if not isinstance(token, int) or isinstance(token, bool) or not 0 < token <= 0xffffffff:
+        raise RuntimeError("Completed-frame capture is busy or unavailable")
+    try:
+        deadline = time.monotonic() + 10
+        while source.get("state") == 1:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Compositor did not publish a completed frame")
+            time.sleep(.01)
+            source = guest(data, f"bridge frame status {token}", timeout=10)
+            if source.get("capture_api") != 2 or source.get("token") != token:
+                raise RuntimeError("Completed-frame token changed while waiting")
+        if source.get("state") != 2:
+            raise RuntimeError("Completed-frame capture failed or expired")
+        yield source
+        # Guest time was stopped during RAM extraction, but the lease could
+        # expire before/after it. Never publish bytes from an invalidated lease.
+        status = guest(data, f"bridge frame status {token}", timeout=10)
+        if any(status.get(key) != source.get(key) for key in
+               ("capture_api", "token", "state", "frame_epoch", "address", "width", "height", "stride")):
+            raise RuntimeError("Completed-frame lease expired during capture")
+    finally:
+        failed = sys.exc_info()[0] is not None
+        try:
+            released = guest(data, f"bridge frame release {token}", timeout=10)
+            if released.get("released") is not True:
+                raise RuntimeError("Completed-frame lease release was not acknowledged")
+        except (OSError, ValueError, RuntimeError, TimeoutError):
+            if not failed:
+                raise
+
+
+def read_frame_bytes(session, source):
     w, h, stride = source["width"], source["height"], source["stride"]
     address = int(source["address"], 16)
     if not address or not (0 < w <= 4096 and 0 < h <= 2160 and w <= stride <= 8192):
@@ -117,19 +144,40 @@ def capture(session, data, crop=None, max_width=None):
     if size > 64 * 1024 * 1024:
         raise ValueError("Framebuffer exceeds capture limit")
     raw_path = artifact(session, ".xrgb")
-    with QMP(session, timeout=20) as q:
-        running = q.call("query-status")["running"]
-        if running:
-            q.call("stop")
-        try:
-            q.hmp(f'memsave {address:#x} {size} "{raw_path}"')
-        finally:
+    try:
+        with QMP(session, timeout=20) as q:
+            running = q.call("query-status")["running"]
             if running:
-                q.call("cont")
-    raw = raw_path.read_bytes()
-    raw_path.unlink()
-    if len(raw) != size:
-        raise RuntimeError("QEMU returned an incomplete framebuffer")
+                q.call("stop")
+            try:
+                q.hmp(f'memsave {address:#x} {size} "{raw_path}"')
+            finally:
+                if running:
+                    q.call("cont")
+        raw = raw_path.read_bytes()
+        if len(raw) != size:
+            raise RuntimeError("QEMU returned an incomplete framebuffer")
+        return raw
+    finally:
+        raw_path.unlink(missing_ok=True)
+
+
+def capture(session, data, crop=None, max_width=None):
+    """Read a leased completed frame; panic keeps the cached physical fallback."""
+    metadata_path = REGISTRY / session / "frame-source.json"
+    panic = panic_state(data)
+    if panic:
+        if not metadata_path.exists():
+            raise RuntimeError("No pre-panic framebuffer metadata; memory/register inspection is available")
+        source = json.loads(metadata_path.read_text())
+        source["address"] = source["panic_address"]
+        source["stride"] = source["panic_stride"]
+        raw = read_frame_bytes(session, source)
+    else:
+        with completed_frame_source(session, data) as source:
+            raw = read_frame_bytes(session, source)
+        write_json(metadata_path, source)
+    w, h, stride = source["width"], source["height"], source["stride"]
     rgb = bytearray(w*h*3)
     for y in range(h):
         row = raw[y*stride*4:y*stride*4+w*4]
@@ -161,9 +209,11 @@ def capture(session, data, crop=None, max_width=None):
              "width": iw, "height": ih, "coordinate_width": w, "coordinate_height": h,
              "crop_width":cw,"crop_height":ch,"scale":iw/cw,"scale_y":ih/ch,
              "crop_origin": [cx, cy], "captured_monotonic": time.monotonic(),
-             "source": "panic_cpu_framebuffer" if panic else "guest_compositor_readback",
+             "source": "panic_cpu_framebuffer" if panic else "guest_completed_frame",
+             "frame_epoch": None if panic else source.get("frame_epoch"),
+             "frame_tick_ms": None if panic else source.get("frame_tick_ms"),
              "panic": panic, "artifact": str(path), "sha256": hashlib.sha256(image).hexdigest(),
-             "intrusive": "brief VM pause; normal GPU capture also performs guest readback"}
+             "intrusive": "completed-frame copy and brief VM pause; GPU readback at frame boundary"}
     write_json(REGISTRY / session / "last-frame.json", frame)
     return {"data": frame, "image": image}
 
@@ -192,7 +242,7 @@ def doctor(session, **_):
                   "commands": [x["name"] for x in q.call("query-commands")
                                if x["name"] in {"input-send-event","screendump","human-monitor-command",
                                                 "query-status","query-blockstats","stop","cont","quit"}],
-                  "capture": "guest readback + QEMU memory; requires healthy guest or cached panic metadata",
+                  "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable"}
         try:
             result["guest"] = guest(data, "bridge stats", timeout=3)
@@ -679,7 +729,7 @@ register("vm_sessions",sessions,"Discover opted-in user/agent VM runs; no deskto
 register("vm_doctor",doctor,"VM transport and guest readiness; capabilities distinguish unsupported paths",SESSION,["session"],True)
 register("vm_start",start,"Boot a named experiment on new disk clones with playback off",{"scenario":STR,"gpu":STR})
 register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop/reset await guest sync, force explicitly allows unsynced shutdown",{**SESSION,"action":STR,"force":{"type":"boolean"}},["session","action"])
-register("vm_observe",observe,"Guest image with crop/scale coordinate metadata; briefly pauses VM; panic capture needs cached framebuffer",{**SESSION,"crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session"])
+register("vm_observe",observe,"Leased completed-frame image with crop/scale metadata; briefly pauses VM; current kernel required; panic needs cached framebuffer",{**SESSION,"crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session"])
 register("vm_logs",logs,"Read bounded logs by byte cursor",{**SESSION,"source":STR,"offset":INT,"limit":INT},["session"],True)
 register("vm_stats",stats,"OS memory/process counts and compositor intervals; optional rolling memory census holds guest mapping locks while sampling",{**SESSION,"memory_details":{"type":"boolean"}},["session"],True)
 register("vm_guest_run",guest_run,"Launch via Brook run syntax; returns PID, not exit status",{**SESSION,"command":STR},["session","command"])

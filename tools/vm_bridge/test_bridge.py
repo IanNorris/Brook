@@ -341,4 +341,97 @@ FlatView #7
             self.assertEqual(process.returncode,0,error)
 
 
+
+
+class CompletedFrameTests(unittest.TestCase):
+    def ready(self, **changes):
+        return dict(capture_api=2, token=7, state=2, address='0x1000',
+                    width=2, height=1, stride=2, frame_epoch=41,
+                    frame_tick_ms=123, panic_address='0x2000', panic_stride=2,
+                    **changes)
+
+    def test_waits_for_completed_frame_and_releases_it(self):
+        ready = self.ready()
+        replies = [dict(capture_api=2, token=7, state=1), ready, ready,
+                   dict(released=True)]
+        with patch.object(server, 'guest', side_effect=replies) as guest, \
+             patch.object(server.time, 'sleep'):
+            with server.completed_frame_source('s', {}) as source:
+                self.assertEqual(source['frame_epoch'], 41)
+            self.assertEqual([call.args[1] for call in guest.call_args_list],
+                             ['bridge frame request', 'bridge frame status 7',
+                              'bridge frame status 7', 'bridge frame release 7'])
+
+    def test_refuses_mutable_legacy_frame(self):
+        with patch.object(server, 'guest', return_value={'address': '0x1000'}):
+            with self.assertRaisesRegex(RuntimeError, 'lacks completed-frame'):
+                with server.completed_frame_source('s', {}):
+                    self.fail('legacy buffer must never be read')
+
+    def test_does_not_steal_an_existing_capture(self):
+        with patch.object(server, 'guest', return_value=dict(capture_api=2, token=0, state=4)) as guest:
+            with self.assertRaisesRegex(RuntimeError, 'busy or unavailable'):
+                with server.completed_frame_source('s', {}):
+                    self.fail('busy capture must not be read')
+            self.assertEqual(guest.call_count, 1)
+
+    def test_expired_lease_is_not_publishable(self):
+        with patch.object(server, 'guest', side_effect=[self.ready(),
+                dict(capture_api=2, token=7, state=5), dict(released=False)]) as guest:
+            with self.assertRaisesRegex(RuntimeError, 'expired during capture'):
+                with server.completed_frame_source('s', {}):
+                    pass
+            self.assertEqual(guest.call_args_list[-1].args[1], 'bridge frame release 7')
+
+    def test_release_after_read_failure_preserves_original_error(self):
+        with patch.object(server, 'guest', side_effect=[self.ready(), OSError('disconnected')]) as guest:
+            with self.assertRaisesRegex(ValueError, 'read failed'):
+                with server.completed_frame_source('s', {}):
+                    raise ValueError('read failed')
+            self.assertEqual(guest.call_args_list[-1].args[1], 'bridge frame release 7')
+
+    def test_wrong_token_while_pending_is_rejected_and_released(self):
+        with patch.object(server, 'guest', side_effect=[dict(capture_api=2, token=7, state=1),
+                dict(capture_api=2, token=8, state=2), dict(released=True)]), \
+             patch.object(server.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'token changed'):
+                with server.completed_frame_source('s', {}):
+                    self.fail('wrong token must not be read')
+
+    def test_panic_capture_does_not_reuse_old_frame_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'s').mkdir()
+            (root/'s'/'frame-source.json').write_text(json.dumps(self.ready()))
+            image_path=root/'panic.png'
+            with patch.object(server, 'REGISTRY', root), \
+                 patch.object(server, 'panic_state', return_value=True), \
+                 patch.object(server, 'artifact', return_value=image_path), \
+                 patch.object(server, 'read_frame_bytes', return_value=bytes(8)) as read:
+                result=server.capture('s',{'generation':'g'})['data']
+            self.assertTrue(result['panic'])
+            self.assertIsNone(result['frame_epoch'])
+            self.assertIsNone(result['frame_tick_ms'])
+            self.assertEqual(read.call_args.args[1]['address'],'0x2000')
+
+    def test_memsave_error_resumes_vm_and_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'partial.xrgb'
+            events = []
+            class FakeQMP:
+                def __init__(self, *args, **kwargs): pass
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
+                def call(self, command):
+                    events.append(command)
+                    return {'running': True} if command == 'query-status' else {}
+                def hmp(self, command):
+                    path.write_bytes(b'partial')
+                    raise RuntimeError('memsave failed')
+            with patch.object(server, 'QMP', FakeQMP), patch.object(server, 'artifact', return_value=path):
+                with self.assertRaisesRegex(RuntimeError, 'memsave failed'):
+                    server.read_frame_bytes('s', self.ready())
+            self.assertEqual(events, ['query-status', 'stop', 'cont'])
+            self.assertFalse(path.exists())
+
+
 if __name__=='__main__':unittest.main()

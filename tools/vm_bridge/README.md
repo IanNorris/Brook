@@ -54,7 +54,7 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_sessions`, `vm_doctor` | Discover opted-in runs and inspect actual transport/guest capabilities. Select an explicit session. |
 | `vm_start` | Clone seed disks and start `desktop`, `video`, `quake-soft`, `quake-gl3` or `office`; `gpu` is `software` or `gl`. Audio defaults to `none`. |
 | `vm_control` | `pause`, `resume`, `reset`, `stop`, `takeover`, `release`, or controlled `panic`. Stop/reset wait for guest metadata sync; explicit `force: true` permits shutdown when sync cannot complete. Reset changes the generation and invalidates frames. |
-| `vm_observe` | Return PNG and frame ID, native geometry, crop origin and scale. Optional native `crop` and `max_width`; GPU readback plus brief VM pause. |
+| `vm_observe` | Return PNG and frame ID, native geometry, crop origin and scale. Optional native `crop` and `max_width`; leased completed frame, GPU readback at the frame boundary, and brief VM pause. Requires capture API 2 in the kernel. |
 | `vm_input` | Ordered key/chord/text/pointer/scroll/relative/hold/wait batches. Coordinates require the current `frame_id`; crop/scale map back to native coordinates. US ASCII text only; holds release at batch end/cancel. Observe to verify reaction. |
 | `vm_logs`, `vm_wait` | Bounded serial/QEMU byte cursors or bounded serial-substring waits. Logs survive VM exit. |
 | `vm_guest_run` | Launch a Brook `run /absolute/guest/path args` command, optionally `--uid 1000`. Return PID; no process completion or isolated stdout/stderr yet. Entire framed command fits 220 bytes. |
@@ -188,3 +188,39 @@ batches. Capacity exhaustion leaves a normal uncached COW mapping. Hits include
 same-frame aliases, so `hits * 4096` is **not** a memory-saving measurement.
 Use physical free-memory measurements and the rolling census together. Active
 entries survive trimming; released frames may await PMM quarantine drainage.
+
+
+## Completed-frame capture
+
+The bridge no longer reads the live render backbuffer. `bridge frame request`
+returns a token in Pending state; the compositor services it after presenting a
+frame. CPU capture copies the presented front buffer. GPU capture reads the
+completed scanout and copies its pixels. `bridge frame status TOKEN` exposes the
+immutable snapshot only in Ready state, with its frame epoch and guest tick.
+The bridge pauses QEMU for RAM extraction, restores its previous running state,
+revalidates token/geometry/epoch, and sends `bridge frame release TOKEN` even
+when extraction fails. A different or expired lease is never published as an
+image. A second request returns Busy; a wrong release cannot invalidate an
+existing capture. Tokens are not reused within a boot.
+
+An abandoned request/snapshot expires after 30 seconds of guest time. The one
+snapshot allocation is reused (about 8 MiB at 1080p); no copy/readback occurs
+without a request. Metadata rejects runtime display remaps during the captured
+frame. Scanout flips and CPU front-buffer capture share the geometry mutex.
+The snapshot mutex can wait through readback/allocation/copy; debug commands
+never wait for another compositor frame, since they may run on that thread.
+
+Normal images report `source: guest_completed_frame`, `frame_epoch` and
+`frame_tick_ms`. These identify a completed render, not GPU timing or the host
+capture instant. Panic capture still reads the cached physical framebuffer and
+reports null frame epoch/tick, rather than borrowing an earlier image's time.
+It is a separate best-effort crash view. Reset invalidates cached metadata.
+
+Use the updated kernel and bridge source together. An older kernel produces an
+explicit unsupported-capture error; an already running MCP process needs a reload
+to pick up `server.py`. The source CLI and showcase helper use the updated code
+immediately. No desktop automation backend is introduced.
+
+CPU and GPU lease acceptance, failure tests and remaining recording work are
+recorded in [completed-frame capture](../../docs/completed-frame-capture.md).
+This still-capture protocol is intrusive and is not a continuous video recorder.
