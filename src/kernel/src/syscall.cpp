@@ -276,10 +276,15 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "jne .Lsigreturn_iret\n\t"
         "pop %%r11\n\t"                // [3] user RFLAGS
         "pop %%rcx\n\t"                // [2] user return address
-        // Validate RCX is a canonical user-mode address before sysret.
-        // Use bt to test bit 47 without clobbering any GPR.
-        "bt $47, %%rcx\n\t"
-        "jc .Lsysret_bad_rcx\n\t"
+        // Every high bit must be clear for Brook's low-47-bit user range.
+        // Bit 47 alone misses noncanonical values with higher bits set.
+        // The scratch push reuses the consumed RIP slot, preserving RAX/RSP.
+        "push %%rax\n\t"
+        "mov %%rcx, %%rax\n\t"
+        "shr $47, %%rax\n\t"
+        "test %%rax, %%rax\n\t"
+        "pop %%rax\n\t"
+        "jnz .Lsysret_bad_rcx\n\t"
         "swapgs\n\t"
         "mov (%%rsp), %%rsp\n\t"       // [1] user RSP
         ".byte 0x48\n\t"
@@ -405,7 +410,7 @@ static bool HasReadInterruptSignal()
     if (!proc) return false;
     constexpr uint64_t childBit = 1ULL << (17 - 1);
     if ((proc->sigPending & ~proc->sigMask & childBit) && proc->tgid < MAX_PROCESSES) {
-        uint64_t handler = g_sigHandlers[proc->tgid][17 - 1].handler;
+        uint64_t handler = ReadSignalAction(proc->tgid,17 - 1).handler;
         if (handler == 0 || handler == 1)
             ProcessDequeueSignal(proc, 17, nullptr);
     }
@@ -4290,16 +4295,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     if ((flags & CLONE_CLEAR_SIGHAND) && !(flags & CLONE_THREAD))
     {
         uint32_t childPid = child->pid;
-        if (childPid < MAX_PROCESSES)
-        {
-            for (int s = 0; s < 64; s++)
-            {
-                g_sigHandlers[childPid][s].handler = 0; // SIG_DFL
-                g_sigHandlers[childPid][s].flags = 0;
-                g_sigHandlers[childPid][s].restorer = 0;
-                g_sigHandlers[childPid][s].mask = 0;
-            }
-        }
+        if (childPid < MAX_PROCESSES)ResetSignalActions(childPid);
     }
 
     SchedulerAddProcess(child);
@@ -4423,7 +4419,7 @@ static bool ChildWaitInterrupted(Process* caller)
     if (pending & childBit) {
         // Default/ignored SIGCHLD is a wait wakeup. A caught SIGCHLD must reach
         // its handler through normal syscall signal delivery instead of vanishing.
-        if (g_sigHandlers[caller->tgid][16].handler > 1) return true;
+        if (ReadSignalAction(caller->tgid,16).handler > 1) return true;
         ProcessDequeueSignal(caller, 17, nullptr);
     }
     return false;
@@ -7408,8 +7404,6 @@ static int64_t sys_setgroups(uint64_t size, uint64_t listAddr, uint64_t,
 // Signal: rt_sigaction (13), rt_sigprocmask (14)
 // ---------------------------------------------------------------------------
 
-KernelSigaction g_sigHandlers[MAX_PROCESSES][64];
-
 static int64_t sys_rt_sigaction(uint64_t signum, uint64_t actAddr, uint64_t oldactAddr,
                                  uint64_t sigsetsize, uint64_t, uint64_t)
 {
@@ -7423,21 +7417,12 @@ static int64_t sys_rt_sigaction(uint64_t signum, uint64_t actAddr, uint64_t olda
     uint16_t pid = proc->tgid;
     if (pid >= MAX_PROCESSES) return -EINVAL;
 
-    if (oldactAddr)
-    {
-        if (!UserBufferWritable(oldactAddr, sizeof(KernelSigaction))) return -EFAULT;
-        auto* old = reinterpret_cast<KernelSigaction*>(oldactAddr);
-        *old = g_sigHandlers[pid][idx];
-    }
-
-    if (actAddr)
-    {
-        if (!UserBufferReadable(actAddr, sizeof(KernelSigaction))) return -EFAULT;
-        auto* act = reinterpret_cast<const KernelSigaction*>(actAddr);
-        g_sigHandlers[pid][idx] = *act;
-    }
-
-    return 0;
+    KernelSigaction action{};
+    if(actAddr && !CopyFromUser(&action,actAddr,sizeof(action)))return -EFAULT;
+    if(actAddr && (signum==9 || signum==19))return -EINVAL;
+    action.mask &= ~((1ULL<<8)|(1ULL<<18));
+    const KernelSigaction previous=ExchangeSignalAction(pid,idx,actAddr?&action:nullptr);
+    return !oldactAddr || CopyToUser(oldactAddr,&previous,sizeof(previous))?0:-EFAULT;
 }
 
 static int64_t sys_rt_sigpending(uint64_t setAddr, uint64_t sigsetsize,

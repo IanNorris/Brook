@@ -35,6 +35,36 @@
 
 namespace brook {
 
+namespace {
+IrqSpinLock signalActionLock;
+KernelSigaction signalActions[MAX_PROCESSES][64];
+struct SignalActionGuard {
+    uint64_t flags=IrqSpinLockAcquire(&signalActionLock);
+    ~SignalActionGuard() { IrqSpinLockRelease(&signalActionLock,flags); }
+};
+}
+KernelSigaction ExchangeSignalAction(uint16_t tgid,uint32_t index,const KernelSigaction* replacement) {
+    if(tgid>=MAX_PROCESSES || index>=64)return {};
+    SignalActionGuard held;
+    const KernelSigaction previous=signalActions[tgid][index];
+    if(replacement)signalActions[tgid][index]=*replacement;
+    return previous;
+}
+KernelSigaction ReadSignalAction(uint16_t tgid,uint32_t index) {
+    return ExchangeSignalAction(tgid,index,nullptr);
+}
+void ResetSignalActions(uint16_t tgid,bool preserveIgnore) {
+    if(tgid>=MAX_PROCESSES)return;
+    SignalActionGuard held;
+    for(auto& action:signalActions[tgid])
+        if(!preserveIgnore || action.handler!=1)action={};
+}
+void CopySignalActions(uint16_t destination,uint16_t source) {
+    if(destination>=MAX_PROCESSES || source>=MAX_PROCESSES)return;
+    SignalActionGuard held;
+    for(unsigned index=0;index<64;++index)signalActions[destination][index]=signalActions[source][index];
+}
+
 struct ProcessOperationGuard {
     Process* process;
     explicit ProcessOperationGuard(Process* p) : process(p) {
@@ -1126,12 +1156,7 @@ void ProcessDestroyNow(Process* proc)
     // the leader (pid == tgid) is destroyed, otherwise a thread exiting
     // before the leader would wipe the still-live process's handlers.
     if (proc->pid == proc->tgid) {
-        for (int s = 0; s < 64; ++s) {
-            g_sigHandlers[proc->tgid][s].handler = 0;
-            g_sigHandlers[proc->tgid][s].flags = 0;
-            g_sigHandlers[proc->tgid][s].restorer = 0;
-            g_sigHandlers[proc->tgid][s].mask = 0;
-        }
+        ResetSignalActions(proc->tgid);
     }
 
     // Release the PID only after clearing its signal slots and exact resources.
@@ -1324,13 +1349,12 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->straceEnabled = parent->straceEnabled;
     child->straceErrorsOnly = parent->straceErrorsOnly;
 
-    // Inherit parent's signal handlers (POSIX fork semantics). The
-    // g_sigHandlers table is indexed by pid, so we must explicitly copy;
+    // Inherit parent's signal handlers (POSIX fork semantics).
+    // The table is indexed by group identity, so we must explicitly copy;
     // otherwise the child's slot contains stale handler pointers from
     // whatever previous process had the same pid — a deterministic #PF
     // waiting for the first signal delivery (e.g. SIGCHLD on waitpid).
-    for (int s = 0; s < 64; ++s)
-        g_sigHandlers[child->tgid][s] = g_sigHandlers[parent->tgid][s];
+    CopySignalActions(child->tgid,parent->tgid);
 
     // Set child's name
     {
@@ -1507,7 +1531,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->sigReturnPending = false;
 
     // Threads share the parent's tgid (set above), so they already index
-    // into the same g_sigHandlers[tgid] slot — no copy needed.
+    // into the same group disposition slot — no copy needed.
 
     // Set thread name
     {
@@ -1756,15 +1780,7 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     //    same PID if we never cleared on destroy) would redirect signal
     //    delivery to unmapped memory, causing a #PF in the new program on
     //    its first signal (e.g. SIGCHLD from a child exiting).
-    for (int s = 0; s < 64; ++s) {
-        auto& sa = g_sigHandlers[proc->tgid][s];
-        if (sa.handler != 1 /* SIG_IGN */) {
-            sa.handler = 0;
-            sa.flags = 0;
-            sa.restorer = 0;
-            sa.mask = 0;
-        }
-    }
+    ResetSignalActions(proc->tgid,true);
 
     // Ordinary exec preserves real IDs/groups and snapshots effective IDs.
     SpinLockAcquire(&g_credentialsLock);
@@ -1881,7 +1897,7 @@ int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
     // (like SIGSTOP). Otherwise fall through to set pending for handler delivery.
     if (signum == 20 || signum == 21 || signum == 22)
     {
-        KernelSigaction& sa = g_sigHandlers[proc->tgid][signum - 1];
+        const KernelSigaction sa = ReadSignalAction(proc->tgid,signum - 1);
         if (sa.handler == 0 || sa.handler == 1) // SIG_DFL or SIG_IGN
         {
             if (sa.handler == 1) return 0; // SIG_IGN — ignore
@@ -1906,7 +1922,7 @@ int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
     //   - SIG_DFL where the POSIX default is "ignore": SIGCHLD (17),
     //     SIGURG (23), SIGWINCH (28)
     {
-        KernelSigaction& sa = g_sigHandlers[proc->tgid][signum - 1];
+        const KernelSigaction sa = ReadSignalAction(proc->tgid,signum - 1);
         bool defaultIsIgnore = (signum == 17 || signum == 23 || signum == 28);
         if (sa.handler == 1 ||
             (sa.handler == 0 && defaultIsIgnore))
@@ -2052,7 +2068,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     uint16_t pid = proc->tgid;
     if (pid >= MAX_PROCESSES) return syscallResult;
 
-    KernelSigaction& sa = g_sigHandlers[pid][signum - 1];
+    const KernelSigaction sa = ReadSignalAction(pid,signum - 1);
 
     // SIG_DFL (0) — default action
     if (sa.handler == 0)
@@ -2073,6 +2089,12 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // SIG_IGN (1)
     if (sa.handler == 1)
         return syscallResult;
+
+    if(!UserReturnAddress(sa.handler)) {
+        SerialPrintf("SIGNAL: invalid handler pid %u address=%lx\n",proc->pid,sa.handler);
+        SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
+        SchedulerExitCurrentProcess(128+11,11);
+    }
 
     // --- User handler: build SignalFrame on user stack ---
     DbgPrintf("SIGNAL: delivering signal %d to pid %u handler=0x%lx restorer=0x%lx\n",

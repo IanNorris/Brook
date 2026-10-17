@@ -45,7 +45,7 @@ bool Owned(const Timer& t, Process* p)
 bool IgnoredUnblocked(const Timer& t, Process* p)
 {
     if (p->sigMask & (1ULL << (t.signo - 1))) return false;
-    auto& action = g_sigHandlers[p->tgid][t.signo - 1];
+    const auto action = ReadSignalAction(p->tgid,t.signo - 1);
     return action.handler == 1 || (action.handler == 0 &&
         (t.signo == 17 || t.signo == 23 || t.signo == 28));
 }

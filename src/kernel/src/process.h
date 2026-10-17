@@ -67,6 +67,11 @@ struct KernelSigaction {
     uint64_t restorer;   // User-space __restore_rt trampoline
     uint64_t mask;       // Signals blocked during handler
 };
+static_assert(sizeof(KernelSigaction)==32);
+static_assert(__builtin_offsetof(KernelSigaction,handler)==0);
+static_assert(__builtin_offsetof(KernelSigaction,flags)==8);
+static_assert(__builtin_offsetof(KernelSigaction,restorer)==16);
+static_assert(__builtin_offsetof(KernelSigaction,mask)==24);
 
 // SA_* flag constants
 static constexpr uint64_t SA_SIGINFO  = 0x00000004;
@@ -74,8 +79,12 @@ static constexpr uint64_t SA_ONSTACK  = 0x08000000;
 static constexpr uint64_t SA_RESTORER = 0x04000000;
 static constexpr uint64_t SA_RESTART  = 0x10000000;
 
-// Per-process signal handlers (indexed by [pid][signal-1])
-extern KernelSigaction g_sigHandlers[MAX_PROCESSES][64];
+// Group dispositions are snapshotted/exchanged under one short IRQ-safe lock.
+// Replacement is a trusted kernel-local value; perform user copies outside it.
+KernelSigaction ReadSignalAction(uint16_t tgid,uint32_t index);
+KernelSigaction ExchangeSignalAction(uint16_t tgid,uint32_t index,const KernelSigaction* replacement);
+void ResetSignalActions(uint16_t tgid,bool preserveIgnore=false);
+void CopySignalActions(uint16_t destination,uint16_t source);
 
 // ---------------------------------------------------------------------------
 // Signal frame structures (Linux x86_64 ABI compatible)

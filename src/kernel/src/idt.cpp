@@ -1601,17 +1601,17 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
     // for both kernel-mode and user-mode writes to COW-protected user pages.
 
     // Check if the process has a handler registered for this signal.
-    bool hasHandler = false;
-    if (proc && proc->pid < brook::MAX_PROCESSES)
-    {
-        const brook::KernelSigaction& sa = brook::g_sigHandlers[proc->tgid][signum - 1];
-        if (sa.handler > 1) // Not SIG_DFL (0) or SIG_IGN (1)
-            hasHandler = true;
-    }
+    const brook::KernelSigaction sa=proc?brook::ReadSignalAction(proc->tgid,signum-1):brook::KernelSigaction{};
+    const bool hasHandler=sa.handler>1;
 
     if (hasHandler && proc && !proc->inSignalHandler)
     {
-        const brook::KernelSigaction& sa = brook::g_sigHandlers[proc->tgid][signum - 1];
+        if(!brook::UserReturnAddress(sa.handler)) {
+            SerialPrintf("SIGNAL: invalid fault handler pid %u address=%lx\n",proc->pid,sa.handler);
+            __asm__ volatile("sti":::"memory");
+            brook::SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
+            brook::SchedulerExitCurrentProcess(128+11,11);
+        }
 
         SerialPrintf("[SIG] Delivering signal %u to pid %u (handler=0x%lx faultAddr=0x%lx RIP=0x%lx)\n",
                      signum, proc->pid, sa.handler, cr2, ef->rip);

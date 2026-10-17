@@ -91,6 +91,9 @@ int main() {
     to.destination=to.address;to.source=0xffff800000010000ULL;to.error=2;CHECK(UserCopyFaultFixup(to));
     to.destination=to.address=0x0000800000000000ULL;CHECK(!UserCopyFaultFixup(to));
     SyscallReturnState state{};
+    CHECK(UserReturnAddress(0x10000)&&UserReturnAddress(0x7fffffffffff));
+    CHECK(!UserReturnAddress(0xffff)&&!UserReturnAddress(0x800000000000));
+    CHECK(!UserReturnAddress(0x1000000000000001)&&!UserReturnAddress(0xffff800000000000));
     CHECK(PrepareSignalReturn(state,0x401000,0x7fffffffe000,~uint64_t{0},0x123456));
     CHECK(state.mode==1&&state.rcx==0x123456&&state.rip==0x401000&&state.rsp==0x7fffffffe000);
     CHECK(state.cs==GDT_USER_CODE&&state.ss==GDT_USER_DATA&&state.flags==0x250fd7&&state.padding==0);

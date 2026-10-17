@@ -86,6 +86,11 @@ hardware guest execution, not substitutes for it.
 
 ## Coverage required before claiming all handlers
 
+The subsequent [signal target/snapshot checkpoint](signal-return-targets.md)
+strengthens SYSRET's full-range guard, validates signal targets and protects
+the action table. It adds independent native invalid-handler/copy/concurrency
+controls; complete static modeling of the syscall dispatcher is still open.
+
 ### Controlled kernel-mode checkpoint
 
 `BROOK_REGISTER_TEST_HOOKS=ON` adds the root-only scalar test syscall 0xB31.

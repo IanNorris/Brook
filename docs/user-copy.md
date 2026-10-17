@@ -109,6 +109,10 @@ disk checks pass. Evidence: `build/workloads/user-copy-df-hooks-20261017/`, sess
 
 ## Remaining gate before mapped resize
 
+The [signal target checkpoint](signal-return-targets.md) also migrates
+rt_sigaction input/output to recoverable staged copies. Its disposition lock
+does not span those copies. Signal-frame construction still needs migration.
+
 The exact-instruction fixup deliberately does not cover arbitrary kernel loads,
 stores or memcpy. The inspected legacy paths still needing migration include:
 
