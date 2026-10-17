@@ -582,6 +582,7 @@ extern "C" void PanicNmiRecord(uint64_t cpuIdx, uint64_t rip,
 
 __asm__(
     ".global PanicNmiHandlerAsm\n"
+    ".type PanicNmiHandlerAsm,@function\n"
     "PanicNmiHandlerAsm:\n"
     "    cmpb $0, g_panicHaltActive(%rip)\n"
     "    jne .Lnmi_panic\n"
@@ -647,6 +648,7 @@ __asm__(
     "    pop %rcx\n"
     "    pop %rax\n"
     "    iretq\n"
+    ".size PanicNmiHandlerAsm,.-PanicNmiHandlerAsm\n"
 );
 extern "C" void PanicNmiHandlerAsm();
 

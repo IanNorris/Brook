@@ -1,14 +1,18 @@
 #include "register_test.h"
 #include "irq_wrapper.h"
 #include "process.h"
+#include "scheduler.h"
+#include "apic.h"
 #include "serial.h"
 #include "string.h"
 
 extern "C" {
 uint64_t kr_seed[15],kr_actual[17],kr_expected_rsp,kr_actual_guard[4];
 uint64_t kr_inner_rsp,kr_inner_flags,kr_arrivals;
+uint64_t kr_ipi_events,kr_ipi_return_flags;
 alignas(16) unsigned char kr_seed_fx[512],kr_actual_fx[512];
 void kr_probe_irq(),kr_probe_ud(),kr_probe_gp(),kr_probe_pf(),kr_clobber();
+void kr_probe_ipi();
 extern const char kr_ud_instruction[],kr_ud_resume[],kr_gp_instruction[],kr_gp_resume[];
 extern const char kr_pf_instruction[],kr_pf_resume[];
 IRQ_NAKED_HANDLER(RegisterTestIrqWrapper,kr_clobber)
@@ -31,6 +35,7 @@ void Seed() {
     memcpy(kr_seed_fx,&fcw,2);memcpy(kr_seed_fx+24,&mxcsr,4);
     for(unsigned i=0;i<256;++i)kr_seed_fx[160+i]=static_cast<unsigned char>(i*13+37);
     kr_arrivals=kr_inner_rsp=kr_inner_flags=0;frameBad=false;
+    kr_ipi_events=kr_ipi_return_flags=0;
 }
 bool Check(const char* name) {
     bool ok=!frameBad;
@@ -40,12 +45,22 @@ bool Check(const char* name) {
     if(kr_actual[15]!=kr_expected_rsp || (kr_actual[16]&flagsMask)!=flagsMask)ok=false;
     for(unsigned i=0;i<4;++i)if(kr_actual_guard[i]!=0x35792468)ok=false;
     if(kr_arrivals!=1 || (kr_inner_rsp&15)!=8 || (kr_inner_flags&0x600))ok=false;
-    if(memcmp(kr_seed_fx,kr_actual_fx,2) || memcmp(kr_seed_fx+24,kr_actual_fx+24,4) ||
-       memcmp(kr_seed_fx+160,kr_actual_fx+160,256))ok=false;
-    SerialPrintf("KREGISTER %s %s rsp=%lx expected=%lx inner=%lx flags=%lx arrivals=%lu frame_bad=%u\n",
-        name,ok?"PASS":"FAIL",kr_actual[15],kr_expected_rsp,kr_inner_rsp,kr_actual[16],kr_arrivals,frameBad?1:0);
+    const bool fpuBad=memcmp(kr_seed_fx,kr_actual_fx,2) || memcmp(kr_seed_fx+24,kr_actual_fx+24,4) ||
+                      memcmp(kr_seed_fx+160,kr_actual_fx+160,256);
+    if(fpuBad)ok=false;
+    SerialPrintf("KREGISTER %s %s rsp=%lx expected=%lx inner=%lx flags=%lx arrivals=%lu frame_bad=%u fpu_bad=%u\n",
+        name,ok?"PASS":"FAIL",kr_actual[15],kr_expected_rsp,kr_inner_rsp,kr_actual[16],kr_arrivals,frameBad?1:0,fpuBad?1:0);
     return ok;
 }
+}
+
+void RegisterTestReschedArrival() {
+    auto* actor=__atomic_load_n(&owner,__ATOMIC_ACQUIRE);
+    if(!actor || actor!=ProcessCurrent() || selected!=4)return;
+    ++kr_ipi_events;
+    // One intentional ABI-legal vector clobber. More real wake IPIs may coalesce
+    // or arrive during the bounded loop; at least one must be observed.
+    if(!kr_arrivals)kr_clobber();
 }
 
 bool RegisterTestException(FullExceptionFrame* frame,uint64_t vector,uint64_t address) {
@@ -70,12 +85,15 @@ bool RegisterTestException(FullExceptionFrame* frame,uint64_t vector,uint64_t ad
 int64_t RegisterTestControl(uint64_t action,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) {
     auto* actor=ProcessCurrent();if(!actor || actor->euid!=0)return -1;
     if(action)return -22;
+    SchedulerKernelRegionEnter(actor);
     uint32_t expected=0;
-    if(!__atomic_compare_exchange_n(&busy,&expected,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return -16;
+    if(!__atomic_compare_exchange_n(&busy,&expected,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) {
+        SchedulerKernelRegionLeave(actor);return -16;
+    }
     uint64_t originalFlags;
     __asm__ volatile("pushfq; popq %0; cli":"=r"(originalFlags)::"memory");
     // No allocation, sleeping lock or asynchronous maskable delivery while the
-    // shared snapshots are live. The whole batch is four bounded local traps.
+    // shared snapshots are live, except the final bounded hardware-IPI loop.
     alignas(64) unsigned char saved[1152]{};
     __asm__ volatile("xsave64 %0":"=m"(saved):"a"(7),"d"(0):"memory");
     __atomic_store_n(&owner,actor,__ATOMIC_RELEASE);
@@ -84,10 +102,17 @@ int64_t RegisterTestControl(uint64_t action,uint64_t,uint64_t,uint64_t,uint64_t,
     Seed();selected=1;kr_probe_ud();passed+=Check("hardware-UD");
     Seed();selected=2;kr_seed[0]=0x7ff8;kr_probe_gp();passed+=Check("hardware-GP");
     Seed();selected=3;kr_seed[5]=badAddress;kr_probe_pf();passed+=Check("hardware-PF");
+    Seed();selected=4;kr_seed[2]=50000000;
+    ApicSendRescheduleIpi(ApicGetId());
+    kr_probe_ipi();kr_seed[2]=0;
+    if(!kr_ipi_events || (kr_ipi_return_flags&0xed7)!=0xed7)frameBad=true;
+    passed+=Check("hardware-resched-IPI");
+    SerialPrintf("KREGISTER IPI events=%lu live_return_flags=%lx\n",kr_ipi_events,kr_ipi_return_flags);
     __atomic_store_n(&owner,static_cast<Process*>(nullptr),__ATOMIC_RELEASE);selected=0;
     __asm__ volatile("xrstor64 %0"::"m"(saved),"a"(7),"d"(0):"memory");
     __atomic_store_n(&busy,0,__ATOMIC_RELEASE);
+    SchedulerKernelRegionLeave(actor);
     if(originalFlags&512)__asm__ volatile("sti":::"memory");
-    return passed==4?4:-5;
+    return passed==5?5:-5;
 }
 }

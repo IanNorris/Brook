@@ -140,13 +140,72 @@ return path, so the current partial audit cannot pass as full coverage.
 Fatal/nonreturning handlers, runtime IDT installation and external driver modules
 still need a separate inventory/contract audit.
 
-The production ELF passes nine supported stubs, with 39 rejected machine-byte
-mutations. The test ELF passes ten stubs and 43 mutations. Cases change CLD to
+The initial production ELF passed nine supported stubs, with 39 rejected machine-byte
+mutations. The initial test ELF passed ten stubs and 43 mutations. Cases change CLD to
 STD, a pop register, XSAVE bytes, a GS branch displacement and error-slot discard.
-Six paths remain unsupported: syscall dispatcher, timer, reschedule/TLB IPIs,
+Six paths were then unsupported: syscall dispatcher, timer, reschedule/TLB IPIs,
 fork-child trampoline and initial user-mode switch. Reports:
 `build/register-entry-static-production-20261017.json` and
 `build/register-entry-static-hooks-20261017.json`.
+
+### APIC follow-up and reschedule-IPI regression
+
+The audit now models the timer wrapper, including its interrupted RIP/CS/RBP
+offsets, validator call and final vector restore. The TLB IPI wrapper has no
+XSAVE; its entire compiled callee is checked as a bounded scalar leaf, with no
+calls, vector/FPU operations or branches outside local instruction boundaries.
+Mutation cases inject PXOR, a call, an escaping branch and a removed return into
+that actual callee. No transitive no-vector claim is inferred from compiler flags.
+
+The reschedule IPI calls the scheduler and ordinary C callees. A new test queues
+an actual self-IPI with IF clear, then enables interrupts for a bounded LOOP
+interval. An owned test-only callback deliberately clobbers ABI caller-saved
+GPRs and vector state once; an event counter verifies real IPI delivery. The
+snapshot checks exact RSP, guards, GPRs, FPU state and returned IF/DF/status flags.
+RCX intentionally becomes zero through LOOP. The kernel cancellation region
+protects scratch ownership across this asynchronous interval.
+
+The unchanged wrapper fails this test: exactly one IPI arrives, RSP/guards/GPRs
+and flags match, but `fpu_bad=1` and the client exits 1 (10/11). The VM remains
+healthy and completes checked shutdown and clean data/Nix/FAT checks. Baseline:
+`build/workloads/register-resched-baseline-hooks-20261017/kernel-run/`, session
+`5d677c2508c54175b144c21b0c57ade1`. The strengthened static audit also rejects its
+missing save/restore contract. This test does not identify the cause of any
+particular browser failure.
+
+The production fix saves/restores x87/SSE/AVX around reschedule-IPI C calls, using
+the same per-thread stack scheme as the timer. Interrupted CS is read through
+the saved GPR-frame base rather than the temporary XSAVE stack pointer. The
+root test batch now contains five cases, returning 5 on success; the client
+still reports 11/11 because it counts the kernel batch as one case.
+
+The NMI assembly now has ELF function type/size metadata, so it is explicitly
+inventoried. It was previously an untyped zero-size symbol, outside the decoded
+function inventory. Its multiple returning/terminal paths remain unsupported;
+this metadata change is not NMI/IST acceptance. Current production scope is
+twelve supported templates and four unsupported paths: syscall dispatcher,
+fork-child trampoline, initial user switch and the panic/epoch NMI handler.
+
+The fixed hook-enabled kernel passes all five kernel cases and the original ten
+user cases (client 11/11), with actual IPI events=1, exact RSP/flags and
+`fpu_bad=0`. UID 1000 is denied. Checked shutdown and all three disk checks pass.
+Evidence: `build/workloads/register-resched-fixed-hooks-20261017/kernel-run/`,
+session `325caf7674c449e6b96f03506d5ed0e0`.
+
+The production build disables both test hooks and passes the standard build
+gate and 31 hosted suites. Its twelve-template audit rejects 56 mutations;
+the test kernel covers thirteen templates and 60 mutations. Production guest
+checks pass register 10/10, copy 6/6 and file-fault 10/10. Firefox launches through
+`/nix/bin/brook-firefox` as UID 1000, renders the local fixture, confirms exactly
+one click and `IPI-state-restored` input through JavaScript window-title updates,
+and exits 0 with no remaining job descendants after guarded WM close. A
+boot-guarded 1920×1080 screenshot is retained in its acceptance directory. The
+VM returns to ten processes before checked shutdown and clean disk checks.
+Evidence: `build/workloads/register-resched-fixed-production-20261017/audit.json`,
+session `2f3281337f9547afb29ca8c5863f9ad3`; static report
+`build/register-resched-production-static-20261017.json`. Firefox audio, network
+sites and full bootstrap/workload acceptance were not renewed by this local
+interaction check.
 
 The audit led to explicit ELF sizes on full exception stubs and consistent live
 NT/DF/AC normalization before their IRET. Saved interrupted flags remain in the

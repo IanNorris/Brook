@@ -86,6 +86,41 @@ pop %rbp
 pop %rbx
 ret
 .size kr_probe_irq,.-kr_probe_irq
+.global kr_probe_ipi
+.type kr_probe_ipi,@function
+kr_probe_ipi:
+push %rbx
+push %rbp
+push %r12
+push %r13
+push %r14
+push %r15
+sub $32,%rsp
+movq $0x35792468,0(%rsp)
+movq $0x35792468,8(%rsp)
+movq $0x35792468,16(%rsp)
+movq $0x35792468,24(%rsp)
+mov %rsp,kr_expected_rsp(%rip)
+LOAD_STATE
+.global kr_ipi_instruction
+kr_ipi_instruction:
+sti
+1: loop 1b
+pushfq
+popq kr_ipi_return_flags(%rip)
+cli
+.global kr_ipi_resume
+kr_ipi_resume:
+SNAPSHOT
+add $32,%rsp
+pop %r15
+pop %r14
+pop %r13
+pop %r12
+pop %rbp
+pop %rbx
+ret
+.size kr_probe_ipi,.-kr_probe_ipi
 .global kr_probe_ud
 .type kr_probe_ud,@function
 kr_probe_ud:

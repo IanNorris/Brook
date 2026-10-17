@@ -469,6 +469,11 @@ ctest --test-dir build/release/host_tests --output-on-failure  # Host-native uni
 ./scripts/run-tests.sh release                                  # Bare-metal test ELFs in QEMU
 ```
 
+The build also runs a Capstone audit of supported compiled entry/return
+templates, with machine-code mutation checks. Its report lists unsupported
+paths separately. See [register and stack tests](docs/register-state-tests.md)
+for coverage, kernel-only probes and remaining gaps.
+
 ## Acknowledgements
 
 - [DOOM Generic](https://github.com/ozkl/doomgeneric) — portable DOOM engine

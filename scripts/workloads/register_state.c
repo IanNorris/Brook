@@ -102,7 +102,7 @@ int main(int argc,char** argv) {
     register_probe_timer();check("timer-exposure",register_flags,1);
     if(kernel||denied) {
         errno=0;long result=syscall(0xb31,0ul,0ul,0ul,0ul,0ul,0ul);
-        const int ok=kernel?result==4:(result==-1&&errno==EPERM);
+        const int ok=kernel?result==5:(result==-1&&errno==EPERM);
         ++total;passed+=ok;
         printf("REGISTER_CASE %s %s result=%ld errno=%d\n",kernel?"kernel-entry":"kernel-permission",ok?"PASS":"FAIL",result,errno);
     }

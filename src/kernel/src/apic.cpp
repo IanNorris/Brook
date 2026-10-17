@@ -2,6 +2,7 @@
 #include "idt.h"
 #include "gs_paranoid.h"
 #include "fpu_irq.h"
+#include "register_test.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "serial.h"
@@ -680,6 +681,7 @@ void ApicBroadcastNmi()
 // saved and swapgs handled properly.
 extern "C" void ReschedIpiHandlerInner(uint64_t interruptedCs)
 {
+    RegisterTestReschedArrival();
     LapicWrite(LapicReg::EOI, 0);
     // Only allow preemption when the IPI interrupted user mode (CPL 3).
     // Brook kernel code is not preemptible — it may hold internal locks
@@ -712,12 +714,17 @@ static void ReschedIpiHandler(void)
         // BRO-178: paranoid swapgs by actual GS base (ebx = did-swap flag).
         GS_PARANOID_ENTRY_EBX
 
-        // Extract interrupted CS from the interrupt frame.
-        // After 15 GPR pushes the interrupt frame CS is at RSP + 128.
-        "movq 128(%%rsp), %%rdi\n\t"    // arg1 = interrupted CS
+        // SchedulerTimerTick can call ordinary C code and context-switch.
+        // Keep interrupted x87/SSE/AVX state on this thread's kernel stack,
+        // just as in the timer wrapper; -mgeneral-regs-only is not transitive.
+        BROOK_FPU_SAVE_IRQ
+
+        "movq 128(%%r14), %%rdi\n\t"    // arg1 = interrupted CS
 
         "cld\n\t"
         "call ReschedIpiHandlerInner\n\t"
+
+        BROOK_FPU_RESTORE_IRQ
 
         // BRO-178: paranoid swapgs restore (ebx flag) before popping GPRs.
         GS_PARANOID_EXIT_EBX

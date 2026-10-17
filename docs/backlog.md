@@ -915,6 +915,16 @@ remain explicitly unsupported. Full-coverage mode must still fail. NMI/IST,
 hardware device delivery, nested/preempted entry windows, TLS and signal FPU
 state remain open; see `register-state-tests.md` for the supported contracts.
 
+The APIC follow-up reproduced vector-state loss across a real reschedule IPI
+with an ABI-legal test clobber. Its wrapper now saves/restores x87/SSE/AVX on
+the interrupted thread's stack. The identical five-case kernel batch passes;
+the baseline failed only the IPI FPU check. Static coverage now includes timer,
+reschedule and TLB paths (the latter proves its complete scalar leaf callee).
+The production audit passes twelve templates and 56 rejected mutations. NMI
+assembly has explicit ELF bounds and is now counted among four unsupported
+paths rather than being absent from the decoded inventory. Full coverage is
+still open.
+
 
 ## Current real-workload and desktop follow-ups (2026-10-16)
 
