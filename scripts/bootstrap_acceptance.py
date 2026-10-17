@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools/vm_bridge"))
 import server
 
-NATIVE_TEST_COUNT = 24
+NATIVE_TEST_COUNT = 25
 NATIVE_PASS_MARKER = f"100% tests passed, 0 tests failed out of {NATIVE_TEST_COUNT}"
 
 
@@ -105,11 +105,11 @@ def check_stopped_serial(data, directory):
         raise RuntimeError(f"Guest device/panic errors; see {directory / 'guest-final-serial.log'}")
 
 
-def launch(directory, instance, artifacts=None, cpus=8, memory="8G"):
+def launch(directory, instance, artifacts=None, cpus=8, memory="8G", gpu="0", composite="cpu"):
     env = dict(os.environ, BROOK_EXPERIMENT_RUN=str(directory),
                BROOK_EXPERIMENT_DISKS=str(directory), BROOK_DISK_IMG=str(directory / "boot.img"),
                BROOK_VM_BRIDGE="1", BROOK_VM_PROVENANCE="agent", BROOK_SMP=str(cpus), BROOK_MEMORY=memory,
-               BROOK_AUDIODEV="none", BROOK_GPU="0", BROOK_COMPOSITE="cpu",
+               BROOK_AUDIODEV="none", BROOK_GPU=gpu, BROOK_COMPOSITE=composite,
                BROOK_EXPERIMENT_DISPLAY="headless", BROOK_EXPERIMENT_TIMEOUT="14400",
                BROOK_INSTANCE=str(instance))
     temporary = directory / "tmp-host"
@@ -138,7 +138,14 @@ def launch(directory, instance, artifacts=None, cpus=8, memory="8G"):
         if matches:
             session = matches[-1]
             data = server.load_session(session)
-            if "DEBUG_TCP: listening on port 1234" in Path(data["serial_log"]).read_text(errors="replace"):
+            # Registry publication precedes QEMU opening its serial log. Missing
+            # output at this point means not ready yet, not a failed VM boot.
+            try:
+                serial_text = Path(data["serial_log"]).read_text(errors="replace")
+            except FileNotFoundError:
+                time.sleep(1)
+                continue
+            if "DEBUG_TCP: listening on port 1234" in serial_text:
                 try:
                     server.guest(data, "uptime", timeout=5)
                     return process, session, data, time.monotonic() - started

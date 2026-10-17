@@ -809,3 +809,20 @@ Stage the ignored binary on a disposable VM disk while stopped, then run
 `FATALGROUPCHECK PASS rounds=4 cases=48 failures=0`, no remaining test tasks,
 heap integrity OK and no kernel ownership warnings. Follow with checked guest
 shutdown and offline filesystem checks. The same binary is a Linux control.
+
+
+`cursorcheck.c` is Brook-only: it uses custom syscall 519, so do not run it as
+a Linux control. It checks invalid dimensions, null/protected source memory,
+an unaligned 16 KiB image across five mappings, and 500 uploads racing 200
+unmap/remap cycles. Expect `CURSORCHECK PASS ... failures=0`; both accepted and
+EFAULT results are valid during the race. `show` publishes a small teal cursor
+with a nonzero hotspot; `reset` restores the default arrow. Use these modes
+while launching an app to inspect busy-badge preservation and reset.
+
+```sh
+nix-shell --run '"$MUSL_CC" -O2 -Wall -Wextra -Werror -static -pthread tools/at-syscall-probe/cursorcheck.c -o build/io-bench/cursorcheck'
+```
+
+Stage the ignored executable only on a stopped disposable VM disk. Run the
+probe through `vm_guest_run`, inspect its completion marker and kernel logs,
+then use checked shutdown and offline filesystem checks.

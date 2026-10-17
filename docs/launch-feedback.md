@@ -66,8 +66,8 @@ These are bounded correctness checks, not a startup-performance benchmark.
 
 ## Remaining work
 
-- Animated cursor feedback is not connected; animation currently lives in the
-  taskbar placeholder. Display scaling remains open.
+- Display scaling remains open. Busy cursor feedback was added in the follow-up
+  described below.
 - Older custom Wayland shortcuts need accurate app ID/executable metadata when
   not replaced by an installed desktop entry. Unknown IDs retain the pending
   entry until process exit or timeout. This is not complete launch correlation
@@ -76,3 +76,57 @@ These are bounded correctness checks, not a startup-performance benchmark.
   capacity and timeout are currently covered by hosted state tests.
 - The native terminal toolbar button still creates its terminal directly;
   the worker change applies to launcher entries.
+
+
+## Busy cursor follow-up
+
+Pending launches now add an animated badge beside the existing cursor. The
+client-provided pixels and hotspot remain the base image; the compositor takes
+one synchronized snapshot and composes into a separate frame used by both CPU
+drawing and GPU upload. Removing the badge restores the original cursor.
+
+![Native-size custom cursor with busy badge](images/brook_busy_cursor.png)
+
+Cursor uploads stage at most 16 KiB into kernel memory before taking the cursor
+publication lock. Lazy pages are populated first; each read is then revalidated
+under the address-space mutation lock so concurrent unmap/protect cannot retire
+the source while it is copied. Source memory is never read under the cursor
+spinlock. Publication is protected against fatal cancellation, including reset.
+
+All 25 hosted suites pass. The shared composition suite verifies base pixels,
+alpha and hotspot preservation, animation phases, restoration and 64×64 bounds.
+The Brook-only `cursorcheck.c` guest probe covers invalid dimensions, null and
+protected memory, an unaligned 16 KiB upload spanning five distinct mappings,
+and 500 uploads racing 200 unmap/remap cycles. It also provides bounded `show`
+and `reset` modes for live composition checks.
+
+The initial CPU session `7708742c715b48c1860f38f39db9cef9` passed with 2 accepted
+and 498 safely rejected racing uploads. Custom and default cursor busy badges
+were visible; reset during startup preserved the badge. After startup ended the
+badge disappeared, with 10 tasks remaining. Checked shutdown and all three disk
+checks passed.
+
+Initial GPU session `08d9d0c433034b1ab8c868f47131af52` confirmed GPU DRAW composition
+active on the host render node and passed with 7 accepted and 493 rejected racing
+uploads. It verified custom cursor/reset while busy, edge movement and Mousepad
+launch/close. The screenshot above is from this session. Checked shutdown and
+all three disk checks passed. Its last 12-task sample included maintenance
+processes and is not a post-cleanup baseline measurement.
+
+Local evidence is under `build/workloads/busy-cursor-20261017/`. Cursor tests do
+not establish arbitrary syscall user-buffer safety elsewhere in the kernel.
+
+The final cancellation-protected candidate was rerun as GPU session
+`d10ec83733fd42518f99569522c6f3db`, kernel SHA-256
+`855b0d0d22af04b3658cdf04febd571e37eb1c0f1e495a1349fa44800ac73c65`.
+The probe passed with 10 accepted and 490 rejected racing uploads, zero
+failures; the final sample after fixture removal returned to 10 tasks and
+212,443,136 physical bytes used. Checked shutdown and all three filesystem
+checks passed. The earlier visual CPU/GPU checks use the same composition code;
+the final change additionally protects publication/reset from fatal cancellation.
+
+This last boot exposed a host readiness race: session registration can precede
+creation of the serial log. The helper now waits for that file instead of
+aborting. The already-running VM was reattached and tested, not restarted.
+The launch helper also accepts explicit GPU/composition parameters for these
+parity checks; its bootstrap defaults remain CPU rendering.

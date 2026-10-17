@@ -1,4 +1,6 @@
 #include "compositor.h"
+#include "cursor_composition.h"
+#include "spinlock.h"
 #include "memory/mapping_fault_test.h"
 #include "process.h"
 #include "scheduler.h"
@@ -1086,37 +1088,40 @@ static const uint8_t g_cursorBitmapBuiltin[16][12] = {
     {0,0,0,0,0,2,2,2,2,0,0,0},
 };
 
-static constexpr uint32_t CURSOR_MAX = 64;
-// Active cursor state
-static uint32_t g_cursorW = 12;
-static uint32_t g_cursorH = 16;
-static int32_t  g_cursorHotX = 0;
-static int32_t  g_cursorHotY = 0;
-static bool     g_cursorCustom = false;
-static uint32_t g_cursorPixels[CURSOR_MAX * CURSOR_MAX]; // ARGB8888 custom cursor
+static constexpr uint32_t CURSOR_MAX = CursorCapacity;
+// Client updates publish only the base image. The compositor takes one bounded
+// copy per frame; both CPU save/restore and GPU upload use that same image.
+static SpinLock g_cursorSourceLock;
+static CursorImage g_cursorSource;
+static CursorImage g_cursorFrame;
+static bool g_cursorSourceReady = false;
 
 // Saved pixels under the cursor (for restore before re-blit)
 static uint32_t g_cursorSave[CURSOR_MAX * CURSOR_MAX];
 static int32_t  g_cursorSaveX = -1;
 static int32_t  g_cursorSaveY = -1;
 
-// Populate g_cursorPixels (stride CURSOR_MAX) from the built-in arrow bitmap as
-// opaque ARGB: 1=white, 2=black, 0=transparent. The GPU path uploads
-// g_cursorPixels as the cursor texture, so without this the default cursor is
-// all-zero (fully transparent) and therefore invisible on the GPU compositor.
-// Idempotent; cheap enough to call on init and whenever the cursor is reset.
+// Caller holds g_cursorSourceLock.
 static void CursorLoadBuiltinPixels()
 {
-    for (uint32_t i = 0; i < CURSOR_MAX * CURSOR_MAX; ++i) g_cursorPixels[i] = 0;
+    g_cursorSource.width = 12;
+    g_cursorSource.height = 16;
+    g_cursorSource.hotX = g_cursorSource.hotY = 0;
+    for (uint32_t i = 0; i < CURSOR_MAX * CURSOR_MAX; ++i) g_cursorSource.pixels[i] = 0;
     for (uint32_t row = 0; row < 16; ++row)
-        for (uint32_t col = 0; col < 12; ++col)
-        {
+        for (uint32_t col = 0; col < 12; ++col) {
             uint8_t px = g_cursorBitmapBuiltin[row][col];
-            uint32_t argb = (px == 1) ? 0xFFFFFFFFu       // white fill
-                          : (px == 2) ? 0xFF000000u       // black outline
-                                      : 0x00000000u;      // transparent
-            g_cursorPixels[row * CURSOR_MAX + col] = argb;
+            g_cursorSource.pixels[row * CURSOR_MAX + col] = px == 1 ? 0xffffffffu : px == 2 ? 0xff000000u : 0;
         }
+    g_cursorSourceReady = true;
+}
+
+static void CursorPrepareFrame(bool busy, uint64_t now)
+{
+    SpinLockAcquire(&g_cursorSourceLock);
+    if (!g_cursorSourceReady) CursorLoadBuiltinPixels();
+    ComposeCursor(g_cursorSource, g_cursorFrame, busy, now, WmCurrentPalette().borderActive);
+    SpinLockRelease(&g_cursorSourceLock);
 }
 static int32_t  g_cursorSaveW = 0;
 static int32_t  g_cursorSaveH = 0;
@@ -1126,7 +1131,7 @@ static void CursorSaveUnder(int32_t cx, int32_t cy)
 {
     uint32_t* buf = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     uint32_t  stride = g_backBuffer ? g_backBufStride : g_physFbStride;
-    uint32_t cw = g_cursorW, ch = g_cursorH;
+    uint32_t cw = g_cursorFrame.width, ch = g_cursorFrame.height;
     for (uint32_t row = 0; row < ch; row++)
     {
         int32_t sy = cy + static_cast<int32_t>(row);
@@ -1171,16 +1176,16 @@ static void CursorRestore()
 static void CursorDraw(int32_t mx, int32_t my)
 {
     // Apply hotspot offset
-    int32_t cx = mx - g_cursorHotX;
-    int32_t cy = my - g_cursorHotY;
+    int32_t cx = mx - g_cursorFrame.hotX;
+    int32_t cy = my - g_cursorFrame.hotY;
 
     CursorSaveUnder(cx, cy);
     uint32_t* buf = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     uint32_t  stride = g_backBuffer ? g_backBufStride : g_physFbStride;
-    uint32_t cw = g_cursorW, ch = g_cursorH;
+    uint32_t cw = g_cursorFrame.width, ch = g_cursorFrame.height;
 
-    if (g_cursorCustom) {
-        // Custom ARGB8888 cursor with alpha blending
+    {
+        // The base cursor and busy badge share one ARGB frame.
         for (uint32_t row = 0; row < ch; row++)
         {
             int32_t sy = cy + static_cast<int32_t>(row);
@@ -1189,7 +1194,7 @@ static void CursorDraw(int32_t mx, int32_t my)
             {
                 int32_t sx = cx + static_cast<int32_t>(col);
                 if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
-                uint32_t src = g_cursorPixels[row * CURSOR_MAX + col];
+                uint32_t src = g_cursorFrame.pixels[row * CURSOR_MAX + col];
                 uint32_t alpha = (src >> 24) & 0xFF;
                 if (alpha == 0) continue;
                 if (alpha == 255) {
@@ -1204,53 +1209,30 @@ static void CursorDraw(int32_t mx, int32_t my)
                 }
             }
         }
-    } else {
-        // Built-in arrow bitmap
-        for (uint32_t row = 0; row < ch; row++)
-        {
-            int32_t sy = cy + static_cast<int32_t>(row);
-            if (sy < 0 || static_cast<uint32_t>(sy) >= g_physFbHeight) continue;
-            for (uint32_t col = 0; col < cw; col++)
-            {
-                uint8_t px = g_cursorBitmapBuiltin[row][col];
-                if (px == 0) continue;
-                int32_t sx = cx + static_cast<int32_t>(col);
-                if (sx < 0 || static_cast<uint32_t>(sx) >= g_physFbWidth) continue;
-                buf[sy * stride + sx] = (px == 1) ? 0x00FFFFFF : 0x00000000;
-            }
-        }
     }
 }
 
 bool CompositorSetCursorImage(const uint32_t* pixels, uint32_t w, uint32_t h,
-                                     int32_t hotX, int32_t hotY)
+                              int32_t hotX, int32_t hotY)
 {
-    if (w == 0 || h == 0) {
-        // Reset to built-in cursor
-        g_cursorCustom = false;
-        g_cursorW = 12;
-        g_cursorH = 16;
-        g_cursorHotX = 0;
-        g_cursorHotY = 0;
-        CursorLoadBuiltinPixels();   // refresh the GPU cursor texture source
-        return true;
+    if (w > CURSOR_MAX || h > CURSOR_MAX || (w && h && !pixels)) return false;
+    Process* self = ProcessCurrent();
+    if (self) SchedulerKernelRegionEnter(self);
+    SpinLockAcquire(&g_cursorSourceLock);
+    if (w == 0 || h == 0) CursorLoadBuiltinPixels();
+    else {
+        for (uint32_t row = 0; row < CURSOR_MAX; ++row)
+            for (uint32_t col = 0; col < CURSOR_MAX; ++col)
+                g_cursorSource.pixels[row * CURSOR_MAX + col] =
+                    row < h && col < w ? pixels[row * w + col] : 0;
+        g_cursorSource.width = w;
+        g_cursorSource.height = h;
+        g_cursorSource.hotX = hotX;
+        g_cursorSource.hotY = hotY;
+        g_cursorSourceReady = true;
     }
-    if (w > CURSOR_MAX || h > CURSOR_MAX) return false;
-
-    // Copy pixels into kernel buffer at stride CURSOR_MAX so the layout matches
-    // the CURSOR_MAX-wide GPU cursor texture (UpdateTexture reads the source at
-    // the texture's full width) and the CPU blit path, which both index at
-    // stride CURSOR_MAX.
-    for (uint32_t row = 0; row < CURSOR_MAX; row++)
-        for (uint32_t col = 0; col < CURSOR_MAX; col++)
-            g_cursorPixels[row * CURSOR_MAX + col] =
-                (row < h && col < w) ? pixels[row * w + col] : 0;
-
-    g_cursorW = w;
-    g_cursorH = h;
-    g_cursorHotX = hotX;
-    g_cursorHotY = hotY;
-    g_cursorCustom = true;
+    SpinLockRelease(&g_cursorSourceLock);
+    if (self) SchedulerKernelRegionLeave(self);
     return true;
 }
 
@@ -1767,11 +1749,7 @@ static void CompositorInputWM()
                     __atomic_store_n(&g_defaultCursorVisible, 1u, __ATOMIC_RELEASE);
                     // Also reset to built-in arrow in case a custom cursor
                     // was set by the previous Wayland client.
-                    g_cursorCustom = false;
-                    g_cursorW = 12;
-                    g_cursorH = 16;
-                    g_cursorHotX = 0;
-                    g_cursorHotY = 0;
+                    CompositorSetCursorImage(nullptr, 0, 0, 0, 0);
                 }
             }
             continue;
@@ -2767,18 +2745,14 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         else useOverlayLayer = false;
     }
 
-    // 2. Cursor sprite (ARGB, alpha-blended). The built-in arrow lives in
-    // g_cursorBitmapBuiltin; convert it into g_cursorPixels (the texture source)
-    // once, before first upload, so the default cursor is visible on the GPU
-    // path (a custom cursor populates g_cursorPixels itself).
+    // 2. Cursor sprite: upload the same composed frame used by CPU drawing.
     if (!g_cursorTex)
     {
-        if (!g_cursorCustom) CursorLoadBuiltinPixels();
         g_cursorTex = gpu->CreateTexture(CURSOR_MAX, CURSOR_MAX,
-                                         reinterpret_cast<uint64_t>(g_cursorPixels), true);
+                                         reinterpret_cast<uint64_t>(g_cursorFrame.pixels), true);
     }
     if (g_cursorTex)
-        gpu->UpdateTexture(g_cursorTex, 0, 0, g_cursorW, g_cursorH);
+        gpu->UpdateTexture(g_cursorTex, 0, 0, g_cursorFrame.width, g_cursorFrame.height);
 
     int sorted[WM_MAX_WINDOWS];
     uint32_t wcount = WmGetZOrder(sorted, WM_MAX_WINDOWS);
@@ -2920,13 +2894,13 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     {
         int32_t mx = 0, my = 0;
         MouseGetPosition(&mx, &my);
-        int cx = mx - g_cursorHotX, cy = my - g_cursorHotY;
+        int cx = mx - g_cursorFrame.hotX, cy = my - g_cursorFrame.hotY;
         // Crop the SOURCE rect (cursor-texture space) when the sprite straddles a
         // screen edge. Clamping only the destination (as before) left the source
         // at (0,0,W,H), so at the left/top edges the pointer was squashed/shifted
         // instead of cleanly clipped.
         int sx = 0, sy = 0;
-        int sw = (int)g_cursorW, sh = (int)g_cursorH;
+        int sw = (int)g_cursorFrame.width, sh = (int)g_cursorFrame.height;
         int dx = cx, dy = cy;
         if (dx < 0) { sx = -dx; sw += dx; dx = 0; }
         if (dy < 0) { sy = -dy; sh += dy; dy = 0; }
@@ -2975,10 +2949,14 @@ static void CompositorLoop()
         MarkDirtyRows(oldMinY, oldMaxY);
     }
 
+    // Restore used the old frame's saved bounds. Publish the complete next
+    // cursor frame before either CPU drawing or GPU upload begins.
+    if (WmIsActive()) WmLaunchFeedbackPoll();
+    CursorPrepareFrame(WmIsActive() && WmLaunchBusy(), loopStartTick);
+
     // Branch: WM mode vs legacy mode
     if (WmIsActive())
     {
-        WmLaunchFeedbackPoll();
         CompositorLoopWM();
     }
     else
@@ -3064,9 +3042,9 @@ static void CompositorLoop()
         int32_t mx, my;
         MouseGetPosition(&mx, &my);
         // CursorDraw applies hotspot internally; dirty region needs hotspot-adjusted coords
-        int32_t drawY = my - g_cursorHotY;
+        int32_t drawY = my - g_cursorFrame.hotY;
         uint32_t newMinY = (drawY >= 0) ? static_cast<uint32_t>(drawY) : 0;
-        uint32_t newMaxY = static_cast<uint32_t>(drawY) + g_cursorH;
+        uint32_t newMaxY = static_cast<uint32_t>(drawY) + g_cursorFrame.height;
         if (newMaxY > g_physFbHeight) newMaxY = g_physFbHeight;
         MarkDirtyRows(newMinY, newMaxY);
         CursorDraw(mx, my);

@@ -80,7 +80,7 @@ the table distinguishes tested behavior from remaining limitations.
   including long pause/resume and seeking, without an autoplay workaround.
   Connected Unix socket shutdown, anonymous memory discard and descriptor
   capacity fixes support these workloads. See [workload validation](docs/workloads.md)
-  for tested configurations and remaining limits. All 24 hosted test suites pass.
+  for tested configurations and remaining limits. All 25 hosted test suites pass.
 
 - **Desktop identity and package registration:** new apps and Terminal run as
   `brook` by default, with persistent `/data/home`. The installer preserves
@@ -92,8 +92,8 @@ the table distinguishes tested behavior from remaining limitations.
 - **Desktop appearance:** application icons in window chrome, an icon taskbar,
   and a launcher that updates after package installation/removal. Settings
   previews and saves three desktop themes, and uses Brook's native titlebar.
-  Launcher loading now runs on a worker, with animated pending taskbar entries
-  and visible failure notices. See [desktop settings](docs/desktop-settings.md)
+  Launcher loading now runs on a worker, with animated pending taskbar entries,
+  a busy cursor badge and visible failure notices. See [desktop settings](docs/desktop-settings.md)
   and [launch feedback](docs/launch-feedback.md).
 - **VM control bridge:** VM-only screenshots and input, guest command launches,
   logs, CPU/context-switch profiles, OS statistics, silent-output PCM capture,

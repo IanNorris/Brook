@@ -11232,12 +11232,46 @@ static int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
         return 0;
     }
     if (w > 64 || h > 64) return -EINVAL;
-    uint64_t byteSize = w * h * 4;
+    if (h == 0) {
+        brook::CompositorSetCursorImage(nullptr, 0, 0, 0, 0);
+        return 0;
+    }
+    Process* proc = ProcessCurrent();
+    if (!proc || !proc->addressSpace) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    const uint64_t byteSize = w * h * 4;
+    // Populate lazy pages before acquiring the AS lock. Validation alone is
+    // not a lifetime pin: a sibling may unmap/protect the buffer immediately.
     if (!UserBufferReadable(pixelsAddr, byteSize)) return -EFAULT;
-    return brook::CompositorSetCursorImage(
-        reinterpret_cast<const uint32_t*>(pixelsAddr),
-        static_cast<uint32_t>(w), static_cast<uint32_t>(h),
-        static_cast<int32_t>(hotX), static_cast<int32_t>(hotY)) ? 0 : -EINVAL;
+    auto* staged = static_cast<uint8_t*>(kmalloc(byteSize));
+    if (!staged) return -ENOMEM;
+    int64_t result = 0;
+    {
+        MappingTransaction lifetime(proc, proc->addressSpace);
+        // Read-only resident copy: mutation serializes leaf retirement,
+        // protection changes and file invalidation. No backing escapes this lock.
+        KMutexLock(&proc->addressSpace->mutation);
+        uint64_t offset = 0;
+        while (!result && offset < byteSize) {
+            const uint64_t address = pixelsAddr + offset;
+            const auto* range = MappingRangeFind(proc->addressSpace->ranges, address);
+            if (!range || !(range->protection & 1)) { result = -EFAULT; break; }
+            const uint64_t leaf = VmmReadLeaf(proc->addressSpace->pageTable, VirtualAddress(address));
+            if ((leaf & (VMM_PRESENT | VMM_USER)) != (VMM_PRESENT | VMM_USER)) { result = -EFAULT; break; }
+            uint64_t chunk = 4096 - (address & 4095);
+            if (chunk > byteSize - offset) chunk = byteSize - offset;
+            if (chunk > range->end - address) chunk = range->end - address;
+            memcpy(staged + offset, reinterpret_cast<const void*>(address), chunk);
+            offset += chunk;
+        }
+        KMutexUnlock(&proc->addressSpace->mutation);
+    }
+    // Cursor publication reads kernel memory only, after releasing the AS lock.
+    if (!result && !brook::CompositorSetCursorImage(reinterpret_cast<const uint32_t*>(staged),
+            static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+            static_cast<int32_t>(hotX), static_cast<int32_t>(hotY))) result = -EINVAL;
+    kfree(staged);
+    return result;
 }
 
 // 520: WM_GET_SCREEN_INFO(out_ptr) — return screen width and height
