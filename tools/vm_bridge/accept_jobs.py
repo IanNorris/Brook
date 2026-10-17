@@ -59,7 +59,7 @@ def main():
     assert repeated['operation_id']==once['result']['operation_id']
     # Explicit replay against the guest, not just the host cache.
     with server.session_lock(args.session) as data:
-        replay=server.guest(data,'bridge job commit '+once['request']['request_id'])
+        replay=server.guest(data,'bridge job commit '+once['request']['request_id']+' '+once['result']['guest_boot_id'])
     assert replay['state']=='completed'
     read=run('dedup-read','while IFS= read -r line; do printf "%s\\n" "$line"; done < "$1"; rm -f "$1"',(path,))
     assert read['result']['stdout']['text']=='once\n'

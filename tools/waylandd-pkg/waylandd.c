@@ -51,6 +51,7 @@
 #define BROOK_SYS_WM_SIGNAL_DIRTY    508
 #define BROOK_SYS_WM_SET_TITLE       509
 #define BROOK_SYS_WM_SET_APP_ID      0xB01
+#define BROOK_SYS_WM_SET_CLIENT_SOCKET 0xB05
 #define BROOK_SYS_WM_POP_INPUT       510
 #define BROOK_SYS_WM_RESIZE_VFB      511
 #define BROOK_SYS_WM_SET_DECORATION_MODE 512
@@ -127,6 +128,12 @@ static long wm_set_title(uint32_t id, const char* title) {
 }
 static long wm_set_app_id(uint32_t id, const char* app_id) {
     return syscall(BROOK_SYS_WM_SET_APP_ID, (long)id, (long)app_id);
+}
+static void wm_register_client(uint32_t id, struct wl_resource* surface) {
+    struct wl_client* client=wl_resource_get_client(surface);
+    int fd=wl_client_get_fd(client);
+    if (syscall(BROOK_SYS_WM_SET_CLIENT_SOCKET,(long)id,(long)fd)<0)
+        fprintf(stderr,"[waylandd] client-origin registration wm=%u failed: %s\n",id,strerror(errno));
 }
 static long wm_pop_input(uint32_t id, struct brook_wm_event* buf, long max) {
     return syscall(BROOK_SYS_WM_POP_INPUT, (long)id, (long)buf, max);
@@ -497,6 +504,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                                            create_flags, &out);
                 if (rc == 0 && out.wm_id) {
                     s->wm_id      = out.wm_id;
+                    wm_register_client(s->wm_id,s->resource);
                     if (s->app_id[0]) wm_set_app_id(s->wm_id, s->app_id);
                     s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
                     s->vfb_stride = out.vfb_stride;
@@ -643,6 +651,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                                        &out);
             if (rc == 0 && out.wm_id) {
                 s->wm_id      = out.wm_id;
+                wm_register_client(s->wm_id,s->resource);
                 if (s->app_id[0]) wm_set_app_id(s->wm_id, s->app_id);
                 s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
                 s->vfb_stride = out.vfb_stride;

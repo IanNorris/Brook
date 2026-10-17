@@ -1,4 +1,5 @@
 #include "debug_jobs.h"
+#include "debug_epoch.h"
 #include "debug_job_wire.h"
 #include "process.h"
 #include "scheduler.h"
@@ -160,8 +161,10 @@ bool DebugJobHandleCommand(const char* command) {
     }
     if(*at || !count) {Error("Invalid fields");return true;}
     if(count==1 && !strcmp(args[0],"caps")) {
-        Send("{\"job_api\":1,\"max_request_bytes\":32768,\"max_jobs\":256,\"max_active\":8,\"retained_stream_bytes\":65536,\"dedup_retention\":\"until_reboot\",\"stdin\":\"null\",\"auto_window\":false}\n");return true;
+        char boot[33];DebugEpochCopy(boot);Send("{\"boot_id\":\"");Send(boot);Send("\",\"job_api\":2,\"max_request_bytes\":32768,\"max_jobs\":256,\"max_active\":8,\"retained_stream_bytes\":65536,\"dedup_retention\":\"until_reboot\",\"stdin\":\"null\",\"auto_window\":false}\n");return true;
     }
+    if(count<3 || !DebugEpochMatches(args[count-1])) {Error("Stale guest boot");return true;}
+    --count; // All operation reads and writes carry the expected boot epoch.
     if(count<2 || !Id(args[1])) {Error("Invalid job ID");return true;}
     Job* job=nullptr;Job* free=nullptr;uint32_t active=0;
     for(uint32_t i=0;i<MaxJobs;++i) {

@@ -35,6 +35,19 @@ Changed arguments need a fresh request ID. Stop/reset invalidates active jobs;
 retrieve useful output before shutdown. A cancelled wait leaves the job running.
 These jobs do not exercise launcher UI or add automatic framebuffer windows.
 
+Prefer vm_windows and vm_window for semantic UI control. Pass the exact returned
+window reference, action and fresh request_id; restore also requires an explicit
+restore_target (previous, normal or maximized). Each action returns window state.
+Use vm_ui to recover an uncertain result; never repeat a mutation with a new ID
+just because its reply was lost. Check wait_condition_met, observation_error and
+current_window. Close dispatch is separate from disappearance and exact client
+origin-group exit; select wait_for closed or client_group_exit when needed.
+A Wayland provider is shared; connection-origin metadata is not permission to
+signal it. Unknown ownership stays unknown. Host generation, guest boot epoch
+and window incarnation must all match. Takeover cancels queued UI work but cannot
+recall already-dispatched events. Actual UI launcher activation is still pending;
+command jobs are a different execution path.
+
 The legacy command form still uses Brook syntax, e.g. run --uid 1000 /nix/profile/bin/brook-run
 /nix/bin/brook-player --autoexit /data/videos/big-buck-bunny-720p.mov (one line).
 That form returns a PID, not process exit status or isolated stdout/stderr.

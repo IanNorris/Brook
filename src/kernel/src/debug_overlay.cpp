@@ -388,6 +388,8 @@ static void DebugTcpThread(void* /*arg*/)
         char lineBuf[TCP_BATCH][TCP_LINE_LEN + 1];
         char cmdBuf[256];
         int  cmdLen = 0;
+        bool framedClient=false,classifiedClient=false;
+        const uint64_t classifyDeadline=g_lapicTickCount+50;
 
         for (;;)
         {
@@ -399,9 +401,13 @@ static void DebugTcpThread(void* /*arg*/)
                 // Accumulate into cmdBuf, dispatch on newline
                 for (int i = 0; i < n; i++) {
                     char c = tmp[i];
+                    if(!classifiedClient && c!='\n' && c!='\r') {
+                        classifiedClient=true;framedClient=c=='@';
+                    }
                     if (c == '\n' || c == '\r') {
                         if (cmdLen > 0) {
                             cmdBuf[cmdLen] = '\0';
+                            if(cmdBuf[0]=='@')framedClient=true;
                             DebugChannelSetReplySock(clientSock);
                             DebugHandleCommand(cmdBuf, static_cast<uint32_t>(cmdLen));
                             DebugChannelClearReplySock();
@@ -411,6 +417,14 @@ static void DebugTcpThread(void* /*arg*/)
                         cmdBuf[cmdLen++] = c;
                     }
                 }
+            }
+
+            // Framed bridge RPCs carry their own replies and read serial logs
+            // separately. Replaying the entire log ring after each short RPC
+            // delays FIN handling/accept and can fill the pending TCP queue.
+            if(framedClient || (!classifiedClient && g_lapicTickCount<classifyDeadline)) {
+                SchedulerSleepMs(2);
+                continue;
             }
 
             // --- Stream log lines ---

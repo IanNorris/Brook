@@ -55,12 +55,17 @@ enum class WindowState : uint8_t
     Normal,
     Maximized,
 };
+enum class WmClientOrigin : uint8_t { Unknown, NativeProcess, RegisteredUnixPeer };
 
 struct Window
 {
     const DesktopMetrics* metrics; // Immutable decoration geometry for this window.
     uint64_t    creationIdentity; // Monotonic identity across reused window slots.
     Process*    proc;           // owning process (nullptr = unused slot)
+    uint16_t    clientPid;      // Connection-origin TGID; never signal authority.
+    uint64_t    clientIncarnation;
+    uint64_t    clientLaunchId;
+    WmClientOrigin clientOrigin;
     int16_t     x, y;           // window position (outer top-left, including chrome)
     uint16_t    clientW;        // client area width (= VFB width * upscale)
     uint16_t    clientH;        // client area height (= VFB height * upscale)
@@ -83,6 +88,7 @@ struct Window
     // mapped user-readable into `proc`'s address space at `vfbUser`.
     uint32_t*   vfb;            // kernel-virtual pointer (for blit reads)
     uint32_t    vfbStride;      // pixels per row (== clientW today)
+    uint32_t    vfbWidth,vfbHeight; // Actual allocated extent, independent of requested geometry.
     uint64_t    vfbBytes;       // total allocation size (page-aligned)
     void*       vfbUser;        // user-space address in vfbAddressSpace
     AddressSpaceState* vfbAddressSpace; // retained original mapping identity
@@ -212,6 +218,25 @@ void WmMinimizeWindow(int idx);
 
 // Restore a minimized window.
 void WmRestoreWindow(int idx);
+// Same cooperative close path for chrome, keyboard and semantic controls.
+bool WmRequestCloseWindow(int idx);
+
+struct WmDebugWindow {
+    uint32_t id,providerPid,clientPid;
+    uint64_t incarnation,providerIncarnation,clientIncarnation,launchId;
+    WmClientOrigin clientOrigin;
+    int32_t x,y;uint32_t width,height,outerWidth,outerHeight,bufferWidth,bufferHeight;
+    bool visible,minimized,maximized,focused,focusable,apiWindow,providerKernel;
+    char title[64],appId[128];
+};
+enum class WmDebugAction : uint32_t { Focus,Minimize,Maximize,Restore,Close };
+// Registry-backed owner reference; caller must ProcessUnref after cleanup.
+Process* WmReferenceTerminatedOwner();
+// Value-only snapshots; no raw Window/Process pointers escape this API.
+uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t capacity,uint64_t* tick);
+// Compositor context only. restoreTarget: 0 previous, 1 normal, 2 maximized.
+int WmApplyDebugAction(uint32_t id,uint64_t incarnation,WmDebugAction action,
+                      uint32_t restoreTarget,WmDebugWindow* result,uint32_t* closeMethod);
 
 // Toggle CSD (client-side decoration) mode for a window.  When enabled the
 // kernel WM stops drawing chrome and treats the whole outer area as client.
@@ -351,7 +376,11 @@ static constexpr uint8_t WM_EVT_FOCUS_LOST      = 0x82;
 static constexpr uint8_t WM_EVT_RESIZED         = 0x83; // x=newW, y=newH
 
 // Push a synthetic WM event into the per-window queue.  Drops on overflow.
-void WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);
+bool WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);
+// Kernel-authenticated socket origin, associated by the provider. Immutable
+// after the first registration, and only for a window owned by that provider.
+bool WmRegisterClientOrigin(Process* provider,uint32_t wmId,uint16_t clientPid,
+                            uint64_t incarnation,uint64_t launchId);
 
 // ---------------------------------------------------------------------------
 // App Launcher

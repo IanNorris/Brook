@@ -94,6 +94,8 @@ void TerminalRestoreAfterExec(Process* proc);
 
 // Shut down a terminal: kill child, stop thread, clean up.
 void TerminalClose(Terminal* t);
+// Atomic exact child lookup and cleanup; no reusable Terminal pointer escapes.
+bool TerminalCloseForProcess(Process* owner);
 
 // Resize a terminal's VFB and update character dimensions.
 // Sends SIGWINCH to the child process.

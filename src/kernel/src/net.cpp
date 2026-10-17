@@ -29,6 +29,8 @@
 #include "shell.h"
 #include "compositor.h"
 #include "debug_jobs.h"
+#include "debug_epoch.h"
+#include "debug_ui.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -3371,7 +3373,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         marker[p++]='\n';marker[p]=0;DebugChannelSend(marker);
         return;
     }
+    if (DebugEpochHandleCommand(cmd)) return;
     if (DebugJobHandleCommand(cmd)) return;
+    if (DebugUiHandleCommand(cmd)) return;
     if (NetStrEq(cmd, "bridge sync")) {
         // Synchronous acknowledgement: a process-launch reply cannot tell
         // the host whether filesystem metadata has actually been flushed.

@@ -62,6 +62,7 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_input` | Ordered key/chord/text/pointer/scroll/relative/hold/wait batches. Coordinates require the current `frame_id`; crop/scale map back to native coordinates. US ASCII text only; holds release at batch end/cancel. Observe to verify reaction. |
 | `vm_logs`, `vm_wait` | Bounded serial/QEMU byte cursors or bounded serial-substring waits. Logs survive VM exit. |
 | `vm_guest_run` | Structured `argv`, optional `cwd`/`env`/`uid`, required `request_id`, and optional `wait_s` return a recoverable command job with isolated output and exit status. Default identity is Brook. The explicitly legacy `command: "run …"` form still returns launch ACK only and fits 220 bytes. |
+| `vm_windows`, `vm_window`, `vm_ui` | Boot-bound native/Wayland discovery, semantic actions, bundled window state and read-only request recovery. |
 | `vm_job` | Inspect/wait for an `operation_id`, with independent stdout/stderr byte cursors and real exit/descendant/EOF state. Does not execute or resume commands. |
 | `vm_guest` | Existing window/process listings and focus by window index (the `pid` argument). |
 | `vm_stats` | Usable RAM/free/used and process counts; p50/p90/p95/max of the recent 256 compositor-loop intervals using the millisecond guest clock. Optional `memory_details: true` adds a rolling address-space census. Not app GPU or physical scanout timings. |
@@ -97,7 +98,69 @@ description time. This does not invent capture timing from a file's wall clock.
 `vm_doctor.bridge_capabilities.artifact_delivery` advertises revision 1. Reload
 an already running MCP server to receive these source/schema changes.
 
-### Guest command jobs (bridge 0.4.0)
+### Semantic windows (bridge 0.5.0)
+
+`vm_windows` returns native and Wayland windows without taking a screenshot.
+Copy a window's exact `reference` into `vm_window` with an `action` and fresh
+32-character lowercase hex `request_id`. Supported actions are `focus`,
+`minimize`, `maximize`, `restore` and graceful `close`; each row advertises its
+supported subset. For restore, supply `restore_target`: `previous` preserves
+maximized/normal state and unminimizes, `normal` restores the saved rectangle,
+`maximized` maximizes and unminimizes. Maximize preserves minimization.
+
+A reference includes window ID, uint64 creation incarnation as a decimal string,
+host session generation and guest boot epoch. A first-wins UUID handshake binds
+the epoch once per guest boot; a guest self-reboot invalidates references and
+operation reads even if QMP reset was not used. This does not detect restoring
+a whole VM snapshot that contains the old epoch; snapshot restore must change
+the host generation. Jobs require guest job API 2 with these guards. Legacy
+coordinate input and old `vm_guest` index-based focus do not yet use this new
+epoch contract; prefer the semantic interface for window mutations.
+
+Requests dispatch on the compositor through the chrome/taskbar focus, minimize,
+resize and close paths. `completed` confirms WM state applied or graceful close
+enqueued, not a client configure acknowledgement, completed redraw or process
+exit. Native close sends SIGHUP to a terminal or SIGTERM to another native
+provider; Wayland close sends the ordinary close event, never a signal to the
+shared Wayland server. Unknown client ownership and kernel-service close are
+unsupported. A full notification queue rejects the semantic action explicitly.
+
+The response includes a fresh windows observation, with its host capture
+interval and guest sample tick. The WM values are captured under one lock;
+process liveness is sampled afterwards. No correspondence to a framebuffer is
+asserted. `buffer_width/height` on API windows report the actual allocated VFB
+extent, separately from requested geometry; a matching size is not a formal
+client configure ACK. Frames remain a separate `vm_observe` artifact.
+
+`wait_s` is 0–20 (default 2). `wait_for` defaults to `applied`; close can wait
+for `closed` or `client_group_exit`. Results report these facts separately.
+Wayland client metadata identifies the kernel-authenticated origin of an
+accepted Unix stream, associated with the surface by its provider. It is not
+proof of the current owner after socket inheritance/passing, nor authority to
+signal that PID. Unknown origins remain null. Exact origin-group exit is not
+proof that all application descendants have exited.
+
+`vm_ui` recovers by `operation_id` without replay. Same-ID identical actions
+recover evidence; changed arguments reject. Unknown transport delivery never
+triggers an automatic mutation retry. The guest reserves 256 request IDs until
+reboot, allows 16 queued/inflight and applies at most four per compositor turn.
+Wait cancellation/timeout leaves accepted work pending. `vm_control` takeover
+blocks new host UI submissions, cancels queued guest UI requests, and reports
+already-dispatched requests; it cannot undo an event already sent to a client.
+Takeover/release transitions serialize across bridge clients. If guest takeover
+is unavailable, the host block still applies and the response says so.
+
+The reusable `accept_ui.py --session SESSION --out build/ui-acceptance`
+workflow expects a native Terminal and clean Mousepad already open, exercises
+both, captures them and gracefully closes them. Run it only on a disposable VM.
+It checks idempotent recovery, actual Wayland buffer dimensions, disappearance,
+exact client-group exit and survival of the unrelated app/shared server.
+
+Actual installed-app discovery/semantic launcher activation remains the next
+phase. Running an executable through a command job does not exercise launcher
+feedback or single-instance activation.
+
+### Guest command jobs (bridge 0.4.0; boot guards in 0.5.0)
 
 Structured requests go through the guest's job protocol, without a host shell
 or serial-log scraping. For example, provide the following arguments to
@@ -133,9 +196,9 @@ reused. Worst-case retained output/request storage is about 40 MiB, plus active
 pipes and process overhead. The capability handshake reports these limits.
 
 The returned `operation_id` is the request ID. Its host record binds the ID
-to session generation and an argument fingerprint before any mutation. An
+to session generation, guest boot epoch and an argument fingerprint before any mutation. An
 identical resubmission returns the existing job. Changed arguments or a new
-generation with the same ID are rejected. After interrupted staging, an
+generation/guest boot with the same ID are rejected. After interrupted staging, an
 explicit identical resubmission observes the guest first, verifies duplicate
 chunks against its immutable request and resumes only unfinished staging.
 If the guest already started, commit is skipped. A failed observation remains
@@ -147,7 +210,7 @@ reads can retry transport errors within their deadline.
 observation budget is 20 seconds; longer commands keep running. Cancelling a
 wait does not terminate the workload. Control has a separate executor so four
 long waits cannot prevent shutdown/takeover. Kernel job cancellation and
-typed UI/event waits remain future work.
+general event waits remain future work.
 
 Results distinguish leader exit, collected exit code/terminating signal,
 remaining tagged descendants, original POSIX process-group tasks, and each

@@ -17,6 +17,7 @@ class JobTests(unittest.TestCase):
         self.root=Path(self.temp.name);self.session='a'*32;self.ident='b'*32
         (self.root/self.session).mkdir()
         self.data={'generation':'first','state':'running'}
+        self.boot='e'*32
         self.calls=[];self.payload=bytearray();self.commits=0
         self.state='uploading';self.stdout=b'hello\n';self.stderr=b'warning\n';self.complete=True
         self.fail_commit=False;self.begun=False;self.fail_put=False;self.fail_begin=False
@@ -32,8 +33,14 @@ class JobTests(unittest.TestCase):
 
     def guest(self,data,command,timeout):
         self.calls.append(command)
-        args=command.split(' ');action=args[2]
-        if action=='caps':return {'job_api':1}
+        args=command.split(' ')
+        if args[1]=='epoch':
+            if len(args)>2 and self.boot=='0'*32:self.boot=args[3]
+            return {'boot_id':self.boot}
+        action=args[2]
+        if action=='caps':return {'job_api':2,'boot_id':self.boot}
+        if args[-1]!=self.boot:return {'job_error':'Stale guest boot'}
+        args=args[:-1]
         if action=='begin':
             self.begun=True
             if self.fail_begin:
@@ -125,6 +132,49 @@ class JobTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'different arguments or generation'):
             self.submit()
 
+    def test_guest_self_reboot_loses_job_without_replay_or_new_output(self):
+        self.submit();before=self.commits
+        self.boot='f'*32;self.stdout=b'WRONG NEW BOOT'
+        result=self.client.status(self.session,self.ident)
+        self.assertEqual(result['state'],'lost')
+        self.assertNotIn('stdout',result)
+        with self.assertRaisesRegex(ValueError,'different arguments'):
+            self.submit()
+        self.assertEqual(self.commits,before)
+
+    def test_unset_epoch_initializes_once_and_old_id_never_rebinds(self):
+        self.boot='0'*32
+        self.submit();old=self.boot
+        self.assertNotEqual(old,'0'*32)
+        self.boot='0'*32
+        with self.assertRaisesRegex(ValueError,'different arguments'):
+            self.submit()
+        self.assertNotEqual(self.boot,old)
+        self.assertEqual(self.commits,1)
+
+    def test_abandoned_created_job_is_lost_after_guest_self_reboot(self):
+        import threading
+        from unittest.mock import patch
+        with patch.object(threading.Thread,'start'):
+            pending=self.client.submit(self.session,self.ident,['/bin/test'])
+        self.assertEqual(pending['stage'],'created')
+        self.boot='f'*32
+        result=self.client.status(self.session,self.ident)
+        self.assertEqual(result['state'],'lost')
+        self.assertEqual(self.commits,0)
+
+    def test_reboot_between_status_and_output_cannot_read_new_boot_streams(self):
+        self.submit()
+        original=self.client.guest
+        def guest(data,command,timeout):
+            if command.startswith('bridge job read '):self.boot='f'*32
+            return original(data,command,timeout)
+        self.client.guest=guest
+        result=self.client.status(self.session,self.ident)
+        self.assertEqual(result['state'],'lost')
+        self.assertEqual(result['stdout']['text'],'')
+        self.assertEqual(result['stdout']['read_error'],'Stale guest boot')
+
     def test_stopped_guest_returns_labelled_cached_evidence(self):
         self.submit();self.data['state']='stopped'
         result=self.client.status(self.session,self.ident)
@@ -145,11 +195,11 @@ class JobTests(unittest.TestCase):
 
     def test_utf8_tail_is_not_silently_consumed(self):
         self.stdout='A€Z'.encode();self.complete=False
-        result=self.client.stream(self.session,'first',self.ident,'out',0,3)
+        result=self.client.stream(self.session,'first',self.ident,'out',0,3,boot_id=self.boot)
         self.assertEqual(result['text'],'A')
         self.assertEqual(result['next_offset'],1)
         self.assertEqual(result['pending_utf8_bytes'],2)
-        result=self.client.stream(self.session,'first',self.ident,'out',1,4)
+        result=self.client.stream(self.session,'first',self.ident,'out',1,4,boot_id=self.boot)
         self.assertEqual(result['text'],'€Z')
         self.assertEqual(result['next_offset'],5)
 
@@ -192,7 +242,7 @@ class JobTests(unittest.TestCase):
         original=self.client.guest;failed=False
         def guest(data,command,timeout):
             nonlocal failed
-            if command.endswith('status '+self.ident) and not failed:
+            if command.startswith('bridge job status '+self.ident) and not failed:
                 failed=True;raise TimeoutError('temporary read timeout')
             return original(data,command,timeout)
         self.client.guest=guest

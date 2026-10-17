@@ -58,6 +58,7 @@ bool WmSetScale(uint32_t percent) {
     CompositorWake();return true;
 }
 static bool ResizeWindowLocked(int idx,uint16_t newClientW,uint16_t newClientH);
+static void FocusWindowLocked(int idx);
 
 static uint32_t g_themeId = BROOK_THEME_BROOK;
 static bool g_themeSettingsLoaded = false;
@@ -203,7 +204,9 @@ void WmLaunchFeedbackPoll()
         for (const auto& w : g_windows) {
             if (!w.proc || !w.visible || !w.focusable) continue;
             SpinLockAcquire(&g_launchLock);
-            g_launches.Window(w.proc->launchId, w.creationIdentity, w.appId);
+            uint64_t token=w.clientLaunchId;
+            if(w.clientOrigin==WmClientOrigin::RegisteredUnixPeer&&g_launches.Find(token)<0)token=0;
+            g_launches.Window(token, w.creationIdentity, w.appId);
             SpinLockRelease(&g_launchLock);
         }
     }
@@ -565,6 +568,10 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.proc = proc;
     w.metrics = &WmDesktopMetrics();
     w.creationIdentity = __atomic_add_fetch(&g_windowIdentity, 1, __ATOMIC_ACQ_REL);
+    w.clientPid=proc?(proc->tgid?proc->tgid:proc->pid):0;
+    w.clientIncarnation=proc?(proc->isThread?proc->leaderIncarnation:proc->incarnation):0;
+    w.clientLaunchId=proc?proc->launchId:0;
+    w.clientOrigin=proc?WmClientOrigin::NativeProcess:WmClientOrigin::Unknown;
     w.appId[0] = 0;
     w.x = x;
     w.y = y;
@@ -586,6 +593,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.savedH = clientH;
     w.vfb       = nullptr;
     w.vfbStride = 0;
+    w.vfbWidth=w.vfbHeight=0;
     w.vfbBytes  = 0;
     w.vfbUser   = nullptr;
     w.vfbAddressSpace = nullptr;
@@ -607,7 +615,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     // menus) already received the highest z-order above, so they'll render
     // on top of existing windows without stealing keyboard focus.
     if (w.focusable)
-        WmSetFocus(idx);
+        FocusWindowLocked(idx);
 
     return idx;
 }
@@ -639,6 +647,7 @@ static void DestroyWindowLocked(int idx)
         w.vfbAddressSpace = nullptr;
         w.vfb       = nullptr;
         w.vfbStride = 0;
+        w.vfbWidth=w.vfbHeight=0;
         w.vfbBytes  = 0;
         w.vfbUser   = nullptr;
         w.vfbDirty  = 0;
@@ -668,7 +677,7 @@ static void DestroyWindowLocked(int idx)
                 bestIdx = static_cast<int>(i);
             }
         }
-        if (bestIdx >= 0) WmSetFocus(bestIdx);
+        if (bestIdx >= 0) FocusWindowLocked(bestIdx);
     }
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
@@ -814,7 +823,7 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
     return result;
 }
 
-void WmSetFocus(int idx)
+static void FocusWindowLocked(int idx)
 {
     g_taskbarPageTarget = -1;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
@@ -855,8 +864,11 @@ void WmSetFocus(int idx)
     WmPushWmEvent(&g_windows[idx], WM_EVT_FOCUS_GAINED, 0, 0);
 }
 
+void WmSetFocus(int idx) { VfbGuard guard;FocusWindowLocked(idx); }
+
 void WmSendToBack(int idx)
 {
+    VfbGuard guard;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     if (!g_windows[idx].proc) return;
 
@@ -937,9 +949,8 @@ uint32_t WmWindowCount()
     return n;
 }
 
-void WmSetMaximized(int idx, bool enable)
+static void SetMaximizedLocked(int idx, bool enable)
 {
-    VfbGuard guard;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
@@ -998,6 +1009,8 @@ void WmSetMaximized(int idx, bool enable)
     w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
 }
 
+void WmSetMaximized(int idx,bool enable) { VfbGuard guard;SetMaximizedLocked(idx,enable); }
+
 void WmToggleMaximize(int idx)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
@@ -1053,6 +1066,11 @@ static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
     Window& w = g_windows[idx];
     if (!w.proc) return false;
+    if (w.vfb) {
+        const uint32_t head=__atomic_load_n(&w.inputHead,__ATOMIC_ACQUIRE);
+        const uint32_t tail=__atomic_load_n(&w.inputTail,__ATOMIC_ACQUIRE);
+        if ((head+1)%Window::WM_INPUT_QUEUE==tail) return false;
+    }
 
     // Enforce minimum size
     if (newClientW < WM_MIN_WIDTH)  newClientW = WM_MIN_WIDTH;
@@ -1136,7 +1154,19 @@ bool WmApplyScalePending()
     return true;
 }
 
-void WmMinimizeWindow(int idx)
+static int NextFocusCandidateLocked(int excluded)
+{
+    int best=-1;uint8_t bestZ=0;
+    for(uint32_t i=0;i<WM_MAX_WINDOWS;++i) {
+        const auto& w=g_windows[i];
+        if(static_cast<int>(i)!=excluded && w.proc && w.visible && !w.minimized && w.focusable && w.zOrder>=bestZ) {
+            bestZ=w.zOrder;best=static_cast<int>(i);
+        }
+    }
+    return best;
+}
+
+static void MinimizeWindowLocked(int idx)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
@@ -1150,25 +1180,15 @@ void WmMinimizeWindow(int idx)
     {
         g_focusedIdx = -1;
         w.focused = false;
-        int bestIdx = -1;
-        uint8_t bestZ = 0;
-        for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
-        {
-            if (g_windows[i].proc && g_windows[i].visible && !g_windows[i].minimized
-                && g_windows[i].focusable
-                && g_windows[i].zOrder >= bestZ)
-            {
-                bestZ = g_windows[i].zOrder;
-                bestIdx = static_cast<int>(i);
-            }
-        }
-        if (bestIdx >= 0) WmSetFocus(bestIdx);
+        WmPushWmEvent(&w,WM_EVT_FOCUS_LOST,0,0);
+        const int bestIdx=NextFocusCandidateLocked(idx);
+        if (bestIdx >= 0) FocusWindowLocked(bestIdx);
     }
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
 }
 
-void WmRestoreWindow(int idx)
+static void RestoreWindowLocked(int idx)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
@@ -1176,9 +1196,118 @@ void WmRestoreWindow(int idx)
 
     w.minimized = false;
     SerialPrintf("WM: restored window %d '%s'\n", idx, w.title);
-    WmSetFocus(idx);
+    FocusWindowLocked(idx);
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
+}
+
+void WmMinimizeWindow(int idx) { VfbGuard guard;MinimizeWindowLocked(idx); }
+void WmRestoreWindow(int idx) { VfbGuard guard;RestoreWindowLocked(idx); }
+
+static bool RequestCloseLocked(int idx,uint32_t* method)
+{
+    if (idx<0 || idx>=static_cast<int>(WM_MAX_WINDOWS)) return false;
+    auto& w=g_windows[idx];
+    if (!w.proc || !w.focusable) return false;
+    if (w.vfb) {
+        *method=1;
+        return WmPushWmEvent(&w,WM_EVT_CLOSE_REQUESTED,0,0);
+    }
+    if(w.proc->state==ProcessState::Terminated)return false;
+    TerminalGeometry terminal{};
+    const bool isTerminal=TerminalSnapshotGeometry(w.proc,&terminal);
+    *method=isTerminal?2:3;
+    // Terminal hangup is cooperative too: no hidden SIGKILL on close.
+    ProcessSendSignal(w.proc,isTerminal?1:15);
+    return true;
+}
+
+bool WmRequestCloseWindow(int idx) {
+    VfbGuard guard;uint32_t method=0;return RequestCloseLocked(idx,&method);
+}
+
+static void SnapshotDebugWindowLocked(const Window& w,WmDebugWindow* out)
+{
+    *out={};out->id=w.wmId;out->incarnation=w.creationIdentity;
+    out->providerPid=w.proc->tgid?w.proc->tgid:w.proc->pid;
+    out->providerIncarnation=w.proc->isThread?w.proc->leaderIncarnation:w.proc->incarnation;
+    out->clientPid=w.clientPid;out->clientIncarnation=w.clientIncarnation;
+    out->clientOrigin=w.clientOrigin;out->launchId=w.clientLaunchId;
+    out->x=w.x;out->y=w.y;out->width=w.clientW;out->height=w.clientH;
+    out->outerWidth=w.outerWidth();out->outerHeight=w.outerHeight();
+    out->bufferWidth=w.vfbWidth;out->bufferHeight=w.vfbHeight;
+    out->visible=w.visible;out->minimized=w.minimized;out->maximized=w.state==WindowState::Maximized;
+    out->focused=w.focused;out->focusable=w.focusable;out->apiWindow=w.vfb!=nullptr;
+    out->providerKernel=w.proc->isKernelThread;
+    WmStrCopy(out->title,w.title,sizeof(out->title));WmStrCopy(out->appId,w.appId,sizeof(out->appId));
+}
+
+Process* WmReferenceTerminatedOwner()
+{
+    VfbGuard guard;
+    for(const auto& w:g_windows) {
+        if(!w.proc || w.proc->state!=ProcessState::Terminated)continue;
+        Process* pinned=SchedulerFindProcessReference(w.proc->pid);
+        if(pinned && pinned==w.proc && pinned->incarnation==w.proc->incarnation)return pinned;
+        if(pinned)ProcessUnref(pinned);
+    }
+    return nullptr;
+}
+
+uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t capacity,uint64_t* tick)
+{
+    VfbGuard guard;uint32_t count=0;
+    for (const auto& w:g_windows) if(w.proc && count<capacity) SnapshotDebugWindowLocked(w,&out[count++]);
+    *tick=ApicTickCount();return count;
+}
+
+int WmApplyDebugAction(uint32_t id,uint64_t incarnation,WmDebugAction action,
+                      uint32_t restoreTarget,WmDebugWindow* result,uint32_t* closeMethod)
+{
+    VfbGuard guard;
+    if (!id || id>WM_MAX_WINDOWS) return -2;
+    const int idx=static_cast<int>(id)-1;auto& w=g_windows[idx];
+    if (!w.proc || w.creationIdentity!=incarnation) return -2;
+    if (!w.focusable) return -95;
+    const bool needsResize=(action==WmDebugAction::Maximize && w.state!=WindowState::Maximized) ||
+        (action==WmDebugAction::Restore && restoreTarget &&
+        (w.state==WindowState::Maximized)!=(restoreTarget==2));
+    uint32_t notifications[WM_MAX_WINDOWS]{};
+    if(needsResize)++notifications[idx];
+    int focusTarget=-1;
+    if(action==WmDebugAction::Focus || (action==WmDebugAction::Restore && w.minimized))focusTarget=idx;
+    if(action==WmDebugAction::Minimize && !w.minimized && g_focusedIdx==idx) {
+        ++notifications[idx];focusTarget=NextFocusCandidateLocked(idx);
+        if(focusTarget>=0)++notifications[focusTarget];
+    }else if(focusTarget>=0 && focusTarget!=g_focusedIdx) {
+        ++notifications[focusTarget];
+        if(g_focusedIdx>=0)++notifications[g_focusedIdx];
+    }
+    // Check every notification before applying any part of the transition.
+    // Consumers can only free slots while this WM lock excludes producers.
+    for(uint32_t i=0;i<WM_MAX_WINDOWS;++i)if(notifications[i] && g_windows[i].vfb) {
+        const auto& target=g_windows[i];
+        const uint32_t head=__atomic_load_n(&target.inputHead,__ATOMIC_ACQUIRE);
+        const uint32_t tail=__atomic_load_n(&target.inputTail,__ATOMIC_ACQUIRE);
+        const uint32_t free=(tail+Window::WM_INPUT_QUEUE-head-1)%Window::WM_INPUT_QUEUE;
+        if(free<notifications[i])return -11;
+    }
+    switch(action) {
+    case WmDebugAction::Focus:RestoreWindowLocked(idx);FocusWindowLocked(idx);break;
+    case WmDebugAction::Minimize:MinimizeWindowLocked(idx);break;
+    case WmDebugAction::Maximize:SetMaximizedLocked(idx,true);if(w.state!=WindowState::Maximized)return -12;break;
+    case WmDebugAction::Restore:
+        if(restoreTarget>2)return -22;
+        if(restoreTarget) SetMaximizedLocked(idx,restoreTarget==2);
+        if(restoreTarget && (w.state==WindowState::Maximized)!=(restoreTarget==2))return -12;
+        RestoreWindowLocked(idx);break;
+    case WmDebugAction::Close:
+        if(w.clientOrigin==WmClientOrigin::Unknown || w.proc->isKernelThread)return -95;
+        if(!RequestCloseLocked(idx,closeMethod))return -11;
+        break;
+    }
+    SnapshotDebugWindowLocked(w,result);
+    CompositorMarkDirty();CompositorWake();return 0;
 }
 
 uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
@@ -2323,6 +2452,10 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     Window& w = g_windows[idx];
 
     // Allocate the VFB pages kernel-side.
+    // API-created windows may be relayed by a shared userspace compositor.
+    // Its PID is provider identity, never an inferred application identity.
+    w.clientPid=0;w.clientIncarnation=0;w.clientLaunchId=0;
+    w.clientOrigin=WmClientOrigin::Unknown;
     uint32_t stride = clientW;
     uint64_t bytes  = static_cast<uint64_t>(stride) * clientH * 4;
     uint64_t pages  = (bytes + 4095) / 4096;
@@ -2353,6 +2486,7 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
 
     w.vfb       = kVfb;
     w.vfbStride = stride;
+    w.vfbWidth=clientW;w.vfbHeight=clientH;
     w.vfbBytes  = pages * 4096;
     w.vfbUser   = reinterpret_cast<void*>(userBase);
     AddressSpaceRef(proc->addressSpace);
@@ -2431,6 +2565,7 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     w->vfbBacking = newBacking;
     w->vfb       = newKVfb;
     w->vfbStride = newStride;
+    w->vfbWidth=newW;w->vfbHeight=newH;
     w->vfbBytes  = roundedBytes;
     w->vfbUser   = reinterpret_cast<void*>(newUserBase);
     AddressSpaceRef(proc->addressSpace);
@@ -2506,8 +2641,23 @@ bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId)
     return true;
 }
 
+bool WmRegisterClientOrigin(Process* provider,uint32_t wmId,uint16_t clientPid,
+                            uint64_t incarnation,uint64_t launchId)
+{
+    VfbGuard guard;
+    Window* w=WmFindWindowById(provider,wmId);
+    if (!w || !w->vfb || !clientPid || !incarnation) return false;
+    if (w->clientOrigin!=WmClientOrigin::Unknown)
+        return w->clientOrigin==WmClientOrigin::RegisteredUnixPeer &&
+               w->clientPid==clientPid && w->clientIncarnation==incarnation && w->clientLaunchId==launchId;
+    w->clientPid=clientPid;w->clientIncarnation=incarnation;w->clientLaunchId=launchId;
+    w->clientOrigin=WmClientOrigin::RegisteredUnixPeer;
+    CompositorWake();return true;
+}
+
 void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
 {
+    VfbGuard guard;
     Window* w = WmFindWindowById(proc, wmId);
     if (!w || !title) return;
     WmStrCopy(w->title, title, sizeof(w->title));
@@ -2570,13 +2720,13 @@ uint32_t WmInputPop(Window* win, Window::WmInputEvent* out, uint32_t max)
     return produced;
 }
 
-void WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
+bool WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
 {
-    if (!win) return;
+    if (!win) return false;
     uint32_t head = __atomic_load_n(&win->inputHead, __ATOMIC_ACQUIRE);
     uint32_t tail = __atomic_load_n(&win->inputTail, __ATOMIC_ACQUIRE);
     uint32_t next = (head + 1) % Window::WM_INPUT_QUEUE;
-    if (next == tail) return;
+    if (next == tail) return false;
     Window::WmInputEvent& slot = win->inputQueue[head];
     slot.type      = type;
     slot.scanCode  = 0;
@@ -2586,6 +2736,7 @@ void WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
     slot.y         = y;
     slot.reserved  = 0;
     __atomic_store_n(&win->inputHead, next, __ATOMIC_RELEASE);
+    return true;
 }
 
 } // namespace brook

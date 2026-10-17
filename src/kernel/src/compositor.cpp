@@ -13,6 +13,7 @@
 #include "memory/address.h"
 #include "mouse.h"
 #include "window.h"
+#include "debug_ui.h"
 #include "terminal.h"
 #include "input.h"
 #include "net.h"
@@ -1451,6 +1452,18 @@ static void CompositorLoopWM()
         g_overlayLauncherShown = false;
         CompositorMarkDirty();
     }
+    DebugUiPoll();
+    // Reap terminated owners regardless of visibility/minimization. A terminal
+    // holds its child alive until cleanup; rendering only visible windows left
+    // minimized terminals retaining their process/pipe references indefinitely.
+    for(uint32_t n=0;n<WM_MAX_WINDOWS;++n) {
+        Process* owner=WmReferenceTerminatedOwner();
+        if(!owner)break;
+        TerminalCloseForProcess(owner);
+        WmDestroyWindowForProcess(owner);
+        CompositorUnregisterProcess(owner);
+        ProcessUnref(owner);
+    }
     uint64_t now = g_lapicTickCount;
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
@@ -1545,24 +1558,6 @@ static void CompositorLoopWM()
         if (!w || !w->proc || !w->visible || w->minimized) continue;
 
         Process* p = w->proc;
-
-        // Handle terminated processes
-        if (p->state == ProcessState::Terminated)
-        {
-            // If this is a terminal window, shut down the terminal properly
-            Terminal* term = TerminalFindByProcess(p);
-            if (term)
-                TerminalClose(term);
-
-            // Destroy every window owned by this process in one go,
-            // *before* unregistering / marking reapable.  Otherwise the
-            // next loop iteration that dereferences w->proc on a sibling
-            // window of the same proc may hit a freed Process struct
-            // (the reaper can race us between iterations).
-            WmDestroyWindowForProcess(p);
-            CompositorUnregisterProcess(p);
-            continue;
-        }
 
         // Update process destX/destY to match window client area
         p->fbDestX = w->clientX();
@@ -1917,10 +1912,7 @@ static void CompositorInputWM()
                 if (cur >= 0) {
                     Window* w = WmGetWindow(cur);
                     if (w && w->proc) {
-                        if (w->vfb) // WM-API (Wayland) window
-                            WmPushWmEvent(w, WM_EVT_CLOSE_REQUESTED, 0, 0);
-                        else // Terminal — send SIGTERM
-                            ProcessSendSignal(w->proc, 15);
+                        WmRequestCloseWindow(cur);
                     }
                 }
                 continue;
@@ -2259,24 +2251,9 @@ static void CompositorHandleMouseWM()
                 if (w && w->proc)
                 {
                     SerialPrintf("WM: close window %d '%s'\n", hit.windowIndex, w->title);
-                    if (w->vfb)
-                    {
-                        // Closing is a request: the client may show a save
-                        // dialog or cancel it. Neither elapsed time nor a
-                        // repeated click authorizes terminating the process.
-                        // Deliver each request so closing works again after
-                        // cancellation; the client owns its eventual teardown.
-                        WmPushWmEvent(w, WM_EVT_CLOSE_REQUESTED, 0, 0);
-                    }
-                    else
-                    {
-                        // Native/legacy window: previous behaviour.
-                        Terminal* term = TerminalFindByProcess(w->proc);
-                        if (term)
-                            TerminalClose(term);
-                        else
-                            ProcessSendSignal(w->proc, 15); // SIGTERM
-                    }
+                    // Advisory close follows one path for chrome, keyboard
+                    // and the semantic bridge. A save dialog may cancel it.
+                    WmRequestCloseWindow(hit.windowIndex);
                 }
                 break;
             }

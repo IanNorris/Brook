@@ -26,6 +26,7 @@ import zlib
 from common import ROOT, REGISTRY, QMP, artifact, load_session, process_identity, process_is_alive, recording_lock, session_lock, write_json
 from media import Delivery, describe as describe_artifact, scoped_path
 from jobs import Jobs
+from ui import Ui
 
 MAX_LOG = 256 * 1024
 
@@ -245,7 +246,7 @@ def doctor(session, **_):
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
-                  "generation": data["generation"], "server_version": "0.4.0",
+                  "generation": data["generation"], "server_version": "0.5.0",
                   "bridge_capabilities": {"artifact_delivery": {"revision": 1,
                       "default": "references", "include_image": True,
                       "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
@@ -255,9 +256,14 @@ def doctor(session, **_):
             result["guest_error"] = str(error)
         try:
             caps=guest(data,"bridge job caps",timeout=3)
-            result["bridge_capabilities"]["command_jobs"]={"supported":caps.get("job_api")==1,**caps}
+            result["bridge_capabilities"]["command_jobs"]={"supported":caps.get("job_api")==2,**caps}
         except (OSError,ValueError,RuntimeError) as error:
             result["bridge_capabilities"]["command_jobs"]={"supported":False,"error":str(error)}
+        try:
+            caps=guest(data,"bridge ui caps",timeout=3)
+            result["bridge_capabilities"]["window_controls"]={"supported":caps.get("ui_api")==1,**caps}
+        except (OSError,ValueError,RuntimeError) as error:
+            result["bridge_capabilities"]["window_controls"]={"supported":False,"error":str(error)}
         return result
 
 
@@ -308,8 +314,15 @@ def control(session, action, force=False, **_):
         raise ValueError("force is only supported for stop/reset")
     if action in {"takeover", "release"}:
         load_session(session)
-        write_json(REGISTRY / session / "control.json", {"user_takeover": action == "takeover"})
-        return {"user_takeover": action == "takeover"}
+        ui=window_ui()
+        # One transition lock across clients orders host intent and the guest
+        # latch. Individual guest exchanges take session_lock themselves.
+        with ui.lock(REGISTRY/session/'control-transition',deadline=time.monotonic()+6):
+            write_json(REGISTRY / session / "control.json", {"user_takeover": action == "takeover"})
+            result={"user_takeover": action == "takeover"}
+            try:result['guest_ui']=ui.takeover(session,action=='takeover')
+            except (OSError,RuntimeError,ValueError) as error:result['guest_ui_unavailable']=str(error)
+            return result
     with session_lock(session) as data:
         if action == "panic":
             try:
@@ -384,6 +397,22 @@ def stats(session, memory_details=False, **_):
         result["queried_monotonic"] = time.monotonic()
         result["note"] = "Recent 256 compositor-loop intervals, nearest-rank percentiles, millisecond guest timer resolution; not app GPU or scanout frametimes"
         return result
+
+
+def window_ui():
+    return Ui(REGISTRY,load_session,session_lock,guest,write_json)
+
+
+def windows(session,**_):
+    return window_ui().windows(session)
+
+
+def window_action(session,window,action,request_id,restore_target=None,wait_for='applied',wait_s=2,_cancel=None,**_):
+    return window_ui().submit(session,window,action,request_id,restore_target,wait_for,wait_s,_cancel)
+
+
+def ui_status(session,operation_id,wait_s=0,wait_for='applied',_cancel=None,**_):
+    return window_ui().status(session,operation_id,wait_s,wait_for,_cancel)
 
 
 def command_jobs():
@@ -822,6 +851,13 @@ register("vm_guest_run",guest_run,"Run structured guest argv with separate outpu
     "request_id":STR,"wait_s":NUM},["session"])
 register("vm_job",job_status,"Recover/wait for a guest operation by ID; return exit, descendants, separate byte-cursor output and EOF; never repeats execution",{**SESSION,
     "operation_id":STR,"stdout_offset":INT,"stderr_offset":INT,"output_limit":INT,"wait_s":NUM},["session","operation_id"],True)
+WINDOW_REF=schema({"window_id":INT,"incarnation":STR,"session_generation":STR,"guest_boot_id":STR},["window_id","incarnation","session_generation","guest_boot_id"])
+register("vm_windows",windows,"Snapshot native/Wayland windows with boot-bound references, provider/client identities, geometry and supported actions",SESSION,["session"],True)
+register("vm_window",window_action,"Apply a semantic compositor action once; return request status and windows. Close dispatch, window disappearance and exact client-group exit are separate conditions",{**SESSION,
+    "window":WINDOW_REF,"action":{"type":"string","enum":list(Ui.actions)},"request_id":STR,
+    "restore_target":{"type":"string","enum":list(Ui.restores)},"wait_for":{"type":"string","enum":["applied","closed","client_group_exit"]},"wait_s":NUM},["session","window","action","request_id"])
+register("vm_ui",ui_status,"Recover a semantic UI request by ID without replaying it; optionally wait and return a windows observation",{**SESSION,"operation_id":STR,"wait_s":NUM,
+    "wait_for":{"type":"string","enum":["applied","closed","client_group_exit"]}},["session","operation_id"],True)
 register("vm_guest",guest_inspect,"Guest windows/processes, or focus by window index in pid",{**SESSION,"action":STR,"pid":INT},["session"])
 register("vm_artifacts",get_artifact,"Describe a scoped artifact by local path, size and checksum, including after VM exit; binary is never embedded in JSON",{**SESSION,**IMAGE_OPTION,"artifact_name":STR},["session","artifact_name"],True)
 register("vm_profile",profile,"CPU samples and context-switch capture: start/stop/status/export to Speedscope",{**SESSION,"action":STR,"duration_ms":INT},["session"])
@@ -871,7 +907,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.4.0"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.5.0"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":

@@ -1076,6 +1076,10 @@ static UnixCredentials UnixCurrentCredentials(Process* process)
 {
     return {static_cast<int32_t>((process->tgid ? process->tgid : process->pid)), process->euid, process->egid};
 }
+static uint64_t UnixCurrentIncarnation(Process* process)
+{
+    return process->isThread?process->leaderIncarnation:process->incarnation;
+}
 
 // FIFO of in-flight fds for one direction of a connected AF_UNIX pair.
 // Shared between sender (enqueue) and receiver (dequeue).
@@ -1187,6 +1191,7 @@ static inline int UnixFdQueueCount(const UnixFdQueue* q)
 
 struct UnixPendingConn {
     UnixCredentials clientCredentials;
+    uint64_t clientIncarnation,clientLaunchId;
     PipeBuffer* serverRx;     // server reads this (client→server data)
     PipeBuffer* serverTx;     // server writes this (server→client data)
     UnixFdQueue* serverRxFds; // server reads these fds (client→server)
@@ -1205,6 +1210,8 @@ struct UnixSocketData {
     volatile uint32_t refCount; // +1 per fd pointing at this struct
     uint32_t socketType;       // creation type (without NONBLOCK/CLOEXEC flags)
     UnixCredentials peerCredentials; // connection/listen snapshot; registry lock protects copies
+    uint64_t peerIncarnation,peerLaunchId;
+    bool acceptedEndpoint; // Only accept(), never connect() or socketpair().
     char    path[108];
     UnixPendingConn pending[UNIX_ACCEPT_QUEUE];
     int             pendingCount;
@@ -10883,6 +10890,35 @@ static int64_t sys_brook_wm_scale(uint64_t op,uint64_t scale,uint64_t,uint64_t,u
 }
 
 // 0xB01: WM_SET_APP_ID(wmId, appId*) — metadata for an owned window.
+// 0xB05: WM_SET_CLIENT_SOCKET(wmId, accepted AF_UNIX stream fd). The kernel
+// authenticates connection origin; the provider supplies the surface association.
+// This metadata grants no authority to signal another process.
+static int64_t sys_brook_wm_set_client_socket(uint64_t wmId,uint64_t fdValue,
+    uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    Process* proc=ProcessCurrent();
+    if (!proc) return -ESRCH;
+    if (!wmId || wmId>0xffffffffULL || fdValue>0x7fffffffULL) return -EINVAL;
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc,static_cast<int>(fdValue));
+    auto* entry=descriptor.get();
+    if (!entry) return -EBADF;
+    if (entry->type!=FdType::UnixSocket || !entry->handle) return -88; // ENOTSOCK
+    auto* socket=static_cast<UnixSocketData*>(entry->handle);
+    UnixCredentials credentials{};uint64_t incarnation=0,launchId=0;
+    SpinLockAcquire(&g_unixRegistryLock);
+    const bool accepted=socket->state==UnixSocketData::State::Connected &&
+                        socket->acceptedEndpoint && socket->socketType==1;
+    if (accepted) {
+        credentials=socket->peerCredentials;incarnation=socket->peerIncarnation;launchId=socket->peerLaunchId;
+    }
+    SpinLockRelease(&g_unixRegistryLock);
+    if (!accepted) return -95; // EOPNOTSUPP
+    if (credentials.pid<=0 || credentials.pid>65535 || !incarnation) return -ESRCH;
+    return WmRegisterClientOrigin(proc,static_cast<uint32_t>(wmId),
+        static_cast<uint16_t>(credentials.pid),incarnation,launchId)?0:-EPERM;
+}
+
 static int64_t sys_brook_wm_set_app_id(uint64_t wmId, uint64_t appIdPtr,
                                       uint64_t, uint64_t, uint64_t, uint64_t)
 {
@@ -12110,6 +12146,7 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
             return error;
         }
         usd->peerCredentials = server->peerCredentials;
+        usd->peerIncarnation=server->peerIncarnation;usd->peerLaunchId=server->peerLaunchId;
         usd->rxPipe = pipeSC;
         usd->txPipe = pipeCS;
         usd->incomingFds = fdqSC;
@@ -12123,6 +12160,7 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         pending.serverRxFds = fdqCS;
         pending.serverTxFds = fdqSC;
         pending.clientCredentials = UnixCurrentCredentials(proc);
+        pending.clientIncarnation=UnixCurrentIncarnation(proc);pending.clientLaunchId=proc->launchId;
         pending.used = true;
         ++server->pendingCount;
         if (server->acceptWaiter) {
@@ -12453,8 +12491,10 @@ static int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
         if (usd->state == UnixSocketData::State::Connected) return -EINVAL;
         SpinLockAcquire(&g_unixRegistryLock);
         // Linux captures listener identity on the first listen, not at accept.
-        if (usd->state != UnixSocketData::State::Listening)
+        if (usd->state != UnixSocketData::State::Listening) {
             usd->peerCredentials = UnixCurrentCredentials(proc);
+            usd->peerIncarnation=UnixCurrentIncarnation(proc);usd->peerLaunchId=proc->launchId;
+        }
         usd->state = UnixSocketData::State::Listening;
         SpinLockRelease(&g_unixRegistryLock);
         if (!UnixRegisterServer(usd)) return -ENOMEM;
@@ -12509,6 +12549,8 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
                 serverSock->state = UnixSocketData::State::Connected;
                 serverSock->socketType = usd->socketType;
                 serverSock->peerCredentials = pending.clientCredentials;
+                serverSock->peerIncarnation=pending.clientIncarnation;
+                serverSock->peerLaunchId=pending.clientLaunchId;serverSock->acceptedEndpoint=true;
                 serverSock->nonblock = (flags & UNIX_SOCK_NONBLOCK) != 0;
                 serverSock->rxPipe = pending.serverRx;
                 serverSock->txPipe = pending.serverTx;
@@ -12649,6 +12691,7 @@ static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     endA->refCount = 1;
     endA->socketType = static_cast<uint32_t>(type) & 0xfu;
     endA->peerCredentials = UnixCurrentCredentials(proc);
+    endA->peerIncarnation=UnixCurrentIncarnation(proc);endA->peerLaunchId=proc->launchId;
     endA->rxPipe = pipeBtoA;
     endA->txPipe = pipeAtoB;
     endA->incomingFds = fdqBtoA;
@@ -12659,6 +12702,7 @@ static int64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t protocol,
     endB->refCount = 1;
     endB->socketType = static_cast<uint32_t>(type) & 0xfu;
     endB->peerCredentials = endA->peerCredentials;
+    endB->peerIncarnation=endA->peerIncarnation;endB->peerLaunchId=endA->peerLaunchId;
     endB->rxPipe = pipeAtoB;
     endB->txPipe = pipeBtoA;
     endB->incomingFds = fdqAtoB;
@@ -13344,6 +13388,7 @@ void SyscallTableInit()
     // and Windows syscall ranges.
     g_syscallTable[0xB00]                = sys_brook_wm_set_window_properties; // WM_SET_WINDOW_PROPERTIES
     g_syscallTable[0xB01]                = sys_brook_wm_set_app_id;
+    g_syscallTable[0xB05]                = sys_brook_wm_set_client_socket;
     g_syscallTable[0xB02]                = sys_brook_wm_theme;
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     g_syscallTable[0xB04]                = sys_brook_wm_scale;

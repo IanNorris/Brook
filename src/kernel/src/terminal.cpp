@@ -1337,10 +1337,9 @@ void TerminalRestoreAfterExec(Process* proc)
     }
 }
 
-void TerminalClose(Terminal* t)
+static void CloseTerminalLocked(Terminal* t)
 {
     if (!t) return;
-    TerminalStateGuard state;
     if (!t->active && !t->vfb) return;
 
     SerialPrintf("TERMINAL: closing terminal (bash pid=%u)\n",
@@ -1382,6 +1381,21 @@ void TerminalClose(Terminal* t)
     // Wake the terminal thread so it can exit its loop
     if (t->thread && t->thread!=ProcessCurrent())
         SchedulerUnblock(t->thread);
+}
+
+void TerminalClose(Terminal* t)
+{
+    TerminalStateGuard state;CloseTerminalLocked(t);
+}
+
+bool TerminalCloseForProcess(Process* owner)
+{
+    TerminalStateGuard state;
+    for(uint32_t i=0;i<g_terminalCount;++i) {
+        auto& terminal=g_terminals[i];
+        if(terminal.child==owner) {CloseTerminalLocked(&terminal);return true;}
+    }
+    return false;
 }
 
 static bool ResizeTerminalLocked(Terminal* t, uint32_t newW, uint32_t newH)

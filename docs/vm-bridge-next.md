@@ -6,8 +6,11 @@ extraction and artifact capability revision 1. Existing artifacts without a
 recorded monotonic creation time report it as unknown. Bridge 0.4.0 adds
 structured command jobs, bounded separate output, exit/descendant/EOF tracking,
 durable request identities, verified staging recovery and reserved control
-capacity. Output artifacts after shutdown, job cancellation, semantic UI
-controls, observation bundles and remaining sections are still proposed.
+capacity. Bridge 0.5.0 passes [isolated acceptance](vm-bridge-ui-acceptance.md) with boot-epoch guarded jobs and semantic
+window discovery/actions, provider/connection-origin identity and per-action
+window observations. Actual launcher activation, output artifacts after shutdown,
+job cancellation, frame/process/error observation bundles and remaining sections
+are still proposed.
 Current behavior is documented in the
 [bridge README](../tools/vm_bridge/README.md). Preserve the existing VM-only
 architecture and [completed-frame capture contract](completed-frame-capture.md).
