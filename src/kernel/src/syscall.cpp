@@ -13032,7 +13032,9 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
 
-        if(flagsVal&~(0x40ULL|0x40000000ULL))return -95;
+        // MSG_NOSIGNAL is also accepted on receive by Linux. Receives never
+        // generate SIGPIPE; audio IPC uses it with MSG_CMSG_CLOEXEC.
+        if(flagsVal&~(0x40ULL|0x4000ULL|0x40000000ULL))return -95;
         if(msg->msg_controllen && !UserBufferWritable(reinterpret_cast<uint64_t>(msg->msg_control),msg->msg_controllen))return -EFAULT;
         const uint64_t capacity=msg->msg_controllen;
         UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;

@@ -1,5 +1,21 @@
 # Recovery and VM-control backlog
 
+- Firefox audio IPC now passes its Unix receive-flag dependency: Linux and
+  Brook both pass the four-case SCM_RIGHTS/epoll/EOF probe after accepting
+  MSG_NOSIGNAL on receive. The normal backend reaches PulseAudio but remains
+  blocked; a separate ALSA-selected profile emits PCM through audio IPC with
+  severe silence/lost frames. Continue device-clock/delay and backend selection
+  work; do not treat this as audio acceptance. The candidate also records a
+  recovered virtio-blk timeout. See [evidence](unix-recv-flags.md).
+- Unix getsockname/getpeername still use the INET-only descriptor lookup.
+  Python's high-level socketpair wrapper consequently fails with EBADF while
+  rewrapping a valid Unix descriptor. Implement Unix address-query semantics
+  separately, including unnamed/socketpair, bound/accepted and short-buffer
+  cases; the receive-flag probe deliberately uses C socket objects directly.
+- Strace name/all toggles iterate only PIDs 1 through 255, while MAX_PROCESSES
+  is 1024. Audit snapshot/lifetime-safe targeting and disable behavior for
+  higher-numbered threads; do not assume a name/all toggle covered every task.
+
 - Ext2 process-associated GETLK/SETLK now use real inode-based record locks and
   logical-close cleanup. See [record-lock evidence and limits](record-locks.md).
   Complete cancellation-safe blocking SETLKW/deadlock detection, OFD ownership,
