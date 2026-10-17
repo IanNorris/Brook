@@ -1,4 +1,5 @@
 #include "terminal.h"
+#include "desktop_identity.h"
 #include "pipe.h"
 #include "process.h"
 #include "shell.h"
@@ -1113,12 +1114,17 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     }
 
     uint32_t envIdx = 0;
+    char userEnv[32], loginEnv[32];
+    LaunchIdentityEnvironment(userEnv, false, DesktopUid);
+    LaunchIdentityEnvironment(loginEnv, true, DesktopUid);
     // Copy base env, but skip entries we override (PATH, TERMINFO).
     for (uint32_t i = 0; i < baseN; ++i) {
         const char* e = baseEnv[i];
         // Skip PATH= so we can put /boot/BIN first.
         if (e[0]=='P'&&e[1]=='A'&&e[2]=='T'&&e[3]=='H'&&e[4]=='=') continue;
         if (e[0]=='T'&&e[1]=='E'&&e[2]=='R'&&e[3]=='M'&&e[4]=='I'&&e[5]=='N'&&e[6]=='F'&&e[7]=='O'&&(e[8]=='='||e[8]=='_')) continue;
+        if (!strcmp(e, "USER=root")) e = userEnv;
+        if (!strcmp(e, "LOGNAME=root")) e = loginEnv;
         bashEnvp[envIdx++] = e;
     }
     // Terminal-specific additions
@@ -1135,7 +1141,7 @@ int TerminalCreate(uint32_t clientW, uint32_t clientH)
     bashEnvp[envIdx]   = nullptr;
 
     Process* child = ProcessCreate(elfData, st.size, 1, bashArgv,
-                                   static_cast<int>(envIdx), bashEnvp, stdFds);
+                                   static_cast<int>(envIdx), bashEnvp, stdFds, DesktopUid, DesktopGid);
     kfree(elfData);
     kfree(bashEnvp);
 

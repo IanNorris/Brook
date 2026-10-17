@@ -18,7 +18,7 @@ mkdir -p "$XDG_CONFIG_HOME/VSCodium-brook" "$XDG_DATA_HOME/VSCodium-brook/extens
 unset DISPLAY
 # Keep shared allocations on Brook's supported /dev/shm backend.
 exec /nix/profile/bin/brook-run /nix/profile/bin/codium \
-  --no-sandbox --no-zygote --disable-chromium-sandbox \
+  --no-sandbox --disable-chromium-sandbox \
   --disable-gpu --disable-crash-reporter --ozone-platform=wayland \
   --user-data-dir="$XDG_CONFIG_HOME/VSCodium-brook" \
   --extensions-dir="$XDG_DATA_HOME/VSCodium-brook/extensions" "$@"

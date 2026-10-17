@@ -253,12 +253,20 @@ os.write(FD,json.dumps({'passed':True,'detail':{'uid':u,'gid':g,'auxv':a,'groups
 def capability_errors(_):
     header = (ctypes.c_uint32 * 2)(0x20080522, 0)
     data = (ctypes.c_uint32 * 6)(*[0xdeadbeef]*6)
-    for number in (125, 126):
-        denied(errno.ENOSYS, lambda: raw(number, ctypes.addressof(header), ctypes.addressof(data)))
-        assert list(data) == [0xdeadbeef]*6
+    if all(os.getresuid()):
+        assert raw(125,ctypes.addressof(header),ctypes.addressof(data)) == 0
+        assert list(data) == [0]*6
+        data[0] = 1
+        denied(errno.EPERM,lambda:raw(126,ctypes.addressof(header),ctypes.addressof(data)))
+        data[0] = 0
+        assert raw(126,ctypes.addressof(header),ctypes.addressof(data)) == 0
+    else:
+        for number in (125, 126):
+            denied(errno.ENOSYS, lambda: raw(number, ctypes.addressof(header), ctypes.addressof(data)))
+            assert list(data) == [0xdeadbeef]*6
     for option in (7,8,21,22,23,24,27,28,38,39,47):
         denied(errno.EINVAL, lambda: raw(157, option, 0, 0, 0, 0))
-    return 'unsupported capability/security controls fail explicitly without writing buffers'
+    return 'empty self capabilities for nonroot IDs; root-capable/security controls remain unsupported'
 
 try:
     child_case('queries', queries, False)

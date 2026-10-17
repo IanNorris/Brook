@@ -7242,11 +7242,61 @@ static int64_t sys_setresgid(uint64_t real, uint64_t effective, uint64_t saved, 
     return ChangeIds(true, CredentialChange::Res, real, effective, saved);
 }
 
-// No capability model is implemented. Do not fabricate capability queries or
-// claim that a privilege drop happened. In particular, never write a V3-sized
-// result into an unchecked pointer or a smaller V1 buffer.
-static int64_t sys_capget(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { return -ENOSYS; }
-static int64_t sys_capset(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { return -ENOSYS; }
+// Empty-capability API for tasks without retained root IDs. The current UID
+// rules cannot introduce zero into an all-nonzero tuple, and exec grants no
+// set-ID/file capabilities. Revisit this invariant before adding either feature.
+// Root-capable tasks remain unsupported: do not pretend an empty capset drops
+// their UID-based privileges. Bounding/ambient sets and securebits are separate.
+static bool EmptyCapabilitiesSupported(Process* proc) {
+    CredentialIds ids = ProcessReadIds(proc, false);
+    return ids.real != 0 && ids.effective != 0 && ids.saved != 0;
+}
+static int CapabilityWords(uint64_t header, bool queryOnly) {
+    if (!UserBufferReadable(header, sizeof(uint32_t))) return -EFAULT;
+    uint32_t version;
+    memcpy(&version, reinterpret_cast<const void*>(header), sizeof(version));
+    if (version == 0x19980330U) return 3; // V1: one 3-word structure.
+    if (version == 0x20071026U || version == 0x20080522U) return 6; // V2/V3.
+    if (!UserBufferWritable(header, sizeof(uint32_t))) return -EFAULT;
+    version = 0x20080522U;
+    memcpy(reinterpret_cast<void*>(header), &version, sizeof(version));
+    // Linux permits version discovery using capget(header, NULL).
+    return queryOnly ? 0 : -EINVAL;
+}
+static int64_t sys_capget(uint64_t header, uint64_t data, uint64_t,
+                          uint64_t, uint64_t, uint64_t) {
+    auto* proc = ProcessCurrent(); if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if (!EmptyCapabilitiesSupported(proc)) return -ENOSYS;
+    int words = CapabilityWords(header, !data);
+    if (words <= 0) return words;
+    if (!data) return 0; // Valid-version null data does not require the PID field.
+    if (!UserBufferReadable(header + sizeof(uint32_t), sizeof(int32_t))) return -EFAULT;
+    int32_t pid;
+    memcpy(&pid, reinterpret_cast<const void*>(header + sizeof(uint32_t)), sizeof(pid));
+    if (pid < 0) return -EINVAL;
+    if (pid && pid != proc->pid) return -ENOSYS; // Foreign queries not implemented.
+    if (!UserBufferWritable(data, words * sizeof(uint32_t))) return -EFAULT;
+    memset(reinterpret_cast<void*>(data), 0, words * sizeof(uint32_t));
+    return 0;
+}
+static int64_t sys_capset(uint64_t header, uint64_t data, uint64_t,
+                          uint64_t, uint64_t, uint64_t) {
+    auto* proc = ProcessCurrent(); if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if (!EmptyCapabilitiesSupported(proc)) return -ENOSYS;
+    int words = CapabilityWords(header, false);
+    if (words < 0) return words;
+    if (!UserBufferReadable(header + sizeof(uint32_t), sizeof(int32_t))) return -EFAULT;
+    int32_t pid;
+    memcpy(&pid, reinterpret_cast<const void*>(header + sizeof(uint32_t)), sizeof(pid));
+    if (pid && pid != proc->pid) return -EPERM;
+    uint32_t values[6] = {};
+    if (!UserBufferReadable(data, words * sizeof(uint32_t))) return -EFAULT;
+    memcpy(values, reinterpret_cast<const void*>(data), words * sizeof(uint32_t));
+    for (int i = 0; i < words; ++i) if (values[i]) return -EPERM;
+    return 0; // An already-empty state remains empty.
+}
 
 static int64_t sys_getgroups(uint64_t size, uint64_t listAddr, uint64_t,
                               uint64_t, uint64_t, uint64_t) {

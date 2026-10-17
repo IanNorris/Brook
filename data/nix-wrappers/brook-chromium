@@ -1,14 +1,19 @@
 #!/nix/profile/bin/bash
 # Experimental software Wayland browser; Chromium's sandbox is unsupported.
 set -eu
+if [ "$EUID" -eq 0 ]; then
+  echo 'brook-chromium: launch from Applications or use: run --uid 1000 /nix/bin/brook-chromium [URLs...]' >&2
+  exit 64
+fi
 export HOME=/data/home
 export XDG_CONFIG_HOME=$HOME/.config XDG_CACHE_HOME=$HOME/.cache
 export XDG_DATA_HOME=$HOME/.local/share
-export TMPDIR=$XDG_CACHE_HOME/chromium/tmp
-mkdir -p "$XDG_CONFIG_HOME/chromium" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$TMPDIR"
+export TMPDIR=$XDG_CACHE_HOME/chromium-brook/tmp
+# Preserve the older root-run profile; this state belongs to the desktop user.
+mkdir -p "$XDG_CONFIG_HOME/chromium-brook" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$TMPDIR"
 unset DISPLAY
 exec /nix/profile/bin/brook-run /nix/profile/bin/chromium \
   --no-sandbox --disable-gpu --disable-background-networking \
   --disable-component-update --disable-extensions --renderer-process-limit=2 \
   --disable-crash-reporter --no-first-run --no-default-browser-check \
-  --ozone-platform=wayland --user-data-dir="$XDG_CONFIG_HOME/chromium" "$@"
+  --ozone-platform=wayland --user-data-dir="$XDG_CONFIG_HOME/chromium-brook" "$@"

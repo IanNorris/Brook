@@ -259,6 +259,44 @@ filesystem checks. Kernel:
 
 ## Delivery order and acceptance
 
+### Default desktop identity checkpoint (2026-10-17)
+
+The kernel shell now defaults new app launches to Brook UID 1000:GID 100,
+including bare executable commands. Native Terminal starts Bash with the same
+identity and USER/LOGNAME. Maintenance commands that need root must explicitly
+use `run --uid 0`. This changes the desktop default; it does not complete the
+directory authorization audit above or introduce a login boundary.
+
+Nonroot tasks whose real, effective and saved UIDs are all nonzero support
+empty self capability queries and empty capset operations. Nonempty grants fail
+with EPERM. V1/V2/V3 buffer sizes and version negotiation are checked separately.
+Root or retained-root tuples still return ENOSYS; securebits, bounding/ambient
+sets and other unsupported security controls are not implemented. This contract
+depends on exec not granting set-ID or file capabilities.
+
+`scripts/workloads/capabilities.py` passed five Linux comparison groups and nine
+Brook groups (including retained-root cases). Session
+`8de9d8f0f0694d3bbe967496527c984a` also passed all six nonroot identity groups
+using the default launch, without a UID override. Kernel SHA256:
+`9b3efe47b5b55d2d64761a73785be995b6df039b0b02adbe11c3880761204288`.
+The candidate built successfully; hosted tests and shutdown/reboot acceptance
+have not yet been repeated for this checkpoint.
+
+Chromium rejects root launches and uses a separate chromium-brook profile,
+preserving its previous root profile. Both Chromium and Codium retain their
+normal zygote path. Chromium rendered Google's HTTPS consent page as Brook.
+Launching Codium alongside it still produced ELF allocation failures and a
+crashed editor window. Guest usage reached about 3.8 GB of 4.24 GB physical
+memory. Concurrent browser/editor use is therefore not accepted. The same run
+also logged a Chromium thread scheduler stall, which needs investigation.
+
+Installer reliability remains a prerequisite for App Gallery: the candidate's
+profile manifest contains an overwritten row after append-mode writes. Vnode
+O_APPEND handling needs an atomic inode-level fix and regression coverage before
+repairing registration. The existing Firefox package is indexed as
+`firefox-stock`; its wrapper exists but its desktop registration is missing.
+Neither browser reacceptance nor manifest repair is complete at this checkpoint.
+
 1. Fix contradictory identity queries and false-success credential operations,
    with small Linux/guest comparison probes. Establish one named desktop identity
    and a matching primary group, environment and persistent directory layout.

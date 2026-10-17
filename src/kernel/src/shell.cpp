@@ -419,7 +419,7 @@ static Process* SpawnProcess(const char* path, int argc, const char* const* argv
     int envc = 0;
     while (g_defaultEnvp[envc]) ++envc;
 
-    const uint32_t uid = uidOverride == CredentialUnchanged ? 0 : uidOverride;
+    const uint32_t uid = uidOverride == CredentialUnchanged ? DesktopUid : uidOverride;
     const uint32_t gid = gidOverride == CredentialUnchanged ? LaunchPrimaryGroup(uid) : gidOverride;
     const char* launchEnv[sizeof(g_defaultEnvp) / sizeof(g_defaultEnvp[0])];
     char userEnv[32], loginEnv[32];
