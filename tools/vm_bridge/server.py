@@ -29,6 +29,7 @@ from jobs import Jobs
 from ui import Ui
 from observation import Observations, StaleObservation, validate_selection
 from frame_views import FrameViews
+import reset as reset_control
 
 MAX_LOG = 256 * 1024
 
@@ -252,11 +253,13 @@ def doctor(session, **_):
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
-                  "generation": data["generation"], "server_version": "0.9.0",
+                  "generation": data["generation"], "server_version": "0.9.1",
                   "bridge_capabilities": {"artifact_delivery": {"revision": 1,
                       "default": "references", "include_image": True,
                       "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
         result['bridge_capabilities']['frame_views']={'revision':1,'tiny_width':320,'medium_width':960,'cached_crops':True,'coordinate_overlay':True,'crop_coordinates':'native_frame','extra_vm_capture':False}
+        result['bridge_capabilities']['verified_reset']={'revision':1,'launch_reboot_action':data.get('qemu_reboot_action'),
+            'recovery_tool':'vm_reset_status','verification':'Running QMP and different nonzero guest boot; missing prior epoch remains unverified'}
         result['bridge_capabilities']['observation_bundles']={'revision':1,'components':['frame','windows','processes','launches','errors'],
             'atomic':False,'frame_window_correspondence':'unverified','errors_source':'bounded serial-pattern scan'}
         try:
@@ -316,11 +319,13 @@ def start(scenario="desktop", gpu="software", **_):
             "message": "Launch continues independently; discover it with vm_sessions"}
 
 
-def control(session, action, force=False, **_):
+def control(session, action, force=False, wait_s=20, _cancel=None, **_):
     if not isinstance(force, bool):
         raise ValueError("force must be a boolean")
     if force and action not in {"stop", "reset"}:
         raise ValueError("force is only supported for stop/reset")
+    if isinstance(wait_s,bool) or not isinstance(wait_s,(int,float)) or not 0<=wait_s<=20:
+        raise ValueError('wait_s must be 0–20')
     if action in {"takeover", "release"}:
         load_session(session)
         ui=window_ui()
@@ -362,17 +367,24 @@ def control(session, action, force=False, **_):
                     ) from error
                 sync_result = {"guest_sync_completed": False, "forced": True,
                                "sync_error": str(error)}
-        with QMP(session) as q:
-            if action == "reset":
-                # Keep earlier crash logs, but do not classify the new boot by them.
-                data["generation_log_offset"] = Path(data["serial_log"]).stat().st_size
-            q.call(commands[action])
         if action == "reset":
-            data["generation"] = uuid.uuid4().hex
-            write_json(REGISTRY/session/"session.json",data)
-            for name in ["last-frame.json","frame-source.json"]:
-                (REGISTRY/session/name).unlink(missing_ok=True)
+            return {"action":action,"session":session,**sync_result,
+                **reset_control.perform(session,data,REGISTRY,guest,QMP,wait_s,_cancel)}
+        with QMP(session) as q:q.call(commands[action])
         return {"action": action, "session": session, **sync_result}
+
+
+def reset_status(session,**_):
+    data=load_session(session,live=False)
+    if data['state']!='running' or not process_is_alive(data['pid'],data['process_identity']):
+        return {'session':session,**reset_control.status(session,data,REGISTRY,guest,QMP,available=False)}
+    try:
+        with session_lock(session) as data:
+            return {'session':session,**reset_control.status(session,data,REGISTRY,guest,QMP)}
+    except (OSError,ValueError):
+        data=load_session(session,live=False)
+        if process_is_alive(data['pid'],data['process_identity']):raise
+        return {'session':session,**reset_control.status(session,data,REGISTRY,guest,QMP,available=False)}
 
 
 def observe(session, crop=None, max_width=None, include=None, since_event_cursor=None,
@@ -915,7 +927,8 @@ def register(name,fn,description,props=None,required=None,readonly=False):
 register("vm_sessions",sessions,"Discover opted-in user/agent VM runs; no desktop discovery",readonly=True)
 register("vm_doctor",doctor,"VM transport and guest readiness; capabilities distinguish unsupported paths",SESSION,["session"],True)
 register("vm_start",start,"Boot a named experiment on new disk clones with playback off",{"scenario":STR,"gpu":STR})
-register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop/reset await guest sync, force explicitly allows unsynced shutdown",{**SESSION,"action":STR,"force":{"type":"boolean"}},["session","action"])
+register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop/reset await guest sync; reset verifies a different guest boot, never infer restart from QMP acknowledgement; force explicitly permits unsynced shutdown",{**SESSION,"action":STR,"force":{"type":"boolean"},"wait_s":NUM},["session","action"])
+register("vm_reset_status",reset_status,"Read-only recovery of the last reset: QMP state and changed guest boot identity; never resets/resumes or changes QEMU policy",SESSION,["session"],True)
 OBSERVATION_OPTIONS={**IMAGE_OPTION,
     "include":{"type":"array","items":{"type":"string","enum":["frame","windows","processes","launches","errors"]},"minItems":1,"maxItems":5},
     "since_event_cursor":{"type":"object"},"error_limit_bytes":INT,"error_limit_events":INT,
@@ -1008,7 +1021,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.9.0"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.9.1"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":

@@ -58,6 +58,7 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_sessions`, `vm_doctor` | Discover opted-in runs and inspect actual transport/guest capabilities. Select an explicit session. |
 | `vm_start` | Clone seed disks and start `desktop`, `video`, `quake-soft`, `quake-gl3` or `office`; `gpu` is `software` or `gl`. Audio defaults to `none`. |
 | `vm_control` | `pause`, `resume`, `reset`, `stop`, `takeover`, `release`, or controlled `panic`. Stop/reset wait for guest metadata sync; explicit `force: true` permits shutdown when sync cannot complete. Reset changes the generation and invalidates frames. |
+| `vm_reset_status` | Inspect the last reset attempt without resetting/resuming again. Preserves historical restart evidence even after pause/exit, separately from current guest readiness. |
 | `vm_observe` | Return PNG artifact reference and frame ID, native geometry, crop origin and scale. Optional native `crop`, `max_width` and opt-in `include_image`; leased completed frame, GPU readback at the frame boundary, and brief VM pause. Requires capture API 2 in the kernel. |
 | `vm_frame` | Read a saved frame as `tiny` (320px), `medium` (960px), full resolution or a native-coordinate crop. Optional `overlay: true` adds a labelled native-coordinate grid. No VM capture; works after stop. |
 | `vm_input` | Ordered key/chord/text/pointer/scroll/relative/hold/wait batches. Coordinates require the current `frame_id`; crop/scale map back to native coordinates. US ASCII text only; holds release at batch end/cancel. Observe to verify reaction. |
@@ -99,6 +100,45 @@ report `created_host_monotonic: null`; `described_host_monotonic` is the current
 description time. This does not invent capture timing from a file's wall clock.
 `vm_doctor.bridge_capabilities.artifact_delivery` advertises revision 1. Reload
 an already running MCP server to receive these source/schema changes.
+
+### Verified reset (bridge 0.9.1)
+
+`vm_control` with `action: "reset"` performs one checked-sync reset, invalidates
+old references before dispatch, and observes QMP state plus a different nonzero
+guest boot identity. `wait_s` controls up to 20 seconds of readiness polling
+(default 20), in addition to sync, dispatch and bounded transport/cleanup time.
+Fresh epochs use the existing first-wins initialization handshake. This verifies
+kernel/debug-transport readiness, not a rendered desktop or application readiness.
+
+A new launch records its reboot policy. For the normal `-no-reboot` launcher,
+reset temporarily selects `reboot=reset`, then restores `reboot=shutdown` as soon
+as QEMU acknowledges the request. Panic/shutdown actions remain untouched.
+Only reset-induced `prelaunch`/`paused` states are eligible for one automatic
+resume; takeover/cancellation suppress it. Late `shutdown → prelaunch`
+transitions are polled. Other stopped/error states are not resumed.
+Old registrations and custom `-action`/`-readconfig` launches with unknown policy
+refuse reset rather than guess what policy to restore. Direct external QMP policy
+changes are outside this contract; the bridge restores the recorded launch policy.
+
+The reply separates `reset_delivery`, historical `restart_verified`, current
+`guest_ready`/`current_restart_observed`/`vm`, and `reboot_policy_restored`.
+Unknown reset delivery is never retried automatically. After a lost response or
+pending verification, call `vm_reset_status` rather than repeating reset. It
+cannot reset, resume or change policy; it may initialize an unset epoch as bridge
+bookkeeping. Its latest-attempt record survives pause and process exit. Historical
+verification has a `verified_guest_boot_id` and monotonic time; a later paused or
+unavailable VM does not erase that fact. A newer host generation reports stale
+current correspondence. This is latest-attempt recovery, not caller-ID deduplication
+or durable storage of every previous reset.
+
+A forced reset with no accessible previous guest epoch can report
+`running_unverified`: the new debug endpoint is ready, but a changed epoch cannot
+be proved. Policy restoration failures are explicit, even if a new boot is later
+verified. Cancellation stops waiting; it cannot undo a reset already sent.
+`accept_reset.py --session SESSION --out build/reset-check --panic` exercises
+normal reset, historical paused status, controlled-panic refusal/forced recovery
+and post-reset capture on an empty agent VM with private cloned disks. It leaves
+the VM running for explicit checked shutdown and offline disk checks.
 
 ### Saved screenshot views (bridge 0.9.0)
 

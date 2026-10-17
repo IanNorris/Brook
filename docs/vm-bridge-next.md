@@ -16,7 +16,9 @@ for frames, windows, tasks, launches and serial errors, with per-component timin
 and boot-guarded frame leases. Bridge 0.8.0 adds optional post-action observation
 bundles without replaying mutations. Bridge 0.9.0 adds automatic 320/960px previews,
 saved native crops and optional native-coordinate ruler/grid overlays, requiring
-no additional VM capture. Exact frame/WM revision correspondence, a lossless
+no additional VM capture. Bridge 0.9.1 adds [accepted verified reset/recovery](vm-bridge-reset.md) with temporary
+reboot-policy override, early reference invalidation and explicit current versus
+historical evidence. Exact frame/WM revision correspondence, a lossless
 guest event stream, output artifacts after shutdown, job cancellation and
 remaining sections are still proposed.
 Current behavior is documented in the

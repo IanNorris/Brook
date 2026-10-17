@@ -2,23 +2,21 @@
 
 ## VM bridge findings, 17 October
 
-- Semantic window controls and boot-epoch guarded jobs are implemented; actual
-  installed-app catalog/launcher activation is the next bridge phase. Follow
+- Semantic window controls and boot-epoch guarded jobs are implemented; installed-app catalog/launcher activation, observation bundles, saved screenshot
+  views and boot-guarded known-frame input are implemented. Follow
   `docs/vm-bridge-next.md` for remaining observation, event, profile/audio and
-  stop conveniences. Migrate legacy index-based focus and coordinate input to
-  guest boot guards too; they do not yet share the new semantic reference contract.
+  stop conveniences. Migrate legacy index-based focus and pre-epoch coordinate frames to the
+  semantic reference contract.
 - Avoid opening one short debug TCP connection per staging chunk/observation
   component. Framed clients now skip replaying the debug ring, but the listener's
   500 ms idle accept sleep remains visible in end-to-end timings. Add a wakeable
   accept path or bounded batched/persistent transport without blocking takeover,
   replaying mutations, or starving manual clients. Measure CPU/observer overhead.
-- Explicit QMP `system_reset` on the `-no-reboot -no-shutdown` experiment run
-  stopped in `shutdown` instead of returning to a usable boot. Recovery used
-  QMP `set-action {reboot:reset}`, another reset and `cont` from `prelaunch`.
-  Make `vm_control reset` verify actual restart/resume and report the VM state;
-  preserve the intentional crash-stop launch policy and never infer successful
-  reboot from a reset command acknowledgement alone. The boot-epoch acceptance
-  kept host generation unchanged through that explicit recovered reset.
+- Bridge 0.9.1 now verifies reset against running QMP state and a new initialized
+  guest epoch, restores the recorded reboot policy, and exposes read-only
+  latest-attempt recovery. See `tools/vm_bridge/README.md`. Durable caller-ID
+  deduplication/reset history and unknown/custom launch policies remain open.
+
 
 ## Workload findings, 16 October
 

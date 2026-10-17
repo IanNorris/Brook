@@ -14,6 +14,7 @@ import time
 import uuid
 
 from common import REGISTRY, QMP, process_identity, write_json
+from reset import launch_reboot_action
 
 
 def recording_display_args(command):
@@ -60,6 +61,7 @@ def supervise(command, kernel, disk, debug_port, provenance, scenario):
                   "boot_disk": str(Path(disk).resolve()), "guest_debug_port": debug_port,
                   "kernel": str(kernel_copy),
                   "kernel_sha256": hashlib.sha256(kernel_copy.read_bytes()).hexdigest(),
+                  "qemu_reboot_action":launch_reboot_action(args),
                   "gpu": os.environ.get("BROOK_GPU", "software"),
                   "render_node": os.environ.get("BROOK_RENDERNODE", "/dev/dri/renderD128"),
                   "cloned_disks": os.environ.get("BROOK_VM_CLONED_DISKS") == "1"}

@@ -109,3 +109,12 @@ before launching the VM. Start is asynchronous: poll until completed or failed.
 Use BROOK_AUDIODEV=none to retain guest sound capture without speaker output.
 Keep masters and timelines under ignored build directories. Timing is observed
 at host transport arrival; upstream drops and exact source A/V timing are unknown.
+
+For reset, quiesce writers first. vm_control action=reset checked-syncs, sends one
+reset and polls a new boot identity; a QMP ACK alone is insufficient. Inspect
+reset_delivery, restart_verified, guest_ready, vm and reboot_policy_restored
+separately. Use vm_reset_status after timeout/pending/uncertain delivery; never
+repeat reset just to recover a reply. Historical verification survives later
+pause/exit. Missing old epoch yields running_unverified, not a verified change.
+Older/custom launches without a known restoration policy refuse reset. Force
+allows unsynced reset only when explicitly authorized for that disposable run.

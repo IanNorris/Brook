@@ -46,9 +46,14 @@ class ShutdownSyncTests(unittest.TestCase):
                 self.assertEqual(timeout, 30)
                 if error is not None: raise error
                 return reply
+            def reset(session,mutable,registry,guest_fn,qmp_factory,wait_s,cancel):
+                mutable['generation']='after';common.write_json(registry/session/'session.json',mutable)
+                with qmp_factory(session) as q:q.call('system_reset')
+                return {'restart_verified':True}
             with patch.object(server, 'REGISTRY', root), \
                  patch.object(server, 'session_lock', lock), \
                  patch.object(server, 'guest', guest), \
+                 patch.object(server.reset_control,'perform',reset), \
                  patch.object(server, 'QMP', lambda _: FakeQMP()):
                 yield events, data, root
 
