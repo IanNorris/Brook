@@ -225,6 +225,14 @@ int FileObjectAppend(FileObject* object,Vnode* vnode,const void* buffer,uint64_t
     if(result>0)*offset=position;
     return result;
 }
+bool FileObjectIsCanonicalLocked(FileObject* object,uint64_t index,PhysicalAddress physical) {
+#ifndef BROOK_HOST_TEST
+    if(!object->gate.locked || object->gate.owner!=ProcessCurrent())
+        KernelPanic("file object: canonical lookup without file gate");
+#endif
+    auto* page=Find(object,index);
+    return page && physical && page->physical==physical;
+}
 bool FileObjectExposeWritableLocked(FileObject* object,Vnode* vnode,uint64_t index,PhysicalAddress physical) {
 #ifndef BROOK_HOST_TEST
     if(!object->gate.locked || object->gate.owner!=ProcessCurrent())

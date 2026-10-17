@@ -95,9 +95,11 @@ private:
 };
 // Narrow truncate foundation: the caller retains the file/backing and owns its
 // file gate through this object's destruction (including ACK). This type cannot
-// change range metadata or publish leaves, and never locks other file gates.
+// change range metadata, and never locks other file gates.
 // Intervals are page-aligned, half-open FILE offsets, not virtual addresses.
-// Do not use it to discard a partial EOF page with private modified prefix data.
+// Resize callers must prepare private restoration before any detach and ACK
+// EVERY target AS before restoring. This primitive does not perform filesystem
+// resize, flush canonical pages, or recover from unknown resulting EOF.
 class FileMappingInvalidation {
 public:
     FileMappingInvalidation(Process* actor, AddressSpaceState* space, MappingBacking* backing);
@@ -105,6 +107,12 @@ public:
     FileMappingInvalidation(const FileMappingInvalidation&) = delete;
     FileMappingInvalidation& operator=(const FileMappingInvalidation&) = delete;
     bool Prepare(uint64_t leafCapacity); // once, outside AS mutation
+    // Optional, once after Prepare and before Detach, outside AS mutation.
+    // Reserves copies for partial boundary pages before destructive work. The
+    // Prefix is the planned min(old EOF, resulting EOF). Caller must confirm
+    // that prefix against actual EOF before restoring after backend mutation;
+    // failed/partial mutation and unknown EOF need separate recovery handling.
+    bool PreparePrivateRestore(uint64_t validPrefix);
     void LockTargetFileAlreadyHeld();
     void Unlock(); // only releases AS mutation; caller still owns file gate
     bool Count(uint64_t fileBegin, uint64_t fileEnd, uint64_t& count) const;
@@ -112,16 +120,30 @@ public:
     // Managed PTE refs survive until destructor's full TLB acknowledgement;
     // borrowed PTEs lose map accounting but never transfer a frame reference.
     bool Detach(uint64_t fileBegin, uint64_t fileEnd);
+    // Unlock AS and ACK once, retaining all detached references. Seals detach.
+    void Acknowledge();
+    // Requires preparation, local ACK, target gate and AS lock. Caller must
+    // first ACK all target spaces. Restores only noncanonical managed private
+    // data below the prepared prefix; partial tails use separate zeroed copies.
+    // Canonical/shared/borrowed leaves remain detached for lazy reload.
+    bool RestorePrivate();
 private:
-    struct Leaf { uint64_t raw; bool managed; };
+    struct Leaf {
+        uint64_t address,offset,raw,boundary;
+        bool managed,privateData;
+    };
     static void Capture(VirtualAddress address, uint64_t raw, void* context);
     void RequireTargetGate() const;
     Process* actor_;
     AddressSpaceState* space_;
     MappingBacking* backing_;
     Leaf* leaves_ = nullptr;
+    PhysicalAddress* boundaries_ = nullptr;
+    uint64_t boundaryCount_ = 0, boundaryUsed_ = 0, validPrefix_ = 0;
     uint64_t capacity_ = 0, count_ = 0;
     bool prepared_ = false, locked_ = false, shootdown_ = false;
+    bool restoreRequested_ = false, restorePrepared_ = false;
+    bool acknowledged_ = false, restored_ = false;
 };
 
 }

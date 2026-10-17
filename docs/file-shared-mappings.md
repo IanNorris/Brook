@@ -260,6 +260,47 @@ truncate consumer yet. It does not implement boundary-page reconciliation,
 backend-error size recovery, typed EOF faults or dirty writeback, and neither
 mapped truncate nor writable regular-file MAP_SHARED is enabled by this pass.
 
+### Private restoration after acknowledgement (17 October)
+
+The invalidation primitive now separates `Acknowledge()` from reference release.
+ACK unlocks AS mutation, invalidates stale translations once, and retains all
+detached frames until restoration or destruction. No further detach is allowed
+after ACK. The caller must acknowledge every participating AS before restoring
+any private data, while retaining the target inode gate throughout.
+
+`PreparePrivateRestore(prefix)` reserves partial-boundary replacement frames
+before detachment, outside AS mutation. Capture identifies managed private frames
+by comparing their exact file offset and physical address against the inode's
+canonical cache. This is a pure gate-owned lookup, safe inside the PT spinlock.
+Canonical, shared and borrowed leaves are not restored by this operation.
+
+`RestorePrivate()` validates all destinations before publication, retains full
+private pages below the prepared limit, and copies partial-page prefixes into
+separate frames with zeroed tails. It never changes the original private frame:
+that frame may still have fork/CoW or independent owners. Original hidden state,
+permissions, CoW, PTE tag and PID are preserved. Restored references transfer back
+to PTEs exactly once; un-restored originals and unused copies remain owned by the
+job until destruction. New frames use the destination AS's PMM allocation PID.
+
+The actual-module hosted test covers two address spaces, multiple aliases,
+hidden pages, an independent retained source owner, preservation of private bytes,
+canonical/shared/borrowed exclusion, above-EOF retirement, zero/aligned/full
+retention limits, heap and partial-frame-allocation failures, delayed ACK with
+retained refs, repeated ACK, exact PTE metadata and allocation-free restoration.
+All 30 hosted suites pass. The production kernel and module import checks pass;
+this path has no production caller, so these are hosted primitive results, not
+guest mapped-truncate acceptance. Logs: `build/private-restore-final-host-20261017.log`
+and `build/private-restore-build-20261017.log`.
+
+The prepared limit must match the actual resulting EOF. A complete resize
+consumer must additionally handle failure before mutation, mutation followed by
+error, and unknown EOF without discarding private data. In particular this API
+does not implement quarantine or permit restoring a planned prefix after an
+unverified backend failure. Post-ACK dirty flush, backend resize/re-stat,
+cache reconciliation, raw kernel-copy fault recovery and runtime acceptance are
+still required. Mapped truncate remains EBUSY and writable regular-file MAP_SHARED
+remains disabled.
+
 
 ### Resident writeback primitive verified on the host (16 October)
 

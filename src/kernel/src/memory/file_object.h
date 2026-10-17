@@ -33,6 +33,9 @@ void FileObjectDispose(FileObject* object);
 // outside AS mutation; backend operations never recursively call the VFS layer.
 PhysicalAddress FileObjectGetPage(FileObject* object,Vnode* vnode,uint64_t index,
                                   bool load,int* error,bool* loaded = nullptr);
+// Pure identity lookup with the inode gate already owned; safe under a PT
+// spinlock. Never allocates, loads a page or acquires another lock.
+bool FileObjectIsCanonicalLocked(FileObject* object,uint64_t index,PhysicalAddress physical);
 // One gate acquisition: load primary if necessary, pin only resident neighbors.
 // Caller bounds count by its VMA and EOF snapshot; publication must still
 // revalidate mapping/file generations. For valid count (1..16), failure clears

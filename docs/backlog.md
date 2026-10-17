@@ -872,6 +872,14 @@ MAP_SHARED remains disabled; mapped resize still returns EBUSY. Renew both full
 bootstrap paths and browser acceptance after the connected implementation.
 FAT retains its prior uncached path.
 
+17 October: target-file invalidation now has explicit ACK/retained references
+and prepared private-prefix restoration, including separate partial-boundary
+copies so fork/CoW owners are not modified in place. Actual-module hosted tests
+cover both AS aliases, hidden/canonical/shared/borrowed leaves, preparation OOM,
+reference transfer and EOF limits; all 30 suites pass. The production resize
+consumer, failed/partial-mutation recovery, unknown-EOF quarantine and kernel
+raw-copy recovery remain open. See `file-shared-mappings.md` for exact scope.
+
 
 ## Current real-workload and desktop follow-ups (2026-10-16)
 
