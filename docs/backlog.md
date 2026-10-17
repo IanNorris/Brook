@@ -877,14 +877,20 @@ and prepared private-prefix restoration, including separate partial-boundary
 copies so fork/CoW owners are not modified in place. Actual-module hosted tests
 cover both AS aliases, hidden/canonical/shared/borrowed leaves, preparation OOM,
 reference transfer and EOF limits; all 30 suites pass. The production resize
-consumer, failed/partial-mutation recovery, unknown-EOF quarantine and kernel
-raw-copy recovery remain open. See `file-shared-mappings.md` for exact scope.
+consumer, connected failed/partial-mutation recovery and kernel raw-copy recovery
+remain open. See `file-shared-mappings.md` for exact scope.
 The restoration API now accepts EOF only after the backend result is known,
 with one reserved boundary frame per populated private range. Exact rollback
 also restores canonical/shared/borrowed aliases after a flush failure before
 the backend resize attempt. Unknown-EOF recovery must block size-changing
 writes until it observes and reconciles current EOF, as well as blocking
 faults and hidden-leaf protection changes.
+The quarantine primitives now enforce those guards, retain private data hidden,
+and recover fork/remap aliases with clamped prefixes, zero tails and preserved
+PROT_NONE/CoW. A finite global writeback pass retires stale cache/queue ownership
+after the last registration while reporting the error. All 30 hosted suites and
+production kernel/module checks pass; filesystem integration and guest failure
+injection are still required before enabling mapped resize.
 
 
 ## Current real-workload and desktop follow-ups (2026-10-16)

@@ -309,14 +309,68 @@ and `build/private-recovery-build-20261017.log`.
 
 The supplied limit must be min(old valid private prefix, actual resulting EOF).
 The primitive now supports exact pre-attempt rollback and arbitrary observed
-EOF. A complete resize consumer must still connect those branches to filesystem
-results and handle unknown EOF without discarding private data. In particular
-this API does not implement quarantine or permit restoring a planned prefix
-after an unverified backend failure. Post-ACK dirty flush, backend resize/re-stat,
+EOF. The quarantine stage below handles unknown EOF while retaining private
+data. A complete resize consumer must still connect those branches to filesystem
+results; a planned prefix cannot substitute for an observed result after a
+backend failure. Post-ACK dirty flush, backend resize/re-stat,
 cache reconciliation, raw kernel-copy fault recovery and runtime acceptance are
 still required. Mapped truncate remains EBUSY and writable regular-file MAP_SHARED
 remains disabled.
 
+
+### Unknown-EOF quarantine and recovery primitives (17 October)
+
+`FileObjectQuarantineLocked` records a negative mapping error, clamps the saved
+valid private prefix without widening it, and advances the file generation.
+Its caller must already hold the inode gate, have acknowledged every detached
+alias, and have successfully flushed canonical pages **before** the backend
+resize attempt. Marking quarantine after a failed pre-attempt flush would violate
+the cache-retirement contract.
+
+`QuarantinePrivate()` returns noncanonical managed-private frames to hidden PTEs
+without changing their contents or allocating copies. Canonical/shared/borrowed
+leaves remain detached. The inode error blocks normal reads/writes/appends,
+canonical page getters, writable exposure and writeback. Faults produce a typed
+I/O outcome; stale prepared faults fail epoch validation. Both mapping creation
+phases, accessible publication and nonzero mprotect reject quarantine. PROT_NONE,
+unmap, exit, hidden-only fork and remap remain available.
+
+Recovery must first observe current EOF before any further size-changing write,
+then capture and ACK all current registrations, including aliases created by
+fork/remap during quarantine. `RestorePrivate` clamps its input to the saved
+prefix. It restores temporary hidden pages according to current range protection,
+so explicit PROT_NONE remains hidden, preserves CoW, and uses separate zero-tailed
+boundary copies. The inode error stays set throughout this phase; the specialized
+invalidation restorer is the narrow publication exception.
+
+Only after every alias is reconciled may `FileObjectCompleteMappingRecoveryLocked`
+evict stale canonical cache, clear quarantine and advance the epoch again. The
+global writeback pass also handles a queue-owned orphan: it reports the stored
+error, but once registrations reach zero it discards the already-flushed stale
+cache and releases the queue vnode outside locks. Independent pins keep their
+own frame references and a still-live inode retains its error. It does not claim
+that flushing the quarantined file succeeded.
+
+Actual-module hosted tests model backend mutation followed by EIO and a failed
+stat, retained private bytes, stale/fresh fault rejection, accessible-publication
+and protection guards, blocked file I/O with unchanged offsets/backend bytes,
+finite orphan queue retirement, hidden fork/remap, registry enumeration of both
+address spaces, recovery clamping after growth, real PROT_NONE versus temporary
+hiding, CoW and zero tails. All 30 suites and production kernel/module checks pass:
+`build/quarantine-host-20261017.log`, `build/quarantine-build-20261017.log`.
+
+These are connected primitive tests, not guest mapped-truncate error injection.
+The filesystem resize consumer and raw kernel-copy fault recovery remain open;
+the production mapped-truncate and writable-sharing guards remain in place.
+
+An isolated 8-core/4-GiB production VM also passes the unchanged native file-fault
+probe 10/10 as UID 1000 with mapping test hooks off. Its checked sync/shutdown,
+QEMU exit and offline data/Nix/FAT checks all finish successfully (exit 0).
+Evidence: `build/workloads/quarantine-20261017/audit.json`, session
+`2fdfb237151b4d5c9e0e1eff387359c9`, kernel SHA-256
+`5ef1f6553816acd302eaec7999d615e92641b3ca19c4954d047347435fe91dd7`.
+This verifies normal file-fault behavior with the new kernel/modules; it does
+not exercise production quarantine, mapped resize, SQLite WAL or Firefox audio.
 
 ### Resident writeback primitive verified on the host (16 October)
 

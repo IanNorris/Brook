@@ -118,6 +118,9 @@ VmmMapResult MappingTransaction::Publish(uint64_t index, VirtualAddress address,
         KernelPanic("mapping: invalid prepared publication");
     if (tag == MemTag::Device && fresh_[index].managed)
         KernelPanic("mapping: managed prepared page cannot use borrowed Device tag");
+    const auto* range=MappingRangeFind(space_->ranges,address.raw());
+    if (accessible && range && range->backing && range->backing->file && range->backing->file->mappingError)
+        return VmmMapResult::InvalidAddress;
     auto result = VmmTryMapPage(space_->pageTable, address, fresh_[index].physical, flags, tag, pid, accessible);
     if (result == VmmMapResult::Mapped) {
         fresh_[index].published = true;
@@ -219,6 +222,10 @@ bool MappingTransaction::PrivateLeaf(VirtualAddress address, uint64_t, void* con
 }
 bool MappingTransaction::ProtectMapping(uint64_t begin, uint64_t end, uint32_t protection) {
     if (!locked_) KernelPanic("mapping: protection without lock");
+    if (protection)for(auto* node=space_->ranges.head;node && node->range.begin<end;node=node->next) {
+        const auto& range=node->range;
+        if(range.end>begin && range.backing && range.backing->file && range.backing->file->mappingError)return false;
+    }
     if (!ranges_.CanProtect(space_->ranges,begin,end,protection)) return false;
     if (!VmmProtectRange(space_->pageTable,begin,end,protection,PrivateLeaf,this)) return false;
     if (!ranges_.Protect(space_->ranges,begin,end,protection)) KernelPanic("mapping: protection preflight changed under lock");
@@ -262,6 +269,8 @@ bool MappingTransaction::ValidateRange(const MappingFaultSnapshot& snapshot, uin
 MappingFaultCommit MappingTransaction::PublishFault(const MappingFaultSnapshot& snapshot, uint64_t index,
                                                     VirtualAddress address, uint32_t access, bool copyOnWrite) {
     if (!ValidateRange(snapshot,address.raw(),access)) return MappingFaultCommit::Stale;
+    if (snapshot.range.backing && snapshot.range.backing->file && snapshot.range.backing->file->mappingError)
+        return MappingFaultCommit::Failed;
     if (copyOnWrite && (snapshot.range.sharing != MappingSharing::Private ||
         snapshot.range.leafOwnership != MappingLeafOwnership::Managed)) return MappingFaultCommit::Failed;
     uint64_t flags = VMM_USER;
@@ -408,12 +417,17 @@ bool FileMappingInvalidation::Detach(uint64_t begin,uint64_t end) {
     ++space_->generation;shootdown_=true;return true;
 }
 bool FileMappingInvalidation::RestorePrivate(uint64_t validPrefix) {
+    RequireTargetGate();
+    if(backing_->file->privateValidPrefix<validPrefix)validPrefix=backing_->file->privateValidPrefix;
     return Restore(false,validPrefix);
 }
 bool FileMappingInvalidation::RestoreAll() { return Restore(true,0); }
-bool FileMappingInvalidation::Restore(bool all,uint64_t validPrefix) {
+bool FileMappingInvalidation::QuarantinePrivate() { return Restore(false,~uint64_t{0},true); }
+bool FileMappingInvalidation::Restore(bool all,uint64_t validPrefix,bool quarantine) {
     RequireTargetGate();
-    if (!locked_ || !acknowledged_ || (!all && !restorePrepared_) || restored_) return false;
+    const bool recovering=backing_->file->mappingError!=0;
+    if (!locked_ || !acknowledged_ || (!all && !quarantine && !restorePrepared_) || restored_ ||
+        (quarantine && !recovering) || (all && recovering)) return false;
     // File gate excludes range changes and leaf publication for this inode.
     // Validate every destination before restoring the first reference.
     uint64_t restoring=0,boundaries=0;
@@ -428,7 +442,7 @@ bool FileMappingInvalidation::Restore(bool all,uint64_t validPrefix) {
             VmmReadLeaf(space_->pageTable,VirtualAddress(leaf.address)))
             KernelPanic("mapping: private restore destination changed");
         ++restoring;
-        if (!all && validPrefix-leaf.offset<4096) ++boundaries;
+        if (!all && !quarantine && validPrefix-leaf.offset<4096) ++boundaries;
     }
     if (boundaries>boundaryCount_) KernelPanic("mapping: unprepared private boundary");
     if (restoring && space_->generation==~uint64_t{0}) KernelPanic("mapping: generation exhausted");
@@ -437,7 +451,7 @@ bool FileMappingInvalidation::Restore(bool all,uint64_t validPrefix) {
         auto& leaf=leaves_[i];
         if (!all && (!leaf.privateData || leaf.offset>=validPrefix)) continue;
         PhysicalAddress physical=VmmLeafPhysical(leaf.raw);
-        const bool copy=!all && validPrefix-leaf.offset<4096;
+        const bool copy=!all && !quarantine && validPrefix-leaf.offset<4096;
         if (copy) {
             physical=boundaries_[boundary];
             const uint64_t prefix=validPrefix-leaf.offset;
@@ -448,8 +462,12 @@ bool FileMappingInvalidation::Restore(bool all,uint64_t validPrefix) {
         const uint64_t flags=leaf.raw&(0xffULL|VMM_NO_EXEC|PTE_COW_BIT);
         const auto tag=static_cast<MemTag>((leaf.raw&PTE_TAG_MASK)>>PTE_TAG_SHIFT);
         const auto pid=static_cast<uint16_t>((leaf.raw&PTE_PID_MASK)>>PTE_PID_SHIFT);
+        // Quarantine hides an otherwise accessible private leaf. Metadata still
+        // distinguishes true PROT_NONE from those temporarily hidden leaves.
+        const auto* range=MappingRangeFind(space_->ranges,leaf.address);
+        const bool accessible=!quarantine && (recovering?range->protection!=0:(leaf.raw&VMM_PRESENT)!=0);
         if (VmmTryMapPage(space_->pageTable,VirtualAddress(leaf.address),physical,flags,tag,pid,
-                         (leaf.raw&VMM_PRESENT)!=0)!=VmmMapResult::Mapped)
+                         accessible)!=VmmMapResult::Mapped)
             KernelPanic("mapping: prepared private restore failed");
         if (copy) boundaries_[boundary++]=PhysicalAddress{};
         else leaf.managed=false; // detached reference transferred back to PTE

@@ -5,6 +5,7 @@
 #include "string.h"
 #include "heap.h"
 #include "serial.h"
+#include "file_object.h"
 
 namespace brook {
 // Source metadata and leaves are stable under AS.mutation. Destination is not
@@ -317,6 +318,8 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
         MappingTransaction operation(actor,space,request.range.backing);
         PmmThrottleForDrain();
         if(!operation.Lock())return failure.Fail("gate-set-snapshot",-12);
+        if(request.range.backing && request.range.backing->file && request.range.backing->file->mappingError)
+            return failure.Fail("file-quarantine",request.range.backing->file->mappingError);
         const uint64_t address = PickMappingAddress(space,request);
         if (!address) return failure.Fail("address-gap",-12);
         const uint64_t end = address+request.length;
@@ -335,6 +338,8 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
             if (!operation.PreparedPage(i)) return failure.Fail("prepared-page-missing",-12);
         if (request.preparedPages && !VmmPrepareRange(space->pageTable,address,end)) return failure.Fail("page-table-prepare",-12);
         if(!operation.Lock())return failure.Fail("gate-set-commit",-12);
+        if(request.range.backing && request.range.backing->file && request.range.backing->file->mappingError)
+            return failure.Fail("file-quarantine",request.range.backing->file->mappingError);
         if (space->generation != generation) continue;
         MappingRange range = request.range;
         range.begin = address; range.end = end; range.identity = 0;
@@ -387,6 +392,8 @@ int64_t UserMappingProtect(Process* actor, AddressSpaceState* space, uint64_t ad
         const auto* range = MappingRangeFind(space->ranges,at);
         if (!range) return -12;
         if (protection & ~range->maximumProtection) return -13;
+        if (protection && range->backing && range->backing->file && range->backing->file->mappingError)
+            return range->backing->file->mappingError;
         at = range->end < end ? range->end : end;
     }
     return operation.ProtectMapping(address,end,protection) ? 0 : -12;

@@ -1380,6 +1380,129 @@ static void privateRestoreObservedEof() {
     std::puts("PRIVATE RESTORE EOF PASS deferred-boundary/zero/aligned/full-retention/source-unchanged/no-restore-allocation");
 }
 
+static void targetQuarantineRecovery() {
+    auto root=table();VmmHostSetKernelRoot(root);AddressSpaceKernelInit();
+    auto* space=AddressSpaceCreate(50);auto* child=AddressSpaceCreate(51);
+    Process actor{};actor.addressSpace=space;
+    FileObject file{};FileObjectInit(&file);unsigned released=0;
+    auto* backing=MappingBackingCreate(&released,rangeBackingReleased);CHECK(backing);backing->file=&file;
+    VnodeOps ops{};ops.stat=restoreFileStat;ops.read=restoreFileRead;
+    Vnode vnode{&ops,VnodeType::File,nullptr,1,0};int error=0;
+    auto canonical=FileObjectGetPage(&file,&vnode,0,true,&error);CHECK(canonical&&!error);
+    PhysicalAddress pages[3];
+    for(unsigned i=0;i<3;++i) {
+        pages[i]=PmmAllocPage(MemTag::User,50);CHECK(pages[i]);
+        std::memset(reinterpret_cast<void*>(pages[i].raw()),0x61+i,pageSize);
+    }
+    PmmRefPage(pages[1]);PmmRefPage(pages[1]); // true hidden alias + independent pin
+    auto shared=PmmAllocPage(MemTag::User,50),borrowed=PmmAllocPage(MemTag::User,50);CHECK(shared&&borrowed);
+    {
+        MappingTransaction operation(&actor,space,backing);CHECK(operation.PrepareRanges(5)&&operation.Lock());
+        CHECK(operation.InsertRange(rangeRecord(va.raw(),va.raw()+3*pageSize,backing)));
+        for(unsigned i=0;i<3;++i)
+            CHECK(VmmTryMapPage(space->pageTable,va+i*pageSize,pages[i],flags,MemTag::User,50)==VmmMapResult::Mapped);
+        auto range=rangeRecord(va.raw()+4*pageSize,va.raw()+5*pageSize,backing,0);range.offset=pageSize;
+        CHECK(operation.InsertRange(range));
+        CHECK(VmmTryMapPage(space->pageTable,va+4*pageSize,pages[1],flags,MemTag::User,50,false)==VmmMapResult::Mapped);
+        CHECK(operation.InsertRange(rangeRecord(va.raw()+6*pageSize,va.raw()+7*pageSize,backing,1)));
+        CHECK(VmmTryMapPage(space->pageTable,va+6*pageSize,canonical,flags&~VMM_WRITABLE,MemTag::User,50)==VmmMapResult::Mapped);
+        range=rangeRecord(va.raw()+8*pageSize,va.raw()+9*pageSize,backing);range.sharing=MappingSharing::Shared;
+        CHECK(operation.InsertRange(range));
+        CHECK(VmmTryMapPage(space->pageTable,va+8*pageSize,shared,flags,MemTag::User,50)==VmmMapResult::Mapped);
+        range=rangeRecord(va.raw()+10*pageSize,va.raw()+11*pageSize,backing);range.leafOwnership=MappingLeafOwnership::Borrowed;
+        CHECK(operation.InsertRange(range));
+        CHECK(VmmTryMapPage(space->pageTable,va+10*pageSize,borrowed,flags,MemTag::User,50)==VmmMapResult::Mapped);
+    }
+    {
+        MappingTransaction stale(&actor,space,backing);CHECK(stale.Prepare(0,1)&&stale.Lock());
+        MappingFaultSnapshot snapshot{};CHECK(stale.CaptureRange(va.raw(),1,snapshot));stale.Unlock();
+        auto candidate=PmmAllocPage(MemTag::User,50);CHECK(candidate&&stale.StagePage(0,candidate,true));
+        KMutexLock(&file.gate);
+        {
+            FileMappingInvalidation job(&actor,space,backing);CHECK(job.Prepare(7)); // no copy reservation needed
+            job.LockTargetFileAlreadyHeld();CHECK(job.Detach(0,8*pageSize));job.Acknowledge();
+            job.LockTargetFileAlreadyHeld();CHECK(!job.QuarantinePrivate());job.Unlock();
+            FileObjectQuarantineLocked(&file,-5,pageSize+173);
+            failAllocation=true;failHeapAfter=0;
+            job.LockTargetFileAlreadyHeld();CHECK(!job.RestoreAll());CHECK(job.QuarantinePrivate());
+            CHECK(!job.QuarantinePrivate());job.Unlock();
+            CHECK(failHeapAfter==0);failHeapAfter=-1;failAllocation=false;
+        }
+        KMutexUnlock(&file.gate);
+        CHECK(stale.Lock());
+        CHECK(stale.PublishFault(snapshot,0,va,1,true)==MappingFaultCommit::Stale);
+        CHECK(stale.CaptureRange(va.raw(),1,snapshot));
+        CHECK(stale.PublishFault(snapshot,0,va,1,true)==MappingFaultCommit::Failed);
+        CHECK(stale.Publish(0,va+pageSize,VMM_USER|VMM_WRITABLE,MemTag::User,50)==VmmMapResult::InvalidAddress);
+        CHECK(!stale.ProtectMapping(va.raw(),va.raw()+3*pageSize,3));stale.Unlock();
+    }
+    CHECK(PmmGetRefCount(canonical)==1&&!PmmGetRefCount(shared)&&PmmGetRefCount(borrowed)==1);
+    CHECK(!VmmReadLeaf(space->pageTable,va+6*pageSize)&&!VmmReadLeaf(space->pageTable,va+8*pageSize));
+    CHECK(!VmmReadLeaf(space->pageTable,va+10*pageSize));
+    for(unsigned i=0;i<3;++i) {
+        CHECK(VmmReadLeaf(space->pageTable,va+i*pageSize)&PTE_HIDDEN_BIT);
+        for(unsigned j=0;j<pageSize;++j)CHECK(reinterpret_cast<unsigned char*>(pages[i].raw())[j]==0x61+i);
+    }
+    const auto generation=space->generation;
+    CHECK(UserMappingProtect(&actor,space,va.raw(),3*pageSize,1)==-5&&space->generation==generation);
+    CHECK(UserMappingProtect(&actor,space,va.raw(),pageSize,0)==0); // remain PROT_NONE after recovery
+    CHECK(UserMappingPageAccess(&actor,space,va.raw()+pageSize,2,true)==UserPageAccess::Missing);
+    UserMappingRequest request{};request.range=rangeRecord(0,pageSize,backing);request.length=pageSize;
+    CHECK(UserMappingCreate(&actor,space,request)==-5);
+    CHECK(UserMappingClone(&actor,space,child,51));
+    CHECK(VmmReadLeaf(child->pageTable,va+pageSize)&PTE_HIDDEN_BIT);
+    CHECK(UserMappingProtect(&actor,child,va.raw()+pageSize,pageSize,3)==-5);
+    const auto moved=va+16*pageSize;
+    CHECK(UserMappingResize(&actor,space,va.raw()+pageSize,2*pageSize,2*pageSize,3,moved.raw(),nullptr,nullptr)==static_cast<int64_t>(moved.raw()));
+    CHECK(!VmmReadLeaf(space->pageTable,va+pageSize));
+    CHECK((VmmReadLeaf(space->pageTable,moved)&(PTE_HIDDEN_BIT|VMM_PRESENT))==PTE_HIDDEN_BIT);
+    CHECK(PmmGetRefCount(pages[1])==5&&maps(pages[1])==4);
+    // Later stat succeeds. Before any further size mutation, recovery captures
+    // the new fork/remap aliases. A regrown EOF cannot widen the saved prefix.
+    KMutexLock(&file.gate);
+    auto* first=FileMappingNextSpace(&file,0);CHECK(first);
+    auto* second=FileMappingNextSpace(&file,first->identity);CHECK(second);
+    CHECK(!FileMappingNextSpace(&file,second->identity));AddressSpaceUnref(first);AddressSpaceUnref(second);
+    {
+        FileMappingInvalidation parentJob(&actor,space,backing),childJob(&actor,child,backing);
+        CHECK(parentJob.Prepare(4)&&parentJob.PreparePrivateRestore());
+        CHECK(childJob.Prepare(4)&&childJob.PreparePrivateRestore());
+        parentJob.LockTargetFileAlreadyHeld();CHECK(parentJob.Detach(0,8*pageSize));parentJob.Unlock();
+        childJob.LockTargetFileAlreadyHeld();CHECK(childJob.Detach(0,8*pageSize));childJob.Unlock();
+        parentJob.Acknowledge();childJob.Acknowledge();
+        failAllocation=true;failHeapAfter=0;
+        parentJob.LockTargetFileAlreadyHeld();CHECK(parentJob.RestorePrivate(3*pageSize));parentJob.Unlock();
+        childJob.LockTargetFileAlreadyHeld();CHECK(childJob.RestorePrivate(3*pageSize));childJob.Unlock();
+        CHECK(file.mappingError==-5&&file.privateValidPrefix==pageSize+173);
+        CHECK(failHeapAfter==0);failHeapAfter=-1;failAllocation=false;
+        FileObjectCompleteMappingRecoveryLocked(&file);
+    }
+    KMutexUnlock(&file.gate);
+    CHECK(!file.mappingError&&!PmmGetRefCount(canonical)&&!PmmGetRefCount(pages[2]));
+    CHECK(PmmGetRefCount(pages[1])==1&&!maps(pages[1]));
+    CHECK((VmmReadLeaf(space->pageTable,va)&(PTE_HIDDEN_BIT|VMM_PRESENT))==PTE_HIDDEN_BIT);
+    CHECK((VmmReadLeaf(child->pageTable,va)&(PTE_HIDDEN_BIT|VMM_PRESENT))==PTE_HIDDEN_BIT);
+    CHECK(VmmReadLeaf(space->pageTable,moved)&VMM_PRESENT);
+    CHECK(VmmReadLeaf(child->pageTable,va+pageSize)&VMM_PRESENT);
+    CHECK((VmmReadLeaf(space->pageTable,va+4*pageSize)&(PTE_HIDDEN_BIT|VMM_PRESENT))==PTE_HIDDEN_BIT);
+    CHECK((VmmReadLeaf(child->pageTable,va+4*pageSize)&(PTE_HIDDEN_BIT|VMM_PRESENT))==PTE_HIDDEN_BIT);
+    const uint64_t restored[]={VmmReadLeaf(space->pageTable,moved),VmmReadLeaf(child->pageTable,va+pageSize),
+        VmmReadLeaf(space->pageTable,va+4*pageSize),VmmReadLeaf(child->pageTable,va+4*pageSize)};
+    for(auto raw:restored) {
+        CHECK(raw&PTE_COW_BIT);auto* bytes=reinterpret_cast<unsigned char*>(VmmLeafPhysical(raw).raw());
+        for(unsigned j=0;j<pageSize;++j)CHECK(bytes[j]==(j<173?0x62:0));
+    }
+    CHECK(UserMappingPageAccess(&actor,space,moved.raw(),1,true)==UserPageAccess::Ready);
+    CHECK(UserMappingProtect(&actor,space,va.raw(),pageSize,3)==0);
+    CHECK(UserMappingPageAccess(&actor,space,va.raw(),1,true)==UserPageAccess::Ready);
+    for(unsigned j=0;j<pageSize;++j)CHECK(reinterpret_cast<unsigned char*>(pages[1].raw())[j]==0x62);
+    PmmUnrefPage(pages[1]);PmmUnrefPage(borrowed);
+    AddressSpaceUnref(space);AddressSpaceUnref(child);CHECK(ProcessCleanupStep());CHECK(ProcessCleanupStep());
+    CHECK(!FileMappingRegisteredRanges(&file));MappingBackingUnref(backing);CHECK(released==1);
+    FileObjectDispose(&file);VmmDestroyUserPageTable(root);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("QUARANTINE PASS retained-private/hidden/no-allocation/stale-fault/publication/protect/fork/remap/recovery-prefix/PROT_NONE/cache-eviction");
+}
+
 static void pageAccessWithoutUnrelatedGate() {
     auto root=table();VmmHostSetKernelRoot(root);AddressSpaceKernelInit();
     Process kernelActor{};kernelActor.addressSpace=AddressSpaceKernel();
@@ -1574,7 +1697,7 @@ int main(int argc,char** argv) {
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
     liveMappingClone();sharedMappingClone();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
-    pageAccessWithoutUnrelatedGate();
+    targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();
     anonymousDiscard();memoryCensus();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

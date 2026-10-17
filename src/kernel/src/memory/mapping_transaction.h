@@ -99,7 +99,7 @@ private:
 // Intervals are page-aligned, half-open FILE offsets, not virtual addresses.
 // Resize callers must prepare private restoration before any detach and ACK
 // EVERY target AS before restoring. This primitive does not perform filesystem
-// resize, flush canonical pages, or recover from unknown resulting EOF.
+// resize, flush canonical pages, or observe resulting EOF itself.
 class FileMappingInvalidation {
 public:
     FileMappingInvalidation(Process* actor, AddressSpaceState* space, MappingBacking* backing);
@@ -129,12 +129,16 @@ public:
     // Includes canonical/shared/borrowed aliases, needs no boundary preparation.
     // Caller must ACK every target space first; preserves original bytes/PTEs.
     bool RestoreAll();
+    // Unknown EOF: retain all noncanonical managed-private data hidden without
+    // changing its bytes. Requires inode quarantine and caller-wide ACK first.
+    // Needs no boundary copies. Other kinds of leaves remain detached.
+    bool QuarantinePrivate();
 private:
     struct Leaf {
         uint64_t address,offset,raw;
         bool managed,privateData;
     };
-    bool Restore(bool all,uint64_t validPrefix);
+    bool Restore(bool all,uint64_t validPrefix,bool quarantine=false);
     static void Capture(VirtualAddress address, uint64_t raw, void* context);
     void RequireTargetGate() const;
     Process* actor_;

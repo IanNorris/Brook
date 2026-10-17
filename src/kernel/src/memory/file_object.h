@@ -18,6 +18,10 @@ struct FileObject {
     RecordLockTable recordLocks;
     KMutex gate;
     uint64_t generation,orderId;
+    // Gate-owned unknown-EOF quarantine. Size writers remain blocked until
+    // recovery first observes EOF and reconciles every retained private alias.
+    int mappingError;
+    uint64_t privateValidPrefix;
     FileMappingRegistration* mappings;
     // Includes retiring tokens until TLB ACK/unlink; changed by the registry.
     uint64_t mappingRegistrations;
@@ -36,6 +40,15 @@ PhysicalAddress FileObjectGetPage(FileObject* object,Vnode* vnode,uint64_t index
 // Pure identity lookup with the inode gate already owned; safe under a PT
 // spinlock. Never allocates, loads a page or acquires another lock.
 bool FileObjectIsCanonicalLocked(FileObject* object,uint64_t index,PhysicalAddress physical);
+// Caller owns inode gate and has detached/ACKed every alias before marking.
+// Canonical data MUST have flushed successfully before the resize attempt;
+// orphan retirement can discard that stale cache without writing it again.
+// Preserve private data hidden; never treat a failed backend attempt as rollback.
+void FileObjectQuarantineLocked(FileObject* object,int error,uint64_t lastKnownPrefix);
+// Caller has re-statted EOF, reconciled all private aliases and ACKed stale
+// canonical mappings; old canonical data was flushed BEFORE the resize attempt.
+// Drop stale cache, clear quarantine and advance epoch. No AS/PT lock held.
+void FileObjectCompleteMappingRecoveryLocked(FileObject* object);
 // One gate acquisition: load primary if necessary, pin only resident neighbors.
 // Caller bounds count by its VMA and EOF snapshot; publication must still
 // revalidate mapping/file generations. For valid count (1..16), failure clears
@@ -65,7 +78,9 @@ bool FileObjectExposeWritableLocked(FileObject* object,Vnode* vnode,uint64_t ind
 int FileObjectWriteback(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t end);
 // Finite pass over exposed objects. Successful objects with no registrations
 // release their retained vnode outside all locks. Errors keep backing/pages for
-// retry; other objects are still attempted. Does not flush backend devices.
+// retry; other objects are still attempted. Quarantined objects report their
+// error but retire stale cache/queue ownership once every mapping is gone.
+// Quarantine requires a successful pre-attempt flush. No backend-device flush.
 int FileObjectWritebackAll();
 // Initial integration: caller's mapping-pin gate has established no mappings.
 // Coordinated mapped resize/invalidation must replace that restriction later.

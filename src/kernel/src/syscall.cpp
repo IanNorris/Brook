@@ -951,6 +951,8 @@ MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error) {
         MappingTransaction operation(actor,actor->addressSpace);
         if(!operation.Lock())return MappingFaultResult::Unhandled;MappingFaultSnapshot snapshot{};
         if (!operation.CaptureRange(page,access,snapshot)) return MappingFaultResult::Unhandled;
+        if(snapshot.range.backing && snapshot.range.backing->file && snapshot.range.backing->file->mappingError)
+            return MappingFaultResult::IoError;
         // A peer may have resolved this fault or replaced its range while we
         // prepared I/O. Use the current range and leaf, not the original fault
         // backend. Returning retries the instruction (including a subsequent

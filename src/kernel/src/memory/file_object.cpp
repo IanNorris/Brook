@@ -39,6 +39,14 @@ struct Gate {
     explicit Gate(FileObject* value):object(value) { KMutexLock(&object->gate); }
     ~Gate() { KMutexUnlock(&object->gate); }
 };
+void RequireGate(FileObject* object) {
+#ifndef BROOK_HOST_TEST
+    if(!object->gate.locked || object->gate.owner!=ProcessCurrent())
+        KernelPanic("file object: inode gate not owned");
+#else
+    (void)object;
+#endif
+}
 FileObjectPage* Find(FileObject* object,uint64_t index) {
     for(auto* page=object->pages[index%64];page;page=page->next)
         if(page->index==index) return page;
@@ -67,11 +75,15 @@ bool UserPointer(const void* pointer) {
 }
 int ReadResident(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset) {
     Gate held(object);const uint64_t begin=*offset;
+    if(!length)return 0;
+    if(object->mappingError)return object->mappingError;
     int result=vnode->ops->read(vnode,buffer,length,offset);
     if(result>0)Overlay(object,begin,buffer,static_cast<uint64_t>(result),false);
     return result;
 }
 int WriteLocked(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset) {
+    if(!length)return 0;
+    if(object->mappingError)return object->mappingError;
     const uint64_t begin=*offset;
     int result=vnode->ops->write(vnode,buffer,length,offset);
     if(result>0) {
@@ -89,6 +101,7 @@ void FileObjectInit(FileObject* object) {
     object->recordLocks.lock.next=object->recordLocks.lock.serving=0;
     object->recordLocks.head=nullptr;
     KMutexInit(&object->gate);object->generation=1;
+    object->mappingError=0;object->privateValidPrefix=~uint64_t{0};
     object->orderId=__atomic_add_fetch(&nextIdentity,1,__ATOMIC_RELAXED);
     if(!object->orderId)KernelPanic("file object: ordering identity exhausted");
     object->mappings=nullptr;
@@ -105,6 +118,7 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
                                      const VnodeStat* knownStat=nullptr) {
     if(error)*error=0;
     if(loaded)*loaded=false;
+    if(object->mappingError) { if(error)*error=object->mappingError;return PhysicalAddress{}; }
     if(index>~uint64_t{0}/4096) { if(error)*error=-22;return PhysicalAddress{}; }
     if(auto* page=Find(object,index)) { PmmRefPage(page->physical);return page->physical; }
     if(!load)return PhysicalAddress{};
@@ -166,6 +180,7 @@ MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t
     for(uint32_t i=0;i<capacity;++i)pages[i]=PhysicalAddress{};
     if(index>~uint64_t{0}/4096)return MappingFaultResult::EndOfFile;
     Gate held(object);
+    if(object->mappingError)return MappingFaultResult::IoError;
     VnodeStat stat{};
     const int statResult=vnode->ops->stat(vnode,&stat);
     if(statResult)return statResult==-12?MappingFaultResult::OutOfMemory:MappingFaultResult::IoError;
@@ -218,6 +233,7 @@ int FileObjectAppend(FileObject* object,Vnode* vnode,const void* buffer,uint64_t
     if(!length)return 0;
     if(UserPointer(buffer))return -22; // Never fault/copy user memory under gate.
     Gate held(object);
+    if(object->mappingError)return object->mappingError;
     VnodeStat stat{};int result=vnode->ops->stat(vnode,&stat);
     if(result)return result;
     uint64_t position=stat.size;
@@ -226,18 +242,28 @@ int FileObjectAppend(FileObject* object,Vnode* vnode,const void* buffer,uint64_t
     return result;
 }
 bool FileObjectIsCanonicalLocked(FileObject* object,uint64_t index,PhysicalAddress physical) {
-#ifndef BROOK_HOST_TEST
-    if(!object->gate.locked || object->gate.owner!=ProcessCurrent())
-        KernelPanic("file object: canonical lookup without file gate");
-#endif
+    RequireGate(object);
     auto* page=Find(object,index);
     return page && physical && page->physical==physical;
 }
+void FileObjectQuarantineLocked(FileObject* object,int error,uint64_t lastKnownPrefix) {
+    RequireGate(object);
+    if(error>=0)KernelPanic("file object: invalid mapping quarantine error");
+    if(object->generation==~uint64_t{0})KernelPanic("file object: generation exhausted");
+    object->mappingError=error;
+    if(lastKnownPrefix<object->privateValidPrefix)object->privateValidPrefix=lastKnownPrefix;
+    ++object->generation;
+}
+void FileObjectCompleteMappingRecoveryLocked(FileObject* object) {
+    RequireGate(object);
+    if(!object->mappingError)KernelPanic("file object: recovery without quarantine");
+    if(object->generation==~uint64_t{0})KernelPanic("file object: generation exhausted");
+    for(auto& bucket:object->pages) { auto* retired=bucket;bucket=nullptr;Release(retired); }
+    object->mappingError=0;object->privateValidPrefix=~uint64_t{0};++object->generation;
+}
 bool FileObjectExposeWritableLocked(FileObject* object,Vnode* vnode,uint64_t index,PhysicalAddress physical) {
-#ifndef BROOK_HOST_TEST
-    if(!object->gate.locked || object->gate.owner!=ProcessCurrent())
-        KernelPanic("file object: writable publication without file gate");
-#endif
+    RequireGate(object);
+    if(object->mappingError)return false;
     auto* page=Find(object,index);
     if(!page || !physical || page->physical!=physical || !vnode || vnode->type!=VnodeType::File || !vnode->ops ||
        !vnode->ops->stat || !vnode->ops->write || !vnode->ops->file_object ||
@@ -252,6 +278,7 @@ bool FileObjectExposeWritableLocked(FileObject* object,Vnode* vnode,uint64_t ind
     return true;
 }
 static int WritebackLocked(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t end,uint8_t* snapshot) {
+    if(object->mappingError)return object->mappingError;
     int result=0;
     VnodeStat stat{};result=vnode->ops->stat(vnode,&stat);
     if(!result)for(auto* bucket:object->pages) {
@@ -284,7 +311,7 @@ int FileObjectWriteback(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t 
     if(begin>end)return -22;
     if(begin==end)return 0;
     if(!vnode || !vnode->ops || !vnode->ops->stat || !vnode->ops->write)return -95;
-    { Gate held(object);if(!object->writebackVnode)return 0; }
+    { Gate held(object);if(object->mappingError)return object->mappingError;if(!object->writebackVnode)return 0; }
     // Allocate before taking the file gate. The backend never sees live mapped
     // memory: a concurrent user store can change it during filesystem I/O.
     auto* snapshot=static_cast<uint8_t*>(kmalloc(4096));if(!snapshot)return -12;
@@ -320,7 +347,11 @@ int FileObjectWritebackAll() {
             if(object->writebackVnode) {
                 const int error=WritebackLocked(object,vnode,0,~uint64_t{0},snapshot);
                 if(!result && error)result=error;
-                if(!error && !__atomic_load_n(&object->mappingRegistrations,__ATOMIC_ACQUIRE)) {
+                // Quarantined cache was flushed before the failed resize and
+                // has accepted no writes since. Once all aliases retire it is
+                // stale data, not pending dirty output: report the error but
+                // release this queue pin instead of retaining an orphan forever.
+                if((!error || object->mappingError) && !__atomic_load_n(&object->mappingRegistrations,__ATOMIC_ACQUIRE)) {
                     flags=IrqSpinLockAcquire(&writebackLock);
                     auto** link=&writebackObjects;
                     while(*link && *link!=object)link=&(*link)->writebackNext;
@@ -328,7 +359,9 @@ int FileObjectWritebackAll() {
                     *link=object->writebackNext;object->writebackNext=nullptr;
                     retired=object->writebackVnode;object->writebackVnode=nullptr;
                     IrqSpinLockRelease(&writebackLock,flags);
-                    for(auto* bucket:object->pages)for(auto* page=bucket;page;page=page->next)page->writeExposed=false;
+                    if(object->mappingError) {
+                        for(auto& bucket:object->pages) { auto* pages=bucket;bucket=nullptr;Release(pages); }
+                    } else for(auto* bucket:object->pages)for(auto* page=bucket;page;page=page->next)page->writeExposed=false;
                 }
             }
         }
@@ -343,7 +376,9 @@ int FileObjectTruncateUnmapped(FileObject* object,Vnode* vnode,uint64_t length) 
     int writeback=FileObjectWriteback(object,vnode,0,~uint64_t{0});if(writeback)return writeback;
     FileObjectPage* retired[64];memset(retired,0,sizeof(retired));int result;
     {
-        Gate held(object);result=vnode->ops->truncate(vnode,length);
+        Gate held(object);
+        if(object->mappingError)return object->mappingError;
+        result=vnode->ops->truncate(vnode,length);
         // A backend error does not imply rollback: ext2 can modify a tail or
         // inode before a later write/free fails. Never reopen stale cached
         // contents after an attempted resize, even when preserving its errno.

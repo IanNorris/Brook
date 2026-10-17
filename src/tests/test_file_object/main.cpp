@@ -355,6 +355,62 @@ static void BatchPages() {
     FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
 }
 
+static void QuarantinedPages() {
+    CHECK(refs.empty()&&heapBlocks==0);
+    Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(8192,0x57);
+    Vnode vnode{&operations,VnodeType::File,&backend,1,0};int error=0;
+    auto pinned=FileObjectGetPage(&backend.object,&vnode,0,true,&error);CHECK(pinned&&!error);
+    KMutexLock(&backend.object.gate);
+    CHECK(FileObjectExposeWritableLocked(&backend.object,&vnode,0,pinned));
+    KMutexUnlock(&backend.object.gate);
+    CHECK(FileObjectWriteback(&backend.object,&vnode,0,8192)==0); // pre-attempt flush
+    backend.failAfterTruncate=true;CHECK(truncate_backend(&vnode,31)==-5);
+    backend.failStat=true;backend.statError=-12; // resulting EOF cannot be observed
+    const auto generation=backend.object.generation;
+    KMutexLock(&backend.object.gate);
+    FileObjectQuarantineLocked(&backend.object,-5,8192);
+    CHECK(backend.object.mappingError==-5&&backend.object.privateValidPrefix==8192);
+    FileObjectQuarantineLocked(&backend.object,-5,4097);
+    FileObjectQuarantineLocked(&backend.object,-5,9000);
+    CHECK(backend.object.privateValidPrefix==4097&&backend.object.generation==generation+3);
+    CHECK(FileObjectIsCanonicalLocked(&backend.object,0,pinned)); // cache retained, inaccessible
+    CHECK(!FileObjectExposeWritableLocked(&backend.object,&vnode,0,pinned));
+    KMutexUnlock(&backend.object.gate);
+    const auto bytes=backend.bytes;const auto reads=backend.reads,writes=backend.writes;
+    bool loaded=true;PhysicalAddress pages[4];
+    CHECK(!FileObjectGetPage(&backend.object,&vnode,0,true,&error,&loaded)&&error==-5&&!loaded);
+    CHECK(!FileObjectGetPage(&backend.object,&vnode,0,false,&error)&&error==-5);
+    CHECK(FileObjectGetPages(&backend.object,&vnode,0,4,pages)==-5);for(auto page:pages)CHECK(!page);
+    CHECK(FileObjectFaultPages(&backend.object,&vnode,0,4,pages)==MappingFaultResult::IoError);
+    for(auto page:pages)CHECK(!page);
+    unsigned char buffer[64]{};uint64_t offset=19;
+    CHECK(FileObjectRead(&backend.object,&vnode,buffer,sizeof(buffer),&offset)==-5&&offset==19);
+    CHECK(FileObjectWrite(&backend.object,&vnode,buffer,sizeof(buffer),&offset)==-5&&offset==19);
+    CHECK(FileObjectAppend(&backend.object,&vnode,buffer,sizeof(buffer),&offset)==-5&&offset==19);
+    CHECK(FileObjectTruncateUnmapped(&backend.object,&vnode,9000)==-5);
+    CHECK(FileObjectWriteback(&backend.object,&vnode,0,8192)==-5);
+    CHECK(FileObjectRead(&backend.object,&vnode,buffer,0,&offset)==0);
+    CHECK(FileObjectWrite(&backend.object,&vnode,buffer,0,&offset)==0);
+    CHECK(FileObjectAppend(&backend.object,&vnode,buffer,0,&offset)==0);
+    backend.object.mappingRegistrations=1;
+    CHECK(FileObjectWritebackAll()==-5&&backend.object.writebackVnode==&vnode&&vnode.refCount==2);
+    backend.object.mappingRegistrations=0;
+    CHECK(FileObjectWritebackAll()==-5&&!backend.object.writebackVnode&&vnode.refCount==1);
+    CHECK(FileObjectWritebackAll()==0); // finite queue retirement, no orphan cycle
+    CHECK(backend.object.mappingError==-5&&backend.object.privateValidPrefix==4097);
+    CHECK(backend.bytes==bytes&&backend.reads==reads&&backend.writes==writes);
+    CHECK(refs.size()==1&&refs.at(pinned.raw())==1); // external pin survives cache eviction
+    CHECK(*reinterpret_cast<unsigned char*>(pinned.raw())==0x57);
+    backend.failStat=false;backend.failAfterTruncate=false;
+    VnodeStat observed{};CHECK(stat_backend(&vnode,&observed)==0&&observed.size==31);
+    KMutexLock(&backend.object.gate);FileObjectCompleteMappingRecoveryLocked(&backend.object);KMutexUnlock(&backend.object.gate);
+    CHECK(!backend.object.mappingError&&backend.object.privateValidPrefix==~uint64_t{0});
+    auto fresh=FileObjectGetPage(&backend.object,&vnode,0,true,&error);CHECK(fresh&&fresh!=pinned&&!error);
+    auto* data=reinterpret_cast<unsigned char*>(fresh.raw());CHECK(data[0]==0xA7&&data[30]==0x57&&data[31]==0);
+    offset=31;CHECK(FileObjectAppend(&backend.object,&vnode,buffer,1,&offset)==1&&offset==32);
+    PmmUnrefPage(fresh);PmmUnrefPage(pinned);FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
+}
+
 static void FaultPages() {
     CHECK(refs.empty() && heapBlocks==0);
     Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(4097,0x5a);
@@ -448,5 +504,6 @@ int main() {
     WritebackLifetime();
     AppendTransactions();
     FaultPages();
+    QuarantinedPages();
     std::puts("FILE_OBJECT PASS batch/sparse-pins/one-gate/failure-cleanup/concurrent-load/io-coherence/partial-error/truncate/zero-tail/lifetime/writeback-range/snapshot/redirty/error-retry");
 }
