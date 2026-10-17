@@ -156,6 +156,40 @@ class Contracts(unittest.TestCase):
             self.assertEqual(value,{'pid':42});self.assertEqual(len(seen),1)
         finally:thread.join();listener.close()
 
+    def test_census_keeps_records_and_requires_footer(self):
+        header={'kind':'memory_census','identity_ceiling':42}
+        records=[{'as_id':7,'mapping_kind':'image','backed_bytes':8192},
+                 {'as_id':8,'mapping_kind':'anonymous','backed_bytes':4096}]
+        footer={'snapshot':'rolling','spaces':2}
+        wire='noise\r\n'+'\n'.join(json.dumps(v) for v in [header,*records,footer])+'\n'
+        result=server.parse_guest_reply(wire)
+        self.assertEqual(result['records'],records)
+        self.assertEqual(result['summary'],footer)
+        self.assertEqual(result['identity_ceiling'],42)
+        with self.assertRaisesRegex(ValueError,'Incomplete memory census'):
+            server.parse_guest_reply(json.dumps(header)+'\n'+json.dumps(records[0]))
+        self.assertEqual(server.parse_guest_reply('ordinary reply\n'),{'reply':'ordinary reply'})
+
+    def test_stats_census_is_opt_in(self):
+        data={'guest_debug_port':1234}
+        with patch.object(server,'session_lock',return_value=contextlib.nullcontext(data)), \
+             patch.object(server,'guest',return_value={'used_memory_bytes':4096}) as request:
+            result=server.stats('fixture')
+            self.assertNotIn('memory_census',result)
+            request.assert_called_once_with(data,'bridge stats')
+        census={'kind':'memory_census','records':[],'summary':{'spaces':0}}
+        with patch.object(server,'session_lock',return_value=contextlib.nullcontext(data)), \
+             patch.object(server,'guest',side_effect=[{'used_memory_bytes':4096},census]) as request:
+            result=server.stats('fixture',memory_details=True)
+            self.assertEqual(result['memory_census'],census)
+            self.assertTrue(result['memory_census']['supported'])
+            self.assertGreaterEqual(result['memory_census']['round_trip_ms'],0)
+            self.assertEqual(request.call_args_list[1].args,(data,'mem census'))
+            self.assertEqual(request.call_args_list[1].kwargs,{'timeout':30})
+        with patch.object(server,'session_lock',return_value=contextlib.nullcontext(data)), \
+             patch.object(server,'guest',side_effect=[{}, {'reply':'Unknown command'}]):
+            self.assertFalse(server.stats('fixture',memory_details=True)['memory_census']['supported'])
+
     def test_holds_released_on_cancel(self):
         events=[];cancel=threading.Event()
         class FakeQMP:

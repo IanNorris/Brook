@@ -480,6 +480,73 @@ bool VmmCanMoveRange(PageTable pt,uint64_t begin,uint64_t end,uint64_t destinati
 bool VmmMoveRange(PageTable pt,uint64_t begin,uint64_t end,uint64_t destination) {
     return MoveLeafRange(pt,begin,end,destination,false,false,true);
 }
+struct MeasureWalk {
+    uint64_t cursor, budget;
+    bool accountRam;
+    VmmRangeStats* stats;
+};
+static bool MeasureTable(uint64_t* table, unsigned level, uint64_t base,
+                          uint64_t begin, uint64_t end, MeasureWalk& walk)
+{
+    const uint64_t span = uint64_t{1} << (12 + (level-1)*9);
+    const uint64_t first = (begin-base)/span;
+    const uint64_t last = (end-1-base)/span;
+    for (uint64_t i=first;i<=last;++i) {
+        if (!walk.budget) return true;
+        --walk.budget; ++walk.stats->tableEntriesVisited;
+        const uint64_t address = base + i*span;
+        const uint64_t low = begin > address ? begin : address;
+        const uint64_t high = end < address+span ? end : address+span;
+        const uint64_t entry = table[i];
+        if (!VmmLeafBacked(entry)) { walk.cursor=high;continue; }
+        if (level>1) {
+            if (!(entry & VMM_PRESENT) || (entry & (1ULL<<7))) return false;
+            auto* child = reinterpret_cast<uint64_t*>(PhysToVirt(VmmLeafPhysical(entry)).raw());
+            if (!MeasureTable(child,level-1,address,low,high,walk)) return false;
+        } else {
+            if (entry & VMM_USER) {
+                auto& stats = *walk.stats;
+                ++stats.backedPages;
+                if (!(entry & VMM_PRESENT)) ++stats.hiddenPages;
+                if (entry & PTE_COW_BIT) ++stats.cowPages;
+                if (entry & VMM_WRITABLE) ++stats.writablePages;
+                if (walk.accountRam) {
+                    const uint32_t mappings=PmmGetMapCount(VmmLeafPhysical(entry));
+                    if (!mappings) ++stats.unknownMapCountPages;
+                    else {
+                        if (mappings>1) ++stats.multiplyMappedPages;
+                        stats.proportionalUnits += (4096ULL<<16)/mappings;
+                    }
+                }
+            }
+            walk.cursor=high;
+        }
+    }
+    return true;
+}
+bool VmmMeasureRange(PageTable pt, uint64_t begin, uint64_t end,
+                     bool accountRam, VmmRangeStats* stats)
+{
+    if (!stats) return false;
+    *stats={};
+    if (!ValidLeafRange(pt,begin,end)) return false;
+    VmmRangeStats measured{};
+    uint64_t cursor=begin;
+    while(cursor<end) {
+        // Bound real traversal work, rather than iterating every 2MiB of a
+        // potentially multi-TiB untouched reservation.
+        MeasureWalk walk{cursor,4096,accountRam,&measured};
+        const uint64_t irq=IrqSpinLockAcquire(&g_userPtLock);
+        auto* table=reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
+        const bool valid=MeasureTable(table,4,0,cursor,end,walk);
+        IrqSpinLockRelease(&g_userPtLock,irq);
+        if (!valid || walk.cursor<=cursor) return false;
+        ++measured.lockBatches;cursor=walk.cursor;
+    }
+    *stats=measured;
+    return true;
+}
+
 bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* count)
 {
     if (!count || !ValidLeafRange(pt,begin,end)) return false;

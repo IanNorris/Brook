@@ -16,6 +16,8 @@ void ProcessDestroyNow(Process* process);
 static AddressSpaceState g_kernelSpace;
 static uint64_t g_identity;
 static IrqSpinLock g_cleanupLock;
+static IrqSpinLock g_registryLock;
+static AddressSpaceState* g_publishedSpaces;
 static AddressSpaceState* g_spaceHead;
 static AddressSpaceState* g_spaceTail;
 static Process* g_processHead;
@@ -62,12 +64,50 @@ void AddressSpaceRef(AddressSpaceState* space) {
 static void WakeCleanupWorker() {
     if (g_cleanupWorker) SchedulerUnblock(g_cleanupWorker);
 }
+void AddressSpacePublish(AddressSpaceState* space) {
+    if (!space || space->kernel) return;
+    const uint64_t flags=IrqSpinLockAcquire(&g_registryLock);
+    if (!space->published) {
+        if (!__atomic_load_n(&space->references,__ATOMIC_ACQUIRE))
+            KernelPanic("AS: publishing retired space");
+        space->registryNext=g_publishedSpaces;g_publishedSpaces=space;
+        space->published=true;
+    }
+    IrqSpinLockRelease(&g_registryLock,flags);
+}
+uint64_t AddressSpaceIdentityCeiling() {
+    return __atomic_load_n(&g_identity,__ATOMIC_ACQUIRE);
+}
+AddressSpaceState* AddressSpaceNextReference(uint64_t after,uint64_t ceiling) {
+    const uint64_t flags=IrqSpinLockAcquire(&g_registryLock);
+    for (;;) {
+        AddressSpaceState* best=nullptr;
+        for(auto* space=g_publishedSpaces;space;space=space->registryNext)
+            if(space->identity>after && space->identity<=ceiling &&
+               (!best || space->identity<best->identity)) best=space;
+        if(!best) { IrqSpinLockRelease(&g_registryLock,flags);return nullptr; }
+        if(AddressSpaceTryRef(best)) {
+            IrqSpinLockRelease(&g_registryLock,flags);return best;
+        }
+        // Last-unref may await this lock before unlinking. Never resurrect it
+        // or repeatedly select the same zero-reference entry.
+        after=best->identity;
+    }
+}
 void AddressSpaceUnref(AddressSpaceState* space) {
     if (!space || space->kernel) return;
     uint32_t before = __atomic_fetch_sub(&space->references, 1, __ATOMIC_ACQ_REL);
     if (!before) KernelPanic("AS: reference underflow");
     if (before != 1) return;
-    uint64_t flags = IrqSpinLockAcquire(&g_cleanupLock);
+    uint64_t flags=IrqSpinLockAcquire(&g_registryLock);
+    if(space->published) {
+        auto** link=&g_publishedSpaces;
+        while(*link && *link!=space)link=&(*link)->registryNext;
+        if(!*link)KernelPanic("AS: published space missing from registry");
+        *link=space->registryNext;space->registryNext=nullptr;space->published=false;
+    }
+    IrqSpinLockRelease(&g_registryLock,flags);
+    flags = IrqSpinLockAcquire(&g_cleanupLock);
     space->cleanupNext = nullptr;
     if (g_spaceTail) g_spaceTail->cleanupNext = space;
     else g_spaceHead = space;

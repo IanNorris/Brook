@@ -43,6 +43,21 @@ def panic_state(data):
     return bool(re.search(r"KERNEL PANIC|KERNEL FAULT", text))
 
 
+def parse_guest_reply(reply):
+    # A census is a framed JSON-lines stream, not just its first header.
+    # Keep single-object responses and surrounding human logs compatible.
+    lines = [line for line in reply.splitlines() if line.startswith("{")]
+    if not lines:
+        return {"reply": reply.strip()}
+    first = json.loads(lines[0])
+    if first.get("kind") != "memory_census":
+        return first
+    records = [json.loads(line) for line in lines[1:]]
+    if not records or records[-1].get("snapshot") != "rolling" or "spaces" not in records[-1]:
+        raise ValueError("Incomplete memory census response")
+    return {**first, "records": records[:-1], "summary": records[-1]}
+
+
 def guest(data, command, timeout=8):
     if panic_state(data):
         raise RuntimeError("Guest has panicked; use vm_debug for QEMU-level inspection")
@@ -67,11 +82,7 @@ def guest(data, command, timeout=8):
             # Replies use LF; the log stream may use CRLF.
             if start >= 0 and end + "\n" in text[start:]:
                 reply = text[start + len(begin) + 1:].split(end + "\n", 1)[0]
-                # Structured replies can be surrounded by human log messages.
-                for line in reply.splitlines():
-                    if line.startswith("{"):
-                        return json.loads(line)
-                return {"reply": reply.strip()}
+                return parse_guest_reply(reply)
     raise TimeoutError("No complete guest response; delivery/completion is unknown (not retried)")
 
 
@@ -302,9 +313,14 @@ def logs(session, source="serial", offset=0, limit=65536, **_):
             "more": next_offset < size, "rotated": rotated, "source": source}
 
 
-def stats(session, **_):
+def stats(session, memory_details=False, **_):
     with session_lock(session) as data:
         result = guest(data, "bridge stats")
+        if memory_details:
+            started = time.monotonic()
+            result["memory_census"] = guest(data, "mem census", timeout=30)
+            result["memory_census"]["supported"] = result["memory_census"].get("kind") == "memory_census"
+            result["memory_census"]["round_trip_ms"] = (time.monotonic() - started) * 1000
         result["queried_monotonic"] = time.monotonic()
         result["note"] = "Recent 256 compositor-loop intervals, nearest-rank percentiles, millisecond guest timer resolution; not app GPU or scanout frametimes"
         return result
@@ -665,7 +681,7 @@ register("vm_start",start,"Boot a named experiment on new disk clones with playb
 register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop/reset await guest sync, force explicitly allows unsynced shutdown",{**SESSION,"action":STR,"force":{"type":"boolean"}},["session","action"])
 register("vm_observe",observe,"Guest image with crop/scale coordinate metadata; briefly pauses VM; panic capture needs cached framebuffer",{**SESSION,"crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session"])
 register("vm_logs",logs,"Read bounded logs by byte cursor",{**SESSION,"source":STR,"offset":INT,"limit":INT},["session"],True)
-register("vm_stats",stats,"OS memory/process counts and recent compositor interval p50/p90/p95/max",SESSION,["session"],True)
+register("vm_stats",stats,"OS memory/process counts and compositor intervals; optional rolling memory census holds guest mapping locks while sampling",{**SESSION,"memory_details":{"type":"boolean"}},["session"],True)
 register("vm_guest_run",guest_run,"Launch via Brook run syntax; returns PID, not exit status",{**SESSION,"command":STR},["session","command"])
 register("vm_guest",guest_inspect,"Guest windows/processes, or focus by window index in pid",{**SESSION,"action":STR,"pid":INT},["session"])
 register("vm_artifacts",get_artifact,"Read a scoped artifact, including images or bounded binary data after VM exit",{**SESSION,"artifact_name":STR},["session","artifact_name"],True)

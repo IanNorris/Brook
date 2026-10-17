@@ -59,7 +59,7 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_logs`, `vm_wait` | Bounded serial/QEMU byte cursors or bounded serial-substring waits. Logs survive VM exit. |
 | `vm_guest_run` | Launch a Brook `run /absolute/guest/path args` command, optionally `--uid 1000`. Return PID; no process completion or isolated stdout/stderr yet. Entire framed command fits 220 bytes. |
 | `vm_guest` | Existing window/process listings and focus by window index (the `pid` argument). |
-| `vm_stats` | Usable RAM/free/used and process counts; p50/p90/p95/max of the recent 256 compositor-loop intervals using the millisecond guest clock. Not app GPU or physical scanout timings. |
+| `vm_stats` | Usable RAM/free/used and process counts; p50/p90/p95/max of the recent 256 compositor-loop intervals using the millisecond guest clock. Optional `memory_details: true` adds a rolling address-space census. Not app GPU or physical scanout timings. |
 | `vm_profile` | `start` with `duration_ms`, `stop`, `status`, `export`. CPU samples and context-switch events; export after IDLE to raw/Speedscope artifacts using the run's immutable kernel ELF. |
 | `vm_debug` | Current vCPU registers or up to 1 MiB physical/virtual memory. Virtual addresses use the selected vCPU's current translation. RAM-only checks exclude MMIO; memory reads pause vCPUs and restore prior running state. Devices may still run. |
 | `vm_audio_capture` | 0.1–10 seconds of QEMU PCM WAV with format, frames and host monotonic interval. No microphone. Launcher watchdog bounds abandoned recordings. |
@@ -117,13 +117,41 @@ ignored experiment disks. They are never included in the plugin package.
 python3 -m unittest discover -s tools/vm_bridge -p "test_*.py" -v
 ```
 
-The 28 host tests cover fragmented tokenized replies, stdio MCP, PNG pixels,
+The 41 host tests cover fragmented tokenized replies, stdio MCP, PNG pixels,
 cancellation cleanup, input preflight, crop-coordinate mapping, reset/panic
 history, RAM-map selection and resume after failed memory reads. Shutdown
 tests cover sync-before-QMP ordering, rejection of missing/negative replies,
 timeout/panic/unreachable handling, explicit forced shutdown reporting, and
 unchanged pause/resume behavior. Wrapper tests cover first-run controls,
 startup demos, explicit commands, renderer selection and saved preferences.
+
+### Optional memory census
+
+```sh
+python3 tools/vm_bridge/server.py --call vm_stats --arguments '{"session":"SESSION_ID","memory_details":true}'
+```
+
+The updated kernel's `mem census` command samples completed, referenced user
+address spaces once each, including shared-VM threads. Each record identifies
+the address-space generation and mapping kind. `allocation_pid` is historical
+allocation metadata; PID reuse does not change the address-space identity.
+`backed_bytes` counts user leaves, including inaccessible PROT_NONE leaves.
+`mapped_ram_bytes` counts RAM-backed aliases and therefore double-counts shared
+frames. `proportional_bytes` divides by user mapcount to approximate each
+mapping's share; cache/staging references do not reduce it. Borrowed device MMIO
+is excluded from RAM attribution, while borrowed memfd pages remain included.
+
+This is a rolling diagnostic, not a simultaneous physical-memory inventory.
+It excludes construction, staging, cache-only pages, kernel allocations, page
+tables, queued teardown and quarantine. The unaccounted remainder does not
+establish a leak. Mapping topology is locked while each AS is sampled; PT locks
+are released after bounded batches of actual table visits. Empty virtual
+subtrees are skipped. AS pins are released before potentially slow output.
+Collection can perturb workloads; `round_trip_ms` includes transport and guest
+processing, and these samples must not be treated as application timing tests.
+The ordinary `vm_stats` path does not run this census. Old kernels report
+`supported: false` when they return an unknown-command response. The normal TCP
+dispatcher remains unavailable after panic.
 
 Clicks and double clicks now hold their mouse button for 200 ms by default.
 Brook samples button state in its compositor loop; the old 20 ms pulse could

@@ -1034,6 +1034,14 @@ void PmmMapDec(PhysicalAddress physAddr)
     __atomic_sub_fetch(&d.mapCount, 1, __ATOMIC_RELAXED);
 }
 
+uint32_t PmmGetMapCount(PhysicalAddress physAddr)
+{
+    if (!g_pageDescs || !physAddr) return 0;
+    const uint64_t index = physAddr.raw() / PAGE_SIZE;
+    if (index >= g_totalPages) return 0;
+    return __atomic_load_n(&Desc(static_cast<uint32_t>(index)).mapCount,__ATOMIC_RELAXED);
+}
+
 uint32_t PmmGetRefCount(PhysicalAddress physAddr)
 {
     if (!g_pageDescs || !physAddr) return 0;

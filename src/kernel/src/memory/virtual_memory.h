@@ -113,6 +113,19 @@ uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address); // locked value snap
 // retire must only store tokens/inspect locked metadata: no allocation/I/O or
 // reentry into VMM/AS locks. References are released by caller after shootdown.
 using VmmRetireLeaf = void (*)(VirtualAddress, uint64_t leaf, void* context);
+struct VmmRangeStats {
+    uint64_t backedPages = 0, hiddenPages = 0, cowPages = 0, writablePages = 0;
+    uint64_t multiplyMappedPages = 0, unknownMapCountPages = 0;
+    // 16 fractional bits; division uses user mapcount, not cache/staging refs.
+    uint64_t proportionalUnits = 0;
+    uint64_t tableEntriesVisited = 0, lockBatches = 0;
+};
+// Rolling read-only snapshot, skips absent subtrees and caps table visits per
+// IRQ-lock hold. Caller retains the AS and stabilizes its range topology.
+// Unmanaged device leaves must pass accountRam=false; borrowed memfd is RAM.
+// Huge leaves are unsupported and fail with zero output.
+bool VmmMeasureRange(PageTable pt, uint64_t begin, uint64_t end,
+                     bool accountRam, VmmRangeStats* stats);
 bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* count);
 // Bounded snapshot of populated addresses; caller stabilizes AS topology.
 // Capacity failure never writes beyond the supplied array or changes leaves.

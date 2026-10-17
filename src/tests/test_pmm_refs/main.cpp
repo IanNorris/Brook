@@ -22,6 +22,7 @@ static void describe(PhysicalAddress page,unsigned expectedRefs,unsigned expecte
         std::fprintf(stderr,"PMM counts: refs=%u expected=%u maps=%u expected=%u used=%u expected=%u\n",refs,expectedRefs,maps,expectedMaps,used,expectedUsed);
     CHECK(refs==expectedRefs && maps==expectedMaps && used==expectedUsed);
     CHECK(PmmGetRefCount(page)==expectedRefs);
+    CHECK(PmmGetMapCount(page)==expectedMaps);
 }
 int main() {
     PageDescriptor descriptors[256]{}; PmmHostTestInit(descriptors,256);

@@ -925,6 +925,7 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
                  proc->pid, proc->initialEntry, proc->stackTop,
                  proc->addressSpace->programBreak, proc->addressSpace->pageTable.pml4.raw());
 
+    AddressSpacePublish(proc->addressSpace);
     return proc;
 }
 
@@ -1340,6 +1341,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     DbgPrintf("FORK: parent pid=%u -> child pid=%u '%s', rip=0x%lx rsp=0x%lx\n",
                  parent->pid, child->pid, child->name, userRip, userRsp);
 
+    AddressSpacePublish(child->addressSpace);
     return child;
 }
 
@@ -1772,6 +1774,7 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
 
     // If dynamically linked, start at the interpreter's entry point;
     // otherwise, start at the main binary's entry.
+    AddressSpacePublish(proc->addressSpace);
     return interpEntry ? interpEntry : proc->elf.entryPoint;
 }
 

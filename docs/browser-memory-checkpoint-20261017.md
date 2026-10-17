@@ -138,10 +138,76 @@ user faults were logged, and checked shutdown plus all three offline filesystem
 checks passed again. Local results and frozen artifacts are under
 `build/workloads/browser-memory-20261017/`.
 
-Next memory work should attribute resident pages by mapping kind and distinguish
-live allocations from retained caches. Independent exec images still duplicate
+The next investigation targeted attribution by mapping kind. Independent exec images still duplicate
 initialized pages across executions. Demand file-backed exec would need bounded
 header reads, TLS preparation, file-gate publication and executable write
 exclusion or immutable-version backing; the current file-map pin blocks truncate
 but does not block ordinary writes. A bounded immutable content-dedup cache is
 another option, subject to admission, lifetime and pressure-recovery testing.
+
+## Rolling address-space census
+
+The new `mem census` debug command, also available through the bridge's optional
+`vm_stats(memory_details=true)`, distinguishes virtual reservations, RAM-backed
+aliases and approximate proportional attribution by mapping kind. A weak
+registry publishes only successfully constructed user address spaces; snapshot
+references are acquired under its lock before final-unref can queue teardown.
+The census uses an identity ceiling to terminate during continuous fork/exec.
+It avoids following a raw process AS pointer across exec. It releases mapping
+locks and AS pins before sending output. The sparse walker bounds actual table
+visits per PT-lock acquisition and skips absent upper-level subtrees.
+
+All 22 hosted suites pass. Actual VMM tests cover a 64 TiB sparse range, hidden
+leaves, aliases, proportional accounting, unknown mapcounts, huge-leaf rejection
+and a 5,000-leaf multi-batch walk. Registry tests cover unpublished construction,
+duplicate/out-of-order publication, identity ceilings and reference-held
+teardown. All 41 bridge tests pass, including complete census parsing and
+opt-in/default statistics behavior. Astra reviewed the lifecycle and locking.
+
+An 8-CPU, 8 GiB guest passed 300 native ELF fork/COW probes. Six complete censuses
+ran while the latter 200 probes were actively launching/executing/exiting:
+serial PASS counts advanced during each query. Afterward the registry contained
+no user AS and the guest returned to nine kernel tasks. With Wayland and apps
+running, representative snapshots were:
+
+| Category | Chromium attribution | Chromium + Codium attribution |
+| --- | ---: | ---: |
+| Image | 1,346,973,693 B | 2,973,323,261 B |
+| Anonymous | 114,475,005 B | 654,811,133 B |
+| File | 24,170,489 B | 51,773,431 B |
+| Memfd | 19,283,966 B | 32,112,637 B |
+| Device RAM | 2,138,112 B | 4,059,136 B |
+| Stack | 59,088,895 B | 126,402,559 B |
+| Heap | 135,168 B | 135,168 B |
+| Global physical used sample | 1,853,689,856 B | 4,191,510,528 B |
+
+These are approximate rolling proportional-byte samples, not sums of RSS or a
+simultaneous whole-system census. No unknown mapcounts were reported. The
+combined image attribution is about 71% of the physical-used sample. Image
+records show approximately 335 MB for each Chromium image and 203 MB for each
+Codium image; descendants that forked without exec already share pages.
+Anonymous virtual reservations totaled approximately 9.61 TB while their RAM
+backing was approximately 658 MB, reinforcing the need for demand-zero mmap.
+
+Both apps exited through native window controls. A census series straddled
+Chromium close: completed-AS counts fell from ten to one (Wayland), and physical
+used memory fell from approximately 1.88 GB to 290 MB. Ten tasks remained and
+heap integrity passed. The serial log has no allocation failures, user faults,
+negative process exits or map-accounting violations. Checked shutdown and all
+three offline filesystem checks passed. Session:
+`525dcb84aa9c4aca855d494ab2e8a67c`; kernel:
+`211ab4a124948270039c9ab2597e2c923c2b3ff9ed817fc31ad999f069a84ef6`.
+Local evidence: `build/workloads/memory-census-20261017/`, notably `stress.json`,
+`chromium-settled.json`, `combined-later.json`, `chromium-close-census.json` and
+`after-close.json`. Census sampling affects execution and is not a startup-time
+benchmark. It misses in-progress executable staging, among other memory listed
+in the bridge documentation.
+
+The next optimisation should share byte-identical initialized ELF pages across
+independent execs. A bounded immutable content cache can compare complete pages
+after hashing, publish only COW aliases and release idle cache references after
+AS cleanup. It must retain references through lookup/publication, unlink before
+eviction, avoid PMM-lock inversion or quarantine waits, and preserve raw-buffer,
+partial-page, BSS and overlap behavior. Cache admission must avoid sequential
+scan thrashing; existing fork sharing must not be counted as additional savings.
+This cache is not implemented by the census checkpoint.

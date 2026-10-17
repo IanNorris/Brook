@@ -11,6 +11,8 @@
 #include "process.h"
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
+#include "memory/address_space.h"
+#include "memory/virtual_memory.h"
 #include "klog.h"
 #include "profiler.h"
 #include "string.h"
@@ -3272,6 +3274,76 @@ struct BridgeReply {
     void send() {data[size]=0;DebugChannelSend(data);}
 };
 
+// Process-context only: pin completed AS identities without following a raw
+// proc->addressSpace pointer that a concurrent exec could retire.
+static void DebugMemoryCensus()
+{
+    Process* actor=ProcessCurrent();
+    if(!actor) { DebugChannelSend("{\"error\":\"process_context_required\"}\n");return; }
+    struct Operation {
+        Process* process;
+        explicit Operation(Process* p):process(p) { SchedulerKernelRegionEnter(process); }
+        ~Operation() { SchedulerKernelRegionLeave(process); }
+    } operation(actor);
+    const uint64_t ceiling=AddressSpaceIdentityCeiling();
+    BridgeReply header;header.text("{\"kind\":\"memory_census\",\"scope\":\"completed_user_address_spaces\",");
+    header.field("identity_ceiling",ceiling);header.text("}\n");header.send();
+    uint64_t cursor=0,spaces=0;
+    while(auto* space=AddressSpaceNextReference(cursor,ceiling)) {
+        struct Pin { AddressSpaceState* space;~Pin(){AddressSpaceUnref(space);}
+            void release(){AddressSpaceUnref(space);space=nullptr;} } pin{space};
+        cursor=space->identity;++spaces;const uint16_t allocationPid=space->allocationPid;
+        constexpr unsigned kinds=static_cast<unsigned>(MappingKind::Heap)+1;
+        struct Category { uint64_t virtualPages=0,ramPages=0,ranges=0;VmmRangeStats pages; } categories[kinds]{};
+        uint64_t generation=0;bool valid=true;
+        KMutexLock(&space->mutation);
+        generation=space->generation;
+        for(auto* node=space->ranges.head;node;node=node->next) {
+            const auto& range=node->range;const unsigned index=static_cast<unsigned>(range.kind);
+            if(index>=kinds) { valid=false;break; }
+            VmmRangeStats pages{};
+            const bool ram=range.kind!=MappingKind::Device || range.leafOwnership!=MappingLeafOwnership::Borrowed;
+            if(!VmmMeasureRange(space->pageTable,range.begin,range.end,ram,&pages)) { valid=false;break; }
+            auto& category=categories[index];++category.ranges;
+            category.virtualPages+=(range.end-range.begin)/4096;
+            if(ram)category.ramPages+=pages.backedPages;
+            auto& total=category.pages;
+            total.backedPages+=pages.backedPages;total.hiddenPages+=pages.hiddenPages;
+            total.cowPages+=pages.cowPages;total.writablePages+=pages.writablePages;
+            total.multiplyMappedPages+=pages.multiplyMappedPages;
+            total.unknownMapCountPages+=pages.unknownMapCountPages;
+            total.proportionalUnits+=pages.proportionalUnits;
+            total.tableEntriesVisited+=pages.tableEntriesVisited;total.lockBatches+=pages.lockBatches;
+        }
+        KMutexUnlock(&space->mutation);
+        pin.release(); // backpressured output must not pin a large exiting AS
+        // Never format or send while holding AS/PT/registry locks.
+        if(!valid) {
+            BridgeReply r;r.text("{\"error\":\"unsupported_range\",");r.field("as_id",cursor);r.text("}\n");r.send();continue;
+        }
+        static const char* names[kinds]={"anonymous","file","memfd","device","image","stack","heap"};
+        for(unsigned i=0;i<kinds;++i) {
+            const auto& category=categories[i];if(!category.ranges)continue;
+            const auto& pages=category.pages;
+            BridgeReply r;r.text("{");r.field("as_id",cursor);r.text(",");r.field("allocation_pid",allocationPid);
+            r.text(",");r.field("generation",generation);r.text(",\"mapping_kind\":\"");r.text(names[i]);r.text("\",");
+            r.field("ranges",category.ranges);r.text(",");r.field("virtual_bytes",category.virtualPages*4096);
+            r.text(",");r.field("backed_bytes",pages.backedPages*4096);
+            r.text(",");r.field("mapped_ram_bytes",category.ramPages*4096);
+            r.text(",");r.field("proportional_bytes",pages.proportionalUnits>>16);
+            r.text(",");r.field("hidden_bytes",pages.hiddenPages*4096);
+            r.text(",");r.field("cow_bytes",pages.cowPages*4096);
+            r.text(",");r.field("writable_bytes",pages.writablePages*4096);
+            r.text(",");r.field("multiply_mapped_bytes",pages.multiplyMappedPages*4096);
+            r.text(",");r.field("unknown_mapcount_pages",pages.unknownMapCountPages);
+            r.text(",");r.field("table_entries_visited",pages.tableEntriesVisited);
+            r.text(",");r.field("pt_lock_batches",pages.lockBatches);r.text("}\n");r.send();
+        }
+    }
+    BridgeReply footer;footer.text("{\"snapshot\":\"rolling\",");footer.field("spaces",spaces);
+    footer.text(",\"excludes\":\"construction,staging,cache-only,kernel,page-tables,queued-teardown,quarantine\"}\n");footer.send();
+}
+
 void DebugHandleCommand(const char* cmd, uint32_t len)
 {
     (void)len;
@@ -3354,6 +3426,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap poison on|off - runtime alloc/free poison (default off)\n"
             "  heap timing on|off|reset|status - allocator raw-cycle counters (default off)\n"
             "  heap check      - validate heap block metadata\n"
+            "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
             "  uptime          - system uptime + wall clock\n"
             "  cpus            - CPU count + SMP info\n"
@@ -3614,6 +3687,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     // -----------------------------------------------------------------------
     // mem pids — per-PID page counts (PMM)
     // -----------------------------------------------------------------------
+    else if (NetStrEq(cmd, "mem census")) { DebugMemoryCensus(); }
     else if (NetStrEq(cmd, "mem pids")) {
         PmmDumpPidStats();
         DebugChannelSend("mem pids: written to serial (see kernel log)\n");

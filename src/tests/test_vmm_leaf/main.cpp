@@ -141,14 +141,15 @@ PhysicalAddress PmmAllocPage(MemTag,uint16_t) {
 }
 void PmmThrottleForDrain() {}
 void PmmRefPage(PhysicalAddress p) {
-    std::lock_guard<std::mutex> lock(frameLock);auto& r=records[indexOf(p)];CHECK(r.refs&&r.refs<254);++r.refs;
+    std::lock_guard<std::mutex> lock(frameLock);auto& r=records[indexOf(p)];CHECK(r.refs&&r.refs<~unsigned{0});++r.refs;
 }
 bool PmmRefPageIfAlive(PhysicalAddress p) {
-    std::lock_guard<std::mutex> lock(frameLock);auto& r=records[indexOf(p)];if(!r.refs)return false;CHECK(r.refs<254);++r.refs;return true;
+    std::lock_guard<std::mutex> lock(frameLock);auto& r=records[indexOf(p)];if(!r.refs)return false;CHECK(r.refs<~unsigned{0});++r.refs;return true;
 }
 void PmmUnrefPage(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);dropLocked(indexOf(p)); }
 void PmmFreePage(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);CHECK(records[indexOf(p)].refs==1);dropLocked(indexOf(p)); }
 uint32_t PmmGetRefCount(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);return records[indexOf(p)].refs; }
+uint32_t PmmGetMapCount(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);return records[indexOf(p)].maps; }
 void PmmMapInc(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);auto& r=records[indexOf(p)];CHECK(r.refs);++r.maps; }
 void PmmMapDec(PhysicalAddress p) { std::lock_guard<std::mutex> lock(frameLock);auto& r=records[indexOf(p)];CHECK(r.maps);--r.maps; }
 extern "C" int PmmDumpFreeLog(uint64_t) { CHECK(false);return 0; }
@@ -240,6 +241,8 @@ static void largeLeafAndBorrowedFrame() {
         uint64_t saved=0x40000000|VMM_PRESENT|VMM_USER|VMM_WRITABLE|(1u<<7);
         *large=saved;uint64_t directoryEntry=entries[1];auto candidate=PmmAllocPage();
         CHECK(VmmTryMapPage(pt,va,candidate,flags)==VmmMapResult::Occupied);
+        VmmRangeStats census{};
+        CHECK(!VmmMeasureRange(pt,va.raw(),va.raw()+4096,true,&census)&&!census.backedPages);
         CHECK(*large==saved&&!VmmDetachPage(pt,va));
         CHECK(reinterpret_cast<uint64_t*>(pt.pml4.raw())[0]==rootEntry&&entries[1]==directoryEntry);
         CHECK(PmmGetRefCount(candidate)==1&&maps(candidate)==0);
@@ -1248,6 +1251,65 @@ static void anonymousDiscard() {
     std::puts("ANONYMOUS DISCARD PASS zero/hidden/CoW-isolation/OOM-atomicity/delayed-ACK/bounded-snapshot");
 }
 
+static void memoryCensus() {
+    auto root=table();VmmHostSetKernelRoot(root);
+    auto* first=AddressSpaceCreate(50);auto* second=AddressSpaceCreate(51);
+    auto* hidden=AddressSpaceCreate(52);CHECK(first&&second&&hidden);
+    const uint64_t ceiling=AddressSpaceIdentityCeiling();
+    CHECK(!AddressSpaceNextReference(0,ceiling)); // construction isn't published
+    AddressSpacePublish(second);AddressSpacePublish(first);AddressSpacePublish(first);
+    auto* late=AddressSpaceCreate(53);AddressSpacePublish(late);
+    auto* one=AddressSpaceNextReference(0,ceiling);CHECK(one==first);
+    auto* two=AddressSpaceNextReference(one->identity,ceiling);CHECK(two==second);
+    CHECK(!AddressSpaceNextReference(two->identity,ceiling)); // creation ceiling
+    // Snapshot pins remain valid after both owning tasks have dropped refs.
+    AddressSpaceUnref(first);AddressSpaceUnref(second);CHECK(!ProcessCleanupStep());
+    AddressSpaceUnref(one);CHECK(ProcessCleanupStep());
+    AddressSpaceUnref(two);CHECK(ProcessCleanupStep());
+    CHECK(!AddressSpaceNextReference(0,ceiling));
+    AddressSpaceUnref(hidden);CHECK(ProcessCleanupStep());
+    AddressSpaceUnref(late);CHECK(ProcessCleanupStep());
+    CHECK(!AddressSpaceNextReference(0,AddressSpaceIdentityCeiling()));
+
+    auto pt=table();auto frame=PmmAllocPage();CHECK(frame);
+    CHECK(VmmTryMapPage(pt,VirtualAddress(0x400000),frame,VMM_USER|PTE_COW_BIT)==VmmMapResult::Mapped);
+    PmmRefPage(frame);
+    CHECK(VmmTryMapPage(pt,VirtualAddress(0x800000),frame,VMM_USER|PTE_COW_BIT)==VmmMapResult::Mapped);
+    auto privatePage=PmmAllocPage();CHECK(privatePage);
+    CHECK(VmmTryMapPage(pt,VirtualAddress(0x1000000),privatePage,flags)==VmmMapResult::Mapped);
+    auto* pte=VmmGetPte(pt,VirtualAddress(0x1000000));CHECK(pte);
+    *pte=(*pte&~VMM_PRESENT)|PTE_HIDDEN_BIT;
+    VmmRangeStats stats{};
+    // Huge virtual holes must be skipped; no loop per reserved 4K/2MiB.
+    CHECK(VmmMeasureRange(pt,4096,0x400000000000ULL,true,&stats));
+    CHECK(stats.backedPages==3&&stats.hiddenPages==1&&stats.cowPages==2);
+    CHECK(stats.multiplyMappedPages==2&&stats.unknownMapCountPages==0);
+    CHECK(stats.proportionalUnits==(8192ULL<<16));
+    CHECK(stats.tableEntriesVisited<3000&&stats.lockBatches==1);
+    PmmMapDec(privatePage); // deliberately missing accounting must be visible
+    CHECK(VmmMeasureRange(pt,4096,0x400000000000ULL,true,&stats));
+    CHECK(stats.unknownMapCountPages==1&&stats.proportionalUnits==(4096ULL<<16));
+    PmmMapInc(privatePage);
+    CHECK(VmmMeasureRange(pt,4096,0x400000000000ULL,false,&stats));
+    CHECK(stats.backedPages==3&&!stats.proportionalUnits&&!stats.multiplyMappedPages);
+    CHECK(!VmmMeasureRange(pt,1,8192,true,&stats)&&!stats.backedPages);
+    VmmDestroyUserPageTable(pt);
+
+    // Multiple traversal batches must neither omit nor double count leaves.
+    pt=table();
+    frame=PmmAllocPage();CHECK(frame);
+    for(uint64_t i=0;i<5000;++i) {
+        if(i)PmmRefPage(frame);
+        CHECK(VmmTryMapPage(pt,VirtualAddress(0x400000+i*4096),frame,flags)==VmmMapResult::Mapped);
+    }
+    CHECK(VmmMeasureRange(pt,4096,0x400000000000ULL,true,&stats));
+    CHECK(stats.backedPages==5000&&stats.writablePages==5000&&stats.lockBatches>1);
+    CHECK(stats.proportionalUnits==((4096ULL<<16)/5000)*5000&&!stats.unknownMapCountPages);
+    VmmDestroyUserPageTable(pt);
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("MEMORY CENSUS PASS lifetime/publication/ceiling/sparse/hidden/aliases/bounded-batches");
+}
+
 int main() {
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
@@ -1255,6 +1317,6 @@ int main() {
     liveMappingClone();sharedMappingClone();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();targetFileInvalidation();
     pageAccessWithoutUnrelatedGate();
-    anonymousDiscard();
+    anonymousDiscard();memoryCensus();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

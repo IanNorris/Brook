@@ -26,6 +26,9 @@ struct AddressSpaceState {
     uint64_t mmapNext;
     CompositorVfbAllocation* fbAllocations; // legacy graphics backing owned by this AS
     AddressSpaceState* cleanupNext;
+    // Weak diagnostic registry: only completed construction is published.
+    AddressSpaceState* registryNext;
+    bool published;
     uint64_t programBreakLow, programBreakHigh; // bounds of this image, independent of leader exec
     MappingRangeTable ranges; // authoritative mapping extents, permissions and ownership
 };
@@ -33,6 +36,11 @@ struct AddressSpaceState {
 void AddressSpaceKernelInit();
 AddressSpaceState* AddressSpaceKernel(); // Immortal; initialized before APs/tasks.
 AddressSpaceState* AddressSpaceCreate(uint16_t allocationPid);
+void AddressSpacePublish(AddressSpaceState* space);
+uint64_t AddressSpaceIdentityCeiling();
+// Owned reference to the lowest published identity in (after,ceiling].
+// Registry protects acquisition against last-unref/queued teardown.
+AddressSpaceState* AddressSpaceNextReference(uint64_t after, uint64_t ceiling);
 void AddressSpaceRef(AddressSpaceState* space);
 // Raw pointer lifetime must be protected (e.g. file registry lock). Never resurrects zero.
 bool AddressSpaceTryRef(AddressSpaceState* space);
