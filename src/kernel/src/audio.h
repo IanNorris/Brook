@@ -6,9 +6,8 @@
 // during module init. The kernel can then use AudioPlay() etc.
 // without knowing which driver is behind it.
 //
-// AudioMixerSubmit() accumulates PCM from multiple /dev/dsp writers
-// into a shared mix buffer. AudioMixerFlush() pushes the mixed result
-// to the hardware driver.
+// AudioMixerSubmit() queues PCM for an independently owned stream.
+// AudioMixerFlush() mixes streams when delivering a batch to the driver.
 
 #include <stdint.h>
 
@@ -51,8 +50,7 @@ bool     AudioAvailable();
 
 // --- Mixer API ---
 // All samples must be 44100 Hz, stereo, 16-bit signed LE before submission.
-// The mixer accumulates (adds with clamping) from multiple writers and
-// flushes to hardware when enough data is ready.
+// Queues retain unaccepted samples; mixing/clamping happens at delivery.
 
 static constexpr uint32_t MIXER_HW_RATE     = 44100;
 static constexpr uint8_t  MIXER_HW_CHANNELS = 2;
@@ -60,14 +58,20 @@ static constexpr uint8_t  MIXER_HW_BITS     = 16;
 static constexpr uint32_t MIXER_FRAME_BYTES  = MIXER_HW_CHANNELS * (MIXER_HW_BITS / 8); // 4
 static constexpr uint32_t MIXER_RING_FRAMES = 16384;
 
-// Submit pre-resampled 44100/stereo/16-bit PCM into the mix buffer.
-// Samples are added to whatever is already accumulated at that stream's position.
-// streamId identifies the /dev/dsp fd (0-7), allowing independent write cursors.
+using AudioStreamId = uint64_t;
+static constexpr uint32_t MIXER_MAX_STREAMS = 8;
+// Zero means unavailable/exhausted. Identities include slot generations.
+AudioStreamId AudioMixerOpen();
+bool AudioMixerClose(AudioStreamId stream);
+bool AudioMixerReset(AudioStreamId stream);
+bool AudioMixerSetEnabled(AudioStreamId stream, bool enabled);
+
+// Submit pre-resampled 44100/stereo/16-bit PCM into this stream's FIFO.
 // Returns the number of frames actually accepted; callers must retry the rest.
-uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t streamId = 0);
+uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, AudioStreamId stream);
 
 // Query available space in mixer ring for a given stream (in frames).
-uint32_t AudioMixerAvailableFrames(uint32_t streamId = 0);
+uint32_t AudioMixerAvailableFrames(AudioStreamId stream);
 
 // Deliver a pending batch or move accumulated samples into a new batch.
 // Retain the unaccepted suffix across zero, partial and failed driver writes.

@@ -4,7 +4,9 @@
   descriptor has 5,680–41,552 queued bytes. Complete a clocked, independently
   owned OSS stream path before enabling the standard ALSA OSS plugin. Include
   hardware completion/discontinuities, short-tail drain, consistent readiness
-  and stream-local reset/close. See [measured clock and delivery work](audio-clock.md).
+  and independently attributable hardware reset/close. Software FIFO ownership,
+  pause/reset/close and dup/fork lifetime now pass targeted tests; hardware
+  completion is still open. See [measured clock and delivery work](audio-clock.md).
 
 - Firefox audio IPC now passes its Unix receive-flag dependency: Linux and
   Brook both pass the four-case SCM_RIGHTS/epoll/EOF probe after accepting

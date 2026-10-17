@@ -2011,3 +2011,18 @@ Codium edit/save/ownership/normal-close smoke checks also pass. All three guests
 stop with checked sync and clean offline filesystems. Writable shared mappings,
 mapped truncate and raw kernel-uaccess recovery remain open; this does not
 accept SQLite WAL or Firefox audio. See the [fault-outcome report](file-fault-outcomes.md).
+
+
+### Audio stream ownership (18 October)
+
+DSP descriptions now own separate FIFO queues with generation-tagged identities.
+Closing/resetting one description no longer globally stops playback or reuses an
+active slot. Dup/fork retain one stream until final close. Real guest tests pass
+ownership, exhaustion/reuse, backpressure, blocked-writer reset, extreme rates
+and 64 KiB fragments. All 32 hosted suites and the supported entry-state audit
+pass. The same 200-round ALSA reproducer that initially asserted at cleanup now
+exits zero after restoring blocking full-chunk writes. A three-second tone
+capture contains PCM and the later idle capture is empty. Checked shutdown and
+all offline filesystems pass. This is not Firefox audio acceptance: per-stream
+hardware completion, device clock, readiness and drain remain open. See the
+[audio clock report](audio-clock.md) for exact identities and limitations.

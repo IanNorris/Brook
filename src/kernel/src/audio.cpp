@@ -1,7 +1,7 @@
 // audio.cpp — Brook audio subsystem registry + software mixer.
 //
-// The mixer is a ring buffer into which /dev/dsp writers submit resampled
-// 44100 Hz stereo 16-bit PCM.  Multiple streams are additively mixed.
+// Each /dev/dsp open owns a FIFO of resampled 44100 Hz stereo 16-bit PCM.
+// Delivery snapshots mix live streams without sharing write cursors.
 // A dedicated kernel thread (audio_mix) wakes every ~10ms and drains
 // accumulated data to the hardware driver in consistent chunks,
 // decoupling application write timing from hardware playback timing.
@@ -23,195 +23,231 @@ extern volatile uint64_t g_lapicTickCount;
 static const AudioDriver* g_audioDriver = nullptr;
 static SpinLock g_mixerLock;
 
-// --- Mixer ring buffer ---
-// Ring of int32 stereo samples.  Writers add into it at their stream's
-// write cursor; the tick drains from readPos to the hw-write high-water mark.
-//
-// Layout: [readPos ... writeHighWater ... end] wrapping around.
-// Multiple streams can write concurrently at different positions; we drain
-// up to the minimum write position to ensure all streams have contributed.
-
-static constexpr uint32_t MIXER_BUF_FRAMES = MIXER_RING_FRAMES; // ~372ms at 44100 Hz
-static constexpr uint32_t MIXER_BUF_MASK   = MIXER_BUF_FRAMES - 1;
-static constexpr uint32_t MIXER_MAX_STREAMS = 8;
-
-// Flush target: drain up to this many frames per tick (~10ms = 441 frames).
-// We target slightly larger chunks to reduce per-call overhead.
-static constexpr uint32_t MIXER_TICK_FRAMES = 882; // ~20ms chunk
-
-static int32_t* g_mixBuf = nullptr;     // [MIXER_BUF_FRAMES * 2] (L/R interleaved)
-static uint32_t g_readPos = 0;          // next frame to be flushed to hardware
-static uint32_t g_streamWritePos[MIXER_MAX_STREAMS]; // per-stream write cursor (absolute)
-static uint32_t g_writeHighWater = 0;   // max of all stream write positions
-static bool     g_mixerReady = false;
-static int16_t* g_flushBuf = nullptr;   // temporary int16 buffer for flush
-// One immutable delivery batch survives zero, short and failed driver writes.
-// Only the flush owner touches these cursors; writers keep using the mix ring.
-static uint32_t g_flushBytes = 0;
-static uint32_t g_flushOffset = 0;
+// Independently owned FIFO rings. Samples remain charged to their stream
+// until the driver accepts them; prepared mixes never own pointers into a ring.
+static constexpr uint32_t MIXER_BUF_MASK = MIXER_RING_FRAMES - 1;
+static constexpr uint32_t MIXER_BATCH_FRAMES = 1764;
+struct MixerStream {
+    int16_t* samples = nullptr;
+    AudioStreamId identity = 0;
+    uint64_t epoch = 0;
+    uint64_t read = 0, write = 0;
+    bool enabled = true;
+};
+static MixerStream g_streams[MIXER_MAX_STREAMS];
+static uint64_t g_nextStreamIdentity = 1;
+static bool g_mixerReady = false;
+static int16_t* g_flushBuf = nullptr;
 static uint32_t g_flushBusy = 0;
-static uint64_t g_deliveryEpoch = 0;
-static uint64_t g_flushEpoch = 0;
+static uint64_t g_deliveryEpoch = 0, g_flushEpoch = 0;
+static uint32_t g_batchRemaining = 0;
+struct Contribution {
+    AudioStreamId identity = 0;
+    uint64_t epoch = 0, read = 0;
+    uint32_t frames = 0;
+};
+// If a generic driver accepts part of an encoded stereo frame, preserve the
+// rest of that frame exactly. Later whole frames can be remixed after a close.
+static uint8_t g_partialFrame[MIXER_FRAME_BYTES];
+static uint32_t g_partialOffset = 0;
+static Contribution g_partialContributions[MIXER_MAX_STREAMS];
 
+static MixerStream* FindStream(AudioStreamId identity)
+{
+    const uint32_t slot = static_cast<uint32_t>(identity & 15);
+    if (!slot || slot > MIXER_MAX_STREAMS) return nullptr;
+    auto& stream = g_streams[slot - 1];
+    return identity && stream.identity == identity ? &stream : nullptr;
+}
+static void ResetStream(MixerStream& stream)
+{
+    ++stream.epoch;
+    stream.read = stream.write = 0;
+}
+static void ResetAllStreams()
+{
+    SpinLockAcquire(&g_mixerLock);
+    for (auto& stream : g_streams) ResetStream(stream);
+    SpinLockRelease(&g_mixerLock);
+}
 void AudioMixerInit()
 {
-    g_mixBuf = static_cast<int32_t*>(kmalloc(MIXER_BUF_FRAMES * 2 * sizeof(int32_t)));
-    g_flushBuf = static_cast<int16_t*>(kmalloc(MIXER_TICK_FRAMES * 2 * 2 * sizeof(int16_t)));
-    if (g_mixBuf && g_flushBuf)
-    {
-        memset(g_mixBuf, 0, MIXER_BUF_FRAMES * 2 * sizeof(int32_t));
-        g_readPos = 0;
-        g_writeHighWater = 0;
-        memset(g_streamWritePos, 0, sizeof(g_streamWritePos));
-        g_mixerReady = true;
+    // Boot-only initialization: allocate outside the mixer lock.
+    for (auto& stream : g_streams)
+        stream.samples = static_cast<int16_t*>(kmalloc(MIXER_RING_FRAMES * MIXER_FRAME_BYTES));
+    g_flushBuf = static_cast<int16_t*>(kmalloc(MIXER_BATCH_FRAMES * MIXER_FRAME_BYTES));
+    bool ready = g_flushBuf != nullptr;
+    for (const auto& stream : g_streams) ready = ready && stream.samples;
+    if (!ready) {
+        for (auto& stream : g_streams) { kfree(stream.samples); stream.samples = nullptr; }
+        kfree(g_flushBuf); g_flushBuf = nullptr;
+        return;
     }
+    g_mixerReady = true;
 }
-
-// How many frames are buffered (available to flush).
-static inline uint32_t MixerBufferedFrames()
+AudioStreamId AudioMixerOpen()
 {
-    return g_writeHighWater - g_readPos;
-}
-
-uint32_t AudioMixerAvailableFrames(uint32_t streamId)
-{
-    if (!g_mixerReady) return 0;
-    if (streamId >= MIXER_MAX_STREAMS) streamId = 0;
-
     SpinLockAcquire(&g_mixerLock);
-    uint32_t writePos = g_streamWritePos[streamId];
-    if (writePos < g_readPos)
-        writePos = g_readPos;
-    uint32_t available = MIXER_BUF_FRAMES - (writePos - g_readPos);
+    AudioStreamId identity = 0;
+    if (g_mixerReady && g_nextStreamIdentity <= (~uint64_t(0) >> 4)) {
+        for (uint32_t i = 0; i < MIXER_MAX_STREAMS; ++i) {
+            auto& stream = g_streams[i];
+            if (stream.identity) continue;
+            identity = (g_nextStreamIdentity++ << 4) | (i + 1);
+            ResetStream(stream); stream.enabled = true; stream.identity = identity;
+            break;
+        }
+    }
+    SpinLockRelease(&g_mixerLock);
+    return identity;
+}
+bool AudioMixerClose(AudioStreamId identity)
+{
+    SpinLockAcquire(&g_mixerLock);
+    auto* stream = FindStream(identity);
+    if (stream) { ResetStream(*stream); stream->identity = 0; }
+    SpinLockRelease(&g_mixerLock);
+    return stream != nullptr;
+}
+bool AudioMixerReset(AudioStreamId identity)
+{
+    SpinLockAcquire(&g_mixerLock);
+    auto* stream = FindStream(identity);
+    if (stream) ResetStream(*stream);
+    SpinLockRelease(&g_mixerLock);
+    return stream != nullptr;
+}
+bool AudioMixerSetEnabled(AudioStreamId identity, bool enabled)
+{
+    SpinLockAcquire(&g_mixerLock);
+    auto* stream = FindStream(identity);
+    if (stream) stream->enabled = enabled;
+    SpinLockRelease(&g_mixerLock);
+    return stream != nullptr;
+}
+uint32_t AudioMixerAvailableFrames(AudioStreamId identity)
+{
+    SpinLockAcquire(&g_mixerLock);
+    auto* stream = FindStream(identity);
+    uint32_t available = stream ? MIXER_RING_FRAMES - static_cast<uint32_t>(stream->write - stream->read) : 0;
     SpinLockRelease(&g_mixerLock);
     return available;
 }
-
-uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t streamId)
+uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frames, AudioStreamId identity)
 {
-    if (!g_mixerReady || !samples || frameCount == 0) return 0;
-    if (streamId >= MIXER_MAX_STREAMS) streamId = 0;
-
+    if (!samples || !frames) return 0;
     SpinLockAcquire(&g_mixerLock);
-
-    uint32_t writePos = g_streamWritePos[streamId];
-
-    // If stream is behind readPos (just started or was idle), catch up
-    if (writePos < g_readPos)
-        writePos = g_readPos;
-
-    // If this write would overflow the ring, clamp to available space
-    uint32_t available = MIXER_BUF_FRAMES - (writePos - g_readPos);
-    if (frameCount > available)
-        frameCount = available;
-
-    if (frameCount == 0)
-    {
-        SpinLockRelease(&g_mixerLock);
-        return 0;
+    auto* stream = FindStream(identity);
+    if (!stream) { SpinLockRelease(&g_mixerLock); return 0; }
+    const uint32_t available = MIXER_RING_FRAMES - static_cast<uint32_t>(stream->write - stream->read);
+    if (frames > available) frames = available;
+    // Empty queues may restart their indices, avoiding lifetime counter wrap.
+    if (stream->read == stream->write) stream->read = stream->write = 0;
+    for (uint32_t i = 0; i < frames; ++i) {
+        const uint32_t index = static_cast<uint32_t>(stream->write + i) & MIXER_BUF_MASK;
+        stream->samples[index * 2] = samples[i * 2];
+        stream->samples[index * 2 + 1] = samples[i * 2 + 1];
     }
-
-    // Additively mix into the ring buffer
-    for (uint32_t i = 0; i < frameCount; i++)
-    {
-        uint32_t ringIdx = (writePos + i) & MIXER_BUF_MASK;
-        g_mixBuf[ringIdx * 2 + 0] += static_cast<int32_t>(samples[i * 2 + 0]);
-        g_mixBuf[ringIdx * 2 + 1] += static_cast<int32_t>(samples[i * 2 + 1]);
-    }
-
-    writePos += frameCount;
-    g_streamWritePos[streamId] = writePos;
-    if (writePos > g_writeHighWater)
-        g_writeHighWater = writePos;
-
+    stream->write += frames;
     SpinLockRelease(&g_mixerLock);
-    return frameCount;
+    return frames;
 }
-
-// Flush accumulated mix data to hardware.
-// Lock is acquired/released internally — play() may block.
-
+static void Consume(const Contribution* contributions, uint32_t frames)
+{
+    for (uint32_t i = 0; i < MIXER_MAX_STREAMS; ++i) {
+        const auto& part = contributions[i];
+        auto* stream = FindStream(part.identity);
+        if (!stream || stream->epoch != part.epoch || stream->read != part.read) continue;
+        uint32_t consumed = frames < part.frames ? frames : part.frames;
+        stream->read += consumed;
+    }
+}
+// Snapshot a new whole-frame attempt. Rebuilding unaccepted frames removes
+// closed/reset/paused contributors without subtracting already-clamped sums.
+static uint32_t Prepare(Contribution* contributions)
+{
+    uint32_t frames = 0;
+    for (const auto& stream : g_streams)
+        if (stream.identity && stream.enabled && stream.write - stream.read > frames)
+            frames = static_cast<uint32_t>(stream.write - stream.read);
+    if (frames > MIXER_BATCH_FRAMES) frames = MIXER_BATCH_FRAMES;
+    if (g_batchRemaining && frames > g_batchRemaining) frames = g_batchRemaining;
+    g_batchRemaining = frames;
+    for (uint32_t slot = 0; slot < MIXER_MAX_STREAMS; ++slot) {
+        const auto& stream = g_streams[slot];
+        if (!stream.identity || !stream.enabled) continue;
+        uint32_t count = static_cast<uint32_t>(stream.write - stream.read);
+        if (count > frames) count = frames;
+        contributions[slot] = {stream.identity, stream.epoch, stream.read, count};
+    }
+    for (uint32_t i = 0; i < frames; ++i) {
+        int32_t left = 0, right = 0;
+        for (uint32_t slot = 0; slot < MIXER_MAX_STREAMS; ++slot) {
+            const auto& part = contributions[slot];
+            if (i >= part.frames) continue;
+            const uint32_t index = static_cast<uint32_t>(part.read + i) & MIXER_BUF_MASK;
+            left += g_streams[slot].samples[index * 2];
+            right += g_streams[slot].samples[index * 2 + 1];
+        }
+        if (left > 32767) left = 32767; else if (left < -32768) left = -32768;
+        if (right > 32767) right = 32767; else if (right < -32768) right = -32768;
+        g_flushBuf[i * 2] = static_cast<int16_t>(left);
+        g_flushBuf[i * 2 + 1] = static_cast<int16_t>(right);
+    }
+    return frames;
+}
 void AudioMixerFlush()
 {
-    // A second caller must not overwrite a batch while play() is sleeping.
-    // Do not retain the mixer spinlock across the driver callback.
     if (__atomic_exchange_n(&g_flushBusy, 1u, __ATOMIC_ACQUIRE)) return;
-    struct FlushOwner {
-        ~FlushOwner() { __atomic_store_n(&g_flushBusy, 0u, __ATOMIC_RELEASE); }
-    } owner;
-
+    struct FlushOwner { ~FlushOwner() { __atomic_store_n(&g_flushBusy, 0u, __ATOMIC_RELEASE); } } owner;
     const uint64_t epoch = __atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE);
-    if (g_flushEpoch != epoch)
-    {
-        g_flushBytes = g_flushOffset = 0;
-        g_flushEpoch = epoch;
-    }
-
+    if (g_flushEpoch != epoch) { g_batchRemaining = g_partialOffset = 0; g_flushEpoch = epoch; }
+    Contribution contributions[MIXER_MAX_STREAMS]{};
+    const bool partial = g_partialOffset != 0;
     SpinLockAcquire(&g_mixerLock);
-    if (!g_mixerReady || !g_audioDriver || !g_audioDriver->play)
-    {
-        SpinLockRelease(&g_mixerLock);
-        return;
+    if (!g_mixerReady || !g_audioDriver || !g_audioDriver->play) {
+        SpinLockRelease(&g_mixerLock); return;
     }
-
-    if (g_flushOffset == g_flushBytes)
-    {
-        uint32_t buffered = MixerBufferedFrames();
-        if (buffered == 0)
-        {
-            SpinLockRelease(&g_mixerLock);
-            return;
-        }
-
-        // Flush up to 2x tick size per call (avoid huge bursts)
-        uint32_t toFlush = buffered;
-        if (toFlush > MIXER_TICK_FRAMES * 2)
-            toFlush = MIXER_TICK_FRAMES * 2;
-
-        // Convert int32 → int16 with clamping into the flush buffer
-        for (uint32_t i = 0; i < toFlush; i++)
-        {
-            uint32_t ringIdx = (g_readPos + i) & MIXER_BUF_MASK;
-            int32_t l = g_mixBuf[ringIdx * 2 + 0];
-            int32_t r = g_mixBuf[ringIdx * 2 + 1];
-            if (l > 32767) l = 32767; else if (l < -32768) l = -32768;
-            if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
-            g_flushBuf[i * 2 + 0] = static_cast<int16_t>(l);
-            g_flushBuf[i * 2 + 1] = static_cast<int16_t>(r);
-            g_mixBuf[ringIdx * 2 + 0] = 0;
-            g_mixBuf[ringIdx * 2 + 1] = 0;
-        }
-
-        // The ring slots may be reused now: their complete clamped contents
-        // belong to g_flushBuf until the driver accepts the entire batch.
-        g_readPos += toFlush;
-        g_flushBytes = toFlush * MIXER_FRAME_BYTES;
-        g_flushOffset = 0;
-    }
-
-    // Release lock BEFORE calling into the HDA driver — play() may block
-    // (SchedulerSleepMs) when the HDA ring buffer is full. Holding a
-    // spinlock across a sleep would stall all AudioMixerSubmit callers.
+    const uint32_t frames = partial ? 0 : Prepare(contributions);
     SpinLockRelease(&g_mixerLock);
-
-    if (__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE) != g_flushEpoch)
-    {
-        g_flushBytes = g_flushOffset = 0;
-        return;
+    if (!partial && !frames) return;
+    if (__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE) != epoch) {
+        g_batchRemaining = g_partialOffset = 0; return;
     }
-    const uint32_t remaining = g_flushBytes - g_flushOffset;
-    const auto* pending = reinterpret_cast<const uint8_t*>(g_flushBuf) + g_flushOffset;
-    int accepted = g_audioDriver->play(pending, remaining,
-                        MIXER_HW_RATE, MIXER_HW_CHANNELS, MIXER_HW_BITS, false);
-    if (__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE) != g_flushEpoch)
-    {
-        g_flushBytes = g_flushOffset = 0;
-        return;
+    const uint32_t bytes = partial ? MIXER_FRAME_BYTES - g_partialOffset : frames * MIXER_FRAME_BYTES;
+    const void* data = partial ? static_cast<const void*>(g_partialFrame + g_partialOffset) : g_flushBuf;
+    const int accepted = g_audioDriver->play(data, bytes,
+        MIXER_HW_RATE, MIXER_HW_CHANNELS, MIXER_HW_BITS, false);
+    if (__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE) != epoch) {
+        g_batchRemaining = g_partialOffset = 0; return;
     }
-    if (accepted > 0 && static_cast<uint32_t>(accepted) <= remaining)
-        g_flushOffset += static_cast<uint32_t>(accepted);
-    else if (accepted > 0)
-        SerialPrintf("audio: driver returned %d for %u pending bytes\n", accepted, remaining);
+    if (accepted <= 0) return;
+    if (static_cast<uint32_t>(accepted) > bytes) {
+        SerialPrintf("audio: driver returned %d for %u pending bytes\n", accepted, bytes); return;
+    }
+    SpinLockAcquire(&g_mixerLock);
+    if (partial) {
+        g_partialOffset += static_cast<uint32_t>(accepted);
+        if (g_partialOffset == MIXER_FRAME_BYTES) {
+            Consume(g_partialContributions, 1);
+            g_partialOffset = 0; --g_batchRemaining;
+        }
+    } else {
+        const uint32_t whole = static_cast<uint32_t>(accepted) / MIXER_FRAME_BYTES;
+        Consume(contributions, whole);
+        g_batchRemaining -= whole;
+        const uint32_t tail = static_cast<uint32_t>(accepted) % MIXER_FRAME_BYTES;
+        if (tail) {
+            memcpy(g_partialFrame, reinterpret_cast<uint8_t*>(g_flushBuf) + whole * MIXER_FRAME_BYTES, MIXER_FRAME_BYTES);
+            g_partialOffset = tail;
+            for (uint32_t i = 0; i < MIXER_MAX_STREAMS; ++i) {
+                const auto& part = contributions[i];
+                g_partialContributions[i] = part.frames > whole
+                    ? Contribution{part.identity, part.epoch, part.read + whole, 1} : Contribution{};
+            }
+        }
+    }
+    SpinLockRelease(&g_mixerLock);
 }
 
 void AudioMixerTick()
@@ -256,8 +292,10 @@ void AudioStop()
     // while the sleeping driver stop is in progress. Only its flush owner
     // mutates the batch; this does not retract an in-flight hardware write.
     __atomic_fetch_add(&g_deliveryEpoch, 1ULL, __ATOMIC_ACQ_REL);
+    ResetAllStreams();
     if (g_audioDriver && g_audioDriver->stop)
         g_audioDriver->stop();
+    ResetAllStreams();
     __atomic_fetch_add(&g_deliveryEpoch, 1ULL, __ATOMIC_ACQ_REL);
 }
 

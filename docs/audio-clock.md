@@ -30,7 +30,7 @@ zero, the desktop returned to ten tasks, checked shutdown completed and all
 three offline filesystem checks passed. No unexpected device/serial error was
 found. Probe success means observations were collected, not that timing is correct.
 
-## Delivery loss prerequisite
+## Delivery loss prerequisite (17 October)
 
 The old mixer removed a batch from its ring, called the driver and ignored the
 returned byte count. A short or failed write therefore discarded unaccepted
@@ -38,7 +38,7 @@ samples. The hosted `test_audio_delivery` compiles the actual `audio.cpp` with
 a fake driver: the baseline loses data after a partial write and fails its
 independent byte-sequence comparison.
 
-The revised mixer retains one immutable delivery batch and its accepted-byte
+At the 17 October checkpoint, the revised mixer retains one immutable delivery batch and its accepted-byte
 cursor until the driver consumes it. Zero and negative returns preserve the
 suffix. An atomic ownership flag prevents another flush from overwriting the
 batch while the driver is sleeping; the mixer spinlock is released before
@@ -73,17 +73,78 @@ has zero PCM frames, and the desktop returns to ten tasks. Checked shutdown,
 the serial/device gate and all three offline filesystem checks pass.
 Evidence is under `build/workloads/audio-delivery-fixed-20261017/`.
 
-This is a delivery prerequisite, not complete stream accounting. In particular,
-existing delay/space queries still omit staged delivery bytes, stream IDs can
-collide, and global stop/reset and per-stream ownership remain unfinished.
+That checkpoint fixes delivery loss, not complete stream accounting. Its stream
+identities, shared ring and global close/reset are superseded by the ownership
+work below; hardware completion and a trustworthy device clock remain open.
+
+## Independently owned software queues (18 October)
+
+Each open DSP description now owns a generation-tagged stream and a bounded
+16,384-frame FIFO. Exhaustion returns EBUSY instead of cycling through active
+slots. Dup/fork share the description; only its final reference releases the
+stream. Reset, pause and close affect that stream's unaccepted FIFO data, without
+stopping the shared hardware device. New writes and controls are serialized by
+a per-description mutex. User data is safely copied into bounded kernel staging
+before taking the mixer spinlock; sendfile supplies an explicitly trusted kernel
+source. Blocking capacity waits release the mutex and are interruptible.
+
+A flush snapshots each contributor's identity, reset epoch, FIFO front and
+contributed frame count. Only driver-accepted frames are consumed. Whole-frame
+retries remix live contributors, including after clipping, so resetting or
+closing one stream does not leave its unaccepted samples in another's mix.
+A partially accepted encoded frame retains an immutable tail; finishing it
+cannot consume data from a replacement stream or reset epoch. Pause preserves
+the identity needed to consume an already accepted prefix exactly once.
+
+GETOSPACE now reports software FIFO space in the negotiated format instead of
+a stale global hardware-capacity constant. Rate negotiation reports a supported
+4,000–192,000 Hz range. A 64 KiB fragment no longer truncates to zero. Requested
+fragment count remains unsupported; this is not complete OSS geometry support.
+The existing nearest-neighbour resampler remains stateless across writes.
+
+Hosted production-mixer tests cover partial/error writes, late append,
+close/reuse while a callback is blocked, reset after saturated mixing, pause and
+reset during partial-frame completion, unequal stream lengths, slot exhaustion,
+stale identities, full queues and ring-index wraps. The two-pass release build,
+supported entry-state audit and all 32 hosted suites pass in
+`build/audio-owned-queues-build-v2-20261018.log`. The bootstrap acceptance gate's
+expected suite count is updated to 32; its five observer tests pass. This does
+not itself rerun either guest bootstrap path.
+
+The isolated eight-CPU, 4 GiB production VM boots frozen kernel
+`7adc4527c6f230078a1789eff98048f3055cc14a3fd14370559632fb40829ffa`.
+`scripts/workloads/dsp_ownership.py` passes real-syscall checks for independent
+reset/close, dup and fork final-reference lifetime, exhaustion/reuse, nonblocking
+backpressure, extreme-rate negotiation, 64 KiB fragments, and a paused/full
+writer released by another thread's reset. The job exits zero with no live tasks.
+
+An initial candidate passed ownership but a 200-round ALSA clock probe aborted
+at `snd_pcm_file_drop` with buffered bytes remaining. The
+[upstream file PCM implementation](https://github.com/alsa-project/alsa-lib/blob/master/src/pcm/pcm_file.c)
+stops its flush after a short write and asserts that drop emptied the buffer.
+Restoring blocking full-chunk writes fixes the same reproducer: all 200 rounds
+and cleanup now exit zero. Nonblocking writes still report partial acceptance.
+The requested three-second QEMU capture contains 132,526 active PCM frames
+(3.005 seconds), RMS 0.04322 and no entirely silent analysis bins. This is a tone
+smoke test, not proof of glitch-free timing. A subsequent two-second idle capture
+contains zero PCM frames. The desktop returns to ten tasks; checked shutdown,
+launcher exit zero, serial/device gate and all three offline filesystem checks
+pass. Final evidence is under
+`build/workloads/audio-owned-queues-v2-20261018/`; the failed initial reproducer
+is retained under `build/workloads/audio-owned-queues-20261018/`.
+
+Hardware-accepted mixed samples cannot yet be independently retracted or charged
+to contributing streams. GETODELAY still includes the global hardware queue;
+GETOPTR, accurate completion, readiness and drain remain unfinished. Firefox
+normal-launcher audio is not accepted, and ALSA/launcher defaults are unchanged.
+
 
 ## Clocked OSS endpoint before enabling the ALSA OSS plugin
 
 Review with Astra identified these required integration steps:
 
-- Allocate real stream identities with serialized per-open controls and safe
-  staging. Replace modulo-eight reuse and the shared additive ownership model
-  with per-stream queues.
+- Preserve the independently owned FIFO and serialized safe-staging foundation
+  above while adding hardware accounting; do not reintroduce shared ownership.
 - Account for accepted, hardware-committed and completed frames, including a
   pending delivery batch and partial/error driver writes. Track contributing
   stream generations through hardware completion.

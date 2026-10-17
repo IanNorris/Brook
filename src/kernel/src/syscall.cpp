@@ -769,12 +769,20 @@ struct DspState {
     uint32_t sampleRate;
     uint8_t  channels;
     uint8_t  bitsPerSample;
-    uint16_t fragmentSize;   // bytes per fragment
+    uint32_t fragmentSize;   // bytes per fragment
     uint32_t bufferOffset;   // write cursor into staging buffer
     uint8_t* buffer;         // staging buffer (kmalloc'd)
     uint32_t bufferSize;     // total staging buffer size
-    uint32_t mixerStreamId;  // mixer stream slot (0-7)
+    AudioStreamId mixerStreamId; // generation-tagged mixer ownership
+    KMutex ioLock;           // shared by dup/fork; never held while waiting for FIFO space
+    uint8_t* inputBuffer;    // bounded user-copy staging
     uint32_t refCount;       // fork-safe refcount (1 on creation)
+};
+
+struct DspIoGuard {
+    DspState* state;
+    explicit DspIoGuard(DspState* value) : state(value) { KMutexLock(&state->ioLock); }
+    ~DspIoGuard() { KMutexUnlock(&state->ioLock); }
 };
 
 void DspHandleRef(void* handle)
@@ -1492,7 +1500,6 @@ static constexpr uint8_t  DSP_DEFAULT_CHANNELS = 2;
 static constexpr uint8_t  DSP_DEFAULT_BITS     = 16;
 static constexpr uint32_t DSP_HW_RATE          = 44100; // hardware playback rate
 static constexpr uint32_t DSP_BUFFER_SIZE      = 65536; // 64KB staging buffer
-static constexpr uint32_t DSP_REPORT_BUFFER_SIZE = 24576; // HDA target queue (~139ms)
 
 // RAII guard for the pinned fget/fput path (BRO-156). Constructing it pins the
 // fd; destruction (on *every* return path, including the blocking ones) runs
@@ -1650,7 +1657,7 @@ static int64_t AppendUserBuffer(Vnode* vn, uint64_t address, uint64_t count, uin
     return result;
 }
 
-static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
+static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bool userSource = true)
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
@@ -1747,121 +1754,62 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
-        const uint8_t* src = reinterpret_cast<const uint8_t*>(bufAddr);
-        uint32_t appRate = dsp->sampleRate;
-        uint32_t bytesPerFrame = (dsp->bitsPerSample / 8) * dsp->channels;
-        if (bytesPerFrame == 0) bytesPerFrame = 1;
-
-        uint32_t totalInFrames = static_cast<uint32_t>(count) / bytesPerFrame;
-        uint32_t totalOutFrames;
-        if (appRate == DSP_HW_RATE || appRate == 0)
-            totalOutFrames = totalInFrames;
-        else
-            totalOutFrames = (totalInFrames * DSP_HW_RATE + appRate - 1) / appRate;
-
-        // Block until mixer has enough space (avoid silent sample drops).
-        // Skip blocking for O_NONBLOCK fds (games need non-blocking writes
-        // to avoid stalling their render loop; report partial writes faithfully).
-        // Timeout after 500ms to avoid permanent hang on broken stream.
-        bool isNonBlock = (fde->statusFlags & 0x800) != 0;
-        if (!isNonBlock)
-        {
-            extern volatile uint64_t g_lapicTickCount;
-            uint64_t deadline = g_lapicTickCount + 500;
-            uint32_t waitFrames = totalOutFrames < MIXER_RING_FRAMES ? totalOutFrames : MIXER_RING_FRAMES;
-            while (AudioMixerAvailableFrames(dsp->mixerStreamId) < waitFrames)
+        extern volatile uint64_t g_lapicTickCount;
+        const uint64_t deadline = g_lapicTickCount + 500;
+        for (;;) {
+            SpinLockAcquire(ProcessFdLock(proc));
+            const bool nonblock = (fde->statusFlags & 0x800) != 0;
+            SpinLockRelease(ProcessFdLock(proc));
             {
-                if (g_lapicTickCount >= deadline) break;
-                Process* self = SchedulerCurrentProcess();
-                if (self) {
-                    self->wakeupTick = g_lapicTickCount + 5; // 5ms poll
-                    SchedulerBlock(self);
+                DspIoGuard held(dsp);
+                const uint32_t rate = dsp->sampleRate ? dsp->sampleRate : DSP_HW_RATE;
+                const uint32_t frameBytes = (dsp->bitsPerSample / 8) * dsp->channels;
+                if (!frameBytes) return -EINVAL;
+                uint64_t frames = count / frameBytes;
+                if (!frames) return 0;
+                const uint64_t inputCap = DSP_BUFFER_SIZE / frameBytes;
+                const uint64_t outputCap = static_cast<uint64_t>(dsp->bufferSize / 4) * rate / DSP_HW_RATE;
+                if (frames > inputCap) frames = inputCap;
+                if (frames > outputCap) frames = outputCap;
+                if (!frames) return -EINVAL;
+                const uint32_t outFrames = static_cast<uint32_t>((frames * DSP_HW_RATE + rate - 1) / rate);
+                // Blocking writes wait for the bounded converted chunk, preserving
+                // the full-write behaviour expected by ALSA's file output backend.
+                if (nonblock || AudioMixerAvailableFrames(dsp->mixerStreamId) >= outFrames) {
+                    // User faults and conversion occur outside the IRQ-disabling mixer lock.
+                    if (userSource) {
+                        if (!CopyFromUser(dsp->inputBuffer, bufAddr, frames * frameBytes)) return -EFAULT;
+                    } else {
+                        memcpy(dsp->inputBuffer, reinterpret_cast<const void*>(bufAddr), frames * frameBytes);
+                    }
+                    auto* out = reinterpret_cast<int16_t*>(dsp->buffer);
+                    auto* src16 = reinterpret_cast<const int16_t*>(dsp->inputBuffer);
+                    for (uint32_t i = 0; i < outFrames; ++i) {
+                        uint64_t source = static_cast<uint64_t>(i) * rate / DSP_HW_RATE;
+                        if (source >= frames) source = frames - 1;
+                        for (uint32_t channel = 0; channel < 2; ++channel) {
+                            const uint64_t index = source * dsp->channels + (dsp->channels == 2 ? channel : 0);
+                            out[i * 2 + channel] = dsp->bitsPerSample == 8
+                                ? static_cast<int16_t>((static_cast<int>(dsp->inputBuffer[index]) - 128) * 256)
+                                : src16[index];
+                        }
+                    }
+                    const uint32_t accepted = AudioMixerSubmit(out, outFrames, dsp->mixerStreamId);
+                    if (accepted) {
+                        uint64_t consumed = accepted == outFrames ? frames
+                            : static_cast<uint64_t>(accepted - 1) * rate / DSP_HW_RATE + 1;
+                        if (consumed > frames) consumed = frames;
+                        return static_cast<int64_t>(consumed * frameBytes);
+                    }
                 }
             }
+            // A paused/full writer must not prevent another thread from resetting
+            // or enabling this same open description. Revalidate after every wait.
+            if (nonblock || g_lapicTickCount >= deadline) return -EAGAIN;
+            if (HasReadInterruptSignal()) return -EINTR;
+            Process* self = SchedulerCurrentProcess();
+            if (self) { self->wakeupTick = g_lapicTickCount + 5; SchedulerBlockInterruptible(self); }
         }
-
-        const int16_t* mixSrc = nullptr;
-        uint32_t mixFrames = 0;
-
-        if (appRate == DSP_HW_RATE || appRate == 0)
-        {
-            // Already at hardware rate — can submit directly
-            if (dsp->channels == 2 && dsp->bitsPerSample == 16)
-            {
-                mixSrc = reinterpret_cast<const int16_t*>(src);
-                mixFrames = static_cast<uint32_t>(count) / 4;
-            }
-            else
-            {
-                // Mono→stereo or 8→16 bit conversion needed
-                uint32_t inFrames = static_cast<uint32_t>(count) / bytesPerFrame;
-                uint32_t outBytes = inFrames * 4; // stereo 16-bit
-                if (outBytes > dsp->bufferSize) outBytes = dsp->bufferSize;
-                uint32_t outFrames = outBytes / 4;
-                int16_t* out = reinterpret_cast<int16_t*>(dsp->buffer);
-
-                for (uint32_t i = 0; i < outFrames; i++)
-                {
-                    int16_t sample;
-                    if (dsp->bitsPerSample == 8)
-                        sample = (static_cast<int16_t>(src[i * (dsp->channels == 2 ? 2 : 1)]) - 128) << 8;
-                    else
-                        sample = reinterpret_cast<const int16_t*>(src)[i * (dsp->channels == 2 ? 2 : 1)];
-                    out[i * 2 + 0] = sample; // L
-                    out[i * 2 + 1] = (dsp->channels == 2)
-                        ? (dsp->bitsPerSample == 8
-                            ? (static_cast<int16_t>(src[i * 2 + 1]) - 128) << 8
-                            : reinterpret_cast<const int16_t*>(src)[i * 2 + 1])
-                        : sample; // R = L for mono
-                }
-                mixSrc = out;
-                mixFrames = outFrames;
-            }
-        }
-        else
-        {
-            // Resample to 44100 Hz stereo 16-bit
-            uint32_t inFrames  = static_cast<uint32_t>(count) / bytesPerFrame;
-            uint32_t outFrames = (inFrames * DSP_HW_RATE + appRate - 1) / appRate;
-            uint32_t outBytes  = outFrames * 4; // stereo 16-bit
-            if (outBytes > dsp->bufferSize) outBytes = dsp->bufferSize;
-            outFrames = outBytes / 4;
-
-            int16_t* out = reinterpret_cast<int16_t*>(dsp->buffer);
-
-            for (uint32_t i = 0; i < outFrames; i++)
-            {
-                uint32_t srcFrame = (uint64_t)i * appRate / DSP_HW_RATE;
-                if (srcFrame >= inFrames) srcFrame = inFrames - 1;
-
-                int16_t sample;
-                if (dsp->bitsPerSample == 8)
-                    sample = (static_cast<int16_t>(src[srcFrame * (dsp->channels == 2 ? 2 : 1)]) - 128) << 8;
-                else
-                    sample = reinterpret_cast<const int16_t*>(src)[srcFrame * (dsp->channels == 2 ? 2 : 1)];
-
-                out[i * 2 + 0] = sample; // L
-                out[i * 2 + 1] = (dsp->channels == 2)
-                    ? (dsp->bitsPerSample == 8
-                        ? (static_cast<int16_t>(src[srcFrame * 2 + 1]) - 128) << 8
-                        : reinterpret_cast<const int16_t*>(src)[srcFrame * 2 + 1])
-                    : sample; // R = L for mono
-            }
-            mixSrc = out;
-            mixFrames = outFrames;
-        }
-
-        if (mixSrc && mixFrames > 0)
-        {
-            uint32_t accepted = AudioMixerSubmit(mixSrc, mixFrames, dsp->mixerStreamId);
-            if (!accepted) return -EAGAIN;
-            uint64_t consumed = (appRate == DSP_HW_RATE || appRate == 0)
-                ? accepted : static_cast<uint64_t>(accepted - 1) * appRate / DSP_HW_RATE + 1;
-            if (consumed > totalInFrames) consumed = totalInFrames;
-            return static_cast<int64_t>(consumed * bytesPerFrame);
-        }
-
-        return 0;
     }
 
     // Write to /dev/tty (DevKeyboard) — route to serial + TTY framebuffer
@@ -3042,7 +2990,6 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     if (StrEq(path, "/dev/dsp"))
     {
         if (!AudioAvailable()) return -ENODEV;
-        static uint32_t s_nextMixerStream = 0;
         auto* dsp = static_cast<DspState*>(kmalloc(sizeof(DspState)));
         if (!dsp) return -ENOMEM;
         dsp->sampleRate    = DSP_DEFAULT_RATE;
@@ -3051,12 +2998,25 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         dsp->fragmentSize  = 4096;
         dsp->bufferOffset  = 0;
         dsp->bufferSize    = DSP_BUFFER_SIZE;
-        dsp->mixerStreamId = s_nextMixerStream++ % 8;
+        dsp->mixerStreamId = AudioMixerOpen();
+        if (!dsp->mixerStreamId) { kfree(dsp); return -16; } // EBUSY
+        KMutexInit(&dsp->ioLock);
         dsp->refCount      = 1;
         dsp->buffer        = static_cast<uint8_t*>(kmalloc(DSP_BUFFER_SIZE));
-        if (!dsp->buffer) { kfree(dsp); return -ENOMEM; }
-        int fd = FdAlloc(proc, FdType::DevDsp, dsp);
-        if (fd < 0) { kfree(dsp->buffer); kfree(dsp); return -EMFILE; }
+        dsp->inputBuffer = static_cast<uint8_t*>(kmalloc(DSP_BUFFER_SIZE));
+        if (!dsp->buffer || !dsp->inputBuffer) {
+            AudioMixerClose(dsp->mixerStreamId);
+            kfree(dsp->inputBuffer); kfree(dsp->buffer); kfree(dsp); return -ENOMEM;
+        }
+        FdEntry owned{};
+        owned.type = FdType::DevDsp; owned.handle = dsp;
+        owned.statusFlags = static_cast<uint32_t>(flags) & ~(0x80000u | 0x40u | 0x80u | 0x200u);
+        owned.fdFlags = (flags & 0x80000u) ? 1 : 0;
+        int fd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), owned, 0, -1, nullptr);
+        if (fd < 0) {
+            AudioMixerClose(dsp->mixerStreamId);
+            kfree(dsp->inputBuffer); kfree(dsp->buffer); kfree(dsp); return -EMFILE;
+        }
         return fd;
     }
 
@@ -3340,7 +3300,8 @@ void FinalizeClosedFd(const FdClaimResult& c)
         uint32_t prev = __atomic_fetch_sub(&dsp->refCount, 1, __ATOMIC_ACQ_REL);
         if (prev <= 1)
         {
-            AudioStop();
+            AudioMixerClose(dsp->mixerStreamId);
+            kfree(dsp->inputBuffer);
             kfree(dsp->buffer);
             kfree(dsp);
         }
@@ -6436,130 +6397,73 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
 
-        // SNDCTL_DSP_RESET — stop playback, reset buffer
-        if (cmd == SNDCTL_DSP_RESET)
-        {
-            AudioStop();
+        DspIoGuard held(dsp);
+        if (cmd == SNDCTL_DSP_RESET) {
+            AudioMixerReset(dsp->mixerStreamId);
             dsp->bufferOffset = 0;
             return 0;
         }
-
-        // All remaining DSP ioctls use arg as a pointer — validate it
-        if (!UserBufferWritable(arg, sizeof(int))) return -EFAULT;
-
-        // SNDCTL_DSP_SPEED — set/get sample rate
-        if (cmd == SNDCTL_DSP_SPEED)
-        {
-            auto* rate = reinterpret_cast<int*>(arg);
-            if (*rate > 0) dsp->sampleRate = static_cast<uint32_t>(*rate);
-            *rate = static_cast<int>(dsp->sampleRate);
-            return 0;
+        if (cmd == SNDCTL_DSP_GETOSPACE) {
+            struct AudioBufInfo { int fragments, fragstotal, fragsize, bytes; } info{};
+            // Software FIFO capacity in negotiated input bytes. Hardware delay
+            // is separate; a per-stream hardware-completion ledger is still needed.
+            const uint64_t frameBytes = dsp->channels * (dsp->bitsPerSample / 8);
+            const uint64_t capacity = static_cast<uint64_t>(MIXER_RING_FRAMES) * dsp->sampleRate / MIXER_HW_RATE * frameBytes;
+            const uint64_t available = static_cast<uint64_t>(AudioMixerAvailableFrames(dsp->mixerStreamId)) * dsp->sampleRate / MIXER_HW_RATE * frameBytes;
+            info.fragsize = static_cast<int>(dsp->fragmentSize);
+            info.fragstotal = static_cast<int>(capacity / dsp->fragmentSize);
+            info.fragments = static_cast<int>(available / dsp->fragmentSize);
+            info.bytes = static_cast<int>(available);
+            return CopyToUser(arg, &info, sizeof(info)) ? 0 : -EFAULT;
         }
-
-        // SNDCTL_DSP_SETFMT — set/get audio format
-        if (cmd == SNDCTL_DSP_SETFMT)
-        {
-            auto* fmt = reinterpret_cast<int*>(arg);
-            if (*fmt == AFMT_S16_LE)
-                dsp->bitsPerSample = 16;
-            else if (*fmt == AFMT_U8)
-                dsp->bitsPerSample = 8;
-            // Report back current format
-            *fmt = (dsp->bitsPerSample == 16) ? AFMT_S16_LE : AFMT_U8;
-            return 0;
-        }
-
-        // SNDCTL_DSP_CHANNELS — set/get channel count
-        if (cmd == SNDCTL_DSP_CHANNELS)
-        {
-            auto* ch = reinterpret_cast<int*>(arg);
-            if (*ch >= 1 && *ch <= 2) dsp->channels = static_cast<uint8_t>(*ch);
-            *ch = dsp->channels;
-            return 0;
-        }
-
-        // SNDCTL_DSP_STEREO — set mono(0)/stereo(1)
-        if (cmd == SNDCTL_DSP_STEREO)
-        {
-            auto* stereo = reinterpret_cast<int*>(arg);
-            dsp->channels = (*stereo) ? 2 : 1;
-            *stereo = (dsp->channels == 2) ? 1 : 0;
-            return 0;
-        }
-
-        // Report queued bytes in the application's negotiated PCM format.
-        if (cmd == SNDCTL_DSP_GETODELAY)
-        {
+        int value = 0;
+        const bool input = cmd == SNDCTL_DSP_SPEED || cmd == SNDCTL_DSP_SETFMT ||
+            cmd == SNDCTL_DSP_CHANNELS || cmd == SNDCTL_DSP_STEREO ||
+            cmd == SNDCTL_DSP_SETFRAGMENT || cmd == SNDCTL_DSP_SETTRIGGER;
+        if (input && !CopyFromUser(&value, arg, sizeof(value))) return -EFAULT;
+        if (cmd == SNDCTL_DSP_SPEED) {
+            if (value > 0) {
+                // Report a realizable conversion rate and bounded OSS geometry.
+                if (value < 4000) value = 4000;
+                if (value > 192000) value = 192000;
+                dsp->sampleRate = static_cast<uint32_t>(value);
+            }
+            value = static_cast<int>(dsp->sampleRate);
+        } else if (cmd == SNDCTL_DSP_SETFMT) {
+            if (value == AFMT_S16_LE) dsp->bitsPerSample = 16;
+            else if (value == AFMT_U8) dsp->bitsPerSample = 8;
+            value = dsp->bitsPerSample == 16 ? AFMT_S16_LE : AFMT_U8;
+        } else if (cmd == SNDCTL_DSP_CHANNELS) {
+            if (value >= 1 && value <= 2) dsp->channels = static_cast<uint8_t>(value);
+            value = dsp->channels;
+        } else if (cmd == SNDCTL_DSP_STEREO) {
+            dsp->channels = value ? 2 : 1;
+            value = dsp->channels == 2;
+        } else if (cmd == SNDCTL_DSP_GETODELAY) {
+            // Legacy estimate: includes global hardware queue, not independently
+            // attributed completion. Do not use as an accepted device clock yet.
             uint64_t frames = MIXER_RING_FRAMES - AudioMixerAvailableFrames(dsp->mixerStreamId);
             frames += AudioGetPosition() / MIXER_FRAME_BYTES;
-            uint64_t inputFrames = (frames * dsp->sampleRate + MIXER_HW_RATE - 1) / MIXER_HW_RATE;
-            uint64_t bytes = inputFrames * dsp->channels * (dsp->bitsPerSample / 8);
-            *reinterpret_cast<int*>(arg) = static_cast<int>(bytes > 0x7fffffffULL ? 0x7fffffffULL : bytes);
+            uint64_t bytes = (frames * dsp->sampleRate + MIXER_HW_RATE - 1) / MIXER_HW_RATE * dsp->channels * (dsp->bitsPerSample / 8);
+            value = static_cast<int>(bytes > 0x7fffffffULL ? 0x7fffffffULL : bytes);
+        } else if (cmd == SNDCTL_DSP_GETCAPS) value = DSP_CAP_TRIGGER;
+        else if (cmd == SNDCTL_DSP_GETFMTS) value = AFMT_U8 | AFMT_S16_LE;
+        else if (cmd == SNDCTL_DSP_SETFRAGMENT) {
+            int exponent = value & 0xffff;
+            if (exponent < 8) exponent = 8;
+            if (exponent > 16) exponent = 16;
+            dsp->fragmentSize = 1u << exponent;
+            return 0; // Requested fragment count remains unsupported.
+        } else if (cmd == SNDCTL_DSP_GETBLKSIZE) value = static_cast<int>(dsp->fragmentSize);
+        else if (cmd == SNDCTL_DSP_SETTRIGGER) {
+            if (value & ~2) return -95; // EOPNOTSUPP: output only; no capture endpoint.
+            AudioMixerSetEnabled(dsp->mixerStreamId, (value & 2) != 0);
             return 0;
+        } else {
+            SerialPrintf("sys_ioctl: dsp unknown cmd 0x%lx\n", cmd);
+            return -EINVAL;
         }
-
-        // SNDCTL_DSP_GETOSPACE — report available buffer space
-        if (cmd == SNDCTL_DSP_GETOSPACE)
-        {
-            struct audio_buf_info { int fragments; int fragstotal; int fragsize; int bytes; };
-            if (!UserBufferWritable(arg, sizeof(audio_buf_info))) return -EFAULT;
-            auto* info = reinterpret_cast<audio_buf_info*>(arg);
-            uint32_t queued = AudioGetPosition();
-            uint32_t avail = queued < DSP_REPORT_BUFFER_SIZE
-                ? (DSP_REPORT_BUFFER_SIZE - queued)
-                : 0;
-            uint32_t fragTotal = dsp->fragmentSize
-                ? (DSP_REPORT_BUFFER_SIZE / dsp->fragmentSize)
-                : 0;
-            if (fragTotal == 0) fragTotal = 1;
-            info->fragsize   = static_cast<int>(dsp->fragmentSize);
-            info->fragstotal = static_cast<int>(fragTotal);
-            info->fragments  = static_cast<int>(dsp->fragmentSize ? (avail / dsp->fragmentSize) : 0);
-            info->bytes      = static_cast<int>(avail);
-            return 0;
-        }
-
-        // SNDCTL_DSP_GETCAPS — report capabilities
-        if (cmd == SNDCTL_DSP_GETCAPS)
-        {
-            auto* caps = reinterpret_cast<int*>(arg);
-            *caps = DSP_CAP_TRIGGER;
-            return 0;
-        }
-
-        // SNDCTL_DSP_GETFMTS — report supported formats
-        if (cmd == SNDCTL_DSP_GETFMTS)
-        {
-            auto* fmts = reinterpret_cast<int*>(arg);
-            *fmts = AFMT_U8 | AFMT_S16_LE;
-            return 0;
-        }
-
-        // SNDCTL_DSP_SETFRAGMENT — set fragment size (accept, clamp)
-        if (cmd == SNDCTL_DSP_SETFRAGMENT)
-        {
-            auto* val = reinterpret_cast<int*>(arg);
-            int fragExp = (*val) & 0xFFFF;
-            if (fragExp < 8) fragExp = 8;    // min 256 bytes
-            if (fragExp > 16) fragExp = 16;  // max 64KB
-            dsp->fragmentSize = static_cast<uint16_t>(1u << fragExp);
-            return 0;
-        }
-
-        // SNDCTL_DSP_GETBLKSIZE — return fragment size
-        if (cmd == SNDCTL_DSP_GETBLKSIZE)
-        {
-            auto* size = reinterpret_cast<int*>(arg);
-            *size = static_cast<int>(dsp->fragmentSize);
-            return 0;
-        }
-
-        // SNDCTL_DSP_SETTRIGGER — enable/disable output, accept but noop
-        if (cmd == SNDCTL_DSP_SETTRIGGER)
-            return 0;
-
-        SerialPrintf("sys_ioctl: dsp unknown cmd 0x%lx\n", cmd);
-        return -EINVAL;
+        return CopyToUser(arg, &value, sizeof(value)) ? 0 : -EFAULT;
     }
 
     // TCGETS2 = 0x802c542a — termios2 (like TCGETS plus ispeed/ospeed uint32s)
@@ -9225,7 +9129,7 @@ static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr
         // TTY/pipe — e.g. busybox `cat` to stdout — silently returned 0.)
         int wr = static_cast<int>(
             WriteToFdByType(out_fd, reinterpret_cast<uint64_t>(bounce),
-                         static_cast<uint64_t>(rd)));
+                         static_cast<uint64_t>(rd), false));
         if (wr <= 0) break;
 
         totalSent += wr;

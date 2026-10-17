@@ -9,6 +9,7 @@
 
 namespace brook {
 extern "C" void* kmalloc(uint64_t size) { return std::malloc(size); }
+extern "C" void kfree(void* memory) { std::free(memory); }
 extern "C" void SerialPrintf(const char*,...) {}
 extern "C" void SerialPuts(const char*) {}
 extern "C" void KPrintf(const char*,...) {}
@@ -19,7 +20,8 @@ std::mutex outputLock;
 std::atomic<int> limit{-1},calls{0};
 std::atomic<bool> blockFirst{false},entered{false},releaseFirst{false};
 std::atomic<bool> blockStop{false},stopEntered{false},releaseStop{false};
-int failures=0;
+std::atomic<int> failures{0};
+brook::AudioStreamId primary=0,secondary=0;
 #define CHECK(x) do { if(!(x)) { std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x);++failures; } } while(0)
 int play(const void* data,uint32_t bytes,uint32_t rate,uint8_t channels,uint8_t bits,bool) {
     CHECK(rate==44100 && channels==2 && bits==16);
@@ -57,7 +59,7 @@ bool partialAndErrors() {
     std::vector<int16_t> samples;
     for(int i=0;i<200;++i)samples.push_back(static_cast<int16_t>(i*37-3000));
     auto expected=raw(samples);output.clear();
-    CHECK(brook::AudioMixerSubmit(samples.data(),samples.size()/2,0)==samples.size()/2);
+    CHECK(brook::AudioMixerSubmit(samples.data(),samples.size()/2,primary)==samples.size()/2);
     limit=28;brook::AudioMixerFlush();CHECK(output.size()==28);
     limit=7;brook::AudioMixerFlush();CHECK(output.size()==35);
     limit=0;brook::AudioMixerFlush();CHECK(output.size()==35);
@@ -69,10 +71,10 @@ void concurrentFlush() {
     std::vector<int16_t> first(80,1234),second(60,-2345);
     auto expected=raw(first),tail=raw(second);expected.insert(expected.end(),tail.begin(),tail.end());
     output.clear();calls=0;entered=false;releaseFirst=false;blockFirst=true;limit=4;
-    CHECK(brook::AudioMixerSubmit(first.data(),first.size()/2,0)==first.size()/2);
+    CHECK(brook::AudioMixerSubmit(first.data(),first.size()/2,primary)==first.size()/2);
     std::thread writer([] { brook::AudioMixerFlush(); });
     while(!entered.load())std::this_thread::yield();
-    CHECK(brook::AudioMixerSubmit(second.data(),second.size()/2,0)==second.size()/2);
+    CHECK(brook::AudioMixerSubmit(second.data(),second.size()/2,primary)==second.size()/2);
     std::thread racingFlush([] { brook::AudioMixerFlush(); });racingFlush.join();
     releaseFirst=true;writer.join();blockFirst=false;
     finish(expected.size());CHECK(output==expected);
@@ -80,7 +82,7 @@ void concurrentFlush() {
 void stopInvalidatesSuffix() {
     std::vector<int16_t> samples(100,5678);
     output.clear();limit=4;
-    CHECK(brook::AudioMixerSubmit(samples.data(),50,0)==50);
+    CHECK(brook::AudioMixerSubmit(samples.data(),50,primary)==50);
     brook::AudioMixerFlush();CHECK(output.size()==4);
     brook::AudioStop();limit=-1;brook::AudioMixerFlush();CHECK(output.size()==4);
 
@@ -88,7 +90,7 @@ void stopInvalidatesSuffix() {
     output.clear();blockStop=true;stopEntered=false;releaseStop=false;limit=4;
     std::thread stopping([] { brook::AudioStop(); });
     while(!stopEntered.load())std::this_thread::yield();
-    CHECK(brook::AudioMixerSubmit(samples.data(),50,0)==50);
+    CHECK(brook::AudioMixerSubmit(samples.data(),50,primary)==50);
     brook::AudioMixerFlush();CHECK(output.size()==4);
     releaseStop=true;stopping.join();blockStop=false;
     limit=-1;brook::AudioMixerFlush();CHECK(output.size()==4);
@@ -96,7 +98,7 @@ void stopInvalidatesSuffix() {
     // Hardware acceptance that was already in flight cannot be retracted,
     // but its unaccepted suffix must not be retried after that stop.
     output.clear();calls=0;blockFirst=true;entered=false;releaseFirst=false;limit=4;
-    CHECK(brook::AudioMixerSubmit(samples.data(),50,0)==50);
+    CHECK(brook::AudioMixerSubmit(samples.data(),50,primary)==50);
     std::thread writing([] { brook::AudioMixerFlush(); });
     while(!entered.load())std::this_thread::yield();
     brook::AudioStop();releaseFirst=true;writing.join();blockFirst=false;
@@ -108,24 +110,123 @@ void ringAndClamping() {
         std::vector<int16_t> samples(8000);
         for(unsigned i=0;i<samples.size();++i)samples[i]=static_cast<int16_t>(batch*109+i*13);
         auto bytes=raw(samples);expected.insert(expected.end(),bytes.begin(),bytes.end());
-        CHECK(brook::AudioMixerSubmit(samples.data(),samples.size()/2,0)==samples.size()/2);
+        CHECK(brook::AudioMixerSubmit(samples.data(),samples.size()/2,primary)==samples.size()/2);
         limit=1000;brook::AudioMixerFlush();finish(expected.size());
     }
     CHECK(output==expected);
     output.clear();std::vector<int16_t> left(100),right(100),mixed(100);
     for(unsigned i=0;i<100;++i) {left[i]=right[i]=i%2?-30000:30000;mixed[i]=i%2?-32768:32767;}
-    CHECK(brook::AudioMixerSubmit(left.data(),50,0)==50);
-    CHECK(brook::AudioMixerSubmit(right.data(),50,1)==50);
+    CHECK(brook::AudioMixerSubmit(left.data(),50,primary)==50);
+    CHECK(brook::AudioMixerSubmit(right.data(),50,secondary)==50);
     finish(200);CHECK(output==raw(mixed));
 }
+void ownedQueues() {
+    using namespace brook;
+    std::vector<int16_t> a(8,30000), b(12,10000);
+    AudioStop(); output.clear(); limit=4;
+    CHECK(AudioMixerSubmit(a.data(),4,primary)==4);
+    CHECK(AudioMixerSubmit(b.data(),6,secondary)==6);
+    AudioMixerFlush();
+    CHECK(output==raw(std::vector<int16_t>(2,32767)));
+    // Unaccepted clipped frames must be remixed, not subtracted after clipping.
+    CHECK(AudioMixerReset(primary));
+    finish(24);
+    auto expected=raw(std::vector<int16_t>(2,32767));
+    auto rest=raw(std::vector<int16_t>(10,10000));
+    expected.insert(expected.end(),rest.begin(),rest.end());CHECK(output==expected);
+
+    AudioStop(); output.clear(); calls=0; limit=4;
+    CHECK(AudioMixerSubmit(a.data(),4,primary)==4);
+    CHECK(AudioMixerSubmit(b.data(),6,secondary)==6);
+    blockFirst=true;entered=false;releaseFirst=false;
+    std::thread flushing([] { AudioMixerFlush(); });
+    while(!entered.load())std::this_thread::yield();
+    auto stale=primary; CHECK(AudioMixerClose(stale));primary=AudioMixerOpen();
+    CHECK(primary && primary!=stale);
+    CHECK(!AudioMixerClose(stale) && !AudioMixerReset(stale));
+    CHECK(!AudioMixerSubmit(a.data(),4,stale));
+    std::vector<int16_t> replacement(4,-2000);
+    CHECK(AudioMixerSubmit(replacement.data(),2,primary)==2);
+    releaseFirst=true;flushing.join();blockFirst=false;
+    CHECK(AudioMixerAvailableFrames(primary)==MIXER_RING_FRAMES-2);
+    finish(24);
+    expected=raw(std::vector<int16_t>(2,32767));
+    rest=raw(std::vector<int16_t>(4,8000));expected.insert(expected.end(),rest.begin(),rest.end());
+    rest=raw(std::vector<int16_t>(6,10000));expected.insert(expected.end(),rest.begin(),rest.end());
+    CHECK(output==expected);
+
+    // Pause while a driver call is in flight still consumes accepted frames.
+    AudioStop();output.clear();calls=0;limit=4;blockFirst=true;entered=false;releaseFirst=false;
+    CHECK(AudioMixerSubmit(b.data(),6,primary)==6);
+    std::thread pausing([] { AudioMixerFlush(); });
+    while(!entered.load())std::this_thread::yield();
+    CHECK(AudioMixerSetEnabled(primary,false));
+    releaseFirst=true;pausing.join();blockFirst=false;
+    CHECK(AudioMixerAvailableFrames(primary)==MIXER_RING_FRAMES-5);
+    limit=-1;AudioMixerFlush();CHECK(output.size()==4);
+    CHECK(AudioMixerSetEnabled(primary,true));finish(24);CHECK(output==raw(b));
+
+    // A sub-frame tail is immutable across close/reuse, with no consumption
+    // charged to the replacement generation when the old frame finishes.
+    AudioStop();output.clear();limit=1;
+    CHECK(AudioMixerSubmit(a.data(),4,primary)==4);
+    AudioMixerFlush();auto old=primary;
+    CHECK(AudioMixerClose(old));primary=AudioMixerOpen();
+    CHECK(primary && primary!=old);
+    CHECK(AudioMixerSubmit(replacement.data(),2,primary)==2);
+    limit=-1;AudioMixerFlush();CHECK(output.size()==4);
+    CHECK(AudioMixerAvailableFrames(primary)==MIXER_RING_FRAMES-2);
+    finish(12);
+    expected=raw(std::vector<int16_t>(2,30000));rest=raw(replacement);
+    expected.insert(expected.end(),rest.begin(),rest.end());CHECK(output==expected);
+
+    // Completing an immutable partial frame while paused must consume that
+    // frame once, leaving only its unaccepted successors for resume.
+    AudioStop();output.clear();limit=1;
+    CHECK(AudioMixerSubmit(b.data(),6,primary)==6);
+    AudioMixerFlush();CHECK(AudioMixerSetEnabled(primary,false));
+    limit=-1;AudioMixerFlush();CHECK(output.size()==4);
+    CHECK(AudioMixerAvailableFrames(primary)==MIXER_RING_FRAMES-5);
+    AudioMixerFlush();CHECK(output.size()==4);
+    CHECK(AudioMixerSetEnabled(primary,true));finish(24);CHECK(output==raw(b));
+
+    // Reset preserves identity but changes its commit epoch, protecting new
+    // samples from completion of the old partially accepted frame.
+    AudioStop();output.clear();limit=1;
+    CHECK(AudioMixerSubmit(a.data(),4,primary)==4);AudioMixerFlush();
+    CHECK(AudioMixerReset(primary));
+    CHECK(AudioMixerSubmit(replacement.data(),2,primary)==2);
+    limit=-1;AudioMixerFlush();
+    CHECK(AudioMixerAvailableFrames(primary)==MIXER_RING_FRAMES-2);
+    finish(12);expected=raw(std::vector<int16_t>(2,30000));rest=raw(replacement);
+    expected.insert(expected.end(),rest.begin(),rest.end());CHECK(output==expected);
+
+    AudioStop();output.clear();
+    std::vector<AudioStreamId> handles;
+    for(unsigned i=2;i<MIXER_MAX_STREAMS;++i) {auto id=AudioMixerOpen();CHECK(id);handles.push_back(id);}
+    CHECK(!AudioMixerOpen());
+    for(auto id:handles)CHECK(AudioMixerClose(id));
+    auto recycled=AudioMixerOpen();CHECK(recycled);CHECK(AudioMixerClose(recycled));
+    std::vector<int16_t> full(MIXER_RING_FRAMES*2,37);
+    CHECK(AudioMixerSubmit(full.data(),MIXER_RING_FRAMES,primary)==MIXER_RING_FRAMES);
+    CHECK(AudioMixerAvailableFrames(primary)==0);
+    CHECK(!AudioMixerSubmit(a.data(),1,primary));
+    limit=0;AudioMixerFlush();CHECK(AudioMixerAvailableFrames(primary)==0);
+    limit=-11;AudioMixerFlush();CHECK(AudioMixerAvailableFrames(primary)==0);
+    finish(full.size()*2);CHECK(output==raw(full));
+    CHECK(AudioMixerAvailableFrames(primary)==MIXER_RING_FRAMES);
+}
+
 }
 int main() {
     brook::AudioMixerInit();
     const brook::AudioDriver driver{"test",play,stop,nullptr,nullptr,nullptr};
     CHECK(brook::AudioRegister(&driver));
+    primary=brook::AudioMixerOpen();secondary=brook::AudioMixerOpen();
+    CHECK(primary && secondary && primary!=secondary);
     // The baseline must fail cleanly on lost partial data before concurrency.
     if(!partialAndErrors())return 1;
-    concurrentFlush();stopInvalidatesSuffix();ringAndClamping();
+    concurrentFlush();stopInvalidatesSuffix();ringAndClamping();ownedQueues();
     std::printf("AUDIO_DELIVERY %s\n",failures?"FAIL":"PASS");
     return failures?1:0;
 }
