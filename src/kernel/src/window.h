@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "desktop_metrics.h"
 #include "../../shared/brook_theme.h"
 
 namespace brook {
@@ -10,6 +11,15 @@ struct AddressSpaceState;
 struct MappingBacking;
 struct CompositorVfbAllocation;
 struct InputEvent;
+struct FontAtlas;
+const DesktopMetrics& WmDesktopMetrics();
+uint32_t WmMetric(uint32_t base);
+const FontAtlas& WmDesktopFont();
+uint32_t WmGetRequestedScale();
+uint32_t WmGetAppliedScale();
+bool WmSetScale(uint32_t percent);
+// Called by the compositor after old-frame input and before new-frame drawing.
+bool WmApplyScalePending();
 
 // Window manager constants
 static constexpr uint32_t WM_TITLE_BAR_HEIGHT = 36;
@@ -48,6 +58,7 @@ enum class WindowState : uint8_t
 
 struct Window
 {
+    const DesktopMetrics* metrics; // Immutable decoration geometry for this window.
     uint64_t    creationIdentity; // Monotonic identity across reused window slots.
     Process*    proc;           // owning process (nullptr = unused slot)
     int16_t     x, y;           // window position (outer top-left, including chrome)
@@ -114,12 +125,14 @@ struct Window
 
     // Outer dimensions including chrome.  CSD (noChrome) windows have
     // no kernel chrome, so outer == client.
-    uint16_t outerWidth()  const { return noChrome ? clientW : (clientW + 2 * WM_BORDER_WIDTH); }
-    uint16_t outerHeight() const { return noChrome ? clientH : (clientH + WM_TITLE_BAR_HEIGHT + 2 * WM_BORDER_WIDTH); }
+    const DesktopMetrics& desktopMetrics() const { return metrics ? *metrics : DesktopMetric100; }
+    uint32_t metric(uint32_t base) const { return static_cast<uint32_t>(desktopMetrics().pixels(base)); }
+    uint16_t outerWidth()  const { return noChrome ? clientW : (clientW + 2 * metric(WM_BORDER_WIDTH)); }
+    uint16_t outerHeight() const { return noChrome ? clientH : (clientH + metric(WM_TITLE_BAR_HEIGHT) + 2 * metric(WM_BORDER_WIDTH)); }
 
     // Client area origin relative to outer top-left
-    int16_t clientX() const { return noChrome ? x : (x + static_cast<int16_t>(WM_BORDER_WIDTH)); }
-    int16_t clientY() const { return noChrome ? y : (y + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH)); }
+    int16_t clientX() const { return noChrome ? x : (x + static_cast<int16_t>(metric(WM_BORDER_WIDTH))); }
+    int16_t clientY() const { return noChrome ? y : (y + static_cast<int16_t>(metric(WM_TITLE_BAR_HEIGHT) + metric(WM_BORDER_WIDTH))); }
 };
 
 // Hit-test result for mouse clicks
@@ -229,7 +242,7 @@ bool WmMoveWindowRelativeToParent(Process* proc, uint32_t wmId,
 
 // Resize a window's client area.  For terminal windows, reallocates the VFB
 // and sends SIGWINCH.  For non-terminal windows, updates dimensions only.
-void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH);
+bool WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH);
 
 // Return the window index owned by `proc`, or -1 if none.
 int WmFindWindowForProcess(Process* proc);

@@ -42,6 +42,23 @@ struct VfbGuard {
     VfbGuard() { KMutexLock(&g_vfbLock); }
     ~VfbGuard() { KMutexUnlock(&g_vfbLock); }
 };
+static const DesktopMetrics* g_desktopMetrics = &DesktopMetric100;
+static uint32_t g_requestedScale = 100;
+const DesktopMetrics& WmDesktopMetrics() { return *__atomic_load_n(&g_desktopMetrics,__ATOMIC_ACQUIRE); }
+uint32_t WmMetric(uint32_t base) { return static_cast<uint32_t>(WmDesktopMetrics().pixels(static_cast<int>(base))); }
+uint32_t WmGetRequestedScale() { return __atomic_load_n(&g_requestedScale,__ATOMIC_ACQUIRE); }
+uint32_t WmGetAppliedScale() { return WmDesktopMetrics().percent; }
+const FontAtlas& WmDesktopFont() {
+    uint32_t scale=WmGetAppliedScale();
+    return scale==200 ? g_desktopFont200 : scale==150 ? g_desktopFont150 : g_fontAtlas;
+}
+bool WmSetScale(uint32_t percent) {
+    if (!DesktopMetricsFor(percent)) return false;
+    __atomic_store_n(&g_requestedScale,percent,__ATOMIC_RELEASE);
+    CompositorWake();return true;
+}
+static bool ResizeWindowLocked(int idx,uint16_t newClientW,uint16_t newClientH);
+
 static uint32_t g_themeId = BROOK_THEME_BROOK;
 static bool g_themeSettingsLoaded = false;
 uint32_t WmGetTheme() { return __atomic_load_n(&g_themeId, __ATOMIC_ACQUIRE); }
@@ -62,6 +79,7 @@ static void WmRestoreTheme()
     if (g_themeSettingsLoaded) return;
     g_themeSettingsLoaded = true;
     uint32_t selected = BROOK_THEME_BROOK;
+    uint32_t selectedScale = 100;
     Vnode* vn = VfsOpen("/data/home/.config/brook/settings.ini", 0);
     if (vn)
     {
@@ -104,11 +122,18 @@ static void WmRestoreTheme()
                     }
                     else selected = BROOK_THEME_BROOK;
                 }
+                else if (desktopSection && strncmp(p,"scale=",6)==0) {
+                    p+=6;uint32_t value=0,digits=0;
+                    while (*p>='0' && *p<='9' && digits<4) {value=value*10+(*p++-'0');++digits;}
+                    while (*p==' ' || *p=='\t' || *p=='\r') ++p;
+                    selectedScale=!*p && digits==3 && DesktopMetrics::Supported(value) ? value : 100;
+                }
                 if (!more) break;
                 line = end + 1;
             }
         }
     }
+    WmSetScale(selectedScale);
     WmSetTheme(selected);
 }
 
@@ -261,23 +286,13 @@ bool WmLauncherApplyPending()
 // Helpers
 // ---------------------------------------------------------------------------
 
-struct WmRect
-{
-    int x, y, w, h;
-    bool contains(int px, int py) const
-    { return w > 0 && h > 0 && px >= x && py >= y && px < x + w && py < y + h; }
-};
+using WmRect = DesktopRect;
 
 // Index 0 is close, 1 maximize/restore, 2 minimize. Rendering and input
 // intentionally use the same full-height rectangular control cells.
 static WmRect CaptionRect(const Window& w, int index)
 {
-    int width = static_cast<int>(WM_BUTTON_WIDTH);
-    if (width * 3 > w.clientW) width = w.clientW / 3;
-    return {w.x + w.outerWidth() - static_cast<int>(WM_BORDER_WIDTH) -
-            WM_BTN_RIGHT_PAD - (index + 1) * width,
-            w.y + static_cast<int>(WM_BORDER_WIDTH), width,
-            static_cast<int>(WM_TITLE_BAR_HEIGHT)};
+    return DesktopCaptionRect({w.x,w.y,w.clientW,w.clientH,w.noChrome},w.desktopMetrics(),index);
 }
 
 static int WmTextWidth(const char* text)
@@ -286,8 +301,8 @@ static int WmTextWidth(const char* text)
     for (; *text; ++text)
     {
         uint32_t code = static_cast<uint8_t>(*text);
-        if (code >= g_fontAtlas.firstChar && code < g_fontAtlas.firstChar + g_fontAtlas.glyphCount)
-            width += g_fontAtlas.glyphs[code - g_fontAtlas.firstChar].advance;
+        if (code >= WmDesktopFont().firstChar && code < WmDesktopFont().firstChar + WmDesktopFont().glyphCount)
+            width += WmDesktopFont().glyphs[code - WmDesktopFont().firstChar].advance;
     }
     return width;
 }
@@ -328,7 +343,7 @@ static int WmRenderGlyph(uint32_t* buf, uint32_t stride,
                           uint32_t fg, uint32_t bg,
                           int clipRight = 0)
 {
-    const FontAtlas& fa = g_fontAtlas;
+    const FontAtlas& fa = WmDesktopFont();
     if (code < static_cast<int>(fa.firstChar) ||
         code >= static_cast<int>(fa.firstChar + fa.glyphCount))
         return 0;
@@ -548,6 +563,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
 
     Window& w = g_windows[idx];
     w.proc = proc;
+    w.metrics = &WmDesktopMetrics();
     w.creationIdentity = __atomic_add_fetch(&g_windowIdentity, 1, __ATOMIC_ACQ_REL);
     w.appId[0] = 0;
     w.x = x;
@@ -577,6 +593,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.vfbRetirement = nullptr;
     w.vfbDirty  = 0;
     w.wmId      = static_cast<uint16_t>(idx + 1);
+    if (proc) {proc->fbDestX=w.clientX();proc->fbDestY=w.clientY();}
     w.inputHead = 0;
     w.inputTail = 0;
     w.inputDropCount = 0;
@@ -710,7 +727,7 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
         // Check if mouse is within outer bounds (extended by grab zone for resize).
         // CSD windows have no kernel-managed chrome or resize zone; treat them
         // strictly by their outer (== client) bounds.
-        int grab = w.noChrome ? 0 : static_cast<int>(WM_RESIZE_EDGE);
+        int grab = w.noChrome ? 0 : static_cast<int>(WmMetric(WM_RESIZE_EDGE));
         if (mx < wx - grab || my < wy || mx >= wx + ww + grab || my >= wy + wh + grab)
             continue;
 
@@ -754,36 +771,36 @@ WmHitResult WmHitTest(int32_t mx, int32_t my)
                 return result;
             }
         }
-        if (relY < static_cast<int>(WM_BORDER_WIDTH + WM_TITLE_BAR_HEIGHT))
+        if (relY < static_cast<int>(WmMetric(WM_BORDER_WIDTH) + WmMetric(WM_TITLE_BAR_HEIGHT)))
         {
             result.zone = WmHitZone::TitleBar;
             return result;
         }
 
         // Resize corner (bottom-right grab zone)
-        if (relX >= ww - static_cast<int>(WM_RESIZE_GRAB) &&
-            relY >= wh - static_cast<int>(WM_RESIZE_GRAB))
+        if (relX >= ww - static_cast<int>(WmMetric(WM_RESIZE_GRAB)) &&
+            relY >= wh - static_cast<int>(WmMetric(WM_RESIZE_GRAB)))
         {
             result.zone = WmHitZone::ResizeCorner;
             return result;
         }
 
         // Resize edges (bottom and right, wider than visual border)
-        if (relY >= wh - static_cast<int>(WM_RESIZE_EDGE))
+        if (relY >= wh - static_cast<int>(WmMetric(WM_RESIZE_EDGE)))
         {
             result.zone = WmHitZone::ResizeBottom;
             return result;
         }
-        if (relX >= ww - static_cast<int>(WM_RESIZE_EDGE))
+        if (relX >= ww - static_cast<int>(WmMetric(WM_RESIZE_EDGE)))
         {
             result.zone = WmHitZone::ResizeRight;
             return result;
         }
 
         // Border
-        if (relX < static_cast<int>(WM_BORDER_WIDTH) ||
-            relX >= ww - static_cast<int>(WM_BORDER_WIDTH) ||
-            relY >= wh - static_cast<int>(WM_BORDER_WIDTH))
+        if (relX < static_cast<int>(WmMetric(WM_BORDER_WIDTH)) ||
+            relX >= ww - static_cast<int>(WmMetric(WM_BORDER_WIDTH)) ||
+            relY >= wh - static_cast<int>(WmMetric(WM_BORDER_WIDTH)))
         {
             result.zone = WmHitZone::Border;
             return result;
@@ -883,6 +900,7 @@ Window* WmGetWindow(int idx)
 
 void WmSetClientSideDecoration(int idx, bool enable)
 {
+    VfbGuard guard;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
@@ -921,6 +939,7 @@ uint32_t WmWindowCount()
 
 void WmSetMaximized(int idx, bool enable)
 {
+    VfbGuard guard;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
@@ -930,9 +949,18 @@ void WmSetMaximized(int idx, bool enable)
     CompositorGetPhysDims(&screenW, &screenH);
 
     uint16_t newW, newH;
+    const auto oldState=w.state;
+    const auto oldX=w.x,oldY=w.y;
+    const auto oldW=w.clientW,oldH=w.clientH;
+    const auto savedX=w.savedX,savedY=w.savedY;
+    const auto savedW=w.savedW,savedH=w.savedH;
 
     if (w.state == WindowState::Normal)
     {
+        const int64_t width = static_cast<int64_t>(screenW) - (w.noChrome ? 0 : 2 * w.metric(WM_BORDER_WIDTH));
+        const int64_t height = static_cast<int64_t>(WmDesktopHeight(screenH)) -
+            (w.noChrome ? 0 : w.metric(WM_TITLE_BAR_HEIGHT) + 2 * w.metric(WM_BORDER_WIDTH));
+        if (width < WM_MIN_WIDTH || height < WM_MIN_HEIGHT || width > 65535 || height > 65535) return;
         // Save current geometry
         w.savedX = w.x;
         w.savedY = w.y;
@@ -943,21 +971,19 @@ void WmSetMaximized(int idx, bool enable)
         // CSD windows have no chrome, so the client area takes the full space.
         w.x = 0;
         w.y = 0;
-        uint32_t desktopH = WmDesktopHeight(screenH);
-        if (w.noChrome) {
-            newW = static_cast<uint16_t>(screenW);
-            newH = static_cast<uint16_t>(desktopH);
-        } else {
-            newW = static_cast<uint16_t>(screenW - 2 * WM_BORDER_WIDTH);
-            newH = static_cast<uint16_t>(desktopH - WM_TITLE_BAR_HEIGHT - 2 * WM_BORDER_WIDTH);
-        }
+        newW = static_cast<uint16_t>(width);
+        newH = static_cast<uint16_t>(height);
         w.state = WindowState::Maximized;
     }
     else
     {
         // Restore
-        w.x = w.savedX;
-        w.y = w.savedY;
+        const auto restored = ReframeDesktopWindow(
+            {w.savedX,w.savedY,w.savedW,w.savedH,w.noChrome},
+            w.desktopMetrics(),w.desktopMetrics(),screenW,WmDesktopHeight(screenH),
+            !w.noChrome && w.focusable);
+        w.x = static_cast<int16_t>(restored.x);
+        w.y = static_cast<int16_t>(restored.y);
         newW = w.savedW;
         newH = w.savedH;
         w.state = WindowState::Normal;
@@ -965,7 +991,11 @@ void WmSetMaximized(int idx, bool enable)
 
     // Route through WmResizeWindow so terminal VFBs / SIGWINCH paths fire.
     // Without this, chrome grows but the inner VFB stays the old size.
-    WmResizeWindow(idx, newW, newH);
+    if (!ResizeWindowLocked(idx,newW,newH)) {
+        w.x=oldX;w.y=oldY;w.clientW=oldW;w.clientH=oldH;w.state=oldState;
+        w.savedX=savedX;w.savedY=savedY;w.savedW=savedW;w.savedH=savedH;
+    }
+    w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
 }
 
 void WmToggleMaximize(int idx)
@@ -976,27 +1006,35 @@ void WmToggleMaximize(int idx)
     WmSetMaximized(idx, w.state != WindowState::Maximized);
 }
 
-void WmMoveWindow(int idx, int16_t newX, int16_t newY)
+static void MoveWindowLocked(int idx, int16_t newX, int16_t newY)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
     w.x = newX;
     w.y = newY;
+    w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
+}
+
+void WmMoveWindow(int idx, int16_t newX, int16_t newY)
+{
+    VfbGuard guard;
+    MoveWindowLocked(idx,newX,newY);
 }
 
 bool WmMoveWindowRelativeToParent(Process* proc, uint32_t wmId,
                                   uint32_t parentWmId,
                                   int32_t relX, int32_t relY)
 {
+    VfbGuard guard;
     Window* child = WmFindWindowById(proc, wmId);
     Window* parent = WmFindWindowById(proc, parentWmId);
     if (!child || !parent) return false;
 
-    int32_t clientX = parent->x + (parent->noChrome ? 0 : static_cast<int32_t>(WM_BORDER_WIDTH));
-    int32_t clientY = parent->y + (parent->noChrome ? 0 : static_cast<int32_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH));
+    int32_t clientX = parent->clientX();
+    int32_t clientY = parent->clientY();
     int32_t x = clientX + relX;
     int32_t y = clientY + relY;
     static constexpr int32_t kMinI16 = -32768;
@@ -1006,16 +1044,15 @@ bool WmMoveWindowRelativeToParent(Process* proc, uint32_t wmId,
     if (y < kMinI16) y = kMinI16;
     if (y > kMaxI16) y = kMaxI16;
 
-    WmMoveWindow(static_cast<int>(wmId) - 1, static_cast<int16_t>(x), static_cast<int16_t>(y));
+    MoveWindowLocked(static_cast<int>(wmId) - 1, static_cast<int16_t>(x), static_cast<int16_t>(y));
     return true;
 }
 
-void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH)
+static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH)
 {
-    VfbGuard guard;
-    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
+    if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
     Window& w = g_windows[idx];
-    if (!w.proc) return;
+    if (!w.proc) return false;
 
     // Enforce minimum size
     if (newClientW < WM_MIN_WIDTH)  newClientW = WM_MIN_WIDTH;
@@ -1024,7 +1061,7 @@ void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH)
     // Keep exact ownership and geometry stable across terminal preparation.
     // Both locks sleep; terminal state never acquires the window guard.
     auto terminal = TerminalResizeForProcess(w.proc->pid,w.proc->incarnation,newClientW,newClientH);
-    if (terminal == TerminalResizeResult::Failed) return;
+    if (terminal == TerminalResizeResult::Failed) return false;
     w.clientW = newClientW;
     w.clientH = newClientH;
     if (terminal == TerminalResizeResult::Resized)
@@ -1054,6 +1091,49 @@ void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH)
     }
     extern void CompositorMarkDirty();
     CompositorMarkDirty();
+    return true;
+}
+
+bool WmResizeWindow(int idx,uint16_t newClientW,uint16_t newClientH)
+{
+    VfbGuard guard;
+    return ResizeWindowLocked(idx,newClientW,newClientH);
+}
+
+bool WmApplyScalePending()
+{
+    const auto* next=DesktopMetricsFor(WmGetRequestedScale());
+    if (!next || next==&WmDesktopMetrics()) return false;
+    uint32_t sw,sh;CompositorGetPhysDims(&sw,&sh);
+    VfbGuard guard;
+    const int desktopH=sh>static_cast<uint32_t>(next->taskbar()) ? sh-next->taskbar() : 0;
+    for (auto& w:g_windows) {
+        if (!w.proc) continue;
+        const auto& before=w.desktopMetrics();
+        auto rect=ReframeDesktopWindow({w.x,w.y,w.clientW,w.clientH,w.noChrome},before,*next,sw,desktopH,!w.noChrome && w.focusable);
+        auto saved=ReframeDesktopWindow({w.savedX,w.savedY,w.savedW,w.savedH,w.noChrome},before,*next,sw,desktopH,false);
+        w.metrics=next;w.x=static_cast<int16_t>(rect.x);w.y=static_cast<int16_t>(rect.y);
+        w.savedX=static_cast<int16_t>(saved.x);w.savedY=static_cast<int16_t>(saved.y);
+        if (w.state==WindowState::Maximized) {
+            const int border=w.noChrome ? 0 : next->border();
+            const int title=w.noChrome ? 0 : next->title();
+            const int width=static_cast<int>(sw)-2*border,height=desktopH-title-2*border;
+            if (width>=static_cast<int>(WM_MIN_WIDTH) && height>=static_cast<int>(WM_MIN_HEIGHT) && width<=65535 && height<=65535 && ResizeWindowLocked(static_cast<int>(&w-g_windows),width,height)) {
+                w.x=w.y=0;
+            } else {
+                // Keep the existing owned pixels and make the window movable
+                // if memory cannot satisfy a new maximized backing allocation.
+                w.state=WindowState::Normal;
+                SerialPrintf("WM: scale resize failed for window %u; preserving client buffer\n",w.wmId);
+            }
+        }
+        w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
+    }
+    __atomic_store_n(&g_desktopMetrics,next,__ATOMIC_RELEASE);
+    g_launcherScroll=0;
+    CompositorMarkDirty();
+    SerialPrintf("WM: desktop scale applied %u%%\n",next->percent);
+    return true;
 }
 
 void WmMinimizeWindow(int idx)
@@ -1138,7 +1218,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 int32_t mouseX = -1, int32_t mouseY = -1)
 {
     if (!buf || !stride || !screenW || !screenH || w.noChrome || !w.proc || !w.visible) return;
-    const int border = WM_BORDER_WIDTH;
+    const int border = WmMetric(WM_BORDER_WIDTH);
     const int ow = w.outerWidth(), oh = w.outerHeight();
     const uint32_t edge = w.focused ? WmCurrentPalette().borderActive : WmCurrentPalette().borderInactive;
     const uint32_t bg = w.focused ? WmCurrentPalette().titleActive : WmCurrentPalette().titleInactive;
@@ -1148,17 +1228,17 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     WmFillRect(buf, stride, screenW, screenH, w.x + ow - border, w.y, border, oh, edge);
     WmFillRect(buf, stride, screenW, screenH, w.x, w.y + oh - border, ow, border, edge);
     const int tx = w.x + border, ty = w.y + border;
-    WmFillRect(buf, stride, screenW, screenH, tx, ty, w.clientW, WM_TITLE_BAR_HEIGHT, bg);
+    WmFillRect(buf, stride, screenW, screenH, tx, ty, w.clientW, WmMetric(WM_TITLE_BAR_HEIGHT), bg);
     LauncherReadGuard icons;
-    const int iconX = tx + 10;
-    const int textX = iconX + 20 + 8;
-    if (CaptionRect(w, 2).x - iconX >= 24)
+    const int iconX = tx + WmMetric(10);
+    const int textX = iconX + WmMetric(20) + WmMetric(8);
+    if (CaptionRect(w, 2).x - iconX >= static_cast<int>(WmMetric(24)))
         WmDrawIcon(buf, stride, screenW, screenH, iconX,
-                   ty + (static_cast<int>(WM_TITLE_BAR_HEIGHT) - 20) / 2, 20, WindowIcon(w, icons.get()));
-    const int textW = CaptionRect(w, 2).x - textX - 8;
+                   ty + (static_cast<int>(WmMetric(WM_TITLE_BAR_HEIGHT)) - static_cast<int>(WmMetric(20))) / 2, WmMetric(20), WindowIcon(w, icons.get()));
+    const int textW = CaptionRect(w, 2).x - textX - WmMetric(8);
     if (textW > 0)
         WmRenderString(buf, stride, screenW, screenH, textX,
-            ty + (static_cast<int>(WM_TITLE_BAR_HEIGHT) - g_fontAtlas.lineHeight) / 2,
+            ty + (static_cast<int>(WmMetric(WM_TITLE_BAR_HEIGHT)) - WmDesktopFont().lineHeight) / 2,
             w.title, fg, bg, textW);
     for (int button = 0; button < 3; ++button)
     {
@@ -1166,36 +1246,36 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
         const bool hover = r.contains(mouseX, mouseY);
         if (hover) WmFillRect(buf, stride, screenW, screenH, r.x, r.y, r.w, r.h,
                              button == 0 ? WmCurrentPalette().closeHover : WmCurrentPalette().captionHover);
-        if (r.w < 14) continue;
+        if (r.w < static_cast<int>(WmMetric(14))) continue;
         const uint32_t ink = hover && button == 0 ? WmCurrentPalette().closeText :
                              hover ? WmCurrentPalette().text : fg;
         const int cx = r.x + r.w / 2, cy = r.y + r.h / 2;
         if (button == 0)
         {
-            for (int d = -4; d <= 4; ++d)
+            for (int d = -static_cast<int>(WmMetric(4)); d <= static_cast<int>(WmMetric(4)); ++d)
             {
-                WmPutPixel(buf, stride, screenW, screenH, cx + d, cy + d, ink);
-                WmPutPixel(buf, stride, screenW, screenH, cx + d, cy - d, ink);
+                WmFillRect(buf, stride, screenW, screenH, cx+d,cy+d,WmMetric(1),WmMetric(1),ink);
+                WmFillRect(buf, stride, screenW, screenH, cx+d,cy-d,WmMetric(1),WmMetric(1),ink);
             }
         }
         else if (button == 1)
         {
             auto box = [&](int x, int y, int width, int height) {
-                WmFillRect(buf, stride, screenW, screenH, x, y, width, 1, ink);
-                WmFillRect(buf, stride, screenW, screenH, x, y + height - 1, width, 1, ink);
-                WmFillRect(buf, stride, screenW, screenH, x, y, 1, height, ink);
-                WmFillRect(buf, stride, screenW, screenH, x + width - 1, y, 1, height, ink);
+                WmFillRect(buf, stride, screenW, screenH, x, y, width, WmMetric(1), ink);
+                WmFillRect(buf, stride, screenW, screenH, x, y + height - 1, width, WmMetric(1), ink);
+                WmFillRect(buf, stride, screenW, screenH, x, y, WmMetric(1), height, ink);
+                WmFillRect(buf, stride, screenW, screenH, x + width - 1, y, WmMetric(1), height, ink);
             };
             if (w.state == WindowState::Maximized)
             {
-                box(cx - 2, cy - 5, 8, 8);
-                WmFillRect(buf, stride, screenW, screenH, cx - 5, cy - 2, 8, 8,
+                box(cx - WmMetric(2), cy - WmMetric(5), WmMetric(8), WmMetric(8));
+                WmFillRect(buf, stride, screenW, screenH, cx - WmMetric(5), cy - WmMetric(2), WmMetric(8), WmMetric(8),
                            hover ? WmCurrentPalette().captionHover : bg);
-                box(cx - 5, cy - 2, 8, 8);
+                box(cx - WmMetric(5), cy - WmMetric(2), WmMetric(8), WmMetric(8));
             }
-            else box(cx - 5, cy - 4, 11, 9);
+            else box(cx - WmMetric(5), cy - WmMetric(4), WmMetric(11), WmMetric(9));
         }
-        else WmFillRect(buf, stride, screenW, screenH, cx - 5, cy + 3, 11, 1, ink);
+        else WmFillRect(buf, stride, screenW, screenH, cx - WmMetric(5), cy + WmMetric(3), WmMetric(11), WmMetric(1), ink);
     }
 }
 
@@ -1244,24 +1324,24 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     TaskbarLayout l = {};
     l.nextIndex = -1;
     const int sw = static_cast<int>(screenW), sh = static_cast<int>(screenH);
-    l.y = sh > static_cast<int>(WM_TASKBAR_HEIGHT) ? sh - WM_TASKBAR_HEIGHT : 0;
+    l.y = sh > static_cast<int>(WmMetric(WM_TASKBAR_HEIGHT)) ? sh - WmMetric(WM_TASKBAR_HEIGHT) : 0;
     const int height = sh - l.y;
-    const int bh = height < static_cast<int>(WM_TASKBAR_BTN_HEIGHT) ? height : WM_TASKBAR_BTN_HEIGHT;
+    const int bh = height < static_cast<int>(WmMetric(WM_TASKBAR_BTN_HEIGHT)) ? height : WmMetric(WM_TASKBAR_BTN_HEIGHT);
     const int by = l.y + (height - bh) / 2;
-    l.textY = by + (bh - g_fontAtlas.lineHeight) / 2;
-    int x = WM_TASKBAR_PADDING;
-    const int appsW = 40;
-    l.apps = {x, by, appsW, bh}; x += appsW + WM_TASKBAR_PADDING;
-    l.terminal = {x, by, 40, bh}; x += 40 + WM_TASKBAR_PADDING;
+    l.textY = by + (bh - WmDesktopFont().lineHeight) / 2;
+    int x = WmMetric(WM_TASKBAR_PADDING);
+    const int appsW = WmMetric(40);
+    l.apps = {x, by, appsW, bh}; x += appsW + WmMetric(WM_TASKBAR_PADDING);
+    l.terminal = {x, by, static_cast<int>(WmMetric(40)), bh}; x += WmMetric(40) + WmMetric(WM_TASKBAR_PADDING);
     RtcFormatTaskbar(l.clockText, RtcNow(), false);
-    int right = sw - 8;
+    int right = sw - WmMetric(8);
     // Reserve measured widgets from right to left. Keep one useful window
     // button on small displays; diagnostics yield before the clock does.
     auto reserve = [&](WmRect& r, int width) {
-        if (right - width - 12 < x + 80) return;
+        if (right - width - static_cast<int>(WmMetric(12)) < x + static_cast<int>(WmMetric(80))) return;
         right -= width;
         r = {right, by, width, bh};
-        right -= 12;
+        right -= WmMetric(12);
     };
     reserve(l.clock, WmTextWidth(l.clockText));
     reserve(l.gpu, WmTextWidth("GPU"));
@@ -1291,30 +1371,30 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     SpinLockRelease(&g_launchLock);
     int available = right - x;
     if (!total || available <= 0) return l;
-    int capacity = (available + WM_TASKBAR_PADDING) / (WM_TASKBAR_BTN_WIDTH + WM_TASKBAR_PADDING);
+    int capacity = (available + WmMetric(WM_TASKBAR_PADDING)) / (WmMetric(WM_TASKBAR_BTN_WIDTH) + WmMetric(WM_TASKBAR_PADDING));
     bool overflow = capacity < total;
     if (overflow)
     {
         // The arrow focuses the first window on the next page. The focused
         // window selects the page, so every hidden/minimized window remains
         // reachable through the existing focus/restore input path.
-        int arrowW = available < 32 ? available : 32;
+        int arrowW = available < static_cast<int>(WmMetric(32)) ? available : static_cast<int>(WmMetric(32));
         l.next = {right - arrowW, by, arrowW, bh};
-        available -= arrowW + WM_TASKBAR_PADDING;
-        capacity = (available + WM_TASKBAR_PADDING) / (WM_TASKBAR_BTN_WIDTH + WM_TASKBAR_PADDING);
+        available -= arrowW + WmMetric(WM_TASKBAR_PADDING);
+        capacity = (available + WmMetric(WM_TASKBAR_PADDING)) / (WmMetric(WM_TASKBAR_BTN_WIDTH) + WmMetric(WM_TASKBAR_PADDING));
         if (capacity < 1 && available > 0) capacity = 1;
         if (capacity < 1) { l.nextIndex = ids[(focused + 1) % total]; return l; }
     }
     if (capacity > total) capacity = total;
     const int first = (focused / capacity) * capacity;
     l.count = total - first < capacity ? total - first : capacity;
-    int width = (available - (capacity - 1) * WM_TASKBAR_PADDING) / capacity;
-    if (width > static_cast<int>(WM_TASKBAR_BTN_WIDTH)) width = WM_TASKBAR_BTN_WIDTH;
+    int width = (available - (capacity - 1) * WmMetric(WM_TASKBAR_PADDING)) / capacity;
+    if (width > static_cast<int>(WmMetric(WM_TASKBAR_BTN_WIDTH))) width = WmMetric(WM_TASKBAR_BTN_WIDTH);
     for (int i = 0; i < l.count; ++i)
     {
         l.indices[i] = ids[first + i];
         l.buttons[i] = {x, by, width, bh};
-        x += width + WM_TASKBAR_PADDING;
+        x += width + WmMetric(WM_TASKBAR_PADDING);
     }
     if (overflow) l.nextIndex = ids[(first + capacity) % total];
     return l;
@@ -1335,17 +1415,17 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
             r.contains(mouseX, mouseY) ? WmCurrentPalette().taskHover : WmCurrentPalette().taskButton;
         WmFillRect(backBuffer, stride, screenW, screenH, r.x, r.y, r.w, r.h, bg);
         if (active || minimized)
-            WmFillRect(backBuffer, stride, screenW, screenH, r.x + 6, r.y + r.h - 2,
-                       r.w - 12, 2, active ? WmCurrentPalette().borderActive : WmCurrentPalette().minimized);
-        if (r.w > 12) WmRenderString(backBuffer, stride, screenW, screenH,
-            r.x + 6, l.textY, title, WmCurrentPalette().taskText, bg, r.w - 12);
+            WmFillRect(backBuffer, stride, screenW, screenH, r.x + WmMetric(6), r.y + r.h - WmMetric(2),
+                       r.w - WmMetric(12), WmMetric(2), active ? WmCurrentPalette().borderActive : WmCurrentPalette().minimized);
+        if (r.w > static_cast<int>(WmMetric(12))) WmRenderString(backBuffer, stride, screenW, screenH,
+            r.x + WmMetric(6), l.textY, title, WmCurrentPalette().taskText, bg, r.w - WmMetric(12));
     };
     button(l.apps, "", g_launcherOpen, false);
     button(l.terminal, "", false, false);
-    WmDrawIcon(backBuffer, stride, screenW, screenH, l.apps.x + (l.apps.w - 24) / 2,
-               l.apps.y + (l.apps.h - 24) / 2, 24, icons.get().appsIcon);
-    WmDrawIcon(backBuffer, stride, screenW, screenH, l.terminal.x + (l.terminal.w - 24) / 2,
-               l.terminal.y + (l.terminal.h - 24) / 2, 24, icons.get().terminalIcon);
+    WmDrawIcon(backBuffer, stride, screenW, screenH, l.apps.x + (l.apps.w - static_cast<int>(WmMetric(24))) / 2,
+               l.apps.y + (l.apps.h - static_cast<int>(WmMetric(24))) / 2, WmMetric(24), icons.get().appsIcon);
+    WmDrawIcon(backBuffer, stride, screenW, screenH, l.terminal.x + (l.terminal.w - static_cast<int>(WmMetric(24))) / 2,
+               l.terminal.y + (l.terminal.h - static_cast<int>(WmMetric(24))) / 2, WmMetric(24), icons.get().terminalIcon);
     char launchTitle[80]{};
     const char* hoverTitle = l.apps.contains(mouseX, mouseY) ? "Applications" :
         l.terminal.contains(mouseX, mouseY) ? "New terminal" : nullptr;
@@ -1363,9 +1443,9 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
             if (hasIcon) memcpy(icon, g_launchRequests[slot].icon, sizeof(icon));
             SpinLockRelease(&g_launchLock);
             button(r, "", false, false);
-            if (r.w >= 24 && r.h >= 24)
-                WmDrawIcon(backBuffer, stride, screenW, screenH, r.x + (r.w - 24) / 2,
-                           r.y + (r.h - 24) / 2, 24, hasIcon ? icon : icons.get().applicationIcon);
+            if (r.w >= static_cast<int>(WmMetric(24)) && r.h >= static_cast<int>(WmMetric(24)))
+                WmDrawIcon(backBuffer, stride, screenW, screenH, r.x + (r.w - static_cast<int>(WmMetric(24))) / 2,
+                           r.y + (r.h - static_cast<int>(WmMetric(24))) / 2, WmMetric(24), hasIcon ? icon : icons.get().applicationIcon);
             if (e.busy()) {
                 // Eight positions form a bounded animated progress ring.
                 static const int dx[8] = {0, 3, 4, 3, 0, -3, -4, -3};
@@ -1376,8 +1456,8 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                                r.y + r.h - 8 + dy[dot], 2, 2,
                                dot == step ? WmCurrentPalette().taskText : WmCurrentPalette().minimized);
             } else {
-                WmRenderString(backBuffer, stride, screenW, screenH, r.x + r.w - 10,
-                               l.textY, "!", WmCurrentPalette().taskText, WmCurrentPalette().taskButton, 10);
+                WmRenderString(backBuffer, stride, screenW, screenH, r.x + r.w - WmMetric(10),
+                               l.textY, "!", WmCurrentPalette().taskText, WmCurrentPalette().taskButton, WmMetric(10));
             }
             if (r.contains(mouseX, mouseY)) {
                 WmStrCopy(launchTitle, e.busy() ? "Starting: " :
@@ -1390,9 +1470,9 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
         }
         const Window& w = g_windows[l.indices[i]];
         button(r, "", w.focused && !w.minimized, w.minimized);
-        if (r.w >= 24 && r.h >= 24)
-            WmDrawIcon(backBuffer, stride, screenW, screenH, r.x + (r.w - 24) / 2,
-                       r.y + (r.h - 24) / 2, 24, WindowIcon(w, icons.get()));
+        if (r.w >= static_cast<int>(WmMetric(24)) && r.h >= static_cast<int>(WmMetric(24)))
+            WmDrawIcon(backBuffer, stride, screenW, screenH, r.x + (r.w - static_cast<int>(WmMetric(24))) / 2,
+                       r.y + (r.h - static_cast<int>(WmMetric(24))) / 2, WmMetric(24), WindowIcon(w, icons.get()));
         if (r.contains(mouseX, mouseY)) hoverTitle = w.title;
     }
     if (l.next.w > 0) {
@@ -1404,10 +1484,10 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     int labelX = static_cast<int>(screenW);
     const WmRect trayRects[] = {l.fps, l.gpu, l.clock};
     for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
-    if (hoverTitle && labelX + 12 < static_cast<int>(screenW))
+    if (hoverTitle && labelX + static_cast<int>(WmMetric(12)) < static_cast<int>(screenW))
     {
         WmRenderString(backBuffer, stride, screenW, screenH, labelX, l.textY,
-                       hoverTitle, WmCurrentPalette().text, WmCurrentPalette().taskbar, static_cast<int>(screenW) - labelX - 8);
+                       hoverTitle, WmCurrentPalette().text, WmCurrentPalette().taskbar, static_cast<int>(screenW) - labelX - WmMetric(8));
         return;
     }
     auto trayText = [&](const WmRect& r, const char* text, uint32_t fg) {
@@ -1442,7 +1522,7 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 
 uint32_t WmDesktopHeight(uint32_t screenH)
 {
-    return screenH > WM_TASKBAR_HEIGHT ? screenH - WM_TASKBAR_HEIGHT : screenH;
+    return screenH > WmMetric(WM_TASKBAR_HEIGHT) ? screenH - WmMetric(WM_TASKBAR_HEIGHT) : 0;
 }
 
 void WmSpawnTerminal()
@@ -1466,8 +1546,8 @@ void WmSpawnTerminal()
         int16_t winX = static_cast<int16_t>(60 + (termIdx % 6) * 40);
         int16_t winY = static_cast<int16_t>(60 + (termIdx % 6) * 40);
 
-        t->child->fbDestX = winX + static_cast<int16_t>(WM_BORDER_WIDTH);
-        t->child->fbDestY = winY + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH);
+        t->child->fbDestX = winX + static_cast<int16_t>(WmMetric(WM_BORDER_WIDTH));
+        t->child->fbDestY = winY + static_cast<int16_t>(WmMetric(WM_TITLE_BAR_HEIGHT) + WmMetric(WM_BORDER_WIDTH));
         t->child->fbScale = 1;
         t->child->fbDirty = 1;
 
@@ -1496,7 +1576,7 @@ static void LauncherDrawIcon(uint32_t* buf, uint32_t stride,
                              uint32_t screenW, uint32_t screenH,
                              int32_t x, int32_t y, const LauncherItem* item, const LauncherSnapshot& launcher)
 {
-    WmDrawIcon(buf, stride, screenW, screenH, x, y, LAUNCHER_ICON_PX,
+    WmDrawIcon(buf, stride, screenW, screenH, x, y, WmMetric(LAUNCHER_ICON_PX),
                item->iconPixels ? item->iconPixels : launcher.applicationIcon);
 }
 
@@ -1952,44 +2032,44 @@ static LauncherLayout GetLauncherLayout(uint32_t screenW, uint32_t screenH,
     uint32_t total = 0;
     for (uint32_t i = 0; i < launcher.count; ++i)
         if (launcher.items[i].valid) ++total;
-    const uint32_t desktopH = screenH > WM_TASKBAR_HEIGHT ? screenH - WM_TASKBAR_HEIGHT : 0;
+    const uint32_t desktopH = screenH > WmMetric(WM_TASKBAR_HEIGHT) ? screenH - WmMetric(WM_TASKBAR_HEIGHT) : 0;
     LauncherLayout l = {};
-    l.x = screenW > 8 ? 4 : 0;
-    const uint32_t availableW = screenW > 8 ? screenW - 8 : screenW;
-    const uint32_t availableH = desktopH > 4 ? desktopH - 4 : desktopH;
-    const uint32_t fixedH = LAUNCHER_ITEM_HEIGHT + 2 * LAUNCHER_PADDING;
-    l.rows = availableH > fixedH ? (availableH - fixedH) / (LAUNCHER_ITEM_HEIGHT + 2) : 0;
+    l.x = screenW > WmMetric(8) ? WmMetric(4) : 0;
+    const uint32_t availableW = screenW > WmMetric(8) ? screenW - WmMetric(8) : screenW;
+    const uint32_t availableH = desktopH > WmMetric(4) ? desktopH - WmMetric(4) : desktopH;
+    const uint32_t fixedH = WmMetric(LAUNCHER_ITEM_HEIGHT) + 2 * WmMetric(LAUNCHER_PADDING);
+    l.rows = availableH > fixedH ? (availableH - fixedH) / (WmMetric(LAUNCHER_ITEM_HEIGHT) + WmMetric(2)) : 0;
     if (l.rows > LAUNCHER_MAX_ROWS) l.rows = LAUNCHER_MAX_ROWS;
     l.cols = l.rows ? (total + l.rows - 1) / l.rows : 1;
     if (!l.cols) l.cols = 1;
     if (l.cols > LAUNCHER_MAX_COLS) l.cols = LAUNCHER_MAX_COLS;
-    uint32_t fitCols = availableW > 2 * LAUNCHER_PADDING ?
-        (availableW - 2 * LAUNCHER_PADDING) / (LAUNCHER_ITEM_WIDTH + 4) : 0;
+    uint32_t fitCols = availableW > 2 * WmMetric(LAUNCHER_PADDING) ?
+        (availableW - 2 * WmMetric(LAUNCHER_PADDING)) / (WmMetric(LAUNCHER_ITEM_WIDTH) + WmMetric(4)) : 0;
     if (!fitCols) fitCols = 1;
     if (l.cols > fitCols) l.cols = fitCols;
-    l.itemW = availableW > 2 * LAUNCHER_PADDING + 4 ?
-        (availableW - 2 * LAUNCHER_PADDING) / l.cols - 4 : 0;
-    if (l.itemW > LAUNCHER_ITEM_WIDTH) l.itemW = LAUNCHER_ITEM_WIDTH;
+    l.itemW = availableW > 2 * WmMetric(LAUNCHER_PADDING) + WmMetric(4) ?
+        (availableW - 2 * WmMetric(LAUNCHER_PADDING)) / l.cols - WmMetric(4) : 0;
+    if (l.itemW > WmMetric(LAUNCHER_ITEM_WIDTH)) l.itemW = WmMetric(LAUNCHER_ITEM_WIDTH);
     uint32_t neededRows = (total + l.cols - 1) / l.cols;
     if (l.rows > neededRows) l.rows = neededRows;
     l.capacity = l.rows * l.cols;
     uint32_t maxScroll = total > l.capacity ? total - l.capacity : 0;
     if (g_launcherScroll > maxScroll) g_launcherScroll = maxScroll;
-    l.w = l.cols * (l.itemW + 4) + 2 * LAUNCHER_PADDING;
+    l.w = l.cols * (l.itemW + WmMetric(4)) + 2 * WmMetric(LAUNCHER_PADDING);
     if (l.w > availableW) l.w = availableW;
-    l.h = fixedH + l.rows * (LAUNCHER_ITEM_HEIGHT + 2);
+    l.h = fixedH + l.rows * (WmMetric(LAUNCHER_ITEM_HEIGHT) + WmMetric(2));
     if (l.h > availableH) l.h = availableH;
-    l.y = static_cast<int>(desktopH) - static_cast<int>(l.h) - 2;
+    l.y = static_cast<int>(desktopH) - static_cast<int>(l.h) - WmMetric(2);
     if (l.y < 0) l.y = 0;
     return l;
 }
 
 static WmRect LauncherItemRect(const LauncherLayout& l, uint32_t slot)
 {
-    return {l.x + static_cast<int>(LAUNCHER_PADDING + (slot % l.cols) * (l.itemW + 4)),
-            l.y + static_cast<int>(LAUNCHER_PADDING + LAUNCHER_ITEM_HEIGHT +
-                                   (slot / l.cols) * (LAUNCHER_ITEM_HEIGHT + 2)),
-            static_cast<int>(l.itemW), static_cast<int>(LAUNCHER_ITEM_HEIGHT)};
+    return {l.x + static_cast<int>(WmMetric(LAUNCHER_PADDING) + (slot % l.cols) * (l.itemW + WmMetric(4))),
+            l.y + static_cast<int>(WmMetric(LAUNCHER_PADDING) + WmMetric(LAUNCHER_ITEM_HEIGHT) +
+                                   (slot / l.cols) * (WmMetric(LAUNCHER_ITEM_HEIGHT) + WmMetric(2))),
+            static_cast<int>(l.itemW), static_cast<int>(WmMetric(LAUNCHER_ITEM_HEIGHT))};
 }
 
 void WmLauncherScroll(int delta, uint32_t screenW, uint32_t screenH)
@@ -2044,23 +2124,23 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
     WmFillRect(backBuffer, stride, screenW, screenH, px, py, 1, static_cast<int>(ph), WmCurrentPalette().launcherBorder);
     WmFillRect(backBuffer, stride, screenW, screenH, px + static_cast<int32_t>(pw) - 1, py, 1, static_cast<int>(ph), WmCurrentPalette().launcherBorder);
 
-    int textYOff = (static_cast<int>(LAUNCHER_ITEM_HEIGHT) - g_fontAtlas.lineHeight) / 2;
+    int textYOff = (static_cast<int>(WmMetric(LAUNCHER_ITEM_HEIGHT)) - WmDesktopFont().lineHeight) / 2;
 
     // Extremely small surfaces cannot fit even the header.
-    if (ph < LAUNCHER_ITEM_HEIGHT + 2 * LAUNCHER_PADDING || pw < 2 * LAUNCHER_PADDING + 1) return;
+    if (ph < WmMetric(LAUNCHER_ITEM_HEIGHT) + 2 * WmMetric(LAUNCHER_PADDING) || pw < 2 * WmMetric(LAUNCHER_PADDING) + 1) return;
 
     // Header: "Applications"
-    int32_t iy = py + static_cast<int32_t>(LAUNCHER_PADDING);
-    if (pw > 56) WmRenderString(backBuffer, stride, screenW, screenH,
-                   px + static_cast<int32_t>(LAUNCHER_PADDING) + 4,
+    int32_t iy = py + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING));
+    if (pw > WmMetric(56)) WmRenderString(backBuffer, stride, screenW, screenH,
+                   px + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)) + static_cast<int>(WmMetric(4)),
                    iy + static_cast<int32_t>(textYOff),
-                   g_launcherQueueFull ? "Launch queue full" : "Applications", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - 56);
-    iy += LAUNCHER_ITEM_HEIGHT;
+                   g_launcherQueueFull ? "Launch queue full" : "Applications", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - WmMetric(56));
+    iy += WmMetric(LAUNCHER_ITEM_HEIGHT);
 
     // Separator line below header
     WmFillRect(backBuffer, stride, screenW, screenH,
-               px + static_cast<int32_t>(LAUNCHER_PADDING),
-               iy - 1, static_cast<int>(pw) - 2 * LAUNCHER_PADDING, 1, WmCurrentPalette().launcherBorder);
+               px + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)),
+               iy - 1, static_cast<int>(pw) - 2 * WmMetric(LAUNCHER_PADDING), 1, WmCurrentPalette().launcherBorder);
 
     // Items — render in multi-column layout based on scroll offset
     uint32_t totalValid = 0;
@@ -2092,21 +2172,21 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
         WmFillRect(backBuffer, stride, screenW, screenH,
                    itemX, itemY,
                    static_cast<int>(layout.itemW),
-                   static_cast<int>(LAUNCHER_ITEM_HEIGHT),
+                   static_cast<int>(WmMetric(LAUNCHER_ITEM_HEIGHT)),
                    itemBg);
 
         // Draw icon
-        int32_t iconX = itemX + 6;
-        int32_t iconY = itemY + static_cast<int32_t>((LAUNCHER_ITEM_HEIGHT - LAUNCHER_ICON_SIZE) / 2);
-        if (layout.itemW >= LAUNCHER_ICON_SIZE + 12)
+        int32_t iconX = itemX + WmMetric(6);
+        int32_t iconY = itemY + static_cast<int32_t>((WmMetric(LAUNCHER_ITEM_HEIGHT) - WmMetric(LAUNCHER_ICON_SIZE)) / 2);
+        if (layout.itemW >= WmMetric(LAUNCHER_ICON_SIZE) + WmMetric(12))
             LauncherDrawIcon(backBuffer, stride, screenW, screenH,
                              iconX, iconY, &launcher.items[i], launcher);
 
         // Title text (offset to right of icon)
-        int32_t textX = iconX + static_cast<int32_t>(LAUNCHER_ICON_SIZE) +
-                        static_cast<int32_t>(LAUNCHER_ICON_MARGIN);
+        int32_t textX = iconX + static_cast<int32_t>(WmMetric(LAUNCHER_ICON_SIZE)) +
+                        static_cast<int32_t>(WmMetric(LAUNCHER_ICON_MARGIN));
         uint32_t textFg = hovered ? WmCurrentPalette().text : WmCurrentPalette().taskText;
-        int maxTextW = static_cast<int>(layout.itemW) - static_cast<int>(LAUNCHER_ICON_SIZE + LAUNCHER_ICON_MARGIN + 12);
+        int maxTextW = static_cast<int>(layout.itemW) - static_cast<int>(WmMetric(LAUNCHER_ICON_SIZE) + WmMetric(LAUNCHER_ICON_MARGIN) + WmMetric(12));
         if (maxTextW > 0) WmRenderString(backBuffer, stride, screenW, screenH,
                        textX, itemY + static_cast<int32_t>(textYOff),
                        launcher.items[i].title,
@@ -2116,20 +2196,20 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
     }
 
     // Scroll indicators (arrows) if content overflows
-    if (pw >= 48 && g_launcherScroll > 0)
+    if (pw >= WmMetric(48) && g_launcherScroll > 0)
     {
         // Wheel-scroll hints live in the header, clear of application labels.
         WmRenderString(backBuffer, stride, screenW, screenH,
-                       px + static_cast<int32_t>(pw) - 32,
-                       py + static_cast<int32_t>(LAUNCHER_PADDING) + static_cast<int32_t>(textYOff),
+                       px + static_cast<int32_t>(pw) - static_cast<int>(WmMetric(32)),
+                       py + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)) + static_cast<int32_t>(textYOff),
                        "^", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher);
     }
-    if (pw >= 48 && g_launcherScroll + maxVisible < totalValid)
+    if (pw >= WmMetric(48) && g_launcherScroll + maxVisible < totalValid)
     {
         // Down arrow beside the up hint.
         WmRenderString(backBuffer, stride, screenW, screenH,
-                       px + static_cast<int32_t>(pw) - 16,
-                       py + static_cast<int32_t>(LAUNCHER_PADDING) + textYOff,
+                       px + static_cast<int32_t>(pw) - static_cast<int>(WmMetric(16)),
+                       py + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)) + textYOff,
                        "v", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher);
     }
 }

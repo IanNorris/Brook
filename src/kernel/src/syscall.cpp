@@ -6104,8 +6104,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             if (autoH > fbH) autoH = fbH;
 
             CompositorSetupProcess(proc,
-                                   winX + static_cast<int16_t>(WM_BORDER_WIDTH),
-                                   winY + static_cast<int16_t>(WM_TITLE_BAR_HEIGHT + WM_BORDER_WIDTH),
+                                   winX + static_cast<int16_t>(WmMetric(WM_BORDER_WIDTH)),
+                                   winY + static_cast<int16_t>(WmMetric(WM_TITLE_BAR_HEIGHT) + WmMetric(WM_BORDER_WIDTH)),
                                    autoW, autoH, 1);
 
             WmCreateWindow(proc, winX, winY,
@@ -10851,6 +10851,16 @@ static int64_t sys_brook_wm_theme(uint64_t op, uint64_t theme,
     return brook::WmSetTheme(static_cast<uint32_t>(theme)) ? 0 : -EINVAL;
 }
 
+// 0xB04: native desktop scale. Query requested (0), request (1), query applied (2).
+static int64_t sys_brook_wm_scale(uint64_t op,uint64_t scale,uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    if (!ProcessCurrent()) return -ESRCH;
+    if (op==0) return WmGetRequestedScale();
+    if (op==2) return WmGetAppliedScale();
+    if (op!=1 || scale>0xffffffffULL) return -EINVAL;
+    return WmSetScale(static_cast<uint32_t>(scale)) ? 0 : -EINVAL;
+}
+
 // 0xB01: WM_SET_APP_ID(wmId, appId*) — metadata for an owned window.
 static int64_t sys_brook_wm_set_app_id(uint64_t wmId, uint64_t appIdPtr,
                                       uint64_t, uint64_t, uint64_t, uint64_t)
@@ -13314,6 +13324,7 @@ void SyscallTableInit()
     g_syscallTable[0xB01]                = sys_brook_wm_set_app_id;
     g_syscallTable[0xB02]                = sys_brook_wm_theme;
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
+    g_syscallTable[0xB04]                = sys_brook_wm_scale;
 #ifdef BROOK_MAPPING_TEST_HOOKS
     g_syscallTable[0xB30]                = MappingFaultTestControl;
 #endif

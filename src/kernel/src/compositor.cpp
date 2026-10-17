@@ -1292,9 +1292,9 @@ static void SetChromeDecorAlpha(const Window& w)
             for (int xx = x; xx < x + rw; ++xx) row[xx] = (row[xx] & 0x00FFFFFFu) | aShift;
         }
     };
-    // Top strip = solid top border (WM_BORDER_WIDTH rows) + glassy titlebar.
-    int topBorderH = (int)WM_BORDER_WIDTH;
-    int titleBarH  = (cy - oy) - topBorderH;          // == WM_TITLE_BAR_HEIGHT
+    // Top strip = solid top border (WmMetric(WM_BORDER_WIDTH) rows) + glassy titlebar.
+    int topBorderH = (int)WmMetric(WM_BORDER_WIDTH);
+    int titleBarH  = (cy - oy) - topBorderH;          // == WmMetric(WM_TITLE_BAR_HEIGHT)
     setAlpha(ox, oy, ow, topBorderH, 0xFF);                              // top border (solid)
     setAlpha(ox, oy + topBorderH, ow, titleBarH, WM_CHROME_TITLE_ALPHA); // titlebar (glass)
     setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF);             // bottom border (solid)
@@ -1354,6 +1354,7 @@ static void OverlaySetAlphaRect(int x, int y, int w, int h)
 
 // WM-mode compositor loop: wallpaper → windows (z-ordered) → chrome → cursor.
 static void CompositorInputWM();
+static bool CompositorWmGestureActive();
 
 static void CompositorLoopWM()
 {
@@ -1362,7 +1363,8 @@ static void CompositorLoopWM()
     CompositorInputWM();
     // Consume a worker-built launcher only after clicks against the old frame
     // are handled. One snapshot then serves geometry, render and GPU compose.
-    if (WmLauncherApplyPending()) {
+    const bool scaleChanged=!CompositorWmGestureActive() && WmApplyScalePending();
+    if (WmLauncherApplyPending() || scaleChanged) {
         if (g_overlayBuffer)
             OverlayClearRect(0, 0, static_cast<int>(g_physFbWidth), static_cast<int>(g_physFbHeight));
         g_overlayLauncherShown = false;
@@ -1599,16 +1601,16 @@ static void CompositorLoopWM()
     }
 
     // 3. Render taskbar at bottom of screen + launcher popup if open.
-    uint32_t tbY = g_physFbHeight - WM_TASKBAR_HEIGHT;
+    uint32_t tbY = WmDesktopHeight(g_physFbHeight);
     if (drawOverlayLayer)
     {
         // GPU DRAW: render into the overlay layer (composited on top of windows
         // at g_overlayOpacity). Clear+redraw the taskbar strip each frame; mark
         // its pixels opaque by geometry (solid full-width strip).
-        OverlayClearRect(0, (int)tbY, (int)g_physFbWidth, (int)WM_TASKBAR_HEIGHT);
+        OverlayClearRect(0, (int)tbY, (int)g_physFbWidth, (int)WmMetric(WM_TASKBAR_HEIGHT));
         WmRenderTaskbar(g_overlayBuffer, g_backBufStride,
                         g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
-        OverlaySetAlphaRect(0, (int)tbY, (int)g_physFbWidth, (int)WM_TASKBAR_HEIGHT);
+        OverlaySetAlphaRect(0, (int)tbY, (int)g_physFbWidth, (int)WmMetric(WM_TASKBAR_HEIGHT));
         MarkDirtyRows(tbY, g_physFbHeight);
 
         int32_t lx, ly; uint32_t lw, lh;
@@ -1995,6 +1997,7 @@ static int16_t g_wmResizeStartX  = 0;
 static int16_t g_wmResizeStartY  = 0;
 static uint16_t g_wmResizeStartW = 0;
 static uint16_t g_wmResizeStartH = 0;
+static bool CompositorWmGestureActive() {return g_wmDragging || g_wmResizing;}
 static bool    g_wmResizeLeft    = false;
 static bool    g_wmResizeRight   = false;
 static bool    g_wmResizeTop     = false;
@@ -2137,7 +2140,7 @@ static void CompositorHandleMouseWM()
                 }
             }
         }
-        else if (my >= static_cast<int32_t>(g_physFbHeight - WM_TASKBAR_HEIGHT))
+        else if (my >= static_cast<int32_t>(WmDesktopHeight(g_physFbHeight)))
         {
             // Clicked taskbar background — do nothing
         }
@@ -2877,8 +2880,8 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     // above windows). Populated in WM mode only; legacy mode has no taskbar.
     if (useOverlayLayer)
     {
-        GpuComposeSrcRect(gpu, g_overlayTex, 0, (int)scrH - (int)WM_TASKBAR_HEIGHT,
-                          (int)scrW, (int)WM_TASKBAR_HEIGHT, g_overlayOpacity, true);
+        GpuComposeSrcRect(gpu, g_overlayTex, 0, (int)scrH - (int)WmMetric(WM_TASKBAR_HEIGHT),
+                          (int)scrW, (int)WmMetric(WM_TASKBAR_HEIGHT), g_overlayOpacity, true);
         if (WmLauncherVisible())
         {
             int32_t lx, ly; uint32_t lw, lh;
