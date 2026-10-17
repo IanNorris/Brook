@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <signal.h>
+#include "cancel.h"
 
 #define MAX_NARINFO  32768
 #define MAX_REFERENCES 16384
@@ -40,7 +41,10 @@ static const char *g_store_dir  = "/nix/store";
  * path keyed by hash), so caching them on disk avoids one TLS handshake
  * + curl fork/exec per closure walk. Each install of a package whose
  * deps were already resolved becomes ~free. */
-static const char *g_narinfo_cache_dir = "/nix/var/cache/narinfo";
+#ifndef NARINFO_CACHE_DIR
+#define NARINFO_CACHE_DIR "/nix/var/cache/narinfo"
+#endif
+static const char *g_narinfo_cache_dir = NARINFO_CACHE_DIR;
 static const char *g_curl_path  = NULL;
 static const char *g_cacert_path = NULL;
 static const char *g_xz_path    = NULL;
@@ -209,7 +213,7 @@ static long now_ms(void) {
  * curl will close cleanly at end of input.
  */
 static void batch_prefetch_narinfos(char hashes[][33], int n) {
-    if (n <= 0 || g_cache_disabled) return;
+    if (n <= 0 || g_cache_disabled || fetch_cancelled()) return;
     narinfo_cache_init();
     if (g_cache_disabled) return;
 
@@ -390,6 +394,7 @@ static int curl_fetch_once(const char *url, char *buf, size_t bufsz) {
  * (including send failures). Archive streams never use this function. */
 static int curl_fetch(const char *url, char *buf, size_t bufsz) {
     for (int attempt = 0; attempt < 3; ++attempt) {
+        if(fetch_cancelled())return -1;
         int result = curl_fetch_once(url, buf, bufsz);
         if (result >= 0) return result;
         if (attempt < 2) usleep(200000);
@@ -567,6 +572,7 @@ static int fetch_package(const char *hash, int force);
  * saved pointer references a popped stack frame. That produced wild jumps
  * (crash at RIP=0x4738ab well outside the text segment). */
 static int fetch_dependencies(const char *refs_str) {
+    if(fetch_cancelled())return -1;
     char buf[MAX_REFERENCES];
     strncpy(buf, refs_str, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
@@ -633,6 +639,7 @@ static int fetch_dependencies(const char *refs_str) {
 }
 
 static int fetch_package(const char *hash, int force) {
+    if(fetch_cancelled())return -1;
     /* Guard against self-referential packages and shared deps in parallel chains */
     if (hash_is_seen(hash)) return 0;
     if (g_seen_count == MAX_SEEN) {
@@ -718,6 +725,7 @@ static int fetch_package(const char *hash, int force) {
     }
     if (installed && !force) return 0;
 
+    if(fetch_cancelled())return -1;
     char tmp_dest[MAX_PATH];
     char old_dest[MAX_PATH];
     snprintf(tmp_dest, sizeof(tmp_dest), "%s/.%s.tmp.%d",
@@ -761,6 +769,7 @@ static int fetch_package(const char *hash, int force) {
 }
 
 int main(int argc, char **argv) {
+    if(fetch_cancel_init()<0){perror("nix-fetch cancellation channel");return 1;}
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -857,5 +866,5 @@ int main(int argc, char **argv) {
     printf("nix-fetch: store=%s\n", g_store_dir);
 
     int rc = fetch_package(hash_buf, g_force_root);
-    _exit(rc == 0 ? 0 : 1);
+    _exit(fetch_cancelled()?130:rc == 0 ? 0 : 1);
 }

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 
 #define INDEX_PATH "/nix/index/packages.idx"
 #define MANIFEST_PATH "/nix/profile/manifest.tsv"
@@ -13,10 +14,10 @@ static const char *index_path=INDEX_PATH,*manifest_path=MANIFEST_PATH;
 typedef struct { char *name,*version,*description,*search; gboolean available; } Package;
 static GPtrArray *catalog;
 static GHashTable *installed;
-static GtkWidget *window,*search,*only_installed,*list,*status,*install_button,*remove_button,*spinner,*log_view;
+static GtkWidget *window,*search,*only_installed,*list,*status,*install_button,*remove_button,*cancel_button,*spinner,*log_view;
 static GtkListStore *model;
 static GSubprocess *child;
-static gboolean busy,waited,drained,operation_finished;
+static gboolean busy,waited,drained,operation_finished,cancel_sent,close_after_operation;
 static int child_status;
 static char *output_error;
 static guint filter_idle;
@@ -95,6 +96,7 @@ static void controls(void) {
     gtk_widget_set_sensitive(install_button,allowed&&chosen&&chosen->available);
     gtk_button_set_label(GTK_BUTTON(install_button),present?"Repair":"Install");
     gtk_widget_set_sensitive(remove_button,allowed&&present);
+    gtk_widget_set_sensitive(cancel_button,busy&&!waited&&!cancel_sent);
 }
 static void selection_changed(GtkTreeSelection *selection,gpointer unused) {
     (void)unused;GtkTreeModel *m=NULL;GtkTreeIter it;chosen=NULL;
@@ -146,8 +148,9 @@ static void finish_operation(void) {
     busy=FALSE;operation_finished=TRUE;g_clear_object(&child);gtk_spinner_stop(GTK_SPINNER(spinner));
     filter_changed(NULL,NULL);
     /* Keep the result visible even after the result list finishes filtering. */
-    char *message=error?g_strdup(error->message):output_error?g_strdup(output_error):g_strdup_printf(child_status==0?"Package operation completed. Installed state refreshed.":"Package operation failed (status %d). See details below; you can retry.",child_status);
+    char *message=error?g_strdup(error->message):output_error?g_strdup(output_error):child_status==130?g_strdup("Installation cancelled. Completed downloads remain cached."):g_strdup_printf(child_status==0?"Package operation completed. Installed state refreshed.":"Package operation failed (status %d). See details below; you can retry.",child_status);
     gtk_label_set_text(GTK_LABEL(status),message);g_free(message);g_clear_error(&error);controls();
+    if(close_after_operation)gtk_widget_destroy(window);
 }
 static void output_ready(GObject *source,GAsyncResult *result,gpointer unused) {
     (void)unused;GError *error=NULL;GBytes *bytes=g_input_stream_read_bytes_finish(G_INPUT_STREAM(source),result,&error);
@@ -168,7 +171,19 @@ static void operation_waited(GObject *source,GAsyncResult *result,gpointer unuse
     (void)unused;GError *error=NULL;
     gboolean ok=g_subprocess_wait_finish(G_SUBPROCESS(source),result,&error);
     child_status=ok&&g_subprocess_get_if_exited(G_SUBPROCESS(source))?g_subprocess_get_exit_status(G_SUBPROCESS(source)):128;
-    g_clear_error(&error);waited=TRUE;finish_operation();
+    g_clear_error(&error);waited=TRUE;controls();finish_operation();
+}
+/* Block the request across exec until nix installs its handler, so an early
+ * button press cannot terminate a writer before it can clean up its lock. */
+static void prepare_installer_child(gpointer unused) {
+    (void)unused;sigset_t block;sigemptyset(&block);sigaddset(&block,SIGUSR1);
+    sigprocmask(SIG_BLOCK,&block,NULL);
+}
+static void cancel_operation(GtkButton *button,gpointer unused) {
+    (void)button;(void)unused;
+    if(!busy||waited||cancel_sent)return;
+    cancel_sent=TRUE;g_subprocess_send_signal(child,SIGUSR1);controls();
+    gtk_label_set_text(GTK_LABEL(status),"Stopping safely… Finishing the current download or profile update.");
 }
 static void operate(GtkButton *button,gpointer unused) {
     (void)unused;if(!chosen||busy||geteuid()!=1000)return;
@@ -179,10 +194,13 @@ static void operate(GtkButton *button,gpointer unused) {
     gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog),"%s",removing?"Remove this package from the shared desktop profile? Its downloaded files stay cached on disk.":"Install this package and its dependencies into the shared desktop profile?");
     int response=gtk_dialog_run(GTK_DIALOG(dialog));gtk_widget_destroy(dialog);if(response!=GTK_RESPONSE_OK)return;
     GError *error=NULL;
-    child=g_subprocess_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE|G_SUBPROCESS_FLAGS_STDERR_MERGE,&error,"/nix/bin/nix",removing?"remove":"install",name,NULL);
+    GSubprocessLauncher *launcher=g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE|G_SUBPROCESS_FLAGS_STDERR_MERGE);
+    g_subprocess_launcher_set_child_setup(launcher,prepare_installer_child,NULL,NULL);
+    child=g_subprocess_launcher_spawn(launcher,&error,"/nix/bin/nix",removing?"remove":"install",name,NULL);
+    g_object_unref(launcher);
     if(!child){gtk_label_set_text(GTK_LABEL(status),error->message);g_error_free(error);return;}
     g_clear_pointer(&output_error,g_free);
-    busy=TRUE;waited=drained=operation_finished=FALSE;controls();gtk_spinner_start(GTK_SPINNER(spinner));
+    busy=TRUE;waited=drained=operation_finished=cancel_sent=close_after_operation=FALSE;controls();gtk_spinner_start(GTK_SPINNER(spinner));
     gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(log_view)),"",0);
     gtk_label_set_text(GTK_LABEL(status),"Working… Keep App Gallery open until the installer finishes.");
     g_input_stream_read_bytes_async(g_subprocess_get_stdout_pipe(child),4096,G_PRIORITY_DEFAULT,NULL,output_ready,NULL);
@@ -190,7 +208,7 @@ static void operate(GtkButton *button,gpointer unused) {
 }
 static gboolean close_requested(GtkWidget *widget,GdkEvent *event,gpointer unused) {
     (void)widget;(void)event;(void)unused;
-    if(busy){gtk_label_set_text(GTK_LABEL(status),"The installer is still working. Wait for it to finish before closing.");return TRUE;}
+    if(busy){close_after_operation=TRUE;cancel_operation(NULL,NULL);return TRUE;}
     return FALSE;
 }
 int main(int argc,char **argv) {
@@ -227,6 +245,8 @@ int main(int argc,char **argv) {
     spinner=gtk_spinner_new();gtk_box_pack_start(GTK_BOX(row),spinner,FALSE,FALSE,0);
     status=gtk_label_new("Reading package catalog…");gtk_label_set_line_wrap(GTK_LABEL(status),TRUE);gtk_label_set_xalign(GTK_LABEL(status),0);gtk_box_pack_start(GTK_BOX(row),status,TRUE,TRUE,0);
     install_button=gtk_button_new_with_label("Install");remove_button=gtk_button_new_with_label("Remove");gtk_box_pack_start(GTK_BOX(row),install_button,FALSE,FALSE,0);gtk_box_pack_start(GTK_BOX(row),remove_button,FALSE,FALSE,0);
+    cancel_button=gtk_button_new_with_label("Stop");gtk_box_pack_start(GTK_BOX(row),cancel_button,FALSE,FALSE,0);
+    g_signal_connect(cancel_button,"clicked",G_CALLBACK(cancel_operation),NULL);
     g_signal_connect(install_button,"clicked",G_CALLBACK(operate),NULL);g_signal_connect(remove_button,"clicked",G_CALLBACK(operate),NULL);
     GtkWidget *expander=gtk_expander_new("Installer details");gtk_box_pack_start(GTK_BOX(box),expander,FALSE,FALSE,0);
     scroll=gtk_scrolled_window_new(NULL,NULL);gtk_widget_set_size_request(scroll,-1,140);gtk_container_add(GTK_CONTAINER(expander),scroll);

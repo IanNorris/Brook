@@ -85,10 +85,36 @@ The debug TCP transport timed out during two observations; re-observing the same
 VM recovered. No ambiguous install action was replayed. These are open bridge
 reliability observations, not clean transport acceptance.
 
+## Cancellation checkpoint (work in progress)
+
+The remote work branch includes cooperative Stop and close-and-cancel handling.
+The installer requests cancellation through a private pipe; an active archive
+finishes extraction before the fetcher stops. Completed store paths remain
+cached, while cancellation before profile publication preserves registration.
+Once profile publication starts, it finishes before accepting the request.
+Metadata prefetch may also finish its current batch of up to 64 entries, so
+Stop has no tight latency bound. This is not abrupt-kill recovery.
+
+Six additional host tests cover the actual installer/fetcher/extractor pipeline,
+early requests across exec, cached retry and both sides of the commit boundary.
+An isolated guest run (`0d476c768ffd4076ac55cb565e0040b4`) verified Stop during
+a dependency archive and closing Gallery during the final archive. Both left
+complete cached data, unchanged registration and no mutation lock or helper
+processes. Checked shutdown and all three offline filesystem checks passed.
+
+**This checkpoint is not ready to merge or deploy.** Guest retry exposed missing
+kernel syscall 127 (`rt_sigpending`), used by the new commit guard. The guard
+refuses publication on that kernel, including ordinary successful installs.
+Implement and probe the syscall, rebuild the kernel, then repeat retry/repair
+acceptance. A second review found that the private pipe must relocate file
+descriptors above standard input/output/error when those streams are closed;
+that fix and a closed-stdin process test are also outstanding. Evidence remains
+under ignored `build/workloads/gallery-cancel-20261017/`.
+
 ## Remaining work
 
-- Cancellation with safe subprocess cleanup; the UI currently stays open while
-  an installer operation runs.
+- Finish the cancellation checkpoint above, including matched-kernel guest
+  acceptance and the closed-standard-stream regression test.
 - Disk-full and interrupted-install recovery across the whole profile. Atomic
   manifest publication alone does not transact symlinks and launcher metadata.
 - Dependency/shared-file removal ownership and base-image package registration.

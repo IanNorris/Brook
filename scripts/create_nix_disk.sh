@@ -65,14 +65,16 @@ fi
 
 DISK_IMG="${BROOK_NIX_DISK:-${ROOT_DIR}/brook_nix_disk.img}"
 
-# Compile the installer from current sources before allocating/updating images.
+# Compile the installer/fetcher from current sources before allocating/updating images.
 if [ -z "${MUSL_CC:-}" ]; then
-    echo "ERROR: MUSL_CC is required to rebuild nix-install; run inside nix-shell."
+    echo "ERROR: MUSL_CC is required to rebuild nix-install/nix-fetch; run inside nix-shell."
     exit 1
 fi
 NIX_INSTALL_OUT="${ROOT_DIR}/build/package-tools/nix-install"
+NIX_FETCH_OUT="${ROOT_DIR}/build/package-tools/nix-fetch"
 mkdir -p "$(dirname "$NIX_INSTALL_OUT")"
 "$MUSL_CC" -static -O2 -o "$NIX_INSTALL_OUT" "${ROOT_DIR}/tools/nix-install/nix-install.c"
+    "$MUSL_CC" -static -O2 -o "$NIX_FETCH_OUT" "${ROOT_DIR}/tools/nix-fetch/nix-fetch.c"
 
 echo "Creating ${SIZE_MB}MB Nix store disk at ${DISK_IMG}..."
 
@@ -166,7 +168,7 @@ echo "Building Brook Nix tools..."
 TOOLS_BIN="${ROOT_DIR}/tools"
 NIX_SEARCH="${TOOLS_BIN}/nix-search/nix-search"
 NIX_INSTALL="$NIX_INSTALL_OUT"
-NIX_FETCH="${TOOLS_BIN}/nix-fetch/nix-fetch"
+NIX_FETCH="$NIX_FETCH_OUT"
 NAR_UNPACK="${TOOLS_BIN}/nar-unpack/nar-unpack"
 
 for tool in "${NIX_SEARCH}" "${NIX_INSTALL}" "${NIX_FETCH}" "${NAR_UNPACK}"; do
@@ -253,6 +255,7 @@ if [ "${FUSE}" -eq 1 ]; then
     for tool in nix-fetch nix-search nix-install; do
         src="${TOOLS_BIN}/${tool}/${tool}"
         if [ "$tool" = nix-install ]; then src="$NIX_INSTALL_OUT"; fi
+        if [ "$tool" = nix-fetch ]; then src="$NIX_FETCH_OUT"; fi
         [ -f "$src" ] && cp "$src" "${MOUNT_DIR}/bin/${tool}"
     done
     [ -f "${NAR_UNPACK}" ] && cp "${NAR_UNPACK}" "${MOUNT_DIR}/bin/nar-unpack"
@@ -370,6 +373,7 @@ else
     for tool in nix-fetch nix-search nix-install; do
         src="${TOOLS_BIN}/${tool}/${tool}"
         if [ "$tool" = nix-install ]; then src="$NIX_INSTALL_OUT"; fi
+        if [ "$tool" = nix-fetch ]; then src="$NIX_FETCH_OUT"; fi
         [ -f "$src" ] && write_to_disk "${DISK_IMG}" "$src" "bin/${tool}"
     done
     [ -f "${NAR_UNPACK}" ] && write_to_disk "${DISK_IMG}" "${NAR_UNPACK}" "bin/nar-unpack"

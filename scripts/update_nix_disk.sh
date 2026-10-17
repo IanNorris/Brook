@@ -42,15 +42,17 @@ if ! command -v fuse2fs &>/dev/null; then
     exit 1
 fi
 
-# Rebuild changed installer sources instead of deploying a stale local binary.
+# Rebuild changed installer/fetcher sources instead of deploying a stale local binary.
 NIX_INSTALL_OUT="${ROOT_DIR}/build/package-tools/nix-install"
+NIX_FETCH_OUT="${ROOT_DIR}/build/package-tools/nix-fetch"
 if [ "${UPDATE_TOOLS}" -eq 1 ]; then
     if [ -z "${MUSL_CC:-}" ]; then
-        echo "ERROR: MUSL_CC is required to rebuild nix-install; run inside nix-shell."
+        echo "ERROR: MUSL_CC is required to rebuild nix-install/nix-fetch; run inside nix-shell."
         exit 1
     fi
     mkdir -p "$(dirname "$NIX_INSTALL_OUT")"
     "$MUSL_CC" -static -O2 -o "$NIX_INSTALL_OUT" "${ROOT_DIR}/tools/nix-install/nix-install.c"
+    "$MUSL_CC" -static -O2 -o "$NIX_FETCH_OUT" "${ROOT_DIR}/tools/nix-fetch/nix-fetch.c"
 fi
 
 MNTDIR=$(mktemp -d)
@@ -140,6 +142,7 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
     for tool in nix-fetch nix-search nix-install; do
         src="${TOOLS_BIN}/${tool}/${tool}"
         if [ "$tool" = nix-install ]; then src="$NIX_INSTALL_OUT"; fi
+        if [ "$tool" = nix-fetch ]; then src="$NIX_FETCH_OUT"; fi
         if [ -f "$src" ]; then
             cp "$src" "${MNTDIR}/bin/${tool}"
             echo "  ${tool} -> /nix/bin/${tool}"

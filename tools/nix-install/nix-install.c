@@ -26,6 +26,10 @@
 #include <stdint.h>
 #include <elf.h>
 #include "manifest.h"
+#include "cancel.h"
+#ifndef NIX_FETCH_PATH
+#define NIX_FETCH_PATH "/nix/bin/nix-fetch"
+#endif
 
 #ifndef INDEX_PATH
 #define INDEX_PATH      "/nix/index/packages.idx"
@@ -155,13 +159,13 @@ static int run_program(char *const argv[]) {
 
 static int run_nix_fetch_deps(const char *hash, int force) {
     char *const argv[] = {
-        (char*)"/nix/bin/nix-fetch",
+        (char*)NIX_FETCH_PATH,
         (char*)"--deps",
         force ? (char*)"--force" : (char*)hash,
         force ? (char*)hash : NULL,
         NULL,
     };
-    return run_program(argv);
+    return install_run_fetch(argv);
 }
 
 static int read_full_at(int fd, void *buf, size_t len, off_t off) {
@@ -894,6 +898,9 @@ static void refresh_desktop_entries(void)
 }
 
 static int cmd_install(const char *name) {
+    install_commit_started=0;
+    if(install_cancel_enable()<0)return 1;
+    if(install_cancel_requested)return 130;
     if (acquire_profile_lock()<0) return 1;
     printf("Looking up '%s'...\n", name);
 
@@ -931,6 +938,7 @@ static int cmd_install(const char *name) {
             fprintf(stderr, "Error: installed package closure is incomplete\n");
             return 1;
         }
+        sigset_t previous;int boundary=install_commit_begin(&previous);if(boundary)return boundary;
         int linked = link_package_bins(existing_store);
         link_package_desktops(existing_store);
         int lib_linked = link_package_libs(existing_store);
@@ -944,7 +952,7 @@ static int cmd_install(const char *name) {
         if (rpath_linked > 0)
             printf("  re-linked %d runtime library file(s) beside package binaries\n", rpath_linked);
         refresh_desktop_entries();
-        return 0;
+        return install_commit_end(&previous,0);
     }
 
     struct pkg_info pkg;
@@ -1023,10 +1031,12 @@ static int cmd_install(const char *name) {
     /* Create profile directories */
     mkdir_p(PROFILE_DIR);
 
+    sigset_t previous;int boundary=install_commit_begin(&previous);if(boundary)return boundary;
+
     /* Add to manifest */
     if (add_to_manifest(&pkg) != 0) {
         fprintf(stderr, "Error: failed to update manifest\n");
-        return 1;
+        return install_commit_end(&previous,1);
     }
 
     /* Link binaries */
@@ -1046,10 +1056,13 @@ static int cmd_install(const char *name) {
 
     refresh_desktop_entries();
 
-    return 0;
+    return install_commit_end(&previous,0);
 }
 
 static int cmd_remove(const char *name) {
+    install_commit_started=0;
+    if(install_cancel_enable()<0)return 1;
+    if(install_cancel_requested)return 130;
     if (acquire_profile_lock()<0) return 1;
     if (!is_installed(name)) {
         fprintf(stderr, "'%s' is not installed.\n", name);
@@ -1079,12 +1092,14 @@ static int cmd_remove(const char *name) {
         fclose(f);
     }
 
+    sigset_t previous;int boundary=install_commit_begin(&previous);if(boundary)return boundary;
+
     /* Publish removal before changing links. Prepublication write failures
      * preserve the original manifest and links. A directory flush can fail
      * after publication; return failure and leave reconciliation explicit. */
     if (remove_from_manifest(name) != 0) {
         fprintf(stderr, "Error: failed to update manifest: %s\n",strerror(errno));
-        return 1;
+        return install_commit_end(&previous,1);
     }
     if (store_name[0]) {
         unlink_package_bins(store_name);
@@ -1094,7 +1109,7 @@ static int cmd_remove(const char *name) {
 
     printf("%s✓ Removed %s%s\n",color_green,name,color_reset);
     refresh_desktop_entries();
-    return 0;
+    return install_commit_end(&previous,0);
 }
 
 /* Fetch a package's closure into the store (no manifest / profile mutation).
@@ -1309,13 +1324,13 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Usage: %s install <package>\n", prog);
                 return 1;
             }
-            return cmd_install(argv[2]);
+            return install_cancel_status(cmd_install(argv[2]));
         } else if (strcmp(cmd, "remove") == 0 || strcmp(cmd, "rm") == 0) {
             if (argc < 3) {
                 fprintf(stderr, "Usage: %s remove <package>\n", prog);
                 return 1;
             }
-            return cmd_remove(argv[2]);
+            return install_cancel_status(cmd_remove(argv[2]));
         } else if (strcmp(cmd, "list") == 0 || strcmp(cmd, "ls") == 0) {
             return cmd_list();
         } else if (strcmp(cmd, "shell") == 0) {
@@ -1353,8 +1368,9 @@ int main(int argc, char *argv[]) {
     }
     int rc = 0;
     for (int i = 1; i < argc; i++) {
-        int r = cmd_install(argv[i]);
+        int r = install_cancel_status(cmd_install(argv[i]));
         if (r != 0) rc = r;
+        if(install_cancel_requested){if(i+1<argc)rc=130;break;}
     }
     return rc;
 }
