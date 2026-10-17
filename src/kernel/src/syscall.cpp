@@ -5379,6 +5379,11 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
             __builtin_add_overflow(ClockNowNs(1), duration, &deadline)) return -EINVAL;
     }
     for (;;) {
+        // A fatal group exit must unwind this synchronous wait even though
+        // its signal mask excludes ordinary asynchronous delivery. The syscall
+        // return boundary publishes termination before any return to user code.
+        if (__atomic_load_n(&proc->terminalPending, __ATOMIC_ACQUIRE))
+            return -EINTR;
         uint64_t pending = __atomic_load_n(&proc->sigPending, __ATOMIC_ACQUIRE) |
                            PosixTimerPending(proc);
         uint64_t matched = pending & waitSet;
@@ -5398,7 +5403,7 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
             ((deadline - now) % 1000000ULL != 0) : 100;
         if (sleepMs > 100) sleepMs = 100;
         proc->wakeupTick = g_lapicTickCount + sleepMs;
-        SchedulerBlock(proc);
+        SchedulerBlockInterruptible(proc);
     }
 }
 

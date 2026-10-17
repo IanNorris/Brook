@@ -372,6 +372,27 @@ ignored `build/workloads/gallery-fresh-20261017/` logs `fault-final.log`,
 `fatal-final.log`, `vlc-containment-close.log` and
 `containment-final-filesystems.json`.
 
+A later VLC startup failure exposed a separate cancellation gap: the leader
+remained blocked in syscall 128 (`rt_sigtimedwait`) after its workers died.
+The hang dump showed no live peers, no futex waiters and all CPUs idle.
+The synchronous signal-wait loop ignored pending termination. It now checks
+that request before dequeue and uses the scheduler's interruptible wait to
+close the cancellation/sleep race. Ordinary matched-signal selection is retained.
+The extended fault probe reproduces a stuck signal-waiting leader on the old
+kernel (`f684ef82a6094410abf0aa8aaf5b4360`); the fixed kernel passes all 72
+cases, including waiting leaders, peers and group SIGKILL
+(`ac8a974dcc5f4a64b0e87e2163b2bf29`). The same session passes all 85
+pending-signal checks and the glibc POSIX-timer suite, including 16 callbacks
+and required TID reuse, then returns to nine service tasks. Actual VLC still
+reproduces its startup protocol/proxy fault, but now reclaims all tasks and
+returns to ten services with Wayland running, without a maintenance kill or
+teardown timeout. All 26 hosted suites, checked shutdown and all three offline
+filesystem checks pass. Evidence remains in ignored `sigwait-before.log`,
+`sigwait-after-controls.log`, `vlc-case-sigwait-vlc.log` and
+`sigwait-after-filesystems.json` in the same workload directory. VLC itself is
+not accepted yet: the package lifetime fixes still need successful startup
+and clean-close validation.
+
 The same install emitted “real strand” scheduler warnings but completed. Astra
 review found that the detector combines process state, ready-queue and trace
 observations under separate locks, and the printed trace shows fresh RUN/BLOCK
@@ -901,11 +922,16 @@ installer as Brook. A binary-cache install, executable launch, manifest
 ownership, reboot persistence, busy-profile error, retry and removal passed.
 Manifest add/remove no longer loses rows above 256 and publishes atomically;
 [installer evidence](../tools/nix-install/README.md) covers failed writes and
-profile-lock handling. Full profile crash/disk-full recovery, cancellation,
-large-package and successful-repair acceptance, base-image registration,
-shared-file removal ownership, and fresh-image launcher/icon deployment remain
-open. The launcher itself still has a 256-entry bound; that separate limit
-was not removed by the manifest fix.
+profile-lock handling. Subsequent acceptance covered cooperative Stop and
+close-and-cancel, offline cached retry, fixture repair, and VLC closure installs
+from fresh generated data/Nix images. The generated Gallery launcher and icon
+also passed on those images; see the detailed session evidence in
+[App Gallery](app-gallery.md). Full profile crash/disk-full recovery,
+abrupt-kill recovery, large-application repair, base-image registration,
+shared-file removal ownership and icon conversion for newly installed packages
+remain open. The launcher itself still has a 256-entry bound; that separate
+limit was not removed by the manifest fix. Existing install registrations
+retain their store hash on repair; a package upgrade workflow is still needed.
 
 Two completed-frame observations during Gallery acceptance timed out over the
 guest debug TCP connection; a later observation of the same VM recovered.

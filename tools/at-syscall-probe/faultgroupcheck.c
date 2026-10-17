@@ -15,9 +15,11 @@
 #include <unistd.h>
 
 enum { WORKER_SEGV, WORKER_ILL, WORKER_FPE, LEADER_SEGV, HANDLED_SEGV,
-       EXITED_LEADER_SEGV, CASES };
+       EXITED_LEADER_SEGV, SIGWAIT_LEADER_SEGV, SIGWAIT_WORKER_SEGV,
+       SIGWAIT_GROUP_KILL, CASES };
 static const char *names[]={"worker-segv","worker-ill","worker-fpe",
-    "leader-segv","handled-worker-segv","exited-leader-worker-segv"};
+    "leader-segv","handled-worker-segv","exited-leader-worker-segv",
+    "sigwait-leader-worker-segv","sigwait-peer-worker-segv","sigwait-group-kill"};
 static int mode,go[2],report[2],life[2],hold[2],word;
 static unsigned ready;
 static pid_t parent_pid;
@@ -59,22 +61,32 @@ static void recover(int signal,siginfo_t *info,void *context) {
     /* Skip precisely the three-byte movq load in fault(), not arbitrary code. */
     ((ucontext_t*)context)->uc_mcontext.gregs[REG_RIP]+=3;
 }
+static void signal_wait(void) {
+    uint64_t mask=1ULL<<(SIGUSR1-1);
+    syscall(SYS_rt_sigtimedwait,&mask,NULL,NULL,8);
+    _exit(102); // No requested signal is sent; only fatal cancellation may end it.
+}
 static void *worker(void *arg) {
     uintptr_t id=(uintptr_t)arg;
     __atomic_add_fetch(&ready,1,__ATOMIC_RELEASE);
-    if(id==2 && mode!=LEADER_SEGV) {
+    if(id==2 && mode!=LEADER_SEGV && mode!=SIGWAIT_GROUP_KILL) {
         char c;if(read(go[0],&c,1)!=1)_exit(92);
         wait_for_parent();
         fault();
         if(mode!=HANDLED_SEGV || handled!=1)_exit(93);
         if(write(report[1],"H",1)!=1)_exit(94);
     }
+    if(mode==SIGWAIT_GROUP_KILL || (id==0 && mode==SIGWAIT_WORKER_SEGV))signal_wait();
     if(id==1) {char c;for(;;)read(hold[0],&c,1);}
     for(;;)syscall(SYS_futex,&word,128,0,NULL,NULL,0);
     return NULL;
 }
 static void child(void) {
     close(go[1]);close(report[0]);close(life[0]);
+    if(mode>=SIGWAIT_LEADER_SEGV) {
+        sigset_t mask;sigemptyset(&mask);sigaddset(&mask,SIGUSR1);
+        if(pthread_sigmask(SIG_BLOCK,&mask,NULL))_exit(103);
+    }
     if(mode==HANDLED_SEGV) {
         struct sigaction a={0};a.sa_sigaction=recover;a.sa_flags=SA_SIGINFO;
         sigemptyset(&a.sa_mask);if(sigaction(SIGSEGV,&a,NULL))_exit(95);
@@ -84,6 +96,7 @@ static void child(void) {
     while(__atomic_load_n(&ready,__ATOMIC_ACQUIRE)!=3)sched_yield();
     if(write(report[1],"R",1)!=1)_exit(97);
     if(mode==EXITED_LEADER_SEGV){syscall(SYS_exit,0);_exit(98);}
+    if(mode==SIGWAIT_LEADER_SEGV || mode==SIGWAIT_GROUP_KILL)signal_wait();
     if(mode==LEADER_SEGV) {char c;if(read(go[0],&c,1)!=1)_exit(99);wait_for_parent();fault();_exit(100);}
     for(;;)syscall(SYS_futex,&word,128,0,NULL,NULL,0);
 }
@@ -130,7 +143,7 @@ static int run_case(int which) {
     const char *stage="ready";
     int ok=byte_with_timeout(report[0],'R'),status=0,reaped=0;
     pause_ms(30); // Let the leader and ordinary peer waits settle.
-    if(ok){stage="trigger";ok=write(go[1],"G",1)==1;}
+    if(ok){stage="trigger";ok=mode==SIGWAIT_GROUP_KILL?kill(pid,SIGKILL)==0:write(go[1],"G",1)==1;}
     if(ok && mode==HANDLED_SEGV) {
         stage="handled";ok=byte_with_timeout(report[0],'H') && waitpid(pid,&status,WNOHANG)==0;
         kill(pid,SIGKILL);
@@ -139,7 +152,8 @@ static int run_case(int which) {
     ok=ok && reaped;
     if(ok) {
         stage="signal-status";
-        int expected=mode==WORKER_ILL?SIGILL:mode==WORKER_FPE?SIGFPE:mode==HANDLED_SEGV?SIGKILL:SIGSEGV;
+        int expected=mode==WORKER_ILL?SIGILL:mode==WORKER_FPE?SIGFPE:
+            (mode==HANDLED_SEGV || mode==SIGWAIT_GROUP_KILL)?SIGKILL:SIGSEGV;
         ok=WIFSIGNALED(status) && WTERMSIG(status)==expected;
     }
     int observed_status=status,saved_errno=errno;

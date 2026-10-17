@@ -799,19 +799,26 @@ browser cleanup, heap integrity and clean offline filesystem checks. A 60-second
 alarm bounds the probe. Internet sockets and unbound/listening Unix shutdown
 remain outside Brook's connected-stream subset and return EOPNOTSUPP.
 
-`faultgroupcheck.c` requires `-pthread` and x86-64. Six cases exercise actual
+`faultgroupcheck.c` requires `-pthread` and x86-64. Nine cases exercise actual
 worker SIGSEGV, SIGILL and SIGFPE faults, a leader SIGSEGV, a handled worker
-SIGSEGV, and a worker fault after raw leader `SYS_exit(0)`. Other workers block
-in futex and pipe reads. The parent waits for readiness, triggers the fault,
+SIGSEGV, and a worker fault after raw leader `SYS_exit(0)`. Additional cases
+put the leader or a peer in an indefinite raw `rt_sigtimedwait` for blocked
+SIGUSR1 while another worker faults; external SIGKILL also cancels an entire
+group waiting in that syscall. Other workers block in futex and pipe reads.
+The parent waits for readiness, triggers the fault,
 then uses blocking waitpid with an alarm deadline. It checks the exact fatal
 signal and pipe EOF after group teardown; the handled control must remain alive
 until explicit SIGKILL. Readiness waits retry EINTR, including SIGCHLD from a
 raw leader exit. Failure output identifies the stage and distinguishes the
-observed wait result from cleanup. Run `faultgroupcheck 8` for 48 cases, with
-an external host deadline as well. The Linux control passes 48/48; the final
-probe also passes 48/48 on Brook (session
-`72f2260bb6cf4742bfff86664d5fbe5b`), followed by the existing fatal-signal
-probe's 48/48 and recovery to nine service tasks. Follow guest
+observed wait result from cleanup. Run `faultgroupcheck 8` for 72 cases, with
+an external host deadline as well. The Linux and Brook controls pass 72/72
+(Brook session `ac8a974dcc5f4a64b0e87e2163b2bf29`), returning to nine service
+tasks. The old kernel reproduces a stuck leader in the new signal-wait case;
+the fix checks terminal cancellation and uses an interruptible scheduler wait.
+The same fixed session passes all 85 pending-signal checks and the glibc
+POSIX-timer suite with 16 callbacks and required TID reuse. The original six
+cases and separate fatal-signal probe previously passed 48/48 each in session
+`72f2260bb6cf4742bfff86664d5fbe5b`. Follow guest
 acceptance with task-count recovery, checked shutdown and offline fsck. This
 tests fault containment, not a fix for VLC's underlying invalid proxy access.
 
