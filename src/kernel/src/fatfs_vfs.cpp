@@ -283,15 +283,17 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     return static_cast<int>(br);
 }
 
-static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
+static int FatFileWriteAt(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset, bool append)
 {
     FIL* fil = static_cast<FIL*>(vn->priv);
     KMutexLock(&g_fatLock);
     auto* file = reinterpret_cast<FatOpenFile*>(fil);
     int ready = PrepareFatMutation(file, false);
     if (ready) { KMutexUnlock(&g_fatLock); return ready; }
-    if (f_tell(fil) != *offset) {
-        FRESULT sres = f_lseek(fil, static_cast<FSIZE_t>(*offset));
+    // Alias metadata has been synchronized; EOF and write share g_fatLock.
+    uint64_t position = append ? f_size(fil) : *offset;
+    if (f_tell(fil) != position) {
+        FRESULT sres = f_lseek(fil, static_cast<FSIZE_t>(position));
         if (sres != FR_OK) {
             KMutexUnlock(&g_fatLock);
             return FrToErrno(sres);
@@ -308,10 +310,15 @@ static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offs
     PublishFatMutation(file);
     if (res == FR_OK) res = sync;
     if (res != FR_OK) { KMutexUnlock(&g_fatLock); return FrToErrno(res); }
-    *offset += bw;
+    if (bw) *offset = position + bw;
     KMutexUnlock(&g_fatLock);
     return static_cast<int>(bw);
 }
+
+static int FatFileWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
+{ return FatFileWriteAt(vn, buf, len, offset, false); }
+static int FatFileAppend(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
+{ return len ? FatFileWriteAt(vn, buf, len, offset, true) : 0; }
 
 static int FatDirReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
 {
@@ -553,6 +560,7 @@ static const VnodeOps g_fatFileOps = {
     .readdir = nullptr, .close = FatFileClose, .stat = FatStat,
     .fsync = FatFileFsync,
     .truncate = FatFileTruncate,
+    .append = FatFileAppend,
 };
 
 static const VnodeOps g_fatDirOps = {

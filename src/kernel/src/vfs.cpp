@@ -689,6 +689,15 @@ int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
     return vn->ops->write(vn, buf, len, offset);
 }
 
+int VfsAppend(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
+{
+    if (!vn || vn->type != VnodeType::File || !vn->ops->write) return -22;
+    if (vn->ops->file_object)
+        return FileObjectAppend(vn->ops->file_object(vn), vn, buf, len, offset);
+    if (vn->ops->append) return vn->ops->append(vn, buf, len, offset);
+    return -95; // A stat followed by write would race other opens/truncation.
+}
+
 // Mapping descriptors retain their vnode. Dynamic bindings aggregate separate
 // opens by stable identity without a fixed number of simultaneous mappings.
 static MappingPinRegistry g_mappingPins;

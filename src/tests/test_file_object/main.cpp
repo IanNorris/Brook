@@ -101,6 +101,68 @@ void PmmRefPage(PhysicalAddress page) { std::lock_guard<std::mutex> lock(framesG
 void PmmUnrefPage(PhysicalAddress page) { std::lock_guard<std::mutex> lock(framesGuard);CHECK(refs.at(page.raw())>0);if(!--refs.at(page.raw())){refs.erase(page.raw());std::free(reinterpret_cast<void*>(page.raw()));} }
 }
 extern "C" __attribute__((noreturn)) void KernelPanic(const char*,...) { std::abort(); }
+static void AppendTransactions() {
+    CHECK(refs.empty()&&heapBlocks==0);
+    Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(10,0x31);
+    Vnode first{&operations,VnodeType::File,&backend,1,0};
+    Vnode second{&operations,VnodeType::File,&backend,1,0};
+    int error=0;auto page=FileObjectGetPage(&backend.object,&first,0,true,&error);
+    CHECK(page&&error==0);
+    auto* bytes=reinterpret_cast<unsigned char*>(page.raw());
+    uint64_t offset=0;const unsigned char data[]={0x41,0x42,0x43};
+    CHECK(FileObjectAppend(&backend.object,&first,data,3,&offset)==3&&offset==13);
+    CHECK(bytes[9]==0x31&&bytes[10]==0x41&&bytes[12]==0x43);
+    offset=1;backend.writeLimit=1;
+    CHECK(FileObjectAppend(&backend.object,&second,data,3,&offset)==1&&offset==14&&bytes[13]==0x41);
+    const auto generation=backend.object.generation;
+    backend.failStat=true;offset=7;
+    CHECK(FileObjectAppend(&backend.object,&second,data,3,&offset)==-5&&offset==7);
+    backend.failStat=false;backend.failWrite=true;
+    CHECK(FileObjectAppend(&backend.object,&second,data,3,&offset)==-5&&offset==7);
+    backend.failWrite=false;backend.zeroAtWrite=backend.writes+1;
+    CHECK(FileObjectAppend(&backend.object,&second,data,3,&offset)==0&&offset==7);
+    CHECK(FileObjectAppend(&backend.object,&second,nullptr,0,&offset)==0&&offset==7);
+    CHECK(backend.object.generation==generation);
+    backend.zeroAtWrite=0;backend.writeLimit=~0u;
+    PmmUnrefPage(page);
+    CHECK(FileObjectTruncateUnmapped(&backend.object,&first,0)==0);
+    std::vector<std::thread> writers;
+    for(unsigned n=0;n<8;++n)writers.emplace_back([&,n] {
+        // Independent vnode and deliberately stale offset for every record.
+        Vnode vnode{&operations,VnodeType::File,&backend,1,0};
+        unsigned char record[64];std::memset(record,n+1,sizeof(record));
+        for(unsigned i=0;i<100;++i) {
+            uint64_t stale=0;
+            CHECK(FileObjectAppend(&backend.object,&vnode,record,sizeof(record),&stale)==64);
+        }
+    });
+    for(auto& writer:writers)writer.join();
+    CHECK(backend.bytes.size()==8*100*64);
+    unsigned records[8]{};
+    for(unsigned i=0;i<backend.bytes.size();i+=64) {
+        unsigned value=backend.bytes[i];CHECK(value>=1&&value<=8);++records[value-1];
+        for(unsigned j=0;j<64;++j)CHECK(backend.bytes[i+j]==value);
+    }
+    for(auto count:records)CHECK(count==100);
+    // A truncation through another open cannot enter between EOF selection
+    // and backend/cache publication. Block the append inside its backend.
+    backend.blockWrite=true;writeHookEntered=false;writeHookReleased=false;
+    std::thread appender([&] {
+        uint64_t stale=0;CHECK(FileObjectAppend(&backend.object,&first,data,3,&stale)==3);
+    });
+    { std::unique_lock<std::mutex> lock(writeHookGuard);
+      writeHookCv.wait(lock,[]{return writeHookEntered;}); }
+    const auto before=gateAcquires.load();std::atomic<bool> truncated{false};
+    std::thread truncater([&] {
+        CHECK(FileObjectTruncateUnmapped(&backend.object,&second,0)==0);truncated=true;
+    });
+    while(gateAcquires.load()==before)std::this_thread::yield();
+    CHECK(!truncated.load());
+    { std::lock_guard<std::mutex> lock(writeHookGuard);writeHookReleased=true; }
+    writeHookCv.notify_all();appender.join();truncater.join();
+    CHECK(truncated.load()&&backend.bytes.empty());
+    FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
+}
 static void WritebackPages() {
     CHECK(refs.empty()&&heapBlocks==0);
     Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(8192+37,0x31);
@@ -349,5 +411,6 @@ int main() {
     BatchPages();
     WritebackPages();
     WritebackLifetime();
+    AppendTransactions();
     std::puts("FILE_OBJECT PASS batch/sparse-pins/one-gate/failure-cleanup/concurrent-load/io-coherence/partial-error/truncate/zero-tail/lifetime/writeback-range/snapshot/redirty/error-retry");
 }

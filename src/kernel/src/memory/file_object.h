@@ -40,6 +40,9 @@ int FileObjectGetPages(FileObject* object,Vnode* vnode,uint64_t index,uint32_t c
                        PhysicalAddress* pages,bool* loaded = nullptr);
 int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset);
 int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset);
+// Kernel-staged buffer only. Fresh EOF selection, backend write and resident
+// cache publication share one inode gate, including across independent opens.
+int FileObjectAppend(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset);
 // Publication hook: caller owns the file gate and retains its vnode. Mark only
 // the canonical frame that will be exposed, before making any writable alias.
 // Exposure is conservative and survives flushes while registrations remain.

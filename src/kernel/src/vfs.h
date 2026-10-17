@@ -56,6 +56,8 @@ struct VnodeOps {
     // Borrowed stable live-inode object; caller retains vn through use.
     FileObject* (*file_object)(Vnode* vn) = nullptr;
     int (*chown)(Vnode* vn, uint32_t uid, uint32_t gid) = nullptr;
+    // Kernel-staged buffer; choose current EOF atomically with the write.
+    int (*append)(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset) = nullptr;
 };
 
 struct Vnode {
@@ -99,7 +101,7 @@ static constexpr int VFS_O_WRITE  = 0x01;  // Open for writing
 static constexpr int VFS_O_CREATE = 0x02;  // Create file if it doesn't exist
 static constexpr int VFS_O_TRUNC  = 0x04;  // Truncate existing file
 static constexpr int VFS_O_EXCL   = 0x10;  // With CREATE, fail if the directory entry exists
-static constexpr int VFS_O_APPEND = 0x08;  // Seek to end after open
+static constexpr int VFS_O_APPEND = 0x08;  // Append intent (FD layer retains it).
 // WRITE alone is write-only; retain Linux O_RDWR's read requirement separately.
 static constexpr int VFS_O_READWRITE = 0x20;
 
@@ -239,6 +241,8 @@ void VfsFileMapClone(Vnode* vn);
 void VfsFileMapUnpin(Vnode* vn);
 extern "C" int VfsTruncate(Vnode* vn, uint64_t size);
 extern "C" int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset);
+// Requires a kernel-staged buffer, not a userspace pointer.
+extern "C" int VfsAppend(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset);
 
 // Read directory entries.  *cookie starts at 0.
 extern "C" int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);

@@ -322,8 +322,15 @@ static int add_to_manifest(const struct pkg_info *pkg) {
                 MANIFEST_PATH, strerror(errno));
         return -1;
     }
-    fprintf(f, "%s\t%s\t%s\n", pkg->name, pkg->version, pkg->store_name);
-    fclose(f);
+    int failed = fprintf(f, "%s\t%s\t%s\n", pkg->name, pkg->version, pkg->store_name) < 0;
+    /* Buffered writes may fail only at close; never report an installed entry
+     * whose manifest write failed (e.g. ENOSPC or a backend I/O error). */
+    if (fclose(f) != 0) failed = 1;
+    if (failed) {
+        fprintf(stderr, "Error: writing manifest %s failed: %s\n",
+                MANIFEST_PATH, strerror(errno));
+        return -1;
+    }
     return 0;
 }
 

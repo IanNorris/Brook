@@ -53,7 +53,7 @@ the table distinguishes tested behavior from remaining limitations.
 | Nix binaries | — | ✅ Working | Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …) |
 | [NetSurf](https://www.netsurf-browser.org/) | 3.11 | ✅ Working | Web browser rendering HTML/CSS via custom framebuffer surface |
 | [Ladybird](https://ladybird.dev/) | 2026-04-04 | ⚠️ Experimental | HTTPS Google search and Amazon navigation verified; loading/input/scrolling performance remains limited |
-| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Wayland browsing, JavaScript/input, Google/Amazon HTTPS and 480p YouTube video verified; audio and normal-quit investigation in progress |
+| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Wayland browsing, JavaScript/input, Google/Amazon HTTPS and 480p YouTube video verified; Brook-user menu launch and normal exit rechecked; audio under investigation |
 | [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
 | [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation, text input, save/load verified; music and two bounded exit tests pass; longer-session exit testing remains |
 | [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Native text editing, save/reopen and normal exit verified with software Wayland; startup remains slow, Electron sandbox disabled |
@@ -69,13 +69,22 @@ the table distinguishes tested behavior from remaining limitations.
   saves and reopens text files, and exits through its window controls. Nested
   epoll readiness and timeout fixes unblock Electron's event loop. The current
   launcher uses software Wayland and a persistent profile; startup remains slow.
+  Running it alongside Chromium can exhaust a 4 GiB guest and crash the editor;
+  concurrent use remains under investigation.
 
 - **Modern browsers:** stock Firefox and Chromium render real HTTPS websites
   with working input and JavaScript. Chromium now plays YouTube video and audio,
   including long pause/resume and seeking, without an autoplay workaround.
   Connected Unix socket shutdown, anonymous memory discard and descriptor
   capacity fixes support these workloads. See [workload validation](docs/workloads.md)
-  for tested configurations and remaining limits. All 20 hosted test suites pass.
+  for tested configurations and remaining limits. All 21 hosted test suites pass.
+
+- **Desktop identity and package registration:** new apps and Terminal run as
+  `brook` by default, with persistent `/data/home`. The installer preserves
+  package manifest rows when appending; Firefox's menu launch, HTTPS rendering
+  and normal exit have been rechecked with this identity. Permission enforcement
+  is still being audited before adding login/accounts. See [identity](docs/identity.md)
+  and [append acceptance](docs/append-writes.md).
 
 - **Desktop appearance:** application icons in window chrome, an icon taskbar,
   and a launcher that updates after package installation/removal. Settings

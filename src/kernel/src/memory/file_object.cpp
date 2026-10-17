@@ -71,14 +71,17 @@ int ReadResident(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,ui
     if(result>0)Overlay(object,begin,buffer,static_cast<uint64_t>(result),false);
     return result;
 }
-int WriteResident(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset) {
-    Gate held(object);const uint64_t begin=*offset;
+int WriteLocked(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset) {
+    const uint64_t begin=*offset;
     int result=vnode->ops->write(vnode,buffer,length,offset);
     if(result>0) {
         Overlay(object,begin,const_cast<void*>(buffer),static_cast<uint64_t>(result),true);
         ++object->generation;
     }
     return result;
+}
+int WriteResident(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset) {
+    Gate held(object);return WriteLocked(object,vnode,buffer,length,offset);
 }
 }
 void FileObjectInit(FileObject* object) {
@@ -183,6 +186,18 @@ int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t 
         done+=static_cast<uint64_t>(result);if(static_cast<uint64_t>(result)<count)break;
     }
     kfree(bounce);return done?static_cast<int>(done):result;
+}
+int FileObjectAppend(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset) {
+    [[maybe_unused]] Operation operation;
+    if(!length)return 0;
+    if(UserPointer(buffer))return -22; // Never fault/copy user memory under gate.
+    Gate held(object);
+    VnodeStat stat{};int result=vnode->ops->stat(vnode,&stat);
+    if(result)return result;
+    uint64_t position=stat.size;
+    result=WriteLocked(object,vnode,buffer,length,&position);
+    if(result>0)*offset=position;
+    return result;
 }
 bool FileObjectExposeWritableLocked(FileObject* object,Vnode* vnode,uint64_t index,PhysicalAddress physical) {
 #ifndef BROOK_HOST_TEST

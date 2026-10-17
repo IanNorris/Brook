@@ -297,6 +297,11 @@ repairing registration. The existing Firefox package is indexed as
 `firefox-stock`; its wrapper exists but its desktop registration is missing.
 Neither browser reacceptance nor manifest repair is complete at this checkpoint.
 
+Follow-up: [atomic append and installer acceptance](append-writes.md) records the
+manifest fix, actual Firefox/Chromium registration, Brook-user Firefox HTTPS and
+normal exit, and native Terminal identity verification. The earlier Chromium/
+Codium memory failure and directory authorization gaps remain open.
+
 1. Fix contradictory identity queries and false-success credential operations,
    with small Linux/guest comparison probes. Establish one named desktop identity
    and a matching primary group, environment and persistent directory layout.

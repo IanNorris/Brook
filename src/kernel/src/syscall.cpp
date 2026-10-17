@@ -1642,6 +1642,24 @@ static int OpenProcMemFd(Process* proc, const char* path, uint64_t flags, bool* 
 // buffer; sendfile passes a kernel bounce buffer that is always readable).
 // Handles every fd type: serial, vnode, framebuffer, /dev/null, dsp, tty,
 // pipe, eventfd, socket, memfd, unix-socket.
+// One append syscall commits at most this prefix. A short write permits callers
+// to retry without holding inode/backend locks across user faults or allocation.
+static constexpr uint64_t AppendStageLimit = 64 * 1024;
+// Backend/VFS byte results are signed int. Bound ordinary writes rather than
+// narrowing a 64-bit request (which can wrap to zero or a negative result).
+static constexpr uint64_t VnodeWriteLimit = 0x7ffff000ULL;
+static int64_t AppendUserBuffer(Vnode* vn, uint64_t address, uint64_t count, uint64_t* offset)
+{
+    if (!count) return 0;
+    uint64_t size = count < AppendStageLimit ? count : AppendStageLimit;
+    auto* staged = kmalloc(size);
+    if (!staged) return -ENOMEM;
+    memcpy(staged, reinterpret_cast<const void*>(address), size);
+    int64_t result = VfsAppend(vn, staged, size, offset);
+    kfree(staged);
+    return result;
+}
+
 static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
 {
     Process* proc = ProcessCurrent();
@@ -1703,9 +1721,12 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
     // destructor performs any deferred-close teardown on every return path.
     if (fde->type == FdType::Vnode && fde->handle)
     {
+        if ((fde->statusFlags & 3) == 0) return -EBADF;
         auto* vn = static_cast<Vnode*>(fde->handle);
-        int64_t ret = VfsWrite(vn, reinterpret_cast<const void*>(bufAddr),
-                               static_cast<uint32_t>(count), &fde->seekPos);
+        int64_t ret = (fde->statusFlags & 0x400)
+            ? AppendUserBuffer(vn, bufAddr, count, &fde->seekPos)
+            : VfsWrite(vn, reinterpret_cast<const void*>(bufAddr),
+                       count < VnodeWriteLimit ? count : VnodeWriteLimit, &fde->seekPos);
         // O_SYNC includes O_DSYNC (0x1000). A stronger full-file sync is valid
         // for either flag and must complete before reporting a durable write.
         if (ret > 0 && (fde->statusFlags & 0x1000)) {
@@ -4063,12 +4084,53 @@ static int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
     if (iovcnt > 1024) return -EINVAL;
     if (!UserBufferReadable(iovAddr, iovcnt * sizeof(iovec))) return -EFAULT;
     const auto* iov = reinterpret_cast<const iovec*>(iovAddr);
+    Process* proc = ProcessCurrent();
+    if (!proc) return -EBADF;
+    FdRef ref(proc, static_cast<int>(fd));
+    if (!ref) return -EBADF;
+    auto* entry = ref.get();
+    if (entry->type == FdType::Vnode && entry->handle && (entry->statusFlags & 0x400)) {
+        if ((entry->statusFlags & 3) == 0) return -EBADF;
+        // Snapshot descriptors before validation: users may change the array.
+        auto* vectors = static_cast<iovec*>(kmalloc(iovcnt ? iovcnt * sizeof(iovec) : 1));
+        if (!vectors) return -ENOMEM;
+        memcpy(vectors, iov, iovcnt * sizeof(iovec));
+        uint64_t bytes = 0;
+        for (uint64_t i = 0; i < iovcnt; ++i) {
+            if (vectors[i].iov_len > 0x7fffffffffffffffULL - bytes) {
+                kfree(vectors);return -EINVAL;
+            }
+            bytes += vectors[i].iov_len;
+        }
+        uint64_t capacity = bytes < AppendStageLimit ? bytes : AppendStageLimit;
+        auto* staged = static_cast<uint8_t*>(kmalloc(capacity ? capacity : 1));
+        if (!staged) { kfree(vectors);return -ENOMEM; }
+        uint64_t copied = 0;
+        for (uint64_t i = 0; i < iovcnt && copied < capacity; ++i) {
+            uint64_t length = vectors[i].iov_len;
+            if (length > capacity - copied) length = capacity - copied;
+            if (length && !UserBufferReadable(vectors[i].iov_base, length)) {
+                kfree(staged);kfree(vectors);return -EFAULT;
+            }
+            if (length) memcpy(staged + copied, reinterpret_cast<const void*>(vectors[i].iov_base), length);
+            copied += length;
+        }
+        kfree(vectors);
+        auto* vn = static_cast<Vnode*>(entry->handle);
+        int64_t result = VfsAppend(vn, staged, capacity, &entry->seekPos);
+        kfree(staged);
+        if (result > 0 && (entry->statusFlags & 0x1000)) {
+            int error = VfsFsync(vn);if (error) return error;
+        }
+        return result;
+    }
     int64_t total = 0;
     for (uint64_t i = 0; i < iovcnt; ++i)
     {
         int64_t ret = sys_write(fd, iov[i].iov_base, iov[i].iov_len, 0, 0, 0);
         if (ret < 0) return (total > 0) ? total : ret;
         total += ret;
+        if (static_cast<uint64_t>(ret) < iov[i].iov_len) break;
     }
     return total;
 }
@@ -10115,11 +10177,16 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
             (fde->statusFlags & 0x400) != 0);
     }
     if (fde->type != FdType::Vnode || !fde->handle) return -EINVAL;
+    if ((fde->statusFlags & 3) == 0) return -EBADF;
+    if (count && !UserBufferReadable(bufAddr, count)) return -EFAULT;
 
     auto* vn = static_cast<Vnode*>(fde->handle);
     const void* buf = reinterpret_cast<const void*>(bufAddr);
     uint64_t off = offset;
-    int64_t result = VfsWrite(vn, buf, count, &off);
+    // Linux pwrite on O_APPEND chooses EOF but leaves the FD offset unchanged.
+    int64_t result = (fde->statusFlags & 0x400)
+        ? AppendUserBuffer(vn, bufAddr, count, &off)
+        : VfsWrite(vn, buf, count < VnodeWriteLimit ? count : VnodeWriteLimit, &off);
     if (result > 0 && (fde->statusFlags & 0x1000)) {
         int error = VfsFsync(vn);
         if (error) return error;

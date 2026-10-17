@@ -49,12 +49,24 @@
   must not be described as user isolation. Avoid migrating/deleting existing home
   files without preserving their data and ownership.
 
-- O_APPEND on ext2: a shell `printf ... >> user.js` overwrote the first bytes
-  instead of appending during Firefox audio setup. Preserve the corrupted
-  profile as evidence and test append semantics through separate opens, dup and
-  concurrent writers. Ext2's open callback currently ignores flags and VfsWrite
-  does not receive the descriptor's append bit. Keep profile generation as one
-  complete write during audio diagnosis; do not call the append behavior fixed.
+- Append writes: the descriptor append bit now reaches atomic inode/backend
+  append transactions for write, writev and pwrite. Independent/concurrent opens,
+  positioned writes, short retries and installer manifest preservation are
+  covered by [append acceptance](append-writes.md). Shared open-file-description
+  offsets and F_SETFL propagation across dup/fork remain a separate gap. FAT
+  still rejects rename/unlink of retained open entries, and directory rmdir can
+  remain busy until reboot; the append change does not remove those restrictions.
+- Shutdown with applications still open: after the Chromium/Codium OOM run,
+  checked sync left data inode 3468 allocated with zero mode/dtime. Preserve
+  `build/workloads/brook-default-20261017/data.img` and its fsck evidence. Audit
+  open-unlinked inode recovery across shutdown; do not infer that this was
+  caused by OOM. Quiesced append/browser acceptance disks pass offline checks.
+- GIMP profile migration: default-Brook launch and normal quit work, but the
+  existing `/data/home/.config/GIMP/3.0` tree belongs to root. Updates to theme.css,
+  pluginrc and gimprc fail with EACCES. Preserve original profile data/ownership
+  when migrating or provision a separate Brook-owned profile; verify saved
+  settings and image editing across reboot. Evidence: session
+  `4f5313ed306445708efc27d3e24b566e`. Do not describe this launch as full acceptance.
 
 - Evaluate LZ4-backed storage as a measured experiment, starting with immutable
   Nix-store content rather than changing writable ext2 semantics. Compare cold
