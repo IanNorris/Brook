@@ -274,7 +274,7 @@ def main():
             if (Path(store_dir).parent/'bin'/wrapper).is_file():
                 arguments = shlex.split(exec_cmd)[1:]
                 exec_cmd = shlex.join(['/nix/bin/' + wrapper, *arguments])
-                if binary == 'firefox':
+                if binary in ('firefox', 'codium', 'vscodium'):
                     exec_cmd = '--uid 1000 ' + exec_cmd
 
         entries.append((name, exec_cmd, icon_file, categories, Path(df).stem))

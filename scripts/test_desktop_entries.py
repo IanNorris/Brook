@@ -65,7 +65,7 @@ class DesktopEntriesTest(unittest.TestCase):
             (apps/'codium.desktop').write_text('[Desktop Entry]\nName=VSCodium\nExec=codium --reuse-window %F\n')
             self.assertIn('VSCodium\tcodium --reuse-window\t',collect_manifest())
             (root/'bin/brook-codium').write_text('#!/bin/sh\n')
-            self.assertIn('VSCodium\t/nix/bin/brook-codium --reuse-window\t',collect_manifest())
+            self.assertIn('VSCodium\t--uid 1000 /nix/bin/brook-codium --reuse-window\t',collect_manifest())
             (package/'bin/codium').unlink()
             (package/'bin/chromium').unlink()
             self.assertEqual(collect_manifest(),'')

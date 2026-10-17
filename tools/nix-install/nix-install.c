@@ -817,20 +817,21 @@ static void refresh_desktop_entries(void)
 
             if (!desktop_exec_exists(exec_cmd)) continue;
 
-            /* Browser startup requires Brook's tested Wayland/profile setup.
+            /* Browser/editor startup requires Brook's Wayland/profile setup.
              * Redirect only when both the real package and wrapper exist. */
-            const char *browsers[] = {"chromium", "firefox"};
-            for (unsigned bi = 0; bi < 2; ++bi) {
+            const char *browsers[] = {"chromium", "firefox", "codium", "vscodium"};
+            for (unsigned bi = 0; bi < sizeof(browsers) / sizeof(browsers[0]); ++bi) {
                 const char *browser = browsers[bi];
                 size_t blen = strlen(browser);
                 if (strncmp(exec_cmd, browser, blen) ||
                     (exec_cmd[blen] && exec_cmd[blen] != ' ')) continue;
                 char wrapper[64];
-                snprintf(wrapper, sizeof(wrapper), "/nix/bin/brook-%s", browser);
+                snprintf(wrapper, sizeof(wrapper), "/nix/bin/brook-%s",
+                         strcmp(browser, "vscodium") == 0 ? "codium" : browser);
                 if (access(wrapper, X_OK) != 0) continue;
                 char arguments[sizeof(exec_cmd)];
                 snprintf(arguments, sizeof(arguments), "%s", exec_cmd + blen);
-                const char *identity = bi == 1 ? "--uid 1000 " : "";
+                const char *identity = strcmp(browser, "chromium") == 0 ? "" : "--uid 1000 ";
                 if (strlen(identity) + strlen(wrapper) + strlen(arguments) >= sizeof(exec_cmd)) continue;
                 snprintf(exec_cmd, sizeof(exec_cmd), "%s%s%s", identity, wrapper, arguments);
             }

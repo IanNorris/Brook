@@ -131,8 +131,33 @@ state and temporary directories were fresh private codium-brook-test paths
 under the persistent home. This is an accepted explicit nonroot configuration;
 it does not prove the default root wrapper or mixed-owner existing profiles.
 The effects of NSS correction and the changed profile/launch configuration have
-not been isolated. Integrate the tested identity and configuration into the
-standard launcher and rerun GIMP/browsers before accepting the desktop candidate.
+not been isolated. The standard launcher integration is verified below;
+rerun GIMP/browsers before accepting the whole desktop candidate.
+
+### Standard Codium menu acceptance
+
+Session `8e017fb410e44128a5e17051daaa8b6b`, with branding kernel
+`3d458c5de54a597c964ed51059894987a3bb67117db24d10ec007e487c8e91c3`,
+verified the deployed wrapper through the actual Applications menu. Both host
+image discovery and the guest installer now generate
+`--uid 1000 /nix/bin/brook-codium` when the package and wrapper exist. The wrapper
+rejects root with an actionable launch command, uses the direct-spawn software
+Wayland configuration, and creates separate `VSCodium-brook` profile/extensions
+state and `codium-brook/tmp` beneath HOME. Existing root-run profiles are preserved.
+
+The candidate already contained Codium's store closure but lacked its installed
+desktop registration. Guest `nix-install brook-codium` registered that existing
+package and refreshed the menu to thirteen entries. Clicking VSCodium rendered
+the editor; native typing and Save As created
+`/data/home/codium menu acceptance.txt`. An independent Python read confirmed
+the exact three-line text and owner 1000:100. Closing the tab and reopening it
+through Ctrl+P rendered the same text. Normal window close returned to ten tasks
+with heap integrity OK. Checked shutdown and all three offline filesystem checks
+passed. Evidence is in `build/workloads/identity-20261017/`, with native capture
+`build/vm-bridge/8e017fb410e44128a5e17051daaa8b6b/artifacts/a91b7d4b0dea4e11b362606cd936d605.png`.
+This menu integration was tested in one boot; the earlier explicit configuration
+also passed reboot persistence. Extensions, debugger workflows, performance and
+broader authorization enforcement remain unaccepted.
 
 ## Delivery order and acceptance
 

@@ -1,15 +1,24 @@
 #!/nix/profile/bin/bash
 # Experimental software Wayland editor; Electron's sandbox is unsupported.
+# Launch as brook: run --uid 1000 /nix/bin/brook-codium [files...].
+# The installed-app manifest supplies that identity for menu launches.
 set -eu
+if [ "$EUID" -eq 0 ]; then
+  echo 'brook-codium: launch from Applications or use: run --uid 1000 /nix/bin/brook-codium [files...]' >&2
+  exit 64
+fi
 export HOME=/data/home
 export XDG_CONFIG_HOME=$HOME/.config XDG_CACHE_HOME=$HOME/.cache
 export XDG_DATA_HOME=$HOME/.local/share
-export TMPDIR=$XDG_CACHE_HOME/codium/tmp
+# Preserve the older root-run profile unchanged. New state belongs to brook.
+export XDG_STATE_HOME=$XDG_DATA_HOME/VSCodium-brook/state
+export TMPDIR=$XDG_CACHE_HOME/codium-brook/tmp
 export ELECTRON_OZONE_PLATFORM_HINT=wayland
-mkdir -p "$XDG_CONFIG_HOME/VSCodium" "$XDG_DATA_HOME/VSCodium/extensions" "$TMPDIR"
+mkdir -p "$XDG_CONFIG_HOME/VSCodium-brook" "$XDG_DATA_HOME/VSCodium-brook/extensions" "$XDG_STATE_HOME" "$TMPDIR"
 unset DISPLAY
 # Keep shared allocations on Brook's supported /dev/shm backend.
 exec /nix/profile/bin/brook-run /nix/profile/bin/codium \
-  --no-sandbox --disable-gpu --disable-crash-reporter --ozone-platform=wayland \
-  --user-data-dir="$XDG_CONFIG_HOME/VSCodium" \
-  --extensions-dir="$XDG_DATA_HOME/VSCodium/extensions" "$@"
+  --no-sandbox --no-zygote --disable-chromium-sandbox \
+  --disable-gpu --disable-crash-reporter --ozone-platform=wayland \
+  --user-data-dir="$XDG_CONFIG_HOME/VSCodium-brook" \
+  --extensions-dir="$XDG_DATA_HOME/VSCodium-brook/extensions" "$@"
