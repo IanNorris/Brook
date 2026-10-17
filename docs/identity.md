@@ -6,8 +6,9 @@ desktop; its UID support does not establish isolation between users.
 
 ## Current desktop
 
-The shell still launches applications as root by default. `run --uid 1000`
-selects the named compatibility identity `brook`, with primary GID 100 (`users`),
+The shell and native Terminal launch applications as `brook` by default,
+with UID 1000 and primary GID 100 (`users`). `run --uid 0` explicitly selects
+root for maintenance. The named desktop identity has
 matching new-home ownership and its synthetic passwd/group entries. Other UIDs
 retain the numeric UID-as-GID default unless `--gid` is supplied. All three IDs
 are set before ELF auxiliary-vector construction. USER/LOGNAME are root, brook,
@@ -18,13 +19,87 @@ state directories point into persistent `/data/home`.
 Existing homes and preferences retain their ownership at boot. Root and brook
 still share this home and runtime directory; named launch metadata does not
 resolve mixed-owner application profiles or establish an account boundary.
-Default desktop launch policy and a migration preserving existing state remain
-unfinished.
+The desktop default is implemented; legacy profile migration and the remaining
+permission audit are separate from that policy.
 
 Root and UID 1000 each wrote, fsynced and reopened a 90,112-byte file under HOME
 on an empty data volume, and verified it after a complete reboot. GIMP's generic
 desktop entry also launched and saved settings there on the reboot. See the
 17 October desktop acceptance notes in [workloads.md](workloads.md).
+
+## GIMP legacy profile migration
+
+Existing root-owned GIMP settings can be migrated with
+`scripts/migrate_desktop_profile.py`. Disk updates deploy it as
+`/boot/SCRIPTS/MIGRATE_PROFILE.PY`; installed guest Python is required. Stop GIMP,
+then use the kernel maintenance console or VM bridge (not ordinary Bash):
+
+```
+run --uid 0 /nix/profile/bin/python3 /boot/SCRIPTS/MIGRATE_PROFILE.PY
+run --uid 0 /nix/profile/bin/python3 /boot/SCRIPTS/MIGRATE_PROFILE.PY --apply
+```
+
+The first command reports a plan. Apply requires root and refuses a running
+GIMP, symlink maintenance paths, special entries or any profile UID other than
+root/Brook. Missing or already-owned profiles are no-ops. The tool copies only
+`.config/GIMP/3.0`, verifies its bytes, modes, ownership and mtimes, then retains
+the original inodes under `/data/.brook-profile-backups/gimp-*/original` and
+publishes a UID-1000:GID-100 working copy. Its GIMP parent directory also becomes
+Brook-owned; the parent's former ownership and mode are recorded in the journal.
+The original tree retains its ownership, modes, content and mtimes. Normal
+rename ctime changes and read atime effects are not forensic preservation.
+
+Copies use bounded buffers and do not follow profile symlinks. Original
+hardlinks/xattrs remain with the retained original inodes; working copies retain
+file bytes, modes, mtimes and link targets rather than hardlink relationships or
+xattrs. No unrelated HOME files or old documents are recursively re-owned.
+This is single-desktop maintenance, not an account/security boundary.
+
+Files, journals and directory transitions are flushed. Copy failures leave the
+original path intact; a failed second rename restores it. Interrupted cutover
+leaves `gimp.lock/transaction` pointing to the retained journal and prevents a
+second migration even when the original path is temporarily absent. Inspect
+that transaction before recovery; the tool does not guess which tree to replace.
+The regression's recovery only operates on its own private fixture.
+
+This work exposed an ext2 rename defect: rewriting a moved directory's `..`
+entry called the ordinary directory-touch helper, changing its mtime. The rename
+now preserves that mtime while updating ctime; ordinary parent entry changes
+still update parent times. This follows the separation in
+[Linux ext2 rename](https://github.com/torvalds/linux/blob/master/fs/ext2/namei.c).
+`scripts/workloads/rename_metadata.py` deliberately sets old timestamps so a
+same-second rename cannot hide the error. All nine cases pass on Linux and the
+fixed guest; the old guest fails both cross-parent directory cases. Guest checks
+run as root because nonroot symlink creation ownership remains a separate gap.
+
+`scripts/workloads/profile_migration.py` passes five guest groups: complete copy
+and preservation/idempotence, failed-copy preservation, failed-cutover rollback,
+interrupted-cutover refusal/recovery, and foreign-UID/symlink refusal. It checks
+that injected failures actually reach the intended operation. The host's narrow
+UID/GID mapping permits the symlink refusal case but skips four ownership cases;
+those skips are not Linux ownership-comparison passes.
+
+Kernel `c22675993ec5f98c18c7298cb27ed89c4dab6653e155840236a4f582bc69c83c`
+passed 21 hosted suites and the guest regressions. Session
+`a238069bad8c4ba89d8fd45383d352d3` migrated all 93 real GIMP profile entries.
+GIMP launched as Brook, imported the transparent B image, saved a 789824-byte XCF
+and exported a 286604-byte PNG. Both belong to 1000:100. The PNG's signature,
+638x822 dimensions, chunk CRCs and compressed data were validated. The working
+profile grew to 96 Brook-owned entries and persisted `(show-welcome-dialog no)`.
+The original 93 entries still match their journal. GIMP quit normally, returning
+to ten tasks with heap integrity OK; checked shutdown and all three offline
+filesystem checks passed.
+
+Reboot session `192dc0c1286e4c23a97dc131a8951d78` verified exact saved-image
+hashes/ownership, the same preferences and original backup, and migration's
+already-owned no-op. GIMP reopened the saved XCF without the welcome dialog or
+profile permission errors, then quit normally again. The run again reached ten
+tasks, heap integrity OK and three clean offline filesystem checks. Both runs
+used eight vCPUs, 4 GiB and software rendering with speaker output disabled.
+Evidence and the one-off image checker reside under
+`build/workloads/gimp-user-20261017/`. The earlier failed timestamp check and
+preserved original remain separately under `build/workloads/gimp-migration-20261017/`.
+Optional plugin faults and dialog stacking/xdg_foreign support remain open.
 
 ## Source findings
 
@@ -32,12 +107,12 @@ desktop entry also launched and saved settings there on the reboot. See the
 | --- | --- | --- |
 | Identity queries | All UID/GID queries return the real/effective/saved task credentials. ELF auxiliary vectors reflect launch/exec credentials and mark mismatched real/effective IDs with AT_SECURE. Required result pointers are validated. | Keep launch, fork, exec and credential-change regressions passing. |
 | Credential changes | setuid/setgid, setreuid/setregid and setresuid/setresgid track saved IDs and validate the old tuple before changing it. Raw syscalls change the calling thread; libc coordinates changes with SIGSETXID. Root authorization currently means effective UID 0. | Capability-aware authorization and set-ID executable handling remain unsupported; do not describe this as full Linux credential support. |
-| Groups and capabilities | Immutable, reference-counted supplementary lists are inherited by fork/clone and independently replaced; getgroups/setgroups validate buffers and the Linux 65536-entry limit. capget/capset return ENOSYS without writing buffers. Unsupported capability/security prctl options return EINVAL. | Ext2 existing-file opens now use supplementary groups; other filesystem and operation paths remain to audit. Audit the remaining prctl options: several legacy options still return success without implementing behavior. Filesystem IDs are coupled to effective IDs; setfsuid/setfsgid are unsupported. |
+| Groups and capabilities | Immutable, reference-counted supplementary lists are inherited by fork/clone and independently replaced; getgroups/setgroups validate buffers and the Linux 65536-entry limit. Tasks with all three UIDs nonzero support empty self capabilities; nonempty grants fail. Root/retained-root tuples return ENOSYS. Unsupported capability/security prctl options return EINVAL. | Ext2 existing-file opens now use supplementary groups; other filesystem and operation paths remain to audit. Audit the remaining prctl options: several legacy options still return success without implementing behavior. Filesystem IDs are coupled to effective IDs; setfsuid/setfsgid are unsupported. |
 | Inheritance | Fork and thread creation retain an owned group-list reference and snapshot all six IDs under the credential lock. Ordinary exec saves effective IDs and preserves real IDs/groups. Teardown releases the list, including failed creation paths. | Keep matching launch environment/passwd entries and verify repeated failure/cancellation cleanup. Define set-ID executable behavior separately. |
 | File open | `Ext2FsOpenModeChecked` requires both access bits for O_RDWR and uses effective UID, primary GID and supplementary groups. Denials return EACCES without alias fallback; O_TRUNC requires write access. Creation skips the new leaf inode check, and the explicit Nix bypass remains. | Check ancestor search and parent mutation permissions, audit other filesystems, and define the writable Nix mount policy. |
 | Path traversal and mutation | Path resolution and parent lookup have no complete directory search/mutation authorization contract. Nix can explicitly skip permission checks. | Audit mkdir, create, unlink, rmdir, rename, symlink, hard links, sticky directories and directory-relative operations; restrict the writable Nix service deliberately. |
 | Access checks | `AccessAt` validates flags and resolves paths, but implements existence rather than R/W/X permission evaluation, including AT_EACCESS. | Use real/effective credentials as requested and apply the same traversal rules as open/exec; cover descriptor and symlink variants. |
-| Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Ext2 ownership is currently 16-bit and rejects larger chown IDs, but file/directory creation still truncates larger effective IDs to 16 bits. | Test mode/ownership through every mutation path and all filesystems. Resolve 32-bit ownership and accurate nonroot group-change rules before exposing account creation. |
+| Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Ext2 ownership is currently 16-bit and rejects larger chown IDs, but file/directory creation still truncates larger effective IDs to 16 bits; symlink creation still assigns root ownership. | Test mode/ownership through every mutation path and all filesystems. Resolve 32-bit ownership and accurate nonroot group-change rules before exposing account creation. |
 | Runtime directory | Every shell application inherits `XDG_RUNTIME_DIR=/tmp`. Wayland and other IPC endpoints are shared. | Give a named desktop identity an owned, mode-0700 runtime directory with a defined lifetime; audit IPC peer credentials and access policy. |
 | Persistent preferences | HOME/XDG is persistent, but root apps and compatibility-UID apps share it. Browser wrappers explicitly select their own profiles. | Use the named desktop identity consistently in the default launcher and owned application state. Preserve existing data during any migration; report conflicts rather than silently replacing ownership. |
 

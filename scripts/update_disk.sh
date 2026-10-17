@@ -380,6 +380,10 @@ if [ -d "$data_scripts" ]; then
     done
 fi
 
+# --- Optional legacy-profile maintenance (requires guest Python and root) ---
+mmd -D s -i "${DISK_IMG}" "::SCRIPTS" 2>/dev/null || true
+sync_file "${SCRIPT_DIR}/migrate_desktop_profile.py" "SCRIPTS/MIGRATE_PROFILE.PY"
+
 # --- App shortcuts ---
 shortcuts_dir="${ROOT_DIR}/data/shortcuts"
 if [ -d "$shortcuts_dir" ]; then

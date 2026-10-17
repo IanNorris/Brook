@@ -59,7 +59,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Native text editing, save/reopen and normal exit verified with software Wayland; startup remains slow, Electron sandbox disabled |
 | [Blender](https://www.blender.org/) | 5.1.1 | 🚧 Blocked | Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
-| [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified across reboot; optional plugin discovery still has faults |
+| [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
 | [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer opens via Wayland and edits a real document; startup is slow and window-close behavior needs work |
 | [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | Brook compatibility build installs through guest `nix-install`; 720p video and OSS audio verified; window-close/SMP stability remains under investigation |
 
@@ -207,10 +207,10 @@ New captures use native 1920×1080 without upscaling. See
 <p align="center"><em>VSCodium — native editing and file persistence, captured at 1920×1080 with 130% editor zoom</em></p>
 
 <p align="center">
-  <a href="docs/images/brook_gimp_workflow_1080.png"><img src="docs/images/brook_gimp_workflow_1080.png" alt="GIMP 3 editing a drawing in Brook after saving and reopening it" width="960"></a>
+  <a href="docs/images/brook_gimp_workflow_1080.png"><img src="docs/images/brook_gimp_workflow_1080.png" alt="GIMP 3 running as Brook with the transparent B image saved as XCF and exported as PNG" width="960"></a>
 </p>
 
-<p align="center"><em>GIMP 3 — painting, XCF persistence and PNG export/import, captured at native 1920×1080</em></p>
+<p align="center"><em>GIMP 3 as brook — XCF persistence and PNG export, captured at native 1920×1080</em></p>
 
 <p align="center">
   <a href="docs/images/brook_settings_midnight_1080.png"><img src="docs/images/brook_settings_midnight_1080.png" alt="Brook Settings with native window chrome and the Midnight desktop theme applied" width="960"></a>

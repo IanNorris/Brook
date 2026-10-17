@@ -61,12 +61,15 @@
   `build/workloads/brook-default-20261017/data.img` and its fsck evidence. Audit
   open-unlinked inode recovery across shutdown; do not infer that this was
   caused by OOM. Quiesced append/browser acceptance disks pass offline checks.
-- GIMP profile migration: default-Brook launch and normal quit work, but the
-  existing `/data/home/.config/GIMP/3.0` tree belongs to root. Updates to theme.css,
-  pluginrc and gimprc fail with EACCES. Preserve original profile data/ownership
-  when migrating or provision a separate Brook-owned profile; verify saved
-  settings and image editing across reboot. Evidence: session
-  `4f5313ed306445708efc27d3e24b566e`. Do not describe this launch as full acceptance.
+- Legacy ownership: GIMP now has an explicit profile migration that retains its
+  original, with Brook-user save/export/reopen and settings persistence accepted
+  across reboot. See [migration procedure and evidence](identity.md#gimp-legacy-profile-migration).
+  Audit other old profiles and root-owned documents separately; this tool does
+  not recursively replace ownership across HOME or implement account isolation.
+- Window transients: GIMP's colour-profile and PNG export plugin dialogs can
+  appear behind another GIMP window and need selection/restoration from the
+  taskbar. The client reports missing xdg_foreign support. Investigate transient
+  relationships, stacking and presentation; keep it separate from profile access.
 
 - Evaluate LZ4-backed storage as a measured experiment, starting with immutable
   Nix-store content rather than changing writable ext2 semantics. Compare cold
