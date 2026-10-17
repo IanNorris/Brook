@@ -2,11 +2,20 @@
 #include <cassert>
 #include <cstring>
 #include <initializer_list>
+#include <string>
 #include "../../kernel/src/launcher_command.h"
 
 int main()
 {
     using brook::LauncherExecutableStart;
+    auto identity=[](const char* domain,const char* key){
+        brook::LauncherIdentity id;id.field(domain);id.field(key);char out[33];id.finish(out);return std::string(out);
+    };
+    assert(identity("desktop","org.Editor")==identity("desktop","org.Editor"));
+    assert(identity("desktop","org.Editor")!=identity("desktop","org.editor"));
+    assert(identity("desktop","same")!=identity("shortcut","same"));
+    assert(identity("ab","c")!=identity("a","bc"));
+    assert(identity("desktop","old-command").size()==32);
     assert(!LauncherExecutableStart(nullptr));
     assert(!LauncherExecutableStart(" \t"));
     assert(!std::strcmp(LauncherExecutableStart("firefox --name firefox"), "firefox --name firefox"));

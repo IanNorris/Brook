@@ -43,6 +43,19 @@ class Ui(Jobs):
             'capture_started_host_monotonic':started,'capture_ended_host_monotonic':time.monotonic(),
             'consistency':'Window values captured under one WM lock; process liveness sampled afterwards; no frame correspondence asserted'}
 
+    def apps(self,session):
+        deadline=time.monotonic()+20
+        data,caps=self.capabilities(session,deadline)
+        if caps.get('apps_api')!=1:raise RuntimeError('Guest app discovery is unsupported; update the guest kernel')
+        generation,boot=data['generation'],caps['boot_id']
+        started=time.monotonic()
+        reply=self.query(session,generation,'bridge ui apps',deadline,boot_id=boot)
+        for app in reply['apps']:
+            app['reference']={'app_id':app['app_id'],'catalog_generation':reply['catalog_generation'],
+                'session_generation':generation,'guest_boot_id':boot}
+        return {'session':session,'generation':generation,'guest_boot_id':boot,**reply,
+            'capture_started_host_monotonic':started,'capture_ended_host_monotonic':time.monotonic()}
+
     @staticmethod
     def validate_reference(window):
         if not isinstance(window,dict) or set(window)!={'window_id','incarnation','session_generation','guest_boot_id'}:

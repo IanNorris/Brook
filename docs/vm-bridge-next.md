@@ -8,7 +8,8 @@ structured command jobs, bounded separate output, exit/descendant/EOF tracking,
 durable request identities, verified staging recovery and reserved control
 capacity. Bridge 0.5.0 passes [isolated acceptance](vm-bridge-ui-acceptance.md) with boot-epoch guarded jobs and semantic
 window discovery/actions, provider/connection-origin identity and per-action
-window observations. Actual launcher activation, output artifacts after shutdown,
+window observations. Bridge 0.5.1 adds read-only app catalog discovery and fixes transient launcher
+coalescing/completion races. Actual semantic launcher activation, output artifacts after shutdown,
 job cancellation, frame/process/error observation bundles and remaining sections
 are still proposed.
 Current behavior is documented in the

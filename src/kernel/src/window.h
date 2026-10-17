@@ -392,6 +392,7 @@ static constexpr uint32_t LAUNCHER_ICON_PX = 24;  // Icon dimensions (24x24 pixe
 static constexpr uint32_t LAUNCHER_ICON_BYTES = LAUNCHER_ICON_PX * LAUNCHER_ICON_PX * 4;
 
 struct LauncherItem {
+    char catalogId[33], specification[33];
     char title[48];
     char appId[128];       // desktop basename without .desktop (optional manifest field)
     char executable[64];  // executable basename for native/older manifest matching
@@ -401,6 +402,13 @@ struct LauncherItem {
     bool valid;
     bool isDesktopEntry;   // true if sourced from .desktop file (exec directly)
 };
+
+struct WmDebugApp {
+    char id[33],title[48],desktopAppId[128],executable[64];
+    bool desktop,eligible;
+};
+uint32_t WmSnapshotDebugApps(WmDebugApp* out,uint32_t capacity,
+                             uint32_t* generation,uint64_t* builtTick);
 
 // Load shortcut files from /boot/SHORTCUTS/ directory.
 void WmLauncherLoad();

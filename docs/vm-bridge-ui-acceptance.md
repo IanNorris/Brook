@@ -79,3 +79,41 @@ coordinate input and index-based focus do not yet share the new boot guard.
 Manual user-started VM acceptance, adversarial syscall registration cases and
 remaining spec items are follow-ups. This checkpoint is not full-spec or
 real-workload acceptance.
+
+
+## Catalog discovery follow-up — bridge 0.5.1
+
+`vm_apps` now exposes the same pinned catalog as the Applications menu. The
+follow-up used the same isolated 8-vCPU/4-GiB software-rendered setup, with kernel
+SHA-256 `979d1fe4ed026c94121e5b7227b1aafa778669513a03dd60481207d85b597042`.
+Evidence is under the same ignored workload directory:
+
+- `apps-acceptance/apps.json` and `catalog-events.json`: 19 original entries,
+  stable IDs across refresh, an actual Mousepad menu click with a nonzero launch
+  tag and registered client origin, followed by graceful window/group exit.
+- Two new desktop entries with identical titles and different IDs both appeared.
+  Reusing the ID too rejected the entire candidate; the serial rejection marker
+  and unchanged active generation establish that the old catalog was retained.
+- Removing a test executable after publication, without triggering another
+  refresh, then clicking its visible entry produced `dispatch failed result=-2`.
+  This exercised worker revalidation rather than just hiding the entry on rebuild.
+- The original manifest/catalog was restored. Checked sync/shutdown, serial
+  screening and all three read-only filesystem checks passed (`apps-final-check`).
+- 28 hosted kernel tests and the 111-test bridge suite passed (five optional
+  encoder tests skipped). State-machine cases retain coalescing through an early
+  window, preserve later dispatch failure, reject incompatible specifications,
+  and keep in-flight identity through timeout/dismissal. Exact namespace/case and
+  field-separated catalog keys have hosted coverage.
+
+`tools/vm_bridge/accept_apps.py` packages the live discovery/menu workflow;
+`--negative-tests` explicitly enables the temporary manifest edits on disposable
+images. The checked-in script also passed all negative cases on a second fresh boot
+(`apps-script-acceptance/apps.json`); all 19 app IDs matched across both boots.
+Its fixture requires an empty 1920×1080 desktop at 100% scale and at most
+40 initial entries. This remains pixel-menu acceptance, not semantic activation.
+
+Availability is validated at catalog build and rechecked by the launch worker;
+it is not a fresh filesystem scan per `vm_apps` call. Duplicate legacy shortcut
+and desktop entries may still represent the same package through different
+launch configurations. Durable `vm_launch` dispatch/history, single-instance
+outcome correlation, and the remainder of the specification are still pending.

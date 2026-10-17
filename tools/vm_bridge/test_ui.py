@@ -29,9 +29,10 @@ class UiTests(unittest.TestCase):
         if parts[1]=='epoch':
             if len(parts)>2 and self.boot=='0'*32:self.boot=parts[3]
             return {'boot_id':self.boot}
-        if parts[2]=='caps':return {'ui_api':1,'boot_id':self.boot}
+        if parts[2]=='caps':return {'ui_api':1,'apps_api':1,'boot_id':self.boot}
         if parts[-1]!=self.boot:return {'ui_error':'Stale guest boot'}
         action=parts[2]
+        if action=='apps':return {'catalog_generation':17,'catalog_built_tick_ms':40,'apps':[{'app_id':'d'*32,'title':'Editor','launch_eligible':True}]}
         if action=='windows':return {'windows':[dict(row) for row in self.rows],'sample_tick_ms':99}
         if action=='process':return {'live_group_tasks':self.client_tasks,'sample_tick_ms':100}
         if action=='status':
@@ -50,6 +51,14 @@ class UiTests(unittest.TestCase):
 
     def submit(self,action='minimize',**options):
         return self.ui.submit(self.session,self.ref,action,self.ident,wait_s=0,**options)
+
+    def test_apps_return_catalog_and_boot_bound_references_without_a_frame(self):
+        result=self.ui.apps(self.session)
+        self.assertEqual(result['apps'][0]['reference'],{'app_id':'d'*32,'catalog_generation':17,
+            'session_generation':'generation','guest_boot_id':self.boot})
+        self.assertEqual(result['catalog_built_tick_ms'],40)
+        self.assertEqual(self.mutations,0)
+        self.assertTrue(self.calls[-1].startswith('bridge ui apps '))
 
     def test_action_returns_observation_and_large_incarnation_without_precision_loss(self):
         result=self.submit()

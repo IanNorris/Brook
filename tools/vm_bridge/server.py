@@ -246,7 +246,7 @@ def doctor(session, **_):
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
-                  "generation": data["generation"], "server_version": "0.5.0",
+                  "generation": data["generation"], "server_version": "0.5.1",
                   "bridge_capabilities": {"artifact_delivery": {"revision": 1,
                       "default": "references", "include_image": True,
                       "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
@@ -401,6 +401,10 @@ def stats(session, memory_details=False, **_):
 
 def window_ui():
     return Ui(REGISTRY,load_session,session_lock,guest,write_json)
+
+
+def apps(session,**_):
+    return window_ui().apps(session)
 
 
 def windows(session,**_):
@@ -852,6 +856,7 @@ register("vm_guest_run",guest_run,"Run structured guest argv with separate outpu
 register("vm_job",job_status,"Recover/wait for a guest operation by ID; return exit, descendants, separate byte-cursor output and EOF; never repeats execution",{**SESSION,
     "operation_id":STR,"stdout_offset":INT,"stderr_offset":INT,"output_limit":INT,"wait_s":NUM},["session","operation_id"],True)
 WINDOW_REF=schema({"window_id":INT,"incarnation":STR,"session_generation":STR,"guest_boot_id":STR},["window_id","incarnation","session_generation","guest_boot_id"])
+register("vm_apps",apps,"Read the published installed-app/shortcut catalog, build-time availability and boot/catalog-bound references; no launches",SESSION,["session"],True)
 register("vm_windows",windows,"Snapshot native/Wayland windows with boot-bound references, provider/client identities, geometry and supported actions",SESSION,["session"],True)
 register("vm_window",window_action,"Apply a semantic compositor action once; return request status and windows. Close dispatch, window disappearance and exact client-group exit are separate conditions",{**SESSION,
     "window":WINDOW_REF,"action":{"type":"string","enum":list(Ui.actions)},"request_id":STR,
@@ -907,7 +912,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.5.0"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.5.1"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":

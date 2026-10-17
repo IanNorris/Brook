@@ -152,6 +152,7 @@ struct LauncherSnapshot {
     LauncherItem items[WM_LAUNCHER_MAX_ITEMS];
     uint32_t count;
     uint32_t generation;
+    uint64_t builtTick;
     uint32_t refs;
     uint32_t* applicationIcon;
     uint32_t* terminalIcon;
@@ -166,7 +167,7 @@ static uint32_t g_launcherRequested = 1;
 static bool g_launcherWorkerStarted = false;
 static bool g_launcherLoaded = false;
 static bool g_launcherOpen = false;
-static bool g_launcherQueueFull = false;
+static int g_launcherError = 0;
 static uint32_t g_launcherScroll = 0;
 static void LauncherStartWorker();
 
@@ -225,7 +226,7 @@ void WmLaunchFeedbackPoll()
     }
     bool busy = false;
     SpinLockAcquire(&g_launchLock);
-    for (const auto& e : g_launches.entries) busy |= e.busy();
+    for (const auto& e : g_launches.entries) busy |= e.busy()&&!e.windowObserved;
     SpinLockRelease(&g_launchLock);
     __atomic_store_n(&g_launchBusy, busy, __ATOMIC_RELEASE);
     CompositorMarkDirty(); // Also erase the final expired notice.
@@ -260,6 +261,23 @@ public:
     LauncherReadGuard(const LauncherReadGuard&) = delete;
     LauncherReadGuard& operator=(const LauncherReadGuard&) = delete;
 };
+
+uint32_t WmSnapshotDebugApps(WmDebugApp* out,uint32_t capacity,
+                             uint32_t* generation,uint64_t* builtTick)
+{
+    LauncherReadGuard guard;const auto& catalog=guard.get();
+    *generation=catalog.generation;*builtTick=catalog.builtTick;
+    uint32_t count=0;
+    for(uint32_t i=0;i<catalog.count&&count<capacity;++i) {
+        const auto& item=catalog.items[i];auto& app=out[count++];app={};
+        // Fixed arrays have identical extents; no live catalog pointers escape.
+        memcpy(app.id,item.catalogId,sizeof(app.id));memcpy(app.title,item.title,sizeof(app.title));
+        memcpy(app.desktopAppId,item.appId,sizeof(app.desktopAppId));
+        memcpy(app.executable,item.executable,sizeof(app.executable));
+        app.desktop=item.isDesktopEntry;app.eligible=item.valid;
+    }
+    return count;
+}
 
 void WmRequestLauncherRefresh()
 {
@@ -1493,7 +1511,7 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     }
     SpinLockAcquire(&g_launchLock);
     for (unsigned i = 0; i < LaunchFeedbackTable::Capacity; ++i) {
-        if (g_launches.entries[i].phase == LaunchPhase::Empty) continue;
+        if (!g_launches.entries[i].present()) continue;
         if (g_taskbarPageTarget == -10 - static_cast<int>(i)) focused = total;
         ids[total++] = -10 - static_cast<int>(i);
     }
@@ -1947,7 +1965,7 @@ static bool LauncherLoadDesktopEntries(LauncherSnapshot& launcher)
         {
             LauncherItem* item = nullptr;
             for (uint32_t i = 0; i < launcher.count; ++i)
-                if (WmEqualI(launcher.items[i].title, fields[0])) { item = &launcher.items[i]; break; }
+                if (!launcher.items[i].isDesktopEntry && WmEqualI(launcher.items[i].title, fields[0])) { item = &launcher.items[i]; break; }
             if (!item)
             {
                 if (launcher.count == WM_LAUNCHER_MAX_ITEMS) { ok = false; break; }
@@ -1979,6 +1997,29 @@ static void FreeLauncherSnapshot(LauncherSnapshot* snapshot)
     for (uint32_t i = 0; i < snapshot->count; ++i) kfree(snapshot->items[i].iconPixels);
     kfree(snapshot->applicationIcon); kfree(snapshot->terminalIcon); kfree(snapshot->appsIcon);
     kfree(snapshot);
+}
+
+static bool IdentifyLauncherItems(LauncherSnapshot& catalog)
+{
+    const char* hex="0123456789abcdef";char generation[9];
+    for(unsigned i=0;i<8;++i)generation[i]=hex[(catalog.generation>>((7-i)*4))&15];
+    generation[8]=0;
+    for(uint32_t i=0;i<catalog.count;++i) {
+        auto& item=catalog.items[i];LauncherIdentity identity;
+        identity.field(item.isDesktopEntry?"desktop":"shortcut");
+        // New manifests carry the exact desktop-file basename. For legacy
+        // manifests without it, use the command and label as an explicit fallback.
+        if(item.isDesktopEntry&&item.appId[0])identity.field(item.appId);
+        else {identity.field(item.scriptPath);if(item.isDesktopEntry)identity.field(item.title);}
+        identity.finish(item.catalogId);
+        for(uint32_t j=0;j<i;++j)if(!strcmp(item.catalogId,catalog.items[j].catalogId)) {
+            SerialPuts("WM: duplicate/colliding launcher identity; retaining previous catalog\n");return false;
+        }
+        LauncherIdentity spec;spec.field(item.catalogId);spec.field(item.scriptPath);
+        spec.field(item.isDesktopEntry?"desktop":"shortcut");spec.field(generation);
+        spec.finish(item.specification);
+    }
+    return true;
 }
 
 static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
@@ -2025,11 +2066,13 @@ static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
         ok = false;
     }
     if (ok) ok = LauncherLoadDesktopEntries(*snapshot);
+    if (ok) ok = IdentifyLauncherItems(*snapshot);
     if (!ok) {
         SerialPuts("WM: launcher rebuild failed; previous snapshot retained\n");
         FreeLauncherSnapshot(snapshot);
         return nullptr;
     }
+    snapshot->builtTick=ApicTickCount();
     return snapshot;
 }
 
@@ -2077,7 +2120,10 @@ static void LauncherWorker(void*)
             const uint64_t previous = self->launchId;
             self->launchId = token;
             int result;
-            if (desktop) {
+            char executable[64];
+            const bool available=desktop?LauncherExecutable(command,executable,sizeof(executable)):ShortcutRequirementsMet(command);
+            if(!available)result=-2;
+            else if (desktop) {
                 char script[512];
                 const char* hdr = "set wm\nset vfb none\nrun --once /nix/bin/waylandd\nrun ";
                 uint32_t si = 0;
@@ -2092,7 +2138,7 @@ static void LauncherWorker(void*)
             SpinLockAcquire(&g_launchLock);
             g_launches.Complete(token, result >= 0, ApicTickCount());
             SpinLockRelease(&g_launchLock);
-            SerialPrintf("WM: launch token %lu dispatch %s\n", token, result >= 0 ? "complete" : "failed");
+            SerialPrintf("WM: launch token %lu dispatch %s result=%d\n", token, result >= 0 ? "complete" : "failed",result);
             CompositorMarkDirty();
             CompositorWake();
         }
@@ -2139,6 +2185,7 @@ void WmLauncherToggle()
     if (!g_launcherLoaded) return;
     g_launcherOpen = !g_launcherOpen;
     if (g_launcherOpen) {
+        g_launcherError = 0;
         g_launcherScroll = 0;
         WmRequestLauncherRefresh(); // also catches installs/removals outside the installer
     }
@@ -2263,7 +2310,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
     if (pw > WmMetric(56)) WmRenderString(backBuffer, stride, screenW, screenH,
                    px + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)) + static_cast<int>(WmMetric(4)),
                    iy + static_cast<int32_t>(textYOff),
-                   g_launcherQueueFull ? "Launch queue full" : "Applications", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - WmMetric(56));
+                   g_launcherError == -2 ? "App launch already pending" : g_launcherError ? "Launch queue full" : "Applications", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - WmMetric(56));
     iy += WmMetric(LAUNCHER_ITEM_HEIGHT);
 
     // Separator line below header
@@ -2391,9 +2438,10 @@ void WmLauncherExec(int itemIdx)
         if (itemIdx < 0 || itemIdx >= static_cast<int>(launcher.count) || !launcher.items[itemIdx].valid) return;
         const auto& item = launcher.items[itemIdx];
         SpinLockAcquire(&g_launchLock);
+        bool created=false;
         slot = g_launches.Begin(ApicTickCount(), __atomic_load_n(&g_windowIdentity, __ATOMIC_ACQUIRE),
-                               item.title, item.appId, item.executable);
-        if (slot >= 0 && g_launches.entries[slot].phase == LaunchPhase::Queued) {
+                               item.title, item.appId, item.executable,item.catalogId,item.specification,&created,launcher.generation);
+        if (slot >= 0 && created) {
             auto& request = g_launchRequests[slot];
             WmStrCopy(request.command, item.scriptPath, sizeof(request.command));
             request.desktop = item.isDesktopEntry;
@@ -2402,12 +2450,12 @@ void WmLauncherExec(int itemIdx)
         }
         SpinLockRelease(&g_launchLock);
     }
-    g_launcherQueueFull = slot < 0;
+    g_launcherError = slot < 0 ? slot : 0;
     g_launcherOpen = slot < 0;
     if (slot >= 0) {
         g_taskbarPageTarget = -10 - slot;
         __atomic_store_n(&g_launchBusy, true, __ATOMIC_RELEASE);
-    } else SerialPuts("WM: launcher request queue full\n");
+    } else SerialPuts(slot==-2?"WM: same app has pending launch from older catalog\n":"WM: launcher request queue full\n");
     CompositorMarkDirty();
     CompositorWake();
 }

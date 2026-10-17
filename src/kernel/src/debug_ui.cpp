@@ -153,7 +153,7 @@ bool DebugUiHandleCommand(const char* command) {
     }
     if(*at||!count){Error("Invalid fields");return true;}
     if(count==1&&!strcmp(args[0],"caps")) {
-        Json json;char boot[33];DebugEpochCopy(boot);json.text("{\"boot_id\":");json.string(boot);json.text(",\"ui_api\":1,\"max_requests\":256,\"max_queued\":16,\"dedup_retention\":\"until_reboot\",\"launcher\":false,\"window_actions\":[\"focus\",\"minimize\",\"maximize\",\"restore\",\"close\"]}");json.finish();return true;
+        Json json;char boot[33];DebugEpochCopy(boot);json.text("{\"boot_id\":");json.string(boot);json.text(",\"ui_api\":1,\"max_requests\":256,\"max_queued\":16,\"dedup_retention\":\"until_reboot\",\"launcher\":false,\"apps_api\":1,\"window_actions\":[\"focus\",\"minimize\",\"maximize\",\"restore\",\"close\"]}");json.finish();return true;
     }
     if(count<2||!DebugEpochMatches(args[count-1])){Error("Stale guest boot");return true;}
     --count;
@@ -166,6 +166,27 @@ bool DebugUiHandleCommand(const char* command) {
         }SpinLockRelease(&requestLock);
         Json json;json.text("{\"user_takeover\":");json.text(enabled?"true":"false");
         json.field("queued_cancelled",cancelled);json.field("already_dispatched",inflight);json.text("}");json.finish();return true;
+    }
+    if(count==1&&!strcmp(args[0],"apps")) {
+        auto* apps=static_cast<WmDebugApp*>(kmalloc(sizeof(WmDebugApp)*WM_LAUNCHER_MAX_ITEMS));
+        if(!apps){Error("Catalog snapshot allocation failed");return true;}
+        uint32_t generation=0;uint64_t built=0;
+        const uint32_t total=WmSnapshotDebugApps(apps,WM_LAUNCHER_MAX_ITEMS,&generation,&built);
+        Json json(128*1024);json.text("{\"catalog_generation\":");json.number(generation);
+        json.boolean("catalog_ready",generation!=0);
+        json.field("catalog_built_tick_ms",built);json.field("sample_tick_ms",ApicTickCount());
+        json.text(",\"availability_scope\":\"Validated during catalog build; worker revalidates before dispatch\",\"apps\":[");
+        for(uint32_t i=0;i<total;++i) {
+            const auto& app=apps[i];if(i)json.text(",");
+            json.text("{\"app_id\":");json.string(app.id);json.text(",\"title\":");json.string(app.title);
+            json.text(",\"desktop_app_id\":");json.string(app.desktopAppId);
+            json.text(",\"executable\":");json.string(app.executable);
+            json.text(",\"source\":");json.string(app.desktop?"installed_desktop_entry":"validated_shortcut");
+            json.boolean("launch_eligible",app.eligible);
+            json.text(",\"availability\":");json.string(app.desktop?"executable_validated_at_build":"requirements_validated_at_build");
+            json.text("}");
+        }
+        json.text("]}");kfree(apps);json.finish();return true;
     }
     if(count==1&&!strcmp(args[0],"windows")) {
         auto* windows=static_cast<WmDebugWindow*>(kmalloc(sizeof(WmDebugWindow)*WM_MAX_WINDOWS));

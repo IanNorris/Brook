@@ -950,7 +950,7 @@ static int ExecCommand(int argc, const char* const* argv)
     {
         if (!WmIsActive()) {
             KPrintf("kconsole: window manager not active (use 'set wm' first)\n");
-            return 1;
+            return -1;
         }
         KernelConsoleSpawn();
         return 0;

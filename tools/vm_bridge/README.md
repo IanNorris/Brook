@@ -62,6 +62,7 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_input` | Ordered key/chord/text/pointer/scroll/relative/hold/wait batches. Coordinates require the current `frame_id`; crop/scale map back to native coordinates. US ASCII text only; holds release at batch end/cancel. Observe to verify reaction. |
 | `vm_logs`, `vm_wait` | Bounded serial/QEMU byte cursors or bounded serial-substring waits. Logs survive VM exit. |
 | `vm_guest_run` | Structured `argv`, optional `cwd`/`env`/`uid`, required `request_id`, and optional `wait_s` return a recoverable command job with isolated output and exit status. Default identity is Brook. The explicitly legacy `command: "run …"` form still returns launch ACK only and fits 220 bytes. |
+| `vm_apps` | Published installed-app/validated-shortcut catalog, stable IDs, generation-bound references and build-time availability. Does not launch apps. |
 | `vm_windows`, `vm_window`, `vm_ui` | Boot-bound native/Wayland discovery, semantic actions, bundled window state and read-only request recovery. |
 | `vm_job` | Inspect/wait for an `operation_id`, with independent stdout/stderr byte cursors and real exit/descendant/EOF state. Does not execute or resume commands. |
 | `vm_guest` | Existing window/process listings and focus by window index (the `pid` argument). |
@@ -97,6 +98,41 @@ report `created_host_monotonic: null`; `described_host_monotonic` is the current
 description time. This does not invent capture timing from a file's wall clock.
 `vm_doctor.bridge_capabilities.artifact_delivery` advertises revision 1. Reload
 an already running MCP server to receive these source/schema changes.
+
+### App discovery (bridge 0.5.1)
+
+`vm_apps` reads the same immutable catalog used by the Applications menu. It
+returns exact desktop-file identity separately from an opaque `app_id`, a
+`catalog_generation`, `catalog_built_tick_ms` and a boot/session-bound reference.
+IDs remain stable across catalog rebuilds; exact identity bytes and source
+namespace matter. Legacy shortcuts use their path; older desktop manifests
+without IDs fall back to command plus title. Duplicate/colliding IDs reject the
+candidate catalog and preserve the previous menu. Distinct desktop entries with
+the same display title remain distinct.
+
+Availability describes executable/profile validation or shortcut requirements
+**at catalog build time**, not a fresh per-query filesystem scan. `catalog_ready`
+is false before first publication. The launch worker revalidates dependencies
+and executable/profile availability before executing a request. `launch_eligible`
+means the entry passed catalog validation, not that queue capacity or application
+startup is guaranteed.
+
+Launcher requests now retain their identity until dispatch completes even if a
+window appears first. An early window cannot hide a later dispatch failure;
+coalescing never overwrites an admitted command/icon, and an incompatible
+catalog generation returns "App launch already pending". Absence of a live
+launch-tagged process does not prove a single-instance handoff failed. It keeps
+waiting for window evidence or the existing five-minute timeout.
+
+`accept_apps.py --session SESSION --out build/apps-acceptance` tests discovery,
+stable IDs after refresh and a real Mousepad menu click on an empty disposable
+1920×1080 desktop at 100% scale (up to 40 initial entries). The optional
+`--negative-tests` temporarily edits/restores the manifest as maintenance UID 0
+to check equal titles, duplicate IDs and a removed executable. It must use private
+test images. The negative cases retain their rejection log evidence.
+
+`vm_launch` is still pending durable dispatch history and status correlation.
+A real menu-click smoke test remains separate from future semantic activation.
 
 ### Semantic windows (bridge 0.5.0)
 

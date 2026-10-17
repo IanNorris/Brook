@@ -104,8 +104,10 @@ the table distinguishes tested behavior from remaining limitations.
   Fresh-image launcher deployment and a larger VLC install also passed.
   See [Gallery status](docs/app-gallery.md)
   for recovery and deployment work still open.
-- **VM control bridge:** VM-only screenshots and input, guest command launches,
-  logs, CPU/context-switch profiles, OS statistics, silent-output PCM capture,
+- **VM control bridge:** screenshots returned as artifact references, VM input,
+  recoverable command jobs with separate output and exit status, native/Wayland
+  window controls and installed app discovery; logs, CPU/context-switch profiles,
+  OS statistics, silent-output PCM capture,
   bounded direct [video/audio recording](docs/vm-recording.md),
   and bounded post-panic memory/register inspection. See the
   [bridge tools](tools/vm_bridge/README.md).

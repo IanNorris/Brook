@@ -35,6 +35,13 @@ Changed arguments need a fresh request ID. Stop/reset invalidates active jobs;
 retrieve useful output before shutdown. A cancelled wait leaves the job running.
 These jobs do not exercise launcher UI or add automatic framebuffer windows.
 
+Use vm_apps for installed-app/shortcut discovery without taking a screenshot.
+Its app reference binds the published catalog generation, session and guest boot;
+app IDs are distinct from a window's desktop app_id. Availability is validated at
+catalog build, not freshly probed by each read. Semantic vm_launch remains pending;
+use actual menu clicks when testing launcher behavior, and label command jobs as
+a different path.
+
 Prefer vm_windows and vm_window for semantic UI control. Pass the exact returned
 window reference, action and fresh request_id; restore also requires an explicit
 restore_target (previous, normal or maximized). Each action returns window state.

@@ -3,6 +3,21 @@
 
 namespace brook {
 
+// Opaque deterministic catalog keys, not authentication tokens. Catalog builds
+// reject duplicate IDs/collisions before publication; admission also binds the
+// generation. Hash namespaced exact bytes, with explicit field separators.
+class LauncherIdentity {
+    uint64_t first=14695981039346656037ULL,second=1099511628211ULL;
+    void byte(uint8_t value) {first=(first^value)*1099511628211ULL;second=(second^value)*1099511628211ULL;}
+public:
+    void field(const char* value) {if(value)while(*value)byte(static_cast<uint8_t>(*value++));byte(0);}
+    void finish(char out[33]) const {
+        const char* digits="0123456789abcdef";
+        for(unsigned i=0;i<16;++i){out[i]=digits[(first>>((15-i)*4))&15];out[16+i]=digits[(second>>((15-i)*4))&15];}
+        out[32]=0;
+    }
+};
+
 // Manifest commands use the shell's run syntax. Validate the actual program,
 // not a supported run option. UID is bounded to the shell's signed override.
 inline const char* LauncherExecutableStart(const char* command)
