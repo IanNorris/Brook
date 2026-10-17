@@ -23,6 +23,16 @@ US-ASCII text and bounded waits; holds last only within a batch. An injection
 acknowledgement does not prove the guest reacted: observe again or check logs.
 Respect takeover. Never substitute host mouse/keyboard/clipboard APIs.
 
+Use vm_observe include=[frame,windows,processes,launches,errors] for a bundle, or
+omit frame to avoid its copy/PNG/QEMU-pause cost. It returns per-component states,
+intervals and boot-bound references. Snapshots are not atomic and frame/window
+correspondence is unverified; inspect stale/partial states and identity_error.
+Pass errors.next_cursor back as since_event_cursor for incremental diagnostics.
+Serial pattern scanning is best-effort, not a lossless event stream; check dropped
+bytes, rotation/reset, more and pending-line fields. Task snapshots are bounded
+and report truncation. Panic frame geometry may be from an earlier guest boot and
+is explicitly unverified; no ordinary guest metadata is available after panic.
+
 Prefer vm_guest_run with argv, request_id (fresh 32-character lowercase hex),
 optional cwd/env and wait_s. It defaults to Brook UID 1000, cwd/home /data/home,
 and null stdin. Use real absolute executable paths. Retrieve longer operations

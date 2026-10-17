@@ -2488,6 +2488,13 @@ bool WmSnapshotLaunch(uint64_t token,LaunchRecord* out)
     SpinLockRelease(&g_launchLock);return index>=0;
 }
 
+uint32_t WmSnapshotLaunches(LaunchRecord* out,uint32_t capacity)
+{
+    uint32_t count=0;SpinLockAcquire(&g_launchLock);
+    for(const auto& r:g_launchHistory.records)if(r.token&&count<capacity)out[count++]=r;
+    SpinLockRelease(&g_launchLock);return count;
+}
+
 void WmCancelBridgeQueuedLaunches(uint32_t* cancelled,uint32_t* startedOrShared)
 {
     *cancelled=*startedOrShared=0;

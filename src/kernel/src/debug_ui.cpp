@@ -110,9 +110,8 @@ const char* PhaseName(Phase phase) {
     case Phase::Empty:return "empty";
     }return "unknown";
 }
-void SerializeLaunch(Json& json,uint64_t token) {
-    LaunchRecord launch{};
-    if(!token||!WmSnapshotLaunch(token,&launch)){json.text("null");return;}
+void SerializeLaunchRecord(Json& json,const LaunchRecord& launch,bool sampleLiveness) {
+    const uint64_t token=launch.token;
     json.text("{\"token\":\"");json.number(token);json.text("\",\"state\":");
     json.string(LaunchHistory::State(launch,ApicTickCount()));
     json.boolean("started",launch.started);json.boolean("dispatch_finished",launch.dispatchFinished);
@@ -133,7 +132,65 @@ void SerializeLaunch(Json& json,uint64_t token) {
     json.text(",\"started_tick_ms\":");if(launch.startedTick)json.number(launch.startedTick);else json.text("null");
     json.text(",\"dispatch_tick_ms\":");if(launch.dispatchTick)json.number(launch.dispatchTick);else json.text("null");
     json.boolean("cancelled",launch.cancelled);json.boolean("bridge_only",launch.bridgeOnly);
-    json.boolean("has_live_launch_tagged_processes",SchedulerLaunchHasLiveProcesses(token));
+    if(sampleLiveness)json.boolean("has_live_launch_tagged_processes",SchedulerLaunchHasLiveProcesses(token));
+    else json.text(",\"has_live_launch_tagged_processes\":null");
+    json.text("}");
+}
+
+void SerializeLaunch(Json& json,uint64_t token) {
+    LaunchRecord launch{};
+    if(!token||!WmSnapshotLaunch(token,&launch)){json.text("null");return;}
+    SerializeLaunchRecord(json,launch,true);
+}
+void Observe(Json& json,uint32_t mask) {
+    json.text("{\"observation_api\":1,\"windows\":");
+    if(mask&1) {
+        auto* windows=static_cast<WmDebugWindow*>(kmalloc(sizeof(WmDebugWindow)*WM_MAX_WINDOWS));
+        if(!windows){json.text("{\"error\":\"Snapshot allocation failed\"}");}
+        else {
+            const auto begin=ApicTickCount();uint64_t end=0;
+            const auto count=WmSnapshotDebugWindows(windows,WM_MAX_WINDOWS,&end);
+            json.text("{\"snapshot_started_tick_ms\":");json.number(begin);json.field("snapshot_ended_tick_ms",end);
+            json.text(",\"state_revision\":null,\"frame_correspondence\":\"unverified\",\"process_liveness\":\"rolling after WM snapshot\",\"windows\":[");
+            for(uint32_t i=0;i<count;++i){if(i)json.text(",");SerializeWindow(json,windows[i]);}
+            json.text("]}");kfree(windows);
+        }
+    }else json.text("null");
+    json.text(",\"processes\":");
+    if(mask&2) {
+        auto* tasks=static_cast<DebugTaskSnapshot*>(kmalloc(sizeof(DebugTaskSnapshot)*MAX_PROCESSES));
+        if(!tasks)json.text("{\"error\":\"Snapshot allocation failed\"}");
+        else {
+            uint32_t total=0;uint64_t begin=0,end=0;
+            const auto count=SchedulerSnapshotDebugTasks(tasks,MAX_PROCESSES,&total,&begin,&end);
+            json.text("{\"snapshot_started_tick_ms\":");json.number(begin);json.field("snapshot_ended_tick_ms",end);
+            json.field("total",total);json.field("capacity",MAX_PROCESSES);json.boolean("truncated",count<total);
+            json.text(",\"consistency\":\"Registry membership and incarnations pinned; task state, credentials and CPU counters are rolling\",\"tasks\":[");
+            for(uint32_t i=0;i<count;++i) {
+                const auto& r=tasks[i];if(i)json.text(",");
+                json.text("{\"pid\":");json.number(r.pid);json.text(",\"incarnation\":\"");json.number(r.incarnation);json.text("\"");
+                json.field("tgid",r.tgid);json.text(",\"group_incarnation\":\"");json.number(r.groupIncarnation);json.text("\"");
+                json.field("parent_tgid",r.parentPid);json.field("uid",r.uid);json.field("euid",r.euid);json.field("gid",r.gid);json.field("egid",r.egid);
+                json.text(",\"launch_id\":\"");json.number(r.launchId);json.text("\",\"name\":");json.string(r.name);
+                const char* states[]={"ready","running","blocked","stopped","terminated"};
+                json.text(",\"state\":");const auto state=static_cast<uint32_t>(r.state);json.string(state<5?states[state]:"unknown");
+                json.boolean("kernel",r.kernel);json.text(",\"running_on_cpu\":");json.signedNumber(r.runningOnCpu);
+                json.field("user_ticks",r.userTicks);json.field("system_ticks",r.sysTicks);json.text("}");
+            }json.text("]}");kfree(tasks);
+        }
+    }else json.text("null");
+    json.text(",\"launches\":");
+    if(mask&4) {
+        auto* launches=static_cast<LaunchRecord*>(kmalloc(sizeof(LaunchRecord)*LaunchHistory::Capacity));
+        if(!launches)json.text("{\"error\":\"Snapshot allocation failed\"}");
+        else {
+            const auto begin=ApicTickCount();const auto count=WmSnapshotLaunches(launches,LaunchHistory::Capacity);const auto end=ApicTickCount();
+            json.text("{\"snapshot_started_tick_ms\":");json.number(begin);json.field("snapshot_ended_tick_ms",end);
+            json.field("capacity",LaunchHistory::Capacity);json.text(",\"scope\":\"Bridge-tracked launch tokens retained until reboot; process liveness not sampled here\",\"launches\":[");
+            for(uint32_t i=0;i<count;++i){if(i)json.text(",");SerializeLaunchRecord(json,launches[i],false);}
+            json.text("]}");kfree(launches);
+        }
+    }else json.text("null");
     json.text("}");
 }
 
@@ -185,10 +242,15 @@ bool DebugUiHandleCommand(const char* command) {
     }
     if(*at||!count){Error("Invalid fields");return true;}
     if(count==1&&!strcmp(args[0],"caps")) {
-        Json json;char boot[33];DebugEpochCopy(boot);json.text("{\"boot_id\":");json.string(boot);json.text(",\"ui_api\":1,\"max_requests\":256,\"max_queued\":16,\"dedup_retention\":\"until_reboot\",\"launcher\":true,\"launch_api\":1,\"apps_api\":1,\"window_actions\":[\"focus\",\"minimize\",\"maximize\",\"restore\",\"close\"]}");json.finish();return true;
+        Json json;char boot[33];DebugEpochCopy(boot);json.text("{\"boot_id\":");json.string(boot);json.text(",\"ui_api\":1,\"max_requests\":256,\"max_queued\":16,\"dedup_retention\":\"until_reboot\",\"launcher\":true,\"launch_api\":1,\"observation_api\":1,\"frame_epoch_guard\":1,\"apps_api\":1,\"window_actions\":[\"focus\",\"minimize\",\"maximize\",\"restore\",\"close\"]}");json.finish();return true;
     }
     if(count<2||!DebugEpochMatches(args[count-1])){Error("Stale guest boot");return true;}
     --count;
+    if(count==2&&!strcmp(args[0],"observe")) {
+        uint64_t mask=0;
+        if(!Decimal(args[1],&mask)||!mask||mask>7){Error("Invalid observation mask");return true;}
+        Json json(1024*1024);Observe(json,static_cast<uint32_t>(mask));json.finish();return true;
+    }
     if(count==2&&!strcmp(args[0],"takeover")&&(!strcmp(args[1],"0")||!strcmp(args[1],"1"))) {
         uint32_t cancelled=0,inflight=0;const bool enabled=args[1][0]=='1';
         SpinLockAcquire(&requestLock);userTakeover=enabled;

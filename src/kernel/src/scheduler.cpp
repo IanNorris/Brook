@@ -3195,6 +3195,23 @@ uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)
     return count;
 }
 
+uint32_t SchedulerSnapshotDebugTasks(DebugTaskSnapshot* out,uint32_t capacity,
+                                    uint32_t* total,uint64_t* beginTick,uint64_t* endTick)
+{
+    *beginTick=ApicTickCount();uint32_t count=0;*total=0;
+    uint64_t flags=SchedLockAcquire(g_allProcLock);
+    for(uint32_t i=0;i<g_processCount;++i) {
+        const auto* p=g_allProcesses[i];if(!p)continue;++*total;
+        if(count>=capacity)continue;auto& r=out[count++];r={};
+        r.pid=p->pid;r.parentPid=p->parentPid;r.tgid=SnapshotTgid(p);
+        r.incarnation=p->incarnation;r.groupIncarnation=SnapshotGroup(p);r.launchId=p->launchId;
+        r.uid=p->uid;r.euid=p->euid;r.gid=p->gid;r.egid=p->egid;r.kernel=p->isKernelThread;
+        r.runningOnCpu=p->runningOnCpu;r.state=p->state;r.userTicks=p->userTicks;r.sysTicks=p->sysTicks;
+        for(unsigned j=0;j+1<sizeof(r.name)&&p->name[j];++j)r.name[j]=p->name[j];
+    }
+    SchedLockRelease(g_allProcLock,flags);*endTick=ApicTickCount();return count;
+}
+
 bool SchedulerSnapshotProcess(uint16_t pid, ProcessSnapshot* out)
 {
     bool found = false;

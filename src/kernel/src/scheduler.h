@@ -156,6 +156,20 @@ struct ProcessSnapshot {
 // Returns the number of entries written.
 uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
 
+// Compact diagnostic snapshot: one registry lock, no pointers, AS locks or
+// per-task group scans. Task state/CPU counters may change concurrently.
+struct DebugTaskSnapshot {
+    uint16_t pid,parentPid,tgid;
+    uint64_t incarnation,groupIncarnation,launchId,userTicks,sysTicks;
+    uint32_t uid,euid,gid,egid;
+    int32_t runningOnCpu;
+    ProcessState state;
+    bool kernel;
+    char name[32];
+};
+uint32_t SchedulerSnapshotDebugTasks(DebugTaskSnapshot* out,uint32_t capacity,
+                                   uint32_t* total,uint64_t* beginTick,uint64_t* endTick);
+
 // Snapshot a single process by PID. Returns true if found.
 bool SchedulerSnapshotProcess(uint16_t pid, ProcessSnapshot* out);
 

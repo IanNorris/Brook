@@ -27,6 +27,7 @@ from common import ROOT, REGISTRY, QMP, artifact, load_session, process_identity
 from media import Delivery, describe as describe_artifact, scoped_path
 from jobs import Jobs
 from ui import Ui
+from observation import Observations
 
 MAX_LOG = 256 * 1024
 
@@ -100,9 +101,14 @@ def png_rgb(width, height, rgb):
 
 
 @contextlib.contextmanager
-def completed_frame_source(session, data):
+def completed_frame_source(session, data, boot_id=None):
     """A guest-owned immutable frame lease, never a mutable render buffer."""
-    source = guest(data, "bridge frame request", timeout=10)
+    def command(suffix):
+        prefix='bridge frame ' if boot_id is None else f'bridge frame guarded {boot_id} '
+        result=guest(data,prefix+suffix,timeout=10)
+        if 'frame_error' in result:raise RuntimeError(result['frame_error'])
+        return result
+    source = command("request")
     if not isinstance(source, dict) or source.get("capture_api") != 2:
         raise RuntimeError("Kernel lacks completed-frame capture; boot a current build")
     token = source.get("token")
@@ -114,7 +120,7 @@ def completed_frame_source(session, data):
             if time.monotonic() >= deadline:
                 raise TimeoutError("Compositor did not publish a completed frame")
             time.sleep(.01)
-            source = guest(data, f"bridge frame status {token}", timeout=10)
+            source = command(f"status {token}")
             if source.get("capture_api") != 2 or source.get("token") != token:
                 raise RuntimeError("Completed-frame token changed while waiting")
         if source.get("state") != 2:
@@ -122,14 +128,14 @@ def completed_frame_source(session, data):
         yield source
         # Guest time was stopped during RAM extraction, but the lease could
         # expire before/after it. Never publish bytes from an invalidated lease.
-        status = guest(data, f"bridge frame status {token}", timeout=10)
+        status = command(f"status {token}")
         if any(status.get(key) != source.get(key) for key in
                ("capture_api", "token", "state", "frame_epoch", "address", "width", "height", "stride")):
             raise RuntimeError("Completed-frame lease expired during capture")
     finally:
         failed = sys.exc_info()[0] is not None
         try:
-            released = guest(data, f"bridge frame release {token}", timeout=10)
+            released = command(f"release {token}")
             if released.get("released") is not True:
                 raise RuntimeError("Completed-frame lease release was not acknowledged")
         except (OSError, ValueError, RuntimeError, TimeoutError):
@@ -164,7 +170,7 @@ def read_frame_bytes(session, source):
         raw_path.unlink(missing_ok=True)
 
 
-def capture(session, data, crop=None, max_width=None):
+def capture(session, data, crop=None, max_width=None, boot_id=None):
     """Read a leased completed frame; panic keeps the cached physical fallback."""
     metadata_path = REGISTRY / session / "frame-source.json"
     panic = panic_state(data)
@@ -172,12 +178,15 @@ def capture(session, data, crop=None, max_width=None):
         if not metadata_path.exists():
             raise RuntimeError("No pre-panic framebuffer metadata; memory/register inspection is available")
         source = json.loads(metadata_path.read_text())
+        if source.get("session_generation") is not None and source["session_generation"]!=data["generation"]:
+            raise RuntimeError("Cached panic geometry belongs to another host generation")
         source["address"] = source["panic_address"]
         source["stride"] = source["panic_stride"]
         raw = read_frame_bytes(session, source)
     else:
-        with completed_frame_source(session, data) as source:
+        with completed_frame_source(session, data, boot_id) as source:
             raw = read_frame_bytes(session, source)
+        source={**source,"session_generation":data["generation"],"guest_boot_id":boot_id}
         write_json(metadata_path, source)
     w, h, stride = source["width"], source["height"], source["stride"]
     rgb = bytearray(w*h*3)
@@ -208,13 +217,18 @@ def capture(session, data, crop=None, max_width=None):
     path = artifact(session, ".png")
     path.write_bytes(image)
     frame = {"frame_id": uuid.uuid4().hex, "generation": data["generation"],
+             "guest_boot_id":boot_id,
              "width": iw, "height": ih, "coordinate_width": w, "coordinate_height": h,
              "crop_width":cw,"crop_height":ch,"scale":iw/cw,"scale_y":ih/ch,
              "crop_origin": [cx, cy], "captured_monotonic": time.monotonic(),
              "source": "panic_cpu_framebuffer" if panic else "guest_completed_frame",
              "frame_epoch": None if panic else source.get("frame_epoch"),
              "frame_tick_ms": None if panic else source.get("frame_tick_ms"),
-             "panic": panic, "artifact": str(path), "sha256": hashlib.sha256(image).hexdigest(),
+             "panic": panic,
+             "geometry_provenance":{"session_generation":source.get("session_generation"),
+                 "guest_boot_id":source.get("guest_boot_id"),"verified_for_current_boot":bool(boot_id and not panic),
+                 "note":"Panic geometry may be from an earlier guest boot" if panic else "Boot-guarded lease" if boot_id else "Legacy unguarded lease"},
+             "artifact": str(path), "sha256": hashlib.sha256(image).hexdigest(),
              "intrusive": "completed-frame copy and brief VM pause; GPU readback at frame boundary"}
     write_json(REGISTRY / session / "last-frame.json", frame)
     return {"data": frame, "image": image}
@@ -246,10 +260,12 @@ def doctor(session, **_):
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
-                  "generation": data["generation"], "server_version": "0.6.0",
+                  "generation": data["generation"], "server_version": "0.7.0",
                   "bridge_capabilities": {"artifact_delivery": {"revision": 1,
                       "default": "references", "include_image": True,
                       "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
+        result['bridge_capabilities']['observation_bundles']={'revision':1,'components':['frame','windows','processes','launches','errors'],
+            'atomic':False,'frame_window_correspondence':'unverified','errors_source':'bounded serial-pattern scan'}
         try:
             result["guest"] = guest(data, "bridge stats", timeout=3)
         except (OSError, ValueError, RuntimeError) as error:
@@ -366,7 +382,12 @@ def control(session, action, force=False, **_):
         return {"action": action, "session": session, **sync_result}
 
 
-def observe(session, crop=None, max_width=None, **_):
+def observe(session, crop=None, max_width=None, include=None, since_event_cursor=None,
+            error_limit_bytes=65536,error_limit_events=64, **_):
+    if include is not None:
+        return Observations(window_ui(),capture,panic_state).collect(session,include,crop,max_width,
+            since_event_cursor,error_limit_bytes,error_limit_events)
+    if since_event_cursor is not None:raise ValueError('since_event_cursor requires include=[errors]')
     with session_lock(session) as data:
         return capture(session, data,crop,max_width)
 
@@ -850,7 +871,10 @@ register("vm_sessions",sessions,"Discover opted-in user/agent VM runs; no deskto
 register("vm_doctor",doctor,"VM transport and guest readiness; capabilities distinguish unsupported paths",SESSION,["session"],True)
 register("vm_start",start,"Boot a named experiment on new disk clones with playback off",{"scenario":STR,"gpu":STR})
 register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop/reset await guest sync, force explicitly allows unsynced shutdown",{**SESSION,"action":STR,"force":{"type":"boolean"}},["session","action"])
-register("vm_observe",observe,"Leased completed-frame artifact with crop/scale metadata; briefly pauses VM; current kernel required; panic needs cached framebuffer",{**SESSION,**IMAGE_OPTION,"crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session"])
+register("vm_observe",observe,"Completed-frame artifact or selectable boot-bound frame/windows/tasks/launches/error bundle with per-component timing; snapshots are not atomic; serial errors are best-effort",{**SESSION,**IMAGE_OPTION,
+    "include":{"type":"array","items":{"type":"string","enum":["frame","windows","processes","launches","errors"]},"minItems":1,"maxItems":5},
+    "since_event_cursor":{"type":"object"},"error_limit_bytes":INT,"error_limit_events":INT,
+    "crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session"])
 register("vm_logs",logs,"Read bounded logs by byte cursor",{**SESSION,"source":STR,"offset":INT,"limit":INT},["session"],True)
 register("vm_stats",stats,"OS memory/process counts and compositor intervals; optional rolling memory census holds guest mapping locks while sampling",{**SESSION,"memory_details":{"type":"boolean"}},["session"],True)
 register("vm_guest_run",guest_run,"Run structured guest argv with separate output and real exit status; requires request_id. Legacy command uses Brook run syntax and returns launch ACK only",{**SESSION,"command":STR,
@@ -919,7 +943,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.6.0"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.7.0"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":

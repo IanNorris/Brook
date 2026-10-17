@@ -105,7 +105,7 @@ class Jobs:
             validate_id(boot_id)
             if boot_id=="0"*32:raise ValueError("Guest boot identity is unset")
             command += " " + boot_id
-        readonly=command in {'bridge job caps','bridge ui caps','bridge epoch'} or command.startswith(('bridge job status ','bridge job read ','bridge ui windows ','bridge ui process ','bridge ui status ','bridge ui apps '))
+        readonly=command in {'bridge job caps','bridge ui caps','bridge epoch'} or command.startswith(('bridge job status ','bridge job read ','bridge ui windows ','bridge ui process ','bridge ui status ','bridge ui apps ','bridge ui observe '))
         for attempt in range(3 if readonly else 1):
             try:
                 return self.exchange(session,generation,command,deadline)

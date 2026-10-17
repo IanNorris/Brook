@@ -362,6 +362,20 @@ class CompletedFrameTests(unittest.TestCase):
                              ['bridge frame request', 'bridge frame status 7',
                               'bridge frame status 7', 'bridge frame release 7'])
 
+    def test_bundle_frame_leases_are_boot_guarded_including_release(self):
+        boot='a'*32
+        with patch.object(server,'guest',side_effect=[self.ready(),self.ready(),{'released':True}]) as guest:
+            with server.completed_frame_source('s',{},boot_id=boot):pass
+        self.assertEqual([x.args[1] for x in guest.call_args_list],[
+            f'bridge frame guarded {boot} request',f'bridge frame guarded {boot} status 7',f'bridge frame guarded {boot} release 7'])
+
+    def test_reboot_cannot_release_a_new_boots_reused_frame_token(self):
+        with patch.object(server,'guest',side_effect=[self.ready(),{'frame_error':'Stale guest boot'},
+                {'frame_error':'Stale guest boot'}]) as guest:
+            with self.assertRaisesRegex(RuntimeError,'Stale guest boot'):
+                with server.completed_frame_source('s',{},boot_id='a'*32):pass
+        self.assertTrue(all('guarded '+('a'*32) in x.args[1] for x in guest.call_args_list))
+
     def test_refuses_mutable_legacy_frame(self):
         with patch.object(server, 'guest', return_value={'address': '0x1000'}):
             with self.assertRaisesRegex(RuntimeError, 'lacks completed-frame'):
@@ -412,6 +426,16 @@ class CompletedFrameTests(unittest.TestCase):
             self.assertIsNone(result['frame_epoch'])
             self.assertIsNone(result['frame_tick_ms'])
             self.assertEqual(read.call_args.args[1]['address'],'0x2000')
+
+    def test_panic_geometry_from_known_other_host_generation_is_not_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'s').mkdir()
+            (root/'s'/'frame-source.json').write_text(json.dumps(self.ready(session_generation='old')))
+            with patch.object(server,'REGISTRY',root),patch.object(server,'panic_state',return_value=True), \
+                 patch.object(server,'read_frame_bytes') as read:
+                with self.assertRaisesRegex(RuntimeError,'another host generation'):
+                    server.capture('s',{'generation':'new'})
+                read.assert_not_called()
 
     def test_memsave_error_resumes_vm_and_removes_partial_file(self):
         with tempfile.TemporaryDirectory() as directory:

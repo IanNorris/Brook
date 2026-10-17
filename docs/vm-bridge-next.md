@@ -11,9 +11,11 @@ window discovery/actions, provider/connection-origin identity and per-action
 window observations. Bridge 0.5.1 adds read-only app catalog discovery and fixes transient launcher
 coalescing/completion races. Bridge 0.6.0 adds semantic launcher activation with
 bounded boot-lifetime dispatch history, window correlation and durable recovery.
-Output artifacts after shutdown,
-job cancellation, frame/process/error observation bundles and remaining sections
-are still proposed.
+Bridge 0.7.0 adds [accepted selectable observations](vm-bridge-observations.md)
+for frames, windows, tasks, launches and serial errors, with per-component timing
+and boot-guarded frame leases. Exact frame/WM revision correspondence, a lossless
+guest event stream, output artifacts after shutdown, job cancellation and
+remaining sections are still proposed.
 Current behavior is documented in the
 [bridge README](../tools/vm_bridge/README.md). Preserve the existing VM-only
 architecture and [completed-frame capture contract](completed-frame-capture.md).

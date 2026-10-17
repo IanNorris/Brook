@@ -106,7 +106,8 @@ the table distinguishes tested behavior from remaining limitations.
   for recovery and deployment work still open.
 - **VM control bridge:** screenshots returned as artifact references, VM input,
   recoverable command jobs with separate output and exit status, native/Wayland
-  window controls and installed app discovery; logs, CPU/context-switch profiles,
+  window controls, installed-app discovery and recoverable launcher activation;
+  selectable frame/window/task/launch/diagnostic bundles; logs, CPU/context-switch profiles,
   OS statistics, silent-output PCM capture,
   bounded direct [video/audio recording](docs/vm-recording.md),
   and bounded post-panic memory/register inspection. See the

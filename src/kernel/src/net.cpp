@@ -3376,6 +3376,25 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     if (DebugEpochHandleCommand(cmd)) return;
     if (DebugJobHandleCommand(cmd)) return;
     if (DebugUiHandleCommand(cmd)) return;
+    // Guarded frame leases bind request/status/release to one guest boot.
+    // Legacy unguarded capture remains available for older bridge clients.
+    char guardedFrame[224];
+    if(StrStartsWith(cmd,"bridge frame guarded ")) {
+        const char* argument=cmd+21;char boot[33]{};
+        for(uint32_t i=0;i<32;++i) {
+            if(!argument[i]){DebugChannelSend("{\"frame_error\":\"Invalid frame epoch\"}\n");return;}
+            boot[i]=argument[i];
+        }
+        if(argument[32]!=' '||!DebugEpochMatches(boot)) {
+            DebugChannelSend("{\"frame_error\":\"Stale guest boot\"}\n");return;
+        }
+        uint32_t n=0;const char* prefix="bridge frame ";
+        while(*prefix)guardedFrame[n++]=*prefix++;
+        argument+=33;
+        while(*argument&&n+1<sizeof(guardedFrame))guardedFrame[n++]=*argument++;
+        if(*argument){DebugChannelSend("{\"frame_error\":\"Command too long\"}\n");return;}
+        guardedFrame[n]=0;cmd=guardedFrame;len=n;
+    }
     if (NetStrEq(cmd, "bridge sync")) {
         // Synchronous acknowledgement: a process-launch reply cannot tell
         // the host whether filesystem metadata has actually been flushed.

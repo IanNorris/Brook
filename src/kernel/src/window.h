@@ -444,6 +444,7 @@ void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
 // Semantic admission is compositor-only and uses the same worker as a click.
 int WmLauncherActivate(const char* appId,uint32_t generation,uint64_t* token,bool* coalesced);
 bool WmSnapshotLaunch(uint64_t token,LaunchRecord* out);
+uint32_t WmSnapshotLaunches(LaunchRecord* out,uint32_t capacity);
 void WmCancelBridgeQueuedLaunches(uint32_t* cancelled,uint32_t* startedOrShared);
 
 // Launch the item at the given index.

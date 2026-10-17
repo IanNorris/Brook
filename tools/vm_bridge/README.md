@@ -99,6 +99,67 @@ description time. This does not invent capture timing from a file's wall clock.
 `vm_doctor.bridge_capabilities.artifact_delivery` advertises revision 1. Reload
 an already running MCP server to receive these source/schema changes.
 
+### Observation bundles (bridge 0.7.0)
+
+`vm_observe` retains its normal full-resolution frame default. Supply `include`
+with any distinct selection of `frame`, `windows`, `processes`, `launches` and
+`errors` to get one response with per-component state, capture interval and age
+at bundle completion. Omitting `frame` avoids the snapshot copy, PNG work and
+QEMU pause. Window/task/launch metadata uses one guest request; capabilities and
+the final boot-identity check are additional transport exchanges.
+
+```json
+{"session":"SESSION","include":["frame","windows","processes","launches","errors"]}
+```
+
+Images use the same recursive reference-first adapter. Set `include_image: true`
+for a bounded native preview. Crop/scale preserves the original coordinate
+extent and frame ID. All window, task, group and launch references bind the
+host generation and guest boot. The component timestamps are separate: a frame
+and a later WM snapshot are **not atomic**. `frame_window_correspondence` remains
+`unverified` and `window_state_revision` is null; do not infer geometry matches
+pixels from this bundle. Task membership/incarnations are pinned during copying;
+scheduler state, credentials and CPU counters are rolling. Task snapshots cover
+at most the kernel's 1,024 registry entries and report truncation. Launch history
+contains bridge-tracked tokens, not every historical user launch.
+
+The bundled frame path uses boot-guarded request/status/release. A stale boot
+cannot release another boot's reused frame token. The old unguarded capture
+commands remain available for older clients. End-of-bundle identity failures
+mark earlier components stale and the bundle partial. Per-component errors retain
+other useful results; unsupported guests never fall back to a different action.
+Stopped VMs support serial scanning; normal guest metadata is unavailable.
+After panic, cached-geometry framebuffer capture is explicitly `unverified`:
+its geometry can be from an earlier guest boot. Known host-generation mismatch
+rejects it. No normal guest command is attempted when panic is already known.
+
+For incremental diagnostics, pass the errors component's exact `next_cursor` as
+`since_event_cursor` on the next call with `include: ["errors"]`. The cursor binds
+session/generation, log inode, byte offset, continuation state and a small content
+anchor. Rotation, truncation and detected in-place rewrites reset it explicitly.
+A guest reboot reports a boot transition while retaining same-file log continuity.
+The scan is bounded to 64 KiB/64 events by default (configurable up to 256 KiB/128
+with `error_limit_bytes`/`error_limit_events`); each event retains at most 2 KiB
+and reports text truncation. Initial scans use the most recent requested byte window (64 KiB by default,
+up to 256 KiB) and report excluded history. Short unfinished lines are revisited; oversized lines are
+skipped with explicit dropped bytes and continuation tracking. Rotation loss is
+unknown rather than zero.
+
+This is a pattern scan of serial diagnostics, including Brook user faults,
+panics and launcher dispatch failures. It is **not** a lossless kernel event ring,
+and no matching lines does not prove there were no errors. Lines may span guest
+boots; per-line guest timestamps/boot identity are unknown. Structured command
+stdout/stderr remains in its job channels.
+
+`accept_observe.py --session SESSION --out build/observe-acceptance` exercises the
+bundle with native Terminal, Mousepad and Settings on an empty disposable
+1920×1080 desktop at 100% scale, checks Brook task credentials/references, crops,
+error cursor continuity and actual reference-only MCP delivery. Human UI actions
+remain separate from observation, and still-frame capture is not video recording.
+`accept_observe_reboot.py --session SESSION --out build/observe-reboot --panic`
+explicitly resets an empty agent VM with cloned disks, tests reused lease tokens,
+and optionally leaves it panicked. See [acceptance evidence](../../docs/vm-bridge-observations.md).
+
 ### App discovery (bridge 0.5.1)
 
 `vm_apps` reads the same immutable catalog used by the Applications menu. It

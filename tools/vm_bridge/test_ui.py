@@ -52,6 +52,14 @@ class UiTests(unittest.TestCase):
     def submit(self,action='minimize',**options):
         return self.ui.submit(self.session,self.ref,action,self.ident,wait_s=0,**options)
 
+    def test_capabilities_reuses_a_nonzero_boot_epoch_from_same_reply(self):
+        before=len(self.calls);_,caps=self.ui.capabilities(self.session)
+        self.assertEqual(caps['boot_id'],self.boot)
+        self.assertEqual(self.calls[before:],['bridge ui caps'])
+        self.boot='0'*32
+        _,caps=self.ui.capabilities(self.session)
+        self.assertNotEqual(caps['boot_id'],'0'*32)
+
     def test_apps_return_catalog_and_boot_bound_references_without_a_frame(self):
         result=self.ui.apps(self.session)
         self.assertEqual(result['apps'][0]['reference'],{'app_id':'d'*32,'catalog_generation':17,

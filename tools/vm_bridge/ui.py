@@ -27,7 +27,12 @@ class Ui(Jobs):
         caps=self.query(session,data['generation'],'bridge ui caps',deadline)
         if caps.get('ui_api')!=1:
             raise RuntimeError('Guest semantic window controls are unsupported; update the guest kernel')
-        caps['boot_id']=self.boot_identity(session,data['generation'],deadline)
+        # Current kernels already return the boot epoch with capabilities.
+        # Subsequent commands are epoch-guarded, so a second epoch read adds
+        # no protection against a reboot between the two calls.
+        reported=caps.get('boot_id')
+        if reported is not None:validate_id(reported)
+        caps['boot_id']=reported if reported and reported!='0'*32 else self.boot_identity(session,data['generation'],deadline)
         return data,caps
 
     def windows(self, session, deadline=None, generation=None, boot_id=None):
