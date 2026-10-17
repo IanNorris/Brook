@@ -8,7 +8,7 @@ the matching count tells the user when to refine the search. Installer output
 streams into a bounded details panel, and completion reloads the manifest.
 Packages installed locally but absent from the index remain discoverable.
 
-![App Gallery after installing hello](images/brook_app_gallery_1080.png)
+![App Gallery after installing VLC on fresh disks](images/brook_app_gallery_1080.png)
 
 The image is an unscaled native 1920×1080 completed-frame capture. It shows a
 real install from the binary cache, rather than a mockup.
@@ -52,8 +52,8 @@ In Brook, use its installed App Gallery entry, or:
 run /nix/profile/bin/brook-run /nix/bin/brook-gallery
 ```
 
-The current live tests staged the new package closure onto isolated existing
-disks. Full fresh-image menu/icon deployment remains to be exercised.
+Initial live tests staged the new package closure onto isolated existing disks.
+Fresh data/Nix image deployment was subsequently checked below.
 
 ## Acceptance on 17 October 2026
 
@@ -145,12 +145,54 @@ discarding also retain earlier limitations. The syscall does not claim to fix
 those wider signal semantics. Its partial-size contract follows the
 [Linux implementation](https://raw.githubusercontent.com/torvalds/linux/master/kernel/signal.c).
 
+## Fresh disks and larger packages
+
+On 17 October, the repository's `create_experiment_disks.py` built new 32 GiB
+Nix and 8 GiB data images with a 481-path profile and current installer sources,
+without game data. The acceptance boot disk and matched kernel/modules were
+reused; this was not a rebuild of the entire boot disk. Session
+`793aa3cdeed44930ad08184fe49b2b86` launched Gallery from its generated menu
+entry, with its icon on the launcher, taskbar and native caption. The empty
+manifest correctly reported zero registered packages; bundled components are
+not yet registered as removable packages.
+
+Gallery installed stock VLC 3.0.23-2 from the HTTPS cache. Store entries grew
+from 481 to 851; completion was observed within 329 seconds (an upper bound,
+not an exact timed benchmark). The executable reported its version. The stock
+package lacks OSS options required by `brook-vlc`; its UI opened and closed
+cleanly with explicit `--aout=dummy`. `--no-audio` alone still initializes
+PulseAudio and hit the previously observed mutex-unlock abort. Registration
+persisted across reboot. New shortcut requirements check the real VLC,
+Ladybird and LibreOffice binaries as well as their wrappers; the rebooted menu
+hid absent Ladybird while retaining installed applications.
+
+A short 2-second CPU capture contained 1,613 samples across eight CPUs: 87.5%
+idle, 4.4% in block-I/O leaf routines and 1.9% in TLB barriers. This is one
+phase of the installation, not wall-time attribution. The profile and
+unscaled captures remain under ignored `build/workloads/gallery-fresh-20261017/`.
+
+Session `52efde0bc3d641e994de61a7d1068f93` then installed the existing
+`vlc-brook-native` build through Gallery using its exported local cache and an
+added index row. It played the attributed 720p Big Buck Bunny fixture on eight
+vCPUs/4 GiB, with advancing video and nonzero captured OSS PCM. Pause produced
+no active audio stream; resume restored nonzero PCM. Both manifest rows were
+UID 1000 and the mutation lock was absent. Closing the player reproduced a
+known worker page fault and left eleven VLC tasks blocked. After preserving
+evidence, maintenance SIGKILL reclaimed the group. Both runs passed checked
+shutdown and all three offline filesystem checks. Playback success does not
+establish clean close or simultaneous-install stability.
+
+The compatibility cache/index and video were supplied as explicit test inputs
+after the initial fresh-image run; they are not automatically included by the
+default disk script. Stock/native package file ownership and removal conflicts
+remain part of the shared-profile work below.
+
 ## Remaining work
 
 - Disk-full and interrupted-install recovery across the whole profile. Atomic
   manifest publication alone does not transact symlinks and launcher metadata.
 - Dependency/shared-file removal ownership and base-image package registration.
-- Successful repair, large-package installs, launcher icon/menu refresh and
-  complete fresh-image/reboot acceptance through the Gallery.
+- Large-application repair/removal, icons for packages installed in the guest,
+  automatic compatibility-package sources and broader fresh-image acceptance.
 - Persisted desktop themes in GTK, richer app descriptions/icons, and broader
   real-application acceptance. Current styling is a first readable interface.

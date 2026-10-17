@@ -32,7 +32,11 @@ for installation only. The installed package launches from the guest's own
 store afterwards. `BROOK_AUDIODEV=none` on the host launcher keeps speakers
 silent while retaining the guest HDA device and bridge WAV capture.
 
-The validated playback configuration currently uses `BROOK_SMP=1`. Four-vCPU
-startup can still fail descriptor duplication. Closing VLC during a concurrent
-package installation also produced a worker fault; keep installs and playback
-separate for now. See REC-03/REC-04 in `docs/backlog.md` for the evidence.
+An eight-vCPU, 4 GiB run on 17 October installed this package through Gallery,
+played 720p video, captured nonzero OSS audio, paused and resumed. This improves
+on the earlier one-vCPU baseline; it does not resolve intermittent SMP startup
+failures across repeated runs. Close still reproduced the known worker fault
+at RIP `0x1e45703f`, now without a concurrent install, leaving peer tasks alive.
+Maintenance SIGKILL reclaimed the group before checked shutdown and clean
+filesystem checks. Keep installs and playback separate; see REC-03/REC-04 in
+`docs/backlog.md` and the [fresh Gallery acceptance](../../docs/app-gallery.md).

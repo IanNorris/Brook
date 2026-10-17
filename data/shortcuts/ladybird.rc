@@ -1,4 +1,5 @@
 # title: Ladybird
 # Requires: /nix/profile/bin/brook-ladybird
+# Requires: /nix/profile/bin/Ladybird
 # desc: Ladybird browser
 source /boot/SCRIPTS/wayland_ladybird_example.rc

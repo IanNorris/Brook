@@ -334,6 +334,32 @@ initial bottom-strip/full-frame corruption diagnosis. Window-close still
 faulted a VLC worker after that fix (`2efcc298b41a4c4494a1367c2143c964`), so
 shutdown and SMP startup remain open. The prepared launcher uses one vCPU.
 
+17 October fresh-image follow-up (`52efde0bc3d641e994de61a7d1068f93`): Gallery
+installed the compatibility VLC build; eight-vCPU/4-GiB playback, nonzero OSS
+PCM and pause/resume passed. Native close, without concurrent installation,
+reproduced RIP `0x1e45703f` (CR2 `0x3520`) in worker PID 27/TGID 11. The window
+and audio disappeared but eleven VLC tasks remained blocked. Brook's user-fault
+handler terminates the whole group only for leader faults; worker-fault group
+termination is a separate containment gap. Maintenance SIGKILL reclaimed all
+VLC tasks, then checked shutdown and all three filesystem checks passed.
+`/proc/11/maps` currently emits only heap/stack, so it cannot resolve shared
+libraries; expand mapping diagnostics as part of this investigation. The full
+fault bytes match `libwayland-client.so.0.24.0` in the exact cached closure at
+file/ELF offset `0x903f`, `wl_proxy_marshal_flags+0xbf`; preserve that binary
+association when resolving the request being marshalled. The proxy's interface
+method pointer is invalid at the fault; its lifetime/corruption cause remains
+unproven. Evidence: ignored
+`build/workloads/gallery-fresh-20261017/native-close-full-serial.log`.
+
+The same install emitted “real strand” scheduler warnings but completed. Astra
+review found that the detector combines process state, ready-queue and trace
+observations under separate locks, and the printed trace shows fresh RUN/BLOCK
+progress between samples. This is not proof of a lost wakeup. Backlog a coherent
+snapshot with incarnation and a scheduling-progress sequence, accounting for
+deferred wake/requeue handoff; print after releasing locks and avoid claiming
+persistence from repeated PIDs alone. No scheduler behavior change is justified
+by this diagnostic alone.
+
 ### Browser performance follow-up
 
 14 October measurements and artifacts are recorded in

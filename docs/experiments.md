@@ -42,13 +42,13 @@ nix-shell --run 'python3 scripts/create_experiment_disks.py --q2-dir build/exper
 ```
 
 This creates `build/experiments/seeds/data.img` (16 GiB), `nix.img` (32 GiB),
-and `manifest.json`. Images are sparse; the initial assets and 477-path
+and `manifest.json`. Images are sparse; the initial assets and approximately 481-path
 closure use about 5.2 GiB of host storage. An existing output is never
 overwritten; choose another `--output` directory to rebuild.
 
 `nix/experiment-packages.nix` uses the repository's package pin. The profile
 contains Bash, coreutils, curl, Python, ffmpeg, Wayland, the Brook player,
-file browser and calculator, LibreOffice, GIMP, Mousepad, Qalculate, fonts,
+file browser, App Gallery and calculator, LibreOffice, GIMP, Mousepad, Qalculate, fonts,
 cursors, both yquake2 builds, and an OSS-enabled OpenAL library. Launchers
 receive their actual dependency paths from Nix rather than hardcoded hashes.
 

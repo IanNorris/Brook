@@ -61,7 +61,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
 | [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer opens via Wayland and edits a real document; startup is slow and window-close behavior needs work |
-| [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | Brook compatibility build installs through guest `nix-install`; 720p video and OSS audio verified; window-close/SMP stability remains under investigation |
+| [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | Gallery install, 720p video and captured OSS audio passed on eight vCPUs; close still faults a worker and requires cleanup |
 
 ## Recent progress
 
@@ -101,6 +101,7 @@ the table distinguishes tested behavior from remaining limitations.
   packages from the shared desktop profile. A real install, executable launch,
   reboot persistence and removal passed as Brook. Stop and close-during-install
   finish the active archive safely; cancelled downloads can be reused on retry.
+  Fresh-image launcher deployment and a larger VLC install also passed.
   See [Gallery status](docs/app-gallery.md)
   for recovery and deployment work still open.
 - **VM control bridge:** VM-only screenshots and input, guest command launches,
@@ -251,10 +252,10 @@ New captures use native 1920×1080 without upscaling. See
 <p align="center"><em>LibreOffice Writer 25.8.5.2 editing a document through Wayland — native 1920×1080 capture, with no automatically opened debug windows</em></p>
 
 <p align="center">
-  <a href="docs/images/brook_app_gallery_1080.png"><img src="docs/images/brook_app_gallery_1080.png" alt="Brook App Gallery after installing hello from the Nix binary cache" width="1280"></a>
+  <a href="docs/images/brook_app_gallery_1080.png"><img src="docs/images/brook_app_gallery_1080.png" alt="Brook App Gallery after installing VLC from the Nix binary cache on fresh disks" width="1280"></a>
 </p>
 
-<p align="center"><em>App Gallery searching the package index after a real install as Brook — native 1920×1080 capture; click for full-size text</em></p>
+<p align="center"><em>App Gallery after installing VLC as Brook on freshly generated disks — native 1920×1080 capture; click for full-size text</em></p>
 
 <p align="center">
   <a href="docs/images/brook_boot_logo_1080.png"><img src="docs/images/brook_boot_logo_1080.png" alt="Brook's new blue and teal river B mark on its actual boot progress screen" width="800"></a>
