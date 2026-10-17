@@ -407,3 +407,15 @@ VM. Fatal-signal group cancellation fixes retained Codium shutdown helpers in
 three native-close cycles, including reboot persistence. The edited document
 is owned by Brook. This progress does not resolve the directory authorization
 or install privilege-boundary gaps; it is not acceptance of multiple accounts.
+
+
+### Shared-profile App Gallery policy (17 October)
+
+The first [App Gallery](app-gallery.md) runs as Brook and invokes the existing
+installer without elevation. Its UI permits mutation only for UID 1000; other
+identities can browse. The current Nix mount remains deliberately shared and
+writable, with its existing permission bypass. This is the single-desktop
+policy, not a protected store or authorization boundary. Install/remove
+serialization and atomic manifest replacement passed host and guest tests.
+General directory authorization must still be implemented before a protected
+service or multiple accounts can be accepted.

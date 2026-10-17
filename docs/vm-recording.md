@@ -25,7 +25,7 @@ python3 tools/vm_bridge/server.py --call vm_record --arguments '{"session":"SESS
 python3 tools/vm_bridge/server.py --call vm_record --arguments '{"session":"SESSION_ID","action":"stop"}'
 ```
 
-Start acknowledges an asynchronous worker; poll status until `completed` or
+Start acknowledges an asynchronous worker; poll status until `complete` or
 `failed`. Stop requests early finalization. One recorder may own a session at a
 time. Bounds are 1–600 seconds, 1–60 requested frames per second and an even
 canvas up to 4096×2160. Smaller guest modes are centered without scaling;

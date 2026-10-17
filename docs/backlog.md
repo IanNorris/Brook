@@ -845,3 +845,22 @@ shutdown profile. Correct maximized Firefox client-side shadow/content geometry
 hardware-rendering and longer browsing acceptance separately. The software
 rendering, multi-seat input and pinned initrd CA fixes are accepted as recorded
 in workloads.md; the default app checkpoint remains unchanged.
+
+
+### App Gallery follow-up (17 October)
+
+The first [Gallery UI](app-gallery.md) now searches the index and drives the
+installer as Brook. A binary-cache install, executable launch, manifest
+ownership, reboot persistence, busy-profile error, retry and removal passed.
+Manifest add/remove no longer loses rows above 256 and publishes atomically;
+[installer evidence](../tools/nix-install/README.md) covers failed writes and
+profile-lock handling. Full profile crash/disk-full recovery, cancellation,
+large-package and successful-repair acceptance, base-image registration,
+shared-file removal ownership, and fresh-image launcher/icon deployment remain
+open. The launcher itself still has a 256-entry bound; that separate limit
+was not removed by the manifest fix.
+
+Two completed-frame observations during Gallery acceptance timed out over the
+guest debug TCP connection; a later observation of the same VM recovered.
+Preserve the serial traces under `build/workloads/gallery-installer-20261017/`
+and investigate connection/reply loss without replaying ambiguous mutations.

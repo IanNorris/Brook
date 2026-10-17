@@ -39,6 +39,7 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
         iperf3          # TCP throughput + sequential connection stress testing
         netcat-openbsd  # raw TCP without TLS overhead (nc host port)
         wayland         # libwayland-client/server for compositor work
+        "${ROOT_DIR}/tools/brook-gallery-pkg"  # Shared-profile package browser
         "${ROOT_DIR}/tools/netsurf-pkg"
         "${ROOT_DIR}/tools/waylandd-pkg"  # Brook first-light Wayland server
         "${ROOT_DIR}/tools/wayland-smoke-pkg"  # Wayland client smoke test
@@ -63,6 +64,15 @@ if [ ${#PACKAGES[@]} -eq 0 ]; then
 fi
 
 DISK_IMG="${BROOK_NIX_DISK:-${ROOT_DIR}/brook_nix_disk.img}"
+
+# Compile the installer from current sources before allocating/updating images.
+if [ -z "${MUSL_CC:-}" ]; then
+    echo "ERROR: MUSL_CC is required to rebuild nix-install; run inside nix-shell."
+    exit 1
+fi
+NIX_INSTALL_OUT="${ROOT_DIR}/build/package-tools/nix-install"
+mkdir -p "$(dirname "$NIX_INSTALL_OUT")"
+"$MUSL_CC" -static -O2 -o "$NIX_INSTALL_OUT" "${ROOT_DIR}/tools/nix-install/nix-install.c"
 
 echo "Creating ${SIZE_MB}MB Nix store disk at ${DISK_IMG}..."
 
@@ -155,7 +165,7 @@ fi
 echo "Building Brook Nix tools..."
 TOOLS_BIN="${ROOT_DIR}/tools"
 NIX_SEARCH="${TOOLS_BIN}/nix-search/nix-search"
-NIX_INSTALL="${TOOLS_BIN}/nix-install/nix-install"
+NIX_INSTALL="$NIX_INSTALL_OUT"
 NIX_FETCH="${TOOLS_BIN}/nix-fetch/nix-fetch"
 NAR_UNPACK="${TOOLS_BIN}/nar-unpack/nar-unpack"
 
@@ -242,6 +252,7 @@ if [ "${FUSE}" -eq 1 ]; then
     mkdir -p "${MOUNT_DIR}/bin"
     for tool in nix-fetch nix-search nix-install; do
         src="${TOOLS_BIN}/${tool}/${tool}"
+        if [ "$tool" = nix-install ]; then src="$NIX_INSTALL_OUT"; fi
         [ -f "$src" ] && cp "$src" "${MOUNT_DIR}/bin/${tool}"
     done
     [ -f "${NAR_UNPACK}" ] && cp "${NAR_UNPACK}" "${MOUNT_DIR}/bin/nar-unpack"
@@ -358,6 +369,7 @@ else
     mkdir_on_disk "${DISK_IMG}" "bin"
     for tool in nix-fetch nix-search nix-install; do
         src="${TOOLS_BIN}/${tool}/${tool}"
+        if [ "$tool" = nix-install ]; then src="$NIX_INSTALL_OUT"; fi
         [ -f "$src" ] && write_to_disk "${DISK_IMG}" "$src" "bin/${tool}"
     done
     [ -f "${NAR_UNPACK}" ] && write_to_disk "${DISK_IMG}" "${NAR_UNPACK}" "bin/nar-unpack"

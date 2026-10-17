@@ -42,6 +42,17 @@ if ! command -v fuse2fs &>/dev/null; then
     exit 1
 fi
 
+# Rebuild changed installer sources instead of deploying a stale local binary.
+NIX_INSTALL_OUT="${ROOT_DIR}/build/package-tools/nix-install"
+if [ "${UPDATE_TOOLS}" -eq 1 ]; then
+    if [ -z "${MUSL_CC:-}" ]; then
+        echo "ERROR: MUSL_CC is required to rebuild nix-install; run inside nix-shell."
+        exit 1
+    fi
+    mkdir -p "$(dirname "$NIX_INSTALL_OUT")"
+    "$MUSL_CC" -static -O2 -o "$NIX_INSTALL_OUT" "${ROOT_DIR}/tools/nix-install/nix-install.c"
+fi
+
 MNTDIR=$(mktemp -d)
 cleanup() {
     sync
@@ -128,6 +139,7 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
     fi
     for tool in nix-fetch nix-search nix-install; do
         src="${TOOLS_BIN}/${tool}/${tool}"
+        if [ "$tool" = nix-install ]; then src="$NIX_INSTALL_OUT"; fi
         if [ -f "$src" ]; then
             cp "$src" "${MNTDIR}/bin/${tool}"
             echo "  ${tool} -> /nix/bin/${tool}"
@@ -202,6 +214,19 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
                 echo "  brook-files -> /nix/bin/brook-files"
                 break
             done
+        fi
+        # App Gallery runs as the desktop user and invokes the existing installer.
+        if command -v nix-build &>/dev/null; then
+            BROOK_GALLERY_OUT=$(nix-build "${ROOT_DIR}/tools/brook-gallery-pkg" --no-out-link)
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                dst="${MNTDIR}/store/$(basename "$p")"
+                if [ ! -e "$dst" ]; then
+                    cp -a --no-preserve=links "$p" "$dst"
+                fi
+            done < <(nix-store -qR "$BROOK_GALLERY_OUT")
+            cp "${BROOK_GALLERY_OUT}/bin/brook-gallery" "${MNTDIR}/bin/brook-gallery"
+            echo "  brook-gallery -> /nix/bin/brook-gallery"
         fi
         # Copy brook-edit (text editor) — build fresh or find in store
         BROOK_EDIT_OUT=""

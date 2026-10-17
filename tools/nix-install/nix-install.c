@@ -25,18 +25,39 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <elf.h>
+#include "manifest.h"
 
+#ifndef INDEX_PATH
 #define INDEX_PATH      "/nix/index/packages.idx"
+#endif
+#ifndef PROFILE_DIR
 #define PROFILE_DIR     "/nix/profile"
+#endif
+#ifndef MANIFEST_PATH
 #define MANIFEST_PATH   "/nix/profile/manifest.tsv"
+#endif
+#ifndef PROFILE_BIN
 #define PROFILE_BIN     "/nix/profile/bin"
+#endif
+#ifndef PROFILE_LIB
 #define PROFILE_LIB     "/nix/profile/lib"
+#endif
+#ifndef PROFILE_APPS
 #define PROFILE_APPS    "/nix/profile/share/applications"
+#endif
+#ifndef APPS_DIR
 #define APPS_DIR        "/nix/share/applications"
+#endif
+#ifndef APPS_IDX
 #define APPS_IDX        "/nix/share/applications/applications.idx"
+#endif
+#ifndef APPS_ICONS_DIR
 #define APPS_ICONS_DIR  "/nix/share/applications/icons"
+#endif
 #define MAX_LINE        16384
 #define MAX_PACKAGES    256
+
+static const char *color_green="",*color_cyan="",*color_reset="";
 
 /* Package info from the index */
 struct pkg_info {
@@ -44,13 +65,6 @@ struct pkg_info {
     char version[128];
     char store_name[512];
     char description[1024];
-};
-
-/* Installed package from manifest */
-struct installed_pkg {
-    char name[256];
-    char version[128];
-    char store_name[512];
 };
 
 static int lookup_package(const char *query, struct pkg_info *out) {
@@ -316,68 +330,33 @@ static int is_installed(const char *name) {
 }
 
 static int add_to_manifest(const struct pkg_info *pkg) {
-    FILE *f = fopen(MANIFEST_PATH, "a");
-    if (!f) {
-        fprintf(stderr, "Error: cannot write manifest %s: %s\n",
-                MANIFEST_PATH, strerror(errno));
-        return -1;
-    }
-    int failed = fprintf(f, "%s\t%s\t%s\n", pkg->name, pkg->version, pkg->store_name) < 0;
-    /* Buffered writes may fail only at close; never report an installed entry
-     * whose manifest write failed (e.g. ENOSPC or a backend I/O error). */
-    if (fclose(f) != 0) failed = 1;
-    if (failed) {
-        fprintf(stderr, "Error: writing manifest %s failed: %s\n",
-                MANIFEST_PATH, strerror(errno));
-        return -1;
-    }
-    return 0;
+    return manifest_update(MANIFEST_PATH,pkg->name,pkg->version,pkg->store_name);
 }
 
 static int remove_from_manifest(const char *name) {
-    FILE *f = fopen(MANIFEST_PATH, "r");
-    if (!f) return -1;
+    return manifest_update(MANIFEST_PATH,name,NULL,NULL);
+}
 
-    /* Read all lines except the matching one */
-    struct installed_pkg pkgs[MAX_PACKAGES];
-    int count = 0;
-    char line[MAX_LINE];
-    int found = 0;
-
-    while (fgets(line, sizeof(line), f) && count < MAX_PACKAGES) {
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
-        if (len == 0) continue;
-
-        char *p_name = line;
-        char *p_ver = strchr(p_name, '\t');
-        if (!p_ver) continue;
-        *p_ver++ = '\0';
-        char *p_store = strchr(p_ver, '\t');
-        if (!p_store) continue;
-        *p_store++ = '\0';
-
-        if (strcasecmp(p_name, name) == 0) {
-            found = 1;
-            continue; /* skip this entry */
-        }
-
-        strncpy(pkgs[count].name, p_name, sizeof(pkgs[count].name) - 1);
-        strncpy(pkgs[count].version, p_ver, sizeof(pkgs[count].version) - 1);
-        strncpy(pkgs[count].store_name, p_store, sizeof(pkgs[count].store_name) - 1);
-        count++;
+/* Install/remove serialize profile mutations: flock is a Brook stub.
+ * Never infer that an existing lock is stale or remove another writer's lock.
+ * After a crash maintenance must inspect the recorded PID before recovery. */
+static int profile_lock_owned;
+static void release_profile_lock(void) {
+    if (!profile_lock_owned) return;
+    unlink(PROFILE_DIR "/.mutation-lock/owner");
+    rmdir(PROFILE_DIR "/.mutation-lock");
+    profile_lock_owned=0;
+}
+static int acquire_profile_lock(void) {
+    if (profile_lock_owned) return 0;
+    if (mkdir_p(PROFILE_DIR)<0 && errno!=EEXIST) return -1;
+    if (mkdir(PROFILE_DIR "/.mutation-lock",0700)<0) {
+        fprintf(stderr,"Profile busy: %s/.mutation-lock (%s). Do not remove a live writer's lock.\n",PROFILE_DIR,strerror(errno));
+        return -1;
     }
-    fclose(f);
-
-    if (!found) return -1;
-
-    /* Rewrite manifest */
-    f = fopen(MANIFEST_PATH, "w");
-    if (!f) return -1;
-    for (int i = 0; i < count; i++) {
-        fprintf(f, "%s\t%s\t%s\n", pkgs[i].name, pkgs[i].version, pkgs[i].store_name);
-    }
-    fclose(f);
+    profile_lock_owned=1;atexit(release_profile_lock);
+    FILE *owner=fopen(PROFILE_DIR "/.mutation-lock/owner","w");
+    if (owner) {fprintf(owner,"pid=%ld uid=%ld\n",(long)getpid(),(long)geteuid());fclose(owner);}
     return 0;
 }
 
@@ -915,6 +894,7 @@ static void refresh_desktop_entries(void)
 }
 
 static int cmd_install(const char *name) {
+    if (acquire_profile_lock()<0) return 1;
     printf("Looking up '%s'...\n", name);
 
     char existing_store[512] = {0};
@@ -1056,7 +1036,7 @@ static int cmd_install(const char *name) {
     lib_linked += link_closure_libs_from_narinfo(pkg.store_name);
     int rpath_linked = link_closure_libs_into_package(pkg.store_name);
 
-    printf("\n\033[32m✓ Installed %s %s\033[0m\n", pkg.name, pkg.version);
+    printf("\n%s✓ Installed %s %s%s\n",color_green,pkg.name,pkg.version,color_reset);
     if (linked > 0)
         printf("  %d binary(ies) added to %s\n", linked, PROFILE_BIN);
     if (lib_linked > 0)
@@ -1070,6 +1050,7 @@ static int cmd_install(const char *name) {
 }
 
 static int cmd_remove(const char *name) {
+    if (acquire_profile_lock()<0) return 1;
     if (!is_installed(name)) {
         fprintf(stderr, "'%s' is not installed.\n", name);
         return 1;
@@ -1098,20 +1079,20 @@ static int cmd_remove(const char *name) {
         fclose(f);
     }
 
-    /* Remove symlinks */
+    /* Publish removal before changing links. Prepublication write failures
+     * preserve the original manifest and links. A directory flush can fail
+     * after publication; return failure and leave reconciliation explicit. */
+    if (remove_from_manifest(name) != 0) {
+        fprintf(stderr, "Error: failed to update manifest: %s\n",strerror(errno));
+        return 1;
+    }
     if (store_name[0]) {
         unlink_package_bins(store_name);
         unlink_package_desktops(store_name);
         unlink_package_libs(store_name);
     }
 
-    /* Remove from manifest */
-    if (remove_from_manifest(name) != 0) {
-        fprintf(stderr, "Error: failed to update manifest\n");
-        return 1;
-    }
-
-    printf("\033[32m✓ Removed %s\033[0m\n", name);
+    printf("%s✓ Removed %s%s\n",color_green,name,color_reset);
     refresh_desktop_entries();
     return 0;
 }
@@ -1244,8 +1225,8 @@ static int cmd_shell(int npkgs, char *const *pkgs) {
     setenv("PS1", ps1_prefix, 1);
     setenv("IN_NIX_SHELL", "impure", 1);
 
-    printf("\033[36mEntering nix shell with %d package(s). Exit to return.\033[0m\n",
-           npkgs);
+    printf("%sEntering nix shell with %d package(s). Exit to return.%s\n",
+           color_cyan,npkgs,color_reset);
     printf("  PATH=%s\n", new_path);
     free(new_path);
 
@@ -1308,6 +1289,9 @@ static void usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Gallery reads a pipe: publish progress before the operation exits. */
+    setvbuf(stdout,NULL,_IOLBF,0);
+    if(isatty(STDOUT_FILENO)){color_green="\033[32m";color_cyan="\033[36m";color_reset="\033[0m";}
     /* Determine command - support being called as "nix" or "nix-install" */
     const char *prog = argv[0];
     const char *base = strrchr(prog, '/');

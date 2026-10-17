@@ -1,0 +1,42 @@
+# Brook package profile updates
+
+`nix install`, `nix remove` and direct `nix-install` use one shared
+`/nix/profile`. Install/remove operations acquire `.mutation-lock` with an atomic
+mkdir before fetching or changing profile metadata/links. This avoids relying
+on Brook's currently stubbed `flock`. A competing writer fails explicitly;
+read-only discovery remains available. Direct `nix-fetch` and `nix shell`
+closure downloads are not serialized by this profile lock.
+
+Manifest add/remove now streams every row into a sibling temporary file,
+flushes and fsyncs it, atomically renames it, then fsyncs the parent directory.
+Removing a package no longer truncates the registration list at 256 entries.
+Blank separators are preserved; malformed, torn or oversized rows cause an
+error. A failed prepublication write preserves the old bytes. If the directory
+flush fails after rename, publication has already happened: an error is not
+proof that nothing changed. Removal changes links only after metadata commit.
+
+This protects the manifest, not the entire profile as a transaction. Crashes
+between metadata and symlink/launcher updates still need reconciliation. An
+abruptly terminated writer may leave its lock; it is never automatically
+reclaimed using a potentially reused PID. Its `owner` file is diagnostic.
+Maintenance must establish that no writer remains before removing a stale lock.
+
+Build and tests:
+
+```sh
+# Inside nix-shell:
+$MUSL_CC -static -O2 -o build/nix-install tools/nix-install/nix-install.c
+python3 -m unittest discover -s tools/nix-install -p 'test_*.py' -v
+$MUSL_CC -static -O2 -o build/manifestcheck tools/nix-install/manifestcheck.c
+```
+
+Stage `manifestcheck` in an isolated guest, then run it as Brook with `/data`
+and `/nix` as arguments. It creates and removes only its private fixture. On
+17 October both mounts passed the 1,000-row preservation, add/remove,
+missing-entry, torn-record and symlink-refusal checks. Session:
+`fef41e76fb5c41c4940f497ecb0e9afa`. All ten host tests pass, including actual
+failed writes using RLIMIT_FSIZE, concurrent readers, the public CLI with
+1,000 rows, refusing an existing lock and releasing an owned lock after failure.
+
+The [App Gallery acceptance](../../docs/app-gallery.md) exercised the actual
+installer as UID 1000, package execution, reboot persistence and removal.

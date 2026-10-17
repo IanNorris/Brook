@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=App Gallery
+Comment=Find and install packages for Brook
+Exec=brook-gallery
+Icon=brook-gallery
+Categories=System;PackageManager;
+Terminal=false

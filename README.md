@@ -97,6 +97,10 @@ the table distinguishes tested behavior from remaining limitations.
   Launcher loading now runs on a worker, with animated pending taskbar entries,
   a busy cursor badge and visible failure notices. See [desktop settings](docs/desktop-settings.md)
   and [launch feedback](docs/launch-feedback.md).
+- **App Gallery:** search the package index and install, repair or remove
+  packages from the shared desktop profile. A real install, executable launch,
+  reboot persistence and removal passed as Brook. See [Gallery status](docs/app-gallery.md)
+  for recovery and deployment work still open.
 - **VM control bridge:** VM-only screenshots and input, guest command launches,
   logs, CPU/context-switch profiles, OS statistics, silent-output PCM capture,
   bounded direct [video/audio recording](docs/vm-recording.md),
@@ -243,6 +247,12 @@ New captures use native 1920×1080 without upscaling. See
 </p>
 
 <p align="center"><em>LibreOffice Writer 25.8.5.2 editing a document through Wayland — native 1920×1080 capture, with no automatically opened debug windows</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_app_gallery_1080.png"><img src="docs/images/brook_app_gallery_1080.png" alt="Brook App Gallery after installing hello from the Nix binary cache" width="1280"></a>
+</p>
+
+<p align="center"><em>App Gallery searching the package index after a real install as Brook — native 1920×1080 capture; click for full-size text</em></p>
 
 <p align="center">
   <a href="docs/images/brook_boot_logo_1080.png"><img src="docs/images/brook_boot_logo_1080.png" alt="Brook's new blue and teal river B mark on its actual boot progress screen" width="800"></a>

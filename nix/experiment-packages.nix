@@ -5,6 +5,7 @@ let
   calc = import ../tools/wayland-calc-pkg {};
   player = import ../tools/brook-player-pkg {};
   files = import ../tools/brook-files-pkg {};
+  gallery = import ../tools/brook-gallery-pkg { inherit pkgs; };
   settings = import ../tools/brook-settings-pkg { inherit pkgs; };
   fonts = import ../tools/brook-fonts-pkg {};
   cursors = import ../tools/brook-cursor-theme {};
@@ -75,7 +76,7 @@ in {
       pkgs.bash pkgs.coreutils pkgs.curl.bin pkgs.xz.bin pkgs.zstd.bin pkgs.cacert
       pkgs.python3 pkgs.ffmpeg.bin pkgs.wayland pkgs.mesa
       pkgs.libreoffice pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad
-      waylandd calc player files settings fonts cursors launchers
+      waylandd calc player files settings gallery fonts cursors launchers
     ];
     ignoreCollisions = true;
   };
