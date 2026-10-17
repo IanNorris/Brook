@@ -236,3 +236,6 @@ target_compile_options(test_launch_feedback PRIVATE "-iquote${BROOK_ROOT}/src/ke
 
 add_host_test(test_cursor_composition)
 target_compile_options(test_cursor_composition PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+
+add_host_test(test_desktop_metrics)
+target_compile_options(test_desktop_metrics PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")

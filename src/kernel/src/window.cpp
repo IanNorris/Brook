@@ -1012,6 +1012,7 @@ bool WmMoveWindowRelativeToParent(Process* proc, uint32_t wmId,
 
 void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH)
 {
+    VfbGuard guard;
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
@@ -1020,15 +1021,15 @@ void WmResizeWindow(int idx, uint16_t newClientW, uint16_t newClientH)
     if (newClientW < WM_MIN_WIDTH)  newClientW = WM_MIN_WIDTH;
     if (newClientH < WM_MIN_HEIGHT) newClientH = WM_MIN_HEIGHT;
 
-    // Update window dimensions
+    // Keep exact ownership and geometry stable across terminal preparation.
+    // Both locks sleep; terminal state never acquires the window guard.
+    auto terminal = TerminalResizeForProcess(w.proc->pid,w.proc->incarnation,newClientW,newClientH);
+    if (terminal == TerminalResizeResult::Failed) return;
     w.clientW = newClientW;
     w.clientH = newClientH;
-
-    // Check if this is a terminal window — resize its VFB
-    Terminal* t = TerminalFindByProcess(w.proc);
-    if (t)
+    if (terminal == TerminalResizeResult::Resized)
     {
-        TerminalResize(t, newClientW, newClientH);
+        // Backing pixels and SIGWINCH were committed by the exact owner.
     }
     else if (w.vfb)
     {

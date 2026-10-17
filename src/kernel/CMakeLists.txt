@@ -84,6 +84,24 @@ add_custom_command(
     VERBATIM
 )
 
+# Native desktop fonts use separate final-size glyphs rather than stretching
+# terminal pixels. Keeping the same source face preserves a consistent family.
+set(DESKTOP_FONT_SOURCES "")
+foreach(DESKTOP_SCALE IN ITEMS 150 200)
+    math(EXPR DESKTOP_FONT_SIZE "16 * ${DESKTOP_SCALE} / 100")
+    set(DESKTOP_FONT_CPP "${CMAKE_CURRENT_BINARY_DIR}/desktop_font_${DESKTOP_SCALE}.cpp")
+    add_custom_command(
+        OUTPUT "${DESKTOP_FONT_CPP}"
+        COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/bake_font.py"
+                "${BROOK_FONT_TTF}" "${DESKTOP_FONT_SIZE}" "${DESKTOP_FONT_CPP}"
+                "g_desktopFont${DESKTOP_SCALE}"
+        DEPENDS "${BROOK_ROOT}/scripts/bake_font.py" "${BROOK_FONT_TTF}"
+        COMMENT "Baking native desktop font (${DESKTOP_SCALE}%)"
+        VERBATIM
+    )
+    list(APPEND DESKTOP_FONT_SOURCES "${DESKTOP_FONT_CPP}")
+endforeach()
+
 # ---------------------------------------------------------------------------
 # FAT test image baking — generates a small FAT16 ramdisk embedded in the kernel.
 # ---------------------------------------------------------------------------
@@ -245,6 +263,7 @@ add_executable(kernel
     src/ksym_addrs.cpp
     "${KSYM_TABLE_CPP}"
     "${FONT_ATLAS_CPP}"
+    ${DESKTOP_FONT_SOURCES}
     "${FAT_IMAGE_CPP}"
     "${BROOK_ROOT}/src/shared/src_km/serial.cpp"
     # FatFS (C source — compiled from a build-dir copy so our ffconf.h overlay

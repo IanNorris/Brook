@@ -39,5 +39,9 @@ struct FontAtlas
 
 // The single font atlas instance, defined in the generated font_atlas.cpp.
 extern const FontAtlas g_fontAtlas;
+// Native desktop fonts are baked at their final size. Terminal text continues
+// to use g_fontAtlas regardless of desktop scale.
+extern const FontAtlas g_desktopFont150;
+extern const FontAtlas g_desktopFont200;
 
 } // namespace brook

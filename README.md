@@ -80,7 +80,7 @@ the table distinguishes tested behavior from remaining limitations.
   including long pause/resume and seeking, without an autoplay workaround.
   Connected Unix socket shutdown, anonymous memory discard and descriptor
   capacity fixes support these workloads. See [workload validation](docs/workloads.md)
-  for tested configurations and remaining limits. All 25 hosted test suites pass.
+  for tested configurations and remaining limits. All 26 hosted test suites pass.
 
 - **Desktop identity and package registration:** new apps and Terminal run as
   `brook` by default, with persistent `/data/home`. The installer preserves

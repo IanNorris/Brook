@@ -826,3 +826,19 @@ nix-shell --run '"$MUSL_CC" -O2 -Wall -Wextra -Werror -static -pthread tools/at-
 Stage the ignored executable only on a stopped disposable VM disk. Run the
 probe through `vm_guest_run`, inspect its completion marker and kernel logs,
 then use checked shutdown and offline filesystem checks.
+
+
+`wmterminalresizecheck.c` is Brook-only and must be launched from a native
+Terminal, not directly through `vm_guest_run`. It creates a GUI as a bash
+descendant, maximizes/restores it twelve times, and verifies that its parent
+terminal's character grid never changes. Expect
+`WMTERMINALRESIZECHECK PASS rounds=12 parent=<rows>x<cols>`. The older incorrect
+controlling-terminal lookup changes the parent grid on the first maximize.
+
+```sh
+nix-shell --run '"$MUSL_CC" -O2 -Wall -Wextra -Werror -static tools/at-syscall-probe/wmterminalresizecheck.c -o build/io-bench/wmterminalresizecheck'
+```
+
+Stage on a stopped disposable disk, open Terminal, and execute the staged path.
+Compare the previous and candidate kernels, capture the visible result, and
+finish each run with checked shutdown and offline filesystem checks.

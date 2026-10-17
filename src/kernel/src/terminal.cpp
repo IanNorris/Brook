@@ -1384,11 +1384,10 @@ void TerminalClose(Terminal* t)
         SchedulerUnblock(t->thread);
 }
 
-void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
+static bool ResizeTerminalLocked(Terminal* t, uint32_t newW, uint32_t newH)
 {
-    TerminalStateGuard state;
-    if (!t || !t->active || newW == 0 || newH == 0) return;
-    if (newW == t->vfbW && newH == t->vfbH) return; // no change
+    if (!t || !t->active || newW == 0 || newH == 0) return false;
+    if (newW == t->vfbW && newH == t->vfbH) return true; // no change
 
     uint32_t newCols=newW/static_cast<uint32_t>(g_fontAtlas.glyphs[0].advance);
     uint32_t newRows=newH/static_cast<uint32_t>(g_fontAtlas.lineHeight);
@@ -1398,13 +1397,13 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
     bool reflow=newCols!=t->cols && t->scrollback && t->scrollbackRows;
     TermCell* preparedRing=reflow?static_cast<TermCell*>(kmalloc(static_cast<uint64_t>(t->scrollbackRows)*newCols*sizeof(TermCell))):nullptr;
     if ((t->cells && !preparedCells) || (reflow && !preparedRing)) {
-        kfree(preparedCells);kfree(preparedRing);return;
+        kfree(preparedCells);kfree(preparedRing);return false;
     }
 
     // Allocate new VFB
     uint32_t* newVfb=nullptr;MappingBacking* newBacking=nullptr;CompositorVfbAllocation* newRetirement=nullptr;
     if (!AllocateTerminalPixels(newW,newH,&newVfb,&newBacking,&newRetirement)) {
-        kfree(preparedCells);kfree(preparedRing);return;
+        kfree(preparedCells);kfree(preparedRing);return false;
     }
     uint32_t newSize = newW * newH * 4;
 
@@ -1529,6 +1528,27 @@ void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
     {
         ProcessSendSignalToGroup(t->child->pgid, 28); // SIGWINCH
     }
+    return true;
+}
+
+void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH)
+{
+    TerminalStateGuard state;
+    (void)ResizeTerminalLocked(t,newW,newH);
+}
+
+TerminalResizeResult TerminalResizeForProcess(uint16_t pid, uint64_t incarnation,
+                                              uint32_t newW, uint32_t newH)
+{
+    TerminalStateGuard state;
+    for (uint32_t i=0;i<g_terminalCount;++i) {
+        auto& terminal=g_terminals[i];
+        // Terminal state owns a child reference through this entire operation.
+        if (!terminal.active || !terminal.child || terminal.child->pid!=pid ||
+            terminal.child->incarnation!=incarnation) continue;
+        return ResizeTerminalLocked(&terminal,newW,newH) ? TerminalResizeResult::Resized : TerminalResizeResult::Failed;
+    }
+    return TerminalResizeResult::NotOwned;
 }
 
 void TerminalScroll(Terminal* t, int32_t dy)

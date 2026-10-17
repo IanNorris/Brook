@@ -98,6 +98,11 @@ void TerminalClose(Terminal* t);
 // Resize a terminal's VFB and update character dimensions.
 // Sends SIGWINCH to the child process.
 void TerminalResize(Terminal* t, uint32_t newW, uint32_t newH);
+enum class TerminalResizeResult { NotOwned, Resized, Failed };
+// Exact pinned child identity, not a descendant's controlling terminal.
+// No Terminal pointer escapes the terminal-state guard.
+TerminalResizeResult TerminalResizeForProcess(uint16_t pid, uint64_t incarnation,
+                                              uint32_t newW, uint32_t newH);
 
 // Scroll the terminal viewport by dy lines.  Positive dy scrolls UP
 // (older content into view), negative scrolls down toward live output.

@@ -54,14 +54,17 @@ def pack_glyphs(glyphs, atlas_width):
 
 
 def main():
-    if len(sys.argv) != 4:
-        print(f"Usage: {sys.argv[0]} <font.ttf> <size_px> <output.cpp>",
+    if len(sys.argv) not in (4, 5):
+        print(f"Usage: {sys.argv[0]} <font.ttf> <size_px> <output.cpp> [symbol]",
               file=sys.stderr)
         sys.exit(1)
 
     font_path = sys.argv[1]
     size_px   = int(sys.argv[2])
     out_cpp   = sys.argv[3]
+    symbol = sys.argv[4] if len(sys.argv) == 5 else "g_fontAtlas"
+    if not symbol.isidentifier() or not symbol.isascii():
+        raise SystemExit("Invalid C++ font atlas symbol")
 
     if not os.path.exists(font_path):
         print(f"Error: font file not found: {font_path}", file=sys.stderr)
@@ -159,7 +162,7 @@ def main():
         f.write('};\n\n')
 
         # FontAtlas instance.
-        f.write('const FontAtlas g_fontAtlas = {\n')
+        f.write(f'extern const FontAtlas {symbol} = {{\n')
         f.write('    s_atlasPixels,\n')
         f.write(f'    {atlas_width},   // atlasWidth\n')
         f.write(f'    {atlas_height},  // atlasHeight\n')
