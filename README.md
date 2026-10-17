@@ -61,7 +61,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
 | [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer opens via Wayland and edits a real document; startup is slow and window-close behavior needs work |
-| [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | Gallery install, 720p video and captured OSS audio passed on eight vCPUs; close still faults a worker and requires cleanup |
+| [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | Gallery install, 720p OSS playback and clean native/paused/Quit exits passed on eight vCPUs, including a fresh-settings reboot |
 
 ## Recent progress
 

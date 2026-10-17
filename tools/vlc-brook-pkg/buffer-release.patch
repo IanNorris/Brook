@@ -1,0 +1,17 @@
+diff --git a/modules/video_output/wayland/shm.c b/modules/video_output/wayland/shm.c
+--- a/modules/video_output/wayland/shm.c
++++ b/modules/video_output/wayland/shm.c
+@@ -76,10 +76,10 @@ static void buffer_release_cb(void *data, struct wl_buffer *buffer)
+ 
+ #ifndef NDEBUG
+     assert(pic != NULL);
+-    wl_buffer_set_user_data(buffer, NULL);
+-#else
+-    (void) buffer;
+ #endif
++    /* PictureDetach uses this pointer to distinguish a pending compositor
++     * reference from one already released, including in release builds. */
++    wl_buffer_set_user_data(buffer, NULL);
+     picture_Release(pic);
+ }
+ 

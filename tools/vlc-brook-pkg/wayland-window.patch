@@ -1,0 +1,97 @@
+--- a/modules/gui/qt/components/interface_widgets.hpp
++++ b/modules/gui/qt/components/interface_widgets.hpp
+@@ -62,6 +62,9 @@
+     bool request( struct vout_window_t * );
+     void release( bool forced );
+     void sync( void );
++#ifdef QT5_HAS_WAYLAND
++    bool refreshWaylandHandle();
++#endif
+ 
+ protected:
+     QPaintEngine *paintEngine() const Q_DECL_OVERRIDE
+--- a/modules/gui/qt/components/interface_widgets.cpp
++++ b/modules/gui/qt/components/interface_widgets.cpp
+@@ -167,21 +167,15 @@
+ #ifdef QT5_HAS_WAYLAND
+         case VOUT_WINDOW_TYPE_WAYLAND:
+         {
+-            /* Ensure only the video widget is native (needed for Wayland) */
++            /* Prepare the native child now. MainInterface refreshes its
++             * borrowed handle after showing/reparenting/resizing the widget. */
+             stable->setAttribute( Qt::WA_DontCreateNativeAncestors, true);
+-
+-            QWindow *window = stable->windowHandle();
+-            assert(window != NULL);
+-            window->create();
+-
+-            QPlatformNativeInterface *qni = qApp->platformNativeInterface();
+-            assert(qni != NULL);
+-
+-            p_wnd->handle.wl = static_cast<wl_surface*>(
+-                qni->nativeResourceForWindow(QByteArrayLiteral("surface"),
+-                                             window));
+-            p_wnd->display.wl = static_cast<wl_display*>(
+-                qni->nativeResourceForIntegration(QByteArrayLiteral("wl_display")));
++            p_wnd->handle.wl = NULL;
++            if( !refreshWaylandHandle() )
++            {
++                release( false );
++                return false;
++            }
+             break;
+         }
+ #endif
+@@ -192,6 +186,32 @@
+     enable_mouse_events = var_InheritBool(p_window, "mouse-events");
+     return true;
+ }
++
++
++#ifdef QT5_HAS_WAYLAND
++bool VideoWidget::refreshWaylandHandle()
++{
++    if( !stable || !p_window || p_window->type != VOUT_WINDOW_TYPE_WAYLAND )
++        return false;
++    QWindow *window = stable->windowHandle();
++    QPlatformNativeInterface *qni = qApp->platformNativeInterface();
++    if( !window || !qni )
++        return false;
++    window->create();
++    void *surface = qni->nativeResourceForWindow(QByteArrayLiteral("surface"), window);
++    void *display = qni->nativeResourceForIntegration(QByteArrayLiteral("wl_display"));
++    if( !surface || !display )
++        return false;
++
++    /* Qt's stack changes can hide/recreate a native child. Compare only the
++     * saved pointer value; the former surface may already have been freed. */
++    msg_Dbg( p_intf, "Wayland surface handoff: %p -> %p",
++             static_cast<void*>(p_window->handle.wl), surface );
++    p_window->handle.wl = static_cast<wl_surface*>(surface);
++    p_window->display.wl = static_cast<wl_display*>(display);
++    return true;
++}
++#endif
+ 
+ QSize VideoWidget::physicalSize() const
+ {
+--- a/modules/gui/qt/main_interface.cpp
++++ b/modules/gui/qt/main_interface.cpp
+@@ -784,6 +784,17 @@
+ 
+             videoWidget->setSize( i_width, i_height );
+         }
++#ifdef QT5_HAS_WAYLAND
++        /* All Qt stack/fullscreen/size transitions must finish before the
++         * blocking request returns a wl_surface to the renderer. */
++        if( p_wnd->type == VOUT_WINDOW_TYPE_WAYLAND &&
++            !videoWidget->refreshWaylandHandle() )
++        {
++            msg_Err( p_intf, "no Wayland surface after video widget setup" );
++            releaseVideoSlot( false );
++            *res = false;
++        }
++#endif
+     }
+ }
+ 

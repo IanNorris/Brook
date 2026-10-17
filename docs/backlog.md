@@ -393,6 +393,17 @@ filesystem checks pass. Evidence remains in ignored `sigwait-before.log`,
 not accepted yet: the package lifetime fixes still need successful startup
 and clean-close validation.
 
+Subsequent VLC package lifetime fixes passed four launches over two eight-vCPU
+boots: playback/native close, paused close, Quit after fullscreen requests, and
+fresh-settings playback/close after reboot. Three shell-supervised normal runs
+reported exit zero; all closes reclaimed the group, and checked shutdown plus
+all filesystem checks passed. See [exact package and evidence](../tools/vlc-brook-pkg/README.md).
+The fixes refresh the borrowed surface after initial Qt stack changes, preserve
+it until renderer shutdown, and clear released picture-clone references in
+release builds. Fullscreen requests did not change native window bounds;
+fullscreen geometry, startup-time close, playlist switching, longer sessions
+and further post-startup hide/reparent transitions remain open.
+
 The same install emitted “real strand” scheduler warnings but completed. Astra
 review found that the detector combines process state, ready-queue and trace
 observations under separate locks, and the printed trace shows fresh RUN/BLOCK

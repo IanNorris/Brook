@@ -1,0 +1,23 @@
+diff --git a/modules/gui/qt/main_interface.cpp b/modules/gui/qt/main_interface.cpp
+--- a/modules/gui/qt/main_interface.cpp
++++ b/modules/gui/qt/main_interface.cpp
+@@ -1703,6 +1703,19 @@ void MainInterface::wheelEvent( QWheelEvent *e )
+ 
+ void MainInterface::closeEvent( QCloseEvent *e )
+ {
++#ifdef QT5_HAS_WAYLAND
++    if( b_hasWayland )
++    {
++        /* Qt owns the wl_surface borrowed by the video-output thread.
++         * Neither forced release nor accepting this event may destroy it
++         * while that thread still renders. Close() deactivates the playlist
++         * with the Qt loop alive, so normal WindowClose releases the widget
++         * after the renderer joins, then the interface can exit. */
++        e->ignore();
++        emit askToQuit();
++        return;
++    }
++#endif
+ //  hide();
+     if ( b_minimalView )
+         setMinimalView( false );
