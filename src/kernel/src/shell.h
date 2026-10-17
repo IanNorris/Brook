@@ -36,6 +36,13 @@ int ShellExecString(const char* script);
 // The line must begin with run; returns the spawned PID or a negative error.
 int ShellLaunchCommand(const char* line);
 
+struct Process;
+struct FdEntry;
+// Unpublished process for the debug job supervisor. Structured argv is never
+// parsed as shell source. Merge environment overrides with desktop defaults.
+Process* ShellCreateDebugJob(int argc, const char* const* argv, const char* cwd,
+    int envc, const char* const* env, uint32_t uid, const FdEntry* standardFds);
+
 // Enter the interactive shell.  Reads from the keyboard, executes commands.
 // Never returns (runs until shutdown/reboot).
 [[noreturn]] void ShellInteractive();

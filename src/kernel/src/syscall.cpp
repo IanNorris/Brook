@@ -1949,6 +1949,7 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count)
                 PipeWakeEpoll(pipe);
                 break;
             }
+            __atomic_fetch_add(&pipe->fullWriteWaits,1,__ATOMIC_RELAXED);
             // Safety timeout — recheck every 10ms in case wakeup was missed
             extern volatile uint64_t g_lapicTickCount;
             self->wakeupTick = g_lapicTickCount + 10;

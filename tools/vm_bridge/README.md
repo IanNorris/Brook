@@ -1,8 +1,8 @@
 # Brook VM bridge
 
 Follow-up roadmap: [efficiency, artifact delivery and UI control specification](../../docs/vm-bridge-next.md).
-Reference-first artifact delivery is implemented; command jobs and semantic UI
-controls remain proposed.
+Reference-first artifact delivery and command jobs are implemented. Semantic UI
+controls, observation bundles and the remaining roadmap are still proposed.
 
 A local Python MCP server for explicitly enabled Brook QEMU
 sessions. It observes and injects input into the selected VM through private
@@ -61,7 +61,8 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_observe` | Return PNG artifact reference and frame ID, native geometry, crop origin and scale. Optional native `crop`, `max_width` and opt-in `include_image`; leased completed frame, GPU readback at the frame boundary, and brief VM pause. Requires capture API 2 in the kernel. |
 | `vm_input` | Ordered key/chord/text/pointer/scroll/relative/hold/wait batches. Coordinates require the current `frame_id`; crop/scale map back to native coordinates. US ASCII text only; holds release at batch end/cancel. Observe to verify reaction. |
 | `vm_logs`, `vm_wait` | Bounded serial/QEMU byte cursors or bounded serial-substring waits. Logs survive VM exit. |
-| `vm_guest_run` | Launch a Brook `run /absolute/guest/path args` command, optionally `--uid 1000`. Return PID; no process completion or isolated stdout/stderr yet. Entire framed command fits 220 bytes. |
+| `vm_guest_run` | Structured `argv`, optional `cwd`/`env`/`uid`, required `request_id`, and optional `wait_s` return a recoverable command job with isolated output and exit status. Default identity is Brook. The explicitly legacy `command: "run …"` form still returns launch ACK only and fits 220 bytes. |
+| `vm_job` | Inspect/wait for an `operation_id`, with independent stdout/stderr byte cursors and real exit/descendant/EOF state. Does not execute or resume commands. |
 | `vm_guest` | Existing window/process listings and focus by window index (the `pid` argument). |
 | `vm_stats` | Usable RAM/free/used and process counts; p50/p90/p95/max of the recent 256 compositor-loop intervals using the millisecond guest clock. Optional `memory_details: true` adds a rolling address-space census. Not app GPU or physical scanout timings. |
 | `vm_profile` | `start` with `duration_ms`, `stop`, `status`, `export`. CPU samples and context-switch events; export after IDLE to raw/Speedscope artifacts using the run's immutable kernel ELF. |
@@ -95,6 +96,91 @@ report `created_host_monotonic: null`; `described_host_monotonic` is the current
 description time. This does not invent capture timing from a file's wall clock.
 `vm_doctor.bridge_capabilities.artifact_delivery` advertises revision 1. Reload
 an already running MCP server to receive these source/schema changes.
+
+### Guest command jobs (bridge 0.4.0)
+
+Structured requests go through the guest's job protocol, without a host shell
+or serial-log scraping. For example, provide the following arguments to
+`vm_guest_run`, substituting the explicit session and a fresh 32-character
+lowercase hexadecimal request ID:
+
+```json
+{
+  "session": "SESSION_ID",
+  "request_id": "0123456789abcdef0123456789abcdef",
+  "argv": ["/boot/BIN/BASH", "-c", "printf 'hello\\n'; printf 'warning\\n' >&2; exit 7"],
+  "cwd": "/data/home",
+  "env": {"CUSTOM": "literal value"},
+  "wait_s": 10
+}
+```
+
+`argv[0]` must be a real absolute guest path; the legacy shell's fallback
+lookup is not applied. On the acceptance image Bash is `/boot/BIN/BASH`;
+`/bin/bash` is absent even though the old shell can resolve that spelling.
+Default cwd/home is `/data/home`, UID 1000 and primary GID 100. `uid: 0` is an
+explicit maintenance option. Environment overrides merge with the desktop's
+framework, font, TLS and XDG defaults. Stdin is `/dev/null`. Job launches do
+not create an automatic framebuffer window or exercise the Applications UI;
+semantic launcher activation is separate future work.
+
+Requests support 1–64 NUL-free arguments, 64 environment overrides and a
+32 KiB total serialized payload, uploaded in bounded checked chunks. Paths
+for the executable and cwd are at most 255 bytes. The guest retains 256 job
+identities per boot, permits eight active/uploading jobs, and retains the last
+64 KiB per stream. Capacity exhaustion is explicit; IDs are never evicted and
+reused. Worst-case retained output/request storage is about 40 MiB, plus active
+pipes and process overhead. The capability handshake reports these limits.
+
+The returned `operation_id` is the request ID. Its host record binds the ID
+to session generation and an argument fingerprint before any mutation. An
+identical resubmission returns the existing job. Changed arguments or a new
+generation with the same ID are rejected. After interrupted staging, an
+explicit identical resubmission observes the guest first, verifies duplicate
+chunks against its immutable request and resumes only unfinished staging.
+If the guest already started, commit is skipped. A failed observation remains
+unknown; it never triggers a blind launch retry. Pure status/capability/output
+reads can retry transport errors within their deadline.
+
+`vm_job` takes `operation_id`, optional `wait_s` (0–20), `stdout_offset`,
+`stderr_offset` and `output_limit` (1–16384 bytes per stream). The inline
+observation budget is 20 seconds; longer commands keep running. Cancelling a
+wait does not terminate the workload. Control has a separate executor so four
+long waits cannot prevent shutdown/takeover. Kernel job cancellation and
+typed UI/event waits remain future work.
+
+Results distinguish leader exit, collected exit code/terminating signal,
+remaining tagged descendants, original POSIX process-group tasks, and each
+stream's EOF. Fork/threads inherit an immutable job tag across exec; reusing a
+PID cannot join another job. Overall `completed` requires collected leader
+status, no live tagged descendants and both pipe EOFs. The leader can exit
+while descendants retain output, and streams can close while descendants run.
+
+Each output result contains `text`, `next_offset`, `eof`, explicit
+`dropped_bytes`/`gaps` and pending UTF-8 bytes. Follow `next_offset`; an incomplete
+UTF-8 tail is not consumed. Decoding resets across retention gaps so disconnected
+bytes cannot invent characters. `guest.stdout_eof` describes the source pipe;
+`stdout.eof` also requires reaching the end of the requested retained output.
+Full-buffer counters count blocking attempts, not measured sleep durations.
+
+Host records survive server reconnect; output remains in the guest's bounded
+ring. Reset invalidates old operations. After shutdown, only saved status/exit
+metadata is returned with `cached: true`; full output artifacts and automatic
+job-output retention after shutdown remain future work. Check `observation_error`
+and per-stream `read_error`/`read_timed_out` before treating a snapshot as fresh.
+Normal CLI exit or stdio EOF waits for an in-flight upload to finish staging;
+the queued response is flushed immediately. A forced server termination may
+still need explicit same-ID staging recovery.
+
+Run real-VM acceptance against an explicit disposable session:
+
+```sh
+python3 tools/vm_bridge/accept_jobs.py --session SESSION_ID --out build/job-acceptance
+```
+
+The script leaves the VM running. `--resume` reuses completed same-session,
+same-request evidence following an interrupted test run. It does not mean an
+observation timeout stopped the VM or its workloads.
 
 Input is serialized across clients. Human takeover interrupts subsequent input
 and keeps observation available. Other mutations are still explicit tools;
@@ -168,6 +254,20 @@ frame's response was 1,784 bytes; its old base64 image payload alone would be
 5,626,572 bytes. This measures response size, not faster GPU capture. Guest
 checked sync, QEMU exit and all three offline filesystem checks passed. The
 test used the source server; the already-connected Codex MCP still needs reload.
+
+Command-job acceptance (17 October): 96 bridge tests, 91 passed and five optional
+encoder tests skipped; all 27 hosted kernel suites passed. Ten live scenarios
+passed on the eight-vCPU/4 GiB kernel, followed by a public MCP `vm_guest_run`
+stdio check and a clean missing-executable rejection. The parent-exit case
+reported exit 9 with two remaining tasks and open output; another case reported
+both EOFs with one task still running. The 140,000-byte output test explicitly
+reported 74,464 discarded bytes. TERM/KILL producer stress recorded 20 stdout
+and 11 stderr full-buffer blocking attempts, then zero descendants and both
+EOFs. The final process list returned to nine baseline services. Checked sync,
+QEMU exit, serial error screening and all three offline filesystem checks passed.
+Evidence is under ignored `build/workloads/gallery-fresh-20261017/job-acceptance/`
+and `job-final-check/`. Reset/panic, interactive stdin and post-shutdown full-output
+retention are not covered by this live gate.
 
 ### Optional memory census
 

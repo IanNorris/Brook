@@ -23,9 +23,21 @@ US-ASCII text and bounded waits; holds last only within a batch. An injection
 acknowledgement does not prove the guest reacted: observe again or check logs.
 Respect takeover. Never substitute host mouse/keyboard/clipboard APIs.
 
-vm_guest_run uses Brook syntax, e.g. run --uid 1000 /nix/profile/bin/brook-run
+Prefer vm_guest_run with argv, request_id (fresh 32-character lowercase hex),
+optional cwd/env and wait_s. It defaults to Brook UID 1000, cwd/home /data/home,
+and null stdin. Use real absolute executable paths. Retrieve longer operations
+with vm_job and its operation_id. Preserve stdout/stderr next_offset separately;
+check truncation, UTF-8 tails, read errors and EOF. Leader exit is distinct from
+descendant exit and output EOF. Reconnect preserves operation identity. After
+unknown delivery, inspect first; explicit identical resubmission can recover
+verified unfinished staging, while vm_job itself never launches or resumes.
+Changed arguments need a fresh request ID. Stop/reset invalidates active jobs;
+retrieve useful output before shutdown. A cancelled wait leaves the job running.
+These jobs do not exercise launcher UI or add automatic framebuffer windows.
+
+The legacy command form still uses Brook syntax, e.g. run --uid 1000 /nix/profile/bin/brook-run
 /nix/bin/brook-player --autoexit /data/videos/big-buck-bunny-720p.mov (one line).
-It returns a PID, not the process exit status or isolated stdout/stderr.
+That form returns a PID, not process exit status or isolated stdout/stderr.
 vm_guest lists windows/processes. vm_stats reports RAM and recent compositor
 intervals, not GPU draw time or physical display refresh.
 

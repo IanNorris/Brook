@@ -2977,6 +2977,27 @@ int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
     return outcome;
 }
 
+DebugJobSnapshot SchedulerDebugJobSnapshot(uint64_t job, uint16_t leaderPid,
+                                          uint64_t leaderIncarnation)
+{
+    DebugJobSnapshot result{};
+    uint64_t alf = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i=0;i<g_processCount;++i) {
+        const auto* p=g_allProcesses[i];
+        if (!job || p->debugJobId!=job) continue;
+        if (p->pid==leaderPid && p->incarnation==leaderIncarnation) {
+            result.leaderPresent=true;
+            result.leaderExited=p->state==ProcessState::Terminated;
+        }
+        if (p->state!=ProcessState::Terminated) {
+            ++result.liveTasks;
+            if (p->pgid==leaderPid) ++result.originalGroupTasks;
+        }
+    }
+    SchedLockRelease(g_allProcLock, alf);
+    return result;
+}
+
 void SchedulerDumpChildState(uint16_t parentPid, uint16_t targetPid)
 {
     uint64_t alf = SchedLockAcquire(g_allProcLock);

@@ -70,10 +70,10 @@ def load_session(session, live=True):
 
 
 @contextlib.contextmanager
-def session_lock(session):
+def session_lock(session, timeout=10):
     data = load_session(session)
     with (REGISTRY / session / "operation.lock").open("a") as lock:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + timeout
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

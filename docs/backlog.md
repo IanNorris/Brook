@@ -948,3 +948,34 @@ Two completed-frame observations during Gallery acceptance timed out over the
 guest debug TCP connection; a later observation of the same VM recovered.
 Preserve the serial traces under `build/workloads/gallery-installer-20261017/`
 and investigate connection/reply loss without replaying ambiguous mutations.
+
+### Command jobs and remaining bridge work (17 October)
+
+Structured command jobs now return isolated stdout/stderr, real exit status,
+tagged descendants, stream EOF and recoverable operation IDs. Live acceptance
+includes literal long argv, duplicate commits, signal status, independent
+leader/descendant/EOF transitions, bounded output loss, signalled producers
+with confirmed pipe backpressure, and server reconnect. The remaining
+[bridge specification](vm-bridge-next.md) includes semantic window/launcher
+hooks, consistent observation bundles and waits, job cancellation, finalized
+output artifacts after shutdown and broader reset/panic acceptance.
+
+Audit ordinary pipe waiter ownership. The full-pipe `sys_write` EINTR path can
+leave `writerWaiter` pointing at a producer that is later reaped; a raw magic
+check does not pin its lifetime. Debug jobs deliberately avoid dereferencing
+this pointer, use the existing 10 ms writer retry, and clear the stale waiter
+only after EOF and all tagged descendants terminate. This protects the new
+diagnostic consumer; it does not repair every existing pipe/socket waiter.
+
+Investigate debug-channel connection/reply loss and large-output latency.
+Command acceptance recovered a timed-out read-only capability request on the
+same live VM. Read-only queries now have bounded transport retries; mutations
+remain explicitly recovered. The 140,000-byte retention test took about 16 s
+including upload/status/output retrieval, while the six-producer signal stress
+took about 5.9 s. Separate guest execution from TCP framing/connection and
+hex-output retrieval costs before claiming a workload performance regression.
+
+The acceptance image lacks `/bin/bash`; the old shell silently resolves that
+spelling via fallback lookup. Structured jobs require an actual executable
+path (`/boot/BIN/BASH` on that image). Audit standard executable aliases as part
+of the fresh-image and real-workload follow-up.

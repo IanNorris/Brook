@@ -25,6 +25,7 @@ import zlib
 
 from common import ROOT, REGISTRY, QMP, artifact, load_session, process_identity, process_is_alive, recording_lock, session_lock, write_json
 from media import Delivery, describe as describe_artifact, scoped_path
+from jobs import Jobs
 
 MAX_LOG = 256 * 1024
 
@@ -244,7 +245,7 @@ def doctor(session, **_):
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
-                  "generation": data["generation"], "server_version": "0.3.0",
+                  "generation": data["generation"], "server_version": "0.4.0",
                   "bridge_capabilities": {"artifact_delivery": {"revision": 1,
                       "default": "references", "include_image": True,
                       "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
@@ -252,6 +253,11 @@ def doctor(session, **_):
             result["guest"] = guest(data, "bridge stats", timeout=3)
         except (OSError, ValueError, RuntimeError) as error:
             result["guest_error"] = str(error)
+        try:
+            caps=guest(data,"bridge job caps",timeout=3)
+            result["bridge_capabilities"]["command_jobs"]={"supported":caps.get("job_api")==1,**caps}
+        except (OSError,ValueError,RuntimeError) as error:
+            result["bridge_capabilities"]["command_jobs"]={"supported":False,"error":str(error)}
         return result
 
 
@@ -380,7 +386,21 @@ def stats(session, memory_details=False, **_):
         return result
 
 
-def guest_run(session, command, **_):
+def command_jobs():
+    return Jobs(REGISTRY,load_session,session_lock,guest,write_json)
+
+
+def job_status(session,operation_id,stdout_offset=0,stderr_offset=0,output_limit=4096,wait_s=0,_cancel=None,**_):
+    return command_jobs().status(session,operation_id,stdout_offset,stderr_offset,output_limit,wait_s,_cancel)
+
+
+def guest_run(session, command=None, argv=None, cwd="/data/home", env=None, uid=1000,
+              request_id=None, wait_s=0, _cancel=None, **_):
+    if argv is not None:
+        if command is not None:raise ValueError("Choose structured argv or legacy command, not both")
+        return command_jobs().submit(session,request_id,argv,cwd,env,uid,wait_s,_cancel)
+    if request_id is not None or env is not None or cwd!="/data/home" or uid!=1000 or wait_s!=0:
+        raise ValueError("Job options require structured argv")
     # This is explicitly the Brook run-command grammar, not host shell code.
     if not isinstance(command, str) or not command.startswith("run "):
         raise ValueError("Use Brook launch syntax: run [--uid 1000] /absolute/guest/path args")
@@ -796,7 +816,12 @@ register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop
 register("vm_observe",observe,"Leased completed-frame artifact with crop/scale metadata; briefly pauses VM; current kernel required; panic needs cached framebuffer",{**SESSION,**IMAGE_OPTION,"crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session"])
 register("vm_logs",logs,"Read bounded logs by byte cursor",{**SESSION,"source":STR,"offset":INT,"limit":INT},["session"],True)
 register("vm_stats",stats,"OS memory/process counts and compositor intervals; optional rolling memory census holds guest mapping locks while sampling",{**SESSION,"memory_details":{"type":"boolean"}},["session"],True)
-register("vm_guest_run",guest_run,"Launch via Brook run syntax; returns PID, not exit status",{**SESSION,"command":STR},["session","command"])
+register("vm_guest_run",guest_run,"Run structured guest argv with separate output and real exit status; requires request_id. Legacy command uses Brook run syntax and returns launch ACK only",{**SESSION,"command":STR,
+    "argv":{"type":"array","items":STR,"minItems":1,"maxItems":64},"cwd":STR,
+    "env":{"type":"object","additionalProperties":STR,"maxProperties":64},"uid":INT,
+    "request_id":STR,"wait_s":NUM},["session"])
+register("vm_job",job_status,"Recover/wait for a guest operation by ID; return exit, descendants, separate byte-cursor output and EOF; never repeats execution",{**SESSION,
+    "operation_id":STR,"stdout_offset":INT,"stderr_offset":INT,"output_limit":INT,"wait_s":NUM},["session","operation_id"],True)
 register("vm_guest",guest_inspect,"Guest windows/processes, or focus by window index in pid",{**SESSION,"action":STR,"pid":INT},["session"])
 register("vm_artifacts",get_artifact,"Describe a scoped artifact by local path, size and checksum, including after VM exit; binary is never embedded in JSON",{**SESSION,**IMAGE_OPTION,"artifact_name":STR},["session","artifact_name"],True)
 register("vm_profile",profile,"CPU samples and context-switch capture: start/stop/status/export to Speedscope",{**SESSION,"action":STR,"duration_ms":INT},["session"])
@@ -819,7 +844,8 @@ def call_tool(name,arguments,cancel=None):
     if any(k not in arguments for k in spec["inputSchema"]["required"]):raise ValueError("Missing required argument")
     for k,v in arguments.items():
         kind=properties[k]["type"]
-        if (kind=="string" and not isinstance(v,str)) or (kind=="boolean" and not isinstance(v,bool)) or (kind in {"integer","number"} and
+        if (kind=="string" and not isinstance(v,str)) or (kind=="boolean" and not isinstance(v,bool)) or \
+           (kind=="array" and not isinstance(v,list)) or (kind=="object" and not isinstance(v,dict)) or (kind in {"integer","number"} and
             (isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or (kind=="integer" and not isinstance(v,int)))):
             raise ValueError("Invalid type for "+k)
     result=fn(**arguments,_cancel=cancel)
@@ -835,6 +861,7 @@ def call_tool(name,arguments,cancel=None):
 def serve():
     out_lock=threading.Lock();pending={};pending_lock=threading.Lock()
     executor=ThreadPoolExecutor(max_workers=4)
+    control_executor=ThreadPoolExecutor(max_workers=1)
     def emit(value):
         with out_lock:
             print(json.dumps(value,separators=(",",":")),flush=True)
@@ -844,7 +871,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.3.0"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.4.0"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":
@@ -881,11 +908,13 @@ def serve():
                 if message["id"] in pending or len(pending)>=32:
                     emit({"jsonrpc":"2.0","id":message["id"],"error":{"code":-32600,"message":"Duplicate ID or too many pending requests"}});continue
                 pending[message["id"]]=event
-            executor.submit(handle,message,event)
+            pool=control_executor if message.get("method")=="tools/call" and message.get("params",{}).get("name")=="vm_control" else executor
+            pool.submit(handle,message,event)
     finally:
         with pending_lock:
             for event in pending.values():event.set()
         executor.shutdown(wait=True)
+        control_executor.shutdown(wait=True)
 
 
 if __name__=="__main__":
@@ -894,6 +923,6 @@ if __name__=="__main__":
     parser.add_argument("--arguments",default="{}")
     options=parser.parse_args()
     if options.call:
-        try:print(json.dumps(call_tool(options.call,json.loads(options.arguments))))
+        try:print(json.dumps(call_tool(options.call,json.loads(options.arguments))),flush=True)
         except Exception as error:print(json.dumps({"error":str(error)}));raise SystemExit(1)
     else:serve()

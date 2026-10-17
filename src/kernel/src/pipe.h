@@ -24,6 +24,7 @@ struct PipeBuffer
 
     volatile uint32_t readers = 0;   // Number of FDs open for reading
     volatile uint32_t writers = 0;   // Number of FDs open for writing
+    volatile uint64_t fullWriteWaits = 0; // Confirmed-full blocking attempts
 
     // AF_UNIX direction shutdown, independent of endpoint ownership. Protected
     // by lock for mutation; readiness paths take atomic snapshots. Ordinary

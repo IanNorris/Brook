@@ -1697,6 +1697,64 @@ int ShellLaunchCommand(const char* command)
     return ExecCommand(argc, argv);
 }
 
+Process* ShellCreateDebugJob(int argc, const char* const* argv, const char* cwd,
+    int envc, const char* const* env, uint32_t uid, const FdEntry* standardFds)
+{
+    ShellDispatchGuard dispatch;
+    if (argc<1 || argc>64 || envc<0 || envc>64 || argv[0][0]!='/' ||
+        StrLen(argv[0])>=256 || StrLen(cwd)>=sizeof(Process::cwd) || cwd[0]!='/') return nullptr;
+    VnodeStat stat;
+    if (VfsStatPath(cwd,&stat)!=0 || !stat.isDir) return nullptr;
+    char paths[5][256]{};char extra[4][256]{};
+    const char* effective[80];int count=argc;
+    for (int i=0;i<argc;++i) effective[i]=argv[i];
+    StrCopy(paths[0],argv[0],sizeof(paths[0]));
+    int depth=0;
+    for (;depth<4;++depth) {
+        char interpreter[256],argument[256];
+        if (!PeekShebang(paths[depth],interpreter,sizeof(interpreter),argument,sizeof(argument))) break;
+        if (!ResolveBinaryPath(interpreter,paths[depth+1],sizeof(paths[0]))) return nullptr;
+        StrCopy(extra[depth],argument,sizeof(extra[0]));
+        const int added=extra[depth][0]?2:1;
+        if (count+added>80) return nullptr;
+        for (int i=count-1;i>=1;--i) effective[i+added]=effective[i];
+        effective[0]=paths[depth+1];
+        if (added==2) effective[1]=extra[depth];
+        effective[added]=paths[depth];count+=added;
+    }
+    char user[32],login[32];
+    LaunchIdentityEnvironment(user,false,uid);LaunchIdentityEnvironment(login,true,uid);
+    const char* launchEnv[192];int n=0;
+    const auto* defaults=ShellGetDefaultEnvp();
+    for (int i=0;defaults[i];++i) {
+        if (n>=127) return nullptr;
+        const char* value=defaults[i];
+        if (StrEq(value,"USER=root")) value=user;
+        if (StrEq(value,"LOGNAME=root")) value=login;
+        bool replaced=false;
+        for (int j=0;j<envc;++j) {
+            uint32_t k=0;
+            while (env[j][k] && env[j][k]!='=' && value[k]==env[j][k]) ++k;
+            if (env[j][k]=='=' && value[k]=='=') {replaced=true;break;}
+        }
+        if (!replaced) launchEnv[n++]=value;
+    }
+    for (int i=0;i<envc;++i) launchEnv[n++]=env[i];
+    ExecutableImage image{};Vnode* vnode=nullptr;char executable[256];
+    int result=VfsOpenExecutable(paths[depth],&vnode,executable,sizeof(executable));
+    if (!result) result=ReadExecutableImage(vnode,&image);
+    if (vnode) VfsClose(vnode);
+    if (result) return nullptr;
+    Process* proc=ProcessCreateExecutable(image,count,effective,n,launchEnv,standardFds,
+                                         uid,LaunchPrimaryGroup(uid));
+    FreeExecutableImage(&image);
+    if (!proc) return nullptr;
+    StrCopy(proc->exePath,executable,sizeof(proc->exePath));
+    const char* base=argv[0];for (const char* p=base;*p;++p) if (*p=='/') base=p+1;
+    StrCopy(proc->name,base,sizeof(proc->name));StrCopy(proc->cwd,cwd,sizeof(proc->cwd));
+    return proc;
+}
+
 int ShellExecScript(const char* path)
 {
     ShellDispatchGuard dispatch;

@@ -3,8 +3,12 @@
 Status: partially implemented, 17 October 2026. Bridge 0.3.0 implements the
 reference-first media adapter, optional native previews, recursive binary
 extraction and artifact capability revision 1. Existing artifacts without a
-recorded monotonic creation time report it as unknown. Remaining sections,
-including command jobs and semantic UI controls, are proposed. Current behavior is documented in the
+recorded monotonic creation time report it as unknown. Bridge 0.4.0 adds
+structured command jobs, bounded separate output, exit/descendant/EOF tracking,
+durable request identities, verified staging recovery and reserved control
+capacity. Output artifacts after shutdown, job cancellation, semantic UI
+controls, observation bundles and remaining sections are still proposed.
+Current behavior is documented in the
 [bridge README](../tools/vm_bridge/README.md). Preserve the existing VM-only
 architecture and [completed-frame capture contract](completed-frame-capture.md).
 

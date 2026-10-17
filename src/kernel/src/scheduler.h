@@ -110,6 +110,14 @@ struct ChildWaitSnapshot {
 int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
                        uint32_t options, ChildWaitSnapshot* result);
 void SchedulerDumpChildState(uint16_t parentPid, uint16_t targetPid);
+// A job tag cannot match a reused PID. Counts include all descendant process
+// groups; originalGroupTasks separately describes the initial POSIX group.
+struct DebugJobSnapshot {
+    uint32_t liveTasks, originalGroupTasks;
+    bool leaderPresent, leaderExited;
+};
+DebugJobSnapshot SchedulerDebugJobSnapshot(uint64_t job, uint16_t leaderPid,
+                                          uint64_t leaderIncarnation);
 void SchedulerStop(Process* proc, int signal = 19);
 
 // Find a non-terminated process whose name (basename, possibly suffixed
