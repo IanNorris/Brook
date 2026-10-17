@@ -351,6 +351,17 @@ method pointer is invalid at the fault; its lifetime/corruption cause remains
 unproven. Evidence: ignored
 `build/workloads/gallery-fresh-20261017/native-close-full-serial.log`.
 
+17 October remote checkpoint: the kernel now invokes whole-group teardown for
+unhandled worker hardware faults too, and promotes a raw-exited leader's normal
+wait status to the subsequent fatal signal. The kernel builds and all 26 hosted
+suites passed. Initial fixed-kernel testing passed the worker-fault and handled
+control cases; intermittent exited-leader failures were traced to the probe's
+readiness poll being interrupted by SIGCHLD before sending the trigger (those
+cases produced no hardware-fault dump). The corrected probe passes 48/48 on
+Linux. Its final Brook rerun, existing fatal-signal regression probe, and real
+VLC close/task-reclamation check remain pending. Treat this as a containment
+checkpoint, not completed acceptance or a fix for VLC's invalid proxy access.
+
 The same install emitted “real strand” scheduler warnings but completed. Astra
 review found that the detector combines process state, ready-queue and trace
 observations under separate locks, and the printed trace shows fresh RUN/BLOCK

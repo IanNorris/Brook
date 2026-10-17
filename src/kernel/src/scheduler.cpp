@@ -2756,7 +2756,8 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
     {
         Process* p = g_allProcesses[i];
         if (p && p != caller && p != executing && p->tgid == tgid
-            && p->state != ProcessState::Terminated)
+            && (p->state != ProcessState::Terminated ||
+                (terminationSignal && p->pid == tgid)))
         {
             if (count < MAX_PROCESSES) {
                 // BRO-173: claim teardown ownership while still holding
@@ -2799,6 +2800,19 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
         Process* p = targets[i];
         SchedulerMarkTerminated(p, terminationSignal ? (terminationSignal & 0x7f)
                                                      : ((exitStatus & 0xff) << 8));
+        if (terminationSignal && p->pid == tgid) {
+            // A leader can exit via raw SYS_exit while peers keep the process
+            // alive. A later fatal worker fault must replace that provisional
+            // normal exit status. The snapshot reference protects the leader;
+            // this worker's AS ownership still prevents parent reaping. Keep
+            // an already-published fatal signal (first fatal result wins).
+            // Check after terminal publication so a concurrent normal exit
+            // cannot slip between this check and SchedulerMarkTerminated.
+            uint64_t flags = SchedLockAcquire(g_readyLock);
+            if (p->state == ProcessState::Terminated && !(p->waitStatus & 0x7f))
+                p->waitStatus = terminationSignal & 0x7f;
+            SchedLockRelease(g_readyLock, flags);
+        }
         DbgPrintf("SCHED: exit_group killing thread pid=%u tgid=%u\n",
                   p->pid, p->tgid);
     }

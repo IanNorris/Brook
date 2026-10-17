@@ -799,6 +799,20 @@ browser cleanup, heap integrity and clean offline filesystem checks. A 60-second
 alarm bounds the probe. Internet sockets and unbound/listening Unix shutdown
 remain outside Brook's connected-stream subset and return EOPNOTSUPP.
 
+`faultgroupcheck.c` requires `-pthread` and x86-64. Six cases exercise actual
+worker SIGSEGV, SIGILL and SIGFPE faults, a leader SIGSEGV, a handled worker
+SIGSEGV, and a worker fault after raw leader `SYS_exit(0)`. Other workers block
+in futex and pipe reads. The parent waits for readiness, triggers the fault,
+then uses blocking waitpid with an alarm deadline. It checks the exact fatal
+signal and pipe EOF after group teardown; the handled control must remain alive
+until explicit SIGKILL. Readiness waits retry EINTR, including SIGCHLD from a
+raw leader exit. Failure output identifies the stage and distinguishes the
+observed wait result from cleanup. Run `faultgroupcheck 8` for 48 cases, with
+an external host deadline as well. The Linux control passes 48/48; the final
+probe still needs its Brook rerun at the current checkpoint. Follow guest
+acceptance with task-count recovery, checked shutdown and offline fsck. This
+tests fault containment, not a fix for VLC's underlying invalid proxy access.
+
 `fatalgroupcheck.c` requires `-pthread`. It creates a child with futex, pipe,
 epoll and timed-sleep workers. Twelve cases cover default SIGTERM to the leader
 and a nonleader, nonleader `tgkill(SIGKILL)`, raw `alarm` SIGALRM, masked TERM,

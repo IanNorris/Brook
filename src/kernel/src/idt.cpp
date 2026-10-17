@@ -717,21 +717,12 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         ExcPutsRaw(cpuTag); ExcPutsRaw("=== KILLING PROCESS ===\n");
         --excDepthPerCpu[cpuSlot];
         __asm__ volatile("sti");
-        // BRO-176: a fatal user fault is group-fatal. In Linux a fatal SIGSEGV
-        // terminates the WHOLE thread group, not just the faulting thread. If the
-        // faulting thread is a thread-group LEADER with live sibling threads,
-        // SchedulerExitCurrentProcess alone only marks the leader Terminated and
-        // waits for the siblings to exit on their own (see scheduler.cpp). But the
-        // siblings are typically Blocked in futex waits and nothing wakes/kills
-        // them, so asLiveThreads never drains to 0, the leader is never reapable,
-        // and the group wedges as a permanent zombie -> reap-stall -> watchdog
-        // panic (the BRO-176 STK crash). Mirror exactly what sys_exit already does
-        // for a leader exiting with live peers (syscall.cpp): tear the whole group
-        // down first. SchedulerKillThreadGroup is a no-op when no siblings exist,
-        // and the interrupts-enabled (sti above) state matches sys_exit's context,
-        // which its Phase-2 quiesce-wait requires. Leader-gated: a worker-thread
-        // fault being group-fatal needs the leader parent-notify hoisted out of
-        // SchedulerExitCurrentProcess first (follow-up).
+        // An unhandled fatal user fault ends the entire thread group, including
+        // when a worker faults. Handled faults returned through the earlier
+        // signal path. Use the same quiescing helper as default-fatal signal
+        // delivery; final scheduler/AS reference drops notify the leader's
+        // parent even when that leader never executes its own exit cleanup.
+        // The quiesce wait requires interrupts enabled (sti above).
         // Record a fatal signal separately from the diagnostic exception
         // vector, so wait4 reports a crash rather than a normal exit code.
         int faultSignal = 11; // SIGSEGV: page/protection and other user faults
@@ -739,7 +730,7 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         else if (vector == 1 || vector == 3) faultSignal = 5; // SIGTRAP
         else if (vector == 6) faultSignal = 4; // SIGILL
         else if (vector == 17) faultSignal = 7; // SIGBUS (alignment check)
-        if (diagProc && diagProc->pid == diagProc->tgid && !diagProc->isThread)
+        if (diagProc)
             brook::SchedulerKillThreadGroup(diagProc->tgid, diagProc,
                                             -static_cast<int>(vector), faultSignal);
         brook::SchedulerExitCurrentProcess(-static_cast<int>(vector), faultSignal);
