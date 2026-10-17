@@ -1,5 +1,8 @@
 # Brook VM bridge
 
+Proposed follow-up: [efficiency, artifact delivery and UI control specification](../../docs/vm-bridge-next.md).
+This proposal is separate from implemented behavior.
+
 A local Python MCP server for explicitly enabled Brook QEMU
 sessions. It observes and injects input into the selected VM through private
 QMP sockets and Brook's guest debug channel. It never captures the host desktop.

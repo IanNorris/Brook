@@ -1,5 +1,8 @@
 # VM-only computer-use MCP research
 
+Proposed follow-up: [efficiency, artifact delivery and UI control specification](vm-bridge-next.md).
+This proposal is separate from implemented behavior.
+
 Research and implementation date: 14 October 2026. A first working bridge is
 implemented in [tools/vm_bridge](../tools/vm_bridge/README.md) and registered
 as the local `brook-vm` Codex MCP. No existing desktop-control plugin was
