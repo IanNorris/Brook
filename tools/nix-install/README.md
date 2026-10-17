@@ -21,6 +21,22 @@ abruptly terminated writer may leave its lock; it is never automatically
 reclaimed using a potentially reused PID. Its `owner` file is diagnostic.
 Maintenance must establish that no writer remains before removing a stale lock.
 
+Gallery uses SIGUSR1 for cooperative cancellation, with the signal blocked
+across exec until the installer installs its handler. The installer closes a
+private pipe to ask the fetcher to stop between complete archive operations;
+it waits for the fetcher and its archive pipeline instead of killing writers.
+Both pipe ends are above descriptors 0–2 and close-on-exec except the read end
+explicitly passed to the fetcher. Closed standard streams are filled before
+the fetcher constructs its archive pipelines.
+
+Before publication, the installer blocks SIGUSR1 and queries `rt_sigpending`
+to catch a request that arrived at the boundary. A request before that boundary
+returns 130 without changing registration; a request after it lets publication
+and link refresh finish. Use a kernel with syscall 127 implemented. Completed
+store downloads remain cached. Metadata batches and active archive transfers
+can delay cancellation; this protocol has no tight response-time guarantee.
+It does not make forced termination or the complete profile crash-atomic.
+
 Build and tests:
 
 ```sh
@@ -40,3 +56,8 @@ failed writes using RLIMIT_FSIZE, concurrent readers, the public CLI with
 
 The [App Gallery acceptance](../../docs/app-gallery.md) exercised the actual
 installer as UID 1000, package execution, reboot persistence and removal.
+Seven further host tests cover cancellation in real installer/fetcher/extractor
+processes using generated archives, closed stdin, early requests across exec,
+cached retry, invalid control descriptors and both commit boundaries. The final
+guest build passed gated Stop, close-and-cancel and offline cached retry;
+cleanup returned to ten tasks and all three offline filesystem checks passed.

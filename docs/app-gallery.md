@@ -85,7 +85,7 @@ The debug TCP transport timed out during two observations; re-observing the same
 VM recovered. No ambiguous install action was replayed. These are open bridge
 reliability observations, not clean transport acceptance.
 
-## Cancellation checkpoint (work in progress)
+## Cooperative cancellation
 
 The remote work branch includes cooperative Stop and close-and-cancel handling.
 The installer requests cancellation through a private pipe; an active archive
@@ -119,9 +119,24 @@ state. Registration contained exactly one fixture row, the mutation lock was
 absent, and closing Gallery returned to ten tasks. Checked shutdown and all
 three filesystem checks passed. All 17 installer host tests and 26 hosted
 suites passed. This fixture validates the operation path, not large-application
-repair. Repeat gated Stop/close acceptance with the final descriptor setup
-before treating cancellation as fully accepted. Evidence remains under ignored
-`build/workloads/gallery-cancel-20261017/`.
+repair. Evidence remains under ignored `build/workloads/gallery-cancel-20261017/`.
+
+The final kernel and descriptor setup were then exercised in session
+`67caa20c55044a3997f8a0fe6b443923`. Stop during a gated dependency archive kept
+the old three-package manifest, completed that dependency with its expected
+SHA-256, skipped the root archive and left no fixture temporary directory or
+mutation lock. The installer and fetcher both exited 130; Gallery remained
+responsive with fourteen tasks including its workers.
+
+A second attempt reused the dependency and gated the final archive. Closing
+the native window showed “Stopping safely” and kept Gallery alive until that
+archive finished. Gallery then closed, both complete cached files matched their
+expected SHA-256, registration was unchanged, and ten tasks remained. With the
+fixture server stopped, a subsequent UID-1000 install succeeded from those
+cached files, adding exactly one fixture registration. The lock and temporary
+directories were absent afterward. Checked shutdown and all three offline
+filesystem checks passed. These controlled archive tests validate cooperative
+cancellation, not SIGKILL/crash recovery or a maximum cancellation latency.
 
 `rt_sigpending` observes the caller's blocked ordinary pending bits and matching
 POSIX timers without consuming either. Ordinary process-directed signal routing
@@ -132,7 +147,6 @@ those wider signal semantics. Its partial-size contract follows the
 
 ## Remaining work
 
-- Repeat gated cancellation acceptance with the final descriptor setup.
 - Disk-full and interrupted-install recovery across the whole profile. Atomic
   manifest publication alone does not transact symlinks and launcher metadata.
 - Dependency/shared-file removal ownership and base-image package registration.

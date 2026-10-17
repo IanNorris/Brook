@@ -99,7 +99,9 @@ the table distinguishes tested behavior from remaining limitations.
   and [launch feedback](docs/launch-feedback.md).
 - **App Gallery:** search the package index and install, repair or remove
   packages from the shared desktop profile. A real install, executable launch,
-  reboot persistence and removal passed as Brook. See [Gallery status](docs/app-gallery.md)
+  reboot persistence and removal passed as Brook. Stop and close-during-install
+  finish the active archive safely; cancelled downloads can be reused on retry.
+  See [Gallery status](docs/app-gallery.md)
   for recovery and deployment work still open.
 - **VM control bridge:** VM-only screenshots and input, guest command launches,
   logs, CPU/context-switch profiles, OS statistics, silent-output PCM capture,
