@@ -1,3 +1,4 @@
+#include "signal_defaults.h"
 #include "unix_lifetime_trace.h"
 // process.cpp -- Process creation, fd table, user stack setup.
 //
@@ -1846,15 +1847,7 @@ int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
     // SIGKILL and SIGSTOP cannot be caught/blocked
     if (signum == SIGKILL)
     {
-        // Immediately terminate. There's a race window if the process is
-        // Running on another CPU — it may execute a few more instructions
-        // before the next timer tick preempts it. This is acceptable for a
-        // hobby OS; a production kernel would use an IPI to force-preempt.
-        SchedulerMarkTerminated(proc, SIGKILL);
-        // BRO-173/175: reapable is decoupled from holders; the reaper requires
-        // refCount==0 before freeing, so it is safe to mark reapable here.
-        __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
-        DbgPrintf("SIGNAL: SIGKILL -> pid %u\n", proc->pid);
+        SchedulerRequestFatalSignal(proc, signum);
         return 0;
     }
 
@@ -1888,7 +1881,11 @@ int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
         if (sa.handler == 0 || sa.handler == 1) // SIG_DFL or SIG_IGN
         {
             if (sa.handler == 1) return 0; // SIG_IGN — ignore
-            // Default action: stop
+            // Catchable default stop signals respect the target mask.
+            if (proc->sigMask & (1ULL << (signum - 1))) {
+                QueueSignal(proc, signum, info);
+                return 0;
+            }
             SchedulerStop(proc, signum);
             DbgPrintf("SIGNAL: sig %d -> pid %u stopped (default)\n", signum, proc->pid);
             return 0;
@@ -1916,25 +1913,18 @@ int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
         // SIG_DFL where the default action is "terminate": kill the process.
         // Without this, abort()'s raise(SIGABRT) with SIG_DFL sets the bit
         // pending but never terminates — execution falls through to HLT.
-        bool defaultIsTerminate = (signum == 1  || signum == 2  || signum == 3  ||
-                                   signum == 4  || signum == 6  || signum == 8  ||
-                                   signum == 11 || signum == 13 || signum == 14 ||
-                                   signum == 15);
-        if (sa.handler == 0 && defaultIsTerminate)
+        const bool masked = (proc->sigMask & (1ULL << (signum - 1))) != 0;
+        if (sa.handler == 0 && DefaultSignalAction(signum) == SignalDefault::Terminate && !masked)
         {
-            SchedulerMarkTerminated(proc, signum);
-            // BRO-173/175: reapable decoupled from holders (reaper requires
-            // refCount==0), so it is safe to mark reapable unconditionally.
-            __atomic_store_n(&proc->reapable, true, __ATOMIC_RELEASE);
-            DbgPrintf("SIGNAL: sig %d -> pid %u terminated (default action)\n",
-                      signum, proc->pid);
+            SchedulerRequestFatalSignal(proc, signum);
             return 0;
         }
     }
 
     QueueSignal(proc, signum, info);
 
-    // Wake blocked processes so they can handle the signal
+    // Synchronous sigtimedwait also consumes masked signals. Keep its wake;
+    // ordinary waits recheck their deliverable mask after a spurious wake.
     if (proc->state == ProcessState::Blocked)
     {
         proc->pendingWakeup = 1;
@@ -2059,48 +2049,17 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // SIG_DFL (0) — default action
     if (sa.handler == 0)
     {
-        // Timer-origin signals preserve pending/mask semantics until dequeue.
-        // Catchable signals other than the default-ignore set terminate by
-        // default, including the real-time range (ordinary legacy dispatch
-        // below historically omitted those defaults).
-        if (signalInfo.si_code == -2 && signum != 17 && signum != 23 && signum != 28) {
-            SchedulerKillThreadGroup(proc->tgid, proc, 128 + signum, signum);
-            SchedulerExitCurrentProcess(128 + signum, signum);
-        }
-        switch (signum)
-        {
-        case 1:  // SIGHUP
-        case 2:  // SIGINT
-        case 3:  // SIGQUIT
-        case 6:  // SIGABRT
-        case 11: // SIGSEGV
-        case 13: // SIGPIPE
-        case 14: // SIGALRM
-        case 15: // SIGTERM
-            DbgPrintf("SIGNAL: default terminate pid %u by signal %d\n", proc->pid, signum);
-            // A fatal default signal terminates the whole thread group on
-            // Linux. Killing only this thread lets sibling threads run after
-            // process-wide teardown has started.
-            SchedulerKillThreadGroup(proc->tgid, proc, 128 + signum, signum);
-            SchedulerExitCurrentProcess(128 + signum, signum);
-        case 17: // SIGCHLD — default is ignore
-        case 28: // SIGWINCH — ignore
+        const auto action = DefaultSignalAction(signum);
+        if (action == SignalDefault::Ignore || action == SignalDefault::Continue)
             return syscallResult;
-        case 20: // SIGTSTP — default is stop
-        case 21: // SIGTTIN
-        case 22: // SIGTTOU
-        {
-            DbgPrintf("SIGNAL: pid %u stopped by signal %d\n", proc->pid, signum);
-            // Set Stopped state. The scheduler timer tick will deschedule
-            // this process when it sees state != Running. We can't call
-            // SchedulerStop/Yield from SyscallCheckSignals because we're
-            // in the syscall return path with a special stack layout.
+        if (action == SignalDefault::Stop) {
             SchedulerMarkStopped(proc, signum);
             return syscallResult;
         }
-        default:
-            return syscallResult;
-        }
+        // Syscall return is a process-context boundary with no sender locks.
+        // The synchronous exit path can quiesce peers before exiting this task.
+        SchedulerKillThreadGroup(proc->tgid, proc, 128 + signum, signum);
+        SchedulerExitCurrentProcess(128 + signum, signum);
     }
 
     // SIG_IGN (1)

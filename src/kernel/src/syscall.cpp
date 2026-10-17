@@ -10427,18 +10427,7 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,
         SchedulerKernelRegionLeave(self);
         return -ESRCH;
     }
-    int result = 0;
-    if (signal == 9) {
-        // A process-directed fatal signal terminates every live thread. The
-        // referenced target pins the TGID lifetime while the group is latched
-        // and snapshotted; no filesystem cleanup happens under registry locks.
-        SchedulerKillThreadGroup(target->tgid, target, 128 + 9, 9);
-        result = ProcessSendSignal(target, 9);
-        if (self != target && self->tgid == target->tgid)
-            SchedulerMarkTerminated(self, 9);
-    } else if (signal) {
-        result = ProcessSendSignal(target, signal);
-    }
+    int result = signal ? ProcessSendSignal(target, signal) : 0;
     ProcessUnref(target);
     SchedulerKernelRegionLeave(self);
     return result;

@@ -1932,3 +1932,31 @@ A second native exit, however, left a terminated shutdown-launched helper leader
 and four live threads. Repeated exit cleanup remains open; the memory cache
 correctly retains frames while those threads still own mappings. The linked
 report records the hang dump and a fatal-signal-delivery hypothesis.
+
+
+### Fatal-signal cleanup regression (17 October)
+
+The retained Codium helper group exposed a default-fatal signal path that
+terminated only its addressed task. A referenced, generation-matched,
+non-waiting group cancellation request now covers direct and thread-directed
+fatal signals, including timer/terminal senders. Masked signals remain pending;
+immediate and deferred default actions agree. Existing synchronous exit_group
+semantics remain separate.
+
+A Linux-controlled 12-case native probe fails nine cases on the preceding
+kernel and passes all 48 cases over four rounds on the candidate. Coverage
+includes futex/pipe/epoll peers, nonleader SIGKILL/SIGTERM, raw alarm delivery,
+masked/default/handled/ignored signals, real-time defaults, thread birth during
+cancellation and raw leader-only exit. Filesystem cancellation on ext2/FAT,
+32 mixed exit_group rounds and the existing wait-mask suite also pass with no
+leftover test tasks and heap integrity OK. The first candidate Codium native
+close released all helper threads. Repeated app acceptance and persistence are
+recorded in the [memory/exit report](browser-memory-checkpoint-20261017.md).
+
+Three candidate native Codium close cycles now release every tested helper,
+including concurrent Chromium use and a reboot restoring the edited document.
+The 224-byte saved file retains Brook ownership and its SHA-256. ext2/FAT
+cancellation fixtures also verify after reboot. Both checked app shutdowns and
+all offline filesystem checks pass. Startup remains slow; full process-wide
+signal routing, stop/continue behavior and raw leader-exit final wait status
+remain separate follow-ups in the linked report.

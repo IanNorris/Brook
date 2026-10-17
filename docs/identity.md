@@ -396,3 +396,14 @@ Codium memory failure and directory authorization gaps remain open.
 The audit identifies unfinished implementation, rather than accepting the
 current desktop as a multi-user system. Filesystem integrity checks alone do not
 prove authorization or identity correctness.
+
+
+### Browser/editor acceptance follow-up (17 October)
+
+The [memory and exit report](browser-memory-checkpoint-20261017.md) supersedes
+the earlier browser/editor memory failure above: bounded immutable ELF sharing
+allows native Chromium browsing and Codium edit/save/reopen together in a 4 GiB
+VM. Fatal-signal group cancellation fixes retained Codium shutdown helpers in
+three native-close cycles, including reboot persistence. The edited document
+is owned by Brook. This progress does not resolve the directory authorization
+or install privilege-boundary gaps; it is not acceptance of multiple accounts.

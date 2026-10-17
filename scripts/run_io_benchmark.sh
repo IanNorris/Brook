@@ -16,4 +16,5 @@ done
 "$MUSL_CC" -O2 -Wall -Wextra -static tools/at-syscall-probe/flushcheck.c -o build/io-bench/flushcheck
 "$MUSL_CC" -O2 -Wall -Wextra -static -pthread tools/at-syscall-probe/threadpagecheck.c -o build/io-bench/threadpagecheck
 "$MUSL_CC" -O2 -Wall -Wextra -static -pthread tools/at-syscall-probe/exitgroupcheck.c -o build/io-bench/exitgroupcheck
+"$MUSL_CC" -O2 -Wall -Wextra -static -pthread tools/at-syscall-probe/fatalgroupcheck.c -o build/io-bench/fatalgroupcheck
 python3 scripts/io_acceptance.py "$@"

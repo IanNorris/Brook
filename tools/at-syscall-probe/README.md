@@ -788,3 +788,24 @@ through a duplicate. Require `SHUTDOWNCHECK PASS checks=722 rounds=8`, then norm
 browser cleanup, heap integrity and clean offline filesystem checks. A 60-second
 alarm bounds the probe. Internet sockets and unbound/listening Unix shutdown
 remain outside Brook's connected-stream subset and return EOPNOTSUPP.
+
+`fatalgroupcheck.c` requires `-pthread`. It creates a child with futex, pipe,
+epoll and timed-sleep workers. Twelve cases cover default SIGTERM to the leader
+and a nonleader, nonleader `tgkill(SIGKILL)`, raw `alarm` SIGALRM, masked TERM,
+handled/ignored TERM, raw leader `SYS_exit`, racing thread creation, default
+SIGUSR1, masked SIGUSR2 and real-time signal 34. Parent waitpid is bounded;
+failing cases request process-wide SIGKILL and use a second bounded wait.
+Handled/ignored controls must exit normally, fatal cases must report the exact
+signal, and raw leader exit must leave peers alive until explicitly released.
+It does not establish complete process-wide routing or stop/continue semantics.
+
+```sh
+mkdir -p build/io-bench
+nix-shell --run '"$MUSL_CC" -O2 -Wall -Wextra -Werror -static -pthread tools/at-syscall-probe/fatalgroupcheck.c -o build/io-bench/fatalgroupcheck'
+```
+
+Stage the ignored binary on a disposable VM disk while stopped, then run
+`run /data/fatalgroupcheck 4` through `vm_guest_run`. Expect
+`FATALGROUPCHECK PASS rounds=4 cases=48 failures=0`, no remaining test tasks,
+heap integrity OK and no kernel ownership warnings. Follow with checked guest
+shutdown and offline filesystem checks. The same binary is a Linux control.

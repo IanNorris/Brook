@@ -56,7 +56,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Wayland browsing, JavaScript/input, Google/Amazon HTTPS and 480p YouTube video verified; Brook-user menu launch and normal exit rechecked; audio under investigation |
 | [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
 | [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation, text input, save/load verified; music and two bounded exit tests pass; longer-session exit testing remains |
-| [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, save/reopen and normal exit verified alongside Chromium in a 4 GiB VM; startup remains slow and intermittent helper cleanup needs work; Electron sandbox disabled |
+| [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, save/reopen and normal exit verified alongside Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
 | [Blender](https://www.blender.org/) | 5.1.1 | 🚧 Blocked | Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
@@ -71,8 +71,9 @@ the table distinguishes tested behavior from remaining limitations.
   launcher uses software Wayland and a persistent profile; startup remains slow.
   Byte-identical executable pages now share COW frames across independent
   launches; Chromium and Codium passed concurrent editing/browsing in a 4 GiB
-  guest. A repeated exit left helper threads alive; cleanup, broader
-  memory-pressure testing and startup performance work remain.
+  guest. Fatal-signal group cancellation fixes retained shutdown helpers;
+  three native close cycles, including a reboot, release every tested helper.
+  Broader memory-pressure testing and startup performance work remain.
 
 - **Modern browsers:** stock Firefox and Chromium render real HTTPS websites
   with working input and JavaScript. Chromium now plays YouTube video and audio,

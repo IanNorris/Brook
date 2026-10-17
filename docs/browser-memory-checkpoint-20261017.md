@@ -327,3 +327,102 @@ Astra confirmed that synchronous group-kill cannot be called from every signal
 sender: timer/terminal callers may hold IRQ/terminal locks. Follow-up needs a
 non-waiting fatal-group request with proper snapshot references, birth latch,
 masked-signal behavior and cooperative waiter cancellation.
+
+## Fatal-signal group cancellation follow-up
+
+The focused `fatalgroupcheck` control reproduces the cleanup defect independently
+of Electron. With identical static probe bytes, Linux passes all twelve cases;
+the cache checkpoint kernel fails nine (term to leader/thread, tgkill KILL to a
+thread, alarm-group, masked TERM, clone race, USR1, masked USR2 and real-time 34).
+Handled/ignored TERM and raw leader SYS_exit controls pass. The corrected alarm
+case uses raw SYS_alarm; an earlier exploratory run used musl's unimplemented
+setitimer wrapper and is not the final baseline. Baseline session
+`f0529f00acaf492cabea9f9e484f3dd3`, kernel
+`3af99054fd37878cd881fec57197511857a50bb8c00dc4420afcdd4e9f9480dd`.
+
+`SchedulerRequestFatalSignal` now snapshots every generation-matched group
+member under the registry lock and publishes the thread-birth exit latch.
+It marks members outside that lock, releases notification-safe references with
+IRQs still disabled, and never waits for peer quiescence. Existing cooperative
+operation/wait cancellation and reaper gates drain the group. Timer and terminal
+senders therefore avoid the synchronous syscall group-kill helper's waits and
+IRQ enabling. Both SIGKILL and unblocked catchable default-fatal delivery use
+this path, including tgkill to a nonleader. Masked catchable signals remain
+pending; the existing wake is preserved for synchronous signal waits. Deferred
+and immediate default action classification now agree, including user and
+real-time fatal signals. Raw SYS_exit continues to terminate only its caller.
+Astra's read-only review found no blocking lock/reference issue.
+
+Candidate kernel
+`fc6e8cf96cb494a83d316d1f73569fd3fdf0d39f2c1e55f0bbe2d2cb41ed31c1`,
+session `60b27dc31cb7485fb667114d670e3e73`, 8 CPUs / 4 GiB:
+**48/48 cases pass** across four rounds, followed by 9 kernel tasks, zero cache
+entries and heap integrity OK. Checked shutdown and all three offline filesystem
+checks passed. All 23 hosted suites and the two-pass release build passed.
+
+The same candidate rebooted as `7346cfc4fe2c4d73837b0f4f6ea0d93e` and passed
+16 filesystem-cancellation rounds with 8 workers on ext2, another 16 on FAT,
+32 mixed futex/pipe/sleep exit_group rounds, and the existing wait-mask suite
+with zero failures. All test tasks exited, cache entries returned to zero and
+heap integrity stayed OK. These checks exercise cancellation during filesystem
+activity; they do not prove all process-wide signal routing or stop/continue
+semantics.
+
+Local evidence: `build/workloads/fatal-signals-20261017/`, especially
+`metadata.json`, `linux-control-final.log`, `candidate-build-tests.log`,
+`final-kernel-build.log`, `baseline/guest-final-serial.log`,
+`candidate-probe-serial.log`, `candidate-probe-results.json`,
+`controls-results.json` and the corresponding session serial logs. The probe
+source and invocation are documented in `tools/at-syscall-probe/README.md`.
+
+The raw leader-exit control checks only that peers survive and the eventual
+process result is a normal exit. Linux reports the final worker group's zero
+status, while Brook preserves the leader's earlier status 23. That wait-status
+difference is a separate follow-up; it is not covered by this fatal-signal fix.
+
+
+The first candidate Codium-only native close returned to 10 tasks, 14 desktop
+cache entries, 243,896,320 physical bytes used and heap integrity OK
+(`codium-close-1.json`). A short startup CPU/CS capture was preserved at
+`build/vm-bridge/7346cfc4fe2c4d73837b0f4f6ea0d93e/artifacts/090eb79af994487981c031b67f5c14e4.speedscope.json`
+(2,245 CPU samples, 52,438 switches). It is a late, instrumented startup slice,
+not a before/after performance test. MappingRangeFind and the page-fault path
+are visible hot spots among busy samples; startup optimisation remains open.
+
+
+### Repeated native close and reboot acceptance
+
+The second candidate Codium cycle ran alongside Chromium, edited/saved/reopened
+the persistent document and closed through its native window control. No Codium
+tasks remained (`codium-close-2.json`); Chromium remained live. Native Chromium
+closure then returned to 10 tasks, 14 desktop cache entries, 278,663,168 physical
+bytes used and heap integrity OK (`apps-closed.json`). Checked shutdown and all
+three offline filesystem checks passed.
+
+Reboot session `13b736cafa48412688323df1cbd6b74a` verified both filesystem
+fixtures (`FSEXITCHECK VERIFY PASS bytes=131119` twice). The updated document
+persisted at 224 bytes with owner `1000:100`, SHA-256
+`561e011c75eb459481db8a0779e57aac56ca24593c3afa30a66c2168caeaca37`.
+Codium displayed all seven saved lines, then closed natively for a third time.
+The early close sample still observed ordinary asynchronous shutdown; the later
+sample confirmed 10 tasks, 14 desktop cache entries, 243,560,448 physical bytes
+used and heap integrity OK (`codium-close-3-reboot-later.json`). No forced kill
+was used in any of these three candidate native-close cycles. Checked shutdown
+and all three final offline filesystem checks returned zero. These bounded
+runs accept the observed helper cleanup regression, not every possible future
+exit race. Startup remains slow. The original failure evidence is preserved
+above rather than relabelled as successful acceptance.
+
+
+The final probe strengthens the clone-race setup by waiting for a successful
+thread birth before publishing readiness to its parent. Linux still passes all
+12 cases. The unchanged baseline kernel rerun
+`378e96afa7824247b75329c9f88e14fc` still fails the same nine cases, with cleanup
+and all three filesystem checks passing. Final probe SHA-256:
+`0860b9149e2c3e5d7d08769b65712f8798c92488873c1a46b80b8a44f2750ad4`.
+The metadata preserves the earlier probe hash separately.
+
+The matching final candidate session `d7cd0fd4c80e41b99aa1cef5c2fb330c` passes
+all 48 strengthened cases, returning to 9 kernel tasks and zero cache entries
+with heap integrity OK. Checked shutdown and three offline filesystem checks
+all pass (`strengthened-final-results.json`, `strengthened-filesystem-results.json`).

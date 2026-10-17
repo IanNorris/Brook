@@ -74,6 +74,10 @@ void SchedulerKernelRegionLeave(Process* proc);
 // Returns true if terminal delivery was committed; caller must not return to user.
 bool SchedulerKernelOperationBoundary();
 
+// IRQ/lock-safe fatal signal request. Latches birth, marks all generation-matched
+// members and releases snapshot holds without waiting for peer quiescence.
+// Caller keeps anchor alive for this call; cooperative cancellation drains waits.
+void SchedulerRequestFatalSignal(Process* anchor, int signal);
 void SchedulerMarkTerminated(Process* proc, int waitStatus);
 // Request a stop without yielding (for the syscall signal-return path).
 void SchedulerMarkStopped(Process* proc, int signal = 19);
