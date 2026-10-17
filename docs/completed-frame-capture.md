@@ -52,12 +52,10 @@ loaded MCP process still used the old code and failed against Pending metadata;
 its outstanding token was released, and an updated source capture recovered.
 Reload is a compatibility requirement, not a reason to restart a live VM.
 
-## Continuous recording remains open
+## Continuous recording
 
-This is still-capture ownership, not a video recorder. A snapshot copy, GPU
-readback and QEMU RAM extraction on every frame would add substantial observer
-overhead. Continuous VM recording still needs a display stream, encoding,
-timestamps, audio synchronization and frame-drop accounting. The existing
-[showcase plan](showcase.md#live-one-take-tour) identifies QEMU's private D-Bus
-display/audio listener as the next implementation candidate. Do not begin the
-final showcase or describe repeated screenshots as smooth video recording.
+Still capture uses a snapshot copy, GPU readback and brief QEMU pause. Continuous
+recording now uses a separate private display/audio stream, avoiding repeated
+intrusive still captures. See [recording setup and acceptance](vm-recording.md)
+for the bounded recorder, host-observed timing and remaining validation. The
+final showcase remains on hold.

@@ -38,3 +38,10 @@ captures, dumps and profiles under ignored build directories.
 When loading a copied plugin package, set BROOK_ROOT to the Brook checkout;
 direct source registration infers it from server.py's location. This plugin
 does not install desktop automation backends.
+
+Use vm_record start/status/stop for continuous VM-only video/audio, not repeated
+vm_observe calls. Prepare build/vm-recording-runtime with recording-runtime.nix
+before launching the VM. Start is asynchronous: poll until completed or failed.
+Use BROOK_AUDIODEV=none to retain guest sound capture without speaker output.
+Keep masters and timelines under ignored build directories. Timing is observed
+at host transport arrival; upstream drops and exact source A/V timing are unknown.

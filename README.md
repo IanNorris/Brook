@@ -99,6 +99,7 @@ the table distinguishes tested behavior from remaining limitations.
   and [launch feedback](docs/launch-feedback.md).
 - **VM control bridge:** VM-only screenshots and input, guest command launches,
   logs, CPU/context-switch profiles, OS statistics, silent-output PCM capture,
+  bounded direct [video/audio recording](docs/vm-recording.md),
   and bounded post-panic memory/register inspection. See the
   [bridge tools](tools/vm_bridge/README.md).
 - **Real workloads:** Ladybird browsing, hardware GL3 Quake demos, Wayland

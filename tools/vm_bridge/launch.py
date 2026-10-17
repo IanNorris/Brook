@@ -16,6 +16,19 @@ import uuid
 from common import REGISTRY, QMP, process_identity, write_json
 
 
+def recording_display_args(command):
+    """Initialize private QMP VNC/audio access alongside the selected UI."""
+    args=list(command)
+    if "-vnc" not in args:args.extend(["-vnc","none"])
+    index=args.index("-vnc")+1
+    # run-qemu's output backend is hda0, including silent playback. Preserve
+    # an explicitly selected VNC audio backend and all display/security flags.
+    has_audio=any(args[i]=="-audiodev" and "id=hda0" in args[i+1].split(",")
+                  for i in range(len(args)-1))
+    if has_audio and "audiodev=" not in args[index]:args[index]+=",audiodev=hda0"
+    return args
+
+
 def supervise(command, kernel, disk, debug_port, provenance, scenario):
     REGISTRY.mkdir(parents=True, exist_ok=True, mode=0o700)
     session = uuid.uuid4().hex
@@ -24,7 +37,7 @@ def supervise(command, kernel, disk, debug_port, provenance, scenario):
     # Private registry sockets must fit sockaddr_un's 108-byte limit.
     if len(str(directory / "qmp.sock").encode()) >= 100:
         raise ValueError("BROOK_VM_REGISTRY path is too long for a Unix socket")
-    args = list(command)
+    args = recording_display_args(command)
     for option, value in [("-monitor", f"unix:{directory}/hmp.sock,server=on,wait=off"),
                           ("-serial", f"file:{directory}/serial.log")]:
         if option in args:

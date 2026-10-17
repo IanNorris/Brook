@@ -1,6 +1,6 @@
 # Brook VM bridge
 
-A local, dependency-free Python MCP server for explicitly enabled Brook QEMU
+A local Python MCP server for explicitly enabled Brook QEMU
 sessions. It observes and injects input into the selected VM through private
 QMP sockets and Brook's guest debug channel. It never captures the host desktop.
 
@@ -62,6 +62,7 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_stats` | Usable RAM/free/used and process counts; p50/p90/p95/max of the recent 256 compositor-loop intervals using the millisecond guest clock. Optional `memory_details: true` adds a rolling address-space census. Not app GPU or physical scanout timings. |
 | `vm_profile` | `start` with `duration_ms`, `stop`, `status`, `export`. CPU samples and context-switch events; export after IDLE to raw/Speedscope artifacts using the run's immutable kernel ELF. |
 | `vm_debug` | Current vCPU registers or up to 1 MiB physical/virtual memory. Virtual addresses use the selected vCPU's current translation. RAM-only checks exclude MMIO; memory reads pause vCPUs and restore prior running state. Devices may still run. |
+| `vm_record` | Asynchronous start/status/stop of bounded VM-only H.264/AAC recording through a private display stream. Requires the pinned host encoder; see [setup and acceptance](../../docs/vm-recording.md). |
 | `vm_audio_capture` | 0.1–10 seconds of QEMU PCM WAV with format, frames and host monotonic interval. No microphone. Launcher watchdog bounds abandoned recordings. |
 | `vm_audio_analyze` | Session WAV waveform PNG, RMS and silent bins. PCM silence alone does not identify stutter. |
 | `vm_artifacts` | Fetch scoped ignored artifacts, including images and exports after VM exit. |
@@ -103,8 +104,9 @@ panic command pipe and full dumps remain backlog items.
 The audio backend is QEMU `none`, which is a suitable `/dev/null` equivalent
 while preserving the guest device and PCM capture. The current capture uses
 QEMU's deprecated HMP `wavcapture` facility. It is verified with QEMU 10.2.2;
-private D-Bus listeners are the intended successor. Chunk-arrival timestamps,
-guest queue counters and precise sample/visual synchronization are deferred.
+the separate `vm_record` tool uses the QEMU RFB audio stream for video/audio
+masters. Guest queue counters and precise source sample/visual synchronization
+remain unavailable.
 Screenshots and memory pauses can themselves affect performance measurements.
 
 All registry entries, logs, copied ELF files, memory, PCM, images and profile
@@ -117,7 +119,7 @@ ignored experiment disks. They are never included in the plugin package.
 python3 -m unittest discover -s tools/vm_bridge -p "test_*.py" -v
 ```
 
-The 41 host tests cover fragmented tokenized replies, stdio MCP, PNG pixels,
+The host tests cover fragmented tokenized replies, stdio MCP, PNG pixels,
 cancellation cleanup, input preflight, crop-coordinate mapping, reset/panic
 history, RAM-map selection and resume after failed memory reads. Shutdown
 tests cover sync-before-QMP ordering, rejection of missing/negative replies,
@@ -224,3 +226,11 @@ immediately. No desktop automation backend is introduced.
 CPU and GPU lease acceptance, failure tests and remaining recording work are
 recorded in [completed-frame capture](../../docs/completed-frame-capture.md).
 This still-capture protocol is intrusive and is not a continuous video recorder.
+
+## Continuous recording
+
+Prepare the optional pinned encoder before VM launch with
+`nix-build tools/vm_bridge/recording-runtime.nix -o build/vm-recording-runtime`.
+Use `vm_record` start/status/stop instead of looping still captures. The MCP
+server itself needs only Python; encoding runs in the prepared runtime. See
+[recording setup, evidence and limits](../../docs/vm-recording.md).

@@ -79,16 +79,16 @@ cues still need measurement; no tempo has been assumed. Play and capture the
 music in synchronization with the continuous take, rather than assembling
 separate clips to disguise startup or stability issues.
 
-Use the VM bridge to rehearse repeatable actions and inspect readiness. For
-continuous recording, investigate a private QEMU D-Bus display/audio listener,
-including GPU DMA-BUF updates where available. This captures the VM directly
-and avoids the user's host desktop. QEMU documents those listener interfaces;
-the recorder has not yet been implemented or validated.
-[QEMU D-Bus display documentation](https://www.qemu.org/docs/master/interop/dbus-display.html).
+Use the VM bridge to rehearse repeatable actions and inspect readiness. Direct
+VM recording now uses a private QEMU display/audio stream and a pinned host
+encoder. CPU/GPU headless captures, real player audio, early stop and worker
+recovery passed bounded tests; see [recording setup and limits](vm-recording.md).
 
-Record a native 1080p master with timestamps, audio synchronization and
-frame-drop counters. Preserve the unedited take and the action/cue log so its
-behavior can be reproduced. A final movie has not been produced yet.
+The recorder writes a native-canvas H.264/AAC master with frame timestamps and
+local loss counters. Source timestamps and upstream drop counts are unavailable.
+Long takes, boot transitions and native-window capture still need acceptance.
+Preserve the unedited take and action/cue log. Final showcase production remains
+on hold; no final movie has been produced.
 
 
 ### SuperTuxKart launcher and verified run

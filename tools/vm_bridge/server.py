@@ -24,7 +24,7 @@ import uuid
 import wave
 import zlib
 
-from common import ROOT, REGISTRY, QMP, artifact, load_session, session_lock, write_json
+from common import ROOT, REGISTRY, QMP, artifact, load_session, process_identity, process_is_alive, recording_lock, session_lock, write_json
 
 MAX_LOG = 256 * 1024
 
@@ -636,6 +636,66 @@ def wait(session, text, timeout_s=5, _cancel=None, **_):
     return {"matched":False,"timeout":True}
 
 
+def video_recording(session,action="status",duration_s=30,fps=30,audio=True,width=1920,height=1080,**_):
+    if action not in {"start","status","stop"}:raise ValueError("Use start/status/stop")
+    descriptor=REGISTRY/session/"video-recording.json"
+    # Validate session before forming/reading scoped recording paths.
+    data=load_session(session,live=action!="status")
+    if action=="status":
+        if not descriptor.exists():return {"state":"idle","session":session}
+        state=json.loads(descriptor.read_text())
+        if state.get("state") in {"starting","recording"}:
+            try:alive=process_is_alive(state["pid"],state["process_identity"])
+            except (OSError,KeyError):alive=False
+            if not alive and not (state.get("state")=="starting" and time.monotonic()-state.get("created_monotonic",0)<10):
+                state.update(state="failed",error="Recorder process is no longer alive")
+        return state
+    with session_lock(session) as data, recording_lock(session):
+        state=json.loads(descriptor.read_text()) if descriptor.exists() else {}
+        active=False
+        if state.get("state") in {"starting","recording"}:
+            try:active=process_is_alive(state["pid"],state["process_identity"])
+            except (OSError,KeyError):active=state.get("state")=="starting" and time.monotonic()-state.get("created_monotonic",0)<10
+        if action=="stop":
+            if not active:return {"state":state.get("state","idle"),"stop_requested":False}
+            token=state.get("recording","")
+            if not re.fullmatch(r"[0-9a-f]{32}",token):raise ValueError("Invalid recording descriptor")
+            (REGISTRY/session/f"video-stop-{token}").touch()
+            return {"recording":token,"stop_requested":True,"completion":"Poll status for finalized artifact"}
+        if active:raise RuntimeError("A VM video recording is already active")
+        if not isinstance(duration_s,(int,float)) or isinstance(duration_s,bool) or not math.isfinite(duration_s) or not 1<=duration_s<=600:raise ValueError("Recording duration must be 1–600 seconds")
+        if not isinstance(fps,int) or isinstance(fps,bool) or not 1<=fps<=60:raise ValueError("Recording FPS must be 1–60")
+        if not isinstance(audio,bool):raise ValueError("audio must be boolean")
+        if any(not isinstance(v,int) or isinstance(v,bool) or v%2 for v in (width,height)) or not 32<=width<=4096 or not 32<=height<=2160:raise ValueError("Even recording canvas up to 4096x2160 required")
+        runtime=ROOT/"build/vm-recording-runtime/bin/python3"
+        if not runtime.exists():raise RuntimeError("Prepare runtime before VM launch: nix-build tools/vm_bridge/recording-runtime.nix -o build/vm-recording-runtime")
+        token=uuid.uuid4().hex
+        claim={"recording":token,"session":session,"generation":data["generation"],
+               "state":"starting","created_monotonic":time.monotonic()}
+        write_json(descriptor,claim)
+        path=artifact(session,".record.log")
+        args=[str(runtime),str(ROOT/"tools/vm_bridge/record.py"),"--session",session,
+              "--recording",token,"--duration",str(duration_s),"--fps",str(fps),
+              "--width",str(width),"--height",str(height),"--wait-for-parent"]+(["--audio"] if audio else [])
+        worker=None
+        try:
+            with path.open("wb") as output:
+                worker=subprocess.Popen(args,cwd=ROOT,stdout=output,stderr=subprocess.STDOUT,
+                                        stdin=subprocess.PIPE,start_new_session=True)
+            claim.update(pid=worker.pid,process_identity=process_identity(worker.pid))
+            write_json(descriptor,claim)
+            worker.stdin.write(b"start\n");worker.stdin.close()
+            threading.Thread(target=worker.wait,daemon=True).start()
+        except BaseException as error:
+            if worker:
+                if worker.stdin and not worker.stdin.closed:worker.stdin.close()
+                if worker.poll() is None:worker.terminate()
+                worker.wait(timeout=10)
+            write_json(descriptor,{**claim,"state":"failed","error":str(error)});raise
+        return {"recording":token,"state":"starting","pid":worker.pid,"log":str(path),
+                "completion":"Poll vm_record status; start acknowledgement is not a finalized video"}
+
+
 def audio_capture(session, duration_s=2, _cancel=None, **_):
     if not 0.1 <= duration_s <= 10:raise ValueError("Capture must be 0.1–10 seconds")
     with session_lock(session) as data,QMP(session) as q:
@@ -683,7 +743,13 @@ def get_artifact(session, artifact_name, **_):
         raise ValueError("Invalid artifact basename")
     directory=(REGISTRY/session/"artifacts").resolve();path=directory/artifact_name
     if path.resolve().parent!=directory or path.is_symlink():raise ValueError("Artifact escapes its run")
-    if path.stat().st_size>16*1024*1024:raise ValueError("Artifact exceeds response limit")
+    size=path.stat().st_size
+    if path.suffix in {".mkv",".mp4"}:
+        with path.open("rb") as video:checksum=hashlib.file_digest(video,"sha256").hexdigest()
+        return {"artifact":str(path),"size":size,"sha256":checksum,
+                "mime_type":"video/mp4" if path.suffix==".mp4" else "video/x-matroska",
+                "delivery":"local video artifact; binary is not embedded in the tool response"}
+    if size>16*1024*1024:raise ValueError("Artifact exceeds response limit")
     if path.suffix==".png":return {"image":path.read_bytes(),"data":{"artifact":str(path)}}
     blob=path.read_bytes()
     return {"artifact":str(path),"size":len(blob),"sha256":hashlib.sha256(blob).hexdigest(),
@@ -743,6 +809,7 @@ register("vm_input",input_actions,"Ordered timed key/mouse batches, ASCII-US tex
     "key":STR,"keys":{"type":"array","items":STR},"text":STR,"seconds":NUM,
     "hold_seconds":{"type":"number","minimum":.01,"maximum":1,"description":"Click/double-click press duration (default0.2s); keypress override (default0.02s)"}},["type"])},"frame_id":STR},["session","actions"])
 register("vm_wait",wait,"Wait for a serial-log substring without repeatedly returning whole logs",{**SESSION,"text":STR,"timeout_s":NUM},["session","text"],True)
+register("vm_record",video_recording,"Direct VM video/audio recording: start/status/stop; private display stream, no host desktop or microphone",{**SESSION,"action":STR,"duration_s":NUM,"fps":INT,"audio":{"type":"boolean"},"width":INT,"height":INT},["session"])
 register("vm_audio_capture",audio_capture,"Bounded PCM WAV capture without speaker output; no host microphone",{**SESSION,"duration_s":NUM},["session"])
 register("vm_audio_analyze",audio_analyze,"Return waveform image and metrics for a session WAV artifact",{**SESSION,"artifact_name":STR},["session","artifact_name"],True)
 
@@ -778,7 +845,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.1.0"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.2.0"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":

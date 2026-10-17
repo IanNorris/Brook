@@ -18,8 +18,9 @@
 - Completed-frame capture now replaces the mutable render-buffer screenshot
   path. CPU/GPU lease ownership, expiry and recovery passed isolated acceptance;
   see [capture evidence](completed-frame-capture.md). Existing MCP processes need
-  a reload alongside the updated kernel. Continuous recording, audio sync and
-  encoding remain open; do not loop intrusive still captures as a video recorder.
+  a reload alongside the updated kernel. Bounded private-stream video/audio
+  recording now passes CPU/GPU and real-player checks; see [recording](vm-recording.md).
+  Long takes, native-window capture and boot/mode transitions remain open.
 
 - OpenTTD 15.3 hung during the user's confirmed in-game exit, with music
   continuing until SIGKILL. On the revised persistent-home/idle-DMA build, both
@@ -623,8 +624,8 @@ reproducers alongside each experiment rather than treating launch as success.
   workload. Record missing syscalls, rendering/input failures and performance.
 - Prioritize a usable Firefox or Chromium browser after the preceding
   compatibility checks, including real page navigation and interaction.
-- Implement VM-only video recording with synchronized audio, then rehearse the
-  live tour described in [showcase.md](showcase.md).
+- Extend the tested bounded [VM recorder](vm-recording.md) to long takes and
+  boot/mode transitions before rehearsing the [live tour](showcase.md).
 
 
 ### RUN-06 — GPU resource mapping accounting during SuperTuxKart teardown

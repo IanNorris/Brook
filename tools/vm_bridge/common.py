@@ -1,5 +1,6 @@
 """VM identity, scoped artifacts and QMP transport (stdlib only)."""
 import contextlib
+import array
 import fcntl
 import json
 import os
@@ -15,6 +16,27 @@ REGISTRY = Path(os.environ.get("BROOK_VM_REGISTRY", ROOT / "build/vm-bridge")).r
 def process_identity(pid):
     text = Path(f"/proc/{pid}/stat").read_text()
     return text.rsplit(")", 1)[1].split()[19]
+
+
+def process_is_alive(pid, identity):
+    try:
+        fields=Path(f"/proc/{pid}/stat").read_text().rsplit(")",1)[1].split()
+        return fields[0] not in {"Z","X"} and fields[19]==identity
+    except (OSError,IndexError,TypeError):return False
+
+
+@contextlib.contextmanager
+def recording_lock(session):
+    load_session(session,live=False)
+    with (REGISTRY/session/"video-recording.lock").open("a") as lock:
+        deadline=time.monotonic()+10
+        while True:
+            try:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+            except BlockingIOError:
+                if time.monotonic()>deadline:raise TimeoutError("VM recording state is busy")
+                time.sleep(.01)
+        yield
 
 
 def write_json(path, value):
@@ -80,12 +102,17 @@ class QMP:
             raise ConnectionError("QMP closed or oversized message")
         return json.loads(line)
 
-    def call(self, execute, arguments=None):
+    def call(self, execute, arguments=None, fd=None):
         self.sequence += 1
         request = {"execute": execute, "id": self.sequence}
         if arguments is not None:
             request["arguments"] = arguments
-        self.sock.sendall(json.dumps(request).encode() + b"\n")
+        payload=json.dumps(request).encode()+b"\n"
+        if fd is None:
+            self.sock.sendall(payload)
+        else:
+            sent=self.sock.sendmsg([payload],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array("i",[fd]))])
+            if sent<len(payload):self.sock.sendall(payload[sent:])
         while True:
             response = self.read()
             if response.get("id") != self.sequence:
