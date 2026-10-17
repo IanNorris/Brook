@@ -125,3 +125,39 @@ Still open: frame/WM revision correlation, guest-owned event rings/typed waits,
 action-attached selectable bundles, profile/audio convenience operations,
 shutdown verification as an MCP operation, job cancellation and retained output
 artifacts after stop. Broader real-app acceptance remains part of the active goal.
+
+## Action bundles and saved views — bridge 0.9.0
+
+Host-only follow-up; the kernel and Wayland provider hashes above are unchanged.
+The bridge suite passes 177 tests (five optional encoder tests skipped). New tests
+cover preserving action evidence across optional observation/delivery failures,
+read-only recovery with different view options, preview/crop pixel provenance,
+cache integrity/scoping, no-Pillow fallback, native row-copy crops, diagnostic
+overlay separation and latest-source coordinate input/boot checks.
+
+A private eight-vCPU/4-GiB 1080p VM used cloned disks under ignored
+`build/workloads/action-workloads-20261017/`. VSCodium launched through `vm_launch`
+with a frame/windows/tasks/errors bundle. Window presence plus bundle took 12.59s;
+this was not editor-readiness timing. Native key input created and saved a 171-byte
+document in `/data/home`, independently verified as UID/GID 1000:100 with SHA-256
+`b9c2d352158a05d9801f5f6a923bc15fc53189a118355e14cfc6b6f2af179500`.
+Minimize and restore each confirmed and returned a separate post-action bundle.
+
+From the restored frame: tiny 320×180 (116,894 bytes), medium 960×540 (916,241
+bytes), and native editor crop 820×620 (108,273 bytes). Cached preview reads took
+5–10ms and a fresh crop 65ms in this run before the native row-copy optimization.
+These are individual measurements, not performance guarantees. Cached view reads
+passed with guest/QMP entry points replaced by functions that raise, proving no
+VM exchange. Visual inspection confirmed the crop's editor text was readable.
+An optional native-coordinate grid was generated and inspected from the same
+saved source, retaining the clean original. Chromium then launched through the same action/bundle path alongside Codium
+(window presence plus bundle: 14.79s) and native address-bar input navigated to
+Google, visually confirmed with the remote page title and content. Browser
+startup still emits D-Bus/inotify and cache diagnostics; rendering this page
+does not resolve those compatibility gaps or complete the broader workload goal.
+
+Both apps subsequently passed graceful close with exact client-group exit waits.
+The private VM acknowledged checked filesystem/device flush and its launch
+process exited zero. Serial screening found no user fault, panic, allocator
+exhaustion or device-timeout marker. Read-only data/Nix/FAT checks passed after
+process exit. Acceptance evidence remains in the ignored workload directory.

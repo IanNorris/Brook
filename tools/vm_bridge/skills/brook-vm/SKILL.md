@@ -9,7 +9,13 @@ Keep speaker playback off unless the user requests it.
 
 Use vm_observe to get a full-resolution completed-frame image and frame_id.
 Media delivery defaults to local artifact references with absolute path, MIME,
-size and checksum. Open the referenced PNG to inspect it. Set include_image:
+size and checksum. Inspect `previews.tiny` first for layout and `previews.medium` for more detail.
+Use vm_frame with the saved frame_id and native x/y/width/height crop for readable
+text without another capture. Optional overlay=true draws a ruler/grid labelled
+in native coordinates. Keep it off for detail checks. Crop coordinates always
+refer to the original display, including when starting from a preview. Saved
+views work after stop; reading them never makes an old capture current for input.
+Pass the viewed derivative frame_id into coordinate input for correct mapping. Set include_image:
 true on vm_observe, vm_audio_analyze or vm_artifacts only when a native MCP
 image preview is useful. Never serialize a preview-bearing MCP envelope into
 text: image transport contains base64 even though JSON metadata does not.
@@ -60,6 +66,9 @@ are a separate execution path.
 Prefer vm_windows and vm_window for semantic UI control. Pass the exact returned
 window reference, action and fresh request_id; restore also requires an explicit
 restore_target (previous, normal or maximized). Each action returns window state.
+Add include=[frame,windows,processes,errors] to vm_launch/vm_window/vm_ui when
+a post-wait bundle is useful. Its separate post_action_observation can fail without
+invalidating action evidence; it samples later and does not prove client readiness.
 Use vm_ui to recover an uncertain result; never repeat a mutation with a new ID
 just because its reply was lost. Check wait_condition_met, observation_error and
 current_window. Close dispatch is separate from disappearance and exact client

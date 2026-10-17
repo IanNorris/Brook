@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from observation import Observations,read_errors
+from observation import Observations,StaleObservation,read_errors
 from media import Delivery
 import server
 
@@ -176,6 +176,16 @@ class BundleTests(unittest.TestCase):
         for include,kw in [([],{}),(['windows','windows'],{}),(['bad'],{}),(['windows'],{'crop':{}}),(['errors'],{'error_limit_events':True}),(['frame'],{'cursor':{}})]:
             with self.assertRaises(ValueError):self.collect(include,**kw)
         self.assertEqual(self.calls,[])
+    def test_action_expected_generation_is_checked_before_guest_queries(self):
+        with self.assertRaises(StaleObservation):self.collect(['frame'],expected_generation='old')
+        self.assertEqual(self.calls,[])
+    def test_action_expected_boot_is_checked_before_frame_or_metadata_work(self):
+        with self.assertRaises(StaleObservation):self.collect(['frame','windows'],expected_boot_id='c'*32)
+        self.assertEqual(self.calls,['caps'])
+    def test_action_expected_identity_is_retained_in_result(self):
+        r=self.collect(['windows'],expected_generation='g',expected_boot_id=self.boot)
+        self.assertEqual(r['expected_identity'],{'generation':'g','guest_boot_id':self.boot})
+
     def test_frame_only_legacy_shape_remains_available(self):
         @contextlib.contextmanager
         def lock(s):yield self.data

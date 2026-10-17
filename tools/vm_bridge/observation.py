@@ -80,19 +80,36 @@ def read_errors(data,boot_id,cursor=None,limit_bytes=65536,limit_events=64):
         'capture_started_host_monotonic':started,'capture_ended_host_monotonic':time.monotonic()}
 
 
+class StaleObservation(ValueError):
+    pass
+
+
+def validate_selection(include,crop=None,max_width=None,cursor=None,error_limit_bytes=65536,error_limit_events=64):
+    if not isinstance(include,list) or not include or len(include)>5 or any(not isinstance(x,str) or x not in COMPONENTS for x in include) or len(set(include))!=len(include):
+        raise ValueError('include requires distinct frame/windows/processes/launches/errors components')
+    if (crop is not None or max_width is not None) and 'frame' not in include:raise ValueError('crop/max_width require the frame component')
+    if cursor is not None and 'errors' not in include:raise ValueError('since_event_cursor requires errors')
+    validate_cursor(cursor)
+    if isinstance(error_limit_bytes,bool) or not isinstance(error_limit_bytes,int) or not 1024<=error_limit_bytes<=262144:raise ValueError('error_limit_bytes must be 1024–262144')
+    if isinstance(error_limit_events,bool) or not isinstance(error_limit_events,int) or not 1<=error_limit_events<=128:raise ValueError('error_limit_events must be 1–128')
+    if crop is not None:
+        if not isinstance(crop,dict) or set(crop)!={'x','y','width','height'} or any(isinstance(v,bool) or not isinstance(v,int) for v in crop.values()):
+            raise ValueError('Crop requires integer x/y/width/height')
+        if crop['x']<0 or crop['y']<0 or not 1<=crop['width']<=4096 or not 1<=crop['height']<=2160:
+            raise ValueError('Invalid crop extent')
+    if max_width is not None and (isinstance(max_width,bool) or not isinstance(max_width,int) or not 32<=max_width<=4096):
+        raise ValueError('max_width must be 32–4096')
+
 class Observations:
     def __init__(self,ui,capture,panic_state):
         self.ui,self.capture,self.panic_state=ui,capture,panic_state
 
-    def collect(self,session,include,crop=None,max_width=None,cursor=None,error_limit_bytes=65536,error_limit_events=64):
-        if not isinstance(include,list) or not include or len(include)>5 or any(not isinstance(x,str) or x not in COMPONENTS for x in include) or len(set(include))!=len(include):
-            raise ValueError('include requires distinct frame/windows/processes/launches/errors components')
-        if (crop is not None or max_width is not None) and 'frame' not in include:raise ValueError('crop/max_width require the frame component')
-        if cursor is not None and 'errors' not in include:raise ValueError('since_event_cursor requires errors')
-        validate_cursor(cursor)
-        if isinstance(error_limit_bytes,bool) or not isinstance(error_limit_bytes,int) or not 1024<=error_limit_bytes<=262144:raise ValueError('error_limit_bytes must be 1024–262144')
-        if isinstance(error_limit_events,bool) or not isinstance(error_limit_events,int) or not 1<=error_limit_events<=128:raise ValueError('error_limit_events must be 1–128')
+    def collect(self,session,include,crop=None,max_width=None,cursor=None,error_limit_bytes=65536,error_limit_events=64,
+                expected_generation=None,expected_boot_id=None):
+        validate_selection(include,crop,max_width,cursor,error_limit_bytes,error_limit_events)
+        if expected_boot_id is not None:validate_id(expected_boot_id)
         started=time.monotonic();data=self.ui.load_session(session,live=False);generation=data['generation']
+        if expected_generation is not None and generation!=expected_generation:raise StaleObservation('Action host generation changed before observation')
         if cursor and (cursor['session']!=session or cursor['generation']!=generation):raise ValueError('Stale error cursor session/generation')
         result={'session':session,'generation':generation,'guest_boot_id':None,'observation_api':1,'components':{},
             'consistency':{'atomic':False,'frame_window_correspondence':'unverified','window_state_revision':None,
@@ -108,6 +125,9 @@ class Observations:
                 result['guest_boot_id']=boot
             except (OSError,ValueError,RuntimeError) as error:cap_error=str(error)
         elif cap_error is None:cap_error='Guest has panicked' if panic else 'Guest is stopped'
+        if boot and expected_boot_id is not None and boot!=expected_boot_id:raise StaleObservation('Action guest boot changed before observation')
+        if expected_generation is not None or expected_boot_id is not None:
+            result['expected_identity']={'generation':expected_generation,'guest_boot_id':expected_boot_id}
         result['guest_status']={'state':'panicked' if panic else 'stopped' if not live else 'unavailable' if cap_error else 'running'}
         if cap_error:result['guest_status']['detail']=cap_error
         if live and cap_error and not panic:result['identity_error']=cap_error

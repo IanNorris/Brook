@@ -50,6 +50,24 @@ full=observe('full',['frame','windows','processes','launches','errors'])
 f=full['components']['frame']['result'];(out/'observed-desktop.png').write_bytes(f['image'])
 assert f['data']['guest_boot_id']==full['guest_boot_id'] and f['data']['geometry_provenance']['verified_for_current_boot']
 assert (f['data']['width'],f['data']['height'])==(1920,1080)
+# Saved views exercise the actual MCP adapter while proving that follow-up
+# previews/crops/coordinate rulers make no guest or QMP call.
+source=f['data'];original_guest=server.guest;original_qmp=server.QMP
+try:
+ def no_vm(*args,**kwargs):raise AssertionError('Saved views must not contact the VM')
+ server.guest=no_vm;server.QMP=no_vm
+ for name,options in [('tiny',{'size':'tiny'}),('medium',{'size':'medium'}),
+                      ('ruler',{'size':'medium','overlay':True}),
+                      ('native_crop',{'crop':{'x':100,'y':80,'width':820,'height':620}})]:
+  wire=server.call_tool('vm_frame',{'session':s,'frame_id':source['frame_id'],**options})
+  assert not wire['isError'] and all(x['type']=='text' for x in wire['content'])
+  view=json.loads(wire['content'][0]['text'])
+  assert view['source_frame_id']==source['frame_id'] and view['frame_epoch']==source['frame_epoch']
+  assert not view['vm_capture_performed']
+  if name=='native_crop':assert (view['width'],view['height'])==(820,620)
+  if name=='ruler':assert view['overlay']['coordinate_space']=='native_frame'
+  evidence.setdefault('saved_views',{})[name]=view;save()
+finally:server.guest=original_guest;server.QMP=original_qmp
 cursor=full['components']['errors']['result']['next_cursor']
 next_read=observe('incremental',['errors'],since_event_cursor=cursor)
 assert int(next_read['components']['errors']['result']['next_cursor']['offset'])>=int(cursor['offset'])

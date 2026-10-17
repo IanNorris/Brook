@@ -13,7 +13,10 @@ coalescing/completion races. Bridge 0.6.0 adds semantic launcher activation with
 bounded boot-lifetime dispatch history, window correlation and durable recovery.
 Bridge 0.7.0 adds [accepted selectable observations](vm-bridge-observations.md)
 for frames, windows, tasks, launches and serial errors, with per-component timing
-and boot-guarded frame leases. Exact frame/WM revision correspondence, a lossless
+and boot-guarded frame leases. Bridge 0.8.0 adds optional post-action observation
+bundles without replaying mutations. Bridge 0.9.0 adds automatic 320/960px previews,
+saved native crops and optional native-coordinate ruler/grid overlays, requiring
+no additional VM capture. Exact frame/WM revision correspondence, a lossless
 guest event stream, output artifacts after shutdown, job cancellation and
 remaining sections are still proposed.
 Current behavior is documented in the
@@ -348,3 +351,27 @@ launch/inspect/close and command-completion workflows. Common short operations
 should need one call; long operations should need a start and one blocking wait,
 with no repeated log polling. Do not improve call count by hiding failures or
 weakening the underlying evidence.
+
+## Proposed toolkit accessibility extension
+
+GTK and Qt can expose application controls through Linux AT-SPI over the guest
+accessibility D-Bus. This is not yet implemented or verified in Brook. First probe
+the guest session/accessibility bus and adapters with a GTK app and a Qt app.
+References: [GTK accessibility](https://gnome.pages.gitlab.gnome.org/gtk/gtk4/section-accessibility.html),
+[Qt QAccessible](https://doc.qt.io/qt-6/qaccessible.html),
+[AT-SPI architecture](https://gnome.pages.gitlab.gnome.org/at-spi2-core/devel-docs/architecture.html).
+
+Proposed tools: a bounded `vm_widgets` query scoped to a known guest app/window,
+and `vm_widget_action` supporting only the object's advertised actions. Return
+name, role, state, bounds, supported interfaces/actions and child references.
+Text/value access must respect sensitive/password states. Bound depth, node count,
+text bytes and timeout; permit filtering by role/name and incremental subtree reads.
+Duplicate names require explicit disambiguation rather than activating the first.
+
+Bind references to session, host generation, guest boot and accessibility-provider
+identity. Resolve and revalidate the object/action immediately before dispatch;
+report defunct/changed objects and uncertain replies without replaying actions.
+Where window correlation is unavailable, report it as unknown. Keep all D-Bus
+access inside the VM; never connect to the host accessibility service. Custom
+controls may omit useful semantics. Retain pixel inspection to verify rendering
+and use native Brook WM/launcher hooks for controls outside toolkit apps.

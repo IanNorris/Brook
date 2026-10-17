@@ -416,7 +416,8 @@ class CompletedFrameTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);(root/'s').mkdir()
             (root/'s'/'frame-source.json').write_text(json.dumps(self.ready()))
-            image_path=root/'panic.png'
+            (root/'s'/'artifacts').mkdir()
+            image_path=root/'s'/'artifacts'/('d'*32+'.png')
             with patch.object(server, 'REGISTRY', root), \
                  patch.object(server, 'panic_state', return_value=True), \
                  patch.object(server, 'artifact', return_value=image_path), \

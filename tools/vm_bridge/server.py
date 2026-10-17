@@ -24,10 +24,11 @@ import wave
 import zlib
 
 from common import ROOT, REGISTRY, QMP, artifact, load_session, process_identity, process_is_alive, recording_lock, session_lock, write_json
-from media import Delivery, describe as describe_artifact, scoped_path
+from media import Delivery, PreviewLimitError, describe as describe_artifact, scoped_path
 from jobs import Jobs
 from ui import Ui
-from observation import Observations
+from observation import Observations, StaleObservation, validate_selection
+from frame_views import FrameViews
 
 MAX_LOG = 256 * 1024
 
@@ -196,31 +197,10 @@ def capture(session, data, crop=None, max_width=None, boot_id=None):
         rgb[offset:offset+w*3:3] = row[2::4]
         rgb[offset+1:offset+w*3:3] = row[1::4]
         rgb[offset+2:offset+w*3:3] = row[0::4]
-    cx=cy=0;cw=w;ch=h
-    if crop is not None:
-        if not isinstance(crop,dict) or set(crop)!={"x","y","width","height"} or any(not isinstance(v,int) or isinstance(v,bool) for v in crop.values()):
-            raise ValueError("Crop requires integer x/y/width/height")
-        cx,cy,cw,ch=crop["x"],crop["y"],crop["width"],crop["height"]
-        if not (0<=cx<w and 0<=cy<h and 0<cw<=w-cx and 0<ch<=h-cy):raise ValueError("Crop outside native frame")
-    if max_width is not None and not (isinstance(max_width,int) and not isinstance(max_width,bool) and 32<=max_width<=4096):
-        raise ValueError("max_width must be 32–4096")
-    iw=min(cw,max_width or cw);ih=max(1,round(ch*iw/cw))
-    if (cx,cy,iw,ih)!=(0,0,w,h):
-        preview=bytearray(iw*ih*3)
-        for y in range(ih):
-            sy=cy+y*ch//ih
-            for x in range(iw):
-                sx=cx+x*cw//iw
-                preview[(y*iw+x)*3:(y*iw+x)*3+3]=rgb[(sy*w+sx)*3:(sy*w+sx)*3+3]
-        rgb=preview
-    image = png_rgb(iw, ih, rgb)
-    path = artifact(session, ".png")
-    path.write_bytes(image)
-    frame = {"frame_id": uuid.uuid4().hex, "generation": data["generation"],
+    frame = {"generation": data["generation"],
              "guest_boot_id":boot_id,
-             "width": iw, "height": ih, "coordinate_width": w, "coordinate_height": h,
-             "crop_width":cw,"crop_height":ch,"scale":iw/cw,"scale_y":ih/ch,
-             "crop_origin": [cx, cy], "captured_monotonic": time.monotonic(),
+             "coordinate_width": w, "coordinate_height": h,
+             "captured_monotonic": time.monotonic(),
              "source": "panic_cpu_framebuffer" if panic else "guest_completed_frame",
              "frame_epoch": None if panic else source.get("frame_epoch"),
              "frame_tick_ms": None if panic else source.get("frame_tick_ms"),
@@ -228,10 +208,22 @@ def capture(session, data, crop=None, max_width=None, boot_id=None):
              "geometry_provenance":{"session_generation":source.get("session_generation"),
                  "guest_boot_id":source.get("guest_boot_id"),"verified_for_current_boot":bool(boot_id and not panic),
                  "note":"Panic geometry may be from an earlier guest boot" if panic else "Boot-guarded lease" if boot_id else "Legacy unguarded lease"},
-             "artifact": str(path), "sha256": hashlib.sha256(image).hexdigest(),
              "intrusive": "completed-frame copy and brief VM pause; GPU readback at frame boundary"}
-    write_json(REGISTRY / session / "last-frame.json", frame)
-    return {"data": frame, "image": image}
+    result=frame_views(session).publish(bytes(rgb),frame,crop,max_width)
+    write_json(REGISTRY / session / "last-frame.json",result['data'])
+    return result
+
+
+def frame_views(session):
+    return FrameViews(REGISTRY,session,png_rgb,lambda suffix:artifact(session,suffix))
+
+
+def frame_view(session,frame_id,crop=None,max_width=None,size='full',overlay=False,**_):
+    data=load_session(session,live=False)
+    result=frame_views(session).view(frame_id,crop,max_width,size,overlay)
+    result['data']['current_generation']=data['generation']
+    result['data']['historical_generation']=result['data']['generation']!=data['generation']
+    return result
 
 
 def sessions(**_):
@@ -260,10 +252,11 @@ def doctor(session, **_):
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
-                  "generation": data["generation"], "server_version": "0.7.0",
+                  "generation": data["generation"], "server_version": "0.9.0",
                   "bridge_capabilities": {"artifact_delivery": {"revision": 1,
                       "default": "references", "include_image": True,
                       "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
+        result['bridge_capabilities']['frame_views']={'revision':1,'tiny_width':320,'medium_width':960,'cached_crops':True,'coordinate_overlay':True,'crop_coordinates':'native_frame','extra_vm_capture':False}
         result['bridge_capabilities']['observation_bundles']={'revision':1,'components':['frame','windows','processes','launches','errors'],
             'atomic':False,'frame_window_correspondence':'unverified','errors_source':'bounded serial-pattern scan'}
         try:
@@ -432,16 +425,57 @@ def windows(session,**_):
     return window_ui().windows(session)
 
 
-def window_action(session,window,action,request_id,restore_target=None,wait_for='applied',wait_s=2,_cancel=None,**_):
-    return window_ui().submit(session,window,action,request_id,restore_target,wait_for,wait_s,_cancel)
+def action_observation_options(session,include=None,crop=None,max_width=None,since_event_cursor=None,
+                               error_limit_bytes=65536,error_limit_events=64,include_image=False,target_generation=None):
+    if include is None:
+        if crop is not None or max_width is not None or since_event_cursor is not None or include_image or error_limit_bytes!=65536 or error_limit_events!=64:
+            raise ValueError('Observation options require include')
+        return None
+    validate_selection(include,crop,max_width,since_event_cursor,error_limit_bytes,error_limit_events)
+    if since_event_cursor is not None and (since_event_cursor['session']!=session or
+            (target_generation is not None and since_event_cursor['generation']!=target_generation)):
+        raise ValueError('Stale error cursor session/generation')
+    return {'include':include,'crop':crop,'max_width':max_width,'cursor':since_event_cursor,
+        'error_limit_bytes':error_limit_bytes,'error_limit_events':error_limit_events}
 
 
-def launch_app(session,app,request_id,wait_for='window',wait_s=2,_cancel=None,**_):
-    return window_ui().launch(session,app,request_id,wait_for,wait_s,_cancel)
+def attach_action_observation(session,result,options,cancel=None):
+    if options is None:return result
+    identity={'generation':result['generation'],'guest_boot_id':result['guest_boot_id']}
+    if cancel is not None and cancel.is_set():
+        bundle={'state':'cancelled','expected_identity':identity,'error':'Wait cancelled before post-action observation'}
+    else:
+        try:
+            bundle=Observations(window_ui(),capture,panic_state).collect(session,**options,
+                expected_generation=identity['generation'],expected_boot_id=identity['guest_boot_id'])
+        except (OSError,ValueError,RuntimeError) as error:
+            bundle={'state':'stale' if isinstance(error,StaleObservation) else 'unavailable',
+                'expected_identity':identity,'error':str(error)}
+    return {**result,'post_action_observation':bundle,
+        'post_action_observation_scope':'Separate read after the wait; action conditions were sampled earlier; neither window presence nor pixels prove application readiness'}
 
 
-def ui_status(session,operation_id,wait_s=0,wait_for='applied',_cancel=None,**_):
-    return window_ui().status(session,operation_id,wait_s,wait_for,_cancel)
+def window_action(session,window,action,request_id,restore_target=None,wait_for='applied',wait_s=2,_cancel=None,
+                  include=None,crop=None,max_width=None,since_event_cursor=None,error_limit_bytes=65536,error_limit_events=64,include_image=False,**_):
+    options=action_observation_options(session,include,crop,max_width,since_event_cursor,error_limit_bytes,error_limit_events,include_image,
+        target_generation=window.get('session_generation') if isinstance(window,dict) else None)
+    result=window_ui().submit(session,window,action,request_id,restore_target,wait_for,wait_s,_cancel)
+    return attach_action_observation(session,result,options,_cancel)
+
+
+def launch_app(session,app,request_id,wait_for='window',wait_s=2,_cancel=None,
+               include=None,crop=None,max_width=None,since_event_cursor=None,error_limit_bytes=65536,error_limit_events=64,include_image=False,**_):
+    options=action_observation_options(session,include,crop,max_width,since_event_cursor,error_limit_bytes,error_limit_events,include_image,
+        target_generation=app.get('session_generation') if isinstance(app,dict) else None)
+    result=window_ui().launch(session,app,request_id,wait_for,wait_s,_cancel)
+    return attach_action_observation(session,result,options,_cancel)
+
+
+def ui_status(session,operation_id,wait_s=0,wait_for='applied',_cancel=None,
+              include=None,crop=None,max_width=None,since_event_cursor=None,error_limit_bytes=65536,error_limit_events=64,include_image=False,**_):
+    options=action_observation_options(session,include,crop,max_width,since_event_cursor,error_limit_bytes,error_limit_events,include_image)
+    result=window_ui().status(session,operation_id,wait_s,wait_for,_cancel)
+    return attach_action_observation(session,result,options,_cancel)
 
 
 def command_jobs():
@@ -633,7 +667,18 @@ def input_actions(session, actions, frame_id=None, _cancel=None, **_):
         frame_path=REGISTRY/session/"last-frame.json"
         frame=json.loads(frame_path.read_text()) if frame_path.exists() else None
         coordinates=any(a["type"] in {"move","click","double_click","scroll"} for a in actions)
-        if coordinates and (not frame or frame["frame_id"]!=frame_id):raise ValueError("Observe first and pass that frame_id")
+        if coordinates:
+            if not frame:raise ValueError("Observe first and pass that frame_id")
+            if frame['frame_id']!=frame_id:
+                candidate=frame_views(session).metadata(frame_id)
+                if not frame.get('source_frame_id') or candidate['source_frame_id']!=frame['source_frame_id']:
+                    raise ValueError('Frame view is not from the latest capture')
+                frame=candidate
+            if frame.get('generation') is not None and data.get('generation') is not None and frame['generation']!=data['generation']:
+                raise ValueError('Stale frame session generation')
+            if frame.get('guest_boot_id') is not None:
+                epoch=guest(data,'bridge epoch')
+                if epoch.get('boot_id')!=frame['guest_boot_id']:raise ValueError('Stale frame guest boot')
         for a in actions:
             if a["type"] in {"move","click","double_click","scroll"}:
                 if not 0 <= int(a.get("x",-1)) < frame["width"] or not 0 <= int(a.get("y",-1)) < frame["height"]:
@@ -871,10 +916,15 @@ register("vm_sessions",sessions,"Discover opted-in user/agent VM runs; no deskto
 register("vm_doctor",doctor,"VM transport and guest readiness; capabilities distinguish unsupported paths",SESSION,["session"],True)
 register("vm_start",start,"Boot a named experiment on new disk clones with playback off",{"scenario":STR,"gpu":STR})
 register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop/reset await guest sync, force explicitly allows unsynced shutdown",{**SESSION,"action":STR,"force":{"type":"boolean"}},["session","action"])
-register("vm_observe",observe,"Completed-frame artifact or selectable boot-bound frame/windows/tasks/launches/error bundle with per-component timing; snapshots are not atomic; serial errors are best-effort",{**SESSION,**IMAGE_OPTION,
+OBSERVATION_OPTIONS={**IMAGE_OPTION,
     "include":{"type":"array","items":{"type":"string","enum":["frame","windows","processes","launches","errors"]},"minItems":1,"maxItems":5},
     "since_event_cursor":{"type":"object"},"error_limit_bytes":INT,"error_limit_events":INT,
-    "crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session"])
+    "crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT}
+register("vm_observe",observe,"Completed-frame artifact or selectable boot-bound frame/windows/tasks/launches/error bundle with per-component timing; snapshots are not atomic; serial errors are best-effort",{**SESSION,**OBSERVATION_OPTIONS},["session"])
+register("vm_frame",frame_view,"Read a saved frame as tiny/medium/full or a native-coordinate crop; no VM capture or pause; views retain capture provenance and work after stop",{**SESSION,**IMAGE_OPTION,
+    "frame_id":STR,"size":{"type":"string","enum":["tiny","medium","full"]},
+    "overlay":{"type":"boolean","default":False,"description":"Add a diagnostic ruler/grid labelled in native-frame coordinates; clean source retained"},
+    "crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session","frame_id"],True)
 register("vm_logs",logs,"Read bounded logs by byte cursor",{**SESSION,"source":STR,"offset":INT,"limit":INT},["session"],True)
 register("vm_stats",stats,"OS memory/process counts and compositor intervals; optional rolling memory census holds guest mapping locks while sampling",{**SESSION,"memory_details":{"type":"boolean"}},["session"],True)
 register("vm_guest_run",guest_run,"Run structured guest argv with separate output and real exit status; requires request_id. Legacy command uses Brook run syntax and returns launch ACK only",{**SESSION,"command":STR,
@@ -886,13 +936,13 @@ register("vm_job",job_status,"Recover/wait for a guest operation by ID; return e
 WINDOW_REF=schema({"window_id":INT,"incarnation":STR,"session_generation":STR,"guest_boot_id":STR},["window_id","incarnation","session_generation","guest_boot_id"])
 register("vm_apps",apps,"Read the published installed-app/shortcut catalog, build-time availability and boot/catalog-bound references; no launches",SESSION,["session"],True)
 register("vm_windows",windows,"Snapshot native/Wayland windows with boot-bound references, provider/client identities, geometry and supported actions",SESSION,["session"],True)
-register("vm_window",window_action,"Apply a semantic compositor action once; return request status and windows. Close dispatch, window disappearance and exact client-group exit are separate conditions",{**SESSION,
+register("vm_window",window_action,"Apply a semantic compositor action once; return request status and windows. Close dispatch, window disappearance and exact client-group exit are separate conditions; optional include adds a post-wait bundle",{**SESSION,**OBSERVATION_OPTIONS,
     "window":WINDOW_REF,"action":{"type":"string","enum":list(Ui.actions)},"request_id":STR,
     "restore_target":{"type":"string","enum":list(Ui.restores)},"wait_for":{"type":"string","enum":["applied","closed","client_group_exit"]},"wait_s":NUM},["session","window","action","request_id"])
 APP_REF=schema({"app_id":STR,"catalog_generation":INT,"session_generation":STR,"guest_boot_id":STR},["app_id","catalog_generation","session_generation","guest_boot_id"])
-register("vm_launch",launch_app,"Launch an exact installed-app reference through the normal UI launcher once; return durable dispatch history and windows, without claiming app readiness",{**SESSION,
+register("vm_launch",launch_app,"Launch an exact installed-app reference through the normal UI launcher once; return durable dispatch history and windows, without claiming app readiness; optional include adds a post-wait bundle",{**SESSION,**OBSERVATION_OPTIONS,
     "app":APP_REF,"request_id":STR,"wait_s":NUM,"wait_for":{"type":"string","enum":["admitted","dispatched","window"]}},["session","app","request_id"])
-register("vm_ui",ui_status,"Recover a semantic UI request by ID without replaying it; optionally wait and return a windows observation",{**SESSION,"operation_id":STR,"wait_s":NUM,
+register("vm_ui",ui_status,"Recover a semantic UI request by ID without replaying it; optionally wait and return windows and an optional post-wait bundle",{**SESSION,**OBSERVATION_OPTIONS,"operation_id":STR,"wait_s":NUM,
     "wait_for":{"type":"string","enum":["applied","closed","client_group_exit","admitted","dispatched","window"]}},["session","operation_id"],True)
 register("vm_guest",guest_inspect,"Guest windows/processes, or focus by window index in pid",{**SESSION,"action":STR,"pid":INT},["session"])
 register("vm_artifacts",get_artifact,"Describe a scoped artifact by local path, size and checksum, including after VM exit; binary is never embedded in JSON",{**SESSION,**IMAGE_OPTION,"artifact_name":STR},["session","artifact_name"],True)
@@ -922,7 +972,22 @@ def call_tool(name,arguments,cancel=None):
             raise ValueError("Invalid type for "+k)
     result=fn(**arguments,_cancel=cancel)
     delivery=Delivery(REGISTRY,arguments.get("session"),arguments.get("include_image",False))
-    result=delivery.adapt(result)
+    if isinstance(result,dict) and 'post_action_observation' in result:
+        # Optional media delivery cannot erase a mutation's durable result.
+        post=result['post_action_observation']
+        result=delivery.adapt({k:v for k,v in result.items() if k!='post_action_observation'})
+        try:
+            extra=Delivery(REGISTRY,arguments.get('session'),arguments.get('include_image',False))
+            try:adapted=extra.adapt(post)
+            except PreviewLimitError as error:
+                extra=Delivery(REGISTRY,arguments.get('session'),False)
+                adapted=extra.adapt(post);adapted['preview_error']=str(error)
+            result['post_action_observation']=adapted
+            delivery.descriptors.update(extra.descriptors);delivery.images.extend(extra.images)
+        except (OSError,ValueError,RuntimeError,TypeError) as error:
+            result['post_action_observation']={'state':'unavailable','delivery_error':str(error),
+                'expected_identity':post.get('expected_identity') if isinstance(post,dict) else None}
+    else:result=delivery.adapt(result)
     if delivery.descriptors:
         result["artifacts"]=list(delivery.descriptors.values())
     content=delivery.images
@@ -943,7 +1008,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.7.0"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.9.0"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":

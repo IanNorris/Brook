@@ -1,8 +1,8 @@
 # Brook VM bridge
 
 Follow-up roadmap: [efficiency, artifact delivery and UI control specification](../../docs/vm-bridge-next.md).
-Reference-first artifact delivery and command jobs are implemented. Semantic UI
-controls, observation bundles and the remaining roadmap are still proposed.
+Reference-first artifacts, command jobs, semantic UI controls, selectable/action-attached
+observations and cached screenshot views are implemented. See the roadmap for remaining work.
 
 A local Python MCP server for explicitly enabled Brook QEMU
 sessions. It observes and injects input into the selected VM through private
@@ -59,6 +59,7 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_start` | Clone seed disks and start `desktop`, `video`, `quake-soft`, `quake-gl3` or `office`; `gpu` is `software` or `gl`. Audio defaults to `none`. |
 | `vm_control` | `pause`, `resume`, `reset`, `stop`, `takeover`, `release`, or controlled `panic`. Stop/reset wait for guest metadata sync; explicit `force: true` permits shutdown when sync cannot complete. Reset changes the generation and invalidates frames. |
 | `vm_observe` | Return PNG artifact reference and frame ID, native geometry, crop origin and scale. Optional native `crop`, `max_width` and opt-in `include_image`; leased completed frame, GPU readback at the frame boundary, and brief VM pause. Requires capture API 2 in the kernel. |
+| `vm_frame` | Read a saved frame as `tiny` (320px), `medium` (960px), full resolution or a native-coordinate crop. Optional `overlay: true` adds a labelled native-coordinate grid. No VM capture; works after stop. |
 | `vm_input` | Ordered key/chord/text/pointer/scroll/relative/hold/wait batches. Coordinates require the current `frame_id`; crop/scale map back to native coordinates. US ASCII text only; holds release at batch end/cancel. Observe to verify reaction. |
 | `vm_logs`, `vm_wait` | Bounded serial/QEMU byte cursors or bounded serial-substring waits. Logs survive VM exit. |
 | `vm_guest_run` | Structured `argv`, optional `cwd`/`env`/`uid`, required `request_id`, and optional `wait_s` return a recoverable command job with isolated output and exit status. Default identity is Brook. The explicitly legacy `command: "run …"` form still returns launch ACK only and fits 220 bytes. |
@@ -98,6 +99,59 @@ report `created_host_monotonic: null`; `described_host_monotonic` is the current
 description time. This does not invent capture timing from a file's wall clock.
 `vm_doctor.bridge_capabilities.artifact_delivery` advertises revision 1. Reload
 an already running MCP server to receive these source/schema changes.
+
+### Saved screenshot views (bridge 0.9.0)
+
+Every capture retains its native-resolution PNG and generates `previews.tiny`
+(320px wide) and `previews.medium` (960px), preserving aspect ratio without
+upscaling. All views share `source_frame_id`, original capture time, frame epoch
+and boot/generation identity; each distinct view has its own `frame_id`.
+The previews always cover the native frame, even when the selected image is cropped.
+
+Inspect the tiny overview, then request a readable region from that exact frame:
+
+```json
+{"session":"SESSION","frame_id":"FRAME_ID","size":"medium","overlay":true}
+```
+
+```json
+{"session":"SESSION","frame_id":"FRAME_ID","crop":{"x":100,"y":80,"width":820,"height":620}}
+```
+
+These are `vm_frame` arguments. Crop coordinates always refer to the original
+native display, including when `FRAME_ID` names a preview. `overlay: true` draws
+a diagnostic grid/ruler labelled in those same native coordinates. It produces
+a separate cached artifact and preserves clean pixels; omit it for text/detail
+inspection. `size` defaults to `full`; alternatively pass `max_width`. The result
+reports `vm_capture_performed: false`. No guest request, new screenshot or VM
+pause is needed. Saved views remain readable after shutdown or generation change;
+`historical_generation` identifies the latter case.
+
+Pass the actual view's `frame_id` to coordinate input: crop and scale map back to
+native geometry. Input requires the latest captured source; reading an older
+saved view cannot make it current again. Known boot mismatch rejects input before
+QMP injection. This check is not atomic with an in-guest reboot.
+
+Pillow supplies Lanczos downsampling when available; a bounded standard-library
+block-average fallback needs no extra package. Native crops copy original rows.
+Run-scoped PNGs are checksum-validated; no image bytes enter text metadata.
+`vm_doctor.bridge_capabilities.frame_views` advertises support.
+
+### Action-attached observations (bridge 0.8.0)
+
+`vm_launch`, `vm_window` and read-only `vm_ui` accept the same optional `include`
+and observation options as `vm_observe`. A selected bundle appears separately as
+`post_action_observation`, after the action's bounded wait. Action confirmation,
+window presence and application readiness remain distinct. The bundle is later
+than the condition sample; it does not retroactively prove readiness or atomicity.
+Without `include`, no additional bundle is captured.
+
+Malformed observation options are rejected before dispatch. Optional capture or
+media-delivery failures preserve confirmed action evidence. Oversized optional
+native previews fall back to artifact references. Cancellation skips an unstarted
+bundle without undoing the action or killing the app. Changing only observation
+options with the same request ID recovers the original mutation and reads fresh
+evidence; it does not launch or apply the action again.
 
 ### Observation bundles (bridge 0.7.0)
 
@@ -271,7 +325,8 @@ interval and guest sample tick. The WM values are captured under one lock;
 process liveness is sampled afterwards. No correspondence to a framebuffer is
 asserted. `buffer_width/height` on API windows report the actual allocated VFB
 extent, separately from requested geometry; a matching size is not a formal
-client configure ACK. Frames remain a separate `vm_observe` artifact.
+client configure ACK. Request `include: ["frame"]` for a separate post-action
+frame component, or use `vm_observe`.
 
 `wait_s` is 0–20 (default 2). `wait_for` defaults to `applied`; close can wait
 for `closed` or `client_group_exit`. Results report these facts separately.

@@ -68,6 +68,10 @@ def describe(registry, session, name):
     return result
 
 
+class PreviewLimitError(ValueError):
+    pass
+
+
 class Delivery:
     """Recursively extract typed bytes and register known artifact path fields.
 
@@ -115,7 +119,7 @@ class Delivery:
             if descriptor["mime_type"] != "image/png":
                 raise ValueError("Image preview requires PNG")
             if self.preview_bytes + len(blob) > MAX_PREVIEW_BYTES or len(self.images) >= 4:
-                raise ValueError("Image preview exceeds delivery limit; use artifact references")
+                raise PreviewLimitError("Image preview exceeds delivery limit; use artifact references")
             self.preview_bytes += len(blob)
             self.images.append({"type": "image", "mimeType": "image/png",
                                 "data": base64.b64encode(blob).decode("ascii")})

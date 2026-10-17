@@ -223,6 +223,8 @@ class Ui(Jobs):
                 admitted=operation.get('admission_state')=='completed'
                 dispatched=launch.get('dispatch_finished') is True and launch.get('dispatch_succeeded') is True
                 conditions={'applied':admitted,'admitted':admitted,'dispatched':dispatched,'window':False}
+            else:
+                conditions={'applied':operation['state']=='completed','closed':False,'client_group_exit':False}
             try:
                 observation=self.windows(session,deadline,operation['generation'],operation['guest_boot_id'])
                 if is_launch:
