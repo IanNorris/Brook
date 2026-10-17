@@ -199,6 +199,64 @@ parent mutation checks, sticky/setgid rules, access/faccessat, execution, other
 filesystems and the explicit Nix permission bypass remain open audit items.
 Accounts and multi-user isolation are not accepted by these results.
 
+## Descriptor-relative paths and directory audit
+
+The path review found independent syscall defects beneath the account work:
+openat and several metadata/readlink callers could retry relative to CWD after
+an invalid dirfd; the shared join silently truncated paths; and renameat sent
+trusted kernel strings through the user-pointer validator, producing EFAULT.
+The path join now pins the descriptor while copying its metadata, checks that
+it names a directory, ignores dirfd for absolute paths and returns an explicit
+errno. Every caller propagates that error. Relative open uses the same bounded
+join, and an empty open path returns ENOENT. A separate DoRename helper accepts
+trusted strings. Unsupported nonzero renameat2 flags return EINVAL rather than
+claiming to honor NOREPLACE/EXCHANGE; flags zero uses the working rename path.
+Mutation aliases under /boot are skipped when the whole prefixed path cannot fit.
+
+The initial frozen-kernel guest probe recorded twenty mismatches in 31 cases,
+including a successful create under a truncated filename. Its Python temporary
+cleanup also failed: deep directory descriptors still retain only 62 path bytes.
+The serial-derived baseline is `at-paths-before-serial.json`. Directory metadata
+remains a path string, so this change does not repair deep dirfds or preserve
+directory identity through rename, unlink or symlink replacement.
+
+The final `scripts/workloads/at_paths.py` probe passed forty guest cases in
+session `403dfeab8d7744f4816f30c6e84b6e1c`; thirty-nine host Linux reference cases
+also passed. Brook adds its explicit bounded-join case. Controls cover successful
+open/stat/statx, mkdir/rmdir, symlink, directory/CWD readlink, unlink, chmod,
+timestamps and both zero-flag rename entry points, alongside invalid and
+nondirectory descriptors. The readonly destination remains intact when unsupported
+rename policies fail. All 21 hosted suites passed. The final controls run returned
+to ten tasks with heap integrity OK, checked shutdown and three clean offline
+filesystem checks. The initial malformed private fixture was removed by absolute
+paths after preserving its evidence. Results: `at-paths-controls.json` and
+`at-paths-result.json` under `build/workloads/identity-20261017/`.
+
+The next traversal boundary must walk components in order, check search before
+consuming each component (including dot/dotdot), expand symlinks before dotdot,
+resolve mount crossings and preserve trailing slash requirements. It must return
+structural and authorization errors directly rather than retrying the unresolved
+spelling. VfsOpenExecutable has a useful component walk, but the general VFS
+normalizer currently collapses dotdot first. sys_open also strips relative trailing
+/.; chdir retains unresolved spelling. Parent mutations must check write plus
+search under the filesystem write lock; sticky removal/replacement checks apply
+to both relevant entries in a rename. A checked string followed by another lookup
+also needs namespace synchronization; pinned directory objects are the longer-term
+solution for CWD and dirfds.
+
+`scripts/workloads/permission_audit.py` records these remaining gaps separately
+from passing tests. In session `202f1504b8fb43cfbf8f2b708eefb2e3`, UID 1001:GID100
+with no supplementary groups reproduced seventeen mismatches: seven traversal/type
+cases, five readonly-parent mutations, both rename parents, two sticky-directory
+operations and access-search. The public-directory creation control succeeded.
+Each fixture is private under /data and the parent remains root. This is evidence
+that directory authorization remains incomplete, not an accepted account boundary.
+The same kernel passed 686 leaf-open checks, the two-mount ownership regression
+and all fourteen current root credential groups. It returned to ten background
+tasks with heap integrity OK, then passed checked shutdown and all three offline
+filesystem checks. Kernel:
+`ddc5239fb692a0baf443723ace56993c01a70c25d30f63af2cb739357bc81bb0`.
+
 ## Delivery order and acceptance
 
 1. Fix contradictory identity queries and false-success credential operations,

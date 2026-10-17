@@ -2847,6 +2847,8 @@ static DrmGemObj* DrmGemGet(DrmCtx* c, uint32_t bo_handle) {
 }
 } // namespace
 
+static int ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize);
+
 static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
                          uint64_t, uint64_t, uint64_t)
 {
@@ -2878,16 +2880,9 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     // Resolve relative paths against the process's CWD.
     char resolvedPath[256];
     const char* lookupPath = path;
-    if (path[0] != '/' && proc->cwd[0] != '\0')
-    {
-        uint32_t ci = 0;
-        for (uint32_t j = 0; proc->cwd[j] && ci < 250; ++j)
-            resolvedPath[ci++] = proc->cwd[j];
-        if (ci > 0 && resolvedPath[ci - 1] != '/')
-            resolvedPath[ci++] = '/';
-        for (uint32_t j = 0; path[j] && ci < 254; ++j)
-            resolvedPath[ci++] = path[j];
-        resolvedPath[ci] = '\0';
+    if (!path[0]) return -ENOENT;
+    if (path[0] != '/') {
+        if (int error = ResolveAtPath(-100, path, resolvedPath, sizeof(resolvedPath))) return error;
         lookupPath = resolvedPath;
     }
 
@@ -7031,9 +7026,6 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
     return -EBADF;
 }
 
-// Forward decl for *at path resolution (defined after sys_openat).
-static bool ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize);
-
 static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAddr,
                                uint64_t flags, uint64_t, uint64_t)
 {
@@ -7053,9 +7045,9 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAd
 
     // Resolve relative path against dirfd
     char resolved[256];
-    const char* finalPath = path;
-    if (ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        finalPath = resolved;
+    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        return error;
+    const char* finalPath = resolved;
 
     if (noFollow)
         return do_lstat_internal(finalPath, statAddr);
@@ -7490,56 +7482,46 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     if (path[0] == '/' || static_cast<int64_t>(dirfd) == AT_FDCWD)
         return sys_open(pathAddr, flags, mode, 0, 0, 0);
 
-    // Resolve relative path against dirfd's directory path
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(dirfd));
-    if (!fde || fde->dirPath[0] == '\0')
-        return sys_open(pathAddr, flags, mode, 0, 0, 0);
-
-    // Build absolute path: dirPath + relative path
     char resolved[256];
-    uint32_t ri = 0;
-    for (uint32_t i = 0; fde->dirPath[i] && ri < 250; ++i)
-        resolved[ri++] = fde->dirPath[i];
-    if (ri > 0 && resolved[ri - 1] != '/' && ri < 254)
-        resolved[ri++] = '/';
-    for (uint32_t i = 0; path[i] && ri < 254; ++i)
-        resolved[ri++] = path[i];
-    resolved[ri] = '\0';
-
+    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        return error;
     return sys_open(reinterpret_cast<uint64_t>(resolved), flags, mode, 0, 0, 0);
 }
 
-// Shared helper for *at syscalls: resolves a path relative to dirfd into an
-// absolute path in 'out'. AT_FDCWD resolves against the process cwd.
-static bool ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize)
+// Shared bounded path join for *at syscalls. This is not an inode resolver:
+// dirPath still needs replacement with a pinned directory identity.
+static int ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize)
 {
-    static constexpr int AT_FDCWD = -100;
-    if (!path || !out || outSize < 2) return false;
+    if (!path || !out || outSize < 2) return -EINVAL;
+    if (!path[0]) return -ENOENT;
     if (path[0] == '/') {
-        uint32_t i = 0;
-        while (path[i] && i < outSize - 1) { out[i] = path[i]; ++i; }
-        out[i] = '\0';
-        return true;
+        uint32_t length = strlen(path);
+        if (length >= outSize) return -36; // ENAMETOOLONG; never truncate.
+        memcpy(out, path, length + 1);
+        return 0; // Absolute paths ignore dirfd.
     }
     Process* proc = ProcessCurrent();
-    if (!proc) return false;
-    const char* prefix = proc->cwd;
-    if (dirfd != AT_FDCWD) {
-        FdEntry* fde = FdGet(proc, dirfd);
-        if (!fde || fde->dirPath[0] == '\0') return false;
-        prefix = fde->dirPath;
+    if (!proc) return -EBADF;
+    char prefix[sizeof(proc->cwd)];
+    if (dirfd == -100) {
+        memcpy(prefix, proc->cwd, sizeof(prefix));
+        prefix[sizeof(prefix) - 1] = 0;
+    } else {
+        FdRef ref(proc, dirfd);
+        FdEntry* entry = ref.get();
+        if (!entry) return -EBADF;
+        if (entry->type != FdType::Vnode || !entry->handle ||
+            static_cast<Vnode*>(entry->handle)->type != VnodeType::Dir) return -ENOTDIR;
+        if (!entry->dirPath[0]) return -EBADF;
+        StrCopyN(prefix, entry->dirPath, sizeof(prefix));
     }
-    uint32_t ri = 0;
-    for (uint32_t i = 0; prefix[i] && ri < outSize - 2; ++i)
-        out[ri++] = prefix[i];
-    if (ri > 0 && out[ri - 1] != '/' && ri < outSize - 2)
-        out[ri++] = '/';
-    for (uint32_t i = 0; path[i] && ri < outSize - 1; ++i)
-        out[ri++] = path[i];
-    out[ri] = '\0';
-    return true;
+    uint32_t length = strlen(prefix), suffix = strlen(path);
+    bool slash = length && prefix[length - 1] != '/';
+    if (length + slash + suffix >= outSize) return -36;
+    memcpy(out, prefix, length);
+    if (slash) out[length++] = '/';
+    memcpy(out + length, path, suffix + 1);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -8256,7 +8238,7 @@ static int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz
     if (!CopyUserCString(pathAddr, path, sizeof(path)))
         return -EFAULT;
     char resolved[256];
-    if (!ResolveAtPath(-100,path,resolved,sizeof(resolved))) return -ENOENT;
+    if (int error = ResolveAtPath(-100,path,resolved,sizeof(resolved))) return error;
     return DoReadlink(resolved, bufAddr, bufsiz);
 }
 
@@ -8268,8 +8250,8 @@ static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAdd
         return -EFAULT;
 
     char resolved[256];
-    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        return DoReadlink(path, bufAddr, bufsiz);
+    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
+        return error;
     return DoReadlink(resolved, bufAddr, bufsiz);
 }
 
@@ -8284,7 +8266,7 @@ static int64_t sys_symlink(uint64_t targetAddr, uint64_t linkpathAddr, uint64_t,
     if (!CopyUserCString(targetAddr, targetBuf, sizeof(targetBuf))) return -EFAULT;
     if (!CopyUserCString(linkpathAddr, linkBuf, sizeof(linkBuf))) return -EFAULT;
     char resolved[512];
-    if (!ResolveAtPath(-100, linkBuf, resolved, sizeof(resolved))) return -ENOENT;
+    if (int error = ResolveAtPath(-100, linkBuf, resolved, sizeof(resolved))) return error;
     int r = VfsSymlink(targetBuf, resolved);
     return (r == 0) ? 0 : static_cast<int64_t>(r);
 }
@@ -8296,8 +8278,7 @@ static int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t li
     if (!CopyUserCString(targetAddr, targetBuf, sizeof(targetBuf))) return -EFAULT;
     if (!CopyUserCString(linkpathAddr, linkBuf, sizeof(linkBuf))) return -EFAULT;
     char resolved[256];
-    if (!ResolveAtPath(static_cast<int>(newdirfd), linkBuf, resolved, sizeof(resolved)))
-        return -EBADF;
+    if (int error = ResolveAtPath(static_cast<int>(newdirfd), linkBuf, resolved, sizeof(resolved))) return error;
     return VfsSymlink(targetBuf, resolved);
 }
 
@@ -9314,7 +9295,7 @@ static int64_t sys_rmdir(uint64_t pathAddr, uint64_t, uint64_t,
 static int64_t DoUnlink(const char* path, bool directory)
 {
     char resolved[256];
-    if (!ResolveAtPath(-100, path, resolved, sizeof(resolved))) return -ENOENT;
+    if (int error = ResolveAtPath(-100, path, resolved, sizeof(resolved))) return error;
     path = resolved;
 
     // /dev/shm/<name> — shm_unlink: mark entry as free
@@ -9330,6 +9311,7 @@ static int64_t DoUnlink(const char* path, bool directory)
 
     char bootPath[256] = "/boot";
     uint32_t bi = 5;
+    if (strlen(path) + bi >= sizeof(bootPath)) return rc == -1 ? -ENOENT : rc;
     for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
         bootPath[bi++] = *p;
     bootPath[bi] = '\0';
@@ -9351,15 +9333,11 @@ static int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
 // sys_rename (82) — rename a file or directory
 // ---------------------------------------------------------------------------
 
-static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
-                           uint64_t, uint64_t, uint64_t)
+static int64_t DoRename(const char* oldBuf, const char* newBuf)
 {
-    char oldBuf[256], newBuf[256];
-    if (!CopyUserCString(oldAddr, oldBuf, sizeof(oldBuf))) return -EFAULT;
-    if (!CopyUserCString(newAddr, newBuf, sizeof(newBuf))) return -EFAULT;
     char oldResolved[512], newResolved[512];
-    if (!ResolveAtPath(-100, oldBuf, oldResolved, sizeof(oldResolved)) ||
-        !ResolveAtPath(-100, newBuf, newResolved, sizeof(newResolved))) return -ENOENT;
+    if (int error = ResolveAtPath(-100, oldBuf, oldResolved, sizeof(oldResolved))) return error;
+    if (int error = ResolveAtPath(-100, newBuf, newResolved, sizeof(newResolved))) return error;
     const char* oldPath = oldResolved;
     const char* newPath = newResolved;
 
@@ -9370,6 +9348,8 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
     // Try with /boot prefix on both
     char bootOld[256] = "/boot", bootNew[256] = "/boot";
     uint32_t oi = 5, ni = 5;
+    if (strlen(oldPath) + oi >= sizeof(bootOld) ||
+        strlen(newPath) + ni >= sizeof(bootNew)) return rc == -1 ? -ENOENT : rc;
     for (const char* p = oldPath; *p && oi + 1 < sizeof(bootOld); ++p)
         bootOld[oi++] = *p;
     bootOld[oi] = '\0';
@@ -9383,10 +9363,19 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
     return -ENOENT;
 }
 
+static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    char oldBuf[256], newBuf[256];
+    if (!CopyUserCString(oldAddr, oldBuf, sizeof(oldBuf))) return -EFAULT;
+    if (!CopyUserCString(newAddr, newBuf, sizeof(newBuf))) return -EFAULT;
+    return DoRename(oldBuf, newBuf);
+}
+
 static int64_t DoMkdir(const char* path, uint16_t mode)
 {
     char resolved[256];
-    if (!ResolveAtPath(-100, path, resolved, sizeof(resolved))) return -ENOENT;
+    if (int error = ResolveAtPath(-100, path, resolved, sizeof(resolved))) return error;
     path = resolved;
 
     int rc = VfsMkdir(path,mode);
@@ -9395,6 +9384,7 @@ static int64_t DoMkdir(const char* path, uint16_t mode)
 
     char bootPath[256] = "/boot";
     uint32_t bi = 5;
+    if (strlen(path) + bi >= sizeof(bootPath)) return rc == -1 ? -ENOENT : rc;
     for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
         bootPath[bi++] = *p;
     bootPath[bi] = '\0';
@@ -9423,8 +9413,7 @@ static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     const char* path = pathBuf;
     char resolved[256];
-    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        return -EBADF;
+    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved))) return error;
     return DoMkdir(resolved,static_cast<uint16_t>(mode));
 }
 
@@ -9440,8 +9429,7 @@ static int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     const char* path = pathBuf;
     char resolved[256];
-    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        return -EBADF;
+    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved))) return error;
     return DoUnlink(resolved, (flags & 0x200) != 0);
 }
 
@@ -9459,19 +9447,17 @@ static int64_t sys_renameat(uint64_t olddirfd, uint64_t oldAddr,
     const char* oldP = oldBuf;
     const char* newP = newBuf;
     char oldR[256], newR[256];
-    uint64_t oArg = reinterpret_cast<uint64_t>(oldP), nArg = reinterpret_cast<uint64_t>(newP);
-    if (ResolveAtPath(static_cast<int>(olddirfd), oldP, oldR, sizeof(oldR)))
-        oArg = reinterpret_cast<uint64_t>(oldR);
-    if (ResolveAtPath(static_cast<int>(newdirfd), newP, newR, sizeof(newR)))
-        nArg = reinterpret_cast<uint64_t>(newR);
-    return sys_rename(oArg, nArg, 0, 0, 0, 0);
+    if (int error = ResolveAtPath(static_cast<int>(olddirfd), oldP, oldR, sizeof(oldR))) return error;
+    if (int error = ResolveAtPath(static_cast<int>(newdirfd), newP, newR, sizeof(newR))) return error;
+    return DoRename(oldR, newR);
 }
 
 static int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldAddr,
                               uint64_t newdirfd, uint64_t newAddr,
                               uint64_t flags, uint64_t)
 {
-    (void)flags; // RENAME_NOREPLACE etc.
+    // Unsupported atomic rename policies must not silently replace a target.
+    if (flags) return -EINVAL;
     return sys_renameat(olddirfd, oldAddr, newdirfd, newAddr, 0, 0);
 }
 
@@ -9537,7 +9523,7 @@ static int64_t sys_truncate(uint64_t pathAddr, uint64_t length, uint64_t,
     if (!CopyUserCString(pathAddr, path, sizeof(path))) return -EFAULT;
     if (!path[0]) return -ENOENT;
     char resolved[512];
-    if (!ResolveAtPath(-100, path, resolved, sizeof(resolved))) return -ENOENT;
+    if (int error = ResolveAtPath(-100, path, resolved, sizeof(resolved))) return error;
     VnodeStat st;
     int result = VfsStatPath(resolved, &st);
     if (result) return result < -1 ? result : -ENOENT;
@@ -9575,7 +9561,7 @@ static int64_t sys_chmod(uint64_t pathAddr, uint64_t mode, uint64_t,
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     if (!pathBuf[0]) return -ENOENT;
     char resolved[512];
-    if (!ResolveAtPath(-100, pathBuf, resolved, sizeof(resolved))) return -ENOENT;
+    if (int error = ResolveAtPath(-100, pathBuf, resolved, sizeof(resolved))) return error;
     return VfsChmodPath(resolved, static_cast<uint16_t>(mode & 07777));
 }
 
@@ -9595,16 +9581,8 @@ static int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
     char pathBuf[256];
     if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     if (!pathBuf[0]) return -ENOENT;
-    if (pathBuf[0] != '/' && static_cast<int>(dirfd) != -100) {
-        Process* proc = ProcessCurrent();
-        FdEntry* entry = proc ? FdGet(proc, static_cast<int>(dirfd)) : nullptr;
-        if (!entry || !entry->handle) return -EBADF;
-        if (entry->type != FdType::Vnode ||
-            static_cast<Vnode*>(entry->handle)->type != VnodeType::Dir) return -ENOTDIR;
-    }
     char resolved[512];
-    if (!ResolveAtPath(static_cast<int>(dirfd), pathBuf, resolved, sizeof(resolved)))
-        return -ENOENT;
+    if (int error = ResolveAtPath(static_cast<int>(dirfd), pathBuf, resolved, sizeof(resolved))) return error;
     return VfsChmodPath(resolved, static_cast<uint16_t>(mode & 07777));
 }
 
@@ -9715,8 +9693,7 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathAddr, uint64_t timesAd
     }
     if (!path[0]) return -ENOENT;
     char resolved[512];
-    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        return static_cast<int>(dirfd) == -100 ? -ENOENT : -EBADF;
+    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved))) return error;
     return VfsSetTimesPath(resolved, times, (flags & NOFOLLOW) != 0);
 }
 
@@ -9876,8 +9853,7 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     VnodeStat st{};
 
     char resolved[256];
-    if (!ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        return -ENOENT;
+    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved))) return error;
 
     // GL shim (M0): synthetic DRM devfs/sysfs entries (glibc stat() may route
     // through statx). Reuse the shared LinuxStat filler, then convert.

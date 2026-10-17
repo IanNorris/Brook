@@ -430,7 +430,11 @@ traced to the missing-directory `/boot/lib` fallback, not proven cache aliasing.
 
 Ext2 directory type, emptiness and link accounting now pass with offline fsck.
 Access variants still do not evaluate requested permission bits; classic
-relative readlink needs a cwd audit.
+relative readlink now has a cwd/dirfd regression. Descriptor-relative joins now
+return precise errors and reject overflow, but the 62-byte stored directory path
+and directory identity after rename remain open. The private directory audit in
+[identity.md](identity.md) reproduces seventeen traversal/mutation/access gaps;
+implement a shared component resolver and parent/sticky checks before accounts.
 
 The bootstrap SIMD probe exposed syscall entry clobbering user XMM/YMM state:
 anonymous mmap and brk zero-fill used XMM0 without preserving it. Stack XSAVE/
