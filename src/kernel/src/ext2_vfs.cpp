@@ -3247,7 +3247,8 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath, uint1
 }
 
 static bool Ext2DirReplace(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* directory,
-                            const char* name, uint32_t inode, uint8_t type, bool* committed = nullptr)
+                            const char* name, uint32_t inode, uint8_t type,
+                            bool* committed = nullptr, bool updateTimes = true)
 {
     if (committed) *committed = false;
     if (!Ext2PrepareDirectoryWrite(mnt, dirIno, directory)) return false;
@@ -3267,7 +3268,7 @@ static bool Ext2DirReplace(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* directory
                 kfree(buf);
                 if (ok && committed) *committed = true;
                 Ext2DirentCacheInvalidateParent(mnt, dirIno);
-                Ext2Touch(directory);
+                if (updateTimes) Ext2Touch(directory);
                 return ok && Ext2WriteInode(mnt, dirIno, directory);
             }
             pos += entry->rec_len;
@@ -3366,8 +3367,10 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
     // Namespace committed. Even if a later metadata write fails, complete
     // victim accounting and retain the first error; never skip its unlink.
     int error = 0;
+    // Updating the moved directory's '..' entry is rename bookkeeping, not
+    // a user content modification. Preserve its mtime; ctime is set below.
     if (directory && oldParent != newParent &&
-        !Ext2DirReplace(mnt, ino, &target, "..", newParent, 2)) error = -5;
+        !Ext2DirReplace(mnt, ino, &target, "..", newParent, 2, nullptr, false)) error = -5;
     if (!Ext2ReadInode(mnt, oldParent, &oldDir) || !Ext2ReadInode(mnt, newParent, &newDir)) {
         error = -5;
     } else {
