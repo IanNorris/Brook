@@ -358,9 +358,19 @@ suites passed. Initial fixed-kernel testing passed the worker-fault and handled
 control cases; intermittent exited-leader failures were traced to the probe's
 readiness poll being interrupted by SIGCHLD before sending the trigger (those
 cases produced no hardware-fault dump). The corrected probe passes 48/48 on
-Linux. Its final Brook rerun, existing fatal-signal regression probe, and real
-VLC close/task-reclamation check remain pending. Treat this as a containment
-checkpoint, not completed acceptance or a fix for VLC's invalid proxy access.
+Linux. Final Brook acceptance (`72f2260bb6cf4742bfff86664d5fbe5b`) also passed
+48/48 hardware-fault cases and 48/48 existing fatal-signal cases, returning to
+nine service tasks. Native VLC played the 720p fixture with active PCM capture;
+closing it faulted at `0x1e456fe5` (the earlier interface-method load in the same
+`wl_proxy_marshal_flags` function), but all application tasks were automatically
+reclaimed. The guest returned to ten service tasks with Wayland running and no
+windows; subsequent audio capture had zero frames and an inactive stream.
+No maintenance kill was needed. Checked filesystem/device-flushing shutdown
+and all three offline filesystem checks passed. Containment is verified for
+these cases; VLC's underlying invalid proxy access still needs a fix. Evidence:
+ignored `build/workloads/gallery-fresh-20261017/` logs `fault-final.log`,
+`fatal-final.log`, `vlc-containment-close.log` and
+`containment-final-filesystems.json`.
 
 The same install emitted “real strand” scheduler warnings but completed. Astra
 review found that the detector combines process state, ready-queue and trace

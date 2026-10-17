@@ -40,3 +40,11 @@ at RIP `0x1e45703f`, now without a concurrent install, leaving peer tasks alive.
 Maintenance SIGKILL reclaimed the group before checked shutdown and clean
 filesystem checks. Keep installs and playback separate; see REC-03/REC-04 in
 `docs/backlog.md` and the [fresh Gallery acceptance](../../docs/app-gallery.md).
+
+The worker-fault containment fix was subsequently verified in session
+`72f2260bb6cf4742bfff86664d5fbe5b`: native playback still faults on close in
+`wl_proxy_marshal_flags`, but the kernel now reclaims the entire application
+group automatically. No windows or VLC tasks remained, the audio stream became
+inactive, and checked shutdown plus all three offline filesystem checks passed.
+This fixes leaked peers after a fatal worker fault; it does not fix VLC's
+underlying shutdown crash.

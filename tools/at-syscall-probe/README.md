@@ -809,7 +809,9 @@ until explicit SIGKILL. Readiness waits retry EINTR, including SIGCHLD from a
 raw leader exit. Failure output identifies the stage and distinguishes the
 observed wait result from cleanup. Run `faultgroupcheck 8` for 48 cases, with
 an external host deadline as well. The Linux control passes 48/48; the final
-probe still needs its Brook rerun at the current checkpoint. Follow guest
+probe also passes 48/48 on Brook (session
+`72f2260bb6cf4742bfff86664d5fbe5b`), followed by the existing fatal-signal
+probe's 48/48 and recovery to nine service tasks. Follow guest
 acceptance with task-count recovery, checked shutdown and offline fsck. This
 tests fault containment, not a fix for VLC's underlying invalid proxy access.
 
