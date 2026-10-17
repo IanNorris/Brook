@@ -1,7 +1,8 @@
 # Brook VM bridge
 
-Proposed follow-up: [efficiency, artifact delivery and UI control specification](../../docs/vm-bridge-next.md).
-This proposal is separate from implemented behavior.
+Follow-up roadmap: [efficiency, artifact delivery and UI control specification](../../docs/vm-bridge-next.md).
+Reference-first artifact delivery is implemented; command jobs and semantic UI
+controls remain proposed.
 
 A local Python MCP server for explicitly enabled Brook QEMU
 sessions. It observes and injects input into the selected VM through private
@@ -57,7 +58,7 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_sessions`, `vm_doctor` | Discover opted-in runs and inspect actual transport/guest capabilities. Select an explicit session. |
 | `vm_start` | Clone seed disks and start `desktop`, `video`, `quake-soft`, `quake-gl3` or `office`; `gpu` is `software` or `gl`. Audio defaults to `none`. |
 | `vm_control` | `pause`, `resume`, `reset`, `stop`, `takeover`, `release`, or controlled `panic`. Stop/reset wait for guest metadata sync; explicit `force: true` permits shutdown when sync cannot complete. Reset changes the generation and invalidates frames. |
-| `vm_observe` | Return PNG and frame ID, native geometry, crop origin and scale. Optional native `crop` and `max_width`; leased completed frame, GPU readback at the frame boundary, and brief VM pause. Requires capture API 2 in the kernel. |
+| `vm_observe` | Return PNG artifact reference and frame ID, native geometry, crop origin and scale. Optional native `crop`, `max_width` and opt-in `include_image`; leased completed frame, GPU readback at the frame boundary, and brief VM pause. Requires capture API 2 in the kernel. |
 | `vm_input` | Ordered key/chord/text/pointer/scroll/relative/hold/wait batches. Coordinates require the current `frame_id`; crop/scale map back to native coordinates. US ASCII text only; holds release at batch end/cancel. Observe to verify reaction. |
 | `vm_logs`, `vm_wait` | Bounded serial/QEMU byte cursors or bounded serial-substring waits. Logs survive VM exit. |
 | `vm_guest_run` | Launch a Brook `run /absolute/guest/path args` command, optionally `--uid 1000`. Return PID; no process completion or isolated stdout/stderr yet. Entire framed command fits 220 bytes. |
@@ -68,7 +69,32 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_record` | Asynchronous start/status/stop of bounded VM-only H.264/AAC recording through a private display stream. Requires the pinned host encoder; see [setup and acceptance](../../docs/vm-recording.md). |
 | `vm_audio_capture` | 0.1–10 seconds of QEMU PCM WAV with format, frames and host monotonic interval. No microphone. Launcher watchdog bounds abandoned recordings. |
 | `vm_audio_analyze` | Session WAV waveform PNG, RMS and silent bins. PCM silence alone does not identify stutter. |
-| `vm_artifacts` | Fetch scoped ignored artifacts, including images and exports after VM exit. |
+| `vm_artifacts` | Describe scoped ignored artifacts by absolute path, MIME, bytes and checksum, including after VM exit. `include_image: true` opts in to a PNG preview. Binary exports are never embedded in JSON. |
+
+### Media delivery (bridge 0.3.0)
+
+Image-producing tools default to `include_image: false`. Text results contain
+an `artifacts` array with session-scoped `artifact_id`, absolute `path`,
+`mime_type`, `byte_length`, `sha256`, and image dimensions. Frame metadata keeps
+its original epoch, coordinate extent, crop origin and scale. Waveform results
+identify both the plot and source PCM. Existing files are reused without copying
+or re-encoding. The adapter also extracts nested typed binary results into new
+run-scoped files. Ordinary guest text is untouched, including base64 strings.
+
+Use a local image viewer on the returned path. Clients supporting native MCP
+image content can request `include_image: true`; previews are bounded to 8 MiB
+total and four images. Do not dump that entire media-bearing envelope as JSON
+text. Native MCP image transport still contains encoded bytes. Clients unable
+to open local paths should opt in to that preview rather than treat the path
+as a remote URL. Standalone CLI calls use the same reference-first default.
+
+Artifact descriptions validate session access even after shutdown, reject
+symlinks/nonregular files and known unfinished captures, and hash files with
+bounded memory. Existing artifacts without a recorded monotonic creation time
+report `created_host_monotonic: null`; `described_host_monotonic` is the current
+description time. This does not invent capture timing from a file's wall clock.
+`vm_doctor.bridge_capabilities.artifact_delivery` advertises revision 1. Reload
+an already running MCP server to receive these source/schema changes.
 
 Input is serialized across clients. Human takeover interrupts subsequent input
 and keeps observation available. Other mutations are still explicit tools;
@@ -129,6 +155,19 @@ tests cover sync-before-QMP ordering, rejection of missing/negative replies,
 timeout/panic/unreachable handling, explicit forced shutdown reporting, and
 unchanged pause/resume behavior. Wrapper tests cover first-run controls,
 startup demos, explicit commands, renderer selection and saved preferences.
+Media tests cover default/explicit previews over stdio, nested payloads,
+coordinate preservation, legitimate guest text, waveform/PCM references,
+large binary exports, preview bounds, stopped sessions, unfinished captures,
+and symlink/path/FIFO rejection.
+
+Reference delivery acceptance (17 October 2026): 80 host tests, 75 passed and
+five optional encoder-runtime tests skipped. A live eight-vCPU/4 GiB VM passed
+full-resolution and cropped/scaled capture, byte-identical explicit preview,
+PCM/waveform references, and artifact recovery after shutdown. The 1920×1080
+frame's response was 1,784 bytes; its old base64 image payload alone would be
+5,626,572 bytes. This measures response size, not faster GPU capture. Guest
+checked sync, QEMU exit and all three offline filesystem checks passed. The
+test used the source server; the already-connected Codex MCP still needs reload.
 
 ### Optional memory census
 

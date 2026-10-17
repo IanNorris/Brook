@@ -4,7 +4,6 @@
 No host desktop APIs, input daemons, clipboard, or arbitrary host shell tool.
 """
 import argparse
-import base64
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -25,6 +24,7 @@ import wave
 import zlib
 
 from common import ROOT, REGISTRY, QMP, artifact, load_session, process_identity, process_is_alive, recording_lock, session_lock, write_json
+from media import Delivery, describe as describe_artifact, scoped_path
 
 MAX_LOG = 256 * 1024
 
@@ -243,7 +243,11 @@ def doctor(session, **_):
                                if x["name"] in {"input-send-event","screendump","human-monitor-command",
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
-                  "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable"}
+                  "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
+                  "generation": data["generation"], "server_version": "0.3.0",
+                  "bridge_capabilities": {"artifact_delivery": {"revision": 1,
+                      "default": "references", "include_image": True,
+                      "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
         try:
             result["guest"] = guest(data, "bridge stats", timeout=3)
         except (OSError, ValueError, RuntimeError) as error:
@@ -739,27 +743,19 @@ def guest_inspect(session, action="windows", pid=0, **_):
 
 def get_artifact(session, artifact_name, **_):
     load_session(session,live=False)
-    if Path(artifact_name).name!=artifact_name or not re.fullmatch(r"[0-9a-f]{32}\.[A-Za-z0-9_.]+",artifact_name):
-        raise ValueError("Invalid artifact basename")
-    directory=(REGISTRY/session/"artifacts").resolve();path=directory/artifact_name
-    if path.resolve().parent!=directory or path.is_symlink():raise ValueError("Artifact escapes its run")
-    size=path.stat().st_size
-    if path.suffix in {".mkv",".mp4"}:
-        with path.open("rb") as video:checksum=hashlib.file_digest(video,"sha256").hexdigest()
-        return {"artifact":str(path),"size":size,"sha256":checksum,
-                "mime_type":"video/mp4" if path.suffix==".mp4" else "video/x-matroska",
-                "delivery":"local video artifact; binary is not embedded in the tool response"}
-    if size>16*1024*1024:raise ValueError("Artifact exceeds response limit")
-    if path.suffix==".png":return {"image":path.read_bytes(),"data":{"artifact":str(path)}}
-    blob=path.read_bytes()
-    return {"artifact":str(path),"size":len(blob),"sha256":hashlib.sha256(blob).hexdigest(),
-            "base64":base64.b64encode(blob).decode(),"encoding":"base64"}
+    descriptor=describe_artifact(REGISTRY,session,artifact_name)
+    result={"artifact":descriptor["path"],"size":descriptor["byte_length"],**descriptor}
+    if _.get("include_image",False) and descriptor["mime_type"]=="image/png":
+        if descriptor["byte_length"]>8*1024*1024:
+            raise ValueError("Image preview exceeds delivery limit; use artifact references")
+        return {"image":Path(descriptor["path"]).read_bytes(),"data":result}
+    return result
 
 
 def audio_analyze(session, artifact_name, **_):
     name=Path(artifact_name).name
     if name!=artifact_name or not name.endswith(".wav"):raise ValueError("Use a WAV artifact basename")
-    load_session(session,live=False);path=REGISTRY/session/"artifacts"/name
+    load_session(session,live=False);path=scoped_path(REGISTRY,session,name)
     if path.stat().st_size>8*1024*1024:raise ValueError("WAV exceeds analysis limit")
     with wave.open(str(path)) as f:
         channels,rate,width=f.getnchannels(),f.getframerate(),f.getsampwidth()
@@ -787,6 +783,8 @@ def schema(properties=None, required=None):
 
 STR={"type":"string"};NUM={"type":"number"};INT={"type":"integer"}
 SESSION={"session":STR}
+IMAGE_OPTION={"include_image":{"type":"boolean","default":False,
+    "description":"Opt in to bounded native MCP image blocks; default returns local artifact references"}}
 TOOLS={}
 def register(name,fn,description,props=None,required=None,readonly=False):
     TOOLS[name]=(fn,{"name":name,"description":description,"inputSchema":schema(props,required),
@@ -795,12 +793,12 @@ register("vm_sessions",sessions,"Discover opted-in user/agent VM runs; no deskto
 register("vm_doctor",doctor,"VM transport and guest readiness; capabilities distinguish unsupported paths",SESSION,["session"],True)
 register("vm_start",start,"Boot a named experiment on new disk clones with playback off",{"scenario":STR,"gpu":STR})
 register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop/reset await guest sync, force explicitly allows unsynced shutdown",{**SESSION,"action":STR,"force":{"type":"boolean"}},["session","action"])
-register("vm_observe",observe,"Leased completed-frame image with crop/scale metadata; briefly pauses VM; current kernel required; panic needs cached framebuffer",{**SESSION,"crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session"])
+register("vm_observe",observe,"Leased completed-frame artifact with crop/scale metadata; briefly pauses VM; current kernel required; panic needs cached framebuffer",{**SESSION,**IMAGE_OPTION,"crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session"])
 register("vm_logs",logs,"Read bounded logs by byte cursor",{**SESSION,"source":STR,"offset":INT,"limit":INT},["session"],True)
 register("vm_stats",stats,"OS memory/process counts and compositor intervals; optional rolling memory census holds guest mapping locks while sampling",{**SESSION,"memory_details":{"type":"boolean"}},["session"],True)
 register("vm_guest_run",guest_run,"Launch via Brook run syntax; returns PID, not exit status",{**SESSION,"command":STR},["session","command"])
 register("vm_guest",guest_inspect,"Guest windows/processes, or focus by window index in pid",{**SESSION,"action":STR,"pid":INT},["session"])
-register("vm_artifacts",get_artifact,"Read a scoped artifact, including images or bounded binary data after VM exit",{**SESSION,"artifact_name":STR},["session","artifact_name"],True)
+register("vm_artifacts",get_artifact,"Describe a scoped artifact by local path, size and checksum, including after VM exit; binary is never embedded in JSON",{**SESSION,**IMAGE_OPTION,"artifact_name":STR},["session","artifact_name"],True)
 register("vm_profile",profile,"CPU samples and context-switch capture: start/stop/status/export to Speedscope",{**SESSION,"action":STR,"duration_ms":INT},["session"])
 register("vm_debug",debug,"QEMU-level current registers or bounded physical/virtual memory; works independently of guest TCP",{**SESSION,"action":STR,"address":STR,"size":INT,"cpu":INT},["session"],True)
 register("vm_input",input_actions,"Ordered timed key/mouse batches, ASCII-US text; all held state released at end/cancel",{**SESSION,"actions":{"type":"array","minItems":1,"maxItems":64,"items":schema({
@@ -811,7 +809,7 @@ register("vm_input",input_actions,"Ordered timed key/mouse batches, ASCII-US tex
 register("vm_wait",wait,"Wait for a serial-log substring without repeatedly returning whole logs",{**SESSION,"text":STR,"timeout_s":NUM},["session","text"],True)
 register("vm_record",video_recording,"Direct VM video/audio recording: start/status/stop; private display stream, no host desktop or microphone",{**SESSION,"action":STR,"duration_s":NUM,"fps":INT,"audio":{"type":"boolean"},"width":INT,"height":INT},["session"])
 register("vm_audio_capture",audio_capture,"Bounded PCM WAV capture without speaker output; no host microphone",{**SESSION,"duration_s":NUM},["session"])
-register("vm_audio_analyze",audio_analyze,"Return waveform image and metrics for a session WAV artifact",{**SESSION,"artifact_name":STR},["session","artifact_name"],True)
+register("vm_audio_analyze",audio_analyze,"Return waveform artifact and metrics for a session WAV artifact",{**SESSION,**IMAGE_OPTION,"artifact_name":STR},["session","artifact_name"],True)
 
 
 def call_tool(name,arguments,cancel=None):
@@ -821,14 +819,15 @@ def call_tool(name,arguments,cancel=None):
     if any(k not in arguments for k in spec["inputSchema"]["required"]):raise ValueError("Missing required argument")
     for k,v in arguments.items():
         kind=properties[k]["type"]
-        if (kind=="string" and not isinstance(v,str)) or (kind in {"integer","number"} and
+        if (kind=="string" and not isinstance(v,str)) or (kind=="boolean" and not isinstance(v,bool)) or (kind in {"integer","number"} and
             (isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v) or (kind=="integer" and not isinstance(v,int)))):
             raise ValueError("Invalid type for "+k)
     result=fn(**arguments,_cancel=cancel)
-    content=[]
-    if "image" in result:
-        content.append({"type":"image","mimeType":"image/png","data":base64.b64encode(result["image"]).decode()})
-        result=result["data"]
+    delivery=Delivery(REGISTRY,arguments.get("session"),arguments.get("include_image",False))
+    result=delivery.adapt(result)
+    if delivery.descriptors:
+        result["artifacts"]=list(delivery.descriptors.values())
+    content=delivery.images
     content.append({"type":"text","text":json.dumps(result)})
     return {"content":content,"isError":False}
 
@@ -845,7 +844,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.2.0"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.3.0"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":

@@ -8,6 +8,13 @@ to user-started runs without restarting them. vm_start makes new disk clones.
 Keep speaker playback off unless the user requests it.
 
 Use vm_observe to get a full-resolution completed-frame image and frame_id.
+Media delivery defaults to local artifact references with absolute path, MIME,
+size and checksum. Open the referenced PNG to inspect it. Set include_image:
+true on vm_observe, vm_audio_analyze or vm_artifacts only when a native MCP
+image preview is useful. Never serialize a preview-bearing MCP envelope into
+text: image transport contains base64 even though JSON metadata does not.
+vm_artifacts returns references for binary exports too, including after exit.
+The same adapter handles nested media and retains coordinate provenance.
 Normal capture requires the updated kernel and bridge (capture API 2); reload
 an older running MCP process after source updates. Captures lease a snapshot
 and briefly pause QEMU; do not loop this tool as a video recorder. Coordinate input

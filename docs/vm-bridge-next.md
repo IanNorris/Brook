@@ -1,7 +1,10 @@
 # VM bridge efficiency and UI control specification
 
-Status: proposed, 17 October 2026. This specifies follow-up work; it does not
-claim these APIs are implemented. Current behavior is documented in the
+Status: partially implemented, 17 October 2026. Bridge 0.3.0 implements the
+reference-first media adapter, optional native previews, recursive binary
+extraction and artifact capability revision 1. Existing artifacts without a
+recorded monotonic creation time report it as unknown. Remaining sections,
+including command jobs and semantic UI controls, are proposed. Current behavior is documented in the
 [bridge README](../tools/vm_bridge/README.md). Preserve the existing VM-only
 architecture and [completed-frame capture contract](completed-frame-capture.md).
 
