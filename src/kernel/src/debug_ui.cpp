@@ -15,7 +15,7 @@ namespace {
 constexpr uint32_t MaxRequests=256,MaxQueued=16;
 enum class Phase { Empty,Queued,Dispatched,Completed,Rejected };
 struct Request {
-    char id[33];Phase phase;uint32_t windowId,restoreTarget,closeMethod;
+    char id[33],appId[33];bool launch,coalesced;uint32_t catalogGeneration;uint64_t launchToken;Phase phase;uint32_t windowId,restoreTarget,closeMethod;
     uint64_t incarnation,queuedTick,appliedTick;WmDebugAction action;
     int error;WmDebugWindow result;
 };
@@ -110,15 +110,45 @@ const char* PhaseName(Phase phase) {
     case Phase::Empty:return "empty";
     }return "unknown";
 }
+void SerializeLaunch(Json& json,uint64_t token) {
+    LaunchRecord launch{};
+    if(!token||!WmSnapshotLaunch(token,&launch)){json.text("null");return;}
+    json.text("{\"token\":\"");json.number(token);json.text("\",\"state\":");
+    json.string(LaunchHistory::State(launch,ApicTickCount()));
+    json.boolean("started",launch.started);json.boolean("dispatch_finished",launch.dispatchFinished);
+    json.text(",\"dispatch_succeeded\":");
+    if(launch.dispatchFinished)json.text(launch.dispatchSucceeded?"true":"false");else json.text("null");
+    json.text(",\"raw_dispatch_result\":");
+    if(launch.rawResultKnown)json.signedNumber(launch.rawResult);else json.text("null");
+    json.boolean("window_observed",launch.windowObserved);json.boolean("existing_window",launch.existingWindow);
+    json.text(",\"window\":");
+    if(launch.windowObserved&&launch.windowId&&launch.windowIncarnation) {
+        json.text("{\"window_id\":");json.number(launch.windowId);
+        json.text(",\"incarnation\":\"");json.number(launch.windowIncarnation);json.text("\"}");
+    }else json.text("null");
+    json.text(",\"correlation\":");json.string(!launch.windowObserved?"none":launch.viaToken?"launch_tag":"app_id_presence");
+    json.field("requested_tick_ms",launch.requested);
+    json.text(",\"window_observed_tick_ms\":");if(launch.windowObserved)json.number(launch.windowTick);else json.text("null");
+    json.field("window_observation_deadline_tick_ms",launch.requested+LaunchFeedbackTable::TimeoutMs);
+    json.text(",\"started_tick_ms\":");if(launch.startedTick)json.number(launch.startedTick);else json.text("null");
+    json.text(",\"dispatch_tick_ms\":");if(launch.dispatchTick)json.number(launch.dispatchTick);else json.text("null");
+    json.boolean("cancelled",launch.cancelled);json.boolean("bridge_only",launch.bridgeOnly);
+    json.boolean("has_live_launch_tagged_processes",SchedulerLaunchHasLiveProcesses(token));
+    json.text("}");
+}
+
 void Status(const Request& request) {
     Json json;json.text("{\"request_id\":");json.string(request.id);
     json.text(",\"state\":");json.string(PhaseName(request.phase));
     json.field("queued_tick_ms",request.queuedTick);json.field("applied_tick_ms",request.appliedTick);
     json.text(",\"error_code\":");json.signedNumber(request.error);
     json.field("close_method",request.closeMethod);
+    json.text(",\"kind\":");json.string(request.launch?"launch":"window");
+    json.boolean("coalesced",request.coalesced);
+    json.text(",\"launch\":");if(request.launch)SerializeLaunch(json,request.launchToken);else json.text("null");
     // The snapshot describes WM state at dispatch, not a client configure ACK.
     json.text(",\"applied_window\":");
-    if(request.phase==Phase::Completed)SerializeWindow(json,request.result);else json.text("null");
+    if(request.phase==Phase::Completed&&!request.launch)SerializeWindow(json,request.result);else json.text("null");
     json.text("}");json.finish();
 }
 } // namespace
@@ -132,8 +162,10 @@ void DebugUiPoll() {
         }
         SpinLockRelease(&requestLock);
         if(selected<0)return;
-        request.error=WmApplyDebugAction(request.windowId,request.incarnation,request.action,
-            request.restoreTarget,&request.result,&request.closeMethod);
+        request.error=request.launch?
+            WmLauncherActivate(request.appId,request.catalogGeneration,&request.launchToken,&request.coalesced):
+            WmApplyDebugAction(request.windowId,request.incarnation,request.action,
+                request.restoreTarget,&request.result,&request.closeMethod);
         request.appliedTick=ApicTickCount();request.phase=request.error?Phase::Rejected:Phase::Completed;
         SpinLockAcquire(&requestLock);requests[selected]=request;SpinLockRelease(&requestLock);
     }
@@ -153,7 +185,7 @@ bool DebugUiHandleCommand(const char* command) {
     }
     if(*at||!count){Error("Invalid fields");return true;}
     if(count==1&&!strcmp(args[0],"caps")) {
-        Json json;char boot[33];DebugEpochCopy(boot);json.text("{\"boot_id\":");json.string(boot);json.text(",\"ui_api\":1,\"max_requests\":256,\"max_queued\":16,\"dedup_retention\":\"until_reboot\",\"launcher\":false,\"apps_api\":1,\"window_actions\":[\"focus\",\"minimize\",\"maximize\",\"restore\",\"close\"]}");json.finish();return true;
+        Json json;char boot[33];DebugEpochCopy(boot);json.text("{\"boot_id\":");json.string(boot);json.text(",\"ui_api\":1,\"max_requests\":256,\"max_queued\":16,\"dedup_retention\":\"until_reboot\",\"launcher\":true,\"launch_api\":1,\"apps_api\":1,\"window_actions\":[\"focus\",\"minimize\",\"maximize\",\"restore\",\"close\"]}");json.finish();return true;
     }
     if(count<2||!DebugEpochMatches(args[count-1])){Error("Stale guest boot");return true;}
     --count;
@@ -164,8 +196,11 @@ bool DebugUiHandleCommand(const char* command) {
             if(enabled&&request.phase==Phase::Queued) {request.phase=Phase::Rejected;request.error=-125;++cancelled;}
             if(request.phase==Phase::Dispatched)++inflight;
         }SpinLockRelease(&requestLock);
+        uint32_t launcherCancelled=0,launcherStarted=0;
+        if(enabled)WmCancelBridgeQueuedLaunches(&launcherCancelled,&launcherStarted);
         Json json;json.text("{\"user_takeover\":");json.text(enabled?"true":"false");
-        json.field("queued_cancelled",cancelled);json.field("already_dispatched",inflight);json.text("}");json.finish();return true;
+        json.field("queued_cancelled",cancelled);json.field("already_dispatched",inflight);
+        json.field("launcher_queued_cancelled",launcherCancelled);json.field("launcher_already_started_or_shared",launcherStarted);json.text("}");json.finish();return true;
     }
     if(count==1&&!strcmp(args[0],"apps")) {
         auto* apps=static_cast<WmDebugApp*>(kmalloc(sizeof(WmDebugApp)*WM_LAUNCHER_MAX_ITEMS));
@@ -211,10 +246,15 @@ bool DebugUiHandleCommand(const char* command) {
         SpinLockRelease(&requestLock);
         if(found)Status(request);else Error("Unknown UI request");return true;
     }
-    if(count==6&&!strcmp(args[0],"window")&&Id(args[1])) {
+    const bool launch=count==4&&!strcmp(args[0],"launch");
+    if(((count==6&&!strcmp(args[0],"window"))||launch)&&Id(args[1])) {
         if(!WmIsActive()){Error("Window manager inactive");return true;}
-        uint64_t id,incarnation,action,restore;
-        if(!Decimal(args[2],&id)||!id||id>WM_MAX_WINDOWS||!Decimal(args[3],&incarnation)||!incarnation||
+        uint64_t id=0,incarnation=0,action=0,restore=0,generation=0;
+        if(launch) {
+            if(!Id(args[2])||!Decimal(args[3],&generation)||!generation||generation>0xffffffffULL) {
+                Error("Invalid app reference");return true;
+            }
+        }else if(!Decimal(args[2],&id)||!id||id>WM_MAX_WINDOWS||!Decimal(args[3],&incarnation)||!incarnation||
            !Decimal(args[4],&action)||action>4||!Decimal(args[5],&restore)||restore>2) {Error("Invalid window request");return true;}
         Request result{};int free=-1;uint32_t queued=0;bool found=false,mismatch=false,taken=false;
         SpinLockAcquire(&requestLock);
@@ -225,12 +265,16 @@ bool DebugUiHandleCommand(const char* command) {
             if(candidate.phase==Phase::Queued||candidate.phase==Phase::Dispatched)++queued;
             if(!strcmp(candidate.id,args[1])) {
                 result=candidate;found=true;
-                mismatch=candidate.windowId!=id||candidate.incarnation!=incarnation||
-                    static_cast<uint32_t>(candidate.action)!=action||candidate.restoreTarget!=restore;
+                mismatch=candidate.launch!=launch || (launch?
+                    candidate.catalogGeneration!=generation||strcmp(candidate.appId,args[2]):
+                    candidate.windowId!=id||candidate.incarnation!=incarnation||
+                    static_cast<uint32_t>(candidate.action)!=action||candidate.restoreTarget!=restore);
             }
         }
         if(!found&&!taken&&free>=0&&queued<MaxQueued) {
-            memcpy(result.id,args[1],33);result.phase=Phase::Queued;result.windowId=static_cast<uint32_t>(id);
+            memcpy(result.id,args[1],33);result.phase=Phase::Queued;result.launch=launch;
+            if(launch){memcpy(result.appId,args[2],33);result.catalogGeneration=static_cast<uint32_t>(generation);}
+            result.windowId=static_cast<uint32_t>(id);
             result.incarnation=incarnation;result.action=static_cast<WmDebugAction>(action);
             result.restoreTarget=static_cast<uint32_t>(restore);result.queuedTick=ApicTickCount();requests[free]=result;
         }

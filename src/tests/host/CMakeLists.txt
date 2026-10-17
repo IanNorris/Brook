@@ -248,3 +248,6 @@ target_compile_options(test_debug_epoch PRIVATE -UNDEBUG -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src"
     "-iquote${BROOK_ROOT}/src/shared"
     "-iquote${BROOK_ROOT}/src/shared/inc_km")
+
+add_host_test(test_launch_history)
+target_compile_options(test_launch_history PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")

@@ -38,9 +38,14 @@ These jobs do not exercise launcher UI or add automatic framebuffer windows.
 Use vm_apps for installed-app/shortcut discovery without taking a screenshot.
 Its app reference binds the published catalog generation, session and guest boot;
 app IDs are distinct from a window's desktop app_id. Availability is validated at
-catalog build, not freshly probed by each read. Semantic vm_launch remains pending;
-use actual menu clicks when testing launcher behavior, and label command jobs as
-a different path.
+catalog build, not freshly probed by each read. Use vm_launch with the exact app
+reference and fresh request_id to exercise normal launcher admission/worker and
+feedback. Wait for admitted, dispatched or window (default); a window proves
+presence, not readiness. Check raw dispatch result and correlation: app_id_presence
+can be an existing single-instance window and does not confirm activation. Recover
+through vm_ui with the original operation ID; never retry with a new ID after an
+uncertain reply. Real menu clicks remain necessary to test hitboxes; command jobs
+are a separate execution path.
 
 Prefer vm_windows and vm_window for semantic UI control. Pass the exact returned
 window reference, action and fresh request_id; restore also requires an explicit
@@ -52,8 +57,9 @@ origin-group exit; select wait_for closed or client_group_exit when needed.
 A Wayland provider is shared; connection-origin metadata is not permission to
 signal it. Unknown ownership stays unknown. Host generation, guest boot epoch
 and window incarnation must all match. Takeover cancels queued UI work but cannot
-recall already-dispatched events. Actual UI launcher activation is still pending;
-command jobs are a different execution path.
+recall already-dispatched events or terminate started applications. Queued launches
+shared with the user are preserved. Guest reboot invalidates launch history;
+stopped-session replies retain cached dispatch facts without a current window.
 
 The legacy command form still uses Brook syntax, e.g. run --uid 1000 /nix/profile/bin/brook-run
 /nix/bin/brook-player --autoexit /data/videos/big-buck-bunny-720p.mov (one line).

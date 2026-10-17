@@ -4,7 +4,10 @@ namespace brook {
 enum class LaunchPhase : uint8_t { Empty, Queued, Dispatching, Waiting, Failed, TimedOut };
 struct LaunchFeedback {
     uint64_t token=0, requested=0, changed=0, windowCeiling=0;
+    uint64_t startedTick=0,dispatchTick=0,windowTick=0,observedWindowIncarnation=0;
+    uint32_t observedWindowId=0;bool observedViaToken=false,existingWindow=false;
     uint32_t catalogGeneration=0;
+    int rawResult=0;bool rawResultKnown=false;
     LaunchPhase phase=LaunchPhase::Empty;
     bool started=false, dispatched=false, dispatchFinished=false, windowObserved=false;
     char identity[33]{}, specification[33]{};
@@ -71,17 +74,18 @@ public:
             if(now-e.requested>=TimeoutMs){e.phase=LaunchPhase::TimedOut;e.changed=now;continue;}
             if(oldest<0||e.token<entries[oldest].token)oldest=i;
         }
-        if(oldest>=0){entries[oldest].phase=LaunchPhase::Dispatching;entries[oldest].started=true;}
+        if(oldest>=0){entries[oldest].phase=LaunchPhase::Dispatching;entries[oldest].started=true;entries[oldest].startedTick=now;}
         return oldest;
     }
-    void Complete(uint64_t token,bool success,uint64_t now) {
+    void Complete(uint64_t token,bool success,uint64_t now,int rawResult=0,bool rawResultKnown=false) {
         int i=Find(token);if(i<0)return;auto& e=entries[i];
-        e.dispatched=success;e.dispatchFinished=true;
+        e.dispatchTick=now;e.dispatched=success;e.dispatchFinished=true;e.rawResult=rawResult;e.rawResultKnown=rawResultKnown;
         if(success&&e.windowObserved){e={};return;}
         if(e.phase==LaunchPhase::TimedOut&&success)return;
         e.phase=success?LaunchPhase::Waiting:LaunchPhase::Failed;e.changed=now;
     }
-    bool Window(uint64_t token,uint64_t birth,const char* appId,LaunchFeedback* observed=nullptr) {
+    bool Window(uint64_t token,uint64_t birth,const char* appId,LaunchFeedback* observed=nullptr,
+                uint32_t windowId=0,uint64_t incarnation=0,uint64_t tick=0) {
         for(auto& e:entries) {
             if(e.phase==LaunchPhase::Empty||e.windowObserved||!e.started||(e.dispatchFinished&&!e.dispatched))continue;
             // A known native launch token beats identity guesses. Wayland
@@ -90,8 +94,9 @@ public:
                 (e.started&&(birth>e.windowCeiling||e.dispatched)&&
                  (Equal(appId,e.appId)||Equal(appId,e.executable)));
             if(match){
+                e.windowObserved=true;e.observedWindowId=windowId;e.observedWindowIncarnation=incarnation;
+                e.windowTick=tick;e.observedViaToken=token==e.token;e.existingWindow=birth<=e.windowCeiling;
                 if(observed)*observed=e;
-                e.windowObserved=true;
                 if(e.dispatchFinished&&e.dispatched)e={};
                 return true;
             }

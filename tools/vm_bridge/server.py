@@ -246,7 +246,7 @@ def doctor(session, **_):
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
-                  "generation": data["generation"], "server_version": "0.5.1",
+                  "generation": data["generation"], "server_version": "0.6.0",
                   "bridge_capabilities": {"artifact_delivery": {"revision": 1,
                       "default": "references", "include_image": True,
                       "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
@@ -413,6 +413,10 @@ def windows(session,**_):
 
 def window_action(session,window,action,request_id,restore_target=None,wait_for='applied',wait_s=2,_cancel=None,**_):
     return window_ui().submit(session,window,action,request_id,restore_target,wait_for,wait_s,_cancel)
+
+
+def launch_app(session,app,request_id,wait_for='window',wait_s=2,_cancel=None,**_):
+    return window_ui().launch(session,app,request_id,wait_for,wait_s,_cancel)
 
 
 def ui_status(session,operation_id,wait_s=0,wait_for='applied',_cancel=None,**_):
@@ -861,8 +865,11 @@ register("vm_windows",windows,"Snapshot native/Wayland windows with boot-bound r
 register("vm_window",window_action,"Apply a semantic compositor action once; return request status and windows. Close dispatch, window disappearance and exact client-group exit are separate conditions",{**SESSION,
     "window":WINDOW_REF,"action":{"type":"string","enum":list(Ui.actions)},"request_id":STR,
     "restore_target":{"type":"string","enum":list(Ui.restores)},"wait_for":{"type":"string","enum":["applied","closed","client_group_exit"]},"wait_s":NUM},["session","window","action","request_id"])
+APP_REF=schema({"app_id":STR,"catalog_generation":INT,"session_generation":STR,"guest_boot_id":STR},["app_id","catalog_generation","session_generation","guest_boot_id"])
+register("vm_launch",launch_app,"Launch an exact installed-app reference through the normal UI launcher once; return durable dispatch history and windows, without claiming app readiness",{**SESSION,
+    "app":APP_REF,"request_id":STR,"wait_s":NUM,"wait_for":{"type":"string","enum":["admitted","dispatched","window"]}},["session","app","request_id"])
 register("vm_ui",ui_status,"Recover a semantic UI request by ID without replaying it; optionally wait and return a windows observation",{**SESSION,"operation_id":STR,"wait_s":NUM,
-    "wait_for":{"type":"string","enum":["applied","closed","client_group_exit"]}},["session","operation_id"],True)
+    "wait_for":{"type":"string","enum":["applied","closed","client_group_exit","admitted","dispatched","window"]}},["session","operation_id"],True)
 register("vm_guest",guest_inspect,"Guest windows/processes, or focus by window index in pid",{**SESSION,"action":STR,"pid":INT},["session"])
 register("vm_artifacts",get_artifact,"Describe a scoped artifact by local path, size and checksum, including after VM exit; binary is never embedded in JSON",{**SESSION,**IMAGE_OPTION,"artifact_name":STR},["session","artifact_name"],True)
 register("vm_profile",profile,"CPU samples and context-switch capture: start/stop/status/export to Speedscope",{**SESSION,"action":STR,"duration_ms":INT},["session"])
@@ -912,7 +919,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.5.1"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.6.0"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":

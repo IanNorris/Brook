@@ -179,6 +179,7 @@ struct LauncherRequest {
 };
 static SpinLock g_launchLock;
 static LaunchFeedbackTable g_launches;
+static LaunchHistory g_launchHistory;
 static LauncherRequest g_launchRequests[LaunchFeedbackTable::Capacity];
 static bool g_launchBusy = false;
 
@@ -192,11 +193,12 @@ void WmLaunchFeedbackPoll()
     lastPoll = now;
     // Window/process lookups may take sleeping/scheduler locks. Never hold the
     // feedback spinlock while acquiring them. Completion is versioned by token.
-    bool hadEntries = false;
+    bool hadEntries = false,needsObservation = false;
     SpinLockAcquire(&g_launchLock);
     for (const auto& e : g_launches.entries) hadEntries |= e.phase != LaunchPhase::Empty;
+    for (const auto& r : g_launchHistory.records) needsObservation |= LaunchHistory::NeedsObservation(r,now);
     SpinLockRelease(&g_launchLock);
-    if (!hadEntries) {
+    if (!hadEntries && !needsObservation) {
         if (__atomic_exchange_n(&g_launchBusy, false, __ATOMIC_ACQ_REL)) CompositorMarkDirty();
         return;
     }
@@ -205,9 +207,11 @@ void WmLaunchFeedbackPoll()
         for (const auto& w : g_windows) {
             if (!w.proc || !w.visible || !w.focusable) continue;
             SpinLockAcquire(&g_launchLock);
+            g_launchHistory.Observe(w.clientLaunchId,w.clientOrigin==WmClientOrigin::RegisteredUnixPeer,
+                w.creationIdentity,w.appId,w.wmId,w.creationIdentity,now);
             uint64_t token=w.clientLaunchId;
             if(w.clientOrigin==WmClientOrigin::RegisteredUnixPeer&&g_launches.Find(token)<0)token=0;
-            g_launches.Window(token, w.creationIdentity, w.appId);
+            g_launches.Window(token, w.creationIdentity, w.appId,nullptr,w.wmId,w.creationIdentity,now);
             SpinLockRelease(&g_launchLock);
         }
     }
@@ -217,19 +221,17 @@ void WmLaunchFeedbackPoll()
         entry = g_launches.entries[i];
         SpinLockRelease(&g_launchLock);
         if (entry.phase == LaunchPhase::Empty) continue;
-        // A worker may complete Dispatching -> Waiting while the lock is
-        // released. Only a sampled Waiting phase can supply a negative result.
-        const bool live = entry.phase != LaunchPhase::Waiting || SchedulerLaunchHasLiveProcesses(entry.token);
         SpinLockAcquire(&g_launchLock);
-        g_launches.Advance(entry.token, now, live);
+        // Absence of tagged processes is not a failed single-instance handoff.
+        g_launches.Advance(entry.token, now, true);
         SpinLockRelease(&g_launchLock);
     }
     bool busy = false;
     SpinLockAcquire(&g_launchLock);
     for (const auto& e : g_launches.entries) busy |= e.busy()&&!e.windowObserved;
     SpinLockRelease(&g_launchLock);
-    __atomic_store_n(&g_launchBusy, busy, __ATOMIC_RELEASE);
-    CompositorMarkDirty(); // Also erase the final expired notice.
+    const bool busyChanged=__atomic_exchange_n(&g_launchBusy,busy,__ATOMIC_ACQ_REL)!=busy;
+    if(hadEntries||busyChanged)CompositorMarkDirty(); // Also erase the final expired notice.
 }
 
 void WmTaskbarPendingClick(int target)
@@ -2111,6 +2113,7 @@ static void LauncherWorker(void*)
         int launch = g_launches.Take(ApicTickCount());
         if (launch >= 0) {
             token = g_launches.entries[launch].token;
+            g_launchHistory.Start(token,ApicTickCount());
             WmStrCopy(command, g_launchRequests[launch].command, sizeof(command));
             desktop = g_launchRequests[launch].desktop;
         }
@@ -2136,7 +2139,8 @@ static void LauncherWorker(void*)
             } else result = ShellExecScript(command);
             self->launchId = previous;
             SpinLockAcquire(&g_launchLock);
-            g_launches.Complete(token, result >= 0, ApicTickCount());
+            g_launches.Complete(token, result >= 0, ApicTickCount(),result,true);
+            g_launchHistory.Complete(token,result,ApicTickCount());
             SpinLockRelease(&g_launchLock);
             SerialPrintf("WM: launch token %lu dispatch %s result=%d\n", token, result >= 0 ? "complete" : "failed",result);
             CompositorMarkDirty();
@@ -2427,37 +2431,75 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
     return -1; // clicked in panel but not on an item (header or padding)
 }
 
+static int AdmitLauncherItem(const LauncherSnapshot& catalog,int itemIdx,bool tracked,
+                             uint64_t* token,bool* coalesced)
+{
+    if(itemIdx<0||itemIdx>=static_cast<int>(catalog.count)||!catalog.items[itemIdx].valid)return -2;
+    LauncherStartWorker();
+    if(!__atomic_load_n(&g_launcherWorkerStarted,__ATOMIC_ACQUIRE))return -12;
+    const auto& item=catalog.items[itemIdx];int slot;
+    SpinLockAcquire(&g_launchLock);
+    uint64_t pending=0;
+    for(const auto& e:g_launches.entries)if((e.busy()||e.inFlight())&&LaunchFeedbackTable::Exact(e.identity,item.catalogId)) {pending=e.token;break;}
+    // Reserve durable tracking capacity before any launch admission side effect.
+    if(tracked&&!g_launchHistory.CanTrack(pending)){SpinLockRelease(&g_launchLock);return -28;}
+    bool created=false;
+    slot=g_launches.Begin(ApicTickCount(),__atomic_load_n(&g_windowIdentity,__ATOMIC_ACQUIRE),
+        item.title,item.appId,item.executable,item.catalogId,item.specification,&created,catalog.generation);
+    if(slot>=0) {
+        const auto& entry=g_launches.entries[slot];*token=entry.token;*coalesced=!created;
+        if(created) {
+            auto& request=g_launchRequests[slot];
+            WmStrCopy(request.command,item.scriptPath,sizeof(request.command));
+            request.desktop=item.isDesktopEntry;request.hasIcon=item.iconPixels!=nullptr;
+            if(request.hasIcon)memcpy(request.icon,item.iconPixels,sizeof(request.icon));
+        }
+        if(tracked)g_launchHistory.Track(entry,created);
+        else g_launchHistory.ShareWithUser(entry.token);
+    }
+    SpinLockRelease(&g_launchLock);
+    g_launcherError=slot<0?slot:0;g_launcherOpen=slot<0;
+    if(slot>=0) {
+        g_taskbarPageTarget=-10-slot;__atomic_store_n(&g_launchBusy,true,__ATOMIC_RELEASE);
+    }else SerialPuts(slot==-2?"WM: same app has pending launch from older catalog\n":"WM: launcher request queue full\n");
+    CompositorMarkDirty();CompositorWake();
+    return slot>=0?0:slot==-2?-16:-11;
+}
+
 void WmLauncherExec(int itemIdx)
 {
-    LauncherStartWorker();
-    if (!__atomic_load_n(&g_launcherWorkerStarted, __ATOMIC_ACQUIRE)) return;
-    int slot;
-    {
-        LauncherReadGuard guard;
-        const auto& launcher = guard.get();
-        if (itemIdx < 0 || itemIdx >= static_cast<int>(launcher.count) || !launcher.items[itemIdx].valid) return;
-        const auto& item = launcher.items[itemIdx];
-        SpinLockAcquire(&g_launchLock);
-        bool created=false;
-        slot = g_launches.Begin(ApicTickCount(), __atomic_load_n(&g_windowIdentity, __ATOMIC_ACQUIRE),
-                               item.title, item.appId, item.executable,item.catalogId,item.specification,&created,launcher.generation);
-        if (slot >= 0 && created) {
-            auto& request = g_launchRequests[slot];
-            WmStrCopy(request.command, item.scriptPath, sizeof(request.command));
-            request.desktop = item.isDesktopEntry;
-            request.hasIcon = item.iconPixels != nullptr;
-            if (request.hasIcon) memcpy(request.icon, item.iconPixels, sizeof(request.icon));
-        }
-        SpinLockRelease(&g_launchLock);
+    LauncherReadGuard guard;uint64_t token=0;bool coalesced=false;
+    AdmitLauncherItem(guard.get(),itemIdx,false,&token,&coalesced);
+}
+
+int WmLauncherActivate(const char* appId,uint32_t generation,uint64_t* token,bool* coalesced)
+{
+    LauncherReadGuard guard;const auto& catalog=guard.get();
+    if(!generation||catalog.generation!=generation)return -116;
+    for(uint32_t i=0;i<catalog.count;++i)if(!strcmp(catalog.items[i].catalogId,appId))
+        return AdmitLauncherItem(catalog,static_cast<int>(i),true,token,coalesced);
+    return -2;
+}
+
+bool WmSnapshotLaunch(uint64_t token,LaunchRecord* out)
+{
+    SpinLockAcquire(&g_launchLock);int index=g_launchHistory.Find(token);
+    if(index>=0)*out=g_launchHistory.records[index];
+    SpinLockRelease(&g_launchLock);return index>=0;
+}
+
+void WmCancelBridgeQueuedLaunches(uint32_t* cancelled,uint32_t* startedOrShared)
+{
+    *cancelled=*startedOrShared=0;
+    SpinLockAcquire(&g_launchLock);
+    for(auto& record:g_launchHistory.records) {
+        if(!record.token||record.cancelled||record.dispatchFinished)continue;
+        const int slot=g_launches.Find(record.token);
+        if(!record.started&&record.bridgeOnly&&slot>=0&&g_launches.entries[slot].phase==LaunchPhase::Queued) {
+            record.cancelled=true;g_launches.entries[slot]={};++*cancelled;
+        }else if(record.started||(slot>=0&&g_launches.entries[slot].phase==LaunchPhase::Queued))++*startedOrShared;
     }
-    g_launcherError = slot < 0 ? slot : 0;
-    g_launcherOpen = slot < 0;
-    if (slot >= 0) {
-        g_taskbarPageTarget = -10 - slot;
-        __atomic_store_n(&g_launchBusy, true, __ATOMIC_RELEASE);
-    } else SerialPuts(slot==-2?"WM: same app has pending launch from older catalog\n":"WM: launcher request queue full\n");
-    CompositorMarkDirty();
-    CompositorWake();
+    SpinLockRelease(&g_launchLock);CompositorMarkDirty();
 }
 
 // ---------------------------------------------------------------------------

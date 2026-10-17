@@ -131,8 +131,52 @@ stable IDs after refresh and a real Mousepad menu click on an empty disposable
 to check equal titles, duplicate IDs and a removed executable. It must use private
 test images. The negative cases retain their rejection log evidence.
 
-`vm_launch` is still pending durable dispatch history and status correlation.
-A real menu-click smoke test remains separate from future semantic activation.
+### Semantic launcher (bridge 0.6.0)
+
+Pass an exact `vm_apps` app `reference` and a fresh 32-character lowercase hex
+`request_id` to `vm_launch`. This calls the same admission/worker path as a real
+Applications menu click, including identity/environment, frozen command/icon,
+coalescing, pending cursor/taskbar feedback and worker revalidation. Stale catalog
+references reject with raw admission error `-116`; fetch `vm_apps` again rather
+than silently targeting a different version of an entry.
+
+The response separates `admission_state`, launch history and a fresh windows
+observation. `wait_for` accepts `admitted`, `dispatched`, or `window` (default).
+`dispatched` means the normal worker returned success; `window` additionally
+requires the observed exact window incarnation to still exist. Neither proves
+application readiness, client responsiveness or successful single-instance
+activation. `correlation=app_id_presence` is weaker than `launch_tag` and can
+refer to an existing window; `existing_window` labels that fact. Raw dispatch
+failure remains authoritative even if a window appeared before dispatch ended.
+
+A bounded inline wait (0–20 seconds, default 2) leaves the launch running.
+Recover through `vm_ui` with the same operation ID and launch wait condition.
+Identical resubmission recovers existing evidence; it never launches again.
+Changed arguments or a different operation kind with the same ID reject. Guest
+reboot invalidates the request; stopped VMs return labelled cached evidence,
+retaining known dispatch facts without claiming a current window.
+
+UI requests and their tombstones share a 256-record boot-lifetime limit, with at
+most 16 frontend requests queued/dispatched. Bridge launch history separately
+retains 256 launch tokens until reboot; exhaustion rejects before launch
+admission. Ordinary user launches do not consume this history capacity. Window
+correlation polls at 100 ms for at most five minutes after admission; its deadline
+is reported. Raw worker completion remains recoverable beyond that deadline.
+Read-only history polling does not itself dirty the compositor.
+
+Takeover cancels queued frontend requests and bridge-only queued launches;
+requests coalesced with a user launch are preserved. An already-started worker or
+frontend request already selected for dispatch may continue. The separate
+`already_dispatched` and `launcher_already_started_or_shared` counts describe
+these boundaries; takeover does not terminate applications.
+
+`accept_launch.py --session SESSION --out build/launch-acceptance` exercises
+native and Wayland semantic activation, durable recovery, stale catalog and
+takeover using an empty disposable 1920×1080 VM at 100% scale. Optional
+`--negative-tests` temporarily edits/restores the manifest as maintenance UID 0
+and verifies the raw worker failure after removing a published executable.
+Real menu-click acceptance remains
+separate in `accept_apps.py`; semantic activation does not certify hitboxes.
 
 ### Semantic windows (bridge 0.5.0)
 

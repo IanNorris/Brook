@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "launch_history.h"
 #include "desktop_metrics.h"
 #include "../../shared/brook_theme.h"
 
@@ -439,6 +440,11 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
 void WmLauncherGetRect(uint32_t screenW, uint32_t screenH,
                        int32_t* outX, int32_t* outY,
                        uint32_t* outW, uint32_t* outH);
+
+// Semantic admission is compositor-only and uses the same worker as a click.
+int WmLauncherActivate(const char* appId,uint32_t generation,uint64_t* token,bool* coalesced);
+bool WmSnapshotLaunch(uint64_t token,LaunchRecord* out);
+void WmCancelBridgeQueuedLaunches(uint32_t* cancelled,uint32_t* startedOrShared);
 
 // Launch the item at the given index.
 void WmLauncherExec(int itemIdx);

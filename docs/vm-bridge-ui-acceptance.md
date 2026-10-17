@@ -2,8 +2,8 @@
 
 Bridge 0.5.0 adds `vm_windows`, `vm_window` and `vm_ui`. It implements the
 window-control portion of [the bridge specification](vm-bridge-next.md).
-Installed-app discovery/launcher activation and the remaining observation/event
-conveniences are still pending. Reload the MCP process after updating its source;
+Catalog discovery (0.5.1) and semantic launcher activation (0.6.0) follow below;
+the remaining observation/event conveniences are still pending. Reload the MCP process after updating its source;
 its previously loaded tool schema does not acquire new tools automatically.
 
 The kernel and the rebuilt `waylandd` package are both required for Wayland
@@ -117,3 +117,49 @@ it is not a fresh filesystem scan per `vm_apps` call. Duplicate legacy shortcut
 and desktop entries may still represent the same package through different
 launch configurations. Durable `vm_launch` dispatch/history, single-instance
 outcome correlation, and the remainder of the specification are still pending.
+
+
+## Semantic launcher follow-up — bridge 0.6.0
+
+`vm_launch` now admits an exact app reference through the same compositor and
+worker path as the Applications menu. The tested kernel SHA-256 was
+`4f729090d7968c0368bf7c4e3330d2fde8ce010a294225fe641ca669d92f70db`,
+with unchanged `waylandd`, the same isolated 8-vCPU/4-GiB software-rendered setup,
+and host speaker output disabled.
+
+Evidence under `build/workloads/gallery-fresh-20261017/`:
+
+- `launch-build.log`: two-pass kernel/symbol build and all 29 hosted kernel tests.
+- `launch-acceptance/launch.json`: native Terminal and Wayland Mousepad launch,
+  exact-tag correlation, repeated request-ID recovery, second app request,
+  graceful close of each actual window, stale catalog rejection and takeover.
+- `launch-complete-acceptance/launch.json`: the complete checked-in
+  `accept_launch.py --negative-tests` workflow. It additionally removes a probe
+  executable after catalog publication and retains actual dispatch failure
+  `-2`; the original manifest/catalog is restored in `finally`.
+- The second Mousepad request initially observed an existing app-ID match;
+  its later status strengthened this to the new window's exact launch tag.
+  This is correlation evidence, not proof of a single-instance activation ACK.
+- `semantic-launches.png` in those acceptance directories retains the raw
+  1920×1080 completed-frame screenshot. No preview envelope was serialized.
+- `launch-final-check/`: checked sync/stop, serial screening, all three
+  read-only filesystem checks, and labelled cached launch recovery after stop.
+
+The bridge regression suite passed 123 tests (five optional encoder tests
+skipped). New host tests cover lost mutation/status replies without replay,
+request-ID binding across operation kinds, stale catalog/boot, takeover,
+unsupported guest capabilities, wait cancellation without launch cancellation,
+window disappearance/incarnation reuse, and dispatch failure despite an early
+window. Admission/dispatch waits remain valid when a windows query fails;
+stopped-session recovery retains known dispatch facts while current windows
+remain unavailable. Hosted history tests cover adoption of prior UI window
+observations and timestamps, weak-to-exact correlation, timeout/late completion,
+capacity/tombstones and cancellation.
+
+History and correlation are bounded as documented in the bridge README. Human
+takeover cancels queued agent-only work; a frontend request already selected for
+dispatch, a started worker or a launch shared with the user may continue. Live
+queue saturation, this in-progress takeover race and a true application's
+single-instance acknowledgement are not claimed by this acceptance. The first
+negative test attempt used an incorrect Escape-to-dismiss fixture; it was fixed
+to click outside the menu and the full workflow passed afterwards.
