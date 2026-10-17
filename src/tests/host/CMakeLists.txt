@@ -45,6 +45,15 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_audio_delivery "${BROOK_ROOT}/src/kernel/src/audio.cpp")
+target_compile_options(test_audio_delivery PRIVATE
+    -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+target_link_options(test_audio_delivery PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_audio_delivery PROPERTIES TIMEOUT 15)
 add_host_test(test_user_copy
     "${BROOK_ROOT}/src/kernel/src/user_copy_fault.cpp"
     "${BROOK_ROOT}/src/kernel/src/user_copy.S"

@@ -69,7 +69,9 @@ comparison, not sample alignment or an exact loss measurement.
 
 The existing ALSA route uses a file PCM over a null slave. Its device-clock and
 delay reporting remain a separate investigation; selecting ALSA alone does not
-fix playback. No launcher preferences changed. The first Play click in this
+fix playback. A [follow-up clock probe](audio-clock.md) measures the disagreement
+between ALSA delay and the same OSS descriptor's queue. No launcher preferences
+changed. The first Play click in this
 second window missed its shifted position; only `play-corrected-input.json`
 and subsequent evidence demonstrate playback.
 

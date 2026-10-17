@@ -1,5 +1,11 @@
 # Recovery and VM-control backlog
 
+- The VM clock probe now directly observes ALSA delay zero while its own OSS
+  descriptor has 5,680–41,552 queued bytes. Complete a clocked, independently
+  owned OSS stream path before enabling the standard ALSA OSS plugin. Include
+  hardware completion/discontinuities, short-tail drain, consistent readiness
+  and stream-local reset/close. See [measured clock and delivery work](audio-clock.md).
+
 - Firefox audio IPC now passes its Unix receive-flag dependency: Linux and
   Brook both pass the four-case SCM_RIGHTS/epoll/EOF probe after accepting
   MSG_NOSIGNAL on receive. The normal backend reaches PulseAudio but remains

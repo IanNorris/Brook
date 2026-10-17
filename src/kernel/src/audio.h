@@ -69,7 +69,9 @@ uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, uint32_t 
 // Query available space in mixer ring for a given stream (in frames).
 uint32_t AudioMixerAvailableFrames(uint32_t streamId = 0);
 
-// Flush the accumulated mix buffer to the hardware driver and reset.
+// Deliver a pending batch or move accumulated samples into a new batch.
+// Retain the unaccepted suffix across zero, partial and failed driver writes.
+// Concurrent flush calls leave the current delivery owner in charge.
 void AudioMixerFlush();
 
 // Initialize the mixer (call once at boot, after kmalloc is available).
