@@ -39,12 +39,21 @@ static int install_commit_end(const sigset_t *previous,int result) {
 }
 static int install_run_fetch(char *const argv[]) {
     if(install_cancel_requested)return 130;
-    int channel[2];if(pipe(channel)<0)return 1;
+    int channel[2];if(pipe(channel)<0){perror("cancellation pipe");return 1;}
+    /* Closed standard streams must not turn the private control channel into
+     * stdin/out/err. Keep both ends private across unrelated execs. */
+    for(int i=0;i<2;i++) {
+        int private_fd=fcntl(channel[i],F_DUPFD_CLOEXEC,3);
+        if(private_fd<0){perror("cancellation descriptor");close(channel[0]);close(channel[1]);return 1;}
+        close(channel[i]);channel[i]=private_fd;
+    }
     if(fcntl(channel[0],F_SETFL,O_NONBLOCK)<0) {close(channel[0]);close(channel[1]);return 1;}
     pid_t pid=fork();
     if(pid<0){close(channel[0]);close(channel[1]);return 1;}
     if(!pid) {
-        close(channel[1]);char number[32];snprintf(number,sizeof(number),"%d",channel[0]);
+        close(channel[1]);
+        if(fcntl(channel[0],F_SETFD,0)<0)_exit(127);
+        char number[32];snprintf(number,sizeof(number),"%d",channel[0]);
         if(setenv("BROOK_NIX_CANCEL_FD",number,1)<0)_exit(127);
         execv(argv[0],argv);perror("exec nix-fetch");_exit(127);
     }
@@ -55,7 +64,7 @@ static int install_run_fetch(char *const argv[]) {
         if(install_cancel_requested&&channel[1]>=0){close(channel[1]);channel[1]=-1;}
         pid_t result=waitpid(pid,&status,WNOHANG);
         if(result==pid)break;
-        if(result<0&&errno!=EINTR){if(channel[1]>=0)close(channel[1]);return 1;}
+        if(result<0&&errno!=EINTR){perror("wait nix-fetch");if(channel[1]>=0)close(channel[1]);return 1;}
         struct timespec pause={0,50000000};nanosleep(&pause,NULL);
     }
     if(channel[1]>=0)close(channel[1]);

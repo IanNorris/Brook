@@ -4,6 +4,16 @@ Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:
 
+`sigpendingcheck.c` requires `-pthread`. It checks raw `rt_sigpending` sizes
+0 through 8, oversized rejection, exact partial writes, null/read-only/unmapped
+destinations, repeated non-consuming observation, libc `sigpending`, signal 64,
+fork clearing, handler delivery after unblock, blocked POSIX timer signals and
+thread-directed isolation. Linux passes 85 checks. Run under a host deadline
+because a broken signal/thread implementation can hang. This does not certify
+shared process-directed signal routing or ignored-disposition transitions;
+Brook's existing ordinary signal storage is per task, and those broader
+semantics remain separate work.
+
 `unixrightscheck.c` requires `-pthread`. The default uses one receiver;
 `--concurrent` uses four. One sender transfers 512 references to a mapped memfd.
 Every one-byte receive must carry exactly one descriptor, every received handle

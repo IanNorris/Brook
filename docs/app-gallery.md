@@ -95,26 +95,44 @@ Once profile publication starts, it finishes before accepting the request.
 Metadata prefetch may also finish its current batch of up to 64 entries, so
 Stop has no tight latency bound. This is not abrupt-kill recovery.
 
-Six additional host tests cover the actual installer/fetcher/extractor pipeline,
-early requests across exec, cached retry and both sides of the commit boundary.
+Seven additional host tests cover the actual installer/fetcher/extractor pipeline,
+early requests across exec, closed standard input, cached retry and both sides
+of the commit boundary.
 An isolated guest run (`0d476c768ffd4076ac55cb565e0040b4`) verified Stop during
 a dependency archive and closing Gallery during the final archive. Both left
 complete cached data, unchanged registration and no mutation lock or helper
 processes. Checked shutdown and all three offline filesystem checks passed.
 
-**This checkpoint is not ready to merge or deploy.** Guest retry exposed missing
-kernel syscall 127 (`rt_sigpending`), used by the new commit guard. The guard
-refuses publication on that kernel, including ordinary successful installs.
-Implement and probe the syscall, rebuild the kernel, then repeat retry/repair
-acceptance. A second review found that the private pipe must relocate file
-descriptors above standard input/output/error when those streams are closed;
-that fix and a closed-stdin process test are also outstanding. Evidence remains
-under ignored `build/workloads/gallery-cancel-20261017/`.
+Guest retry exposed missing kernel syscall 127 (`rt_sigpending`), used by the
+new commit guard. The checkpoint at `a5e23fa` therefore refuses publication on
+its original kernel. The follow-up implements the syscall and checks it with
+the same 85-check probe on Linux and Brook: partial sizes, invalid destinations,
+non-consuming snapshots, timer signals, fork clearing and thread isolation.
+The new private pipe relocates both ends above standard streams and uses
+close-on-exec; the fetcher fills closed standard slots before allocating archive
+pipes, preventing a dup2/close collision when standard input is closed.
+
+With the matched rebuilt kernel, session `21923ac1be4049e8b25b34bb515d4b00`
+successfully retried the cached generated fixture as UID 1000, without starting
+a cache server. Native Gallery Repair then completed and refreshed installed
+state. Registration contained exactly one fixture row, the mutation lock was
+absent, and closing Gallery returned to ten tasks. Checked shutdown and all
+three filesystem checks passed. All 17 installer host tests and 26 hosted
+suites passed. This fixture validates the operation path, not large-application
+repair. Repeat gated Stop/close acceptance with the final descriptor setup
+before treating cancellation as fully accepted. Evidence remains under ignored
+`build/workloads/gallery-cancel-20261017/`.
+
+`rt_sigpending` observes the caller's blocked ordinary pending bits and matching
+POSIX timers without consuming either. Ordinary process-directed signal routing
+still lacks a shared group queue; blocked ignored signals and disposition-change
+discarding also retain earlier limitations. The syscall does not claim to fix
+those wider signal semantics. Its partial-size contract follows the
+[Linux implementation](https://raw.githubusercontent.com/torvalds/linux/master/kernel/signal.c).
 
 ## Remaining work
 
-- Finish the cancellation checkpoint above, including matched-kernel guest
-  acceptance and the closed-standard-stream regression test.
+- Repeat gated cancellation acceptance with the final descriptor setup.
 - Disk-full and interrupted-install recovery across the whole profile. Atomic
   manifest publication alone does not transact symlinks and launcher metadata.
 - Dependency/shared-file removal ownership and base-image package registration.

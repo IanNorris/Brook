@@ -112,6 +112,16 @@ class CancellationTests(unittest.TestCase):
         self.assertIn(b'cancellation channel',result.stderr)
         self.assertEqual(sum(self.cache.requests.values()),0)
 
+    def test_install_with_closed_stdin_keeps_control_pipe_private(self):
+        self.cache.release.set()
+        result=subprocess.run([self.installer,'install','fixture'],env=self.environment,
+                              stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                              preexec_fn=lambda: os.close(0),timeout=20)
+        self.assertEqual(result.returncode,0,result.stdout)
+        self.assertEqual((self.store/ROOT_NAME/'proof.txt').read_bytes(),PAYLOAD)
+        self.assertIn(f'fixture\t1\t{ROOT_NAME}\n'.encode(),self.manifest.read_bytes())
+        self.assertFalse((self.profile/'.mutation-lock').exists())
+
 
 class CommitBoundaryTests(unittest.TestCase):
     @classmethod

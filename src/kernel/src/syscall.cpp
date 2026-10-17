@@ -7455,6 +7455,21 @@ static int64_t sys_rt_sigaction(uint64_t signum, uint64_t actAddr, uint64_t olda
     return 0;
 }
 
+static int64_t sys_rt_sigpending(uint64_t setAddr, uint64_t sigsetsize,
+                                uint64_t, uint64_t, uint64_t, uint64_t)
+{
+    // Unlike rt_sigprocmask, Linux permits a partial (or zero-length) set.
+    if (sigsetsize > sizeof(uint64_t)) return -EINVAL;
+    if (sigsetsize == 0) return 0;
+    Process* proc = ProcessCurrent();
+    if (!proc) return -ESRCH;
+    // Observe without consuming. Ordinary signals currently have per-task
+    // storage; unioning sibling queues would leak thread-directed signals.
+    uint64_t pending = (__atomic_load_n(&proc->sigPending, __ATOMIC_ACQUIRE) |
+                        PosixTimerPending(proc)) & proc->sigMask;
+    return CopyToUser(setAddr, &pending, sigsetsize) ? 0 : -EFAULT;
+}
+
 static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t setAddr, uint64_t oldAddr,
                                    uint64_t sigsetsize, uint64_t, uint64_t)
 {
@@ -13190,6 +13205,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_SIGALTSTACK]     = sys_sigaltstack;
     g_syscallTable[SYS_ALARM]           = sys_alarm;
     g_syscallTable[SYS_PAUSE]           = sys_pause;
+    g_syscallTable[SYS_RT_SIGPENDING] = sys_rt_sigpending;
     g_syscallTable[SYS_RT_SIGTIMEDWAIT] = sys_rt_sigtimedwait;
     g_syscallTable[SYS_RT_SIGSUSPEND]   = sys_rt_sigsuspend;
     g_syscallTable[SYS_STATFS]          = sys_statfs;
@@ -13483,6 +13499,7 @@ static const char* SyscallName(uint64_t num)
     case 222: return "timer_create"; case 223: return "timer_settime";
     case 224: return "timer_gettime"; case 225: return "timer_getoverrun";
     case 226: return "timer_delete";
+    case 127: return "rt_sigpending";
     case 128: return "rt_sigtimedwait"; case 131: return "sigaltstack"; case 130: return "rt_sigsuspend";
     case 134: return "statfs";
     case 34: return "pause"; case 37: return "alarm";

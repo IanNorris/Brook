@@ -116,6 +116,7 @@ static constexpr uint64_t SYS_GETPGID         = 121;
 static constexpr uint64_t SYS_GETSID          = 124;
 static constexpr uint64_t SYS_CAPGET           = 125;
 static constexpr uint64_t SYS_CAPSET           = 126;
+static constexpr uint64_t SYS_RT_SIGPENDING    = 127;
 static constexpr uint64_t SYS_RT_SIGTIMEDWAIT  = 128;
 static constexpr uint64_t SYS_SIGALTSTACK     = 131;
 static constexpr uint64_t SYS_STATFS          = 137;

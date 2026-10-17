@@ -769,6 +769,18 @@ static int fetch_package(const char *hash, int force) {
 }
 
 int main(int argc, char **argv) {
+    /* Pipeline setup uses the conventional stdin/stdout/stderr slots. Fill
+     * closed slots before creating pipes so dup2 followed by close cannot
+     * accidentally close an archive stream that was allocated as fd 0/1/2. */
+    for (int fd=0;fd<3;fd++) {
+        if (fcntl(fd,F_GETFD)>=0 || errno!=EBADF) continue;
+        int replacement=open("/dev/null",fd==0?O_RDONLY:O_WRONLY);
+        if (replacement<0) return 1;
+        if (replacement!=fd) {
+            if (dup2(replacement,fd)<0) {close(replacement);return 1;}
+            close(replacement);
+        }
+    }
     if(fetch_cancel_init()<0){perror("nix-fetch cancellation channel");return 1;}
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
