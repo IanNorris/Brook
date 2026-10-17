@@ -108,11 +108,9 @@ public:
     FileMappingInvalidation& operator=(const FileMappingInvalidation&) = delete;
     bool Prepare(uint64_t leafCapacity); // once, outside AS mutation
     // Optional, once after Prepare and before Detach, outside AS mutation.
-    // Reserves copies for partial boundary pages before destructive work. The
-    // Prefix is the planned min(old EOF, resulting EOF). Caller must confirm
-    // that prefix against actual EOF before restoring after backend mutation;
-    // failed/partial mutation and unknown EOF need separate recovery handling.
-    bool PreparePrivateRestore(uint64_t validPrefix);
+    // Reserve one boundary copy per populated managed-private range before
+    // destructive work. Resulting EOF need not be known until restoration.
+    bool PreparePrivateRestore();
     void LockTargetFileAlreadyHeld();
     void Unlock(); // only releases AS mutation; caller still owns file gate
     bool Count(uint64_t fileBegin, uint64_t fileEnd, uint64_t& count) const;
@@ -124,14 +122,19 @@ public:
     void Acknowledge();
     // Requires preparation, local ACK, target gate and AS lock. Caller must
     // first ACK all target spaces. Restores only noncanonical managed private
-    // data below the prepared prefix; partial tails use separate zeroed copies.
+    // data below min(old EOF, observed resulting EOF); partial tails use copies.
     // Canonical/shared/borrowed leaves remain detached for lazy reload.
-    bool RestorePrivate();
+    bool RestorePrivate(uint64_t validPrefix);
+    // Exact rollback BEFORE any backend resize attempt (post-ACK flush failed).
+    // Includes canonical/shared/borrowed aliases, needs no boundary preparation.
+    // Caller must ACK every target space first; preserves original bytes/PTEs.
+    bool RestoreAll();
 private:
     struct Leaf {
-        uint64_t address,offset,raw,boundary;
+        uint64_t address,offset,raw;
         bool managed,privateData;
     };
+    bool Restore(bool all,uint64_t validPrefix);
     static void Capture(VirtualAddress address, uint64_t raw, void* context);
     void RequireTargetGate() const;
     Process* actor_;
@@ -139,7 +142,7 @@ private:
     MappingBacking* backing_;
     Leaf* leaves_ = nullptr;
     PhysicalAddress* boundaries_ = nullptr;
-    uint64_t boundaryCount_ = 0, boundaryUsed_ = 0, validPrefix_ = 0;
+    uint64_t boundaryCount_ = 0;
     uint64_t capacity_ = 0, count_ = 0;
     bool prepared_ = false, locked_ = false, shootdown_ = false;
     bool restoreRequested_ = false, restorePrepared_ = false;

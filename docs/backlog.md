@@ -879,6 +879,12 @@ cover both AS aliases, hidden/canonical/shared/borrowed leaves, preparation OOM,
 reference transfer and EOF limits; all 30 suites pass. The production resize
 consumer, failed/partial-mutation recovery, unknown-EOF quarantine and kernel
 raw-copy recovery remain open. See `file-shared-mappings.md` for exact scope.
+The restoration API now accepts EOF only after the backend result is known,
+with one reserved boundary frame per populated private range. Exact rollback
+also restores canonical/shared/borrowed aliases after a flush failure before
+the backend resize attempt. Unknown-EOF recovery must block size-changing
+writes until it observes and reconciles current EOF, as well as blocking
+faults and hidden-leaf protection changes.
 
 
 ## Current real-workload and desktop follow-ups (2026-10-16)

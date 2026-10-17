@@ -191,15 +191,15 @@ partial EOF, existing private/shared aliases and shrink/regrow. The registration
 list alone is insufficient without gates on every publication path.
 
 
-### Resize error-path correction awaiting verification
+### Unmapped resize error-path correction
 
 Review of `Ext2FileTruncate` shows that a negative return can follow tail,
 indirect-block or inode mutation, including a size change followed by a block-free
 failure. The source now evicts the unmapped canonical cache and advances file
 generation after every backend resize attempt, preserving its original errno.
 The host regression models mutation followed by EIO and checks reloaded bytes,
-new EOF and zero tails. These edits are not yet built or run: the user is testing
-the frozen production checkpoint. Future mapped resize must additionally re-stat
+new EOF and zero tails; it is included in the currently passing 30-suite hosted
+run. This is unmapped-resize evidence. Future mapped resize must additionally re-stat
 after errors and handle stat failure without republishing stale aliases.
 
 
@@ -233,7 +233,11 @@ acquire gates for unrelated files in the same address space.
 6. Re-stat after a backend error as well as success, invalidate stale canonical
    pages, advance file generation and preserve the original errno. If stat
    fails too, block affected faults with an explicit error state until a safe
-   retry rather than expose old cached mappings.
+   retry rather than expose old cached mappings. Keep private frames hidden and
+   prevent mprotect from revealing them. Block size-changing writes/appends and
+   further resize attempts until recovery first observes and reconciles current
+   EOF: otherwise shrink followed by regrowth could erase the evidence needed
+   to sanitize a retained private tail. Fork/remap must preserve hidden state.
 
 Verification must include delayed fault/fork/remap publication, last-unmap ACK,
 ref-zero teardown, hidden mappings, private dirty boundary prefixes, shrink and
@@ -268,35 +272,47 @@ detached frames until restoration or destruction. No further detach is allowed
 after ACK. The caller must acknowledge every participating AS before restoring
 any private data, while retaining the target inode gate throughout.
 
-`PreparePrivateRestore(prefix)` reserves partial-boundary replacement frames
-before detachment, outside AS mutation. Capture identifies managed private frames
+`PreparePrivateRestore()` reserves one replacement frame per populated
+managed-private range before detachment, outside AS mutation. It uses sparse
+leaf counting rather than allocating per virtual page. Any observed EOF can
+intersect at most one boundary leaf per range, so the limit need not be known
+until after the backend attempt and re-stat. Capture identifies managed private frames
 by comparing their exact file offset and physical address against the inode's
 canonical cache. This is a pure gate-owned lookup, safe inside the PT spinlock.
 Canonical, shared and borrowed leaves are not restored by this operation.
 
-`RestorePrivate()` validates all destinations before publication, retains full
-private pages below the prepared limit, and copies partial-page prefixes into
+`RestorePrivate(validPrefix)` validates all destinations and required copies
+before publication, retains full private pages below the observed limit, and copies partial-page prefixes into
 separate frames with zeroed tails. It never changes the original private frame:
 that frame may still have fork/CoW or independent owners. Original hidden state,
 permissions, CoW, PTE tag and PID are preserved. Restored references transfer back
 to PTEs exactly once; un-restored originals and unused copies remain owned by the
 job until destruction. New frames use the destination AS's PMM allocation PID.
 
+`RestoreAll()` supplies exact rollback after a post-ACK flush failure **before
+the backend resize attempt**. It restores canonical, shared, borrowed and private
+aliases with original PTEs and bytes, needs no boundary copies, and restores
+borrowed map accounting without taking frame ownership. It is mutually exclusive
+with private-prefix restoration. An errored backend resize may already mutate
+the file and must not use this rollback path.
+
 The actual-module hosted test covers two address spaces, multiple aliases,
 hidden pages, an independent retained source owner, preservation of private bytes,
 canonical/shared/borrowed exclusion, above-EOF retirement, zero/aligned/full
-retention limits, heap and partial-frame-allocation failures, delayed ACK with
+retention limits, a deferred EOF in each of three different pages, exact rollback
+with and without unused copy reservations, heap and partial-frame-allocation failures, delayed ACK with
 retained refs, repeated ACK, exact PTE metadata and allocation-free restoration.
 All 30 hosted suites pass. The production kernel and module import checks pass;
 this path has no production caller, so these are hosted primitive results, not
-guest mapped-truncate acceptance. Logs: `build/private-restore-final-host-20261017.log`
-and `build/private-restore-build-20261017.log`.
+guest mapped-truncate acceptance. Current logs: `build/private-recovery-host-20261017.log`
+and `build/private-recovery-build-20261017.log`.
 
-The prepared limit must match the actual resulting EOF. A complete resize
-consumer must additionally handle failure before mutation, mutation followed by
-error, and unknown EOF without discarding private data. In particular this API
-does not implement quarantine or permit restoring a planned prefix after an
-unverified backend failure. Post-ACK dirty flush, backend resize/re-stat,
+The supplied limit must be min(old valid private prefix, actual resulting EOF).
+The primitive now supports exact pre-attempt rollback and arbitrary observed
+EOF. A complete resize consumer must still connect those branches to filesystem
+results and handle unknown EOF without discarding private data. In particular
+this API does not implement quarantine or permit restoring a planned prefix
+after an unverified backend failure. Post-ACK dirty flush, backend resize/re-stat,
 cache reconciliation, raw kernel-copy fault recovery and runtime acceptance are
 still required. Mapped truncate remains EBUSY and writable regular-file MAP_SHARED
 remains disabled.

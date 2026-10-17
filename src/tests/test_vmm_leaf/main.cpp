@@ -1249,13 +1249,33 @@ static void targetPrivateRestore() {
     const uint64_t generation=space->generation;
     KMutexLock(&file.gate);
     // Heap/frame preparation failures leave mappings, bytes and refs intact.
-    for (unsigned kind=0;kind<3;++kind) {
+    for (unsigned kind=0;kind<4;++kind) {
         FileMappingInvalidation job(&actor,space,backing);CHECK(job.Prepare(7));
         if(!kind)failHeapAfter=0;else failFrameAfter=kind-1;
-        CHECK(!job.PreparePrivateRestore(pageSize+123));
+        CHECK(!job.PreparePrivateRestore());
         failHeapAfter=-1;failFrameAfter=-1;
         job.LockTargetFileAlreadyHeld();CHECK(!job.Detach(0,8*pageSize));
         CHECK(space->generation==generation&&VmmReadLeaf(space->pageTable,va+pageSize)==original);
+    }
+    const unsigned slots[]={0,1,2,4,6,8,10};uint64_t before[7];
+    for(unsigned i=0;i<7;++i)before[i]=VmmReadLeaf(space->pageTable,va+slots[i]*pageSize);
+    // A failed post-ACK flush has not attempted resize: roll back exact PTEs,
+    // including canonical/shared/borrowed/hidden aliases and private EOF padding.
+    // This works with no copy preparation, and also frees unused prepared copies.
+    for(unsigned prepare=0;prepare<2;++prepare) {
+        FileMappingInvalidation job(&actor,space,backing);CHECK(job.Prepare(7));
+        if(prepare)CHECK(job.PreparePrivateRestore());
+        job.LockTargetFileAlreadyHeld();CHECK(!job.RestoreAll());CHECK(job.Detach(0,8*pageSize));
+        job.Acknowledge();failAllocation=true;failHeapAfter=0;
+        job.LockTargetFileAlreadyHeld();CHECK(job.RestoreAll());
+        CHECK(!job.RestoreAll()&&!job.RestorePrivate(pageSize+123));job.Unlock();
+        CHECK(failHeapAfter==0);failHeapAfter=-1;failAllocation=false;
+        for(unsigned i=0;i<7;++i)CHECK(VmmReadLeaf(space->pageTable,va+slots[i]*pageSize)==before[i]);
+        CHECK(PmmGetRefCount(canonical)==2&&maps(canonical)==1);
+        CHECK(PmmGetRefCount(shared)==1&&maps(shared)==1);
+        CHECK(PmmGetRefCount(borrowed)==1&&maps(borrowed)==1);
+        CHECK(PmmGetRefCount(boundary)==4&&maps(boundary)==3);
+        for(unsigned i=0;i<pageSize;++i)CHECK(reinterpret_cast<unsigned char*>(boundary.raw())[i]==0x52);
     }
     KMutexUnlock(&file.gate);CHECK(PmmGetRefCount(boundary)==4&&maps(boundary)==3);
     Gate ack,afterAck;pendingAcknowledgement=&ack;
@@ -1263,18 +1283,18 @@ static void targetPrivateRestore() {
         KMutexLock(&file.gate);
         {
             FileMappingInvalidation parentJob(&actor,space,backing),childJob(&actor,child,backing);
-            CHECK(parentJob.Prepare(7)&&parentJob.PreparePrivateRestore(pageSize+123));
-            CHECK(childJob.Prepare(1)&&childJob.PreparePrivateRestore(pageSize+123));
+            CHECK(parentJob.Prepare(7)&&parentJob.PreparePrivateRestore());
+            CHECK(childJob.Prepare(1)&&childJob.PreparePrivateRestore());
             parentJob.LockTargetFileAlreadyHeld();CHECK(parentJob.Detach(0,8*pageSize));
-            CHECK(!parentJob.RestorePrivate());parentJob.Unlock();
+            CHECK(!parentJob.RestorePrivate(pageSize+123));parentJob.Unlock();
             childJob.LockTargetFileAlreadyHeld();CHECK(childJob.Detach(0,8*pageSize));childJob.Unlock();
             parentJob.Acknowledge();childJob.Acknowledge();
             parentJob.Acknowledge(); // idempotent; no extra shootdown
             afterAck.park(); // ACK must retain original refs until restore/destruction
             failAllocation=true;failHeapAfter=0;
             parentJob.LockTargetFileAlreadyHeld();CHECK(!parentJob.Detach(0,8*pageSize));
-            CHECK(parentJob.RestorePrivate());CHECK(!parentJob.RestorePrivate());parentJob.Unlock();
-            childJob.LockTargetFileAlreadyHeld();CHECK(childJob.RestorePrivate());childJob.Unlock();
+            CHECK(parentJob.RestorePrivate(pageSize+123));CHECK(!parentJob.RestorePrivate(pageSize+123));parentJob.Unlock();
+            childJob.LockTargetFileAlreadyHeld();CHECK(childJob.RestorePrivate(pageSize+123));childJob.Unlock();
             CHECK(failHeapAfter==0);failHeapAfter=-1;failAllocation=false;
         }
         KMutexUnlock(&file.gate);
@@ -1309,38 +1329,55 @@ static void targetPrivateRestore() {
     AddressSpaceUnref(space);AddressSpaceUnref(child);CHECK(ProcessCleanupStep());CHECK(ProcessCleanupStep());
     CHECK(!FileMappingRegisteredRanges(&file));MappingBackingUnref(backing);CHECK(released==1);
     FileObjectDispose(&file);VmmDestroyUserPageTable(root);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
-    std::puts("PRIVATE RESTORE PASS prepare-OOM/all-AS-ACK/retained-refs/canonical/shared/borrowed/hidden/CoW/boundary-copy/no-allocation");
+    std::puts("PRIVATE RESTORE PASS prepare-OOM/exact-rollback/all-AS-ACK/retained-refs/canonical/shared/borrowed/hidden/CoW/boundary-copy/no-allocation");
 }
-static void privateRestoreAlignedLimits() {
-    for(uint64_t limit:{uint64_t{0},uint64_t{pageSize},~uint64_t{0}}) {
+static void privateRestoreObservedEof() {
+    for(uint64_t limit:{uint64_t{0},uint64_t{37},uint64_t{pageSize},
+                       uint64_t{pageSize+123},uint64_t{2*pageSize+17},~uint64_t{0}}) {
         auto root=table();VmmHostSetKernelRoot(root);AddressSpaceKernelInit();
         auto* space=AddressSpaceCreate(49);Process actor{};actor.addressSpace=space;
         FileObject file{};FileObjectInit(&file);unsigned released=0;
         auto* backing=MappingBackingCreate(&released,rangeBackingReleased);CHECK(backing);backing->file=&file;
-        auto page=PmmAllocPage(MemTag::User,49);CHECK(page);
-        std::memset(reinterpret_cast<void*>(page.raw()),0x63,pageSize);
+        PhysicalAddress pages[3];
+        for(auto& page:pages) {
+            page=PmmAllocPage(MemTag::User,49);CHECK(page);PmmRefPage(page);
+            std::memset(reinterpret_cast<void*>(page.raw()),0x63,pageSize);
+        }
         {
             MappingTransaction operation(&actor,space,backing);CHECK(operation.PrepareRanges(1)&&operation.Lock());
-            CHECK(operation.InsertRange(rangeRecord(va.raw(),va.raw()+pageSize,backing)));
-            CHECK(VmmTryMapPage(space->pageTable,va,page,flags,MemTag::User,49)==VmmMapResult::Mapped);
+            CHECK(operation.InsertRange(rangeRecord(va.raw(),va.raw()+3*pageSize,backing)));
+            for(unsigned i=0;i<3;++i)
+                CHECK(VmmTryMapPage(space->pageTable,va+i*pageSize,pages[i],flags,MemTag::User,49)==VmmMapResult::Mapped);
         }
-        const auto original=VmmReadLeaf(space->pageTable,va);
         KMutexLock(&file.gate);
         {
-            FileMappingInvalidation job(&actor,space,backing);CHECK(job.Prepare(1));
-            // No boundary copy is necessary for zero/aligned/full retention.
-            failAllocation=true;CHECK(job.PreparePrivateRestore(limit));failAllocation=false;
-            job.LockTargetFileAlreadyHeld();CHECK(job.Detach(0,pageSize));job.Acknowledge();
-            job.LockTargetFileAlreadyHeld();CHECK(job.RestorePrivate());job.Unlock();
+            FileMappingInvalidation job(&actor,space,backing);CHECK(job.Prepare(3));
+            CHECK(job.PreparePrivateRestore()); // no knowledge of eventual EOF
+            job.LockTargetFileAlreadyHeld();CHECK(job.Detach(0,3*pageSize));job.Acknowledge();
+            failAllocation=true;failHeapAfter=0;
+            job.LockTargetFileAlreadyHeld();CHECK(job.RestorePrivate(limit));job.Unlock();
+            CHECK(failHeapAfter==0);failHeapAfter=-1;failAllocation=false;
         }
         KMutexUnlock(&file.gate);
-        CHECK(VmmReadLeaf(space->pageTable,va)==(limit?original:0));
-        if(limit)for(unsigned i=0;i<pageSize;++i)CHECK(reinterpret_cast<unsigned char*>(page.raw())[i]==0x63);
-        else CHECK(!PmmGetRefCount(page));
+        for(unsigned i=0;i<3;++i) {
+            const uint64_t offset=i*pageSize;
+            const auto leaf=VmmReadLeaf(space->pageTable,va+offset);
+            if(offset>=limit) { CHECK(!leaf&&PmmGetRefCount(pages[i])==1); }
+            else {
+                const auto frame=VmmLeafPhysical(leaf);
+                const bool partial=limit-offset<pageSize;
+                CHECK((frame!=pages[i])==partial);
+                auto* bytes=reinterpret_cast<unsigned char*>(frame.raw());
+                for(unsigned j=0;j<pageSize;++j)CHECK(bytes[j]==(partial&&j>=limit-offset?0:0x63));
+                CHECK(PmmGetRefCount(pages[i])==(partial?1:2));
+            }
+            for(unsigned j=0;j<pageSize;++j)CHECK(reinterpret_cast<unsigned char*>(pages[i].raw())[j]==0x63);
+            PmmUnrefPage(pages[i]);
+        }
         AddressSpaceUnref(space);CHECK(ProcessCleanupStep());MappingBackingUnref(backing);CHECK(released==1);
         FileObjectDispose(&file);VmmDestroyUserPageTable(root);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
     }
-    std::puts("PRIVATE RESTORE LIMITS PASS zero/aligned/full-retention/no-boundary-allocation");
+    std::puts("PRIVATE RESTORE EOF PASS deferred-boundary/zero/aligned/full-retention/source-unchanged/no-restore-allocation");
 }
 
 static void pageAccessWithoutUnrelatedGate() {
@@ -1536,7 +1573,7 @@ int main(int argc,char** argv) {
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
     liveMappingClone();sharedMappingClone();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
-    fileMappingRegistrations();fileMappingGateOom();targetFileInvalidation();targetPrivateRestore();privateRestoreAlignedLimits();
+    fileMappingRegistrations();fileMappingGateOom();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
     pageAccessWithoutUnrelatedGate();
     anonymousDiscard();memoryCensus();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");

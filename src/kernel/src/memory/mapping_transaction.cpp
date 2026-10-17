@@ -315,26 +315,25 @@ bool FileMappingInvalidation::Prepare(uint64_t leafCapacity) {
     capacity_=leaves_?leafCapacity:0;
     return !leafCapacity || leaves_;
 }
-bool FileMappingInvalidation::PreparePrivateRestore(uint64_t validPrefix) {
+bool FileMappingInvalidation::PreparePrivateRestore() {
     RequireTargetGate();
     if (!prepared_ || locked_ || count_ || acknowledged_ || restoreRequested_)
         KernelPanic("mapping: invalid private restore preparation");
-    restoreRequested_=true;validPrefix_=validPrefix;
+    restoreRequested_=true;
     uint64_t needed=0;
-    if (validPrefix&4095) {
-        const uint64_t boundary=validPrefix&~uint64_t{4095};
-        LockTargetFileAlreadyHeld();
-        for (auto* node=space_->ranges.head;node;node=node->next) {
-            const auto& range=node->range;
-            if (!range.backing || range.backing->file!=backing_->file ||
-                range.sharing!=MappingSharing::Private || range.leafOwnership!=MappingLeafOwnership::Managed ||
-                boundary<range.offset || boundary-range.offset>=range.end-range.begin) continue;
-            const uint64_t raw=VmmReadLeaf(space_->pageTable,VirtualAddress(range.begin+boundary-range.offset));
-            if (VmmLeafBacked(raw) && !FileObjectIsCanonicalLocked(backing_->file,boundary/4096,VmmLeafPhysical(raw)))
-                ++needed;
-        }
-        Unlock();
+    LockTargetFileAlreadyHeld();
+    for (auto* node=space_->ranges.head;node;node=node->next) {
+        const auto& range=node->range;
+        if (!range.backing || range.backing->file!=backing_->file ||
+            range.sharing!=MappingSharing::Private || range.leafOwnership!=MappingLeafOwnership::Managed) continue;
+        uint64_t leaves=0;
+        if (!VmmCountRangeLeaves(space_->pageTable,range.begin,range.end,&leaves))
+            KernelPanic("mapping: invalid private restore range");
+        // Any resulting EOF can intersect at most one populated page per
+        // range. Reserve by sparse range count, never by virtual-page count.
+        if (leaves) ++needed;
     }
+    Unlock();
     if (needed>capacity_) return false;
     boundaries_=static_cast<PhysicalAddress*>(AllocateRecords(needed,sizeof(PhysicalAddress)));
     if (needed && !boundaries_) return false;
@@ -392,13 +391,7 @@ void FileMappingInvalidation::Capture(VirtualAddress address,uint64_t raw,void* 
     const bool managed=range->leafOwnership==MappingLeafOwnership::Managed;
     const bool privateData=managed && range->sharing==MappingSharing::Private &&
         !FileObjectIsCanonicalLocked(job->backing_->file,offset/4096,VmmLeafPhysical(raw));
-    uint64_t boundary=~uint64_t{0};
-    if (job->restorePrepared_ && privateData && (job->validPrefix_&4095) &&
-        offset==(job->validPrefix_&~uint64_t{4095})) {
-        if (job->boundaryUsed_==job->boundaryCount_) KernelPanic("mapping: unprepared private boundary");
-        boundary=job->boundaryUsed_++;
-    }
-    job->leaves_[job->count_++]={address.raw(),offset,raw,boundary,managed,privateData};
+    job->leaves_[job->count_++]={address.raw(),offset,raw,managed,privateData};
 }
 bool FileMappingInvalidation::Detach(uint64_t begin,uint64_t end) {
     uint64_t needed=0;
@@ -414,31 +407,40 @@ bool FileMappingInvalidation::Detach(uint64_t begin,uint64_t end) {
     }
     ++space_->generation;shootdown_=true;return true;
 }
-bool FileMappingInvalidation::RestorePrivate() {
+bool FileMappingInvalidation::RestorePrivate(uint64_t validPrefix) {
+    return Restore(false,validPrefix);
+}
+bool FileMappingInvalidation::RestoreAll() { return Restore(true,0); }
+bool FileMappingInvalidation::Restore(bool all,uint64_t validPrefix) {
     RequireTargetGate();
-    if (!locked_ || !acknowledged_ || !restorePrepared_ || restored_) return false;
+    if (!locked_ || !acknowledged_ || (!all && !restorePrepared_) || restored_) return false;
     // File gate excludes range changes and leaf publication for this inode.
     // Validate every destination before restoring the first reference.
-    uint64_t restoring=0;
+    uint64_t restoring=0,boundaries=0;
     for (uint64_t i=0;i<count_;++i) {
         const auto& leaf=leaves_[i];
-        if (!leaf.privateData || leaf.offset>=validPrefix_) continue;
+        if (!all && (!leaf.privateData || leaf.offset>=validPrefix)) continue;
         const auto* range=MappingRangeFind(space_->ranges,leaf.address);
         if (!range || !range->backing || range->backing->file!=backing_->file ||
-            range->sharing!=MappingSharing::Private || range->leafOwnership!=MappingLeafOwnership::Managed ||
+            (range->leafOwnership==MappingLeafOwnership::Managed)!=leaf.managed ||
+            (!all && range->sharing!=MappingSharing::Private) ||
             range->offset+leaf.address-range->begin!=leaf.offset ||
             VmmReadLeaf(space_->pageTable,VirtualAddress(leaf.address)))
             KernelPanic("mapping: private restore destination changed");
         ++restoring;
+        if (!all && validPrefix-leaf.offset<4096) ++boundaries;
     }
+    if (boundaries>boundaryCount_) KernelPanic("mapping: unprepared private boundary");
     if (restoring && space_->generation==~uint64_t{0}) KernelPanic("mapping: generation exhausted");
+    uint64_t boundary=0;
     for (uint64_t i=0;i<count_;++i) {
         auto& leaf=leaves_[i];
-        if (!leaf.privateData || leaf.offset>=validPrefix_) continue;
+        if (!all && (!leaf.privateData || leaf.offset>=validPrefix)) continue;
         PhysicalAddress physical=VmmLeafPhysical(leaf.raw);
-        if (leaf.boundary!=~uint64_t{0}) {
-            physical=boundaries_[leaf.boundary];
-            const uint64_t prefix=validPrefix_-leaf.offset;
+        const bool copy=!all && validPrefix-leaf.offset<4096;
+        if (copy) {
+            physical=boundaries_[boundary];
+            const uint64_t prefix=validPrefix-leaf.offset;
             auto* bytes=reinterpret_cast<uint8_t*>(PhysToVirt(physical).raw());
             memcpy(bytes,reinterpret_cast<void*>(PhysToVirt(VmmLeafPhysical(leaf.raw)).raw()),prefix);
             memset(bytes+prefix,0,4096-prefix);
@@ -449,7 +451,7 @@ bool FileMappingInvalidation::RestorePrivate() {
         if (VmmTryMapPage(space_->pageTable,VirtualAddress(leaf.address),physical,flags,tag,pid,
                          (leaf.raw&VMM_PRESENT)!=0)!=VmmMapResult::Mapped)
             KernelPanic("mapping: prepared private restore failed");
-        if (leaf.boundary!=~uint64_t{0}) boundaries_[leaf.boundary]=PhysicalAddress{};
+        if (copy) boundaries_[boundary++]=PhysicalAddress{};
         else leaf.managed=false; // detached reference transferred back to PTE
     }
     if (restoring) ++space_->generation;
