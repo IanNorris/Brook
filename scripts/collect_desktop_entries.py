@@ -200,7 +200,7 @@ def main():
     for source in sorted((root/'data/icons').glob('*.svg')):
         # Use the current B mark, matching the boot screen.
         # Keep the existing output name consumed by the native window manager.
-        asset = root/'data/branding/brook-boot-mark.png' if source.stem == 'applications' else source
+        asset = root/'data/branding/brook-mark.png' if source.stem == 'applications' else source
         if not convert_icon_to_rgba(asset,os.path.join(icons_dir,source.stem+'.rgba')):
             raise RuntimeError(f'Cannot convert built-in icon {asset}')
 

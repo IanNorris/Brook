@@ -37,6 +37,13 @@ class DesktopEntriesTest(unittest.TestCase):
             self.assertEqual(struct.unpack_from('<I',pixels,(12*24+12)*4)[0],0xffff0000)
             for builtin in ('applications','application','terminal'):
                 self.assertEqual((output/'icons'/f'{builtin}.rgba').stat().st_size,2304)
+            mark = struct.unpack('<576I', (output/'icons/applications.rgba').read_bytes())
+            # An opaque boot tile or a padded export fails these checks: the
+            # launcher needs clear corners and a mark filling the icon height.
+            for corner in (0, 23, 23*24, 24*24-1):
+                self.assertEqual(mark[corner] >> 24, 0)
+            self.assertTrue(any(pixel >> 24 > 128 for pixel in mark[:24]))
+            self.assertTrue(any(pixel >> 24 > 128 for pixel in mark[-24:]))
 
     def test_browser_wrapper_requires_installed_binary_and_deployed_wrapper(self):
         with tempfile.TemporaryDirectory() as temp:

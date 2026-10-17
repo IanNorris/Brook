@@ -9,18 +9,30 @@ The original attached wallpaper is preserved as
 `data/wallpaper/brook-original-concept.png`. The original attached logo is
 `docs/design/brook-original-logo.png`.
 
-`data/branding/brook-mark-draft.png` is a transparent blue/teal logo draft
-using the original logo as a reference. It simplifies the river into one
-broad cutout and removes the wordmark. This is a design exploration; edge
-and transparency cleanup and small-size vector work remain before it
-becomes the production logo. It is not used by the bootloader or desktop.
+`data/branding/brook-mark.png` is the selected blue/teal B mark, shared by
+the README, launcher and boot screen. It has real alpha in both the background
+and river cutout, and its canvas is trimmed to the visible mark. The launcher
+fits that canvas into its 24-pixel icon; the build bakes the same source against
+black for boot. No ImageMagick dependency is needed to build from the tracked PNG.
 
-`data/branding/brook-boot-mark.png` is the new boot-screen mark: a smooth
-blue/teal B with a broad winding river cutout on a black background. The
-transparent draft's residual speckles made it unsuitable for boot use, so
-the selected version was generated directly on black. The original logo and
-draft remain preserved. Kernel CMake invokes `scripts/bake_logo.py` to generate
-the 300×300 boot bitmap in the build directory whenever the source changes.
+The original opaque source is retained as `data/branding/brook-boot-mark.png`.
+With user approval, the production cutout was derived with ImageMagick:
+
+```sh
+magick data/branding/brook-boot-mark.png -alpha off -separate \
+  -evaluate-sequence max -threshold 12% \
+  -define connected-components:area-threshold=500 \
+  -define connected-components:mean-color=true -connected-components 8 \
+  -blur 0x0.45 /tmp/brook-b-alpha.png
+magick data/branding/brook-boot-mark.png /tmp/brook-b-alpha.png -alpha off \
+  -compose CopyOpacity -composite -trim +repage data/branding/brook-mark.png
+```
+
+This removes the black matte and small isolated compression noise without
+redesigning the B. The older swirl draft `data/branding/brook-mark-draft.png`
+remains a design exploration; it is not used by the README, launcher or boot.
+The retired rainbow PNGs and unused checked-in boot bitmap have been removed.
+The prompt below records generation of the original opaque B source.
 
 Built-in imagegen, generation mode, no input image, opaque background:
 

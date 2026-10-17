@@ -46,10 +46,10 @@ set(BOOT_LOGO_HEADER "${CMAKE_CURRENT_BINARY_DIR}/brook_boot_logo_data.h")
 add_custom_command(
     OUTPUT "${BOOT_LOGO_HEADER}"
     COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/bake_logo.py"
-            "${BROOK_ROOT}/data/branding/brook-boot-mark.png"
+            "${BROOK_ROOT}/data/branding/brook-mark.png"
             "${BOOT_LOGO_HEADER}" 300
     DEPENDS "${BROOK_ROOT}/scripts/bake_logo.py"
-            "${BROOK_ROOT}/data/branding/brook-boot-mark.png"
+            "${BROOK_ROOT}/data/branding/brook-mark.png"
     COMMENT "Baking Brook boot logo"
     VERBATIM
 )

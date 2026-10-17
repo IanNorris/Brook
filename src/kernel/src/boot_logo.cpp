@@ -1,7 +1,7 @@
 // Boot logo and progress bar display.
 //
 // Renders the Brook "B" logo centered on screen with a progress bar.
-// The logo data is baked at build time from data/branding/brook-boot-mark.png.
+// The logo data is baked at build time from data/branding/brook-mark.png.
 
 #include "boot_logo.h"
 #include "brook_boot_logo_data.h"

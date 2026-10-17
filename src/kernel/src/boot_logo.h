@@ -7,7 +7,7 @@
 // Renders the Brook logo centered on screen with a progress bar below it.
 // Called during kernel initialization to show boot progress.
 //
-// The logo is baked at build time from data/branding/brook-boot-mark.png into a C header.
+// The logo is baked at build time from data/branding/brook-mark.png into a C header.
 // Progress bar shows percentage and becomes an error code display on failure.
 
 namespace brook {
