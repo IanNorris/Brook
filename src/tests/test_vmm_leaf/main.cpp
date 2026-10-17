@@ -529,6 +529,10 @@ static void rangeTableEdits() {
     auto next=[&]{random^=random<<13;random^=random>>17;random^=random<<5;return random;};
     for(unsigned round=0;round<1000;++round) {
         unsigned begin=next()%64,end=begin+1+next()%(64-begin),op=next()%4;
+        // Warm entries on both sides and inside the next edit. Keep positive
+        // lookups live across replacement, hole creation and protection splits.
+        for (unsigned i : {begin,end-1,next()%64})
+            (void)MappingRangeFind(table,(i+1)*pageSize+13);
         uint32_t protection=next()%8;bool expected=true;
         {
             MappingRangePlan plan;CHECK(plan.Prepare(3));
@@ -564,6 +568,77 @@ static void rangeTableEdits() {
     }
     MappingRangeDestroy(table);CHECK(heapAllocations==initialHeap);
     std::puts("MAPPING RANGES PASS split/offset/reservation/gaps/permissions/OOM/oracle=1000");
+}
+static void rangeLookupCache() {
+    const auto heap=heapAllocations.load();MappingRangeTable first{},second{};
+    auto put=[](MappingRangeTable& table,uint64_t begin,uint64_t end,uint32_t protection) {
+        MappingRangePlan plan;CHECK(plan.Prepare(3));auto r=rangeRecord(begin,end,nullptr,protection);
+        CHECK(plan.Replace(table,begin,end,&r));
+    };
+    put(first,0x1000,0x9000,3);put(second,0x1000,0x9000,1);
+    for (unsigned i=0;i<32;++i) {
+        CHECK(MappingRangeFind(first,0x3123)->protection==3);
+        CHECK(MappingRangeFind(second,0x3123)->protection==1);
+    }
+    { MappingRangePlan plan;CHECK(plan.Prepare(2));CHECK(plan.Protect(first,0x3000,0x5000,0)); }
+    CHECK(MappingRangeFind(first,0x2fff)->protection==3);
+    CHECK(MappingRangeFind(first,0x3000)->protection==0);
+    CHECK(MappingRangeFind(first,0x4fff)->protection==0);
+    CHECK(MappingRangeFind(first,0x5000)->protection==3);
+    { MappingRangePlan plan;CHECK(plan.Prepare(0));CHECK(plan.Replace(first,0x3000,0x5000)); }
+    CHECK(!MappingRangeFind(first,0x3000));CHECK(!MappingRangeFind(first,0x4fff));
+    put(first,0x3000,0x5000,1);CHECK(MappingRangeFind(first,0x3123)->protection==1);
+    const auto identity=MappingRangeFind(first,0x8123)->identity;
+    { MappingRangePlan plan;CHECK(plan.Prepare(0));CHECK(plan.Extend(first,identity,0xb000)); }
+    CHECK(MappingRangeFind(first,0xafff)->end==0xb000);CHECK(!MappingRangeFind(first,0xb000));
+    MappingRangeDestroy(first);CHECK(!MappingRangeFind(first,0x3123));
+    put(first,0x3000,0x4000,7);CHECK(MappingRangeFind(first,0x3123)->protection==7);
+    // More distinct pages than slots guarantee collisions; neither gaps nor
+    // table identity may inherit a previous page's metadata.
+    MappingRangeDestroy(first);
+    for (unsigned i=0;i<96;++i) put(first,(2*i+1)*pageSize,(2*i+2)*pageSize,i%8);
+    for (unsigned round=0;round<4;++round) for (unsigned i=0;i<96;++i) {
+        const auto begin=(2*i+1)*pageSize;
+        CHECK(MappingRangeFind(first,begin+19)->protection==i%8);
+        CHECK(!MappingRangeFind(first,begin+pageSize));
+    }
+    CHECK(MappingRangeFind(second,0x3123)->protection==1);
+    MappingRangeDestroy(first);MappingRangeDestroy(second);CHECK(heapAllocations==heap);
+    std::puts("MAPPING LOOKUP CACHE PASS replacement/unmap/remap/splits/extend/destroy/collisions/table-isolation");
+}
+static const MappingRange* linearRangeLookup(const MappingRangeTable& table,uint64_t address) {
+    for (auto* node=table.head;node && node->range.begin<=address;node=node->next)
+        if(address<node->range.end)return &node->range;
+    return nullptr;
+}
+static void rangeLookupBenchmark() {
+    MappingRangeTable table{};constexpr unsigned count=1658,iterations=200000;
+    for(unsigned i=0;i<count;++i) {
+        MappingRangePlan plan;CHECK(plan.Prepare(1));auto r=rangeRecord((2*i+1)*pageSize,(2*i+2)*pageSize,nullptr);
+        CHECK(plan.Insert(table,r));
+    }
+    volatile uint64_t targets[8];for(unsigned i=0;i<8;++i)targets[i]=(2*(count-1-i)+1)*pageSize+13;
+    for(unsigned i=0;i<8;++i)CHECK(MappingRangeFind(table,targets[i])==linearRangeLookup(table,targets[i]));
+    for(unsigned workload=0;workload<3;++workload) {
+        uint64_t sums[2]={};double ns[2]={};
+        for(unsigned variant=0;variant<2;++variant) {
+            auto start=std::chrono::steady_clock::now();
+            for(unsigned i=0;i<iterations;++i) {
+                const uint64_t address=workload==1?(2*(i%count)+1)*pageSize+13:targets[i%8];
+                if(workload==2 && i%256==0) {
+                    const uint64_t begin=address&~uint64_t{4095};MappingRangePlan plan;CHECK(plan.Prepare(1));
+                    auto r=rangeRecord(begin,begin+pageSize,nullptr,(i/256)%8);CHECK(plan.Replace(table,begin,begin+pageSize,&r));
+                }
+                auto* result=variant?MappingRangeFind(table,address):linearRangeLookup(table,address);CHECK(result);
+                sums[variant]+=result->begin;
+            }
+            ns[variant]=std::chrono::duration<double,std::nano>(std::chrono::steady_clock::now()-start).count()/iterations;
+        }
+        CHECK(sums[0]==sums[1]);
+        const char* name=workload==0?"hot8":workload==1?"cycle1658":"hot8_replace256";
+        std::printf("MAPPING LOOKUP BENCH workload=%s ranges=%u iterations=%u linear_ns=%.2f cached_ns=%.2f speedup=%.2f checksum=%lu\n",name,count,iterations,ns[0],ns[1],ns[0]/ns[1],static_cast<unsigned long>(sums[1]));
+    }
+    MappingRangeDestroy(table);
 }
 static void rangeSnapshotRetirement() {
     auto root=table();VmmHostSetKernelRoot(root);auto* space=AddressSpaceCreate(29);CHECK(space);
@@ -1311,10 +1386,11 @@ static void memoryCensus() {
     std::puts("MEMORY CENSUS PASS lifetime/publication/ceiling/sparse/hidden/aliases/bounded-batches");
 }
 
-int main() {
+int main(int argc,char** argv) {
+    if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
-    addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeSnapshotRetirement();rangeLeafOwnership();
+    addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
     liveMappingClone();sharedMappingClone();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();targetFileInvalidation();
     pageAccessWithoutUnrelatedGate();

@@ -1,5 +1,12 @@
 # Recovery and VM-control backlog
 
+- Implement real POSIX record locking for regular files. A fresh ext2 `F_GETLK`
+  query currently succeeds without replacing `F_WRLCK` with `F_UNLCK`; fresh
+  SQLite WAL fails with `SQLITE_PROTOCOL` while rollback journal passes.
+  See [lookup/browser diagnostics](mapping-lookup-cache.md) for evidence and
+  required inode identity, range conversion, process ownership and logical-close
+  lifecycle coverage. Do not replace this with fictional unlocked success.
+
 ## VM bridge findings, 17 October
 
 - Semantic window controls and boot-epoch guarded jobs are implemented; installed-app catalog/launcher activation, observation bundles, saved screenshot

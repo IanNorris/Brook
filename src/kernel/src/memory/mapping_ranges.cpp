@@ -4,6 +4,9 @@
 
 namespace brook {
 static constexpr uint64_t UserEnd = 0x0000800000000000ULL;
+static void InvalidateLookup(MappingRangeTable& table) {
+    for (auto& entry : table.lookup) entry = nullptr;
+}
 static bool ValidRange(uint64_t begin, uint64_t end) {
     return begin < end && end <= UserEnd && !(begin & 4095) && !(end & 4095);
 }
@@ -67,6 +70,7 @@ MappingRangeNode* MappingRangePlan::Take(const MappingRange& source, uint64_t be
 bool MappingRangePlan::Replace(MappingRangeTable& table, uint64_t begin, uint64_t end,
                                const MappingRange* replacement) {
     if (!CanReplace(table,begin,end,replacement)) return false;
+    InvalidateLookup(table);
     MappingRangeNode** first = &table.head;
     while (*first && (*first)->range.end <= begin) first = &(*first)->next;
     auto* stop = *first;
@@ -128,6 +132,7 @@ bool MappingRangePlan::CanProtect(const MappingRangeTable& table, uint64_t begin
 bool MappingRangePlan::Protect(MappingRangeTable& table, uint64_t begin, uint64_t end,
                                uint32_t protection) {
     if (!CanProtect(table,begin,end,protection)) return false;
+    InvalidateLookup(table);
     MappingRangeNode** link = &table.head;
     while (*link && (*link)->range.end <= begin) link = &(*link)->next;
     while (*link && (*link)->range.begin < end) {
@@ -147,8 +152,15 @@ bool MappingRangePlan::Protect(MappingRangeTable& table, uint64_t begin, uint64_
     return true;
 }
 const MappingRange* MappingRangeFind(const MappingRangeTable& table, uint64_t address) {
+    const uint64_t page = address >> 12;
+    const unsigned slot = (page ^ (page >> 8) ^ (page >> 16)) & (MappingRangeTable::LookupSlots-1);
+    if (const auto* cached = table.lookup[slot])
+        if (cached->begin <= address && address < cached->end) return cached;
     for (auto* node = table.head; node && node->range.begin <= address; node = node->next)
-        if (address < node->range.end) return &node->range;
+        if (address < node->range.end) {
+            table.lookup[slot] = &node->range;
+            return &node->range;
+        }
     return nullptr;
 }
 bool MappingRangePlan::Extend(MappingRangeTable& table,uint64_t identity,uint64_t end) {
@@ -158,6 +170,7 @@ bool MappingRangePlan::Extend(MappingRangeTable& table,uint64_t identity,uint64_
         auto extended=node->range;extended.end=end;
         if (end<node->range.end || !MappingRangeValid(extended) ||
             (node->next && end>node->next->range.begin) || table.nextIdentity==~uint64_t{0}) return false;
+        InvalidateLookup(table);
         extended.identity=++table.nextIdentity;node->range=extended;return true;
     }
     return false;
@@ -178,6 +191,7 @@ uint64_t MappingRangeFindGap(const MappingRangeTable& table, uint64_t hint,
     return start <= ceiling && length <= ceiling-start ? start : 0;
 }
 void MappingRangeDestroy(MappingRangeTable& table) {
+    InvalidateLookup(table);
     auto* nodes = table.head; table.head = nullptr; ReleaseNodes(nodes);
 }
 }

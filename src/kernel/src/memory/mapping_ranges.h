@@ -34,6 +34,11 @@ struct MappingRangeTable {
     MappingRangeNode* head;
     uint64_t nextIdentity;
     AddressSpaceState* owner = nullptr;
+    // Positive metadata lookups only. The same AS mutation lock that protects
+    // the list protects this cache; unpublished construction is exclusive.
+    // Never copy a table/cache into another address space.
+    static constexpr unsigned LookupSlots = 16;
+    mutable const MappingRange* lookup[LookupSlots] = {};
 };
 
 // All table access is protected by AS.mutation, except unpublished AS creation

@@ -1960,3 +1960,21 @@ cancellation fixtures also verify after reboot. Both checked app shutdowns and
 all offline filesystem checks pass. Startup remains slow; full process-wide
 signal routing, stop/continue behavior and raw leader-exit final wait status
 remain separate follow-ups in the linked report.
+
+
+### Mapping lookup and Firefox audio rerun (17 October)
+
+A small address-space metadata lookup cache passes all 29 hosted suites and
+the guest's eight anonymous-memory/COW checks. Chromium and Codium open together;
+Codium restores, edits and saves its document as Brook, and both native closes
+release their registered groups. Checked shutdown and all offline filesystem
+checks pass. Hosted hot-lookup costs improve substantially, while a full-range
+cycle is unchanged; no end-to-end browser speedup is established.
+
+Firefox eventually renders the local video/audio fixture, but its five-second
+VM audio capture contains zero PCM frames. Its native close releases the
+registered group in this run. Fresh ext2 file-lock queries expose an unimplemented
+fcntl path, and SQLite WAL fails with SQLITE_PROTOCOL even on a fresh database.
+Firefox audio and the wider database/record-locking work remain open. See the
+[lookup and browser diagnostic report](mapping-lookup-cache.md) for exact
+identities, evidence, limitations and the required locking lifecycle.
