@@ -2026,3 +2026,22 @@ capture contains PCM and the later idle capture is empty. Checked shutdown and
 all offline filesystems pass. This is not Firefox audio acceptance: per-stream
 hardware completion, device clock, readiness and drain remain open. See the
 [audio clock report](audio-clock.md) for exact identities and limitations.
+
+### Native audio completion and exact tails (18 October)
+
+The optional HDA DMA receipt/completion path now attributes hardware progress
+to individual streams; hardware acceptance no longer frees FIFO capacity early.
+Real guest tests pass ownership, independent completion, paused-stream isolation,
+format-change rejection and poll backpressure/reset. An exact-sample capture
+exposed alternating short-sound loss from stale pre-RUN LPIB. After correcting
+native and legacy fresh-ring baselines, all 9,660 expected nonzero stereo frames
+arrive in each of persistent-open, close/reopen and reset tests, including every
+final marker. The baseline delivered only 4,830 frames.
+
+All 34 hosted suites and supported entry-state checks pass. The 200-round ALSA
+probe exits zero; a three-second sustained capture has 132,502 PCM frames and
+no silent analysis bins, followed by empty idle capture. Checked shutdown and
+offline filesystem gates pass. These checks do not accept Firefox audio, ALSA
+clock behavior or glitch-free playback. GETOPTR, complete drain, exact fragment
+geometry and DSP epoll remain follow-ups before switching ALSA defaults. See
+the [audio clock report](audio-clock.md) for evidence and sampling limitations.

@@ -1762,6 +1762,9 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
             SpinLockRelease(ProcessFdLock(proc));
             {
                 DspIoGuard held(dsp);
+                AudioStreamProgress progress{};
+                if (!AudioMixerGetProgress(dsp->mixerStreamId, &progress)) return -EBADF;
+                if (progress.discontinuity) return -32; // EPIPE: explicit RESET required.
                 const uint32_t rate = dsp->sampleRate ? dsp->sampleRate : DSP_HW_RATE;
                 const uint32_t frameBytes = (dsp->bitsPerSample / 8) * dsp->channels;
                 if (!frameBytes) return -EINVAL;
@@ -6397,7 +6400,10 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
 
+        AudioMixerRefresh(); // Driver query before taking the per-open control mutex.
         DspIoGuard held(dsp);
+        AudioStreamProgress progress{};
+        if (!AudioMixerGetProgress(dsp->mixerStreamId, &progress)) return -EBADF;
         if (cmd == SNDCTL_DSP_RESET) {
             AudioMixerReset(dsp->mixerStreamId);
             dsp->bufferOffset = 0;
@@ -6426,24 +6432,32 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                 // Report a realizable conversion rate and bounded OSS geometry.
                 if (value < 4000) value = 4000;
                 if (value > 192000) value = 192000;
+                if (static_cast<uint32_t>(value) != dsp->sampleRate && progress.queuedFrames) return -16;
                 dsp->sampleRate = static_cast<uint32_t>(value);
             }
             value = static_cast<int>(dsp->sampleRate);
         } else if (cmd == SNDCTL_DSP_SETFMT) {
-            if (value == AFMT_S16_LE) dsp->bitsPerSample = 16;
-            else if (value == AFMT_U8) dsp->bitsPerSample = 8;
+            uint8_t bits = value == AFMT_S16_LE ? 16 : value == AFMT_U8 ? 8 : dsp->bitsPerSample;
+            if (bits != dsp->bitsPerSample && progress.queuedFrames) return -16;
+            dsp->bitsPerSample = bits;
             value = dsp->bitsPerSample == 16 ? AFMT_S16_LE : AFMT_U8;
         } else if (cmd == SNDCTL_DSP_CHANNELS) {
-            if (value >= 1 && value <= 2) dsp->channels = static_cast<uint8_t>(value);
+            if (value >= 1 && value <= 2) {
+                if (value != dsp->channels && progress.queuedFrames) return -16;
+                dsp->channels = static_cast<uint8_t>(value);
+            }
             value = dsp->channels;
         } else if (cmd == SNDCTL_DSP_STEREO) {
-            dsp->channels = value ? 2 : 1;
+            const uint8_t channels = value ? 2 : 1;
+            if (channels != dsp->channels && progress.queuedFrames) return -16;
+            dsp->channels = channels;
             value = dsp->channels == 2;
         } else if (cmd == SNDCTL_DSP_GETODELAY) {
-            // Legacy estimate: includes global hardware queue, not independently
-            // attributed completion. Do not use as an accepted device clock yet.
-            uint64_t frames = MIXER_RING_FRAMES - AudioMixerAvailableFrames(dsp->mixerStreamId);
-            frames += AudioGetPosition() / MIXER_FRAME_BYTES;
+            if (progress.discontinuity) return -32;
+            uint64_t frames = progress.queuedFrames;
+            // Unclocked drivers still expose the legacy estimate; a clocked
+            // endpoint charges only this description's incomplete contribution.
+            if (!progress.clocked) frames += AudioGetPosition() / MIXER_FRAME_BYTES;
             uint64_t bytes = (frames * dsp->sampleRate + MIXER_HW_RATE - 1) / MIXER_HW_RATE * dsp->channels * (dsp->bitsPerSample / 8);
             value = static_cast<int>(bytes > 0x7fffffffULL ? 0x7fffffffULL : bytes);
         } else if (cmd == SNDCTL_DSP_GETCAPS) value = DSP_CAP_TRIGGER;
@@ -7908,11 +7922,16 @@ retry_poll:
             continue;
         }
 
-        // /dev/dsp: always writable (we buffer)
+        // Cached per-stream capacity: descriptor scans must not call the sleeping driver.
         if (fde->type == FdType::DevDsp)
         {
-            if (fds[i].events & POLLOUT)
-                fds[i].revents |= POLLOUT;
+            AudioStreamProgress progress{};
+            auto* dsp = static_cast<DspState*>(fde->handle);
+            if (dsp && AudioMixerGetProgress(dsp->mixerStreamId, &progress)) {
+                if (progress.discontinuity) fds[i].revents |= POLLERR;
+                else if ((fds[i].events & POLLOUT) && AudioMixerAvailableFrames(dsp->mixerStreamId))
+                    fds[i].revents |= POLLOUT;
+            } else fds[i].revents |= POLLERR;
             if (fds[i].revents) ready++;
             continue;
         }

@@ -45,7 +45,26 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
-add_host_test(test_audio_delivery "${BROOK_ROOT}/src/kernel/src/audio.cpp")
+add_host_test(test_module_sections)
+target_compile_options(test_module_sections PRIVATE
+    -Wno-unused-parameter -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+target_link_options(test_module_sections PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_module_sections PROPERTIES TIMEOUT 15)
+add_host_test(test_kvmclock_stable)
+target_compile_options(test_kvmclock_stable PRIVATE
+    -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+target_link_options(test_kvmclock_stable PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_kvmclock_stable PROPERTIES TIMEOUT 15)
+add_host_test(test_audio_delivery "${BROOK_ROOT}/src/kernel/src/audio.cpp"
+    "${BROOK_ROOT}/src/tests/test_audio_delivery/hda_clock.cpp")
 target_compile_options(test_audio_delivery PRIVATE
     -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
     "-iquote${BROOK_ROOT}/src/kernel/src"

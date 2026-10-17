@@ -14,12 +14,17 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "audio.h"
+#include "audio_dma_clock.h"
 #include "scheduler.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
 #include "memory/address.h"
 #include "mem_tag.h"
+#ifdef BROOK_HOST_TEST
+#include <cstring>
+#else
 #include "string.h"
+#endif
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -36,6 +41,7 @@ MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPage);
 MODULE_IMPORT_SYMBOL(AudioRegister);
+MODULE_IMPORT_SYMBOL(AudioClockNowNs);
 MODULE_IMPORT_SYMBOL(SchedulerYield);
 MODULE_IMPORT_SYMBOL(SchedulerSleepMs);
 
@@ -194,6 +200,18 @@ enum WidgetType : uint8_t {
 
 static volatile uint8_t* g_mmioBase = nullptr;
 
+#ifdef BROOK_HOST_TEST
+// Fake MMIO models hardware register side effects; all queue/clock code below
+// remains production code in the hosted driver regression.
+extern uint32_t HdaTestRead(uint32_t offset, uint32_t width);
+extern void HdaTestWrite(uint32_t offset, uint32_t width, uint32_t value);
+static inline void hda_write8(uint32_t off, uint8_t value) { HdaTestWrite(off, 1, value); }
+static inline void hda_write16(uint32_t off, uint16_t value) { HdaTestWrite(off, 2, value); }
+static inline void hda_write32(uint32_t off, uint32_t value) { HdaTestWrite(off, 4, value); }
+static inline uint8_t hda_read8(uint32_t off) { return static_cast<uint8_t>(HdaTestRead(off, 1)); }
+static inline uint16_t hda_read16(uint32_t off) { return static_cast<uint16_t>(HdaTestRead(off, 2)); }
+static inline uint32_t hda_read32(uint32_t off) { return HdaTestRead(off, 4); }
+#else
 static inline void hda_write8(uint32_t off, uint8_t v)
 { *reinterpret_cast<volatile uint8_t*>(g_mmioBase + off) = v; }
 static inline void hda_write16(uint32_t off, uint16_t v)
@@ -207,6 +225,8 @@ static inline uint16_t hda_read16(uint32_t off)
 { return *reinterpret_cast<volatile uint16_t*>(g_mmioBase + off); }
 static inline uint32_t hda_read32(uint32_t off)
 { return *reinterpret_cast<volatile uint32_t*>(g_mmioBase + off); }
+
+#endif
 
 // ---------------------------------------------------------------------------
 // Buffer Descriptor List for output stream
@@ -239,6 +259,20 @@ static uint64_t  g_playedBytes = 0;    // monotonically increasing DMA position
 static uint32_t  g_lastLpib = 0;       // previous cyclic DMA position
 static bool      g_streamRunning = false;
 static volatile uint32_t g_playLock = 0;
+static AudioDmaClock g_nativeClock;
+static bool g_nativeMode = false;
+static uint32_t g_legacyActive = 0;
+static uint64_t g_legacyEpoch = 0;
+// Logical endpoint mapped to byte zero after a clean physical-ring restart.
+static uint64_t g_nativeRingBase = 0;
+static uint64_t g_nativeLastDataEnd = 0, g_nativePrimedAt = 0;
+// QEMU's codec FIFO is 8192 bytes. Keep DMA running over zero-filled memory
+// until that many physical bytes follow the final application byte. This
+// protects codec tails; it is not a claim of speaker/backend completion.
+static constexpr uint32_t NATIVE_IDLE_TRAILER = 8192;
+static constexpr uint32_t NATIVE_WRITE_LEAD = NATIVE_IDLE_TRAILER + FRAG_SIZE;
+static constexpr uint64_t NATIVE_PRIME_NS = 10000000;
+
 
 // Output stream descriptor offset (depends on GCAP)
 static uint32_t g_outStreamBase = 0;
@@ -588,6 +622,7 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
     uint32_t sdBase = g_outStreamBase;
     uint8_t streamTag = 1;
 
+    g_streamConfigured = false;
     // Reset stream
     hda_write32(sdBase + SD_CTL, SD_CTL_SRST);
     BusyWait(10000);
@@ -596,6 +631,7 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
         if (hda_read32(sdBase + SD_CTL) & SD_CTL_SRST) break;
         BusyWait(1000);
     }
+    if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_SRST)) return false;
     hda_write32(sdBase + SD_CTL, 0);
     BusyWait(10000);
     for (int i = 0; i < 100; i++)
@@ -603,6 +639,8 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
         if (!(hda_read32(sdBase + SD_CTL) & SD_CTL_SRST)) break;
         BusyWait(1000);
     }
+
+    if (hda_read32(sdBase + SD_CTL) & SD_CTL_SRST) return false;
 
     // Clear status
     hda_write8(sdBase + SD_STS, SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE);
@@ -612,9 +650,10 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
     hda_write16(sdBase + SD_FMT, fmt);
 
     // Configure DAC: set stream tag and channel
-    HdaCommandNoResp(HdaVerb(g_codecAddr, g_dacNid, VERB_SET_CONV_STREAM,
-                              (streamTag << 4) | 0));
-    HdaCommandNoResp(HdaVerb4(g_codecAddr, g_dacNid, VERB_SET_CONV_FMT, fmt));
+    if (!HdaCommandNoResp(HdaVerb(g_codecAddr, g_dacNid, VERB_SET_CONV_STREAM,
+                                (streamTag << 4) | 0)) ||
+        !HdaCommandNoResp(HdaVerb4(g_codecAddr, g_dacNid, VERB_SET_CONV_FMT, fmt)))
+        return false;
 
     // Set BDL address
     hda_write32(sdBase + SD_BDLPL, static_cast<uint32_t>(g_bdlPhys));
@@ -650,12 +689,14 @@ static bool SetupOutputStream(uint32_t sampleRate, uint8_t channels, uint8_t bit
     return true;
 }
 
-// Start the stream (after setup or buffer update)
+// Start a freshly prepared ring; continuing playback does not call this.
 static void StartOutputStream()
 {
     uint32_t sdBase = g_outStreamBase;
     uint8_t streamTag = 1;
-    g_lastLpib = hda_read32(sdBase + SD_LPIB) % AUDIO_BUF_SIZE;
+    // RUN starts the prepared BDL at zero. In QEMU SRST preserves the previous
+    // LPIB until RUN rises, so reading it here would invent a wrap on restart.
+    g_lastLpib = 0;
     uint32_t ctl = (static_cast<uint32_t>(streamTag) << 20) | SD_CTL_IOCE | SD_CTL_RUN;
     hda_write32(sdBase + SD_CTL, ctl);
 }
@@ -712,6 +753,181 @@ static void ResetPlaybackQueueLocked(bool reconfigure)
     }
 }
 
+// Clocked native path. The driver lock covers one bounded submission and its
+// receipt. No capacity waits, implicit epoch resets or format changes occur.
+static void StopNativePhysicalLocked()
+{
+    if (g_streamRunning) StopOutputStream();
+    g_streamRunning = false;
+    g_streamConfigured = false;
+    g_nativePrimedAt = 0;
+    memset(g_audioBuf, 0, AUDIO_BUF_SIZE);
+}
+static bool StartNativePrimedLocked()
+{
+    const uint64_t before = AudioClockNowNs();
+    // Baseline precedes RUN: a post-RUN read could discard real DMA progress.
+    if (!g_nativeClock.Start(0, before)) {
+        StopNativePhysicalLocked(); return false;
+    }
+    StartOutputStream(); g_streamRunning = true;
+    if (!(hda_read32(g_outStreamBase + SD_CTL) & SD_CTL_RUN)) {
+        g_nativeClock.Fault(); StopNativePhysicalLocked(); return false;
+    }
+    return true;
+}
+static void ObserveNativeLocked()
+{
+    if (!g_nativeClock.running) {
+        if (!g_nativeClock.discontinuity && g_nativeClock.Pending()) {
+            const uint64_t now = AudioClockNowNs();
+            if (!now || now < g_nativePrimedAt) {
+                g_nativeClock.Fault(); StopNativePhysicalLocked();
+            }
+        }
+        return;
+    }
+    const uint64_t before = AudioClockNowNs();
+    const uint32_t raw = hda_read32(g_outStreamBase + SD_LPIB);
+    const uint8_t status = hda_read8(g_outStreamBase + SD_STS);
+    const uint64_t after = AudioClockNowNs();
+    const uint64_t oldCompleted = g_nativeClock.completed;
+    if (!g_nativeClock.Observe(raw == AUDIO_BUF_SIZE ? 0 : raw, before, after,
+                              (status & (SD_STS_FIFOE | SD_STS_DESE)) != 0)) {
+        StopNativePhysicalLocked();
+        return;
+    }
+    // Completed areas become silence before cyclic DMA can visit them again.
+    uint32_t cleared = static_cast<uint32_t>(g_nativeClock.completed - oldCompleted);
+    uint32_t offset = static_cast<uint32_t>((oldCompleted - g_nativeRingBase) % AUDIO_BUF_SIZE);
+    uint32_t first = AUDIO_BUF_SIZE - offset;
+    if (first > cleared) first = cleared;
+    memset(g_audioBuf + offset, 0, first);
+    if (cleared > first) memset(g_audioBuf, 0, cleared - first);
+    if (!g_nativeClock.Pending() && g_nativeClock.completed >= g_nativeLastDataEnd &&
+        g_nativeClock.completed - g_nativeLastDataEnd >= NATIVE_IDLE_TRAILER) {
+        StopNativePhysicalLocked();
+        g_nativeClock.Drained();
+    }
+}
+static bool HdaNativeProgress(AudioDeviceProgress* result)
+{
+    if (!result || !g_initialized) return false;
+    PlayLock();
+    if (!g_nativeMode && !AudioClockNowNs()) { PlayUnlock(); return false; }
+    ObserveNativeLocked();
+    *result = {g_nativeClock.epoch, g_nativeClock.submitted, g_nativeClock.completed,
+               TARGET_QUEUE_BYTES, g_nativeClock.running, g_nativeClock.discontinuity};
+    PlayUnlock();
+    return true;
+}
+static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
+{
+    AudioSubmitReceipt receipt{};
+    if (!g_initialized || !g_dacNid) { receipt.error = -19; return receipt; }
+    if (!samples || !bytes || bytes % AudioDmaClock::FrameBytes) { receipt.error = -22; return receipt; }
+    PlayLock();
+    if (!AudioClockNowNs()) {
+        if (g_nativeMode) { g_nativeClock.Fault(); StopNativePhysicalLocked(); }
+        receipt = {g_nativeClock.epoch, g_nativeClock.submitted, 0, -95};
+        PlayUnlock(); return receipt;
+    }
+    if (__atomic_load_n(&g_legacyActive, __ATOMIC_ACQUIRE)) {
+        receipt.error = -16; PlayUnlock(); return receipt;
+    }
+    if (!g_nativeMode) {
+        if (g_streamConfigured && QueuedBytesLocked()) {
+            receipt.error = -16; PlayUnlock(); return receipt;
+        }
+        if (g_streamRunning) StopOutputStream();
+        g_streamRunning = g_streamConfigured = false;
+        g_nativeMode = true;
+    }
+    ObserveNativeLocked();
+    receipt = {g_nativeClock.epoch, g_nativeClock.submitted, 0, 0};
+    if (g_nativeClock.discontinuity) { receipt.error = -32; PlayUnlock(); return receipt; }
+    if (!g_streamConfigured) {
+        if (!SetupOutputStream(44100, 2, 16)) {
+            g_nativeClock.Fault(); StopNativePhysicalLocked();
+            receipt.error = -5; PlayUnlock(); return receipt;
+        }
+        g_nativeRingBase = g_nativeClock.submitted;
+    }
+    if (!g_nativeClock.Pending() && g_streamRunning) {
+        if (g_nativeClock.completed > ~uint64_t(0) - NATIVE_WRITE_LEAD ||
+            !g_nativeClock.ReserveStart(g_nativeClock.completed + NATIVE_WRITE_LEAD)) {
+            g_nativeClock.Fault(); StopNativePhysicalLocked();
+            receipt.error = -5; PlayUnlock(); return receipt;
+        }
+    }
+    receipt.begin = g_nativeClock.submitted;
+    uint32_t capacity = TARGET_QUEUE_BYTES - g_nativeClock.Pending();
+    if (bytes > capacity) bytes = capacity;
+    bytes -= bytes % AudioDmaClock::FrameBytes;
+    if (!bytes) { PlayUnlock(); return receipt; }
+    const uint32_t offset = static_cast<uint32_t>((g_nativeClock.submitted - g_nativeRingBase) % AUDIO_BUF_SIZE);
+    uint32_t first = AUDIO_BUF_SIZE - offset;
+    if (first > bytes) first = bytes;
+    memcpy(g_audioBuf + offset, samples, first);
+    if (bytes > first) memcpy(g_audioBuf, static_cast<const uint8_t*>(samples) + first, bytes - first);
+#ifdef BROOK_HOST_TEST
+    extern void HdaTestAfterCopy();
+    HdaTestAfterCopy();
+#endif
+    // The software lock does not stop DMA. Publish stores before validating
+    // that hardware could not already have consumed the new interval.
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!g_nativeClock.Accept(bytes)) {
+        g_nativeClock.Fault(); StopNativePhysicalLocked();
+        receipt.error = -5; PlayUnlock(); return receipt;
+    }
+    receipt.accepted = bytes;
+    const uint64_t afterCopy = AudioClockNowNs();
+    bool publishSafe = afterCopy != 0;
+    if (g_streamRunning) {
+        const uint32_t raw = hda_read32(g_outStreamBase + SD_LPIB);
+        const uint64_t afterPosition = AudioClockNowNs();
+        const uint32_t position = raw == AUDIO_BUF_SIZE ? 0 : raw;
+        const uint32_t delta = (position + AUDIO_BUF_SIZE - g_nativeClock.Position()) % AUDIO_BUF_SIZE;
+        publishSafe = publishSafe && position < AUDIO_BUF_SIZE &&
+            afterPosition && afterPosition >= afterCopy && afterPosition >= g_nativeClock.SampleBeforeNs() &&
+            afterPosition - g_nativeClock.SampleBeforeNs() < AudioDmaClock::MaxSampleNs &&
+            g_nativeClock.RawCompleted() <= ~uint64_t(0) - delta &&
+            g_nativeClock.RawCompleted() + delta <= receipt.begin;
+    }
+    if (!publishSafe) {
+        // Some copied samples may have escaped. Charge the interval to this
+        // epoch, but preserve only the pre-copy proven completion watermark.
+        g_nativeClock.Fault(); StopNativePhysicalLocked();
+        receipt.error = -32; PlayUnlock(); return receipt;
+    }
+    g_nativeLastDataEnd = g_nativeClock.submitted;
+    if (!g_streamRunning) {
+        if (!g_nativePrimedAt) g_nativePrimedAt = AudioClockNowNs();
+        // Prime streaming output before starting, but service forces a short
+        // finite tail to start after one mixer interval without another write.
+        if (g_nativeClock.Pending() >= START_QUEUE_BYTES && !StartNativePrimedLocked())
+            receipt.error = -5;
+    }
+    PlayUnlock();
+    return receipt;
+}
+static bool HdaNativeRestart(uint64_t expectedEpoch)
+{
+    PlayLock();
+    if (!g_nativeMode || !g_nativeClock.discontinuity || expectedEpoch != g_nativeClock.epoch) {
+        PlayUnlock(); return false;
+    }
+    StopNativePhysicalLocked();
+    if (!AudioClockNowNs() || !SetupOutputStream(44100, 2, 16)) {
+        StopNativePhysicalLocked(); PlayUnlock(); return false;
+    }
+    const bool restarted = g_nativeClock.Restart(expectedEpoch);
+    if (restarted) { g_nativeRingBase = g_nativeLastDataEnd = g_nativePrimedAt = 0; }
+    PlayUnlock();
+    return restarted;
+}
+
 // ---------------------------------------------------------------------------
 // Public API: play PCM audio
 // ---------------------------------------------------------------------------
@@ -734,6 +950,21 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
     if (byteCount == 0) return 0;
 
     PlayLock();
+    // Legacy format reconfiguration cannot invalidate native receipts.
+    if (g_nativeMode) {
+        ObserveNativeLocked();
+        if (g_nativeClock.discontinuity || g_nativeClock.Pending() || g_nativeClock.running) { PlayUnlock(); return -16; }
+        // A fully drained native timeline can pause while a legacy tone plays.
+        // Its counters survive; the next native setup establishes a new ring base.
+        g_nativeMode = false;
+    }
+
+    if (__atomic_load_n(&g_legacyActive, __ATOMIC_ACQUIRE)) { PlayUnlock(); return -16; }
+    __atomic_store_n(&g_legacyActive, 1u, __ATOMIC_RELEASE);
+    struct LegacyOwner {
+        ~LegacyOwner() { __atomic_store_n(&g_legacyActive, 0u, __ATOMIC_RELEASE); }
+    } legacyOwner;
+    const uint64_t callEpoch = g_legacyEpoch;
 
     // Full stream setup on first call or format change
     bool needSetup = !g_streamConfigured ||
@@ -745,7 +976,7 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
     {
         if (g_streamRunning) StopOutputStream();
         g_streamRunning = false;
-        SetupOutputStream(sampleRate, channels, bitsPerSample);
+        if (!SetupOutputStream(sampleRate, channels, bitsPerSample)) { PlayUnlock(); return -5; }
     }
 
     const uint8_t* src = static_cast<const uint8_t*>(samples);
@@ -753,6 +984,10 @@ extern "C" int HdaPlayPcm(const void* samples, uint32_t byteCount,
 
     while (totalWritten < byteCount)
     {
+        if (callEpoch != g_legacyEpoch) break; // A global stop cancels future writes.
+        if (!g_streamConfigured && !SetupOutputStream(sampleRate, channels, bitsPerSample)) {
+            PlayUnlock(); return totalWritten ? static_cast<int>(totalWritten) : -5;
+        }
         uint32_t queued = QueuedBytesLocked();
         if (g_streamRunning && queued == 0)
         {
@@ -830,6 +1065,7 @@ extern "C" void HdaStop()
     if (!g_initialized) return;
     PlayLock();
     StopOutputStream();
+    ++g_legacyEpoch;
     g_streamRunning = false;
     g_streamConfigured = false;
     g_writeFrag = 0;
@@ -837,6 +1073,7 @@ extern "C" void HdaStop()
     g_submittedBytes = 0;
     g_playedBytes = 0;
     g_lastLpib = 0;
+    if (g_nativeMode) g_nativeClock.Fault();
     // Zero buffer so next open doesn't replay stale data
     memset(g_audioBuf, 0, AUDIO_BUF_SIZE);
     PlayUnlock();
@@ -855,7 +1092,9 @@ extern "C" uint32_t HdaGetPosition()
 {
     if (!g_initialized) return 0;
     PlayLock();
-    uint32_t queued = QueuedBytesLocked();
+    uint32_t queued;
+    if (g_nativeMode) { ObserveNativeLocked(); queued = g_nativeClock.Pending(); }
+    else queued = QueuedBytesLocked();
     PlayUnlock();
     return queued;
 }
@@ -869,6 +1108,17 @@ static void HdaService()
 {
     if (!g_initialized) return;
     PlayLock();
+    if (g_nativeMode) {
+        if (!g_streamRunning && !g_nativeClock.discontinuity && g_nativeClock.Pending()) {
+            const uint64_t now = AudioClockNowNs();
+            if (now && now >= g_nativePrimedAt && now - g_nativePrimedAt >= NATIVE_PRIME_NS)
+                StartNativePrimedLocked();
+        }
+        ObserveNativeLocked(); PlayUnlock(); return;
+    }
+    if (g_streamConfigured && !g_streamRunning && g_submittedBytes > g_playedBytes) {
+        StartOutputStream(); g_streamRunning = true;
+    }
     if (g_streamRunning && QueuedBytesLocked() == 0)
     {
         ResetPlaybackQueueLocked(false);
@@ -1007,6 +1257,9 @@ static int IntelHdaInit()
         HdaIsPlaying,
         HdaGetPosition,
         HdaService,
+        HdaTrySubmit,
+        HdaNativeProgress,
+        HdaNativeRestart,
     };
     AudioRegister(&hdaAudioDriver);
 

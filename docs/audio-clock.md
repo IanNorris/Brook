@@ -133,24 +133,99 @@ pass. Final evidence is under
 `build/workloads/audio-owned-queues-v2-20261018/`; the failed initial reproducer
 is retained under `build/workloads/audio-owned-queues-20261018/`.
 
-Hardware-accepted mixed samples cannot yet be independently retracted or charged
-to contributing streams. GETODELAY still includes the global hardware queue;
-GETOPTR, accurate completion, readiness and drain remain unfinished. Firefox
-normal-launcher audio is not accepted, and ALSA/launcher defaults are unchanged.
+At that checkpoint, hardware-accepted mixed samples could not be independently
+charged to contributing streams and GETODELAY included the global hardware queue.
+The native accounting below supersedes those limitations on supported clocks.
+Independent retraction of already mixed hardware data, GETOPTR and complete drain
+remain unfinished. Firefox normal-launcher audio is not accepted, and
+ALSA/launcher defaults are unchanged.
+
+## Native DMA completion and restart acceptance (18 October)
+
+An optional driver contract now returns bounded native-format submission
+receipts and an epoch-tagged DMA completion watermark. A bounded mixer ledger
+retains each contributing stream's identity and reset generation until hardware
+completion. Hardware acceptance alone no longer frees application capacity;
+GETODELAY charges only that description's queued and in-flight contribution.
+Reset/close/reuse cannot credit a replacement stream with earlier completion.
+Classic poll uses cached per-stream capacity without sleeping driver calls
+under descriptor locks. Format changes with outstanding data return EBUSY.
+
+HDA progress uses LPIB movement, not elapsed time to manufacture completed
+bytes. Clock loss, rollback, device errors, unsafe publication and an ambiguous
+sampling gap preserve the last proven watermark and report discontinuity/EPIPE.
+The elapsed-time guard uses a coherent, ordered KVM pvclock snapshot only when
+both stable-clock feature and runtime flags are present. Unsupported clocks
+retain legacy delivery. Half a nominal ring duration is a conservative sampling
+policy with prefetch margin, not a certified maximum device transfer rate; this
+does not fix or certify Brook's separate ordinary clock reader.
+
+Finite sounds start after a bounded priming interval even below the streaming
+threshold. Physical DMA continues across a zero-filled 8,192-byte trailer before
+stopping, allowing QEMU's codec FIFO to emit the tail. Idle intervals have no
+application owner and cannot advance stream completion. DMA completion is not a
+guarantee that a host backend or speaker has emitted those samples.
+
+The exact-sample capture caught a second restart fault: QEMU preserves old LPIB
+through SRST but resets the prepared BDL position when RUN rises. Reading the
+pre-RUN value as the baseline invented a wrap, prematurely completing every
+other sound. Native and legacy starts now baseline the fresh ring at zero,
+before RUN. The production-driver MMIO harness models these distinct reset
+effects and verifies consecutive starts with nonzero stale positions.
+
+`dsp_short_tail.py` emits 30 stereo sounds of 1, 16, 128, 441 and 1,024 frames,
+each with a distinct final negative marker. A host/guest barrier starts recording
+before releasing the source; all source execution must finish within capture.
+The failed candidate delivered exactly 4,830 of 9,660 nonzero frames. The corrected
+candidate delivers all 9,660 in exact order, with equal stereo channels, in each
+of persistent-open, close/reopen and stream-reset modes. Each job exits zero
+without remaining tasks. This tests complete short-sound delivery, not continuous
+latency or jitter; QEMU capture omits inactive intervals.
+
+The same candidate passes real-syscall ownership and independent-completion
+probes, including paused-stream isolation, short tails, format-change rejection,
+full-queue poll and reset. All 200 ALSA write/sample rounds and cleanup exit zero.
+A three-second sustained capture contains 132,502 PCM frames (3.00458 seconds),
+RMS 0.043218 and no entirely silent analysis bins. The subsequent two-second idle
+capture has zero frames. These are playback smoke checks, not glitch-free timing
+or Firefox acceptance. The ALSA file-over-null route still reports zero delay
+while its actual DSP descriptor has queued data, so its clock mismatch remains.
+
+Evidence: `build/workloads/hda-ledger-idle-v3-20261018/`, frozen kernel
+`d00f816bd224a614adc67dadd9a4f01fbaa528133fb4c74cf46d00bf50816984`,
+eight CPUs, 4 GiB RAM, silent host backend. The alternating-loss baseline is
+retained in `hda-ledger-idle-v2-20261018/gated2-tail-persistent/`. The corrected
+VM returns to ten tasks; checked shutdown, launcher exit zero, serial/device
+checks and all three offline filesystem checks pass. Two-pass release build,
+supported compiled-entry audit and all 34 hosted suites pass in
+`build/hda-restart-build-20261018.log`. Host stress tests ran before VM launch
+to avoid contaminating playback measurements.
+
+The expanded HDA module also exposed the loader's fixed 64-section metadata
+array. Validated ELF section metadata now uses a bounded heap allocation instead
+of a compiler-dependent section limit or large stack array. Table bounds reject
+overflow/truncation, allocation failures fail cleanly, and the invalid-symbol-table
+return frees its allocated pages. Hosted tests cover header boundaries and metadata
+lifetime; the VM verifies actual module load. This is not a full ELF-loader audit:
+extended section numbering, the module registry limit and image-size policy remain
+separate work. The optional driver interface requires module ABI 16 and a complete
+matching module rebuild.
 
 
 ## Clocked OSS endpoint before enabling the ALSA OSS plugin
 
-Review with Astra identified these required integration steps:
+Review with Astra identified the following integration requirements. The native
+receipt, completion, discontinuity and short-tail prerequisites now have the
+coverage above; full OSS geometry, pointer, readiness and drain acceptance remain:
 
 - Preserve the independently owned FIFO and serialized safe-staging foundation
   above while adding hardware accounting; do not reintroduce shared ownership.
 - Account for accepted, hardware-committed and completed frames, including a
   pending delivery batch and partial/error driver writes. Track contributing
   stream generations through hardware completion.
-- Expose trustworthy HDA progress and discontinuities. Current counters reset
-  on recovery, cyclic LPIB polling can miss a complete wrap, and short sounds
-  below the current 8,192-byte start threshold need explicit drain/start handling.
+- Preserve observable HDA progress and discontinuities across recovery; reject
+  ambiguous cyclic LPIB polling gaps and start short finite sounds below the
+  8,192-byte streaming threshold without requiring another writer call.
 - Derive GETOPTR, GETODELAY, GETOSPACE, readiness and interruptible SYNC from
   consistent accounting. Implement stream-local trigger/reset/close and exact
   supported fragment geometry. Do not call sleeping HDA operations under mixer

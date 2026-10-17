@@ -218,15 +218,23 @@ void ownedQueues() {
 }
 
 }
+int RunHdaClockTests();
+int RunMixerClockTests();
+brook::AudioSubmitReceipt TestMixerNativeSubmit(const void*,uint32_t);
+bool TestMixerNativeProgress(brook::AudioDeviceProgress*);
+bool TestMixerNativeRestart(uint64_t);
 int main() {
     brook::AudioMixerInit();
-    const brook::AudioDriver driver{"test",play,stop,nullptr,nullptr,nullptr};
+    const brook::AudioDriver driver{"test",play,stop,nullptr,nullptr,nullptr,
+        TestMixerNativeSubmit,TestMixerNativeProgress,TestMixerNativeRestart};
     CHECK(brook::AudioRegister(&driver));
     primary=brook::AudioMixerOpen();secondary=brook::AudioMixerOpen();
     CHECK(primary && secondary && primary!=secondary);
     // The baseline must fail cleanly on lost partial data before concurrency.
     if(!partialAndErrors())return 1;
     concurrentFlush();stopInvalidatesSuffix();ringAndClamping();ownedQueues();
+    failures+=RunHdaClockTests();
+    failures+=RunMixerClockTests();
     std::printf("AUDIO_DELIVERY %s\n",failures?"FAIL":"PASS");
     return failures?1:0;
 }

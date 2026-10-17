@@ -7,7 +7,11 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "mem_tag.h"
+#ifdef BROOK_HOST_TEST
+#include <cstring>
+#else
 #include "string.h"
+#endif
 
 namespace brook {
 
@@ -69,7 +73,16 @@ struct LoadedSection {
     uint64_t base;   // virtual address of loaded section (0 = not loaded)
 };
 
-static constexpr uint32_t MAX_SECTIONS = 64;
+// The ELF header bounds count to 16 bits. Allocate only the validated table's
+// metadata, avoiding a compiler-dependent fixed section count and kernel stack use.
+struct SectionMappings {
+    LoadedSection* data;
+    explicit SectionMappings(uint32_t count)
+        : data(static_cast<LoadedSection*>(kmalloc(uint64_t(count) * sizeof(LoadedSection)))) {}
+    ~SectionMappings() { kfree(data); }
+    SectionMappings(const SectionMappings&) = delete;
+    SectionMappings& operator=(const SectionMappings&) = delete;
+};
 
 static bool ValidateElf(const uint8_t* data, uint64_t size)
 {
@@ -103,17 +116,12 @@ static bool ValidateElf(const uint8_t* data, uint64_t size)
         SerialPuts("module: not x86-64\n");
         return false;
     }
-    if (ehdr->e_shnum > MAX_SECTIONS)
-    {
-        SerialPrintf("module: too many sections (%u)\n", ehdr->e_shnum);
-        return false;
-    }
-    // Validate section header table fits within buffer.
-    uint64_t shEnd = static_cast<uint64_t>(ehdr->e_shoff) +
-                     static_cast<uint64_t>(ehdr->e_shnum) * sizeof(Elf64_Shdr);
-    if (shEnd > size || ehdr->e_shoff >= size)
-    {
-        SerialPuts("module: section header table out of bounds\n");
+    // Extended section numbering is unsupported. Validate with subtraction
+    // before allocating or forming pointers, including a wrapping e_shoff.
+    if (!ehdr->e_shnum || ehdr->e_shentsize != sizeof(Elf64_Shdr) ||
+        ehdr->e_shoff > size ||
+        ehdr->e_shnum > (size - ehdr->e_shoff) / sizeof(Elf64_Shdr)) {
+        SerialPuts("module: invalid section header table\n");
         return false;
     }
     return true;
@@ -317,6 +325,11 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
         return false;
     }
 
+    SectionMappings mappings(shnum);
+    if (!mappings.data) { SerialPuts("module: section metadata allocation failed\n"); return false; }
+    LoadedSection* secs = mappings.data;
+    for (uint32_t i = 0; i < shnum; ++i) secs[i].base = 0;
+
     uint64_t pageCount = (totalSize + 4095) / 4096;
     // VMM_WRITABLE | VMM_EXEC (exec flag = 0 currently means executable since
     // the kernel's VMM doesn't set NX by default)
@@ -329,8 +342,6 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
     ModZero(reinterpret_cast<void*>(baseVirt), pageCount * 4096);
 
     // ---- Pass 2: place sections ----
-    LoadedSection secs[MAX_SECTIONS];
-    for (uint32_t i = 0; i < MAX_SECTIONS; ++i) secs[i].base = 0;
     uint64_t cursor = baseVirt;
 
     for (uint32_t i = 0; i < shnum; ++i)
@@ -367,6 +378,7 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
                 shdrs[i].sh_size > size - shdrs[i].sh_offset)
             {
                 SerialPuts("module: symtab section out of bounds\n");
+                VmmFreePages(VirtualAddress(baseVirt), pageCount);
                 return false;
             }
             symtab   = reinterpret_cast<const Elf64_Sym*>(data + shdrs[i].sh_offset);

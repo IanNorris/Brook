@@ -13,6 +13,27 @@
 
 namespace brook {
 
+// Native clocked submission: all byte watermarks describe 44.1k stereo S16.
+// A receipt is one bounded, nonblocking interval in one hardware epoch.
+// A nonzero accepted count plus error marks exposed data with uncertain delivery;
+// only the terminal progress watermark may credit its completion.
+struct AudioSubmitReceipt {
+    uint64_t epoch = 0;
+    uint64_t begin = 0;
+    uint32_t accepted = 0;
+    int error = 0;
+};
+// Device watermarks include unowned zero-filled physical intervals. Completion
+// can pass the last submitted application byte while DMA drains over silence.
+struct AudioDeviceProgress {
+    uint64_t epoch = 0;
+    uint64_t submitted = 0;
+    uint64_t completed = 0;
+    uint32_t capacity = 0;
+    bool running = false;
+    bool discontinuity = false;
+};
+
 struct AudioDriver {
     const char* name;
 
@@ -34,7 +55,17 @@ struct AudioDriver {
     // Periodic maintenance, including draining an idle DMA queue. Called in
     // thread context even when applications have stopped submitting samples.
     void (*service)() = nullptr;
+
+    // Optional native clock contract. Snapshot returns false if no trustworthy
+    // elapsed-time source exists. Terminal completion/fault stays observable
+    // until explicit epoch restart; new submissions reject a latched fault.
+    AudioSubmitReceipt (*trySubmit)(const void*, uint32_t) = nullptr;
+    bool (*progress)(AudioDeviceProgress*) = nullptr;
+    bool (*restart)(uint64_t expectedEpoch) = nullptr;
 };
+
+// Zero means no trustworthy elapsed-time source (legacy playback still works).
+extern "C" uint64_t AudioClockNowNs();
 
 // Register an audio driver.  Only one can be active at a time.
 extern "C" bool AudioRegister(const AudioDriver* drv);
@@ -65,6 +96,19 @@ AudioStreamId AudioMixerOpen();
 bool AudioMixerClose(AudioStreamId stream);
 bool AudioMixerReset(AudioStreamId stream);
 bool AudioMixerSetEnabled(AudioStreamId stream, bool enabled);
+
+struct AudioStreamProgress {
+    uint64_t epoch = 0;
+    uint64_t submittedFrames = 0;
+    uint64_t completedFrames = 0;
+    uint32_t queuedFrames = 0;
+    bool clocked = false;
+    bool discontinuity = false;
+};
+// Refresh calls the driver without the mixer lock. GetProgress reads cached
+// accounting only and is safe for descriptor scans that cannot sleep.
+void AudioMixerRefresh();
+bool AudioMixerGetProgress(AudioStreamId stream, AudioStreamProgress* result);
 
 // Submit pre-resampled 44100/stereo/16-bit PCM into this stream's FIFO.
 // Returns the number of frames actually accepted; callers must retry the rest.

@@ -35,6 +35,7 @@ static constexpr uint32_t KVM_FEATURE_CLOCKSOURCE2 = (1u << 3);
 
 static volatile PvClockVcpuTimeInfo* g_pvti = nullptr;
 static bool g_enabled = false;
+static bool g_stableFeature = false;
 
 static inline void Cpuid(uint32_t leaf, uint32_t sub,
                          uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d)
@@ -91,6 +92,7 @@ bool KvmClockInit()
 
     // Write MSR: bit 0 = enable, bits 63..1 = physical address (4-byte aligned).
     WriteMsr(MSR_KVM_SYSTEM_TIME_NEW, phys.raw() | 1ULL);
+    g_stableFeature = (features & (1u << 24)) != 0;
     g_enabled = true;
 
     // Do a throwaway read so we can log something useful.
@@ -138,6 +140,48 @@ uint64_t KvmClockReadNs()
 
     unsigned __int128 p = static_cast<unsigned __int128>(delta) * mul;
     return sys_t + static_cast<uint64_t>(p >> 32);
+}
+
+static uint64_t OrderedTsc()
+{
+#ifdef BROOK_HOST_TEST
+    extern uint64_t KvmClockTestTsc();
+    return KvmClockTestTsc();
+#else
+    uint32_t low, high;
+    __asm__ volatile("lfence; rdtsc; lfence" : "=a"(low), "=d"(high) :: "memory");
+    return uint64_t(low) | (uint64_t(high) << 32);
+#endif
+}
+bool KvmClockReadStableNs(uint64_t* result)
+{
+    if (!result || !g_enabled || !g_pvti || !g_stableFeature) return false;
+    for (uint32_t attempt = 0; attempt < 32; ++attempt) {
+        const uint32_t first = __atomic_load_n(&g_pvti->version, __ATOMIC_ACQUIRE);
+        if (first & 1) { __asm__ volatile("pause"); continue; }
+        const uint64_t timestamp = g_pvti->tsc_timestamp;
+        const uint64_t base = g_pvti->system_time;
+        const uint32_t multiplier = g_pvti->tsc_to_system_mul;
+        const int shift = g_pvti->tsc_shift;
+        const uint8_t flags = g_pvti->flags;
+        // Sample TSC inside the validated snapshot, with CPU and compiler
+        // ordering on both sides. A concurrent hypervisor update retries all.
+        const uint64_t tsc = OrderedTsc();
+        const uint32_t second = __atomic_load_n(&g_pvti->version, __ATOMIC_ACQUIRE);
+        if (first != second || (second & 1)) continue;
+        if (!(flags & 1) || !multiplier || tsc < timestamp || shift < -63 || shift > 63) return false;
+        uint64_t delta = tsc - timestamp;
+        if (shift < 0) delta >>= -shift;
+        else if (shift > 0) {
+            if (delta > (~uint64_t(0) >> shift)) return false;
+            delta <<= shift;
+        }
+        const uint64_t elapsed = static_cast<uint64_t>((static_cast<unsigned __int128>(delta) * multiplier) >> 32);
+        if (base > ~uint64_t(0) - elapsed) return false;
+        *result = base + elapsed;
+        return true;
+    }
+    return false;
 }
 
 } // namespace brook

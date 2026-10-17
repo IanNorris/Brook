@@ -157,6 +157,18 @@
   quits also left child tasks behind; preserve that cleanup failure and the
   recovered virtio-blk timeout from this run before reusing any candidate.
   Chromium's previously accepted ALSA-to-OSS output works after pause/resume.
+- Native HDA receipt/completion accounting now passes exact short-sound captures
+  across persistent opens, close/reopen and reset, plus independent stream delay
+  and classic poll backpressure. Finish GETOPTR, interruptible SYNC/drain, exact
+  supported fragment geometry and DSP epoll before enabling the ALSA OSS plugin.
+  Preserve explicit discontinuity reporting and unsupported-clock behavior. The
+  conservative half-ring sampling guard is not a formal maximum transfer-rate
+  proof. See `audio-clock.md`; Firefox normal-launcher audio is still open.
+- Fresh-build diagnostics: `scripts/build.sh` currently prints success after a
+  hosted configure/build failure. Make required hosted failures propagate, with
+  an explicit opt-out if kernel-only builds need to remain supported. An early
+  module-test fixture compile failure exposed this; the final audio checkpoint
+  uses an explicit full ctest gate and passes all 34 suites.
 - Fix kernel-symbol table generation on incremental/fresh builds: the current
   post-link generator writes addresses for the next link. Chromium's preserved
   panic labeled RIP `0xffffffff800af838` as KRwLockReadLock, while the exact

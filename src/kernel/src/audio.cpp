@@ -15,10 +15,19 @@
 #include "scheduler.h"
 #include "process.h"
 #include "apic.h"
+#include "kvmclock.h"
 
 namespace brook {
 
 extern volatile uint64_t g_lapicTickCount;
+
+extern "C" uint64_t AudioClockNowNs()
+{
+    // Delivered LAPIC ticks can undercount a CPU stall. Do not present that
+    // fallback as a bound on elapsed DMA time. Add a hardware clock separately.
+    uint64_t now = 0;
+    return KvmClockReadStableNs(&now) ? now : 0;
+}
 
 static const AudioDriver* g_audioDriver = nullptr;
 static SpinLock g_mixerLock;
@@ -33,6 +42,9 @@ struct MixerStream {
     uint64_t epoch = 0;
     uint64_t read = 0, write = 0;
     bool enabled = true;
+    uint64_t submittedFrames = 0, completedFrames = 0;
+    uint32_t inFlight = 0;
+    bool discontinuity = false;
 };
 static MixerStream g_streams[MIXER_MAX_STREAMS];
 static uint64_t g_nextStreamIdentity = 1;
@@ -51,6 +63,19 @@ struct Contribution {
 static uint8_t g_partialFrame[MIXER_FRAME_BYTES];
 static uint32_t g_partialOffset = 0;
 static Contribution g_partialContributions[MIXER_MAX_STREAMS];
+static constexpr uint32_t COMPLETION_SLOTS = 128;
+struct Completion {
+    AudioSubmitReceipt receipt{};
+    uint32_t credited = 0;
+    Contribution parts[MIXER_MAX_STREAMS]{};
+};
+static Completion g_completions[COMPLETION_SLOTS];
+static uint32_t g_completionHead = 0, g_completionCount = 0;
+enum class DriverMode { Unknown, Legacy, Native };
+static DriverMode g_driverMode = DriverMode::Unknown; // flush owner only
+static uint64_t g_hardwareEpoch = 0;
+static bool g_clockSupported = false; // mixer lock
+
 
 static MixerStream* FindStream(AudioStreamId identity)
 {
@@ -63,6 +88,8 @@ static void ResetStream(MixerStream& stream)
 {
     ++stream.epoch;
     stream.read = stream.write = 0;
+    stream.submittedFrames = stream.completedFrames = stream.inFlight = 0;
+    stream.discontinuity = false;
 }
 static void ResetAllStreams()
 {
@@ -87,6 +114,7 @@ void AudioMixerInit()
 }
 AudioStreamId AudioMixerOpen()
 {
+    AudioMixerRefresh();
     SpinLockAcquire(&g_mixerLock);
     AudioStreamId identity = 0;
     if (g_mixerReady && g_nextStreamIdentity <= (~uint64_t(0) >> 4)) {
@@ -129,7 +157,7 @@ uint32_t AudioMixerAvailableFrames(AudioStreamId identity)
 {
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
-    uint32_t available = stream ? MIXER_RING_FRAMES - static_cast<uint32_t>(stream->write - stream->read) : 0;
+    uint32_t available = stream && !stream->discontinuity ? MIXER_RING_FRAMES - static_cast<uint32_t>(stream->write - stream->read) - stream->inFlight : 0;
     SpinLockRelease(&g_mixerLock);
     return available;
 }
@@ -138,8 +166,8 @@ uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frames, AudioStreamId
     if (!samples || !frames) return 0;
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
-    if (!stream) { SpinLockRelease(&g_mixerLock); return 0; }
-    const uint32_t available = MIXER_RING_FRAMES - static_cast<uint32_t>(stream->write - stream->read);
+    if (!stream || stream->discontinuity) { SpinLockRelease(&g_mixerLock); return 0; }
+    const uint32_t available = MIXER_RING_FRAMES - static_cast<uint32_t>(stream->write - stream->read) - stream->inFlight;
     if (frames > available) frames = available;
     // Empty queues may restart their indices, avoiding lifetime counter wrap.
     if (stream->read == stream->write) stream->read = stream->write = 0;
@@ -148,11 +176,15 @@ uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frames, AudioStreamId
         stream->samples[index * 2] = samples[i * 2];
         stream->samples[index * 2 + 1] = samples[i * 2 + 1];
     }
+    if (stream->submittedFrames > ~uint64_t(0) - frames) {
+        stream->discontinuity = true; SpinLockRelease(&g_mixerLock); return 0;
+    }
     stream->write += frames;
+    stream->submittedFrames += frames;
     SpinLockRelease(&g_mixerLock);
     return frames;
 }
-static void Consume(const Contribution* contributions, uint32_t frames)
+static void Consume(const Contribution* contributions, uint32_t frames, bool clocked = false)
 {
     for (uint32_t i = 0; i < MIXER_MAX_STREAMS; ++i) {
         const auto& part = contributions[i];
@@ -160,6 +192,7 @@ static void Consume(const Contribution* contributions, uint32_t frames)
         if (!stream || stream->epoch != part.epoch || stream->read != part.read) continue;
         uint32_t consumed = frames < part.frames ? frames : part.frames;
         stream->read += consumed;
+        if (clocked) stream->inFlight += consumed;
     }
 }
 // Snapshot a new whole-frame attempt. Rebuilding unaccepted frames removes
@@ -168,14 +201,14 @@ static uint32_t Prepare(Contribution* contributions)
 {
     uint32_t frames = 0;
     for (const auto& stream : g_streams)
-        if (stream.identity && stream.enabled && stream.write - stream.read > frames)
+        if (stream.identity && stream.enabled && !stream.discontinuity && stream.write - stream.read > frames)
             frames = static_cast<uint32_t>(stream.write - stream.read);
     if (frames > MIXER_BATCH_FRAMES) frames = MIXER_BATCH_FRAMES;
     if (g_batchRemaining && frames > g_batchRemaining) frames = g_batchRemaining;
     g_batchRemaining = frames;
     for (uint32_t slot = 0; slot < MIXER_MAX_STREAMS; ++slot) {
         const auto& stream = g_streams[slot];
-        if (!stream.identity || !stream.enabled) continue;
+        if (!stream.identity || !stream.enabled || stream.discontinuity) continue;
         uint32_t count = static_cast<uint32_t>(stream.write - stream.read);
         if (count > frames) count = frames;
         contributions[slot] = {stream.identity, stream.epoch, stream.read, count};
@@ -196,12 +229,102 @@ static uint32_t Prepare(Contribution* contributions)
     }
     return frames;
 }
+// The sole flush owner owns the bounded completion ledger. Reserve before
+// submitting; hardware acceptance can never outrun its ownership metadata.
+static void Reconcile(const AudioDeviceProgress& device)
+{
+    SpinLockAcquire(&g_mixerLock);
+    for (uint32_t n = 0; n < g_completionCount; ++n) {
+        auto& entry = g_completions[(g_completionHead + n) % COMPLETION_SLOTS];
+        const uint32_t total = entry.receipt.accepted / MIXER_FRAME_BYTES;
+        const bool sameEpoch = entry.receipt.epoch == device.epoch;
+        uint32_t proven = 0;
+        if (sameEpoch && device.completed > entry.receipt.begin) {
+            const uint64_t frames = (device.completed - entry.receipt.begin) / MIXER_FRAME_BYTES;
+            proven = frames < total ? static_cast<uint32_t>(frames) : total;
+        }
+        // A backwards snapshot is not new completion evidence.
+        if (proven < entry.credited) proven = entry.credited;
+        const bool lost = !sameEpoch || device.discontinuity;
+        for (const auto& part : entry.parts) {
+            auto* stream = FindStream(part.identity);
+            if (!stream || stream->epoch != part.epoch) continue;
+            const uint32_t before = entry.credited < part.frames ? entry.credited : part.frames;
+            const uint32_t after = proven < part.frames ? proven : part.frames;
+            stream->inFlight -= after - before;
+            stream->completedFrames += after - before;
+            if (lost && part.frames > after) {
+                stream->inFlight -= part.frames - after;
+                stream->discontinuity = true;
+            }
+        }
+        entry.credited = lost ? total : proven;
+    }
+    while (g_completionCount) {
+        auto& entry = g_completions[g_completionHead];
+        if (entry.credited != entry.receipt.accepted / MIXER_FRAME_BYTES) break;
+        g_completionHead = (g_completionHead + 1) % COMPLETION_SLOTS;
+        --g_completionCount;
+    }
+    SpinLockRelease(&g_mixerLock);
+}
+static void RefreshDevice(uint64_t epoch)
+{
+    if (g_flushEpoch != epoch) {
+        g_batchRemaining = g_partialOffset = g_completionHead = g_completionCount = 0;
+        g_driverMode = DriverMode::Unknown;
+        g_flushEpoch = epoch;
+    }
+    if (!g_audioDriver || g_driverMode == DriverMode::Legacy) return;
+    AudioDeviceProgress device{};
+    const bool supported = g_audioDriver->trySubmit && g_audioDriver->progress && g_audioDriver->restart &&
+                           g_audioDriver->progress(&device);
+    if (__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE) != epoch) return;
+    if (!supported) {
+        if (g_driverMode == DriverMode::Native) {
+            // Previously clocked data cannot silently switch to an unclocked
+            // path. Preserve only already proven completion and report loss.
+            device.epoch = g_hardwareEpoch; device.discontinuity = true;
+            Reconcile(device);
+            return;
+        }
+        g_driverMode = DriverMode::Legacy;
+        SerialPuts("audio: native DMA clock unavailable; using legacy delivery\n");
+        SpinLockAcquire(&g_mixerLock); g_clockSupported = false; SpinLockRelease(&g_mixerLock);
+        return;
+    }
+    if (g_driverMode != DriverMode::Native) SerialPuts("audio: native DMA completion accounting enabled\n");
+    g_driverMode = DriverMode::Native;
+    g_hardwareEpoch = device.epoch;
+    SpinLockAcquire(&g_mixerLock); g_clockSupported = true; SpinLockRelease(&g_mixerLock);
+    Reconcile(device);
+    // The terminal snapshot was reconciled before retiring this epoch. A failed
+    // restart leaves the driver's fault and its last proven watermark latched.
+    if (device.discontinuity) g_audioDriver->restart(device.epoch);
+}
+void AudioMixerRefresh()
+{
+    if (__atomic_exchange_n(&g_flushBusy, 1u, __ATOMIC_ACQUIRE)) return;
+    RefreshDevice(__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE));
+    __atomic_store_n(&g_flushBusy, 0u, __ATOMIC_RELEASE);
+}
+bool AudioMixerGetProgress(AudioStreamId identity, AudioStreamProgress* result)
+{
+    if (!result) return false;
+    SpinLockAcquire(&g_mixerLock);
+    auto* stream = FindStream(identity);
+    if (stream) *result = {stream->epoch, stream->submittedFrames, stream->completedFrames,
+        static_cast<uint32_t>(stream->write - stream->read) + stream->inFlight,
+        g_clockSupported, stream->discontinuity};
+    SpinLockRelease(&g_mixerLock);
+    return stream != nullptr;
+}
 void AudioMixerFlush()
 {
     if (__atomic_exchange_n(&g_flushBusy, 1u, __ATOMIC_ACQUIRE)) return;
     struct FlushOwner { ~FlushOwner() { __atomic_store_n(&g_flushBusy, 0u, __ATOMIC_RELEASE); } } owner;
     const uint64_t epoch = __atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE);
-    if (g_flushEpoch != epoch) { g_batchRemaining = g_partialOffset = 0; g_flushEpoch = epoch; }
+    RefreshDevice(epoch);
     Contribution contributions[MIXER_MAX_STREAMS]{};
     const bool partial = g_partialOffset != 0;
     SpinLockAcquire(&g_mixerLock);
@@ -213,6 +336,30 @@ void AudioMixerFlush()
     if (!partial && !frames) return;
     if (__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE) != epoch) {
         g_batchRemaining = g_partialOffset = 0; return;
+    }
+    if (g_driverMode == DriverMode::Native) {
+        if (g_completionCount == COMPLETION_SLOTS) return;
+        const auto receipt = g_audioDriver->trySubmit(g_flushBuf, frames * MIXER_FRAME_BYTES);
+        if (__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE) != epoch) return;
+        if (!receipt.accepted) return;
+        if (receipt.accepted > frames * MIXER_FRAME_BYTES || receipt.accepted % MIXER_FRAME_BYTES ||
+            receipt.begin % MIXER_FRAME_BYTES) {
+            SerialPuts("audio: invalid native receipt\n");
+            AudioStop(); return;
+        }
+        const uint32_t acceptedFrames = receipt.accepted / MIXER_FRAME_BYTES;
+        SpinLockAcquire(&g_mixerLock);
+        auto& entry = g_completions[(g_completionHead + g_completionCount) % COMPLETION_SLOTS];
+        entry.receipt = receipt; entry.credited = 0;
+        for (uint32_t i = 0; i < MIXER_MAX_STREAMS; ++i) {
+            entry.parts[i] = contributions[i];
+            if (entry.parts[i].frames > acceptedFrames) entry.parts[i].frames = acceptedFrames;
+        }
+        ++g_completionCount;
+        Consume(contributions, acceptedFrames, true);
+        g_batchRemaining -= acceptedFrames;
+        SpinLockRelease(&g_mixerLock);
+        return;
     }
     const uint32_t bytes = partial ? MIXER_FRAME_BYTES - g_partialOffset : frames * MIXER_FRAME_BYTES;
     const void* data = partial ? static_cast<const void*>(g_partialFrame + g_partialOffset) : g_flushBuf;

@@ -20,4 +20,9 @@ bool KvmClockAvailable();
 // PVCLOCK_TSC_STABLE_BIT flag) produce consistent results across CPUs.
 uint64_t KvmClockReadNs();
 
+// Bounded coherent read for consumers that require cross-CPU elapsed-time
+// bounds. Requires both CPUID stable-clock capability and the snapshot flag.
+// Failure leaves *result unchanged; there is no delivered-tick fallback.
+bool KvmClockReadStableNs(uint64_t* result);
+
 } // namespace brook

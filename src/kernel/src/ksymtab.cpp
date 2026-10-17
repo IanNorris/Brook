@@ -180,6 +180,7 @@ EXPORT_SYMBOL(NetWakePollThread);
 
 // Audio
 EXPORT_SYMBOL(AudioRegister);
+EXPORT_SYMBOL(AudioClockNowNs);
 
 // C runtime support (compiler may emit calls to these)
 extern "C" void* memcpy(void* dest, const void* src, uint64_t n);
