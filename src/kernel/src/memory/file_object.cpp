@@ -6,12 +6,16 @@
 #include "string.h"
 #include "panic.h"
 #include "spinlock.h"
+#include "user_copy.h"
 #ifndef BROOK_HOST_TEST
 #include "process.h"
 #include "scheduler.h"
 #endif
 
 namespace brook {
+#ifdef BROOK_HOST_USER_COPY_TEST
+bool FileObjectHostUserPointer(const void*);
+#endif
 struct FileObjectPage {
     uint64_t index;
     PhysicalAddress physical;
@@ -38,6 +42,11 @@ struct Gate {
     FileObject* object;
     explicit Gate(FileObject* value):object(value) { KMutexLock(&object->gate); }
     ~Gate() { KMutexUnlock(&object->gate); }
+};
+struct OffsetGate {
+    FileObject* object;
+    explicit OffsetGate(FileObject* value):object(value) { KMutexLock(&object->ioOffsetGate); }
+    ~OffsetGate() { KMutexUnlock(&object->ioOffsetGate); }
 };
 void RequireGate(FileObject* object) {
 #ifndef BROOK_HOST_TEST
@@ -67,10 +76,26 @@ void Overlay(FileObject* object,uint64_t offset,void* buffer,uint64_t length,boo
     }
 }
 bool UserPointer(const void* pointer) {
-#ifdef BROOK_HOST_TEST
+#ifdef BROOK_HOST_USER_COPY_TEST
+    return FileObjectHostUserPointer(pointer);
+#elif defined(BROOK_HOST_TEST)
     (void)pointer;return false;
 #else
     return reinterpret_cast<uint64_t>(pointer)<0x0000800000000000ULL;
+#endif
+}
+uint64_t CopyOut(void* destination,const void* source,uint64_t length) {
+#if !defined(BROOK_HOST_TEST) || defined(BROOK_HOST_USER_COPY_TEST)
+    return CopyToUserBytes(reinterpret_cast<uint64_t>(destination),source,length);
+#else
+    memcpy(destination,source,length);return length;
+#endif
+}
+uint64_t CopyIn(void* destination,const void* source,uint64_t length) {
+#if !defined(BROOK_HOST_TEST) || defined(BROOK_HOST_USER_COPY_TEST)
+    return CopyFromUserBytes(destination,reinterpret_cast<uint64_t>(source),length);
+#else
+    memcpy(destination,source,length);return length;
 #endif
 }
 int ReadResident(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset) {
@@ -100,7 +125,7 @@ void FileObjectInit(FileObject* object) {
     static uint64_t nextIdentity;
     object->recordLocks.lock.next=object->recordLocks.lock.serving=0;
     object->recordLocks.head=nullptr;
-    KMutexInit(&object->gate);object->generation=1;
+    KMutexInit(&object->gate);KMutexInit(&object->ioOffsetGate);object->generation=1;
     object->mappingError=0;object->privateValidPrefix=~uint64_t{0};
     object->orderId=__atomic_add_fetch(&nextIdentity,1,__ATOMIC_RELAXED);
     if(!object->orderId)KernelPanic("file object: ordering identity exhausted");
@@ -196,6 +221,7 @@ MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t
 }
 int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,uint64_t* offset) {
     [[maybe_unused]] Operation operation;
+    OffsetGate offsetHeld(object);
     if(!length || !UserPointer(buffer))return ReadResident(object,vnode,buffer,length,offset);
     constexpr uint64_t maximum=64*1024;
     uint64_t capacity=length<maximum?length:maximum;
@@ -203,16 +229,20 @@ int FileObjectRead(FileObject* object,Vnode* vnode,void* buffer,uint64_t length,
     uint64_t done=0;int result=0;
     while(done<length) {
         uint64_t count=length-done;if(count>capacity)count=capacity;
-        result=ReadResident(object,vnode,bounce,count,offset);
+        uint64_t position=*offset;
+        result=ReadResident(object,vnode,bounce,count,&position);
         if(result<=0)break;
         // Copyout may fault/CoW. The file gate and filesystem locks are gone.
-        memcpy(static_cast<uint8_t*>(buffer)+done,bounce,static_cast<uint64_t>(result));
-        done+=static_cast<uint64_t>(result);if(static_cast<uint64_t>(result)<count)break;
+        const uint64_t copied=CopyOut(static_cast<uint8_t*>(buffer)+done,bounce,static_cast<uint64_t>(result));
+        *offset+=copied;done+=copied;
+        if(copied<static_cast<uint64_t>(result)) { result=-14;break; }
+        if(static_cast<uint64_t>(result)<count)break;
     }
     kfree(bounce);return done?static_cast<int>(done):result;
 }
 int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t length,uint64_t* offset) {
     [[maybe_unused]] Operation operation;
+    OffsetGate offsetHeld(object);
     if(!length || !UserPointer(buffer))return WriteResident(object,vnode,buffer,length,offset);
     constexpr uint64_t maximum=64*1024;
     uint64_t capacity=length<maximum?length:maximum;
@@ -221,8 +251,9 @@ int FileObjectWrite(FileObject* object,Vnode* vnode,const void* buffer,uint64_t 
     while(done<length) {
         uint64_t count=length-done;if(count>capacity)count=capacity;
         // Copyin can fault on this file itself, so it precedes the file gate.
-        memcpy(bounce,static_cast<const uint8_t*>(buffer)+done,count);
-        result=WriteResident(object,vnode,bounce,count,offset);
+        const uint64_t copied=CopyIn(bounce,static_cast<const uint8_t*>(buffer)+done,count);
+        if(!copied) { result=-14;break; }
+        result=WriteResident(object,vnode,bounce,copied,offset);
         if(result<=0)break;
         done+=static_cast<uint64_t>(result);if(static_cast<uint64_t>(result)<count)break;
     }
@@ -232,6 +263,7 @@ int FileObjectAppend(FileObject* object,Vnode* vnode,const void* buffer,uint64_t
     [[maybe_unused]] Operation operation;
     if(!length)return 0;
     if(UserPointer(buffer))return -22; // Never fault/copy user memory under gate.
+    OffsetGate offsetHeld(object);
     Gate held(object);
     if(object->mappingError)return object->mappingError;
     VnodeStat stat{};int result=vnode->ops->stat(vnode,&stat);

@@ -892,6 +892,20 @@ after the last registration while reporting the error. All 30 hosted suites and
 production kernel/module checks pass; filesystem integration and guest failure
 injection are still required before enabling mapped resize.
 
+The checked-copy primitive now has exact-instruction REP fixups and bounded
+progress-aware retries, with protected regular-file staging and partial-offset
+commit. The new hosted assembly test brings the suite to 31; root test-kernel
+mapping races pass 13/13. This does not close raw user-pointer access across the
+kernel or enable mapped resize. See `user-copy.md` for migrated callers and gaps.
+
+Register-return testing now has a native assembly workload with exact user RSP,
+red-zone canaries, GPR/flags and vector/control-state comparisons. Linux and Brook pass
+the initial ten cases. Guest testing exposed RCX/R11 loss through SYSRET on
+rt_sigreturn, stale selector literals and missing CLD in full exception stubs.
+See `register-state-tests.md`. Complete controlled CPL0/IST, IRQ/IPI/NMI,
+nested/migration, kernel-stack/canary and signal FPU-frame coverage before claiming
+all handlers preserve their required state.
+
 
 ## Current real-workload and desktop follow-ups (2026-10-16)
 

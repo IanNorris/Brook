@@ -23,6 +23,7 @@
 #include "memory/heap.h"
 #include "string.h"
 #include "irq_wrapper.h"
+#include "user_copy_fault.h"
 
 using brook::SerialPrintf;
 using brook::IoApicUnmaskIrq;
@@ -925,6 +926,18 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
     bool fromUser = (ef->cs & 3) != 0;
 
+    // Only the two explicit user-copy instructions can recover here. No locks,
+    // lazy faults or scheduling: return through that stub's residual-count RET,
+    // keeping every caller frame/guard alive and IRET's saved flags unchanged.
+    if(vector==14) {
+        const uint64_t fixup=brook::UserCopyFaultFixup({ef->rip,cr2,ef->rsi,ef->rdi,
+            ef->rcx,ef->errorCode,ef->cs,ef->rflags});
+        if(fixup) {
+            __atomic_fetch_add(&brook::g_profFaultCount,1,__ATOMIC_RELAXED);
+            ef->rip=fixup;return;
+        }
+    }
+
     // --- COW page fault handling (both kernel and user mode) ---
     // The kernel writes to user COW pages via sys_wait4, sys_read, etc.
     // These are kernel-mode writes (error code bit 2 = 0) to user-space
@@ -1707,7 +1720,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         mc.rsp    = ef->rsp;
         mc.rip    = ef->rip;
         mc.eflags = ef->rflags;
-        mc.cs     = 0x23;          // user code segment
+        mc.cs     = GDT_USER_CODE;
         mc.err    = ef->errorCode;
         mc.trapno = vector;
         mc.cr2    = cr2;
@@ -1728,6 +1741,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         // to the signal handler with the right arguments.
         ef->rip    = sa.handler;               // RIP → handler
         ef->rsp    = userRsp;                  // RSP → signal frame
+        ef->rflags &= ~uint64_t{0x10500};       // C handler: clear DF/TF/RF
         ef->rdi    = static_cast<uint64_t>(signum);        // arg1 = signum
         if (sa.flags & brook::SA_SIGINFO)
         {

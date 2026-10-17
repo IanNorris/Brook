@@ -199,6 +199,9 @@ add_executable(kernel
     src/ramdisk.cpp
     src/runtime.cpp
     src/syscall.cpp
+    src/user_copy.cpp
+    src/user_copy_fault.cpp
+    src/user_copy.S
     src/posix_timer.cpp
     src/process.cpp
     src/memory/address_space.cpp

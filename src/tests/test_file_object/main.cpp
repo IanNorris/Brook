@@ -13,6 +13,7 @@
 #include "memory/heap.h"
 #include "vfs.h"
 #include "panic.h"
+#include "user_copy.h"
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#c); std::abort(); } } while (0)
 using namespace brook;
 namespace {
@@ -25,6 +26,10 @@ std::atomic<bool> failHeap{false},failFrame{false};
 std::mutex writeHookGuard;
 std::condition_variable writeHookCv;
 bool writeHookEntered=false,writeHookReleased=false;
+uint64_t userBegin=0,userEnd=0;
+std::atomic<uint64_t> copyLimit{~uint64_t{0}};
+bool blockCopy=false,copyEntered=false,copyReleased=false;
+std::mutex copyGuard;std::condition_variable copyCv;
 struct Backend {
     FileObject object;
     std::vector<unsigned char> bytes;
@@ -84,6 +89,23 @@ struct Barrier {
 };
 }
 namespace brook {
+bool FileObjectHostUserPointer(const void* pointer) {
+    auto address=reinterpret_cast<uint64_t>(pointer);return address>=userBegin&&address<userEnd;
+}
+static uint64_t UserCopyTest(void* destination,const void* source,uint64_t length) {
+    uint64_t limit=copyLimit.exchange(~uint64_t{0});if(length>limit)length=limit;
+    if(blockCopy) {
+        std::unique_lock<std::mutex> lock(copyGuard);copyEntered=true;copyCv.notify_all();
+        copyCv.wait(lock,[]{return copyReleased;});
+    }
+    std::memcpy(destination,source,length);return length;
+}
+uint64_t CopyFromUserBytes(void* destination,uint64_t source,uint64_t length) {
+    return UserCopyTest(destination,reinterpret_cast<void*>(source),length);
+}
+uint64_t CopyToUserBytes(uint64_t destination,const void* source,uint64_t length) {
+    return UserCopyTest(reinterpret_cast<void*>(destination),source,length);
+}
 extern "C" void VfsClose(Vnode* vnode) {
     CHECK(!vnode->refCount);++closedVnodes;
     FileObjectDispose(vnode->ops->file_object(vnode));
@@ -355,6 +377,42 @@ static void BatchPages() {
     FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
 }
 
+static void PartialUserCopies() {
+    CHECK(refs.empty()&&heapBlocks==0);
+    Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(256);
+    for(unsigned i=0;i<256;++i)backend.bytes[i]=static_cast<unsigned char>(i);
+    Vnode vnode{&operations,VnodeType::File,&backend,1,0};
+    unsigned char buffer[128];std::memset(buffer,0xe3,sizeof(buffer));
+    userBegin=reinterpret_cast<uint64_t>(buffer);userEnd=userBegin+sizeof(buffer);
+    uint64_t offset=0;copyLimit=31;
+    CHECK(FileObjectRead(&backend.object,&vnode,buffer,64,&offset)==31&&offset==31);
+    for(unsigned i=0;i<128;++i)CHECK(buffer[i]==(i<31?i:0xe3));
+    copyLimit=0;CHECK(FileObjectRead(&backend.object,&vnode,buffer,64,&offset)==-14&&offset==31);
+    CHECK(FileObjectRead(&backend.object,&vnode,buffer,32,&offset)==32&&offset==63);
+    for(unsigned i=0;i<32;++i)CHECK(buffer[i]==i+31);
+    std::memset(buffer,0xb5,sizeof(buffer));offset=100;copyLimit=17;
+    CHECK(FileObjectWrite(&backend.object,&vnode,buffer,64,&offset)==17&&offset==117);
+    for(unsigned i=0;i<256;++i)CHECK(backend.bytes[i]==(i>=100&&i<117?0xb5:i));
+    copyLimit=0;CHECK(FileObjectWrite(&backend.object,&vnode,buffer,64,&offset)==-14&&offset==117);
+    const unsigned writes=backend.writes;CHECK(writes==1);
+    // A blocked partial copyout must not reserve and lose the remainder of its
+    // file bytes, or let a peer consume the same initial offset concurrently.
+    offset=0;copyLimit=31;blockCopy=true;copyEntered=false;copyReleased=false;
+    int results[2]={};
+    std::thread first([&]{results[0]=FileObjectRead(&backend.object,&vnode,buffer,64,&offset);});
+    { std::unique_lock<std::mutex> lock(copyGuard);copyCv.wait(lock,[]{return copyEntered;}); }
+    const unsigned reads=backend.reads;const auto gates=gateAcquires.load();
+    std::thread second([&]{results[1]=FileObjectRead(&backend.object,&vnode,buffer+64,64,&offset);});
+    while(gateAcquires.load()==gates)std::this_thread::yield();
+    CHECK(backend.reads==reads&&offset==0);
+    { std::lock_guard<std::mutex> lock(copyGuard);copyReleased=true;copyCv.notify_all(); }
+    first.join();second.join();blockCopy=false;
+    CHECK(results[0]==31&&results[1]==64&&offset==95);
+    for(unsigned i=0;i<31;++i)CHECK(buffer[i]==i);
+    for(unsigned i=0;i<64;++i)CHECK(buffer[64+i]==31+i);
+    userBegin=userEnd=0;FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
+}
+
 static void QuarantinedPages() {
     CHECK(refs.empty()&&heapBlocks==0);
     Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(8192,0x57);
@@ -505,5 +563,6 @@ int main() {
     AppendTransactions();
     FaultPages();
     QuarantinedPages();
+    PartialUserCopies();
     std::puts("FILE_OBJECT PASS batch/sparse-pins/one-gate/failure-cleanup/concurrent-load/io-coherence/partial-error/truncate/zero-tail/lifetime/writeback-range/snapshot/redirty/error-retry");
 }

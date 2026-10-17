@@ -26,7 +26,7 @@ int64_t MappingFaultTestControl(uint64_t action,uint64_t address,uint64_t length
         if (waiting) result=-16;
         else if (length && !(address&4095) && !(length&4095) &&
                  address<0x0000800000000000ULL && length<=0x0000800000000000ULL-address &&
-                 (phase==1 || phase==2 || phase==3) && count && count<=8) {
+                 (phase>=1 && phase<=4) && count && count<=8) {
             identity=actor->addressSpace->identity;begin=address;end=address+length;
             selectedPhase=phase;quota=count;arrivals=0;released=false;timedOut=false;armed=true;
             ++epoch;result=0;

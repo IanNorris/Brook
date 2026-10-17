@@ -31,6 +31,7 @@
 #include "apic.h"
 #include "cpu.h"
 #include "ksym_addrs.h"
+#include "user_copy.h"
 
 namespace brook {
 
@@ -1986,24 +1987,28 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         // ucontext (pretcode was popped by handler's RET, then restorer did syscall).
         // frame->rsp is the user RSP saved on syscall entry.
         // The SignalFrame starts 8 bytes before the ucontext (pretcode field).
-        {
-            uint64_t ucEnd = frame->rsp + sizeof(SignalUcontext);
-            if (frame->rsp >= 0x0000800000000000ULL || ucEnd > 0x0000800000000000ULL ||
-                ucEnd < frame->rsp) {
-                brook::SerialPrintf("SIGRETURN: bad user stack 0x%lx pid %u\n", frame->rsp, proc->pid);
-                return syscallResult;
-            }
+        SignalUcontext context{};
+        // The dispatcher calls with IF clear. Snapshot without return-path
+        // locks held; prefault may need interrupts, I/O and a context switch.
+        __asm__ volatile("sti":::"memory");
+        const bool copied=CopyFromUser(&context,frame->rsp,sizeof(context));
+        __asm__ volatile("cli":::"memory");
+        // Copy introduced a new protected operation after the entry boundary.
+        if(SchedulerKernelOperationBoundary()) { SchedulerYield();__builtin_trap(); }
+        const SignalMcontext& mc=context.uc_mcontext;
+        if(!copied || !PrepareSignalReturn(frame->returnState,mc.rip,mc.rsp,mc.eflags,mc.rcx)) {
+            SerialPrintf("SIGRETURN: invalid context pid %u\n",proc->pid);
+            SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
+            SchedulerExitCurrentProcess(128+11,11);
         }
-        auto* uc = reinterpret_cast<SignalUcontext*>(frame->rsp);
-        const SignalMcontext& mc = uc->uc_mcontext;
 
         // Restore signal mask
-        proc->sigMask = uc->uc_sigmask;
+        proc->sigMask = context.uc_sigmask & ~((1ULL<<8)|(1ULL<<18));
 
         // Restore all registers from mcontext into the SyscallFrame
         frame->rcx    = mc.rip;      // user RIP (sysret uses RCX)
         frame->rsp    = mc.rsp;
-        frame->rflags = mc.eflags;
+        frame->rflags = frame->returnState.flags;
         frame->rdi    = mc.rdi;
         frame->rsi    = mc.rsi;
         frame->rdx    = mc.rdx;
@@ -2152,7 +2157,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     mc.r15    = frame->r15;
     mc.rip    = frame->rcx;     // user RIP (stored in RCX by syscall)
     mc.eflags = frame->rflags;
-    mc.cs     = 0x23;           // user code segment
+    mc.cs     = GDT_USER_CODE;
 
     // Linux restarts selected interrupted syscalls after a signal handler
     // returns when the handler was installed with SA_RESTART. Bash relies on
@@ -2210,6 +2215,9 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // Redirect execution to the signal handler
     frame->rcx = sa.handler;                           // RIP = handler
     frame->rsp = userRsp;                              // RSP = signal frame
+    // The saved ucontext retains interrupted flags; C handlers enter with DF,
+    // TF and RF clear, independently of the eventual rt_sigreturn context.
+    frame->rflags &= ~uint64_t{0x10500};
     frame->rdi = static_cast<uint64_t>(signum);        // arg1 = signum
     if (sa.flags & SA_SIGINFO)
     {

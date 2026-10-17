@@ -17,6 +17,9 @@ struct FileMappingRegistration;
 struct FileObject {
     RecordLockTable recordLocks;
     KMutex gate;
+    // Offset reservation/copyout serialization, ordered before gate. Fault page
+    // preparation uses backend ops directly and never acquires this mutex.
+    KMutex ioOffsetGate;
     uint64_t generation,orderId;
     // Gate-owned unknown-EOF quarantine. Size writers remain blocked until
     // recovery first observes EOF and reconciles every retained private alias.

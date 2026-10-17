@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 project(brook-host-tests CXX)
+set(CMAKE_ASM_COMPILER "${CMAKE_CXX_COMPILER}")
+enable_language(ASM)
 
 if(NOT DEFINED BROOK_ROOT)
     set(BROOK_ROOT "${CMAKE_SOURCE_DIR}/../../..")
@@ -43,6 +45,12 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_user_copy
+    "${BROOK_ROOT}/src/kernel/src/user_copy_fault.cpp"
+    "${BROOK_ROOT}/src/kernel/src/user_copy.S"
+)
+target_compile_options(test_user_copy PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+set_tests_properties(test_user_copy PROPERTIES TIMEOUT 15)
 add_host_test(test_virgl_submit)
 add_host_test(test_busybox_lookup)
 add_host_test(test_launcher_command)
@@ -191,6 +199,7 @@ add_host_test(test_file_object
 set_tests_properties(test_file_object PROPERTIES TIMEOUT 30)
 target_compile_options(test_file_object PRIVATE
     -DBROOK_HOST_TEST
+    -DBROOK_HOST_USER_COPY_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src"
     "-iquote${BROOK_ROOT}/src/shared"
     "-iquote${BROOK_ROOT}/src/shared/inc_km"

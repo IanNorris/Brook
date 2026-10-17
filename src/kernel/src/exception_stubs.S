@@ -130,6 +130,8 @@ ExceptionStub\vector:
     // Leaves RSP at the 64-aligned XSAVE slot (valid alignment for the call).
     FPU_SAVE_TO_R15
 
+    // C requires DF clear. The CPU-saved user flags remain in the IRET frame.
+    cld
     call HandleExceptionFull
 
     // BRO-187: restore FPU after the handler, then RSP = frame base (r14).
@@ -196,6 +198,8 @@ ExceptionStub\vector:
     // the 64-aligned XSAVE slot (correct alignment for the SysV call).
     FPU_SAVE_TO_R15
 
+    // C requires DF clear, including when the fault interrupted STD/REP code.
+    cld
     call HandleExceptionFull
 
     // BRO-187: restore FPU after the handler, then RSP = frame base (r14).

@@ -48,69 +48,18 @@
 #include "apic.h"
 #include "serial_writer.h"
 #include "debug_overlay.h"
+#include "user_copy.h"
+#include "gs_paranoid.h"
 
 // Forward declaration
 extern "C" __attribute__((naked)) void ReturnToKernel();
 extern "C" bool MemFdHandleUserFault(uint64_t cr2, uint64_t errCode);
 extern "C" bool FileMapHandleUserFault(uint64_t cr2, uint64_t errCode);
 
-// ---------------------------------------------------------------------------
-// UserBufferReadable — verify [addr, addr+len) is fully mapped in the
-// current process's address space. Returns false if any page is unmapped
-// or if the range is in kernel space. Used to validate user-supplied
-// pointers before kernel reads, so a malicious/buggy user program can't
-// fault the kernel.
-// ---------------------------------------------------------------------------
-static bool EnsureUserPage(brook::Process* process,uint64_t page,uint32_t access) {
-    using namespace brook;
-    auto result=UserMappingPageAccess(process,process->addressSpace,page,access,true);
-    if (result==UserPageAccess::Missing) {
-        uint64_t error=4|((access&2)?2:0)|((access&4)?16:0);
-        if (!MemFdHandleUserFault(page,error) && !FileMapHandleUserFault(page,error)) return false;
-        result=UserMappingPageAccess(process,process->addressSpace,page,access,true);
-    }
-    return result==UserPageAccess::Ready;
-}
-static bool CheckUserBuffer(uint64_t address,uint64_t length,uint32_t access) {
-    if (!length) return true;
-    constexpr uint64_t limit=0x0000800000000000ULL;
-    if (address>=limit || length>limit-address) return false;
-    auto* process=brook::ProcessCurrent();if (!process) return false;
-    const uint64_t end=address+length;
-    for (uint64_t page=address&~uint64_t{4095};page<end;page+=4096)
-        if (!EnsureUserPage(process,page,access)) return false;
-    return true;
-}
-static bool UserBufferReadable(uint64_t address,uint64_t length) { return CheckUserBuffer(address,length,1); }
-static bool UserBufferWritable(uint64_t address,uint64_t length) { return CheckUserBuffer(address,length,2); }
-
-static bool CopyUserCString(uint64_t address,char* out,uint32_t capacity) {
-    if (!out || !capacity) return false;
-    uint32_t copied=0;
-    while (copied<capacity) {
-        uint64_t current;
-        if (__builtin_add_overflow(address,static_cast<uint64_t>(copied),&current)) return false;
-        uint32_t chunk=4096-static_cast<uint32_t>(current&4095);
-        if (chunk>capacity-copied) chunk=capacity-copied;
-        if (!UserBufferReadable(current,chunk)) return false;
-        for (uint32_t i=0;i<chunk;++i) {
-            char value=*reinterpret_cast<const char*>(current+i);
-            out[copied++]=value;if (!value) return true;
-        }
-    }
-    out[capacity-1]=0;return false;
-}
-
-static bool CopyToUser(uint64_t addr, const void* src, uint64_t len)
-{
-    if (len == 0) return true;
-    if (!src || !UserBufferWritable(addr, len)) return false;
-    auto* dst = reinterpret_cast<char*>(addr);
-    auto* in  = reinterpret_cast<const char*>(src);
-    for (uint64_t i = 0; i < len; ++i)
-        dst[i] = in[i];
-    return true;
-}
+using brook::UserBufferReadable;
+using brook::UserBufferWritable;
+using brook::CopyToUser;
+using brook::CopyUserCString;
 
 // ---------------------------------------------------------------------------
 // Random helpers: RDRAND with TSC fallback
@@ -218,6 +167,9 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "mov %%rsp, %%r11\n\t"          // r11 = user RSP
         "mov %%gs:8, %%rsp\n\t"
         "and $~0xF, %%rsp\n\t"
+        // Keep all existing frame/RBP offsets and 16-byte call alignment.
+        "sub $64, %%rsp\n\t"
+        "movq $0, (%%rsp)\n\t"          // this entry defaults to SYSRET
         "push %%r11\n\t"               // [1] user RSP
         "push %%rcx\n\t"               // [2] user return address
         "movq %%gs:24, %%r11\n\t"       // reload user RFLAGS
@@ -317,6 +269,10 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         "pop %%rsi\n\t"                // [6]
         "pop %%rdx\n\t"                // [5]
         "pop %%rbp\n\t"                // [4]
+        // RSP is now frame+104. Signal return must restore RCX and R11 as
+        // ordinary GPRs; SYSRET would replace them with RIP and RFLAGS.
+        "cmpq $0, 24(%%rsp)\n\t"        // returnState.mode at frame+128
+        "jne .Lsigreturn_iret\n\t"
         "pop %%r11\n\t"                // [3] user RFLAGS
         "pop %%rcx\n\t"                // [2] user return address
         // Validate RCX is a canonical user-mode address before sysret.
@@ -336,6 +292,12 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         ".Lsysret_halt:\n\t"
         "hlt\n\t"
         "jmp .Lsysret_halt\n\t"
+        ".Lsigreturn_iret:\n\t"
+        "mov 32(%%rsp), %%rcx\n\t"      // frame+136, original signal RCX
+        "add $40, %%rsp\n\t"            // frame+144, validated IRET frame
+        IRETQ_NORMALIZE_RFLAGS
+        "swapgs\n\t"
+        "iretq\n\t"
         ::: "memory"
     );
 }
@@ -1675,8 +1637,9 @@ static int64_t AppendUserBuffer(Vnode* vn, uint64_t address, uint64_t count, uin
     uint64_t size = count < AppendStageLimit ? count : AppendStageLimit;
     auto* staged = kmalloc(size);
     if (!staged) return -ENOMEM;
-    memcpy(staged, reinterpret_cast<const void*>(address), size);
-    int64_t result = VfsAppend(vn, staged, size, offset);
+    const uint64_t copied=CopyFromUserBytes(staged,address,size);
+    if(!copied) { kfree(staged);return -EFAULT; }
+    int64_t result = VfsAppend(vn, staged, copied, offset);
     kfree(staged);
     return result;
 }
@@ -4186,15 +4149,14 @@ static void StrCopyN(char* dst, const char* src, uint64_t n)
 static int64_t sys_uname(uint64_t bufAddr, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    if (!UserBufferWritable(bufAddr, sizeof(utsname))) return -EFAULT;
-    auto* buf = reinterpret_cast<utsname*>(bufAddr);
+    utsname value{};auto* buf=&value;
     StrCopyN(buf->sysname,    "Brook",     65);
     StrCopyN(buf->nodename,   "brook",     65);
     StrCopyN(buf->release,    "6.0.0",     65);
     StrCopyN(buf->version,    "#1",        65);
     StrCopyN(buf->machine,    "x86_64",    65);
     StrCopyN(buf->domainname, "(none)",    65);
-    return 0;
+    return CopyToUser(bufAddr,&value,sizeof(value))?0:-EFAULT;
 }
 
 // ---------------------------------------------------------------------------
@@ -5075,8 +5037,7 @@ static uint64_t ClockNowNs(uint64_t clockid)
 static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
                                   uint64_t, uint64_t, uint64_t)
 {
-    if (!UserBufferWritable(tsAddr, sizeof(timespec))) return -EFAULT;
-    auto* ts = reinterpret_cast<timespec*>(tsAddr);
+    timespec value{};auto* ts=&value;
 
     // Under KVM, the pvclock source gives us nanosecond precision directly.
     // LAPIC-derived ms is only ms-accurate and drifts between RTC
@@ -5096,7 +5057,7 @@ static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
             ts->tv_sec  = static_cast<int64_t>(ns / 1000000000ULL);
             ts->tv_nsec = static_cast<int64_t>(ns % 1000000000ULL);
         }
-        return 0;
+        return CopyToUser(tsAddr,&value,sizeof(value))?0:-EFAULT;
     }
 
     if (clockid == 0) // CLOCK_REALTIME — wall-clock via RTC
@@ -5112,7 +5073,7 @@ static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
         ts->tv_sec  = static_cast<int64_t>(ms / 1000);
         ts->tv_nsec = static_cast<int64_t>((ms % 1000) * 1000000);
     }
-    return 0;
+    return CopyToUser(tsAddr,&value,sizeof(value))?0:-EFAULT;
 }
 
 static int64_t sys_clock_getres(uint64_t clockid, uint64_t tsAddr, uint64_t,
@@ -5120,19 +5081,17 @@ static int64_t sys_clock_getres(uint64_t clockid, uint64_t tsAddr, uint64_t,
 {
     (void)clockid;
     if (!tsAddr) return 0;
-    if (!UserBufferWritable(tsAddr, sizeof(timespec))) return -EFAULT;
-    auto* ts = reinterpret_cast<timespec*>(tsAddr);
+    timespec value{};auto* ts=&value;
 
     ts->tv_sec = 0;
     ts->tv_nsec = KvmClockAvailable() ? 1 : 1000000;
-    return 0;
+    return CopyToUser(tsAddr,&value,sizeof(value))?0:-EFAULT;
 }
 
 static int64_t sys_gettimeofday(uint64_t tvAddr, uint64_t, uint64_t,
                                  uint64_t, uint64_t, uint64_t)
 {
-    if (!UserBufferWritable(tvAddr, sizeof(timeval))) return -EFAULT;
-    auto* tv = reinterpret_cast<timeval*>(tvAddr);
+    timeval value{};auto* tv=&value;
 
     uint64_t epoch = RtcNow();
     if (KvmClockAvailable())
@@ -5147,7 +5106,7 @@ static int64_t sys_gettimeofday(uint64_t tvAddr, uint64_t, uint64_t,
         tv->tv_sec  = static_cast<int64_t>(epoch);
         tv->tv_usec = static_cast<int64_t>((ms % 1000) * 1000);
     }
-    return 0;
+    return CopyToUser(tvAddr,&value,sizeof(value))?0:-EFAULT;
 }
 
 // ---------------------------------------------------------------------------
@@ -5159,9 +5118,7 @@ static int64_t sys_time(uint64_t tloc, uint64_t, uint64_t,
 {
     uint64_t epoch = RtcNow();
     if (tloc) {
-        if (!UserBufferWritable(tloc, sizeof(int64_t))) return -EFAULT;
-        auto* p = reinterpret_cast<int64_t*>(tloc);
-        *p = static_cast<int64_t>(epoch);
+        if(!CopyToUser(tloc,&epoch,sizeof(epoch)))return -EFAULT;
     }
     return static_cast<int64_t>(epoch);
 }
@@ -7584,8 +7541,7 @@ static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
                                uint64_t, uint64_t, uint64_t)
 {
     if (count > 256) count = 256; // cap per-call to avoid long stalls
-    if (!UserBufferWritable(bufAddr, count)) return -EFAULT;
-    auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
+    uint8_t buf[256];
 
     uint64_t filled = 0;
     while (filled < count)
@@ -7601,7 +7557,8 @@ static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
             buf[filled++] = static_cast<uint8_t>(rnd >> (b * 8));
         }
     }
-    return static_cast<int64_t>(count);
+    const uint64_t copied=CopyToUserBytes(bufAddr,buf,count);
+    return copied || !count ? static_cast<int64_t>(copied) : -EFAULT;
 }
 
 // ---------------------------------------------------------------------------

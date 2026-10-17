@@ -5,6 +5,7 @@ namespace brook {
 #ifdef BROOK_MAPPING_TEST_HOOKS
 // Test kernels only. Called outside AS/PT/backing locks, with the real fault's
 // MappingTransaction still owning its cancellation region and backing snapshot.
+// Phase 4 is checked usercopy after prefault: that helper pins AS/cancellation.
 bool MappingFaultTestBarrier(AddressSpaceState* space,uint64_t page,uint32_t phase);
 // Pause at compositor frame entry, outside all renderer/source locks. Holds no
 // process/AS reference, so consuming wait must complete while epochs stop.

@@ -320,6 +320,12 @@ remains disabled.
 
 ### Unknown-EOF quarantine and recovery primitives (17 October)
 
+The subsequent [recoverable-copy checkpoint](user-copy.md) adds exact-RIP
+assembly fixups and progress-aware regular-file staging. It is a prerequisite,
+not completion of the kernel-wide raw-access audit or the resize coordinator.
+The hosted suite now contains 31 tests; the 30-suite results below describe the
+earlier quarantine checkpoint.
+
 `FileObjectQuarantineLocked` records a negative mapping error, clamps the saved
 valid private prefix without widening it, and advances the file generation.
 Its caller must already hold the inode gate, have acknowledged every detached

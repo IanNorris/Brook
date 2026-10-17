@@ -7,6 +7,7 @@
 #include "spinlock.h"
 #include "fd_table.h"
 #include "credential_ids.h"
+#include "signal_return.h"
 
 namespace brook {
 
@@ -122,7 +123,7 @@ struct SignalFrame {
 };
 
 // Kernel stack frame layout matching BrookSyscallDispatcher's push order.
-// Used by SyscallCheckSignals to modify saved registers before sysret.
+// Used by SyscallCheckSignals before SYSRET or full-register signal IRET.
 struct SyscallFrame {
     uint64_t rbx;       // [RSP+0]
     uint64_t r15;       // [RSP+8]
@@ -140,7 +141,12 @@ struct SyscallFrame {
     uint64_t rflags;    // [RSP+104]  (user RFLAGS, popped into R11)
     uint64_t rcx;       // [RSP+112]  (user RIP, restored via sysret)
     uint64_t rsp;       // [RSP+120]  (user RSP)
+    SyscallReturnState returnState; // +128 mode, +136 RCX, +144 IRET frame
 };
+static_assert(__builtin_offsetof(SyscallFrame,returnState)==128);
+static_assert(__builtin_offsetof(SyscallFrame,returnState)+__builtin_offsetof(SyscallReturnState,rcx)==136);
+static_assert(__builtin_offsetof(SyscallFrame,returnState)+__builtin_offsetof(SyscallReturnState,rip)==144);
+static_assert(sizeof(SyscallFrame)==192);
 
 // ---------------------------------------------------------------------------
 // Process scheduling state
