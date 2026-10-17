@@ -319,7 +319,7 @@ EOF
 fi
 
 # Keep compatibility launchers current even on an index-only refresh.
-for browser in brook-chromium brook-firefox; do
+for browser in brook-chromium brook-firefox brook-codium; do
     install -m 755 "${ROOT_DIR}/data/nix-wrappers/${browser}" "${MNTDIR}/bin/${browser}"
 done
 

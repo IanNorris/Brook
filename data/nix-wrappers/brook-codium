@@ -1,0 +1,15 @@
+#!/nix/profile/bin/bash
+# Experimental software Wayland editor; Electron's sandbox is unsupported.
+set -eu
+export HOME=/data/home
+export XDG_CONFIG_HOME=$HOME/.config XDG_CACHE_HOME=$HOME/.cache
+export XDG_DATA_HOME=$HOME/.local/share
+export TMPDIR=$XDG_CACHE_HOME/codium/tmp
+export ELECTRON_OZONE_PLATFORM_HINT=wayland
+mkdir -p "$XDG_CONFIG_HOME/VSCodium" "$XDG_DATA_HOME/VSCodium/extensions" "$TMPDIR"
+unset DISPLAY
+# Keep shared allocations on Brook's supported /dev/shm backend.
+exec /nix/profile/bin/brook-run /nix/profile/bin/codium \
+  --no-sandbox --disable-gpu --disable-crash-reporter --ozone-platform=wayland \
+  --user-data-dir="$XDG_CONFIG_HOME/VSCodium" \
+  --extensions-dir="$XDG_DATA_HOME/VSCodium/extensions" "$@"

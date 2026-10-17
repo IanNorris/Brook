@@ -133,18 +133,17 @@
 - Audit memfd shrinking independently: `ftruncate` currently frees tail backing
   pages without invalidating live borrowed mappings. This is a separate source
   finding; the reproduced Firefox teardown free came from descriptor close.
-- Codium follow-up (17 October): removing `--disable-dev-shm-usage` gets past
-  its field-trial allocation breakpoint using the supported `/dev/shm` backend.
-  Matched Electron symbols and a guest probe identified missing nested-epoll
-  readiness. The fix reaches window creation and workbench JavaScript loading;
-  the first comparison still showed a blank client area, so editor acceptance
-  remains open. Nested wakeup/timer, graph limits and close-during-wait probes
-  pass. Closed numeric watches also produced persistent orphan ERR/HUP events;
-  the follow-up retires those when scanned. Keep investigating rendering/input
-  and exit; no regular-file MAP_SHARED enabled. See `docs/workloads.md`.
-- Codium's earlier clean-boot rerun fails its 256-KiB writable file MAP_SHARED
-  request with EOPNOTSUPP and reaches the same startup INT3. Complete coherent
-  shared writes/writeback; rerunning without that feature did not yield an editor.
+- Codium follow-up (17 October): using the supported `/dev/shm` backend and
+  implementing nested epoll readiness unblock Electron. A further timeout-arming
+  correction permits the workbench to render, native editing, save/reopen and
+  normal exit. The deployed standard wrapper also renders, edits, saves and
+  exits without inspector flags. Repeated nested wait, timer, graph, close and
+  killed-waiter checks pass. Continue startup/performance, extension and broader
+  development-workflow testing; see `docs/workloads.md`.
+- Writable regular-file MAP_SHARED remains unsupported. Codium's earlier
+  `--disable-dev-shm-usage` control reproduced a failed 256-KiB request and INT3;
+  its current wrapper uses `/dev/shm`. Coherent shared writes/writeback remain
+  separate filesystem/VM work, rather than a current editor-startup gate.
 - The boot filesystem's `/tmp` cannot unlink an open temporary file (EBUSY),
   which breaks stock Bash here-documents; fchmod also returns ENOTSUP there.
   The shell acceptance uses a data-backed TMPDIR. Provide suitable temporary

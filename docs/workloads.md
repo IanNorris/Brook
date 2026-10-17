@@ -1854,3 +1854,42 @@ session `659c1072ce88407abf1fe876419313a7`;
 `epoll-guest-repeated-all.json` preserves both runs, and
 `epoll-timeout-heap-{1,2}.json` their heap snapshots. All 20 existing host suites
 passed on this kernel build. This does not establish Codium editor acceptance.
+
+### Codium editor unlocked after the timeout correction
+
+On the final kernel above, Electron inspector reconnects work and the workbench
+finishes loading. Native VM input selected/replaced text, Ctrl+S saved it, and
+an independent guest `cat` confirmed the exact saved contents. Closing the
+editor tab and reopening `/data/codium-acceptance.txt` through Ctrl+P showed the
+same text without a dirty marker. Closing the window through its CSD close
+button returned to ten tasks without SIGKILL; heap integrity passed.
+
+This first control launched the installed Electron main binary with inspector
+flags and the stock package environment. Its initially blank splash is not a
+remaining graphics blocker on this kernel. Readable screenshot:
+`docs/images/brook_codium_edit_1080.png`, an unmodified native 1920×1080 VM capture
+with the editor window resized to 1480×850 and its own zoom set to 130%.
+It shows the file after reopening. No desktop-wide scaling feature is implied.
+
+The deployed `brook-codium` wrapper follows the browser launchers: persistent
+`/data/home` HOME/XDG directories, ext2 TMPDIR, software Wayland, explicit profile
+and extensions paths, and no `--disable-dev-shm-usage`. Installed-app discovery
+redirects Codium only when both its real executable and this wrapper exist.
+Electron's sandbox remains disabled; extensions, development/debugger workflows,
+non-root identity and wider stability/performance are not accepted by this check.
+
+The standard `/nix/bin/brook-codium /data/codium-acceptance.txt` path was then
+tested with a fresh persistent profile and **without inspector flags**. It
+rendered the saved file, accepted another native edit (`Standard launcher
+verified.`), and Ctrl+S persisted that edit as confirmed by guest `cat`. Native
+window close returned to ten tasks again without a forced kill. Heap integrity,
+checked filesystem/device shutdown and all three offline filesystem checks
+passed. Summary: `build/workloads/codium-startup-20261017/epoll-codium-result.json`.
+The isolated fixture HTTP server was stopped after deployment.
+
+Both installed-app discovery tests pass in the Nix development shell, including
+preserving Codium file arguments and requiring its deployed wrapper plus real
+package executable. The host's bare Python lacks CairoSVG; use `nix-shell` for
+these tests, as the development shell supplies it. Shell/Python syntax checks
+also pass. The candidate VM is stopped; the main checkpoint images were not
+modified by these isolated runs.

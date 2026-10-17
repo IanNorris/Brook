@@ -41,7 +41,7 @@ def install_package_tools(nix_root, manifest):
         shutil.copy2(stk_wrapper, target)
         target.chmod(0o755)
     manifest["assets"]["stk-play.sh"] = digest(stk_wrapper)
-    for name in ["brook-chromium", "brook-firefox"]:
+    for name in ["brook-chromium", "brook-firefox", "brook-codium"]:
         source = ROOT / "data/nix-wrappers" / name
         target = nix_root / "bin" / name
         shutil.copy2(source, target)

@@ -267,10 +267,10 @@ def main():
         if override:
             exec_cmd = override
 
-        # Only installed browsers with a deployed compatibility wrapper get
+        # Only installed apps with a deployed compatibility wrapper get
         # redirected; the raw executable validation above remains required.
-        if binary in ('chromium', 'firefox'):
-            wrapper = 'brook-' + binary
+        if binary in ('chromium', 'firefox', 'codium', 'vscodium'):
+            wrapper = 'brook-' + ('codium' if binary == 'vscodium' else binary)
             if (Path(store_dir).parent/'bin'/wrapper).is_file():
                 arguments = shlex.split(exec_cmd)[1:]
                 exec_cmd = shlex.join(['/nix/bin/' + wrapper, *arguments])

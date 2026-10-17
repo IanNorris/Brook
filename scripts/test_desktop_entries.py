@@ -52,6 +52,14 @@ class DesktopEntriesTest(unittest.TestCase):
             self.assertIn('Chromium\tchromium --incognito\t',collect_manifest())
             (root/'bin').mkdir();(root/'bin/brook-chromium').write_text('#!/bin/sh\n')
             self.assertIn('Chromium\t/nix/bin/brook-chromium --incognito\t',collect_manifest())
+            # Codium also requires the real installed package and a wrapper;
+            # preserve upstream file arguments rather than invent a shortcut.
+            (package/'bin/codium').write_text('#!/bin/sh\n')
+            (apps/'codium.desktop').write_text('[Desktop Entry]\nName=VSCodium\nExec=codium --reuse-window %F\n')
+            self.assertIn('VSCodium\tcodium --reuse-window\t',collect_manifest())
+            (root/'bin/brook-codium').write_text('#!/bin/sh\n')
+            self.assertIn('VSCodium\t/nix/bin/brook-codium --reuse-window\t',collect_manifest())
+            (package/'bin/codium').unlink()
             (package/'bin/chromium').unlink()
             self.assertEqual(collect_manifest(),'')
 
