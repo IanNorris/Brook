@@ -16,6 +16,9 @@ pkgs.alsa-plugins.overrideAttrs (old: {
     runHook preCheck
     $CC -DPIC -I. -Ioss ${./test_callbacks.c} $(pkg-config --cflags --libs alsa) -o test-oss-callbacks
     ./test-oss-callbacks
+    $CC -DPIC -fPIC -shared -I. -Ioss ${./test_rate_plugin.c} $(pkg-config --cflags --libs alsa) -o test-oss-rate.so
+    $CC ${./test_rate_negotiation.c} $(pkg-config --cflags --libs alsa) -o test-oss-rate-negotiation
+    ./test-oss-rate-negotiation "$PWD/test-oss-rate.so"
     runHook postCheck
   '';
 })

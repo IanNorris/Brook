@@ -5,8 +5,8 @@ synthetic playback/capture probes are diagnostic tools and regressions. It is
 not yet selected by the default image or Firefox launcher.
 
 The pinned ALSA plugin source is patched to propagate I/O/control errors,
-advertise native 44.1-kHz stereo S16_LE playback and negotiate a bounded exact
-buffer. An outer ALSA `plug` handles client conversion. Native clock availability
+advertise native 44.1-kHz stereo S16_LE playback and negotiate bounded software
+and physical buffers. An outer ALSA `plug` handles client conversion. Native clock availability
 is required during prepare; the kernel's unclocked legacy delay estimate is not
 accepted as a playback clock.
 
@@ -26,6 +26,19 @@ nix-build tools/alsa-oss-pkg --no-out-link
 The build's check phase uses real ALSA null-PCM parameters plus injected device
 operations. It covers errors, short/zero transfers, native-clock rejection,
 whole-ring completion, boundary wrapping and invalid origin/queue snapshots.
+It also opens the production plugin against a synthetic `/dev/null` endpoint
+through real ALSA `plug` negotiation: 8, 22.05, 44.1, 48 and 96 kHz, integer and
+float samples, and 50/100/200-ms requested latencies (30 cases).
+
+Logical periods and buffers can have arbitrary frame geometry. Requiring both
+power-of-two periods and an integer count of periods rejected rate conversion,
+including Firefox's 48-kHz YouTube audio. Physical OSS fragments remain 256
+bytes, with enough whole fragments to cover the software ring. The unused
+physical capacity is less than 64 stereo frames; transfer/pointer accounting
+continues to use accepted application frames and actual per-stream delay.
+Hardware capacity never substitutes for the logical ring size. The kernel's
+16,384-frame capacity limit is preserved. The old plugin failed 20/30 host
+negotiations; the corrected plugin passes all 30.
 
 Export for an isolated guest installation:
 

@@ -474,3 +474,50 @@ and close/reuse behavior passes the production-mixer hosted test; all 36
 current hosted suites, the supported entry audit and 40 bridge contract tests
 pass. This does not establish YouTube audio, pause/resume, simultaneous-app
 acceptance or fresh bootstrap package-closure coverage.
+
+## Firefox YouTube stream setup — 18 October 2026
+
+With the accepted userspace-clock kernel, normal Firefox still played YouTube
+video without audio. A ten-second capture had zero PCM frames, mixer stats had
+no streams, and serial output reported OpenCubeb stream-initialization failure.
+The player selected AV1 video and Opus audio. This failure differs from an
+underrun in an already running stream. The adjacent normal Chromium run produced
+441123 frames over 10.0029 host seconds with no silent 10-ms bins. Both browser
+lineages drained; heap, checked shutdown, serial audit and all three offline
+filesystem checks passed. Evidence: build/workloads/vdso-youtube-20261018.
+
+A standalone guest probe using Firefox's packaged ALSA configuration accepted
+44.1-kHz S16_LE and FLOAT_LE streams but rejected both 48-kHz streams with
+EINVAL during period negotiation. A Linux control using real ALSA and the
+production OSS plugin against synthetic device operations reproduced this: its
+30-case rate/format/latency matrix failed 20 cases. Power-of-two period and ring
+requirements plus an integer count of periods prevented compatible resampler
+geometry.
+
+The plugin now accepts arbitrary logical period and ring sizes within the
+existing bounds. Physical OSS fragments remain 256 bytes; sufficient whole
+fragments cover the software ring with less than 64 stereo frames unused.
+Application transfer, completion and delay accounting retain the logical ring
+and actual accepted/queued frames. Logical capacity is never expanded merely
+because physical storage has spare room. Callback checks and all 30 real-ALSA
+negotiation cases pass in the Nix check phase. The final assertion-enabled
+build's runtime PCM library is byte-identical to the installed guest candidate.
+
+On fresh isolated disks, guest nix-install installed that Firefox closure as
+Brook and the normal installed-app launcher selected it. The four-case guest
+rate/format setup probe now passes. YouTube produced 441126, 443780 and 441212
+frames in three consecutive approximately ten-second captures; their longest
+silent 10-ms runs were respectively 29, zero and zero bins. Pause produced zero
+frames and an inactive stream. Resume produced 441484 frames in 10.007 host
+seconds without silent 10-ms bins. The tab also showed its audio indicator.
+Intermittent initial gaps remain; this is not acceptance of indefinite smooth
+playback or of every ALSA operation.
+
+The candidate package remains separate from base-image/public-index promotion.
+Evidence and exact store identities: [Firefox package checkpoint](../tools/firefox-brook-pkg/README.md),
+build/workloads/firefox-rate-youtube-20261018, kernel
+e05bc514d02aa3050148b3a779cfc889752bfd63d47f0f4e819a4862b0619602.
+
+The corrected Firefox run also passed native close with no remaining browser
+lineage tasks, inactive post-exit audio, heap integrity, acknowledged sync,
+launcher exit zero, serial audit and all three offline filesystem checks.
