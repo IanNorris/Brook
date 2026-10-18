@@ -252,6 +252,14 @@
   and syscall-return delivery. The failed disks are preserved and not reused.
   This invalidates full stability acceptance for that candidate, despite the
   preceding clean Chromium and Firefox workflow/quit results.
+- Define a user-facing memory-pressure response: reject/terminate the newly
+  launching app when its allocation cannot be satisfied, and consider reclaiming
+  the largest non-critical application when appropriate. Protect critical OS
+  services, preserve process-group cleanup and audio teardown, and expose a clear
+  launch-failure notification. This is future policy work; the immediate fault
+  signal-frame fix must contain failed user-stack writes without requiring an
+  OOM victim-selection policy. The 18 October STK/browser review exhausted all
+  physical pages and reproduced the unchecked signal-frame panic on RR.
 - Panic observability: simultaneous raw user-fault dumps interleaved with the
   kernel fault text, so the bridge's serial regex missed the panic and observation
   attempted a dead guest TCP query. Preserve structured panic state independently

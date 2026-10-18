@@ -11,6 +11,9 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <climits>
+#include <deque>
+#include <array>
+#include <vector>
 
 // Include the shared ABI header via relative path (no -I on kernel/src
 // to avoid kernel string.h shadowing system headers).
@@ -30,8 +33,9 @@ static const char* g_currentModule = "";
     static void invoke_##name(const SchedOps* ops, void* state) { \
         ops->Init(state); \
         printf("  %-50s ", #name); \
+        const int before=g_failed; \
         run_##name(ops, state); \
-        printf("PASS\n"); g_passed++; \
+        if(g_failed==before) {printf("PASS\n");g_passed++;} \
     } \
     static void run_##name(const SchedOps* ops, void* state)
 
@@ -467,11 +471,105 @@ TEST(idle_simulation) {
     ASSERT(counts[IDLE_PID] == 0);
 }
 
+TEST(full_capacity_recycle) {
+    for(uint16_t pid=0;pid<SCHED_MAX_PIDS;++pid) {
+        ops->InitProcess(state,pid,2);ops->Enqueue(state,pid);
+    }
+    ASSERT(ops->ReadyCount(state)==SCHED_MAX_PIDS);
+    for(uint16_t pid=0;pid<SCHED_MAX_PIDS;pid+=2) {
+        ops->Remove(state,pid);
+        ops->InitProcess(state,pid,2);ops->Enqueue(state,pid);
+    }
+    ASSERT(ops->ReadyCount(state)==SCHED_MAX_PIDS);
+    bool seen[SCHED_MAX_PIDS]{};
+    for(unsigned i=0;i<SCHED_MAX_PIDS;++i) {
+        uint16_t pid=ops->PickNext(state);
+        ASSERT(pid<SCHED_MAX_PIDS && !seen[pid]);seen[pid]=true;
+    }
+    ASSERT(ops->ReadyCount(state)==0 && ops->PickNext(state)==NONE);
+    ops->Enqueue(state,NONE);ops->Remove(state,NONE);
+    ASSERT(ops->ReadyCount(state)==0);
+}
+
+TEST(mlfq_model_interleaved_cpus) {
+    constexpr unsigned N=96,CPUS=8;
+    std::array<std::deque<uint16_t>,4> ready;
+    std::array<unsigned,N> priority{};
+    std::array<bool,N> queued{},running{};
+    std::array<uint16_t,CPUS> current;current.fill(NONE);
+    auto enqueue=[&](uint16_t pid) {
+        if(queued[pid])return;
+        queued[pid]=true;ready[priority[pid]].push_back(pid);
+    };
+    auto pick=[&]() -> uint16_t {
+        for(auto& q:ready)if(!q.empty()) {
+            auto pid=q.front();q.pop_front();queued[pid]=false;return pid;
+        }
+        return NONE;
+    };
+    auto remove=[&](uint16_t pid) {
+        if(!queued[pid])return;
+        auto& q=ready[priority[pid]];
+        for(auto it=q.begin();it!=q.end();++it)if(*it==pid){q.erase(it);break;}
+        queued[pid]=false;
+    };
+    for(uint16_t pid=0;pid<N;++pid) {
+        priority[pid]=pid%4;ops->InitProcess(state,pid,priority[pid]);
+        enqueue(pid);ops->Enqueue(state,pid);
+    }
+    uint64_t now=0,lastBoost=0;uint32_t random=0x42524f4f;
+    for(unsigned step=0;step<100000;++step) {
+        random^=random<<13;random^=random>>17;random^=random<<5;
+        const unsigned cpu=(random>>8)%CPUS,action=random%5;
+        const uint16_t pid=(random>>16)%N,old=current[cpu];
+        if(action==0 && old!=NONE) {
+            if(priority[old]<3)++priority[old];ops->TimesliceExpired(state,old);
+            uint16_t expected=pick(),actual=ops->PickNext(state);ASSERT(actual==expected);
+            if(actual!=NONE) {
+                running[old]=false;enqueue(old);ops->Enqueue(state,old);
+                current[cpu]=actual;ASSERT(!running[actual]);running[actual]=true;
+            }
+        } else if(action==1 && old!=NONE) {
+            ops->Remove(state,old);remove(old);
+            if(priority[old]>1)--priority[old];ops->VoluntaryYield(state,old);
+            running[old]=false;current[cpu]=NONE;
+        } else if(action==2 && !running[pid]) {
+            enqueue(pid);ops->Enqueue(state,pid); // includes duplicate wakeups
+        } else if(action==3 && !running[pid]) {
+            remove(pid);ops->Remove(state,pid);
+            priority[pid]=(random>>12)%4;ops->InitProcess(state,pid,priority[pid]);
+        } else if(action==4) {
+            now+=137;ops->Tick(state,now);
+            if(now-lastBoost>=1000) {
+                lastBoost=now;
+                for(unsigned level=2;level<4;++level)while(!ready[level].empty()) {
+                    auto moved=ready[level].front();ready[level].pop_front();
+                    priority[moved]=1;ready[1].push_back(moved);
+                }
+            }
+        }
+        if(current[cpu]==NONE) {
+            uint16_t expected=pick(),actual=ops->PickNext(state);ASSERT(actual==expected);
+            current[cpu]=actual;
+            if(actual!=NONE){ASSERT(!running[actual]);running[actual]=true;}
+        }
+        unsigned count=0;for(auto& q:ready)count+=q.size();
+        ASSERT(ops->ReadyCount(state)==count);
+        constexpr uint64_t slices[]={5,10,20,40};
+        for(uint16_t task=0;task<N;++task)ASSERT(ops->Timeslice(state,task)==slices[priority[task]]);
+        if(step%127==0) {
+            std::vector<unsigned char> copy(ops->stateSize);std::memcpy(copy.data(),state,copy.size());
+            for(auto& q:ready)for(auto task:q)ASSERT(ops->PickNext(copy.data())==task);
+            ASSERT(ops->PickNext(copy.data())==NONE && ops->ReadyCount(copy.data())==0);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MLFQ-specific tests (only run for mlfq)
 // ---------------------------------------------------------------------------
 
-static void run_mlfq_priority_ordering(const SchedOps* ops, void* state) {
+TEST(mlfq_priority_ordering) {
     ops->Init(state);
     // Higher priority (lower number) should be picked first.
     ops->InitProcess(state, 0, 3); // LOW
@@ -482,13 +580,13 @@ static void run_mlfq_priority_ordering(const SchedOps* ops, void* state) {
     ops->Enqueue(state, 1);
     ops->Enqueue(state, 2);
     ops->Enqueue(state, 3);
-    assert(ops->PickNext(state) == 1); // REALTIME first
-    assert(ops->PickNext(state) == 3); // HIGH second
-    assert(ops->PickNext(state) == 2); // NORMAL third
-    assert(ops->PickNext(state) == 0); // LOW last
+    ASSERT(ops->PickNext(state) == 1); // REALTIME first
+    ASSERT(ops->PickNext(state) == 3); // HIGH second
+    ASSERT(ops->PickNext(state) == 2); // NORMAL third
+    ASSERT(ops->PickNext(state) == 0); // LOW last
 }
 
-static void run_mlfq_demotion(const SchedOps* ops, void* state) {
+TEST(mlfq_demotion) {
     ops->Init(state);
     // Process at NORMAL, expire timeslice → should demote to LOW.
     ops->InitProcess(state, 0, 2); // NORMAL
@@ -496,11 +594,11 @@ static void run_mlfq_demotion(const SchedOps* ops, void* state) {
     ops->TimesliceExpired(state, 0); // demote 0 → LOW
     ops->Enqueue(state, 0);
     ops->Enqueue(state, 1);
-    assert(ops->PickNext(state) == 1); // 1 is NORMAL, picked first
-    assert(ops->PickNext(state) == 0); // 0 is LOW, picked second
+    ASSERT(ops->PickNext(state) == 1); // 1 is NORMAL, picked first
+    ASSERT(ops->PickNext(state) == 0); // 0 is LOW, picked second
 }
 
-static void run_mlfq_boost(const SchedOps* ops, void* state) {
+TEST(mlfq_boost) {
     ops->Init(state);
     // Process demoted to LOW, then boost should bring it back to HIGH.
     ops->InitProcess(state, 0, 3); // LOW
@@ -509,33 +607,33 @@ static void run_mlfq_boost(const SchedOps* ops, void* state) {
     ops->Tick(state, 1001); // past boost interval
     // Process should now be at HIGH priority
     [[maybe_unused]] uint64_t ts = ops->Timeslice(state, 0);
-    assert(ts == 10); // HIGH timeslice
+    ASSERT(ts == 10); // HIGH timeslice
 }
 
-static void run_mlfq_timeslice_by_priority(const SchedOps* ops, void* state) {
+TEST(mlfq_timeslice_by_priority) {
     ops->Init(state);
     ops->InitProcess(state, 0, 0); // REALTIME
     ops->InitProcess(state, 1, 1); // HIGH
     ops->InitProcess(state, 2, 2); // NORMAL
     ops->InitProcess(state, 3, 3); // LOW
-    assert(ops->Timeslice(state, 0) == 5);
-    assert(ops->Timeslice(state, 1) == 10);
-    assert(ops->Timeslice(state, 2) == 20);
-    assert(ops->Timeslice(state, 3) == 40);
+    ASSERT(ops->Timeslice(state, 0) == 5);
+    ASSERT(ops->Timeslice(state, 1) == 10);
+    ASSERT(ops->Timeslice(state, 2) == 20);
+    ASSERT(ops->Timeslice(state, 3) == 40);
 }
 
-static void run_mlfq_voluntary_yield_boosts(const SchedOps* ops, void* state) {
+TEST(mlfq_voluntary_yield_boosts) {
     ops->Init(state);
     ops->InitProcess(state, 0, 3); // LOW
     ops->VoluntaryYield(state, 0); // boost → NORMAL
-    assert(ops->Timeslice(state, 0) == 20);
+    ASSERT(ops->Timeslice(state, 0) == 20);
     ops->VoluntaryYield(state, 0); // boost → HIGH
-    assert(ops->Timeslice(state, 0) == 10);
+    ASSERT(ops->Timeslice(state, 0) == 10);
     ops->VoluntaryYield(state, 0); // already HIGH, should stay
-    assert(ops->Timeslice(state, 0) == 10);
+    ASSERT(ops->Timeslice(state, 0) == 10);
 }
 
-static void run_mlfq_priority_fairness(const SchedOps* ops, void* state) {
+TEST(mlfq_priority_fairness) {
     // Within each priority band, processes should get equal time.
     // Create 4 HIGH and 4 LOW processes.
     ops->Init(state);
@@ -555,7 +653,7 @@ static void run_mlfq_priority_fairness(const SchedOps* ops, void* state) {
             ops->Tick(state, simTime);
         }
         uint16_t pid = ops->PickNext(state);
-        assert(pid != NONE);
+        ASSERT(pid != NONE);
         counts[pid]++;
         ops->Enqueue(state, pid);
     }
@@ -573,11 +671,11 @@ static void run_mlfq_priority_fairness(const SchedOps* ops, void* state) {
     }
 
     // HIGH processes should get more than LOW.
-    assert(highMin > lowMax);
+    ASSERT(highMin > lowMax);
 
     // Within each band, fairness: max/min ratio < 2.
-    assert(highMax <= highMin * 2);
-    assert(lowMax <= lowMin * 2);
+    ASSERT(highMax <= highMin * 2);
+    ASSERT(lowMax <= lowMin * 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -605,32 +703,17 @@ static void RunCommonTests(const SchedOps* ops, void* state) {
     invoke_idle_wake_after_all_exit_new_process(ops, state);
     invoke_idle_repeated_block_unblock_cycle(ops, state);
     invoke_idle_simulation(ops, state);
+    invoke_full_capacity_recycle(ops,state);
 }
 
 static void RunMlfqTests(const SchedOps* ops, void* state) {
-    printf("  %-50s ", "mlfq_priority_ordering");
-    run_mlfq_priority_ordering(ops, state);
-    printf("PASS\n"); g_passed++;
-
-    printf("  %-50s ", "mlfq_demotion");
-    run_mlfq_demotion(ops, state);
-    printf("PASS\n"); g_passed++;
-
-    printf("  %-50s ", "mlfq_boost");
-    run_mlfq_boost(ops, state);
-    printf("PASS\n"); g_passed++;
-
-    printf("  %-50s ", "mlfq_timeslice_by_priority");
-    run_mlfq_timeslice_by_priority(ops, state);
-    printf("PASS\n"); g_passed++;
-
-    printf("  %-50s ", "mlfq_voluntary_yield_boosts");
-    run_mlfq_voluntary_yield_boosts(ops, state);
-    printf("PASS\n"); g_passed++;
-
-    printf("  %-50s ", "mlfq_priority_fairness");
-    run_mlfq_priority_fairness(ops, state);
-    printf("PASS\n"); g_passed++;
+    invoke_mlfq_priority_ordering(ops,state);
+    invoke_mlfq_demotion(ops,state);
+    invoke_mlfq_boost(ops,state);
+    invoke_mlfq_timeslice_by_priority(ops,state);
+    invoke_mlfq_voluntary_yield_boosts(ops,state);
+    invoke_mlfq_priority_fairness(ops,state);
+    invoke_mlfq_model_interleaved_cpus(ops,state);
 }
 
 int main(int argc, char* argv[]) {

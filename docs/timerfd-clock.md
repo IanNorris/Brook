@@ -118,5 +118,34 @@ the corrected check bounds counts against actual selected-clock elapsed time
 and observed the expected 34 counts. No production fix was made to satisfy
 that mistaken assertion.
 
-A separate native-window, PipeWire run is prepared for user feedback on real
-YouTube playback. Its results are separate from this controlled acceptance.
+In a separate native-window/PipeWire review, the user reported almost perfect
+YouTube video playback and a substantial improvement in page responsiveness.
+Occasional audible stutters remain. This is subjective real-site feedback,
+separate from the controlled counters above. The user also reported CSD shadows
+repeatedly darkening then resetting. The CPU compositor blends partial window
+updates onto its previous scene and restores wallpaper every 500 ms. The
+subsequent CPU region-recomposition repair passed guest shadow-stability and
+launcher pointer tests; see [signal and desktop follow-up](signal-desktop-followup.md).
+
+### Live concurrent profile
+
+The same native review produced a 500 ms capture with 399 CPU samples and
+12,637 context switches, no producer drops and matched exported event counts.
+327 samples were idle; the separate untruncated census found 382 Firefox
+lineage tasks and 112 Chromium lineage tasks. These are tasks, including
+threads, rather than 494 independent browser processes. Among outgoing switch
+stacks, 1,164 passed through the epoll readiness graph mutex and 389 through
+its waiter/deadline path. These counts suggest lock contention as a useful
+follow-up; they do not quantify blocked wall time or establish the main cause.
+IRQ-masked execution is not sampled uniformly. Resolving the exact loaded
+module maps eighteen driver samples to HDA MMIO read paths and one to the
+playback lock. These sample counts do not establish their elapsed-time cost.
+
+A separate passive real-site PCM capture contained seven adjacent silent
+10 ms bins. The source itself can contain silence, so this is not by itself
+proof of an underrun. No screenshots or profiling ran during that audio
+interval. The native review later exhausted physical memory after STK was
+started alongside both browsers and panicked while writing a signal frame.
+Its disks remain forensic; subsequent acceptance used fresh private copies of
+the last checked image. The [follow-up](signal-desktop-followup.md) records the
+contained signal-copy failures and desktop checks.
