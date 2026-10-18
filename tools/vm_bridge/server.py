@@ -833,6 +833,12 @@ def video_recording(session,action="status",duration_s=30,fps=30,audio=True,widt
     descriptor=REGISTRY/session/"video-recording.json"
     # Validate session before forming/reading scoped recording paths.
     data=load_session(session,live=action!="status")
+    if data.get("private_rfb_available") is False:
+        reason=data.get("recording_unavailable_reason","Private recording transport unavailable")
+        if action=="start":
+            raise ValueError(reason+"; use EGL-headless or a non-GL display for video recording")
+        if action=="status" and not descriptor.exists():
+            return {"state":"idle","session":session,"available":False,"reason":reason}
     if action=="status":
         if not descriptor.exists():return {"state":"idle","session":session}
         state=json.loads(descriptor.read_text())

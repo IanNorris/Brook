@@ -21,6 +21,17 @@ from lifecycle import launch_args as lifecycle_launch_args
 def recording_display_args(command):
     """Initialize private QMP VNC/audio access alongside the selected UI."""
     args=list(command)
+    native_gl=any(args[i]=="-display" and
+                  args[i+1].split(",")[0] in {"sdl","gtk"} and
+                  any(option in {"gl=on","gl=core","gl=es"} for option in args[i+1].split(",")[1:])
+                  for i in range(len(args)-1))
+    if native_gl:
+        # QEMU rejects its VNC display listener even when it is private/none
+        # alongside these GL frontends. Frame leases and WAV capture use QMP
+        # independently; do not prevent the user's native VM from starting.
+        if "-vnc" in args:
+            raise ValueError("Native OpenGL display cannot be combined with VNC")
+        return args
     if "-vnc" not in args:args.extend(["-vnc","none"])
     index=args.index("-vnc")+1
     # run-qemu's output backend is hda0, including silent playback. Preserve
@@ -74,6 +85,9 @@ def supervise(command, kernel, disk, debug_port, provenance, scenario):
                   "gpu": os.environ.get("BROOK_GPU", "software"),
                   "render_node": os.environ.get("BROOK_RENDERNODE", "/dev/dri/renderD128"),
                   "cloned_disks": os.environ.get("BROOK_VM_CLONED_DISKS") == "1"}
+    descriptor["private_rfb_available"] = "-vnc" in args
+    if not descriptor["private_rfb_available"]:
+        descriptor["recording_unavailable_reason"] = "Native OpenGL display is incompatible with QEMU VNC"
     write_json(directory / "session.json", descriptor)
     print(f"Brook VM bridge session: {session}\nRegistry: {directory}", flush=True)
 

@@ -168,3 +168,22 @@ retained their original hashes and ownership. Evidence:
 `2cab1de4c4e347c5b92792e88a89a6a2`, recording
 `d7913c6603e24dcbbf9f21f490c72558`. GPU native-window recording, 4K and reset
 during capture remain open. No final showcase has begun.
+
+## Native OpenGL display compatibility — 18 October 2026
+
+The user review launch exposed a QEMU frontend restriction: adding even a
+private `-vnc none,audiodev=hda0` alongside `-display sdl,gl=on` prevents startup
+with “Display vnc is incompatible with the GL context.” The bridge now leaves
+VNC disabled for native SDL/GTK OpenGL displays. An explicit conflicting VNC
+selection is rejected before QEMU starts. CPU SDL and EGL-headless displays
+retain their private RFB/audio transport.
+
+Session metadata reports private-RFB availability. Video recording requests on
+the native-GL configuration report the unsupported transport before dispatch;
+kernel frame capture and QMP WAV capture remain independent. Native GPU video
+recording still needs another capture path; this fix does not complete it.
+
+All 25 recording/transport tests pass with the media runtime, including actual
+socket descriptor handoff. The user's restarted review VM was verified running
+with `sdl,gl=on`, PipeWire and no VNC option. Live application acceptance and
+checked shutdown of that user-owned session remain separate.

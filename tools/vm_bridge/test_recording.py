@@ -140,10 +140,34 @@ class PrivateHandoffTests(unittest.TestCase):
             self.assertFalse(process_is_alive(worker.pid,identity))
         finally:worker.wait()
 
-    def test_native_display_initialized_without_listening_socket(self):
+    def test_native_gl_display_does_not_add_incompatible_vnc(self):
         args=recording_display_args(['qemu','-display','sdl,gl=on','-audiodev','none,id=hda0'])
-        self.assertEqual(args[-2:],['-vnc','none,audiodev=hda0'])
+        self.assertNotIn('-vnc',args)
         self.assertIn('sdl,gl=on',args)
+
+    def test_native_software_display_keeps_private_audio_recording(self):
+        args=recording_display_args(['qemu','-display','sdl','-audiodev','none,id=hda0'])
+        self.assertEqual(args[-2:],['-vnc','none,audiodev=hda0'])
+
+    def test_egl_headless_keeps_private_audio_recording(self):
+        args=recording_display_args(['qemu','-display','egl-headless,rendernode=/dev/dri/renderD128','-audiodev','none,id=hda0'])
+        self.assertEqual(args[-2:],['-vnc','none,audiodev=hda0'])
+
+    def test_explicit_native_gl_vnc_conflict_is_reported(self):
+        with self.assertRaisesRegex(ValueError,'OpenGL.*VNC'):
+            recording_display_args(['qemu','-display','gtk,gl=on','-vnc','none'])
+
+    def test_native_gl_recording_is_unavailable_before_worker_dispatch(self):
+        import server
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            descriptor={'private_rfb_available':False,'recording_unavailable_reason':'Native OpenGL display is incompatible with QEMU VNC'}
+            with patch.object(server,'REGISTRY',Path(directory)),patch.object(server,'load_session',return_value=descriptor):
+                status=server.video_recording('a'*32,action='status')
+                self.assertFalse(status['available'])
+                with self.assertRaisesRegex(ValueError,'Native OpenGL'):
+                    server.video_recording('a'*32,action='start')
+            self.assertEqual(list(Path(directory).iterdir()),[])
 
     def test_preserves_existing_vnc_security_and_audio_selection(self):
         args=recording_display_args(['qemu','-vnc','127.0.0.1:1,password=on,audiodev=other','-audiodev','none,id=hda0'])
