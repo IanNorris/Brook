@@ -36,6 +36,10 @@ public:
     FileMappingGateSet(const FileMappingGateSet&) = delete;
     FileMappingGateSet& operator=(const FileMappingGateSet&) = delete;
     bool Lock(AddressSpaceState* space,MappingBacking* incoming,MappingBacking* onlyBacking);
+    // Leaf-only fault preparation/publication: retain only the current range
+    // backing, acquire its file gate before AS mutation, and retry if topology
+    // changes. Caller must not modify range metadata or access another range.
+    bool LockAddress(AddressSpaceState* space,uint64_t address);
     void Unlock();
     void Finish();
 private:

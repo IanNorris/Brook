@@ -1109,12 +1109,126 @@ static void fileMappingGateOom() {
         failHeapAfter=0;CHECK(gates.Lock(space,nullptr,aliases[0]));
         CHECK(failHeapAfter==0);failHeapAfter=-1;gates.Unlock();
     }
+    // Reuse the dynamic/hash-backed full-space snapshot for a single target.
+    // Its old hash slots must not suppress the new target descriptor pin.
+    {
+        failHeapAfter=0;CHECK(gates.LockAddress(space,va.raw()));
+        CHECK(backings[0]->references+aliases[0]->references==before[0]+1);
+        for(unsigned i=1;i<10;++i)CHECK(backings[i]->references+aliases[i]->references==before[i]);
+        CHECK(failHeapAfter==0);failHeapAfter=-1;gates.Unlock();
+    }
     gates.Finish();
     for(unsigned i=0;i<10;++i)CHECK(backings[i]->references+aliases[i]->references==before[i]);
     AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
     for(unsigned i=0;i<10;++i){CHECK(!FileMappingRegisteredRanges(&files[i]));MappingBackingUnref(backings[i]);MappingBackingUnref(aliases[i]);FileObjectDispose(&files[i]);}
     CHECK(released==20);VmmDestroyUserPageTable(root);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
     std::puts("FILE GATES PASS dynamic-capacity/OOM-unchanged/brk-contract/no-reference-leaks");
+}
+static void addressFileGateScope() {
+    auto root=table();VmmHostSetKernelRoot(root);AddressSpaceKernelInit();
+    auto* space=AddressSpaceCreate(52);Process actor{};actor.addressSpace=space;
+    FileObject target{},unrelated{};FileObjectInit(&target);FileObjectInit(&unrelated);
+    unsigned released=0;
+    auto* backing=MappingBackingCreate(&released,rangeBackingReleased);
+    auto* other=MappingBackingCreate(&released,rangeBackingReleased);
+    CHECK(backing && other);backing->file=&target;other->file=&unrelated;
+    {
+        MappingTransaction operation(&actor,space,backing);CHECK(operation.PrepareRanges(2)&&operation.Lock());
+        CHECK(operation.InsertRange(rangeRecord(va.raw(),va.raw()+pageSize,backing)));
+        CHECK(operation.InsertRange(rangeRecord(va.raw()+2*pageSize,va.raw()+3*pageSize,nullptr)));
+    }
+    {
+        MappingTransaction operation(&actor,space,other);CHECK(operation.PrepareRanges(1)&&operation.Lock());
+        CHECK(operation.InsertRange(rangeRecord(va.raw()+4*pageSize,va.raw()+5*pageSize,other)));
+    }
+    const auto generation=space->generation;
+    const auto targetRefs=backing->references,otherRefs=other->references;
+    Gate acquired;
+    std::thread holder([&] {
+        FileMappingGateSet gates;CHECK(gates.LockAddress(space,va.raw()));
+        acquired.park();gates.Unlock();
+    });
+    acquired.wait(1);
+    const bool targetFree=hostMutex(&target.gate).try_lock();
+    if(targetFree)hostMutex(&target.gate).unlock();
+    const bool unrelatedFree=hostMutex(&unrelated.gate).try_lock();
+    if(unrelatedFree)hostMutex(&unrelated.gate).unlock();
+    acquired.release();holder.join();CHECK(!targetFree && unrelatedFree);
+    std::mutex completionMutex;std::condition_variable completion;bool done=false;
+    KMutexLock(&unrelated.gate);failHeapAfter=0;
+    std::thread reader([&] {
+        FileMappingGateSet gates;
+        for(auto address:{va.raw(),va.raw()+2*pageSize,va.raw()+8*pageSize}) {
+            CHECK(gates.LockAddress(space,address));
+            CHECK(backing->references==targetRefs+(address==va.raw()?1:0));
+            CHECK(other->references==otherRefs);gates.Unlock();
+        }
+        std::lock_guard<std::mutex> lock(completionMutex);done=true;completion.notify_all();
+    });
+    bool completedWhileHeld;
+    {
+        std::unique_lock<std::mutex> lock(completionMutex);
+        completedWhileHeld=completion.wait_for(lock,std::chrono::seconds(2),[&]{return done;});
+    }
+    KMutexUnlock(&unrelated.gate);reader.join();
+    const bool noHeapAttempt=failHeapAfter==0;failHeapAfter=-1;
+    CHECK(completedWhileHeld && noHeapAttempt && space->generation==generation);
+    CHECK(backing->references==targetRefs && other->references==otherRefs);
+    // Pause after retaining the old target and dropping AS mutation, before
+    // acquiring its file gate. A concurrent replacement must force retry and
+    // acquire/pin the new range instead of returning with the old gate.
+    Gate paused;pageAccessPauseMutex=&target.gate;pageAccessPause=&paused;
+    std::atomic<bool> finished{false};
+    std::thread racing([&] {
+        pageAccessPauseOnce=true;FileMappingGateSet gates;
+        CHECK(gates.LockAddress(space,va.raw()));
+        CHECK(MappingRangeFind(space->ranges,va.raw())->backing==other);
+        CHECK(released==1 && other->references==otherRefs+2);
+        gates.Unlock();finished=true;
+    });
+    paused.wait(1);
+    // Once the old VMA retires, only the acquisition pin owns this descriptor.
+    MappingBackingUnref(backing);backing=nullptr;
+    {
+        MappingTransaction operation(&actor,space,other);CHECK(operation.PrepareRanges(1)&&operation.Lock());
+        auto replacement=rangeRecord(va.raw(),va.raw()+pageSize,other);
+        CHECK(operation.ReplaceMapping(va.raw(),va.raw()+pageSize,&replacement));
+    }
+    CHECK(!finished);paused.release();racing.join();pageAccessPauseMutex=nullptr;pageAccessPause=nullptr;
+    CHECK(released==1 && other->references==otherRefs+1);
+    {
+        MappingTransaction operation(&actor,space);MappingFaultSnapshot snapshot{};
+        CHECK(operation.LockFaultRange(va.raw()));
+        CHECK(operation.CaptureRange(va.raw(),1,snapshot));
+        MappingFaultSnapshot unrelatedSnapshot{};
+        CHECK(!operation.CaptureRange(va.raw()+4*pageSize,1,unrelatedSnapshot));
+        operation.Unlock();CHECK(operation.Prepare(0,1,1));
+        CHECK(operation.PrepareZeroed(MemTag::User,52));
+        CHECK(operation.LockFaultRange(va.raw()));CHECK(operation.ValidateRange(snapshot,va.raw(),1));
+        CHECK(operation.PublishFault(snapshot,0,va,1,false)==MappingFaultCommit::Mapped);
+        CHECK(operation.PublishFault(snapshot,0,va+4*pageSize,1,false)==MappingFaultCommit::Stale);
+    }
+    CHECK(VmmReadLeaf(space->pageTable,va)&VMM_PRESENT);
+    // File-content generation changes and topology changes both invalidate
+    // staged snapshots. A missing range cannot validate or publish a leaf.
+    {
+        MappingTransaction operation(&actor,space);MappingFaultSnapshot snapshot{};
+        CHECK(operation.LockFaultRange(va.raw()));CHECK(operation.CaptureRange(va.raw(),1,snapshot));
+        operation.Unlock();
+        KMutexLock(&unrelated.gate);++unrelated.generation;KMutexUnlock(&unrelated.gate);
+        CHECK(operation.LockFaultRange(va.raw()));CHECK(!operation.ValidateRange(snapshot,va.raw(),1));
+    }
+    {
+        MappingTransaction operation(&actor,space);MappingFaultSnapshot snapshot{};
+        CHECK(operation.LockFaultRange(va.raw()+8*pageSize));
+        CHECK(!operation.CaptureMapping(va.raw()+8*pageSize,snapshot));
+        CHECK(!operation.CaptureMapping(va.raw(),snapshot));
+    }
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
+    MappingBackingUnref(backing);MappingBackingUnref(other);CHECK(released==2);
+    FileObjectDispose(&target);FileObjectDispose(&unrelated);
+    VmmDestroyUserPageTable(root);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("ADDRESS FILE GATE PASS target/anonymous/hole/no-allocation/unrelated-held/replacement-retry/pins");
 }
 static void targetFileInvalidation() {
     auto root=table();VmmHostSetKernelRoot(root);AddressSpaceKernelInit();
@@ -1696,7 +1810,7 @@ int main(int argc,char** argv) {
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
     liveMappingClone();sharedMappingClone();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
-    fileMappingRegistrations();fileMappingGateOom();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
+    fileMappingRegistrations();fileMappingGateOom();addressFileGateScope();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
     targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();
     anonymousDiscard();memoryCensus();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");

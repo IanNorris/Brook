@@ -1148,3 +1148,29 @@ The acceptance image lacks `/bin/bash`; the old shell silently resolves that
 spelling via fallback lookup. Structured jobs require an actual executable
 path (`/boot/BIN/BASH` on that image). Audit standard executable aliases as part
 of the fresh-image and real-workload follow-up.
+
+
+### Mapping contention and persistence boundaries (18 October)
+
+- Reduce resident-page validation contention separately from demand faults.
+  Firefox playback still blocks frequently in `UserMappingPageAccess` for
+  clock output and futex readability checks, while measured ready-queue waits
+  are short. Review an AS reader/writer lock conversion: concurrent read checks,
+  exclusive topology/PTE mutation, cache-free AVL lookups or atomic positive
+  cache slots, a nonblocking read-try path for exception diagnostics, nested
+  ownership/cancellation, and CoW drop/reacquire/revalidation. Preserve mapping
+  node lifetime; a generation check alone does not pin retired nodes.
+- FAT stale-EOF growth: the deterministic prepared-EOF/grow/release case returns
+  SIGBUS after a successful write. Reproduces on both the old frozen hook kernel
+  and the scoped-fault candidate; ext2 passes. FAT lacks the canonical
+  `FileObject` generation/gate accessor used by ext2. Add equivalent shared file
+  identity and mutation ordering before claiming the same mapped-resize/fault
+  coherence across filesystems. Do not consume stale EOF observations or perform
+  filesystem I/O while holding AS mutation as a workaround.
+- SQLite WAL remains blocked by writable shared regular-file mmap. Synthetic
+  SQLite 3.51.2 tests pass DELETE/TRUNCATE/PERSIST transactions and read-only
+  reopens, but WAL fails with `SQLITE_IOERR_SHMMAP` (5386). Preserve the coherent
+  shared-file/writeback plan; never substitute MAP_PRIVATE for MAP_SHARED.
+  Firefox profile/consent persistence still requires same-disk browser restart
+  acceptance after these boundaries are addressed. Preserve the clean native
+  review disk; do not infer persistence from fresh clones or filesystem fsck.

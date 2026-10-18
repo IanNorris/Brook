@@ -2433,5 +2433,88 @@ audio is inactive. Checked sync, launcher exit zero, serial audit and all three
 offline filesystem checks pass. All 38 hosted suites pass. Both full bootstrap
 paths still need rerunning with the 38-suite expectation. Source hashes,
 profiles, counter snapshots and the exact protocol are retained under the run
-folder. The later native user review is separate and remains unaccepted until
-handback and its own checked shutdown.
+folder. The later native user review is separate; its checked shutdown is recorded below.
+
+
+The subsequent native `mapping-ready-live-review-20261018` user run reports no
+noticeable overall improvement. With both browsers playing, 128,664 recorded
+user queue episodes have a p95 upper bound of 50 µs and a maximum of 859 µs.
+After the user closes Chromium, its window disappears before its background
+tasks; the observer waits for zero launch-lineage tasks before the next capture.
+Firefox alone has 83,272 episodes, a p95 upper bound of 25 µs and a maximum of
+187 µs. Short profiles have zero drops, with validation-access stacks in
+907/2,786 and 622/1,847 non-idle outgoing switches respectively. The broad file
+gate stacks observed during loading are largely absent during these playback
+captures. These observations distinguish two candidate bottlenecks rather than
+showing that narrower fault gates alone will fix playback.
+
+The simultaneous capture records 441,118 audio frames; Firefox alone records
+zero, with no mixer streams in the before/after snapshots. This confirms the
+missing Firefox audio is upstream of the device in this interval, without
+identifying a decoder, browser state or backend cause. Profile files are owned
+by uid 1000 in `/data/home/.mozilla/brook` and are being updated; a read-only
+cookie query is blocked by the live database lock. The fresh review disk is
+cloned from an earlier accepted seed, so consent state from a later discarded
+review is not expected to carry over. Same-disk consent persistence across a
+clean browser restart still needs explicit verification.
+
+A candidate introduces address-scoped fault transactions: retain
+the target range's backing under AS mutation, drop AS mutation, lock only its
+file gate, then reacquire AS mutation and retry on topology generation changes.
+Anonymous and absent ranges acquire no file gate. Scoped transactions reject
+range edits and out-of-range snapshots/publication. File generation validation,
+EOF handling, preparation and retirement ownership remain in the fault path.
+The host-native mapping fixture checks unrelated-gate independence, allocation-
+free acquisition, replacement during acquisition, exact backing pins, scoped
+publication, missing ranges and file-generation invalidation. The native user VM used its previous frozen kernel throughout testing;
+source edits did not change that run. Subsequent guest acceptance is recorded
+below. This change does not claim an overall browser performance improvement.
+
+
+The first native Firefox-only interval overlaps a CPU-heavy hosted
+`test_fd_table` run, so it is not a clean host-load comparison. The observer
+records that confound, stops all 17 threads of its own hosted test and repeats
+the same live Firefox page under `firefox-alone-host-quiet`. After user handback, the test is resumed and the broad suite completes 38/38.
+The final source build, including additional backing-lifetime and hashed-cache
+reuse checks, independently passes all 38 hosted suites in 6.58 seconds. The
+earlier paused run's elapsed time is not a test performance measurement.
+
+
+### Scoped fault-gate guest acceptance
+
+The native review ends with both browser lineages drained, inactive post-exit
+audio, checked sync, launcher exit zero, a clean serial audit and all three
+offline filesystem checks passing. Its profile disk is preserved unchanged for
+future same-disk persistence tests. A read-only guest SQLite query after exit
+returns an I/O error; this does not establish profile persistence. Real cookie
+payloads are not copied into diagnostic artifacts.
+
+The separate `fault-gates-hooks-20261018` kernel passes 13/13 EOF cases and
+22/22 deterministic mapping cases on ext2. FAT passes the same 22 mapping cases
+and 12/13 EOF cases: growing a file while an EOF observation is staged still
+produces SIGBUS. `fault-gates-fat-baseline-20261018`, using the previously frozen
+hook kernel, reproduces that exact FAT failure on the same clean seed. FAT has
+no `FileObject` accessor/generation for these fallback mappings, unlike ext2.
+This existing boundary remains open rather than being counted as a passing
+regression. Both guests drain their jobs, stop with checked sync and exit zero,
+and pass serial and all three offline filesystem checks. The hook and ordinary
+kernels both pass the supported compiled-entry audit.
+
+The ordinary `fault-gates-production-20261018` kernel passes the 10 non-hook EOF
+cases on each filesystem. Its synthetic SQLite 3.51.2 probe passes DELETE,
+TRUNCATE and PERSIST transactions, concurrent read-only access and read-only
+reopening. WAL fails at creation with `SQLITE_IOERR_SHMMAP` (5386), reproducing
+the explicit writable shared-file-mapping limitation without touching user
+databases. The same probe passes all four modes on the Linux host. WAL remains
+unaccepted; the diagnostic exits one when any mode fails.
+
+Firefox and Chromium start through their normal semantic launchers and coexist
+with both windows registered. Firefox's controlled local H.264/AAC capture
+records 441,129 frames with no near-silent 10 ms bins over a 10.078-second host
+observation. This does not establish Firefox YouTube audio or general playback
+performance. First-window observations of approximately 13.0/7.7 seconds are
+not a controlled comparison with earlier runs: other diagnostics prewarmed this
+guest before launching browsers. Both browser lineages drain, post-exit audio
+is inactive, heap integrity passes, checked sync succeeds, the launcher exits
+zero, and the serial audit and all three offline filesystem checks pass.
+Full bootstrap paths and broader real-app regressions remain open.

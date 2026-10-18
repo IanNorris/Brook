@@ -28,6 +28,9 @@ public:
     bool StagePage(uint64_t index, PhysicalAddress physical, bool managed);
     PhysicalAddress PreparedPage(uint64_t index) const;
     bool Lock(); // OOM acquiring the file set leaves metadata unchanged
+    // Leaf-only scope: current range gate + AS mutation, with generation retry.
+    // Cannot be used for range edits or publication outside that range.
+    bool LockFaultRange(uint64_t address);
     void Unlock();
     void Changed(bool requiresShootdown = true);
     // Capture ownership while old metadata is still present; detach before
@@ -74,6 +77,7 @@ private:
     struct RetiredLeaf { uint64_t raw; bool managed; };
     struct FreshPage { PhysicalAddress physical; VirtualAddress publishedAt; uint64_t publicationEpoch; bool published, settled, managed; };
     struct Backing { void* pointer; void (*release)(void*); };
+    bool FaultScopeContains(uint64_t address) const;
     bool Borrowed(VirtualAddress address, uint64_t leaf) const;
     bool HoldBacking(void* backing, void (*release)(void*));
     static void CaptureDetachedLeaf(VirtualAddress address, uint64_t leaf, void* context);
@@ -92,6 +96,8 @@ private:
     MappingBacking* incoming_;
     MappingBacking* onlyBacking_;
     FileMappingGateSet fileGates_;
+    bool faultScoped_ = false;
+    uint64_t faultBegin_ = 0, faultEnd_ = 0;
 };
 // Narrow truncate foundation: the caller retains the file/backing and owns its
 // file gate through this object's destruction (including ACK). This type cannot

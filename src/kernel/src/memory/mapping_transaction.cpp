@@ -84,9 +84,23 @@ PhysicalAddress MappingTransaction::PreparedPage(uint64_t index) const {
     return index < freshCapacity_ ? fresh_[index].physical : PhysicalAddress{};
 }
 bool MappingTransaction::Lock() {
-    if (locked_) KernelPanic("mapping: recursive mutation lock");
+    if (locked_ || faultScoped_) KernelPanic("mapping: recursive or widened mutation lock");
     if(!fileGates_.Lock(space_,incoming_,onlyBacking_))return false;
     locked_ = true; ++lockEpoch_;return true;
+}
+bool MappingTransaction::LockFaultRange(uint64_t address) {
+    if (locked_ || incoming_ || onlyBacking_)
+        KernelPanic("mapping: invalid fault range lock");
+    faultScoped_ = true;
+    if (!fileGates_.LockAddress(space_,address)) return false;
+    locked_ = true; ++lockEpoch_;
+    const auto* range = MappingRangeFind(space_->ranges,address);
+    faultBegin_ = range ? range->begin : 0;
+    faultEnd_ = range ? range->end : 0;
+    return true;
+}
+bool MappingTransaction::FaultScopeContains(uint64_t address) const {
+    return !faultScoped_ || (address >= faultBegin_ && address < faultEnd_);
 }
 void MappingTransaction::Unlock() {
     if (locked_) { locked_ = false; fileGates_.Unlock(); }
@@ -102,7 +116,7 @@ bool MappingTransaction::Borrowed(VirtualAddress address, uint64_t) const {
     return false;
 }
 bool MappingTransaction::Detach(VirtualAddress address) {
-    if (!locked_) KernelPanic("mapping: detach without mutation lock");
+    if (!locked_ || !FaultScopeContains(address.raw())) KernelPanic("mapping: detach outside locked scope");
     if (retiredCount_ == retiredCapacity_) return false;
     uint64_t old = VmmDetachPage(space_->pageTable, address);
     if (old) {
@@ -113,7 +127,7 @@ bool MappingTransaction::Detach(VirtualAddress address) {
 }
 VmmMapResult MappingTransaction::Publish(uint64_t index, VirtualAddress address,
                                         uint64_t flags, MemTag tag, uint16_t pid, bool accessible) {
-    if (!locked_ || index >= freshCapacity_ ||
+    if (!locked_ || !FaultScopeContains(address.raw()) || index >= freshCapacity_ ||
         !fresh_[index].physical || fresh_[index].published)
         KernelPanic("mapping: invalid prepared publication");
     if (tag == MemTag::Device && fresh_[index].managed)
@@ -171,7 +185,7 @@ bool MappingTransaction::PrepareRanges(uint64_t nodes) {
     return ranges_.Prepare(nodes);
 }
 bool MappingTransaction::RemoveMappingWithRetirer(uint64_t begin,uint64_t end,VmmRetireLeaf retire,void* context) {
-    if (!locked_) KernelPanic("mapping: external retirement without lock");
+    if (!locked_ || faultScoped_) KernelPanic("mapping: external retirement without lock or in fault scope");
     if (!ranges_.CanReplace(space_->ranges,begin,end)) return false;
     uint64_t detached=0;
     if (!VmmDetachRange(space_->pageTable,begin,end,~uint64_t{0},retire,context,&detached)) return false;
@@ -179,7 +193,7 @@ bool MappingTransaction::RemoveMappingWithRetirer(uint64_t begin,uint64_t end,Vm
     Changed(detached!=0);return true;
 }
 bool MappingTransaction::ReplaceMapping(uint64_t begin, uint64_t end, const MappingRange* replacement) {
-    if (!locked_) KernelPanic("mapping: range replacement without lock");
+    if (!locked_ || faultScoped_) KernelPanic("mapping: range replacement without lock or in fault scope");
     if (!ranges_.CanReplace(space_->ranges,begin,end,replacement)) return false;
     uint64_t detached = 0;
     if (!VmmDetachRange(space_->pageTable,begin,end,retiredCapacity_-retiredCount_,
@@ -201,17 +215,17 @@ bool MappingTransaction::RangeLeafCount(uint64_t begin, uint64_t end, uint64_t& 
     return VmmCountRangeLeaves(space_->pageTable,begin,end,&count);
 }
 bool MappingTransaction::InsertRange(const MappingRange& range) {
-    if (!locked_) KernelPanic("mapping: range insertion without lock");
+    if (!locked_ || faultScoped_) KernelPanic("mapping: range insertion without lock or in fault scope");
     if (!ranges_.Insert(space_->ranges,range)) return false;
     Changed(false); return true;
 }
 bool MappingTransaction::ExtendRange(uint64_t identity,uint64_t end) {
-    if (!locked_) KernelPanic("mapping: extension without lock");
+    if (!locked_ || faultScoped_) KernelPanic("mapping: extension without lock or in fault scope");
     if (!ranges_.Extend(space_->ranges,identity,end)) return false;
     Changed(false);return true;
 }
 bool MappingTransaction::ProtectRange(uint64_t begin, uint64_t end, uint32_t protection) {
-    if (!locked_) KernelPanic("mapping: range protection without lock");
+    if (!locked_ || faultScoped_) KernelPanic("mapping: range protection without lock or in fault scope");
     if (!ranges_.Protect(space_->ranges,begin,end,protection)) return false;
     Changed(); return true;
 }
@@ -221,7 +235,7 @@ bool MappingTransaction::PrivateLeaf(VirtualAddress address, uint64_t, void* con
     return range && range->sharing == MappingSharing::Private && range->leafOwnership == MappingLeafOwnership::Managed;
 }
 bool MappingTransaction::ProtectMapping(uint64_t begin, uint64_t end, uint32_t protection) {
-    if (!locked_) KernelPanic("mapping: protection without lock");
+    if (!locked_ || faultScoped_) KernelPanic("mapping: protection without lock or in fault scope");
     if (protection)for(auto* node=space_->ranges.head;node && node->range.begin<end;node=node->next) {
         const auto& range=node->range;
         if(range.end>begin && range.backing && range.backing->file && range.backing->file->mappingError)return false;
@@ -234,6 +248,7 @@ bool MappingTransaction::ProtectMapping(uint64_t begin, uint64_t end, uint32_t p
 static void ReleaseMappingBacking(void* backing) { MappingBackingUnref(static_cast<MappingBacking*>(backing)); }
 bool MappingTransaction::CaptureMapping(uint64_t address, MappingFaultSnapshot& snapshot) {
     if (!locked_) KernelPanic("mapping: range snapshot without lock");
+    if (!FaultScopeContains(address)) return false;
     const auto* range = MappingRangeFind(space_->ranges,address);
     if (!range) return false;
     if (range->backing) {
@@ -248,12 +263,14 @@ bool MappingTransaction::CaptureMapping(uint64_t address, MappingFaultSnapshot& 
 }
 bool MappingTransaction::CaptureRange(uint64_t address, uint32_t access, MappingFaultSnapshot& snapshot) {
     if (!locked_) KernelPanic("mapping: range snapshot without lock");
+    if (!FaultScopeContains(address)) return false;
     const auto* range=MappingRangeFind(space_->ranges,address);
     if (!range || !access || (access & ~range->protection)) return false;
     return CaptureMapping(address,snapshot);
 }
 bool MappingTransaction::ValidateMapping(const MappingFaultSnapshot& snapshot, uint64_t address) const {
     if (!locked_) KernelPanic("mapping: range validation without lock");
+    if (!FaultScopeContains(address)) return false;
     if (snapshot.addressSpaceIdentity != space_->identity || snapshot.generation != space_->generation) return false;
     const auto* range = MappingRangeFind(space_->ranges,address);
     const auto& old = snapshot.range;

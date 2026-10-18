@@ -962,7 +962,7 @@ MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error) {
     const uint32_t access=(error&2)?2u:((error&16)?4u:1u);
     for (;;) {
         MappingTransaction operation(actor,actor->addressSpace);
-        if(!operation.Lock())return MappingFaultResult::Unhandled;MappingFaultSnapshot snapshot{};
+        if(!operation.LockFaultRange(page))return MappingFaultResult::Unhandled;MappingFaultSnapshot snapshot{};
         if (!operation.CaptureRange(page,access,snapshot)) return MappingFaultResult::Unhandled;
         if(snapshot.range.backing && snapshot.range.backing->file && snapshot.range.backing->file->mappingError)
             return MappingFaultResult::IoError;
@@ -1048,7 +1048,7 @@ MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error) {
             if (!physical || !operation.StagePage(0,physical,false)) return MappingFaultResult::Unhandled;
         } else if (!operation.PrepareZeroed(MemTag::User,operation.Space()->allocationPid)) return MappingFaultResult::Unhandled;
         if (!MappingFaultTestBarrier(operation.Space(),page,2)) return MappingFaultResult::Unhandled;
-        if(!operation.Lock())return MappingFaultResult::OutOfMemory;
+        if(!operation.LockFaultRange(page))return MappingFaultResult::OutOfMemory;
         if (!operation.ValidateRange(snapshot,page,access)) continue;
         // EOF/IO observations are only authoritative for this same VMA and file
         // generation. A remap, protection change or resize retries preparation.
