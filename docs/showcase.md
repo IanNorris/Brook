@@ -62,14 +62,17 @@ enter:
 
 Then launch progressively more demanding applications, keeping earlier apps
 running. Bring each window forward on a musical cue. Background or minimized
-launches will be needed so readiness can be established before a window's cue;
-that behavior still needs implementation and verification. The OS itself is
+launches let readiness be established before a window's cue. The bridge now
+offers launch, focus, minimize, maximize, restore and close actions; rehearsing
+their timing with the chosen application set remains necessary. The OS itself is
 the demonstration, including real input and visible application responses.
 
 Potential scenes are terminal editing and live Rust/C++ compilation, browser
 navigation, a Writer document, 720p media playback, Quake's recorded Installation
-demo, SuperTuxKart and GLtron. A full editor, Blender and Firefox/Chromium join
-the tour only after they are usable. Simultaneous-app stability, readable UI
+demo, SuperTuxKart and GLtron. Firefox, Chromium and VSCodium already have real
+workload checks; selection for the tour also needs a stable concurrent rehearsal.
+Blender remains optional because its missing capabilities are outside the small-fix
+scope. Simultaneous-app stability, readable UI
 text, predictable focus, safe app shutdown and performance come before a final
 recording. A loading screen or launcher icon does not establish a working app.
 
@@ -86,9 +89,35 @@ recovery passed bounded tests; see [recording setup and limits](vm-recording.md)
 
 The recorder writes a native-canvas H.264/AAC master with frame timestamps and
 local loss counters. Source timestamps and upstream drop counts are unavailable.
-Long takes, boot transitions and native-window capture still need acceptance.
+Boot transitions and native-window capture still need acceptance.
 Preserve the unedited take and action/cue log. Final showcase production remains
 on hold; no final movie has been produced.
+
+### Rough rehearsal sequence
+
+These are provisional wall-clock slots, not measured musical cues. The 3:09
+soundtrack remains separate until the sequence and recording are reliable.
+
+| Time | Visible action | Readiness gate |
+| --- | --- | --- |
+| 0:00–0:25 | Boot, open a text editor, type the two introductory lines | Stable display transition; readable text and native input |
+| 0:25–0:55 | Compile and run a small C++ or Rust example in a terminal | Exact output, successful exit, no pending build |
+| 0:55–1:20 | Bring up the saved Writer document and GIMP image | Existing files open correctly; keep earlier windows available |
+| 1:20–1:55 | Use one browser on a real site, then play a short video | Working input, advancing video and audio; use the browser that passes the rehearsal |
+| 1:55–2:20 | Play the local 720p clip in the media player | Stable playback; pause the browser first to avoid competing audio |
+| 2:20–2:55 | Bring up Quake II's recorded demo | Verified GPU mode, mouse/focus behavior and normal demo progress |
+| 2:55–3:09 | Return to the desktop, show the running apps and end | Responsive focus changes and an intact continuous recording |
+
+Use one browser in the proposed take. Adding both browsers, Codium, Blender or
+a second game requires another simultaneous-workload check and a memory budget;
+minimizing a window does not release its resources. Slow launches stay visible
+or happen within the continuous take before their cue. Do not hide waits with edits.
+
+A technical 180-second headless rehearsal has been captured at 1920×1080 with
+Firefox, Chromium and VSCodium. All 3,972 encoded video frames and the AAC stream
+decode successfully. This is test footage, including scripted-edit mistakes and
+overlapping windows, rather than the proposed showcase sequence. Its counters
+and remaining recording limitations are in [recording evidence](vm-recording.md).
 
 
 ### SuperTuxKart launcher and verified run

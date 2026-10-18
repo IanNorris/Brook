@@ -52,7 +52,7 @@ physical A/V timing. Capture and encoding consume host CPU and memory.
 
 CPU and GPU headless QEMU were exercised. Native SDL display arguments are
 preserved by tested launcher code, but concurrent native-window recording,
-boot/mode transitions, 4K, long captures and reset-during-live-recording still
+boot/mode transitions, 4K and reset-during-live-recording still
 need live acceptance. No final showcase production has begun.
 
 ## Acceptance on 17 October 2026
@@ -84,3 +84,29 @@ Evidence, frozen artifacts and harnesses are retained locally under
 `6c677de42ccc457cabc5b9987bc44a63`. Movie and recording media are not tracked.
 Big Buck Bunny: (c) copyright 2008, Blender Foundation / www.bigbuckbunny.org,
 [CC BY 3.0](https://peach.blender.org/about/).
+
+## Three-minute rehearsal — 18 October 2026
+
+A 180.000-second headless CPU-compositor take at native 1920×1080 captured
+Firefox playing a controlled 640×360 Opus/video fixture while Chromium and
+VSCodium were launched and exercised. The original Matroska master contains
+3,972 H.264 frames and stereo 48-kHz AAC. An independent full decode verified
+every video frame, native dimensions and monotonic presentation timestamps,
+plus 8,438 AAC frames. The MP4 copy is a container-only remux of the whole take.
+Selected frames at 10, 80 and 160 seconds were inspected at full resolution.
+
+The recorder counted 4,246 incoming display updates, 282 coalesced updates and
+28 missed encoder slots. It received 8,634,317 audio sample frames and filled
+5,689 with silence; queue drops, late samples and estimated discontinuities
+were all zero. Host cost was about 92 CPU seconds and 174 MiB peak resident
+memory. Requested capture cadence was 30 FPS; the encoded frame count does not
+establish 30 distinct guest frames per second. Upstream loss and physical A/V
+synchronization remain unknown, and silent host output was used.
+
+This is technical rehearsal footage: overlapping windows and an editor
+completion mistake are visible. It is not a final showcase or proof of smooth
+concurrent browser playback. Native-window capture and boot/display transitions
+remain separate acceptance work. Local evidence:
+`build/workloads/stability-f99e267d-20261018/review/`, session
+`1ebd6b51256e49949dfcba5471e8bed6`, recording
+`62880e51b2e2427caca3f169b50bc1ac`.
