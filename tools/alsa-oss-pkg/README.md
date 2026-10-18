@@ -2,7 +2,8 @@
 
 This is intended as a compatibility path for applications using ALSA. The
 synthetic playback/capture probes are diagnostic tools and regressions. It is
-not yet selected by the default image or Firefox launcher.
+selected by Firefox in the default experiment image. The global ALSA default
+for other applications remains separate.
 
 The pinned ALSA plugin source is patched to propagate I/O/control errors,
 advertise native 44.1-kHz stereo S16_LE playback and negotiate bounded software
@@ -77,3 +78,10 @@ See [audio evidence](../../docs/audio-clock.md) for accepted identities, limits
 and remaining Firefox integration. Client-rate/format conversion, browser IPC,
 normal-launcher behavior and wider application regressions remain separate
 acceptance work. The default file-over-null route remains unchanged.
+
+The default experiment profile now includes this Firefox package and Chromium.
+The fresh-image check in build/workloads/fresh-browsers-20261018 passes normal
+menu launches and controlled 48-kHz Opus audio without manual package/profile
+setup. Chromium and a synthetic home file retain state across VM restart;
+Firefox local-storage writes fail with a quota error, so Firefox persistence
+remains unaccepted. See docs/experiments.md for this checkpoint and its limits.

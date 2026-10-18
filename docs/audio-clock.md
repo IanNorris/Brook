@@ -513,7 +513,8 @@ seconds without silent 10-ms bins. The tab also showed its audio indicator.
 Intermittent initial gaps remain; this is not acceptance of indefinite smooth
 playback or of every ALSA operation.
 
-The candidate package remains separate from base-image/public-index promotion.
+That candidate checkpoint preceded default-image promotion. The experiment
+profile now includes the package; generic public-index entries remain stock.
 Evidence and exact store identities: [Firefox package checkpoint](../tools/firefox-brook-pkg/README.md),
 build/workloads/firefox-rate-youtube-20261018, kernel
 e05bc514d02aa3050148b3a779cfc889752bfd63d47f0f4e819a4862b0619602.

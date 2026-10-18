@@ -1,4 +1,4 @@
-# Firefox clocked-audio integration candidate
+# Firefox clocked-audio integration
 
 Build with `nix-build tools/firefox-brook-pkg --no-out-link`.
 
@@ -26,7 +26,7 @@ silent 10 ms bins and a longest silent run of 480 ms. Normal close exits zero
 with no surviving group tasks; a subsequent two-second capture reports no
 active output. These results do not establish continuous, glitch-free playback.
 Pause/resume and preservation of an existing explicit backend preference still
-need guest checks. This candidate is not selected by the image's package
+need guest checks. At that checkpoint this candidate was not selected by the image's package
 profile or public index; global ALSA defaults remain unchanged.
 
 Evidence is retained in ignored
@@ -64,8 +64,8 @@ ten-second captures contained 441126, 443780 and 441212 frames. The first had a
 longest silent run of 290 ms; the following two had no silent 10-ms blocks.
 Pause produced zero frames with an inactive stream, and resume produced 441484
 frames over 10.007 host seconds with no silent 10-ms blocks. These are bounded
-checks, not continuous glitch-free playback acceptance. The base image and public
-index still do not select this package.
+checks, not continuous glitch-free playback acceptance. That run preceded
+base-image promotion; the public index still does not select this package.
 
 Evidence: build/workloads/firefox-rate-youtube-20261018, session
 3076e2a5810a4a4e8b47e74a80ee0874. Tested wrapper:
@@ -80,3 +80,10 @@ Normal close drained all browser lineage tasks, post-exit audio was inactive,
 heap integrity passed, sync was acknowledged, the launcher exited zero and
 all three offline filesystem checks passed. General shared-profile ownership,
 base-image promotion and broader application/audio regressions remain open.
+
+The default experiment profile now includes this Firefox package and Chromium.
+The fresh-image check in build/workloads/fresh-browsers-20261018 passes normal
+menu launches and controlled 48-kHz Opus audio without manual package/profile
+setup. Chromium and a synthetic home file retain state across VM restart;
+Firefox local-storage writes fail with a quota error, so Firefox persistence
+remains unaccepted. See docs/experiments.md for this checkpoint and its limits.

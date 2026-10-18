@@ -53,7 +53,7 @@ the table distinguishes tested behavior from remaining limitations.
 | Nix binaries | — | ✅ Working | Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …) |
 | [NetSurf](https://www.netsurf-browser.org/) | 3.11 | ✅ Working | Web browser rendering HTML/CSS via custom framebuffer surface |
 | [Ladybird](https://ladybird.dev/) | 2026-04-04 | ⚠️ Experimental | HTTPS Google search and Amazon navigation verified; loading/input/scrolling performance remains limited |
-| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Wayland browsing, JavaScript/input and Google/Amazon HTTPS; candidate Brook audio package plays YouTube through the normal launcher, including pause/resume; intermittent audio gaps remain |
+| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Included in fresh experiment images; HTTPS/JavaScript and YouTube audio through the normal launcher, including pause/resume; intermittent audio gaps and failing site-storage writes remain |
 | [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
 | [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation, text input, save/load verified; music and two bounded exit tests pass; longer-session exit testing remains |
 | [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, save/reopen and normal exit verified alongside Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
@@ -79,12 +79,15 @@ the table distinguishes tested behavior from remaining limitations.
   with working input and JavaScript. Chromium now plays YouTube video and audio,
   including long pause/resume and seeking, without an autoplay workaround.
   Connected Unix socket shutdown, anonymous memory discard and descriptor
-  capacity fixes support these workloads. The candidate Firefox audio package
+  capacity fixes support these workloads. The default experiment Firefox package
   now plays YouTube through its normal launcher after fixing 48-kHz ALSA
   negotiation. Pause stops output and resume restores it; one early capture
   contained a 290-ms silent interval, while subsequent captures had none.
-  Browser performance and intermittent audio stalls remain under investigation;
-  the package is not yet selected by the base image or public package index.
+  Fresh experiment images now include both browsers and pass a controlled
+  48-kHz Opus playback check. Chromium retains a synthetic site-storage marker
+  across VM restart; Firefox rejects the write with a quota error. Browser
+  performance, intermittent audio stalls and Firefox persistence remain under
+  investigation. The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and
   remaining limits. All 38 hosted test suites pass; both full bootstrap paths
   still need rerunning against the current suite.
@@ -220,10 +223,10 @@ New captures use native 1920×1080 without upscaling. See
 <p align="center"><em>Chromium playing YouTube at 480p with audio — software rendering, native 1920×1080 capture</em></p>
 
 <p align="center">
-  <a href="docs/images/brook_firefox_youtube_audio_1080.png"><img src="docs/images/brook_firefox_youtube_audio_1080.png" alt="Firefox playing Crab Rave on YouTube with audio through Brook's candidate ALSA integration" width="960"></a>
+  <a href="docs/images/brook_firefox_youtube_audio_1080.png"><img src="docs/images/brook_firefox_youtube_audio_1080.png" alt="Firefox playing Crab Rave on YouTube with audio through Brook's ALSA integration" width="960"></a>
 </p>
 
-<p align="center"><em>Firefox playing YouTube with audio through the candidate Brook package — software rendering, native 1920×1080 capture. Intermittent audio gaps remain.</em></p>
+<p align="center"><em>Firefox playing YouTube with audio through the Brook package — software rendering, native 1920×1080 capture. Intermittent audio gaps remain.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_codium_edit_1080.png"><img src="docs/images/brook_codium_edit_1080.png" alt="VSCodium displaying text edited, saved and reopened on Brook, with enlarged editor UI" width="960"></a>

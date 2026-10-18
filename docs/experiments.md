@@ -42,15 +42,40 @@ nix-shell --run 'python3 scripts/create_experiment_disks.py --q2-dir build/exper
 ```
 
 This creates `build/experiments/seeds/data.img` (16 GiB), `nix.img` (32 GiB),
-and `manifest.json`. Images are sparse; the initial assets and approximately 481-path
-closure use about 5.2 GiB of host storage. An existing output is never
+and `manifest.json`. Images are sparse; the 18 October browser-inclusive
+546-path closure uses about 5.4 GiB of host storage before optional game/video
+assets. An existing output is never
 overwritten; choose another `--output` directory to rebuild.
 
 `nix/experiment-packages.nix` uses the repository's package pin. The profile
 contains Bash, coreutils, curl, Python, ffmpeg, Wayland, the Brook player,
-file browser, App Gallery and calculator, LibreOffice, GIMP, Mousepad, Qalculate, fonts,
+file browser, App Gallery and calculator, LibreOffice, GIMP, Mousepad, Qalculate,
+Chromium, Firefox with the clocked ALSA integration, fonts,
 cursors, both yquake2 builds, and an OSS-enabled OpenAL library. Launchers
 receive their actual dependency paths from Nix rather than hardcoded hashes.
+
+For a new image without external media or game assets:
+
+```bash
+nix-shell --run 'python3 scripts/create_experiment_disks.py --output build/experiments/fresh'
+```
+
+The browser-inclusive image was built from source without reusing profiles.
+Normal menu launches for Firefox and Chromium coexist in an eight-CPU, 4-GiB
+guest. Each played a controlled 48-kHz Opus fixture and produced approximately
+ten seconds of PCM without silent 10-ms blocks. A synthetic home file retained
+contents, UID 1000 and mode 0600 across checked VM restart; Chromium also retained
+its synthetic local-storage marker. Firefox rejected that first write with
+`QuotaExceededError`, and no marker survived. Its persistence remains unaccepted.
+The kernel's zero-filled `statfs`/`fstatfs` stub is the next capacity-reporting
+bug to address; these observations alone do not prove it causes every Firefox
+storage failure. Generic public package-index entries remain stock packages,
+and base-image components still lack complete Gallery ownership/registration.
+
+Evidence is under ignored `build/workloads/fresh-browsers-20261018`, including
+the generated closure manifest, separate boot/restart requests, audio reports
+and filesystem checks. This does not rerun either full bootstrap path or prove
+all applications on the image work.
 
 ## DOOM fixture
 
