@@ -84,6 +84,20 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
             fi
         done < <(nix-store -qR "$WAYLANDD_OUT")
 
+        SESSION_OUT=$(nix-build "${ROOT_DIR}/tools/brook-session-pkg" --no-out-link)
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            base=$(basename "$p")
+            dst="${MNTDIR}/store/${base}"
+            if [ ! -e "$dst" ]; then
+                cp -a --no-preserve=links "$p" "$dst"
+                echo "  store/${base}"
+            fi
+        done < <(nix-store -qR "$SESSION_OUT")
+        cp "${SESSION_OUT}/bin/brook-dbus" "${MNTDIR}/bin/brook-dbus"
+        cp "${SESSION_OUT}/bin/brook-session.conf" "${MNTDIR}/bin/brook-session.conf"
+        echo "  brook-dbus -> /nix/bin/brook-dbus"
+
         # Copy ffplay (ffmpeg-bin) closure for video playback
         FFPLAY_STORE="/nix/store/nih4c7knfj2mgjz6jp5l0fqn86xdwmhc-ffmpeg-8.0.1-bin"
         if [ -x "${FFPLAY_STORE}/bin/ffplay" ]; then

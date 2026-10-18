@@ -149,7 +149,7 @@ def main():
         shutil.copy2(ROOT / "data/asound.conf", nix_root / "etc/asound.conf")
         shutil.copy2(ROOT / "data/config/alsoft-oss.conf", nix_root / "etc/alsoft-oss.conf")
         for executable in ([] if args.bootstrap_mode else ["waylandd", "wayland-calc", "brook-player", "brook-files", "brook-gallery",
-                           "brook-office", "brook-ladybird", "brook-vlc",
+                           "brook-office", "brook-ladybird", "brook-vlc", "brook-dbus", "brook-session.conf",
                            "brook-yquake2-gl", "brook-yquake2-soft"]):
             source = profile / "bin" / executable
             if not source.exists():

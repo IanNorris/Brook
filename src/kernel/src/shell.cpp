@@ -155,6 +155,8 @@ const char* const g_defaultEnvp[] = {
     "GSETTINGS_BACKEND=memory",
     "GIO_USE_VFS=local",
     "NO_AT_BRIDGE=1",
+    // Desktop startup owns this Brook-user service outside app launch lineages.
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/brook-session-bus",
     // Reduced GIMP plugin trees are optional image assets. Legacy lite
     // scenarios select them through an explicit gimprc; ordinary package
     // launches must use the package's own plugin directory.
@@ -166,7 +168,6 @@ const char* const g_defaultEnvp[] = {
     "SAL_DISABLE_PRINTERLIST=1",
     "SAL_DISABLE_EXTENSION_UPDATE=1",
     "CUPS_SERVER=/dev/null",
-    "SAL_LOG=+INFO.sfx.appl +ERR",
     "SDL_VIDEODRIVER=wayland",
     "SDL_AUDIODRIVER=alsa",
     // Hardware GL via virtio-gpu/virgl. These point Mesa's loader at the

@@ -13,6 +13,7 @@ let
   yquakeSoft = import ../tools/yquake2-pkg { inherit pkgs; };
   openal = import ../tools/openal-soft-oss-pkg { inherit pkgs; };
   firefox = import ../tools/firefox-brook-pkg { inherit pkgs; };
+  session = import ../tools/brook-session-pkg { inherit pkgs; };
   quakeWrapper = package: pkgs.replaceVars ../data/nix-wrappers/yquake2-play.sh.in {
     BASH_BIN = "${pkgs.bash}/bin/bash";
     MESA_PATH = "${pkgs.mesa}";
@@ -78,7 +79,7 @@ in {
       pkgs.python3 pkgs.ffmpeg.bin pkgs.wayland pkgs.mesa
       pkgs.libreoffice pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad
       firefox pkgs.chromium
-      waylandd calc player files settings gallery fonts cursors launchers
+      waylandd calc player files settings gallery fonts cursors launchers session
     ];
     ignoreCollisions = true;
   };

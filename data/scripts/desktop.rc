@@ -1,4 +1,5 @@
 # Brook OS — Window Manager with app launcher
 set wm
 set vfb none
+source /boot/SCRIPTS/compat_services.rc
 run --once /nix/bin/waylandd

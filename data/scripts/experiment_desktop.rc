@@ -1,4 +1,5 @@
 # Uses the pinned experiment profile on the new Nix disk.
 set wm
 set vfb none
+source /boot/SCRIPTS/compat_services.rc
 run --once /nix/bin/waylandd
