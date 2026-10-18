@@ -221,6 +221,11 @@ The final publication probe uses absolute cleanup paths and does not claim to
 fix this defect. The earlier quoting-error receipt and long-dirfd negative
 control are also retained, with complete output and drained command lineages.
 
+The subsequent [ABI-19 directory follow-up](dirfd-identity.md) fixes the saved
+prefix truncation and reruns this install/repair matrix with standard fd-safe
+cleanup. The absolute-path workaround has been removed from the owned probe;
+remaining atomic namespace and other-backend identity limits stay explicit.
+
 [Recovery design](app-gallery-recovery.md) records the remaining transaction,
 shared ownership, base-package inventory and real disk-full failure matrix.
 

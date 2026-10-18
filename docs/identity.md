@@ -725,3 +725,10 @@ renewed controlled three-app concurrency, synthetic storage/document persistence
 GIMP/Writer reopen and full-lineage close on this same kernel. It also retained
 the measured audio/presentation and native-input limits; real-site cookies and
 complete identity isolation remain unaccepted. Login/accounts remain deferred.
+
+
+The subsequent [retained-directory follow-up](dirfd-identity.md) fixes silent
+64-byte descriptor-prefix truncation and adds sequential rename/replacement
+lookup through ext2's retained inode. Its ABI-19 layout requires all modules to
+be rebuilt. Atomic namespace-relative operations, retained process CWD and the
+other identity gaps above remain open; this does not complete account isolation.

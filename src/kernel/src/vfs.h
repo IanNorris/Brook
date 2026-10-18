@@ -66,6 +66,9 @@ struct VnodeOps {
     int (*space)(Vnode* vn, VfsSpace* out) = nullptr;
     // Permission inquiry for a retained descriptor, independent of its path.
     int (*access)(Vnode* vn, uint8_t required, bool realIds) = nullptr;
+    // Resolve a retained directory's current filesystem-relative name.
+    // Optional: legacy backends use the canonical opening path instead.
+    int (*directory_path)(Vnode* vn, char* out, uint32_t capacity) = nullptr;
 };
 
 struct Vnode {
@@ -74,10 +77,13 @@ struct Vnode {
     void*           priv;     // filesystem-private state (e.g. FIL* or DIR*)
     uint32_t        refCount; // reference count for fork/dup sharing
     uint64_t        cacheId;  // global file identity for page cache; 0 disables caching (not st_ino)
+    char*           directoryPath = nullptr; // owned canonical opening path; immutable until final close
 };
 
 // Caller must already own a live vnode reference. This is retention, not a
 // safe way to acquire a reference from an unprotected raw pointer.
+int VfsDirectoryPath(Vnode* vn, char* out, uint32_t capacity);
+
 inline void VfsRetain(Vnode* vn) {
     __atomic_fetch_add(&vn->refCount, 1, __ATOMIC_RELEASE);
 }

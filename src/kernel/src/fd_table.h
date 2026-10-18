@@ -68,7 +68,7 @@ struct FdEntry
                            // must not be cleared or reused; close() defers until 0.
     void*    handle;       // VFS Vnode* or device-specific state
     uint64_t seekPos;      // Current file offset (for lseek)
-    char     dirPath[64];  // For directory fds: path prefix for openat resolution
+    char     dirPath[64];  // Bounded diagnostic label only; directory resolution uses retained vnode
 };
 
 // Outcome of an FdTableClose: either the slot was claimed-and-cleared right now

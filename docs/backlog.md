@@ -1220,8 +1220,8 @@ valid open directory. A private Gallery fixture at
 be listed/opened absolutely, but `stat("fixture.desktop", dir_fd=fd)` returned
 ENOENT; Python's fd-safe recursive deletion then failed with ENOTEMPTY. Retained
 negative control: `build/workloads/gallery-links-20261018/dirfd-truncation-regression/`.
-Fix retained directory identity/path handling and add long-path openat/statat,
-unlinkat/renameat/fchdir, dup and rename/replacement tests. Avoid a large fixed
-per-FD buffer increase across 1,024 slots as an unmeasured workaround; pinned
-CWD/dirfd objects remain the intended identity work. The installer publication
-probe's absolute fixture cleanup is not a kernel fix.
+The [retained-directory follow-up](dirfd-identity.md) removes this truncation,
+passes the long-path, rename/replacement and fd-safe cleanup probes, and removes
+the installer fixture workaround. Atomic inode-relative namespace operations,
+retained process CWD and other-backend identity remain open; the callback and
+canonical opening-path fallback do not establish complete isolation.

@@ -70,7 +70,7 @@ Uses `PROCESS_MAGIC` sentinel for use-after-free detection.
 | `statusFlags` | uint32_t | O_* flags from open |
 | `handle` | void* | Backend-specific handle |
 | `seekPos` | uint64_t | File offset |
-| `dirPath[64]` | char | Directory path for openat |
+| `dirPath[64]` | char | Bounded diagnostic label; relative directory lookup uses the retained vnode |
 
 ### Address Space Layout (User)
 

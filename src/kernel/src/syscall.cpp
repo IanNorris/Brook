@@ -3351,7 +3351,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     }
     proc->fds[fd].statusFlags = static_cast<uint32_t>(flags);
 
-    // Store directory path for openat resolution
+    // Keep a bounded diagnostic label; this is never a resolution prefix.
     if (vn->type == VnodeType::Dir)
     {
         uint32_t pi = 0;
@@ -5479,9 +5479,7 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
             if (!entry) return -EBADF;
             if (entry->type != FdType::Vnode || !entry->handle ||
                 static_cast<Vnode*>(entry->handle)->type != VnodeType::Dir) return -ENOTDIR;
-            if (!entry->dirPath[0]) return -EBADF;
-            memcpy(prefix, entry->dirPath, sizeof(entry->dirPath));
-            prefix[sizeof(entry->dirPath) - 1] = 0;
+            if(int error=VfsDirectoryPath(static_cast<Vnode*>(entry->handle),prefix,sizeof(prefix)))return error;
         }
         uint32_t pos = 0;
         while (prefix[pos]) { resolved[pos] = prefix[pos]; ++pos; }
@@ -7693,7 +7691,8 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
 }
 
 // Shared bounded path join for *at syscalls. This is not an inode resolver:
-// dirPath still needs replacement with a pinned directory identity.
+// Ext2 resolves retained directory inodes; other backends retain opening names.
+// Namespace lookup and the eventual operation are not yet one atomic *at walk.
 static int ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize)
 {
     if (!path || !out || outSize < 2) return -EINVAL;
@@ -7716,8 +7715,7 @@ static int ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSiz
         if (!entry) return -EBADF;
         if (entry->type != FdType::Vnode || !entry->handle ||
             static_cast<Vnode*>(entry->handle)->type != VnodeType::Dir) return -ENOTDIR;
-        if (!entry->dirPath[0]) return -EBADF;
-        StrCopyN(prefix, entry->dirPath, sizeof(prefix));
+        if(int error=VfsDirectoryPath(static_cast<Vnode*>(entry->handle),prefix,sizeof(prefix)))return error;
     }
     uint32_t length = strlen(prefix), suffix = strlen(path);
     bool slash = length && prefix[length - 1] != '/';
@@ -9565,9 +9563,9 @@ static int64_t sys_fchdir(uint64_t fd,uint64_t,uint64_t,uint64_t,uint64_t,uint64
     if (!entry) return -EBADF;
     if (entry->type!=FdType::Vnode || !entry->handle ||
         static_cast<Vnode*>(entry->handle)->type!=VnodeType::Dir) return -ENOTDIR;
-    if (!entry->dirPath[0]) return -EBADF;
-    char canonical[sizeof(proc->cwd)];
-    if (int error=VfsResolveDirectory(entry->dirPath,canonical,sizeof(canonical))) return error;
+    char current[sizeof(proc->cwd)],canonical[sizeof(proc->cwd)];
+    if(int error=VfsDirectoryPath(static_cast<Vnode*>(entry->handle),current,sizeof(current)))return error;
+    if (int error=VfsResolveDirectory(current,canonical,sizeof(canonical))) return error;
     memcpy(proc->cwd,canonical,strlen(canonical)+1);
     return 0;
 }
@@ -9903,13 +9901,14 @@ static int64_t ChownAt(int dirfd, uint64_t pathAddr, uint32_t uid, uint32_t gid,
     const char* lookup = path;
     char resolved[512];
     if (path[0] != '/') {
+        char directoryPath[512];
         const char* prefix = proc->cwd;
         if (dirfd != -100) {
             if (!directory) return -EBADF;
             if (directory->type != FdType::Vnode || !directory->handle ||
                 static_cast<Vnode*>(directory->handle)->type != VnodeType::Dir) return -ENOTDIR;
-            if (!directory->dirPath[0]) return -ENOENT;
-            prefix = directory->dirPath;
+            if(int error=VfsDirectoryPath(static_cast<Vnode*>(directory->handle),directoryPath,sizeof(directoryPath)))return error;
+            prefix = directoryPath;
         }
         const uint32_t plen = strlen(prefix), length = strlen(path);
         const bool slash = plen && prefix[plen - 1] != '/';

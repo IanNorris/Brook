@@ -2598,6 +2598,55 @@ static int Ext2VnodeAccess(Vnode* vn,uint8_t required,bool realIds)
     return Ext2AccessMetadata(mount,&st,required,realIds);
 }
 
+// Reconstruct the current name from the retained inode, never the opening
+// spelling. Directory hard links are unsupported; '..' gives the parent and
+// its live entry gives this inode's component. The VFS namespace read lock
+// excludes rename/remove across the complete reconstruction.
+static int Ext2DirectoryPath(Vnode* vn,char* out,uint32_t capacity)
+{
+    if(!out || capacity<2)return -36;
+    auto* dp=static_cast<Ext2DirPriv*>(vn->priv);
+    auto* mnt=dp->mnt;
+    auto* buffer=static_cast<uint8_t*>(kmalloc(mnt->blockSize));
+    if(!buffer)return -12;
+    KRwLockReadLock(&g_ext2Lock);
+    auto finish=[&](int result) {KRwLockReadUnlock(&g_ext2Lock);kfree(buffer);return result;};
+    uint32_t position=capacity-1,current=dp->inode;
+    out[position]=0;
+    for(uint32_t depth=0;current!=EXT2_ROOT_INO;++depth) {
+        if(depth>=256)return finish(-40);
+        Ext2Inode child,parent;
+        if(!Ext2ReadInode(mnt,current,&child))return finish(-5);
+        if((child.i_mode&EXT2_S_IFMT)!=EXT2_S_IFDIR || !child.i_links_count)return finish(-2);
+        uint32_t parentIno=Ext2DirLookup(mnt,current,&child,"..");
+        if(!parentIno || parentIno==current)return finish(-2);
+        if(!Ext2ReadInode(mnt,parentIno,&parent))return finish(-5);
+        bool found=false;
+        for(uint64_t offset=0;offset<Ext2InodeSize(&parent) && !found;offset+=mnt->blockSize) {
+            uint32_t block=Ext2BlockMap(mnt,&parent,offset>>mnt->blockShift);
+            if(!block || !Ext2ReadBlock(mnt,block,buffer))return finish(-5);
+            for(uint32_t pos=0;pos<mnt->blockSize;) {
+                auto* entry=reinterpret_cast<Ext2DirEntry2*>(buffer+pos);
+                if(!Ext2DirEntryValid(entry,pos,mnt->blockSize))return finish(-5);
+                const bool dot=entry->name_len==1 && entry->name[0]=='.';
+                const bool dotdot=entry->name_len==2 && entry->name[0]=='.' && entry->name[1]=='.';
+                if(entry->inode==current && !dot && !dotdot) {
+                    if(!entry->name_len || position<uint32_t(entry->name_len)+1)return finish(-36);
+                    position-=entry->name_len;
+                    for(uint32_t i=0;i<entry->name_len;++i)out[position+i]=entry->name[i];
+                    out[--position]='/';found=true;break;
+                }
+                pos+=entry->rec_len;
+            }
+        }
+        if(!found)return finish(-2);
+        current=parentIno;
+    }
+    if(position==capacity-1)out[--position]='/';
+    for(uint32_t i=0;i<capacity-position;++i)out[i]=out[position+i];
+    return finish(0);
+}
+
 static const VnodeOps g_ext2FileOps = {
     .open    = Ext2FileOpen,
     .read    = Ext2FileRead,
@@ -2628,6 +2677,7 @@ static const VnodeOps g_ext2DirOps = {
     .chown   = Ext2VnodeChown,
     .space   = Ext2Space,
     .access  = Ext2VnodeAccess,
+    .directory_path = Ext2DirectoryPath,
 };
 
 // ---------------------------------------------------------------------------
@@ -3035,6 +3085,7 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
 
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) { kfree(dp); Ext2ReleaseInode(hold); return nullptr; }
+        vn->directoryPath = nullptr;
         vn->ops = &g_ext2DirOps;
         vn->type = VnodeType::Dir;
         vn->priv = dp;
@@ -3053,6 +3104,7 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
 
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) { kfree(fp); Ext2ReleaseInode(hold); return nullptr; }
+        vn->directoryPath = nullptr;
         vn->ops = &g_ext2FileOps;
         vn->type = VnodeType::File;
         vn->priv = fp;

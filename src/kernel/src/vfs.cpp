@@ -509,7 +509,47 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
             return nullptr;
         }
     }
+    if (vn && vn->type==VnodeType::Dir) {
+        const uint32_t length=StrLen(resolved);
+        vn->directoryPath=static_cast<char*>(kmalloc(length+1));
+        if(!vn->directoryPath) {
+            if(error)*error=-12;
+            VfsClose(vn);return nullptr;
+        }
+        for(uint32_t i=0;i<=length;++i)vn->directoryPath[i]=resolved[i];
+    }
     return vn;
+}
+
+int VfsDirectoryPath(Vnode* vn,char* out,uint32_t capacity)
+{
+    if(!vn || vn->type!=VnodeType::Dir)return -20;
+    if(!out || !capacity)return -22;
+    if(!vn->directoryPath)return -9;
+    FileMutationGuard lookup(false);
+    const char* path=vn->directoryPath;
+    char current[512];
+    if(vn->ops && vn->ops->directory_path) {
+        const char* ignored=nullptr;
+        MountEntry* mount=FindMount(path,&ignored);
+        if(!mount)return -2;
+        int error=vn->ops->directory_path(vn,current,sizeof(current));
+        if(error)return error;
+        const uint32_t prefix=StrLen(mount->mountPoint),relative=StrLen(current);
+        const bool root=prefix==1 && mount->mountPoint[0]=='/';
+        const bool relativeRoot=relative==1 && current[0]=='/';
+        const uint32_t length=root?relative:prefix+(relativeRoot?0:relative);
+        if(length>=capacity)return -36;
+        if(root)StrCopy(out,current,capacity);
+        else {
+            for(uint32_t i=0;i<prefix;++i)out[i]=mount->mountPoint[i];
+            if(!relativeRoot)for(uint32_t i=0;i<relative;++i)out[prefix+i]=current[i];
+            out[length]=0;
+        }
+        return 0;
+    }
+    if(StrLen(path)>=capacity)return -36;
+    StrCopy(out,path,capacity);return 0;
 }
 
 int VfsChmod(Vnode* vn, uint16_t mode)
@@ -825,6 +865,7 @@ void VfsClose(Vnode* vn)
 {
     if (!vn) return;
     if (vn->ops && vn->ops->close) vn->ops->close(vn);
+    kfree(vn->directoryPath);
     kfree(vn);
 }
 

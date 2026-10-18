@@ -6,6 +6,7 @@ The fixture installer must be compiled with profile/store/index paths below
 This checks publication/repair on cached files, not downloads or crash recovery.
 """
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -14,18 +15,6 @@ root=Path('/data/home/regression-input/gallery-links')
 binary=Path(sys.argv[1]).resolve()
 assert not root.exists(), 'Refusing to reuse a pre-existing fixture directory'
 assert os.getuid()==1000, 'Run the owned workload as Brook'
-# Brook currently truncates saved directory-fd paths at 64 bytes. Keep that
-# independent regression explicit; setup/cleanup here uses absolute paths so
-# this probe measures link publication rather than that known dirfd failure.
-def clear_created_tree(path):
-    for parent,directories,files in os.walk(path,topdown=False):
-        for name in files:(Path(parent)/name).unlink()
-        for name in directories:
-            child=Path(parent)/name
-            if child.is_symlink():child.unlink()
-            else:child.rmdir()
-    path.rmdir()
-
 store_name='a'*32+'-fixture'
 paths=['bin/tool','lib/libfixture.so','share/applications/fixture.desktop']
 
@@ -50,7 +39,7 @@ for blocked_name in [None,*paths]:
         assert b'incomplete profile links' in result.stderr
         assert b'Installed fixture' not in result.stdout
         assert (blocked/'keep').read_text()=='unchanged'
-        clear_created_tree(blocked)
+        shutil.rmtree(blocked)
         result=subprocess.run([str(binary),'fixture'],capture_output=True,timeout=120)
         assert result.returncode==0,result.stdout+result.stderr
     links=[root/'profile'/p for p in paths]
@@ -65,5 +54,5 @@ for blocked_name in [None,*paths]:
     assert not (root/'profile/.mutation-lock').exists()
     print('GALLERY_LINK_CASE_PASS',blocked_name or 'normal',flush=True)
     # This exact tree was created by this run; never clear an existing profile.
-    clear_created_tree(root)
+    shutil.rmtree(root)
 print('GALLERY_LINK_CHECK_PASS uid='+str(os.getuid()),flush=True)

@@ -109,7 +109,8 @@ the table distinguishes tested behavior from remaining limitations.
   package manifest rows when appending; Firefox's menu launch, HTTPS rendering
   and normal exit have been rechecked with this identity. Permission enforcement
   is still being audited before adding login/accounts. See [identity](docs/identity.md)
-  and [append acceptance](docs/append-writes.md).
+  and [append acceptance](docs/append-writes.md). [Retained-directory checks](docs/dirfd-identity.md)
+  cover long paths, ext2 rename/replacement and fd-safe cleanup.
 
 - **Desktop appearance:** application icons in window chrome, an icon taskbar,
   and a launcher that updates after package installation/removal. Settings
