@@ -5,7 +5,64 @@ import bisect
 from collections import Counter
 import json
 from pathlib import Path
+import re
 import subprocess
+
+
+def summarize_block_io(text):
+    """Pair the two explicit /proc/blkprobe tables around each stage.
+
+    Never subtract high-water marks/averages or infer bytes from requests.
+    Whole-VM counters include profiling and unrelated kernel storage work.
+    """
+    counters = ('waits', 'reqs', 'waitNsTotal', 'spinIters', 'legacy',
+                'batch', 'sg', 'flushSubmitted', 'flushErrors')
+    rows, stage, tables, table, header = [], None, [], None, None
+    for line in text.splitlines():
+        begin = re.fullmatch(r'BOOTSTRAP_BEGIN (\S+)', line)
+        end = re.fullmatch(r'BOOTSTRAP_END (\S+) (\d+)', line)
+        if begin:
+            stage, tables, table, header = begin[1], [], None, None
+        elif end and stage == end[1]:
+            result = {'stage': stage, 'guest_seconds': int(end[2]), 'devices': {}}
+            if len(tables) != 2:
+                result['unavailable'] = 'Expected exactly two explicit block-counter tables'
+            else:
+                before, after = tables
+                for dev in sorted(before.keys() | after.keys()):
+                    if dev not in before or dev not in after:
+                        result['devices'][dev] = {'unavailable': 'Device inventory changed'}
+                        continue
+                    first, last = before[dev], after[dev]
+                    required = (*counters, 'waitNsMax')
+                    if any(key not in first or key not in last for key in required):
+                        result['devices'][dev] = {'unavailable': 'Counter schema incomplete'}
+                        continue
+                    if any(last[key] < first[key] for key in required):
+                        result['devices'][dev] = {'unavailable': 'Counter reset or non-monotonic snapshot'}
+                        continue
+                    delta = {key: last[key] - first[key] for key in counters}
+                    result['devices'][dev] = {
+                        'delta': delta,
+                        'aggregate_wait_seconds': delta['waitNsTotal'] / 1e9,
+                        'mean_wait_ns': delta['waitNsTotal'] / delta['waits'] if delta['waits'] else None,
+                        'cumulative_max_wait_ns_before': first['waitNsMax'],
+                        'cumulative_max_wait_ns_after': last['waitNsMax'],
+                        'new_max_wait_ns': last['waitNsMax'] if last['waitNsMax'] > first['waitNsMax'] else None,
+                    }
+            rows.append(result)
+            stage, table, header = None, None, None
+        elif stage and line.startswith('dev waits reqs '):
+            header = line.split()[1:]
+            table = {}
+            tables.append(table)
+        elif stage and table is not None:
+            fields = line.split()
+            if len(fields) == len(header) + 1 and fields[0].startswith('virtio') and all(value.isdecimal() for value in fields[1:]):
+                table[fields[0]] = dict(zip(header, map(int, fields[1:])))
+            else:
+                table = None
+    return {'stages': rows, 'scope': 'Whole-VM block-driver counters between guest stage markers, including instrumentation. Aggregate wait can overlap across workers; it is not elapsed stage time or disk-only service time. Request counters do not measure bytes/bandwidth. An unchanged cumulative maximum does not establish a stage maximum.'}
 
 
 def summarize_profile(record):
@@ -63,11 +120,14 @@ def main():
         extra_profiles = json.loads(manual.read_text()) if manual.exists() else []
         used = [s["stats"]["used_memory_bytes"] for s in data.get("snapshots", [])
                 if "used_memory_bytes" in s.get("stats", {})]
+        command = directory / 'command-evidence.json'
+        block_io = summarize_block_io(json.loads(command.read_text()).get('stdout', '')) if command.exists() else None
         reports.append({"directory": str(directory), "complete": data.get("success", False),
                         "mode": data.get("mode"), "revision": data.get("revision"),
                         "guest_stage_seconds": {s["name"]: s.get("guest_seconds") for s in data["stages"]},
                         "observed_used_memory_bytes": {"min": min(used), "max": max(used)} if used else None,
-                        "profiles": [summarize_profile(p) for p in data.get("profiles", [])+extra_profiles if "profile" in p]})
+                        "profiles": [summarize_profile(p) for p in data.get("profiles", [])+extra_profiles if "profile" in p],
+                        'block_io': block_io})
     print(json.dumps(reports, indent=2))
 
 
