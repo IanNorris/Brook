@@ -1174,3 +1174,14 @@ of the fresh-image and real-workload follow-up.
   Firefox profile/consent persistence still requires same-disk browser restart
   acceptance after these boundaries are addressed. Preserve the clean native
   review disk; do not infer persistence from fresh clones or filesystem fsck.
+
+
+- Assess a Linux-compatible vDSO clock path as a measured alternative or
+  complement to concurrent AS validation. Current source has neither vDSO symbols
+  nor AT_SYSINFO_EHDR in its initial stack. Browser profiles frequently block
+  while `clock_gettime` copies out through AS validation. Consider a versioned
+  ELF helper with a read-only public clock page, stable-clock checks and syscall
+  fallback; preserve clock IDs and non-KVM behavior. Do not expose kernel page
+  contents beyond sanitized public clock data. Compare libc clock calls with
+  forced syscalls, validate fork/exec/protection and migration behavior, and
+  measure actual browser profiles before claiming a performance improvement.

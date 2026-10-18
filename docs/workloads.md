@@ -2518,3 +2518,38 @@ guest before launching browsers. Both browser lineages drain, post-exit audio
 is inactive, heap integrity passes, checked sync succeeds, the launcher exits
 zero, and the serial audit and all three offline filesystem checks pass.
 Full bootstrap paths and broader real-app regressions remain open.
+
+
+### Reader wake-batch progress (18 October)
+
+Review before concurrent AS validation exposed a separate `KRwLock` progress
+bug. Writer unlock grants at most 128 queued readers, but the last reader had
+no path to grant deferred readers when no writer remained. With 257 queued
+readers, the actual-core hosted fixture times out waiting for completion on
+the previous implementation. Increasing the stack batch would only move the
+failure threshold.
+
+The last reader now grants a queued writer first, otherwise the next bounded
+reader cohort. New arrivals cannot bypass an existing deferred-reader queue.
+Every batch is dequeued, counted, assigned ownership and temporarily referenced
+under the guard before waking anyone. Wake callbacks and unrefs run outside
+the guard; the releasing caller remains cancellation-protected until they all
+finish. This retains the existing reader/writer alternation and bounded stack
+storage while allowing queues larger than one batch to drain.
+
+Actual-core tests pass at 128, 129 and 257 readers, including a queued writer,
+pending cancellation, a recipient completing before its wake callback returns,
+and arriving readers held behind a deferred cohort. Existing 64 cancellation/
+spurious-wakeup rounds still pass. Both full kernel builds and the supported
+entry audit pass, as do all 38 hosted suites. This does not expand verification
+of the unchanged early-boot/no-process fallback or fix single-slot nested rwlock
+ownership diagnostics; those require review before migrating AS mutation.
+
+The isolated `rw-reader-batches-production-20261018` run passes the ordinary
+10/10 EOF tests on each filesystem, normal Firefox/Chromium launch and complete
+browser-task drainage. Local Firefox media produces 441,214 audio frames over
+a 10.044-second observation with no near-silent 10 ms bins. Post-exit audio is
+inactive; heap integrity, checked shutdown, launcher exit zero, serial audit and
+all three offline filesystem checks pass. Synthetic WAL still reports the same
+5386 boundary. These checks do not prove the previous live browser stalls were
+caused by a >128-reader cohort, and no browser speedup is claimed.

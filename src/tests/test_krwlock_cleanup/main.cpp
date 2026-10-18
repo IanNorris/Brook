@@ -121,8 +121,97 @@ static void testRw(bool writerOwner) {
     assert(owner.terminal && waiter.terminal && !owner.refCount && !waiter.refCount);
     KRwLockCleanupOnExit(&owner); KRwLockCleanupOnExit(&waiter);
 }
+static void testLargeReaderQueue(unsigned count,bool mixedWriter,bool delayedWake) {
+    KRwLock rw{};KRwLockInit(&rw);Process owner{10,200};current=&owner;
+    KRwLockWriteLock(&rw);
+    std::vector<Process> readers;readers.reserve(count);
+    for(unsigned i=0;i<count;++i)readers.push_back(Process{100+i,300+i});
+    std::vector<std::thread> threads;threads.reserve(count);
+    for(unsigned i=0;i<count;++i)threads.emplace_back([&,i] {
+        current=&readers[i];KRwLockReadLock(&rw);KRwLockReadUnlock(&rw);boundary(readers[i]);
+        std::lock_guard<std::mutex> lock(ready);readers[i].released=true;changed.notify_all();
+    });
+    waitFor([&] { for(const auto& reader:readers)if(!reader.blocked)return false;return true; });
+    Process writer{20,250};std::thread writerThread;
+    if(mixedWriter) {
+        writerThread=std::thread([&] {
+            current=&writer;KRwLockWriteLock(&rw);KRwLockWriteUnlock(&rw);boundary(writer);
+            std::lock_guard<std::mutex> lock(ready);writer.released=true;changed.notify_all();
+        });
+        waitFor([&] {return writer.blocked;});
+    }
+    // Pending cancellation cannot abandon a granted reader or the remainder
+    // of a wake batch when its first recipient has already unlocked/exited.
+    for(unsigned i=0;i<count;i+=128)kill(readers[i]);
+    if(delayedWake) {
+        { std::lock_guard<std::mutex> lock(ready);holdWake=true;wakeEntered=allowWake=false; }
+        std::thread unlocker([&] {current=&owner;KRwLockWriteUnlock(&rw);boundary(owner);});
+        waitFor([&] {
+            if(!wakeEntered)return false;
+            for(const auto& reader:readers)if(reader.released)return true;
+            return false;
+        });
+        kill(owner);assert(owner.depth && !owner.terminal);
+        { std::lock_guard<std::mutex> lock(ready);allowWake=true;changed.notify_all(); }
+        unlocker.join();assert(owner.terminal && !owner.depth && !owner.refCount);
+        { std::lock_guard<std::mutex> lock(ready);holdWake=false; }
+    } else { KRwLockWriteUnlock(&rw);boundary(owner); }
+    waitFor([&] {
+        for(const auto& reader:readers)if(!reader.released)return false;
+        return !mixedWriter || writer.released;
+    });
+    if(writerThread.joinable())writerThread.join();
+    assert(!writer.depth && !writer.refCount && !writer.heldWriteLock && !writer.blockedOnRwLock);
+    for(auto& thread:threads)thread.join();
+    assert(!rw.readerCount && !rw.writerActive && !rw.readWaitHead && !rw.writeWaitHead);
+    for(auto& reader:readers) {
+        assert(!reader.depth && !reader.refCount && !reader.heldReadLock && !reader.blockedOnRwLock);
+        KRwLockCleanupOnExit(&reader);
+    }
+    KRwLockCleanupOnExit(&owner);
+    std::printf("RW LARGE QUEUE PASS readers=%u mixed-writer=%u delayed-wake=%u no stranded waiters/references\n",count,mixedWriter,delayedWake);
+}
+static void testDeferredReaderAdmission() {
+    constexpr unsigned count=129;
+    KRwLock rw{};KRwLockInit(&rw);Process owner{30,500},arrival{31,501};current=&owner;
+    KRwLockWriteLock(&rw);
+    std::vector<Process> readers;readers.reserve(count);
+    for(unsigned i=0;i<count;++i)readers.push_back(Process{100+i,600+i});
+    unsigned acquired=0,released=0;bool allowUnlock=false,arrivalAcquired=false;
+    auto reader=[&](Process& process,bool newcomer) {
+        current=&process;KRwLockReadLock(&rw);
+        {
+            std::unique_lock<std::mutex> lock(ready);
+            ++acquired;if(newcomer)arrivalAcquired=true;changed.notify_all();
+            changed.wait(lock,[&]{return allowUnlock;});
+        }
+        KRwLockReadUnlock(&rw);boundary(process);
+        std::lock_guard<std::mutex> lock(ready);++released;changed.notify_all();
+    };
+    std::vector<std::thread> threads;threads.reserve(count);
+    for(auto& process:readers)threads.emplace_back([&reader,&process]{reader(process,false);});
+    waitFor([&]{for(const auto& process:readers)if(!process.blocked)return false;return true;});
+    KRwLockWriteUnlock(&rw);boundary(owner);
+    waitFor([&]{return acquired==128;});
+    std::thread newcomer([&]{reader(arrival,true);});
+    waitFor([&]{return arrival.blocked || arrivalAcquired;});
+    {
+        std::lock_guard<std::mutex> lock(ready);
+        assert(arrival.blocked && !arrivalAcquired && acquired==128);
+        allowUnlock=true;changed.notify_all();
+    }
+    waitFor([&]{return released==count+1;});
+    for(auto& thread:threads)thread.join();newcomer.join();
+    assert(!rw.readerCount && !rw.writerActive && !rw.readWaitHead && !rw.writeWaitHead);
+    std::puts("RW DEFERRED ADMISSION PASS new reader cannot bypass a deferred cohort");
+}
 int main() {
     alarm(30);
+    testDeferredReaderAdmission();
+    testLargeReaderQueue(128,false,false);
+    testLargeReaderQueue(129,false,false);
+    testLargeReaderQueue(257,false,true);
+    testLargeReaderQueue(257,true,true);
     for (int i = 0; i < 64; ++i) { testMutex(i % 2); testRw(i % 2); }
     std::puts("test_krwlock_cleanup: actual KMutex/KRwLock cooperative lifetime PASS (64 rounds)");
 }

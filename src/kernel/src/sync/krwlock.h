@@ -9,13 +9,14 @@
 //   - `readerCount` tracks active readers (>0 = readers holding).
 //   - `writerActive` is 1 when a writer holds the lock.
 //   - Separate wait queues for readers and writers.
-//   - Readers are admitted when no writer is active (readers-preferred
-//     when no writer holds). Writers wait for all readers to finish.
+//   - New readers wait behind active/pending writers and deferred readers.
+//     Writers wait for the active reader cohort to finish.
 //   - Internal guard: interrupt-disabling ticket spinlock, held only
 //     for queue manipulation.
 //
-// Fairness: When a writer unlocks, all queued readers are woken at once
-// (batch wakeup). If no readers are queued, the next writer is woken.
+// Fairness: Writer unlock grants a bounded reader cohort, or the next writer
+// when no readers are queued. The last reader grants a waiting writer first,
+// otherwise the next deferred reader cohort. The batch size is not a queue cap.
 
 #include <stdint.h>
 
@@ -50,7 +51,7 @@ void KRwLockReadUnlock(KRwLock* rw);
 // Acquire for writing. Blocks if any readers or another writer are active.
 void KRwLockWriteLock(KRwLock* rw);
 
-// Release the write lock. Wakes all queued readers, or the next writer.
+// Release the write lock. Grants a bounded reader cohort, or the next writer.
 void KRwLockWriteUnlock(KRwLock* rw);
 
 // Cleanup on thread exit: release held write lock and/or remove from wait queues.

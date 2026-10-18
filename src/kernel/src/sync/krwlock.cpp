@@ -82,6 +82,29 @@ static inline Process* Dequeue(Process*& head, Process*& tail)
     return p;
 }
 
+// Called under the guard: reserve the whole batch before any recipient can
+// run. Keep separate wake pointers because a recipient may reuse syncNext.
+static constexpr uint32_t ReadWakeBatch = 128;
+static uint32_t GrantReadBatch(KRwLock* rw, Process** readers) {
+    uint32_t count = 0;
+    while (rw->readWaitHead && count < ReadWakeBatch) {
+        Process* reader = Dequeue(rw->readWaitHead,rw->readWaitTail);
+        ProcessRef(reader);
+        reader->heldReadLock = rw;
+        reader->blockedOnRwLock = nullptr;
+        __atomic_store_n(&reader->pendingWakeup,1,__ATOMIC_RELEASE);
+        readers[count++] = reader;
+        ++rw->readerCount;
+    }
+    return count;
+}
+static void WakeReadBatch(Process** readers,uint32_t count) {
+    for (uint32_t i=0;i<count;++i) {
+        SchedulerUnblock(readers[i]);
+        ProcessUnref(readers[i]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KRwLock API
 // ---------------------------------------------------------------------------
@@ -105,8 +128,8 @@ void KRwLockReadLock(KRwLock* rw)
     if (self) SchedulerKernelRegionEnter(self);
     uint64_t flags = RwGuardAcquire(rw);
 
-    // Grant immediately if no writer is active and none waiting.
-    if (!rw->writerActive && rw->writersWaiting == 0)
+    // Grant immediately only when no writer or deferred reader is waiting.
+    if (!rw->writerActive && rw->writersWaiting == 0 && !rw->readWaitHead)
     {
         rw->readerCount++;
         // Track ownership for the terminal-state invariant check.
@@ -183,6 +206,17 @@ void KRwLockReadUnlock(KRwLock* rw)
         return;
     }
 
+    // Writer unlock grants a bounded cohort. If no writer is waiting, the
+    // last reader must carry remaining readers into the next cohort; leaving
+    // this queue behind stranded readers beyond the first 128 indefinitely.
+    if (rw->readerCount == 0 && rw->readWaitHead) {
+        Process* readers[ReadWakeBatch];
+        const uint32_t count = GrantReadBatch(rw,readers);
+        RwGuardRelease(rw,flags);
+        WakeReadBatch(readers,count);
+        if (self) SchedulerKernelRegionLeave(self);
+        return;
+    }
     RwGuardRelease(rw, flags);
     if (self) SchedulerKernelRegionLeave(self);
 }
@@ -250,32 +284,14 @@ void KRwLockWriteUnlock(KRwLock* rw)
     uint64_t flags = RwGuardAcquire(rw);
     rw->writerActive = 0;
 
-    // Prefer waking all queued readers (batch wakeup) over a single writer,
-    // unless no readers are waiting.
+    // Prefer one bounded reader cohort over a single writer. The final
+    // reader carries deferred cohorts forward, alternating with queued writers.
     if (rw->readWaitHead)
     {
-        // Collect all waiting readers.
-        Process* readers[128];
-        uint32_t count = 0;
-        while (rw->readWaitHead && count < 128)
-        {
-            readers[count] = Dequeue(rw->readWaitHead, rw->readWaitTail);
-            // Publish the read grant before waking; cancellation remains
-            // pending until this acquisition and its operation finish.
-            ProcessRef(readers[count]);
-            readers[count]->heldReadLock = rw;
-            readers[count]->blockedOnRwLock = nullptr;
-            __atomic_store_n(&readers[count]->pendingWakeup, 1, __ATOMIC_RELEASE);
-            count++;
-            rw->readerCount++;
-        }
-        RwGuardRelease(rw, flags);
-
-        // Wake them all outside the guard.
-        for (uint32_t i = 0; i < count; ++i) {
-            SchedulerUnblock(readers[i]);
-            ProcessUnref(readers[i]);
-        }
+        Process* readers[ReadWakeBatch];
+        const uint32_t count = GrantReadBatch(rw,readers);
+        RwGuardRelease(rw,flags);
+        WakeReadBatch(readers,count);
         if (self) SchedulerKernelRegionLeave(self);
         return;
     }
