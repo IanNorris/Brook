@@ -522,3 +522,53 @@ e05bc514d02aa3050148b3a779cfc889752bfd63d47f0f4e819a4862b0619602.
 The corrected Firefox run also passed native close with no remaining browser
 lineage tasks, inactive post-exit audio, heap integrity, acknowledged sync,
 launcher exit zero, serial audit and all three offline filesystem checks.
+
+## Chromium recovery route — 18 October 2026
+
+The frozen desktop stability run reproduced Chromium staying at media time zero
+and four decoded frames for 19.4 seconds while Firefox and VSCodium were open.
+Serial output reported `/dev/dsp` broken pipe followed by ALSA `EIO`. The same
+Chromium process played after the other apps exited and its page was reloaded;
+that also replaces its audio open, so it does not prove a stream-ownership bug.
+
+Chromium inherited the global file-over-null ALSA configuration. In the pinned
+ALSA 1.2.15.3 implementation, output-file write failures become `EIO`, and
+prepare/reset do not issue DSP reset on that file descriptor. This cannot
+recover a genuinely faulted Brook audio stream. The existing clocked OSS plugin
+preserves the error and resets the DSP during prepare. Chromium now has a small
+[package wrapper](../tools/chromium-brook-pkg/README.md) selecting that route,
+while preserving explicitly different caller configurations. No kernel mixer or
+browser engine was changed. The initial discontinuity trigger remains unknown.
+
+The wrapper built from the pinned package and was installed with guest
+`nix-install`. Normal catalogue launches then produced nonzero PCM alone and
+with Firefox. The retained Chromium source batch advanced 1,812 decoded frames
+over 105.3 page seconds, including the concurrent interval; Firefox advanced
+768 over 43.3 page seconds with both playing. Both batches end paused. These
+are page counters, not physical presentation rates, and playback still loses
+time under contention. Two mixer snapshots showed separate enabled streams,
+both with advancing completion counts and no latched discontinuity at sampling.
+
+Pausing Firefox left Chromium producing nonzero PCM. Both paused produced
+zero-amplitude PCM; closing Firefox while Chromium resumed also left nonzero
+output. Both normal close barriers drained their full launch lineages, and
+post-exit capture contained zero frames with inactive output. Heap integrity,
+acknowledged sync, original launcher exit zero, serial audit and all three
+read-only filesystem checks passed. Eight existing documents retained exact
+hashes and Brook ownership. Evidence:
+`build/workloads/stability-f99e267d-20261018/review/`, kernel
+`9e64f2783804714a8998f0bdaf2cbe756980fa0e668b98d07c38292615646ccd`,
+Chromium wrapper `1hafz50sflicc02mcifpc2yqxv2b271x-chromium-brook-148.0.7778.96`.
+
+A subsequent cold boot retained both synthetic browser storage markers and
+reopened the exact Brook-owned text saved through VSCodium. Chromium's installed
+wrapper survived reboot and produced advancing video plus nonzero PCM with
+Firefox and VSCodium also open (Firefox paused). The trio then closed with no
+surviving launch tasks and inactive audio. The second original launcher exited
+zero, all three read-only filesystem checks passed again, and all nine saved
+fixtures retained their hashes and ownership. The combined audit is
+`build/workloads/stability-f99e267d-20261018/acceptance-audit.json`.
+
+This is bounded concurrent-playback and cleanup evidence. Controlled device-fault
+recovery with Chromium, long smooth playback, speakers and fresh-image promotion
+of this wrapper remain separate checks. The generic public index stays stock.

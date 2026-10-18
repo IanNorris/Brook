@@ -95,7 +95,9 @@ the table distinguishes tested behavior from remaining limitations.
   23–24 video callbacks per page second on the controlled 24-fps local clip;
   concurrent playback still slows down. In the latest [network-recovery rerun](docs/package-pipeline.md#late-tx-completion-follow-up-18-october),
   Firefox playback progressed but Chromium's controlled clip stayed at its first
-  frame; that follow-up remains open. [Presentation diagnostics](docs/firefox-presentation.md)
+  frame. A subsequent [Chromium audio-route correction](docs/audio-clock.md#chromium-recovery-route--18-october-2026)
+  lets both controlled clips advance with audio in a bounded concurrent check;
+  playback still loses time under contention. [Presentation diagnostics](docs/firefox-presentation.md)
   distinguish media progress, callback counters and VM display output.
   The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and

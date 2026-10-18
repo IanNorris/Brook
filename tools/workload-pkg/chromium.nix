@@ -1,1 +1,1 @@
-import ./default.nix { app = "chromium"; }
+import ../chromium-brook-pkg {}
