@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "memory/address.h"
 
 namespace brook {
 
@@ -12,11 +13,15 @@ bool KvmClockInit();
 // True if pvclock was successfully registered.
 bool KvmClockAvailable();
 
+// Sanitized, permanently pinned page, only on stable-clock-capable KVM hosts.
+// Borrowed kernel reference; every user PTE must acquire a separate PMM ref.
+PhysicalAddress KvmClockPublicPage();
+
 // Read monotonic nanoseconds since VM start.  Returns 0 if pvclock is
 // not available (callers must fall back to the LAPIC-tick clock).
 //
-// Safe to call from any CPU — the BSP's pvti struct is only read, never
-// written, after KvmClockInit.  Hosts with synchronized TSCs (the
+// Safe to call from any CPU — Brook only reads the BSP's pvti struct after
+// KvmClockInit; KVM updates it asynchronously. Hosts with synchronized TSCs (the
 // PVCLOCK_TSC_STABLE_BIT flag) produce consistent results across CPUs.
 uint64_t KvmClockReadNs();
 

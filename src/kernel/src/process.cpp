@@ -32,6 +32,7 @@
 #include "cpu.h"
 #include "ksym_addrs.h"
 #include "user_copy.h"
+#include "vdso.h"
 
 namespace brook {
 
@@ -509,7 +510,7 @@ static bool SetupTLS(Process* proc, uint64_t stackVirtBase, uint64_t guardPages)
 static uint64_t SetupUserStack(Process* proc,
                                 int argc, const char* const* argv,
                                 int envc, const char* const* envp,
-                                uint64_t interpBase = 0)
+                                uint64_t interpBase = 0, uint64_t vdsoBase = 0)
 {
     // Work from the top of the stack downward.
     uint64_t sp = proc->stackTop;
@@ -576,16 +577,17 @@ static uint64_t SetupUserStack(Process* proc,
 
     // Compute total 8-byte slots to be pushed below, and pad so final RSP
     // is 16-byte aligned (Linux ABI: RSP mod 16 == 0 at process entry).
-    //   auxv: 19 entries × 2 slots = 38
+    //   auxv: 19 entries plus optional AT_SYSINFO_EHDR, two slots each
     //   envp: (envc + 1) slots (including NULL terminator)
     //   argv: (argc + 1) slots (including NULL terminator)
     //   argc: 1 slot
-    int totalSlots = 38 + (envc + 1) + (argc + 1) + 1;
+    int totalSlots = 38 + (vdsoBase ? 2 : 0) + (envc + 1) + (argc + 1) + 1;
     if (totalSlots & 1)
         pushU64(0); // padding to maintain 16-byte alignment
 
     // 5. Push auxiliary vectors (in reverse order, so first entry is at lowest address)
     pushU64(0); pushU64(AT_NULL);                               // AT_NULL
+    if (vdsoBase) { pushU64(vdsoBase); pushU64(33); }            // AT_SYSINFO_EHDR
     pushU64(execfnAddr); pushU64(AT_EXECFN);                    // AT_EXECFN
     pushU64(0); pushU64(AT_HWCAP2);                             // AT_HWCAP2 = 0
     pushU64(randomAddr); pushU64(AT_RANDOM);                    // AT_RANDOM
@@ -946,7 +948,8 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     proc->straceErrorsOnly = false;
 
     // Build user stack with argc/argv/envp/auxv
-    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase);
+    const uint64_t vdsoBase = VdsoInstall(proc->addressSpace, RandomU64());
+    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase, vdsoBase);
 
     // Store the final SP for SwitchToUserMode
     proc->stackTop = userSP;
@@ -1759,12 +1762,13 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     proc->stackBase = stackVirtBase + guardPages * 4096;
     proc->stackTop  = stackVirtTop - 8;
 
-    // 5. Build user stack with argc/argv/envp/auxv
-    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase);
-    proc->stackTop = userSP;
-
-    // 6. Set up TLS
+    // Complete TLS reservations before installing the optional helper.
     if (!SetupTLS(proc, stackVirtBase, guardPages)) return 0;
+
+    // 5. Build user stack with argc/argv/envp/auxv
+    const uint64_t vdsoBase = VdsoInstall(proc->addressSpace, RandomU64());
+    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase, vdsoBase);
+    proc->stackTop = userSP;
 
     // 8. Close FD_CLOEXEC file descriptors — POSIX execve semantics require
     //    that any fd opened with O_CLOEXEC / FD_CLOEXEC is closed when the

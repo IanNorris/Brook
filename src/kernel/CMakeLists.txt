@@ -42,6 +42,28 @@ set(FAT_IMAGE_CPP  "${CMAKE_CURRENT_BINARY_DIR}/fat_test_image.cpp")
 # Python environment can lack Pillow after branding becomes a build input.
 find_program(BROOK_PYTHON3 python3 REQUIRED NO_CACHE)
 
+# Compile the Linux userspace ABI separately from the kernel target flags.
+find_program(BROOK_VDSO_CLANG clang REQUIRED NO_CACHE)
+set(VDSO_ELF "${CMAKE_CURRENT_BINARY_DIR}/brook-vdso.so")
+set(VDSO_CPP "${CMAKE_CURRENT_BINARY_DIR}/vdso_code_page.cpp")
+add_custom_command(
+    OUTPUT "${VDSO_ELF}" "${VDSO_CPP}"
+    COMMAND ${BROOK_VDSO_CLANG} --target=x86_64-linux-gnu -O2 -Wall -Wextra -Werror
+            -ffreestanding -fPIC -fno-builtin -fno-stack-protector
+            -fno-asynchronous-unwind-tables -fno-unwind-tables -nostdlib
+            -fuse-ld=lld -shared -Wl,-Bsymbolic -Wl,--hash-style=both
+            -Wl,-soname=linux-vdso.so.1
+            "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/vdso/layout.ld"
+            "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/vdso/versions.map"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vdso/clock.c" -o "${VDSO_ELF}"
+    COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/bake_vdso.py"
+            "${VDSO_ELF}" --cpp "${VDSO_CPP}"
+    DEPENDS vdso/clock.c vdso/layout.ld vdso/versions.map
+            "${BROOK_ROOT}/scripts/bake_vdso.py"
+    COMMENT "Building and validating Linux clock vDSO"
+    VERBATIM
+)
+
 # Bake branding from the tracked source rather than a stale checked-in array.
 set(BOOT_LOGO_HEADER "${CMAKE_CURRENT_BINARY_DIR}/brook_boot_logo_data.h")
 add_custom_command(
@@ -222,6 +244,7 @@ add_executable(kernel
     src/terminal.cpp
     src/rtc.cpp
     src/kvmclock.cpp
+    src/vdso.cpp
     src/display.cpp
     src/gpu_compositor.cpp
     src/gpu_app.cpp
@@ -272,6 +295,7 @@ add_executable(kernel
     src/ksym_addrs.cpp
     "${KSYM_TABLE_CPP}"
     "${FONT_ATLAS_CPP}"
+    "${VDSO_CPP}"
     ${DESKTOP_FONT_SOURCES}
     "${FAT_IMAGE_CPP}"
     "${BROOK_ROOT}/src/shared/src_km/serial.cpp"

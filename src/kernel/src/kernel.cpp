@@ -46,6 +46,7 @@
 #include "fw_cfg.h"
 #include "rtc.h"
 #include "kvmclock.h"
+#include "vdso.h"
 #include "watchdog.h"
 #include "string.h"
 
@@ -395,6 +396,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     {
         brook::KPuts("WARNING: ACPI init failed — running without LAPIC\n");
     }
+
+    brook::VdsoInit();
 
     // TTY: map framebuffer into virtual space and initialise the text display.
     const brook::Framebuffer& fb = bootProtocol->framebuffer;

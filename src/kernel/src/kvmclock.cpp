@@ -36,6 +36,7 @@ static constexpr uint32_t KVM_FEATURE_CLOCKSOURCE2 = (1u << 3);
 static volatile PvClockVcpuTimeInfo* g_pvti = nullptr;
 static bool g_enabled = false;
 static bool g_stableFeature = false;
+static PhysicalAddress g_clockPage;
 
 static inline void Cpuid(uint32_t leaf, uint32_t sub,
                          uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d)
@@ -86,9 +87,11 @@ bool KvmClockInit()
 
     g_pvti = reinterpret_cast<volatile PvClockVcpuTimeInfo*>(PhysToVirt(phys).raw());
 
-    // Zero the struct — version must be 0 (even) before the host writes it.
+    // Sanitize the entire allocation before host registration: the read-only
+    // user alias must never expose stale kernel data outside the pvclock ABI.
     volatile uint64_t* q = reinterpret_cast<volatile uint64_t*>(g_pvti);
-    for (int i = 0; i < 4; i++) q[i] = 0;
+    for (int i = 0; i < 4096 / 8; i++) q[i] = 0;
+    g_clockPage = phys; // Permanent reference while KVM may write this page.
 
     // Write MSR: bit 0 = enable, bits 63..1 = physical address (4-byte aligned).
     WriteMsr(MSR_KVM_SYSTEM_TIME_NEW, phys.raw() | 1ULL);
@@ -105,6 +108,11 @@ bool KvmClockInit()
 bool KvmClockAvailable()
 {
     return g_enabled;
+}
+
+PhysicalAddress KvmClockPublicPage()
+{
+    return g_enabled && g_stableFeature ? g_clockPage : PhysicalAddress{};
 }
 
 uint64_t KvmClockReadNs()
