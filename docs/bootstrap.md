@@ -1154,3 +1154,88 @@ This supersedes the pending full-rerun note for the TX change and renews both
 bootstrap paths with the current 39-suite source. Real application co-use,
 profile/cookie persistence, permissions and remaining desktop work still need
 their own acceptance.
+
+### Matching 39-suite refresh after clock and desktop changes (2026-10-18)
+
+Both full paths pass at `f4066d0c78c3196d07344789d1cdce774c7fb0ef`, renewing
+acceptance after the realtime/block completion clock and desktop session-service
+changes. Each isolated eight-vCPU/4-GiB VM cloned that exact remote revision,
+built kernel/EFI, 12 modules, seven bare-metal test ELFs and 39 native suites,
+and passed the native suites before and after a clean native rebuild. Independent
+verification disks then booted the respective guest-built kernels, passed Git
+fsck and all 39 suites again. Bare-metal ELFs were built and hashed, not executed.
+The bootstrap runs use root maintenance identity, not a non-root build acceptance.
+
+| Stage, guest seconds | Prepared SDK | Clean image |
+| --- | ---: | ---: |
+| SDK installation via nix-install | Already installed | 239 |
+| Clone | 16 | 14 |
+| Checkout | 6 | 8 |
+| Submodules | 19 | 19 |
+| Full compilation | 51 | 53 |
+| Native compilation | 31 | 30 |
+| Native tests | 8 | 8 |
+| Warm native compilation | 30 | 30 |
+| Warm native tests | 8 | 8 |
+| Incremental build | 3 | 3 |
+
+The same clean seed and pinned SDK previously installed in 236 seconds. The
+239-second refresh and 51–53-second compilation are baseline consistency checks,
+not evidence of a new speedup. Host cache/thermal state and observer overhead
+remain uncontrolled. The largest clean-run NARs took 51,181 ms for the
+502,507,680-byte LLVM library and 46,772 ms for the 817,440,144-byte Clang library.
+Those are end-to-end pipeline intervals on RAM-backed disks, not physical disk
+throughput measurements or isolated decompressor CPU times.
+
+Twenty coarse clean-run snapshots observed up to 646.5 MiB used physical memory;
+nine prepared snapshots observed up to 746.9 MiB, both during native compilation.
+These approximately 20-second samples include kernel/cache memory and miss
+unobserved peaks; they are not per-process RSS or a memory improvement claim.
+Three-second diagnostic profiles lost records in clone, checkout, compilation
+and native tests. Their loss counters are retained; they cannot establish
+unbiased CPU percentages or a new bottleneck. Shorter targeted captures are
+needed before attributing remaining package/compilation costs.
+
+All four tracked commands exited zero, with no remaining tagged descendants
+and both output streams complete. All four launchers exited zero after checked
+sync/stop; all FAT/ext2 checks passed. The 60 extracted outputs per path match
+their recorded hashes, staged ESP kernel/EFI files and deployed verification
+modules. The launcher's temporary EFI disk was deleted on exit; the independent
+post-run comparison covers the retained ESP staging, not that removed raw disk.
+Successful RAM images were archived and their owned tmpfs directories released.
+
+The clean guest-built kernel SHA-256 is
+`43f995297dd4164e168421df939e14e5443b821b4ecc560b107f59f904735988`;
+prepared is
+`dc22eba01ca3a0630703e480f07999f0637a086501c9cde695dac0d504764e48`.
+Each verification launch used its own extracted output; cross-build byte
+reproducibility is not claimed.
+
+A blanket user-fault rejection is incorrect for this suite: `test_user_copy`
+intentionally faults real REP instructions and tests signal-return register
+preservation. The new [fault auditor](../scripts/audit_bootstrap_faults.py)
+checks visible records against the extracted test's exact instruction/fixup and
+handler symbols, operand direction, signal delivery and completed test receipt.
+An exact large-RAX sentinel case uses completed in-test assertions because the
+kernel suppresses its restore-register log for RAX above 512. Unrelated images,
+instructions, handlers, incomplete receipts and unproven recovery fail closed;
+seven host regression tests exercise these rejection paths. The bootstrap
+harness now invokes this audit before publishing success. That host-side hook
+was added after the live runs and verified against all four completed records.
+
+The clean build/verification logs contain 9/5 intact fault banners; prepared
+contains 10/5. Serial interleaving corrupts some additional probe text, so this
+is a classification of visible records, not a lossless exception census. The
+collected native test results remain the evidence for their assertions. This
+does not extend coverage to every interrupt vector or every raw user-pointer
+access path. No kernel/device panic or unexpected intact fault record was found.
+
+Evidence is under ignored:
+
+- `build/experiments/results/bootstrap-clean-f4066d0-ram/`
+- `build/experiments/results/bootstrap-prepared-f4066d0-ram/`
+- `build/workloads/bootstrap-f4066d0-20261018/acceptance-audit.json`
+
+Both result directories contain the separate `user-fault-audit.json`. This
+supersedes the pending full-rerun notes for the clock/session kernel changes;
+application, identity, Gallery and desktop acceptance still have their own scope.

@@ -257,3 +257,15 @@ supported templates (`build/register-entry-all-coverage-20261017.json`).
 
 Keep production test hooks disabled. Expand this matrix as tests and observed
 path evidence are added; do not advertise exhaustive interrupt coverage yet.
+
+
+### Full bootstrap follow-up (2026-10-18)
+
+The [matching bootstrap refresh](bootstrap.md#matching-39-suite-refresh-after-clock-and-desktop-changes-2026-10-18)
+passes all 39 suites three times on each path, including under each guest-built
+kernel. Hosted `test_user_copy` exercises real CPL3 REP faults and Brook signal
+return, with partial-count/RCX/R11 assertions and malformed RIP/RSP rejection.
+Its hosted fault model translates the fault into the CPL0 fixup predicate; this
+is not exhaustive live coverage of kernel-mode copies or interrupt vectors.
+The new bootstrap fault audit preserves that distinction and does not mistake
+intentional probes for application crashes.

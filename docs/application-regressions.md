@@ -175,5 +175,6 @@ Ignored evidence is in `build/workloads/app-regressions-20261018/`, including
 session-service tests is
 `f14006ec594b239f331d74619d65e554db44b2467c83e2dd08adc7cf807c2a00`.
 All 39 hosted suites and the supported compiled entry audit passed before boot.
-Full matching bootstrap acceptance remains at `610592d`; newer kernel changes
-still need both complete bootstrap paths rerun.
+Both full bootstrap paths were subsequently renewed at `f4066d0`; see the
+[matching refresh](bootstrap.md#matching-39-suite-refresh-after-clock-and-desktop-changes-2026-10-18).
+Application evidence above retains its own kernel/package identities and scope.

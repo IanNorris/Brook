@@ -581,6 +581,15 @@ sync
     verify_process.wait(timeout=30)
     check_stopped_serial(verify_data, verification)
     verify_fsck = offline_fsck(verification, "after")
+    # Hosted user-copy probes deliberately fault. Reject unexpected visible
+    # records without treating those pinned, successfully recovered tests as
+    # application crashes. Serial remains best-effort evidence, not a census.
+    from audit_bootstrap_faults import audit_files
+    fault_audit = audit_files(artifacts / "host_tests/test_user_copy", [
+        (directory / "guest-final-serial.log", directory / "command-evidence.json"),
+        (verification / "guest-final-serial.log", verification / "command-evidence.json"),
+    ])
+    write(directory / "user-fault-audit.json", fault_audit)
     metadata.update(stages=stages, snapshots=snapshots, profiles=profiles,
                     after_fsck=after, artifact_hashes=hashes,
                     verification={"session": verify_session, "boot_seconds": verify_seconds,

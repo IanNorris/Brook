@@ -94,7 +94,7 @@ the table distinguishes tested behavior from remaining limitations.
   progress from slow video-frame callbacks and VM display output.
   The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and
-  remaining limits. Both [full bootstrap paths](docs/bootstrap.md#matching-39-suite-acceptance-after-tx-ownership-2026-10-18)
+  remaining limits. Both [full bootstrap paths](docs/bootstrap.md#matching-39-suite-refresh-after-clock-and-desktop-changes-2026-10-18)
   pass all 39 native suites three times, including under their guest-built
   kernels. The [virtio-net TX ownership fix](docs/package-pipeline.md) reduces
   the measured clean-image SDK install from 732 to 236 seconds; compilation
