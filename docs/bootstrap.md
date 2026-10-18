@@ -13,11 +13,10 @@ that does not imply that Nix or the compiler was rebuilt inside Brook.
 
 ## Next acceptance goal
 
-The shared-library startup and native compatibility gate now contains 19
-tests. The filesystem gate also passes the expanded guest lifetime probe and
-offline fsck after a clean shutdown. Both the prepared-SDK and clean-image
-paths passed the full sequence at the same revision, most recently `5a363c6`
-with the current 19-test suite, including the profiler stack-walker test.
+The native compatibility gate now contains 44 suites. Both prepared-SDK and
+clean-image paths passed at pinned revision `ead55379`, including guest-built
+boot and repeated tests. The [44-suite refresh below](#44-suite-bootstrap-refresh-18-october)
+records exact artifacts, timings, profiling limits and launcher evidence scope.
 
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
 revision, SDK closure and VM configuration:
@@ -74,7 +73,7 @@ matches. Base transport paths keep the same host-prepared modes in both images.
 The harness runs the real guest installer, performs an HTTPS clone and pinned
 submodule update, and builds kernel/EFI/modules/bare-metal/native artifacts.
 It validates module imports and requires the explicit native-suite inventory
-(currently 42/42 CTest results) twice, before and
+(currently 44/44 CTest results) twice, before and
 after a clean native rebuild with warm caches. The incremental kernel stage
 is labelled separately from a full compilation.
 
@@ -102,6 +101,12 @@ not turn a failed or hung guest build into acceptance. Shutdown evidence records
 whether sync was acknowledged live or came from an already completed script
 and a normal launcher-recorded exit.
 
+New runs separately persist and require zero from the owned VM launcher in
+`launcher-exit.json`, before extraction and after verification. Resume requires
+that matching receipt; a QEMU exit alone does not substitute for it. Two host
+tests use actual subprocesses to verify zero acceptance and nonzero rejection.
+Historical runs without that receipt retain their explicitly narrower evidence.
+
 Each new run uses eight vCPUs, eight build jobs, 4 GiB by default, software virtio graphics, silent audio and the
 kernel WM command listener without Wayland apps. The kernel compositor still
 runs: this is a no-Wayland baseline, not a machine with no graphics work.
@@ -116,7 +121,7 @@ interpreted using the nearest kernel symbol.
 After guest sync and shutdown, the harness requires offline fsck on both
 disks, extracts artifacts with debugfs, hashes them, boots their kernel/EFI
 and modules in a second isolated VM, verifies the booted kernel hash and
-command replies, and reruns Git fsck and all 40 native tests under that kernel,
+command replies, and reruns Git fsck and all 44 native tests under that kernel,
 then repeats synced offline fsck. Only this complete sequence
 writes `result.json` with `success: true`. Failure retains logs/disks and may
 leave the VM running for diagnosis; use its bridge session to sync and stop it.
@@ -1332,3 +1337,106 @@ This renews bootstrap acceptance for the permission source revision, including
 the SDK install on the clean image. Real-application concurrency, complete
 identity isolation and App Gallery interruption/disk-full recovery still have
 separate outstanding acceptance work.
+
+## 44-suite bootstrap refresh (18 October)
+
+Prepared and clean images both built pinned remote revision
+`ead5537988f4b8b53982e258e335d1d1c6428353`. Fresh seeds were recreated from current
+package-tool sources with the same SDK
+`/nix/store/wryc8rh1a9rb7gr528fdhzp9n38rjwda-brook-bootstrap`.
+The clean image verified its base-only store and absent SDK before installing
+through guest `nix-install`. The prepared SDK uses guest-NAR-equivalent modes.
+Neither seed contains Quake data. These are root bootstrap commands, not
+unprivileged self-hosting or a complete desktop permission boundary.
+
+Each eight-vCPU/4-GiB VM used private host-tmpfs disks, software virtio graphics,
+the kernel compositor without Wayland apps, silent audio and 4 GiB host reserve.
+Both paths performed HTTPS clone, pinned checkout/submodules, kernel/EFI/module/
+bare-metal builds, 44 native tests, clean native rebuild and another 44-test
+pass. Independent VMs booted each path's guest-built kernel and passed all 44
+again. Bare-metal test ELFs were built, not executed.
+
+| Stage (guest wall seconds) | Prepared SDK | Clean image |
+| --- | ---: | ---: |
+| SDK installation | Already installed | 243 |
+| HTTPS clone | 13 | 14 |
+| Checkout | 8 | 7 |
+| Submodules | 20 | 20 |
+| Kernel/module/bare-metal compilation | 52 | 53 |
+| Native configuration | 4 | 4 |
+| Native compilation | 31 | 31 |
+| Native tests | 8 | 9 |
+| Warm native compilation | 31 | 31 |
+| Warm native tests | 8 | 9 |
+| Incremental kernel build | 3 | 2 |
+
+These are instrumented single runs with one-second stage resolution and
+uncontrolled host cache/load. The previous 245-second install and 52–54-second
+kernel builds remain observations, not evidence of a speedup. Periodically
+observed guest used memory peaked around 735 MiB prepared and 699 MiB clean;
+these snapshots are not allocation high-water marks.
+
+Each path produced 65 hashed artifacts: kernel/EFI, twelve modules, seven
+bare-metal ELFs and 44 native binaries. Independent `.modinfo` inspection found
+ABI 20 throughout. Verification ESP/kernel/module bytes matched extracted
+outputs. Guest kernel SHA-256:
+
+- Prepared: `613a36b043a61315277e4a16fab46d0a3111975b9bb47280e41ce3c8523f6b83`.
+- Clean: `906e92470031d8daf215fd095857bb5e93035144c3c2443d638072fcc67119ec`.
+
+Both original outer Nix-shell/harness invocations returned zero. All four QEMU
+identities were independently dead with exit zero. Primary tracked commands
+had terminal exit zero, original/full lineages empty and exact stdout/stderr EOF
+without gaps, drops or read errors. Checked sync and both sets of three read-only
+FAT/data/Nix checks passed per path. Images were saved as sparse regular files
+and owned tmpfs directories removed. The historical harness does not separately
+persist the inner `run_experiment.sh` wrapper's return status; QEMU and outer
+harness evidence must not be relabelled as that missing receipt. Visible user
+faults were recognised deliberate recovery probes in the exact built user-copy
+ELF; serial interleaving prevents an exhaustive fault-count claim.
+
+### Performance evidence
+
+`scripts/bootstrap_perf_report.py` now pairs explicit block-counter tables
+around build stages. It subtracts monotonic counters and retains cumulative
+maxima without subtracting them; missing/reset/device-change data is explicit.
+Six parser tests pass. Counters include whole-VM/profiling work, aggregate waits
+can overlap, and requests do not measure bytes. Installation has no automatic
+before/after tables, so whole-stage disk attribution remains unavailable.
+
+Many three-second build captures overflowed. The initial clean-install capture
+retained 2,390 CPU samples without drops, including 2,358 idle leaves. A later
+500-ms capture retained 394 CPU samples and 7,675 switches without drops, with
+358 idle leaves. IRQ-masked work is underrepresented and these intervals do not
+represent the full install.
+
+A separate ten-second host interval measured about 4.41 CPU-seconds across
+selected QEMU threads (0.44 cores on average). vCPUs 0/1 used around 12%/19% of a
+core. Guest block counters around that interval recorded about 0.266 aggregate
+completion-wait seconds and 6,958 requests on the Nix disk, with no new flush
+errors. This motivates separating pipeline pacing, network delivery,
+decompression and filesystem work; it does not identify one bottleneck or
+establish physical disk latency as the dominant cost.
+
+The owned `tools/io-bench/pipecheck.c` control transfers and byte-verifies 8 MiB
+through one/two pipes with requested 4-KiB/64-KiB chunks, verifies producer reports
+and waits every child. The same static binary passed on Linux and in a separate
+eight-vCPU/4-GiB Brook VM as UID 1000. Two guest rounds took roughly 25–77 ms per
+case; Linux took roughly 4 ms. Guest 64-KiB requests still required about 2,000
+writes per pipe, consistent with the current 4-KiB syscall cap. Timings include
+process lifecycle and byte checking, without decompression, file output,
+metadata or networking. This throughput alone does not explain SDK install
+time. Next compare controlled NAR extraction with and without those stages,
+preserving exact output hashes. This is not general pipe cancellation or
+concurrent-reader verification.
+
+The control VM drained all user address spaces/finalizers, passed heap integrity,
+used orderly MCP shutdown and exited zero; three read-only checks were clean.
+Local ignored evidence:
+
+- `build/experiments/results/bootstrap-{prepared,clean}-ead55379-ram/`.
+- `build/workloads/bootstrap-ead55379-20261018/acceptance-audit.json`.
+- `build/bootstrap-ead55379-perf-20261018.json`.
+- Clean-run `install-short-profile.json` and `install-host-interval/`.
+- `build/workloads/pipe-control-20261018/review/` and
+  `build/pipecheck-linux-20261018.log`.

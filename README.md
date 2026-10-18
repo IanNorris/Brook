@@ -149,8 +149,8 @@ the table distinguishes tested behavior from remaining limitations.
   and the actual validation evidence are recorded in
   [experiment notes](docs/experiments.md).
 - **Self-hosting:** Both clean-image and prepared-SDK paths passed at pinned
-  revision `37cccf60`. The clean image installs its SDK through `nix-install`;
-  both clone and build Brook, pass all 40 native suites twice, then boot their
+  revision `ead55379`. The clean image installs its SDK through `nix-install`;
+  both clone and build Brook, pass all 44 native suites twice, then boot their
   guest-built kernels and pass the suites again. Checked shutdown and offline
   FAT/ext2 checks passed for both boots; see [bootstrap testing](docs/bootstrap.md)
   for the validation scope.

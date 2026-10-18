@@ -101,6 +101,18 @@ def memory_available():
     return int(re.search(r"^MemAvailable:\s+(\d+)", Path("/proc/meminfo").read_text(), re.M)[1])*1024
 
 
+def wait_launcher(process, directory, session):
+    """Persist the owned wrapper's terminal status, separately from QEMU."""
+    code = process.wait(timeout=30)
+    receipt = {"session": session, "pid": process.pid, "exit_code": code,
+               "source": "owned subprocess.Popen.wait",
+               "completed_host_monotonic": time.monotonic()}
+    write(directory / 'launcher-exit.json', receipt)
+    if code != 0:
+        raise RuntimeError(f"VM launcher exited {code}; retain disks and launcher receipt")
+    return receipt
+
+
 def check_stopped_serial(data, directory):
     serial = Path(data["serial_log"])
     text = serial.read_text(errors="replace")
@@ -516,8 +528,17 @@ def finalize_acceptance(directory, args, metadata, process, session, data, stage
             raise RuntimeError("Guest sync was not acknowledged")
     metadata["initial_shutdown"] = stop
     write(directory / "stop-evidence.json", stop)
-    if process: process.wait(timeout=30)
-    else: wait_existing_vm(data)
+    if process:
+        metadata['initial_launcher_exit'] = wait_launcher(process, directory, session)
+    else:
+        wait_existing_vm(data)
+        receipt_path = directory / 'launcher-exit.json'
+        if not receipt_path.exists():
+            raise RuntimeError('Original VM launcher exit receipt missing; stopped disks retained for audit')
+        receipt = json.loads(receipt_path.read_text())
+        if receipt.get('session') != session or receipt.get('exit_code') != 0:
+            raise RuntimeError('Original VM launcher exit is unverified or failed')
+        metadata['initial_launcher_exit'] = receipt
     check_stopped_serial(data, directory)
     if cache: cache.shutdown()
     after = offline_fsck(directory, "after")
@@ -586,7 +607,7 @@ sync
     verify_stop = server.control(verify_session, "stop")
     if not verify_stop.get("guest_sync_completed"):
         raise RuntimeError("Verification guest sync was not acknowledged")
-    verify_process.wait(timeout=30)
+    verify_launcher_exit = wait_launcher(verify_process, verification, verify_session)
     check_stopped_serial(verify_data, verification)
     verify_fsck = offline_fsck(verification, "after")
     # Hosted user-copy probes deliberately fault. Reject unexpected visible
@@ -601,6 +622,7 @@ sync
     metadata.update(stages=stages, snapshots=snapshots, profiles=profiles,
                     after_fsck=after, artifact_hashes=hashes,
                     verification={"session": verify_session, "boot_seconds": verify_seconds,
+                                  "launcher_exit": verify_launcher_exit,
                                   "native_test_seconds": verify_native_seconds,
                                   "replies": replies, "fsck": verify_fsck}, success=True)
     if ram:

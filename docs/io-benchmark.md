@@ -219,3 +219,27 @@ Mounted filesystem modules must remain loaded. The current void module-exit
 API cannot honor checked-unmount failure and then safely release module code;
 see the mounted-module unload item in [backlog.md](backlog.md). This limitation
 is separate from normal checked VFS unmount and bridge synchronization.
+
+## Pipe transport control
+
+For a small control that excludes filesystem, decompression and network costs,
+compile inside `nix-shell`:
+
+```sh
+mkdir -p build/io-bench
+"$MUSL_CC" -O2 -Wall -Wextra -Werror -static tools/io-bench/pipecheck.c -o build/io-bench/pipecheck
+build/io-bench/pipecheck 8
+```
+
+The argument is MiB per case (1–256, default 8). Four cases cover one/two pipes
+and requested 4-KiB/64-KiB chunks. The sink checks every byte, parents verify child
+byte reports and wait statuses, and timings include process lifecycle and data
+checking. The program creates no files and uses no network. Deploy the same
+binary to a stopped private VM disk and execute it as an ordinary guest command;
+keep its tracked exit, full lineage and output evidence.
+
+Two UID-1000 rounds on the ABI-20 kernel verified all cases at roughly 25–77 ms
+per 8 MiB. Linux with the identical binary took roughly 4 ms. The control VM
+passed heap/cleanup drain, orderly shutdown and read-only filesystem checks.
+See the [bootstrap refresh](bootstrap.md#performance-evidence) for exact scope,
+evidence and why these results do not identify the complete installer bottleneck.
