@@ -245,3 +245,50 @@ exit zero, serial kernel/device/fatal-user-error checks and the three read-only
 filesystem checks. All nine saved fixtures retained hashes and ownership.
 Two native-window recordings fully decode; see [recording evidence](vm-recording.md).
 Local evidence: `build/workloads/media-regression-bed237cb-20261018/`.
+
+## VLC retained-surface fix — 18 October 2026
+
+The user observed black flashes and corruption during native-SDL playback.
+Updating to the current unmodified Wayland server reproduced the flashes.
+Its trace showed video subsurface buffers continuing to commit while the parent
+window also repainted. The server wrote both directly into the same VFB and
+retained neither surface's pixels, allowing a parent repaint to erase video.
+
+The candidate server owns snapshots of committed SHM pixels, composes the root
+and its subsurfaces in private memory, then exports the complete image to the
+kernel VFB. Composition uses premultiplied alpha and converts once to Brook's
+straight-alpha representation. Tests against production code cover parent
+repaint, client buffer reuse, repeated alpha composition, sibling order,
+negative/nested clipping, shrink/move/detach, and role/surface destruction.
+Resource teardown handles both explicit requests and client disconnect.
+
+The user reported the flashes fixed with this candidate. A subsequent short
+minimize/restore showed real video again, rather than the earlier black area.
+The 40-second recording fully decoded 646 H.264 and 1,877 AAC frames. It reported
+one estimated audio discontinuity, so this does not establish smooth audio.
+Neither the recording counts nor this uncontrolled live comparison establish
+a frame-rate improvement. The final shared-VFB copy and resize publication can
+still race kernel reads; atomic CPU presentation is separate work.
+
+A sampled-luma scan of the movie rectangle found 28 near-black frames among
+374 baseline frames and none among 646 candidate frames. These are different
+movie intervals, and the recorder can coalesce upstream updates; this supports
+the live observation without proving every displayed/source frame correct.
+
+The user subsequently confirmed the live fix and handed the VM back. Normal
+close drained its full launch lineage and audio. A headless cold run verified
+the same server hash, ordinary playback, a measured 55.87-second minimize,
+restored real video with nonzero PCM, normal close and a separate active-audio
+SIGKILL. Both exit paths drained all tasks in the launch lineage and left audio
+inactive with zero captured frames.
+
+The native and cold runs passed heap checks, checked shutdown, original launcher
+exit zero, serial fault checks and all six read-only filesystem checks. All nine
+saved fixtures retained their hashes and ownership. The separate failed boot
+before Wayland started is retained as failure evidence and excluded from these
+accepted endpoints; see the [backlog](backlog.md).
+
+Local evidence: `build/workloads/boot-recording-7c72adad-20261018/`, including
+`acceptance-audit.json`, `retained-retry/` and `retained-cold/`. Sessions:
+`0723c067e5684898b96add5c1a382f83` and `7f5bf0855f4c400dbe419e4ba0bcbaeb`.
+Package: `bifkmjncizclcyl7wqz7l0vycdrjr1j4-waylandd-brook-0.1-brook`.

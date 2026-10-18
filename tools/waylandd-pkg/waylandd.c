@@ -218,6 +218,12 @@ struct brook_frame_callback {
 struct brook_surface {
     struct wl_resource *resource;
     struct wl_resource *pending_buffer;
+    int pending_attach;
+    /* Own committed SHM pixels after releasing the client's buffer. Never use
+     * the shared kernel VFB as the backing store for a surface tree. */
+    uint32_t *image, *composite;
+    uint32_t image_w, image_h;
+    size_t composite_pixels;
 
     /* xdg-shell role state. */
     struct wl_resource *xdg_surface;
@@ -387,6 +393,7 @@ static void surface_attach(struct wl_client *c, struct wl_resource *r,
     (void)c; (void)x; (void)y;
     struct brook_surface *s = wl_resource_get_user_data(r);
     s->pending_buffer = buffer;
+    s->pending_attach = 1;
 }
 static void surface_damage(struct wl_client *c, struct wl_resource *r,
                            int32_t x, int32_t y, int32_t w, int32_t h) {
@@ -472,22 +479,101 @@ static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
     (void)c; (void)r; (void)reg;
 }
 
-/* Copy wl_shm buffer pixels into the per-window VFB.  Preserve ARGB alpha so
- * GTK/Qt CSD shadows stay transparent; force XRGB buffers opaque. */
-static void blit_to_window(struct brook_surface *s,
-                           const uint8_t *src, int sw, int sh, int sstride,
-                           uint32_t format) {
-    if (!s->vfb || sw <= 0 || sh <= 0) return;
-    int cw = sw < (int)s->vfb_w ? sw : (int)s->vfb_w;
-    int ch = sh < (int)s->vfb_h ? sh : (int)s->vfb_h;
-    int has_alpha = (format == WL_SHM_FORMAT_ARGB8888);
-    for (int y = 0; y < ch; y++) {
-        const uint32_t *srow = (const uint32_t*)(src + (size_t)y * sstride);
-        uint32_t *drow = s->vfb + (size_t)y * s->vfb_stride;
-        for (int x = 0; x < cw; x++) {
-            drow[x] = has_alpha ? srow[x] : (0xff000000u | (srow[x] & 0x00ffffffu));
-        }
+/* Retained images and the private composition canvas use Wayland's
+ * premultiplied ARGB. Only the final export converts to Brook's straight ARGB.
+ * Building the complete tree before touching the VFB prevents a root-only
+ * intermediate frame from becoming visible between parent and child blits. */
+static int surface_snapshot(struct brook_surface *s, const uint8_t *src,
+                            int w, int h, int stride, uint32_t format) {
+    if (w <= 0 || h <= 0 || (size_t)w > SIZE_MAX / 4 / (size_t)h ||
+        stride < 0 || (size_t)stride < (size_t)w * 4) return 0;
+    uint32_t *pixels = s->image;
+    if (s->image_w != (uint32_t)w || s->image_h != (uint32_t)h) {
+        pixels = malloc((size_t)w * h * 4);
+        if (!pixels) return 0;
     }
+    for (int y = 0; y < h; ++y) {
+        const uint32_t *row = (const uint32_t *)(src + (size_t)y * stride);
+        uint32_t *dst = pixels + (size_t)y * w;
+        if (format == WL_SHM_FORMAT_ARGB8888) memcpy(dst, row, (size_t)w * 4);
+        else for (int x = 0; x < w; ++x) dst[x] = row[x] | 0xff000000u;
+    }
+    if (pixels != s->image) free(s->image);
+    s->image = pixels; s->image_w = w; s->image_h = h;
+    return 1;
+}
+static void surface_clear_image(struct brook_surface *s) {
+    free(s->image); s->image = NULL; s->image_w = s->image_h = 0;
+}
+static uint32_t pixel_over(uint32_t src, uint32_t dst) {
+    unsigned a = src >> 24, inv = 255 - a;
+    if (a == 255) return src;
+    if (!a) return dst;
+    uint32_t out = 0;
+    for (unsigned shift = 0; shift < 32; shift += 8) {
+        unsigned v = ((src >> shift) & 255) + (((dst >> shift) & 255) * inv + 127) / 255;
+        out |= (v > 255 ? 255 : v) << shift;
+    }
+    return out;
+}
+static uint32_t pixel_straight(uint32_t px) {
+    unsigned a = px >> 24;
+    if (!a || a == 255) return a ? px : 0;
+    uint32_t out = px & 0xff000000u;
+    for (unsigned shift = 0; shift < 24; shift += 8) {
+        unsigned v = (((px >> shift) & 255) * 255 + a / 2) / a;
+        out |= (v > 255 ? 255 : v) << shift;
+    }
+    return out;
+}
+/* Iterative traversal avoids a client-controlled recursive call stack. Child
+ * coordinates are relative to their parent, clipped only by the root window. */
+static int surface_compose(struct brook_surface *root) {
+    if (!root->vfb_w || !root->vfb_h ||
+        (size_t)root->vfb_w > SIZE_MAX / 4 / root->vfb_h) return 0;
+    size_t count = (size_t)root->vfb_w * root->vfb_h;
+    if (root->composite_pixels < count) {
+        uint32_t *next = realloc(root->composite, count * 4);
+        if (!next) return 0;
+        root->composite = next; root->composite_pixels = count;
+    }
+    memset(root->composite, 0, count * 4);
+    struct brook_surface *s = root;
+    int64_t ox = 0, oy = 0;
+    for (;;) {
+        if (s->image) {
+            int64_t x0 = ox < 0 ? -ox : 0, y0 = oy < 0 ? -oy : 0;
+            int64_t x1 = s->image_w, y1 = s->image_h;
+            if (ox + x1 > root->vfb_w) x1 = (int64_t)root->vfb_w - ox;
+            if (oy + y1 > root->vfb_h) y1 = (int64_t)root->vfb_h - oy;
+            for (int64_t y = y0; y < y1; ++y) {
+                uint32_t *dst = root->composite + (size_t)(oy + y) * root->vfb_w;
+                const uint32_t *src = s->image + (size_t)y * s->image_w;
+                for (int64_t x = x0; x < x1; ++x)
+                    dst[ox + x] = pixel_over(src[x], dst[ox + x]);
+            }
+        }
+        if (s->image && s->children) {
+            s = s->children; ox += s->sub_x; oy += s->sub_y; continue;
+        }
+        while (s != root && !s->sibling) {
+            ox -= s->sub_x; oy -= s->sub_y; s = s->subsurface_parent;
+        }
+        if (s == root) break;
+        ox -= s->sub_x; oy -= s->sub_y; s = s->sibling;
+        ox += s->sub_x; oy += s->sub_y;
+    }
+    return 1;
+}
+static void surface_repaint(struct brook_surface *s) {
+    while (s->subsurface_parent) s = s->subsurface_parent;
+    if (!s->vfb || !surface_compose(s)) return;
+    for (uint32_t y = 0; y < s->vfb_h; ++y) {
+        uint32_t *dst = s->vfb + (size_t)y * s->vfb_stride;
+        const uint32_t *src = s->composite + (size_t)y * s->vfb_w;
+        for (uint32_t x = 0; x < s->vfb_w; ++x) dst[x] = pixel_straight(src[x]);
+    }
+    wm_signal_dirty(s->wm_id);
 }
 
 static void surface_commit(struct wl_client *c, struct wl_resource *r) {
@@ -548,7 +634,17 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         wl_list_insert_list(s->committed_frames.prev, &s->pending_frames);
         wl_list_init(&s->pending_frames);
     }
-    if (!s->pending_buffer) return;
+    if (s->pending_attach && !s->pending_buffer) {
+        s->pending_attach = 0;
+        surface_clear_image(s);
+        surface_repaint(s);
+        return;
+    }
+    s->pending_attach = 0;
+    if (!s->pending_buffer) {
+        if (s->children) surface_repaint(s);
+        return;
+    }
 
     /* Hardware GL path: a dmabuf-backed buffer (Mesa's render target shared via
      * zwp_linux_dmabuf_v1). Lazily create the kernel Window (sized from the
@@ -650,52 +746,21 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         return;
     }
 
-    /* Subsurface commit: blit into parent's VFB at the subsurface offset. */
-    if (s->subsurface_parent && s->pending_buffer) {
-        struct brook_surface *par = s->subsurface_parent;
-        if (par->vfb && par->vfb_w > 0 && par->vfb_h > 0) {
-            struct wl_shm_buffer *sub_shm = wl_shm_buffer_get(s->pending_buffer);
-            if (sub_shm) {
-                int32_t sw = wl_shm_buffer_get_width(sub_shm);
-                int32_t sh = wl_shm_buffer_get_height(sub_shm);
-                int32_t ss_stride = wl_shm_buffer_get_stride(sub_shm);
-                uint32_t fmt = wl_shm_buffer_get_format(sub_shm);
-                int has_alpha = (fmt == WL_SHM_FORMAT_ARGB8888);
-
-                wl_shm_buffer_begin_access(sub_shm);
-                const uint8_t *px = wl_shm_buffer_get_data(sub_shm);
-                if (px) {
-                    /* Clip to parent VFB bounds */
-                    int32_t dx = s->sub_x, dy = s->sub_y;
-                    int32_t cx0 = dx < 0 ? -dx : 0;
-                    int32_t cy0 = dy < 0 ? -dy : 0;
-                    int32_t cx1 = sw; if (dx + cx1 > (int32_t)par->vfb_w) cx1 = (int32_t)par->vfb_w - dx;
-                    int32_t cy1 = sh; if (dy + cy1 > (int32_t)par->vfb_h) cy1 = (int32_t)par->vfb_h - dy;
-
-                    for (int32_t y = cy0; y < cy1; y++) {
-                        const uint32_t *srow = (const uint32_t*)(px + y * ss_stride);
-                        uint32_t *drow = par->vfb + (size_t)(dy + y) * par->vfb_stride + dx;
-                        for (int32_t x = cx0; x < cx1; x++) {
-                            uint32_t pixel = srow[x];
-                            if (has_alpha) {
-                                uint32_t a = (pixel >> 24) & 0xff;
-                                if (a == 0xff) { drow[x] = pixel; }
-                                else if (a > 0) {
-                                    uint32_t dst = drow[x];
-                                    uint32_t rb = ((pixel & 0xff00ff) * a + (dst & 0xff00ff) * (255 - a) + 0x800080) >> 8;
-                                    uint32_t g  = ((pixel & 0x00ff00) * a + (dst & 0x00ff00) * (255 - a) + 0x008000) >> 8;
-                                    drow[x] = 0xff000000 | (rb & 0xff00ff) | (g & 0x00ff00);
-                                }
-                            } else {
-                                drow[x] = 0xff000000 | (pixel & 0x00ffffff);
-                            }
-                        }
-                    }
-                }
-                wl_shm_buffer_end_access(sub_shm);
-                wm_signal_dirty(par->wm_id);
-            }
-        }
+    /* Snapshot before releasing SHM; the client may reuse or destroy it as
+     * soon as it receives release. Parent repaints must retain this image. */
+    wl_shm_buffer_begin_access(shm);
+    const uint8_t *pixels = wl_shm_buffer_get_data(shm);
+    int copied = pixels && surface_snapshot(s, pixels, w, h, stride,
+                                            wl_shm_buffer_get_format(shm));
+    wl_shm_buffer_end_access(shm);
+    if (!copied) {
+        wl_client_post_no_memory(c);
+        wl_buffer_send_release(s->pending_buffer);
+        s->pending_buffer = NULL;
+        return;
+    }
+    if (s->subsurface_parent) {
+        surface_repaint(s);
         wl_buffer_send_release(s->pending_buffer);
         s->pending_buffer = NULL;
         return;
@@ -768,11 +833,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                             s->wm_id, w, h, rc);
                 }
             }
-            wl_shm_buffer_begin_access(shm);
-            const uint8_t *px = wl_shm_buffer_get_data(shm);
-            if (px) blit_to_window(s, px, w, h, stride, wl_shm_buffer_get_format(shm));
-            wl_shm_buffer_end_access(shm);
-            wm_signal_dirty(s->wm_id);
+            surface_repaint(s);
         }
     }
 
@@ -831,11 +892,13 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     }
     /* Clean up subsurface relationships */
     if (s->subsurface_parent) {
+        struct brook_surface *parent = s->subsurface_parent;
         struct brook_surface **pp2 = &s->subsurface_parent->children;
         while (*pp2) {
             if (*pp2 == s) { *pp2 = s->sibling; break; }
             pp2 = &(*pp2)->sibling;
         }
+        surface_repaint(parent);
     }
     /* Orphan any children */
     for (struct brook_surface *ch = s->children; ch; ) {
@@ -844,6 +907,9 @@ static void surface_destroy_userdata(struct wl_resource *r) {
         ch->sibling = NULL;
         ch = next_ch;
     }
+    if (s->subsurface_resource) wl_resource_set_user_data(s->subsurface_resource, NULL);
+    surface_clear_image(s);
+    free(s->composite);
     if (s->wm_id) wm_destroy_window(s->wm_id);
     struct brook_frame_callback *callback, *next;
     wl_list_for_each_safe(callback, next, &s->pending_frames, link)
@@ -2312,19 +2378,24 @@ static void viewporter_bind(struct wl_client *client, void *data,
 }
 
 /* ---------------- wl_subcompositor ---------------- */
-static void subsurface_destroy(struct wl_client *c, struct wl_resource *r) {
-    (void)c;
+static void subsurface_resource_destroy(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
-    if (s && s->subsurface_parent) {
-        /* Unlink from parent's children list */
-        struct brook_surface **pp = &s->subsurface_parent->children;
+    if (!s) return;
+    struct brook_surface *parent = s->subsurface_parent;
+    if (parent) {
+        struct brook_surface **pp = &parent->children;
         while (*pp) {
             if (*pp == s) { *pp = s->sibling; break; }
             pp = &(*pp)->sibling;
         }
-        s->subsurface_parent = NULL;
-        s->subsurface_resource = NULL;
     }
+    s->subsurface_parent = NULL;
+    s->subsurface_resource = NULL;
+    s->sibling = NULL;
+    if (parent) surface_repaint(parent);
+}
+static void subsurface_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c;
     wl_resource_destroy(r);
 }
 static void subsurface_set_position(struct wl_client *c, struct wl_resource *r,
@@ -2366,6 +2437,11 @@ static void subcomp_get_subsurface(struct wl_client *c, struct wl_resource *r,
     (void)r;
     struct brook_surface *child = wl_resource_get_user_data(surface);
     struct brook_surface *par   = wl_resource_get_user_data(parent);
+    if (!child || !par || child->subsurface_resource || child->xdg_surface || child->is_cursor) {
+        wl_resource_post_error(r, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
+                               "surface already has a role");
+        return;
+    }
     for (struct brook_surface *ancestor = par; ancestor; ancestor = ancestor->subsurface_parent) {
         if (ancestor == child) {
             wl_resource_post_error(r, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
@@ -2376,15 +2452,17 @@ static void subcomp_get_subsurface(struct wl_client *c, struct wl_resource *r,
     struct wl_resource *ss = wl_resource_create(c, &wl_subsurface_interface,
                                                  wl_resource_get_version(r), id);
     if (!ss) { wl_client_post_no_memory(c); return; }
-    wl_resource_set_implementation(ss, &subsurface_impl, child, NULL);
+    wl_resource_set_implementation(ss, &subsurface_impl, child, subsurface_resource_destroy);
     if (child && par) {
         child->subsurface_parent = par;
         child->subsurface_resource = ss;
         child->sub_x = 0;
         child->sub_y = 0;
-        /* Add to parent's children list */
-        child->sibling = par->children;
-        par->children = child;
+        /* New subsurfaces start above existing siblings. */
+        struct brook_surface **tail = &par->children;
+        while (*tail) tail = &(*tail)->sibling;
+        child->sibling = NULL;
+        *tail = child;
         fprintf(stderr, "[waylandd] subsurface: child surface %p -> parent %p\n",
                 (void*)child, (void*)par);
         waylandd_send_enter_for_surface(child->resource);

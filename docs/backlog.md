@@ -1,5 +1,17 @@
 # Recovery and VM-control backlog
 
+- Investigate the isolated eight-vCPU boot fault in session
+  `6ff23309fe2d4c288482506746bb9f8f`: `brook-dbus_0` PID11 raised #GP in its
+  interpreter at `0x7f0000020b77`, followed by the deliberate
+  `KRwLockCleanupOnExit` trap because the terminal task still owned lock state.
+  This happened before Wayland started. Preserve the guard: releasing abandoned
+  filesystem locks could expose partial metadata. Serial, CPU5 registers and
+  the screen are saved under
+  `build/workloads/boot-recording-7c72adad-20261018/retained-candidate/`.
+  The halted VM was force-stopped without clean sync; those disks are retained
+  as failure evidence, not an accepted seed. Fresh copies of the previous
+  checked seed booted on retry. The cause and reproducibility remain unknown.
+
 - Initial [Wine64 smoke test](wine-smoke.md): diagnose wineserver's rejection of
   `/tmp/.wine-1000` as not owned by UID1000, including metadata on newly created
   temporary directories and path routing. A private owned ext2 `TMPDIR` did not
@@ -131,7 +143,8 @@
   a reload alongside the updated kernel. Bounded private-stream video/audio
   recording now passes CPU/GPU and real-player checks; see [recording](vm-recording.md).
   A three-minute headless take and two 90-second CPU/native-SDL takes now pass
-  full codec decode. GPU native-window capture and boot/mode transitions remain
+  full codec decode. A subsequent 150-second native run also captured boot and
+  three display modes with full decode. GPU native-window capture remains
   open; see the recording evidence for timing and application limits.
 
 - OpenTTD 15.3 hung during the user's confirmed in-game exit, with music
@@ -141,11 +154,14 @@
   the two changes have not been isolated as the cause of the original hang.
 - The frozen-kernel media rerun again passes OpenTTD saved-world progression,
   confirmed exit and separate active-music SIGKILL cleanup. VLC's OSS error loop
-  is fixed, but its video area remains black after a 55-second minimize/restore
-  while audio recovers. Isolate later Wayland surface/frame-callback transitions;
-  do not describe video restoration as accepted. The run also observed three
+  is fixed. Its initial black-video result after a 55-second minimize/restore
+  was subsequently addressed by retained Wayland surface composition, with
+  user review and cold long-restore/normal/forced exit checks passing. The
+  original run also observed three
   blocking DSP write `EAGAIN` errors; investigate the existing 500-ms deadline
   and producer/device progress. See [media rerun](application-regressions.md#frozen-kernel-media-rerun--18-october-2026).
+  Atomic CPU VFB publication/resize and uninterrupted audio remain open; the
+  candidate recording still reported one estimated audio discontinuity.
 - Browser launcher entries must use the same tested compatibility configuration
   as command-driven acceptance. The user-run Chromium entry exited with a root
   sandbox error; Firefox faulted during generic startup instead of loading.
