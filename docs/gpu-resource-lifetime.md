@@ -74,8 +74,17 @@ host resource reclamation remain open.
 Existing disk images need both the rebuilt kernel and rebuilt `waylandd`:
 the kernel now returns shared handles, and the server counts their buffer owners.
 The prepared private user review preserves the prior user packages/profiles;
-its launcher is `build/reviews/prime-import-20261018/launch.sh`. Copyrighted game
-assets stay in ignored private images and must not be committed or redistributed.
+start it from the repository root with:
+
+```sh
+scripts/run_review.sh build/reviews/prime-import-20261018
+```
+
+This entry point creates the review's host temporary directory before Nix
+starts, then delegates to its frozen `launch.sh` configuration. It does not
+prepare images or rebuild artifacts. Set `BROOK_AUDIODEV=none` to mute the host
+sink. Copyrighted game assets stay in ignored private images and must not be
+committed or redistributed.
 
 ## Required ownership conversion
 
