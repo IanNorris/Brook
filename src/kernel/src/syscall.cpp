@@ -2931,20 +2931,6 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         lookupPath = resolvedPath;
     }
 
-    // Strip trailing "/." from resolved path (e.g., "/boot/." → "/boot")
-    {
-        uint32_t len = 0;
-        while (lookupPath[len]) len++;
-        if (lookupPath == resolvedPath && len >= 2 &&
-            resolvedPath[len - 1] == '.' && resolvedPath[len - 2] == '/')
-        {
-            if (len > 2)
-                resolvedPath[len - 2] = '\0'; // "/boot/." → "/boot"
-            else
-                resolvedPath[1] = '\0';        // "/." → "/"
-        }
-    }
-
     bool procFdPath = false;
     int procFdResult = OpenProcMemFd(proc, lookupPath, flags, &procFdPath);
     if (procFdPath) return procFdResult;
@@ -3207,7 +3193,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 
     int openError = 0;
     Vnode* vn = VfsOpenModeChecked(lookupPath, vfsFlags, static_cast<uint16_t>(mode & 07777), &openError);
-    if (!vn && openError) return openError;
+    if (!vn && openError && openError != -ENOENT) return openError;
 
     // Preserve /boot aliases for legacy applications, but Nix store paths
     // identify exact package contents. In particular, a missing libc.so in
@@ -3225,7 +3211,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         if (!*p) { // Never open a silently truncated alias.
             vn = VfsOpenModeChecked(bootPath, vfsFlags,
                                     static_cast<uint16_t>(mode & 07777), &openError);
-            if (!vn && openError) return openError;
+            if (!vn && openError && openError != -ENOENT) return openError;
         }
 
         if (!vn && !(flags & (LINUX_O_DIRECTORY | LINUX_O_CREAT | LINUX_O_TRUNC | LINUX_O_APPEND)) &&
@@ -5450,6 +5436,7 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
     VnodeStat st{};
     int result = (flags & NOFOLLOW) ? VfsLstatPath(lookup, &st) : VfsStatPath(lookup, &st);
     if (result == 0) return 0;
+    if (result != -ENOENT && result != -1) return result;
     static const char* syntheticPaths[] = {
         "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
         "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
@@ -6850,8 +6837,10 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr)
         return 0;
 
     VnodeStat vs{};
-    if (VfsStatPath(lookup, &vs) < 0)
+    int pathError = VfsStatPath(lookup, &vs);
+    if (pathError < 0)
     {
+        if (pathError != -ENOENT && pathError != -1) return pathError;
         // Synthetic proc/etc files — stat should succeed for these
         static const char* syntheticPaths[] = {
             "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
@@ -6921,8 +6910,10 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
         return 0;
 
     VnodeStat vs{};
-    if (VfsLstatPath(lookup, &vs) < 0)
+    int pathError = VfsLstatPath(lookup, &vs);
+    if (pathError < 0)
     {
+        if (pathError != -ENOENT && pathError != -1) return pathError;
         // Synthetic proc/etc files
         static const char* syntheticPaths[] = {
             "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
@@ -9531,63 +9522,32 @@ static int64_t sys_umask(uint64_t newMask, uint64_t, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_chdir (80) / sys_fchdir (81) — stub
+// sys_chdir (80) / sys_fchdir (81) — canonical path and final search check
 // ---------------------------------------------------------------------------
 
-static int64_t sys_chdir(uint64_t pathAddr, uint64_t, uint64_t,
-                          uint64_t, uint64_t, uint64_t)
+static int64_t sys_chdir(uint64_t pathAddr,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    const char* path = pathBuf;
-
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-
-    // Resolve relative paths against current CWD
-    char resolved[256];
-    const char* newCwd = path;
-    if (path[0] != '/')
-    {
-        uint32_t ri = 0;
-        for (uint32_t i = 0; proc->cwd[i] && ri < 250; ++i)
-            resolved[ri++] = proc->cwd[i];
-        if (ri > 0 && resolved[ri-1] != '/')
-            resolved[ri++] = '/';
-        for (uint32_t i = 0; path[i] && ri < 254; ++i)
-            resolved[ri++] = path[i];
-        resolved[ri] = '\0';
-        newCwd = resolved;
-    }
-
-    // Verify path exists and is a directory
-    VnodeStat vs{};
-    if (VfsStatPath(newCwd, &vs) < 0) return -ENOENT;
-    if (!vs.isDir) return -ENOTDIR;
-
-    // Update CWD
-    uint32_t ci = 0;
-    while (newCwd[ci] && ci < 254) { proc->cwd[ci] = newCwd[ci]; ci++; }
-    proc->cwd[ci] = '\0';
-
+    char path[256];
+    if (!CopyUserCString(pathAddr,path,sizeof(path))) return -EFAULT;
+    Process* proc=ProcessCurrent();if (!proc) return -EBADF;
+    char joined[512],canonical[sizeof(proc->cwd)];
+    if (int error=ResolveAtPath(-100,path,joined,sizeof(joined))) return error;
+    if (int error=VfsResolveDirectory(joined,canonical,sizeof(canonical))) return error;
+    memcpy(proc->cwd,canonical,strlen(canonical)+1);
     return 0;
 }
 
-static int64_t sys_fchdir(uint64_t fd, uint64_t, uint64_t,
-                           uint64_t, uint64_t, uint64_t)
+static int64_t sys_fchdir(uint64_t fd,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
 {
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde || fde->dirPath[0] == '\0') return -EBADF;
-
-    // Use the stored dirPath (without trailing slash)
-    uint32_t ci = 0;
-    while (fde->dirPath[ci] && ci < 254) { proc->cwd[ci] = fde->dirPath[ci]; ci++; }
-    // Remove trailing slash if not root
-    if (ci > 1 && proc->cwd[ci-1] == '/') ci--;
-    proc->cwd[ci] = '\0';
-
+    Process* proc=ProcessCurrent();if (!proc) return -EBADF;
+    FdRef ref(proc,static_cast<int>(fd));FdEntry* entry=ref.get();
+    if (!entry) return -EBADF;
+    if (entry->type!=FdType::Vnode || !entry->handle ||
+        static_cast<Vnode*>(entry->handle)->type!=VnodeType::Dir) return -ENOTDIR;
+    if (!entry->dirPath[0]) return -EBADF;
+    char canonical[sizeof(proc->cwd)];
+    if (int error=VfsResolveDirectory(entry->dirPath,canonical,sizeof(canonical))) return error;
+    memcpy(proc->cwd,canonical,strlen(canonical)+1);
     return 0;
 }
 
@@ -10178,7 +10138,7 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
     int ret = (flags & AT_SYMLINK_NOFOLLOW)
         ? VfsLstatPath(resolved, &st)
         : VfsStatPath(resolved, &st);
-    if (ret != 0) return -ENOENT;
+    if (ret != 0) return ret == -1 ? -ENOENT : ret;
 
     // Use the same filesystem metadata as stat/fstatat. Inventing mode0644
     // made Git reject installed HTTPS helpers; inode1 hid file identities.

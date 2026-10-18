@@ -6,7 +6,8 @@
 #include "memory/heap.h"
 #include "serial.h"
 #include "memory/virtual_memory.h"
-#include "sync/kmutex.h"
+#include "sync/krwlock.h"
+#include "path_walk.h"
 #include "spinlock.h"
 
 // Forward-declare SchedulerYield — weak so test builds link without the scheduler.
@@ -14,16 +15,19 @@ namespace brook { __attribute__((weak)) void SchedulerYield(); }
 
 namespace brook {
 
-// Global lock protecting VFS mount table and filesystem operations.
-static KMutex g_vfsLock;
-
 // Namespace changes, initial mapping registration and resize are serialized.
 // Fork/split/unmap only touch the short registry spinlock below.
-static KMutex g_fileMutationLock;
+static KRwLock g_fileMutationLock;
 struct FileMutationGuard {
-    bool held;
-    explicit FileMutationGuard(bool needed = true) : held(needed) { if (held) KMutexLock(&g_fileMutationLock); }
-    ~FileMutationGuard() { if (held) KMutexUnlock(&g_fileMutationLock); }
+    bool write;
+    explicit FileMutationGuard(bool mutation = true) : write(mutation) {
+        if (write) KRwLockWriteLock(&g_fileMutationLock);
+        else KRwLockReadLock(&g_fileMutationLock);
+    }
+    ~FileMutationGuard() {
+        if (write) KRwLockWriteUnlock(&g_fileMutationLock);
+        else KRwLockReadUnlock(&g_fileMutationLock);
+    }
 };
 static bool VfsMappedPathBusy(const char* path);
 static int VfsTruncateLocked(Vnode* vn, uint64_t size);
@@ -124,15 +128,6 @@ static bool StrEq(const char* a, const char* b)
     return *a == *b;
 }
 
-static void StrAppend(char* dst, const char* src, uint32_t maxLen)
-{
-    uint32_t di = StrLen(dst);
-    uint32_t si = 0;
-    while (di + 1 < maxLen && src[si])
-        dst[di++] = src[si++];
-    dst[di] = '\0';
-}
-
 // Find the best (longest-prefix) mount for a given absolute path.
 // Returns the mount entry and sets *relPath to the path within the mount.
 static MountEntry* FindMount(const char* absPath, const char** relPath)
@@ -168,13 +163,31 @@ static int VfsLstatPathRaw(const char* path, VnodeStat* st)
 
     const char* relPath = nullptr;
     MountEntry* mount   = FindMount(path, &relPath);
-    if (!mount || !mount->fsOps) return -1;
+    if (!mount || !mount->fsOps) return -2;
 
+    int result = -2;
     if (mount->fsOps->lstat_path)
-        return mount->fsOps->lstat_path(mount->mountPriv, mount->pdrv, relPath, st);
-    if (mount->fsOps->stat_path)
-        return mount->fsOps->stat_path(mount->mountPriv, mount->pdrv, relPath, st);
-    return -1;
+        result = mount->fsOps->lstat_path(mount->mountPriv, mount->pdrv, relPath, st);
+    else if (mount->fsOps->stat_path)
+        result = mount->fsOps->stat_path(mount->mountPriv, mount->pdrv, relPath, st);
+    // Legacy stat callbacks use -1 for missing entries, not authorization.
+    if (result == -1) result = -2;
+    if (result == -2) {
+        // Mounts can have virtual ancestors (the boot probe uses /mnt/probe
+        // without a physical /mnt). Do not fabricate ordinary missing paths or
+        // replace a backing error/file: only an absent ancestor of a live mount.
+        uint32_t length = StrLen(path);
+        for (const auto& candidate : g_mounts) {
+            if (!candidate.used || StrLen(candidate.mountPoint) <= length) continue;
+            bool match = true;
+            for (uint32_t i = 0; i < length; ++i)
+                if (path[i] != candidate.mountPoint[i]) { match = false; break; }
+            if (match && candidate.mountPoint[length] == '/') {
+                *st = {}; st->isDir = true; st->mode = 0040555; return 0;
+            }
+        }
+    }
+    return result;
 }
 
 static int VfsReadlinkRaw(const char* path, char* buf, uint64_t bufsiz)
@@ -194,143 +207,37 @@ static int VfsReadlinkRaw(const char* path, char* buf, uint64_t bufsiz)
     return mount->fsOps->readlink(mount->mountPriv, mount->pdrv, relPath, buf, bufsiz);
 }
 
-static bool NormalizePath(const char* in, char* out, uint32_t outSize)
+static int VfsCheckAccessRaw(const char* path, const VnodeStat& st, uint8_t required)
 {
-    if (!in || !out || outSize < 2) return false;
-
-    out[0] = '/';
-    out[1] = '\0';
-
-    const char* p = in;
-    while (*p)
-    {
-        while (*p == '/') ++p;
-        if (!*p) break;
-
-        char comp[256];
-        uint32_t ci = 0;
-        while (*p && *p != '/' && ci + 1 < sizeof(comp))
-            comp[ci++] = *p++;
-        comp[ci] = '\0';
-        while (*p && *p != '/') ++p;
-
-        if (StrEq(comp, "."))
-            continue;
-
-        if (StrEq(comp, ".."))
-        {
-            uint32_t len = StrLen(out);
-            if (len > 1)
-            {
-                if (out[len - 1] == '/') out[--len] = '\0';
-                while (len > 1 && out[len - 1] != '/') --len;
-                out[len == 1 ? 1 : len] = '\0';
-            }
-            continue;
-        }
-
-        if (!StrEq(out, "/")) StrAppend(out, "/", outSize);
-        StrAppend(out, comp, outSize);
-    }
-
-    return true;
+    MountEntry* mount = FindMount(path, nullptr);
+    if (!mount || !mount->fsOps) return -2;
+    return mount->fsOps->check_access ? mount->fsOps->check_access(mount->mountPriv, &st, required) : 0;
 }
-
-static bool BuildSymlinkPath(const char* linkPath, const char* target,
-                             const char* remaining, char* out, uint32_t outSize)
+struct VfsPathProvider {
+    int Stat(const char* p, VnodeStat& st) {
+        int error=VfsLstatPathRaw(p,&st);
+        MountEntry* mount=FindMount(p,nullptr);
+        // The walk cannot turn procfs FD objects into textual symlink targets.
+        // Only its internal node is opaque; final stat/lstat keep backend data.
+        if (!error && mount && mount->fsOps->opaque_symlinks) st.isSymlink=false;
+        return error;
+    }
+    int Search(const char* p, const VnodeStat& st) { return VfsCheckAccessRaw(p,st,1); }
+    int Readlink(const char* p,char* buf,uint32_t size) { return VfsReadlinkRaw(p,buf,size); }
+};
+// Caller holds the namespace lock, shared for lookups and exclusive for changes.
+static int VfsResolvePath(const char* path,char* out,uint32_t size,PathWalkOptions options={})
 {
-    char combined[512];
-    combined[0] = '\0';
-
-    if (target[0] == '/')
-    {
-        StrCopy(combined, target, sizeof(combined));
-    }
-    else
-    {
-        StrCopy(combined, linkPath, sizeof(combined));
-        uint32_t len = StrLen(combined);
-        while (len > 1 && combined[len - 1] != '/') --len;
-        combined[len] = '\0';
-        if (!StrEq(combined, "/")) StrAppend(combined, "/", sizeof(combined));
-        StrAppend(combined, target, sizeof(combined));
-    }
-
-    if (remaining && remaining[0])
-    {
-        if (!StrEq(combined, "/")) StrAppend(combined, "/", sizeof(combined));
-        StrAppend(combined, remaining, sizeof(combined));
-    }
-
-    return NormalizePath(combined, out, outSize);
+    VfsPathProvider provider;
+    return WalkPath<VnodeStat>(path,out,size,provider,options);
 }
-
-static bool VfsResolveSymlinks(const char* path, char* out, uint32_t outSize,
-                               bool followFinal)
-{
-    if (!path || !path[0] || !out || outSize < 2) return false;
-
-    char work[512];
-    if (!NormalizePath(path, work, sizeof(work))) return false;
-
-    for (int depth = 0; depth < 8; ++depth)
-    {
-        char cur[512];
-        cur[0] = '/';
-        cur[1] = '\0';
-        const char* p = work;
-        while (*p == '/') ++p;
-
-        while (*p)
-        {
-            char comp[256];
-            uint32_t ci = 0;
-            while (*p && *p != '/' && ci + 1 < sizeof(comp))
-                comp[ci++] = *p++;
-            comp[ci] = '\0';
-            while (*p == '/') ++p;
-
-            if (!StrEq(cur, "/")) StrAppend(cur, "/", sizeof(cur));
-            StrAppend(cur, comp, sizeof(cur));
-
-            bool final = (*p == '\0');
-            if (!final || followFinal)
-            {
-                VnodeStat st;
-                st.size = 0;
-                st.isDir = false;
-                st.isSymlink = false;
-                if (VfsLstatPathRaw(cur, &st) == 0 && st.isSymlink)
-                {
-                    char target[512];
-                    int n = VfsReadlinkRaw(cur, target, sizeof(target) - 1);
-                    if (n < 0) return false;
-                    target[n] = '\0';
-
-                    char next[512];
-                    if (!BuildSymlinkPath(cur, target, p, next, sizeof(next)))
-                        return false;
-                    StrCopy(work, next, sizeof(work));
-                    goto restart;
-                }
-            }
-        }
-
-        StrCopy(out, cur, outSize);
-        return true;
-
-    restart:
-        continue;
-    }
-
-    return false;
-}
+static bool VfsTrailingSlash(const char* path) { uint32_t n=StrLen(path);return n>1 && path[n-1]=='/'; }
 
 // ---- Public API ----
 
 void VfsInit()
 {
-    KMutexInit(&g_vfsLock);
+    KRwLockInit(&g_fileMutationLock);
     for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i) g_mounts[i].used = false;
     for (uint32_t i = 0; i < VFS_MAX_FS_DRIVERS; ++i) g_fsDrivers[i].used = false;
     SerialPuts("VFS: initialised\n");
@@ -338,6 +245,7 @@ void VfsInit()
 
 bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
 {
+    FileMutationGuard mutation;
     if (!mountPoint || !fsName) return false;
 
     const VfsFsOps* ops = FindFsDriver(fsName);
@@ -376,6 +284,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
 
 bool VfsUnmount(const char* mountPoint)
 {
+    FileMutationGuard mutation;
     if (!mountPoint) return false;
     for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i)
     {
@@ -476,85 +385,34 @@ VfsFsSnapshot VfsFsSnapshotAt(uint32_t idx)
     return snap;
 }
 
+int VfsResolveDirectory(const char* path,char* resolved,uint32_t size)
+{
+    FileMutationGuard lookup(false);
+    if (int error=VfsResolvePath(path,resolved,size)) return error;
+    VnodeStat st{};
+    if (int error=VfsLstatPathRaw(resolved,&st)) return error;
+    if (!st.isDir) return -20;
+    return VfsCheckAccessRaw(resolved,st,1);
+}
+
 int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t size)
 {
-    if (!vnode || !resolved || size < 2) return -22;
-    *vnode = nullptr;
-    resolved[0] = 0;
-    if (!path || path[0] != '/') return -2;
-    char remaining[512], current[512];
-    current[0] = '/';
-    current[1] = 0;
-    if (StrLen(path) >= sizeof(remaining)) return -36;
-    StrCopy(remaining, path, sizeof(remaining));
-    uint32_t links = 0;
-    for (;;) {
-        const char* next = remaining;
-        while (*next == '/') ++next;
-        if (!*next) break;
-        char component[256];
-        uint32_t count = 0;
-        while (*next && *next != '/') {
-            if (count + 1 >= sizeof(component)) return -36;
-            component[count++] = *next++;
-        }
-        component[count] = 0;
-        char tail[512];
-        StrCopy(tail, next, sizeof(tail));
-        if (StrEq(component, ".")) {
-            StrCopy(remaining, tail, sizeof(remaining));
-            continue;
-        }
-        if (StrEq(component, "..")) {
-            uint32_t n = StrLen(current);
-            while (n > 1 && current[n - 1] != '/') --n;
-            if (n > 1) --n;
-            current[n] = 0;
-            StrCopy(remaining, tail, sizeof(remaining));
-            continue;
-        }
-        uint32_t parentLength = StrLen(current);
-        uint32_t slash = parentLength > 1 ? 1 : 0;
-        if (parentLength + slash + count >= sizeof(current)) return -36;
-        if (slash) StrAppend(current, "/", sizeof(current));
-        StrAppend(current, component, sizeof(current));
-        VnodeStat st{};
-        if (VfsLstatPathRaw(current, &st) != 0) return -2;
-        if (st.isSymlink) {
-            if (++links > 40) return -40;
-            char target[512];
-            int bytes = VfsReadlinkRaw(current, target, sizeof(target) - 1);
-            if (bytes < 0) return bytes;
-            // readlink can truncate without a terminator; refuse ambiguity.
-            if (bytes >= static_cast<int>(sizeof(target) - 1)) return -36;
-            if (!bytes) return -2;
-            target[bytes] = 0;
-            if (static_cast<uint32_t>(bytes) + StrLen(tail) >= sizeof(remaining)) return -36;
-            StrCopy(remaining, target, sizeof(remaining));
-            StrAppend(remaining, tail, sizeof(remaining));
-            if (target[0] == '/') { current[0] = '/'; current[1] = 0; }
-            else current[parentLength] = 0;
-            continue;
-        }
-        // Resolve '..' only AFTER symlinks, and require directory traversal
-        // even when the remaining suffix consists solely of a trailing slash.
-        if (tail[0] && !st.isDir) return -20;
-        StrCopy(remaining, tail, sizeof(remaining));
-    }
-    if (StrLen(current) >= size) return -36;
-    const char* relative = nullptr;
-    MountEntry* mount = FindMount(current, &relative);
+    if (!vnode || !resolved || size<2) return -22;
+    *vnode=nullptr;resolved[0]=0;
+    if (!path || path[0]!='/') return -2;
+    FileMutationGuard lookup(false);
+    if (int error=VfsResolvePath(path,resolved,size)) return error;
+    const char* relative=nullptr;
+    MountEntry* mount=FindMount(resolved,&relative);
     if (!mount || !mount->fsOps) return -2;
-    Vnode* opened = nullptr;
-    if (mount->fsOps->open_mode)
-        opened = mount->fsOps->open_mode(mount->mountPriv, mount->pdrv, relative, 0, 0666);
-    else if (mount->fsOps->open)
-        opened = mount->fsOps->open(mount->mountPriv, mount->pdrv, relative, 0);
-    if (!opened) return -2;
-    if (opened->type == VnodeType::Dir) { VfsClose(opened); return -13; }
-    StrCopy(resolved, current, size);
-    *vnode = opened;
-    return 0;
+    int error=0;
+    Vnode* opened=mount->fsOps->open_mode_checked ?
+        mount->fsOps->open_mode_checked(mount->mountPriv,mount->pdrv,relative,0,0666,&error) :
+        mount->fsOps->open_mode ? mount->fsOps->open_mode(mount->mountPriv,mount->pdrv,relative,0,0666) :
+        mount->fsOps->open ? mount->fsOps->open(mount->mountPriv,mount->pdrv,relative,0) : nullptr;
+    if (!opened) return error?error:-2;
+    if (opened->type==VnodeType::Dir) { VfsClose(opened);return -13; }
+    *vnode=opened;return 0;
 }
 
 Vnode* VfsOpen(const char* path, int flags)
@@ -578,22 +436,21 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
     FileMutationGuard mutation((flags & (VFS_O_TRUNC | VFS_O_CREATE)) != 0);
     if (!path || !path[0]) return nullptr;
 
-    // Check the entry itself before following the final symlink: O_EXCL also
-    // rejects dangling symlinks. The namespace mutation gate spans check/create
-    // and is shared by regular creation, mkdir, symlink, rename and unlink.
     char resolved[512];
-    const char* lookup = path;
-    const bool exclusive = (flags & (VFS_O_CREATE | VFS_O_EXCL)) ==
-                            (VFS_O_CREATE | VFS_O_EXCL);
+    const bool exclusive=(flags & (VFS_O_CREATE | VFS_O_EXCL))==(VFS_O_CREATE | VFS_O_EXCL);
+    PathWalkOptions options{!exclusive, bool(flags & VFS_O_CREATE), false, -21};
+    if (int result=VfsResolvePath(path,resolved,sizeof(resolved),options)) {
+        if (error) *error=result;
+        return nullptr;
+    }
+    const char* lookup=resolved;
     if (exclusive) {
-        if (VfsResolveSymlinks(path, resolved, sizeof(resolved), false)) lookup = resolved;
-        VnodeStat stat{};
-        if (VfsLstatPathRaw(lookup, &stat) == 0) {
-            if (error) *error = -17;
+        VnodeStat st{};
+        int result=VfsLstatPathRaw(lookup,&st);
+        if (!result || result!=-2) {
+            if (error) *error=result?result:-17;
             return nullptr;
         }
-    } else if (VfsResolveSymlinks(path, resolved, sizeof(resolved), true)) {
-        lookup = resolved;
     }
 
     const char* relPath = nullptr;
@@ -632,6 +489,7 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
 
 int VfsChmod(Vnode* vn, uint16_t mode)
 {
+    FileMutationGuard mutation;
     if (!vn) return -9;
     if (!vn->ops || !vn->ops->chmod) return -95;
     return vn->ops->chmod(vn, mode);
@@ -640,9 +498,10 @@ int VfsChmod(Vnode* vn, uint16_t mode)
 int VfsChmodPath(const char* path, uint16_t mode)
 {
     if (!path || !path[0]) return -2;
+    FileMutationGuard mutation;
     char resolved[512];
-    const char* lookup = path;
-    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), true)) lookup = resolved;
+    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{true})) return error;
+    const char* lookup=resolved;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(lookup, &relPath);
     if (!mount) return -2;
@@ -652,6 +511,7 @@ int VfsChmodPath(const char* path, uint16_t mode)
 
 int VfsChown(Vnode* vn, uint32_t uid, uint32_t gid)
 {
+    FileMutationGuard mutation;
     if (!vn) return -9;
     if (!vn->ops || !vn->ops->chown) return -95;
     return vn->ops->chown(vn, uid, gid);
@@ -660,9 +520,10 @@ int VfsChown(Vnode* vn, uint32_t uid, uint32_t gid)
 int VfsChownPath(const char* path, uint32_t uid, uint32_t gid, bool nofollow)
 {
     if (!path || !path[0]) return -2;
+    FileMutationGuard mutation;
     char resolved[512];
-    const char* lookup = path;
-    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), !nofollow)) lookup = resolved;
+    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{!nofollow})) return error;
+    const char* lookup=resolved;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(lookup, &relPath);
     if (!mount) return -2;
@@ -755,7 +616,7 @@ int VfsTruncate(Vnode* vn, uint64_t size)
 static bool VfsMappedPathBusy(const char* path)
 {
     VnodeStat st;
-    if (VfsLstatPath(path, &st)) return false;
+    if (VfsLstatPathRaw(path, &st)) return false;
     // ext2 open-inode holders preserve deleted/renamed backing. FAT has no
     // persistent inode and must retain its physical directory entry instead.
     if (((st.dev >> 8) & 0xfff) != 253) return false;
@@ -789,42 +650,20 @@ int VfsSpaceInfo(Vnode* vn, VfsSpace* out)
 
 int VfsStatPath(const char* path, VnodeStat* st)
 {
-    if (!path || !path[0] || !st) return -1;
-    *st = {};
-
+    if (!st) return -22;
+    *st={};FileMutationGuard lookup(false);
     char resolved[512];
-    const char* lookup = path;
-    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), true))
-        lookup = resolved;
-
-    const char* relPath = nullptr;
-    MountEntry* mount   = FindMount(lookup, &relPath);
-    if (!mount) return -1;
-
-    if (!mount->fsOps || !mount->fsOps->stat_path) return -1;
-    return mount->fsOps->stat_path(mount->mountPriv, mount->pdrv, relPath, st);
+    if (int error=VfsResolvePath(path,resolved,sizeof(resolved))) return error;
+    return VfsLstatPathRaw(resolved,st);
 }
 
 int VfsLstatPath(const char* path, VnodeStat* st)
 {
-    if (!path || !st) return -1;
-    *st = {};
-
+    if (!st) return -22;
+    *st={};FileMutationGuard lookup(false);
     char resolved[512];
-    const char* lookup = path;
-    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), false))
-        lookup = resolved;
-
-    const char* relPath = nullptr;
-    MountEntry* mount   = FindMount(lookup, &relPath);
-    if (!mount || !mount->fsOps) return -1;
-
-    // Use lstat_path if available, otherwise fall back to stat_path
-    if (mount->fsOps->lstat_path)
-        return mount->fsOps->lstat_path(mount->mountPriv, mount->pdrv, relPath, st);
-    if (mount->fsOps->stat_path)
-        return mount->fsOps->stat_path(mount->mountPriv, mount->pdrv, relPath, st);
-    return -1;
+    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{false})) return error;
+    return VfsLstatPathRaw(resolved,st);
 }
 
 int VfsSetTimes(Vnode* vn, const VnodeTime* times)
@@ -837,10 +676,10 @@ int VfsSetTimes(Vnode* vn, const VnodeTime* times)
 int VfsSetTimesPath(const char* path, const VnodeTime* times, bool nofollow)
 {
     if (!path || !path[0] || !times) return -22;
+    FileMutationGuard mutation;
     char resolved[512];
-    const char* lookup = path;
-    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), !nofollow))
-        lookup = resolved;
+    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{!nofollow})) return error;
+    const char* lookup=resolved;
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(lookup, &relPath);
     if (!mount || !mount->fsOps) return -2;
@@ -878,79 +717,83 @@ int VfsFsync(Vnode* vn)
     return result?result:flush;
 }
 
-int VfsUnlink(const char* path)
-{
-    FileMutationGuard mutation;
-    if (VfsMappedPathBusy(path)) return -16;
-    if (!path || !path[0]) return -1;
-    const char* relPath = nullptr;
-    MountEntry* mount = FindMount(path, &relPath);
-    if (!mount || !mount->fsOps || !mount->fsOps->unlink) return -1;
-    return mount->fsOps->unlink(mount->mountPriv, mount->pdrv, relPath);
-}
+int VfsUnlink(const char* path) { return VfsRemovePath(path,false); }
 
 int VfsRemovePath(const char* path, bool directory)
 {
     FileMutationGuard mutation;
-    if (VfsMappedPathBusy(path)) return -16;
-    if (!path || !path[0]) return -2;
-    const char* relPath = nullptr;
-    MountEntry* mount = FindMount(path, &relPath);
-    if (!mount || !mount->fsOps) return -2;
-    if (mount->fsOps->remove_path)
-        return mount->fsOps->remove_path(mount->mountPriv, mount->pdrv, relPath, directory);
-    VnodeStat st;
-    if (VfsLstatPath(path, &st) != 0) return -2;
-    if (st.isDir != directory) return directory ? -20 : -21;
-    if (!mount->fsOps->unlink) return -95;
-    return mount->fsOps->unlink(mount->mountPriv, mount->pdrv, relPath);
-}
-
-int VfsMkdir(const char* path, uint16_t mode)
-{
-    FileMutationGuard mutation;
-    if (!path || !path[0]) return -1;
-    const char* relPath = nullptr;
-    MountEntry* mount = FindMount(path, &relPath);
-    if (!mount || !mount->fsOps || !mount->fsOps->mkdir) return -1;
-    return mount->fsOps->mkdir(mount->mountPriv, mount->pdrv, relPath, mode);
-}
-
-int VfsRename(const char* oldPath, const char* newPath)
-{
-    FileMutationGuard mutation;
-    if (VfsMappedPathBusy(oldPath) || VfsMappedPathBusy(newPath)) return -16;
-    if (!oldPath || !newPath || !oldPath[0] || !newPath[0]) return -1;
-    const char* relOld = nullptr;
-    const char* relNew = nullptr;
-    MountEntry* mountOld = FindMount(oldPath, &relOld);
-    MountEntry* mountNew = FindMount(newPath, &relNew);
-    if (!mountOld || !mountNew) return -2;
-    if (mountOld != mountNew) return -18;
-    if (!mountOld->fsOps || !mountOld->fsOps->rename) return -1;
-    return mountOld->fsOps->rename(mountOld->mountPriv, mountOld->pdrv, relOld, relNew);
-}
-
-int VfsSymlink(const char* target, const char* linkPath)
-{
-    FileMutationGuard mutation;
-    if (!target || !linkPath || !target[0] || !linkPath[0]) return -22; // -EINVAL
-    const char* relPath = nullptr;
-    MountEntry* mount = FindMount(linkPath, &relPath);
-    if (!mount || !mount->fsOps || !mount->fsOps->symlink) return -1; // -EPERM
-    return mount->fsOps->symlink(mount->mountPriv, mount->pdrv, target, relPath);
-}
-
-int VfsReadlink(const char* path, char* buf, uint64_t bufsiz)
-{
-    if (!path || !buf || bufsiz == 0) return -22;
-
     char resolved[512];
-    const char* lookup = path;
-    if (VfsResolveSymlinks(path, resolved, sizeof(resolved), false))
-        lookup = resolved;
+    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{false,false,true})) return error;
+    if (VfsTrailingSlash(resolved)) {
+        VnodeStat st{};
+        if (int error=VfsLstatPathRaw(resolved,&st)) return error;
+        if (!st.isDir || st.isSymlink) return -20;
+    }
+    if (VfsMappedPathBusy(resolved)) return -16;
+    const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative);
+    if (!mount || !mount->fsOps) return -2;
+    if (mount->fsOps->remove_path) return mount->fsOps->remove_path(mount->mountPriv,mount->pdrv,relative,directory);
+    VnodeStat st{};
+    if (int error=VfsLstatPathRaw(resolved,&st)) return error;
+    if (st.isDir!=directory) return directory?-20:-21;
+    return mount->fsOps->unlink ? mount->fsOps->unlink(mount->mountPriv,mount->pdrv,relative) : -95;
+}
 
-    return VfsReadlinkRaw(lookup, buf, bufsiz);
+int VfsMkdir(const char* path,uint16_t mode)
+{
+    FileMutationGuard mutation;
+    char resolved[512];
+    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{false,true,true})) return error;
+    const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative);
+    if (!mount || !mount->fsOps) return -2;
+    return mount->fsOps->mkdir ? mount->fsOps->mkdir(mount->mountPriv,mount->pdrv,relative,mode) : -95;
+}
+
+int VfsRename(const char* oldPath,const char* newPath)
+{
+    FileMutationGuard mutation;
+    char oldResolved[512],newResolved[512];
+    if (int error=VfsResolvePath(oldPath,oldResolved,sizeof(oldResolved),{false,false,true})) return error;
+    if (int error=VfsResolvePath(newPath,newResolved,sizeof(newResolved),{false,true,true})) return error;
+    if (VfsTrailingSlash(oldResolved) || VfsTrailingSlash(newResolved)) {
+        VnodeStat st{};
+        if (int error=VfsLstatPathRaw(oldResolved,&st)) return error;
+        if (!st.isDir || st.isSymlink) return -20;
+        int error=VfsLstatPathRaw(newResolved,&st);
+        if (error && error!=-2) return error;
+        if (!error && (!st.isDir || st.isSymlink)) return -20;
+    }
+    if (VfsMappedPathBusy(oldResolved) || VfsMappedPathBusy(newResolved)) return -16;
+    const char* oldRelative=nullptr;const char* newRelative=nullptr;
+    MountEntry* oldMount=FindMount(oldResolved,&oldRelative);MountEntry* newMount=FindMount(newResolved,&newRelative);
+    if (!oldMount || !newMount || !oldMount->fsOps) return -2;
+    if (oldMount!=newMount) return -18;
+    return oldMount->fsOps->rename ? oldMount->fsOps->rename(oldMount->mountPriv,oldMount->pdrv,oldRelative,newRelative) : -95;
+}
+
+int VfsSymlink(const char* target,const char* linkPath)
+{
+    if (!target || !target[0]) return -22;
+    FileMutationGuard mutation;
+    char resolved[512];
+    if (int error=VfsResolvePath(linkPath,resolved,sizeof(resolved),{false,true,true})) return error;
+    if (VfsTrailingSlash(resolved)) {
+        VnodeStat st{};
+        int error=VfsLstatPathRaw(resolved,&st);
+        return error?error:-17;
+    }
+    const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative);
+    if (!mount || !mount->fsOps) return -2;
+    return mount->fsOps->symlink ? mount->fsOps->symlink(mount->mountPriv,mount->pdrv,target,relative) : -95;
+}
+
+int VfsReadlink(const char* path,char* buf,uint64_t bufsiz)
+{
+    if (!buf || !bufsiz) return -22;
+    FileMutationGuard lookup(false);
+    char resolved[512];
+    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{false})) return error;
+    return VfsReadlinkRaw(resolved,buf,bufsiz);
 }
 
 void VfsClose(Vnode* vn)

@@ -40,7 +40,8 @@ namespace brook {
 // ABI 14 adds file registrations to range tables and file identity to mapping backings.
 // ABI 15 carries the requested creation mode through VfsFsOps::mkdir.
 // ABI 16 appends native submission/progress/restart callbacks to AudioDriver.
-static constexpr uint32_t MODULE_ABI_VERSION = 16;
+// ABI 17 appends VfsFsOps permission-policy and opaque-link fields.
+static constexpr uint32_t MODULE_ABI_VERSION = 17;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

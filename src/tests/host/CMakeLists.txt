@@ -327,3 +327,7 @@ target_compile_options(test_debug_epoch PRIVATE -UNDEBUG -DBROOK_HOST_TEST
 
 add_host_test(test_launch_history)
 target_compile_options(test_launch_history PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+
+# Shared component walker: symlink/dotdot ordering, search and typed failures.
+add_host_test(test_path_walk)
+target_compile_options(test_path_walk PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")

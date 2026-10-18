@@ -3710,6 +3710,12 @@ static int Ext2FsSetTimes(void* mountPriv, uint8_t pdrv, const char* relPath,
     return result;
 }
 
+static int Ext2CheckAccess(void* mountPriv, const VnodeStat* st, uint8_t required)
+{
+    if (static_cast<Ext2Mount*>(mountPriv)->skipPermChecks) return 0;
+    return (ProcessFilePermissions(ProcessCurrent(), st->uid, st->gid, st->mode) & required) == required ? 0 : -13;
+}
+
 static const VfsFsOps g_ext2FsOps = {
     .mount      = Ext2FsMount,
     .unmount    = Ext2FsUnmount,
@@ -3729,6 +3735,7 @@ static const VfsFsOps g_ext2FsOps = {
     .can_unmount = Ext2FsCanUnmount,
     .chown      = Ext2FsChown,
     .open_mode_checked = Ext2FsOpenModeChecked,
+    .check_access = Ext2CheckAccess,
 };
 
 // ---------------------------------------------------------------------------

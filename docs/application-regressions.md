@@ -21,6 +21,13 @@ checks. Its kernel is
 with local evidence under `build/workloads/identity-uid32-20261018/final/`.
 This is a cold file-reopen check, not a startup performance comparison.
 
+The [shared path-walk checkpoint](identity.md#shared-component-walk-checkpoint-18-october)
+repeated normal catalogue launch, visible XCF reopen and full native-close cleanup
+on kernel `424e461dd8d5e1855c4e1268904be43a69fe3714f0bd3b43b63e761cf2d38371`
+with module ABI 17. Saved document hashes and independent offline owner checks
+passed, followed by checked shutdown and three clean filesystem checks. Its
+local evidence is `build/workloads/path-walk-20261018/review/gimp/`.
+
 ![GIMP reopening the saved XCF after cold boot](images/brook_gimp_cold_reopen_1080.png)
 
 Native 1920×1080 capture. The black mark in the upper-right transparent margin

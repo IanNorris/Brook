@@ -183,6 +183,13 @@ struct VfsFsOps {
     // filesystem's own inode lock, rather than a racy stat/open preflight.
     Vnode* (*open_mode_checked)(void* mountPriv, uint8_t pdrv, const char* relPath,
                                int flags, uint16_t mode, int* error) = nullptr;
+    // Optional permission policy for already-read metadata. The VFS namespace
+    // lock stabilizes path/ownership/mode through the following operation.
+    int (*check_access)(void* mountPriv, const VnodeStat* st, uint8_t required) = nullptr;
+    // Procfs descriptor links are brokered objects, not filesystem text links.
+    // Preserve their existing metadata path; syscall-specific FD operations
+    // retain their own lifetime/credential checks.
+    bool opaque_symlinks = false;
 };
 
 // Register a filesystem driver with the VFS.
@@ -236,6 +243,8 @@ extern "C" Vnode* VfsOpen(const char* path, int flags = 0);
 // Open an executable and return the initial fully resolved pathname used for
 // the backend open. No truncation; this does not track later rename/unlink.
 int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t size);
+// Canonical directory lookup with search permission on the final directory.
+int VfsResolveDirectory(const char* path, char* resolved, uint32_t size);
 // Creation mode is used only for a new inode; the filesystem applies umask.
 Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode);
 // Reports exclusive-create EEXIST without changing the legacy open ABI.
