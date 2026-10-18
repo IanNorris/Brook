@@ -94,10 +94,11 @@ the table distinguishes tested behavior from remaining limitations.
   progress from slow video-frame callbacks and VM display output.
   The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and
-  remaining limits. At the pinned `f4066d0` checkpoint, both [full bootstrap paths](docs/bootstrap.md#matching-39-suite-refresh-after-clock-and-desktop-changes-2026-10-18)
-  passed all 39 native suites three times, including under their guest-built
-  kernels. Later permission changes pass 40 hosted suites; a full bootstrap
-  refresh for those changes remains pending. The [virtio-net TX ownership fix](docs/package-pipeline.md) reduces
+  remaining limits. At the pinned `37cccf60` permission checkpoint, both [full bootstrap paths](docs/bootstrap.md#40-suite-bootstrap-refresh-after-permission-checks-2026-10-18)
+  passed all 40 native suites three times, including under their guest-built
+  kernels. The clean image installed its SDK through `nix-install` in 245 seconds;
+  building the kernel, modules and bare-metal tests took 52–54 seconds.
+  The [virtio-net TX ownership fix](docs/package-pipeline.md) reduced
   the measured clean-image SDK install from 732 to 236 seconds; compilation
   remains about 50 seconds.
 

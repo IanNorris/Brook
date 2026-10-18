@@ -73,7 +73,7 @@ rather than the host store's 0444/0555, so mode-dependent mmap cache behavior
 matches. Base transport paths keep the same host-prepared modes in both images.
 The harness runs the real guest installer, performs an HTTPS clone and pinned
 submodule update, and builds kernel/EFI/modules/bare-metal/native artifacts.
-It validates module imports and requires 39/39 CTest results twice, before and
+It validates module imports and requires 40/40 CTest results twice, before and
 after a clean native rebuild with warm caches. The incremental kernel stage
 is labelled separately from a full compilation.
 
@@ -115,7 +115,7 @@ interpreted using the nearest kernel symbol.
 After guest sync and shutdown, the harness requires offline fsck on both
 disks, extracts artifacts with debugfs, hashes them, boots their kernel/EFI
 and modules in a second isolated VM, verifies the booted kernel hash and
-command replies, and reruns Git fsck and all 39 native tests under that kernel,
+command replies, and reruns Git fsck and all 40 native tests under that kernel,
 then repeats synced offline fsck. Only this complete sequence
 writes `result.json` with `success: true`. Failure retains logs/disks and may
 leave the VM running for diagnosis; use its bridge session to sync and stop it.
@@ -1239,3 +1239,95 @@ Evidence is under ignored:
 Both result directories contain the separate `user-fault-audit.json`. This
 supersedes the pending full-rerun notes for the clock/session kernel changes;
 application, identity, Gallery and desktop acceptance still have their own scope.
+
+
+### 40-suite bootstrap refresh after permission checks (2026-10-18)
+
+Both paths passed at pinned remote revision
+`37cccf6087e96b26e2e0224fadabacb2dbc421e6`, including the shared component walker
+and real/effective-ID access inquiries. The acceptance harness now requires
+**40** native suites; its stale 39-suite expectation was updated, with checks
+that incomplete or old-count output is rejected. Each path built and hashed
+61 artifacts: kernel/EFI, twelve modules, seven bare-metal test ELFs and forty
+native test binaries. The bare-metal ELFs were built, not executed. All native
+suites passed before and after a clean rebuild, then a third time under that
+path's exact guest-built kernel. The verification ESP's EFI/kernel and all
+staged modules match the extracted outputs; all twelve modules have ABI 18.
+
+| Stage (guest wall seconds) | Prepared SDK | Clean image |
+| --- | ---: | ---: |
+| SDK install through nix-install | Already installed | 245 |
+| HTTPS clone | 15 | 14 |
+| Pinned checkout | 7 | 7 |
+| Submodules | 19 | 20 |
+| Kernel/module/bare-metal build | 52 | 54 |
+| Native configure | 4 | 4 |
+| Native compile | 30 | 31 |
+| Native tests | 9 | 8 |
+| Warm native compile | 30 | 29 |
+| Warm native tests | 9 | 8 |
+| Incremental kernel build | 2 | 2 |
+
+These eight-vCPU, 4-GiB guests used private RAM-backed disks. Both paths
+completed checked sync/stop, zero QEMU/launcher exit, terminal original/full
+command lineages, both EOFs without gaps/drops, Git fsck and both sets of three
+read-only filesystem checks. Owned RAM images were preserved on disk and freed.
+The original guests booted kernel
+`50fe3e571183c246225af8cbe724133394f8bdd3ce71a5afd7dbcdf997be368e`.
+The independent guest-built verification kernels were:
+
+- Prepared: `9578d4dcbb221dcffa5a678589d552985049c923335e3c91605b7d0133cb1580`.
+- Clean: `8dbdcbb6ba8321386290b1c076760dfb19ad1cda57322a82b1b5d78f6a5b6aa3`.
+
+Cross-build byte reproducibility is not claimed. Each original/verification
+serial pair contained 10/5 intact user-fault banners, all classified as the
+pinned, recovered user-copy probes by the existing fault auditor. This remains
+best-effort serial evidence, not expanded interrupt or raw-pointer coverage.
+
+The clean run exposed a host-side profiling failure: compiler output moved the
+profile filename outside the bridge's 256-KiB recent-log window. The guest kept
+building. Its original session/request was resumed without redispatch, and all
+acceptance gates completed. The first recovery verification launcher lacked
+the Nix shell's firmware environment and exited before QEMU started; the same
+staged outputs/disks were then verified inside nix-shell. Those diagnostics and
+recovery notes are retained; a fresh uninterrupted run of the host-side fixes
+has not been performed.
+
+The bridge now searches backwards with bounded memory for the latest complete
+profile filename within the current boot's serial range. It rejects partial
+filenames and prior-boot references. Forty-seven bridge contract tests passed,
+including long compiler output and every split position in a filename record.
+Offline recovery from the actual long build log also found and decoded the
+completed profile. A missing optional profile reference now records a diagnostic
+and disables further automatic captures instead of abandoning the build monitor;
+kernel-identity mismatches and other validation errors still fail acceptance.
+
+The three-second stage profiles remain partly lossy and cannot establish a
+reliable bottleneck ranking. A separate 500-ms install capture retained 396 CPU
+samples and 7,525 context switches with zero drops and matching event counts.
+389 of those CPU samples landed in idle loops; IRQ-masked time may be
+underrepresented, and one window is not a stage-wide estimate. User/module
+addresses were not attributed to the nearest kernel symbol. The concurrent
+process census showed the curl/zstd/nar-unpack pipeline. Installer-reported
+unpack wall times included 53 seconds for an 817-MB Clang library NAR, 50 seconds
+for a 503-MB LLVM NAR and 36 seconds for a 277-MB GCC NAR. These are pipelined
+wall times, not isolated disk bandwidth. RAM-backed storage and substantial
+idle sampling motivate separating decompression, pipes, filesystem writes and
+wakeups in a focused experiment before selecting an optimization. The earlier
+239-second SDK install and 51–53-second compile remain comparable single-run
+baselines; host load/cache and this run's extra short profile prevent a precise
+performance-change claim.
+
+Local ignored evidence:
+
+- `build/experiments/results/bootstrap-prepared-37cccf60-ram/`
+- `build/experiments/results/bootstrap-clean-37cccf60-ram/`
+- `build/workloads/bootstrap-37cccf60-20261018/acceptance-audit.json`
+- `build/workloads/bootstrap-37cccf60-20261018/install-short-profile.json`
+- `build/workloads/bootstrap-37cccf60-20261018/package-timings.json`
+- `build/workloads/bootstrap-37cccf60-20261018/profile-lookup-recovery.json`
+
+This renews bootstrap acceptance for the permission source revision, including
+the SDK install on the clean image. Real-application concurrency, complete
+identity isolation and App Gallery interruption/disk-full recovery still have
+separate outstanding acceptance work.

@@ -24,7 +24,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools/vm_bridge"))
 import server
 
-NATIVE_TEST_COUNT = 39
+# Independent expected inventory for the source revision under acceptance.
+# Keep this in step with src/tests/host/CMakeLists.txt; never accept whatever
+# count a partial build happens to report.
+NATIVE_TEST_COUNT = 40
 NATIVE_PASS_MARKER = f"100% tests passed, 0 tests failed out of {NATIVE_TEST_COUNT}"
 
 
@@ -358,7 +361,12 @@ def monitor(directory, session, data, deadline, job=None):
                 print(f"Profile {capture['stage']}: {result['sample_count']} CPU samples", flush=True)
                 capture = None
             except RuntimeError as e:
-                if "RUNNING" not in str(e) and "recording/flushing" not in str(e):
+                if "No recorded profile output path" in str(e):
+                    snapshots.append({"stage": capture["stage"], "profile_error": str(e),
+                                      "profiling_disabled": True})
+                    capture = None
+                    profiling_available = False
+                elif "RUNNING" not in str(e) and "recording/flushing" not in str(e):
                     raise
             except (TimeoutError, OSError) as e:
                 # Profiling is ancillary to build acceptance. The guest may

@@ -718,6 +718,7 @@ isolated clones, not RAM disks.
 Executable authorization is separate: access(X_OK) success must never authorize
 a later exec. Actual executable leaf checks, pinned CWD/dirfds, nonroot chown,
 parent setgid inheritance, runtime directories, other filesystem policies and
-Nix protection remain open. Full bootstrap and browser concurrency acceptance
-have not been renewed on this kernel; their earlier pinned results still apply
-only to their recorded revisions. Login/accounts remain deferred.
+Nix protection remain open. Both full bootstrap paths subsequently passed at
+this source revision, as recorded in the [40-suite refresh](bootstrap.md#40-suite-bootstrap-refresh-after-permission-checks-2026-10-18).
+Browser concurrency acceptance has not been renewed on this kernel; its earlier
+pinned results apply only to their recorded revisions. Login/accounts remain deferred.

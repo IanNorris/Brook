@@ -543,6 +543,30 @@ def profile_event_summary(content):
             "quality_note": "Producer drops and count mismatches limit interpretation; IRQ-masked time is not sampled uniformly"}
 
 
+def latest_profile_path(serial_log, generation_offset=0):
+    """Find the latest complete filename without loading an entire build log.
+
+    A long command can print more than MAX_LOG after the profiler opens its
+    file. Search backwards in bounded chunks, retaining enough overlap for a
+    filename crossing a chunk boundary. Never reuse a previous boot's capture.
+    """
+    pattern = rb"PROFILER: writing to (/boot/[A-Za-z0-9_.]{1,255})(?=\r?\n)"
+    with Path(serial_log).open("rb") as log:
+        end = log.seek(0, 2)
+        lower = max(0, generation_offset)
+        suffix = b""
+        while end > lower:
+            start = max(lower, end - 65536)
+            log.seek(start)
+            block = log.read(end - start) + suffix
+            matches = re.findall(pattern, block)
+            if matches:
+                return matches[-1].decode("ascii")
+            suffix = block[:512]
+            end = start
+    raise RuntimeError("No recorded profile output path in this guest generation")
+
+
 def profile(session, action="status", duration_ms=1000, guest_timeout=8, **_):
     if action not in {"start", "stop", "status", "export"} or not 100 <= duration_ms <= 30000:
         raise ValueError("Invalid profile action/duration")
@@ -557,11 +581,8 @@ def profile(session, action="status", duration_ms=1000, guest_timeout=8, **_):
         state = query("prof status")
         if "RUNNING" in state.get("reply", ""):
             raise RuntimeError("Profiler recording/flushing: export after status reports IDLE")
-        text = tail(data["serial_log"])
-        matches = re.findall(r"PROFILER: writing to (/boot/[A-Za-z0-9_.]+)", text)
-        if not matches:
-            raise RuntimeError("No recorded profile output path in recent serial log")
-        source = "::" + Path(matches[-1]).name
+        recorded_path = latest_profile_path(data["serial_log"], data.get("generation_log_offset", 0))
+        source = "::" + Path(recorded_path).name
         path = artifact(session, ".profile")
         command = "exec mcopy -o -i " + shlex.quote(data["boot_disk"]) + " " + shlex.quote(source) + " " + shlex.quote(str(path))
         result = subprocess.run(["nix-shell", "--run", command], cwd=ROOT, capture_output=True, timeout=30)

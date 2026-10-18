@@ -43,6 +43,47 @@ class ProfileLossTests(unittest.TestCase):
                 server.profile_event_summary(text)
 
 
+class ProfilePathTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.log = Path(self.temp.name) / 'serial.log'
+
+    def test_export_reference_survives_long_compiler_output(self):
+        self.log.write_bytes(b'PROFILER: writing to /boot/PROF_123.TXT\r\n'
+                             + b'compiler output\n' * 100000)
+        self.assertNotIn('PROFILER:', server.tail(self.log))
+        self.assertEqual(server.latest_profile_path(self.log), '/boot/PROF_123.TXT')
+
+    def test_latest_complete_capture_wins(self):
+        self.log.write_bytes(b'PROFILER: writing to /boot/PROF_1.TXT\n'
+                             + b'x' * 200000
+                             + b'\nPROFILER: writing to /boot/PROF_2.TXT\n')
+        self.assertEqual(server.latest_profile_path(self.log), '/boot/PROF_2.TXT')
+
+    def test_filename_crossing_read_boundary_is_complete(self):
+        record = b'PROFILER: writing to /boot/PROF_123.TXT\r\n'
+        # Exercise splits in both the prefix and filename/newline.
+        for split in range(1, len(record)):
+            with self.subTest(split=split):
+                self.log.write_bytes(b'prefix\n' + record + b'x' * (65536 - split))
+                self.assertEqual(server.latest_profile_path(self.log), '/boot/PROF_123.TXT')
+
+    def test_previous_generation_cannot_supply_capture(self):
+        old = b'PROFILER: writing to /boot/PROF_OLD.TXT\n'
+        self.log.write_bytes(old + b'new boot without a capture\n')
+        with self.assertRaisesRegex(RuntimeError, 'this guest generation'):
+            server.latest_profile_path(self.log, len(old))
+        with self.log.open('ab') as log:
+            log.write(b'PROFILER: writing to /boot/PROF_NEW.TXT\n')
+        self.assertEqual(server.latest_profile_path(self.log, len(old)), '/boot/PROF_NEW.TXT')
+
+    def test_partial_filename_is_not_exportable(self):
+        self.log.write_bytes(b'PROFILER: writing to /boot/PROF_12')
+        with self.assertRaises(RuntimeError):
+            server.latest_profile_path(self.log)
+
+
 class CpuSelectionTests(unittest.TestCase):
     def test_hmp_request_carries_cpu_for_every_command(self):
         qmp = object.__new__(common.QMP)
