@@ -1,6 +1,34 @@
 # virtio-gpu 2D display driver — design & recon notes
 
-Status: **Phase 1 (recon) complete — no driver code yet.**
+This is the historical 2D reconnaissance plan. The implemented driver now
+provides 2D scanout, virgl composition and a userspace DRM render path; current
+application checks and remaining defects are in
+[application regressions](../../../docs/application-regressions.md).
+
+## DRM transfer byte-offset repair — 18 October 2026
+
+The DRM transfer path previously derived a guest-backing offset as
+`(y * texture_width + x) * 4`, even for byte-addressed vertex buffers. It also
+dropped the requested mip level, z/depth, explicit stride/layer stride and
+readback coordinates. A generated 128-byte buffer probe isolated the offset
+bug: a full upload/readback passed, but uploading guest bytes 16–31 to resource
+bytes 16–31 instead uploaded bytes 64–79. Other resource bytes stayed correct.
+
+`GpuAppOps::Transfer3D` now carries a full `GpuTransfer3D` descriptor. DRM fields
+are forwarded unchanged; the native full-image syscall constructs its explicit
+four-byte-pixel layout. Module ABI 21 prevents loading a driver with the old
+function contract. Kernel-private compositor helpers retain their existing
+texture-layout convention.
+
+`scripts/workloads/gpu_buffer_transfer_check.py --brook-guest` runs in an
+isolated Brook GL VM. The candidate passes full upload/readback, partial byte
+upload, partial readback with a distinct destination offset, and upload with
+independent resource/backing offsets. These are buffer-layout checks, not proof
+of arbitrary texture formats, mip chains, all GPU synchronization or resource
+lifetime correctness. The Quake crash and cumulative resource budgets still
+need separate investigation.
+
+## Original plan
 
 A loadable display driver for the QEMU **virtio-gpu** device, sitting behind the
 kernel's existing `DisplayOps` abstraction. The immediate goal is **2D scanout**

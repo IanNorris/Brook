@@ -38,6 +38,34 @@ has yet been proved as the crash's cause.
 Local failure evidence: `build/workloads/quake-openttd-crash-20261018/`.
 The user-controlled sessions are diagnostic runs, not checked acceptance seeds.
 
+### Partial GPU buffer transfers
+
+A deterministic 128-byte vertex-buffer probe subsequently confirmed a separate
+data-corruption bug. Full upload/readback passed, but uploading bytes 16–31 at
+resource offset 16 instead copied guest bytes 64–79: the driver multiplied byte
+coordinates by four and ignored DRM's explicit backing offset. The repair
+preserves the complete transfer box, byte offset, mip level and stride fields.
+The changed driver interface requires module ABI 21.
+
+Kernel `312a7bc7c34530420a1f48a095be596db1af7853fe881a1beb966fc5ab2bf744`
+and all 12 matching ABI-21 modules passed the full-buffer control, partial
+upload, partial readback, and independent resource/backing-offset checks.
+The negative and positive tracked jobs drained completely with exact output
+byte counts (exit 1 before, exit 0 after). Quake's GL3 demo → `map base1` →
+OpenTTD launch/normal close sequence completed with Quake still alive; the
+same sequence also survived on the preceding candidate, so this does not prove
+the intermittent crash is repaired. Gallery then reused Quake's closed slot
+correctly. All application lineages drained and the guest audio stream list
+was empty after normal close. Host audio output was disabled.
+
+Checked shutdown and original launcher exit zero, independent QEMU death,
+three offline filesystem checks and nine unchanged saved fixtures/owners
+passed. Local evidence:
+`build/workloads/window-surface-20261018/transfer-fix/acceptance-audit.json`.
+SuperTuxKart, longer/repeated Quake transitions, arbitrary texture formats,
+mips/3D transfers and broader synchronization remain unverified by this probe.
+GPU resource lifetime cleanup and cumulative ID exhaustion are still open.
+
 The earlier acceptance checks below use isolated eight-vCPU, 4-GiB
 software-Wayland VMs. Earlier runs use
 RAM-backed host disks; the access-inquiry and browser-permission follow-ups use

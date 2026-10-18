@@ -17,6 +17,15 @@
 
 namespace brook {
 
+// Resource coordinates and guest-backing byte offset are independent. A
+// PIPE_BUFFER's x/width are bytes; texture coordinates are texels. Preserve
+// the caller's layout rather than deriving a four-byte-pixel offset from x/y.
+struct GpuTransfer3D {
+    uint32_t x, y, z, w, h, d;
+    uint64_t offset;
+    uint32_t level, stride, layerStride;
+};
+
 struct GpuAppOps {
     const char* name;
 
@@ -61,8 +70,7 @@ struct GpuAppOps {
 
     // Transfer a resource box guest<->host. dir: 0 = TO host, 1 = FROM host.
     int32_t (*Transfer3D)(int32_t ctxId, int32_t resId, int dir,
-                          uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                          uint32_t texW, uint32_t texH);
+                          const GpuTransfer3D& transfer);
 
     // Fetch a host 3D capability set (virgl_caps blob) via the virtio-gpu
     // GET_CAPSET command. `capsetId` is a VIRTIO_GPU_CAPSET_* value (1=VIRGL,

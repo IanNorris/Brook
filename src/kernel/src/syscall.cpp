@@ -5928,12 +5928,12 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         const brook::GpuAppOps* ga = brook::GpuAppGet();
         if (!ga || !ga->Transfer3D) return -ENODEV;
         int dir = (nr == DRM_NR_VIRTGPU_TRANSFER_TO_HOST) ? 0 : 1;
-        uint32_t w = t.box.w ? t.box.w : g->width;
-        uint32_t h = t.box.h ? t.box.h : g->height;
-        uint32_t texW = g->width ? g->width : w;
-        uint32_t texH = g->height ? g->height : h;
+        if (!t.box.w || !t.box.h || !t.box.d) return -EINVAL;
+        const brook::GpuTransfer3D transfer{
+            t.box.x,t.box.y,t.box.z,t.box.w,t.box.h,t.box.d,
+            t.offset,t.level,t.stride,t.layer_stride};
         int32_t r = ga->Transfer3D(dctx->ctxId, (int32_t)g->gres, dir,
-                                   t.box.x, t.box.y, w, h, texW, texH);
+                                   transfer);
         return r < 0 ? -EIO : 0;
     }
     case DRM_NR_VIRTGPU_EXECBUFFER:
@@ -11378,9 +11378,11 @@ static int64_t sys_brook_gpu_transfer(uint64_t ctx, uint64_t resId, uint64_t dir
     const brook::GpuAppOps* ga = brook::GpuAppGet();
     if (!ga || !ga->Transfer3D) return -ENODEV;
     if ((int32_t)ctx != proc->gpuAppCtx || proc->gpuAppCtx <= 0) return -EPERM;
-    if (w == 0 || h == 0 || w > 8192 || h > 8192) return -EINVAL;
+    if (w == 0 || h == 0 || w > 8192 || h > 8192 || dir > 1) return -EINVAL;
+    const brook::GpuTransfer3D transfer{
+        0,0,0,(uint32_t)w,(uint32_t)h,1,0,0,(uint32_t)w*4,(uint32_t)(w*h*4)};
     int32_t r = ga->Transfer3D((int32_t)ctx, (int32_t)resId, (int)dir,
-                               0, 0, (uint32_t)w, (uint32_t)h, (uint32_t)w, (uint32_t)h);
+                               transfer);
     return r < 0 ? -EIO : 0;
 }
 
