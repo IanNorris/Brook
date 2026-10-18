@@ -64,6 +64,8 @@ struct VnodeOps {
     // Kernel-staged buffer; choose current EOF atomically with the write.
     int (*append)(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset) = nullptr;
     int (*space)(Vnode* vn, VfsSpace* out) = nullptr;
+    // Permission inquiry for a retained descriptor, independent of its path.
+    int (*access)(Vnode* vn, uint8_t required, bool realIds) = nullptr;
 };
 
 struct Vnode {
@@ -190,6 +192,7 @@ struct VfsFsOps {
     // Preserve their existing metadata path; syscall-specific FD operations
     // retain their own lifetime/credential checks.
     bool opaque_symlinks = false;
+    int (*check_access_real)(void* mountPriv, const VnodeStat* st, uint8_t required) = nullptr;
 };
 
 // Register a filesystem driver with the VFS.
@@ -245,6 +248,8 @@ extern "C" Vnode* VfsOpen(const char* path, int flags = 0);
 int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t size);
 // Canonical directory lookup with search permission on the final directory.
 int VfsResolveDirectory(const char* path, char* resolved, uint32_t size);
+int VfsAccessPath(const char* path, uint8_t required, bool realIds, bool nofollow = false);
+int VfsAccess(Vnode* vn, uint8_t required, bool realIds);
 // Creation mode is used only for a new inode; the filesystem applies umask.
 Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode);
 // Reports exclusive-create EEXIST without changing the legacy open ABI.

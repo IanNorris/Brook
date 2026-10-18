@@ -112,11 +112,13 @@ void ProcessGroupsReplace(Process* proc, SupplementaryGroups* owned) {
     auto* old = proc->groups; proc->groups = owned;
     SpinLockRelease(&g_credentialsLock); ProcessGroupsRelease(old);
 }
-FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode) {
+FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode, bool realIds) {
     if (!proc) return {true, false, false, 7};
     ProcessOperationGuard credentialOperation(ProcessCurrent());
     SpinLockAcquire(&g_credentialsLock);
-    FileCredentialAccess access = {proc->euid == 0, proc->euid == owner, proc->egid == group, 0};
+    uint32_t uid = realIds ? proc->uid : proc->euid;
+    uint32_t gid = realIds ? proc->gid : proc->egid;
+    FileCredentialAccess access = {uid == 0, uid == owner, gid == group, 0};
     auto* groups = proc->groups;
     // Published group lists are sorted and immutable. Membership is needed
     // even for the owner (chmod's setgid rule), unlike the access-bit choice.
@@ -131,6 +133,15 @@ FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t g
                          : access.group ? (mode >> 3) & 7 : mode & 7;
     SpinLockRelease(&g_credentialsLock);
     return access;
+}
+int ProcessCheckFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode,
+                           uint8_t required, bool realIds) {
+    if (required & ~7u) return -22;
+    auto access = ProcessFileAccess(proc, owner, group, mode, realIds);
+    // Linux root access(X_OK) still requires an execute bit on regular files.
+    // Directory search uses the root override even when its mode is 000.
+    if (access.privileged && (required & 1) && (mode & 0170000) == 0100000 && !(mode & 0111)) return -13;
+    return (access.permissions & required) == required ? 0 : -13;
 }
 uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, uint16_t mode) {
     return ProcessFileAccess(proc, owner, group, mode).permissions;

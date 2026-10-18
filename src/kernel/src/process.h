@@ -626,7 +626,8 @@ struct FileCredentialAccess {
     bool group;
     uint8_t permissions;
 };
-FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode);
+FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode, bool realIds = false);
+int ProcessCheckFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode, uint8_t required, bool realIds = false);
 uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, uint16_t mode);
 
 // Create a kernel-mode thread. Runs `fn(arg)` in ring 0 with the kernel's

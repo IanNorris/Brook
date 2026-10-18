@@ -111,8 +111,8 @@ Optional plugin faults and dialog stacking/xdg_foreign support remain open.
 | Groups and capabilities | Immutable, reference-counted supplementary lists are inherited by fork/clone and independently replaced; getgroups/setgroups validate buffers and the Linux 65536-entry limit. Tasks with all three UIDs nonzero support empty self capabilities; nonempty grants fail. Root/retained-root tuples return ENOSYS. Unsupported capability/security prctl options return EINVAL. | Ext2 existing-file opens, chmod setgid filtering and timestamp write checks use supplementary groups; other filesystem and operation paths remain to audit. Audit the remaining prctl options: several legacy options still return success without implementing behavior. Filesystem IDs are coupled to effective IDs; setfsuid/setfsgid are unsupported. |
 | Inheritance | Fork and thread creation retain an owned group-list reference and snapshot all six IDs under the credential lock. Ordinary exec saves effective IDs and preserves real IDs/groups. Teardown releases the list, including failed creation paths. | Keep matching launch environment/passwd entries and verify repeated failure/cancellation cleanup. Define set-ID executable behavior separately. |
 | File open | `Ext2FsOpenModeChecked` requires both access bits for O_RDWR and uses effective UID, primary GID and supplementary groups. Denials return EACCES without alias fallback; O_TRUNC requires write access. Creation skips the new leaf inode check but requires parent write/search; the explicit Nix bypass remains. | Keep checked component traversal and parent mutation regressions passing; audit other filesystems and define the writable Nix mount policy. |
-| Path traversal and mutation | Ext2 checks parent write/search and sticky entry ownership under its write lock for creation, removal and both rename parents. A shared checked component walk preserves symlink/dotdot order and directory search checks through lookup/operation under a namespace read/write gate. Nix explicitly skips permission checks. | Complete pinned dirfd/CWD identity, real-ID/leaf access and executable checks, other filesystem policies and hard-link policy; restrict the writable Nix service deliberately. |
-| Access checks | `AccessAt` preserves checked traversal errors but still implements leaf existence rather than R/W/X permission evaluation, including AT_EACCESS. | Use real/effective credentials as requested and apply the same traversal rules as open/exec; cover descriptor and symlink variants. |
+| Path traversal and mutation | Ext2 checks parent write/search and sticky entry ownership under its write lock for creation, removal and both rename parents. A shared checked component walk preserves symlink/dotdot order and directory search checks through lookup/operation under a namespace read/write gate. Nix explicitly skips permission checks. | Complete pinned dirfd/CWD identity, executable authorization, other filesystem policies and hard-link policy; restrict the writable Nix service deliberately. |
+| Access checks | Ext2 access/faccessat/faccessat2 evaluate all requested R/W/X bits, using real IDs by default and effective IDs with AT_EACCESS for both directory search and leaf metadata. Retained ext2 descriptors support AT_EMPTY_PATH, including unlinked files. Nix retains its explicit bypass. | Add other filesystem/non-vnode policies and pinned CWD/dirfds. Inquiry success does not authorize a later operation; executable loading still needs its own leaf execute check. |
 | Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Linux-layout ext2 ownership now preserves all 32 UID/GID bits through creation, stat, chown and existing leaf permission checks; new symlinks inherit creator credentials. | Test mode/ownership through every mutation path and all filesystems. Audit nonroot chown group-change rules, parent setgid inheritance and remaining filesystem operations before exposing account creation. |
 | Runtime directory | Every shell application inherits `XDG_RUNTIME_DIR=/tmp`. This path is on the FAT-backed initrd, which cannot persist Unix ownership/modes. Wayland and other IPC endpoints are shared. | Give a named desktop identity an owned, mode-0700 runtime directory with a defined lifetime; audit IPC peer credentials and access policy. |
 | Persistent preferences | HOME/XDG is persistent, but root apps and compatibility-UID apps share it. Browser wrappers explicitly select their own profiles. | Use the named desktop identity consistently in the default launcher and owned application state. Preserve existing data during any migration; report conflicts rather than silently replacing ownership. |
@@ -658,3 +658,66 @@ setgid inheritance, other filesystem policies, runtime directories and the
 writable Nix boundary still need work. Browser concurrency, full bootstrap and
 performance acceptance have not been renewed for this kernel. The earlier
 39-suite bootstrap checkpoint stays pinned separately in the README.
+
+
+### Access inquiry checkpoint (18 October)
+
+`access`, `faccessat` and `faccessat2` now evaluate the requested leaf R/W/X
+bits on enforced ext2 mounts. Both the component walk and leaf inquiry select
+real UID/GID by default, or effective IDs with AT_EACCESS; supplementary groups
+participate in either selection. Owner precedence and combined requests use the
+same credential snapshot as other ext2 permission checks. Within Brook's
+existing UID-zero privilege model, root still needs at least one execute bit
+for regular-file X_OK. These rules follow
+[Linux access inquiries](https://man7.org/linux/man-pages/man2/access.2.html);
+capability-aware root behavior remains unsupported.
+
+AT_SYMLINK_NOFOLLOW evaluates link metadata. AT_EMPTY_PATH on an ext2 vnode
+uses the retained object rather than looking up its saved pathname, including
+after unlink or when its parent is inaccessible. Descriptor queries therefore
+need no parent search. Relative dirfd and empty-CWD queries still use stored
+paths and are not pinned against rename/replacement. Non-vnode descriptors and
+vnodes without a permission callback return EOPNOTSUPP for nonzero requested
+modes; F_OK remains an existence inquiry. Backends without a pathname policy
+retain their legacy behavior. The Nix mount deliberately bypasses both pathname
+and retained-vnode permission inquiries. Synthetic compatibility fallbacks use
+their declared metadata, but are not a complete synthetic/magic-link policy.
+
+The added real-ID filesystem and retained-vnode callbacks require module ABI
+**18**. All twelve frozen module headers match. `access_permissions.py` passed
+**6,204** guest checks across twelve credential combinations, including primary
+and supplementary groups, high IDs, differing real/effective IDs, ancestor
+search, retained/unlinked descriptors, symlinks and error cases. The corrected
+negative control on the previous kernel recorded **3,496** mismatches in that
+same matrix. The unprivileged Linux owner subset passed **448** controls;
+privileged Linux credential comparisons were unavailable on this host and are
+not claimed. `access_flags.py` passed another **45** Brook controls for relative
+dirfds, empty CWD, retained descriptors, explicit unsupported pipe permissions
+and the shared-Nix bypass.
+
+The existing 43 traversal, 185 mutation, ten FAT, 45 metadata and 686 leaf-open
+checks passed, along with ownership/full-width-ID controls and all eighteen
+remaining-path audit cases. The bounded namespace-contention probe returned
+217 public reads and 183 EACCES results during 200 symlink switches, with no
+protected payload in 400 reads. All **40** hosted suites and the supported
+compiled-entry audit passed; this is not expanded interrupt-handler coverage.
+
+Reviewed kernel SHA-256:
+`50fe3e571183c246225af8cbe724133394f8bdd3ce71a5afd7dbcdf997be368e`.
+Local evidence: `build/workloads/access-checks-20261018/acceptance-audit.json`,
+review session `ff61cd9f5f72410281d4077fbc7f9801`. Sixteen tracked commands
+finished with zero exit, drained original/full task lineages, both EOFs and no
+output gaps. GIMP's normal Brook-user catalogue launch displayed its Welcome
+window and recent-document list, then native close drained its full launch
+lineage. This run did not reopen the XCF. Independent offline inspection after
+shutdown verified all four saved document hashes and UID:GID 1000:100. Checked
+sync/stop, QEMU/launcher exit zero, serial kernel/device/user-fault checks and
+three read-only filesystem checks passed. These test disks are host-backed
+isolated clones, not RAM disks.
+
+Executable authorization is separate: access(X_OK) success must never authorize
+a later exec. Actual executable leaf checks, pinned CWD/dirfds, nonroot chown,
+parent setgid inheritance, runtime directories, other filesystem policies and
+Nix protection remain open. Full bootstrap and browser concurrency acceptance
+have not been renewed on this kernel; their earlier pinned results still apply
+only to their recorded revisions. Login/accounts remain deferred.

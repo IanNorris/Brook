@@ -1,7 +1,7 @@
 # Application regressions — 2026-10-18
 
-Tests use an isolated eight-vCPU, 4-GiB software-Wayland VM with RAM-backed host
-disks. Applications launch through the installed catalogue as Brook, UID 1000.
+Tests use isolated eight-vCPU, 4-GiB software-Wayland VMs. Earlier runs use
+RAM-backed host disks; the access-inquiry follow-up uses host-backed clones. Applications launch through the installed catalogue as Brook, UID 1000.
 These are correctness observations, not matched startup benchmarks.
 
 ## GIMP and document persistence
@@ -27,6 +27,14 @@ on kernel `424e461dd8d5e1855c4e1268904be43a69fe3714f0bd3b43b63e761cf2d38371`
 with module ABI 17. Saved document hashes and independent offline owner checks
 passed, followed by checked shutdown and three clean filesystem checks. Its
 local evidence is `build/workloads/path-walk-20261018/review/gimp/`.
+
+The [access inquiry checkpoint](identity.md#access-inquiry-checkpoint-18-october)
+on kernel `50fe3e571183c246225af8cbe724133394f8bdd3ce71a5afd7dbcdf997be368e`
+(ABI 18) passed normal launch and full native-close cleanup. The visible Welcome
+window retained the recent-document list; the XCF was not reopened in this run.
+After checked shutdown, independent disk inspection verified all four saved
+document hashes and Brook ownership, and all three filesystem checks passed.
+Local evidence: `build/workloads/access-checks-20261018/acceptance-audit.json`.
 
 ![GIMP reopening the saved XCF after cold boot](images/brook_gimp_cold_reopen_1080.png)
 

@@ -2582,6 +2582,22 @@ static int Ext2Space(Vnode* vn, VfsSpace* out)
     return 0;
 }
 
+static int Ext2AccessMetadata(Ext2Mount* mount,const VnodeStat* st,uint8_t required,bool realIds)
+{
+    if (mount->skipPermChecks) return 0;
+    return ProcessCheckFileAccess(ProcessCurrent(),st->uid,st->gid,st->mode,required,realIds);
+}
+
+static int Ext2VnodeAccess(Vnode* vn,uint8_t required,bool realIds)
+{
+    VnodeStat st{};
+    int error=vn->type==VnodeType::Dir ? Ext2DirStat(vn,&st) : Ext2FileStat(vn,&st);
+    if (error) return error;
+    Ext2Mount* mount=vn->type==VnodeType::Dir ? static_cast<Ext2DirPriv*>(vn->priv)->mnt
+                                           : static_cast<Ext2FilePriv*>(vn->priv)->mnt;
+    return Ext2AccessMetadata(mount,&st,required,realIds);
+}
+
 static const VnodeOps g_ext2FileOps = {
     .open    = Ext2FileOpen,
     .read    = Ext2FileRead,
@@ -2596,6 +2612,7 @@ static const VnodeOps g_ext2FileOps = {
     .file_object = Ext2FileObject,
     .chown   = Ext2VnodeChown,
     .space   = Ext2Space,
+    .access  = Ext2VnodeAccess,
 };
 
 static const VnodeOps g_ext2DirOps = {
@@ -2610,6 +2627,7 @@ static const VnodeOps g_ext2DirOps = {
     .chmod   = Ext2VnodeChmod,
     .chown   = Ext2VnodeChown,
     .space   = Ext2Space,
+    .access  = Ext2VnodeAccess,
 };
 
 // ---------------------------------------------------------------------------
@@ -3710,10 +3728,13 @@ static int Ext2FsSetTimes(void* mountPriv, uint8_t pdrv, const char* relPath,
     return result;
 }
 
-static int Ext2CheckAccess(void* mountPriv, const VnodeStat* st, uint8_t required)
+static int Ext2CheckAccess(void* mountPriv,const VnodeStat* st,uint8_t required)
 {
-    if (static_cast<Ext2Mount*>(mountPriv)->skipPermChecks) return 0;
-    return (ProcessFilePermissions(ProcessCurrent(), st->uid, st->gid, st->mode) & required) == required ? 0 : -13;
+    return Ext2AccessMetadata(static_cast<Ext2Mount*>(mountPriv),st,required,false);
+}
+static int Ext2CheckRealAccess(void* mountPriv,const VnodeStat* st,uint8_t required)
+{
+    return Ext2AccessMetadata(static_cast<Ext2Mount*>(mountPriv),st,required,true);
 }
 
 static const VfsFsOps g_ext2FsOps = {
@@ -3736,6 +3757,7 @@ static const VfsFsOps g_ext2FsOps = {
     .chown      = Ext2FsChown,
     .open_mode_checked = Ext2FsOpenModeChecked,
     .check_access = Ext2CheckAccess,
+    .check_access_real = Ext2CheckRealAccess,
 };
 
 // ---------------------------------------------------------------------------

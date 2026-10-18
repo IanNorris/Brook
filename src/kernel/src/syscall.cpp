@@ -5384,8 +5384,7 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
 
 static bool BusyboxStatFallback(const char* path, VnodeStat* vs);
 
-// Existence checks share pathname resolution. Permission-bit evaluation
-// (including real/effective credentials) remains an existing limitation.
+// Inquiry only: do not use access() as authorization for a later operation.
 static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t flags)
 {
     constexpr uint64_t NOFOLLOW = 0x100, EACCESS = 0x200, EMPTY_PATH = 0x1000;
@@ -5404,10 +5403,13 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
         if (!(flags & EMPTY_PATH)) return -ENOENT;
         if (dirfd != -100) {
             FdRef ref(proc, dirfd);
-            return ref.get() ? 0 : -EBADF;
+            FdEntry* entry=ref.get();
+            if (!entry) return -EBADF;
+            if (entry->type==FdType::Vnode && entry->handle)
+                return VfsAccess(static_cast<Vnode*>(entry->handle),static_cast<uint8_t>(mode),!(flags&EACCESS));
+            return mode ? -95 : 0; // EOPNOTSUPP: non-vnode permission metadata is not implemented.
         }
-        VnodeStat st{};
-        return VfsStatPath(proc->cwd, &st) == 0 ? 0 : -ENOENT;
+        return VfsAccessPath(proc->cwd,static_cast<uint8_t>(mode),!(flags&EACCESS));
     }
     char resolved[512];
     const char* lookup = path;
@@ -5434,7 +5436,8 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
         lookup = resolved;
     }
     VnodeStat st{};
-    int result = (flags & NOFOLLOW) ? VfsLstatPath(lookup, &st) : VfsStatPath(lookup, &st);
+    bool realIds=!(flags&EACCESS);
+    int result=VfsAccessPath(lookup,static_cast<uint8_t>(mode),realIds,flags&NOFOLLOW);
     if (result == 0) return 0;
     if (result != -ENOENT && result != -1) return result;
     static const char* syntheticPaths[] = {
@@ -5443,8 +5446,11 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
         "/proc/version", nullptr
     };
     for (auto** sp = syntheticPaths; *sp; ++sp)
-        if (StrEq(lookup, *sp)) return 0;
-    return BusyboxStatFallback(lookup, &st) ? 0 : -ENOENT;
+        if (StrEq(lookup, *sp))
+            return ProcessCheckFileAccess(proc,0,0,0100444,static_cast<uint8_t>(mode),realIds);
+    if (!BusyboxStatFallback(lookup,&st)) return -ENOENT;
+    return ProcessCheckFileAccess(proc,st.uid,st.gid,st.mode ? st.mode : 0100755,
+                                  static_cast<uint8_t>(mode),realIds);
 }
 
 static int64_t sys_access(uint64_t pathAddr, uint64_t mode, uint64_t,

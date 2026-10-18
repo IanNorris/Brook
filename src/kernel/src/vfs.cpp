@@ -207,13 +207,18 @@ static int VfsReadlinkRaw(const char* path, char* buf, uint64_t bufsiz)
     return mount->fsOps->readlink(mount->mountPriv, mount->pdrv, relPath, buf, bufsiz);
 }
 
-static int VfsCheckAccessRaw(const char* path, const VnodeStat& st, uint8_t required)
+static int VfsCheckAccessRaw(const char* path, const VnodeStat& st, uint8_t required, bool realIds = false)
 {
     MountEntry* mount = FindMount(path, nullptr);
     if (!mount || !mount->fsOps) return -2;
-    return mount->fsOps->check_access ? mount->fsOps->check_access(mount->mountPriv, &st, required) : 0;
+    auto policy = realIds ? mount->fsOps->check_access_real : mount->fsOps->check_access;
+    if (policy) return policy(mount->mountPriv, &st, required);
+    // Never substitute effective-ID authorization for a real-ID inquiry.
+    if (realIds && mount->fsOps->check_access) return -95;
+    return 0; // Backends without a policy retain their explicit legacy behavior.
 }
 struct VfsPathProvider {
+    bool realIds;
     int Stat(const char* p, VnodeStat& st) {
         int error=VfsLstatPathRaw(p,&st);
         MountEntry* mount=FindMount(p,nullptr);
@@ -222,13 +227,13 @@ struct VfsPathProvider {
         if (!error && mount && mount->fsOps->opaque_symlinks) st.isSymlink=false;
         return error;
     }
-    int Search(const char* p, const VnodeStat& st) { return VfsCheckAccessRaw(p,st,1); }
+    int Search(const char* p, const VnodeStat& st) { return VfsCheckAccessRaw(p,st,1,realIds); }
     int Readlink(const char* p,char* buf,uint32_t size) { return VfsReadlinkRaw(p,buf,size); }
 };
 // Caller holds the namespace lock, shared for lookups and exclusive for changes.
-static int VfsResolvePath(const char* path,char* out,uint32_t size,PathWalkOptions options={})
+static int VfsResolvePath(const char* path,char* out,uint32_t size,PathWalkOptions options={},bool realIds=false)
 {
-    VfsPathProvider provider;
+    VfsPathProvider provider{realIds};
     return WalkPath<VnodeStat>(path,out,size,provider,options);
 }
 static bool VfsTrailingSlash(const char* path) { uint32_t n=StrLen(path);return n>1 && path[n-1]=='/'; }
@@ -383,6 +388,26 @@ VfsFsSnapshot VfsFsSnapshotAt(uint32_t idx)
     for (; j < 15 && src && src[j]; ++j) snap.name[j] = src[j];
     snap.name[j] = '\0';
     return snap;
+}
+
+int VfsAccessPath(const char* path,uint8_t required,bool realIds,bool nofollow)
+{
+    if (required & ~7u) return -22;
+    FileMutationGuard lookup(false);
+    char resolved[512];
+    if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{!nofollow},realIds)) return error;
+    VnodeStat st{};
+    if (int error=VfsLstatPathRaw(resolved,&st)) return error;
+    return VfsCheckAccessRaw(resolved,st,required,realIds);
+}
+
+int VfsAccess(Vnode* vn,uint8_t required,bool realIds)
+{
+    if (!vn) return -9;
+    if (required & ~7u) return -22;
+    FileMutationGuard lookup(false);
+    if (vn->ops && vn->ops->access) return vn->ops->access(vn,required,realIds);
+    return required ? -95 : 0;
 }
 
 int VfsResolveDirectory(const char* path,char* resolved,uint32_t size)
