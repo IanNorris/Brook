@@ -37,6 +37,7 @@
 #include "pipe.h"
 #include "memory/heap.h"
 #include "memory/object_cache.h"
+#include "epoll_diagnostics.h"
 #include "compositor.h"
 #include "window.h"
 #include "gpu_app.h"
@@ -8780,8 +8781,36 @@ struct EpollWalkOwner {
         if (!g_epollWalkCache.Release(walk)) kfree(walk);
     }
 };
+static bool g_epollDiagEnabled = false;
+static EpollDiagSnapshot g_epollDiag[MAX_PROCESSES]{};
+void EpollDiagEnable(bool enabled) { __atomic_store_n(&g_epollDiagEnabled, enabled, __ATOMIC_RELEASE); }
+bool EpollDiagEnabled() { return __atomic_load_n(&g_epollDiagEnabled, __ATOMIC_ACQUIRE); }
+bool EpollDiagRead(unsigned pid, EpollDiagSnapshot* output) {
+    if (pid >= MAX_PROCESSES || !output) return false;
+    const auto& row = g_epollDiag[pid];
+    const uint64_t incarnation = __atomic_load_n(&row.incarnation, __ATOMIC_ACQUIRE);
+    if (!incarnation) return false;
+    for (unsigned i = 0; i < EpDiagCount; ++i)
+        output->counters[i] = __atomic_load_n(&row.counters[i], __ATOMIC_RELAXED);
+    output->incarnation = incarnation;
+    return incarnation == __atomic_load_n(&row.incarnation, __ATOMIC_ACQUIRE);
+}
+static EpollDiagSnapshot* EpollDiagFor(Process* proc) {
+    if (!EpollDiagEnabled() || proc->pid >= MAX_PROCESSES) return nullptr;
+    auto* row = &g_epollDiag[proc->pid];
+    // One live task owns a PID. Invalidate before reusing its diagnostic row.
+    if (__atomic_load_n(&row->incarnation, __ATOMIC_RELAXED) != proc->incarnation) {
+        __atomic_store_n(&row->incarnation, 0, __ATOMIC_RELEASE);
+        for (auto& counter : row->counters) __atomic_store_n(&counter, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&row->incarnation, proc->incarnation, __ATOMIC_RELEASE);
+    }
+    return row;
+}
+static void EpollDiagAdd(EpollDiagSnapshot* row, EpollDiagCounter metric) {
+    if (row) __atomic_fetch_add(&row->counters[metric], 1, __ATOMIC_RELAXED);
+}
 static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
-                          EpollEvent* events, int maxevents) {
+                          EpollEvent* events, int maxevents, EpollDiagSnapshot* diag) {
     EpollGraphGuard guard;
     walk->clearMemo();
     int n = 0;
@@ -8790,7 +8819,21 @@ static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
         if (e.fd < 0) continue;
         if (!walk->pin(e.fd)) { ep->entries[i].fd = -1; continue; }
         uint32_t ready = walk->ready(e.fd, e.events, 0);
-        if (ready) { events[n].events = ready; events[n++].data.u64 = e.data; }
+        if (ready) {
+            events[n].events = ready; events[n++].data.u64 = e.data;
+            if (diag) {
+                if (ready & EPOLLIN) EpollDiagAdd(diag, EpScanRead);
+                if (ready & EPOLLOUT) EpollDiagAdd(diag, EpScanWrite);
+                if (ready & EPOLLHUP) EpollDiagAdd(diag, EpScanHup);
+                if (ready & EPOLLERR) EpollDiagAdd(diag, EpScanError);
+                if (e.events & EPOLLET) EpollDiagAdd(diag, EpScanEdge);
+                if (e.events & EPOLLONESHOT) EpollDiagAdd(diag, EpScanOneShot);
+                __atomic_store_n(&diag->counters[EpLastFd], e.fd, __ATOMIC_RELAXED);
+                __atomic_store_n(&diag->counters[EpLastType], static_cast<uint64_t>(walk->pins[e.fd]->type), __ATOMIC_RELAXED);
+                __atomic_store_n(&diag->counters[EpLastRequested], e.events, __ATOMIC_RELAXED);
+                __atomic_store_n(&diag->counters[EpLastReturned], ready, __ATOMIC_RELAXED);
+            }
+        }
     }
     return n;
 }
@@ -8891,15 +8934,19 @@ static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
 
 static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                                 EpollEvent* kEvents, int maxevents,
-                                int timeout_ms)
+                                int timeout_ms, EpollDiagSnapshot* diag)
 {
     const uint64_t deadline = WaitDeadlineNs(timeout_ms < 0 ? ~0ULL : static_cast<uint64_t>(timeout_ms));
+    bool firstScan = true;
     for (;;) {
+        EpollDiagAdd(diag, EpIterations);
         EpollWalkOwner state(proc);
         auto* walk = state.walk;
         if (!walk) return -ENOMEM;
-        int n = EpollScanReady(walk, ep, kEvents, maxevents);
-        if (n > 0 || timeout_ms == 0) return n;
+        int n = EpollScanReady(walk, ep, kEvents, maxevents, diag);
+        if (n > 0) { EpollDiagAdd(diag, firstScan ? EpInitialReady : EpLaterReady); return n; }
+        if (timeout_ms == 0) { EpollDiagAdd(diag, EpTimeouts); return 0; }
+        firstScan = false;
         {
             EpollGraphGuard guard;
             walk->clearMemo();
@@ -8965,7 +9012,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         registerWaiters();
         // The graph mutex can sleep. Arm the timeout only after this scan:
         // SchedulerUnblock clears wakeupTick when granting a contended mutex.
-        n = EpollScanReady(walk, ep, kEvents, maxevents);
+        n = EpollScanReady(walk, ep, kEvents, maxevents, diag);
         if (!n && !HasPendingSignals() && (timeout_ms < 0 || ClockNowNs(1) < deadline)) {
             uint64_t wakeAt = WaitWakeupTick(deadline, 100);
             for (int fd = 0; fd < EPOLL_MAX_FDS; fd++) {
@@ -8981,14 +9028,17 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                 if (timer->armed && timer->nextExpiry < wakeAt) wakeAt = timer->nextExpiry;
             }
             proc->wakeupTick = wakeAt;
+            EpollDiagAdd(diag, EpBlocks);
             SchedulerBlockInterruptible(proc);
         }
         unregisterWaiters();
-        if (HasPendingSignals()) return -EINTR;
-        if (n > 0) return n;
-        n = EpollScanReady(walk, ep, kEvents, maxevents);
-        if (n > 0) return n;
-        if (timeout_ms >= 0 && ClockNowNs(1) >= deadline) return 0;
+        if (HasPendingSignals()) { EpollDiagAdd(diag, EpInterrupts); return -EINTR; }
+        if (n > 0) { EpollDiagAdd(diag, EpLaterReady); return n; }
+        n = EpollScanReady(walk, ep, kEvents, maxevents, diag);
+        if (n > 0) { EpollDiagAdd(diag, EpLaterReady); return n; }
+        if (timeout_ms >= 0 && ClockNowNs(1) >= deadline) {
+            EpollDiagAdd(diag, EpTimeouts); return 0;
+        }
         // Release pins only after unregistering the exact flattened leaves.
     }
 }
@@ -9035,9 +9085,12 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
         kmalloc(sizeof(EpollEvent) * static_cast<uint32_t>(maxevents)));
     if (!kEvents) return -ENOMEM;
 
+    auto* diag = EpollDiagFor(proc);
+    EpollDiagAdd(diag, EpCalls);
+    if (static_cast<int>(static_cast<int64_t>(timeout_ms)) == 0) EpollDiagAdd(diag, EpZeroTimeout);
     int n = epoll_wait_impl(proc, ep, kEvents,
                              static_cast<int>(maxevents),
-                             static_cast<int>(static_cast<int64_t>(timeout_ms)));
+                             static_cast<int>(static_cast<int64_t>(timeout_ms)), diag);
 
     if (n > 0) {
         if (eventsAddr < 0x1000) {

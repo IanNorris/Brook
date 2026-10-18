@@ -2140,3 +2140,47 @@ serial acceptance and offline filesystem checks pass for both epoll VMs. Exact
 manifests, repeated reports and `epoll-cache-comparison-20261018.json` remain in
 ignored `build/workloads/`. Browser responsiveness, repeated ready-event causes,
 normal-launcher Firefox audio and live network behavior still need retesting.
+
+The following native review, `browser-cache-review-20261018`, used that exact
+candidate kernel. The user reported substantially better Firefox loading and
+responsiveness, while Chromium never loaded the YouTube home page. Live timing
+intervals (10.34 versus 10.28 host seconds) show about 23% fewer allocations/sec,
+91% fewer allocator search headers/sec, 94% fewer allocator lock-wait cycles/sec
+and 85% fewer lock-held cycles/sec; measured QEMU host CPU use fell about 15%.
+These user-driven pages/phases were not synchronized, so those figures are
+observations rather than controlled browser speedup claims. The second CPU
+capture dropped 881,246 events; its export now carries explicit quality fields.
+Firefox also logged an AudioIPC stream error. Browser audio remains unaccepted.
+Both windows closed, but the VM was stopped before the pending Firefox job exit
+observation completed; clean browser exit is unverified. Checked guest sync,
+launcher exit, serial acceptance and all three offline filesystem checks passed.
+The run is retained as diagnostic evidence rather than a clean browser seed.
+
+An isolated follow-up (`epoll-cache-diagnostics-20261018`, kernel
+`b9a59a3f...04c`) adds runtime-disabled, bounded per-task epoll counters.
+Use the bridge guest debug command `epoll diag on`, `epoll diag status`, and
+`epoll diag off`. Status returns the eight tasks with most recorded calls;
+rows carry task incarnations so clients can reject PID reuse. Counts are
+cumulative per incarnation, with readiness observations counted at each scan.
+Disabling prevents new waits from recording; already-running waits can finish
+their counters. This does not log or allocate on the measured hot path.
+
+Guest checks verify 4,004 calls with 4,000 initial-ready deliveries and four
+zero-timeout expirations, disabled-call stability, nested epoll behavior and heap
+integrity. All 35 hosted tests pass. Normal-launcher Firefox, using a candidate
+packaged ALSA configuration and unchanged sandbox, played a controlled media
+clip: one ten-second capture had a 370 ms silent interval, while a replay had
+none. Audio remains unaccepted. During replay, three threads each made
+359,000–421,000 epoll calls in approximately twelve seconds, almost all returning
+immediately for `EPOLLIN|EPOLLET` eventfd watches, with no blocking. Eventfd ET
+is currently handled as LT; this is a concrete correctness/performance target.
+Firefox subsequently exited with code zero and no surviving group tasks;
+checked shutdown, serial audit and all three offline filesystem checks pass.
+
+`scripts/workloads/eventfd_edges.py` supplies a Linux reference for undrained
+notifications, writes while readable, semaphore and writable notifications,
+independent/rearmed watches, truncated batches, non-consuming nested readiness,
+failed output copies, saturation and LT compatibility. Its eight groups pass
+on the Linux host. Guest acceptance of the ET fix is still pending; this probe
+does not establish ET support for other descriptor types, concurrent delivery,
+signal interruption or blocked-writer cancellation.

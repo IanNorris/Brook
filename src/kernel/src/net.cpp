@@ -5,6 +5,7 @@
 
 #include "net.h"
 #include "tcp.h"
+#include "epoll_diagnostics.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "scheduler.h"
@@ -3279,6 +3280,44 @@ struct BridgeReply {
     void send() {data[size]=0;DebugChannelSend(data);}
 };
 
+static void DebugEpollDiagnostics()
+{
+    struct Row { unsigned pid; EpollDiagSnapshot data; } top[8]{};
+    for (unsigned pid = 0; pid < MAX_PROCESSES; ++pid) {
+        EpollDiagSnapshot snapshot{};
+        if (!EpollDiagRead(pid, &snapshot) || !snapshot.counters[EpCalls]) continue;
+        for (unsigned slot = 0; slot < 8; ++slot) {
+            if (snapshot.counters[EpCalls] <= top[slot].data.counters[EpCalls]) continue;
+            for (unsigned next = 7; next > slot; --next) top[next] = top[next - 1];
+            top[slot] = {pid, snapshot}; break;
+        }
+    }
+    static const char* names[EpDiagCount] = {
+        "calls", "zero_timeout", "iterations", "initial_ready", "later_ready",
+        "timeouts", "interrupts", "block_attempts", "scan_read", "scan_write", "scan_hup",
+        "scan_error", "scan_edge", "scan_oneshot", "last_fd", "last_type",
+        "last_requested", "last_returned"
+    };
+    BridgeReply header;
+    header.text("{\"enabled\":"); header.text(EpollDiagEnabled() ? "true" : "false");
+    header.text(",\"scope\":\"rolling counters for calls started while enabled; PID incarnation guards reuse; scans are not deliveries\",\"top\":[");
+    header.send();
+    bool first = true;
+    for (const auto& row : top) {
+        if (!row.data.counters[EpCalls]) break;
+        BridgeReply reply;
+        if (!first) reply.text(",");
+        first = false;
+        reply.text("{"); reply.field("pid", row.pid); reply.text(",");
+        reply.field("incarnation", row.data.incarnation);
+        for (unsigned field = 0; field < EpDiagCount; ++field) {
+            reply.text(","); reply.field(names[field], row.data.counters[field]);
+        }
+        reply.text("}"); reply.send();
+    }
+    DebugChannelSend("]}\n");
+}
+
 // Process-context only: pin completed AS identities without following a raw
 // proc->addressSpace pointer that a concurrent exec could retire.
 static void DebugMemoryCensus()
@@ -3471,6 +3510,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap poison on|off - runtime alloc/free poison (default off)\n"
             "  heap timing on|off|reset|status - allocator raw-cycle counters (default off)\n"
             "  heap check      - validate heap block metadata\n"
+            "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
@@ -3688,6 +3728,12 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         char report[768];
         HeapTimingFormat(report, sizeof(report));
         DebugChannelSend(report);
+    }
+    else if (NetStrEq(cmd, "epoll diag on") || NetStrEq(cmd, "epoll diag off") ||
+             NetStrEq(cmd, "epoll diag status")) {
+        if (NetStrEq(cmd, "epoll diag on")) EpollDiagEnable(true);
+        if (NetStrEq(cmd, "epoll diag off")) EpollDiagEnable(false);
+        DebugEpollDiagnostics();
     }
     else if (NetStrEq(cmd, "heap check")) {
         DebugChannelSend(HeapCheckIntegrity() ? "heap integrity: OK\n" : "heap integrity: CORRUPT\n");
