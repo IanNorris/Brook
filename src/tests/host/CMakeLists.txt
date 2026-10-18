@@ -45,6 +45,8 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_drm_map_tokens)
+set_tests_properties(test_drm_map_tokens PROPERTIES TIMEOUT 15)
 add_host_test(test_window_surfaces)
 target_compile_options(test_window_surfaces PRIVATE
     -Wno-unused-parameter -Wno-attributes -Wno-misleading-indentation -Wno-error=extra

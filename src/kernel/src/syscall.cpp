@@ -15,6 +15,7 @@
 #include "process.h"
 #include "desktop_identity.h"
 #include "exec_limits.h"
+#include "drm_map_tokens.h"
 #include "exec_image.h"
 #include "fpu_irq.h"
 #include "scheduler.h"
@@ -2859,6 +2860,7 @@ static bool DrmSysIsDir(const char* path) {
 // Mesa's GL3 streaming buffers exceed 256 live objects during first present.
 // Reconstructed BRO-227 fix (06a8d07); keep headroom for console/UI transitions.
 static constexpr uint32_t DRM_MAX_GEM = 2048;
+static DrmMapTokenAllocator g_drmMapTokens;
 struct DrmGemObj {
     bool     used;
     uint32_t gres;     // host-global virgl resource id (== res_handle)
@@ -2869,6 +2871,7 @@ struct DrmGemObj {
     uint32_t backingBytes; // byte size of the backing allocation
     bool     imported;     // PRIME-imported: gres is owned by another context, so
                            // this GEM's teardown must NOT free the host resource.
+    uint64_t mapToken;     // issued once, never derived from a recyclable handle
 };
 
 // A DRM PRIME dmabuf handle, modelled as an unforgeable capability: it wraps a
@@ -2920,7 +2923,7 @@ static uint32_t DrmGemAlloc(DrmCtx* c, uint32_t gres, uint32_t size,
                             uint32_t stride, uint32_t w, uint32_t h) {
     for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
         if (c->gem[i].used) continue;
-        c->gem[i] = { true, gres, size, stride, w, h, 0, 0, false };
+        c->gem[i] = { true, gres, size, stride, w, h, 0, 0, false, 0 };
         return i + 1;
     }
     return 0;
@@ -2931,7 +2934,7 @@ static uint32_t DrmGemAllocImported(DrmCtx* c, uint32_t gres, uint32_t size,
                                     uint32_t stride, uint32_t w, uint32_t h) {
     for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
         if (c->gem[i].used) continue;
-        c->gem[i] = { true, gres, size, stride, w, h, 0, 0, true };
+        c->gem[i] = { true, gres, size, stride, w, h, 0, 0, true, 0 };
         return i + 1;
     }
     return 0;
@@ -3927,7 +3930,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (entry->type == FdType::DevDri) {
             auto* context=static_cast<DrmCtx*>(entry->handle);if (!context) return -ENODEV;
             DrmMappingGuard guard(context);
-            auto* gem=DrmGemGet(context,static_cast<uint32_t>(offset>>32));
+            auto* gem=DrmFindMapToken(context->gem,DRM_MAX_GEM,offset);
             if (!gem || !gem->backingKva) return -EINVAL;
             source->kernelBase=gem->backingKva;available=(gem->backingBytes+4095)&~uint64_t{4095};
         } else {
@@ -6073,7 +6076,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         // allocate guest backing for the resource and attach it to the host
         // virgl resource, so a later TRANSFER_FROM_HOST DMAs the rendered
         // pixels into pages that sys_mmap then maps into user space. The
-        // returned offset is a token encoding the GEM handle (see sys_mmap).
+        // returned offset identifies this GEM incarnation (see sys_mmap).
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpuMap)) ||
             !UserBufferWritable(arg, sizeof(DrmVirtgpuMap)))
             return -EFAULT;
@@ -6081,7 +6084,11 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         DrmGemObj* g = DrmGemGet(dctx, m.handle);
         if (!g) return -ENOENT;
         if (!DrmEnsureBacking(dctx, g)) return -ENOMEM;
-        m.offset = static_cast<uint64_t>(m.handle) << 32;  // decoded in sys_mmap
+        if (!g->mapToken) {
+            g->mapToken = g_drmMapTokens.Allocate();
+            if (!g->mapToken) return -ENOMEM;
+        }
+        m.offset = g->mapToken;
         return CopyToUser(arg, &m, sizeof(m)) ? 0 : -EFAULT;
     }
     default:

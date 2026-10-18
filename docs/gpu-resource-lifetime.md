@@ -71,6 +71,23 @@ unchanged UID1000/GID100 document fixtures. See
 This is one controlled Quake/OpenTTD cycle; repeated Quake/STK acceptance and
 host resource reclamation remain open.
 
+The subsequent native review (`c9adad6cc3624730aabf0530cf34d30f`, same kernel,
+eight CPUs and 4 GiB) did not pass mixed-application acceptance. Ian reported
+STK crashing and Chromium never finishing loading. Serial output records
+physical-page exhaustion, failed 64 MiB GPU backing allocations and user page
+faults. Chromium and STK had exited by the later process census. This does not
+establish which allocations caused the peak, or that host ID exhaustion caused
+these failures. A captured Firefox surface was blank and Gallery reported a
+truncated NAR download; their relationship to the exhaustion is unproven.
+
+After handback, Firefox and Gallery launch lineages drained and audio streams
+were empty. Checked shutdown completed and QEMU's supervisor recorded exit zero;
+the user-owned outer launcher's exit was not independently observed. Offline
+data/Nix/FAT checks passed and nine document hashes and UID1000/GID100 ownership
+were unchanged. Private evidence is under
+`build/workloads/prime-review-failure-20261019/`. Retain this as failed workload
+acceptance despite the clean shutdown and filesystem checks.
+
 Existing disk images need both the rebuilt kernel and rebuilt `waylandd`:
 the kernel now returns shared handles, and the server counts their buffer owners.
 The prepared private user review preserves the prior user packages/profiles;
@@ -88,6 +105,37 @@ committed or redistributed.
 
 ## Required ownership conversion
 
+### Stable mmap offsets
+
+MAP offsets now come from a global monotonic page-aligned allocator, stored in
+the live GEM incarnation. An offset cannot resolve a reused GEM slot or a
+different DRM file. Repeated MAP on the same live GEM returns its issued offset.
+The allocator saturates rather than wrapping; it does not recycle host IDs.
+
+The old kernel reproduced slot/file aliasing in session
+`3a02d8cfe57349568324b496609c7f1a`: all three MAPs returned `0x100000000`.
+Candidate session `7344a308ce474cb983a90a2e5d773966`, kernel SHA-256
+`e24878bbb930b5509435297e1f0f479f0e0572e04744754545dad408a2ba1d0f`,
+returned distinct offsets and rejected stale offsets. Existing mappings retained
+their contents through GEM close, final DRM descriptor close, fork sharing and
+parent unmap while the child retained its mapping. The Python probe explicitly
+uses `trackfd=False`; otherwise Python's hidden duplicated descriptor would
+prevent testing final DRM descriptor close.
+
+The candidate also passed four byte-transfer cases and the 3,000-import PRIME
+probe, including 256 concurrent close/import attempts (14 pinned imports, 242
+clean rejections, no errors). Both runs have complete tracked command output,
+drained job lineages, checked shutdown, owned launcher exit zero, offline
+data/Nix/FAT checks returning zero and nine unchanged document fixtures. See
+`build/workloads/drm-map-token-20261019/acceptance-audit.json`. All 46 kernel
+host suites and supported compiled entry/startup audits passed.
+
+These offsets fix identity only. They do not pin the underlying resource in
+the interval between GEM lookup and installing mapping-page references, share
+PRIME backing correctly, or authorize host resource reclamation.
+
+### Shared resources and mappings
+
 Use one shared resource object, independent of recyclable GEM table slots. It
 owns immutable geometry, backing allocation and driver identity/incarnation.
 GEM handles, PRIME capabilities, imported handles, active operations and VMAs
@@ -103,8 +151,8 @@ For mappings, acquire the resource reference under `DrmCtx::mappingLock` while
 resolving the GEM. Store it in `DeviceMappingBacking` and release it from that
 mapping backing's final callback. Existing `MappingBacking` ownership then
 carries the resource through preparation, fork, splitting and unmapping. This
-also protects the interval before physical-page pins are installed. Give mmap
-tokens stable object identity so an old token cannot map a recycled GEM slot.
+also protects the interval before physical-page pins are installed. Preserve
+the stable mmap-offset identity when converting GEMs to shared resources.
 
 ## Presentation completion
 

@@ -85,7 +85,7 @@ commit retry. The guest protocol and its 220-byte command bound are unchanged.
 The controlled old-kernel mmap probe used 13 upload connections for 98 PUTs and
 completed its tracked job in 13.72 seconds. This establishes delivery and
 connection counts, not a comparison against the previous guest upload time.
-Host regression coverage passed 253 tests with five existing optional skips;
+The 253-test host regression run completed successfully with five skips;
 evidence is under `build/workloads/drm-map-token-20261019/baseline/` and
 `build/vm-bridge-batch-host-tests-20261019.log`.
 
