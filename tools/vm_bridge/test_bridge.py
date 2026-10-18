@@ -16,6 +16,33 @@ import common
 import server
 
 
+class ProfileLossTests(unittest.TestCase):
+    def test_producer_drops_are_visible_despite_complete_export(self):
+        result = server.profile_event_summary(
+            'PROF_BEGIN 8 100\nP 0 1 0 0 ffff\nCS 1 0 1 2\nPROF_END 2 725094\n')
+        self.assertEqual(result['dropped_event_count'], 725094)
+        self.assertEqual(result['sample_count'], 1)
+        self.assertEqual(result['context_switch_count'], 1)
+        self.assertTrue(result['event_count_matches'])
+        self.assertTrue(result['lossy'])
+
+    def test_missing_records_are_distinct_from_producer_drops(self):
+        result = server.profile_event_summary('PROF_BEGIN 1 0\nP 0 1 0 1 1000\nPROF_END 2 0\n')
+        self.assertEqual(result['dropped_event_count'], 0)
+        self.assertFalse(result['event_count_matches'])
+        self.assertTrue(result['lossy'])
+
+    def test_complete_lossless_capture(self):
+        result = server.profile_event_summary('PROF_BEGIN 1 0\nP 0 1 0 1 1000\nPROF_END 1 0\n')
+        self.assertFalse(result['lossy'])
+
+    def test_incomplete_reversed_or_multiple_captures_rejected(self):
+        for text in ('PROF_BEGIN 1 0\n', 'PROF_END 0 0\nPROF_BEGIN 1 0\n',
+                     'PROF_BEGIN 1 0\nPROF_END 0 0\n' * 2):
+            with self.subTest(text=text), self.assertRaises(RuntimeError):
+                server.profile_event_summary(text)
+
+
 class CpuSelectionTests(unittest.TestCase):
     def test_hmp_request_carries_cpu_for_every_command(self):
         qmp = object.__new__(common.QMP)

@@ -516,6 +516,27 @@ def guest_run(session, command=None, argv=None, cwd="/data/home", env=None, uid=
         return result
 
 
+def profile_event_summary(content):
+    """Expose producer losses separately from export/conversion success."""
+    begin = re.findall(r"^PROF_BEGIN \d+ \d+\s*$", content, re.M)
+    end = re.findall(r"^PROF_END (\d+) (\d+)\s*$", content, re.M)
+    if len(begin) != 1 or len(end) != 1:
+        raise RuntimeError("Profile needs one complete begin/end capture")
+    start = content.index("PROF_BEGIN ")
+    finish = content.index("PROF_END ")
+    if finish <= start:
+        raise RuntimeError("Profile end precedes begin")
+    records = content[start:finish]
+    samples = len(re.findall(r"^P ", records, re.M))
+    switches = len(re.findall(r"^CS ", records, re.M))
+    reported, dropped = map(int, end[0])
+    matches = samples + switches == reported
+    return {"sample_count": samples, "context_switch_count": switches,
+            "reported_event_count": reported, "dropped_event_count": dropped,
+            "event_count_matches": matches, "lossy": dropped > 0 or not matches,
+            "quality_note": "Producer drops and count mismatches limit interpretation; IRQ-masked time is not sampled uniformly"}
+
+
 def profile(session, action="status", duration_ms=1000, guest_timeout=8, **_):
     if action not in {"start", "stop", "status", "export"} or not 100 <= duration_ms <= 30000:
         raise ValueError("Invalid profile action/duration")
@@ -541,8 +562,7 @@ def profile(session, action="status", duration_ms=1000, guest_timeout=8, **_):
         if result.returncode:
             raise RuntimeError(result.stderr.decode(errors="replace")[-2048:])
         content = path.read_text(errors="replace")
-        if "PROF_BEGIN" not in content or "PROF_END" not in content:
-            raise RuntimeError("Profile is incomplete (no complete begin/end record)")
+        summary = profile_event_summary(content)
         output = path.with_suffix(".speedscope.json")
         if hashlib.sha256(Path(data["kernel"]).read_bytes()).hexdigest() != data["kernel_sha256"]:
             raise RuntimeError("Saved run kernel changed; refusing incorrect profile symbolization")
@@ -550,8 +570,7 @@ def profile(session, action="status", duration_ms=1000, guest_timeout=8, **_):
                                     str(path), str(output), "--elf", data["kernel"]],
                                    capture_output=True, timeout=30)
         return {"profile": str(path), "speedscope": str(output) if converted.returncode == 0 else None,
-                "sample_count": len(re.findall(r"^P ", content, re.M)),
-                "context_switch_count": len(re.findall(r"^CS ", content, re.M)),
+                **summary,
                 "kernel_sha256": data["kernel_sha256"], "conversion_error": converted.stderr.decode(errors="replace")[-2048:]}
 
 

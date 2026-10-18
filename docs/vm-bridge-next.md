@@ -303,6 +303,14 @@ summary plus raw/Speedscope references. Preserve the exact kernel/symbol identit
 sample count, duration and context-switch data. Label sampled CPU percentages
 separately from wall time; allow deferred completion by operation ID.
 
+Implemented export-quality fields: recorded sample/context-switch counts,
+producer-reported event count, dropped-event count, count agreement and `lossy`.
+A complete file or successful Speedscope conversion does not imply lossless
+capture. Export rejects incomplete/reversed/multiple capture boundaries; a
+count mismatch is retained and explicitly flagged. IRQ-masked regions remain
+unevenly sampled even when no records are dropped. The browser review retained
+233,584 events and dropped 725,094, so this limit must travel with the artifact.
+
 Add audio capture-and-analysis returning activity, PCM format/frame count, RMS,
 waveform reference and analysis limitations together. Zero captured frames means
 an inactive/unavailable stream, not a measured duration of silent PCM. Keep host

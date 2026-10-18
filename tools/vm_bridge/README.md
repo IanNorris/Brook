@@ -69,7 +69,7 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_job` | Inspect/wait for an `operation_id`, with independent stdout/stderr byte cursors and real exit/descendant/EOF state. Does not execute or resume commands. |
 | `vm_guest` | Existing window/process listings and focus by window index (the `pid` argument). |
 | `vm_stats` | Usable RAM/free/used and process counts; p50/p90/p95/max of the recent 256 compositor-loop intervals using the millisecond guest clock. Optional `memory_details: true` adds a rolling address-space census. Not app GPU or physical scanout timings. |
-| `vm_profile` | `start` with `duration_ms`, `stop`, `status`, `export`. CPU samples and context-switch events; export after IDLE to raw/Speedscope artifacts using the run's immutable kernel ELF. |
+| `vm_profile` | `start` with `duration_ms`, `stop`, `status`, `export`. Export after IDLE using the run's immutable kernel ELF. Returns raw/Speedscope references, sample/switch counts, producer event/drop counts, count agreement and `lossy`; conversion success does not establish lossless capture. |
 | `vm_debug` | Current vCPU registers or up to 1 MiB physical/virtual memory. Virtual addresses use the selected vCPU's current translation. RAM-only checks exclude MMIO; memory reads pause vCPUs and restore prior running state. Devices may still run. |
 | `vm_record` | Asynchronous start/status/stop of bounded VM-only H.264/AAC recording through a private display stream. Requires the pinned host encoder; see [setup and acceptance](../../docs/vm-recording.md). |
 | `vm_audio_capture` | 0.1–10 seconds of QEMU PCM WAV with format, frames and host monotonic interval. No microphone. Launcher watchdog bounds abandoned recordings. |
