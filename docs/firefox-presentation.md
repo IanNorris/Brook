@@ -153,3 +153,11 @@ producer drops. Short windows and IRQ-masking bias still prevent an unbiased
 CPU/blocked-time attribution. Next diagnostics should connect Wayland callback
 requests, timer dispatch, client commits and native display updates; neither
 compositor-loop intervals nor browser frame totals prove actual video FPS.
+
+## Timerfd follow-up
+
+The [timerfd clock investigation](timerfd-clock.md) identifies the absolute
+clock/LAPIC mismatch behind the roughly one-Hz Wayland frame timer. The final
+candidate restores controlled single-browser video callbacks to about 23–24
+per page second and passes short audio captures. Concurrent playback remains
+slow, and these counters are not independently observed display FPS.

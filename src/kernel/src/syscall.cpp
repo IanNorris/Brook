@@ -6,6 +6,7 @@
 
 #include "syscall.h"
 #include "posix_timer.h"
+#include "timerfd_state.h"
 #include "busybox_applets.h"
 #include "cpu.h"
 #include "gdt.h"
@@ -472,17 +473,39 @@ static constexpr uint32_t EFD_NONBLOCK  = 0x800;
 static constexpr int TFD_NONBLOCK     = 0x800;
 static constexpr int TFD_CLOEXEC      = 0x80000;
 static constexpr int TFD_TIMER_ABSTIME = 1;
-static constexpr uint64_t LAPIC_TICKS_PER_MS = 1; // LAPIC ticks ≈ 1ms each
-
+static uint64_t ClockNowNs(uint64_t clockid);
+static uint64_t WaitWakeupTick(uint64_t deadlineNs, uint64_t safetyMs);
+struct TimerWaitNode;
 struct TimerFdData {
-    volatile uint64_t expiryCount; // number of expirations since last read
-    uint64_t  intervalNs;          // interval in nanoseconds (0 = one-shot)
-    uint64_t  nextExpiry;          // absolute LAPIC tick of next expiry
-    int       clockId;
-    volatile uint32_t refCount;    // +1 per fd sharing this timer
-    bool      armed;
-    Process*  waiter;              // process blocked in read() or epoll
+    KMutex lock; // graph -> timer; no graph acquisition under this mutex
+    brook::TimerFdState state;
+    int clockId;
+    volatile uint32_t refCount;
+    TimerWaitNode* waiters;
+    uint64_t rearmGeneration;
 };
+struct TimerFdGuard {
+    TimerFdData* timer;
+    explicit TimerFdGuard(TimerFdData* t) : timer(t) { KMutexLock(&t->lock); }
+    ~TimerFdGuard() { KMutexUnlock(&timer->lock); }
+};
+static bool TimerFdReady(TimerFdData* timer) {
+    TimerFdGuard guard(timer);
+    timer->state.refresh(ClockNowNs(timer->clockId));
+    return timer->state.pending != 0;
+}
+// A selected-clock deadline is never a LAPIC tick or a monotonic timestamp.
+static uint64_t TimerFdDeadline(TimerFdData* timer, uint64_t* generation = nullptr) {
+    TimerFdGuard guard(timer);
+    const uint64_t now = ClockNowNs(timer->clockId);
+    timer->state.refresh(now);
+    if (generation) *generation = __atomic_load_n(&timer->rearmGeneration, __ATOMIC_RELAXED);
+    const uint64_t mono = ClockNowNs(1);
+    if (timer->state.pending) return mono;
+    if (!timer->state.armed) return ~0ULL;
+    const uint64_t remaining = timer->state.deadline - now;
+    return remaining > ~0ULL - mono ? ~0ULL : mono + remaining;
+}
 
 struct EpollEvent {
     uint32_t events;
@@ -774,6 +797,57 @@ static inline bool TimerFdUnref(TimerFdData* tfd)
         return true;
     }
     return false;
+}
+
+// Each syscall owns its registrations and retains the timer independently of
+// numeric fd reuse. Rearm/disarm wakes every reader, poller and epoll waiter.
+struct TimerWaitNode {
+    TimerFdData* timer;
+    Process* process;
+    TimerWaitNode* nextTimer;
+    TimerWaitNode* nextGroup;
+    uint64_t observedGeneration;
+};
+struct TimerWaitGroup {
+    TimerWaitNode* nodes = nullptr;
+    bool allocationFailed = false;
+    void add(TimerFdData* timer, Process* process) {
+        for (auto* n = nodes; n; n = n->nextGroup) if (n->timer == timer) return;
+        auto* n = static_cast<TimerWaitNode*>(kmalloc(sizeof(TimerWaitNode)));
+        if (!n) { allocationFailed = true; return; }
+        TimerFdRef(timer);
+        TimerFdGuard guard(timer);
+        *n = {timer, process, timer->waiters, nodes, 0};
+        timer->waiters = n; nodes = n;
+    }
+    uint64_t deadline(uint64_t outer) {
+        for (auto* n = nodes; n; n = n->nextGroup) {
+            const uint64_t candidate = TimerFdDeadline(n->timer, &n->observedGeneration);
+            if (candidate < outer) outer = candidate;
+        }
+        // A rearm wake can be consumed while acquiring a later timer's
+        // contended mutex. Check every snapshot again without sleeping locks.
+        // A rearm after this pass leaves pendingWakeup set until the block.
+        for (auto* n = nodes; n; n = n->nextGroup)
+            if (__atomic_load_n(&n->timer->rearmGeneration, __ATOMIC_ACQUIRE) != n->observedGeneration)
+                return ClockNowNs(1);
+        return outer;
+    }
+    ~TimerWaitGroup() {
+        while (nodes) {
+            auto* n = nodes; nodes = n->nextGroup;
+            {
+                TimerFdGuard guard(n->timer);
+                auto** link = &n->timer->waiters;
+                while (*link && *link != n) link = &(*link)->nextTimer;
+                if (*link) *link = n->nextTimer;
+            }
+            TimerFdUnref(n->timer); kfree(n);
+        }
+    }
+};
+static void TimerFdWakeLocked(TimerFdData* timer) {
+    for (auto* n = timer->waiters; n; n = n->nextTimer) WakeProcess(n->process);
 }
 
 static inline void EpollFdRef(EpollInstance* ep)
@@ -2584,45 +2658,26 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         auto* tfd = static_cast<TimerFdData*>(fde->handle);
         bool nonblock = (fde->statusFlags & 0x800) != 0;
 
-        // Poll for expiry
+        TimerWaitGroup waiters;
+        if (!nonblock) waiters.add(tfd, proc);
         for (;;) {
-            extern volatile uint64_t g_lapicTickCount;
-            uint64_t now = g_lapicTickCount;
-
-            // Check if timer has fired
-            if (tfd->armed && now >= tfd->nextExpiry) {
-                // Count how many intervals have elapsed
-                uint64_t elapsed = 1;
-                if (tfd->intervalNs > 0) {
-                    uint64_t intervalMs = tfd->intervalNs / 1000000ULL;
-                    if (intervalMs == 0) intervalMs = 1;
-                    uint64_t over = now - tfd->nextExpiry;
-                    elapsed = 1 + over / (intervalMs * LAPIC_TICKS_PER_MS);
-                    tfd->nextExpiry += elapsed * intervalMs * LAPIC_TICKS_PER_MS;
-                } else {
-                    tfd->armed = false; // one-shot
+            {
+                TimerFdGuard guard(tfd);
+                tfd->state.refresh(ClockNowNs(tfd->clockId));
+                if (tfd->state.pending) {
+                    const uint64_t total = tfd->state.pending;
+                    if (!CopyToUser(bufAddr, &total, sizeof(total))) return -EFAULT;
+                    tfd->state.pending = 0;
+                    return 8;
                 }
-
-                uint64_t total = __atomic_exchange_n(&tfd->expiryCount, 0, __ATOMIC_ACQ_REL) + elapsed;
-                __builtin_memcpy(reinterpret_cast<void*>(bufAddr), &total, 8);
-                return 8;
             }
-
-            uint64_t pending = __atomic_exchange_n(&tfd->expiryCount, 0, __ATOMIC_ACQ_REL);
-            if (pending > 0) {
-                __builtin_memcpy(reinterpret_cast<void*>(bufAddr), &pending, 8);
-                return 8;
-            }
-
             if (nonblock) return -EAGAIN;
-            if (!tfd->armed) return -EAGAIN;
-
-            // Block until next expiry
-            Process* self = ProcessCurrent();
-            tfd->waiter = self;
-            self->wakeupTick = tfd->nextExpiry;
-            SchedulerBlock(self);
-            tfd->waiter = nullptr;
+            if (HasPendingSignals()) return -EINTR;
+            // Assign only after every potentially sleeping timer lock. Pending
+            // wakeups close the rearm-between-snapshot-and-block race.
+            const uint64_t deadline = TimerFdDeadline(tfd);
+            proc->wakeupTick = WaitWakeupTick(deadline, waiters.allocationFailed ? 5 : 100);
+            SchedulerBlockInterruptible(proc);
             if (HasPendingSignals()) return -EINTR;
         }
     }
@@ -8029,10 +8084,7 @@ retry_poll:
             auto* tfd = static_cast<TimerFdData*>(fde->handle);
             if (fds[i].events & POLLIN)
             {
-                extern volatile uint64_t g_lapicTickCount;
-                bool fired = (tfd->expiryCount > 0) ||
-                             (tfd->armed && g_lapicTickCount >= tfd->nextExpiry);
-                if (fired) fds[i].revents |= POLLIN;
+                if (TimerFdReady(tfd)) fds[i].revents |= POLLIN;
             }
             if (fds[i].revents) ready++;
             continue;
@@ -8091,12 +8143,15 @@ retry_poll:
         // For pipe FDs, register as waiter on the pipe
         uint64_t waiterCap = nfds;
         uint64_t safetyMs = 50;
+        TimerWaitGroup timerWaiters;
         for (uint64_t i = 0; i < waiterCap; i++)
         {
             if (fds[i].fd < 0) continue;
             FdRef fde_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
             FdEntry* fde = fde_ref.get();
             if (!fde) continue;
+            if (fde->type == FdType::TimerFd && fde->handle && (fds[i].events & POLLIN))
+                timerWaiters.add(static_cast<TimerFdData*>(fde->handle), self);
             if (fde->type == FdType::DevDsp) safetyMs = 5; // Cached DMA readiness has no IRQ waiter yet.
             if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
             {
@@ -8146,6 +8201,9 @@ retry_poll:
             FdRef fde_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
             FdEntry* fde = fde_ref.get();
             if (!fde) continue;
+            if (fde->type == FdType::TimerFd && fde->handle && (fds[i].events & POLLIN) &&
+                TimerFdReady(static_cast<TimerFdData*>(fde->handle)))
+            { ready++; break; }
             if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN) && InputHasEvents())
             { ready++; break; }
             if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
@@ -8192,7 +8250,9 @@ retry_poll:
         {
             // Keep one absolute deadline across spurious wakes. Periodic
             // checks also service timerfds and descriptors without wait hooks.
-            self->wakeupTick = WaitWakeupTick(deadline, safetyMs);
+            const uint64_t timerDeadline = timerWaiters.deadline(deadline);
+            if (timerWaiters.allocationFailed) safetyMs = 5;
+            self->wakeupTick = WaitWakeupTick(timerDeadline, safetyMs);
             if (!HasPendingSignals() && (infinite || ClockNowNs(1) < deadline))
                 SchedulerBlockInterruptible(self);
 
@@ -8633,11 +8693,7 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
             int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
             readable = brook::SockPollReady(si, true, false);
         } else if (fde->type == FdType::TimerFd && fde->handle) {
-            // TimerFd is readable when its expiry count > 0 or timer has fired
-            auto* tfd = static_cast<TimerFdData*>(fde->handle);
-            extern volatile uint64_t g_lapicTickCount;
-            readable = (tfd->expiryCount > 0) ||
-                       (tfd->armed && g_lapicTickCount >= tfd->nextExpiry);
+            readable = TimerFdReady(static_cast<TimerFdData*>(fde->handle));
         } else if (fde->type == FdType::Vnode) {
             readable = true; // files always readable
         } else if (fde->type == FdType::DevTty && fde->handle) {
@@ -8977,6 +9033,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
             walk->clearMemo();
             walk->collect(ep);
         }
+        TimerWaitGroup timerWaiters;
         auto registerWaiters = [&]() {
             for (int wfd = 0; wfd < EPOLL_MAX_FDS; wfd++) {
                 FdEntry* fde = walk->pins[wfd];
@@ -8987,7 +9044,8 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                 } else if (fde->type == FdType::EventFd) {
                     static_cast<EventFdData*>(fde->handle)->epollWaiter = proc;
                 } else if (fde->type == FdType::TimerFd) {
-                    static_cast<TimerFdData*>(fde->handle)->waiter = proc;
+                    if (walk->masks[wfd] & EPOLLIN)
+                        timerWaiters.add(static_cast<TimerFdData*>(fde->handle), proc);
                 } else if (fde->type == FdType::Socket) {
                     int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
                     brook::SockSetPollWaiter(si, proc);
@@ -9017,9 +9075,6 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                 } else if (fde->type == FdType::EventFd) {
                     auto* efd = static_cast<EventFdData*>(fde->handle);
                     if (efd->epollWaiter == proc) efd->epollWaiter = nullptr;
-                } else if (fde->type == FdType::TimerFd) {
-                    auto* tfd = static_cast<TimerFdData*>(fde->handle);
-                    if (tfd->waiter == proc) tfd->waiter = nullptr;
                 } else if (fde->type == FdType::Socket) {
                     int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
                     brook::SockSetPollWaiter(si, nullptr);
@@ -9039,20 +9094,17 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         // SchedulerUnblock clears wakeupTick when granting a contended mutex.
         n = EpollScanReady(walk, ep, kEvents, maxevents, diag, eventsAddr);
         if (!n && !HasPendingSignals() && (timeout_ms < 0 || ClockNowNs(1) < deadline)) {
-            uint64_t wakeAt = WaitWakeupTick(deadline, 100);
+            uint64_t safetyMs = timerWaiters.allocationFailed ? 5 : 100;
             for (int fd = 0; fd < EPOLL_MAX_FDS; fd++) {
                 auto* fde = walk->pins[fd];
                 if (!walk->masks[fd] || !fde) continue;
                 if (fde->type == FdType::DevDsp) {
-                    const uint64_t audioWake = WaitWakeupTick(deadline, 5);
-                    if (audioWake < wakeAt) wakeAt = audioWake;
+                    safetyMs = 5;
                     continue;
                 }
-                if (fde->type != FdType::TimerFd) continue;
-                auto* timer = static_cast<TimerFdData*>(fde->handle);
-                if (timer->armed && timer->nextExpiry < wakeAt) wakeAt = timer->nextExpiry;
             }
-            proc->wakeupTick = wakeAt;
+            const uint64_t timerDeadline = timerWaiters.deadline(deadline);
+            proc->wakeupTick = WaitWakeupTick(timerDeadline, safetyMs);
             EpollDiagAdd(diag, EpBlocks);
             SchedulerBlockInterruptible(proc);
         }
@@ -9162,15 +9214,12 @@ static int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags,
     if (clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC)
         return -EINVAL;
 
+    if (flags & ~(TFD_NONBLOCK | TFD_CLOEXEC)) return -EINVAL;
     auto* tfd = static_cast<TimerFdData*>(kmalloc(sizeof(TimerFdData)));
     if (!tfd) return -ENOMEM;
-    tfd->expiryCount = 0;
-    tfd->intervalNs  = 0;
-    tfd->nextExpiry  = 0;
-    tfd->clockId     = static_cast<int>(clockid);
-    tfd->refCount    = 1;
-    tfd->armed       = false;
-    tfd->waiter      = nullptr;
+    __builtin_memset(tfd, 0, sizeof(*tfd));
+    tfd->clockId = static_cast<int>(clockid);
+    tfd->refCount = 1;
 
     int fd = FdAlloc(proc, FdType::TimerFd, tfd);
     if (fd < 0) { kfree(tfd); return -EMFILE; }
@@ -9183,71 +9232,48 @@ static int64_t sys_timerfd_create(uint64_t clockid, uint64_t flags,
     return fd;
 }
 
+static ITimerSpec TimerFdSnapshotLocked(TimerFdData* timer) {
+    const uint64_t now = ClockNowNs(timer->clockId);
+    timer->state.refresh(now);
+    const uint64_t remaining = timer->state.armed ? timer->state.deadline - now : 0;
+    ITimerSpec value{};
+    value.it_value.tv_sec = remaining / 1000000000ULL;
+    value.it_value.tv_nsec = remaining % 1000000000ULL;
+    value.it_interval.tv_sec = timer->state.interval / 1000000000ULL;
+    value.it_interval.tv_nsec = timer->state.interval % 1000000000ULL;
+    return value;
+}
 static int64_t sys_timerfd_settime(uint64_t fd, uint64_t flagsVal,
                                     uint64_t newValAddr, uint64_t oldValAddr,
                                     uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde || fde->type != FdType::TimerFd || !fde->handle) return -EBADF;
-    auto* tfd = static_cast<TimerFdData*>(fde->handle);
-
-    ITimerSpec newVal = {};
-    if (newValAddr < 0x1000) return -EFAULT;
-    __builtin_memcpy(&newVal, reinterpret_cast<const void*>(newValAddr), sizeof(newVal));
-
-    if (newVal.it_value.tv_sec < 0 || newVal.it_interval.tv_sec < 0 ||
-        newVal.it_value.tv_nsec < 0 || newVal.it_value.tv_nsec >= 1000000000LL ||
-        newVal.it_interval.tv_nsec < 0 || newVal.it_interval.tv_nsec >= 1000000000LL)
+    FdRef pin(proc, static_cast<int>(fd));
+    auto* fde = pin.get();
+    if (!fde) return -EBADF;
+    if (fde->type != FdType::TimerFd || !fde->handle) return -EINVAL;
+    // Wall-clock setting/cancellation is not implemented. Reject unsupported
+    // flags rather than claiming CANCEL_ON_SET behavior.
+    if (flagsVal & ~static_cast<uint64_t>(TFD_TIMER_ABSTIME)) return -EINVAL;
+    ITimerSpec value{};
+    if (!CopyFromUser(&value, newValAddr, sizeof(value))) return -EFAULT;
+    uint64_t initial, interval;
+    if (!brook::TimerFdNanoseconds(value.it_value.tv_sec, value.it_value.tv_nsec, &initial) ||
+        !brook::TimerFdNanoseconds(value.it_interval.tv_sec, value.it_interval.tv_nsec, &interval))
         return -EINVAL;
-
-    // Save old value if requested
-    if (oldValAddr) {
-        ITimerSpec oldVal = {};
-        if (tfd->armed) {
-            extern volatile uint64_t g_lapicTickCount;
-            uint64_t remaining = (tfd->nextExpiry > g_lapicTickCount)
-                ? (tfd->nextExpiry - g_lapicTickCount) : 0;
-            oldVal.it_value.tv_sec  = static_cast<int64_t>(remaining / 1000);
-            oldVal.it_value.tv_nsec = static_cast<int64_t>((remaining % 1000) * 1000000);
-            oldVal.it_interval.tv_sec  = static_cast<int64_t>(tfd->intervalNs / 1000000000ULL);
-            oldVal.it_interval.tv_nsec = static_cast<int64_t>(tfd->intervalNs % 1000000000ULL);
-        }
-        if (oldValAddr >= 0x1000)
-            __builtin_memcpy(reinterpret_cast<void*>(oldValAddr), &oldVal, sizeof(oldVal));
-    }
-
-    // Disarm if both it_value fields are zero
-    int64_t valueSec  = newVal.it_value.tv_sec;
-    int64_t valueNsec = newVal.it_value.tv_nsec;
-    if (valueSec == 0 && valueNsec == 0) {
-        tfd->armed = false;
-        tfd->expiryCount = 0;
-        return 0;
-    }
-
-    extern volatile uint64_t g_lapicTickCount;
-    uint64_t nowTick = g_lapicTickCount;
-    uint64_t valueMs = static_cast<uint64_t>(valueSec) * 1000ULL
-                       + static_cast<uint64_t>(valueNsec) / 1000000ULL;
-    if (valueMs == 0 && valueNsec != 0)
-        valueMs = 1;
-
-    if (flagsVal & TFD_TIMER_ABSTIME) {
-        // Convert absolute time to tick (rough: treat as ms from epoch offset)
-        tfd->nextExpiry = valueMs; // absolute - not great but acceptable for now
-    } else {
-        tfd->nextExpiry = nowTick + valueMs * LAPIC_TICKS_PER_MS;
-    }
-
-    uint64_t intervalSec  = static_cast<uint64_t>(newVal.it_interval.tv_sec);
-    uint64_t intervalNsec = static_cast<uint64_t>(newVal.it_interval.tv_nsec);
-    tfd->intervalNs = intervalSec * 1000000000ULL + intervalNsec;
-    tfd->armed = true;
-    tfd->expiryCount = 0;
-
+    auto* timer = static_cast<TimerFdData*>(fde->handle);
+    TimerFdGuard guard(timer);
+    const uint64_t now = ClockNowNs(timer->clockId);
+    if (initial && !(flagsVal & TFD_TIMER_ABSTIME) && initial > ~0ULL - now) return -EINVAL;
+    const ITimerSpec old = TimerFdSnapshotLocked(timer);
+    if (oldValAddr && !CopyToUser(oldValAddr, &old, sizeof(old))) return -EFAULT;
+    timer->state.interval = interval;
+    timer->state.pending = 0;
+    timer->state.armed = initial != 0;
+    timer->state.deadline = !initial ? 0 : (flagsVal & TFD_TIMER_ABSTIME) ? initial : now + initial;
+    __atomic_fetch_add(&timer->rearmGeneration, 1, __ATOMIC_RELEASE);
+    TimerFdWakeLocked(timer);
     return 0;
 }
 
@@ -9256,25 +9282,14 @@ static int64_t sys_timerfd_gettime(uint64_t fd, uint64_t currValAddr,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde || fde->type != FdType::TimerFd || !fde->handle) return -EBADF;
-    auto* tfd = static_cast<TimerFdData*>(fde->handle);
-
-    ITimerSpec curr = {};
-    if (tfd->armed) {
-        extern volatile uint64_t g_lapicTickCount;
-        uint64_t remaining = (tfd->nextExpiry > g_lapicTickCount)
-            ? (tfd->nextExpiry - g_lapicTickCount) : 0;
-        curr.it_value.tv_sec  = static_cast<int64_t>(remaining / 1000);
-        curr.it_value.tv_nsec = static_cast<int64_t>((remaining % 1000) * 1000000LL);
-        curr.it_interval.tv_sec  = static_cast<int64_t>(tfd->intervalNs / 1000000000ULL);
-        curr.it_interval.tv_nsec = static_cast<int64_t>(tfd->intervalNs % 1000000000ULL);
-    }
-
-    if (currValAddr < 0x1000) return -EFAULT;
-    __builtin_memcpy(reinterpret_cast<void*>(currValAddr), &curr, sizeof(curr));
-    return 0;
+    FdRef pin(proc, static_cast<int>(fd));
+    auto* fde = pin.get();
+    if (!fde) return -EBADF;
+    if (fde->type != FdType::TimerFd || !fde->handle) return -EINVAL;
+    auto* timer = static_cast<TimerFdData*>(fde->handle);
+    TimerFdGuard guard(timer);
+    const ITimerSpec value = TimerFdSnapshotLocked(timer);
+    return CopyToUser(currValAddr, &value, sizeof(value)) ? 0 : -EFAULT;
 }
 
 // ---------------------------------------------------------------------------

@@ -104,6 +104,11 @@ struct brook_wm_event {
 static struct wl_display *g_display = NULL;
 static volatile sig_atomic_t g_shutdown = 0;
 static int g_commit_count = 0;
+/* Opt-in diagnostics: no extra clock reads or logging in normal operation. */
+static int g_trace_frames;
+static uint64_t g_trace_surface_id, g_trace_ticks, g_trace_dispatches;
+static uint32_t g_trace_last_tick, g_trace_tick_max_ms, g_trace_last_report;
+static uint32_t g_trace_input_max_ms, g_trace_dispatch_max_ms;
 
 static uint32_t g_now_ms(void) {
     struct timespec ts;
@@ -205,6 +210,9 @@ static int is_dmabuf_buffer(struct wl_resource *buf);
 struct brook_frame_callback {
     struct wl_resource *resource;
     struct wl_list link;
+    struct brook_surface *surface;
+    uint32_t requested_ms, committed_ms;
+    int done;
 };
 
 struct brook_surface {
@@ -229,6 +237,9 @@ struct brook_surface {
 
     /* Requests become eligible only when their surface state is committed. */
     struct wl_list pending_frames, committed_frames;
+    uint64_t trace_id, trace_requests, trace_commits, trace_buffers;
+    uint64_t trace_done, trace_cancelled;
+    uint32_t trace_request_max_ms, trace_committed_max_ms;
 
     /* Latest set_title — copied so it survives the wayland string. */
     char title[64];
@@ -383,6 +394,7 @@ static void surface_damage(struct wl_client *c, struct wl_resource *r,
 }
 static void frame_callback_destroy(struct wl_resource *resource) {
     struct brook_frame_callback *callback = wl_resource_get_user_data(resource);
+    if (g_trace_frames && !callback->done) ++callback->surface->trace_cancelled;
     wl_list_remove(&callback->link);
     free(callback);
 }
@@ -392,12 +404,25 @@ static void surface_frame(struct wl_client *c, struct wl_resource *r, uint32_t i
     if (!callback) { wl_client_post_no_memory(c); return; }
     callback->resource = wl_resource_create(c, &wl_callback_interface, 1, id);
     if (!callback->resource) { free(callback); wl_client_post_no_memory(c); return; }
+    callback->surface = surface;
+    if (g_trace_frames) {
+        callback->requested_ms = g_now_ms();
+        ++surface->trace_requests;
+    }
     wl_list_insert(surface->pending_frames.prev, &callback->link);
     wl_resource_set_implementation(callback->resource, NULL, callback, frame_callback_destroy);
 }
 static void surface_send_frame_callbacks(struct brook_surface *surface, uint32_t now) {
     struct brook_frame_callback *callback, *next;
     wl_list_for_each_safe(callback, next, &surface->committed_frames, link) {
+        if (g_trace_frames) {
+            uint32_t requested = now - callback->requested_ms;
+            uint32_t committed = now - callback->committed_ms;
+            if (requested > surface->trace_request_max_ms) surface->trace_request_max_ms = requested;
+            if (committed > surface->trace_committed_max_ms) surface->trace_committed_max_ms = committed;
+            ++surface->trace_done;
+        }
+        callback->done = 1;
         wl_callback_send_done(callback->resource, now);
         wl_resource_destroy(callback->resource);
     }
@@ -406,6 +431,12 @@ static struct wl_event_source *g_frame_timer;
 static int frame_clock_tick(void *unused) {
     (void)unused;
     uint32_t now = g_now_ms();
+    if (g_trace_frames) {
+        if (g_trace_ticks && now - g_trace_last_tick > g_trace_tick_max_ms)
+            g_trace_tick_max_ms = now - g_trace_last_tick;
+        g_trace_last_tick = now;
+        ++g_trace_ticks;
+    }
     for (struct brook_surface *surface = g_surfaces; surface; surface = surface->next) {
         struct brook_surface *root = surface;
         while (root->subsurface_parent) root = root->subsurface_parent;
@@ -413,6 +444,24 @@ static int frame_clock_tick(void *unused) {
     }
     wl_event_source_timer_update(g_frame_timer, 16);
     return 0;
+}
+static void trace_frames_report(uint32_t now) {
+    if (!g_trace_frames || now - g_trace_last_report < 1000) return;
+    g_trace_last_report = now;
+    fprintf(stderr, "[wayland-frame] clock ms=%u ticks=%llu max_tick_gap_ms=%u dispatches=%llu max_dispatch_ms=%u max_input_ms=%u\n",
+            now, (unsigned long long)g_trace_ticks, g_trace_tick_max_ms,
+            (unsigned long long)g_trace_dispatches, g_trace_dispatch_max_ms, g_trace_input_max_ms);
+    for (struct brook_surface *s = g_surfaces; s; s = s->next) {
+        if (!s->trace_requests && !s->trace_buffers && !s->wm_id) continue;
+        struct brook_surface *root = s;
+        while (root->subsurface_parent) root = root->subsurface_parent;
+        fprintf(stderr, "[wayland-frame] surface=%llu object=%u wm=%u root_wm=%u requests=%llu commits=%llu buffers=%llu done=%llu cancelled=%llu pending=%d eligible=%d max_request_ms=%u max_committed_ms=%u\n",
+                (unsigned long long)s->trace_id, wl_resource_get_id(s->resource), s->wm_id, root->wm_id,
+                (unsigned long long)s->trace_requests, (unsigned long long)s->trace_commits,
+                (unsigned long long)s->trace_buffers, (unsigned long long)s->trace_done,
+                (unsigned long long)s->trace_cancelled, wl_list_length(&s->pending_frames),
+                wl_list_length(&s->committed_frames), s->trace_request_max_ms, s->trace_committed_max_ms);
+    }
 }
 static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r,
                                        struct wl_resource *reg) {
@@ -444,6 +493,11 @@ static void blit_to_window(struct brook_surface *s,
 static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     (void)c;
     struct brook_surface *s = wl_resource_get_user_data(r);
+
+    if (g_trace_frames) {
+        ++s->trace_commits;
+        if (s->pending_buffer) ++s->trace_buffers;
+    }
 
     if (s->window_geometry_pending) {
         s->window_geometry_w = s->pending_geometry_w;
@@ -484,6 +538,13 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     /* A bufferless commit still commits frame requests. Deliver them on the
      * shared frame clock, not synchronously from request dispatch. */
     if (!wl_list_empty(&s->pending_frames)) {
+        if (g_trace_frames) {
+            uint32_t now = g_now_ms();
+            struct brook_frame_callback *callback;
+            wl_list_for_each(callback, &s->pending_frames, link) {
+                callback->committed_ms = now;
+            }
+        }
         wl_list_insert_list(s->committed_frames.prev, &s->pending_frames);
         wl_list_init(&s->pending_frames);
     }
@@ -799,6 +860,7 @@ static void compositor_create_surface(struct wl_client *client,
                                       uint32_t id) {
     struct brook_surface *s = calloc(1, sizeof(*s));
     if (!s) { wl_client_post_no_memory(client); return; }
+    if (g_trace_frames) s->trace_id = ++g_trace_surface_id;
     struct wl_resource *sr = wl_resource_create(client, &wl_surface_interface,
                                                 wl_resource_get_version(res), id);
     if (!sr) { free(s); wl_client_post_no_memory(client); return; }
@@ -2721,6 +2783,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "[waylandd] starting (Phase D — kernel-WM unified)\n");
     int run_seconds = 0;
     for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--trace-frames")) g_trace_frames = 1;
         if ((!strcmp(argv[i], "--for") || !strcmp(argv[i], "--seconds"))
             && i + 1 < argc)
             run_seconds = atoi(argv[++i]);
@@ -2814,13 +2877,24 @@ int main(int argc, char **argv)
         if (g_shutdown) break;
         wl_display_flush_clients(g_display);
         for (int sub = 0; sub < 60 && !g_shutdown; ++sub) {
+            uint32_t input_start = g_trace_frames ? g_now_ms() : 0;
             pump_input_once();
+            uint32_t dispatch_start = g_trace_frames ? g_now_ms() : 0;
             int n = wl_event_loop_dispatch(loop, 16);
             if (n < 0) {
                 fprintf(stderr, "[waylandd] event loop error: %s\n", strerror(errno));
                 goto done;
             }
             wl_display_flush_clients(g_display);
+            if (g_trace_frames) {
+                uint32_t now = g_now_ms();
+                uint32_t input_ms = dispatch_start - input_start;
+                uint32_t dispatch_ms = now - dispatch_start;
+                if (input_ms > g_trace_input_max_ms) g_trace_input_max_ms = input_ms;
+                if (dispatch_ms > g_trace_dispatch_max_ms) g_trace_dispatch_max_ms = dispatch_ms;
+                ++g_trace_dispatches;
+                trace_frames_report(now);
+            }
         }
         if (run_seconds > 0 && (int)((g_now_ms() - loop_start) / 1000) >= run_seconds)
             break;

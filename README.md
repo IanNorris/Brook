@@ -90,8 +90,10 @@ the table distinguishes tested behavior from remaining limitations.
   markers across VM restart after fixing filesystem capacity reporting. Browser
   performance, intermittent audio stalls and real-site profile persistence remain
   under investigation. See [filesystem capacity acceptance](docs/filesystem-space.md).
-  [Presentation diagnostics](docs/firefox-presentation.md) now distinguish media
-  progress from slow video-frame callbacks and VM display output.
+  A [timerfd clock-domain repair](docs/timerfd-clock.md) restores roughly
+  23–24 video callbacks per page second on the controlled 24-fps local clip;
+  concurrent playback still slows down. [Presentation diagnostics](docs/firefox-presentation.md)
+  distinguish media progress, callback counters and VM display output.
   The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and
   remaining limits. At the pinned `37cccf60` permission checkpoint, both [full bootstrap paths](docs/bootstrap.md#40-suite-bootstrap-refresh-after-permission-checks-2026-10-18)

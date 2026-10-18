@@ -45,6 +45,13 @@ def analyze(rows, phase, interval=None):
         elif delta < 0:
             backwards += 1
         progress += delta
+    callback_rate = None
+    if all(isinstance(r['state'].get('rvfc'), (int, float)) and
+           not isinstance(r['state']['rvfc'], bool) and
+           math.isfinite(r['state']['rvfc']) and r['state']['rvfc'] >= 0 for r in rows):
+        if any(b['state']['rvfc'] < a['state']['rvfc'] for a, b in zip(rows, rows[1:])):
+            raise ValueError('Video callback counter reset within one phase')
+        callback_rate = (last['rvfc'] - first['rvfc']) / seconds
     return {'phase': phase, 'samples': len(rows), 'source_span_seconds': seconds,
             'receipt_span_seconds': max(arrival_times) - min(arrival_times),
             'out_of_order_receipts': reordered, 'media_loops': loops,
@@ -52,6 +59,7 @@ def analyze(rows, phase, interval=None):
             'media_seconds_per_page_second': progress / seconds,
             'total_video_frames_per_page_second': (last['frames'] - first['frames']) / seconds,
             'dropped_frames': last['dropped'] - first['dropped'],
+            'video_callbacks_per_page_second': callback_rate,
             'reported_presented_frames_per_page_second':
                 ((last['frames'] - last['dropped']) -
                  (first['frames'] - first['dropped'])) / seconds,

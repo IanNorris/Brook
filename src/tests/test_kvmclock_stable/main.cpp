@@ -1,4 +1,5 @@
 #include <cstdio>
+#include "../../kernel/src/timerfd_state.h"
 #include "../../kernel/src/clock_interval.h"
 #include "../../kernel/src/kvmclock.cpp"
 #include "../../kernel/src/rtc.cpp"
@@ -100,6 +101,33 @@ int main() {
     g_lapicRawTickCount+=1;g_lapicTickCount=0;
     CHECK(RtcNowNs()==fallbackEpoch+1000000000);
     CHECK(RtcNow()==fallbackEpoch/1000000000+1);
+
+    // The real timerfd accounting code, independent of scheduler tick phase.
+    TimerFdState timer{};
+    timer.armed=true;timer.deadline=16000001;
+    timer.refresh(16000000);CHECK(!timer.pending && timer.armed);
+    timer.refresh(16000001);CHECK(timer.pending==1 && !timer.armed);
+    timer.refresh(999999999);CHECK(timer.pending==1);
+    timer={};timer.armed=true;timer.deadline=100;timer.interval=7;
+    timer.refresh(120);CHECK(timer.pending==3 && timer.deadline==121);
+    timer.refresh(120);CHECK(timer.pending==3 && timer.deadline==121);
+    timer.refresh(121);CHECK(timer.pending==4 && timer.deadline==128);
+    timer.pending=0;timer.refresh(148);CHECK(timer.pending==3 && timer.deadline==149);
+    // Retain submillisecond periodic precision, never round interval to ticks.
+    timer={};timer.armed=true;timer.deadline=1000000000;timer.interval=100;
+    timer.refresh(1001000050);CHECK(timer.pending==10001 && timer.deadline==1001000100);
+    timer={};timer.armed=true;timer.deadline=0;timer.interval=1;
+    timer.refresh(~uint64_t(0));CHECK(timer.pending==~uint64_t(0) && !timer.armed);
+    timer={};timer.armed=true;timer.deadline=10;timer.pending=~uint64_t(0);
+    timer.refresh(10);CHECK(timer.pending==~uint64_t(0));
+    uint64_t ns=123;
+    CHECK(TimerFdNanoseconds(1,999999999,&ns) && ns==1999999999);
+    CHECK(!TimerFdNanoseconds(-1,0,&ns));
+    CHECK(!TimerFdNanoseconds(0,-1,&ns));
+    CHECK(!TimerFdNanoseconds(0,1000000000,&ns));
+    CHECK(!TimerFdNanoseconds(INT64_MAX,0,&ns));
+    CHECK(TimerFdNanoseconds(18446744073LL,709551615,&ns) && ns==~uint64_t(0));
+    CHECK(!TimerFdNanoseconds(18446744073LL,709551616,&ns));
 
     std::printf("PVCLOCK_STABLE %s\n",failures?"FAIL":"PASS");return failures?1:0;
 }

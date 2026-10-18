@@ -30,6 +30,18 @@ class BrowserMediaTests(unittest.TestCase):
         self.assertEqual(r['samples'], 2)
         self.assertIn('does not align', r['scope'])
 
+    def test_callbacks_are_distinct_from_non_dropped_frame_counts(self):
+        rows = [sample(1, 5, 1, 24), sample(3, 5, 3, 72, 2)]
+        rows[0]['state']['rvfc'] = 1
+        rows[1]['state']['rvfc'] = 3
+        result = analyze(rows, 'test')
+        self.assertEqual(result['video_callbacks_per_page_second'], 1)
+        self.assertEqual(result['reported_presented_frames_per_page_second'], 23)
+        del rows[1]['state']['rvfc']
+        self.assertIsNone(analyze(rows, 'test')['video_callbacks_per_page_second'])
+        rows[1]['state']['rvfc'] = 0
+        with self.assertRaises(ValueError): analyze(rows, 'test')
+
     def test_missing_span_and_counter_reset_are_rejected(self):
         for rows in ([sample(1, 1, 1, 24)],
                      [sample(1, 1, 1, 24), sample(1, 2, 2, 48)],

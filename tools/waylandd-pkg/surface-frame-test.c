@@ -4,6 +4,7 @@
 #include "waylandd.c"
 #undef main
 int main(void) {
+    g_trace_frames = 1;
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     struct wl_display *display=wl_display_create();
@@ -46,10 +47,12 @@ int main(void) {
         assert(recv(sockets[1],wire,sizeof(wire),MSG_DONTWAIT)==-1 && errno==EAGAIN);
     }
     for(unsigned i=0;i<24;++i)surface_frame(client,surface.resource,6+i);
+    assert(surface.trace_requests==27 && surface.trace_done==3 && !surface.trace_cancelled);
     assert(wl_list_length(&surface.pending_frames)==24);
     surface_commit(client,surface.resource);
     assert(wl_list_length(&surface.committed_frames)==24);
     surface_frame(client,surface.resource,30);
+    assert(surface.trace_requests==28);
     int foreignSockets[2];
     assert(socketpair(AF_UNIX,SOCK_STREAM,0,foreignSockets)==0);
     struct wl_client *foreign=wl_client_create(display,foreignSockets[0]);
@@ -138,6 +141,7 @@ int main(void) {
 
     g_seat_clients=NULL;wl_client_destroy(foreign);close(foreignSockets[1]);
     wl_client_destroy(client);
+    assert(surface.trace_done==3 && surface.trace_cancelled==25);
     assert(wl_list_empty(&surface.pending_frames) && wl_list_empty(&surface.committed_frames));
     g_surfaces=NULL;wl_display_destroy(display);close(sockets[1]);
     return 0;
