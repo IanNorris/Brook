@@ -3,7 +3,11 @@
 #include <stdint.h>
 #include "memory/heap.h"
 #include "spinlock.h"
+#if defined(__BROOK_KERNEL__)
 #include "string.h"
+#else
+#include <cstring>
+#endif
 
 namespace brook {
 
@@ -13,6 +17,8 @@ struct Process;  // forward declaration for waiter
 // Blocking read/write via SchedulerBlock() when buffer is empty/full.
 static constexpr uint32_t PIPE_BUF_DEFAULT_SIZE = 65536;
 static constexpr uint32_t PIPE_BUF_UNIX_SIZE    = 65536;
+
+enum class PipeReadWait { Retry, Eof, WouldBlock, Registered };
 
 struct PipeBuffer
 {
@@ -57,6 +63,31 @@ struct PipeBuffer
     }
 
     bool empty() const { return head == tail; }
+
+    // Recheck after an empty read while excluding writes and endpoint close.
+    // Buffered bytes take precedence over EOF and nonblocking EAGAIN. This
+    // closes the arrival-before-registration race; the scheduler's pending
+    // wake flag handles a notification after registration but before block.
+    // This retains the existing single-waiter model, not a general wait queue.
+    PipeReadWait prepareReadWait(Process* self, bool nonblocking)
+    {
+        SpinLockAcquire(&lock);
+        PipeReadWait result;
+        if (!empty()) result = PipeReadWait::Retry;
+        else if (__atomic_load_n(&writers, __ATOMIC_ACQUIRE) == 0)
+            result = PipeReadWait::Eof;
+        else if (nonblocking) result = PipeReadWait::WouldBlock;
+        else { readerWaiter = self; result = PipeReadWait::Registered; }
+        SpinLockRelease(&lock);
+        return result;
+    }
+
+    void removeReadWait(Process* self)
+    {
+        SpinLockAcquire(&lock);
+        if (readerWaiter == self) readerWaiter = nullptr;
+        SpinLockRelease(&lock);
+    }
 
     // Non-blocking write. Returns bytes written (may be partial).
     uint32_t write(const char* src, uint32_t len)

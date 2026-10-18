@@ -2536,6 +2536,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // Read from pipe — block until data available or all writers closed
     if (fde->type == FdType::Pipe && fde->handle)
     {
+        if (count == 0) return 0;
         auto* pipe = static_cast<PipeBuffer*>(fde->handle);
         auto* dst = reinterpret_cast<char*>(bufAddr);
 
@@ -2555,25 +2556,20 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 return static_cast<int64_t>(got);
             }
 
-            // EOF — no writers left and buffer empty
-            uint32_t wr = __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE);
-            if (wr == 0)
-                return 0;
-
-            // Non-blocking: return -EAGAIN instead of blocking
-            if (fde->statusFlags & 0x800) // O_NONBLOCK
-                return -EAGAIN;
-
-            // Block until writer puts data or writer closes
             Process* self = ProcessCurrent();
-            pipe->readerWaiter = self;
+            switch (pipe->prepareReadWait(self, (fde->statusFlags & 0x800) != 0)) {
+                case PipeReadWait::Retry: continue;
+                case PipeReadWait::Eof: return 0;
+                case PipeReadWait::WouldBlock: return -EAGAIN;
+                case PipeReadWait::Registered: break;
+            }
             // Use timed wakeup to recheck writer count periodically
             // (avoids permanent deadlock if close notification was missed)
             extern volatile uint64_t g_lapicTickCount;
             self->wakeupTick = g_lapicTickCount + 10; // recheck every ~10ms
             SchedulerBlock(self);
+            pipe->removeReadWait(self);
             if (HasReadInterruptSignal()) {
-                if (pipe->readerWaiter == self) pipe->readerWaiter = nullptr;
                 return -EINTR;
             }
         }

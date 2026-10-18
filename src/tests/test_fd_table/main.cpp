@@ -21,6 +21,7 @@
 
 #include "fd_table.h"
 #include "unix_lifetime_trace.h"
+#include "pipe.h"
 #include <chrono>
 
 using brook::FdEntry;
@@ -570,8 +571,48 @@ static void TestUnixLifeCore()
                 sizeof(core), sizeof(event), static_cast<long long>(ns / 100000));
 }
 
+static void TestPipeReadRegistration()
+{
+    using brook::PipeBuffer;
+    using brook::PipeReadWait;
+    char storage[16] = {};
+    PipeBuffer pipe{};
+    pipe.data = storage; pipe.capacity = sizeof(storage); pipe.writers = 1;
+    auto* self = reinterpret_cast<brook::Process*>(uintptr_t(0x1000));
+    char byte = 0;
+    CHECK(pipe.read(&byte, 1) == 0, "initial read observes empty pipe");
+    CHECK(pipe.write("x", 1) == 1, "producer wins before wait preparation");
+    CHECK(pipe.prepareReadWait(self, false) == PipeReadWait::Retry,
+          "arrival before registration retries instead of sleeping");
+    CHECK(pipe.readerWaiter == nullptr, "retry publishes no waiter");
+    CHECK(pipe.read(&byte, 1) == 1 && byte == 'x', "retry drains arriving byte");
+
+    CHECK(pipe.read(&byte, 1) == 0, "read before final write observes empty");
+    CHECK(pipe.write("y", 1) == 1, "final write arrives before close");
+    brook::SpinLockAcquire(&pipe.lock);
+    __atomic_store_n(&pipe.writers, 0, __ATOMIC_RELEASE);
+    brook::SpinLockRelease(&pipe.lock);
+    CHECK(pipe.prepareReadWait(self, false) == PipeReadWait::Retry,
+          "final bytes win over EOF after writer closes");
+    CHECK(pipe.prepareReadWait(self, true) == PipeReadWait::Retry,
+          "final bytes also win for nonblocking read");
+    CHECK(pipe.read(&byte, 1) == 1 && byte == 'y', "final byte survives close race");
+    CHECK(pipe.prepareReadWait(self, false) == PipeReadWait::Eof,
+          "EOF only after all buffered bytes drain");
+    pipe.writers = 1;
+    CHECK(pipe.prepareReadWait(self, true) == PipeReadWait::WouldBlock,
+          "empty live nonblocking pipe returns EAGAIN");
+    CHECK(pipe.readerWaiter == nullptr, "nonblocking read publishes no waiter");
+    CHECK(pipe.prepareReadWait(self, false) == PipeReadWait::Registered,
+          "empty live blocking pipe registers waiter");
+    CHECK(pipe.readerWaiter == self, "waiter is visible before blocking");
+    pipe.removeReadWait(self);
+    CHECK(pipe.readerWaiter == nullptr, "wake or interruption removes registration");
+}
+
 int main()
 {
+    TestPipeReadRegistration();
     TestUnixLifeCore();
     TestBasic();
     TestConcurrent();

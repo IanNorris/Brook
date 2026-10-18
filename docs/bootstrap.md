@@ -127,6 +127,37 @@ after cold boot, both original launchers and QEMU sessions exited zero, and
 all six post-stop filesystem checks passed. This reused the fixed kernel hash
 above and ABI20 modules; it introduces no additional kernel change.
 
+#### Pipe-read ordering repair
+
+The next candidate rechecks buffered data, writer closure, nonblocking state
+and waiter registration together under the pipe lock after an empty read.
+Bytes arriving before registration now trigger a retry, and final buffered
+bytes take precedence over EOF. A zero-length ordinary pipe read returns
+immediately. The reader removes its registration after waking, before signal
+handling. The scheduler's existing pending-wake mechanism handles notification
+after registration but before blocking.
+
+The existing `test_fd_table` suite now exercises the actual `PipeBuffer`
+helper with deterministic arrival-before-registration and final-write/close
+interleavings, plus EOF/nonblocking precedence and registration removal.
+All 44 native suites and the compiled entry audit passed. Guest checks cover
+zero-length reads both before and after writer closure, followed by exact
+final-byte draining. The NAR matrix again passed all 20 cases and cold-boot
+verification, followed by clean original-launcher/QEMU exits and six passing
+post-stop filesystem checks.
+
+This is a correctness repair, not a demonstrated performance improvement.
+The large-file HTTP+zstd cases took 6.7/7.2 seconds, versus 6.2/6.7 seconds in
+the preceding baseline; the dominant pipeline bottleneck remains open. The
+4 KiB syscall transfer cap, 10 ms fallback and existing single/raw waiter
+scheme remain. General multiple-waiter and process-lifetime safety, and a
+deterministic scheduler wake-before-block test, are not established by this
+helper test.
+
+Evidence: `build/workloads/nar-pipe-read-fixed-20261018/acceptance-audit.json`.
+Kernel SHA256:
+`9e64f2783804714a8998f0bdaf2cbe756980fa0e668b98d07c38292615646ccd`.
+
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
 revision, SDK closure and VM configuration:
 
