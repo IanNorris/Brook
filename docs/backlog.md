@@ -1,5 +1,13 @@
 # Recovery and VM-control backlog
 
+- Initial [Wine64 smoke test](wine-smoke.md): diagnose wineserver's rejection of
+  `/tmp/.wine-1000` as not owned by UID1000, including metadata on newly created
+  temporary directories and path routing. A private owned ext2 `TMPDIR` did not
+  change the server path. The loader's version command passes, but no Windows
+  command has passed yet. Separately repair the `nix-install` profile-link
+  `ENOTDIR` failure after Wine's payload was unpacked; preserve and test recovery
+  of the partially published profile. Keep Vulkan/Proton work separate.
+
 - Finish clock coverage after the [realtime epoch-anchor repair](realtime-clock.md).
   The eight-worker KVM comparison now has zero backwards realtime steps, versus
   15 per worker before. Audit remaining apparent LAPIC tick consumers, especially
