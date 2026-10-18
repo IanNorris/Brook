@@ -1,0 +1,448 @@
+--- a/oss/pcm_oss.c
++++ b/oss/pcm_oss.c
+@@ -20,6 +20,7 @@
+ 
+ #include "config.h"
+ #include <stdio.h>
++#include <pthread.h>
+ #include <sys/ioctl.h>
+ #include <alsa/asoundlib.h>
+ #include <alsa/pcm_external.h>
+@@ -41,7 +42,36 @@
+ 	unsigned int period_shift;
+ 	unsigned int periods;
+ 	unsigned int frame_bytes;
++	pthread_mutex_t lock;
++	snd_pcm_uframes_t boundary;
++	snd_pcm_uframes_t expected_appl;
+ } snd_pcm_oss_t;
++
++/* Called under the private mutex. ALSA serializes ordinary transfers and
++ * pointer calls; guard the accepted application origin against forward/rewind
++ * and software-only reset. Prepared configuration must be serialized by users. */
++static int oss_queue_locked(snd_pcm_ioplug_t *io, snd_pcm_uframes_t *queued)
++{
++	snd_pcm_oss_t *oss = io->private_data;
++	int bytes;
++	if (!oss->boundary || !oss->frame_bytes || !io->buffer_size)
++		return -EBADFD;
++	if (ioctl(oss->fd, SNDCTL_DSP_GETODELAY, &bytes) < 0)
++		return -errno;
++	if (bytes < 0 || (unsigned int)bytes % oss->frame_bytes)
++		return -EPIPE;
++	*queued = (unsigned int)bytes / oss->frame_bytes;
++	if (*queued > io->buffer_size)
++		return -EPIPE;
++	if (oss->expected_appl != io->appl_ptr) {
++		/* A software-only reset is safe only after the actual queue drains. */
++		if (!io->appl_ptr && !io->hw_ptr && !*queued)
++			oss->expected_appl = 0;
++		else
++			return -EPIPE;
++	}
++	return 0;
++}
+ 
+ static snd_pcm_sframes_t oss_write(snd_pcm_ioplug_t *io,
+ 				   const snd_pcm_channel_area_t *areas,
+@@ -49,18 +79,30 @@
+ 				   snd_pcm_uframes_t size)
+ {
+ 	snd_pcm_oss_t *oss = io->private_data;
+-	const char *buf;
++	const char *buf = (char *)areas->addr + (areas->first + areas->step * offset) / 8;
++	snd_pcm_uframes_t queued, frames;
+ 	ssize_t result;
+-
+-	/* we handle only an interleaved buffer */
+-	buf = (char *)areas->addr + (areas->first + areas->step * offset) / 8;
+-	size *= oss->frame_bytes;
+-	result = write(oss->fd, buf, size);
+-	if (result <= 0)
+-		return result;
+-	return result / oss->frame_bytes;
+-}
+-
++	pthread_mutex_lock(&oss->lock);
++	result = oss_queue_locked(io, &queued);
++	if (result < 0)
++		goto out;
++	result = write(oss->fd, buf, size * oss->frame_bytes);
++	if (result < 0) {
++		result = -errno;
++		goto out;
++	}
++	if ((size_t)result > size * oss->frame_bytes || result % oss->frame_bytes) {
++		oss->boundary = 0;
++		result = -EIO;
++		goto out;
++	}
++	frames = result / oss->frame_bytes;
++	oss->expected_appl = (oss->expected_appl + frames) % oss->boundary;
++	result = frames;
++out:
++	pthread_mutex_unlock(&oss->lock);
++	return result;
++}
+ static snd_pcm_sframes_t oss_read(snd_pcm_ioplug_t *io,
+ 				  const snd_pcm_channel_area_t *areas,
+ 				  snd_pcm_uframes_t offset,
+@@ -74,24 +116,43 @@
+ 	buf = (char *)areas->addr + (areas->first + areas->step * offset) / 8;
+ 	size *= oss->frame_bytes;
+ 	result = read(oss->fd, buf, size);
+-	if (result <= 0)
+-		return result;
++	if (result < 0)
++		return -errno;
+ 	return result / oss->frame_bytes;
+ }
+ 
+ static snd_pcm_sframes_t oss_pointer(snd_pcm_ioplug_t *io)
+ {
+ 	snd_pcm_oss_t *oss = io->private_data;
+-	struct count_info info;
+-	int ptr;
+-
+-	if (ioctl(oss->fd, io->stream == SND_PCM_STREAM_PLAYBACK ?
+-		  SNDCTL_DSP_GETOPTR : SNDCTL_DSP_GETIPTR, &info) < 0) {
+-		fprintf(stderr, "*** OSS: oss_pointer error\n");
+-		return 0;
+-	}
+-	ptr = snd_pcm_bytes_to_frames(io->pcm, info.ptr);
+-	return ptr;
++	snd_pcm_uframes_t queued, position, delta;
++	snd_pcm_sframes_t result;
++	pthread_mutex_lock(&oss->lock);
++	result = oss_queue_locked(io, &queued);
++	if (result < 0)
++		goto out;
++	/* Native frames accepted by ALSA minus this stream's actual unfinished
++	 * frames gives completion, including a whole ring between queries. */
++	position = oss->expected_appl >= queued ? oss->expected_appl - queued :
++		oss->boundary - (queued - oss->expected_appl);
++	delta = position >= io->hw_ptr ? position - io->hw_ptr :
++		oss->boundary - (io->hw_ptr - position);
++	result = delta <= io->buffer_size ? (snd_pcm_sframes_t)position : -EPIPE;
++out:
++	pthread_mutex_unlock(&oss->lock);
++	return result;
++}
++
++static int oss_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delay)
++{
++	snd_pcm_oss_t *oss = io->private_data;
++	snd_pcm_uframes_t queued;
++	int result;
++	pthread_mutex_lock(&oss->lock);
++	result = oss_queue_locked(io, &queued);
++	if (!result)
++		*delay = queued;
++	pthread_mutex_unlock(&oss->lock);
++	return result;
+ }
+ 
+ static int oss_start(snd_pcm_ioplug_t *io)
+@@ -100,12 +161,8 @@
+ 	int tmp = io->stream == SND_PCM_STREAM_PLAYBACK ?
+ 		PCM_ENABLE_OUTPUT : PCM_ENABLE_INPUT;
+ 
+-	if (ioctl(oss->fd, SNDCTL_DSP_SETTRIGGER, &tmp) < 0) {
+-		fprintf(stderr, "*** OSS: trigger failed\n");
+-		if (io->stream == SND_PCM_STREAM_CAPTURE)
+-			/* fake read to trigger */
+-			read(oss->fd, &tmp, 0);
+-	}
++	if (ioctl(oss->fd, SNDCTL_DSP_SETTRIGGER, &tmp) < 0)
++		return -errno;
+ 	return 0;
+ }
+ 
+@@ -114,7 +171,8 @@
+ 	snd_pcm_oss_t *oss = io->private_data;
+ 	int tmp = 0;
+ 
+-	ioctl(oss->fd, SNDCTL_DSP_SETTRIGGER, &tmp);
++	if (ioctl(oss->fd, SNDCTL_DSP_SETTRIGGER, &tmp) < 0)
++		return -errno;
+ 	return 0;
+ }
+ 
+@@ -122,37 +180,66 @@
+ {
+ 	snd_pcm_oss_t *oss = io->private_data;
+ 
+-	if (io->stream == SND_PCM_STREAM_PLAYBACK)
+-		ioctl(oss->fd, SNDCTL_DSP_SYNC);
++	if (io->stream == SND_PCM_STREAM_PLAYBACK &&
++	    ioctl(oss->fd, SNDCTL_DSP_SYNC) < 0)
++		return -errno;
+ 	return 0;
+ }
+ 
+ static int oss_prepare(snd_pcm_ioplug_t *io)
+ {
+ 	snd_pcm_oss_t *oss = io->private_data;
+-	int tmp;
+-
+-	ioctl(oss->fd, SNDCTL_DSP_RESET);
+-
++	snd_pcm_sw_params_t *sw;
++	snd_pcm_uframes_t boundary;
++	struct count_info pointer;
++	int tmp, result;
++
++	pthread_mutex_lock(&oss->lock);
++	oss->boundary = 0; /* Failed/in-progress preparation cannot expose old data. */
++	pthread_mutex_unlock(&oss->lock);
++	/* prepare runs unlocked in ioplug; never query ALSA params while holding
++	 * the private mutex, because pointer/transfer callbacks hold the PCM lock. */
++	snd_pcm_sw_params_alloca(&sw);
++	result = snd_pcm_sw_params_current(io->pcm, sw);
++	if (result < 0)
++		return result;
++	result = snd_pcm_sw_params_get_boundary(sw, &boundary);
++	if (result < 0)
++		return result;
++	if (!boundary || boundary < io->buffer_size)
++		return -EINVAL;
++	pthread_mutex_lock(&oss->lock);
++	if (ioctl(oss->fd, SNDCTL_DSP_RESET) < 0)
++		goto device_error;
+ 	tmp = io->channels;
+-	if (ioctl(oss->fd, SNDCTL_DSP_CHANNELS, &tmp) < 0) {
+-		perror("SNDCTL_DSP_CHANNELS");
+-		return -EINVAL;
+-	}
++	if (ioctl(oss->fd, SNDCTL_DSP_CHANNELS, &tmp) < 0)
++		goto device_error;
++	if (tmp != io->channels) { result = -EINVAL; goto out; }
+ 	tmp = oss->format;
+-	if (ioctl(oss->fd, SNDCTL_DSP_SETFMT, &tmp) < 0) {
+-		perror("SNDCTL_DSP_SETFMT");
+-		return -EINVAL;
+-	}
++	if (ioctl(oss->fd, SNDCTL_DSP_SETFMT, &tmp) < 0)
++		goto device_error;
++	if (tmp != oss->format) { result = -EINVAL; goto out; }
+ 	tmp = io->rate;
+-	if (ioctl(oss->fd, SNDCTL_DSP_SPEED, &tmp) < 0 ||
+-	    tmp > io->rate * 1.01 || tmp < io->rate * 0.99) {
+-		perror("SNDCTL_DSP_SPEED");
+-		return -EINVAL;
+-	}
+-	return 0;
+-}
+-
++	if (ioctl(oss->fd, SNDCTL_DSP_SPEED, &tmp) < 0)
++		goto device_error;
++	if (tmp != io->rate) { result = -EINVAL; goto out; }
++	tmp = 0;
++	if (ioctl(oss->fd, SNDCTL_DSP_SETTRIGGER, &tmp) < 0)
++		goto device_error;
++	/* GETODELAY has an unclocked legacy fallback. Require the native pointer
++	 * contract before using its per-stream completion-based delay as a clock. */
++	if (ioctl(oss->fd, SNDCTL_DSP_GETOPTR, &pointer) < 0)
++		goto device_error;
++	oss->expected_appl = 0;
++	oss->boundary = boundary;
++	result = 0;
++	goto out;
++device_error:
++	result = -errno;
++out:
++	pthread_mutex_unlock(&oss->lock);
++	return result;
++}
+ static int oss_hw_params(snd_pcm_ioplug_t *io,
+ 			 snd_pcm_hw_params_t *params ATTRIBUTE_UNUSED)
+ {
+@@ -161,6 +248,9 @@
+ 	unsigned int period_bytes;
+ 	long oflags, flags;
+ 
++	pthread_mutex_lock(&oss->lock);
++	oss->boundary = 0;
++	pthread_mutex_unlock(&oss->lock);
+ 	oss->frame_bytes = (snd_pcm_format_physical_width(io->format) * io->channels) / 8;
+ 	switch (io->format) {
+ 	case SND_PCM_FORMAT_U8:
+@@ -219,7 +309,7 @@
+ 
+ 	if ((flags = fcntl(oss->fd, F_GETFL)) < 0) {
+ 		err = -errno;
+-		perror("F_GETFL");
++		return err;
+ 	} else {
+ 		oflags = flags;
+ 		if (io->nonblock)
+@@ -229,7 +319,7 @@
+ 		if (flags != oflags &&
+ 		    fcntl(oss->fd, F_SETFL, flags) < 0) {
+ 			err = -errno;
+-			perror("F_SETFL");
++			return err;
+ 		}
+ 	}
+ 
+@@ -245,66 +335,40 @@
+ 		SND_PCM_ACCESS_RW_INTERLEAVED,
+ 		SND_PCM_ACCESS_MMAP_INTERLEAVED
+ 	};
+-	unsigned int nformats;
+-	unsigned int format[5];
+-	unsigned int nchannels;
+-	unsigned int channel[6];
++	unsigned int format = SND_PCM_FORMAT_S16_LE;
+ 	/* period and buffer bytes must be power of two */
+ 	static const unsigned int bytes_list[] = {
+ 		1U<<8, 1U<<9, 1U<<10, 1U<<11, 1U<<12, 1U<<13, 1U<<14, 1U<<15,
+-		1U<<16, 1U<<17, 1U<<18, 1U<<19, 1U<<20, 1U<<21, 1U<<22, 1U<<23
++		1U<<16
+ 	};
+-	int i, err, tmp;
++	int err, tmp;
+ 
+ 	/* check trigger */
+ 	oss->caps = 0;
+-	if (ioctl(oss->fd, SNDCTL_DSP_GETCAPS, &oss->caps) >= 0) {
+-		if (! (oss->caps & DSP_CAP_TRIGGER))
+-			fprintf(stderr, "*** OSS: trigger is not supported!\n");
+-	}
++	if (ioctl(oss->fd, SNDCTL_DSP_GETCAPS, &oss->caps) < 0)
++		return -errno;
++	if (!(oss->caps & DSP_CAP_TRIGGER))
++		return -ENOTSUP;
+ 
+ 	/* access type - interleaved only */
+ 	if ((err = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_ACCESS,
+ 						 ARRAY_SIZE(access_list), access_list)) < 0)
+ 		return err;
+ 
+-	/* supported formats */
++	/* Brook's clocked endpoint: native stereo S16_LE at 44100 Hz.
++	 * The outer ALSA plug performs any client format/rate conversion. */
+ 	tmp = 0;
+-	ioctl(oss->fd, SNDCTL_DSP_GETFMTS, &tmp);
+-	nformats = 0;
+-	if (tmp & AFMT_U8)
+-		format[nformats++] = SND_PCM_FORMAT_U8;
+-	if (tmp & AFMT_S16_LE)
+-		format[nformats++] = SND_PCM_FORMAT_S16_LE;
+-	if (tmp & AFMT_S16_BE)
+-		format[nformats++] = SND_PCM_FORMAT_S16_BE;
+-	if (tmp & AFMT_MU_LAW)
+-		format[nformats++] = SND_PCM_FORMAT_MU_LAW;
+-	if (! nformats)
+-		format[nformats++] = SND_PCM_FORMAT_S16;
+-	if ((err = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_FORMAT,
+-						 nformats, format)) < 0)
+-		return err;
+-	
+-	/* supported channels */
+-	nchannels = 0;
+-	for (i = 0; i < 6; i++) {
+-		tmp = i + 1;
+-		if (ioctl(oss->fd, SNDCTL_DSP_CHANNELS, &tmp) >= 0)
+-			channel[nchannels++] = tmp;
+-	}
+-	if (! nchannels) /* assume 2ch stereo */
+-		err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_CHANNELS,
+-						      2, 2);
+-	else
+-		err = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_CHANNELS,
+-						    nchannels, channel);
+-	if (err < 0)
+-		return err;
+-
+-	/* supported rates */
+-	/* FIXME: should query? */
+-	err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_RATE, 8000, 480000);
++	if (ioctl(oss->fd, SNDCTL_DSP_GETFMTS, &tmp) < 0)
++		return -errno;
++	if (!(tmp & AFMT_S16_LE))
++		return -ENOTSUP;
++	err = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_FORMAT, 1, &format);
++	if (err < 0)
++		return err;
++	err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_CHANNELS, 2, 2);
++	if (err < 0)
++		return err;
++	err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_RATE, 44100, 44100);
+ 	if (err < 0)
+ 		return err;
+ 
+@@ -314,7 +378,7 @@
+ 	if (err < 0)
+ 		return err;
+ 	/* periods */
+-	err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_PERIODS, 2, 1024);
++	err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_PERIODS, 2, 256);
+ 	if (err < 0)
+ 		return err;
+ 	/* buffer size (in power of two) */
+@@ -333,6 +397,7 @@
+ 
+ 	close(oss->fd);
+ 	free(oss->device);
++	pthread_mutex_destroy(&oss->lock);
+ 	free(oss);
+ 	return 0;
+ }
+@@ -342,6 +407,7 @@
+ 	.stop = oss_stop,
+ 	.transfer = oss_write,
+ 	.pointer = oss_pointer,
++	.delay = oss_delay,
+ 	.close = oss_close,
+ 	.hw_params = oss_hw_params,
+ 	.prepare = oss_prepare,
+@@ -353,6 +419,7 @@
+ 	.stop = oss_stop,
+ 	.transfer = oss_read,
+ 	.pointer = oss_pointer,
++	.delay = oss_delay,
+ 	.close = oss_close,
+ 	.hw_params = oss_hw_params,
+ 	.prepare = oss_prepare,
+@@ -366,7 +433,10 @@
+ 	const char *device = "/dev/dsp";
+ 	int err;
+ 	snd_pcm_oss_t *oss;
+-	
++
++	if (stream != SND_PCM_STREAM_PLAYBACK)
++		return -ENOTSUP;
++
+ 	snd_config_for_each(i, next, conf) {
+ 		snd_config_t *n = snd_config_iterator_entry(i);
+ 		const char *id;
+@@ -391,9 +461,12 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	err = pthread_mutex_init(&oss->lock, NULL);
++	if (err) { free(oss); return -err; }
+ 	oss->device = strdup(device);
+ 	if (oss->device == NULL) {
+ 		SNDERR("cannot allocate");
++		pthread_mutex_destroy(&oss->lock);
+ 		free(oss);
+ 		return -ENOMEM;
+ 	}
+@@ -406,6 +479,7 @@
+ 	}
+ 
+ 	oss->io.version = SND_PCM_IOPLUG_VERSION;
++	oss->io.flags = SND_PCM_IOPLUG_FLAG_BOUNDARY_WA;
+ 	oss->io.name = "ALSA <-> OSS PCM I/O Plugin";
+ 	oss->io.poll_fd = oss->fd;
+ 	oss->io.poll_events = stream == SND_PCM_STREAM_PLAYBACK ? POLLOUT : POLLIN;
+@@ -430,6 +504,7 @@
+ 	if (oss->fd >= 0)
+ 		close(oss->fd);
+ 	free(oss->device);
++	pthread_mutex_destroy(&oss->lock);
+ 	free(oss);
+ 	return err;
+ }

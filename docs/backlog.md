@@ -170,9 +170,11 @@
   across persistent opens, close/reopen and reset, plus independent stream delay
   and classic poll backpressure. Native-rate GETOPTR, exact supported fragment
   geometry, interruptible captured-target SYNC and cached DSP epoll now pass
-  targeted guest tests. Finish fragment-threshold readiness, ALSA OSS plugin
-  packaging/error propagation and its pointer/delay/drain acceptance before
-  changing defaults. Non-native pointer mapping remains unsupported.
+  targeted guest tests. Fragment-threshold readiness and a packaged clocked ALSA
+  slave now pass guest checks, including whole-ring gaps and exact short sounds
+  through raw and outer-plug routes. Finish client conversion and Firefox
+  normal-launcher/IPC acceptance before changing defaults. Non-native OSS
+  pointer mapping remains unsupported.
   Preserve explicit discontinuity reporting and unsupported-clock behavior. The
   conservative half-ring sampling guard is not a formal maximum transfer-rate
   proof. See `audio-clock.md`; Firefox normal-launcher audio is still open.

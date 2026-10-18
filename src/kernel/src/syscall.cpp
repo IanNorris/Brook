@@ -1497,7 +1497,7 @@ static constexpr uint64_t SNDCTL_DSP_GETBLKSIZE = 0xC0045004;// _IOWR('P', 4, in
 static constexpr int AFMT_U8     = 0x00000008;
 static constexpr int AFMT_S16_LE = 0x00000010;
 // OSS capabilities
-static constexpr int DSP_CAP_TRIGGER = 0x00000010;
+static constexpr int DSP_CAP_TRIGGER = 0x00001000;
 
 // DspState is defined earlier in the file (near DspHandleRef).
 
@@ -1514,7 +1514,10 @@ static int DspChangeFormat(DspState* dsp, const AudioStreamProgress& progress,
     if (dsp->ringBytes && rate != MIXER_HW_RATE) return -95;
     const uint32_t frames = dsp->ringBytes ? dsp->ringBytes / (channels * (bits / 8)) : MIXER_RING_FRAMES;
     if (!frames || frames > MIXER_RING_FRAMES) return -EINVAL;
-    if (!AudioMixerSetCapacity(dsp->mixerStreamId, frames)) return -16;
+    uint64_t period = (uint64_t(dsp->fragmentSize) * MIXER_HW_RATE + uint64_t(channels) * (bits / 8) * rate - 1)
+        / (uint64_t(channels) * (bits / 8) * rate);
+    if (period > frames) period = frames;
+    if (!AudioMixerSetCapacity(dsp->mixerStreamId, frames, static_cast<uint32_t>(period))) return -16;
     ++dsp->controlEpoch;
     dsp->pointerEpoch = progress.epoch; dsp->pointerBaseFrames = progress.completedFrames;
     dsp->sampleRate = rate; dsp->channels = channels; dsp->bitsPerSample = bits;
@@ -3026,6 +3029,9 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         dsp->pointerEpoch = dsp->pointerBaseFrames = 0;
         dsp->controlEpoch = 1;
         if (!dsp->mixerStreamId) { kfree(dsp); return -16; } // EBUSY
+        if (!AudioMixerSetCapacity(dsp->mixerStreamId, MIXER_RING_FRAMES, 4096 / MIXER_FRAME_BYTES)) {
+            AudioMixerClose(dsp->mixerStreamId); kfree(dsp); return -EIO;
+        }
         KMutexInit(&dsp->ioLock);
         dsp->refCount      = 1;
         dsp->buffer        = static_cast<uint8_t*>(kmalloc(DSP_BUFFER_SIZE));
@@ -6578,7 +6584,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             if (!fragments) fragments = maximum / size; // Unspecified count: use capacity.
             if (!fragments || uint64_t(fragments) * size > maximum) return -EINVAL;
             const uint32_t bytes = fragments * size;
-            if (!AudioMixerSetCapacity(dsp->mixerStreamId, bytes / frameBytes)) return -16;
+            if (!AudioMixerSetCapacity(dsp->mixerStreamId, bytes / frameBytes, size / frameBytes)) return -16;
             dsp->fragmentSize = size; dsp->ringBytes = bytes;
             ++dsp->controlEpoch;
             return 0; // Exact requested nonzero count; never silently clamp it.
@@ -8044,7 +8050,8 @@ retry_poll:
             auto* dsp = static_cast<DspState*>(fde->handle);
             if (dsp && AudioMixerGetProgress(dsp->mixerStreamId, &progress)) {
                 if (progress.discontinuity) fds[i].revents |= POLLERR;
-                else if ((fds[i].events & POLLOUT) && AudioMixerAvailableFrames(dsp->mixerStreamId))
+                else if ((fds[i].events & POLLOUT) &&
+                         progress.capacityFrames - progress.queuedFrames >= progress.writableFrames)
                     fds[i].revents |= POLLOUT;
             } else fds[i].revents |= POLLERR;
             if (fds[i].revents) ready++;
@@ -8611,7 +8618,8 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
         AudioStreamProgress progress{};
         if (!dsp || !AudioMixerGetProgress(dsp->mixerStreamId, &progress) || progress.discontinuity)
             return EPOLLERR;
-        return (events & EPOLLOUT) && AudioMixerAvailableFrames(dsp->mixerStreamId) ? EPOLLOUT : 0;
+        return (events & EPOLLOUT) && progress.capacityFrames - progress.queuedFrames >= progress.writableFrames
+            ? EPOLLOUT : 0;
     }
 
     if (events & EPOLLIN) {

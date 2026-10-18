@@ -290,12 +290,82 @@ Sources: [Linux OSS pointer/drain implementation](https://raw.githubusercontent.
 [ALSA OSS plugin](https://raw.githubusercontent.com/alsa-project/alsa-plugins/v1.2.12/oss/pcm_oss.c).
 
 
-## Clocked OSS endpoint before enabling the ALSA OSS plugin
+## Fragment readiness and clocked ALSA slave (18 October)
+
+Poll/epoll readiness now requires room for a negotiated fragment. The threshold
+is stored with mixer geometry, so descriptor scans use one cached snapshot
+without acquiring the per-open mutex or calling HDA. Writes can still accept a
+smaller whole-frame request when appropriate. Reset preserves the negotiated
+threshold; a new description starts with default geometry. A paused 4x1,024-byte
+guest queue reports neither poll nor epoll readiness with 1,020 free bytes and
+reports both at exactly 1,024. Hosted tests also cover in-flight accounting
+across this threshold. The OSS trigger capability bit is corrected from 0x10
+to the Linux UAPI value 0x1000; the guest endpoint regression checks it.
+
+`tools/alsa-oss-pkg` builds a Brook playback slave from the pinned ALSA plugin
+source. It propagates callback errors, negotiates native stereo S16_LE/44.1 kHz
+with bounded buffers, and disables output while data is prepared. An outer plug
+can perform client conversion, which needs separate non-native-format acceptance.
+Prepare requires successful native GETOPTR support before using GETODELAY as a
+clock, preventing fallback to the kernel's approximate unclocked legacy estimate.
+The host callback harness exercises the patched source and real null-PCM params,
+including errors and failed preparation, without opening a host audio device.
+
+The first plugin candidate passed frequent clock queries but failed a whole-ring
+gap: after 0.7 seconds without querying, DSP reported zero while ALSA still
+reported 16,384 queued frames. Its modulo pointer could not distinguish no
+movement from one complete ring. The corrected plugin uses ALSA boundary mode,
+with completion derived from accepted application frames minus this stream's
+actual incomplete frames. It tracks the expected application origin so
+forward/rewind cannot manufacture progress. An empty zero-origin reset can
+rebase; reset with pending data returns EPIPE on observation until prepare.
+Private metadata is protected by a mutex; callers must serialize configuration
+operations on one PCM handle. No complete ALSA concurrency/API claim is made.
+
+In the corrected guest, both `brook_oss` and `brook_plug` pass 68 bracketed delay
+comparisons against the same open DSP descriptor. A separately paused stream
+remains full while another drains. Three whole-ring gaps per route now report
+both zero delay and full ALSA availability. Raw real-library tests also cover
+drained reset recovery, pending-reset/forward/rewind rejection and recovery,
+and a partial mmap commit: 64 frames are charged while uncommitted bytes are not.
+
+Both routes deliver all 9,660 expected nonzero frames in exact stereo order
+through 30 short sounds and repeated prepare/drain. The host barrier releases
+the source only after recording starts, and all source execution finishes within
+capture. This checks actual PCM delivery in addition to API counters. It does
+not certify glitch-free timing, all client conversions or browser playback.
+
+Evidence: `build/workloads/alsa-oss-v2-20261018/`, kernel
+`9261115b37d0605c2403348e80b801b12e3ccefdee0a93091ff1eeb728053675`,
+plugin `/nix/store/dfpfpdlxhhnapm54xrqfakfyfm8wssqy-alsa-plugins-oss-brook-1.2.12`.
+The plugin installs through the real guest `nix-install` as UID 1000. The initial
+full-ring failure is retained in
+`build/workloads/alsa-oss-20261018/alsa-full-wrap-baseline/`. All 34 hosted suites
+and supported compiled-entry checks pass in
+`build/alsa-oss-capability-build-20261018.log`; the plugin callback checks pass in
+`build/alsa-oss-boundary-build-20261018.log`.
+
+The corrected VM returns to ten tasks and its final two-second idle capture
+contains zero PCM frames. Checked guest synchronization, launcher exit zero,
+serial/device checks and all three offline filesystem checks pass. The candidate
+keeps the installed test package for a subsequent isolated Firefox run; no
+existing user image/profile was changed.
+
+Default ALSA configuration and Firefox launch preferences remain unchanged.
+Normal-launcher Firefox audio, IPC, non-native client conversion and broader
+application acceptance are still open. The slave is intended as an ongoing
+compatibility path; the generators and captures are regression helpers.
+
+Sources: [Linux OSS capability definitions](https://raw.githubusercontent.com/torvalds/linux/master/include/uapi/linux/soundcard.h),
+[ALSA ioplug transfer and boundary behavior](https://raw.githubusercontent.com/alsa-project/alsa-lib/v1.2.15.3/src/pcm/pcm_ioplug.c).
+
+## Remaining integration acceptance
 
 Review with Astra identified the following integration requirements. The native
 receipt, completion, discontinuity, short-tail and native pointer/drain
-prerequisites now have the coverage above; full ALSA integration, fragment
-readiness and non-native mappings remain:
+prerequisites now have the coverage above. Fragment readiness and the native
+ALSA slave also pass targeted checks; normal defaults, client conversion,
+Firefox and non-native OSS mappings remain:
 
 - Preserve the independently owned FIFO and serialized safe-staging foundation
   above while adding hardware accounting; do not reintroduce shared ownership.

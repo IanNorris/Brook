@@ -45,6 +45,7 @@ struct MixerStream {
     uint64_t submittedFrames = 0, completedFrames = 0;
     uint32_t inFlight = 0;
     uint32_t capacity = MIXER_RING_FRAMES;
+    uint32_t writableFrames = 1;
     bool discontinuity = false;
 };
 static MixerStream g_streams[MIXER_MAX_STREAMS];
@@ -123,7 +124,8 @@ AudioStreamId AudioMixerOpen()
             auto& stream = g_streams[i];
             if (stream.identity) continue;
             identity = (g_nextStreamIdentity++ << 4) | (i + 1);
-            ResetStream(stream); stream.enabled = true; stream.capacity = MIXER_RING_FRAMES; stream.identity = identity;
+            ResetStream(stream); stream.enabled = true; stream.capacity = MIXER_RING_FRAMES;
+            stream.writableFrames = 1; stream.identity = identity;
             break;
         }
     }
@@ -154,13 +156,13 @@ bool AudioMixerSetEnabled(AudioStreamId identity, bool enabled)
     SpinLockRelease(&g_mixerLock);
     return stream != nullptr;
 }
-bool AudioMixerSetCapacity(AudioStreamId identity, uint32_t frames)
+bool AudioMixerSetCapacity(AudioStreamId identity, uint32_t frames, uint32_t writableFrames)
 {
-    if (!frames || frames > MIXER_RING_FRAMES) return false;
+    if (!frames || frames > MIXER_RING_FRAMES || !writableFrames || writableFrames > frames) return false;
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
     const bool empty = stream && stream->read == stream->write && !stream->inFlight;
-    if (empty) stream->capacity = frames;
+    if (empty) { stream->capacity = frames; stream->writableFrames = writableFrames; }
     SpinLockRelease(&g_mixerLock);
     return empty;
 }
@@ -326,7 +328,7 @@ bool AudioMixerGetProgress(AudioStreamId identity, AudioStreamProgress* result)
     auto* stream = FindStream(identity);
     if (stream) *result = {stream->epoch, stream->submittedFrames, stream->completedFrames,
         static_cast<uint32_t>(stream->write - stream->read) + stream->inFlight,
-        g_clockSupported, stream->discontinuity, stream->capacity};
+        g_clockSupported, stream->discontinuity, stream->capacity, stream->writableFrames};
     SpinLockRelease(&g_mixerLock);
     return stream != nullptr;
 }

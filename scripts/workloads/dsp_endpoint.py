@@ -73,12 +73,27 @@ def main():
     fd, other = opened(), opened()
     duplicate = os.dup(fd)
     try:
+        assert integer(fd, 0x8004500F) == 0x1000, 'incorrect OSS trigger capability bit'
         integer(fd, SETFRAGMENT, (4 << 16) | 10)
         assert query(fd, GETOSPACE, 4) == [4, 4, 1024, 4096]
         expect_error(lambda: integer(fd, SETFRAGMENT, (65 << 16) | 10), errno.EINVAL)
         expect_error(lambda: integer(fd, SETFRAGMENT, (4 << 16) | 7), errno.EINVAL)
         assert query(fd, GETOSPACE, 4) == [4, 4, 1024, 4096]
         integer(fd, TRIGGER, 0)
+        with select.epoll() as ep:
+            ep.register(fd, select.EPOLLOUT)
+            poller = select.poll()
+            poller.register(fd, select.POLLOUT)
+            assert os.write(fd, b'\x20\x01' * 1538) == 3076
+            assert query(fd, GETOSPACE, 4) == [0, 4, 1024, 1020]
+            assert ep.poll(0) == [] and poller.poll(0) == []
+            fcntl.ioctl(fd, RESET)
+            assert os.write(fd, b'\x20\x01' * 1536) == 3072
+            assert query(fd, GETOSPACE, 4) == [1, 4, 1024, 1024]
+            assert ep.poll(0) == [(fd, select.EPOLLOUT)]
+            assert poller.poll(0) == [(fd, select.POLLOUT)]
+            fcntl.ioctl(fd, RESET)
+        print('DSP_ENDPOINT fragment_readiness_boundary PASS', flush=True)
         assert os.write(fd, b'\x20\x01' * 4096) == 4096  # Enforce negotiated limit.
         expect_error(lambda: os.write(fd, b'\x20\x01' * 2), errno.EAGAIN)
         assert query(fd, GETOPTR, 3) == [0, 4, 0]

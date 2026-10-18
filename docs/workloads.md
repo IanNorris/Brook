@@ -2059,3 +2059,16 @@ readiness, ALSA plugin error propagation and its own clock/drain tests remain.
 Non-native pointers and explicit non-native fragment geometry return unsupported
 rather than exposing a fictitious resampler clock. See `audio-clock.md` for the
 precise evidence and compatibility limits.
+
+### Clocked ALSA slave acceptance (18 October)
+
+Negotiated fragment readiness now passes exact-boundary poll/epoll checks.
+A Brook ALSA OSS slave installs through guest `nix-install` as Brook and passes
+clock comparisons, independent streams, drain, repeated whole-ring query gaps,
+reset/origin guards and partial mmap commit accounting. Raw and outer-plug paths
+each capture all 9,660 expected nonzero stereo frames exactly. All 34 hosted
+suites, supported compiled-entry checks and the plugin callback tests pass.
+This fixes the reproduced modulo-pointer ambiguity without selecting a new
+default or accepting Firefox audio. Other client rates/formats and normal-launcher
+browser acceptance remain next. See [audio evidence](audio-clock.md) and the
+[plugin instructions](../tools/alsa-oss-pkg/README.md).
