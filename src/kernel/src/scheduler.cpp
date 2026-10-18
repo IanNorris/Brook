@@ -2394,6 +2394,26 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     __builtin_unreachable();
 }
 
+// A CPU's first selected task need not be new: another CPU can already have
+// run and preempted it before this AP finishes starting. Restore its saved
+// kernel continuation exactly as in normal dispatch. Re-entering initialEntry
+// instead restarts user code with its existing memory and abandons any locks
+// held by its suspended syscall (observed as double relocation in ld.so).
+[[noreturn]] static void RestoreFirstProcess(Process* first, uint32_t cpu)
+{
+    SavedContext bootstrapContext{};
+    FxsaveArea bootstrapFx{};
+    volatile int32_t bootstrapRunningOnCpu = static_cast<int32_t>(cpu);
+    SerialPrintf("SCHED: CPU%u first dispatch pid=%u saved_rip=0x%lx\n",
+                 cpu, first->pid, first->savedCtx.rip);
+    // These throwaway bootstrap objects live on the permanent boot stack.
+    // No task can enqueue or resume them; context_switch only uses them as
+    // destinations for the outgoing state before restoring the selected task.
+    context_switch(&bootstrapContext, &first->savedCtx,
+                   &bootstrapFx, &first->fxsave, &bootstrapRunningOnCpu);
+    KernelPanic("SCHED: resumed discarded bootstrap context on CPU%u", cpu);
+}
+
 [[noreturn]] void SchedulerStart()
 {
     SerialPrintf("SCHED: starting scheduler, %u processes ready\n",
@@ -2421,42 +2441,10 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
 
-    VmmSwitchPageTable(first->addressSpace->pageTable);
-
-    WriteMsr(MSR_KERNEL_GS_BASE, first->savedCtx.gsBase);
-
-    if (first->fsBase)
-    {
-        uint32_t lo = static_cast<uint32_t>(first->fsBase);
-        uint32_t hi = static_cast<uint32_t>(first->fsBase >> 32);
-        __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000100U));
-    }
-
-    DbgPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
-                 cpu, first->name, first->pid);
-
-    g_schedulerRunning = true;
-
-    if (first->isKernelThread)
-    {
-        // Kernel threads stay in ring 0. Switch to the thread's own kernel
-        // stack, enable interrupts, and call the trampoline.
-        uint64_t newRsp = first->kernelStackTop - 16; // below fn/arg slots
-        __asm__ volatile(
-            "movq %0, %%rsp\n\t"
-            "sti\n\t"
-            "call *%1\n\t"
-            "ud2\n\t"
-            :: "r"(newRsp),
-               "r"(reinterpret_cast<uint64_t>(&KernelThreadTrampoline))
-            : "memory"
-        );
-        __builtin_unreachable();
-    }
-
-    SwitchToUserMode(first->stackTop, first->initialEntry);
-
-    __builtin_unreachable();
+    // Publish only after CPU-local ownership, CR3 tracking and entry stacks
+    // are ready. IF remains clear until the restored continuation enables it.
+    __atomic_store_n(&g_schedulerRunning, true, __ATOMIC_RELEASE);
+    RestoreFirstProcess(first, cpu);
 }
 
 // AP entry into the scheduler — called from SmpActivateAPs via the AP wake path.
@@ -2492,44 +2480,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
 
-    VmmSwitchPageTable(first->addressSpace->pageTable);
-
-    if (first == g_perCpu[cpu].idleProcess)
-    {
-        SerialPrintf("SCHED: CPU%u entering idle\n", cpu);
-        __asm__ volatile("sti");
-        for (;;)
-            __asm__ volatile("hlt" ::: "memory");
-    }
-
-    WriteMsr(MSR_KERNEL_GS_BASE, first->savedCtx.gsBase);
-
-    if (first->fsBase)
-    {
-        uint32_t lo = static_cast<uint32_t>(first->fsBase);
-        uint32_t hi = static_cast<uint32_t>(first->fsBase >> 32);
-        __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000100U));
-    }
-
-    DbgPrintf("SCHED: CPU%u entering user mode for '%s' (pid %u)\n",
-                 cpu, first->name, first->pid);
-
-    if (first->isKernelThread)
-    {
-        uint64_t newRsp = first->kernelStackTop - 16;
-        __asm__ volatile(
-            "movq %0, %%rsp\n\t"
-            "sti\n\t"
-            "call *%1\n\t"
-            "ud2\n\t"
-            :: "r"(newRsp),
-               "r"(reinterpret_cast<uint64_t>(&KernelThreadTrampoline))
-            : "memory"
-        );
-        __builtin_unreachable();
-    }
-
-    SwitchToUserMode(first->stackTop, first->initialEntry);    __builtin_unreachable();
+    RestoreFirstProcess(first, cpu);
 }
 
 void SchedulerSetCpuEnv(uint32_t cpuIndex, KernelCpuEnv* env)

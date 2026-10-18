@@ -2612,6 +2612,51 @@ to contain `0xfe0000000d18`, consistent with adding the bias twice. That is a
 hypothesis, not a reliable original-register or runtime-memory reconstruction.
 The original fault did not capture the relevant dynamic-table memory.
 
+The recurrence in session `84647ecd164143f98c42b9f7a9f0417c` used the same
+older review kernel and failed before the wallpaper appeared. This time CPU6
+registers, CR3, loader pages, user/panic stacks and the PID11 process object were
+captured before the user-authorized stop. Evidence is retained locally under
+`build/workloads/quake-openttd-crash-20261018/native-boot-iov-230928/`.
+The dynamic table's pointer entries (including HASH, STRTAB, SYMTAB, RELA and
+RELR) already contained twice the load bias in memory. `_dl_rtld_map` still had
+the correct single load bias and its readonly selector bit was clear. RELR
+relocation targets such as `0x37260` had already received one relocation:
+`0x2ef44` on disk became `0x7f000002ef44` in memory. This supersedes the earlier
+CMOV-only hypothesis: the bad address was present before the conditional move.
+PID11 still held a read lease on `g_fileMutationLock`. Its saved RIP was
+`0xffffffff80090fab`, the old kernel's `context_switch` resume `ret`, with
+a saved kernel RSP below the stack top. It had already been suspended; its
+saved context was not a fresh-process trampoline.
+
+Inspection found a concrete restart path: `SchedulerStartAp` could select a
+process already run and suspended on another CPU, then enter `initialEntry`
+instead of restoring its saved continuation. The same shortcut existed for
+kernel threads. The repair makes both BSP/AP first dispatch use the normal
+`context_switch` path, including the selected kernel stack, continuation and
+extended register state; fresh tasks still enter their prepared trampolines.
+The bootstrap context is discarded rather than published as a task. Keep the
+abandoned-lock guard intact. Static startup call-edge checks reject bypasses;
+they do not prove all scheduler control flow or register contents.
+
+The repaired Release kernel has SHA-256
+`97ae96b87edc3dded4eb4f27d69cd14bb840596a7bf45b6be6b1a0864b1c54be`.
+All 45 hosted suites and the supported entry-template mutation audit passed.
+`scripts/audit_scheduler_start.py` checks the compiled first-dispatch call
+contract, rejects three redirected-edge controls, and rejects the old kernel
+which lacks the restore helper. This is a direct-edge check, not a control-flow
+or arbitrary-body proof. The normal eight-CPU GL boot reached Wayland; eight
+workers completed 1,024 dynamic launches in 18.085846 seconds and all four
+byte-offset GPU transfer checks passed. Both tracked jobs drained their full
+lineages and exact stdout/stderr, the owned launcher exited zero after checked
+sync/shutdown, all three offline filesystem checks passed, and nine document
+fixtures retained their hashes and UID1000/GID100 ownership. Evidence:
+`build/workloads/first-dispatch-20261018/candidate-checked/acceptance-audit.json`.
+This boot selected fresh kernel threads on all eight first dispatches. A
+controlled delayed-AP test covering a suspended user syscall, suspended kernel
+thread, fresh task and idle case remains outstanding; ordinary boot acceptance
+does not establish that timing coverage. This is also separate from the known
+Quake/STK GPU resource-lifetime investigation.
+
 Two diagnostic helpers now preserve reproducible probes:
 
 - `scripts/workloads/loader_cmov.c` and `.S` exercise the loader's
@@ -2632,9 +2677,10 @@ Two diagnostic helpers now preserve reproducible probes:
 These are narrow diagnostics. No IRQ count was measured, the arithmetic pass
 is not an audit of all entry/return handlers, and concurrent exec does not
 exercise the same creation path as kernel-queued boot services. Matching disk
-bytes does not exclude runtime corruption. No kernel repair is established.
-A recurrence needs per-CPU registers/CR3, the original saved frame and stack,
-and the loader's relocated dynamic entries captured before stopping the VM.
+bytes does not exclude runtime corruption. These original probes alone did
+not establish a kernel repair. Future recurrences still need per-CPU
+registers/CR3, the original saved frame and stack, and the loader's relocated
+dynamic entries captured before stopping the VM.
 Keep the `KRwLockCleanupOnExit` guard: releasing abandoned filesystem locks
 would not repair the originating fault.
 

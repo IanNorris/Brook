@@ -14,6 +14,12 @@
   The [loader diagnostic checkpoint](workloads.md#loader-startup-diagnostic-checkpoint-18-october-2026)
   identifies the faulting relocation-loop instruction and records narrow CMOV
   and concurrent-exec probes; their passes do not resolve the boot fault.
+  A second captured failure (`84647ecd164143f98c42b9f7a9f0417c`) established
+  double-biased dynamic pointers in memory and once-relocated RELR targets.
+  The AP first-dispatch entry shortcut can restart a suspended process instead
+  of restoring it. Its saved-context repair is under acceptance; retain both
+  crash images and distinguish boot coverage from a deterministic delayed-AP
+  test of suspended user/kernel continuations.
 
 - Extend the static entry-state auditor's TLB-leaf model to the Debug compiler's
   `sub rsp, 0x10` stack-allocation form. `scripts/build.sh Debug` rejected that
