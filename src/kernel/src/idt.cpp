@@ -24,6 +24,8 @@
 #include "string.h"
 #include "irq_wrapper.h"
 #include "user_copy_fault.h"
+#include "user_copy.h"
+#include "signal_frame_layout.h"
 
 using brook::SerialPrintf;
 using brook::IoApicUnmaskIrq;
@@ -1655,40 +1657,27 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                              cr2, cr3val, missing, e4, e3, e2, e1);
         }
 
-        // Mark that we're in a signal handler
-        proc->inSignalHandler = true;
-        proc->sigSavedMask = proc->sigMask;
-        proc->sigMask |= sa.mask | (1ULL << (signum - 1));
-        proc->sigMask &= ~((1ULL << 8) | (1ULL << 18)); // never block SIGKILL/SIGSTOP
-
-        // Build SignalFrame — on alt stack if SA_ONSTACK & configured
-        uint64_t userRsp;
-        bool useAlt = (sa.flags & brook::SA_ONSTACK) && proc->sigAltstackSp != 0
-                      && !(proc->sigAltstackFlags & 2)
-                      && !proc->inSignalHandlerOnAltStack;
-        if (useAlt)
-        {
-            userRsp = proc->sigAltstackSp + proc->sigAltstackSize;
-            proc->inSignalHandlerOnAltStack = true;
+        const uint64_t savedMask=proc->sigMask;
+        const uint64_t handlerMask=(savedMask|sa.mask|(1ULL<<(signum-1))) &
+                                  ~((1ULL<<8)|(1ULL<<18));
+        const bool useAlt=(sa.flags&brook::SA_ONSTACK) && proc->sigAltstackSp!=0 &&
+                          !(proc->sigAltstackFlags&2) && !proc->inSignalHandlerOnAltStack;
+        uint64_t userRsp=0;
+        if(!brook::PlaceSignalFrame(ef->rsp,proc->sigAltstackSp,proc->sigAltstackSize,
+                                    useAlt,sizeof(brook::SignalFrame),&userRsp)) {
+            SerialPrintf("SIGNAL: invalid fault-frame location pid %u signal %u\n",proc->pid,signum);
+            __asm__ volatile("sti":::"memory");
+            brook::SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
+            brook::SchedulerExitCurrentProcess(128+11,11);
         }
-        else
-        {
-            userRsp = ef->rsp;
-            userRsp -= 128;                    // skip red zone
-        }
-        userRsp -= sizeof(brook::SignalFrame);
-        userRsp = (userRsp & ~0xFULL) - 8;    // function-entry ABI: RSP % 16 == 8
-
-        auto* sf = reinterpret_cast<brook::SignalFrame*>(userRsp);
-
-        // Clear the frame
-        memset(sf, 0, sizeof(brook::SignalFrame));
+        brook::SignalFrame localFrame{};
+        auto* sf=&localFrame;
 
         // Return address: sa_restorer (musl's __restore_rt → rt_sigreturn)
         sf->pretcode = sa.restorer;
 
         // Fill ucontext
-        sf->uc.uc_sigmask = proc->sigSavedMask;
+        sf->uc.uc_sigmask = savedMask;
         sf->uc.uc_stack.ss_sp    = proc->sigAltstackSp;
         sf->uc.uc_stack.ss_size  = proc->sigAltstackSize;
         sf->uc.uc_stack.ss_flags = useAlt ? 1
@@ -1731,6 +1720,21 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         // Store faulting address in si_addr (first 8 bytes of _data)
         *reinterpret_cast<uint64_t*>(&sf->info._data[0]) = cr2;
 
+        __asm__ volatile("sti":::"memory");
+        const bool copied=brook::CopyToUser(userRsp,sf,sizeof(*sf));
+        __asm__ volatile("cli":::"memory");
+        if(brook::SchedulerKernelOperationBoundary()) {brook::SchedulerYield();__builtin_trap();}
+        if(!copied) {
+            SerialPrintf("SIGNAL: inaccessible fault frame pid %u signal %u rsp=%lx\n",proc->pid,signum,userRsp);
+            __asm__ volatile("sti":::"memory");
+            brook::SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
+            brook::SchedulerExitCurrentProcess(128+11,11);
+        }
+        proc->sigSavedMask=savedMask;
+        proc->sigMask=handlerMask;
+        proc->inSignalHandler=true;
+        if(useAlt)proc->inSignalHandlerOnAltStack=true;
+
         // Redirect execution: modify the FullExceptionFrame so IRETQ returns
         // to the signal handler with the right arguments.
         ef->rip    = sa.handler;               // RIP → handler
@@ -1739,8 +1743,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         ef->rdi    = static_cast<uint64_t>(signum);        // arg1 = signum
         if (sa.flags & brook::SA_SIGINFO)
         {
-            ef->rsi = reinterpret_cast<uint64_t>(&sf->info);  // arg2 = siginfo
-            ef->rdx = reinterpret_cast<uint64_t>(&sf->uc);    // arg3 = ucontext
+            ef->rsi = userRsp+__builtin_offsetof(brook::SignalFrame,info);  // arg2 = siginfo
+            ef->rdx = userRsp+__builtin_offsetof(brook::SignalFrame,uc);    // arg3 = ucontext
         }
 
         // Re-enable interrupts; the assembly stub will IRETQ back to the handler.

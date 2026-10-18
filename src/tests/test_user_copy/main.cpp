@@ -13,6 +13,7 @@
 #include <ucontext.h>
 #include "user_copy_fault.h"
 #include "signal_return.h"
+#include "signal_frame_layout.h"
 #define CHECK(c) do { if(!(c)) { std::fprintf(stderr,"FAIL %d: %s\n",__LINE__,#c);std::abort(); } } while(0)
 using namespace brook;
 extern "C" const char BrookCopyFromUserInstruction[],BrookCopyToUserInstruction[];
@@ -45,6 +46,19 @@ static void recover(int,siginfo_t* info,void* context) {
     }
 }
 int main() {
+    uint64_t address=123;
+    CHECK(PlaceSignalFrame(0x7fffffffe000,0,0,false,440,&address));
+    CHECK((address&15)==8 && address+440<=0x7fffffffe000-128);
+    CHECK(PlaceSignalFrame(0,0x100000,8192,true,440,&address));
+    CHECK(address>=0x100000 && address+440<=0x102000 && (address&15)==8);
+    for(auto bad:{uint64_t{0},uint64_t{127},uint64_t{0x10000},uint64_t{0x800000000000},~uint64_t{0}}) {
+        address=123;CHECK(!PlaceSignalFrame(bad,0,0,false,440,&address) && address==123);
+    }
+    CHECK(!PlaceSignalFrame(0,~uint64_t{0}-100,8192,true,440,&address));
+    CHECK(!PlaceSignalFrame(0,0x7ffffffff000,8192,true,440,&address));
+    CHECK(!PlaceSignalFrame(0,0x100000,440,true,440,&address)); // alignment needs room
+    CHECK(!PlaceSignalFrame(0,0x100000,0,true,440,&address));
+    CHECK(!PlaceSignalFrame(0,0,8192,true,440,&address));
     struct sigaction action{};action.sa_sigaction=recover;action.sa_flags=SA_SIGINFO;
     CHECK(!sigaction(SIGSEGV,&action,nullptr));
     const size_t page=static_cast<size_t>(sysconf(_SC_PAGESIZE));CHECK(page==4096);

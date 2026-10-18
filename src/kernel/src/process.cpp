@@ -32,6 +32,7 @@
 #include "cpu.h"
 #include "ksym_addrs.h"
 #include "user_copy.h"
+#include "signal_frame_layout.h"
 #include "vdso.h"
 
 namespace brook {
@@ -2121,54 +2122,27 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
                             proc->pid, proc->tgid, sa.handler, sa.restorer, sa.flags,
                             syscallResult, proc->currentSyscallNum);
 
-    proc->inSignalHandler = true;
-
-    // Save current signal mask, then block signals specified by sa_mask + this signal
-    proc->sigSavedMask = returnMask;
-    proc->sigMask |= sa.mask | (1ULL << (signum - 1));
-    // Never block SIGKILL or SIGSTOP
-    proc->sigMask &= ~((1ULL << 8) | (1ULL << 18));
-
-    // Build the signal frame — on alt stack if SA_ONSTACK and one is configured,
-    // otherwise on the current user stack (skip red zone).
-    uint64_t userRsp;
-    bool useAlt = (sa.flags & SA_ONSTACK) && proc->sigAltstackSp != 0
-                  && !(proc->sigAltstackFlags & 2 /*SS_DISABLE*/)
-                  && !proc->inSignalHandlerOnAltStack;
-    if (useAlt)
-    {
-        userRsp = proc->sigAltstackSp + proc->sigAltstackSize;
-        proc->inSignalHandlerOnAltStack = true;
+    const uint64_t savedMask=returnMask;
+    const uint64_t handlerMask=(proc->sigMask|sa.mask|(1ULL<<(signum-1))) &
+                              ~((1ULL<<8)|(1ULL<<18));
+    const bool useAlt=(sa.flags&SA_ONSTACK) && proc->sigAltstackSp!=0 &&
+                      !(proc->sigAltstackFlags&2) && !proc->inSignalHandlerOnAltStack;
+    uint64_t userRsp=0;
+    if(!PlaceSignalFrame(frame->rsp,proc->sigAltstackSp,proc->sigAltstackSize,
+                         useAlt,sizeof(SignalFrame),&userRsp)) {
+        SerialPrintf("SIGNAL: invalid frame location pid %u signal %d\n",proc->pid,signum);
+        __asm__ volatile("sti":::"memory");
+        SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
+        SchedulerExitCurrentProcess(128+11,11);
     }
-    else
-    {
-        userRsp = frame->rsp;
-        userRsp -= 128;                    // skip red zone
-    }
-    userRsp -= sizeof(SignalFrame);
-    userRsp = (userRsp & ~0xFULL) - 8;    // function-entry ABI: RSP % 16 == 8
-
-    {
-        uint64_t sfEnd = userRsp + sizeof(SignalFrame);
-        if (userRsp >= 0x0000800000000000ULL || sfEnd > 0x0000800000000000ULL ||
-            sfEnd < userRsp) {
-            brook::SerialPrintf("SIGNAL: bad user stack 0x%lx for pid %u signal %d\n",
-                                userRsp, proc->pid, signum);
-            proc->inSignalHandler = false;
-            proc->sigMask = proc->sigSavedMask;
-            return syscallResult;
-        }
-    }
-    auto* sf = reinterpret_cast<SignalFrame*>(userRsp);
-
-    // Clear the frame
-    memset(sf, 0, sizeof(SignalFrame));
+    SignalFrame localFrame{};
+    auto* sf=&localFrame;
 
     // Return address: sa_restorer (musl's __restore_rt which calls rt_sigreturn)
     sf->pretcode = sa.restorer;
 
     // Fill ucontext
-    sf->uc.uc_sigmask = proc->sigSavedMask;
+    sf->uc.uc_sigmask = savedMask;
     sf->uc.uc_stack.ss_sp    = proc->sigAltstackSp;
     sf->uc.uc_stack.ss_size  = proc->sigAltstackSize;
     sf->uc.uc_stack.ss_flags = useAlt ? 1 /*SS_ONSTACK*/
@@ -2249,6 +2223,23 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // Fill siginfo
     sf->info = signalInfo;
 
+    // Prefault/COW may allocate or sleep. No return-path locks are held, and
+    // precise usercopy faults return failure instead of nesting a kernel #PF.
+    __asm__ volatile("sti":::"memory");
+    const bool copied=CopyToUser(userRsp,sf,sizeof(*sf));
+    __asm__ volatile("cli":::"memory");
+    if(SchedulerKernelOperationBoundary()) {SchedulerYield();__builtin_trap();}
+    if(!copied) {
+        SerialPrintf("SIGNAL: inaccessible frame pid %u signal %d rsp=%lx\n",proc->pid,signum,userRsp);
+        __asm__ volatile("sti":::"memory");
+        SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
+        SchedulerExitCurrentProcess(128+11,11);
+    }
+    proc->sigSavedMask=savedMask;
+    proc->sigMask=handlerMask;
+    proc->inSignalHandler=true;
+    if(useAlt)proc->inSignalHandlerOnAltStack=true;
+
     // Redirect execution to the signal handler
     frame->rcx = sa.handler;                           // RIP = handler
     frame->rsp = userRsp;                              // RSP = signal frame
@@ -2259,8 +2250,8 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     if (sa.flags & SA_SIGINFO)
     {
         // SA_SIGINFO: handler(int signum, siginfo_t* info, void* ucontext)
-        frame->rsi = reinterpret_cast<uint64_t>(&sf->info);
-        frame->rdx = reinterpret_cast<uint64_t>(&sf->uc);
+        frame->rsi = userRsp+__builtin_offsetof(SignalFrame,info);
+        frame->rdx = userRsp+__builtin_offsetof(SignalFrame,uc);
     }
 
     // The handler's mask remains active until rt_sigreturn restores returnMask.
