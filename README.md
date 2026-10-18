@@ -42,7 +42,7 @@ the table distinguishes tested behavior from remaining limitations.
 |----------|---------|--------|-------|
 | [bash](https://www.gnu.org/software/bash/) | 5.2 / 5.3 | ✅ Working | Bundled shell and Nix Bash closures; readline, job control and scripting |
 | [DOOM](https://github.com/ozkl/doomgeneric) | 1.9 | ✅ Working | Runs in a WM window or full-screen, with keyboard input |
-| [Quake 2 / Yamagi](https://www.yamagi.org/quake2/) | 8.60 | ✅ Gameplay | Software and hardware virgl GL3 renderers, startup demo, OSS audio and OGG music; mouse capture and intermittent audio timing remain open |
+| [Quake 2 / Yamagi](https://www.yamagi.org/quake2/) | 8.60 | ✅ Gameplay | Software and hardware virgl GL3 renderers, startup demo, OSS audio and OGG music; [GPU resource retirement/repeated launches](docs/gpu-resource-lifetime.md), mouse capture and intermittent audio timing remain open |
 | [GLtron](https://www.gltron.org/) | 0.70 | ⚠️ Experimental | Compatibility launcher installs through guest `nix-install`; hardware virgl menu and light-cycle gameplay verified, with sound disabled |
 | [SuperTuxKart](https://supertuxkart.net/) | 1.5 | ⚠️ Experimental | Guest package installation and virgl Lighthouse AI race verified; writable state uses ext2; GPU teardown accounting remains under investigation |
 | [busybox](https://busybox.net/) | 1.36 | ✅ Working | ls, cat, echo, wc, head, tail, grep, and many more |
@@ -107,7 +107,7 @@ the table distinguishes tested behavior from remaining limitations.
   building the kernel, modules and bare-metal tests took 52–54 seconds.
   The [virtio-net TX ownership fix](docs/package-pipeline.md) reduced
   the measured clean-image SDK install from 732 to 236 seconds; compilation
-  remains about 50 seconds. Current host validation covers 42 suites; both full
+  remains about 50 seconds. Current host validation covers 45 suites; both full
   bootstrap paths still need renewal beyond that pinned 40-suite checkpoint.
 
 - **Desktop identity and package registration:** new apps and Terminal run as

@@ -2594,12 +2594,39 @@ struct drm_gem_close { uint32_t handle, pad; };
 
 static int g_drm_fd = -1;   /* /dev/dri/renderD128, opened once at startup */
 
+/* PRIME imports return an existing GEM handle for the same object. wl_buffers
+ * share ownership here; closing each alias independently can close a new
+ * buffer after the numeric GEM handle is reused. The event loop is single
+ * threaded, and this list is the sole owner of imported GEM handles. */
+struct brook_dmabuf_import {
+    uint32_t bo, gres, refs;
+    struct brook_dmabuf_import *next;
+};
+static struct brook_dmabuf_import *g_dmabuf_imports;
+
+static void dmabuf_release_bo(uint32_t bo)
+{
+    struct brook_dmabuf_import **link = &g_dmabuf_imports;
+    while (*link && (*link)->bo != bo) link = &(*link)->next;
+    if (!*link) return;
+    struct brook_dmabuf_import *entry = *link;
+    if (--entry->refs) return;
+    *link = entry->next;
+    if (g_drm_fd >= 0) {
+        struct drm_gem_close gc = { bo, 0 };
+        ioctl(g_drm_fd, DRM_IOCTL_GEM_CLOSE, &gc);
+    }
+    free(entry);
+}
+
+
 static const struct wl_buffer_interface dmabuf_buffer_impl;
 
 /* Resolve an imported dmabuf fd to a host virgl resource id via the DRM node:
  * PRIME_FD_TO_HANDLE (fd -> GEM bo) then RESOURCE_INFO (bo -> res_handle/gres). */
 static uint32_t dmabuf_resolve_gres(int fd, uint32_t *out_bo)
 {
+    if (out_bo) *out_bo = 0;
     if (g_drm_fd < 0) return 0;
     struct drm_prime_handle ph;
     memset(&ph, 0, sizeof(ph));
@@ -2608,13 +2635,30 @@ static uint32_t dmabuf_resolve_gres(int fd, uint32_t *out_bo)
         fprintf(stderr, "[waylandd] dmabuf: FD_TO_HANDLE failed: %s\n", strerror(errno));
         return 0;
     }
+    for (struct brook_dmabuf_import *entry = g_dmabuf_imports; entry; entry = entry->next) {
+        if (entry->bo == ph.handle) {
+            ++entry->refs;
+            if (out_bo) *out_bo = entry->bo;
+            return entry->gres;
+        }
+    }
     struct drm_virtgpu_resource_info ri;
     memset(&ri, 0, sizeof(ri));
     ri.bo_handle = ph.handle;
     if (ioctl(g_drm_fd, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &ri) != 0) {
         fprintf(stderr, "[waylandd] dmabuf: RESOURCE_INFO failed: %s\n", strerror(errno));
+        struct drm_gem_close gc = { ph.handle, 0 };
+        ioctl(g_drm_fd, DRM_IOCTL_GEM_CLOSE, &gc);
         return 0;
     }
+    struct brook_dmabuf_import *entry = calloc(1, sizeof(*entry));
+    if (!entry) {
+        struct drm_gem_close gc = { ph.handle, 0 };
+        ioctl(g_drm_fd, DRM_IOCTL_GEM_CLOSE, &gc);
+        return 0;
+    }
+    entry->bo = ph.handle; entry->gres = ri.res_handle; entry->refs = 1;
+    entry->next = g_dmabuf_imports; g_dmabuf_imports = entry;
     if (out_bo) *out_bo = ph.handle;
     return ri.res_handle;
 }
@@ -2623,10 +2667,7 @@ static void dmabuf_buffer_destroy(struct wl_resource *r)
 {
     struct brook_dmabuf_buffer *db = wl_resource_get_user_data(r);
     if (db) {
-        if (db->bo_handle && g_drm_fd >= 0) {
-            struct drm_gem_close gc = { db->bo_handle, 0 };
-            ioctl(g_drm_fd, DRM_IOCTL_GEM_CLOSE, &gc);
-        }
+        if (db->bo_handle) dmabuf_release_bo(db->bo_handle);
         free(db);
     }
 }
@@ -2679,12 +2720,21 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
     db->width = width; db->height = height;
     db->stride = p->stride; db->fourcc = format;
     db->gres = dmabuf_resolve_gres(p->fd, &db->bo_handle);
-    close(p->fd); p->fd = -1;   /* the GEM alias now holds the reference */
+    close(p->fd); p->fd = -1;   /* the import cache now holds the GEM reference */
+    if (!db->gres) {
+        free(db);
+        if (id) wl_resource_post_error(r, ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_WL_BUFFER,
+                                       "dmabuf import failed");
+        return NULL;
+    }
     fprintf(stderr, "[waylandd] dmabuf buffer %dx%d stride=%u fourcc=0x%x -> gres=%u\n",
             width, height, db->stride, format, db->gres);
 
     struct wl_resource *buf = wl_resource_create(c, &wl_buffer_interface, 1, id);
-    if (!buf) { free(db); wl_client_post_no_memory(c); return NULL; }
+    if (!buf) {
+        if (db->bo_handle) dmabuf_release_bo(db->bo_handle);
+        free(db); wl_client_post_no_memory(c); return NULL;
+    }
     wl_resource_set_implementation(buf, &dmabuf_buffer_impl, db,
                                    dmabuf_buffer_destroy);
     return buf;

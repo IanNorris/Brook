@@ -36,6 +36,11 @@ stdenv.mkDerivation {
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
         -L${wayland}/lib -lwayland-server -o retained-surface-test
     ./retained-surface-test
+    $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
+        dmabuf-import-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        -L${wayland}/lib -lwayland-server -o dmabuf-import-test
+    ./dmabuf-import-test
   '';
 
   buildPhase = ''

@@ -3444,8 +3444,8 @@ void FinalizeClosedFd(const FdClaimResult& c)
 
     if (c.type == FdType::DevDri && c.handle)
     {
-        // GL shim: tear down the per-fd DRM context — destroy its GpuApp virgl
-        // context (frees host resources) and free the GEM table.
+        // Tear down the per-fd context and GEM table. Host RESOURCE_UNREF and
+        // shared backing lifetime remain open; see docs/gpu-resource-lifetime.md.
         auto* dctx = static_cast<DrmCtx*>(c.handle);
         if (__atomic_fetch_sub(&dctx->refCount, 1, __ATOMIC_ACQ_REL) > 1) return;
         const brook::GpuAppOps* ga = brook::GpuAppGet();
@@ -6011,7 +6011,11 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         int fd = FdAlloc(proc, FdType::DrmPrime, p);
         if (fd < 0) { kfree(p); return -EMFILE; }
         ph.fd = fd;
-        return CopyToUser(arg, &ph, sizeof(ph)) ? 0 : -EFAULT;
+        if (!CopyToUser(arg, &ph, sizeof(ph))) {
+            CloseProcessFd(proc, fd);
+            return -EFAULT;
+        }
+        return 0;
     }
     case DRM_NR_PRIME_FD_TO_HANDLE:
     {
@@ -6024,14 +6028,33 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         DrmPrimeHandle ph = *reinterpret_cast<DrmPrimeHandle*>(arg);
         Process* proc = ProcessCurrent();
         if (!proc) return -ESRCH;
-        FdEntry* fde = FdGet(proc, ph.fd);
+        // Keep the capability alive across metadata lookup and GEM creation.
+        // FdGet drops the table lock and can race a concurrent close/reuse.
+        FdRef primeRef(proc, ph.fd);
+        FdEntry* fde = primeRef.get();
         if (!fde || fde->type != FdType::DrmPrime || !fde->handle) return -EINVAL;
         auto* p = static_cast<DrmPrimeObj*>(fde->handle);
+        // Repeated PRIME imports into one DRM file describe one GEM handle,
+        // including imports through separately exported FDs and self-import.
+        // Host IDs are not recycled today; shared object identity must replace
+        // this comparison before resource-ID recycling is enabled.
+        for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
+            if (dctx->gem[i].used && dctx->gem[i].gres == p->gres) {
+                ph.handle = i + 1;
+                return CopyToUser(arg, &ph, sizeof(ph)) ? 0 : -EFAULT;
+            }
+        }
         uint32_t bo = DrmGemAllocImported(dctx, p->gres, p->size, p->stride,
                                           p->width, p->height);
         if (bo == 0) return -ENOMEM;
         ph.handle = bo;
-        return CopyToUser(arg, &ph, sizeof(ph)) ? 0 : -EFAULT;
+        if (!CopyToUser(arg, &ph, sizeof(ph))) {
+            // This is a metadata-only alias: creation allocated no new host
+            // resource or backing. Undo only this newly inserted handle.
+            dctx->gem[bo - 1] = {};
+            return -EFAULT;
+        }
+        return 0;
     }
     case DRM_NR_GEM_CLOSE:
     {
@@ -6039,8 +6062,8 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         DrmGemClose gc = *reinterpret_cast<DrmGemClose*>(arg);
         DrmGemObj* g = DrmGemGet(dctx, gc.handle);
         if (!g) return -ENOENT;
-        // Note: the underlying host resource is reclaimed wholesale on
-        // CtxDestroy (fd close); per-handle host free lands with MAP/blob in M1b.
+        // Drops only the GEM alias today. Host retirement and backing leases
+        // are still required before IDs or device-visible pages can be reused.
         g->used = false;
         return 0;
     }

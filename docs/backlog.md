@@ -903,6 +903,16 @@ reproducers alongside each experiment rather than treating launch as success.
   boot/mode transitions before rehearsing the [live tour](showcase.md).
 
 
+### GPU resource lifetime and PRIME identity
+
+See [ownership, evidence and retirement gates](gpu-resource-lifetime.md).
+Repeated imports now reuse a GEM handle with a companion Wayland owner count;
+PRIME metadata lookup is pinned against concurrent close. The separate
+4,095-allocation host-ID exhaustion, exporter/backing lifetime, completed
+presentation before buffer release, mmap tokens and fenced resource/texture
+retirement remain open. Do not enable numeric ID reuse before those leases and
+completion paths are safe.
+
 ### RUN-06 — GPU resource mapping accounting during SuperTuxKart teardown
 
 SuperTuxKart 1.5 completed a timed Lighthouse AI race on the eight-core, 4 GiB
