@@ -599,8 +599,13 @@ dispatcher remains unavailable after panic.
 Clicks and double clicks now hold their mouse button for 200 ms by default.
 Brook samples button state in its compositor loop; the old 20 ms pulse could
 fall between frames and disappear at 8–13 FPS even though QMP accepted it.
-Set `hold_seconds` on `click`, `double_click` or `keypress` actions to override
-the press duration (0.01–1 s). Keyboard chords retain their 20 ms default.
+Set `hold_seconds` on `click`, `double_click`, `keypress` or `type` actions to
+override the press duration (0.01–1 s). For `type`, it applies to each character,
+including its Shift chord. Keyboard chords and typed characters retain their
+20 ms default; `{"type":"type","text":"https://example.org","hold_seconds":0.08}`
+is useful for a loaded guest. Typed holds count toward the batch limit, so split
+long text into bounded batches. A live Firefox URL entry lost its final character
+with 20 ms holds; an 80 ms Chromium entry delivered the complete same video URL.
 Combined explicit waits and holds are bounded to 20 seconds, and cancellation
 releases held input. The contract tests model a 100 ms guest poll and verify
 that the default click spans it while an explicitly short pulse is preserved.

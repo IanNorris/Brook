@@ -673,8 +673,8 @@ def input_actions(session, actions, frame_id=None, _cancel=None, **_):
             raise ValueError("Unknown action field")
         if "hold_seconds" in a:
             hold=a["hold_seconds"]
-            if a["type"] not in {"click","double_click","keypress"}:
-                raise ValueError("hold_seconds applies to click, double_click or keypress")
+            if a["type"] not in {"click","double_click","keypress","type"}:
+                raise ValueError("hold_seconds applies to click, double_click, keypress or type")
             if isinstance(hold,bool) or not isinstance(hold,(int,float)) or not math.isfinite(hold) or not .01<=hold<=1:
                 raise ValueError("hold_seconds must be finite and between 0.01 and 1")
         if a["type"]=="keypress" and (not isinstance(a.get("keys"),list) or not 1<=len(a["keys"])<=8 or any(not isinstance(k,str) for k in a["keys"])):
@@ -695,6 +695,8 @@ def input_actions(session, actions, frame_id=None, _cancel=None, **_):
     timed+=sum(float(a.get("hold_seconds",.2 if a["type"] in {"click","double_click"} else .02)) *
                (2 if a["type"]=="double_click" else 1)
                for a in actions if a["type"] in {"click","double_click","keypress"})
+    timed+=sum(len(a.get("text",""))*float(a.get("hold_seconds",.02))
+               for a in actions if a["type"]=="type")
     if timed>20:raise ValueError("Input waits and holds exceed 20 seconds")
     with session_lock(session) as data:
         lease=REGISTRY/session/"control.json"
@@ -778,7 +780,7 @@ def input_actions(session, actions, frame_id=None, _cancel=None, **_):
                     elif kind in {"button_down","button_up"}:button(a.get("button","left"),kind=="button_down")
                     elif kind=="type":
                         for k,shift in text_keys(a["text"]):
-                            check_cancel();chord((["shift"] if shift else [])+[k])
+                            check_cancel();chord((["shift"] if shift else [])+[k],float(a.get("hold_seconds",.02)))
                     elif kind=="wait":
                         end=time.monotonic()+float(a.get("seconds",0))
                         while time.monotonic()<end:
@@ -990,7 +992,7 @@ register("vm_input",input_actions,"Ordered timed key/mouse batches, ASCII-US tex
     "type":{"type":"string","enum":["keypress","type","move","relative_move","click","double_click","scroll","key_down","key_up","button_down","button_up","wait"]},
     "x":INT,"y":INT,"dx":INT,"dy":INT,"button":{"type":"string","enum":["left","middle","right"]},
     "key":STR,"keys":{"type":"array","items":STR},"text":STR,"seconds":NUM,
-    "hold_seconds":{"type":"number","minimum":.01,"maximum":1,"description":"Click/double-click press duration (default0.2s); keypress override (default0.02s)"}},["type"])},"frame_id":STR},["session","actions"])
+    "hold_seconds":{"type":"number","minimum":.01,"maximum":1,"description":"Click/double-click press duration (default0.2s); keypress or each typed character (default0.02s). Increase for slow guests; typed holds count toward the20s batch limit."}},["type"])},"frame_id":STR},["session","actions"])
 register("vm_wait",wait,"Wait for a serial-log substring without repeatedly returning whole logs",{**SESSION,"text":STR,"timeout_s":NUM},["session","text"],True)
 register("vm_record",video_recording,"Direct VM video/audio recording: start/status/stop; private display stream, no host desktop or microphone",{**SESSION,"action":STR,"duration_s":NUM,"fps":INT,"audio":{"type":"boolean"},"width":INT,"height":INT},["session"])
 register("vm_audio_capture",audio_capture,"Bounded PCM WAV capture without speaker output; no host microphone",{**SESSION,"duration_s":NUM},["session"])

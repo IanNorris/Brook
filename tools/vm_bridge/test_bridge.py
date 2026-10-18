@@ -269,6 +269,50 @@ class Contracts(unittest.TestCase):
                 server.input_actions('s',[{'type':'keypress','keys':['a']},{'type':'scroll','dy':500}])
             lock.assert_not_called()
 
+    def test_typed_holds_keep_shift_and_release_on_cancel(self):
+        clock=[0.0];edges=[];cancel=threading.Event()
+        class FakeQMP:
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def call(self,name,args=None):
+                if name=='query-qmp-schema':
+                    return [{'meta-type':'enum','members':[{'name':x} for x in ['ret','ctrl','shift','a','b']]}]
+                for event in args['events']:
+                    if event['type']=='key':edges.append((clock[0],event['data']['key']['data'],event['data']['down']))
+                return {}
+        @contextlib.contextmanager
+        def lock(_):yield {}
+        def sleep(seconds):clock[0]+=seconds
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);(root/'s').mkdir()
+            with patch.object(server,'REGISTRY',root),patch.object(server,'session_lock',lock), \
+                 patch.object(server,'panic_state',return_value=False),patch.object(server,'QMP',lambda _:FakeQMP()), \
+                 patch.object(server.time,'monotonic',side_effect=lambda:clock[0]),patch.object(server.time,'sleep',side_effect=sleep):
+                server.input_actions('s',[{'type':'type','text':'Ab','hold_seconds':.15}])
+                self.assertEqual([(k,d) for _,k,d in edges],
+                                 [('shift',True),('a',True),('a',False),('shift',False),('b',True),('b',False)])
+                self.assertAlmostEqual(edges[2][0]-edges[1][0],.15)
+                self.assertAlmostEqual(edges[5][0]-edges[4][0],.15)
+                edges.clear()
+                def interrupt(seconds):
+                    clock[0]+=seconds;cancel.set()
+                with patch.object(server.time,'sleep',side_effect=interrupt):
+                    with self.assertRaisesRegex(RuntimeError,'cancelled'):
+                        server.input_actions('s',[{'type':'type','text':'Ab','hold_seconds':.15}],_cancel=cancel)
+                self.assertEqual({k for _,k,d in edges if d},{'shift','a'})
+                self.assertEqual({k for _,k,d in edges if not d},{'shift','a'})
+
+    def test_typed_hold_budget_rejected_before_input(self):
+        with patch.object(server,'session_lock') as lock:
+            for actions in ([{'type':'type','text':'a'*201,'hold_seconds':.1}],
+                            [{'type':'wait','seconds':5}]*3+[{'type':'type','text':'a'*300}]):
+                with self.subTest(actions=actions),self.assertRaisesRegex(ValueError,'holds exceed'):
+                    server.input_actions('s',actions)
+            for value in [True,0,float('nan'),float('inf'),2]:
+                with self.subTest(value=value),self.assertRaises(ValueError):
+                    server.input_actions('s',[{'type':'type','text':'a','hold_seconds':value}])
+            lock.assert_not_called()
+
     def test_schema_rejects_boolean_number(self):
         with self.assertRaises(ValueError):
             server.call_tool('vm_logs',{'session':'f'*32,'offset':True})
