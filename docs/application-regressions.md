@@ -215,3 +215,33 @@ All 39 hosted suites and the supported compiled entry audit passed before boot.
 Both full bootstrap paths were subsequently renewed at `f4066d0`; see the
 [matching refresh](bootstrap.md#matching-39-suite-refresh-after-clock-and-desktop-changes-2026-10-18).
 Application evidence above retains its own kernel/package identities and scope.
+
+## Frozen-kernel media rerun — 18 October 2026
+
+Eight-vCPU, 4-GiB private disk copies ran kernel
+`9e64f2783804714a8998f0bdaf2cbe756980fa0e668b98d07c38292615646ccd`.
+The first two runs used an actual native SDL QEMU window with silent host audio;
+the final cold check used headless display. App launches came from the installed
+catalogue as Brook. Saved documents and profiles were preserved.
+
+| Check | Result |
+| --- | --- |
+| OpenTTD saved world | Loaded the existing save and advanced the simulation with nonzero music |
+| OpenTTD confirmed in-game exit | Native Yes confirmation drained the complete launch lineage; subsequent capture had zero frames and inactive output |
+| OpenTTD separate SIGKILL | Nonzero PCM before termination; full lineage and output drained afterward |
+| VLC ordinary playback | New recovery package played 720p video/audio through the normal launcher, including after cold boot |
+| VLC pause/resume and close | Pause silenced output, resume restored it; normal exit and a separate active-playback SIGKILL drained all lineage tasks and audio |
+| VLC long minimize/restore | Audio recovered and normal close passed; the restored video area remained black and is **not accepted** |
+
+The run found and fixed a VLC OSS callback that retried persistent errors and
+zero writes forever. The [package checks](../tools/vlc-brook-pkg/README.md)
+reproduce six bounded original loops and pass all ten patched cases. The guest
+logged three temporary-backpressure errors and replaced its stream before
+resuming audio. Brook's existing blocking-write timeout and the original device
+discontinuity still need investigation; this is not smooth-playback acceptance.
+
+All three sessions passed heap checks, acknowledged shutdown, original-launcher
+exit zero, serial kernel/device/fatal-user-error checks and the three read-only
+filesystem checks. All nine saved fixtures retained hashes and ownership.
+Two native-window recordings fully decode; see [recording evidence](vm-recording.md).
+Local evidence: `build/workloads/media-regression-bed237cb-20261018/`.

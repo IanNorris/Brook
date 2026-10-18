@@ -50,9 +50,8 @@ QEMU supplies no source audio timestamps or upstream drop counters: unknown
 upstream losses remain unknown. These observations do not establish exact
 physical A/V timing. Capture and encoding consume host CPU and memory.
 
-CPU and GPU headless QEMU were exercised. Native SDL display arguments are
-preserved by tested launcher code, but concurrent native-window recording,
-boot/mode transitions, 4K and reset-during-live-recording still
+CPU and GPU headless QEMU and bounded CPU-compositor/native-SDL recording were
+exercised. GPU native-window operation, boot/mode transitions, 4K and reset-during-live-recording still
 need live acceptance. No final showcase production has begun.
 
 ## Acceptance on 17 October 2026
@@ -110,3 +109,36 @@ remain separate acceptance work. Local evidence:
 `build/workloads/stability-f99e267d-20261018/review/`, session
 `1ebd6b51256e49949dfcba5471e8bed6`, recording
 `62880e51b2e2427caca3f169b50bc1ac`.
+
+## Native SDL window — 18 October 2026
+
+Two 90-second CPU-compositor recordings ran with QEMU's actual `-display sdl`
+window active and its host audio backend set to `none`. Capture used the VM's
+private RFB/audio stream; it did not capture the host desktop. VLC decoded the
+1280×720 Big Buck Bunny source on the native 1920×1080 desktop. All video and
+AAC frames decoded, with monotonic timestamps and the expected canvas size.
+
+| Take | Video frames | Coalesced updates | Missed encoder slots | Received audio frames | Silence filled |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Initial playback | 2,419 | 117 | 35 | 3,593,247 | 726,760 |
+| Recovery-package window test | 2,117 | 60 | 31 | 3,413,907 | 906,099 |
+
+Both reported zero local audio queue drops, late samples and estimated
+discontinuities. Requested cadence was 30 FPS; these counts do not certify
+application or display frame rate. Silence includes idle/pause/exit intervals;
+upstream losses and physical A/V synchronization remain unknown. Encoder cost
+was respectively about 85 and 55 CPU seconds, with 171 and 165 MiB peak RSS.
+Full-resolution frames were inspected from both takes.
+
+The second take includes pause/resume, a measured 55-second minimize, restore
+and normal close. It exposed an application limitation: audio recovered, but
+VLC's video area stayed black after restore. Ordinary playback and recording
+work; video restoration is not accepted. The first run also exposed an OSS
+write-error loop, addressed by the [VLC recovery patch](../tools/vlc-brook-pkg/README.md).
+Recording completion must not be confused with full application acceptance.
+
+Evidence: `build/workloads/media-regression-bed237cb-20261018/`. Sessions
+`e93e9fc9d43f4402a88651e132acadf8` and `d284671b1e0b41d5a779d8d9362748f4`,
+recordings `03849c21d4cd4e1e98e626ca7a5e2084` and
+`57383b5f2a5d4060bfccb674bd78c995`. Boot/mode transitions, GPU native-window
+recording, 4K and reset during capture remain open. No final showcase has begun.

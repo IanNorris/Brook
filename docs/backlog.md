@@ -130,13 +130,22 @@
   see [capture evidence](completed-frame-capture.md). Existing MCP processes need
   a reload alongside the updated kernel. Bounded private-stream video/audio
   recording now passes CPU/GPU and real-player checks; see [recording](vm-recording.md).
-  Long takes, native-window capture and boot/mode transitions remain open.
+  A three-minute headless take and two 90-second CPU/native-SDL takes now pass
+  full codec decode. GPU native-window capture and boot/mode transitions remain
+  open; see the recording evidence for timing and application limits.
 
 - OpenTTD 15.3 hung during the user's confirmed in-game exit, with music
   continuing until SIGKILL. On the revised persistent-home/idle-DMA build, both
   menu exit and confirmed in-game exit with music enabled returned to ten tasks
   and inactive audio. Keep longer-session reruns and any recurrence capture open;
   the two changes have not been isolated as the cause of the original hang.
+- The frozen-kernel media rerun again passes OpenTTD saved-world progression,
+  confirmed exit and separate active-music SIGKILL cleanup. VLC's OSS error loop
+  is fixed, but its video area remains black after a 55-second minimize/restore
+  while audio recovers. Isolate later Wayland surface/frame-callback transitions;
+  do not describe video restoration as accepted. The run also observed three
+  blocking DSP write `EAGAIN` errors; investigate the existing 500-ms deadline
+  and producer/device progress. See [media rerun](application-regressions.md#frozen-kernel-media-rerun--18-october-2026).
 - Browser launcher entries must use the same tested compatibility configuration
   as command-driven acceptance. The user-run Chromium entry exited with a root
   sandbox error; Firefox faulted during generic startup instead of loading.

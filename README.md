@@ -62,7 +62,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen (including cold boot) and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
 | [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer save/reopen across cold boot and full native-close cleanup verified as Brook; startup and broader suite coverage remain experimental |
-| [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | 720p OSS playback through the normal launcher; pause/resume, full native-close and SIGKILL audio cleanup verified with the compatibility build |
+| [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | 720p OSS playback; write-error recovery, normal-close and SIGKILL audio cleanup verified; video after long minimize/restore remains broken |
 
 ## Recent progress
 
@@ -317,7 +317,7 @@ New captures use native 1920×1080 without upscaling. See
   <a href="docs/images/brook_vlc_720p_1080.png"><img src="docs/images/brook_vlc_720p_1080.png" alt="VLC playing Big Buck Bunny at 720p on Brook's native 1080p desktop" width="960"></a>
 </p>
 
-<p align="center"><em>Guest-installed VLC playing the Blender Foundation's Big Buck Bunny at 720p; the captured desktop is native 1920×1080. Normal-launcher playback, pause/resume and exit/audio cleanup are covered in the <a href="docs/application-regressions.md">application regressions</a>; smoothness and A/V sync remain unverified.</em></p>
+<p align="center"><em>Guest-installed VLC playing Big Buck Bunny (© 2008 Blender Foundation, <a href="https://peach.blender.org/about/">CC BY 3.0</a>) at 720p — a full 1920×1080 frame from direct VM recording. Normal playback and exit/audio cleanup are covered in the <a href="docs/application-regressions.md">application regressions</a>; video restoration after minimize, smoothness and A/V sync remain unaccepted.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_quake2_lan.png"><img src="docs/images/brook_quake2_lan.png" alt="Two Brook VMs playing Quake 2 LAN deathmatch" width="800"></a>
