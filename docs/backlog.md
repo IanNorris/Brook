@@ -1211,3 +1211,17 @@ of the fresh-image and real-workload follow-up.
   contents beyond sanitized public clock data. Compare libc clock calls with
   forced syscalls, validate fork/exec/protection and migration behavior, and
   measure actual browser profiles before claiming a performance improvement.
+
+### Long directory-descriptor paths (18 October workload probe)
+
+`FdEntry::dirPath[64]` and sys_open's 62-byte prefix copy silently truncate a
+valid open directory. A private Gallery fixture at
+`/data/home/regression-input/gallery-links/profile/share/applications` could
+be listed/opened absolutely, but `stat("fixture.desktop", dir_fd=fd)` returned
+ENOENT; Python's fd-safe recursive deletion then failed with ENOTEMPTY. Retained
+negative control: `build/workloads/gallery-links-20261018/dirfd-truncation-regression/`.
+Fix retained directory identity/path handling and add long-path openat/statat,
+unlinkat/renameat/fchdir, dup and rename/replacement tests. Avoid a large fixed
+per-FD buffer increase across 1,024 slots as an unmeasured workaround; pinned
+CWD/dirfd objects remain the intended identity work. The installer publication
+probe's absolute fixture cleanup is not a kernel fix.

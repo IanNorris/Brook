@@ -27,8 +27,13 @@
 #include <elf.h>
 #include "manifest.h"
 #include "cancel.h"
+#include "profile_link.h"
 #ifndef NIX_FETCH_PATH
 #define NIX_FETCH_PATH "/nix/bin/nix-fetch"
+#endif
+
+#ifndef STORE_DIR
+#define STORE_DIR "/nix/store"
 #endif
 
 #ifndef INDEX_PATH
@@ -266,7 +271,7 @@ out:
 
 static int store_path_healthy(const char *store_name) {
     char store_path[512];
-    snprintf(store_path, sizeof(store_path), "/nix/store/%s", store_name);
+    snprintf(store_path, sizeof(store_path), STORE_DIR "/%s", store_name);
 
     struct stat st;
     if (stat(store_path, &st) != 0 || !S_ISDIR(st.st_mode))
@@ -379,10 +384,10 @@ static int acquire_profile_lock(void) {
  * and every installed binary to exit 127. */
 static int link_package_desktops(const char *store_name) {
     char source[1024];
-    snprintf(source,sizeof(source),"/nix/store/%s/share/applications",store_name);
+    snprintf(source,sizeof(source),STORE_DIR "/%s/share/applications",store_name);
     DIR *directory=opendir(source);
-    if (!directory) return 0;
-    mkdir_p(PROFILE_APPS);
+    if (!directory) return errno==ENOENT ? 0 : -1;
+    if(mkdir_p(PROFILE_APPS)<0 && errno!=EEXIST) {closedir(directory);return -1;}
     struct dirent *entry;int linked=0;
     while ((entry=readdir(directory))) {
         size_t length=strlen(entry->d_name);
@@ -392,8 +397,9 @@ static int link_package_desktops(const char *store_name) {
         snprintf(destination,sizeof(destination),"%s/%s",PROFILE_APPS,entry->d_name);
         char existing[1536];ssize_t n=readlink(destination,existing,sizeof(existing)-1);
         if (n>0) { existing[n]=0;if (!strcmp(existing,target)) continue; }
-        unlink(destination);
-        if (!symlink(target,destination)) ++linked;
+        int changed=profile_link_replace(target,destination);
+        if(changed<0) {int saved=errno;closedir(directory);errno=saved;return -1;}
+        linked+=changed;
     }
     closedir(directory);return linked;
 }
@@ -402,7 +408,7 @@ static int unlink_package_desktops(const char *store_name) {
     DIR *directory=opendir(PROFILE_APPS);
     if (!directory) return 0;
     char absolute[1024],relative[1024];
-    snprintf(absolute,sizeof(absolute),"/nix/store/%s/",store_name);
+    snprintf(absolute,sizeof(absolute),STORE_DIR "/%s/",store_name);
     snprintf(relative,sizeof(relative),"../../../store/%s/",store_name);
     struct dirent *entry;int removed=0;
     while ((entry=readdir(directory))) {
@@ -421,12 +427,12 @@ static int unlink_package_desktops(const char *store_name) {
 
 static int link_package_bins(const char *store_name) {
     char bin_dir[512];
-    snprintf(bin_dir, sizeof(bin_dir), "/nix/store/%s/bin", store_name);
+    snprintf(bin_dir, sizeof(bin_dir), STORE_DIR "/%s/bin", store_name);
 
     DIR *d = opendir(bin_dir);
-    if (!d) return 0; /* No bin dir is OK (e.g., libraries) */
+    if (!d) return errno==ENOENT ? 0 : -1; /* Libraries may have no bin/. */
 
-    mkdir_p(PROFILE_BIN);
+    if(mkdir_p(PROFILE_BIN)<0 && errno!=EEXIST) {closedir(d);return -1;}
 
     struct dirent *ent;
     int linked = 0;
@@ -444,10 +450,9 @@ static int link_package_bins(const char *store_name) {
         /* Check if it's a regular file or symlink (stat the real path) */
         struct stat st;
         if (stat(src_abs, &st) == 0 && (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode))) {
-            unlink(dst); /* Remove existing link if any */
-            if (symlink(rel_target, dst) == 0) {
-                linked++;
-            }
+            int changed=profile_link_replace(rel_target,dst);
+            if(changed<0) {int saved=errno;closedir(d);errno=saved;return -1;}
+            linked+=changed;
         }
     }
     closedir(d);
@@ -457,12 +462,12 @@ static int link_package_bins(const char *store_name) {
 static int link_package_libs_to_dir(const char *store_name, const char *dst_dir,
                                     const char *rel_prefix, int replace_regular) {
     char lib_dir[512];
-    snprintf(lib_dir, sizeof(lib_dir), "/nix/store/%s/lib", store_name);
+    snprintf(lib_dir, sizeof(lib_dir), STORE_DIR "/%s/lib", store_name);
 
     DIR *d = opendir(lib_dir);
-    if (!d) return 0; /* No lib dir is OK (e.g., tools) */
+    if (!d) return errno==ENOENT ? 0 : -1; /* Tools may have no lib/. */
 
-    mkdir_p(dst_dir);
+    if(mkdir_p(dst_dir)<0 && errno!=EEXIST) {closedir(d);return -1;}
 
     struct dirent *ent;
     int linked = 0;
@@ -481,22 +486,10 @@ static int link_package_libs_to_dir(const char *store_name, const char *dst_dir,
             if (lstat(dst, &dst_st) == 0) {
                 if (!S_ISLNK(dst_st.st_mode) && !replace_regular)
                     continue;
-                /* Skip if existing symlink already points to the same target —
-                 * re-linking would briefly invalidate mmap'd libraries used by
-                 * running processes (e.g. bash using glibc from this path). */
-                if (S_ISLNK(dst_st.st_mode)) {
-                    char existing[1024];
-                    ssize_t rl = readlink(dst, existing, sizeof(existing) - 1);
-                    if (rl > 0) {
-                        existing[rl] = '\0';
-                        if (strcmp(existing, rel_target) == 0)
-                            continue; /* already correct */
-                    }
-                }
-                unlink(dst);
             }
-            if (symlink(rel_target, dst) == 0)
-                linked++;
+            int changed=profile_link_replace(rel_target,dst);
+            if(changed<0) {int saved=errno;closedir(d);errno=saved;return -1;}
+            linked+=changed;
         }
     }
     closedir(d);
@@ -540,7 +533,9 @@ static int link_closure_libs_from_narinfo(const char *store_name) {
         char *saveptr = NULL;
         char *tok = strtok_r(p, " \t\r\n", &saveptr);
         while (tok) {
-            linked += link_package_libs(tok);
+            int count=link_package_libs(tok);
+            if(count<0) {int saved=errno;fclose(f);errno=saved;return -1;}
+            linked+=count;
             tok = strtok_r(NULL, " \t\r\n", &saveptr);
         }
         break;
@@ -552,7 +547,7 @@ static int link_closure_libs_from_narinfo(const char *store_name) {
 
 static int link_closure_libs_into_package(const char *store_name) {
     char package_lib_dir[512];
-    snprintf(package_lib_dir, sizeof(package_lib_dir), "/nix/store/%s/lib", store_name);
+    snprintf(package_lib_dir, sizeof(package_lib_dir), STORE_DIR "/%s/lib", store_name);
 
     char hash[33];
     store_hash_from_name(store_name, hash);
@@ -576,8 +571,11 @@ static int link_closure_libs_into_package(const char *store_name) {
         char *saveptr = NULL;
         char *tok = strtok_r(p, " \t\r\n", &saveptr);
         while (tok) {
-            if (strcmp(tok, store_name) != 0)
-                linked += link_package_libs_to_dir(tok, package_lib_dir, "../../", 0);
+            if (strcmp(tok, store_name) != 0) {
+                int count=link_package_libs_to_dir(tok, package_lib_dir, "../../", 0);
+                if(count<0) {int saved=errno;fclose(f);errno=saved;return -1;}
+                linked+=count;
+            }
             tok = strtok_r(NULL, " \t\r\n", &saveptr);
         }
         break;
@@ -593,7 +591,7 @@ static int unlink_package_bins(const char *store_name) {
     if (!d) return 0;
 
     char prefix[512];
-    snprintf(prefix, sizeof(prefix), "/nix/store/%s/", store_name);
+    snprintf(prefix, sizeof(prefix), STORE_DIR "/%s/", store_name);
     size_t prefix_len = strlen(prefix);
     char relative_prefix[512];
     snprintf(relative_prefix,sizeof(relative_prefix),"../../store/%s/",store_name);
@@ -746,7 +744,7 @@ static int desktop_exec_exists(const char *command)
         if (stat(binary,&st)!=0 || !S_ISREG(st.st_mode) || access(binary,X_OK)!=0) return 0;
         /* Removed packages remain in the store as cache/dependencies. An
          * absolute desktop Exec must still be exposed by the active profile. */
-        if (strncmp(binary,"/nix/store/",11)==0) {
+        if (strncmp(binary,STORE_DIR "/",strlen(STORE_DIR)+1)==0) {
             const char *base=strrchr(binary,'/');
             char active[1200];struct stat exposed;
             snprintf(active,sizeof(active),"%s/%s",PROFILE_BIN,base?base+1:binary);
@@ -946,7 +944,7 @@ static int cmd_install(const char *name) {
 
         /* Already in manifest. Re-link bins in case the profile/bin
          * symlinks are missing (e.g. wiped, or earlier link step never
-         * ran). This is idempotent — link_package_bins unlinks first. */
+         * ran). Replacement publishes a complete new link atomically. */
         char hash[33];
         store_hash_from_name(existing_store, hash);
         if (run_nix_fetch_deps(hash, 0) != 0) {
@@ -955,10 +953,15 @@ static int cmd_install(const char *name) {
         }
         sigset_t previous;int boundary=install_commit_begin(&previous);if(boundary)return boundary;
         int linked = link_package_bins(existing_store);
-        link_package_desktops(existing_store);
-        int lib_linked = link_package_libs(existing_store);
-        lib_linked += link_closure_libs_from_narinfo(existing_store);
-        int rpath_linked = link_closure_libs_into_package(existing_store);
+        int desktops = linked<0 ? -1 : link_package_desktops(existing_store);
+        int lib_linked = desktops<0 ? -1 : link_package_libs(existing_store);
+        int closure_linked = lib_linked<0 ? -1 : link_closure_libs_from_narinfo(existing_store);
+        int rpath_linked = closure_linked<0 ? -1 : link_closure_libs_into_package(existing_store);
+        if(rpath_linked<0) {
+            fprintf(stderr,"Error: incomplete profile links: %s. Registration may already be published; retry install to repair.\n",strerror(errno));
+            return install_commit_end(&previous,1);
+        }
+        lib_linked+=closure_linked;
         printf("'%s' is already installed.\n", name);
         if (linked > 0)
             printf("  re-linked %d binary(ies) in %s\n", linked, PROFILE_BIN);
@@ -999,7 +1002,7 @@ static int cmd_install(const char *name) {
 
     /* Check if already in store (verify it's not just an empty dir) */
     char store_path[512];
-    snprintf(store_path, sizeof(store_path), "/nix/store/%s", pkg.store_name);
+    snprintf(store_path, sizeof(store_path), STORE_DIR "/%s", pkg.store_name);
     struct stat st;
     int in_store = 0;
     if (stat(store_path, &st) == 0) {
@@ -1056,10 +1059,15 @@ static int cmd_install(const char *name) {
 
     /* Link binaries */
     int linked = link_package_bins(pkg.store_name);
-    link_package_desktops(pkg.store_name);
-    int lib_linked = link_package_libs(pkg.store_name);
-    lib_linked += link_closure_libs_from_narinfo(pkg.store_name);
-    int rpath_linked = link_closure_libs_into_package(pkg.store_name);
+    int desktops = linked<0 ? -1 : link_package_desktops(pkg.store_name);
+    int lib_linked = desktops<0 ? -1 : link_package_libs(pkg.store_name);
+    int closure_linked = lib_linked<0 ? -1 : link_closure_libs_from_narinfo(pkg.store_name);
+    int rpath_linked = closure_linked<0 ? -1 : link_closure_libs_into_package(pkg.store_name);
+    if(rpath_linked<0) {
+        fprintf(stderr,"Error: incomplete profile links: %s. Registration may already be published; retry install to repair.\n",strerror(errno));
+        return install_commit_end(&previous,1);
+    }
+    lib_linked+=closure_linked;
 
     printf("\n%s✓ Installed %s %s%s\n",color_green,pkg.name,pkg.version,color_reset);
     if (linked > 0)
@@ -1153,7 +1161,7 @@ static int fetch_package_to_store(const char *name, char *out_store_name, size_t
 
     /* Check whether the store path already has real content */
     char store_path[512];
-    snprintf(store_path, sizeof(store_path), "/nix/store/%s", pkg.store_name);
+    snprintf(store_path, sizeof(store_path), STORE_DIR "/%s", pkg.store_name);
     int in_store = 0;
     struct stat st;
     const char *probes[] = { "bin", "lib", "share" };
@@ -1208,7 +1216,7 @@ static int cmd_shell(int npkgs, char *const *pkgs) {
             return 1;
         }
         char bin[640];
-        snprintf(bin, sizeof(bin), "/nix/store/%s/bin", store_name);
+        snprintf(bin, sizeof(bin), STORE_DIR "/%s/bin", store_name);
         /* Only add to PATH if the dir actually exists (libraries may not
          * have one — skip silently). */
         struct stat st;

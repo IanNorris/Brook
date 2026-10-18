@@ -187,6 +187,43 @@ after the initial fresh-image run; they are not automatically included by the
 default disk script. Stock/native package file ownership and removal conflicts
 remain part of the shared-profile work below.
 
+## Per-link publication follow-up — 18 October
+
+Binary, library and desktop links now replace via a staged symlink and atomic
+rename, keeping the previous destination if staging or rename fails. Identical
+targets are left in place. Link errors now make install/repair fail visibly;
+metadata can already be committed, and the error explicitly requests a repair
+retry. This is per-link publication, not whole-profile rollback.
+
+All 28 installer host tests passed, including concurrent readers, injected
+ENOSPC at symlink creation, real rename failure, parent flush failure and a
+writer killed after staging. A killed writer's private temporary name remains
+untrusted; retry does not delete it or mistake it for committed state. These
+checks do not simulate an actually full disk or power loss.
+
+Session `96e328f24f994c2eaf3aa1cc7185b4cf` tested a statically built installer
+against an owned private cached profile as UID 1000. Normal install, no-op
+repair, and binary/library/desktop publication failures followed by repair all
+passed. No-op repair preserved link inodes; failed publication preserved the
+blocking directory and returned an error. The fetch helper was a successful
+no-op, so this does not renew large-package/network acceptance. The guest used
+the checked ABI-18 kernel from the signal/desktop follow-up; no kernel rebuild
+was needed. Heap, inactive audio, checked shutdown, launcher exit and all three
+read-only filesystem checks passed. Evidence is under ignored
+`build/workloads/gallery-links-20261018/`.
+
+The initial probe used the wrong standalone CLI argument form; its failed
+receipt is retained. Cleanup then exposed an independent kernel issue: saved
+directory-descriptor paths silently truncate at 64 bytes. Absolute lookup of
+the fixture desktop entry succeeded while dirfd-relative lookup returned
+ENOENT. Python's fd-based recursive deletion consequently left entries behind.
+The final publication probe uses absolute cleanup paths and does not claim to
+fix this defect. The earlier quoting-error receipt and long-dirfd negative
+control are also retained, with complete output and drained command lineages.
+
+[Recovery design](app-gallery-recovery.md) records the remaining transaction,
+shared ownership, base-package inventory and real disk-full failure matrix.
+
 ## Remaining work
 
 - Disk-full and interrupted-install recovery across the whole profile. Atomic

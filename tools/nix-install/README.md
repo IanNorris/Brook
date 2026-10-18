@@ -15,6 +15,16 @@ error. A failed prepublication write preserves the old bytes. If the directory
 flush fails after rename, publication has already happened: an error is not
 proof that nothing changed. Removal changes links only after metadata commit.
 
+Profile binary, library and desktop links now publish a sibling symlink with
+`rename`, then synchronize the parent directory. The old destination remains
+available if staging or rename fails. Identical targets retain their inode.
+Link failures propagate to install/repair instead of producing a success
+message; registration may already have been published, so an error explicitly
+asks for a repair retry. A parent-directory flush error can likewise occur
+after the new link becomes visible. Killed writers may leave hidden
+`.brook-link.*` staging names; retries neither trust nor indiscriminately
+remove those names.
+
 This protects the manifest, not the entire profile as a transaction. Crashes
 between metadata and symlink/launcher updates still need reconciliation. An
 abruptly terminated writer may leave its lock; it is never automatically
@@ -69,3 +79,6 @@ Absolute-path browser/editor entries use the same mapping. The collector's
 private-filesystem regression is included in `test_desktop.py`; current
 application playback/exit evidence is in
 [application regressions](../../docs/application-regressions.md).
+
+The recovery design and remaining acceptance matrix are documented in
+[App Gallery recovery](../../docs/app-gallery-recovery.md).
