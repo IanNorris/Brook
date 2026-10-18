@@ -9624,18 +9624,16 @@ static int64_t DoUnlink(const char* path, bool directory)
     // Try as-is first, then with /boot prefix
     int rc = VfsRemovePath(path, directory);
     if (rc == 0) return 0;
-    if (rc != -1 && rc != -ENOENT) return rc;
+    if (rc != -ENOENT) return rc;
 
     char bootPath[256] = "/boot";
     uint32_t bi = 5;
-    if (strlen(path) + bi >= sizeof(bootPath)) return rc == -1 ? -ENOENT : rc;
+    if (strlen(path) + bi >= sizeof(bootPath)) return rc;
     for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
         bootPath[bi++] = *p;
     bootPath[bi] = '\0';
     rc = VfsRemovePath(bootPath, directory);
-    if (rc != -1) return rc;
-
-    return -ENOENT;
+    return rc;
 }
 
 static int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
@@ -9660,13 +9658,13 @@ static int64_t DoRename(const char* oldBuf, const char* newBuf)
 
     int rc = VfsRename(oldPath, newPath);
     if (rc == 0) return 0;
-    if (rc != -1 && rc != -ENOENT) return rc;
+    if (rc != -ENOENT) return rc;
 
     // Try with /boot prefix on both
     char bootOld[256] = "/boot", bootNew[256] = "/boot";
     uint32_t oi = 5, ni = 5;
     if (strlen(oldPath) + oi >= sizeof(bootOld) ||
-        strlen(newPath) + ni >= sizeof(bootNew)) return rc == -1 ? -ENOENT : rc;
+        strlen(newPath) + ni >= sizeof(bootNew)) return rc;
     for (const char* p = oldPath; *p && oi + 1 < sizeof(bootOld); ++p)
         bootOld[oi++] = *p;
     bootOld[oi] = '\0';
@@ -9674,10 +9672,7 @@ static int64_t DoRename(const char* oldBuf, const char* newBuf)
         bootNew[ni++] = *p;
     bootNew[ni] = '\0';
     rc = VfsRename(bootOld, bootNew);
-    if (rc != -1) return rc;
-
-    SerialPrintf("sys_rename FAILED: '%s' -> '%s'\n", oldPath, newPath);
-    return -ENOENT;
+    return rc;
 }
 
 static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,

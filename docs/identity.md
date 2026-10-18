@@ -1,7 +1,7 @@
 # Desktop identity and permission audit
 
-Initial audit baseline: `811de61`, updated 17 October 2026 with credential
-and signal regression results. Brook currently provides a shared experimental
+Initial audit baseline: `811de61`, updated 18 October 2026 with credential,
+metadata and parent-mutation regression results. Brook currently provides a shared experimental
 desktop; its UID support does not establish isolation between users.
 
 ## Current desktop
@@ -110,8 +110,8 @@ Optional plugin faults and dialog stacking/xdg_foreign support remain open.
 | Credential changes | setuid/setgid, setreuid/setregid and setresuid/setresgid track saved IDs and validate the old tuple before changing it. Raw syscalls change the calling thread; libc coordinates changes with SIGSETXID. Root authorization currently means effective UID 0. | Capability-aware authorization and set-ID executable handling remain unsupported; do not describe this as full Linux credential support. |
 | Groups and capabilities | Immutable, reference-counted supplementary lists are inherited by fork/clone and independently replaced; getgroups/setgroups validate buffers and the Linux 65536-entry limit. Tasks with all three UIDs nonzero support empty self capabilities; nonempty grants fail. Root/retained-root tuples return ENOSYS. Unsupported capability/security prctl options return EINVAL. | Ext2 existing-file opens, chmod setgid filtering and timestamp write checks use supplementary groups; other filesystem and operation paths remain to audit. Audit the remaining prctl options: several legacy options still return success without implementing behavior. Filesystem IDs are coupled to effective IDs; setfsuid/setfsgid are unsupported. |
 | Inheritance | Fork and thread creation retain an owned group-list reference and snapshot all six IDs under the credential lock. Ordinary exec saves effective IDs and preserves real IDs/groups. Teardown releases the list, including failed creation paths. | Keep matching launch environment/passwd entries and verify repeated failure/cancellation cleanup. Define set-ID executable behavior separately. |
-| File open | `Ext2FsOpenModeChecked` requires both access bits for O_RDWR and uses effective UID, primary GID and supplementary groups. Denials return EACCES without alias fallback; O_TRUNC requires write access. Creation skips the new leaf inode check, and the explicit Nix bypass remains. | Check ancestor search and parent mutation permissions, audit other filesystems, and define the writable Nix mount policy. |
-| Path traversal and mutation | Path resolution and parent lookup have no complete directory search/mutation authorization contract. Nix can explicitly skip permission checks. | Audit mkdir, create, unlink, rmdir, rename, symlink, hard links, sticky directories and directory-relative operations; restrict the writable Nix service deliberately. |
+| File open | `Ext2FsOpenModeChecked` requires both access bits for O_RDWR and uses effective UID, primary GID and supplementary groups. Denials return EACCES without alias fallback; O_TRUNC requires write access. Creation skips the new leaf inode check but requires parent write/search; the explicit Nix bypass remains. | Check ancestor search and parent mutation permissions, audit other filesystems, and define the writable Nix mount policy. |
+| Path traversal and mutation | Ext2 checks parent write/search and sticky entry ownership under its write lock for creation, removal and both rename parents. The general ancestor walk remains incomplete: VFS still normalizes dotdot before symlinks. Nix explicitly skips permission checks. | Replace the shared resolver with a checked component walk and preserve its errors. Complete dirfd/CWD identity, access checks and hard-link policy; restrict the writable Nix service deliberately. |
 | Access checks | `AccessAt` validates flags and resolves paths, but implements existence rather than R/W/X permission evaluation, including AT_EACCESS. | Use real/effective credentials as requested and apply the same traversal rules as open/exec; cover descriptor and symlink variants. |
 | Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Linux-layout ext2 ownership now preserves all 32 UID/GID bits through creation, stat, chown and existing leaf permission checks; new symlinks inherit creator credentials. | Test mode/ownership through every mutation path and all filesystems. Audit nonroot chown group-change rules, parent setgid inheritance and remaining filesystem operations before exposing account creation. |
 | Runtime directory | Every shell application inherits `XDG_RUNTIME_DIR=/tmp`. This path is on the FAT-backed initrd, which cannot persist Unix ownership/modes. Wayland and other IPC endpoints are shared. | Give a named desktop identity an owned, mode-0700 runtime directory with a defined lifetime; audit IPC peer credentials and access policy. |
@@ -517,3 +517,66 @@ Root-only chown, parent setgid inheritance, directory authorization, private
 runtime directories and the writable Nix boundary remain unfinished. This
 checkpoint does not renew browser, full-bootstrap or concurrent-use acceptance
 for the new kernel.
+
+### Parent mutation and sticky-directory checkpoint (18 October)
+
+Ext2 now requires write **and** search access to the actual parent inode before
+creating a file/directory/symlink or removing an entry. Rename checks both parents
+and sticky ownership for the source and any replaced destination. Sticky removal
+uses the entry's full-width owner, including for symlinks, rather than its
+referent's owner. Cross-parent directory moves also require write access to the
+moved directory for its `..` update; same-parent renames do not add that requirement.
+All checks precede entry changes under the filesystem write lock. Root and the
+explicit shared Nix bypass retain their existing policy. These checks follow the
+[unlink](https://man7.org/linux/man-pages/man2/unlink.2.html) and
+[rename](https://man7.org/linux/man-pages/man2/rename.2.html) rules within that
+limited privilege model. Existing writable files can still be opened with O_CREAT
+under a readonly parent; parent write is required for creation of a new entry.
+
+The old kernel recorded 50 mismatches in 103 mutation controls. The first probe's
+cleanup failed on the known shortened deep-dirfd path, so its nonzero receipt is
+not acceptance. An absolute-path cleanup removed only that private fixture, then
+the same VM completed a new negative-control request. The regression deliberately
+uses absolute cleanup; it does not repair or accept deep directory descriptors.
+
+`scripts/workloads/directory_mutations.py` now passes 122 operations plus 63
+preservation assertions. Cases include primary/supplementary/other permissions,
+owner-bit precedence, missing write/search, both rename parents, sticky source
+and replacement ownership, symlink ownership, high-ID/low-bit collisions and
+cross-parent directory write access. Denied operations preserve entry names,
+inodes, owners, modes, link counts, payloads and parent mtimes. This is a private
+`/data` matrix; full cross-user Linux comparison was unavailable on this host.
+
+Preserving EPERM also required removing unlink/rename's legacy interpretation of
+`-1` as a missing path. Only ENOENT may retry the `/boot` alias. FAT mutation
+callbacks now use the existing typed error mapping while mkdir retains EEXIST.
+FAT controls then exposed an existing guard that blocked every directory move or
+removal whenever any FIL was open on that mount. A separate old-kernel run
+reproduced EBUSY for an empty directory with an unrelated file held open. The guard
+now scans such directories under the FAT lock and permits empty ones. Nonempty
+directories retain the conservative open-file guard; descendant/open-directory
+handle tracking and atomic replacement are not accepted here.
+`scripts/workloads/fat_mutations.py` passes ten controls, including empty-directory
+rename/removal with an unrelated open file, retained EBUSY protection for that
+open file, replacement, EEXIST and ENOENT. The earlier failing FAT receipt remains
+recorded; it is not counted as successful acceptance.
+
+Reviewed kernel
+`a63c9aaa2af15da78988b4efb49d7eebe9fdf243b7c6ab47c418cc7f5b7be17e`
+passed all 39 hosted suites and the supported compiled entry audit. Session
+`6b448be57cf24d8db3bef2c952a86d7e` passed the two new regressions, all 45 metadata
+assertions, 686 leaf-open checks, two-mount ownership and full-width ID controls.
+Four saved Writer/GIMP/OpenTTD documents retained their bytes and Brook ownership.
+Checked sync/stop, QEMU/launcher exit zero, serial kernel/device/user-fault audit
+and all three read-only offline filesystem checks passed. Evidence is local under
+`build/workloads/directory-mutations-20261018/`, with final acceptance in `review/`.
+
+The separate path audit still reports **eight** gaps: ancestor search for
+open/stat/readlink, locked-directory dotdot, file/dotdot, symlink-before-dotdot,
+absolute-symlink search and access-search. Its previous readonly-parent and sticky
+cases now match. VFS still normalizes dotdot before expanding symlinks and may
+retry an unresolved spelling; checked component traversal and explicit errors
+must replace that behavior before account isolation is accepted. CWD/dirfd
+identity, parent setgid inheritance, nonroot chown, private runtime directories
+and Nix protection also remain open. This checkpoint does not renew full
+bootstrap/browser acceptance for the new kernel.

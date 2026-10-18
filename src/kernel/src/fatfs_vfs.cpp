@@ -923,7 +923,26 @@ static bool FatPathOpenLocked(FatFsMountData* mount, const char* path)
 {
     FILINFO info;
     if (f_stat(path, &info) != FR_OK) return false;
-    if (info.fattrib & AM_DIR) return mount->allFiles != nullptr;
+    if (info.fattrib & AM_DIR) {
+        if (!mount->allFiles) return false;
+        // Open FILs prevent moving their directory slots. An empty directory
+        // has no such slots: unrelated fonts/logs must not block its removal.
+        // Nonempty directories retain the conservative guard until descendant
+        // handle tracking is implemented. Keep errors conservative as well.
+        DIR directory{};
+        if (f_opendir(&directory, path) != FR_OK) return true;
+        bool busy = false;
+        for (;;) {
+            FILINFO child{};
+            if (f_readdir(&directory, &child) != FR_OK) { busy = true; break; }
+            if (!child.fname[0]) break;
+            bool dot = child.fname[0] == '.' && !child.fname[1];
+            bool dotdot = child.fname[0] == '.' && child.fname[1] == '.' && !child.fname[2];
+            if (!dot && !dotdot) { busy = true; break; }
+        }
+        if (f_closedir(&directory) != FR_OK) busy = true;
+        return busy;
+    }
     FIL lookup;
     if (f_open(&lookup, path, FA_READ) != FR_OK) return true;
     bool busy = false;
@@ -943,7 +962,7 @@ static int FatFsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
     }
     FRESULT res = f_unlink(fatPath);
     KMutexUnlock(&g_fatLock);
-    return (res == FR_OK) ? 0 : -1;
+    return res == FR_OK ? 0 : FrToErrno(res);
 }
 
 static int FatFsMkdir(void* /*mountPriv*/, uint8_t pdrv, const char* relPath, uint16_t /*mode*/)
@@ -953,7 +972,7 @@ static int FatFsMkdir(void* /*mountPriv*/, uint8_t pdrv, const char* relPath, ui
     KMutexLock(&g_fatLock);
     FRESULT res = f_mkdir(fatPath);
     KMutexUnlock(&g_fatLock);
-    return res == FR_OK ? 0 : (res == FR_EXIST ? -17 : -1);
+    return res == FR_OK ? 0 : (res == FR_EXIST ? -17 : FrToErrno(res));
 }
 
 static int FatFsRename(void* mountPriv, uint8_t pdrv,
@@ -973,7 +992,7 @@ static int FatFsRename(void* mountPriv, uint8_t pdrv,
     f_unlink(fatNew);
     FRESULT res = f_rename(fatOld, fatNew);
     KMutexUnlock(&g_fatLock);
-    return (res == FR_OK) ? 0 : -1;
+    return res == FR_OK ? 0 : FrToErrno(res);
 }
 
 static const VfsFsOps g_fatFsOps = {

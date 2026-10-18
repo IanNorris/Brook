@@ -2415,6 +2415,24 @@ static int Ext2DirStat(Vnode* vn, VnodeStat* st)
     return 0;
 }
 
+// Call only while holding the filesystem write lock, before changing entries.
+// This checks the actual parent inode; ancestor traversal remains a VFS concern.
+static int Ext2CheckParentMutation(Ext2Mount* mnt, const Ext2Inode& parent)
+{
+    if ((parent.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return -20;
+    if (mnt->skipPermChecks) return 0;
+    uint8_t permissions = ProcessFilePermissions(ProcessCurrent(), Ext2Uid(parent), Ext2Gid(parent), parent.i_mode);
+    return (permissions & 3) == 3 ? 0 : -13; // Write AND search.
+}
+
+static int Ext2CheckStickyRemoval(Ext2Mount* mnt, const Ext2Inode& parent, const Ext2Inode& entry)
+{
+    Process* cur = ProcessCurrent();
+    if (mnt->skipPermChecks || !(parent.i_mode & 01000) || !cur) return 0;
+    uint32_t uid = ProcessReadIds(cur, false).effective;
+    return uid == 0 || uid == Ext2Uid(parent) || uid == Ext2Uid(entry) ? 0 : -1;
+}
+
 // Caller holds g_ext2Lock for writing. Ext2's base inode stores whole seconds;
 // explicit subsecond values are rounded down to that on-disk precision.
 static int Ext2SetInodeTimes(Ext2Mount* mnt, uint32_t ino, const VnodeTime* times)
@@ -2903,7 +2921,10 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
 
         Ext2Inode parentData;
         if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockWriteUnlock(&g_ext2Lock); return nullptr; }
-        if ((parentData.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) { KRwLockWriteUnlock(&g_ext2Lock); return nullptr; }
+        if (int denied = Ext2CheckParentMutation(mnt, parentData)) {
+            if (error) *error = denied;
+            KRwLockWriteUnlock(&g_ext2Lock); return nullptr;
+        }
 
         // Allocate new inode
         ino = Ext2AllocInode(mnt, false);
@@ -3168,10 +3189,12 @@ static int Ext2FsRemovePath(void* mountPriv, uint8_t pdrv, const char* relPath, 
     if (!strcmp(name, ".") || !strcmp(name, "..")) return finish(-22);
     Ext2Inode parent, target;
     if (!Ext2ReadInode(mnt, parentIno, &parent)) return finish(-5);
+    if (int denied = Ext2CheckParentMutation(mnt, parent)) return finish(denied);
     uint32_t ino = Ext2DirLookup(mnt, parentIno, &parent, name);
     if (!ino) return finish(-2);
     if (ino == EXT2_ROOT_INO) return finish(-16);
     if (!Ext2ReadInode(mnt, ino, &target)) return finish(-5);
+    if (int denied = Ext2CheckStickyRemoval(mnt, parent, target)) return finish(denied);
     bool directory = (target.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
     if (directory != removeDirectory) return finish(removeDirectory ? -20 : -21);
     if (directory) {
@@ -3213,6 +3236,10 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath, uint1
 
     Ext2Inode parentData;
     if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
+
+    if (int denied = Ext2CheckParentMutation(mnt, parentData)) {
+        KRwLockWriteUnlock(&g_ext2Lock); return denied;
+    }
 
     // Check if already exists
     if (Ext2DirLookup(mnt, parentIno, &parentData, name)) {
@@ -3355,18 +3382,22 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
     Ext2Inode oldDir, newDir, target, victim;
     if (!Ext2ReadInode(mnt, oldParent, &oldDir) || !Ext2ReadInode(mnt, newParent, &newDir))
         return finish(-5);
+    if (int denied = Ext2CheckParentMutation(mnt, oldDir)) return finish(denied);
+    if (int denied = Ext2CheckParentMutation(mnt, newDir)) return finish(denied);
     uint32_t ino = Ext2DirLookup(mnt, oldParent, &oldDir, oldName);
     if (!ino) return finish(-2);
     uint32_t existing = Ext2DirLookup(mnt, newParent, &newDir, newName);
     if (existing == ino) return finish(0);
     if (ino == EXT2_ROOT_INO) return finish(-16);
     if (!Ext2ReadInode(mnt, ino, &target)) return finish(-5);
+    if (int denied = Ext2CheckStickyRemoval(mnt, oldDir, target)) return finish(denied);
     bool directory = (target.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
     uint8_t type = directory ? 2 : (target.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK ? 7 : 1;
     bool victimDirectory = false;
     uint8_t victimType = 1;
     if (existing) {
         if (!Ext2ReadInode(mnt, existing, &victim)) return finish(-5);
+        if (int denied = Ext2CheckStickyRemoval(mnt, newDir, victim)) return finish(denied);
         victimDirectory = (victim.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
         if (directory != victimDirectory) return finish(directory ? -20 : -21);
         victimType = victimDirectory ? 2 : (victim.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK ? 7 : 1;
@@ -3376,6 +3407,9 @@ static int Ext2FsRename(void* mountPriv, uint8_t pdrv,
         }
     }
     if (directory && oldParent != newParent) {
+        // Reparenting rewrites the moved directory's own '..' entry.
+        if (!mnt->skipPermChecks && !(ProcessFilePermissions(ProcessCurrent(),
+                Ext2Uid(target), Ext2Gid(target), target.i_mode) & 2)) return finish(-13);
         // Walk '..' before modifying anything; moving into a descendant
         // would detach a cyclic directory tree from the filesystem root.
         uint32_t ancestor = newParent;
@@ -3477,6 +3511,10 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
         SerialPrintf("ext2 symlink: ReadInode parent %u FAILED for '%s'\n",
                      parentIno, relPath);
         KRwLockWriteUnlock(&g_ext2Lock); return -5; // -EIO
+    }
+
+    if (int denied = Ext2CheckParentMutation(mnt, parentData)) {
+        KRwLockWriteUnlock(&g_ext2Lock); return denied;
     }
 
     // Check if already exists
