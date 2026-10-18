@@ -3309,14 +3309,16 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath, uint1
     Ext2Inode parentData;
     if (!Ext2ReadInode(mnt, parentIno, &parentData)) { KRwLockWriteUnlock(&g_ext2Lock); return -1; }
 
-    if (int denied = Ext2CheckParentMutation(mnt, parentData)) {
-        KRwLockWriteUnlock(&g_ext2Lock); return denied;
-    }
-
-    // Check if already exists
+    // VFS already checked ancestor search permission. Like Linux, report an
+    // existing name before requiring write permission to create a new entry.
+    // Keep lookup and creation under the same exclusive filesystem lock.
     if (Ext2DirLookup(mnt, parentIno, &parentData, name)) {
         KRwLockWriteUnlock(&g_ext2Lock);
         return -17; // EEXIST; never claim to have created an existing name.
+    }
+
+    if (int denied = Ext2CheckParentMutation(mnt, parentData)) {
+        KRwLockWriteUnlock(&g_ext2Lock); return denied;
     }
 
     // Allocate inode

@@ -18,6 +18,71 @@ clean-image paths passed at pinned revision `ead55379`, including guest-built
 boot and repeated tests. The [44-suite refresh below](#44-suite-bootstrap-refresh-18-october)
 records exact artifacts, timings, profiling limits and launcher evidence scope.
 
+### Extraction controls and mkdir compatibility (18 October)
+
+The synthetic extraction control found an ext2 compatibility bug: `mkdir` on
+an existing name under a searchable, non-writable parent returned `EACCES`
+instead of `EEXIST`. This prevents unpackers from safely accepting existing
+ancestor directories. Ext2 now checks for the existing name before requiring
+parent write permission, under the same exclusive lock. VFS ancestor search
+checks and permission checks for new entries remain in force.
+
+`scripts/workloads/mkdir_permissions.py PARENT` runs as an ordinary user in
+an owned temporary directory. Its 36 cases cover mkdir/mkdirat, existing
+directories/files/live and dangling symlinks, trailing slashes, missing names,
+and parents without search permission. Linux passed all cases; the old Brook
+kernel failed 16; the fixed guest passed all 36 without changing the protected
+directory contents. The compiled entry audit and all 44 native suites passed.
+
+The extraction control uses `scripts/workloads/nar_pipeline.py`: `generate`
+creates deterministic synthetic NAR/zstd archives, `run` compares file input,
+cat, zstd, HTTP+zstd and HTTP raw transport, and `verify` rechecks saved outputs.
+Use a fresh owned fixture directory for each run; the tool refuses existing
+results. The default fixture has one 32 MiB file and a tree of 1,024 small files.
+Generation requires zstd; running requires the existing `nar-unpack`, cat,
+zstd and curl plus an explicitly supplied local fixture HTTP server. It does
+not install packages or change profiles. For example, inside an owned fixture:
+
+```sh
+python3 scripts/workloads/nar_pipeline.py generate /absolute/new-fixture
+python3 scripts/workloads/nar_pipeline.py run /absolute/new-fixture \
+  --nar /absolute/nar-unpack --url http://127.0.0.1:PORT
+python3 scripts/workloads/nar_pipeline.py verify /absolute/new-fixture
+```
+
+The fixed Brook run used eight vCPUs, 4 GiB, CPU composition, no applications
+or host audio, and private RAM-backed boot/data/Nix disks. Both rounds passed
+all child exit statuses and exact file contents, inventory and executable modes.
+Round two reverses transport order; input hashes are checked before timing, so
+these are not cold-cache measurements. Extraction includes process startup;
+owned-output fsync and verification are timed separately.
+
+| Input path | 32 MiB file extraction, two rounds | 1,024-file tree extraction, two rounds |
+| --- | --- | --- |
+| Direct file | 86 / 90 ms | 292 / 311 ms |
+| cat pipe | 190 / 175 ms | 302 / 353 ms |
+| zstd pipe | 1,336 / 1,109 ms | 330 / 323 ms |
+| HTTP + zstd | 6,214 / 6,728 ms | 560 / 526 ms |
+| HTTP raw | 1,764 / 1,497 ms | 832 / 336 ms |
+
+Owned-output fsync took 1–2 ms for the large file and 41–53 ms for the tree.
+This directs the next profile toward decompression/download pipeline overhead;
+it does not prove its cause or establish a new full SDK installation time.
+A Linux baseline and an independent `nix-store --restore` check also passed;
+only the static unpacker was explicitly matched across Linux and Brook, so
+do not attribute the entire host/guest difference to kernel overhead.
+
+Evidence is in `build/workloads/nar-control-fixed-20261018/acceptance-audit.json`
+and its `review` directory, with Linux controls under `build/nar-control`.
+Kernel SHA256 is
+`d5570e1741ebc9e7c4d64cce43d4227c54505a8b92bfb060473624bb380d6612`.
+All 20 outputs passed hash/mode verification again after a cold boot. Both
+sessions drained their tracked commands and deferred cleanup, checked heap
+integrity, completed orderly shutdown, and recorded QEMU and original launcher
+exit zero. All six post-stop filesystem checks passed; RAM copies were released.
+The earlier negative diagnostic run is retained separately and is not an
+accepted performance run.
+
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
 revision, SDK closure and VM configuration:
 
