@@ -44,6 +44,7 @@ struct MixerStream {
     bool enabled = true;
     uint64_t submittedFrames = 0, completedFrames = 0;
     uint32_t inFlight = 0;
+    uint32_t capacity = MIXER_RING_FRAMES;
     bool discontinuity = false;
 };
 static MixerStream g_streams[MIXER_MAX_STREAMS];
@@ -122,7 +123,7 @@ AudioStreamId AudioMixerOpen()
             auto& stream = g_streams[i];
             if (stream.identity) continue;
             identity = (g_nextStreamIdentity++ << 4) | (i + 1);
-            ResetStream(stream); stream.enabled = true; stream.identity = identity;
+            ResetStream(stream); stream.enabled = true; stream.capacity = MIXER_RING_FRAMES; stream.identity = identity;
             break;
         }
     }
@@ -153,11 +154,21 @@ bool AudioMixerSetEnabled(AudioStreamId identity, bool enabled)
     SpinLockRelease(&g_mixerLock);
     return stream != nullptr;
 }
+bool AudioMixerSetCapacity(AudioStreamId identity, uint32_t frames)
+{
+    if (!frames || frames > MIXER_RING_FRAMES) return false;
+    SpinLockAcquire(&g_mixerLock);
+    auto* stream = FindStream(identity);
+    const bool empty = stream && stream->read == stream->write && !stream->inFlight;
+    if (empty) stream->capacity = frames;
+    SpinLockRelease(&g_mixerLock);
+    return empty;
+}
 uint32_t AudioMixerAvailableFrames(AudioStreamId identity)
 {
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
-    uint32_t available = stream && !stream->discontinuity ? MIXER_RING_FRAMES - static_cast<uint32_t>(stream->write - stream->read) - stream->inFlight : 0;
+    uint32_t available = stream && !stream->discontinuity ? stream->capacity - static_cast<uint32_t>(stream->write - stream->read) - stream->inFlight : 0;
     SpinLockRelease(&g_mixerLock);
     return available;
 }
@@ -167,7 +178,7 @@ uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frames, AudioStreamId
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
     if (!stream || stream->discontinuity) { SpinLockRelease(&g_mixerLock); return 0; }
-    const uint32_t available = MIXER_RING_FRAMES - static_cast<uint32_t>(stream->write - stream->read) - stream->inFlight;
+    const uint32_t available = stream->capacity - static_cast<uint32_t>(stream->write - stream->read) - stream->inFlight;
     if (frames > available) frames = available;
     // Empty queues may restart their indices, avoiding lifetime counter wrap.
     if (stream->read == stream->write) stream->read = stream->write = 0;
@@ -315,7 +326,7 @@ bool AudioMixerGetProgress(AudioStreamId identity, AudioStreamProgress* result)
     auto* stream = FindStream(identity);
     if (stream) *result = {stream->epoch, stream->submittedFrames, stream->completedFrames,
         static_cast<uint32_t>(stream->write - stream->read) + stream->inFlight,
-        g_clockSupported, stream->discontinuity};
+        g_clockSupported, stream->discontinuity, stream->capacity};
     SpinLockRelease(&g_mixerLock);
     return stream != nullptr;
 }

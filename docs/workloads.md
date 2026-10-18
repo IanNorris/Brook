@@ -2045,3 +2045,17 @@ offline filesystem gates pass. These checks do not accept Firefox audio, ALSA
 clock behavior or glitch-free playback. GETOPTR, complete drain, exact fragment
 geometry and DSP epoll remain follow-ups before switching ALSA defaults. See
 the [audio clock report](audio-clock.md) for evidence and sampling limitations.
+
+### Native OSS endpoint acceptance (18 October)
+
+The next isolated guest passes native GETOPTR and exact fragment-capacity checks,
+repeated ring wraps, independent/duplicated streams, mono U8 frame accounting, invalid
+pointer handling, epoll readiness and interruptible SYNC. Drain cancellation on
+reset/pause, masked versus unmasked signals and later concurrent writes are
+covered. Ownership/completion probes and the 9,660-frame exact short-sound
+capture pass again. All 34 hosted suites and supported compiled-entry checks pass.
+This does not accept Firefox audio or enable a new ALSA default: fragment-level
+readiness, ALSA plugin error propagation and its own clock/drain tests remain.
+Non-native pointers and explicit non-native fragment geometry return unsupported
+rather than exposing a fictitious resampler clock. See `audio-clock.md` for the
+precise evidence and compatibility limits.

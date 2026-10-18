@@ -78,6 +78,13 @@ def main():
             assert 0 < space(handles[0]) <= 2147483647
         print('DSP_OWNERSHIP rate_bounds PASS', flush=True)
         fragment = array.array('i', [(4 << 16) | 16])
+        try:
+            fcntl.ioctl(handles[0], 0xC004500A, fragment, True)
+        except OSError as error:
+            assert error.errno == errno.EINVAL, error
+        else:
+            raise AssertionError('oversized explicit geometry silently accepted')
+        fragment[0] = (1 << 16) | 16
         fcntl.ioctl(handles[0], 0xC004500A, fragment, True)
         fragment[0] = 0
         fcntl.ioctl(handles[0], 0xC0045004, fragment, True)

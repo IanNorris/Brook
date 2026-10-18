@@ -136,8 +136,9 @@ is retained under `build/workloads/audio-owned-queues-20261018/`.
 At that checkpoint, hardware-accepted mixed samples could not be independently
 charged to contributing streams and GETODELAY included the global hardware queue.
 The native accounting below supersedes those limitations on supported clocks.
-Independent retraction of already mixed hardware data, GETOPTR and complete drain
-remain unfinished. Firefox normal-launcher audio is not accepted, and
+Independent retraction of already mixed hardware data remains unfinished.
+The native OSS pointer/drain checkpoint below supersedes the earlier missing
+GETOPTR/SYNC status. Firefox normal-launcher audio is not accepted, and
 ALSA/launcher defaults are unchanged.
 
 ## Native DMA completion and restart acceptance (18 October)
@@ -211,12 +212,90 @@ extended section numbering, the module registry limit and image-size policy rema
 separate work. The optional driver interface requires module ABI 16 and a complete
 matching module rebuild.
 
+## Native OSS pointers, geometry and captured-target drain (18 October)
+
+GETOPTR now exposes completed application bytes and the position modulo the
+negotiated stream capacity at 44.1 kHz. Mono/U8 and stereo/S16 have exact frame
+mapping at that rate. Other rates and unclocked drivers return EOPNOTSUPP rather
+than derive an inaccurate pointer through the write-local resampler. Byte count
+uses positive 31-bit wrapping. As in Linux's non-mmap OSS path, `blocks` reports
+queued whole fragments; this is not the mmap query-delta convention. Brook does
+not advertise OSS mmap. Byte-counter overflow boundaries are not runtime-tested;
+the real guest regression covers repeated ring-pointer wraps.
+
+SETFRAGMENT now enforces a supported native-rate request exactly, including its
+nonzero fragment count. Unsupported sizes/counts return EINVAL, and non-native
+rates return EOPNOTSUPP. A zero count selects the full available capacity. The
+actual mixer limit, write chunk size, GETOSPACE and GETOPTR modulus all use the
+same negotiated capacity. RESET preserves geometry; a newly opened description
+gets default capacity. Geometry changes require RESET after any submitted data.
+This replaces the earlier silent acceptance of oversized fragment counts.
+
+SYNC starts a paused finite stream, captures its submitted-frame target and
+waits interruptibly for that target's proven completion. It releases the open
+description's mutex while waiting, retaining the fd pin. Later writes do not
+extend its target. Reset, pause or reconfiguration cancels the old wait with
+ECANCELED; discontinuity returns EPIPE. A two-second no-progress guard returns
+EIO without crediting samples. A successful drain retains cumulative counters
+until explicit RESET; this differs from Linux's prepare-needed-after-SYNC state
+and avoids discarding later concurrent writes. The guard's stalled-device timeout
+is implemented but has not been directly exercised by the guest acceptance run.
+
+DSP epoll now uses cached per-stream readiness and reports discontinuities as
+EPOLLERR. Poll/epoll waits that watch DSP use a five-millisecond safety rescan;
+this is bounded polling, not a new IRQ notification mechanism. Readiness currently
+means room for a frame, rather than a complete negotiated fragment. Fragment
+threshold readiness remains an integration follow-up. Driver queries, including
+the approximate legacy delay fallback, occur outside the per-open mutex and
+descriptor scans.
+
+`dsp_endpoint.py` passes real guest checks for exact 4x1,024-byte geometry,
+oversize rejection, nonblocking capacity enforcement, EFAULT on an invalid output
+pointer, repeated ring wraps, shared dup state, independent streams, U8 mono,
+epoll full/drained readiness, and unsupported non-native pointers. It also passes
+drain cancellation on reset/pause, concurrent later writes not extending the
+captured target, unmasked-signal EINTR and a masked signal remaining pending until
+after successful drain. The initial timer-driven probe failed because setitimer
+is unsupported. The corrected probe uses pthread-directed signals and exits zero
+with no remaining tasks. These checks do not certify all OSS ioctls or mmap.
+
+Evidence: `build/workloads/oss-endpoint-20261018/endpoint-v2/` retains the corrected
+probe's complete source in its request and the authoritative completion. The
+frozen kernel is
+`ae3b46ff2ba527cbe9d91fee3fadecc7ee1ae0742439453d4f2548b8a9741b99`.
+All 34 hosted suites and supported compiled-entry checks pass in
+`build/oss-endpoint-build-20261018.log`, including production mixer tests that
+keep hardware-accepted data charged against a smaller negotiated capacity.
+The existing ownership and independent-completion guest probes pass again. An
+additional persistent-open capture delivers all 9,660 expected nonzero frames
+in exact stereo order, including every final marker. The source finishes within
+the capture interval.
+
+The 200-round existing ALSA file-over-null probe and cleanup also exit zero.
+Its three-second sustained capture contains 132,592 PCM frames (3.00662 seconds),
+RMS 0.043217 and no silent analysis bins; the two-second idle capture has no
+frames. The desktop returns to ten tasks. Checked shutdown, launcher exit zero,
+serial/device checks and all three offline filesystem checks pass. This preserves
+the earlier playback smoke result without accepting the file PCM's clock.
+
+The ALSA OSS plugin still needs packaging and error-propagation fixes: its
+upstream pointer callback converts GETOPTR errors to pointer zero, and its drain
+callback ignores SYNC errors. It also assumes the requested buffer geometry.
+Do not enable this route until those errors propagate and the configured native
+slave passes ALSA pointer/delay/drain acceptance. Default file-over-null ALSA and
+Firefox launch settings remain unchanged; Firefox normal-launcher audio remains
+open.
+
+Sources: [Linux OSS pointer/drain implementation](https://raw.githubusercontent.com/torvalds/linux/master/sound/core/oss/pcm_oss.c),
+[ALSA OSS plugin](https://raw.githubusercontent.com/alsa-project/alsa-plugins/v1.2.12/oss/pcm_oss.c).
+
 
 ## Clocked OSS endpoint before enabling the ALSA OSS plugin
 
 Review with Astra identified the following integration requirements. The native
-receipt, completion, discontinuity and short-tail prerequisites now have the
-coverage above; full OSS geometry, pointer, readiness and drain acceptance remain:
+receipt, completion, discontinuity, short-tail and native pointer/drain
+prerequisites now have the coverage above; full ALSA integration, fragment
+readiness and non-native mappings remain:
 
 - Preserve the independently owned FIFO and serialized safe-staging foundation
   above while adding hardware accounting; do not reintroduce shared ownership.

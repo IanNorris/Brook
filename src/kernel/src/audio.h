@@ -96,6 +96,8 @@ AudioStreamId AudioMixerOpen();
 bool AudioMixerClose(AudioStreamId stream);
 bool AudioMixerReset(AudioStreamId stream);
 bool AudioMixerSetEnabled(AudioStreamId stream, bool enabled);
+// Empty streams may negotiate a smaller capacity; reset preserves geometry.
+bool AudioMixerSetCapacity(AudioStreamId stream, uint32_t frames);
 
 struct AudioStreamProgress {
     uint64_t epoch = 0;
@@ -104,6 +106,7 @@ struct AudioStreamProgress {
     uint32_t queuedFrames = 0;
     bool clocked = false;
     bool discontinuity = false;
+    uint32_t capacityFrames = MIXER_RING_FRAMES;
 };
 // Refresh calls the driver without the mixer lock. GetProgress reads cached
 // accounting only and is safe for descriptor scans that cannot sleep.

@@ -159,11 +159,18 @@
   Chromium's previously accepted ALSA-to-OSS output works after pause/resume.
 - Native HDA receipt/completion accounting now passes exact short-sound captures
   across persistent opens, close/reopen and reset, plus independent stream delay
-  and classic poll backpressure. Finish GETOPTR, interruptible SYNC/drain, exact
-  supported fragment geometry and DSP epoll before enabling the ALSA OSS plugin.
+  and classic poll backpressure. Native-rate GETOPTR, exact supported fragment
+  geometry, interruptible captured-target SYNC and cached DSP epoll now pass
+  targeted guest tests. Finish fragment-threshold readiness, ALSA OSS plugin
+  packaging/error propagation and its pointer/delay/drain acceptance before
+  changing defaults. Non-native pointer mapping remains unsupported.
   Preserve explicit discontinuity reporting and unsupported-clock behavior. The
   conservative half-ring sampling guard is not a formal maximum transfer-rate
   proof. See `audio-clock.md`; Firefox normal-launcher audio is still open.
+- Implement and test setitimer/getitimer compatibility when a real workload needs
+  it. Python's ITIMER_REAL probe currently fails with ENOSYS. Audio interruption
+  tests use targeted pthread signals instead; that substitution does not verify
+  interval timers or resolve the missing syscall.
 - Fresh-build diagnostics: `scripts/build.sh` currently prints success after a
   hosted configure/build failure. Make required hosted failures propagate, with
   an explicit opt-out if kernel-only builds need to remain supported. An early
