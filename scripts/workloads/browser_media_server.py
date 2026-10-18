@@ -22,19 +22,34 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--clip', type=Path, required=True)
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume a stopped fixture on its recorded port, preserving its origin')
     args = parser.parse_args()
     output = args.output.resolve()
     clip = args.clip.resolve(strict=True)
-    if not output.is_relative_to(ROOT / 'build') or output.exists():
-        parser.error('--output must be a new directory under build/')
+    if not output.is_relative_to(ROOT / 'build') or (output.exists() and not args.resume):
+        parser.error('--output must be new under build/, or explicitly resumed')
     if not clip.is_file():
         parser.error('--clip must be a media file')
     media = output / 'http'
-    media.mkdir(parents=True)
-    (media / 'clip.webm').symlink_to(clip)
     page = Path(__file__).with_name('browser_media_fixture.html')
     page_bytes = page.read_bytes()
-    (media / 'index.html').write_bytes(page_bytes)
+    with clip.open('rb') as source:
+        clip_sha = hashlib.file_digest(source, 'sha256').hexdigest()
+    port = 0
+    if args.resume:
+        previous = json.loads((output / 'servers.json').read_text())
+        if (not (output / 'stop-server').is_file()
+                or previous['clip_sha256'] != clip_sha
+                or previous['page_sha256'] != hashlib.sha256(page_bytes).hexdigest()
+                or (media / 'index.html').read_bytes() != page_bytes
+                or (media / 'clip.webm').resolve() != clip):
+            parser.error('Resume requires an explicitly stopped fixture with matching media/page')
+        port = previous['media_port']
+    else:
+        media.mkdir(parents=True)
+        (media / 'clip.webm').symlink_to(clip)
+        (media / 'index.html').write_bytes(page_bytes)
     lock = threading.Lock()
 
     class Handler(http.server.SimpleHTTPRequestHandler):
@@ -44,7 +59,9 @@ def main():
                 return
             try:
                 size = int(self.headers.get('Content-Length', '0'))
-                if not 0 < size <= 262144:
+                # Ten minutes of 100 ms source samples exceed the old 256 KiB
+                # limit. Retain a bound large enough for the long-run fixture.
+                if not 0 < size <= 4 * 1024 * 1024:
                     raise ValueError('report size')
                 state = json.loads(self.rfile.read(size))
                 if not isinstance(state, dict):
@@ -63,10 +80,10 @@ def main():
                 log.write(fmt % values + '\n')
 
     server = http.server.ThreadingHTTPServer(
-        ('127.0.0.1', 0), functools.partial(Handler, directory=str(media)))
+        ('127.0.0.1', port), functools.partial(Handler, directory=str(media)))
+    if args.resume:
+        (output / 'stop-server').unlink()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
-    with clip.open('rb') as source:
-        clip_sha = hashlib.file_digest(source, 'sha256').hexdigest()
     (output / 'servers.json').write_text(json.dumps({
         'pid': os.getpid(), 'media_port': server.server_port,
         'clip': str(clip), 'clip_sha256': clip_sha,
