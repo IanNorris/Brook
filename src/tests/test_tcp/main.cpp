@@ -380,6 +380,19 @@ int main()
 {
     printf("=== TCP State Machine Tests ===\n");
 
+    ASSERT_TRUE(!TcpTimerElapsed(1000, 1001, 40));
+    ASSERT_TRUE(!TcpTimerElapsed(1000, 2168, 60000));
+    ASSERT_TRUE(!TcpTimerElapsed(1000, 1000, 40));
+    ASSERT_TRUE(!TcpTimerElapsed(1039, 1000, 40));
+    ASSERT_TRUE(TcpTimerElapsed(1040, 1000, 40));
+    ASSERT_TRUE(!TcpTimerElapsed(60999, 1000, 60000));
+    ASSERT_TRUE(TcpTimerElapsed(61000, 1000, 60000));
+    ASSERT_TRUE(TcpTimerElapsed(30, ~uint64_t{0} - 9, 40));
+    Socket rewound = {};
+    rewound.tcpState = TcpState::SynRecv;
+    rewound.tcpLastRxTick = 2168;
+    ASSERT_TRUE(!TcpPassiveOpenExpired(rewound, 1000));
+
     TestPassiveHandshake();
     TestSynAck();
     TestSynRst();

@@ -1844,14 +1844,14 @@ static void TcpStatsMaybeFlush()
         if (!g_sockUsed[i]) continue;
         Socket& s = g_sockets[i];
         if (s.type != SOCK_STREAM) continue;
-        if (s.tcpUnackedSegs > 0 && now - s.tcpLastDataTick >= DELAYED_ACK_MS) {
+        if (s.tcpUnackedSegs > 0 && TcpTimerElapsed(now, s.tcpLastDataTick, DELAYED_ACK_MS)) {
             s.tcpUnackedSegs = 0;
             TcpSendSegment(s, TCP_ACK, nullptr, 0, "delayed-ack-timer");
         }
         // Proactive window update for stalled connections
         if (s.tcpState == TcpState::Established &&
             s.tcpLastRxTick != 0 &&
-            now - s.tcpLastRxTick >= WINDOW_KEEPALIVE_MS &&
+            TcpTimerElapsed(now, s.tcpLastRxTick, WINDOW_KEEPALIVE_MS) &&
             TcpReceiveFree(s) >= WINDOW_KEEPALIVE_MSS)
         {
             TcpSendSegment(s, TCP_ACK, nullptr, 0, "wnd-keepalive");
@@ -1859,7 +1859,7 @@ static void TcpStatsMaybeFlush()
         }
     }
 
-    if (now - g_tcpStatsLastTick < 5000) return;
+    if (!TcpTimerElapsed(now, g_tcpStatsLastTick, 5000)) return;
     if (g_tcpStats.txPkts == 0 && g_tcpStats.rxPkts == 0) {
         // No traffic in 5s — dump state of all established sockets to help
         // diagnose stalls (BRO-153).
@@ -1918,7 +1918,7 @@ static void TcpReapOoo(Socket& s, uint64_t now)
     static constexpr uint64_t TCP_OOO_REAP_MS = 30000;
     for (uint32_t i = 0; i < Socket::TCP_OOO_SLOT_COUNT; ++i) {
         auto& slot = s.tcpOooSlots[i];
-        if (!slot.used || now - slot.tick < TCP_OOO_REAP_MS)
+        if (!slot.used || !TcpTimerElapsed(now, slot.tick, TCP_OOO_REAP_MS))
             continue;
 
         if (s.tcpOooBytes >= slot.len)
@@ -2884,13 +2884,14 @@ bool SockPollHangup(int sockIdx)
     // silently stops delivering data and curl's --max-time can't fire because
     // it relies on poll() returning.
     static constexpr uint64_t TCP_IDLE_TIMEOUT_MS = 60000;
+    const uint64_t now = g_lapicTickCount;
     if (!hungUp && s.tcpState == TcpState::Established &&
         s.tcpLastRxTick != 0 &&
-        g_lapicTickCount - s.tcpLastRxTick >= TCP_IDLE_TIMEOUT_MS)
+        TcpTimerElapsed(now, s.tcpLastRxTick, TCP_IDLE_TIMEOUT_MS))
     {
-        SerialPrintf("tcp: sock=%d pid=%u idle %lums — reporting POLLHUP\n",
-                     sockIdx, s.ownerPid,
-                     g_lapicTickCount - s.tcpLastRxTick);
+        // Readiness can be queried repeatedly: do not log on every poll while
+        // holding the socket lock. In particular, backwards time must never
+        // synthesize an enormous unsigned idle duration and a false hangup.
         hungUp = true;
     }
     SpinLockRelease(&s.lock);

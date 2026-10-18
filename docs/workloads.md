@@ -2087,3 +2087,56 @@ active PCM, and checked shutdown/serial/offline filesystem acceptance passes.
 This is not yet normal shipped-launcher audio acceptance. See
 [audio evidence](audio-clock.md) for exact artifacts, remaining integration and
 startup diagnostics.
+
+### Live browser review and epoll allocation checkpoint (18 October)
+
+The native PipeWire review in `build/workloads/firefox-audio-review-20261018/`
+did not pass browser audio/performance acceptance. The user heard Firefox demo
+stutters and intermittent Chromium speedups/stutters; Chromium video and page
+updates were very slow, and Firefox search input barely responded. YouTube ads
+did play. Both browsers ran together on eight CPUs/4 GiB with CPU composition.
+The scheduler was RR; MLFQ was registered but not selected. After closing both
+windows, the tracked Firefox job exited completely, but 76 total tasks remained.
+Serial acceptance failed on an `exit_group` timeout. Checked shutdown and all
+three offline filesystem checks passed; this is not a clean acceptance seed.
+
+The live heap timing interval measured 1,523,262 allocations and 1,522,913 frees
+over 10.34 host seconds, with 64,418,197 searched free headers. CPU samples point
+predominantly to epoll event-buffer/walk allocation. Many samples land just after
+STI, so sampling percentages do not quantify time spent in IRQ-masked allocator
+sections. The profile writer also adds I/O and 725,094 profiler records were
+dropped; retain these limitations when interpreting the capture. The complete
+review log contains 639 unsigned-underflow idle-HUP reports: RTC calibration can
+rewind LAPIC-derived time, and TCP readiness treated that as enormous inactivity.
+
+The candidate caches at most 32 **free** epoll walk objects, retaining heap
+fallback and all pin cleanup/reset. Sleepers own their objects independently of
+the free cache. Event batches up to 16 use a fixed 192-byte stack buffer. TCP
+timer comparisons now reject backwards intervals while preserving short uint64
+wraparound, and readiness no longer logs every idle query under the socket lock.
+This does not fix the underlying clock rewind or implement ET/ONESHOT semantics.
+
+Two isolated, sequential VM candidates used the same accepted seed disks and
+capacity, with frozen kernels `9261115b...675` (baseline) and `22634263...588`
+(candidate). `scripts/workloads/epoll_churn.py` passes ready-event correctness,
+large event batches and hot calls with 48 blocked waits; nested-epoll checks also
+pass, including graph mutation, wakeup and killed-waiter cleanup. Three repeated
+10,000-call measurements give these median nanoseconds per call:
+
+| Event batch | Baseline | Candidate |
+| --- | ---: | ---: |
+| 1 | 4,622 | 4,224 |
+| 16 | 4,794 | 4,490 |
+| 1,024 | 4,685 | 4,616 |
+| 1, with 48 blocked waiters | 5,988 | 6,098 |
+
+Small-batch reductions are about 8.6% and 6.3%; these short VM measurements do
+not establish a significant improvement for large batches or the sleeper case.
+Whole-job allocator counts fall from 90,689 to 20,084 (including Python/job
+overhead). Cache inspection after the first candidate probes records 43,456 hits,
+50 misses and 31 retained free objects; full-cache releases use the normal heap
+free path. All 35 hosted tests, supported compiled-entry audits, heap checks,
+serial acceptance and offline filesystem checks pass for both epoll VMs. Exact
+manifests, repeated reports and `epoll-cache-comparison-20261018.json` remain in
+ignored `build/workloads/`. Browser responsiveness, repeated ready-event causes,
+normal-launcher Firefox audio and live network behavior still need retesting.

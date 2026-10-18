@@ -11,6 +11,15 @@
 
 namespace brook {
 
+// Calibration can move the LAPIC-derived clock backwards. Only a forward
+// interval shorter than half the counter range can expire a TCP timer. This
+// also preserves ordinary uint64 wraparound for short elapsed intervals.
+inline bool TcpTimerElapsed(uint64_t now, uint64_t previous, uint64_t delay)
+{
+    const uint64_t elapsed = now - previous;
+    return elapsed <= (~uint64_t{0} >> 1) && elapsed >= delay;
+}
+
 // A received FIN closes only the peer's send direction. Our send direction
 // remains available until we close it or receive a reset.
 inline bool TcpCanSendData(TcpState state)
@@ -36,7 +45,7 @@ struct TcpAction {
 // Bound incomplete passive opens without discarding established/half-closed FDs.
 inline bool TcpPassiveOpenExpired(const Socket& socket, uint64_t now)
 {
-    return socket.tcpState == TcpState::SynRecv && now - socket.tcpLastRxTick >= 30000;
+    return socket.tcpState == TcpState::SynRecv && TcpTimerElapsed(now, socket.tcpLastRxTick, 30000);
 }
 
 // Process an incoming TCP segment for a socket.
