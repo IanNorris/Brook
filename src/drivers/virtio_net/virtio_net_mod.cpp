@@ -20,7 +20,11 @@
 #include "memory/physical_memory.h"
 #include "memory/address.h"
 #include "mem_tag.h"
+#ifdef BROOK_HOST_TEST
+#include <string.h>
+#else
 #include "string.h"
+#endif
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -172,6 +176,12 @@ static uint64_t g_rxBufsPhys = 0;
 // TX packet buffer (single, reused)
 static uint8_t* g_txBuf = nullptr;
 static uint64_t g_txBufPhys = 0;
+// TX has one DMA buffer/descriptor. Own both through device completion, not
+// merely publication: concurrent socket/poll callers otherwise overwrite ACKs.
+// TX runs in process/early-boot context; RX IRQs only wake the poll thread.
+// Keep interrupts enabled while polling completion so TLB IPIs can run.
+static SpinLock g_txLock;
+static bool g_txFaulted = false;
 
 static NetIf g_netIf;
 
@@ -283,9 +293,14 @@ static bool AllocTxBuffer()
 
 static void NotifyQueue(uint16_t queueIdx, const VirtqState& q)
 {
+#ifdef BROOK_HOST_TEST
+    extern void VirtioNetTestNotify(uint16_t queueIdx);
+    VirtioNetTestNotify(queueIdx);
+#else
     volatile uint16_t* notifyAddr = reinterpret_cast<volatile uint16_t*>(
         g_notifyCfg + q.notifyOff * g_notifyMultiplier);
     *notifyAddr = queueIdx;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +324,10 @@ static void VirtioNetPoll(NetIf* /*nif*/)
 
 static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
 {
-    if (len + VIRTIO_NET_HDR_SIZE > RX_BUF_SIZE) return -1;
+    if (len > RX_BUF_SIZE - VIRTIO_NET_HDR_SIZE || (!frame && len)) return -1;
+    SpinLockAcquire(&g_txLock);
+    struct ReleaseTx { ~ReleaseTx() { SpinLockRelease(&g_txLock); } } release;
+    if (g_txFaulted) return -1;
 
     static uint32_t s_txCount = 0;
     s_txCount++;
@@ -351,16 +369,32 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
     NotifyQueue(1, g_txq);
 
     // Wait for TX completion (poll used ring)
+#ifdef BROOK_HOST_TEST
+    constexpr uint32_t waitBudget = 1024; // Exercise timeout ownership, not hardware latency.
+#else
+    constexpr uint32_t waitBudget = 10000000;
+#endif
     uint32_t spins = 0;
     while (*g_txq.usedIdx == g_txq.usedIdxShadow) {
         __asm__ volatile("pause");
-        if (++spins > 10000000u) {
-            SerialPuts("virtio_net: TX timeout\n");
+        if (++spins > waitBudget) {
+            // The device may still own descriptor zero. Never reuse its DMA
+            // memory after unknown completion; recovery requires driver reset.
+            g_txFaulted = true;
+            SerialPuts("virtio_net: TX timeout; queue quarantined\n");
             return -1;
         }
     }
     __asm__ volatile("mfence" ::: "memory");
-    g_txq.usedIdxShadow++;
+    const uint16_t completed = *g_txq.usedIdx;
+    const uint16_t usedSlot = g_txq.usedIdxShadow & (g_txq.size - 1);
+    if (completed != static_cast<uint16_t>(g_txq.usedIdxShadow + 1) ||
+        g_txq.usedRing[usedSlot].id != 0) {
+        g_txFaulted = true;
+        SerialPuts("virtio_net: invalid TX completion; queue quarantined\n");
+        return -1;
+    }
+    g_txq.usedIdxShadow = completed;
 
     return 0;
 }

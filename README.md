@@ -90,9 +90,11 @@ the table distinguishes tested behavior from remaining limitations.
   under investigation. See [filesystem capacity acceptance](docs/filesystem-space.md).
   The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and
-  remaining limits. Both [full bootstrap paths](docs/bootstrap.md#matching-38-suite-acceptance-2026-10-18)
-  pass the current 38 native suites twice, then boot their own kernels and pass
-  all 38 again. Clean-image SDK installation remains slow (732 seconds).
+  remaining limits. The last [full bootstrap acceptance](docs/bootstrap.md#matching-38-suite-acceptance-2026-10-18)
+  passed 38 native suites three times per path. All 39 hosted suites now pass
+  with the [virtio-net TX ownership fix](docs/package-pipeline.md); full reruns
+  are pending. That component test reduces network-fed package extraction from
+  about 26 seconds to 4 seconds; the full SDK install still needs remeasurement.
 
 - **Desktop identity and package registration:** new apps and Terminal run as
   `brook` by default, with persistent `/data/home`. The installer preserves

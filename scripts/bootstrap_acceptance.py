@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools/vm_bridge"))
 import server
 
-NATIVE_TEST_COUNT = 38
+NATIVE_TEST_COUNT = 39
 NATIVE_PASS_MARKER = f"100% tests passed, 0 tests failed out of {NATIVE_TEST_COUNT}"
 
 
@@ -102,7 +102,7 @@ def check_stopped_serial(data, directory):
     serial = Path(data["serial_log"])
     text = serial.read_text(errors="replace")
     shutil.copy2(serial, directory / "guest-final-serial.log")
-    if re.search(r"KERNEL PANIC|KERNEL FAULT|BRO176-MAP(?:LEAK|UNDERFLOW)|SCHED: exit_group timeout|virtio-blk.*(?:timeout|reset)|virtio.*I/O error", text, re.I):
+    if re.search(r"KERNEL PANIC|KERNEL FAULT|BRO176-MAP(?:LEAK|UNDERFLOW)|SCHED: exit_group timeout|virtio_net: (?:TX timeout|invalid TX completion)|virtio-blk.*(?:timeout|reset)|virtio.*I/O error", text, re.I):
         raise RuntimeError(f"Guest device/panic errors; see {directory / 'guest-final-serial.log'}")
 
 
