@@ -29,7 +29,16 @@ struct MappingRange {
     MappingLeafOwnership leafOwnership;
 };
 bool MappingRangeValid(const MappingRange& range);
-struct MappingRangeNode { MappingRange range; MappingRangeNode* next; FileMappingRegistration fileRegistration; };
+struct MappingRangeNode {
+    MappingRange range;
+    MappingRangeNode* next;
+    FileMappingRegistration fileRegistration;
+    // Intrusive AVL index by range.begin; the list remains the ordered
+    // iteration/teardown representation. Both use the same AS mutation lock.
+    MappingRangeNode* left = nullptr;
+    MappingRangeNode* right = nullptr;
+    uint32_t height = 1;
+};
 struct MappingRangeTable {
     MappingRangeNode* head;
     uint64_t nextIdentity;
@@ -39,6 +48,7 @@ struct MappingRangeTable {
     // Never copy a table/cache into another address space.
     static constexpr unsigned LookupSlots = 16;
     mutable const MappingRange* lookup[LookupSlots] = {};
+    MappingRangeNode* root = nullptr;
 };
 
 // All table access is protected by AS.mutation, except unpublished AS creation

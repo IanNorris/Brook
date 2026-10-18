@@ -242,12 +242,11 @@ TEST_MAIN("heap", {
     brook::kfree(noSplit); brook::kfree(guardA); brook::kfree(guardB);
     ASSERT_EQ(brook::HeapFreeBytes(), freeBeforeIndex);
 
-    // Same floor-log2 class can contain both undersized and fitting blocks.
-    // Free in reverse-size order so the search must skip the small head.
+    // Finer buckets separate undersized blocks in the same log2 class.
     auto* classGuardA = brook::kmalloc(64);
-    auto* classLarge = brook::kmalloc(320); // total 448, bin 8
+    auto* classLarge = brook::kmalloc(320); // total 448
     auto* classGuardB = brook::kmalloc(64);
-    auto* classSmall = brook::kmalloc(192); // total 320, bin 8
+    auto* classSmall = brook::kmalloc(192); // total 320
     auto* classGuardC = brook::kmalloc(64);
     ASSERT_TRUE(classGuardA && classLarge && classGuardB && classSmall && classGuardC);
     brook::kfree(classLarge); brook::kfree(classSmall);
@@ -255,9 +254,65 @@ TEST_MAIN("heap", {
     auto* classFit = brook::kmalloc(256); // total 384, skip 320 and select 448
     brook::HeapTimingEnable(false); brook::HeapTimingSnapshot(&timing);
     ASSERT_TRUE(classFit == classLarge);
-    ASSERT_EQ(timing.headers, uint64_t{2});
+    ASSERT_EQ(timing.headers, uint64_t{1});
     brook::kfree(classFit); brook::kfree(classGuardA);
     brook::kfree(classGuardB); brook::kfree(classGuardC);
+    ASSERT_TRUE(brook::HeapCheckIntegrity());
+    ASSERT_EQ(brook::HeapFreeBytes(), freeBeforeIndex);
+
+    // Many isolated undersized holes must not cause a linear search under
+    // the IRQ lock. Guards preserve fragmentation; live payloads are checked.
+    static uint8_t* bucketHoles[512];
+    static uint8_t* bucketGuards[512];
+    auto* bucketFit = brook::kmalloc(320); // total 448, fits requested 384
+    auto* bucketFitGuard = brook::kmalloc(64);
+    ASSERT_TRUE(bucketFit && bucketFitGuard);
+    for (unsigned i = 0; i < 512; ++i) {
+        bucketHoles[i] = static_cast<uint8_t*>(brook::kmalloc(192)); // total 320
+        bucketGuards[i] = static_cast<uint8_t*>(brook::kmalloc(64));
+        ASSERT_TRUE(bucketHoles[i] && bucketGuards[i]);
+        bucketGuards[i][0] = static_cast<uint8_t>(i);
+    }
+    brook::kfree(bucketFit);
+    for (auto* pointer : bucketHoles) brook::kfree(pointer);
+    brook::HeapTimingReset(); brook::HeapTimingEnable(true);
+    auto* bucketResult = brook::kmalloc(256);
+    brook::HeapTimingEnable(false); brook::HeapTimingSnapshot(&timing);
+    ASSERT_TRUE(bucketResult == bucketFit);
+    ASSERT_EQ(timing.headers, uint64_t{1});
+    ASSERT_EQ(timing.expansions, uint64_t{0});
+    for (unsigned i = 0; i < 512; ++i) {
+        ASSERT_EQ(bucketGuards[i][0], static_cast<uint8_t>(i));
+        brook::kfree(bucketGuards[i]);
+    }
+    brook::kfree(bucketResult); brook::kfree(bucketFitGuard);
+    ASSERT_TRUE(brook::HeapCheckIntegrity());
+    ASSERT_EQ(brook::HeapFreeBytes(), freeBeforeIndex);
+
+    // For larger sizes a sub-bin can cover more than one aligned size.
+    // Consume the remaining tail first: there is no guaranteed larger bucket
+    // available, but a fitting block behind an undersized head must be reused
+    // without expanding or incorrectly reporting exhaustion.
+    auto* partialGuardA = brook::kmalloc(64);
+    auto* partialFit = brook::kmalloc(2240); // total 2368, bucket [2304,2432)
+    auto* partialGuardB = brook::kmalloc(64);
+    auto* partialSmall = brook::kmalloc(2176); // total 2304, same bucket
+    auto* partialGuardC = brook::kmalloc(64);
+    ASSERT_TRUE(partialGuardA && partialFit && partialGuardB && partialSmall && partialGuardC);
+    brook::HeapGetStats(&stats);
+    ASSERT_EQ(stats.freeBlocks, uint32_t{1});
+    ASSERT_TRUE(stats.largestFreeBlock > 128);
+    auto* consumedTail = brook::kmalloc(stats.largestFreeBlock - 128);
+    ASSERT_TRUE(consumedTail != nullptr);
+    brook::kfree(partialFit); brook::kfree(partialSmall);
+    brook::HeapTimingReset(); brook::HeapTimingEnable(true);
+    auto* partialResult = brook::kmalloc(2240);
+    brook::HeapTimingEnable(false); brook::HeapTimingSnapshot(&timing);
+    ASSERT_TRUE(partialResult == partialFit);
+    ASSERT_EQ(timing.expansions, uint64_t{0});
+    ASSERT_EQ(timing.headers, uint64_t{2});
+    brook::kfree(partialResult); brook::kfree(partialGuardA);
+    brook::kfree(partialGuardB); brook::kfree(partialGuardC); brook::kfree(consumedTail);
     ASSERT_TRUE(brook::HeapCheckIntegrity());
     ASSERT_EQ(brook::HeapFreeBytes(), freeBeforeIndex);
 

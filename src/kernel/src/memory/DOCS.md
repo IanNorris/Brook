@@ -428,14 +428,16 @@ failure detaches installed leaves and releases their frames without publishing a
 new heap extent; empty intermediate page tables remain reusable kernel state.
 
 
-The current allocator uses 32 floor-log2 free-block bins and a bitmap of nonempty
-bins. A request scans its own class for a fitting free block, then takes the first
-node of the lowest larger nonempty class. It does not visit allocated blocks.
+The current allocator divides each of 32 floor-log2 groups into 16 free-block
+bins, with a group bitmap and one sub-bin bitmap per group. A request tries its
+own bin's head, then the lowest guaranteed fitting larger bin. If none exists,
+it scans the remainder of its partially covered bin before expanding or failing.
+It does not visit allocated blocks or skip a usable fit when no larger bin exists.
 Removing a block precedes any size change; split remainders and final coalesced
 blocks are inserted once. Expansion locates the physical tail through its footer.
 Links occupy previously unused header padding and stay outside poisoned payload.
 This removes the old first-fit/live-block and expansion-tail scans described above;
-within-class fragmentation can still require examining several free blocks.
+The partial-bin fallback can still examine several free blocks.
 
 `HeapCheckIntegrity` validates physical tags, alignment and free-byte accounting,
 then validates classes, bitmap, backlinks and exact free-block membership using a

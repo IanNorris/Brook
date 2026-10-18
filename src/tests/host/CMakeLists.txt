@@ -45,6 +45,21 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_mapping_ranges "${BROOK_ROOT}/src/kernel/src/memory/mapping_ranges.cpp")
+target_compile_options(test_mapping_ranges PRIVATE
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+set_tests_properties(test_mapping_ranges PROPERTIES TIMEOUT 15)
+add_host_test(test_heap_index "${BROOK_ROOT}/src/kernel/src/memory/heap.cpp")
+target_compile_options(test_heap_index PRIVATE
+    -DBROOK_HOST_TEST -DBROOK_HEAP_HOST_REGION=0x300000000000ULL
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+set_tests_properties(test_heap_index PROPERTIES TIMEOUT 15)
 add_host_test(test_object_cache)
 set_tests_properties(test_object_cache PROPERTIES TIMEOUT 15)
 add_host_test(test_module_sections)

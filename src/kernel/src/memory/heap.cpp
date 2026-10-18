@@ -23,8 +23,16 @@ static constexpr uint64_t INITIAL_PAGES = 256;         // 1MB initial heap
 static constexpr uint64_t EXPAND_PAGES  = 256;         // expand by 1MB at a time
 
 // Dedicated virtual region for the heap (PML4[385] — separate from VMALLOC).
+#ifdef BROOK_HEAP_HOST_REGION
+#if !defined(BROOK_HOST_TEST) || defined(BROOK_STANDALONE_TEST)
+#error Host heap region requires the unprivileged hosted test configuration
+#endif
+static constexpr uint64_t HEAP_VIRT_BASE = BROOK_HEAP_HOST_REGION;
+static constexpr uint64_t HEAP_VIRT_MAX  = HEAP_VIRT_BASE + 64 * 1024 * 1024;
+#else
 static constexpr uint64_t HEAP_VIRT_BASE = 0xFFFFC08000000000ULL;
 static constexpr uint64_t HEAP_VIRT_MAX  = 0xFFFFC0FF00000000ULL; // 508GB max
+#endif
 
 // Poison fill patterns for debugging
 static constexpr uint8_t  POISON_ALLOC  = 0xCD;  // uninitialized alloc
@@ -135,7 +143,11 @@ static constexpr uint64_t MIN_BLOCK     = OVERHEAD + ALIGN; // smallest useful b
 static uint8_t* g_heapStart   = nullptr;
 static uint8_t* g_heapEnd     = nullptr;  // exclusive
 static uint64_t g_freeBytes   = 0;
-static BlockHeader* g_freeBins[32] = {};
+static constexpr unsigned FREE_SUB_BITS = 4;
+static constexpr unsigned FREE_SUB_COUNT = 1u << FREE_SUB_BITS;
+static constexpr unsigned FREE_BIN_COUNT = 32 * FREE_SUB_COUNT;
+static BlockHeader* g_freeBins[FREE_BIN_COUNT] = {};
+static uint32_t g_freeSubMasks[32] = {};
 static uint32_t g_freeBinMask = 0;
 
 // SMP lock protecting all heap metadata.
@@ -271,12 +283,15 @@ static inline bool IsValidHeader(BlockHeader* h)
     return h != nullptr && h->magic == HEADER_MAGIC;
 }
 
-// Floor-log2 classes. Only the requested class may contain undersized
-// blocks; every block in a larger class is large enough. Links live outside
-// the poisoned payload. All index operations require g_heapLock.
+// Sixteen subdivisions per floor-log2 class. Blocks are 64-byte aligned,
+// so these classes are exact below 2048 bytes. Links remain outside the
+// poisoned payload. All index operations require g_heapLock.
 static unsigned FreeBin(uint32_t size)
 {
-    return 31u - static_cast<unsigned>(__builtin_clz(size));
+    const unsigned group = 31u - static_cast<unsigned>(__builtin_clz(size));
+    // All physical blocks are at least MIN_BLOCK (192 bytes), hence group>=7.
+    const unsigned sub = (size >> (group - FREE_SUB_BITS)) - FREE_SUB_COUNT;
+    return group * FREE_SUB_COUNT + sub;
 }
 
 static void FreeInsert(BlockHeader* h)
@@ -286,7 +301,8 @@ static void FreeInsert(BlockHeader* h)
     h->freeNext = g_freeBins[bin];
     if (h->freeNext) h->freeNext->freePrev = h;
     g_freeBins[bin] = h;
-    g_freeBinMask |= uint32_t{1} << bin;
+    g_freeSubMasks[bin >> FREE_SUB_BITS] |= uint32_t{1} << (bin & (FREE_SUB_COUNT - 1));
+    g_freeBinMask |= uint32_t{1} << (bin >> FREE_SUB_BITS);
 }
 
 static void FreeRemove(BlockHeader* h)
@@ -295,21 +311,45 @@ static void FreeRemove(BlockHeader* h)
     if (h->freePrev) h->freePrev->freeNext = h->freeNext;
     else g_freeBins[bin] = h->freeNext;
     if (h->freeNext) h->freeNext->freePrev = h->freePrev;
-    if (!g_freeBins[bin]) g_freeBinMask &= ~(uint32_t{1} << bin);
+    if (!g_freeBins[bin]) {
+        auto& mask = g_freeSubMasks[bin >> FREE_SUB_BITS];
+        mask &= ~(uint32_t{1} << (bin & (FREE_SUB_COUNT - 1)));
+        if (!mask) g_freeBinMask &= ~(uint32_t{1} << (bin >> FREE_SUB_BITS));
+    }
     h->freePrev = h->freeNext = nullptr;
 }
 
 static BlockHeader* FreeFind(uint32_t needed, HeapTimedLock& timing)
 {
     const unsigned bin = FreeBin(needed);
-    for (BlockHeader* h = g_freeBins[bin]; h; h = h->freeNext) {
+    auto* head = g_freeBins[bin];
+    if (head) {
+        if (timing.measured) ++timing.headers;
+        if (head->size >= needed) return head;
+    }
+    const unsigned group = bin >> FREE_SUB_BITS;
+    const unsigned sub = bin & (FREE_SUB_COUNT - 1);
+    uint32_t available = g_freeSubMasks[group] & (~uint32_t{0} << (sub + 1));
+    unsigned selectedGroup = group;
+    if (!available) {
+        const uint32_t larger = group == 31 ? 0 : g_freeBinMask & (~uint32_t{0} << (group + 1));
+        if (larger) {
+            selectedGroup = __builtin_ctz(larger);
+            available = g_freeSubMasks[selectedGroup];
+        }
+    }
+    if (available) {
+        if (timing.measured) ++timing.headers;
+        return g_freeBins[selectedGroup * FREE_SUB_COUNT + __builtin_ctz(available)];
+    }
+    // A partially covered sub-bin can still contain a fitting block behind
+    // its undersized head. Search it before expanding/failing when no larger
+    // bucket exists; never report OOM merely because rounding skipped a fit.
+    for (auto* h = head ? head->freeNext : nullptr; h; h = h->freeNext) {
         if (timing.measured) ++timing.headers;
         if (h->size >= needed) return h;
     }
-    const uint32_t larger = bin == 31 ? 0 : g_freeBinMask & (~uint32_t{0} << (bin + 1));
-    if (!larger) return nullptr;
-    if (timing.measured) ++timing.headers;
-    return g_freeBins[__builtin_ctz(larger)];
+    return nullptr;
 }
 
 static void WriteBlock(uint8_t* base, uint32_t size, uint32_t free)
@@ -476,6 +516,7 @@ void HeapInit()
     uint32_t blockSize = static_cast<uint32_t>(INITIAL_PAGES * 4096);
     WriteBlock(g_heapStart, blockSize, 1);
     for (auto& bin : g_freeBins) bin = nullptr;
+    for (auto& mask : g_freeSubMasks) mask = 0;
     g_freeBinMask = 0;
     FreeInsert(reinterpret_cast<BlockHeader*>(g_heapStart));
     g_freeBytes = blockSize - OVERHEAD;
@@ -671,7 +712,7 @@ bool HeapCheckIntegrity()
 
     uint32_t blockCount = 0;
     uint64_t freeBytes = 0;
-    uint64_t freeCounts[32] = {};
+    uint32_t freeCounts[FREE_BIN_COUNT] = {};
     BlockHeader* cur = reinterpret_cast<BlockHeader*>(g_heapStart);
 
     while (reinterpret_cast<uint8_t*>(cur) < g_heapEnd)
@@ -720,10 +761,19 @@ bool HeapCheckIntegrity()
 
     // A bounded walk catches cycles/duplicates, missing nodes, wrong classes,
     // broken backlinks and stale bitmap entries without allocating scratch.
-    for (unsigned bin = 0; bin < 32; ++bin) {
+    for (unsigned group = 0; group < 32; ++group) {
+        if (bool(g_freeBinMask & (uint32_t{1} << group)) != bool(g_freeSubMasks[group]) ||
+            (g_freeSubMasks[group] >> FREE_SUB_COUNT)) {
+            SerialPrintf("HeapCheck: free-index group mismatch %u\n", group);
+            IrqSpinLockRelease(&g_heapLock, heapFlags);
+            return false;
+        }
+    }
+    for (unsigned bin = 0; bin < FREE_BIN_COUNT; ++bin) {
         uint64_t count = 0;
         BlockHeader* prev = nullptr;
-        bool valid = bool(g_freeBinMask & (uint32_t{1} << bin)) == bool(g_freeBins[bin]);
+        bool valid = bool(g_freeSubMasks[bin >> FREE_SUB_BITS] &
+                          (uint32_t{1} << (bin & (FREE_SUB_COUNT - 1)))) == bool(g_freeBins[bin]);
         for (BlockHeader* node = g_freeBins[bin]; valid && node; node = node->freeNext) {
             const uint64_t address = reinterpret_cast<uint64_t>(node);
             if (++count > freeCounts[bin] || address < reinterpret_cast<uint64_t>(g_heapStart) ||

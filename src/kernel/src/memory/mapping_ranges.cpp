@@ -7,6 +7,65 @@ static constexpr uint64_t UserEnd = 0x0000800000000000ULL;
 static void InvalidateLookup(MappingRangeTable& table) {
     for (auto& entry : table.lookup) entry = nullptr;
 }
+static uint32_t Height(const MappingRangeNode* node) { return node ? node->height : 0; }
+static void UpdateHeight(MappingRangeNode* node) {
+    auto left = Height(node->left), right = Height(node->right);
+    node->height = 1 + (left > right ? left : right);
+}
+static MappingRangeNode* RotateLeft(MappingRangeNode* node) {
+    auto* top = node->right;
+    node->right = top->left; top->left = node;
+    UpdateHeight(node); UpdateHeight(top); return top;
+}
+static MappingRangeNode* RotateRight(MappingRangeNode* node) {
+    auto* top = node->left;
+    node->left = top->right; top->right = node;
+    UpdateHeight(node); UpdateHeight(top); return top;
+}
+static MappingRangeNode* Balance(MappingRangeNode* node) {
+    if (!node) return nullptr;
+    UpdateHeight(node);
+    if (Height(node->left) > Height(node->right) + 1) {
+        if (Height(node->left->right) > Height(node->left->left))
+            node->left = RotateLeft(node->left);
+        return RotateRight(node);
+    }
+    if (Height(node->right) > Height(node->left) + 1) {
+        if (Height(node->right->left) > Height(node->right->right))
+            node->right = RotateRight(node->right);
+        return RotateLeft(node);
+    }
+    return node;
+}
+static MappingRangeNode* IndexInsert(MappingRangeNode* root, MappingRangeNode* node) {
+    if (!root) return node;
+    if (node->range.begin < root->range.begin) root->left = IndexInsert(root->left, node);
+    else if (node->range.begin > root->range.begin) root->right = IndexInsert(root->right, node);
+    else KernelPanic("mapping: duplicate range index key");
+    return Balance(root);
+}
+static MappingRangeNode* IndexRemove(MappingRangeNode* root, MappingRangeNode* node) {
+    if (!root) KernelPanic("mapping: missing range index key");
+    if (node->range.begin < root->range.begin) root->left = IndexRemove(root->left, node);
+    else if (node->range.begin > root->range.begin) root->right = IndexRemove(root->right, node);
+    else {
+        if (root != node) KernelPanic("mapping: mismatched range index identity");
+        if (!root->left) return root->right;
+        if (!root->right) return root->left;
+        // Transplant the successor node itself. Copying its payload would
+        // invalidate range pointers and embedded file-registry identities.
+        auto* successor = root->right;
+        while (successor->left) successor = successor->left;
+        auto* right = IndexRemove(root->right, successor);
+        successor->left = root->left; successor->right = right;
+        return Balance(successor);
+    }
+    return Balance(root);
+}
+static void IndexErase(MappingRangeTable& table, MappingRangeNode* node) {
+    table.root = IndexRemove(table.root, node);
+    node->left = node->right = nullptr; node->height = 1;
+}
 static bool ValidRange(uint64_t begin, uint64_t end) {
     return begin < end && end <= UserEnd && !(begin & 4095) && !(end & 4095);
 }
@@ -89,9 +148,12 @@ bool MappingRangePlan::Replace(MappingRangeTable& table, uint64_t begin, uint64_
     if (right) append(Take(*right,end,right->end,table));
     auto* old = *first;
     while (old != stop) {
+        IndexErase(table, old);
         FileMappingRetire(&old->fileRegistration);
         auto* next = old->next; old->next = retired_; retired_ = old; old = next;
     }
+    for (auto* node = chain; node; node = node->next)
+        table.root = IndexInsert(table.root, node);
     *tail = stop; *first = chain ? chain : stop;
     return true;
 }
@@ -137,16 +199,20 @@ bool MappingRangePlan::Protect(MappingRangeTable& table, uint64_t begin, uint64_
     while (*link && (*link)->range.end <= begin) link = &(*link)->next;
     while (*link && (*link)->range.begin < end) {
         auto* node = *link; const auto original = node->range;
+        IndexErase(table, node);
         if (original.begin < begin) {
             auto* left = Take(original,original.begin,begin,table);
+            table.root = IndexInsert(table.root, left);
             left->next = node; *link = left; link = &left->next;
             node->range.begin = begin; node->range.offset += begin - original.begin;
         }
         if (original.end > end) {
             auto* right = Take(original,end,original.end,table);
+            table.root = IndexInsert(table.root, right);
             right->next = node->next; node->next = right; node->range.end = end;
         }
         node->range.protection = protection; node->range.identity = ++table.nextIdentity;
+        table.root = IndexInsert(table.root, node);
         link = &node->next;
     }
     return true;
@@ -156,11 +222,14 @@ const MappingRange* MappingRangeFind(const MappingRangeTable& table, uint64_t ad
     const unsigned slot = (page ^ (page >> 8) ^ (page >> 16)) & (MappingRangeTable::LookupSlots-1);
     if (const auto* cached = table.lookup[slot])
         if (cached->begin <= address && address < cached->end) return cached;
-    for (auto* node = table.head; node && node->range.begin <= address; node = node->next)
-        if (address < node->range.end) {
+    for (auto* node = table.root; node;) {
+        if (address < node->range.begin) node = node->left;
+        else if (address >= node->range.end) node = node->right;
+        else {
             table.lookup[slot] = &node->range;
             return &node->range;
         }
+    }
     return nullptr;
 }
 bool MappingRangePlan::Extend(MappingRangeTable& table,uint64_t identity,uint64_t end) {
@@ -192,6 +261,6 @@ uint64_t MappingRangeFindGap(const MappingRangeTable& table, uint64_t hint,
 }
 void MappingRangeDestroy(MappingRangeTable& table) {
     InvalidateLookup(table);
-    auto* nodes = table.head; table.head = nullptr; ReleaseNodes(nodes);
+    auto* nodes = table.head; table.head = table.root = nullptr; ReleaseNodes(nodes);
 }
 }

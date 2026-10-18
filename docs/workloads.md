@@ -2217,3 +2217,159 @@ run: audio remains unaccepted. Firefox exits normally with code zero and no
 surviving group tasks; the two-second post-exit capture reports an inactive
 stream and zero frames. Both baseline and candidate have checked shutdown,
 launcher exit zero, clean serial audits and all three offline filesystem checks.
+
+The following native review (`eventfd-live-review-20261018`) records the user's
+report of substantially better Firefox video framerate, no audible Firefox
+audio or tab speaker indicator, and smooth Chromium audio while both played
+YouTube. Rendering and playback CPU snapshots contain 209/197 samples and
+1,976/4,691 context switches with zero producer drops. The simultaneous playback
+interval records 43,926 allocations and 8,461,582 searched free headers in
+10.42 host seconds. The mixed ten-second WAV has no near-silent 10 ms bins;
+this cannot attribute output to Firefox. Heap counters and short CPU samples
+measure different aspects: IRQ-masked heap time is not uniformly sampled.
+
+This review is diagnostic evidence. The visible Firefox client was PID 7,
+incarnation 14; the separately tracked launch was PID 64, incarnation 78. Thus
+the latter's package/profile inspection and Pulse/runtime-directory stderr
+cannot be attributed to the visible browser. The catalog does resolve Firefox
+and Chromium to Brook wrappers, but individual execution/configuration remains
+unverified. The tracked Chromium command also completed while another Chromium
+window remained; wrapper completion alone does not prove browser exit. Visible
+windows had gone when the VM was handed back. The remaining tracked Firefox
+group received SIGTERM and reached zero tasks. Serial audit, checked sync,
+launcher exit zero and all three offline filesystem checks pass; this is not
+clean browser-exit acceptance.
+
+UI regressions from that run remain open: both browsers lack minimize/maximize
+controls; double-click maximize leaves top/left space and clips right/bottom;
+the resulting window cannot be moved; the developer console did not open.
+Wayland's `set_window_geometry` handler currently ignores its arguments, and
+resize configure events do not advertise maximized state. These are concrete
+implementation gaps, not yet verified explanations of every reported symptom.
+
+The allocator experiment (`heap-sub-bins-{baseline2,candidate}-20261018`)
+subdivides each logarithmic free-list class into sixteen bins. It tries the
+requested head, then a guaranteed fitting larger class, retaining a fallback
+scan of the partially covered class when no larger fit exists. Splitting,
+coalescing and poison remain enabled as before; this does not promise bounded
+search in every fragmentation pattern. The production-allocator hosted fixture
+reduces a constructed fragmented search from 513 headers to one, and checks
+partial-bin fallback, expansion rollback and concurrent payload preservation.
+All 36 hosted tests, the supported compiled-entry audit and the baremetal heap
+test pass. The same fixture also passes inside Brook with its missing host-toolchain runtime
+libraries supplied in a private test directory; this does not establish fresh
+bootstrap package-closure coverage.
+
+With the same isolated seed, eight CPUs, 4 GiB, CPU composition and one Firefox
+instance, cold-start header visits fall from 930,451 over 566,721 allocations to
+559,418 over 544,007; maximum search falls from 539 to three. Warm-start maxima
+fall from 305 to two. Cold heap size is 36,780 versus 35,756 KiB; warm heap size
+is 36,780 KiB for both. These are different allocation sequences, not a
+deterministic replay. Cold first-window times are 25.54 versus 33.32 seconds,
+and warm times 20.60 versus 23.64 seconds. The user reports concurrent host
+background activity, and there is only one matched run per kernel: startup
+speedup or regression is inconclusive. Audio captures contain fewer PCM frames
+than a continuous ten-second stream requires; absence of silent PCM bins alone
+does not establish continuous playback. Host-arrival ordering of asynchronous
+page telemetry is also insufficient to derive video framerate.
+
+Both runs have checked shutdown and all three offline filesystem checks pass.
+However, the candidate serial audit rejects an `exit_group` timeout for PID 14
+while off CPU. Its browser jobs later finish with code zero and zero remaining
+group tasks, which does not waive the earlier cancellation warning. That run
+remains rejected; later clean repeats are recorded separately. Detailed comparison and
+artifacts are in `build/workloads/heap-sub-bins-comparison-20261018.json`.
+
+A fresh diagnostic repeat (`heap-sub-bins-diagnostic-20261018`) passes the
+guest-native allocator fixture and both normal Firefox launch/exit cycles;
+each browser job exits zero with no remaining group tasks, and post-exit audio
+is inactive. Checked shutdown, launcher exit zero, serial audit and all three
+offline filesystem checks pass. The earlier timeout does not reproduce. The
+same warning is also present in the older `firefox-audio-review-20261018` serial
+log, predating this allocator experiment; this does not establish its cause or
+resolve it. The diagnostic kernel records cancellation/lock state if it recurs.
+The playback capture contains 275,066 frames over 10.06 host seconds at 44.1 kHz,
+with a longest near-silent run of 60 ms. This still falls short of continuous
+audio acceptance. Timing is diagnostic rather than a controlled comparison.
+
+The native `audio-live-review-20261018` run uses that finer heap index plus
+cached audio snapshots (see [audio timeline evidence](audio-clock.md)). The user
+reports noticeably faster page rendering, unchanged slow Firefox video and no
+Firefox YouTube audio. Two bounded playback observations contain no active
+mixer streams and zero PCM frames. Serial exec records tie the visible user
+Firefox (PID 7, incarnation 14, launch token 1) to the candidate Firefox package;
+its persistent profile has no cubeb backend/sandbox user preference. The
+agent's separate launch is tracked independently and must not be mistaken for
+the visible browser or included in its thread count.
+
+An incarnation-aware, non-truncated rolling census counts 348 tasks across 13
+groups carrying the user's Firefox launch token, including 101 in its main
+group: 346 blocked, one running and one ready at observation. Chromium has
+81 tasks under a separate launch token. These are task states sampled during
+enumeration, not an atomic occupancy measurement. RR is loaded at boot; MLFQ
+is registered but no policy switch is recorded. The 250 ms Firefox captures
+have 199 CPU samples each (191/187 idle) and 4,122/4,353 context switches, with
+zero producer drops. Of 2,754/2,860 non-idle outgoing switches, 1,404/1,356
+originate in `UserMappingPageAccess` mutex waits, chiefly clock/futex and IPC
+buffer validation. Counts are not blocked wall-time fractions; IRQ-masked work
+is not sampled uniformly. Existing switch records do not separate blocked time
+from time runnable in the ready queue.
+
+The user reports Chromium stalled until closing Firefox. Subsequent Chromium
+captures produce 441,235 and 444,998 PCM frames with supplied mixer queues.
+The user hears long stretches of normal Chromium audio with occasional stalls,
+and clarifies that no speedups have been heard so far in this run. Audio is
+therefore audible but remains unaccepted for continuity; counts alone do not
+establish smooth playback.
+The AS mutation mutex is per address space, so its contention does not alone
+explain the cross-browser effect. Shared scheduler, allocator, I/O and memory
+pressure remain relevant. During the Firefox counter interval there are
+11,333 allocations and exactly 11,333 examined free headers, with no expansion;
+this supports the narrower allocation-search improvement rather than a general
+browser speedup claim. Comparison artifacts are retained in
+`build/workloads/audio-live-review-20261018/live-phase-comparison.json`.
+
+A candidate now adds an intrusive AVL index for mapping-cache misses,
+retaining the ordered range list, AS mutex, positive cache invalidation,
+permission checks and deferred backing retirement. Its prepared hosted fixture
+checks balancing, list/index identity, a linear lookup oracle, randomized
+replace/protect/removal, failed preparation and backing lifetimes. This candidate
+passes all 37 hosted suites, the supported compiled-entry audit, and QEMU
+`test_vmm`/`test_heap`. The expanded fixture also checks two-child file-backed
+deletion with exact surviving registration addresses, failed edits with a warm
+cache, extension up to a neighbour boundary and reuse after destruction.
+Mutation preflight and gap scans remain linear; a shorter lookup does not remove
+serialization or establish scheduler latency improvements. Both full bootstrap
+paths still need rerunning with the 37-suite expectation.
+
+The live review was subsequently handed back and stopped with checked sync and
+launcher exit zero. Its serial audit passes, but the data disk fails offline
+fsck with two allocated, zero-link inodes. The shutdown helper incorrectly
+matched `chromium` while the real app ID is `chromium-browser`: its final window
+and task snapshots show Chromium still running at stop. This failed run cannot
+establish browser-exit or filesystem acceptance; open temporary files are a
+plausible explanation, not proof of a new filesystem regression. The failed
+image is preserved unchanged. Boot and Nix fsck pass.
+
+`scripts/workloads/close_review_browsers.py` now recognizes those app IDs and
+requires both windows and browser tasks, including launch-token descendants,
+to disappear. It retains pending task evidence on timeout and leaves the VM
+running. This is a browser-exit barrier, not a complete OS shutdown transaction.
+Its three hosted contract tests cover the Chromium ID, background/zombie task
+drainage, hidden Firefox and truncated-census rejection.
+
+The new `mapping-avl-candidate-20261018` production run starts from the previous
+clean seed, not the failed review image. The mapping fixture passes inside
+Brook using privately staged test runtime libraries; this is not fresh-bootstrap
+closure acceptance. Firefox and Chromium launch through the semantic app
+catalog, one instance at a time. Firefox plays the controlled local H.264/AAC
+clip through its normal launcher with no audio backend environment override:
+441,444 frames, with no near-silent 10 ms bins. This bounded capture does not
+establish YouTube audio or pause/resume. An input-tag typo caused the harness to
+miss readiness; it resumed the same already-loaded page using the actual tag,
+without relaunching the browser. First-window times of 21.05/11.05 seconds for
+Firefox/Chromium are diagnostic, not controlled comparative startup timings.
+Chromium is checked for launch and exit here, not video/audio playback.
+Both browser-exit barriers reach zero tasks; both post-exit audio captures are
+inactive. Heap integrity, checked sync, launcher exit zero, serial audit and all
+three offline filesystem checks pass. No overall browser-speedup claim is made.
