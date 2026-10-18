@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 project(brook-kernel C CXX ASM)
 option(BROOK_MAPPING_TEST_HOOKS "Enable guest-controlled mapping fault barriers (test kernels only)" OFF)
 option(BROOK_REGISTER_TEST_HOOKS "Enable controlled kernel register probes (test kernels only)" OFF)
+option(BROOK_SCHED_START_TEST_HOOKS "Force delayed-AP first-dispatch regression cases (test kernels only)" OFF)
 
 if(NOT DEFINED BROOK_ROOT)
     set(BROOK_ROOT "${CMAKE_SOURCE_DIR}/../..")
@@ -433,6 +434,10 @@ endif()
 if(BROOK_REGISTER_TEST_HOOKS)
     target_sources(kernel PRIVATE src/register_test.cpp src/register_test.S)
     target_compile_definitions(kernel PRIVATE BROOK_REGISTER_TEST_HOOKS=1)
+endif()
+
+if(BROOK_SCHED_START_TEST_HOOKS)
+    target_compile_definitions(kernel PRIVATE BROOK_SCHED_START_TEST_HOOKS=1)
 endif()
 
 # Interrupt handler files and panic must NOT use SSE/FPU registers.

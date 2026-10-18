@@ -16,10 +16,13 @@
   and concurrent-exec probes; their passes do not resolve the boot fault.
   A second captured failure (`84647ecd164143f98c42b9f7a9f0417c`) established
   double-biased dynamic pointers in memory and once-relocated RELR targets.
-  The AP first-dispatch entry shortcut can restart a suspended process instead
-  of restoring it. Its saved-context repair is under acceptance; retain both
-  crash images and distinguish boot coverage from a deterministic delayed-AP
-  test of suspended user/kernel continuations.
+  The AP first-dispatch entry shortcut could restart a suspended process instead
+  of restoring it; its saved-context repair and controlled AP startup tests now
+  pass. The opt-in test covers suspended user/kernel continuations, a fresh
+  kernel thread and idle, including saved-frame nonce and stack identity. Keep
+  both crash images. Specific held-lock syscall and full seeded-register/FPU
+  cases remain outside that coverage; user acceptance of the repaired review
+  is still pending.
 
 - Extend the static entry-state auditor's TLB-leaf model to the Debug compiler's
   `sub rsp, 0x10` stack-allocation form. `scripts/build.sh Debug` rejected that

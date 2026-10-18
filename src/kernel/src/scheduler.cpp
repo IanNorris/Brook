@@ -339,6 +339,57 @@ static SchedLock g_pidLock;
 // Guard: timer ticks are ignored until SchedulerStart sets this.
 static volatile bool g_schedulerRunning = false;
 
+#ifdef BROOK_SCHED_START_TEST_HOOKS
+// Test builds only: hold AP1/AP2 until a suspended user/kernel task is ready,
+// reserve a never-started kernel task for AP3, and force AP4's idle entry.
+static Process* g_startTestFresh;
+static Process* g_startTestExpected[SCHED_MAX_CPUS];
+static uint32_t g_startTestArrivals[SCHED_MAX_CPUS];
+struct StartTestCookie { const volatile uint64_t* address; uint64_t value; };
+static StartTestCookie g_startTestCookies[SCHED_MAX_PIDS];
+static StartTestCookie g_startTestExpectedCookie[SCHED_MAX_CPUS];
+static uint64_t g_startTestCookieSequence;
+static void StartTestArrival(uint32_t cpu, Process* task, const char* kind,
+                             const volatile uint64_t* cookie = nullptr)
+{
+    if (cpu < 1 || cpu > 4 || g_startTestExpected[cpu] != task) return;
+    const auto expectedCookie = g_startTestExpectedCookie[cpu];
+    if (expectedCookie.address &&
+        (cookie != expectedCookie.address || !cookie || *cookie != expectedCookie.value))
+        KernelPanic("SCHED_START_TEST: wrong saved continuation on CPU%u", cpu);
+    uint64_t rsp;
+    __asm__ volatile("mov %%rsp,%0" : "=r"(rsp));
+    if (ProcessCurrent() != task || rsp < task->kernelStackBase || rsp >= task->kernelStackTop ||
+        __atomic_add_fetch(&g_startTestArrivals[cpu], 1, __ATOMIC_RELAXED) != 1)
+        KernelPanic("SCHED_START_TEST: invalid %s arrival on CPU%u", kind, cpu);
+    SerialPrintf("SCHED_START_TEST PASS cpu=%u kind=%s pid=%u rsp=0x%lx\n",
+                 cpu, kind, task->pid, rsp);
+    g_startTestExpected[cpu] = nullptr;
+}
+static void StartTestFresh(void*)
+{
+    StartTestArrival(ThisCpu(), ProcessCurrent(), "fresh-kernel");
+    const uint64_t flags = SchedLockAcquire(g_readyLock);
+    g_startTestFresh = nullptr; // do not reserve a subsequently reused heap slot
+    SchedLockRelease(g_readyLock, flags);
+}
+static bool StartTestEligible(Process* task, uint32_t cpu)
+{
+    // Kernel threads intentionally bypass production affinity checks. Reserve
+    // this fixture explicitly, including picks on already-started CPUs.
+    if (task == g_startTestFresh && cpu != 3) return false;
+    if (g_perCpu[cpu].currentProcess) return true;
+    if (cpu == 1 || cpu == 2) {
+        const bool suspended = task->savedCtx.rsp < task->kernelStackTop - 24;
+        return suspended && g_startTestCookies[task->pid].address &&
+               task->isKernelThread == (cpu == 2);
+    }
+    if (cpu == 3) return task == g_startTestFresh;
+    if (cpu == 4) return false;
+    return true;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // BRO-176 DIAGNOSTIC: asLiveThreads inc/dec ring.
 // Records every asLiveThreads increment (SchedulerAddProcess) and decrement
@@ -622,7 +673,11 @@ static Process* PickNextLocked(uint32_t cpu)
             g_schedOps->Enqueue(g_schedState, proc->pid);
             continue;
         }
-        if (ProcessCanRunOnCpu(proc, cpu))
+        if (ProcessCanRunOnCpu(proc, cpu)
+#ifdef BROOK_SCHED_START_TEST_HOOKS
+            && StartTestEligible(proc, cpu)
+#endif
+        )
         {
             for (uint32_t j = 0; j < skippedCount; ++j)
                 ReadyQueueInsertLocked(skipped[j]);
@@ -789,6 +844,9 @@ static void IdleLoop()
         // reapable=0) and livelocked the parent's wait/fork loop under heavy
         // thread churn.  Draining at the top of every idle iteration closes it.
         DrainPostSwitch(ThisCpu());
+#ifdef BROOK_SCHED_START_TEST_HOOKS
+        StartTestArrival(ThisCpu(), ProcessCurrent(), "idle");
+#endif
         __asm__ volatile("sti\n\thlt" ::: "memory");
     }
 }
@@ -1858,6 +1916,13 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     ProfilerContextSwitch(oldProc->pid, newProc->pid,
                           oldProc->kernelStackBase, oldProc->kernelStackTop);
 
+#ifdef BROOK_SCHED_START_TEST_HOOKS
+    // A new invocation after a restart must not count as resuming this frame.
+    // The first AP dispatch snapshots this exact stack address and nonce.
+    volatile uint64_t startTestCookie = __atomic_add_fetch(&g_startTestCookieSequence, 1, __ATOMIC_RELAXED);
+    if (oldProc->pid < SCHED_MAX_PIDS)
+        g_startTestCookies[oldProc->pid] = {&startTestCookie, startTestCookie};
+#endif
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave,
                    &oldProc->runningOnCpu);
@@ -1865,6 +1930,11 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     // --- We return here when another CPU (or this one) switches back to us ---
 
     DrainPostSwitch(ThisCpu());
+#ifdef BROOK_SCHED_START_TEST_HOOKS
+    const uint32_t arrivalCpu = ThisCpu();
+    StartTestArrival(arrivalCpu, ProcessCurrent(), arrivalCpu == 1 ? "resumed-user" : "resumed-kernel",
+                     &startTestCookie);
+#endif
 }
 
 void SchedulerTimerTick(bool allowPreempt)
@@ -2416,6 +2486,14 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 
 [[noreturn]] void SchedulerStart()
 {
+#ifdef BROOK_SCHED_START_TEST_HOOKS
+    if (SmpGetCpuCount() < 5) KernelPanic("SCHED_START_TEST requires at least five CPUs");
+    g_startTestFresh = KernelThreadCreate("start-test-fresh", StartTestFresh, nullptr);
+    if (!g_startTestFresh) KernelPanic("SCHED_START_TEST fixture allocation failed");
+    g_startTestFresh->cpuAffinity = 3;
+    SchedulerAddProcess(g_startTestFresh);
+#endif
+
     SerialPrintf("SCHED: starting scheduler, %u processes ready\n",
                  SchedulerReadyCount());
 
@@ -2460,11 +2538,30 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         __asm__ volatile("hlt" ::: "memory");
 
     // Try to pick a process from the global queue.
+#ifdef BROOK_SCHED_START_TEST_HOOKS
+    Process* first = nullptr;
+    const uint64_t testDeadline = g_lapicTickCount + 10000;
+    for (;;) {
+        SchedLockAcquire(g_readyLock);
+        first = PickNextLocked(cpu);
+        if (first || cpu < 1 || cpu > 3) break;
+        SchedLockReleaseRaw(g_readyLock);
+        if (g_lapicTickCount >= testDeadline)
+            KernelPanic("SCHED_START_TEST timed out waiting for CPU%u case", cpu);
+        __asm__ volatile("sti; hlt" ::: "memory");
+    }
+#else
     uint64_t rlf12 = SchedLockAcquire(g_readyLock);
     Process* first = PickNextLocked(cpu);
     (void)rlf12;
-
+#endif
     if (!first) first = g_perCpu[cpu].idleProcess;
+#ifdef BROOK_SCHED_START_TEST_HOOKS
+    if (cpu >= 1 && cpu <= 4) {
+        g_startTestExpected[cpu] = first;
+        if (cpu <= 2) g_startTestExpectedCookie[cpu] = g_startTestCookies[first->pid];
+    }
+#endif
 
     g_perCpu[cpu].currentProcess = first;
     if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }

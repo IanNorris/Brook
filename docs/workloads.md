@@ -2657,6 +2657,61 @@ thread, fresh task and idle case remains outstanding; ordinary boot acceptance
 does not establish that timing coverage. This is also separate from the known
 Quake/STK GPU resource-lifetime investigation.
 
+### Controlled first-dispatch regression
+
+The later opt-in `BROOK_SCHED_START_TEST_HOOKS` kernel closes the ordinary-boot
+coverage gap for suspended user/kernel tasks, a fresh kernel thread and idle.
+It holds AP1/AP2 at first selection until a previously suspended user/kernel
+task is eligible, explicitly reserves a fresh thread for AP3, and selects idle
+on AP4. Kernel-thread affinity is normally ignored, so the fixture reservation
+is enforced separately in the test-only picker and cleared before fixture exit.
+The initial test boot happened to pass but review found that reservation race;
+its evidence is retained as preliminary, and the corrected run is authoritative.
+
+Before each normal context switch, test code records a unique nonce and its
+address on that invocation's stack. First AP dispatch snapshots that pair;
+arrival checks require the same stack frame and nonce, the expected current
+task, and RSP inside its own kernel stack. Merely restarting and yielding again
+cannot satisfy the old frame's nonce. Fresh and idle arrivals check their task
+and stack identity. The hooks default OFF and require at least five CPUs.
+
+Session `e7d8f03a873346aab24b9922463c9974` with eight CPUs reached all four
+expected arrivals and Wayland using test kernel SHA-256
+`d2e041dee6395ba4519bdc5f45123f81b0f67a604fffce0d2baf429ba164d129`.
+AP1 resumed user PID12 and AP2 kernel PID3 at the compiled context-switch resume
+return; AP3 started fresh PID17; AP4 entered idle PID0. The verifier matches
+these selected addresses against the frozen ELF and requires all four exact
+CPU/kind/PID arrivals. Removing each case from the log is rejected, in addition
+to the three compiled call-edge rejection controls. Four wrong-continuation
+log controls are also rejected. Checked shutdown, owned
+launcher exit zero, all three offline filesystem checks and nine unchanged
+UID1000/GID100 fixtures are recorded in
+`build/workloads/first-dispatch-20261018/delayed-ap-checked/acceptance-audit.json`.
+
+Build separately from the normal review artifacts:
+
+```sh
+nix-shell --run 'cmake -S . -B build/start-test -G Ninja -DCMAKE_BUILD_TYPE=Release -DBROOK_SCHED_START_TEST_HOOKS=ON'
+nix-shell --run 'cmake --build build/start-test && cmake --build build/start-test'
+```
+
+Boot those artifacts with at least five CPUs and fresh private copies of a
+checked image, using the existing experiment launcher. Require all four cases
+within the test's external boot deadline; the internal ten-second timeout only
+bounds case selection. After preserving the complete serial log, verify it
+against that exact frozen kernel:
+
+```sh
+nix-shell --run 'python3 scripts/audit_scheduler_start.py /path/to/frozen/kernel.elf --boot-log /path/to/serial.log --mutations --output /path/to/audit.json'
+```
+
+This verifies saved continuations and stack identity for these startup cases.
+It does not require a specific suspended syscall or held filesystem lock, does
+not compare seeded full register/FPU state, and has no runtime corrupt-cookie
+negative-control run. It does not close arbitrary entry-handler coverage or
+other causes of boot failure. Normal release artifacts and the prepared user
+review keep these scheduling hooks disabled.
+
 Two diagnostic helpers now preserve reproducible probes:
 
 - `scripts/workloads/loader_cmov.c` and `.S` exercise the loader's
