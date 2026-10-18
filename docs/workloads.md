@@ -2553,3 +2553,25 @@ inactive; heap integrity, checked shutdown, launcher exit zero, serial audit and
 all three offline filesystem checks pass. Synthetic WAL still reports the same
 5386 boundary. These checks do not prove the previous live browser stalls were
 caused by a >128-reader cohort, and no browser speedup is claimed.
+
+
+### Capacity reporting and renewed bootstrap acceptance (18 October)
+
+Real ext2/FAT `statfs`/`fstatfs` reporting replaces the zero-filled success stub.
+On the preserved synthetic browser-test disks, Firefox's formerly failing
+local-storage write succeeds without preference changes, then survives a cold
+VM restart without being rewritten. Chromium's prior marker and the home
+fixture's content, UID 1000 and mode 0600 also survive. Normal UI browser launches,
+complete client-task drainage, inactive post-exit audio, heap integrity, checked
+shutdown, launcher exit zero, serial audit and all offline filesystem checks
+pass. See [capacity reporting](filesystem-space.md) for the accounting/ABI probe,
+negative cases and explicit resolver/filesystem limits. This does not close the
+SQLite shared-file mapping boundary or prove real-site cookie persistence.
+
+Both full bootstrap paths now pass at `049d22e`, including three executions
+of the current 38-suite set per path and verified boots of the guest-built
+kernels. See [matching acceptance](bootstrap.md#matching-38-suite-acceptance-2026-10-18)
+for fixture identity, timings and the 732-second clean SDK installation cost.
+Earlier entries' pending bootstrap notes remain historical; this is the matching
+acceptance for the current kernel changes. Browser/editor co-use and broader
+application regression acceptance remain open.

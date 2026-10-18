@@ -73,7 +73,7 @@ rather than the host store's 0444/0555, so mode-dependent mmap cache behavior
 matches. Base transport paths keep the same host-prepared modes in both images.
 The harness runs the real guest installer, performs an HTTPS clone and pinned
 submodule update, and builds kernel/EFI/modules/bare-metal/native artifacts.
-It validates module imports and requires 19/19 CTest results twice, before and
+It validates module imports and requires 38/38 CTest results twice, before and
 after a clean native rebuild with warm caches. The incremental kernel stage
 is labelled separately from a full compilation.
 
@@ -115,7 +115,7 @@ interpreted using the nearest kernel symbol.
 After guest sync and shutdown, the harness requires offline fsck on both
 disks, extracts artifacts with debugfs, hashes them, boots their kernel/EFI
 and modules in a second isolated VM, verifies the booted kernel hash and
-command replies, and reruns Git fsck and all 13 native tests under that kernel,
+command replies, and reruns Git fsck and all 38 native tests under that kernel,
 then repeats synced offline fsck. Only this complete sequence
 writes `result.json` with `success: true`. Failure retains logs/disks and may
 leave the VM running for diagnosis; use its bridge session to sync and stop it.
@@ -1022,4 +1022,75 @@ output loss and the distinction between leader exit and drained descendants.
 
 These SDK installation/build tests deliberately run as root on isolated disks;
 they do not establish unprivileged compilation or package-install permissions.
-Full acceptance with the current 38-suite source is pending below this change.
+The matching 38-suite acceptance below uses this command protocol.
+
+
+### Matching 38-suite acceptance (2026-10-18)
+
+Both full paths passed at `049d22e6c95db146ed68088843f37f55c5dba0ac`,
+including the filesystem capacity fix, Firefox audio integration, signal/entry
+changes and current locking changes. Each eight-vCPU, 4-GiB run cloned that
+remote revision and both required submodules, built the EFI loader, kernel,
+12 modules and seven bare-metal test ELFs, and passed all 38 native suites.
+Each then cleaned/rebuilt the native tests and passed all 38 again. Independent
+verification disks booted each guest-built kernel (checked against its extracted
+hash), passed Git fsck and ran all 38 suites a third time. The seven bare-metal
+ELFs were built and hashed; this does not claim their execution.
+
+| Stage, guest seconds | Prepared SDK | Clean image |
+| --- | ---: | ---: |
+| SDK installation via nix-install | Already installed | 732 |
+| Clone | 14 | 14 |
+| Checkout | 5 | 8 |
+| Submodules | 20 | 19 |
+| Full compilation | 51 | 51 |
+| Native compilation | 29 | 30 |
+| Native tests | 8 | 24 |
+| Warm native compilation | 29 | 27 |
+| Warm native tests | 9 | 9 |
+| Incremental build | 2 | 3 |
+
+The clean run's first native-test outlier is `test_fd_table`: 15.51 seconds,
+versus 0.67 seconds in the prepared run's first pass. Its 500-round concurrent
+close stress and pin/use/close tests still pass; this variance needs a targeted
+scheduling/latency investigation before drawing a performance conclusion.
+Host-observed verification, including command/output observation, took 15.00
+and 18.92 seconds. These are instrumented correctness runs, not a controlled
+before/after benchmark. Several CPU/context-switch captures report producer
+drops, and IRQ-masked work is not sampled uniformly.
+
+Both use the pinned `wryc8rh1a9rb7gr528fdhzp9n38rjwda-brook-bootstrap` SDK.
+The starting fixtures are `bootstrap-prepared-parity-20261014` (guest-NAR SDK
+modes) and `bootstrap-clean-20261014`, rather than newly generated desktop
+images. The clean guest checks that its store contains only the base closure
+and no compiler/SDK shell, then installs 91 additions from a host-local binary
+cache through its seeded installer. This verifies the current kernel and
+source against those fixtures; it does not validate the latest Gallery UI or
+replace fresh-image acceptance for current package-tool changes. Both commands
+run as root; unprivileged bootstrap remains outside this result.
+
+Installation remains expensive with host-RAM-backed images. The 502,507,680-byte
+LLVM library NAR took 152,584 ms to extract, and the 817,440,144-byte Clang library
+NAR took 166,013 ms. Curl, decompressor and unpacker run concurrently; their
+similar pipeline durations are not additive and do not identify the limiting
+stage. The two install samples mostly contain idle CPUs. Next isolate raw
+transfer, local decompression, pipes and local filesystem writes using the same
+payload before choosing a kernel or installer optimization. The older 260-second
+install result above is not renewed performance acceptance for this revision.
+
+All four command jobs exited zero with zero live lineage tasks and both output
+streams at EOF. All four VMs acknowledged checked sync, exited zero and passed
+the serial audit; FAT and both ext2 disks passed every offline check. Their
+owned tmpfs payloads were saved as sparse regular files and removed from RAM.
+Evidence and exact artifact hashes:
+
+- `build/experiments/results/bootstrap-prepared-049d22e-ram/`
+- `build/experiments/results/bootstrap-clean-049d22e-ram/`
+- `build/workloads/bootstrap-049d22e-acceptance-audit-20261018.json`
+
+Each run retains `command-evidence.json` for the build and verification,
+`result.json`, profile paths, per-stage block counters and host-environment
+metadata. The clean run also retains a separate mid-install profile. This
+acceptance closes the matching full-bootstrap rerun gap for the pinned revision;
+application co-use, real-site persistence and broader desktop regressions remain
+separate work.
