@@ -45,6 +45,8 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_object_cache)
+set_tests_properties(test_object_cache PROPERTIES TIMEOUT 15)
 add_host_test(test_module_sections)
 target_compile_options(test_module_sections PRIVATE
     -Wno-unused-parameter -DBROOK_HOST_TEST -ffunction-sections -fdata-sections

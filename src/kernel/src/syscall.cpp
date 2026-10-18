@@ -36,6 +36,7 @@
 #include "input.h"
 #include "pipe.h"
 #include "memory/heap.h"
+#include "memory/object_cache.h"
 #include "compositor.h"
 #include "window.h"
 #include "gpu_app.h"
@@ -8762,16 +8763,21 @@ struct EpollWalk {
         __builtin_memset(nodes, 0, sizeof(nodes)); count = 0;
     }
 };
+// Reuse free scratch objects on hot epoll paths. Sleepers retain their own
+// objects but do not occupy cache slots; any completed fallback can refill it.
+// At most 32 free objects remain cached; concurrent waits retain heap fallback.
+static ObjectCache<EpollWalk, 32> g_epollWalkCache{};
 struct EpollWalkOwner {
     KernelOperationGuard operation; // unwind pins/storage before fatal cancellation
     EpollWalk* walk;
-    explicit EpollWalkOwner(Process* proc) : operation(proc), walk(static_cast<EpollWalk*>(kmalloc(sizeof(EpollWalk)))) {
+    explicit EpollWalkOwner(Process* proc) : operation(proc), walk(g_epollWalkCache.TryAcquire()) {
+        if (!walk) walk = static_cast<EpollWalk*>(kmalloc(sizeof(EpollWalk)));
         if (walk) { __builtin_memset(walk, 0, sizeof(*walk)); walk->proc = proc; }
     }
     ~EpollWalkOwner() {
         if (!walk) return;
         for (int fd = 0; fd < EPOLL_MAX_FDS; fd++) if (walk->pins[fd]) FdPut(walk->proc, fd);
-        kfree(walk);
+        if (!g_epollWalkCache.Release(walk)) kfree(walk);
     }
 };
 static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
@@ -9022,8 +9028,10 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
 
     if (maxevents <= 0 || maxevents > 1024) return -EINVAL;
 
-    // Allocate kernel-side event buffer
-    auto* kEvents = static_cast<EpollEvent*>(
+    // Small event batches do not need to visit the global heap. Keep the stack
+    // budget fixed (192 bytes), with the existing heap path for larger batches.
+    EpollEvent localEvents[16];
+    auto* kEvents = maxevents <= 16 ? localEvents : static_cast<EpollEvent*>(
         kmalloc(sizeof(EpollEvent) * static_cast<uint32_t>(maxevents)));
     if (!kEvents) return -ENOMEM;
 
@@ -9032,12 +9040,15 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
                              static_cast<int>(static_cast<int64_t>(timeout_ms)));
 
     if (n > 0) {
-        if (eventsAddr < 0x1000) { kfree(kEvents); return -EFAULT; }
+        if (eventsAddr < 0x1000) {
+            if (kEvents != localEvents) kfree(kEvents);
+            return -EFAULT;
+        }
         __builtin_memcpy(reinterpret_cast<void*>(eventsAddr), kEvents,
                         sizeof(EpollEvent) * static_cast<uint32_t>(n));
     }
 
-    kfree(kEvents);
+    if (kEvents != localEvents) kfree(kEvents);
     return n;
 }
 
