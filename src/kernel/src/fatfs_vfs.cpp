@@ -549,10 +549,43 @@ static int FatFileTruncate(Vnode* vn, uint64_t size)
     return result;
 }
 
+static int FatSpaceFor(FATFS* expected, VfsSpace* out)
+{
+    if (!expected) return -FVFS_EIO;
+    char drive[] = {static_cast<char>('0' + expected->pdrv), ':', 0};
+    FATFS* fs = nullptr;
+    DWORD freeClusters = 0;
+    FRESULT result = f_getfree(drive, &freeClusters, &fs);
+    if (result != FR_OK) return FrToErrno(result);
+    if (fs != expected || fs->n_fatent < 2 || freeClusters > fs->n_fatent - 2)
+        return -FVFS_EIO;
+    const uint64_t clusterBytes = uint64_t{fs->csize} * 512;
+    *out = {0x4d44, clusterBytes, fs->n_fatent - 2, freeClusters, freeClusters,
+            0, 0, FatDeviceIdentity(fs), 255, clusterBytes, 0};
+    return 0;
+}
+static int FatSpace(Vnode* vn, VfsSpace* out)
+{
+    KMutexLock(&g_fatLock);
+    FATFS* fs = vn->type == VnodeType::Dir ? static_cast<DIR*>(vn->priv)->obj.fs
+        : static_cast<FIL*>(vn->priv)->obj.fs;
+    int result = FatSpaceFor(fs, out);
+    KMutexUnlock(&g_fatLock);
+    return result;
+}
+static int FatCachedSpace(Vnode* vn, VfsSpace* out)
+{
+    KMutexLock(&g_fatLock);
+    int result = FatSpaceFor(static_cast<CachedFile*>(vn->priv)->fil->obj.fs, out);
+    KMutexUnlock(&g_fatLock);
+    return result;
+}
+
 static const VnodeOps g_cachedFileOps = {
     .open = FatFileOpen, .read = CachedFileRead, .write = nullptr,
     .readdir = nullptr, .close = CachedFileClose, .stat = CachedFileStat,
     .fsync = FatCachedFsync,
+    .space = FatCachedSpace,
 };
 
 static const VnodeOps g_fatFileOps = {
@@ -561,12 +594,14 @@ static const VnodeOps g_fatFileOps = {
     .fsync = FatFileFsync,
     .truncate = FatFileTruncate,
     .append = FatFileAppend,
+    .space = FatSpace,
 };
 
 static const VnodeOps g_fatDirOps = {
     .open = FatFileOpen, .read = nullptr, .write = nullptr,
     .readdir = FatDirReaddir, .close = FatFileClose, .stat = FatStat,
     .fsync = FatDirFsync,
+    .space = FatSpace,
 };
 
 // ---- VfsFsOps callbacks ----
@@ -672,7 +707,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
     if (flags & VFS_O_TRUNC)  mode |= FA_CREATE_ALWAYS;
 
     // Check shared cache first (read-only opens).
-    if (!(mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS))) {
+    if (!(flags & VFS_O_METADATA) && !(mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS))) {
         KMutexLock(&g_fatLock);
         CachedFile* existing = FileCacheLookup(fatPath);
         if (existing) {
@@ -728,7 +763,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
 
         static constexpr uint64_t CACHE_THRESHOLD = 64 * 1024;
         uint64_t fileSize = f_size(fil);
-        if (!file->writable && fileSize >= CACHE_THRESHOLD) {
+        if (!(flags & VFS_O_METADATA) && !file->writable && fileSize >= CACHE_THRESHOLD) {
             file->cacheLoading = true;
             auto* placeholder = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
             if (placeholder) {

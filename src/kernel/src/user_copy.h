@@ -16,4 +16,6 @@ inline bool CopyToUser(uint64_t destination,const void* source,uint64_t length) 
     return CopyToUserBytes(destination,source,length)==length;
 }
 bool CopyUserCString(uint64_t address,char* destination,uint32_t capacity);
+// Same page-bounded copy, with distinct EFAULT and ENAMETOOLONG outcomes.
+int CopyUserCStringResult(uint64_t address,char* destination,uint32_t capacity);
 }

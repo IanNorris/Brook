@@ -63,19 +63,22 @@ bool UserBufferReadable(uint64_t address,uint64_t length) { Operation operation;
 bool UserBufferWritable(uint64_t address,uint64_t length) { Operation operation;return Check(operation,address,length,2); }
 uint64_t CopyFromUserBytes(void* destination,uint64_t source,uint64_t length) { return Copy(destination,source,length,false); }
 uint64_t CopyToUserBytes(uint64_t destination,const void* source,uint64_t length) { return Copy(const_cast<void*>(source),destination,length,true); }
-bool CopyUserCString(uint64_t address,char* destination,uint32_t capacity) {
-    if(!destination || !capacity)return false;
+int CopyUserCStringResult(uint64_t address,char* destination,uint32_t capacity) {
+    if(!destination || !capacity)return -22;
     uint32_t copied=0;
     while(copied<capacity) {
         uint64_t current;
-        if(__builtin_add_overflow(address,static_cast<uint64_t>(copied),&current))return false;
+        if(__builtin_add_overflow(address,static_cast<uint64_t>(copied),&current))return -14;
         uint32_t chunk=4096-static_cast<uint32_t>(current&4095);
         if(chunk>capacity-copied)chunk=capacity-copied;
         const uint64_t got=CopyFromUserBytes(destination+copied,current,chunk);
-        for(uint32_t i=0;i<got;++i)if(!destination[copied+i])return true;
-        if(got!=chunk)return false;
+        for(uint32_t i=0;i<got;++i)if(!destination[copied+i])return 0;
+        if(got!=chunk)return -14;
         copied+=chunk;
     }
-    destination[capacity-1]=0;return false;
+    destination[capacity-1]=0;return -36;
+}
+bool CopyUserCString(uint64_t address,char* destination,uint32_t capacity) {
+    return CopyUserCStringResult(address,destination,capacity)==0;
 }
 }

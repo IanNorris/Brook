@@ -65,11 +65,14 @@ Normal menu launches for Firefox and Chromium coexist in an eight-CPU, 4-GiB
 guest. Each played a controlled 48-kHz Opus fixture and produced approximately
 ten seconds of PCM without silent 10-ms blocks. A synthetic home file retained
 contents, UID 1000 and mode 0600 across checked VM restart; Chromium also retained
-its synthetic local-storage marker. Firefox rejected that first write with
-`QuotaExceededError`, and no marker survived. Its persistence remains unaccepted.
-The kernel's zero-filled `statfs`/`fstatfs` stub is the next capacity-reporting
-bug to address; these observations alone do not prove it causes every Firefox
-storage failure. Generic public package-index entries remain stock packages,
+its synthetic local-storage marker. Firefox initially rejected the write with
+`QuotaExceededError` on the zero-filled `statfs`/`fstatfs` stub. With real ext2/FAT
+capacity reporting and unchanged browser preferences, its write succeeds and
+the marker survives a separate cold VM restart without being rewritten. Both
+browsers use the same isolated disks and origin across these tests. Real-site
+cookies and broader profile persistence remain unaccepted; see
+[filesystem capacity acceptance](filesystem-space.md). Generic public package-index
+entries remain stock packages,
 and base-image components still lack complete Gallery ownership/registration.
 
 Evidence is under ignored `build/workloads/fresh-browsers-20261018`, including

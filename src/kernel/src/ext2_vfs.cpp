@@ -173,6 +173,7 @@ struct Ext2Mount {
     uint32_t firstDataBlock;
     uint32_t totalInodes;    // s_inodes_count
     uint32_t totalBlocks;    // s_blocks_count
+    uint32_t reservedBlocks; // s_r_blocks_count, unavailable to ordinary users
     uint64_t bgdtDiskOff;    // byte offset of BGDT on disk
     Ext2BlockGroupDesc* bgdt; // block group descriptor table (heap allocated)
 
@@ -2513,6 +2514,31 @@ static FileObject* Ext2FileObject(Vnode* vn) {
     return &static_cast<Ext2FilePriv*>(vn->priv)->hold->file;
 }
 
+static int Ext2Space(Vnode* vn, VfsSpace* out)
+{
+    auto* mnt = vn->type == VnodeType::Dir
+        ? static_cast<Ext2DirPriv*>(vn->priv)->mnt
+        : static_cast<Ext2FilePriv*>(vn->priv)->mnt;
+    KRwLockReadLock(&g_ext2Lock);
+    uint64_t blocks = 0, inodes = 0;
+    // Dirty cached group descriptors include allocations not yet synced to
+    // the on-disk superblock. Snapshot under the same metadata lock.
+    for (uint32_t g = 0; g < mnt->groupCount; ++g) {
+        blocks += mnt->bgdt[g].bg_free_blocks_count;
+        inodes += mnt->bgdt[g].bg_free_inodes_count;
+    }
+    if (blocks > mnt->totalBlocks || inodes > mnt->totalInodes) {
+        KRwLockReadUnlock(&g_ext2Lock);
+        return -5;
+    }
+    *out = {0xef53, mnt->blockSize, mnt->totalBlocks, blocks,
+            blocks > mnt->reservedBlocks ? blocks - mnt->reservedBlocks : 0,
+            mnt->totalInodes, inodes, (254ULL << 32) | mnt->cacheNamespace,
+            255, mnt->blockSize, 0};
+    KRwLockReadUnlock(&g_ext2Lock);
+    return 0;
+}
+
 static const VnodeOps g_ext2FileOps = {
     .open    = Ext2FileOpen,
     .read    = Ext2FileRead,
@@ -2526,6 +2552,7 @@ static const VnodeOps g_ext2FileOps = {
     .truncate = Ext2FileTruncate,
     .file_object = Ext2FileObject,
     .chown   = Ext2VnodeChown,
+    .space   = Ext2Space,
 };
 
 static const VnodeOps g_ext2DirOps = {
@@ -2539,6 +2566,7 @@ static const VnodeOps g_ext2DirOps = {
     .set_times = Ext2VnodeSetTimes,
     .chmod   = Ext2VnodeChmod,
     .chown   = Ext2VnodeChown,
+    .space   = Ext2Space,
 };
 
 // ---------------------------------------------------------------------------
@@ -2651,6 +2679,7 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     mnt->firstDataBlock = sb.s_first_data_block;
     mnt->totalInodes    = sb.s_inodes_count;
     mnt->totalBlocks    = sb.s_blocks_count;
+    mnt->reservedBlocks = sb.s_r_blocks_count;
     mnt->bgdtDiskOff    = bgdtOff;
     mnt->bgdt           = bgdt;
 
@@ -2896,7 +2925,7 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
 
     // Permission check (skipped for root or mounts with skipPermChecks set).
     // Only applies to existing files — newly created files skip this.
-    if (!created) {
+    if (!created && !(flags & VFS_O_METADATA)) {
         Process* cur = ProcessCurrent();
         if (!mnt->skipPermChecks) {
             uint8_t perm = ProcessFilePermissions(cur, inodeData.i_uid, inodeData.i_gid,

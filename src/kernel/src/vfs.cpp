@@ -570,6 +570,11 @@ Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode)
 Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error)
 {
     if (error) *error = 0;
+    if ((flags & VFS_O_METADATA) &&
+        (flags & (VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC | VFS_O_READWRITE | VFS_O_APPEND))) {
+        if (error) *error = -22;
+        return nullptr;
+    }
     FileMutationGuard mutation((flags & (VFS_O_TRUNC | VFS_O_CREATE)) != 0);
     if (!path || !path[0]) return nullptr;
 
@@ -772,6 +777,14 @@ int VfsStat(Vnode* vn, VnodeStat* st)
     if (ret == 0 && !st->ino)
         st->ino = vn->cacheId;
     return ret;
+}
+
+int VfsSpaceInfo(Vnode* vn, VfsSpace* out)
+{
+    if (!vn || !out) return -22;
+    *out = {};
+    if (!vn->ops || !vn->ops->space) return -38; // ENOSYS, never fabricated capacity.
+    return vn->ops->space(vn, out);
 }
 
 int VfsStatPath(const char* path, VnodeStat* st)

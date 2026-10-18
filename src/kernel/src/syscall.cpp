@@ -10708,21 +10708,71 @@ static int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
 }
 
 // ---------------------------------------------------------------------------
-// sys_statfs (137) / sys_fstatfs (138) — stub
+// sys_statfs (137) / sys_fstatfs (138) — x86-64 Linux ABI.
 // ---------------------------------------------------------------------------
 
-static int64_t sys_statfs(uint64_t, uint64_t bufAddr, uint64_t,
-                           uint64_t, uint64_t, uint64_t)
+struct LinuxStatFs {
+    int64_t type, blockSize;
+    uint64_t blocks, freeBlocks, availableBlocks, files, freeFiles;
+    int32_t identity[2];
+    int64_t maxName, fragmentSize, flags, spare[4];
+};
+static_assert(sizeof(LinuxStatFs) == 120, "x86-64 statfs ABI");
+
+static int64_t CopySpaceResult(uint64_t address, const VfsSpace& source)
 {
-    if (!UserBufferWritable(bufAddr, 120)) return -EFAULT;
-    __builtin_memset(reinterpret_cast<void*>(bufAddr), 0, 120); // sizeof(struct statfs)
-    return 0;
+    LinuxStatFs result{};
+    result.type = source.type;
+    result.blockSize = source.blockSize;
+    result.blocks = source.blocks;
+    result.freeBlocks = source.freeBlocks;
+    result.availableBlocks = source.availableBlocks;
+    result.files = source.files;
+    result.freeFiles = source.freeFiles;
+    result.identity[0] = static_cast<int32_t>(source.identity);
+    result.identity[1] = static_cast<int32_t>(source.identity >> 32);
+    result.maxName = source.maxName;
+    result.fragmentSize = source.fragmentSize;
+    result.flags = source.flags | 0x20; // Linux ST_VALID: mount flag fields are present.
+    // No filesystem lock is held while resolving/copying user memory.
+    return CopyToUser(address, &result, sizeof(result)) ? 0 : -EFAULT;
 }
 
-static int64_t sys_fstatfs(uint64_t, uint64_t bufAddr, uint64_t,
+static int64_t sys_statfs(uint64_t pathAddr, uint64_t bufAddr, uint64_t,
+                           uint64_t, uint64_t, uint64_t)
+{
+    char path[512], resolved[512];
+    int error = CopyUserCStringResult(pathAddr, path, sizeof(path));
+    if (error) return error;
+    if ((error = ResolveAtPath(-100, path, resolved, sizeof(resolved)))) return error;
+    unsigned component = 0;
+    for (const char* p = resolved; *p; ++p) {
+        if (*p == '/') component = 0;
+        else if (++component > 255) return -36;
+    }
+    // Keep a vnode reference through the metadata query (including deleted or
+    // concurrently renamed files); do not require data-read permission or cache
+    // a large file merely to identify its filesystem.
+    Vnode* vn = VfsOpenModeChecked(resolved, VFS_O_METADATA, 0, &error);
+    if (!vn) return error ? error : -ENOENT;
+    VfsSpace space{};
+    error = VfsSpaceInfo(vn, &space);
+    VfsClose(vn);
+    return error ? error : CopySpaceResult(bufAddr, space);
+}
+
+static int64_t sys_fstatfs(uint64_t fd, uint64_t bufAddr, uint64_t,
                             uint64_t, uint64_t, uint64_t)
 {
-    return sys_statfs(0, bufAddr, 0, 0, 0, 0);
+    Process* process = ProcessCurrent();
+    if (!process || fd >= MAX_FDS) return -EBADF;
+    FdRef ref(process, static_cast<int>(fd));
+    FdEntry* entry = ref.get();
+    if (!entry) return -EBADF;
+    if (entry->type != FdType::Vnode || !entry->handle) return -ENOSYS;
+    VfsSpace space{};
+    int error = VfsSpaceInfo(static_cast<Vnode*>(entry->handle), &space);
+    return error ? error : CopySpaceResult(bufAddr, space);
 }
 
 // ---------------------------------------------------------------------------

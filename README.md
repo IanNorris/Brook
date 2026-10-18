@@ -53,7 +53,7 @@ the table distinguishes tested behavior from remaining limitations.
 | Nix binaries | — | ✅ Working | Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …) |
 | [NetSurf](https://www.netsurf-browser.org/) | 3.11 | ✅ Working | Web browser rendering HTML/CSS via custom framebuffer surface |
 | [Ladybird](https://ladybird.dev/) | 2026-04-04 | ⚠️ Experimental | HTTPS Google search and Amazon navigation verified; loading/input/scrolling performance remains limited |
-| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Included in fresh experiment images; HTTPS/JavaScript and YouTube audio through the normal launcher, including pause/resume; intermittent audio gaps and failing site-storage writes remain |
+| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Included in fresh experiment images; HTTPS/JavaScript and YouTube audio through the normal launcher, including pause/resume; synthetic site storage survives reboot; intermittent audio gaps remain |
 | [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
 | [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation, text input, save/load verified; music and two bounded exit tests pass; longer-session exit testing remains |
 | [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, save/reopen and normal exit verified alongside Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
@@ -84,10 +84,11 @@ the table distinguishes tested behavior from remaining limitations.
   negotiation. Pause stops output and resume restores it; one early capture
   contained a 290-ms silent interval, while subsequent captures had none.
   Fresh experiment images now include both browsers and pass a controlled
-  48-kHz Opus playback check. Chromium retains a synthetic site-storage marker
-  across VM restart; Firefox rejects the write with a quota error. Browser
-  performance, intermittent audio stalls and Firefox persistence remain under
-  investigation. The generic public package index still lists stock packages.
+  48-kHz Opus playback check. Both browsers retain synthetic site-storage
+  markers across VM restart after fixing filesystem capacity reporting. Browser
+  performance, intermittent audio stalls and real-site profile persistence remain
+  under investigation. See [filesystem capacity acceptance](docs/filesystem-space.md).
+  The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and
   remaining limits. All 38 hosted test suites pass; both full bootstrap paths
   still need rerunning against the current suite.

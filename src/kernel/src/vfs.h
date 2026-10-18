@@ -19,6 +19,11 @@ struct Vnode;
 struct FileObject;
 struct DirEntry;
 struct VnodeStat;
+// Mount accounting, in blockSize units. Callbacks fill a kernel buffer only.
+struct VfsSpace {
+    uint64_t type, blockSize, blocks, freeBlocks, availableBlocks;
+    uint64_t files, freeFiles, identity, maxName, fragmentSize, flags;
+};
 
 struct VnodeTime {
     int64_t sec;
@@ -58,6 +63,7 @@ struct VnodeOps {
     int (*chown)(Vnode* vn, uint32_t uid, uint32_t gid) = nullptr;
     // Kernel-staged buffer; choose current EOF atomically with the write.
     int (*append)(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset) = nullptr;
+    int (*space)(Vnode* vn, VfsSpace* out) = nullptr;
 };
 
 struct Vnode {
@@ -104,6 +110,9 @@ static constexpr int VFS_O_EXCL   = 0x10;  // With CREATE, fail if the directory
 static constexpr int VFS_O_APPEND = 0x08;  // Append intent (FD layer retains it).
 // WRITE alone is write-only; retain Linux O_RDWR's read requirement separately.
 static constexpr int VFS_O_READWRITE = 0x20;
+// Internal metadata-only lookup: retain a vnode without requiring data-read
+// permission or preloading contents. Never expose this handle as a readable FD.
+static constexpr int VFS_O_METADATA = 0x40;
 
 // ---- Filesystem driver interface ----
 //
@@ -249,6 +258,7 @@ extern "C" int VfsReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie);
 
 // Stat a vnode.
 int VfsStat(Vnode* vn, VnodeStat* st);
+int VfsSpaceInfo(Vnode* vn, VfsSpace* out);
 
 // Stat by path — uses directory metadata only, does NOT open the file.
 extern "C" int VfsStatPath(const char* path, VnodeStat* st);
