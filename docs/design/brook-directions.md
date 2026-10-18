@@ -109,6 +109,52 @@ merely to make path translation convenient. Identify which native contracts can
 be supplied by adapters and which require app changes; do not promise identical
 coverage for every ecosystem.
 
+## Services activated by use
+
+Explore reserving lightweight service endpoints without keeping each provider
+process resident. A connection or native capability request activates the provider;
+the supervisor queues bounded pending requests, reports readiness or a meaningful
+failure, and releases the provider after its last useful lease and an idle grace
+period. This could reduce boot work, idle memory and per-app launcher scripts;
+measure the corresponding first-use latency before claiming an improvement.
+
+The stub should initially be an endpoint registration, not a suspended process
+with its own stack and address space. Use a shared supervisor with declarative
+service manifests: executable, endpoint, scope, identity, dependencies, activation
+protocol, readiness deadline, restart budget and idle policy. Keep protocol
+implementations outside the kernel. Permissions must be checked before activation,
+and concurrent first connections must start exactly one intended provider.
+
+Distinguish shared infrastructure from per-app instances. Audio protocol adapters
+could be scoped to an app or workspace while mixing and hardware ownership remain
+shared. The desktop compositor remains needed while the desktop is visible;
+optional Wayland compatibility providers may have a different lifetime. ALSA is
+primarily a library/plugin and device interface, so activate any provider behind
+it rather than assuming there is an ALSA daemon to start. Select mutually
+appropriate audio routes rather than starting PulseAudio and PipeWire merely
+because a client probes both protocols.
+
+Prefer inherited listening descriptors for providers that support activation;
+otherwise investigate a provider adapter or bounded proxy. Preserve peer
+credentials, descriptor passing, shared-memory ownership and backpressure.
+An ordinary byte proxy is insufficient for every desktop protocol. Library probes
+and long-lived idle control connections must not accidentally pin every service
+forever. Conversely, no open-stream count is sufficient grounds to stop a provider
+with pending output, live surfaces, subscriptions or persistent state to flush.
+
+Prototype with one optional compatibility endpoint. Test racing connections,
+caller exit during startup, dependency cycles, provider crashes, restart loops,
+idle shutdown/reconnection and audio drain. Record boot time, idle RSS, cold/warm
+first-use latency and remaining launcher configuration. Native apps could request
+named capabilities directly; compatibility apps should retain their expected
+socket/device discovery conventions.
+
+References: [systemd socket activation](https://www.freedesktop.org/software/systemd/man/latest/systemd.socket.html)
+provides an existing endpoint-and-inherited-descriptor pattern;
+[ALSA PCM plugins](https://www.alsa-project.org/alsa-doc/alsa-lib/pcm_plugins.html)
+document the library-side distinction. These are design references, not a
+decision to import systemd or implement this before current workload acceptance.
+
 ## What makes an application native to Brook?
 
 Draft a small native app contract, then demonstrate it with a useful editor or
