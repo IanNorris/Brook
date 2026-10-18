@@ -270,6 +270,17 @@
   lifetime. Messages occurred during zstd imports in both successful clean
   bootstrap and OpenTTD installation. Establish a coherent referenced snapshot
   and distinguish detector races from an actual persistent scheduling fault.
+- Implement an EEVDF (Earliest Eligible Virtual Deadline First) scheduler policy
+  as a future alternative through the existing `SchedOps` interface. The 18
+  October browser review boot selected `rr`; the MLFQ module registered but was
+  not selected. Keep policy selection explicit and observable. Define eligibility,
+  virtual runtime/deadlines, weights, wakeup/sleeper behavior and preemption;
+  verify SMP queue ownership, migration, fairness, starvation and task exit before
+  considering a default switch. Compare RR, MLFQ and EEVDF on the same browser,
+  audio, interactive and bootstrap workloads, recording input/frametime tails,
+  audio underruns, throughput and scheduler overhead. A policy change must not
+  conceal readiness loops, allocator contention or lifecycle bugs. This backlog
+  does not change the active policy or expand the current performance fix scope.
 
 ## Mounted filesystem module unload
 
