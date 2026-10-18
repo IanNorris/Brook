@@ -116,6 +116,16 @@ class Channel(unittest.TestCase):
 
 
 class Arguments(unittest.TestCase):
+    def test_power_ports_only_for_known_q35_policy(self):
+        for suffix,power in [([], 'q35-reset'),(['-no-reboot'],'q35-stop'),(['-no-shutdown'],None),(['-readconfig','custom'],None)]:
+            args=['qemu','-serial','stdio','-machine','q35']+suffix
+            result=lifecycle.launch_args(args,SESSION,Path('/tmp')/SESSION)
+            values=[arg for arg in result if 'opt/brook/power' in arg]
+            self.assertEqual(values,[] if power is None else ['name=opt/brook/power,string='+power])
+        result=lifecycle.launch_args(['qemu','-serial','stdio','-machine','pc'],SESSION,Path('/tmp')/SESSION)
+        self.assertFalse(any('opt/brook/power' in arg for arg in result))
+
+
     def test_optout_preserves_existing_serial_devices(self):
         original=['qemu','-serial','stdio','-serial','null']
         self.assertEqual(lifecycle.launch_args(original,SESSION,Path('/tmp'),enabled=False),original)

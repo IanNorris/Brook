@@ -139,7 +139,11 @@ the table distinguishes tested behavior from remaining limitations.
   and bounded post-panic memory/register inspection. See the
   [bridge tools](tools/vm_bridge/README.md). An optional
   [network-independent flush/status channel](docs/orderly-shutdown.md) now works
-  with the VM network disconnected; orderly launcher/MCP shutdown remains in progress.
+  with the VM network disconnected. The launcher and `vm_lifecycle` now share
+  orderly shutdown/restart: save-dialog handling, cancellation before service
+  teardown, process/cleanup drain and a final write barrier. Q35 restart and
+  network-disconnected poweroff passed isolated-disk acceptance; real-hardware
+  power management remains unsupported.
 - **Real workloads:** Ladybird browsing, hardware GL3 Quake demos, Wayland
   office applications, and guest-installed VLC playback. App-specific limits
   and the actual validation evidence are recorded in

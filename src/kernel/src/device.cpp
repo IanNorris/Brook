@@ -1,8 +1,31 @@
 #include "device.h"
 #include "serial.h"
 #include "spinlock.h"
+#include "write_admission.h"
+#include "process.h"
+namespace brook { __attribute__((weak)) Process* ProcessCurrent(); }
 
 namespace brook {
+
+static SpinLock g_writeLock;
+static WriteAdmission g_writes;
+static uintptr_t WriteCaller() {return ProcessCurrent?reinterpret_cast<uintptr_t>(ProcessCurrent()):0;}
+int DeviceWrite(Device* dev,uint64_t offset,const void* data,uint64_t len) {
+    if(!dev || dev->type!=DeviceType::Block || !dev->ops || !dev->ops->write)return -19;
+    const auto caller=WriteCaller();
+    SpinLockAcquire(&g_writeLock);const bool admitted=g_writes.Enter(caller);SpinLockRelease(&g_writeLock);
+    if(!admitted)return -30;
+    const int result=dev->ops->write(dev,offset,data,len);
+    SpinLockAcquire(&g_writeLock);g_writes.Leave();SpinLockRelease(&g_writeLock);return result;
+}
+bool DeviceCloseWrites() {
+    const auto caller=WriteCaller();SpinLockAcquire(&g_writeLock);
+    const bool result=g_writes.Close(caller);SpinLockRelease(&g_writeLock);return result;
+}
+bool DeviceReopenWrites() {
+    const auto caller=WriteCaller();SpinLockAcquire(&g_writeLock);
+    const bool result=g_writes.Reopen(caller);SpinLockRelease(&g_writeLock);return result;
+}
 
 // ---- Registry storage ----
 

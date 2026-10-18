@@ -114,7 +114,7 @@ static int brook_bdev_bwrite(ext4_blockdev* bdev, const void* buf,
     uint64_t offset = blk_id * bsize;
     uint64_t len = (uint64_t)blk_cnt * bsize;
 
-    int ret = m->dev->ops->write(m->dev, offset, buf, len);
+    int ret = DeviceWrite(m->dev, offset, buf, len);
     if (ret < 0 || static_cast<uint64_t>(ret) != len) return EIO;
     // lwext4 has no device barrier callback. Preserve its former stable-write
     // completion semantics, including journal ordering, until it gains one.

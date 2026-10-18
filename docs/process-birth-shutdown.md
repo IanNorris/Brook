@@ -1,5 +1,11 @@
 # Process births, shutdown admission and PID capacity
 
+This records the reservation/PID-capacity foundation and its original tests.
+The [orderly shutdown coordinator](orderly-shutdown.md#implemented-coordinator)
+now uses the gate in live launcher/MCP shutdown, together with service teardown,
+cleanup drain and a final block-write barrier. Statements below about future
+coordination describe the foundation's original acceptance scope.
+
 The shutdown coordinator must distinguish an empty task census from a process
 still being constructed. `ProcessCreateImpl`, `ProcessFork` and
 `ProcessCreateThread` allocate a PID before `SchedulerAddProcess` publishes the

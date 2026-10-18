@@ -1,4 +1,5 @@
 #include "lifecycle_channel.h"
+#include "shutdown.h"
 #include "debug_epoch.h"
 #include "fw_cfg.h"
 #include "portio.h"
@@ -38,7 +39,7 @@ void Worker(void*) {
             if(c=='\n') {
                 if(!discard) {
                     line[length]=0;char response[160];
-                    if(channel.Handle(line,response,Epoch,Sync))Send(response);
+                    if(channel.Handle(line,response,Epoch,Sync,ShutdownCommand))Send(response);
                 }
                 length=0;discard=false;
             }else if(c<' '||c>'~'||length+1>=sizeof(line))discard=true;
@@ -51,6 +52,7 @@ void Worker(void*) {
 // Read fw_cfg only before scheduling starts: its selector/data registers are
 // shared with other fw_cfg readers, which are not a runtime transport.
 void LifecycleChannelConfigure() {
+    ShutdownConfigure();
     const auto n=FwCfgReadFile("opt/brook/lifecycle",configuredCookie,sizeof(configuredCookie));
     if(n!=32){configuredCookie[0]=0;return;}
     configuredCookie[32]=0;
@@ -61,6 +63,7 @@ void LifecycleChannelConfigure() {
     outb(Base+3,3);outb(Base+2,0xc7);outb(Base+4,3);
 }
 void LifecycleChannelStart() {
+    ShutdownStart();
     if(!configuredCookie[0])return;
     Process* worker=KernelThreadCreate("vm_lifecycle",Worker,nullptr,3);
     if(!worker){SerialPuts("lifecycle: worker allocation failed\n");return;}

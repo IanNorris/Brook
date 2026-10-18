@@ -2,8 +2,8 @@
 #include <stdint.h>
 
 namespace brook {
-// Narrow, boot-scoped maintenance protocol. This is NOT an application
-// shutdown coordinator: callers must quiesce writers before requesting sync.
+// Narrow, boot-scoped COM2 framing. Raw sync requires callers to quiesce
+// writers. Optional power verbs delegate to the shared shutdown coordinator.
 // One worker owns this object. Retained IDs are never evicted during a boot.
 class LifecycleChannel {
     struct Entry { char id[33]{}; int result=0; };
@@ -33,13 +33,14 @@ class LifecycleChannel {
 public:
     using Epoch = void (*)(const char* proposal,char output[33]);
     using Sync = int (*)();
+    using Power = void (*)(const char* id,const char* verb,char state[24],int* result);
     bool Init(const char* sessionCookie) {
         if(!Id(sessionCookie))return false;
         Copy(cookie,sessionCookie);return true;
     }
     // Caller rejects UART line errors and discards overlong lines through LF.
     // Five exact, space-delimited ASCII tokens; no shells, paths or commands.
-    bool Handle(const char* input,char output[160],Epoch epoch,Sync sync) {
+    bool Handle(const char* input,char output[160],Epoch epoch,Sync sync,Power power=nullptr) {
         output[0]=0;if(!cookie[0])return false;
         char line[160];unsigned n=0;
         while(input[n]&&n<sizeof(line)-1){line[n]=input[n];++n;}
@@ -58,6 +59,9 @@ public:
         if(!Id(boot))return false;
         if(Equal(verb,"hello")){Reply(output,id,boot,"ok",0);return true;}
         if(!Equal(boot,expected)){Reply(output,id,boot,"stale",-116);return true;}
+        if(power && (Equal(verb,"shutdown")||Equal(verb,"restart")||Equal(verb,"power_status")||Equal(verb,"cancel")||Equal(verb,"commit"))) {
+            char state[24];int result=0;power(id,verb,state,&result);Reply(output,id,boot,state,result);return true;
+        }
         if(!Equal(verb,"sync")&&!Equal(verb,"status")){
             Reply(output,id,boot,"unsupported",-95);return true;
         }

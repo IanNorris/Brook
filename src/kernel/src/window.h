@@ -449,5 +449,7 @@ void WmCancelBridgeQueuedLaunches(uint32_t* cancelled,uint32_t* startedOrShared)
 
 // Launch the item at the given index.
 void WmLauncherExec(int itemIdx);
+void WmSetLaunchInhibited(bool inhibited);
+bool WmLauncherDispatching();
 
 } // namespace brook

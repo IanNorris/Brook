@@ -5,6 +5,7 @@
 // blitting client areas to draw the window decorations.
 
 #include "window.h"
+#include "shutdown.h"
 #include "launcher_command.h"
 #include "launch_feedback.h"
 #include "shell.h"
@@ -1676,7 +1677,7 @@ uint32_t WmDesktopHeight(uint32_t screenH)
 
 void WmSpawnTerminal()
 {
-    if (!g_wmActive) return;
+    if (!g_wmActive || !ShutdownLaunchAllowed()) return;
 
     uint32_t clientW = 800;
     uint32_t clientH = 600;
@@ -2078,6 +2079,7 @@ static LauncherSnapshot* BuildLauncherSnapshot(uint32_t generation)
     return snapshot;
 }
 
+static bool g_launchInhibited=false;
 static void LauncherWorker(void*)
 {
     uint32_t attempted = 0;
@@ -2110,7 +2112,7 @@ static void LauncherWorker(void*)
         bool desktop = false;
         uint64_t token = 0;
         SpinLockAcquire(&g_launchLock);
-        int launch = g_launches.Take(ApicTickCount());
+        int launch = g_launchInhibited?-1:g_launches.Take(ApicTickCount());
         if (launch >= 0) {
             token = g_launches.entries[launch].token;
             g_launchHistory.Start(token,ApicTickCount());
@@ -2217,7 +2219,7 @@ static LauncherLayout GetLauncherLayout(uint32_t screenW, uint32_t screenH,
     l.x = screenW > WmMetric(8) ? WmMetric(4) : 0;
     const uint32_t availableW = screenW > WmMetric(8) ? screenW - WmMetric(8) : screenW;
     const uint32_t availableH = desktopH > WmMetric(4) ? desktopH - WmMetric(4) : desktopH;
-    const uint32_t fixedH = WmMetric(LAUNCHER_ITEM_HEIGHT) + 2 * WmMetric(LAUNCHER_PADDING);
+    const uint32_t fixedH = 2 * WmMetric(LAUNCHER_ITEM_HEIGHT) + 2 * WmMetric(LAUNCHER_PADDING);
     l.rows = availableH > fixedH ? (availableH - fixedH) / (WmMetric(LAUNCHER_ITEM_HEIGHT) + WmMetric(2)) : 0;
     if (l.rows > LAUNCHER_MAX_ROWS) l.rows = LAUNCHER_MAX_ROWS;
     l.cols = l.rows ? (total + l.rows - 1) / l.rows : 1;
@@ -2288,7 +2290,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
 {
     LauncherReadGuard guard;
     const auto& launcher = guard.get();
-    if (!g_launcherOpen || launcher.count == 0) return;
+    if (!g_launcherOpen) return;
 
     int32_t px, py;
     uint32_t pw, ph;
@@ -2314,13 +2316,20 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
     if (pw > WmMetric(56)) WmRenderString(backBuffer, stride, screenW, screenH,
                    px + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)) + static_cast<int>(WmMetric(4)),
                    iy + static_cast<int32_t>(textYOff),
-                   g_launcherError == -2 ? "App launch already pending" : g_launcherError ? "Launch queue full" : "Applications", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - WmMetric(56));
+                   g_launcherError == -2 ? "App launch already pending" : g_launcherError ? "Launch queue full" : ShutdownDesktopStatus(), WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - WmMetric(56));
     iy += WmMetric(LAUNCHER_ITEM_HEIGHT);
 
     // Separator line below header
     WmFillRect(backBuffer, stride, screenW, screenH,
                px + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)),
                iy - 1, static_cast<int>(pw) - 2 * WmMetric(LAUNCHER_PADDING), 1, WmCurrentPalette().launcherBorder);
+
+    // Always available, independent of installed package shortcuts.
+    const int footerY=py+static_cast<int>(ph)-WmMetric(LAUNCHER_PADDING)-WmMetric(LAUNCHER_ITEM_HEIGHT);
+    const int third=(static_cast<int>(pw)-2*WmMetric(LAUNCHER_PADDING))/3;
+    const char* labels[]={"Shut down","Restart","Cancel"};
+    for(int i=0;i<3;++i)if(third>static_cast<int>(WmMetric(12)))
+        WmRenderString(backBuffer,stride,screenW,screenH,px+WmMetric(LAUNCHER_PADDING)+i*third+WmMetric(4),footerY+textYOff,labels[i],WmCurrentPalette().text,WmCurrentPalette().launcher,third-WmMetric(8));
 
     // Items — render in multi-column layout based on scroll offset
     uint32_t totalValid = 0;
@@ -2398,7 +2407,7 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
 {
     LauncherReadGuard guard;
     const auto& launcher = guard.get();
-    if (!g_launcherOpen || launcher.count == 0) return -1;
+    if (!g_launcherOpen) return -1;
 
     int32_t px, py;
     uint32_t pw, ph;
@@ -2409,6 +2418,11 @@ int WmLauncherHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH
         my < py || my >= py + static_cast<int32_t>(ph))
         return -1;
 
+    const int footerY=py+static_cast<int>(ph)-WmMetric(LAUNCHER_PADDING)-WmMetric(LAUNCHER_ITEM_HEIGHT);
+    const int third=(static_cast<int>(pw)-2*WmMetric(LAUNCHER_PADDING))/3;
+    const int relative=mx-px-WmMetric(LAUNCHER_PADDING);
+    if(my>=footerY&&my<footerY+static_cast<int>(WmMetric(LAUNCHER_ITEM_HEIGHT))&&third>0&&relative>=0&&relative<3*third)
+        return WM_LAUNCHER_MAX_ITEMS+relative/third;
     const LauncherLayout layout = GetLauncherLayout(screenW, screenH, launcher);
     uint32_t maxVisible = layout.capacity;
 
@@ -2439,6 +2453,7 @@ static int AdmitLauncherItem(const LauncherSnapshot& catalog,int itemIdx,bool tr
     if(!__atomic_load_n(&g_launcherWorkerStarted,__ATOMIC_ACQUIRE))return -12;
     const auto& item=catalog.items[itemIdx];int slot;
     SpinLockAcquire(&g_launchLock);
+    if(g_launchInhibited){SpinLockRelease(&g_launchLock);return -108;}
     uint64_t pending=0;
     for(const auto& e:g_launches.entries)if((e.busy()||e.inFlight())&&LaunchFeedbackTable::Exact(e.identity,item.catalogId)) {pending=e.token;break;}
     // Reserve durable tracking capacity before any launch admission side effect.
@@ -2466,8 +2481,25 @@ static int AdmitLauncherItem(const LauncherSnapshot& catalog,int itemIdx,bool tr
     return slot>=0?0:slot==-2?-16:-11;
 }
 
+void WmSetLaunchInhibited(bool inhibited) {
+    SpinLockAcquire(&g_launchLock);g_launchInhibited=inhibited;
+    if(inhibited)for(auto& entry:g_launches.entries)if(entry.phase==LaunchPhase::Queued) {
+        const auto token=entry.token;entry={};
+        const int index=g_launchHistory.Find(token);
+        if(index>=0){g_launchHistory.records[index].cancelled=true;g_launchHistory.Complete(token,-125,ApicTickCount());}
+    }
+    SpinLockRelease(&g_launchLock);
+}
+bool WmLauncherDispatching() {
+    bool dispatching=false;SpinLockAcquire(&g_launchLock);
+    for(const auto& entry:g_launches.entries)if(entry.inFlight())dispatching=true;
+    SpinLockRelease(&g_launchLock);return dispatching;
+}
 void WmLauncherExec(int itemIdx)
 {
+    if(itemIdx==WM_LAUNCHER_MAX_ITEMS){ShutdownDesktopRequest(false);return;}
+    if(itemIdx==WM_LAUNCHER_MAX_ITEMS+1){ShutdownDesktopRequest(true);return;}
+    if(itemIdx==WM_LAUNCHER_MAX_ITEMS+2){ShutdownDesktopCancel();return;}
     LauncherReadGuard guard;uint64_t token=0;bool coalesced=false;
     AdmitLauncherItem(guard.get(),itemIdx,false,&token,&coalesced);
 }

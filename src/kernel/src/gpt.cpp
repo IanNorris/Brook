@@ -67,7 +67,7 @@ static int PartWrite(Device* dev, uint64_t offset, const void* buf, uint64_t len
     auto* pp = static_cast<PartitionPriv*>(dev->priv);
     if (offset + len > pp->lengthBytes)
         len = pp->lengthBytes - offset;
-    return pp->parent->ops->write(pp->parent, pp->startByte + offset, buf, len);
+    return DeviceWrite(pp->parent, pp->startByte + offset, buf, len);
 }
 
 static uint64_t PartBlockCount(Device* dev)

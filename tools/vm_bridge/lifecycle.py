@@ -1,8 +1,8 @@
 """Network-independent guest maintenance transport; not orderly shutdown yet.
 
-Only hello, synchronous filesystem/device flush, and retained flush status are
-implemented. Callers must quiesce writers themselves. A timeout is unknown
-completion; query status using the SAME boot/request IDs before further action.
+Maintenance hello/sync/status and the shared coordinator's typed power verbs
+use this transport. Raw sync callers must quiesce writers themselves. A timeout
+is unknown completion; query the SAME boot/request before further action.
 No kernel-memory edits, focus-dependent input, host shell, or arbitrary guest
 commands are part of this transport.
 """
@@ -39,6 +39,16 @@ def launch_args(command, session, directory, enabled=True):
     endpoint = Path(directory) / 'lifecycle.sock'
     if len(str(endpoint).encode()) >= 108:
         raise ValueError('Lifecycle socket exceeds sockaddr_un path limit')
+    # Native power ports are enabled only for this known Q35 emulator and
+    # ordinary poweroff behavior. Unknown/custom platform policies fail closed.
+    from reset import launch_reboot_action
+    machines=[args[i+1].split(',')[0] for i in range(len(args)-1) if args[i] in {'-machine','-M'}]
+    power=None
+    if machines==['q35'] and '-no-shutdown' not in args:
+        policy=launch_reboot_action(args)
+        if policy in {'reset','shutdown'}:power='q35-reset' if policy=='reset' else 'q35-stop'
+    if any('opt/brook/power' in arg for arg in args):raise ValueError('Lifecycle power argument collision')
+    if power:args.extend(['-fw_cfg',f'name=opt/brook/power,string={power}'])
     args.extend(['-chardev', f'socket,id=brook_lifecycle,path={endpoint},server=on,wait=off',
                  '-serial', 'chardev:brook_lifecycle',
                  '-fw_cfg', f'name=opt/brook/lifecycle,string={session}'])
@@ -54,7 +64,7 @@ def exchange(session, verb, request_id, boot_id, timeout=8):
     """
     for value in (session, request_id, boot_id):
         valid_id(value)
-    if verb not in {'hello', 'sync', 'status'}:
+    if verb not in {'hello', 'sync', 'status', 'shutdown', 'restart', 'power_status', 'cancel', 'commit'}:
         raise ValueError('Unsupported lifecycle transport operation')
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 30:
         raise ValueError('Timeout must be positive and at most 30 seconds')
@@ -102,19 +112,20 @@ def exchange(session, verb, request_id, boot_id, timeout=8):
                     valid_id(parts[1]);valid_id(parts[2])
                     if parts[1] != request_id:
                         continue  # A reply from a disconnected prior exchange.
-                    if parts[3] not in {'ok', 'done', 'stale', 'missing', 'full', 'unsupported'}:
+                    if parts[3] not in {'ok','done','stale','missing','full','unsupported','closing','services','cleanup','syncing','ready','committing','failed','cancelled','busy','conflict','too_late','not_ready'}:
                         raise ValueError('Unknown lifecycle response state')
                     if not re.fullmatch(r'-?(?:0|[1-9][0-9]{0,9})', parts[4]):
                         raise ValueError('Invalid lifecycle result')
                     allowed = {'hello': {'ok'}, 'sync': {'done', 'stale', 'full', 'unsupported'},
                                'status': {'done', 'stale', 'missing', 'unsupported'}}
+                    if verb not in allowed:allowed[verb]={'stale','unsupported','missing','full','closing','services','cleanup','syncing','ready','committing','failed','cancelled','busy','conflict','too_late','not_ready'}
                     if parts[3] not in allowed[verb]:
                         raise ValueError('Lifecycle state does not match the operation')
                     result = int(parts[4])
                     if not -(2**31) <= result < 2**31:
                         raise ValueError('Lifecycle result exceeds int32')
-                    expected_errors = {'ok': 0, 'stale': -116, 'missing': -2, 'full': -28, 'unsupported': -95}
-                    if ((parts[3] == 'done' and result > 0) or
+                    expected_errors = {'ok': 0, 'stale': -116, 'missing': -2, 'full': -28, 'unsupported': -95,'busy':-16,'conflict':-22,'too_late':-16,'not_ready':-16,'closing':0,'services':0,'cleanup':0,'syncing':0,'ready':0,'committing':0,'cancelled':0}
+                    if ((parts[3] == 'done' and result > 0) or (parts[3]=='failed' and result>=0) or
                         (parts[3] in expected_errors and result != expected_errors[parts[3]])):
                         raise ValueError('Lifecycle state/result mismatch')
                     if verb != 'hello' and parts[2] != boot_id and parts[3] != 'stale':
@@ -122,8 +133,8 @@ def exchange(session, verb, request_id, boot_id, timeout=8):
                     return {'session': session, 'generation': data['generation'],
                             'request_id': request_id, 'guest_boot_id': parts[2],
                             'state': parts[3], 'result': result,
-                            'guest_sync_completed': parts[3] == 'done' and result == 0,
-                            'scope': 'filesystem/device flush only; writers must already be quiescent'}
+                            'guest_sync_completed': parts[3] in {'done','ready','committing'} and result == 0,
+                            'scope': 'filesystem/device flush only; writers must already be quiescent' if verb in {'hello','sync','status'} else 'guest application-close/service/cleanup/final-write-barrier coordinator'}
                 if len(buffer) > 159:
                     raise ValueError('Unterminated lifecycle response exceeds bound')
     raise TimeoutError('No lifecycle response; completion unknown (not retried)')

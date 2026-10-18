@@ -84,6 +84,12 @@ extern "C" Device* DeviceFind(const char* name);
 extern "C" bool DeviceIsRegistered(Device* dev);
 
 extern "C" int DeviceFlush(Device* dev);
+// All filesystem and partition block writes enter here, including modules.
+extern "C" int DeviceWrite(Device* dev,uint64_t offset,const void* data,uint64_t len);
+// Final-sync worker only; failed closure has no side effects. No sleeping I/O
+// or driver callback is executed under the admission lock.
+bool DeviceCloseWrites();
+bool DeviceReopenWrites();
 
 // Verify device registry integrity (canaries + checksum).  Returns true if OK.
 // Logs diagnostic details on corruption.  Safe to call from timer tick context.

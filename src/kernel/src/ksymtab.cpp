@@ -72,6 +72,7 @@ EXPORT_SYMBOL(VmmMapPage);
 // Device registry
 EXPORT_SYMBOL(DeviceRegister);
 EXPORT_SYMBOL(DeviceFlush);
+EXPORT_SYMBOL(DeviceWrite);
 EXPORT_SYMBOL(DeviceUnregister);
 EXPORT_SYMBOL(DeviceFind);
 EXPORT_SYMBOL(DeviceIterate);

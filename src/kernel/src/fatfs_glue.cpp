@@ -142,7 +142,7 @@ DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
     uint64_t offset = static_cast<uint64_t>(sector) * SECTOR_SIZE;
     uint64_t len    = static_cast<uint64_t>(count)  * SECTOR_SIZE;
 
-    int ret = dev->ops->write(dev, offset, buff, len);
+    int ret = brook::DeviceWrite(dev, offset, buff, len);
     if (ret != static_cast<int>(len))
         __atomic_store_n(&brook::g_fatfsWriteErrors[pdrv], 1, __ATOMIC_RELAXED);
     return (ret == static_cast<int>(len)) ? RES_OK : RES_ERROR;

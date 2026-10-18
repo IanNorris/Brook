@@ -443,7 +443,7 @@ static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
 // Write exactly `len` bytes to device at `byteOffset`.
 static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, uint64_t len)
 {
-    int r = mnt->dev->ops->write(mnt->dev, byteOffset, buf, len);
+    int r = DeviceWrite(mnt->dev, byteOffset, buf, len);
     if (r == static_cast<int>(len)) return true;
     // All write callers hold g_ext2Lock exclusively. Successful later I/O
     // cannot establish that an earlier failed pointer/inode write was repaired.

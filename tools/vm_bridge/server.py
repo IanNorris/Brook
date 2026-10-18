@@ -30,6 +30,7 @@ from ui import Ui
 from observation import Observations, StaleObservation, validate_selection
 from frame_views import FrameViews
 import reset as reset_control
+import shutdown as shutdown_control
 
 MAX_LOG = 256 * 1024
 
@@ -317,6 +318,10 @@ def start(scenario="desktop", gpu="software", **_):
         time.sleep(.1)
     return {"launch_log": str(log_path), "pending": True,
             "message": "Launch continues independently; discover it with vm_sessions"}
+
+
+def lifecycle_operation(session,action,request_id=None,wait_s=10,**_):
+    return shutdown_control.operate(session,action,request_id,wait_s,guest=guest)
 
 
 def control(session, action, force=False, wait_s=20, _cancel=None, **_):
@@ -976,6 +981,7 @@ register("vm_sessions",sessions,"Discover opted-in user/agent VM runs; no deskto
 register("vm_doctor",doctor,"VM transport and guest readiness; capabilities distinguish unsupported paths",SESSION,["session"],True)
 register("vm_start",start,"Boot a named experiment on new disk clones with playback off",{"scenario":STR,"gpu":STR})
 register("vm_control",control,"pause/resume/reset/stop or takeover/release; stop/reset await guest sync; reset verifies a different guest boot, never infer restart from QMP acknowledgement; force explicitly permits unsynced shutdown",{**SESSION,"action":STR,"force":{"type":"boolean"},"wait_s":NUM},["session","action"])
+register("vm_lifecycle",lifecycle_operation,"Orderly guest shutdown/restart: normal app close and save dialogs, service/cleanup drain and final checked flush. Returns a retained request_id; status never redispatches; cancel before service stop; commit after ready if start timed out. Diagnostic force stop/reset are separate.",{**SESSION,"action":{"type":"string","enum":["shutdown","restart","status","cancel","commit"]},"request_id":STR,"wait_s":NUM},["session","action"])
 register("vm_reset_status",reset_status,"Read-only recovery of the last reset: QMP state and changed guest boot identity; never resets/resumes or changes QEMU policy",SESSION,["session"],True)
 OBSERVATION_OPTIONS={**IMAGE_OPTION,
     "include":{"type":"array","items":{"type":"string","enum":["frame","windows","processes","launches","errors"]},"minItems":1,"maxItems":5},
@@ -1106,7 +1112,7 @@ def serve():
                 if message["id"] in pending or len(pending)>=32:
                     emit({"jsonrpc":"2.0","id":message["id"],"error":{"code":-32600,"message":"Duplicate ID or too many pending requests"}});continue
                 pending[message["id"]]=event
-            pool=control_executor if message.get("method")=="tools/call" and message.get("params",{}).get("name")=="vm_control" else executor
+            pool=control_executor if message.get("method")=="tools/call" and message.get("params",{}).get("name") in {"vm_control","vm_lifecycle"} else executor
             pool.submit(handle,message,event)
     finally:
         with pending_lock:

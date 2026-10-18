@@ -10,6 +10,7 @@
 // just enough to launch programs and inspect system state.
 
 #include "shell.h"
+#include "shutdown.h"
 #include "exec_image.h"
 #include "vfs.h"
 #include "process.h"
@@ -423,6 +424,9 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
                              bool strace = false, bool straceErrors = false,
                              bool quiet = false, bool trackLaunch = true, bool service = false)
 {
+    if(!ShutdownLaunchAllowed()) {
+        KPrintf("shell: shutdown in progress\n");return -108;
+    }
     ExecutableImage image{};
     char executablePath[sizeof(Process::exePath)];
     Vnode* vnode = nullptr;
@@ -1168,23 +1172,10 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
-    // Built-in: shutdown / halt
-    if (StrEq(cmd, "shutdown") || StrEq(cmd, "halt"))
-    {
-        KPrintf("Shutting down.\n");
-        // QEMU shutdown via ACPI (port 0x604 for q35)
-        __asm__ volatile("outw %0, %1" :: "a"((uint16_t)0x2000), "Nd"((uint16_t)0x604));
-        for (;;) __asm__ volatile("hlt");
-    }
-
-    // Built-in: reboot
-    if (StrEq(cmd, "reboot"))
-    {
-        KPrintf("Rebooting.\n");
-        // Triple fault: load null IDT and trigger interrupt
-        struct { uint16_t limit; uint64_t base; } __attribute__((packed)) nullIdt = {0, 0};
-        __asm__ volatile("lidt %0; int3" :: "m"(nullIdt));
-        for (;;) __asm__ volatile("hlt");
+    // Cooperative desktop lifecycle; never discard unsaved application work.
+    if(StrEq(cmd,"shutdown")||StrEq(cmd,"halt")||StrEq(cmd,"reboot")) {
+        ShutdownDesktopRequest(StrEq(cmd,"reboot"));
+        KPrintf("%s\n",ShutdownDesktopStatus());return 0;
     }
 
     // Built-in: panic [message] — deliberately trigger a kernel panic (for testing)

@@ -264,11 +264,24 @@ silent PCM capture and plots; guest diagnostics; packaging/client discovery.
 Detailed acceptance criteria and the deferred branch investigations are in
 [backlog.md](backlog.md).
 
-### Network-independent lifecycle foundation
+### Orderly guest power operations
 
 New opted-in VM launches provide a private COM2 maintenance channel with hello,
 checked flush and retained status. It shares the guest boot epoch with TCP and
-works with the virtual network disconnected. It is not yet wired into the public
-MCP stop/reset path or an application shutdown coordinator; callers of the raw
-host transport must already quiesce writers. Existing MCP semantics above remain
-unchanged. See [implementation, limits and acceptance](orderly-shutdown.md#implemented-foundation-network-independent-flush-channel-18-october).
+works with the virtual network disconnected. `vm_lifecycle` now uses this
+transport for the shared launcher/shell/MCP shutdown coordinator. Its actions
+are `shutdown`, `restart`, `status`, `cancel` and `commit`; `request_id` is
+required to observe or advance an existing operation. `wait_s` is bounded to
+20 seconds. A start may commit when ready during its wait; a returned blocked
+operation requires status lookup with that same ID, followed by commit when
+ready. Status does not redispatch. Cancellation is allowed before service
+teardown. No timeout discards unsaved work or silently forces a power action.
+
+The coordinator closes apps normally, awaits complete user/service and cleanup
+drain, stops audio and establishes a block-write barrier before checked sync.
+Restart requires a different boot and matching guest handshake. Stopped-session
+receipts remain readable, and QEMU exit is reported separately from verification
+of an outer launcher process. The new tool appears after MCP server reload.
+`vm_control stop/reset` retains its existing diagnostic semantics. Raw `sync`
+still requires callers to quiesce writers themselves. See
+[implementation, platform restrictions and acceptance](orderly-shutdown.md).

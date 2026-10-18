@@ -16,6 +16,7 @@
 #include "mouse.h"
 #include "window.h"
 #include "debug_ui.h"
+#include "shutdown.h"
 #include "terminal.h"
 #include "input.h"
 #include "net.h"
@@ -1470,6 +1471,7 @@ static void CompositorLoopWM()
         CompositorMarkDirty();
     }
     DebugUiPoll();
+    ShutdownCompositorPoll();
     // Reap terminated owners regardless of visibility/minimization. A terminal
     // holds its child alive until cleanup; rendering only visible windows left
     // minimized terminals retaining their process/pipe references indefinitely.

@@ -1,10 +1,16 @@
 # Orderly desktop shutdown and restart
 
-Proposed after the 18 October live browser review. The launcher needs Shutdown
-and Restart actions, and MCP needs the same lifecycle operation. Existing
-`vm_control stop/reset` synchronously flushes metadata before QMP, but expects
-callers to close applications first and depends on the guest TCP debug channel.
-This is not yet a complete desktop shutdown feature.
+The launcher now provides **Shut down**, **Restart** and **Cancel**. Shell
+`shutdown`/`halt`/`reboot` and MCP `vm_lifecycle` use the same guest coordinator.
+This replaces manual app closure and sync for normal desktop power operations.
+The existing `vm_control stop/reset` remains a separate diagnostic control.
+
+Standard `scripts/run-qemu.sh` launches now allow guest poweroff and restart.
+`BROOK_REBOOT_POLICY=shutdown` explicitly retains stop-on-reboot policy; guest
+Restart is then unsupported. The supervisor only enables native power ports
+for a recognized Q35 launch with a known reboot policy and ordinary poweroff
+behavior. Custom `-no-shutdown` launches and other platforms fail closed.
+Real-hardware ACPI power management remains unimplemented.
 
 ## Shared guest operation
 
@@ -70,6 +76,97 @@ user-started and agent-started opted-in VMs. Retain original launcher exit statu
 serial/device audit and read-only filesystem checks. Test restart under normal
 and no-reboot QEMU policies and document real-hardware support separately.
 
+## Implemented coordinator
+
+The kernel worker in `shutdown.cpp` blocks new launcher/structured command
+admission, cancels queued app launches and awaits dispatches already started.
+It requests cooperative window closure on the compositor thread. Save dialogs
+remain interactive: each initial window and late new client group receives its
+normal close request, while later dialogs from a known group are preserved.
+Unknown window origins, lingering headless jobs and uncooperative applications
+block progress; timeouts never become an implicit kill. Use Cancel while the
+operation is closing applications. Cancellation reopens admission and leaves
+remaining documents/dialogs available; already-closed applications are not
+restarted. Same-client windows opened later can require manual closure because
+they cannot safely be distinguished from save dialogs with the current API.
+
+After applications finish, the worker closes user-birth admission, awaits
+unpublished births, and sends SIGTERM to explicitly tagged service groups. It
+selects live, incarnation-checked recipients and prefers an unmasked sibling.
+Services that ignore or block termination remain blockers. Cancellation is
+rejected once service teardown starts. All remaining user tasks, live address
+spaces, queued destruction and active finalizers must drain before final sync.
+
+`DeviceWrite` now admits every in-tree filesystem/partition block write through
+one short gate, including the ext4 module. Final closure succeeds only with no
+admitted writes; afterward only the persistent coordinator worker can write
+during its final `VfsSync`. Other writers receive EROFS. Audio is stopped before
+sync. A sync or platform-power error is retained as failure and does not reopen
+launches or writes over a partly torn-down desktop. Recovery after that stage
+requires inspection and an explicit diagnostic decision; no automatic retry,
+forced kill or unsafe cancellation is provided.
+
+MCP `vm_lifecycle` accepts `shutdown`, `restart`, `status`, `cancel` and `commit`.
+Requests are bound to a guest boot and retained ID. A start call can proceed to
+commit when ready within its wait. If it returns while blocked, use `status`
+with the same ID; after `ready`, explicitly `commit`. Status never replays a
+start or commit, including after a lost reply. Retained observations remain
+available after QEMU exits. Restart invalidates cached references before
+dispatch and requires a changed guest boot plus a matching TCP handshake.
+Power/status requests travel over private COM2, independently of guest TCP.
+The MCP server must be reloaded to advertise the added tool.
+
+The host receipt distinguishes QEMU exit from the original outer launcher:
+the latter still needs its own terminal result from the invoking environment.
+Panic/unreachable kernels cannot promise orderly shutdown; existing explicit
+forced diagnostic controls remain separate. The bounded table retains 64
+operation IDs until reboot. Widget-level save-dialog semantics, per-blocker
+progress details and full cross-app save testing remain follow-ups.
+
+### Coordinator acceptance (18 October)
+
+All 44 native suites and the compiled entry audit pass. Native fixtures exercise
+the actual coordinator's cancellation, late clients versus same-client dialogs,
+masked service siblings, pending dispatch/births, retained address spaces,
+active finalizers, write-admission contention and sync failure. The actual
+`DeviceWrite` test races a held writer against closure, denies late writers and
+allows the final owner and nested partition writes. The bridge suite ran 240
+tests with five pre-existing PyAV skips; nine retained-operation tests also
+passed after the final host receipt change. These are targeted checks, not
+general verification of every shutdown path or full bootstrap renewal.
+
+Session `ae0df8ab33ff48cebbc7cc69aa12ac37` used eight CPUs/8 GiB and kernel
+SHA-256 `f3ae05d6e1ef10c5fc008d1d4ead0ece50fae89e3b1e07514e8a457e910dd047`.
+Mousepad's unsaved document blocked shutdown at its save dialog; cancellation
+left it open. Normal-launcher Firefox and Chromium then closed through the
+coordinator. Before restart, the independent census showed no user tasks or
+windows, and all live-address-space/queued/active cleanup counts were zero.
+User births were closed with no pending reservations, heap integrity passed and
+audio was inactive. Real guest restart produced a different boot ID and a
+matching guest handshake. The rebooted launcher then powered off with `net0`
+disconnected. QEMU and original launcher exited zero; all three read-only
+filesystem checks passed.
+
+Final session `d45b99aea2d348f28873be8ee1000fcf`, also eight CPUs/8 GiB, used
+kernel SHA-256 `73cc2764b1a3b86b8dfc26837b4c6d4a35f5080c51419f06d5930efdf02eaa34`.
+This adds the explicit shell-launch rejection and cancellation-notice fix to
+the previous candidate. The unsaved-document cancellation check passed again;
+an attempted shell launch returned no PID with the shutdown rejection logged.
+After cancellation, a UID-1000 tracked command wrote and synced an owned probe,
+exited zero, drained both lineages and provided exact stdout/stderr EOF without
+drops or gaps. MCP shutdown, readiness, commit and stopped-status lookup all
+worked with networking disconnected. QEMU and the original launcher exited
+zero, all three read-only checks passed, and eight owned files retained exact
+hashes and UID 1000/GID 100. All twelve frozen modules independently reported
+ABI 20. Neither session had a serial kernel/device/user fault. An independent
+read-only review found no remaining blocker in the inspected fixes.
+
+Evidence: `build/workloads/orderly-power-release-20261018/acceptance-audit.json`,
+the two sessions' `review/` artifacts, `build/shutdown-coordinator-build-20261018.log`,
+`build/shutdown-bridge-tests-20261018.log` and
+`build/shutdown-operations-20261018.log`. Full unsaved Writer/GIMP coverage,
+hung-service UI, panic/unreachable acceptance and real hardware remain open.
+
 ## Implemented foundation: network-independent flush channel (18 October)
 
 The opted-in VM supervisor now provides a private COM2 Unix socket and passes
@@ -80,11 +177,11 @@ second serial port. `BROOK_VM_LIFECYCLE=0` disables this addition, including for
 launches that already use COM2. Enabling it refuses an existing serial-device or
 reserved-argument conflict rather than silently replacing a device.
 
-This is maintenance transport, **not yet orderly application shutdown**. The
-public `vm_control stop/reset` path is still the existing TCP-based operation.
-Launcher actions, the shared shutdown coordinator, launch inhibition, writer
-quiescence and platform power handling remain to implement. No new arbitrary
-command or kernel-memory-write interface is exposed.
+At the foundation revision this was maintenance transport without application
+shutdown. The coordinator above now adds the launcher and `vm_lifecycle` path;
+`vm_control stop/reset` remains the existing TCP-based diagnostic operation.
+The maintenance verbs below still have their narrower original semantics. No
+arbitrary command or kernel-memory-write interface is exposed by COM2.
 
 `src/kernel/src/lifecycle_channel.h` implements the bounded protocol;
 `lifecycle_channel.cpp` supplies the optional UART worker. The host transport is
@@ -120,9 +217,9 @@ from a persisted pre-reboot operation.
 
 The status transport still requires a running kernel worker. Panic-time QMP
 inspection remains separate; this is not the recalled post-panic command pipe.
-A completed flush does not inhibit later writers, close applications or establish
-power-loss durability. Future MCP/launcher lifecycle integration must provide
-those coordinator guarantees before using this as an orderly shutdown API.
+A raw maintenance flush does not inhibit later writers, close applications or
+establish power-loss durability. Use the coordinator's power operations for
+orderly desktop shutdown.
 
 ### Verified behavior
 
@@ -164,10 +261,10 @@ Evidence: `build/workloads/lifecycle-channel-20261018/acceptance-audit.json`,
 
 The [process-birth reservation work](process-birth-shutdown.md) now accounts for
 user processes between PID allocation and scheduler publication. The future
-coordinator can close user admission and wait for those reservations, then take
-its task census. The gate remains open in ordinary use; this is not yet wired
-into launcher/MCP shutdown. Existing processes, pending launcher requests,
-services and mapped/file writers still require coordination. Resource-capacity
+coordinator closes user admission and waits for those reservations before its
+final task census. The gate remains open in ordinary use. Existing processes,
+pending launcher requests, services and mapped/file writers are coordinated by
+the shared shutdown worker described above. Resource-capacity
 acceptance now verifies PID exhaustion returns an allocation failure rather
 than panicking, followed by full cleanup and successful forks.
 

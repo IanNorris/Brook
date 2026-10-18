@@ -70,8 +70,8 @@ def load_session(session, live=True):
 
 
 @contextlib.contextmanager
-def session_lock(session, timeout=10):
-    data = load_session(session)
+def session_lock(session, timeout=10, live=True):
+    data = load_session(session,live=live)
     with (REGISTRY / session / "operation.lock").open("a") as lock:
         deadline = time.monotonic() + timeout
         while True:
@@ -83,7 +83,7 @@ def session_lock(session, timeout=10):
                     raise TimeoutError("Another client owns the VM operation lock")
                 time.sleep(.05)
         # Revalidate after acquiring: the process may have exited while waiting.
-        yield load_session(session)
+        yield load_session(session,live=live)
 
 
 class QMP:

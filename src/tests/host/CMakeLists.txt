@@ -339,3 +339,14 @@ set_tests_properties(test_lifecycle_channel PROPERTIES TIMEOUT 15)
 add_host_test(test_process_ids)
 target_compile_options(test_process_ids PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 set_tests_properties(test_process_ids PROPERTIES TIMEOUT 15)
+
+add_host_test(test_write_admission "${BROOK_ROOT}/src/kernel/src/device.cpp")
+target_compile_options(test_write_admission PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_write_admission PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_write_admission PROPERTIES TIMEOUT 15)
+add_host_test(test_shutdown)
+target_compile_options(test_shutdown PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_shutdown PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_shutdown PROPERTIES TIMEOUT 15)

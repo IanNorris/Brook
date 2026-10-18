@@ -26,7 +26,7 @@ struct Job {
     const char* error;
 };
 Job jobs[MaxJobs]{};
-KMutex lock{};
+KMutex lock{};bool launchInhibited=false;
 struct Guard { Guard(){KMutexLock(&lock);} ~Guard(){KMutexUnlock(&lock);} };
 char responseBytes[4096];uint32_t responseLength;
 struct Response {
@@ -146,6 +146,11 @@ void Worker(void* argument) {
 }
 } // namespace
 
+void DebugJobsSetLaunchInhibited(bool inhibited) {Guard guard;launchInhibited=inhibited;}
+bool DebugJobsActive() {
+    Guard guard;for(const auto& job:jobs)if(job.id[0]&&(job.state==State::Queued||job.state==State::Running))return true;
+    return false;
+}
 bool DebugJobHandleCommand(const char* command) {
     const char* prefix="bridge job ";uint32_t p=0;
     while(prefix[p] && command[p]==prefix[p]) ++p;
@@ -178,6 +183,7 @@ bool DebugJobHandleCommand(const char* command) {
             if(job->size!=size) Error("Request ID size mismatch");else Status(*job);
             return true;
         }
+        if(launchInhibited){Error("Shutdown in progress");return true;}
         if(!free || active>=MaxActive) {Error("Job capacity exceeded");return true;}
         auto* request=static_cast<uint8_t*>(kmalloc(size));
         if(!request) {Error("Request allocation failed");return true;}
@@ -204,6 +210,7 @@ bool DebugJobHandleCommand(const char* command) {
     }
     if(!strcmp(args[0],"commit") && count==2) {
         if(job->state!=State::Uploading) {Status(*job);return true;}
+        if(launchInhibited){Error("Shutdown in progress");return true;}
         if(job->received!=job->size) {Error("Incomplete request");return true;}
         DebugJobRequest request{};
         if(!DebugJobDecode(job->request,job->size,&request)) {Error("Invalid structured request");return true;}

@@ -1244,16 +1244,17 @@ whole kernel unnecessarily, and verify clean/dirty checkout transitions.
 
 ### Orderly desktop shutdown and restart
 
-Add launcher Shutdown/Restart and a shared MCP lifecycle operation, including
-application close/unsaved-document handling, full helper-lineage drain, launch
-inhibition, writer quiescence and checked final device flush. The 18 October
-virtio-net stall also requires a narrow network-independent VM control transport;
-current `vm_control stop/reset` relies on TCP and assumes apps are already closed.
-See the [shutdown design and acceptance requirements](orderly-shutdown.md).
-The optional COM2 flush/status foundation now passes live link-down/reconnect
-acceptance. The application coordinator, writer barrier, power implementation
-and launcher/MCP lifecycle integration remain open; current public stop/reset
-still uses TCP.
+Implemented for recognized Q35 launches: launcher/shell/MCP cooperative close,
+cancellation before service teardown, full user/cleanup drain, write barrier,
+checked flush, and COM2 power/status independent of networking. Browser restart,
+Mousepad save-dialog cancellation, network-down launcher/MCP poweroff and stopped
+receipt recovery passed isolated-disk acceptance. See
+[implementation and evidence](orderly-shutdown.md).
+
+Remaining: full unsaved Writer/GIMP and hung-service matrix, clearer per-blocker
+UI, same-client new-main-window versus save-dialog semantics, panic/unreachable
+acceptance, sustained UART faults, and real-hardware ACPI power support.
+`vm_control stop/reset` remains a separate TCP-based diagnostic interface.
 
 ### Chromium controlled playback follow-up (18 October)
 
@@ -1269,8 +1270,8 @@ successful downloads.
 
 [User-birth reservations and recoverable PID exhaustion](process-birth-shutdown.md)
 now pass two isolated capacity/reuse rounds and a thread-publication probe. The
-internal closed gate is host-model tested but not yet used by the live lifecycle
-coordinator. Finish app/save/close and launch-queue handling, service teardown,
-waiting for admitted births, and a final writer barrier before wiring power
-actions. Refine PID exhaustion errno (currently inherited ENOMEM) separately.
+internal closed gate is now used by the accepted live lifecycle coordinator,
+alongside app/save/close handling, launch admission, tagged service teardown,
+pending-birth/cleanup drain and a final block-write barrier. Extend the lifecycle
+matrix as described above. Refine PID exhaustion errno (currently inherited ENOMEM) separately.
 This does not implement OOM victim selection or repair MLFQ policy replacement.

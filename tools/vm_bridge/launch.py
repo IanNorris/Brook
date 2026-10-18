@@ -64,7 +64,7 @@ def supervise(command, kernel, disk, debug_port, provenance, scenario):
                   "provenance": provenance, "scenario": scenario,
                   "lifecycle_channel": {"api": 1 if lifecycle_enabled else 0,
                                         "socket": str(directory / "lifecycle.sock") if lifecycle_enabled else None,
-                                        "commands": ["hello", "sync", "status"] if lifecycle_enabled else []},
+                                        "commands": ["hello", "sync", "status", "shutdown", "restart", "power_status", "cancel", "commit"] if lifecycle_enabled else []},
                   "qmp": str(directory / "qmp.sock"), "run_directory": str(directory),
                   "serial_log": str(directory / "serial.log"), "qemu_log": str(directory / "qemu.log"),
                   "boot_disk": str(Path(disk).resolve()), "guest_debug_port": debug_port,

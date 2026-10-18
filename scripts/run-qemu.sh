@@ -541,6 +541,14 @@ if [ "${VM_BRIDGE}" = "1" ]; then
         --provenance "${BROOK_VM_PROVENANCE:-user}" --scenario "${SCRIPT_NAME:-existing-boot-script}"
         -- "${QEMU_BIN:-qemu-system-x86_64}")
 fi
+# Interactive runs support guest-requested restart and poweroff. Tests needing
+# the old stop-on-reboot behavior can request it explicitly.
+REBOOT_ARGS=()
+case "${BROOK_REBOOT_POLICY:-reset}" in
+    reset) ;;
+    shutdown) REBOOT_ARGS=(-no-reboot) ;;
+    *) echo "BROOK_REBOOT_POLICY must be reset or shutdown" >&2; exit 2 ;;
+esac
 "${QEMU_COMMAND[@]}" \
     -machine q35${MACHINE_MEMBACKEND:-} \
     ${KVM_FLAGS} \
@@ -569,8 +577,7 @@ fi
     ${SERIAL_OPT} \
     ${DISPLAY_OPT} \
     -monitor unix:${MONITOR_SOCK},server,nowait \
-    -no-reboot \
-    -no-shutdown \
+    "${REBOOT_ARGS[@]}" \
     ${DEBUG_FLAGS} \
     ${INT_DEBUG_FLAGS} \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
