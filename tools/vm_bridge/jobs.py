@@ -58,10 +58,11 @@ def validate_id(value):
 
 class Jobs:
     directory_name = "jobs"
-    def __init__(self, registry, load_session, session_lock, guest, write_json):
+    def __init__(self, registry, load_session, session_lock, guest, write_json, guest_batch=None):
         self.registry = Path(registry)
         self.load_session, self.session_lock = load_session, session_lock
         self.guest, self.write_json = guest, write_json
+        self.guest_batch = guest_batch
         self.read_retries=0
 
     def path(self, session, operation):
@@ -217,14 +218,30 @@ class Jobs:
                 received=begun.get('received',0)
                 if not 0<=received<=len(payload):
                     raise RuntimeError('Guest request upload extent mismatch')
-                for offset in range(0, len(payload), 64):
-                    stage(f'put_dispatched:{offset}')
-                    reply = self.query(session, generation,
-                        f'bridge job put {ident} {offset} {payload[offset:offset+64].hex()}',boot_id=boot_id)
-                    acknowledged=reply.get('received',-1)
-                    if not max(received,min(offset+64,len(payload)))<=acknowledged<=len(payload):
-                        raise RuntimeError('Guest request upload acknowledgement mismatch')
-                    received=acknowledged
+                # Keep each existing 64-byte PUT and its acknowledgement, but
+                # amortize TCP connection/accept over up to eight PUTs. Replays
+                # still verify every byte of a staged prefix before commit.
+                width=8 if self.guest_batch is not None else 1
+                for first in range(0,len(payload),64*width):
+                    offsets=list(range(first,min(first+64*width,len(payload)),64))
+                    stage(f'put_dispatched:{first}')
+                    commands=[f'bridge job put {ident} {offset} {payload[offset:offset+64].hex()}' for offset in offsets]
+                    if self.guest_batch is None:
+                        replies=[self.query(session,generation,commands[0],boot_id=boot_id)]
+                    else:
+                        with self.session_lock(session,timeout=10) as data:
+                            if data['generation']!=generation:
+                                raise RuntimeError('Guest generation changed; operation targets are stale')
+                            for command in commands:self.before_exchange(session,command)
+                            replies=self.guest_batch(data,[command+' '+boot_id for command in commands],timeout=3)
+                        if len(replies)!=len(commands):
+                            raise RuntimeError('Guest request upload reply count mismatch')
+                    for offset,reply in zip(offsets,replies):
+                        if 'job_error' in reply:raise GuestJobError(reply['job_error'])
+                        acknowledged=reply.get('received',-1)
+                        if not max(received,min(offset+64,len(payload)))<=acknowledged<=len(payload):
+                            raise RuntimeError('Guest request upload acknowledgement mismatch')
+                        received=acknowledged
                 stage('commit_dispatched')
                 reply = self.query(session, generation, f'bridge job commit {ident}',boot_id=boot_id)
                 operation.update(stage='committed', effect='confirmed', state=reply['state'], guest=reply)

@@ -124,6 +124,102 @@ class JobTests(unittest.TestCase):
         self.submit()
         self.assertEqual(self.commits,1)
 
+    def batch(self,data,commands,timeout):
+        self.batches.append(list(commands))
+        return [self.guest(data,command,timeout) for command in commands]
+
+    def upload_error(self):
+        # A readonly status observation may label partial staging "uploading"
+        # after the worker records unknown delivery. Wait for its error record,
+        # rather than depending on which thread last persisted the state.
+        path=self.client.path(self.session,self.ident)
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            with self.client.lock(path):row=json.loads(path.read_text())
+            if row.get('error'):return row
+            time.sleep(.01)
+        self.fail('Upload worker did not record its error')
+
+    def test_batch_upload_preserves_bytes_and_reduces_connection_exchanges(self):
+        self.batches=[];self.client.guest_batch=self.batch
+        argv=['/bin/test','x'*6600]
+        result=self.client.submit(self.session,self.ident,argv,wait_s=2)
+        self.assertEqual(result['state'],'completed')
+        self.assertEqual(bytes(self.payload),request_bytes(argv))
+        chunks=sum(len(batch) for batch in self.batches)
+        self.assertEqual(len(self.batches),(chunks+7)//8)
+        self.assertGreater(chunks,100)
+        self.assertTrue(all(1<=len(batch)<=8 for batch in self.batches))
+        self.assertTrue(all(len(command.encode())<=220 for batch in self.batches for command in batch))
+        self.assertEqual(self.commits,1)
+
+    def test_batch_lost_reply_replays_staged_prefix_without_double_commit(self):
+        self.batches=[];self.client.guest_batch=self.batch
+        self.fail_put=True
+        argv=['/bin/test','x'*1200]
+        self.client.submit(self.session,self.ident,argv,wait_s=.01)
+        self.upload_error()
+        self.assertEqual(len(self.payload),64)
+        self.assertEqual(self.commits,0)
+        result=self.client.submit(self.session,self.ident,argv,wait_s=2)
+        self.assertEqual(result['state'],'completed')
+        self.assertEqual(bytes(self.payload),request_bytes(argv))
+        self.assertEqual(self.commits,1)
+
+    def test_batch_missing_acknowledgement_prevents_commit(self):
+        self.batches=[]
+        self.client.guest_batch=lambda *a,**k:[]
+        self.client.submit(self.session,self.ident,['/bin/test'],wait_s=.01)
+        row=self.upload_error()
+        self.assertIn(row['state'],('unknown','uploading'))
+        self.assertIn('reply count mismatch',row['error'])
+        self.assertEqual(self.commits,0)
+
+    def test_lost_batch_reply_rechecks_all_staged_bytes_before_commit(self):
+        self.batches=[]
+        def lost_reply(data,commands,timeout):
+            replies=self.batch(data,commands,timeout)
+            self.client.guest_batch=self.batch
+            raise TimeoutError('all chunks staged but replies lost')
+        self.client.guest_batch=lost_reply
+        argv=['/bin/test','x'*1200]
+        self.client.submit(self.session,self.ident,argv,wait_s=.01)
+        self.upload_error()
+        self.assertEqual(len(self.payload),512)
+        self.assertEqual(self.commits,0)
+        result=self.client.submit(self.session,self.ident,argv,wait_s=2)
+        self.assertEqual(result['state'],'completed')
+        self.assertEqual(bytes(self.payload),request_bytes(argv))
+        self.assertEqual(self.batches[0],self.batches[1])
+        self.assertEqual(self.commits,1)
+
+    def test_bad_ack_or_guest_error_in_batch_prevents_commit(self):
+        for mode in ('bad_ack','guest_error'):
+            with self.subTest(mode=mode):
+                self.ident=('7' if mode=='bad_ack' else '8')*32
+                self.payload.clear();self.begun=False;self.state='uploading'
+                self.batches=[]
+                def invalid(data,commands,timeout):
+                    replies=self.batch(data,commands,timeout)
+                    replies[1]={'received':0} if mode=='bad_ack' else {'job_error':'Invalid chunk extent'}
+                    return replies
+                self.client.guest_batch=invalid
+                self.client.submit(self.session,self.ident,['/bin/test','x'*1200],wait_s=.01)
+                row=self.upload_error()
+                self.assertIn(row['state'],('unknown','uploading'))
+                self.assertIn('acknowledgement mismatch' if mode=='bad_ack' else 'Invalid chunk extent',row['error'])
+                self.assertEqual(self.commits,0)
+
+    def test_batch_stale_boot_prevents_commit(self):
+        self.batches=[]
+        def reboot(data,commands,timeout):
+            self.boot='f'*32
+            return self.batch(data,commands,timeout)
+        self.client.guest_batch=reboot
+        self.client.submit(self.session,self.ident,['/bin/test'],wait_s=.01)
+        self.assertEqual(self.upload_error()['state'],'lost')
+        self.assertEqual(self.commits,0)
+
     def test_generation_change_loses_old_operation(self):
         self.submit();self.data['generation']='second'
         result=self.client.status(self.session,self.ident)

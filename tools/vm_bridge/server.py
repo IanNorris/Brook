@@ -66,30 +66,47 @@ def parse_guest_reply(reply):
 
 
 def guest(data, command, timeout=8):
+    return guest_batch(data, [command], timeout)[0]
+
+
+def guest_batch(data, commands, timeout=8):
+    """Bounded framed RPCs on one connection; never retry unknown delivery."""
     if panic_state(data):
         raise RuntimeError("Guest has panicked; use vm_debug for QEMU-level inspection")
-    if "\n" in command or "\r" in command or len(command.encode()) > 220:
-        raise ValueError("Guest command must fit one 220-byte protocol line")
-    token = str(int(uuid.uuid4().hex[:12], 16))
-    begin, end = f"BRIDGE_BEGIN {token}", f"BRIDGE_END {token}"
+    if not isinstance(commands, list) or not 1 <= len(commands) <= 8:
+        raise ValueError("Guest batch must contain 1–8 commands")
+    frames=[]
+    for command in commands:
+        if not isinstance(command, str) or "\n" in command or "\r" in command or len(command.encode()) > 220:
+            raise ValueError("Guest command must fit one 220-byte protocol line")
+        token = str(int(uuid.uuid4().hex[:12], 16))
+        frames.append((token, command))
     deadline = time.monotonic() + timeout
     with socket.create_connection(("127.0.0.1", data["guest_debug_port"]), timeout=timeout) as s:
-        s.sendall(f"@{token} {command}\n".encode())
+        s.sendall(''.join(f'@{token} {command}\n' for token,command in frames).encode())
         buffer = bytearray()
+        results=[]
+        received=0
         while time.monotonic() < deadline:
             s.settimeout(max(.1, deadline - time.monotonic()))
             chunk = s.recv(65536)
             if not chunk:
                 break
             buffer.extend(chunk)
-            if len(buffer) > 2 * 1024 * 1024:
+            received+=len(chunk)
+            if received > 2 * 1024 * 1024:
                 raise ValueError("Guest reply exceeded bounded receive buffer")
-            text = buffer.decode(errors="replace")
-            start = text.find(begin + "\n")
-            # Replies use LF; the log stream may use CRLF.
-            if start >= 0 and end + "\n" in text[start:]:
-                reply = text[start + len(begin) + 1:].split(end + "\n", 1)[0]
-                return parse_guest_reply(reply)
+            # Replies use LF; the log stream may use CRLF. Consume only the
+            # next token's complete frame, including when recv coalesces them.
+            while len(results)<len(frames):
+                token=frames[len(results)][0]
+                begin,end=f'BRIDGE_BEGIN {token}\n'.encode(),f'BRIDGE_END {token}\n'.encode()
+                start=buffer.find(begin)
+                finish=buffer.find(end,start+len(begin)) if start>=0 else -1
+                if finish<0:break
+                results.append(parse_guest_reply(buffer[start+len(begin):finish].decode(errors='replace')))
+                del buffer[:finish+len(end)]
+            if len(results)==len(frames):return results
     raise TimeoutError("No complete guest response; delivery/completion is unknown (not retried)")
 
 
@@ -502,7 +519,7 @@ def ui_status(session,operation_id,wait_s=0,wait_for='applied',_cancel=None,
 
 
 def command_jobs():
-    return Jobs(REGISTRY,load_session,session_lock,guest,write_json)
+    return Jobs(REGISTRY,load_session,session_lock,guest,write_json,guest_batch=guest_batch)
 
 
 def job_status(session,operation_id,stdout_offset=0,stderr_offset=0,output_limit=4096,wait_s=0,_cancel=None,**_):

@@ -77,6 +77,18 @@ launcher with a named scenario, rather than accepting arbitrary host commands.
 | `vm_audio_analyze` | Session WAV waveform PNG, RMS and silent bins. PCM silence alone does not identify stutter. |
 | `vm_artifacts` | Describe scoped ignored artifacts by absolute path, MIME, bytes and checksum, including after VM exit. `include_image: true` opts in to a PNG preview. Binary exports are never embedded in JSON. |
 
+Structured command uploads group up to eight existing 64-byte PUTs on one TCP
+connection. Every line retains its frame token and guest boot identity; every
+PUT acknowledgement is checked before commit. Interrupted uploads still replay
+and compare the staged prefix, and unknown delivery never triggers an automatic
+commit retry. The guest protocol and its 220-byte command bound are unchanged.
+The controlled old-kernel mmap probe used 13 upload connections for 98 PUTs and
+completed its tracked job in 13.72 seconds. This establishes delivery and
+connection counts, not a comparison against the previous guest upload time.
+Host regression coverage passed 253 tests with five existing optional skips;
+evidence is under `build/workloads/drm-map-token-20261019/baseline/` and
+`build/vm-bridge-batch-host-tests-20261019.log`.
+
 ### Media delivery (bridge 0.3.0)
 
 Image-producing tools default to `include_image: false`. Text results contain

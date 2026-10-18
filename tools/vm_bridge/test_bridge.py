@@ -229,6 +229,56 @@ class Contracts(unittest.TestCase):
             self.assertEqual(value,{'pid':42});self.assertEqual(len(seen),1)
         finally:thread.join();listener.close()
 
+    def test_guest_batch_uses_one_connection_and_keeps_fragmented_utf8(self):
+        listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen()
+        seen=[]
+        def endpoint():
+            connection,_=listener.accept()
+            with connection:
+                request=b''
+                while request.count(b'\n')<3:request+=connection.recv(4096)
+                seen.extend(request.decode().splitlines())
+                replies=[]
+                for index,line in enumerate(seen):
+                    token=line.split(' ',1)[0][1:]
+                    replies.append(f'BRIDGE_BEGIN {token}\n'+json.dumps({'index':index,'text':'€'},ensure_ascii=False)+f'\nBRIDGE_END {token}\n')
+                # Every byte boundary, including inside UTF-8 and frame markers.
+                for byte in ('banner\r\n'+''.join(replies)).encode():
+                    connection.sendall(bytes([byte]))
+        thread=threading.Thread(target=endpoint);thread.start()
+        try:
+            with patch.object(server,'panic_state',return_value=False):
+                result=server.guest_batch({'guest_debug_port':listener.getsockname()[1]},['bridge stats']*3)
+            self.assertEqual(result,[{'index':i,'text':'€'} for i in range(3)])
+            self.assertEqual(len(seen),3)
+        finally:thread.join();listener.close()
+
+    def test_guest_batch_requires_all_frames_without_retry(self):
+        class PartialSocket:
+            sends=0
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def settimeout(self,*args):pass
+            def sendall(self,wire):
+                self.sends+=1
+                token=wire.split(b' ',1)[0][1:]
+                self.reply=b'BRIDGE_BEGIN '+token+b'\n{}\nBRIDGE_END '+token+b'\n'
+            def recv(self,size):
+                result=self.reply;self.reply=b'';return result
+        transport=PartialSocket()
+        with patch.object(server,'panic_state',return_value=False),patch.object(server.socket,'create_connection',return_value=transport) as connect:
+            with self.assertRaisesRegex(TimeoutError,'delivery/completion is unknown'):
+                server.guest_batch({'guest_debug_port':1234},['bridge stats']*2)
+        self.assertEqual(transport.sends,1)
+        connect.assert_called_once()
+
+    def test_guest_batch_validates_all_lines_before_sending(self):
+        with patch.object(server,'panic_state',return_value=False),patch.object(server.socket,'create_connection') as connect:
+            for commands in ([],['bridge stats']*9,['bridge stats','bad\nline'],['x'*221],['good',None]):
+                with self.subTest(commands=commands),self.assertRaises(ValueError):
+                    server.guest_batch({},commands)
+            connect.assert_not_called()
+
     def test_census_keeps_records_and_requires_footer(self):
         header={'kind':'memory_census','identity_ceiling':42}
         records=[{'as_id':7,'mapping_kind':'image','backed_bytes':8192},
