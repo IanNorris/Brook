@@ -2598,3 +2598,57 @@ and every offline FAT/ext2 check passed. See
 [matching acceptance](bootstrap.md#matching-39-suite-acceptance-after-tx-ownership-2026-10-18).
 This does not establish browser speed improvements; application regressions and
 the separate known realtime-clock composition defect remain open.
+
+## Loader startup diagnostic checkpoint — 18 October 2026
+
+The pre-Wayland boot failure in session `6ff23309fe2d4c288482506746bb9f8f`
+remains unresolved. Matching the pinned glibc loader from the failed image,
+a checked image and the host identified `_dl_start+0x277`: `mov (%rcx),%rax`
+in the DT_RELR relocation loop. All three loader files have SHA-256
+`1640ec4d1cfcc3c19430b368cbbb057c5652eac340ecba12cf9dfbe2c3769d07`.
+The file's DT_RELR offset is `0xd18`; with load bias `0x7f0000000000`, the
+expected table address is `0x7f0000000d18`. The interleaved fault dump appeared
+to contain `0xfe0000000d18`, consistent with adding the bias twice. That is a
+hypothesis, not a reliable original-register or runtime-memory reconstruction.
+The original fault did not capture the relevant dynamic-table memory.
+
+Two diagnostic helpers now preserve reproducible probes:
+
+- `scripts/workloads/loader_cmov.c` and `.S` exercise the loader's
+  TEST/LEA/CMOVE arithmetic window with both zero and nonzero selectors, without
+  a syscall or pointer dereference inside that window. Eight guest workers
+  completed 128 billion pairs in 25.062264 seconds without a mismatch. A host
+  negative-control build with `BROOK_CMOV_NEGATIVE_CONTROL` deliberately
+  clobbered flags and detected the doubled-bias result. Its recorded
+  `compare_flags` are the later comparison flags, not the original TEST flags.
+- `scripts/workloads/exec_startup_check.py` verifies an actual ELF64 PT_INTERP
+  and hashes the executable and interpreter before starting eight concurrent
+  children per batch. The corrected guest run completed 1,024 successful
+  dynamic launches in 10.513368 seconds. The first harness version executed
+  the resolved multicall `coreutils` path instead of preserving the invoked
+  `true` name, producing exit 1. That is retained as a harness failure; the
+  corrected version preserves argv[0].
+
+These are narrow diagnostics. No IRQ count was measured, the arithmetic pass
+is not an audit of all entry/return handlers, and concurrent exec does not
+exercise the same creation path as kernel-queued boot services. Matching disk
+bytes does not exclude runtime corruption. No kernel repair is established.
+A recurrence needs per-CPU registers/CR3, the original saved frame and stack,
+and the loader's relocated dynamic entries captured before stopping the VM.
+Keep the `KRwLockCleanupOnExit` guard: releasing abandoned filesystem locks
+would not repair the originating fault.
+
+The diagnostic VM used eight vCPUs, 4 GiB and frozen kernel
+`9e64f2783804714a8998f0bdaf2cbe756980fa0e668b98d07c38292615646ccd`.
+Its six tracked jobs completed with full lineage drained and exact accumulated
+stdout/stderr byte counts, accounting for the expected harness failure above.
+Checked shutdown completed guest sync; the owned launcher exited zero and
+QEMU was independently confirmed dead. All three offline filesystem checks
+returned zero. Nine saved fixture hashes remained unchanged; the six fixtures
+with ownership fields retained UID 1000/GID 100. No ownership claim is made
+for the other three hash-only fixtures.
+
+Local evidence: `build/workloads/boot-panic-analysis-652a01b7-20261018/`,
+including `analysis.json`, `probe-acceptance-audit.json` and stopped diagnostic
+session `027d5d03079946e4912be7924fb93acb`. The original panic disks remain
+failure evidence and were not reused as an accepted seed.

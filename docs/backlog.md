@@ -11,6 +11,9 @@
   The halted VM was force-stopped without clean sync; those disks are retained
   as failure evidence, not an accepted seed. Fresh copies of the previous
   checked seed booted on retry. The cause and reproducibility remain unknown.
+  The [loader diagnostic checkpoint](workloads.md#loader-startup-diagnostic-checkpoint-18-october-2026)
+  identifies the faulting relocation-loop instruction and records narrow CMOV
+  and concurrent-exec probes; their passes do not resolve the boot fault.
 
 - Initial [Wine64 smoke test](wine-smoke.md): diagnose wineserver's rejection of
   `/tmp/.wine-1000` as not owned by UID1000, including metadata on newly created
