@@ -1,3 +1,5 @@
+#include "scene_damage.h"
+#include "desktop_pointer_route.h"
 #include "compositor.h"
 #include "cursor_composition.h"
 #include "spinlock.h"
@@ -950,7 +952,7 @@ static void BlitProcess(Process* proc, bool forceAll)
 // Blit a process VFB at an explicit destination (for WM-managed windows).
 // Supports integer upscaling via nearest-neighbor (for DOOM at 320×200 → 4×).
 static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
-                           uint8_t upscale = 1)
+                           uint32_t clientW, uint32_t clientH, uint8_t upscale = 1)
 {
     // Snapshot VFB pointer atomically to avoid TOCTOU race with process exit
     // (another CPU may null fbVirtual between check and use).
@@ -968,20 +970,17 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
     uint32_t*       dstBase   = g_backBuffer ? g_backBuffer : const_cast<uint32_t*>(g_physFb);
     const uint32_t  dstStride = g_backBuffer ? g_backBufStride : g_physFbStride;
 
+    const SceneRect clip=SceneClientBlitRect(dstX0,dstY0,srcW,srcH,clientW,clientH,
+                                             upscale,g_physFbWidth,g_physFbHeight);
+    if(clip.empty())return;
+    const uint32_t startDx=static_cast<uint32_t>(clip.left-dstX0);
+    const uint32_t startDy=static_cast<uint32_t>(clip.top-dstY0);
+    const uint32_t endDx=static_cast<uint32_t>(clip.right-dstX0);
+    const uint32_t endDy=static_cast<uint32_t>(clip.bottom-dstY0);
+
     if (upscale <= 1)
     {
         // 1:1 blit (fast path)
-        uint32_t startDy = 0, startDx = 0;
-        if (dstY0 < 0) startDy = static_cast<uint32_t>(-dstY0);
-        if (dstX0 < 0) startDx = static_cast<uint32_t>(-dstX0);
-
-        uint32_t endDy = srcH;
-        uint32_t endDx = srcW;
-        if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_physFbHeight))
-            endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
-        if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
-            endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
-
         MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
                       static_cast<uint32_t>(dstY0) + endDy);
 
@@ -998,20 +997,6 @@ static void BlitProcessAt(Process* proc, int dstX0, int dstY0, bool forceAll,
     else
     {
         // Nearest-neighbor upscale
-        uint32_t dispW = srcW * upscale;
-        uint32_t dispH = srcH * upscale;
-
-        uint32_t startDy = 0, startDx = 0;
-        if (dstY0 < 0) startDy = static_cast<uint32_t>(-dstY0);
-        if (dstX0 < 0) startDx = static_cast<uint32_t>(-dstX0);
-
-        uint32_t endDy = dispH;
-        uint32_t endDx = dispW;
-        if (dstY0 + static_cast<int>(endDy) > static_cast<int>(g_physFbHeight))
-            endDy = g_physFbHeight - static_cast<uint32_t>(dstY0);
-        if (dstX0 + static_cast<int>(endDx) > static_cast<int>(g_physFbWidth))
-            endDx = g_physFbWidth - static_cast<uint32_t>(dstX0);
-
         MarkDirtyRows(static_cast<uint32_t>(dstY0) + startDy,
                       static_cast<uint32_t>(dstY0) + endDy);
 
@@ -1121,7 +1106,7 @@ static void BlitWallpaper()
         uint32_t offY = (g_physFbHeight > copyH) ? (g_physFbHeight - copyH) / 2 : 0;
 
         // Clear edges if wallpaper doesn't fill
-        if (offX > 0 || offY > 0)
+        if (copyW < g_physFbWidth || copyH < g_physFbHeight)
         {
             for (uint32_t y = 0; y < g_physFbHeight; ++y)
                 for (uint32_t x = 0; x < g_physFbWidth; ++x)
@@ -1138,12 +1123,44 @@ static void BlitWallpaper()
     }
     else
     {
-        // No wallpaper loaded yet — preserve the current backbuffer content
-        // (boot logo / previous TTY output) to avoid a black flash.
-        // Once wallpaper is set via CompositorSetWallpaper, this branch
-        // will stop being taken and the wallpaper fills the screen.
+        // WM mode needs a stable scene base even before an image is loaded
+        // or if loading fails. Match partial repaint's desktop fallback.
+        for(uint32_t y=0;y<g_physFbHeight;++y)
+            for(uint32_t x=0;x<g_physFbWidth;++x)dstBase[y*dstStride+x]=0x00001a3a;
     }
     MarkAllDirty();
+}
+
+// Restore just the affected CPU scene component. No previously blended window
+// pixels are used as the backdrop for the next translucent frame.
+static void BlitWallpaperRegion(const SceneRect& region)
+{
+    const SceneRect clip=region.clipped(g_physFbWidth,g_physFbHeight);
+    if(clip.empty())return;
+    uint32_t* dst=g_backBuffer?g_backBuffer:const_cast<uint32_t*>(g_physFb);
+    const uint32_t stride=g_backBuffer?g_backBufStride:g_physFbStride;
+    const uint32_t copyW=g_wallpaperWidth<g_physFbWidth?g_wallpaperWidth:g_physFbWidth;
+    const uint32_t copyH=g_wallpaperHeight<g_physFbHeight?g_wallpaperHeight:g_physFbHeight;
+    const int64_t offX=(g_physFbWidth-copyW)/2,offY=(g_physFbHeight-copyH)/2;
+    for(int64_t y=clip.top;y<clip.bottom;++y) {
+        uint32_t* row=dst+y*stride;
+        // Match the full wallpaper path's edge colour. With a full-sized
+        // image the row is copied exactly once, with no extra clearing pass.
+        if(!g_wallpaper || y<offY || y>=offY+copyH) {
+            for(int64_t x=clip.left;x<clip.right;++x)row[x]=0x00001a3a;
+            continue;
+        }
+        const int64_t left=clip.left>offX?clip.left:offX;
+        const int64_t right=clip.right<offX+copyW?clip.right:offX+copyW;
+        if(left>=right) {
+            for(int64_t x=clip.left;x<clip.right;++x)row[x]=0x00001a3a;
+            continue;
+        }
+        for(int64_t x=clip.left;x<left;++x)row[x]=0x00001a3a;
+        __builtin_memcpy(row+left,g_wallpaper+(y-offY)*g_wallpaperWidth+left-offX,(right-left)*4);
+        for(int64_t x=right;x<clip.right;++x)row[x]=0x00001a3a;
+    }
+    MarkDirtyRows(static_cast<uint32_t>(clip.top),static_cast<uint32_t>(clip.bottom));
 }
 
 // ---------------------------------------------------------------------------
@@ -1525,6 +1542,22 @@ static void CompositorLoopWM()
     int sorted[WM_MAX_WINDOWS];
     uint32_t wcount = WmGetZOrder(sorted, WM_MAX_WINDOWS);
 
+    SceneRect cpuDamage;
+    const bool cpuPartial=!CompositorGpuActive() && !fullRepaint;
+    if(cpuPartial) {
+        SceneRect layers[WM_MAX_WINDOWS]{};
+        for(uint32_t i=0;i<wcount;++i) {
+            Window* w=WmGetWindow(sorted[i]);
+            if(!w || !w->proc || !w->visible || w->minimized)continue;
+            layers[i]=SceneRect{w->x,w->y,static_cast<int64_t>(w->x)+w->outerWidth(),
+                                      static_cast<int64_t>(w->y)+w->outerHeight()}.clipped(g_physFbWidth,g_physFbHeight);
+            const bool windowBuffer=__atomic_load_n(&w->vfb,__ATOMIC_ACQUIRE)!=nullptr;
+            if(windowBuffer?w->vfbDirty:w->proc->fbDirty)cpuDamage.include(layers[i]);
+        }
+        cpuDamage=SceneDamageClosure(cpuDamage,layers,wcount);
+        BlitWallpaperRegion(cpuDamage);
+    }
+
     // Demo: auto-open the launcher once (opt/gpulaunch) for headless capture.
     if (g_gpuLaunchDemo && !WmLauncherVisible())
     {
@@ -1557,6 +1590,11 @@ static void CompositorLoopWM()
         Window* w = WmGetWindow(sorted[i]);
         if (!w || !w->proc || !w->visible || w->minimized) continue;
 
+        if(cpuPartial) {
+            const SceneRect bounds{w->x,w->y,static_cast<int64_t>(w->x)+w->outerWidth(),
+                                             static_cast<int64_t>(w->y)+w->outerHeight()};
+            if(!cpuDamage.intersects(bounds))continue;
+        }
         Process* p = w->proc;
 
         // Update process destX/destY to match window client area
@@ -1571,10 +1609,9 @@ static void CompositorLoopWM()
 
         if (localVfb && localStride)
         {
-            // In partial-repaint mode, skip windows whose content hasn't
-            // changed AND no lower-z window was re-blitted (which could
-            // overwrite our region in the backbuffer).
-            if (!fullRepaint && !w->vfbDirty && !anyBelowBlitted)
+            // CPU damage closure redraws every included layer over its clean
+            // backdrop. GPU upload retains the existing dirty/occlusion test.
+            if (!fullRepaint && !cpuPartial && !w->vfbDirty && !anyBelowBlitted)
                 continue;
 
             anyBelowBlitted = true;
@@ -1597,11 +1634,11 @@ static void CompositorLoopWM()
         }
         else if (p->state != ProcessState::Terminated && p->fbVfbWidth > 0)
         {
-            if (!fullRepaint && !p->fbDirty && !anyBelowBlitted)
+            if (!fullRepaint && !cpuPartial && !p->fbDirty && !anyBelowBlitted)
                 continue;
             anyBelowBlitted = true;
             if (!CompositorGpuActive())
-                BlitProcessAt(p, w->clientX(), w->clientY(), true, w->upscale);
+                BlitProcessAt(p, w->clientX(), w->clientY(), true, w->clientW, w->clientH, w->upscale);
         }
 
         // Draw text cursor for terminal windows
@@ -1727,6 +1764,8 @@ static void CompositorLoopWM()
 
 }
 
+static DesktopPointerGate g_desktopPointerGate;
+
 static void CompositorInputWM()
 {
     // Route input events (keyboard + mouse buttons)
@@ -1735,9 +1774,34 @@ static void CompositorInputWM()
     InputEvent ev;
     while (InputPollEvent(&ev))
     {
-        // Always copy the event to the global grabber (e.g. waylandd) so
-        // userspace display servers see every input regardless of WM
-        // hit-test result.
+        // Desktop overlays own pointer events before either raw grabber or
+        // per-window delivery. Keep button ownership through release even if
+        // launching/dismissing the menu closes it on the preceding press.
+        const bool pointer=ev.type==InputEventType::MouseButtonDown ||
+                           ev.type==InputEventType::MouseButtonUp ||
+                           ev.type==InputEventType::MouseMove ||
+                           ev.type==InputEventType::MouseScroll;
+        if(pointer) {
+            int32_t mx=0,my=0;MouseGetPosition(&mx,&my);
+            const bool launcher=WmLauncherVisible();
+            const bool overlay=launcher || my>=static_cast<int32_t>(WmDesktopHeight(g_physFbHeight));
+            const auto kind=ev.type==InputEventType::MouseButtonDown?DesktopPointerEvent::Down:
+                            ev.type==InputEventType::MouseButtonUp?DesktopPointerEvent::Up:
+                            ev.type==InputEventType::MouseScroll?DesktopPointerEvent::Scroll:DesktopPointerEvent::Move;
+            if(g_desktopPointerGate.consume(kind,ev.scanCode,overlay)) {
+                // The WM still needs its own primary-button transitions.
+                if(ev.scanCode==0 && kind==DesktopPointerEvent::Down)g_wmBtnLatch=true;
+                if(ev.scanCode==0 && kind==DesktopPointerEvent::Up)g_wmBtnReleaseLatch=true;
+                if(kind==DesktopPointerEvent::Scroll && launcher)
+                    WmLauncherScroll(static_cast<int8_t>(ev.scanCode),g_physFbWidth,g_physFbHeight);
+                if(__atomic_load_n(&g_defaultCursorVisible,__ATOMIC_ACQUIRE)==0) {
+                    __atomic_store_n(&g_defaultCursorVisible,1u,__ATOMIC_RELEASE);
+                    CompositorSetCursorImage(nullptr,0,0,0,0);
+                }
+                continue;
+            }
+        }
+        // Non-overlay events retain the existing raw and targeted routes.
         RouteToGrabber(ev);
 
         if (ev.type == InputEventType::MouseButtonDown && ev.scanCode == 0)
