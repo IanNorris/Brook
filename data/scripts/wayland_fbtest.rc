@@ -2,5 +2,5 @@
 # No video decoding — just renders a sweeping bar at target FPS.
 set wm
 set vfb none
-run --once /nix/bin/waylandd
+run --service --once /nix/bin/waylandd
 run --uid 1000 /nix/bin/brook-fbtest 24

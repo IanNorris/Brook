@@ -170,3 +170,52 @@ into launcher/MCP shutdown. Existing processes, pending launcher requests,
 services and mapped/file writers still require coordination. Resource-capacity
 acceptance now verifies PID exhaustion returns an allocation failure rather
 than panicking, followed by full cleanup and successful forks.
+
+## Service roles and deferred cleanup observations
+
+`run --service` now assigns a lifecycle role before scheduler publication.
+The session bus and Wayland startup scripts use it. Fork and thread creation
+inherit the role, and exec preserves it; ordinary catalogue applications remain
+applications. This classification does not grant credentials or privileges.
+An already running `--once` match is not retroactively promoted. Activation
+services that launch applications will need an explicit application handoff;
+the shutdown coordinator must still close GUI windows regardless of this role.
+The appended Process field requires module ABI 20 and matching rebuilt modules.
+
+`vm_stats.cleanup` now reports live user address spaces, queued processes and
+address spaces, active finalizers, and cumulative completed destructions. Live
+spaces include externally retained and unpublished spaces. Active finalizers
+remain counted after dequeue, through mapping cleanup and completion-waiter
+release, including a captured consuming-wait batch. These observations are not
+a shutdown barrier: admission, live tasks, services and kernel writers must all
+be coordinated before the final flush.
+
+Private eight-CPU/8-GiB session `163d971c19c3434a924415197525a08a` used kernel
+SHA-256 `b549ea3b4c60e073e76f4f46a5e4ed91368049d29fda74eb7d304353c4e5138b`.
+All twelve frozen modules independently reported ABI 20. An owned, bounded
+fixture verified six service tasks and six ordinary application tasks across
+fork, exec and threads, all UID 1000/GID 100. Both families exited normally;
+their exact process incarnations disappeared, and cleanup returned to the two
+background service address spaces with no queued or active destruction.
+
+Firefox's normal catalogue launch remained an application across 293 sampled
+tasks. Its owned local VP9/Opus fixture produced 441,118 stereo frames at
+44.1 kHz over ten host seconds, approximately 440.18 Hz, with no silent 10-ms
+bins. Browser telemetry reported approximately 24 video frames per page-second;
+this is not independent screen-presentation measurement or general website
+acceptance. Pause stopped the audio stream. Normal close drained the complete
+launch lineage and returned cleanup to the background-service baseline.
+Chromium's separate first-frame issue remains open.
+
+All five tracked fixture commands exited zero with complete output and drained
+lineages. Heap integrity passed. Checked shutdown, QEMU exit, original launcher
+exit zero and all three read-only filesystem checks passed. Seven existing
+owned files retained exact hashes and UID 1000/GID 100. All 42 native suites and
+the compiled entry audit passed; the existing VMM suite now checks retained
+references, blocked finalizers and concurrent enqueue during batch destruction.
+An independent read-only review found no blocker in the inspected role and
+counter paths. Full bootstrap renewal remains pending.
+
+Evidence: `build/workloads/shutdown-services-20261018/acceptance-audit.json`,
+`review/verified-role-identities.json`, `review/firefox-audio/`, and
+`build/shutdown-services-build-20261018.log`.

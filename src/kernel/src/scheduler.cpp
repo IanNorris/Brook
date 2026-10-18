@@ -3275,6 +3275,7 @@ uint32_t SchedulerSnapshotDebugTasks(DebugTaskSnapshot* out,uint32_t capacity,
         r.pid=p->pid;r.parentPid=p->parentPid;r.tgid=SnapshotTgid(p);
         r.incarnation=p->incarnation;r.groupIncarnation=SnapshotGroup(p);r.launchId=p->launchId;
         r.uid=p->uid;r.euid=p->euid;r.gid=p->gid;r.egid=p->egid;r.kernel=p->isKernelThread;
+        r.systemService=!p->isKernelThread && p->lifecycleRole==ProcessLifecycleRole::Service;
         r.runningOnCpu=p->runningOnCpu;r.state=p->state;r.userTicks=p->userTicks;r.sysTicks=p->sysTicks;
         for(unsigned j=0;j+1<sizeof(r.name)&&p->name[j];++j)r.name[j]=p->name[j];
     }

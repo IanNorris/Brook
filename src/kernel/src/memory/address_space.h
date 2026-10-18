@@ -49,6 +49,13 @@ void AddressSpaceUnref(AddressSpaceState* space);
 // Execute at most one queued finalizer, exclusively from process context.
 bool ProcessCleanupStep();
 void ProcessStartCleanupWorker();
+// One cleanup-lock snapshot. Includes unpublished/retained user AS lifetimes,
+// not just queued work; zero queues alone never proves cleanup is drained.
+struct ProcessCleanupStatus {
+    uint64_t liveUserAddressSpaces,queuedProcesses,queuedAddressSpaces,activeFinalizers;
+    uint64_t completedProcesses,completedAddressSpaces;
+};
+ProcessCleanupStatus ProcessGetCleanupStatus();
 void ProcessQueueDestroy(Process* process);
 // Consuming wait only; caller must retain a kernel region across this wait.
 void ProcessDestroyAndWait(Process* process);

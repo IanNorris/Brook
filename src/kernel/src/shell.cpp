@@ -421,7 +421,7 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
                              uint32_t uidOverride = CredentialUnchanged,
                              uint32_t gidOverride = CredentialUnchanged,
                              bool strace = false, bool straceErrors = false,
-                             bool quiet = false, bool trackLaunch = true)
+                             bool quiet = false, bool trackLaunch = true, bool service = false)
 {
     ExecutableImage image{};
     char executablePath[sizeof(Process::exePath)];
@@ -506,6 +506,7 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
     }
     Process* launcher = ProcessCurrent();
     proc->launchId = trackLaunch && launcher ? launcher->launchId : 0;
+    proc->lifecycleRole = service ? ProcessLifecycleRole::Service : ProcessLifecycleRole::Application;
 
     // Set up compositor placement
     bool skipVfb = g_ttyFull || g_vfbNone;
@@ -1012,6 +1013,7 @@ static int ExecCommand(int argc, const char* const* argv)
         bool straceErrors = false;
         bool runOnce = false;
         bool quiet = false;
+        bool service = false;
 
         // Parse flags before the path
         while (pathIdx < argc) {
@@ -1033,6 +1035,9 @@ static int ExecCommand(int argc, const char* const* argv)
             } else if (StrEq(argv[pathIdx], "--strace-errors")) {
                 straceErrors = true;
                 pathIdx++;
+            } else if (StrEq(argv[pathIdx], "--service")) {
+                service = true;
+                pathIdx++;
             } else if (StrEq(argv[pathIdx], "--once")) {
                 // Idempotent spawn: skip if a process with the same basename
                 // is already running. Used by re-sourceable launcher scripts
@@ -1050,7 +1055,7 @@ static int ExecCommand(int argc, const char* const* argv)
 
         if (pathIdx >= argc)
         {
-            KPrintf("usage: run [--as <name>] [--uid <uid>] [--gid <gid>] [--strace] [--quiet] [--once] <path> [args...]\n");
+            KPrintf("usage: run [--as <name>] [--uid <uid>] [--gid <gid>] [--strace] [--quiet] [--once] [--service] <path> [args...]\n");
             return -1;
         }
 
@@ -1136,10 +1141,10 @@ static int ExecCommand(int argc, const char* const* argv)
             for (int i = 1; i < effArgc && i < 31; ++i)
                 newArgv[i] = effArgv[i];
             return SpawnProcess(shebangPath, effArgc, newArgv, uidOverride, gidOverride,
-                                strace, straceErrors, quiet, !runOnce);
+                                strace, straceErrors, quiet, !runOnce, service);
         }
         return SpawnProcess(shebangPath, effArgc, effArgv, uidOverride, gidOverride,
-                            strace, straceErrors, quiet, !runOnce);
+                            strace, straceErrors, quiet, !runOnce, service);
     }
 
     // Built-in: wait — block until all user processes finish

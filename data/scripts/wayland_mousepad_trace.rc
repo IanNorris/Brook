@@ -1,5 +1,5 @@
 # Brook + mousepad with strace.
 set wm
 set vfb none
-run --once /nix/bin/waylandd
+run --service --once /nix/bin/waylandd
 run --strace /nix/store/n7gxslgrhr7kmwgxigsys49davanf2c6-mousepad-0.7.0/bin/mousepad

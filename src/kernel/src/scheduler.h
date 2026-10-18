@@ -170,7 +170,7 @@ struct DebugTaskSnapshot {
     uint32_t uid,euid,gid,egid;
     int32_t runningOnCpu;
     ProcessState state;
-    bool kernel;
+    bool kernel,systemService;
     char name[32];
 };
 uint32_t SchedulerSnapshotDebugTasks(DebugTaskSnapshot* out,uint32_t capacity,

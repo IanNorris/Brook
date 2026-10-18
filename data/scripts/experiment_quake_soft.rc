@@ -2,5 +2,5 @@
 run /boot/BIN/OSSCHECK
 set wm
 set vfb none
-run --once /nix/bin/waylandd
+run --service --once /nix/bin/waylandd
 run --uid 1000 /nix/bin/brook-yquake2-soft soft +set vid_width 1280 +set vid_height 720 +set s_musicvolume 0.5 +map base1

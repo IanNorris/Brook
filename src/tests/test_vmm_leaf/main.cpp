@@ -113,10 +113,12 @@ void SchedulerUnblock(Process* process) {
     CHECK(expectedCompletion && expectedCompletion->done);
     CHECK(process==expectedCompletion->waiter && process->refCount==1);
     CHECK(unpinnedVnodes==2 && closedVnodes==2);
+    CHECK(ProcessGetCleanupStatus().activeFinalizers!=0);
     ++cleanupWakeups;
 }
 void ProcessDestroyNow(Process* process) {
     CHECK(process==expectedDestroy);
+    CHECK(ProcessGetCleanupStatus().activeFinalizers!=0);
     AddressSpaceUnref(process->addressSpace);
     process->addressSpace=nullptr;
 }
@@ -317,6 +319,8 @@ static void attachTestRange(AddressSpaceState* space,uint64_t begin,MappingKind 
     CHECK(plan.Insert(space->ranges,range));MappingBackingUnref(backing);
 }
 static void addressSpaceLifetime() {
+    const auto baseline=ProcessGetCleanupStatus();
+    CHECK(!baseline.liveUserAddressSpaces&&!baseline.queuedProcesses&&!baseline.queuedAddressSpaces&&!baseline.activeFinalizers);
     auto kernelRoot=table();VmmHostSetKernelRoot(kernelRoot);AddressSpaceKernelInit();
     auto* immortal=AddressSpaceKernel();AddressSpaceRef(immortal);AddressSpaceUnref(immortal);CHECK(!ProcessCleanupStep());
     failAllocation=true;CHECK(!AddressSpaceCreate(17)&&heapAllocations==0);
@@ -339,11 +343,16 @@ static void addressSpaceLifetime() {
     // Managed shared graphics aliases retain their own PTE references.
     CHECK(VmmTryMapPage(old->pageTable,va+12288,window,flags,MemTag::Device)==VmmMapResult::Mapped);
     AddressSpaceUnref(old);CHECK(old->references==1&&!ProcessCleanupStep());
+    CHECK(ProcessGetCleanupStatus().liveUserAddressSpaces==1);
+    CHECK(!ProcessGetCleanupStatus().queuedAddressSpaces); // Retained refs still matter.
     uint64_t identity=old->identity;
     const int ownedAllocations=heapAllocations.load();
     AddressSpaceUnref(old);CHECK(PmmGetRefCount(file)==1&&heapAllocations==ownedAllocations);
+    CHECK(ProcessGetCleanupStatus().queuedAddressSpaces==1);
     Gate ack;pendingAcknowledgement=&ack;
     std::thread cleanup([]{CHECK(ProcessCleanupStep());});ack.wait(1);
+    const auto blocked=ProcessGetCleanupStatus();
+    CHECK(blocked.liveUserAddressSpaces==1&&!blocked.queuedAddressSpaces&&blocked.activeFinalizers==1);
     // Old AS is queued and still owns its pages through the acknowledgement.
     CHECK(PmmGetRefCount(file)==1&&PmmGetRefCount(memfd)==1&&maps(framebuffer)==1);
     auto* replacement=AddressSpaceCreate(17);CHECK(replacement&&replacement->identity!=identity);
@@ -362,6 +371,7 @@ static void addressSpaceLifetime() {
     std::puts("ADDRESS SPACE PASS refs/identity/queued-cleanup/borrowed-backing/reused-pid/OOM");
 }
 static void consumingWaitCleanup() {
+    const auto baseline=ProcessGetCleanupStatus();
     auto root=table();VmmHostSetKernelRoot(root);
     auto* retiring=AddressSpaceCreate(23);lateRetirement=AddressSpaceCreate(24);
     CHECK(retiring&&lateRetirement);
@@ -373,13 +383,21 @@ static void consumingWaitCleanup() {
     child.addressSpace=retiring;child.destroyCompletion=&completion;
     expectedDestroy=&child;expectedCompletion=&completion;
     ProcessQueueDestroy(&child);
+    CHECK(ProcessGetCleanupStatus().queuedProcesses==1);
     CHECK(!completion.done&&heapAllocations==4);
     CHECK(ProcessCleanupStep());
     CHECK(completion.done&&cleanupWakeups==1&&!waiter.refCount);
+    const auto partial=ProcessGetCleanupStatus();
+    CHECK(!partial.activeFinalizers&&!partial.queuedProcesses&&partial.queuedAddressSpaces==1&&partial.liveUserAddressSpaces==1);
+    CHECK(partial.completedProcesses==baseline.completedProcesses+1);
+    CHECK(partial.completedAddressSpaces==baseline.completedAddressSpaces+1);
     CHECK(!PmmGetRefCount(page)&&heapAllocations==1);
     // Work enqueued while draining the finite retirement batch stays queued;
     // it cannot postpone this child's consuming wait indefinitely.
     CHECK(ProcessCleanupStep()&&!ProcessCleanupStep()&&heapAllocations==0);
+    CHECK(!ProcessGetCleanupStatus().liveUserAddressSpaces);
+    CHECK(!ProcessGetCleanupStatus().queuedAddressSpaces);
+    CHECK(ProcessGetCleanupStatus().completedAddressSpaces==baseline.completedAddressSpaces+2);
     expectedDestroy=nullptr;expectedCompletion=nullptr;
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();
     std::puts("ADDRESS SPACE WAIT PASS pin-release-before-wake/waiter-ref/finite-batch");
@@ -1813,5 +1831,7 @@ int main(int argc,char** argv) {
     fileMappingRegistrations();fileMappingGateOom();addressFileGateScope();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
     targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();
     anonymousDiscard();memoryCensus();
+    const auto cleanup=ProcessGetCleanupStatus();
+    CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

@@ -2,5 +2,5 @@
 # Requires the GPU compositor: boot with BROOK_GPU=gl BROOK_COMPOSITE=gpu.
 # Launched via /nix/stk-play.sh (adds Brook virgl env + OpenAL null backend).
 set wm
-run --once /nix/bin/waylandd
+run --service --once /nix/bin/waylandd
 run --uid 1000 /nix/stk-play.sh

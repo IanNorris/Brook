@@ -143,7 +143,7 @@ void SerializeLaunch(Json& json,uint64_t token) {
     SerializeLaunchRecord(json,launch,true);
 }
 void Observe(Json& json,uint32_t mask) {
-    json.text("{\"observation_api\":1,\"windows\":");
+    json.text("{\"observation_api\":1,\"lifecycle_role_api\":1,\"windows\":");
     if(mask&1) {
         auto* windows=static_cast<WmDebugWindow*>(kmalloc(sizeof(WmDebugWindow)*WM_MAX_WINDOWS));
         if(!windows){json.text("{\"error\":\"Snapshot allocation failed\"}");}
@@ -174,7 +174,7 @@ void Observe(Json& json,uint32_t mask) {
                 json.text(",\"launch_id\":\"");json.number(r.launchId);json.text("\",\"name\":");json.string(r.name);
                 const char* states[]={"ready","running","blocked","stopped","terminated"};
                 json.text(",\"state\":");const auto state=static_cast<uint32_t>(r.state);json.string(state<5?states[state]:"unknown");
-                json.boolean("kernel",r.kernel);json.text(",\"running_on_cpu\":");json.signedNumber(r.runningOnCpu);
+                json.boolean("kernel",r.kernel);json.boolean("system_service",r.systemService);json.text(",\"running_on_cpu\":");json.signedNumber(r.runningOnCpu);
                 json.field("user_ticks",r.userTicks);json.field("system_ticks",r.sysTicks);json.text("}");
             }json.text("]}");kfree(tasks);
         }
@@ -242,7 +242,7 @@ bool DebugUiHandleCommand(const char* command) {
     }
     if(*at||!count){Error("Invalid fields");return true;}
     if(count==1&&!strcmp(args[0],"caps")) {
-        Json json;char boot[33];DebugEpochCopy(boot);json.text("{\"boot_id\":");json.string(boot);json.text(",\"ui_api\":1,\"max_requests\":256,\"max_queued\":16,\"dedup_retention\":\"until_reboot\",\"launcher\":true,\"launch_api\":1,\"observation_api\":1,\"frame_epoch_guard\":1,\"apps_api\":1,\"window_actions\":[\"focus\",\"minimize\",\"maximize\",\"restore\",\"close\"]}");json.finish();return true;
+        Json json;char boot[33];DebugEpochCopy(boot);json.text("{\"boot_id\":");json.string(boot);json.text(",\"ui_api\":1,\"max_requests\":256,\"max_queued\":16,\"dedup_retention\":\"until_reboot\",\"launcher\":true,\"launch_api\":1,\"observation_api\":1,\"lifecycle_role_api\":1,\"frame_epoch_guard\":1,\"apps_api\":1,\"window_actions\":[\"focus\",\"minimize\",\"maximize\",\"restore\",\"close\"]}");json.finish();return true;
     }
     if(count<2||!DebugEpochMatches(args[count-1])){Error("Stale guest boot");return true;}
     --count;

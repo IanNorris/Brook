@@ -1,5 +1,5 @@
 # Brook + Ladybird Wayland URL smoke test.
 set wm
 set vfb none
-run --once /nix/bin/waylandd
+run --service --once /nix/bin/waylandd
 run /nix/profile/bin/brook-ladybird https://example.com

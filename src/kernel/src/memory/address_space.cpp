@@ -24,6 +24,12 @@ static AddressSpaceState* g_spaceTail;
 static Process* g_processHead;
 static Process* g_processTail;
 static Process* g_cleanupWorker;
+static ProcessCleanupStatus g_cleanupStatus{};
+ProcessCleanupStatus ProcessGetCleanupStatus() {
+    const auto flags=IrqSpinLockAcquire(&g_cleanupLock);
+    const auto result=g_cleanupStatus;
+    IrqSpinLockRelease(&g_cleanupLock,flags);return result;
+}
 
 void AddressSpaceKernelInit() {
     memset(&g_kernelSpace, 0, sizeof(g_kernelSpace));
@@ -47,6 +53,9 @@ AddressSpaceState* AddressSpaceCreate(uint16_t pid) {
     KMutexInit(&space->mutation);
     space->pageTable = VmmCreateUserPageTable();
     if (!space->pageTable) { kfree(space); return nullptr; }
+    const auto flags=IrqSpinLockAcquire(&g_cleanupLock);
+    ++g_cleanupStatus.liveUserAddressSpaces;
+    IrqSpinLockRelease(&g_cleanupLock,flags);
     return space;
 }
 bool AddressSpaceTryRef(AddressSpaceState* space) {
@@ -113,6 +122,7 @@ void AddressSpaceUnref(AddressSpaceState* space) {
     if (g_spaceTail) g_spaceTail->cleanupNext = space;
     else g_spaceHead = space;
     g_spaceTail = space;
+    ++g_cleanupStatus.queuedAddressSpaces;
     IrqSpinLockRelease(&g_cleanupLock, flags);
     WakeCleanupWorker();
 }
@@ -122,6 +132,7 @@ void ProcessQueueDestroy(Process* process) {
     if (g_processTail) g_processTail->destroyNext = process;
     else g_processHead = process;
     g_processTail = process;
+    ++g_cleanupStatus.queuedProcesses;
     IrqSpinLockRelease(&g_cleanupLock, flags);
     WakeCleanupWorker();
 }
@@ -159,6 +170,10 @@ static void DestroyAddressSpace(AddressSpaceState* space) {
     kfree(space);
     // No AS, page-table, range or filesystem locks remain held here.
     ExecPageCacheTrimIdle();
+    const auto flags=IrqSpinLockAcquire(&g_cleanupLock);
+    --g_cleanupStatus.liveUserAddressSpaces;
+    ++g_cleanupStatus.completedAddressSpaces;
+    IrqSpinLockRelease(&g_cleanupLock,flags);
 }
 bool ProcessCleanupStep() {
     uint64_t flags = IrqSpinLockAcquire(&g_cleanupLock);
@@ -167,21 +182,29 @@ bool ProcessCleanupStep() {
     if (space) {
         g_spaceHead = space->cleanupNext;
         if (!g_spaceHead) g_spaceTail = nullptr;
+        --g_cleanupStatus.queuedAddressSpaces;
     } else if ((process = g_processHead)) {
         g_processHead = process->destroyNext;
         if (!g_processHead) g_processTail = nullptr;
+        --g_cleanupStatus.queuedProcesses;
     }
+    if(space || process)++g_cleanupStatus.activeFinalizers;
     IrqSpinLockRelease(&g_cleanupLock, flags);
     if (space) DestroyAddressSpace(space);
     else if (process) {
         auto* completion = process->destroyCompletion;
         ProcessDestroyNow(process);
+        flags=IrqSpinLockAcquire(&g_cleanupLock);
+        ++g_cleanupStatus.completedProcesses;
+        IrqSpinLockRelease(&g_cleanupLock,flags);
         if (completion) {
             // Final task/window drops enqueue AS jobs. Capture one finite batch
             // before waking waitpid: a new unrelated exec cannot extend it.
             flags = IrqSpinLockAcquire(&g_cleanupLock);
             auto* batch = g_spaceHead;
             g_spaceHead = g_spaceTail = nullptr;
+            g_cleanupStatus.queuedAddressSpaces = 0;
+            // The outer process finalizer remains active through this batch.
             IrqSpinLockRelease(&g_cleanupLock, flags);
             while (batch) {
                 auto* next = batch->cleanupNext;
@@ -196,6 +219,11 @@ bool ProcessCleanupStep() {
             SchedulerUnblock(waiter);
             ProcessUnref(waiter);
         }
+    }
+    if(space || process) {
+        flags=IrqSpinLockAcquire(&g_cleanupLock);
+        --g_cleanupStatus.activeFinalizers;
+        IrqSpinLockRelease(&g_cleanupLock,flags);
     }
     return space || process;
 }

@@ -2128,7 +2128,7 @@ static void LauncherWorker(void*)
             if(!available)result=-2;
             else if (desktop) {
                 char script[512];
-                const char* hdr = "set wm\nset vfb none\nrun --once /nix/bin/waylandd\nrun ";
+                const char* hdr = "set wm\nset vfb none\nrun --service --once /nix/bin/waylandd\nrun ";
                 uint32_t si = 0;
                 while (*hdr && si < sizeof(script) - 2) script[si++] = *hdr++;
                 const char* exec = command;

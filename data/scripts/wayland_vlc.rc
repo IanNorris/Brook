@@ -2,5 +2,5 @@
 # Install vlc-brook-native from the local guest cache first (see experiments.md).
 set wm
 set vfb none
-run --once /nix/bin/waylandd
+run --service --once /nix/bin/waylandd
 run --uid 1000 /nix/profile/bin/brook-vlc /data/videos/big-buck-bunny-720p.mov

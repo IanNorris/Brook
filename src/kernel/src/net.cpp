@@ -3530,6 +3530,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         SchedulerUserBirthStatus(&userBirthClosed,&pendingUserBirths);
         r.text(",\"user_birth_closed\":");r.text(userBirthClosed?"true":"false");
         r.text(",");r.field("pending_user_births",pendingUserBirths);
+        const auto cleanup=ProcessGetCleanupStatus();
+        r.text(",\"cleanup\":{");r.field("live_user_address_spaces",cleanup.liveUserAddressSpaces);
+        r.text(",");r.field("queued_processes",cleanup.queuedProcesses);
+        r.text(",");r.field("queued_address_spaces",cleanup.queuedAddressSpaces);
+        r.text(",");r.field("active_finalizers",cleanup.activeFinalizers);
+        r.text(",");r.field("completed_processes",cleanup.completedProcesses);
+        r.text(",");r.field("completed_address_spaces",cleanup.completedAddressSpaces);r.text("}");
         r.text(",");r.field("process_count",count);
         r.text(",");r.field("running_process_count",running);
         r.text(",");r.field("sample_tick_ms",t.tick);

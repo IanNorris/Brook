@@ -256,6 +256,8 @@ struct ElfBinary
 // non-canonical-as-an-address, and ASCII-distinctive in serial dumps.
 static constexpr uint64_t PROCESS_MAGIC = 0xB0000B5042524F4FULL; // "B   BROO"
 
+enum class ProcessLifecycleRole : uint8_t { Application = 0, Service = 1 };
+
 struct Process
 {
     // Magic word — used by DoSwitch and SchedulerBlock to catch use-after-free
@@ -526,6 +528,10 @@ struct Process
     InputEvent inputQueue[INPUT_QUEUE_SIZE];
     volatile uint32_t inputHead;  // Write index (compositor)
     volatile uint32_t inputTail;  // Read index (process/syscall)
+
+    // Kernel launcher classification, immutable after publication. Fork and
+    // threads inherit it; exec preserves it. This grants no Linux credentials.
+    ProcessLifecycleRole lifecycleRole;
 };
 
 // User backing pages belong to the shared address space, not the allocating

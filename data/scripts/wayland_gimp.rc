@@ -1,5 +1,5 @@
 # Full installed GIMP, with the persistent profile used by desktop acceptance.
 set wm
 set vfb none
-run --once /nix/bin/waylandd
+run --service --once /nix/bin/waylandd
 run /nix/profile/bin/env -u GIMP3_PLUGINDIR HOME=/data/home XDG_CONFIG_HOME=/data/home/.config XDG_CACHE_HOME=/data/home/.cache XDG_DATA_HOME=/data/home/.local/share /nix/profile/bin/gimp-3.0

@@ -1,5 +1,5 @@
 set wm
 set vfb none
 source /boot/SCRIPTS/compat_services.rc
-run --once /nix/bin/waylandd
+run --service --once /nix/bin/waylandd
 run --uid 1000 /nix/bin/brook-office

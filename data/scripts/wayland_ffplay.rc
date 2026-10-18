@@ -4,5 +4,5 @@
 # requirement. Without it, ffplay falls back to software decode naturally.
 set wm
 set vfb none
-run --once /nix/bin/waylandd
+run --service --once /nix/bin/waylandd
 run --uid 1000 /nix/bin/ffplay -autoexit -fs /boot/VIDEOS/sample-5s.mp4

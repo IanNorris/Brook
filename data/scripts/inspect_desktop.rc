@@ -1,5 +1,5 @@
 # Small fresh-build inspection desktop; requires the base Nix disk.
 set wm
 set vfb none
-run --once /nix/bin/waylandd
+run --service --once /nix/bin/waylandd
 # Open Terminal with the taskbar + button, or Calculator from Apps when needed.

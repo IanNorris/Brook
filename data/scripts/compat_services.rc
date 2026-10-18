@@ -1,2 +1,2 @@
 # One Brook-owned bus per desktop session; /tmp is recreated at boot.
-run --once --uid 1000 --gid 100 /nix/bin/brook-dbus --config-file=/nix/bin/brook-session.conf --nofork --address=unix:path=/tmp/brook-session-bus --nosyslog
+run --service --once --uid 1000 --gid 100 /nix/bin/brook-dbus --config-file=/nix/bin/brook-session.conf --nofork --address=unix:path=/tmp/brook-session-bus --nosyslog
