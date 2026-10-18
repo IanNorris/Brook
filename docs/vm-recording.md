@@ -142,3 +142,29 @@ Evidence: `build/workloads/media-regression-bed237cb-20261018/`. Sessions
 recordings `03849c21d4cd4e1e98e626ca7a5e2084` and
 `57383b5f2a5d4060bfccb674bd78c995`. Boot/mode transitions, GPU native-window
 recording, 4K and reset during capture remain open. No final showcase has begun.
+
+## Boot and display modes — 18 October 2026
+
+A native-SDL CPU run started paused with QEMU `-S`. The recorder produced its
+first frame before CPUs resumed, then captured 150 seconds across source modes
+640×480, 1280×800 and 1920×1080. The experiment launcher now forwards additional
+QEMU arguments, including `scripts/run_experiment.sh desktop -S`; a test checks
+argument boundaries and the unchanged default invocation.
+
+All 1,956 H.264 and 7,033 AAC frames decoded with monotonic timestamps. Inspected
+frames show the initial black display, Brook boot logo/progress, desktop and VLC
+playback. The recorder counted 700 coalesced updates and 903 missed encoder
+slots; it received 3,694,606 audio sample frames and filled 3,505,400 with silence,
+including boot/idle intervals. Local audio queue drops, late samples and
+estimated discontinuities were zero. Host cost was about 103 CPU seconds and
+176 MiB peak RSS. These results verify capture continuity through mode changes,
+not smooth playback or source frame rate. The user observed VLC black flashes
+and corruption during this diagnostic run.
+
+VLC's full launch lineage exited, audio became inactive, the original launcher
+returned zero, all three offline filesystem checks passed, and nine saved files
+retained their original hashes and ownership. Evidence:
+`build/workloads/boot-recording-7c72adad-20261018/review/`, session
+`2cab1de4c4e347c5b92792e88a89a6a2`, recording
+`d7913c6603e24dcbbf9f21f490c72558`. GPU native-window recording, 4K and reset
+during capture remain open. No final showcase has begun.

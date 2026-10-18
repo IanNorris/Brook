@@ -13,7 +13,7 @@ case "${1:-desktop}" in
         ;;
     office) scenario=experiment_office ;;
     bootstrap) scenario=experiment_bootstrap ;;
-    *) echo "Usage: $0 [desktop|video|quake-soft|quake-gl3|office|bootstrap]" >&2; exit 2 ;;
+    *) echo "Usage: $0 [desktop|video|quake-soft|quake-gl3|office|bootstrap] [QEMU arguments...]" >&2; exit 2 ;;
 esac
 disks="${BROOK_EXPERIMENT_DISKS:-${ROOT_DIR}/build/experiments/seeds}"
 source_boot="${BROOK_DISK_IMG:-${ROOT_DIR}/brook_disk.img}"
@@ -65,4 +65,4 @@ else
 fi
 exec timeout "${BROOK_EXPERIMENT_TIMEOUT:-600}" "${ROOT_DIR}/scripts/run-qemu.sh" \
     --release "${display_args[@]}" --instance="${instance}" \
-    --real-esp --script "${scenario}"
+    --real-esp --script "${scenario}" "${@:2}"
