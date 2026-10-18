@@ -3526,6 +3526,10 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         BridgeReply r;r.text("{");r.field("total_memory_bytes",total*4096);
         r.text(",");r.field("free_memory_bytes",free*4096);
         r.text(",");r.field("used_memory_bytes",(total-free)*4096);
+        bool userBirthClosed=false;uint32_t pendingUserBirths=0;
+        SchedulerUserBirthStatus(&userBirthClosed,&pendingUserBirths);
+        r.text(",\"user_birth_closed\":");r.text(userBirthClosed?"true":"false");
+        r.text(",");r.field("pending_user_births",pendingUserBirths);
         r.text(",");r.field("process_count",count);
         r.text(",");r.field("running_process_count",running);
         r.text(",");r.field("sample_tick_ms",t.tick);

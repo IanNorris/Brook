@@ -159,3 +159,14 @@ Evidence: `build/workloads/lifecycle-channel-20261018/acceptance-audit.json`,
 `build/lifecycle-channel-host-20261018.log`,
 `build/lifecycle-channel-bridge-tests-20261018.log` and
 `build/lifecycle-channel-bootstrap-observer-20261018.log`.
+
+## Next prerequisite: process birth admission
+
+The [process-birth reservation work](process-birth-shutdown.md) now accounts for
+user processes between PID allocation and scheduler publication. The future
+coordinator can close user admission and wait for those reservations, then take
+its task census. The gate remains open in ordinary use; this is not yet wired
+into launcher/MCP shutdown. Existing processes, pending launcher requests,
+services and mapped/file writers still require coordination. Resource-capacity
+acceptance now verifies PID exhaustion returns an allocation failure rather
+than panicking, followed by full cleanup and successful forks.

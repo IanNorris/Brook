@@ -74,7 +74,7 @@ matches. Base transport paths keep the same host-prepared modes in both images.
 The harness runs the real guest installer, performs an HTTPS clone and pinned
 submodule update, and builds kernel/EFI/modules/bare-metal/native artifacts.
 It validates module imports and requires the explicit native-suite inventory
-(currently 41/41 CTest results) twice, before and
+(currently 42/42 CTest results) twice, before and
 after a clean native rebuild with warm caches. The incremental kernel stage
 is labelled separately from a full compilation.
 

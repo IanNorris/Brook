@@ -734,7 +734,11 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     proc->fxsave.data[24] = 0x80;
     proc->fxsave.data[25] = 0x1F;
 
-    proc->pid = SchedulerAllocPid();
+    proc->pid = SchedulerAllocUserPid();
+    if (!proc->pid) {
+        FreeProcessStruct(proc);
+        return nullptr;
+    }
     proc->pgid = proc->pid;
     proc->sid = proc->pid;
     proc->tgid = proc->pid;         // Process is its own thread group leader
@@ -1000,6 +1004,10 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
     proc->fxsave.data[25] = 0x1F;
 
     proc->pid = SchedulerAllocPid();
+    if (!proc->pid) {
+        FreeProcessStruct(proc);
+        return nullptr;
+    }
     proc->pgid = proc->pid;
     proc->sid = proc->pid;
     proc->tgid = proc->pid;
@@ -1206,7 +1214,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->leaderIncarnation = 0;   // a fork child is its own leader
 
     // Allocate new PID
-    child->pid = SchedulerAllocPid();
+    child->pid = SchedulerAllocUserPid();
     child->parentPid = parent->tgid;
     child->pgid = parent->pgid;      // Inherit process group from parent
     child->sid = parent->sid;         // Inherit session from parent
@@ -1401,7 +1409,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->magic = PROCESS_MAGIC;
     thread->incarnation = NextIncarnation();
     // Allocate TID (threads get unique PIDs but share tgid)
-    thread->pid = SchedulerAllocPid();
+    thread->pid = SchedulerAllocUserPid();
     if (thread->pid == 0)
     {
         FreeProcessStruct(thread);

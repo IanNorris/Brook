@@ -92,7 +92,9 @@ the table distinguishes tested behavior from remaining limitations.
   under investigation. See [filesystem capacity acceptance](docs/filesystem-space.md).
   A [timerfd clock-domain repair](docs/timerfd-clock.md) restores roughly
   23–24 video callbacks per page second on the controlled 24-fps local clip;
-  concurrent playback still slows down. [Presentation diagnostics](docs/firefox-presentation.md)
+  concurrent playback still slows down. In the latest [network-recovery rerun](docs/package-pipeline.md#late-tx-completion-follow-up-18-october),
+  Firefox playback progressed but Chromium's controlled clip stayed at its first
+  frame; that follow-up remains open. [Presentation diagnostics](docs/firefox-presentation.md)
   distinguish media progress, callback counters and VM display output.
   The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and
@@ -102,7 +104,8 @@ the table distinguishes tested behavior from remaining limitations.
   building the kernel, modules and bare-metal tests took 52–54 seconds.
   The [virtio-net TX ownership fix](docs/package-pipeline.md) reduced
   the measured clean-image SDK install from 732 to 236 seconds; compilation
-  remains about 50 seconds.
+  remains about 50 seconds. Current host validation covers 42 suites; both full
+  bootstrap paths still need renewal beyond that pinned 40-suite checkpoint.
 
 - **Desktop identity and package registration:** new apps and Terminal run as
   `brook` by default, with persistent `/data/home`. The installer preserves
@@ -134,7 +137,9 @@ the table distinguishes tested behavior from remaining limitations.
   OS statistics, silent-output PCM capture,
   bounded direct [video/audio recording](docs/vm-recording.md),
   and bounded post-panic memory/register inspection. See the
-  [bridge tools](tools/vm_bridge/README.md).
+  [bridge tools](tools/vm_bridge/README.md). An optional
+  [network-independent flush/status channel](docs/orderly-shutdown.md) now works
+  with the VM network disconnected; orderly launcher/MCP shutdown remains in progress.
 - **Real workloads:** Ladybird browsing, hardware GL3 Quake demos, Wayland
   office applications, and guest-installed VLC playback. App-specific limits
   and the actual validation evidence are recorded in
@@ -155,8 +160,8 @@ the table distinguishes tested behavior from remaining limitations.
 
 ### Kernel
 - **UEFI bootloader** — custom bootloader loads ELF kernel at high virtual addresses
-- **SMP** — symmetric multiprocessing with per-CPU run queues and load balancing
-- **MLFQ scheduler** — multi-level feedback queue loaded as a kernel module, with configurable policy
+- **SMP** — symmetric multiprocessing with per-CPU context and idle threads; the default round-robin policy uses a shared ready queue
+- **Scheduling** — round robin remains the default. An optional MLFQ module has a [safety audit and integration blockers](docs/mlfq-safety.md)
 - **Virtual memory** — 4-level paging, per-PID ownership tracking, guard pages, demand-zero private anonymous mmap, on-demand mprotect, sparse ELF segments and COW reuse of initialized executable pages
 - **Kernel heap** — first-fit kmalloc/kfree allocator with coalescing; kmutex, krwlock, ksemaphore
 - **Loadable kernel modules** — drivers compiled separately and loaded from disk at boot (Phase 1 from initrd, Phase 2 from /boot/drivers)

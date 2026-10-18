@@ -18,6 +18,7 @@
 #include "device.h"
 #include "sync/krwlock.h"
 #include "kvmclock.h"
+#include "process_ids.h"
 
 #include <stdint.h>
 
@@ -330,15 +331,9 @@ extern "C" void ProcessDumpFrameMappers(uint64_t targetPhys)
     SerialPrintf("  --- end reverse-map (%u mapper PTE(s)) ---\n", hits);
 }
 
-// Next PID to allocate.
-static uint16_t g_nextPid = 1;
-
-// PID recycling: stack of freed pids in the [1, MAX_PROCESSES) range.
-// Without recycling g_nextPid grows unboundedly past MAX_PROCESSES, which
-// breaks any g_sigHandlers[tgid] / g_pidToProcess[tgid] indexing. We keep
-// PIDs bounded so signal-handler tables never overflow.
-static uint16_t g_pidFreeStack[MAX_PROCESSES];
-static uint32_t g_pidFreeCount = 0;
+// PID allocation, recycling and unpublished user-birth leases share one lock.
+// No PID escapes a shutdown admission check before acquiring its reservation.
+static ProcessIdPool<MAX_PROCESSES> g_processIds;
 static SchedLock g_pidLock;
 
 // Guard: timer ticks are ignored until SchedulerStart sets this.
@@ -1079,6 +1074,13 @@ void SchedulerAddProcess(Process* proc)
                     "Process '%s' pid=%u not registered.\n",
                     MAX_PROCESSES, proc->name, proc->pid);
     }
+    // Publish before dispatch/removal can recycle this PID. Lock order is
+    // ready -> registry -> PID; allocation/release never takes another lock
+    // while holding PID. A shutdown fence must wait for these leases before
+    // checking the registry for remaining userspace tasks.
+    uint64_t pidFlags=SchedLockAcquire(g_pidLock);
+    g_processIds.Publish(proc->pid);
+    SchedLockRelease(g_pidLock,pidFlags);
     SchedLockRelease(g_allProcLock, alf1);
     SchedLockRelease(g_readyLock, birthFlags);
 
@@ -2706,35 +2708,33 @@ int ProcessSendSignalToGroup(uint16_t pgid, int signum)
     return static_cast<int>(count);
 }
 
-uint16_t SchedulerAllocPid()
+static uint16_t AllocatePid(bool user)
 {
-    uint64_t f = SchedLockAcquire(g_pidLock);
-    uint16_t pid;
-    if (g_pidFreeCount > 0)
-    {
-        pid = g_pidFreeStack[--g_pidFreeCount];
-    }
-    else
-    {
-        pid = g_nextPid++;
-        if (pid >= MAX_PROCESSES)
-        {
-            SchedLockRelease(g_pidLock, f);
-            KernelPanic("SCHED: pid %u exceeds MAX_PROCESSES=%u and no "
-                        "freed pids available\n", pid, MAX_PROCESSES);
-        }
-    }
-    SchedLockRelease(g_pidLock, f);
-    return pid;
+    uint64_t flags=SchedLockAcquire(g_pidLock);
+    uint16_t pid=g_processIds.Allocate(user);
+    SchedLockRelease(g_pidLock,flags);
+    return pid; // Exhaustion is an allocation failure, never a kernel panic.
 }
+uint16_t SchedulerAllocPid() { return AllocatePid(false); }
+uint16_t SchedulerAllocUserPid() { return AllocatePid(true); }
 
+uint32_t SchedulerSetUserBirthClosed(bool closed)
+{
+    uint64_t flags=SchedLockAcquire(g_pidLock);
+    uint32_t pending=g_processIds.SetUserClosed(closed);
+    SchedLockRelease(g_pidLock,flags);return pending;
+}
+void SchedulerUserBirthStatus(bool* closed,uint32_t* pending)
+{
+    uint64_t flags=SchedLockAcquire(g_pidLock);
+    *closed=g_processIds.UserClosed();*pending=g_processIds.Pending();
+    SchedLockRelease(g_pidLock,flags);
+}
 void SchedulerFreePid(uint16_t pid)
 {
-    if (pid == 0 || pid >= MAX_PROCESSES) return;
-    uint64_t f = SchedLockAcquire(g_pidLock);
-    if (g_pidFreeCount < MAX_PROCESSES)
-        g_pidFreeStack[g_pidFreeCount++] = pid;
-    SchedLockRelease(g_pidLock, f);
+    uint64_t flags=SchedLockAcquire(g_pidLock);
+    g_processIds.Release(pid);
+    SchedLockRelease(g_pidLock,flags);
 }
 
 void SchedulerRequestFatalSignal(Process* anchor, int signal)

@@ -1264,3 +1264,13 @@ Separate media startup, input delivery and profile state before attributing this
 to networking or calling browser playback accepted. Retain the candidate's
 screenshots and fixture reports; no playback performance claim follows from
 successful downloads.
+
+### Process admission and PID capacity during shutdown
+
+[User-birth reservations and recoverable PID exhaustion](process-birth-shutdown.md)
+now pass two isolated capacity/reuse rounds and a thread-publication probe. The
+internal closed gate is host-model tested but not yet used by the live lifecycle
+coordinator. Finish app/save/close and launch-queue handling, service teardown,
+waiting for admitted births, and a final writer barrier before wiring power
+actions. Refine PID exhaustion errno (currently inherited ENOMEM) separately.
+This does not implement OOM victim selection or repair MLFQ policy replacement.

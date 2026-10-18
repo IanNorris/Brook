@@ -335,3 +335,7 @@ target_compile_options(test_path_walk PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src
 add_host_test(test_lifecycle_channel)
 target_compile_options(test_lifecycle_channel PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 set_tests_properties(test_lifecycle_channel PROPERTIES TIMEOUT 15)
+
+add_host_test(test_process_ids)
+target_compile_options(test_process_ids PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+set_tests_properties(test_process_ids PROPERTIES TIMEOUT 15)
