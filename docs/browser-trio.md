@@ -112,3 +112,125 @@ process groups remain part of that barrier. Six tests cover late helpers,
 ambiguous close delivery, missing lineage, boot change, truncated census and
 expired observations. It neither kills processes nor stops the VM. Checked
 shutdown and offline filesystem checks remain separate requirements.
+
+
+## Permission-kernel refresh
+
+The access-inquiry kernel was rechecked in two isolated eight-vCPU, 4-GiB
+software-Wayland sessions. Kernel SHA-256:
+`50fe3e571183c246225af8cbe724133394f8bdd3ce71a5afd7dbcdf997be368e`, with all
+twelve frozen modules matching ABI 18. The host launcher/docs revision was
+`36b482b7`; kernel source remains the accepted `37cccf60` checkpoint. These runs
+used host-backed private clones of the accepted application disks, retaining
+existing profiles. They are not fresh package/profile installation tests or
+matched startup benchmarks. Speaker output was disabled throughout.
+
+All three applications launched through the normal catalogue. The first
+observed actual-app windows arrived after approximately 16.3 seconds for Firefox,
+10.4 seconds for Chromium and 5.9 seconds for VSCodium. Launches were sequential;
+each also had a separate 500-ms startup capture. The three captures contain
+419/402/402 CPU samples and 3,122/3,209/3,734 context switches, respectively,
+with zero producer drops and matching event counts. A separate concurrent-playback
+capture retained 410 CPU samples and 8,343 switches without drops. These are
+short windows, not whole-startup CPU-time estimates. Most timer samples hit idle
+loops; executable-page-cache adoption appeared in the Chromium/Codium windows,
+but the sample and IRQ-masking limits do not establish a bottleneck ranking.
+
+VSCodium opened a new test file through native input, edited it and saved exact
+bytes with UID:GID 1000:100 and mode 0600. Its SHA-256 is
+`f04b724d98dbda2b8474f3b223204d7a4883fb8756fe7b18f43d335975fa23f9`.
+The initial multiline `type` action lost line breaks and failed independent
+byte verification. That terminal failure is retained as an input diagnostic.
+Explicit per-line typing, Escape and settled Enter actions then saved the exact
+intended three lines. The cause of the multiline-input failure has not been
+isolated; general text delivery is not newly accepted by this follow-up.
+
+### Audio and presentation measurements
+
+Each browser played the controlled 640×360, 24-fps VP9/48-kHz Opus fixture while
+the other browser and Codium stayed open. No screenshots or CPU captures occurred
+during the ten-second PCM intervals. The host captured stereo output at 44.1 kHz.
+
+| Single-browser playback | Firefox | Chromium |
+| --- | ---: | ---: |
+| Captured audio frames | 441,127 | 441,185 |
+| Longest digital-silent interval | About 70 ms | No silent 10-ms bins |
+| Media seconds per page second | 0.993 | 0.998 |
+| Browser total video frames per page second | 23.91 | 23.97 |
+| Video-frame callbacks per page second | 1.20 | 1.01 |
+
+Firefox's seven silent 10-ms bins occurred at approximately 8.84–8.91 seconds
+into its capture. Chromium's tone estimate was 440.3 Hz; Firefox's whole-capture
+estimate was 436.8 Hz including the gap. Those estimates do not establish
+sample-rate correctness or glitch-free playback. Pause yielded an inactive
+zero-frame stream for Firefox and an active but entirely silent stream for
+Chromium. After full application exit, both sessions had inactive zero-frame
+output. Stream-active metadata describes the capture interval, not necessarily
+its final instant.
+
+The buffered source samples also confirmed a concurrent-playback round, with
+about 13.2 seconds of overlap on the shared guest realtime clock. Firefox
+advanced 0.552 media seconds per page second over its 19.655-second source
+interval; Chromium advanced 0.994 over 17.101 seconds. Frame callbacks remained
+low, about 1.17 and 0.82 per page second. Some Firefox samples reported hidden
+while focused, including during its single-browser playback check. Browser
+frame totals, callbacks and actual desktop updates remain separate evidence;
+the screenshots sometimes retain earlier client pixels after titles or page
+telemetry advance. This renews audio delivery and cleanup acceptance, not smooth
+concurrent playback, compositor presentation rate or the visibility fix.
+
+### Cold persistence and application cleanup
+
+Before close, both browsers navigated to read-only fixture URLs. After checked
+shutdown and a cold boot of the same private disks, read-only URLs without
+marker arguments retrieved each browser's distinct synthetic localStorage
+value. The Codium file's exact bytes and ownership were checked before launching
+any application. All three then ran together again; untruncated task censuses
+verified UID/EUID 1000 and GID/EGID 100 for their recorded non-kernel launch
+lineages. This is synthetic storage/document persistence, not real-site cookies.
+
+During that cold run, GIMP also launched normally and visibly reopened the saved
+XCF and painted mark. After its full lineage exited, Writer launched and visibly
+reopened the original ODT beside the three still-running applications. Its first
+capture showed the initial empty page despite the updated title; a later native
+capture displayed all three saved paragraphs. Document readiness was accepted
+from the painted content, not the title alone. See the refreshed
+[GIMP and Writer captures](application-regressions.md#gimp-and-document-persistence).
+
+The review run drained all three complete UI launch lineages. The cold run
+drained all five recorded lineages, including the already-closed GIMP. Both
+passed post-exit audio and heap checks, checked filesystem/device sync, QEMU and
+launcher exit zero, serial kernel/device/user-fault audits, and FAT plus both
+ext2 read-only checks. Offline inode/data inspection verified UID:GID 1000:100
+and unchanged hashes for the four original documents and the new Codium file.
+Eight accepted tracked commands had terminal zero status, drained original/full
+lineages, both EOFs and no gaps or dropped bytes. The separate failed multiline
+input diagnostic is excluded from those eight passing receipts.
+
+Evidence: `build/workloads/browser-permissions-20261018/acceptance-audit.json`,
+with review session `1318aefd28c44f33ba50c840e8af1361` and cold session
+`999282bb53c44ac89aba8191568a8817`. Profiles, audio, source batches, native input
+intents and captures remain under `review/` and `cold/`. The loopback fixture
+server exited zero after both VMs stopped. No kernel code changed for this
+refresh; the [matching full bootstrap](bootstrap.md#40-suite-bootstrap-refresh-after-permission-checks-2026-10-18)
+acceptance still applies. Forced-exit media tests, long-session workloads,
+real-site persistence, browser presentation and complete identity isolation
+retain their separate outstanding scope.
+
+### Reusable fixture server
+
+```sh
+python3 scripts/workloads/browser_media_server.py \
+  --output build/workloads/browser-check/fixture \
+  --clip /absolute/path/to/controlled-clip.webm
+```
+
+Use a new directory below `build/`. The server binds host loopback on a free
+port and records it, media/page hashes and PID in `servers.json`. Point the VM at
+`http://10.0.2.2:PORT/?phase=NAME`; `write=1&marker=VALUE` explicitly seeds the
+synthetic storage value, while `write=0` only reads it. Keep the same server
+process/port alive across the cold boot so the origin stays constant. Reports
+include source timestamps and arrive in a batch after Pause; HTTP receipt time
+must not be used as video FPS. Touch `OUTPUT/stop-server` to shut it down. The
+actual browser runs and a loopback GET/POST probe exercised this helper. It does
+not start, stop or control any VM.

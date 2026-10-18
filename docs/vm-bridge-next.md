@@ -156,6 +156,17 @@ print base64. The guarantee applies to payloads owned by the bridge's schema.
 Update the local skill/examples to handle references or explicit image blocks
 without serializing a complete media-bearing MCP envelope as text.
 
+### Text input verification gap
+
+The [permission-kernel workload refresh](browser-trio.md#permission-kernel-refresh)
+retained a native Codium failure where a multiline `type` action delivered the
+words but lost line breaks. Explicit per-line typing with Escape, settled Enter
+and a final save passed exact byte verification. The cause remains unisolated;
+injection completion does not establish the editor's resulting text. Keep this
+as an integration regression before promising reliable multiline text entry.
+After uncertain input, inspect the current document and record a new deliberate
+action instead of replaying an old mutation. No clipboard fallback is implied.
+
 ## Observation bundles
 
 Extend `vm_observe` with selectable components, for example:

@@ -720,5 +720,8 @@ a later exec. Actual executable leaf checks, pinned CWD/dirfds, nonroot chown,
 parent setgid inheritance, runtime directories, other filesystem policies and
 Nix protection remain open. Both full bootstrap paths subsequently passed at
 this source revision, as recorded in the [40-suite refresh](bootstrap.md#40-suite-bootstrap-refresh-after-permission-checks-2026-10-18).
-Browser concurrency acceptance has not been renewed on this kernel; its earlier
-pinned results apply only to their recorded revisions. Login/accounts remain deferred.
+The subsequent [application refresh](browser-trio.md#permission-kernel-refresh)
+renewed controlled three-app concurrency, synthetic storage/document persistence,
+GIMP/Writer reopen and full-lineage close on this same kernel. It also retained
+the measured audio/presentation and native-input limits; real-site cookies and
+complete identity isolation remain unaccepted. Login/accounts remain deferred.

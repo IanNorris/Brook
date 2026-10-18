@@ -1,7 +1,8 @@
 # Application regressions — 2026-10-18
 
 Tests use isolated eight-vCPU, 4-GiB software-Wayland VMs. Earlier runs use
-RAM-backed host disks; the access-inquiry follow-up uses host-backed clones. Applications launch through the installed catalogue as Brook, UID 1000.
+RAM-backed host disks; the access-inquiry and browser-permission follow-ups use
+host-backed clones. Applications launch through the installed catalogue as Brook, UID 1000.
 These are correctness observations, not matched startup benchmarks.
 
 ## GIMP and document persistence
@@ -36,7 +37,15 @@ After checked shutdown, independent disk inspection verified all four saved
 document hashes and Brook ownership, and all three filesystem checks passed.
 Local evidence: `build/workloads/access-checks-20261018/acceptance-audit.json`.
 
-![GIMP reopening the saved XCF after cold boot](images/brook_gimp_cold_reopen_1080.png)
+The subsequent [permission-kernel browser refresh](browser-trio.md#permission-kernel-refresh)
+renewed actual XCF reopen on that same ABI-18 kernel, with Firefox, Chromium and
+Codium still open. The saved painted mark was visible; native close drained
+GIMP's full lineage. The original ODT also reopened visibly in Writer after
+GIMP exited. Both documents retained their hashes and 1000:100 ownership after
+the final full-lineage close, checked shutdown, serial and filesystem checks.
+Local evidence: `build/workloads/browser-permissions-20261018/cold/`.
+
+![GIMP reopening the saved XCF after cold boot](images/brook_gimp_permissions_1080.png)
 
 Native 1920×1080 capture. The black mark in the upper-right transparent margin
 is the saved brush edit used to distinguish this file from its source.
@@ -45,7 +54,7 @@ LibreOffice Writer accepted native text entry and saved an ODT. Independent ZIP,
 mimetype and XML checks verified the exact three paragraphs. The ODT retained
 its hash and Brook ownership across cold boot and reopened visibly in Writer.
 
-![Writer reopening the saved regression document](images/brook_writer_saved_1080.png)
+![Writer reopening the saved regression document](images/brook_writer_permissions_1080.png)
 
 Native 1920×1080 capture, with no resizing or post-processing.
 

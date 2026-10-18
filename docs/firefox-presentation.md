@@ -133,3 +133,23 @@ copy-based deployment. Canonical file/directory modes and launcher bytes were
 verified. Package tools and app registrations were unchanged. This is not App
 Gallery installation/recovery acceptance. The rejected disks were archived;
 the final disk copy was hash-verified before releasing its temporary RAM storage.
+
+
+## Permission-kernel follow-up
+
+The [browser refresh](browser-trio.md#permission-kernel-refresh) on kernel
+`50fe3e571183c246225af8cbe724133394f8bdd3ce71a5afd7dbcdf997be368e`
+reproduced the distinction: single-browser media progressed near one second
+per page second and reported about 24 video frames per page second, while
+Firefox/Chromium frame callbacks remained about 1.20/1.01 per page second.
+Firefox again reported hidden in some focused samples. Its ten-second PCM
+capture contained an approximately 70-ms silent interval; Chromium's had no
+silent 10-ms bins. These captures had no screenshot/profile activity during PCM.
+
+In the source-timestamped concurrent round, Firefox progressed 0.552 media
+seconds per page second while Chromium remained at 0.994. A separate 500-ms
+runtime profile retained 410 CPU samples and 8,343 context switches without
+producer drops. Short windows and IRQ-masking bias still prevent an unbiased
+CPU/blocked-time attribution. Next diagnostics should connect Wayland callback
+requests, timer dispatch, client commits and native display updates; neither
+compositor-loop intervals nor browser frame totals prove actual video FPS.

@@ -6,9 +6,14 @@ const params=new URLSearchParams(location.search), phase=params.get('phase'),
       noisy=params.get('status')==='1', video=document.querySelector('video'),
       status=document.querySelector('#status');
 let samples=[], timer=null, lastText=0, callbacks=0, lastBatch=null;
+let storage=null, storageError=null;
+try {
+  if(params.get('write')==='1')localStorage.setItem('brook-media-marker',params.get('marker'));
+  storage=localStorage.getItem('brook-media-marker');
+} catch(error) { storageError=String(error); }
 function sample(){
   const q=video.getVideoPlaybackQuality();
-  return {phase,performance_ms:performance.now(),realtime_ms:Date.now(),
+  return {phase,storage,storageError,performance_ms:performance.now(),realtime_ms:Date.now(),
     visibility:document.visibilityState,has_focus:document.hasFocus(),
     t:video.currentTime,duration:video.duration,frames:q.totalVideoFrames,
     dropped:q.droppedVideoFrames,rvfc:typeof video.requestVideoFrameCallback==='function'?callbacks:null,

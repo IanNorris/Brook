@@ -56,7 +56,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Included in fresh experiment images; HTTPS/JavaScript and YouTube audio through the normal launcher, including pause/resume; synthetic site storage survives reboot; intermittent audio gaps remain |
 | [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
 | [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation and cold-boot save/load verified; music output, normal quit and forced-exit cleanup checked; longer-session gameplay remains experimental |
-| [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, save/reopen and normal exit verified alongside Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
+| [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, cold save/reopen and normal exit verified alongside Firefox and Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
 | [Blender](https://www.blender.org/) | 5.1.1 | 🚧 Blocked | Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen (including cold boot) and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
@@ -75,7 +75,7 @@ the table distinguishes tested behavior from remaining limitations.
   three native close cycles, including a reboot, release every tested helper.
   Broader memory-pressure testing and startup performance work remain.
   Firefox, Chromium and VSCodium have now also passed a three-app cold-persistence
-  and clean-exit check; [results and limitations](docs/browser-trio.md).
+  and clean-exit check on the permission kernel; [results and limitations](docs/browser-trio.md#permission-kernel-refresh).
 
 - **Modern browsers:** stock Firefox and Chromium render real HTTPS websites
   with working input and JavaScript. Chromium now plays YouTube video and audio,
@@ -136,12 +136,12 @@ the table distinguishes tested behavior from remaining limitations.
   office applications, and guest-installed VLC playback. App-specific limits
   and the actual validation evidence are recorded in
   [experiment notes](docs/experiments.md).
-- **Self-hosting:** The clean-image acceptance path installs its SDK through
-  guest `nix-install`, clones and builds Brook, passes all 14 native tests,
-  then boots the guest-built kernel and passes them again. Offline checks of
-  both filesystems pass before and after that boot. Both clean-image and
-  prepared-SDK paths passed at revision `3c0ea82`; see
-  [bootstrap testing](docs/bootstrap.md) for the validation scope.
+- **Self-hosting:** Both clean-image and prepared-SDK paths passed at pinned
+  revision `37cccf60`. The clean image installs its SDK through `nix-install`;
+  both clone and build Brook, pass all 40 native suites twice, then boot their
+  guest-built kernels and pass the suites again. Checked shutdown and offline
+  FAT/ext2 checks passed for both boots; see [bootstrap testing](docs/bootstrap.md)
+  for the validation scope.
 - **Storage correctness and speed:** unlink-while-open, rename-overwrite,
   directory removal and inode reuse now have guest lifetime checks plus offline
   filesystem verification. A short eight-worker RAM-backed
@@ -251,10 +251,10 @@ New captures use native 1920×1080 without upscaling. See
 <p align="center"><em>Firefox, Chromium and VSCodium together — Brook user, software Wayland, 4 GiB VM and native 1920×1080 capture. Document and synthetic site storage survived reboot; normal exits verified.</em></p>
 
 <p align="center">
-  <a href="docs/images/brook_gimp_workflow_1080.png"><img src="docs/images/brook_gimp_workflow_1080.png" alt="GIMP 3 running as Brook with the transparent B image saved as XCF and exported as PNG" width="960"></a>
+  <a href="docs/images/brook_gimp_permissions_1080.png"><img src="docs/images/brook_gimp_permissions_1080.png" alt="GIMP reopening the saved XCF after cold boot, showing the transparent B and its painted mark" width="960"></a>
 </p>
 
-<p align="center"><em>GIMP 3 as brook — XCF persistence and PNG export, captured at native 1920×1080</em></p>
+<p align="center"><em>GIMP 3 — saved XCF reopened on the current permission kernel, captured at native 1920×1080</em></p>
 
 <p align="center">
   <a href="docs/images/brook_settings_midnight_1080.png"><img src="docs/images/brook_settings_midnight_1080.png" alt="Brook Settings with native window chrome and the Midnight desktop theme applied" width="960"></a>
@@ -269,10 +269,10 @@ New captures use native 1920×1080 without upscaling. See
 <p align="center"><em>Native desktop at 200% scale with GPU composition — captured at 1920×1080; application content retains its existing scale</em></p>
 
 <p align="center">
-  <a href="docs/images/brook_libreoffice_writer_1080.png"><img src="docs/images/brook_libreoffice_writer_1080.png" alt="A real document typed in LibreOffice Writer running on Brook, without debug windows" width="960"></a>
+  <a href="docs/images/brook_writer_permissions_1080.png"><img src="docs/images/brook_writer_permissions_1080.png" alt="LibreOffice Writer reopening the preserved document after cold boot on Brook" width="960"></a>
 </p>
 
-<p align="center"><em>LibreOffice Writer 25.8.5.2 editing a document through Wayland — native 1920×1080 capture, with no automatically opened debug windows</em></p>
+<p align="center"><em>LibreOffice Writer 25.8.5.2 reopening the preserved document through Wayland — native 1920×1080 capture</em></p>
 
 <p align="center">
   <a href="docs/images/brook_app_gallery_1080.png"><img src="docs/images/brook_app_gallery_1080.png" alt="Brook App Gallery after installing VLC from the Nix binary cache on fresh disks" width="1280"></a>
