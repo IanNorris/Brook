@@ -72,5 +72,65 @@ class ObserverTests(unittest.TestCase):
             self.run_observer('export', live_error=RuntimeError('VM process is no longer running'))
 
 
+class TrackedCommandTests(unittest.TestCase):
+    @staticmethod
+    def status(text="", offset=0, *, state="running", live=1, eof=False, code=None):
+        return {"stage": "committed", "state": state,
+            "exit": {"code": code, "signal": None}, "guest": {"live_tasks": live},
+            "stdout": {"text": text, "next_offset": offset, "eof": eof},
+            "stderr": {"text": "", "next_offset": 0, "eof": eof}}
+
+    def test_resume_uses_same_identity_and_byte_cursor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            job = acceptance.TrackedCommand(directory, "fixture", ["/bin/test"])
+            with patch.object(acceptance.server, "guest_run") as submit, \
+                 patch.object(acceptance.server, "job_status", side_effect=[
+                     self.status("one", 3),
+                     self.status("two", 6, state="completed", live=0, eof=True, code=0)]) as status:
+                self.assertEqual(job.poll(), "one")
+                self.assertFalse(job.complete())
+                resumed = acceptance.TrackedCommand(directory, "fixture", ["/bin/test"])
+                self.assertEqual(resumed.poll(), "onetwo")
+                self.assertTrue(resumed.complete())
+                self.assertEqual(submit.call_count, 1)
+                self.assertEqual(status.call_args.kwargs["stdout_offset"], 3)
+            with self.assertRaisesRegex(RuntimeError, "another session or argv"):
+                acceptance.TrackedCommand(directory, "different", ["/bin/test"])
+
+    def test_exit_marker_cannot_replace_drained_lineage_and_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = acceptance.TrackedCommand(Path(tmp), "fixture", ["/bin/test"])
+            for live, eof in [(1, True), (0, False)]:
+                job.evidence["status"] = self.status("BOOTSTRAP_EXIT 0", 16,
+                    state="completed", live=live, eof=eof, code=0)
+                self.assertFalse(job.complete())
+
+    def test_failure_and_missing_output_prevent_acceptance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("failure", "gap"):
+                directory = Path(tmp) / name
+                directory.mkdir()
+                job = acceptance.TrackedCommand(directory, "fixture", ["/bin/test"])
+                r = self.status(state="completed", live=0, eof=True, code=1 if name == "failure" else 0)
+                if name == "gap":
+                    r["stdout"]["dropped_bytes"] = 4
+                with patch.object(acceptance.server, "guest_run"), \
+                     patch.object(acceptance.server, "job_status", return_value=r), \
+                     self.assertRaises(RuntimeError):
+                    job.poll()
+
+    def test_unknown_upload_observation_reuses_persisted_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = acceptance.TrackedCommand(Path(tmp), "fixture", ["/bin/test"])
+            with patch.object(acceptance.server, "guest_run") as submit, \
+                 patch.object(acceptance.server, "job_status", side_effect=[
+                     {"stage": "commit_dispatched", "state": "unknown"}, self.status()]):
+                job.poll()
+                self.assertFalse(job.complete())
+                job.poll()
+                self.assertEqual(submit.call_args_list[0], submit.call_args_list[1])
+
+
 if __name__ == '__main__':
     unittest.main()

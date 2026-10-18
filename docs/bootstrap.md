@@ -1007,3 +1007,19 @@ counts; checked shutdowns and all offline filesystem checks passed. Guest-clock
 phase timings were 0.117 seconds for the 64-MiB write, 0.303 for the read and
 0.501 for small files. This is host-RAM-backed I/O, not physical SSD throughput.
 Evidence: `build/io-bench/accepted-5a363c6-ram/result.json`.
+
+
+### Command completion receipts (2026-10-18)
+
+The acceptance harness now launches build and verification scripts as structured
+VM bridge jobs. It persists each request identity, stdout/stderr byte cursors
+and observed output in `command-evidence.json`. An ambiguous upload observation
+reuses the same request. Output gaps, failed exits, missing required markers,
+unread output or remaining lineage tasks prevent acceptance; a printed success
+marker alone is insufficient. Serial logs remain the source for kernel/device
+fault auditing. Observer unit tests cover cursor recovery, ambiguous submission,
+output loss and the distinction between leader exit and drained descendants.
+
+These SDK installation/build tests deliberately run as root on isolated disks;
+they do not establish unprivileged compilation or package-install permissions.
+Full acceptance with the current 38-suite source is pending below this change.

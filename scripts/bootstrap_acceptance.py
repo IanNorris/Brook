@@ -18,6 +18,7 @@ import tempfile
 import shutil
 import threading
 import time
+import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools/vm_bridge"))
@@ -253,7 +254,58 @@ def wait_existing_vm(data, timeout=30):
     raise TimeoutError("Existing QEMU did not exit after stop")
 
 
-def monitor(directory, session, data, deadline):
+class TrackedCommand:
+    """Persist one job identity, byte cursors and complete observed output."""
+    def __init__(self, directory, session, argv):
+        self.path = directory / "command-evidence.json"
+        if self.path.exists():
+            self.evidence = json.loads(self.path.read_text())
+            request = self.evidence["request"]
+            if request["session"] != session or request["argv"] != argv:
+                raise RuntimeError("Existing bootstrap command targets another session or argv")
+        else:
+            # SDK installation and boot verification are explicitly root tests;
+            # this does not establish unprivileged bootstrap acceptance.
+            self.evidence = {"request": dict(session=session, argv=argv, uid=0,
+                request_id=uuid.uuid4().hex, wait_s=1), "stdout": "", "stderr": "",
+                "stdout_offset": 0, "stderr_offset": 0, "status": {}}
+            write(self.path, self.evidence)
+
+    def poll(self):
+        e = self.evidence
+        request = e["request"]
+        if e["status"].get("stage") != "committed":
+            # Same identity recovers an interrupted upload, never a new launch.
+            server.guest_run(**request)
+        r = server.job_status(request["session"], request["request_id"],
+            stdout_offset=e["stdout_offset"], stderr_offset=e["stderr_offset"],
+            output_limit=16384, wait_s=0)
+        for name in ("stdout", "stderr"):
+            stream = r.get(name, {})
+            if stream.get("dropped_bytes") or stream.get("gaps"):
+                write(self.path.with_suffix(".output-gap.json"), r)
+                raise RuntimeError("Bootstrap command output was lost; acceptance is unproven")
+            e[name] += stream.get("text", "")
+            e[name+"_offset"] = stream.get("next_offset", e[name+"_offset"])
+        e["status"] = r
+        write(self.path, e)
+        if r.get("state") in {"failed", "rejected", "cancelled", "lost"}:
+            raise RuntimeError(f"Bootstrap command cannot complete: {r.get('state')}; see {self.path}")
+        if r.get("state") == "completed" and (r.get("exit", {}).get("code") != 0
+                or r.get("exit", {}).get("signal") is not None):
+            raise RuntimeError(f"Bootstrap command exit failure; see {self.path}")
+        return e["stdout"]
+
+    def complete(self):
+        r = self.evidence["status"]
+        return (r.get("state") == "completed" and r.get("exit", {}).get("code") == 0
+                and r.get("exit", {}).get("signal") is None
+                and r.get("guest", {}).get("live_tasks") == 0
+                and all(r.get(name, {}).get("eof") and not r[name].get("read_error")
+                        for name in ("stdout", "stderr")))
+
+
+def monitor(directory, session, data, deadline, job=None):
     started = time.monotonic()
     stages, snapshots, profiles = [], [], []
     active = None
@@ -263,9 +315,11 @@ def monitor(directory, session, data, deadline):
     last_snapshot = 0
     seen = 0
     serial = Path(data["serial_log"])
+    exit_seen = False
     while time.monotonic() - started < deadline:
-        text = serial.read_text(errors="replace")
-        if re.search(r'BRO176-MAP(?:LEAK|UNDERFLOW)|SCHED: exit_group timeout', text):
+        serial_text = serial.read_text(errors="replace")
+        text = job.poll() if job else serial_text
+        if re.search(r'BRO176-MAP(?:LEAK|UNDERFLOW)|SCHED: exit_group timeout', serial_text):
             raise RuntimeError('Guest mapped-page accounting or thread-quiescence failure; VM retained for diagnosis')
         markers = re.findall(r"^BOOTSTRAP_(BEGIN|END|EXIT) ([^\r\n]+)", text, re.M)
         for kind, payload in markers[seen:]:
@@ -282,13 +336,17 @@ def monitor(directory, session, data, deadline):
                 print(f"Completed {name}: {seconds}s", flush=True)
             elif kind == "EXIT":
                 rc = int(payload)
-                write(directory / "stage-results.json", {"exit": rc, "stages": stages,
-                      "snapshots": snapshots, "profiles": profiles})
                 if rc:
-                    raise RuntimeError(f"Guest bootstrap exit {rc}; see {serial}")
+                    raise RuntimeError(f"Guest bootstrap exit {rc}; see command/serial evidence")
                 validate_finished_build(text)
-                return stages, snapshots, profiles
+                exit_seen = True
         seen = len(markers)
+        if exit_seen and (job is None or job.complete()):
+            write(directory / "stage-results.json", {"exit": 0, "stages": stages,
+                  "snapshots": snapshots, "profiles": profiles})
+            return stages, snapshots, profiles
+        if job and job.complete() and not exit_seen:
+            raise RuntimeError("Bootstrap command exited without required completion marker")
         # A stopped VM with no completion marker cannot make progress. Use
         # the registry's PID/incarnation check, not a stale state field.
         server.load_session(session)
@@ -363,7 +421,10 @@ def main():
         if stage_data["exit"] != 0: parser.error("Guest build did not complete successfully")
         session = metadata["session"]
         data = server.load_session(session, live=False)
-        validate_finished_build(Path(data["serial_log"]).read_text(errors="replace"))
+        receipt = json.loads((directory / "command-evidence.json").read_text())
+        validate_finished_build(receipt["stdout"])
+        if not TrackedCommand(directory, session, receipt["request"]["argv"]).complete():
+            raise RuntimeError("Completed build lacks terminal, drained command evidence")
         ram = Path(metadata["ram_directory"]) if metadata.get("ram_directory") else None
         finalize_acceptance(directory, args, metadata, None, session, data, stage_data["stages"], stage_data["snapshots"], stage_data["profiles"], None, ram)
         return
@@ -429,15 +490,16 @@ def main():
     metadata["qemu_argv"] = [p.decode() for p in Path(f"/proc/{data['pid']}/cmdline").read_bytes().split(b"\0") if p]
     write(directory / "manifest.json", metadata)
     print(f"Booted {args.mode}: {session} ({boot_seconds:.2f}s)", flush=True)
-    server.guest_run(session, "run /nix/profile/bin/bash /boot/START.SH")
-    stages, snapshots, profiles = monitor(directory, session, data, args.deadline)
+    job = TrackedCommand(directory, session, ["/nix/profile/bin/bash", "/boot/START.SH"])
+    stages, snapshots, profiles = monitor(directory, session, data, args.deadline, job=job)
     finalize_acceptance(directory, args, metadata, process, session, data, stages, snapshots, profiles, cache, ram)
 
 
 def finalize_acceptance(directory, args, metadata, process, session, data, stages, snapshots, profiles, cache, ram):
     if process is None and data.get("state") == "stopped":
         if data.get("exit_code") != 0: raise RuntimeError("Resume VM did not exit cleanly")
-        validate_finished_build(Path(data["serial_log"]).read_text(errors="replace"))
+        receipt = json.loads((directory / "command-evidence.json").read_text())
+        validate_finished_build(receipt["stdout"])
         stop = {"already_stopped": True, "exit_code": 0,
                 "sync_source": "completed guest build script ends with successful sync; normal VM exit recorded by launcher"}
     else:
@@ -494,16 +556,18 @@ sync
     if verify_data["kernel_sha256"] != hashes["kernel/BROOK.elf"]:
         raise RuntimeError("Verification VM did not boot the extracted guest kernel")
     replies = {query: server.guest(verify_data, query, timeout=20) for query in ("uptime", "mem", "procs")}
-    server.guest_run(verify_session, "run /nix/profile/bin/brook-bootstrap-shell /boot/VERIFY.SH")
+    verify_job = TrackedCommand(verification, verify_session, ["/nix/profile/bin/brook-bootstrap-shell", "/boot/VERIFY.SH"])
     verify_started = time.monotonic()
-    verify_log = Path(verify_data["serial_log"])
     while time.monotonic() - verify_started < 600:
-        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", verify_log.read_text(errors="replace"))
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", verify_job.poll())
         exit_marker = re.search(r"^BOOTSTRAP_VERIFY_EXIT (\d+)", text, re.M)
         if exit_marker:
             if exit_marker[1] != "0" or NATIVE_PASS_MARKER not in text:
                 raise RuntimeError("Tests under guest-built kernel failed")
-            break
+            if verify_job.complete():
+                break
+        elif verify_job.complete():
+            raise RuntimeError("Verification command exited without required completion marker")
         if server.panic_state(verify_data):
             raise RuntimeError("Guest-built verification kernel panicked")
         time.sleep(1)
