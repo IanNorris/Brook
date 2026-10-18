@@ -83,6 +83,50 @@ exit zero. All six post-stop filesystem checks passed; RAM copies were released.
 The earlier negative diagnostic run is retained separately and is not an
 accepted performance run.
 
+#### Matched-tool pipeline isolation
+
+`scripts/workloads/pipeline_stages.py` separates download/decompression from
+NAR parsing. It uses the generated fixture root above and requires explicit
+`--cat`, `--zstd`, `--curl` and `--url` arguments. Each run requires a new
+`stage-results` directory, performs four repetitions per path by default,
+waits for every child, checks every output SHA256, and retains the final output
+per case. Timing excludes hashing and the final per-case fsync. The exact cat,
+zstd and curl executable hashes matched between Linux and Brook in this run.
+
+| Path to output file | Brook median, 4 repeats | Linux median, 4 repeats |
+| --- | --- | --- |
+| cat raw archive | 130 ms | 6 ms |
+| zstd from local archive | 484 ms | 27 ms |
+| zstd → cat | 1,238 ms | 28 ms |
+| HTTP raw archive | 2,745 ms | 37 ms |
+| HTTP compressed archive, no decompression | 1,390 ms | 20 ms |
+| HTTP → zstd | 1,882 ms | 32 ms |
+| HTTP → zstd → cat | 5,854 ms | 35 ms |
+
+These are stage-isolation results, not a speedup comparison with the preceding
+NAR run. The Brook run included short profiler captures; storage/cache state,
+network routing (guest NAT versus host loopback), and runtime environments also
+differ. The 500 ms HTTP→zstd capture had 400 samples, 1,322 context switches,
+zero dropped events, and 399 idle samples. The zstd→cat capture dropped 17,608
+events, so its sampled distribution is not representative. Avoid treating the
+idle distribution as a complete attribution of elapsed time.
+
+Source review found two ordinary pipe-read races to test and repair next:
+data can arrive between an empty read and waiter registration, leading to the
+10 ms fallback sleep; a final write and close in that interval can also make
+the reader return EOF before draining buffered bytes. No runtime data loss was
+observed in these controls, and no performance attribution to these races is
+established yet. A correct repair must coordinate condition checks, waiter
+registration/removal, close notifications and process lifetime, including
+multiple readers/writers; increasing transfer sizes alone is insufficient.
+
+Evidence: `build/workloads/pipeline-stages-20261018/acceptance-audit.json`,
+with Linux results in `build/pipeline-stages-linux-complete/stage-results`.
+All 28 cases passed on each OS, all seven retained guest outputs passed hashes
+after cold boot, both original launchers and QEMU sessions exited zero, and
+all six post-stop filesystem checks passed. This reused the fixed kernel hash
+above and ABI20 modules; it introduces no additional kernel change.
+
 Maintain two acceptance paths, using isolated disks and the same pinned Brook
 revision, SDK closure and VM configuration:
 
