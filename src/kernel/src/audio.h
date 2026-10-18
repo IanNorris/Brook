@@ -114,6 +114,21 @@ struct AudioStreamProgress {
 void AudioMixerRefresh();
 bool AudioMixerGetProgress(AudioStreamId stream, AudioStreamProgress* result);
 
+// Read-only diagnostics: one bounded cached-mixer snapshot. No driver poll,
+// refresh, allocation or sample consumption. The clock is sampled separately.
+struct AudioStreamDiagnostic {
+    AudioStreamId identity = 0;
+    uint64_t epoch = 0, submittedFrames = 0, completedFrames = 0;
+    uint32_t softwareFrames = 0, inFlightFrames = 0, capacityFrames = 0;
+    bool enabled = false, discontinuity = false;
+};
+struct AudioMixerDiagnostic {
+    uint64_t clockNs = 0;
+    bool ready = false, clocked = false;
+    AudioStreamDiagnostic streams[MIXER_MAX_STREAMS]{};
+};
+void AudioMixerDiagnosticSnapshot(AudioMixerDiagnostic* result);
+
 // Submit pre-resampled 44100/stereo/16-bit PCM into this stream's FIFO.
 // Returns the number of frames actually accepted; callers must retry the rest.
 uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, AudioStreamId stream);

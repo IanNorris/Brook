@@ -6,6 +6,7 @@
 #include "net.h"
 #include "tcp.h"
 #include "epoll_diagnostics.h"
+#include "audio.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "scheduler.h"
@@ -3318,6 +3319,36 @@ static void DebugEpollDiagnostics()
     DebugChannelSend("]}\n");
 }
 
+static void DebugAudioDiagnostics()
+{
+    AudioMixerDiagnostic snapshot{};
+    AudioMixerDiagnosticSnapshot(&snapshot);
+    BridgeReply header;
+    header.text("{"); header.field("guest_clock_ns", snapshot.clockNs);
+    header.text(","); header.field("ready", snapshot.ready);
+    header.text(","); header.field("clocked", snapshot.clocked);
+    header.text(",\"scope\":\"cached mixer accounting; separately sampled clock; no driver polling; identities and epochs guard reuse/reset\",\"streams\":[");
+    header.send();
+    bool first = true;
+    for (const auto& stream : snapshot.streams) {
+        if (!stream.identity) continue;
+        BridgeReply row;
+        if (!first) row.text(",");
+        first = false;
+        row.text("{"); row.field("identity", stream.identity);
+        row.text(","); row.field("epoch", stream.epoch);
+        row.text(","); row.field("submitted_frames", stream.submittedFrames);
+        row.text(","); row.field("completed_frames", stream.completedFrames);
+        row.text(","); row.field("software_frames", stream.softwareFrames);
+        row.text(","); row.field("inflight_frames", stream.inFlightFrames);
+        row.text(","); row.field("capacity_frames", stream.capacityFrames);
+        row.text(","); row.field("enabled", stream.enabled);
+        row.text(","); row.field("discontinuity", stream.discontinuity);
+        row.text("}"); row.send();
+    }
+    DebugChannelSend("]}\n");
+}
+
 // Process-context only: pin completed AS identities without following a raw
 // proc->addressSpace pointer that a concurrent exec could retire.
 static void DebugMemoryCensus()
@@ -3511,6 +3542,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap timing on|off|reset|status - allocator raw-cycle counters (default off)\n"
             "  heap check      - validate heap block metadata\n"
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
+            "  audio stats - cached stream queues, completion and guest clock\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
@@ -3737,6 +3769,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     }
     else if (NetStrEq(cmd, "heap check")) {
         DebugChannelSend(HeapCheckIntegrity() ? "heap integrity: OK\n" : "heap integrity: CORRUPT\n");
+    }
+    else if (NetStrEq(cmd, "audio stats")) {
+        DebugAudioDiagnostics();
     }
 
     // -----------------------------------------------------------------------

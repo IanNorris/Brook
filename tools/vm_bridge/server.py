@@ -412,7 +412,7 @@ def logs(session, source="serial", offset=0, limit=65536, **_):
             "more": next_offset < size, "rotated": rotated, "source": source}
 
 
-def stats(session, memory_details=False, **_):
+def stats(session, memory_details=False, audio_details=False, **_):
     with session_lock(session) as data:
         result = guest(data, "bridge stats")
         if memory_details:
@@ -420,6 +420,12 @@ def stats(session, memory_details=False, **_):
             result["memory_census"] = guest(data, "mem census", timeout=30)
             result["memory_census"]["supported"] = result["memory_census"].get("kind") == "memory_census"
             result["memory_census"]["round_trip_ms"] = (time.monotonic() - started) * 1000
+        if audio_details:
+            started = time.monotonic()
+            result["audio"] = guest(data, "audio stats")
+            result["audio"]["supported"] = (isinstance(result["audio"].get("streams"), list)
+                                             and "guest_clock_ns" in result["audio"])
+            result["audio"]["round_trip_ms"] = (time.monotonic() - started) * 1000
         result["queried_monotonic"] = time.monotonic()
         result["note"] = "Recent 256 compositor-loop intervals, nearest-rank percentiles, millisecond guest timer resolution; not app GPU or scanout frametimes"
         return result
@@ -958,7 +964,7 @@ register("vm_frame",frame_view,"Read a saved frame as tiny/medium/full or a nati
     "overlay":{"type":"boolean","default":False,"description":"Add a diagnostic ruler/grid labelled in native-frame coordinates; clean source retained"},
     "crop":schema({"x":INT,"y":INT,"width":INT,"height":INT},["x","y","width","height"]),"max_width":INT},["session","frame_id"],True)
 register("vm_logs",logs,"Read bounded logs by byte cursor",{**SESSION,"source":STR,"offset":INT,"limit":INT},["session"],True)
-register("vm_stats",stats,"OS memory/process counts and compositor intervals; optional rolling memory census holds guest mapping locks while sampling",{**SESSION,"memory_details":{"type":"boolean"}},["session"],True)
+register("vm_stats",stats,"OS memory/process counts and compositor intervals; optional cached audio queues and rolling memory census (census holds guest mapping locks)",{**SESSION,"memory_details":{"type":"boolean"},"audio_details":{"type":"boolean"}},["session"],True)
 register("vm_guest_run",guest_run,"Run structured guest argv with separate output and real exit status; requires request_id. Legacy command uses Brook run syntax and returns launch ACK only",{**SESSION,"command":STR,
     "argv":{"type":"array","items":STR,"minItems":1,"maxItems":64},"cwd":STR,
     "env":{"type":"object","additionalProperties":STR,"maxProperties":64},"uid":INT,

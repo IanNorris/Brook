@@ -332,6 +332,24 @@ bool AudioMixerGetProgress(AudioStreamId identity, AudioStreamProgress* result)
     SpinLockRelease(&g_mixerLock);
     return stream != nullptr;
 }
+void AudioMixerDiagnosticSnapshot(AudioMixerDiagnostic* result)
+{
+    if (!result) return;
+    *result = {};
+    result->clockNs = AudioClockNowNs();
+    SpinLockAcquire(&g_mixerLock);
+    result->ready = g_mixerReady;
+    result->clocked = g_clockSupported;
+    for (uint32_t i = 0; i < MIXER_MAX_STREAMS; ++i) {
+        const auto& stream = g_streams[i];
+        if (!stream.identity) continue;
+        result->streams[i] = {stream.identity, stream.epoch,
+            stream.submittedFrames, stream.completedFrames,
+            static_cast<uint32_t>(stream.write - stream.read), stream.inFlight,
+            stream.capacity, stream.enabled, stream.discontinuity};
+    }
+    SpinLockRelease(&g_mixerLock);
+}
 void AudioMixerFlush()
 {
     if (__atomic_exchange_n(&g_flushBusy, 1u, __ATOMIC_ACQUIRE)) return;

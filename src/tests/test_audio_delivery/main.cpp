@@ -67,6 +67,47 @@ bool partialAndErrors() {
     finish(expected.size());CHECK(output==expected);
     return !failures;
 }
+void diagnosticSnapshot() {
+    using namespace brook;
+    AudioMixerDiagnosticSnapshot(nullptr);
+    auto probe = AudioMixerOpen(); CHECK(probe);
+    std::vector<int16_t> samples(64, 123);
+    CHECK(AudioMixerSubmit(samples.data(), 32, probe) == 32);
+    CHECK(AudioMixerSetEnabled(probe, false));
+    const auto available = AudioMixerAvailableFrames(probe);
+    const auto driverCalls = calls.load();
+    for (unsigned repeat = 0; repeat < 3; ++repeat) {
+        AudioMixerDiagnostic snapshot{};
+        AudioMixerDiagnosticSnapshot(&snapshot);
+        CHECK(snapshot.ready);
+        unsigned found = 0;
+        for (const auto& row : snapshot.streams) {
+            if (row.identity != probe) continue;
+            ++found;
+            CHECK(!row.enabled && !row.discontinuity);
+            CHECK(row.submittedFrames == 32 && row.completedFrames == 0);
+            CHECK(row.softwareFrames == 32 && row.inFlightFrames == 0);
+            CHECK(row.capacityFrames == MIXER_RING_FRAMES);
+        }
+        CHECK(found == 1);
+        CHECK(AudioMixerAvailableFrames(probe) == available);
+        CHECK(calls.load() == driverCalls); // Observation never invokes driver.
+    }
+    CHECK(AudioMixerClose(probe));
+    auto replacement = AudioMixerOpen(); CHECK(replacement && replacement != probe);
+    AudioMixerDiagnostic snapshot{};
+    AudioMixerDiagnosticSnapshot(&snapshot);
+    unsigned found = 0;
+    for (const auto& row : snapshot.streams) {
+        CHECK(row.identity != probe);
+        if (row.identity == replacement) {
+            ++found;
+            CHECK(!row.submittedFrames && !row.completedFrames && !row.softwareFrames);
+        }
+    }
+    CHECK(found == 1);
+    CHECK(AudioMixerClose(replacement));
+}
 void concurrentFlush() {
     std::vector<int16_t> first(80,1234),second(60,-2345);
     auto expected=raw(first),tail=raw(second);expected.insert(expected.end(),tail.begin(),tail.end());
@@ -230,6 +271,7 @@ int main() {
     CHECK(brook::AudioRegister(&driver));
     primary=brook::AudioMixerOpen();secondary=brook::AudioMixerOpen();
     CHECK(primary && secondary && primary!=secondary);
+    diagnosticSnapshot();
     // The baseline must fail cleanly on lost partial data before concurrency.
     if(!partialAndErrors())return 1;
     concurrentFlush();stopInvalidatesSuffix();ringAndClamping();ownedQueues();

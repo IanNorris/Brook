@@ -430,3 +430,47 @@ The [standard ALSA OSS plugin](https://raw.githubusercontent.com/alsa-project/al
 uses GETOPTR's ring pointer and negotiated ALSA geometry directly. Adding a
 fictional pointer or selecting this plugin before the endpoint contract works
 would not solve the clock problem. Launcher and ALSA defaults remain unchanged.
+
+## Normal package and audio timeline checkpoint (18 October)
+
+The candidate `tools/firefox-brook-pkg` now supplies the native OSS plugin and
+44.1 kHz stereo plug configuration, replacing only the inherited legacy ALSA
+configuration. Its ALSA backend setting is a default preference, preserving
+explicit user choices. The public package index/image has not been promoted.
+
+`audio stats` on the guest debug channel reports a bounded cached-mixer snapshot:
+stream identity/reset epoch, submitted/completed frames, software/in-flight
+queues, capacity, enable state and discontinuity. It separately samples the
+stable guest clock; it neither polls the driver nor consumes samples. Identities
+and epochs must match before subtracting counters across snapshots. Empty
+software queues can still have in-flight hardware audio. One-second samples
+cannot exclude shorter underruns, and these are not hardware interrupt-time
+timestamps. The bridge exposes this optionally through
+`vm_stats(audio_details=true)`; older kernels report `supported=false`.
+
+The isolated `heap-sub-bins-audio-timeline-20261018` run compares a blocking
+native OSS producer with one normally launched Firefox, without backend/config
+environment overrides. Neither cloned `user.js` nor `prefs.js` has a cubeb
+backend or sandbox override. With the silent host backend, the direct synthetic
+440 Hz tone captures 441,319 frames (10.0072 seconds) over 10.0061 host seconds,
+without silent 10 ms bins. The software-plus-in-flight queue remains supplied
+at each one-second observation, with no recorded stream discontinuity.
+
+Firefox captures 441,306 frames (10.0069 seconds) over 10.0070 host seconds.
+An 80 ms silent interval occurs 0.41–0.49 seconds into this capture; the rest
+has no silent 10 ms bins. Thus the earlier short PCM captures are not a
+universal fixed-rate mismatch, but intermittent playback remains unaccepted.
+Firefox's negotiated capacity is 4,096 frames versus the direct producer's
+16,384; this is an observed buffering difference, not a proven cause. Its
+one-second observations generally retain thousands of in-flight frames and
+cannot identify the cause of that short gap. Browser telemetry now includes
+page identity and sequence numbers so queued/out-of-order HTTP reports need
+not be mistaken for playback resets.
+
+Both producers exit zero with no remaining tracked tasks; both post-exit audio
+captures are inactive. Checked shutdown, launcher exit zero, serial audit and
+all three offline filesystem checks pass. The audio snapshot's non-consuming
+and close/reuse behavior passes the production-mixer hosted test; all 36
+current hosted suites, the supported entry audit and 40 bridge contract tests
+pass. This does not establish YouTube audio, pause/resume, simultaneous-app
+acceptance or fresh bootstrap package-closure coverage.

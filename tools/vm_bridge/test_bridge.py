@@ -222,6 +222,27 @@ class Contracts(unittest.TestCase):
              patch.object(server,'guest',side_effect=[{}, {'reply':'Unknown command'}]):
             self.assertFalse(server.stats('fixture',memory_details=True)['memory_census']['supported'])
 
+    def test_stats_audio_is_opt_in_and_handles_older_guests(self):
+        data={'guest_debug_port':1234}
+        with patch.object(server,'session_lock',return_value=contextlib.nullcontext(data)), \
+             patch.object(server,'guest',return_value={}) as request:
+            self.assertNotIn('audio',server.stats('fixture'))
+            request.assert_called_once_with(data,'bridge stats')
+        audio={'guest_clock_ns':123456,'streams':[], 'clocked':1}
+        with patch.object(server,'session_lock',return_value=contextlib.nullcontext(data)), \
+             patch.object(server,'guest',side_effect=[{},audio]) as request:
+            result=server.stats('fixture',audio_details=True)
+            self.assertTrue(result['audio']['supported'])
+            self.assertEqual(result['audio']['guest_clock_ns'],123456)
+            self.assertEqual(result['audio']['streams'],[])
+            self.assertGreaterEqual(result['audio']['round_trip_ms'],0)
+            self.assertEqual(request.call_args_list[1].args,(data,'audio stats'))
+        with patch.object(server,'session_lock',return_value=contextlib.nullcontext(data)), \
+             patch.object(server,'guest',side_effect=[{}, {'reply':'Unknown command'}]):
+            result=server.stats('fixture',audio_details=True)
+            self.assertFalse(result['audio']['supported'])
+            self.assertEqual(result['audio']['reply'],'Unknown command')
+
     def test_holds_released_on_cancel(self):
         events=[];cancel=threading.Event()
         class FakeQMP:
