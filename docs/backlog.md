@@ -15,6 +15,13 @@
   identifies the faulting relocation-loop instruction and records narrow CMOV
   and concurrent-exec probes; their passes do not resolve the boot fault.
 
+- Extend the static entry-state auditor's TLB-leaf model to the Debug compiler's
+  `sub rsp, 0x10` stack-allocation form. `scripts/build.sh Debug` rejected that
+  unmodeled instruction on 18 October; do not silently skip it or count it as
+  verified. The matching Release build and its supported-template mutation
+  audit passed. Local logs: `build/window-surface-candidate-build-20261018.log`
+  and `build/debug/entry-state-audit.json`.
+
 - Initial [Wine64 smoke test](wine-smoke.md): diagnose wineserver's rejection of
   `/tmp/.wine-1000` as not owned by UID1000, including metadata on newly created
   temporary directories and path routing. A private owned ext2 `TMPDIR` did not

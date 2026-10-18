@@ -621,6 +621,10 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.vfbBacking = nullptr;
     w.vfbRetirement = nullptr;
     w.vfbDirty  = 0;
+    // A reused slot must not keep the previous client's dmabuf. Otherwise a
+    // new SHM window keeps displaying the dead GL client's last frame.
+    w.externalGres = 0;
+    w.externalW = w.externalH = 0;
     w.wmId      = static_cast<uint16_t>(idx + 1);
     if (proc) {proc->fbDestX=w.clientX();proc->fbDestY=w.clientY();}
     w.inputHead = 0;
@@ -679,6 +683,8 @@ static void DestroyWindowLocked(int idx)
         MappingBackingUnref(backing);AddressSpaceUnref(space);
         CompositorRetireVfb(retirement);
     }
+    w.externalGres = 0;
+    w.externalW = w.externalH = 0;
     w.wmId = 0;
     w.proc = nullptr;
     w.visible = false;
@@ -2740,8 +2746,13 @@ uint64_t WmMapWindowVfb(Process* caller,uint32_t wmId) {
 
 void WmSignalDirtyById(Process* proc, uint32_t wmId)
 {
+    VfbGuard guard;
     Window* w = WmFindWindowById(proc, wmId);
     if (!w) return;
+    // This syscall publishes CPU-written VFB content, including a surface
+    // switching from dmabuf to SHM. Stop sampling any previous GL buffer.
+    w->externalGres = 0;
+    w->externalW = w->externalH = 0;
     w->vfbDirty = 1;
     CompositorWake();
 }
@@ -2749,6 +2760,7 @@ void WmSignalDirtyById(Process* proc, uint32_t wmId)
 bool WmPresentExternalById(Process* proc, uint32_t wmId, uint32_t gres,
                            uint32_t w, uint32_t h)
 {
+    VfbGuard guard;
     Window* win = WmFindWindowById(proc, wmId);
     if (!win) return false;
     win->externalGres = gres;

@@ -5868,7 +5868,11 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
                                             rc.depth, rc.array_size,
                                             rc.last_level, rc.nr_samples,
                                             rc.flags);
-        if (gres < 0) return -ENOMEM;
+        if (gres < 0) {
+            SerialPrintf("drm: resource create failed ctx=%d target=%u size=%ux%u\n",
+                         dctx->ctxId,rc.target,rc.width,createH);
+            return -ENOMEM;
+        }
         // For a buffer the "stride" is its byte length, not width*texel; for a
         // 2D texture default to width*4 bytes/texel when the client omits stride.
         uint32_t stride = rc.stride ? rc.stride
@@ -5880,12 +5884,20 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
                                  : stride * createH;
         uint32_t bo = DrmGemAlloc(dctx, (uint32_t)gres, size, stride,
                                   rc.width, createH);
-        if (bo == 0) return -ENOMEM;   // GEM table full
+        if (bo == 0) {
+            SerialPrintf("drm: GEM table full ctx=%d capacity=%u gres=%d\n",
+                         dctx->ctxId,DRM_MAX_GEM,gres);
+            return -ENOMEM;
+        }
         // Attach guest backing now (not lazily at MAP): a render target read by
         // Mesa's glReadPixels COPY_TRANSFER3D must already have an iov, or
         // virglrenderer rejects the command (check_copy_transfer3d_handles).
         DrmGemObj* gobj = DrmGemGet(dctx, bo);
-        if (gobj && !DrmEnsureBacking(dctx, gobj)) return -ENOMEM;
+        if (gobj && !DrmEnsureBacking(dctx, gobj)) {
+            SerialPrintf("drm: resource backing allocation failed ctx=%d gres=%d bytes=%u\n",
+                         dctx->ctxId,gres,gobj->size);
+            return -ENOMEM;
+        }
         rc.res_handle = (uint32_t)gres;   // host id, used inside virgl streams
         rc.bo_handle  = bo;               // per-fd GEM handle, used in ioctls
         rc.size = size; rc.stride = stride;

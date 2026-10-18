@@ -2696,7 +2696,13 @@ static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t target, uint32_t form
     static uint32_t s_localCounter[MAX_APP_CTX] = {};
     uint32_t i = (uint32_t)ctxId - APP_FIRST_CTX;
     uint32_t localRes = ++s_localCounter[i];
-    if (localRes >= APP_RES_STRIDE) return -1;
+    if (localRes >= APP_RES_STRIDE)
+    {
+        if (localRes == APP_RES_STRIDE)
+            SerialPrintf("virtio_gpu: app resource ids exhausted ctx=%d pid=%u allocations=%u\n",
+                         ctxId, c->pid, localRes);
+        return -1;
+    }
     uint32_t gres = AppResGlobal((uint32_t)ctxId, localRes);
     // A PIPE_BUFFER must be created as a 1-D linear buffer (target 0), or
     // virglrenderer rejects buffer bind flags on a texture target — this is
@@ -2707,8 +2713,17 @@ static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t target, uint32_t form
         ? ResourceCreateBuffer(gres, bind, w)
         : ResourceCreate3DEx(gres, target, format, bind, w, h,
                              depth, arraySize, lastLevel, nrSamples, flags);
-    if (!created) return -1;
-    if (!CtxAttachResource((uint32_t)ctxId, gres)) return -1;
+    if (!created)
+    {
+        SerialPrintf("virtio_gpu: app resource create FAILED ctx=%d gres=%u target=%u format=%u bind=0x%x size=%ux%u\n",
+                     ctxId, gres, target, format, bind, w, h);
+        return -1;
+    }
+    if (!CtxAttachResource((uint32_t)ctxId, gres))
+    {
+        SerialPrintf("virtio_gpu: app resource attach FAILED ctx=%d gres=%u\n",ctxId,gres);
+        return -1;
+    }
     return static_cast<int32_t>(gres);
 }
 

@@ -1,6 +1,45 @@
 # Application regressions — 2026-10-18
 
-Tests use isolated eight-vCPU, 4-GiB software-Wayland VMs. Earlier runs use
+## Native GL user review: stale window surfaces and Quake crash
+
+User review of the private Quake image exposed two failures that the shorter
+GL3 demo smoke did not cover. After a Quake crash, Chromium displayed Quake's
+last corrupted image, including after resizing. Closing SuperTuxKart and
+opening App Gallery reproduced the stale-surface behavior. The serial log
+shows the replacement application reusing the closed GL window's slot.
+`CreateWindowLocked` and `DestroyWindowLocked` did not clear `externalGres`
+or its dimensions, so composition continued sampling the previous client's
+GPU resource instead of the replacement application's CPU framebuffer.
+
+The candidate clears that state at creation/destruction and on CPU framebuffer
+publication, including a live dmabuf-to-SHM transition. A host test executes the
+production window functions for slot reuse, destruction, transitions and owner
+checks. It passes on the candidate and fails on the unmodified implementation.
+Release kernel `246e2d02691ee8001937d65b50173afee51f4015fcb01dd3536d1b7cb8abe5c8`
+then passed an accelerated eight-vCPU, 4-GiB run: Quake's 720p GL3 demo rendered,
+closed normally, and Gallery reused the exact same slot with its own content.
+Gallery close/reopen reused the slot again and displayed correctly. All three
+UI launch lineages drained. Checked shutdown, owned launcher exit zero,
+independent QEMU death, three offline filesystem checks, and all nine saved
+fixture hashes/ownership checks passed. This is a short lifecycle check;
+SuperTuxKart teardown and the longer Quake failure remain separate tests.
+Local evidence: `build/workloads/window-surface-20261018/candidate/acceptance-audit.json`.
+
+Quake also showed malformed geometry and crashed at the same null-pointer read
+in Mesa `dri2_query_image+0xd0`, reached through Wayland EGL buffer creation and
+SDL. One launch reported host `GL_INVALID_FRAMEBUFFER_OPERATION` and an illegal
+`DRAW_VBO` command. The window fix does not establish the cause of those errors.
+GPU resource creation has a cumulative per-slot ID bound; GEM close drops its
+bookkeeping without releasing the host resource or guest backing. Allocation
+failure diagnostics are included to distinguish these paths in a controlled
+reproduction. Neither resource exhaustion nor a particular lifetime failure
+has yet been proved as the crash's cause.
+
+Local failure evidence: `build/workloads/quake-openttd-crash-20261018/`.
+The user-controlled sessions are diagnostic runs, not checked acceptance seeds.
+
+The earlier acceptance checks below use isolated eight-vCPU, 4-GiB
+software-Wayland VMs. Earlier runs use
 RAM-backed host disks; the access-inquiry and browser-permission follow-ups use
 host-backed clones. Applications launch through the installed catalogue as Brook, UID 1000.
 These are correctness observations, not matched startup benchmarks.
