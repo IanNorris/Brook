@@ -106,6 +106,42 @@ class InstallLinkTests(unittest.TestCase):
         self.install()
         self.assertEqual(self.package.read_bytes(),b'owned data-only output')
 
+    def remove(self):
+        result=subprocess.run([str(self.binary),'remove','fixture'],capture_output=True,timeout=15)
+        self.assertFalse((self.root/'profile/.mutation-lock').exists())
+        return result
+
+    def test_remove_cleans_relative_and_absolute_exports_preserving_store(self):
+        self.install()
+        for link in self.links():
+            target=link.resolve();link.unlink();link.symlink_to(target)
+        foreign=self.root/'profile/lib/foreign.so'
+        foreign.symlink_to('/unrelated/owned/library')
+        result=self.remove()
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        for link in self.links():self.assertFalse(link.is_symlink(),link)
+        self.assertTrue(foreign.is_symlink())
+        self.assertTrue((self.package/'bin/tool').is_file())
+        self.assertTrue((self.package/'lib/libfixture.so').is_file())
+
+    @unittest.skipIf(os.geteuid()==0,'directory permission failure requires an unprivileged host')
+    def test_remove_reports_each_export_unlink_failure(self):
+        for relative in ['bin/tool','lib/libfixture.so','share/applications/fixture.desktop']:
+            with self.subTest(relative=relative):
+                self.setUp();self.install()
+                blocked=self.root/'profile'/relative
+                blocked.parent.chmod(0o555)
+                try:result=self.remove()
+                finally:blocked.parent.chmod(0o755)
+                self.assertTrue(blocked.is_symlink())
+                self.assertNotEqual(result.returncode,0,result.stdout+result.stderr)
+                self.assertIn(b'incomplete profile removal',result.stderr)
+                self.assertNotIn(b'Removed fixture',result.stdout)
+                # The current manifest-first protocol requires reinstall to
+                # recover an interrupted removal; do not claim rollback.
+                self.install()
+                for link in self.links():self.assertTrue(link.is_file(),link)
+
 
 if __name__=='__main__':
     unittest.main()

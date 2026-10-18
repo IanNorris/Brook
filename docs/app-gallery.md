@@ -229,6 +229,36 @@ remaining atomic namespace and other-backend identity limits stay explicit.
 [Recovery design](app-gallery-recovery.md) records the remaining transaction,
 shared ownership, base-package inventory and real disk-full failure matrix.
 
+## Removal error reporting — 18 October 2026
+
+Removal previously printed success when deleting an exported binary, library
+or desktop link failed. It also missed absolute library links. The installer
+now handles absolute and relative store targets consistently, propagates scan,
+unlink and directory-flush errors, preserves unrelated links and keeps cached
+store files. It reports incomplete removal instead of printing success.
+
+The existing manifest-first protocol still applies: registration may already
+be removed when cleanup fails. The error tells the user to reinstall the
+package to restore its exports before retrying removal. This is an explicit
+recovery path, not rollback or shared-provider reconciliation.
+
+All 33 installer host tests pass. New negative controls reproduce the original
+false-success behavior in each export class and the leftover absolute library
+link. An isolated static fixture in session
+`7f5bf0855f4c400dbe419e4ba0bcbaeb` passed the same four cases on guest ext2 as
+UID1000, including real read-only directory permissions, reinstall/retry,
+preservation of an unrelated link and unchanged cached payloads. The probe's
+fetch helper is a successful no-op; it does not establish download, large-package,
+real disk-full or whole-profile recovery behavior. The system profile was not
+modified by this fixture; refresh the bundled installer with future images.
+
+Both tracked guest commands completed with full output, EOF and no remaining
+tasks. The run passed checked shutdown, original-launcher exit zero and all
+three read-only filesystem checks. Nine saved documents retained hashes and
+ownership. Source fixture: `scripts/workloads/gallery_remove_check.py`.
+Local evidence: `build/workloads/boot-recording-7c72adad-20261018/retained-cold/`
+and the parent `acceptance-audit.json`.
+
 ## Remaining work
 
 - Disk-full and interrupted-install recovery across the whole profile. Atomic

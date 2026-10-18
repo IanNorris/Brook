@@ -82,3 +82,12 @@ application playback/exit evidence is in
 
 The recovery design and remaining acceptance matrix are documented in
 [App Gallery recovery](../../docs/app-gallery-recovery.md).
+
+Removal reports failed export cleanup, recognizes both absolute and relative
+store links, and flushes changed directories. Registration is still published
+first: an incomplete removal requires reinstalling to restore exports before
+retrying. All 33 host tests pass, including real directory-permission failures;
+the private UID1000 guest fixture also passes. See
+[removal evidence](../../docs/app-gallery.md#removal-error-reporting--18-october-2026).
+Whole-profile transactions, shared-provider restoration and real disk-full
+recovery remain open.

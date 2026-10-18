@@ -420,25 +420,48 @@ static int link_package_desktops(const char *store_name) {
     closedir(directory);return linked;
 }
 
-static int unlink_package_desktops(const char *store_name) {
-    DIR *directory=opendir(PROFILE_APPS);
-    if (!directory) return 0;
+/* Remove only exports owned by this store path. Failure is distinct from
+ * zero matching links: the manifest may already be published, so callers must
+ * report incomplete removal and leave reinstall/repair explicit. */
+static int unlink_package_exports(const char *store_name, const char *directory,
+                                  const char *relative_root) {
+    DIR *d=opendir(directory);
+    if (!d) return errno==ENOENT ? 0 : -1;
     char absolute[1024],relative[1024];
-    snprintf(absolute,sizeof(absolute),STORE_DIR "/%s/",store_name);
-    snprintf(relative,sizeof(relative),"../../../store/%s/",store_name);
-    struct dirent *entry;int removed=0;
-    while ((entry=readdir(directory))) {
+    int a=snprintf(absolute,sizeof(absolute),STORE_DIR "/%s/",store_name);
+    int r=snprintf(relative,sizeof(relative),"%s%s/",relative_root,store_name);
+    int removed=0,saved=0;
+    if(a<0 || (size_t)a>=sizeof(absolute) || r<0 || (size_t)r>=sizeof(relative)) {
+        saved=ENAMETOOLONG;goto done;
+    }
+    for (;;) {
+        errno=0;
+        struct dirent *entry=readdir(d);
+        if (!entry) {saved=errno;break;}
         if (entry->d_name[0]=='.') continue;
-        char path[1024],target[1536];
-        snprintf(path,sizeof(path),"%s/%s",PROFILE_APPS,entry->d_name);
-        ssize_t n=readlink(path,target,sizeof(target)-1);
-        if (n<=0) continue;
-        target[n]=0;
-        if (!strncmp(target,absolute,strlen(absolute)) || !strncmp(target,relative,strlen(relative))) {
-            if (!unlink(path)) ++removed;
+        char path[1536],target[1536];
+        int n=snprintf(path,sizeof(path),"%s/%s",directory,entry->d_name);
+        if(n<0 || (size_t)n>=sizeof(path)) {saved=ENAMETOOLONG;break;}
+        ssize_t length=readlink(path,target,sizeof(target));
+        if(length<0) {
+            if(errno==EINVAL || errno==ENOENT) continue;
+            saved=errno;break;
+        }
+        if((size_t)length==sizeof(target)) {saved=ENAMETOOLONG;break;}
+        target[length]=0;
+        if(!strncmp(target,absolute,(size_t)a) || !strncmp(target,relative,(size_t)r)) {
+            if(unlink(path)<0) {saved=errno;break;}
+            ++removed;
         }
     }
-    closedir(directory);return removed;
+done:
+    if(removed && fsync(dirfd(d))<0 && !saved) saved=errno;
+    if(closedir(d)<0 && !saved) saved=errno;
+    if(saved) {errno=saved;return -1;}
+    return removed;
+}
+static int unlink_package_desktops(const char *store_name) {
+    return unlink_package_exports(store_name,PROFILE_APPS,"../../../store/");
 }
 
 static int link_package_bins(const char *store_name) {
@@ -603,69 +626,11 @@ static int link_closure_libs_into_package(const char *store_name) {
     return linked;
 }
 
-/* Remove symlinks that point into a package's store path */
 static int unlink_package_bins(const char *store_name) {
-    DIR *d = opendir(PROFILE_BIN);
-    if (!d) return 0;
-
-    char prefix[512];
-    snprintf(prefix, sizeof(prefix), STORE_DIR "/%s/", store_name);
-    size_t prefix_len = strlen(prefix);
-    char relative_prefix[512];
-    snprintf(relative_prefix,sizeof(relative_prefix),"../../store/%s/",store_name);
-    size_t relative_len=strlen(relative_prefix);
-
-    struct dirent *ent;
-    int removed = 0;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;
-
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/%s", PROFILE_BIN, ent->d_name);
-
-        char target[1024];
-        ssize_t n = readlink(path, target, sizeof(target) - 1);
-        if (n > 0) {
-            target[n] = '\0';
-            if (strncmp(target, prefix, prefix_len) == 0 ||
-                strncmp(target, relative_prefix, relative_len) == 0) {
-                unlink(path);
-                removed++;
-            }
-        }
-    }
-    closedir(d);
-    return removed;
+    return unlink_package_exports(store_name,PROFILE_BIN,"../../store/");
 }
-
 static int unlink_package_libs(const char *store_name) {
-    DIR *d = opendir(PROFILE_LIB);
-    if (!d) return 0;
-
-    char prefix[512];
-    snprintf(prefix, sizeof(prefix), "../../store/%s/lib/", store_name);
-    size_t prefix_len = strlen(prefix);
-
-    struct dirent *ent;
-    int removed = 0;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;
-
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/%s", PROFILE_LIB, ent->d_name);
-
-        char target[1024];
-        ssize_t n = readlink(path, target, sizeof(target) - 1);
-        if (n > 0) {
-            target[n] = '\0';
-            if (strncmp(target, prefix, prefix_len) == 0) {
-                unlink(path);
-                removed++;
-            }
-        }
-    }
-    closedir(d);
-    return removed;
+    return unlink_package_exports(store_name,PROFILE_LIB,"../../store/");
 }
 
 /* -----------------------------------------------------------------------
@@ -1142,14 +1107,20 @@ static int cmd_remove(const char *name) {
         fprintf(stderr, "Error: failed to update manifest: %s\n",strerror(errno));
         return install_commit_end(&previous,1);
     }
+    int removal_error=0;
     if (store_name[0]) {
-        unlink_package_bins(store_name);
-        unlink_package_desktops(store_name);
-        unlink_package_libs(store_name);
+        if(unlink_package_bins(store_name)<0) removal_error=errno;
+        if(unlink_package_desktops(store_name)<0 && !removal_error) removal_error=errno;
+        if(unlink_package_libs(store_name)<0 && !removal_error) removal_error=errno;
     }
-
-    printf("%s✓ Removed %s%s\n",color_green,name,color_reset);
     refresh_desktop_entries();
+    if(removal_error) {
+        fprintf(stderr,"Error: incomplete profile removal: %s. Registration was removed; "
+                       "reinstall '%s' to restore its profile links before retrying removal.\n",
+                       strerror(removal_error),name);
+        return install_commit_end(&previous,1);
+    }
+    printf("%s✓ Removed %s%s\n",color_green,name,color_reset);
     return install_commit_end(&previous,0);
 }
 
