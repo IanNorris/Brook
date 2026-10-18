@@ -1,12 +1,21 @@
 # Recovery and VM-control backlog
 
+- Future product/architecture exploration: [Brook beyond compatibility](design/brook-directions.md).
+  Investigate app/workspace identities for a primarily single-owner PC, deliberate
+  memory sharing, conditional anti-cheat/attestation, native agentic interfaces,
+  Linux/Proton/Android integration, native app contracts, OS/API tradeoffs and
+  alternatives to established desktop conventions. Backlog only; retain the
+  current real-workload, audio and performance priorities.
+
 - The VM clock probe now directly observes ALSA delay zero while its own OSS
   descriptor has 5,680–41,552 queued bytes. Complete a clocked, independently
   owned OSS stream path before enabling the standard ALSA OSS plugin. Include
   hardware completion/discontinuities, short-tail drain, consistent readiness
   and independently attributable hardware reset/close. Software FIFO ownership,
-  pause/reset/close and dup/fork lifetime now pass targeted tests; hardware
-  completion is still open. See [measured clock and delivery work](audio-clock.md).
+  pause/reset/close and dup/fork lifetime now pass targeted tests. Native HDA
+  completion, exact short tails and native OSS pointer/drain acceptance now pass;
+  ALSA integration and Firefox acceptance remain in progress. See
+  [measured clock and delivery work](audio-clock.md).
 
 - Firefox audio IPC now passes its Unix receive-flag dependency: Linux and
   Brook both pass the four-case SCM_RIGHTS/epoll/EOF probe after accepting
