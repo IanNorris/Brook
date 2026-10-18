@@ -1,6 +1,6 @@
 # VM bridge efficiency and UI control specification
 
-Status: partially implemented, 17 October 2026. Bridge 0.3.0 implements the
+Status: partially implemented; specification reviewed 18 October 2026. Bridge 0.3.0 implements the
 reference-first media adapter, optional native previews, recursive binary
 extraction and artifact capability revision 1. Existing artifacts without a
 recorded monotonic creation time report it as unknown. Bridge 0.4.0 adds
@@ -51,19 +51,21 @@ exercise actual menu hitboxes and client UI.
 
 ## Findings motivating the changes
 
-`vm_guest_run` currently returns a launch PID, not completion or isolated
-output. Tests add shell exit markers and separately scan serial logs. Image
-capture, window queries and process queries are separate calls. Input injection
+At the initial 14 October research baseline, `vm_guest_run` returned a launch
+PID, not completion or isolated output. Tests then added shell exit markers
+and separately scanned serial logs. Image capture, window queries and process
+queries were separate calls. Input injection
 reports delivery without proving a reaction. Profiling and audio capture need
 separate status/export/analysis calls. New source capabilities have also required
 host Python because an already-running MCP process exposed older tools.
 
 `call_tool` already separates screenshots into MCP image blocks and text
 metadata. Serializing that entire envelope as JSON can expose its image data.
-More directly, `get_artifact` currently returns base64 inside JSON for non-image
-binary artifacts. Both paths need an explicit delivery contract.
+At that baseline, `get_artifact` also returned base64 inside JSON for non-image
+binary artifacts. The implemented media adapter now handles both paths; retain
+the delivery contract below when extending tools.
 
-Current window queries often identify the shared Wayland server as the window
+Initial window queries often identified the shared Wayland server as the window
 provider. That is insufficient to identify the application to terminate. Slot
 indices and PIDs can also be reused. Resolve ownership and generations before
 adding semantic close or process-correlated waits.
@@ -265,6 +267,70 @@ remain recoverable by operation ID. Exceeding the current small debug-command
 line limit requires bounded framing/chunking, not unsafe shell quoting or silent
 argument truncation.
 
+### Durable command output and guest-produced artifacts — proposed
+
+The current 64-KiB-per-stream tail ring is deliberately bounded. Fast installer
+output and a 289-KiB PNG export exceeded it in the application regressions. A
+zero process exit with output gaps is not complete output acceptance. Polling
+more often cannot guarantee retention across server disconnects or long tool
+calls. Do not put binary artifacts through stdout or silently raise memory
+limits to the largest observed workload.
+
+Add an opt-in structured output policy, for example
+`output: {"retention": "artifact", "max_bytes_per_stream": 33554432}`. Keep the
+existing bounded text policy available and explicitly advertised. Proposed
+default limits for artifact mode are 32 MiB per stream and 256 MiB across the
+boot session; expose actual negotiated limits before dispatch. These numbers
+are design defaults, not current implementation or a promise of unlimited logs.
+
+Artifact mode writes output to service-owned persistent spool files while
+continuing to drain the pipes. Bind every file to session generation, guest
+boot ID, immutable job ID, stream and owner identity. Use a private filesystem
+namespace and retained file handles, rejecting symlink/replacement escapes;
+user processes receive pipe descriptors, not writable names for another job's
+spool. Do not assume the current ownership audit already proves this isolation.
+A backend incapable of these guarantees rejects artifact mode before launch.
+
+Report produced bytes, retained byte ranges, discarded ranges, quota/I/O
+errors, and separate stdout/stderr storage states. On quota or disk-full
+failure, continue draining/discarding with explicit loss counters so a child
+cannot deadlock indefinitely on its diagnostic output. Preserve the existing
+small tail ring as a bounded diagnostic fallback. Never report the spool as
+complete when bytes were discarded, even if the workload exits successfully.
+
+Finalize each successful spool only after pipe EOF, flush and checked close;
+record length and SHA-256. Workload completion still independently requires a
+collected leader exit and an empty immutable job lineage. Return compact text
+previews plus artifact descriptors in the completed response. Host artifacts
+remain readable after checked VM stop and MCP reconnect. A disk failure or
+panic returns partial status and recoverable ranges, not invented EOF. Define
+per-job removal and explicit session retention cleanup; never silently evict
+unread data while advertising complete retention.
+
+Large guest-produced files need a separate negotiated export channel. A future
+`vm_guest_artifact` accepts an explicit permitted guest path or a service-owned
+job artifact reference, identity guard, maximum size and request ID. This is not
+permission to collect arbitrary profiles, cookies or home directories. Resolve
+and pin the approved file, stream bounded binary frames over a private VM
+transport into a temporary registry artifact, and verify length/hash before
+atomic publication. Resume only against the same pinned file identity; changed
+content or a reboot invalidates the transfer. Do not automatically execute a
+curl/upload script as an unlabelled fallback. No guest command is launched by
+an artifact read.
+
+Use reusable binary framing and bounded chunks rather than per-byte hex/text
+commands or one huge JSON/base64 value. The MCP response contains the verified
+host artifact path/descriptor, never those frames. The existing image adapter
+then supplies tiny/medium previews and native crops from the saved artifact.
+Until this capability exists, guest-file export is explicitly unsupported;
+callers may arrange separately authorised, scoped fixture transfers.
+
+Acceptance must cover fast output larger than both ring and negotiated quota,
+interleaved streams, arbitrary binary bytes, disconnect/reconnect, slow readers,
+delayed descendants, EOF before process exit, disk-full, panic, reset, explicit
+cleanup, and path/symlink replacement. Verify actual files and byte ranges;
+checking only a terminal job state or a green transport response is insufficient.
+
 ## Conditions, event waits and action completion
 
 Generalize `vm_wait` from serial substrings to typed conditions:
@@ -290,6 +356,18 @@ frame/window generations at dispatch, including within multi-action sequences.
 Distinguish a newer frame, compositor activity and application readiness. A
 browser window or a high compositor FPS does not prove a page loaded. Optional
 app readiness probes must identify their evidence and scope.
+
+A future guest-owned exception event stream must distinguish a handled user
+exception from a fatal process/kernel fault. Include process incarnation,
+immutable job/launch identity, exception vector, instruction/address and final
+disposition (signal delivered, fixup or fatal), with sequence/overflow metadata.
+Do not record normal resolved demand-paging faults as application crashes.
+Bootstrap user-copy tests intentionally touch guard pages and alter signal
+registers; they cannot be classified by the presence of a fault banner alone.
+Expected-probe classification requires pinned test/executable provenance and a
+completed test result, not an application-supplied "expected" label. The current
+serial scanner remains best-effort: interleaved text can hide or corrupt records
+and cannot establish a lossless fault census.
 
 Human takeover blocks new UI mutations and interrupts queued/in-progress input
 at safe boundaries; read-only observation/waits remain available. Do not
@@ -317,6 +395,22 @@ an inactive/unavailable stream, not a measured duration of silent PCM. Keep host
 arrival times separate from sample time. Add guest mixer/HDA queue and underrun
 telemetry as a capability before claiming to identify stutters from silence.
 Continue supporting capture with speaker playback disabled.
+
+Audio activity during a capture and stream state at the end are different
+facts. The current `stream_active` field is derived from captured frame count:
+a finite post-exit PCM tail can therefore set it even though the device stops
+during that capture. Specify `activity_observed`, captured sample duration,
+host capture interval, and a separately timed `state_at_end` when supported;
+otherwise end state is unknown. Preserve a labelled compatibility alias if the
+wire field is renamed. A nonempty WAV alone must not imply ongoing playback.
+
+For cleanup checks, require active nonzero audio before normal quit or forced
+termination, full application-lineage reclamation, then a bounded follow-up
+observation showing inactive output or an explicitly identified silent active
+stream. Retain finite tails separately from repeating stale buffers. Frame
+counts without chunk-arrival timestamps do not prove exact output-stop latency.
+Test both a finite tail that stops and a deliberately repeating-buffer negative
+control before advertising automatic cleanup/stutter classification.
 
 Allow checked stop plus an optional read-only offline filesystem verification
 operation for the selected run's disks. Preserve the existing guest filesystem

@@ -9,7 +9,8 @@ as the local `brook-vm` Codex MCP. No existing desktop-control plugin was
 installed and no host desktop was accessed. The research below remains the
 architecture reference; the README specifies currently available behavior.
 
-Verified: opted-in user/agent discovery, private QMP, 16 stdio tools, guest
+Initial 14 October implementation snapshot (later additions are documented in
+the bridge README): opted-in user/agent discovery, private QMP, 16 stdio tools, guest
 launch/windows/processes, framed guest stats, CPU/context-switch export,
 accelerated/CPU screenshots with crop metadata, input cancellation, silent
 PCM/waveforms and host-side post-panic inspection. Actual frame capture uses

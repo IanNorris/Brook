@@ -421,7 +421,7 @@ Default cwd/home is `/data/home`, UID 1000 and primary GID 100. `uid: 0` is an
 explicit maintenance option. Environment overrides merge with the desktop's
 framework, font, TLS and XDG defaults. Stdin is `/dev/null`. Job launches do
 not create an automatic framebuffer window or exercise the Applications UI;
-semantic launcher activation is separate future work.
+use the separate implemented `vm_launch` tool for semantic launcher activation.
 
 Requests support 1–64 NUL-free arguments, 64 environment overrides and a
 32 KiB total serialized payload, uploaded in bounded checked chunks. Paths
@@ -465,7 +465,8 @@ Full-buffer counters count blocking attempts, not measured sleep durations.
 Host records survive server reconnect; output remains in the guest's bounded
 ring. Reset invalidates old operations. After shutdown, only saved status/exit
 metadata is returned with `cached: true`; full output artifacts and automatic
-job-output retention after shutdown remain future work. Check `observation_error`
+job-output retention after shutdown remain future work; see the
+[durable output proposal](../../docs/vm-bridge-next.md#durable-command-output-and-guest-produced-artifacts--proposed). Check `observation_error`
 and per-stream `read_error`/`read_timed_out` before treating a snapshot as fresh.
 Normal CLI exit or stdio EOF waits for an in-flight upload to finish staging;
 the queued response is flushed immediately. A forced server termination may
