@@ -155,6 +155,12 @@ def main():
         for name, size in [('data', max(2048, args.workers*args.mib+512)), ('nix', 64)]:
             seed = directory / f'{name}-seed'; seed.mkdir()
             (seed / 'BROOK.MNT').write_text('/'+name)
+            if name == 'data':
+                # Kernel home initialization persists these five directories.
+                # Include them before the allocation baseline, so the final
+                # exact comparison measures workload leaks rather than boot.
+                for relative in ('home/.cache', 'home/.config', 'home/.local/share'):
+                    (seed / relative).mkdir(parents=True, exist_ok=True)
             image = directory / f'{name}.img'
             with image.open('wb') as f: f.truncate(size*1024*1024)
             base.command(['mkfs.ext2', '-q', '-F', '-b', str(args.block_size), '-d', str(seed), str(image)], output / f'format-{name}.log')

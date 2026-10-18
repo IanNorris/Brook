@@ -7,6 +7,7 @@
 // network interface.  This lets us unit-test the state transitions.
 
 #include "net.h"
+#include "clock_interval.h"
 #include <stdint.h>
 
 namespace brook {
@@ -16,8 +17,7 @@ namespace brook {
 // also preserves ordinary uint64 wraparound for short elapsed intervals.
 inline bool TcpTimerElapsed(uint64_t now, uint64_t previous, uint64_t delay)
 {
-    const uint64_t elapsed = now - previous;
-    return elapsed <= (~uint64_t{0} >> 1) && elapsed >= delay;
+    return ClockIntervalElapsed(now, previous, delay);
 }
 
 // A received FIN closes only the peer's send direction. Our send direction

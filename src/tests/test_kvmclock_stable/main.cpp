@@ -1,4 +1,5 @@
 #include <cstdio>
+#include "../../kernel/src/clock_interval.h"
 #include "../../kernel/src/kvmclock.cpp"
 
 namespace {
@@ -41,5 +42,16 @@ int main() {
     initialize();sampledTsc=~uint64_t(0);page.tsc_timestamp=0;CHECK(!KvmClockReadStableNs(&result));
     initialize();page.system_time=~uint64_t(0)-100;CHECK(!KvmClockReadStableNs(&result));
     CHECK(!KvmClockReadStableNs(nullptr));
+    // A recalibration step must not turn a fresh five-second I/O budget into
+    // an immediate timeout. The previous unsigned-only check fails this case.
+    CHECK(!ClockIntervalElapsed(9999,10000,5000));
+    CHECK(!ClockIntervalElapsed(14999,10000,5000));
+    CHECK(ClockIntervalElapsed(15000,10000,5000));
+    CHECK(ClockIntervalElapsed(15001,10000,5000));
+    const uint64_t nearWrap=~uint64_t(0)-999;
+    CHECK(!ClockIntervalElapsed(3999,nearWrap,5000));
+    CHECK(ClockIntervalElapsed(4000,nearWrap,5000));
+    CHECK(!ClockIntervalElapsed((uint64_t(1)<<63)+10000,10000,5000));
+
     std::printf("PVCLOCK_STABLE %s\n",failures?"FAIL":"PASS");return failures?1:0;
 }

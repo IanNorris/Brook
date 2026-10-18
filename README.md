@@ -74,6 +74,8 @@ the table distinguishes tested behavior from remaining limitations.
   guest. Fatal-signal group cancellation fixes retained shutdown helpers;
   three native close cycles, including a reboot, release every tested helper.
   Broader memory-pressure testing and startup performance work remain.
+  Firefox, Chromium and VSCodium have now also passed a three-app cold-persistence
+  and clean-exit check; [results and limitations](docs/browser-trio.md).
 
 - **Modern browsers:** stock Firefox and Chromium render real HTTPS websites
   with working input and JavaScript. Chromium now plays YouTube video and audio,
@@ -239,10 +241,10 @@ New captures use native 1920×1080 without upscaling. See
 <p align="center"><em>VSCodium — native editing and file persistence, captured at 1920×1080 with 130% editor zoom</em></p>
 
 <p align="center">
-  <a href="docs/images/brook_chromium_codium_4g_1080.png"><img src="docs/images/brook_chromium_codium_4g_1080.png" alt="Chromium browsing Google beside VSCodium with a document saved as the Brook user" width="960"></a>
+  <a href="docs/images/brook_browser_trio_1080.png"><img src="docs/images/brook_browser_trio_1080.png" alt="Firefox and Chromium showing synthetic video test pages beside VSCodium with a document saved as the Brook user" width="960"></a>
 </p>
 
-<p align="center"><em>Chromium and VSCodium together — Brook user, software Wayland, 4 GiB VM and native 1920×1080 capture. Editing, save/reopen and normal exits verified.</em></p>
+<p align="center"><em>Firefox, Chromium and VSCodium together — Brook user, software Wayland, 4 GiB VM and native 1920×1080 capture. Document and synthetic site storage survived reboot; normal exits verified.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_gimp_workflow_1080.png"><img src="docs/images/brook_gimp_workflow_1080.png" alt="GIMP 3 running as Brook with the transparent B image saved as XCF and exported as PNG" width="960"></a>

@@ -9,6 +9,7 @@
 #include "mem_tag.h"
 #include "idt.h"
 #include "kvmclock.h"
+#include "clock_interval.h"
 
 namespace brook {
 
@@ -65,26 +66,28 @@ static constexpr uint32_t VIRTIO_BLK_SUPPORTED_FEATURES = 0;
 static constexpr uint32_t VIRTIO_BLK_SUPPORTED_FEATURES = VIRTIO_BLK_F_FLUSH;
 #endif
 
-// Completion wait budget. The primary bound is wall-clock: under heavy
-// multi-device load a legitimately-slow completion can take far longer than a
-// fixed spin count, and a premature "timeout" used to permanently desync the
-// queue (BRO-164). The iteration cap is only a safety net for the rare caller
-// that spins with interrupts disabled (where the tick count is frozen).
-static constexpr uint64_t VIRTIO_WAIT_DEADLINE_MS = 5000;        // 5 s wall-clock
+// Completion wait budget. Use monotonic pvclock when available: RTC calibration
+// can move the apparent LAPIC counter backwards, so unsigned tick subtraction
+// could otherwise reset a healthy queue immediately. The non-KVM fallback
+// rejects backwards intervals; its rate/adjustments still limit accuracy.
+// The iteration cap also bounds waits with frozen LAPIC ticks (IRQs masked).
+static constexpr uint64_t VIRTIO_WAIT_DEADLINE_MS = 5000;        // 5 s on the selected clock
 static constexpr uint32_t VIRTIO_WAIT_ITER_CAP    = 2000000000u; // ~tens of seconds of pure spin
 
 // Global millisecond tick, incremented by the LAPIC timer ISR.
 extern volatile uint64_t g_lapicTickCount;
 
-// True once the spin budget is exhausted. Wall-clock deadline is primary;
-// the iteration cap bounds the wait if ticks are frozen (interrupts masked).
-static inline bool WaitBudgetExhausted(uint32_t iter, uint64_t startTick)
+// Clock selection is fixed during boot, before block requests are submitted.
+static inline uint64_t CompletionClockMs()
+{
+    return KvmClockAvailable() ? KvmClockReadNs() / 1000000ULL : g_lapicTickCount;
+}
+
+static inline bool WaitBudgetExhausted(uint32_t iter, uint64_t startedMs)
 {
     if (iter >= VIRTIO_WAIT_ITER_CAP) return true;
-    if ((iter & 0xFFFFu) == 0 &&
-        (g_lapicTickCount - startTick) >= VIRTIO_WAIT_DEADLINE_MS)
-        return true;
-    return false;
+    if ((iter & 0xFFFFu) != 0) return false;
+    return ClockIntervalElapsed(CompletionClockMs(), startedMs, VIRTIO_WAIT_DEADLINE_MS);
 }
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SECTORS = 8;     // 4 KiB
 static constexpr uint32_t VIRTIO_CACHE_BLOCK_SIZE    = 4096;
@@ -559,10 +562,10 @@ static bool SubmitRequest(VirtioBlkState& s,
     uint64_t probeStartNs = KvmClockReadNs();
     uint64_t probeIters   = 0;
     {
-        uint64_t startTick = g_lapicTickCount;
+        uint64_t startedMs = CompletionClockMs();
         for (uint32_t i = 0; ; ++i) {
             if (*s.usedIdx != s.usedIdxShadow) { probeIters = i; goto done; }
-            if (WaitBudgetExhausted(i, startTick)) break;
+            if (WaitBudgetExhausted(i, startedMs)) break;
             __asm__ volatile("pause" ::: "memory");
         }
     }
@@ -669,7 +672,7 @@ static bool WaitAllSlots(VirtioBlkState& s, uint32_t count)
     // Spin-wait for completion. We hold requestGuard (and callers may hold
     // filesystem locks), so we must NOT hlt — the completion IRQ may route
     // to another CPU, leaving this one halted with locks held.
-    uint64_t startTick = g_lapicTickCount;
+    uint64_t startedMs = CompletionClockMs();
     uint64_t probeStartNs = KvmClockReadNs();
     for (uint32_t iter = 0; ; ++iter)
     {
@@ -678,7 +681,7 @@ static bool WaitAllSlots(VirtioBlkState& s, uint32_t count)
         for (uint32_t i = 0; i < count; ++i)
             if (!s.slots[i].complete) { allDone = false; break; }
         if (allDone) { ProbeRecordWait(s, probeStartNs, iter, count, 1); return true; }
-        if (WaitBudgetExhausted(iter, startTick)) break;
+        if (WaitBudgetExhausted(iter, startedMs)) break;
         __asm__ volatile("pause" ::: "memory");
     }
 
@@ -826,10 +829,10 @@ static int SubmitScatterGatherRead(VirtioBlkState& s, uint64_t startSector,
     uint64_t probeStartNs = KvmClockReadNs();
     uint64_t probeIters   = 0;
     {
-        uint64_t startTick = g_lapicTickCount;
+        uint64_t startedMs = CompletionClockMs();
         for (uint32_t i = 0; ; ++i) {
             if (*s.usedIdx != s.usedIdxShadow) { probeIters = i; goto sg_done; }
-            if (WaitBudgetExhausted(i, startTick)) break;
+            if (WaitBudgetExhausted(i, startedMs)) break;
             __asm__ volatile("pause" ::: "memory");
         }
     }
@@ -965,10 +968,10 @@ static int SubmitScatterGatherWrite(VirtioBlkState& s, uint64_t startSector,
     uint64_t probeStartNs = KvmClockReadNs();
     uint64_t probeIters   = 0;
     {
-        uint64_t startTick = g_lapicTickCount;
+        uint64_t startedMs = CompletionClockMs();
         for (uint32_t i = 0; ; ++i) {
             if (*s.usedIdx != s.usedIdxShadow) { probeIters = i; goto sgw_done; }
-            if (WaitBudgetExhausted(i, startTick)) break;
+            if (WaitBudgetExhausted(i, startedMs)) break;
             __asm__ volatile("pause" ::: "memory");
         }
     }
