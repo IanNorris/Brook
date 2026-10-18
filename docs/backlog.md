@@ -9,6 +9,15 @@
   wakeup behavior. Measure Firefox playback separately; no browser improvement
   is established by the clock probe. Preserve rejected historical timings.
 
+- Investigate Firefox presentation and visibility after the
+  [buffered-fixture/profile work](firefox-presentation.md). Media progress and
+  browser total-frame counters run near source rate, while video-frame callbacks
+  and the private display stream remain slow. Cold pages can report hidden
+  despite visible/focused native windows, including after the activation
+  correction. Separate event delivery, mapping-lock contention and presentation;
+  retain producer-loss checks. Finish native resize/maximize CSD geometry and
+  true widget visibility independently of seat focus.
+
 - Split `src/kernel/src/syscall.cpp` (now over 14,000 lines) into subsystem
   translation units. Start with an inventory of dispatch entries, shared state
   and helper ownership; move one subsystem at a time while preserving behavior,

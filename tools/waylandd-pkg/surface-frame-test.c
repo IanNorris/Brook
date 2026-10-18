@@ -64,6 +64,20 @@ int main(void) {
     other.pointer=wl_resource_create(foreign,&wl_pointer_interface,5,3);
     assert(first.pointer && second.pointer && other.pointer);
     other.next=&second;second.next=&first;g_seat_clients=&other;
+    /* v1 clients also require exactly one post-map activation configure, even
+     * when the client binds the seat twice. */
+    surface.xdg_surface=wl_resource_create(client,&xdg_surface_interface,1,35);
+    surface.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,36);
+    assert(surface.xdg_surface && surface.xdg_toplevel);
+    surface.xdg_initial_commit_done=1;
+    wl_resource_set_user_data(surface.xdg_surface,&surface);
+    surface.vfb_w=852;surface.vfb_h=652; // includes the CSD shadow margins
+    xdg_surface_set_window_geometry(client,surface.xdg_surface,26,26,800,600);
+    assert(surface.window_geometry_pending && surface.window_geometry_w==0);
+    surface_commit(client,surface.resource);
+    assert(!surface.window_geometry_pending && surface.window_geometry_w==800 && surface.window_geometry_h==600);
+    /* A later uncommitted geometry must not alter a state-only configure. */
+    xdg_surface_set_window_geometry(client,surface.xdg_surface,26,26,640,480);
     struct brook_wm_event event={.type=WM_EVT_FOCUS_GAINED};
     dispatch_window_event(&surface,&event,100);
     assert(first.kb_focus==&surface && second.kb_focus==&surface && !other.kb_focus);
@@ -77,10 +91,18 @@ int main(void) {
     uint32_t keysWire[128];
     ssize_t keysBytes=recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT);
     assert(keysBytes>0);
-    unsigned enters[2]={0},keys[2]={0},axes[2]={0};
+    unsigned enters[2]={0},keys[2]={0},axes[2]={0},activations=0,configures=0;
     for(size_t i=0;i<(size_t)keysBytes/4;) {
         uint32_t object=keysWire[i],op=keysWire[i+1]&65535,size=keysWire[i+1]>>16;
         assert(size>=8 && i*4+size<=(size_t)keysBytes);
+        if(object==36 && op==XDG_TOPLEVEL_CONFIGURE) {
+            assert(size==24 && keysWire[i+2]==800 && keysWire[i+3]==600);
+            assert(keysWire[i+4]==4 && keysWire[i+5]==XDG_TOPLEVEL_STATE_ACTIVATED);
+            ++activations;
+        }
+        if(object==35 && op==XDG_SURFACE_CONFIGURE) {
+            assert(size==12 && keysWire[i+2]==surface.next_configure_serial);++configures;
+        }
         if(object==31 || object==32) {
             if(op==WL_KEYBOARD_ENTER)++enters[object-31];
             if(op==WL_KEYBOARD_KEY)++keys[object-31];
@@ -91,11 +113,29 @@ int main(void) {
         }
         i+=size/4;
     }
+    assert(surface.toplevel_activated && !surface.xdg_acked);
+    assert(activations==1 && configures==1);
     assert(axes[0]==1 && axes[1]==1);
     assert(enters[0]==1 && enters[1]==1 && keys[0]==2 && keys[1]==2);
     assert(recv(foreignSockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT)==-1 && errno==EAGAIN);
     event.type=WM_EVT_FOCUS_LOST;dispatch_window_event(&surface,&event,103);
     assert(!first.kb_focus && !second.kb_focus && !other.kb_focus);
+    assert(!surface.toplevel_activated);
+    wl_display_flush_clients(display);
+    keysBytes=recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT);assert(keysBytes>0);
+    unsigned deactivations=0;configures=0;
+    for(size_t i=0;i<(size_t)keysBytes/4;) {
+        uint32_t object=keysWire[i],op=keysWire[i+1]&65535,size=keysWire[i+1]>>16;
+        assert(size>=8 && i*4+size<=(size_t)keysBytes);
+        if(object==36 && op==XDG_TOPLEVEL_CONFIGURE) {assert(size==20 && keysWire[i+4]==0);++deactivations;}
+        if(object==35 && op==XDG_SURFACE_CONFIGURE)++configures;
+        i+=size/4;
+    }
+    assert(deactivations==1 && configures==1);
+    /* Repeated focus-lost must not manufacture another configure. */
+    dispatch_window_event(&surface,&event,104);wl_display_flush_clients(display);
+    assert(recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT)==-1 && errno==EAGAIN);
+
     g_seat_clients=NULL;wl_client_destroy(foreign);close(foreignSockets[1]);
     wl_client_destroy(client);
     assert(wl_list_empty(&surface.pending_frames) && wl_list_empty(&surface.committed_frames));

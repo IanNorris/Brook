@@ -129,3 +129,7 @@ scope, missing source spans and counter reset. For example:
 python3 scripts/analyze_browser_media.py RUN/media-state.jsonl \
   --phase ff-candidate --capture RUN/candidate/audio.json
 ```
+
+The [buffered-fixture presentation follow-up](firefox-presentation.md) separates
+frame counters from frame callbacks, adds loss-checked profiles, and records
+the remaining native/browser visibility discrepancy.

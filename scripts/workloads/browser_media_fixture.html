@@ -1,0 +1,37 @@
+<!doctype html><meta charset="utf-8"><title>Brook media timing</title>
+<style>body{margin:20px;font:20px sans-serif;background:#172638;color:#e3edf7}h1{font-size:26px;margin:10px 0}button{font:22px sans-serif;padding:10px 18px;margin:8px 10px 16px 0}video{display:block;width:480px;height:270px;background:#000}pre{font:17px monospace;white-space:pre-wrap}</style>
+<h1>Brook: browser presentation check</h1><button id="play">Play video + audio</button><button id="pause">Pause</button><button id="report">Report</button><video controls loop src="clip.webm"></video><pre id="status"></pre>
+<script>
+const params=new URLSearchParams(location.search), phase=params.get('phase'),
+      noisy=params.get('status')==='1', video=document.querySelector('video'),
+      status=document.querySelector('#status');
+let samples=[], timer=null, lastText=0, callbacks=0, lastBatch=null;
+function sample(){
+  const q=video.getVideoPlaybackQuality();
+  return {phase,performance_ms:performance.now(),realtime_ms:Date.now(),
+    visibility:document.visibilityState,has_focus:document.hasFocus(),
+    t:video.currentTime,duration:video.duration,frames:q.totalVideoFrames,
+    dropped:q.droppedVideoFrames,rvfc:typeof video.requestVideoFrameCallback==='function'?callbacks:null,
+    paused:video.paused,ready:video.readyState,w:video.videoWidth,h:video.videoHeight};
+}
+function send(state){return fetch('/state',{method:'POST',body:JSON.stringify(state)});}
+function take(){
+  const state=sample();samples.push(state);
+  if(noisy && state.performance_ms-lastText>=500){status.textContent=JSON.stringify(state,null,2);lastText=state.performance_ms;}
+}
+if(typeof video.requestVideoFrameCallback==='function'){
+  const frame=()=>{callbacks++;video.requestVideoFrameCallback(frame);};video.requestVideoFrameCallback(frame);
+}
+video.addEventListener('canplay',()=>send({...sample(),kind:'ready'}).catch(()=>{}),{once:true});
+video.addEventListener('playing',()=>{if(timer!==null)return;samples=[];take();timer=setInterval(take,100);});
+video.addEventListener('pause',()=>{
+  if(timer===null)return;take();clearInterval(timer);timer=null;
+  lastBatch={phase,kind:'batch',status_updates:noisy,samples};
+  status.textContent='Paused; '+samples.length+' source-timestamped samples.';
+  send(lastBatch).catch(()=>{status.textContent+=' Report delivery failed; use Report to retry.';});
+});
+document.querySelector('#play').onclick=()=>video.play().catch(e=>{status.textContent=String(e);});
+document.querySelector('#pause').onclick=()=>video.pause();
+document.querySelector('#report').onclick=()=>{if(lastBatch)send(lastBatch).catch(()=>{});};
+status.textContent=noisy?'Status text updates every 500 ms.':'Quiet mode: no text updates or telemetry requests during playback.';
+</script>

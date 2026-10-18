@@ -217,6 +217,10 @@ struct brook_surface {
     struct wl_resource *xdg_popup;        /* popup role (mutex with toplevel) */
     int  xdg_initial_commit_done;
     int  xdg_acked;
+    int  toplevel_activated;
+    int32_t window_geometry_w, window_geometry_h;
+    int32_t pending_geometry_w, pending_geometry_h;
+    int window_geometry_pending;
     uint32_t next_configure_serial;
     /* Popup geometry derived from positioner at get_popup time. */
     int32_t popup_w, popup_h;
@@ -440,6 +444,12 @@ static void blit_to_window(struct brook_surface *s,
 static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     (void)c;
     struct brook_surface *s = wl_resource_get_user_data(r);
+
+    if (s->window_geometry_pending) {
+        s->window_geometry_w = s->pending_geometry_w;
+        s->window_geometry_h = s->pending_geometry_h;
+        s->window_geometry_pending = 0;
+    }
 
     /* xdg-shell role: the very first commit must have NO buffer; we
      * respond with a configure. The client acks, then commits with a
@@ -1053,7 +1063,15 @@ static void xdg_surface_get_popup(struct wl_client *c, struct wl_resource *r,
 static void xdg_surface_set_window_geometry(struct wl_client *c, struct wl_resource *r,
                                               int32_t x, int32_t y,
                                               int32_t w, int32_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+    (void)c; (void)x; (void)y;
+    struct brook_surface *s = wl_resource_get_user_data(r);
+    if (w <= 0 || h <= 0) {
+        wl_resource_post_error(r, XDG_SURFACE_ERROR_INVALID_SIZE,
+                               "window geometry must have positive dimensions");
+        return;
+    }
+    s->pending_geometry_w = w; s->pending_geometry_h = h;
+    s->window_geometry_pending = 1;
 }
 static void xdg_surface_ack_configure(struct wl_client *c, struct wl_resource *r,
                                         uint32_t serial) {
@@ -1944,9 +1962,9 @@ static void dispatch_surface_event(struct brook_surface *s,
             int32_t neww = e->x;
             int32_t newh = e->y;
             struct wl_array states; wl_array_init(&states);
-            /* Tell the client this is an active toplevel; resize is a
-             * normal configure, not a fullscreen/maximize. */
-            if (wl_resource_get_version(s->xdg_toplevel) >= 2) {
+            /* Preserve the native activation state on resize. Activation is
+             * available from xdg_toplevel v1, independently of seat bindings. */
+            if (s->toplevel_activated) {
                 uint32_t *st = wl_array_add(&states, sizeof(uint32_t));
                 if (st) *st = XDG_TOPLEVEL_STATE_ACTIVATED;
             }
@@ -1965,10 +1983,37 @@ static void dispatch_surface_event(struct brook_surface *s,
     }
 
 }
+/* Activation is a toplevel state, independent of seat bindings. GTK clients
+ * need a post-map configure when the native WM activates the window; keyboard
+ * enter alone does not communicate xdg-shell activation. The activated enum
+ * exists in xdg_toplevel v1. Preserve committed client geometry: a zero-size
+ * reconfigure makes some GTK clients choose a smaller natural size, whereas
+ * buffer dimensions include CSD shadows and would grow the window. */
+static void toplevel_set_activated(struct brook_surface *surface, int active) {
+    if (!surface->xdg_toplevel || !surface->xdg_surface ||
+        surface->toplevel_activated == active) return;
+    struct wl_array states; wl_array_init(&states);
+    if (active) {
+        uint32_t *state = wl_array_add(&states, sizeof(*state));
+        if (!state) { wl_client_post_no_memory(wl_resource_get_client(surface->resource)); return; }
+        *state = XDG_TOPLEVEL_STATE_ACTIVATED;
+    }
+    surface->toplevel_activated = active;
+    int32_t width = surface->window_geometry_w > 0 ? surface->window_geometry_w : (int32_t)surface->vfb_w;
+    int32_t height = surface->window_geometry_h > 0 ? surface->window_geometry_h : (int32_t)surface->vfb_h;
+    xdg_toplevel_send_configure(surface->xdg_toplevel, width, height, &states);
+    wl_array_release(&states);
+    surface->next_configure_serial = next_serial();
+    surface->xdg_acked = 0;
+    xdg_surface_send_configure(surface->xdg_surface, surface->next_configure_serial);
+}
+
 static void dispatch_window_event(struct brook_surface *surface,
                                   struct brook_wm_event *event,uint32_t now) {
     /* Window management requests are per window. Input is per resource: GTK
      * and application libraries can independently bind the same wl_seat. */
+    if (event->type == WM_EVT_FOCUS_GAINED) toplevel_set_activated(surface, 1);
+    if (event->type == WM_EVT_FOCUS_LOST) toplevel_set_activated(surface, 0);
     if (event->type==WM_EVT_CLOSE_REQUESTED || event->type==WM_EVT_RESIZED) {
         dispatch_surface_event(surface,NULL,event,now);
         return;
