@@ -76,7 +76,56 @@ contains frozen artifacts, manifests, tracked command output, serial and disk
 checks; `summary.json` records the eight-worker results. Build, final suites and
 negative-control logs are adjacent under `build/workloads/`.
 
-Firefox previously reported slow media progress. This clock defect could affect
-its realtime waits, but browser playback has not yet been compared with this
-kernel. Do not infer browser speed or audio improvements from the clock probe.
-Full matching bootstrap acceptance still precedes this kernel revision.
+## Firefox follow-up: source time versus HTTP receipt time
+
+Firefox subsequently launched through its normal catalogue entry on both
+kernels, alone in an eight-vCPU, 4 GiB software-Wayland guest. The same private
+synthetic profile fixture and local 640×360, 24-fps VP9/48-kHz Opus clip were
+used. Native Play/Pause actions bracketed ten-second PCM captures without
+screenshots or profiling inside the capture intervals.
+
+| Observation | Previous kernel | Epoch-anchor kernel |
+| --- | ---: | ---: |
+| Host PCM capture duration | 10.003 s | 10.006 s |
+| Stereo PCM frames at 44.1 kHz | 441,300 | 441,056 |
+| Silent 10-ms bins | 0 | 0 |
+| Source sample interval | 12.653 s | 9.623 s |
+| Media seconds per `performance.now` second | 1.002 | 1.001 |
+| Browser total video frames per page second | 24.26 | 24.00 |
+| Browser reported presented frames per page second | 3.24 | 8.00 |
+| Out-of-order sample receipts | 14/26 samples | 8/20 samples |
+
+Both pause checks returned zero PCM frames and an inactive stream. Each normal
+Firefox close drained its full launch lineage; heap, checked shutdown,
+authoritative QEMU exit, launcher exit zero, serial and offline FAT/ext2 checks
+passed. Evidence is under `build/workloads/firefox-realtime-20261018/`.
+
+**This is not an accepted video speedup measurement.** The control observer
+first requested an unsupported 15-second capture, then resumed the same playing
+page at the supported ten-second limit. That gave the control a longer warm-up.
+A second observer assertion exposed delayed/out-of-order HTTP telemetry; the
+existing PCM was retained and reanalyzed, without replaying Play or recapturing.
+The candidate's interval followed the corrected path. One pair with unequal
+warm-up and no host-load control cannot establish the effect of the clock fix
+on presentation performance. Total/presented frame counts are browser reports,
+not an independent count of visible compositor frames or proof of decode cost.
+
+The earlier half-speed inference from receipt-time progress is withdrawn.
+Sample requests can arrive seconds late and out of order. Sorting by source
+`performance.now` gives media progress near one second per page second on both
+kernels; numerous frames are still reported dropped. This does not prove
+real-time host pacing for the earlier three-app run, whose old fixture lacked
+source timestamps. Further work should separate decode, presentation and
+scheduling costs with a controlled warm-up and loss-checked profiles.
+
+`scripts/analyze_browser_media.py` now sorts source samples, unwraps real clip
+loops, preserves smaller media backsteps, rejects counter resets and labels its
+rates as page-clock measurements. Its optional PCM interval filter selects
+**receipt** times; it explicitly does not claim sample/PCM alignment. Four
+regressions cover reordered delivery, loop/backstep distinction, interval
+scope, missing source spans and counter reset. For example:
+
+```sh
+python3 scripts/analyze_browser_media.py RUN/media-state.jsonl \
+  --phase ff-candidate --capture RUN/candidate/audio.json
+```

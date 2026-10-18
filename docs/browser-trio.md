@@ -30,9 +30,12 @@ After all applications exited, capture returned no frames and an inactive
 stream. No screenshots or CPU profiling interrupted the measurement intervals.
 
 These checks establish audio delivery and cleanup, not glitch-free playback.
-Firefox's reported media progress was approximately half real time in this
-run; Chromium was closer to source rate. Delayed page-state delivery and the
-known realtime-clock defect have not been separated from media scheduling.
+An initial half-speed inference from Firefox's receipt-time progress is
+withdrawn: later measurements found delayed and out-of-order page-state
+delivery. The original fixture lacked source timestamps, so its actual media
+pacing remains unverified. A [source-timestamp follow-up](realtime-clock.md#firefox-follow-up-source-time-versus-http-receipt-time)
+finds normal media progress per page second but many reported dropped frames;
+the realtime clock defect has also been repaired separately.
 The later CPU capture lost 24,279 records, so it cannot establish an application
 CPU bottleneck or support a speedup claim.
 
