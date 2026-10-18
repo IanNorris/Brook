@@ -20,7 +20,7 @@ class InstallLinkTests(unittest.TestCase):
         cls.build=tempfile.TemporaryDirectory(prefix='brook-install-links-')
         cls.root=Path(cls.build.name)/'fixture'
         cls.binary=Path(cls.build.name)/'nix'
-        paths=dict(STORE_DIR='store',INDEX_PATH='index',PROFILE_DIR='profile',
+        paths=dict(STORE_DIR='store',NARINFO_DIR='narinfo',INDEX_PATH='index',PROFILE_DIR='profile',
                    PROFILE_BIN='profile/bin',PROFILE_LIB='profile/lib',
                    PROFILE_APPS='profile/share/applications',MANIFEST_PATH='profile/manifest.tsv',
                    APPS_DIR='apps',APPS_IDX='apps/applications.idx',APPS_ICONS_DIR='apps/icons',BROOK_BIN='wrappers')
@@ -80,6 +80,31 @@ class InstallLinkTests(unittest.TestCase):
                 self.assertEqual(self.manifest.read_text(),f'fixture\t1\t{STORE_NAME}\n')
                 shutil.rmtree(blocked);self.install()
                 for link in self.links():self.assertTrue(link.is_file(),link)
+
+    def references(self, names):
+        cache=self.root/'narinfo';cache.mkdir(exist_ok=True)
+        (cache/(STORE_NAME[:32]+'.narinfo')).write_text('References: '+' '.join(names)+'\n')
+
+    def test_file_output_dependencies_do_not_require_lib_directories(self):
+        name='b'*32+'-runtime.msi';link='c'*32+'-runtime-link'
+        data=self.root/'store'/name;data.write_bytes(b'owned standalone store output')
+        (self.root/'store'/link).symlink_to(name)
+        self.references([name,link])
+        self.install()
+        for path in self.links():self.assertTrue(path.is_file(),path)
+        self.assertEqual(data.read_bytes(),b'owned standalone store output')
+        self.install()  # Exercise repair of the already-published registration.
+
+    def test_malformed_dependency_lib_directory_remains_an_error(self):
+        name='d'*32+'-broken';dependency=self.root/'store'/name;dependency.mkdir()
+        (dependency/'lib').write_text('a file where the library directory belongs')
+        self.references([name])
+        self.assertIn(b'incomplete profile links',self.install(success=False).stderr)
+
+    def test_regular_store_output_has_no_profile_subdirectories(self):
+        shutil.rmtree(self.package);self.package.write_bytes(b'owned data-only output')
+        self.install()
+        self.assertEqual(self.package.read_bytes(),b'owned data-only output')
 
 
 if __name__=='__main__':

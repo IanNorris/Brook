@@ -35,6 +35,9 @@
 #ifndef STORE_DIR
 #define STORE_DIR "/nix/store"
 #endif
+#ifndef NARINFO_DIR
+#define NARINFO_DIR "/nix/var/cache/narinfo"
+#endif
 
 #ifndef INDEX_PATH
 #define INDEX_PATH      "/nix/index/packages.idx"
@@ -382,11 +385,24 @@ static int acquire_profile_lock(void) {
  * /nix/profile/store/... and the kernel's VFS correctly reported the
  * path as non-existent, which caused execve to fall back to busybox
  * and every installed binary to exit 127. */
+/* Store outputs may be individual files (for example Wine's Mono MSI), not
+ * just directory trees. Such outputs have no profile subdirectories. Check
+ * the output itself so an invalid lib/bin within a directory still fails. */
+static int open_package_directory(const char *store_name, const char *suffix, DIR **out) {
+    char package[512],path[1024];struct stat st;
+    *out=NULL;
+    snprintf(package,sizeof(package),STORE_DIR "/%s",store_name);
+    if(stat(package,&st)<0) return errno==ENOENT ? 0 : -1;
+    if(!S_ISDIR(st.st_mode)) return 0;
+    snprintf(path,sizeof(path),"%s/%s",package,suffix);
+    *out=opendir(path);
+    return *out ? 1 : (errno==ENOENT ? 0 : -1);
+}
+
 static int link_package_desktops(const char *store_name) {
-    char source[1024];
-    snprintf(source,sizeof(source),STORE_DIR "/%s/share/applications",store_name);
-    DIR *directory=opendir(source);
-    if (!directory) return errno==ENOENT ? 0 : -1;
+    DIR *directory=NULL;
+    int opened=open_package_directory(store_name,"share/applications",&directory);
+    if(opened<=0) return opened;
     if(mkdir_p(PROFILE_APPS)<0 && errno!=EEXIST) {closedir(directory);return -1;}
     struct dirent *entry;int linked=0;
     while ((entry=readdir(directory))) {
@@ -429,8 +445,9 @@ static int link_package_bins(const char *store_name) {
     char bin_dir[512];
     snprintf(bin_dir, sizeof(bin_dir), STORE_DIR "/%s/bin", store_name);
 
-    DIR *d = opendir(bin_dir);
-    if (!d) return errno==ENOENT ? 0 : -1; /* Libraries may have no bin/. */
+    DIR *d = NULL;
+    int opened=open_package_directory(store_name,"bin",&d);
+    if(opened<=0) return opened;
 
     if(mkdir_p(PROFILE_BIN)<0 && errno!=EEXIST) {closedir(d);return -1;}
 
@@ -464,8 +481,9 @@ static int link_package_libs_to_dir(const char *store_name, const char *dst_dir,
     char lib_dir[512];
     snprintf(lib_dir, sizeof(lib_dir), STORE_DIR "/%s/lib", store_name);
 
-    DIR *d = opendir(lib_dir);
-    if (!d) return errno==ENOENT ? 0 : -1; /* Tools may have no lib/. */
+    DIR *d = NULL;
+    int opened=open_package_directory(store_name,"lib",&d);
+    if(opened<=0) return opened;
 
     if(mkdir_p(dst_dir)<0 && errno!=EEXIST) {closedir(d);return -1;}
 
@@ -517,7 +535,7 @@ static int link_closure_libs_from_narinfo(const char *store_name) {
 
     char narinfo_path[512];
     snprintf(narinfo_path, sizeof(narinfo_path),
-             "/nix/var/cache/narinfo/%s.narinfo", hash);
+             NARINFO_DIR "/%s.narinfo", hash);
 
     FILE *f = fopen(narinfo_path, "r");
     if (!f) return 0;
@@ -555,7 +573,7 @@ static int link_closure_libs_into_package(const char *store_name) {
 
     char narinfo_path[512];
     snprintf(narinfo_path, sizeof(narinfo_path),
-             "/nix/var/cache/narinfo/%s.narinfo", hash);
+             NARINFO_DIR "/%s.narinfo", hash);
 
     FILE *f = fopen(narinfo_path, "r");
     if (!f) return 0;

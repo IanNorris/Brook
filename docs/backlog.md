@@ -4,9 +4,11 @@
   `/tmp/.wine-1000` as not owned by UID1000, including metadata on newly created
   temporary directories and path routing. A private owned ext2 `TMPDIR` did not
   change the server path. The loader's version command passes, but no Windows
-  command has passed yet. Separately repair the `nix-install` profile-link
-  `ENOTDIR` failure after Wine's payload was unpacked; preserve and test recovery
-  of the partially published profile. Keep Vulkan/Proton work separate.
+  command has passed yet. The installer now accepts standalone file outputs
+  such as the Mono MSI, with candidate recovery/retry and cold profile-version
+  checks passing; refresh bundled tools with future images. Full fresh-download,
+  interrupted/disk-full and whole-profile transaction acceptance remain separate.
+  Keep Vulkan/Proton work separate and return to application stability testing.
 
 - Finish clock coverage after the [realtime epoch-anchor repair](realtime-clock.md).
   The eight-worker KVM comparison now has zero backwards realtime steps, versus

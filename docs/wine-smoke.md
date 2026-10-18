@@ -11,7 +11,7 @@ guest's existing `nix-install`, using private RAM-backed copies of the checked
 prepared bootstrap disks. Configuration: eight vCPUs, 4 GiB, CPU composition,
 headless, no Wayland service, and silent host audio. The candidate kernel SHA256
 was `9e64f2783804714a8998f0bdaf2cbe756980fa0e668b98d07c38292615646ccd`;
-it also contained the pending pipe-read ordering fix, whose source hashes are
+it also contained the pipe-read ordering fix, whose source hashes are
 retained in the audit. Main was not changed.
 
 ## Results
@@ -42,8 +42,8 @@ normal desktop launcher or an isolation guarantee.
 First diagnose the ownership/metadata and path handling behind the server
 directory rejection, using a rootless temporary-directory regression. Do not
 assume ordinary Wine application syscalls are already working: the test stopped
-before its first successful Windows command. Investigate the installer profile
-link failure separately, preserving the partially published state. Resume with
+before its first successful Windows command. The small installer repair below
+addresses the encountered profile-link failure. Resume with
 the same small console command before attempting a graphical Windows program.
 Vulkan remains a separate planned effort.
 
@@ -56,3 +56,36 @@ QEMU exit zero, zero deferred cleanup, passing heap checks, no visible user
 faults, and nine passing read-only post-stop filesystem checks. Private images
 were retained and RAM copies released. The package-install and Windows-command
 failures are negative evidence, not passing workload acceptance.
+
+## Installer recovery verified
+
+Wine's closure includes standalone file outputs, including the Mono MSI.
+The installer tried to open `<file-output>/lib` while linking closure libraries,
+then treated the resulting `ENOTDIR` as a damaged profile. It now checks the
+store output's type before looking for bin/lib/desktop directories. File
+outputs have no such directories; an actual malformed `lib` inside a directory
+output still fails instead of being silently ignored.
+
+Two new positive host regressions reproduced the old failure: a file/symlink
+dependency and a standalone file package. A negative regression preserves
+errors for malformed library directories. All 31 installer tests passed,
+including existing publication, repair and cancellation checks.
+
+A candidate static installer (`/boot/BIN/NIXWTEST`, not the old bundled helper)
+was run on fresh private clones of the failed installation. Both recovery and
+an immediate repeated install exited zero. `/nix/profile/bin/wine --version`
+then passed as Brook, and passed again after cold boot. Full child logs were
+retained as files and matched their reported lengths/SHA256 after shutdown;
+the Mono MSI's contents also matched the original host store output. Both
+accepted sessions drained all tasks and deferred cleanup, passed heap checks,
+and completed orderly shutdown with original launcher/QEMU exit zero and six
+passing post-stop filesystem checks. RAM copies were released.
+
+Evidence: `build/workloads/wine-profile-repair-verified-20261018/acceptance-audit.json`.
+The first diagnostic recovery returned zero but overflowed bridge output; it
+is retained separately and excluded from acceptance. The bundled installer in
+the earlier smoke image remains old; future tool/image builds pick up this
+source fix. This verifies recovery of an already-unpacked package, not a new
+fresh download through the candidate. Wineserver's temporary-directory
+ownership rejection and Windows command acceptance remain unresolved. Further
+Wine/Proton work is deferred while application stability testing continues.
