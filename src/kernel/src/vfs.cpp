@@ -432,9 +432,9 @@ int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t 
     if (!mount || !mount->fsOps) return -2;
     int error=0;
     Vnode* opened=mount->fsOps->open_mode_checked ?
-        mount->fsOps->open_mode_checked(mount->mountPriv,mount->pdrv,relative,0,0666,&error) :
-        mount->fsOps->open_mode ? mount->fsOps->open_mode(mount->mountPriv,mount->pdrv,relative,0,0666) :
-        mount->fsOps->open ? mount->fsOps->open(mount->mountPriv,mount->pdrv,relative,0) : nullptr;
+        mount->fsOps->open_mode_checked(mount->mountPriv,mount->pdrv,relative,VFS_O_EXEC,0666,&error) :
+        mount->fsOps->open_mode ? mount->fsOps->open_mode(mount->mountPriv,mount->pdrv,relative,VFS_O_EXEC,0666) :
+        mount->fsOps->open ? mount->fsOps->open(mount->mountPriv,mount->pdrv,relative,VFS_O_EXEC) : nullptr;
     if (!opened) return error?error:-2;
     if (opened->type==VnodeType::Dir) { VfsClose(opened);return -13; }
     *vnode=opened;return 0;

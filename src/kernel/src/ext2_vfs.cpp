@@ -3042,11 +3042,13 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
     if (!created && !(flags & VFS_O_METADATA)) {
         Process* cur = ProcessCurrent();
         if (!mnt->skipPermChecks) {
-            uint8_t perm = ProcessFilePermissions(cur, Ext2Uid(inodeData), Ext2Gid(inodeData),
-                                                  inodeData.i_mode);
-            uint8_t required = (flags & VFS_O_WRITE) ? 2 : 4;
-            if (flags & VFS_O_READWRITE) required |= 4;
-            if ((perm & required) != required) {
+            uint8_t required=(flags&VFS_O_EXEC)?1:((flags&VFS_O_WRITE)?2:4);
+            if(flags&VFS_O_READWRITE)required|=4;
+            const int denied=(flags&VFS_O_EXEC) &&
+                (inodeData.i_mode&EXT2_S_IFMT)!=EXT2_S_IFREG ? -13 :
+                ProcessCheckFileAccess(cur,Ext2Uid(inodeData),Ext2Gid(inodeData),
+                                       inodeData.i_mode,required,false);
+            if (denied) {
                 if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
                 else            KRwLockReadUnlock(&g_ext2Lock);
                 if (error) *error = -13; // EACCES; prevent alias fallback on denial.

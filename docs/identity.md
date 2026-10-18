@@ -732,3 +732,11 @@ The subsequent [retained-directory follow-up](dirfd-identity.md) fixes silent
 lookup through ext2's retained inode. Its ABI-19 layout requires all modules to
 be rebuilt. Atomic namespace-relative operations, retained process CWD and the
 other identity gaps above remain open; this does not complete account isolation.
+
+
+The [executable-permission follow-up](exec-permissions.md) now checks execute
+intent on ext2 data files and preflights ELF interpreters before exec commits.
+Its 672-case matrix covers effective IDs, groups, execute-only files and denied
+interpreter calls preserving the old process. The Nix bypass, dispatch-time
+launch credential context, set-ID/capability policy and remaining namespace
+limits remain explicit. This does not finish the accounts boundary.

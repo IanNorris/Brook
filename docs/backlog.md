@@ -1225,3 +1225,19 @@ passes the long-path, rename/replacement and fd-safe cleanup probes, and removes
 the installer fixture workaround. Atomic inode-relative namespace operations,
 retained process CWD and other-backend identity remain open; the callback and
 canonical opening-path fallback do not establish complete isolation.
+
+### Exec launch context, path limits and build provenance
+
+The [execute gate](exec-permissions.md) checks the syscall caller's effective
+credentials. Kernel-created desktop/guest-command launches still open images
+in the dispatch caller's context before applying the requested target UID.
+Audit that context before accounts. Relative exec joins still use a bounded
+copy that can truncate rather than return ENAMETOOLONG; replace it with the
+checked path helper and test exact length boundaries and CWD behavior.
+
+The kernel's CMake-generated embedded git label can remain stale across source
+builds when the external kernel project is not reconfigured. The 18 October exec
+build showed `72df825+...` while the checked-out base was `600c53a5`; acceptance
+uses frozen ELF/module SHA-256 and source patches, not that label. Make build
+provenance refresh on every relevant source/HEAD change without recompiling the
+whole kernel unnecessarily, and verify clean/dirty checkout transitions.

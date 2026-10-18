@@ -611,6 +611,10 @@ uint64_t ProcessExecExecutable(Process* proc, const ExecutableImage& image,
     int argc, const char* const* argv, int envc, const char* const* envp,
     uint64_t* outStackPtr);
 
+uint64_t ProcessExecPreparedExecutable(Process*, const ExecutableImage&,
+    const ExecutableImage& interpreter, int argc, const char* const* argv,
+    int envc, const char* const* envp, uint64_t* outStackPtr);
+
 CredentialIds ProcessReadIds(Process* proc, bool group);
 int ProcessChangeIds(Process* proc, bool group, CredentialChange operation,
                      uint32_t real, uint32_t effective = CredentialUnchanged,

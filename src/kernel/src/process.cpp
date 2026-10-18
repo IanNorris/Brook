@@ -654,71 +654,57 @@ static constexpr uint64_t INTERP_LOAD_BASE = 0x7F0000000000ULL; // ~127 TB
 // proc->elf.interpPath.  Returns the interpreter entry point, or 0 on
 // failure.  The interpreter is loaded at INTERP_LOAD_BASE.
 // ---------------------------------------------------------------------------
-static uint64_t LoadInterpreter(Process* proc)
+static int ReadInterpreterImage(const char* path,ExecutableImage* image)
 {
-    if (proc->elf.interpPath[0] == '\0') return 0;
-
-    SerialPrintf("INTERP: loading '%s' for pid %u\n",
-                 proc->elf.interpPath, proc->pid);
-
-    // Try the exact path first.
-    const char* whichPath = proc->elf.interpPath;
-    Vnode* vn = VfsOpen(proc->elf.interpPath);
-
-    // Fallback: try /boot prefix.
-    char bootPath[256];
-    if (!vn)
-    {
-        bootPath[0]='/',bootPath[1]='b',bootPath[2]='o',bootPath[3]='o',bootPath[4]='t';
-        uint32_t bi = 5;
-        const char* p = proc->elf.interpPath;
-        while (*p && bi + 1 < sizeof(bootPath)) bootPath[bi++] = *p++;
-        bootPath[bi] = '\0';
-        whichPath = bootPath;
-        vn = VfsOpen(bootPath);
+    *image={};Vnode* vnode=nullptr;char resolved[256];
+    int error=VfsOpenExecutable(path,&vnode,resolved,sizeof(resolved));
+    // Historical aliases remain compatibility fallbacks for missing paths,
+    // never a way around an existing interpreter's permission denial.
+    char alternate[256];
+    if(error==-2) {
+        const uint32_t length=strlen(path);
+        if(length+5>=sizeof(alternate))return -36;
+        memcpy(alternate,"/boot",5);memcpy(alternate+5,path,length+1);
+        error=VfsOpenExecutable(alternate,&vnode,resolved,sizeof(resolved));
     }
-
-    // Fallback: extract filename and look in /boot/lib/.
-    char libPath[256];
-    if (!vn)
-    {
-        const char* fname = proc->elf.interpPath;
-        for (const char* p = proc->elf.interpPath; *p; ++p)
-            if (*p == '/') fname = p + 1;
-
-        libPath[0]='/',libPath[1]='b',libPath[2]='o',libPath[3]='o',libPath[4]='t';
-        libPath[5]='/',libPath[6]='l',libPath[7]='i',libPath[8]='b',libPath[9]='/';
-        uint32_t li = 10;
-        while (*fname && li + 1 < sizeof(libPath)) libPath[li++] = *fname++;
-        libPath[li] = '\0';
-
-        SerialPrintf("INTERP: loading '%s' for pid %d\n", libPath, proc->pid);
-        whichPath = libPath;
-        vn = VfsOpen(libPath);
+    if(error==-2) {
+        const char* name=path;
+        for(const char* p=path;*p;++p)if(*p=='/')name=p+1;
+        const uint32_t length=strlen(name);
+        if(length+10>=sizeof(alternate))return -36;
+        memcpy(alternate,"/boot/lib/",10);memcpy(alternate+10,name,length+1);
+        error=VfsOpenExecutable(alternate,&vnode,resolved,sizeof(resolved));
     }
-
-    if (!vn)
-    {
-        SerialPrintf("INTERP: failed to open '%s'\n", proc->elf.interpPath);
-        return 0;
+    if(error)return error;
+    error=ReadExecutableImage(vnode,image);VfsClose(vnode);
+    if(error)return error;
+    if(image->size<64) {FreeExecutableImage(image);return -5;} // short ELF header: EIO
+    if(!ElfValidateInterpreterImage(image->data,image->size,INTERP_LOAD_BASE)) {
+        FreeExecutableImage(image);return -80; // ELIBBAD
     }
+    return 0;
+}
 
-    ExecutableImage image{};
-    int readResult = ReadExecutableImage(vn, &image);
-    VfsClose(vn);
-    if (readResult != 0) {
-        SerialPrintf("INTERP: read error %d for '%s'\n", readResult, whichPath);
-        return 0;
+int PrepareExecInterpreter(const ExecutableImage& main,ExecutableImage* output)
+{
+    if(!output)return -22;
+    *output={};char path[sizeof(ElfBinary{}.interpPath)];
+    if(!ElfMainInterpreter(main.data,main.size,path,sizeof(path)))return -8;
+    return path[0]?ReadInterpreterImage(path,output):0;
+}
+
+static uint64_t LoadInterpreter(Process* proc,const ExecutableImage* prepared=nullptr)
+{
+    if(!proc->elf.interpPath[0])return 0;
+    ExecutableImage owned{};
+    if(!prepared) {
+        const int error=ReadInterpreterImage(proc->elf.interpPath,&owned);
+        if(error) {SerialPrintf("INTERP: open/load error %d for '%s'\n",error,proc->elf.interpPath);return 0;}
+        prepared=&owned;
     }
-    SerialPrintf("INTERP: opened '%s' size=%lu\n", whichPath, image.size);
-    uint64_t entry = ElfLoadAt(image.data, image.size, INTERP_LOAD_BASE,
-                               proc->addressSpace, proc->pid);
-    FreeExecutableImage(&image);
-
-    if (!entry)
-        SerialPrintf("INTERP: ElfLoadAt failed for '%s'\n", proc->elf.interpPath);
-
-    return entry;
+    const uint64_t entry=ElfLoadAt(prepared->data,prepared->size,INTERP_LOAD_BASE,
+                                   proc->addressSpace,proc->pid);
+    FreeExecutableImage(&owned);return entry;
 }
 
 static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
@@ -1661,7 +1647,8 @@ uint16_t CreateRemoteThread(Process* target, uint64_t entry,
 static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t elfSize,
                      int argc, const char* const* argv,
                      int envc, const char* const* envp,
-                     uint64_t* outStackPtr, const ExecutableImage* owned)
+                     uint64_t* outStackPtr, const ExecutableImage* owned,
+                     const ExecutableImage* interpreter=nullptr)
 {
     if (!proc || proc->isKernelThread) return 0;
     if (!ExecArgumentsFit(argc, argv, envc, envp)) return 0;
@@ -1736,7 +1723,7 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     uint64_t interpBase  = 0;
     if (proc->elf.interpPath[0] != '\0')
     {
-        interpEntry = LoadInterpreter(proc);
+        interpEntry = LoadInterpreter(proc,interpreter);
         if (!interpEntry)
         {
             SerialPrintf("EXEC: failed to load interpreter '%s'\n",
@@ -1827,6 +1814,13 @@ uint64_t ProcessExecExecutable(Process* proc, const ExecutableImage& image,
     int argc, const char* const* argv, int envc, const char* const* envp, uint64_t* outStackPtr)
 {
     return ProcessExecImpl(proc,image.data,image.size,argc,argv,envc,envp,outStackPtr,&image);
+}
+
+uint64_t ProcessExecPreparedExecutable(Process* proc,const ExecutableImage& image,
+    const ExecutableImage& interpreter,int argc,const char* const* argv,
+    int envc,const char* const* envp,uint64_t* outStackPtr)
+{
+    return ProcessExecImpl(proc,image.data,image.size,argc,argv,envc,envp,outStackPtr,&image,&interpreter);
 }
 
 // ---------------------------------------------------------------------------

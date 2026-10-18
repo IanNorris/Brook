@@ -20,4 +20,9 @@ bool ElfLoadExecutable(const ExecutableImage&, ElfBinary*, AddressSpaceState*, u
 int ReadExecutableImage(Vnode*, ExecutableImage*);
 void FreeExecutableImage(ExecutableImage*);
 bool ElfValidateMainImage(const uint8_t*, uint64_t);
+bool ElfMainInterpreter(const uint8_t*, uint64_t, char*, uint32_t);
+bool ElfValidateInterpreterImage(const uint8_t*, uint64_t, uint64_t base);
+// Preflight and retain PT_INTERP bytes before exec tears down the old image.
+// No PT_INTERP returns success with an empty output image.
+int PrepareExecInterpreter(const ExecutableImage&, ExecutableImage*);
 }

@@ -121,6 +121,9 @@ static constexpr int VFS_O_READWRITE = 0x20;
 // Internal metadata-only lookup: retain a vnode without requiring data-read
 // permission or preloading contents. Never expose this handle as a readable FD.
 static constexpr int VFS_O_METADATA = 0x40;
+// Internal executable-image read: authorize execute rather than user data read.
+// The retained vnode is consumed by the loader, never returned as a readable FD.
+static constexpr int VFS_O_EXEC = 0x80;
 
 // ---- Filesystem driver interface ----
 //

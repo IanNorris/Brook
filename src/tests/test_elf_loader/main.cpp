@@ -231,6 +231,25 @@ void ownedTests() {
 }
 
 int main() {
+    {
+        auto bytes=fixture();char path[128];
+        CHECK(ElfMainInterpreter(bytes.data(),bytes.size(),path,sizeof(path)) && !path[0]);
+        auto* header=reinterpret_cast<Elf64_Ehdr*>(bytes.data());
+        header->e_phnum=3;
+        auto* ph=reinterpret_cast<Elf64_Phdr*>(bytes.data()+header->e_phoff);
+        const char name[]="/owned/interpreter";
+        ph[2]={};ph[2].p_type=PT_INTERP;ph[2].p_offset=0x300;ph[2].p_filesz=sizeof(name);
+        std::memcpy(bytes.data()+0x300,name,sizeof(name));
+        CHECK(ElfMainInterpreter(bytes.data(),bytes.size(),path,sizeof(path)) && !std::strcmp(path,name));
+        char small[4];CHECK(!ElfMainInterpreter(bytes.data(),bytes.size(),small,sizeof(small)));
+        bytes[0x300+sizeof(name)-1]='x';CHECK(!ElfMainInterpreter(bytes.data(),bytes.size(),path,sizeof(path)));
+        bytes[0x300+sizeof(name)-1]=0;
+        CHECK(ElfValidateInterpreterImage(bytes.data(),bytes.size(),0x7f0000000000ULL));
+        CHECK(!ElfValidateInterpreterImage(bytes.data(),bytes.size(),0x7f0000000001ULL));
+        CHECK(!ElfValidateInterpreterImage(bytes.data(),bytes.size(),0x7ffffffff000ULL));
+        ph[2].p_offset=bytes.size()-2;
+        CHECK(!ElfMainInterpreter(bytes.data(),bytes.size(),path,sizeof(path)));
+    }
     for(bool reverse:{false,true})for(bool overlap:{false,true}) {
         auto bytes=fixture(overlap,reverse);AddressSpaceState space{};ElfBinary binary{};
         space.ranges.owner=&space;

@@ -167,6 +167,27 @@ bool ElfValidateMainImage(const uint8_t* data, uint64_t size)
     return PrepareMainImage(data, size, &image, &slide);
 }
 
+bool ElfMainInterpreter(const uint8_t* data,uint64_t size,char* path,uint32_t capacity)
+{
+    ElfLayout image;uint64_t slide;
+    if(!path || !capacity || !PrepareMainImage(data,size,&image,&slide))return false;
+    path[0]=0;
+    for(uint16_t i=0;i<image.header->e_phnum;++i) {
+        const auto& segment=image.segments[i];
+        if(segment.p_type!=PT_INTERP)continue;
+        if(segment.p_filesz>capacity)return false;
+        for(uint64_t n=0;n<segment.p_filesz;++n)path[n]=static_cast<char>(data[segment.p_offset+n]);
+    }
+    return true;
+}
+
+bool ElfValidateInterpreterImage(const uint8_t* data,uint64_t size,uint64_t base)
+{
+    ElfLayout image;
+    return ValidateElf(data,size,&image) && !(base&4095) && base>=image.first &&
+        RelocatedElfFits(image,base-image.first,0x0000800000000000ULL);
+}
+
 // A dedicated owned image is the only eligible source: raw callers may pass
 // kmalloc buffers sharing a page with unrelated kernel data.
 static bool OwnedImageValid(const ExecutableImage& image)

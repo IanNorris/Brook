@@ -4720,8 +4720,12 @@ resolve_path:
 
     {
         VnodeStat st;
-        if (VfsStatPath(lookupPath, &st) == 0 && !st.isDir)
-            found = true;
+        const int result=VfsStatPath(lookupPath,&st);
+        if(!result) {
+            if(st.isDir)return -13; // EACCES
+            found=true;
+        } else if(result!=-ENOENT)return result; // Never alias an inaccessible path.
+
     }
 
     if (!found)
@@ -4973,6 +4977,10 @@ resolve_path:
         return -ENOEXEC;
     }
 
+    ExecutableImage interpreterImage{};
+    const int interpreterResult=PrepareExecInterpreter(image,&interpreterImage);
+    if(interpreterResult) {FreeExecutableImage(&image);return interpreterResult;}
+
     // --- Kill sibling threads before replacing the process image ---
     // Linux: execve terminates all other threads in the thread group
     // before the old address space is destroyed.  Without this, sibling
@@ -4995,11 +5003,12 @@ resolve_path:
 
     // --- Replace the process image ---
     uint64_t newStackPtr = 0;
-    uint64_t newEntry = ProcessExecExecutable(proc, image,
+    uint64_t newEntry = ProcessExecPreparedExecutable(proc, image, interpreterImage,
                                      argc, kArgv, envc, kEnvp,
                                      &newStackPtr);
 
-    // Free ELF buffer
+    // Both image snapshots remain retained until loading has finished.
+    FreeExecutableImage(&interpreterImage);
     FreeExecutableImage(&image);
 
     if (!newEntry)
