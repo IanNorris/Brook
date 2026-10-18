@@ -266,6 +266,7 @@ add_executable(kernel
     src/procfs.cpp
     src/procfs_vfs.cpp
     src/net.cpp
+    src/lifecycle_channel.cpp
     src/debug_epoch.cpp
     src/debug_jobs.cpp
     src/debug_ui.cpp

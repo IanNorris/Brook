@@ -331,3 +331,7 @@ target_compile_options(test_launch_history PRIVATE "-iquote${BROOK_ROOT}/src/ker
 # Shared component walker: symlink/dotdot ordering, search and typed failures.
 add_host_test(test_path_walk)
 target_compile_options(test_path_walk PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+
+add_host_test(test_lifecycle_channel)
+target_compile_options(test_lifecycle_channel PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+set_tests_properties(test_lifecycle_channel PROPERTIES TIMEOUT 15)

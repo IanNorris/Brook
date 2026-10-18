@@ -1250,6 +1250,10 @@ inhibition, writer quiescence and checked final device flush. The 18 October
 virtio-net stall also requires a narrow network-independent VM control transport;
 current `vm_control stop/reset` relies on TCP and assumes apps are already closed.
 See the [shutdown design and acceptance requirements](orderly-shutdown.md).
+The optional COM2 flush/status foundation now passes live link-down/reconnect
+acceptance. The application coordinator, writer barrier, power implementation
+and launcher/MCP lifecycle integration remain open; current public stop/reset
+still uses TCP.
 
 ### Chromium controlled playback follow-up (18 October)
 

@@ -16,6 +16,12 @@ bool Valid(const char* token) {
     return nonzero&&!token[32];
 }
 }
+bool DebugEpochInitialize(const char* proposal) {
+    if(!Valid(proposal))return false;
+    SpinLockAcquire(&epochLock);
+    if(!Valid(epoch))memcpy(epoch,proposal,33);
+    SpinLockRelease(&epochLock);return true;
+}
 void DebugEpochCopy(char out[33]) {
     SpinLockAcquire(&epochLock);memcpy(out,epoch,33);SpinLockRelease(&epochLock);
 }
@@ -33,9 +39,7 @@ bool DebugEpochHandleCommand(const char* command) {
         if(suffix[n]||!Valid(command+i+n)) {
             DebugChannelSend("{\"epoch_error\":\"Invalid epoch proposal\"}\n");return true;
         }
-        SpinLockAcquire(&epochLock);
-        if(!Valid(epoch))memcpy(epoch,command+i+n,33);
-        SpinLockRelease(&epochLock);
+        DebugEpochInitialize(command+i+n);
     }
     char current[33];DebugEpochCopy(current);
     DebugChannelSend("{\"boot_id\":\"");DebugChannelSend(current);DebugChannelSend("\"}\n");return true;

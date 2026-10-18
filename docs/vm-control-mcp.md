@@ -263,3 +263,12 @@ frame backend and coordinate calibration; input probes and cancel/hold tests;
 silent PCM capture and plots; guest diagnostics; packaging/client discovery.
 Detailed acceptance criteria and the deferred branch investigations are in
 [backlog.md](backlog.md).
+
+### Network-independent lifecycle foundation
+
+New opted-in VM launches provide a private COM2 maintenance channel with hello,
+checked flush and retained status. It shares the guest boot epoch with TCP and
+works with the virtual network disconnected. It is not yet wired into the public
+MCP stop/reset path or an application shutdown coordinator; callers of the raw
+host transport must already quiesce writers. Existing MCP semantics above remain
+unchanged. See [implementation, limits and acceptance](orderly-shutdown.md#implemented-foundation-network-independent-flush-channel-18-october).

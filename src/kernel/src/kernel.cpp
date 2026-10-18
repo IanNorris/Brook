@@ -1,4 +1,5 @@
 #include "desktop_identity.h"
+namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart(); }
 #include "boot_protocol/boot_protocol.h"
 #include "serial.h"
 #include "kprintf.h"
@@ -522,6 +523,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     // ---- QEMU fw_cfg ----
     brook::FwCfgInit();
+    brook::LifecycleChannelConfigure();
 
     // ---- virtio-blk: enumerate all PCI virtio drives ----
     brook::BootLogoProgress(50, "Storage");
@@ -712,6 +714,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::BootLogoProgress(90, "Scheduler");
         brook::SchedulerInit();
         brook::CompositorInit();
+        brook::LifecycleChannelStart();
 
         // Start the NIC polling thread now that the scheduler is initialised.
         if (brook::NetGetIf())

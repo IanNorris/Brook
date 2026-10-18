@@ -15,6 +15,7 @@ import uuid
 
 from common import REGISTRY, QMP, process_identity, write_json
 from reset import launch_reboot_action
+from lifecycle import launch_args as lifecycle_launch_args
 
 
 def recording_display_args(command):
@@ -46,6 +47,11 @@ def supervise(command, kernel, disk, debug_port, provenance, scenario):
             args[index + 1] = value
         else:
             args.extend([option, value])
+    lifecycle_mode = os.environ.get("BROOK_VM_LIFECYCLE", "1")
+    if lifecycle_mode not in {"0", "1"}:
+        raise ValueError("BROOK_VM_LIFECYCLE must be 0 or 1")
+    lifecycle_enabled = lifecycle_mode == "1"
+    args = lifecycle_launch_args(args, session, directory, enabled=lifecycle_enabled)
     args.extend(["-qmp", f"unix:{directory}/qmp.sock,server=on,wait=off"])
     kernel_copy = directory / "kernel.elf"
     shutil.copy2(kernel, kernel_copy)
@@ -56,6 +62,9 @@ def supervise(command, kernel, disk, debug_port, provenance, scenario):
                   "pid": child.pid, "process_identity": process_identity(child.pid),
                   "owner_uid": os.getuid(), "state": "running", "created_at": time.time(),
                   "provenance": provenance, "scenario": scenario,
+                  "lifecycle_channel": {"api": 1 if lifecycle_enabled else 0,
+                                        "socket": str(directory / "lifecycle.sock") if lifecycle_enabled else None,
+                                        "commands": ["hello", "sync", "status"] if lifecycle_enabled else []},
                   "qmp": str(directory / "qmp.sock"), "run_directory": str(directory),
                   "serial_log": str(directory / "serial.log"), "qemu_log": str(directory / "qemu.log"),
                   "boot_disk": str(Path(disk).resolve()), "guest_debug_port": debug_port,
