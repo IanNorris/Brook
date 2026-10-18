@@ -10,12 +10,16 @@ import json
 import os
 import select
 import struct
+import signal
+import threading
+import time
 from contextlib import contextmanager
 
 
 @contextmanager
-def event(count=1, semaphore=False):
-    fd = os.eventfd(count, os.EFD_NONBLOCK | (os.EFD_SEMAPHORE if semaphore else 0))
+def event(count=1, semaphore=False, nonblock=True):
+    fd = os.eventfd(count, (os.EFD_NONBLOCK if nonblock else 0) |
+                    (os.EFD_SEMAPHORE if semaphore else 0))
     try:
         yield fd
     finally:
@@ -172,10 +176,103 @@ def saturation_and_level():
         expect(poll, fd, select.EPOLLOUT)
 
 
+def concurrent_drain():
+    with event(0) as fd, select.epoll() as poll:
+        poll.register(fd, select.EPOLLIN | select.EPOLLET)
+        errors = []
+        def produce():
+            try:
+                for _ in range(1000):
+                    os.eventfd_write(fd, 1)
+            except Exception as error:
+                errors.append(repr(error))
+        workers = [threading.Thread(target=produce, daemon=True) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        total = 0
+        deadline = time.monotonic() + 10
+        while total < 4000 and time.monotonic() < deadline:
+            for ready_fd, mask in poll.poll(0.05, 1):
+                assert ready_fd == fd and mask == select.EPOLLIN
+                while True:
+                    try:
+                        total += os.eventfd_read(fd)
+                    except BlockingIOError:
+                        break
+        for worker in workers:
+            worker.join(2)
+        assert not any(worker.is_alive() for worker in workers)
+        assert not errors and total == 4000, (errors, total)
+        # A queued notification can refer to data already drained; it must
+        # not make a currently empty source readable.
+        expect(poll)
+
+
+def blocked_writer():
+    fd = os.eventfd(0, 0)
+    writer = None
+    done = threading.Event()
+    errors = []
+    def write():
+        try:
+            os.eventfd_write(fd, 1)
+        except Exception as error:
+            errors.append(repr(error))
+        finally:
+            done.set()
+    try:
+        os.eventfd_write(fd, (1 << 64) - 2)
+        writer = threading.Thread(target=write, daemon=True)
+        writer.start()
+        assert not done.wait(0.03), errors
+        assert os.eventfd_read(fd) == (1 << 64) - 2
+        assert done.wait(2), 'blocked writer made no progress after read'
+        writer.join(2)
+        assert not errors, errors
+        assert os.eventfd_read(fd) == 1
+    finally:
+        if writer is None or not writer.is_alive():
+            os.close(fd)
+
+
+def killed_writer():
+    with event(0, nonblock=False) as fd:
+        os.eventfd_write(fd, (1 << 64) - 2)
+        child = os.fork()
+        if child == 0:
+            try:
+                os.eventfd_write(fd, 1)
+            finally:
+                os._exit(3)
+        try:
+            time.sleep(0.03)
+            assert os.waitpid(child, os.WNOHANG) == (0, 0)
+            os.kill(child, signal.SIGKILL)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                pid, status = os.waitpid(child, os.WNOHANG)
+                if pid:
+                    child = 0
+                    assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+                    break
+                time.sleep(0.01)
+            assert child == 0, 'killed blocked writer was not reaped'
+            assert os.eventfd_read(fd) == (1 << 64) - 2
+            os.eventfd_write(fd, 1)
+            assert os.eventfd_read(fd) == 1
+        finally:
+            if child > 0:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
 def main():
     report = {}
     for check in (undrained, semaphore, writable, rearm_and_independent,
-                  truncated_batch, nested_peek, failed_copy, saturation_and_level):
+                  truncated_batch, nested_peek, failed_copy, saturation_and_level,
+                  concurrent_drain, blocked_writer, killed_writer):
         try:
             check()
             report[check.__name__] = {'pass': True}

@@ -2184,3 +2184,36 @@ failed output copies, saturation and LT compatibility. Its eight groups pass
 on the Linux host. Guest acceptance of the ET fix is still pending; this probe
 does not establish ET support for other descriptor types, concurrent delivery,
 signal interruption or blocked-writer cancellation.
+
+The eventfd ET candidate (`eventfd-edges-candidate-20261018`, kernel
+`244ee8e0...52a0`) now tracks readable/writable notification generations per
+source and delivery state per watch. A source mutex makes counter/generation
+snapshots coherent and permits fault-aware read copyout before consuming the
+counter. Every accepted write notifies IN, including zero; successful reads
+notify OUT. A queued watch returns its full current requested readiness mask.
+Only selected events commit their captured generations, after successful epoll
+copyout; nested readiness checks do not consume child events. ADD/MOD rearm,
+source identities avoid inheriting generations from a recycled eventfd, and
+capacity checks prevent counter overflow. Positive delivered events take
+precedence over ordinary signal interruption after waiter cleanup.
+
+The unchanged baseline fails all seven safely runnable original reference
+groups; its unsafe readonly-copy test was deliberately omitted. The candidate
+passes all eleven expanded groups on Linux and Brook, including concurrent
+producers, capacity-blocked writer progress and killed-writer cleanup. Nine
+nested-epoll groups, the LT churn probe, heap integrity, all 35 hosted tests and
+the supported compiled-entry audit also pass. This is eventfd ET support, not
+general ET or ONESHOT support. Numeric-fd watch identity/dup-close limitations
+and single-waiter fallback latency remain. The tests do not deterministically
+force a write during copyout or a signal between scan and return.
+
+During normal-launcher Firefox playback, the busiest recorded task has 3,559
+cumulative epoll calls, mostly blocking; the earlier short capture had three
+tasks at 359,000–421,000 immediate returns each. The intervals include different
+idle/startup phases, so this establishes removal of the observed churn rather
+than a controlled overall browser speedup. Two consecutive ten-second audio
+captures have respectively zero and 48 silent 10 ms bins in their longest silent
+run: audio remains unaccepted. Firefox exits normally with code zero and no
+surviving group tasks; the two-second post-exit capture reports an inactive
+stream and zero frames. Both baseline and candidate have checked shutdown,
+launcher exit zero, clean serial audits and all three offline filesystem checks.

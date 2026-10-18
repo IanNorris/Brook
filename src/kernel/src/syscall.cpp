@@ -430,12 +430,40 @@ static void WakeProcess(Process* proc)
 
 // EventFd data structure (used in read/write/poll/close)
 struct EventFdData {
-    volatile uint64_t counter;
+    KMutex lock; // graph -> eventfd; never acquire graph while holding this
+    uint64_t counter;
+    uint64_t inGeneration;
+    uint64_t outGeneration;
+    uint64_t identity;
     uint32_t flags;
     volatile uint32_t refCount;
     Process* readerWaiter;
     Process* epollWaiter;  // process blocked in epoll_wait watching this eventfd
 };
+static uint64_t g_eventFdIdentity = 0;
+static void EventFdInit(EventFdData* efd, uint64_t counter, uint32_t flags) {
+    __builtin_memset(efd, 0, sizeof(*efd));
+    efd->counter = counter;
+    efd->flags = flags;
+    efd->refCount = 1;
+    efd->identity = __atomic_add_fetch(&g_eventFdIdentity, 1, __ATOMIC_RELAXED);
+}
+struct EventFdGuard {
+    EventFdData* efd;
+    explicit EventFdGuard(EventFdData* value) : efd(value) { KMutexLock(&efd->lock); }
+    ~EventFdGuard() { KMutexUnlock(&efd->lock); }
+};
+struct EventFdSnapshot {
+    uint64_t identity, inGeneration, outGeneration;
+    uint32_t ready;
+};
+static EventFdSnapshot EventFdReady(EventFdData* efd, uint32_t events) {
+    EventFdGuard guard(efd);
+    uint32_t ready = 0;
+    if (efd->counter && (events & 1)) ready |= 1;
+    if (efd->counter < ~0ULL - 1 && (events & 4)) ready |= 4;
+    return {efd->identity, efd->inGeneration, efd->outGeneration, ready};
+}
 static constexpr uint32_t EFD_SEMAPHORE = 0x01;
 static constexpr uint32_t EFD_CLOEXEC = 0x80000;
 static constexpr uint32_t EFD_NONBLOCK  = 0x800;
@@ -472,6 +500,9 @@ struct EpollEntry {
     int      fd;      // watched fd (-1 = free)
     uint32_t events;  // requested events
     uint64_t data;    // user data (uint64)
+    uint64_t eventFdIdentity = 0; // zero means initial/MOD delivery is pending
+    uint64_t inGeneration = 0;
+    uint64_t outGeneration = 0;
 };
 
 struct EpollInstance {
@@ -1927,11 +1958,31 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
     // Write to eventfd — adds value to counter
     if (fde->type == FdType::EventFd && fde->handle)
     {
-        if (count < 8) return -EINVAL;
-        uint64_t val = *reinterpret_cast<const uint64_t*>(bufAddr);
+        if (count != 8) return -EINVAL;
+        uint64_t val;
+        if (!CopyFromUser(&val, bufAddr, sizeof(val))) return -EFAULT;
         if (val == 0xFFFFFFFFFFFFFFFFULL) return -EINVAL;
         auto* efd = static_cast<EventFdData*>(fde->handle);
-        __atomic_fetch_add(&efd->counter, val, __ATOMIC_ACQ_REL);
+        for (;;) {
+            bool accepted = false;
+            {
+                EventFdGuard guard(efd);
+                if (val <= (~0ULL - 1) - efd->counter) {
+                    efd->counter += val;
+                    ++efd->inGeneration; // every write, including zero
+                    accepted = true;
+                }
+            }
+            if (accepted) break;
+            if (fde->statusFlags & EFD_NONBLOCK) return -EAGAIN;
+            // Existing eventfd wait hooks have one slot; bounded polling also
+            // supplies progress to writers waiting for counter capacity.
+            Process* self = ProcessCurrent();
+            extern volatile uint64_t g_lapicTickCount;
+            self->wakeupTick = g_lapicTickCount + 10;
+            SchedulerBlockInterruptible(self);
+            if (HasPendingSignals()) return -EINTR;
+        }
         // Wake blocked reader
         Process* reader = efd->readerWaiter;
         if (reader) {
@@ -2462,19 +2513,25 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
         for (;;)
         {
-            uint64_t val = __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE);
-            if (val > 0)
+            bool consumed = false;
             {
-                const bool semaphore=(efd->flags&EFD_SEMAPHORE)!=0;
-                const uint64_t next=semaphore?val-1:0;
-                // A concurrent write must not disappear between the old load
-                // and reset, nor may competing semaphore readers underflow.
-                if(!__atomic_compare_exchange_n(&efd->counter,&val,next,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))continue;
-                if(semaphore)val=1;
-                *reinterpret_cast<uint64_t*>(bufAddr) = val;
+                EventFdGuard guard(efd);
+                if (efd->counter > 0) {
+                    const bool semaphore = (efd->flags & EFD_SEMAPHORE) != 0;
+                    const uint64_t val = semaphore ? 1 : efd->counter;
+                    // A sleeping mutex permits fault-aware copy before state
+                    // mutation. No spinlock is held across userspace copying.
+                    if (!CopyToUser(bufAddr, &val, sizeof(val))) return -EFAULT;
+                    efd->counter = semaphore ? efd->counter - 1 : 0;
+                    ++efd->outGeneration;
+                    consumed = true;
+                }
+            }
+            if (consumed) {
+                Process* ew = efd->epollWaiter;
+                if (ew) { efd->epollWaiter = nullptr; WakeProcess(ew); }
                 return 8;
             }
-
             // Non-blocking: return EAGAIN
             if (fde->statusFlags & 0x800)
                 return -EAGAIN;
@@ -5888,11 +5945,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             if (fp) {
                 auto* efd = static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
                 if (efd) {
-                    efd->counter = 1;        // real host render fence completed
-                    efd->flags = 0;
-                    efd->refCount = 1;
-                    efd->readerWaiter = nullptr;
-                    efd->epollWaiter = nullptr;
+                    EventFdInit(efd, 1, 0); // real host render fence completed
                     fenceFd = FdAlloc(fp, FdType::EventFd, efd);
                     if (fenceFd < 0) kfree(efd);
                 }
@@ -8008,17 +8061,11 @@ retry_poll:
             continue;
         }
 
-        // EventFd: readable when counter > 0, always writable
+        // EventFd: readable when nonempty, writable below counter capacity.
         if (fde->type == FdType::EventFd && fde->handle)
         {
             auto* efd = static_cast<EventFdData*>(fde->handle);
-            if ((fds[i].events & POLLIN) &&
-                __atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE) > 0)
-            {
-                fds[i].revents |= POLLIN;
-            }
-            if (fds[i].events & POLLOUT)
-                fds[i].revents |= POLLOUT;
+            fds[i].revents |= EventFdReady(efd, fds[i].events).ready;
             if (fds[i].revents) ready++;
             continue;
         }
@@ -8129,7 +8176,7 @@ retry_poll:
                     usd->state == UnixSocketData::State::Connected && usd->txPipe)
                     usd->txPipe->writerWaiter = self;
             }
-            if (fde->type == FdType::EventFd && fde->handle && (fds[i].events & POLLIN))
+            if (fde->type == FdType::EventFd && fde->handle)
             {
                 auto* efd = static_cast<EventFdData*>(fde->handle);
                 efd->readerWaiter = self;
@@ -8182,7 +8229,7 @@ retry_poll:
             if (fde->type == FdType::EventFd && fde->handle && (fds[i].events & POLLIN))
             {
                 auto* efd = static_cast<EventFdData*>(fde->handle);
-                if (__atomic_load_n(&efd->counter, __ATOMIC_ACQUIRE) > 0)
+                if (EventFdReady(efd, fds[i].events).ready)
                 { ready++; break; }
             }
         }
@@ -8548,11 +8595,7 @@ static int64_t sys_eventfd2(uint64_t initval, uint64_t flagsVal, uint64_t,
     auto* efd = static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
     if (!efd) return -ENOMEM;
 
-    efd->counter = static_cast<uint32_t>(initval);
-    efd->flags = flags;
-    efd->refCount = 1;
-    efd->readerWaiter = nullptr;
-    efd->epollWaiter = nullptr;
+    EventFdInit(efd, static_cast<uint32_t>(initval), flags);
 
     FdEntry entry{};entry.type=FdType::EventFd;entry.handle=efd;
     entry.statusFlags=2u|((flags&EFD_NONBLOCK)?0x800u:0u);
@@ -8582,7 +8625,7 @@ static constexpr uint32_t EPOLLOUT     = 0x004;
 [[maybe_unused]] static constexpr uint32_t EPOLLPRI     = 0x002;
 static constexpr uint32_t EPOLLERR     = 0x008;
 static constexpr uint32_t EPOLLHUP     = 0x010;
-[[maybe_unused]] static constexpr uint32_t EPOLLET      = (1u << 31);  // edge-triggered (ignored, always LT)
+static constexpr uint32_t EPOLLET      = (1u << 31); // eventfd notifications; other sources remain LT
 [[maybe_unused]] static constexpr uint32_t EPOLLONESHOT = (1u << 30);
 
 [[maybe_unused]] static constexpr int EPOLL_CTL_ADD = 1;
@@ -8605,6 +8648,9 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
     // A closed watch is not an fd producing a hangup event. In particular,
     // do not feed libuv orphan ERR|HUP notifications forever after close.
     if (!fde) return 0;
+
+    if (fde->type == FdType::EventFd && fde->handle)
+        return EventFdReady(static_cast<EventFdData*>(fde->handle), events).ready;
 
     uint32_t ready = 0;
     if (fde->type == FdType::Socket && fde->handle) {
@@ -8629,9 +8675,6 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
         if (fde->type == FdType::Pipe && fde->handle) {
             auto* pb = static_cast<PipeBuffer*>(fde->handle);
             readable = (pb->count() > 0 || pb->writers == 0);
-        } else if (fde->type == FdType::EventFd && fde->handle) {
-            auto* efd = static_cast<EventFdData*>(fde->handle);
-            readable = (efd->counter > 0);
         } else if (fde->type == FdType::Socket && fde->handle) {
             int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
             readable = brook::SockPollReady(si, true, false);
@@ -8662,8 +8705,6 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
         } else if (fde->type == FdType::Socket && fde->handle) {
             int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
             writable = brook::SockPollReady(si, false, true);
-        } else if (fde->type == FdType::EventFd) {
-            writable = true;
         } else if (fde->type == FdType::Vnode) {
             writable = true;
         } else if (fde->type == FdType::DevTty) {
@@ -8685,6 +8726,9 @@ struct EpollWalk {
     FdEntry* pins[MAX_FDS];
     bool attempted[MAX_FDS];
     uint32_t masks[MAX_FDS];
+    // Only selected events have delivery snapshots. Retained until copyout
+    // succeeds under the graph mutex; peeking never changes a watch.
+    struct Delivery { int index; EventFdSnapshot eventFd; } deliveries[MAX_FDS];
     struct Node {
         EpollInstance* ep;
         uint8_t ready[EPOLL_MAX_DEPTH]; // 0 unknown, 1 false, 2 true
@@ -8717,7 +8761,7 @@ struct EpollWalk {
             auto e = ep->entries[i];
             if (e.fd >= 0) {
                 if (!pin(e.fd)) { ep->entries[i].fd = -1; continue; }
-                result = ready(e.fd, e.events, depth);
+                result = watchReady(e, depth);
             }
         }
         n->active = false; n->ready[depth] = result ? 2 : 1;
@@ -8728,6 +8772,18 @@ struct EpollWalk {
         if (fde && fde->type == FdType::EpollFd && fde->handle)
             return (events & EPOLLIN) && any(static_cast<EpollInstance*>(fde->handle), depth + 1) ? EPOLLIN : 0;
         return EpollLeafReady(fde, events);
+    }
+    uint32_t watchReady(const EpollEntry& entry, int depth, EventFdSnapshot* captured = nullptr) {
+        auto* fde = pin(entry.fd);
+        if (!(entry.events & EPOLLET) || !fde ||
+            fde->type != FdType::EventFd || !fde->handle)
+            return ready(entry.fd, entry.events, depth);
+        auto snapshot = EventFdReady(static_cast<EventFdData*>(fde->handle), entry.events);
+        if (captured) *captured = snapshot;
+        const bool notified = entry.eventFdIdentity != snapshot.identity ||
+            ((entry.events & EPOLLIN) && entry.inGeneration != snapshot.inGeneration) ||
+            ((entry.events & EPOLLOUT) && entry.outGeneration != snapshot.outGeneration);
+        return notified ? snapshot.ready : 0;
     }
     void collect(EpollInstance* ep, int depth = 0) {
         if (depth >= EPOLL_MAX_DEPTH) return;
@@ -8810,7 +8866,8 @@ static void EpollDiagAdd(EpollDiagSnapshot* row, EpollDiagCounter metric) {
     if (row) __atomic_fetch_add(&row->counters[metric], 1, __ATOMIC_RELAXED);
 }
 static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
-                          EpollEvent* events, int maxevents, EpollDiagSnapshot* diag) {
+                          EpollEvent* events, int maxevents, EpollDiagSnapshot* diag,
+                          uint64_t eventsAddr) {
     EpollGraphGuard guard;
     walk->clearMemo();
     int n = 0;
@@ -8818,8 +8875,10 @@ static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
         auto e = ep->entries[i];
         if (e.fd < 0) continue;
         if (!walk->pin(e.fd)) { ep->entries[i].fd = -1; continue; }
-        uint32_t ready = walk->ready(e.fd, e.events, 0);
+        EventFdSnapshot captured{};
+        uint32_t ready = walk->watchReady(e, 0, &captured);
         if (ready) {
+            walk->deliveries[n] = {i, captured};
             events[n].events = ready; events[n++].data.u64 = e.data;
             if (diag) {
                 if (ready & EPOLLIN) EpollDiagAdd(diag, EpScanRead);
@@ -8834,6 +8893,17 @@ static int EpollScanReady(EpollWalk* walk, EpollInstance* ep,
                 __atomic_store_n(&diag->counters[EpLastReturned], ready, __ATOMIC_RELAXED);
             }
         }
+    }
+    if (n && !CopyToUser(eventsAddr, events, sizeof(EpollEvent) * n)) return -EFAULT;
+    for (int i = 0; i < n; ++i) {
+        const auto& delivery = walk->deliveries[i];
+        if (!delivery.eventFd.identity) continue;
+        auto& entry = ep->entries[delivery.index];
+        // Commit exactly the snapshot returned to userspace, not newer source
+        // generations that may have arrived during copyout.
+        entry.eventFdIdentity = delivery.eventFd.identity;
+        entry.inGeneration = delivery.eventFd.inGeneration;
+        entry.outGeneration = delivery.eventFd.outGeneration;
     }
     return n;
 }
@@ -8934,7 +9004,7 @@ static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
 
 static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                                 EpollEvent* kEvents, int maxevents,
-                                int timeout_ms, EpollDiagSnapshot* diag)
+                                int timeout_ms, EpollDiagSnapshot* diag, uint64_t eventsAddr)
 {
     const uint64_t deadline = WaitDeadlineNs(timeout_ms < 0 ? ~0ULL : static_cast<uint64_t>(timeout_ms));
     bool firstScan = true;
@@ -8943,7 +9013,8 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         EpollWalkOwner state(proc);
         auto* walk = state.walk;
         if (!walk) return -ENOMEM;
-        int n = EpollScanReady(walk, ep, kEvents, maxevents, diag);
+        int n = EpollScanReady(walk, ep, kEvents, maxevents, diag, eventsAddr);
+        if (n < 0) return n;
         if (n > 0) { EpollDiagAdd(diag, firstScan ? EpInitialReady : EpLaterReady); return n; }
         if (timeout_ms == 0) { EpollDiagAdd(diag, EpTimeouts); return 0; }
         firstScan = false;
@@ -9012,7 +9083,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         registerWaiters();
         // The graph mutex can sleep. Arm the timeout only after this scan:
         // SchedulerUnblock clears wakeupTick when granting a contended mutex.
-        n = EpollScanReady(walk, ep, kEvents, maxevents, diag);
+        n = EpollScanReady(walk, ep, kEvents, maxevents, diag, eventsAddr);
         if (!n && !HasPendingSignals() && (timeout_ms < 0 || ClockNowNs(1) < deadline)) {
             uint64_t wakeAt = WaitWakeupTick(deadline, 100);
             for (int fd = 0; fd < EPOLL_MAX_FDS; fd++) {
@@ -9032,9 +9103,11 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
             SchedulerBlockInterruptible(proc);
         }
         unregisterWaiters();
-        if (HasPendingSignals()) { EpollDiagAdd(diag, EpInterrupts); return -EINTR; }
+        if (n < 0) return n;
         if (n > 0) { EpollDiagAdd(diag, EpLaterReady); return n; }
-        n = EpollScanReady(walk, ep, kEvents, maxevents, diag);
+        if (HasPendingSignals()) { EpollDiagAdd(diag, EpInterrupts); return -EINTR; }
+        n = EpollScanReady(walk, ep, kEvents, maxevents, diag, eventsAddr);
+        if (n < 0) return n;
         if (n > 0) { EpollDiagAdd(diag, EpLaterReady); return n; }
         if (timeout_ms >= 0 && ClockNowNs(1) >= deadline) {
             EpollDiagAdd(diag, EpTimeouts); return 0;
@@ -9090,16 +9163,7 @@ static int64_t sys_epoll_wait(uint64_t epfd, uint64_t eventsAddr,
     if (static_cast<int>(static_cast<int64_t>(timeout_ms)) == 0) EpollDiagAdd(diag, EpZeroTimeout);
     int n = epoll_wait_impl(proc, ep, kEvents,
                              static_cast<int>(maxevents),
-                             static_cast<int>(static_cast<int64_t>(timeout_ms)), diag);
-
-    if (n > 0) {
-        if (eventsAddr < 0x1000) {
-            if (kEvents != localEvents) kfree(kEvents);
-            return -EFAULT;
-        }
-        __builtin_memcpy(reinterpret_cast<void*>(eventsAddr), kEvents,
-                        sizeof(EpollEvent) * static_cast<uint32_t>(n));
-    }
+                             static_cast<int>(static_cast<int64_t>(timeout_ms)), diag, eventsAddr);
 
     if (kEvents != localEvents) kfree(kEvents);
     return n;
