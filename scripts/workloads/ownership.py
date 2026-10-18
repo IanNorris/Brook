@@ -74,7 +74,9 @@ try:
             error(errno.ENOENT, lambda: os.chown(directory / 'absent', 1000, 100))
             error(errno.EBADF, lambda: os.fchown(-1, 1000, 100))
             error(errno.ENOTDIR, lambda: os.chown('payload', 1000, 100, dir_fd=fd))
-            error(errno.EOVERFLOW, lambda: os.chown(payload, 65536, 100))
+            os.chown(payload, 65536, 131172)
+            owner(payload, 65536, 131172)
+            os.chown(payload, 1006, 105)
             owner(payload, 1006, 105)
             libc = ctypes.CDLL(None, use_errno=True)
             libc.fchownat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_int]

@@ -10,8 +10,21 @@ GIMP opened the transparent Brook B PNG, accepted a native brush edit, saved XCF
 exported PNG, and reopened the XCF. An independent PNG decoder found 2,608 newly
 nontransparent pixels relative to the source. The PNG signature, dimensions and
 all chunk CRCs also passed. Normal close drained the complete UI launch lineage.
-A cold boot preserved both saved files' hashes and ownership. Cold GUI reopening
-of the XCF has not yet been repeated.
+A cold boot preserved both saved files' hashes and ownership. The later
+full-width ownership kernel also reopened the saved XCF through GIMP's recent
+images, displaying the transparent B and the painted mark. Normal close drained
+the complete UI launch lineage; the saved XCF/PNG hashes and Brook ownership
+were unchanged afterward. That run passed checked sync/stop, QEMU/launcher exit
+zero, serial kernel/device/user-fault audits and all three offline filesystem
+checks. Its kernel is
+`dd601109c01b5f782263491e84883b75d3229abafee971a63dd7bed1f7bf84b5`,
+with local evidence under `build/workloads/identity-uid32-20261018/final/`.
+This is a cold file-reopen check, not a startup performance comparison.
+
+![GIMP reopening the saved XCF after cold boot](images/brook_gimp_cold_reopen_1080.png)
+
+Native 1920×1080 capture. The black mark in the upper-right transparent margin
+is the saved brush edit used to distinguish this file from its source.
 
 LibreOffice Writer accepted native text entry and saved an ODT. Independent ZIP,
 mimetype and XML checks verified the exact three paragraphs. The ODT retained

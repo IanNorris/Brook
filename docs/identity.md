@@ -69,8 +69,9 @@ still update parent times. This follows the separation in
 [Linux ext2 rename](https://github.com/torvalds/linux/blob/master/fs/ext2/namei.c).
 `scripts/workloads/rename_metadata.py` deliberately sets old timestamps so a
 same-second rename cannot hide the error. All nine cases pass on Linux and the
-fixed guest; the old guest fails both cross-parent directory cases. Guest checks
-run as root because nonroot symlink creation ownership remains a separate gap.
+fixed guest; the old guest fails both cross-parent directory cases. Those
+historical checks ran as root; nonroot symlink creation ownership is covered
+by the later full-width ownership checkpoint below.
 
 `scripts/workloads/profile_migration.py` passes five guest groups: complete copy
 and preservation/idempotence, failed-copy preservation, failed-cutover rollback,
@@ -112,8 +113,8 @@ Optional plugin faults and dialog stacking/xdg_foreign support remain open.
 | File open | `Ext2FsOpenModeChecked` requires both access bits for O_RDWR and uses effective UID, primary GID and supplementary groups. Denials return EACCES without alias fallback; O_TRUNC requires write access. Creation skips the new leaf inode check, and the explicit Nix bypass remains. | Check ancestor search and parent mutation permissions, audit other filesystems, and define the writable Nix mount policy. |
 | Path traversal and mutation | Path resolution and parent lookup have no complete directory search/mutation authorization contract. Nix can explicitly skip permission checks. | Audit mkdir, create, unlink, rmdir, rename, symlink, hard links, sticky directories and directory-relative operations; restrict the writable Nix service deliberately. |
 | Access checks | `AccessAt` validates flags and resolves paths, but implements existence rather than R/W/X permission evaluation, including AT_EACCESS. | Use real/effective credentials as requested and apply the same traversal rules as open/exec; cover descriptor and symlink variants. |
-| Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Ext2 ownership is currently 16-bit and rejects larger chown IDs, but file/directory creation still truncates larger effective IDs to 16 bits; symlink creation still assigns root ownership. | Test mode/ownership through every mutation path and all filesystems. Resolve 32-bit ownership and accurate nonroot group-change rules before exposing account creation. |
-| Runtime directory | Every shell application inherits `XDG_RUNTIME_DIR=/tmp`. Wayland and other IPC endpoints are shared. | Give a named desktop identity an owned, mode-0700 runtime directory with a defined lifetime; audit IPC peer credentials and access policy. |
+| Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Linux-layout ext2 ownership now preserves all 32 UID/GID bits through creation, stat, chown and existing leaf permission checks; new symlinks inherit creator credentials. | Test mode/ownership through every mutation path and all filesystems. Audit nonroot group-change rules, parent setgid inheritance and supplementary-group handling in metadata operations before exposing account creation. |
+| Runtime directory | Every shell application inherits `XDG_RUNTIME_DIR=/tmp`. This path is on the FAT-backed initrd, which cannot persist Unix ownership/modes. Wayland and other IPC endpoints are shared. | Give a named desktop identity an owned, mode-0700 runtime directory with a defined lifetime; audit IPC peer credentials and access policy. |
 | Persistent preferences | HOME/XDG is persistent, but root apps and compatibility-UID apps share it. Browser wrappers explicitly select their own profiles. | Use the named desktop identity consistently in the default launcher and owned application state. Preserve existing data during any migration; report conflicts rather than silently replacing ownership. |
 
 Primary implementation locations: `src/kernel/src/process.h`, `process.cpp`,
@@ -419,3 +420,55 @@ policy, not a protected store or authorization boundary. Install/remove
 serialization and atomic manifest replacement passed host and guest tests.
 General directory authorization must still be implemented before a protected
 service or multiple accounts can be accepted.
+
+
+### Full-width ext2 ownership checkpoint (18 October)
+
+The old kernel truncated new file/directory owners to 16 bits and assigned new
+symlinks to root. A frozen-kernel negative control reproduced both defects on
+`/data` and `/nix`: creation by UID 66536:GID 131172 became 1000:100, while both
+inline and block-backed symlinks became 0:0. Merely reporting full-width IDs in
+stat would not repair these on-disk values.
+
+The backend now reads and writes the Linux ext2 high UID/GID fields at inode
+bytes 120/122, preserving other OS-dependent bytes. Creation, stat, chmod,
+timestamps, chown and existing-file permission checks use the complete IDs.
+New symlinks use the creator's effective credentials. Chown retains the `-1`
+unchanged sentinel; final inode reclamation clears upper owner bits after open
+unlinked references have drained. The layout and deletion convention follow
+[Linux ext2's inode format](https://github.com/torvalds/linux/blob/master/fs/ext2/ext2.h)
+and [inode serialization](https://github.com/torvalds/linux/blob/master/fs/ext2/inode.c).
+This checkpoint covers Linux-layout images, not other creator-OS inode layouts.
+
+`scripts/workloads/ownership_ids.py` uses private, explicitly named fixtures on
+both ext2 mounts. Real fork/setgroups/setgid/setuid probes cover file/directory
+and short/long symlink creation, owner metadata changes, path/descriptor chown,
+upper-bit clearing when returning to low IDs, lchown without changing the target,
+primary/supplementary groups and open-unlinked descriptors. Values up to UID
+4294967294:GID 4294967293 survive stat and reboot. On `/data`, unrelated users
+sharing the owner's low 16 bits are denied both chmod and file reads. The Nix
+open-permission bypass remains deliberate and is explicitly excluded from
+isolation acceptance.
+
+Kernel SHA-256
+`dd601109c01b5f782263491e84883b75d3229abafee971a63dd7bed1f7bf84b5`
+passed the supported compiled entry audit and all 39 hosted suites. Session
+`726d0a4464d041ee973da02403b6cd2d` passed the existing ownership regression and
+the new preparation matrix on both mounts. Independent offline `debugfs` reads
+verified fourteen inode owners, including the maximum IDs (printed as signed
+-2/-3 by this e2fsprogs version and normalized to their uint32 values).
+Cold session `64329a90e05f408da37f32e1cf1da19c` passed persistent owner/read checks,
+metadata denials and supplementary-group reads. Four pre-existing Writer, GIMP
+and OpenTTD documents retained their exact bytes and 1000:100 owners. Both runs
+passed checked sync/stop, QEMU/launcher exit zero, serial fault/device audits
+and read-only checks of the FAT and two ext2 volumes. Local evidence is under
+`build/workloads/identity-uid32-20261018/`.
+
+This does not complete directory traversal/mutation authorization, metadata
+supplementary-group policy, parent setgid inheritance, Nix store protection or
+IPC peer credentials. In particular, changing `XDG_RUNTIME_DIR` alone cannot
+make the FAT-backed `/tmp` a private mode-0700 directory. A suitable runtime
+filesystem and endpoint lifetime policy remain required; no login/accounts or
+runtime-directory relocation are introduced here. The full two-path bootstrap
+acceptance remains at `f4066d0`, before this kernel change, and has not yet been
+renewed for this ownership checkpoint.

@@ -117,6 +117,30 @@ struct Ext2Inode {
 };
 
 static_assert(sizeof(Ext2Inode) == 128, "Ext2Inode size mismatch");
+// Linux ext2 stores the upper halves at inode byte offsets 120/122.
+// Read/write bytes explicitly: preserve the other OS-dependent fields.
+static_assert(__builtin_offsetof(Ext2Inode, i_osd2) == 116, "ext2 owner layout");
+static uint32_t Ext2Uid(const Ext2Inode& inode)
+{
+    return inode.i_uid | (uint32_t(inode.i_osd2[4]) << 16) | (uint32_t(inode.i_osd2[5]) << 24);
+}
+static uint32_t Ext2Gid(const Ext2Inode& inode)
+{
+    return inode.i_gid | (uint32_t(inode.i_osd2[6]) << 16) | (uint32_t(inode.i_osd2[7]) << 24);
+}
+static void Ext2SetUid(Ext2Inode& inode, uint32_t uid)
+{
+    inode.i_uid = static_cast<uint16_t>(uid);
+    inode.i_osd2[4] = static_cast<uint8_t>(uid >> 16);
+    inode.i_osd2[5] = static_cast<uint8_t>(uid >> 24);
+}
+static void Ext2SetGid(Ext2Inode& inode, uint32_t gid)
+{
+    inode.i_gid = static_cast<uint16_t>(gid);
+    inode.i_osd2[6] = static_cast<uint8_t>(gid >> 16);
+    inode.i_osd2[7] = static_cast<uint8_t>(gid >> 24);
+}
+
 static constexpr uint32_t EXT2_MAX_TIMESTAMP = 0xffffffffu;
 
 static uint32_t Ext2Now()
@@ -1395,6 +1419,9 @@ static bool Ext2ReclaimInode(Ext2Mount* mnt, uint32_t ino, Ext2Inode* data)
     if (!Ext2FreeInodeBlocks(mnt, ino, data)) return false;
     data->i_dtime = Ext2Now();
     if (!data->i_dtime) data->i_dtime = 1;
+    // Deleted/reused inodes must not retain stale upper owner bits. Open
+    // unlinked inodes reach this point only after their final hold is gone.
+    memset(data->i_osd2 + 4, 0, 4);
     if (!Ext2WriteInode(mnt, ino, data)) return false;
     return Ext2FreeInode(mnt, ino, (data->i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR);
 }
@@ -2284,8 +2311,8 @@ static void Ext2FillStat(VnodeStat* st, Ext2Mount* mnt, uint32_t ino, const Ext2
     st->isSymlink = (data.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK;
     st->size = st->isDir ? 0 : Ext2InodeSize(&data);
     st->ino = ino;
-    st->uid = data.i_uid;
-    st->gid = data.i_gid;
+    st->uid = Ext2Uid(data);
+    st->gid = Ext2Gid(data);
     st->mode = data.i_mode;
     st->nlink = data.i_links_count;
     // A virtual major reserved for ext2, with a unique minor per mount.
@@ -2396,9 +2423,9 @@ static int Ext2SetInodeTimes(Ext2Mount* mnt, uint32_t ino, const VnodeTime* time
     if (!Ext2ReadInode(mnt, ino, &data)) return -5;
     if (times[0].nsec == VFS_UTIME_OMIT && times[1].nsec == VFS_UTIME_OMIT) return 0;
     Process* cur = ProcessCurrent();
-    if (cur && cur->euid != 0 && cur->euid != data.i_uid && !mnt->skipPermChecks) {
+    if (cur && cur->euid != 0 && cur->euid != Ext2Uid(data) && !mnt->skipPermChecks) {
         bool bothNow = times[0].nsec == VFS_UTIME_NOW && times[1].nsec == VFS_UTIME_NOW;
-        uint16_t permissions = cur->egid == data.i_gid ? (data.i_mode >> 3) : data.i_mode;
+        uint16_t permissions = cur->egid == Ext2Gid(data) ? (data.i_mode >> 3) : data.i_mode;
         if (!bothNow || !(permissions & 2)) return -1; // EPERM
     }
     uint32_t now = Ext2Now();
@@ -2439,8 +2466,8 @@ static int Ext2SetInodeMode(Ext2Mount* mnt, uint32_t ino, uint16_t mode)
     if (!Ext2ReadInode(mnt, ino, &data)) return -5;
     Process* cur = ProcessCurrent();
     if (cur && cur->euid != 0) {
-        if (cur->euid != data.i_uid) return -1;
-        if (cur->egid != data.i_gid) mode &= ~02000;
+        if (cur->euid != Ext2Uid(data)) return -1;
+        if (cur->egid != Ext2Gid(data)) mode &= ~02000;
     }
     data.i_mode = (data.i_mode & EXT2_S_IFMT) | (mode & 07777);
     data.i_ctime = Ext2Now();
@@ -2464,17 +2491,15 @@ static int Ext2VnodeChmod(Vnode* vn, uint16_t mode)
     return result;
 }
 
-// Caller holds the filesystem write lock. This backend currently exposes
-// 16-bit ownership; reject larger IDs rather than silently truncating them.
+// Caller holds the filesystem write lock. UINT32_MAX retains the old ID.
 static int Ext2SetInodeOwner(Ext2Mount* mnt, uint32_t ino, uint32_t uid, uint32_t gid)
 {
-    if ((uid != 0xffffffffu && uid > 65535) || (gid != 0xffffffffu && gid > 65535)) return -75;
     Process* cur = ProcessCurrent();
     if (cur && cur->euid != 0) return -1;
     Ext2Inode data;
     if (!Ext2ReadInode(mnt, ino, &data)) return -5;
-    if (uid != 0xffffffffu) data.i_uid = static_cast<uint16_t>(uid);
-    if (gid != 0xffffffffu) data.i_gid = static_cast<uint16_t>(gid);
+    if (uid != 0xffffffffu) Ext2SetUid(data, uid);
+    if (gid != 0xffffffffu) Ext2SetGid(data, gid);
     if ((data.i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
         data.i_mode &= ~04000;
         if (data.i_mode & 0010) data.i_mode &= ~02000;
@@ -2890,8 +2915,8 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
             Process* cur = ProcessCurrent();
             uint16_t mask = cur ? cur->umask : 022;
             inodeData.i_mode = EXT2_S_IFREG | (createMode & 07777 & ~mask);
-            inodeData.i_uid = cur ? static_cast<uint16_t>(cur->euid) : 0;
-            inodeData.i_gid = cur ? static_cast<uint16_t>(cur->egid) : 0;
+            Ext2SetUid(inodeData, cur ? cur->euid : 0);
+            Ext2SetGid(inodeData, cur ? cur->egid : 0);
         }
         inodeData.i_links_count = 1;
         Ext2Touch(&inodeData, true);
@@ -2928,7 +2953,7 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
     if (!created && !(flags & VFS_O_METADATA)) {
         Process* cur = ProcessCurrent();
         if (!mnt->skipPermChecks) {
-            uint8_t perm = ProcessFilePermissions(cur, inodeData.i_uid, inodeData.i_gid,
+            uint8_t perm = ProcessFilePermissions(cur, Ext2Uid(inodeData), Ext2Gid(inodeData),
                                                   inodeData.i_mode);
             uint8_t required = (flags & VFS_O_WRITE) ? 2 : 4;
             if (flags & VFS_O_READWRITE) required |= 4;
@@ -3206,8 +3231,8 @@ static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath, uint1
         Process* cur = ProcessCurrent();
         uint16_t mask = cur ? cur->umask : 022;
         newData.i_mode = EXT2_S_IFDIR | (mode & 01777 & ~mask);
-        newData.i_uid = cur ? static_cast<uint16_t>(cur->euid) : 0;
-        newData.i_gid = cur ? static_cast<uint16_t>(cur->egid) : 0;
+        Ext2SetUid(newData, cur ? cur->euid : 0);
+        Ext2SetGid(newData, cur ? cur->egid : 0);
     }
     newData.i_links_count = 2; // . and parent's entry
     Ext2Touch(&newData, true);
@@ -3470,6 +3495,9 @@ static int Ext2FsSymlink(void* mountPriv, uint8_t pdrv,
     Ext2Inode newData;
     memset(&newData, 0, sizeof(newData));
     newData.i_mode = EXT2_S_IFLNK | 0777;
+    Process* cur = ProcessCurrent();
+    Ext2SetUid(newData, cur ? cur->euid : 0);
+    Ext2SetGid(newData, cur ? cur->egid : 0);
     newData.i_links_count = 1;
     Ext2Touch(&newData, true);
 

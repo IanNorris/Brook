@@ -59,7 +59,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, save/reopen and normal exit verified alongside Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
 | [Blender](https://www.blender.org/) | 5.1.1 | 🚧 Blocked | Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
-| [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
+| [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen (including cold boot) and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
 | [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer save/reopen across cold boot and full native-close cleanup verified as Brook; startup and broader suite coverage remain experimental |
 | [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | 720p OSS playback through the normal launcher; pause/resume, full native-close and SIGKILL audio cleanup verified with the compatibility build |
 
