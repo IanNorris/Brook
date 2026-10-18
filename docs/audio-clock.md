@@ -359,6 +359,49 @@ compatibility path; the generators and captures are regression helpers.
 Sources: [Linux OSS capability definitions](https://raw.githubusercontent.com/torvalds/linux/master/include/uapi/linux/soundcard.h),
 [ALSA ioplug transfer and boundary behavior](https://raw.githubusercontent.com/alsa-project/alsa-lib/v1.2.15.3/src/pcm/pcm_ioplug.c).
 
+## Firefox with the clocked ALSA route (18 October)
+
+The isolated `build/workloads/firefox-clocked-20261018/` candidate cloned the
+accepted ALSA v2 disks and frozen artifacts, with eight CPUs, 4 GiB RAM, CPU
+composition and silent host audio. Session `f3bda22cb9f5427cb238542942a0bba0`
+used kernel SHA-256
+`9261115b37d0605c2403348e80b801b12e3ccefdee0a93091ff1eeb728053675`.
+The current `brook-firefox` wrapper was staged byte-for-byte as `/boot/FFNORM.SH`;
+the cloned installed profile lacked that wrapper. Firefox ran as UID 1000 against
+the existing cloned `/data/home/.mozilla/brook` profile.
+
+With only test ALSA configuration/plugin environment variables supplied, Firefox
+still selected PulseAudio, remained at media time zero after Play, and produced
+no PCM. It closed normally with exit zero and no remaining tracked job tasks.
+After backing up the cloned `user.js`, adding only
+`user_pref("media.cubeb.backend", "alsa");` allowed playback through the same
+wrapper. No content-sandbox or cubeb-sandbox settings were changed; the audio
+process log reports `media.cubeb.sandbox: true`. This does not establish complete
+Firefox sandbox security or explain every child-process diagnostic.
+
+The first short-loop capture contained nonzero PCM but repeated approximately
+0.54-second silent intervals every five seconds. A separate, generated 30-second
+H.264/AAC fixture removed looping from the measurement: its ten-second capture
+contains 441,193 stereo frames over 10.0044 seconds, RMS 2046 in signed-16 units,
+and no silent 10-ms RMS bins below one signed-16 unit. Positive zero crossings
+over the interior eight seconds measure the generated 440-Hz tone at 440 Hz.
+Evidence is in `alsa-continuous-audio2.json` and its referenced WAV;
+`alsa-continuous-playing.png` records the video. This is a bounded steady-playback
+check, not proof of glitch-free arbitrary media or acceptable loop transitions.
+
+Native WM close returned the entire tracked Firefox job to terminal exit zero
+with zero live tasks. A subsequent three-second capture has no active output;
+the guest returned to ten processes. Checked guest sync, launcher exit zero,
+stopped-process verification, serial/device acceptance and all three offline
+filesystem checks pass. Startup stderr still includes crashreporter/telemetry
+diagnostics, which are retained rather than treated as crash-free acceptance.
+
+Normal shipped-launcher integration remains open: this run needed test-only
+ALSA environment variables and a cloned-profile backend preference. The image
+must supply the plugin/configuration and a preference policy that preserves user
+choices, then pass the same test without diagnostic setup. Default ALSA settings
+and the repository Firefox wrapper remain unchanged.
+
 ## Remaining integration acceptance
 
 Review with Astra identified the following integration requirements. The native

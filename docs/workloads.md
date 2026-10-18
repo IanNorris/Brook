@@ -2072,3 +2072,18 @@ This fixes the reproduced modulo-pointer ambiguity without selecting a new
 default or accepting Firefox audio. Other client rates/formats and normal-launcher
 browser acceptance remain next. See [audio evidence](audio-clock.md) and the
 [plugin instructions](../tools/alsa-oss-pkg/README.md).
+
+### Firefox clocked playback checkpoint (18 October)
+
+Firefox now produces sustained audio through the clocked ALSA route in an
+isolated clone, using the current launcher wrapper and existing cloned profile.
+Selecting ALSA in that profile, plus test-only ALSA configuration/module paths,
+was necessary; the unmodified backend choice still reaches failing PulseAudio.
+Content/audio sandbox preferences were unchanged. A generated continuous video
+produced 10.0044 seconds of captured stereo PCM, no silent 10-ms bins, and the
+expected 440-Hz tone. Short-video looping still showed periodic silence and
+needs separate investigation. Normal close leaves zero tracked tasks and no
+active PCM, and checked shutdown/serial/offline filesystem acceptance passes.
+This is not yet normal shipped-launcher audio acceptance. See
+[audio evidence](audio-clock.md) for exact artifacts, remaining integration and
+startup diagnostics.
