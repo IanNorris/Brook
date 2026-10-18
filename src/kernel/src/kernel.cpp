@@ -383,14 +383,12 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::ApicInitReschedIpi();
         brook::ApicInitTlbShootdown();
 
-        // Read CMOS RTC to get wall-clock time before LAPIC timer starts.
+        // Select the elapsed clock before anchoring the CMOS wall-clock epoch.
+        // Falls back silently on bare metal / non-KVM hosts.
+        brook::KvmClockInit();
         brook::RtcInit();
-        // Default timezone: UTC+0 (UK). Set to UTC+1 for BST when needed.
         brook::RtcSetTimezoneOffset(0);
 
-        // KVM paravirt clock — high-precision monotonic time when running
-        // under KVM.  Falls back silently on bare metal / non-KVM hosts.
-        brook::KvmClockInit();
     }
     else
     {

@@ -1,12 +1,13 @@
 // rtc.cpp — CMOS Real-Time Clock driver.
 //
 // Reads the MC146818-compatible RTC at boot to capture wall-clock time,
-// then derives current time from the LAPIC tick counter.
+// then advances one epoch anchor using a single elapsed-time source.
 
 #include "rtc.h"
 #include "portio.h"
 #include "serial.h"
 #include "apic.h"
+#include "kvmclock.h"
 
 namespace brook {
 
@@ -18,6 +19,12 @@ static uint64_t g_bootEpochSec = 0;
 
 // LAPIC tick value when RTC was read (to compute elapsed time).
 static uint64_t g_bootTick = 0;
+
+// Immutable after BSP boot, before application/AP clock readers start. The
+// CMOS read has one-second precision; fractional time must share its epoch.
+static uint64_t g_wallEpochNs = 0;
+static uint64_t g_wallStarted = 0;
+static bool g_wallUsesPvclock = false;
 
 // Timezone offset in seconds east of UTC.
 static int32_t g_tzOffsetSec = 0;
@@ -40,9 +47,14 @@ static uint64_t g_lastRateTick = 0;
 
 static uint8_t CmosRead(uint8_t reg)
 {
+#ifdef BROOK_HOST_TEST
+    extern uint8_t RtcTestCmosRead(uint8_t);
+    return RtcTestCmosRead(reg);
+#else
     outb(0x70, reg);
     io_wait();
     return inb(0x71);
+#endif
 }
 
 static bool CmosUpdateInProgress()
@@ -166,6 +178,9 @@ void RtcInit()
 
     g_bootEpochSec = DateToEpoch(fullYear, mon, day, hr, min, sec);
     g_bootTick = g_lapicTickCount;
+    g_wallUsesPvclock = KvmClockAvailable();
+    g_wallStarted = g_wallUsesPvclock ? KvmClockReadNs() : g_lapicRawTickCount;
+    g_wallEpochNs = g_bootEpochSec * 1000000000ULL;
     g_lastRtcSec = g_bootEpochSec;
     g_lastRtcTick = g_bootTick;
 
@@ -216,14 +231,14 @@ static uint64_t TryReadCmosEpoch()
 // Re-align g_lapicTickCount against the CMOS RTC.  Called periodically from
 // the BSP's LAPIC timer ISR.  The LAPIC timer is calibrated once at boot
 // against the PIT; under real hardware turbo-boost (or KVM timer drift)
-// it can skew by 10-20% from wall-clock.  Since every Brook time source
-// (clock_gettime, gettimeofday, nanosleep scheduling) is based on this
-// counter, letting it skew makes user-space time sources diverge from
-// reality.  We rebase by reading CMOS (1-second resolution) once a second
+// it can skew by 10-20% from wall-clock. Legacy scheduler/tick consumers
+// still depend on this counter; realtime no longer uses its rebased value.
+// We rebase by reading CMOS (1-second resolution) once a second
 // and nudging g_lapicTickCount so it matches wall time.
 //
-// The counter is never decremented — only paused (when LAPIC is running
-// fast) or jumped forward (when running slow).
+// This legacy apparent counter can be nudged backwards. It is not the elapsed
+// source for RtcNowNs; raw IRQ ticks remain unadjusted. KVM realtime uses
+// pvclock independently. Recalibration still adjusts the hardware timer rate.
 void RtcRecalibrateLapic()
 {
     uint64_t tickNow = g_lapicTickCount;
@@ -284,10 +299,19 @@ void RtcRecalibrateLapic()
     g_lastRtcTick = g_lapicTickCount;
 }
 
+uint64_t RtcNowNs()
+{
+    const uint64_t now = g_wallUsesPvclock ? KvmClockReadNs() : g_lapicRawTickCount;
+    // Never combine integer seconds from one clock with another clock's phase.
+    // Raw delivered ticks avoid RTC rebasing on the fallback path; their rate
+    // still depends on timer calibration and interrupt delivery.
+    const uint64_t elapsed = now >= g_wallStarted ? now - g_wallStarted : 0;
+    return g_wallEpochNs + elapsed * (g_wallUsesPvclock ? 1ULL : 1000000ULL);
+}
+
 uint64_t RtcNow()
 {
-    uint64_t elapsedMs = g_lapicTickCount - g_bootTick;
-    return g_bootEpochSec + elapsedMs / 1000;
+    return RtcNowNs() / 1000000000ULL;
 }
 
 uint64_t RtcNowLocal()

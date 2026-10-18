@@ -109,9 +109,9 @@ does not renew full bootstrap acceptance or prove browser startup/playback gains
 The preliminary `package-pipeline-baseline-20261018` is rejected timing evidence:
 Bash's realtime-based clock went backwards. A separate three-second audit saw
 three backwards realtime steps, up to 999,000,322 ns, while monotonic time did
-not regress. Its content checks and checked shutdown/fsck passed. The known
-RTC/pvclock composition bug is in the [backlog](backlog.md); benchmark durations
-now use `tools/io-bench/monotime.c`, not realtime.
+not regress. Its content checks and checked shutdown/fsck passed. The RTC/pvclock composition bug was subsequently
+[repaired and checked separately](realtime-clock.md); benchmark durations
+use `tools/io-bench/monotime.c`, not realtime.
 
 
 ## Full SDK acceptance

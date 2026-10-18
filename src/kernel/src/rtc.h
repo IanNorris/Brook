@@ -5,12 +5,17 @@
 namespace brook {
 
 // Read the CMOS RTC and initialise the wall-clock epoch.
-// Must be called early in boot (before LAPIC timer starts).
+// Call after KvmClockInit, before AP/application readers; source fixed at boot.
 void RtcInit();
 
 // Re-align g_lapicTickCount against the CMOS RTC.  Called once per second
 // from the BSP's LAPIC timer ISR to correct for timer calibration drift.
 void RtcRecalibrateLapic();
+
+// Nanoseconds since Unix epoch, advanced from one boot CMOS/elapsed anchor.
+// CMOS precision is one second. No runtime wall-clock setting is implemented.
+// Non-KVM fallback uses raw delivered timer ticks, subject to calibration/drift.
+uint64_t RtcNowNs();
 
 // Get current wall-clock time as Unix timestamp (UTC).
 uint64_t RtcNow();

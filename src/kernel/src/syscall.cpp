@@ -5076,11 +5076,9 @@ struct timeval {
 // CLOCK_REALTIME=0  CLOCK_MONOTONIC=1  CLOCK_MONOTONIC_RAW=4  CLOCK_BOOTTIME=7
 static uint64_t ClockNowNs(uint64_t clockid)
 {
-    uint64_t ns = KvmClockAvailable() ? KvmClockReadNs()
-                                     : g_lapicTickCount * 1000000ULL;
-    if (clockid == 0)
-        return RtcNow() * 1000000000ULL + ns % 1000000000ULL;
-    return ns;
+    if (clockid == 0) return RtcNowNs();
+    return KvmClockAvailable() ? KvmClockReadNs()
+                               : g_lapicTickCount * 1000000ULL;
 }
 
 static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
@@ -5088,40 +5086,9 @@ static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
 {
     timespec value{};auto* ts=&value;
 
-    // Under KVM, the pvclock source gives us nanosecond precision directly.
-    // LAPIC-derived ms is only ms-accurate and drifts between RTC
-    // re-anchors, so prefer pvclock whenever it's live.
-    if (KvmClockAvailable())
-    {
-        uint64_t ns = KvmClockReadNs();
-        if (clockid == 0) // CLOCK_REALTIME
-        {
-            // Wall-clock: RtcNow() gives the epoch base, pvclock the sub-sec.
-            uint64_t epoch = RtcNow();
-            ts->tv_sec  = static_cast<int64_t>(epoch);
-            ts->tv_nsec = static_cast<int64_t>(ns % 1000000000ULL);
-        }
-        else
-        {
-            ts->tv_sec  = static_cast<int64_t>(ns / 1000000000ULL);
-            ts->tv_nsec = static_cast<int64_t>(ns % 1000000000ULL);
-        }
-        return CopyToUser(tsAddr,&value,sizeof(value))?0:-EFAULT;
-    }
-
-    if (clockid == 0) // CLOCK_REALTIME — wall-clock via RTC
-    {
-        uint64_t epoch = RtcNow();
-        uint64_t ms = g_lapicTickCount;
-        ts->tv_sec  = static_cast<int64_t>(epoch);
-        ts->tv_nsec = static_cast<int64_t>((ms % 1000) * 1000000);
-    }
-    else // CLOCK_MONOTONIC and variants — boot-relative
-    {
-        uint64_t ms = g_lapicTickCount;
-        ts->tv_sec  = static_cast<int64_t>(ms / 1000);
-        ts->tv_nsec = static_cast<int64_t>((ms % 1000) * 1000000);
-    }
+    const uint64_t ns = ClockNowNs(clockid);
+    ts->tv_sec = static_cast<int64_t>(ns / 1000000000ULL);
+    ts->tv_nsec = static_cast<int64_t>(ns % 1000000000ULL);
     return CopyToUser(tsAddr,&value,sizeof(value))?0:-EFAULT;
 }
 
@@ -5142,19 +5109,9 @@ static int64_t sys_gettimeofday(uint64_t tvAddr, uint64_t, uint64_t,
 {
     timeval value{};auto* tv=&value;
 
-    uint64_t epoch = RtcNow();
-    if (KvmClockAvailable())
-    {
-        uint64_t ns = KvmClockReadNs();
-        tv->tv_sec  = static_cast<int64_t>(epoch);
-        tv->tv_usec = static_cast<int64_t>((ns / 1000) % 1000000ULL);
-    }
-    else
-    {
-        uint64_t ms = g_lapicTickCount;
-        tv->tv_sec  = static_cast<int64_t>(epoch);
-        tv->tv_usec = static_cast<int64_t>((ms % 1000) * 1000);
-    }
+    const uint64_t ns = RtcNowNs();
+    tv->tv_sec = static_cast<int64_t>(ns / 1000000000ULL);
+    tv->tv_usec = static_cast<int64_t>((ns / 1000) % 1000000ULL);
     return CopyToUser(tvAddr,&value,sizeof(value))?0:-EFAULT;
 }
 

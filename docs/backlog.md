@@ -1,16 +1,13 @@
 # Recovery and VM-control backlog
 
-- Repair the realtime clock composition. The controlled package pipeline probe
-  (`build/workloads/package-pipeline-baseline-20261018`) observed three backwards
-  steps in three seconds, with a largest step of 999,000,322 ns; monotonic time
-  did not regress. `ClockNowNs(0)`, `clock_gettime(CLOCK_REALTIME)` and
-  `gettimeofday` combine LAPIC/RTC-derived integer seconds with an unrelated
-  pvclock fractional second. Bind the epoch to one elapsed clock source instead;
-  keep `time`, realtime timers and display/file timestamps consistent. Cover
-  second boundaries and deliberate RTC changes separately, and audit LAPIC
-  recalibration (which can currently decrement its apparent tick counter) for
-  the non-KVM path. Benchmark durations now use a static monotonic-clock helper;
-  rejected wall-clock timings are preserved and must not be accepted as data.
+- Finish clock coverage after the [realtime epoch-anchor repair](realtime-clock.md).
+  The eight-worker KVM comparison now has zero backwards realtime steps, versus
+  15 per worker before. Audit remaining apparent LAPIC tick consumers, especially
+  non-KVM monotonic/scheduler paths: RTC calibration can still decrement that
+  legacy counter. Test real hardware frequency accuracy, suspend/resume,
+  runtime wall-clock adjustment semantics, clock-ID handling and realtime timer
+  wakeup behavior. Measure Firefox playback separately; no browser improvement
+  is established by the clock probe. Preserve rejected historical timings.
 
 - Split `src/kernel/src/syscall.cpp` (now over 14,000 lines) into subsystem
   translation units. Start with an inventory of dispatch entries, shared state
