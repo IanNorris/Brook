@@ -182,11 +182,13 @@
   it. Python's ITIMER_REAL probe currently fails with ENOSYS. Audio interruption
   tests use targeted pthread signals instead; that substitution does not verify
   interval timers or resolve the missing syscall.
-- Fresh-build diagnostics: `scripts/build.sh` currently prints success after a
-  hosted configure/build failure. Make required hosted failures propagate, with
-  an explicit opt-out if kernel-only builds need to remain supported. An early
-  module-test fixture compile failure exposed this; the final audio checkpoint
-  uses an explicit full ctest gate and passes all 34 suites.
+- Fresh-build diagnostics: `scripts/build.sh` now propagates hosted configure/build
+  failures, prints the relevant log tail on stderr and does not report completion.
+  Three fake-tool control-flow checks cover both failures and success without
+  compiling a kernel (`scripts/test_build_script.py`). Verify the revised script
+  at the next full build; the preceding audio checkpoint independently passed all
+  34 hosted suites. The script still builds tests without running them: ctest is
+  a separate required acceptance gate.
 - Fix kernel-symbol table generation on incremental/fresh builds: the current
   post-link generator writes addresses for the next link. Chromium's preserved
   panic labeled RIP `0xffffffff800af838` as KRwLockReadLock, while the exact

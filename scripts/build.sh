@@ -71,12 +71,14 @@ then
         echo "Host tests built."
         echo "  Run host-native tests with: ctest --test-dir ${HOST_TEST_DIR} --output-on-failure"
     else
-        echo "Host tests skipped (build failed; see ${HOST_TEST_DIR}/build.log)."
-        tail -25 "${HOST_TEST_DIR}/build.log"
+        echo "Host test build failed; see ${HOST_TEST_DIR}/build.log." >&2
+        tail -25 "${HOST_TEST_DIR}/build.log" >&2
+        exit 1
     fi
 else
-    echo "Host tests skipped (configure failed; see ${HOST_TEST_DIR}/configure.log)."
-    tail -25 "${HOST_TEST_DIR}/configure.log"
+    echo "Host test configuration failed; see ${HOST_TEST_DIR}/configure.log." >&2
+    tail -25 "${HOST_TEST_DIR}/configure.log" >&2
+    exit 1
 fi
 
 echo "  Run bare-metal test ELFs with: ./scripts/run-tests.sh ${BUILD_TYPE_LOWER}"
