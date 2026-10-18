@@ -21,6 +21,10 @@ The patches:
   and sizing changes, before returning the blocking window request to the
   renderer. Those transitions can hide and recreate the native surface.
   Reject a missing final handle and release the widget reservation.
+- Return from OSS playback on a persistent write error or zero progress and
+  request VLC's deferred output restart. Short writes retain their unwritten
+  suffix; interrupted writes retry. The previous callback could spin forever on
+  a faulted DSP descriptor and prevent playback or shutdown from progressing.
 
 The callback ownership regression can be checked against the matching VLC
 source directory (the package derivation's `src`):
@@ -34,6 +38,20 @@ compiles five ownership cases in debug/release modes. The model keeps clones
 distinct from their backing pictures and detects stale releases without using
 freed host memory. Unpatched release code reproduces two duplicate releases;
 patched code passes all cases. This does not replace real playback/quit tests.
+
+The OSS write regression likewise compiles the actual `Play` callback:
+
+```sh
+python3 tools/vlc-brook-pkg/check-oss-write.py /path/to/vlc-source
+```
+
+Ten cases cover full/short writes, interruption, broken pipe, zero progress,
+partial write followed by error, unavailable-device errors and an empty block.
+Six bounded no-progress loops reproduce in the original callback. All patched
+cases return and release their block once; fatal cases request output restart.
+The Nix check phase runs the patched cases against the source being built.
+This proves callback termination and ownership, rather than physical-device
+reopening or glitch-free audio.
 
 Build and export its closure plus a guest index entry:
 
@@ -106,3 +124,34 @@ long sessions, playlist switching and additional later hide/reparent transitions
 still need coverage. The test index used distinct package names to avoid the
 installer's existing-registration repair behavior, which retains its store hash;
 a general package upgrade workflow remains separate work.
+
+## OSS write recovery checkpoint — 18 October 2026
+
+A native-SDL regression with the preceding package initially played 720p video
+and passed pause/resume, then reported repeated DSP `EPIPE` with silent output
+after a prolonged minimize/restore. Its `Play` callback retried the same buffer
+forever. That run was retained as a negative and required SIGKILL; it is not a
+normal-quit pass.
+
+Package `45m0jgbaciv7zmp1avpkvsf108dispdh-vlc-brook-3.0.23-2` adds the bounded
+write/restart path above. It built with all ten callback cases passing and was
+installed through guest `nix-install` as UID 1000. The deployed OSS module matches
+the host build: SHA-256
+`6d45c887d741a86f39affbd9394e0ba7c5eb4b39ae45504c0332baa7b8b1c0aa`.
+
+The normal launcher played the movie, paused/resumed and restored nonzero audio
+after a measured 55-second minimize. Three temporary-backpressure write errors
+were logged, with replacement audio streams and subsequent nonzero output,
+rather than the preceding repeated-error loop. Normal close drained the complete
+launch lineage and left inactive audio with zero captured frames. A separate
+active-playback SIGKILL case also drained its full lineage and output. A full
+cold boot retained the new module and passed ordinary playback/audio and normal
+close again. Checked shutdown, original launcher exit zero, heap checks and all
+three read-only filesystem checks passed after each boot; nine saved fixtures
+retained exact hashes and Brook ownership.
+
+**Video restoration remains broken:** the video area was black after the long
+minimize even though audio recovered. The reference movie at that timestamp is
+not black. This checkpoint accepts bounded callback recovery and exit cleanup,
+not video restoration, uninterrupted audio or controlled guest `EPIPE` injection.
+Evidence: `build/workloads/media-regression-bed237cb-20261018/`.

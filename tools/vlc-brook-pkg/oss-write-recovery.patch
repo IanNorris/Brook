@@ -1,0 +1,29 @@
+--- a/modules/audio_output/oss.c
++++ b/modules/audio_output/oss.c
+@@ -271,13 +271,24 @@
+     while (block->i_buffer > 0)
+     {
+         ssize_t bytes = write (fd, block->p_buffer, block->i_buffer);
+-        if (bytes >= 0)
++        if (bytes > 0)
+         {
+             block->p_buffer += bytes;
+             block->i_buffer -= bytes;
+         }
+         else
+-            msg_Err (aout, "cannot write samples: %s", vlc_strerror_c(errno));
++        {
++            if (bytes < 0 && errno == EINTR)
++                continue;
++            if (bytes < 0)
++                msg_Err (aout, "cannot write samples: %s", vlc_strerror_c(errno));
++            else
++                msg_Err (aout, "OSS device made no write progress");
++            /* A faulted DSP open needs recovery. Return to the output owner
++             * rather than retrying forever and preventing stop/close. */
++            aout_RestartRequest (aout, AOUT_RESTART_OUTPUT);
++            break;
++        }
+     }
+     block_Release (block);
+ }
