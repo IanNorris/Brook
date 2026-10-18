@@ -88,6 +88,54 @@ were unchanged. Private evidence is under
 `build/workloads/prime-review-failure-20261019/`. Retain this as failed workload
 acceptance despite the clean shutdown and filesystem checks.
 
+## Isolated memory attribution
+
+Separate eight-CPU, 4 GiB hardware-GL boots used identical starting packages and
+profiles, the validated mmap-token kernel and silent host audio. These measured
+normal-launcher startup, not gameplay or video playback. STK remained on its
+loading screen when the configured 1,536 MiB free-memory floor triggered close;
+Chromium showed a blank new tab. Rolling diagnostic snapshots reported:
+
+| Guest used memory (MiB) | Baseline | Before close | After full lineage exit |
+|---|---:|---:|---:|
+| STK | 215.0 | 2,694.8 | 2,481.1 |
+| Chromium | 215.0 | 928.7 | 291.3 |
+
+STK reached the sampled floor after about 21 seconds. Its user-address-space
+census accounted for only 221.6 MiB near close, and returned to 18.9 MiB after
+close. Kernel heap use also returned near baseline. These measurements alone
+did not distinguish DRM allocations from caches or other kernel memory.
+
+The subsequent diagnostic kernel adds `mem drm`, also available through
+`vm_stats(gpu_details=true)`. It counts successful kernel backing-mapping
+allocations, releases at final DRM-FD teardown, mappings discarded at GEM close,
+and failed allocation attempts. Counts are cumulative and independently sampled;
+use quiescent endpoints for conservation checks. Releasing a kernel mapping does
+not prove physical-page release while userspace mappings still pin its pages.
+The counters exclude host VRAM, driver upload buffers and compositor allocations.
+GEM-close discards are already part of allocated-minus-released; do not subtract
+them a second time. Older guests report `gpu_backing.supported=false`.
+
+The completed tiny mapping/fork probe verified exact deltas of three allocations
+(12,288 bytes), two releases (8,192 bytes), one GEM-close discard (4,096 bytes)
+and no allocation failures. The assertion waits for the full process lineage
+and output EOF, because the probe prints its result before its final FD closes.
+
+In the repeated STK run, all processes exited normally but **2,285,068,288 bytes
+above baseline** remained in backing mappings discarded by GEM close. This is
+2.13 GiB, accounting for 96.5% of the 2,367,795,200-byte retained guest-memory
+growth. No allocation failure occurred in the bounded diagnostic run. This
+identifies the dominant retention in that run; the diagnostic does not repair
+it. Freeing those pages immediately at GEM close would violate outstanding
+mapping/export/GPU ownership. Implement the shared ownership and completion
+rules below before reclaiming them.
+
+Evidence: `build/workloads/memory-isolated-20261019/acceptance-audit.json` and
+`stk-diagnostics/` beneath that directory. Each run has checked shutdown, owned
+launcher exit zero, offline data/Nix/FAT checks returning zero and nine unchanged
+document fixtures. The diagnostic build passed 46 host suites and supported
+compiled entry/startup audits; the bridge run completed 254 tests with five skips.
+
 Existing disk images need both the rebuilt kernel and rebuilt `waylandd`:
 the kernel now returns shared handles, and the server counts their buffer owners.
 The prepared private user review preserves the prior user packages/profiles;

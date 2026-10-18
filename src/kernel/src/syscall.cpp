@@ -16,6 +16,7 @@
 #include "desktop_identity.h"
 #include "exec_limits.h"
 #include "drm_map_tokens.h"
+#include "drm_backing_diagnostics.h"
 #include "exec_image.h"
 #include "fpu_irq.h"
 #include "scheduler.h"
@@ -2861,6 +2862,7 @@ static bool DrmSysIsDir(const char* path) {
 // Reconstructed BRO-227 fix (06a8d07); keep headroom for console/UI transitions.
 static constexpr uint32_t DRM_MAX_GEM = 2048;
 static DrmMapTokenAllocator g_drmMapTokens;
+static DrmBackingDiagnostics g_drmBackingDiagnostics;
 struct DrmGemObj {
     bool     used;
     uint32_t gres;     // host-global virgl resource id (== res_handle)
@@ -2945,6 +2947,18 @@ static DrmGemObj* DrmGemGet(DrmCtx* c, uint32_t bo_handle) {
     return g->used ? g : nullptr;
 }
 } // namespace
+
+DrmBackingDiagnostics DrmBackingDiagnosticsRead() {
+    const auto& d=g_drmBackingDiagnostics;
+    return {__atomic_load_n(&d.allocatedMappings,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.allocatedPageBytes,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.releasedMappings,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.releasedPageBytes,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.gemCloseDiscardedMappings,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.gemCloseDiscardedPageBytes,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.failedAllocations,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.failedRequestedBytes,__ATOMIC_RELAXED)};
+}
 
 static int ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize);
 
@@ -3459,6 +3473,8 @@ void FinalizeClosedFd(const FdClaimResult& c)
             if (dctx->gem[i].used && dctx->gem[i].backingKva) {
                 uint64_t bpages = (dctx->gem[i].backingBytes + 4095) / 4096;
                 VmmFreePages(VirtualAddress(dctx->gem[i].backingKva), bpages);
+                __atomic_fetch_add(&g_drmBackingDiagnostics.releasedMappings,1,__ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_drmBackingDiagnostics.releasedPageBytes,bpages*4096,__ATOMIC_RELAXED);
             }
         }
         kfree(dctx);
@@ -5735,7 +5751,13 @@ static bool DrmEnsureBacking(DrmCtx* dctx, DrmGemObj* g)
     uint64_t pages = (bytes + 4095) / 4096;
     VirtualAddress kva = VmmAllocPages(pages, VMM_WRITABLE,
                                        MemTag::Device, KernelPid);
-    if (!kva.raw()) return false;
+    if (!kva.raw()) {
+        __atomic_fetch_add(&g_drmBackingDiagnostics.failedAllocations,1,__ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_drmBackingDiagnostics.failedRequestedBytes,bytes,__ATOMIC_RELAXED);
+        return false;
+    }
+    __atomic_fetch_add(&g_drmBackingDiagnostics.allocatedMappings,1,__ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_drmBackingDiagnostics.allocatedPageBytes,pages*4096,__ATOMIC_RELAXED);
     auto* zp = reinterpret_cast<volatile uint8_t*>(kva.raw());
     for (uint64_t b = 0; b < pages * 4096; ++b) zp[b] = 0;
     const brook::GpuAppOps* ga = brook::GpuAppGet();
@@ -6067,6 +6089,11 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!g) return -ENOENT;
         // Drops only the GEM alias today. Host retirement and backing leases
         // are still required before IDs or device-visible pages can be reused.
+        if (g->backingKva) {
+            const uint64_t pages=(static_cast<uint64_t>(g->backingBytes)+4095)/4096;
+            __atomic_fetch_add(&g_drmBackingDiagnostics.gemCloseDiscardedMappings,1,__ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_drmBackingDiagnostics.gemCloseDiscardedPageBytes,pages*4096,__ATOMIC_RELAXED);
+        }
         g->used = false;
         return 0;
     }

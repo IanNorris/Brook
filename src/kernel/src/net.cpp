@@ -33,6 +33,7 @@
 #include "debug_jobs.h"
 #include "debug_epoch.h"
 #include "debug_ui.h"
+#include "drm_backing_diagnostics.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -3600,6 +3601,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
+            "  mem drm         - cumulative DRM backing mapping counters\n"
             "  uptime          - system uptime + wall clock\n"
             "  cpus            - CPU count + SMP info\n"
             "\n"
@@ -3885,6 +3887,18 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("full",stats.full);
         r.text(",");r.field("collisions",stats.collisions);
         r.text(",");r.field("trimmed",stats.trimmed);r.text("}\n");r.send();
+    }
+    else if (NetStrEq(cmd, "mem drm")) {
+        const auto d=DrmBackingDiagnosticsRead();
+        BridgeReply r;r.text("{\"scope\":\"rolling cumulative DRM kernel backing mappings; not physical RAM or host VRAM\",");
+        r.field("allocated_mappings",d.allocatedMappings);r.text(",");
+        r.field("allocated_page_bytes",d.allocatedPageBytes);r.text(",");
+        r.field("released_mappings",d.releasedMappings);r.text(",");
+        r.field("released_page_bytes",d.releasedPageBytes);r.text(",");
+        r.field("gem_close_discarded_mappings",d.gemCloseDiscardedMappings);r.text(",");
+        r.field("gem_close_discarded_page_bytes",d.gemCloseDiscardedPageBytes);r.text(",");
+        r.field("failed_allocations",d.failedAllocations);r.text(",");
+        r.field("failed_requested_bytes",d.failedRequestedBytes);r.text("}\n");r.send();
     }
     else if (NetStrEq(cmd, "mem census")) { DebugMemoryCensus(); }
     else if (NetStrEq(cmd, "mem pids")) {

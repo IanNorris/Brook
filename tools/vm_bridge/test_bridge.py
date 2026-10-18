@@ -334,6 +334,22 @@ class Contracts(unittest.TestCase):
             self.assertFalse(result['audio']['supported'])
             self.assertEqual(result['audio']['reply'],'Unknown command')
 
+    def test_stats_gpu_counters_are_opt_in_and_label_older_guests(self):
+        data={'guest_debug_port':1234}
+        with patch.object(server,'session_lock',return_value=contextlib.nullcontext(data)), \
+             patch.object(server,'guest',return_value={}) as request:
+            self.assertNotIn('gpu_backing',server.stats('fixture'))
+            request.assert_called_once_with(data,'bridge stats')
+        for reply,supported in [({'allocated_page_bytes':12288,'released_page_bytes':8192},True),
+                                ({'reply':'Unknown command'},False)]:
+            with self.subTest(supported=supported), \
+                 patch.object(server,'session_lock',return_value=contextlib.nullcontext(data)), \
+                 patch.object(server,'guest',side_effect=[{},dict(reply)]) as request:
+                result=server.stats('fixture',gpu_details=True)['gpu_backing']
+                self.assertEqual(result['supported'],supported)
+                self.assertGreaterEqual(result['round_trip_ms'],0)
+                self.assertEqual(request.call_args_list[1].args,(data,'mem drm'))
+
     def test_holds_released_on_cancel(self):
         events=[];cancel=threading.Event()
         class FakeQMP:

@@ -44,7 +44,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [DOOM](https://github.com/ozkl/doomgeneric) | 1.9 | ✅ Working | Runs in a WM window or full-screen, with keyboard input |
 | [Quake 2 / Yamagi](https://www.yamagi.org/quake2/) | 8.60 | ✅ Gameplay | Software and hardware virgl GL3 renderers, startup demo, OSS audio and OGG music; [GPU resource retirement/repeated launches](docs/gpu-resource-lifetime.md), mouse capture and intermittent audio timing remain open |
 | [GLtron](https://www.gltron.org/) | 0.70 | ⚠️ Experimental | Compatibility launcher installs through guest `nix-install`; hardware virgl menu and light-cycle gameplay verified, with sound disabled |
-| [SuperTuxKart](https://supertuxkart.net/) | 1.5 | ⚠️ Experimental | Guest package installation and virgl Lighthouse AI race verified; writable state uses ext2; GPU teardown accounting remains under investigation |
+| [SuperTuxKart](https://supertuxkart.net/) | 1.5 | ⚠️ Experimental | Earlier guest installation and virgl Lighthouse AI race verified; current startup reproduces [retained GPU backing growth](docs/gpu-resource-lifetime.md#isolated-memory-attribution), so mixed-app acceptance remains open |
 | [busybox](https://busybox.net/) | 1.36 | ✅ Working | ls, cat, echo, wc, head, tail, grep, and many more |
 | [TCC](https://bellard.org/tcc/) | 0.9.27 | ✅ Working | Compiles and runs C programs natively on Brook |
 | [CoreMark](https://www.eembc.org/coremark/) | 1.0 | ✅ Working | CPU benchmark, runs to completion |
