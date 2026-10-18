@@ -1,5 +1,14 @@
 # Recovery and VM-control backlog
 
+- Split `src/kernel/src/syscall.cpp` (now over 14,000 lines) into subsystem
+  translation units. Start with an inventory of dispatch entries, shared state
+  and helper ownership; move one subsystem at a time while preserving behavior,
+  syscall numbers, ABI and user-memory/cancellation boundaries. Keep dispatch
+  and truly shared infrastructure explicit rather than duplicating helpers.
+  Run the relevant syscall/workload regressions and compiled entry audit after
+  each move. This is deferred maintenance, separate from current performance
+  and browser acceptance fixes.
+
 - Future product/architecture exploration: [Brook beyond compatibility](design/brook-directions.md).
   Investigate app/workspace identities for a primarily single-owner PC, deliberate
   memory sharing, conditional anti-cheat/attestation, native agentic interfaces,
