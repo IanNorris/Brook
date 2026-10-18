@@ -2,6 +2,7 @@
 
 #include "process.h"
 #include "sched_ops.h"
+#include "ready_latency.h"
 
 struct KernelCpuEnv;
 
@@ -224,6 +225,10 @@ bool SchedulerSwitchPolicy(const char* name);
 
 // Get the name of the currently active scheduling policy.
 const char* SchedulerPolicyName();
+
+// Runtime-off queue-entry-to-dispatch diagnostics. Copies under readyLock;
+// callers format/send after release. No blocked-time or wakeup-IPI measurement.
+void SchedulerReadyLatency(ReadyLatencyAction action, ReadyLatencySnapshot* output);
 
 // Panic-safe process enumeration — no locks, assumes all other CPUs halted.
 uint32_t PanicGetProcessCount();

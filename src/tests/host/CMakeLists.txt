@@ -45,6 +45,9 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_ready_latency)
+target_compile_options(test_ready_latency PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+set_tests_properties(test_ready_latency PROPERTIES TIMEOUT 15)
 add_host_test(test_mapping_ranges "${BROOK_ROOT}/src/kernel/src/memory/mapping_ranges.cpp")
 target_compile_options(test_mapping_ranges PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"

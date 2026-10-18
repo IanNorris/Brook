@@ -17,6 +17,7 @@
 #include "profiler.h"
 #include "device.h"
 #include "sync/krwlock.h"
+#include "kvmclock.h"
 
 #include <stdint.h>
 
@@ -206,6 +207,46 @@ static Process* g_pidToProcess[SCHED_MAX_PIDS] = {};
 
 // Global scheduler lock (interrupt-safe, protects all policy calls).
 static SchedLock g_readyLock;
+static ReadyLatencyTracker<SCHED_MAX_PIDS> g_readyLatency;
+
+// All non-idle enqueue/dispatch calls below already hold g_readyLock. A missing
+// stable clock is reported, never replaced with delivered timer-tick time.
+static uint64_t ReadyLatencyNow() {
+    uint64_t now = 0;
+    return KvmClockReadStableNs(&now) ? now : 0;
+}
+static void RecordReadyEnqueue(Process* process) {
+    if (process->pid && g_readyLatency.Enabled())
+        g_readyLatency.Enqueue(process->pid, process->incarnation,
+                              process->isKernelThread, ReadyLatencyNow());
+}
+static void RecordReadyDispatch(Process* process) {
+    if (process->pid && g_readyLatency.Enabled())
+        g_readyLatency.Dispatch(process->pid, process->incarnation, ReadyLatencyNow());
+}
+void SchedulerReadyLatency(ReadyLatencyAction action, ReadyLatencySnapshot* output) {
+    uint64_t flags = SchedLockAcquire(g_readyLock);
+    const bool fresh = action == ReadyLatencyAction::Reset ||
+                       (action == ReadyLatencyAction::On && !g_readyLatency.Enabled());
+    if (action == ReadyLatencyAction::On) g_readyLatency.Enable(true);
+    if (action == ReadyLatencyAction::Off) g_readyLatency.Enable(false);
+    if (action == ReadyLatencyAction::Reset) g_readyLatency.Reset();
+    if (fresh && g_readyLatency.Enabled()) {
+        for (unsigned pid = 1; pid < SCHED_MAX_PIDS; ++pid) {
+            auto* process = g_pidToProcess[pid];
+            if (process && process->state == ProcessState::Ready &&
+                __atomic_load_n(&process->runningOnCpu, __ATOMIC_ACQUIRE) == -1)
+                g_readyLatency.SeedPending(pid, process->incarnation, process->isKernelThread);
+        }
+    }
+    if (output) {
+        *output = g_readyLatency.Snapshot();
+        const char* name = g_schedOps ? g_schedOps->name : "none";
+        for (unsigned i = 0; i + 1 < sizeof(output->policy) && name[i]; ++i)
+            output->policy[i] = name[i];
+    }
+    SchedLockRelease(g_readyLock, flags);
+}
 
 // All processes (for blocked-process scanning).
 static Process* g_allProcesses[MAX_PROCESSES] = {};
@@ -468,6 +509,7 @@ static void ReadyQueueInsertLocked(Process* proc)
     }
     SchedTrace(proc, STR_ENQUEUE);
     g_schedOps->Enqueue(g_schedState, proc->pid);
+    RecordReadyEnqueue(proc);
 }
 
 static void ReadyQueueRemoveLocked(Process* proc)
@@ -475,6 +517,7 @@ static void ReadyQueueRemoveLocked(Process* proc)
     if (proc->pid == 0) return; // idle never in policy queue
     SchedTrace(proc, STR_REMOVE);
     g_schedOps->Remove(g_schedState, proc->pid);
+    g_readyLatency.Remove(proc->pid, proc->incarnation);
 }
 
 static bool ProcessCanRunOnCpu(Process* proc, uint32_t cpu)
@@ -1734,6 +1777,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(newProc);
     }
     newProc->state = ProcessState::Running;
+    if (holdingReadyLock) RecordReadyDispatch(newProc);
     SchedTrace(newProc, STR_RUN);
     __atomic_store_n(&newProc->runningOnCpu, static_cast<int32_t>(cpu), __ATOMIC_RELEASE);
     // Track which CPUs have this process's TLB entries loaded
@@ -2312,6 +2356,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(next);
     }
     next->state = ProcessState::Running;
+    RecordReadyDispatch(next);
     __atomic_store_n(&next->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(&next->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(AddressSpaceTlbMaskPtr(next), 1ULL << cpu, __ATOMIC_RELEASE);
@@ -2364,6 +2409,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
     
     first->state = ProcessState::Running;
+    RecordReadyDispatch(first);
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     SchedLockReleaseRaw(g_readyLock);
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
@@ -2434,6 +2480,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
     
     first->state = ProcessState::Running;
+    RecordReadyDispatch(first);
     __atomic_store_n(&first->runningOnCpu, (int32_t)cpu, __ATOMIC_RELEASE);
     SchedLockReleaseRaw(g_readyLock);
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
@@ -3515,6 +3562,8 @@ bool SchedulerSwitchPolicy(const char* name)
     // Initialize new policy state
     __builtin_memset(g_schedStateStorage, 0, sizeof(g_schedStateStorage));
     g_schedOps = newOps;
+    // Do not mix episodes spanning different policies in one report.
+    g_readyLatency.Reset();
     newOps->Init(g_schedState);
 
     // Re-register all active processes and enqueue ready ones
@@ -3528,8 +3577,11 @@ bool SchedulerSwitchPolicy(const char* name)
             p->name[2] == 'l' && p->name[3] == 'e')
             continue;
         newOps->InitProcess(g_schedState, p->pid, 2); // default priority
-        if (p->state == ProcessState::Ready)
+        if (p->state == ProcessState::Ready) {
             newOps->Enqueue(g_schedState, p->pid);
+            if (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1)
+                RecordReadyEnqueue(p);
+        }
     }
     SchedLockRelease(g_allProcLock, allFlags);
 

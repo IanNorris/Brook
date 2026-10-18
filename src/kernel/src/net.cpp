@@ -3319,6 +3319,48 @@ static void DebugEpollDiagnostics()
     DebugChannelSend("]}\n");
 }
 
+static void DebugReadyLatency(ReadyLatencyAction action)
+{
+    ReadyLatencySnapshot snapshot{};
+    SchedulerReadyLatency(action, &snapshot);
+    BridgeReply header;
+    header.text("{\"enabled\":"); header.text(snapshot.enabled ? "true" : "false");
+    header.text(",\"policy\":\""); header.text(snapshot.policy); header.text("\",");
+    header.field("reset_generation", snapshot.resetGeneration);
+    header.text(","); header.field("enqueues", snapshot.enqueues);
+    header.text(","); header.field("cancelled", snapshot.cancelled);
+    header.text(","); header.field("pending_captured", snapshot.pending);
+    header.text(","); header.field("untracked_dispatches", snapshot.untrackedDispatches);
+    header.text(","); header.field("unavailable_clock_events", snapshot.unavailableClock);
+    header.text(","); header.field("backwards_clock", snapshot.backwardsClock);
+    header.text(","); header.field("preexisting_queued", snapshot.preexistingQueued);
+    header.text(","); header.field("preexisting_dispatches", snapshot.preexistingDispatches);
+    header.text(",\"scope\":\"observed queue insertion to dispatch bookkeeping; excludes blocked time, pre-enqueue wakeup delay and return-to-user time; stable clock required\",\"histogram_upper_bounds_ns\":[");
+    header.send();
+    BridgeReply bounds;
+    for (unsigned i = 0; i + 1 < ReadyLatencyBins; ++i) {
+        if (i) bounds.text(","); bounds.number(ReadyLatencyBoundsNs[i]);
+    }
+    bounds.text(",null]"); bounds.send();
+    auto send = [](const char* name, const ReadyLatencyCounts& counts) {
+        BridgeReply row;
+        row.text(",\""); row.text(name); row.text("\":{");
+        row.field("samples", counts.samples);
+        row.text(","); row.field("sum_ns", counts.sumNs);
+        row.text(","); row.field("maximum_ns", counts.maximumNs);
+        row.text(","); row.field("maximum_pid", counts.maximumPid);
+        row.text(","); row.field("maximum_incarnation", counts.maximumIncarnation);
+        row.text(",\"sum_saturated\":"); row.text(counts.sumSaturated ? "true" : "false");
+        row.text(",\"histogram\":[");
+        for (unsigned i = 0; i < ReadyLatencyBins; ++i) {
+            if (i) row.text(","); row.number(counts.bins[i]);
+        }
+        row.text("]}"); row.send();
+    };
+    send("user", snapshot.user); send("kernel", snapshot.kernel);
+    DebugChannelSend("}\n");
+}
+
 static void DebugAudioDiagnostics()
 {
     AudioMixerDiagnostic snapshot{};
@@ -3543,6 +3585,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap check      - validate heap block metadata\n"
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  audio stats - cached stream queues, completion and guest clock\n"
+            "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
@@ -3772,6 +3815,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     }
     else if (NetStrEq(cmd, "audio stats")) {
         DebugAudioDiagnostics();
+    }
+    else if (NetStrEq(cmd, "sched timing on") || NetStrEq(cmd, "sched timing off") ||
+             NetStrEq(cmd, "sched timing reset") || NetStrEq(cmd, "sched timing status")) {
+        auto action = NetStrEq(cmd, "sched timing on") ? ReadyLatencyAction::On :
+                      NetStrEq(cmd, "sched timing off") ? ReadyLatencyAction::Off :
+                      NetStrEq(cmd, "sched timing reset") ? ReadyLatencyAction::Reset : ReadyLatencyAction::Status;
+        DebugReadyLatency(action);
     }
 
     // -----------------------------------------------------------------------

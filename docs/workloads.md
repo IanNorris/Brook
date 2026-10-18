@@ -2373,3 +2373,65 @@ Chromium is checked for launch and exit here, not video/audio playback.
 Both browser-exit barriers reach zero tasks; both post-exit audio captures are
 inactive. Heap integrity, checked sync, launcher exit zero, serial audit and all
 three offline filesystem checks pass. No overall browser-speedup claim is made.
+
+
+### Ready-queue timing and mapping contention (18 October 2026)
+
+`sched timing on|off|reset|status` exposes bounded runtime diagnostics, disabled
+at boot. Enabling starts a fresh epoch; reset preserves the enabled state;
+turning it off freezes the snapshot. Policy changes reset the epoch. Existing
+queued tasks are counted separately rather than assigned partial timestamps.
+The tracker retains PID/incarnation values, never process pointers. It uses
+stable KVM clock readings and explicitly counts missing or backwards readings.
+User and kernel histograms measure observed queue insertion through dispatch
+bookkeeping. They exclude blocked time, delay before enqueue, and the remainder
+of a switch through return to userspace. Histogram percentiles are bucket upper
+bounds. Summed waits overlap across tasks and are not elapsed workload time.
+
+The isolated `ready-latency-candidate-20261018` run uses eight CPUs, 4 GiB and
+the CPU compositor. Its static musl `scripts/workloads/clock_threads.c` probe
+reserves 512 VMAs, creates separate pthread stacks and calls the actual
+`clock_gettime` syscall 250 times per worker. READY/RESULT lead and tail waits
+let the observer exclude thread creation and VMA teardown from counter capture.
+Guest duration below covers barrier release through worker joins; the global
+queue histogram also includes background services and observer traffic.
+
+| Workers | Clock calls | Guest worker interval | Maximum recorded user queue wait |
+| --- | --- | --- | --- |
+| 1 | 250 | 0.258 ms | 67.9 µs |
+| 8 | 2,000 | 6.182 ms | 30.7 µs |
+| 32 | 8,000 | 29.142 ms | 65.4 µs |
+| 128 | 32,000 | 133.677 ms | 70.6 µs |
+
+All four jobs finish with exit zero and zero live tasks. Timing reports have
+zero unavailable/backwards clock events and zero untracked dispatches. Disabled
+snapshots remain stable; heap integrity passes. These small probes exercise
+syscall serialization, not general CPU-bound scheduling throughput. They do not
+establish a performance regression against another kernel or scheduler.
+
+Normal semantic app launches then load YouTube in Firefox alone and in Firefox
+plus Chromium. In the two 15-second intervals, recorded user-task ready waits
+have p95 upper bounds of 25 µs in both cases, and p99 upper bounds of 50 µs.
+Maximums are 61.60 ms and 8.17 ms respectively. These are global observations,
+not browser-only latency or controlled policy comparisons. They do not support
+replacing RR as the first response to this particular loading stall.
+
+The corresponding 250 ms profiles have zero producer drops. Of 3,549/7,015
+non-idle outgoing switches, 1,809/2,381 have page-fault stacks waiting inside
+`FileMappingGateSet::Lock`; another 205/1,899 include its gate acquisition below
+`UserMappingPageAccess`. Direct `UserMappingPageAccess` mutex waits also remain.
+These are switch counts rather than blocked durations. The current transaction
+collects and locks every file mapped into its address space, including for
+single-page faults. Shared mapped files can therefore create contention across
+otherwise separate browser address spaces. Narrowing fault transactions to
+the necessary backing, while preserving truncate ordering and snapshot
+revalidation, is the next candidate to investigate; the profiles do not yet
+prove which individual file gate was contended.
+
+Both browser windows and their tasks drain through the exit barrier. Post-exit
+audio is inactive. Checked sync, launcher exit zero, serial audit and all three
+offline filesystem checks pass. All 38 hosted suites pass. Both full bootstrap
+paths still need rerunning with the 38-suite expectation. Source hashes,
+profiles, counter snapshots and the exact protocol are retained under the run
+folder. The later native user review is separate and remains unaccepted until
+handback and its own checked shutdown.

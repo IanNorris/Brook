@@ -83,7 +83,7 @@ the table distinguishes tested behavior from remaining limitations.
   missing Firefox YouTube audio and occasional Chromium audio stalls. A candidate
   Firefox package plays controlled local media through its normal launcher.
   See [workload validation](docs/workloads.md) for tested configurations and
-  remaining limits. All 37 hosted test suites pass; both full bootstrap paths
+  remaining limits. All 38 hosted test suites pass; both full bootstrap paths
   still need rerunning against the current suite.
 
 - **Desktop identity and package registration:** new apps and Terminal run as
