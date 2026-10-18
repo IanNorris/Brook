@@ -618,8 +618,15 @@ int ProcessChangeIds(Process* proc, bool group, CredentialChange operation,
 SupplementaryGroups* ProcessGroupsAcquire(Process* proc);
 void ProcessGroupsRelease(SupplementaryGroups* groups);
 void ProcessGroupsReplace(Process* proc, SupplementaryGroups* owned);
-// Read effective IDs and supplementary membership atomically. Root receives
-// read/write access here; executable authorization needs its own root rules.
+// One credential snapshot for leaf-file authorization. Root receives read/write
+// access here; executable authorization needs its own root rules.
+struct FileCredentialAccess {
+    bool privileged;
+    bool owner;
+    bool group;
+    uint8_t permissions;
+};
+FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode);
 uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, uint16_t mode);
 
 // Create a kernel-mode thread. Runs `fn(arg)` in ring 0 with the kernel's

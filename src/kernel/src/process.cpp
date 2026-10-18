@@ -112,28 +112,28 @@ void ProcessGroupsReplace(Process* proc, SupplementaryGroups* owned) {
     auto* old = proc->groups; proc->groups = owned;
     SpinLockRelease(&g_credentialsLock); ProcessGroupsRelease(old);
 }
-uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, uint16_t mode) {
-    if (!proc) return 7;
+FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode) {
+    if (!proc) return {true, false, false, 7};
     ProcessOperationGuard credentialOperation(ProcessCurrent());
     SpinLockAcquire(&g_credentialsLock);
-    uint8_t permissions;
-    if (proc->euid == 0) permissions = 7;
-    else if (proc->euid == owner) permissions = (mode >> 6) & 7;
-    else {
-        bool member = proc->egid == group;
-        auto* groups = proc->groups;
-        // Published group lists are sorted and immutable.
-        uint32_t low = 0, high = groups ? groups->count : 0;
-        while (!member && low < high) {
-            uint32_t mid = low + (high - low) / 2;
-            if (groups->ids[mid] == group) member = true;
-            else if (groups->ids[mid] < group) low = mid + 1;
-            else high = mid;
-        }
-        permissions = member ? (mode >> 3) & 7 : mode & 7;
+    FileCredentialAccess access = {proc->euid == 0, proc->euid == owner, proc->egid == group, 0};
+    auto* groups = proc->groups;
+    // Published group lists are sorted and immutable. Membership is needed
+    // even for the owner (chmod's setgid rule), unlike the access-bit choice.
+    uint32_t low = 0, high = groups ? groups->count : 0;
+    while (!access.group && low < high) {
+        uint32_t mid = low + (high - low) / 2;
+        if (groups->ids[mid] == group) access.group = true;
+        else if (groups->ids[mid] < group) low = mid + 1;
+        else high = mid;
     }
+    access.permissions = access.privileged ? 7 : access.owner ? (mode >> 6) & 7
+                         : access.group ? (mode >> 3) & 7 : mode & 7;
     SpinLockRelease(&g_credentialsLock);
-    return permissions;
+    return access;
+}
+uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, uint16_t mode) {
+    return ProcessFileAccess(proc, owner, group, mode).permissions;
 }
 // Immediately after memcpy: the copied pointer is borrowed until this retains
 // it. This same lock protects a concurrently running remote-thread target.

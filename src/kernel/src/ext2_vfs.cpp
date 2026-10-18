@@ -2422,11 +2422,11 @@ static int Ext2SetInodeTimes(Ext2Mount* mnt, uint32_t ino, const VnodeTime* time
     Ext2Inode data;
     if (!Ext2ReadInode(mnt, ino, &data)) return -5;
     if (times[0].nsec == VFS_UTIME_OMIT && times[1].nsec == VFS_UTIME_OMIT) return 0;
-    Process* cur = ProcessCurrent();
-    if (cur && cur->euid != 0 && cur->euid != Ext2Uid(data) && !mnt->skipPermChecks) {
+    auto access = ProcessFileAccess(ProcessCurrent(), Ext2Uid(data), Ext2Gid(data), data.i_mode);
+    if (!access.privileged && !access.owner && !mnt->skipPermChecks) {
         bool bothNow = times[0].nsec == VFS_UTIME_NOW && times[1].nsec == VFS_UTIME_NOW;
-        uint16_t permissions = cur->egid == Ext2Gid(data) ? (data.i_mode >> 3) : data.i_mode;
-        if (!bothNow || !(permissions & 2)) return -1; // EPERM
+        if (!bothNow) return -1; // EPERM: explicit or mixed timestamps require ownership.
+        if (!(access.permissions & 2)) return -13; // EACCES: both-now requires write access.
     }
     uint32_t now = Ext2Now();
     for (int i = 0; i < 2; ++i) {
@@ -2464,10 +2464,10 @@ static int Ext2SetInodeMode(Ext2Mount* mnt, uint32_t ino, uint16_t mode)
 {
     Ext2Inode data;
     if (!Ext2ReadInode(mnt, ino, &data)) return -5;
-    Process* cur = ProcessCurrent();
-    if (cur && cur->euid != 0) {
-        if (cur->euid != Ext2Uid(data)) return -1;
-        if (cur->egid != Ext2Gid(data)) mode &= ~02000;
+    auto access = ProcessFileAccess(ProcessCurrent(), Ext2Uid(data), Ext2Gid(data), data.i_mode);
+    if (!access.privileged) {
+        if (!access.owner) return -1;
+        if (!access.group) mode &= ~02000;
     }
     data.i_mode = (data.i_mode & EXT2_S_IFMT) | (mode & 07777);
     data.i_ctime = Ext2Now();

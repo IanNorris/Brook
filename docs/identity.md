@@ -108,12 +108,12 @@ Optional plugin faults and dialog stacking/xdg_foreign support remain open.
 | --- | --- | --- |
 | Identity queries | All UID/GID queries return the real/effective/saved task credentials. ELF auxiliary vectors reflect launch/exec credentials and mark mismatched real/effective IDs with AT_SECURE. Required result pointers are validated. | Keep launch, fork, exec and credential-change regressions passing. |
 | Credential changes | setuid/setgid, setreuid/setregid and setresuid/setresgid track saved IDs and validate the old tuple before changing it. Raw syscalls change the calling thread; libc coordinates changes with SIGSETXID. Root authorization currently means effective UID 0. | Capability-aware authorization and set-ID executable handling remain unsupported; do not describe this as full Linux credential support. |
-| Groups and capabilities | Immutable, reference-counted supplementary lists are inherited by fork/clone and independently replaced; getgroups/setgroups validate buffers and the Linux 65536-entry limit. Tasks with all three UIDs nonzero support empty self capabilities; nonempty grants fail. Root/retained-root tuples return ENOSYS. Unsupported capability/security prctl options return EINVAL. | Ext2 existing-file opens now use supplementary groups; other filesystem and operation paths remain to audit. Audit the remaining prctl options: several legacy options still return success without implementing behavior. Filesystem IDs are coupled to effective IDs; setfsuid/setfsgid are unsupported. |
+| Groups and capabilities | Immutable, reference-counted supplementary lists are inherited by fork/clone and independently replaced; getgroups/setgroups validate buffers and the Linux 65536-entry limit. Tasks with all three UIDs nonzero support empty self capabilities; nonempty grants fail. Root/retained-root tuples return ENOSYS. Unsupported capability/security prctl options return EINVAL. | Ext2 existing-file opens, chmod setgid filtering and timestamp write checks use supplementary groups; other filesystem and operation paths remain to audit. Audit the remaining prctl options: several legacy options still return success without implementing behavior. Filesystem IDs are coupled to effective IDs; setfsuid/setfsgid are unsupported. |
 | Inheritance | Fork and thread creation retain an owned group-list reference and snapshot all six IDs under the credential lock. Ordinary exec saves effective IDs and preserves real IDs/groups. Teardown releases the list, including failed creation paths. | Keep matching launch environment/passwd entries and verify repeated failure/cancellation cleanup. Define set-ID executable behavior separately. |
 | File open | `Ext2FsOpenModeChecked` requires both access bits for O_RDWR and uses effective UID, primary GID and supplementary groups. Denials return EACCES without alias fallback; O_TRUNC requires write access. Creation skips the new leaf inode check, and the explicit Nix bypass remains. | Check ancestor search and parent mutation permissions, audit other filesystems, and define the writable Nix mount policy. |
 | Path traversal and mutation | Path resolution and parent lookup have no complete directory search/mutation authorization contract. Nix can explicitly skip permission checks. | Audit mkdir, create, unlink, rmdir, rename, symlink, hard links, sticky directories and directory-relative operations; restrict the writable Nix service deliberately. |
 | Access checks | `AccessAt` validates flags and resolves paths, but implements existence rather than R/W/X permission evaluation, including AT_EACCESS. | Use real/effective credentials as requested and apply the same traversal rules as open/exec; cover descriptor and symlink variants. |
-| Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Linux-layout ext2 ownership now preserves all 32 UID/GID bits through creation, stat, chown and existing leaf permission checks; new symlinks inherit creator credentials. | Test mode/ownership through every mutation path and all filesystems. Audit nonroot group-change rules, parent setgid inheritance and supplementary-group handling in metadata operations before exposing account creation. |
+| Mode and ownership | Ext2 chmod checks effective owner/root; chown is root-only. New mount-aware ownership handling supports paths, descriptors, unlinked files, symlinks and dirfd variants. Linux-layout ext2 ownership now preserves all 32 UID/GID bits through creation, stat, chown and existing leaf permission checks; new symlinks inherit creator credentials. | Test mode/ownership through every mutation path and all filesystems. Audit nonroot chown group-change rules, parent setgid inheritance and remaining filesystem operations before exposing account creation. |
 | Runtime directory | Every shell application inherits `XDG_RUNTIME_DIR=/tmp`. This path is on the FAT-backed initrd, which cannot persist Unix ownership/modes. Wayland and other IPC endpoints are shared. | Give a named desktop identity an owned, mode-0700 runtime directory with a defined lifetime; audit IPC peer credentials and access policy. |
 | Persistent preferences | HOME/XDG is persistent, but root apps and compatibility-UID apps share it. Browser wrappers explicitly select their own profiles. | Use the named desktop identity consistently in the default launcher and owned application state. Preserve existing data during any migration; report conflicts rather than silently replacing ownership. |
 
@@ -472,3 +472,48 @@ filesystem and endpoint lifetime policy remain required; no login/accounts or
 runtime-directory relocation are introduced here. The full two-path bootstrap
 acceptance remains at `f4066d0`, before this kernel change, and has not yet been
 renewed for this ownership checkpoint.
+
+
+### Metadata permission checkpoint (18 October)
+
+The full-width ownership kernel still lost setgid when an owner belonged to the
+file's group only through the supplementary list. Timestamp updates also omitted
+that list: a group writer was rejected, while a group member could incorrectly
+fall through to the other-write bit. Both-now denials returned EPERM instead of
+EACCES. The frozen-kernel probe recorded eight mismatches, including path,
+descriptor and directory chmod and the incorrectly permitted timestamp update.
+
+Ext2 metadata checks now consume the same locked credential snapshot as leaf
+opens: effective root/owner status, primary or supplementary group membership,
+and the selected access bits. Owners retain setgid for either membership form;
+nonmembers have it stripped. Both-now timestamps permit owners or writers, with
+EACCES for an unrelated nonwriter; explicit or mixed timestamps still require
+owner/root. A matching group never falls back to other bits. These follow the
+Linux [chmod](https://man7.org/linux/man-pages/man2/chmod.2.html) and
+[utimensat](https://man7.org/linux/man-pages/man2/utimensat.2.html) permission rules
+within Brook's existing root privilege model.
+
+`scripts/workloads/metadata_permissions.py` checks high-ID owner/group cases,
+path/fd/directory chmod, setgid retention/removal, primary/supplementary/other
+write access, explicit/NOW/OMIT timestamps and unchanged mtime after denials.
+The full matrix runs on private `/data` fixtures; the Nix timestamp bypass is
+not presented as permission enforcement. The host's three owner-only controls
+passed; a supplementary group was unmapped and skipped. Full cross-user Linux
+comparison was unavailable because this host forbids privilege escalation.
+No capabilities or concurrent credential-change stress coverage is claimed.
+
+Candidate kernel
+`a14bcc16b908acc5459cfabf4d65a204300d09d18e4f9e31b83efe9a3194ae52`
+passed the metadata matrix, all 686 existing leaf-open checks, the two-mount
+ownership suite and full-width creation/stat/permission/chown controls. Four
+saved application documents retained their hashes and Brook ownership. All 39
+hosted suites and the supported compiled entry audit passed before boot.
+Baseline session `eed6a7df2e054980963f04553bdb72a1` and candidate session
+`b6a271fc1c524fe189d0b49d0aa70759` both completed checked sync/stop, QEMU/launcher
+exit zero, serial kernel/device/user-fault audits and three read-only offline
+filesystem checks. Local evidence: `build/workloads/metadata-permissions-20261018/`.
+
+Root-only chown, parent setgid inheritance, directory authorization, private
+runtime directories and the writable Nix boundary remain unfinished. This
+checkpoint does not renew browser, full-bootstrap or concurrent-use acceptance
+for the new kernel.
