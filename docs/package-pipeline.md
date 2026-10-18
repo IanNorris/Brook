@@ -112,3 +112,15 @@ three backwards realtime steps, up to 999,000,322 ns, while monotonic time did
 not regress. Its content checks and checked shutdown/fsck passed. The known
 RTC/pvclock composition bug is in the [backlog](backlog.md); benchmark durations
 now use `tools/io-bench/monotime.c`, not realtime.
+
+
+## Full SDK acceptance
+
+Both full bootstrap paths subsequently passed at `610592d` with all 39 native
+suites running three times per path, including under each guest-built kernel.
+The clean seed installed all 91 SDK additions in 236 seconds, versus 732 seconds
+in the preceding control (about 68% lower). Host observer intervals support the
+same reduction. Compilation stayed around 50 seconds. See
+[full acceptance](bootstrap.md#matching-39-suite-acceptance-after-tx-ownership-2026-10-18)
+for source/fixture identities, stage timings, checked shutdown and filesystem
+evidence. Real browsers have not yet been remeasured with this driver.

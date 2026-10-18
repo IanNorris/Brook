@@ -90,11 +90,11 @@ the table distinguishes tested behavior from remaining limitations.
   under investigation. See [filesystem capacity acceptance](docs/filesystem-space.md).
   The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and
-  remaining limits. The last [full bootstrap acceptance](docs/bootstrap.md#matching-38-suite-acceptance-2026-10-18)
-  passed 38 native suites three times per path. All 39 hosted suites now pass
-  with the [virtio-net TX ownership fix](docs/package-pipeline.md); full reruns
-  are pending. That component test reduces network-fed package extraction from
-  about 26 seconds to 4 seconds; the full SDK install still needs remeasurement.
+  remaining limits. Both [full bootstrap paths](docs/bootstrap.md#matching-39-suite-acceptance-after-tx-ownership-2026-10-18)
+  pass all 39 native suites three times, including under their guest-built
+  kernels. The [virtio-net TX ownership fix](docs/package-pipeline.md) reduces
+  the measured clean-image SDK install from 732 to 236 seconds; compilation
+  remains about 50 seconds.
 
 - **Desktop identity and package registration:** new apps and Terminal run as
   `brook` by default, with persistent `/data/home`. The installer preserves

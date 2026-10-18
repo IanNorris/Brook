@@ -73,7 +73,7 @@ rather than the host store's 0444/0555, so mode-dependent mmap cache behavior
 matches. Base transport paths keep the same host-prepared modes in both images.
 The harness runs the real guest installer, performs an HTTPS clone and pinned
 submodule update, and builds kernel/EFI/modules/bare-metal/native artifacts.
-It validates module imports and requires 38/38 CTest results twice, before and
+It validates module imports and requires 39/39 CTest results twice, before and
 after a clean native rebuild with warm caches. The incremental kernel stage
 is labelled separately from a full compilation.
 
@@ -115,7 +115,7 @@ interpreted using the nearest kernel symbol.
 After guest sync and shutdown, the harness requires offline fsck on both
 disks, extracts artifacts with debugfs, hashes them, boots their kernel/EFI
 and modules in a second isolated VM, verifies the booted kernel hash and
-command replies, and reruns Git fsck and all 38 native tests under that kernel,
+command replies, and reruns Git fsck and all 39 native tests under that kernel,
 then repeats synced offline fsck. Only this complete sequence
 writes `result.json` with `success: true`. Failure retains logs/disks and may
 leave the VM running for diagnosis; use its bridge session to sync and stop it.
@@ -1094,3 +1094,63 @@ metadata. The clean run also retains a separate mid-install profile. This
 acceptance closes the matching full-bootstrap rerun gap for the pinned revision;
 application co-use, real-site persistence and broader desktop regressions remain
 separate work.
+
+
+### Matching 39-suite acceptance after TX ownership (2026-10-18)
+
+Both full paths pass at `610592de4f5463f8d5a453844b07d7f6e1c30614` after
+[serializing virtio-net TX ownership](package-pipeline.md). The new actual-driver
+fixture brings the suite to 39 tests. Each path cloned that exact remote source
+and its required submodules, built the kernel/EFI loader, 12 modules and seven
+bare-metal test ELFs, and passed all 39 native suites twice, including a clean
+native rebuild. Independent disks then booted each guest-built kernel, verified
+its hash, passed Git fsck and ran all 39 suites a third time. The staged ESP EFI
+and kernel match the extracted hashes; the verification data disk's virtio-net
+module also matches the guest-built artifact. Bare-metal ELFs were built/hashed,
+not executed by this acceptance.
+
+| Stage, guest seconds | Prepared SDK | Clean image |
+| --- | ---: | ---: |
+| SDK installation via nix-install | Already installed | 236 |
+| Clone | 14 | 14 |
+| Checkout | 7 | 7 |
+| Submodules | 19 | 20 |
+| Full compilation | 51 | 50 |
+| Native compilation | 30 | 30 |
+| Native tests | 9 | 9 |
+| Warm native compilation | 29 | 28 |
+| Warm native tests | 10 | 9 |
+| Incremental build | 1 | 2 |
+
+The same clean seed and pinned SDK took 732 seconds to install in the preceding
+38-suite run. The new 236-second result is about 68% lower; observer marker
+intervals likewise fell from 729.67 to 234.77 host seconds. The initial kernel
+ELF is byte-identical and the virtio-net module differs. The controlled component
+comparisons and negative driver test provide additional evidence for the fix;
+these full acceptance runs still have uncontrolled host cache/thermal state and
+short diagnostic profiles. No browser-rendering speedup or general disk
+throughput percentage follows from these numbers.
+
+Within the installer, the LLVM library's 502,507,680-byte NAR fell from 152,584 to
+51,625 ms; the Clang library's 817,440,144-byte NAR fell from 166,013 to 46,588 ms.
+All 91 SDK additions registered. The starting prepared/clean fixtures, host-local
+binary cache, SDK identity and root execution scope are the same as documented
+in the preceding acceptance. This does not replace fresh-image/current Gallery
+installation acceptance. Compiling remains around 50 seconds. Verification
+under the guest-built kernels took 16.58 host seconds for prepared and 15.68 for
+clean, including command/output observation.
+
+All four build/verification jobs exited zero with zero live lineage tasks and
+both streams at EOF. All four VMs acknowledged checked sync, exited zero and
+passed serial auditing, including the new TX timeout/bad-completion checks.
+Every offline FAT/ext2 check passed. Successful owned RAM images were archived
+and their tmpfs directories released. Evidence:
+
+- `build/experiments/results/bootstrap-clean-610592d-ram/`
+- `build/experiments/results/bootstrap-prepared-610592d-ram/`
+- `build/workloads/bootstrap-610592d-acceptance-audit-20261018.json`
+
+This supersedes the pending full-rerun note for the TX change and renews both
+bootstrap paths with the current 39-suite source. Real application co-use,
+profile/cookie persistence, permissions and remaining desktop work still need
+their own acceptance.

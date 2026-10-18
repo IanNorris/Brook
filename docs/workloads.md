@@ -2575,3 +2575,26 @@ for fixture identity, timings and the 732-second clean SDK installation cost.
 Earlier entries' pending bootstrap notes remain historical; this is the matching
 acceptance for the current kernel changes. Browser/editor co-use and broader
 application regression acceptance remain open.
+
+
+### Virtio-net ownership and 39-suite bootstrap (18 October)
+
+A controlled package pipeline separated local disk, pipes, decompression and
+network-fed extraction. Repeated local zstd extraction took about 1.1 seconds;
+feeding the same archive over the network took 25.6–26.8 seconds. The NIC's
+single shared TX DMA buffer and descriptor were unprotected across concurrent
+poll/socket callers. An actual-driver negative fixture demonstrates overwritten
+frames and overlapping submissions without serialization. Holding ownership
+through device completion reduces network-fed extraction to 4.2–4.5 seconds;
+a separate packet capture has no >=50-ms incoming-data gaps or retransmitted
+archive bytes in that flow. Timeout/bad completion now quarantine the queue;
+reset recovery is still missing. See [pipeline measurements](package-pipeline.md).
+
+Both full bootstrap paths pass at `610592d`, including all 39 native suites
+three times per path and hash-verified boots of guest-built kernels. The clean
+SDK installation fell from 732 to 236 seconds; compilation remains 50–51
+seconds. Every tracked command drained, all four VMs exited with checked sync,
+and every offline FAT/ext2 check passed. See
+[matching acceptance](bootstrap.md#matching-39-suite-acceptance-after-tx-ownership-2026-10-18).
+This does not establish browser speed improvements; application regressions and
+the separate known realtime-clock composition defect remain open.
