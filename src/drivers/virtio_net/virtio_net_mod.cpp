@@ -182,6 +182,9 @@ static uint64_t g_txBufPhys = 0;
 // Keep interrupts enabled while polling completion so TLB IPIs can run.
 static SpinLock g_txLock;
 static bool g_txFaulted = false;
+// A timeout does not return ownership of descriptor zero or its DMA buffer.
+// Keep it pending until a subsequent send observes a valid completion.
+static bool g_txPending = false;
 
 static NetIf g_netIf;
 
@@ -322,12 +325,35 @@ static void VirtioNetPoll(NetIf* /*nif*/)
 // Transmit
 // ---------------------------------------------------------------------------
 
+static int ReapTxCompletion()
+{
+    if (*g_txq.usedIdx == g_txq.usedIdxShadow) return -11; // EAGAIN
+    __asm__ volatile("mfence" ::: "memory");
+    const uint16_t completed = *g_txq.usedIdx;
+    const uint16_t usedSlot = g_txq.usedIdxShadow & (g_txq.size - 1);
+    if (completed != static_cast<uint16_t>(g_txq.usedIdxShadow + 1) ||
+        g_txq.usedRing[usedSlot].id != 0) {
+        g_txFaulted = true;
+        SerialPuts("virtio_net: invalid TX completion; queue quarantined\n");
+        return -1;
+    }
+    g_txq.usedIdxShadow = completed;
+    g_txPending = false;
+    return 0;
+}
+
 static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
 {
     if (len > RX_BUF_SIZE - VIRTIO_NET_HDR_SIZE || (!frame && len)) return -1;
     SpinLockAcquire(&g_txLock);
     struct ReleaseTx { ~ReleaseTx() { SpinLockRelease(&g_txLock); } } release;
     if (g_txFaulted) return -1;
+    // A slow device/host may complete after our bounded polling window. Do
+    // not disable networking permanently, or overwrite memory it still owns.
+    if (g_txPending) {
+        int result = ReapTxCompletion();
+        if (result) return result;
+    }
 
     static uint32_t s_txCount = 0;
     s_txCount++;
@@ -366,6 +392,7 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
     *g_txq.availIdx = g_txq.availIdxShadow;
     __asm__ volatile("mfence" ::: "memory");
 
+    g_txPending = true;
     NotifyQueue(1, g_txq);
 
     // Wait for TX completion (poll used ring)
@@ -378,25 +405,13 @@ static int VirtioNetTransmit(NetIf* nif, const void* frame, uint32_t len)
     while (*g_txq.usedIdx == g_txq.usedIdxShadow) {
         __asm__ volatile("pause");
         if (++spins > waitBudget) {
-            // The device may still own descriptor zero. Never reuse its DMA
-            // memory after unknown completion; recovery requires driver reset.
-            g_txFaulted = true;
-            SerialPuts("virtio_net: TX timeout; queue quarantined\n");
-            return -1;
+            // A bounded wait is not proof of device failure. Leave the DMA
+            // buffer pending, and let the next send check for late completion.
+            SerialPuts("virtio_net: TX wait expired; completion pending\n");
+            return -11;
         }
     }
-    __asm__ volatile("mfence" ::: "memory");
-    const uint16_t completed = *g_txq.usedIdx;
-    const uint16_t usedSlot = g_txq.usedIdxShadow & (g_txq.size - 1);
-    if (completed != static_cast<uint16_t>(g_txq.usedIdxShadow + 1) ||
-        g_txq.usedRing[usedSlot].id != 0) {
-        g_txFaulted = true;
-        SerialPuts("virtio_net: invalid TX completion; queue quarantined\n");
-        return -1;
-    }
-    g_txq.usedIdxShadow = completed;
-
-    return 0;
+    return ReapTxCompletion();
 }
 
 // ---------------------------------------------------------------------------

@@ -57,16 +57,21 @@ spinlock through completion. Interrupts remain enabled; the current RX ISR only
 wakes the poll thread, and TX callers run in process or early-boot context.
 Adding an IRQ-context TX caller would require rechecking this contract.
 
-After timeout or an invalid completion ID/index advance, the queue is
-quarantined: the shared DMA storage is left untouched and later sends fail.
-Driver reset/recovery remains unimplemented. Releasing the software lock is not
-evidence that the device released a timed-out buffer. This follows the
+An invalid completion ID/index advance quarantines the queue: shared DMA
+storage remains untouched and later sends fail. A polling timeout instead
+keeps descriptor zero pending and returns EAGAIN. Subsequent sends first check
+for its valid completion, without modifying or republishing the pending frame.
+Only after that completion can a new frame reuse the DMA storage. Driver reset
+for a permanently unresponsive or corrupt device remains unimplemented.
+Releasing the software lock is not evidence that the device released a timed-out
+buffer. This follows the
 [virtio device-cleanup ownership requirements](https://docs.oasis-open.org/virtio/virtio/v1.3/csd01/virtio-v1.3-csd01.html).
 
 `test_virtio_net_tx` includes the actual driver with a fake device notification
 hook. It pauses the first DMA submission while another producer enters, checks
-eight competing producers, ring-index wraparound, oversized input, timeout and
-bad-completion quarantine. Removing serialization makes the fixture fail;
+eight competing producers, ring-index wraparound, oversized input, pending DMA
+preservation, valid late completion and bad-completion quarantine (including
+late corrupt responses). Removing serialization makes the fixture fail;
 restoring it passes. The host fixture uses a shorter spin budget to exercise
 timeout ownership, not to establish real-device timeout latency. All 39 hosted
 suites, the supported compiled entry audit and nine bootstrap observer tests
@@ -124,3 +129,58 @@ same reduction. Compilation stayed around 50 seconds. See
 [full acceptance](bootstrap.md#matching-39-suite-acceptance-after-tx-ownership-2026-10-18)
 for source/fixture identities, stage timings, checked shutdown and filesystem
 evidence. Real browsers have not yet been remeasured with this driver.
+
+## Late TX completion follow-up (18 October)
+
+The native review session `1b989704dd774a4ba955e42149b3684c` lost
+transmission while both browsers were open. Chromium reported
+ERR_NAME_NOT_RESOLVED and Firefox stopped/reload failed. Serial recorded
+`virtio_net: TX timeout; queue quarantined`, followed by failing TCP sends and
+unanswered DNS queries. A read-only QMP snapshot found the device used index
+7215, matching the published available index, while the driver shadow remained
+7214 and its fault flag stayed set. The device counter had advanced after the
+bounded wait; that alone does not validate the completion element's ID.
+The old policy could never examine a late completion and resume transmission.
+Evidence is retained below
+`build/workloads/exec-permissions-20261018/native/network-stall/`.
+
+The pending-completion path above removes that permanent shutdown on polling
+timeout without returning DMA ownership early. Invalid completions still
+quarantine the queue. Deterministic host tests exercise no completion over
+repeated sends, unchanged DMA bytes/one publication while pending, valid late
+completion followed by another send, and invalid late completion IDs/advances.
+The spin limit remains a bounded poll count, not a measured wall-clock timeout.
+There is still no reset for a device that never completes.
+
+Candidate `build/workloads/net-late-completion-20261018/review/`, session
+`bd2e7088bf874fb58cf5b0e59a5a2413`, used eight CPUs, 8 GiB and frozen kernel
+SHA-256 `560806163e48c379e508f70b041aa7fa2e9732b8f46f1a9dafb405aa8f1f5c48`.
+With both browsers open, eight workers completed 32 local HTTP downloads,
+verified all 86,109,536 bytes by SHA-256 and resolved Google, Amazon and Wikipedia
+in 9.153 guest-monotonic seconds. This is a correctness/load probe, not a paired
+throughput benchmark. Four subsequent network/debug checks succeeded. No TX
+poll timeout occurred in this candidate run; late recovery is covered by the
+host fixture, not claimed as exercised in this guest run.
+
+Firefox supplied 804 playback samples and 2,007 total frames. Chromium stayed
+at its first controlled-video frame despite play attempts; its playback is not
+accepted by this check and needs a separate follow-up. Ctrl+T opened a Chromium
+tab without adding a desktop window, and Super+Enter added one Terminal window.
+
+All 40 native suites and the compiled entry audit pass. The tracked network
+command exited zero with complete stdout/stderr and both launch lineages empty.
+Both browser UI launch lineages drained after normal close, heap integrity was
+OK, audio was inactive, checked sync succeeded, QEMU exited and the original
+launcher returned zero. All three read-only filesystem checks passed. Five
+saved documents retained exact hashes and UID 1000/GID 100. The stopped-run
+serial audit found no kernel/device/user fault. See the retained
+`build/workloads/net-late-completion-20261018/acceptance-audit.json` and
+`build/net-late-completion-build-20261018.log`.
+
+The failed native review was shut down separately: normal terminal commands
+terminated the browsers and returned success from `sync`, visibly recorded in
+`final-sync.png`, before QMP quit. Its launcher returned zero and all three
+read-only filesystem checks passed. Its browser exit was forced and untracked;
+those disks remain separate from the accepted candidate seed. A proposed live
+kernel-memory recovery was rejected by automatic approval review and was not
+executed. The normal terminal sync provided a safer shutdown route.

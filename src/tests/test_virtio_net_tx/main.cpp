@@ -19,7 +19,7 @@ uint16_t available[MAX_QUEUE_SIZE];
 VirtqUsedElem completions[MAX_QUEUE_SIZE];
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"NET_TX FAIL line %d: %s\n",__LINE__,#x);++failures;}}while(0)
 void initialize() {
-    g_txLock={};g_txFaulted=false;g_txq={};
+    g_txLock={};g_txFaulted=false;g_txPending=false;g_txq={};
     g_txBuf=dma;g_txBufPhys=0x1000;avail=0;used=0;
     g_txq.size=MAX_QUEUE_SIZE;g_txq.descTable=descriptors;
     g_txq.availIdx=&avail;g_txq.availRing=available;
@@ -78,7 +78,32 @@ int main() {
     CHECK(VirtioNetTransmit(nullptr,dma,UINT32_MAX)==-1);
     CHECK(VirtioNetTransmit(nullptr,nullptr,1)==-1);CHECK(notifications==before);
 
-    for(Mode failure:{NoCompletion,BadId,BadAdvance}) {
+    // A slow completion must preserve DMA ownership without permanently
+    // disabling the interface. Repeated sends cannot touch the pending frame.
+    initialize();mode=NoCompletion;
+    uint8_t pendingPayload[256];memset(pendingPayload,1,sizeof(pendingPayload));expectedId=1;
+    CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==-11);
+    CHECK(g_txPending && !g_txFaulted);
+    uint8_t pendingSnapshot[RX_BUF_SIZE];memcpy(pendingSnapshot,dma,sizeof(dma));
+    memset(pendingPayload,2,sizeof(pendingPayload));
+    for(unsigned i=0;i<8;i++)
+        CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==-11);
+    CHECK(notifications==1 && avail==1 && !memcmp(pendingSnapshot,dma,sizeof(dma)));
+    completions[0].id=0;used=1;mode=Normal;expectedId=2;
+    CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==0);
+    CHECK(!g_txPending && !g_txFaulted && notifications==2 && used==2 && avail==2 && badFrames==0);
+
+    // The same late-completion path must reject corrupt device responses.
+    for(Mode failure:{BadId,BadAdvance}) {
+        initialize();mode=NoCompletion;expectedId=1;
+        memset(pendingPayload,1,sizeof(pendingPayload));
+        CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==-11);
+        completions[0].id=failure==BadId?1:0;used=failure==BadAdvance?2:1;
+        CHECK(VirtioNetTransmit(nullptr,pendingPayload,sizeof(pendingPayload))==-1);
+        CHECK(g_txFaulted && notifications==1);
+    }
+
+    for(Mode failure:{BadId,BadAdvance}) {
         initialize();mode=failure;
         uint8_t payload[256];memset(payload,1,sizeof(payload));expectedId=1;
         CHECK(VirtioNetTransmit(nullptr,payload,sizeof(payload))==-1);CHECK(g_txFaulted);

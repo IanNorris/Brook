@@ -1241,3 +1241,22 @@ build showed `72df825+...` while the checked-out base was `600c53a5`; acceptance
 uses frozen ELF/module SHA-256 and source patches, not that label. Make build
 provenance refresh on every relevant source/HEAD change without recompiling the
 whole kernel unnecessarily, and verify clean/dirty checkout transitions.
+
+### Orderly desktop shutdown and restart
+
+Add launcher Shutdown/Restart and a shared MCP lifecycle operation, including
+application close/unsaved-document handling, full helper-lineage drain, launch
+inhibition, writer quiescence and checked final device flush. The 18 October
+virtio-net stall also requires a narrow network-independent VM control transport;
+current `vm_control stop/reset` relies on TCP and assumes apps are already closed.
+See the [shutdown design and acceptance requirements](orderly-shutdown.md).
+
+### Chromium controlled playback follow-up (18 October)
+
+The [late-TX candidate](package-pipeline.md#late-tx-completion-follow-up-18-october)
+passed concurrent verified downloads, public DNS and Firefox playback, but
+Chromium's controlled clip stayed at frame zero despite normal play attempts.
+Separate media startup, input delivery and profile state before attributing this
+to networking or calling browser playback accepted. Retain the candidate's
+screenshots and fixture reports; no playback performance claim follows from
+successful downloads.

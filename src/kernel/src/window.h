@@ -308,7 +308,7 @@ int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)
 // Get the usable desktop height (screen height minus taskbar).
 uint32_t WmDesktopHeight(uint32_t screenH);
 
-// Spawn a new terminal window (Ctrl+T handler).
+// Spawn a new terminal window (Super+Enter handler).
 void WmSpawnTerminal();
 
 // ---------------------------------------------------------------------------

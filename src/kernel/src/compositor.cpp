@@ -1961,9 +1961,8 @@ static void CompositorInputWM()
                 continue;
             }
 
-            // Super+T or Ctrl+T — spawn new terminal window
-            if (((ev.modifiers & INPUT_MOD_SUPER) || (ev.modifiers & INPUT_MOD_CTRL))
-                && ev.scanCode == 0x14) // T
+            // Super+Enter — spawn a terminal; leave Ctrl+T to applications.
+            if ((ev.modifiers & INPUT_MOD_SUPER) && ev.scanCode == 0x1C) // Enter
             {
                 WmSpawnTerminal();
                 continue;
