@@ -269,12 +269,14 @@ def main():
 
         # Only installed apps with a deployed compatibility wrapper get
         # redirected; the raw executable validation above remains required.
-        if binary in ('chromium', 'firefox', 'codium', 'vscodium'):
-            wrapper = 'brook-' + ('codium' if binary == 'vscodium' else binary)
-            if (Path(store_dir).parent/'bin'/wrapper).is_file():
+        binary_name = Path(binary).name
+        if binary_name in ('chromium', 'firefox', 'codium', 'vscodium', 'vlc'):
+            wrapper = 'brook-' + ('codium' if binary_name == 'vscodium' else binary_name)
+            wrapper_path = Path(store_dir).parent/'bin'/wrapper
+            if wrapper_path.is_file() and os.access(wrapper_path, os.X_OK):
                 arguments = shlex.split(exec_cmd)[1:]
                 exec_cmd = shlex.join(['/nix/bin/' + wrapper, *arguments])
-                if binary in ('firefox', 'codium', 'vscodium'):
+                if binary_name in ('firefox', 'codium', 'vscodium', 'vlc'):
                     exec_cmd = '--uid 1000 ' + exec_cmd
 
         entries.append((name, exec_cmd, icon_file, categories, Path(df).stem))

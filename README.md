@@ -60,8 +60,8 @@ the table distinguishes tested behavior from remaining limitations.
 | [Blender](https://www.blender.org/) | 5.1.1 | 🚧 Blocked | Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
-| [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer opens via Wayland and edits a real document; startup is slow and window-close behavior needs work |
-| [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | Gallery install, 720p OSS playback and clean native/paused/Quit exits passed on eight vCPUs, including a fresh-settings reboot |
+| [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer save/reopen across cold boot and full native-close cleanup verified as Brook; startup and broader suite coverage remain experimental |
+| [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | 720p OSS playback through the normal launcher; pause/resume, full native-close and SIGKILL audio cleanup verified with the compatibility build |
 
 ## Recent progress
 
@@ -300,7 +300,7 @@ New captures use native 1920×1080 without upscaling. See
   <a href="docs/images/brook_vlc_720p_1080.png"><img src="docs/images/brook_vlc_720p_1080.png" alt="VLC playing Big Buck Bunny at 720p on Brook's native 1080p desktop" width="960"></a>
 </p>
 
-<p align="center"><em>Guest-installed VLC playing the Blender Foundation's Big Buck Bunny at 720p; the captured desktop is native 1920×1080. This demonstrates playback, with stability limits recorded in the experiment notes.</em></p>
+<p align="center"><em>Guest-installed VLC playing the Blender Foundation's Big Buck Bunny at 720p; the captured desktop is native 1920×1080. Normal-launcher playback, pause/resume and exit/audio cleanup are covered in the <a href="docs/application-regressions.md">application regressions</a>; smoothness and A/V sync remain unverified.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_quake2_lan.png"><img src="docs/images/brook_quake2_lan.png" alt="Two Brook VMs playing Quake 2 LAN deathmatch" width="800"></a>

@@ -43,6 +43,9 @@
 #ifndef PROFILE_BIN
 #define PROFILE_BIN     "/nix/profile/bin"
 #endif
+#ifndef BROOK_BIN
+#define BROOK_BIN       "/nix/bin"
+#endif
 #ifndef PROFILE_LIB
 #define PROFILE_LIB     "/nix/profile/lib"
 #endif
@@ -716,19 +719,28 @@ static int parse_desktop_entry(const char *path, char *name, size_t name_sz,
     return 0;
 }
 
-static int desktop_exec_exists(const char *command)
+/* Return the untouched argument suffix after one optionally quoted command. */
+static const char *desktop_exec_binary(const char *command, char *binary, size_t capacity)
 {
-    char binary[1024];
     const char *p=command;
     while (*p==' ' || *p=='\t') ++p;
     char quote=(*p=='"' || *p=='\'')?*p++:0;
     size_t n=0;
     while (*p && (quote?*p!=quote:(*p!=' ' && *p!='\t'))) {
-        if (n+1>=sizeof(binary)) return 0;
+        if (n+1>=capacity) return NULL;
         binary[n++]=*p++;
     }
     binary[n]=0;
-    if (!n) return 0;
+    if (!n || (quote && *p!=quote)) return NULL;
+    if (quote) ++p;
+    if (*p && *p!=' ' && *p!='\t') return NULL;
+    return p;
+}
+
+static int desktop_exec_exists(const char *command)
+{
+    char binary[1024];
+    if (!desktop_exec_binary(command,binary,sizeof(binary))) return 0;
     struct stat st;
     if (binary[0]=='/') {
         if (stat(binary,&st)!=0 || !S_ISREG(st.st_mode) || access(binary,X_OK)!=0) return 0;
@@ -742,7 +754,7 @@ static int desktop_exec_exists(const char *command)
         }
         return 1;
     }
-    const char *directories[]={PROFILE_BIN,"/nix/bin"};
+    const char *directories[]={PROFILE_BIN,BROOK_BIN};
     char path[1200];
     for (size_t i=0;i<sizeof(directories)/sizeof(directories[0]);++i) {
         snprintf(path,sizeof(path),"%s/%s",directories[i],binary);
@@ -807,23 +819,26 @@ static void refresh_desktop_entries(void)
 
             if (!desktop_exec_exists(exec_cmd)) continue;
 
-            /* Browser/editor startup requires Brook's Wayland/profile setup.
+            /* Browser/editor/media startup requires Brook's compatibility setup.
              * Redirect only when both the real package and wrapper exist. */
-            const char *browsers[] = {"chromium", "firefox", "codium", "vscodium"};
-            for (unsigned bi = 0; bi < sizeof(browsers) / sizeof(browsers[0]); ++bi) {
-                const char *browser = browsers[bi];
-                size_t blen = strlen(browser);
-                if (strncmp(exec_cmd, browser, blen) ||
-                    (exec_cmd[blen] && exec_cmd[blen] != ' ')) continue;
-                char wrapper[64];
-                snprintf(wrapper, sizeof(wrapper), "/nix/bin/brook-%s",
-                         strcmp(browser, "vscodium") == 0 ? "codium" : browser);
+            char binary[1024];
+            const char *suffix=desktop_exec_binary(exec_cmd,binary,sizeof(binary));
+            if (!suffix) continue;
+            const char *base=strrchr(binary,'/');base=base?base+1:binary;
+            const char *programs[] = {"chromium", "firefox", "codium", "vscodium", "vlc"};
+            for (unsigned bi = 0; bi < sizeof(programs) / sizeof(programs[0]); ++bi) {
+                const char *program = programs[bi];
+                if (strcmp(base,program)) continue;
+                char wrapper[1200];
+                snprintf(wrapper, sizeof(wrapper), BROOK_BIN "/brook-%s",
+                         strcmp(program, "vscodium") == 0 ? "codium" : program);
                 if (access(wrapper, X_OK) != 0) continue;
                 char arguments[sizeof(exec_cmd)];
-                snprintf(arguments, sizeof(arguments), "%s", exec_cmd + blen);
-                const char *identity = strcmp(browser, "chromium") == 0 ? "" : "--uid 1000 ";
+                snprintf(arguments, sizeof(arguments), "%s", suffix);
+                const char *identity = strcmp(program, "chromium") == 0 ? "" : "--uid 1000 ";
                 if (strlen(identity) + strlen(wrapper) + strlen(arguments) >= sizeof(exec_cmd)) continue;
                 snprintf(exec_cmd, sizeof(exec_cmd), "%s%s%s", identity, wrapper, arguments);
+                break;
             }
 
             /* Use the deployed Brook wrapper without changing the stock closure.

@@ -61,3 +61,11 @@ processes using generated archives, closed stdin, early requests across exec,
 cached retry, invalid control descriptors and both commit boundaries. The final
 guest build passed gated Stop, close-and-cancel and offline cached retry;
 cleanup returned to ten tasks and all three offline filesystem checks passed.
+
+Desktop entry refresh redirects installed VLC through `brook-vlc`, preserving
+upstream arguments, including absolute Nix-store and quoted executable paths.
+Both the real executable and an executable compatibility wrapper must exist.
+Absolute-path browser/editor entries use the same mapping. The collector's
+private-filesystem regression is included in `test_desktop.py`; current
+application playback/exit evidence is in
+[application regressions](../../docs/application-regressions.md).

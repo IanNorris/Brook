@@ -66,25 +66,85 @@ and socket chmod. Transient service-directory activation, service recovery,
 legacy standalone script launch scopes, and private per-user runtime directories
 remain unverified. The global bus address does not establish those capabilities.
 
-## Remaining regressions
+## VLC launcher and current-package regression
 
-VLC's installed desktop entry currently launches raw `vlc`, bypassing the
-installed `brook-vlc` wrapper. In the observed run it reported stale plugin
-cache entries, tried PulseAudio, printed a mutex error, and exited without a
-window. The complete launch lineage was empty; this is a diagnosed failed
-launch, not a readiness timeout or successful playback test. Both the host and
-guest desktop-entry collectors need the compatibility mapping checked.
-The temporary first-window helper subsequently misattributed Writer’s new
-window to the still-observed VLC request. That observation is rejected; explicit
-launch-token matching now guards the temporary helper. Writer acceptance uses
-its actual title, launch group and independent reopen/exit checks.
-OpenTTD gameplay, VLC playback, and their normal/forced audio cleanup checks
-remain pending. Existing browser audio evidence is documented separately in
-[browser-trio.md](browser-trio.md).
+The installed desktop entry initially launched raw `vlc`, bypassing the
+installed `brook-vlc` wrapper. It tried PulseAudio, printed a mutex error and
+exited without a window. Both desktop collectors now redirect VLC only when
+its real executable and executable compatibility wrapper are present. Bare, absolute and quoted command
+paths retain the upstream arguments. This also corrects absolute-path browser
+and editor entries in the guest collector. Two host collector tests and all
+18 installer tests pass, including real-filesystem missing/disabled-wrapper
+and removed-application cases.
+
+The temporary first-window helper once misattributed Writer's new window to a
+still-observed failed VLC request. That observation is rejected; explicit
+launch-token matching now guards the helper. Writer acceptance uses its actual
+title, launch group and independent reopen/exit checks.
+
+The first wrapper run selected the stale cached `vlc-brook-close` package,
+store `hlj5f0vyqgcgc0d3r8shn68hijvmjslv-vlc-brook-3.0.23-2`. It predates the
+accepted surface-handoff fix and reproduced an invalid `get_viewport` argument.
+Its launch group was reclaimed and audio became inactive. This is not evidence
+of a regression in the current VLC source. Building the current expression
+confirmed output `3x6wrd699l6kmnr9gr5jkq8xlvsh4yi4-vlc-brook-3.0.23-2`.
+Guest installation of that exact output under its existing `vlc-brook-window`
+cache label verified the active profile target before playback. Existing-name
+installation retains its registered store hash; package upgrade acceptance is
+separate from this test.
+
+Current-source VLC launched normally as Brook, opened the 1280×720 H.264/AAC
+Big Buck Bunny fixture and advanced through distinct video scenes. A six-second
+host PCM capture contained 264,980 stereo frames at 44.1 kHz and nonzero audio.
+Pause produced zero frames; resume produced 88,364 frames with nonzero samples.
+Normal native close drained the complete UI launch lineage and audio became
+inactive with zero frames. A separate normal launch played the fixture before
+SIGKILL; its entire launch lineage and windows then disappeared and audio again
+became inactive. These establish output and cleanup, not smooth playback,
+frame rate or A/V sync. Maximize/fullscreen geometry remains unaccepted.
+The VM subsequently passed checked sync/stop, authoritative QEMU exit, launcher
+exit zero, serial kernel/device/user-fault audit and all three offline filesystem
+checks. The earlier stale-package failure remains recorded; this is not a
+fresh-image install or package-upgrade acceptance run.
+
+![Current-source VLC playing the 720p fixture](images/brook_vlc_720p_1080.png)
+
+An initial installer check overflowed the bounded stdout channel and then
+failed on an unavailable `grep`. Its receipt is not accepted as complete output.
+Subsequent installation checks saved verbose output to a guest log and returned
+its hash/size, explicit process result and independently checked launcher row.
+Staging with Python `shutil.copy2` also exposed unsupported `listxattr` (ENOSYS);
+the file contents had already copied, and an independent hash check verified the
+executable before it was used. Extended-attribute compatibility remains open.
+
+## OpenTTD follow-up
+
+OpenTTD 15.3 launched normally, generated a 256×256 world and continued advancing
+its simulation. Native Save Game wrote an 84,496-byte `OTTX` save as UID 1000
+under `/data/home/.local/share/openttd/save/`. Ctrl+A did not replace the generated
+filename; the initial exact-name assertion failed. The actual file is
+`Unnamed, 1950-02-19brook-regression.sav`, SHA-256
+`e8a0614f5863d416d995480304e0773aa0de13806c1853169488568810f790ae`.
+An independent check verified those bytes and ownership. Cold persistence,
+loading the saved game and meaningful transport-building gameplay remain open.
+
+The first mouse click on Exit confirmation left it open. A remaining-task
+snapshot initially looked like the reported hang, but settled pixels and the
+advancing simulation disproved that inference: the main thread was sleeping
+normally between frames. The paused kernel-stack snapshot is diagnostic only,
+not proof of a deadlock. A distinct click after a one-second pointer settle
+confirmed Exit, and the full 29-task UI launch lineage drained normally. The
+cause of the missed interaction is not established. This single normal exit
+does not establish that the user's intermittent quit hang is eliminated.
+
+Audio capture while the world was running was inactive, so after-exit inactivity
+cannot establish cleanup of playing OpenTTD music. Fresh-playback audio,
+forced-termination cleanup and repeated exit tests remain pending. Browser
+audio evidence is documented separately in [browser-trio.md](browser-trio.md).
 
 Ignored evidence is in `build/workloads/app-regressions-20261018/`, including
 `pre-fix-result.json`, `gimp/`, `writer/`, `lo-log-probe.json`,
-`session-acceptance/` and `session-cold-acceptance/`. Kernel SHA-256 for these
+`session-acceptance/`, `session-cold-acceptance/` and `vlc-launcher/`. Kernel SHA-256 for these
 session-service tests is
 `f14006ec594b239f331d74619d65e554db44b2467c83e2dd08adc7cf807c2a00`.
 All 39 hosted suites and the supported compiled entry audit passed before boot.
