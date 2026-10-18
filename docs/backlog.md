@@ -59,6 +59,13 @@
 
 ## VM bridge findings, 17 October
 
+- Diagnose intermittent off-CPU `exit_group` cancellation timeouts in Firefox
+  runs. They occur before and during the finer heap-bin experiment, while a
+  subsequent fresh repeat passes both browser exits and the serial audit.
+  Capture task incarnation, state, ready-queue membership, protected-operation
+  depth and cancellation/lock state on recurrence. A later zero-task job census
+  does not waive an earlier warning or justify freeing pending kernel state.
+
 - Semantic window controls and boot-epoch guarded jobs are implemented; installed-app catalog/launcher activation, observation bundles, saved screenshot
   views and boot-guarded known-frame input are implemented. Follow
   `docs/vm-bridge-next.md` for remaining observation, event, profile/audio and

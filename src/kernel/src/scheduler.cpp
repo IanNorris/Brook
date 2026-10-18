@@ -2852,6 +2852,28 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
                 SerialPrintf("SCHED: exit_group timeout waiting for pid=%u "
                              "(cpu=%d), retaining pending thread\n",
                              p->pid, cpu);
+                // A protected operation may still be unwinding rather than
+                // executing on a CPU. Capture its cancellation/lock state so
+                // this diagnostic distinguishes that from a stranded task.
+                // Never print while holding the scheduler ready lock.
+                uint64_t diagnosticFlags = SchedLockAcquire(g_readyLock);
+                unsigned state = static_cast<unsigned>(p->state);
+                uint32_t depth = p->kernelRegionDepth;
+                bool protectedOperation = p->kernelOperationProtected;
+                bool pending = p->terminalPending;
+                bool interruptible = p->interruptibleWait;
+                uint32_t queued = p->inReadyQueue;
+                KRwLock* blocked = p->blockedOnRwLock;
+                KRwLock* reader = p->heldReadLock;
+                KRwLock* writer = p->heldWriteLock;
+                SchedLockRelease(g_readyLock, diagnosticFlags);
+                SerialPrintf("SCHED: pending exit pid=%u incarnation=%llu tgid=%u "
+                             "state=%u queued=%u region=%u protected=%u "
+                             "pending=%u interruptible=%u rw_wait=%p "
+                             "rw_read=%p rw_write=%p\n",
+                             p->pid, p->incarnation, p->tgid, state, queued, depth,
+                             unsigned(protectedOperation), unsigned(pending),
+                             unsigned(interruptible), blocked, reader, writer);
                 quiesced = false;
                 break;
             }
