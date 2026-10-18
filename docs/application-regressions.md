@@ -125,8 +125,10 @@ under `/data/home/.local/share/openttd/save/`. Ctrl+A did not replace the genera
 filename; the initial exact-name assertion failed. The actual file is
 `Unnamed, 1950-02-19brook-regression.sav`, SHA-256
 `e8a0614f5863d416d995480304e0773aa0de13806c1853169488568810f790ae`.
-An independent check verified those bytes and ownership. Cold persistence,
-loading the saved game and meaningful transport-building gameplay remain open.
+An independent check verified those bytes and ownership. A subsequent cold boot
+checked the same hash and owner before launching the game; the normal UI then
+decoded its metadata and loaded the saved world. Meaningful transport-building
+gameplay remains open.
 
 The first mouse click on Exit confirmation left it open. A remaining-task
 snapshot initially looked like the reported hang, but settled pixels and the
@@ -137,14 +139,39 @@ confirmed Exit, and the full 29-task UI launch lineage drained normally. The
 cause of the missed interaction is not established. This single normal exit
 does not establish that the user's intermittent quit hang is eliminated.
 
-Audio capture while the world was running was inactive, so after-exit inactivity
-cannot establish cleanup of playing OpenTTD music. Fresh-playback audio,
-forced-termination cleanup and repeated exit tests remain pending. Browser
-audio evidence is documented separately in [browser-trio.md](browser-trio.md).
+The first run's inactive audio sample did not establish cleanup of playing
+music. The cold-boot follow-up captured 220,520 stereo frames at 44.1 kHz with
+nonzero samples immediately after normal launch. After loading the world,
+Shift+F12 opened the in-game jukebox; native Play produced 132,590 frames with
+263,225 nonzero samples over a three-second capture. F11 opens the company league
+table in a game: the `music = F11` setting belongs to the scenario editor, not
+the in-game toolbar.
+
+Normal quit through its confirmation dialog drained the complete 29-task UI
+launch lineage, and a subsequent three-second audio capture was inactive with
+zero frames. A separate normal launch produced nonzero music before SIGKILL.
+Its full launch lineage and window were reclaimed. The initial assertion that
+its first post-exit capture must contain zero frames failed: that three-second
+capture held a finite 4,422-frame (0.1003-second) PCM tail. A later three-second
+capture was inactive with zero frames and no remaining application tasks.
+There was no repeating stale buffer. Capture lacks chunk-arrival timestamps,
+so this is not an exact output-stop latency or immediate-silencing guarantee.
+Longer-session/repeated quit, music smoothness and broader gameplay remain open.
+
+The cold follow-up passed checked sync/stop, authoritative QEMU exit, launcher
+exit zero, serial kernel/device/user-fault audit and all three read-only offline
+filesystem checks. Browser audio evidence is documented separately in
+[browser-trio.md](browser-trio.md).
+
+![OpenTTD loading its saved world after cold boot](images/brook_openttd_saved_1080.png)
+
+The screenshot is an unmodified native 1920×1080 frame; the game is using its
+own 800×600 window. It demonstrates reload, not a completed transport network.
 
 Ignored evidence is in `build/workloads/app-regressions-20261018/`, including
 `pre-fix-result.json`, `gimp/`, `writer/`, `lo-log-probe.json`,
-`session-acceptance/`, `session-cold-acceptance/` and `vlc-launcher/`. Kernel SHA-256 for these
+`session-acceptance/`, `session-cold-acceptance/`, `vlc-launcher/` and
+`openttd-cold/`. Kernel SHA-256 for these
 session-service tests is
 `f14006ec594b239f331d74619d65e554db44b2467c83e2dd08adc7cf807c2a00`.
 All 39 hosted suites and the supported compiled entry audit passed before boot.
