@@ -10,6 +10,20 @@ inline bool GpuControlCompletionValid(uint32_t expectedHead,uint32_t usedId,
     return expectedFence ? (flags&1u) && fence==expectedFence : !(flags&1u);
 }
 enum class GpuRetirementStep { ProducerFence,CompositorFence,DetachContext,DetachBacking,Unref };
+enum class GpuCaptureStep { ProducerFence,AttachSource,Copy,CompositorFence,DetachSource };
+template<class Step>
+bool GpuCaptureSequence(Step step) {
+    return step(GpuCaptureStep::ProducerFence) && step(GpuCaptureStep::AttachSource) &&
+           step(GpuCaptureStep::Copy) && step(GpuCaptureStep::CompositorFence) &&
+           step(GpuCaptureStep::DetachSource);
+}
+enum class GpuOwnedTextureRetirementStep { UnbindViewAndFence,DetachTexture,UnrefTexture };
+template<class Step>
+bool GpuOwnedTextureRetirementSequence(Step step) {
+    return step(GpuOwnedTextureRetirementStep::UnbindViewAndFence) &&
+           step(GpuOwnedTextureRetirementStep::DetachTexture) &&
+           step(GpuOwnedTextureRetirementStep::UnrefTexture);
+}
 template<class Step>
 bool GpuRetirementSequence(bool compositorReady,Step step) {
     if (!step(GpuRetirementStep::ProducerFence)) return false;

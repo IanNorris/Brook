@@ -302,6 +302,7 @@ static constexpr uint32_t PIPE_CLEAR_COLOR0           = 1u << 2;
 // virgl command-stream opcodes + object types.
 static constexpr uint32_t VIRGL_CCMD_CREATE_OBJECT        = 1;
 static constexpr uint32_t VIRGL_CCMD_BIND_OBJECT          = 2;
+static constexpr uint32_t VIRGL_CCMD_DESTROY_OBJECT       = 3;
 static constexpr uint32_t VIRGL_CCMD_SET_VIEWPORT_STATE   = 4;
 static constexpr uint32_t VIRGL_CCMD_SET_FRAMEBUFFER_STATE = 5;
 static constexpr uint32_t VIRGL_CCMD_SET_VERTEX_BUFFERS   = 6;
@@ -1670,7 +1671,14 @@ static constexpr uint32_t COMP_BLUR_B_RES   = 6;    // ping-pong temp RT
 static constexpr uint32_t COMP_BLURVTX_RES  = 7;    // full-screen blur-pass vertex buffer
 static constexpr uint32_t DRAW_FS_BLURH = 10, DRAW_FS_BLURV = 11, DRAW_SAMP_LIN = 12,
                           BLUR_A_SURF = 13, BLUR_B_SURF = 14;
-static uint32_t  g_drawNextSview = 256;      // monotonic sampler-view handle allocator
+static uint32_t g_drawNextSview = 256;
+static uint32_t AllocateSamplerViewLocked()
+{
+    // Zero is a permanent exhausted state; never wrap back into live objects.
+    const uint32_t view=g_drawNextSview;
+    if (view) ++g_drawNextSview;
+    return view;
+}
 static bool      g_blurReady     = false;    // blur RTs/shaders/sampler set up
 static uint32_t  g_blurAView     = 0;        // sampler view for COMP_BLUR_A_RES
 static uint32_t  g_blurBView     = 0;        // sampler view for COMP_BLUR_B_RES
@@ -1703,9 +1711,17 @@ static constexpr uint32_t MAX_DRAW_QUADS = 256;
 static DrawQuadRec g_drawQuads[MAX_DRAW_QUADS];
 static uint32_t    g_drawQuadCount = 0;
 
-struct GpuTexture { uint32_t resId; uint32_t w; uint32_t h; uint32_t format; bool used; uint32_t sview; };
+struct GpuTexture {
+    uint32_t resId,w,h,format;
+    bool used;
+    uint32_t sview;
+    bool owned,quarantined,attached;
+};
 static constexpr uint32_t MAX_GPU_TEXTURES = 128;
 static GpuTexture g_gpuTextures[MAX_GPU_TEXTURES] = {};
+// Owned copies/destruction may not overwrite a command stream being assembled
+// or invalidate a sampler view recorded in g_drawQuads for a later EndFrame.
+static bool g_compFrameAssembling;
 
 static inline uint32_t* ComposeDwBase()
 { return reinterpret_cast<uint32_t*>(g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit)); }
@@ -1982,8 +1998,9 @@ static bool SetupGpuBlur()
     }
     // Sampler views for the two blur RTs (identity swizzle 0x688).
     {
-        g_blurAView = g_drawNextSview++;
-        g_blurBView = g_drawNextSview++;
+        g_blurAView = AllocateSamplerViewLocked();
+        g_blurBView = AllocateSamplerViewLocked();
+        if (!g_blurAView || !g_blurBView) return false;
         auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
         memset(sub, 0, sizeof(*sub));
         sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = COMP_CTX_ID;
@@ -2114,7 +2131,7 @@ static GpuTexId CompCreateTexture(uint32_t w, uint32_t h, uint64_t backingVaddr,
     if (!CtxAttachResource(COMP_CTX_ID, resId))
     { SerialPuts("virtio_gpu: comp tex ctx-attach failed\n"); return 0; }
 
-    g_gpuTextures[slot] = { resId, w, h, format, true, 0 };
+    g_gpuTextures[slot] = { resId, w, h, format, true, 0, false, false, true };
     GpuTexture& gt = g_gpuTextures[slot];
 
     // In DRAW mode, every texture needs a sampler view to be drawn as a quad.
@@ -2122,7 +2139,8 @@ static GpuTexId CompCreateTexture(uint32_t w, uint32_t h, uint64_t backingVaddr,
     // safely issue its own submit). Identity swizzle (0x688): R->R,G->G,B->B,A->A.
     if (g_drawReady)
     {
-        uint32_t sv = g_drawNextSview++;
+        uint32_t sv = AllocateSamplerViewLocked();
+        if (!sv) { gt.quarantined=true;return 0; }
         auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
         memset(sub, 0, sizeof(*sub));
         sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = COMP_CTX_ID;
@@ -2143,13 +2161,18 @@ static GpuTexture* CompTex(GpuTexId t)
 {
     if (t == 0 || t > MAX_GPU_TEXTURES) return nullptr;
     GpuTexture* gt = &g_gpuTextures[t - 1];
-    return gt->used ? gt : nullptr;
+    return gt->used && !gt->quarantined ? gt : nullptr;
 }
 
 static void CompDestroyTexture(GpuTexId t)
 {
+    GpuCmdGuard guard;
     GpuTexture* gt = CompTex(t);
     if (!gt) return;
+    if (gt->owned) {
+        SerialPuts("virtio_gpu: refusing legacy destroy of owned texture\n");
+        return;
+    }
     // Detach via attach-backing with zero entries would be ideal; for now just
     // free the table slot (resource id is not recycled — monotonic). The host
     // resource is reclaimed at context teardown / device reset.
@@ -2160,7 +2183,7 @@ static void CompUpdateTexture(GpuTexId t, uint32_t x, uint32_t y, uint32_t w, ui
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     GpuTexture* gt = CompTex(t);
-    if (!gt) return;
+    if (!gt || gt->owned) return;
     if (x >= gt->w || y >= gt->h) return;
     if (x + w > gt->w) w = gt->w - x;
     if (y + h > gt->h) h = gt->h - y;
@@ -2181,7 +2204,7 @@ static bool CompBlitExternalToTexture(GpuTexId t, uint32_t srcGres,
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     if (!g_compReady || srcGres == 0 || srcW == 0 || srcH == 0) return false;
     GpuTexture* gt = CompTex(t);
-    if (!gt) return false;
+    if (!gt || gt->owned) return false;
     // Attach the external resource to the compositor context (idempotent-ish:
     // re-attaching the same id is cheap, but skip the common repeat case).
     if (g_compExternalAttached != srcGres)
@@ -2205,6 +2228,7 @@ static void CompBeginFrame(uint32_t clearArgb)
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     if (!g_compReady) return;
+    g_compFrameAssembling = true;
     (void)clearArgb;   // see note below
     // First GPU frame: point scanout 0 at the RT (switches away from the 2D FB).
     if (!g_compScanoutBound)
@@ -2492,6 +2516,7 @@ static void CompEndFrameDraw()
 static void CompEndFrame()
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
+    struct FinishAssembly { ~FinishAssembly() { g_compFrameAssembling=false; } } finish;
     if (!g_compReady) return;
     if (g_drawReady && g_drawQuadCount > 0) { CompEndFrameDraw(); return; }
     if (g_composeN == 0) return;
@@ -2846,6 +2871,129 @@ static int32_t AppRetireResource(int32_t ctxId,int32_t gres)
     return retired ? 0 : -1;
 }
 
+// These operations run on the compositor thread between frames (or during
+// pre-publication boot verification). They never borrow a window's guest pages.
+static bool g_ownedCaptureReady;
+static bool ResourceControlLocked(uint32_t type,uint32_t context,uint32_t resource)
+{
+    if (g_controlQueuePoisoned) return false;
+    auto* req=reinterpret_cast<VirtioGpuCtxResource*>(g_cmdBuf+CMD_REQ_OFF);
+    memset(req,0,sizeof(*req));req->hdr.type=type;req->hdr.ctx_id=context;
+    req->resource_id=resource;
+    return CmdRespOk(SubmitCommand(sizeof(*req),CMD_RESP_CAP));
+}
+static bool DestroyOwnedTextureLocked(GpuTexture& texture)
+{
+    if (!texture.owned || texture.quarantined || g_controlQueuePoisoned) return false;
+    const bool retired=brook::GpuOwnedTextureRetirementSequence([&](brook::GpuOwnedTextureRetirementStep step) {
+        switch (step) {
+        case brook::GpuOwnedTextureRetirementStep::UnbindViewAndFence: {
+            if (!texture.sview) return AppFenceLocked(COMP_CTX_ID);
+            auto* sub=reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf+CMD_REQ_OFF);
+            memset(sub,0,sizeof(*sub));sub->hdr.type=VIRTIO_GPU_CMD_SUBMIT_3D;
+            sub->hdr.ctx_id=COMP_CTX_ID;
+            auto* dw=ComposeDwBase();uint32_t n=0;
+            dw[n++]=VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS,0,3);
+            dw[n++]=PIPE_SHADER_FRAGMENT;dw[n++]=0;dw[n++]=0;
+            dw[n++]=VirglCmd0(VIRGL_CCMD_DESTROY_OBJECT,VIRGL_OBJECT_SAMPLER_VIEW,1);
+            dw[n++]=texture.sview;sub->size=n*4;
+            if (!CmdRespOk(SubmitCommand(sizeof(*sub)+n*4,CMD_RESP_CAP,true))) return false;
+            texture.sview=0;return true;
+        }
+        case brook::GpuOwnedTextureRetirementStep::DetachTexture:
+            if (texture.attached && !ResourceControlLocked(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,COMP_CTX_ID,texture.resId)) return false;
+            texture.attached=false;return true;
+        case brook::GpuOwnedTextureRetirementStep::UnrefTexture:
+            return ResourceControlLocked(VIRTIO_GPU_CMD_RESOURCE_UNREF,0,texture.resId);
+        }
+        return false;
+    });
+    if (!retired) { texture.quarantined=true;return false; }
+    texture={};
+    return true;
+}
+static GpuTexId CompCreateOwnedTexture(uint32_t w,uint32_t h,bool alpha)
+{
+    GpuCmdGuard guard;
+    if (!g_ownedCaptureReady || !g_compReady || !g_drawReady || g_compFrameAssembling ||
+        g_controlQueuePoisoned || alpha || !w || !h) return 0;
+    uint32_t slot=MAX_GPU_TEXTURES;
+    for (uint32_t i=0;i<MAX_GPU_TEXTURES;++i)
+        if (!g_gpuTextures[i].used) { slot=i;break; }
+    if (slot==MAX_GPU_TEXTURES) return 0;
+    uint32_t resource=g_compTextureIds.Allocate();
+    if (!resource) return 0;
+    auto& texture=g_gpuTextures[slot];
+    const uint32_t format=alpha?VIRGL_FORMAT_B8G8R8A8_UNORM:VIRGL_FORMAT_B8G8R8X8_UNORM;
+    // Reserve metadata before sending anything. Uncertain host creation must
+    // leave an identifiable quarantined slot, not an apparently free handle.
+    texture={resource,w,h,format,true,0,true,false,false};
+    if (!ResourceCreate3D(resource,format,VIRGL_BIND_RENDER_TARGET|VIRGL_BIND_SAMPLER_VIEW,w,h)) {
+        texture.quarantined=true;return 0;
+    }
+    if (!CtxAttachResource(COMP_CTX_ID,resource)) {
+        // No view or GPU reads have been submitted. Verified unref can roll
+        // back this known stage; a poisoned queue retains the metadata instead.
+        if (!ResourceControlLocked(VIRTIO_GPU_CMD_RESOURCE_UNREF,0,resource)) texture.quarantined=true;
+        else texture={};
+        return 0;
+    }
+    texture.attached=true;
+    const uint32_t view=AllocateSamplerViewLocked();
+    if (!view) { texture.quarantined=true;return 0; }
+    texture.sview=view;
+    auto* sub=reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf+CMD_REQ_OFF);
+    memset(sub,0,sizeof(*sub));sub->hdr.type=VIRTIO_GPU_CMD_SUBMIT_3D;
+    sub->hdr.ctx_id=COMP_CTX_ID;
+    auto* dw=ComposeDwBase();uint32_t n=0;
+    dw[n++]=VirglCmd0(VIRGL_CCMD_CREATE_OBJECT,VIRGL_OBJECT_SAMPLER_VIEW,6);
+    dw[n++]=view;dw[n++]=resource;dw[n++]=format;dw[n++]=0;dw[n++]=0;dw[n++]=0x688u;
+    sub->size=n*4;
+    if (!CmdRespOk(SubmitCommand(sizeof(*sub)+n*4,CMD_RESP_CAP))) {
+        // The view command may have taken effect. Never guess which object
+        // exists, or retry a potentially completed destroy against this ID.
+        texture.quarantined=true;return 0;
+    }
+    return slot+1;
+}
+static bool CompDestroyOwnedTexture(GpuTexId id)
+{
+    GpuCmdGuard guard;
+    if (!g_ownedCaptureReady || g_compFrameAssembling) return false;
+    auto* texture=CompTex(id);
+    return texture && texture->owned && DestroyOwnedTextureLocked(*texture);
+}
+static brook::GpuCaptureResult CompCaptureExternal(GpuTexId id,int32_t producer,
+                                                    uint32_t source,uint32_t w,uint32_t h)
+{
+    GpuCmdGuard guard;
+    auto* texture=CompTex(id);
+    if (!g_ownedCaptureReady || !g_compReady || g_compFrameAssembling || g_controlQueuePoisoned ||
+        !texture || !texture->owned || !AppCtxFind(producer) || !AppResValid(producer,source) ||
+        !w || !h || w!=texture->w || h!=texture->h) return brook::GpuCaptureResult::Rejected;
+    const bool completed=brook::GpuCaptureSequence([&](brook::GpuCaptureStep step) {
+        switch (step) {
+        case brook::GpuCaptureStep::ProducerFence:return AppFenceLocked(static_cast<uint32_t>(producer));
+        case brook::GpuCaptureStep::AttachSource:return CtxAttachResource(COMP_CTX_ID,source);
+        case brook::GpuCaptureStep::Copy:
+            return Submit3DBlit(COMP_CTX_ID,texture->resId,0,0,w,h,source,0,0,w,h,false);
+        case brook::GpuCaptureStep::CompositorFence:return AppFenceLocked(COMP_CTX_ID);
+        case brook::GpuCaptureStep::DetachSource:
+            if (!ResourceControlLocked(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,COMP_CTX_ID,source)) return false;
+            if (g_compExternalAttached==source) g_compExternalAttached=0;
+            return true;
+        }
+        return false;
+    });
+    if (!completed) {
+        // A partly completed copy cannot replace an old retained frame. This
+        // handle is no longer usable, and the caller must retain its source.
+        texture->quarantined=true;
+        return brook::GpuCaptureResult::Uncertain;
+    }
+    return brook::GpuCaptureResult::Complete;
+}
+
 static int32_t AppTransfer3D(int32_t ctxId, int32_t gres, int dir,
                              const brook::GpuTransfer3D& transfer)
 {
@@ -2901,7 +3049,91 @@ static const brook::GpuCompositorOps g_gpuCompositorOps = {
     CompDrawSupported,
     CompDrawQuad,
     CompBlurBarrier,
+    CompCreateOwnedTexture,
+    CompDestroyOwnedTexture,
+    CompCaptureExternal,
 };
+
+// Verify actual host execution before making owned capture available. On any
+// uncertain stage retain the test's pages/objects; guessing cleanup could turn a
+// failed test into DMA against freed memory. This runs before ops publication.
+static bool VirtioGpuOwnedCaptureSelfTest()
+{
+    if (!g_drawReady) return false;
+    g_ownedCaptureReady=true;
+    for (uint32_t cycle=0;cycle<3;++cycle) {
+        VirtualAddress backing=VmmAllocPages(2,VMM_WRITABLE,MemTag::Device,KernelPid);
+        if (!backing) return false;
+        auto* sourcePixels=reinterpret_cast<uint32_t*>(backing.raw());
+        auto* readPixels=reinterpret_cast<uint32_t*>(backing.raw()+4096);
+        memset(sourcePixels,0,8192);
+        const int32_t ctx=AppCtxCreate(0);
+        if (ctx<0) return false;
+        const int32_t source=AppResourceCreate3D(ctx,PIPE_TEXTURE_2D,VIRGL_FORMAT_B8G8R8X8_UNORM,
+            VIRGL_BIND_RENDER_TARGET|VIRGL_BIND_SAMPLER_VIEW,4,4,1,1,0,0,0);
+        const int32_t readback=AppResourceCreate3D(ctx,PIPE_TEXTURE_2D,VIRGL_FORMAT_B8G8R8X8_UNORM,
+            VIRGL_BIND_RENDER_TARGET|VIRGL_BIND_SAMPLER_VIEW,4,4,1,1,0,0,0);
+        if (source<0 || readback<0 || AppResourceAttachUser(ctx,source,backing.raw(),64) ||
+            AppResourceAttachUser(ctx,readback,backing.raw()+4096,64)) return false;
+        const GpuTexId captured=CompCreateOwnedTexture(4,4,false);
+        if (!captured) return false;
+        {
+            GpuCmdGuard guard;
+            if (!Submit3DClear(ctx,source,1,0.0f,1.0f,0.0f,1.0f)) return false;
+        }
+        if (CompCaptureExternal(captured,ctx,source,4,4)!=GpuCaptureResult::Complete) return false;
+        {
+            GpuCmdGuard guard;
+            if (!Submit3DClear(ctx,source,2,0.0f,0.0f,1.0f,1.0f)) return false;
+        }
+        // Independently prove the producer overwrite happened: otherwise a
+        // missing overwrite would make the retained-green assertion vacuous.
+        const GpuTransfer3D transfer={0,0,0,4,4,1,0,0,16,64};
+        if (AppTransfer3D(ctx,source,1,transfer) || AppPresentBarrier(ctx)) return false;
+        for (uint32_t i=0;i<16;++i)
+            if ((sourcePixels[i]&0xffffffu)!=0x0000ffu) return false;
+        {
+            GpuCmdGuard guard;
+            if (!CtxAttachResource(COMP_CTX_ID,readback)) return false;
+        }
+        auto checkReadback=[&](uint32_t resource,uint32_t expected) {
+            GpuCmdGuard guard;
+            memset(readPixels,0,64);
+            // COPY_TRANSFER3D rejects a host-only source without an iov in
+            // the pinned renderer. Blit to a backed test RT then transfer it.
+            if (!Submit3DBlit(COMP_CTX_ID,readback,0,0,4,4,resource,0,0,4,4,false) ||
+                !AppFenceLocked(COMP_CTX_ID) || !TransferFromHost3D(COMP_CTX_ID,readback,4,4)) return false;
+            for (uint32_t i=0;i<16;++i)
+                if ((readPixels[i]&0xffffffu)!=expected) return false;
+            return true;
+        };
+        const uint32_t capturedResource=CompTex(captured)->resId;
+        if (!checkReadback(capturedResource,0x00ff00u) || AppRetireResource(ctx,source) ||
+            !checkReadback(capturedResource,0x00ff00u)) return false;
+        // Exercise destruction after this view has actually been bound and
+        // sampled. Keep the boot framebuffer selected during the test draw.
+        const bool wasBound=g_compScanoutBound;
+        g_compScanoutBound=true;
+        CompBeginFrame(0xff000000u);
+        CompEndFrame();
+        const bool cleared=checkReadback(COMP_SCANOUT_RES,0);
+        CompBeginFrame(0xff000000u);
+        CompDrawQuad(captured,0,0,4,4,0,0,4,4,255,false);
+        CompEndFrame();
+        g_compScanoutBound=wasBound;
+        if (!cleared || !checkReadback(COMP_SCANOUT_RES,0x00ff00u) ||
+            !CompDestroyOwnedTexture(captured)) return false;
+        {
+            GpuCmdGuard guard;
+            if (!ResourceControlLocked(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,COMP_CTX_ID,readback)) return false;
+        }
+        if (AppRetireResource(ctx,readback)) return false;
+        AppCtxDestroy(ctx);
+        if (AppCtxFind(ctx)) return false;
+        VmmFreePages(backing,2);
+    }
+    return true;
+}
 
 // Readback self-test of the real compositor ops: build a scattered-backed
 // texture (VmmAllocPages → physically non-contiguous), fill it green via its
@@ -3579,9 +3811,20 @@ static int VirtioGpuModuleInit()
         {
             if (SetupGpuCompositor(g_fbW, g_fbH))
             {
-                GpuCompositorRegister(&g_gpuCompositorOps);
-                // Same proven 3D path also backs per-process app GL contexts.
-                GpuAppRegister(&g_gpuAppOps);
+                const bool ownedCaptureVerified=VirtioGpuOwnedCaptureSelfTest();
+                g_ownedCaptureReady=ownedCaptureVerified;
+                SerialPrintf("virtio_gpu: owned capture self-test -> %s\n",ownedCaptureVerified?"PASS":"FAIL (disabled, uncertain objects retained)");
+                if (ownedCaptureVerified) {
+                    GpuCompositorRegister(&g_gpuCompositorOps);
+                    // Same proven 3D path backs per-process app GL contexts.
+                    GpuAppRegister(&g_gpuAppOps);
+                } else {
+                    // A failed GPU test can leave the host context in error.
+                    // Keep the already-registered 2D driver/module alive, but
+                    // never publish operations against an unverified context.
+                    g_compReady=false;g_drawReady=false;g_gpu3dWorks=false;
+                    DisplaySet3DActive(false);
+                }
             }
         }
     }

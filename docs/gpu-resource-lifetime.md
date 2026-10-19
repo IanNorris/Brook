@@ -5,7 +5,7 @@
 The GPU transfer fix and scheduler startup repair are separate from resource
 retirement. Private DRM resources now retire after their last owning reference
 and verified GPU completion. Exported display sources remain quarantined;
-compositor texture destruction and resource-ID recycling remain open. Do not
+legacy compositor texture destruction and resource-ID recycling remain open. Do not
 reset counters or recycle IDs until the remaining completion rules below are
 implemented.
 
@@ -507,3 +507,55 @@ save fence round trips later, but it cannot repair the exported-buffer contract.
 
 The PRIME identity repair is a prerequisite. It does not complete these gates
 or establish that the intermittent Quake/STK crashes are fixed.
+
+## Compositor-owned capture prerequisites
+
+The ABI 23 driver adds host-only destination creation, fenced external capture,
+and verified destination teardown. This is a prerequisite, not the Wayland
+publication change: existing exported-resource quarantine remains enabled and
+no application-buffer reclamation or mixed-application acceptance is claimed.
+
+Capture currently supports opaque XRGB only. Alpha creation is rejected before
+sending commands. The caller must hold the canonical source/producer lease and
+validate its dimensions. Calls run on the compositor thread outside frame
+assembly. Capture orders producer fence, compositor source attachment, GPU
+copy, compositor fence and source detachment. Only complete success authorizes
+source release. Any uncertain operation quarantines the destination; callers
+must retain the source lease. Owned teardown unbinds and destroys the sampler
+view with a fence before detachment and unref. The legacy destruction API
+refuses owned textures. Sampler-view IDs saturate instead of wrapping.
+
+A pre-publication hardware self-test gates registration of both GPU compositor
+and application operations. Failure retains uncertain objects and leaves the
+already-registered 2D display driver active. It repeats three times: create and capture
+a green source, overwrite it blue and independently read back the blue source,
+verify retained green before and after source retirement, clear and verify the
+scanout black, draw the captured view, verify green, then destroy the sampled
+view and retire the test resources. Pages are freed only after verified
+retirement and context destruction. Source surface objects remain until that
+context destruction; the earlier post-retirement readback does not prove that
+all host GL references have already vanished.
+
+The initial test exposed the pinned renderer's `COPY_TRANSFER3D` requirement
+that even a read-from-host source has guest backing. A host-only texture cannot
+use that route. The corrected test blits into a backed staging texture and
+transfers that texture to the guest. This staging is only for verification;
+capture itself remains GPU-to-GPU.
+
+Host tests exercise short-circuit failure at each capture and teardown phase.
+Mutation controls reject omitted fences/detaches/unref and ignored copy failure.
+They do not inject real queue timeouts or host GPU failures. Alpha, publication
+cancellation, minimized windows, window-slot reuse and early Wayland buffer
+release still require integration tests before removing exported quarantine.
+
+Final paired-build session `4975e87dc5164ce8a8937d888c43c06d` passed the
+three-cycle hardware test, 8,192 private resource creations/closures (net backing
+zero), mmap lifetime checks, PRIME lifetime checks and full/partial/independent
+buffer transfers. It used eight CPUs, 4 GiB, hardware EGL GL and muted audio.
+All 50 host suites and the entry/startup audits passed; seven negative mutation
+controls were detected. Command output completed with no gaps and no remaining
+command tasks. Checked shutdown returned launcher/QEMU exit zero, all three
+offline filesystem checks passed, and nine UID/GID/document hashes were
+preserved. Evidence: `build/workloads/gpu-owned-capture-20261019/verified/acceptance-audit.json`.
+The final failed-test 2D fallback registration branch is inspected, not exercised
+by a real injected GPU failure. Main and mixed-app acceptance remain unchanged.

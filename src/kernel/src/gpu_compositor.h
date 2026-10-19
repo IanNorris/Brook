@@ -26,6 +26,11 @@ typedef uint32_t GpuTexId;
 // at the quad's destination rect in screen space. Used to paint frosted glass
 // behind a window's titlebar. Only valid in the phase after BlurBarrier().
 static constexpr GpuTexId GPU_TEX_BLUR_BACKDROP = 0xFFFFFFFFu;
+enum class GpuCaptureResult : int32_t {
+    Uncertain = -1, // A GPU operation failed: keep the source lease/quarantine.
+    Rejected = 0,  // Rejected before any GPU commands; no source read started.
+    Complete = 1,  // Source read completed and compositor source detached.
+};
 
 struct GpuCompositorOps {
     const char* name;
@@ -105,6 +110,20 @@ struct GpuCompositorOps {
     // (a window's blurRadius; the compositor passes the max across glass windows)
     // and scales how wide the blur is. No-op if blur is unsupported.
     void (*BlurBarrier)(uint32_t strength);
+
+    // Owned-capture prerequisites. Only the compositor thread may call these,
+    // outside BeginFrame/EndFrame assembly. Destinations have no guest backing.
+    // Currently opaque XRGB only: alpha=true is rejected before host commands.
+    // Creation publishes a handle only after resource/attachment/view creation.
+    // Failed teardown retains an unusable quarantined metadata slot; never
+    // fall back to DestroyTexture on an owned texture.
+    GpuTexId (*CreateOwnedTexture)(uint32_t w, uint32_t h, bool alpha);
+    bool (*DestroyOwnedTexture)(GpuTexId tex);
+    // Caller pins the canonical source/producer and validates its dimensions.
+    // Success fences producer, copies, fences compositor, then detaches source.
+    // An uncertain result must never authorize buffer release or backing free.
+    GpuCaptureResult (*CaptureExternal)(GpuTexId dst, int32_t producerCtx,
+                                      uint32_t srcGres, uint32_t srcW, uint32_t srcH);
 };
 
 // Register the GPU compositor ops (called by the display driver once its 3D
