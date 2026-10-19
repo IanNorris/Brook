@@ -707,7 +707,8 @@ the format prerequisite below is now verified:
   this prerequisite for BGRA/XRGB 2D sources.
 - Add explicit premultiplied composition: `ONE, ONE_MINUS_SRC_ALPHA` for RGB
   and alpha, and scale both RGB and alpha by window opacity. Existing straight
-  alpha chrome drawing keeps its separate mode.
+  alpha chrome drawing keeps its separate mode. ABI 26 supplies the driver
+  operation; scene ownership/publication and Wayland integration remain.
 - A provider-owned scene capability binds to a window incarnation. Layers have
   generation-tagged identities and completed versions. Dmabuf updates retain
   canonical source leases through verified capture; SHM updates copy into owned
@@ -772,3 +773,60 @@ guest commands drained with full output, and all seven DRM backing mappings
 checked shutdown, owned launcher/QEMU exit zero, three clean offline filesystem
 checks and nine preserved document hashes/owners. Final endpoint evidence:
 `build/workloads/gpu-format-capture-20261019/verified/acceptance-audit.json`.
+
+## Offscreen premultiplied composition prerequisite (ABI 26)
+
+`ComposeOwnedLayers` accepts at most 64 retained owned images and writes a
+distinct owned ARGB staging target. It validates the complete list before
+changing vertex backing or submitting commands. The flattened descriptors
+carry integer source crops, signed destination positions, scaling, root-relative
+clips and opacity. Clipping retains rational UVs, so scaled/cropped images keep
+their sampling positions. An empty list clears the target to transparent.
+Source/target aliasing and malformed geometry reject without changing it.
+
+The driver uses premultiplied source-over for both RGB and alpha, with opacity
+applied to every channel. Render and desktop-state restoration each complete a
+verified fence. Offscreen work has a dedicated vertex buffer; uncertain
+completion disables its reuse and quarantines the target. The caller must keep
+all input versions and their lifetimes on uncertainty. This API is currently a
+kernel/driver prerequisite, not an exposed userspace scene interface.
+
+Owned textures now have render-surface objects as well as sampler views.
+Verified destruction unbinds framebuffer and sampler references, destroys both
+objects, fences, detaches and unreferences. Object IDs share a non-wrapping
+allocator. The new desktop draw operation selects a separate premultiplied
+shader/blend state; existing straight-alpha drawing keeps its prior semantics.
+
+Viewport half-dimensions use an exact integer-to-float-bit conversion for odd
+and even sizes. Reusing the normalized UV fixed-point helper here would have
+overflowed at ordinary display sizes; review caught this before hardware boot.
+Host checks cover actual float bits for every dimension from 0 to 16,384,
+10,000 randomized clipping/scaling cases against an independent pixel-center
+reference, signed extremes and all three composition/restore failure phases.
+All 52 host suites and supported compiled entry/startup audits passed.
+
+Hardware session `d7212bb194804f5e801f7cae584f7396` passed a prepublication GPU
+readback test using a 5×3 ARGB root and two captured gradient images. It checked
+negative positioning, explicit clipping, scaling, both layer orders, partial
+opacity, 64 layers, transparent clearing, rejection preserving the previous
+image, premultiplied root drawing, switching back to the legacy opacity shader,
+and fenced texture teardown. Production composition stays on the GPU; readback
+is confined to verification.
+
+The retained-source overwrite/close, GL→SHM→GL and minimized-update pixel probe
+also passed with zero outstanding backing at every inspected phase. Quake GL3
+at 1280×720 advanced through three inspected demo frames and exited normally.
+This is a short rendering regression, not a performance/music or mixed-app soak
+claim. Seven guest jobs drained with full output, the Quake launch lineage
+drained, backing returned to zero without quarantine or failures, and audio
+streams emptied. Checked shutdown, owned launcher/QEMU exit zero, three offline
+filesystem checks and nine preserved document hashes/owners passed. Evidence:
+`build/workloads/gpu-scene-20261019/candidate/acceptance-audit.json`.
+
+Still required: verified SHM uploads into owned images; provider-owned scene
+capabilities and generation-tagged layer versions; serialized updates and atomic
+root publication; Wayland tree ordering, cached/synchronized state, detach and
+disconnect cleanup; and real Firefox rendering/audio acceptance. Layer versions
+selected by a queued composition must remain immutable; replacing a cached
+child must not overwrite a currently committed version. Long-run bounded-memory
+testing and injected hardware completion failures remain unverified.

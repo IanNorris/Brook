@@ -343,6 +343,7 @@ static constexpr uint32_t PIPE_SHADER_VERTEX          = 0;
 static constexpr uint32_t PIPE_SHADER_FRAGMENT        = 1;
 static constexpr uint32_t PIPE_PRIM_TRIANGLE_STRIP    = 5;
 // Gallium blend factors / function for standard src-alpha-over composite.
+static constexpr uint32_t PIPE_BLENDFACTOR_ONE           = 1;
 static constexpr uint32_t PIPE_BLENDFACTOR_SRC_ALPHA     = 0x3;
 static constexpr uint32_t PIPE_BLENDFACTOR_INV_SRC_ALPHA = 0x13;
 static constexpr uint32_t PIPE_BLEND_ADD                 = 0;
@@ -386,7 +387,7 @@ static inline uint32_t IntToF32Bits(int32_t v)
 static inline uint32_t FracBits(int32_t num, int32_t den)
 {
     if (num == 0 || den == 0) return 0;
-    int64_t q = (static_cast<int64_t>(num) << 23) / den;   // ~ (num/den) * 2^23
+    int64_t q = (static_cast<int64_t>(num) * (int64_t{1} << 23)) / den;   // ~ (num/den) * 2^23
     if (q == 0) return 0;
     uint32_t f = IntToF32Bits(static_cast<int32_t>(q));
     uint32_t exp = (f >> 23) & 0xFF;                 // divide by 2^23 ...
@@ -1662,7 +1663,7 @@ static uint64_t  g_drawVtxPhys   = 0;        // its physical address
 static constexpr uint32_t COMP_DRAW_VBUF_RES = 13;   // dynamic vertex buffer resource
 static constexpr uint32_t DRAW_BLEND = 2, DRAW_BLEND_ON = 3, DRAW_RAST = 4,
                           DRAW_DSA = 5, DRAW_VE = 6, DRAW_SAMP = 7,
-                          DRAW_VS = 8, DRAW_FS = 9;
+                          DRAW_VS = 8, DRAW_FS = 9, DRAW_BLEND_PM = 15, DRAW_FS_PM = 16;
 // Frosted-glass backdrop blur: fixed-size downsampled RTs + separable gaussian.
 // Fixed dims (independent of display size) keep the gaussian texel offsets as
 // compile-time constants; the downsample BLIT handles any scanout resolution and
@@ -1674,12 +1675,15 @@ static constexpr uint32_t COMP_BLUR_B_RES   = 6;    // ping-pong temp RT
 static constexpr uint32_t COMP_BLURVTX_RES  = 7;    // full-screen blur-pass vertex buffer
 static constexpr uint32_t DRAW_FS_BLURH = 10, DRAW_FS_BLURV = 11, DRAW_SAMP_LIN = 12,
                           BLUR_A_SURF = 13, BLUR_B_SURF = 14;
-static uint32_t g_drawNextSview = 256;
-static uint32_t AllocateSamplerViewLocked()
+static uint32_t g_drawNextObject = 256;
+static uint32_t g_sceneVtxResource;
+static uint32_t* g_sceneVtxBuf;
+static bool g_sceneReady;
+static uint32_t AllocateCompObjectLocked()
 {
     // Zero is a permanent exhausted state; never wrap back into live objects.
-    const uint32_t view=g_drawNextSview;
-    if (view) ++g_drawNextSview;
+    const uint32_t view=g_drawNextObject;
+    if (view) ++g_drawNextObject;
     return view;
 }
 static bool      g_blurReady     = false;    // blur RTs/shaders/sampler set up
@@ -1700,6 +1704,7 @@ static uint32_t  g_blurBarrierStrength[MAX_BLUR_BARRIERS] = {}; // app blur amou
 static uint32_t  g_blurBarrierCount = 0;                        // active barriers this frame
 // Quad flags.
 static constexpr uint32_t QUAD_SAMPLE_BLUR = 1u << 0;  // sample the blurred backdrop (sview ignored)
+static constexpr uint32_t QUAD_PREMULTIPLIED = 1u << 1;
 // One recorded quad (filled by CompDrawQuad, consumed by CompEndFrame). Dst is in
 // integer screen pixels; uv is precomputed float bits; blend selects the object.
 struct DrawQuadRec {
@@ -1719,6 +1724,7 @@ struct GpuTexture {
     bool used;
     uint32_t sview;
     bool owned,quarantined,attached;
+    uint32_t surface=0;
 };
 static constexpr uint32_t MAX_GPU_TEXTURES = 128;
 static GpuTexture g_gpuTextures[MAX_GPU_TEXTURES] = {};
@@ -1786,6 +1792,19 @@ static const char* kCompFS =
     "TEX TEMP[0], IN[0], SAMP[0], 2D\n"
     "MUL TEMP[0].w, TEMP[0].wwww, IN[1].xxxx\n"
     "MOV OUT[0], TEMP[0]\n"
+    "END\n";
+
+// Premultiplied images require opacity on every channel, not alpha alone.
+static const char* kCompFsPremultiplied =
+    "FRAG\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL IN[1], GENERIC[1], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "DCL SVIEW[0], 2D, FLOAT\n"
+    "DCL TEMP[0]\n"
+    "TEX TEMP[0], IN[0], SAMP[0], 2D\n"
+    "MUL OUT[0], TEMP[0], IN[1].xxxx\n"
     "END\n";
 
 // Separable 5-tap gaussian for the backdrop blur. Taps at 0, +-1, +-2 texels
@@ -1896,6 +1915,15 @@ static bool SetupGpuDrawPipeline()
             dw[n++] = s2;
             for (int i = 1; i < 8; ++i) dw[n++] = 0;
         }
+        // Premultiplied source-over for retained Wayland images.
+        {
+            const uint32_t state=1u | (PIPE_BLEND_ADD<<1) | (PIPE_BLENDFACTOR_ONE<<4) |
+                (PIPE_BLENDFACTOR_INV_SRC_ALPHA<<9) | (PIPE_BLEND_ADD<<14) |
+                (PIPE_BLENDFACTOR_ONE<<17) | (PIPE_BLENDFACTOR_INV_SRC_ALPHA<<22) | (0xFu<<27);
+            dw[n++]=VirglCmd0(VIRGL_CCMD_CREATE_OBJECT,VIRGL_OBJECT_BLEND,11);
+            dw[n++]=DRAW_BLEND_PM;dw[n++]=0;dw[n++]=0;dw[n++]=state;
+            for (int i=1;i<8;++i) dw[n++]=0;
+        }
         // Rasterizer.
         dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_RASTERIZER, 9);
         dw[n++] = DRAW_RAST;
@@ -1927,9 +1955,22 @@ static bool SetupGpuDrawPipeline()
     // Shaders: the compositor uses the opacity-aware pass-through pair so per-quad
     // opacity (3rd vertex attribute) scales sampled alpha for src-alpha-over blend.
     if (!CreateShaderObj(COMP_CTX_ID, DRAW_VS, PIPE_SHADER_VERTEX, kCompVS) ||
-        !CreateShaderObj(COMP_CTX_ID, DRAW_FS, PIPE_SHADER_FRAGMENT, kCompFS))
+        !CreateShaderObj(COMP_CTX_ID, DRAW_FS, PIPE_SHADER_FRAGMENT, kCompFS) ||
+        !CreateShaderObj(COMP_CTX_ID, DRAW_FS_PM, PIPE_SHADER_FRAGMENT, kCompFsPremultiplied))
     { SerialPuts("virtio_gpu: draw shader create failed\n"); return false; }
 
+    // Offscreen work has its own vertex backing. If completion is uncertain,
+    // disable its reuse while ordinary desktop draws retain their own buffer.
+    const uint32_t sceneBytes=brook::GPU_SCENE_MAX_LAYERS*80;
+    const auto sceneBacking=PmmAllocPages(AlignUp(sceneBytes,4096)/4096,MemTag::Device,KernelPid);
+    g_sceneVtxResource=g_compTextureIds.Allocate();
+    if (!sceneBacking || !g_sceneVtxResource) return false;
+    g_sceneVtxBuf=reinterpret_cast<uint32_t*>(PhysToVirt(sceneBacking).raw());
+    memset(g_sceneVtxBuf,0,sceneBytes);
+    if (!ResourceCreateBuffer(g_sceneVtxResource,VIRGL_BIND_VERTEX_BUFFER,sceneBytes) ||
+        !ResourceAttachBackingContig(g_sceneVtxResource,sceneBacking.raw(),sceneBytes) ||
+        !CtxAttachResource(COMP_CTX_ID,g_sceneVtxResource)) return false;
+    g_sceneReady=true;
     g_drawReady = true;
     return true;
 }
@@ -2001,8 +2042,8 @@ static bool SetupGpuBlur()
     }
     // Sampler views for the two blur RTs (identity swizzle 0x688).
     {
-        g_blurAView = AllocateSamplerViewLocked();
-        g_blurBView = AllocateSamplerViewLocked();
+        g_blurAView = AllocateCompObjectLocked();
+        g_blurBView = AllocateCompObjectLocked();
         if (!g_blurAView || !g_blurBView) return false;
         auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
         memset(sub, 0, sizeof(*sub));
@@ -2142,7 +2183,7 @@ static GpuTexId CompCreateTexture(uint32_t w, uint32_t h, uint64_t backingVaddr,
     // safely issue its own submit). Identity swizzle (0x688): R->R,G->G,B->B,A->A.
     if (g_drawReady)
     {
-        uint32_t sv = AllocateSamplerViewLocked();
+        uint32_t sv = AllocateCompObjectLocked();
         if (!sv) { gt.quarantined=true;return 0; }
         auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
         memset(sub, 0, sizeof(*sub));
@@ -2292,6 +2333,20 @@ static void CompDrawQuad(GpuTexId src,
     q.flags = 0;
 }
 
+static void CompDrawPremultipliedQuad(GpuTexId src,
+    uint32_t sx,uint32_t sy,uint32_t sw,uint32_t sh,
+    uint32_t dx,uint32_t dy,uint32_t w,uint32_t h,uint32_t opacity)
+{
+    auto* texture=CompTex(src);
+    if (!texture || !texture->owned || texture->quarantined || opacity>255) return;
+    const uint32_t before=g_drawQuadCount;
+    CompDrawQuad(src,sx,sy,sw,sh,dx,dy,w,h,opacity,true);
+    if (g_drawQuadCount!=before) {
+        g_drawQuads[before].blend=DRAW_BLEND_PM;
+        g_drawQuads[before].flags|=QUAD_PREMULTIPLIED;
+    }
+}
+
 // Record the backdrop barrier: subsequent GPU_TEX_BLUR_BACKDROP quads sample the
 // blur of everything recorded before this point. Records the split index and the
 // app-requested blur strength (scales the number of gaussian iterations).
@@ -2348,8 +2403,8 @@ static void CompEndFrameDraw()
     // built from integer dims via IntToF32Bits (no runtime FP).
     dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7);
     dw[n++] = 0;
-    dw[n++] = IntToF32Bits(W / 2); dw[n++] = IntToF32Bits(H / 2); dw[n++] = F32Bits(1.0f);
-    dw[n++] = IntToF32Bits(W / 2); dw[n++] = IntToF32Bits(H / 2); dw[n++] = F32Bits(0.0f);
+    dw[n++] = GpuViewportHalfBits(W); dw[n++] = GpuViewportHalfBits(H); dw[n++] = F32Bits(1.0f);
+    dw[n++] = GpuViewportHalfBits(W); dw[n++] = GpuViewportHalfBits(H); dw[n++] = F32Bits(0.0f);
     // State bound once for the whole frame.
     dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_RASTERIZER, 1);      dw[n++] = DRAW_RAST;
     dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_DSA, 1);             dw[n++] = DRAW_DSA;
@@ -2359,6 +2414,7 @@ static void CompEndFrameDraw()
     dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3);
     dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = DRAW_SAMP;
 
+    uint32_t lastFragment=DRAW_FS;
     uint32_t lastBlend = 0;
     uint32_t lastSamp  = DRAW_SAMP;   // nearest bound above
     uint32_t barrierCursor = 0;       // next barrier to process (indices ascending)
@@ -2437,11 +2493,12 @@ static void CompEndFrameDraw()
                 dw[n++] = 1; dw[n++] = 0; dw[n++] = COMP_SCANOUT_SURF;
                 dw[n++] = VirglCmd0(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7);
                 dw[n++] = 0;
-                dw[n++] = IntToF32Bits(W / 2); dw[n++] = IntToF32Bits(H / 2); dw[n++] = F32Bits(1.0f);
-                dw[n++] = IntToF32Bits(W / 2); dw[n++] = IntToF32Bits(H / 2); dw[n++] = F32Bits(0.0f);
+                dw[n++] = GpuViewportHalfBits(W); dw[n++] = GpuViewportHalfBits(H); dw[n++] = F32Bits(1.0f);
+                dw[n++] = GpuViewportHalfBits(W); dw[n++] = GpuViewportHalfBits(H); dw[n++] = F32Bits(0.0f);
                 dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SHADER, 0, 2); dw[n++] = DRAW_FS; dw[n++] = PIPE_SHADER_FRAGMENT;
                 dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3);
                 dw[n++] = PIPE_SHADER_FRAGMENT; dw[n++] = 0; dw[n++] = DRAW_SAMP;
+                lastFragment=DRAW_FS;
                 lastBlend = DRAW_BLEND;   // blur bound opaque
                 lastSamp  = DRAW_SAMP;
             }
@@ -2450,11 +2507,16 @@ static void CompEndFrameDraw()
         const DrawQuadRec& q = g_drawQuads[i];
         // ~16 dwords/quad; bail if we'd overflow the compose region (last page
         // is the response buffer).
-        if (n + 18 > (CMD_PAGES - 1) * 1024) break;
+        if (n + 32 > (CMD_PAGES - 1) * 1024) break;
         if (q.blend != lastBlend) {
             dw[n++] = VirglCmd0(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_BLEND, 1);
             dw[n++] = q.blend;
             lastBlend = q.blend;
+        }
+        const uint32_t fragment=(q.flags&QUAD_PREMULTIPLIED)?DRAW_FS_PM:DRAW_FS;
+        if (fragment!=lastFragment) {
+            dw[n++]=VirglCmd0(VIRGL_CCMD_BIND_SHADER,0,2);
+            dw[n++]=fragment;dw[n++]=PIPE_SHADER_FRAGMENT;lastFragment=fragment;
         }
         // Frosted-glass backdrop quads sample the (upscaled) blur RT with linear
         // filtering; everything else stays nearest (crisp 1:1 textures/masks).
@@ -2858,17 +2920,26 @@ static bool DestroyOwnedTextureLocked(GpuTexture& texture)
     const bool retired=brook::GpuOwnedTextureRetirementSequence([&](brook::GpuOwnedTextureRetirementStep step) {
         switch (step) {
         case brook::GpuOwnedTextureRetirementStep::UnbindViewAndFence: {
-            if (!texture.sview) return AppFenceLocked(COMP_CTX_ID);
+            if (!texture.sview && !texture.surface) return AppFenceLocked(COMP_CTX_ID);
             auto* sub=reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf+CMD_REQ_OFF);
             memset(sub,0,sizeof(*sub));sub->hdr.type=VIRTIO_GPU_CMD_SUBMIT_3D;
             sub->hdr.ctx_id=COMP_CTX_ID;
             auto* dw=ComposeDwBase();uint32_t n=0;
             dw[n++]=VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS,0,3);
             dw[n++]=PIPE_SHADER_FRAGMENT;dw[n++]=0;dw[n++]=0;
-            dw[n++]=VirglCmd0(VIRGL_CCMD_DESTROY_OBJECT,VIRGL_OBJECT_SAMPLER_VIEW,1);
-            dw[n++]=texture.sview;sub->size=n*4;
+            dw[n++]=VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE,0,3);
+            dw[n++]=1;dw[n++]=0;dw[n++]=COMP_SCANOUT_SURF;
+            if (texture.sview) {
+                dw[n++]=VirglCmd0(VIRGL_CCMD_DESTROY_OBJECT,VIRGL_OBJECT_SAMPLER_VIEW,1);
+                dw[n++]=texture.sview;
+            }
+            if (texture.surface) {
+                dw[n++]=VirglCmd0(VIRGL_CCMD_DESTROY_OBJECT,VIRGL_OBJECT_SURFACE,1);
+                dw[n++]=texture.surface;
+            }
+            sub->size=n*4;
             if (!CmdRespOk(SubmitCommand(sizeof(*sub)+n*4,CMD_RESP_CAP,true))) return false;
-            texture.sview=0;return true;
+            texture.sview=texture.surface=0;return true;
         }
         case brook::GpuOwnedTextureRetirementStep::DetachTexture:
             if (texture.attached && !ResourceControlLocked(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,COMP_CTX_ID,texture.resId)) return false;
@@ -2909,15 +2980,18 @@ static GpuTexId CompCreateOwnedTexture(uint32_t w,uint32_t h,bool alpha)
         return 0;
     }
     texture.attached=true;
-    const uint32_t view=AllocateSamplerViewLocked();
-    if (!view) { texture.quarantined=true;return 0; }
-    texture.sview=view;
+    const uint32_t view=AllocateCompObjectLocked();
+    const uint32_t surface=AllocateCompObjectLocked();
+    if (!view || !surface) { texture.quarantined=true;return 0; }
+    texture.sview=view;texture.surface=surface;
     auto* sub=reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf+CMD_REQ_OFF);
     memset(sub,0,sizeof(*sub));sub->hdr.type=VIRTIO_GPU_CMD_SUBMIT_3D;
     sub->hdr.ctx_id=COMP_CTX_ID;
     auto* dw=ComposeDwBase();uint32_t n=0;
     dw[n++]=VirglCmd0(VIRGL_CCMD_CREATE_OBJECT,VIRGL_OBJECT_SAMPLER_VIEW,6);
     dw[n++]=view;dw[n++]=resource;dw[n++]=format;dw[n++]=0;dw[n++]=0;dw[n++]=0x688u;
+    dw[n++]=VirglCmd0(VIRGL_CCMD_CREATE_OBJECT,VIRGL_OBJECT_SURFACE,5);
+    dw[n++]=surface;dw[n++]=resource;dw[n++]=format;dw[n++]=0;dw[n++]=0;
     sub->size=n*4;
     if (!CmdRespOk(SubmitCommand(sizeof(*sub)+n*4,CMD_RESP_CAP))) {
         // The view command may have taken effect. Never guess which object
@@ -2961,6 +3035,98 @@ static brook::GpuCaptureResult CompCaptureExternal(GpuTexId id,int32_t producer,
         return brook::GpuCaptureResult::Uncertain;
     }
     return brook::GpuCaptureResult::Complete;
+}
+
+// Offscreen composition never borrows desktop vertex backing or mutates the
+// recorded desktop draw list. All handles are pinned by the scene's caller.
+static GpuCaptureResult CompComposeOwnedLayers(GpuTexId destination,
+                                               const GpuSceneLayer* layers,uint32_t count)
+{
+    GpuCmdGuard guard;
+    auto* target=CompTex(destination);
+    if (!g_ownedCaptureReady || !g_sceneReady || !g_compReady || !g_drawReady ||
+        g_compFrameAssembling || g_controlQueuePoisoned || !target || !target->owned ||
+        target->quarantined || !target->surface || target->format!=VIRGL_FORMAT_B8G8R8A8_UNORM ||
+        !target->w || !target->h || target->w>GPU_SCENE_MAX_DIMENSION || target->h>GPU_SCENE_MAX_DIMENSION ||
+        count>GPU_SCENE_MAX_LAYERS || (count && !layers)) return GpuCaptureResult::Rejected;
+    GpuSceneRect rectangles[GPU_SCENE_MAX_LAYERS];
+    uint32_t views[GPU_SCENE_MAX_LAYERS];
+    for (uint32_t i=0;i<count;++i) {
+        auto* source=CompTex(layers[i].texture);
+        if (!source || !source->owned || source->quarantined || !source->sview ||
+            source->resId==target->resId || !GpuCaptureFormatSupported(source->format) ||
+            !GpuSceneClip(layers[i],source->w,source->h,target->w,target->h,rectangles[i]))
+            return GpuCaptureResult::Rejected;
+        views[i]=source->sview;
+    }
+    // Validation above must finish before changing backing or sending commands.
+    for (uint32_t i=0;i<count;++i) {
+        auto* v=g_sceneVtxBuf+i*20;const auto& r=rectangles[i];
+        memset(v,0,80);
+        if (!r.visible) continue;
+        const uint32_t x0=NdcBits(r.x,int32_t(target->w)),x1=NdcBits(r.right,int32_t(target->w));
+        const uint32_t y0=NdcBits(r.y,int32_t(target->h)),y1=NdcBits(r.bottom,int32_t(target->h));
+        const uint32_t u0=FracBits(r.u0,r.uDen),u1=FracBits(r.u1,r.uDen);
+        const uint32_t v0=FracBits(r.v0,r.vDen),v1=FracBits(r.v1,r.vDen);
+        const uint32_t opacity=FracBits(int32_t(layers[i].opacity),255);
+        v[0]=x0;v[1]=y0;v[2]=u0;v[3]=v0;v[4]=opacity;
+        v[5]=x1;v[6]=y0;v[7]=u1;v[8]=v0;v[9]=opacity;
+        v[10]=x0;v[11]=y1;v[12]=u0;v[13]=v1;v[14]=opacity;
+        v[15]=x1;v[16]=y1;v[17]=u1;v[18]=v1;v[19]=opacity;
+    }
+    const bool completed=GpuSceneSequence([&](GpuSceneStep step) {
+        if (step==GpuSceneStep::UploadVertices)
+            return !count || TransferToHostBuffer(COMP_CTX_ID,g_sceneVtxResource,count*80);
+        auto* sub=reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf+CMD_REQ_OFF);
+        memset(sub,0,sizeof(*sub));sub->hdr.type=VIRTIO_GPU_CMD_SUBMIT_3D;sub->hdr.ctx_id=COMP_CTX_ID;
+        auto* dw=ComposeDwBase();uint32_t n=0;
+        const bool render=step==GpuSceneStep::RenderAndFence;
+        dw[n++]=VirglCmd0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE,0,3);
+        dw[n++]=1;dw[n++]=0;dw[n++]=render?target->surface:COMP_SCANOUT_SURF;
+        if (render) {
+            dw[n++]=VirglCmd0(VIRGL_CCMD_CLEAR,0,8);dw[n++]=PIPE_CLEAR_COLOR0;
+            for (uint32_t i=0;i<7;++i) dw[n++]=0; // transparent RGBA, depth/stencil
+        }
+        const int32_t w=int32_t(render?target->w:g_compScanoutW);
+        const int32_t h=int32_t(render?target->h:g_compScanoutH);
+        dw[n++]=VirglCmd0(VIRGL_CCMD_SET_VIEWPORT_STATE,0,7);dw[n++]=0;
+        dw[n++]=GpuViewportHalfBits(w);dw[n++]=GpuViewportHalfBits(h);dw[n++]=F32Bits(1.0f);
+        dw[n++]=GpuViewportHalfBits(w);dw[n++]=GpuViewportHalfBits(h);dw[n++]=0;
+        dw[n++]=VirglCmd0(VIRGL_CCMD_BIND_OBJECT,VIRGL_OBJECT_RASTERIZER,1);dw[n++]=DRAW_RAST;
+        dw[n++]=VirglCmd0(VIRGL_CCMD_BIND_OBJECT,VIRGL_OBJECT_DSA,1);dw[n++]=DRAW_DSA;
+        dw[n++]=VirglCmd0(VIRGL_CCMD_BIND_OBJECT,VIRGL_OBJECT_VERTEX_ELEMENTS,1);dw[n++]=DRAW_VE;
+        dw[n++]=VirglCmd0(VIRGL_CCMD_BIND_OBJECT,VIRGL_OBJECT_BLEND,1);dw[n++]=render?DRAW_BLEND_PM:DRAW_BLEND;
+        dw[n++]=VirglCmd0(VIRGL_CCMD_BIND_SHADER,0,2);dw[n++]=DRAW_VS;dw[n++]=PIPE_SHADER_VERTEX;
+        dw[n++]=VirglCmd0(VIRGL_CCMD_BIND_SHADER,0,2);dw[n++]=render?DRAW_FS_PM:DRAW_FS;dw[n++]=PIPE_SHADER_FRAGMENT;
+        dw[n++]=VirglCmd0(VIRGL_CCMD_BIND_SAMPLER_STATES,0,3);
+        dw[n++]=PIPE_SHADER_FRAGMENT;dw[n++]=0;dw[n++]=DRAW_SAMP;
+        if (render) {
+            for (uint32_t i=0;i<count;++i) {
+                if (!rectangles[i].visible) continue;
+                dw[n++]=VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS,0,3);
+                dw[n++]=PIPE_SHADER_FRAGMENT;dw[n++]=0;dw[n++]=views[i];
+                dw[n++]=VirglCmd0(VIRGL_CCMD_SET_VERTEX_BUFFERS,0,3);
+                dw[n++]=20;dw[n++]=i*80;dw[n++]=g_sceneVtxResource;
+                dw[n++]=VirglCmd0(VIRGL_CCMD_DRAW_VBO,0,12);
+                dw[n++]=0;dw[n++]=4;dw[n++]=PIPE_PRIM_TRIANGLE_STRIP;dw[n++]=0;
+                dw[n++]=1;dw[n++]=0;dw[n++]=0;dw[n++]=0;
+                dw[n++]=0;dw[n++]=0;dw[n++]=3;dw[n++]=0;
+            }
+        } else {
+            dw[n++]=VirglCmd0(VIRGL_CCMD_SET_SAMPLER_VIEWS,0,3);
+            dw[n++]=PIPE_SHADER_FRAGMENT;dw[n++]=0;dw[n++]=0;
+            dw[n++]=VirglCmd0(VIRGL_CCMD_SET_VERTEX_BUFFERS,0,3);
+            dw[n++]=20;dw[n++]=0;dw[n++]=COMP_DRAW_VBUF_RES;
+        }
+        sub->size=n*4;
+        return CmdRespOk(SubmitCommand(sizeof(*sub)+n*4,CMD_RESP_CAP,true));
+    });
+    if (!completed) {
+        // Never reuse offscreen vertex backing after ambiguous GPU use.
+        g_sceneReady=false;target->quarantined=true;
+        return GpuCaptureResult::Uncertain;
+    }
+    return GpuCaptureResult::Complete;
 }
 
 static int32_t AppTransfer3D(int32_t ctxId, int32_t gres, int dir,
@@ -3020,6 +3186,8 @@ static const brook::GpuCompositorOps g_gpuCompositorOps = {
     CompCreateOwnedTexture,
     CompDestroyOwnedTexture,
     CompCaptureExternal,
+    CompComposeOwnedLayers,
+    CompDrawPremultipliedQuad,
 };
 
 // Verify actual host execution before making owned capture available. On any
@@ -3105,6 +3273,134 @@ static bool VirtioGpuOwnedCaptureSelfTest()
         VmmFreePages(backing,2);
     }
     SerialPuts("virtio_gpu: owned capture verified XRGB and ARGB alpha/overwrite/retire/readback\n");
+    return true;
+}
+
+// Deterministic readback test of the actual offscreen pipeline and desktop
+// premultiplied shader. Pixel readback is a test tool, not the production path.
+static bool VirtioGpuSceneSelfTest()
+{
+    if (!g_sceneReady || !g_ownedCaptureReady) return false;
+    const auto backing=VmmAllocPages(3,VMM_WRITABLE,MemTag::Device,KernelPid);
+    if (!backing) return false;
+    auto* red=reinterpret_cast<uint32_t*>(backing.raw());
+    auto* green=reinterpret_cast<uint32_t*>(backing.raw()+4096);
+    auto* read=reinterpret_cast<uint32_t*>(backing.raw()+8192);
+    for (uint32_t y=0;y<4;++y) for (uint32_t x=0;x<4;++x) {
+        red[y*4+x]=0x80000000u|((32u+x*32u)<<16);
+        green[y*4+x]=0x80000000u|((32u+y*32u)<<8);
+    }
+    const auto ctx=AppCtxCreate(0);if (ctx<0) return false;
+    auto create=[&](uint32_t w,uint32_t h,uint64_t address) {
+        const int32_t id=AppResourceCreate3D(ctx,PIPE_TEXTURE_2D,VIRGL_FORMAT_B8G8R8A8_UNORM,
+            VIRGL_BIND_RENDER_TARGET|VIRGL_BIND_SAMPLER_VIEW,w,h,1,1,0,0,0);
+        return id>0 && !AppResourceAttachUser(ctx,id,address,w*h*4)?id:-1;
+    };
+    const auto redResource=create(4,4,backing.raw());
+    const auto greenResource=create(4,4,backing.raw()+4096);
+    const auto readResource=create(5,3,backing.raw()+8192);
+    if (redResource<0 || greenResource<0 || readResource<0) return false;
+    const GpuTransfer3D upload={0,0,0,4,4,1,0,0,16,64};
+    if (AppTransfer3D(ctx,redResource,0,upload) || AppTransfer3D(ctx,greenResource,0,upload)) return false;
+    const auto redTexture=CompCreateOwnedTexture(4,4,true);
+    const auto greenTexture=CompCreateOwnedTexture(4,4,true);
+    const auto root=CompCreateOwnedTexture(5,3,true);
+    if (!redTexture || !greenTexture || !root ||
+        CompCaptureExternal(redTexture,ctx,redResource,VIRGL_FORMAT_B8G8R8A8_UNORM,4,4)!=GpuCaptureResult::Complete ||
+        CompCaptureExternal(greenTexture,ctx,greenResource,VIRGL_FORMAT_B8G8R8A8_UNORM,4,4)!=GpuCaptureResult::Complete) return false;
+    {
+        GpuCmdGuard guard;if (!CtxAttachResource(COMP_CTX_ID,readResource)) return false;
+    }
+    auto readback=[&](uint32_t resource,uint32_t format) {
+        GpuCmdGuard guard;memset(read,0x55,60);
+        return Submit3DBlit(COMP_CTX_ID,readResource,0,0,5,3,resource,0,0,5,3,false,
+                           VIRGL_FORMAT_B8G8R8A8_UNORM,format) &&
+               AppFenceLocked(COMP_CTX_ID) && TransferFromHost3D(COMP_CTX_ID,readResource,5,3);
+    };
+    auto over=[](uint32_t source,uint32_t destination,uint32_t opacity) {
+        uint32_t result=0;const uint32_t alpha=(source>>24)*opacity;
+        for (uint32_t shift=0;shift<32;shift+=8) {
+            const uint32_t a=(source>>shift)&255u,b=(destination>>shift)&255u;
+            result|=((a*opacity*255u+b*(65025u-alpha)+32512u)/65025u)<<shift;
+        }
+        return result;
+    };
+    auto pixelMatches=[](uint32_t actual,uint32_t expected) {
+        for (uint32_t shift=0;shift<32;shift+=8) {
+            const int a=int((actual>>shift)&255u),b=int((expected>>shift)&255u);
+            if (a-b>1 || b-a>1) return false;
+        }
+        return true;
+    };
+    uint32_t expected[15]{};
+    auto compare=[&](const GpuSceneLayer* layers,uint32_t count) {
+        memset(expected,0,sizeof(expected));
+        for (uint32_t i=0;i<count;++i) {
+            const auto& l=layers[i];
+            for (int32_t y=0;y<3;++y) for (int32_t x=0;x<5;++x) {
+                // Independent pixel-center reference, without GpuSceneClip.
+                if (x<l.x || y<l.y || int64_t(x)>=int64_t(l.x)+l.w || int64_t(y)>=int64_t(l.y)+l.h ||
+                    x<l.clipX || y<l.clipY || int64_t(x)>=int64_t(l.clipX)+l.clipW ||
+                    int64_t(y)>=int64_t(l.clipY)+l.clipH) continue;
+                const uint32_t sx=l.sx+uint32_t((2*(int64_t(x)-l.x)+1)*l.sw/(2*l.w));
+                const uint32_t sy=l.sy+uint32_t((2*(int64_t(y)-l.y)+1)*l.sh/(2*l.h));
+                const uint32_t source=l.texture==redTexture?red[sy*4+sx]:green[sy*4+sx];
+                expected[y*5+x]=over(source,expected[y*5+x],l.opacity);
+            }
+        }
+        if (!readback(CompTex(root)->resId,VIRGL_FORMAT_B8G8R8A8_UNORM)) return false;
+        for (uint32_t i=0;i<15;++i) if (!pixelMatches(read[i],expected[i])) {
+            SerialPrintf("virtio_gpu: scene pixel %u got=%08x expected=%08x layers=%u\n",i,read[i],expected[i],count);
+            return false;
+        }
+        return true;
+    };
+    GpuSceneLayer layers[GPU_SCENE_MAX_LAYERS]{};
+    layers[0]={redTexture,1,0,3,3,1,0,4,3,255,0,0,5,3};
+    layers[1]={greenTexture,0,1,4,2,-1,1,4,2,255,1,0,3,3};
+    auto compose=[&](uint32_t count) {
+        return CompComposeOwnedLayers(root,layers,count)==GpuCaptureResult::Complete && compare(layers,count);
+    };
+    if (!compose(2)) return false; // gradients, scaling, negative offsets and clip
+    auto saved=layers[0];layers[0]=layers[1];layers[1]=saved;
+    if (!compose(2)) return false; // order is observable through premultiplied alpha
+    saved=layers[0];layers[0]=layers[1];layers[1]=saved;layers[1].opacity=128;
+    if (!compose(2)) return false; // opacity scales RGB and alpha together
+    // Invalid submissions must not clear or partially mutate the previous root.
+    const auto valid=layers[0];layers[0].texture=root;
+    if (CompComposeOwnedLayers(root,layers,2)!=GpuCaptureResult::Rejected) return false;
+    layers[0]=valid;layers[0].opacity=256;
+    if (CompComposeOwnedLayers(root,layers,2)!=GpuCaptureResult::Rejected) return false;
+    layers[0]=valid;
+    if (!compare(layers,2) || CompComposeOwnedLayers(root,layers,GPU_SCENE_MAX_LAYERS+1)!=GpuCaptureResult::Rejected ||
+        CompComposeOwnedLayers(root,nullptr,1)!=GpuCaptureResult::Rejected) return false;
+    for (uint32_t i=1;i<GPU_SCENE_MAX_LAYERS;++i) layers[i]=layers[0];
+    if (!compose(GPU_SCENE_MAX_LAYERS) || !compose(0)) return false;
+    // Empty scenes really clear to transparent; a new scene cannot accumulate
+    // stale contents from a previous compose. Restore a single layer for draw.
+    if (!compose(1)) return false;
+    const bool bound=g_compScanoutBound;g_compScanoutBound=true;
+    CompBeginFrame(0xff000000u);
+    CompDrawPremultipliedQuad(root,0,0,5,3,0,0,5,3,128);
+    CompDrawQuad(redTexture,0,0,1,1,0,0,1,1,128,true); // switches back to legacy shader
+    CompEndFrame();g_compScanoutBound=bound;
+    if (!readback(COMP_SCANOUT_RES,VIRGL_FORMAT_B8G8R8X8_UNORM)) return false;
+    for (uint32_t i=0;i<15;++i) {
+        uint32_t want=over(expected[i],0xff000000u,128);
+        if (!i) want=0xff000000u | (((((red[0]>>16)&255u)*128u*128u+32512u)/65025u)<<16);
+        if (!pixelMatches(read[i],want)) {
+            SerialPrintf("virtio_gpu: scene desktop pixel %u got=%08x expected=%08x\n",i,read[i],want);
+            return false;
+        }
+    }
+    if (!CompDestroyOwnedTexture(root) || !CompDestroyOwnedTexture(greenTexture) || !CompDestroyOwnedTexture(redTexture)) return false;
+    {
+        GpuCmdGuard guard;if (!ResourceControlLocked(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,COMP_CTX_ID,readResource)) return false;
+    }
+    if (AppRetireResource(ctx,redResource) || AppRetireResource(ctx,greenResource) || AppRetireResource(ctx,readResource)) return false;
+    AppCtxDestroy(ctx);if (AppCtxFind(ctx)) return false;
+    VmmFreePages(backing,3);
+    SerialPuts("virtio_gpu: premultiplied scene verified clip/scale/order/opacity/64-layers/clear/desktop/teardown\n");
     return true;
 }
 
@@ -3784,7 +4080,7 @@ static int VirtioGpuModuleInit()
         {
             if (SetupGpuCompositor(g_fbW, g_fbH))
             {
-                const bool ownedCaptureVerified=VirtioGpuOwnedCaptureSelfTest();
+                const bool ownedCaptureVerified=VirtioGpuOwnedCaptureSelfTest() && VirtioGpuSceneSelfTest();
                 g_ownedCaptureReady=ownedCaptureVerified;
                 SerialPrintf("virtio_gpu: owned capture self-test -> %s\n",ownedCaptureVerified?"PASS":"FAIL (disabled, uncertain objects retained)");
                 if (ownedCaptureVerified) {

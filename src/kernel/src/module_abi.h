@@ -48,7 +48,8 @@ namespace brook {
 // ABI 23 adds host-owned captured textures and verified copy completion.
 // ABI 24 removes the unleased raw external-resource blit operation.
 // ABI 25 passes canonical source formats to retained GPU capture.
-static constexpr uint32_t MODULE_ABI_VERSION = 25;
+// ABI 26 adds bounded offscreen premultiplied scene composition.
+static constexpr uint32_t MODULE_ABI_VERSION = 26;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

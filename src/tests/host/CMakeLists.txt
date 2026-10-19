@@ -377,3 +377,5 @@ target_compile_options(test_shutdown PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffuncti
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_link_options(test_shutdown PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_shutdown PROPERTIES TIMEOUT 15)
+
+add_host_test(test_gpu_scene)

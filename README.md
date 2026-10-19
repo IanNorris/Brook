@@ -44,7 +44,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [DOOM](https://github.com/ozkl/doomgeneric) | 1.9 | ✅ Working | Runs in a WM window or full-screen, with keyboard input |
 | [Quake 2 / Yamagi](https://www.yamagi.org/quake2/) | 8.60 | ✅ Gameplay | Software and hardware virgl GL3 renderers, startup demo, OSS audio and OGG music; [GPU resource retirement/repeated launches](docs/gpu-resource-lifetime.md), mouse capture and intermittent audio timing remain open |
 | [GLtron](https://www.gltron.org/) | 0.70 | ⚠️ Experimental | Compatibility launcher installs through guest `nix-install`; hardware virgl menu and light-cycle gameplay verified, with sound disabled |
-| [SuperTuxKart](https://supertuxkart.net/) | 1.5 | ⚠️ Experimental | Earlier guest installation and virgl Lighthouse AI race verified; current GPU ownership candidate reaches the main menu and [reclaims private backing after close](docs/gpu-resource-lifetime.md#stk-memory-recovery-checkpoint); live memory pressure and mixed-app acceptance remain open |
+| [SuperTuxKart](https://supertuxkart.net/) | 1.5 | ⚠️ Experimental | Earlier guest installation and virgl Lighthouse AI race verified; current GPU ownership candidate reaches the main menu and [reclaims DRM backing after close](docs/gpu-resource-lifetime.md#exported-backing-retirement-abi-24); live memory pressure and mixed-app acceptance remain open |
 | [busybox](https://busybox.net/) | 1.36 | ✅ Working | ls, cat, echo, wc, head, tail, grep, and many more |
 | [TCC](https://bellard.org/tcc/) | 0.9.27 | ✅ Working | Compiles and runs C programs natively on Brook |
 | [CoreMark](https://www.eembc.org/coremark/) | 1.0 | ✅ Working | CPU benchmark, runs to completion |
@@ -53,7 +53,7 @@ the table distinguishes tested behavior from remaining limitations.
 | Nix binaries | — | ✅ Working | Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …) |
 | [NetSurf](https://www.netsurf-browser.org/) | 3.11 | ✅ Working | Web browser rendering HTML/CSS via custom framebuffer surface |
 | [Ladybird](https://ladybird.dev/) | 2026-04-04 | ⚠️ Experimental | HTTPS Google search and Amazon navigation verified; loading/input/scrolling performance remains limited |
-| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Included in fresh experiment images; HTTPS/JavaScript and YouTube audio through the normal launcher, including pause/resume; synthetic site storage survives reboot; intermittent audio gaps remain |
+| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Included in fresh experiment images; software Wayland HTTPS/JavaScript and YouTube audio through the normal launcher, including pause/resume; synthetic site storage survives reboot; hardware dmabuf subsurfaces and intermittent audio gaps remain |
 | [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
 | [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation and cold-boot save/load verified; music output, normal quit and forced-exit cleanup checked; longer-session gameplay remains experimental |
 | [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, cold save/reopen and normal exit verified alongside Firefox and Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
@@ -99,7 +99,9 @@ the table distinguishes tested behavior from remaining limitations.
   lets both controlled clips advance with audio in a bounded concurrent check;
   playback still loses time under contention. [Presentation diagnostics](docs/firefox-presentation.md)
   distinguish media progress, callback counters and VM display output.
-  The generic public package index still lists stock packages.
+  These browser acceptance runs use software rendering. Hardware-mode Firefox
+  currently loses its dmabuf subsurface content; [retained GPU surface-tree work](docs/gpu-resource-lifetime.md#hardware-firefox-retained-surface-tree-work)
+  is in progress. The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and
   remaining limits. At the pinned `37cccf60` permission checkpoint, both [full bootstrap paths](docs/bootstrap.md#40-suite-bootstrap-refresh-after-permission-checks-2026-10-18)
   passed all 40 native suites three times, including under their guest-built
@@ -107,7 +109,7 @@ the table distinguishes tested behavior from remaining limitations.
   building the kernel, modules and bare-metal tests took 52–54 seconds.
   The [virtio-net TX ownership fix](docs/package-pipeline.md) reduced
   the measured clean-image SDK install from 732 to 236 seconds; compilation
-  remains about 50 seconds. Current host validation covers 51 suites; both full
+  remains about 50 seconds. Current host validation covers 52 suites; both full
   bootstrap paths still need renewal beyond that pinned 40-suite checkpoint.
 
 - **Desktop identity and package registration:** new apps and Terminal run as

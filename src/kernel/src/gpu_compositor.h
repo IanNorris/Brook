@@ -15,6 +15,7 @@
 // and is completely untouched.
 
 #include <stdint.h>
+#include "gpu_scene.h"
 
 namespace brook {
 
@@ -122,6 +123,15 @@ struct GpuCompositorOps {
     // An uncertain result must never authorize buffer release or backing free.
     GpuCaptureResult (*CaptureExternal)(GpuTexId dst, int32_t producerCtx,
                                       uint32_t srcGres, uint32_t srcFormat, uint32_t srcW, uint32_t srcH);
+    // Compose retained owned sources into a distinct owned ARGB staging target.
+    // Caller pins every source and destination, outside frame assembly. Invalid
+    // lists reject before commands; uncertain completion requires retaining all
+    // inputs. Complete includes a fence and restoration of desktop GPU state.
+    GpuCaptureResult (*ComposeOwnedLayers)(GpuTexId dst,const GpuSceneLayer*,uint32_t count);
+    // Draw a retained premultiplied root during desktop frame assembly. Opacity
+    // scales RGB and alpha together; existing DrawQuad retains its legacy mode.
+    void (*DrawPremultipliedQuad)(GpuTexId src,uint32_t sx,uint32_t sy,uint32_t sw,uint32_t sh,
+                                 uint32_t dx,uint32_t dy,uint32_t dw,uint32_t dh,uint32_t opacity);
 };
 
 // Register the GPU compositor ops (called by the display driver once its 3D
