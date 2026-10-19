@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <cstdio>
 #include <cstdlib>
@@ -90,6 +91,19 @@ int main(int argc,char** argv) {
         swap.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;swap.BufferCount=2;swap.OutputWindow=window;swap.Windowed=TRUE;
         swap.SwapEffect=DXGI_SWAP_EFFECT_DISCARD;
         check(factory->CreateSwapChain(device,&swap,&swapchain),"swapchain");
+        IDXGISwapChain1* chain1=nullptr;
+        check(swapchain->QueryInterface(IID_IDXGISwapChain1,reinterpret_cast<void**>(&chain1)),"swapchain1");
+        check(chain1->SetRotation(DXGI_MODE_ROTATION_IDENTITY),"identity rotation");
+        DXGI_MODE_ROTATION rotation=DXGI_MODE_ROTATION_UNSPECIFIED;
+        check(chain1->GetRotation(&rotation),"get rotation");
+        if(rotation!=DXGI_MODE_ROTATION_IDENTITY || chain1->GetRotation(nullptr)!=E_INVALIDARG ||
+           chain1->SetRotation(DXGI_MODE_ROTATION_UNSPECIFIED)!=E_INVALIDARG ||
+           chain1->SetRotation(DXGI_MODE_ROTATION_ROTATE90)!=E_NOTIMPL) {
+            std::fprintf(stderr,"D3D11_FAIL rotation contract\n");std::exit(4);
+        }
+        check(chain1->GetRotation(&rotation),"rotation after rejected request");
+        if(rotation!=DXGI_MODE_ROTATION_IDENTITY) {std::fprintf(stderr,"D3D11_FAIL rejected rotation changed state\n");std::exit(4);}
+        chain1->Release();std::puts("D3D11_ROTATION identity verified; invalid/unsupported requests rejected");
         check(swapchain->GetBuffer(0,IID_ID3D11Texture2D,reinterpret_cast<void**>(&target)),"backbuffer");
     } else {
         D3D11_TEXTURE2D_DESC desc{};desc.Width=640;desc.Height=360;desc.MipLevels=1;desc.ArraySize=1;

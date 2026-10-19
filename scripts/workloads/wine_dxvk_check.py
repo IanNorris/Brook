@@ -5,10 +5,11 @@ from elftools.elf.elffile import ELFFile
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]));import bootstrap_acceptance as b
 import argparse
 p=argparse.ArgumentParser(description='Private Wine/DXVK D3D11 acceptance; run inside nix-shell from repository root')
-for name in ('output','seed','nix-seed','control','wine','probe','snake'):p.add_argument('--'+name,required=True,type=Path)
+for name in ('output','seed','nix-seed','control','wine','probe','snake','dxvk'):p.add_argument('--'+name,required=True,type=Path)
 p.add_argument('--instance',type=int,default=514)
 p.add_argument('--offscreen-cycles',type=int,choices=range(1,11),default=3)
-p.add_argument('--mouse-resize',action='store_true',help='Diagnostic CSD drag-resize instead of Win32 SetWindowPos')
+p.add_argument('--profile-startup',action='store_true',help='Capture a bounded early cold Wine startup sample')
+p.add_argument('--mouse-resize',action='store_true',help='Also exercise CSD mouse-drag resize after the exact Win32 720p resize')
 p.add_argument('--trace-proc',action='store_true',help='Diagnostic syscall tracing; performance results are not comparable')
 args=p.parse_args()
 r=args.output.resolve();r.mkdir(parents=True,exist_ok=False);run=r/'run';run.mkdir()
@@ -50,11 +51,26 @@ b.write(r/'host-renderer.json',dict(loaded=sorted(set(loaded)),expected=str(rend
 
 commands=[]
 wine=args.wine.resolve();snake=args.snake.resolve()
-b.write(r/'packages.json',dict(wine=str(wine),snake=str(snake),probe=str(args.probe.resolve()),wine_unix_nsi_sha256=b.sha(wine/'lib/wine/x86_64-unix/nsiproxy.so'),probe_sha256=b.sha(args.probe.resolve()/'bin/brook-d3d11.exe'),snake_sha256=b.sha(snake/'bin/brook-snake.exe'),sdl_sha256=b.sha(snake/'bin/SDL3.dll')))
+b.write(r/'packages.json',dict(wine=str(wine),snake=str(snake),probe=str(args.probe.resolve()),wine_unix_nsi_sha256=b.sha(wine/'lib/wine/x86_64-unix/nsiproxy.so'),dxvk=str(args.dxvk.resolve()),dxvk_d3d11_sha256=b.sha(args.dxvk.resolve()/'bin/d3d11.dll'),dxvk_dxgi_sha256=b.sha(args.dxvk.resolve()/'bin/dxgi.dll'),probe_sha256=b.sha(args.probe.resolve()/'bin/brook-d3d11.exe'),snake_sha256=b.sha(snake/'bin/brook-snake.exe'),sdl_sha256=b.sha(snake/'bin/SDL3.dll')))
 shutil.copy2(__file__,r/'acceptance-driver.py')
 def launch(name,argv,env=None):
  out=r/name;out.mkdir();j=b.TrackedCommand(out,s,argv)
  j.evidence['request'].update(uid=1000,cwd='/data/home',env=env or {});b.write(j.path,j.evidence);commands.append(j)
+ if args.profile_startup and name=='offscreen1':
+  # TrackedCommand construction only persists a request. Submit it before
+  # sampling, otherwise the "startup" profile captures idle bridge traffic.
+  deadline=time.monotonic()+30
+  while j.evidence['status'].get('stage')!='committed':
+   j.poll()
+   assert time.monotonic()<deadline,'Wine submission did not commit before startup capture'
+   time.sleep(.05)
+  assert not j.evidence['status']['guest']['leader_exited']
+  b.write(r/'startup-profile-job.json',j.evidence['status'])
+  b.write(r/'startup-profile-processes.json',b.server.observe(s,include=['processes']))
+  # Cold Wine startup can fill a per-CPU context-switch ring in 500 ms.
+  # Keep the sample short and reject producer loss below rather than silently
+  # treating a truncated capture as a complete startup profile.
+  b.write(r/'startup-profile-start.json',b.server.profile(s,action='start',duration_ms=150))
  if args.trace_proc and name.startswith(('offscreen','window','snake','wine-stop')):
   # guest_run creates an independent process, rather than forking the debug
   # server. Enable tracing after it exists; future children inherit the flag.
@@ -98,7 +114,7 @@ def window(j,title,predicate=lambda w:True,seconds=60):
   time.sleep(.15)
  b.write(r/'window-timeout-observation.json',b.server.observe(s,include=['windows','processes']))
  b.write(r/'window-timeout-stats.json',b.server.stats(s,gpu_details=True,memory_details=True))
- b.write(r/'window-timeout-profile-start.json',b.server.profile(s,action='start',duration_ms=1500))
+ b.write(r/'window-timeout-profile-start.json',b.server.profile(s,action='start',duration_ms=750))
  time.sleep(2)
  b.write(r/'window-timeout-profile-stop.json',b.server.profile(s,action='stop'))
  time.sleep(1)
@@ -131,12 +147,12 @@ print(json.dumps(result))
  root='/data/home/wine-dxvk';os.mkdir(root);os.mkdir(root+'/app');os.mkdir(root+'/logs')
  clone('/data/home/wine-acceptance/prefix-file-trace',root+'/prefix')
  shutil.copyfile('/boot/BIN/D3D11.EXE',root+'/app/brook-d3d11.exe')
- for name in ('d3d11.dll','dxgi.dll'):shutil.copyfile('/nix/store/ra8zv0lmhrlglpc0908ibmjf13qpm254-dxvk-x86_64-w64-mingw32-2.7.1/bin/'+name,root+'/app/'+name)
+ for name in ('d3d11.dll','dxgi.dll'):shutil.copyfile(dxvk_directory_placeholder+'/'+name,root+'/app/'+name)
  snake_package_placeholder
  print(json.dumps(dict(prepared=True,original_prefix_unchanged=True)))
  """
  import textwrap
- code=textwrap.dedent(code).replace('def_clone_placeholder',"""def clone(src,dst):
+ code=textwrap.dedent(code).replace('dxvk_directory_placeholder',repr(str(args.dxvk.resolve()/'bin'))).replace('def_clone_placeholder',"""def clone(src,dst):
  if os.path.islink(src):os.symlink(os.readlink(src),dst);return
  if os.path.isdir(src):
   os.mkdir(dst)
@@ -151,6 +167,25 @@ print(json.dumps(result))
   j=launch('offscreen'+str(i+1),[str(wine/'bin/wine'),'Z:\\data\\home\\wine-dxvk\\app\\brook-d3d11.exe','--offscreen'],wine_env);wait(j,main_only=True)
   result=json.loads(j.evidence['stdout'].splitlines()[-1]);assert result['passed'] and result['offscreen'] and result['frames']==1
   assert 'DXVK: 2.7.1' in j.evidence['stderr'] and 'D3D11_ADAPTER Virtio-GPU Venus' in j.evidence['stdout']
+  if args.profile_startup and i==0:
+   end=time.monotonic()+15
+   while 'IDLE' not in b.server.profile(s,action='status').get('reply',''):
+    assert time.monotonic()<end,'Startup profile has not flushed';time.sleep(.2)
+   startup=b.server.profile(s,action='export');b.write(r/'startup-profile-export.json',startup)
+   assert startup['sample_count']>0 and startup['context_switch_count']>0 and not startup['lossy'],startup
+   shutil.copy2(startup['profile'],r/'startup.profile')
+   root_pid=json.loads((r/'startup-profile-job.json').read_text())['guest']['pid']
+   tasks=json.loads((r/'startup-profile-processes.json').read_text())['components']['processes']['result']['tasks']
+   # Wine's initial launcher can wait while its children do the work. Keep
+   # the observed Wine tasks/incarnations, rather than requiring the waiting
+   # launcher itself to appear in CPU samples.
+   wine_tasks=[task for task in tasks if not task['kernel'] and task['name'].startswith('wine')]
+   wine_pids={task['pid'] for task in wine_tasks}
+   wine_samples=sum(1 for line in (r/'startup.profile').read_text().splitlines() if line.startswith('P ') and int(line.split()[2],16) in wine_pids)
+   b.write(r/'startup-profile-attribution.json',dict(root_pid=root_pid,wine_tasks=wine_tasks,wine_samples=wine_samples,submitted_before_capture=True))
+   assert wine_samples>0,'Startup sample did not capture an observed Wine task'
+   if startup['speedscope']:shutil.copy2(startup['speedscope'],r/'startup.speedscope.json')
+
  for i in range(2):
   name='window'+str(i+1);out=r/name;start=time.monotonic()
   j=launch(name,[str(wine/'bin/wine'),'Z:\\data\\home\\wine-dxvk\\app\\brook-d3d11.exe','--frames','6000'],wine_env)
@@ -161,23 +196,30 @@ print(json.dumps(result))
   extra_w=w['buffer_width']-640;extra_h=w['buffer_height']-360
   assert 0<=extra_w<=64 and 0<=extra_h<=96,w
   target_w=1280+extra_w;target_h=720+extra_h
-  if args.mouse_resize:
-   x=w['x']+w['outer_width']-2;y=w['y']+w['outer_height']-2
-   b.write(out/'resize-input.json',b.server.input_actions(s,[dict(type='move',x=x,y=y),dict(type='button_down'),dict(type='wait',seconds=.2),dict(type='move',x=x+target_w-w['width'],y=y+target_h-w['height']),dict(type='button_up')],frame_id=frame['frame_id']))
-  else:b.write(out/'resize-input.json',b.server.input_actions(s,[dict(type='keypress',keys=['r'],hold_seconds=.15)]))
+  b.write(out/'resize-input.json',b.server.input_actions(s,[dict(type='keypress',keys=['r'],hold_seconds=.15)]))
   w=window(j,'Brook D3D11 via DXVK',lambda w:w['buffer_width']==target_w and w['buffer_height']==target_h);b.write(out/'720p-window.json',w);snapshot(name+'-720p')
+  if args.mouse_resize:
+   frame=snapshot(name+'-before-drag');old_w=w['width'];old_h=w['height']
+   x=w['x']+w['outer_width']-2;y=w['y']+w['outer_height']-2
+   b.write(out/'drag-input.json',b.server.input_actions(s,[dict(type='move',x=x,y=y),dict(type='button_down'),dict(type='wait',seconds=2),dict(type='move',x=x+64,y=y+48),dict(type='wait',seconds=.5),dict(type='button_up')],frame_id=frame['frame_id']))
+   w=window(j,'Brook D3D11 via DXVK',lambda w:old_w+62<=w['width']<=old_w+66 and old_h+46<=w['height']<=old_h+50 and w['width']==w['buffer_width'] and w['height']==w['buffer_height'])
+   target_w=w['width'];target_h=w['height'];b.write(out/'drag-window.json',w);snapshot(name+'-dragged')
   action(out,w,'minimize');w=window(j,'Brook D3D11 via DXVK',lambda w:w['minimized']);action(out,w,'restore');w=window(j,'Brook D3D11 via DXVK',lambda w:not w['minimized'] and w['visible'])
   action(out,w,'maximize');w=window(j,'Brook D3D11 via DXVK',lambda w:w['maximized'] and w['buffer_width']==w['width'] and w['buffer_height']==w['height']);snapshot(name+'-maximized')
-  action(out,w,'restore');w=window(j,'Brook D3D11 via DXVK',lambda w:not w['maximized'] and w['buffer_width']==w['width'] and w['buffer_height']==w['height']);action(out,w,'close');wait(j,main_only=True)
+  action(out,w,'restore');w=window(j,'Brook D3D11 via DXVK',lambda w:not w['maximized'] and w['buffer_width']==target_w and w['buffer_height']==target_h and w['width']==target_w and w['height']==target_h);action(out,w,'close');wait(j,main_only=True)
   result=json.loads(j.evidence['stdout'].splitlines()[-1]);assert result['passed'] and result['frames']>0 and result['keys']>=2 and result['size_events']>=3
   assert 'D3D11_READBACK 1280x720' in j.evidence['stdout'],j.evidence['stdout']
+  assert 'D3D11_ROTATION identity verified' in j.evidence['stdout'],j.evidence['stdout']
+  if args.mouse_resize:assert ('D3D11_READBACK '+str(target_w-extra_w)+'x'+str(target_h-extra_h)) in j.evidence['stdout'],j.evidence['stdout']
  # Upstream Windows SDL3 Snake, with its renderer pinned to Direct3D11.
  game_env=dict(wine_env,SDL_VIDEODRIVER='windows',SDL_AUDIODRIVER='wasapi',SDL_RENDER_DRIVER='direct3d11')
  j=launch('snake',[str(wine/'bin/wine'),'Z:\\data\\home\\wine-dxvk\\app\\brook-snake.exe'],game_env)
  w=window(j,'examples/demo/snake');snapshot('snake-initial');action(r/'snake',w,'focus')
  actions=[dict(type='keypress',keys=[key],hold_seconds=.15) for key in ('up','left','down','right')]
  b.write(r/'snake/input.json',b.server.input_actions(s,actions));time.sleep(2);snapshot('snake-playing')
- b.write(r/'snake/profile.json',b.server.profile(s,action='start',duration_ms=1500))
+ assert json.loads(guest_command('mixed-linux-vulkan',['/boot/BIN/VKPROBE','--expect-driver','venus']))['passed']
+ assert any('examples/demo/snake' in item['title'] for item in windows());snapshot('snake-after-native-vulkan')
+ b.write(r/'snake/profile.json',b.server.profile(s,action='start',duration_ms=750))
  time.sleep(2);b.write(r/'snake/profile-stop.json',b.server.profile(s,action='stop'))
  end=time.monotonic()+15
  while 'IDLE' not in b.server.profile(s,action='status').get('reply',''):
@@ -198,6 +240,10 @@ print(json.dumps(result))
  name='gpu_egl_readback_check.py';argv=[name,'--brook-guest','--mesa',control['mesa'],'--glvnd',control['glvnd'],'--persistent']
  code='import sys;sys.argv='+repr(argv)+';\n'+Path('scripts/workloads',name).read_text();assert json.loads(guest_command('linux-gl',['/nix/profile/bin/python3','-c',code]))['passed']
  assert json.loads(guest_command('linux-vulkan',['/boot/BIN/VKPROBE','--expect-driver','venus']))['passed']
+ name='wayland_gl_check.py';argv=[name,'--brook-guest','--sdl','/nix/store/vnbg4yzxpacm8pxwa4qq02m2llnrnigl-sdl3-3.4.2-lib/lib/libSDL3.so.0']
+ code='import sys;sys.argv='+repr(argv)+';\n'+Path('scripts/workloads',name).read_text()
+ assert json.loads(guest_command('linux-wayland-gl',['/nix/profile/bin/python3','-c',code]))['passed']
+ assert not windows()
  end=time.monotonic()+15
  while True:
   gpu=b.server.stats(s,gpu_details=True)['gpu_backing']
@@ -217,4 +263,4 @@ finally:
  errors=[line for line in (text+(run/'launch.log').read_text(errors='replace')).splitlines() if re.search(r'\[FAULT\] User fault|Delivering signal 11|context error|failed to dispatch|virtio_gpu_virgl_process_cmd.*error|IOV data size exceeds|retained (scene|image capture) failed',line,re.I)]
  b.write(r/'runtime-errors.json',dict(passed=not errors,errors=errors));assert not errors,errors
  print('WINE_DXVK_CHECKED_STOP',s,flush=True)
-b.write(r/'acceptance-complete.json',dict(passed=True,offscreen_cycles=args.offscreen_cycles,diagnostic_trace=args.trace_proc,window_cycles=2,upstream_snake=True,checked_shutdown=True,offline_fsck_passed=True))
+b.write(r/'acceptance-complete.json',dict(passed=True,offscreen_cycles=args.offscreen_cycles,diagnostic_trace=args.trace_proc,csd_drag=args.mouse_resize,early_startup_profile=args.profile_startup,mixed_native_vulkan=True,native_wayland_gl=True,window_cycles=2,upstream_snake=True,checked_shutdown=True,offline_fsck_passed=True))

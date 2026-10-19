@@ -59,7 +59,8 @@ the table distinguishes tested behavior from remaining limitations.
 | [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation and cold-boot save/load verified; music output, normal quit and forced-exit cleanup checked; longer-session gameplay remains experimental |
 | [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, cold save/reopen and normal exit verified alongside Firefox and Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
 | [Blender](https://www.blender.org/) | 5.1.1 | 🚧 Blocked | Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked |
-| Wine64 | 11.0 | ✅ Basic apps | Console command and Windows Notepad: keyboard input, save, normal close and cold-boot reopen as Brook. Broader Windows apps and Proton remain untested. [Evidence and screenshot](docs/wine-smoke.md#console-and-notepad-acceptance--19-october) |
+| Wine64 | 11.0 | ✅ Basic apps | Console command and Windows Notepad: keyboard input, save, normal close and cold-boot reopen as Brook. Broader Windows coverage remains limited. [Evidence and screenshot](docs/wine-smoke.md#console-and-notepad-acceptance--19-october) |
+| Wine + DXVK | 11.0 / 2.7.1 | ⚠️ Experimental D3D11 | Hardware Venus shader/readback probe and Windows SDL3 Snake; keyboard input, resize, maximize, minimize/restore and repeated launch/close verified. Windows audio and Proton remain untested. [Results](docs/wine-dxvk.md) |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen (including cold boot) and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
 | [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer save/reopen across cold boot and full native-close cleanup verified as Brook; startup and broader suite coverage remain experimental |
@@ -73,7 +74,14 @@ the table distinguishes tested behavior from remaining limitations.
   with CPU composition. Repeated resize, minimize/restore and relaunch tests
   pass alongside hardware GL, with clean resource retirement and saved-data
   checks. The [measured Intel configuration and comparison](docs/vulkan-desktop.md)
-  are documented; DXVK and Proton remain future work.
+  are documented.
+
+- **Windows D3D11:** Wine and DXVK render through hardware Venus. A shader
+  probe verifies pixel readback through repeated launches, resize and window
+  controls; the Windows SDL3 Snake example also runs with its D3D11 renderer.
+  Wine cleanup, committed viewport geometry and resize acknowledgement fixes
+  support the path. [Acceptance and limitations](docs/wine-dxvk.md) cover the
+  tested configuration. Full Steam/Proton integration remains future work.
 
 - **Native editor:** VSCodium renders its workbench, accepts keyboard input,
   saves and reopens text files, and exits through its window controls. Nested

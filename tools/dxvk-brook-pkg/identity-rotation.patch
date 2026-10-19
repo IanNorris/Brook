@@ -1,0 +1,29 @@
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -184,8 +184,10 @@
+   
+   HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetRotation(
+           DXGI_MODE_ROTATION*       pRotation) {
+-    Logger::err("DxgiSwapChain::GetRotation: Not implemented");
+-    return E_NOTIMPL;
++    if (!pRotation)
++      return E_INVALIDARG;
++    *pRotation = DXGI_MODE_ROTATION_IDENTITY;
++    return S_OK;
+   }
+   
+   
+@@ -542,7 +544,12 @@
+   
+   HRESULT STDMETHODCALLTYPE DxgiSwapChain::SetRotation(
+           DXGI_MODE_ROTATION        Rotation) {
+-    Logger::err("DxgiSwapChain::SetRotation: Not implemented");
++    if (Rotation < DXGI_MODE_ROTATION_IDENTITY || Rotation > DXGI_MODE_ROTATION_ROTATE270)
++      return E_INVALIDARG;
++    // No content transform is needed for identity. Do not claim that other
++    // rotations were applied when the pinned presenter cannot perform them.
++    if (Rotation == DXGI_MODE_ROTATION_IDENTITY)
++      return S_OK;
+     return E_NOTIMPL;
+   }
+   
