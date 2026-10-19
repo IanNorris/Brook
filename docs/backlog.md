@@ -1401,3 +1401,20 @@ the 1024-ID kernel namespace; remove that diagnostic limit in a focused follow-u
   The saved-SS fix leaves strict ucontext flags unadvertised. Keep the existing
   static entry auditor's unsupported paths visible rather than claiming full
   arbitrary-handler verification.
+
+### Standalone Proton integration followups
+
+- Place interpreter-less PIE executables outside Wine's low-address reservation
+  ranges, with layout, overlap, ELF auxiliary-vector and real preloader tests.
+  The Proton checkpoint disables optional preloaders in its private runtime;
+  it does not alter their code or claim a general address-layout repair.
+- Consolidate flat boot-tool versus package-profile selection. Installing a new
+  compositor changes `/nix/profile/bin/waylandd`, while boot still starts
+  `/nix/bin/waylandd`. Keep the explicit boot copy current until that migration
+  has a fresh-image/reboot acceptance test.
+- Add Linux credential fields to `/proc/PID/status` with caller/target access
+  checks; the current file omits Uid/Gid. VM process observations already expose
+  credentials, but ordinary guest tooling cannot assume those status fields.
+- Add a supported standalone Proton launcher/image package after the bounded
+  game test. Keep synchronization accelerators, full Steam/runtime containers,
+  32-bit CPU execution, anti-cheat and D3D12 as separate acceptance work.

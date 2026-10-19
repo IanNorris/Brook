@@ -60,7 +60,8 @@ the table distinguishes tested behavior from remaining limitations.
 | [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, cold save/reopen and normal exit verified alongside Firefox and Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
 | [Blender](https://www.blender.org/) | 5.1.1 | 🚧 Blocked | Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked |
 | Wine64 | 11.0 | ✅ Basic apps | Console command and Windows Notepad: keyboard input, save, normal close and cold-boot reopen as Brook. Broader Windows coverage remains limited. [Evidence and screenshot](docs/wine-smoke.md#console-and-notepad-acceptance--19-october) |
-| Wine + DXVK | 11.0 / 2.7.1 | ⚠️ Experimental D3D11 | Hardware Venus shader/readback probe and Windows SDL3 Snake; keyboard input, resize, maximize, minimize/restore and repeated launch/close verified. Per-app Unity audio also verified; Proton remains untested. [Results](docs/wine-dxvk.md), [Unity smoke test](docs/wine-unity.md) |
+| Wine + DXVK | 11.0 / 2.7.1 | ⚠️ Experimental D3D11 | Hardware Venus shader/readback probe and Windows SDL3 Snake; keyboard input, resize, maximize, minimize/restore and repeated launch/close verified. Per-app Unity audio also verified; standalone Proton GE has a separate smoke test. [Results](docs/wine-dxvk.md), [Unity smoke test](docs/wine-unity.md) |
+| Proton GE | 11-10 / DXVK 3.1.1 | ⚠️ Experimental | Standalone Helltaker at 720p: first-puzzle input/reset, captured audio and normal exit verified. Steam client integration remains untested. [Results](docs/proton.md) |
 | SpaceVenture (Windows) | 2.08.12 / Unity 2022.3 | ⚠️ Experimental | D3D11/DXVK main menu, opening sequence and first-room interaction; clocked ALSA PCM captured. [Screenshot and limits](docs/wine-unity.md#spaceventure--unity-2022362f2) |
 | Helltaker (Windows) | Unity 2019.2.9f1 | ⚠️ Experimental | 720p D3D11/DXVK first-puzzle gameplay, keyboard movement/restart, minimize/restore and normal exit; clocked ALSA audio captured. [Screenshot and scope](docs/wine-unity.md) |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
@@ -84,7 +85,8 @@ the table distinguishes tested behavior from remaining limitations.
   Wine cleanup, committed viewport geometry and resize acknowledgement fixes
   support the path. [Acceptance and limitations](docs/wine-dxvk.md) cover the
   tested configuration. [Unity game smoke tests](docs/wine-unity.md) now cover
-  Helltaker and SpaceVenture, including captured audio. Full Steam/Proton
+  Helltaker and SpaceVenture, including captured audio. A separate
+  [standalone Proton GE test](docs/proton.md) now runs Helltaker too. Full Steam
   integration remains future work.
 
 - **Native editor:** VSCodium renders its workbench, accepts keyboard input,
@@ -272,10 +274,10 @@ New captures use native 1920×1080 without upscaling. See
 <p align="center"><em>SpaceVenture — Windows Unity 2022, D3D11 through DXVK/Venus, first-room interaction and captured audio. 720p game window; native 1920×1080 capture.</em></p>
 
 <p align="center">
-  <a href="docs/images/brook_wine_helltaker_1080.png"><img src="docs/images/brook_wine_helltaker_1080.png" alt="Windows Helltaker puzzle gameplay through Wine and DXVK on Brook" width="960"></a>
+  <a href="docs/images/brook_proton_helltaker_1080.png"><img src="docs/images/brook_proton_helltaker_1080.png" alt="Windows Helltaker puzzle gameplay through standalone Proton GE and DXVK on Brook" width="960"></a>
 </p>
 
-<p align="center"><em>Helltaker — Windows Unity 2019 puzzle gameplay through Wine and DXVK, with keyboard input and captured audio. Native 1920×1080 capture.</em></p>
+<p align="center"><em>Helltaker — Windows Unity 2019 puzzle gameplay through standalone Proton GE 11 and DXVK 3.1.1, with keyboard input and captured audio. Native 1920×1080 capture.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_chromium_youtube_1080.png"><img src="docs/images/brook_chromium_youtube_1080.png" alt="Chromium playing Big Buck Bunny on YouTube with audio on Brook's native 1920 by 1080 desktop" width="960"></a>
