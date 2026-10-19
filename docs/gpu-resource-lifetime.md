@@ -423,6 +423,73 @@ return to the initial memory baseline. The private 8,192-allocation test alone
 returned its retained backing to zero. Owned compositor captures and exported
 retirement remain necessary; increasing VM memory will not fix that retention.
 
+## Uninterrupted demo and focus-pause correction
+
+The next fresh 8-CPU/4-GiB hardware-GL guest, session
+`957e85593c9d49ac9083079f066857a0`, ran Quake GL3 at 1280×720 without input or
+window-focus changes. Seven spaced frames over 161 seconds show different
+rooms, weapons and world states without a pause overlay. Serial demo-boundary
+messages advanced and the resource counter passed 8,192. The captures are in
+`build/workloads/gpu-unpaused-20261019/baseline/uninterrupted/`. Readback briefly
+perturbs the guest; this is progression evidence, not a matched-scene FPS test
+or proof that no transient artifact occurred between captures.
+
+The pinned Yamagi 8.60 SDL3 input implementation explains the earlier pause:
+`vid_pauseonfocuslost=0` pauses on focus loss but does not automatically unpause
+on focus gain; `1` disables focus-loss pausing, while `2` automatically resumes.
+The opt-in `yquake2-benchmark.cfg` now sets `vid_pauseonfocuslost 1` and
+`paused 0`. Normal launch wrappers are unchanged. This is an archived game
+setting, so use a private acceptance profile when running the benchmark.
+
+After the first game lineage drained, the revised benchmark was installed by
+a tracked guest command and a second game was launched. Chromium local video
+then played while focus changed between the applications. Boot-guarded images
+`focus-check/game-1.png`, `game-2.png` and `game-3.png` show the game advancing
+without the former pause overlay; both audio stream completion counters
+advanced with the host sink muted. Audible quality and OST acceptance remain
+unverified. `game-3.png` contains a questionable large brown polygon; additional
+frames were saved, but it has not been isolated as corruption versus scene
+geometry. This does not close full graphics acceptance.
+
+During the uninterrupted interval, retained DRM backing grew from 209,932,288
+to 409,391,104 bytes. The complete two-launch/browser run ended with
+825,753,600 bytes retained, exactly its exported quarantine. No allocation or
+retirement failed. All three application lineages drained, audio streams were
+empty, checked sync/shutdown and owned launcher exit 0 completed, all three
+offline filesystem checks returned 0 and all nine document fixtures were
+preserved. Evidence: `baseline/acceptance-audit.json` beneath the directory above.
+This strengthens the case for fixing exported presentation ownership rather
+than treating a larger VM as the memory repair.
+
+### Capture implementation constraints
+
+The source review with Astra identified requirements beyond retaining a GEM:
+
+- The current external BLIT is unfenced and caches its source attachment.
+  Owned capture needs a producer fence, source attachment, BLIT, compositor
+  completion fence and verified source detachment before successful return.
+  Remove indefinite external-source attachment caching from this path.
+- A retained destination must own its storage. Current `CreateTexture` attaches
+  VFB guest pages and `DestroyTexture` only frees a metadata slot. Add host-only
+  capture textures with verified teardown and creation-failure rollback; also
+  preserve the backing lifetime of existing CPU-upload textures. A CPU reader
+  epoch alone does not establish GPU DMA completion.
+- Service a bounded capture queue on the compositor thread, before visibility
+  filtering. Pin the canonical source and its actual producer context, not the
+  importing Wayland context. Track window creation identity and publication
+  generation across resize, slot reuse and newer SHM commits.
+- Give queued work independent heap ownership and protect syscall wait/unwind
+  through the existing kernel-operation mechanism. Do not wait for the GPU
+  under window, GEM, address-space or queue locks. Complete each waiter once.
+- Cancelling publication does not cancel an in-flight GPU read. Keep its source
+  lease through verified completion; ambiguous completion requires quarantine.
+  Wayland currently releases even after presentation failure and must distinguish
+  a safely discarded frame from an ambiguous read before sending release.
+
+Keep exported quarantine until all deferred numeric-source paths are replaced
+and these completion/failure rules are tested. Private-retirement batching may
+save fence round trips later, but it cannot repair the exported-buffer contract.
+
 ## Acceptance gates for reclamation
 
 - More than 4,095 create/close iterations with bounded live objects and backing,
