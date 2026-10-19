@@ -1435,4 +1435,30 @@ the 1024-ID kernel namespace; remove that diagnostic limit in a focused follow-u
   credentials, but ordinary guest tooling cannot assume those status fields.
 - Add a supported standalone Proton launcher/image package after the bounded
   game test. Keep synchronization accelerators, full Steam/runtime containers,
-  32-bit CPU execution, anti-cheat and D3D12 as separate acceptance work.
+  32-bit CPU execution and anti-cheat as separate acceptance work. D3D12 now
+  has bounded shader, SDL Snake and Veloren gameplay coverage; see
+  [the D3D12 results](d3d12.md) and the live-review limitations below.
+
+### Native-display colour reversal and playback timing
+
+The combined Wine/Proton/D3D12 image's live review found red and blue reversed
+in SpaceVenture and the D3D12 shader test on the native SDL display. The saved
+headless SpaceVenture screenshot has correct colours. The live D3D12 probe's
+internal render-target readback also reports the expected red centre and blue
+corner. Trace the Venus DMA-BUF import, retained composition and native display
+path, then compare simultaneous bridge captures and host display observations.
+Do not treat render-target readback alone as end-to-end colour acceptance.
+
+Quake II and Firefox YouTube playback were also reported to run approximately
+1.5 times too fast in the same session. A short live sample measured 9.037 guest
+clock seconds against 9.033 host seconds, so a sustained monotonic-clock rate
+error was not reproduced. Investigate intermittent timing and audio position
+accounting. LAPIC rate correction remains active and scheduler waits still use
+its tick counter; absolute `clock_nanosleep` also lacks the monotonic-deadline
+recheck used by relative `nanosleep`. These are investigation leads, not a
+confirmed explanation for the observed speedup.
+
+The private review D3D11 shader launcher passed an unsupported `--window`
+argument. It has been removed from the staged recipe and running review image;
+a live retry is still needed. Keep generated launch recipes consistent with
+each probe's argument parser.
