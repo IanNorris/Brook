@@ -121,7 +121,7 @@ def check_stopped_serial(data, directory):
         raise RuntimeError(f"Guest device/panic errors; see {directory / 'guest-final-serial.log'}")
 
 
-def launch(directory, instance, artifacts=None, cpus=8, memory="8G", gpu="0", composite="cpu"):
+def launch(directory, instance, artifacts=None, cpus=8, memory="8G", gpu="0", composite="cpu", scenario="bootstrap", on_started=None):
     env = dict(os.environ, BROOK_EXPERIMENT_RUN=str(directory),
                BROOK_EXPERIMENT_DISKS=str(directory), BROOK_DISK_IMG=str(directory / "boot.img"),
                BROOK_VM_BRIDGE="1", BROOK_VM_PROVENANCE="agent", BROOK_SMP=str(cpus), BROOK_MEMORY=memory,
@@ -144,8 +144,10 @@ def launch(directory, instance, artifacts=None, cpus=8, memory="8G", gpu="0", co
         env["BROOK_BUILD_DIR"] = str(artifacts)
     log = directory / "launch.log"
     with log.open("wb") as f:
-        process = subprocess.Popen([str(ROOT / "scripts/run_experiment.sh"), "bootstrap"],
+        process = subprocess.Popen([str(ROOT / "scripts/run_experiment.sh"), scenario],
                                    cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)
+    if on_started is not None:
+        on_started(process)
     started = time.monotonic()
     while time.monotonic() - started < 180:
         if process.poll() is not None:

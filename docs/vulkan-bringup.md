@@ -1,7 +1,8 @@
 # Vulkan bring-up through Venus
 
 Started: 19 October 2026, based on `fc46b6d4` (the accepted Wine
-checkpoint, now on main). Hardware Vulkan compute/readback now passes on Brook; graphical presentation remains unaccepted.
+checkpoint, now on main). Hardware Vulkan compute, triangle readback, native
+Wayland swapchains with CPU staging, and bounded vkmark workloads now pass.
 Work is isolated on `wip/vulkan-bringup-20261019`; main is unchanged.
 
 ## Target and boundaries
@@ -27,7 +28,7 @@ Linux Vulkan application
   -> selected host Vulkan driver/GPU
 ```
 
-## What already exists
+## Starting state at the Wine checkpoint
 
 | Layer | Verified in source at this checkpoint | Remaining work |
 | --- | --- | --- |
@@ -334,7 +335,78 @@ filesystem checks. `candidate/triangle.png` enlarges the 64×64 readback with
 nearest-neighbor sampling for inspection. Windowed swapchain presentation is
 still a separate, unaccepted gate.
 
-## Active goal
+## Native Wayland presentation and workload testing
+
+The initial presentation lane uses ordinary Mesa Vulkan Wayland swapchains with
+`MESA_VK_WSI_DEBUG=sw,noshm`. This changes WSI storage/presentation, not the Vulkan
+ICD or shader execution: the device remains hardware Venus backed by Intel.
+Mesa renders into a GPU image, copies into coherent host-visible memory, waits
+for the swapchain GPU fence, and copies the result into `wl_shm`. Brook's CPU
+compositor presents that surface. This is Mesa's native WSI path, rather than a
+custom diagnostic application copying an offscreen probe into another window.
+
+The direct DMA-BUF path is not ready: Brook's current scene capture requires
+VirGL image metadata which Venus blobs do not provide. DMA-BUF producer-fence
+import/export and validated layout/modifier handling also need implementation;
+device-local exported memory cannot be assumed CPU-mappable. The initial direct
+attempt failed with a Wayland retained-scene protocol error and is preserved at
+`build/workloads/vulkan-wsi-20261019/candidate/`. Do not remove the staging flag
+until those contracts have separate acceptance coverage.
+
+`vkcube` completed 600 frames in `shm-candidate/`. Two lifecycle cycles in
+`cycle2-candidate/` then passed 1280×720 resize, minimize/restore, maximize on the
+1920×1080 desktop, restore to the previous size, graceful close and relaunch.
+The maximized client buffer is 1916×996 after chrome/taskbar space. Captures are
+native 1920×1080 PNGs. Hardware GLES pixel and persistent-buffer checks ran while
+each Vulkan window was active; host blob/aperture counts returned to zero.
+
+The stock pinned `vkmark` package silently omitted Wayland because its scanner
+was unavailable. [The experiment package](../tools/vulkan-vkmark-pkg/default.nix)
+adds the scanner, requires `-Dwayland=true` and checks that `wayland.so` exists.
+Its host headless vertex/texture control passes on Intel; that control is not a
+comparison of guest presentation performance.
+
+Accepted full run: `build/workloads/vulkan-wsi-20261019/workload2-candidate/`.
+Both `vkmark` scenes report 52 FPS in the first cycle and 53 FPS in the second;
+these are correctness-run timings with captures/concurrent GL, not an isolated
+performance benchmark. All eight tracked commands exit successfully with full
+output and drained descendants. Final blob/aperture/quarantine counts are zero,
+legacy backing mappings/bytes balance, heap integrity and all four offline
+filesystem checks pass. No app windows/tasks remain. The 12 document fixtures,
+configuration/browser/editor trees and Wine prefix match the checked seed.
+
+![Native Wayland Vulkan cube on the 1080p desktop](images/brook_vulkan_vkcube_1080.png)
+
+![Hardware Vulkan vkmark scene on the 1080p desktop](images/brook_vulkan_vkmark_1080.png)
+
+The reusable test freezes artifacts and driver ABI, checks the actual loaded
+host renderer, forces the guest Venus ICD, compares changing pixels inside the
+client area, and records complete command output and process-lineage teardown.
+It repeats the window lifecycle and optionally two bounded `vkmark`
+vertex/texture runs with concurrent hardware GL. Positive per-scene FPS,
+balanced resource counters, heap integrity, host/guest error logs, checked
+shutdown and offline filesystem checks are required. An early failure preserves
+its private disks and cannot produce an acceptance-complete marker.
+
+Reproduce from a checked stopped seed containing `run/` and `artifacts/`, after
+building the matching kernel/modules. Run from the repository root inside the
+project environment; use new output directories:
+
+```sh
+nix-build tools/vulkan-linux-control -o build/vulkan-control
+nix-build tools/vulkan-vkmark-pkg -o build/vulkan-vkmark-wayland-result
+nix-shell --run 'python scripts/workloads/stage_vulkan_nix.py --seed CHECKED_SEED/run/nix.img --output build/vulkan-nix-seed --control build/vulkan-control --package build/vulkan-vkmark-wayland-result'
+nix-shell --run 'python scripts/workloads/vulkan_wayland_check.py --seed CHECKED_SEED --nix-seed build/vulkan-nix-seed/nix.img --control build/vulkan-control --vkmark build/vulkan-vkmark-wayland-result --output build/vulkan-wayland-run'
+```
+
+The offline staging helper makes a fresh clone and adds missing store closures
+through `debugfs`; it does not require host FUSE. It retains its batch, install
+log, package closure and fsck result. The VM suite uses eight CPUs, 4 GiB RAM,
+Intel `renderD128`, a 1 GiB host aperture, CPU composition and no speaker output.
+It requires no other QEMU instance and an 8 GiB available-host-memory floor.
+Profiles/documents are audited separately against the checked seed.
+
+## Goal
 
 > Bring up hardware-backed Vulkan on Brook through Mesa Venus and virtio-gpu.
 > First establish a reproducible host/Linux-guest control on the selected GPU,
