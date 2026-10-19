@@ -45,5 +45,25 @@ int main() {
         CHECK(retired==(fail==destroy.size()));
         CHECK(seen.size()==(fail<destroy.size()?fail+1:destroy.size()));
     }
+    const std::vector<GpuOwnedUploadStep> upload={GpuOwnedUploadStep::AttachBacking,
+        GpuOwnedUploadStep::Transfer,GpuOwnedUploadStep::CompletionFence,
+        GpuOwnedUploadStep::DetachBacking,GpuOwnedUploadStep::DetachFence};
+    for (unsigned fail=0;fail<=upload.size();++fail) {
+        unsigned seen=0;bool attached=false,pendingRead=false;
+        const bool complete=GpuOwnedUploadSequence([&](auto step) {
+            CHECK(step==upload[seen]);if (seen++==fail) return false;
+            switch (step) {
+            case GpuOwnedUploadStep::AttachBacking:attached=true;break;
+            case GpuOwnedUploadStep::Transfer:CHECK(attached);pendingRead=true;break;
+            case GpuOwnedUploadStep::CompletionFence:CHECK(attached && pendingRead);pendingRead=false;break;
+            case GpuOwnedUploadStep::DetachBacking:CHECK(attached && !pendingRead);attached=false;break;
+            case GpuOwnedUploadStep::DetachFence:CHECK(!attached && !pendingRead);break;
+            }
+            return true;
+        });
+        CHECK(complete==(fail==upload.size()));
+        CHECK(seen==(fail<upload.size()?fail+1:upload.size()));
+        if (complete) CHECK(!attached && !pendingRead);
+    }
     std::puts("GPU_CAPTURE_PASS copy/fence/detach ordering, retained pixels and all capture/teardown failure phases");
 }

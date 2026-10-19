@@ -830,3 +830,66 @@ disconnect cleanup; and real Firefox rendering/audio acceptance. Layer versions
 selected by a queued composition must remain immutable; replacing a cached
 child must not overwrite a currently committed version. Long-run bounded-memory
 testing and injected hardware completion failures remain unverified.
+
+## Temporary-backing owned uploads (ABI 27)
+
+`UploadOwnedTexture` uploads tightly packed pixels from a page-aligned,
+kernel-owned VMM snapshot into an owned staging image. The caller retains the
+snapshot through the operation. Success requires backing attach, transfer,
+completion fence, backing detach and a final fence. The resulting image has no
+guest backing dependency, so the snapshot can be overwritten and freed.
+
+The backing walker reports whether it actually submitted an attach. Unmapped
+pages or excessive fragmentation detected during preflight reject without
+commands or quarantine. Once an attach has been submitted, any failure is
+uncertain: the target is quarantined and the caller must retain the snapshot.
+Texture destruction rejects outstanding upload backing. No cleanup guesses
+whether a failed attach/detach acknowledgement took effect.
+
+The hosted capture test checks all five upload phases and short-circuit failures.
+The hardware self-test uploads a 19×67 image spanning two pages, poisons the
+original snapshot, frees it, allocates/poisons new pages, and checks every output
+pixel. It repeats three uploads per destination for both ARGB and XRGB; arbitrary
+input X bytes resolve to alpha one. A guarded mapping also exercises a real
+partial IOV walk followed by an unmapped page, then verifies a valid upload to
+the same destination succeeds. Guard-page allocators are exported to the driver
+for that fixture. The mixed composition test now combines an uploaded SHM image
+with a captured GPU image, reusing the SHM snapshot before rendering.
+
+Hardware session `e19dbdfd6c12476d831589a86e5049c3` passed those tests and the
+existing capture/composition gates. The physical-page reuse counter was **0/12**:
+same-physical-page reuse is not established by this run. The deterministic
+overwrite of the original snapshot before freeing is independently covered.
+All 52 host suites and supported compiled entry/startup audits passed.
+
+The retained-source pixel probe passed GL→SHM→GL and minimized updates after
+the producer resources were closed. Quake GL3 at 1280×720 advanced through three
+inspected demo frames and closed normally. Seven guest jobs drained with complete
+output, and the Quake launch lineage drained. Tracked DRM backing was fully
+released, with zero quarantine or allocation/retirement failures; audio streams
+emptied. Checked shutdown, owned launcher/QEMU exit zero, three offline filesystem
+checks, and nine preserved document hashes/owners passed. This is a short
+regression, not an audio-quality, performance or mixed-app soak result. Evidence:
+`build/workloads/gpu-owned-upload-20261019/candidate/acceptance-audit.json`.
+
+
+The scene API must expose immutable versions rather than a single mutable image
+per layer. A synchronized child can have committed A, cached B, and incoming C;
+failure to create C must preserve A and B. Three textures can be necessary
+temporarily. The shared 128-texture driver table therefore cannot promise 64
+layers with arbitrary retained versions across several windows. Reserve and
+report version/texture capacity, preserve existing images on exhaustion, and
+reuse retired textures only after public and queued references disappear and
+GPU completion is verified. Keep Wayland committed/cached state outside the
+kernel, and pin exact image versions for each queued draw list.
+
+Still required: scene descriptors, version lifetime/capacity management, owned
+snapshot copying/admission, cancellation-safe queued work, root publication and
+Wayland integration. This driver API alone does not make Firefox render.
+Long-run allocation bounds and injected hardware failures remain unverified.
+
+Separate follow-up: the older native `AppBufferUpload` path frees bounce pages
+on partial failure even if backing attachment succeeded. It needs per-resource
+verified retirement and a cleanup audit; this upload prerequisite does not
+change that path. The normal DRM/PRIME image path uses its separate canonical
+resource lifetime machinery.

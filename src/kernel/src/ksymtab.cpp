@@ -65,6 +65,8 @@ EXPORT_SYMBOL(PmmFreePage);
 // Virtual memory
 EXPORT_SYMBOL(VmmAllocPages);
 EXPORT_SYMBOL(VmmFreePages);
+EXPORT_SYMBOL(VmmAllocKernelStack);
+EXPORT_SYMBOL(VmmFreeKernelStack);
 EXPORT_SYMBOL(VmmVirtToPhys);
 EXPORT_SYMBOL(KsymPhysToVirt);
 EXPORT_SYMBOL(VmmMapPage);

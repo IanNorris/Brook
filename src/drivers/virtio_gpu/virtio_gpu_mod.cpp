@@ -969,8 +969,10 @@ static bool ResourceAttachBackingContig(uint32_t resId, uint64_t phys, uint32_t 
 // page-by-page (VmmVirtToPhys works here — these are 4K-mapped, not the
 // huge-page direct map), coalescing physically-contiguous runs into as few
 // mem-entries as possible. Returns false on any unmapped page.
-static bool ResourceAttachBackingVirt(uint32_t resId, uint64_t vaddr, uint32_t sizeBytes)
+static bool ResourceAttachBackingVirt(uint32_t resId, uint64_t vaddr, uint32_t sizeBytes,
+                                      bool* submitted=nullptr)
 {
+    if (submitted) *submitted=false;
     auto* req = reinterpret_cast<VirtioGpuResourceAttachBacking*>(g_cmdBuf + CMD_REQ_OFF);
     auto* entries = reinterpret_cast<VirtioGpuMemEntry*>(
         g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuResourceAttachBacking));
@@ -1040,6 +1042,7 @@ static bool ResourceAttachBackingVirt(uint32_t resId, uint64_t vaddr, uint32_t s
 
     uint32_t reqLen = sizeof(VirtioGpuResourceAttachBacking)
                     + nEntries * sizeof(VirtioGpuMemEntry);
+    if (submitted) *submitted=true;
     return CmdRespOk(SubmitCommand(reqLen, CMD_RESP_CAP));
 }
 
@@ -1725,6 +1728,7 @@ struct GpuTexture {
     uint32_t sview;
     bool owned,quarantined,attached;
     uint32_t surface=0;
+    bool uploadBackingAttached=false;
 };
 static constexpr uint32_t MAX_GPU_TEXTURES = 128;
 static GpuTexture g_gpuTextures[MAX_GPU_TEXTURES] = {};
@@ -2916,7 +2920,7 @@ static bool ResourceControlLocked(uint32_t type,uint32_t context,uint32_t resour
 }
 static bool DestroyOwnedTextureLocked(GpuTexture& texture)
 {
-    if (!texture.owned || texture.quarantined || g_controlQueuePoisoned) return false;
+    if (!texture.owned || texture.quarantined || texture.uploadBackingAttached || g_controlQueuePoisoned) return false;
     const bool retired=brook::GpuOwnedTextureRetirementSequence([&](brook::GpuOwnedTextureRetirementStep step) {
         switch (step) {
         case brook::GpuOwnedTextureRetirementStep::UnbindViewAndFence: {
@@ -3035,6 +3039,45 @@ static brook::GpuCaptureResult CompCaptureExternal(GpuTexId id,int32_t producer,
         return brook::GpuCaptureResult::Uncertain;
     }
     return brook::GpuCaptureResult::Complete;
+}
+
+static GpuCaptureResult CompUploadOwnedTexture(GpuTexId destination,uint64_t snapshot,uint32_t bytes)
+{
+    GpuCmdGuard guard;
+    auto* target=CompTex(destination);
+    if (!g_ownedCaptureReady || !g_compReady || !g_drawReady || g_compFrameAssembling ||
+        g_controlQueuePoisoned || !target || !target->owned || target->quarantined ||
+        target->uploadBackingAttached || !GpuCaptureFormatSupported(target->format) ||
+        !target->w || !target->h || target->w>GPU_SCENE_MAX_DIMENSION || target->h>GPU_SCENE_MAX_DIMENSION ||
+        !snapshot || (snapshot&4095u) || !bytes || uint64_t(target->w)*target->h*4!=bytes ||
+        snapshot>~uint64_t{0}-bytes) return GpuCaptureResult::Rejected;
+    bool submitted=false;
+    const bool complete=GpuOwnedUploadSequence([&](GpuOwnedUploadStep step) {
+        switch (step) {
+        case GpuOwnedUploadStep::AttachBacking: {
+            const bool attached=ResourceAttachBackingVirt(target->resId,snapshot,bytes,&submitted);
+            // A submitted attach may have succeeded even when its reply failed.
+            target->uploadBackingAttached=submitted;
+            return attached;
+        }
+        case GpuOwnedUploadStep::Transfer:
+            return TransferToHost3D(COMP_CTX_ID,target->resId,0,0,target->w,target->h,target->w,target->h);
+        case GpuOwnedUploadStep::CompletionFence:return AppFenceLocked(COMP_CTX_ID);
+        case GpuOwnedUploadStep::DetachBacking:
+            if (!ResourceControlLocked(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING,0,target->resId)) return false;
+            target->uploadBackingAttached=false;return true;
+        case GpuOwnedUploadStep::DetachFence:return AppFenceLocked(COMP_CTX_ID);
+        }
+        return false;
+    });
+    if (!complete) {
+        if (!submitted) return GpuCaptureResult::Rejected;
+        target->quarantined=true;
+        // The caller retains the snapshot lease until device reset. Never free
+        // it merely because an attach/transfer/detach acknowledgement failed.
+        return GpuCaptureResult::Uncertain;
+    }
+    return GpuCaptureResult::Complete;
 }
 
 // Offscreen composition never borrows desktop vertex backing or mutates the
@@ -3188,6 +3231,7 @@ static const brook::GpuCompositorOps g_gpuCompositorOps = {
     CompCaptureExternal,
     CompComposeOwnedLayers,
     CompDrawPremultipliedQuad,
+    CompUploadOwnedTexture,
 };
 
 // Verify actual host execution before making owned capture available. On any
@@ -3276,6 +3320,90 @@ static bool VirtioGpuOwnedCaptureSelfTest()
     return true;
 }
 
+static bool VirtioGpuOwnedUploadSelfTest()
+{
+    constexpr uint32_t w=19,h=67,bytes=w*h*4,pages=(bytes+4095)/4096;
+    const auto readBacking=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,KernelPid);
+    if (!readBacking) return false;
+    auto* pixels=reinterpret_cast<uint32_t*>(readBacking.raw());
+    const auto guarded=VmmAllocKernelStack(1,MemTag::Device,KernelPid);
+    if (!guarded) return false;
+    uint32_t reusedPhysicalPages=0;
+    const auto ctx=AppCtxCreate(0);if (ctx<0) return false;
+    const auto readResource=AppResourceCreate3D(ctx,PIPE_TEXTURE_2D,VIRGL_FORMAT_B8G8R8A8_UNORM,
+        VIRGL_BIND_RENDER_TARGET|VIRGL_BIND_SAMPLER_VIEW,w,h,1,1,0,0,0);
+    if (readResource<0 || AppResourceAttachUser(ctx,readResource,readBacking.raw(),bytes)) return false;
+    {
+        GpuCmdGuard guard;if (!CtxAttachResource(COMP_CTX_ID,readResource)) return false;
+    }
+    auto pattern=[](uint32_t i,uint32_t phase,bool alpha) {
+        return ((alpha?128u:(i*11u)%256u)<<24) | (((i+phase*19u)%129u)<<16) |
+               (((i*3u+phase*17u)%129u)<<8) | ((i*7u+phase*11u)%129u);
+    };
+    for (uint32_t alpha=0;alpha<2;++alpha) {
+        const uint32_t format=alpha?VIRGL_FORMAT_B8G8R8A8_UNORM:VIRGL_FORMAT_B8G8R8X8_UNORM;
+        const auto texture=CompCreateOwnedTexture(w,h,alpha);
+        if (!texture) return false;
+        for (uint32_t phase=0;phase<3;++phase) {
+            const auto snapshot=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,KernelPid);
+            if (!snapshot) return false;
+            auto* input=reinterpret_cast<uint32_t*>(snapshot.raw());
+            for (uint32_t i=0;i<w*h;++i) input[i]=pattern(i,phase,alpha);
+            if (CompUploadOwnedTexture(texture,0,bytes)!=GpuCaptureResult::Rejected ||
+                CompUploadOwnedTexture(texture,snapshot.raw()+4,bytes)!=GpuCaptureResult::Rejected ||
+                CompUploadOwnedTexture(texture,snapshot.raw(),bytes-4)!=GpuCaptureResult::Rejected) return false;
+            if (!alpha && !phase) {
+                // The two-page extent crosses this owned guard mapping: the
+                // IOV walk must reject before submit and leave the target usable.
+                SerialPuts("virtio_gpu: self-test expects unmapped upload rejection\n");
+                if (CompUploadOwnedTexture(texture,guarded.raw(),bytes)!=GpuCaptureResult::Rejected) return false;
+            }
+            if (CompUploadOwnedTexture(texture,snapshot.raw(),bytes)!=GpuCaptureResult::Complete) return false;
+            uint64_t originalPhysical[pages];
+            for (uint32_t i=0;i<pages;++i)
+                originalPhysical[i]=VmmVirtToPhys(KernelPageTable,VirtualAddress(snapshot.raw()+i*4096)).raw();
+            // Deterministic overwrite precedes free; reallocation alone would
+            // not prove that the same physical pages happened to be reused.
+            memset(input,0x55,pages*4096);
+            VmmFreePages(snapshot,pages);
+            // Source lifetime really ends here. Allocate and poison new pages
+            // before reading the host-only texture, then upload again next phase.
+            const auto reused=VmmAllocPages(pages,VMM_WRITABLE,MemTag::Device,KernelPid);
+            if (!reused) return false;
+            memset(reinterpret_cast<void*>(reused.raw()),0x55,pages*4096);
+            for (uint32_t i=0;i<pages;++i) {
+                const auto physical=VmmVirtToPhys(KernelPageTable,VirtualAddress(reused.raw()+i*4096)).raw();
+                for (uint32_t j=0;j<pages;++j) if (physical==originalPhysical[j]) { ++reusedPhysicalPages;break; }
+            }
+            {
+                GpuCmdGuard guard;memset(pixels,0xaa,bytes);
+                if (!Submit3DBlit(COMP_CTX_ID,readResource,0,0,w,h,CompTex(texture)->resId,0,0,w,h,false,
+                                  VIRGL_FORMAT_B8G8R8A8_UNORM,format) || !AppFenceLocked(COMP_CTX_ID) ||
+                    !TransferFromHost3D(COMP_CTX_ID,readResource,w,h)) return false;
+            }
+            for (uint32_t i=0;i<w*h;++i) {
+                const uint32_t expected=pattern(i,phase,alpha)|(alpha?0u:0xff000000u);
+                if (pixels[i]!=expected) {
+                    SerialPrintf("virtio_gpu: owned upload pixel=%u alpha=%u phase=%u got=%08x expected=%08x\n",
+                                 i,alpha,phase,pixels[i],expected);
+                    return false;
+                }
+            }
+            VmmFreePages(reused,pages);
+        }
+        if (!CompDestroyOwnedTexture(texture)) return false;
+    }
+    {
+        GpuCmdGuard guard;if (!ResourceControlLocked(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,COMP_CTX_ID,readResource)) return false;
+    }
+    if (AppRetireResource(ctx,readResource)) return false;
+    AppCtxDestroy(ctx);if (AppCtxFind(ctx)) return false;
+    VmmFreeKernelStack(guarded,1);
+    VmmFreePages(readBacking,pages);
+    SerialPrintf("virtio_gpu: owned upload verified ARGB/XRGB two-page poison/free/reallocate/reupload/teardown reused_physical_pages=%u/12\n",reusedPhysicalPages);
+    return true;
+}
+
 // Deterministic readback test of the actual offscreen pipeline and desktop
 // premultiplied shader. Pixel readback is a test tool, not the production path.
 static bool VirtioGpuSceneSelfTest()
@@ -3297,17 +3425,17 @@ static bool VirtioGpuSceneSelfTest()
         return id>0 && !AppResourceAttachUser(ctx,id,address,w*h*4)?id:-1;
     };
     const auto redResource=create(4,4,backing.raw());
-    const auto greenResource=create(4,4,backing.raw()+4096);
     const auto readResource=create(5,3,backing.raw()+8192);
-    if (redResource<0 || greenResource<0 || readResource<0) return false;
+    if (redResource<0 || readResource<0) return false;
     const GpuTransfer3D upload={0,0,0,4,4,1,0,0,16,64};
-    if (AppTransfer3D(ctx,redResource,0,upload) || AppTransfer3D(ctx,greenResource,0,upload)) return false;
+    if (AppTransfer3D(ctx,redResource,0,upload)) return false;
     const auto redTexture=CompCreateOwnedTexture(4,4,true);
     const auto greenTexture=CompCreateOwnedTexture(4,4,true);
     const auto root=CompCreateOwnedTexture(5,3,true);
     if (!redTexture || !greenTexture || !root ||
         CompCaptureExternal(redTexture,ctx,redResource,VIRGL_FORMAT_B8G8R8A8_UNORM,4,4)!=GpuCaptureResult::Complete ||
-        CompCaptureExternal(greenTexture,ctx,greenResource,VIRGL_FORMAT_B8G8R8A8_UNORM,4,4)!=GpuCaptureResult::Complete) return false;
+        CompUploadOwnedTexture(greenTexture,backing.raw()+4096,64)!=GpuCaptureResult::Complete) return false;
+    memset(green,0x55,64); // the uploaded snapshot may now be reused
     {
         GpuCmdGuard guard;if (!CtxAttachResource(COMP_CTX_ID,readResource)) return false;
     }
@@ -3344,7 +3472,7 @@ static bool VirtioGpuSceneSelfTest()
                     int64_t(y)>=int64_t(l.clipY)+l.clipH) continue;
                 const uint32_t sx=l.sx+uint32_t((2*(int64_t(x)-l.x)+1)*l.sw/(2*l.w));
                 const uint32_t sy=l.sy+uint32_t((2*(int64_t(y)-l.y)+1)*l.sh/(2*l.h));
-                const uint32_t source=l.texture==redTexture?red[sy*4+sx]:green[sy*4+sx];
+                const uint32_t source=l.texture==redTexture?red[sy*4+sx]:(0x80000000u|((32u+sy*32u)<<8));
                 expected[y*5+x]=over(source,expected[y*5+x],l.opacity);
             }
         }
@@ -3397,10 +3525,10 @@ static bool VirtioGpuSceneSelfTest()
     {
         GpuCmdGuard guard;if (!ResourceControlLocked(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,COMP_CTX_ID,readResource)) return false;
     }
-    if (AppRetireResource(ctx,redResource) || AppRetireResource(ctx,greenResource) || AppRetireResource(ctx,readResource)) return false;
+    if (AppRetireResource(ctx,redResource) || AppRetireResource(ctx,readResource)) return false;
     AppCtxDestroy(ctx);if (AppCtxFind(ctx)) return false;
     VmmFreePages(backing,3);
-    SerialPuts("virtio_gpu: premultiplied scene verified clip/scale/order/opacity/64-layers/clear/desktop/teardown\n");
+    SerialPuts("virtio_gpu: premultiplied scene verified upload/capture/clip/scale/order/opacity/64-layers/clear/desktop/teardown\n");
     return true;
 }
 
@@ -4080,7 +4208,7 @@ static int VirtioGpuModuleInit()
         {
             if (SetupGpuCompositor(g_fbW, g_fbH))
             {
-                const bool ownedCaptureVerified=VirtioGpuOwnedCaptureSelfTest() && VirtioGpuSceneSelfTest();
+                const bool ownedCaptureVerified=VirtioGpuOwnedCaptureSelfTest() && VirtioGpuOwnedUploadSelfTest() && VirtioGpuSceneSelfTest();
                 g_ownedCaptureReady=ownedCaptureVerified;
                 SerialPrintf("virtio_gpu: owned capture self-test -> %s\n",ownedCaptureVerified?"PASS":"FAIL (disabled, uncertain objects retained)");
                 if (ownedCaptureVerified) {
