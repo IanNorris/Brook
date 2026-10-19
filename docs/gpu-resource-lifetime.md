@@ -1048,3 +1048,39 @@ Wayland still needs to create scene descriptors, retain/coalesce committed and
 cached versions, flatten tree order and clipping, preserve synchronized commits,
 and handle detach/disconnect cleanup. This service alone does not establish
 Firefox hardware rendering/audio or browser mixed-workload acceptance.
+
+### Wayland dependency snapshots: component checkpoint
+
+`tools/waylandd-pkg/surface-tree.h` adds a single-event-loop immutable commit
+snapshot engine. This is a tested component, **not yet used by `waylandd.c`**.
+The existing renderer's synchronized-subsurface and hardware child-surface gaps
+therefore remain open; this checkpoint makes no new browser acceptance claim.
+
+Each parent commit retains the exact child states it captured, including nested
+synchronized commits. Newer child updates remain cached until an appropriate
+parent commit captures them. Positions and below/above-parent stacking belong to
+the parent's pending state. Association generations reject old snapshots after
+unlink/reparent, and snapshots retain node/state lifetimes without parent cycles.
+Applying and freeing snapshots use iterative traversal, including deep trees.
+
+Frame callbacks must be owned by the frontend surface, independently of image
+snapshot lifetime, and tagged with the node's monotonic commit sequence. Applying
+a snapshot makes callbacks through its commit number eligible; actual delivery
+remains the frontend's responsibility. This preserves callbacks when replacing
+an unapplied parent snapshot discards an older child image, while keeping newer
+child callbacks ineligible when a grandparent still holds the older dependency.
+The adapter must cancel all callback queues at protocol surface destruction,
+even if retained snapshots defer final node memory reclamation.
+
+Commit allocation failure preserves sequence, current/latest state and child
+caches. Desynchronizing has a deliberately different failure contract: it may
+apply earlier descendants before a later path allocation fails. That failure
+requires fatal client OOM teardown; callers must not retry assuming rollback.
+Sequence and association exhaustion reject further operations without wrapping.
+
+The package check phase includes dependency, synchronization, stacking, callback,
+allocation-failure and 4,096-level lifetime regressions. The component also passes
+Clang AddressSanitizer/UndefinedBehaviorSanitizer checks. Astra reviewed the
+callback replacement and shared older-dependency cases with no remaining blocker.
+Pending integration still includes buffer lifetimes, permanent surface roles,
+scene-backed rendering, cross-scene migration and end-to-end Firefox validation.

@@ -22,6 +22,8 @@ stdenv.mkDerivation {
   doCheck = true;
 
   checkPhase = ''
+    $CC -O2 -UNDEBUG -Wall -Wextra surface-tree-test.c -o surface-tree-test
+    ./surface-tree-test
     $CC -O2 -Wall -Wextra -I${wayland.dev}/include -I. \
         text-input-test.c text-input-v3-protocol.c \
         -L${wayland}/lib -lwayland-server -o text-input-test
