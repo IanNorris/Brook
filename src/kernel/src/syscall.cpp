@@ -2888,8 +2888,9 @@ struct DrmResource {
     DrmResource* retiredNext;
 };
 // Final callbacks only enqueue: GPU waits never enter mapping/FD cleanup locks.
-// Exported sources stay quarantined until owned compositor capture replaces
-// the legacy numeric presentation contract.
+// GEMs, PRIME capabilities, VMAs and capture requests independently own the
+// canonical resource. Last-reference retirement now covers exported buffers,
+// too. An uncertain capture keeps its source lease, so it cannot reach here.
 static KMutex g_drmRetirementLock{};
 static DrmResource* g_drmRetiredResources;
 static DrmResource* g_drmQuarantinedResources;
@@ -2903,14 +2904,13 @@ static void DrmRetirementWorker(void*) {
         g_drmRetiredResources=resource->retiredNext;
         KMutexUnlock(&g_drmRetirementLock);
         const auto* ga=GpuAppGet();
-        const bool exported=__atomic_load_n(&resource->everExported,__ATOMIC_ACQUIRE);
-        const bool retired=!resource->gres || (!exported && ga && ga->RetireResource &&
+        const bool retired=!resource->gres || (ga && ga->RetireResource &&
             ga->RetireResource(resource->owner->ctxId,static_cast<int32_t>(resource->gres))==0);
         if (!retired) {
             __atomic_fetch_add(&g_drmBackingDiagnostics.quarantinedResources,1,__ATOMIC_RELAXED);
             const uint64_t bytes=(static_cast<uint64_t>(resource->backingBytes)+4095)&~uint64_t{4095};
             __atomic_fetch_add(&g_drmBackingDiagnostics.quarantinedPageBytes,bytes,__ATOMIC_RELAXED);
-            if (!exported) __atomic_fetch_add(&g_drmBackingDiagnostics.failedRetirements,1,__ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_drmBackingDiagnostics.failedRetirements,1,__ATOMIC_RELAXED);
             KMutexLock(&g_drmRetirementLock);
             resource->retiredNext=g_drmQuarantinedResources;
             g_drmQuarantinedResources=resource;
@@ -3534,7 +3534,7 @@ void FinalizeClosedFd(const FdClaimResult& c)
     if (c.type == FdType::DevDri && c.handle)
     {
         // Drop file-owned references. Resource retirement runs independently;
-        // exported presentation retirement remains open (see the lifetime doc).
+        // GEM/PRIME/VMA/capture leases independently keep the producer alive.
         auto* dctx = static_cast<DrmCtx*>(c.handle);
         if (__atomic_fetch_sub(&dctx->refCount, 1, __ATOMIC_ACQ_REL) > 1) return;
         for (uint32_t i=0;i<DRM_MAX_GEM;++i)
@@ -6112,8 +6112,8 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         p->resource=g->resource;
         MappingBackingRef(p->resource->lifetime);
         p->refCount=1;
-        // Sticky until owned presentation capture exists: exported resources
-        // cannot be reclaimed while a window may retain their numeric ID.
+        // Sticky authorization for the numeric WM_PRESENT_GRES ABI. Actual
+        // lifetime is owned by GEM/PRIME/VMA/capture references, not this flag.
         __atomic_store_n(&p->resource->everExported,true,__ATOMIC_RELEASE);
         int fd = FdAlloc(proc, FdType::DrmPrime, p);
         if (fd < 0) { DrmPrimeUnref(p);return -EMFILE; }

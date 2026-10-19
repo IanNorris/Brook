@@ -46,7 +46,8 @@ namespace brook {
 // ABI 21 preserves full resource-box coordinates and byte layout in GpuAppOps transfers.
 // ABI 22 adds verified resource retirement to GpuAppOps.
 // ABI 23 adds host-owned captured textures and verified copy completion.
-static constexpr uint32_t MODULE_ABI_VERSION = 23;
+// ABI 24 removes the unleased raw external-resource blit operation.
+static constexpr uint32_t MODULE_ABI_VERSION = 24;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

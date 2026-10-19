@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Guest-only PRIME shared backing, exporter close and mapping lifetime probe.
 
-This checks reference ownership, not reclamation of exported display sources.
-Those remain quarantined until the compositor owns completed frame captures.
+This checks reference ownership. Pair it with host backing-counter checks to
+verify reclamation after the command and every mapping/capability have drained.
 """
 import argparse
 import ctypes
@@ -68,7 +68,7 @@ def main():
             if number==0x47:b[:128]=bytes(128)
         cases['host_roundtrip_after_exporter_close']=b[:128]==expected
 
-        # Legacy presentation must resolve an exported resource capability.
+        # Numeric presentation must resolve an exported resource capability.
         # Use a nonexistent window ID: no real window or pixels are changed.
         private_handle,private_resource=create(target)
         libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
@@ -96,7 +96,7 @@ def main():
         cases['shared_fork_after_exporter_importer_close']=status==0 and b[19]==0xda
         b.close();b=None
         print('GPU_PRIME_LIFETIME_RESULT',json.dumps({'pass':all(cases.values()),
-              'cases':cases,'exported_resource_retirement':'quarantined; not established'}),flush=True)
+              'cases':cases,'exported_resource_retirement':'requires host backing-counter endpoint check'}),flush=True)
         return int(not all(cases.values()))
     finally:
         if a is not None:a.close()

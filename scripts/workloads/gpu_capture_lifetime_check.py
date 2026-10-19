@@ -3,7 +3,8 @@
 
 Run only on an isolated Brook VM. The host must inspect every named phase and
 create the matching file in --control before this bounded command continues.
-Exported backing reclamation is deliberately not asserted.
+This guest half alone does not establish reclamation; the host must also check
+backing counters after the source references have drained.
 """
 import argparse
 import ctypes

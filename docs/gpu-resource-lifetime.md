@@ -4,10 +4,11 @@
 
 The GPU transfer fix and scheduler startup repair are separate from resource
 retirement. Private DRM resources now retire after their last owning reference
-and verified GPU completion. Exported display sources remain quarantined;
-legacy compositor texture destruction and resource-ID recycling remain open. Do not
-reset counters or recycle IDs until the remaining completion rules below are
-implemented.
+and verified GPU completion. Exported display sources now use that same path:
+the compositor retains completed, owned captures rather than their raw resource
+IDs. Uncertain completion still retains its source lease or quarantines the
+resource. Legacy CPU-backed texture destruction remains open; resource IDs
+remain non-recycling. The ABI 24 checkpoint below records the reclamation tests.
 
 Two historical bounded guest probes distinguished different exhaustion paths:
 
@@ -635,3 +636,46 @@ all three offline filesystem checks passed, and nine documents retained their
 hashes and UID/GID. Evidence:
 `build/workloads/gpu-capture-queue-20261019/candidate/acceptance-audit.json`.
 STK/browser simultaneous-use acceptance and main approval remain open.
+
+## Exported backing retirement (ABI 24)
+
+ABI 24 removes the unused, unleased `BlitExternalToTexture` operation and its
+attachment cache. With window presentation using owned captures, the retirement
+worker can retire exported resources after the final GEM, PRIME, VMA and capture
+reference disappears. The sticky export flag continues to authorize numeric
+presentation; it no longer imposes permanent quarantine. A failed retirement
+still quarantines backing and increments the failure counter. Uncertain captures
+retain their source reference and cannot enter last-reference retirement.
+
+Session `d97e7ead9e43436ca62387483d811c12` used eight CPUs, 4 GiB and muted
+hardware EGL GL. The retained-image test independently verified producer
+overwrite, closed every source reference, and checked zero outstanding backing
+before inspecting each published color. GL→SHM→GL and capture while minimized
+passed. The 8,192-resource, mmap/fork, PRIME lifetime and buffer-transfer probes
+each returned to zero outstanding backing with no quarantine or retirement
+failure.
+
+Quake GL3 and Chromium's local video ran together; sampled images showed both
+rendering. Quake closed normally, followed by STK opening its main menu alongside
+Chromium. STK used about 2.1 GiB of live backing; closing it returned the DRM
+backing counters to equality, and Gallery subsequently displayed its own grid.
+This is menu/normal-exit coverage, not a STK race or a paired FPS benchmark.
+After all applications closed, all 20,014 backing mappings were released:
+2,586,910,720 bytes allocated and released, with zero quarantine, failed
+allocations or failed retirements. These counters measure guest backing;
+host GL objects may retain host storage until their objects or contexts retire.
+
+Firefox's local page reported readiness but its hardware-mode window remained
+transparent. This is not accepted as rendered video or audio playback. Static
+inspection found that dmabuf subsurfaces skip capture and release their buffer
+without retaining pixels, unlike SHM subsurfaces. A trace associating Firefox's
+specific committing surface with its parent is still needed. The test image
+also predates the promoted Firefox audio package. Neither issue is resolved by
+the backing-retirement change.
+
+All 51 host suites passed. Twelve guest commands completed with full output and
+no live descendants; all five application launch lineages drained and audio
+streams emptied. Checked guest shutdown, owned launcher/QEMU exit zero, three
+offline filesystem checks and nine unchanged document hashes/owners passed.
+Evidence: `build/workloads/gpu-export-retirement-20261019/candidate/acceptance-audit.json`.
+Broader application acceptance and main approval remain open.

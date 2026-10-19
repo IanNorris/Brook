@@ -2191,39 +2191,6 @@ static void CompUpdateTexture(GpuTexId t, uint32_t x, uint32_t y, uint32_t w, ui
     TransferToHost3D(COMP_CTX_ID, gt->resId, x, y, w, h, gt->w, gt->h);
 }
 
-// Hardware-GL present: host-side BLIT a client's dmabuf-shared render target
-// (`srcGres`) into the window content texture `t`. The source is another
-// context's virgl resource; we attach it to the compositor context so the BLIT
-// can name it, then copy src(0,0..srcW,srcH) -> dst(0,0..gt->w,gt->h). Both are
-// host resources — the copy never touches guest memory. We track the most
-// recently attached external resource to avoid re-attaching every frame.
-static uint32_t g_compExternalAttached = 0;
-static bool CompBlitExternalToTexture(GpuTexId t, uint32_t srcGres,
-                                      uint32_t srcW, uint32_t srcH)
-{
-    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
-    if (!g_compReady || srcGres == 0 || srcW == 0 || srcH == 0) return false;
-    GpuTexture* gt = CompTex(t);
-    if (!gt || gt->owned) return false;
-    // Attach the external resource to the compositor context (idempotent-ish:
-    // re-attaching the same id is cheap, but skip the common repeat case).
-    if (g_compExternalAttached != srcGres)
-    {
-        if (!CtxAttachResource(COMP_CTX_ID, srcGres))
-        {
-            SerialPrintf("virtio_gpu: present attach FAILED gres=%u\n", srcGres);
-            return false;
-        }
-        g_compExternalAttached = srcGres;
-    }
-    // BLIT src(full) -> dst(full). Nearest filter; scales if sizes differ.
-    bool blit = Submit3DBlit(COMP_CTX_ID, gt->resId, 0, 0, gt->w, gt->h,
-                             srcGres, 0, 0, srcW, srcH, /*alphaBlend=*/false);
-    if (!blit)
-        SerialPrintf("virtio_gpu: present blit FAILED gres=%u -> res=%u\n", srcGres, gt->resId);
-    return blit;
-}
-
 static void CompBeginFrame(uint32_t clearArgb)
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
@@ -2980,7 +2947,6 @@ static brook::GpuCaptureResult CompCaptureExternal(GpuTexId id,int32_t producer,
         case brook::GpuCaptureStep::CompositorFence:return AppFenceLocked(COMP_CTX_ID);
         case brook::GpuCaptureStep::DetachSource:
             if (!ResourceControlLocked(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,COMP_CTX_ID,source)) return false;
-            if (g_compExternalAttached==source) g_compExternalAttached=0;
             return true;
         }
         return false;
@@ -3040,7 +3006,6 @@ static const brook::GpuCompositorOps g_gpuCompositorOps = {
     CompCreateTexture,
     CompDestroyTexture,
     CompUpdateTexture,
-    CompBlitExternalToTexture,
     CompBeginFrame,
     CompEndFrame,
     CompGetSize,
