@@ -50,6 +50,7 @@ static int test_ioctl(int fd, unsigned long request, ...)
 static struct wl_resource *buffer(struct wl_client *client, unsigned id, int prime)
 {
     struct brook_dmabuf_buffer *db = calloc(1, sizeof(*db)); assert(db);
+    db->refs = 1;
     db->gres = dmabuf_resolve_gres(prime, &db->bo_handle); assert(db->gres && db->bo_handle);
     struct wl_resource *resource = wl_resource_create(client, &wl_buffer_interface, 1, id); assert(resource);
     wl_resource_set_implementation(resource, &dmabuf_buffer_impl, db, dmabuf_buffer_destroy);
@@ -82,10 +83,46 @@ int main(void)
     fail_alloc = 1; bo = 123;
     assert(dmabuf_resolve_gres(30, &bo) == 0 && bo == 0);
     assert(closes == 5 && !g_dmabuf_imports);
+    /* Pending attachments keep the GEM alias after protocol destruction.
+     * A new import must not reuse that live alias; replacing the attachment
+     * releases it exactly once without touching the unrelated new import. */
+    struct brook_surface surface={0};
+    surface.resource=wl_resource_create(client,&wl_surface_interface,4,0);assert(surface.resource);
+    wl_resource_set_user_data(surface.resource,&surface);
+    struct wl_resource *pending=buffer(client,6,10);
+    unsigned before=closes;
+    uint32_t held_bo=((struct brook_dmabuf_buffer *)wl_resource_get_user_data(pending))->bo_handle;
+    surface_attach(client,surface.resource,pending,0,0);
+    wl_resource_destroy(pending);
+    assert(surface.pending_buffer && !surface.pending_buffer->resource);
+    assert(surface.pending_buffer->dmabuf->refs==1 && closes==before && live[held_bo]==100);
+    struct wl_resource *other=buffer(client,7,20);
+    uint32_t other_bo=((struct brook_dmabuf_buffer *)wl_resource_get_user_data(other))->bo_handle;
+    assert(other_bo!=held_bo);
+    surface_attach(client,surface.resource,NULL,0,0);
+    assert(!surface.pending_buffer && closes==before+1 && !live[held_bo] && live[other_bo]==200);
+    wl_resource_destroy(other);assert(closes==before+2);
+    wl_resource_destroy(surface.resource);
+    /* Destroying the surface with a still-pending attachment is balanced in
+     * both resource-destruction orders, including a deferred final GEM close. */
+    for (int early=0;early<2;++early) {
+        struct brook_surface *dying=calloc(1,sizeof(*dying));assert(dying);
+        wl_list_init(&dying->pending_frames);wl_list_init(&dying->committed_frames);
+        dying->resource=wl_resource_create(client,&wl_surface_interface,4,0);assert(dying->resource);
+        wl_resource_set_implementation(dying->resource,&surface_impl,dying,surface_destroy_userdata);
+        struct wl_resource *attached=buffer(client,0,10);
+        uint32_t attached_bo=((struct brook_dmabuf_buffer *)wl_resource_get_user_data(attached))->bo_handle;
+        unsigned old_closes=closes;
+        surface_attach(client,dying->resource,attached,0,0);
+        if (early) wl_resource_destroy(attached);
+        wl_resource_destroy(dying->resource);
+        if (!early) { assert(closes==old_closes && live[attached_bo]==100);wl_resource_destroy(attached); }
+        assert(closes==old_closes+1 && !live[attached_bo]);
+    }
     /* Client disconnect must release one shared handle exactly once. */
     buffer(client, 6, 10); buffer(client, 7, 11);
     wl_client_destroy(client);
-    assert(closes == 6 && !g_dmabuf_imports);
+    assert(closes == 10 && !g_dmabuf_imports);
     for (unsigned i = 1; i < 8; ++i) assert(!live[i]);
     wl_display_destroy(display); close(sockets[1]);
     puts("DMABUF_IMPORT_OWNERSHIP_PASS shared/reuse/info-failure/OOM/disconnect");

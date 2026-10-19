@@ -22,26 +22,30 @@ static long test_syscall(long number, ...)
     assert(number == BROOK_SYS_WM_PRESENT_GRES);++calls;
     errno=result_errno;return result;
 }
-static void check(long rc,int error,int safe)
+static void check(long rc,int error,int safe,int destroy_early)
 {
     int sockets[2];assert(!socketpair(AF_UNIX,SOCK_STREAM,0,sockets));
     struct wl_display *display=wl_display_create();assert(display);
     struct wl_client *client=wl_client_create(display,sockets[0]);assert(client);
-    struct brook_dmabuf_buffer db={0};db.width=db.height=4;db.gres=65536;
-    struct wl_resource *buffer=wl_resource_create(client,&wl_buffer_interface,1,0);assert(buffer);
-    wl_resource_set_implementation(buffer,&dmabuf_buffer_impl,&db,NULL);
+    struct brook_dmabuf_buffer *db=calloc(1,sizeof(*db));assert(db);
+    db->refs=1;db->width=db->height=4;db->gres=65536;
+    struct wl_resource *buffer=wl_resource_create(client,&wl_buffer_interface,1,2);assert(buffer);
+    wl_resource_set_implementation(buffer,&dmabuf_buffer_impl,db,dmabuf_buffer_destroy);
     const uint32_t buffer_id=wl_resource_get_id(buffer);
     struct brook_surface surface={0};
     wl_list_init(&surface.pending_frames);wl_list_init(&surface.committed_frames);
     surface.resource=wl_resource_create(client,&wl_surface_interface,4,0);assert(surface.resource);
     wl_resource_set_user_data(surface.resource,&surface);
     surface.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,0);assert(surface.xdg_toplevel);
-    surface.xdg_initial_commit_done=surface.xdg_acked=1;surface.wm_id=1;surface.pending_buffer=buffer;
+    surface.xdg_initial_commit_done=surface.xdg_acked=1;surface.wm_id=1;surface_attach(client,surface.resource,buffer,0,0);
+    if (destroy_early) { wl_resource_destroy(buffer);assert(!surface.pending_buffer->resource); }
     result=rc;result_errno=error;calls=0;
     surface_commit(client,surface.resource);
     assert(calls==1 && !surface.pending_buffer);
     wl_display_flush_clients(display);
-    uint32_t wire[256];ssize_t n=recv(sockets[1],wire,sizeof(wire),MSG_DONTWAIT);assert(n>0);
+    uint32_t wire[256];ssize_t n=recv(sockets[1],wire,sizeof(wire),MSG_DONTWAIT);
+    if (n<0) { assert(destroy_early && safe && errno==EAGAIN);n=0; }
+    else assert(n>0);
     int releases=0,errors=0;
     for (size_t i=0;i<(size_t)n/4;) {
         uint32_t id=wire[i],op=wire[i+1]&65535,size=wire[i+1]>>16;
@@ -50,12 +54,13 @@ static void check(long rc,int error,int safe)
         if (id==1 && op==WL_DISPLAY_ERROR) ++errors;
         i+=size/4;
     }
-    assert(releases==safe && errors==!safe);
+    assert(releases==(safe && !destroy_early) && errors==!safe);
     wl_client_destroy(client);close(sockets[1]);wl_display_destroy(display);
 }
 int main(void)
 {
-    check(0,0,1);check(-116,0,1);check(-1,EINVAL,1);
-    check(-EIO,0,0);check(-1,EIO,0);
+    check(0,0,1,0);check(-116,0,1,0);check(-1,EINVAL,1,0);
+    check(-EIO,0,0,0);check(-1,EIO,0,0);
+    check(0,0,1,1);check(-1,EIO,0,1);
     puts("CAPTURE_RELEASE_PASS published/discarded release; raw/libc uncertain errors never release");
 }

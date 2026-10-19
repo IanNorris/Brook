@@ -122,8 +122,20 @@ int main(void) {
     uint32_t repositioned = configure_serial(display, sockets[1], wl_resource_get_id(popup.xdg_surface));
     assert(repositioned > popup_initial);
 
+    /* A committed attachment owns the SHM storage, independently of both
+     * protocol resources. Destroying the buffer/pool before commit must not
+     * turn a valid pending attachment into NULL or a dangling wl_resource. */
+    for (unsigned i=0;i<4;++i) pixels[i]=0x00aabbcc;
+    surface_attach(client,surface.resource,server_buffer,0,0);
+    assert(surface.pending_buffer && surface.pending_buffer->resource==server_buffer);
+    wl_buffer_destroy(buffer);wl_shm_pool_destroy(pool);requests(connection,loop);
+    assert(surface.pending_buffer && !surface.pending_buffer->resource && surface.pending_buffer->shm);
+    surface_commit(client,surface.resource);
+    assert(!surface.pending_buffer && vfb[0]==0xffaabbcc && vfb[3]==0xffaabbcc);
     free(surface.image); free(surface.composite);
+    puts("SHM_ATTACHMENT_LIFETIME_PASS buffer/pool destruction before commit retains pixels");
     munmap(pixels, 16); close(fd);
+    wl_shm_destroy(client_shm);client_shm=NULL;wl_registry_destroy(registry);
     wl_display_disconnect(connection); wl_client_destroy(client); wl_display_destroy(display);
     return 0;
 }

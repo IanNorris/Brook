@@ -201,12 +201,54 @@ struct brook_positioner {
  * host virgl resource id we resolved it to. Defined here (before surface_commit)
  * so the commit handler can read its fields. */
 struct brook_dmabuf_buffer {
+    unsigned refs;
     int32_t  width, height;
     uint32_t stride, fourcc;
     uint32_t gres;        /* resolved host virgl resource id (0 = unresolved) */
     uint32_t bo_handle;   /* our DRM GEM alias of the imported resource */
 };
 static int is_dmabuf_buffer(struct wl_resource *buf);
+
+/* Protocol resource lifetime is independent of a pending/retained attachment.
+ * SHM holds its pool through libwayland; dmabuf holds the import-cache GEM.
+ * The destroy listener only invalidates the event destination. */
+static void dmabuf_buffer_unref(struct brook_dmabuf_buffer *);
+struct brook_buffer {
+    struct wl_resource *resource;
+    struct wl_listener destroy;
+    struct wl_shm_buffer *shm;
+    struct brook_dmabuf_buffer *dmabuf;
+    unsigned refs;
+};
+static void buffer_resource_destroyed(struct wl_listener *listener,void *data) {
+    (void)data;
+    struct brook_buffer *buffer=wl_container_of(listener,buffer,destroy);
+    wl_list_remove(&buffer->destroy.link);wl_list_init(&buffer->destroy.link);
+    buffer->resource=NULL;
+}
+static struct brook_buffer *buffer_hold(struct wl_resource *resource) {
+    struct wl_shm_buffer *shm=wl_shm_buffer_get(resource);
+    struct brook_dmabuf_buffer *db=is_dmabuf_buffer(resource)?wl_resource_get_user_data(resource):NULL;
+    if (!shm && !db) { errno=EINVAL;return NULL; }
+    struct brook_buffer *buffer=calloc(1,sizeof(*buffer));
+    if (!buffer) { errno=ENOMEM;return NULL; }
+    buffer->refs=1;buffer->resource=resource;buffer->shm=shm;buffer->dmabuf=db;
+    if (shm) wl_shm_buffer_ref(shm);
+    if (db) ++db->refs;
+    buffer->destroy.notify=buffer_resource_destroyed;
+    wl_resource_add_destroy_listener(resource,&buffer->destroy);
+    return buffer;
+}
+static void buffer_drop(struct brook_buffer *buffer) {
+    if (!buffer || --buffer->refs) return;
+    if (buffer->resource) wl_list_remove(&buffer->destroy.link);
+    if (buffer->shm) wl_shm_buffer_unref(buffer->shm);
+    if (buffer->dmabuf) dmabuf_buffer_unref(buffer->dmabuf);
+    free(buffer);
+}
+static void buffer_release(struct brook_buffer *buffer) {
+    if (buffer && buffer->resource) wl_buffer_send_release(buffer->resource);
+}
 
 struct brook_frame_callback {
     struct wl_resource *resource;
@@ -218,7 +260,7 @@ struct brook_frame_callback {
 
 struct brook_surface {
     struct wl_resource *resource;
-    struct wl_resource *pending_buffer;
+    struct brook_buffer *pending_buffer;
     int pending_attach;
     /* Own committed SHM pixels after releasing the client's buffer. Never use
      * the shared kernel VFB as the backing store for a surface tree. */
@@ -392,9 +434,16 @@ static void surface_destroy(struct wl_client *c, struct wl_resource *r) {
 }
 static void surface_attach(struct wl_client *c, struct wl_resource *r,
                            struct wl_resource *buffer, int32_t x, int32_t y) {
-    (void)c; (void)x; (void)y;
+    (void)x; (void)y;
     struct brook_surface *s = wl_resource_get_user_data(r);
-    s->pending_buffer = buffer;
+    struct brook_buffer *next=buffer?buffer_hold(buffer):NULL;
+    if (buffer && !next) {
+        if (errno==ENOMEM) wl_client_post_no_memory(c);
+        else wl_client_post_implementation_error(c,"unsupported Brook buffer type");
+        return;
+    }
+    buffer_drop(s->pending_buffer);
+    s->pending_buffer = next;
     s->pending_attach = 1;
 }
 static void surface_damage(struct wl_client *c, struct wl_resource *r,
@@ -652,8 +701,8 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
      * zwp_linux_dmabuf_v1). Lazily create the kernel Window (sized from the
      * dmabuf), then present the resolved host resource via WM_PRESENT_GRES so the
      * compositor BLITs it into the window content texture (zero CPU copy). */
-    if (is_dmabuf_buffer(s->pending_buffer)) {
-        struct brook_dmabuf_buffer *db = wl_resource_get_user_data(s->pending_buffer);
+    if (s->pending_buffer->dmabuf != NULL) {
+        struct brook_dmabuf_buffer *db = s->pending_buffer->dmabuf;
         int dw = db ? db->width  : 0;
         int dh = db ? db->height : 0;
         if (s->subsurface_parent && !s->dmabuf_subsurface_reported) {
@@ -714,21 +763,21 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                      * independent source lease until device reset. */
                     wl_client_post_implementation_error(c,
                         "Brook GPU capture completion is uncertain");
-                    s->pending_buffer = NULL;
+                    buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
                     return;
                 }
             }
         }
-        wl_buffer_send_release(s->pending_buffer);
-        s->pending_buffer = NULL;
+        buffer_release(s->pending_buffer);
+        buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
         return;
     }
 
-    struct wl_shm_buffer *shm = wl_shm_buffer_get(s->pending_buffer);
+    struct wl_shm_buffer *shm = s->pending_buffer->shm;
     if (!shm) {
         fprintf(stderr, "[waylandd] commit: buffer is not wl_shm\n");
-        wl_buffer_send_release(s->pending_buffer);
-        s->pending_buffer = NULL;
+        buffer_release(s->pending_buffer);
+        buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
         return;
     }
 
@@ -768,8 +817,8 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
                     nonzero, dw*dh, (const void*)pixels, src_stride);
             wl_shm_buffer_end_access(shm);
         }
-        wl_buffer_send_release(s->pending_buffer);
-        s->pending_buffer = NULL;
+        buffer_release(s->pending_buffer);
+        buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
         return;
     }
 
@@ -782,14 +831,14 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
     wl_shm_buffer_end_access(shm);
     if (!copied) {
         wl_client_post_no_memory(c);
-        wl_buffer_send_release(s->pending_buffer);
-        s->pending_buffer = NULL;
+        buffer_release(s->pending_buffer);
+        buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
         return;
     }
     if (s->subsurface_parent) {
         surface_repaint(s);
-        wl_buffer_send_release(s->pending_buffer);
-        s->pending_buffer = NULL;
+        buffer_release(s->pending_buffer);
+        buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
         return;
     }
 
@@ -866,8 +915,8 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
 
     ++g_commit_count;
 
-    wl_buffer_send_release(s->pending_buffer);
-    s->pending_buffer = NULL;
+    buffer_release(s->pending_buffer);
+    buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
 
 }
 
@@ -935,6 +984,7 @@ static void surface_destroy_userdata(struct wl_resource *r) {
         ch = next_ch;
     }
     if (s->subsurface_resource) wl_resource_set_user_data(s->subsurface_resource, NULL);
+    buffer_drop(s->pending_buffer);
     surface_clear_image(s);
     free(s->composite);
     if (s->wm_id) wm_destroy_window(s->wm_id);
@@ -1489,7 +1539,7 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
 
         /* If buffer is already attached, upload immediately */
         if (cs && cs->pending_buffer) {
-            struct wl_shm_buffer *shm = wl_shm_buffer_get(cs->pending_buffer);
+            struct wl_shm_buffer *shm = cs->pending_buffer->shm;
             if (shm) {
                 fprintf(stderr, "[waylandd] set_cursor: buf attached, uploading immediately\n");
                 int32_t w = wl_shm_buffer_get_width(shm);
@@ -2691,13 +2741,16 @@ static uint32_t dmabuf_resolve_gres(int fd, uint32_t *out_bo)
     return ri.res_handle;
 }
 
-static void dmabuf_buffer_destroy(struct wl_resource *r)
+static void dmabuf_buffer_unref(struct brook_dmabuf_buffer *db)
 {
-    struct brook_dmabuf_buffer *db = wl_resource_get_user_data(r);
-    if (db) {
+    if (db && !--db->refs) {
         if (db->bo_handle) dmabuf_release_bo(db->bo_handle);
         free(db);
     }
+}
+static void dmabuf_buffer_destroy(struct wl_resource *r)
+{
+    dmabuf_buffer_unref(wl_resource_get_user_data(r));
 }
 static void dmabuf_buffer_destroy_req(struct wl_client *c, struct wl_resource *r)
 { (void)c; wl_resource_destroy(r); }
@@ -2745,7 +2798,7 @@ params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
     }
     struct brook_dmabuf_buffer *db = calloc(1, sizeof(*db));
     if (!db) { wl_client_post_no_memory(c); return NULL; }
-    db->width = width; db->height = height;
+    db->refs = 1;db->width = width; db->height = height;
     db->stride = p->stride; db->fourcc = format;
     db->gres = dmabuf_resolve_gres(p->fd, &db->bo_handle);
     close(p->fd); p->fd = -1;   /* the import cache now holds the GEM reference */

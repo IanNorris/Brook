@@ -1133,3 +1133,40 @@ owned launcher/QEMU exit zero, all three offline filesystem checks and nine
 preserved document hashes/owners passed. All 52 host suites and supported
 compiled entry/startup audits passed. Evidence:
 `build/workloads/gpu-scene-clone-20261019/verified/acceptance-audit.json`.
+
+### Wayland attachment storage outlives protocol buffers
+
+The production frontend now retains pending buffer storage independently of the
+`wl_buffer` resource. A SHM attachment uses libwayland's buffer reference, keeping
+its pool mapping valid even after both buffer and pool protocol destruction. A
+dmabuf attachment retains its imported buffer object and the existing shared GEM
+import-cache ownership. A destroy listener clears only the release-event target.
+Replacement acquires its new attachment before dropping the old one; commit,
+cursor, error and surface destruction consume the retained attachment safely.
+
+Release events are sent only to a still-live buffer resource. Uncertain GPU
+capture still sends no release; dropping the frontend attachment on that fatal
+path is safe because the kernel retains its independent source lease. This
+change removes a borrowed-resource lifetime hazard but does not yet integrate
+scene images or synchronized tree rendering.
+
+The real-libwayland fixtures verify SHM buffer/pool destruction before commit,
+dmabuf destruction before commit/replacement, import non-reuse while attached,
+both pending-surface/buffer destruction orders, and uncertain capture with and
+without a surviving protocol resource. All seven package checks pass, including
+memory/undefined-behaviour sanitizers with leak detection. The sanitizer run also
+caught and removed an existing test fixture's undeleted client proxies. Astra
+found no remaining attachment-lifetime blocker.
+
+In isolated GPU session `904f2ad5644042b799bc9616a85eed03`, Quake GL3 at
+1280×720 advanced through three captured demo frames, and Mousepad rendered its
+SHM editor window. Both UI launch lineages drained after close. The inspected
+screenshots show intact content; this short run makes no comparative-performance
+or audible-music claim. The final package differs from the staged package only
+in test fixtures, with identical deployed/tested `waylandd` binary hashes.
+
+All 2,332 tracked backing mappings (66,125,824 bytes) were released, without
+allocation/retirement failure or quarantine; audio streams emptied. Checked
+shutdown, owned launcher/QEMU exit zero, all three offline filesystem checks and
+nine preserved document hashes/owners passed. Evidence:
+`build/workloads/wayland-owned-buffer-20261019/candidate/acceptance-audit.json`.
