@@ -53,6 +53,7 @@ enum class FdType : uint8_t
     DevDri,        // /dev/dri/renderD128 — virtio-gpu DRM render node (GL shim)
     DrmPrime,      // DRM PRIME dmabuf handle — a capability wrapping a shared virgl resource (gres)
     DebugSerial,   // Direct debug UART output; initially fd 3, preserved by dup/fork
+    CompositorScene, // Scene capability; fd aliases own a shared close handle
 };
 
 struct FdEntry

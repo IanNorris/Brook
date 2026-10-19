@@ -347,6 +347,10 @@ struct WmContentSnapshot {
 // All publication checks hold the same lock as SHM, resize and destruction.
 // Reserving a newer request does not invalidate the last published frame.
 bool WmReserveCapture(Process*,uint32_t wmId,uint32_t w,uint32_t h,WmCaptureToken*);
+bool WmGetCaptureBinding(Process*,uint32_t wmId,WmCaptureToken*);
+// Scene capability already checked by the scene service. Bind to the original
+// incarnation; fd transfer must never grant access to a reused window slot.
+bool WmReserveBoundCapture(const WmCaptureToken& binding,uint32_t w,uint32_t h,WmCaptureToken*);
 bool WmCaptureCurrent(const WmCaptureToken&);
 bool WmCompleteCapture(const WmCaptureToken&);
 WmContentSnapshot WmSnapshotContent(uint32_t slot);

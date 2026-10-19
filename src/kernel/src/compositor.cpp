@@ -1,6 +1,7 @@
 #include "scene_damage.h"
 #include "desktop_pointer_route.h"
 #include "compositor.h"
+#include "compositor_scene.h"
 #include "cursor_composition.h"
 #include "spinlock.h"
 #include "memory/mapping_fault_test.h"
@@ -509,6 +510,7 @@ struct WinTexEntry {
     GpuTexId tex; uint32_t* vfb; uint32_t w,h; bool alpha,owned;
     uint64_t incarnation,generation;
     GpuTexId staging; uint32_t stagingW,stagingH;
+    bool premultiplied,stagingAlpha;
 };
 static WinTexEntry g_winTex[WM_MAX_WINDOWS] = {};
 
@@ -612,12 +614,13 @@ static void DrainOwnedCaptures()
             WmCaptureCurrent(request->token)) {
             auto& entry=g_winTex[request->token.wmId-1];
             const auto& token=request->token;
-            if (entry.staging && (entry.stagingW!=token.w || entry.stagingH!=token.h)) {
+            if (entry.staging && (entry.stagingW!=token.w || entry.stagingH!=token.h || entry.stagingAlpha)) {
                 gpu->DestroyOwnedTexture(entry.staging);entry.staging=0;
             }
             if (!entry.staging) {
                 entry.staging=gpu->CreateOwnedTexture(token.w,token.h,false);
                 entry.stagingW=token.w;entry.stagingH=token.h;
+                entry.stagingAlpha=false;
             }
             if (!entry.staging) result=-12;
             else {
@@ -634,12 +637,13 @@ static void DrainOwnedCaptures()
                     KMutexUnlock(&g_captureLock);
                     if (publish && WmCompleteCapture(token)) {
                         const GpuTexId old=entry.tex;
-                        const bool reusable=entry.owned && entry.w==token.w && entry.h==token.h;
+                        const bool reusable=entry.owned && !entry.alpha && entry.w==token.w && entry.h==token.h;
                         if (old && !reusable) {
                             if (entry.owned) gpu->DestroyOwnedTexture(old);else gpu->DestroyTexture(old);
                         }
                         entry.tex=entry.staging;entry.w=token.w;entry.h=token.h;
                         entry.vfb=nullptr;entry.alpha=false;entry.owned=true;
+                        entry.premultiplied=false;
                         entry.incarnation=token.incarnation;entry.generation=token.generation;
                         entry.staging=reusable?old:0;
                         result=0;
@@ -656,6 +660,42 @@ static void DrainOwnedCaptures()
     }
 }
 
+GpuCaptureResult CompositorBuildSceneRoot(const WmCaptureToken& token,const GpuSceneLayer* layers,uint32_t count)
+{
+    const auto* gpu=GpuCompositorGet();
+    if (!CompositorGpuActive() || !gpu || !gpu->ComposeOwnedLayers || !WmCaptureCurrent(token))
+        return GpuCaptureResult::Rejected;
+    auto& entry=g_winTex[token.wmId-1];
+    if (entry.staging && (entry.stagingW!=token.w || entry.stagingH!=token.h || !entry.stagingAlpha)) {
+        gpu->DestroyOwnedTexture(entry.staging);entry.staging=0;
+    }
+    if (!entry.staging) {
+        entry.staging=gpu->CreateOwnedTexture(token.w,token.h,true);
+        entry.stagingW=token.w;entry.stagingH=token.h;entry.stagingAlpha=true;
+    }
+    if (!entry.staging) return GpuCaptureResult::Rejected;
+    const auto result=gpu->ComposeOwnedLayers(entry.staging,layers,count);
+    if (result==GpuCaptureResult::Uncertain) entry.staging=0;
+    return result;
+}
+bool CompositorPublishSceneRoot(const WmCaptureToken& token,SceneRetiredRoot& retired)
+{
+    retired={};auto& entry=g_winTex[token.wmId-1];
+    if (!entry.staging || !WmCompleteCapture(token)) return false;
+    const auto old=entry.tex;
+    const bool reuse=entry.owned && entry.alpha && entry.w==token.w && entry.h==token.h;
+    if (old && !reuse) retired={old,entry.owned};
+    entry.tex=entry.staging;entry.w=token.w;entry.h=token.h;entry.vfb=nullptr;
+    entry.owned=entry.alpha=entry.premultiplied=true;
+    entry.incarnation=token.incarnation;entry.generation=token.generation;
+    entry.staging=reuse?old:0;entry.stagingW=token.w;entry.stagingH=token.h;entry.stagingAlpha=true;
+    return true;
+}
+void CompositorRetireSceneRoot(const SceneRetiredRoot& retired)
+{
+    const auto* gpu=GpuCompositorGet();if (!gpu || !retired.texture) return;
+    if (retired.owned) gpu->DestroyOwnedTexture(retired.texture);else gpu->DestroyTexture(retired.texture);
+}
 
 bool CompositorGpuActive()
 {
@@ -2895,7 +2935,9 @@ static void GpuDrawWindowContent(const GpuCompositorOps* gpu, const Window* w,
     if (cdx + cdw > scrW) cdw = scrW - cdx;
     if (cdy + cdh > scrH) cdh = scrH - cdy;
     if (cdw == 0 || cdh == 0) return;
-    GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, e.alpha, opacity);
+    if (e.premultiplied)
+        gpu->DrawPremultipliedQuad(e.tex,0,0,e.w,e.h,cdx,cdy,cdw,cdh,opacity);
+    else GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, e.alpha, opacity);
 }
 
 static void EnsureDesktopTex(const GpuCompositorOps* gpu)
@@ -3443,6 +3485,7 @@ static void CompositorThreadFn(void* /*arg*/)
     {
         if (!g_compositorHalted) {
             DrainOwnedCaptures();
+            CompositorDrainScenes();
             CompositorLoop();
         }
 

@@ -2774,12 +2774,27 @@ bool WmReserveCapture(Process* proc,uint32_t wmId,uint32_t width,uint32_t height
     *out={wmId,width,height,win->creationIdentity,++win->publicationGeneration};
     return true;
 }
+bool WmGetCaptureBinding(Process* proc,uint32_t wmId,WmCaptureToken* out)
+{
+    VfbGuard guard;auto* win=WmFindWindowById(proc,wmId);
+    if (!win || !out) return false;
+    *out={wmId,1,1,win->creationIdentity,win->publicationGeneration};return true;
+}
 static Window* CaptureWindowLocked(const WmCaptureToken& token)
 {
     if (!token.wmId || token.wmId>WM_MAX_WINDOWS) return nullptr;
     auto& win=g_windows[token.wmId-1];
     return win.proc && win.creationIdentity==token.incarnation &&
            win.publicationGeneration==token.generation ? &win : nullptr;
+}
+bool WmReserveBoundCapture(const WmCaptureToken& binding,uint32_t width,uint32_t height,WmCaptureToken* out)
+{
+    VfbGuard guard;
+    if (!out || !width || !height || !binding.wmId || binding.wmId>WM_MAX_WINDOWS) return false;
+    auto& win=g_windows[binding.wmId-1];
+    if (!win.proc || win.creationIdentity!=binding.incarnation || win.publicationGeneration>=~uint64_t{0}-1)
+        return false;
+    *out={binding.wmId,width,height,win.creationIdentity,++win.publicationGeneration};return true;
 }
 bool WmCaptureCurrent(const WmCaptureToken& token)
 {

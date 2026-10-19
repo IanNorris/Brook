@@ -35,6 +35,11 @@ int main() {
     CHECK(slot==0);auto& window=g_windows[slot];
     CHECK(!window.externalCaptured && !window.externalW && !window.externalH);
     const uint32_t id=window.wmId;
+    WmCaptureToken binding{};
+    const auto bindingGeneration=window.publicationGeneration;
+    CHECK(WmGetCaptureBinding(owner,id,&binding));
+    CHECK(binding.incarnation==window.creationIdentity && window.publicationGeneration==bindingGeneration);
+    CHECK(!WmGetCaptureBinding(stranger,id,&binding));
     WmCaptureToken first{};
     CHECK(WmReserveCapture(owner,id,1280,720,&first));
     CHECK(!window.externalCaptured && !window.vfbDirty);
@@ -71,6 +76,7 @@ int main() {
     CHECK(WmCreateWindow(stranger,10,10,640,480,"Chromium SHM",1,false)==slot);
     CHECK(!window.externalCaptured && !window.externalW && !window.externalH);
     CHECK(!WmReserveCapture(owner,id,640,480,&rejected));
+    CHECK(!WmReserveBoundCapture(binding,640,480,&rejected));
     CHECK(!WmCompleteCapture(b));
     WmSignalDirtyById(stranger,id);CHECK(window.vfbDirty);
     CHECK(!lockDepth);

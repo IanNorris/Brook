@@ -380,3 +380,6 @@ set_tests_properties(test_shutdown PROPERTIES TIMEOUT 15)
 
 add_host_test(test_gpu_scene)
 target_sources(test_gpu_scene PRIVATE ../test_gpu_scene/versions.cpp)
+target_sources(test_gpu_scene PRIVATE ../test_gpu_scene/service.cpp)
+target_compile_options(test_gpu_scene PRIVATE -DBROOK_HOST_TEST -Wno-unused-parameter -Wno-attributes
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")

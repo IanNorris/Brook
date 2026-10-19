@@ -129,7 +129,7 @@ public:
             if (!entry || entry->state!=SceneVersionState::Published) return false;
             uint32_t occurrences=0;
             for (uint32_t j=0;j<count;++j) if (versions[i]==versions[j]) ++occurrences;
-            if (entry->pins>UINT32_MAX-occurrences) return false;
+            if (entry->pins>~uint32_t{0}-occurrences) return false;
         }
         for (uint32_t i=0;i<count;++i) ++Find(versions[i])->pins;
         return true;

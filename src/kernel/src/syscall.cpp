@@ -43,6 +43,7 @@
 #include "memory/object_cache.h"
 #include "epoll_diagnostics.h"
 #include "compositor.h"
+#include "compositor_scene.h"
 #include "window.h"
 #include "gpu_app.h"
 #include "gpu_compositor.h"
@@ -1316,6 +1317,10 @@ struct UnixSocketData {
     uint64_t peerIncarnation,peerLaunchId;
     bool acceptedEndpoint; // Only accept(), never connect() or socketpair().
     char    path[108];
+    // Routing path may become the server's name during connect. Preserve the
+    // locally bound address separately for getsockname and accepted endpoints.
+    uint8_t localAddress[110];
+    uint32_t localAddressLength;
     UnixPendingConn pending[UNIX_ACCEPT_QUEUE];
     int             pendingCount;
     Process*        acceptWaiter;
@@ -3495,6 +3500,8 @@ void FinalizeClosedFd(const FdClaimResult& c)
 
     if (c.type == FdType::DrmPrime && c.handle)
         DrmPrimeUnref(static_cast<DrmPrimeObj*>(c.handle));
+    if (c.type == FdType::CompositorScene && c.handle)
+        SceneHandleUnref(static_cast<SceneHandle*>(c.handle));
 
     if (c.type == FdType::EpollFd && c.handle)
         EpollFdUnref(static_cast<EpollInstance*>(c.handle));
@@ -3724,6 +3731,9 @@ static void FdBumpRefcount(FdEntry* fde)
         break;
     case FdType::DrmPrime:
         DrmPrimeRef(static_cast<DrmPrimeObj*>(fde->handle));
+        break;
+    case FdType::CompositorScene:
+        SceneHandleRef(static_cast<SceneHandle*>(fde->handle));
         break;
     case FdType::EpollFd:
         EpollFdRef(static_cast<EpollInstance*>(fde->handle));
@@ -11239,6 +11249,88 @@ static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
                                            resource->owner->ctxId,resource->gres,resource->format);
 }
 
+// 0xB06/0xB07: capability-based retained scenes. See gpu_scene_abi.h.
+static int64_t sys_brook_scene_create(uint64_t window,uint64_t abi,uint64_t flags,
+                                      uint64_t a,uint64_t b,uint64_t c)
+{
+    auto* proc=ProcessCurrent();if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if (!window || window>WM_MAX_WINDOWS || abi!=SCENE_ABI_VERSION || flags || a || b || c) return -EINVAL;
+    int error=0;auto* handle=SceneCreate(proc,static_cast<uint32_t>(window),&error);
+    if (!handle) return error;
+    FdEntry owned{};owned.type=FdType::CompositorScene;owned.handle=handle;owned.fdFlags=1;
+    SceneHandleRef(handle); // FD publication owns a reference independently of this call.
+    const int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+    if (fd<0) { SceneHandleUnref(handle);SceneHandleUnref(handle);return fd; }
+    const bool activated=SceneActivate(handle);
+    if (!activated) {
+        // The published slot may already have been closed/reused by a sibling.
+        // Retain the constructor handle while comparing, then pin the exact
+        // slot so rollback cannot close an unrelated replacement descriptor.
+        FdRef published(proc,fd);
+        if (published && published->type==FdType::CompositorScene && published->handle==handle)
+            CloseProcessFd(proc,fd);
+        SceneHandleUnref(handle);return -116;
+    }
+    SceneHandleUnref(handle);
+    return fd;
+}
+static int64_t sys_brook_scene_ctl(uint64_t fd,uint64_t op,uint64_t arg,uint64_t size,
+                                   uint64_t flags,uint64_t reserved)
+{
+    auto* proc=ProcessCurrent();if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if (fd>=MAX_FDS) return -EBADF;
+    if (flags || reserved) return -EINVAL;
+    FdRef ref(proc,static_cast<int>(fd));
+    if (!ref || ref->type!=FdType::CompositorScene || !ref->handle) return -EBADF;
+    auto* handle=static_cast<SceneHandle*>(ref->handle);
+    if (op==SCENE_CTL_STATS) {
+        if (size!=sizeof(SceneStatsDesc)) return -EINVAL;
+        SceneStatsDesc stats{};SceneGetStats(handle,stats);
+        return CopyToUser(arg,&stats,sizeof(stats))?0:-EFAULT;
+    }
+    if (op==SCENE_CTL_RELEASE) {
+        if (size) return -EINVAL;
+        return SceneRelease(handle,arg);
+    }
+    if (op==SCENE_CTL_UPLOAD) {
+        if (size!=sizeof(SceneUploadDesc)) return -EINVAL;
+        SceneUploadDesc desc{};if (!CopyFromUser(&desc,arg,sizeof(desc))) return -EFAULT;
+        return SceneUpload(proc,handle,desc);
+    }
+    if (op==SCENE_CTL_CAPTURE) {
+        if (size!=sizeof(SceneCaptureDesc)) return -EINVAL;
+        SceneCaptureDesc desc{};if (!CopyFromUser(&desc,arg,sizeof(desc))) return -EFAULT;
+        if (desc.reserved) return -EINVAL;
+        FdRef drm(proc,desc.drmFd);
+        if (!drm || drm->type!=FdType::DevDri || !drm->handle) return -EBADF;
+        MappingBackingGuard lease;
+        int32_t producer;uint32_t resource,format;
+        {
+            auto* context=static_cast<DrmCtx*>(drm->handle);DrmMappingGuard guard(context);
+            auto* gem=DrmGemGet(context,desc.gem);
+            if (!gem || gem->resource->target!=2 || !GpuCaptureFormatSupported(gem->resource->format) ||
+                desc.width>gem->resource->width || desc.height>gem->resource->height) return -EINVAL;
+            auto* image=gem->resource;MappingBackingRef(image->lifetime);lease.value=image->lifetime;
+            producer=image->owner->ctxId;resource=image->gres;format=image->format;
+        }
+        return SceneCapture(proc,handle,desc,lease.value,producer,resource,format);
+    }
+    if (op==SCENE_CTL_PRESENT) {
+        if (size!=sizeof(ScenePresentDesc)) return -EINVAL;
+        ScenePresentDesc desc{};if (!CopyFromUser(&desc,arg,sizeof(desc))) return -EFAULT;
+        if (desc.reserved || desc.count>GPU_SCENE_MAX_LAYERS) return -EINVAL;
+        auto* layers=static_cast<SceneLayerDesc*>(kmalloc(sizeof(SceneLayerDesc)*GPU_SCENE_MAX_LAYERS));
+        if (!layers) return -ENOMEM;
+        if (desc.count && !CopyFromUser(layers,desc.layers,sizeof(SceneLayerDesc)*desc.count)) {
+            kfree(layers);return -EFAULT;
+        }
+        const int64_t result=ScenePresent(proc,handle,desc,layers);kfree(layers);return result;
+    }
+    return -EINVAL;
+}
+
 // 0xB03: notify the desktop that installed application metadata changed.
 static int64_t sys_brook_wm_refresh_apps(uint64_t, uint64_t, uint64_t,
                                         uint64_t, uint64_t, uint64_t)
@@ -12438,13 +12530,20 @@ static int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
-        if (addrVal < 0x1000) return -EFAULT;
-        auto* ua = reinterpret_cast<const SockAddrUn*>(addrVal);
-        if (ua->sun_family != AF_UNIX) return -EINVAL;
+        if (addrLen<2 || addrLen>sizeof(SockAddrUn)) return -EINVAL;
+        SockAddrUn address{};
+        if (!CopyFromUser(&address,addrVal,addrLen)) return -EFAULT;
+        if (address.sun_family != AF_UNIX) return -EINVAL;
+        SpinLockAcquire(&g_unixRegistryLock);
+        if (usd->localAddressLength || usd->state!=UnixSocketData::State::Unbound) {
+            SpinLockRelease(&g_unixRegistryLock);return -EINVAL;
+        }
+        memcpy(usd->localAddress,&address,addrLen);usd->localAddressLength=static_cast<uint32_t>(addrLen);
         // Copy path
-        const char* src = ua->sun_path;
+        const char* src = address.sun_path;
         char* dst = usd->path;
         for (int i = 0; i < 107 && src[i]; i++) dst[i] = src[i], dst[i+1] = 0;
+        SpinLockRelease(&g_unixRegistryLock);
         UNIX_LIFE(Bind, usd, 0, 0, fd);
         SerialPrintf("sys_bind: AF_UNIX fd=%d path='%s'\n", fd, usd->path);
         return 0;
@@ -12744,6 +12843,12 @@ static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnam
         case 4: // SO_ERROR: Unix connect currently reports failures synchronously.
             value = 0;
             break;
+        case 38: // SO_PROTOCOL
+            value = 0;
+            break;
+        case 39: // SO_DOMAIN
+            value = AF_UNIX;
+            break;
         case 7: // SO_SNDBUF
         case 8: { // SO_RCVBUF
             PipeBuffer* pipe = option == 7 ? socket->txPipe : socket->rxPipe;
@@ -12772,6 +12877,25 @@ static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ENOSYS;
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc,static_cast<int>(fdVal));
+    if (!descriptor) return -EBADF;
+    if (descriptor->type==FdType::UnixSocket && descriptor->handle) {
+        uint32_t requested=0;
+        if (!CopyFromUser(&requested,addrLenVal,sizeof(requested))) return -EFAULT;
+        if (requested>0x7fffffffu) return -EINVAL;
+        uint8_t address[sizeof(SockAddrUn)]={1,0};uint32_t actual=2;
+        auto* socket=static_cast<UnixSocketData*>(descriptor->handle);
+        SpinLockAcquire(&g_unixRegistryLock);
+        if (socket->localAddressLength) {
+            actual=socket->localAddressLength;memcpy(address,socket->localAddress,actual);
+        }
+        SpinLockRelease(&g_unixRegistryLock);
+        const uint32_t copied=requested<actual?requested:actual;
+        if ((copied && !CopyToUser(addrVal,address,copied)) ||
+            !CopyToUser(addrLenVal,&actual,sizeof(actual))) return -EFAULT;
+        return 0;
+    }
 
     int fd = static_cast<int>(fdVal);
     int sockIdx = GetSockIdx(proc, fd);
@@ -12932,6 +13056,8 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
                 serverSock->peerCredentials = pending.clientCredentials;
                 serverSock->peerIncarnation=pending.clientIncarnation;
                 serverSock->peerLaunchId=pending.clientLaunchId;serverSock->acceptedEndpoint=true;
+                serverSock->localAddressLength=usd->localAddressLength;
+                memcpy(serverSock->localAddress,usd->localAddress,sizeof(serverSock->localAddress));
                 serverSock->nonblock = (flags & UNIX_SOCK_NONBLOCK) != 0;
                 serverSock->rxPipe = pending.serverRx;
                 serverSock->txPipe = pending.serverTx;
@@ -13154,6 +13280,9 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
             // sender closing its fd doesn't free it out from under the receiver.
             if (src->handle) DrmPrimeRef(static_cast<DrmPrimeObj*>(src->handle));
             break;
+        case FdType::CompositorScene:
+            if (src->handle) SceneHandleRef(static_cast<SceneHandle*>(src->handle));
+            break;
         default:
             // Other fd types (Pipe, EventFd, EpollFd, TimerFd, DevDsp, etc.)
             // don't have a portable snapshot refcount today.
@@ -13205,6 +13334,9 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap)
         }
         case FdType::DrmPrime:
             DrmPrimeUnref(static_cast<DrmPrimeObj*>(snap->handle));
+            break;
+        case FdType::CompositorScene:
+            SceneHandleUnref(static_cast<SceneHandle*>(snap->handle));
             break;
         default: break;
     }
@@ -13772,6 +13904,8 @@ void SyscallTableInit()
     g_syscallTable[0xB00]                = sys_brook_wm_set_window_properties; // WM_SET_WINDOW_PROPERTIES
     g_syscallTable[0xB01]                = sys_brook_wm_set_app_id;
     g_syscallTable[0xB05]                = sys_brook_wm_set_client_socket;
+    g_syscallTable[0xB06]                = sys_brook_scene_create;
+    g_syscallTable[0xB07]                = sys_brook_scene_ctl;
     g_syscallTable[0xB02]                = sys_brook_wm_theme;
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     g_syscallTable[0xB04]                = sys_brook_wm_scale;

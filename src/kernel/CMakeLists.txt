@@ -245,6 +245,7 @@ add_executable(kernel
     src/memory/user_mapping.cpp
     src/scheduler.cpp
     src/compositor.cpp
+    src/compositor_scene.cpp
     src/window.cpp
     src/terminal.cpp
     src/rtc.cpp

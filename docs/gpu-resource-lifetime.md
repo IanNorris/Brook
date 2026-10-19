@@ -897,9 +897,9 @@ resource lifetime machinery.
 ## Immutable scene versions (integration in progress)
 
 `gpu_scene_versions.h` now supplies the kernel-private image ownership table.
-It is exercised by the hosted `test_gpu_scene` suite; the live compositor and
-Wayland server do not use it yet. This checkpoint changes no guest rendering
-behavior and is not Firefox acceptance.
+At checkpoint `31d00a28` it was exercised by the hosted `test_gpu_scene` suite
+without live compositor or Wayland integration. The scene service described
+below now uses it; Wayland adoption and Firefox acceptance remain incomplete.
 
 Each reservation gets a fresh positive scene-scoped 63-bit ID. A verified upload
 or capture can publish it; a failed incoming C leaves committed A and cached B
@@ -953,3 +953,98 @@ of the layer versions. After this, Wayland must preserve synchronized cached
 state, committed state, tree order and detach/disconnect semantics, then pass
 real Firefox rendering/audio and mixed-app lifetime tests. None of those
 integration requirements is established by these metadata tests.
+
+
+## Scene descriptor service (Wayland adoption pending)
+
+The kernel now provides `SCENE_CREATE` (`0xB06`) and `SCENE_CTL` (`0xB07`), with
+versioned wire structures in `gpu_scene_abi.h`. Creation requires an owned WM
+window and returns a close-on-exec FD. Control operations report limits/stats,
+upload a SHM snapshot, capture an explicit DRM FD/GEM capability, present a
+copied ordered version list, and release an image version. Upload/capture return
+a positive version ID directly, avoiding a post-completion output-copy rollback.
+Backend texture handles are never exposed through this ABI.
+
+Uploads validate dimensions, stride and byte extent, reserve capacity, then copy
+rows once into a tightly packed kernel-owned VMM snapshot. Capture pins the
+canonical DRM resource independently of descriptor/GEM lifetime and forwards its
+actual source format. The requested destination format controls retained alpha.
+Both operations run on the compositor worker and publish only verified completed
+images. Present validates and pins every exact image before queueing. It composes
+an owned ARGB staging root, waits for completion and desktop-state restoration,
+then rechecks scene binding and WM incarnation/generation before swapping roots.
+The desktop draws these roots with the premultiplied shader. Legacy capture roots
+retain their XRGB format and drawing mode.
+
+Per-scene limits are 64 version slots and 256 MiB of logical pixel storage.
+Global admission allows 32 scenes, 64 jobs and 256 MiB of upload snapshots. The
+job count includes preparation, execution, completed jobs awaiting caller release
+and quarantine; it is not just queued requests. Capacity is reported by the stats
+operation. The driver's shared texture table can reject allocation before these
+per-scene limits; failed creation preserves existing images. Matching idle images
+are reused; bounded worker eviction handles other idle sizes and closed scenes.
+
+FD duplication, fork and Unix rights transfer retain the shared close handle.
+Final handle teardown only atomically requests close and wakes the worker; it
+never acquires the sleeping scene mutex or waits for the GPU under a socket/FD
+lock. A short atomic publication claim orders publication against final teardown.
+As with other pinned FD operations, logical `close(fd)` can return while an
+already pinned operation is still in flight: this API does not promise that
+close returning cancels that operation. Queued timeouts can cancel before GPU
+work; running cancellation retains the operation until completion and suppresses
+publication. Uncertain operations retain the job, source/snapshot, image pins and
+admission budget until device reset. Jobs whose input was quarantined by earlier
+work also retain their complete input set and never submit another draw.
+
+A scene replacement changes the active binding under the scene lock. Old scenes
+cannot publish into a reused slot or replace the new scene's content. Scene close
+retires layer images asynchronously and leaves the window-owned last completed
+root intact until replacement or window destruction. Constructor rollback pins
+and verifies the exact FD handle before closing, avoiding a concurrent FD-reuse
+race. No GPU operations run under the scene metadata lock.
+
+The production-service host fixture uses controlled GPU, window and memory
+operations to exercise actual queue/ownership code: snapshot packing and source
+overwrite, independent capture leases, public release while queued, close before
+and during GPU work, final-teardown/publication ordering, queued terminal/timeout
+cancellation, scene replacement, window incarnation and content-generation
+invalidation, allocation failure and uncertain upload retention. These are
+component tests, not hardware failure injection or proof of every syscall race.
+
+The first hardware run passed retained-source and premultiplied pixel checks,
+then exposed an existing Unix compatibility gap: Python could not wrap a
+`socketpair()` FD because `getsockname()` returned `EBADF` for Unix sockets.
+That checked-stop diagnostic is preserved in
+`build/workloads/gpu-scene-service-20261019/candidate/diagnostic-audit.json`.
+Unix sockets now preserve their local bind address independently of the routing
+path, report anonymous/local/accepted names through bounded user copies, and
+support `SO_DOMAIN`/`SO_PROTOCOL` queries. This does not establish complete Unix
+abstract-name, autobind or peer-name support.
+
+Hardware session `0c24bcc9712848c8a3813da6c12c2978` passed the complete
+UID1000 scene probe. Native screenshots verified retained red/green/blue, exact
+premultiplied green-over-red `(127,128,0)`, and yellow surviving replacement and
+final close. The probe covered producer overwrite/readback and GEM/DRM closure,
+FD dup/fork, close-on-exec behavior after a real exec, SCM rights surviving closure
+of sender aliases, anonymous/truncated/error/local/accepted Unix name queries,
+and 128 updates with fresh IDs. The final layer storage was one 16 KiB idle image,
+with zero pins, snapshots, reservations, published versions or quarantine.
+
+The existing GL→SHM→GL and minimized-update pixel regression also passed. Quake
+GL3 at 1280×720 advanced through three inspected demo frames and closed normally;
+this short run makes no comparative performance or audible-music claim. Fourteen
+guest jobs drained with complete output and the Quake launch lineage drained.
+All 2,330 tracked DRM backing mappings (66,105,344 bytes) were released, without
+allocation/retirement failure or quarantine, and audio streams emptied. Checked
+shutdown, owned launcher/QEMU exit zero, three offline filesystem checks and nine
+preserved document hashes/owners passed. All 52 host suites, production-service
+sanitizers and supported compiled entry/startup audits passed. Additional host
+cases directly cover shared-image quarantine, mixed-input cancellation and
+pre-enqueue close without another GPU draw. Hardware completion fault injection
+and exhaustive FD rollback race execution remain unverified. Evidence:
+`build/workloads/gpu-scene-service-20261019/verified/acceptance-audit.json`.
+
+Wayland still needs to create scene descriptors, retain/coalesce committed and
+cached versions, flatten tree order and clipping, preserve synchronized commits,
+and handle detach/disconnect cleanup. This service alone does not establish
+Firefox hardware rendering/audio or browser mixed-workload acceptance.
