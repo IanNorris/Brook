@@ -34,14 +34,28 @@ closure = sorted(set(subprocess.check_output(['nix-store', '-qR', *roots], text=
 listing = subprocess.check_output(['debugfs', '-R', 'ls -p /store', str(image)], stderr=subprocess.DEVNULL, text=True)
 present = {line.split('/')[5] for line in listing.splitlines() if line.startswith('/')}
 commands, copied = [], []
+standalone_files = {}
 files = 0
 quote = json.dumps
 for source in closure:
     src = Path(source)
-    assert src.parent == Path('/nix/store') and src.is_dir(), source
+    assert src.parent == Path('/nix/store') and (src.is_dir() or src.is_file() or src.is_symlink()), source
     if src.name in present:
         continue
     copied.append(source)
+    # Closures may contain standalone files (Wine Mono MSI, for example),
+    # not only directories. Keep their store path and mode without inventing
+    # bin/lib children or treating a valid file output as a damaged image.
+    if src.is_symlink():
+        commands.append('symlink '+quote('/store/'+src.name)+' '+quote(os.readlink(src)))
+        continue
+    if src.is_file():
+        mode=oct(stat.S_IFREG | stat.S_IMODE(src.stat().st_mode)).replace('0o','0')
+        commands += ['write '+quote(str(src))+' '+quote('/store/'+src.name),
+                     'set_inode_field '+quote('/store/'+src.name)+' mode '+mode]
+        standalone_files[source] = hashlib.sha256(src.read_bytes()).hexdigest()
+        files += 1
+        continue
     for parent, dirs, names in os.walk(src, followlinks=False):
         path = Path(parent)
         dest = '/store/' + str(path.relative_to(src.parent))
@@ -73,6 +87,14 @@ text = (root / 'install.log').read_text()
 assert not re.search(r'Could not allocate|File not found|Usage:|not enough space|not a directory|already exists|No free|while opening|Invalid argument', text, re.I), 'See install.log'
 with (root / 'fsck.log').open('w') as log:
     subprocess.run(['e2fsck', '-f', '-n', str(image)], stdout=log, stderr=subprocess.STDOUT, check=True)
+# Verify standalone outputs after their real filesystem write; debugfs can
+# report some write failures without a failing process exit code.
+with tempfile.TemporaryDirectory(dir=root) as tmp:
+    for i, (source, digest) in enumerate(standalone_files.items()):
+        dumped=Path(tmp)/str(i)
+        subprocess.run(['debugfs','-R','dump '+quote('/store/'+Path(source).name)+' '+quote(str(dumped)),str(image)],
+                       stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
+        assert hashlib.sha256(dumped.read_bytes()).hexdigest()==digest, source
 wayland_override=None
 if args.wayland:
     with tempfile.TemporaryDirectory(dir=root) as tmp:
@@ -82,5 +104,5 @@ if args.wayland:
         digest=hashlib.sha256(binary.read_bytes()).hexdigest()
         assert hashlib.sha256(dumped.read_bytes()).hexdigest()==digest
         wayland_override=dict(package=str(args.wayland.resolve()),sha256=digest,target='/nix/bin/waylandd')
-(root / 'closure.json').write_text(json.dumps(dict(roots=roots, closure=closure, copied=copied, regular_files=files, wayland_override=wayland_override, method='offline debugfs; new private clone'), indent=2) + '\n')
+(root / 'closure.json').write_text(json.dumps(dict(roots=roots, closure=closure, copied=copied, regular_files=files, standalone_file_sha256=standalone_files, wayland_override=wayland_override, method='offline debugfs; new private clone'), indent=2) + '\n')
 print('VULKAN_NIX_SEED_STAGED', len(copied), 'of', len(closure), 'files', files)
