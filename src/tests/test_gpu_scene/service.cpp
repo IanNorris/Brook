@@ -139,6 +139,48 @@ void DropDeviceFixture() {
     while (g_scenes) { auto* held=g_scenes;g_scenes=held->next;held->~Scene();kfree(held); }
     g_sceneCount=0;textures.clear();EXPECT(pages.empty() && !g_jobs && !g_snapshotBytes);
 }
+void CloneImages() {
+    using namespace brook;
+    auto* source=OpenScene();const auto a=UploadPixels(source,0xff123456);
+    auto* destination=OpenScene();
+    EXPECT(SceneClone(fakeOwner,destination,source,0)==-22);
+    const auto cloned=SceneClone(fakeOwner,destination,source,a);
+    EXPECT(cloned>0 && Present(destination,cloned)==0 && rootPixel==0xff123456);
+    EXPECT(SceneRelease(destination,cloned)==0);
+    // Source close after admission must not invalidate the independent pin.
+    atSleep=[&] { EXPECT(SceneRelease(source,a)==0);SceneHandleUnref(source); };
+    const auto retained=SceneClone(fakeOwner,destination,source,a);
+    EXPECT(retained>0 && Present(destination,retained)==0 && rootPixel==0xff123456);
+    SceneHandleUnref(destination);CheckedEmpty();
+
+    source=OpenScene();const auto same=UploadPixels(source,0xffabcdef);
+    atSleep=[&] { EXPECT(SceneRelease(source,same)==0); };
+    const auto copy=SceneClone(fakeOwner,source,source,same);
+    EXPECT(copy>same && Present(source,copy)==0 && rootPixel==0xffabcdef);
+    SceneHandleUnref(source);CheckedEmpty();
+
+    source=OpenScene();const auto b=UploadPixels(source,0xff112233);destination=OpenScene();
+    failAllocation=true;EXPECT(SceneClone(fakeOwner,destination,source,b)==-12);failAllocation=false;
+    SceneStatsDesc stats{};SceneGetStats(source,stats);EXPECT(!stats.pins && stats.published==1);
+    fakeOwner->terminalPending=true;EXPECT(SceneClone(fakeOwner,destination,source,b)==-110);
+    fakeOwner->terminalPending=false;SceneGetStats(source,stats);EXPECT(!stats.pins);
+    operationResult=GpuCaptureResult::Rejected;
+    EXPECT(SceneClone(fakeOwner,destination,source,b)==-22);operationResult=GpuCaptureResult::Complete;
+    SceneGetStats(source,stats);EXPECT(!stats.pins && stats.published==1);
+    atSleep=[&] { SceneHandleUnref(destination); };
+    EXPECT(SceneClone(fakeOwner,destination,source,b)==-125);
+    destination=OpenScene();
+    atGpu=[&] { SceneHandleUnref(destination); };
+    EXPECT(SceneClone(fakeOwner,destination,source,b)==-125);
+    destination=OpenScene();
+    operationResult=GpuCaptureResult::Uncertain;
+    EXPECT(SceneClone(fakeOwner,destination,source,b)==-5);operationResult=GpuCaptureResult::Complete;
+    SceneGetStats(source,stats);EXPECT(stats.pins==1 && stats.quarantined==1 && stats.queued==1);
+    SceneGetStats(destination,stats);EXPECT(stats.quarantined==1 && stats.queued==1);
+    SceneHandleUnref(source);SceneHandleUnref(destination);Drain();
+    EXPECT(g_jobs==1 && g_sceneCount==2 && textures.size()==2);
+    DropDeviceFixture();CheckedEmpty();
+}
 void SharedQuarantine(unsigned mode) {
     using namespace brook;
     auto* handle=OpenScene();const auto a=UploadPixels(handle,8),b=UploadPixels(handle,9);
@@ -176,7 +218,14 @@ void TestSceneService() {
     fakeOwner=static_cast<Process*>(std::calloc(1,sizeof(Process)));EXPECT(fakeOwner);
     fakeGpu.CreateOwnedTexture=CreateTexture;fakeGpu.DestroyOwnedTexture=DestroyTexture;
     fakeGpu.UploadOwnedTexture=Upload;fakeGpu.CaptureExternal=Capture;
-    fakeGpu.ComposeOwnedLayers=[](uint32_t,const GpuSceneLayer*,uint32_t) { return GpuCaptureResult::Complete; };
+    fakeGpu.ComposeOwnedLayers=[](uint32_t destination,const GpuSceneLayer* layers,uint32_t count) {
+        EXPECT(!sceneLockDepth && count==1 && textures.count(destination));
+        EXPECT(layers[0].opacity==255 && layers[0].sw==4 && layers[0].sh==4);
+        EXPECT(layers[0].w==4 && layers[0].h==4 && layers[0].clipW==4 && layers[0].clipH==4);
+        Callback(atGpu);
+        if (operationResult==GpuCaptureResult::Complete) textures.at(destination)=textures.at(layers[0].texture);
+        return operationResult;
+    };
     fakeGpu.DrawPremultipliedQuad=[](uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t) {};
     auto* scene=OpenScene();SceneStatsDesc stats{};SceneGetStats(scene,stats);
     EXPECT(stats.abi==1 && stats.sceneCount==1 && stats.versionSlots==64);
@@ -259,6 +308,7 @@ void TestSceneService() {
     SceneGetStats(scene,stats);EXPECT(stats.quarantined==1 && stats.snapshotBytes==4096 && stats.queued==1);
     SceneHandleUnref(scene);Drain();EXPECT(pages.size()==1 && textures.size()==1 && g_quarantine && g_scenes);
     DropDeviceFixture();CheckedEmpty();
+    CloneImages();
     SharedQuarantine(0);SharedQuarantine(1);SharedQuarantine(2);
     std::free(fakeOwner);fakeOwner=nullptr;
     std::puts("SCENE_SERVICE_PASS real queue/ownership transitions with fake GPU: packing, source leases, close, replacement, reuse, capacity, uncertainty");

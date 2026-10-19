@@ -37,9 +37,9 @@ def main():
         try:fn()
         except OSError as error:assert error.errno==code,(error,code)
         else:raise AssertionError(f'expected errno {code}')
-    def upload(fd,color):
+    def upload(fd,color,format=1):
         pixels=ctypes.create_string_buffer(struct.pack('<I',color)*4096)
-        version=ctl(fd,1,struct.pack('<QQ4I',ctypes.addressof(pixels),16384,64,64,256,1))
+        version=ctl(fd,1,struct.pack('<QQ4I',ctypes.addressof(pixels),16384,64,64,256,format))
         assert version>0;ctypes.memset(ctypes.addressof(pixels),0x55,16384)
         return version
     def present(fd,*versions):
@@ -143,8 +143,29 @@ for fd in FD_VALUES:
             if accepted is not None:accepted.close()
             client.close();listener.close()
         replacement=scene();expect_error(116,lambda:present(fd,a))
-        yellow=upload(replacement,0xffffff00);assert present(replacement,yellow)==0
+        # Move the captured image to a replacement scene after the producer GEM
+        # and DRM FD are gone. These errors must leave the source public claim.
+        expect_error(9,lambda:ctl(replacement,5,struct.pack('<iIQ',-1,0,green)))
+        expect_error(22,lambda:ctl(replacement,5,struct.pack('<iIQ',fd,1,green)))
+        expect_error(22,lambda:ctl(replacement,5,struct.pack('<iIQ',fd,0,0)))
+        migrated=ctl(replacement,5,struct.pack('<iIQ',fd,0,green));assert migrated>0
+        yellow=upload(replacement,0xffffff00)
+        # The clone must have independent storage even when its source scene
+        # closes and its source image storage is retired.
         close(fd)
+        assert present(replacement,migrated)==0;checkpoint('cloned-green')
+        translucent=upload(replacement,0x80008000)
+        copied_alpha=ctl(replacement,5,struct.pack('<iIQ',replacement,0,translucent))
+        release(replacement,translucent)
+        red=upload(replacement,0xffff0000)
+        assert present(replacement,red,copied_alpha)==0;checkpoint('cloned-alpha-over-red')
+        release(replacement,migrated);release(replacement,copied_alpha);release(replacement,red)
+        opaque=upload(replacement,0x000000ff,format=2)
+        copied_opaque=ctl(replacement,5,struct.pack('<iIQ',replacement,0,opaque))
+        release(replacement,opaque)
+        assert present(replacement,copied_opaque)==0;checkpoint('cloned-opaque-blue')
+        release(replacement,copied_opaque)
+        assert present(replacement,yellow)==0
         end=time.monotonic()+30
         while stats(replacement)['scene_count']!=1:
             if time.monotonic()>end:raise TimeoutError('old scene did not drain')
@@ -152,12 +173,15 @@ for fd in FD_VALUES:
         checkpoint('replacement-yellow')
         # Repeated updates reuse completed storage with fresh, nonwrapping IDs.
         previous=yellow;release(replacement,yellow)
+        retained_bytes=stats(replacement)['pixel_bytes']
+        assert retained_bytes<=8*16384
         for _ in range(128):
             version=upload(replacement,0xffffff00);assert version>previous;previous=version
             assert present(replacement,version)==0;release(replacement,version)
         final=stats(replacement)
-        assert final['pixel_bytes']<=2*16384 and not final['pins'] and not final['quarantined']
+        assert final['pixel_bytes']<=retained_bytes and not final['pins'] and not final['quarantined']
         assert not final['snapshot_bytes'] and final['scene_count']==1
+        assert not final['published'] and not final['reserved']
         print('SCENE_API_GUEST_PASS',json.dumps(final,sort_keys=True),flush=True)
         close(replacement);checkpoint('closed-yellow')
     finally:

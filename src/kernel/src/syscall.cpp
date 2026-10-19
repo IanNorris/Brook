@@ -11317,6 +11317,15 @@ static int64_t sys_brook_scene_ctl(uint64_t fd,uint64_t op,uint64_t arg,uint64_t
         }
         return SceneCapture(proc,handle,desc,lease.value,producer,resource,format);
     }
+    if (op==SCENE_CTL_CLONE) {
+        if (size!=sizeof(SceneCloneDesc)) return -EINVAL;
+        SceneCloneDesc desc{};if (!CopyFromUser(&desc,arg,sizeof(desc))) return -EFAULT;
+        if (desc.reserved) return -EINVAL;
+        if (desc.sourceFd<0 || static_cast<uint32_t>(desc.sourceFd)>=MAX_FDS) return -EBADF;
+        FdRef source(proc,desc.sourceFd);
+        if (!source || source->type!=FdType::CompositorScene || !source->handle) return -EBADF;
+        return SceneClone(proc,handle,static_cast<SceneHandle*>(source->handle),desc.version);
+    }
     if (op==SCENE_CTL_PRESENT) {
         if (size!=sizeof(ScenePresentDesc)) return -EINVAL;
         ScenePresentDesc desc{};if (!CopyFromUser(&desc,arg,sizeof(desc))) return -EFAULT;

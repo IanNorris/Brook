@@ -34,11 +34,12 @@ struct Scene {
     // closed. Their atomic order is the close/publication linearization point.
     uint32_t lifecycle=0;
 };
-enum class JobKind { Upload,Capture,Present };
+enum class JobKind { Upload,Capture,Present,Clone };
 enum class JobState { Preparing,Queued,Running,Done };
 struct SceneJob {
     SceneJob* next;
     Scene* scene;
+    Scene* sourceScene; // Clone input owns a separate scene job reference.
     uint32_t references;
     JobKind kind;
     JobState state;
@@ -79,6 +80,7 @@ void JobUnref(SceneJob* job) {
     if (job->snapshot) VmmFreePages(VirtualAddress(job->snapshot),job->pages);
     if (job->sourceLease) MappingBackingUnref(job->sourceLease);
     KMutexLock(&g_sceneLock);
+    if (job->sourceScene) --job->sourceScene->jobs;
     --job->scene->jobs;--g_jobs;g_snapshotBytes-=job->pages*4096;
     KMutexUnlock(&g_sceneLock);kfree(job);CompositorWake();
 }
@@ -96,8 +98,7 @@ int Admit(SceneJob* job,uint64_t pages) {
         g_snapshotBytes>SnapshotLimit-pages*4096) return -11;
     ++g_jobs;++job->scene->jobs;job->pages=pages;g_snapshotBytes+=pages*4096;return 0;
 }
-int ReserveImage(SceneJob* job,uint32_t w,uint32_t h,uint32_t format,uint64_t pages) {
-    KMutexLock(&g_sceneLock);
+int ReserveImageLocked(SceneJob* job,uint32_t w,uint32_t h,uint32_t format,uint64_t pages) {
     int error=Admit(job,pages);
     if (!error) {
         const auto result=job->scene->images.Reserve(w,h,format,job->image);
@@ -109,16 +110,25 @@ int ReserveImage(SceneJob* job,uint32_t w,uint32_t h,uint32_t format,uint64_t pa
             if (result==SceneReserveResult::Capacity) job->scene->trim=true;
         }
     }
+    return error;
+}
+int ReserveImage(SceneJob* job,uint32_t w,uint32_t h,uint32_t format,uint64_t pages) {
+    KMutexLock(&g_sceneLock);const int error=ReserveImageLocked(job,w,h,format,pages);
     KMutexUnlock(&g_sceneLock);if (error) CompositorWake();return error;
 }
 bool CancelMetadata(SceneJob* job) {
     if (job->kind==JobKind::Present) return job->scene->images.Unpin(job->versions,job->count);
+    if (job->kind==JobKind::Clone && !job->sourceScene->images.Unpin(job->versions,1)) return false;
     return job->scene->images.Reject(job->image.version);
 }
 void QuarantineJob(SceneJob* job,bool hasWorkerReference) {
     if (!hasWorkerReference) __atomic_fetch_add(&job->references,1,__ATOMIC_RELAXED);
     if (job->kind==JobKind::Present)
         for (uint32_t i=0;i<job->count;++i) job->scene->images.Quarantine(job->versions[i]);
+    if (job->kind==JobKind::Clone) {
+        job->sourceScene->images.Quarantine(job->versions[0]);
+        job->scene->images.Quarantine(job->image.version);
+    }
     job->state=JobState::Done;job->result=-5;job->next=g_quarantine;g_quarantine=job;
 }
 // Return false when close/cancellation won while a source snapshot was prepared.
@@ -316,6 +326,28 @@ int64_t ScenePresent(Process* caller,SceneHandle* handle,const ScenePresentDesc&
     const int queued=Enqueue(job);if (queued) { JobUnref(job);return queued; }
     return WaitJob(caller,job);
 }
+// Copy an already captured immutable image into another scene. The original
+// producer may have been released; never reconstruct this from its old GEM ID.
+int64_t SceneClone(Process* caller,SceneHandle* destination,SceneHandle* source,uint64_t version) {
+    auto* job=NewJob(destination->scene,JobKind::Clone);if (!job) return -12;
+    auto* input=source->scene;SceneImageInfo image{};
+    KMutexLock(&g_sceneLock);ApplyClose(input);
+    int error=0;
+    if (!input->images.GetPublished(version,image)) error=-22;
+    if (!error) error=ReserveImageLocked(job,image.width,image.height,1,0);
+    if (!error && !input->images.Pin(&version,1)) {
+        job->scene->images.Reject(job->image.version);--g_jobs;--job->scene->jobs;error=-22;
+    }
+    if (!error) {
+        job->sourceScene=input;++input->jobs;job->versions[0]=version;job->count=1;
+        job->layers[0]={image.texture,0,0,image.width,image.height,0,0,image.width,image.height,
+                        255,0,0,image.width,image.height};
+    }
+    KMutexUnlock(&g_sceneLock);
+    if (error) { kfree(job);CompositorWake();return error; }
+    const int queued=Enqueue(job);if (queued) { JobUnref(job);return queued; }
+    return WaitJob(caller,job);
+}
 int SceneRelease(SceneHandle* handle,uint64_t version) {
     KMutexLock(&g_sceneLock);const bool released=handle->scene->images.Release(version);
     KMutexUnlock(&g_sceneLock);if (released) CompositorWake();return released?0:-22;
@@ -343,6 +375,9 @@ void CompositorDrainScenes() {
                 SceneImageInfo image{};
                 if (!job->scene->images.GetPinned(job->versions[i],image)) inputsReady=false;
             }
+        } else if (job->kind==JobKind::Clone) {
+            SceneImageInfo image{};
+            inputsReady=job->sourceScene->images.GetPinned(job->versions[0],image);
         }
         KMutexUnlock(&g_sceneLock);
         if (canceled) { if (!canceledUncertain) JobUnref(job);continue; }
@@ -350,6 +385,7 @@ void CompositorDrainScenes() {
         uint32_t texture=job->image.texture;
         if (job->kind==JobKind::Present) result=inputsReady?
             CompositorBuildSceneRoot(job->token,job->layers,job->count):GpuCaptureResult::Uncertain;
+        else if (!inputsReady) result=GpuCaptureResult::Uncertain;
         else {
             if (!texture) {
                 texture=gpu->CreateOwnedTexture(job->image.width,job->image.height,job->image.format==1);
@@ -361,6 +397,8 @@ void CompositorDrainScenes() {
             if (texture) {
                 if (job->kind==JobKind::Upload)
                     result=gpu->UploadOwnedTexture(texture,job->snapshot,job->image.width*job->image.height*4);
+                else if (job->kind==JobKind::Clone)
+                    result=gpu->ComposeOwnedLayers(texture,job->layers,1);
                 else result=gpu->CaptureExternal(texture,job->producer,job->resource,job->sourceFormat,
                                                  job->image.width,job->image.height);
             }
@@ -371,6 +409,8 @@ void CompositorDrainScenes() {
         ApplyClose(scene);
         const bool discard=job->canceled || scene->closing;
         job->result=-5;
+        if (job->kind==JobKind::Clone && !uncertain &&
+            !job->sourceScene->images.Unpin(job->versions,1)) uncertain=true;
         if (job->kind==JobKind::Present) {
             if (uncertain) {
                 for (uint32_t i=0;i<job->count;++i) scene->images.Quarantine(job->versions[i]);

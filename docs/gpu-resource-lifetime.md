@@ -1084,3 +1084,52 @@ Clang AddressSanitizer/UndefinedBehaviorSanitizer checks. Astra reviewed the
 callback replacement and shared older-dependency cases with no remaining blocker.
 Pending integration still includes buffer lifetimes, permanent surface roles,
 scene-backed rendering, cross-scene migration and end-to-end Firefox validation.
+
+### Retained-image migration between scenes
+
+Scene control operation 5 accepts a 16-byte `SceneCloneDesc` containing a source
+scene FD, reserved zero and a source version. It returns a new public version in
+the destination scene. The source must still have its public ownership claim
+when the call is admitted. This copies the retained immutable image; it never
+reopens a producer GEM or reads pixels back through the CPU. The original client
+buffer may already have been released, overwritten and destroyed.
+
+Admission reserves the destination and pins the exact source under the scene
+mutex. The job independently retains both scenes, including two balanced job
+references for a same-scene copy. GPU composition targets ARGB with full opacity;
+verified completion publishes the new version. Source version/FD closure after
+admission cannot release the in-flight input. Destination close/cancellation
+suppresses publication. Uncertain completion retains both images, scene jobs and
+queue capacity; an already quarantined source is never submitted again.
+
+The production-service host fixture covers ordinary and same-scene copying,
+source close while queued, destination close before/during execution, allocation
+failure, rejected GPU work, terminal cancellation and uncertain completion. It
+passes memory/undefined-behaviour sanitizers. Astra found no lifetime or ABI
+blocker in review. These fixtures do not inject hardware failures.
+
+Hardware session `e31c22b9d5a746d390b87f2109115b96` verified a captured green
+image copied after producer GEM/DRM destruction, then presented after source-scene
+closure. Same-scene ARGB copying retained the exact premultiplied blend
+`(127,128,0)`; XRGB copying produced opaque blue even with zero source alpha
+bytes. All nine native screenshots have 44,800 verified interior pixels each.
+The existing upload/capture, descriptor transfer/exec and replacement/close probe
+also passed. After 128 further updates, storage stayed bounded at five idle
+images (81,920 bytes), with zero public versions, reservations, pins, snapshots,
+in-flight jobs or quarantine before final scene close.
+
+The first diagnostic run stopped on an invalid argument in the probe script,
+before the new copy checks. Its completed failed job, orderly VM exit, three
+filesystem checks and nine preserved documents are recorded separately in
+`build/workloads/gpu-scene-clone-20261019/candidate/diagnostic-audit.json`.
+The corrected acceptance uses fresh private disks. This API is a prerequisite
+for Wayland reparent/remap; the frontend does not use it yet, and browser/mixed-app
+acceptance remains open.
+
+The corrected run drained all ten UID1000 jobs with full output and zero live
+job tasks. The producer's one 16 KiB tracked backing was released with zero
+allocation/retirement failures or quarantine; audio was empty. Checked shutdown,
+owned launcher/QEMU exit zero, all three offline filesystem checks and nine
+preserved document hashes/owners passed. All 52 host suites and supported
+compiled entry/startup audits passed. Evidence:
+`build/workloads/gpu-scene-clone-20261019/verified/acceptance-audit.json`.

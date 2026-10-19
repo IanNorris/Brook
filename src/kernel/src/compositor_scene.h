@@ -15,6 +15,7 @@ int64_t SceneUpload(Process*,SceneHandle*,const SceneUploadDesc&);
 int64_t SceneCapture(Process*,SceneHandle*,const SceneCaptureDesc&,MappingBacking*,
                      int32_t producer,uint32_t resource,uint32_t sourceFormat);
 int64_t ScenePresent(Process*,SceneHandle*,const ScenePresentDesc&,const SceneLayerDesc*);
+int64_t SceneClone(Process*,SceneHandle* destination,SceneHandle* source,uint64_t version);
 int SceneRelease(SceneHandle*,uint64_t version);
 // Compositor-thread only. No GPU operation runs under the metadata lock.
 void CompositorDrainScenes();

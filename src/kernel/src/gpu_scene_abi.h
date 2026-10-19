@@ -6,7 +6,7 @@
 namespace brook {
 inline constexpr uint32_t SCENE_ABI_VERSION=1;
 inline constexpr uint32_t SCENE_CTL_STATS=0,SCENE_CTL_UPLOAD=1,SCENE_CTL_CAPTURE=2;
-inline constexpr uint32_t SCENE_CTL_PRESENT=3,SCENE_CTL_RELEASE=4;
+inline constexpr uint32_t SCENE_CTL_PRESENT=3,SCENE_CTL_RELEASE=4,SCENE_CTL_CLONE=5;
 struct SceneUploadDesc {
     uint64_t pixels,bytes;
     uint32_t width,height,stride,format; // stride bytes; 1=BGRA premultiplied, 2=BGRX
@@ -14,6 +14,11 @@ struct SceneUploadDesc {
 struct SceneCaptureDesc {
     int32_t drmFd;
     uint32_t gem,width,height,format,reserved; // format is destination alpha policy
+};
+struct SceneCloneDesc {
+    int32_t sourceFd;
+    uint32_t reserved;
+    uint64_t version;
 };
 struct SceneLayerDesc {
     uint64_t version;
@@ -34,5 +39,5 @@ struct SceneStatsDesc {
 };
 static_assert(sizeof(SceneUploadDesc)==32 && sizeof(SceneCaptureDesc)==24);
 static_assert(sizeof(SceneLayerDesc)==64 && sizeof(ScenePresentDesc)==24);
-static_assert(sizeof(SceneStatsDesc)==88);
+static_assert(sizeof(SceneStatsDesc)==88 && sizeof(SceneCloneDesc)==16);
 }
