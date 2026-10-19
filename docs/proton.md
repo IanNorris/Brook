@@ -2,7 +2,8 @@
 
 This is a bounded Helltaker smoke test using Proton GE, without the Steam
 client or a Steam Linux Runtime container. It does not establish Steam,
-anti-cheat, 32-bit games or D3D12 compatibility.
+anti-cheat or 32-bit games. A separate [D3D12 checkpoint](d3d12.md) covers
+VKD3D shader/readback and Windows SDL3 Snake; real 3D game testing is next.
 
 ## Runtime
 

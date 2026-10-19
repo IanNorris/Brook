@@ -62,6 +62,7 @@ the table distinguishes tested behavior from remaining limitations.
 | Wine64 | 11.0 | ✅ Basic apps | Console command and Windows Notepad: keyboard input, save, normal close and cold-boot reopen as Brook. Broader Windows coverage remains limited. [Evidence and screenshot](docs/wine-smoke.md#console-and-notepad-acceptance--19-october) |
 | Wine + DXVK | 11.0 / 2.7.1 | ⚠️ Experimental D3D11 | Hardware Venus shader/readback probe and Windows SDL3 Snake; keyboard input, resize, maximize, minimize/restore and repeated launch/close verified. Per-app Unity audio also verified; standalone Proton GE has a separate smoke test. [Results](docs/wine-dxvk.md), [Unity smoke test](docs/wine-unity.md) |
 | Proton GE | 11-10 / DXVK 3.1.1 | ⚠️ Experimental | Standalone Helltaker at 720p: first-puzzle input/reset, captured audio and normal exit verified. Steam client integration remains untested. [Results](docs/proton.md) |
+| D3D12 / VKD3D-Proton | 3.1.0 | ⚠️ Initial checkpoint | Hardware shader/readback, event fences, 720p swapchain resize and Windows SDL3 Snake through Proton GE. Real 3D game testing is next. [Results and screenshots](docs/d3d12.md) |
 | SpaceVenture (Windows) | 2.08.12 / Unity 2022.3 | ⚠️ Experimental | D3D11/DXVK main menu, opening sequence and first-room interaction; clocked ALSA PCM captured. [Screenshot and limits](docs/wine-unity.md#spaceventure--unity-2022362f2) |
 | Helltaker (Windows) | Unity 2019.2.9f1 | ⚠️ Experimental | 720p D3D11/DXVK first-puzzle gameplay, keyboard movement/restart, minimize/restore and normal exit; clocked ALSA audio captured. [Screenshot and scope](docs/wine-unity.md) |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
@@ -70,6 +71,11 @@ the table distinguishes tested behavior from remaining limitations.
 | [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | 720p OSS playback; Wayland black flashes fixed; cold 55-second minimize/restore, normal close and SIGKILL audio cleanup verified; audio timing still experimental |
 
 ## Recent progress
+
+- **D3D12:** Proton GE's VKD3D renders a shader triangle with verified GPU
+  readback and a resized 720p window; Windows SDL3 Snake also runs with its
+  D3D12 renderer forced. Normal exits, native GL/Vulkan regression checks and
+  resource retirement pass. [Checkpoint and limits](docs/d3d12.md).
 
 - **Hardware Vulkan:** vkcube and vkmark run through Mesa Venus with direct
   DMA-BUF presentation, queue synchronization and retained compositor images.
