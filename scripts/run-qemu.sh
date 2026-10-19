@@ -434,6 +434,23 @@ if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
     QEMU_FULL_PATH="${BROOK_GPU_QEMU:-$(nix build --no-link --print-out-paths nixpkgs#qemu_full 2>/dev/null | tail -1)}"
     MESA_PATH="${BROOK_GPU_MESA:-$(nix build --no-link --print-out-paths nixpkgs#mesa 2>/dev/null | tail -1)}"
     GLVND_PATH="${BROOK_GPU_GLVND:-$(nix build --no-link --print-out-paths nixpkgs#libglvnd 2>/dev/null | tail -1)}"
+    VULKAN_PATH=""
+    if [ "${BROOK_GPU}" = "venus" ]; then
+        # virgl_render_server loads libvulkan dynamically for Venus. QEMU's
+        # normal GL closure/search path is insufficient on NixOS.
+        VULKAN_PATH="${BROOK_GPU_VULKAN:-$(nix build --no-link --print-out-paths nixpkgs#vulkan-loader 2>/dev/null | tail -1)}"
+        if [ ! -r "${VULKAN_PATH}/lib/libvulkan.so" ]; then
+            echo "ERROR: Venus needs a Vulkan loader; set BROOK_GPU_VULKAN to its package output." >&2
+            exit 1
+        fi
+        if [ -n "${BROOK_GPU_HOST_ICD:-}" ]; then
+            if [ ! -r "${BROOK_GPU_HOST_ICD}" ]; then
+                echo "ERROR: BROOK_GPU_HOST_ICD is not a readable Vulkan ICD manifest." >&2
+                exit 1
+            fi
+            export VK_DRIVER_FILES="${BROOK_GPU_HOST_ICD}"
+        fi
+    fi
     if [ -z "${QEMU_FULL_PATH}" ] || [ -z "${MESA_PATH}" ] || [ -z "${GLVND_PATH}" ]; then
         echo "ERROR: failed to resolve qemu_full/mesa/libglvnd via nix." >&2
         exit 1
@@ -444,6 +461,9 @@ if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
     export LIBGL_DRIVERS_PATH="${MESA_PATH}/lib/dri"
     export __EGL_VENDOR_LIBRARY_DIRS="${MESA_PATH}/share/glvnd/egl_vendor.d"
     export LD_LIBRARY_PATH="${GLVND_PATH}/lib:${MESA_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    if [ -n "${VULKAN_PATH}" ]; then
+        export LD_LIBRARY_PATH="${VULKAN_PATH}/lib:${LD_LIBRARY_PATH}"
+    fi
     # Display backend for the accelerated path:
     #   (default)              egl-headless — renders the GL scanout OFFSCREEN on
     #                          the host GPU (no window); for CI/headless + monitor

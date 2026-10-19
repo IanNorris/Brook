@@ -1,8 +1,8 @@
 # Vulkan bring-up through Venus
 
-Planning checkpoint: 19 October 2026, based on `fc46b6d4` (the accepted Wine
+Started: 19 October 2026, based on `fc46b6d4` (the accepted Wine
 checkpoint, now on main). No Vulkan workload has been accepted on Brook.
-Implementation starts separately on `wip/vulkan-bringup-20261019`.
+Work is isolated on `wip/vulkan-bringup-20261019`; main is unchanged.
 
 ## Target and boundaries
 
@@ -133,10 +133,62 @@ Notepad document for regression checks. Raw profiles, private images and license
 game data remain outside git. Add host tests for actual new memory/sync logic
 and guest/Linux regressions for observable ABI behavior.
 
-The first implementation session should deliver V0 and a recorded failing raw
-Brook probe with its next concrete ABI gap. Reassess scope at that point before
-committing to V1–V4. No implementation or VM launch is part of this planning
-checkpoint.
+V0 is complete. The next implementation gate is typed context/capability handling,
+followed by host-visible blob ownership, mapping and completion. Brook Vulkan
+execution and presentation remain unaccepted.
+
+## V0 results: 19 October 2026
+
+The Intel path passed on this host's Linux **6.12.109**. The documented 6.13
+baseline remains useful guidance, but a host upgrade is not a prerequisite for
+this measured configuration. This does not establish NVIDIA support.
+
+| Control | Result |
+| --- | --- |
+| Host, pinned Mesa 26.0.6 Intel ICD | UHD 630 (`8086:9bc5`), hardware compute/readback passed. |
+| Diskless Linux 6.18.26 guest, pinned QEMU 10.2.2 / virglrenderer 1.3.0 | Venus driver ID 22, `Virtio-GPU Venus (Intel(R) UHD Graphics 630 (CML GT2))`; three rounds of 16,384 integer words matched exactly. Normal poweroff, no renderer errors. |
+| Brook, accepted ABI 29 kernel, private copies of the Wine checkpoint | Expected prerequisite failure: blob=0, host-visible=0, capset mask=6 (VirGL/VirGL2). Context initialization was **skipped**, so `context_errno=0` in this initial raw probe is not a successful Venus context. |
+
+The probe exercises mapped upload, GPU buffer copy/fill, compute, GPU readback,
+barriers and fence waits. Both tested memory types reported coherent flags 7;
+noncoherent memory behavior and graphical presentation are not established.
+
+The first Linux attempt exposed a host launch omission: virglrenderer's helper
+could not load `libvulkan.so`. Adding the pinned Vulkan loader to its library
+path made the same control pass. The Brook launcher now resolves that dependency
+only for `BROOK_GPU=venus`; `BROOK_GPU_VULKAN` freezes its package path and
+`BROOK_GPU_HOST_ICD` selects the host ICD explicitly. Its launch was verified
+by the Brook baseline, without changing the GL path.
+
+Reproduce the diskless reference from the repository root:
+
+```sh
+nix-build tools/vulkan-linux-control -o build/vulkan-linux-control-result
+python scripts/vulkan_linux_control.py \
+  --output build/workloads/vulkan-control-NEW \
+  --host-icd "$(python -c 'import json; print(json.load(open("build/vulkan-linux-control-result/manifest.json"))["mesa"])')/share/vulkan/icd.d/intel_icd.x86_64.json"
+```
+
+The output directory must be new. The launcher records exact packages, GPU,
+kernel/initrd hashes, environment, arguments and complete serial/renderer logs.
+It requires an idle host VM slot, KVM/render-node access and a normal host
+permission context. It attaches no disks or network and sends no input to the
+host desktop. A timeout is recorded as failure, with only its owned diskless
+QEMU process stopped.
+
+Local evidence: `build/workloads/vulkan-v0-20261019/`. The acceptance audit
+preserves ten existing documents, the mapped-write fixture and Wine Notepad
+document, plus identical recursive contents of `.config`, `.mozilla`,
+`.vscode-oss` and the Wine prefix. Brook heap integrity passed; checked shutdown,
+launcher/QEMU exits and all four offline filesystem checks passed. Raw images,
+profiles and logs remain outside git.
+
+The exact Mesa source narrows the first implementation: this build simulates
+DRM sync objects/submission internally. Initial Venus shared rings and mapped
+Vulkan allocations need HOST3D mappable blobs, 64 rings, ring-index submission
+and an outgoing completion FD. Full DRM syncobj/input-fence support is not a
+prerequisite for this initial lane. Renderer command consumption and Vulkan GPU
+completion must remain distinct.
 
 ## Proposed next goal
 
