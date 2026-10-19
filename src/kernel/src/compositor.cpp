@@ -3521,7 +3521,10 @@ void CompositorHalt()
 void CompositorWake()
 {
     Process* p = g_compositorProcess;
-    if (p && p->state == ProcessState::Blocked)
+    // Forward Running/Ready wakes too: SchedulerUnblock records pendingWakeup
+    // under the ready lock, covering work arriving before SchedulerBlock.
+    // Testing state here loses that wake and delays queued work until the timer.
+    if (p)
         SchedulerUnblock(p);
 }
 

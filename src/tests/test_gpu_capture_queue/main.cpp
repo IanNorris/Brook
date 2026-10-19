@@ -11,6 +11,7 @@ namespace {
 std::mutex queueMutex,windowMutex;
 thread_local unsigned locks;
 std::atomic<int> leases{0};
+std::atomic<unsigned> wakeRequests{0};
 std::atomic<bool> workerDone{false};
 std::thread worker;
 int mode=0,created=0,destroyed=0;
@@ -30,7 +31,7 @@ extern "C" void* kmalloc(uint64_t bytes) { return allocationFails?nullptr:std::c
 extern "C" void kfree(void* p) { std::free(p); }
 void MappingBackingRef(MappingBacking*) { ++leases; }
 void MappingBackingUnref(MappingBacking*) { --leases; }
-void SchedulerUnblock(Process*) { std::abort(); }
+void SchedulerUnblock(Process* p) { CHECK(p==g_compositorProcess);++wakeRequests; }
 const GpuCompositorOps* GpuCompositorGet() { return &ops; }
 WmContentSnapshot WmSnapshotContent(uint32_t slot) {
     std::lock_guard<std::mutex> guard(windowMutex);return slot==0?content:WmContentSnapshot{};
@@ -77,6 +78,11 @@ int capture(uint32_t format=2) {
 int main() {
     using namespace brook;
     caller=static_cast<Process*>(std::calloc(1,sizeof(Process)));CHECK(caller);
+    auto* compositor=static_cast<Process*>(std::calloc(1,sizeof(Process)));CHECK(compositor);
+    g_compositorProcess=compositor;
+    // Exercise the real queue with the worker still Running, as when work
+    // arrives after its last drain and before it reaches SchedulerBlock.
+    compositor->state=ProcessState::Running;
     g_gpuComposite=g_gpuDrawReady=true;
     ops.CreateOwnedTexture=[](uint32_t,uint32_t,bool)->GpuTexId { CHECK(!locks);return mode==6?0:++created; };
     ops.DestroyOwnedTexture=[](GpuTexId)->bool { CHECK(!locks);++destroyed;return true; };
@@ -99,6 +105,11 @@ int main() {
     CHECK(CompositorCaptureExternal(caller,token(),reinterpret_cast<MappingBacking*>(1),256,65536,28)==-22);
     CHECK(leases==0 && created==0 && g_captureCount==0);
     CHECK(capture()==0 && leases==0 && created==1);
+    CHECK(wakeRequests>0); // queued capture must reach the scheduler in this state
+    const auto wakes= wakeRequests.load();
+    compositor->state=ProcessState::Ready;CompositorWake();CHECK(wakeRequests==wakes+1);
+    compositor->state=ProcessState::Blocked;CompositorWake();CHECK(wakeRequests==wakes+2);
+    compositor->state=ProcessState::Running;
     auto first=g_winTex[0].tex;CHECK(pixels[first]==0x00ff00);
     sourcePixel=0x0000ff;CHECK(pixels[first]==0x00ff00);
     CHECK(capture()==0 && created==2 && leases==0);
@@ -130,5 +141,7 @@ int main() {
     auto* retained=g_captureQuarantine;g_captureQuarantine=nullptr;g_captureCount=0;CaptureUnref(retained);CHECK(leases==0);
     mode=0;CHECK(capture(1)==0 && leases==0); // canonical ARGB reaches the worker unchanged
     DestroyWindowTexture(&ops,g_winTex[0]);std::free(caller);
+    g_compositorProcess=nullptr;const auto finalWakes=wakeRequests.load();CompositorWake();CHECK(wakeRequests==finalWakes);
+    std::free(compositor);
     std::puts("CAPTURE_QUEUE_PASS bounded staging, SHM/reuse races, running cancellation, queued timeout, uncertain lease retention");
 }

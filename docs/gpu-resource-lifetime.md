@@ -1244,3 +1244,37 @@ normally. Final evidence:
 `build/workloads/wayland-scene-tree-20261019/verified/acceptance-audit.json`.
 The longer initial playback evidence remains separately in
 `build/workloads/wayland-scene-tree-20261019/candidate/acceptance-audit.json`.
+
+## Compositor wake before blocking
+
+`CompositorWake` previously forwarded a request only when the compositor was
+already Blocked. Work arriving while it was Running or Ready could therefore
+wait until the 16 ms fallback timer, even though `SchedulerUnblock` already
+preserves these requests in `pendingWakeup` under the scheduler's ready lock.
+Forwarding every non-null compositor wake uses that existing race protection;
+it does not change GPU fences, buffer ownership or the fallback interval.
+The actual capture-queue fixture now checks that a queued capture reaches the
+scheduler while the compositor is Running, plus Ready, Blocked and absent-worker
+cases. All 52 host suites and both compiled entry/startup audits passed.
+
+Two fresh private-image Firefox trials used the same local media fixture,
+8 CPUs, 4 GiB RAM, hardware virgl composition and speaker-disabled audio.
+Source video callbacks were 291 over 38.705 s (7.52/s) before the change and
+374 over 39.597 s (9.45/s) after it. This single short trial per build suggests
+an improvement, not a repeatable benchmark or smooth-playback acceptance.
+Each trial included three 200 ms CPU/context-switch captures with no recorded
+event loss. All 12 completed compositor off-CPU spans in the baseline captures
+were 16 ms; none completed within the candidate capture windows. These are
+boundary-censored scheduler observations, not measured GPU durations.
+GPU command polling and command-lock contention remain prominent among active
+samples, so the wake fix does not resolve the remaining rendering bottleneck.
+
+Candidate session `cde469914f224be9824f7e8b09266741` also passed sequential
+Quake GL3 demo and Mousepad launch/normal-close checks. All three app lineages
+drained; all 2,675 tracked backing mappings (212,049,920 bytes) were released
+without failure or quarantine, and audio streams emptied. Checked shutdown,
+owned launcher/QEMU exit zero, three offline filesystem checks and nine
+preserved document hashes/owners passed. Evidence for both trials is under
+`build/workloads/wayland-scene-profile-20261019/{baseline,candidate}/`, including
+`profile-summary.json`, `playback-summary.json` and `acceptance-audit.json`.
+Simultaneous-browser/STK acceptance and the wider workload goal remain open.
