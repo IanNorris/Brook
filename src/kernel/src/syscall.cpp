@@ -7,6 +7,7 @@
 #include "syscall.h"
 #include "posix_timer.h"
 #include "timerfd_state.h"
+#include "sync_file.h"
 #include "busybox_applets.h"
 #include "cpu.h"
 #include "gdt.h"
@@ -433,6 +434,9 @@ static void WakeProcess(Process* proc)
     __atomic_store_n(&proc->pendingWakeup, 1, __ATOMIC_RELEASE);
     SchedulerUnblock(proc);
 }
+
+static void SyncFileRef(SyncFileData* file) { __atomic_fetch_add(&file->references,1,__ATOMIC_RELAXED); }
+static void SyncFileUnref(SyncFileData* file) { if(__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL)==1)kfree(file); }
 
 // EventFd data structure (used in read/write/poll/close)
 struct EventFdData {
@@ -2072,6 +2076,8 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
     }
 
     // Write to eventfd — adds value to counter
+    if (fde->type == FdType::SyncFile) return -EBADF;
+
     if (fde->type == FdType::EventFd && fde->handle)
     {
         if (count != 8) return -EINVAL;
@@ -2618,6 +2624,8 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     }
 
     // Read from eventfd — returns counter as uint64, resets to 0
+    if (fde->type == FdType::SyncFile) return -EINVAL;
+
     if (fde->type == FdType::EventFd && fde->handle)
     {
         if (count < 8) return -EINVAL;
@@ -3531,6 +3539,8 @@ void FinalizeClosedFd(const FdClaimResult& c)
         brook::SockUnref(sockIdx);
     }
 
+    if (c.type == FdType::SyncFile && c.handle) SyncFileUnref(static_cast<SyncFileData*>(c.handle));
+
     if (c.type == FdType::EventFd && c.handle)
         EventFdUnref(static_cast<EventFdData*>(c.handle));
 
@@ -3759,6 +3769,8 @@ static void FdBumpRefcount(const FdEntry* fde)
     case FdType::MemFd:
         MemFdRef(static_cast<MemFdData*>(fde->handle));
         break;
+    case FdType::SyncFile:
+        SyncFileRef(static_cast<SyncFileData*>(fde->handle));break;
     case FdType::EventFd:
         EventFdRef(static_cast<EventFdData*>(fde->handle));
         break;
@@ -3888,6 +3900,8 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     FdRef ref(proc, static_cast<int>(fd));
     if (!ref) return -EBADF;
     FdEntry* fde = ref.get();
+
+    if(fde->type==FdType::SyncFile)return -29; // ESPIPE
 
     int64_t soff = static_cast<int64_t>(offset);
 
@@ -5930,6 +5944,17 @@ static bool DrmEnsureBacking(DrmGemObj* gem)
     return attached;
 }
 
+static int CreateCompletedSyncFile(Process* process) {
+    if(!process)return -ESRCH;
+    auto* file=static_cast<SyncFileData*>(kmalloc(sizeof(SyncFileData)));
+    if(!file)return -ENOMEM;
+    *file={1,ClockNowNs(1),__atomic_add_fetch(&g_eventFdIdentity,1,__ATOMIC_RELAXED)};
+    FdEntry owned{};owned.type=FdType::SyncFile;owned.handle=file;owned.fdFlags=1;owned.statusFlags=0;
+    const int fd=FdTablePublishOwned(process->fds,ProcessFdLock(process),owned,0,-1,nullptr);
+    if(fd<0)SyncFileUnref(file);
+    return fd;
+}
+
 static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
 {
     DrmMappingGuard guard(dctx);
@@ -6214,11 +6239,8 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             if (result<0) return -EIO;
             if (eb.flags&2u) {
                 auto* process=ProcessCurrent();
-                auto* event=static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
-                if (!event) return -ENOMEM;
-                EventFdInit(event,1,0); // selected renderer timeline completed
-                const int descriptor=FdAlloc(process,FdType::EventFd,event);
-                if(descriptor<0) {kfree(event);return descriptor;}
+                const int descriptor=CreateCompletedSyncFile(process);
+                if(descriptor<0)return descriptor;
                 eb.fence_fd=descriptor;
                 if(!CopyToUser(arg,&eb,sizeof(eb))) {CloseProcessFd(process,descriptor);return -EFAULT;}
             }
@@ -6242,17 +6264,9 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (eb.flags & 0x02 /*FENCE_FD_OUT*/) {
             if (!ga->PresentBarrier || ga->PresentBarrier(dctx->owner->ctxId) < 0)
                 return -EIO;
-            int fenceFd = -1;
             Process* fp = ProcessCurrent();
-            if (fp) {
-                auto* efd = static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
-                if (efd) {
-                    EventFdInit(efd, 1, 0); // real host render fence completed
-                    fenceFd = FdAlloc(fp, FdType::EventFd, efd);
-                    if (fenceFd < 0) kfree(efd);
-                }
-            }
-            if (fenceFd < 0) return -ENOMEM;
+            const int fenceFd=CreateCompletedSyncFile(fp);
+            if(fenceFd<0)return fenceFd;
             eb.fence_fd = fenceFd;
             if (!CopyToUser(arg, &eb, sizeof(eb))) {
                 CloseProcessFd(fp, fenceFd);
@@ -6399,6 +6413,22 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
     if (!fde) return -EBADF;
+
+    if(fde->type==FdType::SyncFile) {
+        if(!fde->handle)return -EBADF;
+        if(cmd!=SYNC_FILE_INFO_IOCTL)return -25;
+        SyncFileInfo request{};
+        if(!CopyFromUser(&request,arg,sizeof(request)))return -EFAULT;
+        if(!SyncFileInfoRequestValid(request))return -EINVAL;
+        if(!UserBufferWritable(arg,sizeof(request)))return -EFAULT;
+        SyncFileInfo info{};SyncFenceInfo detail{};
+        SyncFileDescribe(*static_cast<SyncFileData*>(fde->handle),info,detail);
+        info.fences=request.fences;
+        if(request.numFences && !CopyToUser(request.fences,&detail,sizeof(detail)))return -EFAULT;
+        return CopyToUser(arg,&info,sizeof(info))?0:-EFAULT;
+    }
+    // libsync uses this query to distinguish a sync_file from an arbitrary fd.
+    if(cmd==SYNC_FILE_INFO_IOCTL)return -25;
 
     // FIONBIO / FIONREAD are socket ioctls, but their Linux request numbers
     // live in the same 0x54xx range as terminal ioctls.
@@ -7458,7 +7488,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
-    if (fde->type == FdType::EventFd) {
+    if (fde->type == FdType::EventFd || fde->type==FdType::SyncFile) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
@@ -8280,6 +8310,7 @@ static int64_t PollWait(pollfd* fds, uint64_t nfds, uint64_t timeout_ms, bool se
                     case FdType::UnixSocket: tname = "unix"; break;
                     case FdType::Pipe: tname = "pipe"; break;
                     case FdType::EventFd: tname = "evfd"; break;
+                    case FdType::SyncFile: tname = "sync_file"; break;
                     case FdType::TimerFd: tname = "tmfd"; break;
                     default: tname = "oth"; break;
                 }
@@ -8405,6 +8436,12 @@ retry_poll:
             if (fds[i].events & POLLOUT)
                 fds[i].revents |= POLLOUT;
             if (fds[i].revents) ready++;
+            continue;
+        }
+
+        if(fde->type==FdType::SyncFile && fde->handle) {
+            fds[i].revents|=SyncFileReady(fds[i].events);
+            if(fds[i].revents)++ready;
             continue;
         }
 
@@ -9001,6 +9038,8 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
     // do not feed libuv orphan ERR|HUP notifications forever after close.
     if (!fde) return 0;
 
+    if(fde->type==FdType::SyncFile && fde->handle)return SyncFileReady(events);
+
     if (fde->type == FdType::EventFd && fde->handle)
         return EventFdReady(static_cast<EventFdData*>(fde->handle), events).ready;
 
@@ -9123,6 +9162,12 @@ struct EpollWalk {
     }
     uint32_t watchReady(const EpollEntry& entry, int depth, EventFdSnapshot* captured = nullptr) {
         auto* fde = pin(entry.fd);
+        if(fde && fde->type==FdType::SyncFile && fde->handle && (entry.events&(EPOLLET|EPOLLONESHOT))) {
+            auto* fence=static_cast<SyncFileData*>(fde->handle);
+            EventFdSnapshot snapshot{fence->identity,1,0,SyncFileReady(entry.events)};
+            if(captured)*captured=snapshot;
+            return entry.eventFdIdentity!=fence->identity ? snapshot.ready : 0;
+        }
         if (!(entry.events & EPOLLET) || !fde ||
             fde->type != FdType::EventFd || !fde->handle)
             return ready(entry.fd, entry.events, depth);
@@ -13475,6 +13520,7 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
     if (!src || src->type == FdType::None) return false;
     switch (src->type) {
         case FdType::Pipe:
+        case FdType::SyncFile:
         case FdType::EventFd:
         case FdType::EpollFd:
         case FdType::TimerFd:
@@ -13547,6 +13593,8 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap)
         case FdType::Pipe:
             PipeReleaseEnd(static_cast<PipeBuffer*>(snap->handle), (snap->flags & 1) != 0);
             break;
+        case FdType::SyncFile:
+            SyncFileUnref(static_cast<SyncFileData*>(snap->handle));break;
         case FdType::EventFd:
             EventFdUnref(static_cast<EventFdData*>(snap->handle));
             break;

@@ -54,6 +54,7 @@ enum class FdType : uint8_t
     DrmPrime,      // DRM PRIME dmabuf handle — a capability wrapping a shared virgl resource (gres)
     DebugSerial,   // Direct debug UART output; initially fd 3, preserved by dup/fork
     CompositorScene, // Scene capability; fd aliases own a shared close handle
+    SyncFile,      // Immutable completed GPU timeline fence, Linux sync_file ABI
 };
 
 struct FdEntry

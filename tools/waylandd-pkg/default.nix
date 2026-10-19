@@ -18,6 +18,7 @@ stdenv.mkDerivation {
   src = ./.;
 
   postUnpack = ''
+    cp ${../../src/shared/dmabuf_layout.h} "$sourceRoot/dmabuf-layout.h"
     cp ${../../src/kernel/src/gpu_scene_abi.h} "$sourceRoot/gpu-scene-abi.h"
   '';
 
@@ -47,6 +48,11 @@ stdenv.mkDerivation {
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
         -L${wayland}/lib -lwayland-server -o dmabuf-import-test
     ./dmabuf-import-test
+    $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
+        dmabuf-params-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        -L${wayland}/lib -lwayland-server -o dmabuf-params-test
+    ./dmabuf-params-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         configure-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \

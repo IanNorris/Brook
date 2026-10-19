@@ -46,14 +46,17 @@ let
     ${probe}/bin/virtgpu-blob
     blob_exit=$?
     echo "BROOK_VULKAN_CONTROL_BLOB_EXIT $blob_exit"
+    ${probe}/bin/virtgpu-sync-file
+    sync_exit=$?
+    echo "BROOK_VULKAN_CONTROL_SYNC_EXIT $sync_exit"
     ${pkgs.vulkan-tools}/bin/vulkaninfo --summary
     info_exit=$?
     echo "BROOK_VULKAN_CONTROL_INFO_EXIT $info_exit"
-    ${probe}/bin/vulkan-probe --expect-driver venus
+    BROOK_VULKAN_SYNC_FD=1 ${probe}/bin/vulkan-probe --expect-driver venus
     probe_exit=$?
     echo "BROOK_VULKAN_CONTROL_PROBE_EXIT $probe_exit"
     sync
-    echo "BROOK_VULKAN_CONTROL_END pci=$pci_exit gpu=$gpu_exit drm=$drm_exit info=$info_exit probe=$probe_exit context=$context_exit blob=$blob_exit"
+    echo "BROOK_VULKAN_CONTROL_END pci=$pci_exit gpu=$gpu_exit drm=$drm_exit info=$info_exit probe=$probe_exit context=$context_exit blob=$blob_exit sync=$sync_exit"
     echo BROOK_VULKAN_CONTROL_DMESG_START
     dmesg
     echo BROOK_VULKAN_CONTROL_DMESG_END

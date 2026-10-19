@@ -118,9 +118,12 @@ def main():
                 process.kill()
                 exit_code = process.wait()
     text = serial.read_text(errors='replace') if serial.exists() else ''
-    ended = re.findall(r'BROOK_VULKAN_CONTROL_END pci=(\d+) gpu=(\d+) drm=(\d+) info=(\d+) probe=(\d+) context=(\d+) blob=(\d+)', text)
+    ended = re.findall(r'BROOK_VULKAN_CONTROL_END pci=(\d+) gpu=(\d+) drm=(\d+) info=(\d+) probe=(\d+) context=(\d+) blob=(\d+) sync=(\d+)', text)
+    sync_records=[]
     records = []
     for line in text.splitlines():
+        if line.startswith('{"sync_file_passed":'):
+            sync_records.append(json.loads(line))
         if line.startswith('{"passed":'):
             try:
                 records.append(json.loads(line))
@@ -131,14 +134,16 @@ def main():
                                     r'virtio_gpu_virgl_process_cmd.*error|failed to open libvulkan', line)]
     passed = (renderer_verified and not timed_out and not renderer_errors and exit_code == 0 and len(ended) == 1
               and all(int(value) == 0 for value in ended[0])
+              and len(sync_records)==1 and sync_records[0].get('sync_file_passed') is True
               and len(records) == 2 and all(record['passed'] for record in records)
               and records[-1].get('driver_id') == 22 and records[-1].get('rounds') == 3
-              and records[-1].get('triangle_passed') is True)
+              and records[-1].get('triangle_passed') is True
+              and records[-1].get('sync_fd_readback') is True)
     result = dict(passed=passed, qemu_exit=exit_code, timed_out=timed_out,
                   seconds=time.monotonic() - start, end_markers=ended, probes=records,
                   serial_sha256=sha(serial) if serial.exists() else None,
                   full_output_in_files=True, guest_poweroff_marker_seen=bool(ended),
-                  renderer_errors=renderer_errors)
+                  renderer_errors=renderer_errors,sync_file_probes=sync_records)
     write(output / 'result.json', result)
     print(json.dumps(result), flush=True)
     return 0 if passed else 1

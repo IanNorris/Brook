@@ -43,6 +43,7 @@
 #include "xdg-decoration-server-protocol.h"
 #include "kde-server-decoration-server-protocol.h"
 #include "viewporter-server-protocol.h"
+#include "dmabuf-layout.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
 #include "surface-tree.h"
@@ -205,7 +206,8 @@ struct brook_positioner {
 struct brook_dmabuf_buffer {
     unsigned refs;
     int32_t  width, height;
-    uint32_t stride, fourcc;
+    uint32_t stride, fourcc, offset;
+    uint64_t modifier;
     uint32_t gres;        /* resolved host virgl resource id (0 = unresolved) */
     uint32_t bo_handle;   /* our DRM GEM alias of the imported resource */
 };
@@ -2532,6 +2534,8 @@ static int is_dmabuf_buffer(struct wl_resource *buf)
 struct brook_dmabuf_params {
     int      fd;          /* plane-0 dmabuf fd (-1 = none added) */
     uint32_t stride, offset;
+    uint64_t modifier;
+    int used;
 };
 
 static void params_destroy(struct wl_client *c, struct wl_resource *r)
@@ -2541,27 +2545,50 @@ static void params_add(struct wl_client *c, struct wl_resource *r, int32_t fd,
                        uint32_t plane_idx, uint32_t offset, uint32_t stride,
                        uint32_t mod_hi, uint32_t mod_lo)
 {
-    (void)c; (void)mod_hi; (void)mod_lo;
+    (void)c;
     struct brook_dmabuf_params *p = wl_resource_get_user_data(r);
-    if (plane_idx != 0) { if (fd >= 0) close(fd); return; }  /* single-plane only */
-    if (p->fd >= 0) close(p->fd);
-    p->fd = fd; p->stride = stride; p->offset = offset;
+    if (p->used) {
+        if (fd>=0) close(fd);
+        wl_resource_post_error(r,ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_ALREADY_USED,"params already used");return;
+    }
+    if (plane_idx!=0) {
+        if (fd>=0) close(fd);
+        wl_resource_post_error(r,ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_PLANE_IDX,"only plane zero is supported");return;
+    }
+    if (p->fd>=0) {
+        if (fd>=0) close(fd);
+        wl_resource_post_error(r,ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_PLANE_SET,"plane zero already supplied");return;
+    }
+    p->fd=fd;p->stride=stride;p->offset=offset;
+    p->modifier=((uint64_t)mod_hi<<32)|mod_lo;
 }
 
 static struct wl_resource *
 params_make_buffer(struct wl_client *c, struct wl_resource *r, uint32_t id,
-                   int32_t width, int32_t height, uint32_t format)
+                   int32_t width, int32_t height, uint32_t format, uint32_t flags)
 {
     struct brook_dmabuf_params *p = wl_resource_get_user_data(r);
+    if (p->used) {
+        wl_resource_post_error(r,ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_ALREADY_USED,"params already used");return NULL;
+    }
+    p->used=1;
     if (p->fd < 0) {
         wl_resource_post_error(r, ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INCOMPLETE,
                                "no plane added");
         return NULL;
     }
+    const struct BrookDmabufLayout layout={(uint32_t)width,(uint32_t)height,format,p->stride,p->offset,flags,p->modifier};
+    enum BrookDmabufLayoutError error=BrookDmabufValidate(&layout,UINT64_MAX,1);
+    if (error!=BROOK_DMABUF_LAYOUT_OK) {
+        uint32_t protocol_error=error==BROOK_DMABUF_LAYOUT_DIMENSIONS?ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_DIMENSIONS:
+            error==BROOK_DMABUF_LAYOUT_FORMAT?ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_INVALID_FORMAT:ZWP_LINUX_BUFFER_PARAMS_V1_ERROR_OUT_OF_BOUNDS;
+        close(p->fd);p->fd=-1;
+        wl_resource_post_error(r,protocol_error,"unsupported or invalid DMA-BUF layout");return NULL;
+    }
     struct brook_dmabuf_buffer *db = calloc(1, sizeof(*db));
     if (!db) { wl_client_post_no_memory(c); return NULL; }
     db->refs = 1;db->width = width; db->height = height;
-    db->stride = p->stride; db->fourcc = format;
+    db->stride = p->stride; db->fourcc = format;db->offset=p->offset;db->modifier=p->modifier;
     db->gres = dmabuf_resolve_gres(p->fd, &db->bo_handle);
     close(p->fd); p->fd = -1;   /* the import cache now holds the GEM reference */
     if (!db->gres) {
@@ -2587,8 +2614,7 @@ static void params_create(struct wl_client *c, struct wl_resource *r,
                           int32_t width, int32_t height, uint32_t format,
                           uint32_t flags)
 {
-    (void)flags;
-    struct wl_resource *buf = params_make_buffer(c, r, 0, width, height, format);
+    struct wl_resource *buf = params_make_buffer(c, r, 0, width, height, format, flags);
     if (buf)
         zwp_linux_buffer_params_v1_send_created(r, buf);
     else
@@ -2599,8 +2625,7 @@ static void params_create_immed(struct wl_client *c, struct wl_resource *r,
                                 uint32_t buffer_id, int32_t width, int32_t height,
                                 uint32_t format, uint32_t flags)
 {
-    (void)flags;
-    params_make_buffer(c, r, buffer_id, width, height, format);
+    params_make_buffer(c, r, buffer_id, width, height, format, flags);
 }
 
 static const struct zwp_linux_buffer_params_v1_interface params_impl = {

@@ -1,3 +1,7 @@
+#include <poll.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/sync_file.h>
 // Generated compute, transfer and mapped-memory correctness test; no WSI.
 #include <vulkan/vulkan.h>
 #include <stdint.h>
@@ -69,6 +73,9 @@ int main(int argc, char** argv)
         fprintf(stderr, "usage: vulkan-probe [--expect-driver hardware|intel|venus]\n"); return 2;
     }
     int passed = 0;
+    const int externalSync=getenv("BROOK_VULKAN_SYNC_FD")!=NULL;
+    int exportedFd=-1;
+    VkSemaphore exportedSemaphore=VK_NULL_HANDLE;
     VkInstance instance = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkShaderModule shader = VK_NULL_HANDLE;
@@ -113,9 +120,17 @@ int main(int argc, char** argv)
     float priority = 1;
     VkDeviceQueueCreateInfo queueInfo = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority };
+    const char* deviceExtensions[]={VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME};
     VkDeviceCreateInfo deviceInfo = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .queueCreateInfoCount = 1, .pQueueCreateInfos = &queueInfo };
+        .queueCreateInfoCount = 1, .pQueueCreateInfos = &queueInfo,
+        .enabledExtensionCount=externalSync?1:0,.ppEnabledExtensionNames=deviceExtensions };
     CHECK_VK(vkCreateDevice(physical, &deviceInfo, NULL, &device));
+    if(externalSync) {
+        VkExportSemaphoreCreateInfo exportInfo={.sType=VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+            .handleTypes=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+        VkSemaphoreCreateInfo semaphoreInfo={.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,.pNext=&exportInfo};
+        CHECK_VK(vkCreateSemaphore(device,&semaphoreInfo,NULL,&exportedSemaphore));
+    }
     VkQueue queue;
     vkGetDeviceQueue(device, family, 0, &queue);
     VkPhysicalDeviceMemoryProperties memory;
@@ -189,7 +204,16 @@ int main(int argc, char** argv)
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &set, 0, NULL);
         vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(seed), &seed);
-        vkCmdDispatch(command, WORDS / 64, 1, 1);
+        const unsigned dispatches=externalSync?256:1;
+        for(unsigned step=0;step<dispatches;++step) {
+            vkCmdDispatch(command, WORDS / 64, 1, 1);
+            if(step+1<dispatches) {
+                VkMemoryBarrier between={.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT};
+                vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,1,&between,0,NULL,0,NULL);
+            }
+        }
         barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 1, &barrier, 0, NULL, 0, NULL);
@@ -200,9 +224,24 @@ int main(int argc, char** argv)
         CHECK_VK(vkEndCommandBuffer(command));
         CHECK_VK(vkResetFences(device, 1, &fence));
         VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .commandBufferCount = 1, .pCommandBuffers = &command };
+            .commandBufferCount = 1, .pCommandBuffers = &command,
+            .signalSemaphoreCount=externalSync?1:0,.pSignalSemaphores=&exportedSemaphore };
         CHECK_VK(vkQueueSubmit(queue, 1, &submit, fence));
-        CHECK_VK(vkWaitForFences(device, 1, &fence, VK_TRUE, 10000000000ULL));
+        if(externalSync) {
+            VkSemaphoreGetFdInfoKHR info={.sType=VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+                .semaphore=exportedSemaphore,.handleType=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+            PFN_vkGetSemaphoreFdKHR getFd=(PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(device,"vkGetSemaphoreFdKHR");
+            if(!getFd)goto cleanup;
+            CHECK_VK(getFd(device,&info,&exportedFd));
+            if(exportedFd<0)goto cleanup;
+            struct pollfd wait={.fd=exportedFd,.events=POLLIN};
+            if(poll(&wait,1,10000)!=1 || wait.revents!=POLLIN)goto cleanup;
+            struct sync_file_info status={0};
+            if(ioctl(exportedFd,SYNC_IOC_FILE_INFO,&status) || status.status!=1)goto cleanup;
+            close(exportedFd);exportedFd=-1;
+        } else {
+            CHECK_VK(vkWaitForFences(device, 1, &fence, VK_TRUE, 10000000000ULL));
+        }
         if (!(readback.flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
             VkMappedMemoryRange range = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                 .memory = readback.memory, .size = VK_WHOLE_SIZE };
@@ -211,20 +250,25 @@ int main(int argc, char** argv)
         const uint32_t* output = readback.mapped;
         for (uint32_t i = 0; i < WORDS; ++i) {
             uint32_t value = i >= 64 && i < 192 ? 0x13579bdfu : (i * 17u) ^ seed;
-            uint32_t want = (value ^ (0x9e3779b9u + seed)) * 1664525u + 1013904223u;
+            uint32_t want=value;
+            for(unsigned step=0;step<dispatches;++step)want=(want^(0x9e3779b9u+seed))*1664525u+1013904223u;
             if (output[i] != want) {
                 fprintf(stderr, "READBACK_MISMATCH round=%u index=%u actual=%08x expected=%08x\n",
                         round, i, output[i], want); goto cleanup;
             }
         }
+        // Readback above must be correct BEFORE this ordinary fence wait.
+        if(externalSync)CHECK_VK(vkWaitForFences(device,1,&fence,VK_TRUE,10000000000ULL));
     }
     CHECK_VK(render_triangle(device,physical,&memory,queue,command,fence,&readback));
     CHECK_VK(vkDeviceWaitIdle(device));
     passed = 1;
 cleanup:
+    if(exportedFd>=0)close(exportedFd);
     if (device) {
         // Process/VM supervisors also bound failures where a driver cannot finish.
         if (!passed) (void)vkDeviceWaitIdle(device);
+        if(exportedSemaphore)vkDestroySemaphore(device,exportedSemaphore,NULL);
         if (fence) vkDestroyFence(device, fence, NULL);
         if (commands) vkDestroyCommandPool(device, commands, NULL);
         if (descriptors) vkDestroyDescriptorPool(device, descriptors, NULL);
@@ -239,8 +283,8 @@ cleanup:
     printf("{\"passed\":%s,\"device\":", passed ? "true" : "false"); json_string(properties.deviceName);
     printf(",\"driver\":"); json_string(driver.driverName);
     printf(",\"driver_id\":%u,\"vendor_id\":%u,\"device_id\":%u,\"words_per_round\":%u,\"rounds\":%u,"
-           "\"upload_memory_flags\":%u,\"readback_memory_flags\":%u,\"triangle_passed\":%s}\n",
+           "\"upload_memory_flags\":%u,\"readback_memory_flags\":%u,\"triangle_passed\":%s,\"sync_fd_readback\":%s}\n",
            driver.driverID, properties.vendorID, properties.deviceID, WORDS, passed ? ROUNDS : 0,
-           upload.flags, readback.flags, passed ? "true" : "false");
+           upload.flags, readback.flags, passed ? "true" : "false", passed && externalSync ? "true" : "false");
     return passed ? 0 : 1;
 }
