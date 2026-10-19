@@ -31,7 +31,7 @@ for part in ('kernel/BROOK.elf','kernel/ksym_addr_table.cpp','bootloader/BOOTX64
 abis={}
 for module in (art/'kernel/drivers').glob('*.mod'):
  with module.open('rb') as stream:magic,abi=struct.unpack_from('<II',ELFFile(stream).get_section_by_name('.modinfo').data())
- assert magic==0x4b524f42 and abi==32;abis[module.name]=dict(abi=abi,sha256=b.sha(module))
+ assert magic==0x4b524f42 and abi==33;abis[module.name]=dict(abi=abi,sha256=b.sha(module))
 assert len(abis)==12;b.write(r/'module-abi-audit.json',abis)
 env=dict(os.environ,BROOK_BUILD_DIR=str(art),BROOK_DISK_IMG=str(run/'boot.img'));b.command([str(b.ROOT/'scripts/update_disk.sh')],r/'update-boot.log',env)
 control=json.loads((args.control/'manifest.json').read_text());probe=Path(control['probe'])/'bin/virtgpu-context'

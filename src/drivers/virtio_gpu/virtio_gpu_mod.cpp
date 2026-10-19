@@ -387,7 +387,7 @@ static inline uint32_t IntToF32Bits(int32_t v)
 // (no runtime FP). Used for texture uv coordinates (s/texDim) and, via NdcBits,
 // for clip-space vertex positions. Exact when num/den is a dyadic-friendly ratio
 // at these magnitudes; |err| < 1.2e-7 otherwise.
-static inline uint32_t FracBits(int32_t num, int32_t den)
+static inline uint32_t FracBits(int64_t num, int64_t den)
 {
     if (num == 0 || den == 0) return 0;
     int64_t q = (static_cast<int64_t>(num) * (int64_t{1} << 23)) / den;   // ~ (num/den) * 2^23
@@ -3316,13 +3316,13 @@ static GpuCaptureResult CompComposeOwnedLayers(GpuTexId destination,
         if (!r.visible) continue;
         const uint32_t x0=NdcBits(r.x,int32_t(target->w)),x1=NdcBits(r.right,int32_t(target->w));
         const uint32_t y0=NdcBits(r.y,int32_t(target->h)),y1=NdcBits(r.bottom,int32_t(target->h));
-        const uint32_t u0=FracBits(r.u0,r.uDen),u1=FracBits(r.u1,r.uDen);
-        const uint32_t v0=FracBits(r.v0,r.vDen),v1=FracBits(r.v1,r.vDen);
         const uint32_t opacity=FracBits(int32_t(layers[i].opacity),255);
-        v[0]=x0;v[1]=y0;v[2]=u0;v[3]=v0;v[4]=opacity;
-        v[5]=x1;v[6]=y0;v[7]=u1;v[8]=v0;v[9]=opacity;
-        v[10]=x0;v[11]=y1;v[12]=u0;v[13]=v1;v[14]=opacity;
-        v[15]=x1;v[16]=y1;v[17]=u1;v[18]=v1;v[19]=opacity;
+        for (unsigned corner=0;corner<4;++corner) {
+            const auto uv=GpuSceneCorner(r,layers[i].flags,corner&1,corner&2);
+            auto* vertex=v+corner*5;
+            vertex[0]=(corner&1)?x1:x0;vertex[1]=(corner&2)?y1:y0;
+            vertex[2]=FracBits(uv.u,uv.uDen);vertex[3]=FracBits(uv.v,uv.vDen);vertex[4]=opacity;
+        }
     }
     const bool completed=GpuSceneSequence([&](GpuSceneStep step) {
         if (step==GpuSceneStep::UploadVertices)
@@ -3682,8 +3682,18 @@ static bool VirtioGpuSceneSelfTest()
                 if (x<l.x || y<l.y || int64_t(x)>=int64_t(l.x)+l.w || int64_t(y)>=int64_t(l.y)+l.h ||
                     x<l.clipX || y<l.clipY || int64_t(x)>=int64_t(l.clipX)+l.clipW ||
                     int64_t(y)>=int64_t(l.clipY)+l.clipH) continue;
-                const uint32_t sx=l.sx+uint32_t((2*(int64_t(x)-l.x)+1)*l.sw/(2*l.w));
-                const uint32_t sy=l.sy+uint32_t((2*(int64_t(y)-l.y)+1)*l.sh/(2*l.h));
+                const int64_t units=(l.flags&SCENE_LAYER_FIXED8)?256:1;
+                const uint32_t transform=(l.flags>>SCENE_LAYER_TRANSFORM_SHIFT)&7;
+                int64_t u=int64_t(l.sx)*2*l.w+(2*(int64_t(x)-l.x)+1)*l.sw,ud=2*int64_t(l.w)*units*4;
+                int64_t v=int64_t(l.sy)*2*l.h+(2*(int64_t(y)-l.y)+1)*l.sh,vd=2*int64_t(l.h)*units*4;
+                if (transform&4) u=ud-u;
+                int64_t a=u,ad=ud,b=v,bd=vd;
+                switch(transform&3) {
+                case 1:a=v;ad=vd;b=ud-u;bd=ud;break;
+                case 2:a=ud-u;b=vd-v;break;
+                case 3:a=vd-v;ad=vd;b=u;bd=ud;break;
+                }
+                const uint32_t sx=uint32_t(a*4/ad),sy=uint32_t(b*4/bd);
                 const uint32_t source=l.texture==redTexture?red[sy*4+sx]:(0x80000000u|((32u+sy*32u)<<8));
                 expected[y*5+x]=over(source,expected[y*5+x],l.opacity);
             }
@@ -3706,6 +3716,18 @@ static bool VirtioGpuSceneSelfTest()
     if (!compose(2)) return false; // order is observable through premultiplied alpha
     saved=layers[0];layers[0]=layers[1];layers[1]=saved;layers[1].opacity=128;
     if (!compose(2)) return false; // opacity scales RGB and alpha together
+    // Exercise actual GPU UV interpolation for every buffer transform and
+    // fractional source crop, including negative destination clipping.
+    const auto beforeTransform0=layers[0],beforeTransform1=layers[1];
+    for (uint32_t transform=0;transform<8;++transform) {
+        layers[0]={redTexture,96,96,3*256,3*256,-1,0,6,3,255,0,0,5,3,
+            SCENE_LAYER_FIXED8|(transform<<SCENE_LAYER_TRANSFORM_SHIFT)};
+        if (!compose(1)) return false;
+        layers[0].texture=greenTexture;
+        if (!compose(1)) return false;
+    }
+    layers[0]=beforeTransform0;layers[1]=beforeTransform1;
+    if (!compose(2)) return false;
     // Invalid submissions must not clear or partially mutate the previous root.
     const auto valid=layers[0];layers[0].texture=root;
     if (CompComposeOwnedLayers(root,layers,2)!=GpuCaptureResult::Rejected) return false;
@@ -3740,7 +3762,7 @@ static bool VirtioGpuSceneSelfTest()
     if (AppRetireResource(ctx,redResource) || AppRetireResource(ctx,readResource)) return false;
     AppCtxDestroy(ctx);if (AppCtxFind(ctx)) return false;
     VmmFreePages(backing,3);
-    SerialPuts("virtio_gpu: premultiplied scene verified upload/capture/clip/scale/order/opacity/64-layers/clear/desktop/teardown\n");
+    SerialPuts("virtio_gpu: premultiplied scene verified upload/capture/clip/scale/fractional/all-transforms/order/opacity/64-layers/clear/desktop/teardown\n");
     return true;
 }
 

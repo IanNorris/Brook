@@ -47,6 +47,7 @@
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
 #include "surface-tree.h"
+#include "surface-geometry.h"
 #include "gpu-scene-abi.h"
 
 #define BROOK_SYS_WM_CREATE_WINDOW   506
@@ -295,6 +296,8 @@ struct brook_surface {
     int32_t window_geometry_w, window_geometry_h;
     int32_t pending_geometry_w, pending_geometry_h;
     int window_geometry_pending;
+    struct brook_geometry_state geometry;
+    struct wl_resource *viewport;
     uint32_t next_configure_serial; /* Last emitted serial, from next_serial(). */
     /* Popup geometry derived from positioner at get_popup time. */
     int32_t popup_w, popup_h;
@@ -552,45 +555,20 @@ static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
 }
 
 static void surface_cursor_commit(struct brook_surface *s) {
-    struct wl_shm_buffer *shm=s->pending_buffer?s->pending_buffer->shm:NULL;
-    if (!shm) return;
-    buffer_begin_use(s->pending_buffer);
-    int32_t w=wl_shm_buffer_get_width(shm),h=wl_shm_buffer_get_height(shm),stride=wl_shm_buffer_get_stride(shm);
-
-        if (w > 0 && h > 0) {
-            wl_shm_buffer_begin_access(shm);
-            const uint32_t *pixels = (const uint32_t *)wl_shm_buffer_get_data(shm);
-            uint32_t format = wl_shm_buffer_get_format(shm);
-            int force_opaque = (format != WL_SHM_FORMAT_ARGB8888);
-            int32_t src_stride = stride / 4;
-            /* Copy through local buffer: handles stride != width and
-             * forces alpha=0xFF for XRGB format (kernel alpha-blends). */
-            uint32_t dw = (uint32_t)w > 64 ? 64 : (uint32_t)w;
-            uint32_t dh = (uint32_t)h > 64 ? 64 : (uint32_t)h;
-            uint32_t buf[64*64];
-            uint32_t nonzero = 0;
-            for (uint32_t dy = 0; dy < dh; dy++) {
-                uint32_t sy = (dw == (uint32_t)w) ? dy : (dy * (uint32_t)h / dh);
-                for (uint32_t dx = 0; dx < dw; dx++) {
-                    uint32_t sx = (dh == (uint32_t)h) ? dx : (dx * (uint32_t)w / dw);
-                    uint32_t px = pixels[sy * src_stride + sx];
-                    if (px) nonzero++;
-                    buf[dy * dw + dx] = force_opaque ? (0xFF000000u | (px & 0x00FFFFFFu)) : px;
-                }
-            }
-            int32_t shx = s->cursor_hot_x * (int32_t)dw / w;
-            int32_t shy = s->cursor_hot_y * (int32_t)dh / h;
-            long rc = wm_set_cursor_image(buf, dw, dh, shx, shy);
-            fprintf(stderr, "[waylandd] cursor commit: %dx%d fmt=%s hot=(%d,%d) rc=%ld "
-                    "nonzero=%u/%u src=%p stride=%d\n",
-                    dw, dh, force_opaque ? "XRGB" : "ARGB", shx, shy, rc,
-                    nonzero, dw*dh, (const void*)pixels, src_stride);
-            wl_shm_buffer_end_access(shm);
-        }
-        buffer_release(s->pending_buffer);
-        buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
-        return;
+    struct brook_view *view=s->tree.current?s->tree.current->value:NULL;
+    if (!view || !view->image->pixels) return;
+    const struct brook_geometry *g=&view->geometry;
+    const struct brook_image *image=view->image;
+    uint32_t dw=g->w>64?64:g->w,dh=g->h>64?64:g->h;
+    struct brook_geometry cursor=*g;cursor.w=dw;cursor.h=dh;
+    uint32_t pixels[64*64];
+    for (uint32_t y=0;y<dh;++y) for (uint32_t x=0;x<dw;++x) {
+        uint32_t px,py;
+        brook_geometry_pixel(&cursor,image->width,image->height,x,y,&px,&py);
+        pixels[y*dw+x]=image->pixels[(size_t)py*image->width+px];
     }
+    wm_set_cursor_image(pixels,dw,dh,(int64_t)s->cursor_hot_x*dw/g->w,(int64_t)s->cursor_hot_y*dh/g->h);
+}
 static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     struct brook_surface *s=wl_resource_get_user_data(r);
     if (g_trace_frames) { ++s->trace_commits;if (s->pending_buffer) ++s->trace_buffers; }
@@ -628,12 +606,8 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     }
 
 
-    if (s->is_cursor) {
-        surface_cursor_commit(s);
-        if (!surface_tree_commit(s,NULL)) wl_client_post_no_memory(c);
-        return;
-    }
-    struct brook_image *image=s->tree.latest?s->tree.latest->value:NULL;
+    struct brook_view *previous=s->tree.latest?s->tree.latest->value:NULL;
+    struct brook_image *image=previous?previous->image:NULL;
     image_ref(image);
     if (s->pending_attach) {
         image_unref(image);image=NULL;
@@ -657,18 +631,24 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         }
         if (buffer && !image) { wl_client_post_no_memory(c);return; }
     }
-    if (!surface_tree_commit(s,image)) wl_client_post_no_memory(c);
-    else if (!bt_effective_sync(&s->tree)) surface_repaint(s);
+    int committed=surface_tree_commit(s,image);
+    if (!committed) wl_client_post_no_memory(c);
+    else if (committed>0 && s->is_cursor) surface_cursor_commit(s);
+    else if (committed>0 && !bt_effective_sync(&s->tree)) surface_repaint(s);
     image_unref(image);
     buffer_drop(s->pending_buffer);s->pending_buffer=NULL;s->pending_attach=0;
     ++g_commit_count;
 }
 
 static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t) {
-    (void)c; (void)r; (void)t;
+    (void)c;
+    if (t<0 || t>7) { wl_resource_post_error(r,WL_SURFACE_ERROR_INVALID_TRANSFORM,"invalid buffer transform");return; }
+    struct brook_surface *s=wl_resource_get_user_data(r);s->geometry.transform=t;
 }
 static void surface_set_buffer_scale(struct wl_client *c, struct wl_resource *r, int32_t sc) {
-    (void)c; (void)r; (void)sc;
+    (void)c;
+    if (sc<=0) { wl_resource_post_error(r,WL_SURFACE_ERROR_INVALID_SCALE,"invalid buffer scale");return; }
+    struct brook_surface *s=wl_resource_get_user_data(r);s->geometry.scale=sc;
 }
 static void surface_damage_buffer(struct wl_client *c, struct wl_resource *r,
                                   int32_t x, int32_t y, int32_t w, int32_t h) {
@@ -695,6 +675,7 @@ static const struct wl_surface_interface surface_impl = {
 static void surface_destroy_userdata(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (!s) return;
+    if (s->viewport) { wl_resource_set_user_data(s->viewport,NULL);s->viewport=NULL; }
     /* Scrub references to this surface from all seat clients before we free
      * it.  Without this, a subsequent input event would dereference freed
      * memory and (more visibly) call wl_pointer.send_leave with a surface
@@ -1291,37 +1272,9 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
             cs->cursor_hot_y = hy;
         }
 
-        /* If buffer is already attached, upload immediately */
-        if (cs && cs->pending_buffer) {
-            struct wl_shm_buffer *shm = cs->pending_buffer->shm;
-            if (shm) {
-                fprintf(stderr, "[waylandd] set_cursor: buf attached, uploading immediately\n");
-                int32_t w = wl_shm_buffer_get_width(shm);
-                int32_t h = wl_shm_buffer_get_height(shm);
-                if (w > 0 && h > 0) {
-                    wl_shm_buffer_begin_access(shm);
-                    const uint32_t *pixels = (const uint32_t *)wl_shm_buffer_get_data(shm);
-                    int32_t stride_px = wl_shm_buffer_get_stride(shm) / 4;
-                    uint32_t format = wl_shm_buffer_get_format(shm);
-                    int force_opaque = (format != WL_SHM_FORMAT_ARGB8888);
-                    uint32_t dw = (uint32_t)w > 64 ? 64 : (uint32_t)w;
-                    uint32_t dh = (uint32_t)h > 64 ? 64 : (uint32_t)h;
-                    uint32_t buf[64*64];
-                    for (uint32_t dy = 0; dy < dh; dy++) {
-                        uint32_t sy = (dw == (uint32_t)w) ? dy : (dy * (uint32_t)h / dh);
-                        for (uint32_t dx = 0; dx < dw; dx++) {
-                            uint32_t sx = (dh == (uint32_t)h) ? dx : (dx * (uint32_t)w / dw);
-                            uint32_t px = pixels[sy * stride_px + sx];
-                            buf[dy * dw + dx] = force_opaque ? (0xFF000000u | (px & 0x00FFFFFFu)) : px;
-                        }
-                    }
-                    int32_t shx = hx * (int32_t)dw / w;
-                    int32_t shy = hy * (int32_t)dh / h;
-                    wm_set_cursor_image(buf, dw, dh, shx, shy);
-                    wl_shm_buffer_end_access(shm);
-                }
-            }
-        }
+        /* set_cursor selects committed content. Pending attachments and
+         * viewport/scale changes become visible only at wl_surface.commit. */
+        if (cs) surface_cursor_commit(cs);
     } else {
         /* Reset to built-in cursor */
         wm_set_cursor_image(NULL, 0, 0, 0, 0);
@@ -2165,35 +2118,48 @@ static void kde_decoration_manager_bind(struct wl_client *c, void *data,
     fprintf(stderr, "[waylandd] KDE decoration manager default=server\n");
 }
 
-/* ---------------- wp_viewporter (stub for SDL3) ---------------- */
+/* ---------------- wp_viewporter (double-buffered surface geometry) ---------------- */
+static struct brook_surface *viewport_surface(struct wl_resource *r) {
+    struct brook_surface *s=wl_resource_get_user_data(r);
+    if (!s) wl_resource_post_error(r,WP_VIEWPORT_ERROR_NO_SURFACE,"viewport surface destroyed");
+    return s;
+}
+static void viewport_resource_destroy(struct wl_resource *r) {
+    struct brook_surface *s=wl_resource_get_user_data(r);
+    if (s) {
+        s->viewport=NULL;s->geometry.source_set=s->geometry.destination_set=0;
+    }
+}
 static void viewport_destroy(struct wl_client *c, struct wl_resource *r) {
-    (void)c; wl_resource_destroy(r);
+    (void)c;wl_resource_destroy(r);
 }
 static void viewport_set_source(struct wl_client *c, struct wl_resource *r,
-                                wl_fixed_t x, wl_fixed_t y,
-                                wl_fixed_t w, wl_fixed_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+                                wl_fixed_t x, wl_fixed_t y,wl_fixed_t w,wl_fixed_t h) {
+    (void)c;struct brook_surface *s=viewport_surface(r);if (!s) return;
+    if (x==-256 && y==-256 && w==-256 && h==-256) { s->geometry.source_set=0;return; }
+    if (x<0 || y<0 || w<=0 || h<=0) {
+        wl_resource_post_error(r,WP_VIEWPORT_ERROR_BAD_VALUE,"invalid source rectangle");return;
+    }
+    s->geometry.source_set=1;s->geometry.x=x;s->geometry.y=y;s->geometry.w=w;s->geometry.h=h;
 }
-static void viewport_set_destination(struct wl_client *c, struct wl_resource *r,
-                                     int32_t w, int32_t h) {
-    (void)c; (void)r; (void)w; (void)h;
+static void viewport_set_destination(struct wl_client *c, struct wl_resource *r,int32_t w,int32_t h) {
+    (void)c;struct brook_surface *s=viewport_surface(r);if (!s) return;
+    if (w==-1 && h==-1) { s->geometry.destination_set=0;return; }
+    if (w<=0 || h<=0) { wl_resource_post_error(r,WP_VIEWPORT_ERROR_BAD_VALUE,"invalid destination size");return; }
+    s->geometry.destination_set=1;s->geometry.dw=w;s->geometry.dh=h;
 }
 static const struct wp_viewport_interface viewport_impl = {
-    .destroy         = viewport_destroy,
-    .set_source      = viewport_set_source,
-    .set_destination = viewport_set_destination,
+    .destroy=viewport_destroy,.set_source=viewport_set_source,.set_destination=viewport_set_destination,
 };
-
 static void viewporter_destroy(struct wl_client *c, struct wl_resource *r) {
-    (void)c; wl_resource_destroy(r);
+    (void)c;wl_resource_destroy(r);
 }
-static void viewporter_get_viewport(struct wl_client *c, struct wl_resource *r,
-                                     uint32_t id, struct wl_resource *surface) {
-    (void)surface;
-    struct wl_resource *vp = wl_resource_create(c, &wp_viewport_interface,
-                                                 wl_resource_get_version(r), id);
-    if (!vp) { wl_client_post_no_memory(c); return; }
-    wl_resource_set_implementation(vp, &viewport_impl, NULL, NULL);
+static void viewporter_get_viewport(struct wl_client *c, struct wl_resource *r,uint32_t id,struct wl_resource *surface) {
+    struct brook_surface *s=wl_resource_get_user_data(surface);
+    if (s->viewport) { wl_resource_post_error(r,WP_VIEWPORTER_ERROR_VIEWPORT_EXISTS,"surface already has a viewport");return; }
+    struct wl_resource *vp=wl_resource_create(c,&wp_viewport_interface,wl_resource_get_version(r),id);
+    if (!vp) { wl_client_post_no_memory(c);return; }
+    s->viewport=vp;wl_resource_set_implementation(vp,&viewport_impl,s,viewport_resource_destroy);
 }
 static const struct wp_viewporter_interface viewporter_impl = {
     .destroy      = viewporter_destroy,

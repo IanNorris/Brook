@@ -29,7 +29,7 @@ int main(void) {
     snapshot(c,0xffff0000,1,1);snapshot(p,0xffabcdef,2,2);
     snapshot(c,0xff0000ff,1,1);snapshot(r,0xff102030,4,3);
     assert(vfb[5]==0xffff0000 && vfb[0]==0xff102030); // captured A, not newer B
-    assert(c->tree.cached && ((struct brook_image *)c->tree.cached->value)->pixels[0]==0xff0000ff);
+    assert(c->tree.cached && ((struct brook_view *)c->tree.cached->value)->image->pixels[0]==0xff0000ff);
     snapshot(r,0xff102030,4,3);assert(vfb[5]==0xffff0000);
     surface_commit(client,p->resource);surface_commit(client,r->resource);assert(vfb[5]==0xff0000ff);
     subsurface_place_below(client,c->subsurface_resource,p->resource);

@@ -50,9 +50,23 @@ static struct brook_image *image_snapshot(const uint8_t *src,int w,int h,int str
     }
     return image;
 }
+/* Each commit retains its own geometry while sharing immutable pixel storage.
+ * Metadata-only commits therefore neither capture nor release a producer. */
+struct brook_view {
+    unsigned refs;
+    struct brook_image *image;
+    struct brook_geometry geometry;
+};
+static void view_ref(void *value) { if(value) ++((struct brook_view *)value)->refs; }
+static void view_unref(void *value) {
+    struct brook_view *view=value;
+    if (!view || --view->refs) return;
+    image_unref(view->image);free(view);
+}
 static void surface_tree_apply(struct bt_node *node,void *value) {
-    struct brook_surface *s=node->user;struct brook_image *image=value;
-    s->image=image?image->pixels:NULL;s->image_w=image?image->width:0;s->image_h=image?image->height:0;
+    struct brook_surface *s=node->user;struct brook_view *view=value;
+    struct brook_image *image=view?view->image:NULL;
+    s->image=image?image->pixels:NULL;s->image_w=view?view->geometry.w:0;s->image_h=view?view->geometry.h:0;
     s->sub_x=node->x;s->sub_y=node->y;
     struct brook_frame_callback *frame,*next;
     wl_list_for_each_safe(frame,next,&s->waiting_frames,link) {
@@ -61,19 +75,33 @@ static void surface_tree_apply(struct bt_node *node,void *value) {
     }
 }
 static void surface_tree_free(struct bt_node *node) { free(node->user); }
-static const struct bt_ops surface_tree_ops={image_ref,image_unref,surface_tree_apply,surface_tree_free};
+static const struct bt_ops surface_tree_ops={view_ref,view_unref,surface_tree_apply,surface_tree_free};
 static void surface_tree_init(struct brook_surface *s) {
     bt_node_init(&s->tree,&surface_tree_ops,s);
     wl_list_init(&s->pending_frames);wl_list_init(&s->waiting_frames);wl_list_init(&s->committed_frames);
 }
 static int surface_tree_commit(struct brook_surface *s,struct brook_image *image) {
+    struct brook_view *view=NULL;
+    struct brook_geometry geometry;
+    int error=brook_geometry_resolve(&s->geometry,image?image->width:0,image?image->height:0,&geometry);
+    if (error) {
+        if (s->viewport && error!=BROOK_GEOMETRY_BUFFER_SIZE) wl_resource_post_error(s->viewport,
+            error==BROOK_GEOMETRY_BOUNDS?WP_VIEWPORT_ERROR_OUT_OF_BUFFER:WP_VIEWPORT_ERROR_BAD_SIZE,
+            "invalid committed viewport geometry");
+        else wl_resource_post_error(s->resource,WL_SURFACE_ERROR_INVALID_SIZE,"invalid buffer geometry");
+        return -1;
+    }
+    if (image) {
+        view=calloc(1,sizeof(*view));if (!view) return 0;
+        view->refs=1;view->image=image;view->geometry=geometry;image_ref(image);
+    }
     struct brook_frame_callback *frame;
     uint32_t now=g_trace_frames?g_now_ms():0;
     wl_list_for_each(frame,&s->pending_frames,link) {
         frame->commit=s->tree.sequence+1;frame->committed_ms=now;
     }
     wl_list_insert_list(s->waiting_frames.prev,&s->pending_frames);wl_list_init(&s->pending_frames);
-    return bt_commit(&s->tree,image);
+    int result=bt_commit(&s->tree,view);view_unref(view);return result;
 }
 static void surface_unmap(struct brook_surface *s) {
     if (s->wm_id && (s->xdg_toplevel || s->xdg_popup)) {
@@ -83,24 +111,24 @@ static void surface_unmap(struct brook_surface *s) {
     if (s->wm_id) wm_destroy_window(s->wm_id);
     s->wm_id=0;s->vfb=NULL;s->vfb_w=s->vfb_h=s->vfb_stride=0;
 }
-static int surface_window(struct brook_surface *s,struct brook_image *image) {
-    if (!image) { if (s->xdg_toplevel || s->xdg_popup) surface_unmap(s);return 1; }
+static int surface_window(struct brook_surface *s,struct brook_view *view) {
+    if (!view) { if (s->xdg_toplevel || s->xdg_popup) surface_unmap(s);return 1; }
     if (!(s->xdg_toplevel || s->xdg_popup)) return 1;
     if (!s->xdg_acked) return 1;
     struct brook_wm_create_out out={0};
     if (!s->wm_id) {
         int csd=s->xdg_popup || s->deco_csd || (s->xdg_toplevel && !s->deco_negotiated);
         unsigned flags=(csd?BROOK_WM_CREATE_FLAG_CSD:0)|(s->xdg_popup?BROOK_WM_CREATE_FLAG_NO_FOCUS:0);
-        if (wm_create_window(image->width,image->height,s->title[0]?s->title:NULL,flags,&out) || !out.wm_id) return 0;
+        if (wm_create_window(view->geometry.w,view->geometry.h,s->title[0]?s->title:NULL,flags,&out) || !out.wm_id) return 0;
         s->wm_id=out.wm_id;s->scene_disabled=0;
         wm_register_client(s->wm_id,s->resource);
         if (s->app_id[0]) wm_set_app_id(s->wm_id,s->app_id);
         s->deco_pending=0;popup_apply_position(s);
-    } else if (s->vfb_w!=image->width || s->vfb_h!=image->height) {
-        if (wm_resize_vfb(s->wm_id,image->width,image->height,&out) || !out.vfb_user) return 0;
+    } else if (s->vfb_w!=view->geometry.w || s->vfb_h!=view->geometry.h) {
+        if (wm_resize_vfb(s->wm_id,view->geometry.w,view->geometry.h,&out) || !out.vfb_user) return 0;
     } else return 1;
     s->vfb=(uint32_t *)(uintptr_t)out.vfb_user;s->vfb_stride=out.vfb_stride;
-    s->vfb_w=image->width;s->vfb_h=image->height;return 1;
+    s->vfb_w=view->geometry.w;s->vfb_h=view->geometry.h;return 1;
 }
 static int scene_ensure(struct brook_surface *s) {
     if (s->scene || s->scene_disabled) return 1;
@@ -143,7 +171,7 @@ static int image_gpu(struct brook_image *image,struct brook_scene_owner *owner) 
     if (image->source) { buffer_release(image->source);buffer_drop(image->source);image->source=NULL; }
     return 1;
 }
-struct brook_draw { struct brook_image *image;int64_t x,y; };
+struct brook_draw { struct brook_view *view;int64_t x,y; };
 /* Every traversed node is mapped and contributes a layer. Thus the backend's
  * 64-layer bound also bounds this stack, independently of protocol tree depth. */
 static int surface_layers(struct brook_surface *root,struct brook_draw *draw,unsigned *count) {
@@ -187,7 +215,7 @@ static uint32_t pixel_straight(uint32_t px) {
 }
 static int surface_render(struct brook_surface *root) {
     if ((root->xdg_toplevel || root->xdg_popup) && !root->xdg_acked) return 1;
-    struct brook_image *base=root->tree.current?root->tree.current->value:NULL;
+    struct brook_view *base=root->tree.current?root->tree.current->value:NULL;
     if (!surface_window(root,base)) return 0;
     if (!root->wm_id || !root->vfb) return 1;
     if (!scene_ensure(root)) return 0;
@@ -196,10 +224,11 @@ static int surface_render(struct brook_surface *root) {
     if (root->scene) {
         struct SceneLayerDesc layers[64];unsigned n=0;
         for (unsigned i=0;i<count;++i) {
-            struct brook_draw *d=&draws[i];struct brook_image *image=d->image;
-            if (d->x>=root->vfb_w || d->y>=root->vfb_h || d->x+image->width<=0 || d->y+image->height<=0) continue;
+            struct brook_draw *d=&draws[i];struct brook_view *view=d->view;
+            struct brook_image *image=view->image;const struct brook_geometry *g=&view->geometry;
+            if (d->x>=root->vfb_w || d->y>=root->vfb_h || d->x+g->w<=0 || d->y+g->h<=0) continue;
             if (!image_gpu(image,root->scene)) return 0;
-            layers[n++]=(struct SceneLayerDesc){image->version,0,0,image->width,image->height,(int32_t)d->x,(int32_t)d->y,image->width,image->height,255,0,0,root->vfb_w,root->vfb_h,0};
+            layers[n++]=(struct SceneLayerDesc){image->version,g->sx,g->sy,g->sw,g->sh,(int32_t)d->x,(int32_t)d->y,g->w,g->h,255,0,0,root->vfb_w,root->vfb_h,SCENE_LAYER_FIXED8|(g->transform<<SCENE_LAYER_TRANSFORM_SHIFT)};
         }
         struct ScenePresentDesc desc={(uintptr_t)layers,n,root->vfb_w,root->vfb_h,0};
         long result=scene_ctl(root->scene->fd,SCENE_CTL_PRESENT,&desc,sizeof(desc));
@@ -214,14 +243,16 @@ static int surface_render(struct brook_surface *root) {
     }
     memset(root->composite,0,pixels*4);
     for (unsigned i=0;i<count;++i) {
-        struct brook_draw *d=&draws[i];struct brook_image *image=d->image;
+        struct brook_draw *d=&draws[i];struct brook_view *view=d->view;
+            struct brook_image *image=view->image;const struct brook_geometry *g=&view->geometry;
         if (!image->pixels) return 0; // Never read back a GPU producer as a fallback.
-        int64_t x0=d->x<0?-d->x:0,y0=d->y<0?-d->y:0,x1=image->width,y1=image->height;
+        int64_t x0=d->x<0?-d->x:0,y0=d->y<0?-d->y:0,x1=g->w,y1=g->h;
         if (d->x+x1>root->vfb_w) x1=(int64_t)root->vfb_w-d->x;
         if (d->y+y1>root->vfb_h) y1=(int64_t)root->vfb_h-d->y;
         for (int64_t y=y0;y<y1;++y) for (int64_t x=x0;x<x1;++x) {
             uint32_t *out=&root->composite[(size_t)(d->y+y)*root->vfb_w+d->x+x];
-            *out=pixel_over(image->pixels[(size_t)y*image->width+x],*out);
+            uint32_t px,py;brook_geometry_pixel(g,image->width,image->height,x,y,&px,&py);
+            *out=pixel_over(image->pixels[(size_t)py*image->width+px],*out);
         }
     }
     for (unsigned y=0;y<root->vfb_h;++y) for (unsigned x=0;x<root->vfb_w;++x)

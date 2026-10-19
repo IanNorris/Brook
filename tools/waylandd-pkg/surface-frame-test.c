@@ -20,7 +20,7 @@ int main(void) {
     uint32_t pixel=0xff112233,vfb=0;
     surface.vfb=&vfb;surface.vfb_w=surface.vfb_h=surface.vfb_stride=1;surface.scene_disabled=1;
     struct brook_image *mapped=image_snapshot((uint8_t *)&pixel,1,1,4,WL_SHM_FORMAT_ARGB8888);assert(mapped);
-    assert(bt_commit(&surface.tree,mapped));image_unref(mapped);
+    assert(surface_tree_commit(&surface,mapped));image_unref(mapped);
     surface.resource=wl_resource_create(client,&wl_surface_interface,4,2);
     assert(surface.resource);
     wl_resource_set_user_data(surface.resource,&surface);
@@ -82,7 +82,7 @@ int main(void) {
     surface.vfb_w=852;surface.vfb_h=652;surface.vfb_stride=852; // CSD shadow margins
     surface.vfb=calloc(852*652,4);assert(surface.vfb);
     struct brook_image *csd=image_snapshot((uint8_t *)surface.vfb,852,652,852*4,WL_SHM_FORMAT_ARGB8888);assert(csd);
-    assert(bt_commit(&surface.tree,csd));image_unref(csd);
+    assert(surface_tree_commit(&surface,csd));image_unref(csd);
     xdg_surface_set_window_geometry(client,surface.xdg_surface,26,26,800,600);
     assert(surface.window_geometry_pending && surface.window_geometry_w==0);
     surface_commit(client,surface.resource);

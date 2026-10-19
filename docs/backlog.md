@@ -1369,3 +1369,14 @@ alongside app/save/close handling, launch admission, tagged service teardown,
 pending-birth/cleanup drain and a final block-write barrier. Extend the lifecycle
 matrix as described above. Refine PID exhaustion errno (currently inherited ENOMEM) separately.
 This does not implement OOM victim selection or repair MLFQ policy replacement.
+
+### Wine CSD interactive resize
+
+The Wine/DXVK diagnostic at
+`build/workloads/wine-dxvk-20261019/viewport-diagnostic2` reaches
+`xdg_toplevel.resize` and acknowledges the resulting configure, but does not
+publish a newly sized backing before the timeout. Native size becomes
+1288x753 while the earlier 648x394 image remains. Compare a deterministic
+Win32 `SetWindowPos` resize with mouse drag; capture blocked thread/profile
+state before attributing this to either the protocol or Vulkan swapchain.
+Do not count this diagnostic as resize acceptance.

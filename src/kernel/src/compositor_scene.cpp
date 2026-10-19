@@ -324,9 +324,9 @@ int64_t ScenePresent(Process* caller,SceneHandle* handle,const ScenePresentDesc&
     if (g_bindings[scene->binding.wmId-1]!=scene || scene->closing) error=-116;
     for (uint32_t i=0;!error && i<desc.count;++i) {
         const auto& l=layers[i];SceneImageInfo image{};
-        if (l.reserved || !scene->images.GetPublished(l.version,image)) { error=-22;break; }
+        if ((l.reserved&~SCENE_LAYER_FLAGS_MASK) || !scene->images.GetPublished(l.version,image)) { error=-22;break; }
         job->versions[i]=l.version;
-        job->layers[i]={image.texture,l.sx,l.sy,l.sw,l.sh,l.x,l.y,l.w,l.h,l.opacity,l.clipX,l.clipY,l.clipW,l.clipH};
+        job->layers[i]={image.texture,l.sx,l.sy,l.sw,l.sh,l.x,l.y,l.w,l.h,l.opacity,l.clipX,l.clipY,l.clipW,l.clipH,l.reserved};
         GpuSceneRect rect{};
         if (!GpuSceneClip(job->layers[i],image.width,image.height,desc.width,desc.height,rect)) error=-22;
     }

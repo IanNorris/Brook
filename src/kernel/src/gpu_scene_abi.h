@@ -30,13 +30,16 @@ struct SceneDmabufCaptureDesc {
     uint32_t gem,width,height,fourcc,stride,offset,flags;
     uint64_t modifier;
 };
+// Source coordinates use transformed buffer space. Legacy zero flags retain
+// integer coordinates and the normal transform. Unknown bits are rejected.
+enum { SCENE_LAYER_FIXED8=1, SCENE_LAYER_TRANSFORM_SHIFT=1, SCENE_LAYER_FLAGS_MASK=15 };
 struct SceneLayerDesc {
     uint64_t version;
     uint32_t sx,sy,sw,sh;
     int32_t x,y;
     uint32_t w,h,opacity;
     int32_t clipX,clipY;
-    uint32_t clipW,clipH,reserved;
+    uint32_t clipW,clipH,reserved; // Scene layer flags (wire layout unchanged)
 };
 struct ScenePresentDesc {
     uint64_t layers;

@@ -83,19 +83,37 @@ fault. Original documents and profiles match the checked seed after shutdown
 and offline filesystem checks. This is an offscreen checkpoint, not full
 window/game acceptance.
 
-Visible rendering now reaches the desktop. The next blocker is Brook's
-advertised-but-stubbed `wp_viewporter`: Wine crops padded SHM buffers and sets
-surface destinations through this protocol. Ignoring these requests exposes
-white padding and breaks window geometry. Implementing committed view state
-is required before claiming resize/lifecycle acceptance. The existing buffer
-scale/transform stubs also need composing with viewport state, as defined by
-the [protocol](https://raw.githubusercontent.com/wayland-mirror/wayland-protocols/main/stable/viewporter/viewporter.xml).
+Brook now implements committed `wp_viewporter` crop/destination state, buffer
+scale and all eight transforms. Each commit retains a geometry wrapper around
+shared immutable pixel storage. Metadata-only commits do not recapture or
+release DMA-BUF producers. Cursor selection also uses committed geometry.
+CPU sampling and GPU UVs use matching pixel centers, with 64-bit rational UVs
+for fractional sources and clipping. Integer scene requests retain their
+semantics; optional flags use the existing reserved wire word. The internal
+module interface is ABI 33, requiring the kernel and every driver to rebuild
+together. Geometry follows the [viewporter specification](https://raw.githubusercontent.com/wayland-mirror/wayland-protocols/main/stable/viewporter/viewporter.xml)
+and [core buffer transform/scale contract](https://raw.githubusercontent.com/wayland-mirror/wayland/main/protocol/wayland.xml).
 
-The implementation must retain immutable image storage independently of each
-commit's crop, scale and transform; metadata-only commits must not recapture or
-prematurely release DMA-BUF producers. CPU and retained GPU paths need matching
-pixel-center sampling, fractional source positions, all eight transforms,
-negative destination clipping, protocol lifecycle/error handling, synchronized
-child snapshots, and cursor geometry. Existing integer scene-layer requests
-must retain their semantics. Full Wine window/Snake acceptance and Linux
-GL/Vulkan regression checks remain open.
+Validation so far:
+
+- All 57 hosted tests passed; the scene test additionally covers fractional
+  crops, maximum fixed-point numerators, all transforms, and a combined
+  non-square, scale-two, reflected quarter-turn case.
+- All ten production Wayland tests pass, including committed/cached viewport
+  pixels, shared DMA-BUF storage without duplicate capture/release, cursor
+  sampling, destruction/recreation, and ten protocol error scenarios.
+- `viewport-candidate` and `viewport-diagnostic2` pass the actual hardware
+  compositor boot readback, including fractional crops and all transforms.
+- `viewport-diagnostic2/window1-initial.png` shows the D3D11 triangle in a
+  correctly cropped 648x394 Wine frame, without the former padded white area.
+
+These remain diagnostic runs, not complete Wine/DXVK acceptance. The second
+repeated offscreen launch in `viewport-candidate` is killed with SIGKILL during
+device teardown after correct shader readback. No guest fault or renderer error
+was recorded. A CSD mouse drag reaches Brook's resize handler and Wine's
+configure acknowledgement, but a new frame has not appeared; native dimensions
+are 1288x753 while the rendered backing remains at its earlier size. Both runs
+completed checked shutdown and offline filesystem checks. Process tracing and
+a deterministic Win32 resize are the next diagnostics. Windows Snake, repeated
+visible launch/close, profiling, Linux GL/Vulkan regressions and final saved-data
+audits remain required before completing this goal.

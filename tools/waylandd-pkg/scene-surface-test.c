@@ -104,7 +104,7 @@ int main(void) {
     pixels(r,0xff112233,4,3);
     assert(captures==1 && screen[5]==0xff00ff00 && !releases(display,sockets[1],id));
     assert(wl_list_length(&c->committed_frames)==1 && wl_list_length(&c->waiting_frames)==1);
-    struct brook_image *cached=c->tree.cached->value;
+    struct brook_image *cached=((struct brook_view *)c->tree.cached->value)->image;
     assert(cached->source && cached->source->uses==1); // A cannot release B's producer.
     surface_commit(client,p->resource);surface_commit(client,r->resource);
     assert(captures==2 && screen[5]==0xff00ff00 && releases(display,sockets[1],id)==1);
@@ -112,6 +112,19 @@ int main(void) {
     producer=0xffff0000;surface_repaint(r);assert(captures==2 && screen[5]==0xff00ff00);
     present_result=-116;assert(surface_render(r) && screen[5]==0xff00ff00);
     present_result=0;assert(surface_render(r) && screen[5]==0xff00ff00 && captures==2);
+    // Viewport-only commits share the completed image, without recapturing or
+    // releasing a producer again (including synchronized child snapshots).
+    struct wl_resource *manager=wl_resource_create(client,&wp_viewporter_interface,1,0);assert(manager);
+    struct brook_image *storage=((struct brook_view *)c->tree.current->value)->image;
+    viewporter_get_viewport(client,manager,0,c->resource);assert(c->viewport);
+    viewport_set_destination(client,c->viewport,2,1);surface_commit(client,c->resource);
+    assert(((struct brook_view *)c->tree.cached->value)->image==storage);
+    assert(((struct brook_view *)c->tree.current->value)->geometry.w==1);
+    surface_commit(client,p->resource);surface_commit(client,r->resource);
+    assert(captures==2 && !releases(display,sockets[1],id) && screen[5]==0xff00ff00 && screen[6]==0xff00ff00);
+    viewport_destroy(client,c->viewport);surface_commit(client,c->resource);
+    surface_commit(client,p->resource);surface_commit(client,r->resource);
+    assert(captures==2 && screen[5]==0xff00ff00 && screen[6]==0xff112233);
     // Retained images migrate after the old root window disappears, without
     // reading a released producer or publishing the new root prematurely.
     surface_unmap(r);r->wm_id=1;r->vfb=vfb;r->vfb_w=4;r->vfb_h=3;r->vfb_stride=4;
@@ -129,7 +142,7 @@ int main(void) {
     surface_attach(client,c->resource,buffer,0,0);surface_commit(client,c->resource);
     uncertain_capture=1;pixels(r,0xff112233,4,3);
     assert(!releases(display,sockets[1],id));
-    struct brook_image *waiting=c->tree.cached->value;
+    struct brook_image *waiting=((struct brook_view *)c->tree.cached->value)->image;
     assert(waiting->source->uncertain && waiting->source->uses==2);
     surface_destroy(client,r->resource);surface_destroy(client,p->resource);surface_destroy(client,c->resource);
     assert(!releases(display,sockets[1],id) && !g_surfaces);
