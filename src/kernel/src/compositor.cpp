@@ -25,7 +25,11 @@
 #include "fw_cfg.h"
 #include "font_atlas.h"
 #include "debug_overlay.h"
+#ifdef BROOK_HOST_TEST
+#include <cstring>
+#else
 #include "string.h"
+#endif
 
 namespace brook {
 
@@ -313,6 +317,7 @@ CompositorTiming CompositorGetTiming()
             periods[(n*95+99)/100-1], periods[n-1], tick};
 }
 
+
 bool CompositorGpuActive();
 static KMutex g_debugFrameLock{};
 static DebugFrameSnapshot g_debugFrame{};
@@ -500,8 +505,156 @@ static int32_t   g_gpuMouseDemoX  = 0;
 static int32_t   g_gpuMouseDemoY  = 0;
 static GpuTexId  g_cursorTex      = 0;       // ARGB cursor sprite
 // Per-window-slot content texture tracking (recreated when the VFB changes).
-struct WinTexEntry { GpuTexId tex; uint32_t* vfb; uint32_t w; uint32_t h; bool alpha; };
+struct WinTexEntry {
+    GpuTexId tex; uint32_t* vfb; uint32_t w,h; bool alpha,owned;
+    uint64_t incarnation,generation;
+    GpuTexId staging; uint32_t stagingW,stagingH;
+};
 static WinTexEntry g_winTex[WM_MAX_WINDOWS] = {};
+
+// Requests never borrow a syscall stack or Process pointer. Caller and worker
+// own independent references; uncertain GPU completion retains the worker lease.
+enum class CaptureState { Queued,Running,Publishing,Done };
+struct CaptureRequest {
+    CaptureRequest* next;
+    WmCaptureToken token;
+    MappingBacking* sourceLease;
+    int32_t producer;uint32_t source,references;
+    CaptureState state;bool canceled;int result;
+};
+static KMutex g_captureLock{};
+static CaptureRequest* g_captureHead;
+static CaptureRequest* g_captureTail;
+static CaptureRequest* g_captureQuarantine;
+static uint32_t g_captureCount;
+static constexpr uint32_t MAX_CAPTURE_REQUESTS=64;
+static void CaptureUnref(CaptureRequest* request)
+{
+    if (__atomic_fetch_sub(&request->references,1,__ATOMIC_ACQ_REL)!=1) return;
+    MappingBackingUnref(request->sourceLease);kfree(request);
+}
+int CompositorCaptureExternal(Process* caller,const WmCaptureToken& token,
+                              MappingBacking* lease,int32_t producer,uint32_t source)
+{
+    if (!CompositorGpuActive() || !lease) return -95;
+    auto* request=static_cast<CaptureRequest*>(kmalloc(sizeof(CaptureRequest)));
+    if (!request) return -12;
+    *request={nullptr,token,lease,producer,source,2,CaptureState::Queued,false,-5};
+    MappingBackingRef(lease);
+    KMutexLock(&g_captureLock);
+    if (g_captureCount>=MAX_CAPTURE_REQUESTS) {
+        KMutexUnlock(&g_captureLock);request->references=1;CaptureUnref(request);return -11;
+    }
+    ++g_captureCount;
+    if (g_captureTail) g_captureTail->next=request;else g_captureHead=request;
+    g_captureTail=request;KMutexUnlock(&g_captureLock);
+    CompositorWake();
+    const uint64_t deadline=g_lapicTickCount+5000;
+    int result;
+    for (;;) {
+        KMutexLock(&g_captureLock);
+        if (request->state==CaptureState::Done) {
+            result=request->result;KMutexUnlock(&g_captureLock);break;
+        }
+        const bool cancel=g_lapicTickCount>=deadline ||
+            (caller && __atomic_load_n(&caller->terminalPending,__ATOMIC_ACQUIRE));
+        if (cancel && request->state==CaptureState::Queued) {
+            CaptureRequest* previous=nullptr;
+            for (auto* item=g_captureHead;item;item=item->next) {
+                if (item==request) {
+                    if (previous) previous->next=item->next;else g_captureHead=item->next;
+                    if (g_captureTail==item) g_captureTail=previous;
+                    --g_captureCount;break;
+                }
+                previous=item;
+            }
+            request->state=CaptureState::Done;request->result=-110;
+            KMutexUnlock(&g_captureLock);CaptureUnref(request);result=-110;break;
+        }
+        // Running cancellation suppresses publication, but must wait for the
+        // bounded GPU operation to finish. It never turns a timeout into reuse
+        // permission while the host might still be reading the source.
+        if (cancel && request->state==CaptureState::Running) request->canceled=true;
+        KMutexUnlock(&g_captureLock);
+        SchedulerSleepMs(1);
+    }
+    CaptureUnref(request);return result;
+}
+static void DestroyWindowTexture(const GpuCompositorOps* gpu,WinTexEntry& entry)
+{
+    if (entry.tex) {
+        if (entry.owned) gpu->DestroyOwnedTexture(entry.tex);
+        else gpu->DestroyTexture(entry.tex);
+    }
+    if (entry.staging) gpu->DestroyOwnedTexture(entry.staging);
+    entry={};
+}
+static void DrainOwnedCaptures()
+{
+    const auto* gpu=GpuCompositorGet();
+    // Retire dead/reused/SHM slots even when invisible or minimized.
+    if (gpu) for (uint32_t slot=0;slot<WM_MAX_WINDOWS;++slot) {
+        auto& entry=g_winTex[slot];auto snapshot=WmSnapshotContent(slot);
+        if ((entry.tex || entry.staging) && (!snapshot.live || entry.incarnation!=snapshot.incarnation ||
+            (entry.owned && !snapshot.externalCaptured))) DestroyWindowTexture(gpu,entry);
+    }
+    // Bound one drain: new submissions are handled by the next wake/frame.
+    for (uint32_t count=0;count<MAX_CAPTURE_REQUESTS;++count) {
+        KMutexLock(&g_captureLock);
+        auto* request=g_captureHead;
+        if (!request) { KMutexUnlock(&g_captureLock);break; }
+        g_captureHead=request->next;if (!g_captureHead) g_captureTail=nullptr;
+        request->next=nullptr;request->state=CaptureState::Running;
+        KMutexUnlock(&g_captureLock);
+        int result=-116;bool uncertain=false;
+        if (CompositorGpuActive() && gpu && gpu->CaptureExternal &&
+            WmCaptureCurrent(request->token)) {
+            auto& entry=g_winTex[request->token.wmId-1];
+            const auto& token=request->token;
+            if (entry.staging && (entry.stagingW!=token.w || entry.stagingH!=token.h)) {
+                gpu->DestroyOwnedTexture(entry.staging);entry.staging=0;
+            }
+            if (!entry.staging) {
+                entry.staging=gpu->CreateOwnedTexture(token.w,token.h,false);
+                entry.stagingW=token.w;entry.stagingH=token.h;
+            }
+            if (!entry.staging) result=-12;
+            else {
+                const auto captured=gpu->CaptureExternal(entry.staging,request->producer,
+                    request->source,token.w,token.h);
+                if (captured==GpuCaptureResult::Uncertain) {
+                    // The driver quarantines this handle. Keep source lifetime
+                    // and queue capacity reserved until device reset, too.
+                    uncertain=true;entry.staging=0;result=-5;
+                } else if (captured==GpuCaptureResult::Complete) {
+                    KMutexLock(&g_captureLock);
+                    const bool publish=!request->canceled;
+                    request->state=CaptureState::Publishing;
+                    KMutexUnlock(&g_captureLock);
+                    if (publish && WmCompleteCapture(token)) {
+                        const GpuTexId old=entry.tex;
+                        const bool reusable=entry.owned && entry.w==token.w && entry.h==token.h;
+                        if (old && !reusable) {
+                            if (entry.owned) gpu->DestroyOwnedTexture(old);else gpu->DestroyTexture(old);
+                        }
+                        entry.tex=entry.staging;entry.w=token.w;entry.h=token.h;
+                        entry.vfb=nullptr;entry.alpha=false;entry.owned=true;
+                        entry.incarnation=token.incarnation;entry.generation=token.generation;
+                        entry.staging=reusable?old:0;
+                        result=0;
+                    }
+                }
+            }
+        }
+        KMutexLock(&g_captureLock);
+        request->result=result;request->state=CaptureState::Done;
+        if (uncertain) { request->next=g_captureQuarantine;g_captureQuarantine=request; }
+        else --g_captureCount;
+        KMutexUnlock(&g_captureLock);
+        if (!uncertain) CaptureUnref(request);
+    }
+}
+
 
 bool CompositorGpuActive()
 {
@@ -2726,7 +2879,9 @@ static void GpuDrawWindowContent(const GpuCompositorOps* gpu, const Window* w,
                                  const WinTexEntry& e, uint32_t scrW, uint32_t scrH,
                                  uint32_t opacity)
 {
-    if (!e.tex) return;
+    const auto content=WmSnapshotContent(w->wmId? w->wmId-1:WM_MAX_WINDOWS);
+    if (!e.tex || !content.live || e.incarnation!=content.incarnation ||
+        (content.externalCaptured ? (!e.owned || e.generation!=content.generation) : e.owned)) return;
     int dx = w->clientX(), dy = w->clientY();
     int dw = w->clientW,  dh = w->clientH;
     if (dx >= (int)scrW || dy >= (int)scrH || dx + dw <= 0 || dy + dh <= 0) return;
@@ -2889,6 +3044,8 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         int idx = sorted[i];
         Window* w = WmGetWindow(idx);
         if (!w || !w->visible || w->minimized) continue;
+        const auto publication=WmSnapshotContent(idx);
+        if (!publication.live || publication.externalCaptured) continue;
         uint64_t vaddr; uint32_t sw, sh;
         if (!WindowContentSource(w, &vaddr, &sw, &sh)) continue;
 
@@ -2907,35 +3064,26 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         // SHM Wayland buffers carry meaningful alpha (including GTK CSD
         // shadows). waylandd forces XRGB buffers opaque before publishing.
         // Legacy framebuffers and external GL targets retain XRGB behavior.
-        bool contentAlpha = isWayland && !w->externalGres;
+        bool contentAlpha = isWayland;
 
         WinTexEntry& e = g_winTex[idx];
-        if (e.tex && (e.vfb != reinterpret_cast<uint32_t*>(vaddr) || e.w != sw || e.h != sh || e.alpha != contentAlpha))
+        if (e.tex && (e.incarnation!=publication.incarnation || e.owned || e.vfb != reinterpret_cast<uint32_t*>(vaddr) || e.w != sw || e.h != sh || e.alpha != contentAlpha))
         {
-            gpu->DestroyTexture(e.tex);
-            e.tex = 0;
+            DestroyWindowTexture(gpu,e);
         }
         if (!e.tex)
         {
             e.tex = gpu->CreateTexture(sw, sh, vaddr, contentAlpha);
             e.vfb = reinterpret_cast<uint32_t*>(vaddr);
             e.w = sw; e.h = sh;
-            e.alpha = contentAlpha;
+            e.alpha = contentAlpha;e.incarnation=publication.incarnation;
+            e.generation=publication.generation;
             contentDirty = true;   // force first upload
         }
         if (e.tex && contentDirty)
         {
-            // Hardware-GL window: present the client's dmabuf-shared render
-            // target by BLITting it (host-side) into the content texture, rather
-            // than uploading the unused VFB. Falls back to the VFB upload if the
-            // driver lacks the op or the blit fails.
-            bool presented = false;
-            if (w->externalGres && gpu->BlitExternalToTexture)
-                presented = gpu->BlitExternalToTexture(e.tex, w->externalGres,
-                                                       w->externalW, w->externalH);
-            if (!presented)
-                gpu->UpdateTexture(e.tex, 0, 0, sw, sh);
-            if (isWayland) w->vfbDirty = 0;
+            gpu->UpdateTexture(e.tex, 0, 0, sw, sh);
+            if (isWayland) WmAcknowledgeContent(idx,publication);
             else if (p)    p->fbDirty = 0;
         }
     }
@@ -3292,8 +3440,10 @@ static void CompositorThreadFn(void* /*arg*/)
 
     for (;;)
     {
-        if (!g_compositorHalted)
+        if (!g_compositorHalted) {
+            DrainOwnedCaptures();
             CompositorLoop();
+        }
 
         // Poll debug channel for incoming commands
         brook::DebugChannelPoll();

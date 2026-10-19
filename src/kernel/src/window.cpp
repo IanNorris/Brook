@@ -43,6 +43,10 @@ struct VfbGuard {
     VfbGuard() { KMutexLock(&g_vfbLock); }
     ~VfbGuard() { KMutexUnlock(&g_vfbLock); }
 };
+static uint64_t NextPublication(Window& window) {
+    if (window.publicationGeneration!=~uint64_t{0}) ++window.publicationGeneration;
+    return window.publicationGeneration;
+}
 static const DesktopMetrics* g_desktopMetrics = &DesktopMetric100;
 static uint32_t g_requestedScale = 100;
 const DesktopMetrics& WmDesktopMetrics() { return *__atomic_load_n(&g_desktopMetrics,__ATOMIC_ACQUIRE); }
@@ -589,6 +593,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.proc = proc;
     w.metrics = &WmDesktopMetrics();
     w.creationIdentity = __atomic_add_fetch(&g_windowIdentity, 1, __ATOMIC_ACQ_REL);
+    w.publicationGeneration=w.publishedGeneration=1;
     w.clientPid=proc?(proc->tgid?proc->tgid:proc->pid):0;
     w.clientIncarnation=proc?(proc->isThread?proc->leaderIncarnation:proc->incarnation):0;
     w.clientLaunchId=proc?proc->launchId:0;
@@ -623,7 +628,7 @@ static int CreateWindowLocked(Process* proc, int16_t x, int16_t y,
     w.vfbDirty  = 0;
     // A reused slot must not keep the previous client's dmabuf. Otherwise a
     // new SHM window keeps displaying the dead GL client's last frame.
-    w.externalGres = 0;
+    w.externalCaptured = false;
     w.externalW = w.externalH = 0;
     w.wmId      = static_cast<uint16_t>(idx + 1);
     if (proc) {proc->fbDestX=w.clientX();proc->fbDestY=w.clientY();}
@@ -683,7 +688,7 @@ static void DestroyWindowLocked(int idx)
         MappingBackingUnref(backing);AddressSpaceUnref(space);
         CompositorRetireVfb(retirement);
     }
-    w.externalGres = 0;
+    w.externalCaptured = false;
     w.externalW = w.externalH = 0;
     w.wmId = 0;
     w.proc = nullptr;
@@ -1107,6 +1112,7 @@ static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH
     // Both locks sleep; terminal state never acquires the window guard.
     auto terminal = TerminalResizeForProcess(w.proc->pid,w.proc->incarnation,newClientW,newClientH);
     if (terminal == TerminalResizeResult::Failed) return false;
+    NextPublication(w);
     w.clientW = newClientW;
     w.clientH = newClientH;
     if (terminal == TerminalResizeResult::Resized)
@@ -2696,6 +2702,8 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     // Atomically swap the kernel VFB pointer + sizes so the compositor
     // sees a consistent view from this point on.  Mark dirty so the
     // first blit at the new size happens before any client commit.
+    w->externalCaptured=false;w->externalW=w->externalH=0;
+    w->publishedGeneration=NextPublication(*w);
     w->vfbRetirement = retirement;
     w->vfbBacking = newBacking;
     w->vfb       = newKVfb;
@@ -2751,24 +2759,56 @@ void WmSignalDirtyById(Process* proc, uint32_t wmId)
     if (!w) return;
     // This syscall publishes CPU-written VFB content, including a surface
     // switching from dmabuf to SHM. Stop sampling any previous GL buffer.
-    w->externalGres = 0;
+    w->externalCaptured = false;
+    w->publishedGeneration=NextPublication(*w);
     w->externalW = w->externalH = 0;
     w->vfbDirty = 1;
     CompositorWake();
 }
 
-bool WmPresentExternalById(Process* proc, uint32_t wmId, uint32_t gres,
-                           uint32_t w, uint32_t h)
+bool WmReserveCapture(Process* proc,uint32_t wmId,uint32_t width,uint32_t height,WmCaptureToken* out)
 {
     VfbGuard guard;
-    Window* win = WmFindWindowById(proc, wmId);
-    if (!win) return false;
-    win->externalGres = gres;
-    win->externalW = w;
-    win->externalH = h;
-    win->vfbDirty = 1;   // drive a recompose of this window's content
-    CompositorWake();
+    auto* win=WmFindWindowById(proc,wmId);
+    if (!win || !width || !height || !out || win->publicationGeneration>=~uint64_t{0}-1) return false;
+    *out={wmId,width,height,win->creationIdentity,++win->publicationGeneration};
     return true;
+}
+static Window* CaptureWindowLocked(const WmCaptureToken& token)
+{
+    if (!token.wmId || token.wmId>WM_MAX_WINDOWS) return nullptr;
+    auto& win=g_windows[token.wmId-1];
+    return win.proc && win.creationIdentity==token.incarnation &&
+           win.publicationGeneration==token.generation ? &win : nullptr;
+}
+bool WmCaptureCurrent(const WmCaptureToken& token)
+{
+    VfbGuard guard;return CaptureWindowLocked(token)!=nullptr;
+}
+bool WmCompleteCapture(const WmCaptureToken& token)
+{
+    VfbGuard guard;
+    auto* win=CaptureWindowLocked(token);
+    if (!win) return false;
+    win->externalCaptured=true;win->externalW=token.w;win->externalH=token.h;
+    win->publishedGeneration=token.generation;win->vfbDirty=1;
+    CompositorWake();return true;
+}
+WmContentSnapshot WmSnapshotContent(uint32_t slot)
+{
+    VfbGuard guard;
+    if (slot>=WM_MAX_WINDOWS || !g_windows[slot].proc) return {};
+    const auto& w=g_windows[slot];
+    return {true,w.externalCaptured,w.creationIdentity,w.publishedGeneration,w.externalW,w.externalH};
+}
+
+void WmAcknowledgeContent(uint32_t slot,const WmContentSnapshot& uploaded)
+{
+    VfbGuard guard;
+    if (slot>=WM_MAX_WINDOWS) return;
+    auto& w=g_windows[slot];
+    if (w.proc && w.creationIdentity==uploaded.incarnation &&
+        w.publishedGeneration==uploaded.generation && !w.externalCaptured) w.vfbDirty=0;
 }
 
 bool WmSetAppIdById(Process* proc, uint32_t wmId, const char* appId)

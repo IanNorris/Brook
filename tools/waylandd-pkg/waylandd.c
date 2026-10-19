@@ -688,9 +688,19 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
             if (s->wm_id) {
                 long rc = syscall(BROOK_SYS_WM_PRESENT_GRES, (long)s->wm_id,
                                   (long)db->gres, (long)dw, (long)dh);
+                const int capture_errno=errno;
                 if (rc != 0)
                     fprintf(stderr, "[waylandd] WM_PRESENT_GRES id=%u gres=%u rc=%ld\n",
                             s->wm_id, db->gres, rc);
+                if (rc == -EIO || (rc == -1 && capture_errno == EIO)) {
+                    /* GPU completion is uncertain. Never grant reuse of this
+                     * buffer. Terminate the connection; the kernel retains the
+                     * independent source lease until device reset. */
+                    wl_client_post_implementation_error(c,
+                        "Brook GPU capture completion is uncertain");
+                    s->pending_buffer = NULL;
+                    return;
+                }
             }
         }
         wl_buffer_send_release(s->pending_buffer);

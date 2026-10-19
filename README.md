@@ -107,7 +107,7 @@ the table distinguishes tested behavior from remaining limitations.
   building the kernel, modules and bare-metal tests took 52–54 seconds.
   The [virtio-net TX ownership fix](docs/package-pipeline.md) reduced
   the measured clean-image SDK install from 732 to 236 seconds; compilation
-  remains about 50 seconds. Current host validation covers 50 suites; both full
+  remains about 50 seconds. Current host validation covers 51 suites; both full
   bootstrap paths still need renewal beyond that pinned 40-suite checkpoint.
 
 - **Desktop identity and package registration:** new apps and Terminal run as

@@ -559,3 +559,79 @@ offline filesystem checks passed, and nine UID/GID/document hashes were
 preserved. Evidence: `build/workloads/gpu-owned-capture-20261019/verified/acceptance-audit.json`.
 The final failed-test 2D fallback registration branch is inspected, not exercised
 by a real injected GPU failure. Main and mixed-app acceptance remain unchanged.
+
+## Capture queue and publication
+
+`WM_PRESENT_GRES` now retains the canonical DRM source and producer through a
+bounded compositor request. The caller keeps kernel-operation cancellation
+protection while waiting; the request owns an independent mapping-backing
+reference. No GEM-table or window lock is held during GPU commands. The
+compositor drains requests before visibility filtering and frame assembly,
+including requests for minimized windows.
+
+Window reservations carry both the slot incarnation and a publication
+reservation generation. Reserving another capture leaves the last published
+frame valid. SHM publication, resize and destruction invalidate older pending
+work. A completed copy publishes only if its reservation remains current;
+rendering selects the matching incarnation, content kind and published
+generation. Dirty acknowledgement cannot clear a newer SHM publication.
+
+Normal operation uses a published texture and a staging texture per window.
+Only staging receives the next copy, preserving the published image during
+cancellation or allocation failure. After successful publication, compatible
+old published textures become staging. Dead/reused/SHM window slots retire
+owned textures even when minimized. Destination retirement failure leaves the
+driver's quarantined metadata intact.
+
+The queue is limited to 64 live/uncertain requests. Queued cancellation removes
+the request before any GPU read. Running cancellation suppresses publication
+and waits for the bounded driver operation to finish; it does not return a
+reuse-authorizing timeout while the GPU may still read. Uncertain completion
+retains both the source lease and queue capacity until device reset. Wayland
+ends that client connection without sending `wl_buffer.release`. It preserves
+`errno` immediately after the syscall so logging cannot conceal an uncertain
+libc-style `-1/EIO` result. Published and safely discarded copies may release.
+
+The threaded host test includes the production compositor queue and checks
+bounded staging reuse, allocation failure preserving the prior frame, queue
+capacity, SHM/slot-reuse races, running cancellation, queued timeout and uncertain
+source retention. Window tests exercise real publication entry points and dirty
+acknowledgement. The Wayland package's capture-release test inspects real wire
+events, including a logging failure that changes errno. These host tests do not
+replace hardware fault injection or simultaneous-application acceptance.
+
+`scripts/workloads/gpu_capture_lifetime_check.py` is the guest half of an
+isolated framebuffer test. Its host counterpart must inspect and acknowledge
+each named phase. It independently reads back the overwritten source, closes
+all source mappings/GEM/PRIME/render FDs before observation, switches GL→SHM→GL,
+and captures a new frame while minimized. Evidence must include the host pixel
+checks; a guest completion marker alone cannot establish correct presentation.
+
+Exported resource reclamation remains disabled in this checkpoint. Legacy
+CPU-backed texture retirement and mixed-application capacity remain open.
+
+Hardware session `f95f102b828d4ca894dc2fcb9280d820` used the paired ABI 23 kernel
+and tested Wayland package on eight CPUs and 4 GiB with muted hardware EGL GL.
+Two complete pixel sequences passed; the second independently verified the
+producer overwrite and reused the former window slot. Quake II GL3 then
+advanced through seven spaced captures over 163 seconds, crossed 8,192 resource
+allocations and two demo boundaries, and showed no pause overlay or visible
+corruption in those samples. This does not establish between-sample correctness,
+framerate improvement or audible quality.
+
+Quarantined backing stayed at 3,784,704 bytes in all seven demo observations.
+For context, the earlier focused, unpaused demo run recorded growth from
+165,888,000 to 364,953,600 bytes over 161 seconds. No paired FPS comparison is
+claimed. Final backing after application closure and the ownership probes was
+11,161,600 bytes, exactly the remaining exported quarantine; no private backing
+remained. Reclamation of that exported backing is still a separate step.
+
+All 51 host suites passed, followed by the strengthened targeted queue/window
+tests. All six Wayland package checks passed. Eighteen guest probe/advance jobs
+completed with full output and zero live tasks; an initial Python-path error
+failed before process creation and is recorded separately. The Quake launch
+lineage drained, audio streams emptied, owned launcher/QEMU exited zero,
+all three offline filesystem checks passed, and nine documents retained their
+hashes and UID/GID. Evidence:
+`build/workloads/gpu-capture-queue-20261019/candidate/acceptance-audit.json`.
+STK/browser simultaneous-use acceptance and main approval remain open.

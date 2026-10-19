@@ -11197,8 +11197,8 @@ static int64_t sys_brook_wm_signal_dirty(uint64_t wmId, uint64_t, uint64_t,
 
 // 525: WM_PRESENT_GRES(wmId, gres, w, h) — present a hardware-GL (dmabuf) frame.
 // waylandd resolves a client's dmabuf to a host virgl resource id (gres) and
-// calls this so the compositor BLITs that resource into the window's content
-// texture. The gres must be one the caller legitimately holds (it came from the
+// calls this to wait for a compositor-owned capture of the source frame.
+// The gres must be one the caller legitimately holds (it came from the
 // caller importing a PRIME fd the client sent it over the Wayland socket).
 static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
                                          uint64_t w, uint64_t h,
@@ -11206,6 +11206,7 @@ static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
     constexpr uint64_t wireMax=0xffffffffULL;
     if (!wmId || wmId>wireMax || !gres || gres>wireMax || !w || !h ||
         w>wireMax || h>wireMax) return -EINVAL;
@@ -11227,10 +11228,11 @@ static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
         }
     }
     if (!resource || w>resource->width || h>resource->height) return -EINVAL;
-    return brook::WmPresentExternalById(proc, static_cast<uint32_t>(wmId),
-                                        static_cast<uint32_t>(gres),
-                                        static_cast<uint32_t>(w),
-                                        static_cast<uint32_t>(h)) ? 0 : -ENOENT;
+    brook::WmCaptureToken token{};
+    if (!brook::WmReserveCapture(proc,static_cast<uint32_t>(wmId),
+                               static_cast<uint32_t>(w),static_cast<uint32_t>(h),&token)) return -ENOENT;
+    return brook::CompositorCaptureExternal(proc,token,resource->lifetime,
+                                           resource->owner->ctxId,resource->gres);
 }
 
 // 0xB03: notify the desktop that installed application metadata changed.

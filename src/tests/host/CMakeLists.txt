@@ -62,6 +62,16 @@ target_compile_options(test_window_surfaces PRIVATE
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
 target_link_options(test_window_surfaces PRIVATE -Wl,--gc-sections)
+add_host_test(test_gpu_capture_queue)
+target_compile_options(test_gpu_capture_queue PRIVATE
+    -Wno-unused-parameter -Wno-attributes -Wno-misleading-indentation -Wno-error=extra
+    -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+target_link_options(test_gpu_capture_queue PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_gpu_capture_queue PROPERTIES TIMEOUT 20)
 add_host_test(test_ready_latency)
 target_compile_options(test_ready_latency PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 set_tests_properties(test_ready_latency PROPERTIES TIMEOUT 15)
