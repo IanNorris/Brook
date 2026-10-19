@@ -9,14 +9,15 @@ compositor texture destruction and resource-ID recycling remain open. Do not
 reset counters or recycle IDs until the remaining completion rules below are
 implemented.
 
-Two bounded guest probes distinguish different exhaustion paths:
+Two historical bounded guest probes distinguished different exhaustion paths:
 
 - `scripts/workloads/gpu_resource_cycle_check.py --brook-guest` creates and
   closes tiny buffers, with one GEM live at a time. The recorded run completed
   4,095 of 4,500 allocations; allocation 4,096 failed with ENOMEM, and a new DRM
   context could not allocate either. Evidence is in
   `build/workloads/window-surface-20261018/resource-stress/`. This is the
-  unresolved cumulative host-resource-ID limit, not a simultaneous-GEM budget.
+  former cumulative host-resource-ID limit, not a simultaneous-GEM budget. The
+  non-recycling namespace repair below replaces that limit.
 - `scripts/workloads/gpu_prime_import_check.py --brook-guest` imports one
   128-byte resource 3,000 times. The baseline consumed 2,048 different GEM
   handles and then failed with ENOMEM. The candidate returns one handle across
@@ -346,12 +347,81 @@ epoch protects existing CPU readers; it does not establish host GPU completion.
 Retirement fences both the producer and compositor contexts through a helper
 that runs under the existing `GpuCmdGuard` without recursively acquiring it.
 
-Both `ResourceCreate3D` and native `BufferUpload` need one live/retiring/free ID
-allocator. Their independent upward/downward counters can collide. Either keep
-an old context namespace reserved while exported objects survive, or use a
-context-independent resource namespace with owner generations. Remove or
-incarnation-tag the numeric `g_compExternalAttached` cache before reuse.
-Synchronize the module ABI/version when extending GPU operations.
+`ResourceCreate3D` and native `BufferUpload` now share a non-recycling namespace
+allocator; their former independent upward/downward counters could collide.
+Recycling remains separate work. Keep an old context reserved while exported
+objects survive, and remove or incarnation-tag the numeric
+`g_compExternalAttached` cache before reuse. Synchronize the module ABI/version
+when extending GPU operations.
+
+## Non-recycling resource namespace
+
+The explicit 1280×720 GL3 demo reproduced ID exhaustion alongside Chromium in
+session `43758751355440cc913157e830092e32`. The log records
+`app resource ids exhausted ctx=256 pid=99 allocations=4096`, repeated failed
+buffer creation and then a null-pointer fault in Mesa's `dri2_query_image`.
+This is distinct from the earlier physical-memory exhaustion. The attempted
+visible/minimized comparison is invalid because Quake exited during it;
+later profiles captured Chromium alone. See
+`build/workloads/mixed-render-20261019/4g-configure/` and the separate
+[configure-handshake investigation](wayland-configure.md).
+
+`resource_ids.h` supplies the production namespace. Application IDs occupy
+`0x10000..0x7fffffff`, remain positive through the signed module ABI, and encode
+one of sixteen context slots in their low bits. Each slot's sequence increases
+monotonically across context destruction and failed host attempts. A successful
+new context records a sequence watermark, rejecting earlier incarnations' IDs.
+Both app creation and legacy upload allocate through the same instance under
+`GpuCmdGuard`. No ID is reused; arithmetic saturates before wraparound. The
+protocol's finite signed-ID space still bounds the lifetime number of IDs.
+
+Namespace validation establishes a tag and issued interval, not that creation
+succeeded or that a resource remains live. Canonical DRM references enforce
+resource ownership and lifetime. The exported-resource quarantine and its
+sixteen-context limit remain unchanged. This repair does not establish owned
+presentation captures or enable exported-resource reclamation.
+
+Dynamic compositor textures use `0x1000..0xffff`, excluding both app IDs and
+fixed boot/self-test IDs (including 64/65 and 200–213). This allocator also
+saturates without recycling. Compositor texture retirement remains unfinished.
+
+The production-helper host test models more than 4,096 mixed allocation callers,
+all sixteen context tags, burned failed attempts, context incarnation changes
+and boundary saturation. Five isolated mutation controls reject wraparound,
+counter reset, missing tags, saturation failure and fixed-resource overlap.
+The full 49 host suites and supported compiled entry/startup audits pass.
+These helper tests do not execute the legacy upload driver entry point.
+
+The guest boundary probe `gpu_resource_ids_check.py` creates/closes 8,192 tiny
+private resources through one render FD and performs host roundtrips immediately
+before, across and after the former limit. In candidate session
+`702795d0531d400a841518be4b781a8c` it completed in 3.542 seconds with 8,192 unique
+IDs. Allocated-minus-released DRM backing returned to zero; no allocation or
+retirement failed. Stale mmap tokens, retained mappings/fork, PRIME exporter
+close and byte-offset transfers also passed. The PRIME test intentionally
+retained one exported 4-KiB quarantine. Evidence is under
+`build/workloads/gpu-resource-ids-20261019/`; longer app acceptance and the
+checked endpoint are separate from these probe results.
+
+That candidate subsequently ran Chromium local video alongside Quake GL3 at
+1280×720. Both exact launch lineages remained live across the paired profiles
+and thirteen liveness/resource snapshots spanning 130 seconds. No allocation
+failure, retirement failure or user fault occurred. However, the final
+`mixed-stable.png` shows Quake **PAUSED** after the focus-changing experiment.
+This verifies liveness, not continuous demo playback; do not use these profiles
+as a controlled moving-demo comparison. Rerun without focus changes and verify
+actual demo progression. The short samples contain substantial GPU submission
+wait and lock contention, but do not establish a matched-scene FPS benefit.
+
+Both application lineages then drained, audio streams became empty, checked
+guest sync/shutdown and owned launcher exit 0 completed, all three offline
+filesystem checks returned 0 and all nine document fixtures were unchanged.
+The complete endpoint is `candidate/acceptance-audit.json`. Final DRM retained
+backing was **328,093,696 bytes**, exactly its intentional exported quarantine,
+with zero failed retirements. This is still material retained memory, not a
+return to the initial memory baseline. The private 8,192-allocation test alone
+returned its retained backing to zero. Owned compositor captures and exported
+retirement remain necessary; increasing VM memory will not fix that retention.
 
 ## Acceptance gates for reclamation
 

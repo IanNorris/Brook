@@ -28,6 +28,7 @@
 #include "spinlock.h"
 #include "virgl_submit.h"
 #include "retirement_protocol.h"
+#include "resource_ids.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -1631,13 +1632,12 @@ static constexpr uint32_t COMP_THUMB_RES    = 15;    // downscale thumbnail RT
 static constexpr uint32_t COMP_FULL_RES     = 14;    // full-res 1:1 readback RT (lazy)
 static constexpr uint32_t COMP_THUMB_W      = 256;   // thumbnail size (16:9-ish)
 static constexpr uint32_t COMP_THUMB_H      = 144;
-static constexpr uint32_t COMP_FIRST_TEX_RES = 17;   // texture resource ids from here
 
 static bool     g_compReady       = false;   // ops set up + scanout RT created
 static bool     g_compScanoutBound = false;  // SET_SCANOUT to the RT has happened
 static uint32_t g_compScanoutW    = 0;
 static uint32_t g_compScanoutH    = 0;
-static uint32_t g_compNextRes     = COMP_FIRST_TEX_RES;
+static brook::GpuKernelTextureIds g_compTextureIds;
 static uint32_t g_composeN        = 0;       // dwords accumulated in compose stream
 static uint64_t g_compThumbPhys   = 0;       // thumbnail RT readback backing (phys)
 static uint32_t* g_compThumbBuf   = nullptr; // thumbnail RT readback backing (virt)
@@ -2105,7 +2105,8 @@ static GpuTexId CompCreateTexture(uint32_t w, uint32_t h, uint64_t backingVaddr,
     if (slot == MAX_GPU_TEXTURES) { SerialPuts("virtio_gpu: comp texture table full\n"); return 0; }
 
     uint32_t format = alpha ? VIRGL_FORMAT_B8G8R8A8_UNORM : VIRGL_FORMAT_B8G8R8X8_UNORM;
-    uint32_t resId = g_compNextRes++;
+    uint32_t resId = g_compTextureIds.Allocate();
+    if (!resId) { SerialPuts("virtio_gpu: compositor resource namespace exhausted\n"); return 0; }
     if (!ResourceCreate3D(resId, format, VIRGL_BIND_SAMPLER_VIEW, w, h))
     { SerialPuts("virtio_gpu: comp tex create failed\n"); return 0; }
     if (!ResourceAttachBackingVirt(resId, backingVaddr, w * h * 4))
@@ -2616,9 +2617,8 @@ static const uint32_t* CompCaptureFull(uint32_t* outW, uint32_t* outH)
 // use small local ids without colliding with each other or the kernel.
 // ===========================================================================
 static constexpr uint32_t APP_FIRST_CTX  = 0x100;   // app ctx ids start here (1,2 = kernel)
-static constexpr uint32_t APP_RES_STRIDE = 0x1000;  // per-ctx resource-id block
-static constexpr uint32_t APP_RES_BASE   = 0x10000; // app resource ids start here
-static constexpr uint32_t MAX_APP_CTX    = 16;
+static constexpr uint32_t MAX_APP_CTX = brook::GpuResourceNamespace::ContextSlots;
+static brook::GpuAppResourceIds<> g_appResourceIds;
 struct AppCtx { bool used; uint32_t ctxId; uint32_t pid; };
 static AppCtx g_appCtx[MAX_APP_CTX] = {};
 
@@ -2628,24 +2628,13 @@ struct AppUpload { bool used; int32_t ctxId; uint64_t vaddr; uint64_t pages; };
 static constexpr uint32_t MAX_APP_UPLOADS = 64;
 static AppUpload g_appUploads[MAX_APP_UPLOADS] = {};
 
-// Map an app's (ctxId, local resId) to a globally-unique host resource id, so an
-// app can pass small local resource ids (1,2,3,...) without collisions.
-static inline uint32_t AppResGlobal(uint32_t ctxId, uint32_t localRes)
-{
-    return APP_RES_BASE + (ctxId - APP_FIRST_CTX) * APP_RES_STRIDE + (localRes & (APP_RES_STRIDE - 1));
-}
-
-// Validate that `gres` is a global resource id inside `ctxId`'s private block.
-// App resource ids are opaque host-global handles: the app receives them from
-// ResourceCreate3D and uses the SAME id both in syscalls AND inside the virgl
-// command streams it submits (where resource ids must be host-global). Bounding
-// each context to its own APP_RES_STRIDE block keeps apps isolated from each
-// other and from the compositor/self-test resources.
+// IDs are opaque host-global handles, passed unchanged in syscalls and virgl
+// streams. Check the issued namespace for this context incarnation; canonical
+// DRM objects separately enforce whether the requested resource is live/owned.
 static inline bool AppResValid(int32_t ctxId, uint32_t gres)
 {
     if (ctxId < (int32_t)APP_FIRST_CTX) return false;
-    uint32_t base = APP_RES_BASE + ((uint32_t)ctxId - APP_FIRST_CTX) * APP_RES_STRIDE;
-    return gres > base && gres < base + APP_RES_STRIDE;
+    return g_appResourceIds.ContainsIssued(static_cast<uint32_t>(ctxId)-APP_FIRST_CTX,gres);
 }
 
 static int32_t AppCtxCreate(uint32_t pid)
@@ -2659,6 +2648,7 @@ static int32_t AppCtxCreate(uint32_t pid)
         if (!CtxCreate(ctxId, VIRTIO_GPU_CAPSET_VIRGL))
         { SerialPuts("virtio_gpu: app ctx create failed\n"); return -1; }
         g_appCtx[i] = { true, ctxId, pid };
+        g_appResourceIds.BeginContext(i);
         SerialPrintf("virtio_gpu: app virgl ctx %u for pid %u\n", ctxId, pid);
         return static_cast<int32_t>(ctxId);
     }
@@ -2709,20 +2699,15 @@ static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t target, uint32_t form
     if (!c || w == 0) return -1;
     const bool isBuffer = (target == PIPE_BUFFER);
     if (!isBuffer && h == 0) return -1;
-    // Resources are named to the app by their host-global id (1-based per ctx,
-    // mapped into this context's private block) so the app can reference the
-    // same id inside the virgl streams it submits, where ids are host-global.
-    static uint32_t s_localCounter[MAX_APP_CTX] = {};
     uint32_t i = (uint32_t)ctxId - APP_FIRST_CTX;
-    uint32_t localRes = ++s_localCounter[i];
-    if (localRes >= APP_RES_STRIDE)
-    {
-        if (localRes == APP_RES_STRIDE)
-            SerialPrintf("virtio_gpu: app resource ids exhausted ctx=%d pid=%u allocations=%u\n",
-                         ctxId, c->pid, localRes);
+    uint32_t gres = g_appResourceIds.Allocate(i);
+    if (!gres) {
+        SerialPrintf("virtio_gpu: app resource namespace exhausted ctx=%d pid=%u\n",ctxId,c->pid);
         return -1;
     }
-    uint32_t gres = AppResGlobal((uint32_t)ctxId, localRes);
+    const uint32_t issued=g_appResourceIds.Issued(i);
+    if (issued>=4096 && !(issued&(issued-1)))
+        SerialPrintf("virtio_gpu: app resource progress ctx=%d allocations=%u gres=%u\n",ctxId,issued,gres);
     // A PIPE_BUFFER must be created as a 1-D linear buffer (target 0), or
     // virglrenderer rejects buffer bind flags on a texture target — this is
     // Mesa's glReadPixels staging buffer (BRO-188). A texture honours the app's
@@ -2770,13 +2755,9 @@ static int32_t AppBufferUpload(int32_t ctxId, const void* src, uint32_t bytes)
         if (!g_appUploads[i].used) { slot = i; break; }
     if (slot == MAX_APP_UPLOADS) return -1;
 
-    static uint32_t s_bufCounter[MAX_APP_CTX] = {};
     uint32_t ci = (uint32_t)ctxId - APP_FIRST_CTX;
-    // Buffer ids share the per-ctx block but grow downward from the top so they
-    // never collide with ResourceCreate3D's upward-growing texture ids.
-    uint32_t localRes = (APP_RES_STRIDE - 1) - (++s_bufCounter[ci]);
-    if (s_bufCounter[ci] >= APP_RES_STRIDE / 2) return -1;
-    uint32_t gres = AppResGlobal((uint32_t)ctxId, localRes);
+    uint32_t gres = g_appResourceIds.Allocate(ci);
+    if (!gres) return -1;
 
     uint64_t pages = (bytes + 4095) / 4096;
     VirtualAddress va = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, KernelPid);
