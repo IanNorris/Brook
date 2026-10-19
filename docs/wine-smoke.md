@@ -89,3 +89,70 @@ source fix. This verifies recovery of an already-unpacked package, not a new
 fresh download through the candidate. Wineserver's temporary-directory
 ownership rejection and Windows command acceptance remain unresolved. Further
 Wine/Proton work is deferred while application stability testing continues.
+
+## Unix temporary disk follow-up
+
+On 19 October, the bounded Wine follow-up used kernel `ac42f03c`, the current
+Wayland frontend, eight CPUs, 4 GiB RAM and software composition. Private copies
+combined the checked Wine installation with checked application data; the
+original images were preserved. A separate ext2 image mounted at `/tmp` through
+the existing `BROOK.MNT` boot probe. No Wine binary or kernel check was changed.
+
+Wine 11's server and client use `/tmp/.wine-UID`; this path is hard-coded in
+the pinned [server](https://raw.githubusercontent.com/wine-mirror/wine/wine-11.0/server/request.c)
+and [client](https://raw.githubusercontent.com/wine-mirror/wine/wine-11.0/dlls/ntdll/unix/server.c).
+The earlier FAT-backed directory had no Unix ownership/mode metadata, explaining
+why setting `TMPDIR` did not help. On ext2, a Brook-user probe verified UID1000,
+GID100, mode0700 and matching path/FD inode identities for a new directory.
+The mount root was UID0/GID0 and mode01777. Both Wine attempts passed the former
+directory rejection and reached the next blocker.
+
+`wine cmd /c echo BROOK_WINE_CONSOLE_PASS` and `wine notepad` both exited one,
+reporting a running server they could not connect to. The console marker was
+absent and no Notepad window appeared. Wine checks `lstat("socket")` before
+connecting. Brook's bind/listen currently register a string in the Unix socket
+registry without creating a filesystem socket inode. This prevents Wine from
+discovering the listener. A separate rootless probe isolated the broader gap:
+
+| Pathname socket check | Linux reference | Brook |
+| --- | --- | --- |
+| Bound node has socket type, caller UID and umask-derived mode | Pass | ENOENT |
+| Relative connect reaches an absolute pathname bind in the same directory | Pass | ECONNREFUSED |
+| Socket node remains after listener close, until unlink | Pass | ENOENT |
+
+The exact probe is `scripts/workloads/unix_path_socket_check.py`; exit one is
+negative evidence. These three cases do not cover the full socket namespace.
+A complete implementation also needs ownership/permission enforcement,
+symlink lookup, unlink/rebinding, duplicate binds and stale-node behavior.
+That work is deferred beyond this small Wine pass. No Windows console or GUI
+application acceptance, Vulkan or Proton support is established.
+
+Wine servers outlived the failed main commands. Each was stopped using
+`wineserver -k` with the same private prefix, then the original request was
+polled again until its full lineage and output drained. All seven recorded
+commands reached their expected terminal codes without missing output. Heap
+integrity, orderly shutdown, owned launcher/QEMU exit zero and four offline
+filesystem checks passed. All ten existing document fixtures retained their
+content and ownership, including the latest Codium save.
+
+Evidence: `build/workloads/wine-unix-tmp-20261019/candidate/acceptance-audit.json`,
+the console/Notepad records, Linux and guest socket-probe results, and exact
+tested helper sources. The initial console controller hit its observation
+deadline while the Wine server remained alive; cleanup resumed the original
+request rather than launching it again.
+
+### Creating the temporary disk
+
+The reusable helper creates a sparse 128 MiB ext2 image, verifies root ownership
+and mode, runs an offline filesystem check and refuses to replace an existing
+output:
+
+```sh
+python3 scripts/create_tmp_disk.py --output build/experiments/wine-tmp.img
+```
+
+Pass its absolute path as `BROOK_DATA_DISK` when launching a private experiment.
+This uses the optional data/media drive slot, separately from the experiment's
+`/data` and `/nix` disks. Contents persist across boots; this is a disk-backed
+temporary directory, with no automatic boot cleanup. It does not implement
+tmpfs or complete the broader temporary-filesystem work.
