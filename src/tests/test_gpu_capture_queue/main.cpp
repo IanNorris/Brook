@@ -66,9 +66,11 @@ void startWorker() {
         brook::DrainOwnedCaptures();workerDone=true;
     });
 }
-int capture() {
+uint32_t expectedSourceFormat=2;
+int capture(uint32_t format=2) {
+    expectedSourceFormat=format;
     auto t=token();startWorker();
-    const int r=brook::CompositorCaptureExternal(caller,t,reinterpret_cast<brook::MappingBacking*>(1),256,65536);
+    const int r=brook::CompositorCaptureExternal(caller,t,reinterpret_cast<brook::MappingBacking*>(1),256,65536,format);
     worker.join();CHECK(workerDone);return r;
 }
 }
@@ -79,7 +81,8 @@ int main() {
     ops.CreateOwnedTexture=[](uint32_t,uint32_t,bool)->GpuTexId { CHECK(!locks);return mode==6?0:++created; };
     ops.DestroyOwnedTexture=[](GpuTexId)->bool { CHECK(!locks);++destroyed;return true; };
     ops.DestroyTexture=[](GpuTexId) { CHECK(!locks);++destroyed; };
-    ops.CaptureExternal=[](GpuTexId dst,int32_t,uint32_t,uint32_t,uint32_t) {
+    ops.CaptureExternal=[](GpuTexId dst,int32_t,uint32_t,uint32_t format,uint32_t,uint32_t) {
+        CHECK(format==expectedSourceFormat);
         CHECK(!locks);pixels[dst]=sourcePixel;
         if (mode==1) { std::lock_guard<std::mutex> g(windowMutex);++latest;content.externalCaptured=false;content.generation=latest; }
         if (mode==2) { std::lock_guard<std::mutex> g(windowMutex);++content.incarnation;latest=1;content.externalCaptured=false; }
@@ -93,6 +96,8 @@ int main() {
         }
         return mode==5?GpuCaptureResult::Uncertain:GpuCaptureResult::Complete;
     };
+    CHECK(CompositorCaptureExternal(caller,token(),reinterpret_cast<MappingBacking*>(1),256,65536,28)==-22);
+    CHECK(leases==0 && created==0 && g_captureCount==0);
     CHECK(capture()==0 && leases==0 && created==1);
     auto first=g_winTex[0].tex;CHECK(pixels[first]==0x00ff00);
     sourcePixel=0x0000ff;CHECK(pixels[first]==0x00ff00);
@@ -102,9 +107,9 @@ int main() {
     ops.DestroyOwnedTexture(g_winTex[0].staging);g_winTex[0].staging=0;
     mode=6;CHECK(capture()==-12 && g_winTex[0].tex==retainedFront && leases==0);
     mode=0;allocationFails=true;auto oom=token();
-    CHECK(CompositorCaptureExternal(caller,oom,reinterpret_cast<MappingBacking*>(1),256,65536)==-12);
+    CHECK(CompositorCaptureExternal(caller,oom,reinterpret_cast<MappingBacking*>(1),256,65536,2)==-12);
     allocationFails=false;g_captureCount=MAX_CAPTURE_REQUESTS;
-    CHECK(CompositorCaptureExternal(caller,token(),reinterpret_cast<MappingBacking*>(1),256,65536)==-11 && leases==0);
+    CHECK(CompositorCaptureExternal(caller,token(),reinterpret_cast<MappingBacking*>(1),256,65536,2)==-11 && leases==0);
     g_captureCount=0;
     const auto beforeShm=g_winTex[0].tex;const auto priorPixel=pixels[beforeShm];
     sourcePixel=0xff0000;
@@ -117,12 +122,13 @@ int main() {
     mode=3;CHECK(capture()==-116 && leases==0 && g_winTex[0].tex==beforeCancel && pixels[beforeCancel]==cancelPixel); // fatal cancellation waits for safe completion
     CHECK(!g_captureCount && !g_captureHead && !g_captureTail);
     __atomic_store_n(&caller->terminalPending,false,__ATOMIC_RELEASE);
-    mode=4;auto t=token();CHECK(CompositorCaptureExternal(caller,t,reinterpret_cast<MappingBacking*>(1),256,65536)==-110);
+    mode=4;auto t=token();CHECK(CompositorCaptureExternal(caller,t,reinterpret_cast<MappingBacking*>(1),256,65536,2)==-110);
     CHECK(!g_captureCount && !g_captureHead && !g_captureTail && leases==0);
     mode=5;CHECK(capture()==-5 && leases==1 && g_captureCount==1 && g_captureQuarantine);
     CHECK(g_captureQuarantine->state==CaptureState::Done);
     // Simulate device reset only for test cleanup. Production retains this lease.
     auto* retained=g_captureQuarantine;g_captureQuarantine=nullptr;g_captureCount=0;CaptureUnref(retained);CHECK(leases==0);
+    mode=0;CHECK(capture(1)==0 && leases==0); // canonical ARGB reaches the worker unchanged
     DestroyWindowTexture(&ops,g_winTex[0]);std::free(caller);
     std::puts("CAPTURE_QUEUE_PASS bounded staging, SHM/reuse races, running cancellation, queued timeout, uncertain lease retention");
 }

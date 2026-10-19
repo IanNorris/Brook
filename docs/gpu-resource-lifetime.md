@@ -697,12 +697,14 @@ The server reports this unsupported path once per surface. The diagnostic
 does not change presentation, buffer release or application configuration.
 
 The implementation direction is retained images per Wayland surface and GPU
-composition into a retained root texture. It is not implemented yet:
+composition into a retained root texture. The tree itself is not implemented;
+the format prerequisite below is now verified:
 
 - Add canonical resource-format metadata and format-aware owned capture.
   ARGB capture must preserve alpha; XRGB supplies alpha one. Reject unsupported
   formats before submitting commands. Do not infer source format from the
-  destination or from the client's unchecked dmabuf declaration.
+  destination or from the client's unchecked dmabuf declaration. ABI 25 supplies
+  this prerequisite for BGRA/XRGB 2D sources.
 - Add explicit premultiplied composition: `ONE, ONE_MINUS_SRC_ALPHA` for RGB
   and alpha, and scale both RGB and alpha by window opacity. Existing straight
   alpha chrome drawing keeps its separate mode.
@@ -730,3 +732,43 @@ and reused window slots. Test-only readback verifies pixels; thousands of
 updates must retain bounded allocations. Real Firefox rendering and audio are
 subsequent acceptance gates. A CPU readback loop or redirecting the child into
 the entire root window would not satisfy this design.
+
+## Format-aware capture prerequisite (ABI 25)
+
+DRM now retains the creation target and virgl format in the canonical shared
+resource. PRIME aliases preserve that metadata after the exporter and PRIME FD
+close. Numeric window presentation accepts only 2D B8G8R8A8_UNORM and
+B8G8R8X8_UNORM sources. Unsupported formats/targets reject before reservation or
+GPU capture. The queue carries the canonical format through to the driver;
+the BLIT explicitly encodes both source and destination formats.
+
+Owned ARGB textures now preserve alpha. The prepublication hardware self-test
+adds an ARGB cycle: capture half-alpha green (`0x80008000`), overwrite the
+producer with independently verified blue/quarter alpha, retire the source,
+and read back all four retained channels before and after retirement. Its
+surface-clear views use the actual source format. This is capture correctness,
+not premultiplied blending or transparent-window acceptance. The current
+full-window queue deliberately continues to publish opaque XRGB destinations.
+
+All 51 host suites and the compiled entry/startup audits passed. The production
+queue test verifies ARGB format forwarding and unsupported-format rejection
+without allocation or leasing. `gpu_capture_format_check.py` checks the same
+admission boundary on imported resources after exporter closure, with valid
+ARGB/XRGB textures, an unsupported float texture and a byte buffer. The
+retained-pixel probe accepts `--format argb` as well as its XRGB default.
+
+Hardware candidate `3144bc67c5a24d319aa7476dab0d372f` passed both visible
+source-format sequences, including source overwrite/close, GL→SHM→GL and
+minimized updates, with zero outstanding backing at every visible phase.
+The imported-format probe passed all eight cases and returned to zero backing.
+Quake GL3 at 1280×720 advanced in three inspected demo samples and closed
+normally. That is a short rendering regression, not performance/music acceptance.
+Review then corrected an XRGB clear-view declaration in the ARGB self-test;
+the final driver was rebuilt and its corrected hardware self-test passed in
+session `3fdab49e291c4f9bb57dd700d60df424`. That final driver also passed the
+ARGB visible-pixel/minimized sequence and all imported-format cases. Its eight
+guest commands drained with full output, and all seven DRM backing mappings
+(65,536 bytes) were released with zero quarantine or failures. Both runs have
+checked shutdown, owned launcher/QEMU exit zero, three clean offline filesystem
+checks and nine preserved document hashes/owners. Final endpoint evidence:
+`build/workloads/gpu-format-capture-20261019/verified/acceptance-audit.json`.

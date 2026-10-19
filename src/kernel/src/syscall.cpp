@@ -45,6 +45,7 @@
 #include "compositor.h"
 #include "window.h"
 #include "gpu_app.h"
+#include "gpu_compositor.h"
 #include "terminal.h"
 #include "net.h"
 #include "rtc.h"
@@ -2879,7 +2880,7 @@ static void DrmOwnerUnref(DrmGpuOwner* owner) {
 struct DrmResource {
     MappingBacking* lifetime;
     DrmGpuOwner* owner;
-    uint32_t gres,size,stride,width,height;
+    uint32_t gres,size,stride,width,height,target,format;
     uint64_t backingKva;
     uint32_t backingBytes;
     KMutex backingLock;
@@ -2945,13 +2946,15 @@ static void DrmResourceLastReference(void* object) {
     KSemaphoreSignal(&g_drmRetirementReady);
 }
 static DrmResource* DrmResourceCreate(DrmGpuOwner* owner,uint32_t gres,uint32_t size,
-                                    uint32_t stride,uint32_t width,uint32_t height) {
+                                    uint32_t stride,uint32_t width,uint32_t height,
+                                    uint32_t target,uint32_t format) {
     if (!DrmEnsureRetirementWorker()) return nullptr;
     auto* resource=static_cast<DrmResource*>(kmalloc(sizeof(DrmResource)));
     if (!resource) return nullptr;
     memset(resource,0,sizeof(*resource));
     resource->owner=owner;resource->gres=gres;resource->size=size;
     resource->stride=stride;resource->width=width;resource->height=height;
+    resource->target=target;resource->format=format;
     KMutexInit(&resource->backingLock);
     resource->lifetime=MappingBackingCreate(resource,DrmResourceLastReference);
     if (!resource->lifetime) { kfree(resource);return nullptr; }
@@ -2986,10 +2989,10 @@ struct DrmMappingGuard {
     ~DrmMappingGuard() { KMutexUnlock(&context->mappingLock); }
 };
 static uint32_t DrmGemAlloc(DrmCtx* c,uint32_t gres,uint32_t size,
-                           uint32_t stride,uint32_t w,uint32_t h) {
+                           uint32_t stride,uint32_t w,uint32_t h,uint32_t target,uint32_t format) {
     for (uint32_t i=0;i<DRM_MAX_GEM;++i) {
         if (c->gem[i].used) continue;
-        auto* resource=DrmResourceCreate(c->owner,gres,size,stride,w,h);
+        auto* resource=DrmResourceCreate(c->owner,gres,size,stride,w,h,target,format);
         if (!resource) return 0;
         c->gem[i]={true,resource,0};return i+1;
     }
@@ -5978,7 +5981,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
                                  : stride * createH;
         // Allocate owning metadata before creating a host resource, so every
         // successful host allocation has a tracked rollback/retirement owner.
-        uint32_t bo = DrmGemAlloc(dctx,0,size,stride,rc.width,createH);
+        uint32_t bo = DrmGemAlloc(dctx,0,size,stride,rc.width,createH,rc.target,rc.format);
         if (bo == 0) {
             SerialPrintf("drm: GEM metadata allocation failed ctx=%d capacity=%u\n",
                          dctx->owner->ctxId,DRM_MAX_GEM);
@@ -11227,12 +11230,13 @@ static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
             pin.value=resource->lifetime;break;
         }
     }
-    if (!resource || w>resource->width || h>resource->height) return -EINVAL;
+    if (!resource || resource->target!=2 || !brook::GpuCaptureFormatSupported(resource->format) ||
+        w>resource->width || h>resource->height) return -EINVAL;
     brook::WmCaptureToken token{};
     if (!brook::WmReserveCapture(proc,static_cast<uint32_t>(wmId),
                                static_cast<uint32_t>(w),static_cast<uint32_t>(h),&token)) return -ENOENT;
     return brook::CompositorCaptureExternal(proc,token,resource->lifetime,
-                                           resource->owner->ctxId,resource->gres);
+                                           resource->owner->ctxId,resource->gres,resource->format);
 }
 
 // 0xB03: notify the desktop that installed application metadata changed.

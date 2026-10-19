@@ -20,6 +20,11 @@ namespace brook {
 
 // Opaque per-texture handle. 0 == invalid.
 typedef uint32_t GpuTexId;
+// Canonical virgl formats supported by retained capture. These values describe
+// the resource created by DRM, independently of a Wayland buffer declaration.
+inline constexpr bool GpuCaptureFormatSupported(uint32_t format) {
+    return format == 1 || format == 2; // B8G8R8A8_UNORM / B8G8R8X8_UNORM
+}
 
 // Special source handle for DrawQuad: sample the blurred backdrop (the scene as
 // composited up to the most recent BlurBarrier, downsampled + gaussian-blurred)
@@ -104,17 +109,19 @@ struct GpuCompositorOps {
 
     // Owned-capture prerequisites. Only the compositor thread may call these,
     // outside BeginFrame/EndFrame assembly. Destinations have no guest backing.
-    // Currently opaque XRGB only: alpha=true is rejected before host commands.
+    // XRGB destinations force alpha one; ARGB destinations preserve source alpha.
     // Creation publishes a handle only after resource/attachment/view creation.
     // Failed teardown retains an unusable quarantined metadata slot; never
     // fall back to DestroyTexture on an owned texture.
     GpuTexId (*CreateOwnedTexture)(uint32_t w, uint32_t h, bool alpha);
     bool (*DestroyOwnedTexture)(GpuTexId tex);
     // Caller pins the canonical source/producer and validates its dimensions.
+    // srcFormat is canonical virgl B8G8R8A8_UNORM(1) or B8G8R8X8_UNORM(2),
+    // never an unchecked client declaration. Unsupported formats reject.
     // Success fences producer, copies, fences compositor, then detaches source.
     // An uncertain result must never authorize buffer release or backing free.
     GpuCaptureResult (*CaptureExternal)(GpuTexId dst, int32_t producerCtx,
-                                      uint32_t srcGres, uint32_t srcW, uint32_t srcH);
+                                      uint32_t srcGres, uint32_t srcFormat, uint32_t srcW, uint32_t srcH);
 };
 
 // Register the GPU compositor ops (called by the display driver once its 3D

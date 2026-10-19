@@ -12,7 +12,7 @@ struct WmCaptureToken;
 // Caller owns cancellation protection. Independently leases source through GPU
 // completion. 0=published, -116=safely discarded, -5=uncertain (do not release).
 int CompositorCaptureExternal(Process*,const WmCaptureToken&,MappingBacking*,
-                              int32_t producer,uint32_t source);
+                              int32_t producer,uint32_t source,uint32_t sourceFormat);
 // Reserve retirement storage before publishing a native VFB. Retiring cannot
 // allocate/fail and waits for compositor epochs without blocking its renderer.
 CompositorVfbAllocation* CompositorPrepareVfbRetirement(uint64_t address,uint64_t pages);

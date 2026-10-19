@@ -519,7 +519,7 @@ struct CaptureRequest {
     CaptureRequest* next;
     WmCaptureToken token;
     MappingBacking* sourceLease;
-    int32_t producer;uint32_t source,references;
+    int32_t producer;uint32_t source,sourceFormat,references;
     CaptureState state;bool canceled;int result;
 };
 static KMutex g_captureLock{};
@@ -534,12 +534,13 @@ static void CaptureUnref(CaptureRequest* request)
     MappingBackingUnref(request->sourceLease);kfree(request);
 }
 int CompositorCaptureExternal(Process* caller,const WmCaptureToken& token,
-                              MappingBacking* lease,int32_t producer,uint32_t source)
+                              MappingBacking* lease,int32_t producer,uint32_t source,uint32_t sourceFormat)
 {
     if (!CompositorGpuActive() || !lease) return -95;
+    if (!GpuCaptureFormatSupported(sourceFormat)) return -22;
     auto* request=static_cast<CaptureRequest*>(kmalloc(sizeof(CaptureRequest)));
     if (!request) return -12;
-    *request={nullptr,token,lease,producer,source,2,CaptureState::Queued,false,-5};
+    *request={nullptr,token,lease,producer,source,sourceFormat,2,CaptureState::Queued,false,-5};
     MappingBackingRef(lease);
     KMutexLock(&g_captureLock);
     if (g_captureCount>=MAX_CAPTURE_REQUESTS) {
@@ -621,7 +622,7 @@ static void DrainOwnedCaptures()
             if (!entry.staging) result=-12;
             else {
                 const auto captured=gpu->CaptureExternal(entry.staging,request->producer,
-                    request->source,token.w,token.h);
+                    request->source,request->sourceFormat,token.w,token.h);
                 if (captured==GpuCaptureResult::Uncertain) {
                     // The driver quarantines this handle. Keep source lifetime
                     // and queue capacity reserved until device reset, too.

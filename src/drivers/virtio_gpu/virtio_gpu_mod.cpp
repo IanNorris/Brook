@@ -1307,7 +1307,8 @@ static bool TransferToHost3D(uint32_t ctxId, uint32_t resId,
 
 // must be unique per resource within the context (object id namespace).
 static bool Submit3DClear(uint32_t ctxId, uint32_t resId, uint32_t surfHandle,
-                          float r, float g, float b, float a)
+                          float r, float g, float b, float a,
+                          uint32_t format=VIRGL_FORMAT_B8G8R8X8_UNORM)
 {
     auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
     memset(sub, 0, sizeof(*sub));
@@ -1322,7 +1323,7 @@ static bool Submit3DClear(uint32_t ctxId, uint32_t resId, uint32_t surfHandle,
     dw[n++] = VirglCmd0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
     dw[n++] = surfHandle;
     dw[n++] = resId;
-    dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;
+    dw[n++] = format;
     dw[n++] = 0;   // texture level
     dw[n++] = 0;   // texture layers (first | last << 16)
 
@@ -1353,7 +1354,9 @@ static bool Submit3DBlit(uint32_t ctxId, uint32_t dstRes,
                          uint32_t dstX, uint32_t dstY, uint32_t dstW, uint32_t dstH,
                          uint32_t srcRes,
                          uint32_t srcX, uint32_t srcY, uint32_t srcW, uint32_t srcH,
-                         bool alphaBlend)
+                         bool alphaBlend,
+                         uint32_t dstFormat=VIRGL_FORMAT_B8G8R8X8_UNORM,
+                         uint32_t srcFormat=VIRGL_FORMAT_B8G8R8X8_UNORM)
 {
     auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
     memset(sub, 0, sizeof(*sub));
@@ -1374,12 +1377,12 @@ static bool Submit3DBlit(uint32_t ctxId, uint32_t dstRes,
     dw[n++] = 0;   // scissor maxx|maxy
     dw[n++] = dstRes;
     dw[n++] = 0;                              // dst level
-    dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;    // dst format
+    dw[n++] = dstFormat;                      // canonical dst format
     dw[n++] = dstX; dw[n++] = dstY; dw[n++] = 0;          // dst x,y,z
     dw[n++] = dstW; dw[n++] = dstH; dw[n++] = 1;          // dst w,h,d
     dw[n++] = srcRes;
     dw[n++] = 0;                              // src level
-    dw[n++] = VIRGL_FORMAT_B8G8R8X8_UNORM;    // src format
+    dw[n++] = srcFormat;                      // canonical src format
     dw[n++] = srcX; dw[n++] = srcY; dw[n++] = 0;          // src x,y,z
     dw[n++] = srcW; dw[n++] = srcH; dw[n++] = 1;          // src w,h,d
 
@@ -2883,7 +2886,7 @@ static GpuTexId CompCreateOwnedTexture(uint32_t w,uint32_t h,bool alpha)
 {
     GpuCmdGuard guard;
     if (!g_ownedCaptureReady || !g_compReady || !g_drawReady || g_compFrameAssembling ||
-        g_controlQueuePoisoned || alpha || !w || !h) return 0;
+        g_controlQueuePoisoned || !w || !h) return 0;
     uint32_t slot=MAX_GPU_TEXTURES;
     for (uint32_t i=0;i<MAX_GPU_TEXTURES;++i)
         if (!g_gpuTextures[i].used) { slot=i;break; }
@@ -2931,19 +2934,19 @@ static bool CompDestroyOwnedTexture(GpuTexId id)
     return texture && texture->owned && DestroyOwnedTextureLocked(*texture);
 }
 static brook::GpuCaptureResult CompCaptureExternal(GpuTexId id,int32_t producer,
-                                                    uint32_t source,uint32_t w,uint32_t h)
+                                                    uint32_t source,uint32_t sourceFormat,uint32_t w,uint32_t h)
 {
     GpuCmdGuard guard;
     auto* texture=CompTex(id);
     if (!g_ownedCaptureReady || !g_compReady || g_compFrameAssembling || g_controlQueuePoisoned ||
-        !texture || !texture->owned || !AppCtxFind(producer) || !AppResValid(producer,source) ||
+        !texture || !texture->owned || !brook::GpuCaptureFormatSupported(sourceFormat) || !AppCtxFind(producer) || !AppResValid(producer,source) ||
         !w || !h || w!=texture->w || h!=texture->h) return brook::GpuCaptureResult::Rejected;
     const bool completed=brook::GpuCaptureSequence([&](brook::GpuCaptureStep step) {
         switch (step) {
         case brook::GpuCaptureStep::ProducerFence:return AppFenceLocked(static_cast<uint32_t>(producer));
         case brook::GpuCaptureStep::AttachSource:return CtxAttachResource(COMP_CTX_ID,source);
         case brook::GpuCaptureStep::Copy:
-            return Submit3DBlit(COMP_CTX_ID,texture->resId,0,0,w,h,source,0,0,w,h,false);
+            return Submit3DBlit(COMP_CTX_ID,texture->resId,0,0,w,h,source,0,0,w,h,false,texture->format,sourceFormat);
         case brook::GpuCaptureStep::CompositorFence:return AppFenceLocked(COMP_CTX_ID);
         case brook::GpuCaptureStep::DetachSource:
             if (!ResourceControlLocked(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,COMP_CTX_ID,source)) return false;
@@ -3026,7 +3029,10 @@ static bool VirtioGpuOwnedCaptureSelfTest()
 {
     if (!g_drawReady) return false;
     g_ownedCaptureReady=true;
-    for (uint32_t cycle=0;cycle<3;++cycle) {
+    for (uint32_t cycle=0;cycle<4;++cycle) {
+        const bool alpha=cycle==3;
+        const uint32_t format=alpha?VIRGL_FORMAT_B8G8R8A8_UNORM:VIRGL_FORMAT_B8G8R8X8_UNORM;
+        const uint32_t green=alpha?0x008000u:0x00ff00u;
         VirtualAddress backing=VmmAllocPages(2,VMM_WRITABLE,MemTag::Device,KernelPid);
         if (!backing) return false;
         auto* sourcePixels=reinterpret_cast<uint32_t*>(backing.raw());
@@ -3034,59 +3040,60 @@ static bool VirtioGpuOwnedCaptureSelfTest()
         memset(sourcePixels,0,8192);
         const int32_t ctx=AppCtxCreate(0);
         if (ctx<0) return false;
-        const int32_t source=AppResourceCreate3D(ctx,PIPE_TEXTURE_2D,VIRGL_FORMAT_B8G8R8X8_UNORM,
+        const int32_t source=AppResourceCreate3D(ctx,PIPE_TEXTURE_2D,format,
             VIRGL_BIND_RENDER_TARGET|VIRGL_BIND_SAMPLER_VIEW,4,4,1,1,0,0,0);
-        const int32_t readback=AppResourceCreate3D(ctx,PIPE_TEXTURE_2D,VIRGL_FORMAT_B8G8R8X8_UNORM,
+        const int32_t readback=AppResourceCreate3D(ctx,PIPE_TEXTURE_2D,format,
             VIRGL_BIND_RENDER_TARGET|VIRGL_BIND_SAMPLER_VIEW,4,4,1,1,0,0,0);
         if (source<0 || readback<0 || AppResourceAttachUser(ctx,source,backing.raw(),64) ||
             AppResourceAttachUser(ctx,readback,backing.raw()+4096,64)) return false;
-        const GpuTexId captured=CompCreateOwnedTexture(4,4,false);
+        const GpuTexId captured=CompCreateOwnedTexture(4,4,alpha);
         if (!captured) return false;
         {
             GpuCmdGuard guard;
-            if (!Submit3DClear(ctx,source,1,0.0f,1.0f,0.0f,1.0f)) return false;
+            if (!Submit3DClear(ctx,source,1,0.0f,alpha?0.5f:1.0f,0.0f,alpha?0.5f:1.0f,format)) return false;
         }
-        if (CompCaptureExternal(captured,ctx,source,4,4)!=GpuCaptureResult::Complete) return false;
+        if (CompCaptureExternal(captured,ctx,source,format,4,4)!=GpuCaptureResult::Complete) return false;
         {
             GpuCmdGuard guard;
-            if (!Submit3DClear(ctx,source,2,0.0f,0.0f,1.0f,1.0f)) return false;
+            if (!Submit3DClear(ctx,source,2,0.0f,0.0f,1.0f,alpha?0.25f:1.0f,format)) return false;
         }
         // Independently prove the producer overwrite happened: otherwise a
         // missing overwrite would make the retained-green assertion vacuous.
         const GpuTransfer3D transfer={0,0,0,4,4,1,0,0,16,64};
         if (AppTransfer3D(ctx,source,1,transfer) || AppPresentBarrier(ctx)) return false;
         for (uint32_t i=0;i<16;++i)
-            if ((sourcePixels[i]&0xffffffu)!=0x0000ffu) return false;
+            if ((sourcePixels[i]&0xffffffu)!=0x0000ffu ||
+                (alpha && sourcePixels[i]!=0x400000ffu)) return false;
         {
             GpuCmdGuard guard;
             if (!CtxAttachResource(COMP_CTX_ID,readback)) return false;
         }
-        auto checkReadback=[&](uint32_t resource,uint32_t expected) {
+        auto checkReadback=[&](uint32_t resource,uint32_t resourceFormat,uint32_t expected,bool checkAlpha=false) {
             GpuCmdGuard guard;
             memset(readPixels,0,64);
             // COPY_TRANSFER3D rejects a host-only source without an iov in
             // the pinned renderer. Blit to a backed test RT then transfer it.
-            if (!Submit3DBlit(COMP_CTX_ID,readback,0,0,4,4,resource,0,0,4,4,false) ||
+            if (!Submit3DBlit(COMP_CTX_ID,readback,0,0,4,4,resource,0,0,4,4,false,format,resourceFormat) ||
                 !AppFenceLocked(COMP_CTX_ID) || !TransferFromHost3D(COMP_CTX_ID,readback,4,4)) return false;
             for (uint32_t i=0;i<16;++i)
-                if ((readPixels[i]&0xffffffu)!=expected) return false;
+                if ((readPixels[i]&(checkAlpha?0xffffffffu:0xffffffu))!=expected) return false;
             return true;
         };
         const uint32_t capturedResource=CompTex(captured)->resId;
-        if (!checkReadback(capturedResource,0x00ff00u) || AppRetireResource(ctx,source) ||
-            !checkReadback(capturedResource,0x00ff00u)) return false;
+        if (!checkReadback(capturedResource,format,alpha?(0x80000000u|green):green,alpha) || AppRetireResource(ctx,source) ||
+            !checkReadback(capturedResource,format,alpha?(0x80000000u|green):green,alpha)) return false;
         // Exercise destruction after this view has actually been bound and
         // sampled. Keep the boot framebuffer selected during the test draw.
         const bool wasBound=g_compScanoutBound;
         g_compScanoutBound=true;
         CompBeginFrame(0xff000000u);
         CompEndFrame();
-        const bool cleared=checkReadback(COMP_SCANOUT_RES,0);
+        const bool cleared=checkReadback(COMP_SCANOUT_RES,VIRGL_FORMAT_B8G8R8X8_UNORM,0);
         CompBeginFrame(0xff000000u);
         CompDrawQuad(captured,0,0,4,4,0,0,4,4,255,false);
         CompEndFrame();
         g_compScanoutBound=wasBound;
-        if (!cleared || !checkReadback(COMP_SCANOUT_RES,0x00ff00u) ||
+        if (!cleared || !checkReadback(COMP_SCANOUT_RES,VIRGL_FORMAT_B8G8R8X8_UNORM,green) ||
             !CompDestroyOwnedTexture(captured)) return false;
         {
             GpuCmdGuard guard;
@@ -3097,6 +3104,7 @@ static bool VirtioGpuOwnedCaptureSelfTest()
         if (AppCtxFind(ctx)) return false;
         VmmFreePages(backing,2);
     }
+    SerialPuts("virtio_gpu: owned capture verified XRGB and ARGB alpha/overwrite/retire/readback\n");
     return true;
 }
 

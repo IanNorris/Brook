@@ -27,6 +27,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--brook-guest',action='store_true',required=True)
     p.add_argument('--control',required=True)
+    p.add_argument('--format',choices=('xrgb','argb'),default='xrgb')
     args=p.parse_args();control=Path(args.control);control.mkdir(exist_ok=False)
     libc=ctypes.CDLL(None,use_errno=True);libc.syscall.restype=ctypes.c_long
     def call(number,*values):
@@ -46,7 +47,8 @@ def main():
     def capture(color,overwrite=None):
         fd=os.open('/dev/dri/renderD128',os.O_RDWR);prime=-1;memory=None;handle=0
         try:
-            fields=struct.unpack('<14I',ioctl(fd,0x44,struct.pack('<14I',2,2,10,64,64,1,1,0,0,0,0,0,16384,0)))
+            source_format=1 if args.format=='argb' else 2
+            fields=struct.unpack('<14I',ioctl(fd,0x44,struct.pack('<14I',2,source_format,10,64,64,1,1,0,0,0,0,0,16384,0)))
             handle,resource=fields[10:12];assert handle and resource
             offset=struct.unpack('<QII',ioctl(fd,0x41,struct.pack('<QII',0,handle,0)))[0]
             memory=mmap.mmap(fd,16384,flags=mmap.MAP_SHARED,prot=mmap.PROT_READ|mmap.PROT_WRITE,offset=offset,trackfd=False)
