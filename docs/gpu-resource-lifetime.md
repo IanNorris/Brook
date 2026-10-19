@@ -253,6 +253,19 @@ passed and nine document hashes and ownership were unchanged. Evidence is in
 slot recovery and safe ID recycling are still required before repeated-launch
 acceptance can be completed.
 
+A second cold run (`c1e65e30479f40408e95d80702906e48`, same configuration and
+kernel) closed STK and then launched Chromium without restarting the VM.
+Memory returned to 306.1 MiB after STK. Chromium rendered the local fixture in
+the reused window slot, delivered its JavaScript readiness report and decoded
+the 640×360 clip's first frame. The captured page showed its own content with
+no stale STK surface. The clip remained paused; this is not playback/audio or
+public-site acceptance. Guest use was 962.3 MiB with Chromium open and 331.4 MiB
+after its full launch lineage drained. The remaining 5,763,072 backing bytes
+were exactly three quarantined STK exports, with no allocation or retirement
+failures. Both apps' lineages drained, audio was empty, and checked shutdown,
+owned launcher exit zero, offline filesystem checks and nine document fixtures
+passed. See `build/workloads/drm-ownership-20261019/stk-recovery/acceptance-audit.json`.
+
 ## Presentation completion
 
 The current `WM_PRESENT_GRES` stores a raw ID for later compositor sampling,
