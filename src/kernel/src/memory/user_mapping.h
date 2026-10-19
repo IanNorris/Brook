@@ -11,6 +11,9 @@ struct UserMappingRequest {
     bool fixed;
     int (*prepare)(MappingTransaction&,const UserMappingRequest&,void*);
     void* context;
+    // Exact address with collision failure, including PROT_NONE reservations.
+    // Checked and published under the same AS transaction/generation protocol.
+    bool noReplace = false;
 };
 int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMappingRequest& request);
 int64_t UserMappingRemove(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length);

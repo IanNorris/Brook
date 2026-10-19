@@ -3288,7 +3288,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
             { "/etc/hostname", "brook\n" },
             { "/etc/os-release", "NAME=Brook\nID=brook\nPRETTY_NAME=Brook\n" },
             { "/etc/nsswitch.conf", "passwd: files\ngroup: files\nhosts: files dns\n" },
-            { "/etc/hosts", "127.0.0.1 localhost\n" },
+            { "/etc/hosts", "127.0.0.1 localhost brook\n" },
             { "/proc/version", "Linux version 6.1.0-brook (brook@brook) (gcc 14.2) #1 SMP\n" },
             { nullptr, nullptr }
         };
@@ -3938,6 +3938,7 @@ enum MmapFlags : uint64_t {
     MAP_SHARED    = 0x01,
     MAP_PRIVATE   = 0x02,
     MAP_FIXED     = 0x10,
+    MAP_FIXED_NOREPLACE = 0x100000,
     MAP_ANONYMOUS = 0x20,
     MAP_DENYWRITE = 0x0800,
     MAP_POPULATE  = 0x8000,
@@ -4001,9 +4002,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 {
     __atomic_fetch_add(&g_profMmapCount,1,__ATOMIC_RELAXED);
     constexpr uint64_t userEnd = 0x0000800000000000ULL;
+    const bool exactAddress = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) != 0;
     if (!length || length > userEnd || (prot & ~7ULL) ||
         (!(flags & MAP_PRIVATE) == !(flags & MAP_SHARED)) ||
-        ((flags & MAP_FIXED) && ((addr & 4095) || addr < VIRTUAL_NULL_GUARD || addr>=userEnd || length > userEnd-addr)) ||
+        (exactAddress && ((addr & 4095) || addr < VIRTUAL_NULL_GUARD || addr>=userEnd || length > userEnd-addr)) ||
         (!(flags & MAP_ANONYMOUS) && (offset & 4095))) return -EINVAL;
     length = (length+4095)&~uint64_t{4095};
     if (!(flags & MAP_ANONYMOUS) && offset > ~uint64_t{0}-length) return -EINVAL;
@@ -4011,7 +4013,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     KernelOperationGuard protectedOperation(proc);
     MappingBackingGuard backing;
     UserMappingRequest request{};
-    request.hint = addr; request.length = length; request.fixed = (flags & MAP_FIXED) != 0;
+    request.hint = addr; request.length = length; request.fixed = exactAddress;
+    request.noReplace = (flags & MAP_FIXED_NOREPLACE) != 0;
     request.range = {0,length,offset,0,nullptr,static_cast<uint32_t>(prot),7,MappingKind::Anonymous,
                      (flags & MAP_SHARED) ? MappingSharing::Shared : MappingSharing::Private,MappingLeafOwnership::Managed};
     if (flags & MAP_ANONYMOUS) {
@@ -5262,10 +5265,12 @@ struct timeval {
     int64_t tv_usec;
 };
 
-// CLOCK_REALTIME=0  CLOCK_MONOTONIC=1  CLOCK_MONOTONIC_RAW=4  CLOCK_BOOTTIME=7
+// Coarse clocks retain their corresponding epoch. Higher precision is safe;
+// returning uptime for REALTIME_COARSE makes absolute realtime waits expire.
+// CLOCK_REALTIME=0, REALTIME_COARSE=5; MONOTONIC=1, RAW=4, COARSE=6, BOOTTIME=7.
 static uint64_t ClockNowNs(uint64_t clockid)
 {
-    if (clockid == 0) return RtcNowNs();
+    if (clockid == 0 || clockid == 5) return RtcNowNs();
     return KvmClockAvailable() ? KvmClockReadNs()
                                : g_lapicTickCount * 1000000ULL;
 }

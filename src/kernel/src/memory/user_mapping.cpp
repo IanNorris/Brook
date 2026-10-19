@@ -307,7 +307,7 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
     uint64_t checkedEnd;
     MappingRange checked = request.range;
     checked.begin = 0; checked.end = request.length;
-    if (!actor || !space || (request.length & 4095) ||
+    if (!actor || !space || (request.noReplace && !request.fixed) || (request.length & 4095) ||
         !UserInterval(request.fixed ? request.hint : 0,request.length,checkedEnd) ||
         (request.fixed && request.hint < VIRTUAL_NULL_GUARD) ||
         (request.range.protection & ~request.range.maximumProtection) ||
@@ -324,8 +324,11 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
         const uint64_t address = PickMappingAddress(space,request);
         if (!address) return failure.Fail("address-gap",-12);
         const uint64_t end = address+request.length;
+        if (request.noReplace &&
+            MappingRangeFindGap(space->ranges,address,request.length,address,end) != address)
+            return failure.Fail("exact-address-occupied",-17); // EEXIST, without retiring anything
         uint64_t retired = 0;
-        if (request.fixed && !operation.RangeLeafCount(address,end,retired)) return failure.Fail("retirement-count",-22);
+        if (request.fixed && !request.noReplace && !operation.RangeLeafCount(address,end,retired)) return failure.Fail("retirement-count",-22);
         failure.retired=retired;
         const uint64_t generation = space->generation;
         operation.Unlock();
@@ -344,7 +347,7 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
         if (space->generation != generation) continue;
         MappingRange range = request.range;
         range.begin = address; range.end = end; range.identity = 0;
-        if (request.fixed) {
+        if (request.fixed && !request.noReplace) {
             if (!operation.CanReplaceRange(address,end,&range)) return failure.Fail("range-replace-preflight",-12);
             // A fault may have populated another leaf without changing topology
             // while preparation was unlocked. Capacity failure changes nothing.

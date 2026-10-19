@@ -889,6 +889,60 @@ static void sparseLiveRemap() {
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
     std::puts("LIVE SPARSE REMAP PASS 1TiB/two-hidden-leaves/fixed-destination/OOM-atomic/refcounts");
 }
+static void exactAddressNoReplace() {
+    auto root=table();VmmHostSetKernelRoot(root);
+    auto* space=AddressSpaceCreate(39);CHECK(space);
+    Process actor{};actor.addressSpace=space;
+    constexpr uint64_t high=0x7f8800000000ULL;
+    UserMappingRequest request{};request.range=rangeRecord(0,3*pageSize,nullptr);
+    request.hint=high;request.length=3*pageSize;request.fixed=true;request.noReplace=true;
+    request.preparedPages=3;request.prepare=prepareMappingPages;
+    const auto oldNext=space->mmapNext;
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(high));
+    CHECK(space->mmapNext==oldNext);
+    const auto first=VmmReadLeaf(space->pageTable,VirtualAddress(high));
+    auto* bytes=reinterpret_cast<unsigned char*>(VmmLeafPhysical(first).raw());bytes[7]=0x63;
+    const auto generation=space->generation;
+    for (auto [begin,length]: {std::pair{high,3*pageSize},std::pair{high+pageSize,pageSize},
+                              std::pair{high-pageSize,2*pageSize},std::pair{high+2*pageSize,2*pageSize},
+                              std::pair{high-pageSize,5*pageSize}}) {
+        request.hint=begin;request.length=length;request.range.end=length;request.preparedPages=length/pageSize;
+        CHECK(UserMappingCreate(&actor,space,request)==-17);
+        CHECK(space->generation==generation&&bytes[7]==0x63);
+        CHECK(VmmReadLeaf(space->pageTable,VirtualAddress(high))==first);
+    }
+    request.hint=high+1;request.length=pageSize;request.range.end=pageSize;request.preparedPages=1;
+    CHECK(UserMappingCreate(&actor,space,request)==-22);
+    request.hint=high+pageSize;
+    CHECK(UserMappingRemove(&actor,space,request.hint,pageSize)==0);
+    request.range.protection=0;request.preparedPages=0;request.prepare=nullptr;
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(request.hint));
+    CHECK(UserMappingCreate(&actor,space,request)==-17); // Metadata-only PROT_NONE is occupied.
+    CHECK(UserMappingRemove(&actor,space,high,3*pageSize)==0);
+    // A competing creator wins while preparation is unlocked. Generation
+    // revalidation must retry and report EEXIST, preserving the winner.
+    Gate preparing;
+    request.range.protection=3;request.hint=high;
+    request.prepare=[](MappingTransaction&,const UserMappingRequest&,void* context) {
+        static_cast<Gate*>(context)->park();return 0;
+    };
+    request.context=&preparing;
+    int64_t result=0;
+    std::thread worker([&]{result=UserMappingCreate(&actor,space,request);});
+    preparing.wait(1);
+    auto winner=request;winner.prepare=nullptr;winner.context=nullptr;
+    CHECK(UserMappingCreate(&actor,space,winner)==static_cast<int64_t>(high));
+    const auto winnerIdentity=MappingRangeFind(space->ranges,high)->identity;
+    preparing.release();worker.join();CHECK(result==-17);
+    CHECK(MappingRangeFind(space->ranges,high)->identity==winnerIdentity);
+    winner.hint=0x0000800000000000ULL-pageSize;
+    CHECK(UserMappingCreate(&actor,space,winner)==static_cast<int64_t>(winner.hint));
+    winner.length=2*pageSize;winner.range.end=winner.length;
+    CHECK(UserMappingCreate(&actor,space,winner)==-22); // Cannot cross the user boundary.
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("EXACT ADDRESS NOREPLACE PASS high-address/overlap/preservation/PROT_NONE/commit-race/cleanup");
+}
 static void liveMappingClone() {
     auto root=table();VmmHostSetKernelRoot(root);
     auto* source=AddressSpaceCreate(31);auto* child=AddressSpaceCreate(32);CHECK(source&&child);
@@ -1936,7 +1990,7 @@ int main(int argc,char** argv) {
     liveMappingClone();sharedMappingClone();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();addressFileGateScope();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
     targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();
-    anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();
+    anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");

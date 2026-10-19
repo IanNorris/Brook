@@ -31,15 +31,25 @@
   audit passed. Local logs: `build/window-surface-candidate-build-20261018.log`
   and `build/debug/entry-state-audit.json`.
 
-- Initial [Wine64 smoke test](wine-smoke.md): diagnose wineserver's rejection of
-  `/tmp/.wine-1000` as not owned by UID1000, including metadata on newly created
-  temporary directories and path routing. A private owned ext2 `TMPDIR` did not
-  change the server path. The loader's version command passes, but no Windows
-  command has passed yet. The installer now accepts standalone file outputs
+- [Wine64 compatibility](wine-smoke.md): ext2 temporary storage, pathname
+  sockets, descriptor transfer and writable shared-file mappings now let the
+  Windows console command run. Keep the narrow Notepad acceptance separate
+  from broader Windows compatibility. The installer accepts standalone file outputs
   such as the Mono MSI, with candidate recovery/retry and cold profile-version
   checks passing; refresh bundled tools with future images. Full fresh-download,
   interrupted/disk-full and whole-profile transaction acceptance remain separate.
   Keep Vulkan/Proton work separate and return to application stability testing.
+
+- Follow up the Wine review's general Linux semantics gaps with focused Linux
+  references before expanding Windows workload coverage. Regular-file
+  `SCM_RIGHTS` transfer currently resets the file position; dup/fork copy it
+  instead of sharing an open file description. Full/nonblocking pipe writes
+  must respect `O_NONBLOCK` and atomic writes through `PIPE_BUF`. Epoll watches
+  need open-file identity across aliases/close/reuse. These are concrete gaps,
+  but were not established as the cause of Wine's observed startup failures.
+  Complete clock-ID validation in gettime/getres, including unsupported and
+  dynamic IDs and real process/thread CPU clocks; the coarse-realtime epoch
+  repair does not establish complete clock API compatibility.
 
 - Finish clock coverage after the [realtime epoch-anchor repair](realtime-clock.md).
   The eight-worker KVM comparison now has zero backwards realtime steps, versus

@@ -1,9 +1,86 @@
 # Wine64 compatibility
 
-Current checkpoint (19 October): pathname sockets, descriptor exchange and
-coherent writable shared ext2 mappings pass focused Linux-matched regressions.
-A traced Wine64 11.0 run executes the console marker with exit zero. Quiet
-startup is not repeatable yet; Notepad/input/save/reopen acceptance remains open.
+Current checkpoint (19 October): Wine64 11.0 runs the console marker and Windows
+Notepad as Brook. Keyboard input, save, normal close and reopening the saved
+document after a cold boot pass. This is narrow basic-application acceptance;
+Vulkan, DXVK, Proton and 32-bit Windows programs remain untested.
+
+## Console and Notepad acceptance — 19 October
+
+![Windows Notepad reopening its saved document on Brook](images/brook_wine_notepad_1080.png)
+
+The accepted run uses eight vCPUs, 4 GiB, CPU composition, a headless 1920×1080
+display and silent host audio. Kernel SHA256:
+`e83e7518357603b755f8057896579f5122a023a392f9703a88d2832c4edec8a5`.
+All twelve driver modules use ABI29. Each run uses private copies of previously
+checked disks, including separate ext2 data, Nix and temporary volumes.
+
+Three further compatibility repairs resolved the startup failures:
+
+- `MAP_FIXED_NOREPLACE` now maps at the exact requested address or returns
+  `EEXIST` without replacing overlapping mappings, including `PROT_NONE`
+  reservations. Previously Wine's high-address probe repeatedly received a
+  different address, unmapped it and retried. Collision checks and publication
+  share the existing AS transaction/generation protocol, including races during
+  unlocked preparation. Plain `MAP_FIXED` retains replacement behavior.
+- `CLOCK_REALTIME_COARSE` now uses the realtime epoch. It previously returned
+  uptime despite advertising a usable resolution. Wine converted relative GUI
+  waits into absolute deadlines using that value, while wineserver compared
+  them against realtime; explorer startup waits expired immediately. A
+  Linux-matched 200 ms absolute timerfd test reproduced immediate expiration
+  before the repair and approximately 200 ms afterward. This does not complete
+  clock-ID validation or process/thread CPU clocks.
+- The synthetic hosts file includes Brook's own hostname on loopback. The
+  minimal diagnostic image also regained the standard font bundle already
+  included by the normal image builder; no font package source changed.
+
+Both commands ran as UID1000/GID100 with the existing persistent prefix
+`/data/home/wine-acceptance/prefix-file-trace`, `HOME=/data/home`, `WINEARCH=win64`,
+empty `DISPLAY`, `WAYLAND_DISPLAY=wayland-0`, `XDG_RUNTIME_DIR=/tmp`,
+`WINEDLLOVERRIDES=mscoree,mshtml=` and `WINEDEBUG=-all,err+all`:
+
+```text
+/nix/profile/bin/wine cmd /c echo BROOK_WINE_CONSOLE_PASS
+/nix/profile/bin/wine notepad.exe Z:\data\home\wine-notepad-acceptance.txt
+```
+
+The console printed exactly `BROOK_WINE_CONSOLE_PASS\r\n` and exited zero.
+Its main exit was first observed about 8.8 seconds after submission; Notepad's
+window appeared about 7.3 seconds after its separate submission. These are
+single-run observations, not isolated benchmarks. Neither command reported the
+former five-minute boot-event timeout. The final launch uses normal Notepad,
+without the virtual-desktop diagnostic wrapper.
+
+Keyboard input and Ctrl+S wrote a 93-byte CRLF text file owned by Brook, SHA256
+`a695edf6085c6cbb55ca732727ad80a7d77f222240be561c4ac3919c2d879249`.
+The independent cold boot read the same bytes and showed them in Notepad before
+further input. Repeating input/save on the final kernel retained that hash.
+All 1,027 prefix entries had UID1000/GID100. Its kernel32, cmd and Notepad binaries
+also matched the immutable Wine package byte-for-byte in offline checks.
+
+Notepad closed through its UI with exit zero. Wine services exited naturally;
+the original console and Notepad lineages drained completely, with both output
+streams retained without gaps. The heap check passed, no application windows
+or user application tasks remained, and checked shutdown completed with the
+original launcher and QEMU returning zero. All four disks passed offline
+filesystem checks. Ten pre-existing document hashes/owners and the prior
+shared-mapping persistence fixture were preserved.
+
+Validation includes all 52 host suites and compiled entry audits, nineteen
+Linux-matched exact-address checks, seven coarse-clock/deadline checks, hostname
+resolution, and twenty shared-file/descriptor-transfer checks in the preceding
+mapping candidate. Host mapping tests additionally cover concurrent claims
+during preparation and user-address boundary validation.
+
+Evidence: `build/workloads/wine-clock-20261019/candidate/acceptance-audit.json`,
+with earlier diagnostics under `wine-notepad-hostname-20261019` and
+`wine-noreplace-20261019`. One verbose virtual-desktop diagnostic exceeded bridge
+output retention; its gap report and terminal exit/lineage proof are retained
+and it is excluded from full-output application acceptance. The final quiet
+normal launch has complete output. These runs reuse the populated checked
+prefix; fresh-prefix installation, optional Wine services and broader Windows
+application compatibility are separate work. Remaining general Linux semantic
+gaps are recorded in [the backlog](backlog.md).
 
 ## Initial smoke test — 18 October
 
