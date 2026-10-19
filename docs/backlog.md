@@ -1386,3 +1386,18 @@ and pollable lifetime handles as part of Linux compatibility, and audit
 userspace process controllers for incarnation-aware references. The two
 name/all strace iterators in `syscall.cpp` also still stop at PID 255 despite
 the 1024-ID kernel namespace; remove that diagnostic limit in a focused follow-up.
+
+### Windows runtime followups from Unity smoke tests
+
+- Integrate the clocked ALSA OSS route into future Wine launchers/images. The
+  per-prefix ALSA selection and per-app configuration work for Helltaker and
+  SpaceVenture; the old file/null adapter floods errors in the former. Avoid
+  silently changing unrelated application audio defaults.
+- Plan 32-bit Windows/WoW64 support with explicit CPU segment and signal-context
+  requirements. The supplied original Quake II executable is i386; the current
+  Wine build and user code descriptors support only x86-64.
+- Extend signal-context coverage beyond saved CS/SS and exact RSP: floating-point
+  state and strict selector restoration need their own contracts and tests.
+  The saved-SS fix leaves strict ucontext flags unadvertised. Keep the existing
+  static entry auditor's unsupported paths visible rather than claiming full
+  arbitrary-handler verification.

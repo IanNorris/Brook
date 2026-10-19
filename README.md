@@ -60,7 +60,9 @@ the table distinguishes tested behavior from remaining limitations.
 | [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, cold save/reopen and normal exit verified alongside Firefox and Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
 | [Blender](https://www.blender.org/) | 5.1.1 | 🚧 Blocked | Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked |
 | Wine64 | 11.0 | ✅ Basic apps | Console command and Windows Notepad: keyboard input, save, normal close and cold-boot reopen as Brook. Broader Windows coverage remains limited. [Evidence and screenshot](docs/wine-smoke.md#console-and-notepad-acceptance--19-october) |
-| Wine + DXVK | 11.0 / 2.7.1 | ⚠️ Experimental D3D11 | Hardware Venus shader/readback probe and Windows SDL3 Snake; keyboard input, resize, maximize, minimize/restore and repeated launch/close verified. Windows audio and Proton remain untested. [Results](docs/wine-dxvk.md) |
+| Wine + DXVK | 11.0 / 2.7.1 | ⚠️ Experimental D3D11 | Hardware Venus shader/readback probe and Windows SDL3 Snake; keyboard input, resize, maximize, minimize/restore and repeated launch/close verified. Per-app Unity audio also verified; Proton remains untested. [Results](docs/wine-dxvk.md), [Unity smoke test](docs/wine-unity.md) |
+| SpaceVenture (Windows) | 2.08.12 / Unity 2022.3 | ⚠️ Experimental | D3D11/DXVK main menu, opening sequence and first-room interaction; clocked ALSA PCM captured. [Screenshot and limits](docs/wine-unity.md#spaceventure--unity-2022362f2) |
+| Helltaker (Windows) | Unity 2019.2.9f1 | ⚠️ Experimental | 720p D3D11/DXVK first-puzzle gameplay, keyboard movement/restart, minimize/restore and normal exit; clocked ALSA audio captured. [Screenshot and scope](docs/wine-unity.md) |
 | [Qalculate!](https://qalculate.github.io/) | — | ✅ Working | GTK3 calculator via Wayland (CSD decorations) |
 | [GIMP](https://www.gimp.org/) | 3.0.8 | ⚠️ Experimental | Painting, XCF save/reopen (including cold boot) and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults |
 | [LibreOffice](https://www.libreoffice.org/) | 25.8.5.2 | ⚠️ Experimental | Writer save/reopen across cold boot and full native-close cleanup verified as Brook; startup and broader suite coverage remain experimental |
@@ -81,7 +83,9 @@ the table distinguishes tested behavior from remaining limitations.
   controls; the Windows SDL3 Snake example also runs with its D3D11 renderer.
   Wine cleanup, committed viewport geometry and resize acknowledgement fixes
   support the path. [Acceptance and limitations](docs/wine-dxvk.md) cover the
-  tested configuration. Full Steam/Proton integration remains future work.
+  tested configuration. [Unity game smoke tests](docs/wine-unity.md) now cover
+  Helltaker and SpaceVenture, including captured audio. Full Steam/Proton
+  integration remains future work.
 
 - **Native editor:** VSCodium renders its workbench, accepts keyboard input,
   saves and reopens text files, and exits through its window controls. Nested
@@ -260,6 +264,18 @@ Click any screenshot to open its original pixels. README previews are smaller
 than the captured desktop; UI text is clearest in the full-resolution image.
 New captures use native 1920×1080 without upscaling. See
 [showcase capture and demo plans](docs/showcase.md).
+
+<p align="center">
+  <a href="docs/images/brook_wine_spaceventure_1080.png"><img src="docs/images/brook_wine_spaceventure_1080.png" alt="Windows SpaceVenture's first 3D room running through Wine, DXVK and hardware Vulkan on Brook" width="960"></a>
+</p>
+
+<p align="center"><em>SpaceVenture — Windows Unity 2022, D3D11 through DXVK/Venus, first-room interaction and captured audio. 720p game window; native 1920×1080 capture.</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_wine_helltaker_1080.png"><img src="docs/images/brook_wine_helltaker_1080.png" alt="Windows Helltaker puzzle gameplay through Wine and DXVK on Brook" width="960"></a>
+</p>
+
+<p align="center"><em>Helltaker — Windows Unity 2019 puzzle gameplay through Wine and DXVK, with keyboard input and captured audio. Native 1920×1080 capture.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_chromium_youtube_1080.png"><img src="docs/images/brook_chromium_youtube_1080.png" alt="Chromium playing Big Buck Bunny on YouTube with audio on Brook's native 1920 by 1080 desktop" width="960"></a>

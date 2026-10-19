@@ -121,7 +121,14 @@ def check_stopped_serial(data, directory):
         raise RuntimeError(f"Guest device/panic errors; see {directory / 'guest-final-serial.log'}")
 
 
-def launch(directory, instance, artifacts=None, cpus=8, memory="8G", gpu="0", composite="cpu", scenario="bootstrap", on_started=None):
+def launch(directory, instance, artifacts=None, cpus=8, memory="8G", gpu="0", composite="cpu", scenario="bootstrap", on_started=None, media_disk=None):
+    if media_disk is not None:
+        # Large workload payloads exceed QEMU vvfat's default FAT16 capacity.
+        # Accept only a private image belonging to this experiment directory.
+        media_disk = Path(media_disk).resolve(strict=True)
+        media_disk.relative_to(directory.resolve())
+        if not media_disk.is_file():
+            raise ValueError("Experiment media disk must be a private image file")
     env = dict(os.environ, BROOK_EXPERIMENT_RUN=str(directory),
                BROOK_EXPERIMENT_DISKS=str(directory), BROOK_DISK_IMG=str(directory / "boot.img"),
                BROOK_VM_BRIDGE="1", BROOK_VM_PROVENANCE="agent", BROOK_SMP=str(cpus), BROOK_MEMORY=memory,
@@ -137,7 +144,7 @@ def launch(directory, instance, artifacts=None, cpus=8, memory="8G", gpu="0", co
     (media / "BROOK.MNT").write_text("/media")
     env.update(BROOK_HOME_DISK=str(directory / "absent-home.img"),
                BROOK_GPT_DISK=str(directory / "absent-gpt.img"),
-               BROOK_DATA_DISK=str(directory / "absent-extra-data.img"),
+               BROOK_DATA_DISK=str(media_disk if media_disk is not None else directory / "absent-extra-data.img"),
                BROOK_USB_TEST_IMG=str(directory / "usb.img"),
                BROOK_MEDIA_DIR=str(media))
     if artifacts:

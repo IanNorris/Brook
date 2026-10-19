@@ -279,3 +279,7 @@ The 750 ms Snake capture also rejects producer drops and mismatched event
 counts. CPU, PID and scheduler views in Speedscope describe overlapping data
 and must not be added together. Timer sampling cannot represent time spent
 with interrupts masked uniformly.
+
+The subsequent [Windows Unity game smoke tests](wine-unity.md) exercise
+Helltaker gameplay, SpaceVenture's first 3D room and per-app clocked audio
+beyond the video-only Snake workload.
