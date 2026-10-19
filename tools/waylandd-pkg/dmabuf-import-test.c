@@ -107,7 +107,7 @@ int main(void)
      * both resource-destruction orders, including a deferred final GEM close. */
     for (int early=0;early<2;++early) {
         struct brook_surface *dying=calloc(1,sizeof(*dying));assert(dying);
-        wl_list_init(&dying->pending_frames);wl_list_init(&dying->committed_frames);
+        surface_tree_init(dying);
         dying->resource=wl_resource_create(client,&wl_surface_interface,4,0);assert(dying->resource);
         wl_resource_set_implementation(dying->resource,&surface_impl,dying,surface_destroy_userdata);
         struct wl_resource *attached=buffer(client,0,10);

@@ -2,10 +2,25 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <wayland-client.h>
+#include <stdarg.h>
+static long test_syscall(long,...);
+#define syscall test_syscall
 #define main brook_waylandd_main
 #include "waylandd.c"
 #undef main
+#undef syscall
 
+static unsigned created_windows;
+static uint32_t remap_vfb[4];
+static long test_syscall(long number,...) {
+    if (number==0xB06) { errno=EOPNOTSUPP;return -1; }
+    if (number==BROOK_SYS_WM_CREATE_WINDOW) {
+        va_list ap;va_start(ap,number);long w=va_arg(ap,long),h=va_arg(ap,long);
+        (void)va_arg(ap,long);struct brook_wm_create_out *out=(void *)va_arg(ap,long);va_end(ap);
+        assert(w==2 && h==2);++created_windows;*out=(struct brook_wm_create_out){2,2,(uintptr_t)remap_vfb};
+    }
+    return 0;
+}
 static struct wl_shm *client_shm;
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
                             const char *interface, uint32_t version) {
@@ -64,7 +79,7 @@ int main(void) {
     assert(server_buffer && wl_shm_buffer_get(server_buffer));
 
     struct brook_surface surface = {0};
-    wl_list_init(&surface.pending_frames); wl_list_init(&surface.committed_frames);
+    surface_tree_init(&surface);
     surface.resource = wl_resource_create(client, &wl_surface_interface, 4, 0);
     surface.xdg_surface = wl_resource_create(client, &xdg_surface_interface, 1, 0);
     surface.xdg_toplevel = wl_resource_create(client, &xdg_toplevel_interface, 1, 0);
@@ -108,7 +123,7 @@ int main(void) {
 
     /* Initial popup and reposition serials share the same allocator too. */
     struct brook_surface popup = {0};
-    wl_list_init(&popup.pending_frames); wl_list_init(&popup.committed_frames);
+    surface_tree_init(&popup);
     popup.resource = wl_resource_create(client, &wl_surface_interface, 4, 0);
     popup.xdg_surface = wl_resource_create(client, &xdg_surface_interface, 3, 0);
     popup.xdg_popup = wl_resource_create(client, &xdg_popup_interface, 3, 0);
@@ -132,7 +147,20 @@ int main(void) {
     assert(surface.pending_buffer && !surface.pending_buffer->resource && surface.pending_buffer->shm);
     surface_commit(client,surface.resource);
     assert(!surface.pending_buffer && vfb[0]==0xffaabbcc && vfb[3]==0xffaabbcc);
-    free(surface.image); free(surface.composite);
+    surface_attach(client,surface.resource,NULL,0,0);surface_commit(client,surface.resource);
+    assert(!surface.wm_id && !surface.xdg_initial_commit_done && !surface.xdg_acked);
+    surface_commit(client,surface.resource);
+    uint32_t remap=configure_serial(display,sockets[1],wl_resource_get_id(surface.xdg_surface));
+    xdg_surface_ack_configure(client,surface.xdg_surface,remap);
+    struct wl_shm_pool *again_pool=wl_shm_create_pool(client_shm,fd,16);assert(again_pool);
+    struct wl_buffer *again=wl_shm_pool_create_buffer(again_pool,0,2,2,8,WL_SHM_FORMAT_XRGB8888);assert(again);
+    requests(connection,loop);
+    struct wl_resource *again_server=wl_client_get_object(client,wl_proxy_get_id((struct wl_proxy *)again));assert(again_server);
+    surface_attach(client,surface.resource,again_server,0,0);surface_commit(client,surface.resource);
+    assert(created_windows==1 && surface.wm_id==2 && remap_vfb[0]==0xffaabbcc && surface.xdg_acked);
+    wl_buffer_destroy(again);wl_shm_pool_destroy(again_pool);requests(connection,loop);
+    puts("XDG_REMAP_PASS mapped/NULL/unconfigured/new-configure/ack/remap");
+    bt_state_set(&surface.tree.current,NULL);bt_state_set(&surface.tree.latest,NULL);free(surface.composite);
     puts("SHM_ATTACHMENT_LIFETIME_PASS buffer/pool destruction before commit retains pixels");
     munmap(pixels, 16); close(fd);
     wl_shm_destroy(client_shm);client_shm=NULL;wl_registry_destroy(registry);

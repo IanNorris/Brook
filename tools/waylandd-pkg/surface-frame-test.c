@@ -15,8 +15,12 @@ int main(void) {
     assert(g_frame_timer);
     assert(wl_event_source_timer_update(g_frame_timer,16)==0);
     struct brook_surface surface={0};
-    wl_list_init(&surface.pending_frames);wl_list_init(&surface.committed_frames);
+    surface_tree_init(&surface);
     surface.wm_id=1;g_surfaces=&surface;
+    uint32_t pixel=0xff112233,vfb=0;
+    surface.vfb=&vfb;surface.vfb_w=surface.vfb_h=surface.vfb_stride=1;surface.scene_disabled=1;
+    struct brook_image *mapped=image_snapshot((uint8_t *)&pixel,1,1,4,WL_SHM_FORMAT_ARGB8888);assert(mapped);
+    assert(bt_commit(&surface.tree,mapped));image_unref(mapped);
     surface.resource=wl_resource_create(client,&wl_surface_interface,4,2);
     assert(surface.resource);
     wl_resource_set_user_data(surface.resource,&surface);
@@ -75,7 +79,10 @@ int main(void) {
     surface.xdg_initial_commit_done=1;
     surface.xdg_acked=1;
     wl_resource_set_user_data(surface.xdg_surface,&surface);
-    surface.vfb_w=852;surface.vfb_h=652; // includes the CSD shadow margins
+    surface.vfb_w=852;surface.vfb_h=652;surface.vfb_stride=852; // CSD shadow margins
+    surface.vfb=calloc(852*652,4);assert(surface.vfb);
+    struct brook_image *csd=image_snapshot((uint8_t *)surface.vfb,852,652,852*4,WL_SHM_FORMAT_ARGB8888);assert(csd);
+    assert(bt_commit(&surface.tree,csd));image_unref(csd);
     xdg_surface_set_window_geometry(client,surface.xdg_surface,26,26,800,600);
     assert(surface.window_geometry_pending && surface.window_geometry_w==0);
     surface_commit(client,surface.resource);
@@ -144,6 +151,8 @@ int main(void) {
     wl_client_destroy(client);
     assert(surface.trace_done==3 && surface.trace_cancelled==25);
     assert(wl_list_empty(&surface.pending_frames) && wl_list_empty(&surface.committed_frames));
+    bt_state_set(&surface.tree.current,NULL);bt_state_set(&surface.tree.latest,NULL);
+    free(surface.vfb);free(surface.composite);
     g_surfaces=NULL;wl_display_destroy(display);close(sockets[1]);
     return 0;
 }

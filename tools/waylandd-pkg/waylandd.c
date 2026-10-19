@@ -7,8 +7,8 @@
  * in the kernel WM (window.cpp + compositor.cpp).  Our job here is
  * just the wayland protocol relay:
  *
- *   surface_commit   →  copy wl_shm pixels into the per-window VFB,
- *                       WM_SIGNAL_DIRTY, fire frame callbacks.
+ *   surface_commit   →  retain immutable SHM/GPU images and commit dependencies,
+ *                       present the synchronized tree, queue frame callbacks.
  *   set_title        →  WM_SET_TITLE.
  *   surface destroy  →  WM_DESTROY_WINDOW.
  *   per-frame pump   →  WM_POP_INPUT(wm_id) → wl_pointer/wl_keyboard
@@ -45,6 +45,8 @@
 #include "viewporter-server-protocol.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
+#include "surface-tree.h"
+#include "gpu-scene-abi.h"
 
 #define BROOK_SYS_WM_CREATE_WINDOW   506
 #define BROOK_SYS_WM_DESTROY_WINDOW  507
@@ -218,7 +220,8 @@ struct brook_buffer {
     struct wl_listener destroy;
     struct wl_shm_buffer *shm;
     struct brook_dmabuf_buffer *dmabuf;
-    unsigned refs;
+    unsigned refs,uses;
+    int uncertain;
 };
 static void buffer_resource_destroyed(struct wl_listener *listener,void *data) {
     (void)data;
@@ -227,6 +230,10 @@ static void buffer_resource_destroyed(struct wl_listener *listener,void *data) {
     buffer->resource=NULL;
 }
 static struct brook_buffer *buffer_hold(struct wl_resource *resource) {
+    struct wl_listener *existing=wl_resource_get_destroy_listener(resource,buffer_resource_destroyed);
+    if (existing) {
+        struct brook_buffer *buffer=wl_container_of(existing,buffer,destroy);++buffer->refs;return buffer;
+    }
     struct wl_shm_buffer *shm=wl_shm_buffer_get(resource);
     struct brook_dmabuf_buffer *db=is_dmabuf_buffer(resource)?wl_resource_get_user_data(resource):NULL;
     if (!shm && !db) { errno=EINVAL;return NULL; }
@@ -246,8 +253,10 @@ static void buffer_drop(struct brook_buffer *buffer) {
     if (buffer->dmabuf) dmabuf_buffer_unref(buffer->dmabuf);
     free(buffer);
 }
+static void buffer_begin_use(struct brook_buffer *buffer) { ++buffer->uses; }
 static void buffer_release(struct brook_buffer *buffer) {
-    if (buffer && buffer->resource) wl_buffer_send_release(buffer->resource);
+    if (!buffer || !buffer->uses) return;
+    if (!--buffer->uses && !buffer->uncertain && buffer->resource) wl_buffer_send_release(buffer->resource);
 }
 
 struct brook_frame_callback {
@@ -256,9 +265,15 @@ struct brook_frame_callback {
     struct brook_surface *surface;
     uint32_t requested_ms, committed_ms;
     int done;
+    uint64_t commit;
 };
 
+struct brook_scene_owner;
 struct brook_surface {
+    struct bt_node tree;
+    struct brook_scene_owner *scene;
+    int scene_disabled;
+    int role; /* permanent: 1=xdg, 2=subsurface, 3=cursor */
     struct wl_resource *resource;
     struct brook_buffer *pending_buffer;
     int pending_attach;
@@ -285,7 +300,7 @@ struct brook_surface {
     struct brook_surface *popup_parent;
 
     /* Requests become eligible only when their surface state is committed. */
-    struct wl_list pending_frames, committed_frames;
+    struct wl_list pending_frames, committed_frames, waiting_frames;
     uint64_t trace_id, trace_requests, trace_commits, trace_buffers;
     uint64_t trace_done, trace_cancelled;
     uint32_t trace_request_max_ms, trace_committed_max_ms;
@@ -330,6 +345,10 @@ struct brook_surface {
 };
 
 static struct brook_surface *g_surfaces = NULL;
+static int g_drm_fd = -1;
+static void popup_apply_position(struct brook_surface *);
+#include "surface-scene.h"
+
 
 struct brook_surface *find_surface_by_wm_id(uint32_t id);
 struct brook_surface *find_surface_by_wm_id(uint32_t id) {
@@ -530,263 +549,12 @@ static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
     (void)c; (void)r; (void)reg;
 }
 
-/* Retained images and the private composition canvas use Wayland's
- * premultiplied ARGB. Only the final export converts to Brook's straight ARGB.
- * Building the complete tree before touching the VFB prevents a root-only
- * intermediate frame from becoming visible between parent and child blits. */
-static int surface_snapshot(struct brook_surface *s, const uint8_t *src,
-                            int w, int h, int stride, uint32_t format) {
-    if (w <= 0 || h <= 0 || (size_t)w > SIZE_MAX / 4 / (size_t)h ||
-        stride < 0 || (size_t)stride < (size_t)w * 4) return 0;
-    uint32_t *pixels = s->image;
-    if (s->image_w != (uint32_t)w || s->image_h != (uint32_t)h) {
-        pixels = malloc((size_t)w * h * 4);
-        if (!pixels) return 0;
-    }
-    for (int y = 0; y < h; ++y) {
-        const uint32_t *row = (const uint32_t *)(src + (size_t)y * stride);
-        uint32_t *dst = pixels + (size_t)y * w;
-        if (format == WL_SHM_FORMAT_ARGB8888) memcpy(dst, row, (size_t)w * 4);
-        else for (int x = 0; x < w; ++x) dst[x] = row[x] | 0xff000000u;
-    }
-    if (pixels != s->image) free(s->image);
-    s->image = pixels; s->image_w = w; s->image_h = h;
-    return 1;
-}
-static void surface_clear_image(struct brook_surface *s) {
-    free(s->image); s->image = NULL; s->image_w = s->image_h = 0;
-}
-static uint32_t pixel_over(uint32_t src, uint32_t dst) {
-    unsigned a = src >> 24, inv = 255 - a;
-    if (a == 255) return src;
-    if (!a) return dst;
-    uint32_t out = 0;
-    for (unsigned shift = 0; shift < 32; shift += 8) {
-        unsigned v = ((src >> shift) & 255) + (((dst >> shift) & 255) * inv + 127) / 255;
-        out |= (v > 255 ? 255 : v) << shift;
-    }
-    return out;
-}
-static uint32_t pixel_straight(uint32_t px) {
-    unsigned a = px >> 24;
-    if (!a || a == 255) return a ? px : 0;
-    uint32_t out = px & 0xff000000u;
-    for (unsigned shift = 0; shift < 24; shift += 8) {
-        unsigned v = (((px >> shift) & 255) * 255 + a / 2) / a;
-        out |= (v > 255 ? 255 : v) << shift;
-    }
-    return out;
-}
-/* Iterative traversal avoids a client-controlled recursive call stack. Child
- * coordinates are relative to their parent, clipped only by the root window. */
-static int surface_compose(struct brook_surface *root) {
-    if (!root->vfb_w || !root->vfb_h ||
-        (size_t)root->vfb_w > SIZE_MAX / 4 / root->vfb_h) return 0;
-    size_t count = (size_t)root->vfb_w * root->vfb_h;
-    if (root->composite_pixels < count) {
-        uint32_t *next = realloc(root->composite, count * 4);
-        if (!next) return 0;
-        root->composite = next; root->composite_pixels = count;
-    }
-    memset(root->composite, 0, count * 4);
-    struct brook_surface *s = root;
-    int64_t ox = 0, oy = 0;
-    for (;;) {
-        if (s->image) {
-            int64_t x0 = ox < 0 ? -ox : 0, y0 = oy < 0 ? -oy : 0;
-            int64_t x1 = s->image_w, y1 = s->image_h;
-            if (ox + x1 > root->vfb_w) x1 = (int64_t)root->vfb_w - ox;
-            if (oy + y1 > root->vfb_h) y1 = (int64_t)root->vfb_h - oy;
-            for (int64_t y = y0; y < y1; ++y) {
-                uint32_t *dst = root->composite + (size_t)(oy + y) * root->vfb_w;
-                const uint32_t *src = s->image + (size_t)y * s->image_w;
-                for (int64_t x = x0; x < x1; ++x)
-                    dst[ox + x] = pixel_over(src[x], dst[ox + x]);
-            }
-        }
-        if (s->image && s->children) {
-            s = s->children; ox += s->sub_x; oy += s->sub_y; continue;
-        }
-        while (s != root && !s->sibling) {
-            ox -= s->sub_x; oy -= s->sub_y; s = s->subsurface_parent;
-        }
-        if (s == root) break;
-        ox -= s->sub_x; oy -= s->sub_y; s = s->sibling;
-        ox += s->sub_x; oy += s->sub_y;
-    }
-    return 1;
-}
-static void surface_repaint(struct brook_surface *s) {
-    while (s->subsurface_parent) s = s->subsurface_parent;
-    if (!s->vfb || !surface_compose(s)) return;
-    for (uint32_t y = 0; y < s->vfb_h; ++y) {
-        uint32_t *dst = s->vfb + (size_t)y * s->vfb_stride;
-        const uint32_t *src = s->composite + (size_t)y * s->vfb_w;
-        for (uint32_t x = 0; x < s->vfb_w; ++x) dst[x] = pixel_straight(src[x]);
-    }
-    wm_signal_dirty(s->wm_id);
-}
+static void surface_cursor_commit(struct brook_surface *s) {
+    struct wl_shm_buffer *shm=s->pending_buffer?s->pending_buffer->shm:NULL;
+    if (!shm) return;
+    buffer_begin_use(s->pending_buffer);
+    int32_t w=wl_shm_buffer_get_width(shm),h=wl_shm_buffer_get_height(shm),stride=wl_shm_buffer_get_stride(shm);
 
-static void surface_commit(struct wl_client *c, struct wl_resource *r) {
-    (void)c;
-    struct brook_surface *s = wl_resource_get_user_data(r);
-
-    if (g_trace_frames) {
-        ++s->trace_commits;
-        if (s->pending_buffer) ++s->trace_buffers;
-    }
-
-    if (s->window_geometry_pending) {
-        s->window_geometry_w = s->pending_geometry_w;
-        s->window_geometry_h = s->pending_geometry_h;
-        s->window_geometry_pending = 0;
-    }
-
-    /* xdg-shell role: the very first commit must have NO buffer; we
-     * respond with a configure. The client acks, then commits with a
-     * buffer for real. */
-    if (s->xdg_toplevel && !s->xdg_initial_commit_done) {
-        s->xdg_initial_commit_done = 1;
-        struct wl_array states;
-        wl_array_init(&states);
-        /* Suggest a sane default size. Sending 0,0 lets the client pick
-         * its own natural size; for some GTK layouts that produces a
-         * pathological measurement (>65535 px). Bounding it here lets
-         * the SHM pool allocation stay sane. */
-        xdg_toplevel_send_configure(s->xdg_toplevel, 800, 600, &states);
-        wl_array_release(&states);
-        uint32_t serial = s->next_configure_serial = next_serial();
-        xdg_surface_send_configure(s->xdg_surface, serial);
-        fprintf(stderr, "[waylandd] xdg initial configure sent serial=%u (800x600)\n", serial);
-        return;
-    }
-    if (s->xdg_popup && !s->xdg_initial_commit_done) {
-        s->xdg_initial_commit_done = 1;
-        int32_t pw = s->popup_w > 0 ? s->popup_w : 200;
-        int32_t ph = s->popup_h > 0 ? s->popup_h : 100;
-        xdg_popup_send_configure(s->xdg_popup, s->popup_x, s->popup_y, pw, ph);
-        uint32_t serial = s->next_configure_serial = next_serial();
-        xdg_surface_send_configure(s->xdg_surface, serial);
-        fprintf(stderr, "[waylandd] xdg popup initial configure sent serial=%u %dx%d\n",
-                serial, pw, ph);
-        return;
-    }
-
-    /* A bufferless commit still commits frame requests. Deliver them on the
-     * shared frame clock, not synchronously from request dispatch. */
-    if (!wl_list_empty(&s->pending_frames)) {
-        if (g_trace_frames) {
-            uint32_t now = g_now_ms();
-            struct brook_frame_callback *callback;
-            wl_list_for_each(callback, &s->pending_frames, link) {
-                callback->committed_ms = now;
-            }
-        }
-        wl_list_insert_list(s->committed_frames.prev, &s->pending_frames);
-        wl_list_init(&s->pending_frames);
-    }
-    if (s->pending_attach && !s->pending_buffer) {
-        s->pending_attach = 0;
-        surface_clear_image(s);
-        surface_repaint(s);
-        return;
-    }
-    s->pending_attach = 0;
-    if (!s->pending_buffer) {
-        if (s->children) surface_repaint(s);
-        return;
-    }
-
-    /* Hardware GL path: a dmabuf-backed buffer (Mesa's render target shared via
-     * zwp_linux_dmabuf_v1). Lazily create the kernel Window (sized from the
-     * dmabuf), then present the resolved host resource via WM_PRESENT_GRES so the
-     * compositor BLITs it into the window content texture (zero CPU copy). */
-    if (s->pending_buffer->dmabuf != NULL) {
-        struct brook_dmabuf_buffer *db = s->pending_buffer->dmabuf;
-        int dw = db ? db->width  : 0;
-        int dh = db ? db->height : 0;
-        if (s->subsurface_parent && !s->dmabuf_subsurface_reported) {
-            struct brook_surface *root = s;
-            while (root->subsurface_parent) root = root->subsurface_parent;
-            pid_t pid = 0;
-            wl_client_get_credentials(c, &pid, NULL, NULL);
-            fprintf(stderr,
-                "[waylandd] unsupported dmabuf subsurface: pid=%ld surface=%u "
-                "parent=%u root=%u root_wm=%u root_app=%.127s "
-                "offset=%d,%d size=%dx%d gres=%u; content not retained\n",
-                (long)pid, wl_resource_get_id(s->resource),
-                wl_resource_get_id(s->subsurface_parent->resource),
-                wl_resource_get_id(root->resource), root->wm_id, root->app_id,
-                s->sub_x, s->sub_y, dw, dh, db ? db->gres : 0);
-            s->dmabuf_subsurface_reported = 1;
-        }
-        int may_present = (!s->xdg_toplevel && !s->xdg_popup) || s->xdg_acked;
-        if (may_present && db && db->gres && dw > 0 && dh > 0 &&
-            (s->xdg_toplevel || s->xdg_popup)) {
-            if (s->wm_id == 0) {
-                struct brook_wm_create_out out = {0};
-                uint32_t create_flags = 0;
-                int effective_csd = s->deco_csd ||
-                                    (s->xdg_toplevel && !s->deco_negotiated);
-                if (s->xdg_popup || effective_csd)
-                    create_flags |= BROOK_WM_CREATE_FLAG_CSD;
-                if (s->xdg_popup)
-                    create_flags |= BROOK_WM_CREATE_FLAG_NO_FOCUS;
-                long rc = wm_create_window((uint32_t)dw, (uint32_t)dh,
-                                           s->title[0] ? s->title : NULL,
-                                           create_flags, &out);
-                if (rc == 0 && out.wm_id) {
-                    s->wm_id      = out.wm_id;
-                    wm_register_client(s->wm_id,s->resource);
-                    if (s->app_id[0]) wm_set_app_id(s->wm_id, s->app_id);
-                    s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
-                    s->vfb_stride = out.vfb_stride;
-                    s->vfb_w      = (uint32_t)dw;
-                    s->vfb_h      = (uint32_t)dh;
-                    fprintf(stderr, "[waylandd] WM_CREATE_WINDOW (dmabuf) id=%u %dx%d\n",
-                            s->wm_id, dw, dh);
-                    popup_apply_position(s);
-                } else {
-                    fprintf(stderr, "[waylandd] WM_CREATE_WINDOW (dmabuf) failed rc=%ld\n", rc);
-                }
-            }
-            if (s->wm_id) {
-                long rc = syscall(BROOK_SYS_WM_PRESENT_GRES, (long)s->wm_id,
-                                  (long)db->gres, (long)dw, (long)dh);
-                const int capture_errno=errno;
-                if (rc != 0)
-                    fprintf(stderr, "[waylandd] WM_PRESENT_GRES id=%u gres=%u rc=%ld\n",
-                            s->wm_id, db->gres, rc);
-                if (rc == -EIO || (rc == -1 && capture_errno == EIO)) {
-                    /* GPU completion is uncertain. Never grant reuse of this
-                     * buffer. Terminate the connection; the kernel retains the
-                     * independent source lease until device reset. */
-                    wl_client_post_implementation_error(c,
-                        "Brook GPU capture completion is uncertain");
-                    buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
-                    return;
-                }
-            }
-        }
-        buffer_release(s->pending_buffer);
-        buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
-        return;
-    }
-
-    struct wl_shm_buffer *shm = s->pending_buffer->shm;
-    if (!shm) {
-        fprintf(stderr, "[waylandd] commit: buffer is not wl_shm\n");
-        buffer_release(s->pending_buffer);
-        buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
-        return;
-    }
-
-    int32_t w      = wl_shm_buffer_get_width(shm);
-    int32_t h      = wl_shm_buffer_get_height(shm);
-    int32_t stride = wl_shm_buffer_get_stride(shm);
-
-    /* Cursor surface: upload pixels to kernel compositor, don't create a window */
-    if (s->is_cursor) {
         if (w > 0 && h > 0) {
             wl_shm_buffer_begin_access(shm);
             const uint32_t *pixels = (const uint32_t *)wl_shm_buffer_get_data(shm);
@@ -821,103 +589,77 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
         return;
     }
-
-    /* Snapshot before releasing SHM; the client may reuse or destroy it as
-     * soon as it receives release. Parent repaints must retain this image. */
-    wl_shm_buffer_begin_access(shm);
-    const uint8_t *pixels = wl_shm_buffer_get_data(shm);
-    int copied = pixels && surface_snapshot(s, pixels, w, h, stride,
-                                            wl_shm_buffer_get_format(shm));
-    wl_shm_buffer_end_access(shm);
-    if (!copied) {
-        wl_client_post_no_memory(c);
-        buffer_release(s->pending_buffer);
-        buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
+static void surface_commit(struct wl_client *c,struct wl_resource *r) {
+    struct brook_surface *s=wl_resource_get_user_data(r);
+    if (g_trace_frames) { ++s->trace_commits;if (s->pending_buffer) ++s->trace_buffers; }
+    if (s->window_geometry_pending) {
+        s->window_geometry_w=s->pending_geometry_w;s->window_geometry_h=s->pending_geometry_h;s->window_geometry_pending=0;
+    }
+    /* xdg-shell role: the very first commit must have NO buffer; we
+     * respond with a configure. The client acks, then commits with a
+     * buffer for real. */
+    if (s->xdg_toplevel && !s->xdg_initial_commit_done) {
+        s->xdg_initial_commit_done = 1;
+        struct wl_array states;
+        wl_array_init(&states);
+        /* Suggest a sane default size. Sending 0,0 lets the client pick
+         * its own natural size; for some GTK layouts that produces a
+         * pathological measurement (>65535 px). Bounding it here lets
+         * the SHM pool allocation stay sane. */
+        xdg_toplevel_send_configure(s->xdg_toplevel, 800, 600, &states);
+        wl_array_release(&states);
+        uint32_t serial = s->next_configure_serial = next_serial();
+        xdg_surface_send_configure(s->xdg_surface, serial);
+        fprintf(stderr, "[waylandd] xdg initial configure sent serial=%u (800x600)\n", serial);
         return;
     }
-    if (s->subsurface_parent) {
-        surface_repaint(s);
-        buffer_release(s->pending_buffer);
-        buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
+    if (s->xdg_popup && !s->xdg_initial_commit_done) {
+        s->xdg_initial_commit_done = 1;
+        int32_t pw = s->popup_w > 0 ? s->popup_w : 200;
+        int32_t ph = s->popup_h > 0 ? s->popup_h : 100;
+        xdg_popup_send_configure(s->xdg_popup, s->popup_x, s->popup_y, pw, ph);
+        uint32_t serial = s->next_configure_serial = next_serial();
+        xdg_surface_send_configure(s->xdg_surface, serial);
+        fprintf(stderr, "[waylandd] xdg popup initial configure sent serial=%u %dx%d\n",
+                serial, pw, ph);
         return;
     }
 
-    int may_blit = (!s->xdg_toplevel && !s->xdg_popup) || s->xdg_acked;
-    if (may_blit && w > 0 && h > 0 && (s->xdg_toplevel || s->xdg_popup)) {
-        /* Lazy create the kernel Window now that we know the size. */
-        if (s->wm_id == 0) {
-            struct brook_wm_create_out out = {0};
-            uint32_t create_flags = 0;
-            /* CSD if: popup, explicit CSD request, OR the client never
-             * negotiated via xdg-decoration (assume it draws its own
-             * header bar, like GTK3/4 apps). */
-            int effective_csd = s->deco_csd ||
-                                (s->xdg_toplevel && !s->deco_negotiated);
-            if (s->xdg_popup || effective_csd)
-                create_flags |= BROOK_WM_CREATE_FLAG_CSD;
-            if (s->xdg_popup)
-                create_flags |= BROOK_WM_CREATE_FLAG_NO_FOCUS;
-            long rc = wm_create_window((uint32_t)w, (uint32_t)h,
-                                       s->title[0] ? s->title : NULL,
-                                       create_flags,
-                                       &out);
-            if (rc == 0 && out.wm_id) {
-                s->wm_id      = out.wm_id;
-                wm_register_client(s->wm_id,s->resource);
-                if (s->app_id[0]) wm_set_app_id(s->wm_id, s->app_id);
-                s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
-                s->vfb_stride = out.vfb_stride;
-                s->vfb_w      = (uint32_t)w;
-                s->vfb_h      = (uint32_t)h;
-                fprintf(stderr,
-                        "[waylandd] WM_CREATE_WINDOW id=%u %dx%d stride=%u vfb=%p deco=%s%s\n",
-                        s->wm_id, w, h, s->vfb_stride, (void*)s->vfb,
-                        effective_csd ? "client_side" : "server_side",
-                        s->deco_negotiated ? "" : " (inferred)");
-                /* The initial decoration mode is applied atomically by
-                 * WM_CREATE_WINDOW; later mode changes use syscall 512. */
-                if (s->deco_pending) {
-                    s->deco_pending = 0;
-                }
-                popup_apply_position(s);
-            } else {
-                fprintf(stderr, "[waylandd] WM_CREATE_WINDOW failed rc=%ld\n", rc);
-            }
-        }
 
-        if (s->wm_id && s->vfb) {
-            /* If the client committed a buffer at a size different from
-             * our current VFB (typical after we sent a configure with new
-             * dimensions and the client allocated a fresh buffer), grow
-             * the kernel VFB to match before blitting.  We only resize
-             * when *both* dimensions changed or the new buffer is bigger
-             * than current VFB so we don't churn on transient mismatches. */
-            if ((uint32_t)w != s->vfb_w || (uint32_t)h != s->vfb_h) {
-                struct brook_wm_create_out out = {0};
-                long rc = wm_resize_vfb(s->wm_id, (uint32_t)w, (uint32_t)h, &out);
-                if (rc == 0 && out.vfb_user) {
-                    s->vfb        = (uint32_t*)(uintptr_t)out.vfb_user;
-                    s->vfb_stride = out.vfb_stride;
-                    s->vfb_w      = (uint32_t)w;
-                    s->vfb_h      = (uint32_t)h;
-                    fprintf(stderr,
-                            "[waylandd] WM_RESIZE_VFB id=%u %dx%d stride=%u vfb=%p\n",
-                            s->wm_id, w, h, s->vfb_stride, (void*)s->vfb);
-                } else {
-                    fprintf(stderr,
-                            "[waylandd] WM_RESIZE_VFB id=%u %dx%d FAILED rc=%ld — clamping blit\n",
-                            s->wm_id, w, h, rc);
-                }
-            }
-            surface_repaint(s);
-        }
+    if (s->is_cursor) {
+        surface_cursor_commit(s);
+        if (!surface_tree_commit(s,NULL)) wl_client_post_no_memory(c);
+        return;
     }
-
+    struct brook_image *image=s->tree.latest?s->tree.latest->value:NULL;
+    image_ref(image);
+    if (s->pending_attach) {
+        image_unref(image);image=NULL;
+        struct brook_buffer *buffer=s->pending_buffer;
+        if (buffer && buffer->dmabuf) {
+            struct brook_dmabuf_buffer *db=buffer->dmabuf;
+            if (db->width<=0 || db->height<=0 || db->width>16384 || db->height>16384) {
+                wl_client_post_implementation_error(c,"invalid dmabuf dimensions");return;
+            }
+            image=calloc(1,sizeof(*image));
+            if (image) {
+                image->refs=1;image->width=db->width;image->height=db->height;
+                image->format=db->fourcc==0x34325258?2:1;image->source=buffer;++buffer->refs;buffer_begin_use(buffer);
+            }
+        } else if (buffer && buffer->shm) {
+            struct wl_shm_buffer *shm=buffer->shm;
+            buffer_begin_use(buffer);
+            wl_shm_buffer_begin_access(shm);
+            image=image_snapshot(wl_shm_buffer_get_data(shm),wl_shm_buffer_get_width(shm),wl_shm_buffer_get_height(shm),wl_shm_buffer_get_stride(shm),wl_shm_buffer_get_format(shm));
+            wl_shm_buffer_end_access(shm);buffer_release(buffer);
+        }
+        if (buffer && !image) { wl_client_post_no_memory(c);return; }
+    }
+    if (!surface_tree_commit(s,image)) wl_client_post_no_memory(c);
+    else if (!bt_effective_sync(&s->tree)) surface_repaint(s);
+    image_unref(image);
+    buffer_drop(s->pending_buffer);s->pending_buffer=NULL;s->pending_attach=0;
     ++g_commit_count;
-
-    buffer_release(s->pending_buffer);
-    buffer_drop(s->pending_buffer);s->pending_buffer = NULL;
-
 }
 
 static void surface_set_buffer_transform(struct wl_client *c, struct wl_resource *r, int32_t t) {
@@ -966,6 +708,8 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     for (struct brook_surface *it = g_surfaces; it; it = it->next) {
         if (it->popup_parent == s) it->popup_parent = NULL;
     }
+    struct brook_surface *repaint_parent=s->subsurface_parent;
+    bt_unlink(&s->tree);
     /* Clean up subsurface relationships */
     if (s->subsurface_parent) {
         struct brook_surface *parent = s->subsurface_parent;
@@ -974,7 +718,7 @@ static void surface_destroy_userdata(struct wl_resource *r) {
             if (*pp2 == s) { *pp2 = s->sibling; break; }
             pp2 = &(*pp2)->sibling;
         }
-        surface_repaint(parent);
+        (void)parent;
     }
     /* Orphan any children */
     for (struct brook_surface *ch = s->children; ch; ) {
@@ -985,15 +729,21 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     }
     if (s->subsurface_resource) wl_resource_set_user_data(s->subsurface_resource, NULL);
     buffer_drop(s->pending_buffer);
-    surface_clear_image(s);
-    free(s->composite);
-    if (s->wm_id) wm_destroy_window(s->wm_id);
+    free(s->composite);s->composite=NULL;
+    surface_unmap(s);
     struct brook_frame_callback *callback, *next;
     wl_list_for_each_safe(callback, next, &s->pending_frames, link)
         wl_resource_destroy(callback->resource);
     wl_list_for_each_safe(callback, next, &s->committed_frames, link)
         wl_resource_destroy(callback->resource);
-    free(s);
+    wl_list_for_each_safe(callback, next, &s->waiting_frames, link)
+        wl_resource_destroy(callback->resource);
+    if (s->xdg_surface) wl_resource_set_user_data(s->xdg_surface,NULL);
+    if (s->xdg_toplevel) wl_resource_set_user_data(s->xdg_toplevel,NULL);
+    if (s->xdg_popup) wl_resource_set_user_data(s->xdg_popup,NULL);
+    s->resource=NULL;
+    bt_destroy(&s->tree);
+    if (repaint_parent) surface_repaint(repaint_parent);
 }
 
 /* ---------------- wl_compositor ---------------- */
@@ -1007,8 +757,7 @@ static void compositor_create_surface(struct wl_client *client,
     struct wl_resource *sr = wl_resource_create(client, &wl_surface_interface,
                                                 wl_resource_get_version(res), id);
     if (!sr) { free(s); wl_client_post_no_memory(client); return; }
-    wl_list_init(&s->pending_frames);
-    wl_list_init(&s->committed_frames);
+    surface_tree_init(s);
     s->resource = sr;
     s->next = g_surfaces;
     g_surfaces = s;
@@ -1176,7 +925,7 @@ static const struct xdg_toplevel_interface xdg_toplevel_impl = {
 
 static void xdg_toplevel_resource_destroy(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
-    if (s) s->xdg_toplevel = NULL;
+    if (s) { surface_unmap(s);s->xdg_toplevel = NULL; }
 }
 
 static void xdg_surface_destroy_req(struct wl_client *c, struct wl_resource *r) {
@@ -1238,7 +987,7 @@ static const struct xdg_popup_interface xdg_popup_impl = {
 };
 static void xdg_popup_resource_destroy(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
-    if (s) s->xdg_popup = NULL;
+    if (s) { surface_unmap(s);s->xdg_popup = NULL; }
 }
 
 static void xdg_surface_get_popup(struct wl_client *c, struct wl_resource *r,
@@ -1388,7 +1137,7 @@ static void wm_base_get_xdg_surface(struct wl_client *c, struct wl_resource *r,
                                 "no surface state");
         return;
     }
-    if (s->xdg_surface) {
+    if (s->xdg_surface || (s->role && s->role!=1)) {
         wl_resource_post_error(r, XDG_WM_BASE_ERROR_ROLE,
                                 "wl_surface already has xdg_surface");
         return;
@@ -1397,7 +1146,7 @@ static void wm_base_get_xdg_surface(struct wl_client *c, struct wl_resource *r,
                                                  wl_resource_get_version(r), id);
     if (!xs) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(xs, &xdg_surface_impl, s, xdg_surface_resource_destroy);
-    s->xdg_surface = xs;
+    s->xdg_surface = xs;s->role=1;
 
     /* A fresh xdg_surface role on this wl_surface starts a new configure
      * handshake: the next commit must be answered with an initial configure
@@ -1532,7 +1281,10 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
          * to the kernel compositor instead of creating a window. */
         struct brook_surface *cs = wl_resource_get_user_data(surface);
         if (cs) {
-            cs->is_cursor = 1;
+            if (cs->role && cs->role!=3) {
+                wl_resource_post_error(r,WL_POINTER_ERROR_ROLE,"surface already has a role");return;
+            }
+            cs->role=3;cs->is_cursor = 1;
             cs->cursor_hot_x = hx;
             cs->cursor_hot_y = hy;
         }
@@ -2467,6 +2219,7 @@ static void subsurface_resource_destroy(struct wl_resource *r) {
             pp = &(*pp)->sibling;
         }
     }
+    bt_unlink(&s->tree);
     s->subsurface_parent = NULL;
     s->subsurface_resource = NULL;
     s->sibling = NULL;
@@ -2480,21 +2233,27 @@ static void subsurface_set_position(struct wl_client *c, struct wl_resource *r,
                                     int32_t x, int32_t y) {
     (void)c;
     struct brook_surface *s = wl_resource_get_user_data(r);
-    if (s) { s->sub_x = x; s->sub_y = y; }
+    if (s) { s->tree.pending_x=x;s->tree.pending_y=y; }
 }
 static void subsurface_place_above(struct wl_client *c, struct wl_resource *r,
                                    struct wl_resource *sib) {
-    (void)c; (void)r; (void)sib;
+    (void)c;struct brook_surface *s=wl_resource_get_user_data(r),*other=wl_resource_get_user_data(sib);
+    if (!s || !other || !bt_place(&s->tree,&other->tree,1))
+        wl_resource_post_error(r,WL_SUBSURFACE_ERROR_BAD_SURFACE,"invalid stacking sibling");
 }
 static void subsurface_place_below(struct wl_client *c, struct wl_resource *r,
                                    struct wl_resource *sib) {
-    (void)c; (void)r; (void)sib;
+    (void)c;struct brook_surface *s=wl_resource_get_user_data(r),*other=wl_resource_get_user_data(sib);
+    if (!s || !other || !bt_place(&s->tree,&other->tree,0))
+        wl_resource_post_error(r,WL_SUBSURFACE_ERROR_BAD_SURFACE,"invalid stacking sibling");
 }
 static void subsurface_set_sync(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    (void)c;struct brook_surface *s=wl_resource_get_user_data(r);if (s) bt_set_sync(&s->tree,1);
 }
 static void subsurface_set_desync(struct wl_client *c, struct wl_resource *r) {
-    (void)c; (void)r;
+    struct brook_surface *s=wl_resource_get_user_data(r);if (!s) return;
+    if (!bt_set_sync(&s->tree,0)) wl_client_post_no_memory(c);
+    else surface_repaint(s);
 }
 static const struct wl_subsurface_interface subsurface_impl = {
     .destroy      = subsurface_destroy,
@@ -2515,7 +2274,7 @@ static void subcomp_get_subsurface(struct wl_client *c, struct wl_resource *r,
     (void)r;
     struct brook_surface *child = wl_resource_get_user_data(surface);
     struct brook_surface *par   = wl_resource_get_user_data(parent);
-    if (!child || !par || child->subsurface_resource || child->xdg_surface || child->is_cursor) {
+    if (!child || !par || child->subsurface_resource || (child->role && child->role!=2) || child->xdg_surface || child->is_cursor) {
         wl_resource_post_error(r, WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,
                                "surface already has a role");
         return;
@@ -2532,6 +2291,10 @@ static void subcomp_get_subsurface(struct wl_client *c, struct wl_resource *r,
     if (!ss) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(ss, &subsurface_impl, child, subsurface_resource_destroy);
     if (child && par) {
+        if (!bt_attach(&child->tree,&par->tree)) {
+            wl_resource_destroy(ss);wl_resource_post_error(r,WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE,"invalid association");return;
+        }
+        child->role=2;
         child->subsurface_parent = par;
         child->subsurface_resource = ss;
         child->sub_x = 0;
@@ -2653,11 +2416,10 @@ static void ddm_bind(struct wl_client *client, void *data,
 /* ---------------- linux-dmabuf (hardware GL presentation) ---------------- */
 /*
  * Mesa's Wayland EGL platform shares its hardware-rendered render target with
- * us as a dmabuf. We advertise zwp_linux_dmabuf_v1 so Mesa uses the hardware
- * path (not llvmpipe), import the dmabuf fd through the DRM render node to
- * resolve it to a host virgl resource id (gres), and (Stage 3) ask the kernel
- * to blit that gres into the window's compositor texture. For now (Stage 2) we
- * resolve + log the gres and release the buffer, proving the import path.
+ * us as a dmabuf. We advertise zwp_linux_dmabuf_v1, import the fd through the
+ * DRM render node and retain its GEM alias until scene capture completes.
+ * surface-scene.h keeps producer release separate from immutable image and
+ * parent-commit lifetimes; backend resource numbers never become scene IDs.
  *
  * The DRM ioctls mirror the kernel shim (syscall.cpp DrmRenderIoctl). The kernel
  * dispatches on ioctl type+nr only, so the _IOC size/dir bits are cosmetic.
@@ -2670,7 +2432,7 @@ struct drm_gem_close { uint32_t handle, pad; };
 #define DRM_IOCTL_VIRTGPU_RESOURCE_INFO DRM_IOC(0x45, sizeof(struct drm_virtgpu_resource_info))
 #define DRM_IOCTL_GEM_CLOSE           DRM_IOC(0x09, sizeof(struct drm_gem_close))
 
-static int g_drm_fd = -1;   /* /dev/dri/renderD128, opened once at startup */
+/* g_drm_fd is shared with retained scene capture. */
 
 /* PRIME imports return an existing GEM handle for the same object. wl_buffers
  * share ownership here; closing each alias independently can close a new

@@ -17,6 +17,10 @@ stdenv.mkDerivation {
 
   src = ./.;
 
+  postUnpack = ''
+    cp ${../../src/kernel/src/gpu_scene_abi.h} "$sourceRoot/gpu-scene-abi.h"
+  '';
+
   nativeBuildInputs = [ patchelf wayland-scanner ];
   buildInputs = [ wayland ];
   doCheck = true;
@@ -48,6 +52,11 @@ stdenv.mkDerivation {
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
         -L${wayland}/lib -lwayland-server -lwayland-client -o configure-surface-test
     ./configure-surface-test
+    $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
+        scene-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        -L${wayland}/lib -lwayland-server -o scene-surface-test
+    ./scene-surface-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         capture-release-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \

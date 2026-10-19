@@ -53,7 +53,7 @@ the table distinguishes tested behavior from remaining limitations.
 | Nix binaries | — | ✅ Working | Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …) |
 | [NetSurf](https://www.netsurf-browser.org/) | 3.11 | ✅ Working | Web browser rendering HTML/CSS via custom framebuffer surface |
 | [Ladybird](https://ladybird.dev/) | 2026-04-04 | ⚠️ Experimental | HTTPS Google search and Amazon navigation verified; loading/input/scrolling performance remains limited |
-| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Included in fresh experiment images; software Wayland HTTPS/JavaScript and YouTube audio through the normal launcher, including pause/resume; synthetic site storage survives reboot; hardware dmabuf subsurfaces and intermittent audio gaps remain |
+| [Firefox](https://www.mozilla.org/firefox/) | 150.0.1 | ⚠️ Experimental | Included in fresh experiment images; software Wayland HTTPS/JavaScript and YouTube audio through the normal launcher, including pause/resume; synthetic site storage survives reboot; hardware child-surface rendering and local video/PCM capture now verified; low video framerate and intermittent audio gaps remain |
 | [Chromium](https://www.chromium.org/) | 148.0.7778.96 | ⚠️ Experimental | Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled |
 | [OpenTTD](https://www.openttd.org/) | 15.3 | ⚠️ Experimental | World creation and cold-boot save/load verified; music output, normal quit and forced-exit cleanup checked; longer-session gameplay remains experimental |
 | [VSCodium](https://vscodium.com/) | 1.112.01907 | ⚠️ Experimental | Brook-user editing, cold save/reopen and normal exit verified alongside Firefox and Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled |
@@ -99,8 +99,9 @@ the table distinguishes tested behavior from remaining limitations.
   lets both controlled clips advance with audio in a bounded concurrent check;
   playback still loses time under contention. [Presentation diagnostics](docs/firefox-presentation.md)
   distinguish media progress, callback counters and VM display output.
-  These browser acceptance runs use software rendering. Hardware-mode Firefox
-  currently loses its dmabuf subsurface content; [retained GPU surface-tree work](docs/gpu-resource-lifetime.md#hardware-firefox-retained-surface-tree-work)
+  Earlier browser acceptance runs use software rendering. Hardware-mode Firefox
+  now renders retained child surfaces and local video with captured PCM; video
+  framerate remains low. [Retained GPU surface-tree work](docs/gpu-resource-lifetime.md#wayland-scene-tree-adoption)
   is in progress. The generic public package index still lists stock packages.
   See [workload validation](docs/workloads.md) for tested configurations and
   remaining limits. At the pinned `37cccf60` permission checkpoint, both [full bootstrap paths](docs/bootstrap.md#40-suite-bootstrap-refresh-after-permission-checks-2026-10-18)
@@ -216,7 +217,7 @@ the table distinguishes tested behavior from remaining limitations.
 
 ### Userspace / bundled apps
 - **Games** — DOOM (`doomgeneric`), **Quake 2** (single-player + LAN multiplayer over VDE), 2048
-- **Web browsers** — Firefox and Chromium (software-rendered Wayland, experimental), Ladybird (Wayland, experimental), NetSurf (custom framebuffer surface)
+- **Web browsers** — Firefox (software and hardware Wayland, experimental) and Chromium (software Wayland, experimental), Ladybird (Wayland, experimental), NetSurf (custom framebuffer surface)
 - **GTK apps** — Qalculate! (calculator), Mousepad (text editor), GIMP (experimental)
 - **Shells / tools** — bash, busybox, TCC
 - **Brook-native apps** — file browser (`brook-files`), calculator, Wayland smoke tests
@@ -248,6 +249,12 @@ New captures use native 1920×1080 without upscaling. See
 </p>
 
 <p align="center"><em>Chromium playing YouTube at 480p with audio — software rendering, native 1920×1080 capture</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_firefox_hardware_video_1080.png"><img src="docs/images/brook_firefox_hardware_video_1080.png" alt="Firefox rendering a local video fixture through retained hardware Wayland child surfaces on Brook" width="960"></a>
+</p>
+
+<p align="center"><em>Firefox hardware child-surface rendering with local video and captured PCM. Native 1920×1080; video performance and audio gaps remain open.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_firefox_youtube_audio_1080.png"><img src="docs/images/brook_firefox_youtube_audio_1080.png" alt="Firefox playing Crab Rave on YouTube with audio through Brook's ALSA integration" width="960"></a>

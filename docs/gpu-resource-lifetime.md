@@ -683,6 +683,10 @@ Broader application acceptance and main approval remain open.
 
 ## Hardware Firefox: retained surface-tree work
 
+The checkpoint notes below preserve intermediate states. See
+[Wayland scene-tree adoption](#wayland-scene-tree-adoption) for the latest
+frontend integration and verified limitations.
+
 The diagnostic follow-up, session `58ba1b34b0914b1296fe60ce6020f7bb`, confirms
 the association: Firefox's surface 33 is a dmabuf subsurface of root surface 38,
 at offset `(26,23)`, with an 800×600 buffer. Its root app ID is `firefox`.
@@ -1170,3 +1174,73 @@ allocation/retirement failure or quarantine; audio streams emptied. Checked
 shutdown, owned launcher/QEMU exit zero, all three offline filesystem checks and
 nine preserved document hashes/owners passed. Evidence:
 `build/workloads/wayland-owned-buffer-20261019/candidate/acceptance-audit.json`.
+
+### Wayland scene-tree adoption
+
+The production server now uses immutable dependency snapshots and retained scene
+images. SHM commits copy premultiplied pixels before releasing client storage;
+dmabuf commits retain their producer until a verified scene capture. Root SHM and
+hardware child images compose through the same premultiplied GPU tree. Software
+compositor mode uses the same snapshot ordering with a private CPU canvas; it
+does not read back hardware producers. The backend's 64 visible-layer bound is
+explicit and exceeding it produces a client error, not an unbounded kernel job.
+
+Parent commits capture child state, positions and below/above-parent order.
+Nested synchronization/desynchronization uses the tested dependency engine.
+Surface-owned callback queues use commit numbers, preserving callbacks from
+skipped snapshots without making newer child callbacks eligible too soon.
+Permanent roles prevent converting a detached subsurface into an xdg or cursor
+surface. Association generations exclude detached/dead children immediately,
+while strong snapshot references defer their memory reclamation. NULL mapping
+hides the subtree; actual xdg unmap resets the configure/ack handshake. Destroying
+a toplevel or popup also unmaps its kernel window before clearing the role.
+
+Buffer references are shared per `wl_buffer`, with committed-use accounting
+separate from pending attachments. A valid A/parent/B/root sequence can reuse
+the same unchanged producer: completing A must not release it while B still
+needs uncaptured pixels. Release occurs after all committed uses finish or are
+discarded. One uncertain use suppresses release across the remaining uses.
+Logical images share a GPU storage cache; migration replaces that cache only
+after verified cloning, preserving pixels after producer release and old-root
+window destruction. Scene FD ownership and public version release are coalesced.
+
+The wire header now compiles in both C and C++, with shared size assertions;
+Nix copies that exact header into the frontend package. Eight package checks,
+memory/leak/undefined-behaviour checks, all 52 kernel host suites and supported
+compiled entry/startup audits passed. Production-adapter fixtures cover CPU tree
+pixels, deferred GPU children, shared-buffer release, callback eligibility,
+uncertain source teardown, root migration, xdg remap and final cleanup. Astra
+review found and helped resolve the shared-buffer release and remap blockers.
+
+GPU session `2ff30bc26252413fa4d6ae86cddf2bb5` rendered Firefox's hardware
+child surface: browser chrome, the local page and video content were visible.
+Two native playback captures showed advancing source timestamps. Device mixer
+counters advanced and a speaker-disabled five-second WAV contained nonzero PCM
+(RMS 0.0619). This proves delivery, not stutter-free audio: waveform analysis found
+a short silent span whose cause remains unproven. The fixture reported 916 video
+frame callbacks over 118.63 seconds (7.72/s), with 1,896 dropped frames; playback
+performance remains open and this is not a comparative benchmark.
+
+Firefox closed with its complete UI launch lineage drained. Quake GL3 at
+1280×720 subsequently advanced through the startup demo and closed, followed by
+a rendered Mousepad SHM window and clean close. The run does not establish
+simultaneous browser/Codium acceptance or audible Quake music. Viewport/transform
+support and the remaining desktop/browser acceptance scope are still open.
+
+The final build also treats verified stale window publication as a safe frame
+discard, retaining images for the next commit/configure; uncertainty remains
+fatal and retained. The component fixture covers that discard without another
+producer capture. A fresh final-build GPU run,
+`430072e28ef34fd2841da52e9e3d8c39`, repeated visible Firefox video, nonzero
+PCM (RMS 0.0625), minimize/restore, and sequential Quake/Mousepad cleanup. Its
+shorter playback report includes the minimized interval and is not a performance
+comparison. The README image comes from this final-build run.
+
+All 2,644 tracked backing mappings (207,982,592 bytes) were released, without
+allocation/retirement failure or quarantine; audio streams emptied. Checked
+shutdown, owned launcher/QEMU exit zero, three offline filesystem checks and nine
+preserved document hashes/owners passed. Both local fixture servers exited
+normally. Final evidence:
+`build/workloads/wayland-scene-tree-20261019/verified/acceptance-audit.json`.
+The longer initial playback evidence remains separately in
+`build/workloads/wayland-scene-tree-20261019/candidate/acceptance-audit.json`.
