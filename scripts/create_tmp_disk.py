@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Create a private ext2 /tmp image with Unix ownership and sticky permissions.
 
-Attach with BROOK_DATA_DISK=/absolute/path/to/tmp.img. This occupies the
-optional data/media slot, separate from the experiment's /data and /nix disks.
+Attach with BROOK_TMP_DISK=/absolute/path/to/tmp.img. The launcher creates
+this disk by default, separately from /data, /nix and optional media disks.
 The existing BROOK.MNT boot probe mounts it at /tmp. Contents persist until
 the image is replaced; this is not tmpfs or automatic per-boot cleanup.
 """

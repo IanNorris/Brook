@@ -39,6 +39,7 @@ for name in data nix; do
 done
 export BROOK_EXT2_DISK="${run_dir}/data.img"
 export BROOK_NIX_DISK="${run_dir}/nix.img"
+export BROOK_TMP_DISK="${BROOK_TMP_DISK:-${run_dir}/tmp.img}"
 if [ ! -f "${run_dir}/boot.img" ]; then
     cp --reflink=auto --sparse=always "${source_boot}" "${run_dir}/boot.img"
 fi

@@ -276,6 +276,18 @@ if [ -d "${MEDIA_DIR}" ] && [ -z "${DATA_DRIVE}" ]; then
     echo "  Media folder: ${MEDIA_DIR} (fat:rw)"
 fi
 
+# Pathname IPC needs a filesystem with Unix inode ownership and modes. Keep
+# this separate from the optional media drive and from persistent user data.
+TMP_DISK="${BROOK_TMP_DISK:-${ROOT_DIR}/brook_tmp_disk.img}"
+TMP_DRIVE=()
+if [ "${TMP_DISK}" != none ]; then
+    if [ ! -f "${TMP_DISK}" ]; then
+        python3 "${SCRIPT_DIR}/create_tmp_disk.py" --output "${TMP_DISK}"
+    fi
+    TMP_DRIVE=(-drive "if=virtio,format=raw,file=${TMP_DISK},file.locking=off")
+    echo "  Runtime disk: ${TMP_DISK} (/tmp)"
+fi
+
 # Select boot script: --script <name> copies data/scripts/<name>.rc to INIT.RC
 # on the disk image. Without --script, the existing INIT.RC is used.
 if [ -n "${SCRIPT_NAME}" ]; then
@@ -563,6 +575,7 @@ esac
     ${NIX_DRIVE} \
     ${HOME_DRIVE} \
     ${DATA_DRIVE} \
+    "${TMP_DRIVE[@]}" \
     -device virtio-tablet-pci \
     ${GPU_OPTS} \
     -device virtio-rng-pci \

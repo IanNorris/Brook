@@ -50,7 +50,8 @@ namespace brook {
 // ABI 25 passes canonical source formats to retained GPU capture.
 // ABI 26 adds bounded offscreen premultiplied scene composition.
 // ABI 27 adds verified temporary-backing uploads into owned images.
-static constexpr uint32_t MODULE_ABI_VERSION = 27;
+// ABI 28 appends retained pathname socket creation to VfsFsOps.
+static constexpr uint32_t MODULE_ABI_VERSION = 28;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

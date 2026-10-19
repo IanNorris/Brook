@@ -1317,6 +1317,8 @@ struct UnixSocketData {
     uint64_t peerIncarnation,peerLaunchId;
     bool acceptedEndpoint; // Only accept(), never connect() or socketpair().
     char    path[108];
+    Vnode* boundNode; // Owns an inode pin even after unlink; close never unlinks.
+    uint64_t boundDev, boundIno;
     // Routing path may become the server's name during connect. Preserve the
     // locally bound address separately for getsockname and accepted endpoints.
     uint8_t localAddress[110];
@@ -1395,15 +1397,25 @@ void UnixLifePublished(int fd, const FdEntry& entry)
 }
 
 static UnixSocketData* g_unixServers[UNIX_MAX_SERVERS];
+// Name operations can perform filesystem I/O. Serialize them with a sleeping
+// lock; never retain the registry spinlock across lookup or inode creation.
+static KMutex g_unixNameLock;
+struct UnixNameGuard {
+    UnixNameGuard() { KMutexLock(&g_unixNameLock); }
+    ~UnixNameGuard() { KMutexUnlock(&g_unixNameLock); }
+};
 
-static UnixSocketData* UnixFindServer(const char* path)
+static UnixSocketData* UnixFindServer(const char* path, const VnodeStat* node = nullptr)
 {
     SpinLockAcquire(&g_unixRegistryLock);
     UnixSocketData* found = nullptr;
     for (int i = 0; i < UNIX_MAX_SERVERS; i++) {
         auto* candidate = g_unixServers[i];
         if (!candidate || candidate->state != UnixSocketData::State::Listening) continue;
-        if (strcmp(candidate->path, path) == 0) {
+        const bool match = node ? candidate->boundNode &&
+            candidate->boundDev == node->dev && candidate->boundIno == node->ino :
+            !candidate->boundNode && strcmp(candidate->path, path) == 0;
+        if (match) {
             uint32_t previous = __atomic_fetch_add(&candidate->refCount, 1, __ATOMIC_RELAXED);
             UNIX_LIFE(RegistryPin, candidate, previous, previous + 1, -1);
             found = candidate;
@@ -1481,8 +1493,27 @@ void PipeReleaseEnd(PipeBuffer* pipe, bool writer)
     if (destroy) PipeBufferDestroy(pipe);
 }
 
+// The receiver owns delivery, even while the sender still references the
+// queue. Stop new writes and detach all queued capabilities under the stream
+// lock; releasing them can recursively close sockets, so do that unlocked.
+static void UnixDiscardIncoming(PipeBuffer* pipe, UnixFdQueue* queue)
+{
+    if (!pipe || !queue) return;
+    UnixFdSnap discarded[UNIX_FD_QUEUE_CAP];
+    int count = 0;
+    SpinLockAcquire(&pipe->lock);
+    pipe->unixReadShutdown = true;
+    while (queue->tail != queue->head) {
+        discarded[count++] = queue->msgs[queue->tail];
+        queue->tail = (queue->tail + 1) % UNIX_FD_QUEUE_CAP;
+    }
+    SpinLockRelease(&pipe->lock);
+    for (int i = 0; i < count; ++i) UnixFdSnapRelease(&discarded[i]);
+}
+
 static void UnixPendingRelease(const UnixPendingConn& pending)
 {
+    UnixDiscardIncoming(pending.serverRx, pending.serverRxFds);
     PipeReleaseEnd(pending.serverRx, false);
     PipeReleaseEnd(pending.serverTx, true);
     UnixFdQueueUnref(pending.serverRxFds);
@@ -1511,11 +1542,13 @@ static void UnixSocketHandleUnref(void* handle)
     if (prev > 1) return;
     for (const auto& pending : abandoned)
         if (pending.used) UnixPendingRelease(pending);
+    UnixDiscardIncoming(usd->rxPipe, usd->incomingFds);
     PipeReleaseEnd(usd->rxPipe, false);
     PipeReleaseEnd(usd->txPipe, true);
 
     UnixFdQueueUnref(usd->incomingFds);
     UnixFdQueueUnref(usd->peerIncomingFds);
+    if (usd->boundNode) VfsClose(usd->boundNode);
     UNIX_LIFE(DirectFree, usd, 0, 0, -1);
     kfree(usd);
 }
@@ -3699,7 +3732,7 @@ static int64_t sys_pipe(uint64_t pipefdAddr, uint64_t, uint64_t,
 // ---------------------------------------------------------------------------
 
 // Bump refcount on the underlying object for a duplicated fd entry.
-static void FdBumpRefcount(FdEntry* fde)
+static void FdBumpRefcount(const FdEntry* fde)
 {
     if (!fde->handle) return;
     switch (fde->type)
@@ -12543,15 +12576,30 @@ static int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         SockAddrUn address{};
         if (!CopyFromUser(&address,addrVal,addrLen)) return -EFAULT;
         if (address.sun_family != AF_UNIX) return -EINVAL;
+        UnixNameGuard nameGuard;
         SpinLockAcquire(&g_unixRegistryLock);
         if (usd->localAddressLength || usd->state!=UnixSocketData::State::Unbound) {
             SpinLockRelease(&g_unixRegistryLock);return -EINVAL;
         }
+        SpinLockRelease(&g_unixRegistryLock);
+        char path[109]{};
+        memcpy(path, address.sun_path, addrLen - 2);
+        Vnode* node = nullptr;
+        VnodeStat identity{};
+        if (path[0]) {
+            char resolved[512];
+            if (int error = ResolveAtPath(-100, path, resolved, sizeof(resolved))) return error;
+            int error = 0;
+            node = VfsCreateSocket(resolved, 0777, &error);
+            if (!node) return error;
+            if ((error = VfsStat(node, &identity))) { VfsClose(node); return error; }
+        }
+        SpinLockAcquire(&g_unixRegistryLock);
+        usd->boundNode = node;
+        usd->boundDev = identity.dev;
+        usd->boundIno = identity.ino;
         memcpy(usd->localAddress,&address,addrLen);usd->localAddressLength=static_cast<uint32_t>(addrLen);
-        // Copy path
-        const char* src = address.sun_path;
-        char* dst = usd->path;
-        for (int i = 0; i < 107 && src[i]; i++) dst[i] = src[i], dst[i+1] = 0;
+        for (int i = 0; i < 107 && path[i]; ++i) usd->path[i] = path[i];
         SpinLockRelease(&g_unixRegistryLock);
         UNIX_LIFE(Bind, usd, 0, 0, fd);
         SerialPrintf("sys_bind: AF_UNIX fd=%d path='%s'\n", fd, usd->path);
@@ -12581,6 +12629,7 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        UnixNameGuard nameGuard;
         if (usd->state == UnixSocketData::State::Connected) return -106; // EISCONN
         if (usd->state == UnixSocketData::State::Listening) return -EINVAL;
         if (addrLen <= 2 || addrLen > sizeof(SockAddrUn)) return -EINVAL;
@@ -12589,13 +12638,29 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         if (address.sun_family != AF_UNIX) return -EINVAL;
 
         // Copy destination path
-        char path[108] = {};
-        for (int i = 0; i < 107 && address.sun_path[i]; i++) path[i] = address.sun_path[i];
+        char path[109] = {};
+        memcpy(path, address.sun_path, addrLen - 2);
 
         DbgPrintf("sys_connect: AF_UNIX fd=%d path='%s'\n", fd, path);
 
-        // Find the listening server
-        UnixSocketData* server = UnixFindServer(path);
+        // Resolve and pin the named inode, including parent search and socket
+        // write permission. The inode pin makes unlink/rebinding unambiguous.
+        struct NodePin {
+            Vnode* node = nullptr;
+            ~NodePin() { if (node) VfsClose(node); }
+        } lookup;
+        VnodeStat identity{};
+        if (path[0]) {
+            char resolved[512];
+            if (int error = ResolveAtPath(-100, path, resolved, sizeof(resolved))) return error;
+            int error = 0;
+            lookup.node = VfsOpenModeChecked(resolved, VFS_O_METADATA, 0, &error);
+            if (!lookup.node) return error ? error : -ENOENT;
+            if ((error = VfsAccess(lookup.node, 2, false))) return error;
+            if ((error = VfsStat(lookup.node, &identity))) return error;
+            if ((identity.mode & 0170000) != 0140000) return -ECONNREFUSED;
+        }
+        UnixSocketData* server = UnixFindServer(path, lookup.node ? &identity : nullptr);
         if (!server) return -ECONNREFUSED;
         struct ServerReference {
             UnixSocketData* value;
@@ -13005,7 +13070,9 @@ static int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
     FdEntry* fde = descriptor.get();
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        UnixNameGuard nameGuard;
         if (usd->state == UnixSocketData::State::Connected) return -EINVAL;
+        if (!usd->localAddressLength) return -EINVAL;
         SpinLockAcquire(&g_unixRegistryLock);
         // Linux captures listener identity on the first listen, not at accept.
         if (usd->state != UnixSocketData::State::Listening) {
@@ -13268,6 +13335,18 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
 {
     if (!src || src->type == FdType::None) return false;
     switch (src->type) {
+        case FdType::Pipe:
+        case FdType::EventFd:
+        case FdType::EpollFd:
+        case FdType::TimerFd:
+            // Own the same endpoint/object reference as dup(). In particular,
+            // queued pipe rights keep readers/writers alive after sender close.
+            FdBumpRefcount(src);
+            break;
+        case FdType::DevNull:
+        case FdType::DevUrandom:
+            // Stateless devices have no allocated handle to retain.
+            break;
         case FdType::MemFd:
             if (src->handle) MemFdRef(static_cast<MemFdData*>(src->handle));
             break;
@@ -13296,7 +13375,7 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
             if (src->handle) SceneHandleRef(static_cast<SceneHandle*>(src->handle));
             break;
         default:
-            // Other fd types (Pipe, EventFd, EpollFd, TimerFd, DevDsp, etc.)
+            // Other fd types (DevDsp, DevTty, etc.)
             // don't have a portable snapshot refcount today.
             return false;
     }
@@ -13326,6 +13405,18 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap)
 {
     if (!snap || !snap->handle) return;
     switch (snap->type) {
+        case FdType::Pipe:
+            PipeReleaseEnd(static_cast<PipeBuffer*>(snap->handle), (snap->flags & 1) != 0);
+            break;
+        case FdType::EventFd:
+            EventFdUnref(static_cast<EventFdData*>(snap->handle));
+            break;
+        case FdType::EpollFd:
+            EpollFdUnref(static_cast<EpollInstance*>(snap->handle));
+            break;
+        case FdType::TimerFd:
+            TimerFdUnref(static_cast<TimerFdData*>(snap->handle));
+            break;
         case FdType::MemFd:
             MemFdUnref(static_cast<MemFdData*>(snap->handle));
             break;

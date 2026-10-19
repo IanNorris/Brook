@@ -814,6 +814,29 @@ int VfsMkdir(const char* path,uint16_t mode)
     return mount->fsOps->mkdir ? mount->fsOps->mkdir(mount->mountPriv,mount->pdrv,relative,mode) : -95;
 }
 
+Vnode* VfsCreateSocket(const char* path, uint16_t mode, int* error)
+{
+    FileMutationGuard mutation;
+    int localError = 0;
+    if (!error) error = &localError;
+    *error = 0;
+    char resolved[512];
+    if ((*error = VfsResolvePath(path, resolved, sizeof(resolved), {false, true, true})))
+        return nullptr;
+    VnodeStat existing{};
+    int result = VfsLstatPathRaw(resolved, &existing);
+    if (result != -2) { *error = result ? result : -98; return nullptr; }
+    const char* relative = nullptr;
+    MountEntry* mount = FindMount(resolved, &relative);
+    if (!mount || !mount->fsOps) { *error = -2; return nullptr; }
+    if (!mount->fsOps->create_socket) { *error = -95; return nullptr; }
+    Vnode* node = mount->fsOps->create_socket(mount->mountPriv, mount->pdrv,
+                                             relative, mode, error);
+    if (*error == -17) *error = -98;
+    if (!node && !*error) *error = -5;
+    return node;
+}
+
 int VfsRename(const char* oldPath,const char* newPath)
 {
     FileMutationGuard mutation;

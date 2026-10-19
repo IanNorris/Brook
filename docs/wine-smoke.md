@@ -1,4 +1,11 @@
-# Initial Wine64 smoke test — 18 October
+# Wine64 compatibility
+
+Current checkpoint (19 October): pathname sockets and descriptor exchange now
+pass focused Linux-matched guest regressions. Wine64 11.0 reaches user-shared-data
+initialization, where writable shared regular-file mmap returns EOPNOTSUPP.
+The console marker and Windows Notepad acceptance remain outstanding.
+
+## Initial smoke test — 18 October
 
 Wine's Linux loader starts on Brook, but the first Windows console command is
 blocked during wineserver setup. This is not Windows application acceptance.
@@ -151,8 +158,65 @@ output:
 python3 scripts/create_tmp_disk.py --output build/experiments/wine-tmp.img
 ```
 
-Pass its absolute path as `BROOK_DATA_DISK` when launching a private experiment.
-This uses the optional data/media drive slot, separately from the experiment's
-`/data` and `/nix` disks. Contents persist across boots; this is a disk-backed
+The launcher now creates this disk automatically: `run_experiment.sh` uses a
+private `tmp.img` per experiment, and `run-qemu.sh` uses `brook_tmp_disk.img`.
+Override its absolute path with `BROOK_TMP_DISK`; `none` explicitly disables it.
+It has a separate drive slot, preserving optional media, `/data` and `/nix`.
+Contents persist across boots; this is a disk-backed
 temporary directory, with no automatic boot cleanup. It does not implement
 tmpfs or complete the broader temporary-filesystem work.
+
+## Pathname sockets and descriptor ownership — 19 October
+
+Pathname stream sockets now create real ext2 socket inodes with caller
+credentials, umask and parent permissions. Connect resolves relative paths and
+symlinks, checks write permission, and finds the listener by device/inode.
+Listeners retain an inode reference across unlink, so a replacement name can
+route to a new listener while existing streams continue using the old one.
+Closing a listener leaves its filesystem node until explicit unlink, matching
+Linux. Ordinary file opens reject socket nodes. Unsupported filesystems report
+EOPNOTSUPP. The new VFS creation callback advances the driver ABI to 28.
+
+Three basic checks and 24 lifecycle/namespace checks pass on Linux and Brook.
+They cover duplicate binding before listen, permission denial, symlinks,
+rename, stale nodes, unlink/rebinding, old accepted streams and preservation of
+unrelated files. These are focused stream tests, not abstract-namespace or
+datagram acceptance, cross-UID coverage, or filesystem fault injection.
+
+Wine then exposed missing SCM_RIGHTS support for pipes and eventfds. Snapshots
+now retain/release pipe endpoints, eventfds, epoll and timerfds, and support
+stateless null/random devices. Closing the receiving socket also releases its
+queued descriptors while the sender remains open, including abandoned pending
+connections. Detachment is serialized with stream writes; potentially recursive
+handle releases happen outside the stream lock. Twenty-two Linux-matched guest
+checks cover sender close, EOF after receiver close, discarded rights,
+truncation, invalid-group rollback, close-on-exec and usable transferred handles.
+
+The diagnostic `unix_rights_shared_file.py` isolates the next blocker: an
+unlinked temporary file is passed with SCM_RIGHTS, and both descriptors retain
+the same inode, but writable MAP_SHARED fails with errno 95. Linux passes its
+mapping/read/write/msync checks. Wine's protocol trace now reaches successful
+`get_handle_fd` for its shared-data section, then reports failure to map it.
+The final console request exits one without the expected marker; its Wine
+server exits and complete output/lineage is collected before shutdown.
+There is no new Windows application success or Notepad screenshot at this stage.
+
+Fixtures: `scripts/workloads/unix_path_socket_lifecycle.py`,
+`unix_rights_handles.py` and `unix_rights_shared_file.py`. Evidence is under
+`build/workloads/wine-socket-acceptance-20261019/candidate`; earlier negative
+socket/queued-descriptor runs remain under `wine-path-sockets-20261019` and
+`wine-rights-handles-20261019`. An intermediate `wine-rights-cleanup-20261019`
+run passed the socket checks but was stopped before refreshing Wine's recorded
+background-task status; it does not satisfy the final command-completion gate.
+The shared-file implementation must preserve
+canonical pages, ordinary-I/O coherence, permissions, mapped resize/EOF,
+writeback and lifetime before enabling the currently rejected operation; see
+[the shared-file foundation](file-shared-mappings.md).
+
+The exact candidate passes all 52 host suites and both kernel entry audits.
+Its isolated eight-vCPU/4-GiB run uses software composition and silent host
+audio. Every recorded request reaches its expected terminal code with zero
+live tasks and complete stdout/stderr before checked shutdown. Heap integrity,
+owned launcher/QEMU exit zero, four offline filesystem checks and preservation
+of all ten existing documents (content and ownership) pass. No application
+windows, audio streams or outstanding GPU backing mappings remain.

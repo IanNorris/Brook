@@ -81,6 +81,7 @@ static constexpr uint16_t EXT2_S_IFMT   = 0xF000;
 static constexpr uint16_t EXT2_S_IFREG  = 0x8000;
 static constexpr uint16_t EXT2_S_IFDIR  = 0x4000;
 static constexpr uint16_t EXT2_S_IFLNK  = 0xA000;
+static constexpr uint16_t EXT2_S_IFSOCK = 0xC000;
 
 struct Ext2BlockGroupDesc {
     uint32_t bg_block_bitmap;
@@ -2664,6 +2665,14 @@ static const VnodeOps g_ext2FileOps = {
     .access  = Ext2VnodeAccess,
 };
 
+// Socket pins expose metadata and permissions, never file data or mappings.
+static const VnodeOps g_ext2SocketOps = {
+    .open = nullptr, .read = nullptr, .write = nullptr, .readdir = nullptr,
+    .close = Ext2FileClose, .stat = Ext2FileStat, .fsync = nullptr,
+    .set_times = Ext2VnodeSetTimes, .chmod = Ext2VnodeChmod,
+    .chown = Ext2VnodeChown, .space = Ext2Space, .access = Ext2VnodeAccess,
+};
+
 static const VnodeOps g_ext2DirOps = {
     .open    = Ext2FileOpen,
     .read    = nullptr,
@@ -3069,8 +3078,14 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
     }
 
     uint16_t mode = inodeData.i_mode & EXT2_S_IFMT;
+    if (mode == EXT2_S_IFSOCK && !(flags & VFS_O_METADATA)) {
+        if (error) *error = -6; // ENXIO: a socket inode is not an openable file.
+        if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
+        else KRwLockReadUnlock(&g_ext2Lock);
+        return nullptr;
+    }
     Ext2OpenInode* hold = nullptr;
-    if (mode == EXT2_S_IFDIR || mode == EXT2_S_IFREG)
+    if (mode == EXT2_S_IFDIR || mode == EXT2_S_IFREG || mode == EXT2_S_IFSOCK)
         hold = Ext2HoldInode(mnt, ino);
     if (needsWrite) KRwLockWriteUnlock(&g_ext2Lock);
     else KRwLockReadUnlock(&g_ext2Lock);
@@ -3096,7 +3111,7 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
         return vn;
     }
 
-    if (mode == EXT2_S_IFREG) {
+    if (mode == EXT2_S_IFREG || mode == EXT2_S_IFSOCK) {
         auto* fp = static_cast<Ext2FilePriv*>(kmalloc(sizeof(Ext2FilePriv)));
         if (!fp) { Ext2ReleaseInode(hold); return nullptr; }
         fp->mnt = mnt;
@@ -3107,7 +3122,7 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) { kfree(fp); Ext2ReleaseInode(hold); return nullptr; }
         vn->directoryPath = nullptr;
-        vn->ops = &g_ext2FileOps;
+        vn->ops = mode == EXT2_S_IFSOCK ? &g_ext2SocketOps : &g_ext2FileOps;
         vn->type = VnodeType::File;
         vn->priv = fp;
         vn->refCount = 1;
@@ -3290,6 +3305,63 @@ static int Ext2FsRemovePath(void* mountPriv, uint8_t pdrv, const char* relPath, 
 static int Ext2FsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
 {
     return Ext2FsRemovePath(mountPriv, pdrv, relPath, false);
+}
+
+static Vnode* Ext2FsCreateSocket(void* mountPriv, uint8_t pdrv, const char* path,
+                                uint16_t mode, int* error)
+{
+    (void)pdrv;
+    auto* mnt = static_cast<Ext2Mount*>(mountPriv);
+    auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
+    auto* fp = static_cast<Ext2FilePriv*>(kmalloc(sizeof(Ext2FilePriv)));
+    if (!vn || !fp) {
+        kfree(vn); kfree(fp); if (error) *error = -12; return nullptr;
+    }
+    *vn = {};
+    KRwLockWriteLock(&g_ext2Lock);
+    Ext2DrainOrphans(mnt);
+    uint32_t ino = 0;
+    Ext2OpenInode* hold = nullptr;
+    bool published = false;
+    auto fail = [&](int code) -> Vnode* {
+        Ext2ReleaseInode(hold);
+        if (ino && !published) Ext2FreeInode(mnt, ino, false);
+        KRwLockWriteUnlock(&g_ext2Lock);
+        kfree(fp); kfree(vn);
+        if (error) *error = code;
+        return nullptr;
+    };
+    char name[256];
+    uint32_t parent = Ext2ResolveParent(mnt, path, name, sizeof(name));
+    if (!parent || !name[0]) return fail(-2);
+    Ext2Inode directory{};
+    if (!Ext2ReadInode(mnt, parent, &directory)) return fail(-5);
+    if (Ext2DirLookup(mnt, parent, &directory, name)) return fail(-17);
+    if (int denied = Ext2CheckParentMutation(mnt, directory)) return fail(denied);
+    ino = Ext2AllocInode(mnt, false);
+    if (!ino) return fail(-28);
+    hold = Ext2HoldInode(mnt, ino);
+    if (!hold) return fail(-12);
+    Ext2Inode data{};
+    Process* current = ProcessCurrent();
+    data.i_mode = EXT2_S_IFSOCK | (mode & 0777 & ~(current ? current->umask : 022));
+    Ext2SetUid(data, current ? current->euid : 0);
+    Ext2SetGid(data, (directory.i_mode & 02000) ? Ext2Gid(directory) :
+                      (current ? current->egid : 0));
+    data.i_links_count = 1;
+    Ext2Touch(&data, true);
+    if (!Ext2WriteInode(mnt, ino, &data)) return fail(-5);
+    if (!Ext2DirAdd(mnt, parent, &directory, ino, name, 6 /* EXT2_FT_SOCK */, &published))
+        return fail(-5); // An uncertain published entry retains its allocated inode.
+    *fp = {mnt, ino, data, hold};
+    vn->ops = &g_ext2SocketOps;
+    vn->type = VnodeType::File;
+    vn->priv = fp;
+    vn->refCount = 1;
+    vn->cacheId = 0;
+    KRwLockWriteUnlock(&g_ext2Lock);
+    if (error) *error = 0;
+    return vn;
 }
 
 static int Ext2FsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath, uint16_t mode)
@@ -3814,6 +3886,7 @@ static const VfsFsOps g_ext2FsOps = {
     .open_mode_checked = Ext2FsOpenModeChecked,
     .check_access = Ext2CheckAccess,
     .check_access_real = Ext2CheckRealAccess,
+    .create_socket = Ext2FsCreateSocket,
 };
 
 // ---------------------------------------------------------------------------

@@ -81,7 +81,7 @@ def command(args, log=None, env=None):
 
 def offline_fsck(directory, prefix):
     results = {}
-    for name in ("data", "nix"):
+    for name in ("data", "nix", *(["tmp"] if (directory / "tmp.img").exists() else [])):
         log = directory / f"{prefix}-fsck-{name}.log"
         with log.open("wb") as f:
             rc = subprocess.run(["e2fsck", "-fn", str(directory / f"{name}.img")],

@@ -202,6 +202,11 @@ struct VfsFsOps {
     // retain their own lifetime/credential checks.
     bool opaque_symlinks = false;
     int (*check_access_real)(void* mountPriv, const VnodeStat* st, uint8_t required) = nullptr;
+    // Publish a pathname socket and return a metadata-only inode pin. Creation
+    // applies caller credentials/umask atomically; the pin prevents inode reuse
+    // after unlink until its owner closes it. Unsupported filesystems omit it.
+    Vnode* (*create_socket)(void* mountPriv, uint8_t pdrv, const char* relPath,
+                           uint16_t mode, int* error) = nullptr;
 };
 
 // Register a filesystem driver with the VFS.
@@ -302,6 +307,9 @@ int VfsRemovePath(const char* path, bool directory);
 
 // Create a directory.
 int VfsMkdir(const char* path, uint16_t mode = 0777);
+// Exclusive pathname socket creation. Existing entries report EADDRINUSE.
+// The returned metadata-only vnode is owned by the caller, including on unlink.
+Vnode* VfsCreateSocket(const char* path, uint16_t mode, int* error);
 
 // Rename a file or directory.
 int VfsRename(const char* oldPath, const char* newPath);
