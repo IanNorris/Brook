@@ -1370,13 +1370,19 @@ pending-birth/cleanup drain and a final block-write barrier. Extend the lifecycl
 matrix as described above. Refine PID exhaustion errno (currently inherited ENOMEM) separately.
 This does not implement OOM victim selection or repair MLFQ policy replacement.
 
-### Wine CSD interactive resize
+### Early interactive-resize feedback
 
-The Wine/DXVK diagnostic at
-`build/workloads/wine-dxvk-20261019/viewport-diagnostic2` reaches
-`xdg_toplevel.resize` and acknowledges the resulting configure, but does not
-publish a newly sized backing before the timeout. Native size becomes
-1288x753 while the earlier 648x394 image remains. Compare a deterministic
-Win32 `SetWindowPos` resize with mouse drag; capture blocked thread/profile
-state before attributing this to either the protocol or Vulkan swapchain.
-Do not count this diagnostic as resize acceptance.
+The Wine/DXVK work now applies deferred native resize/restore through an
+acknowledged `RESIZING` configure and clears the state after successful commit.
+Consider an additional configure when a drag grab starts, so clients can show
+early resizing feedback while retaining Brook's preview-only motion policy.
+
+### Stable process references and diagnostic PID bounds
+
+Wine/DXVK exposed a delayed numeric-PID kill hitting a newly recycled thread.
+Unused-ID-first/FIFO reuse fixes the immediate recycling behavior, but a bounded
+namespace can still wrap under churn. Consider `pidfd_open`/`pidfd_send_signal`
+and pollable lifetime handles as part of Linux compatibility, and audit
+userspace process controllers for incarnation-aware references. The two
+name/all strace iterators in `syscall.cpp` also still stop at PID 255 despite
+the 1024-ID kernel namespace; remove that diagnostic limit in a focused follow-up.

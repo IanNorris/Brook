@@ -104,6 +104,8 @@ struct brook_wm_event {
 #define WM_EVT_FOCUS_GAINED    0x81
 #define WM_EVT_FOCUS_LOST      0x82
 #define WM_EVT_RESIZED         0x83
+#define WM_RESIZE_MAXIMIZED     1
+#define WM_RESIZE_RESIZING      2
 
 static struct wl_display *g_display = NULL;
 static uint32_t next_serial(void);
@@ -293,6 +295,10 @@ struct brook_surface {
     int  xdg_initial_commit_done;
     int  xdg_acked; /* Initial handshake, not acknowledgement of the newest state. */
     int  toplevel_activated;
+    int  toplevel_maximized,toplevel_resizing;
+    int32_t configure_width,configure_height;
+    int configure_size_pending,configure_size_acked;
+    uint32_t configure_size_serial;
     int32_t window_geometry_w, window_geometry_h;
     int32_t pending_geometry_w, pending_geometry_h;
     int window_geometry_pending;
@@ -569,12 +575,31 @@ static void surface_cursor_commit(struct brook_surface *s) {
     }
     wm_set_cursor_image(pixels,dw,dh,(int64_t)s->cursor_hot_x*dw/g->w,(int64_t)s->cursor_hot_y*dh/g->h);
 }
+/* Configure size and state form one transaction. Focus changes may supersede
+ * its serial, but must preserve both dimensions and management state. */
+static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t height) {
+    if (!s->xdg_toplevel || !s->xdg_surface) return 1;
+    struct wl_array states;wl_array_init(&states);
+    const uint32_t values[]={XDG_TOPLEVEL_STATE_ACTIVATED,XDG_TOPLEVEL_STATE_MAXIMIZED,XDG_TOPLEVEL_STATE_RESIZING};
+    const int enabled[]={s->toplevel_activated,s->toplevel_maximized,s->toplevel_resizing};
+    for (unsigned i=0;i<3;++i) if(enabled[i]) {
+        uint32_t *state=wl_array_add(&states,sizeof(*state));
+        if(!state) { wl_array_release(&states);wl_client_post_no_memory(wl_resource_get_client(s->resource));return 0; }
+        *state=values[i];
+    }
+    xdg_toplevel_send_configure(s->xdg_toplevel,width,height,&states);wl_array_release(&states);
+    s->next_configure_serial=next_serial();
+    if(s->configure_size_pending) {s->configure_size_serial=s->next_configure_serial;s->configure_size_acked=0;}
+    xdg_surface_send_configure(s->xdg_surface,s->next_configure_serial);return 1;
+}
 static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     struct brook_surface *s=wl_resource_get_user_data(r);
     if (g_trace_frames) { ++s->trace_commits;if (s->pending_buffer) ++s->trace_buffers; }
     if (s->window_geometry_pending) {
         s->window_geometry_w=s->pending_geometry_w;s->window_geometry_h=s->pending_geometry_h;s->window_geometry_pending=0;
+
     }
+    const int configure_committed=s->configure_size_pending && s->configure_size_acked;
     /* xdg-shell role: the very first commit must have NO buffer; we
      * respond with a configure. The client acks, then commits with a
      * buffer for real. */
@@ -631,10 +656,21 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         }
         if (buffer && !image) { wl_client_post_no_memory(c);return; }
     }
-    int committed=surface_tree_commit(s,image);
+    int committed=surface_tree_commit(s,image),published=1;
     if (!committed) wl_client_post_no_memory(c);
     else if (committed>0 && s->is_cursor) surface_cursor_commit(s);
-    else if (committed>0 && !bt_effective_sync(&s->tree)) surface_repaint(s);
+    else if (committed>0 && !bt_effective_sync(&s->tree)) published=surface_repaint(s);
+    if (committed>0 && published && configure_committed) {
+        s->configure_size_pending=s->configure_size_acked=0;
+        if(s->toplevel_resizing && s->wm_id) {
+            // Finish only after the acknowledging commit has succeeded. Sending
+            // this beside the resize would let clients coalesce away its size.
+            s->toplevel_resizing=0;
+            int32_t width=s->window_geometry_w>0?s->window_geometry_w:(int32_t)s->image_w;
+            int32_t height=s->window_geometry_h>0?s->window_geometry_h:(int32_t)s->image_h;
+            toplevel_send_state(s,width,height);
+        }
+    }
     image_unref(image);
     buffer_drop(s->pending_buffer);s->pending_buffer=NULL;s->pending_attach=0;
     ++g_commit_count;
@@ -1015,6 +1051,7 @@ static void xdg_surface_ack_configure(struct wl_client *c, struct wl_resource *r
     (void)c;
     struct brook_surface *s = wl_resource_get_user_data(r);
     s->xdg_acked = 1;
+    if (s->configure_size_pending && serial==s->configure_size_serial) s->configure_size_acked=1;
     fprintf(stderr, "[waylandd] xdg_surface.ack_configure serial=%u\n", serial);
 }
 
@@ -1873,20 +1910,12 @@ static void dispatch_surface_event(struct brook_surface *s,
         if (s->xdg_toplevel && s->xdg_surface) {
             int32_t neww = e->x;
             int32_t newh = e->y;
-            struct wl_array states; wl_array_init(&states);
-            /* Preserve the native activation state on resize. Activation is
-             * available from xdg_toplevel v1, independently of seat bindings. */
-            if (s->toplevel_activated) {
-                uint32_t *st = wl_array_add(&states, sizeof(uint32_t));
-                if (st) *st = XDG_TOPLEVEL_STATE_ACTIVATED;
-            }
-            xdg_toplevel_send_configure(s->xdg_toplevel, neww, newh, &states);
-            wl_array_release(&states);
-            uint32_t serial = next_serial();
-            s->next_configure_serial = serial;
-            xdg_surface_send_configure(s->xdg_surface, serial);
-            fprintf(stderr, "[waylandd] WM_EVT_RESIZED wm=%u → configure %dx%d serial=%u\n",
-                    s->wm_id, neww, newh, serial);
+            s->toplevel_maximized=(e->reserved&WM_RESIZE_MAXIMIZED)!=0;
+            s->toplevel_resizing=!s->toplevel_maximized && (e->reserved&WM_RESIZE_RESIZING)!=0;
+            s->configure_width=neww;s->configure_height=newh;s->configure_size_pending=1;
+            toplevel_send_state(s,neww,newh);
+            fprintf(stderr,"[waylandd] WM_EVT_RESIZED wm=%u configure %dx%d max=%d resizing=%d serial=%u\n",
+                s->wm_id,neww,newh,s->toplevel_maximized,s->toplevel_resizing,s->next_configure_serial);
         }
         break;
     }
@@ -1903,22 +1932,14 @@ static void dispatch_surface_event(struct brook_surface *s,
 static void toplevel_set_activated(struct brook_surface *surface, int active) {
     if (!surface->xdg_toplevel || !surface->xdg_surface ||
         surface->toplevel_activated == active) return;
-    struct wl_array states; wl_array_init(&states);
-    if (active) {
-        uint32_t *state = wl_array_add(&states, sizeof(*state));
-        if (!state) { wl_client_post_no_memory(wl_resource_get_client(surface->resource)); return; }
-        *state = XDG_TOPLEVEL_STATE_ACTIVATED;
+    surface->toplevel_activated=active;
+    int32_t width=surface->window_geometry_w>0?surface->window_geometry_w:(int32_t)surface->vfb_w;
+    int32_t height=surface->window_geometry_h>0?surface->window_geometry_h:(int32_t)surface->vfb_h;
+    if(surface->toplevel_maximized || surface->configure_size_pending) {
+        width=surface->configure_width;height=surface->configure_height;
     }
-    surface->toplevel_activated = active;
-    int32_t width = surface->window_geometry_w > 0 ? surface->window_geometry_w : (int32_t)surface->vfb_w;
-    int32_t height = surface->window_geometry_h > 0 ? surface->window_geometry_h : (int32_t)surface->vfb_h;
-    xdg_toplevel_send_configure(surface->xdg_toplevel, width, height, &states);
-    wl_array_release(&states);
-    surface->next_configure_serial = next_serial();
-    /* A mapped client can commit its current state while this configure is
-     * pending. Resetting the initial-handshake gate would consume/release its
-     * buffers without publishing them, indefinitely freezing the window. */
-    xdg_surface_send_configure(surface->xdg_surface, surface->next_configure_serial);
+    // A state-only configure never resets the initial map/ack gate.
+    toplevel_send_state(surface,width,height);
 }
 
 static void dispatch_window_event(struct brook_surface *surface,

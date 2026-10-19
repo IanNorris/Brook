@@ -147,6 +147,62 @@ int main(void) {
     dispatch_window_event(&surface,&event,104);wl_display_flush_clients(display);
     assert(recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT)==-1 && errno==EAGAIN);
 
+    /* Native maximize must be a protocol state, and focus changes must not
+     * erase it. Wine ignores normal-state size suggestions by design. */
+    event=(struct brook_wm_event){.type=WM_EVT_RESIZED,.x=1280,.y=720,.reserved=WM_RESIZE_MAXIMIZED};
+    dispatch_window_event(&surface,&event,105);assert(surface.toplevel_maximized);
+    event.type=WM_EVT_FOCUS_GAINED;dispatch_window_event(&surface,&event,106);
+    wl_display_flush_clients(display);keysBytes=recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT);assert(keysBytes>0);
+    unsigned maxConfigs=0;
+    for(size_t i=0;i<(size_t)keysBytes/4;) {
+        unsigned size=keysWire[i+1]>>16;assert(size>=8 && i*4+size<=(size_t)keysBytes);
+        if(keysWire[i]==36 && (keysWire[i+1]&65535)==XDG_TOPLEVEL_CONFIGURE) {
+            assert(keysWire[i+2]==1280 && keysWire[i+3]==720);
+            unsigned count=keysWire[i+4]/4;int found=0;
+            for(unsigned j=0;j<count;++j)if(keysWire[i+5+j]==XDG_TOPLEVEL_STATE_MAXIMIZED)found=1;
+            assert(found);++maxConfigs;
+        }
+        i+=size/4;
+    }
+    assert(maxConfigs==2);
+    event=(struct brook_wm_event){.type=WM_EVT_RESIZED,.x=800,.y=600};
+    dispatch_window_event(&surface,&event,107);assert(!surface.toplevel_maximized && surface.configure_size_pending);
+    xdg_surface_set_window_geometry(client,surface.xdg_surface,0,0,640,480);
+    xdg_surface_ack_configure(client,surface.xdg_surface,surface.configure_size_serial);
+    assert(surface.configure_size_pending);surface_commit(client,surface.resource);
+    assert(!surface.configure_size_pending && surface.window_geometry_w==640 && surface.window_geometry_h==480);
+
+    wl_display_flush_clients(display);keysBytes=recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT);assert(keysBytes>0);
+    event=(struct brook_wm_event){.type=WM_EVT_RESIZED,.x=900,.y=700,.reserved=WM_RESIZE_RESIZING};
+    dispatch_window_event(&surface,&event,108);uint32_t firstResize=surface.configure_size_serial;
+    assert(surface.toplevel_resizing && surface.configure_size_pending);
+    toplevel_set_activated(&surface,0);uint32_t focusedResize=surface.configure_size_serial;
+    assert(focusedResize!=firstResize);
+    xdg_surface_ack_configure(client,surface.xdg_surface,firstResize);surface_commit(client,surface.resource);
+    assert(surface.toplevel_resizing && surface.configure_size_pending); // superseded ACK cannot finish
+    event.x=960;event.y=720;dispatch_window_event(&surface,&event,109);
+    xdg_surface_ack_configure(client,surface.xdg_surface,focusedResize);surface_commit(client,surface.resource);
+    assert(surface.toplevel_resizing && surface.configure_size_pending);
+    uint32_t finalResize=surface.configure_size_serial;
+    xdg_surface_ack_configure(client,surface.xdg_surface,finalResize);
+    xdg_surface_set_window_geometry(client,surface.xdg_surface,0,0,800,600); // valid smaller accepted size
+    assert(surface.toplevel_resizing);surface_commit(client,surface.resource);
+    assert(!surface.toplevel_resizing && !surface.configure_size_pending && surface.next_configure_serial!=finalResize);
+    wl_display_flush_clients(display);keysBytes=recv(sockets[1],keysWire,sizeof(keysWire),MSG_DONTWAIT);assert(keysBytes>0);
+    unsigned resizeConfigs=0;
+    const unsigned expectedW[]={900,900,960,800},expectedH[]={700,700,720,600};
+    for(size_t i=0;i<(size_t)keysBytes/4;) {
+        unsigned size=keysWire[i+1]>>16;assert(size>=8 && i*4+size<=(size_t)keysBytes);
+        if(keysWire[i]==36 && (keysWire[i+1]&65535)==XDG_TOPLEVEL_CONFIGURE) {
+            assert(resizeConfigs<4 && keysWire[i+2]==expectedW[resizeConfigs] && keysWire[i+3]==expectedH[resizeConfigs]);
+            unsigned count=keysWire[i+4]/4;int resizing=0;
+            for(unsigned j=0;j<count;++j)if(keysWire[i+5+j]==XDG_TOPLEVEL_STATE_RESIZING)resizing=1;
+            assert(resizing==(resizeConfigs<3));++resizeConfigs;
+        }
+        i+=size/4;
+    }
+    assert(resizeConfigs==4);
+
     g_seat_clients=NULL;wl_client_destroy(foreign);close(foreignSockets[1]);
     wl_client_destroy(client);
     assert(surface.trace_done==3 && surface.trace_cancelled==25);

@@ -80,6 +80,17 @@ int main() {
     CHECK(!WmCompleteCapture(b));
     WmSignalDirtyById(stranger,id);CHECK(window.vfbDirty);
     CHECK(!lockDepth);
+    // The native maximized state crosses the provider queue atomically with
+    // its dimensions; restore must clear it without changing the event ABI.
+    Window::WmInputEvent discarded[256]{},event{};
+    WmInputPop(&window,discarded,256);
+    window.state=WindowState::Maximized;
+    CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,1280,720));
+    CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_MAXIMIZED);
+    CHECK(event.type==WM_EVT_RESIZED && event.x==1280 && event.y==720);
+    window.state=WindowState::Normal;
+    CHECK(WmPushWmEvent(&window,WM_EVT_RESIZED,640,360));
+    CHECK(WmInputPop(&window,&event,1)==1 && event.reserved==WM_RESIZE_RESIZING);
     std::free(owner);std::free(stranger);
     std::puts("WINDOW_SURFACES PASS: stale slot, GL/SHM transition, destruction, reuse, owner checks");
 }

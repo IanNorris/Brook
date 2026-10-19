@@ -2930,7 +2930,7 @@ bool WmPushWmEvent(Window* win, uint8_t type, int16_t x, int16_t y)
     slot.modifiers = 0;
     slot.x         = x;
     slot.y         = y;
-    slot.reserved  = 0;
+    slot.reserved  = type==WM_EVT_RESIZED ? (win->state==WindowState::Maximized ? WM_RESIZE_MAXIMIZED : WM_RESIZE_RESIZING) : 0;
     __atomic_store_n(&win->inputHead, next, __ATOMIC_RELEASE);
     return true;
 }

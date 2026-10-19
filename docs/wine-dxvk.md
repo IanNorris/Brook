@@ -143,3 +143,25 @@ needs a `RESIZING` transaction; deterministic Win32 `SetWindowPos` resizing to
 `fatal-trace-candidate`. That run is diagnostic (temporary kernel logging and
 process tracing), and stopped at the assertion detecting the missing native
 maximize redraw; it is not full acceptance.
+
+`resize-candidate2` passes one offscreen render and two complete visible D3D11
+cycles: identity shader readback at 640x360 and 1280x720, actual CSD drag,
+minimize/restore, true maximized redraw, restore to the dragged dimensions,
+input and normal exit. Native normal resize/restore now uses a bounded
+`RESIZING` transaction. It clears after a successful commit acknowledging the
+current configure; activation preserves the desired pair and state, stale
+acknowledgements cannot complete a replacement, and a valid smaller client size
+is accepted. Protocol tests exercise these ordering cases. Drag actions wait
+for Wine to acquire its resize grab before moving the pointer; the earlier
+short wait produced a zero-distance drag and is excluded.
+
+The Windows SDL3 Snake executable reaches D3D11 device/swapchain creation but
+returns failure because DXVK 2.7.1's `SetRotation` returns `E_NOTIMPL` for the
+identity request SDL3 makes. The next package checkpoint adds identity-only
+Set/GetRotation handling, following the no-op behavior in
+[current upstream DXVK](https://github.com/doitsujin/dxvk/blob/master/src/dxgi/dxgi_swapchain.cpp).
+Actual non-identity rotation remains unsupported, and invalid requests retain
+errors. The D3D11 probe now tests that contract; the patched package and Snake
+still need runtime acceptance. Temporary kernel termination logging has been
+removed from the production candidate; its patch and diagnostic artifacts are
+preserved with the workload evidence.

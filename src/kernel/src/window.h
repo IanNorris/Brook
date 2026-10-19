@@ -388,7 +388,9 @@ uint32_t WmInputPop(Window* win, Window::WmInputEvent* out, uint32_t max);
 static constexpr uint8_t WM_EVT_CLOSE_REQUESTED = 0x80;
 static constexpr uint8_t WM_EVT_FOCUS_GAINED    = 0x81;
 static constexpr uint8_t WM_EVT_FOCUS_LOST      = 0x82;
-static constexpr uint8_t WM_EVT_RESIZED         = 0x83; // x=newW, y=newH
+static constexpr uint8_t WM_EVT_RESIZED         = 0x83; // x=newW, y=newH; reserved=WM_RESIZE_*
+static constexpr uint32_t WM_RESIZE_MAXIMIZED = 1;
+static constexpr uint32_t WM_RESIZE_RESIZING = 2;
 
 // Push a synthetic WM event into the per-window queue.  Drops on overflow.
 bool WmPushWmEvent(Window* win, uint8_t type, int16_t x = 0, int16_t y = 0);
