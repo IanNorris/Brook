@@ -1,5 +1,14 @@
 # Recovery and VM-control backlog
 
+- Investigate GLtron's window-close exit hang in the combined Proton/D3D12
+  review image. The window and GPU resources retire, but the `.gltron-real`
+  leader remains blocked after its other threads exit. This correctly holds
+  orderly shutdown in its application-closing phase. The isolated review
+  process exits on SIGTERM; no forced VM stop is needed. Retained task/window
+  evidence is under `build/reviews/proton-d3d12-20261019/`. The existing launcher
+  already disables audio. Distinguish SDL shutdown/join behavior from GPU
+  retirement before changing either implementation.
+
 - Integrate per-title dependency recipes into the standalone Proton/app launch
   path. The pinned GE build has no Veloren rule and its bundled Winetricks
   compiler recipe supplies a 2013 DLL that rejects Shader Model 5.1. The
