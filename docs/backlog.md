@@ -1,5 +1,14 @@
 # Recovery and VM-control backlog
 
+- Integrate per-title dependency recipes into the standalone Proton/app launch
+  path. The pinned GE build has no Veloren rule and its bundled Winetricks
+  compiler recipe supplies a 2013 DLL that rejects Shader Model 5.1. The
+  [Veloren D3D12 smoke test](d3d12.md#shader-compiler-packaging) uses a newer
+  pinned Microsoft compiler beside only that game, with a per-launch override.
+  Preserve per-app isolation and record the actual game ID, dependency version
+  and applied fixes before enabling automatic ProtonFixes. Extend acceptance
+  to cold save/load, audio and sustained 3D gameplay.
+
 - Implement read-only Linux route-netlink interface/address enumeration using
   Brook's actual network configuration, with multipart reply, sequencing,
   socket ownership and libc `if_nameindex`/`getifaddrs` coverage. AF_NETLINK is
