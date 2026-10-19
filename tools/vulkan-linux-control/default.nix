@@ -39,6 +39,9 @@ let
     ${probe}/bin/virtgpu-query
     drm_exit=$?
     echo "BROOK_VULKAN_CONTROL_DRM_EXIT $drm_exit"
+    ${probe}/bin/virtgpu-context
+    context_exit=$?
+    echo "BROOK_VULKAN_CONTROL_CONTEXT_EXIT $context_exit"
     ${pkgs.vulkan-tools}/bin/vulkaninfo --summary
     info_exit=$?
     echo "BROOK_VULKAN_CONTROL_INFO_EXIT $info_exit"
@@ -46,7 +49,7 @@ let
     probe_exit=$?
     echo "BROOK_VULKAN_CONTROL_PROBE_EXIT $probe_exit"
     sync
-    echo "BROOK_VULKAN_CONTROL_END pci=$pci_exit gpu=$gpu_exit drm=$drm_exit info=$info_exit probe=$probe_exit"
+    echo "BROOK_VULKAN_CONTROL_END pci=$pci_exit gpu=$gpu_exit drm=$drm_exit info=$info_exit probe=$probe_exit context=$context_exit"
     echo BROOK_VULKAN_CONTROL_DMESG_START
     dmesg
     echo BROOK_VULKAN_CONTROL_DMESG_END

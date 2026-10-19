@@ -104,7 +104,7 @@ def main():
                 process.kill()
                 exit_code = process.wait()
     text = serial.read_text(errors='replace') if serial.exists() else ''
-    ended = re.findall(r'BROOK_VULKAN_CONTROL_END pci=(\d+) gpu=(\d+) drm=(\d+) info=(\d+) probe=(\d+)', text)
+    ended = re.findall(r'BROOK_VULKAN_CONTROL_END pci=(\d+) gpu=(\d+) drm=(\d+) info=(\d+) probe=(\d+) context=(\d+)', text)
     records = []
     for line in text.splitlines():
         if line.startswith('{"passed":'):

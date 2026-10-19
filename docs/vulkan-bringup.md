@@ -190,6 +190,39 @@ and an outgoing completion FD. Full DRM syncobj/input-fence support is not a
 prerequisite for this initial lane. Renderer command consumption and Vulkan GPU
 completion must remain distinct.
 
+## V1 context checkpoint
+
+Context configuration now travels explicitly from the DRM file to the driver.
+Capability reporting intersects implemented app support with enumerated host
+capsets; unsupported capsets and versions fail before host submission. Venus
+capset version zero is recognized correctly, while Venus/blob capabilities
+remain hidden until their transport exists. All drivers were rebuilt for ABI 30.
+
+Eleven raw context cases pass in Linux and Brook, including explicit VirGL2,
+default initialization, repeated initialization (`EEXIST`), invalid/duplicate
+parameters, bounds and bad pointers. This is a supported subset: debug names and
+nonzero poll masks remain unavailable; accepting a ring count does not establish
+multiring submission. EXECBUFFER ring/completion semantics remain V1c work.
+
+All 53 host suites and both compiled entry audits pass. Private guest checks
+pass full/partial/independent-offset transfers, PRIME ownership and shared fork,
+stale mmap tokens, and canonical capture formats. A stale PRIME test expected a
+byte buffer to pass display-source validation; it now correctly expects EINVAL,
+paired with the separate ARGB/XRGB acceptance cases.
+
+An actual pinned Mesa EGL/GLES surfaceless test selects hardware VirGL and reads
+back exact red, green and blue pixels. Its guest closure is explicitly staged:
+the Wine seed did not contain the pinned Mesa package. The first missing-package
+attempt is retained separately, not counted as a GL pass. This environment lacks
+`/dev/fuse`; the private image was updated with offline debugfs and checked by
+fsck instead. The aperture physical base is confirmed as `0x7000000000`, length
+1 GiB, above existing direct/identity mappings. Host cached and write-combining
+policies still require distinct user leaf encodings and borrowed ownership.
+
+Evidence lives under `build/workloads/vulkan-v1-context-20261019/`. Context,
+GL transfer/lifetime and Mesa readback runs use isolated images and checked
+shutdown. No Vulkan application has executed on Brook yet.
+
 ## Proposed next goal
 
 > Bring up hardware-backed Vulkan on Brook through Mesa Venus and virtio-gpu.

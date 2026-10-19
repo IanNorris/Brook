@@ -14,6 +14,7 @@
 // the driver. Functions return <0 (negative errno) on failure, >=0 on success.
 
 #include <stdint.h>
+#include "gpu_context.h"
 
 namespace brook {
 
@@ -31,7 +32,7 @@ struct GpuAppOps {
 
     // Create a new private virgl context for an app (pid for bookkeeping/logging).
     // Returns a context id (>0) or <0 on failure.
-    int32_t (*CtxCreate)(uint32_t pid);
+    int32_t (*CtxCreate)(uint32_t pid, const GpuContextConfig& config);
 
     // Destroy a context and reclaim its resources. Safe to call on exit.
     void (*CtxDestroy)(int32_t ctxId);
@@ -90,6 +91,9 @@ struct GpuAppOps {
     // and unref the host resource. Return 0 only after verified completion.
     // Caller must exclude all future resource users before calling this.
     int32_t (*RetireResource)(int32_t ctxId, int32_t resId);
+
+    // Implemented app capabilities intersected with negotiated host support.
+    GpuAppCapabilities (*Capabilities)();
 };
 
 // Register the app-GPU ops (called by the display driver once its 3D path is

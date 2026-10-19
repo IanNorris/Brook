@@ -2905,7 +2905,7 @@ static DrmMapTokenAllocator g_drmMapTokens;
 static DrmBackingDiagnostics g_drmBackingDiagnostics;
 // File contexts own handle tables; resources own only a small GPU-context
 // lease. Keeping these separate prevents GEM/PRIME cross-import ownership cycles.
-struct DrmGpuOwner { uint32_t references; int32_t ctxId; };
+struct DrmGpuOwner { uint32_t references; int32_t ctxId; GpuContextConfig config; };
 static void DrmOwnerRef(DrmGpuOwner* owner) {
     __atomic_fetch_add(&owner->references,1,__ATOMIC_RELAXED);
 }
@@ -3175,7 +3175,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         dctx->refCount = 1;
         dctx->owner=static_cast<DrmGpuOwner*>(kmalloc(sizeof(DrmGpuOwner)));
         if (!dctx->owner) { kfree(dctx);return -ENOMEM; }
-        *dctx->owner={1,0};
+        *dctx->owner={1,0,{}};
         int fd = FdAlloc(proc, FdType::DevDri, dctx);
         if (fd < 0) { DrmOwnerUnref(dctx->owner);kfree(dctx);return -EMFILE; }
         DbgPrintf("sys_open: /dev/dri/renderD128 → fd %d\n", fd);
@@ -5946,16 +5946,19 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpuGetparam)))
             return -EFAULT;
         DrmVirtgpuGetparam p = *reinterpret_cast<DrmVirtgpuGetparam*>(arg);
+        const auto* ga = GpuAppGet();
+        if (!ga || !ga->Capabilities) return -ENODEV;
+        const auto caps = ga->Capabilities();
         uint64_t val;
         switch (p.param)
         {
-        case VIRTGPU_PARAM_3D_FEATURES:       val = 1; break;
+        case VIRTGPU_PARAM_3D_FEATURES:       val = caps.capsetMask != 0; break;
         case VIRTGPU_PARAM_CAPSET_QUERY_FIX:  val = 1; break;
-        case VIRTGPU_PARAM_CONTEXT_INIT:      val = 1; break;
+        case VIRTGPU_PARAM_CONTEXT_INIT:      val = caps.contextInit; break;
         // capset id bitmask: VIRGL(1) | VIRGL2(2).
-        case VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs: val = (1u << 1) | (1u << 2); break;
-        case VIRTGPU_PARAM_RESOURCE_BLOB:     val = 0; break;
-        case VIRTGPU_PARAM_HOST_VISIBLE:      val = 0; break;
+        case VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs: val = caps.capsetMask; break;
+        case VIRTGPU_PARAM_RESOURCE_BLOB:     val = caps.resourceBlob; break;
+        case VIRTGPU_PARAM_HOST_VISIBLE:      val = caps.hostVisible; break;
         case VIRTGPU_PARAM_CROSS_DEVICE:      val = 0; break;
         case VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME: val = 0; break;
         default: return -EINVAL;
@@ -5976,7 +5979,9 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         // blob into the user buffer. Zero the tail so any bytes the host didn't
         // supply read as 0 (Mesa reads a fixed-size union virgl_caps).
         const brook::GpuAppOps* ga = brook::GpuAppGet();
-        if (!ga || !ga->GetCapset) return -ENODEV;
+        if (!ga || !ga->GetCapset || !ga->Capabilities) return -ENODEV;
+        if (gc.cap_set_id >= 64 ||
+            !(ga->Capabilities().capsetMask & (uint64_t{1} << gc.cap_set_id))) return -EINVAL;
         for (uint32_t i = 0; i < gc.size; ++i)
             reinterpret_cast<char*>(gc.addr)[i] = 0;
         int32_t n = ga->GetCapset(gc.cap_set_id, gc.cap_set_ver,
@@ -5987,14 +5992,22 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
     // --- M1: resource / submit path (per-fd GEM table -> host virgl ids) ---
     case DRM_NR_VIRTGPU_CONTEXT_INIT:
     {
-        // Create the per-fd virgl context. We ignore the requested capset
-        // params (only VIRGL is offered); the GpuApp driver picks VIRGL.
-        if (dctx->owner->ctxId > 0) return 0;   // already initialised
-        const brook::GpuAppOps* ga = brook::GpuAppGet();
-        if (!ga || !ga->CtxCreate) return -ENODEV;
+        if (!UserBufferReadable(arg, sizeof(DrmVirtgpuContextInit))) return -EFAULT;
+        DrmVirtgpuContextInit init{};
+        if (!CopyFromUser(&init, arg, sizeof(init))) return -EFAULT;
+        if (init.num_params > 4) return -EINVAL;
+        GpuContextParam params[4]{};
+        if (init.num_params && !CopyFromUser(params, init.ctx_set_params,
+                                             init.num_params * sizeof(params[0]))) return -EFAULT;
+        const auto* ga = GpuAppGet();
+        if (!ga || !ga->CtxCreate || !ga->Capabilities) return -ENODEV;
+        if (dctx->owner->ctxId > 0) return -17; // EEXIST
+        GpuContextConfig config{};
+        if (!GpuContextParse(params, init.num_params, ga->Capabilities(), config)) return -EINVAL;
         Process* proc = ProcessCurrent();
-        int32_t ctx = ga->CtxCreate(proc ? proc->pid : 0);
+        const int32_t ctx = ga->CtxCreate(proc ? proc->pid : 0, config);
         if (ctx < 0) return -ENOMEM;
+        dctx->owner->config = config;
         dctx->owner->ctxId = ctx;
         return 0;
     }
@@ -6010,7 +6023,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (dctx->owner->ctxId <= 0) {
             if (!ga->CtxCreate) return -ENODEV;
             Process* proc = ProcessCurrent();
-            int32_t ctx = ga->CtxCreate(proc ? proc->pid : 0);
+            int32_t ctx = ga->CtxCreate(proc ? proc->pid : 0, {});
             if (ctx < 0) return -ENOMEM;
             dctx->owner->ctxId = ctx;
         }
@@ -11595,7 +11608,7 @@ static int64_t sys_brook_gpu_ctx_create(uint64_t, uint64_t, uint64_t, uint64_t,
     const brook::GpuAppOps* ga = brook::GpuAppGet();
     if (!ga || !ga->CtxCreate) return -ENODEV;
     if (proc->gpuAppCtx > 0) return proc->gpuAppCtx;   // already have one
-    int32_t ctx = ga->CtxCreate(proc->pid);
+    int32_t ctx = ga->CtxCreate(proc->pid, {});
     if (ctx < 0) return -ENOMEM;
     proc->gpuAppCtx = ctx;
     return ctx;

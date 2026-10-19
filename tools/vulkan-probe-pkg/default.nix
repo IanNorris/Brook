@@ -19,12 +19,14 @@ pkgs.stdenv.mkDerivation {
     $CC -std=c11 -O2 -Wall -Wextra -Werror probe.c -lvulkan -o vulkan-probe
     $CC -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror \
       -I${pkgs.libdrm.dev}/include/libdrm virtgpu-query.c -o virtgpu-query
+    $CC -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror \
+      -I${pkgs.libdrm.dev}/include/libdrm virtgpu-context.c -o virtgpu-context
     runHook postBuild
   '';
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin
-    cp vulkan-probe virtgpu-query $out/bin/
+    cp vulkan-probe virtgpu-query virtgpu-context $out/bin/
     runHook postInstall
   '';
 }

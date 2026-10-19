@@ -24,6 +24,7 @@ int main(int argc, char** argv)
         if (errors[required[i]] || !values[required[i]]) ready = 0;
     if (!(values[7] & (1ull << 4))) ready = 0;
     int contextError = 0;
+    int contextAttempted = ready;
     if (ready) {
         struct drm_virtgpu_context_set_param parameters[] = {
             { .param = VIRTGPU_CONTEXT_PARAM_CAPSET_ID, .value = 4 },
@@ -38,7 +39,7 @@ int main(int argc, char** argv)
     for (unsigned i = 1; i <= 8; ++i)
         printf("%s{\"id\":%u,\"value\":%llu,\"errno\":%d}", i == 1 ? "" : ",",
                i, (unsigned long long)values[i], errors[i]);
-    printf("],\"context_errno\":%d}\n", contextError);
+    printf("],\"context_attempted\":%s,\"context_errno\":%d}\n", contextAttempted ? "true" : "false", contextError);
     close(fd);
     return ready ? 0 : 1;
 }

@@ -561,6 +561,8 @@ struct VirtioPciCap {
 static uint8_t  g_hostVisBar    = 0xFF;
 static uint64_t g_hostVisOffset = 0;
 static uint64_t g_hostVisLength = 0;
+static uint64_t g_hostCapsetMask = 0;
+static uint32_t g_hostCapsetMaxVersion[64] = {};
 
 static bool FindVirtioCaps(const PciDevice& dev, VirtioPciCap caps[5])
 {
@@ -871,13 +873,16 @@ static void QueryCapsets()
                      i, resp->capset_id, CapsetName(resp->capset_id),
                      resp->capset_max_version, resp->capset_max_size);
 
-        if (resp->capset_id == VIRTIO_GPU_CAPSET_VENUS &&
-            resp->capset_max_version > 0)
+        if (resp->capset_id < 64 && resp->capset_max_size) {
+            g_hostCapsetMask |= uint64_t{1} << resp->capset_id;
+            g_hostCapsetMaxVersion[resp->capset_id] = resp->capset_max_version;
+        }
+        if (resp->capset_id == VIRTIO_GPU_CAPSET_VENUS && resp->capset_max_size)
             g_haveVenusCapset = true;
     }
 
     if (g_haveVenusCapset)
-        SerialPuts("virtio_gpu: Venus capset present — Vulkan transport available\n");
+        SerialPuts("virtio_gpu: Venus capset present (app blob transport not yet enabled)\n");
 }
 
 // Fetch a capset blob (virgl_caps) from the host by id+version via the
@@ -889,7 +894,9 @@ static int32_t GetCapsetBlob(uint32_t capsetId, uint32_t version,
                              void* out, uint32_t maxBytes)
 {
     GpuCmdGuard _gcg;
-    if (!out || maxBytes == 0) return -1;
+    if (!out || maxBytes == 0 || capsetId >= 64 ||
+        !(g_hostCapsetMask & (uint64_t{1} << capsetId)) ||
+        version > g_hostCapsetMaxVersion[capsetId]) return -1;
     memset(g_cmdBuf, 0, 4096);
     auto* req = reinterpret_cast<VirtioGpuGetCapset*>(g_cmdBuf + CMD_REQ_OFF);
     req->hdr.type      = VIRTIO_GPU_CMD_GET_CAPSET;
@@ -2680,7 +2687,7 @@ static const uint32_t* CompCaptureFull(uint32_t* outW, uint32_t* outH)
 static constexpr uint32_t APP_FIRST_CTX  = 0x100;   // app ctx ids start here (1,2 = kernel)
 static constexpr uint32_t MAX_APP_CTX = brook::GpuResourceNamespace::ContextSlots;
 static brook::GpuAppResourceIds<> g_appResourceIds;
-struct AppCtx { bool used; uint32_t ctxId; uint32_t pid; };
+struct AppCtx { bool used; uint32_t ctxId; uint32_t pid; brook::GpuContextConfig config; };
 static AppCtx g_appCtx[MAX_APP_CTX] = {};
 
 // Kernel bounce-buffers backing app resources uploaded from user memory (e.g.
@@ -2698,19 +2705,30 @@ static inline bool AppResValid(int32_t ctxId, uint32_t gres)
     return g_appResourceIds.ContainsIssued(static_cast<uint32_t>(ctxId)-APP_FIRST_CTX,gres);
 }
 
-static int32_t AppCtxCreate(uint32_t pid)
+static brook::GpuAppCapabilities AppCapabilities()
+{
+    // Do not expose Venus until blob memory and submission are implemented.
+    return {g_hostCapsetMask & ((uint64_t{1} << VIRTIO_GPU_CAPSET_VIRGL) |
+                               (uint64_t{1} << VIRTIO_GPU_CAPSET_VIRGL2)),
+            (g_gpu3dFeatures & VIRTIO_GPU_F_CONTEXT_INIT) != 0, false, false};
+}
+
+static int32_t AppCtxCreate(uint32_t pid, const brook::GpuContextConfig& config = {})
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
-    if (!g_compReady) return -1;
+    const auto caps = AppCapabilities();
+    if (!g_compReady || config.capsetId >= 64 || config.numRings > 64 ||
+        config.pollRingsMask || !(caps.capsetMask & (uint64_t{1} << config.capsetId))) return -1;
     for (uint32_t i = 0; i < MAX_APP_CTX; ++i)
     {
         if (g_appCtx[i].used) continue;
         uint32_t ctxId = APP_FIRST_CTX + i;
-        if (!CtxCreate(ctxId, VIRTIO_GPU_CAPSET_VIRGL))
+        if (!CtxCreate(ctxId, config.capsetId))
         { SerialPuts("virtio_gpu: app ctx create failed\n"); return -1; }
-        g_appCtx[i] = { true, ctxId, pid };
+        g_appCtx[i] = { true, ctxId, pid, config };
         g_appResourceIds.BeginContext(i);
-        SerialPrintf("virtio_gpu: app virgl ctx %u for pid %u\n", ctxId, pid);
+        SerialPrintf("virtio_gpu: app ctx %u capset %u rings %u for pid %u\n",
+                     ctxId, config.capsetId, config.numRings, pid);
         return static_cast<int32_t>(ctxId);
     }
     SerialPuts("virtio_gpu: app ctx table full\n");
@@ -3211,6 +3229,7 @@ static const brook::GpuAppOps g_gpuAppOps = {
     GetCapsetBlob,
     AppPresentBarrier,
     AppRetireResource,
+    AppCapabilities,
 };
 
 static const brook::GpuCompositorOps g_gpuCompositorOps = {
@@ -4054,6 +4073,12 @@ static int VirtioGpuModuleInit()
     {
         SerialPuts("virtio_gpu: missing virtio PCI caps\n");
         return -1;
+    }
+    if (g_hostVisBar != 0xFF && g_hostVisBar < 6) {
+        uint64_t base = PciBarMemBase32(dev.bar[g_hostVisBar]);
+        if (PciBarIs64(dev.bar[g_hostVisBar]) && g_hostVisBar + 1 < 6)
+            base |= uint64_t{dev.bar[g_hostVisBar + 1]} << 32;
+        SerialPrintf("virtio_gpu: host-visible physical base 0x%lx\n", base + g_hostVisOffset);
     }
     if (g_hostVisBar != 0xFF)
         SerialPrintf("virtio_gpu: host-visible blob region: bar %u off 0x%lx len 0x%lx (%lu MB)\n",

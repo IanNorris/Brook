@@ -80,7 +80,9 @@ def main():
         cases['unexported_present_rejected']=present(private_resource)==(-1,errno.EINVAL)
         cases['unowned_present_rejected']=present(private_resource+0x40000000)==(-1,errno.EINVAL)
         cases['oversized_present_rejected']=present(resource,129)==(-1,errno.EINVAL)
-        cases['owned_export_resolves_before_window_lookup']=present(resource)==(-1,errno.ENOENT)
+        # This fixture is a PIPE_BUFFER/R8 source, not a capture texture.
+        # The separate gpu_capture_format_check verifies valid ARGB/XRGB sources.
+        cases['owned_buffer_present_rejected']=present(resource)==(-1,errno.EINVAL)
         ioctl(target,0x09,struct.pack('<II',private_handle,0))
         ioctl(target,0x09,struct.pack('<II',imported,0))
         os.close(target);target=-1
