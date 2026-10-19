@@ -1707,6 +1707,10 @@ static void output_bind(struct wl_client *client, void *data,
                         w, h, 60000);
     if (version >= 2) {
         wl_output_send_scale(r, 1);
+        if (version >= 4) {
+            wl_output_send_name(r, "BROOK-1");
+            wl_output_send_description(r, "Brook virtual display");
+        }
         wl_output_send_done(r);
     }
 }
@@ -2823,7 +2827,7 @@ int main(int argc, char **argv)
     if (!wl_global_create(g_display, &xdg_wm_base_interface, 3, NULL, wm_base_bind)) return 1;
     if (!wl_global_create(g_display, &wl_seat_interface, 5, NULL, seat_bind)) return 1;
     if (!wl_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, text_input_manager_bind)) return 1;
-    if (!wl_global_create(g_display, &wl_output_interface, 3, NULL, output_bind)) return 1;
+    if (!wl_global_create(g_display, &wl_output_interface, 4, NULL, output_bind)) return 1;
     if (!wl_global_create(g_display, &zxdg_decoration_manager_v1_interface, 1, NULL, deco_mgr_bind)) return 1;
     if (!wl_global_create(g_display, &org_kde_kwin_server_decoration_manager_interface, 1, NULL, kde_decoration_manager_bind)) return 1;
     if (!wl_global_create(g_display, &wp_viewporter_interface, 1, NULL, viewporter_bind)) return 1;

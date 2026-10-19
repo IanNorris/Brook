@@ -28,6 +28,11 @@ stdenv.mkDerivation {
   doCheck = true;
 
   checkPhase = ''
+    $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
+        output-identity-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        -L${wayland}/lib -lwayland-server -o output-identity-test
+    ./output-identity-test
     $CC -O2 -UNDEBUG -Wall -Wextra surface-tree-test.c -o surface-tree-test
     ./surface-tree-test
     $CC -O2 -Wall -Wextra -I${wayland.dev}/include -I. \
