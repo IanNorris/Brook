@@ -12583,13 +12583,14 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         if (usd->state == UnixSocketData::State::Connected) return -106; // EISCONN
         if (usd->state == UnixSocketData::State::Listening) return -EINVAL;
-        if (addrVal < 0x1000) return -EFAULT;
-        auto* ua = reinterpret_cast<const SockAddrUn*>(addrVal);
-        if (ua->sun_family != AF_UNIX) return -EINVAL;
+        if (addrLen <= 2 || addrLen > sizeof(SockAddrUn)) return -EINVAL;
+        SockAddrUn address{};
+        if (!CopyFromUser(&address, addrVal, addrLen)) return -EFAULT;
+        if (address.sun_family != AF_UNIX) return -EINVAL;
 
         // Copy destination path
         char path[108] = {};
-        for (int i = 0; i < 107 && ua->sun_path[i]; i++) path[i] = ua->sun_path[i];
+        for (int i = 0; i < 107 && address.sun_path[i]; i++) path[i] = address.sun_path[i];
 
         DbgPrintf("sys_connect: AF_UNIX fd=%d path='%s'\n", fd, path);
 
@@ -12667,10 +12668,12 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
-    (void)addrLen;
-
-    auto* uaddr = reinterpret_cast<const brook::SockAddrIn*>(addrVal);
-    if (!uaddr) return -EFAULT;
+    // Snapshot the supplied sockaddr before logging or entering the network
+    // stack. Copy only the advertised length, including storage-size callers.
+    if (addrLen < sizeof(brook::SockAddrIn) || addrLen > 128) return -EINVAL;
+    alignas(brook::SockAddrIn) uint8_t address[128]{};
+    if (!CopyFromUser(address, addrVal, addrLen)) return -EFAULT;
+    const auto* uaddr = reinterpret_cast<const brook::SockAddrIn*>(address);
 
     DbgPrintf("sys_connect: fd=%d sockIdx=%d type=%d addr=%u.%u.%u.%u:%u\n",
                  fd, sockIdx, brook::SockGetType(sockIdx),

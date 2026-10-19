@@ -128,3 +128,47 @@ Protect every remaining access route before enabling mapped resize generally,
 then connect the resize coordinator, inject backend/EOF recovery failures and
 renew bootstrap/browser/workload acceptance. No SQLite WAL or Firefox audio fix
 is claimed by these copies alone.
+
+## Connect address-copy follow-up (2026-10-19)
+
+The pathname AF_UNIX `connect` path still dereferenced the caller's sockaddr
+directly and read beyond the supplied length while scanning its path. The
+AF_INET path also passed a raw user address to logging and the network stack.
+Both now validate supported lengths and snapshot the supplied bytes through
+`CopyFromUser` before using the address. The Unix snapshot is zero-initialized,
+so a short supplied path cannot make the scanner inspect adjacent user memory.
+AF_INET also accepts the usual 128-byte sockaddr-storage callers while copying
+only their advertised length.
+
+`scripts/workloads/connect_user_memory.py` passes 21 cases both on Linux and
+through real Brook syscalls as UID1000. These cover null/kernel/protected-page
+addresses, a family or final byte crossing into a protected page, valid-buffer
+short/oversized lengths, and Unix/IPv4 addresses ending exactly at a page
+boundary. A 128-byte IPv4 storage address at the boundary also succeeds. UDP
+connects only set a local destination; this fixture sends no network packets.
+The absent Unix destination case checks that bounded copying reaches name
+lookup; its ENOENT/ECONNREFUSED alternatives do not establish pathname-socket
+namespace conformance.
+
+Candidate session `3ea046c94bdc4db995547fe8978c52f2` used eight CPUs,
+4 GiB and fresh private disks with the hardware virgl compositor. All 52 host
+suites and both supported compiled entry/startup audits passed for its exact
+kernel. After the guest probe, Quake GL3's demo and Mousepad rendered and closed
+normally, with full launch lineages drained. All 2,308 tracked GPU mappings
+(65,867,776 bytes) were released without failure or quarantine. Audio streams
+emptied; checked shutdown, owned launcher/QEMU exit zero and all three offline
+filesystem checks passed. All ten existing document fixtures were preserved,
+including the latest Codium save and its Brook ownership.
+
+Evidence: `build/workloads/connect-user-copy-20261019/candidate/`, including
+`acceptance-audit.json`, `guest-result.json`, `linux-reference.json`, the exact
+`tested-fixture.py`, command output and frozen kernel/module artifacts.
+
+This is targeted argument-copy coverage. Invalid ranges can be rejected before
+the REP copy instruction, so EFAULT results alone do not prove live fault-fixup
+execution. This fixture does not exercise concurrent unmap/protection changes,
+all address/state error-ordering combinations, abstract Unix names, other
+socket operations or every syscall handler. Existing assembly/register fixtures
+and their separate limitations still apply. The source finding has not been
+connected causally to the intermittent pre-Wayland boot panic; that investigation
+remains open.
