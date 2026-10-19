@@ -2171,6 +2171,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     mc.rip    = frame->rcx;     // user RIP (stored in RCX by syscall)
     mc.eflags = frame->rflags;
     mc.cs     = GDT_USER_CODE;
+    mc.ss     = GDT_USER_DATA;
 
     // Linux restarts selected interrupted syscalls after a signal handler
     // returns when the handler was installed with SA_RESTART. Bash relies on

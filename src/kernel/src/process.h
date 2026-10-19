@@ -96,11 +96,14 @@ struct SignalMcontext {
     uint64_t rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp;
     uint64_t rip;
     uint64_t eflags;
-    uint16_t cs, gs, fs, __pad0;
+    uint16_t cs, gs, fs, ss;
     uint64_t err, trapno, oldmask, cr2;
     uint64_t fpstate;          // NULL (no FPU state saved)
     uint64_t __reserved1[8];
 };
+static_assert(__builtin_offsetof(SignalMcontext, ss) == 150,
+              "Linux x86-64 sigcontext SS must be the fourth selector");
+static_assert(sizeof(SignalMcontext) == 256, "Linux x86-64 sigcontext layout");
 
 struct SignalStack {
     uint64_t ss_sp;

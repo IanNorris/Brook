@@ -1704,6 +1704,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         mc.rip    = ef->rip;
         mc.eflags = ef->rflags;
         mc.cs     = GDT_USER_CODE;
+        mc.ss     = static_cast<uint16_t>(ef->ss);
         mc.err    = ef->errorCode;
         mc.trapno = vector;
         mc.cr2    = cr2;
