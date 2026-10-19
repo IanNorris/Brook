@@ -8,6 +8,7 @@
 #include "posix_timer.h"
 #include "timerfd_state.h"
 #include "sync_file.h"
+#include "gpu_reservation.h"
 #include "busybox_applets.h"
 #include "cpu.h"
 #include "gdt.h"
@@ -2935,6 +2936,8 @@ struct DrmResource {
     uint32_t blobFlags;
     GpuHostMapping hostMapping;
     bool everExported;
+    KMutex reservationLock;
+    GpuReservation reservation;
     DrmResource* retiredNext;
 };
 // Final callbacks only enqueue: GPU waits never enter mapping/FD cleanup locks.
@@ -2954,8 +2957,9 @@ static void DrmRetirementWorker(void*) {
         g_drmRetiredResources=resource->retiredNext;
         KMutexUnlock(&g_drmRetirementLock);
         const auto* ga=GpuAppGet();
-        const bool retired=!resource->gres || (ga && ga->RetireResource &&
-            ga->RetireResource(resource->owner->ctxId,static_cast<int32_t>(resource->gres))==0);
+        const bool safe=resource->reservation.Ready();
+        const bool retired=safe && (!resource->gres || (ga && ga->RetireResource &&
+            ga->RetireResource(resource->owner->ctxId,static_cast<int32_t>(resource->gres))==0));
         if (!retired) {
             __atomic_fetch_add(&g_drmBackingDiagnostics.quarantinedResources,1,__ATOMIC_RELAXED);
             const uint64_t bytes=(static_cast<uint64_t>(resource->backingBytes)+4095)&~uint64_t{4095};
@@ -6224,17 +6228,38 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
                 eb.syncobj_stride || eb.num_in_syncobjs || eb.num_out_syncobjs ||
                 (eb.size&3u) || eb.size>60u*1024u-32u || eb.num_bo_handles>DRM_MAX_GEM) return -EINVAL;
             if ((eb.flags&2u) && !UserBufferWritable(arg,sizeof(eb))) return -EFAULT;
-            for(uint32_t i=0;i<eb.num_bo_handles;++i) {
-                uint32_t handle=0;
-                if (!CopyFromUser(&handle,eb.bo_handles+uint64_t{i}*4,4)) return -EFAULT;
-                if (!DrmGemGet(dctx,handle)) return -ENOENT;
-            }
+            struct BoSnapshot {
+                uint32_t* data;
+                ~BoSnapshot(){kfree(data);}
+            } handles{eb.num_bo_handles?static_cast<uint32_t*>(kmalloc(eb.num_bo_handles*sizeof(uint32_t))):nullptr};
+            if(eb.num_bo_handles && !handles.data)return -ENOMEM;
+            if(eb.num_bo_handles && !CopyFromUser(handles.data,eb.bo_handles,eb.num_bo_handles*sizeof(uint32_t)))return -EFAULT;
+            for(uint32_t i=0;i<eb.num_bo_handles;++i)if(!DrmGemGet(dctx,handles.data[i]))return -ENOENT;
             auto* commands=eb.size ? static_cast<uint32_t*>(kmalloc(eb.size)) : nullptr;
             if (eb.size && !commands) return -ENOMEM;
             if (eb.size && !CopyFromUser(commands,eb.command,eb.size)) {kfree(commands);return -EFAULT;}
+            // BO reservations are also dependencies when no fd was requested.
+            // Retain a pending marker until this exact selected timeline completes.
+            uint32_t begun=0;
+            for(;begun<eb.num_bo_handles;++begun) {
+                auto* gem=DrmGemGet(dctx,handles.data[begun]);
+                KMutexLock(&gem->resource->reservationLock);
+                const bool admitted=gem->resource->reservation.Begin();
+                KMutexUnlock(&gem->resource->reservationLock);
+                if(!admitted)break;
+            }
             const auto* ga=GpuAppGet();
-            const int result=ga && ga->SubmitVenus ?
-                ga->SubmitVenus(dctx->owner->ctxId,commands,eb.size/4,eb.ring_idx,(eb.flags&2u)!=0) : -1;
+            const bool admitted=begun==eb.num_bo_handles;
+            const int result=admitted && ga && ga->SubmitVenus ?
+                ga->SubmitVenus(dctx->owner->ctxId,commands,eb.size/4,eb.ring_idx,(eb.flags&2u)!=0 || eb.num_bo_handles!=0) : -1;
+            for(uint32_t i=0;i<begun;++i) {
+                auto* gem=DrmGemGet(dctx,handles.data[i]);
+                if(gem) {
+                    KMutexLock(&gem->resource->reservationLock);
+                    gem->resource->reservation.Finish(!admitted || result==0);
+                    KMutexUnlock(&gem->resource->reservationLock);
+                }
+            }
             kfree(commands);
             if (result<0) return -EIO;
             if (eb.flags&2u) {
@@ -6429,6 +6454,53 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     }
     // libsync uses this query to distinguish a sync_file from an arbitrary fd.
     if(cmd==SYNC_FILE_INFO_IOCTL)return -25;
+
+    if(fde->type==FdType::DrmPrime) {
+        if(!fde->handle)return -EBADF;
+        struct FenceIoctl {uint32_t flags;int32_t fd;};
+        static_assert(sizeof(FenceIoctl)==8);
+        constexpr uint32_t exportFence=0xc0086202,importFence=0x40086203;
+        if(cmd!=exportFence && cmd!=importFence)return -25;
+        FenceIoctl request{};
+        if(!CopyFromUser(&request,arg,sizeof(request)))return -EFAULT;
+        if(!request.flags || (request.flags&~3u))return -EINVAL;
+        auto* resource=static_cast<DrmPrimeObj*>(fde->handle)->resource;
+        if(cmd==importFence) {
+            if(request.fd<0)return -EINVAL;
+            FdRef source(proc,request.fd);
+            if(!source || source->type!=FdType::SyncFile || !source->handle)return -EINVAL;
+            KMutexLock(&resource->reservationLock);
+            const bool accepted=resource->reservation.ImportCompleted(request.flags);
+            KMutexUnlock(&resource->reservationLock);
+            return accepted?0:-EIO;
+        }
+        if(!UserBufferWritable(arg,sizeof(request)))return -EFAULT;
+        if(resource->owner->config.capsetId!=4) {
+            const auto* ga=GpuAppGet();
+            if(!ga || !ga->PresentBarrier || ga->PresentBarrier(resource->owner->ctxId)<0)return -EIO;
+        }
+        // This implementation exports completed snapshots. Wait for admitted
+        // BO submissions rather than dropping their dependencies from the fd.
+        const uint64_t deadline=ClockNowNs(1)+5000000000ull;
+        for(;;) {
+            KMutexLock(&resource->reservationLock);
+            const bool uncertain=resource->reservation.uncertain;
+            const bool pending=resource->reservation.pending!=0;
+            KMutexUnlock(&resource->reservationLock);
+            if(uncertain)return -EIO;
+            if(!pending)break;
+            if(HasPendingSignals())return -EINTR;
+            if(ClockNowNs(1)>=deadline)return -110; // ETIMEDOUT
+            extern volatile uint64_t g_lapicTickCount;
+            proc->wakeupTick=g_lapicTickCount+1;
+            SchedulerBlockInterruptible(proc);
+        }
+        const int descriptor=CreateCompletedSyncFile(proc);
+        if(descriptor<0)return descriptor;
+        request.fd=descriptor;
+        if(!CopyToUser(arg,&request,sizeof(request))) {CloseProcessFd(proc,descriptor);return -EFAULT;}
+        return 0;
+    }
 
     // FIONBIO / FIONREAD are socket ioctls, but their Linux request numbers
     // live in the same 0x54xx range as terminal ioctls.

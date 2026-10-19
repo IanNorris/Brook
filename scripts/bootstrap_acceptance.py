@@ -27,7 +27,7 @@ import server
 # Independent expected inventory for the source revision under acceptance.
 # Keep this in step with src/tests/host/CMakeLists.txt; never accept whatever
 # count a partial build happens to report.
-NATIVE_TEST_COUNT = 56
+NATIVE_TEST_COUNT = 57
 NATIVE_PASS_MARKER = f"100% tests passed, 0 tests failed out of {NATIVE_TEST_COUNT}"
 
 

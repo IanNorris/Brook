@@ -84,3 +84,29 @@ New fences are read-only, CLOEXEC and non-seekable; their readiness cannot be
 consumed or signaled by the recipient. Only a verified selected-timeline wait
 can create them. DMA-BUF reservation ioctls remain unimplemented at this
 checkpoint, so native unstaged presentation is not enabled.
+
+### Canonical DMA-BUF reservations checkpoint
+
+Linux reference: `build/workloads/vulkan-desktop-reservation-20261019/linux3-intel/`.
+Brook: `build/workloads/vulkan-desktop-reservation-20261019/candidate/`, kernel
+SHA-256 `9c95d923c456baf15a549279873a605199e79418334e6499b557910779eb782f`,
+ABI 31. The shared raw probe passes import/export READ, WRITE and RW flags,
+invalid flags/descriptors, read-only copyout failure without a descriptor leak,
+and aliases after closing original GEM/DRM/PRIME descriptors. The completed
+reservation belongs to the canonical resource. Listed Venus BO submissions
+wait for their selected timeline even when no outgoing fence was requested;
+uncertain completion prevents export and safe retirement. Export waits at most
+five seconds for admitted submissions and can return EINTR/ETIMEDOUT instead
+of Linux's unsignaled fence. This bounded, completed-only subset is intentional.
+
+All seven guest commands pass, including queue-signaled Vulkan semaphore
+readback and persistent hardware GL. Resources return to zero, heap integrity,
+checked shutdown and four offline filesystem checks pass. All 12 document
+fixtures and saved profiles match the checked seed. All 57 host tests pass.
+
+This is not yet sufficient for direct presentation: ordinary Venus shared-ring
+commands may omit BO lists. Capture must require a current-frame imported WRITE
+fence and enforce producer-buffer release ordering. GL export currently fences
+the creating context; it does not prove completion of writes from another
+importing GL context. Cross-context rendering must be rejected or tracked before
+the new image-import path can claim that guarantee.

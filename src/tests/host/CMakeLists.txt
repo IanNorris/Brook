@@ -392,3 +392,6 @@ add_host_test(test_gpu_aperture)
 
 add_host_test(test_dmabuf_layout)
 target_compile_options(test_dmabuf_layout PRIVATE -UNDEBUG)
+
+add_host_test(test_gpu_reservation)
+target_compile_options(test_gpu_reservation PRIVATE -UNDEBUG)

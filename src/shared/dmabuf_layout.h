@@ -6,8 +6,8 @@
  * LINEAR and validate this same extent against its canonical resource size. */
 #define BROOK_DMABUF_XRGB8888 0x34325258u
 #define BROOK_DMABUF_ARGB8888 0x34325241u
-#define BROOK_DMABUF_MOD_LINEAR UINT64_C(0)
-#define BROOK_DMABUF_MOD_IMPLICIT UINT64_C(0x00ffffffffffffff)
+#define BROOK_DMABUF_MOD_LINEAR 0ull
+#define BROOK_DMABUF_MOD_IMPLICIT 0x00ffffffffffffffull
 struct BrookDmabufLayout {
     uint32_t width,height,fourcc,stride,offset,flags;
     uint64_t modifier;

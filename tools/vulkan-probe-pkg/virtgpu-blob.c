@@ -1,6 +1,10 @@
 // Raw HOST3D blob lifetime/bounds regression, shared by Linux and Brook.
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/dma-buf.h>
+#include <linux/sync_file.h>
+#include <sys/eventfd.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +37,44 @@ static void* map(int fd,uint32_t handle,size_t length) {
     if(ioctl(fd,DRM_IOCTL_VIRTGPU_MAP,&m))return MAP_FAILED;
     return mmap(NULL,length,PROT_READ|PROT_WRITE,MAP_SHARED,fd,m.offset);
 }
+static int descriptor_count(void) {
+    int count=0;
+    for(int fd=0;fd<1024;++fd)if(fcntl(fd,F_GETFD)>=0)++count;
+    return count;
+}
+static int fence_contract(int prime) {
+    const unsigned before=descriptor_count();
+    for(uint32_t flags=1;flags<=3;++flags) {
+        struct dma_buf_export_sync_file out={.flags=flags,.fd=-1};
+        CHECK(!ioctl(prime,DMA_BUF_IOCTL_EXPORT_SYNC_FILE,&out));CHECK(out.fd>=0);
+        CHECK(fcntl(out.fd,F_GETFD)&FD_CLOEXEC);
+        struct pollfd fence_ready={.fd=out.fd,.events=POLLIN};
+        CHECK(poll(&fence_ready,1,10000)==1 && fence_ready.revents==POLLIN);
+        struct sync_file_info info={0};CHECK(!ioctl(out.fd,SYNC_IOC_FILE_INFO,&info));CHECK(info.status==1);
+        struct dma_buf_import_sync_file in={.flags=flags,.fd=out.fd};
+        CHECK(!ioctl(prime,DMA_BUF_IOCTL_IMPORT_SYNC_FILE,&in));
+        info=(struct sync_file_info){0}; // query again; the first ioctl filled num_fences
+        CHECK(!ioctl(out.fd,SYNC_IOC_FILE_INFO,&info)); // import never consumes fd
+        close(out.fd);
+    }
+    for(uint32_t flags=0;flags<=8;flags+=4) {
+        struct dma_buf_export_sync_file out={.flags=flags,.fd=-1};
+        errno=0;CHECK(ioctl(prime,DMA_BUF_IOCTL_EXPORT_SYNC_FILE,&out)==-1 && errno==EINVAL);
+        struct dma_buf_import_sync_file in={.flags=flags,.fd=-1};
+        errno=0;CHECK(ioctl(prime,DMA_BUF_IOCTL_IMPORT_SYNC_FILE,&in)==-1 && errno==EINVAL);
+    }
+    struct dma_buf_import_sync_file in={.flags=3,.fd=-1};
+    errno=0;CHECK(ioctl(prime,DMA_BUF_IOCTL_IMPORT_SYNC_FILE,&in)==-1 && errno==EINVAL);
+    int event=eventfd(1,EFD_CLOEXEC);CHECK(event>=0);in.fd=event;
+    errno=0;CHECK(ioctl(prime,DMA_BUF_IOCTL_IMPORT_SYNC_FILE,&in)==-1 && errno==EINVAL);close(event);
+    in.fd=0x7fffffff;errno=0;CHECK(ioctl(prime,DMA_BUF_IOCTL_IMPORT_SYNC_FILE,&in)==-1 && errno==EINVAL);
+    void* page=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(page!=MAP_FAILED);
+    *(struct dma_buf_export_sync_file*)page=(struct dma_buf_export_sync_file){.flags=3,.fd=-1};
+    CHECK(!mprotect(page,4096,PROT_READ));errno=0;
+    CHECK(ioctl(prime,DMA_BUF_IOCTL_EXPORT_SYNC_FILE,page)==-1 && errno==EFAULT);
+    CHECK(!munmap(page,4096));CHECK((unsigned)descriptor_count()==before);
+    return 0;
+}
 int main(void) {
     int source=context();CHECK(source>=0);
     uint32_t handle=create(source,8192);CHECK(handle);
@@ -45,7 +87,16 @@ int main(void) {
     struct drm_prime_handle imported={.fd=prime.fd};
     CHECK(!ioctl(target,DRM_IOCTL_PRIME_FD_TO_HANDLE,&imported));
     uint8_t* alias=map(target,imported.handle,8192);CHECK(alias!=MAP_FAILED);
+    struct drm_virtgpu_execbuffer submit={.flags=VIRTGPU_EXECBUF_RING_IDX,.ring_idx=0,
+        .num_bo_handles=1,.bo_handles=(uintptr_t)&handle,.fence_fd=-1};
+    CHECK(!ioctl(source,DRM_IOCTL_VIRTGPU_EXECBUFFER,&submit)); // implicit reservation, no outgoing fd
+    struct drm_virtgpu_execbuffer malformed=submit;malformed.bo_handles=1;errno=0;
+    CHECK(ioctl(source,DRM_IOCTL_VIRTGPU_EXECBUFFER,&malformed)==-1 && errno==EFAULT);
+    CHECK(!fence_contract(prime.fd));
+    struct drm_prime_handle second={.handle=imported.handle,.flags=DRM_CLOEXEC|DRM_RDWR};
+    CHECK(!ioctl(target,DRM_IOCTL_PRIME_HANDLE_TO_FD,&second));
     CHECK(!drop(source,handle));close(source);close(prime.fd);
+    CHECK(!fence_contract(second.fd));
     for(unsigned i=0;i<8192;++i)CHECK(alias[i]==(uint8_t)(i*17+3));
     struct drm_virtgpu_map partial={.handle=imported.handle};
     CHECK(!ioctl(target,DRM_IOCTL_VIRTGPU_MAP,&partial));
@@ -54,6 +105,7 @@ int main(void) {
     // page token. The reservation must still prevent aliasing a later object.
     CHECK(middle==MAP_FAILED&&errno==EINVAL);
     CHECK(!drop(target,imported.handle));close(target);
+    CHECK(!fence_contract(second.fd));close(second.fd);
     pid_t child=fork();CHECK(child>=0);
     if(!child) {
         if(mprotect(alias,8192,PROT_NONE)||mprotect(alias,8192,PROT_READ|PROT_WRITE))_exit(2);
@@ -81,6 +133,6 @@ int main(void) {
     uint32_t fresh=0;
     for(unsigned i=0;i<200&&!fresh;++i) {fresh=create(fd,4096);if(!fresh)usleep(10000);}
     CHECK(fresh);CHECK(!drop(fd,fresh));close(fd);
-    printf("{\"blob_contract_passed\":true,\"large_extents\":%u,\"shared_fork_remap\":true}\n",count);
+    printf("{\"blob_contract_passed\":true,\"large_extents\":%u,\"shared_fork_remap\":true,\"dma_buf_fences\":true}\n",count);
     return 0;
 }
