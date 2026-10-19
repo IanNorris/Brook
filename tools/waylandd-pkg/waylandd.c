@@ -102,6 +102,7 @@ struct brook_wm_event {
 #define WM_EVT_RESIZED         0x83
 
 static struct wl_display *g_display = NULL;
+static uint32_t next_serial(void);
 static volatile sig_atomic_t g_shutdown = 0;
 static int g_commit_count = 0;
 /* Opt-in diagnostics: no extra clock reads or logging in normal operation. */
@@ -230,12 +231,12 @@ struct brook_surface {
     struct wl_resource *xdg_toplevel;
     struct wl_resource *xdg_popup;        /* popup role (mutex with toplevel) */
     int  xdg_initial_commit_done;
-    int  xdg_acked;
+    int  xdg_acked; /* Initial handshake, not acknowledgement of the newest state. */
     int  toplevel_activated;
     int32_t window_geometry_w, window_geometry_h;
     int32_t pending_geometry_w, pending_geometry_h;
     int window_geometry_pending;
-    uint32_t next_configure_serial;
+    uint32_t next_configure_serial; /* Last emitted serial, from next_serial(). */
     /* Popup geometry derived from positioner at get_popup time. */
     int32_t popup_w, popup_h;
     int32_t popup_x, popup_y;
@@ -604,7 +605,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
          * the SHM pool allocation stay sane. */
         xdg_toplevel_send_configure(s->xdg_toplevel, 800, 600, &states);
         wl_array_release(&states);
-        uint32_t serial = ++s->next_configure_serial;
+        uint32_t serial = s->next_configure_serial = next_serial();
         xdg_surface_send_configure(s->xdg_surface, serial);
         fprintf(stderr, "[waylandd] xdg initial configure sent serial=%u (800x600)\n", serial);
         return;
@@ -614,7 +615,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         int32_t pw = s->popup_w > 0 ? s->popup_w : 200;
         int32_t ph = s->popup_h > 0 ? s->popup_h : 100;
         xdg_popup_send_configure(s->xdg_popup, s->popup_x, s->popup_y, pw, ph);
-        uint32_t serial = ++s->next_configure_serial;
+        uint32_t serial = s->next_configure_serial = next_serial();
         xdg_surface_send_configure(s->xdg_surface, serial);
         fprintf(stderr, "[waylandd] xdg popup initial configure sent serial=%u %dx%d\n",
                 serial, pw, ph);
@@ -1147,7 +1148,7 @@ static void xdg_popup_reposition(struct wl_client *c, struct wl_resource *r,
         xdg_popup_send_configure(r, s->popup_x, s->popup_y,
                                  s->popup_w, s->popup_h);
         if (s->xdg_surface) {
-            uint32_t serial = ++s->next_configure_serial;
+            uint32_t serial = s->next_configure_serial = next_serial();
             xdg_surface_send_configure(s->xdg_surface, serial);
         }
         popup_apply_position(s);
@@ -2100,7 +2101,6 @@ static void dispatch_surface_event(struct brook_surface *s,
             wl_array_release(&states);
             uint32_t serial = next_serial();
             s->next_configure_serial = serial;
-            s->xdg_acked = 0;
             xdg_surface_send_configure(s->xdg_surface, serial);
             fprintf(stderr, "[waylandd] WM_EVT_RESIZED wm=%u → configure %dx%d serial=%u\n",
                     s->wm_id, neww, newh, serial);
@@ -2132,7 +2132,9 @@ static void toplevel_set_activated(struct brook_surface *surface, int active) {
     xdg_toplevel_send_configure(surface->xdg_toplevel, width, height, &states);
     wl_array_release(&states);
     surface->next_configure_serial = next_serial();
-    surface->xdg_acked = 0;
+    /* A mapped client can commit its current state while this configure is
+     * pending. Resetting the initial-handshake gate would consume/release its
+     * buffers without publishing them, indefinitely freezing the window. */
     xdg_surface_send_configure(surface->xdg_surface, surface->next_configure_serial);
 }
 

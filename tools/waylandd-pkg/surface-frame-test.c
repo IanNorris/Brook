@@ -73,6 +73,7 @@ int main(void) {
     surface.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,36);
     assert(surface.xdg_surface && surface.xdg_toplevel);
     surface.xdg_initial_commit_done=1;
+    surface.xdg_acked=1;
     wl_resource_set_user_data(surface.xdg_surface,&surface);
     surface.vfb_w=852;surface.vfb_h=652; // includes the CSD shadow margins
     xdg_surface_set_window_geometry(client,surface.xdg_surface,26,26,800,600);
@@ -116,7 +117,7 @@ int main(void) {
         }
         i+=size/4;
     }
-    assert(surface.toplevel_activated && !surface.xdg_acked);
+    assert(surface.toplevel_activated && surface.xdg_acked);
     assert(activations==1 && configures==1);
     assert(axes[0]==1 && axes[1]==1);
     assert(enters[0]==1 && enters[1]==1 && keys[0]==2 && keys[1]==2);
