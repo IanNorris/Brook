@@ -29,6 +29,8 @@
 #include "virgl_submit.h"
 #include "retirement_protocol.h"
 #include "resource_ids.h"
+#include "aperture_allocator.h"
+#include "cpu.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -49,6 +51,7 @@ MODULE_IMPORT_SYMBOL(DisplayRegister);
 MODULE_IMPORT_SYMBOL(DisplaySet3DActive);
 MODULE_IMPORT_SYMBOL(GpuCompositorRegister);
 MODULE_IMPORT_SYMBOL(GpuAppRegister);
+MODULE_IMPORT_SYMBOL(CpuWriteCombiningReady);
 MODULE_IMPORT_SYMBOL(TtyGetFramebuffer);
 MODULE_IMPORT_SYMBOL(TtyRemap);
 MODULE_IMPORT_SYMBOL(CompositorRemap);
@@ -561,6 +564,7 @@ struct VirtioPciCap {
 static uint8_t  g_hostVisBar    = 0xFF;
 static uint64_t g_hostVisOffset = 0;
 static uint64_t g_hostVisLength = 0;
+static uint64_t g_hostVisPhysical = 0;
 static uint64_t g_hostCapsetMask = 0;
 static uint32_t g_hostCapsetMaxVersion[64] = {};
 
@@ -723,6 +727,10 @@ static bool g_controlQueuePoisoned;
 static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = false)
 {
     if (g_controlQueuePoisoned) return 0;
+    const auto* requestHeader=reinterpret_cast<const VirtioGpuCtrlHdr*>(g_cmdBuf+CMD_REQ_OFF);
+    const bool timeline=fenced && (requestHeader->flags&2u);
+    const uint32_t expectedContext=requestHeader->ctx_id;
+    const uint8_t expectedRing=requestHeader->ring_idx;
     uint64_t expectedFence=0;
     if (fenced) {
         auto* hdr = reinterpret_cast<VirtioGpuCtrlHdr*>(g_cmdBuf + CMD_REQ_OFF);
@@ -762,9 +770,14 @@ static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = f
             const auto* reply=reinterpret_cast<const VirtioGpuCtrlHdr*>(g_cmdBuf+CMD_RESP_OFF);
             static_assert(sizeof(*reply)==brook::GpuControlHeaderBytes);
             if (!brook::GpuControlCompletionValid(head,g_usedRing[slot].id,len,respCap,
-                                                  reply->flags,reply->fence_id,expectedFence)) {
+                                                  reply->flags,reply->fence_id,expectedFence) ||
+                // QEMU10.2.2 echoes fence+context, not INFO_RING_IDX/ring_idx.
+                // The globally unique fence belongs to our single owned request.
+                (fenced && reply->ctx_id!=expectedContext)) {
                 g_controlQueuePoisoned=true;
-                SerialPuts("virtio_gpu: invalid control completion; control queue quarantined\n");
+                SerialPrintf("virtio_gpu: invalid completion head=%u/%u bytes=%u/%u flags=0x%x fence=%lu/%lu ctx=%u/%u ring=%u/%u timeline=%u; queue quarantined\n",
+                             g_usedRing[slot].id,head,len,respCap,reply->flags,reply->fence_id,expectedFence,
+                             reply->ctx_id,expectedContext,unsigned(reply->ring_idx),unsigned(expectedRing),timeline?1u:0u);
                 return 0;
             }
             return len;
@@ -882,7 +895,7 @@ static void QueryCapsets()
     }
 
     if (g_haveVenusCapset)
-        SerialPuts("virtio_gpu: Venus capset present (app blob transport not yet enabled)\n");
+        SerialPuts("virtio_gpu: Venus capset present (app transport capability checked separately)\n");
 }
 
 // Fetch a capset blob (virgl_caps) from the host by id+version via the
@@ -2707,17 +2720,20 @@ static inline bool AppResValid(int32_t ctxId, uint32_t gres)
 
 static brook::GpuAppCapabilities AppCapabilities()
 {
-    // Do not expose Venus until blob memory and submission are implemented.
-    return {g_hostCapsetMask & ((uint64_t{1} << VIRTIO_GPU_CAPSET_VIRGL) |
-                               (uint64_t{1} << VIRTIO_GPU_CAPSET_VIRGL2)),
-            (g_gpu3dFeatures & VIRTIO_GPU_F_CONTEXT_INIT) != 0, false, false};
+    const bool context = (g_gpu3dFeatures & VIRTIO_GPU_F_CONTEXT_INIT) != 0;
+    const bool blobs = context && (g_gpu3dFeatures & VIRTIO_GPU_F_RESOURCE_BLOB) &&
+        g_haveVenusCapset && g_hostVisPhysical && CpuWriteCombiningReady();
+    uint64_t mask = g_hostCapsetMask & ((uint64_t{1} << VIRTIO_GPU_CAPSET_VIRGL) |
+                                      (uint64_t{1} << VIRTIO_GPU_CAPSET_VIRGL2));
+    if (blobs) mask |= uint64_t{1} << VIRTIO_GPU_CAPSET_VENUS;
+    return {mask, context, blobs, blobs};
 }
 
 static int32_t AppCtxCreate(uint32_t pid, const brook::GpuContextConfig& config = {})
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     const auto caps = AppCapabilities();
-    if (!g_compReady || config.capsetId >= 64 || config.numRings > 64 ||
+    if (!g_gpu3dWorks || g_controlQueuePoisoned || config.capsetId >= 64 || config.numRings > 64 ||
         config.pollRingsMask || !(caps.capsetMask & (uint64_t{1} << config.capsetId))) return -1;
     for (uint32_t i = 0; i < MAX_APP_CTX; ++i)
     {
@@ -2767,6 +2783,131 @@ static void AppCtxDestroy(int32_t ctxId)
     SerialPrintf("virtio_gpu: app virgl ctx %d destroyed\n", ctxId);
 }
 
+static bool AppFenceLocked(uint32_t ctxId);
+
+// HOST3D blobs have host aperture backing, never PMM frames or guest IOVs.
+struct AppBlob {
+    bool used, created, mapped, quarantined, attached;
+    int32_t context;
+    uint32_t resource;
+    uint64_t lease, offset, size;
+};
+static AppBlob g_appBlobs[2048]{};
+static brook::GpuApertureAllocator<> g_appAperture;
+struct __attribute__((packed)) GpuCreateBlobCommand {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t resource, memory, flags, entries;
+    uint64_t blobId, size;
+};
+struct __attribute__((packed)) GpuMapBlobCommand {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t resource, padding;
+    uint64_t offset;
+};
+struct __attribute__((packed)) GpuMapBlobResponse {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t cache, padding;
+};
+static_assert(sizeof(GpuCreateBlobCommand)==56 && sizeof(GpuMapBlobCommand)==40 && sizeof(GpuMapBlobResponse)==32);
+static AppBlob* AppBlobFind(int32_t context, uint32_t resource) {
+    for (auto& blob : g_appBlobs)
+        if (blob.used && blob.context == context && blob.resource == resource) return &blob;
+    return nullptr;
+}
+static int32_t AppSubmitVenusLocked(int32_t ctxId, const uint32_t* commands,
+                                    uint32_t count, uint32_t ring, bool fence) {
+    const auto* ctx = AppCtxFind(ctxId);
+    const uint32_t maximum = (CMD_RESP_OFF-sizeof(VirtioGpuCmdSubmit))/4;
+    if (!ctx || ctx->config.capsetId != VIRTIO_GPU_CAPSET_VENUS ||
+        ring >= ctx->config.numRings || count > maximum || (count && !commands)) return -1;
+    auto* submit = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf+CMD_REQ_OFF);
+    memset(submit,0,sizeof(*submit));
+    submit->hdr.type=VIRTIO_GPU_CMD_SUBMIT_3D;submit->hdr.ctx_id=static_cast<uint32_t>(ctxId);
+    if (fence) { submit->hdr.flags=2;submit->hdr.ring_idx=static_cast<uint8_t>(ring); }
+    submit->size=count*4;
+    if (count) memcpy(g_cmdBuf+sizeof(*submit),commands,count*4);
+    return CmdRespOk(SubmitCommand(sizeof(*submit)+count*4,CMD_RESP_CAP,fence)) ? 0 : -1;
+}
+static int32_t AppSubmitVenus(int32_t ctxId, const uint32_t* commands,
+                              uint32_t count, uint32_t ring, bool fence) {
+    GpuCmdGuard guard;
+    return AppSubmitVenusLocked(ctxId,commands,count,ring,fence);
+}
+static int32_t AppResourceCreateBlob(int32_t ctxId, const brook::GpuBlobCreate& create,
+                                     uint32_t* outResource, brook::GpuHostMapping* mapping) {
+    GpuCmdGuard guard;
+    if (!outResource || !mapping) return -1;
+    *outResource=0;*mapping={};
+    const auto* ctx=AppCtxFind(ctxId);
+    if (!ctx || !AppCapabilities().resourceBlob || create.memory!=2 || (create.flags&~3u) ||
+        !create.size || create.size>~uint64_t{0}-4095) return -1;
+    AppBlob* blob=nullptr;
+    for (auto& candidate:g_appBlobs) if (!candidate.used) {blob=&candidate;break;}
+    if (!blob) return -1;
+    brook::GpuApertureAllocator<>::Extent extent{};
+    if ((create.flags&1u) && !g_appAperture.Allocate(create.size,g_hostVisLength,extent)) return -1;
+    const uint32_t resource=g_appResourceIds.Allocate(static_cast<uint32_t>(ctxId)-APP_FIRST_CTX);
+    if (!resource) { if(extent.lease)g_appAperture.Release(extent.lease);return -1; }
+    *blob={true,false,false,false,false,ctxId,resource,extent.lease,extent.offset,(create.size+4095)&~uint64_t{4095}};
+    *outResource=resource; // canonical kernel owner exists before host publication
+    auto* request=reinterpret_cast<GpuCreateBlobCommand*>(g_cmdBuf+CMD_REQ_OFF);
+    memset(request,0,sizeof(*request));request->hdr.type=0x010c;request->hdr.ctx_id=static_cast<uint32_t>(ctxId);
+    request->resource=resource;request->memory=create.memory;request->flags=create.flags;
+    request->blobId=create.blobId;request->size=blob->size;
+    if (!CmdRespOk(SubmitCommand(sizeof(*request),CMD_RESP_CAP))) {
+        if (g_controlQueuePoisoned) {blob->quarantined=true;return -1;}
+        if (blob->lease)g_appAperture.Release(blob->lease);
+        *blob={};*outResource=0;return -1;
+    }
+    blob->created=true;
+    // GEM handle publication in Linux attaches the resource to this context.
+    if (!CtxAttachResource(static_cast<uint32_t>(ctxId),resource)) return -1;
+    blob->attached=true;
+    if (!(create.flags&1u)) return 0;
+    auto* map=reinterpret_cast<GpuMapBlobCommand*>(g_cmdBuf+CMD_REQ_OFF);
+    memset(map,0,sizeof(*map));map->hdr.type=0x0208;map->resource=resource;map->offset=blob->offset;
+    const uint32_t bytes=SubmitCommand(sizeof(*map),sizeof(GpuMapBlobResponse));
+    const auto* response=reinterpret_cast<const GpuMapBlobResponse*>(g_cmdBuf+CMD_RESP_OFF);
+    if (bytes<sizeof(*response) || response->hdr.type!=0x1106) {
+        if (g_controlQueuePoisoned || (bytes>=sizeof(VirtioGpuCtrlHdr) && response->hdr.type==0x1106))
+            blob->quarantined=true;
+        else {g_appAperture.Release(blob->lease);blob->lease=0;}
+        return -1;
+    }
+    blob->mapped=true;
+    *mapping={g_hostVisPhysical+blob->offset,blob->size,blob->lease,response->cache};
+    SerialPrintf("virtio_gpu: blob ctx=%d res=%u bytes=%lu lease=%lu cache=%u\n",
+                 ctxId,resource,blob->size,blob->lease,response->cache);
+    return 0;
+}
+static int32_t AppRetireBlobLocked(AppBlob* blob) {
+    if (blob->quarantined || g_controlQueuePoisoned) {blob->quarantined=true;return -1;}
+    // Ring0 consumes renderer commands; this is not a Vulkan GPU queue fence.
+    const auto* context=AppCtxFind(blob->context);
+    const bool consumed=context && (context->config.capsetId==VIRTIO_GPU_CAPSET_VENUS ?
+        AppSubmitVenusLocked(blob->context,nullptr,0,0,true)==0 : AppFenceLocked(static_cast<uint32_t>(blob->context)));
+    if (!consumed) {blob->quarantined=true;return -1;}
+    auto control=[&](uint32_t type,uint32_t context=0) {
+        auto* command=reinterpret_cast<VirtioGpuCtxResource*>(g_cmdBuf+CMD_REQ_OFF);
+        memset(command,0,sizeof(*command));command->hdr.type=type;command->hdr.ctx_id=context;command->resource_id=blob->resource;
+        return CmdRespOk(SubmitCommand(sizeof(*command),CMD_RESP_CAP));
+    };
+    if (blob->mapped) {
+        if (!control(0x0209)) {blob->quarantined=true;return -1;}
+        blob->mapped=false;
+    }
+    if (blob->attached && !control(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,static_cast<uint32_t>(blob->context))) {blob->quarantined=true;return -1;}
+    if (blob->created && !control(VIRTIO_GPU_CMD_RESOURCE_UNREF)) {blob->quarantined=true;return -1;}
+    if (blob->lease)g_appAperture.Release(blob->lease);
+    *blob={};return 0;
+}
+static brook::GpuBlobStatistics AppBlobStatistics() {
+    GpuCmdGuard guard;
+    brook::GpuBlobStatistics stats{0,g_appAperture.Count(),g_appAperture.Bytes(),0};
+    for(const auto& blob:g_appBlobs)if(blob.used) {++stats.resources;if(blob.quarantined)++stats.quarantined;}
+    return stats;
+}
+
 static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t target, uint32_t format,
                                    uint32_t bind, uint32_t w, uint32_t h,
                                    uint32_t depth, uint32_t arraySize,
@@ -2775,7 +2916,7 @@ static int32_t AppResourceCreate3D(int32_t ctxId, uint32_t target, uint32_t form
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
-    if (!c || w == 0) return -1;
+    if (!c || c->config.capsetId == VIRTIO_GPU_CAPSET_VENUS || w == 0) return -1;
     const bool isBuffer = (target == PIPE_BUFFER);
     if (!isBuffer && h == 0) return -1;
     uint32_t i = (uint32_t)ctxId - APP_FIRST_CTX;
@@ -2860,7 +3001,7 @@ static int32_t AppSubmit3D(int32_t ctxId, const uint32_t* dwords, uint32_t n)
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
-    if (!c || !dwords || n == 0) return -1;
+    if (!c || c->config.capsetId == VIRTIO_GPU_CAPSET_VENUS || !dwords || n == 0) return -1;
     // Bound the stream to the request region (last page is the response buffer).
     const uint32_t maxDw = ((CMD_PAGES - 1) * 4096 - sizeof(VirtioGpuCmdSubmit)) / 4;
     if (!VirglStreamValid(dwords, n, maxDw)) return -1;
@@ -2882,6 +3023,12 @@ static int32_t AppSubmit3D(int32_t ctxId, const uint32_t* dwords, uint32_t n)
         }
         start = end;
     }
+    // Mesa treats NOWAIT errors other than EBUSY as idle. For this initial
+    // host-backed GL path, complete work synchronously instead of claiming an
+    // untracked asynchronous blob is idle. Guest-backed GL stays unchanged.
+    for (const auto& blob:g_appBlobs)
+        if (blob.used && blob.context==ctxId)
+            return AppFenceLocked(static_cast<uint32_t>(ctxId)) ? 0 : -1;
     return 0;
 }
 
@@ -2903,6 +3050,7 @@ static int32_t AppPresentBarrier(int32_t ctxId)
 static int32_t AppRetireResource(int32_t ctxId,int32_t gres)
 {
     GpuCmdGuard guard;
+    if (auto* blob=AppBlobFind(ctxId,static_cast<uint32_t>(gres))) return AppRetireBlobLocked(blob);
     if (g_controlQueuePoisoned || !AppCtxFind(ctxId) || !AppResValid(ctxId,static_cast<uint32_t>(gres))) return -1;
     auto command=[&](uint32_t type,uint32_t context) {
         auto* req=reinterpret_cast<VirtioGpuCtxResource*>(g_cmdBuf+CMD_REQ_OFF);
@@ -3230,6 +3378,9 @@ static const brook::GpuAppOps g_gpuAppOps = {
     AppPresentBarrier,
     AppRetireResource,
     AppCapabilities,
+    AppResourceCreateBlob,
+    AppSubmitVenus,
+    AppBlobStatistics,
 };
 
 static const brook::GpuCompositorOps g_gpuCompositorOps = {
@@ -4078,7 +4229,16 @@ static int VirtioGpuModuleInit()
         uint64_t base = PciBarMemBase32(dev.bar[g_hostVisBar]);
         if (PciBarIs64(dev.bar[g_hostVisBar]) && g_hostVisBar + 1 < 6)
             base |= uint64_t{dev.bar[g_hostVisBar + 1]} << 32;
-        SerialPrintf("virtio_gpu: host-visible physical base 0x%lx\n", base + g_hostVisOffset);
+        const uint64_t minimum = uint64_t{128} << 30; // above all boot identity/direct aliases
+        if (!PciBarIsIo(dev.bar[g_hostVisBar]) && base <= ~uint64_t{0}-g_hostVisOffset &&
+            g_hostVisLength && !(g_hostVisLength & 4095)) {
+            const uint64_t physical = base + g_hostVisOffset;
+            if (!(physical & 4095) && physical >= minimum &&
+                physical < (uint64_t{1} << 52) && g_hostVisLength <= (uint64_t{1} << 52)-physical)
+                g_hostVisPhysical = physical;
+        }
+        SerialPrintf("virtio_gpu: host-visible physical base 0x%lx usable=%u\n",
+                     base + g_hostVisOffset, g_hostVisPhysical ? 1u : 0u);
     }
     if (g_hostVisBar != 0xFF)
         SerialPrintf("virtio_gpu: host-visible blob region: bar %u off 0x%lx len 0x%lx (%lu MB)\n",
@@ -4238,8 +4398,7 @@ static int VirtioGpuModuleInit()
                 SerialPrintf("virtio_gpu: owned capture self-test -> %s\n",ownedCaptureVerified?"PASS":"FAIL (disabled, uncertain objects retained)");
                 if (ownedCaptureVerified) {
                     GpuCompositorRegister(&g_gpuCompositorOps);
-                    // Same proven 3D path backs per-process app GL contexts.
-                    GpuAppRegister(&g_gpuAppOps);
+
                 } else {
                     // A failed GPU test can leave the host context in error.
                     // Keep the already-registered 2D driver/module alive, but
@@ -4255,6 +4414,7 @@ static int VirtioGpuModuleInit()
         KPrintf("virtio_gpu: secondary head (class %02x:%02x) — not driving display\n",
                 baseClass, subClass);
     }
+    if (g_gpu3dWorks && !g_controlQueuePoisoned) GpuAppRegister(&g_gpuAppOps);
     return 0;
 }
 

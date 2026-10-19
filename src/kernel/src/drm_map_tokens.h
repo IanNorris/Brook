@@ -10,11 +10,13 @@ struct DrmMapTokenAllocator {
     static constexpr uint64_t Last = 0x7ffffffffffff000ULL;
     uint64_t next = First;
 
-    uint64_t Allocate() {
+    uint64_t Allocate(uint64_t bytes = 4096) {
+        if (!bytes || bytes>Last) return 0;
+        const uint64_t span=(bytes+4095)&~uint64_t{4095};
         uint64_t value = __atomic_load_n(&next, __ATOMIC_RELAXED);
         for (;;) {
-            if (value > Last) return 0; // saturated: never wrap/reissue an offset
-            if (__atomic_compare_exchange_n(&next, &value, value + 4096, false,
+            if (value > Last || span>Last+4096-value) return 0;
+            if (__atomic_compare_exchange_n(&next, &value, value + span, false,
                                             __ATOMIC_RELAXED, __ATOMIC_RELAXED))
                 return value;
         }

@@ -1,7 +1,7 @@
 # Vulkan bring-up through Venus
 
 Started: 19 October 2026, based on `fc46b6d4` (the accepted Wine
-checkpoint, now on main). No Vulkan workload has been accepted on Brook.
+checkpoint, now on main). Hardware Vulkan compute/readback now passes on Brook; graphical presentation remains unaccepted.
 Work is isolated on `wip/vulkan-bringup-20261019`; main is unchanged.
 
 ## Target and boundaries
@@ -221,7 +221,7 @@ policies still require distinct user leaf encodings and borrowed ownership.
 
 Evidence lives under `build/workloads/vulkan-v1-context-20261019/`. Context,
 GL transfer/lifetime and Mesa readback runs use isolated images and checked
-shutdown. No Vulkan application has executed on Brook yet.
+shutdown. This context-only checkpoint predates the compute result recorded below.
 
 ## Mapping cache preparation
 
@@ -245,7 +245,78 @@ checked shutdown and offline filesystem checks. Evidence:
 `build/workloads/vulkan-pat-20261019/`. This does **not** yet establish a mapped
 Venus blob or GPU/CPU coherence of WC memory; that is the following blob gate.
 
-## Proposed next goal
+## Hardware compute checkpoint
+
+Brook now executes the generated Vulkan compute/transfer/readback probe through
+**Venus on the Intel UHD 630**, driver ID 22. Three rounds of 16,384 integer
+results match exactly. `vulkaninfo --summary` enumerates the same hardware-backed
+device. CPU upload/readback allocations report coherent flags 7 and their actual
+host mappings return WC (`map_info=3`); shared renderer rings return CACHED.
+This establishes the tested cached/WC path, not noncoherent Vulkan memory.
+
+The ABI 31 implementation adds HOST3D blob creation, mapped host aperture leases,
+borrowed user mappings, typed Venus ring submission and checked completion.
+Canonical GEM/PRIME/VMA references retain the resource and producer context.
+Retirement verifies renderer consumption, UNMAP, context detach and UNREF before
+reusing its aperture extent. Uncertain completion retains/quarantines the extent.
+The initial failing run exercised that conservative path: an overly strict
+response check required ring fields which QEMU 10.2.2 does not echo. Validation
+now uses the echoed context and globally unique fence ID of the owned request.
+
+Mmap offsets reserve the rounded resource span and never wrap/recycle. Both
+Linux's DRM core and Brook reject interior offset tokens; this prevents such an
+offset from accidentally identifying another resource. Oversized mappings fail.
+The shared raw probe verifies two-page CPU sharing, PRIME ownership, fork,
+PROT_NONE/restoration, remap, close while mappings remain, aperture exhaustion
+and subsequent reuse. Brook reserved all four 256 MiB extents in its 1 GiB BAR.
+
+Enabling blobs also enables Mesa's persistent VirGL buffers. That path now
+accepts the bundled PIPE_BUFFER creation command with checked geometry and
+matching rounded size, attaches its resource to the context, and fences GL
+submissions synchronously while the context owns host blobs. NOWAIT only reports
+idle under that completion guarantee. Normal GL-only launches retain their
+existing guest-backed path. Actual Mesa GLES tests pass RGB image readback and
+a 16 KiB persistent coherent CPU-to-GPU buffer copy/readback.
+
+### Host mapping-size correction
+
+The pinned renderer could return a PIPE/opaque Vulkan allocation whose extent
+differed from the blob's declared size. Before QEMU installs a MemoryRegion,
+[the bounded renderer](../tools/venus-renderer-pkg/default.nix) now rejects that
+mismatch and rolls back through the matching backend. The test compiles the
+actual renderer map/unmap functions with instrumented backends: over/undersize,
+unchanged output arguments, cleanup, retry, SHM/DMABUF and legacy behavior pass;
+a mutant without the check fails. The Linux control also passes with this DSO,
+and records its actual loaded path and SHA-256 from `/proc`.
+
+`BROOK_GPU=venus` resolves this repository's renderer by default. Freeze it with
+`BROOK_GPU_RENDERER` alongside QEMU, Mesa, GLVND, Vulkan loader and the host ICD.
+This changes the experiment's library path, not host-installed drivers. The
+Linux control manifest selects the same bounded renderer. The guest kernel must
+not attempt to infer opaque allocation bounds from untrusted Vulkan commands.
+
+### Evidence and limits
+
+Accepted private run: `build/workloads/vulkan-blob-20261019/candidate2/`.
+Linux control: `build/workloads/vulkan-blob-20261019/linux-bounded2/`.
+Kernel SHA-256:
+`8dfe72c42830036f1e2da4620dc32be19c71c28e5b262ead53bac5334eaac0fc`.
+All 12 modules use ABI 31. The final run returns host blob resources, aperture
+leases/bytes and quarantines to zero, balances legacy backing pages, passes heap
+integrity, and completes checked shutdown plus four offline filesystem checks.
+Existing documents, browser/editor settings and the Wine prefix are retained.
+
+This is the initial pinned-Mesa path, not the complete Linux virtgpu ABI.
+Guest-backed blobs, CROSS_DEVICE, debug names, nonzero poll masks, input fences,
+DRM syncobj ioctls and full sync_file inspection/import remain unsupported.
+Outgoing pollable FDs represent an already verified selected-timeline completion;
+they are not general sync_file objects. The pinned Venus build simulates the
+sync objects needed by these tests. GPU readback proves actual queue execution;
+renderer ring0 acknowledgement by itself does not. Sizes above the current
+32-bit resource-info limit are rejected. Native Wayland Vulkan WSI, triangle
+rasterization and real Vulkan workloads are subsequent gates.
+
+## Active goal
 
 > Bring up hardware-backed Vulkan on Brook through Mesa Venus and virtio-gpu.
 > First establish a reproducible host/Linux-guest control on the selected GPU,

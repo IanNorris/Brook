@@ -7,6 +7,7 @@
 #include "tcp.h"
 #include "epoll_diagnostics.h"
 #include "audio.h"
+#include "gpu_app.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "scheduler.h"
@@ -3901,7 +3902,14 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.field("failed_requested_bytes",d.failedRequestedBytes);r.text(",");
         r.field("quarantined_resources",d.quarantinedResources);r.text(",");
         r.field("quarantined_page_bytes",d.quarantinedPageBytes);r.text(",");
-        r.field("failed_retirements",d.failedRetirements);r.text("}\n");r.send();
+        r.field("failed_retirements",d.failedRetirements);
+        const auto* gpu=GpuAppGet();
+        const GpuBlobStatistics blobs=gpu && gpu->BlobStatistics ? gpu->BlobStatistics() : GpuBlobStatistics{};
+        r.text(",");r.field("host_blob_resources",blobs.resources);
+        r.text(",");r.field("host_aperture_leases",blobs.apertureLeases);
+        r.text(",");r.field("host_aperture_bytes",blobs.apertureBytes);
+        r.text(",");r.field("host_blob_quarantined",blobs.quarantined);
+        r.text("}\n");r.send();
     }
     else if (NetStrEq(cmd, "mem census")) { DebugMemoryCensus(); }
     else if (NetStrEq(cmd, "mem pids")) {

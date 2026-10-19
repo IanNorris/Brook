@@ -2923,6 +2923,9 @@ struct DrmResource {
     uint32_t backingBytes;
     KMutex backingLock;
     bool backingAttached;
+    bool hostBlob;
+    uint32_t blobFlags;
+    GpuHostMapping hostMapping;
     bool everExported;
     DrmResource* retiredNext;
 };
@@ -3952,7 +3955,7 @@ enum MmapProt : uint64_t {
 
 struct DeviceMappingBacking {
     uint64_t kernelBase, physicalBase;
-    bool firmware;
+    bool borrowedPhysical;
     MappingBacking* resourceLifetime;
 };
 struct MappingBackingGuard {
@@ -3982,12 +3985,12 @@ static int PrepareFileMapping(MappingTransaction& operation, const UserMappingRe
 static int PrepareDeviceMapping(MappingTransaction& operation, const UserMappingRequest& request, void*) {
     const auto* source = static_cast<DeviceMappingBacking*>(request.range.backing->object);
     for (uint64_t page=0;page<request.preparedPages;++page) {
-        auto physical = source->firmware ? PhysicalAddress(source->physicalBase+page*4096) :
+        auto physical = source->borrowedPhysical ? PhysicalAddress(source->physicalBase+page*4096) :
             VmmVirtToPhys(KernelPageTable,VirtualAddress(source->kernelBase+page*4096));
         if (!physical) return -ENOMEM;
-        if (!source->firmware) PmmRefPage(physical);
-        if (!operation.StagePage(page,physical,!source->firmware)) {
-            if (!source->firmware) PmmUnrefPage(physical);
+        if (!source->borrowedPhysical) PmmRefPage(physical);
+        if (!operation.StagePage(page,physical,!source->borrowedPhysical)) {
+            if (!source->borrowedPhysical) PmmUnrefPage(physical);
             return -ENOMEM;
         }
     }
@@ -4063,12 +4066,26 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             auto* context=static_cast<DrmCtx*>(entry->handle);if (!context) return -ENODEV;
             DrmMappingGuard guard(context);
             auto* gem=DrmFindMapToken(context->gem,DRM_MAX_GEM,offset);
-            if (!gem || !gem->resource->backingKva || !gem->resource->backingAttached) return -EINVAL;
+            if (!gem) return -EINVAL;
             auto* resource=gem->resource;
+            if (resource->hostBlob) {
+                const auto& host=resource->hostMapping;
+                if (!(flags&MAP_SHARED) || !host.length || !host.physicalBase || request.length>host.length) return -EINVAL;
+                switch(host.cache) {
+                case 1: break;
+                case 2: request.cacheFlags=VMM_CACHE_DISABLE|VMM_WRITE_THRU;break;
+                case 3:
+                    if (!CpuWriteCombiningReady()) return -95;
+                    request.cacheFlags=VMM_LEAF_PAT;break;
+                default:return -95;
+                }
+                source->borrowedPhysical=true;source->physicalBase=host.physicalBase;
+            } else if (!resource->backingKva || !resource->backingAttached) return -EINVAL;
             MappingBackingRef(resource->lifetime); // before releasing the GEM lock
             source->resourceLifetime=resource->lifetime;
             source->kernelBase=resource->backingKva;
-            available=(static_cast<uint64_t>(resource->backingBytes)+4095)&~uint64_t{4095};
+            available=resource->hostBlob ? resource->hostMapping.length :
+                (static_cast<uint64_t>(resource->backingBytes)+4095)&~uint64_t{4095};
         } else {
             uint32_t width,height,stride;uint64_t physical;
             if (!TtyGetFramebufferPhys(&physical,&width,&height,&stride)) return -ENODEV;
@@ -4084,14 +4101,14 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 if (!UserMappingConfigureBuffer(request,framebuffer)) return -EINVAL;
                 return UserMappingCreate(proc,proc->addressSpace,request);
             }
-            source->firmware=!source->kernelBase;source->physicalBase=physical;
+            source->borrowedPhysical=!source->kernelBase;source->physicalBase=physical;
             available=(available+4095)&~uint64_t{4095};
         }
         if (!available) return -EINVAL;
         if (request.length > available) request.length=available;
         request.range.kind=MappingKind::Device;request.range.sharing=MappingSharing::Shared;
         request.range.offset=0;request.range.backing=backing.value;
-        request.range.leafOwnership=source->firmware?MappingLeafOwnership::Borrowed:MappingLeafOwnership::Managed;
+        request.range.leafOwnership=source->borrowedPhysical?MappingLeafOwnership::Borrowed:MappingLeafOwnership::Managed;
         request.preparedPages=request.length/4096;request.prepare=PrepareDeviceMapping;
         return UserMappingCreate(proc,proc->addressSpace,request);
     }
@@ -5758,6 +5775,7 @@ constexpr uint8_t  DRM_NR_VIRTGPU_TRANSFER_FROM_HOST = DRM_COMMAND_BASE + 0x06; 
 constexpr uint8_t  DRM_NR_VIRTGPU_TRANSFER_TO_HOST   = DRM_COMMAND_BASE + 0x07; // 0x47
 constexpr uint8_t  DRM_NR_VIRTGPU_WAIT           = DRM_COMMAND_BASE + 0x08; // 0x48
 constexpr uint8_t  DRM_NR_VIRTGPU_GET_CAPS       = DRM_COMMAND_BASE + 0x09; // 0x49
+constexpr uint8_t  DRM_NR_VIRTGPU_RESOURCE_CREATE_BLOB = DRM_COMMAND_BASE + 0x0a;
 constexpr uint8_t  DRM_NR_VIRTGPU_CONTEXT_INIT   = DRM_COMMAND_BASE + 0x0b; // 0x4b
 
 // virtio-gpu DRM driver identity (matches the upstream kernel driver).
@@ -5811,6 +5829,12 @@ struct DrmVirtgpuResourceCreate {
 };
 struct DrmVirtgpuResourceInfo {
     uint32_t bo_handle, res_handle, size, blob_mem;
+};
+struct DrmVirtgpuCreateBlob {
+    uint32_t memory, flags, bo_handle, res_handle;
+    uint64_t size;
+    uint32_t pad, cmd_size;
+    uint64_t cmd, blob_id;
 };
 struct DrmVirtgpu3dBox { uint32_t x, y, z, w, h, d; };
 struct DrmVirtgpu3dTransfer {     // to_host and from_host share this layout
@@ -5879,6 +5903,7 @@ static bool DrmEnsureBacking(DrmGemObj* gem)
         explicit Guard(KMutex* value):lock(value){KMutexLock(lock);}
         ~Guard(){KMutexUnlock(lock);}
     } guard(&g->backingLock);
+    if (g->hostBlob) return g->hostMapping.length != 0;
     if (g->backingKva != 0) return g->backingAttached;
     uint32_t bytes = g->backingBytes ? g->backingBytes
                    : (g->size ? g->size
@@ -6011,6 +6036,53 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         dctx->owner->ctxId = ctx;
         return 0;
     }
+    case DRM_NR_VIRTGPU_RESOURCE_CREATE_BLOB:
+    {
+        if (!UserBufferReadable(arg,sizeof(DrmVirtgpuCreateBlob)) ||
+            !UserBufferWritable(arg,sizeof(DrmVirtgpuCreateBlob))) return -EFAULT;
+        DrmVirtgpuCreateBlob create{};
+        if (!CopyFromUser(&create,arg,sizeof(create))) return -EFAULT;
+        const auto* ga=GpuAppGet();
+        if (!ga || !ga->ResourceCreateBlob || !ga->Capabilities || !ga->Capabilities().resourceBlob) return -EINVAL;
+        if (create.memory!=2 || (create.flags&~3u) || !create.size || create.size>0xfffff000ULL) return -EINVAL;
+        if(dctx->owner->ctxId<=0) {
+            if(!ga->CtxCreate) return -ENODEV;
+            auto* process=ProcessCurrent();
+            const auto context=ga->CtxCreate(process?process->pid:0,{});
+            if(context<0)return -ENOMEM;
+            dctx->owner->ctxId=context;
+        }
+        uint32_t virglCreate[12]{};
+        if(dctx->owner->config.capsetId==4) {
+            if(create.cmd_size) return -EINVAL;
+        } else {
+            // Mesa's persistent-buffer path bundles one PIPE_RESOURCE_CREATE.
+            if(create.cmd_size!=sizeof(virglCreate))return -EINVAL;
+            if(!CopyFromUser(virglCreate,create.cmd,sizeof(virglCreate)))return -EFAULT;
+            if(virglCreate[0]!=((11u<<16)|48u) || create.blob_id>0xffffffffULL ||
+                virglCreate[11]!=create.blob_id || virglCreate[1]!=0 ||
+                virglCreate[4]!=((create.size+4095)&~uint64_t{4095}) ||
+                virglCreate[5]>1 || virglCreate[6]>1 || virglCreate[7]!=1 ||
+                virglCreate[8] || virglCreate[9])return -EINVAL;
+        }
+        const uint32_t size=static_cast<uint32_t>((create.size+4095)&~uint64_t{4095});
+        const uint32_t bo=DrmGemAlloc(dctx,0,size,0,0,0,0,0);
+        if (!bo) return -ENOMEM;
+        auto* gem=&dctx->gem[bo-1];auto* resource=gem->resource;
+        resource->hostBlob=true;resource->blobFlags=create.flags;
+        if(dctx->owner->config.capsetId!=4) {
+            resource->target=virglCreate[1];resource->format=virglCreate[2];
+            resource->width=virglCreate[4];resource->height=virglCreate[5]?virglCreate[5]:1;
+            if(!ga->Submit3D || ga->Submit3D(dctx->owner->ctxId,virglCreate,12)<0) {DrmGemDrop(gem);return -EIO;}
+        }
+        const GpuBlobCreate parameters{create.size,create.blob_id,create.memory,create.flags};
+        if (ga->ResourceCreateBlob(dctx->owner->ctxId,parameters,&resource->gres,&resource->hostMapping)<0) {
+            DrmGemDrop(gem);return -ENOMEM;
+        }
+        create.bo_handle=bo;create.res_handle=resource->gres;
+        if (!CopyToUser(arg,&create,sizeof(create))) {DrmGemDrop(gem);return -EFAULT;}
+        return 0;
+    }
     case DRM_NR_VIRTGPU_RESOURCE_CREATE:
     {
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpuResourceCreate)) ||
@@ -6093,7 +6165,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!g) return -ENOENT;
         ri.res_handle = g->resource->gres;
         ri.size = g->resource->size;
-        ri.blob_mem = 0;
+        ri.blob_mem = g->resource->hostBlob ? 2 : 0;
         return CopyToUser(arg, &ri, sizeof(ri)) ? 0 : -EFAULT;
     }
     case DRM_NR_VIRTGPU_TRANSFER_TO_HOST:
@@ -6104,7 +6176,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         DrmVirtgpu3dTransfer t = *reinterpret_cast<DrmVirtgpu3dTransfer*>(arg);
         DrmGemObj* g = DrmGemGet(dctx, t.bo_handle);
         if (!g) return -ENOENT;
-        if (g->resource->owner->ctxId <= 0) return -EINVAL;
+        if (g->resource->owner->ctxId <= 0 || g->resource->hostBlob) return -EINVAL;
         const brook::GpuAppOps* ga = brook::GpuAppGet();
         if (!ga || !ga->Transfer3D) return -ENODEV;
         int dir = (nr == DRM_NR_VIRTGPU_TRANSFER_TO_HOST) ? 0 : 1;
@@ -6122,6 +6194,36 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             return -EFAULT;
         DrmVirtgpuExecbuffer eb = *reinterpret_cast<DrmVirtgpuExecbuffer*>(arg);
         if (dctx->owner->ctxId <= 0) return -EINVAL;
+        if (dctx->owner->config.capsetId==4) {
+            if ((eb.flags&~6u) || !(eb.flags&4u) || eb.ring_idx>=dctx->owner->config.numRings ||
+                eb.syncobj_stride || eb.num_in_syncobjs || eb.num_out_syncobjs ||
+                (eb.size&3u) || eb.size>60u*1024u-32u || eb.num_bo_handles>DRM_MAX_GEM) return -EINVAL;
+            if ((eb.flags&2u) && !UserBufferWritable(arg,sizeof(eb))) return -EFAULT;
+            for(uint32_t i=0;i<eb.num_bo_handles;++i) {
+                uint32_t handle=0;
+                if (!CopyFromUser(&handle,eb.bo_handles+uint64_t{i}*4,4)) return -EFAULT;
+                if (!DrmGemGet(dctx,handle)) return -ENOENT;
+            }
+            auto* commands=eb.size ? static_cast<uint32_t*>(kmalloc(eb.size)) : nullptr;
+            if (eb.size && !commands) return -ENOMEM;
+            if (eb.size && !CopyFromUser(commands,eb.command,eb.size)) {kfree(commands);return -EFAULT;}
+            const auto* ga=GpuAppGet();
+            const int result=ga && ga->SubmitVenus ?
+                ga->SubmitVenus(dctx->owner->ctxId,commands,eb.size/4,eb.ring_idx,(eb.flags&2u)!=0) : -1;
+            kfree(commands);
+            if (result<0) return -EIO;
+            if (eb.flags&2u) {
+                auto* process=ProcessCurrent();
+                auto* event=static_cast<EventFdData*>(kmalloc(sizeof(EventFdData)));
+                if (!event) return -ENOMEM;
+                EventFdInit(event,1,0); // selected renderer timeline completed
+                const int descriptor=FdAlloc(process,FdType::EventFd,event);
+                if(descriptor<0) {kfree(event);return descriptor;}
+                eb.fence_fd=descriptor;
+                if(!CopyToUser(arg,&eb,sizeof(eb))) {CloseProcessFd(process,descriptor);return -EFAULT;}
+            }
+            return 0;
+        }
         if (eb.size == 0 || (eb.size & 3) || eb.size > 1024u * 1024) return -EINVAL;
         if (!UserBufferReadable(eb.command, eb.size)) return -EFAULT;
         const brook::GpuAppOps* ga = brook::GpuAppGet();
@@ -6161,8 +6263,19 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
     }
     case DRM_NR_VIRTGPU_WAIT:
     {
-        // Submits are synchronous (the driver busy-polls the host), so by the
-        // time a client waits, the work is already complete.
+        if(!UserBufferReadable(arg,sizeof(DrmVirtgpu3dWait)))return -EFAULT;
+        DrmVirtgpu3dWait wait{};
+        if(!CopyFromUser(&wait,arg,sizeof(wait)))return -EFAULT;
+        auto* gem=DrmGemGet(dctx,wait.handle);if(!gem)return -ENOENT;
+        if(gem->resource->hostBlob) {
+            if((wait.flags&~1u) || gem->resource->owner->config.capsetId==4)return -95;
+            // GL contexts with host blobs complete their submissions before
+            // returning, so NOWAIT may safely report idle in this bounded path.
+            if(wait.flags&1u)return 0;
+            const auto* ga=GpuAppGet();
+            return ga && ga->PresentBarrier && ga->PresentBarrier(gem->resource->owner->ctxId)==0 ? 0 : -EIO;
+        }
+        // Preserve the legacy guest-backed path at this checkpoint.
         return 0;
     }
     case DRM_NR_PRIME_HANDLE_TO_FD:
@@ -6262,9 +6375,10 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         DrmVirtgpuMap m = *reinterpret_cast<DrmVirtgpuMap*>(arg);
         DrmGemObj* g = DrmGemGet(dctx, m.handle);
         if (!g) return -ENOENT;
+        if (g->resource->hostBlob && !g->resource->hostMapping.length) return -EINVAL;
         if (!DrmEnsureBacking(g)) return -ENOMEM;
         if (!g->mapToken) {
-            g->mapToken = g_drmMapTokens.Allocate();
+            g->mapToken = g_drmMapTokens.Allocate(g->resource->size ? g->resource->size : 4096);
             if (!g->mapToken) return -ENOMEM;
         }
         m.offset = g->mapToken;

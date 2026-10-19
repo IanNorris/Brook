@@ -73,7 +73,7 @@ def main():
                        LIBGL_DRIVERS_PATH=packages['mesa'] + '/lib/dri',
                        __EGL_VENDOR_LIBRARY_DIRS=packages['mesa'] + '/share/glvnd/egl_vendor.d',
                        LD_LIBRARY_PATH=':'.join(packages[key] + '/lib'
-                                                for key in ('glvnd', 'mesa', 'vulkanLoader')))
+                                                for key in ('virglrenderer', 'glvnd', 'mesa', 'vulkanLoader')))
     manifest = dict(packages=packages, argv=argv, host_kernel=platform.release(),
                     rendernode=str(node), pci_device=(Path('/sys/class/drm') / node.name / 'device').resolve().name,
                     host_icd=str(icd), host_icd_json=json.loads(icd.read_text()),
@@ -91,6 +91,20 @@ def main():
         process = subprocess.Popen(argv, env=environment, stdout=stdout, stderr=stderr)
         write(output / 'launcher.json', dict(pid=process.pid, started_host_monotonic=start))
         print('LINUX_VENUS_CONTROL_STARTED', process.pid, str(output), flush=True)
+        expected_renderer=(Path(packages['virglrenderer']) / 'lib/libvirglrenderer.so.1').resolve()
+        renderer_maps=[]
+        for attempt in range(40):
+            try:
+                renderer_maps=[line.split()[-1] for line in Path(f'/proc/{process.pid}/maps').read_text().splitlines()
+                               if 'libvirglrenderer.so' in line]
+            except OSError:
+                break
+            if renderer_maps or process.poll() is not None:
+                break
+            time.sleep(0.05)
+        renderer_verified=bool(renderer_maps) and all(Path(path).resolve()==expected_renderer for path in renderer_maps)
+        write(output / 'renderer-library.json',dict(expected=str(expected_renderer),
+              sha256=sha(expected_renderer),loaded=sorted(set(renderer_maps)),verified=renderer_verified))
         try:
             exit_code = process.wait(timeout=args.timeout)
         except subprocess.TimeoutExpired:
@@ -104,7 +118,7 @@ def main():
                 process.kill()
                 exit_code = process.wait()
     text = serial.read_text(errors='replace') if serial.exists() else ''
-    ended = re.findall(r'BROOK_VULKAN_CONTROL_END pci=(\d+) gpu=(\d+) drm=(\d+) info=(\d+) probe=(\d+) context=(\d+)', text)
+    ended = re.findall(r'BROOK_VULKAN_CONTROL_END pci=(\d+) gpu=(\d+) drm=(\d+) info=(\d+) probe=(\d+) context=(\d+) blob=(\d+)', text)
     records = []
     for line in text.splitlines():
         if line.startswith('{"passed":'):
@@ -115,7 +129,7 @@ def main():
     renderer_errors = [line for line in (text + (output / 'qemu.stderr').read_text(errors='replace')).splitlines()
                        if re.search(r'\[drm:.*\*ERROR\*|context error|failed to dispatch|'
                                     r'virtio_gpu_virgl_process_cmd.*error|failed to open libvulkan', line)]
-    passed = (not timed_out and not renderer_errors and exit_code == 0 and len(ended) == 1
+    passed = (renderer_verified and not timed_out and not renderer_errors and exit_code == 0 and len(ended) == 1
               and all(int(value) == 0 for value in ended[0])
               and len(records) == 2 and all(record['passed'] for record in records)
               and records[-1].get('driver_id') == 22 and records[-1].get('rounds') == 3)

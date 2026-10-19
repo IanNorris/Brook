@@ -1,0 +1,27 @@
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -1238,6 +1238,11 @@
+    if (!res || res->mapped)
+       return -EINVAL;
+ 
++   /* A blob's declared size owns an aperture extent in the guest. Never
++    * expose a larger imported allocation (or a shorter backing) to QEMU. */
++   const uint64_t declared_size = res->map_size;
++   const bool previous_pipe_mapping = res->mapped_from_pipe_resource;
++
+    if (res->pipe_resource) {
+       ret = vrend_renderer_resource_map(res->pipe_resource, &map, &map_size);
+       if (!ret) {
+@@ -1288,6 +1293,12 @@
+       return -EINVAL;
+ 
+    res->mapped = map;
++   if (declared_size && map_size != declared_size) {
++      const int unmap_ret = virgl_renderer_resource_unmap(res_handle);
++      res->map_size = declared_size;
++      res->mapped_from_pipe_resource = previous_pipe_mapping;
++      return unmap_ret ? unmap_ret : -EINVAL;
++   }
+    *out_map = map;
+    *out_size = map_size;
+    return ret;

@@ -435,7 +435,13 @@ if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
     MESA_PATH="${BROOK_GPU_MESA:-$(nix build --no-link --print-out-paths nixpkgs#mesa 2>/dev/null | tail -1)}"
     GLVND_PATH="${BROOK_GPU_GLVND:-$(nix build --no-link --print-out-paths nixpkgs#libglvnd 2>/dev/null | tail -1)}"
     VULKAN_PATH=""
+    RENDERER_PATH=""
     if [ "${BROOK_GPU}" = "venus" ]; then
+        RENDERER_PATH="${BROOK_GPU_RENDERER:-$(nix-build "${SCRIPT_DIR}/../tools/venus-renderer-pkg" --no-out-link 2>/dev/null | tail -1)}"
+        if [ ! -r "${RENDERER_PATH}/lib/libvirglrenderer.so.1" ]; then
+            echo "ERROR: Venus needs the bounded renderer; set BROOK_GPU_RENDERER to its package output." >&2
+            exit 1
+        fi
         # virgl_render_server loads libvulkan dynamically for Venus. QEMU's
         # normal GL closure/search path is insufficient on NixOS.
         VULKAN_PATH="${BROOK_GPU_VULKAN:-$(nix build --no-link --print-out-paths nixpkgs#vulkan-loader 2>/dev/null | tail -1)}"
@@ -462,7 +468,7 @@ if [ -n "${BROOK_GPU:-}" ] && [ "${BROOK_GPU}" != "0" ]; then
     export __EGL_VENDOR_LIBRARY_DIRS="${MESA_PATH}/share/glvnd/egl_vendor.d"
     export LD_LIBRARY_PATH="${GLVND_PATH}/lib:${MESA_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     if [ -n "${VULKAN_PATH}" ]; then
-        export LD_LIBRARY_PATH="${VULKAN_PATH}/lib:${LD_LIBRARY_PATH}"
+        export LD_LIBRARY_PATH="${RENDERER_PATH}/lib:${VULKAN_PATH}/lib:${LD_LIBRARY_PATH}"
     fi
     # Display backend for the accelerated path:
     #   (default)              egl-headless — renders the GL scanout OFFSCREEN on

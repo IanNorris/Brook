@@ -53,7 +53,8 @@ namespace brook {
 // ABI 28 appends retained pathname socket creation to VfsFsOps.
 // ABI 29 adds the retained vnode identity to file mapping backing descriptors.
 // ABI 30 types app GPU context identity and app capability reporting.
-static constexpr uint32_t MODULE_ABI_VERSION = 30;
+// ABI 31 adds owned HOST3D blobs and typed Venus ring submissions.
+static constexpr uint32_t MODULE_ABI_VERSION = 31;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

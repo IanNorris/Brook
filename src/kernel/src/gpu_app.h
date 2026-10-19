@@ -27,6 +27,18 @@ struct GpuTransfer3D {
     uint32_t level, stride, layerStride;
 };
 
+struct GpuBlobCreate {
+    uint64_t size, blobId;
+    uint32_t memory, flags;
+};
+struct GpuHostMapping {
+    uint64_t physicalBase, length, lease;
+    uint32_t cache; // virtio map_info: CACHED=1, UNCACHED=2, WC=3
+};
+struct GpuBlobStatistics {
+    uint64_t resources, apertureLeases, apertureBytes, quarantined;
+};
+
 struct GpuAppOps {
     const char* name;
 
@@ -94,6 +106,16 @@ struct GpuAppOps {
 
     // Implemented app capabilities intersected with negotiated host support.
     GpuAppCapabilities (*Capabilities)();
+
+    // HOST3D blob: kernel has allocated its canonical owner before this call.
+    // outResource is set before host publication, including uncertain failure.
+    int32_t (*ResourceCreateBlob)(int32_t ctxId, const GpuBlobCreate& create,
+                                  uint32_t* outResource, GpuHostMapping* mapping);
+    // Opaque Venus commands, never VirGL parsed/chunked. A requested fence is
+    // checked on the selected host timeline before this synchronous call returns.
+    int32_t (*SubmitVenus)(int32_t ctxId, const uint32_t* commands, uint32_t count,
+                           uint32_t ring, bool fence);
+    GpuBlobStatistics (*BlobStatistics)();
 };
 
 // Register the app-GPU ops (called by the display driver once its 3D path is

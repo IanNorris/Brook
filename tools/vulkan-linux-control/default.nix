@@ -1,6 +1,7 @@
 { pkgs ? import ../../nix/nixpkgs.nix {} }:
 let
   kernel = pkgs.linuxPackages.kernel;
+  renderer = import ../venus-renderer-pkg { inherit pkgs; };
   probe = import ../vulkan-probe-pkg { inherit pkgs; };
   emptyFirmware = pkgs.runCommand "brook-control-empty-firmware" {} ''
     mkdir -p $out/lib/firmware
@@ -42,6 +43,9 @@ let
     ${probe}/bin/virtgpu-context
     context_exit=$?
     echo "BROOK_VULKAN_CONTROL_CONTEXT_EXIT $context_exit"
+    ${probe}/bin/virtgpu-blob
+    blob_exit=$?
+    echo "BROOK_VULKAN_CONTROL_BLOB_EXIT $blob_exit"
     ${pkgs.vulkan-tools}/bin/vulkaninfo --summary
     info_exit=$?
     echo "BROOK_VULKAN_CONTROL_INFO_EXIT $info_exit"
@@ -49,7 +53,7 @@ let
     probe_exit=$?
     echo "BROOK_VULKAN_CONTROL_PROBE_EXIT $probe_exit"
     sync
-    echo "BROOK_VULKAN_CONTROL_END pci=$pci_exit gpu=$gpu_exit drm=$drm_exit info=$info_exit probe=$probe_exit context=$context_exit"
+    echo "BROOK_VULKAN_CONTROL_END pci=$pci_exit gpu=$gpu_exit drm=$drm_exit info=$info_exit probe=$probe_exit context=$context_exit blob=$blob_exit"
     echo BROOK_VULKAN_CONTROL_DMESG_START
     dmesg
     echo BROOK_VULKAN_CONTROL_DMESG_END
@@ -76,7 +80,7 @@ in pkgs.runCommand "brook-vulkan-linux-control" {} ''
     mesa = toString pkgs.mesa;
     qemu = toString pkgs.qemu_full;
     glvnd = toString pkgs.libglvnd;
-    virglrenderer = toString pkgs.virglrenderer;
+    virglrenderer = toString renderer;
     vulkanTools = toString pkgs.vulkan-tools;
     vulkanLoader = toString pkgs.vulkan-loader;
     guestICD = "${pkgs.mesa}/share/vulkan/icd.d/virtio_icd.x86_64.json";

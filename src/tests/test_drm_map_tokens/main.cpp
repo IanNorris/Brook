@@ -48,6 +48,13 @@ int main() {
         CHECK(all[i] && !(all[i]&4095));
         if (i) CHECK(all[i]!=all[i-1]);
     }
+    DrmMapTokenAllocator spans;
+    CHECK(spans.Allocate(8192)==4096);
+    CHECK(spans.Allocate(1)==12288);
+    const auto nextSpan=spans.next;
+    CHECK(!spans.Allocate(0)&&!spans.Allocate(~uint64_t{0})&&spans.next==nextSpan);
+    DrmMapTokenAllocator shortTail{DrmMapTokenAllocator::Last};
+    CHECK(!shortTail.Allocate(8192));CHECK(shortTail.Allocate(4096)==DrmMapTokenAllocator::Last);
     DrmMapTokenAllocator boundary{DrmMapTokenAllocator::Last};
     CHECK(boundary.Allocate()==DrmMapTokenAllocator::Last);
     for (unsigned i=0;i<1000;++i) CHECK(boundary.Allocate()==0);
