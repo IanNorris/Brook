@@ -1278,3 +1278,57 @@ preserved document hashes/owners passed. Evidence for both trials is under
 `build/workloads/wayland-scene-profile-20261019/{baseline,candidate}/`, including
 `profile-summary.json`, `playback-summary.json` and `acceptance-audit.json`.
 Simultaneous-browser/STK acceptance and the wider workload goal remain open.
+
+## GPU workload transition acceptance
+
+Session `2c277862d23b4b07ab140a4ecfe1a24a` exercised the `ac42f03c`
+kernel with the retained Wayland scene-tree package on fresh private disks,
+8 CPUs, 4 GiB RAM and the hardware virgl compositor. Quake GL3's 1280×720
+startup demo advanced and closed normally. SuperTuxKart then reached its menus,
+started a Volcan Island race and accepted a five-second forward-key hold.
+Native screenshots show changing race scenes and HUD time. Closing the race
+drained the full app lineage and returned tracked DRM backing to equality.
+Both a first App Gallery launch and its subsequent reopen displayed their own
+package grid, without the previously reported stale kart surface.
+
+Chromium subsequently rendered the local media fixture in the same VM.
+Firefox joined it, and both videos advanced. Codium launched alongside them,
+accepted a new document through editor input and saved it through the GTK
+dialog. A tracked Brook-user read verified the exact 92 bytes and UID 1000 /
+GID 100; an independent offline read of the stopped disk matched both content
+hash and owner. The original nine document fixtures also retained their hashes
+and ownership. Codium's pre-existing saved workbench restored, but this run
+does not independently establish new browser storage across reboot.
+
+The initial mixed-playback screenshot request did not return a frame result;
+the temporary controller stopped on that missing result without retaining its
+structured error. This is an evidence limitation, not a diagnosed cause.
+The same VM remained reachable, and later captures succeeded without restarting
+or replaying playback input. Treat the transient capture/response delay as an
+open reliability issue. Later screenshots show both videos advancing while
+Codium remains alive, including after minimizing its saved editor window.
+No claim of smooth or competitive simultaneous playback follows from this test.
+
+Two mixer streams were active during paired playback. A five-second,
+speaker-disabled recording contained nonzero PCM (RMS 0.0675). After Chromium
+exited, Firefox alone still produced nonzero PCM (RMS 0.0617). This establishes
+independent Firefox delivery through the installed launcher, not stutter-free
+audio or correct playback tempo. STK's installed launcher explicitly selects
+null SDL/OpenAL audio; its silent capture is not sound acceptance.
+
+Firefox, Chromium and Codium all exited normally with their complete launch
+lineages drained. A second Quake GL3 demo launch then rendered and closed
+normally; its five-second WAV also contained nonzero PCM (RMS 0.2091), without
+separating game effects from music or proving music tempo. All 8,295 tracked
+backing mappings (3,706,384,384 bytes) were released, with zero failed
+allocations, failed retirements or quarantine. Audio streams emptied. Checked
+shutdown, owned launcher/QEMU exit zero and all three offline filesystem checks
+passed. No forced termination, long game session, live-listener music acceptance
+or game/browser concurrency is established by this sequence.
+
+Evidence: `build/workloads/gpu-workload-acceptance-20261019/candidate/`, notably
+`acceptance-audit.json`, `codium/edit/offline-readback.json`, `mixed-browsers/`,
+the two Gallery frame captures and the STK input/frame records. The README's
+new native-resolution kart screenshot comes from `stk/drive/frame-0.png`.
+The wider nine-part workload goal and Ian's final review/merge approval remain
+open.
