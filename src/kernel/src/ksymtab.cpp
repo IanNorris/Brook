@@ -28,6 +28,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "display.h"
 #include "gpu_compositor.h"
 #include "gpu_app.h"
+#include "cpu.h"
 #include "tty.h"
 #include "compositor.h"
 #include "mouse.h"
@@ -114,6 +115,7 @@ EXPORT_SYMBOL(DisplayRegister);
 EXPORT_SYMBOL(DisplaySet3DActive);
 EXPORT_SYMBOL(GpuCompositorRegister);
 EXPORT_SYMBOL(GpuAppRegister);
+EXPORT_SYMBOL(CpuWriteCombiningReady);
 
 // TTY
 EXPORT_SYMBOL(TtyGetFramebuffer);

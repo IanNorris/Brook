@@ -38,7 +38,7 @@ static bool CloneLeaves(MappingTransaction& operation, AddressSpaceState* destin
                     bool managed=mapping.leafOwnership==MappingLeafOwnership::Managed;
                     bool cow=managed && mapping.sharing==MappingSharing::Private &&
                         (raw&(VMM_WRITABLE|PTE_COW_BIT));
-                    uint64_t childFlags=raw&(VMM_USER|VMM_WRITABLE|VMM_NO_EXEC|PTE_COW_BIT);
+                    uint64_t childFlags=raw&(VMM_USER|VMM_WRITABLE|VMM_NO_EXEC|PTE_COW_BIT|VMM_LEAF_CACHE_MASK);
                     if (cow) childFlags=(childFlags&~VMM_WRITABLE)|PTE_COW_BIT;
                     else if (mapping.sharing==MappingSharing::Shared) childFlags&=~PTE_COW_BIT;
                     PhysicalAddress physical(raw&physicalMask);
@@ -314,6 +314,10 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
         (request.range.maximumProtection & ~7u) ||
         !MappingRangeValid(checked) ||
         (request.preparedPages && (request.preparedPages != request.length/4096 || !request.prepare))) return failure.Fail("request-validation",-22);
+    if ((request.cacheFlags & ~VMM_LEAF_CACHE_MASK) ||
+        (request.cacheFlags && (request.range.kind != MappingKind::Device ||
+         request.range.leafOwnership != MappingLeafOwnership::Borrowed ||
+         request.preparedPages != request.length / 4096))) return failure.Fail("cache-policy",-22);
     for (;;) {
         ++failure.attempts;
         MappingTransaction operation(actor,space,request.range.backing);
@@ -353,7 +357,7 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
             // while preparation was unlocked. Capacity failure changes nothing.
             if (!operation.ReplaceMapping(address,end,&range)) continue;
         } else if (!operation.InsertRange(range)) return failure.Fail("range-insert",-12);
-        uint64_t flags = VMM_USER;
+        uint64_t flags = VMM_USER | request.cacheFlags;
         if (!(range.protection & 4)) flags |= VMM_NO_EXEC;
         if (range.protection & 2) flags |= VMM_WRITABLE;
         MemTag tag = range.kind == MappingKind::Device && range.leafOwnership == MappingLeafOwnership::Borrowed ?

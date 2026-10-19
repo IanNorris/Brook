@@ -1,6 +1,7 @@
 #include "cpu.h"
 #include "gdt.h"
 #include "serial.h"
+#include "cpu_memory_type.h"
 
 // ---------------------------------------------------------------------------
 // CR0 / CR4 bit definitions
@@ -19,7 +20,53 @@ static constexpr uint64_t CR4_OSXSAVE    = (1ULL << 18); // OS uses XSAVE/XRSTOR
 static inline uint64_t ReadCr0() { uint64_t v; __asm__ volatile("mov %%cr0,%0":"=r"(v)); return v; }
 static inline void     WriteCr0(uint64_t v) { __asm__ volatile("mov %0,%%cr0"::"r"(v)); }
 static inline uint64_t ReadCr4() { uint64_t v; __asm__ volatile("mov %%cr4,%0":"=r"(v)); return v; }
-static inline void     WriteCr4(uint64_t v) { __asm__ volatile("mov %0,%%cr4"::"r"(v)); }
+static inline void     WriteCr4(uint64_t v) { __asm__ volatile("mov %0,%%cr4"::"r"(v):"memory"); }
+
+static bool g_patFailed;
+static uint32_t g_patInitialized;
+
+void CpuInitMemoryTypes()
+{
+    struct InterruptGuard {
+        uint64_t flags;
+        InterruptGuard() { __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory"); }
+        ~InterruptGuard() { if (flags & (1u << 9)) __asm__ volatile("sti" ::: "memory"); }
+    } interrupts;
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
+    uint64_t target = 0;
+    if (!(edx & (1u << 16)) || !brook::CpuPatWithWriteCombining(ReadMsr(0x277), target)) {
+        __atomic_store_n(&g_patFailed, true, __ATOMIC_RELEASE);
+        brook::SerialPuts("CPU: PAT layout unsupported; write-combining disabled\n");
+        return;
+    }
+    __asm__ volatile("" ::: "memory");
+    WriteMsr(0x277, target);
+    __asm__ volatile("" ::: "memory");
+    // Invalidate local translations after programming PAT. Slot4 has no users
+    // until all admitted CPUs have completed this early startup path.
+    const auto cr4 = ReadCr4();
+    if (cr4 & (1u << 7)) {
+        WriteCr4(cr4 & ~(uint64_t{1} << 7));
+        WriteCr4(cr4);
+    } else {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3,%0; mov %0,%%cr3" : "=r"(cr3) :: "memory");
+    }
+    if (ReadMsr(0x277) != target) {
+        __atomic_store_n(&g_patFailed, true, __ATOMIC_RELEASE);
+        brook::SerialPuts("CPU: PAT readback failed; write-combining disabled\n");
+        return;
+    }
+    __atomic_fetch_add(&g_patInitialized, 1, __ATOMIC_RELEASE);
+    brook::SerialPrintf("CPU: PAT WC slot4 ready value=0x%lx\n", target);
+}
+
+extern "C" bool CpuWriteCombiningReady()
+{
+    return __atomic_load_n(&g_patInitialized, __ATOMIC_ACQUIRE) != 0 &&
+           !__atomic_load_n(&g_patFailed, __ATOMIC_ACQUIRE);
+}
 
 void CpuInitFpu()
 {

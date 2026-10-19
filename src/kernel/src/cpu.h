@@ -18,6 +18,10 @@
 //   FXSAVE64/FXRSTOR64 (or XSAVE/XRSTOR if AVX is enabled).
 
 void CpuInitFpu();
+// Early BSP/AP initialization, before any slot4 device mapping exists.
+void CpuInitMemoryTypes();
+// Query after SmpInit admission; a failure on any CPU disables this capability.
+extern "C" bool CpuWriteCombiningReady();
 
 // Enable XSAVE-managed CPU state (CR4.OSXSAVE + XCR0 = x87|SSE|AVX) so
 // AVX/AVX2 instructions don't #UD in user space.  Called from CpuInitFpu

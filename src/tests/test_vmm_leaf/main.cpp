@@ -824,6 +824,42 @@ static void sharedMappingClone() {
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
     std::puts("LIVE SHARED FORK PASS borrowed-descriptor/managed-shared/writable-no-CoW/last-owner-retirement");
 }
+static void borrowedDeviceCachePolicies() {
+    for (const uint64_t cache : {uint64_t{0}, VMM_WRITE_THRU|VMM_CACHE_DISABLE, VMM_LEAF_PAT}) {
+        auto root=table();VmmHostSetKernelRoot(root);
+        auto* source=AddressSpaceCreate(34);auto* child=AddressSpaceCreate(35);CHECK(source&&child);
+        Process actor{};actor.addressSpace=source;
+        CloneBacking borrowed{PmmAllocPage()};CHECK(borrowed.page);
+        auto* backing=MappingBackingCreate(&borrowed,releaseCloneBacking);CHECK(backing);
+        UserMappingRequest request{};request.range=rangeRecord(0,pageSize,backing);
+        request.range.kind=MappingKind::Device;request.range.sharing=MappingSharing::Shared;
+        request.range.leafOwnership=MappingLeafOwnership::Borrowed;
+        request.hint=va.raw();request.length=pageSize;request.preparedPages=1;
+        request.fixed=true;request.prepare=prepareBorrowedClone;request.context=&borrowed;
+        request.cacheFlags=VMM_USER;
+        CHECK(UserMappingCreate(&actor,source,request)==-22);
+        request.cacheFlags=cache;
+        CHECK(UserMappingCreate(&actor,source,request)==static_cast<int64_t>(va.raw()));
+        MappingBackingUnref(backing);
+        CHECK((VmmReadLeaf(source->pageTable,va)&VMM_LEAF_CACHE_MASK)==cache);
+        CHECK(UserMappingClone(&actor,source,child,35));
+        CHECK(PmmGetRefCount(borrowed.page)==1&&maps(borrowed.page)==2);
+        actor.addressSpace=child;
+        CHECK(UserMappingProtect(&actor,child,va.raw(),pageSize,0)==0);
+        auto raw=VmmReadLeaf(child->pageTable,va);
+        CHECK(!(raw&VMM_PRESENT)&&(raw&PTE_HIDDEN_BIT)&&(raw&VMM_LEAF_CACHE_MASK)==cache);
+        CHECK(UserMappingProtect(&actor,child,va.raw(),pageSize,3)==0);
+        const uint64_t target=va.raw()+0x4000;
+        CHECK(UserMappingResize(&actor,child,va.raw(),pageSize,pageSize,3,target,nullptr,nullptr)==static_cast<int64_t>(target));
+        raw=VmmReadLeaf(child->pageTable,VirtualAddress(target));
+        CHECK((raw&VMM_LEAF_CACHE_MASK)==cache&&VmmLeafPhysical(raw)==borrowed.page);
+        CHECK((raw&VMM_WRITABLE)&&!(raw&PTE_COW_BIT)&&PmmGetRefCount(borrowed.page)==1);
+        AddressSpaceUnref(source);CHECK(ProcessCleanupStep());CHECK(!borrowed.released);
+        AddressSpaceUnref(child);CHECK(ProcessCleanupStep());CHECK(borrowed.released==1);
+        PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    }
+    std::puts("DEVICE CACHE PASS WB/UC/WC leaves, fork, hidden restoration, move and borrowed lifetime");
+}
 static void failedCloneAcknowledgement() {
     auto root=table();VmmHostSetKernelRoot(root);
     auto* source=AddressSpaceCreate(36);auto* child=AddressSpaceCreate(37);CHECK(source&&child);
@@ -1987,7 +2023,7 @@ int main(int argc,char** argv) {
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
-    liveMappingClone();sharedMappingClone();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
+    liveMappingClone();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();addressFileGateScope();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
     targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();
     anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();

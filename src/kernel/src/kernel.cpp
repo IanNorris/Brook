@@ -291,6 +291,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     GdtInit();
     CpuInitFpu();
+    CpuInitMemoryTypes();
     CpuInitSyscallMsrs(brook::SyscallGetEntryPoint());
     brook::KPuts("GDT+FPU+SYSCALL loaded\n");
 

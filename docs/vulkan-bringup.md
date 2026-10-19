@@ -223,6 +223,28 @@ Evidence lives under `build/workloads/vulkan-v1-context-20261019/`. Context,
 GL transfer/lifetime and Mesa readback runs use isolated images and checked
 shutdown. No Vulkan application has executed on Brook yet.
 
+## Mapping cache preparation
+
+The next memory preparation checkpoint initializes an unused PAT slot4 as WC
+on the BSP and each AP before CPU admission. It preserves existing slots,
+rejects unfamiliar firmware layouts, disables interrupts during programming,
+verifies readback and invalidates local translations. A sticky CPU failure
+keeps write-combining unavailable. This boot-time contract relies on Brook's
+own initial page tables not using slot4; it is not a runtime PAT reconfiguration
+API.
+
+Eager borrowed device mapping requests can carry checked cache flags. Fork now
+preserves PAT/PWT/PCD; actual VMM tests verify WB/UC/WC leaf encodings through
+fork, PROT_NONE/restoration, fixed remap and final borrowed backing release.
+Managed mappings cannot request a nondefault cache type.
+
+All 54 host suites passed; focused PAT/VMM suites and compiled entry audits
+passed again after interrupt hardening. The final eight-vCPU private boot
+confirmed all eight PAT values and repeated hardware Mesa RGB readback, with
+checked shutdown and offline filesystem checks. Evidence:
+`build/workloads/vulkan-pat-20261019/`. This does **not** yet establish a mapped
+Venus blob or GPU/CPU coherence of WC memory; that is the following blob gate.
+
 ## Proposed next goal
 
 > Bring up hardware-backed Vulkan on Brook through Mesa Venus and virtio-gpu.

@@ -14,6 +14,9 @@ struct UserMappingRequest {
     // Exact address with collision failure, including PROT_NONE reservations.
     // Checked and published under the same AS transaction/generation protocol.
     bool noReplace = false;
+    // Only eager borrowed device mappings may select a nondefault cache type.
+    // The caller must establish architectural PAT support and alias safety.
+    uint64_t cacheFlags = 0;
 };
 int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMappingRequest& request);
 int64_t UserMappingRemove(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length);

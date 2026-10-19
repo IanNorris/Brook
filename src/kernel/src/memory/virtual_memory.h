@@ -24,6 +24,9 @@ static constexpr uint64_t VMM_WRITABLE     = (1ULL << 1);
 static constexpr uint64_t VMM_USER         = (1ULL << 2);
 static constexpr uint64_t VMM_WRITE_THRU   = (1ULL << 3);  // PWT — write-through caching
 static constexpr uint64_t VMM_CACHE_DISABLE = (1ULL << 4); // PCD — disable caching (uncacheable)
+// Bit7 is PAT on a 4KiB leaf, PS on ancestors. Never copy it across levels.
+static constexpr uint64_t VMM_LEAF_PAT = (1ULL << 7);
+static constexpr uint64_t VMM_LEAF_CACHE_MASK = VMM_WRITE_THRU | VMM_CACHE_DISABLE | VMM_LEAF_PAT;
 static constexpr uint64_t VMM_NO_EXEC      = (1ULL << 63); // requires EFER.NXE
 static constexpr uint64_t VMM_FORCE_MAP    = (1ULL << 62); // bypass null guard (SMP trampoline)
 
