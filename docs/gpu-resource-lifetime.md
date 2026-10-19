@@ -893,3 +893,63 @@ on partial failure even if backing attachment succeeded. It needs per-resource
 verified retirement and a cleanup audit; this upload prerequisite does not
 change that path. The normal DRM/PRIME image path uses its separate canonical
 resource lifetime machinery.
+
+## Immutable scene versions (integration in progress)
+
+`gpu_scene_versions.h` now supplies the kernel-private image ownership table.
+It is exercised by the hosted `test_gpu_scene` suite; the live compositor and
+Wayland server do not use it yet. This checkpoint changes no guest rendering
+behavior and is not Firefox acceptance.
+
+Each reservation gets a fresh positive scene-scoped 63-bit ID. A verified upload
+or capture can publish it; a failed incoming C leaves committed A and cached B
+unchanged. Queued draws pin the exact versions in their copied draw list. Public
+release removes lookup permission while existing pins preserve the allocation.
+Only the last completed reference makes the texture eligible for reuse. Matching
+idle allocations can be recycled without creating a new driver resource every
+frame, but always receive a fresh version ID.
+
+Reservations account for both slots and logical pixel bytes before GPU work.
+The configured limits and current counts are observable through `Stats`; pixel
+bytes include reservations, idle images and quarantine, not measured host VRAM
+or driver overhead. A full table or byte budget rejects admission without
+modifying existing versions. Eviction runs in two phases: mark an idle image,
+drop the scene lock for driver retirement, then release budget only after
+verified destruction. Its completion checks both slot and nonrepeating ticket.
+Failed retirement quarantines the allocation and retains its budget.
+
+Close rejects new reservations and pins, drops public ownership, and leaves
+queued pins and running reservations intact. An upload completing after close
+returns `Discarded` rather than `Published`, retaining the finished image for
+worker cleanup. Uncertain GPU work cannot be recycled through close, release,
+unpin or eviction. Its external snapshots/source leases must remain retained by
+the job; metadata alone does not own those allocations.
+
+The scene owner must serialize metadata operations and perform all GPU work
+outside its lock. `GetPublished` only observes metadata; it does not pin an image
+for asynchronous work. Public ownership is singular: Wayland must count or
+coalesce references when committed and cached state hold the same version ID,
+and call `Release` only after both are finished. Pin/unpin batches validate
+atomically, including repeated IDs. A batch containing a quarantined version
+fails without releasing any pins; cancellation must retain the whole job or
+separately release verified healthy inputs.
+
+Host coverage includes A/B/C preservation, out-of-order reservations, duplicate
+pins, invalid batches, close during upload/eviction, stale completion after
+reuse, eviction-ticket ABA, failed-retirement quarantine and 20,000 modeled
+lifetime transitions. Six mutation controls exercise premature reuse, version
+ID recycling, publication after close, uncertain-retirement reuse, stale
+eviction completion and premature budget release. Sanitizers and the complete
+52-suite host run are recorded under
+`build/workloads/gpu-scene-versions-20261019/`.
+
+The next integration must provide a close-on-exec scene descriptor with correct
+dup/fork/SCM ownership; bounded kernel-owned SHM snapshots; capture through an
+explicit DRM FD/GEM capability; copied/pinned draw lists; worker cancellation and
+deferred cleanup; and atomic premultiplied root publication using the window's
+incarnation/generation token. Closing an old scene must not erase newer SHM or a
+replacement scene's content. Root textures belong to the compositor, independently
+of the layer versions. After this, Wayland must preserve synchronized cached
+state, committed state, tree order and detach/disconnect semantics, then pass
+real Firefox rendering/audio and mixed-app lifetime tests. None of those
+integration requirements is established by these metadata tests.

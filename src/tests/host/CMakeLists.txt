@@ -379,3 +379,4 @@ target_link_options(test_shutdown PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_shutdown PROPERTIES TIMEOUT 15)
 
 add_host_test(test_gpu_scene)
+target_sources(test_gpu_scene PRIVATE ../test_gpu_scene/versions.cpp)

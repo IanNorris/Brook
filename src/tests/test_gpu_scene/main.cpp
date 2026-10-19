@@ -6,7 +6,9 @@
 #include <cstring>
 #include <vector>
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"GPU_SCENE line %d: %s\n",__LINE__,#x);std::abort(); } } while(0)
+void TestSceneVersions();
 int main() {
+    TestSceneVersions();
     using namespace brook;
     CHECK(GpuViewportHalfBits(5)==0x40200000u);
     CHECK(GpuViewportHalfBits(511)==0x437f8000u);
