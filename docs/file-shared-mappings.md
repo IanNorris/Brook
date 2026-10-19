@@ -1,8 +1,34 @@
 # Coherent regular-file mappings
 
-Implementation target following the mapping-transaction checkpoint of
-2026-10-16. Writable regular-file MAP_SHARED remains disabled until the connected
-path below passes. The work must cover ordinary I/O as well as mmap.
+Current checkpoint (19 October): writable regular-file MAP_SHARED is enabled
+for filesystems with canonical retained FileObject backing, currently ext2.
+Mapped truncate still returns EBUSY. The older stages below document the
+foundation and remaining broader compatibility/error-injection work.
+
+ABI 29 retains a vnode identity in each file mapping descriptor. Fault
+publication and mprotect upgrades mark canonical pages exposed before granting
+write access, including PROT_NONE restoration. Noncanonical shared publication
+fails, readonly descriptors cannot gain shared write access, and private copies
+remain isolated. Extending ordinary writes zero cached old EOF gaps before
+overlaying their confirmed payload.
+
+`msync` snapshots and retains each intersecting shared-file descriptor, then
+releases AS/file gates before range writeback and backend durability. It checks
+alignment/flags, reports holes and backend errors, and ignores private/anonymous
+data. ASYNC and zero flags currently perform the stronger synchronous flush.
+The five-second worker flushes pending backing; shutdown quiesces it before
+closing device writes and doing its final sync. Conservative exposure may
+rewrite unchanged writable pages. This is not dirty-bit-based eviction.
+
+Actual-module tests cover canonical publication, protection upgrades, ranges,
+errors/retry, unmapping during sync, empty exposure and EOF-gap zeroing. All 52
+host suites and both kernel entry audits pass. Six Wine-pattern plus fourteen
+Linux-matched guest checks cover independent opens, read/write coherence, fork,
+private isolation, readonly upgrades, SIGBUS past EOF and descriptor close.
+Synced and initially unsynced pages retain their exact bytes and ownership on
+a separate cold boot. Fixtures: `scripts/workloads/unix_rights_shared_file.py`
+and `scripts/workloads/shared_file_mapping.py`. Evidence:
+`build/workloads/wine-shared-mapping-20261019/candidate`.
 
 ## Current implementation and remaining gaps
 

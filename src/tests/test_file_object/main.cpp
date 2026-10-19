@@ -259,6 +259,34 @@ static void WritebackPages() {
     CHECK(FileObjectWritebackAll()==0&&vnode.refCount==1&&!backend.object.writebackVnode);
     FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
 }
+static void ExtendingWriteClearsMappedTail() {
+    Backend backend{};backend.bytes.resize(17,0x31);FileObjectInit(&backend.object);
+    Vnode vnode{&operations,VnodeType::File,&backend,1,0};int error=0;
+    auto page=FileObjectGetPage(&backend.object,&vnode,0,true,&error);CHECK(page&&!error);
+    auto* bytes=reinterpret_cast<unsigned char*>(page.raw());
+    bytes[80]=0xA4;bytes[150]=0xA5;
+    KMutexLock(&backend.object.gate);
+    CHECK(FileObjectExposeRangeLocked(&backend.object,&vnode,10,10));
+    CHECK(vnode.refCount==1&&!backend.object.writebackVnode);
+    CHECK(!FileObjectExposeRangeLocked(&backend.object,&vnode,11,10));
+    CHECK(FileObjectExposeRangeLocked(&backend.object,&vnode,0,4096));
+    KMutexUnlock(&backend.object.gate);
+    unsigned char value=0x62;uint64_t position=128;
+    CHECK(FileObjectWrite(&backend.object,&vnode,&value,1,&position)==1);
+    CHECK(backend.bytes.size()==129&&bytes[16]==0x31&&bytes[80]==0&&bytes[128]==0x62);
+    // The still-invalid tail is cleared on a subsequent partial extension.
+    const unsigned char source[4]={0x73,0x74,0x75,0x76};position=200;backend.writeLimit=2;
+    CHECK(FileObjectWrite(&backend.object,&vnode,source,4,&position)==2);
+    CHECK(backend.bytes.size()==202&&bytes[128]==0x62&&bytes[150]==0&&bytes[200]==0x73&&bytes[201]==0x74);
+    backend.writeLimit=~0u;
+    CHECK(FileObjectWriteback(&backend.object,&vnode,0,~uint64_t{0})==0);
+    CHECK(backend.bytes.size()==202&&backend.bytes[80]==0&&backend.bytes[150]==0);
+    backend.failStat=true;position=300;
+    CHECK(FileObjectWrite(&backend.object,&vnode,&value,1,&position)==-5&&backend.bytes.size()==202);
+    backend.failStat=false;
+    PmmUnrefPage(page);CHECK(FileObjectWritebackAll()==0&&vnode.refCount==1);
+    FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
+}
 static void WritebackLifetime() {
     CHECK(refs.empty()&&heapBlocks==0);
     Backend first{},second{};FileObjectInit(&first.object);FileObjectInit(&second.object);
@@ -560,6 +588,7 @@ int main() {
     BatchPages();
     WritebackPages();
     WritebackLifetime();
+    ExtendingWriteClearsMappedTail();
     AppendTransactions();
     FaultPages();
     QuarantinedPages();

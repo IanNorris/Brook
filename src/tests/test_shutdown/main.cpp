@@ -5,6 +5,8 @@ namespace {
 struct Yield {};
 bool launched=true,jobsAllowed=true,jobsBusy=false,dispatching=false,gate=false,canFreeze=true;
 uint32_t births=0;unsigned closes=0,signals=0,syncs=0,freezes=0;
+unsigned writebackStops=0;
+bool writebackStopped=false;
 int syncError=0;
 brook::ProcessCleanupStatus cleanup{};
 brook::Process serviceTasks[2]{};unsigned signalPid=0;
@@ -31,7 +33,8 @@ bool DebugJobsActive(){return jobsBusy;}
 uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t,uint64_t* tick){*tick=0;if(visible){*out=window;return 1;}return 0;}
 int WmApplyDebugAction(uint32_t target,uint64_t incarnation,WmDebugAction,uint32_t,WmDebugWindow*,uint32_t*){assert(target==window.id&&incarnation==window.incarnation);++closes;return 0;}
 ProcessCleanupStatus ProcessGetCleanupStatus(){return cleanup;}
-bool DeviceCloseWrites(){++freezes;return canFreeze;}
+void FileObjectStopWriteback(){++writebackStops;writebackStopped=true;assert(!cleanup.liveUserAddressSpaces&&!cleanup.activeFinalizers);}
+bool DeviceCloseWrites(){assert(writebackStopped);++freezes;return canFreeze;}
 void AudioStop(){}
 int VfsSync(Vnode*){++syncs;return syncError;}
 void CompositorMarkDirty(){}
@@ -64,8 +67,8 @@ step();assert(!signals&&!syncs&&!gate);
     for(unsigned i=0;i<2;++i){auto& p=serviceTasks[i];p.pid=21+i;p.incarnation=31+i;p.lifecycleRole=ProcessLifecycleRole::Service;p.state=ProcessState::Ready;p.sigMask=i?0:1ULL<<14;p.refCount=1;}
     step();assert(signals==1&&signalPid==22);assert(serviceTasks[0].refCount==1&&serviceTasks[1].refCount==1);command(second,"power_status","services");command(second,"cancel","too_late",-16);
     censusCount=0;step();command(second,"power_status","cleanup");
-    cleanup.liveUserAddressSpaces=1;step();assert(!freezes&&!syncs);
-    cleanup.liveUserAddressSpaces=0;cleanup.activeFinalizers=1;step();assert(!freezes&&!syncs);
+    cleanup.liveUserAddressSpaces=1;step();assert(!freezes&&!syncs&&!writebackStops);
+    cleanup.liveUserAddressSpaces=0;cleanup.activeFinalizers=1;step();assert(!freezes&&!syncs&&!writebackStops);
     cleanup.activeFinalizers=0;canFreeze=false;step();assert(freezes==1&&!syncs);
     canFreeze=true;syncError=-5;step();command(second,"power_status","failed",-5);assert(syncs==1);
     step();assert(syncs==1);command(second,"shutdown","failed",-5);

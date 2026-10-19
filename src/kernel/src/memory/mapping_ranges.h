@@ -3,6 +3,7 @@
 #include "file_mapping_registry.h"
 
 namespace brook {
+struct Vnode;
 // A descriptor pin is created before publication. Retaining it cannot enter
 // filesystem/object code; its final callback must run outside mapping locks.
 struct MappingBacking {
@@ -10,6 +11,7 @@ struct MappingBacking {
     void* object;
     void (*release)(void*);
     FileObject* file = nullptr; // borrowed; object pin retains the live inode
+    Vnode* fileVnode = nullptr; // borrowed; the same object pin owns this vnode
 };
 // Adopts one existing object pin on success; on allocation failure the caller
 // still owns that pin. The descriptor's final callback consumes it exactly once.

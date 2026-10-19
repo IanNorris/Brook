@@ -4094,8 +4094,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     }
     if (entry->type != FdType::Vnode || !entry->handle || static_cast<Vnode*>(entry->handle)->type != VnodeType::File) return -ENODEV;
     if ((entry->statusFlags & 3) == 1) return -13;
-    if ((flags & MAP_SHARED) && (prot & 2))
-        return (entry->statusFlags & 3) == 0 ? -13 : -95; // no coherent regular-file writeback yet
+    if ((flags & MAP_SHARED) && (prot & 2) && (entry->statusFlags & 3) == 0)return -13;
     auto fileFailure=[&](const char* stage,int64_t result) -> int64_t {
         // Only selected errors-only tracing emits this setup-stage evidence.
         // The mapping core reports its own detailed failure after unlocking.
@@ -4105,6 +4104,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return result;
     };
     auto* vnode=static_cast<Vnode*>(entry->handle);
+    auto* fileObject=vnode->ops->file_object?vnode->ops->file_object(vnode):nullptr;
+    if((flags&MAP_SHARED) && (prot&2) && (!fileObject || !vnode->ops->write))return -95;
     int pin=VfsFileMapPin(vnode);if (pin && pin != -95) return fileFailure("mapping-pin",pin);
     VnodeStat stat{};int error=VfsStat(vnode,&stat);
     if (error) { if (!pin) VfsFileMapUnpin(vnode);return fileFailure("stat",error); }
@@ -4113,9 +4114,11 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     VnodeRef(vnode);*file={vnode,stat.size,pin==0};
     backing.value=MappingBackingCreate(file,ReleaseFileMapping);
     if (!backing.value) { ReleaseFileMapping(file);return fileFailure("backing-descriptor-storage",-ENOMEM); }
-    backing.value->file=vnode->ops->file_object ? vnode->ops->file_object(vnode) : nullptr;
+    backing.value->file=fileObject;
+    backing.value->fileVnode=vnode;
     request.range.kind=MappingKind::File;request.range.backing=backing.value;
-    if (flags & MAP_SHARED) request.range.maximumProtection=5;
+    if (flags & MAP_SHARED) request.range.maximumProtection=5u|
+        ((fileObject && vnode->ops->write && (entry->statusFlags&3)!=0)?2u:0u);
     if (pin == -95) { request.preparedPages=length/4096;request.prepare=PrepareFileMapping; }
     else if (length<=16*1024*1024 && stat.size>offset)
         PageCachePreload(vnode,offset/4096,stat.size,static_cast<uint32_t>(length/4096));
@@ -4125,6 +4128,10 @@ static int64_t sys_mprotect(uint64_t addr,uint64_t length,uint64_t prot,uint64_t
     Process* proc=ProcessCurrent();if (!proc) return -ESRCH;
     if (prot & ~7ULL) return -EINVAL;
     return UserMappingProtect(proc,proc->addressSpace,addr,length,static_cast<uint32_t>(prot));
+}
+static int64_t sys_msync(uint64_t addr,uint64_t length,uint64_t flags,uint64_t,uint64_t,uint64_t) {
+    Process* proc=ProcessCurrent();if(!proc)return -ESRCH;
+    return UserMappingSync(proc,proc->addressSpace,addr,length,flags);
 }
 static int64_t sys_munmap(uint64_t addr,uint64_t length,uint64_t,uint64_t,uint64_t,uint64_t) {
     Process* proc=ProcessCurrent();if (!proc) return -ESRCH;
@@ -13782,6 +13789,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_MPROTECT]        = sys_mprotect;
     g_syscallTable[SYS_MUNMAP]          = sys_munmap;
     g_syscallTable[SYS_MREMAP]          = sys_mremap;
+    g_syscallTable[SYS_MSYNC]           = sys_msync;
     g_syscallTable[SYS_BRK]             = sys_brk;
     g_syscallTable[SYS_RT_SIGACTION]    = sys_rt_sigaction;
     g_syscallTable[SYS_RT_SIGPROCMASK]  = sys_rt_sigprocmask;
@@ -14137,6 +14145,7 @@ static const char* SyscallName(uint64_t num)
     case 21: return "access";     case 22: return "pipe";
     case 23: return "select";     case 24: return "sched_yield";
     case 25: return "mremap";
+    case 26: return "msync";
     case 32: return "dup";        case 33: return "dup2";
     case 35: return "nanosleep";  case 39: return "getpid";
     case 40: return "sendfile";   case 41: return "socket";

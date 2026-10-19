@@ -135,6 +135,14 @@ VmmMapResult MappingTransaction::Publish(uint64_t index, VirtualAddress address,
     const auto* range=MappingRangeFind(space_->ranges,address.raw());
     if (accessible && range && range->backing && range->backing->file && range->backing->file->mappingError)
         return VmmMapResult::InvalidAddress;
+    if(accessible && (flags&VMM_WRITABLE) && range && range->kind==MappingKind::File &&
+       range->sharing==MappingSharing::Shared) {
+        auto* backing=range->backing;
+        if(!backing || !backing->file || !backing->fileVnode ||
+           !FileObjectExposeWritableLocked(backing->file,backing->fileVnode,
+                (range->offset+address.raw()-range->begin)/4096,fresh_[index].physical))
+            return VmmMapResult::InvalidAddress;
+    }
     auto result = VmmTryMapPage(space_->pageTable, address, fresh_[index].physical, flags, tag, pid, accessible);
     if (result == VmmMapResult::Mapped) {
         fresh_[index].published = true;
@@ -241,6 +249,19 @@ bool MappingTransaction::ProtectMapping(uint64_t begin, uint64_t end, uint32_t p
         if(range.end>begin && range.backing && range.backing->file && range.backing->file->mappingError)return false;
     }
     if (!ranges_.CanProtect(space_->ranges,begin,end,protection)) return false;
+    // This precedes every writable PTE, including hidden PROT_NONE leaves.
+    // Conservative exposure after a later preflight failure is harmless; no
+    // permission may be granted unless all affected file ranges are retained.
+    if(protection&2)for(auto* node=space_->ranges.head;node && node->range.begin<end;node=node->next) {
+        const auto& range=node->range;
+        if(range.end<=begin || range.kind!=MappingKind::File || range.sharing!=MappingSharing::Shared)continue;
+        const auto left=range.begin>begin?range.begin:begin;
+        const auto right=range.end<end?range.end:end;
+        auto* backing=range.backing;
+        if(!backing || !backing->file || !backing->fileVnode ||
+           !FileObjectExposeRangeLocked(backing->file,backing->fileVnode,
+                range.offset+left-range.begin,range.offset+right-range.begin))return false;
+    }
     if (!VmmProtectRange(space_->pageTable,begin,end,protection,PrivateLeaf,this)) return false;
     if (!ranges_.Protect(space_->ranges,begin,end,protection)) KernelPanic("mapping: protection preflight changed under lock");
     Changed(); return true;

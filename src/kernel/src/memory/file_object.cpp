@@ -10,6 +10,7 @@
 #ifndef BROOK_HOST_TEST
 #include "process.h"
 #include "scheduler.h"
+#include "serial.h"
 #endif
 
 namespace brook {
@@ -75,6 +76,15 @@ void Overlay(FileObject* object,uint64_t offset,void* buffer,uint64_t length,boo
         offset+=count;bytes+=count;length-=count;
     }
 }
+void ZeroResidentGap(FileObject* object,uint64_t begin,uint64_t end) {
+    for(auto* bucket:object->pages)for(auto* page=bucket;page;page=page->next) {
+        const uint64_t offset=page->index*4096;
+        if(offset>=end || (offset<begin && begin-offset>=4096))continue;
+        const uint64_t left=begin>offset?begin-offset:0;
+        const uint64_t right=end-offset<4096?end-offset:4096;
+        memset(reinterpret_cast<uint8_t*>(PhysToVirt(page->physical).raw())+left,0,right-left);
+    }
+}
 bool UserPointer(const void* pointer) {
 #ifdef BROOK_HOST_USER_COPY_TEST
     return FileObjectHostUserPointer(pointer);
@@ -110,8 +120,22 @@ int WriteLocked(FileObject* object,Vnode* vnode,const void* buffer,uint64_t leng
     if(!length)return 0;
     if(object->mappingError)return object->mappingError;
     const uint64_t begin=*offset;
+    if(length>~uint64_t{0}-begin)return -22;
+    bool resident=false;
+    for(auto* bucket:object->pages)if(bucket){resident=true;break;}
+    VnodeStat before{};
+    if(resident) {
+        const int error=vnode->ops->stat(vnode,&before);
+        if(error)return error;
+    }
     int result=vnode->ops->write(vnode,buffer,length,offset);
     if(result>0) {
+        if(static_cast<uint64_t>(result)>length)return -5;
+        // Stores into the old partial-page EOF tail are not valid file data.
+        // A later extending pwrite must not turn them into file contents when
+        // canonical pages overlay reads or are eventually written back.
+        if(resident && begin+static_cast<uint64_t>(result)>before.size)
+            ZeroResidentGap(object,before.size,begin+static_cast<uint64_t>(result));
         Overlay(object,begin,const_cast<void*>(buffer),static_cast<uint64_t>(result),true);
         ++object->generation;
     }
@@ -309,6 +333,19 @@ bool FileObjectExposeWritableLocked(FileObject* object,Vnode* vnode,uint64_t ind
     page->writeExposed=true;
     return true;
 }
+bool FileObjectExposeRangeLocked(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t end) {
+    RequireGate(object);
+    if(begin>end || object->mappingError || !vnode || vnode->type!=VnodeType::File ||
+       !vnode->ops || !vnode->ops->stat || !vnode->ops->write || !vnode->ops->file_object ||
+       vnode->ops->file_object(vnode)!=object)return false;
+    if(begin==end)return true;
+    for(auto* bucket:object->pages)for(auto* page=bucket;page;page=page->next) {
+        const uint64_t offset=page->index*4096;
+        if(offset<end && (offset>=begin || begin-offset<4096) &&
+           !FileObjectExposeWritableLocked(object,vnode,page->index,page->physical))return false;
+    }
+    return true;
+}
 static int WritebackLocked(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t end,uint8_t* snapshot) {
     if(object->mappingError)return object->mappingError;
     int result=0;
@@ -401,6 +438,45 @@ int FileObjectWritebackAll() {
     }
     kfree(snapshot);return result;
 }
+#ifndef BROOK_HOST_TEST
+namespace {
+KMutex writebackWorkerGate;
+bool writebackWorkerStarted=false;
+bool writebackWorkerEnabled=false;
+void WritebackWorker(void*) {
+    int lastError=0;
+    for(;;) {
+        SchedulerSleepMs(5000);
+        KMutexLock(&writebackWorkerGate);
+        if(__atomic_load_n(&writebackWorkerEnabled,__ATOMIC_ACQUIRE)) {
+            auto flags=IrqSpinLockAcquire(&writebackLock);
+            const bool pending=writebackObjects!=nullptr;
+            IrqSpinLockRelease(&writebackLock,flags);
+            // Canonical snapshots precede filesystem/device durability. Empty
+            // queues do not trigger periodic flushes of unrelated mounts.
+            const int error=pending?VfsSync(nullptr):0;
+            if(error && error!=lastError)SerialPrintf("file-writeback: periodic sync failed: %d; backing retained for retry\n",error);
+            lastError=error;
+        }
+        KMutexUnlock(&writebackWorkerGate);
+    }
+}
+}
+void FileObjectStartWriteback() {
+    if(writebackWorkerStarted)return;
+    KMutexInit(&writebackWorkerGate);
+    auto* worker=KernelThreadCreate("file-writeback",WritebackWorker,nullptr,3);
+    if(!worker)KernelPanic("file writeback: could not create worker");
+    writebackWorkerStarted=true;
+    __atomic_store_n(&writebackWorkerEnabled,true,__ATOMIC_RELEASE);
+    SchedulerAddProcess(worker);
+}
+void FileObjectStopWriteback() {
+    if(!writebackWorkerStarted)return;
+    __atomic_store_n(&writebackWorkerEnabled,false,__ATOMIC_RELEASE);
+    KMutexLock(&writebackWorkerGate);KMutexUnlock(&writebackWorkerGate);
+}
+#endif
 int FileObjectTruncateUnmapped(FileObject* object,Vnode* vnode,uint64_t length) {
     [[maybe_unused]] Operation operation;
     // The caller excludes mappings and first-pin publication. Persist any

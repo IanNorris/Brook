@@ -10,6 +10,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
 #include "memory/heap.h"
+#include "memory/file_object.h"
 #include "acpi.h"
 #include "apic.h"
 #include "input.h"
@@ -725,6 +726,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // barrier, closing the freed-while-mapped cross-domain reuse window.
         brook::PmmStartDrainThread();
         brook::ProcessStartCleanupWorker();
+        brook::FileObjectStartWriteback();
 
         // BRO-179 forensic: arm PID/seq-encoded heap poison now that the per-CPU
         // GS base is valid, so a kfree that corrupts a live struct stamps the

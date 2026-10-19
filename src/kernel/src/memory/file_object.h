@@ -12,8 +12,9 @@ struct FileMappingRegistration;
 // Every caller must retain its vnode/inode through the operation. Mappings use
 // that lifetime instead of inode-reuse cache identities. The writeback queue
 // explicitly retains a vnode until a successful flush after all mappings retire.
-// Ordinary writes are write-through. Writable mappings remain disabled while
-// resize coordination, msync and background writeback are incomplete.
+// Ordinary writes are write-through. Writable shared mappings use canonical
+// pages, conservative exposure, msync/fsync and periodic writeback. Mapped
+// truncate remains rejected until resize coordination is enabled.
 struct FileObject {
     RecordLockTable recordLocks;
     KMutex gate;
@@ -74,6 +75,9 @@ int FileObjectAppend(FileObject* object,Vnode* vnode,const void* buffer,uint64_t
 // the canonical frame that will be exposed, before making any writable alias.
 // Exposure is conservative and survives flushes while registrations remain.
 bool FileObjectExposeWritableLocked(FileObject* object,Vnode* vnode,uint64_t index,PhysicalAddress physical);
+// Conservative exposure before mprotect grants write permission. The file
+// gate is owned; marks resident canonical pages only, without I/O or allocation.
+bool FileObjectExposeRangeLocked(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t end);
 // Flush exposed resident pages intersecting [begin,end), clipped to current EOF.
 // Uses bounded snapshots, retries short progress, preserves exposure on errors
 // and success. Does not itself flush the backend device or enable MAP_SHARED.
@@ -85,6 +89,11 @@ int FileObjectWriteback(FileObject* object,Vnode* vnode,uint64_t begin,uint64_t 
 // error but retire stale cache/queue ownership once every mapping is gone.
 // Quarantine requires a successful pre-attempt flush. No backend-device flush.
 int FileObjectWritebackAll();
+// Kernel boot/shutdown integration. Stop waits for the active pass before
+// device write admission closes; explicit shutdown sync then performs the final
+// flush. Neither call is used by the standalone/hosted fixtures.
+void FileObjectStartWriteback();
+void FileObjectStopWriteback();
 // Initial integration: caller's mapping-pin gate has established no mappings.
 // Coordinated mapped resize/invalidation must replace that restriction later.
 int FileObjectTruncateUnmapped(FileObject* object,Vnode* vnode,uint64_t length);

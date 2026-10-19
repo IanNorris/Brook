@@ -1,9 +1,9 @@
 # Wine64 compatibility
 
-Current checkpoint (19 October): pathname sockets and descriptor exchange now
-pass focused Linux-matched guest regressions. Wine64 11.0 reaches user-shared-data
-initialization, where writable shared regular-file mmap returns EOPNOTSUPP.
-The console marker and Windows Notepad acceptance remain outstanding.
+Current checkpoint (19 October): pathname sockets, descriptor exchange and
+coherent writable shared ext2 mappings pass focused Linux-matched regressions.
+A traced Wine64 11.0 run executes the console marker with exit zero. Quiet
+startup is not repeatable yet; Notepad/input/save/reopen acceptance remains open.
 
 ## Initial smoke test — 18 October
 
@@ -220,3 +220,36 @@ live tasks and complete stdout/stderr before checked shutdown. Heap integrity,
 owned launcher/QEMU exit zero, four offline filesystem checks and preservation
 of all ten existing documents (content and ownership) pass. No application
 windows, audio streams or outstanding GPU backing mappings remain.
+
+## Shared-file mappings and first console output — 19 October
+
+The ABI-29 candidate adds coherent shared-file writes, retained writable
+publication, msync and periodic writeback. See [the shared-file implementation](file-shared-mappings.md).
+All 52 host suites, both kernel entry audits, six Wine-pattern and fourteen
+broader Linux-matched mapping checks pass, alongside the 49 socket/rights cases.
+An owned 8192-byte fixture with synced and initially unsynced mapped pages retains
+its exact hash and UID1000/GID100 after checked shutdown and a separate cold boot.
+
+Wine advances beyond shared-data initialization. Early quiet attempts exit 53
+with missing core DLLs in partial prefixes. A separate setup/file trace verifies
+full builtin DLL copies; its actual child `wine cmd /c echo BROOK_WINE_CONSOLE_PASS`
+exits zero with exactly `BROOK_WINE_CONSOLE_PASS\r\n` in its 25-byte stdout file.
+Its server/setup processes are stopped using `wineserver -k`, and the original
+tracked request drains to zero live tasks. A subsequent quiet launch against
+that prefix stalls during service startup and exits one during normal server
+stop. The difference remains unresolved; reliable quiet startup and Notepad
+acceptance are not established.
+
+The first verbose bridge attempt lost stderr and is excluded. Later diagnostic
+traces use guest files, extracted after shutdown. Final files/hashes are
+authoritative because background writers can outlive the main process and its
+early hash report. The successful diagnostic's stdout/stderr match the final
+extracted hashes. No Notepad screenshot is claimed. Evidence and a lossless
+1500-ms CPU/context-switch capture are under
+`build/workloads/wine-shared-mapping-20261019/candidate`, including `cold-boot`.
+
+Both boots pass heap/resource cleanup, owned launcher/QEMU exit zero and four
+offline filesystem checks. All ten existing documents retain their content and
+ownership; the populated prefix's kernel32.dll, cmd.exe and notepad.exe match
+their package bytes in both images. `acceptance-audit.json` records the usable
+commands and the excluded output-gap attempt separately.

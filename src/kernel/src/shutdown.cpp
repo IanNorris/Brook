@@ -5,6 +5,7 @@
 #include "device.h"
 #include "audio.h"
 #include "vfs.h"
+#include "memory/file_object.h"
 #include "fw_cfg.h"
 #include "portio.h"
 #include "apic.h"
@@ -100,7 +101,9 @@ void Worker(void*) {
         }else if(op.phase==Phase::Cleanup) {
             bool closed=false;uint32_t births=0;SchedulerUserBirthStatus(&closed,&births);
             const auto cleanup=ProcessGetCleanupStatus();uint32_t apps=0;
-            if(closed&&!births&&!Census(&apps)&&!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers&&DeviceCloseWrites()) {
+            if(closed&&!births&&!Census(&apps)&&!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers) {
+                FileObjectStopWriteback();
+                if(!DeviceCloseWrites()){SchedulerSleepMs(25);continue;}
                 SetPhase(selected,Phase::Syncing);AudioStop();
                 const int error=VfsSync(nullptr);
                 SetPhase(selected,error?Phase::Failed:Phase::Ready,error);

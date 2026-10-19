@@ -6,6 +6,7 @@
 #include "heap.h"
 #include "serial.h"
 #include "file_object.h"
+#include "vfs.h"
 
 namespace brook {
 // Source metadata and leaves are stable under AS.mutation. Destination is not
@@ -397,6 +398,44 @@ int64_t UserMappingProtect(Process* actor, AddressSpaceState* space, uint64_t ad
         at = range->end < end ? range->end : end;
     }
     return operation.ProtectMapping(address,end,protection) ? 0 : -12;
+}
+int64_t UserMappingSync(Process* actor,AddressSpaceState* space,uint64_t address,uint64_t length,uint64_t flags) {
+    if(!actor || !space || (address&4095) || (flags&~7ULL) || ((flags&1)&&(flags&4)))return -22;
+    if(!length)return 0;
+    uint64_t end;
+    if(!UserInterval(address,length,end))return -12;
+    int firstError=0;
+    for(uint64_t at=address;at<end;) {
+        MappingTransaction operation(actor,space);
+        if(!operation.Lock())return firstError?firstError:-12;
+        const auto* range=MappingRangeFind(space->ranges,at);
+        if(!range) {
+            if(!firstError)firstError=-12;
+            uint64_t next=end;
+            for(auto* node=space->ranges.head;node;node=node->next)
+                if(node->range.begin>at){if(node->range.begin<next)next=node->range.begin;break;}
+            at=next;continue;
+        }
+        const uint64_t right=range->end<end?range->end:end;
+        if(range->kind!=MappingKind::File || range->sharing!=MappingSharing::Shared) {at=right;continue;}
+        MappingFaultSnapshot snapshot{};
+        if(!operation.CaptureMapping(at,snapshot))return firstError?firstError:-12;
+        const uint64_t beginOffset=range->offset+at-range->begin;
+        const uint64_t endOffset=beginOffset+right-at;
+        at=right;
+        auto* backing=snapshot.range.backing;
+        // snapshot's backing owns the vnode until operation destruction, even
+        // if another task unmaps/closes the final userspace reference during I/O.
+        operation.Unlock();
+        int error=-95;
+        if(backing && backing->file && backing->fileVnode) {
+            auto* vnode=backing->fileVnode;
+            error=FileObjectWriteback(backing->file,vnode,beginOffset,endOffset);
+            if(!error)error=vnode->ops->fsync?vnode->ops->fsync(vnode):-95;
+        }
+        if(!firstError && error)firstError=error;
+    }
+    return firstError;
 }
 int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length) {
     uint64_t end;

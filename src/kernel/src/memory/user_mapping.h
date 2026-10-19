@@ -15,6 +15,10 @@ struct UserMappingRequest {
 int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMappingRequest& request);
 int64_t UserMappingRemove(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length);
 int64_t UserMappingProtect(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length, uint32_t protection);
+// Retain each intersecting shared-file backing before dropping AS/file gates
+// for range writeback and backend durability. Holes report ENOMEM after visiting
+// other mapped regions; private/anonymous/device mappings need no writeback.
+int64_t UserMappingSync(Process* actor,AddressSpaceState* space,uint64_t address,uint64_t length,uint64_t flags);
 // Replace populated private anonymous pages with zeroed frames, preserving
 // metadata/protections and fork peers. Old references retire after full TLB ACK.
 int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length);

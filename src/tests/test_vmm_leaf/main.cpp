@@ -1822,6 +1822,112 @@ static void memoryCensus() {
     std::puts("MEMORY CENSUS PASS lifetime/publication/ceiling/sparse/hidden/aliases/bounded-batches");
 }
 
+namespace {
+struct SharedFileBackend {
+    FileObject file{};
+    unsigned char bytes[8192]{};
+    unsigned writes=0,syncs=0;
+    bool failWrite=false,failSync=false,unmapOnSync=false;
+    Process* actor=nullptr;
+};
+int sharedFileStat(Vnode*,VnodeStat* stat) {stat->size=8192;return 0;}
+FileObject* sharedFileObject(Vnode* vnode) {return &static_cast<SharedFileBackend*>(vnode->priv)->file;}
+int sharedFileRead(Vnode* vnode,void* output,uint64_t length,uint64_t* offset) {
+    auto* b=static_cast<SharedFileBackend*>(vnode->priv);
+    if(*offset>=sizeof(b->bytes))return 0;
+    if(length>sizeof(b->bytes)-*offset)length=sizeof(b->bytes)-*offset;
+    std::memcpy(output,b->bytes+*offset,length);*offset+=length;return static_cast<int>(length);
+}
+int sharedFileWrite(Vnode* vnode,const void* input,uint64_t length,uint64_t* offset) {
+    auto* b=static_cast<SharedFileBackend*>(vnode->priv);++b->writes;
+    if(b->failWrite)return -5;
+    CHECK(*offset<=sizeof(b->bytes) && length<=sizeof(b->bytes)-*offset);
+    std::memcpy(b->bytes+*offset,input,length);*offset+=length;return static_cast<int>(length);
+}
+int sharedFileSync(Vnode* vnode) {
+    auto* b=static_cast<SharedFileBackend*>(vnode->priv);++b->syncs;
+    // Backend I/O must run after both AS and file gates have been released.
+    for(auto* mutex:{&b->file.gate,&b->actor->addressSpace->mutation}) {
+        CHECK(hostMutex(mutex).try_lock());hostMutex(mutex).unlock();
+    }
+    if(b->unmapOnSync) {
+        b->unmapOnSync=false;
+        CHECK(UserMappingRemove(b->actor,b->actor->addressSpace,va.raw(),4*pageSize)==0);
+        // The msync snapshot, not the removed VMA, still owns the descriptor.
+        CHECK(vnode->refCount>=2);
+    }
+    return b->failSync?-5:0;
+}
+void sharedFilePublicationAndSync() {
+    auto root=table();VmmHostSetKernelRoot(root);
+    auto* space=AddressSpaceCreate(61);CHECK(space);
+    Process actor{};actor.addressSpace=space;
+    SharedFileBackend backend{};backend.actor=&actor;FileObjectInit(&backend.file);
+    VnodeOps ops{};ops.read=sharedFileRead;ops.write=sharedFileWrite;ops.stat=sharedFileStat;
+    ops.fsync=sharedFileSync;ops.file_object=sharedFileObject;
+    Vnode vnode{&ops,VnodeType::File,&backend,1,0};
+    VfsRetain(&vnode);
+    auto* backing=MappingBackingCreate(&vnode,releaseTestMappedFile);CHECK(backing);
+    backing->file=&backend.file;backing->fileVnode=&vnode;
+    auto install=[&](unsigned slot,uint64_t offset,uint32_t protection,bool canonical=true) {
+        int error=0;
+        auto physical=canonical?FileObjectGetPage(&backend.file,&vnode,offset/pageSize,true,&error):PmmAllocPage();
+        CHECK(physical&&!error);
+        MappingTransaction operation(&actor,space,backing);
+        CHECK(operation.Prepare(0,1)&&operation.StagePage(0,physical,true)&&operation.PrepareRanges(1)&&operation.Lock());
+        auto range=rangeRecord(va.raw()+slot*pageSize,va.raw()+(slot+1)*pageSize,backing,protection);
+        range.offset=offset;range.sharing=MappingSharing::Shared;
+        CHECK(operation.InsertRange(range));
+        auto result=operation.Publish(0,va+slot*pageSize,VMM_USER|VMM_NO_EXEC|((protection&2)?VMM_WRITABLE:0),MemTag::User,61,protection!=0);
+        CHECK(result==(canonical?VmmMapResult::Mapped:VmmMapResult::InvalidAddress));
+    };
+    install(0,0,3);
+    CHECK(backend.file.writebackVnode==&vnode&&vnode.refCount==3);
+    auto first=VmmLeafPhysical(VmmReadLeaf(space->pageTable,va));
+    reinterpret_cast<unsigned char*>(first.raw())[5]=0x51;
+    unsigned char value=0;uint64_t position=5;
+    CHECK(FileObjectRead(&backend.file,&vnode,&value,1,&position)==1&&value==0x51);
+    CHECK(!backend.bytes[5]);
+    // A read-only mapping has no dirty exposure until mprotect grants write.
+    install(2,pageSize,1);
+    auto second=VmmLeafPhysical(VmmReadLeaf(space->pageTable,va+2*pageSize));
+    reinterpret_cast<unsigned char*>(second.raw())[7]=0x62;
+    CHECK(UserMappingSync(&actor,space,va.raw()+2*pageSize,pageSize,4)==0);
+    CHECK(!backend.bytes[pageSize+7]);
+    CHECK(UserMappingProtect(&actor,space,va.raw()+2*pageSize,pageSize,0)==0);
+    CHECK(UserMappingProtect(&actor,space,va.raw()+2*pageSize,pageSize,3)==0);
+    CHECK(VmmReadLeaf(space->pageTable,va+2*pageSize)&VMM_WRITABLE);
+    CHECK(UserMappingSync(&actor,space,va.raw()+2*pageSize,1,4)==0);
+    CHECK(backend.bytes[pageSize+7]==0x62&&!backend.bytes[5]);
+    // Zero/invalid flags, alignment and holes do not silently become success.
+    CHECK(UserMappingSync(&actor,space,va.raw(),0,4)==0);
+    CHECK(UserMappingSync(&actor,space,va.raw()+1,pageSize,4)==-22);
+    CHECK(UserMappingSync(&actor,space,va.raw(),pageSize,5)==-22);
+    CHECK(UserMappingSync(&actor,space,va.raw(),pageSize,8)==-22);
+    CHECK(UserMappingSync(&actor,space,va.raw(),~uint64_t{0},4)==-12);
+    CHECK(UserMappingSync(&actor,space,va.raw(),3*pageSize,4)==-12);
+    CHECK(backend.bytes[5]==0x51);
+    backend.failWrite=true;
+    CHECK(UserMappingSync(&actor,space,va.raw(),pageSize,4)==-5);
+    backend.failWrite=false;backend.failSync=true;
+    CHECK(UserMappingSync(&actor,space,va.raw(),pageSize,4)==-5);
+    backend.failSync=false;
+    CHECK(UserMappingSync(&actor,space,va.raw(),pageSize,0)==0);
+    CHECK(UserMappingSync(&actor,space,va.raw(),pageSize,1)==0);
+    CHECK(UserMappingSync(&actor,space,va.raw(),pageSize,6)==0);
+    install(3,0,3,false); // Never expose an uncached/noncanonical shared frame.
+    CHECK(!VmmReadLeaf(space->pageTable,va+3*pageSize));
+    MappingBackingUnref(backing); // VMA is now the descriptor's only owner.
+    backend.unmapOnSync=true;
+    CHECK(UserMappingSync(&actor,space,va.raw(),pageSize,4)==0);
+    CHECK(!space->ranges.head&&vnode.refCount==2);
+    CHECK(FileObjectWritebackAll()==0&&vnode.refCount==1&&!backend.file.writebackVnode);
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
+    FileObjectDispose(&backend.file);
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("SHARED FILE PUBLICATION/SYNC PASS canonical/exposure/protection/range/errors/unmap-during-sync/cleanup");
+}
+}
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
@@ -1830,7 +1936,7 @@ int main(int argc,char** argv) {
     liveMappingClone();sharedMappingClone();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();addressFileGateScope();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
     targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();
-    anonymousDiscard();memoryCensus();
+    anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
