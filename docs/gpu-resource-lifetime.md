@@ -3,9 +3,11 @@
 ## Current acceptance and known failures
 
 The GPU transfer fix and scheduler startup repair are separate from resource
-retirement. Host resources are still not unreferenced on GEM close or compositor
-texture destruction. Do not reset their counters or recycle IDs until the
-ownership and completion rules below are implemented.
+retirement. Private DRM resources now retire after their last owning reference
+and verified GPU completion. Exported display sources remain quarantined;
+compositor texture destruction and resource-ID recycling remain open. Do not
+reset counters or recycle IDs until the remaining completion rules below are
+implemented.
 
 Two bounded guest probes distinguish different exhaustion paths:
 
@@ -39,11 +41,11 @@ alongside the package's existing tests. The `wl_resource_create` failure unwind
 is checked by inspection, not an injected failure in this test.
 
 The kernel import path pins the PRIME FD while reading its capability metadata.
-Import/export copyout failure now removes newly inserted metadata handles or
-FDs, preserving pre-existing handles. Those copyout rollback branches have not
-been fault-injected. Pinning metadata does not establish backing lifetime or
-safe exporter death. Current duplicate lookup compares unrecycled host IDs;
-replace this with shared object identity before enabling ID reuse.
+Import/export copyout failure removes newly inserted handles or FDs, preserving
+pre-existing handles. Those copyout rollback branches have not been fault-injected.
+The subsequent ownership conversion uses shared resource identity for duplicate
+lookup and retains backing/context ownership through PRIME capabilities and VMAs;
+its bounded exporter-close check is described below.
 
 ## Combined application checkpoint
 
@@ -113,10 +115,17 @@ and failed allocation attempts. Counts are cumulative and independently sampled;
 use quiescent endpoints for conservation checks. Releasing a kernel mapping does
 not prove physical-page release while userspace mappings still pin its pages.
 The counters exclude host VRAM, driver upload buffers and compositor allocations.
+Those historical GEM-close discard fields describe the diagnostic kernel before
+shared ownership. The current wire fields are `gem_close_backing_aliases` and
+`gem_close_backing_alias_page_bytes`: they count alias-close events, can count
+shared backing repeatedly, and must not be interpreted as retained bytes. Current
+quiescent retained backing is allocated minus released; separate quarantine
+counters identify permanently retained resources and backing. `failed_retirements`
+excludes intentional exported-source quarantine.
 GEM-close discards are already part of allocated-minus-released; do not subtract
 them a second time. Older guests report `gpu_backing.supported=false`.
 
-The completed tiny mapping/fork probe verified exact deltas of three allocations
+On that diagnostic kernel, the completed tiny mapping/fork probe verified exact deltas of three allocations
 (12,288 bytes), two releases (8,192 bytes), one GEM-close discard (4,096 bytes)
 and no allocation failures. The assertion waits for the full process lineage
 and output EOF, because the probe prints its result before its final FD closes.
@@ -178,29 +187,71 @@ data/Nix/FAT checks returning zero and nine unchanged document fixtures. See
 `build/workloads/drm-map-token-20261019/acceptance-audit.json`. All 46 kernel
 host suites and supported compiled entry/startup audits passed.
 
-These offsets fix identity only. They do not pin the underlying resource in
-the interval between GEM lookup and installing mapping-page references, share
-PRIME backing correctly, or authorize host resource reclamation.
+The offset repair established identity only. The subsequent ownership conversion
+below additionally pins resources during mmap preparation and shares PRIME backing.
 
 ### Shared resources and mappings
 
-Use one shared resource object, independent of recyclable GEM table slots. It
-owns immutable geometry, backing allocation and driver identity/incarnation.
-GEM handles, PRIME capabilities, imported handles, active operations and VMAs
-hold references. Do not retain a whole DRM context from its own GEM objects:
-that creates ownership cycles, including cross-importing contexts.
+One shared resource object now owns geometry, backing allocation and a small GPU
+context lease. GEM handles, PRIME capabilities, imported handles and device
+mapping backings retain it through the existing `MappingBacking` reference API.
+The lease is separate from the DRM file and GEM table, avoiding a resource-to-file
+ownership cycle. Imported transfers use the resource's original GPU context.
 
-Make creation transactional. Check host backing attachment, and roll back
-creation, GEM insertion, FD publication and copyout in dependency order. An
-ambiguous host timeout cannot justify freeing pages the device may still use.
-Quarantine uncertain resources until their retirement can be established.
+Creation allocates owning metadata before requesting a host resource. Backing
+attachment is checked, and creation/copyout failure drops the new GEM reference.
+Ambiguous attachment keeps its backing until verified retirement or quarantine.
+Failed driver creation after host allocation can still retain a host resource;
+this path has not been fault-injected or made reclaimable.
 
-For mappings, acquire the resource reference under `DrmCtx::mappingLock` while
-resolving the GEM. Store it in `DeviceMappingBacking` and release it from that
-mapping backing's final callback. Existing `MappingBacking` ownership then
-carries the resource through preparation, fork, splitting and unmapping. This
-also protects the interval before physical-page pins are installed. Preserve
-the stable mmap-offset identity when converting GEMs to shared resources.
+The mmap path acquires the resource reference under `DrmCtx::mappingLock` before
+installing page pins. `DeviceMappingBacking` carries it through preparation,
+fork, splitting and unmapping. Final release only queues work; the retirement
+worker performs GPU waits and page release outside mapping and FD cleanup locks.
+
+The ABI-22 candidate, kernel SHA-256
+`fbd205b0bbe55b34d0aa327ec184efbe2a5c53ab7a3a88c838158fe9ab16b19a`,
+passed the stale-offset/fork probe, four byte-exact transfer cases, 3,000 imports
+using one GEM handle, and 256 close/import races (18 pinned imports, 238 clean
+rejections). A new `gpu_prime_lifetime_check.py` verifies shared mapped contents
+and writes, exporter/GEM/PRIME-FD close, host upload/readback after exporter close,
+remaining VMAs after all descriptor/handle closure, and fork sharing. It also
+checks presentation rejects unowned or unexported resources and oversized geometry.
+
+Protocol session `5b7cb0b8853d47a0bb0bdaffe0c2d0f1` allocated seven backing
+mappings (28,672 bytes), reclaimed five (20,480 bytes), and intentionally
+quarantined two exported sources (8,192 bytes), with no allocation or retirement
+failure. Every job exited zero with complete output and no remaining lineage.
+Checked shutdown, owned launcher exit zero, offline data/Nix/FAT checks and all
+nine document hashes/UID1000/GID100 ownership passed. See
+`build/workloads/drm-ownership-20261019/protocol-v2/`. The candidate passed all
+47 host suites and supported compiled entry/startup audits. Failure-phase host
+tests cover descriptor identity, response bounds/fence identity and stopping at
+every failed retirement phase; real-device timeout/unref fault injection remains
+open.
+
+### STK memory recovery checkpoint
+
+The same candidate ran STK on eight CPUs, 4 GiB, muted EGL hardware GL and
+private copies of the same prepared image. Session
+`6cbba9591de149588a0a0da8dea55eff` reached the main menu in the captured frame.
+The free-memory safety floor still triggered after about 20 seconds, so gameplay
+and mixed-app acceptance remain open.
+
+At the quiescent post-close snapshot, all launch tasks/windows had drained and
+all audio streams were gone. Of 2,297,008,128 bytes of allocated DRM backing,
+2,289,324,032 were reclaimed. The remaining 7,684,096 bytes were exactly the
+four quarantined exported buffers; there were zero failed allocations or
+retirements. Guest memory fell from 2,550.6 MiB before close to 307.9 MiB after
+close, compared with 2,479.5 MiB retained by the earlier diagnostic kernel.
+This establishes private-backing cleanup, not a reduction in STK's live peak or
+complete host/compositor-resource reclamation.
+
+The owned launcher exited zero after checked shutdown; data/Nix/FAT checks
+passed and nine document hashes and ownership were unchanged. Evidence is in
+`build/workloads/drm-ownership-20261019/stk/`. Exported-source capture, context
+slot recovery and safe ID recycling are still required before repeated-launch
+acceptance can be completed.
 
 ## Presentation completion
 
@@ -209,7 +260,14 @@ while Wayland immediately sends `wl_buffer.release`. A retained resource
 reference alone does not make that valid: the client can overwrite a still-live
 buffer once it receives release.
 
-Resolve presentation through an owned DRM/PRIME capability. Prefer a synchronous
+The legacy syscall now resolves a held GEM capability, requires that it has been
+exported, checks geometry and pins it through publication. Exported resources
+remain quarantined after their last reference, preserving their context namespace
+and backing while a window might retain the numeric ID. This is deliberately
+conservative and can exhaust the 16 context slots over repeated app launches.
+It does not solve source overwrite after `wl_buffer.release`.
+
+Complete presentation through an owned capture. Prefer a synchronous
 capture request serviced by the compositor thread, which owns `g_winTex`:
 
 1. Acquire the source resource reference and window incarnation.
@@ -228,17 +286,23 @@ locks. GPU waits must not hold window, GEM-table or address-space locks.
 
 ## Host retirement and ID allocation
 
-Final reference release enqueues retirement rather than issuing GPU commands
-from arbitrary mapping or FD callbacks. A worker outside those locks must:
+Private-resource final reference release now enqueues retirement rather than
+issuing GPU commands from mapping or FD callbacks. The worker:
 
 1. Complete outstanding work on relevant producer/compositor contexts.
 2. Detach context and backing associations and verify host resource unref.
-3. Free guest backing and recycle the resource slot only after completion.
+3. Frees guest backing only after all steps succeed; failures retain the resource.
+
+IDs are not recycled yet. Control completions validate descriptor identity,
+response bounds and requested fence identity. Timeout or invalid completion
+quarantines the control queue, preventing subsequent responses from authorizing
+retirement. General device recovery and all existing staging-buffer failure
+paths still need work; this is not a full DMA-timeout recovery implementation.
 
 Retire compositor textures as well as application resources. The CPU reader
 epoch protects existing CPU readers; it does not establish host GPU completion.
-`AppPresentBarrier` currently fences app contexts only. Add compositor-context
-completion without recursively acquiring `GpuCmdGuard`.
+Retirement fences both the producer and compositor contexts through a helper
+that runs under the existing `GpuCmdGuard` without recursively acquiring it.
 
 Both `ResourceCreate3D` and native `BufferUpload` need one live/retiring/free ID
 allocator. Their independent upward/downward counters can collide. Either keep

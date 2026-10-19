@@ -3895,10 +3895,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.field("allocated_page_bytes",d.allocatedPageBytes);r.text(",");
         r.field("released_mappings",d.releasedMappings);r.text(",");
         r.field("released_page_bytes",d.releasedPageBytes);r.text(",");
-        r.field("gem_close_discarded_mappings",d.gemCloseDiscardedMappings);r.text(",");
-        r.field("gem_close_discarded_page_bytes",d.gemCloseDiscardedPageBytes);r.text(",");
+        r.field("gem_close_backing_aliases",d.gemCloseBackingAliases);r.text(",");
+        r.field("gem_close_backing_alias_page_bytes",d.gemCloseBackingAliasPageBytes);r.text(",");
         r.field("failed_allocations",d.failedAllocations);r.text(",");
-        r.field("failed_requested_bytes",d.failedRequestedBytes);r.text("}\n");r.send();
+        r.field("failed_requested_bytes",d.failedRequestedBytes);r.text(",");
+        r.field("quarantined_resources",d.quarantinedResources);r.text(",");
+        r.field("quarantined_page_bytes",d.quarantinedPageBytes);r.text(",");
+        r.field("failed_retirements",d.failedRetirements);r.text("}\n");r.send();
     }
     else if (NetStrEq(cmd, "mem census")) { DebugMemoryCensus(); }
     else if (NetStrEq(cmd, "mem pids")) {

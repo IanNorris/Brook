@@ -27,6 +27,7 @@
 #include "string.h"
 #include "spinlock.h"
 #include "virgl_submit.h"
+#include "retirement_protocol.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -100,10 +101,12 @@ static constexpr uint16_t VIRTQ_AVAIL_F_NO_INTERRUPT = 1;
 
 static constexpr uint32_t VIRTIO_GPU_CMD_GET_DISPLAY_INFO      = 0x0100;
 static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_CREATE_2D    = 0x0101;
+static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_UNREF        = 0x0102;
 static constexpr uint32_t VIRTIO_GPU_CMD_SET_SCANOUT           = 0x0103;
 static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_FLUSH        = 0x0104;
 static constexpr uint32_t VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D   = 0x0105;
 static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING = 0x0106;
+static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING = 0x0107;
 static constexpr uint32_t VIRTIO_GPU_CMD_GET_CAPSET_INFO      = 0x0108;
 static constexpr uint32_t VIRTIO_GPU_CMD_GET_CAPSET           = 0x0109;
 static constexpr uint32_t VIRTIO_GPU_RESP_OK_NODATA           = 0x1100;
@@ -136,6 +139,7 @@ static constexpr uint32_t VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM   = 2;
 static constexpr uint32_t VIRTIO_GPU_CMD_CTX_CREATE            = 0x0200;
 static constexpr uint32_t VIRTIO_GPU_CMD_CTX_DESTROY          = 0x0201;
 static constexpr uint32_t VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE   = 0x0202;
+static constexpr uint32_t VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE   = 0x0203;
 static constexpr uint32_t VIRTIO_GPU_CMD_RESOURCE_CREATE_3D    = 0x0204;
 static constexpr uint32_t VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D   = 0x0205;
 static constexpr uint32_t VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D = 0x0206;
@@ -710,12 +714,15 @@ static void NotifyControlQueue()
 // on timeout. Synchronous poll of the used ring (no IRQs) — the display path
 // runs from the compositor thread, never an ISR.
 static uint64_t g_nextRenderFence = 0;
+static bool g_controlQueuePoisoned;
 static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = false)
 {
+    if (g_controlQueuePoisoned) return 0;
+    uint64_t expectedFence=0;
     if (fenced) {
         auto* hdr = reinterpret_cast<VirtioGpuCtrlHdr*>(g_cmdBuf + CMD_REQ_OFF);
         hdr->flags |= 1u; // VIRTIO_GPU_FLAG_FENCE
-        hdr->fence_id = ++g_nextRenderFence;
+        hdr->fence_id = expectedFence=++g_nextRenderFence;
     }
     uint16_t head = static_cast<uint16_t>(g_availIdxShadow % g_queueSize);
     uint16_t d1   = static_cast<uint16_t>((head + 1) % g_queueSize);
@@ -747,11 +754,20 @@ static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = f
             uint16_t slot = g_usedIdxShadow % g_queueSize;
             uint32_t len  = g_usedRing[slot].len;
             ++g_usedIdxShadow;
+            const auto* reply=reinterpret_cast<const VirtioGpuCtrlHdr*>(g_cmdBuf+CMD_RESP_OFF);
+            static_assert(sizeof(*reply)==brook::GpuControlHeaderBytes);
+            if (!brook::GpuControlCompletionValid(head,g_usedRing[slot].id,len,respCap,
+                                                  reply->flags,reply->fence_id,expectedFence)) {
+                g_controlQueuePoisoned=true;
+                SerialPuts("virtio_gpu: invalid control completion; control queue quarantined\n");
+                return 0;
+            }
             return len;
         }
         __asm__ volatile("pause" ::: "memory");
     }
-    SerialPuts("virtio_gpu: command timeout\n");
+    g_controlQueuePoisoned=true;
+    SerialPuts("virtio_gpu: command timeout; control queue quarantined\n");
     return 0;
 }
 
@@ -2667,7 +2683,10 @@ static void AppCtxDestroy(int32_t ctxId)
     memset(req, 0, sizeof(*req));
     req->type   = VIRTIO_GPU_CMD_CTX_DESTROY;
     req->ctx_id = (uint32_t)ctxId;
-    SubmitCommand(sizeof(*req), CMD_RESP_CAP);
+    if (!CmdRespOk(SubmitCommand(sizeof(*req),CMD_RESP_CAP))) {
+        SerialPrintf("virtio_gpu: app ctx %d teardown unverified; retained\n",ctxId);
+        return;
+    }
     c->used = false;
     // Free any upload bounce-buffers owned by this context.
     for (uint32_t i = 0; i < MAX_APP_UPLOADS; ++i)
@@ -2808,15 +2827,42 @@ static int32_t AppSubmit3D(int32_t ctxId, const uint32_t* dwords, uint32_t n)
 
 // Reconstructed BRO-232: a fenced empty submit flushes this app's GL context.
 // QEMU defers used-ring completion until the host GPU signals the fence.
+static bool AppFenceLocked(uint32_t ctxId)
+{
+    if (g_controlQueuePoisoned) return false;
+    auto* sub=reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf+CMD_REQ_OFF);
+    memset(sub,0,sizeof(*sub));sub->hdr.type=VIRTIO_GPU_CMD_SUBMIT_3D;
+    sub->hdr.ctx_id=ctxId;
+    return CmdRespOk(SubmitCommand(sizeof(*sub),CMD_RESP_CAP,true));
+}
 static int32_t AppPresentBarrier(int32_t ctxId)
 {
-    GpuCmdGuard _gcg;
-    if (!AppCtxFind(ctxId)) return -1;
-    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
-    memset(sub, 0, sizeof(*sub));
-    sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
-    sub->hdr.ctx_id = (uint32_t)ctxId;
-    return CmdRespOk(SubmitCommand(sizeof(*sub), CMD_RESP_CAP, true)) ? 0 : -1;
+    GpuCmdGuard guard;
+    return AppCtxFind(ctxId) && AppFenceLocked(static_cast<uint32_t>(ctxId)) ? 0 : -1;
+}
+static int32_t AppRetireResource(int32_t ctxId,int32_t gres)
+{
+    GpuCmdGuard guard;
+    if (g_controlQueuePoisoned || !AppCtxFind(ctxId) || !AppResValid(ctxId,static_cast<uint32_t>(gres))) return -1;
+    auto command=[&](uint32_t type,uint32_t context) {
+        auto* req=reinterpret_cast<VirtioGpuCtxResource*>(g_cmdBuf+CMD_REQ_OFF);
+        memset(req,0,sizeof(*req));req->hdr.type=type;req->hdr.ctx_id=context;
+        req->resource_id=static_cast<uint32_t>(gres);
+        return CmdRespOk(SubmitCommand(sizeof(*req),CMD_RESP_CAP));
+    };
+    // Retiring callers exclude future users. Any failure leaves the guest
+    // allocation quarantined rather than treating ambiguous DMA as complete.
+    const bool retired=brook::GpuRetirementSequence(g_compReady,[&](brook::GpuRetirementStep step) {
+        switch (step) {
+        case brook::GpuRetirementStep::ProducerFence:return AppFenceLocked(static_cast<uint32_t>(ctxId));
+        case brook::GpuRetirementStep::CompositorFence:return AppFenceLocked(COMP_CTX_ID);
+        case brook::GpuRetirementStep::DetachContext:return command(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,static_cast<uint32_t>(ctxId));
+        case brook::GpuRetirementStep::DetachBacking:return command(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING,0);
+        case brook::GpuRetirementStep::Unref:return command(VIRTIO_GPU_CMD_RESOURCE_UNREF,0);
+        }
+        return false;
+    });
+    return retired ? 0 : -1;
 }
 
 static int32_t AppTransfer3D(int32_t ctxId, int32_t gres, int dir,
@@ -2857,6 +2903,7 @@ static const brook::GpuAppOps g_gpuAppOps = {
     AppTransfer3D,
     GetCapsetBlob,
     AppPresentBarrier,
+    AppRetireResource,
 };
 
 static const brook::GpuCompositorOps g_gpuCompositorOps = {

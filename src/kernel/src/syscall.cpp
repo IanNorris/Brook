@@ -17,6 +17,7 @@
 #include "exec_limits.h"
 #include "drm_map_tokens.h"
 #include "drm_backing_diagnostics.h"
+#include "sync/ksemaphore.h"
 #include "exec_image.h"
 #include "fpu_irq.h"
 #include "scheduler.h"
@@ -2863,54 +2864,120 @@ static bool DrmSysIsDir(const char* path) {
 static constexpr uint32_t DRM_MAX_GEM = 2048;
 static DrmMapTokenAllocator g_drmMapTokens;
 static DrmBackingDiagnostics g_drmBackingDiagnostics;
-struct DrmGemObj {
-    bool     used;
-    uint32_t gres;     // host-global virgl resource id (== res_handle)
-    uint32_t size;     // byte size (validate transfers)
-    uint32_t stride;
-    uint32_t width, height;
-    uint64_t backingKva;   // kernel vaddr of mappable backing (0 = not yet mapped)
-    uint32_t backingBytes; // byte size of the backing allocation
-    bool     imported;     // PRIME-imported: gres is owned by another context, so
-                           // this GEM's teardown must NOT free the host resource.
-    uint64_t mapToken;     // issued once, never derived from a recyclable handle
-};
-
-// A DRM PRIME dmabuf handle, modelled as an unforgeable capability: it wraps a
-// host virgl resource id (gres) plus its geometry, and is held by an fd. A
-// client exports its render-target GEM to a PRIME fd (HANDLE_TO_FD), passes the
-// fd over the Wayland socket (SCM_RIGHTS), and the compositor imports it
-// (FD_TO_HANDLE) to obtain a GEM aliasing the SAME gres. Because access is gated
-// by possession of the fd — which only the exporter can hand out — a process
-// cannot reach another process's resource by guessing a gres id. refCount tracks
-// fd references (the export fd, each SCM_RIGHTS copy in flight, each importer
-// fd); the object is freed at zero. NOTE: it deliberately does NOT own the
-// underlying gres lifetime (that stays with the exporter's GpuApp context) —
-// host-side resource refcounting across exporter death is a later hardening step.
-struct DrmPrimeObj {
-    uint32_t gres;        // shared host virgl resource id (the capability target)
-    uint32_t size;        // byte size
-    uint32_t stride;      // row stride in bytes
-    uint32_t width, height;
-    uint32_t fourcc;      // DRM fourcc format (0 if unknown)
-    int32_t  ownerCtxId;  // exporting GpuApp ctx (for validation/logging)
-    uint32_t refCount;    // fd references; freed at 0
-};
-
-static inline void DrmPrimeRef(DrmPrimeObj* p)
-{
-    if (p) __atomic_fetch_add(&p->refCount, 1, __ATOMIC_RELEASE);
+// File contexts own handle tables; resources own only a small GPU-context
+// lease. Keeping these separate prevents GEM/PRIME cross-import ownership cycles.
+struct DrmGpuOwner { uint32_t references; int32_t ctxId; };
+static void DrmOwnerRef(DrmGpuOwner* owner) {
+    __atomic_fetch_add(&owner->references,1,__ATOMIC_RELAXED);
 }
-static inline void DrmPrimeUnref(DrmPrimeObj* p)
-{
-    if (!p) return;
-    if (__atomic_fetch_sub(&p->refCount, 1, __ATOMIC_ACQ_REL) <= 1)
-        kfree(p);
+static void DrmOwnerUnref(DrmGpuOwner* owner) {
+    if (__atomic_fetch_sub(&owner->references,1,__ATOMIC_ACQ_REL)!=1) return;
+    const auto* ga=GpuAppGet();
+    if (owner->ctxId>0 && ga && ga->CtxDestroy) ga->CtxDestroy(owner->ctxId);
+    kfree(owner);
+}
+struct DrmResource {
+    MappingBacking* lifetime;
+    DrmGpuOwner* owner;
+    uint32_t gres,size,stride,width,height;
+    uint64_t backingKva;
+    uint32_t backingBytes;
+    KMutex backingLock;
+    bool backingAttached;
+    bool everExported;
+    DrmResource* retiredNext;
+};
+// Final callbacks only enqueue: GPU waits never enter mapping/FD cleanup locks.
+// Exported sources stay quarantined until owned compositor capture replaces
+// the legacy numeric presentation contract.
+static KMutex g_drmRetirementLock{};
+static DrmResource* g_drmRetiredResources;
+static DrmResource* g_drmQuarantinedResources;
+static KSemaphore g_drmRetirementReady{};
+static bool g_drmRetirementWorkerStarted;
+static void DrmRetirementWorker(void*) {
+    for (;;) {
+        KSemaphoreWait(&g_drmRetirementReady);
+        KMutexLock(&g_drmRetirementLock);
+        auto* resource=g_drmRetiredResources;
+        g_drmRetiredResources=resource->retiredNext;
+        KMutexUnlock(&g_drmRetirementLock);
+        const auto* ga=GpuAppGet();
+        const bool exported=__atomic_load_n(&resource->everExported,__ATOMIC_ACQUIRE);
+        const bool retired=!resource->gres || (!exported && ga && ga->RetireResource &&
+            ga->RetireResource(resource->owner->ctxId,static_cast<int32_t>(resource->gres))==0);
+        if (!retired) {
+            __atomic_fetch_add(&g_drmBackingDiagnostics.quarantinedResources,1,__ATOMIC_RELAXED);
+            const uint64_t bytes=(static_cast<uint64_t>(resource->backingBytes)+4095)&~uint64_t{4095};
+            __atomic_fetch_add(&g_drmBackingDiagnostics.quarantinedPageBytes,bytes,__ATOMIC_RELAXED);
+            if (!exported) __atomic_fetch_add(&g_drmBackingDiagnostics.failedRetirements,1,__ATOMIC_RELAXED);
+            KMutexLock(&g_drmRetirementLock);
+            resource->retiredNext=g_drmQuarantinedResources;
+            g_drmQuarantinedResources=resource;
+            KMutexUnlock(&g_drmRetirementLock);
+            continue;
+        }
+        if (resource->backingKva) {
+            const uint64_t pages=(static_cast<uint64_t>(resource->backingBytes)+4095)/4096;
+            VmmFreePages(VirtualAddress(resource->backingKva),pages);
+            __atomic_fetch_add(&g_drmBackingDiagnostics.releasedMappings,1,__ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_drmBackingDiagnostics.releasedPageBytes,pages*4096,__ATOMIC_RELAXED);
+        }
+        auto* owner=resource->owner;kfree(resource);DrmOwnerUnref(owner);
+    }
+}
+static bool DrmEnsureRetirementWorker() {
+    KMutexLock(&g_drmRetirementLock);
+    if (g_drmRetirementWorkerStarted) { KMutexUnlock(&g_drmRetirementLock);return true; }
+    auto* worker=KernelThreadCreate("drm_retire",DrmRetirementWorker,nullptr);
+    if (!worker) { KMutexUnlock(&g_drmRetirementLock);return false; }
+    g_drmRetirementWorkerStarted=true;
+    KMutexUnlock(&g_drmRetirementLock);
+    SchedulerAddProcess(worker);
+    return true;
+}
+static void DrmResourceLastReference(void* object) {
+    auto* resource=static_cast<DrmResource*>(object);
+    KMutexLock(&g_drmRetirementLock);
+    resource->retiredNext=g_drmRetiredResources;
+    g_drmRetiredResources=resource;
+    KMutexUnlock(&g_drmRetirementLock);
+    KSemaphoreSignal(&g_drmRetirementReady);
+}
+static DrmResource* DrmResourceCreate(DrmGpuOwner* owner,uint32_t gres,uint32_t size,
+                                    uint32_t stride,uint32_t width,uint32_t height) {
+    if (!DrmEnsureRetirementWorker()) return nullptr;
+    auto* resource=static_cast<DrmResource*>(kmalloc(sizeof(DrmResource)));
+    if (!resource) return nullptr;
+    memset(resource,0,sizeof(*resource));
+    resource->owner=owner;resource->gres=gres;resource->size=size;
+    resource->stride=stride;resource->width=width;resource->height=height;
+    KMutexInit(&resource->backingLock);
+    resource->lifetime=MappingBackingCreate(resource,DrmResourceLastReference);
+    if (!resource->lifetime) { kfree(resource);return nullptr; }
+    DrmOwnerRef(owner);
+    return resource;
+}
+struct DrmGemObj {
+    bool used;
+    DrmResource* resource;
+    uint64_t mapToken; // issued once for this file's GEM incarnation
+};
+// The exported capability owns the resource independently of its source GEM
+// and file. FdRef/SCM_RIGHTS/fork references retain this capability in turn.
+struct DrmPrimeObj { DrmResource* resource; uint32_t refCount; };
+static inline void DrmPrimeRef(DrmPrimeObj* p) {
+    if (p) __atomic_fetch_add(&p->refCount,1,__ATOMIC_RELAXED);
+}
+static inline void DrmPrimeUnref(DrmPrimeObj* p) {
+    if (p && __atomic_fetch_sub(&p->refCount,1,__ATOMIC_ACQ_REL)==1) {
+        MappingBackingUnref(p->resource->lifetime);kfree(p);
+    }
 }
 struct DrmCtx {
-    volatile uint32_t refCount; // descriptor/fork ownership of the shared context
-    int32_t   ctxId;   // GpuApp virgl context (0 = not yet created)
-    DrmGemObj gem[DRM_MAX_GEM];   // index i -> bo_handle (i+1); 0 is invalid
+    volatile uint32_t refCount;
+    DrmGpuOwner* owner;
+    DrmGemObj gem[DRM_MAX_GEM];
     KMutex mappingLock;
 };
 struct DrmMappingGuard {
@@ -2918,28 +2985,27 @@ struct DrmMappingGuard {
     explicit DrmMappingGuard(DrmCtx* value) : context(value) { KMutexLock(&context->mappingLock); }
     ~DrmMappingGuard() { KMutexUnlock(&context->mappingLock); }
 };
-
-// Allocate a GEM handle (1-based) for a freshly created resource. Returns 0 on
-// table-full.
-static uint32_t DrmGemAlloc(DrmCtx* c, uint32_t gres, uint32_t size,
-                            uint32_t stride, uint32_t w, uint32_t h) {
-    for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
+static uint32_t DrmGemAlloc(DrmCtx* c,uint32_t gres,uint32_t size,
+                           uint32_t stride,uint32_t w,uint32_t h) {
+    for (uint32_t i=0;i<DRM_MAX_GEM;++i) {
         if (c->gem[i].used) continue;
-        c->gem[i] = { true, gres, size, stride, w, h, 0, 0, false, 0 };
-        return i + 1;
+        auto* resource=DrmResourceCreate(c->owner,gres,size,stride,w,h);
+        if (!resource) return 0;
+        c->gem[i]={true,resource,0};return i+1;
     }
     return 0;
 }
-// Allocate a GEM handle aliasing an externally-owned (PRIME-imported) gres. The
-// resulting GEM is marked `imported` so teardown never frees the host resource.
-static uint32_t DrmGemAllocImported(DrmCtx* c, uint32_t gres, uint32_t size,
-                                    uint32_t stride, uint32_t w, uint32_t h) {
-    for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
+static uint32_t DrmGemAllocImported(DrmCtx* c,DrmResource* resource) {
+    for (uint32_t i=0;i<DRM_MAX_GEM;++i) {
         if (c->gem[i].used) continue;
-        c->gem[i] = { true, gres, size, stride, w, h, 0, 0, true, 0 };
-        return i + 1;
+        MappingBackingRef(resource->lifetime);
+        c->gem[i]={true,resource,0};return i+1;
     }
     return 0;
+}
+static void DrmGemDrop(DrmGemObj* gem) {
+    auto* resource=gem->resource;*gem={};
+    MappingBackingUnref(resource->lifetime);
 }
 static DrmGemObj* DrmGemGet(DrmCtx* c, uint32_t bo_handle) {
     if (bo_handle == 0 || bo_handle > DRM_MAX_GEM) return nullptr;
@@ -2954,10 +3020,13 @@ DrmBackingDiagnostics DrmBackingDiagnosticsRead() {
             __atomic_load_n(&d.allocatedPageBytes,__ATOMIC_RELAXED),
             __atomic_load_n(&d.releasedMappings,__ATOMIC_RELAXED),
             __atomic_load_n(&d.releasedPageBytes,__ATOMIC_RELAXED),
-            __atomic_load_n(&d.gemCloseDiscardedMappings,__ATOMIC_RELAXED),
-            __atomic_load_n(&d.gemCloseDiscardedPageBytes,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.gemCloseBackingAliases,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.gemCloseBackingAliasPageBytes,__ATOMIC_RELAXED),
             __atomic_load_n(&d.failedAllocations,__ATOMIC_RELAXED),
-            __atomic_load_n(&d.failedRequestedBytes,__ATOMIC_RELAXED)};
+            __atomic_load_n(&d.failedRequestedBytes,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.quarantinedResources,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.quarantinedPageBytes,__ATOMIC_RELAXED),
+            __atomic_load_n(&d.failedRetirements,__ATOMIC_RELAXED)};
 }
 
 static int ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize);
@@ -3063,8 +3132,11 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         memset(dctx, 0, sizeof(DrmCtx));
         KMutexInit(&dctx->mappingLock);
         dctx->refCount = 1;
+        dctx->owner=static_cast<DrmGpuOwner*>(kmalloc(sizeof(DrmGpuOwner)));
+        if (!dctx->owner) { kfree(dctx);return -ENOMEM; }
+        *dctx->owner={1,0};
         int fd = FdAlloc(proc, FdType::DevDri, dctx);
-        if (fd < 0) { kfree(dctx); return -EMFILE; }
+        if (fd < 0) { DrmOwnerUnref(dctx->owner);kfree(dctx);return -EMFILE; }
         DbgPrintf("sys_open: /dev/dri/renderD128 → fd %d\n", fd);
         return fd;
     }
@@ -3461,22 +3533,13 @@ void FinalizeClosedFd(const FdClaimResult& c)
 
     if (c.type == FdType::DevDri && c.handle)
     {
-        // Tear down the per-fd context and GEM table. Host RESOURCE_UNREF and
-        // shared backing lifetime remain open; see docs/gpu-resource-lifetime.md.
+        // Drop file-owned references. Resource retirement runs independently;
+        // exported presentation retirement remains open (see the lifetime doc).
         auto* dctx = static_cast<DrmCtx*>(c.handle);
         if (__atomic_fetch_sub(&dctx->refCount, 1, __ATOMIC_ACQ_REL) > 1) return;
-        const brook::GpuAppOps* ga = brook::GpuAppGet();
-        if (ga && ga->CtxDestroy && dctx->ctxId > 0)
-            ga->CtxDestroy(dctx->ctxId);
-        // Free any mappable resource backing allocated by VIRTGPU_MAP.
-        for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
-            if (dctx->gem[i].used && dctx->gem[i].backingKva) {
-                uint64_t bpages = (dctx->gem[i].backingBytes + 4095) / 4096;
-                VmmFreePages(VirtualAddress(dctx->gem[i].backingKva), bpages);
-                __atomic_fetch_add(&g_drmBackingDiagnostics.releasedMappings,1,__ATOMIC_RELAXED);
-                __atomic_fetch_add(&g_drmBackingDiagnostics.releasedPageBytes,bpages*4096,__ATOMIC_RELAXED);
-            }
-        }
+        for (uint32_t i=0;i<DRM_MAX_GEM;++i)
+            if (dctx->gem[i].used) DrmGemDrop(&dctx->gem[i]);
+        DrmOwnerUnref(dctx->owner);
         kfree(dctx);
     }
 
@@ -3843,6 +3906,7 @@ enum MmapProt : uint64_t {
 struct DeviceMappingBacking {
     uint64_t kernelBase, physicalBase;
     bool firmware;
+    MappingBacking* resourceLifetime;
 };
 struct MappingBackingGuard {
     MappingBacking* value = nullptr;
@@ -3882,7 +3946,10 @@ static int PrepareDeviceMapping(MappingTransaction& operation, const UserMapping
     }
     return 0;
 }
-static void ReleaseDeviceMapping(void* object) { kfree(object); }
+static void ReleaseDeviceMapping(void* object) {
+    auto* source=static_cast<DeviceMappingBacking*>(object);
+    MappingBackingUnref(source->resourceLifetime);kfree(source);
+}
 static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t offset)
 {
@@ -3947,8 +4014,12 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             auto* context=static_cast<DrmCtx*>(entry->handle);if (!context) return -ENODEV;
             DrmMappingGuard guard(context);
             auto* gem=DrmFindMapToken(context->gem,DRM_MAX_GEM,offset);
-            if (!gem || !gem->backingKva) return -EINVAL;
-            source->kernelBase=gem->backingKva;available=(gem->backingBytes+4095)&~uint64_t{4095};
+            if (!gem || !gem->resource->backingKva || !gem->resource->backingAttached) return -EINVAL;
+            auto* resource=gem->resource;
+            MappingBackingRef(resource->lifetime); // before releasing the GEM lock
+            source->resourceLifetime=resource->lifetime;
+            source->kernelBase=resource->backingKva;
+            available=(static_cast<uint64_t>(resource->backingBytes)+4095)&~uint64_t{4095};
         } else {
             uint32_t width,height,stride;uint64_t physical;
             if (!TtyGetFramebufferPhys(&physical,&width,&height,&stride)) return -ENODEV;
@@ -5740,15 +5811,22 @@ static void DrmFillStr(uint64_t userPtr, uint64_t& userLen, const char* s)
 // applies to the *render target* being read, not just the staging buffer, so we
 // must attach backing to every resource at creation time, not lazily at MAP
 // (Mesa never MAPs a render target). Idempotent: a second call is a no-op once
-// backingKva is set, so MAP reuses the same pages. Returns false only on OOM.
-static bool DrmEnsureBacking(DrmCtx* dctx, DrmGemObj* g)
+// attachment is verified, so MAP reuses the same pages. Ambiguous attachment
+// retains its allocation for safe retirement/quarantine and returns false.
+static bool DrmEnsureBacking(DrmGemObj* gem)
 {
-    if (g->backingKva != 0) return true;
+    auto* g=gem->resource;
+    struct Guard {
+        KMutex* lock;
+        explicit Guard(KMutex* value):lock(value){KMutexLock(lock);}
+        ~Guard(){KMutexUnlock(lock);}
+    } guard(&g->backingLock);
+    if (g->backingKva != 0) return g->backingAttached;
     uint32_t bytes = g->backingBytes ? g->backingBytes
                    : (g->size ? g->size
                               : g->stride * (g->height ? g->height : 1));
     if (bytes == 0) return false;
-    uint64_t pages = (bytes + 4095) / 4096;
+    uint64_t pages = (static_cast<uint64_t>(bytes) + 4095) / 4096;
     VirtualAddress kva = VmmAllocPages(pages, VMM_WRITABLE,
                                        MemTag::Device, KernelPid);
     if (!kva.raw()) {
@@ -5761,11 +5839,12 @@ static bool DrmEnsureBacking(DrmCtx* dctx, DrmGemObj* g)
     auto* zp = reinterpret_cast<volatile uint8_t*>(kva.raw());
     for (uint64_t b = 0; b < pages * 4096; ++b) zp[b] = 0;
     const brook::GpuAppOps* ga = brook::GpuAppGet();
-    if (ga && ga->ResourceAttachUser)
-        ga->ResourceAttachUser(dctx->ctxId, (int32_t)g->gres, kva.raw(), bytes);
+    const bool attached=ga && ga->ResourceAttachUser &&
+        ga->ResourceAttachUser(g->owner->ctxId,(int32_t)g->gres,kva.raw(),bytes)>=0;
     g->backingKva = kva.raw();
     g->backingBytes = bytes;
-    return true;
+    g->backingAttached=attached;
+    return attached;
 }
 
 static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
@@ -5852,13 +5931,13 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
     {
         // Create the per-fd virgl context. We ignore the requested capset
         // params (only VIRGL is offered); the GpuApp driver picks VIRGL.
-        if (dctx->ctxId > 0) return 0;   // already initialised
+        if (dctx->owner->ctxId > 0) return 0;   // already initialised
         const brook::GpuAppOps* ga = brook::GpuAppGet();
         if (!ga || !ga->CtxCreate) return -ENODEV;
         Process* proc = ProcessCurrent();
         int32_t ctx = ga->CtxCreate(proc ? proc->pid : 0);
         if (ctx < 0) return -ENOMEM;
-        dctx->ctxId = ctx;
+        dctx->owner->ctxId = ctx;
         return 0;
     }
     case DRM_NR_VIRTGPU_RESOURCE_CREATE:
@@ -5870,12 +5949,12 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         const brook::GpuAppOps* ga = brook::GpuAppGet();
         if (!ga || !ga->ResourceCreate3D) return -ENODEV;
         // Context is created lazily if the client skipped CONTEXT_INIT.
-        if (dctx->ctxId <= 0) {
+        if (dctx->owner->ctxId <= 0) {
             if (!ga->CtxCreate) return -ENODEV;
             Process* proc = ProcessCurrent();
             int32_t ctx = ga->CtxCreate(proc ? proc->pid : 0);
             if (ctx < 0) return -ENOMEM;
-            dctx->ctxId = ctx;
+            dctx->owner->ctxId = ctx;
         }
         // target 0 = PIPE_BUFFER: a 1D linear buffer whose "width" is a byte
         // count (e.g. glReadPixels staging), so it can far exceed the 2D texture
@@ -5888,16 +5967,6 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             return -EINVAL;
         }
         uint32_t createH = rc.height ? rc.height : 1;   // PIPE_BUFFER is 1D (h=0)
-        int32_t gres = ga->ResourceCreate3D(dctx->ctxId, rc.target, rc.format,
-                                            rc.bind, rc.width, createH,
-                                            rc.depth, rc.array_size,
-                                            rc.last_level, rc.nr_samples,
-                                            rc.flags);
-        if (gres < 0) {
-            SerialPrintf("drm: resource create failed ctx=%d target=%u size=%ux%u\n",
-                         dctx->ctxId,rc.target,rc.width,createH);
-            return -ENOMEM;
-        }
         // For a buffer the "stride" is its byte length, not width*texel; for a
         // 2D texture default to width*4 bytes/texel when the client omits stride.
         uint32_t stride = rc.stride ? rc.stride
@@ -5907,26 +5976,41 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         // the full row-stride*height extent. Buffers carry a real byte count.
         uint32_t size = isBuffer ? (rc.size ? rc.size : rc.width)
                                  : stride * createH;
-        uint32_t bo = DrmGemAlloc(dctx, (uint32_t)gres, size, stride,
-                                  rc.width, createH);
+        // Allocate owning metadata before creating a host resource, so every
+        // successful host allocation has a tracked rollback/retirement owner.
+        uint32_t bo = DrmGemAlloc(dctx,0,size,stride,rc.width,createH);
         if (bo == 0) {
-            SerialPrintf("drm: GEM table full ctx=%d capacity=%u gres=%d\n",
-                         dctx->ctxId,DRM_MAX_GEM,gres);
+            SerialPrintf("drm: GEM metadata allocation failed ctx=%d capacity=%u\n",
+                         dctx->owner->ctxId,DRM_MAX_GEM);
             return -ENOMEM;
         }
+        int32_t gres = ga->ResourceCreate3D(dctx->owner->ctxId, rc.target, rc.format,
+                                            rc.bind, rc.width, createH,
+                                            rc.depth, rc.array_size,
+                                            rc.last_level, rc.nr_samples,
+                                            rc.flags);
+        if (gres < 0) {
+            SerialPrintf("drm: resource create failed ctx=%d target=%u size=%ux%u\n",
+                         dctx->owner->ctxId,rc.target,rc.width,createH);
+            DrmGemDrop(&dctx->gem[bo-1]);
+            return -ENOMEM;
+        }
+        dctx->gem[bo-1].resource->gres=static_cast<uint32_t>(gres);
         // Attach guest backing now (not lazily at MAP): a render target read by
         // Mesa's glReadPixels COPY_TRANSFER3D must already have an iov, or
         // virglrenderer rejects the command (check_copy_transfer3d_handles).
         DrmGemObj* gobj = DrmGemGet(dctx, bo);
-        if (gobj && !DrmEnsureBacking(dctx, gobj)) {
+        if (gobj && !DrmEnsureBacking(gobj)) {
             SerialPrintf("drm: resource backing allocation failed ctx=%d gres=%d bytes=%u\n",
-                         dctx->ctxId,gres,gobj->size);
+                         dctx->owner->ctxId,gres,gobj->resource->size);
+            DrmGemDrop(gobj);
             return -ENOMEM;
         }
         rc.res_handle = (uint32_t)gres;   // host id, used inside virgl streams
         rc.bo_handle  = bo;               // per-fd GEM handle, used in ioctls
         rc.size = size; rc.stride = stride;
-        return CopyToUser(arg, &rc, sizeof(rc)) ? 0 : -EFAULT;
+        if (!CopyToUser(arg,&rc,sizeof(rc))) { DrmGemDrop(gobj);return -EFAULT; }
+        return 0;
     }
     case DRM_NR_VIRTGPU_RESOURCE_INFO:
     {
@@ -5936,8 +6020,8 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         DrmVirtgpuResourceInfo ri = *reinterpret_cast<DrmVirtgpuResourceInfo*>(arg);
         DrmGemObj* g = DrmGemGet(dctx, ri.bo_handle);
         if (!g) return -ENOENT;
-        ri.res_handle = g->gres;
-        ri.size = g->size;
+        ri.res_handle = g->resource->gres;
+        ri.size = g->resource->size;
         ri.blob_mem = 0;
         return CopyToUser(arg, &ri, sizeof(ri)) ? 0 : -EFAULT;
     }
@@ -5947,9 +6031,9 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpu3dTransfer)))
             return -EFAULT;
         DrmVirtgpu3dTransfer t = *reinterpret_cast<DrmVirtgpu3dTransfer*>(arg);
-        if (dctx->ctxId <= 0) return -EINVAL;
         DrmGemObj* g = DrmGemGet(dctx, t.bo_handle);
         if (!g) return -ENOENT;
+        if (g->resource->owner->ctxId <= 0) return -EINVAL;
         const brook::GpuAppOps* ga = brook::GpuAppGet();
         if (!ga || !ga->Transfer3D) return -ENODEV;
         int dir = (nr == DRM_NR_VIRTGPU_TRANSFER_TO_HOST) ? 0 : 1;
@@ -5957,7 +6041,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         const brook::GpuTransfer3D transfer{
             t.box.x,t.box.y,t.box.z,t.box.w,t.box.h,t.box.d,
             t.offset,t.level,t.stride,t.layer_stride};
-        int32_t r = ga->Transfer3D(dctx->ctxId, (int32_t)g->gres, dir,
+        int32_t r = ga->Transfer3D(g->resource->owner->ctxId, (int32_t)g->resource->gres, dir,
                                    transfer);
         return r < 0 ? -EIO : 0;
     }
@@ -5966,7 +6050,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!UserBufferReadable(arg, sizeof(DrmVirtgpuExecbuffer)))
             return -EFAULT;
         DrmVirtgpuExecbuffer eb = *reinterpret_cast<DrmVirtgpuExecbuffer*>(arg);
-        if (dctx->ctxId <= 0) return -EINVAL;
+        if (dctx->owner->ctxId <= 0) return -EINVAL;
         if (eb.size == 0 || (eb.size & 3) || eb.size > 1024u * 1024) return -EINVAL;
         if (!UserBufferReadable(eb.command, eb.size)) return -EFAULT;
         const brook::GpuAppOps* ga = brook::GpuAppGet();
@@ -5976,14 +6060,14 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!cmd) return -ENOMEM;
         for (uint32_t i = 0; i < nDw; ++i)
             cmd[i] = reinterpret_cast<const uint32_t*>(eb.command)[i];
-        int32_t r = ga->Submit3D(dctx->ctxId, cmd, nDw);
+        int32_t r = ga->Submit3D(dctx->owner->ctxId, cmd, nDw);
         kfree(cmd);
         if (r < 0) return -EIO;
         // QEMU can acknowledge SUBMIT_3D while rendering is still in flight.
         // Complete a real fence on the app context before handing Mesa a
         // signaled fd: the compositor samples this buffer in another context.
         if (eb.flags & 0x02 /*FENCE_FD_OUT*/) {
-            if (!ga->PresentBarrier || ga->PresentBarrier(dctx->ctxId) < 0)
+            if (!ga->PresentBarrier || ga->PresentBarrier(dctx->owner->ctxId) < 0)
                 return -EIO;
             int fenceFd = -1;
             Process* fp = ProcessCurrent();
@@ -6025,16 +6109,14 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!proc) return -ESRCH;
         auto* p = static_cast<DrmPrimeObj*>(kmalloc(sizeof(DrmPrimeObj)));
         if (!p) return -ENOMEM;
-        p->gres       = g->gres;
-        p->size       = g->size;
-        p->stride     = g->stride;
-        p->width      = g->width;
-        p->height     = g->height;
-        p->fourcc     = 0;
-        p->ownerCtxId = dctx->ctxId;
-        p->refCount   = 1;   // held by the fd we are about to allocate
+        p->resource=g->resource;
+        MappingBackingRef(p->resource->lifetime);
+        p->refCount=1;
+        // Sticky until owned presentation capture exists: exported resources
+        // cannot be reclaimed while a window may retain their numeric ID.
+        __atomic_store_n(&p->resource->everExported,true,__ATOMIC_RELEASE);
         int fd = FdAlloc(proc, FdType::DrmPrime, p);
-        if (fd < 0) { kfree(p); return -EMFILE; }
+        if (fd < 0) { DrmPrimeUnref(p);return -EMFILE; }
         ph.fd = fd;
         if (!CopyToUser(arg, &ph, sizeof(ph))) {
             CloseProcessFd(proc, fd);
@@ -6061,22 +6143,21 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         auto* p = static_cast<DrmPrimeObj*>(fde->handle);
         // Repeated PRIME imports into one DRM file describe one GEM handle,
         // including imports through separately exported FDs and self-import.
-        // Host IDs are not recycled today; shared object identity must replace
-        // this comparison before resource-ID recycling is enabled.
+        // Compare shared object identity, independently of host ID or GEM-slot
+        // reuse. The pinned PRIME capability retains that exact object.
         for (uint32_t i = 0; i < DRM_MAX_GEM; ++i) {
-            if (dctx->gem[i].used && dctx->gem[i].gres == p->gres) {
+            if (dctx->gem[i].used && dctx->gem[i].resource == p->resource) {
                 ph.handle = i + 1;
                 return CopyToUser(arg, &ph, sizeof(ph)) ? 0 : -EFAULT;
             }
         }
-        uint32_t bo = DrmGemAllocImported(dctx, p->gres, p->size, p->stride,
-                                          p->width, p->height);
+        uint32_t bo = DrmGemAllocImported(dctx,p->resource);
         if (bo == 0) return -ENOMEM;
         ph.handle = bo;
         if (!CopyToUser(arg, &ph, sizeof(ph))) {
-            // This is a metadata-only alias: creation allocated no new host
-            // resource or backing. Undo only this newly inserted handle.
-            dctx->gem[bo - 1] = {};
+            // Drop only the newly inserted alias/reference. Existing shared
+            // handles and the PRIME capability remain owned by their callers.
+            DrmGemDrop(&dctx->gem[bo-1]);
             return -EFAULT;
         }
         return 0;
@@ -6087,14 +6168,14 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         DrmGemClose gc = *reinterpret_cast<DrmGemClose*>(arg);
         DrmGemObj* g = DrmGemGet(dctx, gc.handle);
         if (!g) return -ENOENT;
-        // Drops only the GEM alias today. Host retirement and backing leases
-        // are still required before IDs or device-visible pages can be reused.
-        if (g->backingKva) {
-            const uint64_t pages=(static_cast<uint64_t>(g->backingBytes)+4095)/4096;
-            __atomic_fetch_add(&g_drmBackingDiagnostics.gemCloseDiscardedMappings,1,__ATOMIC_RELAXED);
-            __atomic_fetch_add(&g_drmBackingDiagnostics.gemCloseDiscardedPageBytes,pages*4096,__ATOMIC_RELAXED);
+        // Drop this alias; other handles, PRIME capabilities and VMAs retain
+        // the shared resource. The last reference queues verified retirement.
+        if (g->resource->backingKva) {
+            const uint64_t pages=(static_cast<uint64_t>(g->resource->backingBytes)+4095)/4096;
+            __atomic_fetch_add(&g_drmBackingDiagnostics.gemCloseBackingAliases,1,__ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_drmBackingDiagnostics.gemCloseBackingAliasPageBytes,pages*4096,__ATOMIC_RELAXED);
         }
-        g->used = false;
+        DrmGemDrop(g);
         return 0;
     }
     case DRM_NR_VIRTGPU_MAP:
@@ -6110,7 +6191,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         DrmVirtgpuMap m = *reinterpret_cast<DrmVirtgpuMap*>(arg);
         DrmGemObj* g = DrmGemGet(dctx, m.handle);
         if (!g) return -ENOENT;
-        if (!DrmEnsureBacking(dctx, g)) return -ENOMEM;
+        if (!DrmEnsureBacking(g)) return -ENOMEM;
         if (!g->mapToken) {
             g->mapToken = g_drmMapTokens.Allocate();
             if (!g->mapToken) return -ENOMEM;
@@ -11125,7 +11206,27 @@ static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
-    if (wmId == 0 || gres == 0) return -EINVAL;
+    constexpr uint64_t wireMax=0xffffffffULL;
+    if (!wmId || wmId>wireMax || !gres || gres>wireMax || !w || !h ||
+        w>wireMax || h>wireMax) return -EINVAL;
+    // This legacy ABI names a resource numerically, but the caller must own
+    // its GEM capability. In particular, never permit an unexported resource
+    // to become an untracked compositor source before enabling reclamation.
+    MappingBackingGuard pin;
+    DrmResource* resource=nullptr;
+    for (uint32_t fd=0;fd<MAX_FDS && !resource;++fd) {
+        FdRef descriptor(proc,static_cast<int>(fd));
+        if (!descriptor || descriptor->type!=FdType::DevDri || !descriptor->handle) continue;
+        auto* context=static_cast<DrmCtx*>(descriptor->handle);
+        DrmMappingGuard guard(context);
+        for (auto& gem:context->gem) {
+            if (!gem.used || gem.resource->gres!=gres) continue;
+            if (!__atomic_load_n(&gem.resource->everExported,__ATOMIC_ACQUIRE)) return -EINVAL;
+            resource=gem.resource;MappingBackingRef(resource->lifetime);
+            pin.value=resource->lifetime;break;
+        }
+    }
+    if (!resource || w>resource->width || h>resource->height) return -EINVAL;
     return brook::WmPresentExternalById(proc, static_cast<uint32_t>(wmId),
                                         static_cast<uint32_t>(gres),
                                         static_cast<uint32_t>(w),

@@ -85,6 +85,11 @@ struct GpuAppOps {
     // Wait for this context's host GPU work before another context samples it.
     // A virtqueue submission acknowledgement alone is not a render fence.
     int32_t (*PresentBarrier)(int32_t ctxId);
+
+    // Complete producer/compositor work, detach backing/context associations,
+    // and unref the host resource. Return 0 only after verified completion.
+    // Caller must exclude all future resource users before calling this.
+    int32_t (*RetireResource)(int32_t ctxId, int32_t resId);
 };
 
 // Register the app-GPU ops (called by the display driver once its 3D path is

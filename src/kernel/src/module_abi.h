@@ -44,7 +44,8 @@ namespace brook {
 // ABI 18 adds retained-vnode access and real-ID filesystem permission callbacks.
 // ABI 19 adds owned vnode directory paths and retained-inode path lookup.
 // ABI 21 preserves full resource-box coordinates and byte layout in GpuAppOps transfers.
-static constexpr uint32_t MODULE_ABI_VERSION = 21;
+// ABI 22 adds verified resource retirement to GpuAppOps.
+static constexpr uint32_t MODULE_ABI_VERSION = 22;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'
