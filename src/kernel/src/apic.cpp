@@ -657,6 +657,20 @@ void ApicSendNmi(uint8_t targetApicId)
     LapicWrite(LapicReg::ICR_LO, (0x4 << 8) | (1u << 14));
 }
 
+bool ApicSendNmiBounded(uint8_t targetApicId)
+{
+    if (!g_lapicVirt) return false;
+    for (uint32_t i=0;i<100000;++i) {
+        if (!(LapicRead(LapicReg::ICR_LO)&(1u<<12))) {
+            LapicWrite(LapicReg::ICR_HI,static_cast<uint32_t>(targetApicId)<<24);
+            LapicWrite(LapicReg::ICR_LO,(0x4<<8)|(1u<<14));
+            return true;
+        }
+        __asm__ volatile("pause" ::: "memory");
+    }
+    return false;
+}
+
 void ApicBroadcastNmi()
 {
     if (!g_lapicVirt) return; // LAPIC not initialized

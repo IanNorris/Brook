@@ -1,3 +1,5 @@
+#include "smp_boot_policy.h"
+#include "panic.h"
 #include "smp.h"
 #include "acpi.h"
 #include "apic.h"
@@ -38,6 +40,9 @@ struct APDataBlock {
     uint64_t gdtBase;        // [+26] GDT base
     uint16_t idtLimit;       // [+34] IDT limit
     uint64_t idtBase;        // [+36] IDT base
+#if BROOK_SMP_BOOT_TEST_STAGE
+    volatile uint32_t testGate; // [+44] test-only stackless trampoline gate
+#endif
 } __attribute__((packed));
 
 // ---------------------------------------------------------------------------
@@ -47,7 +52,13 @@ struct APDataBlock {
 static constexpr uint64_t AP_STACK_PAGES = 16;
 static CpuInfo     g_cpus[MAX_CPUS];
 static uint32_t    g_cpuCount    = 0;
-static uint32_t    g_onlineCount = 0;
+static SmpBootAdmission g_bootAdmission;
+static bool g_bootstrapRetained;
+static void VerifyDenseOnlinePrefix();
+#if BROOK_SMP_BOOT_TEST_STAGE
+static volatile uint32_t g_smpTestPrivateGate;
+static uint8_t g_smpTestTrampoline[4096];
+#endif
 static bool        g_smpReady    = false;
 
 bool SmpBootstrapStackBounds(uint32_t cpu, uint64_t& base, uint64_t& end)
@@ -60,7 +71,7 @@ bool SmpBootstrapStackBounds(uint32_t cpu, uint64_t& base, uint64_t& end)
     return true;
 }
 
-// Volatile signal: set by AP to tell BSP it's alive.
+// Slot-tagged acknowledgement, published only from the private high stack.
 static volatile uint32_t g_apSignal = 0;
 
 // ---------------------------------------------------------------------------
@@ -79,6 +90,7 @@ static void InstallPanicNmiHandler();
 
 // Per-AP activation flag: BSP sets to 1 to tell AP to proceed.
 static volatile uint32_t g_apActivate[MAX_CPUS] = {};
+static bool g_apNmiReady[MAX_CPUS] = {};
 
 // Count of APs that have completed GdtLoadOnAp (including ltr).
 static volatile uint32_t g_apGdtReady = 0;
@@ -148,7 +160,7 @@ void ApEntryFunction()
     SerialPrintf("SMP: AP %u online\n", myId);
 
     // Determine our CPU index.
-    uint32_t myCpuIndex = 0;
+    uint32_t myCpuIndex = MAX_CPUS;
     for (uint32_t i = 0; i < g_cpuCount; ++i)
     {
         if (g_cpus[i].apicId == myId)
@@ -158,8 +170,31 @@ void ApEntryFunction()
         }
     }
 
-    // Signal BSP that we're alive
-    __atomic_store_n(&g_apSignal, 1, __ATOMIC_RELEASE);
+    if (myCpuIndex==MAX_CPUS) {
+        SerialPrintf("SMP: unknown APIC ID %u parked\n",myId);
+        for (;;) __asm__ volatile("pause" ::: "memory");
+    }
+    uint64_t rsp,stackBase,stackEnd;
+    __asm__ volatile("mov %%rsp,%0" : "=r"(rsp));
+    if (!SmpBootstrapStackBounds(myCpuIndex,stackBase,stackEnd) ||
+        rsp<stackBase || rsp>=stackEnd)
+        KernelPanic("SMP: AP%u arrived on wrong bootstrap stack",myCpuIndex);
+#if BROOK_SMP_BOOT_TEST_STAGE == 2
+    if (myCpuIndex==3) {
+        __atomic_store_n(&g_smpTestPrivateGate,2u,__ATOMIC_RELEASE);
+        while (__atomic_load_n(&g_smpTestPrivateGate,__ATOMIC_ACQUIRE)!=3u)
+            __asm__ volatile("pause" ::: "memory");
+    }
+#endif
+#if BROOK_SMP_BOOT_TEST_STAGE
+    if (myCpuIndex==3) {
+        if (g_cpus[3].online || __atomic_load_n(&g_apActivate[3],__ATOMIC_ACQUIRE))
+            KernelPanic("SMP_BOOT_TEST: late AP admitted");
+        SerialPrintf("SMP_BOOT_TEST: late AP3 parked on private stack 0x%lx\n",rsp);
+    }
+#endif
+    // All trampoline reads and temporary-stack operations have finished.
+    __atomic_store_n(&g_apSignal,myCpuIndex+1,__ATOMIC_RELEASE);
 
     // Spin-wait for activation from BSP.
     while (!__atomic_load_n(&g_apActivate[myCpuIndex], __ATOMIC_ACQUIRE))
@@ -170,12 +205,17 @@ void ApEntryFunction()
     // Load per-CPU GDT/TSS.
     GdtLoadOnAp(g_apTssSelector[myCpuIndex]);
 
-    // Signal BSP that this AP has completed ltr (GDT is now modified).
-    __atomic_fetch_add(&g_apGdtReady, 1, __ATOMIC_RELEASE);
-
     // Set up KernelCpuEnv and GS base for SWAPGS.
     KernelCpuEnv* env = g_apEnv[myCpuIndex];
     CpuSetKernelGsBase(env);
+    // Kernel NMI delivery uses this CPU's TSS/IST and GS environment. A
+    // timed-out, unactivated AP has neither and must never receive panic NMI.
+    __atomic_store_n(&g_apNmiReady[myCpuIndex],true,__ATOMIC_SEQ_CST);
+    // Either the panic scanner sees readiness, or this full StoreLoad pair
+    // observes its already-published panic and prevents scheduler entry.
+    if (__atomic_load_n(&g_panicHaltActive,__ATOMIC_SEQ_CST))
+        for (;;) __asm__ volatile("cli; hlt" ::: "memory");
+    __atomic_fetch_add(&g_apGdtReady,1,__ATOMIC_RELEASE);
 
     // Set up SYSCALL MSRs.
     CpuInitSyscallMsrs(reinterpret_cast<uint64_t>(&BrookSyscallDispatcher));
@@ -238,18 +278,18 @@ static void BusySleepUs(uint32_t us)
 // Boot one AP
 // ---------------------------------------------------------------------------
 
-static bool BootAP(uint8_t apicId, uint8_t sipiVector)
+static bool BootAP(uint32_t slot,uint8_t apicId, uint8_t sipiVector)
 {
     LapicWrite(0x280, 0);
     LapicRead(0x280);
 
     LapicWrite(LapicReg::ICR_HI, static_cast<uint32_t>(apicId) << 24);
     LapicWrite(LapicReg::ICR_LO, 0x00004500);
-    WaitForIpiIdle();
+    if (!WaitForIpiIdle()) return false;
 
     LapicWrite(LapicReg::ICR_HI, static_cast<uint32_t>(apicId) << 24);
     LapicWrite(LapicReg::ICR_LO, 0x00008500);
-    WaitForIpiIdle();
+    if (!WaitForIpiIdle()) return false;
 
     BusySleepMs(10);
 
@@ -259,12 +299,12 @@ static bool BootAP(uint8_t apicId, uint8_t sipiVector)
         LapicWrite(LapicReg::ICR_HI, static_cast<uint32_t>(apicId) << 24);
         LapicWrite(LapicReg::ICR_LO, 0x00000600 | sipiVector);
         BusySleepUs(200);
-        WaitForIpiIdle();
+        if (!WaitForIpiIdle()) return false;
     }
 
     for (uint32_t t = 0; t < 200; ++t)
     {
-        if (__atomic_load_n(&g_apSignal, __ATOMIC_ACQUIRE))
+        if (__atomic_load_n(&g_apSignal, __ATOMIC_ACQUIRE)==slot+1)
             return true;
         BusySleepMs(1);
     }
@@ -284,25 +324,19 @@ uint32_t SmpInit()
     KPrintf("SMP: BSP LAPIC ID=%u, %u processor(s) in MADT\n",
                  bspId, madt.processorCount);
 
-    if (madt.processorCount <= 1)
-    {
-        g_cpus[0].apicId = bspId;
-        g_cpus[0].isBsp  = true;
-        g_cpus[0].online = true;
-        g_cpuCount = 1;
-        g_onlineCount = 1;
+    uint8_t ids[MAX_CPUS]{};
+    const uint32_t count=madt.processorCount<=ACPI_MAX_PROCESSORS ? madt.processorCount : 0;
+    g_cpuCount=SmpOrderApicIds(madt.apicIds,count,bspId,ids,MAX_CPUS);
+    if (!g_cpuCount) KernelPanic("SMP: invalid CPU topology");
+    for (uint32_t i=0;i<g_cpuCount;++i) {
+        g_cpus[i].apicId=ids[i];
+        g_cpus[i].isBsp=(i==0);
+        g_cpus[i].online=(i==0);
+    }
+    if (g_cpuCount==1) {
         InstallPanicNmiHandler();
         return 1;
     }
-
-    g_cpuCount = madt.processorCount;
-    for (uint32_t i = 0; i < g_cpuCount && i < MAX_CPUS; ++i)
-    {
-        g_cpus[i].apicId = madt.apicIds[i];
-        g_cpus[i].isBsp  = (madt.apicIds[i] == bspId);
-        g_cpus[i].online = g_cpus[i].isBsp;
-    }
-    g_onlineCount = 1;
 
     static constexpr uint64_t TRAMPOLINE_PHYS = 0x8000;
     static constexpr uint8_t  SIPI_VECTOR     = TRAMPOLINE_PHYS / 0x1000;
@@ -349,6 +383,7 @@ uint32_t SmpInit()
         if (g_cpus[i].isBsp)
             continue;
 
+        if (!g_bootAdmission.CanStart(i)) KernelPanic("SMP: invalid next CPU slot %u",i);
         uint8_t apicId = g_cpus[i].apicId;
 
         // This stack remains the AP's idle/scheduler stack after startup.
@@ -360,7 +395,8 @@ uint32_t SmpInit()
         if (!stackBase)
         {
             KPrintf("SMP: failed to allocate stack for AP %u\n", apicId);
-            continue;
+            g_bootAdmission.Stop();
+            break;
         }
         uint64_t stackTop = stackBase.raw() + AP_STACK_PAGES * 4096 - 16;
         g_cpus[i].kernelStack = stackTop;
@@ -380,31 +416,71 @@ uint32_t SmpInit()
         data->idtLimit = idtDesc.limit;
         data->idtBase  = idtDesc.base;
 
+#if BROOK_SMP_BOOT_TEST_STAGE
+        data->testGate=(BROOK_SMP_BOOT_TEST_STAGE==1 && i==3) ? 1u : 0u;
+        for (uint32_t b=0;b<trampolineSize;++b) g_smpTestTrampoline[b]=trampolineDst[b];
+#endif
         __asm__ volatile("wbinvd" ::: "memory");
 
         __atomic_store_n(&g_apSignal, 0, __ATOMIC_RELEASE);
         KPrintf("SMP: booting AP %u (LAPIC ID %u)...\n", i, apicId);
 
-        if (BootAP(apicId, SIPI_VECTOR))
+        if (BootAP(i,apicId, SIPI_VECTOR))
         {
+            if (!g_bootAdmission.Accept(i,__atomic_load_n(&g_apSignal,__ATOMIC_ACQUIRE)))
+                KernelPanic("SMP: non-prefix CPU admission at %u",i);
             g_cpus[i].online = true;
-            g_onlineCount++;
             KPrintf("SMP: AP %u (LAPIC ID %u) online ✓\n", i, apicId);
         }
         else
         {
-            KPrintf("SMP: AP %u (LAPIC ID %u) failed to respond\n", i, apicId);
+            KPrintf("SMP: AP %u (LAPIC ID %u) failed to respond; remaining APs parked\n", i, apicId);
+            // This AP may still consume low-memory code/data or its temporary
+            // stack. Never rewrite/unmap them, start another AP, or free its
+            // private stack after ambiguous startup completion.
+#if BROOK_SMP_BOOT_TEST_STAGE
+            if (i!=3 || data->stack64!=stackTop)
+                KernelPanic("SMP_BOOT_TEST: unexpected startup failure");
+            if (BROOK_SMP_BOOT_TEST_STAGE==1 && data->testGate!=2u)
+                KernelPanic("SMP_BOOT_TEST: pre-stack gate was not reached");
+            if (BROOK_SMP_BOOT_TEST_STAGE==2 &&
+                __atomic_load_n(&g_smpTestPrivateGate,__ATOMIC_ACQUIRE)!=2u)
+                KernelPanic("SMP_BOOT_TEST: private-stack gate was not reached");
+#endif
+            g_bootstrapRetained=true;
+            g_bootAdmission.Stop();
+            break;
         }
     }
 
-    VmmUnmapPage(VmmKernelCR3(), VirtualAddress(TRAMPOLINE_PHYS));
-    VmmUnmapPage(VmmKernelCR3(), VirtualAddress(TEMP_STACK_PHYS));
+    if (!g_bootstrapRetained) {
+        VmmUnmapPage(VmmKernelCR3(), VirtualAddress(TRAMPOLINE_PHYS));
+        VmmUnmapPage(VmmKernelCR3(), VirtualAddress(TEMP_STACK_PHYS));
+    } else SerialPuts("SMP: retained bootstrap mappings for late AP; activation remains disabled\n");
 
-    KPrintf("SMP: %u/%u CPUs online\n", g_onlineCount, g_cpuCount);
+#if BROOK_SMP_BOOT_TEST_STAGE
+    if (!g_bootstrapRetained || g_bootAdmission.Count()!=3 || g_cpus[3].online)
+        KernelPanic("SMP_BOOT_TEST: missing dense timeout prefix");
+    auto* testData=reinterpret_cast<APDataBlock*>(trampolineDst+dataBlockOffset);
+    // Real-mode startup patches its far-jump/GDT addresses in the code page.
+    // Preserve the immutable input data block (apart from the explicit gate).
+    for (uint32_t b=dataBlockOffset;b<dataBlockOffset+44;++b)
+        if (trampolineDst[b]!=g_smpTestTrampoline[b])
+            KernelPanic("SMP_BOOT_TEST: bootstrap input changed after timeout");
+    if (BROOK_SMP_BOOT_TEST_STAGE==1) testData->testGate=3;
+    else __atomic_store_n(&g_smpTestPrivateGate,3u,__ATOMIC_RELEASE);
+    for (uint32_t t=0;t<1000 && __atomic_load_n(&g_apSignal,__ATOMIC_ACQUIRE)!=4u;++t)
+        BusySleepMs(1);
+    if (__atomic_load_n(&g_apSignal,__ATOMIC_ACQUIRE)!=4u)
+        KernelPanic("SMP_BOOT_TEST: late AP did not finish private-stack handoff");
+    SerialPrintf("SMP_BOOT_TEST_PASS stage=%u online=3 retained=1 late_slot=3\n",BROOK_SMP_BOOT_TEST_STAGE);
+#endif
+    VerifyDenseOnlinePrefix();
+    KPrintf("SMP: %u/%u CPUs online\n", g_bootAdmission.Count(), g_cpuCount);
 
     InstallPanicNmiHandler();
 
-    return g_onlineCount;
+    return g_bootAdmission.Count();
 }
 
 // ---------------------------------------------------------------------------
@@ -414,12 +490,20 @@ uint32_t SmpInit()
 // Forward-declare the syscall table getter (defined in syscall.cpp).
 uint64_t SyscallGetTableAddress();
 
+static void VerifyDenseOnlinePrefix() {
+    if (!g_cpuCount || !g_cpus[0].isBsp) KernelPanic("SMP: missing logical BSP");
+    for (uint32_t i=0;i<g_cpuCount;++i)
+        if (g_cpus[i].online!=(i<g_bootAdmission.Count()))
+            KernelPanic("SMP: sparse online CPU set at %u",i);
+}
+
 void SmpPrepareAPs()
 {
-    if (g_onlineCount <= 1)
+    VerifyDenseOnlinePrefix();
+    if (g_bootAdmission.Count() <= 1)
         return;
 
-    KPrintf("SMP: preparing %u APs for scheduling\n", g_onlineCount - 1);
+    KPrintf("SMP: preparing %u APs for scheduling\n", g_bootAdmission.Count() - 1);
 
     for (uint32_t i = 0; i < g_cpuCount && i < MAX_CPUS; ++i)
     {
@@ -434,7 +518,7 @@ void SmpPrepareAPs()
 
         // Allocate per-CPU KernelCpuEnv + syscall stack.
         auto* env = static_cast<KernelCpuEnv*>(kmalloc(sizeof(KernelCpuEnv)));
-        if (!env) { SerialPrintf("SMP: OOM allocating KernelCpuEnv for AP%u\n", i); continue; }
+        if (!env) KernelPanic("SMP: OOM preparing KernelCpuEnv for AP%u",i);
         __builtin_memset(env, 0, sizeof(KernelCpuEnv));
 
         constexpr uint64_t SYSCALL_STACK_PAGES = 16;  // 64 KB
@@ -442,7 +526,7 @@ void SmpPrepareAPs()
         VirtualAddress scBase = VmmAllocPages(
             SYSCALL_STACK_PAGES + GUARD_PAGES,
             VMM_WRITABLE, MemTag::KernelData, KernelPid);
-        if (scBase)
+        if (!scBase) KernelPanic("SMP: OOM preparing syscall stack for AP%u",i);
         {
             VmmUnmapPage(KernelPageTable, scBase); // guard page
             uint64_t scTop = scBase.raw() + (SYSCALL_STACK_PAGES + GUARD_PAGES) * 0x1000 - 16;
@@ -462,7 +546,8 @@ void SmpPrepareAPs()
 
 void SmpActivateAPs()
 {
-    if (g_onlineCount <= 1)
+    VerifyDenseOnlinePrefix();
+    if (g_bootAdmission.Count() <= 1)
         return;
 
     // Signal all APs to start — they will init per-CPU state and enter
@@ -472,6 +557,8 @@ void SmpActivateAPs()
     {
         if (g_cpus[i].isBsp || !g_cpus[i].online)
             continue;
+        if (!g_apEnv[i] || !g_apEnv[i]->syscallStack || !g_apTssSelector[i])
+            KernelPanic("SMP: incomplete preparation for AP%u",i);
         __atomic_store_n(&g_apActivate[i], 1, __ATOMIC_RELEASE);
         apCount++;
     }
@@ -484,7 +571,7 @@ void SmpActivateAPs()
 
 uint32_t SmpGetCpuCount()
 {
-    return g_onlineCount;
+    return g_bootAdmission.Count();
 }
 
 const CpuInfo* SmpGetCpu(uint32_t index)
@@ -526,6 +613,7 @@ uint32_t SmpCurrentCpuIndex()
 
 void SmpEnableFastCpuIndex()
 {
+    __atomic_store_n(&g_apNmiReady[0],true,__ATOMIC_RELEASE);
     g_smpReady = true;
 }
 
@@ -654,22 +742,29 @@ extern "C" void PanicNmiHandlerAsm();
 
 uint32_t SmpHaltAllAPs()
 {
-    // Only the first caller broadcasts NMI — subsequent calls skip
+    // Only the first caller sends halt NMIs; subsequent calls observe its count.
     bool expected = false;
     if (!__atomic_compare_exchange_n(&g_panicHaltActive, &expected, true,
                                      false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
     {
-        // Already in panic halt — don't re-broadcast
+        // Already in panic halt; do not send another round.
         return __atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE);
     }
 
     __atomic_store_n(&g_haltedCount, 0, __ATOMIC_SEQ_CST);
 
-    // Send NMI to all other CPUs
-    ApicBroadcastNmi();
+    // A parked or not-yet-prepared AP has no valid NMI IST. Target only
+    // accepted CPUs whose per-CPU TSS/GS setup is published, excluding self.
+    if (!g_cpuCount) return 0; // panic before SMP/LAPIC discovery
+    const uint8_t self=ApicGetId();
+    uint32_t expected_count=0;
+    for (uint32_t i=0;i<g_cpuCount;++i) {
+        if (!g_cpus[i].online || g_cpus[i].apicId==self ||
+            !__atomic_load_n(&g_apNmiReady[i],__ATOMIC_ACQUIRE)) continue;
+        ++expected_count;ApicSendNmiBounded(g_cpus[i].apicId);
+    }
 
-    // Wait up to ~10ms for APs to halt (they should respond almost instantly)
-    uint32_t expected_count = g_onlineCount > 1 ? g_onlineCount - 1 : 0;
+    // Wait up to ~10ms for prepared targets to halt.
     for (uint32_t spin = 0; spin < 10000; ++spin)
     {
         if (__atomic_load_n(&g_haltedCount, __ATOMIC_ACQUIRE) >= expected_count)

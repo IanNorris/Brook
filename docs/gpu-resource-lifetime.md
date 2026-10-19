@@ -266,6 +266,35 @@ failures. Both apps' lineages drained, audio was empty, and checked shutdown,
 owned launcher exit zero, offline filesystem checks and nine document fixtures
 passed. See `build/workloads/drm-ownership-20261019/stk-recovery/acceptance-audit.json`.
 
+### Subsequent mixed-application review failed
+
+Native review `17a539b49090473980023e6fe524ec2f`, kernel `fbd205b0…`, did
+not pass acceptance. Chromium was open before Quake; both slowed down, and
+Quake improved after Chromium was minimized. After Quake closed, STK crashed
+and Firefox did not finish starting. Serial logs show zero free physical pages,
+failed process-stack and DRM backing allocations, and user faults. The Quake
+wrapper selected its default GL1 renderer in this run; it was not a GL3 repeat.
+
+After STK exited, allocated-minus-released DRM backing was 31,567,872 bytes,
+exactly the ten quarantined exported resources, with zero failed retirements.
+The private-backing cleanup is still observed, but it does not bound live
+application memory demand. The subsequent 1.5-second capture reported 914
+samples, 5,715 switches and no producer drops; it was taken after exhaustion and
+cannot establish the healthy concurrent-render bottleneck. Its CPU coverage is
+also incomplete: the startup log shows a timed-out CPU6 followed by CPU7 online,
+and the profiler iterates online cardinality as an index bound, omitting CPU7.
+The same sparse-index error affects TLB invalidation and PMM retirement barriers.
+The separate startup safety defect is addressed by the [dense-prefix admission
+repair](smp-startup.md); fresh mixed-application acceptance remains open.
+
+After handback, all recorded application launch lineages drained, audio streams
+were empty, checked shutdown completed, QEMU's supervisor recorded exit zero,
+and offline data/Nix/FAT checks plus nine document hashes/ownership passed.
+The user-owned outer launcher's wait result was not independently observed.
+Failure disks remain private under `build/reviews/gpu-ownership-20261019`;
+evidence is `build/workloads/drm-ownership-20261019/native-review-failure/`.
+Main remains unchanged.
+
 ## Presentation completion
 
 The current `WM_PRESENT_GRES` stores a raw ID for later compositor sampling,

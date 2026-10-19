@@ -3,6 +3,10 @@ project(brook-kernel C CXX ASM)
 option(BROOK_MAPPING_TEST_HOOKS "Enable guest-controlled mapping fault barriers (test kernels only)" OFF)
 option(BROOK_REGISTER_TEST_HOOKS "Enable controlled kernel register probes (test kernels only)" OFF)
 option(BROOK_SCHED_START_TEST_HOOKS "Force delayed-AP first-dispatch regression cases (test kernels only)" OFF)
+set(BROOK_SMP_BOOT_TEST_STAGE "0" CACHE STRING "Test-only AP3 delay: 0 disabled, 1 trampoline, 2 private stack")
+if(NOT BROOK_SMP_BOOT_TEST_STAGE MATCHES "^[012]$")
+    message(FATAL_ERROR "BROOK_SMP_BOOT_TEST_STAGE must be 0, 1 or 2")
+endif()
 
 if(NOT DEFINED BROOK_ROOT)
     set(BROOK_ROOT "${CMAKE_SOURCE_DIR}/../..")
@@ -439,6 +443,8 @@ endif()
 if(BROOK_SCHED_START_TEST_HOOKS)
     target_compile_definitions(kernel PRIVATE BROOK_SCHED_START_TEST_HOOKS=1)
 endif()
+
+target_compile_definitions(kernel PRIVATE BROOK_SMP_BOOT_TEST_STAGE=${BROOK_SMP_BOOT_TEST_STAGE})
 
 # Interrupt handler files and panic must NOT use SSE/FPU registers.
 # -mgeneral-regs-only overrides the global -msse2/-mfpmath=sse for these files.

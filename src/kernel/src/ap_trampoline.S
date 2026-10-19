@@ -118,6 +118,18 @@ ap_entry_64:
     // EBX still holds page_base (zero-extended to RBX in 64-bit mode)
     movl    %ebx, %ebx                 // zero-extend EBX → RBX
 
+#if BROOK_SMP_BOOT_TEST_STAGE == 1
+    // Stackless deterministic late-AP gate: before lretq uses the temporary
+    // stack and before stack64 is consumed. BSP releases only after timeout.
+    cmpl    $1, (ap_data_test_gate - _ap_trampoline_start)(%rbx)
+    jne     8f
+    movl    $2, (ap_data_test_gate - _ap_trampoline_start)(%rbx)
+7:  pause
+    cmpl    $3, (ap_data_test_gate - _ap_trampoline_start)(%rbx)
+    jne     7b
+8:
+#endif
+
     // Now load the real kernel GDT (64-bit lgdt reads 10-byte descriptor)
     lgdt    (ap_data_gdt64 - _ap_trampoline_start)(%rbx)
 
@@ -198,6 +210,11 @@ ap_data_gdt64:
 ap_data_idt:
     .word   0                          // [+34] IDT limit
     .quad   0                          // [+36] IDT base
+
+#if BROOK_SMP_BOOT_TEST_STAGE
+ap_data_test_gate:
+    .long   0                          // [+44] test-only pre-stack gate
+#endif
 
 _ap_trampoline_end:
 

@@ -27,7 +27,8 @@ uint32_t SmpInit();
 void SmpPrepareAPs();
 void SmpActivateAPs();
 
-// Get the number of online CPUs.
+// Get the number of online CPUs. Accepted indices are a dense prefix [0,N);
+// startup stops on the first failure and never activates a later slot.
 uint32_t SmpGetCpuCount();
 
 // Get the CpuInfo for a CPU by index (0 = BSP).

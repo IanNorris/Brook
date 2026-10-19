@@ -107,7 +107,7 @@ the table distinguishes tested behavior from remaining limitations.
   building the kernel, modules and bare-metal tests took 52–54 seconds.
   The [virtio-net TX ownership fix](docs/package-pipeline.md) reduced
   the measured clean-image SDK install from 732 to 236 seconds; compilation
-  remains about 50 seconds. Current host validation covers 47 suites; both full
+  remains about 50 seconds. Current host validation covers 48 suites; both full
   bootstrap paths still need renewal beyond that pinned 40-suite checkpoint.
 
 - **Desktop identity and package registration:** new apps and Terminal run as
@@ -167,7 +167,7 @@ the table distinguishes tested behavior from remaining limitations.
 
 ### Kernel
 - **UEFI bootloader** — custom bootloader loads ELF kernel at high virtual addresses
-- **SMP** — symmetric multiprocessing with per-CPU context and idle threads; the default round-robin policy uses a shared ready queue
+- **SMP** — symmetric multiprocessing with per-CPU context and idle threads; the default round-robin policy uses a shared ready queue. [Late-CPU startup admission](docs/smp-startup.md) preserves dense CPU membership for TLB barriers and profiling.
 - **Scheduling** — round robin remains the default. An optional MLFQ module has a [safety audit and integration blockers](docs/mlfq-safety.md)
 - **Virtual memory** — 4-level paging, per-PID ownership tracking, guard pages, demand-zero private anonymous mmap, on-demand mprotect, sparse ELF segments and COW reuse of initialized executable pages
 - **Kernel heap** — first-fit kmalloc/kfree allocator with coalescing; kmutex, krwlock, ksemaphore

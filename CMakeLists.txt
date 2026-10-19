@@ -3,6 +3,10 @@ project(Brook NONE)
 option(BROOK_MAPPING_TEST_HOOKS "Enable mapping fault barriers in test kernels only" OFF)
 option(BROOK_REGISTER_TEST_HOOKS "Enable controlled kernel register probes in test kernels only" OFF)
 option(BROOK_SCHED_START_TEST_HOOKS "Force delayed-AP first-dispatch regression cases (test kernels only)" OFF)
+set(BROOK_SMP_BOOT_TEST_STAGE "0" CACHE STRING "Test-only AP3 delay: 0 disabled, 1 trampoline, 2 private stack")
+if(NOT BROOK_SMP_BOOT_TEST_STAGE MATCHES "^[012]$")
+    message(FATAL_ERROR "BROOK_SMP_BOOT_TEST_STAGE must be 0, 1 or 2")
+endif()
 
 include(ExternalProject)
 
@@ -36,6 +40,7 @@ ExternalProject_Add(kernel
         -DBROOK_MAPPING_TEST_HOOKS=${BROOK_MAPPING_TEST_HOOKS}
         -DBROOK_REGISTER_TEST_HOOKS=${BROOK_REGISTER_TEST_HOOKS}
         -DBROOK_SCHED_START_TEST_HOOKS=${BROOK_SCHED_START_TEST_HOOKS}
+        -DBROOK_SMP_BOOT_TEST_STAGE=${BROOK_SMP_BOOT_TEST_STAGE}
     BUILD_ALWAYS  TRUE
     INSTALL_COMMAND ""
 )

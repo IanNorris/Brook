@@ -92,6 +92,8 @@ uint64_t ApicTickCount();
 
 // Send an NMI to a specific CPU by LAPIC ID.
 void ApicSendNmi(uint8_t targetApicId);
+// Panic path: refuse an unavailable/busy LAPIC rather than waiting forever.
+bool ApicSendNmiBounded(uint8_t targetApicId);
 
 // Broadcast NMI to all CPUs except self (for panic halt).
 void ApicBroadcastNmi();
