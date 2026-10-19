@@ -313,8 +313,26 @@ Outgoing pollable FDs represent an already verified selected-timeline completion
 they are not general sync_file objects. The pinned Venus build simulates the
 sync objects needed by these tests. GPU readback proves actual queue execution;
 renderer ring0 acknowledgement by itself does not. Sizes above the current
-32-bit resource-info limit are rejected. Native Wayland Vulkan WSI, triangle
-rasterization and real Vulkan workloads are subsequent gates.
+32-bit resource-info limit are rejected. Native Wayland Vulkan WSI and real
+Vulkan workloads are subsequent gates.
+
+### Offscreen rasterization checkpoint
+
+The same pinned driver now passes a real graphics pipeline in addition to the
+compute checks: GLSL vertex/fragment shaders draw a green triangle into a 64×64
+device-local optimal-tiled RGBA image, then transfer it into a mapped buffer.
+Seven interior/background pixels must match exactly after fence completion and
+host visibility. An optional `BROOK_VULKAN_TRIANGLE_OUTPUT` writes the returned
+pixels as PPM; this is GPU readback, not a window screenshot.
+
+Host Intel, Linux Venus and Brook all pass. Evidence is under
+`build/workloads/vulkan-triangle-20261019/{host-intel,linux-intel,candidate}`.
+Brook uses the unchanged ABI 31 kernel above, passes the context/blob and
+persistent GL checks in the same run, retires all host resources, preserves the
+12 document fixtures and saved profiles, and shuts down with four clean offline
+filesystem checks. `candidate/triangle.png` enlarges the 64×64 readback with
+nearest-neighbor sampling for inspection. Windowed swapchain presentation is
+still a separate, unaccepted gate.
 
 ## Active goal
 

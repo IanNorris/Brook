@@ -132,7 +132,8 @@ def main():
     passed = (renderer_verified and not timed_out and not renderer_errors and exit_code == 0 and len(ended) == 1
               and all(int(value) == 0 for value in ended[0])
               and len(records) == 2 and all(record['passed'] for record in records)
-              and records[-1].get('driver_id') == 22 and records[-1].get('rounds') == 3)
+              and records[-1].get('driver_id') == 22 and records[-1].get('rounds') == 3
+              and records[-1].get('triangle_passed') is True)
     result = dict(passed=passed, qemu_exit=exit_code, timed_out=timed_out,
                   seconds=time.monotonic() - start, end_markers=ended, probes=records,
                   serial_sha256=sha(serial) if serial.exists() else None,

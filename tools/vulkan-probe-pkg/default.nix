@@ -8,6 +8,8 @@ pkgs.stdenv.mkDerivation {
   buildPhase = ''
     runHook preBuild
     glslangValidator -V --target-env vulkan1.1 probe.comp -o probe.spv
+    glslangValidator -V --target-env vulkan1.1 triangle.vert -o vertex.spv
+    glslangValidator -V --target-env vulkan1.1 triangle.frag -o fragment.spv
     python3 - <<'PY'
     import struct
     from pathlib import Path
@@ -15,6 +17,12 @@ pkgs.stdenv.mkDerivation {
     words = struct.unpack('<' + 'I' * (len(data) // 4), data)
     Path('probe_spv.h').write_text('static const uint32_t shaderCode[] = {\n' +
         ',\n'.join('0x%08xu' % word for word in words) + '\n};\n')
+    text = ""
+    for name in ('vertex', 'fragment'):
+        data = Path(name + '.spv').read_bytes()
+        words = struct.unpack('<' + 'I' * (len(data) // 4), data)
+        text += 'static const uint32_t ' + name + 'Code[] = {\n' + ',\n'.join('0x%08xu' % word for word in words) + '\n};\n'
+    Path('triangle_spv.h').write_text(text)
     PY
     $CC -std=c11 -O2 -Wall -Wextra -Werror probe.c -lvulkan -o vulkan-probe
     $CC -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror \

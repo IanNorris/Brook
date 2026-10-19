@@ -58,6 +58,8 @@ static void json_string(const char* text)
 #define CHECK_VK(call) do { VkResult status = (call); if (status != VK_SUCCESS) { \
     fprintf(stderr, "VULKAN_PROBE_ERROR %s result=%d\n", #call, status); goto cleanup; } } while (0)
 
+#include "triangle.h"
+
 int main(int argc, char** argv)
 {
     const char* expected = argc == 3 && !strcmp(argv[1], "--expect-driver") ? argv[2] : "hardware";
@@ -106,7 +108,7 @@ int main(int argc, char** argv)
     VkQueueFamilyProperties queues[64];
     vkGetPhysicalDeviceQueueFamilyProperties(physical, &families, queues);
     for (uint32_t i = 0; i < families; ++i)
-        if (queues[i].queueCount && (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) { family = i; break; }
+        if (queues[i].queueCount && ((queues[i].queueFlags & (VK_QUEUE_COMPUTE_BIT|VK_QUEUE_GRAPHICS_BIT)) == (VK_QUEUE_COMPUTE_BIT|VK_QUEUE_GRAPHICS_BIT))) { family = i; break; }
     if (family == UINT32_MAX) goto cleanup;
     float priority = 1;
     VkDeviceQueueCreateInfo queueInfo = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -216,6 +218,7 @@ int main(int argc, char** argv)
             }
         }
     }
+    CHECK_VK(render_triangle(device,physical,&memory,queue,command,fence,&readback));
     CHECK_VK(vkDeviceWaitIdle(device));
     passed = 1;
 cleanup:
@@ -236,8 +239,8 @@ cleanup:
     printf("{\"passed\":%s,\"device\":", passed ? "true" : "false"); json_string(properties.deviceName);
     printf(",\"driver\":"); json_string(driver.driverName);
     printf(",\"driver_id\":%u,\"vendor_id\":%u,\"device_id\":%u,\"words_per_round\":%u,\"rounds\":%u,"
-           "\"upload_memory_flags\":%u,\"readback_memory_flags\":%u}\n",
+           "\"upload_memory_flags\":%u,\"readback_memory_flags\":%u,\"triangle_passed\":%s}\n",
            driver.driverID, properties.vendorID, properties.deviceID, WORDS, passed ? ROUNDS : 0,
-           upload.flags, readback.flags);
+           upload.flags, readback.flags, passed ? "true" : "false");
     return passed ? 0 : 1;
 }
