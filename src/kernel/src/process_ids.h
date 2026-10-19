@@ -10,17 +10,19 @@ class ProcessIdPool {
     static_assert(Capacity>1&&Capacity<=65536,"PID pool must fit uint16_t");
     uint16_t freeIds[Capacity]{};
     uint8_t flags[Capacity]{}; // bit 0: allocated; bit 1: unpublished user birth
-    uint32_t next=1,freeCount=0,pending=0;
+    uint32_t next=1,freeHead=0,freeCount=0,pending=0;
     bool userClosed=false;
 public:
     uint16_t Allocate(bool user) {
         if(user&&userClosed)return 0;
         uint16_t pid;
-        if(freeCount)pid=freeIds[--freeCount];
-        else {
-            if(next>=Capacity)return 0;
-            pid=static_cast<uint16_t>(next++);
-        }
+        // Numeric PIDs escape into userspace (e.g. delayed kill(pid) timers).
+        // Prefer never-issued IDs, then recycle in release order rather than
+        // immediately aliasing the most recently exited process or thread.
+        if(next<Capacity)pid=static_cast<uint16_t>(next++);
+        else if(freeCount) {
+            pid=freeIds[freeHead];freeHead=(freeHead+1)%Capacity;--freeCount;
+        } else return 0;
         flags[pid]=user?3:1;
         if(user)++pending;
         return pid;
@@ -35,7 +37,7 @@ public:
     bool Release(uint16_t pid) {
         if(!pid||pid>=Capacity||!(flags[pid]&1))return false;
         if(flags[pid]&2)--pending;
-        flags[pid]=0;freeIds[freeCount++]=pid;return true;
+        flags[pid]=0;freeIds[(freeHead+freeCount)%Capacity]=pid;++freeCount;return true;
     }
     uint32_t SetUserClosed(bool closed) {userClosed=closed;return pending;}
     bool UserClosed() const {return userClosed;}

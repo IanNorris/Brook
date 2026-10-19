@@ -31,6 +31,31 @@ int main() {
     for(unsigned i=1;i<65536;++i)CHECK(large.Allocate(false)==i);
     CHECK(large.Allocate(false)==0);CHECK(large.Release(65535));CHECK(large.Allocate(true)==65535);
 
+    // A short-lived service ID must not become the next rendering worker's
+    // TID while unused IDs remain. After wrap, the oldest free ID wins.
+    brook::ProcessIdPool<8> rotating;
+    CHECK(rotating.Allocate(true)==1);CHECK(rotating.Publish(1));CHECK(rotating.Release(1));
+    CHECK(rotating.Allocate(true)==2);CHECK(rotating.Publish(2));CHECK(rotating.Release(2));
+    for(unsigned i=3;i<8;++i)CHECK(rotating.Allocate(false)==i);
+    CHECK(rotating.Allocate(true)==1);CHECK(rotating.Pending()==1);
+    CHECK(rotating.Allocate(false)==2);CHECK(!rotating.Allocate(false));
+    CHECK(rotating.Release(5));CHECK(rotating.Release(3));CHECK(rotating.Release(7));
+    CHECK(rotating.SetUserClosed(true)==1);CHECK(!rotating.Allocate(true));
+    CHECK(rotating.Allocate(false)==5);CHECK(rotating.Allocate(false)==3);CHECK(rotating.Allocate(false)==7);
+    CHECK(rotating.Publish(1));CHECK(!rotating.Pending());CHECK(rotating.Release(1));
+    CHECK(rotating.SetUserClosed(false)==0);CHECK(rotating.Allocate(true)==1);CHECK(rotating.Release(1));
+    // FIFO indices wrap repeatedly, with occupied IDs skipped without losing
+    // capacity or creating duplicates. This also exercises non-power-of-two capacity.
+    brook::ProcessIdPool<7> wrapped;
+    std::vector<uint16_t> queue;
+    for(unsigned i=1;i<7;++i)queue.push_back(wrapped.Allocate(false));
+    for(unsigned turn=0;turn<1000;++turn) {
+        auto first=queue.front();queue.erase(queue.begin());CHECK(wrapped.Release(first));
+        auto second=queue.front();queue.erase(queue.begin());CHECK(wrapped.Release(second));
+        CHECK(wrapped.Allocate(false)==first);CHECK(wrapped.Allocate(false)==second);
+        queue.push_back(first);queue.push_back(second);CHECK(!wrapped.Allocate(false));
+    }
+
     // Owner-lock interleavings: a fence sees each construction reservation,
     // while already admitted births can still publish or unwind after closure.
     brook::ProcessIdPool<1024> concurrent;std::mutex mutex;

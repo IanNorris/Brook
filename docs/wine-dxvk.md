@@ -117,3 +117,29 @@ completed checked shutdown and offline filesystem checks. Process tracing and
 a deterministic Win32 resize are the next diagnostics. Windows Snake, repeated
 visible launch/close, profiling, Linux GL/Vulkan regressions and final saved-data
 audits remain required before completing this goal.
+
+The `maximize-candidate` diagnostic identified the intermittent SIGKILL. Wine's
+server (PID 39/incarnation 244) retained former service PID 61/incarnation 248
+for its delayed cleanup timer. Brook immediately recycled ID 61 as a new Mesa
+worker (incarnation 322) in D3D process 33/incarnation 242. The server's later
+`kill(61, SIGKILL)` therefore killed the D3D group. The serial log records both
+the old exec identity and the new fatal target. Thread-directed PID lookup and
+fatal group delivery were behaving as expected; recycling the newest freed ID
+made the numeric-ID race frequent. The candidate allocator now prefers unused
+IDs and recycles free IDs in FIFO order, retaining birth reservations and full
+namespace exhaustion behavior. Wraparound, reuse order and concurrent shutdown
+reservation tests pass along with all 57 host tests. The first cyclic VM passes
+three repeated D3D11 renders and exits; full window/game acceptance remains open. A bounded
+numeric PID namespace still permits reuse after a complete cycle; this does
+not provide pidfd-style lifetime identity.
+
+A separate configure issue is now isolated: Wine deliberately ignores normal
+state size hints. Brook was omitting `MAXIMIZED` when its native WM maximized a
+window, so the WM enlarged the presentation without resizing the D3D target.
+The candidate carries native maximize state with the resize event and preserves
+its desired dimensions during focus changes. CSD mouse-drag resizing still
+needs a `RESIZING` transaction; deterministic Win32 `SetWindowPos` resizing to
+1280x720 already passes shader readback and normal close in
+`fatal-trace-candidate`. That run is diagnostic (temporary kernel logging and
+process tracing), and stopped at the assertion detecting the missing native
+maximize redraw; it is not full acceptance.
