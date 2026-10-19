@@ -20,6 +20,7 @@
 #include <pthread.h>
 
 #include "fd_table.h"
+#include "sync_file.h"
 #include "unix_lifetime_trace.h"
 #include "pipe.h"
 #include <chrono>
@@ -498,6 +499,31 @@ static void TestOwnedPublication()
     FdTableClose(fds, &lock, source, &retired); --references;
     CHECK(references == 0, "all owned copies balance after replacement");
 }
+static void TestSyncFileCopyoutRollback()
+{
+    FdEntry fds[MAX_FDS]={};SpinLock lock;FdClaimResult retired{};
+    brook::SyncFileData file{1,123,1};
+    FdEntry owned{};owned.type=FdType::SyncFile;owned.handle=&file;owned.fdFlags=1;
+    const int fd=brook::FdTablePublishOwnedPinned(fds,&lock,owned);
+    CHECK(fd==0 && fds[fd].pinCount==1,"publication atomically adopts one pin");
+    CHECK(FdTableClose(fds,&lock,fd,&retired)==FdCloseResult::Deferred,"sibling close waits for copyout pin");
+    CHECK(brook::FdTablePublishOwned(fds,&lock,owned,0,fd,nullptr)==-16,"same-OFD alias cannot replace publication");
+    FdEntry replacement=owned;replacement.type=FdType::EventFd;
+    CHECK(brook::FdTablePublishOwned(fds,&lock,replacement,0,fd,nullptr)==-16,"unrelated replacement also blocked");
+    CHECK(FdTableClose(fds,&lock,fd,&retired)==FdCloseResult::NotFound,"failed copyout does not close twice");
+    CHECK(FdTableUnpin(fds,&lock,fd,&retired),"adopted pin finalizes deferred close");
+    CHECK(retired.handle==&file && fds[fd].type==FdType::None,"original publication alone retired");
+    CHECK(!FdTableUnpin(fds,&lock,fd,&retired),"retirement occurs exactly once");
+    CHECK(brook::FdTablePublishOwnedPinned(fds,&lock,owned)==fd,"successful copyout publication");
+    CHECK(!FdTableUnpin(fds,&lock,fd,&retired) && !fds[fd].pinCount,"successful copyout releases pin without closing");
+    CHECK(FdTableClose(fds,&lock,fd,&retired)==FdCloseResult::ClaimedNow,"success leaves descriptor normally closable");
+    CHECK(brook::FdTablePublishOwnedPinned(fds,&lock,owned)==fd,"failed copyout without sibling");
+    CHECK(FdTableClose(fds,&lock,fd,&retired)==FdCloseResult::Deferred,"rollback stays under publication pin");
+    CHECK(FdTableUnpin(fds,&lock,fd,&retired),"rollback releases original exactly once");
+    for(unsigned i=0;i<MAX_FDS;++i)fds[i]=owned;
+    CHECK(brook::FdTablePublishOwnedPinned(fds,&lock,owned)==-24,"full table rejects publication without installing pin");
+    for(unsigned i=0;i<MAX_FDS;++i)CHECK(!fds[i].pinCount,"failed publication adds no pin");
+}
 
 static std::atomic<bool> snapshotInside, snapshotCloseAttempted;
 static bool RetainSnapshotForRace(FdEntry* entry)
@@ -621,6 +647,7 @@ int main()
     TestDuplicate();
     TestOldPublicationNegative();
     TestOwnedPublication();
+    TestSyncFileCopyoutRollback();
     TestForkSnapshotRace();
 
     if (g_failures == 0) {

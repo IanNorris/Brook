@@ -37,6 +37,8 @@
 #include "audio.h"
 #include "debug_overlay.h"
 #include "sync/kmutex.h"
+#include "gpu_app.h"
+#include "gpu_presentation_policy.h"
 
 // Strace control (defined in syscall.cpp)
 bool StraceEnablePid(uint32_t pid, bool enable, uint32_t filter = 0);
@@ -115,7 +117,7 @@ static bool g_scriptMode = false;
 // terminal.cpp inlined its own minimal envp, bash and its children would
 // run with a stripped-down environment and TLS / fontconfig / wayland
 // would silently break.
-const char* const g_defaultEnvp[] = {
+static constexpr const char* g_defaultEnvp[] = {
     "HOME=/data/home",
     "PATH=/nix/profile/bin:/nix/bin:"
           "/nix/store/sm2nq18jjqp4x0sxpl6lrvwl9rx6mvj2-curl-8.19.0-bin/bin:"
@@ -186,6 +188,7 @@ const char* const g_defaultEnvp[] = {
     "LIBGL_DRIVERS_PATH=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/lib/dri",
     "GBM_BACKENDS_PATH=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/lib/gbm",
     "__EGL_VENDOR_LIBRARY_DIRS=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/share/glvnd/egl_vendor.d",
+    "VK_DRIVER_FILES=/nix/store/b793hmy0383vxaax7hiaslzmizzd3pmg-mesa-26.0.6/share/vulkan/icd.d/virtio_icd.x86_64.json",
     "XDG_CACHE_HOME=/data/home/.cache",
     "XDG_CONFIG_HOME=/data/home/.config",
     "XDG_DATA_HOME=/data/home/.local/share",
@@ -198,12 +201,31 @@ const char* const g_defaultEnvp[] = {
     nullptr
 };
 
-const char* const* ShellGetDefaultEnvp() { return g_defaultEnvp; }
+// Both alternatives are immutable. Concurrent launches never modify a shared
+// environment array or inherit a partially updated presentation policy.
+struct DesktopEnvironment {const char* entries[sizeof(g_defaultEnvp)/sizeof(g_defaultEnvp[0])+2];};
+static constexpr DesktopEnvironment VulkanEnvironment(bool direct) {
+    DesktopEnvironment env{};
+    constexpr uint32_t n=sizeof(g_defaultEnvp)/sizeof(g_defaultEnvp[0])-1;
+    for(uint32_t i=0;i<n;++i)env.entries[i]=g_defaultEnvp[i];
+    env.entries[n]=direct?"MESA_VK_WSI_DEBUG=":"MESA_VK_WSI_DEBUG=sw,noshm";
+    env.entries[n+1]=direct?"BROOK_VULKAN_PRESENTATION=direct":"BROOK_VULKAN_PRESENTATION=staged";
+    return env;
+}
+static constexpr auto g_directEnvironment=VulkanEnvironment(true);
+static constexpr auto g_stagedEnvironment=VulkanEnvironment(false);
+const char* const* ShellGetDefaultEnvp() {
+    const auto* app=GpuAppGet();
+    const auto caps=app && app->Capabilities?app->Capabilities():GpuAppCapabilities{};
+    return GpuVulkanDirectPresentation(CompositorGpuActive(),caps,app && app->PrepareBlobImage)?
+        g_directEnvironment.entries:g_stagedEnvironment.entries;
+}
 
 uint32_t ShellGetDefaultEnvpCount()
 {
     uint32_t n = 0;
-    while (g_defaultEnvp[n]) ++n;
+    const auto* defaults=ShellGetDefaultEnvp();
+    while (defaults[n]) ++n;
     return n;
 }
 
@@ -446,18 +468,19 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
 
     // Count environment entries
     int envc = 0;
-    while (g_defaultEnvp[envc]) ++envc;
+    const auto* defaults=ShellGetDefaultEnvp();
+    while (defaults[envc]) ++envc;
 
     const uint32_t uid = uidOverride == CredentialUnchanged ? DesktopUid : uidOverride;
     const uint32_t gid = gidOverride == CredentialUnchanged ? LaunchPrimaryGroup(uid) : gidOverride;
-    const char* launchEnv[sizeof(g_defaultEnvp) / sizeof(g_defaultEnvp[0])];
+    const char* launchEnv[sizeof(g_directEnvironment.entries) / sizeof(g_directEnvironment.entries[0])];
     char userEnv[32], loginEnv[32];
     LaunchIdentityEnvironment(userEnv, false, uid);
     LaunchIdentityEnvironment(loginEnv, true, uid);
     for (int i = 0; i <= envc; ++i) {
-        launchEnv[i] = g_defaultEnvp[i];
-        if (g_defaultEnvp[i] && StrEq(g_defaultEnvp[i], "USER=root")) launchEnv[i] = userEnv;
-        if (g_defaultEnvp[i] && StrEq(g_defaultEnvp[i], "LOGNAME=root")) launchEnv[i] = loginEnv;
+        launchEnv[i] = defaults[i];
+        if (defaults[i] && StrEq(defaults[i], "USER=root")) launchEnv[i] = userEnv;
+        if (defaults[i] && StrEq(defaults[i], "LOGNAME=root")) launchEnv[i] = loginEnv;
     }
     Process* proc = ProcessCreateExecutable(image, argc, argv,
                                    envc, launchEnv, nullptr, uid, gid);

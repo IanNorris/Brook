@@ -3,9 +3,9 @@
 Active work branch: `wip/vulkan-desktop-20261019`, starting at `f5573cef`.
 The initial bring-up proved hardware Venus compute, offscreen rasterization and
 native Wayland swapchains with Mesa CPU staging. See [bring-up evidence](vulkan-bringup.md).
-This goal additionally requires working direct DMA-BUF presentation and automatic
-selection of the supported presentation path. The goal remains incomplete until
-those paths and the full acceptance below have passed.
+Direct DMA-BUF presentation, automatic policy and safe staging fallback now pass
+the final acceptance below on the pinned Intel configuration. Tested checkpoints
+remain on the work branch; merging to main requires approval.
 
 ## Goal
 
@@ -51,9 +51,9 @@ semaphore after 256 dependent dispatches, polls the exported sync file, then
 checks exact readback before waiting for the ordinary Vulkan fence.
 
 The existing host renderer implements `PIPE_RESOURCE_SET_TYPE` for importing
-untyped DMA-BUF resources into a GL context. Its use still needs kernel ownership,
-layout and producer/compositor completion validation and actual presentation
-acceptance. Unsupported import must not be hidden by relabeling a staged frame
+untyped DMA-BUF resources into a GL context. At this initial stage, its use still
+needed kernel ownership, layout and producer/compositor completion validation and
+actual presentation acceptance. Unsupported import must not be hidden by relabeling a staged frame
 as a direct one.
 
 ### Completed synchronization foundation checkpoint
@@ -162,8 +162,107 @@ install and hash-check the selected server on a new offline image, followed by
 `scripts/workloads/vulkan_wayland_check.py --presentation direct --composite gpu
 --vkmark build/vulkan-vkmark-wayland-result` with explicit checked seed, Nix seed,
 output and matching control arguments. Private images and raw logs stay outside
-git. Automatic policy/fallback and the controlled staged comparison remain open.
+git. Automatic policy/fallback and the controlled staged comparison were still
+open at this checkpoint; the final acceptance below completes them.
 
 ![Direct Vulkan cube on Brook](images/brook_vulkan_direct_1080.png)
 
 ![Direct Vulkan vkmark on Brook](images/brook_vulkan_direct_vkmark_1080.png)
+
+## Desktop policy and final acceptance
+
+Ordinary launches inherit a pinned Venus ICD and a presentation policy from the
+kernel's desktop environment. GPU composition selects direct presentation only
+when context initialization, blob resources, host-visible memory, the Venus
+capset and the image-import operation are available. Otherwise it selects
+`MESA_VK_WSI_DEBUG=sw,noshm` before creating a swapchain. The two environment
+arrays are immutable; Terminal, launcher and bridge-spawned descendants use the
+same defaults. Explicit caller overrides remain available for diagnostics.
+Tests remove each required capability independently. A CPU-composition boot
+exercises the fallback in an actual guest, with empty per-app environment
+requests. Missing optional Mesa synchronization ioctls are never used as a
+fallback mechanism.
+
+A visible SDL3/GLES2 Wayland regression exposed a valid XRGB view of canonical
+BGRA storage. Capture now keeps the canonical storage format for the copy and
+applies opacity to the destination view. It rejects incompatible channel order,
+alpha views of opaque storage and invalid formats. The acceptance probe checks
+60 RGB frames, rejects Wayland protocol errors even if SDL reports successful
+swaps, and verifies that its scenes, queued jobs and snapshots retire.
+
+Completed sync-file exports now publish with a slot pin installed under the FD
+table lock. Each export adopts that pin through copyout and rollback, releasing
+it exactly once. A sibling close cannot reuse the slot until cleanup finishes,
+including replacement with an alias of the same object. The production FD-table
+regression covers deferred close, blocked replacement, successful copyout,
+failed copyout and full-table publication failure.
+
+Final hardware synchronization run:
+`build/workloads/vulkan-desktop-final-20261019/candidate3/`, kernel SHA-256
+`a913ceccb7849c8e64ff358f4a6e02a79f0e3517c92c08c2bd8d4e5435549626`,
+all 12 modules ABI 32. All eight command groups complete with full output and
+no descendants: raw context/query/blob/sync-file contracts, vulkaninfo, three
+256-dispatch Vulkan readback rounds with exported queue semaphore sync files,
+hardware persistent GL and visible Wayland GL. Triangle rasterization and
+readback before ordinary Vulkan fence waits pass. Renderer diagnostics, heap,
+resource retirement, checked shutdown, four offline filesystem checks and
+12 saved-document fixtures plus profile trees pass. All 57 host tests and both
+compiled entry audits pass.
+
+Final comparison: `build/workloads/vulkan-desktop-policy3-20261019/`, using the
+same final kernel, all 12 module hashes, pinned host packages and loaded renderer
+hash. Each configuration passes two cube lifecycle cycles and two vkmark runs,
+with four overlapping hardware GL RGB/persistent-buffer probes. Both GPU cases
+also pass visible SDL3/GL rendering and 17 malformed-image requests. The direct
+run records 46 actual Venus image imports; both staged cases record zero.
+
+| Presentation / composition | Vertex FPS, runs 1 / 2 | Texture FPS, runs 1 / 2 |
+| --- | --- | --- |
+| Automatic direct / GPU | 15 / 15 | 15 / 15 |
+| Forced staging / GPU | 17 / 17 | 16 / 17 |
+| Automatic staging / CPU | 53 / 52 | 53 / 53 |
+
+These are small acceptance samples using identical vkmark 1280×720 vertex and
+texture scenes, 15 seconds each. Direct and staged GPU runs are comparable;
+CPU composition is a separate configuration. Direct import is currently slower
+than staging with GPU composition. No performance improvement is claimed.
+
+All 11 tracked groups in each GPU run and all nine in the CPU fallback drain
+complete stdout/stderr and descendants. Final windows, GPU blobs, aperture
+leases, quarantines and failed retirements are zero. Each GPU run balances
+16 backing mappings and 5,402,624 bytes. Each configuration passes heap checks,
+checked shutdown, launcher/QEMU zero exits and four offline filesystem checks.
+The 12 document fixtures retain their bytes and UID/GID; saved configuration,
+Firefox, Codium and Wine profile trees match the checked seed in all three
+runs. Comparison, preservation and requirement audit receipts are saved beside
+the private evidence. Failed earlier runs remain preserved and are excluded
+from these results.
+
+To reproduce the comparison, run `vulkan_wayland_check.py` inside `nix-shell`
+from the repository root with distinct new output directories and the same
+checked seed, staged Nix seed, control package and frozen artifacts:
+
+```sh
+python scripts/workloads/vulkan_wayland_check.py --output NEW_DIRECT \
+  --seed CHECKED_SEED --nix-seed STAGED_NIX_IMAGE --control CONTROL \
+  --artifacts FROZEN_BUILD --vkmark VKMARK_PACKAGE --presentation auto --composite gpu
+python scripts/workloads/vulkan_wayland_check.py --output NEW_STAGED \
+  --seed CHECKED_SEED --nix-seed STAGED_NIX_IMAGE --control CONTROL \
+  --artifacts FROZEN_BUILD --vkmark VKMARK_PACKAGE --presentation staged --composite gpu
+python scripts/workloads/vulkan_wayland_check.py --output NEW_FALLBACK \
+  --seed CHECKED_SEED --nix-seed STAGED_NIX_IMAGE --control CONTROL \
+  --artifacts FROZEN_BUILD --vkmark VKMARK_PACKAGE --presentation auto --composite cpu
+python scripts/workloads/vulkan_desktop_compare.py --direct NEW_DIRECT \
+  --staged NEW_STAGED --fallback NEW_FALLBACK --output NEW_COMPARISON.json
+```
+
+Run cases sequentially, after the preceding VM's checked stop. The comparator
+requires matching kernel/module/host-stack hashes, workloads, dimensions, drained
+commands, renderer diagnostics and retirement. Document/profile preservation is
+an additional offline audit; the comparator does not claim to establish it.
+Only the tested Intel UHD 630 configuration is accepted. NVIDIA and other
+render nodes are untested. Exported fences remain the bounded completed-only
+subset described above; arbitrary asynchronous fence merging and GL writes
+from other importing contexts are unsupported. Direct presentation still copies
+to an immutable retained compositor image; it does not imply zero-copy scanout.
+DXVK, Proton and broader performance optimization remain outside this work.

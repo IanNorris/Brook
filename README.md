@@ -8,7 +8,7 @@
 <h3 align="center">A hobby x86-64 operating system built from scratch</h3>
 
 <p align="center">
-  UEFI · C++ · Clang/LLVM · SMP · Wayland · OpenGL · Networking · Nix
+  UEFI · C++ · Clang/LLVM · SMP · Wayland · OpenGL · Vulkan · Networking · Nix
 </p>
 
 ---
@@ -45,6 +45,7 @@ the table distinguishes tested behavior from remaining limitations.
 | [Quake 2 / Yamagi](https://www.yamagi.org/quake2/) | 8.60 | ✅ Gameplay | Software and hardware virgl GL3 renderers, startup demo, OSS audio and OGG music; [GPU resource retirement/repeated launches](docs/gpu-resource-lifetime.md), mouse capture and intermittent audio timing remain open |
 | [GLtron](https://www.gltron.org/) | 0.70 | ⚠️ Experimental | Compatibility launcher installs through guest `nix-install`; hardware virgl menu and light-cycle gameplay verified, with sound disabled |
 | [SuperTuxKart](https://supertuxkart.net/) | 1.5 | ⚠️ Experimental | Guest installation and hardware virgl races verified; current ownership build accepts race input and [reclaims backing after close](docs/gpu-resource-lifetime.md#gpu-workload-transition-acceptance), with clean subsequent Gallery/browser surfaces; launcher sound is disabled, memory pressure and mixed-game acceptance remain open |
+| Vulkan / Mesa Venus | 26.0.6 | ✅ vkcube + vkmark | Intel hardware compute, rendering and direct Wayland DMA-BUF presentation; automatic staging with CPU composition. Repeated window lifecycle and concurrent GL verified. [Results and limits](docs/vulkan-desktop.md) |
 | [busybox](https://busybox.net/) | 1.36 | ✅ Working | ls, cat, echo, wc, head, tail, grep, and many more |
 | [TCC](https://bellard.org/tcc/) | 0.9.27 | ✅ Working | Compiles and runs C programs natively on Brook |
 | [CoreMark](https://www.eembc.org/coremark/) | 1.0 | ✅ Working | CPU benchmark, runs to completion |
@@ -65,6 +66,14 @@ the table distinguishes tested behavior from remaining limitations.
 | [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | 720p OSS playback; Wayland black flashes fixed; cold 55-second minimize/restore, normal close and SIGKILL audio cleanup verified; audio timing still experimental |
 
 ## Recent progress
+
+- **Hardware Vulkan:** vkcube and vkmark run through Mesa Venus with direct
+  DMA-BUF presentation, queue synchronization and retained compositor images.
+  Ordinary launches select direct presentation with GPU composition or staging
+  with CPU composition. Repeated resize, minimize/restore and relaunch tests
+  pass alongside hardware GL, with clean resource retirement and saved-data
+  checks. The [measured Intel configuration and comparison](docs/vulkan-desktop.md)
+  are documented; DXVK and Proton remain future work.
 
 - **Native editor:** VSCodium renders its workbench, accepts keyboard input,
   saves and reopens text files, and exits through its window controls. Nested

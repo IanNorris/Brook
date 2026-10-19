@@ -1,5 +1,12 @@
 # Recovery and VM-control backlog
 
+- Audit older descriptor-producing syscalls for copyout rollback after numeric
+  FD reuse. Completed sync-file exports now hold an atomically installed
+  publication pin through copyout and failure cleanup. The preexisting
+  PRIME-handle export still closes its numeric FD directly after failed
+  copyout; extend the publication-pin discipline there and cover sibling close
+  and same-object alias replacement with deterministic tests.
+
 - Investigate the isolated eight-vCPU boot fault in session
   `6ff23309fe2d4c288482506746bb9f8f`: `brook-dbus_0` PID11 raised #GP in its
   interpreter at `0x7f0000020b77`, followed by the deliberate

@@ -1,4 +1,5 @@
 #include "../../kernel/src/gpu_context.h"
+#include "../../kernel/src/gpu_presentation_policy.h"
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
@@ -27,5 +28,14 @@ int main() {
     const GpuContextParam venus[]={{1,4},{2,64},{3,0}};
     rejected(venus,3,gl);CHECK(GpuContextParse(venus,3,{22,true,true,true},out));
     CHECK(out.capsetId==4 && out.numRings==64);
+    const GpuAppCapabilities ready{22,true,true,true};
+    CHECK(GpuVulkanDirectPresentation(true,ready,true));
+    CHECK(!GpuVulkanDirectPresentation(false,ready,true));
+    CHECK(!GpuVulkanDirectPresentation(true,ready,false));
+    CHECK(!GpuVulkanDirectPresentation(true,gl,true));
+    CHECK(!GpuVulkanDirectPresentation(true,{6,true,true,true},true));
+    CHECK(!GpuVulkanDirectPresentation(true,{22,false,true,true},true));
+    CHECK(!GpuVulkanDirectPresentation(true,{22,true,false,true},true));
+    CHECK(!GpuVulkanDirectPresentation(true,{22,true,true,false},true));
     std::puts("GPU_CONTEXT_PASS capability identity, bounds, unsupported modes and atomic rejection");
 }

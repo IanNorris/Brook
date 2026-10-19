@@ -26,6 +26,11 @@ typedef uint32_t GpuTexId;
 inline constexpr bool GpuCaptureFormatSupported(uint32_t format) {
     return format == 1 || format == 2; // B8G8R8A8_UNORM / B8G8R8X8_UNORM
 }
+// XRGB is also a valid opaque view of BGRA storage. Keep the canonical source
+// format for the copy; the scene destination alone discards alpha.
+inline constexpr bool GpuCaptureViewSupported(uint32_t source,uint32_t view) {
+    return (source==1 && (view==1 || view==2)) || (source==2 && view==2);
+}
 
 // Special source handle for DrawQuad: sample the blurred backdrop (the scene as
 // composited up to the most recent BlurBarrier, downsampled + gaussian-blurred)

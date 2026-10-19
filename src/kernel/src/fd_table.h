@@ -164,7 +164,8 @@ inline int FdTableDuplicatePinned(FdEntry* fds, SpinLock* lock, const FdEntry* s
 inline int FdTablePublishOwned(FdEntry* fds, SpinLock* lock, const FdEntry& owned,
                               uint32_t minimum, int replacement, FdClaimResult* retired,
                               void (*published)(int, const FdEntry&) = nullptr,
-                              FdLogicalClose closing = nullptr,void* context = nullptr)
+                              FdLogicalClose closing = nullptr,void* context = nullptr,
+                              bool pinAtPublication = false)
 {
     SpinLockAcquire(lock);
     int target = replacement;
@@ -181,12 +182,20 @@ inline int FdTablePublishOwned(FdEntry* fds, SpinLock* lock, const FdEntry& owne
     if (retired) *retired = {fds[target].type, fds[target].handle, fds[target].flags};
     if (closing && fds[target].type!=FdType::None) closing(fds[target],context);
     FdEntry copy = owned;
-    copy.pinCount = 0;
+    copy.pinCount = pinAtPublication ? 1 : 0;
     copy.closing = 0;
     fds[target] = copy;
     if (published) published(target, copy);
     SpinLockRelease(lock);
     return target;
+}
+
+// The caller adopts the publication pin and must unpin exactly once. This
+// prevents close/reuse between publishing an fd and copying it to userspace.
+inline int FdTablePublishOwnedPinned(FdEntry* fds, SpinLock* lock, const FdEntry& owned)
+{
+    return FdTablePublishOwned(fds, lock, owned, 0, -1, nullptr,
+                               nullptr, nullptr, nullptr, true);
 }
 
 // The destination is private and initially empty. Retain each immutable copy

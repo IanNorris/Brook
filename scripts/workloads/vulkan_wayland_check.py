@@ -11,12 +11,13 @@ parser.add_argument('--nix-seed',required=True,type=Path,help='Offline Nix image
 parser.add_argument('--control',type=Path,default=Path('build/vulkan-triangle-control-result'))
 parser.add_argument('--artifacts',type=Path,default=Path('build/release'))
 parser.add_argument('--vkmark',type=Path,help='Optional vkmark package already staged on the private Nix seed')
-parser.add_argument('--presentation',choices=('direct','staged'),default='staged')
+parser.add_argument('--presentation',choices=('auto','direct','staged'),default='auto')
 parser.add_argument('--composite',choices=('gpu','cpu'),default='cpu')
 parser.add_argument('--instance',type=int,default=510)
 args=parser.parse_args()
 if args.presentation=='direct' and args.composite!='gpu':parser.error('Direct DMA-BUF capture requires GPU composition')
-wsi_env={} if args.presentation=='direct' else {'MESA_VK_WSI_DEBUG':'sw,noshm'}
+wsi_env={'MESA_VK_WSI_DEBUG':'sw,noshm'} if args.presentation=='staged' else {}
+selected='staged' if args.presentation=='staged' or args.composite=='cpu' else 'direct'
 r=args.output.resolve();r.mkdir(parents=True,exist_ok=False);run=r/'run';run.mkdir()
 seed=args.seed.resolve();assert json.loads((seed/'shutdown-result.json').read_text())['orderly_shutdown_completed'];assert all(v['exit']==0 for v in json.loads((seed/'after-fsck.json').read_text()).values())
 for p in Path('/proc').glob('[0-9]*/exe'):
@@ -56,7 +57,7 @@ except BaseException as error:
   b.write(r/'launch-failure-exit.json',dict(pid=wrapper.pid,exit_code=wrapper.returncode))
  raise
 def command(name,argv,expected=0):
- out=r/name;out.mkdir();j=b.TrackedCommand(out,s,argv);j.evidence['request'].update(uid=1000,cwd='/data/home',env={'VK_DRIVER_FILES':control['guestICD'],'XDG_RUNTIME_DIR':'/tmp'});b.write(j.path,j.evidence);end=time.monotonic()+90
+ out=r/name;out.mkdir();j=b.TrackedCommand(out,s,argv);j.evidence['request'].update(uid=1000,cwd='/data/home',env={});b.write(j.path,j.evidence);end=time.monotonic()+90
  while True:
   try:j.poll()
   except RuntimeError:
@@ -69,6 +70,7 @@ def command(name,argv,expected=0):
  for n in ('stdout','stderr'):
   assert not v[n]['gaps'] and not v[n]['dropped_bytes'] and not v[n]['read_error']
   assert len(j.evidence[n].encode())==v['guest'][n+'_bytes']==j.evidence[n+'_offset']
+ assert not re.search(r'wl_display.*error|Wayland display connection closed|retained scene failed',j.evidence['stderr'],re.I),j.evidence['stderr']
  print('COMMAND_PASS',name,j.evidence['stdout'][-1200:],flush=True);return j.evidence['stdout']
 def verify_output(job):
  v=job.evidence['status'];assert job.complete()
@@ -112,13 +114,18 @@ try:
  assert loaded and all(Path(path).resolve()==renderer.resolve() for path in loaded)
  b.write(r/'host-renderer.json',dict(loaded=sorted(set(loaded)),expected=str(renderer.resolve()),sha256=b.sha(renderer.resolve())))
  boot_id=b.server.windows(s)['guest_boot_id']
+ policy=json.loads(command('environment-policy',['/nix/profile/bin/python3','-c',
+  'import os,json;print(json.dumps({k:os.environ.get(k) for k in ("VK_DRIVER_FILES","MESA_VK_WSI_DEBUG","BROOK_VULKAN_PRESENTATION","WAYLAND_DISPLAY","XDG_RUNTIME_DIR")}))']))
+ automatic='direct' if args.composite=='gpu' else 'staged'
+ assert policy==dict(VK_DRIVER_FILES=control['guestICD'],MESA_VK_WSI_DEBUG='' if automatic=='direct' else 'sw,noshm',
+                    BROOK_VULKAN_PRESENTATION=automatic,WAYLAND_DISPLAY='wayland-0',XDG_RUNTIME_DIR='/tmp'),policy
  if args.composite=='gpu':
   name='vulkan_dmabuf_check.py';code='import sys;sys.argv='+repr([name,'--brook-guest'])+';\n'+Path('scripts/workloads',name).read_text()
   assert json.loads(command('dmabuf-validation',['/nix/profile/bin/python3','-c',code]))['passed']
  for iteration in range(2):
   cycle='cycle'+str(iteration+1);out=r/cycle;out.mkdir();started=time.monotonic()
   j=b.TrackedCommand(out,s,[control['vulkanTools']+'/bin/vkcube','--wsi','wayland','--width','1280','--height','720','--c','6000'])
-  j.evidence['request'].update(uid=1000,cwd='/data/home',env={'VK_DRIVER_FILES':control['guestICD'],'XDG_RUNTIME_DIR':'/tmp','WAYLAND_DISPLAY':'wayland-0',**wsi_env});b.write(j.path,j.evidence)
+  j.evidence['request'].update(uid=1000,cwd='/data/home',env=wsi_env);b.write(j.path,j.evidence)
   w=wait_window(lambda w:w['buffer_width']==800 and w['buffer_height']==600);b.write(out/'initial-window.json',w)
   initial=snapshot(cycle+'-initial');time.sleep(.5);second=snapshot(cycle+'-animated');verify_animation(cycle,w)
   x=w['x']+w['outer_width']+1;y=w['y']+w['outer_height']+1
@@ -148,7 +155,7 @@ try:
   for iteration in range(2):
    cycle='vkmark'+str(iteration+1);out=r/cycle;out.mkdir();started=time.monotonic()
    argv=[str(package/'bin/vkmark'),'--winsys','wayland','--present-mode','fifo','--size','1280x720','--benchmark','vertex:duration=15','--benchmark','texture:duration=15']
-   j=b.TrackedCommand(out,s,argv);j.evidence['request'].update(uid=1000,cwd='/data/home',env={'VK_DRIVER_FILES':control['guestICD'],'XDG_RUNTIME_DIR':'/tmp','WAYLAND_DISPLAY':'wayland-0',**wsi_env});b.write(j.path,j.evidence)
+   j=b.TrackedCommand(out,s,argv);j.evidence['request'].update(uid=1000,cwd='/data/home',env=wsi_env);b.write(j.path,j.evidence)
    end=time.monotonic()+90;first=None
    while time.monotonic()<end:
     j.poll();current=windows();first=next((w for w in current if 'vkmark' in w['title'].lower()),None)
@@ -174,6 +181,16 @@ try:
     if not any(g[k] for k in ('host_blob_resources','host_aperture_leases','host_aperture_bytes','host_blob_quarantined','quarantined_resources')) and g['allocated_mappings']==g['released_mappings'] and g['allocated_page_bytes']==g['released_page_bytes']:break
     assert time.monotonic()<end,g;time.sleep(.1)
    assert not windows();b.write(out/'after-stats.json',stats);b.write(out/'timing.json',dict(seconds=time.monotonic()-started,comparative_benchmark=False));print('VKMARK_CYCLE_PASS',cycle,combined,flush=True)
+ if args.composite=='gpu':
+  name='wayland_gl_check.py';argv=[name,'--brook-guest','--sdl','/nix/store/vnbg4yzxpacm8pxwa4qq02m2llnrnigl-sdl3-3.4.2-lib/lib/libSDL3.so.0']
+  code='import sys;sys.argv='+repr(argv)+';\n'+Path('scripts/workloads',name).read_text()
+  assert json.loads(command('wayland-gl',['/nix/profile/bin/python3','-c',code]))['passed']
+  end=time.monotonic()+15
+  while True:
+   stats=b.server.stats(s,gpu_details=True);g=stats['gpu_backing']
+   if not any(g[k] for k in ('host_blob_resources','host_aperture_leases','host_aperture_bytes','host_blob_quarantined','quarantined_resources')) and g['allocated_mappings']==g['released_mappings'] and g['allocated_page_bytes']==g['released_page_bytes']:break
+   assert time.monotonic()<end,g;time.sleep(.1)
+  assert not windows();b.write(r/'wayland-gl-cleanup-stats.json',stats)
  heap=b.server.guest(d,'heap check');b.write(r/'heap-check.json',heap);assert heap['reply']=='heap integrity: OK'
 
 finally:
@@ -193,12 +210,12 @@ finally:
   finally:b.write(r/'after-fsck.json',b.offline_fsck(run,'after'))
   status=b.server.lifecycle_operation(**request);b.write(r/'shutdown-result.json',status);assert status['orderly_shutdown_completed'] and status['qemu_exit_code']==0 and not (r/'forced-stop.json').exists()
   text=(r/'guest-final-serial.log').read_text();assert text.count('CPU: PAT WC slot4 ready value=0x7040100070406')==8;assert 'write-combining disabled' not in text
-  errors=[line for line in (text+(run/'launch.log').read_text(errors='replace')).splitlines() if re.search(r'context error|failed to dispatch|virtio_gpu_virgl_process_cmd.*error|IOV data size exceeds|failed to open libvulkan|invalid.*completion|control queue.*poison',line,re.I)]
+  errors=[line for line in (text+(run/'launch.log').read_text(errors='replace')).splitlines() if re.search(r'context error|failed to dispatch|virtio_gpu_virgl_process_cmd.*error|IOV data size exceeds|failed to open libvulkan|invalid.*completion|control queue.*poison|retained image capture failed|retained scene failed',line,re.I)]
   b.write(r/'renderer-errors.json',dict(passed=not errors,errors=errors));assert not errors,errors
   imported=re.findall(r'virtio_gpu: imported Venus image ctx=(\d+) res=(\d+) (\d+)x(\d+) stride=(\d+) offset=(\d+)',text)
-  b.write(r/'presentation-evidence.json',dict(requested=args.presentation,imports=imported,launch_environment=wsi_env))
-  if args.presentation=='direct':assert imported,'No direct Venus allocation was imported'
+  b.write(r/'presentation-evidence.json',dict(requested=args.presentation,selected=selected,imports=imported,launch_environment=wsi_env))
+  if selected=='direct':assert imported,'No direct Venus allocation was imported'
   else:assert not imported,'Staged run unexpectedly used direct image imports'
   print('BROOK_PAT_CHECKED_STOP',s,flush=True)
 
-b.write(r/'acceptance-complete.json',dict(passed=True,session=s,window_cycles=2,vkmark_cycles=2 if args.vkmark else 0,presentation=args.presentation,composition=args.composite,checked_shutdown=True,offline_fsck_passed=True))
+b.write(r/'acceptance-complete.json',dict(passed=True,session=s,window_cycles=2,vkmark_cycles=2 if args.vkmark else 0,presentation=selected,requested=args.presentation,composition=args.composite,checked_shutdown=True,offline_fsck_passed=True))

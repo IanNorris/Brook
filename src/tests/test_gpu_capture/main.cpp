@@ -1,4 +1,5 @@
 #include "../../drivers/virtio_gpu/retirement_protocol.h"
+#include "../../kernel/src/gpu_compositor.h"
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -6,6 +7,9 @@
 
 int main() {
     using namespace brook;
+    CHECK(GpuCaptureViewSupported(1,1) && GpuCaptureViewSupported(1,2));
+    CHECK(GpuCaptureViewSupported(2,2) && !GpuCaptureViewSupported(2,1));
+    CHECK(!GpuCaptureViewSupported(67,1) && !GpuCaptureViewSupported(1,3));
     const std::vector<GpuCaptureStep> required={GpuCaptureStep::ProducerFence,
         GpuCaptureStep::AttachSource,GpuCaptureStep::Copy,
         GpuCaptureStep::CompositorFence,GpuCaptureStep::DetachSource};

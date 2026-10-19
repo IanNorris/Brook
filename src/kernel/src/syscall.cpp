@@ -5960,10 +5960,20 @@ static int CreateCompletedSyncFile(Process* process) {
     if(!file)return -ENOMEM;
     *file={1,ClockNowNs(1),__atomic_add_fetch(&g_eventFdIdentity,1,__ATOMIC_RELAXED)};
     FdEntry owned{};owned.type=FdType::SyncFile;owned.handle=file;owned.fdFlags=1;owned.statusFlags=0;
-    const int fd=FdTablePublishOwned(process->fds,ProcessFdLock(process),owned,0,-1,nullptr);
+    const int fd=FdTablePublishOwnedPinned(process->fds,ProcessFdLock(process),owned);
     if(fd<0)SyncFileUnref(file);
     return fd;
 }
+// Adopts the pin installed atomically by CreateCompletedSyncFile; no second
+// lookup/pin is allowed because a sibling may already have logically closed it.
+struct SyncFilePublicationPin {
+    Process* process;
+    int fd;
+    SyncFilePublicationPin(Process* p,int f):process(p),fd(f) {}
+    ~SyncFilePublicationPin() { FdPut(process,fd); }
+    SyncFilePublicationPin(const SyncFilePublicationPin&)=delete;
+    SyncFilePublicationPin& operator=(const SyncFilePublicationPin&)=delete;
+};
 
 static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
 {
@@ -6272,6 +6282,7 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
                 auto* process=ProcessCurrent();
                 const int descriptor=CreateCompletedSyncFile(process);
                 if(descriptor<0)return descriptor;
+                SyncFilePublicationPin publication(process,descriptor);
                 eb.fence_fd=descriptor;
                 if(!CopyToUser(arg,&eb,sizeof(eb))) {CloseProcessFd(process,descriptor);return -EFAULT;}
             }
@@ -6298,9 +6309,10 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             Process* fp = ProcessCurrent();
             const int fenceFd=CreateCompletedSyncFile(fp);
             if(fenceFd<0)return fenceFd;
+            SyncFilePublicationPin publication(fp,fenceFd);
             eb.fence_fd = fenceFd;
             if (!CopyToUser(arg, &eb, sizeof(eb))) {
-                CloseProcessFd(fp, fenceFd);
+                CloseProcessFd(fp,fenceFd);
                 return -EFAULT;
             }
         }
@@ -6503,6 +6515,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         }
         const int descriptor=CreateCompletedSyncFile(proc);
         if(descriptor<0)return descriptor;
+        SyncFilePublicationPin publication(proc,descriptor);
         request.fd=descriptor;
         if(!CopyToUser(arg,&request,sizeof(request))) {CloseProcessFd(proc,descriptor);return -EFAULT;}
         return 0;
@@ -11628,7 +11641,12 @@ static int64_t sys_brook_scene_ctl(uint64_t fd,uint64_t op,uint64_t arg,uint64_t
             if(BrookDmabufValidate(&layout,image->size,!venus)!=BROOK_DMABUF_LAYOUT_OK)return -EINVAL;
             if(!venus && (image->target!=2 || desc.width!=image->width || desc.height!=image->height ||
                desc.stride!=image->stride || desc.offset ||
-               image->format!=(desc.fourcc==BROOK_DMABUF_ARGB8888?1u:2u)))return -EINVAL;
+               !GpuCaptureViewSupported(image->format,desc.fourcc==BROOK_DMABUF_ARGB8888?1u:2u))) {
+                SerialPrintf("drm: rejected image view: target=%u backing=%ux%u stride=%u format=%u view=%ux%u stride=%u fourcc=%x offset=%u\n",
+                             image->target,image->width,image->height,image->stride,image->format,
+                             desc.width,desc.height,desc.stride,desc.fourcc,desc.offset);
+                return -EINVAL;
+            }
             if(venus && (!image->hostBlob || !(image->blobFlags&2u)))return -EINVAL;
             MappingBackingRef(image->lifetime);lease.value=image->lifetime;
         }
@@ -11644,7 +11662,7 @@ static int64_t sys_brook_scene_ctl(uint64_t fd,uint64_t op,uint64_t arg,uint64_t
         const SceneCaptureDesc capture{desc.drmFd,desc.gem,desc.width,desc.height,
                                       desc.fourcc==BROOK_DMABUF_ARGB8888?1u:2u,0};
         // VirGL BGRA/BGRX values, distinct from the scene's alpha policy.
-        const uint32_t format=desc.fourcc==BROOK_DMABUF_ARGB8888?1u:2u;
+        const uint32_t format=venus?(desc.fourcc==BROOK_DMABUF_ARGB8888?1u:2u):image->format;
         return SceneCapture(proc,handle,capture,lease.value,image->owner->ctxId,image->gres,format,
                             venus?&layout:nullptr,venus?SceneCaptureSync{image,DrmCaptureComplete}:SceneCaptureSync{});
     }
