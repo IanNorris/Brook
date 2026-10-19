@@ -10,7 +10,8 @@ namespace brook {
 #define BROOK_SCENE_SIZE(type,bytes) _Static_assert(sizeof(struct type)==bytes,#type)
 #endif
 enum { SCENE_ABI_VERSION=1, SCENE_CTL_STATS=0, SCENE_CTL_UPLOAD=1,
-       SCENE_CTL_CAPTURE=2, SCENE_CTL_PRESENT=3, SCENE_CTL_RELEASE=4, SCENE_CTL_CLONE=5 };
+       SCENE_CTL_CAPTURE=2, SCENE_CTL_PRESENT=3, SCENE_CTL_RELEASE=4, SCENE_CTL_CLONE=5,
+       SCENE_CTL_CAPTURE_DMABUF=6 };
 struct SceneUploadDesc {
     uint64_t pixels,bytes;
     uint32_t width,height,stride,format; // stride bytes; 1=BGRA premultiplied, 2=BGRX
@@ -23,6 +24,11 @@ struct SceneCloneDesc {
     int32_t sourceFd;
     uint32_t reserved;
     uint64_t version;
+};
+struct SceneDmabufCaptureDesc {
+    int32_t drmFd;
+    uint32_t gem,width,height,fourcc,stride,offset,flags;
+    uint64_t modifier;
 };
 struct SceneLayerDesc {
     uint64_t version;
@@ -47,6 +53,7 @@ BROOK_SCENE_SIZE(SceneLayerDesc,64);
 BROOK_SCENE_SIZE(ScenePresentDesc,24);
 BROOK_SCENE_SIZE(SceneStatsDesc,88);
 BROOK_SCENE_SIZE(SceneCloneDesc,16);
+BROOK_SCENE_SIZE(SceneDmabufCaptureDesc,40);
 #undef BROOK_SCENE_SIZE
 #ifdef __cplusplus
 }

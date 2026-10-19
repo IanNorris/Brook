@@ -11,8 +11,12 @@ parser.add_argument('--nix-seed',required=True,type=Path,help='Offline Nix image
 parser.add_argument('--control',type=Path,default=Path('build/vulkan-triangle-control-result'))
 parser.add_argument('--artifacts',type=Path,default=Path('build/release'))
 parser.add_argument('--vkmark',type=Path,help='Optional vkmark package already staged on the private Nix seed')
+parser.add_argument('--presentation',choices=('direct','staged'),default='staged')
+parser.add_argument('--composite',choices=('gpu','cpu'),default='cpu')
 parser.add_argument('--instance',type=int,default=510)
 args=parser.parse_args()
+if args.presentation=='direct' and args.composite!='gpu':parser.error('Direct DMA-BUF capture requires GPU composition')
+wsi_env={} if args.presentation=='direct' else {'MESA_VK_WSI_DEBUG':'sw,noshm'}
 r=args.output.resolve();r.mkdir(parents=True,exist_ok=False);run=r/'run';run.mkdir()
 seed=args.seed.resolve();assert json.loads((seed/'shutdown-result.json').read_text())['orderly_shutdown_completed'];assert all(v['exit']==0 for v in json.loads((seed/'after-fsck.json').read_text()).values())
 for p in Path('/proc').glob('[0-9]*/exe'):
@@ -26,7 +30,7 @@ for part in ('kernel/BROOK.elf','kernel/ksym_addr_table.cpp','bootloader/BOOTX64
 abis={}
 for module in (art/'kernel/drivers').glob('*.mod'):
  with module.open('rb') as stream:magic,abi=struct.unpack_from('<II',ELFFile(stream).get_section_by_name('.modinfo').data())
- assert magic==0x4b524f42 and abi==31;abis[module.name]=dict(abi=abi,sha256=b.sha(module))
+ assert magic==0x4b524f42 and abi==32;abis[module.name]=dict(abi=abi,sha256=b.sha(module))
 assert len(abis)==12;b.write(r/'module-abi-audit.json',abis)
 env=dict(os.environ,BROOK_BUILD_DIR=str(art),BROOK_DISK_IMG=str(run/'boot.img'));b.command([str(b.ROOT/'scripts/update_disk.sh')],r/'update-boot.log',env)
 control=json.loads((args.control/'manifest.json').read_text());probe=Path(control['probe'])/'bin/virtgpu-context'
@@ -39,7 +43,7 @@ for name in ('entry-state','scheduler-start'):
  source=args.artifacts/(name+'-audit.json');v=json.loads(source.read_text());assert v['pass'] and v['sha256']==b.sha(art/'kernel/BROOK.elf');shutil.copy2(source,r/source.name)
 owned=[]
 try:
- p,s,d,t=b.launch(run,args.instance,art,cpus=8,memory='4G',gpu='venus',composite='cpu',scenario='desktop',on_started=owned.append)
+ p,s,d,t=b.launch(run,args.instance,art,cpus=8,memory='4G',gpu='venus',composite=args.composite,scenario='desktop',on_started=owned.append)
  (r/'session.txt').write_text(s);print('BROOK_VULKAN_CONTEXT_READY',s,t,flush=True)
 except BaseException as error:
  # Only the timeout wrapper created above is ours. A boot failure cannot
@@ -108,10 +112,13 @@ try:
  assert loaded and all(Path(path).resolve()==renderer.resolve() for path in loaded)
  b.write(r/'host-renderer.json',dict(loaded=sorted(set(loaded)),expected=str(renderer.resolve()),sha256=b.sha(renderer.resolve())))
  boot_id=b.server.windows(s)['guest_boot_id']
+ if args.composite=='gpu':
+  name='vulkan_dmabuf_check.py';code='import sys;sys.argv='+repr([name,'--brook-guest'])+';\n'+Path('scripts/workloads',name).read_text()
+  assert json.loads(command('dmabuf-validation',['/nix/profile/bin/python3','-c',code]))['passed']
  for iteration in range(2):
   cycle='cycle'+str(iteration+1);out=r/cycle;out.mkdir();started=time.monotonic()
   j=b.TrackedCommand(out,s,[control['vulkanTools']+'/bin/vkcube','--wsi','wayland','--width','1280','--height','720','--c','6000'])
-  j.evidence['request'].update(uid=1000,cwd='/data/home',env={'VK_DRIVER_FILES':control['guestICD'],'XDG_RUNTIME_DIR':'/tmp','WAYLAND_DISPLAY':'wayland-0','MESA_VK_WSI_DEBUG':'sw,noshm'});b.write(j.path,j.evidence)
+  j.evidence['request'].update(uid=1000,cwd='/data/home',env={'VK_DRIVER_FILES':control['guestICD'],'XDG_RUNTIME_DIR':'/tmp','WAYLAND_DISPLAY':'wayland-0',**wsi_env});b.write(j.path,j.evidence)
   w=wait_window(lambda w:w['buffer_width']==800 and w['buffer_height']==600);b.write(out/'initial-window.json',w)
   initial=snapshot(cycle+'-initial');time.sleep(.5);second=snapshot(cycle+'-animated');verify_animation(cycle,w)
   x=w['x']+w['outer_width']+1;y=w['y']+w['outer_height']+1
@@ -141,7 +148,7 @@ try:
   for iteration in range(2):
    cycle='vkmark'+str(iteration+1);out=r/cycle;out.mkdir();started=time.monotonic()
    argv=[str(package/'bin/vkmark'),'--winsys','wayland','--present-mode','fifo','--size','1280x720','--benchmark','vertex:duration=15','--benchmark','texture:duration=15']
-   j=b.TrackedCommand(out,s,argv);j.evidence['request'].update(uid=1000,cwd='/data/home',env={'VK_DRIVER_FILES':control['guestICD'],'XDG_RUNTIME_DIR':'/tmp','WAYLAND_DISPLAY':'wayland-0','MESA_VK_WSI_DEBUG':'sw,noshm'});b.write(j.path,j.evidence)
+   j=b.TrackedCommand(out,s,argv);j.evidence['request'].update(uid=1000,cwd='/data/home',env={'VK_DRIVER_FILES':control['guestICD'],'XDG_RUNTIME_DIR':'/tmp','WAYLAND_DISPLAY':'wayland-0',**wsi_env});b.write(j.path,j.evidence)
    end=time.monotonic()+90;first=None
    while time.monotonic()<end:
     j.poll();current=windows();first=next((w for w in current if 'vkmark' in w['title'].lower()),None)
@@ -188,6 +195,10 @@ finally:
   text=(r/'guest-final-serial.log').read_text();assert text.count('CPU: PAT WC slot4 ready value=0x7040100070406')==8;assert 'write-combining disabled' not in text
   errors=[line for line in (text+(run/'launch.log').read_text(errors='replace')).splitlines() if re.search(r'context error|failed to dispatch|virtio_gpu_virgl_process_cmd.*error|IOV data size exceeds|failed to open libvulkan|invalid.*completion|control queue.*poison',line,re.I)]
   b.write(r/'renderer-errors.json',dict(passed=not errors,errors=errors));assert not errors,errors
+  imported=re.findall(r'virtio_gpu: imported Venus image ctx=(\d+) res=(\d+) (\d+)x(\d+) stride=(\d+) offset=(\d+)',text)
+  b.write(r/'presentation-evidence.json',dict(requested=args.presentation,imports=imported,launch_environment=wsi_env))
+  if args.presentation=='direct':assert imported,'No direct Venus allocation was imported'
+  else:assert not imported,'Staged run unexpectedly used direct image imports'
   print('BROOK_PAT_CHECKED_STOP',s,flush=True)
 
-b.write(r/'acceptance-complete.json',dict(passed=True,session=s,window_cycles=2,vkmark_cycles=2 if args.vkmark else 0,presentation='native Mesa Wayland WSI with hardware Venus rendering and CPU staging',checked_shutdown=True,offline_fsck_passed=True))
+b.write(r/'acceptance-complete.json',dict(passed=True,session=s,window_cycles=2,vkmark_cycles=2 if args.vkmark else 0,presentation=args.presentation,composition=args.composite,checked_shutdown=True,offline_fsck_passed=True))

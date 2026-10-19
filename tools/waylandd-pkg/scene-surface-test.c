@@ -42,13 +42,14 @@ static long test_syscall(long number,...) {
         }
         return 0;
     }
-    if (op==SCENE_CTL_CAPTURE && uncertain_capture) { ++captures;errno=EIO;return -1; }
+    if (op==SCENE_CTL_CAPTURE_DMABUF && uncertain_capture) { ++captures;errno=EIO;return -1; }
     uint64_t v=scene->next++;assert(v<64);struct image_slot *out=&scene->images[v];out->live=1;
     if (op==SCENE_CTL_UPLOAD) {
         const struct SceneUploadDesc *d=arg;assert(size==sizeof(*d));
         out->pixel=*(uint32_t *)(uintptr_t)d->pixels;out->w=d->width;out->h=d->height;
-    } else if (op==SCENE_CTL_CAPTURE) {
-        const struct SceneCaptureDesc *d=arg;assert(size==sizeof(*d) && d->drmFd==42 && d->gem==7);
+    } else if (op==SCENE_CTL_CAPTURE_DMABUF) {
+        const struct SceneDmabufCaptureDesc *d=arg;assert(size==sizeof(*d) && d->drmFd==42 && d->gem==7);
+        assert(d->fourcc==BROOK_DMABUF_ARGB8888 && d->stride==4 && d->offset==0 && d->flags==0 && d->modifier==0);
         ++captures;out->pixel=producer;out->w=d->width;out->h=d->height;
     } else if (op==SCENE_CTL_CLONE) {
         const struct SceneCloneDesc *d=arg;assert(size==sizeof(*d));

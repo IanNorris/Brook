@@ -122,13 +122,19 @@ static int image_gpu(struct brook_image *image,struct brook_scene_owner *owner) 
         struct SceneCloneDesc desc={image->owner->fd,0,image->version};
         version=scene_ctl(owner->fd,SCENE_CTL_CLONE,&desc,sizeof(desc));
     } else if (image->source) {
-        struct SceneCaptureDesc desc={g_drm_fd,image->source->dmabuf->bo_handle,image->width,image->height,image->format,0};
-        version=scene_ctl(owner->fd,SCENE_CTL_CAPTURE,&desc,sizeof(desc));
+        const struct brook_dmabuf_buffer *db=image->source->dmabuf;
+        struct SceneDmabufCaptureDesc desc={g_drm_fd,db->bo_handle,image->width,image->height,
+                                           db->fourcc,db->stride,db->offset,0,db->modifier};
+        version=scene_ctl(owner->fd,SCENE_CTL_CAPTURE_DMABUF,&desc,sizeof(desc));
     } else {
         struct SceneUploadDesc desc={(uintptr_t)image->pixels,(uint64_t)image->width*image->height*4,image->width,image->height,image->width*4,image->format};
         version=scene_ctl(owner->fd,SCENE_CTL_UPLOAD,&desc,sizeof(desc));
     }
-    if (version<=0) { if (version==-EIO) { image->uncertain=1;if (image->source) image->source->uncertain=1; }return 0; }
+    if (version<=0) {
+        fprintf(stderr,"[waylandd] retained image capture failed: result=%ld size=%ux%u source=%s\n",
+                version,image->width,image->height,image->source?"dmabuf":"snapshot");
+        if (version==-EIO) { image->uncertain=1;if (image->source) image->source->uncertain=1; }return 0;
+    }
     if (image->owner) {
         scene_ctl(image->owner->fd,SCENE_CTL_RELEASE,(void *)(uintptr_t)image->version,0);
         scene_owner_unref(image->owner);

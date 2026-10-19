@@ -22,7 +22,7 @@ static long test_syscall(long number, ...)
     va_list args;va_start(args,number);
     if (number==0xB06) { va_end(args);return open("/dev/null",O_RDWR); }
     assert(number==0xB07);(void)va_arg(args,long);long op=va_arg(args,long);va_end(args);
-    if (op!=SCENE_CTL_CAPTURE) return 0;
+    if (op!=SCENE_CTL_CAPTURE_DMABUF) return 0;
     ++calls;errno=result_errno;return result;
 }
 static void check(long rc,int error,int safe,int destroy_early)

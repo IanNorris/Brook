@@ -1,6 +1,7 @@
 #include "compositor_scene.h"
 #include "gpu_scene_versions.h"
 #include "compositor.h"
+#include "gpu_app.h"
 #include "window.h"
 #include "process.h"
 #include "scheduler.h"
@@ -48,6 +49,9 @@ struct SceneJob {
     SceneImageInfo image;
     uint64_t snapshot,pages;
     MappingBacking* sourceLease;
+    SceneCaptureSync sourceSync;
+    bool hasLayout;
+    BrookDmabufLayout layout;
     int32_t producer;
     uint32_t resource,sourceFormat,count;
     uint64_t versions[GPU_SCENE_MAX_LAYERS];
@@ -75,9 +79,18 @@ bool BeginPublication(Scene* scene) {
 void EndPublication(Scene* scene) {
     __atomic_fetch_and(&scene->lifecycle,~1u,__ATOMIC_RELEASE);ApplyClose(scene);
 }
+void FinishSource(SceneJob* job,bool safe,bool captured) {
+    if(job->sourceSync.complete) {
+        const auto sync=job->sourceSync;job->sourceSync={};
+        sync.complete(sync.context,safe,captured);
+    }
+}
 void JobUnref(SceneJob* job) {
     if (__atomic_fetch_sub(&job->references,1,__ATOMIC_ACQ_REL)!=1) return;
     if (job->snapshot) VmmFreePages(VirtualAddress(job->snapshot),job->pages);
+    // If no worker accessed the source (admission/queue cancellation), its
+    // current WRITE token is reusable. The canonical lease still pins it here.
+    FinishSource(job,true,false);
     if (job->sourceLease) MappingBackingUnref(job->sourceLease);
     KMutexLock(&g_sceneLock);
     if (job->sourceScene) --job->sourceScene->jobs;
@@ -122,6 +135,7 @@ bool CancelMetadata(SceneJob* job) {
     return job->scene->images.Reject(job->image.version);
 }
 void QuarantineJob(SceneJob* job,bool hasWorkerReference) {
+    FinishSource(job,false,false);
     if (!hasWorkerReference) __atomic_fetch_add(&job->references,1,__ATOMIC_RELAXED);
     if (job->kind==JobKind::Present)
         for (uint32_t i=0;i<job->count;++i) job->scene->images.Quarantine(job->versions[i]);
@@ -284,15 +298,18 @@ int64_t SceneUpload(Process* caller,SceneHandle* handle,const SceneUploadDesc& d
     return WaitJob(caller,job);
 }
 int64_t SceneCapture(Process* caller,SceneHandle* handle,const SceneCaptureDesc& desc,MappingBacking* lease,
-                     int32_t producer,uint32_t resource,uint32_t sourceFormat) {
+                     int32_t producer,uint32_t resource,uint32_t sourceFormat,
+                     const BrookDmabufLayout* layout,SceneCaptureSync sync) {
     if (!lease || !desc.width || !desc.height || desc.width>GPU_SCENE_MAX_DIMENSION ||
         desc.height>GPU_SCENE_MAX_DIMENSION || (desc.format!=1 && desc.format!=2) ||
-        !GpuCaptureFormatSupported(sourceFormat)) return -22;
-    auto* job=NewJob(handle->scene,JobKind::Capture);if (!job) return -12;
+        !GpuCaptureFormatSupported(sourceFormat)) {if(sync.complete)sync.complete(sync.context,true,false);return -22;}
+    auto* job=NewJob(handle->scene,JobKind::Capture);
+    if (!job) {if(sync.complete)sync.complete(sync.context,true,false);return -12;}
     const int error=ReserveImage(job,desc.width,desc.height,desc.format,0);
-    if (error) { kfree(job);return error; }
+    if (error) { kfree(job);if(sync.complete)sync.complete(sync.context,true,false);return error; }
     MappingBackingRef(lease);job->sourceLease=lease;job->producer=producer;
     job->resource=resource;job->sourceFormat=sourceFormat;
+    job->sourceSync=sync;job->hasLayout=layout!=nullptr;if(layout)job->layout=*layout;
     const int queued=Enqueue(job);if (queued) { JobUnref(job);return queued; }
     return WaitJob(caller,job);
 }
@@ -380,7 +397,10 @@ void CompositorDrainScenes() {
             inputsReady=job->sourceScene->images.GetPinned(job->versions[0],image);
         }
         KMutexUnlock(&g_sceneLock);
-        if (canceled) { if (!canceledUncertain) JobUnref(job);continue; }
+        if (canceled) {
+            FinishSource(job,!canceledUncertain,false);
+            if (!canceledUncertain) JobUnref(job);continue;
+        }
         auto* scene=job->scene;GpuCaptureResult result=GpuCaptureResult::Rejected;
         uint32_t texture=job->image.texture;
         if (job->kind==JobKind::Present) result=inputsReady?
@@ -399,10 +419,18 @@ void CompositorDrainScenes() {
                     result=gpu->UploadOwnedTexture(texture,job->snapshot,job->image.width*job->image.height*4);
                 else if (job->kind==JobKind::Clone)
                     result=gpu->ComposeOwnedLayers(texture,job->layers,1);
-                else result=gpu->CaptureExternal(texture,job->producer,job->resource,job->sourceFormat,
-                                                 job->image.width,job->image.height);
+                else {
+                    const auto* app=GpuAppGet();
+                    if(job->hasLayout && (!app || !app->PrepareBlobImage ||
+                       app->PrepareBlobImage(job->producer,job->resource,job->layout)<0))result=GpuCaptureResult::Uncertain;
+                    else result=gpu->CaptureExternal(texture,job->producer,job->resource,job->sourceFormat,
+                                                     job->image.width,job->image.height);
+                }
             }
         }
+        // Complete the resource reservation only after all copy/fence steps,
+        // before publishing a result which permits the producer's release.
+        FinishSource(job,result!=GpuCaptureResult::Uncertain,result==GpuCaptureResult::Complete);
         SceneRetiredRoot retired{};
         bool uncertain=result==GpuCaptureResult::Uncertain;
         KMutexLock(&g_sceneLock);

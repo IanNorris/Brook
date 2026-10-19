@@ -5,6 +5,7 @@
 #include <vector>
 #include <functional>
 #include "../../kernel/src/compositor_scene.cpp"
+#include "../../kernel/src/gpu_reservation.h"
 
 #define EXPECT(x) do { if (!(x)) { std::fprintf(stderr,"SCENE_SERVICE line %d: %s\n",__LINE__,#x);std::abort(); } } while(0)
 namespace {
@@ -13,12 +14,14 @@ std::map<uint64_t,uint64_t> pages;
 std::map<uint32_t,std::vector<uint32_t>> textures;
 uint32_t nextTexture=1,rootPixel=0,stagingPixel=0;
 unsigned rootBuildCalls=0;
+unsigned imagePreparations=0;
 uint64_t windowIncarnation=1,windowGeneration=1;
 bool liveWindow=true,failCopy=false,failAllocation=false,failRetire=false,failRoot=false;
 bool deferWorker=false;
 brook::GpuCaptureResult operationResult=brook::GpuCaptureResult::Complete;
 std::function<void()> atGpu,atSleep;
 brook::GpuCompositorOps fakeGpu{};
+brook::GpuAppOps fakeApp{};
 brook::Process* fakeOwner;
 void Callback(std::function<void()>& callback) {
     if (!callback) return;
@@ -80,6 +83,7 @@ void MappingBackingUnref(MappingBacking* backing) {
     if (!--backing->references && backing->release) backing->release(backing->object);
 }
 const GpuCompositorOps* GpuCompositorGet() { return &fakeGpu; }
+const GpuAppOps* GpuAppGet() { return &fakeApp; }
 bool CompositorGpuActive() { return true; }
 bool WmGetCaptureBinding(Process* caller,uint32_t window,WmCaptureToken* out) {
     EXPECT(!sceneLockDepth);
@@ -212,6 +216,50 @@ void SharedQuarantine(unsigned mode) {
     if (handle) SceneHandleUnref(handle);
     Drain();EXPECT(g_jobs==2 && textures.size()==2);DropDeviceFixture();CheckedEmpty();
 }
+void CaptureReservations() {
+    using namespace brook;
+    struct State { GpuReservation reservation;MappingBacking* backing;unsigned calls=0;bool safe=false,captured=false; };
+    const auto finish=[](void* context,bool safe,bool captured) {
+        auto& state=*static_cast<State*>(context);EXPECT(++state.calls==1 && state.backing->references);
+        state.safe=safe;state.captured=captured;state.reservation.FinishCapture(safe,captured);
+    };
+    for(unsigned mode=0;mode<6;++mode) {
+        auto* scene=OpenScene();MappingBacking backing{1,nullptr,nullptr,nullptr};
+        State state{};state.backing=&backing;
+        EXPECT(state.reservation.ImportCompleted(2) && state.reservation.BeginCapture());
+        unsigned waits=0;imagePreparations=0;
+        fakeApp.PrepareBlobImage=[](int32_t ctx,uint32_t resource,const BrookDmabufLayout& layout) {
+            EXPECT(!sceneLockDepth && ctx==8 && resource==99 && layout.stride==16);++imagePreparations;return 0;
+        };
+        atSleep=[&] {
+            EXPECT(!state.reservation.Ready() && !state.reservation.Begin() && !state.calls);
+            // Both exported WRITE snapshots and conflicting BO submissions
+            // see this source as busy while its actual scene job is queued.
+            ++waits;
+        };
+        if(mode==1)g_jobs=MaxJobs; // admission fails without a GPU read
+        if(mode==2)fakeOwner->terminalPending=true; // queued cancellation
+        if(mode==3)operationResult=GpuCaptureResult::Uncertain;
+        if(mode==4)failAllocation=true;
+        if(mode==5)fakeApp.PrepareBlobImage=[](int32_t,uint32_t,const BrookDmabufLayout&) { EXPECT(!sceneLockDepth);++imagePreparations;return -1; };
+        const SceneCaptureDesc desc{-1,1,4,4,1,0};
+        const BrookDmabufLayout layout{4,4,BROOK_DMABUF_ARGB8888,16,0,0,0};
+        const auto result=SceneCapture(fakeOwner,scene,desc,&backing,8,99,1,&layout,{&state,finish});
+        if(mode==1)g_jobs=0;
+        fakeOwner->terminalPending=false;failAllocation=false;operationResult=GpuCaptureResult::Complete;atSleep={};
+        EXPECT(state.calls==1 && !state.reservation.capturing);
+        if(mode==0)EXPECT(result>0 && state.safe && state.captured && !state.reservation.BeginCapture());
+        else if(mode==3 || mode==5)EXPECT(result==-5 && !state.safe && !state.captured && state.reservation.uncertain);
+        else EXPECT(result<0 && state.safe && !state.captured && state.reservation.BeginCapture());
+        if(mode!=0 && mode!=3 && mode!=5)state.reservation.FinishCapture(true,false);
+        EXPECT(waits==(mode==1?0u:1u));
+        EXPECT(imagePreparations==(mode==1 || mode==2 || mode==4?0u:1u));
+        SceneHandleUnref(scene);Drain();
+        if(mode==3 || mode==5) { EXPECT(backing.references==2);DropDeviceFixture(); }
+        EXPECT(backing.references==1);MappingBackingUnref(&backing);CheckedEmpty();
+    }
+    fakeApp={};
+}
 }
 void TestSceneService() {
     using namespace brook;
@@ -310,6 +358,7 @@ void TestSceneService() {
     DropDeviceFixture();CheckedEmpty();
     CloneImages();
     SharedQuarantine(0);SharedQuarantine(1);SharedQuarantine(2);
+    CaptureReservations();
     std::free(fakeOwner);fakeOwner=nullptr;
     std::puts("SCENE_SERVICE_PASS real queue/ownership transitions with fake GPU: packing, source leases, close, replacement, reuse, capacity, uncertainty");
 }

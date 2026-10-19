@@ -2940,6 +2940,12 @@ struct DrmResource {
     GpuReservation reservation;
     DrmResource* retiredNext;
 };
+static void DrmCaptureComplete(void* context,bool safe,bool captured) {
+    auto* resource=static_cast<DrmResource*>(context);
+    KMutexLock(&resource->reservationLock);
+    resource->reservation.FinishCapture(safe,captured);
+    KMutexUnlock(&resource->reservationLock);
+}
 // Final callbacks only enqueue: GPU waits never enter mapping/FD cleanup locks.
 // GEMs, PRIME capabilities, VMAs and capture requests independently own the
 // canonical resource. Last-reference retirement now covers exported buffers,
@@ -6485,7 +6491,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         for(;;) {
             KMutexLock(&resource->reservationLock);
             const bool uncertain=resource->reservation.uncertain;
-            const bool pending=resource->reservation.pending!=0;
+            const bool pending=resource->reservation.pending!=0 || resource->reservation.capturing;
             KMutexUnlock(&resource->reservationLock);
             if(uncertain)return -EIO;
             if(!pending)break;
@@ -11529,7 +11535,7 @@ static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
             pin.value=resource->lifetime;break;
         }
     }
-    if (!resource || resource->target!=2 || !brook::GpuCaptureFormatSupported(resource->format) ||
+    if (!resource || resource->owner->config.capsetId==4 || resource->target!=2 || !brook::GpuCaptureFormatSupported(resource->format) ||
         w>resource->width || h>resource->height) return -EINVAL;
     brook::WmCaptureToken token{};
     if (!brook::WmReserveCapture(proc,static_cast<uint32_t>(wmId),
@@ -11599,12 +11605,48 @@ static int64_t sys_brook_scene_ctl(uint64_t fd,uint64_t op,uint64_t arg,uint64_t
         {
             auto* context=static_cast<DrmCtx*>(drm->handle);DrmMappingGuard guard(context);
             auto* gem=DrmGemGet(context,desc.gem);
-            if (!gem || gem->resource->target!=2 || !GpuCaptureFormatSupported(gem->resource->format) ||
+            if (!gem || gem->resource->owner->config.capsetId==4 || gem->resource->target!=2 || !GpuCaptureFormatSupported(gem->resource->format) ||
                 desc.width>gem->resource->width || desc.height>gem->resource->height) return -EINVAL;
             auto* image=gem->resource;MappingBackingRef(image->lifetime);lease.value=image->lifetime;
             producer=image->owner->ctxId;resource=image->gres;format=image->format;
         }
         return SceneCapture(proc,handle,desc,lease.value,producer,resource,format);
+    }
+    if (op==SCENE_CTL_CAPTURE_DMABUF) {
+        if(size!=sizeof(SceneDmabufCaptureDesc))return -EINVAL;
+        SceneDmabufCaptureDesc desc{};if(!CopyFromUser(&desc,arg,sizeof(desc)))return -EFAULT;
+        const BrookDmabufLayout layout{desc.width,desc.height,desc.fourcc,desc.stride,desc.offset,desc.flags,desc.modifier};
+        FdRef drm(proc,desc.drmFd);
+        if(!drm || drm->type!=FdType::DevDri || !drm->handle)return -EBADF;
+        MappingBackingGuard lease;DrmResource* image=nullptr;
+        {
+            auto* context=static_cast<DrmCtx*>(drm->handle);DrmMappingGuard guard(context);
+            auto* gem=DrmGemGet(context,desc.gem);if(!gem)return -EINVAL;
+            image=gem->resource;
+            if(!__atomic_load_n(&image->everExported,__ATOMIC_ACQUIRE))return -EINVAL;
+            const bool venus=image->owner->config.capsetId==4;
+            if(BrookDmabufValidate(&layout,image->size,!venus)!=BROOK_DMABUF_LAYOUT_OK)return -EINVAL;
+            if(!venus && (image->target!=2 || desc.width!=image->width || desc.height!=image->height ||
+               desc.stride!=image->stride || desc.offset ||
+               image->format!=(desc.fourcc==BROOK_DMABUF_ARGB8888?1u:2u)))return -EINVAL;
+            if(venus && (!image->hostBlob || !(image->blobFlags&2u)))return -EINVAL;
+            MappingBackingRef(image->lifetime);lease.value=image->lifetime;
+        }
+        const bool venus=image->owner->config.capsetId==4;
+        if(venus) {
+            // Only the current frame's imported WRITE fence is evidence of
+            // Venus queue completion. A prior capture or ring0 ack is not.
+            KMutexLock(&image->reservationLock);
+            const bool admitted=image->reservation.BeginCapture();
+            KMutexUnlock(&image->reservationLock);
+            if(!admitted)return -11; // EAGAIN, producer synchronization absent
+        }
+        const SceneCaptureDesc capture{desc.drmFd,desc.gem,desc.width,desc.height,
+                                      desc.fourcc==BROOK_DMABUF_ARGB8888?1u:2u,0};
+        // VirGL BGRA/BGRX values, distinct from the scene's alpha policy.
+        const uint32_t format=desc.fourcc==BROOK_DMABUF_ARGB8888?1u:2u;
+        return SceneCapture(proc,handle,capture,lease.value,image->owner->ctxId,image->gres,format,
+                            venus?&layout:nullptr,venus?SceneCaptureSync{image,DrmCaptureComplete}:SceneCaptureSync{});
     }
     if (op==SCENE_CTL_CLONE) {
         if (size!=sizeof(SceneCloneDesc)) return -EINVAL;

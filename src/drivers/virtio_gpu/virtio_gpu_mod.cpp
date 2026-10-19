@@ -2791,6 +2791,8 @@ struct AppBlob {
     int32_t context;
     uint32_t resource;
     uint64_t lease, offset, size;
+    bool imagePrepared;
+    BrookDmabufLayout imageLayout;
 };
 static AppBlob g_appBlobs[2048]{};
 static brook::GpuApertureAllocator<> g_appAperture;
@@ -2848,7 +2850,7 @@ static int32_t AppResourceCreateBlob(int32_t ctxId, const brook::GpuBlobCreate& 
     if ((create.flags&1u) && !g_appAperture.Allocate(create.size,g_hostVisLength,extent)) return -1;
     const uint32_t resource=g_appResourceIds.Allocate(static_cast<uint32_t>(ctxId)-APP_FIRST_CTX);
     if (!resource) { if(extent.lease)g_appAperture.Release(extent.lease);return -1; }
-    *blob={true,false,false,false,false,ctxId,resource,extent.lease,extent.offset,(create.size+4095)&~uint64_t{4095}};
+    *blob={true,false,false,false,false,ctxId,resource,extent.lease,extent.offset,(create.size+4095)&~uint64_t{4095},false,{}};
     *outResource=resource; // canonical kernel owner exists before host publication
     auto* request=reinterpret_cast<GpuCreateBlobCommand*>(g_cmdBuf+CMD_REQ_OFF);
     memset(request,0,sizeof(*request));request->hdr.type=0x010c;request->hdr.ctx_id=static_cast<uint32_t>(ctxId);
@@ -3177,6 +3179,38 @@ static bool CompDestroyOwnedTexture(GpuTexId id)
     auto* texture=CompTex(id);
     return texture && texture->owned && DestroyOwnedTextureLocked(*texture);
 }
+static int32_t AppPrepareBlobImage(int32_t ctxId,uint32_t resource,const BrookDmabufLayout& layout)
+{
+    GpuCmdGuard guard;
+    auto* blob=AppBlobFind(ctxId,resource);
+    const auto* context=AppCtxFind(ctxId);
+    if(!context || context->config.capsetId!=VIRTIO_GPU_CAPSET_VENUS || !blob ||
+       blob->quarantined || !g_ownedCaptureReady || !g_compReady || g_compFrameAssembling ||
+       g_controlQueuePoisoned || BrookDmabufValidate(&layout,blob->size,0)!=BROOK_DMABUF_LAYOUT_OK)return -1;
+    // The host treats SET_TYPE on an already typed resource as success without
+    // checking the supplied layout. Enforce identity before reaching it.
+    if(blob->imagePrepared)return memcmp(&blob->imageLayout,&layout,sizeof(layout)) ? -1 : 0;
+    if(!CtxAttachResource(COMP_CTX_ID,resource)){blob->quarantined=true;return -1;}
+    auto* sub=reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf+CMD_REQ_OFF);
+    memset(sub,0,sizeof(*sub));sub->hdr.type=VIRTIO_GPU_CMD_SUBMIT_3D;sub->hdr.ctx_id=COMP_CTX_ID;
+    auto* dw=ComposeDwBase();uint32_t n=0;
+    // virgl_protocol.h PIPE_RESOURCE_SET_TYPE, one plane (8+2 payload dwords).
+    dw[n++]=VirglCmd0(49,0,10);dw[n++]=resource;
+    dw[n++]=layout.fourcc==BROOK_DMABUF_ARGB8888?VIRGL_FORMAT_B8G8R8A8_UNORM:VIRGL_FORMAT_B8G8R8X8_UNORM;
+    dw[n++]=VIRGL_BIND_SAMPLER_VIEW;dw[n++]=layout.width;dw[n++]=layout.height;
+    dw[n++]=0;dw[n++]=static_cast<uint32_t>(layout.modifier);dw[n++]=static_cast<uint32_t>(layout.modifier>>32);
+    dw[n++]=layout.stride;dw[n++]=layout.offset;sub->size=n*4;
+    if(!CmdRespOk(SubmitCommand(sizeof(*sub)+n*4,CMD_RESP_CAP)) || !AppFenceLocked(COMP_CTX_ID) ||
+       !ResourceControlLocked(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,COMP_CTX_ID,resource)) {
+        // Import may have taken effect even after a failed acknowledgement.
+        // Keep the resource alive rather than reusing an uncertain host type.
+        blob->quarantined=true;return -1;
+    }
+    blob->imageLayout=layout;blob->imagePrepared=true;
+    SerialPrintf("virtio_gpu: imported Venus image ctx=%d res=%u %ux%u stride=%u offset=%u\n",
+                 ctxId,resource,layout.width,layout.height,layout.stride,layout.offset);
+    return 0;
+}
 static brook::GpuCaptureResult CompCaptureExternal(GpuTexId id,int32_t producer,
                                                     uint32_t source,uint32_t sourceFormat,uint32_t w,uint32_t h)
 {
@@ -3185,9 +3219,16 @@ static brook::GpuCaptureResult CompCaptureExternal(GpuTexId id,int32_t producer,
     if (!g_ownedCaptureReady || !g_compReady || g_compFrameAssembling || g_controlQueuePoisoned ||
         !texture || !texture->owned || !brook::GpuCaptureFormatSupported(sourceFormat) || !AppCtxFind(producer) || !AppResValid(producer,source) ||
         !w || !h || w!=texture->w || h!=texture->h) return brook::GpuCaptureResult::Rejected;
+    const auto* context=AppCtxFind(producer);
+    auto* blob=AppBlobFind(producer,source);
+    const bool venus=context->config.capsetId==VIRTIO_GPU_CAPSET_VENUS;
+    if(venus && (!blob || !blob->imagePrepared || blob->quarantined ||
+        blob->imageLayout.width!=w || blob->imageLayout.height!=h))return GpuCaptureResult::Rejected;
     const bool completed=brook::GpuCaptureSequence([&](brook::GpuCaptureStep step) {
         switch (step) {
-        case brook::GpuCaptureStep::ProducerFence:return AppFenceLocked(static_cast<uint32_t>(producer));
+        // The kernel admitted a current-frame imported WRITE sync_file before
+        // queuing a Venus capture. A GL/ring0 fence is not Venus GPU completion.
+        case brook::GpuCaptureStep::ProducerFence:return venus || AppFenceLocked(static_cast<uint32_t>(producer));
         case brook::GpuCaptureStep::AttachSource:return CtxAttachResource(COMP_CTX_ID,source);
         case brook::GpuCaptureStep::Copy:
             return Submit3DBlit(COMP_CTX_ID,texture->resId,0,0,w,h,source,0,0,w,h,false,texture->format,sourceFormat);
@@ -3381,6 +3422,7 @@ static const brook::GpuAppOps g_gpuAppOps = {
     AppResourceCreateBlob,
     AppSubmitVenus,
     AppBlobStatistics,
+    AppPrepareBlobImage,
 };
 
 static const brook::GpuCompositorOps g_gpuCompositorOps = {

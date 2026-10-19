@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include "gpu_context.h"
+#include "../../shared/dmabuf_layout.h"
 
 namespace brook {
 
@@ -116,6 +117,10 @@ struct GpuAppOps {
     int32_t (*SubmitVenus)(int32_t ctxId, const uint32_t* commands, uint32_t count,
                            uint32_t ring, bool fence);
     GpuBlobStatistics (*BlobStatistics)();
+    // Type an exported Venus allocation for compositor GL import. The caller
+    // owns its canonical lease and has verified the current producer WRITE
+    // fence. Immutable layout; never CPU-map a device-local allocation.
+    int32_t (*PrepareBlobImage)(int32_t ctxId,uint32_t resource,const BrookDmabufLayout& layout);
 };
 
 // Register the app-GPU ops (called by the display driver once its 3D path is

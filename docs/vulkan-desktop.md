@@ -110,3 +110,60 @@ fence and enforce producer-buffer release ordering. GL export currently fences
 the creating context; it does not prove completion of writes from another
 importing GL context. Cross-context rendering must be rejected or tracked before
 the new image-import path can claim that guarantee.
+
+### Direct image capture checkpoint
+
+Brook: `build/workloads/vulkan-desktop-import-20261019/direct-candidate4/`,
+kernel SHA-256 `4cbe8e41e9e11759a0cbe39625d555b7380d401f5a869529bf530a4f6d813734`,
+all 12 modules ABI 32. Pinned Intel/Mesa/QEMU/renderer versions remain unchanged.
+Wayland binary SHA-256:
+`6cc4a6ec09bcaffce6212cfa9428575fdf59a9510dda5bdc2173d75efab61c83`.
+
+The kernel checks the held GEM capability, canonical allocation extent,
+shareable Venus allocation, explicit LINEAR modifier, format/stride/offset and
+current imported WRITE fence. A capture-read reservation remains busy through
+the actual scene worker's import/copy/completion fence. Conflicting listed BO
+submissions are rejected and completed DMA-BUF exports wait. Safe allocation or
+cancellation failures preserve the frame's WRITE token for retry. Uncertain
+GPU completion stays quarantined. The source lease outlives this callback.
+
+Image preparation runs on the compositor worker, outside desktop frame
+assembly. The driver imports through `PIPE_RESOURCE_SET_TYPE`, rejects changed
+layouts for an already typed allocation, and never maps device-local images
+on the CPU. It does not substitute a GL producer fence for Vulkan completion.
+The compositor's own copy is fenced before Wayland releases the producer.
+Legacy numeric/capture operations reject Venus resources.
+
+Acceptance passed two full vkcube cycles (800×600, resize to 1280×720,
+minimize/restore, maximize to 1916×996 on a 1920×1080 desktop, restore,
+close/relaunch), two vkmark runs (1280×720, vertex and texture for 15 seconds
+each), and four concurrent hardware GLES RGB/persistent-buffer checks. No WSI
+debug flags were supplied to these Vulkan apps. Serial evidence records 44
+validated direct allocation imports. Vkmark reports 15 FPS for each scene in
+both runs; this is not yet a comparison with staging on the same compositor.
+
+All nine tracked command groups drain complete stdout/stderr and descendants.
+The guest rejects 17 malformed/unsupported capture requests without host image
+import. Final blob/aperture/quarantine/failed-retirement counts are zero; all 12
+backing mappings and 4,325,376 bytes balance. Heap integrity, checked shutdown,
+launcher/QEMU exits and all four offline filesystem checks pass. All 12 document
+fixtures and saved profile trees match the checked seed. All 57 host tests pass,
+including real scene-service queued reservations, cancellation/admission rollback,
+worker import failure and exactly-once completion with a live source lease.
+
+Earlier private failures remain preserved: an initial bridge epoch timeout shut
+down cleanly before any app launch; a repeat direct run hit a retained-scene
+failure and required a forced stop; the first negative probe used an unsupported
+raw shareable allocation and failed before WSI. None qualify as acceptance.
+The corrected direct candidate above uses fresh clones of the checked seed.
+
+Reproduction uses `scripts/workloads/stage_vulkan_nix.py --wayland PACKAGE` to
+install and hash-check the selected server on a new offline image, followed by
+`scripts/workloads/vulkan_wayland_check.py --presentation direct --composite gpu
+--vkmark build/vulkan-vkmark-wayland-result` with explicit checked seed, Nix seed,
+output and matching control arguments. Private images and raw logs stay outside
+git. Automatic policy/fallback and the controlled staged comparison remain open.
+
+![Direct Vulkan cube on Brook](images/brook_vulkan_direct_1080.png)
+
+![Direct Vulkan vkmark on Brook](images/brook_vulkan_direct_vkmark_1080.png)
