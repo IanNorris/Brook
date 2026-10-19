@@ -1,5 +1,18 @@
 # Recovery and VM-control backlog
 
+- Implement read-only Linux route-netlink interface/address enumeration using
+  Brook's actual network configuration, with multipart reply, sequencing,
+  socket ownership and libc `if_nameindex`/`getifaddrs` coverage. AF_NETLINK is
+  currently rejected; Wine 11's unchecked NULL interface list exposed a service
+  crash during DXVK testing. The upstream Wine null-check backport handles the
+  error without claiming that enumeration works.
+- Implement or explicitly reject extended-attribute queries with correct Linux
+  semantics. A rootless diagnostic confirms `listxattr` returns ENOSYS while
+  chmod and utime work; Python `shutil.copytree` aggregates these metadata-copy
+  failures into a large traceback. Define path/FD validation and permission
+  behavior before changing syscall results. The DXVK test uses a
+  byte/hash/mode-verified separate clone; original profiles remain untouched.
+
 - Audit older descriptor-producing syscalls for copyout rollback after numeric
   FD reuse. Completed sync-file exports now hold an atomically installed
   publication pin through copyout and failure cleanup. The preexisting

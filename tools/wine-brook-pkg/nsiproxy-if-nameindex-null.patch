@@ -1,0 +1,41 @@
+From 08dbf01aaa3689f8c8a8a22276658f372b023b03 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Micha=C5=82=20Durak?=
+ <24462-mdurak@users.noreply.gitlab.winehq.org>
+Date: Fri, 10 Apr 2026 18:32:59 +0200
+Subject: [PATCH] nsiproxy.sys: Avoid null pointer dereference on
+ if_nameindex() failure.
+
+---
+ dlls/nsiproxy.sys/ndis.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/nsiproxy.sys/ndis.c b/dlls/nsiproxy.sys/ndis.c
+index 8c15186ed531..5dde17244d9a 100644
+--- a/dlls/nsiproxy.sys/ndis.c
++++ b/dlls/nsiproxy.sys/ndis.c
+@@ -29,6 +29,7 @@
+ #include <sys/socket.h>
+ #include <sys/ioctl.h>
+ #include <unistd.h>
++#include <errno.h>
+ 
+ #ifdef HAVE_NET_IF_H
+ #include <net/if.h>
+@@ -308,9 +309,16 @@ static struct if_entry *add_entry( UINT index, char *name )
+ 
+ static unsigned int update_if_table( void )
+ {
+-    struct if_nameindex *indices = if_nameindex(), *entry;
++    struct if_nameindex *indices, *entry;
+     unsigned int append_count = 0;
+ 
++    indices = if_nameindex();
++    if (!indices)
++    {
++        ERR( "if_nameindex failed, errno %d.\n", errno );
++        return 0;
++    }
++
+     for (entry = indices; entry->if_index; entry++)
+     {
+         if (!find_entry_from_index( entry->if_index ) && add_entry( entry->if_index, entry->if_name ))
