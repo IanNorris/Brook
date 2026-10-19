@@ -668,8 +668,9 @@ host GL objects may retain host storage until their objects or contexts retire.
 Firefox's local page reported readiness but its hardware-mode window remained
 transparent. This is not accepted as rendered video or audio playback. Static
 inspection found that dmabuf subsurfaces skip capture and release their buffer
-without retaining pixels, unlike SHM subsurfaces. A trace associating Firefox's
-specific committing surface with its parent is still needed. The test image
+without retaining pixels, unlike SHM subsurfaces. At this checkpoint, a trace
+associating Firefox's specific committing surface with its parent was missing;
+the diagnostic follow-up below supplies it. The test image
 also predates the promoted Firefox audio package. Neither issue is resolved by
 the backing-retirement change.
 
@@ -679,3 +680,53 @@ streams emptied. Checked guest shutdown, owned launcher/QEMU exit zero, three
 offline filesystem checks and nine unchanged document hashes/owners passed.
 Evidence: `build/workloads/gpu-export-retirement-20261019/candidate/acceptance-audit.json`.
 Broader application acceptance and main approval remain open.
+
+## Hardware Firefox: retained surface-tree work
+
+The diagnostic follow-up, session `58ba1b34b0914b1296fe60ce6020f7bb`, confirms
+the association: Firefox's surface 33 is a dmabuf subsurface of root surface 38,
+at offset `(26,23)`, with an 800×600 buffer. Its root app ID is `firefox`.
+The first child commit precedes creation of the 852×652 root kernel window.
+The root later shows only a transparent outline while the local page reports
+media readiness. This proves the server skips Firefox's actual child content;
+it does not prove that this is the only issue remaining in hardware Firefox.
+Evidence is under `build/workloads/gpu-firefox-subsurface-20261019/candidate/`,
+including `surface-association.log` and `firefox.png`.
+
+The server reports this unsupported path once per surface. The diagnostic
+does not change presentation, buffer release or application configuration.
+
+The implementation direction is retained images per Wayland surface and GPU
+composition into a retained root texture. It is not implemented yet:
+
+- Add canonical resource-format metadata and format-aware owned capture.
+  ARGB capture must preserve alpha; XRGB supplies alpha one. Reject unsupported
+  formats before submitting commands. Do not infer source format from the
+  destination or from the client's unchecked dmabuf declaration.
+- Add explicit premultiplied composition: `ONE, ONE_MINUS_SRC_ALPHA` for RGB
+  and alpha, and scale both RGB and alpha by window opacity. Existing straight
+  alpha chrome drawing keeps its separate mode.
+- A provider-owned scene capability binds to a window incarnation. Layers have
+  generation-tagged identities and completed versions. Dmabuf updates retain
+  canonical source leases through verified capture; SHM updates copy into owned
+  upload storage. Closing the capability queues cleanup rather than waiting
+  for the GPU under FD cleanup locks.
+- Serialize layer updates and scene composition so active/staging textures stay
+  bounded and a published or queued version cannot be overwritten. Composition
+  validates and pins a complete bounded draw list, clears root staging to
+  transparent, draws it, fences, then revalidates and atomically publishes.
+  Failure preserves the previous complete root. Desktop repaint samples the
+  root without revisiting clients or recomposing an unchanged tree.
+- Wayland retains the tree semantics: committed versus cached state, child
+  ordering, nested signed offsets, clipping, detach and destruction. Mixed
+  SHM/dmabuf trees work in both directions. Root CPU repaint must not overwrite
+  an active GPU scene. Offscreen work runs before desktop frame assembly and
+  explicitly restores framebuffer, viewport, shader and blend state.
+
+The first pixel fixture must include a transparent SHM root, offset dmabuf
+child, overlapping translucent sibling, nested negative offsets, parent-only
+repaint, GL↔SHM child transitions, source overwrite after release, detach, resize
+and reused window slots. Test-only readback verifies pixels; thousands of
+updates must retain bounded allocations. Real Firefox rendering and audio are
+subsequent acceptance gates. A CPU readback loop or redirecting the child into
+the entire root window would not satisfy this design.

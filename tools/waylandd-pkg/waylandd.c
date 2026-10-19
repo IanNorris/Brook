@@ -284,6 +284,7 @@ struct brook_surface {
     struct brook_surface *children;   /* linked list of child subsurfaces */
     struct brook_surface *sibling;    /* next child in parent's children list */
     struct wl_resource   *subsurface_resource; /* wl_subsurface resource if role is subsurface */
+    int dmabuf_subsurface_reported; /* bounded diagnostic: once per surface */
 };
 
 static struct brook_surface *g_surfaces = NULL;
@@ -655,6 +656,21 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r) {
         struct brook_dmabuf_buffer *db = wl_resource_get_user_data(s->pending_buffer);
         int dw = db ? db->width  : 0;
         int dh = db ? db->height : 0;
+        if (s->subsurface_parent && !s->dmabuf_subsurface_reported) {
+            struct brook_surface *root = s;
+            while (root->subsurface_parent) root = root->subsurface_parent;
+            pid_t pid = 0;
+            wl_client_get_credentials(c, &pid, NULL, NULL);
+            fprintf(stderr,
+                "[waylandd] unsupported dmabuf subsurface: pid=%ld surface=%u "
+                "parent=%u root=%u root_wm=%u root_app=%.127s "
+                "offset=%d,%d size=%dx%d gres=%u; content not retained\n",
+                (long)pid, wl_resource_get_id(s->resource),
+                wl_resource_get_id(s->subsurface_parent->resource),
+                wl_resource_get_id(root->resource), root->wm_id, root->app_id,
+                s->sub_x, s->sub_y, dw, dh, db ? db->gres : 0);
+            s->dmabuf_subsurface_reported = 1;
+        }
         int may_present = (!s->xdg_toplevel && !s->xdg_popup) || s->xdg_acked;
         if (may_present && db && db->gres && dw > 0 && dh > 0 &&
             (s->xdg_toplevel || s->xdg_popup)) {
