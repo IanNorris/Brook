@@ -142,6 +142,32 @@ int main() {
     tracker.Enable(false);tracker.Enqueue(2,22,true,50000000);
     tracker.WatchTick(0,ReadyWatchTick::User);tracker.WatchOtherDispatch(0,3,30,false);
     tracker.Enable(true);assert(!tracker.Snapshot().watch.retained);
+    // Interrupted context belongs to the exact pending watch interval. Retain
+    // the last endpoint per CPU, including PID incarnation, not a residency claim.
+    tracker.Reset();tracker.Watch(2,22);
+    tracker.WatchTick(7,ReadyWatchTick::KernelBusy,0x111,9,90); // not queued
+    tracker.Enqueue(2,22,true,1);
+    tracker.WatchTick(7,ReadyWatchTick::KernelBusy,0x222,9,90);
+    tracker.Enqueue(2,22,true,2); // retry retains context
+    tracker.WatchTick(7,ReadyWatchTick::User,0x333,9,91);
+    tracker.WatchTick(63,ReadyWatchTick::Idle,0x444,0,0);
+    tracker.WatchTick(64,ReadyWatchTick::User,0x555,1,1);
+    tracker.WatchTick(7,static_cast<ReadyWatchTick>(99),0x666,1,1);
+    tracker.Dispatch(2,22,40000001);watched=tracker.Snapshot().watch;
+    activity=watched.events[0].cpus[7];
+    assert(activity.contextSamples==2 && activity.lastRip==0x333);
+    assert(activity.lastPid==9 && activity.lastIncarnation==91 && activity.lastKind==static_cast<uint32_t>(ReadyWatchTick::User));
+    activity=watched.events[0].cpus[63];
+    assert(activity.contextSamples==1 && activity.lastRip==0x444 && !activity.lastPid);
+    assert(watched.invalidActivity==2);
+    tracker.Enqueue(2,22,true,50000000);tracker.Remove(2,22);
+    tracker.WatchTick(7,ReadyWatchTick::KernelBusy,0x777,9,91);
+    tracker.Enqueue(2,22,true,60000000);tracker.Dispatch(2,22,110000001);
+    assert(!tracker.Snapshot().watch.events[0].cpus[7].contextSamples);
+    tracker.Enqueue(2,22,true,120000000);
+    tracker.WatchTick(7,ReadyWatchTick::KernelBusy,0x888,9,91);
+    tracker.Reset();tracker.Enqueue(2,22,true,130000000);tracker.Dispatch(2,22,170000001);
+    assert(!tracker.Snapshot().watch.events[0].cpus[7].lastRip);
     uint32_t observations=~uint32_t(0)-1;
     assert(!ReadyWatchCpuActivity::Increment(observations) && observations==~uint32_t(0));
     assert(ReadyWatchCpuActivity::Increment(observations) && observations==~uint32_t(0));

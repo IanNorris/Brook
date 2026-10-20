@@ -8,6 +8,10 @@ enum class ReadyWatchTick { User, KernelBusy, Idle, Other };
 struct ReadyWatchCpuActivity {
     uint32_t userTicks=0,kernelTicks=0,idleTicks=0,otherTicks=0;
     uint32_t userDispatches=0,kernelDispatches=0;
+    // Last delivered periodic interrupt while this watched task was queued.
+    // Endpoint only: no stack walk, timestamps, Process pointers or residency claim.
+    uint64_t lastRip=0,lastPid=0,lastIncarnation=0;
+    uint32_t contextSamples=0,lastKind=0;
     bool Any()const{return userTicks || kernelTicks || idleTicks || otherTicks || userDispatches || kernelDispatches;}
     static bool Increment(uint32_t& n){if(n==~uint32_t(0))return true;++n;return false;}
 };
@@ -34,7 +38,13 @@ public:
     bool Matches(uint64_t pid,uint64_t incarnation)const {
         return data_.pid && data_.pid==pid && data_.incarnation==incarnation;
     }
-    void Select(uint64_t pid,uint64_t incarnation){data_={};pending_={};data_.pid=pid;data_.incarnation=incarnation;}
+    void Select(uint64_t pid,uint64_t incarnation){
+        // Clear in place: aggregate assignment can materialize a large temporary
+        // on the caller's kernel stack, including during boot policy switching.
+        __builtin_memset(&data_,0,sizeof(data_));
+        __builtin_memset(&pending_,0,sizeof(pending_));
+        data_.pid=pid;data_.incarnation=incarnation;
+    }
     void Reset(){Select(data_.pid,data_.incarnation);}
     void Cancel(uint64_t pid,uint64_t incarnation){
         if(Matches(pid,incarnation)){pending_={};data_.pending=false;}
@@ -47,7 +57,7 @@ public:
         if(!Matches(pid,incarnation) || !data_.pending || !deadline)return;
         pending_.deadlineTick=deadline;pending_.readyTick=nowTick;pending_.hasDeadline=true;
     }
-    void Tick(unsigned cpu,ReadyWatchTick kind){
+    void Tick(unsigned cpu,ReadyWatchTick kind,uint64_t rip=0,uint64_t pid=0,uint64_t incarnation=0){
         if(!data_.pending)return;
         if(cpu>=ReadyWatchCpus){Add(data_.invalidActivity);return;}
         auto& c=pending_.cpus[cpu];uint32_t* counter=nullptr;
@@ -59,6 +69,12 @@ public:
         }
         if(!counter){Add(data_.invalidActivity);return;}
         if(ReadyWatchCpuActivity::Increment(*counter))data_.saturated=true;
+        // A zero RIP means this caller did not provide an interrupted context.
+        if(rip){
+            c.lastRip=rip;c.lastPid=pid;c.lastIncarnation=incarnation;
+            c.lastKind=static_cast<uint32_t>(kind);
+            if(ReadyWatchCpuActivity::Increment(c.contextSamples))data_.saturated=true;
+        }
     }
     void OtherDispatch(unsigned cpu,uint64_t pid,uint64_t incarnation,bool kernel){
         if(!data_.pending || !pid || Matches(pid,incarnation))return;
@@ -89,6 +105,7 @@ public:
         for(unsigned i=data_.retained-1;i>at;--i)data_.events[i]=data_.events[i-1];
         data_.events[at]=e;
     }
+    void CopySnapshot(ReadyWatchSnapshot& output)const{output=data_;}
     ReadyWatchSnapshot Snapshot()const{return data_;}
 };
 }

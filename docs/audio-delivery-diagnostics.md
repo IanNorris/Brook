@@ -241,3 +241,100 @@ No publication lead, FIFO trailer, sampling bound or scheduler default changes
 follow from these results. Before a smaller-lead experiment, separate guest-only
 from host-only load and enable the existing worker ready-watch/BSP/AP timing
 probes to distinguish late wake publication, ready-queue delay and host stalls.
+
+## Guest-only versus host-only load
+
+Two fresh private runs use the same `delivery-extrema-frozen` kernel/modules,
+MLFQ, BSP wake scanning, callback audio and 20-ms HDA output. Both enable the
+existing mixer ready-watch, BSP timer and independent per-CPU arrival probes.
+QEMU runs eight vCPUs with host affinity 0–13, normal nice 0 and SCHED_OTHER.
+The host workers, when present, have the same affinity, priority and cgroup as
+QEMU; their seventeen thread affinities are checked after READY. These are
+single isolated runs, not a statistical policy comparison.
+
+| Load for 30 seconds | Demo observation | Longest mixer ready queue | Audio result |
+| --- | --- | --- | --- |
+| Guest: 24 CPU workers, four periodic sleepers | 15.227 s | 18.767 ms | Active 7.999-s capture, no native fault or discontinuity |
+| Host: twelve CPU workers, four periodic sleepers | 39.066 s | 1,018.979 ms | Sample-gap safety stop; only 2.139 s of captured samples |
+
+The guest-only clock bracket is 0.99912–1.01013 and host-only bracket is
+0.99923–1.00890. Neither reproduces accelerated elapsed time. The host-only
+fault follows a 1,276.209-ms interval between position-sample starts, beyond
+the unchanged half-ring bound. Its audio acceptance is explicitly false even
+though the application job, runtime ledger, heap, normal shutdown, four
+filesystem checks and saved-data checks pass. The guest-only run passes those
+same structural gates and the active-publication/capture gates. A capture
+passing those gates does not establish bit-exact audio continuity.
+
+The longest host-only mixer queue interval is 49.126891542–50.145870620 s.
+During that exact interval all eight CPUs record only KernelBusy periodic
+contexts: 80 on BSP and 167–168 on each AP, with zero user/idle/other contexts
+and zero other dispatch bookkeeping. The timer path returns before policy
+`ShouldPreempt` for these busy kernel contexts. This is evidence of absent
+observed preemptible execution, not evidence that MLFQ selected competitors
+over the mixer. The largest BSP arrival gap is 96.813 ms and AP gaps are
+17–28 ms; BSP wake publication alone does not explain the one-second queue.
+
+Host vCPU schedstat deltas also show substantial runnable wait. These aggregate
+host counters do not localize an individual guest stall. The retained peer
+maximum-gap RIPs resolve in the frozen ELF to `SchedulerBlockImpl`, immediately
+after its final `sti`; they are endpoint samples, not proof of the instruction
+executing throughout a gap or during the longest watched queue interval.
+Long audio service/wake brackets also include time after dispatch bookkeeping,
+so queue delay must not be equated with full wake-to-resume latency.
+
+Artifacts are `q2-delivery-guest-only`, `q2-delivery-host-only`,
+`delivery-isolation-verified-results.json` and `delivery-isolation-sources` under
+the ignored timing workload root. The independent verifier checks the two
+different audio outcomes, staged identities, clocks, worker completion,
+affinities, structural gates and the exact worst-queue CPU activity.
+
+Next, retain bounded interrupted RIP/current-task observations while the mixer
+is queued and per-CPU timer-handler occupancy, then correlate actual resume
+with dispatch. Keep scheduler policy, kernel nonpreemption and HDA safety
+guards unchanged until those observations distinguish host-stretched interrupt
+handling, ordinary kernel work and task ownership restrictions.
+
+The follow-up queue watch adds `context_samples`, `last_interrupted_rip`,
+`last_current_pid`, `last_current_incarnation` and `last_context_kind` to each
+retained event's CPU activity row. Kind values are User=0, KernelBusy=1,
+Idle=2, Other=3; only interpret them when `context_samples` is nonzero. These
+are the last observed endpoint on that CPU during the exact queued interval,
+not an execution-time distribution. Periodic IRQs supply the existing saved
+RIP; IPIs supply no sample. Recording uses the existing ready lock, adds no
+clock reads or stack walks, stores no process pointers, and remains disabled
+unless queue timing and a task watch are enabled. Cancellation/reset removes
+the context with the queued interval. The snapshot has a compile-time 64-KiB
+size bound. Hosted coverage checks last-sample replacement, PID incarnations,
+CPU bounds, invalid kinds, enqueue retries, cancellation and reset.
+
+The first enlarged diagnostic kernel faults at boot during policy-switch reset:
+aggregate assignment materializes large snapshot temporaries on the boot
+thread's stack. Its private image, original serial, eight vCPU register sets
+and bounded stack evidence are retained as `q2-ready-context-host`. No workload
+result is accepted from that attempt. The correction clears tracker state in
+place and copies snapshots directly into caller storage, avoiding nested large
+temporary snapshots. The corrected kernel passes all 68 hosted tests, the
+bounded compiled-entry audit (12 supported wrappers, 56 rejected mutations;
+four return paths remain unsupported), and native boot/policy/watch reset.
+
+The corrected `q2-ready-context-r2-host` repeat again fails audio acceptance:
+HDA sample-gap 1,827.343 ms, empty capture, and maximum mixer ready queue
+2,339.980 ms. The exact worst interval has only KernelBusy periodic contexts
+on every CPU, with a few other dispatches recorded. Its last interrupted
+addresses resolve to `SchedulerBlockImpl` or `SchedulerKernelRegionLeave`,
+immediately after interrupt re-enable. Other retained intervals also sample
+`SchedulerKernelRegionEnter` just after `sti`. These are not spin-loop endpoints
+and do not establish lock ownership or where the entire interval was spent.
+They strengthen the case for measuring per-CPU handler occupancy and pending
+interrupt delivery before modifying policy fairness. Host regression tests
+were also run during VM setup; this diagnostic repeat is not a clean
+before/after performance comparison. The original two isolation controls above
+remain the load comparison.
+
+The repeat's original jobs/VM/router finish normally and independent runtime,
+heap, filesystem, saved-data, identity, clock and affinity gates pass. Its exact
+kernel is frozen under `ready-context-r2-frozen`, with the original thirteen
+control modules. Address resolution and independent failure verification are
+retained alongside the controller sources; unresolved user/module addresses
+are explicitly left unresolved rather than assigned a kernel symbol.

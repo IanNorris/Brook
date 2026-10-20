@@ -330,7 +330,7 @@ void SchedulerReadyLatency(ReadyLatencyAction action, ReadyLatencySnapshot* outp
         }
     }
     if (output) {
-        *output = g_readyLatency.Snapshot();
+        g_readyLatency.CopySnapshot(*output);
         const char* name = g_schedOps ? g_schedOps->name : "none";
         for (unsigned i = 0; i + 1 < sizeof(output->policy) && name[i]; ++i)
             output->policy[i] = name[i];
@@ -2068,7 +2068,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 #endif
 }
 
-void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool periodicTimer)
+void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool periodicTimer,uint64_t interruptedRip)
 {
     if (!g_schedulerRunning)
         return;
@@ -2086,7 +2086,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
             const auto kind=allowPreempt?ReadyWatchTick::User:
                 observed && observed==g_perCpu[runtimeCpu].idleProcess?ReadyWatchTick::Idle:
                 observed && observed->state==ProcessState::Running?ReadyWatchTick::KernelBusy:ReadyWatchTick::Other;
-            g_readyLatency.WatchTick(runtimeCpu,kind);
+            g_readyLatency.WatchTick(runtimeCpu,kind,interruptedRip,observed?observed->pid:0,observed?observed->incarnation:0);
         }
         SchedLockRelease(g_readyLock, runtimeFlags);
     }

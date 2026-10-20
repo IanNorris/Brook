@@ -25,6 +25,7 @@ struct ReadyLatencySnapshot {
     ReadyLatencyCounts user{}, kernel{};
     ReadyWatchSnapshot watch{};
 };
+static_assert(sizeof(ReadyLatencySnapshot)<65536,"Bound queue-watch snapshots on kernel stacks");
 template<unsigned Slots> class ReadyLatencyTracker {
     struct Pending {
         uint64_t incarnation = 0, sinceNs = 0;
@@ -36,7 +37,7 @@ public:
     bool Enabled() const { return snapshot_.enabled; }
     void Watch(uint64_t pid,uint64_t incarnation){watch_.Select(pid,incarnation);}
     bool Watching(uint64_t pid,uint64_t incarnation)const{return Enabled() && watch_.Matches(pid,incarnation);}
-    void WatchTick(unsigned cpu,ReadyWatchTick kind){if(Enabled())watch_.Tick(cpu,kind);}
+    void WatchTick(unsigned cpu,ReadyWatchTick kind,uint64_t rip=0,uint64_t pid=0,uint64_t incarnation=0){if(Enabled())watch_.Tick(cpu,kind,rip,pid,incarnation);}
     void WatchOtherDispatch(unsigned cpu,uint64_t pid,uint64_t incarnation,bool kernel){
         if(Enabled())watch_.OtherDispatch(cpu,pid,incarnation,kernel);
     }
@@ -46,7 +47,7 @@ public:
     void Reset() {
         const auto generation = snapshot_.resetGeneration + 1;
         const bool enabled = snapshot_.enabled;
-        snapshot_ = {}; snapshot_.enabled = enabled; snapshot_.resetGeneration = generation;
+        __builtin_memset(&snapshot_,0,sizeof(snapshot_)); snapshot_.enabled = enabled; snapshot_.resetGeneration = generation;
         for (auto& pending : pending_) pending = {};
         watch_.Reset();
     }
@@ -116,7 +117,10 @@ public:
         while (bin + 1 < ReadyLatencyBins && elapsed > ReadyLatencyBoundsNs[bin]) ++bin;
         ++counts.bins[bin];
     }
-    ReadyLatencySnapshot Snapshot() const { auto s=snapshot_;s.watch=watch_.Snapshot();return s; }
+    void CopySnapshot(ReadyLatencySnapshot& output) const {
+        output=snapshot_;watch_.CopySnapshot(output.watch);
+    }
+    ReadyLatencySnapshot Snapshot() const { ReadyLatencySnapshot s;CopySnapshot(s);return s; }
 };
 enum class ReadyLatencyAction { Status, On, Off, Reset };
 } // namespace brook

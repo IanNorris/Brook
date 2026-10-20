@@ -3390,6 +3390,10 @@ static void DebugReadyWatch(const ReadyWatchSnapshot& s)
             activity.text(",");activity.field("periodic_user_ticks",c.userTicks);activity.text(",");activity.field("periodic_kernel_busy_ticks",c.kernelTicks);
             activity.text(",");activity.field("periodic_idle_ticks",c.idleTicks);activity.text(",");activity.field("periodic_other_ticks",c.otherTicks);
             activity.text(",");activity.field("other_user_dispatches",c.userDispatches);activity.text(",");activity.field("other_kernel_dispatches",c.kernelDispatches);
+            activity.text(",");activity.field("context_samples",c.contextSamples);
+            activity.text(",\"last_interrupted_rip\":\"0x");activity.number(c.lastRip,true);activity.text("\",");
+            activity.field("last_current_pid",c.lastPid);activity.text(",");activity.field("last_current_incarnation",c.lastIncarnation);
+            activity.text(",");activity.field("last_context_kind",c.lastKind);
             activity.text("}");activity.send();
         }
         DebugChannelSend("]}");
