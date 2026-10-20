@@ -309,8 +309,10 @@ static void RecordReadyEnqueue(Process* process) {
                               process->isKernelThread, ReadyLatencyNow());
 }
 static void RecordReadyDispatch(Process* process) {
-    if (process->pid && g_readyLatency.Enabled())
+    if (process->pid && g_readyLatency.Enabled()) {
+        g_readyLatency.WatchOtherDispatch(ThisCpu(),process->pid,process->incarnation,process->isKernelThread);
         g_readyLatency.Dispatch(process->pid, process->incarnation, ReadyLatencyNow());
+    }
 }
 void SchedulerReadyLatency(ReadyLatencyAction action, ReadyLatencySnapshot* output) {
     uint64_t flags = SchedLockAcquire(g_readyLock);
@@ -2076,6 +2078,16 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
         const uint64_t runtimeFlags = SchedLockAcquire(g_readyLock);
         const uint32_t runtimeCpu = ThisCpu();
         RuntimeChargeLocked(runtimeCpu, RuntimeNow(runtimeCpu));
+        // Delivered periodic-IRQ observations only. Ring-0 idle is a dispatch
+        // opportunity, unlike a busy syscall/kernel thread. No extra clock,
+        // policy callback or lock is introduced for the watched queue interval.
+        if(periodicTimer && g_readyLatency.Enabled()){
+            auto* observed=g_perCpu[runtimeCpu].currentProcess;
+            const auto kind=allowPreempt?ReadyWatchTick::User:
+                observed && observed==g_perCpu[runtimeCpu].idleProcess?ReadyWatchTick::Idle:
+                observed && observed->state==ProcessState::Running?ReadyWatchTick::KernelBusy:ReadyWatchTick::Other;
+            g_readyLatency.WatchTick(runtimeCpu,kind);
+        }
         SchedLockRelease(g_readyLock, runtimeFlags);
     }
 

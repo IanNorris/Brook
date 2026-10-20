@@ -36,6 +36,10 @@ public:
     bool Enabled() const { return snapshot_.enabled; }
     void Watch(uint64_t pid,uint64_t incarnation){watch_.Select(pid,incarnation);}
     bool Watching(uint64_t pid,uint64_t incarnation)const{return Enabled() && watch_.Matches(pid,incarnation);}
+    void WatchTick(unsigned cpu,ReadyWatchTick kind){if(Enabled())watch_.Tick(cpu,kind);}
+    void WatchOtherDispatch(unsigned cpu,uint64_t pid,uint64_t incarnation,bool kernel){
+        if(Enabled())watch_.OtherDispatch(cpu,pid,incarnation,kernel);
+    }
     void Deadline(unsigned pid,uint64_t incarnation,uint64_t deadline,uint64_t nowTick){
         if(Enabled())watch_.Deadline(pid,incarnation,deadline,nowTick);
     }

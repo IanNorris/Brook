@@ -138,3 +138,9 @@ request length), and `SchedulerTimerTick` returns before arbitrary preemption
 when the interrupted context is kernel mode. A ready-queue wait alone cannot
 identify eligibility/debt, dispatch opportunities or long unpreemptible kernel
 ownership. Do not tune weights or shorten requests from that wait alone.
+
+The [targeted per-CPU queue-activity probe](targeted-queue-activity.md) now
+distinguishes delivered user/kernel timer observations from other-task dispatch
+bookkeeping during retained mixer waits. It supports investigating EEVDF
+eligibility and MLFQ's expiry-only long slices without treating every wait as
+system-wide non-preemptible kernel execution.

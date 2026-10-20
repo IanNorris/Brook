@@ -105,5 +105,45 @@ int main() {
     tracker.Enable(false);tracker.Dispatch(2,21,1000);tracker.Enable(true);
     assert(tracker.Snapshot().watch.pid==2 && !tracker.Snapshot().watch.samples);
     tracker.Watch(0,0);assert(!tracker.Watching(2,21));
+    // Activity is scoped to one pending PID/incarnation interval, including
+    // idempotent enqueue retries. Own/idle dispatches are not other-task work.
+    tracker.Reset();tracker.Watch(2,21);
+    tracker.WatchTick(0,ReadyWatchTick::User);
+    tracker.Enqueue(2,21,true,1);
+    tracker.WatchTick(0,ReadyWatchTick::User);
+    tracker.WatchOtherDispatch(0,3,30,false);
+    tracker.Enqueue(2,21,true,2);
+    tracker.WatchTick(63,ReadyWatchTick::KernelBusy);
+    tracker.WatchTick(63,ReadyWatchTick::Idle);
+    tracker.WatchTick(63,ReadyWatchTick::Other);
+    tracker.WatchOtherDispatch(63,4,40,true);
+    tracker.WatchOtherDispatch(0,2,21,true);
+    tracker.WatchOtherDispatch(0,0,0,true);
+    tracker.Dispatch(2,21,30000001);watched=tracker.Snapshot().watch;
+    assert(watched.retained==1 && watched.events[0].queueNs==30000000);
+    auto activity=watched.events[0].cpus[0];
+    assert(activity.userTicks==1 && activity.userDispatches==1 && !activity.kernelDispatches);
+    activity=watched.events[0].cpus[63];
+    assert(activity.kernelTicks==1 && activity.idleTicks==1 && activity.otherTicks==1 && activity.kernelDispatches==1);
+    assert(!watched.invalidActivity && !watched.saturated);
+    tracker.WatchTick(0,ReadyWatchTick::User); // no pending interval
+    tracker.Enqueue(2,21,true,40000000);tracker.Remove(2,21);
+    tracker.WatchOtherDispatch(0,3,30,false);tracker.WatchTick(0,ReadyWatchTick::User);
+    tracker.Enqueue(2,21,true,50000000);tracker.Dispatch(2,21,90000000);
+    watched=tracker.Snapshot().watch;assert(!watched.events[0].cpus[0].Any());
+    tracker.Reset();tracker.Enqueue(2,21,true,1);
+    tracker.WatchTick(64,ReadyWatchTick::User);
+    tracker.WatchTick(0,static_cast<ReadyWatchTick>(99));
+    tracker.WatchOtherDispatch(64,3,30,false);
+    assert(tracker.Snapshot().watch.invalidActivity==3);
+    tracker.Watch(2,22);tracker.WatchTick(0,ReadyWatchTick::User);
+    tracker.Enqueue(2,22,true,1);tracker.Dispatch(2,22,40000001);
+    assert(!tracker.Snapshot().watch.events[0].cpus[0].Any());
+    tracker.Enable(false);tracker.Enqueue(2,22,true,50000000);
+    tracker.WatchTick(0,ReadyWatchTick::User);tracker.WatchOtherDispatch(0,3,30,false);
+    tracker.Enable(true);assert(!tracker.Snapshot().watch.retained);
+    uint32_t observations=~uint32_t(0)-1;
+    assert(!ReadyWatchCpuActivity::Increment(observations) && observations==~uint32_t(0));
+    assert(ReadyWatchCpuActivity::Increment(observations) && observations==~uint32_t(0));
     std::puts("READY_LATENCY_PASS identities, queue retries, cancellation, clock bounds, histogram, opt-in/reset");
 }

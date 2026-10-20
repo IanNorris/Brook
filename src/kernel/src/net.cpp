@@ -3376,13 +3376,23 @@ static void DebugReadyWatch(const ReadyWatchSnapshot& s)
     r.text(",");r.field("samples",s.samples);r.text(",");r.field("timed_samples",s.timedSamples);
     r.text(",");r.field("max_queue_ns",s.maxQueueNs);r.text(",");r.field("max_late_ms",s.maxLateMs);
     r.text(",");r.field("slow",s.slow);r.text(",");r.field("excluded",s.excluded);r.text(",");r.field("invalid",s.invalid);
+    r.text(",");r.field("invalid_activity",s.invalidActivity);
     r.text(",\"pending\":");r.text(s.pending?"true":"false");r.text(",\"saturated\":");r.text(s.saturated?"true":"false");r.send();
-    DebugChannelSend(",\"scope\":\"one PID/incarnation; ready insertion to dispatch; deadline lateness sampled after ready insertion in elapsed milliseconds; early wakes clamp to zero; excludes post-dispatch return; largest 16 slow events only\",\"events\":[");
+    DebugChannelSend(",\"scope\":\"one PID/incarnation; ready insertion to dispatch; deadline lateness sampled after ready insertion in elapsed milliseconds; early wakes clamp to zero; excludes post-dispatch return; largest 16 slow events only\",\"activity_scope\":\"while watched task queued; delivered periodic IRQ contexts, not CPU time; no IPIs; other dispatch bookkeeping, not proof of completed context switches; missing observations do not prove idle; zero rows omitted\",\"events\":[");
     for(unsigned i=0;i<s.retained;++i){const auto& e=s.events[i];BridgeReply row;
         if(i)row.text(",");row.text("{");row.field("ready_ns",e.readyNs);row.text(",");row.field("dispatch_ns",e.dispatchNs);
         row.text(",");row.field("deadline_tick_ms",e.deadlineTick);row.text(",");row.field("ready_tick_ms",e.readyTick);
         row.text(",");row.field("queue_ns",e.queueNs);row.text(",");row.field("late_ms",e.lateMs);
-        row.text(",\"has_deadline\":");row.text(e.hasDeadline?"true":"false");row.text("}");row.send();
+        row.text(",\"has_deadline\":");row.text(e.hasDeadline?"true":"false");row.text(",\"cpus\":[");row.send();
+        bool first=true;
+        for(unsigned cpu=0;cpu<ReadyWatchCpus;++cpu){const auto& c=e.cpus[cpu];if(!c.Any())continue;BridgeReply activity;
+            if(!first)activity.text(",");first=false;activity.text("{");activity.field("cpu",cpu);
+            activity.text(",");activity.field("periodic_user_ticks",c.userTicks);activity.text(",");activity.field("periodic_kernel_busy_ticks",c.kernelTicks);
+            activity.text(",");activity.field("periodic_idle_ticks",c.idleTicks);activity.text(",");activity.field("periodic_other_ticks",c.otherTicks);
+            activity.text(",");activity.field("other_user_dispatches",c.userDispatches);activity.text(",");activity.field("other_kernel_dispatches",c.kernelDispatches);
+            activity.text("}");activity.send();
+        }
+        DebugChannelSend("]}");
     }
     DebugChannelSend("]}");
 }
