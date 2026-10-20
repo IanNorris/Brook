@@ -295,5 +295,35 @@ and socket; no ALSA, device-discovery or microphone modules are loaded. A
 half-second generated host tone is successfully configured and explicitly
 linked into that private graph, and its process exits zero. The first unlinked
 smoke attempt and metadata-module omission remain retained as fixture setup
-failures. VM PipeWire playback and actual Quake/Firefox reproduction are not yet
-accepted. Private setup evidence is under `pipewire-null/`.
+failures. Private setup evidence is under `pipewire-null/`.
+
+The same `05e4d684` kernel on RR completes the 30-second native tone in
+27.413 s idle and 27.864 s with 24 CPU workers using the private PipeWire
+backend. Four-second completion bounds reach 1.1268/1.1118 at the client.
+QEMU's eight-second WAV captures still advance at roughly 1x host time, with
+no silent 10-ms bins. The captured tone remains close to 440 Hz. These captures
+are upstream of the sink and do not prove the sink plays every submitted frame.
+Forcing the isolated graph from 48 kHz to 44.1 kHz reduces, but does not remove,
+the discrepancy: completion takes 28.714/28.749 s. A further idle run without
+WAV recording takes 28.463 s, so recording alone does not explain it.
+
+In that last run, QEMU tracing records 772 HDA occupancy corrections and 33
+codec buffer overruns. The corrections comprise 118 positive 1-ms, 258 negative
+1-ms and 396 negative 4-ms changes to its timer origin. The net -1.724 s is
+diagnostic only: an overrun discards the codec buffer and resets that origin.
+The [QEMU 10.2.2 HDA source](https://github.com/qemu/qemu/blob/v10.2.2/hw/audio/hda-codec.c)
+implements both behaviors. This is a concrete device/backend lead, not proof
+that LAPIC calibration is wrong or that the user's 1.5x symptom is solved.
+
+`BROOK_HDA_USE_TIMER=off` selects QEMU's alternate callback-paced codec for
+controlled comparisons; `on` remains the default. It changes the emulated
+device behavior, not Brook's clock source or scheduler. The first PipeWire
+test VM completes guest sync and QEMU exits zero; its launcher wrapper exits
+127 because its live shell source was edited before Bash reached EOF. That
+harness error is retained rather than called a clean launcher acceptance.
+Independent checks of all four primary filesystems pass. Subsequent launcher
+edits must wait until the owning shell exits, as well as QEMU.
+
+Evidence: `matched/rr/audio-pipewire{,-44100,-nocapture}/` and
+`pipewire-null/hda-trace-summary.json`. Actual Quake/Firefox reproduction and
+the alternate HDA mode comparison remain pending.

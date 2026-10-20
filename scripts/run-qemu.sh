@@ -350,9 +350,16 @@ if [ -n "${INSTANCE}" ]; then
     MONITOR_SOCK="/tmp/qemu_monitor_${INSTANCE}.sock"
 fi
 
+# Diagnostic comparison: QEMU's timer-paced codec adjusts DMA progress based on
+# backend occupancy. Keep its normal default until both modes are validated.
+HDA_USE_TIMER="${BROOK_HDA_USE_TIMER:-on}"
+case "${HDA_USE_TIMER}" in
+    on|off) ;;
+    *) echo "BROOK_HDA_USE_TIMER must be on or off" >&2; exit 2 ;;
+esac
 AUDIO_OPTS="-audiodev ${BROOK_AUDIODEV:-pipewire},id=hda0,out.buffer-length=200000,timer-period=5000 \
     -device ich9-intel-hda,bus=pcie.0,addr=0x1b \
-    -device hda-output,audiodev=hda0"
+    -device hda-output,audiodev=hda0,use-timer=${HDA_USE_TIMER}"
 if [ "${NO_AUDIO}" -eq 1 ]; then
     AUDIO_OPTS="-audiodev none,id=hda0"
 fi
