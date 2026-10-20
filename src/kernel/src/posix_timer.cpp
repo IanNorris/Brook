@@ -31,8 +31,10 @@ uint32_t nextId = 1;
 uint64_t nextNotification = 1;
 uint64_t Now(int clock)
 {
-    uint64_t ns = KvmClockAvailable() ? KvmClockReadNs() : g_lapicTickCount * 1000000ULL;
-    return clock == 0 ? RtcNow() * Billion + ns % Billion : ns;
+    // Realtime's seconds and fraction must share the RTC driver's immutable
+    // epoch. Pvclock's fractional phase is unrelated to that epoch.
+    if (clock == 0) return RtcNowNs();
+    return KvmClockAvailable() ? KvmClockReadNs() : g_lapicTickCount * 1000000ULL;
 }
 uint64_t OwnerIncarnation(Process* p)
 {

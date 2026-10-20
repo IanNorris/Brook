@@ -119,6 +119,15 @@ target_compile_options(test_kvmclock_stable PRIVATE
 )
 target_link_options(test_kvmclock_stable PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_kvmclock_stable PROPERTIES TIMEOUT 15)
+add_host_test(test_posix_timer_clock)
+target_compile_options(test_posix_timer_clock PRIVATE
+    -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km"
+)
+target_link_options(test_posix_timer_clock PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_posix_timer_clock PROPERTIES TIMEOUT 15)
 add_host_test(test_audio_delivery "${BROOK_ROOT}/src/kernel/src/audio.cpp"
     "${BROOK_ROOT}/src/tests/test_audio_delivery/hda_clock.cpp")
 target_compile_options(test_audio_delivery PRIVATE
