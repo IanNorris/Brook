@@ -19,7 +19,13 @@ def main():
     parser.add_argument('--engine', type=Path, help='Direct engine path for the Linux reference; default uses Brook wrapper')
     parser.add_argument('--pak-dir', type=Path,
                         default=Path('/data/games/quake2/baseq2'))
+    parser.add_argument('--music-track', type=int, choices=range(2, 22),
+                        help='Restart this locally supplied OGG track at the START marker')
+    parser.add_argument('--music-only', action='store_true',
+                        help='Mute sound effects for a music-track capture')
     args = parser.parse_args()
+    if args.music_only and args.music_track is None:
+        parser.error('--music-only requires --music-track')
     home = args.home
     if not home.is_absolute() or home.exists() or not args.pak_dir.is_absolute():
         raise SystemExit('Use a fresh absolute home and an absolute pak directory')
@@ -70,7 +76,14 @@ def main():
     def marker(text):
         return b'\x0b' + text.encode() + b'\n\0'  # svc_stufftext
 
-    packets = (records[:first] + [marker('echo BROOK_DEMO_TIMING_START')]
+    start_command = 'echo BROOK_DEMO_TIMING_START'
+    if args.music_track is not None:
+        track = args.pak_dir / 'music' / ('track%02d.ogg' % args.music_track)
+        if not track.is_file():
+            raise SystemExit('Requested locally supplied music track is missing: ' + str(track))
+        start_command = ('ogg stop; ogg play %d; ogg info; ' % args.music_track
+                         + start_command)
+    packets = (records[:first] + [marker(start_command)]
                + records[first:last] + [marker('echo BROOK_DEMO_TIMING_END; quit')])
     with (demo_dir / 'brook-timing.dm2').open('wb') as stream:
         for packet in packets:
@@ -78,6 +91,8 @@ def main():
             stream.write(packet)
         stream.write(struct.pack('<i', -1))
     metadata = dict(recorded_frame_delta=150, measured_demo_records=150,
+                    music_track=args.music_track,
+                    music_only=args.music_only,
                     inserted_start_record=1, expected_server_interval_s=15.1,
                     scope='150 original packets plus the start marker tick; '
                           'log observations include reader scheduling latency')
@@ -99,6 +114,9 @@ def main():
             '+set', 'r_customheight', '720', '+set', 'vid_fullscreen', '0',
             '+set', 'cl_maxfps', '60', '+set', 'timedemo', '0',
             '+set', 'nextdemo', 'quit', '+demomap', 'brook-timing.dm2']
+    if args.music_only:
+        # OpenAL streams use ogg_volume separately from the effects gain.
+        argv = prefix + ['+set', 's_volume', '0', '+set', 'ogg_volume', '0.7'] + argv[len(prefix):]
     started = time.monotonic_ns()
     markers, cursor, pending = {}, 0, b''
 

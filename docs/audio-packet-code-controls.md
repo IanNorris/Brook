@@ -92,7 +92,10 @@ anchor model rejects this particular trial; its original rejection and separate
 server-causal bounds are retained. That result is not promoted to clock-model
 acceptance by the successful native probes.
 
-Next steps are a clean Quake II/music comparison, a separately traced emulated
+The [Quake II/music control](q2-music-timing-control.md) completes the GL3 demo
+near nominal time, but its music-only repeat exposes a native stream
+discontinuity and low active audio coverage. It is not continuity acceptance.
+Next steps are identifying that fault's reason, a separately traced emulated
 HDA run to correlate source gaps with occupancy corrections, and bounded host
 contention. The original recording's larger factor and any remaining application
 or scheduler-specific contribution remain open.
