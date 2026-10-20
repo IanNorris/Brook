@@ -1389,3 +1389,100 @@ loss checks, host thread schedstat deltas and interpretation limits are retained
 under `build/reviews/live-timing-baseline-20261020/mixed-stutter-observation`.
 The review VM remains with the user; no restart, input injection or host load
 is part of this observation.
+
+The user hears no noticeable improvement after the live try change; no restart
+is required for that control. A subsequent mixer/wakeup window begins at zero
+and observes 482 DSP calls. Mixer ready-to-dispatch bookkeeping stays below
+0.527 ms; its longest nominal-10-ms sleep is 12.194 ms. Producer gaps reach
+103.016 ms without backpressure sleeping. The next selected-writer window,
+however, has **zero new DSP calls**: its old producer maxima are retained across
+on/off and cannot be correlated with its one-second poll syscalls. The raw
+window and that invalid correlation are explicitly retained in
+`wakeup-window-validity.json`. New independent captures reset and verify zero
+counters after preserving their previous snapshots.
+
+The user's fresh Firefox-only launch passes old-Firefox-PID and Quake-absence
+checks, has observed output progress, and produces 481 new DSP calls after
+explicit resets. Its mixer queue maximum is 0.682 ms, maximum sleep 13.365 ms
+and maximum service 10.380 ms. Producer gaps reach 66.110 ms; maximum DSP call
+is 1.089 ms with no backpressure sleeping. Observed HDA submissions have zero
+unsafe writes and at least 12,288 bytes of measured physical headroom. Physical
+headroom can contain silence; these observations do not establish smooth PCM or
+exclude application buffering and post-dispatch delays. All enabled diagnostics
+are turned off afterward and the scheduler watch returns to zero.
+
+The user still hears clicking/popping and reports Thriller audio while the page
+shows an ad, ignores Search and changes its tab title erratically. A screenshot
+corroborates the ad still displayed at 0:00. The retained host log also contains
+virgl context 257 rejecting `CREATE_OBJECT` with `Illegal resource 70208`, then
+an illegal command buffer. This log has no event timestamp here, so neither its
+onset nor its causal connection to this Firefox instance is established. It is
+a graphics-error confound in a VM that previously ran Quake, not proof of a
+scheduler or clock defect. Evidence is in the `firefox-fresh-capture` and
+`rendering-failure` subdirectories of the same live observation. The screenshot
+briefly pauses the VM after the timing window; it cannot explain the preceding
+user reports. A clean Firefox-only VM repeat requires user handback first.
+
+### Clean Firefox-only restart and producer pacing
+
+After explicit handback, the original live wrapper exits zero, final guest sync
+is acknowledged and all four offline filesystem checks pass. A new private
+clone run, `build/reviews/live-firefox-only-20261021`, retains the same baseline
+kernel/modules, eight vCPUs, 8 GiB and PipeWire output. No Quake is launched.
+The previous RC line `sched irq-accounting try` had been rejected as a policy
+name (`policy 'irq-accounting' not registered`); this is the shell policy API,
+not the debug diagnostics API. The new launcher removes that unsupported RC
+line, applies try through the guest debug bridge and verifies its reply after
+boot. No scheduler default changes.
+
+The user reports that rendering corruption is gone but slow/stuttering audio
+and poor video remain. The new host log has no virgl resource errors at the
+retained checkpoints. The initial 250-ms profile retains 197 samples and 7,932
+switches with zero losses. This is a short observation, not a startup benchmark.
+Firefox's reported 1,082/2,095 dropped frames is 51.6%; the user confirms 720p
+at the reading, but had changed quality during the run. Do not describe that
+cumulative counter as a fixed-720p throughput benchmark.
+
+The valid selected-writer capture is `audio-writer-capture-3`: PID/incarnation
+389/389, 289 new DSP calls, 1,018,248 accepted bytes, a 68.926-ms maximum
+producer gap, a 0.975-ms maximum DSP call and no DSP backpressure sleeping.
+Observed writer queue delay is at most 0.290 ms. Its approximately 6.8–7.0
+second selected syscall window records 153,197 ioctl dispatches, 74,286 polls
+and 75,622 writes, with zero invalid/incomplete spans, kind overflows, recorder
+contention or continuity breaks. An in-flight futex remains unmatched at the
+snapshot. These are instrumented counts and elapsed spans, not uninstrumented
+costs. The ioctl commands and poll descriptors are not identified by this
+first-argument-only trace; most writes are not DSP writes.
+
+The corresponding device WAV has 5.0837 seconds of PCM against 5.0843 host
+seconds, including 12.3% exact-zero stereo frames and a longest exact-zero run
+of 40.3 ms. An earlier valid PCM-only capture has 15.0% exact zeros. These are
+pre-host-output observations; uncontrolled music can contain genuine silence,
+and QEMU WAV lacks chunk-arrival timestamps. They do not prove where every
+audible glitch originates or that host delivery is smooth. Captures 1 and 2
+are retained separately: the first stopped on a diagnostic-state assertion;
+the second has valid PCM/producer evidence but its syscall probe was disabled.
+The corrected collector resets while disabled, uses `sched syscall watch` to
+enable that probe (there is no `sched syscall on`), verifies every enable reply
+and restores diagnostics off.
+
+Astra's read-only review identifies a possible readiness mismatch worth a
+bounded host reproduction: the patched ALSA plugin requests 256-byte physical
+fragments (64 native frames), while logical ALSA periods may be larger.
+Brook's DSP `POLLOUT` threshold follows the physical fragment. The plugin has
+no readiness callback, and the
+[tagged ALSA ioplug default](https://raw.githubusercontent.com/alsa-project/alsa-lib/v1.2.15.3/src/pcm/pcm_ioplug.c)
+forwards descriptor revents without an `avail_min` check. Actual client
+`avail_min`, descriptor identities and deployed libasound identity remain
+unverified. Existing callback/negotiation tests do not model elapsed playback
+with persistent level readiness between fragment and logical-period thresholds.
+Simply filtering `POLLOUT` in a callback would not make a still-level-ready
+descriptor block. Establish the real wait mechanism before choosing a fix.
+
+Chromium's separate ad capture observes writer 771/771, 390 DSP calls, 6,085
+ioctls and 151 polls, with most selected elapsed syscall time in futex waits.
+This differs from Firefox's hot loop; the ad is not matched content. The user
+later reports roughly 10 fps for Chrome's main video but only 1/779 dropped
+frames. Low reported drops do not establish real-time media-clock progress.
+The attempted main-video capture finds no active producer after Chrome exits
+and remains a failed observation, not a successful playback sample.

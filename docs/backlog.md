@@ -1,5 +1,26 @@
 # Recovery and VM-control backlog
 
+- Investigate Chromium fullscreen and off-screen move geometry from the
+  21 October live browser review. The user reports that Chrome does not enter
+  fullscreen, and moving the window's top-left edge a few pixels past the
+  display boundary squashes the window. Record the fullscreen trigger and
+  distinguish browser fullscreen from maximize. Moving a window across the
+  top/left boundaries must preserve its client size; clip visibility separately
+  and send resize/configure events only for an actual resize. Cover negative
+  coordinates, screen-edge crossing and return, CSD geometry, fullscreen entry/
+  exit and maximize/restore on the native VM display. Backlog only; these
+  symptoms have not been reproduced or fixed by an agent yet.
+  The same review subsequently closes Chrome after waylandd reports snapshot
+  capture `result=-12 size=2057x1123`, posts a retained-scene implementation
+  error and destroys the client; Chromium then traps at a user-mode breakpoint.
+  Preserve the exception/protocol error in
+  `build/reviews/live-firefox-only-20261021/chromium-exit-observation`.
+  The VM remains responsive, its heap check passes, and memory is free after
+  client cleanup. `-12` alone does not identify which allocation failed or
+  establish global memory exhaustion. Correlate the inflated resize geometry
+  with this failure, and distinguish transient allocation/capacity pressure
+  from invalid dimensions before choosing recovery or changing limits.
+
 - Investigate GLtron's window-close exit hang in the combined Proton/D3D12
   review image. The window and GPU resources retire, but the `.gltron-real`
   leader remains blocked after its other threads exit. This correctly holds
