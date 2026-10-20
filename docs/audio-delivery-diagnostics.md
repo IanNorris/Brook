@@ -1226,6 +1226,9 @@ bounded host contention; keep per-core queues and EEVDF as separate comparisons.
 No lock algorithm, hypercall, scheduler default or live-review image is changed
 by this source audit.
 
+The source-level critical-section inventory and Astra-reviewed capture/acceptance
+contract are in [scheduler lock attribution](scheduler-lock-attribution.md).
+
 ## Saved-profile check: interrupt delivery at unlock boundaries
 
 An independent offline check of all three `q2-syscall-profile-try-*` captures
