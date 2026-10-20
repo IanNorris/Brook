@@ -386,3 +386,8 @@ owner cannot safely be revoked just because it is slow. Test this ownership
 model and switch it on explicitly for native comparison before changing any
 default. POSIX expiry, alarms and reaping remain separate BSP responsibilities;
 the handoff alone would not repair every timeout path.
+
+The [optional handoff implementation and first matched controls](wake-scan-handoff.md)
+now demonstrate approximately 3 ms maximum completed-scan gaps under both
+policies. It remains explicitly enabled per test; ready-queue and presentation
+limitations prevent treating that result as complete audio/desktop acceptance.

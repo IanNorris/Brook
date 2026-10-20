@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include "clock_interval.h"
 #include "runtime_accounting.h"
+#include "wake_scan_handoff.h"
 
 
 // Context switch — implemented in context_switch.S
@@ -1635,6 +1636,10 @@ Process* SchedulerCurrentProcess()
 // ---------------------------------------------------------------------------
 
 // Check blocked processes for timed wakeups (called with NO locks held).
+static WakeScanHandoff g_wakeScanHandoff;
+bool SchedulerWakeScanControl(int mode,bool reset){return g_wakeScanHandoff.Control(mode,reset);}
+WakeScanSnapshot SchedulerWakeScanRead(){return g_wakeScanHandoff.Snapshot();}
+
 static uint32_t CheckBlockedWakeups()
 {
     uint64_t now = ApicTickCount();
@@ -1669,6 +1674,17 @@ static uint32_t CheckBlockedWakeups()
         ReleaseSchedulerReference(toUnblock[i], false);
     }
     return unblockCount;
+}
+
+static uint32_t TryBlockedWakeScan(unsigned cpu)
+{
+    if(cpu && !g_wakeScanHandoff.Shared())return 0;
+    uint64_t now=0;if(!KvmClockReadStableNs(&now))now=0;
+    const auto token=g_wakeScanHandoff.Begin(cpu,now);if(!token.sequence)return 0;
+    const auto count=CheckBlockedWakeups();
+    uint64_t end=0;if(!KvmClockReadStableNs(&end))end=0;
+    if(!g_wakeScanHandoff.Complete(token,end,count))__builtin_trap();
+    return count;
 }
 
 // Reap terminated processes.
@@ -2050,7 +2066,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 #endif
 }
 
-void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe)
+void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool periodicTimer)
 {
     if (!g_schedulerRunning)
         return;
@@ -2073,7 +2089,8 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe)
     uint32_t cpu = ThisCpu();
     DrainPostSwitch(cpu);
 
-    // Only BSP (CPU 0) does wakeup checks, reaping, and policy ticks.
+    // BSP retains POSIX expiry, alarms, reaping and policy ticks. Sleeping-task
+    // wake scans may be claimed by an AP only with explicit shared-mode opt-in.
     if (cpu == 0)
     {
         // Registry -> timer is the only nested timer lock order. Expiry
@@ -2082,7 +2099,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe)
         PosixTimersTickLocked(g_allProcesses, g_processCount);
         SchedLockRelease(g_allProcLock, timerFlags);
         const uint64_t timerScan=timerProbe?TimerWakeTimingNow():0;
-        const auto wakeCandidates=CheckBlockedWakeups();
+        const auto wakeCandidates=TryBlockedWakeScan(0);
         const uint64_t timerScanEnd=timerProbe?TimerWakeTimingNow():0;
 
         // Check alarm timers for all processes
@@ -2157,6 +2174,11 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe)
         if(timerProbe)TimerWakeTimingComplete(*timerProbe,timerScheduler,timerRuntime,
             timerScan,timerScanEnd,wakeCandidates,TimerWakeTimingNow(),ThisCpu());
     }
+
+    // Reschedule IPIs do not create additional AP scan opportunities. Keep
+    // ownership through wake publication/reference cleanup; an overdue owner
+    // is never stolen, even if it is waiting for another scheduler lock.
+    else if(periodicTimer)TryBlockedWakeScan(cpu);
 
     Process* cur = g_perCpu[cpu].currentProcess;
     if (!cur)

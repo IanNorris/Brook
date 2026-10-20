@@ -43,7 +43,7 @@ void SchedulerContinue(Process* proc);
 // only when the interrupted context was preemptible user mode; wakeups and idle
 // dispatch still run when false.
 struct TimerWakeToken;
-void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe=nullptr);
+void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe=nullptr,bool periodicTimer=false);
 
 // Yield the current timeslice voluntarily.
 extern "C" void SchedulerYield();

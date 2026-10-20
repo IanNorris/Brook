@@ -212,7 +212,7 @@ bool ApicInitElapsedClock()
 }
 
 // Forward-declare scheduler tick (defined in scheduler.cpp).
-void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe);
+void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool periodicTimer);
 
 // Forward-declare thread state dump (defined in scheduler.cpp).
 void SchedulerDumpThreadStates();
@@ -459,7 +459,7 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
     // non-idle work when the interrupted context was user mode; Brook kernel
     // code is not generally safe to timeslice while holding internal locks.
     bool userMode = (interruptedCs & 3) != 0;
-    SchedulerTimerTick(userMode,timerProbe.epoch?&timerProbe:nullptr);
+    SchedulerTimerTick(userMode,timerProbe.epoch?&timerProbe:nullptr,true);
 }
 
 // Naked ISR entry for LAPIC timer (vector 32).
@@ -823,7 +823,7 @@ extern "C" void ReschedIpiHandlerInner(uint64_t interruptedCs)
     // (KMutex, KRwLock, ticket locks) that would deadlock or corrupt
     // callee-saved register state if the process were descheduled mid-hold.
     bool userMode = (interruptedCs & 3) != 0;
-    SchedulerTimerTick(userMode,nullptr);
+    SchedulerTimerTick(userMode,nullptr,false);
 }
 
 __attribute__((naked))

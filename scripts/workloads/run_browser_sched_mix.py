@@ -37,6 +37,8 @@ def main():
                         help='Optional BSP timer IRQ and blocked wake-scan brackets; diagnostic cohort only')
     parser.add_argument('--timer-irq-arrivals',action='store_true',
                         help='Optional independent per-CPU LAPIC arrival counters; diagnostic cohort only')
+    parser.add_argument('--wake-scan-mode',choices=['bsp','shared'],
+                        help='Explicit wake-scan candidate mode; omit for unchanged boot setting')
     args=parser.parse_args();phase,policy=args.phase,args.policy
     if not re.fullmatch('[a-z0-9-]{1,48}',phase):parser.error('Use a lowercase alphanumeric phase name')
     review=args.review.resolve();metadata=json.loads((review/'candidate.json').read_text())
@@ -71,14 +73,34 @@ def main():
      assert read('measurement-mode').get('audio_service_timing',False)==args.audio_service_timing,'Do not change audio diagnostic mode when resuming'
      assert read('measurement-mode').get('timer_wakeup_timing',False)==args.timer_wakeup_timing,'Do not change timer diagnostic mode when resuming'
      assert read('measurement-mode').get('timer_irq_arrivals',False)==args.timer_irq_arrivals,'Do not change per-CPU timer diagnostic mode when resuming'
+     assert read('measurement-mode').get('wake_scan_mode')==args.wake_scan_mode,'Do not change wake-scan mode when resuming'
     else:
-     assert not (args.mapping_timing or args.audio_service_timing or args.timer_wakeup_timing or args.timer_irq_arrivals) or not has('harness'),'Do not enable new counters in an existing cohort'
-     save('measurement-mode',dict(mapping_timing=args.mapping_timing,audio_service_timing=args.audio_service_timing,timer_wakeup_timing=args.timer_wakeup_timing,timer_irq_arrivals=args.timer_irq_arrivals))
+     assert not (args.mapping_timing or args.audio_service_timing or args.timer_wakeup_timing or args.timer_irq_arrivals or args.wake_scan_mode is not None) or not has('harness'),'Do not enable new counters in an existing cohort'
+     save('measurement-mode',dict(mapping_timing=args.mapping_timing,audio_service_timing=args.audio_service_timing,timer_wakeup_timing=args.timer_wakeup_timing,timer_irq_arrivals=args.timer_irq_arrivals,wake_scan_mode=args.wake_scan_mode))
     def diagnostic_control(name,command):
      if has(name):return read(name)
      if has(name+'-intent'):raise RuntimeError('Uncertain diagnostic control delivery; inspect current epoch before resuming')
      save(name+'-intent',dict(command=command,host_monotonic_ns=time.monotonic_ns()))
      return save(name,b.server.guest(d,command))
+    def wake_control(name,command):
+     if has(name):return read(name)
+     # Retry only explicit busy rejections. An uncertain delivery retains its
+     # intent and diagnostic_control refuses to send it again on resume.
+     for attempt in range(16):
+      result=diagnostic_control(name+'-attempt-'+str(attempt),command)
+      if result['applied']:
+       save(name,result);return result
+      time.sleep(.02)
+     raise RuntimeError('Wake-scan control stayed busy; inspect same VM')
+    def wake_snapshot(name):
+     if has(name):return read(name)
+     for attempt in range(16):
+      value=b.server.guest(d,'sched wakes status')
+      save(name+'-sample-'+str(attempt),value)
+      if value['consistent']:
+       save(name,value);return value
+      time.sleep(.02)
+     raise RuntimeError('Wake-scan snapshot stayed active; inspect same VM')
     def tracked(name,argv):
      folder=out/name;folder.mkdir(exist_ok=True);p=folder/'command-evidence.json'
      if p.exists():argv=json.loads(p.read_text())['request']['argv']
@@ -103,6 +125,8 @@ def main():
       save(name,dict(**read(name+'-intent'),host_after_ns=time.monotonic_ns(),result=result))
      return read(name)
     assert b.server.guest(d,'sched policy status')['policy']==policy
+    if args.wake_scan_mode is not None:
+     configured=wake_control('wake-scan-mode','sched wakes '+args.wake_scan_mode);assert configured['mode']==args.wake_scan_mode
     if not has('harness'):save('harness',dict(controller_sha256=b.sha(Path(__file__)),analysis_sha256=b.sha(Path(__file__).with_name('analyze_browser_sched_trace.py')),page_sha256=b.sha(http/'http/index.html'),clip_sha256=b.sha(http/'http/clip.mp4')))
     if not has('identity'):save('identity',dict(session=s,policy=policy,kernel=d['kernel_sha256'],host_load=os.getloadavg(),vm=str(review),hda_codec=codecs[0]))
     else:assert read('identity')['session']==s
@@ -140,6 +164,7 @@ def main():
       diagnostic_control('timer-wake-enable','timer timing on');diagnostic_control('timer-wake-idle-before','timer timing reset')
      if args.timer_irq_arrivals:
       diagnostic_control('timer-peers-enable','timer peers on');diagnostic_control('timer-peers-idle-before','timer peers reset')
+     if args.wake_scan_mode is not None:wake_control('wake-scan-idle-before','sched wakes reset')
      b.server.guest(d,'sched timing on');b.server.guest(d,'sched timing reset');save('idle-begin',states()[-1])
     if not has('idle'):
      first=read('idle-begin');deadline=time.monotonic()+90
@@ -157,6 +182,8 @@ def main():
      save('timer-wake-idle-after',b.server.guest(d,'timer timing status'))
     if args.timer_irq_arrivals and not has('timer-peers-idle-after'):
      save('timer-peers-idle-after',b.server.guest(d,'timer peers status'))
+    if args.wake_scan_mode is not None:
+     wake_snapshot('wake-scan-idle-after');wake_control('wake-scan-load-before','sched wakes reset')
     if args.timer_irq_arrivals and not has('timer-peers-load-before'):
      diagnostic_control('timer-peers-load-before','timer peers reset')
     if args.timer_wakeup_timing and not has('timer-wake-load-before'):
@@ -220,6 +247,7 @@ def main():
      diagnostic_control('timer-wake-load-after','timer timing off')
     if args.timer_irq_arrivals and not has('timer-peers-load-after'):
      diagnostic_control('timer-peers-load-after','timer peers off')
+    if args.wake_scan_mode is not None:wake_snapshot('wake-scan-load-after')
     if args.profile_ms and not has('profile-export'):
      deadline=time.monotonic()+60
      while 'RUNNING' in b.server.profile(s,action='status').get('reply',''):
@@ -265,6 +293,7 @@ def main():
     summary['audio_service_timing']=args.audio_service_timing
     summary['timer_wakeup_timing']=args.timer_wakeup_timing
     summary['timer_irq_arrivals']=args.timer_irq_arrivals
+    summary['wake_scan_mode']=args.wake_scan_mode
     c0,c1=capture['host_monotonic_interval']
     summary['audio_capture_inside_load']=load_start<=c0*1e9<=c1*1e9<=load_end
     save('summary',summary);save('rms-10ms',levels);print('MIX_SUMMARY',json.dumps(summary),flush=True)
@@ -283,6 +312,7 @@ def main():
     while browser.evidence['status'].get('state')!='completed':
      browser.poll();assert time.monotonic()<deadline,'Inspect same browser lineage';time.sleep(.3)
     assert browser.evidence['status']['guest']['live_tasks']==0
+    if args.wake_scan_mode is not None:wake_control('wake-scan-restore','sched wakes bsp')
     save('clock-after',b.server.guest(d,'clock status'))
     save('runtime-after',b.server.guest(d,'sched runtime status'))
     save('service-after',b.server.guest(d,'sched policy service'))

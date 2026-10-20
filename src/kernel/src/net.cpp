@@ -28,6 +28,7 @@
 #include "rtc.h"
 #include "apic.h"
 #include "timer_irq_arrivals.h"
+#include "wake_scan_handoff.h"
 #include "kvmclock.h"
 #include "vfs.h"
 #include "input.h"
@@ -3306,6 +3307,19 @@ static void DebugEpollDiagnostics()
     DebugChannelSend("]}\n");
 }
 
+static void DebugWakeScan(bool requested,bool applied)
+{
+    const auto s=SchedulerWakeScanRead();BridgeReply r;
+    r.text("{\"control_requested\":");r.text(requested?"true":"false");r.text(",\"applied\":");r.text(applied?"true":"false");
+    r.text(",\"mode\":\"");r.text(s.shared?"shared":"bsp");r.text("\",");r.field("sequence",s.sequence);
+    r.text(",");r.field("end_sequence",s.endSequence);r.text(",");r.field("fallback_ns",s.fallbackNs);
+    r.text(",");r.field("last_completion_ns",s.lastCompletionNs);r.text(",");r.field("bsp_scans",s.bspScans);r.text(",");r.field("ap_scans",s.apScans);
+    r.text(",");r.field("candidates",s.candidates);r.text(",");r.field("max_completion_gap_ns",s.maxGapNs);r.text(",");r.field("max_scan_ns",s.maxDurationNs);r.send();
+    BridgeReply tail;tail.text(",");tail.field("invalid_clock",s.invalidClock);tail.text(",");tail.field("last_cpu",s.lastCpu);
+    tail.text(",\"saturated\":");tail.text(s.saturated?"true":"false");tail.text(",\"consistent\":");tail.text(s.consistent?"true":"false");
+    tail.text(",\"scope\":\"exclusive wake-scan claim through publication/reference cleanup; APs use periodic IRQs only and require overdue valid completion; active owner never revoked; alarms/POSIX expiry/reaping remain BSP-only; default bsp\"}\n");tail.send();
+}
+
 static void DebugTimerIrqArrivals()
 {
     const auto epoch=TimerIrqArrivalsEpoch();const auto online=SmpGetCpuCount();
@@ -3659,6 +3673,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sched timing watch PID - target wake/queue timing; 0 clears target\n"
             "  mapping timing on|off|reset|status - preflight mutex timings (default off)\n"
             "  sched policy status|rr|mlfq|eevdf - inspect or select a registered policy\n"
+            "  sched wakes status|bsp|shared|reset - optional wake-scan handoff (default bsp)\n"
             "  sched runtime status - running intervals, steal availability and read errors\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
@@ -3975,6 +3990,12 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text("{\"selected\":"); reply.text(selected ? "true" : "false");
         reply.text(",\"policy\":\""); reply.text(SchedulerPolicyName());
         reply.text("\"}\n"); reply.send();
+    }
+    else if(NetStrEq(cmd,"sched wakes status") || NetStrEq(cmd,"sched wakes bsp") ||
+            NetStrEq(cmd,"sched wakes shared") || NetStrEq(cmd,"sched wakes reset")) {
+        const bool requested=!NetStrEq(cmd,"sched wakes status");bool applied=true;
+        if(requested)applied=SchedulerWakeScanControl(NetStrEq(cmd,"sched wakes shared")?1:NetStrEq(cmd,"sched wakes bsp")?0:-1,NetStrEq(cmd,"sched wakes reset"));
+        DebugWakeScan(requested,applied);
     }
     else if (NetStrEq(cmd, "sched policy service")) {
         PolicyServiceStatus status{};SchedulerPolicyServiceStatus(&status);
