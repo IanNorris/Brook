@@ -143,6 +143,7 @@ class SilentRoutes:
 
 
 def start(args):
+    if not 1000<=args.audio_buffer_us<=1000000:raise ValueError('Audio buffer must be 1000..1000000 microseconds')
     for p in Path('/proc').glob('[0-9]*/exe'):
         try:
             name = p.resolve(strict=True).name
@@ -162,6 +163,8 @@ def start(args):
     node = args.rendernode.resolve(strict=True)
     if not stat.S_ISCHR(node.stat().st_mode):
         raise ValueError('Render node must be a character device')
+    if args.audio_backend=='sdl' and not args.audio_daemon:
+        raise ValueError('SDL controls require the private audio daemon; no host audio fallback')
     routes = SilentRoutes(args.audio_daemon.resolve(strict=True)) if args.audio_daemon else None
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -175,7 +178,9 @@ def start(args):
     qemu = Path(packages['qemu']) / 'bin/qemu-system-x86_64'
     wrapped = qemu.with_name('.qemu-system-x86_64-wrapped')
     qemu_executable = wrapped.resolve() if wrapped.exists() else qemu.resolve()
-    audio = 'pipewire,out.name=brook-null,out.stream-name=brook-linux-vm' if routes else 'none'
+    audio = ('pipewire,out.name=brook-null,out.stream-name=brook-linux-vm' if args.audio_backend=='pipewire' else 'sdl') if routes else 'none'
+    audio_label=('pipewire-null' if args.audio_backend=='pipewire' else 'sdl-pipewire-null') if routes else 'none'
+    hda_timer=args.hda_use_timer=='on'
     append = ' '.join(packages['kernelParams'] + ['init=' + packages['init']])
     argv = [str(qemu), '-no-user-config', '-nodefaults', '-no-reboot',
             '-machine', 'q35,memory-backend=mem', '-accel', 'kvm', '-cpu', 'host',
@@ -183,9 +188,9 @@ def start(args):
             '-vga', 'none', '-device', 'virtio-gpu-gl-pci,id=vgpu,blob=true,venus=true,hostmem=1G,xres=1920,yres=1080',
             '-display', f'egl-headless,rendernode={node}',
             '-device', 'virtio-keyboard-pci', '-device', 'virtio-tablet-pci',
-            '-audiodev', audio + ',id=hda0,out.buffer-length=200000,timer-period=5000',
+            '-audiodev', audio + ',id=hda0,out.buffer-length='+str(args.audio_buffer_us)+',timer-period=5000',
             '-device', 'ich9-intel-hda,bus=pcie.0,addr=0x1b',
-            '-device', 'hda-output,audiodev=hda0,use-timer=false',
+            '-device', 'hda-output,audiodev=hda0,use-timer='+('true' if hda_timer else 'false'),
             '-netdev', f'user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22',
             '-device', 'virtio-net-pci,netdev=net0',
             '-drive', f'file={disk},format=raw,if=none,id=os', '-device', 'virtio-blk-pci,drive=os',
@@ -202,9 +207,10 @@ def start(args):
                LD_LIBRARY_PATH=':'.join(packages[k] + '/lib' for k in ('virglrenderer','glvnd','mesa','vulkanLoader')))
     if routes:
         env.update({k:routes.env[k] for k in ('PIPEWIRE_RUNTIME_DIR', 'PIPEWIRE_REMOTE')})
+        if args.audio_backend=='sdl':env['SDL_AUDIODRIVER']='pipewire'
     manifest = dict(packages=packages, argv=argv, host_affinity=list(range(14)),
-                    memory_gib=6, vcpus=8, audio_backend='pipewire-null' if routes else 'none',
-                    hda_use_timer=False, rendernode=str(node), host_icd=str(icd),
+                    memory_gib=6, vcpus=8, audio_backend=audio_label,
+                    hda_use_timer=hda_timer,audio_buffer_us=args.audio_buffer_us, rendernode=str(node), host_icd=str(icd),
                     kernel_sha256=sha(control / 'bzImage'), initrd_sha256=sha(control / 'initrd'),
                     root_source=str((control / 'root.img').resolve()), root_source_sha256=sha(control / 'root.img'),
                     private_disk=str(disk), ssh_key=str(key), ssh_port=ssh_port,
@@ -321,6 +327,9 @@ def main():
     launch.add_argument('--host-icd', type=Path, required=True)
     launch.add_argument('--rendernode', type=Path, default=Path('/dev/dri/renderD128'))
     launch.add_argument('--audio-daemon', type=Path)
+    launch.add_argument('--audio-backend',choices=['pipewire','sdl'],default='pipewire')
+    launch.add_argument('--audio-buffer-us',type=int,default=200000)
+    launch.add_argument('--hda-use-timer',choices=['on','off'],default='off')
     launch.add_argument('--timeout', type=int, default=1800, choices=range(120, 7201), metavar='120..7200')
     for name in ('status', 'exec', 'shutdown', 'screenshot', 'check'):
         item = sub.add_parser(name)

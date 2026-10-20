@@ -43,8 +43,9 @@ routing setup. In QEMU's timer codec path, virtual time drives DMA progress and
 backend occupancy adjusts the timer origin; full codec buffers can be discarded.
 The callback path differs. See the primary
 [QEMU 10.2.2 HDA implementation](https://github.com/qemu/qemu/blob/v10.2.2/hw/audio/hda-codec.c).
-A matched Linux control with the same private SDL backend is the next useful
-separation of guest and host behavior.
+The subsequent [matched Linux and small-buffer controls](linux-audio-buffer-control.md)
+reproduce the slowdown under Linux and improve it on both guests, narrowing
+the investigation without establishing the exact mechanism.
 
 ## Recovery and verification
 

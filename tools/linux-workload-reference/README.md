@@ -146,3 +146,22 @@ run observes 15.440 seconds, exits zero and reports hardware virgl on Intel UHD
 630. This is a timing/smoke control, not an uncapped rendering-throughput score.
 The private control has only the owned pak, without OST staging; do not equate it
 with a music-matched native audio run. All licensed data remains local/ignored.
+
+
+## Audio backend controls
+
+For a separate diagnostic cohort, `start` accepts `--audio-backend sdl`,
+`--hda-use-timer on|off` and `--audio-buffer-us 20000`. SDL requires the private
+audio daemon and forces its PipeWire driver, with no host-audio fallback. The
+workload controller takes matching backend/timer options and verifies live QOM
+state. Keep the default PipeWire/callback/200-ms reference separate from each
+variant. A 20-ms SDL callback control restored normal media pacing on Linux and
+improved Brook; defaults stay unchanged. See the
+[matched controls and limitations](../../docs/linux-audio-buffer-control.md).
+
+`analyze_http_media_rates.py PHASE_DIRECTORY` supplies a separate server-causal
+rate analysis when the strict buffered clock model rejects a run. It preserves
+host-time bounds and does not relax that rejection. Its whole-run rates do not
+assume a 1× page clock; loaded selection still uses the CPU interval supplied by
+the controller. `clock_state.py` can query Linux monotonic/raw clocks and
+frequency-discipline state without setting any clock.

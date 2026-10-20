@@ -357,7 +357,12 @@ case "${HDA_USE_TIMER}" in
     on|off) ;;
     *) echo "BROOK_HDA_USE_TIMER must be on or off" >&2; exit 2 ;;
 esac
-AUDIO_OPTS="-audiodev ${BROOK_AUDIODEV:-pipewire},id=hda0,out.buffer-length=200000,timer-period=5000 \
+AUDIO_BUFFER_US="${BROOK_AUDIO_BUFFER_US:-200000}"
+if ! [[ "$AUDIO_BUFFER_US" =~ ^[0-9]{4,7}$ ]] || (( 10#$AUDIO_BUFFER_US < 1000 || 10#$AUDIO_BUFFER_US > 1000000 )); then
+    echo "BROOK_AUDIO_BUFFER_US must be 1000..1000000 microseconds" >&2; exit 2
+fi
+AUDIO_BUFFER_US=$((10#$AUDIO_BUFFER_US))
+AUDIO_OPTS="-audiodev ${BROOK_AUDIODEV:-pipewire},id=hda0,out.buffer-length=${AUDIO_BUFFER_US},timer-period=5000 \
     -device ich9-intel-hda,bus=pcie.0,addr=0x1b \
     -device hda-output,audiodev=hda0,use-timer=${HDA_USE_TIMER}"
 if [ "${NO_AUDIO}" -eq 1 ]; then

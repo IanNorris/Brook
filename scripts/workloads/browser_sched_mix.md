@@ -89,3 +89,22 @@ IRQ-masked intervals are not uniformly sampled, context-switch counts are not
 CPU service, and profiler disk writes/recording can perturb the workload. Keep
 these results separate from ordinary performance controls; `summary.json`
 records `profile_ms` explicitly.
+
+
+For separate host-buffer experiments, Brook accepts `BROOK_AUDIO_BUFFER_US`
+(default 200000 microseconds); the tested SDL override is 20000. Record the
+value with the backend and codec mode. The Linux reference reproduced the
+large-buffer slowdown, while smaller-buffer runs improved both guests; this
+is an experimental configuration, not a default change or a completed diagnosis.
+See [matched buffer controls](../../docs/linux-audio-buffer-control.md).
+
+A second analysis can retain server-causal bounds without assuming a 1× page
+clock:
+
+```sh
+python3 scripts/workloads/analyze_http_media_rates.py   build/browser-results/rr-0 --output build/browser-results/rr-0/causal-media-rates.json
+```
+
+This complements the buffered-trace model; it does not turn rejected clock
+anchors into acceptance. Loaded selection inherits the supplied CPU interval's
+assumptions, and delayed POSTs may leave intervals too wide for a useful result.

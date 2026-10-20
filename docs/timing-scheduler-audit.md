@@ -7,7 +7,9 @@ the Quake II timing smoke run, and seven backward nanosecond samples. The subseq
 pause/resume and records the replacement clock layout and native checks. [EEVDF experiments](eevdf-experiment.md) records the optional policy,
 Linux reference comparison, corrected silent-audio routes and GPU-wait trials.
 
-The latest [backend pacing controls](audio-backend-pacing.md) retain a recovered
+The latest [Linux buffer controls](linux-audio-buffer-control.md) reproduce
+the SDL slowdown on Linux and improve both guests with a smaller requested
+buffer; defaults remain unchanged. The earlier [backend pacing controls](audio-backend-pacing.md) retain a recovered
 SDL acceleration lead and a separate SDL callback half-rate discrepancy.
 
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256

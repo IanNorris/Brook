@@ -33,6 +33,8 @@ def main():
     parser.add_argument('--phase', required=True)
     parser.add_argument('--width', type=int, default=800)
     parser.add_argument('--height', type=int, default=600)
+    parser.add_argument('--audio-backend',choices=['pipewire','sdl'],default='pipewire')
+    parser.add_argument('--hda-use-timer',choices=['on','off'],default='off')
     parser.add_argument('--software-vsync', action='store_true', help='Diagnostic Firefox Wayland vsync workaround; separate cohort')
     parser.add_argument('--benchmark', default='/home/brook/benchmark/scheduler-mix')
     args = parser.parse_args()
@@ -42,7 +44,17 @@ def main():
         parser.error('Window dimensions must fit the controlled display')
     review, http, out = args.review.resolve(), args.fixture_directory.resolve(), args.output.resolve()
     data = linux.load(review)
-    assert data['audio_backend'] == 'pipewire-null' and data['hda_use_timer'] is False
+    expected_backend='pipewire-null' if args.audio_backend=='pipewire' else 'sdl-pipewire-null'
+    hda_timer=args.hda_use_timer=='on'
+    assert data['audio_backend']==expected_backend and data['hda_use_timer'] is hda_timer
+    with linux.qmp(review) as q:
+        codecs=[]
+        for parent in ('/machine/peripheral','/machine/peripheral-anon'):
+            for item in q.call('qom-list',{'path':parent}):
+                if item['type']=='child<hda-output>':
+                    path=parent+'/'+item['name'];value=q.call('qom-get',{'path':path,'property':'use-timer'})
+                    codecs.append(dict(path=path,use_timer=value))
+        assert len(codecs)==1 and codecs[0]['use_timer'] is hda_timer
     out.mkdir(parents=True, exist_ok=False)
     phase = args.phase
     def save(name, value):
@@ -73,7 +85,7 @@ def main():
             q.call('send-key', {'keys':[{'type':'qcode','data':letter.lower()}], 'hold-time':50})
         save('key-' + letter, dict(**intent, host_after_ns=time.monotonic_ns()))
     save('identity', dict(session=str(review), phase=phase, kernel=data['packages']['kernelVersion'],
-                          host_load=os.getloadavg(), resources=data, software_vsync=args.software_vsync))
+                          host_load=os.getloadavg(), resources=data, software_vsync=args.software_vsync,hda_codec=codecs[0]))
     save('harness', dict(controller_sha256=linux.sha(Path(__file__)),
                          page_sha256=linux.sha(http/'http/index.html'), clip_sha256=linux.sha(http/'http/clip.mp4')))
     benchmark_hash = guest(['sha256sum', args.benchmark]).split()[0]
@@ -159,7 +171,7 @@ def main():
         for i in range(0,len(pcm),step):
             values=pcm[i:i+step];rms.append(math.sqrt(sum(v*v for v in values)/max(1,len(values))))
         summary=dict(phase=phase,policy='Linux default fair class (EEVDF)',kernel=data['packages']['kernelVersion'],
-                      guest_memory_gib=6,vcpus=8,hda_use_timer=False,benchmark_sha256=benchmark_hash,
+                      guest_memory_gib=6,vcpus=8,hda_use_timer=hda_timer,audio_backend=expected_backend,audio_buffer_us=data.get('audio_buffer_us',200000),benchmark_sha256=benchmark_hash,
                       firefox_software_vsync=args.software_vsync,window_width=args.width,window_height=args.height,
                       host_guest_rate_low=clock_delta/(after['after_ns']-before['before_ns']),
                       host_guest_rate_high=clock_delta/(after['before_ns']-before['after_ns']),
@@ -171,7 +183,7 @@ def main():
                       audio_host_rate_ratio=n/rate/(capture_after-capture_before),
                       audio_capture_inside_load=load_start<=capture_before*1e9<=capture_after*1e9<=load_end,
                       audio_nonzero_10ms_bins=sum(v>=1 for v in rms),audio_10ms_bins=len(rms),
-                      scope='first Linux smoke boot, fresh profile, same static CPU binary and generated clip; default Linux autogroup/RT/compositor differences recorded; startup is not cold-boot matched')
+                      scope='Linux reference cohort, fresh profile, same static CPU binary and generated clip; default Linux autogroup/RT/compositor differences recorded; startup is not cold-boot matched')
         save('summary',summary);save('rms-10ms',rms);save('buffered-analysis',analyze(out))
         print('LINUX_MIX_SUMMARY',json.dumps(summary),flush=True)
         save('screenshot',linux.screenshot(review))
