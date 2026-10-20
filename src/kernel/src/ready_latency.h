@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "ready_watch.h"
 
 namespace brook {
 // All tracker access is serialized by the scheduler's existing ready lock.
@@ -22,6 +23,7 @@ struct ReadyLatencySnapshot {
     uint64_t untrackedDispatches = 0, unavailableClock = 0, backwardsClock = 0;
     uint64_t preexistingQueued = 0, preexistingDispatches = 0;
     ReadyLatencyCounts user{}, kernel{};
+    ReadyWatchSnapshot watch{};
 };
 template<unsigned Slots> class ReadyLatencyTracker {
     struct Pending {
@@ -29,13 +31,20 @@ template<unsigned Slots> class ReadyLatencyTracker {
         bool queued = false, kernel = false, preexisting = false;
     } pending_[Slots]{};
     ReadyLatencySnapshot snapshot_{};
+    ReadyWatchTracker watch_{};
 public:
     bool Enabled() const { return snapshot_.enabled; }
+    void Watch(uint64_t pid,uint64_t incarnation){watch_.Select(pid,incarnation);}
+    bool Watching(uint64_t pid,uint64_t incarnation)const{return Enabled() && watch_.Matches(pid,incarnation);}
+    void Deadline(unsigned pid,uint64_t incarnation,uint64_t deadline,uint64_t nowTick){
+        if(Enabled())watch_.Deadline(pid,incarnation,deadline,nowTick);
+    }
     void Reset() {
         const auto generation = snapshot_.resetGeneration + 1;
         const bool enabled = snapshot_.enabled;
         snapshot_ = {}; snapshot_.enabled = enabled; snapshot_.resetGeneration = generation;
         for (auto& pending : pending_) pending = {};
+        watch_.Reset();
     }
     void Enable(bool enabled) {
         if (enabled && !snapshot_.enabled) Reset();
@@ -45,6 +54,7 @@ public:
         if (!Enabled() || !pid || pid >= Slots) return;
         auto& pending = pending_[pid];
         if (pending.incarnation != incarnation) {
+            watch_.Cancel(pid,pending.incarnation);
             if (pending.queued) { --snapshot_.pending; ++snapshot_.cancelled; }
             pending = {}; pending.incarnation = incarnation;
         }
@@ -53,6 +63,7 @@ public:
         pending.sinceNs = nowNs; pending.queued = true; pending.kernel = kernel;
         pending.preexisting = false;
         ++snapshot_.enqueues; ++snapshot_.pending;
+        watch_.Enqueue(pid,incarnation,nowNs);
         if (!nowNs) ++snapshot_.unavailableClock;
     }
     // Entries already queued when enabling/resetting have no start timestamp.
@@ -62,6 +73,7 @@ public:
         auto& pending = pending_[pid];
         if (pending.queued && pending.incarnation == incarnation) return;
         if (pending.queued) { --snapshot_.pending; ++snapshot_.cancelled; }
+        watch_.Cancel(pid,pending.incarnation);
         pending = {incarnation, 0, true, kernel, true};
         ++snapshot_.pending; ++snapshot_.preexistingQueued;
     }
@@ -70,6 +82,7 @@ public:
         auto& pending = pending_[pid];
         if (pending.incarnation != incarnation || !pending.queued) return;
         pending.queued = false; --snapshot_.pending; ++snapshot_.cancelled;
+        watch_.Cancel(pid,incarnation);
     }
     void Dispatch(unsigned pid, uint64_t incarnation, uint64_t nowNs) {
         if (!Enabled() || !pid || pid >= Slots) return;
@@ -78,6 +91,7 @@ public:
             ++snapshot_.untrackedDispatches; return;
         }
         pending.queued = false; --snapshot_.pending;
+        watch_.Dispatch(pid,incarnation,nowNs);
         if (pending.preexisting) { ++snapshot_.preexistingDispatches; return; }
         if (!pending.sinceNs || !nowNs) {
             if (!nowNs) ++snapshot_.unavailableClock;
@@ -98,7 +112,7 @@ public:
         while (bin + 1 < ReadyLatencyBins && elapsed > ReadyLatencyBoundsNs[bin]) ++bin;
         ++counts.bins[bin];
     }
-    ReadyLatencySnapshot Snapshot() const { return snapshot_; }
+    ReadyLatencySnapshot Snapshot() const { auto s=snapshot_;s.watch=watch_.Snapshot();return s; }
 };
 enum class ReadyLatencyAction { Status, On, Off, Reset };
 } // namespace brook

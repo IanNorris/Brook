@@ -335,6 +335,14 @@ void SchedulerReadyLatency(ReadyLatencyAction action, ReadyLatencySnapshot* outp
     SchedLockRelease(g_readyLock, flags);
 }
 
+bool SchedulerReadyLatencyWatch(uint32_t pid) {
+    const uint64_t flags=SchedLockAcquire(g_readyLock);
+    auto* p=pid<SCHED_MAX_PIDS?g_pidToProcess[pid]:nullptr;
+    const bool valid=!pid || (p && p->state!=ProcessState::Terminated);
+    if(valid)g_readyLatency.Watch(pid,pid?p->incarnation:0);
+    SchedLockRelease(g_readyLock,flags);return valid;
+}
+
 // All processes (for blocked-process scanning).
 static Process* g_allProcesses[MAX_PROCESSES] = {};
 static uint32_t g_processCount = 0;
@@ -1592,10 +1600,13 @@ static void SchedulerUnblockInternal(Process* proc, bool continued)
     }
     __atomic_store_n(&proc->resumePending, false, __ATOMIC_RELEASE);
     proc->state = ProcessState::Ready;
+    const uint64_t wakeDeadline=proc->wakeupTick;
     proc->wakeupTick = 0;
     __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
     SchedTrace(proc, STR_READY_UNBLOCK);
     ReadyQueueInsertLocked(proc);
+    if(wakeDeadline && g_readyLatency.Watching(proc->pid,proc->incarnation))
+        g_readyLatency.Deadline(proc->pid,proc->incarnation,wakeDeadline,ApicTickCount());
     SchedLockRelease(g_readyLock, rlf4);
 
     KickIdleCpu();

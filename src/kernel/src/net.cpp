@@ -3305,6 +3305,23 @@ static void DebugEpollDiagnostics()
     DebugChannelSend("]}\n");
 }
 
+static void DebugReadyWatch(const ReadyWatchSnapshot& s)
+{
+    BridgeReply r;r.text(",\"watch\":{");r.field("pid",s.pid);r.text(",");r.field("incarnation",s.incarnation);
+    r.text(",");r.field("samples",s.samples);r.text(",");r.field("timed_samples",s.timedSamples);
+    r.text(",");r.field("max_queue_ns",s.maxQueueNs);r.text(",");r.field("max_late_ms",s.maxLateMs);
+    r.text(",");r.field("slow",s.slow);r.text(",");r.field("excluded",s.excluded);r.text(",");r.field("invalid",s.invalid);
+    r.text(",\"pending\":");r.text(s.pending?"true":"false");r.text(",\"saturated\":");r.text(s.saturated?"true":"false");r.send();
+    DebugChannelSend(",\"scope\":\"one PID/incarnation; ready insertion to dispatch; deadline lateness sampled after ready insertion in elapsed milliseconds; early wakes clamp to zero; excludes post-dispatch return; largest 16 slow events only\",\"events\":[");
+    for(unsigned i=0;i<s.retained;++i){const auto& e=s.events[i];BridgeReply row;
+        if(i)row.text(",");row.text("{");row.field("ready_ns",e.readyNs);row.text(",");row.field("dispatch_ns",e.dispatchNs);
+        row.text(",");row.field("deadline_tick_ms",e.deadlineTick);row.text(",");row.field("ready_tick_ms",e.readyTick);
+        row.text(",");row.field("queue_ns",e.queueNs);row.text(",");row.field("late_ms",e.lateMs);
+        row.text(",\"has_deadline\":");row.text(e.hasDeadline?"true":"false");row.text("}");row.send();
+    }
+    DebugChannelSend("]}");
+}
+
 static void DebugReadyLatency(ReadyLatencyAction action)
 {
     ReadyLatencySnapshot snapshot{};
@@ -3344,6 +3361,7 @@ static void DebugReadyLatency(ReadyLatencyAction action)
         row.text("]}"); row.send();
     };
     send("user", snapshot.user); send("kernel", snapshot.kernel);
+    DebugReadyWatch(snapshot.watch);
     DebugChannelSend("}\n");
 }
 
@@ -3585,6 +3603,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
+            "  sched timing watch PID - target wake/queue timing; 0 clears target\n"
             "  mapping timing on|off|reset|status - preflight mutex timings (default off)\n"
             "  sched policy status|rr|mlfq|eevdf - inspect or select a registered policy\n"
             "  sched runtime status - running intervals, steal availability and read errors\n"
@@ -3950,6 +3969,15 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.field("clamped_service",d.clampedService); reply.text(",");
         reply.field("stale_identity",d.staleIdentity); reply.text(",");
         reply.field("saturated",d.saturated); reply.text("}\n"); reply.send();
+    }
+    else if(StrStartsWith(cmd,"sched timing watch ")) {
+        const char* a=cmd+sizeof("sched timing watch ")-1;uint32_t pid=0;bool valid=*a!=0;
+        for(;*a && valid;++a){
+            if(*a<'0' || *a>'9' || pid>(~uint32_t(0)-uint32_t(*a-'0'))/10)valid=false;
+            else pid=pid*10+uint32_t(*a-'0');
+        }
+        if(!valid || !SchedulerReadyLatencyWatch(pid))DebugChannelSend("{\"error\":\"invalid live PID\"}\n");
+        else DebugReadyLatency(ReadyLatencyAction::Status);
     }
     else if (NetStrEq(cmd, "sched timing on") || NetStrEq(cmd, "sched timing off") ||
              NetStrEq(cmd, "sched timing reset") || NetStrEq(cmd, "sched timing status")) {

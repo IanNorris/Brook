@@ -62,5 +62,48 @@ int main() {
     tracker.Enqueue(1, 10, false, 1); tracker.Dispatch(1, 10, ~uint64_t{0});
     tracker.Enqueue(1, 10, false, 1); tracker.Dispatch(1, 10, 100);
     assert(tracker.Snapshot().user.sumSaturated && tracker.Snapshot().user.sumNs == ~uint64_t{0});
+    // Watch selection binds an incarnation, preserves aggregate diagnostics,
+    // and never invents a queue start for a task already queued at selection.
+    tracker.Reset();tracker.Watch(2,20);
+    tracker.Enqueue(2,20,true,100);tracker.Deadline(2,20,10,240);
+    tracker.Dispatch(2,20,1000100);
+    auto watched=tracker.Snapshot().watch;
+    assert(watched.samples==1 && watched.timedSamples==1 && watched.maxLateMs==230);
+    assert(watched.maxQueueNs==1000000 && watched.events[0].readyNs==100);
+    assert(watched.events[0].dispatchNs==1000100 && watched.events[0].hasDeadline);
+    // A runnable retry preserves original queue time and no-deadline wakeups
+    // do not acquire a stale deadline from the previous sleep.
+    tracker.Enqueue(2,20,true,2000000);tracker.Enqueue(2,20,true,2000100);
+    tracker.Dispatch(2,20,32000000);
+    watched=tracker.Snapshot().watch;
+    assert(watched.samples==2 && watched.timedSamples==1 && watched.events[1].queueNs==30000000);
+    assert(!watched.events[1].hasDeadline);
+    tracker.Enqueue(2,20,true,33000000);tracker.Remove(2,19);
+    assert(tracker.Snapshot().watch.pending);
+    tracker.Remove(2,20);assert(!tracker.Snapshot().watch.pending);
+    tracker.Enqueue(2,20,true,34000000);tracker.Enqueue(2,21,true,35000000);
+    tracker.Deadline(2,21,1,1000);tracker.Dispatch(2,21,90000000);
+    assert(tracker.Snapshot().watch.samples==2 && !tracker.Snapshot().watch.pending);
+    tracker.Watch(2,21);tracker.Enqueue(2,21,true,100000000);
+    tracker.Deadline(2,21,1000,900);tracker.Dispatch(2,21,100000001);
+    watched=tracker.Snapshot().watch;assert(watched.samples==1 && !watched.maxLateMs && watched.timedSamples==1);
+    tracker.Reset();assert(tracker.Snapshot().watch.pid==2 && !tracker.Snapshot().watch.samples);
+    tracker.Enqueue(2,21,true,0);tracker.Dispatch(2,21,1);
+    assert(tracker.Snapshot().watch.invalid==1);
+    tracker.Enqueue(2,21,true,10);tracker.Dispatch(2,21,9);
+    assert(tracker.Snapshot().watch.invalid==2);
+    tracker.Reset();tracker.SeedPending(2,21,true);tracker.Dispatch(2,21,100000000);
+    assert(!tracker.Snapshot().watch.samples && !tracker.Snapshot().watch.pending);
+    tracker.Enqueue(2,21,true,1);tracker.Watch(2,21);tracker.Dispatch(2,21,90000000);
+    assert(!tracker.Snapshot().watch.samples); // selected while already queued
+    for(unsigned i=0;i<40;++i){
+        tracker.Enqueue(2,21,true,1);tracker.Deadline(2,21,1,21+i);tracker.Dispatch(2,21,2);
+    }
+    watched=tracker.Snapshot().watch;
+    assert(watched.slow==40 && watched.retained==16 && watched.excluded==24);
+    assert(watched.events[0].lateMs==59 && watched.events[15].lateMs==44);
+    tracker.Enable(false);tracker.Dispatch(2,21,1000);tracker.Enable(true);
+    assert(tracker.Snapshot().watch.pid==2 && !tracker.Snapshot().watch.samples);
+    tracker.Watch(0,0);assert(!tracker.Watching(2,21));
     std::puts("READY_LATENCY_PASS identities, queue retries, cancellation, clock bounds, histogram, opt-in/reset");
 }

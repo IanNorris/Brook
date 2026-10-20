@@ -258,6 +258,7 @@ const char* SchedulerPolicyName();
 // Runtime-off queue-entry-to-dispatch diagnostics. Copies under readyLock;
 // callers format/send after release. No blocked-time or wakeup-IPI measurement.
 void SchedulerReadyLatency(ReadyLatencyAction action, ReadyLatencySnapshot* output);
+bool SchedulerReadyLatencyWatch(uint32_t pid);
 
 // Panic-safe process enumeration — no locks, assumes all other CPUs halted.
 uint32_t PanicGetProcessCount();

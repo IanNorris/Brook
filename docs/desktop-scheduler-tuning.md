@@ -181,3 +181,11 @@ also reproduces independently of the longest mixer episodes. Therefore neither
 a good synthetic sleeper p95 nor the absence of a mixer CPU hotspot establishes
 continuous desktop audio. Keep device publication safety, blocked wakeup,
 ready-to-dispatch latency and host delay distinct in subsequent comparisons.
+
+The subsequent [targeted wakeup trace](targeted-wakeup-timing.md) correlates a
+large EEVDF mixer sleep with 69 ms deadline lateness before/at ready insertion,
+13 ms queue wait and under two microseconds from dispatch bookkeeping to the
+resume sample. A corresponding MLFQ episode has 90 ms lateness and 17 ms queue
+wait, but that control fails runtime accounting with four clamped-service
+samples and remains unaccepted. This supports measuring BSP timer/wakeup paths
+and accounting skew before changing quantum, timer ownership or defaults.
