@@ -14,6 +14,7 @@ VNC_DISPLAY=""
 VDE_SOCK=""
 NIC_MAC=""
 INSTANCE=""
+INSTANCE_EXPLICIT=0
 NO_AUDIO=0
 VM_BRIDGE="${BROOK_VM_BRIDGE:-0}"
 REAL_ESP=0
@@ -43,6 +44,7 @@ for arg in "$@"; do
             ;;
         --instance=*)
             INSTANCE="${arg#--instance=}"
+            INSTANCE_EXPLICIT=1
             ;;
         --no-audio)
             NO_AUDIO=1
@@ -70,6 +72,15 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Instance-derived TCP forwarding is 11237 + instance * 100. Check before
+# copying boot artifacts, and bound the decimal input before shell arithmetic.
+if (( INSTANCE_EXPLICIT )); then
+    if ! [[ "$INSTANCE" =~ ^(0|[1-9][0-9]{0,2})$ ]] || (( INSTANCE > 542 )); then
+        echo "Invalid VM instance '$INSTANCE': use a decimal integer from 0 to 542 (host port must fit 65535)." >&2
+        exit 2
+    fi
+fi
 
 if [ "${VM_BRIDGE}" = "1" ]; then
     BROOK_AUDIODEV="${BROOK_AUDIODEV:-none}"

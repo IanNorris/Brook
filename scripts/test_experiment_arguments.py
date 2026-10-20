@@ -11,6 +11,35 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ExperimentArgumentsTests(unittest.TestCase):
+    def test_invalid_instances_fail_before_artifact_creation(self):
+        with tempfile.TemporaryDirectory(prefix='brook invalid instance ') as tmp:
+            build = Path(tmp) / 'must not be created'
+            env = dict(os.environ, BROOK_BUILD_DIR=str(build),
+                       BROOK_EXPERIMENT_DISKS=str(build), BROOK_EXPERIMENT_RUN=str(build))
+            invalid = ['', '-1', '543', '580', '01', '08', '1+1', 'abc', '9'*40]
+            for value in invalid:
+                with self.subTest(entry='qemu', value=value):
+                    result = subprocess.run(['bash', str(ROOT/'scripts/run-qemu.sh'),
+                                             '--instance='+value], env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn('Invalid VM instance', result.stderr)
+                    self.assertFalse(build.exists())
+                if value:  # Empty BROOK_INSTANCE retains the documented default.
+                    with self.subTest(entry='experiment', value=value):
+                        result = subprocess.run(['bash', str(ROOT/'scripts/run_experiment.sh')],
+                                                env=dict(env, BROOK_INSTANCE=value), capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertIn('Invalid VM instance', result.stderr)
+                        self.assertFalse(build.exists())
+            for value in ['0', '98', '536', '542']:
+                with self.subTest(entry='qemu_valid', value=value):
+                    # Stop at the missing bootloader; never invoke a real VM.
+                    result = subprocess.run(['bash', str(ROOT/'scripts/run-qemu.sh'), '--instance='+value],
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn('Bootloader not found', result.stdout)
+                    self.assertFalse(build.exists())
+
     def test_paused_boot_and_argument_boundaries_reach_qemu(self):
         with tempfile.TemporaryDirectory(prefix='brook experiment ') as tmp:
             root = Path(tmp)

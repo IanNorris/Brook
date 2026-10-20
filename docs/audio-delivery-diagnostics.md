@@ -1308,3 +1308,42 @@ This covers AP execution deterministically; it is not a fairness or starvation
 guarantee. The corrected test passes 100 single-host-CPU and 100 normal repeats,
 then the full suite passes. The original failed suite log, diagnostic failure
 receipt and repeat results remain preserved alongside the new kernel evidence.
+
+### Quiet native capability acceptance
+
+A fresh six-disk private clone boots the diagnostic kernel
+`090b153ef86aca1324710cfd158f44e59c08fb8c5bda2252ba2b8747dac08311`
+with thirteen matched ABI-34 modules, eight vCPUs, 6 GiB RAM, host affinity
+0–13, headless Venus display, `AUDIODEV=none`, MLFQ and the explicit
+IRQ-accounting-try control. Its wrapper has a hard 300-second timeout; the
+test requests an orderly shutdown immediately after the read-only queries.
+It does not use or start either prepared persistent live-review image.
+
+The guest reports feature word `0x01007efb`, hint word zero, advertised steal
+time, PV-unhalt and PV scheduler yield. All eight clock and steal records are
+registered (`0xff`); the clock source is pvclock with zero rejected samples.
+Runtime diagnostics use stable pvclock and report no invalid, backwards,
+clamped, stale or saturated samples. Both sampled preemption-byte masks are
+zero in this quiet snapshot. This proves feature advertisement and functioning
+query transport, not hint completeness, lock-holder descheduling, contention
+performance or an audio fix. Brook still implements neither PV wait nor yield.
+
+The heap check passes. Shutdown acknowledges the final guest sync and QEMU
+exit zero; separately, the controller records the original `Popen.wait()` exit
+zero. All four offline filesystem checks and the twelve saved-document/four
+original-profile comparisons pass. Evidence is in
+`build/reviews/kvm-status-native-try-2-20261020`.
+
+The first attempt, `kvm-status-native-20261020`, is a launch failure, not a
+guest boot: the assigned instance 582 produced host-forward port 69437 and
+QEMU exited one. Its controller wait, launch log and untouched failure disks
+are retained. The two not-yet-started live-review launchers had the same invalid
+instance selection; they were corrected to 540/541 (ports 65237/65337), with
+their originals retained. The successful diagnostic uses instance 539.
+
+Both launcher entrypoints now reject invalid/noncanonical instances before
+artifact preparation. The supported decimal range is 0–542, corresponding to
+the forwarding rule `11237 + instance * 100`. Harmless launcher tests cover
+out-of-range, empty explicit arguments, leading-zero, expression/text and
+oversized inputs plus valid boundary values, without starting QEMU. This is a
+launch preflight correction; the diagnostic kernel and scheduler are unchanged.

@@ -15,6 +15,11 @@ case "${1:-desktop}" in
     bootstrap) scenario=experiment_bootstrap ;;
     *) echo "Usage: $0 [desktop|video|quake-soft|quake-gl3|office|bootstrap] [QEMU arguments...]" >&2; exit 2 ;;
 esac
+instance="${BROOK_INSTANCE:-98}"
+if ! [[ "$instance" =~ ^(0|[1-9][0-9]{0,2})$ ]] || (( instance > 542 )); then
+    echo "Invalid VM instance '$instance': use a decimal integer from 0 to 542 (host port must fit 65535)." >&2
+    exit 2
+fi
 disks="${BROOK_EXPERIMENT_DISKS:-${ROOT_DIR}/build/experiments/seeds}"
 source_boot="${BROOK_DISK_IMG:-${ROOT_DIR}/brook_disk.img}"
 for image in "${source_boot}" "${disks}/data.img" "${disks}/nix.img"; do
@@ -50,7 +55,6 @@ export BROOK_SMP="${BROOK_SMP:-8}"
 # PS/2 is the default keyboard, matching 7b0e50a. Preserve explicit caller
 # opt-in for USB experiments rather than overriding the launch default.
 export SERIAL_OPT="-serial file:${run_dir}/serial.log"
-instance="${BROOK_INSTANCE:-98}"
 display_args=(--headless --vnc "127.0.0.1:${instance}")
 case "${BROOK_EXPERIMENT_DISPLAY:-headless}" in
     headless) ;;
