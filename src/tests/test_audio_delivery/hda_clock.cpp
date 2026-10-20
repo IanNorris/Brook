@@ -20,7 +20,7 @@ void store(uint32_t offset, uint32_t width, uint32_t value) {
 }
 void initialize() {
     registers.fill(0);dma.fill(0);nowNs=1000000000;clockAvailable=true;failSetup=false;
-    g_nativeClock=brook::AudioDmaClock{};g_nativeMode=false;g_nativeRingBase=0;
+    g_nativeClock=brook::AudioDmaClock{};g_nativeFaultEvidence={};g_nativeMode=false;g_nativeRingBase=0;
     g_nativeLastDataEnd=g_nativePrimedAt=0;
     g_streamRunning=g_streamConfigured=false;g_playLock=g_legacyActive=0;g_legacyEpoch=0;legacyWaitHook=afterCopyHook=nullptr;
     g_submittedBytes=g_playedBytes=0;g_lastLpib=0;
@@ -132,6 +132,12 @@ int RunHdaClockTests() {
     VERIFY(std::all_of(dma.begin(),dma.begin()+4096,[](uint8_t b){return b==0;}));VERIFY(dma[4096]!=0);
     nowNs+=AudioDmaClock::MaxSampleNs;snapshot=progress();
     VERIFY(snapshot.discontinuity && snapshot.completed==base+4096);
+    VERIFY(g_nativeFaultEvidence.reason && !std::strcmp(g_nativeFaultEvidence.reason,"sample-gap"));
+    VERIFY(g_nativeFaultEvidence.epoch==snapshot.epoch && g_nativeFaultEvidence.completed==snapshot.completed);
+    VERIFY(g_nativeFaultEvidence.afterNs-g_nativeFaultEvidence.previousNs>=AudioDmaClock::MaxSampleNs);
+    const auto retainedFault=g_nativeFaultEvidence;
+    nowNs+=1000000;progress();
+    VERIFY(g_nativeFaultEvidence.beforeNs==retainedFault.beforeNs && g_nativeFaultEvidence.reason==retainedFault.reason);
     receipt=HdaTrySubmit(tone.data(),4);VERIFY(receipt.error==-32 && !receipt.accepted);
     VERIFY(!HdaNativeRestart(snapshot.epoch+1));VERIFY(HdaNativeRestart(snapshot.epoch));
     receipt=HdaTrySubmit(tone.data(),4);VERIFY(receipt.epoch==2 && receipt.begin==0 && receipt.accepted==4);
@@ -155,6 +161,8 @@ int RunHdaClockTests() {
     advanceNative(NATIVE_WRITE_LEAD+4);snapshot=progress();VERIFY(snapshot.completed==receipt.begin+4);
     store(g_outStreamBase+SD_STS,1,SD_STS_FIFOE);snapshot=progress();
     const uint64_t proven=snapshot.completed;VERIFY(snapshot.discontinuity);
+    VERIFY(!std::strcmp(g_nativeFaultEvidence.reason,"device-status"));
+    VERIFY(g_nativeFaultEvidence.status==SD_STS_FIFOE && g_nativeFaultEvidence.completed==proven);
     failSetup=true;VERIFY(!HdaNativeRestart(snapshot.epoch));
     auto failed=progress();VERIFY(failed.epoch==snapshot.epoch && failed.discontinuity && failed.completed==proven);
     failSetup=false;VERIFY(HdaNativeRestart(snapshot.epoch));
@@ -163,6 +171,7 @@ int RunHdaClockTests() {
     initialize();receipt=HdaTrySubmit(tone.data(),8);VERIFY(receipt.accepted==8);prime();
     move(1,1000000);VERIFY(progress().completed==0);move(3,1000000);VERIFY(progress().completed==4);
     nowNs-=10000000;VERIFY(progress().discontinuity);
+    VERIFY(!std::strcmp(g_nativeFaultEvidence.reason,"clock-backwards"));
     initialize();legacyWaitHook=[] {
         move(49152,280000000);HdaService();
         const int16_t sample[2]={1234,1234};auto attempted=HdaTrySubmit(sample,4);
@@ -180,6 +189,7 @@ int RunHdaClockTests() {
     VERIFY(HdaPlayPcm(tone.data(),4,44100,2,16,true)==4);
     initialize();receipt=HdaTrySubmit(tone.data(),8);VERIFY(receipt.accepted==8);prime();
     clockAvailable=false;snapshot=progress();VERIFY(snapshot.discontinuity && snapshot.completed==0);
+    VERIFY(!std::strcmp(g_nativeFaultEvidence.reason,"clock-unavailable"));
     initialize();receipt=HdaTrySubmit(tone.data(),4);VERIFY(receipt.accepted==4 && !g_streamRunning);
     clockAvailable=false;HdaService();snapshot=progress();
     VERIFY(snapshot.discontinuity && !snapshot.completed && !g_streamRunning);

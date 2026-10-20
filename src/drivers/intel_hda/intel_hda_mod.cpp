@@ -763,16 +763,44 @@ static void StopNativePhysicalLocked()
     g_nativePrimedAt = 0;
     memset(g_audioBuf, 0, AUDIO_BUF_SIZE);
 }
+// Retain the first terminal sample in each epoch. Logging occurs only after
+// stopping DMA, in the existing thread-context path; no ABI or sampling-policy
+// change is required to distinguish starvation from clock/device faults.
+struct NativeFaultEvidence {
+    uint64_t epoch = 0, previousNs = 0, beforeNs = 0, afterNs = 0;
+    uint64_t submitted = 0, completed = 0;
+    uint32_t previousPosition = 0, rawPosition = 0, status = 0;
+    const char* reason = nullptr;
+};
+static NativeFaultEvidence g_nativeFaultEvidence;
+static void FailNativeLocked(const char* reason, uint64_t before = 0,
+                             uint64_t after = 0, uint32_t raw = 0, uint8_t status = 0)
+{
+    const bool report = g_nativeFaultEvidence.epoch != g_nativeClock.epoch;
+    if (report) {
+        g_nativeFaultEvidence = {g_nativeClock.epoch, g_nativeClock.SampleBeforeNs(),
+            before, after, g_nativeClock.submitted, g_nativeClock.completed,
+            g_nativeClock.Position(), raw, status, reason};
+    }
+    g_nativeClock.Fault();
+    StopNativePhysicalLocked();
+    if (report) {
+        const auto& f = g_nativeFaultEvidence;
+        SerialPrintf("intel_hda: native fault reason=%s epoch=%lu previous_ns=%lu before_ns=%lu after_ns=%lu previous_position=%u raw_position=%u status=%u submitted=%lu completed=%lu\n",
+            f.reason, f.epoch, f.previousNs, f.beforeNs, f.afterNs,
+            f.previousPosition, f.rawPosition, f.status, f.submitted, f.completed);
+    }
+}
 static bool StartNativePrimedLocked()
 {
     const uint64_t before = AudioClockNowNs();
     // Baseline precedes RUN: a post-RUN read could discard real DMA progress.
     if (!g_nativeClock.Start(0, before)) {
-        StopNativePhysicalLocked(); return false;
+        FailNativeLocked("start-clock-or-position", before); return false;
     }
     StartOutputStream(); g_streamRunning = true;
     if (!(hda_read32(g_outStreamBase + SD_CTL) & SD_CTL_RUN)) {
-        g_nativeClock.Fault(); StopNativePhysicalLocked(); return false;
+        FailNativeLocked("run-not-set", before); return false;
     }
     return true;
 }
@@ -782,7 +810,7 @@ static void ObserveNativeLocked()
         if (!g_nativeClock.discontinuity && g_nativeClock.Pending()) {
             const uint64_t now = AudioClockNowNs();
             if (!now || now < g_nativePrimedAt) {
-                g_nativeClock.Fault(); StopNativePhysicalLocked();
+                FailNativeLocked(!now ? "prime-clock-unavailable" : "prime-clock-backwards", now);
             }
         }
         return;
@@ -794,7 +822,12 @@ static void ObserveNativeLocked()
     const uint64_t oldCompleted = g_nativeClock.completed;
     if (!g_nativeClock.Observe(raw == AUDIO_BUF_SIZE ? 0 : raw, before, after,
                               (status & (SD_STS_FIFOE | SD_STS_DESE)) != 0)) {
-        StopNativePhysicalLocked();
+        const char* reason = (status & (SD_STS_FIFOE | SD_STS_DESE)) ? "device-status" :
+            raw > AUDIO_BUF_SIZE ? "invalid-position" : !before ? "clock-unavailable" :
+            before < g_nativeClock.SampleBeforeNs() || after < before ? "clock-backwards" :
+            after - g_nativeClock.SampleBeforeNs() >= AudioDmaClock::MaxSampleNs ? "sample-gap" :
+            "completion-overflow";
+        FailNativeLocked(reason, before, after, raw, status);
         return;
     }
     // Completed areas become silence before cyclic DMA can visit them again.
@@ -828,7 +861,7 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
     if (!samples || !bytes || bytes % AudioDmaClock::FrameBytes) { receipt.error = -22; return receipt; }
     PlayLock();
     if (!AudioClockNowNs()) {
-        if (g_nativeMode) { g_nativeClock.Fault(); StopNativePhysicalLocked(); }
+        if (g_nativeMode) FailNativeLocked("submit-clock-unavailable");
         receipt = {g_nativeClock.epoch, g_nativeClock.submitted, 0, -95};
         PlayUnlock(); return receipt;
     }
@@ -848,7 +881,7 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
     if (g_nativeClock.discontinuity) { receipt.error = -32; PlayUnlock(); return receipt; }
     if (!g_streamConfigured) {
         if (!SetupOutputStream(44100, 2, 16)) {
-            g_nativeClock.Fault(); StopNativePhysicalLocked();
+            FailNativeLocked("setup-failed");
             receipt.error = -5; PlayUnlock(); return receipt;
         }
         g_nativeRingBase = g_nativeClock.submitted;
@@ -856,7 +889,7 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
     if (!g_nativeClock.Pending() && g_streamRunning) {
         if (g_nativeClock.completed > ~uint64_t(0) - NATIVE_WRITE_LEAD ||
             !g_nativeClock.ReserveStart(g_nativeClock.completed + NATIVE_WRITE_LEAD)) {
-            g_nativeClock.Fault(); StopNativePhysicalLocked();
+            FailNativeLocked("reserve-failed");
             receipt.error = -5; PlayUnlock(); return receipt;
         }
     }
@@ -878,7 +911,7 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
     // that hardware could not already have consumed the new interval.
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (!g_nativeClock.Accept(bytes)) {
-        g_nativeClock.Fault(); StopNativePhysicalLocked();
+        FailNativeLocked("accept-failed");
         receipt.error = -5; PlayUnlock(); return receipt;
     }
     receipt.accepted = bytes;
@@ -898,7 +931,7 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
     if (!publishSafe) {
         // Some copied samples may have escaped. Charge the interval to this
         // epoch, but preserve only the pre-copy proven completion watermark.
-        g_nativeClock.Fault(); StopNativePhysicalLocked();
+        FailNativeLocked("publish-unsafe");
         receipt.error = -32; PlayUnlock(); return receipt;
     }
     g_nativeLastDataEnd = g_nativeClock.submitted;
