@@ -1,5 +1,6 @@
 #include <cstdio>
 #include "../../kernel/src/timer_wakeup_timing.h"
+#include "../../kernel/src/timer_irq_arrivals.h"
 namespace {int failed=0;}
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"timer wake line %d: %s\n",__LINE__,#x);++failed;}}while(0)
 int main(){
@@ -65,5 +66,25 @@ int main(){
     CHECK(m.Complete(t,1600000001,1600000002,1600000003,1600000004,0));
     m.Reset();epoch=m.Epoch();t=m.Begin(epoch,1,0,0,true,500000000);
     CHECK(!t.previousArrivalNs && !t.hasStealGap && !m.Snapshot().missingStealEntries);
+    // Per-CPU arrival histories stay independent, and disabling a window
+    // preserves evidence while rejecting in-flight samples from its old epoch.
+    TimerIrqArrivalModel cpu[2];cpu[0].Reset(3);cpu[1].Reset(3);
+    cpu[0].Observe(1,100,0,0);cpu[0].Observe(2,100,0,0);
+    CHECK(!cpu[0].Snapshot().arrivals);
+    cpu[0].Observe(3,1000000,1,3);cpu[1].Observe(3,1000000,2,3);
+    cpu[0].Observe(3,101000000,3,8);
+    for(uint64_t n=2000000;n<=101000000;n+=1000000)cpu[1].Observe(3,n,4,3);
+    auto p=cpu[0].Snapshot(),q=cpu[1].Snapshot();
+    CHECK(p.arrivals==2 && p.gaps==1 && p.slow==1 && p.maxGapNs==100000000);
+    CHECK(p.maxGapStartNs==1000000 && p.maxGapEndNs==101000000 && p.maxGapRip==3 && p.maxGapCs==8);
+    CHECK(q.arrivals==101 && q.gaps==100 && !q.slow && q.maxGapNs==1000000);
+    cpu[0].SetEpoch(4);cpu[0].Observe(3,201000000,5,3);cpu[0].Observe(4,201000000,5,3);
+    CHECK(cpu[0].Snapshot().arrivals==2 && cpu[0].Snapshot().lastNs==101000000);
+    cpu[0].Reset(7);cpu[0].Observe(3,1,0,0);CHECK(!cpu[0].Snapshot().arrivals);
+    cpu[0].Observe(7,100,0,0);cpu[0].Observe(7,0,0,0);cpu[0].Observe(7,200,0,0);
+    CHECK(cpu[0].Snapshot().invalidClock==1 && cpu[0].Snapshot().gaps==0);
+    cpu[0].Observe(7,199,0,0);cpu[0].Observe(7,300,0,0);cpu[0].Observe(7,300,0,0);
+    p=cpu[0].Snapshot();CHECK(p.invalidClock==2 && p.arrivals==4 && p.gaps==1 && p.maxGapNs==0);
+    CHECK(p.firstNs==100 && p.lastNs==300 && !p.saturated);
     std::printf("TIMER_WAKE_TIMING %s\n",failed?"FAIL":"PASS");return failed?1:0;
 }

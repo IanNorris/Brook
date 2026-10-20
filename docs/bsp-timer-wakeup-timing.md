@@ -315,3 +315,74 @@ controllers, launchers, frozen source hashes, trace windows, raw host thread
 samples, guest probe snapshots, tracked-job/lifecycle receipts and reproducible
 `analyze-results.py` analysis with offset bounds. Scheduler default, safety gates
 and the unresolved historical playback-speedup conclusion remain unchanged.
+
+## Independent per-CPU timer arrivals
+
+`timer peers on|off|reset|status` adds a separate default-off IRQ arrival probe.
+Each CPU has its own cache-aligned model and try-lock; no global IRQ collection
+lock or BSP-only completion path is needed. The hook runs after the GS guard in
+the LAPIC timer handler, excluding reschedule IPIs. It reads stable pvclock and
+records first/last arrival, count, adjacency count, largest gap/context, gaps at
+least 20 ms, invalid clocks and lifetime contention drops. Failed/regressing
+clock reads break adjacency rather than manufacturing a valid gap across an
+unobserved interval.
+
+`on` and `reset` clear the measured window; `off` preserves its evidence. A
+monotonic epoch rejects delayed observations from before a control change;
+exhaustion fails closed. Reports include each row's epoch and a final consistency
+flag because rows are sampled separately. Counters do not claim simultaneous
+all-CPU snapshots or distinguish the host/guest cause of a missed arrival.
+Normal-thread controls may hold a slot lock; its IRQ observer drops rather than
+spins, and that drop remains visible across resets. No scheduler behavior or
+default changes.
+
+The mixed workload's `--timer-irq-arrivals` flag retains idle and loaded
+snapshots, disables the probe after load, and guards its mode on resume. New
+hosted model cases cover independent CPUs, a delayed BSP with continuing AP
+arrivals, stale/off epochs, preserving a disabled window, reset, unavailable and
+regressing clocks, and equal timestamps. All 65 hosted suites pass. Native
+module imports resolve for thirteen modules/106 exports; the compiled entry
+audit passes twelve supported templates and 56 mutation checks, retaining four
+unsupported paths. The frozen kernel hash is
+`1fc8afd966ea45697fa45943ef5fd098f211e7281cd8e472b2fa398fe252eb29`.
+Eleven modules are byte-identical to the prior capsule; the two scheduler modules
+differ only in `.debug_info`/`.debug_line`, with all non-debug sections identical.
+
+Two fresh private eight-CPU boots repeat the browser/audio/24-worker fixture:
+
+| Run | Window | BSP largest gap | AP largest gaps, CPUs 1–7 | Retained BSP slow episodes with proven AP timer activity |
+| --- | --- | --- | --- | --- |
+| tp-e1, EEVDF | browser idle | 51.651 ms | 11.230, 15.547, 11.556, 9.097, 9.765, 9.053, 15.655 ms | 2/2 |
+| tp-e1, EEVDF | CPU load | 103.650 ms | 33.547, 10.541, 14.478, 34.163, 18.602, 32.475, 43.132 ms | 16/16 |
+| tp-m1, MLFQ | browser idle | 42.387 ms | 12.922, 11.183, 12.276, 12.666, 12.238, 12.004, 8.101 ms | 3/3 |
+| tp-m1, MLFQ | CPU load | 116.687 ms | 25.203, 24.549, 27.640, 27.731, 10.895, 32.951, 31.396 ms | 16/16 |
+
+Every per-CPU report has a consistent epoch, nonzero observations, exactly
+`arrivals - 1` adjacent intervals, and zero invalid/drop/saturation counters.
+For each availability claim, the entire BSP episode lies within the AP's
+first/last observed arrivals and that AP's largest gap over its whole window is
+shorter than the BSP episode. Therefore at least one AP timer arrived during
+that BSP gap. This uses shared guest clock intervals directly, without the
+host RPC offset uncertainty of the QEMU correlation. Loaded BSP lists exclude
+six EEVDF and sixteen MLFQ episodes; no availability claim is made for those
+unretained events. An AP having an IRQ does not prove it can acquire scheduler
+locks promptly or complete an audio wakeup.
+
+Both original workloads, runtime gates, launcher/router waits, four filesystem
+checks and saved-data preservation pass. No native HDA fault occurs. All VMs
+and private services stop. Evidence in ignored `timer-peers-cohorts` includes
+source hashes, default-off checks on every CPU, raw snapshots, job receipts and
+`verify-results.py`; module comparison and hosted/native/entry-audit results are
+stored alongside it. These instrumented runs are not acceptance evidence of an
+audio or frame-rate improvement, and do not reproduce the historical speedup.
+
+The next candidate is a serialized wake-scan handoff: preserve BSP preference,
+allow an AP to claim a scan when completion is overdue, and never let a CPU spin
+waiting for the scan owner. Keep ownership across candidate gathering,
+`SchedulerUnblock` and reference release. Merely serializing the registry scan
+is insufficient: duplicate candidates could call `SchedulerUnblock` after a
+peer has made the task Ready and publish an extra `pendingWakeup`. An active
+owner cannot safely be revoked just because it is slow. Test this ownership
+model and switch it on explicitly for native comparison before changing any
+default. POSIX expiry, alarms and reaping remain separate BSP responsibilities;
+the handoff alone would not repair every timeout path.

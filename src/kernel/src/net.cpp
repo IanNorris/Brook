@@ -27,6 +27,7 @@
 #include "smp.h"
 #include "rtc.h"
 #include "apic.h"
+#include "timer_irq_arrivals.h"
 #include "kvmclock.h"
 #include "vfs.h"
 #include "input.h"
@@ -3305,6 +3306,29 @@ static void DebugEpollDiagnostics()
     DebugChannelSend("]}\n");
 }
 
+static void DebugTimerIrqArrivals()
+{
+    const auto epoch=TimerIrqArrivalsEpoch();const auto online=SmpGetCpuCount();
+    const auto capacity=TimerIrqArrivalsCpuCapacity();bool consistent=true;
+    BridgeReply header;header.text("{");header.field("epoch",epoch);
+    header.text(",\"enabled\":");header.text((epoch&1)?"true":"false");
+    header.text(",");header.field("online_cpus",online);header.text(",");header.field("capacity",capacity);
+    header.text(",\"scope\":\"per-CPU LAPIC IRQ after GS guard; no IPIs; independent try-lock slots; contended counts since boot; clock failures break adjacency; rows sampled separately; on/reset clear window, off preserves it\",\"cpus\":[");header.send();
+    for(unsigned cpu=0;cpu<online && cpu<capacity;++cpu){
+        const auto s=TimerIrqArrivalsRead(cpu);consistent=consistent && s.epoch==epoch;
+        BridgeReply row;if(cpu)row.text(",");row.text("{");row.field("cpu",cpu);row.text(",");row.field("epoch",s.epoch);
+        row.text(",");row.field("arrivals",s.arrivals);row.text(",");row.field("gaps",s.gaps);row.text(",");row.field("invalid_clock",s.invalidClock);
+        row.text(",");row.field("first_ns",s.firstNs);row.text(",");row.field("last_ns",s.lastNs);
+        row.text(",");row.field("max_gap_ns",s.maxGapNs);row.text(",");row.field("max_gap_start_ns",s.maxGapStartNs);row.text(",");row.field("max_gap_end_ns",s.maxGapEndNs);row.send();
+        BridgeReply tail;tail.text(",\"max_gap_rip\":\"0x");tail.number(s.maxGapRip,true);tail.text("\",");tail.field("max_gap_cs",s.maxGapCs);
+        tail.text(",");tail.field("slow",s.slow);tail.text(",");tail.field("contended",s.contended);
+        tail.text(",\"saturated\":");tail.text(s.saturated?"true":"false");tail.text("}");tail.send();
+    }
+    const auto endEpoch=TimerIrqArrivalsEpoch();BridgeReply end;
+    end.text("],");end.field("end_epoch",endEpoch);end.text(",\"consistent_epoch\":");
+    end.text(consistent && endEpoch==epoch && online<=capacity?"true":"false");end.text("}\n");end.send();
+}
+
 static void DebugTimerWakeTiming(const TimerWakeSnapshot& s)
 {
     BridgeReply r;r.text("{");r.field("epoch",s.epoch);r.text(",\"enabled\":");r.text((s.epoch&1)?"true":"false");
@@ -3630,6 +3654,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
+            "  timer peers on|off|reset|status - per-CPU timer arrivals (default off)\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
             "  sched timing watch PID - target wake/queue timing; 0 clears target\n"
             "  mapping timing on|off|reset|status - preflight mutex timings (default off)\n"
@@ -4005,6 +4030,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("service_floor_ns",e.serviceFloorNs);r.text(",");r.field("deficit_ns",e.deficitNs);r.text("}");r.send();
         };
         clamp("first_clamp",d.firstClamp);clamp("max_clamp",d.maxClamp);DebugChannelSend("}\n");
+    }
+    else if(NetStrEq(cmd,"timer peers on") || NetStrEq(cmd,"timer peers off") ||
+            NetStrEq(cmd,"timer peers reset") || NetStrEq(cmd,"timer peers status")) {
+        if(NetStrEq(cmd,"timer peers on"))TimerIrqArrivalsEnable(true);
+        else if(NetStrEq(cmd,"timer peers off"))TimerIrqArrivalsEnable(false);
+        else if(NetStrEq(cmd,"timer peers reset"))TimerIrqArrivalsReset();
+        DebugTimerIrqArrivals();
     }
     else if(NetStrEq(cmd,"timer timing on") || NetStrEq(cmd,"timer timing off") ||
             NetStrEq(cmd,"timer timing reset") || NetStrEq(cmd,"timer timing status")) {

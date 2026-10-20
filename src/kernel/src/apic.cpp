@@ -13,6 +13,7 @@
 #include "kvmclock.h"
 #include "tick_clock.h"
 #include "runtime_accounting.h"
+#include "timer_irq_arrivals.h"
 
 // Declared at global scope in idt.cpp
 void IdtInstallHandler(uint8_t vector, void* handler);
@@ -299,12 +300,56 @@ void ValidateIretFrame(const uint64_t* frame)
     }
 }
 
+static SpinLock g_timerIrqControlLock;
+struct alignas(64) TimerIrqArrivalSlot {
+    SpinLock lock;TimerIrqArrivalModel model;uint64_t dropped=0;
+};
+static TimerIrqArrivalSlot g_timerIrqSlots[MAX_CPUS];
+static uint64_t g_timerIrqEpoch=0;
+static bool g_timerIrqExhausted=false;
+static void TimerIrqArrivalsChange(bool enabled,bool clear){
+    // Caller holds control lock. Publish off before resetting individual CPU
+    // slots; a delayed old IRQ sample is rejected by the slot's new epoch.
+    const auto old=__atomic_load_n(&g_timerIrqEpoch,__ATOMIC_ACQUIRE);
+    __atomic_store_n(&g_timerIrqEpoch,old&~uint64_t(1),__ATOMIC_RELEASE);
+    if(g_timerIrqExhausted || old>~uint64_t(0)-2)g_timerIrqExhausted=true;
+    const uint64_t epoch=g_timerIrqExhausted?0:((old&~uint64_t(1))+2)|(enabled?1:0);
+    for(unsigned cpu=0;cpu<MAX_CPUS;++cpu){
+        SpinLockAcquire(&g_timerIrqSlots[cpu].lock);
+        if(clear)g_timerIrqSlots[cpu].model.Reset(epoch);else g_timerIrqSlots[cpu].model.SetEpoch(epoch);
+        SpinLockRelease(&g_timerIrqSlots[cpu].lock);
+    }
+    __atomic_store_n(&g_timerIrqEpoch,epoch,__ATOMIC_RELEASE);
+}
+void TimerIrqArrivalsEnable(bool enabled){
+    SpinLockAcquire(&g_timerIrqControlLock);TimerIrqArrivalsChange(enabled,enabled);SpinLockRelease(&g_timerIrqControlLock);
+}
+void TimerIrqArrivalsReset(){
+    SpinLockAcquire(&g_timerIrqControlLock);
+    TimerIrqArrivalsChange(__atomic_load_n(&g_timerIrqEpoch,__ATOMIC_ACQUIRE)&1,true);
+    SpinLockRelease(&g_timerIrqControlLock);
+}
+uint64_t TimerIrqArrivalsEpoch(){return __atomic_load_n(&g_timerIrqEpoch,__ATOMIC_ACQUIRE);}
+unsigned TimerIrqArrivalsCpuCapacity(){return MAX_CPUS;}
+TimerIrqArrivalSnapshot TimerIrqArrivalsRead(unsigned cpu){
+    if(cpu>=MAX_CPUS)return {};
+    SpinLockAcquire(&g_timerIrqSlots[cpu].lock);auto s=g_timerIrqSlots[cpu].model.Snapshot();SpinLockRelease(&g_timerIrqSlots[cpu].lock);
+    s.contended=__atomic_load_n(&g_timerIrqSlots[cpu].dropped,__ATOMIC_RELAXED);return s;
+}
+
 static SpinLock g_timerWakeLock;
 static TimerWakeTimingModel g_timerWake;
 static uint64_t g_timerWakeEpoch=0,g_timerWakeEntryDrops=0,g_timerWakeRecordDrops=0;
 static void TimerWakeDrop(uint64_t* counter){
     auto old=__atomic_load_n(counter,__ATOMIC_RELAXED);
     while(old!=~uint64_t(0) && !__atomic_compare_exchange_n(counter,&old,old+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+}
+static void TimerIrqArrivalsObserve(uint64_t rip,uint64_t cs){
+    const auto epoch=TimerIrqArrivalsEpoch();if(!(epoch&1))return;
+    const unsigned cpu=SmpCurrentCpuIndex();if(cpu>=MAX_CPUS)return;
+    uint64_t now=0;if(!KvmClockReadStableNs(&now))now=0;
+    if(!SpinLockTryAcquire(&g_timerIrqSlots[cpu].lock)){TimerWakeDrop(&g_timerIrqSlots[cpu].dropped);return;}
+    g_timerIrqSlots[cpu].model.Observe(epoch,now,rip,cs);SpinLockRelease(&g_timerIrqSlots[cpu].lock);
 }
 void TimerWakeTimingEnable(bool enabled){
     SpinLockAcquire(&g_timerWakeLock);g_timerWake.Enable(enabled);
@@ -361,6 +406,7 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
         }
     }
 
+    TimerIrqArrivalsObserve(interruptedRip,interruptedCs);
     const auto timerProbe=TimerWakeTimingBegin(interruptedRip,interruptedCs);
     LapicWrite(LapicReg::EOI, 0);
 
