@@ -1118,3 +1118,57 @@ independent verifiers, frozen manifest and native evidence are retained in
 `decision-trace-verified-results.json` and
 `decision-trace-guest-verified-results.json`. No scheduler default or timing
 safety limit changes are justified by this diagnostic acceptance.
+
+
+## Bounded one-decision deferral experiment (withdrawn)
+
+A private experiment used a default-off MLFQ-only allowance of at most one
+positive periodic Running user decision per CPU commit generation. It skipped
+expiry notification on that decision, retained all accounting/debt/priority,
+and excluded IPIs, stopped/terminal tasks and saturated generations. Counter
+resets and mode toggles could not renew the allowance. Decision records added
+mode/deferral and prior periodic user-boundary flags; existing dispatch samples
+provided age. Both pure-model exclusions and the actual shared MLFQ module's
+unchanged budget/debt and changed-reason recomputation tests passed. All 68
+hosted tests and the supported compiled entry audit passed; Astra found no
+blocking preview/actual-deferral safety inconsistency.
+
+Four fresh private host-load trials used the same frozen experimental kernel
+`48b1b2c5d9a4cf4ebdabdf858b332cd15da451f26f3205cd0c199c30e9d30b91`,
+all thirteen unchanged preceding driver modules, identical load/affinity and
+silent audio, in off/on/on/off order:
+
+| Trial | Accepted game workload | Observed demo | Audio accepted | Native sample-gap faults | Global deferrals |
+| --- | --- | --- | --- | --- | --- |
+| off-1 | no: missing END | unavailable | no | 0 | 0 |
+| on-1 | yes | 41.802 s | no | 0 | 787 |
+| on-2 | yes | 41.566 s | no | 0 | 943 |
+| off-2 | yes | 38.325 s | no | 1 | 0 |
+
+The first game engine exits zero, but its required END marker is absent and
+the original Python workload exits one. It is a failed workload, not a timing
+control. The original strict verifier rejects it; a separate classification
+verifier checks that exact negative outcome while preserving all remaining
+CPU-clock, trace, lifecycle, filesystem and saved-data gates. No END interval
+is invented and the original gate is not relaxed. This limits the completeness
+of the alternating comparison.
+
+All original host-load/CPU-clock jobs drain successfully; all four original VM,
+router, filesystem and saved-data checks pass. The enabled controls prove the
+allowance was exercised: retained selected-writer events include ten and seven
+deferrals, respectively; zero and one of these had a prior periodic user
+boundary in that dispatch. These are retained-event counts, not a complete
+writer distribution. They are compatible with deferring early-return
+preemptions, but there is no full-window audio success and no demonstrated
+workload speed improvement. Absence of a native fault in those two runs does
+not prove timely host audio or a fix for the earlier multi-second interruption.
+
+The unsuccessful behavior change was withdrawn from the working source after
+archiving its exact patch/header, model/module tests, frozen image manifest,
+controllers, independent verifiers and all outcomes in `preempt-grace-sources`.
+The private immutable experimental capsule remains available for reproduction;
+regular source and the live-review baseline retain committed scheduler behavior.
+`preempt-grace-summary.json` and `preempt-grace-classified-results.json` preserve
+the distinct negative and positive workload outcomes. This experiment does not
+rule out preemption as a contributing mechanism, establish uniform IRQ/host
+execution attribution, or finish the broader timing/scheduling goal.
