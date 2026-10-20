@@ -95,3 +95,46 @@ Keep the handoff optional. Next repeat the comparison to assess presentation
 variance, then attribute long ready-queue waits and remaining device service
 delays. Scheduler-default acceptance, broader timeout/ownership audits and the
 historical playback-speedup reproduction remain open.
+
+## Reverse-order repetition
+
+Four more fresh boots use the identical frozen kernel, modules and fixture.
+This time shared mode precedes BSP mode for each policy. The raw records and
+same strict verifier are under ignored `wake-handoff-repeat`.
+
+| Run | Policy/mode | Max completed-scan gap | Mixer recorded deadline lateness | Mixer max ready-queue wait | Mixer max sleep excess over nominal 10 ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| wr-es2 | EEVDF/shared | 3.005 ms | 2 ms | 35.092 ms | 35.076 ms |
+| wr-eb2 | EEVDF/BSP | 133.118 ms | 131 ms | 43.209 ms | 172.340 ms |
+| wr-ms2 | MLFQ/shared | 2.700 ms | 2 ms | 57.958 ms | 57.214 ms |
+| wr-mb2 | MLFQ/BSP | 143.990 ms | 130 ms | 46.709 ms | 129.799 ms |
+
+Both orders reproduce the targeted result: shared mode's completed-scan gap is
+2.700–3.019 ms and the watched mixer's maximum deadline-to-ready lateness is
+2 ms. BSP timer-entry gaps themselves remain; AP handoff does not repair timer
+delivery, host device waits, or the BSP-only housekeeping paths. Both repeated
+shared runs' worst retained mixer sleeps again include a watch event ready at
+its deadline followed by a long queue wait.
+
+| Repeated metric | EEVDF/shared | EEVDF/BSP | MLFQ/shared | MLFQ/BSP |
+| --- | ---: | ---: | ---: | ---: |
+| Periodic helper p95 lateness | 1.610 ms | 2.995 ms | 21.910 ms | 23.579 ms |
+| Periodic helper maximum lateness | 13.269 ms | 152.479 ms | 48.001 ms | 133.777 ms |
+| CPU batches | 6,007,817 | 6,109,865 | 5,951,861 | 5,970,441 |
+| Buffered loaded browser callbacks/page second | 4.421 | 4.927 | 7.068 | 6.827 |
+
+EEVDF/shared has lower browser callback rate in **both** pairs, by about 8–10%,
+and CPU throughput is about 1.3% lower across those two pairs. MLFQ browser
+results change direction between pairs. The measurements therefore support a
+wakeup-availability improvement, not a general desktop speedup or promotion to
+defaults. Two pairs are still too few to establish a stable performance
+distribution. All eight original/repeated runs pass runtime/clock gates, heap,
+tracked-lineage drain, original launcher/router, filesystems and saved-data
+preservation, with no native HDA faults. The repeated VMs are stopped.
+
+Source review identifies two remaining mechanisms to distinguish with targeted
+queue evidence: EEVDF gives tasks equal initial weight (the priority hint sets
+request length), and `SchedulerTimerTick` returns before arbitrary preemption
+when the interrupted context is kernel mode. A ready-queue wait alone cannot
+identify eligibility/debt, dispatch opportunities or long unpreemptible kernel
+ownership. Do not tune weights or shorten requests from that wait alone.
