@@ -1225,3 +1225,39 @@ fairness and accounting plus mixed-workload/audio latency under quiet and
 bounded host contention; keep per-core queues and EEVDF as separate comparisons.
 No lock algorithm, hypercall, scheduler default or live-review image is changed
 by this source audit.
+
+## Saved-profile check: interrupt delivery at unlock boundaries
+
+An independent offline check of all three `q2-syscall-profile-try-*` captures
+uses their exact frozen kernel (`ef6f0c9799b0bdddb035c4cd37fbd3fd419fc70942cb844bc96b8b748b646d2f`),
+verifies exported sample/switch counts and zero drops, and decodes the original
+ELF instruction bytes. Three frequent leaves are exactly the first possible
+maskable interrupt boundary after an `sti` and its following instruction:
+
+| Function | STI offset | Instruction in interrupt shadow | Sampled offset |
+| --- | --- | --- | --- |
+| `SchedulerKernelRegionEnter` | `+0x97` | `add $8,%rsp` | `+0x9c` |
+| `SchedulerKernelRegionLeave` | `+0x96` | `add $8,%rsp` | `+0x9b` |
+| `SchedulerBlockImpl` | `+0x287` | `test %r14b,%r14b` | `+0x28b` |
+
+The [Intel instruction reference](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf)
+describes the delayed interrupt recognition following STI. Brook samples the
+interrupted RIP from its LAPIC ISR, so a timer held pending while IF is clear
+can be observed at this later boundary. It cannot sample the preceding
+IF-cleared ticket loop directly.
+
+These three exact leaves account for 289/1219 (23.7%), 200/679 (29.5%) and
+271/524 (51.7%) delivered samples. Each capture contains boundary samples on
+all eight vCPUs. This establishes a widespread exposure to delivery-boundary
+bias, not CPU occupancy in the named functions, the duration of preceding
+lock waits, or proof that every such interrupt was pending during a lock.
+Other leaves may also be biased. Do not subtract these counts and label the
+remaining distribution an unbiased CPU profile.
+
+The earlier timer-stage durations independently measure waiting; these profile
+counts cannot replace or apportion them among lock holders and ticket
+successors. Per-CPU samples alone therefore cannot answer the proposed
+holder-descheduling question. `profile-irq-boundary-analysis.json` retains raw
+profile hashes, per-CPU counts, exact STI/shadow/resume instruction receipts
+and the scope limitation; `profile-irq-boundary-sources` preserves the checker.
+No VM restart, kernel instrumentation or scheduler behavior change was needed.
