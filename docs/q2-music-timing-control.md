@@ -1,5 +1,49 @@
 # Quake II music and demo timing control
 
+## Current MLFQ follow-up
+
+A fresh private GL3 1280×720 music-only run uses the tested MLFQ wakeup
+preemption module, default BSP wake scanning, the same frozen kernel as the
+[matched browser comparisons](mlfq-wakeup-preemption.md), and SDL audio into
+the private 44.1-kHz PipeWire null sink. Callback HDA and requested 20-ms output
+buffering are checked. No added CPU workers run in this game smoke test.
+
+The nominal 15.1-second segment has a guest-observed marker interval of
+15.2415 seconds. That does not reproduce the large game-time acceleration.
+Host marker polls lag log production and cannot be treated as precise bounds
+on execution of the markers. The guest interval alone is not a host-referenced
+clock calibration.
+
+The eight-second capture contains 8.0196 seconds of PCM over 8.0070 host seconds,
+with at most one silent 10-ms bin at RMS threshold 10 in s16 units. No sampled
+stream discontinuity or native HDA fault occurs. **This does not establish
+correct music progression:** whole-capture spectral alignment instead prefers
+about 0.825× source tempo (similarity 0.796). The first 0–3 seconds, middle
+3–6 seconds and final 5–8 seconds prefer 0.805×, 0.820× and 0.845× respectively,
+with similarities 0.828–0.841. The varying fits are not proof of a uniform clock
+rate or a pitch change. Repeated/delayed non-silent audio remains possible.
+
+The initial 0.85–1.65 search landed at its lower edge, so the retained follow-up
+widens the range to 0.50–1.65. Independently generated 1× and pitch-preserving
+1.3× controls recover 1.000×/1.300× with similarities 0.948/0.913. Thus this is
+a supported slower-source-progression lead, not a fitted historical speedup or
+a reason to claim the music is fixed. It still needs a matched old-module
+control and repeat before attributing it to MLFQ or any other component.
+
+The game job exits zero with no live lineage tasks. Runtime/clock checks pass,
+all eight pvclock/steal slots are active, policy service exactly matches the
+kernel ledger, walked/reported queue counts agree, and heap checks pass.
+Original launcher/router completion, four offline filesystems and saved-data
+preservation pass. The VM and private services stop. The locally extracted OST
+hash matches the user's original; all recordings, game data and analysis
+artifacts remain ignored under `q2-mlfq-current`. `music-rate-check.json` retains
+subwindow results, control results and input/script SHA-256 identities. The
+initial host-Python NumPy import failure and successful isolated Nix analysis
+are retained separately. No copyrighted asset is committed or put in a Nix
+derivation.
+
+## Earlier controls
+
 Two fresh private Brook runs exercise GL3 at 1280×720 with a known local music
 track. Both complete the bounded demo and shut down cleanly. Neither establishes
 uninterrupted music acceptance: the first mixes sound effects into the capture;
