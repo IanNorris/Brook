@@ -67,6 +67,10 @@ callbacks increase about 23%, and CPU batches decrease about 8%. These few
 repeats show a useful responsiveness tradeoff, not statistical confidence or
 general desktop acceptance. Silence results overlap and do not establish an
 audio continuity fix. Residual 23–26 ms ready waits and mixer service gaps remain.
+The fixed-work CPU batch max/min ratios are 1.024/1.016 in controls and
+1.105/1.074 in candidates: every worker progresses, but short-run background
+work distribution becomes less even. These are batch counts, not measured
+per-thread service shares or a long-term starvation bound.
 Captured PCM rate stays close to one; historical accelerated playback is not
 reproduced or conclusively explained by this experiment.
 
@@ -96,7 +100,10 @@ affinity rejection or assembly context-switch correctness.
 
 The initial candidate passed all 66 hosted suites, thirteen-module import audit
 and the compiled entry audit (twelve supported templates, 56 mutations; four
-paths unsupported). Additional review tests are recorded separately. Broader
+paths unsupported). The additional review tests pass in the existing Nix
+toolchain (`mlfq-wakeup-review-tests-nix.log`); an initial direct build outside
+that shell fails to locate libc++, so it is retained as an environment failure.
+Broader
 desktop/gaming acceptance, default BSP wake scanning, adversarial yield
 behavior and direct EEVDF eligibility/debt diagnostics remain open. This is an
 optional policy improvement, not a default scheduler decision.
