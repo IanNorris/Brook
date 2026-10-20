@@ -3305,6 +3305,26 @@ static void DebugEpollDiagnostics()
     DebugChannelSend("]}\n");
 }
 
+static void DebugTimerWakeTiming(const TimerWakeSnapshot& s)
+{
+    BridgeReply r;r.text("{");r.field("epoch",s.epoch);r.text(",\"enabled\":");r.text((s.epoch&1)?"true":"false");
+    r.text(",");r.field("arrivals",s.arrivals);r.text(",");r.field("completed",s.completed);r.text(",");r.field("invalid_clock",s.invalidClock);
+    r.text(",");r.field("max_gap_ns",s.maxGapNs);r.text(",");r.field("max_prefix_ns",s.maxPrefixNs);
+    r.text(",");r.field("max_runtime_ns",s.maxRuntimeNs);r.text(",");r.field("max_pre_scan_ns",s.maxPreScanNs);r.text(",");r.field("max_scan_ns",s.maxScanNs);r.send();
+    BridgeReply counts;counts.text(",");counts.field("slow",s.slow);counts.text(",");counts.field("excluded",s.excluded);
+    counts.text(",");counts.field("contended_entries",s.contendedEntries);counts.text(",");counts.field("contended_records",s.contendedRecords);
+    counts.text(",\"saturated\":");counts.text(s.saturated?"true":"false");counts.text(",\"scope\":\"BSP LAPIC IRQ C-entry after GS guard to blocked wake-scan end; excludes IPIs; gaps include earlier handler work, IRQ masking and host delay; top 16 completed slow events, not timeline; contention counts since boot\",\"events\":[");counts.send();
+    for(unsigned i=0;i<s.retained;++i){const auto& e=s.events[i];BridgeReply row;
+        if(i)row.text(",");row.text("{");row.field("sequence",e.token.sequence);row.text(",");row.field("previous_arrival_ns",e.token.previousArrivalNs);
+        row.text(",");row.field("arrival_ns",e.token.arrivalNs);row.text(",");row.field("scheduler_ns",e.schedulerNs);
+        row.text(",");row.field("after_runtime_ns",e.afterRuntimeNs);row.text(",");row.field("before_scan_ns",e.beforeScanNs);row.text(",");row.field("after_scan_ns",e.afterScanNs);
+        row.text(",");row.field("gap_ns",e.token.gapNs);row.text(",");row.field("prefix_ns",e.prefixNs);row.text(",");row.field("runtime_ns",e.runtimeNs);
+        row.text(",");row.field("pre_scan_ns",e.preScanNs);row.text(",");row.field("scan_ns",e.scanNs);row.text(",");row.field("candidates",e.candidates);
+        row.text(",\"interrupted_rip\":\"0x");row.number(e.token.rip,true);row.text("\",");row.field("interrupted_cs",e.token.cs);row.text("}");row.send();
+    }
+    DebugChannelSend("]}\n");
+}
+
 static void DebugReadyWatch(const ReadyWatchSnapshot& s)
 {
     BridgeReply r;r.text(",\"watch\":{");r.field("pid",s.pid);r.text(",");r.field("incarnation",s.incarnation);
@@ -3602,6 +3622,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio stats - cached stream queues, completion and guest clock\n"
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
+            "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
             "  sched timing watch PID - target wake/queue timing; 0 clears target\n"
             "  mapping timing on|off|reset|status - preflight mutex timings (default off)\n"
@@ -3977,6 +3998,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("service_floor_ns",e.serviceFloorNs);r.text(",");r.field("deficit_ns",e.deficitNs);r.text("}");r.send();
         };
         clamp("first_clamp",d.firstClamp);clamp("max_clamp",d.maxClamp);DebugChannelSend("}\n");
+    }
+    else if(NetStrEq(cmd,"timer timing on") || NetStrEq(cmd,"timer timing off") ||
+            NetStrEq(cmd,"timer timing reset") || NetStrEq(cmd,"timer timing status")) {
+        if(NetStrEq(cmd,"timer timing on"))TimerWakeTimingEnable(true);
+        else if(NetStrEq(cmd,"timer timing off"))TimerWakeTimingEnable(false);
+        else if(NetStrEq(cmd,"timer timing reset"))TimerWakeTimingReset();
+        DebugTimerWakeTiming(TimerWakeTimingRead());
     }
     else if(StrStartsWith(cmd,"sched timing watch ")) {
         const char* a=cmd+sizeof("sched timing watch ")-1;uint32_t pid=0;bool valid=*a!=0;

@@ -33,6 +33,8 @@ def main():
                         help='Optional preflight mapping-lock counters; diagnostic cohort only')
     parser.add_argument('--audio-service-timing',action='store_true',
                         help='Optional mixer sleep/service brackets; diagnostic cohort only')
+    parser.add_argument('--timer-wakeup-timing',action='store_true',
+                        help='Optional BSP timer IRQ and blocked wake-scan brackets; diagnostic cohort only')
     args=parser.parse_args();phase,policy=args.phase,args.policy
     if not re.fullmatch('[a-z0-9-]{1,48}',phase):parser.error('Use a lowercase alphanumeric phase name')
     review=args.review.resolve();metadata=json.loads((review/'candidate.json').read_text())
@@ -65,9 +67,10 @@ def main():
     if has('measurement-mode'):
      assert read('measurement-mode')['mapping_timing']==args.mapping_timing,'Do not change diagnostic mode when resuming a cohort'
      assert read('measurement-mode').get('audio_service_timing',False)==args.audio_service_timing,'Do not change audio diagnostic mode when resuming'
+     assert read('measurement-mode').get('timer_wakeup_timing',False)==args.timer_wakeup_timing,'Do not change timer diagnostic mode when resuming'
     else:
-     assert not (args.mapping_timing or args.audio_service_timing) or not has('harness'),'Do not enable new counters in an existing cohort'
-     save('measurement-mode',dict(mapping_timing=args.mapping_timing,audio_service_timing=args.audio_service_timing))
+     assert not (args.mapping_timing or args.audio_service_timing or args.timer_wakeup_timing) or not has('harness'),'Do not enable new counters in an existing cohort'
+     save('measurement-mode',dict(mapping_timing=args.mapping_timing,audio_service_timing=args.audio_service_timing,timer_wakeup_timing=args.timer_wakeup_timing))
     def diagnostic_control(name,command):
      if has(name):return read(name)
      if has(name+'-intent'):raise RuntimeError('Uncertain diagnostic control delivery; inspect current epoch before resuming')
@@ -130,6 +133,8 @@ def main():
       diagnostic_control('mapping-enable','mapping timing on');diagnostic_control('mapping-idle-before','mapping timing reset')
      if args.audio_service_timing:
       diagnostic_control('audio-service-enable','audio timing on');diagnostic_control('audio-service-idle-before','audio timing reset')
+     if args.timer_wakeup_timing:
+      diagnostic_control('timer-wake-enable','timer timing on');diagnostic_control('timer-wake-idle-before','timer timing reset')
      b.server.guest(d,'sched timing on');b.server.guest(d,'sched timing reset');save('idle-begin',states()[-1])
     if not has('idle'):
      first=read('idle-begin');deadline=time.monotonic()+90
@@ -143,6 +148,10 @@ def main():
      save('mapping-idle-after',b.server.guest(d,'mapping timing status'))
     if args.audio_service_timing and not has('audio-service-idle-after'):
      save('audio-service-idle-after',b.server.guest(d,'audio timing status'))
+    if args.timer_wakeup_timing and not has('timer-wake-idle-after'):
+     save('timer-wake-idle-after',b.server.guest(d,'timer timing status'))
+    if args.timer_wakeup_timing and not has('timer-wake-load-before'):
+     diagnostic_control('timer-wake-load-before','timer timing reset')
     if args.audio_service_timing and not has('audio-service-load-before'):
      diagnostic_control('audio-service-load-before','audio timing reset')
     if args.mapping_timing and not has('mapping-load-before'):
@@ -198,6 +207,8 @@ def main():
      diagnostic_control('mapping-load-after','mapping timing off')
     if args.audio_service_timing and not has('audio-service-load-after'):
      diagnostic_control('audio-service-load-after','audio timing off')
+    if args.timer_wakeup_timing and not has('timer-wake-load-after'):
+     diagnostic_control('timer-wake-load-after','timer timing off')
     if args.profile_ms and not has('profile-export'):
      deadline=time.monotonic()+60
      while 'RUNNING' in b.server.profile(s,action='status').get('reply',''):
@@ -241,6 +252,7 @@ def main():
     summary['profile_ms']=args.profile_ms
     summary['mapping_timing']=args.mapping_timing
     summary['audio_service_timing']=args.audio_service_timing
+    summary['timer_wakeup_timing']=args.timer_wakeup_timing
     c0,c1=capture['host_monotonic_interval']
     summary['audio_capture_inside_load']=load_start<=c0*1e9<=c1*1e9<=load_end
     save('summary',summary);save('rms-10ms',levels);print('MIX_SUMMARY',json.dumps(summary),flush=True)

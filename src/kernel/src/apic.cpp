@@ -210,7 +210,7 @@ bool ApicInitElapsedClock()
 }
 
 // Forward-declare scheduler tick (defined in scheduler.cpp).
-void SchedulerTimerTick(bool allowPreempt);
+void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe);
 
 // Forward-declare thread state dump (defined in scheduler.cpp).
 void SchedulerDumpThreadStates();
@@ -298,6 +298,40 @@ void ValidateIretFrame(const uint64_t* frame)
     }
 }
 
+static SpinLock g_timerWakeLock;
+static TimerWakeTimingModel g_timerWake;
+static uint64_t g_timerWakeEpoch=0,g_timerWakeEntryDrops=0,g_timerWakeRecordDrops=0;
+static void TimerWakeDrop(uint64_t* counter){
+    auto old=__atomic_load_n(counter,__ATOMIC_RELAXED);
+    while(old!=~uint64_t(0) && !__atomic_compare_exchange_n(counter,&old,old+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+}
+void TimerWakeTimingEnable(bool enabled){
+    SpinLockAcquire(&g_timerWakeLock);g_timerWake.Enable(enabled);
+    __atomic_store_n(&g_timerWakeEpoch,g_timerWake.Epoch(),__ATOMIC_RELEASE);SpinLockRelease(&g_timerWakeLock);
+}
+void TimerWakeTimingReset(){
+    SpinLockAcquire(&g_timerWakeLock);g_timerWake.Reset();
+    __atomic_store_n(&g_timerWakeEpoch,g_timerWake.Epoch(),__ATOMIC_RELEASE);SpinLockRelease(&g_timerWakeLock);
+}
+TimerWakeSnapshot TimerWakeTimingRead(){
+    SpinLockAcquire(&g_timerWakeLock);auto s=g_timerWake.Snapshot();SpinLockRelease(&g_timerWakeLock);
+    s.contendedEntries=__atomic_load_n(&g_timerWakeEntryDrops,__ATOMIC_RELAXED);
+    s.contendedRecords=__atomic_load_n(&g_timerWakeRecordDrops,__ATOMIC_RELAXED);return s;
+}
+uint64_t TimerWakeTimingNow(){uint64_t now=0;return KvmClockReadStableNs(&now)?now:0;}
+TimerWakeToken TimerWakeTimingBegin(uint64_t rip,uint64_t cs){
+    const auto epoch=__atomic_load_n(&g_timerWakeEpoch,__ATOMIC_ACQUIRE);
+    if(!(epoch&1) || ApicGetId()!=0)return {};
+    const auto now=TimerWakeTimingNow();
+    if(!SpinLockTryAcquire(&g_timerWakeLock)){TimerWakeDrop(&g_timerWakeEntryDrops);return {};}
+    const auto t=g_timerWake.Begin(epoch,now,rip,cs);SpinLockRelease(&g_timerWakeLock);return t;
+}
+void TimerWakeTimingComplete(const TimerWakeToken& t,uint64_t scheduler,uint64_t runtime,
+                             uint64_t scan,uint64_t end,uint32_t candidates){
+    if(!SpinLockTryAcquire(&g_timerWakeLock)){TimerWakeDrop(&g_timerWakeRecordDrops);return;}
+    g_timerWake.Complete(t,scheduler,runtime,scan,end,candidates);SpinLockRelease(&g_timerWakeLock);
+}
+
 // C handler called from the naked ISR wrapper below.
 // interruptedRip/interruptedCs/interruptedRbp are passed from the naked
 // handler (extracted from the CPU interrupt frame on the stack).
@@ -323,6 +357,7 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
         }
     }
 
+    const auto timerProbe=TimerWakeTimingBegin(interruptedRip,interruptedCs);
     LapicWrite(LapicReg::EOI, 0);
 
     // BRO-179: passive TLB-epoch flush. If the quarantine drainer has bumped the
@@ -374,7 +409,7 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
     // non-idle work when the interrupted context was user mode; Brook kernel
     // code is not generally safe to timeslice while holding internal locks.
     bool userMode = (interruptedCs & 3) != 0;
-    SchedulerTimerTick(userMode);
+    SchedulerTimerTick(userMode,timerProbe.epoch?&timerProbe:nullptr);
 }
 
 // Naked ISR entry for LAPIC timer (vector 32).
@@ -738,7 +773,7 @@ extern "C" void ReschedIpiHandlerInner(uint64_t interruptedCs)
     // (KMutex, KRwLock, ticket locks) that would deadlock or corrupt
     // callee-saved register state if the process were descheduled mid-hold.
     bool userMode = (interruptedCs & 3) != 0;
-    SchedulerTimerTick(userMode);
+    SchedulerTimerTick(userMode,nullptr);
 }
 
 __attribute__((naked))

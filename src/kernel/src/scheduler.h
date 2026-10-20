@@ -42,7 +42,8 @@ void SchedulerContinue(Process* proc);
 // Called from the LAPIC timer ISR on each CPU. `allowPreempt` should be true
 // only when the interrupted context was preemptible user mode; wakeups and idle
 // dispatch still run when false.
-void SchedulerTimerTick(bool allowPreempt);
+struct TimerWakeToken;
+void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe=nullptr);
 
 // Yield the current timeslice voluntarily.
 extern "C" void SchedulerYield();

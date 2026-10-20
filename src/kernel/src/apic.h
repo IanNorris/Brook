@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "timer_wakeup_timing.h"
 
 // APIC subsystem — Local APIC init, PIC disable, LAPIC timer.
 //

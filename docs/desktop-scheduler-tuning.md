@@ -189,3 +189,11 @@ resume sample. A corresponding MLFQ episode has 90 ms lateness and 17 ms queue
 wait, but that control fails runtime accounting with four clamped-service
 samples and remains unaccepted. This supports measuring BSP timer/wakeup paths
 and accounting skew before changing quantum, timer ownership or defaults.
+
+The [BSP timer probe](bsp-timer-wakeup-timing.md) then correlates mixer wakeups
+with 83–108 ms gaps between actual timer C-entries. Measured entry-to-scan stages
+remain below 0.16 ms in both loaded cohorts. This narrows those episodes to
+delay before timer entry plus subsequent queue wait, while leaving host steal,
+later handler work, emulation delays and IRQ masking to be separated. Both
+cohorts pass runtime/preservation gates; this is diagnostic evidence, not a
+policy/default acceptance result.

@@ -1635,7 +1635,7 @@ Process* SchedulerCurrentProcess()
 // ---------------------------------------------------------------------------
 
 // Check blocked processes for timed wakeups (called with NO locks held).
-static void CheckBlockedWakeups()
+static uint32_t CheckBlockedWakeups()
 {
     uint64_t now = ApicTickCount();
     Process* toUnblock[MAX_PROCESSES];
@@ -1668,6 +1668,7 @@ static void CheckBlockedWakeups()
         SchedulerUnblock(toUnblock[i]);
         ReleaseSchedulerReference(toUnblock[i], false);
     }
+    return unblockCount;
 }
 
 // Reap terminated processes.
@@ -2049,10 +2050,11 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 #endif
 }
 
-void SchedulerTimerTick(bool allowPreempt)
+void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe)
 {
     if (!g_schedulerRunning)
         return;
+    const uint64_t timerScheduler=timerProbe?TimerWakeTimingNow():0;
 
     {
         const uint64_t runtimeFlags = SchedLockAcquire(g_readyLock);
@@ -2060,6 +2062,8 @@ void SchedulerTimerTick(bool allowPreempt)
         RuntimeChargeLocked(runtimeCpu, RuntimeNow(runtimeCpu));
         SchedLockRelease(g_readyLock, runtimeFlags);
     }
+
+    const uint64_t timerRuntime=timerProbe?TimerWakeTimingNow():0;
 
     // Drain pendingRetire on EVERY CPU, every tick. Without this, a process
     // that exits on CPU N while idle is running may leave pendingRetire set
@@ -2077,7 +2081,10 @@ void SchedulerTimerTick(bool allowPreempt)
         uint64_t timerFlags = SchedLockAcquire(g_allProcLock);
         PosixTimersTickLocked(g_allProcesses, g_processCount);
         SchedLockRelease(g_allProcLock, timerFlags);
-        CheckBlockedWakeups();
+        const uint64_t timerScan=timerProbe?TimerWakeTimingNow():0;
+        const auto wakeCandidates=CheckBlockedWakeups();
+        if(timerProbe)TimerWakeTimingComplete(*timerProbe,timerScheduler,timerRuntime,
+            timerScan,TimerWakeTimingNow(),wakeCandidates);
 
         // Check alarm timers for all processes
         uint64_t now = ApicTickCount();
