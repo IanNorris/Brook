@@ -15,16 +15,18 @@ correct BSP identification on arbitrary physical hardware.
 
 ## Brackets
 
-The enabled probe samples the stable KVM clock at five points:
+The enabled probe samples the stable KVM clock at six points:
 
 1. Timer C-handler entry after its GS invariant guard, before EOI and TLB work.
 2. Entry to the running scheduler's timer body.
 3. After its initial ready-lock acquisition, runtime charge and release.
 4. After post-switch draining and POSIX-timer handling, before blocked scanning.
 5. After the blocked scan, candidate unblocking and reference release return.
+6. After BSP alarm handling, reaping, device checks, policy tick and load sampling,
+   before the later scheduling/preemption decision.
 
-The event records all raw nanosecond stamps and their four intervening durations:
-`prefix_ns`, `runtime_ns`, `pre_scan_ns` and `scan_ns`. They include host
+The event records all raw nanosecond stamps and their intervening durations:
+`prefix_ns`, `runtime_ns`, `pre_scan_ns`, `scan_ns` and `tail_ns`. They include host
 descheduling and lock waits inside each bracket, not just CPU instructions.
 Candidate count includes snapshotted timed, pending and resume wake candidates;
 it is not a count of successful ready transitions or expired timers.
@@ -37,6 +39,25 @@ GS guard precede the first sample. Other BSP reschedule IPIs may scan wakeups
 between these timer samples; this is not an inventory of every wake scan.
 Interrupted RIP/CS describes the context at arrival, not proof of which earlier
 instruction caused a delay.
+
+The entry wall sample is bracketed with two BSP steal reads and retried if that
+record changes. `has_steal` identifies a valid available sample;
+`has_steal_gap` additionally requires a preceding entry with a valid monotonic
+steal sample in the same control epoch. Missing/failed pairs preserve the raw
+timer observation using a separate clock read and increment
+`missing_steal_entries`. Counter regression and a steal delta exceeding the
+entry gap are reported separately, rather than silently clamped. The report
+retains both raw steal values and their delta. Pair retries can move the chosen
+wall sample later within entry collection; it is not an assembly-entry timestamp.
+Stable individual records are not an atomic host-delay oracle. A gap minus its
+reported steal delta is an estimate, not guest CPU time or proof of IRQ masking;
+QEMU emulation or blocking outside runnable-host delay can remain unaccounted.
+
+`tail_ns` ends after BSP housekeeping, before the later preemption decision or
+context switch. It includes any blocking/host delay in that work. `completion_cpu`
+is sampled near completion, and `migrated` counts non-BSP completion samples.
+The probe observes such a case rather than changing the existing dispatch path.
+It does not measure every later instruction until IRET.
 
 `max_gap_ns` covers observed entries even if their stage record is incomplete.
 Stage maxima and `completed` cover only complete valid records. The report
@@ -76,7 +97,7 @@ handling for controls. Native comparison uses a common frozen set of thirteen
 modules; only the kernel and symbol-address table change from the preceding
 clamp-evidence capsule. Recording overhead is not quantified by hosted tests.
 
-## Native evidence
+## Initial native evidence
 
 Fresh private eight-vCPU/six-GiB EEVDF and MLFQ boots use the generated local
 Firefox video/audio fixture and twenty-four CPU workers for thirty seconds.
@@ -142,3 +163,75 @@ do not guarantee atomic wall/steal publication, as the
 emulation delays and vCPU-idle handling are also distinct from guest work with
 interrupts masked. The present probe does not settle those alternatives or
 establish a scheduler performance win.
+
+## Paired-steal and housekeeping controls
+
+The extended probe passes all 65 hosted suites, the thirteen-module import audit
+and the twelve supported compiled entry templates/56 mutation checks. Hosted
+cases additionally cover absent/first/backwards steal samples, deltas exceeding
+their wall gap, an unavailable final clock and migration metadata. Four entry
+paths remain outside the structural audit. The new frozen kernel is
+`1c411ad8e9d64be7645e8f2c929d7a991fd04af3fd68b18a6804ff49b0708f2c`;
+all thirteen modules remain byte-identical to the initial probe capsule.
+
+Two fresh private boots repeat the same browser/audio/CPU fixture:
+
+| Run | Policy | Completed entries | Largest entry gap | Steal delta for that gap | Maximum measured housekeeping tail |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ts-e1 | EEVDF | 31,541 | 115.853 ms | 23.007 us | 62.521 us |
+| ts-m1 | MLFQ | 33,848 | 104.163 ms | 15.072 us | 35.579 us |
+
+Every observed entry has a completed record. Neither probe reports a dropped
+observation, invalid clock, missing/backwards steal pair, excessive steal delta,
+migration or saturation. EEVDF retains all fourteen slow events; MLFQ retains
+sixteen of twenty-seven, exposing eleven exclusions. The retained steal deltas
+range from zero to 34.343 us for EEVDF and 3.269–85.704 us for MLFQ. Twelve EEVDF
+and ten retained MLFQ episodes lie wholly inside the CPU workload interval;
+other records are not silently labelled loaded performance results.
+
+These reports make the measured housekeeping tail and reported host runnable
+delay insufficient explanations for those retained gaps. They do not exclude
+host emulation/blocking or IRQ-masked kernel paths outside the measured stages.
+Some arrival RIPs symbolize to `SchedulerBlockImpl` just after STI, a Unix socket
+readiness check and the virtio GPU completion-poll pause lambda. Others interrupt
+the user CPU loop. Arrival context alone does not establish the delaying caller.
+No change to those paths is justified solely by these sampled RIPs.
+
+Both browser boots pass runtime-accounting gates, original launcher/router exit,
+all four filesystem checks and saved-data preservation. No native HDA fault is
+logged. Their task/mixer probes also have valid clocks and no saturation or
+mixer contention drops. Ignored `timer-steal-cohorts` evidence includes frozen
+source hashes, exact raw samples, gate receipts and a correlation verifier.
+
+## CPU/audio isolation
+
+A third fresh EEVDF boot uses that identical kernel and modules without starting
+Firefox or Chromium. It plays thirty seconds of generated packet-coded audio,
+first without CPU workers and then with twenty-four CPU workers for twelve
+seconds. All probes are enabled around each audio run. The kernel compositor
+and desktop services still run: this is a no-browser comparison, not a GPU-free
+or otherwise identical application workload. Counter windows include command
+setup/drain; the loaded eight-second capture is verified inside the CPU interval.
+
+| CPU workers | Completed timer records | Maximum entry gap | Slow timer episodes | Full audio completion |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 41,431 | 11.761 ms | 0 | 29.9916 guest s |
+| 24 | 34,738 | 10.934 ms | 0 | 30.0384 guest s |
+
+Both probes have no invalid clocks, dropped/missing/regressing/inconsistent
+steal observations, migration or saturation. All 1,323,000 application frames
+complete per run. The eight-second coded captures have approximately 1.0000
+pitch scale and 1.00014 source seconds per PCM second, with no missing packet
+IDs between retained runs or reversed/repeated transitions. These sampled
+windows do not prove continuity of every frame in the full thirty-second output.
+The original launcher/router, offline result size/SHA verification, runtime,
+filesystem and saved-data gates pass. No native HDA fault occurs. Evidence is
+under ignored `timer-steal-packet-isolation`; all VMs and private services stop.
+
+Generic CPU pressure alone does not reproduce the long browser-associated entry
+gaps in this isolation boot. Next distinguish long IRQ-masked scheduler/kernel
+sections from QEMU/device-emulation delays under browser activity. The current
+QEMU binary exposes `kvm_run_exit` and virtio GPU command/fence trace events,
+which may help attribute host-side delays without another guest policy change.
+The scheduler fairness and historical playback-speedup investigations remain
+open; no default or quantum change is made here.

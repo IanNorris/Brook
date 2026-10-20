@@ -2083,8 +2083,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe)
         SchedLockRelease(g_allProcLock, timerFlags);
         const uint64_t timerScan=timerProbe?TimerWakeTimingNow():0;
         const auto wakeCandidates=CheckBlockedWakeups();
-        if(timerProbe)TimerWakeTimingComplete(*timerProbe,timerScheduler,timerRuntime,
-            timerScan,TimerWakeTimingNow(),wakeCandidates);
+        const uint64_t timerScanEnd=timerProbe?TimerWakeTimingNow():0;
 
         // Check alarm timers for all processes
         uint64_t now = ApicTickCount();
@@ -2155,6 +2154,8 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe)
             g_loadAvg5  = (g_loadAvg5  * LOAD_DECAY_5  + sample * (1000 - LOAD_DECAY_5))  / 1000;
             g_loadAvg15 = (g_loadAvg15 * LOAD_DECAY_15 + sample * (1000 - LOAD_DECAY_15)) / 1000;
         }
+        if(timerProbe)TimerWakeTimingComplete(*timerProbe,timerScheduler,timerRuntime,
+            timerScan,timerScanEnd,wakeCandidates,TimerWakeTimingNow(),ThisCpu());
     }
 
     Process* cur = g_perCpu[cpu].currentProcess;

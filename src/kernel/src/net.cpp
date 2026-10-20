@@ -3310,17 +3310,24 @@ static void DebugTimerWakeTiming(const TimerWakeSnapshot& s)
     BridgeReply r;r.text("{");r.field("epoch",s.epoch);r.text(",\"enabled\":");r.text((s.epoch&1)?"true":"false");
     r.text(",");r.field("arrivals",s.arrivals);r.text(",");r.field("completed",s.completed);r.text(",");r.field("invalid_clock",s.invalidClock);
     r.text(",");r.field("max_gap_ns",s.maxGapNs);r.text(",");r.field("max_prefix_ns",s.maxPrefixNs);
-    r.text(",");r.field("max_runtime_ns",s.maxRuntimeNs);r.text(",");r.field("max_pre_scan_ns",s.maxPreScanNs);r.text(",");r.field("max_scan_ns",s.maxScanNs);r.send();
+    r.text(",");r.field("max_runtime_ns",s.maxRuntimeNs);r.text(",");r.field("max_pre_scan_ns",s.maxPreScanNs);r.text(",");r.field("max_scan_ns",s.maxScanNs);r.text(",");r.field("max_tail_ns",s.maxTailNs);r.send();
     BridgeReply counts;counts.text(",");counts.field("slow",s.slow);counts.text(",");counts.field("excluded",s.excluded);
     counts.text(",");counts.field("contended_entries",s.contendedEntries);counts.text(",");counts.field("contended_records",s.contendedRecords);
-    counts.text(",\"saturated\":");counts.text(s.saturated?"true":"false");counts.text(",\"scope\":\"BSP LAPIC IRQ C-entry after GS guard to blocked wake-scan end; excludes IPIs; gaps include earlier handler work, IRQ masking and host delay; top 16 completed slow events, not timeline; contention counts since boot\",\"events\":[");counts.send();
+    counts.text(",");counts.field("missing_steal_entries",s.missingStealEntries);counts.text(",");counts.field("backwards_steal",s.backwardsSteal);
+    counts.text(",");counts.field("steal_exceeds_gap",s.stealExceedsGap);counts.text(",");counts.field("migrated",s.migrated);counts.send();
+    BridgeReply metadata;
+    metadata.text(",\"saturated\":");metadata.text(s.saturated?"true":"false");metadata.text(",\"scope\":\"BSP LAPIC IRQ after GS guard through BSP housekeeping; excludes IPIs; paired entry wall/steal are separate records, not atomic host-delay truth; tail may include blocking/migration; top 16 completed slow events; contention counts since boot\",\"events\":[");metadata.send();
     for(unsigned i=0;i<s.retained;++i){const auto& e=s.events[i];BridgeReply row;
         if(i)row.text(",");row.text("{");row.field("sequence",e.token.sequence);row.text(",");row.field("previous_arrival_ns",e.token.previousArrivalNs);
         row.text(",");row.field("arrival_ns",e.token.arrivalNs);row.text(",");row.field("scheduler_ns",e.schedulerNs);
         row.text(",");row.field("after_runtime_ns",e.afterRuntimeNs);row.text(",");row.field("before_scan_ns",e.beforeScanNs);row.text(",");row.field("after_scan_ns",e.afterScanNs);
         row.text(",");row.field("gap_ns",e.token.gapNs);row.text(",");row.field("prefix_ns",e.prefixNs);row.text(",");row.field("runtime_ns",e.runtimeNs);
         row.text(",");row.field("pre_scan_ns",e.preScanNs);row.text(",");row.field("scan_ns",e.scanNs);row.text(",");row.field("candidates",e.candidates);
-        row.text(",\"interrupted_rip\":\"0x");row.number(e.token.rip,true);row.text("\",");row.field("interrupted_cs",e.token.cs);row.text("}");row.send();
+        row.send();BridgeReply tail;
+        tail.text(",");tail.field("after_bsp_ns",e.afterBspNs);tail.text(",");tail.field("tail_ns",e.tailNs);tail.text(",");tail.field("completion_cpu",e.completionCpu);
+        tail.text(",");tail.field("steal_ns",e.token.stealNs);tail.text(",");tail.field("previous_steal_ns",e.token.previousStealNs);tail.text(",");tail.field("steal_delta_ns",e.token.stealDeltaNs);
+        tail.text(",\"has_steal\":");tail.text(e.token.hasSteal?"true":"false");tail.text(",\"has_steal_gap\":");tail.text(e.token.hasStealGap?"true":"false");
+        tail.text(",\"interrupted_rip\":\"0x");tail.number(e.token.rip,true);tail.text("\",");tail.field("interrupted_cs",e.token.cs);tail.text("}");tail.send();
     }
     DebugChannelSend("]}\n");
 }

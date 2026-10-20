@@ -12,6 +12,7 @@
 #include "panic.h"
 #include "kvmclock.h"
 #include "tick_clock.h"
+#include "runtime_accounting.h"
 
 // Declared at global scope in idt.cpp
 void IdtInstallHandler(uint8_t vector, void* handler);
@@ -322,14 +323,17 @@ uint64_t TimerWakeTimingNow(){uint64_t now=0;return KvmClockReadStableNs(&now)?n
 TimerWakeToken TimerWakeTimingBegin(uint64_t rip,uint64_t cs){
     const auto epoch=__atomic_load_n(&g_timerWakeEpoch,__ATOMIC_ACQUIRE);
     if(!(epoch&1) || ApicGetId()!=0)return {};
-    const auto now=TimerWakeTimingNow();
+    const bool available=KvmStealAvailable(0);
+    const auto sample=RuntimeReadSample(available,[](uint64_t* wall){return KvmClockReadStableNs(wall);},
+        [](uint64_t* steal){return KvmStealReadNs(0,steal);});
+    const auto now=sample.valid?sample.wallNs:TimerWakeTimingNow();
     if(!SpinLockTryAcquire(&g_timerWakeLock)){TimerWakeDrop(&g_timerWakeEntryDrops);return {};}
-    const auto t=g_timerWake.Begin(epoch,now,rip,cs);SpinLockRelease(&g_timerWakeLock);return t;
+    const auto t=g_timerWake.Begin(epoch,now,rip,cs,available && sample.valid,sample.stealNs);SpinLockRelease(&g_timerWakeLock);return t;
 }
 void TimerWakeTimingComplete(const TimerWakeToken& t,uint64_t scheduler,uint64_t runtime,
-                             uint64_t scan,uint64_t end,uint32_t candidates){
+                             uint64_t scan,uint64_t end,uint32_t candidates,uint64_t afterBsp,uint32_t completionCpu){
     if(!SpinLockTryAcquire(&g_timerWakeLock)){TimerWakeDrop(&g_timerWakeRecordDrops);return;}
-    g_timerWake.Complete(t,scheduler,runtime,scan,end,candidates);SpinLockRelease(&g_timerWakeLock);
+    g_timerWake.Complete(t,scheduler,runtime,scan,end,candidates,afterBsp,completionCpu);SpinLockRelease(&g_timerWakeLock);
 }
 
 // C handler called from the naked ISR wrapper below.

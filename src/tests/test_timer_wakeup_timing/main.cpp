@@ -42,5 +42,28 @@ int main(){
     m.Reset();epoch=m.Epoch();auto a=m.Begin(epoch,1,0,0),b=m.Begin(epoch,2,0,0);
     CHECK(m.Complete(b,3,4,5,6,0));CHECK(m.Complete(a,7,8,9,10,0));
     CHECK(m.Snapshot().completed==2 && m.Snapshot().arrivals==2);
+    // Steal pairing is explicit: first/missing/backwards pairs cannot be
+    // interpreted as zero host delay. Never silently clamp a delta to the gap.
+    m.Reset();epoch=m.Epoch();
+    t=m.Begin(epoch,1000000000,1,3,true,100);
+    CHECK(t.hasSteal && !t.hasStealGap);
+    CHECK(!m.Complete(t,1000000001,1000000002,1000000003,1000000004,3,0,0));
+    CHECK(m.Complete(t,1000000001,1000000002,1000000003,1000000004,3,1090000004,2));
+    s=m.Snapshot();CHECK(s.maxTailNs==90000000 && s.migrated==1 && s.events[0].completionCpu==2);
+    t=m.Begin(epoch,1100000000,1,3,true,100000100);
+    CHECK(t.hasStealGap && t.stealDeltaNs==100000000 && t.gapNs==100000000);
+    CHECK(m.Complete(t,1100000001,1100000002,1100000003,1100000004,0));
+    t=m.Begin(epoch,1200000000,1,3,true,100000100);
+    CHECK(t.hasStealGap && !t.stealDeltaNs);
+    t=m.Begin(epoch,1300000000,1,3,true,99);
+    CHECK(t.hasSteal && !t.hasStealGap && m.Snapshot().backwardsSteal==1);
+    t=m.Begin(epoch,1400000000,1,3,false,0);
+    CHECK(!t.hasSteal && !t.hasStealGap && m.Snapshot().missingStealEntries==1);
+    t=m.Begin(epoch,1500000000,1,3,true,200);CHECK(!t.hasStealGap);
+    t=m.Begin(epoch,1600000000,1,3,true,500000000);
+    CHECK(t.hasStealGap && t.stealDeltaNs==499999800 && m.Snapshot().stealExceedsGap==1);
+    CHECK(m.Complete(t,1600000001,1600000002,1600000003,1600000004,0));
+    m.Reset();epoch=m.Epoch();t=m.Begin(epoch,1,0,0,true,500000000);
+    CHECK(!t.previousArrivalNs && !t.hasStealGap && !m.Snapshot().missingStealEntries);
     std::printf("TIMER_WAKE_TIMING %s\n",failed?"FAIL":"PASS");return failed?1:0;
 }
