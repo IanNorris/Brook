@@ -12,6 +12,11 @@ the SDL slowdown on Linux and improve both guests with a smaller requested
 buffer; defaults remain unchanged. The earlier [backend pacing controls](audio-backend-pacing.md) retain a recovered
 SDL acceleration lead and a separate SDL callback half-rate discrepancy.
 
+The [native packet-coded controls](audio-packet-code-controls.md) reproduce
+roughly 10–12% accelerated source progression without a fitted pitch increase
+in timer mode, while callback captures progress near 1×. The historical larger
+application factor and precise mechanism remain open.
+
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
 `f932600c7ef0ac9606057f8e976e47b3f397695aae69383dc965a6d342e2f1b3`.
 The native review initially estimated roughly 1.5× playback in Quake II and

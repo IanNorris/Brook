@@ -33,13 +33,21 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--trace-uptime', action='store_true',
                         help='Diagnostic procfs reads around writes; adds observer overhead')
+    parser.add_argument('--signal',choices=['tone','packet-code-v1'],default='tone',
+                        help='Packet code changes frequency every 100 ms to identify source intervals')
     args = parser.parse_args()
     destination = Path(args.output)
     if destination.exists():
         raise SystemExit('Refusing to overwrite prior timing evidence')
-    # Exactly 44 complete 440-Hz cycles per 100-ms packet, low amplitude.
-    packet = array.array('h', [int(1200 * math.sin(2*math.pi*440*i/44100))
+    # Low amplitude; every 100-ms packet has an integer number of cycles.
+    # The default remains the original 440-Hz tone (44 cycles).
+    def make_packet(index):
+        frequency=440 if args.signal=='tone' else 400+40*((index*137+29)%463)
+        return array.array('h',[int(1200*math.sin(2*math.pi*frequency*i/44100))
                                for i in range(4410) for _ in range(2)]).tobytes()
+    # Generate before opening/timing the device: producer math must not become
+    # an accidental starvation workload. At most 450 packets (~8 MiB).
+    packets=[make_packet(0)] if args.signal=='tone' else [make_packet(i) for i in range(args.seconds*10)]
     rows = []
     submitted = 0
     failure = None
@@ -58,7 +66,8 @@ def main():
                 raise RuntimeError(('format negotiation', request, value, negotiated))
         started = time.monotonic_ns()
         print('AUDIO_TIMING_STARTED', started, flush=True)
-        for _ in range(args.seconds * 10):
+        for packet_index in range(args.seconds * 10):
+            packet=packets[0] if args.signal=='tone' else packets[packet_index]
             offset = 0
             while offset < len(packet):
                 attempt = dict(before_ns=time.monotonic_ns(), uptime_before=uptime(),
@@ -73,7 +82,7 @@ def main():
             before = time.monotonic_ns()
             completed = progress(fd)
             after = time.monotonic_ns()
-            rows.append(dict(before_ns=before, after_ns=after,
+            rows.append(dict(packet_index=packet_index,before_ns=before, after_ns=after,
                              completed_bytes=completed, submitted_bytes=submitted,
                              write=attempt))
         submitted_at = time.monotonic_ns()
@@ -108,7 +117,8 @@ def main():
                             minimum_interval_ns=minimum, maximum_interval_ns=maximum,
                             rate_ratio_low=frames*1e9/(maximum*44100),
                             rate_ratio_high=frames*1e9/(minimum*44100)))
-    result = dict(requested_seconds=args.seconds, sample_rate=44100, channels=2,
+    result = dict(requested_seconds=args.seconds, sample_rate=44100, channels=2,signal=args.signal,
+                  signal_code=dict(packet_frames=4410,base_hz=400,step_hz=40,modulus=463,multiplier=137,offset=29) if args.signal!='tone' else None,
                   submitted_frames=submitted//4,
                   completed_frames=final_bytes//4 if final_bytes is not None else None,
                   start_ns=started, submitted_at_ns=submitted_at, completed_at_ns=completed_at,
@@ -117,7 +127,7 @@ def main():
                   trace_uptime=args.trace_uptime)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(result, indent=2)+'\n')
-    print(json.dumps(dict(output=str(destination), requested_seconds=args.seconds,
+    print(json.dumps(dict(output=str(destination), requested_seconds=args.seconds,signal=args.signal,
                           completed_frames=result['completed_frames'], failure=failure,
                           delivery_guest_seconds=result['delivery_guest_seconds'],
                           max_4s_completion_ratio_low=max((x['rate_ratio_low'] for x in windows), default=None),

@@ -92,5 +92,6 @@ and `audio-small-buffer-control`, and
 `build/workloads/timing-scheduler-20261020/sdl-small-buffer-browser`.
 The earlier recovered SDL timer trial remains a failed launch acceptance as
 [recorded separately](audio-backend-pacing.md). Nothing here turns that failure
-into a clean result. A clean small-buffer timer-mode comparison, packet-coded
-capture and native Quake II/music validation remain useful next steps.
+into a clean result. The subsequent [small-buffer timer and native packet-coded controls](audio-packet-code-controls.md)
+retain further timer-mode acceleration and successful callback captures.
+Native Quake II/music validation and tracing remain next steps.

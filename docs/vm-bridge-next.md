@@ -490,3 +490,23 @@ Where window correlation is unavailable, report it as unknown. Keep all D-Bus
 access inside the VM; never connect to the host accessibility service. Custom
 controls may omit useful semantics. Retain pixel inspection to verify rendering
 and use native Brook WM/launcher hooks for controls outside toolkit apps.
+
+
+## Observed large-result export limit (20 October)
+
+A generated 173,280-byte audio timing report completed successfully on the guest,
+but exporting it through job stdout lost a 107,744-byte prefix before the host
+read it. The cursor/gap response correctly rejected that transport as acceptance
+evidence. The source file remained intact. The timing controls now collect a
+small size/SHA256 receipt, then verify read-only extraction from the stopped
+private disk after launcher/filesystem gates; this avoids many live chunk RPCs.
+The failed stdout receipt remains saved beside the successful extraction.
+
+Backlog a guest-file artifact export operation: bind it to session generation,
+request identity, guest UID and path; stream a bounded regular-file snapshot to
+a scoped host artifact and return its path, byte count and checksum through the
+existing media adapter. Detect source changes during transfer and preserve a
+failed/unknown operation for recovery. Report binary content through artifact
+handling. Explicitly reject unsupported paths and post-panic filesystem access;
+retain the independently supported memory/log diagnostic subset. This proposal
+is separate from implemented host-artifact reads and bounded command output.
