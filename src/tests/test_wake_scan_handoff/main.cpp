@@ -38,22 +38,36 @@ int main(){
     brook::WakeScanHandoff concurrent(0);CHECK(concurrent.Control(1,true));
     auto initial=concurrent.Begin(0,1);CHECK(concurrent.Complete(initial,2,0));
     std::atomic<uint64_t> clock{3},completed{0};std::atomic<unsigned> active{0},ready{0};std::atomic<bool> go{false};
+    std::atomic<unsigned> turn{0};std::atomic<uint64_t> wins[8]{};
     std::vector<std::thread> threads;
     for(unsigned cpu=0;cpu<8;++cpu)threads.emplace_back([&,cpu]{
         ++ready;while(!go.load())std::this_thread::yield();
-        for(unsigned n=0;n<10000;++n){
-            auto token=concurrent.Begin(cpu,clock.fetch_add(1));if(!token.sequence)continue;
+        auto attempt=[&](unsigned n){
+            auto token=concurrent.Begin(cpu,clock.fetch_add(1));if(!token.sequence)return false;
             CHECK(active.fetch_add(1)==0);
             if(n%17==0)std::this_thread::yield();
             CHECK(!concurrent.Begin(cpu,clock.fetch_add(1)).sequence);
             CHECK(!concurrent.Control(0,true));
             CHECK(active.fetch_sub(1)==1);
-            CHECK(concurrent.Complete(token,clock.fetch_add(1),1));++completed;
-        }
+            CHECK(concurrent.Complete(token,clock.fetch_add(1),1));++completed;++wins[cpu];return true;
+        };
+        // Guarantee each real worker exercises completion, then release all
+        // workers into contention. A bounded try-claim loop does not promise
+        // an AP win: on one host CPU, BSP can own while all AP attempts expire.
+        // This controlled phase is coverage, not a starvation/fairness proof.
+        while(turn.load()!=cpu)std::this_thread::yield();
+        CHECK(attempt(0));++turn;
+        while(turn.load()!=8)std::this_thread::yield();
+        for(unsigned n=0;n<10000;++n)attempt(n);
     });
     while(ready.load()!=8)std::this_thread::yield();go=true;
     for(auto& t:threads)t.join();s=concurrent.Snapshot();
-    CHECK(s.consistent && !active && completed>0 && s.apScans>0);
+    if(!(s.consistent && !active && completed>=8 && s.apScans>=7))
+        std::fprintf(stderr,"handoff snapshot: consistent=%u active=%u completed=%llu bsp=%llu ap=%llu invalid=%llu\n",
+            unsigned(s.consistent),active.load(),(unsigned long long)completed.load(),
+            (unsigned long long)s.bspScans,(unsigned long long)s.apScans,(unsigned long long)s.invalidClock);
+    CHECK(s.consistent && !active && completed>=8 && s.apScans>=7);
+    for(auto& count:wins)CHECK(count.load()>0);
     CHECK(s.bspScans+s.apScans==completed+1 && s.candidates==completed && !s.invalidClock && !s.saturated);
     std::printf("WAKE_SCAN_HANDOFF %s\n",failures?"FAIL":"PASS");return failures?1:0;
 }
