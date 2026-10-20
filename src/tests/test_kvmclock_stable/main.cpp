@@ -3,6 +3,7 @@
 #include <thread>
 #include <vector>
 #include "../../kernel/src/tick_clock.h"
+#include "../../kernel/src/futex_timeout.h"
 #include "../../kernel/src/timerfd_state.h"
 #include "../../kernel/src/clock_interval.h"
 #include "../../kernel/src/kvmclock.cpp"
@@ -46,6 +47,41 @@ uint64_t KvmClockTestTsc() {
 }
 int main() {
     using namespace brook;
+    // Futex deadlines retain ns precision and selected clock identity. A
+    // rounded scheduler hint may not turn a not-yet-expired deadline into timeout.
+    uint64_t nsValue=123;
+    CHECK(FutexTimeoutNanoseconds(2,999999999,&nsValue) && nsValue==2999999999);
+    CHECK(!FutexTimeoutNanoseconds(-1,0,&nsValue) && nsValue==2999999999);
+    CHECK(!FutexTimeoutNanoseconds(0,-1,&nsValue));
+    CHECK(!FutexTimeoutNanoseconds(0,1000000000,&nsValue));
+    CHECK(!FutexTimeoutNanoseconds(INT64_MAX,0,&nsValue));
+    CHECK(!FutexTimeoutNanoseconds(0,0,nullptr));
+    CHECK(FutexTimeoutNanoseconds(18446744073LL,709551615,&nsValue) && nsValue==~uint64_t(0));
+    CHECK(!FutexTimeoutNanoseconds(18446744073LL,709551616,&nsValue));
+    FutexWaitDeadline futex;
+    CHECK(!futex.expired(~uint64_t(0)) && futex.wakeupTick(0,100)==~uint64_t(0));
+    CHECK(FutexMakeDeadline(true,1000000,123456789,1,&futex));
+    CHECK(futex.nanoseconds==124456789 && futex.clockId==1 && futex.finite);
+    CHECK(!futex.expired(124456788) && futex.expired(124456789));
+    CHECK(!FutexMakeDeadline(true,1,~uint64_t(0),1,&futex) && futex.nanoseconds==124456789);
+    CHECK(FutexMakeDeadline(false,123456789,999999999,0,&futex));
+    CHECK(futex.clockId==0 && futex.nanoseconds==123456789 && futex.expired(999999999));
+    CHECK(!FutexMakeDeadline(false,1,0,2,&futex));
+    CHECK(!FutexMakeDeadline(false,1,0,0,nullptr));
+    for (uint64_t remaining : {1ULL,99999ULL,500000ULL,999999ULL,1000000ULL,1000001ULL,10000000ULL}) {
+        CHECK(FutexMakeDeadline(true,remaining,987654321,1,&futex));
+        const uint64_t tick=futex.wakeupTick(987654321,4321);
+        CHECK(tick==4321+(remaining+999999)/1000000);
+        // An early coarse wake must leave the true timeout unexpired and
+        // provide a future hint when the caller retries in the same queue.
+        for (uint64_t elapsed=0;elapsed<remaining;elapsed+=100003) {
+            CHECK(!futex.expired(987654321+elapsed));
+            CHECK(futex.wakeupTick(987654321+elapsed,tick)>tick);
+        }
+    }
+    CHECK(futex.wakeupTick(futex.nanoseconds,4321)==4321);
+    CHECK(futex.wakeupTick(987654321,~uint64_t(0)-2)==~uint64_t(0)-1);
+
     uint64_t milliseconds=999;
     CHECK(TickClockElapsedMs(100,123,100,&milliseconds) && milliseconds==123);
     CHECK(TickClockElapsedMs(100,123,1000099,&milliseconds) && milliseconds==123);

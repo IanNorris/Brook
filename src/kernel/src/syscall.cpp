@@ -7,6 +7,7 @@
 #include "syscall.h"
 #include "posix_timer.h"
 #include "timerfd_state.h"
+#include "futex_timeout.h"
 #include "sync_file.h"
 #include "gpu_reservation.h"
 #include "busybox_applets.h"
@@ -12542,6 +12543,27 @@ static bool FutexRemoveWaiter(uint64_t owner, uint64_t uaddr, Process* proc)
     return false;
 }
 
+// A coarse tick can wake us before the selected-clock deadline. Keep the
+// existing queue entry/reference while rearming: removing and re-enqueuing
+// would create a gap in which FUTEX_WAKE could be lost.
+static bool FutexRearmWaiter(uint64_t owner, uint64_t uaddr, Process* proc,
+                             const FutexWaitDeadline& deadline)
+{
+    const uint64_t flags = IrqSpinLockAcquire(&g_futexLock);
+    for (FutexWaiter* w = g_futexBuckets[FutexHash(owner, uaddr)]; w; w = w->next) {
+        if (w->owner != owner || w->uaddr != uaddr || w->proc != proc) continue;
+        const uint64_t nowNs = ClockNowNs(deadline.clockId);
+        const uint64_t nowTick = ApicTickCount();
+        proc->wakeupTick = deadline.wakeupTick(nowNs, nowTick);
+        // Do not clear pendingWakeup here. A real wake after unlocking must
+        // still prevent the next block through SchedulerBlock's wake latch.
+        IrqSpinLockRelease(&g_futexLock, flags);
+        return true;
+    }
+    IrqSpinLockRelease(&g_futexLock, flags);
+    return false; // A real wake already removed the waiter.
+}
+
 // Caller owns a process reference and has observed it Terminated/off-CPU.
 // Such a syscall cannot resume to remove its own waiter. Release only nodes
 // still linked here; a concurrent wake owns any node it already dequeued.
@@ -12561,28 +12583,19 @@ extern "C" void FutexCancelProcess(Process* proc)
     IrqSpinLockRelease(&g_futexLock, flags);
 }
 
-static uint64_t FutexTimeoutDeadlineMs(int op, uint64_t opVal, uint64_t timeoutAddr)
+static int64_t FutexTimeoutDeadline(int op, uint64_t opVal, uint64_t timeoutAddr,
+                                    FutexWaitDeadline& deadline)
 {
-    if (timeoutAddr == 0)
-        return ~0ULL;
-    if (!UserBufferReadable(timeoutAddr, sizeof(timespec)))
-        return 0;
-
-    auto* ts = reinterpret_cast<const timespec*>(timeoutAddr);
-    if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000LL)
-        return 0;
-
-    uint64_t timeoutMs = static_cast<uint64_t>(ts->tv_sec) * 1000ULL
-                       + (static_cast<uint64_t>(ts->tv_nsec) + 999999ULL) / 1000000ULL;
-
-    if (op == FUTEX_WAIT) {
-        return ApicTickCount() + timeoutMs;
-    }
-
-    uint64_t nowMs = ClockNowNs((opVal & FUTEX_CLOCK_REALTIME) ? 0 : 1) / 1000000ULL;
-    if (timeoutMs <= nowMs)
-        return ApicTickCount();
-    return ApicTickCount() + (timeoutMs - nowMs);
+    deadline = {};
+    if (timeoutAddr == 0) return 0;
+    timespec request{};
+    if (!CopyFromUser(&request, timeoutAddr, sizeof(request))) return -EFAULT;
+    uint64_t valueNs = 0;
+    if (!FutexTimeoutNanoseconds(request.tv_sec, request.tv_nsec, &valueNs)) return -EINVAL;
+    const bool relative = op == FUTEX_WAIT;
+    const unsigned clockId = !relative && (opVal & FUTEX_CLOCK_REALTIME) ? 0 : 1;
+    return FutexMakeDeadline(relative, valueNs, ClockNowNs(clockId), clockId, &deadline)
+        ? 0 : -EINVAL;
 }
 
 static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
@@ -12668,9 +12681,11 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             return -ENOSYS;
         }
 
-        uint64_t deadline = FutexTimeoutDeadlineMs(op, opVal, arg4);
-        if (deadline == 0)
-            return -ETIMEDOUT;
+        FutexWaitDeadline deadline;
+        if (int64_t error = FutexTimeoutDeadline(op, opVal, arg4, deadline)) return error;
+        const uint32_t waitBitset = op == FUTEX_WAIT_BITSET
+            ? static_cast<uint32_t>(arg6) : FUTEX_BITSET_MATCH_ANY;
+        if (!waitBitset) return -EINVAL;
 
         // Acquire futex lock, atomically check value, and enqueue
         uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
@@ -12679,6 +12694,11 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         if (__atomic_load_n(uaddr, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(val)) {
             IrqSpinLockRelease(&g_futexLock, fxFlags);
             return -EAGAIN;
+        }
+
+        if (deadline.finite && deadline.expired(ClockNowNs(deadline.clockId))) {
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
+            return -ETIMEDOUT;
         }
 
         // Allocate and enqueue waiter
@@ -12691,14 +12711,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         w->uaddr = uaddrVal;
         w->owner = owner;
         w->proc = proc;
-        w->bitset = (op == FUTEX_WAIT_BITSET)
-            ? static_cast<uint32_t>(arg6)
-            : FUTEX_BITSET_MATCH_ANY;
-        if (w->bitset == 0) {
-            FutexFreeWaiter(w);
-            IrqSpinLockRelease(&g_futexLock, fxFlags);
-            return -EINVAL;
-        }
+        w->bitset = waitBitset;
         uint32_t bucket = FutexHash(owner, uaddrVal);
         ProcessRef(proc); // owned by linked waiter, then wake/remove/cancel
         w->next = g_futexBuckets[bucket];
@@ -12706,44 +12719,35 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
 
         // Clear pending wakeup flag before blocking
         __atomic_store_n(&proc->pendingWakeup, 0, __ATOMIC_RELEASE);
-        proc->wakeupTick = deadline;
+        if (deadline.finite) {
+            // Sample the ns clock first, then its coarse scheduling hint.
+            const uint64_t nowNs = ClockNowNs(deadline.clockId);
+            const uint64_t nowTick = ApicTickCount();
+            proc->wakeupTick = deadline.wakeupTick(nowNs, nowTick);
+        } else {
+            proc->wakeupTick = ~0ULL;
+        }
 
         // Release the futex lock (restoring interrupts) BEFORE blocking — a
         // process must never be descheduled with interrupts disabled.
         IrqSpinLockRelease(&g_futexLock, fxFlags);
         FutexLog(0, uaddrVal, proc->pid, (int32_t)val);  // WAIT-enqueue
 
-        // Block until FUTEX_WAKE removes our waiter, a signal arrives, or an
-        // optional timeout expires and the scheduler wakes us.
-        SchedulerBlockInterruptible(proc);
-
-        if (FutexRemoveWaiter(owner, uaddrVal, proc))
-        {
-            // We dequeued our own waiter — i.e. no FUTEX_WAKE removed us; we
-            // resumed via the scheduler (signal, timeout, or a SPURIOUS unblock
-            // such as SchedulerBlock's pendingWakeup early-return under SMP
-            // load).
-            if (HasPendingSignals())
-                return -EINTR;
-
-            // BRO-205: report ETIMEDOUT ONLY for a real, finite deadline that
-            // has actually expired. A spurious wake on an INFINITE wait (or one
-            // whose deadline hasn't arrived yet) must NOT be reported as a
-            // timeout: glibc's __lll_lock_wait issues an UNTIMED FUTEX_WAIT for a
-            // contended mutex (e.g. the mutex re-lock inside pthread_cond_wait)
-            // and calls futex_fatal_error() -> abort ("The futex facility
-            // returned an unexpected error code") on ANY return other than
-            // 0/EAGAIN/EINTR — ETIMEDOUT included. Returning ETIMEDOUT here for a
-            // spurious wake crashed every glibc app that re-locks a contended
-            // mutex after a condvar wait (yquake2/mesa llvmpipe, intermittently).
-            if (deadline != ~0ULL && ApicTickCount() >= deadline)
-                return -ETIMEDOUT;
-
-            // Spurious / early wake — behave like a spurious FUTEX_WAKE: return 0
-            // so the caller rechecks the futex word and re-waits if needed. This
-            // is always safe; correct futex users must re-test their condition
-            // after any wake.
-            return 0;
+        for (;;) {
+            SchedulerBlockInterruptible(proc);
+            const bool interrupted = HasPendingSignals();
+            const bool expired = deadline.finite && deadline.expired(ClockNowNs(deadline.clockId));
+            if (interrupted || expired || !deadline.finite) {
+                if (!FutexRemoveWaiter(owner, uaddrVal, proc)) break;
+                if (interrupted) return -EINTR;
+                if (expired) return -ETIMEDOUT;
+                // BRO-205: an infinite wait may return spuriously, but must
+                // never report ETIMEDOUT (glibc mutex waits abort on it).
+                return 0;
+            }
+            // Finite early wake: retain the entry so concurrent FUTEX_WAKE
+            // cannot disappear between a dequeue and a new enqueue.
+            if (!FutexRearmWaiter(owner, uaddrVal, proc, deadline)) break;
         }
 
         FutexLog(1, uaddrVal, proc->pid, 0);  // WAIT-return (woken)

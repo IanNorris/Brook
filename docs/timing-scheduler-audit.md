@@ -718,3 +718,49 @@ Open controls include repeated fresh boots, startup/cache matching, additional
 game throughput and further browser backend comparisons. This first functional
 reference advances the performance target; it does not finish the timing/SMP
 objective or authorize a default scheduler change.
+
+
+### Futex deadline validation and early tick wakeups
+
+A focused native probe now distinguishes an actual early `ETIMEDOUT` from a
+permitted spurious success. It reads the requested clock after each syscall,
+which conservatively detects early returns without subtracting syscall overhead.
+The clock-fixed baseline (`dd5cc190...`) returns 18 early timeouts in 216 waits
+across relative WAIT and absolute monotonic/realtime WAIT_BITSET. Five of twelve
+relative 1-ms waits return early; minimum observed duration is 0.962 ms. Negative
+seconds, out-of-range nanoseconds and an unreadable timeout pointer incorrectly
+return ETIMEDOUT instead of EINVAL/EFAULT. Evidence remains in
+`build/workloads/timing-scheduler-20261020/futex-native0`.
+
+The fix keeps a selected-clock nanosecond deadline, validates the user timespec
+with overflow checks, and uses elapsed milliseconds only as a scheduler wake
+hint. On an early finite wake it rearms the original linked waiter without
+clearing the wake latch. Removing and re-enqueuing would risk losing a concurrent
+FUTEX_WAKE. Real wake/removal ownership still decides the result, and infinite
+spurious waits must never report ETIMEDOUT (BRO-205).
+
+An intermediate +1-tick guard (`613a5ef2...`, native1) eliminates early errors but
+adds an unconditional scheduling tick. It is superseded by rearming without
+that guard (`49d73731...`, native2). The latter passes all 216 timeout samples,
+all three invalid-argument cases and 96 bounded concurrent real-wake races on
+RR. The race probe includes immediate/delayed wakes, 1-ms and 100-ms timeouts,
+and four independent address pairs; it checks timely wakes are not lost and
+bounded threads drain. This is targeted acceptance, not an exhaustive SMP proof.
+
+The 1-ms relative median is still 1.999 ms (minimum 1.116 ms) in native2, versus
+2.002 ms with the guard. These samples do not establish a latency improvement:
+correct exact deadlines can miss the next periodic interrupt, especially when
+entry follows a previous tick-driven sleep. Sub-millisecond timer programming
+and wake latency remain separate work; no busy wait was added to conceal this.
+All 58 hosted suites and compiled entry/start mutation audits pass. The RR
+native job and launcher exit zero, heap integrity passes, all four filesystem
+checks pass, and twelve saved documents/four original profiles are preserved.
+The probe source is `scripts/workloads/futex_timing.py`; its Linux-host run also
+passes. These VMs use silent `none` audio and do not validate browser playback.
+
+A fresh MLFQ boot of the same kernel (`futex-native3`) repeats the 216 timeout,
+three invalid-argument and 96 real-wake cases with zero early timeout failures.
+Its 1-ms relative median is 2.002 ms. The native job, tracked lineage drain,
+heap check, clean launcher exit and four stopped-filesystem checks pass as on
+RR. Before saving the change, original document/profile preservation is checked
+on this separate clone too. Neither policy is selected as a new default.
