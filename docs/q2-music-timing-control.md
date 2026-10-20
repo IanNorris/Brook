@@ -74,6 +74,9 @@ the comparison, with raw evidence in the four named directories. To avoid
 depending solely on commercial-music alignment, the next diagnostic sends the
 existing synthetic packet-code-v1 signal through Quake's actual OGG music path
 in fresh private clones. Original OST files and golden disks remain untouched.
+The [completed synthetic and queue-size controls](audio-small-queue-pacing.md)
+confirm slower source progression with unchanged pitch and frequent short
+silence, including a direct OSS reproduction without Quake or GL.
 
 ## Earlier controls
 

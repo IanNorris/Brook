@@ -35,6 +35,10 @@ def main():
                         help='Diagnostic procfs reads around writes; adds observer overhead')
     parser.add_argument('--signal',choices=['tone','packet-code-v1'],default='tone',
                         help='Packet code changes frequency every 100 ms to identify source intervals')
+    parser.add_argument('--fragments',type=int,choices=range(1,17),
+                        help='Optional OSS fragment-count hint; record actual negotiated geometry')
+    parser.add_argument('--fragment-shift',type=int,choices=range(8,17),default=12,
+                        help='Fragment byte-size exponent for --fragments (default 4096 bytes)')
     args = parser.parse_args()
     destination = Path(args.output)
     if destination.exists():
@@ -54,6 +58,7 @@ def main():
     submitted_at = completed_at = final_bytes = None
     started = time.monotonic_ns()
     attempt = None
+    geometry = None
     def uptime():
         if not args.trace_uptime:
             return None
@@ -64,6 +69,14 @@ def main():
             negotiated = integer(fd, request, value)
             if negotiated != value:
                 raise RuntimeError(('format negotiation', request, value, negotiated))
+        hint = (args.fragments << 16) | args.fragment_shift if args.fragments else None
+        returned_hint = integer(fd, 0xC004500A, hint) if hint is not None else None
+        space = array.array('i', [0, 0, 0, 0])
+        fcntl.ioctl(fd, 0x8010500C, space, True)  # SNDCTL_DSP_GETOSPACE
+        geometry = dict(requested_hint=hint, returned_hint=returned_hint,
+                        available_fragments=space[0], total_fragments=space[1],
+                        fragment_bytes=space[2], available_bytes=space[3])
+        print('AUDIO_TIMING_GEOMETRY', json.dumps(geometry), flush=True)
         started = time.monotonic_ns()
         print('AUDIO_TIMING_STARTED', started, flush=True)
         for packet_index in range(args.seconds * 10):
@@ -118,6 +131,7 @@ def main():
                             rate_ratio_low=frames*1e9/(maximum*44100),
                             rate_ratio_high=frames*1e9/(minimum*44100)))
     result = dict(requested_seconds=args.seconds, sample_rate=44100, channels=2,signal=args.signal,
+                  oss_geometry=geometry,
                   signal_code=dict(packet_frames=4410,base_hz=400,step_hz=40,modulus=463,multiplier=137,offset=29) if args.signal!='tone' else None,
                   submitted_frames=submitted//4,
                   completed_frames=final_bytes//4 if final_bytes is not None else None,

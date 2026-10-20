@@ -11,6 +11,24 @@ from pathlib import Path
 import wave
 
 
+def quiet_windows(pcm, rate):
+    """Fixed roughly 1-ms RMS bins; bin alignment undercounts short gaps."""
+    import numpy as np
+    width=max(1,rate//1000)
+    count=len(pcm)//width
+    if not count:return dict(bins=0,quiet_bins=0,quiet_fraction=None,longest_quiet_bins=0,
+                             bin_frames=width,bin_seconds=width/rate,threshold_rms_s16=10)
+    values=np.asarray(pcm[:count*width],dtype=float).reshape(count,width)
+    quiet=np.sqrt((values**2).mean(axis=1))<10
+    longest=run=0
+    for value in quiet:
+        run=run+1 if value else 0
+        longest=max(longest,run)
+    return dict(bins=count,quiet_bins=int(quiet.sum()),quiet_fraction=float(quiet.mean()),
+                longest_quiet_bins=longest,bin_frames=width,bin_seconds=width/rate,
+                threshold_rms_s16=10)
+
+
 def decode(pcm,rate,packet_count):
     import numpy as np
     if rate!=44100 or not 1<=packet_count<=450:raise ValueError('Expected 44.1-kHz packet code with 1..450 symbols')
@@ -30,7 +48,8 @@ def decode(pcm,rate,packet_count):
     correction=np.divide(.5*(left-right),denominator,out=np.zeros_like(left),where=np.abs(denominator)>1e-12)
     frequencies[interior]+=np.clip(correction,-.5,.5)*rate/width
     candidate=(fraction>.5)&(np.sqrt((frames**2).mean(axis=1))>50)
-    if candidate.sum()<3:return dict(status='insufficient_tone_windows',valid_windows=int(candidate.sum()))
+    quiet=quiet_windows(pcm,rate)
+    if candidate.sum()<3:return dict(status='insufficient_tone_windows',valid_windows=int(candidate.sum()),quiet_windows=quiet)
     # Fit pitch only to the frequency comb, never to a desired source-time rate.
     scales=np.arange(.98,1.02001,.0001);scores=[]
     for scale in scales:
@@ -53,6 +72,7 @@ def decode(pcm,rate,packet_count):
     if len(runs)>=3:
         x=np.array([r['center_pcm_s'] for r in runs]);y=np.array([(r['packet']+.5)/10 for r in runs]);x=x-x.mean();slope=float(np.dot(x,y-y.mean())/np.dot(x,x))
     return dict(status='ok' if len(runs)>=3 else 'insufficient_symbol_runs',sample_rate=rate,pcm_s=len(pcm)/rate,
+        quiet_windows=quiet,
         pitch_scale=scale,fft_window_s=width/rate,fft_hop_s=hop/rate,all_windows=len(frames),decoded_windows=len(points),
         symbol_runs=runs,backwards_or_repeat_transitions=[t for t in transitions if t['next']<=t['previous']],
         unobserved_ids_between_runs=sum(max(0,t['next']-t['previous']-1) for t in transitions),

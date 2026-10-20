@@ -30,6 +30,11 @@ Later evidence supersedes several early leads:
   long audio delays before ready publication, inside BSP interrupt gaps.
 - [Priority query encoding](scheduler-priority-abi.md) now returns Linux's raw
   encoding for default nice zero. Actual per-task nice/RT control remains absent.
+- [Small-queue audio controls](audio-small-queue-pacing.md) reproduce slower
+  source progression with synthetic tones through Quake and direct OSS, with
+  unchanged pitch. Frequent short silence and queue-size interventions support
+  a blocking-refill/HDA-lead interaction. This is separate from the historical
+  acceleration and is not yet fixed.
 
 RR remains the default, with no further RR tuning planned. MLFQ and EEVDF are
 optional. Remaining acceptance includes default-path and broader desktop/game

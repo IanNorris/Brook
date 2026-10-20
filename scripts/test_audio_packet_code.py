@@ -39,6 +39,19 @@ class PacketCodeTests(unittest.TestCase):
         x=decode(np.concatenate(self.packets),self.rate,100)
         self.assertEqual(len(x['symbol_runs']),100);self.assertFalse(x['backwards_or_repeat_transitions']);self.assertEqual(x['unobserved_ids_between_runs'],0)
         self.assertAlmostEqual(x['approximate_source_seconds_per_pcm_second'],1,delta=.005)
+        self.assertEqual(x['quiet_windows']['quiet_bins'],0)
+    def test_repeated_short_silence_slows_source_without_changing_pitch(self):
+        # Every 100 ms of source is followed by 20 ms of silence. Looking only
+        # for the single longest gap obscures the substantial total disruption.
+        gap=np.zeros(882,dtype='<i2')
+        x=decode(np.concatenate([np.concatenate((p,gap)) for p in self.packets]),self.rate,100)
+        self.assertEqual(x['status'],'ok')
+        self.assertAlmostEqual(x['approximate_source_seconds_per_pcm_second'],1/1.2,delta=.005)
+        self.assertAlmostEqual(x['pitch_scale'],1,delta=.001)
+        self.assertFalse(x['backwards_or_repeat_transitions'])
+        self.assertEqual(x['unobserved_ids_between_runs'],0)
+        self.assertAlmostEqual(x['quiet_windows']['quiet_fraction'],1/6,delta=.01)
+        self.assertLess(x['quiet_windows']['longest_quiet_bins']*x['quiet_windows']['bin_seconds'],.022)
     def test_known_pitch_preserving_tempo_controls(self):
         for tempo in (1.3,.5):
             x=self.transform('tempo-'+str(tempo),'atempo='+str(tempo))
