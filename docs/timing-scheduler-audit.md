@@ -226,3 +226,74 @@ passes a six-second, 1,900-sample default-decimal observation with
 or large jumps. The 32 clock brackets and 36 sleep checks pass again. Both
 compiled audits pass for that kernel. This validates the procfs formatting
 repair, not the reported application playback-speed issue.
+
+
+## Matched policy comparison and blocking-audio-write defect
+
+The repeated comparison freezes kernel
+`51b528c4a0466b591b95e6b55a89b787d0f2874adb757fda31c0cb74463890cb`,
+eight vCPUs, 8 GiB, host CPUs 0–13, Venus GPU composition and silent host audio.
+Each policy gets private copies of the same checked data/Nix images, is
+selected before scheduler/AP activation, and runs worker counts 8,24,24,8 for
+ten timed seconds each. Both guests pass default-decimal procfs formatting,
+clock brackets and sleep checks. No sleeper returns early, all CPU workers
+progress, heap checks pass, launchers exit zero after guest sync and all four
+primary filesystems pass offline checks.
+
+| Policy / CPU workers | Sleeper p95 across two runs | Worst lateness across runs |
+| --- | --- | ---: |
+| RR / 8 | 7.20–7.79 ms | 83.37 ms |
+| RR / 24 | 91.07–93.52 ms | 128.11 ms |
+| MLFQ / 8 | 21.61–21.66 ms | 52.76 ms |
+| MLFQ / 24 | 21.15–22.61 ms | 103.21 ms |
+
+The loaded-case improvement comes with worse lighter-load latency. Do not
+switch the default on these synthetic results. The earlier roughly one-second
+MLFQ outlier is not reproduced by these matched runs and is not explained.
+The retained individual rows and scope are under `matched/summary.json`.
+The [policy proposal](scheduler-policy-next.md) sets out EEVDF motivation,
+accounting/preemption prerequisites, module lifetime and validation gates.
+
+An audio-only 30-second tone attempt on RR failed after roughly six seconds:
+`os.write` returned EAGAIN on a blocking DSP description. Keep the failure
+under `matched/rr/audio/w0/`; its sampled stream had no discontinuity flag.
+A later traced retry delivered all 1,323,000 frames in 29.753 guest seconds.
+Its warmed eight-second host capture contained 353,285 PCM frames, a frame/time
+ratio of 1.0004 at 44.1 kHz and no silent 10-ms bins. The maximum four-second
+client completion ratio was 1.0236. This does not reproduce a 1.5× playback
+error and uses the silent backend rather than the user's PipeWire output.
+
+The failure prompted a focused regression: pause a private stream, fill its
+FIFO, clear O_NONBLOCK and start a writer; release space by reset after 1.2 s.
+The baseline returned EAGAIN after 546 ms instead of waiting. The syscall had
+an unconditional 500-ms LAPIC-tick deadline for blocking output. The candidate
+removes that expiry while retaining nonblocking EAGAIN, signal interruption
+and explicit device-discontinuity errors. On kernel
+`05e4d6840be332129f8bc294dd392fa91f3bebb5f627ed5e2a529db1d5c61d86`,
+the full nonblocking write still returns EAGAIN, the blocking writer remains
+waiting until reset, and it then accepts exactly four bytes and exits cleanly.
+Compiled entry/start audits pass. The idle and 24-worker reruns both deliver
+all 1,323,000 frames, taking 29.928 and 29.922 guest seconds. Their warmed
+8.006/8.083-second host captures contain 353,059/356,616 PCM frames: frame/time
+ratios 1.00004/1.00041, with no silent 10-ms bins. Maximum four-second client
+completion ratios are 1.0118/1.0241. Those short-window results do not reproduce
+a 1.5× error. Existing DSP ownership and pointer/geometry/drain/signal probes
+pass; all tracked lineages drain. A post-exit idle capture has zero frames,
+heap integrity passes, the owned launcher exits zero after sync, and all four
+primary filesystems pass offline checks.
+Evidence is under `dsp-blocking-{before,after}/`. Do not claim this repair
+explains the reported playback-speed issue.
+
+
+## Silent PipeWire fixture for the remaining backend comparison
+
+The current successful tone measurements use QEMU's `none` backend. To exercise
+the user's PipeWire path without speakers or desktop-session changes, a
+separate temporary PipeWire 1.6.6 server is prepared with only protocol/client
+modules, a dummy driver and a null sink. It has its own 0700 runtime directory
+and socket; no ALSA, device-discovery or microphone modules are loaded. A
+half-second generated host tone is successfully configured and explicitly
+linked into that private graph, and its process exits zero. The first unlinked
+smoke attempt and metadata-module omission remain retained as fixture setup
+failures. VM PipeWire playback and actual Quake/Firefox reproduction are not yet
+accepted. Private setup evidence is under `pipewire-null/`.
