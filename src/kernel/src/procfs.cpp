@@ -388,8 +388,11 @@ static Vnode* GenUptime()
     uint64_t idleSecs = totalIdle / 1000;
     uint64_t idleFrac = (totalIdle % 1000) / 10;
 
-    uint32_t n = ProcFmt(buf, 64, "%lu.%lu %lu.%lu\n",
-        secs, frac, idleSecs, idleFrac);
+    // ProcFmt has no width/padding modifiers. Emit both centisecond digits
+    // explicitly: printing 9 as ".9" would turn 0.09 seconds into 0.9.
+    uint32_t n = ProcFmt(buf, 64, "%lu.%c%c %lu.%c%c\n",
+        secs, static_cast<int>('0' + frac / 10), static_cast<int>('0' + frac % 10),
+        idleSecs, static_cast<int>('0' + idleFrac / 10), static_cast<int>('0' + idleFrac % 10));
     return MakeProcVnode(buf, n);
 }
 

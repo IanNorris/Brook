@@ -12,7 +12,8 @@ import time
 def sample(brook_centiseconds=False):
     before = time.monotonic_ns()
     with open('/proc/uptime') as stream:
-        value = stream.read().split()[0]
+        fields = stream.read().split()
+    value = fields[0]
     after = time.monotonic_ns()
     whole, _, fraction = value.partition('.')
     if brook_centiseconds:
@@ -23,7 +24,10 @@ def sample(brook_centiseconds=False):
         fractional_ns = int((fraction+'000000000')[:9])
     uptime = int(whole) * 1_000_000_000 + fractional_ns
     return dict(before_ns=before, after_ns=after, uptime_ns=uptime,
-                offset_ns=uptime-(before+after)//2, uptime_text=value)
+                offset_ns=uptime-(before+after)//2, uptime_text=value,
+                canonical_centiseconds=len(fields) == 2 and all(
+                    field.count('.') == 1 and len(field.split('.')[1]) == 2
+                    and field.replace('.', '').isdigit() for field in fields))
 
 
 def main():
@@ -31,15 +35,19 @@ def main():
     parser.add_argument('--seconds', type=int, default=24, choices=range(1, 61))
     parser.add_argument('--brook-centiseconds', action='store_true',
                         help='Decode the known legacy Brook unpadded centisecond field')
+    parser.add_argument('--require-centisecond-format', action='store_true',
+                        help='Fail if uptime or idle lacks two fractional digits')
     args = parser.parse_args()
     initial = previous = sample(args.brook_centiseconds)
     samples = backward = jumps = 0
+    malformed = int(not initial['canonical_centiseconds'])
     largest_read = largest_shift = 0
     anomalies = []
     while True:
         time.sleep(.002)
         current = sample(args.brook_centiseconds)
         samples += 1
+        malformed += not current['canonical_centiseconds']
         width = current['after_ns']-current['before_ns']
         largest_read = max(largest_read, width)
         shift = current['offset_ns']-previous['offset_ns']
@@ -58,9 +66,10 @@ def main():
         if current['after_ns']-initial['before_ns'] >= args.seconds*1_000_000_000:
             break
     print(json.dumps(dict(samples=samples, backwards=backward, large_jumps=jumps,
+                         malformed_centiseconds=malformed,
                          max_read_ns=largest_read, max_offset_shift_ns=largest_shift,
                          first=initial, last=previous, anomalies=anomalies)), flush=True)
-    return 0
+    return 1 if args.require_centisecond_format and malformed else 0
 
 
 if __name__ == '__main__':

@@ -219,6 +219,10 @@ not rule out early-boot or intermittent CMOS rebasing, and no playback speedup
 is reproduced. Evidence is under `lapic-counter-observation/`.
 
 The procfs source now emits both centisecond digits explicitly for uptime and
-idle time (its formatter has no width modifiers). Rebuilt-guest verification
-of that formatting change remains pending. The default decimal observer must
-be rerun without the compatibility decoding to validate the actual file ABI.
+idle time (its formatter has no width modifiers). The rebuilt RR guest kernel
+`51b528c4a0466b591b95e6b55a89b787d0f2874adb757fda31c0cb74463890cb`
+passes a six-second, 1,900-sample default-decimal observation with
+`--require-centisecond-format`: no malformed fractions, backward observations
+or large jumps. The 32 clock brackets and 36 sleep checks pass again. Both
+compiled audits pass for that kernel. This validates the procfs formatting
+repair, not the reported application playback-speed issue.
