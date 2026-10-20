@@ -3968,7 +3968,15 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.field("last_steal_ns",d.lastStealNs); reply.text(",");
         reply.field("clamped_service",d.clampedService); reply.text(",");
         reply.field("stale_identity",d.staleIdentity); reply.text(",");
-        reply.field("saturated",d.saturated); reply.text("}\n"); reply.send();
+        reply.field("saturated",d.saturated); reply.send();
+        auto clamp=[&](const char* name,const RuntimeClampEvidence& e){
+            BridgeReply r;r.text(",\"");r.text(name);r.text("\":{\"valid\":");r.text(d.clampedService?"true":"false");r.text(",");
+            r.field("sample",e.sample);r.text(",");r.field("cpu",e.cpu);r.text(",");r.field("pid",e.pid);r.text(",");r.field("incarnation",e.incarnation);
+            r.text(",");r.field("previous_wall_ns",e.previousWallNs);r.text(",");r.field("wall_ns",e.wallNs);
+            r.text(",");r.field("previous_steal_ns",e.previousStealNs);r.text(",");r.field("steal_ns",e.stealNs);
+            r.text(",");r.field("service_floor_ns",e.serviceFloorNs);r.text(",");r.field("deficit_ns",e.deficitNs);r.text("}");r.send();
+        };
+        clamp("first_clamp",d.firstClamp);clamp("max_clamp",d.maxClamp);DebugChannelSend("}\n");
     }
     else if(StrStartsWith(cmd,"sched timing watch ")) {
         const char* a=cmd+sizeof("sched timing watch ")-1;uint32_t pid=0;bool valid=*a!=0;

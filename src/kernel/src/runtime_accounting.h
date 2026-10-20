@@ -20,6 +20,12 @@ RuntimeSample RuntimeReadSample(bool hasSteal, WallReader wallReader, StealReade
     }
     return {};
 }
+struct RuntimeClampEvidence {
+    uint64_t sample=0,previousWallNs=0,wallNs=0,previousStealNs=0,stealNs=0;
+    uint64_t serviceFloorNs=0,deficitNs=0,incarnation=0;
+    uint32_t cpu=0;
+    uint16_t pid=0;
+};
 struct RuntimeDiagnostics {
     uint64_t samples = 0, chargedNs = 0, idleNs = 0, invalidSamples = 0;
     uint64_t backwardsWall = 0, backwardsSteal = 0, clampedService = 0;
@@ -29,6 +35,7 @@ struct RuntimeDiagnostics {
     uint64_t lastPreviousStealNs = 0, lastStealNs = 0;
     uint32_t lastBackwardsCpu = 0;
     uint16_t lastBackwardsPid = 0;
+    RuntimeClampEvidence firstClamp{},maxClamp{};
 };
 
 // Caller serializes all access. Includes kernel/IRQ work while a task owns the
@@ -100,8 +107,17 @@ public:
             state.baseline = false; return 0;
         }
         Add(diagnostics_.observedStealNs, sample.stealNs - state.steal);
+        const uint64_t previousWall=state.wall,previousSteal=state.steal;
         state.wall = sample.wallNs; state.steal = sample.stealNs;
-        if (service < state.serviceFloor) { ++diagnostics_.clampedService; return 0; }
+        if (service < state.serviceFloor) {
+            ++diagnostics_.clampedService;
+            const RuntimeClampEvidence evidence{diagnostics_.samples,previousWall,sample.wallNs,
+                previousSteal,sample.stealNs,state.serviceFloor,state.serviceFloor-service,
+                state.incarnation,cpu,state.pid};
+            if(diagnostics_.clampedService==1)diagnostics_.firstClamp=evidence;
+            if(evidence.deficitNs>diagnostics_.maxClamp.deficitNs)diagnostics_.maxClamp=evidence;
+            return 0;
+        }
         const uint64_t delta = service - state.serviceFloor;
         state.serviceFloor = service;
         if (!state.pid) { Add(diagnostics_.idleNs, delta); return 0; }

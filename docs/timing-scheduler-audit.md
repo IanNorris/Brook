@@ -904,14 +904,19 @@ bytes with 1,024 task slots/64 CPU slots, in addition to the 4-KiB steal page.
 No Process or SchedOps layout is changed in this stage.
 
 The final sample brackets its elapsed-clock read with steal reads and retries
-the entire pair on change, at most eight times. A host preemption between the
-two different KVM records therefore cannot publish a new wall timestamp with
-an old steal value. The host test simulates exactly that interleaving and a
-perpetually changing record; it also covers unavailable sources. Invalid samples
+the entire pair on change, at most eight times. A steal-record change during
+the wall read rejects that pair. The host test simulates that interleaving and
+a perpetually changing record; it also covers unavailable sources. This does
+not make the two separate KVM records one atomic publication or prove that a
+stable steal value includes every host delay represented by the wall sample.
+Invalid samples
 break an interval instead of charging an unknown gap to the next task. Regressing
 wall/steal samples are counted and discarded; delayed steal correction is
 carried through a monotonic service floor. Such correction can affect precise
 per-task attribution if the hypervisor update lags, so it is observable.
+The [clamp evidence report](runtime-clamp-evidence.md) retains the raw pairs and
+deficit for the first and largest clamp; record stability alone does not prove
+that the wall-minus-steal service estimate is monotonic.
 
 Standard clock IDs 2/3 now return measured task/group service. The vDSO already
 falls back to syscalls for these IDs. CPU getres advertises 1 ms because remote

@@ -65,9 +65,29 @@ int main() {
     discontinuities.Dispatch(0,1,1,at(1000));
     CHECK(discontinuities.Sample(0,at(2000))==1000);
     CHECK(discontinuities.Sample(0,at(2100,500))==0); // delayed steal correction
+    const auto firstClamp=discontinuities.Diagnostics().firstClamp;
+    CHECK(firstClamp.sample==3 && firstClamp.previousWallNs==2000 && firstClamp.wallNs==2100);
+    CHECK(firstClamp.previousStealNs==0 && firstClamp.stealNs==500);
+    CHECK(firstClamp.serviceFloorNs==2000 && firstClamp.deficitNs==400);
+    CHECK(firstClamp.cpu==0 && firstClamp.pid==1 && firstClamp.incarnation==1);
     CHECK(discontinuities.Sample(0,at(2400,500))==0);
     CHECK(discontinuities.Sample(0,at(2600,500))==100);
     CHECK(discontinuities.Diagnostics().clampedService==2);
+    CHECK(discontinuities.Diagnostics().firstClamp.sample==firstClamp.sample);
+    CHECK(discontinuities.Diagnostics().maxClamp.deficitNs==400);
+    RuntimeAccounting<4,2> clampEvidence;
+    CHECK(clampEvidence.Register(2,22,2,22));clampEvidence.Dispatch(1,2,22,at(10000));
+    CHECK(clampEvidence.Sample(1,at(11000))==1000);
+    CHECK(clampEvidence.Sample(1,at(11100,200))==0);
+    CHECK(clampEvidence.Sample(1,at(11200,800))==0);
+    auto clamp=clampEvidence.Diagnostics();
+    CHECK(clamp.firstClamp.deficitNs==100 && clamp.maxClamp.deficitNs==600);
+    CHECK(clamp.maxClamp.previousWallNs==11100 && clamp.maxClamp.previousStealNs==200);
+    CHECK(clamp.maxClamp.wallNs==11200 && clamp.maxClamp.stealNs==800 && clamp.maxClamp.serviceFloorNs==11000);
+    CHECK(clamp.maxClamp.cpu==1 && clamp.maxClamp.pid==2 && clamp.maxClamp.incarnation==22);
+    // Diagnostics must not change the floor or manufacture catch-up service.
+    CHECK(clampEvidence.Sample(1,at(11800,800))==0);
+    CHECK(clampEvidence.Sample(1,at(11900,800))==100);
     discontinuities.Dispatch(0,2,2,{}); // unknown boundary is not charged to next task
     CHECK(discontinuities.Sample(0,at(10000,500))==0);
     CHECK(discontinuities.Sample(0,at(11000,500))==1000);
