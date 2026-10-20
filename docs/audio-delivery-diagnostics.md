@@ -823,3 +823,102 @@ recovery, verifiers, test/audit evidence and hashes are archived in
 should distinguish the leading write preflight/fd-pinning interval from the
 rest of the inter-branch gap and observe other blocking syscalls by the
 verified producer, without attributing all that gap to userspace.
+
+
+## Selected-thread syscall and return-phase brackets
+
+`sched syscall watch PID INC` enables a default-off diagnostic for one thread
+incarnation. `sched syscall status`, `reset` and `off` inspect or control it.
+The common C dispatcher and `SyscallCheckSignals` have separate `dispatch`
+and `return_check` phase identities. Counts represent measured phases, not
+user syscall counts. Histogram keys include both raw syscall number and phase,
+so even an invalid `UINT64_MAX` syscall remains distinguishable. Results are
+raw C return values; `negative_results` does not claim errno semantics.
+
+The recorder uses short IRQ-masked atomic-flag try sections with no ticket
+reservation, waiting or callbacks while held. Stable-disabled/nonselected
+entries do not read the clock. A selected actor is checked again at completion.
+Epoch/sequence checks exclude stale completions after reset, replacement or
+control changes. Failed record acquisitions have an explicit lifetime counter;
+the next observation clears both preceding-end continuity and any active gap.
+A reader/control busy reply explicitly reports no control effect, permitting
+retry of that reply without assuming an unknown transport failure had no effect.
+Asynchronous exit may leave an unmatched entry; this is not a liveness query.
+There are at most sixteen histogram kinds and sixteen retained slow events,
+with explicit overflow/exclusion/saturation counters.
+
+Elapsed brackets use the KVM-backed audio clock and include scheduling and
+host descheduling. Remaining gaps include recording/assembly overhead,
+interrupts, scheduler and host delay, and application execution. Neither phase
+nor gap is a CPU-time attribution. Return checks include the ordinary
+`SchedulerKernelOperationBoundary()` and signal/restart processing; their raw
+results may differ from common-dispatch results. No assembly entry/return
+contract, scheduler default, quantum or audio guard changes here.
+
+The initial dispatch-only run (`q2-syscall-spans-try-1`, frozen kernel
+`70cbbffd2c0699e851e506afdf350d5680d906544cef0b9392e3cb2e44d5f338`)
+completes the controlled demo in 41.993 seconds under the bounded host load.
+Its selected DSP writer has 839 entries/838 completions and an unmatched normal
+thread exit. The 418 poll calls total 14.512 seconds, with a 1.244-second
+maximum; 418 writes total 98.110 ms, maximum 75.955 ms. Its 4.077-second maximum
+gap is outside the common dispatcher, but the original measurement also
+excluded return-side signal/scheduler checks. It therefore cannot identify
+that gap as userspace time. Audio acceptance fails; workload, CPU-clock,
+ledger/heap, original VM/router exits and filesystem/preservation checks pass.
+The exact original source and verifier remain in `syscall-spans-dispatch-sources`.
+
+The phase-separated run (`q2-syscall-return-try-1`, frozen kernel
+`ef6f0c9799b0bdddb035c4cd37fbd3fd419fc70942cb844bc96b8b748b646d2f`)
+uses the same thirteen driver modules and host-load fixture. It completes the
+demo in 43.111 seconds, with 1,946 entries/1,945 completed phases and only the
+normal unmatched exit. There are no invalid, incomplete, contention,
+continuity-break, kind-overflow or saturated observations. Return checks have
+a maximum duration of 11.461 ms, while the largest remaining inter-phase gap
+is 5,749.708 ms, preceding a successful 4,096-byte DSP write. Thus return checks
+do not account for that run's largest gap. Poll dispatches total 15.347 seconds
+and reach 789.510 ms. Write dispatches reach 125.908 ms; their DSP branch
+submeasurement reaches 62.415 ms with zero explicit backpressure sleep.
+These distinct extrema are not additive parts of one identified episode.
+
+The six-second host-loaded capture contains only 0.980 seconds of PCM. Its
+aligned HDA trace is active for 0.966 seconds and inactive for 5.038 seconds;
+audio acceptance remains false despite no native fault or stream
+discontinuity. All original jobs, CPU-clock/ledger/heap checks, original
+VM/router exits, filesystem checks and saved-data preservation pass. The
+independent verifier retains the audio failure separately from those passes.
+This is diagnostic evidence, not a host-load performance fix or a resolution
+of the historical fast-tempo report. The next attribution needs to cover the
+remaining return/entry assembly and runnable/descheduled/application intervals
+without relabelling the entire unmeasured gap as user execution.
+
+
+The same phase-separated kernel passes the guest-only repeat
+(`q2-syscall-return-guest-try-1`) with 24 bounded CPU workers/four periodic
+sleepers. The demo takes 15.195 seconds; 1,478 entries/1,477 completed phases
+have only the normal unmatched exit and no invalid/incomplete/dropped,
+continuity-break, kind-overflow or saturated observations. Maximum remaining
+gap is 0.191 ms, maximum return check 1.041 microseconds and maximum poll
+66.521 ms. Its six-second capture contains 5.979 seconds of PCM and passes the
+unchanged full-window audio criteria. All eight DSP control cases, original
+jobs, CPU clocks, ledgers/heap, original VM/router exits, filesystem checks and
+saved-data preservation pass. The separate DSP-control diagnostic still has
+its explicitly bounded writer coverage; it is not a complete trace of all
+control writers.
+
+The new model/wrapper regressions cover disabled/nonselected clock avoidance,
+identity/epoch/sequence rejection, abandoned and backward records, result
+preservation, reset crossing, distinct phases for arbitrary raw syscall
+numbers, negative results, capacity/saturation and continuity invalidation
+between or during records. All 68 hosted tests pass. Compiled entry auditing
+passes its twelve supported templates and rejects all 56 injected mutations;
+four unsupported templates remain outside that static audit's scope. Astra's
+read-only review found no remaining blocking diagnostic issue after the phase,
+negative-result naming and dropped-record continuity fixes.
+
+`syscall-return-sources` archives exact sources, patch, controllers, independent
+verifiers, frozen kernel/driver manifest and validation evidence. Results are
+kept separately in `syscall-return-verified-results.json` and
+`syscall-return-guest-verified-results.json`. Host contention remains an open
+failure; neither the quiet control nor diagnostic coverage establishes broad
+browser acceptance, fixes the historical speedup, or justifies changing the
+default scheduler.

@@ -1,4 +1,5 @@
 #include "signal_defaults.h"
+#include "syscall_timing.h"
 #include "file_locks.h"
 #include "unix_lifetime_trace.h"
 // process.cpp -- Process creation, fd table, user stack setup.
@@ -1993,6 +1994,8 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     Process* proc = ProcessCurrent();
     if (!proc || proc->isKernelThread) return syscallResult;
 
+    SyscallTimingCall timing(proc->pid,proc->incarnation,proc->currentSyscallNum,0,SyscallTimingPhase::ReturnCheck);
+
     if (SchedulerKernelOperationBoundary()) {
         SchedulerYield();
         __builtin_trap(); // A terminal thread must never resume.
@@ -2067,25 +2070,25 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
             brook::SerialPrintf("SIGRETURN: pid %u rip=0x%lx rax=%lu (restart? rsp=0x%lx)\n",
                                 proc->pid, mc.rip, mc.rax, mc.rsp);
 
-        return static_cast<int64_t>(mc.rax); // restore original RAX
+        return timing.Result(static_cast<int64_t>(mc.rax)); // restore original RAX
     }
 
     // --- Signal delivery ---
-    if (proc->inSignalHandler) return syscallResult;
+    if (proc->inSignalHandler) return timing.Result(syscallResult);
 
     uint64_t deliverable = (proc->sigPending | PosixTimerPending(proc)) & ~proc->sigMask;
-    if (deliverable == 0) return syscallResult;
+    if (deliverable == 0) return timing.Result(syscallResult);
 
     // Find lowest pending signal
     int signum = __builtin_ctzll(deliverable) + 1;
 
     SignalInfo signalInfo{};
     if (!PosixTimerDequeue(proc, 1ULL << (signum - 1), &signalInfo)) {
-        if (!ProcessDequeueSignal(proc, signum, &signalInfo)) return syscallResult;
+        if (!ProcessDequeueSignal(proc, signum, &signalInfo)) return timing.Result(syscallResult);
     }
 
     uint16_t pid = proc->tgid;
-    if (pid >= MAX_PROCESSES) return syscallResult;
+    if (pid >= MAX_PROCESSES) return timing.Result(syscallResult);
 
     const KernelSigaction sa = ReadSignalAction(pid,signum - 1);
 
@@ -2094,10 +2097,10 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     {
         const auto action = DefaultSignalAction(signum);
         if (action == SignalDefault::Ignore || action == SignalDefault::Continue)
-            return syscallResult;
+            return timing.Result(syscallResult);
         if (action == SignalDefault::Stop) {
             SchedulerMarkStopped(proc, signum);
-            return syscallResult;
+            return timing.Result(syscallResult);
         }
         // Syscall return is a process-context boundary with no sender locks.
         // The synchronous exit path can quiesce peers before exiting this task.
@@ -2107,7 +2110,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
 
     // SIG_IGN (1)
     if (sa.handler == 1)
-        return syscallResult;
+        return timing.Result(syscallResult);
 
     if(!UserReturnAddress(sa.handler)) {
         SerialPrintf("SIGNAL: invalid handler pid %u address=%lx\n",proc->pid,sa.handler);
@@ -2260,5 +2263,5 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
 
     // The handler's mask remains active until rt_sigreturn restores returnMask.
     restoreMask.active = false;
-    return syscallResult; // RAX value (handler ignores it, saved in ucontext)
+    return timing.Result(syscallResult); // RAX value (handler ignores it, saved in ucontext)
 }

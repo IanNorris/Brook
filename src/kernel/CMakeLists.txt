@@ -260,6 +260,7 @@ add_executable(kernel
     src/mouse.cpp
     src/shell.cpp
     src/audio.cpp
+    src/syscall_timing.cpp
     src/boot_logo.cpp
     src/klog.cpp
     src/smp.cpp

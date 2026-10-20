@@ -1,5 +1,6 @@
 #include <cstdio>
 #include "../../kernel/src/dsp_producer_timing.h"
+#include "../../kernel/src/syscall_timing.h"
 #include "../../kernel/src/audio_service_timing.h"
 namespace {int failures=0;}
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"audio timing line %d: %s\n",__LINE__,#x);++failures;}}while(0)
@@ -9,6 +10,78 @@ static uint64_t producerNow=0,producerClockReads=0;
 extern "C" uint64_t AudioClockNowNs(){++producerClockReads;return producerNow;}
 uint64_t DspProducerTimingToken(){return producer.Token();}
 void DspProducerTimingRecord(uint64_t token,const DspProducerEvent& event){producer.Observe(token,event);}
+}
+namespace brook {
+static SyscallTimingModel syscallProbe;
+static uint64_t syscallNow=0,syscallClockReads=0;
+SyscallTimingTicket SyscallTimingEnter(uint64_t pid,uint64_t incarnation,uint64_t number,uint64_t arg0,SyscallTimingPhase phase){
+    auto s=syscallProbe.Snapshot();if(!(s.epoch&1) || s.pid!=pid || s.incarnation!=incarnation)return {};
+    ++syscallClockReads;return syscallProbe.Begin(s.epoch,pid,incarnation,number,arg0,syscallNow,phase);
+}
+void SyscallTimingLeave(SyscallTimingTicket ticket,int64_t result,bool hasResult){++syscallClockReads;syscallProbe.End(ticket,syscallNow,result,hasResult);}
+}
+static void CheckSyscalls(){
+    using namespace brook;
+    {SyscallTimingCall call(22,100,1,7);CHECK(call.Result(-11)==-11);}
+    CHECK(!syscallClockReads && !syscallProbe.Snapshot().entries);
+    syscallProbe.Watch(22,100);syscallNow=100;
+    {SyscallTimingCall wrong(22,101,1,7);wrong.Result(1);}
+    CHECK(!syscallClockReads);
+    {SyscallTimingCall call(22,100,1,7);CHECK(call.Result(1024)==1024);syscallNow=200;}
+    CHECK(syscallProbe.Snapshot().completed==1 && syscallClockReads==2);
+    {SyscallTimingCall call(22,100,1,7);CHECK(call.Result(-11)==-11);syscallNow=300;}
+    CHECK(syscallProbe.Snapshot().kind[0].negativeResults==1);
+    {SyscallTimingCall noResult(22,100,1,7);syscallNow=400;}
+    CHECK(syscallProbe.Snapshot().invalid==1);
+    {SyscallTimingCall crossing(22,100,1,7);crossing.Result(1);syscallProbe.Reset();syscallNow=500;}
+    CHECK(!syscallProbe.Snapshot().completed && !syscallProbe.Snapshot().invalid);
+    SyscallTimingModel m;CHECK(!m.Begin(0,22,100,1,7,1).epoch);m.Watch(22,100);auto epoch=m.Token();
+    CHECK(!m.Begin(epoch,22,101,1,7,1).epoch);
+    auto first=m.Begin(epoch,22,100,1,7,100000000);CHECK(first.epoch==epoch);
+    auto snap=m.Snapshot();CHECK(snap.active && snap.activeNumber==1 && snap.activeArg0==7 && snap.entries==1 && !snap.completed);
+    CHECK(!m.End({epoch,first.sequence+1},150000000,1) && m.Snapshot().active);
+    CHECK(m.End(first,150000000,4096));CHECK(!m.End(first,160000000,4096));
+    auto second=m.Begin(epoch,22,100,202,123,200000000);CHECK(m.End(second,500000000,-11));
+    snap=m.Snapshot();CHECK(snap.completed==2 && snap.kinds==2 && snap.maxCallNs==300000000 && snap.maxGapNs==50000000);
+    CHECK(snap.events[0].number==202 && snap.events[0].result==-11 && snap.events[0].arg0==123 && snap.events[0].hasGap);
+    CHECK(snap.kind[0].calls==1 && snap.kind[0].sumNs==50000000 && snap.kind[1].negativeResults==1);
+    // Missing completion is explicit; a later entry must not fabricate a gap.
+    auto abandoned=m.Begin(epoch,22,100,7,0,600000000);auto replacement=m.Begin(epoch,22,100,1,7,700000000);
+    CHECK(!m.End(abandoned,800000000,1) && m.Snapshot().active);CHECK(m.End(replacement,800000000,1));
+    CHECK(m.Snapshot().incomplete==1 && !m.Snapshot().active);
+    auto bad=m.Begin(epoch,22,100,1,7,900000000);CHECK(!m.End(bad,899999999,1) && m.Snapshot().invalid==1);
+    auto beforeReset=m.Begin(epoch,22,100,1,7,1000000000);m.Reset();CHECK(!m.End(beforeReset,1100000000,1));
+    CHECK(!m.Snapshot().active && !m.Snapshot().completed);epoch=m.Token();
+    auto active=m.Begin(epoch,22,100,1,7,100);CHECK(!m.Begin(epoch,22,100,7,0,99).epoch);
+    CHECK(m.Snapshot().invalid==1 && m.Snapshot().incomplete==1 && !m.End(active,200,1));
+    m.Watch(22,101);epoch=m.Token();CHECK(!m.Begin(epoch,22,100,1,7,1).epoch);
+    auto identity=m.Begin(epoch,22,101,1,7,1);m.Off();CHECK(!m.End(identity,2,1));
+    m.Watch(22,101);epoch=m.Token();uint64_t now=1;
+    for(unsigned i=0;i<40;++i){auto call=m.Begin(epoch,22,101,i,i,now);now+=20000000+i;CHECK(m.End(call,now,0));++now;}
+    snap=m.Snapshot();CHECK(snap.completed==40 && snap.kinds==16 && snap.overflowKinds==24 && snap.retained==16 && snap.excluded==24);
+    CHECK(snap.events[0].endNs-snap.events[0].beginNs==20000039);
+    m.Reset();epoch=m.Token();auto large=m.Begin(epoch,22,101,1,7,1);CHECK(m.End(large,~uint64_t(0),1));
+    CHECK(!m.Begin(epoch,22,101,1,7,1).epoch);large=m.Begin(epoch,22,101,1,7,1);CHECK(m.End(large,~uint64_t(0),1));
+    CHECK(m.Snapshot().saturated && m.Snapshot().kind[0].sumNs==~uint64_t(0));
+    m.Watch(22,100);epoch=m.Token();CHECK(m.Matches(22,100) && !m.Matches(22,101) && !m.Matches(23,100));
+    auto dispatch=m.Begin(epoch,22,100,7,0,100);CHECK(m.End(dispatch,200,1));
+    auto returning=m.Begin(epoch,22,100,7,0,201,SyscallTimingPhase::ReturnCheck);CHECK(m.End(returning,30000000,1));
+    auto next=m.Begin(epoch,22,100,1,7,30000100);CHECK(m.End(next,30000200,4096));
+    snap=m.Snapshot();CHECK(snap.kinds==3 && snap.completed==3 && snap.kind[1].number==7 && snap.kind[1].phase==SyscallTimingPhase::ReturnCheck);
+    CHECK(snap.events[0].phase==SyscallTimingPhase::ReturnCheck && snap.events[0].number==7 && snap.maxGapNs==100);
+    // Missing entry between completed phases clears the next gap, even when
+    // its corresponding completion was never observed.
+    m.BreakContinuity();auto afterDrop=m.Begin(epoch,22,100,7,0,90000000);CHECK(m.End(afterDrop,90000001,0));
+    CHECK(m.Snapshot().continuityBreaks==1 && m.Snapshot().maxGapNs==100);
+    // A drop during an observed call also invalidates its pre-entry gap.
+    auto activeDrop=m.Begin(epoch,22,100,7,0,190000000);m.BreakContinuity();CHECK(m.End(activeDrop,220000000,0));
+    CHECK(!m.Snapshot().events[0].hasGap && m.Snapshot().continuityBreaks==2);
+    m.Watch(22,100);epoch=m.Token();
+    auto invalidNumber=m.Begin(epoch,22,100,~uint64_t(0),0,1);CHECK(m.End(invalidNumber,2,-38));
+    auto returnInvalid=m.Begin(epoch,22,100,~uint64_t(0),0,3,SyscallTimingPhase::ReturnCheck);CHECK(m.End(returnInvalid,4,-38));
+    CHECK(m.Snapshot().kinds==2 && m.Snapshot().kind[0].phase==SyscallTimingPhase::Dispatch && m.Snapshot().kind[1].phase==SyscallTimingPhase::ReturnCheck);
+    m.BreakContinuity(true);CHECK(m.Snapshot().saturated);
+    m.Off();CHECK(!m.Matches(22,100));
 }
 static void CheckProducer(){
     using namespace brook;
@@ -66,6 +139,7 @@ static void CheckProducer(){
 }
 int main(){
     CheckProducer();
+    CheckSyscalls();
     using namespace brook;AudioServiceTimingModel m;
     CHECK(!m.Observe(0,1,2,3,4,true));m.Worker(8,99);m.Enable(true);auto token=m.Token();
     CHECK(m.Observe(token,100,200,10000200,10001200,true));

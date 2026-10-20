@@ -57,6 +57,7 @@
 #include "audio.h"
 #include "dsp_write_plan.h"
 #include "dsp_producer_timing.h"
+#include "syscall_timing.h"
 #include "profiler.h"
 #include "smp.h"
 #include "apic.h"
@@ -14656,16 +14657,17 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
                                  uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
     Process* proc = ProcessCurrent();
+    SyscallTimingCall timing(proc?proc->pid:0,proc?proc->incarnation:0,num,a0);
 
     if (proc && proc->straceEnabled)
     {
         // If a filter is set, only trace matching categories
         if (proc->straceFilter == 0 || (SyscallCategory(num) & proc->straceFilter))
-            return SyscallDispatchTraced(num, a0, a1, a2, a3, a4, a5);
+            return timing.Result(SyscallDispatchTraced(num, a0, a1, a2, a3, a4, a5));
         // Filtered out — dispatch without tracing
         SyscallFn fn2 = (num < SYSCALL_MAX) ? g_syscallTable[num] : nullptr;
-        if (!fn2) return -38;
-        return fn2(a0, a1, a2, a3, a4, a5);
+        if (!fn2) return timing.Result(-38);
+        return timing.Result(fn2(a0, a1, a2, a3, a4, a5));
     }
     SyscallFn fn = (num < SYSCALL_MAX) ? g_syscallTable[num] : nullptr;
     if (!fn) {
@@ -14673,12 +14675,12 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
                      "(a0=%lx a1=%lx a2=%lx a3=%lx a4=%lx a5=%lx) -> -ENOSYS\n",
                      proc ? proc->pid : 0, proc ? proc->name : "?",
                      num, a0, a1, a2, a3, a4, a5);
-        return -38; // -ENOSYS
+        return timing.Result(-38); // -ENOSYS
     }
 
     // RequestServer uses the same explicitly enabled, filtered strace path
     // as every other process; no process-name-specific logging here.
-    return fn(a0, a1, a2, a3, a4, a5);
+    return timing.Result(fn(a0, a1, a2, a3, a4, a5));
 }
 
 // ---------------------------------------------------------------------------
