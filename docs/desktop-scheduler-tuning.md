@@ -169,3 +169,15 @@ show other modules' allocated sections match. Freezing the common kernel/modules
 removes those differences from the workload comparison. Build hashes and section
 inventories are retained under the ignored timing-workload directory. Native
 workload acceptance is recorded separately from these build/model checks.
+
+## Audio service versus scheduling delay
+
+The [mixer service probe](audio-mixer-service-timing.md) now separates sleep
+resumption, service and loop-tail brackets, with recording disabled at boot.
+Its first two MLFQ/EEVDF diagnostic boots observe approximately 91–93 ms maximum
+late resumption and approximately 46 ms maximum service. Those are elapsed
+brackets, not pure runnable delay or CPU work. A short DMA publication hazard
+also reproduces independently of the longest mixer episodes. Therefore neither
+a good synthetic sleeper p95 nor the absence of a mixer CPU hotspot establishes
+continuous desktop audio. Keep device publication safety, blocked wakeup,
+ready-to-dispatch latency and host delay distinct in subsequent comparisons.

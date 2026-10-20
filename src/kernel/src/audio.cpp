@@ -30,6 +30,36 @@ extern "C" uint64_t AudioClockNowNs()
 
 static const AudioDriver* g_audioDriver = nullptr;
 static SpinLock g_mixerLock;
+static SpinLock g_audioTimingLock;
+static AudioServiceTimingModel g_audioTiming;
+static uint64_t g_audioTimingEpoch=0,g_audioTimingContention=0;
+void AudioServiceTimingEnable(bool enabled){
+    SpinLockAcquire(&g_audioTimingLock);g_audioTiming.Enable(enabled);
+    __atomic_store_n(&g_audioTimingEpoch,g_audioTiming.Token(),__ATOMIC_RELEASE);
+    SpinLockRelease(&g_audioTimingLock);
+}
+void AudioServiceTimingReset(){
+    SpinLockAcquire(&g_audioTimingLock);g_audioTiming.Reset();
+    __atomic_store_n(&g_audioTimingEpoch,g_audioTiming.Token(),__ATOMIC_RELEASE);
+    SpinLockRelease(&g_audioTimingLock);
+}
+AudioServiceTimingSnapshot AudioServiceTimingRead(){
+    SpinLockAcquire(&g_audioTimingLock);auto result=g_audioTiming.Snapshot();SpinLockRelease(&g_audioTimingLock);
+    result.contendedRecords=__atomic_load_n(&g_audioTimingContention,__ATOMIC_RELAXED);return result;
+}
+static void AudioServiceTimingRecord(uint64_t token,uint64_t before,uint64_t deadline,
+                                    uint64_t wake,uint64_t end,bool worked){
+    // The mixer never waits for a diagnostic reader/reset. Lifetime drop count
+    // is separate from resettable interval counters and must be checked.
+    if(!SpinLockTryAcquire(&g_audioTimingLock)){
+        auto old=__atomic_load_n(&g_audioTimingContention,__ATOMIC_RELAXED);
+        while(old!=~uint64_t(0) && !__atomic_compare_exchange_n(&g_audioTimingContention,
+              &old,old+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+        return;
+    }
+    g_audioTiming.Observe(token,before,deadline,wake,end,worked);
+    SpinLockRelease(&g_audioTimingLock);
+}
 
 // Independently owned FIFO rings. Samples remain charged to their stream
 // until the driver accepts them; prepared mixes never own pointers into a ring.
@@ -496,14 +526,21 @@ static void AudioMixerThreadFn(void* /*arg*/)
     SerialPuts("audio: mixer thread running\n");
     for (;;)
     {
+        const uint64_t timingToken=__atomic_load_n(&g_audioTimingEpoch,__ATOMIC_ACQUIRE);
+        const uint64_t beforeSleep=(timingToken&1)?AudioClockNowNs():0;
         // Sleep ~10ms
         Process* self = ProcessCurrent();
-        self->wakeupTick = ApicTickCount() + 10;
+        self->wakeupTick = ApicTickCount() + AudioServicePeriodNs/1000000;
+        const uint64_t afterDeadline=(timingToken&1)?AudioClockNowNs():0;
         SchedulerBlock(self);
+        const uint64_t wake=(timingToken&1)?AudioClockNowNs():0;
 
         // Flush whatever has accumulated
-        if (g_mixerReady && g_audioDriver && g_audioDriver->play)
+        const bool worked=g_mixerReady && g_audioDriver && g_audioDriver->play;
+        if (worked)
             AudioMixerTick();
+        if(timingToken&1)AudioServiceTimingRecord(timingToken,beforeSleep,afterDeadline,
+            wake,AudioClockNowNs(),worked);
     }
 }
 
@@ -515,6 +552,7 @@ void AudioMixerThreadStart()
         SerialPuts("audio: failed to create mixer thread\n");
         return;
     }
+    SpinLockAcquire(&g_audioTimingLock);g_audioTiming.Worker(thread->pid,thread->incarnation);SpinLockRelease(&g_audioTimingLock);
     SchedulerAddProcess(thread);
     SerialPrintf("audio: mixer thread started (pid %u)\n", thread->pid);
 }

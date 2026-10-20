@@ -3582,6 +3582,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap check      - validate heap block metadata\n"
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  audio stats - cached stream queues, completion and guest clock\n"
+            "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
             "  mapping timing on|off|reset|status - preflight mutex timings (default off)\n"
@@ -3855,6 +3856,33 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text(","); reply.field("timer_ticks_per_ms", clock.timerTicksPerMs);
         reply.text(","); reply.field("initial_timer_ticks_per_ms", clock.initialTimerTicksPerMs);
         reply.text("}\n"); reply.send();
+    }
+    else if(NetStrEq(cmd,"audio timing on") || NetStrEq(cmd,"audio timing off") ||
+            NetStrEq(cmd,"audio timing reset") || NetStrEq(cmd,"audio timing status")) {
+        if(NetStrEq(cmd,"audio timing on"))AudioServiceTimingEnable(true);
+        else if(NetStrEq(cmd,"audio timing off"))AudioServiceTimingEnable(false);
+        else if(NetStrEq(cmd,"audio timing reset"))AudioServiceTimingReset();
+        const auto s=AudioServiceTimingRead();BridgeReply header;header.text("{");header.field("epoch",s.epoch);
+        header.text(",\"enabled\":");header.text((s.epoch&1)?"true":"false");
+        header.text(",");header.field("worker_pid",s.workerPid);header.text(",");header.field("worker_incarnation",s.workerIncarnation);
+        header.text(",\"scope\":\"audio_mix KVM-clock brackets only; late is lower bound after nominal 10ms; service includes locks/host delay; top slow episodes, not timeline; contended records since boot\",");header.send();
+        BridgeReply r;
+        r.field("cycles",s.cycles);r.text(",");r.field("worked",s.worked);r.text(",");r.field("invalid_clock",s.invalidClock);
+        r.text(",");r.field("sum_sleep_ns",s.sumSleepNs);r.text(",");r.field("max_sleep_ns",s.maxSleepNs);
+        r.text(",");r.field("sum_late_lower_ns",s.sumLateLowerNs);r.text(",");r.field("max_late_lower_ns",s.maxLateLowerNs);
+        r.text(",");r.field("sum_service_ns",s.sumServiceNs);r.text(",");r.field("max_service_ns",s.maxServiceNs);
+        r.text(",");r.field("max_setup_ns",s.maxSetupNs);r.text(",");r.field("max_tail_ns",s.maxTailNs);
+        r.text(",");r.field("slow_cycles",s.slowCycles);r.text(",");r.field("excluded_slow",s.excludedSlow);
+        r.text(",");r.field("contended_records",s.contendedRecords);r.text(",\"saturated\":");r.text(s.saturated?"true":"false");r.text(",\"events\":[");r.send();
+        for(unsigned i=0;i<s.retained;++i){const auto& e=s.events[i];BridgeReply row;
+            if(i)row.text(",");row.text("{");row.field("before_sleep_ns",e.beforeSleepNs);
+            row.text(",");row.field("after_deadline_ns",e.afterDeadlineNs);row.text(",");row.field("wake_ns",e.wakeNs);
+            row.text(",");row.field("end_ns",e.endNs);row.text(",");row.field("setup_ns",e.setupNs);
+            row.text(",");row.field("late_lower_ns",e.lateLowerNs);row.text(",");row.field("service_ns",e.serviceNs);
+            row.text(",");row.field("tail_ns",e.tailNs);row.text(",");row.field("score_ns",e.scoreNs);
+            row.text(",\"worked\":");row.text(e.worked?"true":"false");row.text("}");row.send();
+        }
+        DebugChannelSend("]}\n");
     }
     else if (NetStrEq(cmd, "audio stats")) {
         DebugAudioDiagnostics();

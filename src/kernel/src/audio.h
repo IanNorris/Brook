@@ -10,6 +10,7 @@
 // AudioMixerFlush() mixes streams when delivering a batch to the driver.
 
 #include <stdint.h>
+#include "audio_service_timing.h"
 
 namespace brook {
 

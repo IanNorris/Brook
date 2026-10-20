@@ -31,6 +31,8 @@ def main():
                         help='Optional loaded CPU/CS capture; keep separate from unprofiled controls')
     parser.add_argument('--mapping-timing',action='store_true',
                         help='Optional preflight mapping-lock counters; diagnostic cohort only')
+    parser.add_argument('--audio-service-timing',action='store_true',
+                        help='Optional mixer sleep/service brackets; diagnostic cohort only')
     args=parser.parse_args();phase,policy=args.phase,args.policy
     if not re.fullmatch('[a-z0-9-]{1,48}',phase):parser.error('Use a lowercase alphanumeric phase name')
     review=args.review.resolve();metadata=json.loads((review/'candidate.json').read_text())
@@ -62,12 +64,13 @@ def main():
     def has(name):return (out/(name+'.json')).exists()
     if has('measurement-mode'):
      assert read('measurement-mode')['mapping_timing']==args.mapping_timing,'Do not change diagnostic mode when resuming a cohort'
+     assert read('measurement-mode').get('audio_service_timing',False)==args.audio_service_timing,'Do not change audio diagnostic mode when resuming'
     else:
-     assert not args.mapping_timing or not has('harness'),'Do not enable new counters in an existing cohort'
-     save('measurement-mode',dict(mapping_timing=args.mapping_timing))
-    def mapping_control(name,command):
+     assert not (args.mapping_timing or args.audio_service_timing) or not has('harness'),'Do not enable new counters in an existing cohort'
+     save('measurement-mode',dict(mapping_timing=args.mapping_timing,audio_service_timing=args.audio_service_timing))
+    def diagnostic_control(name,command):
      if has(name):return read(name)
-     if has(name+'-intent'):raise RuntimeError('Uncertain mapping control delivery; inspect current epoch before resuming')
+     if has(name+'-intent'):raise RuntimeError('Uncertain diagnostic control delivery; inspect current epoch before resuming')
      save(name+'-intent',dict(command=command,host_monotonic_ns=time.monotonic_ns()))
      return save(name,b.server.guest(d,command))
     def tracked(name,argv):
@@ -124,7 +127,9 @@ def main():
      save('preflight',dict(input=[x for x in rows('input') if x['state']['key']=='KeyP']))
     if not has('idle-begin'):
      if args.mapping_timing:
-      mapping_control('mapping-enable','mapping timing on');mapping_control('mapping-idle-before','mapping timing reset')
+      diagnostic_control('mapping-enable','mapping timing on');diagnostic_control('mapping-idle-before','mapping timing reset')
+     if args.audio_service_timing:
+      diagnostic_control('audio-service-enable','audio timing on');diagnostic_control('audio-service-idle-before','audio timing reset')
      b.server.guest(d,'sched timing on');b.server.guest(d,'sched timing reset');save('idle-begin',states()[-1])
     if not has('idle'):
      first=read('idle-begin');deadline=time.monotonic()+90
@@ -136,9 +141,13 @@ def main():
      print('MIX_IDLE_DONE',phase,len(values),flush=True)
     if args.mapping_timing and not has('mapping-idle-after'):
      save('mapping-idle-after',b.server.guest(d,'mapping timing status'))
+    if args.audio_service_timing and not has('audio-service-idle-after'):
+     save('audio-service-idle-after',b.server.guest(d,'audio timing status'))
+    if args.audio_service_timing and not has('audio-service-load-before'):
+     diagnostic_control('audio-service-load-before','audio timing reset')
     if args.mapping_timing and not has('mapping-load-before'):
      if not has('mapping-procs-before'):save('mapping-procs-before',b.server.guest(d,'procs',timeout=30))
-     mapping_control('mapping-load-before','mapping timing reset')
+     diagnostic_control('mapping-load-before','mapping timing reset')
     if not has('clock-before'):save('clock-before',b.server.guest(d,'clock status'))
     if not has('runtime-before'):save('runtime-before',b.server.guest(d,'sched runtime status'))
     if not has('service-before'):save('service-before',b.server.guest(d,'sched policy service'))
@@ -186,7 +195,9 @@ def main():
     assert bench.evidence['status']['guest']['live_tasks']==0
     if not has('load-after'):save('load-after',dict(clock=guest_clock(),ready_timing=b.server.guest(d,'sched timing status')))
     if args.mapping_timing and not has('mapping-load-after'):
-     mapping_control('mapping-load-after','mapping timing off')
+     diagnostic_control('mapping-load-after','mapping timing off')
+    if args.audio_service_timing and not has('audio-service-load-after'):
+     diagnostic_control('audio-service-load-after','audio timing off')
     if args.profile_ms and not has('profile-export'):
      deadline=time.monotonic()+60
      while 'RUNNING' in b.server.profile(s,action='status').get('reply',''):
@@ -229,6 +240,7 @@ def main():
     summary=dict(phase=phase,policy=policy,kernel=d['kernel_sha256'],guest_memory_gib=6,vcpus=8,hda_use_timer=hda_use_timer,audio_buffer_us=metadata.get('audio_buffer_us',200000),scope='headless GPU VM, fresh Firefox profile, generated local video, 24 bounded CPU workers; input ack includes HTTP and DOM RAF opportunity, not physical display latency; load alignment assumes 1x KVM clock checked by reported brackets',host_guest_rate_low=clock_low,host_guest_rate_high=clock_high,load_host_start_latest_ns=load_start,load_host_end_earliest_ns=load_end,idle=media_summary(read('idle')['rows']),loaded=media_summary(loaded),cpu_batches=sum(counts),cpu_service_ratio=max(counts)/min(counts),periodic_p95_ms=max(x['p95_ns'] for x in result['periodic'])/1e6,periodic_max_ms=max(x['max_ns'] for x in result['periodic'])/1e6,inputs=inputs,audio_frames=n,audio_host_s=capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0],audio_host_rate_ratio=n/rate/(capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0]),audio_longest_silent_10ms_bins=longest)
     summary['profile_ms']=args.profile_ms
     summary['mapping_timing']=args.mapping_timing
+    summary['audio_service_timing']=args.audio_service_timing
     c0,c1=capture['host_monotonic_interval']
     summary['audio_capture_inside_load']=load_start<=c0*1e9<=c1*1e9<=load_end
     save('summary',summary);save('rms-10ms',levels);print('MIX_SUMMARY',json.dumps(summary),flush=True)
