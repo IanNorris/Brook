@@ -10802,7 +10802,10 @@ static int64_t sys_fadvise64(uint64_t, uint64_t, uint64_t,
 static int64_t sys_getpriority(uint64_t, uint64_t, uint64_t,
                                 uint64_t, uint64_t, uint64_t)
 {
-    return 0; // default nice value
+    // Linux's successful syscall result is 20 - nice, not libc's signed nice.
+    // All tasks currently expose fixed nice 0; selectors and nice changes
+    // remain compatibility stubs, separate from the scheduler priority hint.
+    return 20;
 }
 
 static int64_t sys_setpriority(uint64_t, uint64_t, uint64_t,
