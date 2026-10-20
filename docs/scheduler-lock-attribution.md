@@ -171,3 +171,48 @@ without this trace code, with explicit speaker-audio authorization. Do not
 build or stage further kernels while that review VM is running. Loaded trace
 attribution and instrumentation-cost controls remain the next private work
 after handback; this diagnostic is not a scheduling performance fix.
+
+## Offline analysis
+
+`scripts/workloads/analyze_sched_lock_trace.py` consumes a saved status reply.
+It merges duplicate slots by CPU/epoch/serial, accepting a partial publication
+followed by a compatible completed one, and rejects conflicting identities or
+unsupported sample flags. Unknown publications, old windows, partial episodes,
+missing clocks, lifetime loss/error counters and reported CPU IDs remain visible.
+Known clock rewinds suppress derived intervals and cross-record bounds; missing
+clock samples exclude cross-record matching. A reported steal delta larger than
+elapsed wall time is retained with no invented nonnegative execution estimate.
+
+Ticket-neighbor matches are candidates, even if only one predecessor is retained.
+The analyser reports conditional bounds from the release bracket to the next
+acquisition observation. Unretained events or full uint32 ticket cycles are not
+ruled out, and acquisition publication delay remains included. It never selects
+the nearest of multiple candidates or calls those bounds exact handoff latency.
+The quiet native capture has 24 distinct retained events and four such candidates;
+their conditional upper bounds are at most 451 ns. This does not explain the
+seconds-long host-load stall or establish an uninstrumented performance result.
+
+Caller-name decoding requires both an ELF and the expected kernel SHA-256 for
+the captured run. The analyser checks the file against that supplied hash; the
+hash argument must come from the capture's independently retained session/build
+evidence, not merely from whichever ELF happens to be available. It does not
+cryptographically bind a raw status JSON to that session.
+
+For the retained native example, from the repository root:
+
+```sh
+python3 scripts/workloads/analyze_sched_lock_trace.py \
+  build/reviews/lock-trace-native-20261020/trace-after.json \
+  --kernel build/workloads/timing-scheduler-20261020/lock-trace-frozen/BROOK.elf \
+  --expected-kernel-sha256 a065ff1db0ecf68eb2642449b01ac3a876676fa9e0e040221f321cebae18b4f2 \
+  --output build/reviews/lock-trace-native-20261020/offline-analysis.json
+python3 scripts/test_analyze_sched_lock_trace.py
+```
+
+Eleven focused tests cover known bounds including overlapping release brackets,
+partial/complete duplicate merging, missing predecessors, ticket wrap/multiple
+candidates, future/old-window exclusion, clock rewind and lagged steal, unknown
+publications, malformed identities/flags, candidate holders and wrong-ELF hash
+rejection. Astra's review identified the backward-clock bound issue; the final
+analyser excludes those records and retains a regression for either side of the
+proposed handoff. This work is offline and leaves the live review VM untouched.
