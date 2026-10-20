@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include "memory/mapping_transaction.h"
 #include "memory/user_mapping.h"
+#include "memory/mapping_access_timing.h"
 #include "memory/file_object.h"
 #include "memory/file_mapping_registry.h"
 #include "memory/virtual_memory.h"
@@ -107,6 +108,10 @@ void KMutexLock(KMutex* mutex) {
     hostMutex(mutex).lock();
 }
 void KMutexUnlock(KMutex* mutex) { hostMutex(mutex).unlock(); }
+bool KvmClockReadStableNs(uint64_t* result) {
+    *result=std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();return true;
+}
 void SchedulerKernelRegionEnter(Process* process) { ++process->kernelRegionDepth;ProcessRef(process); }
 void SchedulerKernelRegionLeave(Process* process) { CHECK(process->kernelRegionDepth);--process->kernelRegionDepth;ProcessUnref(process); }
 void SchedulerUnblock(Process* process) {
@@ -883,7 +888,11 @@ static void failedCloneAcknowledgement() {
     CHECK(!cloned&&returned);
     AddressSpaceUnref(child);CHECK(ProcessCleanupStep());
     CHECK(PmmGetRefCount(first)==1&&maps(first)==1);
+    MappingAccessTimingEnable(true);MappingAccessTimingReset();
     CHECK(UserMappingPageAccess(&actor,source,va.raw(),2,true)==UserPageAccess::Ready);
+    MappingAccessTimingEnable(false);
+    const auto timing=MappingAccessTimingRead();
+    CHECK(timing.write.samples==1 && !timing.write.invalidClock && timing.read.samples==0);
     CHECK(VmmLeafPhysical(VmmReadLeaf(source->pageTable,va))==first);
     AddressSpaceUnref(source);CHECK(ProcessCleanupStep());
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);

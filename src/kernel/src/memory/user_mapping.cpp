@@ -7,6 +7,7 @@
 #include "serial.h"
 #include "file_object.h"
 #include "vfs.h"
+#include "mapping_access_timing.h"
 
 namespace brook {
 // Source metadata and leaves are stable under AS.mutation. Destination is not
@@ -511,9 +512,15 @@ UserPageAccess UserMappingPageAccess(Process* actor, AddressSpaceState* space, u
     // Pin AS lifetime and cancellation protection before a potentially
     // blocking mutation lock. Read-only PTE/range checks need no file gates.
     MappingTransaction operation(actor,space);
+    const uint64_t timingToken=MappingAccessTimingToken();
+    const uint64_t timingBefore=(timingToken&1)?MappingAccessTimingClock():0;
     KMutexLock(&space->mutation);
+    const uint64_t timingAcquired=(timingToken&1)?MappingAccessTimingClock():0;
     bool cow=false;auto status=CheckPage(space,address,access,cow);
+    const uint64_t timingEnded=(timingToken&1)?MappingAccessTimingClock():0;
     KMutexUnlock(&space->mutation);
+    if(timingToken&1)MappingAccessTimingRecord(timingToken,(access&2)!=0,timingBefore,
+        timingAcquired,timingEnded,actor->pid,actor->incarnation);
     if (!resolveCow || !cow) return status;
     // Reacquire the existing full transaction and revalidate before CoW.
     if (!operation.Prepare(1,0)) return UserPageAccess::OutOfMemory;

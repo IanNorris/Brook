@@ -16,6 +16,7 @@
 #include "memory/physical_memory.h"
 #include "memory/exec_page_cache.h"
 #include "memory/address_space.h"
+#include "memory/mapping_access_timing.h"
 #include "memory/virtual_memory.h"
 #include "klog.h"
 #include "profiler.h"
@@ -3583,6 +3584,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio stats - cached stream queues, completion and guest clock\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
+            "  mapping timing on|off|reset|status - preflight mutex timings (default off)\n"
             "  sched policy status|rr|mlfq|eevdf - inspect or select a registered policy\n"
             "  sched runtime status - running intervals, steal availability and read errors\n"
             "  mem exec-cache  - executable page sharing counters\n"
@@ -3803,6 +3805,32 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         char report[768];
         HeapTimingFormat(report, sizeof(report));
         DebugChannelSend(report);
+    }
+    else if (NetStrEq(cmd, "mapping timing on") || NetStrEq(cmd, "mapping timing off") ||
+             NetStrEq(cmd, "mapping timing reset") || NetStrEq(cmd, "mapping timing status")) {
+        if(NetStrEq(cmd,"mapping timing on"))MappingAccessTimingEnable(true);
+        else if(NetStrEq(cmd,"mapping timing off"))MappingAccessTimingEnable(false);
+        else if(NetStrEq(cmd,"mapping timing reset"))MappingAccessTimingReset();
+        const auto s=MappingAccessTimingRead();BridgeReply header;
+        header.text("{");header.field("epoch",s.epoch);header.text(",\"enabled\":");
+        header.text((s.epoch&1)?"true":"false");
+        header.text(",\"scope\":\"UserMappingPageAccess preflight only; wait includes scheduling; hold excludes unlock and CoW; nanoseconds; clock/measurement overhead included; intervals crossing control changes ignored\",\"bounds_ns\":[");
+        for(unsigned i=0;i+1<MappingAccessTimingBins;++i){if(i)header.text(",");header.number(MappingAccessTimingBounds[i]);}
+        header.text("],");header.send();
+        const auto row=[](const char* name,const MappingAccessTimingCounts& c){
+            BridgeReply r;r.text("\"");r.text(name);r.text("\":{");
+            r.field("samples",c.samples);r.text(",");r.field("invalid_clock",c.invalidClock);
+            r.text(",");r.field("wait_ns",c.waitNs);r.text(",");r.field("hold_ns",c.holdNs);
+            r.text(",");r.field("max_wait_ns",c.maxWaitNs);r.text(",");r.field("max_hold_ns",c.maxHoldNs);
+            r.text(",");r.field("max_wait_pid",c.maxWaitPid);r.text(",");r.field("max_wait_incarnation",c.maxWaitIncarnation);
+            r.text(",");r.field("max_hold_pid",c.maxHoldPid);r.text(",");r.field("max_hold_incarnation",c.maxHoldIncarnation);
+            r.text(",\"saturated\":");r.text(c.saturated?"true":"false");r.send();
+            BridgeReply w;w.text(",\"wait_bins\":[");
+            for(unsigned i=0;i<MappingAccessTimingBins;++i){if(i)w.text(",");w.number(c.waitBins[i]);}w.text("]");w.send();
+            BridgeReply h;h.text(",\"hold_bins\":[");
+            for(unsigned i=0;i<MappingAccessTimingBins;++i){if(i)h.text(",");h.number(c.holdBins[i]);}h.text("]}");h.send();
+        };
+        row("read",s.read);DebugChannelSend(",");row("write",s.write);DebugChannelSend("}\n");
     }
     else if (NetStrEq(cmd, "epoll diag on") || NetStrEq(cmd, "epoll diag off") ||
              NetStrEq(cmd, "epoll diag status")) {

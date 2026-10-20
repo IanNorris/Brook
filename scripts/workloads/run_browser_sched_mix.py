@@ -29,6 +29,8 @@ def main():
     parser.add_argument('--profile-ms',type=int,default=0,
                         choices=[0,*range(100,5001)],metavar='0 or 100..5000',
                         help='Optional loaded CPU/CS capture; keep separate from unprofiled controls')
+    parser.add_argument('--mapping-timing',action='store_true',
+                        help='Optional preflight mapping-lock counters; diagnostic cohort only')
     args=parser.parse_args();phase,policy=args.phase,args.policy
     if not re.fullmatch('[a-z0-9-]{1,48}',phase):parser.error('Use a lowercase alphanumeric phase name')
     review=args.review.resolve();metadata=json.loads((review/'candidate.json').read_text())
@@ -58,6 +60,16 @@ def main():
     def save(name,value):b.write(out/(name+'.json'),value);return value
     def read(name):return json.loads((out/(name+'.json')).read_text())
     def has(name):return (out/(name+'.json')).exists()
+    if has('measurement-mode'):
+     assert read('measurement-mode')['mapping_timing']==args.mapping_timing,'Do not change diagnostic mode when resuming a cohort'
+    else:
+     assert not args.mapping_timing or not has('harness'),'Do not enable new counters in an existing cohort'
+     save('measurement-mode',dict(mapping_timing=args.mapping_timing))
+    def mapping_control(name,command):
+     if has(name):return read(name)
+     if has(name+'-intent'):raise RuntimeError('Uncertain mapping control delivery; inspect current epoch before resuming')
+     save(name+'-intent',dict(command=command,host_monotonic_ns=time.monotonic_ns()))
+     return save(name,b.server.guest(d,command))
     def tracked(name,argv):
      folder=out/name;folder.mkdir(exist_ok=True);p=folder/'command-evidence.json'
      if p.exists():argv=json.loads(p.read_text())['request']['argv']
@@ -111,6 +123,8 @@ def main():
       assert time.monotonic()<deadline,'No DOM preflight ack; inspect focus before sending more input';time.sleep(.2)
      save('preflight',dict(input=[x for x in rows('input') if x['state']['key']=='KeyP']))
     if not has('idle-begin'):
+     if args.mapping_timing:
+      mapping_control('mapping-enable','mapping timing on');mapping_control('mapping-idle-before','mapping timing reset')
      b.server.guest(d,'sched timing on');b.server.guest(d,'sched timing reset');save('idle-begin',states()[-1])
     if not has('idle'):
      first=read('idle-begin');deadline=time.monotonic()+90
@@ -120,6 +134,11 @@ def main():
       assert time.monotonic()<deadline,'Idle telemetry deadline; inspect same page';time.sleep(.3)
      save('idle',dict(first=first,last=values[-1],rows=values,ready_timing=b.server.guest(d,'sched timing status')))
      print('MIX_IDLE_DONE',phase,len(values),flush=True)
+    if args.mapping_timing and not has('mapping-idle-after'):
+     save('mapping-idle-after',b.server.guest(d,'mapping timing status'))
+    if args.mapping_timing and not has('mapping-load-before'):
+     if not has('mapping-procs-before'):save('mapping-procs-before',b.server.guest(d,'procs',timeout=30))
+     mapping_control('mapping-load-before','mapping timing reset')
     if not has('clock-before'):save('clock-before',b.server.guest(d,'clock status'))
     if not has('runtime-before'):save('runtime-before',b.server.guest(d,'sched runtime status'))
     if not has('service-before'):save('service-before',b.server.guest(d,'sched policy service'))
@@ -166,6 +185,8 @@ def main():
      bench.poll();assert time.monotonic()<deadline,'Inspect same CPU job';time.sleep(.3)
     assert bench.evidence['status']['guest']['live_tasks']==0
     if not has('load-after'):save('load-after',dict(clock=guest_clock(),ready_timing=b.server.guest(d,'sched timing status')))
+    if args.mapping_timing and not has('mapping-load-after'):
+     mapping_control('mapping-load-after','mapping timing off')
     if args.profile_ms and not has('profile-export'):
      deadline=time.monotonic()+60
      while 'RUNNING' in b.server.profile(s,action='status').get('reply',''):
@@ -207,6 +228,7 @@ def main():
     counts=[x['batches'] for x in result['cpu']];assert len(counts)==24 and min(counts)>0 and all(x['samples']>0 and not x['early'] for x in result['periodic'])
     summary=dict(phase=phase,policy=policy,kernel=d['kernel_sha256'],guest_memory_gib=6,vcpus=8,hda_use_timer=hda_use_timer,audio_buffer_us=metadata.get('audio_buffer_us',200000),scope='headless GPU VM, fresh Firefox profile, generated local video, 24 bounded CPU workers; input ack includes HTTP and DOM RAF opportunity, not physical display latency; load alignment assumes 1x KVM clock checked by reported brackets',host_guest_rate_low=clock_low,host_guest_rate_high=clock_high,load_host_start_latest_ns=load_start,load_host_end_earliest_ns=load_end,idle=media_summary(read('idle')['rows']),loaded=media_summary(loaded),cpu_batches=sum(counts),cpu_service_ratio=max(counts)/min(counts),periodic_p95_ms=max(x['p95_ns'] for x in result['periodic'])/1e6,periodic_max_ms=max(x['max_ns'] for x in result['periodic'])/1e6,inputs=inputs,audio_frames=n,audio_host_s=capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0],audio_host_rate_ratio=n/rate/(capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0]),audio_longest_silent_10ms_bins=longest)
     summary['profile_ms']=args.profile_ms
+    summary['mapping_timing']=args.mapping_timing
     c0,c1=capture['host_monotonic_interval']
     summary['audio_capture_inside_load']=load_start<=c0*1e9<=c1*1e9<=load_end
     save('summary',summary);save('rms-10ms',levels);print('MIX_SUMMARY',json.dumps(summary),flush=True)

@@ -36,6 +36,11 @@ retain the intermittent HDA fault as unresolved, improve its failure evidence,
 and identify address-space validation mutex waits and GPU completion polling
 in loss-free MLFQ/EEVDF captures. These counts do not establish wait durations.
 
+[Mapping preflight timings](mapping-preflight-timing.md) now separate initial
+validation acquisition wait and check-hold brackets with a runtime probe off by
+default. Native EEVDF/MLFQ measurements show sub-microsecond typical checks and
+long waiting tails; other holders and grant-to-run delays remain unmeasured.
+
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
 `f932600c7ef0ac9606057f8e976e47b3f397695aae69383dc965a6d342e2f1b3`.
 The native review initially estimated roughly 1.5× playback in Quake II and

@@ -245,6 +245,7 @@ add_executable(kernel
     src/memory/mapping_pin_registry.cpp
     src/memory/mapping_ranges.cpp
     src/memory/user_mapping.cpp
+    src/memory/mapping_access_timing.cpp
     src/scheduler.cpp
     src/compositor.cpp
     src/compositor_scene.cpp

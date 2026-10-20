@@ -104,6 +104,10 @@ optimization must preserve range permissions, CoW, cancellation protection,
 address-space lifetime, concurrent unmap/protect and fault-retry semantics.
 Do not replace those checks merely to obtain a faster synthetic result.
 
+The subsequent [preflight timing probe](mapping-preflight-timing.md) measures
+wait/check brackets under both policies. It preserves the distinction between
+initial validation, other lock holders and scheduling after handoff.
+
 ## Collection gates and retained evidence
 
 All four runs pass clock/runtime anomaly checks on all eight CPUs, heap

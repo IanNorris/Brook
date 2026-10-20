@@ -50,6 +50,8 @@ enable_testing()
 add_host_test(test_gpu_completion_wait)
 target_compile_options(test_gpu_completion_wait PRIVATE -UNDEBUG)
 add_host_test(test_eevdf)
+add_host_test(test_mapping_access_timing "${BROOK_ROOT}/src/kernel/src/memory/mapping_access_timing.cpp")
+target_compile_options(test_mapping_access_timing PRIVATE -DBROOK_HOST_TEST "-iquote${BROOK_ROOT}/src/kernel/src")
 set_tests_properties(test_eevdf PROPERTIES TIMEOUT 20)
 add_host_test(test_runtime_accounting)
 set_tests_properties(test_runtime_accounting PROPERTIES TIMEOUT 15)
@@ -272,6 +274,7 @@ add_host_test(test_vmm_leaf
     "${BROOK_ROOT}/src/kernel/src/memory/file_object.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/mapping_ranges.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/user_mapping.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/mapping_access_timing.cpp"
 )
 target_compile_options(test_vmm_leaf PRIVATE
     -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
