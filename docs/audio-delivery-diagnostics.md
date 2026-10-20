@@ -670,3 +670,60 @@ short biased window does not establish a unique producer bottleneck.
 A useful next instrument is elapsed lock/wakeup observation for the audio
 producer, retaining ownership and host-steal semantics, rather than treating
 IRQ sample percentages as a substitute for those measurements.
+
+## Watch the verified DSP writer independently from the mixer
+
+`q2-irq-writer-try-2` identifies the producer before load with existing tools.
+A privileged metadata job reads descriptor targets using `readlink`, and a
+brief, half-second pre-load file-syscall trace observes twenty 4,096-byte
+writes by PID 22 to its verified DSP descriptor 7. Other Quake threads share
+that descriptor; ownership is established by observed writes, not descriptor
+presence or generic thread names. Tracing is disabled before the bounded
+host load. The scheduler watch then binds PID/incarnation 22/22. This remains
+a diagnostic cohort, not a matched performance control. Privileged metadata
+inspection is not an unprivileged procfs acceptance claim.
+
+Across 2,850 ready-to-dispatch samples (2,482 with deadlines), the producer's
+maximum queue wait is 155.245 ms and maximum deadline-to-ready publication
+lateness is 190 ms. The largest retained publication delay has a subsequent
+21.181-ms ready wait; the separate maximum ready wait has no deadline. These
+extrema are different episodes and must not be added as one measured stall.
+There are no invalid/saturated watch observations. Only sixteen largest
+episodes are retained, with 89 excluded slow episodes, and experimental
+accounting deferrals still omit potential periodic context observations.
+
+The 8.005962-second capture contains 2.239274 seconds of PCM; aligned HDA
+run-state totals are 2.248377 seconds active and 5.757585 seconds inactive.
+Individual inactive periods include approximately 1.49–1.58 seconds. No
+native fault or stream discontinuity is reported, but audio acceptance is
+false. The observed ready/wake extrema do not by themselves identify the
+cause of one continuous roughly 1.5-second producer gap. Time inside blocking
+syscalls, waiting on application locks, and executing between write calls
+remain unmeasured. Next diagnostics should bracket DSP write entry/return,
+its description mutex and backpressure sleeps separately, and correlate those
+with observed producer ready/wake intervals. They should preserve actual
+return/error/partial-write behavior and label elapsed wall time and steal
+separately rather than infer CPU occupation from IRQ sample percentages.
+
+Original game, privileged metadata job, host workers and CPU-clock probe
+complete with zero exits and drained guest tasks. The independent verifier
+checks the observed writer against descriptor metadata, watch incarnation,
+unchanged frozen kernel/thirteen modules, IF/ticket counters, settled ledgers,
+clock brackets including 1x, heap, original VM/router exits, all filesystem
+checks and twelve-document/four-profile preservation. An optional maps query
+after shutdown is rejected during capability inspection; no upload/commit
+or guest job occurs. Its local request and explicit unsubmitted disposition
+are retained without retry. Source inspection also shows Brook's current
+`/proc/PID/maps` only reports approximate heap and stack regions, so it cannot
+resolve shared-library sample addresses.
+
+The earlier `q2-irq-writer-try-1` discovery attempt fails before host load: an
+unprivileged helper incorrectly tries to open descriptor targets as text and
+receives EACCES. The failed job and original controller exit one are retained.
+Recovery drains the same original game (exit zero), disables the experimental
+mode, cleanly stops the same VM, and verifies filesystem/saved-data gates.
+The original outer launcher wait status is unavailable and explicitly null;
+no zero exit is invented. That run is excluded from performance acceptance.
+The corrected repetition uses descriptor-link metadata instead of opening
+the descriptors themselves. `irq-writer-sources` retains both controllers,
+recovery, independent verifier, failure disposition and analysis evidence.
