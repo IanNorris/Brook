@@ -590,3 +590,59 @@ demo are tracked. Evidence is under `tick-clock/native-final/` and
 filesystems pass offline checks, and the 12-document/four-profile preservation
 audit passes. Further browser trace, actual migration/residency, CPU-time clock
 semantics and scheduler runtime/lifetime work remain open.
+
+### Buffered browser trace and longer-clip cohort
+
+The page now retains bounded 250-ms media samples and input-handler/RAF stamps
+independently of HTTP telemetry. Key E exports them after CPU load. The analyzer
+intersects host-clock response brackets to map page stamps into host intervals,
+allowing 2 ms of browser timestamp quantization and explicitly assuming the
+separately checked 1x KVM/page clock. This is not physical display latency.
+Trace sampling can itself stall: missing samples are reported, not interpolated.
+
+An initial 120-second stream-copy MP4 had its `moov` box after 27.9 MB of media.
+RR eventually played it; MLFQ stayed at readyState zero, with no duration, past
+the 150-second controller deadline. Inspection of that same live browser after
+192 page seconds still showed no metadata, and the server no longer held a
+media transfer file descriptor. No CPU load was started in this failed MLFQ
+attempt. It was closed and drained, with clean launcher/filesystem/preservation
+gates. The failed receipts remain in `browser-mix/tracemlfq1/`; RR's completed
+but unmatched diagnostic is `browser-mix/tracerr0/`. Neither is pooled with the
+corrected pair. An attempted RR early stop was rejected by its pre-effect guard
+because CPU load had begun; no close/input mutation was dispatched.
+
+The corrected pair uses a separate 120-second MP4 with front-loaded metadata,
+the same final clock kernel, eight vCPUs/six GiB, identical fresh Firefox launch
+source, headless Venus, the same private null audio sink and callback HDA mode.
+Both are fresh boots, ordered MLFQ then RR. No clip-end seek occurs during load.
+
+| Metric during the fixed 24-worker/30-second CPU interval | RR (`fastrr1`) | MLFQ (`fastmlfq0`) |
+| --- | --- | --- |
+| Buffered trace coverage | 17 samples across 12.962 s, largest gap 8.54 s | 114 samples across 29.498 s, largest gap 0.38 s |
+| Media progress in that covered span | 0.000 s | 28.811 s (0.977x) |
+| Minimum media buffered ahead | 58.31 s | 31.94 s |
+| Unplayable sampled ready states | 0 | 0 |
+| Input dispatch → DOM bounds | 17.85–20.36 s across four inputs | 0–0.175 s across four inputs |
+| DOM → RAF opportunity | 95–104 ms | 0–41 ms |
+| PCM frames / roughly 8 host seconds at 44.1 kHz | 0 | 353,152 (~1.000x sample coverage) |
+| CPU batches / worker max:min | 6,939,018 / 1.004 | 5,393,439 / 1.029 |
+| Periodic sleeper p95 / worst | 91.14 / 97.89 ms | 20.66 / 133.10 ms |
+
+The RR result establishes a real stall despite buffered media, rather than just
+delayed HTTP receipts. It does not establish zero progress in the unsampled
+parts of the 30-second interval. MLFQ keeps media and input responsive here at
+about 22% lower compute throughput; it does not win every latency maximum.
+Only one corrected long-clip pair is complete. All app/worker lineages drain,
+heap checks complete, owned launchers exit zero, all four primary filesystem
+checks pass, and both 12-document/four-profile preservation audits pass.
+RR remains the default. EEVDF is the next optional policy trial after runtime
+accounting/lifetime safeguards and a matched Linux reference, not an accepted
+replacement yet.
+
+`scripts/workloads/run_browser_sched_mix.py` promotes the retained controller
+into a reusable parameterized tool. Its generated Firefox source is verified
+byte-for-byte against the original cohort launcher and its RR native run passes
+all gates above. It records harness/fixture hashes, reuses existing tracked jobs,
+retains unresolved input/capture intents and preserves close/shutdown request IDs.
+`scripts/workloads/analyze_browser_sched_trace.py` can reanalyze saved evidence
+without any VM. Frozen code/fixtures are under `browser-mix-http-fast/harness/`.

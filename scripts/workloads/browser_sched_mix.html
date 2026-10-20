@@ -1,0 +1,103 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Brook scheduler workload</title>
+<style>
+body { background:#152333; color:white; font:18px sans-serif; margin:12px }
+h1 { font-size:24px; margin:8px 0 }
+button { font:20px sans-serif; padding:8px; margin-bottom:8px }
+video { display:block; width:640px }
+pre { font-size:12px; white-space:pre-wrap }
+</style>
+<h1>Brook: media, input and CPU contention</h1>
+<button id="probe" autofocus>Input probe: A, B, C, D (E exports trace)</button>
+<video controls autoplay loop src="clip.mp4"></video><pre></pre>
+<script>
+const video = document.querySelector('video'), button = document.querySelector('button');
+const phase = new URLSearchParams(location.search).get('phase');
+const epoch = Date.now() + '-' + Math.random();
+let sequence = 0, frames = 0, mediaTotal = 0, previousMedia = 0;
+let previousSample = performance.now(), ambiguousGaps = 0, wraps = 0, posting = false;
+function frame() { frames++; video.requestVideoFrameCallback(frame); }
+if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(frame);
+function sampleMedia() {
+    const now = performance.now(), current = video.currentTime;
+    if (video.duration && now - previousSample > video.duration * 1000) ambiguousGaps++;
+    let delta = current - previousMedia;
+    if (Number.isFinite(video.duration) && delta < -video.duration / 2) {
+        delta += video.duration; wraps++;
+    }
+    if (delta >= 0) mediaTotal += delta;
+    previousMedia = current; previousSample = now;
+}
+const trace = [], inputTrace = [], mediaEvents = [];
+let traceDropped = 0;
+function snapshot() {
+    const quality = video.getVideoPlaybackQuality();
+    let bufferedAhead = 0;
+    for (let i = 0; i < video.buffered.length; i++) {
+        if (video.buffered.start(i) <= video.currentTime && video.currentTime <= video.buffered.end(i))
+            bufferedAhead = video.buffered.end(i) - video.currentTime;
+    }
+    return {performanceMs:performance.now(), dateMs:Date.now(),
+        mediaSeconds:video.currentTime, mediaTotal, wraps, ambiguousGaps,
+        duration:video.duration, paused:video.paused, ready:video.readyState,
+        networkState:video.networkState, bufferedAhead, rate:video.playbackRate,
+        muted:video.muted, audio:video.mozHasAudio,
+        totalFrames:quality.totalVideoFrames, droppedFrames:quality.droppedVideoFrames,
+        callbacks:frames, focused:document.hasFocus(), error:video.error?.message};
+}
+setInterval(() => {
+    sampleMedia(); trace.push(snapshot());
+    if (trace.length > 720) { trace.shift(); traceDropped++; }
+}, 250);
+for (const kind of ['waiting', 'stalled', 'playing', 'seeking', 'seeked', 'ended', 'error'])
+    video.addEventListener(kind, () => {
+        mediaEvents.push({kind, ...snapshot()});
+        if (mediaEvents.length > 128) mediaEvents.shift();
+    });
+async function post(path, value) {
+    return fetch(path, {method:'POST', body:JSON.stringify(value), cache:'no-store'});
+}
+setInterval(async () => {
+    // One heartbeat in flight. Host clock handling lies within this browser
+    // performance-clock bracket; HTTP arrival alone is not a sample timestamp.
+    if (posting) return;
+    posting = true;
+    try {
+        const before = performance.now();
+        const clock = await (await fetch('/clock', {cache:'no-store'})).json();
+        const after = performance.now(); sampleMedia();
+        const quality = video.getVideoPlaybackQuality();
+        const state = {phase, epoch, sequence:++sequence, performanceMs:after,
+            dateMs:Date.now(), mediaSeconds:video.currentTime, mediaTotal, wraps,
+            ambiguousGaps, duration:video.duration, paused:video.paused,
+            ready:video.readyState, rate:video.playbackRate, muted:video.muted,
+            audio:video.mozHasAudio, width:video.videoWidth, height:video.videoHeight,
+            totalFrames:quality.totalVideoFrames, droppedFrames:quality.droppedVideoFrames,
+            callbacks:frames, focused:document.hasFocus(), active:document.activeElement?.id,
+            clock:{beforePerfMs:before, afterPerfMs:after, ...clock}, error:video.error?.message};
+        document.querySelector('pre').textContent = JSON.stringify(state);
+        await post('/state', state);
+    } catch (error) { document.title = 'Telemetry: ' + error; }
+    finally { posting = false; }
+}, 500);
+window.addEventListener('keydown', event => {
+    if (!/^Key[ABCDEP]$/.test(event.code)) return;
+    event.preventDefault();
+    const handled = performance.now();
+    if (event.code === 'KeyE') {
+        post('/trace', {phase, epoch, schema:2, exportPerfMs:handled,
+            traceDropped, samples:trace, inputs:inputTrace, events:mediaEvents});
+        return;
+    }
+    button.textContent = 'Received ' + event.code;
+    requestAnimationFrame(() => {
+        const value = {phase, epoch, key:event.code, eventTimeMs:event.timeStamp,
+            handledPerfMs:handled, rafPerfMs:performance.now()};
+        inputTrace.push(value); if (inputTrace.length > 32) inputTrace.shift();
+        post('/input', value);
+    });
+});
+button.focus();
+video.play().catch(error => { document.title = 'Play required: ' + error; });
+</script>
