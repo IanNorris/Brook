@@ -63,6 +63,24 @@ It writes `daemon.json`; create its output folder's `stop` file to stop only its
 owned child. The helper also stops the child on timeout. For example (substitute
 the exact host ICD from your checked run):
 
+This daemon has no session manager. The Linux launcher below configures and
+links its own QEMU audio ports automatically. A Brook benchmark launched by
+another tool needs the matching route observer before starting playback:
+
+```sh
+python3 scripts/route_silent_vm_audio.py --session BROOK_SESSION \
+  --audio-daemon build/linux-reference/audio/daemon.json \
+  --output build/linux-reference/brook-audio-routes
+```
+
+Wait for `brook-audio-routes/routed.json` while the observer remains running.
+A live daemon and a null-sink node alone do not prove QEMU has an output route;
+callback HDA can otherwise stop advancing. The browser scheduler controller
+requires this evidence via `--audio-route-directory`. Keep the observer alive
+until QEMU exits, then check its `exit.json` as well as the VM's normal gates.
+
+For Linux, use:
+
 ```sh
 python3 scripts/linux_workload_reference.py start \
   --image build/linux-reference/result --output build/linux-reference/run-0 \

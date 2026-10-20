@@ -19,6 +19,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--review',type=Path,required=True)
     parser.add_argument('--fixture-directory',type=Path,required=True)
+    parser.add_argument('--audio-route-directory',type=Path,required=True,
+                        help='Live route_silent_vm_audio.py evidence for this QEMU')
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--phase',required=True)
     parser.add_argument('--policy',choices=['rr','mlfq','eevdf'],required=True)
@@ -28,6 +30,14 @@ def main():
     assert metadata['private_clones'] and metadata['memory_gib']==6 and metadata['vcpus']==8
     assert metadata['hda_use_timer'] is False,'This cohort requires diagnostic callback HDA mode'
     s=(review/'session.txt').read_text().strip();d=b.server.load_session(s)
+    route=args.audio_route_directory.resolve()
+    route_identity=json.loads((route/'identity.json').read_text())
+    routed=json.loads((route/'routed.json').read_text())
+    assert route_identity['session']==routed['session']==s
+    assert route_identity['pid']==d['pid'] and route_identity['process_identity']==d['process_identity']
+    assert b.server.process_is_alive(d['pid'],d['process_identity'])
+    assert not (route/'exit.json').exists(),'Audio routing observer must remain live'
+    assert routed['events'] and all(len(x['links'])==2 for x in routed['events'])
     http=args.fixture_directory.resolve();out=args.output.resolve();out.mkdir(parents=True,exist_ok=True)
     def save(name,value):b.write(out/(name+'.json'),value);return value
     def read(name):return json.loads((out/(name+'.json')).read_text())

@@ -182,7 +182,7 @@ exit, four filesystems and saved-data/profile preservation. The excluded
 orchestration run is retained separately. Browser video/audio/input comparisons
 and broader contention/real-workload acceptance remain open; RR stays default.
 
-## First mixed-browser controls
+## First mixed-browser controls — unrouted audio, superseded
 
 Three further fresh boots use the same final kernel/modules as the CPU controls,
 eight vCPUs/six GiB, affinity 0–13, an 800×600 Firefox window on 1080p,
@@ -213,11 +213,71 @@ The first Linux reference delivered about 23.07 callbacks/s with nonzero
 captured audio, subject to its documented software-vsync workaround and other
 reference configuration limits.
 
+**Later diagnosis invalidates these runs as matched media/audio acceptance.**
+The isolated PipeWire daemon intentionally has no session manager. The Linux
+launcher installed explicit routes, but this Brook controller omitted them.
+Its QEMU output node was suspended with zero ports and no links. In a subsequent
+same-kernel native OSS probe, 13,230 submitted frames had zero completions while
+the producer remained blocked. Configuring and linking that same live QEMU node
+resumed the same producer, delivered all 529,200 requested frames, and captured
+220,928 frames over 5.00655 host seconds. The full interrupted delivery took
+218.84 seconds; this is recovery evidence, not a normal-speed 12-second trial.
+The first probe's capture preceded producer readiness and is explicitly excluded.
+
+Thus the browser sink errors above do not establish a guest regression. Retain
+the latency observations only with this host-audio-stall condition; do not pool
+their presentation/throughput with routed Linux/Brook results. The new
+`scripts/route_silent_vm_audio.py` observer validates the private daemon, selects
+only nodes owned by the exact QEMU process, configures stereo ports and links
+them to the null sink. The browser controller now requires a matching route
+receipt before starting its workloads. Corrected controls are stored separately
+under `build/workloads/timing-scheduler-20261020/eevdf-browser-routed/`.
+
 All three application lineages drain, original launchers exit zero, four offline
 filesystem checks pass and the twelve saved documents/four original profile
 trees retain their checked data and ownership. Those structural gates passed;
 **desktop acceptance did not**. Evidence and explicit gate distinctions:
 `build/workloads/timing-scheduler-20261020/eevdf-browser-cohorts/gates.json`.
 The optional module is committed; RR remains the default. Next work is the
-common Firefox audio-sink failure, scheduler/kernel stall profiles, and repeated
+verified audio routing, scheduler/kernel stall profiles, and repeated
 browser/game trials before proposing a default policy change.
+
+## Corrected routed browser controls
+
+The separate `er-e0`, `er-r0`, `er-m0` runs require an explicit route-ready
+receipt before browser startup. All share identical controller/page/clip hashes,
+the same final kernel/modules and the previous fixed hardware/profile settings.
+All three routing observers exit successfully after their owned QEMU exits.
+Firefox launcher logs contain no audio-sink error; every capture has PCM.
+
+| Policy | Periodic p95 / worst | Buffered callbacks/s | Media seconds / page second | PCM frames in ~8 s | Longest silent run in captured PCM |
+| --- | --- | ---: | ---: | ---: | ---: |
+| EEVDF | 3.56 / 56.68 ms | 5.73 | 0.8290 | 350,848 | 110 ms |
+| RR | 89.30 / 99.47 ms | 0.034 | 0.0077 | 6,656 | 70 ms* |
+| MLFQ | 20.84 / 87.35 ms | 7.21 | 0.9734 | 353,024 | 10 ms |
+
+*QEMU's WAV capture omits intervals with no active output. RR produced only
+0.151 seconds of PCM across 8.006 host seconds; the 70-ms silent sequence
+inside that short recording does not measure the long missing-output interval.
+Likewise EEVDF's 0.994× captured-frame/host-time ratio covers its eight-second
+capture, not the entire thirty-second browser interval. It does not contradict
+slower media advancement elsewhere in that interval.
+
+Buffered dispatch-to-DOM bounds are 43–215 ms for EEVDF, 0–195 ms for MLFQ and
+17.80–20.31 seconds for RR. Browser render opportunity adds 79–203 ms, 28–166 ms
+and 55–71 ms respectively. These include guest/host clock uncertainty and are
+not measurements of physical display latency. Buffered playback remains ready,
+with at least 40.14/21.91/28.88 seconds ahead for EEVDF/RR/MLFQ; simple network
+buffer starvation does not explain these loaded results. No 1.3× acceleration
+is demonstrated by these tests.
+
+All application lineages drain, heap checks pass, original launchers exit zero,
+four filesystems pass offline checks and twelve documents/four original profile
+trees retain their checked data/ownership. `eevdf-browser-routed/gates.json`
+records these structural gates separately from desktop/default-policy acceptance.
+One routed trial per policy is insufficient for a statistical decision. EEVDF
+has the best synthetic wakeup p95, but MLFQ has the stronger media result here;
+neither approaches the first Linux reference's 23.07 callbacks/s. RR remains
+the default. Next profiling should target media/compositor CPU service and
+non-preemptible kernel intervals, followed by repeated/reverse-order trials and
+Quake II/interactive-game checks on the optional policy.
