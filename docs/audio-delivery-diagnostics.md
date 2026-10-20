@@ -1172,3 +1172,56 @@ regular source and the live-review baseline retain committed scheduler behavior.
 the distinct negative and positive workload outcomes. This experiment does not
 rule out preemption as a contributing mechanism, establish uniform IRQ/host
 execution attribution, or finish the broader timing/scheduling goal.
+
+## KVM lock waiting: source audit and next measurement
+
+Source inspection on 2026-10-20, after withdrawing the deferral experiment,
+separates three mechanisms that must not be treated as one feature:
+
+| Mechanism | Brook implementation | Remaining evidence |
+| --- | --- | --- |
+| Elapsed time | Per-vCPU KVM clock registration/readers in `kvmclock.cpp` | Existing clock comparisons do not measure lock-holder scheduling |
+| Host steal accounting | Per-vCPU MSR `0x4b564d03`, versioned bounded reads | Cumulative steal does not identify which holder or ticket successor delayed a lock |
+| Virtualized lock waiting | `SchedLockWaitForTicket` uses `pause`, with IF cleared before reserving a ticket | No KVM wait/kick or directed-yield implementation found in kernel/drivers |
+
+`SchedLock` contains only `next` and `serving`. It does not publish the owner
+CPU or a ticket-to-waiter CPU mapping. `KvmStealRecord` includes the ABI's
+`preempted` byte, but Brook does not read it. The shared ready, all-process and
+PID locks use the same waiting primitive. The raw release before a context
+switch deliberately leaves IF clear; that dispatch invariant must survive any
+replacement. The spin limit is an iteration count, not a measured elapsed-time
+deadline; its nearby cycle estimate is not an observed timeout guarantee.
+
+KVM documents distinct feature bits for steal time, PV unhalt and PV scheduler
+yield. Guest userspace configuration can mask them, so `-enable-kvm -cpu host`
+in `run-qemu.sh` and successful clock registration do not prove that the latter
+two are advertised. Record the actual guest feature leaf before enabling either.
+See [KVM CPUID](https://docs.kernel.org/virt/kvm/x86/cpuid.html) and
+[steal-time ABI](https://www.kernel.org/doc/html/latest/virt/kvm/x86/msr.html).
+
+Upstream Linux pairs conditional lock waiting with a CPU kick through its PV
+queued-spinlock protocol. Its KVM adapter uses APIC IDs for kicks and separately
+uses directed yield after a call-function IPI to a preempted target. These are
+different operations, not evidence that inserting a generic yield into Brook's
+ticket loop is sufficient. See the [KVM adapter](https://raw.githubusercontent.com/torvalds/linux/master/arch/x86/kernel/kvm.c),
+[PV queued lock](https://raw.githubusercontent.com/torvalds/linux/master/kernel/locking/qspinlock_paravirt.h)
+and [hypercall ABI](https://docs.kernel.org/virt/kvm/x86/hypercalls.html).
+
+The next diagnostic should capture feature availability and sampled lock wait,
+holder and next-ticket CPU identities without acquiring another scheduler lock.
+Include holder release-to-successor-acquire gaps: a descheduled ticket successor
+can stall progress even after the previous holder releases. Classify unavailable
+or raced identity samples explicitly. Compare host wall time and per-vCPU steal
+over matching intervals; retain the existing IRQ-accounting-try control. The
+prior lock-wait profiles motivate this hypothesis but do not prove it.
+
+Only after that attribution should a default-off wait/wake experiment be tried.
+It needs a publication/check/sleep/kick protocol that cannot lose a wake, exact
+APIC-ID mapping, feature-disabled fallback, ticket wrap handling, nested-lock
+and IF-state tests, and the existing pick/claim/off-CPU ownership gates. A
+reserved ticket cannot be abandoned. Simply replacing `pause` with `hlt` while
+IF is clear has no established wake guarantee in Brook. Validate unchanged
+fairness and accounting plus mixed-workload/audio latency under quiet and
+bounded host contention; keep per-core queues and EEVDF as separate comparisons.
+No lock algorithm, hypercall, scheduler default or live-review image is changed
+by this source audit.
