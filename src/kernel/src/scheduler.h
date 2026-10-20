@@ -45,6 +45,9 @@ void SchedulerContinue(Process* proc);
 struct TimerWakeToken;
 void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe=nullptr,bool periodicTimer=false,uint64_t interruptedRip=0);
 
+// Diagnostic commit generation; saturated/out-of-range returns UINT64_MAX.
+uint64_t SchedulerContextSwitchGeneration(unsigned cpu);
+
 // Yield the current timeslice voluntarily.
 extern "C" void SchedulerYield();
 

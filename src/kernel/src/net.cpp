@@ -3320,6 +3320,17 @@ static void DebugWakeScan(bool requested,bool applied)
     tail.text(",\"scope\":\"exclusive wake-scan claim through publication/reference cleanup; APs use periodic IRQs only and require overdue valid completion; active owner never revoked; alarms/POSIX expiry/reaping remain BSP-only; default bsp\"}\n");tail.send();
 }
 
+static void DebugTimerIrqHandlerEvent(const TimerIrqHandlerEvent& e)
+{
+    BridgeReply r;r.text("{");r.field("entry_ns",e.token.entryNs);r.text(",");r.field("scheduler_ns",e.schedulerNs);
+    r.text(",");r.field("end_ns",e.endNs);r.text(",");r.field("prefix_ns",e.prefixNs);
+    r.text(",");r.field("scheduler_wall_ns",e.schedulerWallNs);r.text(",");r.field("total_ns",e.totalNs);
+    r.text(",\"interrupted_rip\":\"0x");r.number(e.token.rip,true);r.text("\",");r.field("interrupted_cs",e.token.cs);
+    r.text(",");r.field("entry_switch_generation",e.token.switchGeneration);r.text(",");r.field("completion_switch_generation",e.completionGeneration);
+    r.text(",");r.field("previous_handler_end_ns",e.token.previousEndNs);r.text(",\"no_switch\":");r.text(e.noSwitch?"true":"false");
+    r.text("}");r.send();
+}
+
 static void DebugTimerIrqArrivals()
 {
     const auto epoch=TimerIrqArrivalsEpoch();const auto online=SmpGetCpuCount();
@@ -3327,7 +3338,7 @@ static void DebugTimerIrqArrivals()
     BridgeReply header;header.text("{");header.field("epoch",epoch);
     header.text(",\"enabled\":");header.text((epoch&1)?"true":"false");
     header.text(",");header.field("online_cpus",online);header.text(",");header.field("capacity",capacity);
-    header.text(",\"scope\":\"per-CPU LAPIC IRQ after GS guard; no IPIs; independent try-lock slots; contended counts since boot; clock failures break adjacency; rows sampled separately; on/reset clear window, off preserves it\",\"cpus\":[");header.send();
+    header.text(",\"scope\":\"per-CPU LAPIC IRQ after GS guard; no IPIs; independent try-lock slots; contended counts since boot; clock failures break adjacency; rows sampled separately; on/reset clear window, off preserves it; handler brackets are wall time through C-body return, exclude wrapper validation/epilogue and can include suspension; migrated returns counted separately; sums can overlap and are not CPU occupancy; prefix precedes scheduler call; handler_events retain largest 16 no-switch completions at least 1ms; adjacent pairs require consecutive entries, both no-switch, same generation; between includes wrapper/epilogue and host delay\",\"cpus\":[");header.send();
     for(unsigned cpu=0;cpu<online && cpu<capacity;++cpu){
         const auto s=TimerIrqArrivalsRead(cpu);consistent=consistent && s.epoch==epoch;
         BridgeReply row;if(cpu)row.text(",");row.text("{");row.field("cpu",cpu);row.text(",");row.field("epoch",s.epoch);
@@ -3336,7 +3347,22 @@ static void DebugTimerIrqArrivals()
         row.text(",");row.field("max_gap_ns",s.maxGapNs);row.text(",");row.field("max_gap_start_ns",s.maxGapStartNs);row.text(",");row.field("max_gap_end_ns",s.maxGapEndNs);row.send();
         BridgeReply tail;tail.text(",\"max_gap_rip\":\"0x");tail.number(s.maxGapRip,true);tail.text("\",");tail.field("max_gap_cs",s.maxGapCs);
         tail.text(",");tail.field("slow",s.slow);tail.text(",");tail.field("contended",s.contended);
-        tail.text(",\"saturated\":");tail.text(s.saturated?"true":"false");tail.text("}");tail.send();
+        tail.text(",");tail.field("handler_completed",s.handlerCompleted);tail.text(",");tail.field("handler_invalid_clock",s.handlerInvalidClock);
+        tail.text(",");tail.field("handler_migrated",s.handlerMigrated);tail.text(",");tail.field("max_handler_prefix_ns",s.maxHandlerPrefixNs);
+        tail.text(",");tail.field("max_handler_scheduler_ns",s.maxHandlerSchedulerNs);tail.text(",");tail.field("max_handler_total_ns",s.maxHandlerTotalNs);
+        tail.text(",");tail.field("sum_handler_prefix_ns",s.sumHandlerPrefixNs);tail.text(",");tail.field("sum_handler_scheduler_ns",s.sumHandlerSchedulerNs);
+        tail.text(",");tail.field("sum_handler_total_ns",s.sumHandlerTotalNs);
+        tail.text(",");tail.field("handler_no_switch",s.handlerNoSwitch);tail.text(",");tail.field("handler_switched",s.handlerSwitched);
+        tail.text(",");tail.field("handler_unknown_generation",s.handlerUnknownGeneration);tail.text(",");tail.field("sum_no_switch_total_ns",s.sumNoSwitchTotalNs);
+        tail.text(",");tail.field("max_no_switch_total_ns",s.maxNoSwitchTotalNs);tail.text(",");tail.field("max_no_switch_scheduler_ns",s.maxNoSwitchSchedulerNs);
+        tail.text(",");tail.field("adjacent_no_switch_pairs",s.adjacentNoSwitchPairs);tail.text(",");tail.field("near_returns",s.nearReturns);
+        tail.text(",");tail.field("sum_between_ns",s.sumBetweenNs);tail.text(",");tail.field("max_between_ns",s.maxBetweenNs);
+        tail.text(",");tail.field("handler_slow",s.handlerSlow);tail.text(",");tail.field("handler_excluded",s.handlerExcluded);
+        tail.text(",\"saturated\":");tail.text(s.saturated?"true":"false");tail.text(",\"max_prefix_event\":");tail.send();
+        DebugTimerIrqHandlerEvent(s.maxPrefixEvent);DebugChannelSend(",\"max_scheduler_event\":");DebugTimerIrqHandlerEvent(s.maxSchedulerEvent);
+        DebugChannelSend(",\"handler_events\":[");
+        for(unsigned i=0;i<s.handlerRetained;++i){if(i)DebugChannelSend(",");DebugTimerIrqHandlerEvent(s.handlerEvents[i]);}
+        DebugChannelSend("]}");
     }
     const auto endEpoch=TimerIrqArrivalsEpoch();BridgeReply end;
     end.text("],");end.field("end_epoch",endEpoch);end.text(",\"consistent_epoch\":");

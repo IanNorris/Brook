@@ -134,6 +134,18 @@ struct PerCpuSchedState {
 };
 
 static PerCpuSchedState g_perCpu[SCHED_MAX_CPUS] = {};
+// Per-CPU commit generation for diagnostic timer-frame suspension detection.
+// Written only by this CPU with IF=0 immediately before all context_switch calls.
+struct alignas(64) ContextSwitchGeneration {uint64_t value=0;};
+static ContextSwitchGeneration g_contextSwitchGeneration[SCHED_MAX_CPUS]{};
+uint64_t SchedulerContextSwitchGeneration(unsigned cpu){
+    return cpu<SCHED_MAX_CPUS?__atomic_load_n(&g_contextSwitchGeneration[cpu].value,__ATOMIC_RELAXED):~uint64_t(0);
+}
+static void ContextSwitchCommitted(unsigned cpu){
+    const auto old=SchedulerContextSwitchGeneration(cpu);
+    if(old!=~uint64_t(0))__atomic_store_n(&g_contextSwitchGeneration[cpu].value,old+1,__ATOMIC_RELAXED);
+}
+
 
 // ---------------------------------------------------------------------------
 // Reschedule IPI — kick an idle CPU to pick up a newly-enqueued process
@@ -2054,6 +2066,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     if (oldProc->pid < SCHED_MAX_PIDS)
         g_startTestCookies[oldProc->pid] = {&startTestCookie, startTestCookie};
 #endif
+    ContextSwitchCommitted(cpu);
     context_switch(&oldProc->savedCtx, &newProc->savedCtx,
                    &oldProc->fxsave, &newProc->fxsave,
                    &oldProc->runningOnCpu);
@@ -2619,6 +2632,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 
     ProfilerContextSwitch(proc->pid, next->pid,
                           proc->kernelStackBase, proc->kernelStackTop);
+    ContextSwitchCommitted(cpu);
     context_switch(&proc->savedCtx, &next->savedCtx,
                    &proc->fxsave, &next->fxsave,
                    &proc->runningOnCpu);
@@ -2641,6 +2655,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // These throwaway bootstrap objects live on the permanent boot stack.
     // No task can enqueue or resume them; context_switch only uses them as
     // destinations for the outgoing state before restoring the selected task.
+    ContextSwitchCommitted(cpu);
     context_switch(&bootstrapContext, &first->savedCtx,
                    &bootstrapFx, &first->fxsave, &bootstrapRunningOnCpu);
     KernelPanic("SCHED: resumed discarded bootstrap context on CPU%u", cpu);

@@ -338,3 +338,100 @@ kernel is frozen under `ready-context-r2-frozen`, with the original thirteen
 control modules. Address resolution and independent failure verification are
 retained alongside the controller sources; unresolved user/module addresses
 are explicitly left unresolved rather than assigned a kernel symbol.
+
+## Timer-handler brackets and suspended interrupt frames
+
+The first `q2-handler-bracket-host` experiment adds per-CPU wall brackets from
+the existing post-GS arrival sample, through the point before
+`SchedulerTimerTick`, to that call's return. The prefix excludes the scheduler;
+the scheduler bracket includes locks, host delay and possible guest task
+suspension. Naked-entry work, return-frame validation and the assembly epilogue
+remain outside the measured C body. Default-off `timer peers` controls share
+the existing epochs and independent per-CPU try-locks. No MMIO, stack walk or
+policy change is added by the probe.
+
+The run reproduces the audio sample-gap stop (3,220.231 ms), empty capture and a
+5,339.889-ms mixer queue. Its longest returned handler brackets span that queue
+on several CPUs, but their interrupted RIP resolves to `IdleLoop` immediately
+after `sti; hlt`. Those frames dispatched useful work and returned much later:
+their wall spans cannot be called continuous IRQ execution. Some per-CPU sums
+exceed the entire observation span because suspended frames overlap. All
+original jobs, shutdown, filesystem and saved-data checks complete; the audio
+outcome remains explicitly failed.
+
+The corrected probe adds a saturating per-CPU context-switch commit generation
+at all three kernel `context_switch` call sites: normal switch, current-process
+exit and first restore. This small counter is maintained even while timing is
+off, with each CPU's counter on a separate cache line. The timer token samples
+it at entry and return. Changed generations are
+classified as switched; saturated/unavailable generations as unknown; migrated
+returns are counted separately and excluded from duration aggregation.
+`handler_events` now retains the largest sixteen **no-switch** completions of
+at least 1 ms. Separate maxima preserve long brackets from all same-CPU returns
+so switched frames remain visible rather than silently disappearing.
+
+`adjacent_no_switch_pairs` requires consecutive arrival sequence numbers, a
+completed previous frame, both frames without switches, unchanged generation
+between them and ordered clocks. `near_returns` counts such gaps at most 100 us;
+`sum_between_ns` and `max_between_ns` describe completion-to-next-entry wall
+time. That gap includes wrapper/epilogue, intervening execution and host delay.
+It is not proof of useful application progress. Clock failures, migration,
+reset and out-of-order older returns break pairing. Hosted tests cover these
+conditions, same-CPU suspension, unknown generations and bounded retention.
+Sequence adjacency means consecutive **recorded** arrivals. A nonzero lifetime
+`contended` count can hide intervening IRQ observations/returns, so those pairs
+must not be described as proven consecutive hardware interrupts. The counter
+is retained even across window reset; it is not silently cleared to certify
+completeness.
+
+The `q2-handler-generation-host` follow-up is **not an accepted performance
+control**. A read-only runtime query times out; the controller exits, losing the
+original host worker's wait status. The original guest job subsequently exits
+nonzero because Quake returns zero without the required END marker. Recovery
+polls that same operation identity, retains its failure and original host
+RESULT, saves diagnostics from the same VM, then shuts it down normally. QEMU
+and router exit evidence, filesystem and saved-data checks pass; they do not
+erase the missing host exit or game acceptance failure. No replacement job or
+VM is started as recovery.
+
+The recovered switch-aware snapshots have no invalid clocks, unknown
+generations, saturation or contention drops. The largest completed switch-free
+handler wall bracket is 59.327 ms on BSP and 17.005–19.293 ms on APs; switched
+frames reach seconds. The mixer queue reaches 8,344.656 ms. No retained largest
+switch-free handler overlaps that worst queue, but retention is bounded and
+outstanding/migrated frames remain outside those duration results. This does
+not rule out cumulative timer work. Recovery considerably extends the window;
+whole-window sums or adjacent-gap means must not be presented as loaded CPU
+occupancy or a clean policy comparison.
+
+The new diagnostics pass all 68 hosted tests and the bounded compiled-entry
+audit (12 supported wrappers, 56 mutation rejections, four unsupported return
+paths). These results localize future measurements; they are not a new
+scheduler or audio performance improvement. The next useful split is time
+through the scheduler's initial ready-lock/runtime-accounting section versus
+its remaining work, with an uninterrupted load interval and retained original
+worker exit status. Policy defaults and timer frequency remain unchanged.
+
+A guest-only control on the switch-aware kernel completes the demo in
+15.206 s with active audio, no native fault or sampled discontinuity, and clean
+original jobs/shutdown/filesystem/saved-data gates. Per-CPU lifetime try-lock
+drops are 6/2/1/3/1/1/4/3 and remain in its independent result; audio acceptance
+is not a claim of complete IRQ observations. In the recovered host failure,
+the surviving stream snapshots happen not to latch a discontinuity: the stream
+is already removed when recovery samples it. The serial native sample-gap
+fault and truncated 3.560-s capture remain independent failure evidence;
+absence of a currently reported stream discontinuity does not override them.
+
+The final cache-line-separated build is frozen as
+`handler-generation-final-frozen` (kernel
+`ee30b43b5b54bf8621a8d8fa046fb008045a108e95a922e88ff48c19e00d2a32`,
+with the original thirteen control modules). Its fresh
+`q2-handler-generation-final-guest` control completes in 15.222 s with an
+active 7.999-s capture, no native fault/discontinuity, original guest job exit
+zero and zero live tasks. Runtime/heap/clock/identity/affinity, original
+VM/router exits, four filesystem checks and saved-data preservation pass.
+Mixer queue maximum is 20.868 ms; this is a single diagnostic control, not a
+latency improvement claim. Lifetime per-CPU probe drops are 2/1/1/1/1/0/0/1.
+All 68 hosted tests and the bounded compiled-entry audit pass on the final
+source. Scripts, final source patch/hashes and independent verifiers are
+retained under `handler-generation-sources` in the ignored workload root.

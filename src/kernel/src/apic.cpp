@@ -214,6 +214,8 @@ bool ApicInitElapsedClock()
 // Forward-declare scheduler tick (defined in scheduler.cpp).
 void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool periodicTimer,uint64_t interruptedRip);
 
+uint64_t SchedulerContextSwitchGeneration(unsigned cpu);
+
 // Forward-declare thread state dump (defined in scheduler.cpp).
 void SchedulerDumpThreadStates();
 
@@ -344,12 +346,21 @@ static void TimerWakeDrop(uint64_t* counter){
     auto old=__atomic_load_n(counter,__ATOMIC_RELAXED);
     while(old!=~uint64_t(0) && !__atomic_compare_exchange_n(counter,&old,old+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
 }
-static void TimerIrqArrivalsObserve(uint64_t rip,uint64_t cs){
-    const auto epoch=TimerIrqArrivalsEpoch();if(!(epoch&1))return;
-    const unsigned cpu=SmpCurrentCpuIndex();if(cpu>=MAX_CPUS)return;
+static TimerIrqHandlerToken TimerIrqArrivalsObserve(uint64_t rip,uint64_t cs){
+    const auto epoch=TimerIrqArrivalsEpoch();if(!(epoch&1))return {};
+    const unsigned cpu=SmpCurrentCpuIndex();if(cpu>=MAX_CPUS)return {};
     uint64_t now=0;if(!KvmClockReadStableNs(&now))now=0;
-    if(!SpinLockTryAcquire(&g_timerIrqSlots[cpu].lock)){TimerWakeDrop(&g_timerIrqSlots[cpu].dropped);return;}
-    g_timerIrqSlots[cpu].model.Observe(epoch,now,rip,cs);SpinLockRelease(&g_timerIrqSlots[cpu].lock);
+    if(!SpinLockTryAcquire(&g_timerIrqSlots[cpu].lock)){TimerWakeDrop(&g_timerIrqSlots[cpu].dropped);return {};}
+    const auto token=g_timerIrqSlots[cpu].model.Observe(epoch,now,rip,cs,cpu,SchedulerContextSwitchGeneration(cpu));
+    SpinLockRelease(&g_timerIrqSlots[cpu].lock);return token;
+}
+static void TimerIrqHandlerComplete(const TimerIrqHandlerToken& token,uint64_t scheduler){
+    if(!token.epoch || token.cpu>=MAX_CPUS)return;
+    const unsigned cpu=SmpCurrentCpuIndex();
+    uint64_t end=0;if(!KvmClockReadStableNs(&end))end=0;
+    auto& slot=g_timerIrqSlots[token.cpu];
+    if(!SpinLockTryAcquire(&slot.lock)){TimerWakeDrop(&slot.dropped);return;}
+    slot.model.Complete(token,scheduler,end,cpu,SchedulerContextSwitchGeneration(cpu));SpinLockRelease(&slot.lock);
 }
 void TimerWakeTimingEnable(bool enabled){
     SpinLockAcquire(&g_timerWakeLock);g_timerWake.Enable(enabled);
@@ -406,7 +417,7 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
         }
     }
 
-    TimerIrqArrivalsObserve(interruptedRip,interruptedCs);
+    const auto peerProbe=TimerIrqArrivalsObserve(interruptedRip,interruptedCs);
     const auto timerProbe=TimerWakeTimingBegin(interruptedRip,interruptedCs);
     LapicWrite(LapicReg::EOI, 0);
 
@@ -459,7 +470,9 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
     // non-idle work when the interrupted context was user mode; Brook kernel
     // code is not generally safe to timeslice while holding internal locks.
     bool userMode = (interruptedCs & 3) != 0;
+    const uint64_t peerScheduler=peerProbe.epoch?TimerWakeTimingNow():0;
     SchedulerTimerTick(userMode,timerProbe.epoch?&timerProbe:nullptr,true,interruptedRip);
+    TimerIrqHandlerComplete(peerProbe,peerScheduler);
 }
 
 // Naked ISR entry for LAPIC timer (vector 32).

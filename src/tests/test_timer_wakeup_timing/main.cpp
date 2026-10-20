@@ -86,5 +86,57 @@ int main(){
     cpu[0].Observe(7,199,0,0);cpu[0].Observe(7,300,0,0);cpu[0].Observe(7,300,0,0);
     p=cpu[0].Snapshot();CHECK(p.invalidClock==2 && p.arrivals==4 && p.gaps==1 && p.maxGapNs==0);
     CHECK(p.firstNs==100 && p.lastNs==300 && !p.saturated);
+    // Peer handler brackets distinguish entry-to-scheduler prefix from wall
+    // time inside SchedulerTimerTick; the latter may contain task suspension.
+    cpu[0].Reset(9);cpu[1].Reset(9);
+    auto peer=cpu[0].Observe(9,100,0xabc,8,0);
+    CHECK(peer.epoch==9 && peer.cpu==0 && peer.entryNs==100 && peer.rip==0xabc);
+    CHECK(cpu[0].Complete(peer,110,130,0));p=cpu[0].Snapshot();
+    CHECK(p.handlerCompleted==1 && p.maxHandlerPrefixNs==10 && p.maxHandlerSchedulerNs==20 && p.maxHandlerTotalNs==30);
+    CHECK(!p.handlerRetained && p.maxPrefixEvent.token.rip==0xabc);
+    CHECK(p.sumHandlerPrefixNs==10 && p.sumHandlerSchedulerNs==20 && p.sumHandlerTotalNs==30);
+    CHECK(!cpu[0].Complete(peer,99,130,0));CHECK(!cpu[0].Complete(peer,110,109,0));
+    CHECK(!cpu[0].Complete(peer,110,130,1));
+    CHECK(cpu[0].Snapshot().handlerInvalidClock==2 && cpu[0].Snapshot().handlerMigrated==1);
+    CHECK(!cpu[1].Snapshot().handlerCompleted);
+    auto outer=cpu[0].Observe(9,200,0x111,8,0),inner=cpu[0].Observe(9,210,0x222,43,0);
+    CHECK(cpu[0].Complete(inner,220,230,0));CHECK(cpu[0].Complete(outer,205,240,0));
+    CHECK(cpu[0].Snapshot().handlerCompleted==3); // out-of-order returns allowed
+    cpu[0].SetEpoch(10);CHECK(!cpu[0].Complete(peer,110,130,0));
+    cpu[0].Reset(13);CHECK(!cpu[0].Complete(peer,110,130,0));
+    CHECK(!cpu[0].Snapshot().handlerInvalidClock && !cpu[0].Snapshot().handlerCompleted);
+    for(unsigned i=0;i<40;++i){
+        peer=cpu[0].Observe(13,1000+i,0x100+i,8,0,17);
+        CHECK(cpu[0].Complete(peer,2000+i,2001000+i*1000000,0,17));
+    }
+    p=cpu[0].Snapshot();CHECK(p.handlerCompleted==40 && p.handlerSlow==40);
+    CHECK(p.handlerRetained==16 && p.handlerExcluded==24);
+    CHECK(p.handlerEvents[0].totalNs>p.handlerEvents[15].totalNs && p.handlerEvents[0].token.rip==0x127);
+    CHECK(p.maxHandlerTotalNs==p.handlerEvents[0].totalNs && !p.saturated);
+    CHECK(p.maxSchedulerEvent.schedulerWallNs==p.maxHandlerSchedulerNs);
+    CHECK(p.maxPrefixEvent.prefixNs==p.maxHandlerPrefixNs);
+    cpu[0].Reset(15);
+    peer=cpu[0].Observe(15,100,0,8,0,5);CHECK(cpu[0].Complete(peer,110,120,0,5));
+    peer=cpu[0].Observe(15,130,0,8,0,5);CHECK(peer.previousEndNs==120);
+    CHECK(cpu[0].Complete(peer,140,150,0,5));p=cpu[0].Snapshot();
+    CHECK(p.handlerNoSwitch==2 && p.adjacentNoSwitchPairs==1 && p.nearReturns==1 && p.sumBetweenNs==10);
+    // Same-CPU resumption with a changed switch generation is suspended work,
+    // not a no-switch handler; it also breaks consecutive-pair measurement.
+    peer=cpu[0].Observe(15,160,0,8,0,5);CHECK(cpu[0].Complete(peer,170,3000000,0,7));
+    p=cpu[0].Snapshot();CHECK(p.handlerSwitched==1 && !p.handlerRetained && p.maxHandlerTotalNs>1000000 && p.maxNoSwitchTotalNs==20);
+    peer=cpu[0].Observe(15,3000010,0,8,0,7);CHECK(!peer.previousEndNs);
+    CHECK(cpu[0].Complete(peer,3000020,3000030,0,7));
+    peer=cpu[0].Observe(15,3000040,0,8,0,8);CHECK(!peer.previousEndNs); // switch between handlers
+    CHECK(cpu[0].Complete(peer,3000050,3000060,0,8));
+    cpu[0].Observe(15,0,0,8,0,8);peer=cpu[0].Observe(15,3000070,0,8,0,8);CHECK(!peer.previousEndNs);
+    CHECK(cpu[0].Complete(peer,3000080,3000090,0,8));
+    peer=cpu[0].Observe(15,3000100,0,8,0,~uint64_t(0));CHECK(!peer.previousEndNs);
+    CHECK(cpu[0].Complete(peer,3000110,3000120,0,~uint64_t(0)));
+    CHECK(cpu[0].Snapshot().handlerUnknownGeneration==1);
+    // Return order and intervening unfinished arrivals must not manufacture an
+    // adjacent pair. Each actual wrapper invokes Complete once per stack token.
+    cpu[0].Reset(17);outer=cpu[0].Observe(17,100,0,8,0,1);inner=cpu[0].Observe(17,110,0,8,0,2);
+    CHECK(cpu[0].Complete(inner,120,130,0,2));CHECK(cpu[0].Complete(outer,105,140,0,2));
+    peer=cpu[0].Observe(17,150,0,8,0,2);CHECK(!peer.previousEndNs);
     std::printf("TIMER_WAKE_TIMING %s\n",failed?"FAIL":"PASS");return failed?1:0;
 }
