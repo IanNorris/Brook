@@ -1,0 +1,152 @@
+# Timing and scheduler audit — 20 October 2026
+
+This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
+`f932600c7ef0ac9606057f8e976e47b3f397695aae69383dc965a6d342e2f1b3`.
+The native review reported roughly 1.5× playback in Quake II and Firefox.
+No repair has yet been shown to resolve the playback speedup, and no scheduler
+default change has been made.
+
+## Clocksource versus interrupt delivery
+
+Brook enables KVM's `MSR_KVM_SYSTEM_TIME_NEW` (`0x4b564d01`) on the BSP and
+registers one pvclock page. `KvmClockReadNs` converts TSC through that page;
+`KvmClockReadStableNs` additionally checks the advertised stable-clock feature,
+per-snapshot stable flag, arithmetic and ordered TSC sampling within the version
+check. The vDSO uses the latter algorithm for MONOTONIC only. Other IDs fall
+back to syscalls. Shared BSP-page reads on other CPUs require explicit stable
+TSC/migration coverage; per-vCPU registration is not currently implemented.
+
+The KVM clocksource is not an interrupt timer. Per-CPU periodic LAPIC timers
+still generate vector 32. Brook calibrates their reload count against PIT
+channel 2 and later changes that count using raw delivered BSP interrupts
+versus coarse CMOS seconds. No TSC-deadline timer programming is implemented.
+See the upstream [KVM clock ABI](https://docs.kernel.org/virt/kvm/x86/msr.html)
+and [x86 timekeeping explanation](https://docs.kernel.org/virt/kvm/x86/timekeeping.html).
+
+The reviewed boot logged `KvmClock: enabled`, stable flag `0x1`, and LAPIC
+calibration 62,591 ticks/ms. Subsequent reload adjustments ranged from 55,705
+to 62,591 in the inspected log; adjustment samples included 745 and 1,129
+interrupts/second. Those observations are not proof of a 1.5× clocksource error.
+A short host-bracketed audio-clock sample advanced 9.037 guest seconds in 9.033
+host seconds. It does not exclude intermittent errors or another timing path.
+
+## Source map
+
+Paths below are relative to the repository. The selected source is the KVM path
+unless explicitly marked as fallback.
+
+| Consumer | Source / delivery | Code | Remaining concern |
+| --- | --- | --- | --- |
+| Syscall MONOTONIC, RAW, COARSE, BOOTTIME | `KvmClockReadNs`; adjustable LAPIC-ms fallback | `src/kernel/src/syscall.cpp`, `ClockNowNs` | IDs currently alias; validate unsupported IDs and RAW semantics separately |
+| libc MONOTONIC fast path | read-only pvclock/TSC vDSO | `src/kernel/vdso/clock.c` | Compare forced syscall, libc, migration and version-update races |
+| REALTIME, gettimeofday, RTC display | immutable CMOS epoch plus pvclock elapsed | `src/kernel/src/rtc.cpp`, `RtcNowNs` | CMOS precision is one second; physical/unstable-clock fallback unaccepted |
+| timerfd expiry | selected nanosecond clock, lazy readiness refresh | `syscall.cpp`, `timerfd_state.h` | Delivery depends on readiness/wakeup paths; existing timerfd tests are not scheduler latency tests |
+| POSIX timer expiry | pvclock; REALTIME recomposes `RtcNow()*1e9 + pvclock%1e9` | `src/kernel/src/posix_timer.cpp`, `Now` | Epoch/fraction mismatch repaired in this branch; host boundary regression passes, guest pending |
+| Relative nanosleep | monotonic deadline rechecked after each wake | `syscall.cpp`, `sys_nanosleep` | Wake requests still expressed in adjustable LAPIC ticks |
+| Absolute clock_nanosleep | selected-clock deadline, LAPIC wake hints | `syscall.cpp`, `sys_clock_nanosleep` | Recheck and request-overflow repair passes short guest regression; signal/load coverage remains |
+| futex, poll/select/epoll waits | nanosecond deadlines plus LAPIC wake hints in several paths | `syscall.cpp`, deadline conversion and waiter loops | Audit each retry, clock selection, signal and overflow path individually |
+| alarm and scheduler sleep | adjustable `g_lapicTickCount` | `scheduler.cpp`, `syscall.cpp` | CMOS rebases can move this counter in either direction |
+| Scheduler slice expiry / policy aging | BSP apparent LAPIC-ms counter | `scheduler.cpp`, `SchedulerTimerTick` | Unsigned elapsed subtraction after a backward rebase; AP delivery differs from BSP time |
+| CPU accounting | one user/sys/idle charge per delivered local IRQ | `scheduler.cpp`, `SchedulerTimerTick` | Counts interrupts, not actual elapsed CPU time; stolen time and masked IRQs bias results |
+| Ready-queue latency diagnostic | stable KVM clock, incarnation-guarded episodes | `scheduler.cpp`, `ReadyLatencyNow` | Optional; does not measure time waiting for device completion |
+| HDA completion | LPIB modulo ring position; stable pvclock bounds ambiguity | `intel_hda_mod.cpp`, `audio_dma_clock.h` | Check native 44.1-kHz progress against host audio capture, underruns and position discontinuities |
+| Mixer stream completion | driver receipts attributed by identity/epoch | `audio.cpp`, `Reconcile` | Acceptance/completion are separate; stateless resampling remains a separate concern |
+| QEMU host output | selected PipeWire/SDL/none backend | `scripts/run-qemu.sh` | Compare native review backend with silent controlled backend without changing game settings |
+
+## Active scheduler and safety audit
+
+The reviewed boot loads `rr` as the built-in policy: one global FIFO, 10 ms
+slices, serialized through `g_readyLock`. `mlfq` registers as a module but is
+not selected. It has four FIFOs with 5/10/20/40 ms slices, blocking/yield boosts,
+demotion on exhaustion and a periodic boost to HIGH. The standalone
+`sched_policy.cpp` implementation is not the selected `SchedOps` policy.
+
+Mechanism ownership must be checked separately from policy queue tests:
+`runningOnCpu` claims, pending requeue after leaving a kernel stack, retirement
+references, blocked wake races, process stop/exit and the ready/all-process lock
+order all live in `scheduler.cpp`. Kernel execution is deliberately not generally
+timeslice-preemptible. A latency policy cannot safely change that assumption.
+
+Confirmed module defect: MLFQ `InitProcess` reset a still-queued PID's priority
+and links without unlinking its old membership. The RR implementation already
+unlinked first. The new common regression replaces head, middle and tail PIDs
+at all four new priorities, verifies both neighbours and counts, then requeues
+and drains the replacement once. It fails MLFQ before the repair; afterwards
+all 51 module checks pass, including the existing 100,000-operation eight-CPU
+interleaving model. Those are host policy checks, not concurrent execution of
+the kernel context-switch mechanism. No default-policy change follows.
+
+The POSIX realtime timer selector now calls `RtcNowNs()` directly. A new host
+regression includes the actual `posix_timer.cpp` and exercises its clock selector
+and expiry code with independent monotonic/realtime fractional epochs, a
+pvclock second rollover, a realtime rollover and non-KVM fallback. Before the
+fix it reports five failures, including an absolute realtime timer expiring
+before its deadline; after the fix it reports zero. Relative POSIX realtime
+timers select a monotonic basis, so this defect chiefly affects absolute
+realtime timers. This is not yet a reproduction of the playback-speed issue.
+
+Other audit leads, not established safety failures:
+
+- Runtime switching clears shared policy storage, then re-registers tasks under
+  ready/all-process locks. Audit running, Ready-but-on-CPU, terminated and idle
+  identification, held references and unlocked `Timeslice` reads before using
+  hot switching as a benchmark technique.
+- `Timeslice` is read outside the ready lock although the policy ABI requires
+  serialized calls. Establish a safe snapshot together with the slice baseline.
+- MLFQ priority zero is demoted on exhaustion in the module despite older docs
+  claiming realtime is never demoted. Decide the contract before changing it.
+- Yield/block promotion has no accumulated execution budget and can reward
+  repeated short yields. Equal priority dispatch-count tests do not establish
+  proportional CPU-time fairness, process-group fairness or a starvation bound.
+- Tick-based CPU accounting is insufficient evidence for EEVDF virtual runtime.
+
+## Verification and next gates
+
+Ignored evidence is in `build/workloads/timing-scheduler-20261020/host/`:
+`mlfq-before.log` (50 pass, one fail), `mlfq-after.log` (51 pass),
+`posix-clock-before.log` (five failures), `posix-clock-after.log` (zero), and
+`timing-paths-host.json`. `scripts/workloads/timing_paths.py` brackets libc
+MONOTONIC with forced syscalls and samples relative and absolute MONOTONIC /
+REALTIME sleeps for premature successful returns. Its host smoke passes. The initial live guest attempt found the session had
+exited; subsequent tests use private clones, preserving the review originals.
+
+The original baseline kernel's short idle-guest probe found 32/32 libc reads
+inside forced-syscall brackets and no early relative sleeps. Four of twelve
+MONOTONIC absolute sleeps and five of twelve REALTIME absolute sleeps returned
+before the requested duration (largest shortfall 90,567 ns). The candidate now
+rechecks the selected clock after every absolute wakeup and rejects arithmetic
+overflow while constructing the deadline. It passes all 36 sleep observations
+and 32 clock brackets, with no early returns. The candidate probe additionally
+records the selected-clock finish against each actual absolute target. These
+short idle samples do not reproduce the reported 50% playback speedup.
+
+Candidate kernel SHA-256 is
+`1da82d41b44f5ed19039d1059981259c988bce8839ab64a798c737225b3873b6`.
+All 58 hosted suites and nine bootstrap-observer checks pass. The existing
+compiled-entry supported-template audit and scheduler-start call-contract audit
+also pass; neither establishes arbitrary handler-body or SMP scheduler safety.
+Guest evidence is retained under
+`build/workloads/timing-scheduler-20261020/{baseline,candidate}-observation/`.
+The baseline acknowledged sync, exited normally and passed all four primary
+offline filesystem checks. The candidate also acknowledged sync, its owned launcher exited zero and all
+four primary filesystems passed offline checks. Full saved-profile fixture
+verification and browser/game regression remain pending. No mixed-workload or browser gain is claimed.
+
+1. Freeze a baseline and gather host/guest clock brackets, actual native audio
+   completion/capture rates and browser media-time progression, without taking
+   screenshots/profiles inside measurement intervals. Reproduce the speedup.
+2. Correct confirmed clock-domain and early-wakeup defects with independent
+   boundary/wakeup tests; compare the same workload and verify clean shutdown,
+   filesystem checks and saved-user-data preservation.
+3. Test policy queue and SMP mechanism invariants, including lifecycle churn,
+   signals, wake races and controlled migration; repair policy switching before
+   relying on it. Prefer boot-selected policy comparisons on private images.
+4. Establish an eight-vCPU mixed workload: fixed CPU workers, periodic sleepers,
+   input-like wakeups and local browser/audio playback. Report per-task service,
+   wake/ready latency p50/p90/p95/max, underruns, throughput and scheduler cost.
+   Separate warmup, startup and steady state; match visibility and host load.
+5. Compare RR and repaired MLFQ. Consider EEVDF with explicit weights, virtual
+   runtime, eligibility/deadlines, sleeper placement, lag, preemption, migration
+   and overflow/lifetime contracts. Select implementation based on measured
+   bottlenecks and safety gates, not only browser smoothness. Keep the default
+   unchanged until evidence supports a change.

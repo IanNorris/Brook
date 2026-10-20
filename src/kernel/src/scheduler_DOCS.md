@@ -5,8 +5,11 @@
 Brook's scheduler is preemptive with pluggable policy and SMP support. The
 mechanism (context switch, per-CPU state, lock management) lives in
 `scheduler.cpp`. The policy (queue management, priority, timeslice) is
-abstracted behind the `SchedOps` vtable, with a built-in MLFQ implementation
-in `sched_policy.cpp` and a loadable round-robin module in `sched_mlfq`.
+abstracted behind the `SchedOps` vtable. The built-in default is round-robin
+(`src/modules/sched_rr.cpp`); `sched_mlfq` registers the optional MLFQ policy
+(`src/modules/sched_mlfq.cpp`). The separate `sched_policy.cpp` implementation
+is not the active policy. See the current [timing and scheduler audit](../../../docs/timing-scheduler-audit.md)
+for clock dependencies, verified coverage and open safety gates.
 
 ## Files
 
@@ -53,7 +56,7 @@ PerCpuSchedState {
 
 Max CPUs: 64 (SCHED_MAX_CPUS).
 
-### MLFQ Policy (Built-in)
+### MLFQ Policy (Optional module)
 
 4 priority levels:
 | Level | Name | Timeslice |
@@ -64,9 +67,9 @@ Max CPUs: 64 (SCHED_MAX_CPUS).
 | 3 | Low | 40ms |
 
 - New processes start at Normal (2)
-- Exhausting timeslice → demote (never demotes Realtime)
+- Exhausting timeslice → demote (the module also demotes level 0)
 - Voluntary yield/block → boost one level
-- Anti-starvation boost every 1000ms → all to High (1)
+- Anti-starvation boost every 1000ms → queued Normal/Low tasks to High (1)
 - Per-level FIFO queues (doubly-linked for O(1) remove)
 
 ---
