@@ -123,6 +123,11 @@ def main():
     if not has('clock-before'):save('clock-before',b.server.guest(d,'clock status'))
     if not has('runtime-before'):save('runtime-before',b.server.guest(d,'sched runtime status'))
     if not has('service-before'):save('service-before',b.server.guest(d,'sched policy service'))
+    # A large process snapshot can time out once RR is saturated. Collect it
+    # before starting the load; only the bounded profiler start belongs inside
+    # that interval. Keep the original snapshot when resuming the same cohort.
+    if args.profile_ms and not has('profile-procs-before'):
+     save('profile-procs-before',b.server.guest(d,'procs',timeout=30))
     if not has('load-before'):
      b.server.guest(d,'sched timing reset');save('load-before',guest_clock())
     bench=tracked('cpu',['/boot/BIN/SCHEDMIX','24','30'])
@@ -133,9 +138,8 @@ def main():
      save('load-ready',dict(host_monotonic_ns=time.monotonic_ns()))
     if args.profile_ms and not has('profile-start'):
      if has('profile-intent'):raise RuntimeError('Prior profile start delivery unresolved; inspect existing capture')
-     save('profile-procs-before',b.server.guest(d,'procs'))
      save('profile-intent',dict(duration_ms=args.profile_ms,host_monotonic_ns=time.monotonic_ns()))
-     save('profile-start',b.server.profile(s,action='start',duration_ms=args.profile_ms))
+     save('profile-start',b.server.profile(s,action='start',duration_ms=args.profile_ms,guest_timeout=30))
     if not has('capture'):
      if has('capture-intent'):raise RuntimeError('Prior capture delivery unresolved; inspect existing recording before retry')
      save('capture-intent',dict(host_monotonic_ns=time.monotonic_ns()));samples=[];done=threading.Event()

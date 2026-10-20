@@ -87,7 +87,8 @@ def main():
     save('identity', dict(session=str(review), phase=phase, kernel=data['packages']['kernelVersion'],
                           host_load=os.getloadavg(), resources=data, software_vsync=args.software_vsync,hda_codec=codecs[0]))
     save('harness', dict(controller_sha256=linux.sha(Path(__file__)),
-                         page_sha256=linux.sha(http/'http/index.html'), clip_sha256=linux.sha(http/'http/clip.mp4')))
+                         page_sha256=linux.sha(http/'http/index.html'), clip_sha256=linux.sha(http/'http/clip.mp4'),
+                         scheduler_probe_sha256=linux.sha(Path(__file__).with_name('linux_sched_state.py'))))
     benchmark_hash = guest(['sha256sum', args.benchmark]).split()[0]
     save('benchmark', dict(path=args.benchmark, sha256=benchmark_hash,
                            expected_brook_sha256='9186eb43eb1673e6734f571dbe779822ec3b0dd4b6ee3263db008c47049253ec'))
@@ -126,6 +127,8 @@ def main():
         wait_for(lambda:rows()[-1]['state']['performanceMs']-idle_first['state']['performanceMs'] >= 10000, 90, 'Idle telemetry deadline')
         save('idle', dict(first=idle_first,last=rows()[-1]))
         save('guest-environment', guest(['sh','-c', 'cat /sys/devices/system/clocksource/clocksource0/current_clocksource; cat /proc/sys/kernel/sched_autogroup_enabled; ps -u 1000 -L -o pid,tid,cls,rtprio,ni,comm; wpctl status']))
+        save('guest-scheduler', json.loads(guest(['python3','-c',
+             Path(__file__).with_name('linux_sched_state.py').read_text(), '--all-user-tasks'])))
         before = save('load-before', clock())
         cpu = spawn('cpu', [args.benchmark,'24','30'])
         wait_for(lambda:'READY workers=' in (out/'cpu.stdout').read_text(), 25, 'CPU READY deadline')

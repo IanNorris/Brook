@@ -1,5 +1,9 @@
 # Scheduler policy direction after the timing audit
 
+The current [desktop/gaming tuning direction](desktop-scheduler-tuning.md)
+prioritizes input, frame cadence and audio over CPU batch throughput. Further
+RR investigation is stopped; Linux's live 2.8-ms requests are now verified.
+
 An optional EEVDF implementation now exists and has passed its first native
 pilot. RR remains the default. The implemented contract, ABI/staging procedure,
 model scope and outstanding acceptance are in [eevdf-experiment.md](eevdf-experiment.md).

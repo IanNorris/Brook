@@ -165,3 +165,10 @@ host-time bounds and does not relax that rejection. Its whole-run rates do not
 assume a 1× page clock; loaded selection still uses the CPU interval supplied by
 the controller. `clock_state.py` can query Linux monotonic/raw clocks and
 frequency-discipline state without setting any clock.
+
+The browser controller now records `guest-scheduler.json` with a read-only
+per-thread `sched_getattr` inventory, readable kernel configuration and group
+metadata. The [live slice audit](../../docs/desktop-scheduler-tuning.md) verifies
+2.8-ms requests on Linux 6.18.26 versus Brook EEVDF's 4-ms normal request,
+and records a callback/20-ms reference cohort. Unreadable debugfs values remain
+unknown; requests are not guarantees of uninterrupted execution time.
