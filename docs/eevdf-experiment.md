@@ -390,3 +390,59 @@ four filesystems and original documents/profiles pass. The earlier unexplained
 backwards clock samples now have a reproducible pause/resume mechanism and
 native repair evidence; the original subjective application speedup still has
 not been reproduced.
+
+## Same-kernel reverse-order browser repeats
+
+Six fresh private cohorts use the per-vCPU-clock kernel
+`a9627f6fb5fcb7fd1f976f5c03138a03c68396f6c8ede195bef8ad4ec372d7a1`
+and GPU module `724914fd7298dfb50d89ce1912b3fbd5d8b916ead51541ba983c48a4daf9f4bb`.
+The order is RR, MLFQ, EEVDF, EEVDF, MLFQ, RR. Each boots from the same checked
+source, creates a fresh Firefox profile and uses the same generated clip,
+controller, eight vCPUs, six GiB, host affinity 0–13, 800×600 browser window,
+explicitly routed 44.1-kHz private PipeWire sink and callback-paced HDA. There
+is no profiler recording in these cohorts. The 24 guest CPU workers run for
+30 seconds. Host load, CPU counters and available memory are sampled once per
+second; these are not cold-cache or isolated-host trials.
+
+Ranges below cover two repeats per policy. Presentation and media figures come
+from the buffered page trace, because RR's HTTP arrivals cannot supply causal
+loaded samples. A larger CPU batch count while the browser is stalled is not
+higher overall workload throughput.
+
+| Policy | Periodic p95 | Worst periodic delay | Video callbacks/s | Media seconds/page second | CPU batches |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RR | 89.80–90.22 ms | 96.02–104.93 ms | 0–0.035 | 0.0114–0.0120 | 6.885–6.971 million |
+| MLFQ | 20.49–23.38 ms | 74.73–94.82 ms | 6.58–6.76 | 0.9660–0.9739 | 5.763–5.920 million |
+| EEVDF | 2.76–3.35 ms | 54.65–120.32 ms | 4.30–4.43 | 0.9089–0.9426 | 6.032–6.097 million |
+
+Buffered dispatch-to-DOM upper bounds reach 19.74/21.64 seconds on RR,
+219/223 ms on MLFQ and 264/225 ms on EEVDF. Their clock-anchor bounds and RAF
+opportunities are retained separately; HTTP receipt is not physical latency.
+RR's ready-queue bookkeeping maximum is only about 33 ms in the first repeat,
+so its much larger application stall cannot be described as one equally large
+ready-queue wait. Blocked time, dependency convoys and pre-enqueue delays remain
+important diagnostic targets.
+
+Eight-second WAV captures contain only 2,560/28,544 frames on RR, versus
+353,024/353,408 on MLFQ and 352,768/349,440 on EEVDF. WAV storage omits inactive
+periods, so short stored-silence runs would conceal RR's missing output. MLFQ's
+longest stored silent runs are 20/100 ms and EEVDF's 90/110 ms; successful
+delivery is not glitch-free playback acceptance. No loaded cohort reproduces
+accelerated media playback. Both repeats confirm EEVDF's latency advantage
+while MLFQ presents more video. They do not establish statistical confidence,
+a consistent worst-case bound or a safe default-policy replacement.
+
+All six retain zero invalid/backwards/clamped/stale/saturated runtime samples,
+with pvclock and steal masks 255, matching ready/actual-ready counts and no
+policy saturation. Buffered traces lose zero samples; CPU/browser lineages
+drain. Each original launcher exits zero, heap checks pass, four filesystems
+pass offline checks and the twelve named documents/four original profile trees
+match the saved source. RR remains default. The frozen runner/source manifest,
+per-run data, host observations and explicit safety-versus-playback gates are
+under `build/workloads/timing-scheduler-20261020/policy-repeats`.
+
+A related harness inventory repair distinguishes 62 configured CTest cases
+from 61 native test executables: the EEVDF module case invokes the existing
+EEVDF binary again. The build now has thirteen kernel modules. Bootstrap
+acceptance checks are updated to those independently verified counts; this is
+an inventory correction, not a new end-to-end bootstrap acceptance result.

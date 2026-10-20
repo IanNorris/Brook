@@ -14,6 +14,9 @@ Firefox. A later subjective comparison with the original music suggested
 approximately 1.3×; neither estimate is a measured playback factor.
 No repair has yet been shown to resolve the playback speedup, and no scheduler
 default change has been made.
+Later [local audio alignment of the historical recording](playback-recording-rate.md)
+supports roughly 1.3× playback with a slower later section; the current controlled
+VM has not yet reproduced that acceleration.
 
 ## Clocksource versus interrupt delivery
 
@@ -63,7 +66,7 @@ elapsed-clock candidate; historical baseline results follow below.
 | alarm and scheduler sleep | `ApicTickCount()`: stable pvclock with preserved boot origin, IRQ fallback otherwise | `scheduler.cpp`, `syscall.cpp` | Delivery still depends on BSP interrupt/wakeup scans; fallback is not a precise wall clock |
 | Scheduler slice expiry / policy aging | `ApicTickCount()` refreshed by each CPU; periodic local IRQ delivery | `scheduler.cpp`, `SchedulerTimerTick` | Stable time removes CMOS rebases; kernel non-preemptibility and IRQ delivery still bound responsiveness |
 | Legacy user/sys/idle CPU statistics | one charge per delivered local IRQ | `scheduler.cpp`, `SchedulerTimerTick` | Existing ticks/proc/rusage/times remain approximate and distinct from the new running-interval ledger |
-| Running-interval ledger | stable KVM elapsed minus paired per-vCPU steal reads; explicit coarse fallback | `runtime_accounting.h`, `RuntimeNow` | Policy ABI has not yet consumed these totals; host/IRQ/failure limits and native validation are recorded below |
+| Running-interval ledger | stable KVM elapsed minus paired per-vCPU steal reads; explicit coarse fallback | `runtime_accounting.h`, `RuntimeNow` | EEVDF consumes charged service through policy ABI 2; host/IRQ/fallback limits and native validation are recorded below |
 | Ready-queue latency diagnostic | stable KVM clock, incarnation-guarded episodes | `scheduler.cpp`, `ReadyLatencyNow` | Optional; does not measure time waiting for device completion |
 | HDA completion | LPIB modulo ring position; stable pvclock bounds ambiguity | `intel_hda_mod.cpp`, `audio_dma_clock.h` | Check native 44.1-kHz progress against host audio capture, underruns and position discontinuities |
 | Mixer stream completion | driver receipts attributed by identity/epoch | `audio.cpp`, `Reconcile` | Acceptance/completion are separate; stateless resampling remains a separate concern |

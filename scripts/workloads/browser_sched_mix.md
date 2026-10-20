@@ -50,6 +50,19 @@ python3 scripts/workloads/analyze_browser_sched_trace.py \
   build/browser-results/rr-0 --output build/browser-results/rr-0/buffered-analysis.json
 ```
 
+The controller also saves before/after runtime and policy-service snapshots.
+A clock/runtime anomaly fails the run before shutdown, preserving the same guest
+for diagnosis. Inspect the per-CPU registration masks as well as the zero-error
+counters. These safety gates do not declare playback smooth: near-zero video
+callbacks or missing PCM delivery are valid negative performance evidence.
+
+For repeated policy comparisons, use fresh clones/profiles, the exact same
+kernel/modules/clip/controller and explicit audio routing. Run one VM at a time;
+reverse policy order on the second block and retain per-run host load/memory
+samples. Two repeats support ranges and consistency checks, not confidence
+intervals or a default-policy decision. Analyze the buffered trace when HTTP
+arrival is too delayed to yield causal loaded samples.
+
 Keep HTTP acknowledgment, input-to-DOM, RAF opportunity and physical presentation
 separate. Clock-anchor intersection assumes a verified 1x page/host clock and
 allows 2 ms browser timestamp quantization. WAV capture omits periods when no

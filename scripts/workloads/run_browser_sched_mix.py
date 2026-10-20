@@ -108,6 +108,8 @@ def main():
      save('idle',dict(first=first,last=values[-1],rows=values,ready_timing=b.server.guest(d,'sched timing status')))
      print('MIX_IDLE_DONE',phase,len(values),flush=True)
     if not has('clock-before'):save('clock-before',b.server.guest(d,'clock status'))
+    if not has('runtime-before'):save('runtime-before',b.server.guest(d,'sched runtime status'))
+    if not has('service-before'):save('service-before',b.server.guest(d,'sched policy service'))
     if not has('load-before'):
      b.server.guest(d,'sched timing reset');save('load-before',guest_clock())
     bench=tracked('cpu',['/boot/BIN/SCHEDMIX','24','30'])
@@ -197,6 +199,16 @@ def main():
      browser.poll();assert time.monotonic()<deadline,'Inspect same browser lineage';time.sleep(.3)
     assert browser.evidence['status']['guest']['live_tasks']==0
     save('clock-after',b.server.guest(d,'clock status'))
+    save('runtime-after',b.server.guest(d,'sched runtime status'))
+    save('service-after',b.server.guest(d,'sched policy service'))
+    runtime=read('runtime-after')
+    bad=('invalid_samples','backwards_wall','backwards_steal','clamped_service','stale_identity','saturated')
+    gate=dict(passed=all(runtime[k]==0 for k in bad),counters={k:runtime[k] for k in bad},
+              pvclock_cpu_mask=read('clock-after').get('pvclock_cpu_mask'),
+              steal_cpu_mask=runtime['steal_cpu_mask'])
+    save('runtime-gate',gate)
+    assert gate['passed'],'Inspect retained clock/runtime anomaly before shutdown'
+
     save('final-heap',b.server.guest(d,'heap check'));save('final-audio',b.server.guest(d,'audio stats'))
     if not has('shutdown-intent'):save('shutdown-intent',dict(request_id=uuid.uuid4().hex))
     if not has('shutdown'):save('shutdown',b.server.lifecycle_operation(s,'shutdown',read('shutdown-intent')['request_id'],wait_s=10))

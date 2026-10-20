@@ -27,7 +27,10 @@ import server
 # Independent expected inventory for the source revision under acceptance.
 # Keep this in step with src/tests/host/CMakeLists.txt; never accept whatever
 # count a partial build happens to report.
-NATIVE_TEST_COUNT = 58
+NATIVE_TEST_COUNT = 62
+# test_eevdf_module invokes test_eevdf a second time with the loadable policy.
+NATIVE_EXECUTABLE_COUNT = 61
+KERNEL_MODULE_COUNT = 13
 NATIVE_PASS_MARKER = f"100% tests passed, 0 tests failed out of {NATIVE_TEST_COUNT}"
 
 
@@ -559,7 +562,7 @@ def finalize_acceptance(directory, args, metadata, process, session, data, stage
     modules = sorted((artifacts / "kernel/drivers").glob("*.mod"))
     baremetal = sorted((artifacts / "tests").glob("*.elf"))
     native = sorted(p for p in (artifacts / "host_tests").glob("test_*") if p.is_file() and os.access(p, os.X_OK))
-    if len(modules) != 12 or len(baremetal) != 7 or len(native) != NATIVE_TEST_COUNT or any(not p.is_file() or not p.stat().st_size for p in required + modules + baremetal):
+    if len(modules) != KERNEL_MODULE_COUNT or len(baremetal) != 7 or len(native) != NATIVE_EXECUTABLE_COUNT or any(not p.is_file() or not p.stat().st_size for p in required + modules + baremetal):
         raise RuntimeError(f"Missing artifacts: modules={len(modules)} baremetal={len(baremetal)} native={len(native)}")
     hashes = {str(p.relative_to(artifacts)): sha(p) for p in required + modules + baremetal + native}
     write(directory / "artifact-hashes.json", hashes)
