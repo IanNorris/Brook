@@ -125,8 +125,18 @@ class SilentRoutes:
                            and prop(o).get('port.name') == 'playback_' + channel]
                 if len(sources) != 1 or len(targets) != 1:
                     raise RuntimeError('Silent audio port identity is ambiguous')
-                self.command(['pw-link', '-L', str(sources[0]['id']), str(targets[0]['id'])])
-                links.append({'channel':channel, 'source':sources[0]['id'], 'target':targets[0]['id']})
+                # A watcher may attach after boot-time routing, or resume after
+                # its observer exited. Adopt only an unambiguous existing link
+                # between these validated owned-source/private-sink endpoints.
+                existing=[o for o in after if o.get('type')=='PipeWire:Interface:Link'
+                          and str(prop(o).get('link.output.port'))==str(sources[0]['id'])
+                          and str(prop(o).get('link.input.port'))==str(targets[0]['id'])]
+                if len(existing)>1 or any(o.get('info',{}).get('state')=='error' for o in existing):
+                    raise RuntimeError('Silent audio link identity is ambiguous or failed')
+                if not existing:
+                    self.command(['pw-link', '-L', str(sources[0]['id']), str(targets[0]['id'])])
+                links.append({'channel':channel, 'source':sources[0]['id'], 'target':targets[0]['id'],
+                              'adopted':bool(existing)})
             self.known.add(token)
             self.events.append({'node':node['id'], 'serial':token[1], 'owner_pid':pid,
                                 'host_monotonic_ns':time.monotonic_ns(), 'links':links})

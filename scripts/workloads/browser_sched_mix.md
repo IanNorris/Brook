@@ -7,6 +7,14 @@ requires the review's `candidate.json` to record `private_clones: true`,
 `memory_gib: 6`, `vcpus: 8` and `hda_use_timer: false`; `session.txt` identifies
 the actual boot. Verify these against the launch arguments before measurement.
 
+`--hda-use-timer off` is the diagnostic default; `on` selects a separate
+prepared timer-mode cohort. The controller verifies the live QOM property and
+records it in `identity.json`. Both eight-CPU pvclock and steal masks must be
+255 for its runtime gate. Mode/backend comparisons must retain their own results.
+For SDL into the private graph, start routing when the bridge session appears,
+before guest-readiness polling. A resumed watcher can adopt existing validated
+links. Preserve the original launcher even if readiness observation expires.
+
 Serve an existing generated 120-second H.264/AAC MP4 on loopback. Put its MP4
 metadata at the front (`-movflags +faststart` when creating/remuxing it). No
 clip or game assets are bundled. A clip that must loop/seek during the CPU

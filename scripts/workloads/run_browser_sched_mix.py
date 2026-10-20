@@ -24,6 +24,8 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--phase',required=True)
     parser.add_argument('--policy',choices=['rr','mlfq','eevdf'],required=True)
+    parser.add_argument('--hda-use-timer',choices=['on','off'],default='off',
+                        help='Keep codec modes in separate cohorts; off is the diagnostic control')
     parser.add_argument('--profile-ms',type=int,default=0,
                         choices=[0,*range(100,5001)],metavar='0 or 100..5000',
                         help='Optional loaded CPU/CS capture; keep separate from unprofiled controls')
@@ -31,7 +33,18 @@ def main():
     if not re.fullmatch('[a-z0-9-]{1,48}',phase):parser.error('Use a lowercase alphanumeric phase name')
     review=args.review.resolve();metadata=json.loads((review/'candidate.json').read_text())
     assert metadata['private_clones'] and metadata['memory_gib']==6 and metadata['vcpus']==8
-    assert metadata['hda_use_timer'] is False,'This cohort requires diagnostic callback HDA mode'
+    hda_use_timer=args.hda_use_timer=='on'
+    assert metadata['hda_use_timer'] is hda_use_timer,'Requested codec mode differs from the prepared VM'
+    # Confirm the live codec, not just a preparation receipt.
+    with b.server.QMP((review/'session.txt').read_text().strip()) as q:
+     codecs=[]
+     for parent in ('/machine/peripheral','/machine/peripheral-anon'):
+      for item in q.call('qom-list',{'path':parent}):
+       if item['type']=='child<hda-output>':
+        path=parent+'/'+item['name'];actual=q.call('qom-get',{'path':path,'property':'use-timer'})
+        codecs.append(dict(path=path,use_timer=actual))
+     assert len(codecs)==1 and codecs[0]['use_timer'] is hda_use_timer,'Live HDA mode mismatch'
+
     s=(review/'session.txt').read_text().strip();d=b.server.load_session(s)
     route=args.audio_route_directory.resolve()
     route_identity=json.loads((route/'identity.json').read_text())
@@ -70,7 +83,7 @@ def main():
      return read(name)
     assert b.server.guest(d,'sched policy status')['policy']==policy
     if not has('harness'):save('harness',dict(controller_sha256=b.sha(Path(__file__)),analysis_sha256=b.sha(Path(__file__).with_name('analyze_browser_sched_trace.py')),page_sha256=b.sha(http/'http/index.html'),clip_sha256=b.sha(http/'http/clip.mp4')))
-    if not has('identity'):save('identity',dict(session=s,policy=policy,kernel=d['kernel_sha256'],host_load=os.getloadavg(),vm=str(review)))
+    if not has('identity'):save('identity',dict(session=s,policy=policy,kernel=d['kernel_sha256'],host_load=os.getloadavg(),vm=str(review),hda_codec=codecs[0]))
     else:assert read('identity')['session']==s
     port=json.loads((http/'server.json').read_text())['port'];home='/data/home/timing-browser-mix-'+phase
     source=out/'browser-source.py'
@@ -180,7 +193,7 @@ def main():
     longest=current=0
     for v in levels:current=current+1 if v<1 else 0;longest=max(longest,current)
     counts=[x['batches'] for x in result['cpu']];assert len(counts)==24 and min(counts)>0 and all(x['samples']>0 and not x['early'] for x in result['periodic'])
-    summary=dict(phase=phase,policy=policy,kernel=d['kernel_sha256'],guest_memory_gib=6,vcpus=8,hda_use_timer=False,scope='headless GPU VM, fresh Firefox profile, generated local video, 24 bounded CPU workers; input ack includes HTTP and DOM RAF opportunity, not physical display latency; load alignment assumes 1x KVM clock checked by reported brackets',host_guest_rate_low=clock_low,host_guest_rate_high=clock_high,load_host_start_latest_ns=load_start,load_host_end_earliest_ns=load_end,idle=media_summary(read('idle')['rows']),loaded=media_summary(loaded),cpu_batches=sum(counts),cpu_service_ratio=max(counts)/min(counts),periodic_p95_ms=max(x['p95_ns'] for x in result['periodic'])/1e6,periodic_max_ms=max(x['max_ns'] for x in result['periodic'])/1e6,inputs=inputs,audio_frames=n,audio_host_s=capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0],audio_host_rate_ratio=n/rate/(capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0]),audio_longest_silent_10ms_bins=longest)
+    summary=dict(phase=phase,policy=policy,kernel=d['kernel_sha256'],guest_memory_gib=6,vcpus=8,hda_use_timer=hda_use_timer,scope='headless GPU VM, fresh Firefox profile, generated local video, 24 bounded CPU workers; input ack includes HTTP and DOM RAF opportunity, not physical display latency; load alignment assumes 1x KVM clock checked by reported brackets',host_guest_rate_low=clock_low,host_guest_rate_high=clock_high,load_host_start_latest_ns=load_start,load_host_end_earliest_ns=load_end,idle=media_summary(read('idle')['rows']),loaded=media_summary(loaded),cpu_batches=sum(counts),cpu_service_ratio=max(counts)/min(counts),periodic_p95_ms=max(x['p95_ns'] for x in result['periodic'])/1e6,periodic_max_ms=max(x['max_ns'] for x in result['periodic'])/1e6,inputs=inputs,audio_frames=n,audio_host_s=capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0],audio_host_rate_ratio=n/rate/(capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0]),audio_longest_silent_10ms_bins=longest)
     summary['profile_ms']=args.profile_ms
     save('summary',summary);save('rms-10ms',levels);print('MIX_SUMMARY',json.dumps(summary),flush=True)
     import importlib.util
@@ -203,7 +216,7 @@ def main():
     save('service-after',b.server.guest(d,'sched policy service'))
     runtime=read('runtime-after')
     bad=('invalid_samples','backwards_wall','backwards_steal','clamped_service','stale_identity','saturated')
-    gate=dict(passed=all(runtime[k]==0 for k in bad),counters={k:runtime[k] for k in bad},
+    gate=dict(passed=all(runtime[k]==0 for k in bad) and read('clock-after').get('pvclock_cpu_mask')==255 and runtime['steal_cpu_mask']==255,counters={k:runtime[k] for k in bad},
               pvclock_cpu_mask=read('clock-after').get('pvclock_cpu_mask'),
               steal_cpu_mask=runtime['steal_cpu_mask'])
     save('runtime-gate',gate)

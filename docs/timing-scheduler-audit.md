@@ -7,6 +7,9 @@ the Quake II timing smoke run, and seven backward nanosecond samples. The subseq
 pause/resume and records the replacement clock layout and native checks. [EEVDF experiments](eevdf-experiment.md) records the optional policy,
 Linux reference comparison, corrected silent-audio routes and GPU-wait trials.
 
+The latest [backend pacing controls](audio-backend-pacing.md) retain a recovered
+SDL acceleration lead and a separate SDL callback half-rate discrepancy.
+
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
 `f932600c7ef0ac9606057f8e976e47b3f397695aae69383dc965a6d342e2f1b3`.
 The native review initially estimated roughly 1.5× playback in Quake II and

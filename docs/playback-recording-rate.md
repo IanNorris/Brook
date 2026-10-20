@@ -56,7 +56,9 @@ CPUs 14–15 with single-threaded numerical operations while the VM is restricte
 to CPUs 0–13.
 
 The controlled scheduler fixtures so far use private PipeWire output and HDA
-`use-timer=off`. The normal launcher defaults to `use-timer=on`. Testing that
-separate device-pacing cohort is still required before connecting the historical
-recording to any current repair. The [per-vCPU clock fix](pvclock-percpu.md)
+`use-timer=off`. The normal launcher defaults to `use-timer=on`. The subsequent
+[backend pacing controls](audio-backend-pacing.md) retain a recovered SDL burst
+and a separate callback-mode discrepancy; a clean, matched Linux/backend
+comparison is still required before connecting the historical recording to a
+current repair. The [per-vCPU clock fix](pvclock-percpu.md)
 addresses a different, directly measured pause/resume defect.
