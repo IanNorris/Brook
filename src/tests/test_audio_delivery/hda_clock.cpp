@@ -270,7 +270,7 @@ int RunHdaClockTests() {
     std::printf("HDA_CLOCK %s\n",failures?"FAIL":"PASS");return failures;
 }
 
-namespace { bool mixerClockEnabled = false; }
+namespace { bool mixerClockEnabled = false; uint64_t resetDuringCopy = 0; }
 brook::AudioSubmitReceipt TestMixerNativeSubmit(const void* samples,uint32_t bytes) { return HdaTrySubmit(samples,bytes); }
 bool TestMixerNativeProgress(brook::AudioDeviceProgress* result) { return mixerClockEnabled && HdaNativeProgress(result); }
 bool TestMixerNativeRestart(uint64_t epoch) { return HdaNativeRestart(epoch); }
@@ -337,6 +337,22 @@ int RunMixerClockTests() {
     advanceNative(8);AudioMixerRefresh();VERIFY(AudioMixerAvailableFrames(a)==4);
     VERIFY(AudioMixerReset(a) && AudioMixerAvailableFrames(a)==4);
     VERIFY(AudioMixerClose(a));a=AudioMixerOpen();VERIFY(a && AudioMixerAvailableFrames(a)==MIXER_RING_FRAMES);
+    // A reset during the device copy must not credit an old receipt to the
+    // replacement stream, even if it queues new data before reconciliation.
+    AudioStop();initialize();AudioMixerRefresh();
+    VERIFY(AudioMixerSubmit(first.data(),2,a)==2);
+    resetDuringCopy=a;
+    afterCopyHook=[] {
+        VERIFY(AudioMixerReset(resetDuringCopy));
+        const int16_t replacement[4]={321,321,321,321};
+        VERIFY(AudioMixerSubmit(replacement,2,resetDuringCopy)==2);
+        AudioMixerFlush(); // nested owner must leave the in-flight batch alone
+    };
+    AudioMixerFlush();VERIFY(g_nativeClock.submitted==8);
+    advanceNative(8);AudioMixerRefresh();
+    VERIFY(AudioMixerGetProgress(a,&pa) && !pa.completedFrames && pa.queuedFrames==2);
+    AudioMixerFlush();advanceNative(g_nativeClock.Pending());AudioMixerRefresh();
+    VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==2 && !pa.queuedFrames);
     VERIFY(AudioMixerClose(a) && AudioMixerClose(b));mixerClockEnabled=false;AudioStop();
     std::printf("MIXER_CLOCK %s\n",failures?"FAIL":"PASS");return failures;
 }

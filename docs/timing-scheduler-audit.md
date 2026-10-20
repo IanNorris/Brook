@@ -34,8 +34,12 @@ Later evidence supersedes several early leads:
   source progression with synthetic tones through Quake and direct OSS, with
   unchanged pitch. Frequent short silence and queue-size interventions support
   a blocking-refill/HDA-lead interaction. Available-prefix blocking writes now
-  improve the direct reproduction and pass eight native control/fault cases;
-  Quake's residual gaps remain. This is separate from historical acceleration.
+  improve the direct reproduction and pass eight native control/fault cases.
+  Producer-triggered native delivery further reduces small-queue silence and
+  modestly improves Quake's synthetic-track capture, but four mixed-load boots
+  do not establish a consistent desktop benefit. That candidate is preserved
+  as an experiment and removed from the default path. Quake's residual gaps
+  remain, separate from historical acceleration.
 
 RR remains the default, with no further RR tuning planned. MLFQ and EEVDF are
 optional. Remaining acceptance includes default-path and broader desktop/game

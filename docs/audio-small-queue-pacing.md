@@ -187,3 +187,99 @@ Ignored evidence under `build/workloads/timing-scheduler-20261020` includes
 Original controllers, generated source, staged identity manifests, raw WAVs,
 decoder output and exported geometry/results remain there. Only synthetic
 generator/helper code, analysis tests and documentation belong in Git.
+
+
+## Producer-triggered native delivery experiment (not retained)
+
+The frozen follow-up candidate calls `AudioMixerKick()` after successful DSP prefix
+submission, after releasing the DSP description mutex. It reuses the existing
+flush ownership, stream identities, delivery epochs and receipt reconciliation,
+but attempts at most one 1,764-frame batch and requires native progress,
+submission and restart callbacks. A busy flush owner is left in charge. An
+unsupported native clock never falls through to the legacy playback callback.
+Periodic mixer delivery remains available.
+
+This is capacity-nonblocking, not wait-free: native HDA callbacks can contend
+on the driver lock and perform bounded device setup polling. In particular,
+this may add latency to nonblocking writes; mixed workload acceptance is still
+needed before retaining the change. No HDA headroom, trailer, publication guard,
+scheduler default or wake scanner default changes are part of this candidate.
+
+Hosted coverage verifies immediate native submission, empty and bounded kicks,
+legacy fallback avoidance, busy ownership, discontinuity recovery, and reset
+between device copy and receipt reconciliation. The in-flight reset case checks
+that old completion cannot credit a replacement stream and that recursive
+producer delivery leaves the existing owner in charge. The original 67-suite
+run passes; the added recovery/reset cases pass in the focused audio suite.
+The supported kernel entry-state/mutation audit also passes; its four unsupported
+entries remain outside that audit's coverage.
+
+The ignored `dsp-kick-frozen` capsule records kernel SHA-256
+`e33cfb794adc1bf6a6eaa2de13c668e6e540e2a57c905a86f63bc9dfb4f840c9`.
+Adding the audio header declaration changed only HDA's `.debug_line` section;
+a recorded ELF-section comparison verifies that distinction. The matched VM
+capsule reuses the byte-identical control HDA module, and all thirteen staged
+modules match the preceding prefix controls.
+
+The first native comparison reports:
+
+| Case | Prefix refill only | Prefix refill plus immediate delivery |
+| --- | ---: | ---: |
+| Four-fragment direct writer, complete 30-s source | 33.955 s | 31.461 s |
+| Four-fragment capture, source seconds / stored PCM second | 0.8827 | 0.9620 |
+| Four-fragment capture, quiet roughly 1-ms bins | 10.52% | 3.75% |
+| Eight-fragment direct writer, complete 30-s source | 30.020 s | 29.991 s |
+| Eight-fragment capture, quiet roughly 1-ms bins | 0% | 0% |
+| Quake generated-track capture, source seconds / stored PCM second | 0.8323 | 0.8640 |
+| Quake generated-track capture, quiet roughly 1-ms bins | 15.86% | 12.76% |
+
+Pitch remains approximately 1.0000 and decoded IDs remain consecutive in all
+candidate packet captures. The private OST capture
+independently fits approximately 0.865 source seconds per PCM second
+with spectral similarity 0.836; that alignment is not a pitch measurement. The Quake demo interval is 15.221 s; the preceding
+prefix control was 15.223 s. Prompt delivery helps this run but does not remove
+Quake's remaining silence. These are single-run comparisons with the preceding
+controls, not repeated simultaneous cohort estimates. The smallest direct queue
+still stretches a 30-s source, so correct pacing is not yet achieved there.
+
+All eight native write/control cases pass, both native queues prove 1,323,000
+completed frames and successful synchronization, and both Quake jobs exit with
+no live tasks. The original launcher/router owners exit normally; four offline
+filesystem checks, saved-data preservation, heap integrity, runtime accounting
+and all thirteen module identity checks pass for these runs. No HDA native or
+publication fault is recorded. Evidence and verifiers remain under ignored
+`dsp-kick-*` and `q2-kick-*` paths. A matched mixed browser/audio/CPU comparison follows below.
+
+Four further fresh boots compare control/candidate/candidate/control, using
+identical driver and scheduler modules, callback HDA, 20-ms host buffering,
+MLFQ, default BSP wake scanning and the same local Firefox video with 24 bounded
+CPU workers. The controls use the accepted prefix-refill kernel.
+
+| Phase | Producer kick | Browser callbacks / page second | CPU batches | Periodic p95 | Longest quiet 10-ms bins |
+| --- | --- | ---: | ---: | ---: | ---: |
+| dk-b1 | no | 8.384 | 5,630,582 | 5.721 ms | 8 |
+| dk-c1 | yes | 7.686 | 5,500,305 | 5.494 ms | 6 |
+| dk-c2 | yes | 7.540 | 5,098,219 | 6.760 ms | 7 |
+| dk-b2 | no | 7.581 | 5,488,864 | 5.500 ms | 4 |
+
+All four original VM launcher/router owners exit normally. Job-drain, heap,
+clock/runtime, service-ledger, queue-count, default wake-scan, four-filesystem,
+saved-data and exact staged identity checks pass, without a native HDA fault.
+These two boots per variant do not prove a causal regression: the second
+control also presents fewer frames, and some HTTP timing brackets are broad.
+They also fail to establish a consistent desktop benefit. CPU throughput is
+lower in both candidate runs, and audio gaps improve in the first pair but not
+the reverse-order pair. Native small-queue pacing alone is insufficient acceptance.
+
+The production DSP/mixer/header code and candidate-only tests are restored to
+the accepted prefix-refill baseline. The frozen capsule, complete candidate
+source patch, launchers, verifiers, raw captures and comparison remain in ignored
+`dsp-kick-*` evidence. The general in-flight reset/replacement-stream test is
+retained against the unchanged baseline mixer and passes there. Private audio
+and fixture-server owners subsequently exit normally; fixture HTTP broken-pipe
+logs on browser closure are retained and do not change VM acceptance.
+
+The next useful experiment measures HDA silence-reservation count/bytes,
+pre/post-copy device advance and headroom, and software-to-device delivery delay
+before altering the conservative write lead. This experiment does not justify
+relaxing publication guards or changing the default scheduler.
