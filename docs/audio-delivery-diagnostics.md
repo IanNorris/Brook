@@ -508,3 +508,92 @@ compiled-entry audit pass. `runtime-stages-analysis.json` retains stage sums,
 maxima and exact overlap checks. Controller/generator, analysis, independent
 verifier, final source patch and hashes are archived under
 `runtime-stages-sources` in the ignored workload root.
+
+## Opt-in AP accounting deferral
+
+`sched irq-accounting try` enables a narrow experiment; `blocking` restores
+the default and `status` reports lifetime per-CPU counters. Only an AP periodic
+timer interrupt in a non-idle kernel context may try the initial ready lock.
+User-mode ticks, idle ticks, BSP ticks and non-periodic interrupts retain
+blocking accounting. Failure reserves no ticket, changes no runtime baseline,
+and skips only the initial accounting/watch sample. Existing wake, retirement,
+termination and preemption handling continues. Later successful samples and
+ownership boundaries charge elapsed-minus-steal service once.
+
+A successful ticket reservation confirms the serving counter before entry.
+If an unreserved reader was suspended across a complete 32-bit counter cycle,
+it waits for its already-reserved ticket through the original bounded wait and
+deadlock diagnostics. It never abandons, reacquires or prematurely releases
+that ticket. Thus ordinary failure is nonblocking, but a rare stale successful
+reservation may wait. A deterministic hosted test injects that state and checks
+exclusion, one release and subsequent lock usability. Mixed blocking/try owners
+also exercise exclusion and counter wrap using the production helper.
+
+`attempts`, `successes`, `deferred`, `if_errors` and `stale_ticket_waits` are
+saturating lifetime counters. Status rows are independently sampled; compare
+settled counters after disabling the mode. `potential_watch_ticks_skipped`
+equals deferred attempts, not the precise number inside an enabled ready-watch
+interval. Missing observations cannot establish idle time or complete IRQ
+coverage. Stage events explicitly mark deferred runtime sampling with zero
+accounting duration. These remain elapsed wall brackets, including host
+descheduling, rather than CPU consumption.
+
+Two blocking and two try-mode trials, ordered A/B/B/A on the initial
+`irq-try-frozen` build, keep eight vCPUs, MLFQ, callback audio and twelve host
+CPU workers plus four sleepers for thirty seconds. Blocking mixer queue maxima
+are 2,746.411 and 2,260.474 ms; try-mode maxima are 212.095 and 204.997 ms.
+Mean observed demo intervals are 39.683 and 39.584 seconds respectively:
+there is no demonstrated demo throughput improvement. All four trials fail
+audio acceptance with native sample-gap faults; try-mode captures are also
+shorter than the requested eight seconds. The queue improvement does not solve
+loaded audio delivery.
+
+Initial try-mode attempts/successes/deferred are 41,088/26,037/15,051 and
+41,153/24,657/16,496, with zero IF errors. Blocking attempts remain zero.
+Original guest and host jobs, CPU-clock API checks, settled runtime/policy
+ledger equality, clock-rate brackets including 1x, heap, original VM/router
+exits, four filesystem checks and saved-data preservation pass in all four.
+A separate try-mode guest-only load with 24 CPU workers and four sleepers
+finishes the demo in 15.304 seconds, with an eight-second active capture, no
+native fault/discontinuity and a mixer queue maximum of 18.913 ms. There is no
+matched same-build blocking guest-only control, so this is acceptance evidence,
+not a throughput comparison. Probe contention drops are retained separately.
+
+Remaining limitations include delayed remote CPU-time visibility between
+samples, attribution across a concurrent policy switch, and conservative
+discard of a larger unsampled gap after an invalid clock sample. General
+per-core run queues and broader scheduler lock changes are not implemented.
+The experiment remains default-off pending broader mixed browser/game tests.
+
+The final counter-wrap-hardened build is frozen as `irq-safe-frozen`, kernel
+`112db7da3ca48172b6283ab605b74827c2c6cbf9607c15f7e002f313dab046cc`,
+with the same thirteen control modules. All 68 hosted tests and the compiled
+entry audit pass. A fresh blocking/try pair completes original host/guest jobs,
+CPU-clock API checks, settled accounting, heap, clock-rate brackets including
+1x, normal VM/router shutdown, filesystem checks and saved-data preservation.
+Blocking/try mixer maxima are 3,266.220/76.998 ms and observed demo intervals
+42.813/40.370 seconds. This single pair does not establish a repeatable demo
+throughput gain. AP average acquisition totals fall from 26.253 to 1.710
+seconds; remaining scheduler wall time rises from 0.083 to 2.888 seconds.
+Try counts are 39,558 attempts, 23,145 successes and 16,413 deferrals; both
+IF errors and stale-ticket fallback waits are zero. The injected hosted test
+covers the rare fallback path. Lifetime probe contention drops are
+0/0/1/0/1/2/0/3 in the candidate and zero in the baseline.
+
+Both final trials still fail audio acceptance. Blocking records a native
+1,793.650-ms sample-gap fault and a 1.940-second capture. Try mode records no
+native fault or sampled discontinuity, but captures only 59,136 frames
+(1.341 seconds) during an 8.004-second host window, despite active guest
+publication. The independent verifier originally assumed no native fault
+implied a passing full capture; that assumption is removed. It recomputes the
+full-window capture/publication gate and verifies that the short capture
+remains a failure. Absence of a native fault cannot establish host playback
+continuity or timing correctness.
+
+`irq-safe-verified-results.json` retains structural checks separately from
+audio outcomes; `irq-safe-comparison.json` retains timing and queue results.
+Controllers, independent verifiers, comparison script, source patch and hashes
+are archived in `irq-safe-sources` under the ignored workload root. The next
+audio investigation must distinguish guest publication, QEMU callback
+progress and host capture progress under load, without relaxing the HDA safety
+guard or treating a shorter queue as a complete playback fix.

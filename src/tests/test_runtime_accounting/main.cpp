@@ -1,5 +1,9 @@
 #include <array>
 #include <cstdio>
+#include <atomic>
+#include <thread>
+#include <vector>
+#include "../../kernel/src/irq_accounting.h"
 #include "../../kernel/src/runtime_accounting.h"
 namespace {
 int failures=0;
@@ -181,6 +185,95 @@ int main() {
         CHECK(model.Read(pid,1000+pid,true,&value) && value==groups[pid]);
     }
     CHECK(model.Diagnostics().staleIdentity==0 && model.Diagnostics().invalidSamples==0);
+    // The production try-claim never reserves an abandoned ticket and cannot
+    // bypass an owner or previously queued waiter, including at uint32 wrap.
+    volatile uint32_t next=5,serving=5;
+    auto waitTicket=[&](uint32_t ticket){while(__atomic_load_n(&serving,__ATOMIC_ACQUIRE)!=ticket)std::this_thread::yield();};
+    CHECK(brook::TicketTryClaim(&next,&serving,waitTicket) && next==6 && serving==5);
+    CHECK(!brook::TicketTryClaim(&next,&serving,waitTicket) && next==6 && serving==5);
+    next=8;CHECK(!brook::TicketTryClaim(&next,&serving,waitTicket) && next==8 && serving==5);
+    next=serving=~uint32_t(0);
+    CHECK(brook::TicketTryClaim(&next,&serving,waitTicket) && next==0 && serving==~uint32_t(0));
+    __atomic_fetch_add(&serving,1,__ATOMIC_RELEASE);CHECK(serving==0 && brook::TicketTryClaim(&next,&serving,waitTicket));
+    CHECK(brook::IrqAccountingMayDefer(true,1,true,false,true,false));
+    CHECK(!brook::IrqAccountingMayDefer(false,1,true,false,true,false));
+    CHECK(!brook::IrqAccountingMayDefer(true,0,true,false,true,false));
+    CHECK(!brook::IrqAccountingMayDefer(true,1,false,false,true,false));
+    CHECK(!brook::IrqAccountingMayDefer(true,1,true,true,true,false));
+    CHECK(!brook::IrqAccountingMayDefer(true,1,true,false,false,false));
+    CHECK(!brook::IrqAccountingMayDefer(true,1,true,false,true,true));
+    next=serving=0;uint64_t protectedCount=0;std::atomic<unsigned> inside{0},overlap{0};
+    std::vector<std::thread> lockers;
+    for(unsigned worker=0;worker<4;++worker)lockers.emplace_back([&,worker]{
+        for(unsigned i=0;i<5000;++i){
+            if(worker<2){
+                const auto ticket=__atomic_fetch_add(&next,1,__ATOMIC_RELAXED);
+                while(__atomic_load_n(&serving,__ATOMIC_ACQUIRE)!=ticket)std::this_thread::yield();
+            }else while(!brook::TicketTryClaim(&next,&serving,waitTicket))std::this_thread::yield();
+            if(inside.fetch_add(1)!=0)++overlap;
+            ++protectedCount;
+            inside.fetch_sub(1);
+            __atomic_fetch_add(&serving,1,__ATOMIC_RELEASE);
+        }
+    });
+    for(auto& thread:lockers)thread.join();CHECK(protectedCount==20000 && !inside && !overlap && next==serving);
+    // Inject an entire counter cycle between serving read and CAS, without
+    // doing billions of operations. A stale successful reservation must not
+    // enter until the actual owner releases, and must release exactly once.
+    next=serving=7;std::atomic<bool> waiting{false},finished{false},enteredEarly{false},ownerReleased{false};
+    std::atomic<unsigned> releases{0};
+    std::thread wrapped([&]{
+        const bool got=brook::TicketTryClaim(&next,&serving,[&](uint32_t ticket){
+            waiting.store(true,std::memory_order_release);waitTicket(ticket);
+        },[&]{__atomic_store_n(&serving,6,__ATOMIC_RELEASE);});
+        if(got){
+            if(!ownerReleased.load(std::memory_order_acquire))enteredEarly=true;
+            __atomic_fetch_add(&serving,1,__ATOMIC_RELEASE);++releases;
+        }
+        finished.store(true,std::memory_order_release);
+    });
+    while(!waiting.load(std::memory_order_acquire) && !finished.load(std::memory_order_acquire))std::this_thread::yield();
+    CHECK(waiting && !finished && !enteredEarly && __atomic_load_n(&next,__ATOMIC_ACQUIRE)==8);
+    ownerReleased.store(true,std::memory_order_release);__atomic_fetch_add(&serving,1,__ATOMIC_RELEASE);
+    wrapped.join();CHECK(!enteredEarly && releases==1 && next==8 && serving==8);
+    CHECK(brook::TicketTryClaim(&next,&serving,waitTicket));__atomic_fetch_add(&serving,1,__ATOMIC_RELEASE);CHECK(next==9 && serving==9);
+    // Identical SMP ownership/migration events with eager versus deferred timer
+    // samples. Dispatch/query boundaries must charge exactly once to the old
+    // owner, preserving task and group clocks despite arbitrary skipped ticks.
+    RuntimeAccounting<40,8> eager,deferred;
+    for(unsigned pid=1;pid<=32;++pid){
+        CHECK(eager.Register(pid,100+pid,(pid-1)/4*4+1,100+(pid-1)/4*4+1));
+        CHECK(deferred.Register(pid,100+pid,(pid-1)/4*4+1,100+(pid-1)/4*4+1));
+    }
+    for(unsigned cpu=0;cpu<8;++cpu){eager.Dispatch(cpu,0,0,at(0));deferred.Dispatch(cpu,0,0,at(0));}
+    uint64_t wall[8]{},steal[8]{};unsigned owner[8]{};
+    uint32_t rng=0x827abcd;
+    for(unsigned event=0;event<40000;++event){
+        rng=rng*1664525+1013904223;unsigned cpu=rng%8;wall[cpu]+=1000+(rng>>8)%10000;steal[cpu]+=(rng>>16)%100;
+        if((rng>>4)%7==0){
+            unsigned selected=(rng>>12)%33;
+            for(unsigned other=0;other<8;++other)if(other!=cpu && selected && owner[other]==selected)selected=0;
+            eager.Dispatch(cpu,selected,selected?100+selected:0,at(wall[cpu],steal[cpu]));
+            deferred.Dispatch(cpu,selected,selected?100+selected:0,at(wall[cpu],steal[cpu]));owner[cpu]=selected;
+        }else {
+            eager.Sample(cpu,at(wall[cpu],steal[cpu]));
+            if((rng>>20)%11==0)deferred.Sample(cpu,at(wall[cpu],steal[cpu]));
+        }
+    }
+    for(unsigned cpu=0;cpu<8;++cpu){eager.Dispatch(cpu,0,0,at(wall[cpu],steal[cpu]));deferred.Dispatch(cpu,0,0,at(wall[cpu],steal[cpu]));}
+    for(unsigned pid=1;pid<=32;++pid)for(bool group:{false,true}){
+        uint64_t other=0;CHECK(eager.Read(pid,100+pid,group,&value) && deferred.Read(pid,100+pid,group,&other) && value==other);
+    }
+    CHECK(eager.Diagnostics().chargedNs==deferred.Diagnostics().chargedNs && eager.Diagnostics().idleNs==deferred.Diagnostics().idleNs);
+    CHECK(!deferred.Diagnostics().invalidSamples && !deferred.Diagnostics().staleIdentity);
+    RuntimeAccounting<4,1> skipped;CHECK(skipped.Register(1,1,1,1));CHECK(skipped.Register(2,2,2,2));
+    skipped.Dispatch(0,1,1,at(100,10)); // several failed tries do not call Sample
+    CHECK(skipped.Sample(0,at(1000,110))==800); // CPU-clock/block boundary catch-up
+    CHECK(skipped.Sample(0,at(1000,110))==0); // no double charge at dispatch
+    skipped.Dispatch(0,2,2,at(1100,110));CHECK(skipped.Read(1,1,false,&value) && value==900);
+    CHECK(skipped.Sample(0,at(1400,210))==200);CHECK(skipped.Read(2,2,false,&value) && value==200);
+    skipped.Sample(0,{}); // failed later sample discards unknown deferred gap
+    skipped.Dispatch(0,1,1,at(10000,210));CHECK(skipped.Read(2,2,false,&value) && value==200);
     std::printf("RUNTIME_ACCOUNTING %s\n",failures?"FAIL":"PASS");
     return failures?1:0;
 }

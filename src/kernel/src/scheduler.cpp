@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "irq_accounting.h"
 #include "timer_irq_arrivals.h"
 #include "module.h"
 #include "posix_timer.h"
@@ -67,11 +68,8 @@ struct SchedLock {
 // critical section, which should be <1µs.
 static constexpr uint64_t SCHEDLOCK_TIMEOUT_SPINS = 50000000ULL;
 
-static inline uint64_t SchedLockAcquire(SchedLock& lock, const char* caller = __builtin_FUNCTION())
+static inline void SchedLockWaitForTicket(SchedLock& lock,uint32_t ticket,const char* caller)
 {
-    uint64_t flags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    uint32_t ticket = __atomic_fetch_add(&lock.next, 1, __ATOMIC_RELAXED);
     uint64_t spins = 0;
     while (__atomic_load_n(&lock.serving, __ATOMIC_ACQUIRE) != ticket)
     {
@@ -92,6 +90,13 @@ static inline uint64_t SchedLockAcquire(SchedLock& lock, const char* caller = __
                         __atomic_load_n(&lock.serving, __ATOMIC_RELAXED));
         }
     }
+}
+static inline uint64_t SchedLockAcquire(SchedLock& lock,const char* caller=__builtin_FUNCTION())
+{
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    const auto ticket=__atomic_fetch_add(&lock.next,1,__ATOMIC_RELAXED);
+    SchedLockWaitForTicket(lock,ticket,caller);
     return flags;
 }
 
@@ -225,6 +230,26 @@ static Process* g_pidToProcess[SCHED_MAX_PIDS] = {};
 // Global scheduler lock (interrupt-safe, protects all policy calls).
 static SchedLock g_readyLock;
 static ReadyLatencyTracker<SCHED_MAX_PIDS> g_readyLatency;
+static bool g_irqAccountingTry=false;
+struct alignas(64) IrqAccountingCounters {uint64_t attempts=0,successes=0,deferred=0,ifErrors=0,staleTicketWaits=0;};
+static IrqAccountingCounters g_irqAccountingCounters[SCHED_MAX_CPUS]{};
+static void IrqAccountingIncrement(uint64_t& value){
+    const auto old=__atomic_load_n(&value,__ATOMIC_RELAXED);
+    if(old!=~uint64_t(0))__atomic_store_n(&value,old+1,__ATOMIC_RELAXED);
+}
+void SchedulerIrqAccountingMode(bool enabled){__atomic_store_n(&g_irqAccountingTry,enabled,__ATOMIC_RELEASE);}
+void SchedulerIrqAccountingRead(IrqAccountingSnapshot* output){
+    if(!output)return;
+    *output={};output->enabled=__atomic_load_n(&g_irqAccountingTry,__ATOMIC_ACQUIRE);
+    output->cpus=SmpGetCpuCount();if(output->cpus>SCHED_MAX_CPUS)output->cpus=SCHED_MAX_CPUS;
+    for(unsigned cpu=0;cpu<output->cpus;++cpu){
+        const auto& c=g_irqAccountingCounters[cpu];auto& o=output->cpu[cpu];
+        o.attempts=__atomic_load_n(&c.attempts,__ATOMIC_RELAXED);o.successes=__atomic_load_n(&c.successes,__ATOMIC_RELAXED);
+        o.deferred=__atomic_load_n(&c.deferred,__ATOMIC_RELAXED);o.ifErrors=__atomic_load_n(&c.ifErrors,__ATOMIC_RELAXED);
+        o.staleTicketWaits=__atomic_load_n(&c.staleTicketWaits,__ATOMIC_RELAXED);
+    }
+}
+
 // Separate bounded accounting storage; it is not policy-owned and survives
 // policy switches. All ledger mutation/read is under g_readyLock.
 static RuntimeAccounting<SCHED_MAX_PIDS, SCHED_MAX_CPUS> g_runtime;
@@ -2089,22 +2114,50 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
     const uint64_t timerScheduler=timerProbe?TimerWakeTimingNow():0;
 
     {
-        const uint64_t runtimeFlags = SchedLockAcquire(g_readyLock);
-        if(stages)stages->acquiredNs=TimerWakeTimingNow();
-        const uint32_t runtimeCpu = ThisCpu();
-        RuntimeChargeLocked(runtimeCpu, RuntimeNow(runtimeCpu));
-        // Delivered periodic-IRQ observations only. Ring-0 idle is a dispatch
-        // opportunity, unlike a busy syscall/kernel thread. No extra clock,
-        // policy callback or lock is introduced for the watched queue interval.
-        if(periodicTimer && g_readyLatency.Enabled()){
-            auto* observed=g_perCpu[runtimeCpu].currentProcess;
-            const auto kind=allowPreempt?ReadyWatchTick::User:
-                observed && observed==g_perCpu[runtimeCpu].idleProcess?ReadyWatchTick::Idle:
-                observed && observed->state==ProcessState::Running?ReadyWatchTick::KernelBusy:ReadyWatchTick::Other;
-            g_readyLatency.WatchTick(runtimeCpu,kind,interruptedRip,observed?observed->pid:0,observed?observed->incarnation:0);
+        const uint32_t runtimeCpu=ThisCpu();
+        const auto* local=g_perCpu[runtimeCpu].currentProcess;
+        bool acquired=false;uint64_t runtimeFlags=0;
+        const bool mayDefer=IrqAccountingMayDefer(__atomic_load_n(&g_irqAccountingTry,__ATOMIC_ACQUIRE),
+            runtimeCpu,periodicTimer,allowPreempt,local!=nullptr,local==g_perCpu[runtimeCpu].idleProcess);
+        if(mayDefer){
+            auto& counts=g_irqAccountingCounters[runtimeCpu];
+            __asm__ volatile("pushfq; pop %0" : "=r"(runtimeFlags) :: "memory");
+            // Timer entry has IF=0. Unexpected enabled interrupts retain the
+            // ordinary blocking path, rather than trying with unsafe exclusion.
+            if(runtimeFlags&0x200)IrqAccountingIncrement(counts.ifErrors);
+            else {
+                IrqAccountingIncrement(counts.attempts);
+                acquired=TicketTryClaim(&g_readyLock.next,&g_readyLock.serving,[&](uint32_t ticket){
+                    IrqAccountingIncrement(counts.staleTicketWaits);
+                    SchedLockWaitForTicket(g_readyLock,ticket,"irq-accounting-try-wrap");
+                });
+                uint64_t afterFlags;__asm__ volatile("pushfq; pop %0" : "=r"(afterFlags) :: "memory");
+                if((afterFlags^runtimeFlags)&0x200)IrqAccountingIncrement(counts.ifErrors);
+                IrqAccountingIncrement(acquired?counts.successes:counts.deferred);
+            }
         }
-        if(stages)stages->accountedNs=TimerWakeTimingNow();
-        SchedLockRelease(g_readyLock, runtimeFlags);
+        if(!mayDefer || (runtimeFlags&0x200)){
+            runtimeFlags=SchedLockAcquire(g_readyLock);acquired=true;
+        }
+        if(stages){stages->acquiredNs=TimerWakeTimingNow();stages->deferred=!acquired;}
+        if(acquired){
+            RuntimeChargeLocked(runtimeCpu, RuntimeNow(runtimeCpu));
+            // Delivered periodic-IRQ observations only. Ring-0 idle is a dispatch
+            // opportunity, unlike a busy syscall/kernel thread. No extra clock,
+            // policy callback or lock is introduced for the watched queue interval.
+            if(periodicTimer && g_readyLatency.Enabled()){
+                auto* observed=g_perCpu[runtimeCpu].currentProcess;
+                const auto kind=allowPreempt?ReadyWatchTick::User:
+                    observed && observed==g_perCpu[runtimeCpu].idleProcess?ReadyWatchTick::Idle:
+                    observed && observed->state==ProcessState::Running?ReadyWatchTick::KernelBusy:ReadyWatchTick::Other;
+                g_readyLatency.WatchTick(runtimeCpu,kind,interruptedRip,observed?observed->pid:0,observed?observed->incarnation:0);
+            }
+            if(stages)stages->accountedNs=TimerWakeTimingNow();
+            SchedLockRelease(g_readyLock, runtimeFlags);
+        }else if(stages)stages->accountedNs=stages->acquiredNs;
+        // Failure touched no ledger/policy/watch state. Continue all existing
+        // housekeeping; a later successful sample or ownership boundary catches
+        // up elapsed-minus-steal service. Missing watch ticks are not idle.
     }
 
     const uint64_t timerRuntime=timerProbe?TimerWakeTimingNow():0;

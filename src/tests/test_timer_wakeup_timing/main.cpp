@@ -157,6 +157,11 @@ int main(){
     // no-switch stage aggregates or maxima.
     stages={130,170};CHECK(cpu[0].Complete(peer,110,3000000,0,11,&stages));
     p=cpu[0].Snapshot();CHECK(p.handlerSwitched==1 && p.stageSamples==1 && p.sumAcquireNs==20);
+    cpu[0].Reset(21);peer=cpu[0].Observe(21,100,0,8,0,10);
+    stages={120,120,true};CHECK(cpu[0].Complete(peer,110,2000000,0,10,&stages));p=cpu[0].Snapshot();
+    CHECK(p.stageSamples==1 && p.stageDeferred==1 && p.handlerEvents[0].runtimeDeferred);
+    CHECK(p.sumAccountingNs==0 && p.sumAcquireNs==10 && p.sumRemainingNs==1999880);
+    stages={120,130,true};CHECK(!cpu[0].Complete(peer,110,2000000,0,10,&stages));
     // Exercise the same streaming reply implementation used by net.cpp.
     // Large JSON rows and numbers crossing the buffer boundary must survive.
     BridgeReplyBuffer<CaptureReply> bridge;std::string expected(765,'x');bridge.text(expected.c_str());

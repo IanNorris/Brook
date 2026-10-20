@@ -1,3 +1,4 @@
+#include "irq_accounting.h"
 #include "bridge_reply.h"
 // net.cpp — Brook OS network stack.
 //
@@ -3319,6 +3320,7 @@ static void DebugTimerIrqHandlerEvent(const TimerIrqHandlerEvent& e)
     r.text(",\"interrupted_rip\":\"0x");r.number(e.token.rip,true);r.text("\",");r.field("interrupted_cs",e.token.cs);
     r.text(",");r.field("entry_switch_generation",e.token.switchGeneration);r.text(",");r.field("completion_switch_generation",e.completionGeneration);
     r.text(",");r.field("previous_handler_end_ns",e.token.previousEndNs);r.text(",\"no_switch\":");r.text(e.noSwitch?"true":"false");
+    r.text(",\"runtime_deferred\":");r.text(e.runtimeDeferred?"true":"false");
     r.text(",\"has_runtime_stages\":");r.text(e.hasStages?"true":"false");r.text(",");r.field("runtime_acquired_ns",e.acquiredNs);
     r.text(",");r.field("runtime_accounted_ns",e.accountedNs);r.text(",");r.field("runtime_acquire_ns",e.acquireNs);
     r.text(",");r.field("runtime_accounting_ns",e.accountingNs);r.text(",");r.field("remaining_ns",e.remainingNs);
@@ -3351,6 +3353,7 @@ static void DebugTimerIrqArrivals()
         tail.text(",");tail.field("max_no_switch_total_ns",s.maxNoSwitchTotalNs);tail.text(",");tail.field("max_no_switch_scheduler_ns",s.maxNoSwitchSchedulerNs);
         tail.text(",");tail.field("adjacent_no_switch_pairs",s.adjacentNoSwitchPairs);tail.text(",");tail.field("near_returns",s.nearReturns);
         tail.text(",");tail.field("sum_between_ns",s.sumBetweenNs);tail.text(",");tail.field("max_between_ns",s.maxBetweenNs);
+        tail.text(",");tail.field("runtime_stage_deferred",s.stageDeferred);
         tail.text(",");tail.field("runtime_stage_samples",s.stageSamples);tail.text(",");tail.field("sum_runtime_acquire_ns",s.sumAcquireNs);
         tail.text(",");tail.field("sum_runtime_accounting_ns",s.sumAccountingNs);tail.text(",");tail.field("sum_remaining_ns",s.sumRemainingNs);
         tail.text(",");tail.field("max_runtime_acquire_ns",s.maxAcquireNs);tail.text(",");tail.field("max_runtime_accounting_ns",s.maxAccountingNs);
@@ -3404,7 +3407,7 @@ static void DebugReadyWatch(const ReadyWatchSnapshot& s)
     r.text(",");r.field("slow",s.slow);r.text(",");r.field("excluded",s.excluded);r.text(",");r.field("invalid",s.invalid);
     r.text(",");r.field("invalid_activity",s.invalidActivity);
     r.text(",\"pending\":");r.text(s.pending?"true":"false");r.text(",\"saturated\":");r.text(s.saturated?"true":"false");r.send();
-    DebugChannelSend(",\"scope\":\"one PID/incarnation; ready insertion to dispatch; deadline lateness sampled after ready insertion in elapsed milliseconds; early wakes clamp to zero; excludes post-dispatch return; largest 16 slow events only\",\"activity_scope\":\"while watched task queued; delivered periodic IRQ contexts, not CPU time; no IPIs; other dispatch bookkeeping, not proof of completed context switches; missing observations do not prove idle; zero rows omitted\",\"events\":[");
+    DebugChannelSend(",\"scope\":\"one PID/incarnation; ready insertion to dispatch; deadline lateness sampled after ready insertion in elapsed milliseconds; early wakes clamp to zero; excludes post-dispatch return; largest 16 slow events only\",\"activity_scope\":\"while watched task queued; delivered periodic IRQ contexts, not CPU time; no IPIs; other dispatch bookkeeping, not proof of completed context switches; missing observations do not prove idle; sched irq-accounting status reports potential skipped ticks; zero rows omitted\",\"events\":[");
     for(unsigned i=0;i<s.retained;++i){const auto& e=s.events[i];BridgeReply row;
         if(i)row.text(",");row.text("{");row.field("ready_ns",e.readyNs);row.text(",");row.field("dispatch_ns",e.dispatchNs);
         row.text(",");row.field("deadline_tick_ms",e.deadlineTick);row.text(",");row.field("ready_tick_ms",e.readyTick);
@@ -3709,6 +3712,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
+            "  sched irq-accounting try|blocking|status - experimental AP accounting deferral\n"
             "  timer peers on|off|reset|status - per-CPU timer arrivals (default off)\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
             "  sched timing watch PID - target wake/queue timing; 0 clears target\n"
@@ -4090,6 +4094,17 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.field("saturations",status.debug.saturations);reply.text(",");
         reply.field("deferred_removals",status.debug.deferredRemovals);reply.text(",");
         reply.field("work_conserving_selections",status.debug.workConservingSelections);reply.text("}\n");reply.send();
+    }
+    else if(NetStrEq(cmd,"sched irq-accounting try") || NetStrEq(cmd,"sched irq-accounting blocking") || NetStrEq(cmd,"sched irq-accounting status")){
+        if(NetStrEq(cmd,"sched irq-accounting try"))SchedulerIrqAccountingMode(true);
+        if(NetStrEq(cmd,"sched irq-accounting blocking"))SchedulerIrqAccountingMode(false);
+        IrqAccountingSnapshot s{};SchedulerIrqAccountingRead(&s);BridgeReply header;
+        header.text("{\"mode\":\"");header.text(s.enabled?"try":"blocking");
+        header.text("\",\"scope\":\"default blocking; try only AP periodic non-idle kernel initial accounting; all housekeeping retained; counters since boot, rows sampled independently; deferred ticks skip potential ready-watch observations and are not idle; CPU-time/remote policy attribution may be stale until catch-up\",\"cpus\":[");header.send();
+        for(unsigned cpu=0;cpu<s.cpus;++cpu){const auto& c=s.cpu[cpu];BridgeReply r;if(cpu)r.text(",");r.text("{");r.field("cpu",cpu);
+            r.text(",");r.field("attempts",c.attempts);r.text(",");r.field("successes",c.successes);r.text(",");r.field("deferred",c.deferred);
+            r.text(",");r.field("potential_watch_ticks_skipped",c.deferred);r.text(",");r.field("if_errors",c.ifErrors);r.text(",");r.field("stale_ticket_waits",c.staleTicketWaits);r.text("}");r.send();
+        }DebugChannelSend("]}\n");
     }
     else if (NetStrEq(cmd, "sched runtime status")) {
         RuntimeStatus status{}; SchedulerRuntimeStatus(&status);
