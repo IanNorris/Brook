@@ -24,8 +24,10 @@ Later evidence supersedes several early leads:
   Counters are observations, not CPU service or proof of policy eligibility.
 - [MLFQ wakeup preemption](mlfq-wakeup-preemption.md) preserves service budgets
   across early interruptions. Four matched native boots under shared scanning
-  improve periodic latency and browser presentation at a CPU-throughput cost;
-  audio continuity and default-BSP acceptance remain unproven.
+  and four under default BSP scanning improve periodic latency and browser
+  presentation at a CPU-throughput cost; audio continuity and broader desktop
+  acceptance remain unproven. Exact loaded-event correlations locate several
+  long audio delays before ready publication, inside BSP interrupt gaps.
 - [Priority query encoding](scheduler-priority-abi.md) now returns Linux's raw
   encoding for default nice zero. Actual per-task nice/RT control remains absent.
 

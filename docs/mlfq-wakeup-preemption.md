@@ -87,6 +87,71 @@ Ignored evidence lives under
 snapshots, source identities, original controller/launchers and verification.
 The comparison manifest and frozen capsules sit alongside that directory.
 
+## Default BSP wake-scan comparison
+
+Four further fresh private boots use the same frozen kernel/module variants,
+fixture and workload, again in control/candidate/candidate/control order. This
+series explicitly retains BSP wake scanning; AP scan counts stay zero. No
+kernel rebuild or module change intervenes.
+
+| Run | Periodic p95 | Mixer max ready wait | Browser video callbacks/s | CPU batches | Longest silent 10 ms bins |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| mb-b1, control | 21.462 ms | 45.147 ms | 6.340 | 5,600,320 | 4 |
+| mb-c1, candidate | 5.528 ms | 21.068 ms | 7.992 | 5,517,065 | 3 |
+| mb-c2, candidate | 5.728 ms | 36.302 ms | 7.824 | 5,294,795 | 8 |
+| mb-b2, control | 23.529 ms | 44.113 ms | 6.655 | 5,767,963 | 4 |
+
+By two-run means, periodic p95 improves about 75%, browser callbacks about 22%,
+and fixed-work CPU throughput decreases about 5%. Background batch max/min
+ratios are 1.023/1.017 in controls and 1.093/1.094 in candidates. Thus the
+responsiveness gain survives the default wake path, with the same short-run
+fairness caveat. Silence still does not improve consistently: the second
+candidate has eight silent bins versus four in either control.
+
+Mixer maxima in both tables cover the diagnostic load window, which includes
+workload startup/drain around the actual CPU interval. Browser and periodic
+statistics have their own stated loaded scopes. Do not infer that every retained
+mixer maximum occurred inside the CPU helper's exact thirty-second interval.
+For example, mb-c1's 157-ms wakeup lateness precedes that interval.
+
+All four boots pass the same lifecycle, accounting, queue consistency, heap,
+filesystem and preservation checks as the shared-scanning series, with no
+native HDA fault. Original owners complete, and the loopback service stops.
+The private null-audio service is deliberately retained for the subsequent
+Quake II test. Ignored `mlfq-bsp-cohorts` retains raw data, verifiers and original
+owners; the comparison uses the same frozen capsules and module manifest.
+
+### Separating late wakeups from ready waits
+
+A stricter offline correlation requires the same mixer PID/incarnation and
+stable clock, valid non-saturated probes, a nominal sleep due upper bound inside
+a retained BSP arrival gap, and ready publication inside that arrival's wake
+scan. The entire mixer event must lie within the CPU helper's recorded start/end
+for the loaded subset below. A later dispatch must precede the mixer's resume.
+
+| Run | Retained loaded matches | Largest matched deadline lateness | Containing BSP gap | Ready wait in that event |
+| --- | ---: | ---: | ---: | ---: |
+| mb-b1 | 6 | 107 ms | 115.806 ms | 5.487 ms |
+| mb-c1 | 11 | 88 ms | 89.150 ms | 0.146 ms |
+| mb-c2 | 12 | 77 ms | 80.220 ms | 0.041 ms |
+| mb-b2 | 5 | 78 ms | 81.972 ms | 0.037 ms |
+
+Every matched episode has at least one independently observed timer arrival on
+each of the other seven CPUs inside the BSP gap, proven by their valid complete
+window maximum-gap bounds. Reported steal in the four listed gaps is only
+0.037–0.097 ms. Dispatch-to-mixer-resume is about 3–4 microseconds. These episodes
+therefore locate most of their delay before ready publication, separate from
+policy dispatch waits. They do not explain why BSP interrupt entry was delayed,
+prove a safe handoff, or establish a silence-to-wakeup causal alignment.
+
+The 157-ms mb-c1 event outside the exact CPU interval is also retained: its
+167.230-ms BSP gap ends at an instruction immediately following interrupt
+restoration in `SchedulerBlockImpl` in the exact frozen binary. This is an
+endpoint, not proof that the whole gap was spent in that function or in any
+particular lock. Guest interrupt masking and host device waits remain distinct
+leads requiring additional evidence. Top-sixteen retention means matched counts
+are not event rates or complete latency distributions.
+
 ## Regression coverage and remaining acceptance
 
 Hosted tests load the production policy through its vtable. They cover repeated
@@ -104,6 +169,6 @@ paths unsupported). The additional review tests pass in the existing Nix
 toolchain (`mlfq-wakeup-review-tests-nix.log`); an initial direct build outside
 that shell fails to locate libc++, so it is retained as an environment failure.
 Broader
-desktop/gaming acceptance, default BSP wake scanning, adversarial yield
+desktop/gaming acceptance, adversarial yield
 behavior and direct EEVDF eligibility/debt diagnostics remain open. This is an
 optional policy improvement, not a default scheduler decision.
