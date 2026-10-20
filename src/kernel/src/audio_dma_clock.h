@@ -33,7 +33,13 @@ public:
     // Zero-filled idle intervals have no application owner. Reserve a safe
     // future physical position without inventing completion of any receipt.
     bool ReserveStart(uint64_t begin) {
-        if (discontinuity || Pending() || begin < submitted || begin < completed ||
+        return !Pending() && ReserveGap(begin);
+    }
+    // Preserve any earlier owned receipts while reserving an unowned silent
+    // interval before the next one. Completion of that gap must never be
+    // counted as application frames; callers reconcile by receipt begin/end.
+    bool ReserveGap(uint64_t begin) {
+        if (discontinuity || begin < submitted || begin < completed ||
             begin % FrameBytes || begin - completed >= RingBytes) return false;
         submitted = begin;
         return true;

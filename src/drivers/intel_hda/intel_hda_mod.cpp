@@ -904,12 +904,26 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
         }
         g_nativeRingBase = g_nativeClock.submitted;
     }
-    if (!g_nativeClock.Pending() && g_streamRunning) {
+    if (g_streamRunning && g_nativeClock.Pending() < NATIVE_WRITE_LEAD) {
+        const uint64_t oldEnd=g_nativeClock.submitted;
         if (g_nativeClock.completed > ~uint64_t(0) - NATIVE_WRITE_LEAD ||
-            !g_nativeClock.ReserveStart(g_nativeClock.completed + NATIVE_WRITE_LEAD)) {
+            !g_nativeClock.ReserveGap(g_nativeClock.completed + NATIVE_WRITE_LEAD)) {
             FailNativeLocked("reserve-failed");
             receipt.error = -5; PlayUnlock(); return receipt;
         }
+        // A short owned tail is not enough protection against a bursty device
+        // fetch during memcpy. Leave it intact, clear only the unowned gap,
+        // and place the new receipt beyond the existing conservative lead.
+        const uint64_t gapBytes=g_nativeClock.submitted-oldEnd;
+        if(oldEnd<g_nativeRingBase || gapBytes>=AUDIO_BUF_SIZE){
+            FailNativeLocked("reserve-gap-range");
+            receipt.error=-5;PlayUnlock();return receipt;
+        }
+        const uint32_t gap=static_cast<uint32_t>(gapBytes);
+        const uint32_t gapOffset=static_cast<uint32_t>((oldEnd-g_nativeRingBase)%AUDIO_BUF_SIZE);
+        uint32_t gapFirst=AUDIO_BUF_SIZE-gapOffset;if(gapFirst>gap)gapFirst=gap;
+        memset(g_audioBuf+gapOffset,0,gapFirst);
+        if(gap>gapFirst)memset(g_audioBuf,0,gap-gapFirst);
     }
     receipt.begin = g_nativeClock.submitted;
     uint32_t capacity = TARGET_QUEUE_BYTES - g_nativeClock.Pending();

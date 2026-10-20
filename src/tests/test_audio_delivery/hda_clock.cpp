@@ -89,6 +89,14 @@ void finishPhysical() {
 void HdaTestAfterCopy() { if(afterCopyHook) {auto hook=afterCopyHook;afterCopyHook=nullptr;hook();} }
 int RunHdaClockTests() {
     using namespace brook;
+    AudioDmaClock reserved{};
+    VERIFY(reserved.Accept(16) && reserved.Start(0,100));
+    VERIFY(reserved.Observe(4,200,201,false) && reserved.completed==4);
+    VERIFY(!reserved.ReserveStart(32) && reserved.submitted==16);
+    VERIFY(reserved.ReserveGap(32) && reserved.completed==4 && reserved.Pending()==28);
+    VERIFY(!reserved.ReserveGap(16) && !reserved.ReserveGap(34));
+    VERIFY(!reserved.ReserveGap(reserved.completed+AudioDmaClock::RingBytes));
+    reserved.Fault();VERIFY(!reserved.ReserveGap(36));
     initialize();std::array<int16_t,AUDIO_BUF_SIZE/2> tone{};tone.fill(1234);
     // Consecutive fresh rings must not charge the stale pre-RUN position as a
     // wrap. Verify both native and legacy accounting before any DMA movement.
@@ -204,17 +212,37 @@ int RunHdaClockTests() {
     VERIFY(g_nativeFaultEvidence.beforeNs==nowNs && g_nativeFaultEvidence.afterNs==nowNs);
     VERIFY(g_nativeFaultEvidence.rawPosition==HdaTestRead(g_outStreamBase+SD_LPIB,4));
     initialize();receipt=HdaTrySubmit(tone.data(),8192);advanceNative(8188);
-    afterCopyHook=[] { move(8,1000000); };
+    afterCopyHook=[] { move(NATIVE_WRITE_LEAD+8,75000000); };
     receipt=HdaTrySubmit(tone.data(),4);snapshot=progress();
     VERIFY(receipt.accepted==4 && receipt.error==-32 && snapshot.discontinuity && snapshot.completed==8188);
     VERIFY(g_nativeFaultEvidence.publish.failedChecks==PublishDmaCaughtWrite);
-    VERIFY(g_nativeFaultEvidence.publish.rawCompleted==8188 && g_nativeFaultEvidence.publish.delta==8);
-    VERIFY(g_nativeFaultEvidence.publish.begin==8192 && g_nativeFaultEvidence.publish.accepted==4);
+    VERIFY(g_nativeFaultEvidence.publish.rawCompleted==8188 && g_nativeFaultEvidence.publish.delta==NATIVE_WRITE_LEAD+8);
+    VERIFY(g_nativeFaultEvidence.publish.begin==8188+NATIVE_WRITE_LEAD && g_nativeFaultEvidence.publish.accepted==4);
     VERIFY(!g_streamRunning && std::all_of(dma.begin(),dma.end(),[](uint8_t b){return b==0;}));
     const auto publishFault=g_nativeFaultEvidence;
     receipt=HdaTrySubmit(tone.data(),4);VERIFY(receipt.error==-32 && !receipt.accepted);
     VERIFY(g_nativeFaultEvidence.afterNs==publishFault.afterNs &&
            g_nativeFaultEvidence.publish.failedChecks==publishFault.publish.failedChecks);
+    // Exact native failure shape: 744 owned bytes left, then a 1024-byte
+    // device fetch during a 49-us copy bracket. Preserve the old tail while
+    // reserving lead; the next receipt must not be exposed at the old end.
+    for(uint32_t previousEnd:{8192u,65000u}) {
+        initialize();
+        if(previousEnd==8192){receipt=HdaTrySubmit(tone.data(),8192);advanceNative(8192-744);}
+        else {
+            receipt=HdaTrySubmit(tone.data(),49152);advanceNative(32768);
+            receipt=HdaTrySubmit(tone.data(),65000-49152);advanceNative(65000-32768-744);
+        }
+        const auto priorCompleted=g_nativeClock.completed;
+        VERIFY(g_nativeClock.submitted==previousEnd && g_nativeClock.Pending()==744);
+        afterCopyHook=[] {move(1024,49000);};
+        receipt=HdaTrySubmit(tone.data(),3072);
+        VERIFY(receipt.accepted==3072 && !receipt.error && receipt.epoch==1);
+        VERIFY(receipt.begin==priorCompleted+NATIVE_WRITE_LEAD && receipt.begin>previousEnd);
+        VERIFY(dma[(previousEnd-1)%AUDIO_BUF_SIZE]!=0); // old owned tail intact
+        snapshot=progress();VERIFY(!snapshot.discontinuity && snapshot.completed==priorCompleted+1024);
+        for(uint64_t at=previousEnd;at<receipt.begin;++at)VERIFY(dma[at%AUDIO_BUF_SIZE]==0);
+    }
     // These independent rejections used to look identical in native logs.
     initialize();receipt=HdaTrySubmit(tone.data(),8192);advanceNative(8188);
     afterCopyHook=[] {nowNs+=AudioDmaClock::MaxSampleNs;};
@@ -259,7 +287,14 @@ int RunMixerClockTests() {
     VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==1 && pa.queuedFrames==5);
     VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==1 && pb.queuedFrames==3);
     VERIFY(AudioMixerReset(a));VERIFY(AudioMixerSubmit(first.data(),2,a)==2);AudioMixerFlush();
+    const uint64_t nextBegin=g_nativeClock.submitted-8;VERIFY(nextBegin>24);
     advanceNative(28);AudioMixerRefresh();
+    VERIFY(AudioMixerGetProgress(a,&pa) && !pa.completedFrames && pa.queuedFrames==2);
+    VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==4 && !pb.queuedFrames);
+    // Completing old receipts and silent lead must not credit the new epoch.
+    advanceNative(static_cast<uint32_t>(nextBegin-g_nativeClock.completed));AudioMixerRefresh();
+    VERIFY(AudioMixerGetProgress(a,&pa) && !pa.completedFrames && pa.queuedFrames==2);
+    advanceNative(8);AudioMixerRefresh();
     VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==2 && pa.submittedFrames==2 && !pa.queuedFrames);
     VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==4 && !pb.queuedFrames);
     AudioStop();initialize();AudioMixerRefresh();
