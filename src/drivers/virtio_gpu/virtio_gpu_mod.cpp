@@ -31,6 +31,10 @@
 #include "resource_ids.h"
 #include "aperture_allocator.h"
 #include "cpu.h"
+#include "sync/kmutex.h"
+#include "process.h"
+#include "kvmclock.h"
+#include "completion_wait.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -47,6 +51,10 @@ MODULE_IMPORT_SYMBOL(VmmFreePages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPages);
+MODULE_IMPORT_SYMBOL(KMutexLock);
+MODULE_IMPORT_SYMBOL(KMutexUnlock);
+MODULE_IMPORT_SYMBOL(ProcessCurrent);
+MODULE_IMPORT_SYMBOL(KvmClockReadStableNs);
 MODULE_IMPORT_SYMBOL(DisplayRegister);
 MODULE_IMPORT_SYMBOL(DisplaySet3DActive);
 MODULE_IMPORT_SYMBOL(GpuCompositorRegister);
@@ -523,17 +531,24 @@ static constexpr uint32_t CMD_RESP_CAP = 4096;
 //
 // Serialize the entire fill-g_cmdBuf + SubmitCommand + read-response critical
 // section at the public-op boundary (every GpuAppOps / GpuCompositorOps entry
-// that submits). A plain ticket SpinLock is used rather than an IrqSpinLock: no
-// GPU submit ever runs in IRQ context (the IRQ path only consumes the used
-// ring), so disabling IRQs across a full device round-trip would needlessly
+// that submits). Runtime contention sleeps on a KMutex. No GPU submit runs in
+// IRQ context, so disabling IRQs across a full device round-trip would needlessly
 // hurt interrupt latency. The lock is non-recursive; no guarded op calls another
 // guarded op (verified), so there is no self-deadlock. Each submit is one
 // complete command to an independent host context, so serializing whole ops is
 // correct even when the compositor and an app interleave between frames.
-static SpinLock g_gpuCmdLock;
+// Early initialization is BSP-only and precedes SchedulerInit. Do not acquire
+// a scheduler mutex until a current process exists. Thereafter every caller
+// uses the same mutex, including callers that entered with interrupts masked.
+static KMutex g_gpuCmdLock{};
 struct GpuCmdGuard {
-    GpuCmdGuard()  { SpinLockAcquire(&g_gpuCmdLock); }
-    ~GpuCmdGuard() { SpinLockRelease(&g_gpuCmdLock); }
+    bool locked;
+    GpuCmdGuard() : locked(ProcessCurrent() != nullptr) {
+        if (locked) KMutexLock(&g_gpuCmdLock);
+    }
+    ~GpuCmdGuard() { if (locked) KMutexUnlock(&g_gpuCmdLock); }
+    GpuCmdGuard(const GpuCmdGuard&) = delete;
+    GpuCmdGuard& operator=(const GpuCmdGuard&) = delete;
 };
 
 // Framebuffer resource backing — the front buffer the device scans out of AND
@@ -724,6 +739,14 @@ static void NotifyControlQueue()
 // runs from the compositor thread, never an ISR.
 static uint64_t g_nextRenderFence = 0;
 static bool g_controlQueuePoisoned;
+// After uncertain completion the original DMA pages must remain untouched.
+// Public operations may still prepare requests before SubmitCommand rejects
+// them; redirect that preparation into scratch storage, never the DMA buffer.
+alignas(16) static uint8_t g_quarantinedCmdBuf[CMD_PAGES * 4096];
+static void PoisonControlQueue() {
+    g_controlQueuePoisoned = true;
+    g_cmdBuf = g_quarantinedCmdBuf;
+}
 static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = false)
 {
     if (g_controlQueuePoisoned) return 0;
@@ -758,33 +781,31 @@ static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = f
 
     NotifyControlQueue();
 
-    // Bounded spin for completion.
-    for (uint64_t i = 0; i < 200000000ull; ++i)
-    {
-        if (*g_usedIdx != g_usedIdxShadow)
-        {
-            __asm__ volatile("mfence" ::: "memory");
-            uint16_t slot = g_usedIdxShadow % g_queueSize;
-            uint32_t len  = g_usedRing[slot].len;
-            ++g_usedIdxShadow;
-            const auto* reply=reinterpret_cast<const VirtioGpuCtrlHdr*>(g_cmdBuf+CMD_RESP_OFF);
-            static_assert(sizeof(*reply)==brook::GpuControlHeaderBytes);
-            if (!brook::GpuControlCompletionValid(head,g_usedRing[slot].id,len,respCap,
-                                                  reply->flags,reply->fence_id,expectedFence) ||
-                // QEMU10.2.2 echoes fence+context, not INFO_RING_IDX/ring_idx.
-                // The globally unique fence belongs to our single owned request.
-                (fenced && reply->ctx_id!=expectedContext)) {
-                g_controlQueuePoisoned=true;
-                SerialPrintf("virtio_gpu: invalid completion head=%u/%u bytes=%u/%u flags=0x%x fence=%lu/%lu ctx=%u/%u ring=%u/%u timeline=%u; queue quarantined\n",
-                             g_usedRing[slot].id,head,len,respCap,reply->flags,reply->fence_id,expectedFence,
-                             reply->ctx_id,expectedContext,unsigned(reply->ring_idx),unsigned(expectedRing),timeline?1u:0u);
-                return 0;
-            }
-            return len;
+    const bool completed = GpuWaitForCompletion(ProcessCurrent() != nullptr,
+        [] { return *g_usedIdx != g_usedIdxShadow; },
+        [](uint64_t* ns) { return KvmClockReadStableNs(ns); },
+        [] { __asm__ volatile("pause" ::: "memory"); });
+    if (completed) {
+        __asm__ volatile("mfence" ::: "memory");
+        uint16_t slot = g_usedIdxShadow % g_queueSize;
+        uint32_t len  = g_usedRing[slot].len;
+        ++g_usedIdxShadow;
+        const auto* reply=reinterpret_cast<const VirtioGpuCtrlHdr*>(g_cmdBuf+CMD_RESP_OFF);
+        static_assert(sizeof(*reply)==brook::GpuControlHeaderBytes);
+        if (!brook::GpuControlCompletionValid(head,g_usedRing[slot].id,len,respCap,
+                                              reply->flags,reply->fence_id,expectedFence) ||
+            // QEMU10.2.2 echoes fence+context, not INFO_RING_IDX/ring_idx.
+            // The globally unique fence belongs to our single owned request.
+            (fenced && reply->ctx_id!=expectedContext)) {
+            PoisonControlQueue();
+            SerialPrintf("virtio_gpu: invalid completion head=%u/%u bytes=%u/%u flags=0x%x fence=%lu/%lu ctx=%u/%u ring=%u/%u timeline=%u; queue quarantined\n",
+                         g_usedRing[slot].id,head,len,respCap,reply->flags,reply->fence_id,expectedFence,
+                         reply->ctx_id,expectedContext,unsigned(reply->ring_idx),unsigned(expectedRing),timeline?1u:0u);
+            return 0;
         }
-        __asm__ volatile("pause" ::: "memory");
+        return len;
     }
-    g_controlQueuePoisoned=true;
+    PoisonControlQueue();
     SerialPuts("virtio_gpu: command timeout; control queue quarantined\n");
     return 0;
 }

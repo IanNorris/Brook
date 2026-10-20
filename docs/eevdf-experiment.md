@@ -321,3 +321,51 @@ The next candidate should address safe cooperative GPU command contention and
 completion waiting, preserving early-boot operation and command ownership,
 then rerun unprofiled controls and GPU/game stability checks. The mapping waits
 and profiler-induced/exposed long stall remain separate unresolved leads.
+
+## GPU command-wait follow-up and receive deadlock
+
+The first GPU candidate used a sleeping FIFO command mutex plus 100-µs initial
+polling followed by 1-ms completion sleeps. Early BSP-only initialization kept
+bounded polling. `gc-e0`/`gc-m0` passed structural/data checks, but MLFQ's buffered
+presentation fell from 7.21 to 4.44 callbacks/s despite higher CPU batches.
+That completion-sleep policy was rejected. Its exact sources and verdict remain
+in `gpu-cooperative-browser/rejected-sleep-candidate/` under the timing workload
+root. These are single pilots, not statistical estimates of a fixed slowdown.
+
+The revised module retains the sleeping command-ownership mutex and polls for
+completion. Runtime polling has a five-second stable KVM elapsed deadline,
+independent of LAPIC IRQ counts; early boot or failed clock reads retain the
+previous finite 200-million-pause fallback. The mutex stays held from request
+preparation through response validation. No other submitter may reuse that
+shared buffer while the owner waits. Before SchedulerInit, no process exists
+and BSP-only module initialization bypasses the scheduler mutex. The added
+kernel exports are additive; module ABI 34/layouts are unchanged and all thirteen
+modules are staged and checked together.
+
+Uncertain or invalid completion poisons the queue as before. Subsequent request
+preparation is redirected into separate scratch storage, preserving the original
+DMA request/response pages; poisoned SubmitCommand calls never notify the host.
+The host helper tests cover completion, exact deadlines, boot fallback and
+failed/regressing clock reads. They do not establish a forced-device timeout or
+native late-DMA failure result; that acceptance remains open.
+
+The first mutex-only browser run (`gm-e0`) exposed a separate TCP receive-copy
+hang and was stopped with frozen vCPU/task/stack evidence. It is **not** an
+accepted run even though QEMU subsequently exits zero. See the
+[TCP repair and native checks](tcp-receive-copy.md). With that repair, a fresh
+RR guest passes sixteen receive-copy cases and the Quake II GL3/720p timing
+smoke check. A fresh EEVDF browser/24-worker cohort completes with 353,152 PCM
+frames in 8.00363 host seconds and no silent 10-ms blocks. Buffered media/page
+ratio is 0.9607 and callbacks 5.20/s; this does not establish a presentation win.
+
+The revised module is SHA-256
+`724914fd7298dfb50d89ce1912b3fbd5d8b916ead51541ba983c48a4daf9f4bb`.
+The combined TCP-repair kernel is
+`18aeb029431977d80aef5d2e3a534f13371674eef5d7a83cb58645180ac56bd1`.
+Earlier sleep and polling-module candidates shared one kernel ELF, so kernel
+hash alone cannot identify a GPU experiment: retain the staged module hashes.
+The source change is retained on the work branch for further comparison. GPU
+performance promotion, repeated/reverse-order MLFQ/RR controls, forced-device
+failure behavior, and seven backward nanosecond samples from the RR ledger
+remain unresolved. RR remains the scheduler default; the overall timing goal
+is still active.

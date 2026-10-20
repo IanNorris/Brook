@@ -36,6 +36,8 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "apic.h"
 #include "net.h"
 #include "audio.h"
+#include "sync/kmutex.h"
+#include "kvmclock.h"
 
 // Bring all brook:: names into scope so EXPORT_SYMBOL(fn) resolves correctly.
 using namespace brook;
@@ -161,6 +163,9 @@ EXPORT_SYMBOL(SchedulerBlock);
 EXPORT_SYMBOL(SchedulerUnblock);
 EXPORT_SYMBOL(SchedulerYield);
 EXPORT_SYMBOL(SchedulerSleepMs);
+EXPORT_SYMBOL(KMutexLock);
+EXPORT_SYMBOL(KMutexUnlock);
+EXPORT_SYMBOL(KvmClockReadStableNs);
 
 // Process
 EXPORT_SYMBOL(ProcessCurrent);
