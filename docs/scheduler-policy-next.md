@@ -8,11 +8,12 @@ default. RR remains the default. Current results and safety limits are in
 
 The bounded CPU/sleeper workload shows that equal compute service does not imply
 short wakeup latency. The first repeated RR results have roughly 7–8 ms sleeper
-p95 at eight busy threads and 91–94 ms at 24 on eight vCPUs. MLFQ's first pilot
-improves the loaded case, but worsens the lighter case and includes a roughly
-one-second shared outlier. Finish the same-kernel comparison and explain the
-outliers before choosing a default. Browser/audio/input workloads must then
-validate the result; a synthetic sleeper is not an input-to-presentation test.
+p95 at eight busy threads and 91–94 ms at 24 on eight vCPUs. The completed
+same-kernel comparison gives MLFQ roughly 21–23 ms at both worker counts: better
+under heavier load, worse under lighter load. Its earlier pilot includes a
+roughly one-second shared outlier, which the matched runs do not reproduce or
+explain. Browser/audio/input workloads must validate any policy choice; a
+synthetic sleeper is not an input-to-presentation test.
 
 A missing prerequisite is observable runtime accounting. Brook currently
 charges one CPU tick per delivered interrupt and uses the BSP's adjustable

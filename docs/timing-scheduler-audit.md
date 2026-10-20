@@ -325,5 +325,88 @@ Independent checks of all four primary filesystems pass. Subsequent launcher
 edits must wait until the owning shell exits, as well as QEMU.
 
 Evidence: `matched/rr/audio-pipewire{,-44100,-nocapture}/` and
-`pipewire-null/hda-trace-summary.json`. Actual Quake/Firefox reproduction and
-the alternate HDA mode comparison remain pending.
+`pipewire-null/hda-trace-summary.json`. Later controlled workload results follow;
+the user's intermittent 1.5x symptom remains unreproduced.
+
+### Matched HDA mode comparison
+
+With host memory headroom below the earlier launch threshold, both modes are
+tested with six GiB instead of eight, retaining eight vCPUs, RR, the same
+kernel and the private graph forced to 44.1 kHz. QMP confirms `use-timer`
+false/true. These are one idle and one loaded trial per mode, not repeated
+alternating-order acceptance.
+
+| HDA mode / guest CPU workers | 30-second tone completion | Maximum four-second client ratio |
+| --- | ---: | ---: |
+| Callback / 0 | 29.981 s | 1.0044 |
+| Callback / 24 | 30.024 s | 1.0019 |
+| Timer / 0 | 29.263 s | 1.0456 |
+| Timer / 24 | 29.410 s | 1.0562 |
+
+All four warmed QEMU WAV captures advance at approximately 1x host time and
+have no silent 10-ms bins. This supports further callback-mode testing, not a
+default change or a claim that all accelerated playback is fixed. The summary
+and scope are retained in `hda-mode-comparison.json`.
+
+Firefox uses a new private HOME/profile in each mode, local generated video,
+autoplay enabled explicitly, and no PCM recording during the measurement.
+Callback mode advances 28.532 media seconds in 29.913 page-clock seconds
+(0.9538x); timer mode advances 20.676 in 20.181 (1.0245x). Both report audio
+present and playbackRate 1. Both have uneven frame presentation. HTTP delivery
+is delayed/reordered: its arrival timestamps do not establish host-paced FPS
+or clock drift. These trials do not reproduce 1.5x playback. Firefox exits,
+its tracked descendants drain, heap checks pass and the original profile trees
+and named documents remain intact. The callback launcher exits zero after
+sync and all four primary filesystems check clean.
+
+The timer-mode host-contention trial adds exactly eight host CPU workers for
+20 seconds, with an independent 30-second timeout, confined along with QEMU
+to CPUs 0–13 of 16. The guest has 24 bounded workers. Its audio probe reports
+EPIPE after 23.809 guest seconds; this is retained as a failed audio test, not
+restarted automatically. The guest load drains and the VM remains responsive.
+The host benchmark writes complete results, but the observer raises before
+recording an authoritative owned host-process exit receipt. Its exit therefore
+remains unverified. Guest sync, QEMU and launcher exit, four primary filesystem
+checks, and saved document/profile preservation subsequently pass.
+
+The matched callback-mode contention trial completes all 1,323,000 frames in
+30.106 guest seconds. Its maximum four-second client ratio is 1.00125 and its
+eight-second PCM capture advances at 0.99496x host time. It has a longest silent
+run of six 10-ms bins: successful completion does not mean glitch-free output.
+The owned host benchmark exits zero. This is one trial per mode, not proof that
+callback mode eliminates discontinuities under arbitrary host starvation.
+The existing DSP ownership and endpoint probes pass in callback mode, including
+reset/close, dup/fork final close, ring geometry/pointer wraps, drain/cancel and
+masked/unmasked signal cases. Their tracked task groups drain normally.
+
+### Bounded real Quake II demo
+
+`scripts/workloads/q2_demo_timing.py` consumes a locally supplied licensed
+`pak0.pak`/demo, creates a short derived demo only inside a fresh private guest
+HOME, and runs the installed GL3/OpenAL wrapper at 1280x720 with timedemo off.
+It delimits 150 consecutive original demo records with log markers: nominal
+server pacing is 15.1 seconds including the inserted marker record. No game
+data is included in the repository. Frame/message counts are checked rather
+than assuming an arbitrary demo offset represents elapsed gameplay.
+
+The first attempt times buffered stdout and receives both markers together at
+exit. It is explicitly invalid timing evidence. The probe instead observes
+`logfile 2`'s per-line-flushed `qconsole.log` at 20-ms guest intervals, retaining
+filesystem visibility and reader scheduling as measurement limitations.
+The timer-mode interval is 15.440 s and callback intervals are 16.901/16.688 s;
+none reproduces accelerated demo playback. The games exit zero and their
+tracked descendants drain. Independent guest monotonic/host RPC brackets bound
+clock-rate ratios to 0.9988–1.0011 and 0.9958–1.0013 respectively, excluding 1.5x
+clock rate during these runs. They do not measure physical music tempo.
+Evidence is under `q2-{timer6-log,callback6-log}/` and
+`q2-demo-comparison.json`.
+
+The final callback VM passes heap integrity, clean guest sync, owned launcher
+exit zero, all four primary offline filesystem checks and the 12-document/four
+original-profile preservation audit. The loopback fixture server, route
+watchers and identity-checked private PipeWire daemon are stopped. Frozen
+orchestration helpers are retained under the ignored evidence root's
+`harness/`; paid game assets and derived demo packets remain private. Native SDL
+presentation, human listening, repeated alternating-order backend trials and
+real mixed-app policy comparisons remain outstanding. RR and timer-paced HDA
+are still the defaults.
