@@ -19,6 +19,13 @@
 // to avoid kernel string.h shadowing system headers).
 #include "../../kernel/src/sched_ops.h"
 #include "../../kernel/src/sched_restore.h"
+#include "../../kernel/src/sched_decision_trace.h"
+
+struct MlfqObservation {uint64_t calls=0,usedNs=0,quantumNs=0;uint16_t pid=0;uint8_t priority=0,reason=0,higher=0;bool serviceSeen=false;};
+static MlfqObservation observedMlfq;
+extern "C" void SchedulerObserveMlfqDecision(uint16_t pid,uint8_t priority,uint64_t usedNs,uint64_t quantumNs,uint8_t reason,bool serviceSeen,uint8_t higher){
+    ++observedMlfq.calls;observedMlfq.pid=pid;observedMlfq.priority=priority;observedMlfq.usedNs=usedNs;observedMlfq.quantumNs=quantumNs;observedMlfq.reason=reason;observedMlfq.serviceSeen=serviceSeen;observedMlfq.higher=higher;
+}
 
 using namespace brook;
 
@@ -934,7 +941,24 @@ static void RunCommonTests(const SchedOps* ops, void* state) {
     invoke_reinitialize_queued_pid_preserves_neighbours(ops,state);
 }
 
+TEST(mlfq_decision_observations){
+    observedMlfq={};ops->InitProcess(state,1,2);ops->AccountService(state,1,1);
+    ASSERT(!ops->ShouldPreempt(state,1,99999) && !observedMlfq.calls);
+    ops->InitProcess(state,2,1);ops->Enqueue(state,2);
+    ASSERT(ops->ShouldPreempt(state,1,0));
+    ASSERT(observedMlfq.calls==1 && observedMlfq.pid==1 && observedMlfq.priority==2);
+    ASSERT(observedMlfq.usedNs==1 && observedMlfq.quantumNs==20000000 && observedMlfq.serviceSeen);
+    ASSERT(observedMlfq.reason==uint8_t(MlfqDecisionReason::HigherPriority) && observedMlfq.higher==1);
+    ops->TimesliceExpired(state,1);ASSERT(ops->PickNext(state)==2);ASSERT(!ops->ShouldPreempt(state,1,0));
+    ops->Enqueue(state,2);ops->AccountService(state,1,20000000);ASSERT(ops->ShouldPreempt(state,1,0));
+    ASSERT(observedMlfq.reason==uint8_t(MlfqDecisionReason::Service) && observedMlfq.usedNs==20000001 && observedMlfq.higher==255);
+    ops->TimesliceExpired(state,1);ASSERT(ops->Timeslice(state,1)==40);
+    ops->InitProcess(state,3,0);ASSERT(ops->ShouldPreempt(state,3,5));
+    ASSERT(observedMlfq.reason==uint8_t(MlfqDecisionReason::LegacyWall) && !observedMlfq.serviceSeen && observedMlfq.quantumNs==5000000);
+}
+
 static void RunMlfqTests(const SchedOps* ops, void* state) {
+    invoke_mlfq_decision_observations(ops,state);
     invoke_mlfq_priority_ordering(ops,state);
     invoke_mlfq_demotion(ops,state);
     invoke_mlfq_boost(ops,state);

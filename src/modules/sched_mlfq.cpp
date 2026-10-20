@@ -6,6 +6,7 @@
 // Compiles as .mod (kernel) or .so (host tests).
 
 #include "sched_ops.h"
+#include "sched_decision_trace.h"
 
 namespace {
 
@@ -234,9 +235,16 @@ static bool MlfqShouldPreempt(void* state, uint16_t pid, uint64_t elapsedMs) {
     // steal. No early preemption, migration or enqueue resets this budget.
     const bool expired=p.serviceSeen?p.usedNs>=MLFQ_TIMESLICE[p.priority]*1000000:
         elapsedMs>=MLFQ_TIMESLICE[p.priority];
-    if(expired)return true;
+    if(expired){
+        SchedulerObserveMlfqDecision(pid,p.priority,p.usedNs,MLFQ_TIMESLICE[p.priority]*1000000,
+            uint8_t(p.serviceSeen?MlfqDecisionReason::Service:MlfqDecisionReason::LegacyWall),p.serviceSeen,255);
+        return true;
+    }
     for(unsigned level=0;level<p.priority;++level)if(s->queues[level].count){
-        p.earlyPreemption=true;return true;
+        p.earlyPreemption=true;
+        SchedulerObserveMlfqDecision(pid,p.priority,p.usedNs,MLFQ_TIMESLICE[p.priority]*1000000,
+            uint8_t(MlfqDecisionReason::HigherPriority),p.serviceSeen,uint8_t(level));
+        return true;
     }
     return false;
 }

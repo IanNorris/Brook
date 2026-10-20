@@ -1,6 +1,7 @@
 #include <cstdio>
 #include "../../kernel/src/dsp_producer_timing.h"
 #include "../../kernel/src/syscall_timing.h"
+#include "../../kernel/src/sched_decision_trace.h"
 #include "../../kernel/src/audio_service_timing.h"
 namespace {int failures=0;}
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"audio timing line %d: %s\n",__LINE__,#x);++failures;}}while(0)
@@ -19,6 +20,30 @@ SyscallTimingTicket SyscallTimingEnter(uint64_t pid,uint64_t incarnation,uint64_
     ++syscallClockReads;return syscallProbe.Begin(s.epoch,pid,incarnation,number,arg0,syscallNow,phase);
 }
 void SyscallTimingLeave(SyscallTimingTicket ticket,int64_t result,bool hasResult){++syscallClockReads;syscallProbe.End(ticket,syscallNow,result,hasResult);}
+}
+static void CheckDecisions(){
+    using namespace brook;SchedDecisionModel m;SchedDecisionEvent e{};
+    CHECK(!m.Observe(e));m.Watch(22,100);auto epoch=m.Snapshot().epoch;
+    e.epoch=epoch;e.pid=22;e.incarnation=100;e.nowNs=300;e.generation=1;e.usedNs=20000000;e.quantumNs=20000000;
+    e.priority=2;e.reason=MlfqDecisionReason::Service;e.serviceSeen=true;
+    e.hasDispatch=true;e.hasDrain=true;e.dispatch={100,10,true};e.drained={200,20,true};
+    CHECK(m.Observe(e));auto snap=m.Snapshot();CHECK(snap.observations==1 && snap.serviceExpiry==1 && !snap.invalid && !snap.unpaired);
+    e.incarnation=101;CHECK(!m.Observe(e));e.incarnation=100;
+    e.reason=MlfqDecisionReason::HigherPriority;e.higherPriority=1;e.usedNs=1;CHECK(m.Observe(e));
+    snap=m.Snapshot();CHECK(snap.higherPriority==1 && snap.events[0].usedNs==20000000);
+    e.higherPriority=2;CHECK(!m.Observe(e));e.higherPriority=1;
+    e.usedNs=e.quantumNs;CHECK(!m.Observe(e));e.usedNs=1;
+    e.reason=MlfqDecisionReason::LegacyWall;CHECK(!m.Observe(e));e.serviceSeen=false;CHECK(m.Observe(e));
+    e.drained.wallNs=301;CHECK(!m.Observe(e));e.drained.wallNs=99;CHECK(!m.Observe(e));e.drained={200,9,true};CHECK(!m.Observe(e));
+    e.drained={200,20,true};e.dispatch.valid=false;CHECK(!m.Observe(e));e.dispatch.valid=true;
+    e.hasDispatch=false;CHECK(!m.Observe(e));e.hasDrain=false;e.dispatch={};e.drained={};CHECK(m.Observe(e));CHECK(m.Snapshot().unpaired==1);
+    m.Reset();CHECK(!m.Observe(e));e.epoch=m.Snapshot().epoch;
+    for(unsigned i=0;i<40;++i){e.usedNs=i;CHECK(m.Observe(e));}
+    snap=m.Snapshot();CHECK(snap.observations==40 && snap.wallExpiry==40 && snap.retained==32 && snap.excluded==8 && snap.maxUsedNs==39);
+    CHECK(snap.events[0].usedNs==39 && snap.events[31].usedNs==8);
+    e.generation=~uint64_t(0);CHECK(!m.Observe(e) && m.Snapshot().saturated);
+    m.Off();e.epoch=m.Snapshot().epoch;CHECK(!m.Observe(e));
+    m.Watch(23,101);e.epoch=m.Snapshot().epoch;e.generation=1;CHECK(!m.Observe(e));
 }
 static void CheckSyscalls(){
     using namespace brook;
@@ -139,7 +164,7 @@ static void CheckProducer(){
 }
 int main(){
     CheckProducer();
-    CheckSyscalls();
+    CheckDecisions();CheckSyscalls();
     using namespace brook;AudioServiceTimingModel m;
     CHECK(!m.Observe(0,1,2,3,4,true));m.Worker(8,99);m.Enable(true);auto token=m.Token();
     CHECK(m.Observe(token,100,200,10000200,10001200,true));

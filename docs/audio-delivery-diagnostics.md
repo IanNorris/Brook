@@ -1004,3 +1004,117 @@ Exact controllers, analysis and verification scripts, kernel/driver identity,
 profile/correlation/loader-resolution results and hashes are archived in
 `syscall-profile-sources` under the ignored timing workload root. The three
 outcomes are retained in `syscall-profile-verified-results.json`.
+
+
+## MLFQ decision reasons and first post-switch drain
+
+`sched decision watch PID INC | off | reset | status` controls a separate,
+default-off selected-thread diagnostic. Native MLFQ reports positive
+`ShouldPreempt` decisions through a matched kernel observation import. The
+policy table/layout and module ABI remain unchanged; staging must pair the new
+MLFQ module with a kernel exporting that import. Old kernels reject its missing
+import rather than silently loading an incompatible diagnostic module. Hosted
+module tests supply an exported observer stub and exercise the actual shared
+library's service-expiry, legacy-wall and higher-priority reasons, including
+expiry taking precedence when both conditions are true. No budget, priority,
+queue selection or ledger mutation is added by the observer.
+
+Decisions retain priority, quantum, total used service, reason, first queued
+higher-priority level when applicable, interrupted RIP, periodic/IPI provenance,
+CPU and commit generation. Per-CPU dispatch metadata is bound to epoch,
+PID/incarnation and the destination CPU's next commit generation. Only the
+first matching post-switch drain marks completion; later timer drains cannot
+move that timestamp. Resumption on another CPU reads that CPU's current
+metadata. Epoch changes invalidate old pairs. Raw wall/steal samples bracket
+incoming ownership to drain completion without another ready-lock acquisition
+or ledger charge. Their difference is not ledger-corrected service: delayed
+steal updates and retained policy debt remain separate considerations.
+
+The recorder uses short IRQ-masked atomic-flag try sections, no waiting,
+allocation or logging while held, explicit contention and invalid/unpaired
+counters, and the largest thirty-two total used-budget observations. It does
+not favor largest post-dispatch overhead. Counts cover valid positive policy
+decisions; selection, termination/state checks or a missing eligible peer may
+prevent a physical switch afterward. A record is not proof of a completed
+switch, user progress or causality for a particular audio fault.
+
+The first host-loaded native run (`q2-decision-trace-try-1`, frozen kernel
+`6f637473059b0ad81d3e24f9a3445a7ba72391f1cf39f220d446bad2adbc6706`)
+changes only the kernel and MLFQ observation module; the other twelve driver
+hashes remain identical to the preceding control. The demo completes in
+37.404 seconds. All original workload/load/CPU-clock jobs, ledger/heap/clock
+checks, VM/router exits, filesystem checks and saved-data preservation pass.
+Audio acceptance fails with a native sample-gap fault and stream discontinuity;
+the HDA position sample itself spans roughly 3.506 seconds. This remains a
+failure, not an accepted performance improvement over the earlier runs.
+
+The selected DSP writer has thirty-eight valid positive decisions: seventeen
+service-budget expiries and twenty-one higher-priority requests, with no legacy
+wall expiries, invalid records, drops, saturation or unmatched dispatch/drain
+pairs. All thirty-two retained observations are paired. Thirty-one report RIP
+`0x10217922`; one is an IPI with unknown interrupted RIP zero. The largest used
+budget is 62.829 ms against a 40-ms quantum. Of fifteen retained higher-priority
+requests, fourteen interrupt priority 3 for queued priority 1 work, and one for
+priority 0. These are retained-event counts, not the priority breakdown of all
+twenty-one requests.
+
+Retained dispatch-to-first-drain wall brackets reach 10.044 ms, while the
+largest total budget and the longest later delay are different observations.
+They must not be added or interpreted as the budget consumed solely by that
+dispatch. Both service expiry and higher-priority competition are now directly
+observed; a wall-slice-start adjustment alone would not address either source.
+The trace still does not establish how much of the long no-user-progress gap
+is IRQ/lock activity versus host descheduling, nor which queued task wins each
+higher-priority request. A bounded behavioral discriminator must preserve
+termination/stop handling, accounting and retained debt if tried next.
+
+
+The first guest-only control (`q2-decision-trace-guest-try-1`) completes in
+15.278 seconds with zero positive writer decisions and zero trace errors/drops.
+All eight DSP return/control cases and original workload/load/CPU-clock,
+ledger/heap/clock, VM/router, filesystem and saved-data checks pass. Its
+six-second capture crosses normal game exit: guest snapshots bracket
+45.706–51.795 seconds while END is observed at 50.277 seconds. HDA becomes
+inactive for the final 1.308 capture seconds, and only 4.701 seconds of PCM are
+stored. The full-window audio gate remains false. A three-second capture repeat
+on the same frozen kernel addresses this fixture overlap without relaxing the
+full-window audio or native safety criteria; the original result stays retained.
+
+Astra reviewed a possible next bounded behavioral discriminator: an opt-in,
+MLFQ-only deferral of at most one positive periodic user-mode preemption decision
+per actual dispatch generation. It must apply only to a still-Running task
+under the existing ready lock, preserve all service, debt and priority, and
+skip expiry handling on the deferred decision. IPIs, stopped/terminal tasks and
+saturated generations must be excluded. Consumption must survive counter resets
+and control toggles. Tests must cover expiry and higher-priority reasons,
+negative decisions before the first positive, changed-reason recomputation,
+migration/new commits and exact budget preservation. A first positive decision
+can occur well after useful execution, so this would test sensitivity to
+suppressing a decision, not by itself prove a return-without-progress loop.
+Dispatch age, reason, RIP and prior user boundaries would be needed for that
+interpretation. A faster demo alone would not resolve the independent multi-
+second HDA sampling interruption. This behavior has not been implemented or
+selected as a default by the diagnostic work.
+
+
+The three-second repeat (`q2-decision-trace-guest-try-2`) completes the demo in
+15.205 seconds and passes the unchanged full-window audio criteria: 3.000
+seconds of PCM over 3.006 host seconds, no native fault/discontinuity, zero
+positive writer preemption decisions and zero trace errors/drops. All eight
+DSP control cases, original jobs, CPU-clock/ledger/heap checks, VM/router exits,
+filesystem checks and saved-data preservation pass again. Both guest repeats
+remain separately recorded; the earlier shutdown-overlapping capture remains
+a failed full-window result. Quiet integration is not host-load acceptance.
+
+All 68 hosted tests pass, including actual shared-module observer semantics
+and the reducer's identity/epoch rejection, reason/threshold validation,
+metadata clock order, missing pairs, capacity, reset and generation saturation
+cases. The compiled entry audit passes twelve supported templates and all
+56 mutation rejections, with four unsupported templates still outside scope.
+Astra found no blocking guard, migration/pairing or accounting safety issue in
+the observational patch. The exact source snapshot, patch, controllers,
+independent verifiers, frozen manifest and native evidence are retained in
+`decision-trace-sources`; host and guest outcomes remain separate in
+`decision-trace-verified-results.json` and
+`decision-trace-guest-verified-results.json`. No scheduler default or timing
+safety limit changes are justified by this diagnostic acceptance.

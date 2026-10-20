@@ -1,5 +1,6 @@
 #include "scheduler.h"
 #include "irq_accounting.h"
+#include "sched_decision_trace.h"
 #include "timer_irq_arrivals.h"
 #include "module.h"
 #include "posix_timer.h"
@@ -128,11 +129,19 @@ static inline void SchedLockReleaseRaw(SchedLock& lock)
 
 static constexpr uint32_t SCHED_MAX_CPUS = 64;
 
+struct DecisionDispatchTiming {
+    uint64_t epoch=0,pid=0,incarnation=0,generation=0;
+    RuntimeSample begin{},drain{};
+    bool drained=false;
+};
 struct PerCpuSchedState {
     Process*         currentProcess;
     Process*         idleProcess;
     uint64_t         sliceStartTick;
     KernelCpuEnv*    cpuEnv;
+    DecisionDispatchTiming decisionDispatch{};
+    uint64_t decisionRip=0;
+    bool decisionActive=false,decisionPeriodic=false;
     Process*         pendingRequeue;   // Owns a ProcessRef until post-switch drain
     Process*         pendingRetire;    // Owns a ProcessRef until post-switch retirement
     volatile uint64_t busyTicks;      // ticks spent running non-idle processes
@@ -279,6 +288,33 @@ static void RuntimeDispatchLocked(uint32_t cpu, const Process* next)
                        next->incarnation);
     if (next != g_perCpu[cpu].idleProcess)
         g_schedOps->SetRunnable(g_schedState, next->pid, true);
+    auto& timing=g_perCpu[cpu].decisionDispatch;timing={};
+    const auto token=SchedDecisionToken(next->pid,next->incarnation);
+    if(token){
+        timing.epoch=token;timing.pid=next->pid;timing.incarnation=next->incarnation;
+        const auto generation=SchedulerContextSwitchGeneration(cpu);
+        if(generation==~uint64_t(0))timing.epoch=0;
+        else timing.generation=generation+1;
+        timing.begin=sample;
+    }
+}
+
+extern "C" void SchedulerObserveMlfqDecision(uint16_t pid,uint8_t priority,uint64_t usedNs,
+    uint64_t quantumNs,uint8_t reason,bool serviceSeen,uint8_t higherPriority)
+{
+    const auto cpu=ThisCpu();const auto* proc=g_perCpu[cpu].currentProcess;
+    if(!proc || proc->pid!=pid || !g_perCpu[cpu].decisionActive)return;
+    const auto epoch=SchedDecisionToken(proc->pid,proc->incarnation);if(!epoch)return;
+    SchedDecisionEvent event{};event.epoch=epoch;event.pid=pid;event.incarnation=proc->incarnation;
+    event.cpu=cpu;event.rip=g_perCpu[cpu].decisionRip;event.periodic=g_perCpu[cpu].decisionPeriodic;
+    event.generation=SchedulerContextSwitchGeneration(cpu);event.usedNs=usedNs;event.quantumNs=quantumNs;
+    event.priority=priority;event.reason=MlfqDecisionReason(reason);event.serviceSeen=serviceSeen;event.higherPriority=higherPriority;
+    const auto now=RuntimeNow(cpu);event.nowNs=now.valid && g_runtimeStableClock?now.wallNs:0;
+    event.hasSteal=KvmStealAvailable(cpu);
+    const auto& timing=g_perCpu[cpu].decisionDispatch;
+    event.hasDispatch=timing.epoch==epoch && timing.pid==pid && timing.incarnation==proc->incarnation && timing.generation==event.generation;
+    if(event.hasDispatch){event.dispatch=timing.begin;event.hasDrain=timing.drained;if(event.hasDrain)event.drained=timing.drain;}
+    SchedDecisionRecord(event);
 }
 
 bool SchedulerCpuTime(Process* proc, bool group, uint64_t* result)
@@ -962,6 +998,16 @@ static void DrainPostSwitch(uint32_t cpu)
             SchedTrace(toRequeue, STR_REQUEUE_SKIP);
         SchedLockRelease(g_readyLock, rlf);
         ReleaseSchedulerReference(toRequeue, false);
+    }
+    // First post-switch completion only. No extra ledger charge or ready-lock
+    // acquisition: raw paired clock samples describe elapsed/steal brackets.
+    auto& timing=g_perCpu[cpu].decisionDispatch;
+    const auto* current=g_perCpu[cpu].currentProcess;
+    if(current && timing.epoch && !timing.drained &&
+       timing.pid==current->pid && timing.incarnation==current->incarnation &&
+       timing.generation==SchedulerContextSwitchGeneration(cpu) &&
+       timing.epoch==SchedDecisionToken(current->pid,current->incarnation)){
+        timing.drain=RuntimeNow(cpu);timing.drained=true;
     }
 }
 
@@ -2434,8 +2480,12 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
     // policy replacement and queue mutation. Module state is not internally
     // synchronized; even a read can race an MLFQ boost or full state reset.
     uint64_t rlf8 = SchedLockAcquire(g_readyLock);
-    if (!g_schedOps->ShouldPreempt(g_schedState, cur->pid,
-                                  ApicTickCount() - g_perCpu[cpu].sliceStartTick))
+    g_perCpu[cpu].decisionRip=interruptedRip;g_perCpu[cpu].decisionPeriodic=periodicTimer;
+    g_perCpu[cpu].decisionActive=true;
+    const bool shouldPreempt=g_schedOps->ShouldPreempt(g_schedState, cur->pid,
+                                  ApicTickCount() - g_perCpu[cpu].sliceStartTick);
+    g_perCpu[cpu].decisionActive=false;
+    if (!shouldPreempt)
     {
         SchedLockRelease(g_readyLock, rlf8);
         return;

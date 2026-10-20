@@ -1,6 +1,7 @@
 #include "irq_accounting.h"
 #include "dsp_producer_timing.h"
 #include "syscall_timing.h"
+#include "sched_decision_trace.h"
 #include "bridge_reply.h"
 // net.cpp — Brook OS network stack.
 //
@@ -3710,6 +3711,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap check      - validate heap block metadata\n"
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  audio stats - cached stream queues, completion and guest clock\n"
+            "  sched decision watch PID INC | off | reset | status - MLFQ decisions (default off)\n"
             "  sched syscall watch PID INC | off | reset | status - thread syscall brackets (default off)\n"
             "  audio producer on|off|reset|status - DSP producer elapsed brackets (default off)\n"
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
@@ -3992,6 +3994,36 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text(","); reply.field("timer_ticks_per_ms", clock.timerTicksPerMs);
         reply.text(","); reply.field("initial_timer_ticks_per_ms", clock.initialTimerTicksPerMs);
         reply.text("}\n"); reply.send();
+    }
+    else if(StrStartsWith(cmd,"sched decision watch ") || NetStrEq(cmd,"sched decision off") ||
+            NetStrEq(cmd,"sched decision reset") || NetStrEq(cmd,"sched decision status")) {
+        SchedDecisionSnapshot s{};bool ok=false;
+        if(StrStartsWith(cmd,"sched decision watch ")){
+            const char* p=cmd+sizeof("sched decision watch ")-1;
+            auto decimal=[&](uint64_t& value){
+                if(*p<'0' || *p>'9')return false;
+                while(*p>='0' && *p<='9'){const uint64_t digit=*p++-'0';if(value>(~uint64_t(0)-digit)/10)return false;value=value*10+digit;}return true;
+            };
+            uint64_t pid=0,incarnation=0;bool valid=decimal(pid);
+            if(*p==' ')++p;else valid=false;
+            valid=valid && decimal(incarnation) && !*p && pid && pid<=65535 && incarnation;
+            if(!valid){DebugChannelSend("{\"error\":\"expected PID and nonzero incarnation\",\"applied\":false}\n");return;}
+            ok=SchedDecisionWatch(pid,incarnation,&s);
+        }else if(NetStrEq(cmd,"sched decision off"))ok=SchedDecisionOff(&s);
+        else if(NetStrEq(cmd,"sched decision reset"))ok=SchedDecisionReset(&s);
+        else ok=SchedDecisionRead(&s);
+        if(!ok){DebugChannelSend("{\"error\":\"diagnostic busy; no control effect\",\"applied\":false}\n");return;}
+        BridgeReply h;h.text("{");h.field("epoch",s.epoch);h.text(",");h.field("pid",s.pid);h.text(",");h.field("incarnation",s.incarnation);
+        h.text(",\"enabled\":");h.text((s.epoch&1)?"true":"false");h.send();
+        DebugChannelSend(" ,\"scope\":\"positive MLFQ decisions, not proof of completed switches; largest 32 used-service budgets; raw dispatch/drain wall and steal brackets are not ledger-corrected service; no continuity across drops; unmatched epoch/generation has no dispatch pair; contention since boot\",");
+        BridgeReply c;c.field("observations",s.observations);c.text(",");c.field("service_expiry",s.serviceExpiry);c.text(",");c.field("wall_expiry",s.wallExpiry);c.text(",");c.field("higher_priority",s.higherPriority);
+        c.text(",");c.field("invalid",s.invalid);c.text(",");c.field("unpaired_dispatch",s.unpaired);c.text(",");c.field("contended_records",s.contended);c.text(",");c.field("excluded",s.excluded);c.text(",");c.field("max_used_ns",s.maxUsedNs);
+        c.text(",\"saturated\":");c.text(s.saturated?"true":"false");c.text(",\"events\":[");c.send();
+        for(unsigned i=0;i<s.retained;++i){const auto& e=s.events[i];BridgeReply r;if(i)r.text(",");r.text("{");r.field("now_ns",e.nowNs);r.text(",");r.field("cpu",e.cpu);r.text(",");r.field("generation",e.generation);r.text(",");r.field("rip",e.rip);r.text(",");r.field("priority",e.priority);r.text(",");r.field("used_ns",e.usedNs);r.text(",");r.field("quantum_ns",e.quantumNs);
+            r.text(",\"reason\":\"");r.text(e.reason==MlfqDecisionReason::Service?"service":e.reason==MlfqDecisionReason::LegacyWall?"legacy_wall":"higher_priority");r.text("\"");r.text(",");r.field("higher_priority_level",e.higherPriority);r.send();
+            BridgeReply b;b.text(",\"service_seen\":");b.text(e.serviceSeen?"true":"false");b.text(",\"periodic\":");b.text(e.periodic?"true":"false");b.text(",\"has_steal\":");b.text(e.hasSteal?"true":"false");b.text(",\"has_dispatch\":");b.text(e.hasDispatch?"true":"false");b.text(",\"has_drain\":");b.text(e.hasDrain?"true":"false");
+            b.text(",");b.field("dispatch_wall_ns",e.dispatch.wallNs);b.text(",");b.field("dispatch_steal_ns",e.dispatch.stealNs);b.text(",");b.field("drain_wall_ns",e.drained.wallNs);b.text(",");b.field("drain_steal_ns",e.drained.stealNs);b.text("}");b.send();}
+        DebugChannelSend("]}\n");
     }
     else if(StrStartsWith(cmd,"sched syscall watch ") || NetStrEq(cmd,"sched syscall off") ||
             NetStrEq(cmd,"sched syscall reset") || NetStrEq(cmd,"sched syscall status")) {

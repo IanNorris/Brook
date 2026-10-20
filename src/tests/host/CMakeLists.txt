@@ -250,6 +250,7 @@ target_compile_options(test_sched_modules PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )
 target_link_libraries(test_sched_modules PRIVATE ${CMAKE_DL_LIBS})
+set_target_properties(test_sched_modules PROPERTIES ENABLE_EXPORTS ON)
 add_dependencies(test_sched_modules sched_rr sched_mlfq)
 
 # Pass .so paths to the test binary.

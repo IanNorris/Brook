@@ -25,6 +25,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "keyboard.h"
 #include "input.h"
 #include "scheduler.h"
+#include "sched_decision_trace.h"
 #include "display.h"
 #include "gpu_compositor.h"
 #include "gpu_app.h"
@@ -159,6 +160,7 @@ EXPORT_SYMBOL(InputWakeWaiters);
 
 // Scheduler — for dynamic policy modules
 EXPORT_SYMBOL(SchedulerRegisterPolicy);
+EXPORT_SYMBOL(SchedulerObserveMlfqDecision);
 EXPORT_SYMBOL(SchedulerBlock);
 EXPORT_SYMBOL(SchedulerUnblock);
 EXPORT_SYMBOL(SchedulerYield);
