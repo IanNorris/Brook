@@ -646,3 +646,75 @@ all gates above. It records harness/fixture hashes, reuses existing tracked jobs
 retains unresolved input/capture intents and preserves close/shutdown request IDs.
 `scripts/workloads/analyze_browser_sched_trace.py` can reanalyze saved evidence
 without any VM. Frozen code/fixtures are under `browser-mix-http-fast/harness/`.
+
+
+### Persistent Linux reference: first native control
+
+`tools/linux-workload-reference` builds a disk-backed NixOS control with the
+repository's pinned Linux/apps. `scripts/linux_workload_reference.py` provides
+owned QEMU lifecycle, key-only loopback SSH, VM-only input/screenshot transport
+and stopped-disk acceptance. Linux boot0 uses the same QEMU 10.2.2, renderer
+library hash, Intel render node, Venus/virtio GPU, 1-GiB hostmem, eight vCPUs,
+six GiB, 0–13 host affinity, callback HDA and isolated 44.1-kHz sink as Brook's
+mixed trials. Linux selects `kvm-clock` and `lapic-deadline`; clocksource and
+interrupt delivery are distinct there too. No swap is configured.
+
+The identical static CPU binary (SHA256
+`9186eb43eb1673e6734f571dbe779822ec3b0dd4b6ee3263db008c47049253ec`)
+is used on both OSes, avoiding compiler differences. The shared Firefox profile
+source was extracted into an import-safe module. AST comparison proves the
+native controller's flow and source are otherwise unchanged. An initial import
+error occurred before launching any Linux browser job and was corrected.
+
+Linux's default Firefox profile decodes near 24 fps and supplies continuous PCM,
+but its Wayland visual callbacks stall at ~0.03/s. An independent line-flushed
+12-second Weston presentation probe produces 703 frames. The separate software-
+vsync diagnostic restores Firefox presentation without changing GPU acceleration.
+The later 800×600 profile matches Brook's browser window dimensions. These are
+separate profiles on one warmed Linux smoke boot, not alternating fresh-boot or
+cold-start comparisons. Linux autogroup and scheduling classes are retained in
+the guest environment snapshot; no RTKit service is present.
+
+| Linux Firefox cohort | Periodic p95 / max | Fixed-work batches | Video callbacks/s / media rate | Capture sample coverage |
+| --- | --- | ---: | --- | --- |
+| Default Wayland vsync, default window | 2.94 / 16.95 ms | 7,049,722 | 0.034 / 1.001x | 1.000x |
+| Software-vsync diagnostic, default window | 1.71 / 43.71 ms | 6,585,094 | 22.51 / 0.999x | 1.001x |
+| Software vsync, matched 800×600 window | 0.45 / 66.72 ms | 6,558,081 | 23.07 / 1.000x | 1.000x |
+
+The matched profile has zero sampled dropped frames, no sampled buffer starvation
+and 800/800 nonzero 10-ms audio bins, with the entire eight-second capture inside
+CPU load. These are callback opportunities/captured samples, not human audio or
+physical display latency. Fixed-work count ratios are not precise CPU-service
+fairness: Linux per-CPU placement and heterogeneous host execution can differ.
+Do not attribute the full Brook/Linux gap to EEVDF alone.
+
+The first two controller attempts time out only during app cleanup: Ctrl+Q
+opens a confirmed quit dialog, and Weston does not bind Alt+F4 by default. Both
+original browser lineages are manually closed and drained, with no replacement
+jobs. Their performance evidence remains, but they are not clean controller
+passes. The final matched controller completes its known quit-confirmation flow,
+and both browser/CPU SSH jobs exit zero. The original output, frozen controllers,
+source/fixture hashes, captures and screenshots remain under
+`build/linux-workload-reference-20261020/mix-*`.
+
+A private pak exported read-only from a stopped checked Brook disk is staged
+outside Nix derivations/git. The same packet timing probe, extended with a direct
+Linux engine option, completes GL3 at 1280×720 in 15.440 seconds versus nominal
+15.1, with game exit zero and no remaining game process. The engine reports
+virgl/Mesa Intel UHD 630 and 44.1-kHz sound. No OST is staged in this control;
+this is not a music-matched or uncapped FPS comparison. Neither this nor the
+clock-fixed Brook probe reproduces accelerated playback.
+
+The image build emits directory-reading warnings during LKL population. Its
+build exits zero and the installed system closure is subsequently verified
+read-only from the normal guest user: 962 paths, including all named app
+packages, match their registered NAR hashes. The original launcher then exits
+zero without timeout after `reboot: Power down`, and offline ext4 checking
+passes. A saved root copy includes only private test data; the immutable image
+seed contains no licensed pak. The QEMU process is now terminal. No passwordless
+sudo, compositor debug access or host desktop control is enabled.
+
+Open controls include repeated fresh boots, startup/cache matching, additional
+game throughput and further browser backend comparisons. This first functional
+reference advances the performance target; it does not finish the timing/SMP
+objective or authorize a default scheduler change.

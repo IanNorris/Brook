@@ -6,6 +6,7 @@ Run in an isolated test VM; log visibility and reader scheduling affect timing.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -15,6 +16,7 @@ import time
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, required=True)
+    parser.add_argument('--engine', type=Path, help='Direct engine path for the Linux reference; default uses Brook wrapper')
     parser.add_argument('--pak-dir', type=Path,
                         default=Path('/data/games/quake2/baseq2'))
     args = parser.parse_args()
@@ -80,10 +82,19 @@ def main():
                     scope='150 original packets plus the start marker tick; '
                           'log observations include reader scheduling latency')
     print('Q2_TIMING_PREPARED', json.dumps(metadata), flush=True)
-    wrapper = (Path('/nix/bin/brook-yquake2-gl').read_text()
-               .replace('/data/yq2', str(home))
-               .replace('/data/games/quake2', str(args.pak_dir.parent)))
-    argv = ['/nix/profile/bin/bash', '-c', wrapper, 'q2-timing', 'gl3',
+    if args.engine:
+        if not args.engine.is_absolute() or not args.engine.is_file():
+            raise SystemExit('Direct engine must be an existing absolute executable')
+        os.environ.update(HOME=str(home), XDG_CONFIG_HOME=str(home/'.config'),
+                          XDG_CACHE_HOME=str(home/'.cache'), SDL_VIDEODRIVER='wayland')
+        prefix = [str(args.engine), '-datadir', str(args.pak_dir.parent),
+                  '+set', 'logfile', '2', '+set', 'vid_renderer', 'gl3']
+    else:
+        wrapper = (Path('/nix/bin/brook-yquake2-gl').read_text()
+                   .replace('/data/yq2', str(home))
+                   .replace('/data/games/quake2', str(args.pak_dir.parent)))
+        prefix = ['/nix/profile/bin/bash', '-c', wrapper, 'q2-timing', 'gl3']
+    argv = prefix + [
             '+set', 'r_mode', '-1', '+set', 'r_customwidth', '1280',
             '+set', 'r_customheight', '720', '+set', 'vid_fullscreen', '0',
             '+set', 'cl_maxfps', '60', '+set', 'timedemo', '0',

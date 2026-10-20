@@ -142,3 +142,27 @@ lifetime prerequisites first, then independently test eligibility/service debt,
 wakeup placement, weights, overflow and SMP/lifecycle invariants before native
 comparison. Do not substitute IRQ counts for precise virtual runtime or select
 a default merely because one playback run appears smooth.
+
+
+### First Linux reference gate completed
+
+A persistent Linux 6.18.26 image now boots and runs the same static CPU binary,
+Firefox 150.0.1/generated-media fixture and Quake II GL3/720p timing probe. The
+same QEMU, host renderer, render node, vCPU/RAM/affinity and silent audio backend
+are recorded. The 800×600 Firefox pilot uses an explicit Wayland software-vsync
+workaround; its default-profile presentation failure remains retained. Linux
+selects kvm-clock with lapic-deadline delivery. The installed 962-path system
+closure verifies, normal apps drain, the owned launcher exits zero after serial
+powerdown and offline ext4 checks pass. These first warm controls and their
+limits are documented in `tools/linux-workload-reference/README.md`.
+
+The working Linux pilot delivers about 23 callbacks/s for the 24-fps clip,
+continuous audio and 6.56 million fixed-work batches under 24-worker contention;
+periodic p95 is 0.45 ms. Brook MLFQ's corresponding first corrected pilot is
+20.66 ms and 5.39 million batches, with about 7.6 video callbacks/s. Different
+compositors, Firefox vsync settings and caches preclude assigning this entire
+gap to the scheduler. This supplies a useful performance target rather than an
+isolated EEVDF proof. Retain both Brook controls and require the runtime/lifetime
+and SMP prerequisites above before enabling an experimental Brook EEVDF policy.
+CPU-time clock IDs currently alias wall time and also need correction; precise
+runtime accounting should serve both those APIs and policy service accounting.
