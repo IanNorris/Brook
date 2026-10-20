@@ -25,6 +25,8 @@ struct RrState {
     uint16_t   tail;       // Last pid in queue
     uint32_t   readyCount;
 };
+static_assert(sizeof(RrState) <= SCHED_POLICY_STATE_CAPACITY,
+              "RR state exceeds kernel policy storage");
 
 static constexpr uint16_t NONE = SCHED_PID_NONE;
 

@@ -100,6 +100,7 @@ TEST(vtable_complete) {
     // Every function pointer must be non-null.
     ASSERT(ops->name != nullptr);
     ASSERT(ops->stateSize > 0);
+    ASSERT(ops->stateSize <= SCHED_POLICY_STATE_CAPACITY);
     ASSERT(ops->Init != nullptr);
     ASSERT(ops->InitProcess != nullptr);
     ASSERT(ops->Enqueue != nullptr);

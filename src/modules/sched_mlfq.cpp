@@ -44,6 +44,8 @@ struct MlfqState {
     uint64_t     lastBoostMs;
     uint32_t     totalReady;
 };
+static_assert(sizeof(MlfqState) <= SCHED_POLICY_STATE_CAPACITY,
+              "MLFQ state exceeds kernel policy storage");
 
 // ---------------------------------------------------------------------------
 // Queue helpers (operate on pid-indexed linked lists)

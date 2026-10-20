@@ -22,6 +22,10 @@ namespace brook {
 // Maximum PIDs the policy must support (must match kernel MAX_PROCESSES).
 static constexpr uint32_t SCHED_MAX_PIDS = 1024;
 
+// Shared kernel/module storage contract. Policy fixtures must fit the same
+// storage used by the kernel, rather than allocating unbounded host memory.
+static constexpr size_t SCHED_POLICY_STATE_CAPACITY = 16384;
+
 // Sentinel value: no process (returned by PickNext when queue is empty).
 static constexpr uint16_t SCHED_PID_NONE = 0xFFFF;
 

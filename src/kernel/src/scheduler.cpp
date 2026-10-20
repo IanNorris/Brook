@@ -195,7 +195,7 @@ static void CopyProcessNameForLog(const Process* proc, char out[33])
 
 // Pluggable scheduling policy (loaded at init, called through vtable).
 static const SchedOps* g_schedOps = nullptr;
-static uint8_t g_schedStateStorage[8192] __attribute__((aligned(16)));
+static uint8_t g_schedStateStorage[SCHED_POLICY_STATE_CAPACITY] __attribute__((aligned(16)));
 static void*   g_schedState = g_schedStateStorage;
 
 // Policy registry — modules register here; we can switch at runtime.
