@@ -11,15 +11,11 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <time.h>
+#include <sched.h>
+#include <cpuid.h>
+#include "../../src/shared/pvclock_page.h"
 #include <unistd.h>
 
-struct clock_page {
-    uint32_t version, padding;
-    uint64_t timestamp, nanoseconds;
-    uint32_t multiplier;
-    int8_t shift;
-    uint8_t flags, reserved[2];
-};
 typedef int (*clock_fn)(int, struct timespec *);
 static uint64_t tsc(void) {
     uint32_t lo, hi;
@@ -46,49 +42,73 @@ int main(int argc, char **argv) {
     assert(!dlvsym(handle, "__vdso_clock_gettime", "LINUX_9.9"));
     Dl_info info;
     assert(dladdr((void *)fn, &info) && info.dli_fbase);
-    struct clock_page *page = (void *)((char *)info.dli_fbase + 4096);
-    assert(mprotect(page, 4096, PROT_READ | PROT_WRITE) == 0);
-    memset(page, 0, 4096);
+    struct BrookPvclockSlot *slots = (void *)((char *)info.dli_fbase + 4096);
+    unsigned a,b,c,d;
+    assert(__get_cpuid(0x80000001,&a,&b,&c,&d) && (d&(1u<<27)));
+    cpu_set_t allowed, selected;
+    assert(sched_getaffinity(0,sizeof(allowed),&allowed)==0);
+    unsigned cpu=BROOK_PVCLOCK_CPUS;
+    /* Prefer an AP slot to catch accidentally continuing to read CPU0. */
+    for(unsigned i=1;i<BROOK_PVCLOCK_CPUS;++i)if(CPU_ISSET(i,&allowed)){cpu=i;break;}
+    if(cpu==BROOK_PVCLOCK_CPUS && CPU_ISSET(0,&allowed))cpu=0;
+    assert(cpu<BROOK_PVCLOCK_CPUS);
+    CPU_ZERO(&selected);CPU_SET(cpu,&selected);
+    assert(sched_setaffinity(0,sizeof(selected),&selected)==0);
+    unsigned lo,hi,aux;
+    __asm__ volatile("rdtscp" : "=a"(lo),"=d"(hi),"=c"(aux));
+    assert((aux&BROOK_PVCLOCK_CPU_MASK)==cpu);
+    struct BrookPvclockInfo *page=&slots[cpu].clock;
+    struct BrookPvclockMetadata *metadata=(void*)slots[0].reserved;
+    assert(mprotect(slots, 4096, PROT_READ | PROT_WRITE) == 0);
+    memset(slots, 0, 4096);
     fallback(fn, CLOCK_MONOTONIC); /* Unavailable clock page. */
-    page->nanoseconds = 1234567890123ULL;
-    page->multiplier = 1;
-    page->shift = -63;
+    metadata->magic=BROOK_PVCLOCK_MAGIC;metadata->version=BROOK_PVCLOCK_VERSION;
+    metadata->stride=BROOK_PVCLOCK_STRIDE;metadata->cpus=BROOK_PVCLOCK_CPUS;
+    metadata->features=BROOK_PVCLOCK_RDTSCP;
+    page->system_time = 1234567890123ULL;
+    page->tsc_to_system_mul = 1;
+    page->tsc_shift = -63;
     page->flags = 1;
     struct timespec value;
     assert(fn(CLOCK_MONOTONIC, &value) == 0);
-    assert(ns(value) == page->nanoseconds); /* Must be fast, not host time. */
+    assert(ns(value) == page->system_time); /* Must be fast, not host time. */
+    metadata->features=0;fallback(fn,CLOCK_MONOTONIC);metadata->features=BROOK_PVCLOCK_RDTSCP;
+    metadata->magic=0;fallback(fn,CLOCK_MONOTONIC);metadata->magic=BROOK_PVCLOCK_MAGIC;
+    metadata->version=2;fallback(fn,CLOCK_MONOTONIC);metadata->version=BROOK_PVCLOCK_VERSION;
+    metadata->stride=32;fallback(fn,CLOCK_MONOTONIC);metadata->stride=BROOK_PVCLOCK_STRIDE;
+    metadata->cpus=65;fallback(fn,CLOCK_MONOTONIC);metadata->cpus=BROOK_PVCLOCK_CPUS;
     const int shifts[] = {-63, -1, 0, 1, 8};
     for (unsigned i = 0; i < sizeof(shifts)/sizeof(shifts[0]); ++i) {
-        page->timestamp = tsc();
-        page->shift = shifts[i];
-        page->multiplier = 0x80000000U;
-        uint64_t lo = tsc() - page->timestamp;
+        page->tsc_timestamp = tsc();
+        page->tsc_shift = shifts[i];
+        page->tsc_to_system_mul = 0x80000000U;
+        uint64_t lo = tsc() - page->tsc_timestamp;
         assert(fn(CLOCK_MONOTONIC, &value) == 0);
-        uint64_t hi = tsc() - page->timestamp;
+        uint64_t hi = tsc() - page->tsc_timestamp;
         if (shifts[i] < 0) { lo >>= -shifts[i]; hi >>= -shifts[i]; }
         else { lo <<= shifts[i]; hi <<= shifts[i]; }
-        assert(ns(value) >= page->nanoseconds + lo / 2);
-        assert(ns(value) <= page->nanoseconds + hi / 2);
+        assert(ns(value) >= page->system_time + lo / 2);
+        assert(ns(value) <= page->system_time + hi / 2);
     }
     page->flags = 0; fallback(fn, CLOCK_MONOTONIC);
     page->flags = 1;
     page->version = 1; fallback(fn, CLOCK_MONOTONIC); /* Bounded retry -> syscall. */
     page->version = 2;
-    page->multiplier = 0; fallback(fn, CLOCK_MONOTONIC);
-    page->multiplier = UINT32_MAX;
-    page->timestamp = UINT64_MAX; fallback(fn, CLOCK_MONOTONIC);
-    page->timestamp = 0;
-    page->shift = -64; fallback(fn, CLOCK_MONOTONIC);
-    page->shift = 64; fallback(fn, CLOCK_MONOTONIC);
-    page->shift = 63; fallback(fn, CLOCK_MONOTONIC); /* Shift overflow. */
-    page->shift = 0;
-    page->nanoseconds = UINT64_MAX; fallback(fn, CLOCK_MONOTONIC); /* Add overflow. */
+    page->tsc_to_system_mul = 0; fallback(fn, CLOCK_MONOTONIC);
+    page->tsc_to_system_mul = UINT32_MAX;
+    page->tsc_timestamp = UINT64_MAX; fallback(fn, CLOCK_MONOTONIC);
+    page->tsc_timestamp = 0;
+    page->tsc_shift = -64; fallback(fn, CLOCK_MONOTONIC);
+    page->tsc_shift = 64; fallback(fn, CLOCK_MONOTONIC);
+    page->tsc_shift = 63; fallback(fn, CLOCK_MONOTONIC); /* Shift overflow. */
+    page->tsc_shift = 0;
+    page->system_time = UINT64_MAX; fallback(fn, CLOCK_MONOTONIC); /* Add overflow. */
     fallback(fn, CLOCK_REALTIME);
     assert(fn(-1, &value) == -EINVAL);
     page->flags = 0;
     assert(fn(CLOCK_MONOTONIC, NULL) == -EFAULT);
-    assert(mprotect(page, 4096, PROT_READ) == 0);
+    assert(mprotect(slots, 4096, PROT_READ) == 0);
     assert(dlclose(handle) == 0);
-    puts("VDSO_HOST_PASS: versioned ELF, arithmetic, bounded helper retry and raw syscall fallback");
+    printf("VDSO_HOST_PASS: CPU slot %u, metadata guards, versioned ELF, arithmetic, bounded retry and syscall fallback\n",cpu);
     return 0;
 }

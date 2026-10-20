@@ -369,3 +369,24 @@ performance promotion, repeated/reverse-order MLFQ/RR controls, forced-device
 failure behavior, and seven backward nanosecond samples from the RR ledger
 remain unresolved. RR remains the scheduler default; the overall timing goal
 is still active.
+
+
+## Per-vCPU clock follow-up
+
+The [pause/resume clock repair](pvclock-percpu.md) replaces shared BSP clock
+reads in both the kernel and vDSO. The new EEVDF cohort `pc-be0` passes twelve
+injected pauses, 1,885,268 libc/syscall bracket checks on all eight CPUs and both
+native libc ABI/lifetime checks. Its loaded browser pilot has periodic p95
+4.04 ms and worst 89.43 ms. Buffered video decodes at 23.18 frames/s but delivers
+4.30 callbacks/s; the Linux reference's earlier 23.07 callbacks/s remains a
+substantial practical target. These are separate single pilots, not a repeated
+matched statistical claim. Graphics/compositor, cache and clockevent differences
+remain; RR stays the default.
+
+The new cohort exports its buffered trace without loss and reports no sampled
+buffer starvation. Its 351,104 captured PCM frames over roughly eight host
+seconds include a 90-ms silent run. All app lineages drain and launcher, heap,
+four filesystems and original documents/profiles pass. The earlier unexplained
+backwards clock samples now have a reproducible pause/resume mechanism and
+native repair evidence; the original subjective application speedup still has
+not been reproduced.

@@ -2,8 +2,9 @@
 
 Later workload follow-up: [TCP receive-copy deadlock](tcp-receive-copy.md)
 records a confirmed socket-lock/page-fault dependency, native CoW/EFAULT checks,
-the Quake II timing smoke run, and seven still-unexplained backward nanosecond
-samples. [EEVDF experiments](eevdf-experiment.md) records the optional policy,
+the Quake II timing smoke run, and seven backward nanosecond samples. The subsequent
+[per-vCPU clock repair](pvclock-percpu.md) localizes those samples to VM
+pause/resume and records the replacement clock layout and native checks. [EEVDF experiments](eevdf-experiment.md) records the optional policy,
 Linux reference comparison, corrected silent-audio routes and GPU-wait trials.
 
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
@@ -16,13 +17,15 @@ default change has been made.
 
 ## Clocksource versus interrupt delivery
 
-Brook enables KVM's `MSR_KVM_SYSTEM_TIME_NEW` (`0x4b564d01`) on the BSP and
-registers one pvclock page. `KvmClockReadNs` converts TSC through that page;
+Brook now enables KVM's `MSR_KVM_SYSTEM_TIME_NEW` (`0x4b564d01`) separately
+on each CPU, using 64-byte slots in one pinned, sanitized page. Kernel readers
+select the current CPU's record; the vDSO uses `RDTSCP` and Brook's CPU index
+in `IA32_TSC_AUX`, validates migration and the snapshot version, and falls back
+to a syscall if the public format or CPU feature is unavailable.
 `KvmClockReadStableNs` additionally checks the advertised stable-clock feature,
-per-snapshot stable flag, arithmetic and ordered TSC sampling within the version
-check. The vDSO uses the latter algorithm for MONOTONIC only. Other IDs fall
-back to syscalls. Shared BSP-page reads on other CPUs require explicit stable
-TSC/migration coverage; per-vCPU registration is not currently implemented.
+per-snapshot stable flag and arithmetic. The vDSO fast path remains MONOTONIC
+only. The earlier BSP-only implementation was unsafe across VM pause/resume;
+see the [repair and evidence](pvclock-percpu.md).
 
 The KVM clocksource is not an interrupt timer. Per-CPU periodic LAPIC timers
 still generate vector 32. Brook calibrates their reload count against PIT

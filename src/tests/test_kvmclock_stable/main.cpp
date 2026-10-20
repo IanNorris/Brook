@@ -10,7 +10,12 @@
 #include "../../kernel/src/rtc.cpp"
 
 namespace {
-brook::PvClockVcpuTimeInfo page{};
+BrookPvclockSlot clockPages[BROOK_PVCLOCK_CPUS]{};
+auto& page=clockPages[0].clock;
+uint32_t currentCpu=0,registeredCpu=0;
+uint64_t registeredAddress=0;
+bool rdtscpSupported=true,registeredAux=false;
+unsigned registrations=0;
 uint64_t sampledTsc=1600;
 unsigned samples=0;
 void (*duringSample)()=nullptr;
@@ -18,13 +23,24 @@ int failures=0;
 uint8_t cmosSeconds=17;
 #define CHECK(x) do { if(!(x)) {std::fprintf(stderr,"PVCLOCK FAIL line %d: %s\n",__LINE__,#x);++failures;} } while(0)
 void initialize() {
-    page={};page.version=2;page.tsc_timestamp=1000;page.system_time=2000;
+    for (unsigned cpu=0;cpu<BROOK_PVCLOCK_CPUS;++cpu) {clockPages[cpu]={};brook::g_clockReady[cpu]=false;}
+    page.version=2;page.tsc_timestamp=1000;page.system_time=2000;
     page.tsc_to_system_mul=0x80000000;page.tsc_shift=1;page.flags=1;
-    brook::g_pvti=&page;brook::g_enabled=brook::g_stableFeature=true;
+    brook::g_pvti=clockPages;brook::g_enabled=brook::g_stableFeature=true;
+    brook::g_clockReady[0]=true;brook::g_clockPage=brook::PhysicalAddress(0x100000);
+    auto* metadata=brook::ClockMetadata();metadata->magic=BROOK_PVCLOCK_MAGIC;
+    metadata->version=BROOK_PVCLOCK_VERSION;metadata->stride=BROOK_PVCLOCK_STRIDE;
+    metadata->cpus=BROOK_PVCLOCK_CPUS;metadata->features=BROOK_PVCLOCK_RDTSCP;
+    currentCpu=0;registrations=0;rdtscpSupported=true;
     sampledTsc=1600;samples=0;duringSample=nullptr;
 }
 }
 namespace brook {
+uint32_t KvmClockTestCpu() {return currentCpu;}
+bool KvmClockTestRdtscpSupported() {return rdtscpSupported;}
+void KvmClockTestRegister(uint32_t cpu,uint64_t address,bool aux) {
+    ++registrations;registeredCpu=cpu;registeredAddress=address;registeredAux=aux;
+}
 volatile uint64_t g_lapicTickCount = 0;
 volatile uint64_t g_lapicRawTickCount = 0;
 uint8_t RtcTestCmosRead(uint8_t reg) {
@@ -140,6 +156,38 @@ int main() {
     initialize();sampledTsc=~uint64_t(0);page.tsc_timestamp=0;CHECK(!KvmClockReadStableNs(&result));
     initialize();page.system_time=~uint64_t(0)-100;CHECK(!KvmClockReadStableNs(&result));
     CHECK(!KvmClockReadStableNs(nullptr));
+    initialize();currentCpu=1;
+    CHECK(!KvmClockReadStableNs(&result)); // An unregistered AP cannot borrow CPU0.
+    CHECK(KvmClockInitOnCpu(1));
+    CHECK(registrations==1 && registeredCpu==1 && registeredAddress==0x100040 && registeredAux);
+    CHECK(KvmClockRegisteredCpuMask()==3);
+    CHECK(KvmClockInitOnCpu(1) && registrations==1); // Never reset a live record.
+    CHECK(!KvmClockInitOnCpu(0) && !KvmClockInitOnCpu(64));
+    clockPages[1].clock=page;clockPages[1].clock.system_time=9000;
+    CHECK(KvmClockReadStableNs(&result) && result==9600);
+    currentCpu=64;CHECK(!KvmClockReadStableNs(&result) && result==9600);
+
+    initialize();clockPages[1].clock=page;g_clockReady[1]=true;
+    clockPages[1].clock.system_time=4000;
+    duringSample=[] {if(samples==1)currentCpu=1;};
+    CHECK(KvmClockReadStableNs(&result) && samples==2 && result==4600);
+    initialize();clockPages[1].clock=page;g_clockReady[1]=true;
+    duringSample=[] {currentCpu^=1;};
+    CHECK(!KvmClockReadStableNs(&result) && samples==32);
+
+    // Resume AP1 before BSP0: the still-stale BSP record extrapolates across
+    // the host pause. AP1's own record was updated before its VM entry.
+    initialize();sampledTsc=3000000;currentCpu=1;
+    clockPages[1].clock=page;clockPages[1].clock.tsc_timestamp=2999000;
+    g_clockReady[1]=true;
+    CHECK(KvmClockReadStableNs(&result) && result==3000);
+    page.tsc_timestamp=2999000; // BSP0 finally resumes and catches up.
+    CHECK(KvmClockReadStableNs(&result) && result==3000);
+    CHECK(KvmClockReadNs()==3000); // Legacy consumers also use the current CPU.
+
+    initialize();currentCpu=1;rdtscpSupported=false;
+    CHECK(KvmClockInitOnCpu(1) && !registeredAux);
+    CHECK(!(ClockMetadata()->features&BROOK_PVCLOCK_RDTSCP));
     // A recalibration step must not turn a fresh five-second I/O budget into
     // an immediate timeout. The previous unsigned-only check fails this case.
     CHECK(!ClockIntervalElapsed(9999,10000,5000));
@@ -170,7 +218,7 @@ int main() {
     // Exercise the real RTC driver with CMOS and elapsed-source fixtures.
     // Its epoch and fractional second must advance together even when the
     // unrelated pvclock phase crosses a second boundary.
-    initialize();page.tsc_to_system_mul=0;page.system_time=9750000000ULL;
+    initialize();sampledTsc=page.tsc_timestamp;page.system_time=9750000000ULL;
     g_lapicTickCount=300;g_lapicRawTickCount=713;
     RtcInit();const uint64_t epoch=g_wallEpochNs;
     CHECK(RtcNowNs()==epoch);

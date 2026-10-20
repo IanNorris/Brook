@@ -73,13 +73,39 @@ int main() {
     CHECK(discontinuities.Sample(0,at(11000,500))==1000);
     CHECK(discontinuities.Sample(0,at(10999,500))==0);
     CHECK(discontinuities.Diagnostics().backwardsWall==1);
+    CHECK(discontinuities.Diagnostics().maxWallRewindNs==1);
+    CHECK(discontinuities.Diagnostics().backwardsCpuMask==1);
+    CHECK(discontinuities.Diagnostics().lastBackwardsCpu==0);
+    CHECK(discontinuities.Diagnostics().lastBackwardsPid==2);
+    CHECK(discontinuities.Diagnostics().lastPreviousWallNs==11000);
+    CHECK(discontinuities.Diagnostics().lastWallNs==10999);
     CHECK(discontinuities.Sample(0,at(12000,500))==0); // reestablish baseline
     CHECK(discontinuities.Sample(0,at(13000,499))==0);
     CHECK(discontinuities.Diagnostics().backwardsSteal==1);
+    CHECK(discontinuities.Diagnostics().maxStealRewindNs==1);
+    CHECK(discontinuities.Diagnostics().lastPreviousStealNs==500);
+    CHECK(discontinuities.Diagnostics().lastStealNs==499);
     CHECK(discontinuities.Sample(0,at(14000,15000))==0);
     CHECK(discontinuities.Diagnostics().invalidSamples==2);
     CHECK(discontinuities.Read(1,1,false,&value) && value==1100);
     CHECK(discontinuities.Read(2,2,false,&value) && value==1000);
+
+    RuntimeAccounting<4,2> rewindDetails;
+    CHECK(rewindDetails.Register(1,1,1,1));
+    rewindDetails.Dispatch(0,1,1,at(1000));
+    rewindDetails.Sample(0,at(900));
+    rewindDetails.Dispatch(1,1,1,at(100000));
+    rewindDetails.Sample(1,at(99998));
+    CHECK(rewindDetails.Diagnostics().maxWallRewindNs==100);
+    CHECK(rewindDetails.Diagnostics().backwardsCpuMask==3);
+    CHECK(rewindDetails.Diagnostics().lastBackwardsCpu==1);
+    CHECK(rewindDetails.Diagnostics().lastBackwardsPid==1);
+    CHECK(rewindDetails.Diagnostics().lastPreviousWallNs==100000);
+    CHECK(rewindDetails.Diagnostics().lastWallNs==99998);
+    CHECK(rewindDetails.Diagnostics().lastBackwardsSample==4);
+    rewindDetails.Sample(1,at(~uint64_t(0)));
+    rewindDetails.Sample(1,at(0));
+    CHECK(rewindDetails.Diagnostics().maxWallRewindNs==~uint64_t(0));
 
     RuntimeAccounting<4,1> rebound;
     CHECK(rebound.Register(1,11,1,11));CHECK(rebound.Register(2,12,1,11));

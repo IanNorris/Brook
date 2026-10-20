@@ -24,6 +24,11 @@ struct RuntimeDiagnostics {
     uint64_t samples = 0, chargedNs = 0, idleNs = 0, invalidSamples = 0;
     uint64_t backwardsWall = 0, backwardsSteal = 0, clampedService = 0;
     uint64_t staleIdentity = 0, saturated = 0, observedStealNs = 0;
+    uint64_t maxWallRewindNs = 0, maxStealRewindNs = 0, backwardsCpuMask = 0;
+    uint64_t lastBackwardsSample = 0, lastPreviousWallNs = 0, lastWallNs = 0;
+    uint64_t lastPreviousStealNs = 0, lastStealNs = 0;
+    uint32_t lastBackwardsCpu = 0;
+    uint16_t lastBackwardsPid = 0;
 };
 
 // Caller serializes all access. Includes kernel/IRQ work while a task owns the
@@ -72,8 +77,24 @@ public:
             state.serviceFloor = service; state.baseline = true; return 0;
         }
         if (sample.wallNs < state.wall || sample.stealNs < state.steal) {
-            if (sample.wallNs < state.wall) ++diagnostics_.backwardsWall;
-            if (sample.stealNs < state.steal) ++diagnostics_.backwardsSteal;
+            if (sample.wallNs < state.wall) {
+                ++diagnostics_.backwardsWall;
+                const uint64_t rewind = state.wall - sample.wallNs;
+                if (rewind > diagnostics_.maxWallRewindNs) diagnostics_.maxWallRewindNs = rewind;
+            }
+            if (sample.stealNs < state.steal) {
+                ++diagnostics_.backwardsSteal;
+                const uint64_t rewind = state.steal - sample.stealNs;
+                if (rewind > diagnostics_.maxStealRewindNs) diagnostics_.maxStealRewindNs = rewind;
+            }
+            if (cpu < 64) diagnostics_.backwardsCpuMask |= uint64_t(1) << cpu;
+            diagnostics_.lastBackwardsCpu = cpu;
+            diagnostics_.lastBackwardsPid = state.pid;
+            diagnostics_.lastBackwardsSample = diagnostics_.samples;
+            diagnostics_.lastPreviousWallNs = state.wall;
+            diagnostics_.lastWallNs = sample.wallNs;
+            diagnostics_.lastPreviousStealNs = state.steal;
+            diagnostics_.lastStealNs = sample.stealNs;
             // Drop the unknown interval, including across the next dispatch.
             // Per-task cumulative clocks themselves never regress.
             state.baseline = false; return 0;

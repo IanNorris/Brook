@@ -4,8 +4,8 @@ Brook supplies a versioned x86-64 ELF through `AT_SYSINFO_EHDR` (33), allowing
 libc to resolve `__vdso_clock_gettime@LINUX_2.6`. Only `CLOCK_MONOTONIC` has a
 fast path. All other clock IDs and unavailable/unstable clock snapshots enter
 the existing syscall and retain its semantics, including its unsupported IDs.
-This does not fix the syscall's current treatment of every nonzero clock ID as
-monotonic time.
+Supported and unsupported IDs follow the kernel clock selector; the helper
+does not implement additional clock semantics.
 
 The helper uses KVM's stable-clock capability and per-snapshot stable flag,
 version validation, ordered TSC sampling and checked shift/add arithmetic.
@@ -28,6 +28,16 @@ it with KVM. Its initial reference is permanently pinned while the host may
 write to it. Code and the non-KVM zero-page fallback are also permanently
 pinned. Every managed user PTE gets its own reference; normal fork, unmap and
 address-space teardown account for those references.
+
+The public page now contains 64 cache-line slots, each holding KVM's 32-byte
+per-vCPU record. Slot zero's padding contains pointer-free format metadata
+(magic/version/stride/capacity/features); other padding remains zero. Every CPU
+registers its own slot before scheduler entry and publishes its CPU index in
+`IA32_TSC_AUX` when `RDTSCP` is supported. The helper validates the format before
+executing `RDTSCP`, selects that CPU's slot and retries if the CPU tag changes
+inside the versioned snapshot. Unsupported CPU features use the syscall path.
+Using one shared BSP record allowed stale extrapolation after VM resume; see
+[per-vCPU clock validation](pvclock-percpu.md).
 
 The two ranges are installed into an exclusively constructed unpublished
 address space after image, interpreter, stack and TLS reservations, with no
@@ -55,6 +65,10 @@ PLT, writable-data or runtime-library support is needed.
   eight fork/unmap/parent-survival
   cycles and exec discovery. This does not force every cross-CPU migration,
   inject allocation failures or prove frame counts return to baseline.
+- Pause/resume: `pvclock_resume.c` runs eight readers while the host deliberately
+  pauses/resumes the same private VM. It requires all eight CPU tags and checks
+  libc monotonic reads against surrounding forced syscalls. Preserve the same
+  tracked job; always resume after each injected pause, including host errors.
 - Performance: `clock_threads.c THREADS ITERATIONS LEAD libc|syscall` reserves
   512 unrelated VMAs and separates its timed interval from setup/teardown.
   Paired isolated guest measurements are clock-path results, not browser gains.

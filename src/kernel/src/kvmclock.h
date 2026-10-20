@@ -9,6 +9,10 @@ namespace brook {
 // Call once, after ApicInit.  Returns true if pvclock is available and
 // now live.  No-op on non-KVM hypervisors or bare metal.
 bool KvmClockInit();
+// On each AP, after its GS CPU identity is installed and before timer/scheduler
+// entry. A vCPU must use its own host-updated record, including after VM resume.
+bool KvmClockInitOnCpu(uint32_t cpu);
+uint64_t KvmClockRegisteredCpuMask();
 
 // True if pvclock was successfully registered.
 bool KvmClockAvailable();
@@ -28,9 +32,8 @@ PhysicalAddress KvmClockPublicPage();
 // Read monotonic nanoseconds since VM start.  Returns 0 if pvclock is
 // not available (callers must fall back to the LAPIC-tick clock).
 //
-// Safe to call from any CPU — Brook only reads the BSP's pvti struct after
-// KvmClockInit; KVM updates it asynchronously. Hosts with synchronized TSCs (the
-// PVCLOCK_TSC_STABLE_BIT flag) produce consistent results across CPUs.
+// Reads the current CPU's record, retrying on migration or a concurrent update.
+// Never substitute a stale BSP record for an unregistered AP.
 uint64_t KvmClockReadNs();
 
 // Bounded coherent read for consumers that require cross-CPU elapsed-time

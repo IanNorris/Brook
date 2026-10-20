@@ -63,7 +63,7 @@ add_custom_command(
             "${CMAKE_CURRENT_SOURCE_DIR}/vdso/clock.c" -o "${VDSO_ELF}"
     COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/bake_vdso.py"
             "${VDSO_ELF}" --cpp "${VDSO_CPP}"
-    DEPENDS vdso/clock.c vdso/layout.ld vdso/versions.map
+    DEPENDS vdso/clock.c vdso/layout.ld vdso/versions.map "${BROOK_ROOT}/src/shared/pvclock_page.h"
             "${BROOK_ROOT}/scripts/bake_vdso.py"
     COMMENT "Building and validating Linux clock vDSO"
     VERBATIM

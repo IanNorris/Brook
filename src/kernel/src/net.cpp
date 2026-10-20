@@ -26,6 +26,7 @@
 #include "smp.h"
 #include "rtc.h"
 #include "apic.h"
+#include "kvmclock.h"
 #include "vfs.h"
 #include "input.h"
 #include "mouse.h"
@@ -3818,6 +3819,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text("{\"source\":\""); reply.text(clock.pvclock ? "pvclock" : "lapic-irqs");
         reply.text("\","); reply.field("elapsed_ms", clock.elapsedMs);
         reply.text(","); reply.field("raw_bsp_irqs", clock.rawBspIrqs);
+        reply.text(","); reply.field("pvclock_cpu_mask",KvmClockRegisteredCpuMask());
         reply.text(","); reply.field("origin_ns", clock.originNs);
         reply.text(","); reply.field("origin_ms", clock.originMs);
         reply.text(","); reply.field("rejected_samples", clock.rejectedSamples);
@@ -3879,6 +3881,16 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.field("invalid_samples",d.invalidSamples); reply.text(",");
         reply.field("backwards_wall",d.backwardsWall); reply.text(",");
         reply.field("backwards_steal",d.backwardsSteal); reply.text(",");
+        reply.field("max_wall_rewind_ns",d.maxWallRewindNs); reply.text(",");
+        reply.field("max_steal_rewind_ns",d.maxStealRewindNs); reply.text(",");
+        reply.field("backwards_cpu_mask",d.backwardsCpuMask); reply.text(",");
+        reply.field("last_backwards_cpu",d.lastBackwardsCpu); reply.text(",");
+        reply.field("last_backwards_pid",d.lastBackwardsPid); reply.text(",");
+        reply.field("last_backwards_sample",d.lastBackwardsSample); reply.text(",");
+        reply.field("last_previous_wall_ns",d.lastPreviousWallNs); reply.text(",");
+        reply.field("last_wall_ns",d.lastWallNs); reply.text(",");
+        reply.field("last_previous_steal_ns",d.lastPreviousStealNs); reply.text(",");
+        reply.field("last_steal_ns",d.lastStealNs); reply.text(",");
         reply.field("clamped_service",d.clampedService); reply.text(",");
         reply.field("stale_identity",d.staleIdentity); reply.text(",");
         reply.field("saturated",d.saturated); reply.text("}\n"); reply.send();

@@ -222,6 +222,8 @@ void ApEntryFunction()
     // Set up SYSCALL MSRs.
     CpuInitSyscallMsrs(reinterpret_cast<uint64_t>(&BrookSyscallDispatcher));
 
+    if (KvmClockAvailable() && !KvmClockInitOnCpu(myCpuIndex))
+        KernelPanic("SMP: pvclock registration failed before scheduler entry");
     KvmStealInit(myCpuIndex);
 
     // Start LAPIC timer on this AP.
