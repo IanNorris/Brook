@@ -1,5 +1,42 @@
 # Timing and scheduler audit — 20 October 2026
 
+## Current evidence and open work
+
+The chronological entries below retain their original experimental scope.
+Later evidence supersedes several early leads:
+
+- [Per-CPU pvclock](pvclock-percpu.md) repairs pause/resume backwards samples;
+  elapsed KVM time remains distinct from periodic LAPIC interrupt delivery.
+- [HDA near-empty publication repair](hda-near-empty-write-lead.md) fixes the
+  publication lead found after the initial diagnostics. Callback HDA avoids
+  the independently demonstrated timer-mode source discards; neither repair
+  proves that the historical roughly 1.3× browser/game acceleration is resolved.
+- [BSP timer/wakeup measurements](bsp-timer-wakeup-timing.md) separate late
+  interrupt entry from wake-scan execution. Independent AP arrivals demonstrate
+  opportunities during some long BSP gaps. Host traces support QEMU device/BQL
+  blocking as a contributor, without identifying the lock owner or explaining
+  every long gap.
+- [Optional wake-scan handoff](wake-scan-handoff.md) reduces deadline-to-ready
+  lateness. It remains opt-in: repeat EEVDF browser results regress even though
+  wake availability improves.
+- [Targeted queue activity](targeted-queue-activity.md) shows that some long
+  audio ready waits coexist with user execution and other task dispatches.
+  Counters are observations, not CPU service or proof of policy eligibility.
+- [MLFQ wakeup preemption](mlfq-wakeup-preemption.md) preserves service budgets
+  across early interruptions. Four matched native boots under shared scanning
+  improve periodic latency and browser presentation at a CPU-throughput cost;
+  audio continuity and default-BSP acceptance remain unproven.
+- [Priority query encoding](scheduler-priority-abi.md) now returns Linux's raw
+  encoding for default nice zero. Actual per-task nice/RT control remains absent.
+
+RR remains the default, with no further RR tuning planned. MLFQ and EEVDF are
+optional. Remaining acceptance includes default-path and broader desktop/game
+workloads, direct EEVDF eligibility/debt evidence, timing-path retry/signal/load
+coverage, and a controlled reproduction of the historical accelerated playback.
+Passing one workload or handler-template audit does not close those items.
+
+## Earlier investigation and source map
+
 Later workload follow-up: [TCP receive-copy deadlock](tcp-receive-copy.md)
 records a confirmed socket-lock/page-fault dependency, native CoW/EFAULT checks,
 the Quake II timing smoke run, and seven backward nanosecond samples. The subsequent
