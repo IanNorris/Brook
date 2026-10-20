@@ -9,9 +9,16 @@ add_driver_module(ps2_kbd
     "${BROOK_ROOT}/src/drivers/ps2_kbd/kbd_mod.cpp"
 )
 
+add_driver_module(sched_eevdf
+    "${BROOK_ROOT}/src/drivers/sched_eevdf/sched_eevdf_mod.cpp"
+    "${BROOK_ROOT}/src/modules/sched_eevdf.cpp"
+    EXTRA_FLAGS "-O2" "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
+)
+
 add_driver_module(sched_mlfq
     "${BROOK_ROOT}/src/drivers/sched_mlfq/sched_mlfq_mod.cpp"
     "${BROOK_ROOT}/src/modules/sched_mlfq.cpp"
+    EXTRA_FLAGS "-O2" "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
 )
 
 add_driver_module(bochs_display

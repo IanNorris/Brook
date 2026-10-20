@@ -1,7 +1,9 @@
 # Scheduler policy direction after the timing audit
 
-This is a proposal, not an implemented policy or a recommendation to change the
-default. RR remains the default. Current results and safety limits are in
+An optional EEVDF implementation now exists and has passed its first native
+pilot. RR remains the default. The implemented contract, ABI/staging procedure,
+model scope and outstanding acceptance are in [eevdf-experiment.md](eevdf-experiment.md).
+The broader timing evidence and limits remain in
 [timing-scheduler-audit.md](timing-scheduler-audit.md).
 
 ## What the measurements justify
@@ -60,29 +62,24 @@ speedup or kernel stalls.
    reboot. Targeted host races and native active/inactive unload refusal are
    recorded in the audit. New EEVDF callbacks must join the retained dependency
    list when its policy ABI is extended.
-4. Wire the measured runtime ledger into an explicit policy ABI callback.
-   The existing ledger accounts each running interval once, survives policy
-   switches, retains exited siblings in the live group's total, detects PID
-   reuse and rebinding on Brook nonleader exec, and subtracts available KVM
-   steal. Every flush matters, including CPU-clock queries before a later
-   block/preemption: do not silently omit that already-committed partial service
-   from the policy. Define transition baselines for running tasks. CPU accounting
-   includes kernel/IRQ work; source failures discard an unknown interval rather
-   than charging it to the next task. Fallback/unsupported-steal modes must stay
-   explicit. Separate user/system accounting and legacy CPU statistics remain
-   future work.
-5. Add an explicit policy preemption decision. Ordering `PickNext` alone cannot
-   preempt a low-priority 40-ms MLFQ slice promptly when a sleeper wakes. At a
-   safe user-mode timer boundary, evaluate the decision and pick under the
-   ready lock. Preserve kernel non-preemptibility until its locking contract is
-   separately changed. An IPI can request reevaluation; it cannot justify an
-   unsafe switch from arbitrary kernel code.
+4. Scheduler ABI 2 now forwards measured service through `AccountService`,
+   including CPU-clock-query flushes and partial block/preemption intervals.
+   It changes ledger ownership after forwarding, so no second sample can
+   silently consume policy service. Running/queued state is separate through
+   `SetRunnable`; the global eligibility model includes on-CPU entities.
+   Post-switch retirement service for an excluded terminated entity is observed
+   separately without resurrecting it. CPU accounting still includes kernel/IRQ
+   ownership time; finer user/system accounting and legacy statistics remain.
+5. The ABI's `ShouldPreempt` runs with the ready lock held at a safe user-mode
+   tick. RR/MLFQ preserve wall-slice behavior; EEVDF compares eligible deadlines
+   and retains partial requests. Selection never authorizes a switch from
+   arbitrary kernel code. Kernel preemptibility and prompt remote IPIs remain
+   separate mechanisms, not implied by the new policy.
 
-Changing `SchedOps` requires an explicit ABI/version transition and rebuilding
-all affected modules. Registration must validate the required callbacks. The
-16-KiB state bound now has compile-time and host checks; a larger EEVDF table
-must get an explicit boot-time allocation/capacity design, never a per-tick
-allocation or another unchecked fixed-size assumption.
+The SchedOps change uses explicit module ABI 34/policy ABI 2 and a complete
+module rebuild. Registration validates version, size and required callbacks. The
+policy state bound is now an explicit 64 KiB, checked by the kernel, modules
+and host fixtures; the optional EEVDF state fits without per-tick allocation.
 
 ## Proposed first EEVDF contract
 

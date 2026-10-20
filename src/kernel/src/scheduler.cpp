@@ -215,6 +215,7 @@ static ReadyLatencyTracker<SCHED_MAX_PIDS> g_readyLatency;
 // policy switches. All ledger mutation/read is under g_readyLock.
 static RuntimeAccounting<SCHED_MAX_PIDS, SCHED_MAX_CPUS> g_runtime;
 static bool g_runtimeStableClock = false;
+static uint64_t g_policyLedgerBaseNs = 0;
 
 static RuntimeSample RuntimeNow(uint32_t cpu)
 {
@@ -224,17 +225,28 @@ static RuntimeSample RuntimeNow(uint32_t cpu)
         return true;
     }, [cpu](uint64_t* steal) { return KvmStealReadNs(cpu, steal); });
 }
+static void RuntimeChargeLocked(uint32_t cpu, RuntimeSample sample)
+{
+    const uint64_t service = g_runtime.Sample(cpu, sample);
+    Process* current = g_perCpu[cpu].currentProcess;
+    if (service && current && current != g_perCpu[cpu].idleProcess && g_schedOps)
+        g_schedOps->AccountService(g_schedState, current->pid, service);
+}
 static void RuntimeDispatchLocked(uint32_t cpu, const Process* next)
 {
-    g_runtime.Dispatch(cpu, next == g_perCpu[cpu].idleProcess ? 0 : next->pid,
-                       next->incarnation, RuntimeNow(cpu));
+    const RuntimeSample sample = RuntimeNow(cpu);
+    RuntimeChargeLocked(cpu, sample);
+    g_runtime.SetOwner(cpu, next == g_perCpu[cpu].idleProcess ? 0 : next->pid,
+                       next->incarnation);
+    if (next != g_perCpu[cpu].idleProcess)
+        g_schedOps->SetRunnable(g_schedState, next->pid, true);
 }
 
 bool SchedulerCpuTime(Process* proc, bool group, uint64_t* result)
 {
     if (!proc || !result) return false;
     const uint64_t flags = SchedLockAcquire(g_readyLock);
-    g_runtime.Sample(ThisCpu(), RuntimeNow(ThisCpu()));
+    RuntimeChargeLocked(ThisCpu(), RuntimeNow(ThisCpu()));
     const uint16_t pid = group ? (proc->tgid ? proc->tgid : proc->pid) : proc->pid;
     const uint64_t incarnation = group && proc->isThread ? proc->leaderIncarnation : proc->incarnation;
     const bool found = g_runtime.Read(pid, incarnation, group, result);
@@ -247,7 +259,7 @@ void SchedulerCpuTimeRebind(Process* proc)
     if (!proc) return;
     const uint64_t flags = SchedLockAcquire(g_readyLock);
     const uint32_t cpu = ThisCpu();
-    g_runtime.Sample(cpu, RuntimeNow(cpu));
+    RuntimeChargeLocked(cpu, RuntimeNow(cpu));
     g_runtime.Rebind(proc->pid, proc->incarnation, proc->tgid ? proc->tgid : proc->pid,
                      proc->isThread ? proc->leaderIncarnation : proc->incarnation);
     SchedLockRelease(g_readyLock, flags);
@@ -257,7 +269,7 @@ void SchedulerRuntimeStatus(RuntimeStatus* output)
 {
     if (!output) return;
     const uint64_t flags = SchedLockAcquire(g_readyLock);
-    g_runtime.Sample(ThisCpu(), RuntimeNow(ThisCpu()));
+    RuntimeChargeLocked(ThisCpu(), RuntimeNow(ThisCpu()));
     output->diagnostics = g_runtime.Diagnostics();
     output->stableClock = g_runtimeStableClock;
     output->storageBytes = sizeof(g_runtime);
@@ -267,6 +279,22 @@ void SchedulerRuntimeStatus(RuntimeStatus* output)
     SchedLockRelease(g_readyLock, flags);
 }
 
+
+void SchedulerPolicyServiceStatus(PolicyServiceStatus* output)
+{
+    if (!output) return;
+    const uint64_t flags = SchedLockAcquire(g_readyLock);
+    RuntimeChargeLocked(ThisCpu(), RuntimeNow(ThisCpu()));
+    *output = {};
+    if (g_schedOps) {
+        output->name = g_schedOps->name;output->stateBytes = g_schedOps->stateSize;
+        output->ledgerSinceSelectionNs = g_runtime.Diagnostics().chargedNs - g_policyLedgerBaseNs;
+        output->debug.readyCount = g_schedOps->ReadyCount(g_schedState);
+        output->hasQueueDebug = g_schedOps->DebugDump != nullptr;
+        if (g_schedOps->DebugDump) g_schedOps->DebugDump(g_schedState, 0, &output->debug);
+    }
+    SchedLockRelease(g_readyLock, flags);
+}
 
 // All non-idle enqueue/dispatch calls below already hold g_readyLock. A missing
 // stable clock is reported, never replaced with delivered timer-tick time.
@@ -620,7 +648,10 @@ static void ReadyQueueRemoveLocked(Process* proc)
 {
     if (proc->pid == 0) return; // idle never in policy queue
     SchedTrace(proc, STR_REMOVE);
+    const uint32_t cpu = ThisCpu();
+    if (g_perCpu[cpu].currentProcess == proc) RuntimeChargeLocked(cpu, RuntimeNow(cpu));
     g_schedOps->Remove(g_schedState, proc->pid);
+    g_schedOps->SetRunnable(g_schedState, proc->pid, false);
     g_readyLatency.Remove(proc->pid, proc->incarnation);
 }
 
@@ -701,6 +732,7 @@ static Process* PickNextLocked(uint32_t cpu)
                                  "(corrupt mapping); scrubbing\n", (unsigned)pid, (void*)proc);
                 }
                 g_pidToProcess[pid] = nullptr;  // scrub the poisoned slot
+                g_schedOps->SetRunnable(g_schedState, pid, false);
                 continue;
             }
         }
@@ -710,8 +742,10 @@ static Process* PickNextLocked(uint32_t cpu)
         // or reference a freed/empty slot.  Scheduling such an entry was a
         // path into the use-after-free; skip it so only genuinely Ready
         // processes are ever returned.
-        if (!proc || proc->state != ProcessState::Ready)
+        if (!proc || proc->state != ProcessState::Ready) {
+            g_schedOps->SetRunnable(g_schedState, pid, false);
             continue;
+        }
         // BRO-176 lost-enqueue root fix: never hand DoSwitch a process that is
         // still marked running on another CPU. RrPickNext already removed this
         // pid from the queue, and PickNext only gates on state==Ready — but a
@@ -920,7 +954,8 @@ void SchedulerInit()
     // The statically-linked default (sched_rr) is always available.
     // Dynamic modules can register additional policies at runtime.
     g_schedOps = GetSchedOps();
-    SchedulerRegisterPolicy(g_schedOps);  // register built-in as first policy
+    if (!SchedulerRegisterPolicy(g_schedOps))
+        KernelPanic("SCHED: built-in policy registration failed");
     if (g_schedOps->stateSize > sizeof(g_schedStateStorage))
     {
         SerialPrintf("SCHED FATAL: policy state %lu > storage %lu\n",
@@ -2011,7 +2046,7 @@ void SchedulerTimerTick(bool allowPreempt)
     {
         const uint64_t runtimeFlags = SchedLockAcquire(g_readyLock);
         const uint32_t runtimeCpu = ThisCpu();
-        g_runtime.Sample(runtimeCpu, RuntimeNow(runtimeCpu));
+        RuntimeChargeLocked(runtimeCpu, RuntimeNow(runtimeCpu));
         SchedLockRelease(g_readyLock, runtimeFlags);
     }
 
@@ -2277,8 +2312,8 @@ void SchedulerTimerTick(bool allowPreempt)
     // policy replacement and queue mutation. Module state is not internally
     // synchronized; even a read can race an MLFQ boost or full state reset.
     uint64_t rlf8 = SchedLockAcquire(g_readyLock);
-    uint64_t timeslice = g_schedOps->Timeslice(g_schedState, cur->pid);
-    if (ApicTickCount() - g_perCpu[cpu].sliceStartTick < timeslice)
+    if (!g_schedOps->ShouldPreempt(g_schedState, cur->pid,
+                                  ApicTickCount() - g_perCpu[cpu].sliceStartTick))
     {
         SchedLockRelease(g_readyLock, rlf8);
         return;
@@ -3607,7 +3642,7 @@ bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap, uint64_t inca
     return false;
 }
 
-void SchedulerRegisterPolicy(const SchedOps* ops)
+bool SchedulerRegisterPolicy(const SchedOps* ops)
 {
     // Pin the table before dereferencing it, then its name and callback owners
     // before publishing any pointer. Pins are permanent: inactive policies are
@@ -3616,12 +3651,12 @@ void SchedulerRegisterPolicy(const SchedOps* ops)
     const uintptr_t table = reinterpret_cast<uintptr_t>(ops);
     if (!ModuleRetainAddresses(&table, 1)) {
         SerialPuts("SCHED: register — provider not resident or unloading\n");
-        return;
+        return false;
     }
     if (!SchedOpsUsable(ops))
     {
         SerialPuts("SCHED: register — incomplete or oversized policy\n");
-        return;
+        return false;
     }
     const uintptr_t dependencies[] = {
         reinterpret_cast<uintptr_t>(ops->name),
@@ -3630,12 +3665,15 @@ void SchedulerRegisterPolicy(const SchedOps* ops)
         reinterpret_cast<uintptr_t>(ops->Remove), reinterpret_cast<uintptr_t>(ops->TimesliceExpired),
         reinterpret_cast<uintptr_t>(ops->VoluntaryYield), reinterpret_cast<uintptr_t>(ops->Tick),
         reinterpret_cast<uintptr_t>(ops->Timeslice), reinterpret_cast<uintptr_t>(ops->ReadyCount),
+        reinterpret_cast<uintptr_t>(ops->AccountService),
+        reinterpret_cast<uintptr_t>(ops->SetRunnable),
+        reinterpret_cast<uintptr_t>(ops->ShouldPreempt),
         reinterpret_cast<uintptr_t>(ops->DebugDump ? ops->DebugDump : nullptr),
     };
     const uint32_t count = sizeof(dependencies) / sizeof(dependencies[0]) - (ops->DebugDump ? 0 : 1);
     if (!ModuleRetainAddresses(dependencies, count)) {
         SerialPuts("SCHED: register — callback provider not resident or unloading\n");
-        return;
+        return false;
     }
     const uint64_t flags = SchedLockAcquire(g_readyLock);
     // Check for duplicate
@@ -3643,7 +3681,7 @@ void SchedulerRegisterPolicy(const SchedOps* ops)
     {
         if (g_registeredPolicies[i] == ops) {
             SchedLockRelease(g_readyLock, flags);
-            return; // already registered
+            return true; // already registered
         }
         // Compare names
         const char* a = g_registeredPolicies[i]->name;
@@ -3659,19 +3697,20 @@ void SchedulerRegisterPolicy(const SchedOps* ops)
             // lifetime. Registration is idempotent only for the same pointer.
             SerialPrintf("SCHED: policy name '%s' already registered\n", ops->name);
             SchedLockRelease(g_readyLock, flags);
-            return;
+            return false;
         }
     }
     if (g_registeredPolicyCount >= MAX_SCHED_POLICIES)
     {
         SerialPrintf("SCHED: policy registry full, cannot register '%s'\n", ops->name);
         SchedLockRelease(g_readyLock, flags);
-        return;
+        return false;
     }
     g_registeredPolicies[g_registeredPolicyCount++] = ops;
     SerialPrintf("SCHED: registered policy '%s' (state=%lu bytes)\n",
                  ops->name, ops->stateSize);
     SchedLockRelease(g_readyLock, flags);
+    return true;
 }
 
 static bool StrEq(const char* a, const char* b)
@@ -3716,12 +3755,18 @@ bool SchedulerSwitchPolicy(const char* name)
     const SchedOps* oldOps = g_schedOps;
     SerialPrintf("SCHED: switching '%s' → '%s'\n", oldOps->name, newOps->name);
 
+    // Charge the caller's final old-policy interval. Other CPUs begin the new
+    // policy at their next local accounting boundary; hot-switch tests establish
+    // safety, not a simultaneous cross-CPU fairness epoch. Performance cohorts
+    // use fresh boots and settle before their measured workload starts.
+    RuntimeChargeLocked(ThisCpu(), RuntimeNow(ThisCpu()));
     // Initialize new policy state
     __builtin_memset(g_schedStateStorage, 0, sizeof(g_schedStateStorage));
     g_schedOps = newOps;
     // Do not mix episodes spanning different policies in one report.
     g_readyLatency.Reset();
     newOps->Init(g_schedState);
+    g_policyLedgerBaseNs = g_runtime.Diagnostics().chargedNs;
 
     // Re-register all active processes and enqueue ready ones
     uint64_t allFlags = SchedLockAcquire(g_allProcLock);
@@ -3732,7 +3777,8 @@ bool SchedulerSwitchPolicy(const char* name)
         if (SchedRestoreProcess(newOps, g_schedState, p->pid, p->schedPriority,
                                 p->state == ProcessState::Terminated,
                                 p->state == ProcessState::Ready,
-                                __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE)))
+                                __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE),
+                                p->state == ProcessState::Running))
             RecordReadyEnqueue(p);
     }
     SchedLockRelease(g_allProcLock, allFlags);

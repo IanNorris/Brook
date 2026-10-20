@@ -97,6 +97,12 @@ public:
     void Dispatch(unsigned cpu, uint16_t pid, uint64_t incarnation, RuntimeSample sample) {
         if (cpu >= Cpus) return;
         Sample(cpu, sample);
+        SetOwner(cpu, pid, incarnation);
+    }
+    // Kernel integration flushes through the policy callback first, then changes
+    // only the ledger owner. Dispatch above remains the combined model API.
+    void SetOwner(unsigned cpu, uint16_t pid, uint64_t incarnation) {
+        if (cpu >= Cpus) return;
         cpus_[cpu].pid = pid; cpus_[cpu].incarnation = incarnation;
     }
     bool Read(uint16_t pid, uint64_t incarnation, bool group, uint64_t* output) const {

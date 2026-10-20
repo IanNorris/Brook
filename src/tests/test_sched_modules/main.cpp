@@ -730,6 +730,9 @@ TEST(policy_registration_contract) {
     REJECT_MISSING(Enqueue); REJECT_MISSING(PickNext); REJECT_MISSING(Remove);
     REJECT_MISSING(TimesliceExpired); REJECT_MISSING(VoluntaryYield);
     REJECT_MISSING(Tick); REJECT_MISSING(Timeslice); REJECT_MISSING(ReadyCount);
+    REJECT_MISSING(AccountService); REJECT_MISSING(SetRunnable); REJECT_MISSING(ShouldPreempt);
+    copy=*ops;copy.abiVersion=0;ASSERT(!SchedOpsUsable(&copy));
+    copy=*ops;copy.opsSize=0;ASSERT(!SchedOpsUsable(&copy));
 #undef REJECT_MISSING
 }
 

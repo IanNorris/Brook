@@ -167,9 +167,16 @@ static void RrDebugDump(void* state, uint16_t pid, SchedDebugInfo* out) {
     out->listLen = len;
 }
 
+static void RrAccountService(void*, uint16_t, uint64_t) {}
+static void RrSetRunnable(void*, uint16_t, bool) {}
+static bool RrShouldPreempt(void* state, uint16_t pid, uint64_t elapsedMs) {
+    return elapsedMs >= RrTimeslice(state, pid);
+}
+
 static const SchedOps g_rrOps = {
     "rr",
     sizeof(RrState),
+    SCHED_POLICY_ABI_VERSION, sizeof(SchedOps),
     RrInit,
     RrInitProcess,
     RrEnqueue,
@@ -181,6 +188,7 @@ static const SchedOps g_rrOps = {
     RrTimeslice,
     RrReadyCount,
     RrDebugDump,
+    RrAccountService, RrSetRunnable, RrShouldPreempt,
 };
 
 } // anonymous namespace

@@ -24,7 +24,7 @@ static constexpr uint32_t SCHED_MAX_PIDS = 1024;
 
 // Shared kernel/module storage contract. Policy fixtures must fit the same
 // storage used by the kernel, rather than allocating unbounded host memory.
-static constexpr size_t SCHED_POLICY_STATE_CAPACITY = 16384;
+static constexpr size_t SCHED_POLICY_STATE_CAPACITY = 65536;
 
 // Sentinel value: no process (returned by PickNext when queue is empty).
 static constexpr uint16_t SCHED_PID_NONE = 0xFFFF;
@@ -40,6 +40,9 @@ struct SchedDebugInfo {
     uint16_t prevPid;     // pid's backward link
     uint32_t readyCount;  // policy's readyCount
     uint32_t listLen;     // ACTUAL length of the queue by walking head->next
+    bool hasServiceInfo = false;
+    uint64_t serviceNs = 0, inactiveServiceNs = 0, rebases = 0, saturations = 0;
+    uint64_t deferredRemovals = 0, workConservingSelections = 0;
 };
 
 // Scheduler policy vtable.
@@ -50,9 +53,13 @@ struct SchedDebugInfo {
 //
 // Thread safety: the caller (scheduler.cpp) holds a lock around all calls.
 // Modules do NOT need internal locking.
+static constexpr uint32_t SCHED_POLICY_ABI_VERSION = 2;
+
 struct SchedOps {
     const char* name;        // Human-readable name, e.g. "rr", "mlfq"
     size_t      stateSize;   // Bytes needed for policy state
+    uint32_t    abiVersion;  // Reject incompatible policy layouts before callbacks.
+    uint32_t    opsSize;
 
     // Initialise policy state (zeroed memory of `stateSize` bytes).
     void (*Init)(void* state);
@@ -95,14 +102,30 @@ struct SchedOps {
     // unlinked (logic desync) or (b) its state struct was corrupted by a wild
     // write (head/tail/count inconsistent with the per-pid links). Pure reads.
     void (*DebugDump)(void* state, uint16_t pid, SchedDebugInfo* out);
+    // CPU service in nanoseconds, charged exactly once for each observed running
+    // interval, including partial slices and CPU-clock-query flushes. Kernel/IRQ
+    // ownership time is included; reported host steal is subtracted when present.
+    void (*AccountService)(void* state, uint16_t pid, uint64_t serviceNs);
+
+    // A running entry participates in fair-service eligibility even while it is
+    // absent from the dispatchable queue. False also covers block/stop/exit.
+    void (*SetRunnable)(void* state, uint16_t pid, bool runnable);
+
+    // Called under the ready lock only at a preemptible user-mode timer boundary.
+    // RR/MLFQ retain wall-slice semantics; service policies can retain unfinished
+    // requests across early preemption. May update policy request state.
+    bool (*ShouldPreempt)(void* state, uint16_t currentPid, uint64_t elapsedWallMs);
+
 };
 
 inline bool SchedOpsUsable(const SchedOps* ops) {
-    return ops && ops->name && ops->name[0] && ops->stateSize &&
+    return ops && ops->abiVersion == SCHED_POLICY_ABI_VERSION && ops->opsSize == sizeof(SchedOps) &&
+           ops->name && ops->name[0] && ops->stateSize &&
            ops->stateSize <= SCHED_POLICY_STATE_CAPACITY &&
            ops->Init && ops->InitProcess && ops->Enqueue && ops->PickNext &&
            ops->Remove && ops->TimesliceExpired && ops->VoluntaryYield &&
-           ops->Tick && ops->Timeslice && ops->ReadyCount;
+           ops->Tick && ops->Timeslice && ops->ReadyCount &&
+           ops->AccountService && ops->SetRunnable && ops->ShouldPreempt;
 }
 
 } // namespace brook

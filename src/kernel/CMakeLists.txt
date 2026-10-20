@@ -457,6 +457,7 @@ set_source_files_properties(
     src/apic.cpp
     src/tlb_test.cpp
     src/scheduler.cpp
+    "${BROOK_ROOT}/src/modules/sched_rr.cpp"
     src/compositor.cpp
     src/keyboard.cpp
     src/mouse.cpp

@@ -3582,7 +3582,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio stats - cached stream queues, completion and guest clock\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
-            "  sched policy status|rr|mlfq - inspect or select a registered policy\n"
+            "  sched policy status|rr|mlfq|eevdf - inspect or select a registered policy\n"
             "  sched runtime status - running intervals, steal availability and read errors\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
@@ -3830,7 +3830,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         DebugAudioDiagnostics();
     }
     else if (NetStrEq(cmd, "sched policy status") ||
-             NetStrEq(cmd, "sched policy rr") || NetStrEq(cmd, "sched policy mlfq")) {
+             NetStrEq(cmd, "sched policy rr") || NetStrEq(cmd, "sched policy mlfq") || NetStrEq(cmd, "sched policy eevdf")) {
         // This normal debug-channel thread is process context. Panic inspection
         // uses its separate read-only path; never attempt a transition there.
         if (!ProcessCurrent()) {
@@ -3840,10 +3840,28 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         bool selected = true;
         if (NetStrEq(cmd, "sched policy rr")) selected = SchedulerSwitchPolicy("rr");
         else if (NetStrEq(cmd, "sched policy mlfq")) selected = SchedulerSwitchPolicy("mlfq");
+        else if (NetStrEq(cmd, "sched policy eevdf")) selected = SchedulerSwitchPolicy("eevdf");
         BridgeReply reply;
         reply.text("{\"selected\":"); reply.text(selected ? "true" : "false");
         reply.text(",\"policy\":\""); reply.text(SchedulerPolicyName());
         reply.text("\"}\n"); reply.send();
+    }
+    else if (NetStrEq(cmd, "sched policy service")) {
+        PolicyServiceStatus status{};SchedulerPolicyServiceStatus(&status);
+        BridgeReply reply;reply.text("{\"policy\":\"");reply.text(status.name);reply.text("\",");
+        reply.field("abi",SCHED_POLICY_ABI_VERSION);reply.text(",");
+        reply.field("state_bytes",status.stateBytes);reply.text(",");
+        reply.field("ledger_since_selection_ns",status.ledgerSinceSelectionNs);reply.text(",\"has_policy_service\":");
+        reply.text(status.debug.hasServiceInfo?"true":"false");reply.text(",");
+        reply.field("policy_service_ns",status.debug.serviceNs);reply.text(",");
+        reply.field("inactive_service_ns",status.debug.inactiveServiceNs);reply.text(",\"has_queue_debug\":");
+        reply.text(status.hasQueueDebug?"true":"false");reply.text(",");
+        reply.field("ready",status.debug.readyCount);reply.text(",");
+        reply.field("actual_ready",status.debug.listLen);reply.text(",");
+        reply.field("rebases",status.debug.rebases);reply.text(",");
+        reply.field("saturations",status.debug.saturations);reply.text(",");
+        reply.field("deferred_removals",status.debug.deferredRemovals);reply.text(",");
+        reply.field("work_conserving_selections",status.debug.workConservingSelections);reply.text("}\n");reply.send();
     }
     else if (NetStrEq(cmd, "sched runtime status")) {
         RuntimeStatus status{}; SchedulerRuntimeStatus(&status);

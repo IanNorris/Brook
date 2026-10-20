@@ -45,6 +45,8 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_eevdf)
+set_tests_properties(test_eevdf PROPERTIES TIMEOUT 20)
 add_host_test(test_runtime_accounting)
 set_tests_properties(test_runtime_accounting PROPERTIES TIMEOUT 15)
 add_host_test(test_smp_boot_policy)
@@ -216,6 +218,14 @@ set_target_properties(sched_rr PROPERTIES PREFIX "lib" SUFFIX ".so")
 add_library(sched_mlfq SHARED "${BROOK_ROOT}/src/modules/sched_mlfq.cpp")
 target_include_directories(sched_mlfq PRIVATE "${BROOK_ROOT}/src/kernel/src")
 set_target_properties(sched_mlfq PROPERTIES PREFIX "lib" SUFFIX ".so")
+
+add_library(sched_eevdf SHARED "${BROOK_ROOT}/src/modules/sched_eevdf.cpp")
+target_include_directories(sched_eevdf PRIVATE "${BROOK_ROOT}/src/kernel/src")
+set_target_properties(sched_eevdf PROPERTIES PREFIX "lib" SUFFIX ".so")
+add_dependencies(test_eevdf sched_eevdf)
+target_link_libraries(test_eevdf PRIVATE ${CMAKE_DL_LIBS})
+add_test(NAME test_eevdf_module COMMAND test_eevdf "$<TARGET_FILE:sched_eevdf>")
+set_tests_properties(test_eevdf_module PROPERTIES TIMEOUT 20)
 
 # test_sched_modules — dlopen-based test that loads the .so modules
 add_executable(test_sched_modules

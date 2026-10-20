@@ -231,6 +231,13 @@ struct RuntimeStatus {
     bool stableClock = false;
 };
 void SchedulerRuntimeStatus(RuntimeStatus* output);
+struct PolicyServiceStatus {
+    const char* name = "none";
+    uint64_t stateBytes = 0, ledgerSinceSelectionNs = 0;
+    SchedDebugInfo debug{};
+    bool hasQueueDebug = false;
+};
+void SchedulerPolicyServiceStatus(PolicyServiceStatus* output);
 
 // Register a scheduling policy. Called by scheduler modules during init().
 // Required callbacks and the shared state bound are validated. A different
@@ -238,7 +245,7 @@ void SchedulerRuntimeStatus(RuntimeStatus* output);
 // the module loader does not yet have an unregister/quiescence contract.
 // Providers of the table/name/callbacks are permanently retained before publish.
 // Heap-owned tables and policy unregister/hot replacement are not supported.
-extern "C" void SchedulerRegisterPolicy(const SchedOps* ops);
+extern "C" bool SchedulerRegisterPolicy(const SchedOps* ops);
 
 // Switch to a registered policy by name. Returns true on success.
 // Serializes policy state replacement with callbacks and task birth. Rebuilds

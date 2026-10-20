@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--fixture-directory',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--phase',required=True)
-    parser.add_argument('--policy',choices=['rr','mlfq'],required=True)
+    parser.add_argument('--policy',choices=['rr','mlfq','eevdf'],required=True)
     args=parser.parse_args();phase,policy=args.phase,args.policy
     if not re.fullmatch('[a-z0-9-]{1,48}',phase):parser.error('Use a lowercase alphanumeric phase name')
     review=args.review.resolve();metadata=json.loads((review/'candidate.json').read_text())

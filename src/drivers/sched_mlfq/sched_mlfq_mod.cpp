@@ -25,7 +25,7 @@ static int SchedMlfqModuleInit()
 {
     SerialPuts("sched_mlfq module: init\n");
     const SchedOps* ops = GetSchedOps();
-    SchedulerRegisterPolicy(ops);
+    if (!SchedulerRegisterPolicy(ops)) return -1;
     KPrintf("sched_mlfq: registered '%s' policy\n", ops->name);
     return 0;
 }

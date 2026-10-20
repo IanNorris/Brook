@@ -189,9 +189,16 @@ static uint32_t MlfqReadyCount(void* state) {
     return static_cast<MlfqState*>(state)->totalReady;
 }
 
+static void MlfqAccountService(void*, uint16_t, uint64_t) {}
+static void MlfqSetRunnable(void*, uint16_t, bool) {}
+static bool MlfqShouldPreempt(void* state, uint16_t pid, uint64_t elapsedMs) {
+    return elapsedMs >= MlfqTimeslice(state, pid);
+}
+
 static const SchedOps g_mlfqOps = {
     "mlfq",
     sizeof(MlfqState),
+    SCHED_POLICY_ABI_VERSION, sizeof(SchedOps),
     MlfqInit,
     MlfqInitProcess,
     MlfqEnqueue,
@@ -203,6 +210,7 @@ static const SchedOps g_mlfqOps = {
     MlfqTimeslice,
     MlfqReadyCount,
     nullptr,  // DebugDump: not implemented for mlfq (BRO-176 diag is RR-only)
+    MlfqAccountService, MlfqSetRunnable, MlfqShouldPreempt,
 };
 
 } // anonymous namespace
