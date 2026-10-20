@@ -24,6 +24,9 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--phase',required=True)
     parser.add_argument('--policy',choices=['rr','mlfq','eevdf'],required=True)
+    parser.add_argument('--profile-ms',type=int,default=0,
+                        choices=[0,*range(100,5001)],metavar='0 or 100..5000',
+                        help='Optional loaded CPU/CS capture; keep separate from unprofiled controls')
     args=parser.parse_args();phase,policy=args.phase,args.policy
     if not re.fullmatch('[a-z0-9-]{1,48}',phase):parser.error('Use a lowercase alphanumeric phase name')
     review=args.review.resolve();metadata=json.loads((review/'candidate.json').read_text())
@@ -113,6 +116,11 @@ def main():
      while 'READY workers=' not in bench.evidence['stdout']:
       bench.poll();assert bench.evidence['status']['state']!='completed';assert time.monotonic()<deadline;time.sleep(.2)
      save('load-ready',dict(host_monotonic_ns=time.monotonic_ns()))
+    if args.profile_ms and not has('profile-start'):
+     if has('profile-intent'):raise RuntimeError('Prior profile start delivery unresolved; inspect existing capture')
+     save('profile-procs-before',b.server.guest(d,'procs'))
+     save('profile-intent',dict(duration_ms=args.profile_ms,host_monotonic_ns=time.monotonic_ns()))
+     save('profile-start',b.server.profile(s,action='start',duration_ms=args.profile_ms))
     if not has('capture'):
      if has('capture-intent'):raise RuntimeError('Prior capture delivery unresolved; inspect existing recording before retry')
      save('capture-intent',dict(host_monotonic_ns=time.monotonic_ns()));samples=[];done=threading.Event()
@@ -131,6 +139,12 @@ def main():
      bench.poll();assert time.monotonic()<deadline,'Inspect same CPU job';time.sleep(.3)
     assert bench.evidence['status']['guest']['live_tasks']==0
     if not has('load-after'):save('load-after',dict(clock=guest_clock(),ready_timing=b.server.guest(d,'sched timing status')))
+    if args.profile_ms and not has('profile-export'):
+     deadline=time.monotonic()+60
+     while 'RUNNING' in b.server.profile(s,action='status').get('reply',''):
+      assert time.monotonic()<deadline,'Inspect same recording/flushing profiler';time.sleep(.3)
+     save('profile-procs-after',b.server.guest(d,'procs'))
+     save('profile-export',b.server.profile(s,action='export'))
     if not has('input-receipts'):
      deadline=time.monotonic()+40
      while len({x['state']['key'] for x in rows('input')}&{'KeyA','KeyB','KeyC','KeyD'})<4 and time.monotonic()<deadline:time.sleep(.3)
@@ -165,6 +179,7 @@ def main():
     for v in levels:current=current+1 if v<1 else 0;longest=max(longest,current)
     counts=[x['batches'] for x in result['cpu']];assert len(counts)==24 and min(counts)>0 and all(x['samples']>0 and not x['early'] for x in result['periodic'])
     summary=dict(phase=phase,policy=policy,kernel=d['kernel_sha256'],guest_memory_gib=6,vcpus=8,hda_use_timer=False,scope='headless GPU VM, fresh Firefox profile, generated local video, 24 bounded CPU workers; input ack includes HTTP and DOM RAF opportunity, not physical display latency; load alignment assumes 1x KVM clock checked by reported brackets',host_guest_rate_low=clock_low,host_guest_rate_high=clock_high,load_host_start_latest_ns=load_start,load_host_end_earliest_ns=load_end,idle=media_summary(read('idle')['rows']),loaded=media_summary(loaded),cpu_batches=sum(counts),cpu_service_ratio=max(counts)/min(counts),periodic_p95_ms=max(x['p95_ns'] for x in result['periodic'])/1e6,periodic_max_ms=max(x['max_ns'] for x in result['periodic'])/1e6,inputs=inputs,audio_frames=n,audio_host_s=capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0],audio_host_rate_ratio=n/rate/(capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0]),audio_longest_silent_10ms_bins=longest)
+    summary['profile_ms']=args.profile_ms
     save('summary',summary);save('rms-10ms',levels);print('MIX_SUMMARY',json.dumps(summary),flush=True)
     import importlib.util
     spec=importlib.util.spec_from_file_location('trace_analysis',str(Path(__file__).with_name('analyze_browser_sched_trace.py')));analysis=importlib.util.module_from_spec(spec);spec.loader.exec_module(analysis)

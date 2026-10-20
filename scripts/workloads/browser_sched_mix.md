@@ -1,6 +1,6 @@
 # Brook browser/audio/scheduler cohort
 
-Use an owned private review VM, eight vCPUs, six GiB, boot-selected RR or MLFQ,
+Use an owned private review VM, eight vCPUs, six GiB, boot-selected RR, MLFQ or EEVDF,
 and the isolated silent 44.1-kHz audio sink with diagnostic callback HDA mode.
 Run one VM at a time with host CPU affinity 0–13. The controller deliberately
 requires the review's `candidate.json` to record `private_clones: true`,
@@ -17,8 +17,15 @@ python3 scripts/workloads/serve_browser_sched_mix.py \
   --output build/browser-fixture --clip /absolute/path/to/generated-faststart.mp4
 python3 scripts/workloads/run_browser_sched_mix.py \
   --review build/reviews/private-review --fixture-directory build/browser-fixture \
+  --audio-route-directory build/browser-audio-routes \
   --output build/browser-results/rr-0 --phase rr-0 --policy rr
 ```
+
+Before running the controller, start `scripts/route_silent_vm_audio.py` for the
+actual bridge session and the private daemon's `daemon.json`, writing evidence
+to `build/browser-audio-routes`. Wait for its `routed.json` while keeping the
+observer alive. The isolated daemon has no session manager: a running null sink
+alone does not connect QEMU's output. See the [reference instructions](../../tools/linux-workload-reference/README.md).
 
 The server binds a fresh loopback port, writes it to `server.json`, copies the
 page and links the supplied clip. It stops after one hour or when its output
@@ -51,3 +58,13 @@ not only stored silence. Report trace gaps, buffered-ahead/ready state, media
 progress, CPU throughput/fairness and latency distributions. A silent sink does
 not establish audible quality. Never pool different fixture/backend/memory/
 visibility cohorts or advertise a single pair as statistical acceptance.
+
+For a separate diagnostic cohort, add `--profile-ms 2000` (allowed 100–5000).
+After the CPU workers report readiness, the controller snapshots process names
+and starts one bounded CPU/context-switch capture. It exports that capture
+after the CPU job drains, saving producer counts/losses and the exact-kernel
+Speedscope artifact. Unknown start delivery is retained rather than retried.
+IRQ-masked intervals are not uniformly sampled, context-switch counts are not
+CPU service, and profiler disk writes/recording can perturb the workload. Keep
+these results separate from ordinary performance controls; `summary.json`
+records `profile_ms` explicitly.

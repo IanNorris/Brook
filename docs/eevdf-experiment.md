@@ -281,3 +281,43 @@ neither approaches the first Linux reference's 23.07 callbacks/s. RR remains
 the default. Next profiling should target media/compositor CPU service and
 non-preemptible kernel intervals, followed by repeated/reverse-order trials and
 Quake II/interactive-game checks on the optional policy.
+
+## Loaded CPU/context-switch profiles
+
+Separate `bp-e0`/`bp-m0` diagnostic cohorts use `--profile-ms 2000`, with process
+snapshots and the same routed browser/24-worker fixture. These are not additional
+unprofiled performance repetitions. Both exports have matching producer counts
+and zero drops: EEVDF has 1,537 samples/22,683 switches, MLFQ 1,547/22,185.
+The analysis reconstructs each archived module's section placement from the
+loader's section-order/alignment rules and its boot-logged base, resolving GPU
+addresses against the exact `.mod`, rather than attributing them to the final
+kernel symbol. Raw captures, Speedscope, analysis and the frozen analysis script
+are under `build/workloads/timing-scheduler-20261020/browser-profile-cohorts/`.
+
+Of EEVDF's 266 kernel samples, 173 leaf samples are GPU `SubmitCommand` and 47
+the GPU command spinlock (220/266). MLFQ has 171/67 respectively (238/322).
+Compositor samples are 169/176, with only 4/7 outgoing switches over the capture.
+The driver holds one global ticket lock across synchronous device round trips;
+completion uses a 200-million-iteration polling bound, with no cooperative
+wait. Kernel timer interrupts do not preempt arbitrary kernel code. Thus faster
+user-mode scheduling cannot itself release those CPUs or allow another GPU
+submitter through. These sample counts identify a target, not an exact wall-time
+breakdown or proof that changing the lock alone improves presentation.
+
+Both traces also contain many outgoing waits through `UserMappingPageAccess`
+(4,385/7,759), which takes the address-space mutation mutex before checking
+pages. MLFQ gives Firefox more observed samples (142 versus 68 across Firefox
+names), while the synthetic workers account for 1,200/1,267 samples. Switch
+counts and finite IRQ samples do not establish service fairness or identify a
+safe mapping-lock change. Profiled EEVDF additionally has an unexplained
+11.37-second periodic outlier and much worse input than its unprofiled control;
+MLFQ's worst is 131.86 ms. The profiler writes to the private FAT disk and adds
+significant observer work. Retain this failure and investigate its timing;
+do not interpret zero dropped events as low observer overhead.
+
+Both guests pass application drain, routing observer exit, heap, original
+launcher exit, four offline filesystem checks and saved-data/profile equality.
+The next candidate should address safe cooperative GPU command contention and
+completion waiting, preserving early-boot operation and command ownership,
+then rerun unprofiled controls and GPU/game stability checks. The mapping waits
+and profiler-induced/exposed long stall remain separate unresolved leads.
