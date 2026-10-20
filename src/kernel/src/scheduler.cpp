@@ -1,6 +1,7 @@
 #include "scheduler.h"
 #include "irq_accounting.h"
 #include "sched_decision_trace.h"
+#include "sched_lock_trace.h"
 #include "timer_irq_arrivals.h"
 #include "module.h"
 #include "posix_timer.h"
@@ -63,7 +64,35 @@ extern "C" int ProcessDumpFreeLog(void* ptr);  // BRO-176 diag (process.cpp)
 struct SchedLock {
     volatile uint32_t next   = 0;
     volatile uint32_t serving = 0;
+    bool traced = false;
 };
+
+static SchedulerLockTrace g_lockTrace;
+static RuntimeSample LockTraceNow(uint32_t cpu)
+{
+    return RuntimeReadSample(KvmStealAvailable(cpu),[](uint64_t* wall){return KvmClockReadStableNs(wall);},
+        [cpu](uint64_t* steal){return KvmStealReadNs(cpu,steal);});
+}
+static LockTraceToken LockTraceReserved(SchedLock& lock,uint32_t ticket,const char* caller)
+{
+    if(!lock.traced || !g_lockTrace.Enabled())return {};
+    const auto state=g_lockTrace.State();const auto cpu=SmpCurrentCpuIndex();
+    return g_lockTrace.Reserve(cpu,ticket,LockTraceNow(cpu),KvmStealAvailable(cpu),reinterpret_cast<uint64_t>(caller),state);
+}
+static void LockTraceAcquired(const LockTraceToken& token)
+{
+    if(token)g_lockTrace.Acquired(token,LockTraceNow(token.cpu));
+}
+static LockTraceToken LockTraceReleasing(SchedLock& lock)
+{
+    if(!lock.traced || !g_lockTrace.HasActive())return {};
+    const auto cpu=SmpCurrentCpuIndex();
+    return g_lockTrace.Releasing(cpu,__atomic_load_n(&lock.serving,__ATOMIC_ACQUIRE),LockTraceNow(cpu));
+}
+static void LockTraceReleased(const LockTraceToken& token)
+{
+    if(token)g_lockTrace.Released(token,LockTraceNow(token.cpu));
+}
 
 // ~25 million cycles at 2.5GHz ≈ 10ms — generous for any SchedLock
 // critical section, which should be <1µs.
@@ -97,13 +126,17 @@ static inline uint64_t SchedLockAcquire(SchedLock& lock,const char* caller=__bui
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
     const auto ticket=__atomic_fetch_add(&lock.next,1,__ATOMIC_RELAXED);
+    const auto trace=LockTraceReserved(lock,ticket,caller);
     SchedLockWaitForTicket(lock,ticket,caller);
+    LockTraceAcquired(trace);
     return flags;
 }
 
 static inline void SchedLockRelease(SchedLock& lock, uint64_t savedFlags)
 {
+    const auto trace=LockTraceReleasing(lock);
     __atomic_fetch_add(&lock.serving, 1, __ATOMIC_RELEASE);
+    LockTraceReleased(trace);
     if (savedFlags & 0x200)
         __asm__ volatile("sti" ::: "memory");
 }
@@ -120,7 +153,9 @@ static inline void SchedLockRelease(SchedLock& lock, uint64_t savedFlags)
 // IF=0 critical section.
 static inline void SchedLockReleaseRaw(SchedLock& lock)
 {
+    const auto trace=LockTraceReleasing(lock);
     __atomic_fetch_add(&lock.serving, 1, __ATOMIC_RELEASE);
+    LockTraceReleased(trace);
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +272,21 @@ static uint32_t g_registeredPolicyCount = 0;
 static Process* g_pidToProcess[SCHED_MAX_PIDS] = {};
 
 // Global scheduler lock (interrupt-safe, protects all policy calls).
-static SchedLock g_readyLock;
+static SchedLock g_readyLock{0,0,true};
+
+bool SchedulerLockTraceControl(int mode,bool reset){return g_lockTrace.Control(mode,reset);}
+void SchedulerLockTraceRead(SchedulerLockTraceSnapshot* output)
+{
+    if(!output)return;
+    *output={};output->state=g_lockTrace.State();
+    output->servingBefore=__atomic_load_n(&g_readyLock.serving,__ATOMIC_ACQUIRE);
+    output->nextTicket=__atomic_load_n(&g_readyLock.next,__ATOMIC_ACQUIRE);
+    output->cpus=SmpGetCpuCount();if(output->cpus>64)output->cpus=64;
+    for(unsigned cpu=0;cpu<output->cpus;++cpu)output->cpu[cpu]=g_lockTrace.Read(cpu);
+    output->servingAfter=__atomic_load_n(&g_readyLock.serving,__ATOMIC_ACQUIRE);
+    output->activeMask=g_lockTrace.ActiveMask();
+    output->endState=g_lockTrace.State();
+}
 static ReadyLatencyTracker<SCHED_MAX_PIDS> g_readyLatency;
 static bool g_irqAccountingTry=false;
 struct alignas(64) IrqAccountingCounters {uint64_t attempts=0,successes=0,deferred=0,ifErrors=0,staleTicketWaits=0;};
@@ -2173,10 +2222,12 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
             if(runtimeFlags&0x200)IrqAccountingIncrement(counts.ifErrors);
             else {
                 IrqAccountingIncrement(counts.attempts);
+                LockTraceToken trace{};
                 acquired=TicketTryClaim(&g_readyLock.next,&g_readyLock.serving,[&](uint32_t ticket){
                     IrqAccountingIncrement(counts.staleTicketWaits);
                     SchedLockWaitForTicket(g_readyLock,ticket,"irq-accounting-try-wrap");
-                });
+                },TicketNoHook{},[&](uint32_t ticket){trace=LockTraceReserved(g_readyLock,ticket,"irq-accounting-try");});
+                if(acquired)LockTraceAcquired(trace);
                 uint64_t afterFlags;__asm__ volatile("pushfq; pop %0" : "=r"(afterFlags) :: "memory");
                 if((afterFlags^runtimeFlags)&0x200)IrqAccountingIncrement(counts.ifErrors);
                 IrqAccountingIncrement(acquired?counts.successes:counts.deferred);

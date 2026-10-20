@@ -1,6 +1,6 @@
 # Scheduler lock attribution before a PV waiting experiment
 
-This is the implementation contract for the next diagnostic, based on the
+This is the implementation and acceptance contract for the diagnostic, based on the
 2026-10-20 source audit and Astra's read-only review. It is not implemented by
 `sched kvm status`, and it does not authorize a different scheduler default.
 The measured lock delays, failed preemption-deferral comparison, IRQ sampling
@@ -97,3 +97,77 @@ Only attribution sufficient to separate these mechanisms justifies a default-off
 PV waiting or directed-yield experiment. Per-core queues, kernel preemptibility
 and EEVDF remain distinct comparisons; none follows automatically from KVM
 advertising the necessary feature bits.
+
+## Implemented first version
+
+`sched lock-trace on|off|reset|status` observes only `g_readyLock`. It is off at
+boot and samples no clocks while off and without an older active capture.
+Ordinary acquisition and the successful-reservation callback in `TicketTryClaim`
+publish reservation and acquisition. Both release paths publish before/after
+the existing `serving` increment, before any IF restoration. Neither ticket
+admission, the spin timeout nor scheduler policy callbacks change.
+
+Per-CPU records use atomic payload fields and bounded sequence validation. Each
+CPU is the sole writer of its slots, with IF masked; controls never clear them.
+A local serial distinguishes reuse of the same uint32 ticket. Enable and reset
+advance the window. Off preserves the current window and stops new reservations;
+older reservations can finish their original window. Reset preserves enabled
+state inside its CAS, so a stale external snapshot cannot undo a concurrent off.
+
+Status exports current, largest observed wait and largest observed hold records
+for each CPU, sample-valid/steal flags, active CPU mask, lifetime completion/loss/
+clock-error counters, and before/after ticket/window observations. Caller tags
+are hexadecimal addresses of static caller-name strings in the matched kernel
+ELF. Sample order errors and missing samples are retained, not silently converted
+to valid durations. Epoch/serial/publication exhaustion never wraps identities.
+
+This first version is not a complete event journal. Maxima may retain different
+episodes, so the predecessor and successor needed for a handoff match can be
+missing. There are no per-spin KVM hint snapshots. Unmatched or changed rows
+remain inconclusive; neither a long hold nor a clean capture establishes a
+performance fix. Instrumentation overhead and native loaded attribution remain
+acceptance work before considering a PV lock algorithm.
+
+The reducer/publication tests cover ticket reuse, stale completions, in-flight
+off/reset, same-CPU reentry rejection, independent max-wait/max-hold retention,
+CPU bounds, missing and backwards clocks, publication/epoch exhaustion,
+successful/failed/stale-success try reservations and cross-CPU active-bit
+preservation. Concurrent atomic publishers/readers and per-CPU episodes with
+concurrent controls pass. All 69 hosted suites and the compiled entry audit pass
+(twelve supported templates, 56 mutation rejections; four templates remain
+unsupported). Astra found no lock-safety blocker and identified the reset/off
+control race, which was corrected before the final build.
+
+## First native acceptance
+
+A fresh private headless/muted VM boots the frozen kernel
+`a065ff1db0ecf68eb2642449b01ac3a876676fa9e0e040221f321cebae18b4f2`
+with thirteen matched ABI-34 modules, eight vCPUs, MLFQ and explicit
+IRQ-accounting try. Default status is disabled, epoch zero, active mask zero,
+and zero records/counters on every CPU. The controller enables capture and
+runs one tracked unprivileged Python job: eight threads each execute 1,000
+getpid/stat/short-sleep iterations. The original job exits zero with both output
+streams at EOF, no lost bytes and no remaining guest tasks.
+
+After off, observed current records are released, the active mask is zero,
+and 707,838 lifetime completions have zero publication losses or clock errors.
+Retained slow episodes exist on all eight CPUs. Max observed reservation-to-
+acquisition is 32.005 microseconds; max observed acquired-to-pre-release is
+30.616 microseconds. The retained ownership intervals have zero reported steal
+increase. These are instrumented quiet-probe observations, not an overhead
+comparison, service-time proof or reproduction of the seconds-long loaded
+stall. The retained predecessor/successor records need not form a matched pair.
+
+Off/reset remains disabled with a newer epoch; on/reset remains enabled with
+a newer epoch. IRQ-accounting IF-error counters remain zero. Runtime ledger,
+heap, acknowledged guest final sync, QEMU exit, separate original wrapper wait,
+four offline filesystem checks and twelve saved-document/four original-profile
+comparisons pass. Evidence and caller-name decoding against the exact ELF are
+in `build/reviews/lock-trace-native-20261020`. This establishes functional
+integration, not complete native raw/normal-release or fairness coverage.
+
+The user live review subsequently starts the earlier established baseline,
+without this trace code, with explicit speaker-audio authorization. Do not
+build or stage further kernels while that review VM is running. Loaded trace
+attribution and instrumentation-cost controls remain the next private work
+after handback; this diagnostic is not a scheduling performance fix.

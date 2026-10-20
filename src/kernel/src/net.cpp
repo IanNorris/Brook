@@ -35,6 +35,7 @@
 #include "timer_irq_arrivals.h"
 #include "wake_scan_handoff.h"
 #include "kvmclock.h"
+#include "sched_lock_trace.h"
 #include "vfs.h"
 #include "input.h"
 #include "mouse.h"
@@ -3264,6 +3265,40 @@ static int DebugReplySend(const char* data, uint32_t length)
 // Fixed-buffer replies: no dependency on a userspace printf implementation.
 using BridgeReply = BridgeReplyBuffer<DebugChannelSend>;
 
+static void DebugSchedulerLockTrace()
+{
+    SchedulerLockTraceSnapshot s{};SchedulerLockTraceRead(&s);
+    BridgeReply r;r.text("{\"lock\":\"ready\",\"enabled\":");
+    const auto epoch=s.state&~uint64_t(1);const bool exhausted=epoch>=~uint64_t(0)-3;
+    r.text((s.state&1)&&!exhausted?"true":"false");r.text(",");r.field("epoch",epoch);
+    r.text(",");r.field("end_state",s.endState);r.text(",\"epoch_exhausted\":");r.text(exhausted?"true":"false");
+    r.text(",\"window_unchanged\":");r.text(s.state==s.endState?"true":"false");
+    r.text(",");r.field("storage_bytes",sizeof(SchedulerLockTrace));
+    r.text(",");r.field("active_cpu_mask",s.activeMask);
+    r.text(",");r.field("next_ticket",s.nextTicket);r.text(",");r.field("serving_before",s.servingBefore);
+    r.text(",");r.field("serving_after",s.servingAfter);
+    r.text(",\"scope\":\"default off; selected ready lock only; phases 1 waiting, 2 acquired, 3 releasing, 4 released; flags 0..3 valid clock samples and bit 4 steal available; publication gaps are unknown; independent CPU/retained rows, lifetime completed/lost counters; no atomic system snapshot or execution-time attribution\",\"cpus\":[");r.send();
+    for(unsigned cpu=0;cpu<s.cpus;++cpu){
+        const auto& c=s.cpu[cpu];BridgeReply row;if(cpu)row.text(",");row.text("{");row.field("cpu",cpu);
+        row.text(",");row.field("completed",c.completed);row.text(",");row.field("lost",c.lost);
+        row.text(",");row.field("clock_errors",c.clockErrors);row.send();
+        auto event=[&](const char* name,const LockTraceRecord& e,bool consistent){
+            BridgeReply out;out.text(",\"");out.text(name);out.text("\":{\"consistent\":");out.text(consistent?"true":"false");
+            out.text(",\"in_window\":");out.text(consistent&&e.epoch==epoch&&e.phase?"true":"false");
+#define LOCK_TRACE_JSON(f) out.text(",");out.field(#f,e.f)
+            LOCK_TRACE_JSON(epoch);LOCK_TRACE_JSON(serial);LOCK_TRACE_JSON(ticket);LOCK_TRACE_JSON(phase);
+            out.text(",\"caller\":\"0x");out.number(e.caller,true);out.text("\"");LOCK_TRACE_JSON(flags);
+            LOCK_TRACE_JSON(reservedNs);LOCK_TRACE_JSON(acquiredNs);LOCK_TRACE_JSON(releaseBeforeNs);LOCK_TRACE_JSON(releaseAfterNs);
+            LOCK_TRACE_JSON(reservedSteal);LOCK_TRACE_JSON(acquiredSteal);LOCK_TRACE_JSON(releaseBeforeSteal);LOCK_TRACE_JSON(releaseAfterSteal);
+#undef LOCK_TRACE_JSON
+            out.text("}");out.send();
+        };
+        event("current",c.current,c.currentValid);event("max_wait",c.maxWait,c.waitValid);event("max_hold",c.maxHold,c.holdValid);
+        DebugChannelSend("}");
+    }
+    DebugChannelSend("]}\n");
+}
+
 static void DebugEpollDiagnostics()
 {
     struct Row { unsigned pid; EpollDiagSnapshot data; } top[8]{};
@@ -3727,6 +3762,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sched wakes status|bsp|shared|reset - optional wake-scan handoff (default bsp)\n"
             "  sched runtime status - running intervals, steal availability and read errors\n"
             "  sched kvm status - advertised PV features and independent preemption hints\n"
+            "  sched lock-trace on|off|reset|status - ready-lock ticket and clock observations\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
@@ -4231,6 +4267,16 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("attempts",c.attempts);r.text(",");r.field("successes",c.successes);r.text(",");r.field("deferred",c.deferred);
             r.text(",");r.field("potential_watch_ticks_skipped",c.deferred);r.text(",");r.field("if_errors",c.ifErrors);r.text(",");r.field("stale_ticket_waits",c.staleTicketWaits);r.text("}");r.send();
         }DebugChannelSend("]}\n");
+    }
+    else if(NetStrEq(cmd,"sched lock-trace on") || NetStrEq(cmd,"sched lock-trace off") ||
+            NetStrEq(cmd,"sched lock-trace reset") || NetStrEq(cmd,"sched lock-trace status")) {
+        if(!NetStrEq(cmd,"sched lock-trace status")) {
+            const int mode=NetStrEq(cmd,"sched lock-trace on")?1:NetStrEq(cmd,"sched lock-trace off")?0:-1;
+            if(!SchedulerLockTraceControl(mode,NetStrEq(cmd,"sched lock-trace reset"))) {
+                DebugChannelSend("{\"error\":\"lock trace control raced or epoch exhausted; inspect status\",\"applied\":false}\n");return;
+            }
+        }
+        DebugSchedulerLockTrace();
     }
     else if (NetStrEq(cmd, "sched kvm status")) {
         KvmVirtualizationStatus status{}; KvmVirtualizationRead(SmpGetCpuCount(), &status);

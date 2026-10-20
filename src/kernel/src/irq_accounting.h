@@ -7,11 +7,13 @@ namespace brook {
 // Rare stale success waits for its already-reserved ticket using the caller's
 // ordinary bounded wait; never acquire again or abandon that reservation.
 struct TicketNoHook {void operator()()const{}};
-template<class Wait,class BeforeCas=TicketNoHook>
-inline bool TicketTryClaim(volatile uint32_t* next,volatile uint32_t* serving,Wait wait,BeforeCas beforeCas={}){
+struct TicketReservationNoHook {void operator()(uint32_t)const{}};
+template<class Wait,class BeforeCas=TicketNoHook,class Reserved=TicketReservationNoHook>
+inline bool TicketTryClaim(volatile uint32_t* next,volatile uint32_t* serving,Wait wait,BeforeCas beforeCas={},Reserved reserved={}){
     auto expected=__atomic_load_n(serving,__ATOMIC_ACQUIRE);
     const auto ticket=expected;beforeCas();
     if(!__atomic_compare_exchange_n(next,&expected,ticket+1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED))return false;
+    reserved(ticket);
     if(__atomic_load_n(serving,__ATOMIC_ACQUIRE)!=ticket)wait(ticket);
     return true;
 }
