@@ -597,3 +597,76 @@ are archived in `irq-safe-sources` under the ignored workload root. The next
 audio investigation must distinguish guest publication, QEMU callback
 progress and host capture progress under load, without relaxing the HDA safety
 guard or treating a shorter queue as a complete playback fix.
+
+## Aligned run-state trace distinguishes stopped audio from missing callbacks
+
+`q2-irq-trace-try-1` repeats the same final kernel/modules, MLFQ, callback
+backend, private silent route and thirty-second bounded host load. It adds
+realtime/monotonic anchor brackets and cached stream snapshots immediately
+before/after capture. Original jobs, CPU-clock API, settled ledger, heap,
+clock-rate, shutdown/router, filesystem and preservation gates pass. Audio
+acceptance remains false, with no native fault or sampled discontinuity.
+
+Across the 8.003526-second host capture window, QEMU's HDA run-state trace
+records 3.671848 seconds active and 4.331678 seconds inactive. The WAV contains
+3.680363 seconds of PCM, only about 8.515 ms more than recorded active time.
+The observed realtime/monotonic offset envelope spans 1,023 ns; both endpoint
+translations yield the same active total. This observed envelope does not
+prove absence of an intermediate clock step. Inactive segments include
+978 ms at capture start, 1,115 ms and 1,867 ms interior gaps, and 371 ms at
+the end. Running state alone does not prove timely callbacks within active
+segments.
+
+The same stream identity/epoch survives across bracketing cached snapshots.
+Both snapshots have zero software and in-flight frames, equal submitted and
+completed counters, and no discontinuity. Submitted/completed deltas are
+125,952 frames each. Driver accepted bytes increase by 503,808 (the same
+125,952 stereo-s16 frames), over 120 accepted submissions; unowned reserved
+silence increases by 103,680 bytes. Snapshot intervals enclose the capture
+with transport uncertainty and are not exact capture-boundary measurements.
+
+QEMU's
+[10.2.2 HDA implementation](https://github.com/qemu/qemu/blob/v10.2.2/hw/audio/hda-codec.c)
+emits `hda_audio_running` when codec run state changes and updates voice
+activity. Brook's `ObserveNativeLocked` stops DMA after its submitted tail
+and idle trailer drain; that ordinary path does not latch a native fault.
+The measured inactive periods and empty bracketing queues support producer
+starvation/draining as an explanation for this short capture. They do not
+identify why the producer stalls, prove continuous publication between
+snapshots, or exclude callback stalls during active periods.
+
+`aligned-audio-trace.json` retains both clock translations, every intersecting
+run-state segment, queue snapshots and publication deltas. The independent
+structural verifier remains separate from this alignment analysis. Exact
+controllers, analysis, verifier and relevant source snapshots are archived
+in `irq-audio-trace-sources`. A subsequent bounded CPU profile targets the
+producer during the same load; neither scheduler nor audio defaults change.
+
+The follow-up `q2-irq-producer-try-1` adds a bounded 500-ms CPU/context-switch
+profile. It retains the same structural/CPU-clock/lifecycle/filesystem gates,
+with audio acceptance still false and no native fault/discontinuity. Its
+8.005570-second capture contains 2.220408 seconds of PCM; HDA is active
+2.203751 seconds and inactive 5.801819 seconds. Empty, same-epoch bracketing
+stream snapshots again show equal submitted/completed deltas (67,584 frames).
+
+The complete profile has 64 CPU samples, 166 context-switch records, zero
+reported drops and matching event counts. Of the CPU samples, 21 land at
+`SchedulerKernelRegionEnter+0x9c` and 21 at
+`SchedulerKernelRegionLeave+0x9b`. Disassembly of the exact frozen kernel
+places those addresses in the epilogues just after conditional `sti`; the
+ticket-wait loops are at different addresses earlier in each function. This
+is consistent with delayed IRQ sampling after interrupt-masked regions. It
+cannot establish that those epilogues consume most CPU time, or identify
+which protected operation caused an individual producer stall. Raw hit counts
+must not be presented as unbiased CPU percentages.
+
+The profile analysis resolves executable module symbols using actual boot
+load addresses, the loader's section ordering/alignment and exact frozen
+module hashes, with symbol-size bounds; user RIPs remain unresolved. Three
+CPU samples resolve to virtio-GPU submission/wait helpers. Context-switch
+stacks include the audio worker, network poller and timer dispatch, but this
+short biased window does not establish a unique producer bottleneck.
+`producer-profile-analysis.json` retains raw counts and outgoing stacks.
+A useful next instrument is elapsed lock/wakeup observation for the audio
+producer, retaining ownership and host-steal semantics, rather than treating
+IRQ sample percentages as a substitute for those measurements.
