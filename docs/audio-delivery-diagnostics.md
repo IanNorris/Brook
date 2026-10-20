@@ -1350,3 +1350,42 @@ the forwarding rule `11237 + instance * 100`. Harmless launcher tests cover
 out-of-range, empty explicit arguments, leading-zero, expression/text and
 oversized inputs plus valid boundary values, without starting QEMU. This is a
 launch preflight correction; the diagnostic kernel and scheduler are unchanged.
+
+## Live Firefox slowdown after Quake closes
+
+The user reports substantial stuttering in Quake and Firefox, continuing in
+Firefox after Quake closes. YouTube has selected 360p instead of the earlier
+720p. Preserve this as a live regression report, not a controlled comparison
+with the earlier content or adaptive quality. The authorized speaker review
+uses baseline kernel `6f637473…`, eight vCPUs and MLFQ. A direct status query
+finds AP IRQ accounting in **blocking** mode; it was not already using the
+private cohorts' explicit try control. The recorded live command opts this
+session into try without changing policy or any default. Its acknowledgement
+and subsequent status retain zero IF errors and stale-ticket waits.
+
+The first five-second profile retains 3,664 samples and 77,449 switch records,
+but drops 17,457 events. A one-second repeat retains 775 samples and 17,213
+switches with 585 drops. Both are incomplete evidence. A later 250-ms capture
+in try mode retains 201 samples and 4,630 switch records with zero drops and
+matching begin/end totals. Its short window, nonuniform IRQ sampling and
+pre-switch bookkeeping still prohibit interpreting counts as CPU occupancy.
+Separate process observations contain no Quake tasks and 373 Firefox-named
+tasks out of 391 total; the first profile cannot establish that Quake remained
+present throughout its capture.
+
+A separate ten-second try-mode interval records 10.117 seconds of guest elapsed
+time, 18.224 aggregate seconds charged by the runtime ledger, 62.657 idle seconds
+and 0.059 seconds reported steal. That is roughly 1.80 charged and 6.19 idle
+CPU equivalents. These independent sequential snapshots include kernel/IRQ work
+and are approximate; they are not Firefox CPU-time measurements. They argue
+against explaining this whole interval by saturation of eight guest CPUs or
+large reported host steal alone. Waiting, serialization and delayed progress
+remain candidates, not established causes. Runtime status reports no invalid,
+backwards, clamped, stale or saturated samples. No playback improvement has yet
+been established from the live accounting-mode change.
+
+Raw counters with host brackets, user reports, all three profiles' independent
+loss checks, host thread schedstat deltas and interpretation limits are retained
+under `build/reviews/live-timing-baseline-20261020/mixed-stutter-observation`.
+The review VM remains with the user; no restart, input injection or host load
+is part of this observation.
