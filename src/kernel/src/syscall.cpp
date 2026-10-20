@@ -55,6 +55,7 @@
 #include "rtc.h"
 #include "kvmclock.h"
 #include "audio.h"
+#include "dsp_write_plan.h"
 #include "profiler.h"
 #include "smp.h"
 #include "apic.h"
@@ -1661,6 +1662,7 @@ static constexpr uint8_t  DSP_DEFAULT_CHANNELS = 2;
 static constexpr uint8_t  DSP_DEFAULT_BITS     = 16;
 static constexpr uint32_t DSP_HW_RATE          = 44100; // hardware playback rate
 static constexpr uint32_t DSP_BUFFER_SIZE      = 65536; // 64KB staging buffer
+static_assert(DSP_BUFFER_SIZE == DspWritePlan::InputBytesLimit && DSP_HW_RATE == DspWritePlan::HardwareRate);
 
 // Caller holds ioLock and has checked that no input remains outstanding.
 static int DspChangeFormat(DspState* dsp, const AudioStreamProgress& progress,
@@ -1930,6 +1932,11 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
+        DspWritePlan plan;
+        auto finish = [&](int64_t error) -> int64_t {
+            const uint64_t bytes = plan.ConsumedBytes();
+            return bytes ? static_cast<int64_t>(bytes) : error;
+        };
         for (;;) {
             SpinLockAcquire(ProcessFdLock(proc));
             const bool nonblock = (fde->statusFlags & 0x800) != 0;
@@ -1937,56 +1944,50 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
             {
                 DspIoGuard held(dsp);
                 AudioStreamProgress progress{};
-                if (!AudioMixerGetProgress(dsp->mixerStreamId, &progress)) return -EBADF;
-                if (progress.discontinuity) return -32; // EPIPE: explicit RESET required.
+                if (!AudioMixerGetProgress(dsp->mixerStreamId, &progress)) return finish(-EBADF);
+                if (progress.discontinuity) return finish(-32); // EPIPE: explicit RESET required.
                 const uint32_t rate = dsp->sampleRate ? dsp->sampleRate : DSP_HW_RATE;
                 const uint32_t frameBytes = (dsp->bitsPerSample / 8) * dsp->channels;
-                if (!frameBytes) return -EINVAL;
-                uint64_t frames = count / frameBytes;
-                if (!frames) return 0;
-                const uint64_t inputCap = DSP_BUFFER_SIZE / frameBytes;
-                const uint64_t outputCap = static_cast<uint64_t>(progress.capacityFrames) * rate / DSP_HW_RATE;
-                if (frames > inputCap) frames = inputCap;
-                if (frames > outputCap) frames = outputCap;
-                if (!frames) return -EINVAL;
-                const uint32_t outFrames = static_cast<uint32_t>((frames * DSP_HW_RATE + rate - 1) / rate);
-                // Blocking writes wait for the bounded converted chunk, preserving
-                // the full-write behaviour expected by ALSA's file output backend.
-                if (nonblock || AudioMixerAvailableFrames(dsp->mixerStreamId) >= outFrames) {
-                    // User faults and conversion occur outside the IRQ-disabling mixer lock.
+                if (!frameBytes) return finish(-EINVAL);
+                if (!plan.Active() || !plan.Matches(rate, dsp->channels, dsp->bitsPerSample,
+                                                   dsp->controlEpoch, progress.epoch)) {
+                    // A reset/pause/reconfiguration cannot splice the rest of an
+                    // already accepted chunk into a different stream epoch.
+                    if (plan.Accepted()) return finish(0);
+                    if (count / frameBytes == 0) return 0;
+                    if (!plan.Begin(count, rate, dsp->channels, dsp->bitsPerSample,
+                                    progress.capacityFrames, dsp->controlEpoch, progress.epoch))
+                        return -EINVAL;
+                }
+                const uint32_t offered = plan.Offer(AudioMixerAvailableFrames(dsp->mixerStreamId));
+                if (offered) {
+                    // Re-stage under ioLock on each attempt. Nothing aliases
+                    // these shared buffers across a wait or another writer.
+                    // Conversion keeps its original output offset even when
+                    // the hardware rate differs from the input rate.
                     if (userSource) {
-                        if (!CopyFromUser(dsp->inputBuffer, bufAddr, frames * frameBytes)) return -EFAULT;
+                        if (!CopyFromUser(dsp->inputBuffer, bufAddr, plan.InputBytes())) return finish(-EFAULT);
                     } else {
-                        memcpy(dsp->inputBuffer, reinterpret_cast<const void*>(bufAddr), frames * frameBytes);
+                        memcpy(dsp->inputBuffer, reinterpret_cast<const void*>(bufAddr), plan.InputBytes());
                     }
                     auto* out = reinterpret_cast<int16_t*>(dsp->buffer);
-                    auto* src16 = reinterpret_cast<const int16_t*>(dsp->inputBuffer);
-                    for (uint32_t i = 0; i < outFrames; ++i) {
-                        uint64_t source = static_cast<uint64_t>(i) * rate / DSP_HW_RATE;
-                        if (source >= frames) source = frames - 1;
-                        for (uint32_t channel = 0; channel < 2; ++channel) {
-                            const uint64_t index = source * dsp->channels + (dsp->channels == 2 ? channel : 0);
-                            out[i * 2 + channel] = dsp->bitsPerSample == 8
-                                ? static_cast<int16_t>((static_cast<int>(dsp->inputBuffer[index]) - 128) * 256)
-                                : src16[index];
-                        }
-                    }
-                    const uint32_t accepted = AudioMixerSubmit(out, outFrames, dsp->mixerStreamId);
+                    if (!plan.Convert(dsp->inputBuffer, out, offered)) return finish(-EIO);
+                    const uint32_t accepted = AudioMixerSubmit(out, offered, dsp->mixerStreamId);
+                    if (!plan.Accept(accepted)) return finish(-EIO);
                     if (accepted) {
-                        uint64_t consumed = accepted == outFrames ? frames
-                            : static_cast<uint64_t>(accepted - 1) * rate / DSP_HW_RATE + 1;
-                        if (consumed > frames) consumed = frames;
-                        return static_cast<int64_t>(consumed * frameBytes);
+                        // Preserve the existing bounded full-write contract for
+                        // blocking users, but refill available prefixes instead
+                        // of waiting for the entire converted chunk to fit.
+                        if (!plan.Remaining() || nonblock) return finish(0);
+                        continue;
                     }
                 }
             }
-            // A paused/full writer must not prevent another thread from resetting
-            // or enabling this same open description. Revalidate after every wait.
-            // Blocking output has no 500-ms expiry. A paused/full stream may
-            // legitimately wait for another thread's reset/enable operation.
-            // Signals and a reported device discontinuity still abort it.
-            if (nonblock) return -EAGAIN;
-            if (HasReadInterruptSignal()) return -EINTR;
+            // The description mutex is released while waiting, so a separate
+            // thread can reset, pause or enable this same open description.
+            // Prefix acceptance wins over a later signal/error, as for write(2).
+            if (nonblock) return finish(-EAGAIN);
+            if (HasReadInterruptSignal()) return finish(-EINTR);
             Process* self = SchedulerCurrentProcess();
             if (self) { self->wakeupTick = ApicTickCount() + 5; SchedulerBlockInterruptible(self); }
         }

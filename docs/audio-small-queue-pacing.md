@@ -79,12 +79,96 @@ comes from that site. Increasing the queue helps but does not fully fix the
 eight-fragment case. It is not an accepted solution or a reason to weaken the
 publication guard.
 
-Next test submitting available prefixes of blocking writes while preserving
-full-write expectations, stream/control epochs, format conversion and buffer
-ownership across waits. Concurrent writers, reset/pause, signals, partial faults
-and resampled inputs must remain correct. Compare the same queue geometry
-before/after and keep the native publication/fault tests. An alternative lead
-change needs explicit safety evidence, not merely better playback numbers.
+The prefix-refill intervention below addresses the whole-chunk admission
+problem. Residual gaps require a separate delivery-path investigation. An
+alternative lead change needs explicit safety evidence, not merely better
+playback numbers: the codec tail-drain requirement and safe publication
+distance have different purposes.
+
+## Available-prefix refill
+
+Blocking DSP writes now submit available output prefixes rather than waiting
+for the entire bounded converted chunk to fit. They still complete that chunk
+before returning normally. A local `DspWritePlan` keeps one conversion origin
+across retries, avoiding new rounding drift when splitting resampled output.
+Each attempt re-stages the bounded user input and converts its remaining
+prefix under the existing description mutex. No pointer into shared staging
+survives a wait, and no additional buffer or mutex is allocated per write.
+
+The mutex is released while waiting. A reset, pause or format/stream epoch
+change after acceptance ends the old transaction with its accepted input-byte
+prefix. Signals, copy faults and device faults similarly preserve accepted
+bytes. Before acceptance a control change can restart the plan. Concurrent
+writers can interleave prefixes; this does not promise atomic PCM writes.
+Partial input-byte returns still use the legacy rounding rule. Interrupted
+blocking prefixes therefore share the existing nonblocking resampler limitation:
+a later syscall cannot recover an incompletely emitted source frame's fractional
+phase. This expands where that limitation can occur; it needs stateful stream
+resampling. Uninterrupted splitting within this bounded transaction preserves
+the original conversion exactly.
+
+| Direct OSS queue | Before: 30-s source completion | Prefix refill | Prefix refill plus extra completion polling |
+| --- | ---: | ---: | ---: |
+| 4,096 frames | 55.460 s | 33.955 s | 33.169 s |
+| 8,192 frames | 32.053 s | 30.020 s | 30.032 s |
+
+The retained prefix-only candidate's four-fragment capture progresses at
+0.8827 source seconds per stored PCM second, with 10.52% quiet 1-ms bins; the
+eight-fragment capture is 1.0003 with no quiet bins. The additional-polling
+variant refreshes completion before initial/retried writes outside the mutex.
+It does not remove the small-queue problem; its single-run difference does not
+establish a repeatable benefit worth the additional device I/O. It is preserved
+as an experiment and removed from the working source.
+
+Quake confirms the limit of the prefix-only repair. Synthetic music still
+progresses at 0.8323 with 15.86% quiet bins, and the original OST whole-capture
+fit is 0.835× (similarity 0.832). Guest demo intervals are 15.223/15.243 seconds.
+This repairs a large-write refill defect, not Quake's remaining pacing issue
+or the historical accelerated playback.
+
+The next controlled intervention is prompt native mixer delivery after a
+successful prefix, outside the description mutex, to avoid an additional mixer
+cycle before hardware submission. A native-only bounded attempt must retain
+the flush-owner guard and must not enter the potentially blocking legacy
+`play` path. Keep the current publication predicates, fault/completion rules
+and 8,192-byte stop trailer. Before reducing the lead, measure actual reserved
+gaps, pre/post-copy device advance and publication headroom, including wraps
+and host-load tails; nominal sample-rate arithmetic cannot bound burst fetches.
+
+### Prefix safety coverage
+
+The production write plan is tested across 4/8/44.1/48/96/192-kHz input, mono/
+stereo and u8/s16. Independent whole-conversion references match split/retried
+prefixes, including partial acceptance, output bounds, epoch/format identity,
+invalid input and shared staging interleaving. All 67 hosted suites pass;
+supported compiled entry templates/mutations pass, with unsupported paths
+still explicitly outside that audit. Thirteen module imports resolve against
+106 kernel exports.
+
+`dsp_write_controls.py` exercises eight actual guest syscall cases: fault before
+acceptance, signals before/after acceptance, reset, pause, format change before
+acceptance, a protected source buffer after acceptance, and two writers with
+reset. Both variants pass, including the observed format-change-wins outcome.
+The test allows the legitimate opposing format/reset race without claiming
+that it exercised a branch it did not observe. Test mappings, fds, threads and
+signals belong solely to the bounded test process in the private null-audio VM.
+
+Both variants and both Quake follow-ups pass original owner completion,
+job-lineage drain, runtime/heap checks, four filesystems and saved-data
+preservation. Native result exports match guest size/SHA-256 receipts. All
+thirteen driver/policy modules, including HDA, are byte-identical to the
+pre-intervention capsule. No native HDA fault is recorded. No default policy,
+wake scanner, queue geometry or driver safety rule changes. All test VMs and
+the private null service stop.
+
+The prefix-only frozen kernel is
+`e5e096412c772989d8ad85bcbca6c581682cdef6776f8eda8ca07ae50601c393`;
+the unretained extra-polling kernel is
+`d3af323c1cb460cd9d557d22cbbef9ebbe2e6e3ef620bc49f253091c812b97d1`.
+Ignored `dsp-{prefix,refresh}-{frozen,sources,geometry-sdl}` retain exact source,
+identities, original controllers, control output and captures. Quake evidence
+is in `dsp-prefix-q2-pair` and `q2-prefix-{packet,music}`.
+`dsp-prefix-verified-results.json` and the preserved verifier record the gates.
 
 ## Evidence and lifecycle
 

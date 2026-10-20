@@ -33,8 +33,9 @@ Later evidence supersedes several early leads:
 - [Small-queue audio controls](audio-small-queue-pacing.md) reproduce slower
   source progression with synthetic tones through Quake and direct OSS, with
   unchanged pitch. Frequent short silence and queue-size interventions support
-  a blocking-refill/HDA-lead interaction. This is separate from the historical
-  acceleration and is not yet fixed.
+  a blocking-refill/HDA-lead interaction. Available-prefix blocking writes now
+  improve the direct reproduction and pass eight native control/fault cases;
+  Quake's residual gaps remain. This is separate from historical acceleration.
 
 RR remains the default, with no further RR tuning planned. MLFQ and EEVDF are
 optional. Remaining acceptance includes default-path and broader desktop/game
