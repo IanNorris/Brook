@@ -766,21 +766,34 @@ static void StopNativePhysicalLocked()
 // Retain the first terminal sample in each epoch. Logging occurs only after
 // stopping DMA, in the existing thread-context path; no ABI or sampling-policy
 // change is required to distinguish starvation from clock/device faults.
+enum NativePublishCheck : uint32_t {
+    PublishCopyClock = 1, PublishPosition = 2, PublishPositionClock = 4,
+    PublishClockOrder = 8, PublishSampleGap = 16, PublishOverflow = 32,
+    PublishDmaCaughtWrite = 64,
+};
+struct NativePublishEvidence {
+    uint64_t rawCompleted = 0, begin = 0;
+    uint32_t accepted = 0, delta = 0, failedChecks = 0;
+    bool sampled = false;
+};
 struct NativeFaultEvidence {
     uint64_t epoch = 0, previousNs = 0, beforeNs = 0, afterNs = 0;
     uint64_t submitted = 0, completed = 0;
     uint32_t previousPosition = 0, rawPosition = 0, status = 0;
     const char* reason = nullptr;
+    NativePublishEvidence publish{};
 };
 static NativeFaultEvidence g_nativeFaultEvidence;
 static void FailNativeLocked(const char* reason, uint64_t before = 0,
-                             uint64_t after = 0, uint32_t raw = 0, uint8_t status = 0)
+                             uint64_t after = 0, uint32_t raw = 0, uint8_t status = 0,
+                             const NativePublishEvidence* publish = nullptr)
 {
     const bool report = g_nativeFaultEvidence.epoch != g_nativeClock.epoch;
     if (report) {
         g_nativeFaultEvidence = {g_nativeClock.epoch, g_nativeClock.SampleBeforeNs(),
             before, after, g_nativeClock.submitted, g_nativeClock.completed,
             g_nativeClock.Position(), raw, status, reason};
+        if (publish) g_nativeFaultEvidence.publish = *publish;
     }
     g_nativeClock.Fault();
     StopNativePhysicalLocked();
@@ -789,6 +802,11 @@ static void FailNativeLocked(const char* reason, uint64_t before = 0,
         SerialPrintf("intel_hda: native fault reason=%s epoch=%lu previous_ns=%lu before_ns=%lu after_ns=%lu previous_position=%u raw_position=%u status=%u submitted=%lu completed=%lu\n",
             f.reason, f.epoch, f.previousNs, f.beforeNs, f.afterNs,
             f.previousPosition, f.rawPosition, f.status, f.submitted, f.completed);
+        if (f.publish.failedChecks) {
+            SerialPrintf("intel_hda: publish fault epoch=%lu checks=%u sampled=%u raw_completed=%lu begin=%lu accepted=%u delta=%u\n",
+                f.epoch, f.publish.failedChecks, unsigned(f.publish.sampled),
+                f.publish.rawCompleted, f.publish.begin, f.publish.accepted, f.publish.delta);
+        }
     }
 }
 static bool StartNativePrimedLocked()
@@ -917,11 +935,13 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
     receipt.accepted = bytes;
     const uint64_t afterCopy = AudioClockNowNs();
     bool publishSafe = afterCopy != 0;
+    uint32_t raw = 0, position = 0, delta = 0;
+    uint64_t afterPosition = 0;
     if (g_streamRunning) {
-        const uint32_t raw = hda_read32(g_outStreamBase + SD_LPIB);
-        const uint64_t afterPosition = AudioClockNowNs();
-        const uint32_t position = raw == AUDIO_BUF_SIZE ? 0 : raw;
-        const uint32_t delta = (position + AUDIO_BUF_SIZE - g_nativeClock.Position()) % AUDIO_BUF_SIZE;
+        raw = hda_read32(g_outStreamBase + SD_LPIB);
+        afterPosition = AudioClockNowNs();
+        position = raw == AUDIO_BUF_SIZE ? 0 : raw;
+        delta = (position + AUDIO_BUF_SIZE - g_nativeClock.Position()) % AUDIO_BUF_SIZE;
         publishSafe = publishSafe && position < AUDIO_BUF_SIZE &&
             afterPosition && afterPosition >= afterCopy && afterPosition >= g_nativeClock.SampleBeforeNs() &&
             afterPosition - g_nativeClock.SampleBeforeNs() < AudioDmaClock::MaxSampleNs &&
@@ -931,7 +951,25 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
     if (!publishSafe) {
         // Some copied samples may have escaped. Charge the interval to this
         // epoch, but preserve only the pre-copy proven completion watermark.
-        FailNativeLocked("publish-unsafe");
+        // Diagnose only after rejection, using the exact samples already used
+        // above. Do not add MMIO/clock reads or relax the publication predicate.
+        NativePublishEvidence evidence{g_nativeClock.RawCompleted(), receipt.begin,
+            receipt.accepted, delta, 0, g_streamRunning};
+        if (!afterCopy) evidence.failedChecks |= PublishCopyClock;
+        if (g_streamRunning) {
+            if (position >= AUDIO_BUF_SIZE) evidence.failedChecks |= PublishPosition;
+            if (!afterPosition) evidence.failedChecks |= PublishPositionClock;
+            if (afterPosition < afterCopy || afterPosition < g_nativeClock.SampleBeforeNs())
+                evidence.failedChecks |= PublishClockOrder;
+            if (afterPosition >= g_nativeClock.SampleBeforeNs() &&
+                afterPosition - g_nativeClock.SampleBeforeNs() >= AudioDmaClock::MaxSampleNs)
+                evidence.failedChecks |= PublishSampleGap;
+            if (g_nativeClock.RawCompleted() > ~uint64_t(0) - delta)
+                evidence.failedChecks |= PublishOverflow;
+            else if (g_nativeClock.RawCompleted() + delta > receipt.begin)
+                evidence.failedChecks |= PublishDmaCaughtWrite;
+        }
+        FailNativeLocked("publish-unsafe", afterCopy, afterPosition, raw, 0, &evidence);
         receipt.error = -32; PlayUnlock(); return receipt;
     }
     g_nativeLastDataEnd = g_nativeClock.submitted;

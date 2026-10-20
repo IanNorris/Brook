@@ -199,10 +199,46 @@ int RunHdaClockTests() {
     afterCopyHook=[] { move(NATIVE_WRITE_LEAD+4,75000000); };
     receipt=HdaTrySubmit(tone.data(),4);snapshot=progress();
     VERIFY(receipt.accepted==4 && receipt.error==-32 && snapshot.discontinuity && snapshot.completed==8192);
+    VERIFY(g_nativeFaultEvidence.publish.failedChecks==PublishDmaCaughtWrite);
+    VERIFY(g_nativeFaultEvidence.publish.sampled && g_nativeFaultEvidence.publish.begin==receipt.begin);
+    VERIFY(g_nativeFaultEvidence.beforeNs==nowNs && g_nativeFaultEvidence.afterNs==nowNs);
+    VERIFY(g_nativeFaultEvidence.rawPosition==HdaTestRead(g_outStreamBase+SD_LPIB,4));
     initialize();receipt=HdaTrySubmit(tone.data(),8192);advanceNative(8188);
     afterCopyHook=[] { move(8,1000000); };
     receipt=HdaTrySubmit(tone.data(),4);snapshot=progress();
     VERIFY(receipt.accepted==4 && receipt.error==-32 && snapshot.discontinuity && snapshot.completed==8188);
+    VERIFY(g_nativeFaultEvidence.publish.failedChecks==PublishDmaCaughtWrite);
+    VERIFY(g_nativeFaultEvidence.publish.rawCompleted==8188 && g_nativeFaultEvidence.publish.delta==8);
+    VERIFY(g_nativeFaultEvidence.publish.begin==8192 && g_nativeFaultEvidence.publish.accepted==4);
+    VERIFY(!g_streamRunning && std::all_of(dma.begin(),dma.end(),[](uint8_t b){return b==0;}));
+    const auto publishFault=g_nativeFaultEvidence;
+    receipt=HdaTrySubmit(tone.data(),4);VERIFY(receipt.error==-32 && !receipt.accepted);
+    VERIFY(g_nativeFaultEvidence.afterNs==publishFault.afterNs &&
+           g_nativeFaultEvidence.publish.failedChecks==publishFault.publish.failedChecks);
+    // These independent rejections used to look identical in native logs.
+    initialize();receipt=HdaTrySubmit(tone.data(),8192);advanceNative(8188);
+    afterCopyHook=[] {nowNs+=AudioDmaClock::MaxSampleNs;};
+    receipt=HdaTrySubmit(tone.data(),4);snapshot=progress();
+    VERIFY(receipt.error==-32 && snapshot.discontinuity && snapshot.completed==8188);
+    VERIFY(g_nativeFaultEvidence.publish.failedChecks==PublishSampleGap);
+    VERIFY(g_nativeFaultEvidence.afterNs-g_nativeFaultEvidence.previousNs==AudioDmaClock::MaxSampleNs);
+    initialize();receipt=HdaTrySubmit(tone.data(),8192);advanceNative(8188);
+    afterCopyHook=[] {--nowNs;};
+    receipt=HdaTrySubmit(tone.data(),4);snapshot=progress();
+    VERIFY(receipt.error==-32 && snapshot.discontinuity && snapshot.completed==8188);
+    VERIFY(g_nativeFaultEvidence.publish.failedChecks==PublishClockOrder);
+    initialize();receipt=HdaTrySubmit(tone.data(),8192);advanceNative(8188);
+    afterCopyHook=[] {clockAvailable=false;};
+    receipt=HdaTrySubmit(tone.data(),4);snapshot=progress();
+    VERIFY(receipt.error==-32 && snapshot.discontinuity && snapshot.completed==8188);
+    VERIFY((g_nativeFaultEvidence.publish.failedChecks&(PublishCopyClock|PublishPositionClock))==
+           (PublishCopyClock|PublishPositionClock));
+    initialize();receipt=HdaTrySubmit(tone.data(),8192);advanceNative(8188);
+    afterCopyHook=[] {store(g_outStreamBase+SD_LPIB,4,AUDIO_BUF_SIZE+4);};
+    receipt=HdaTrySubmit(tone.data(),4);snapshot=progress();
+    VERIFY(receipt.error==-32 && snapshot.discontinuity && snapshot.completed==8188);
+    VERIFY(g_nativeFaultEvidence.publish.failedChecks&PublishPosition);
+    VERIFY(g_nativeFaultEvidence.rawPosition==AUDIO_BUF_SIZE+4);
     std::printf("HDA_CLOCK %s\n",failures?"FAIL":"PASS");return failures;
 }
 

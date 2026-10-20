@@ -71,6 +71,10 @@ absence of faults alone do not establish continuous or correctly paced sound.
 No speaker acceptance is claimed. Audio defects and the historical larger
 application speedup remain open.
 
+The [subsequent diagnostic/profile checkpoint](hda-publish-and-scheduler-profiles.md)
+fills the missing publication samples and records three loss-free profiles.
+It does not reproduce or fix this first baseline's intermittent HDA fault.
+
 ## Safety and evidence
 
 All four runs pass the collection/lifecycle gates: zero clock/runtime anomaly

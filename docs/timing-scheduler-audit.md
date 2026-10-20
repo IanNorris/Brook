@@ -31,6 +31,11 @@ further RR investigation, and verifies live Linux 2.8-ms requests against
 Brook EEVDF's 4-ms normal baseline. It also documents the isolated build-time
 request control and its model/module validation.
 
+[Publication diagnostics and short profiles](hda-publish-and-scheduler-profiles.md)
+retain the intermittent HDA fault as unresolved, improve its failure evidence,
+and identify address-space validation mutex waits and GPU completion polling
+in loss-free MLFQ/EEVDF captures. These counts do not establish wait durations.
+
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
 `f932600c7ef0ac9606057f8e976e47b3f397695aae69383dc965a6d342e2f1b3`.
 The native review initially estimated roughly 1.5× playback in Quake II and
