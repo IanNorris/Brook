@@ -5438,15 +5438,25 @@ static int64_t sys_clock_nanosleep(uint64_t clockid, uint64_t flags, uint64_t re
     if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1000000000LL)
         return -EINVAL;
     if (flags & 1) { // TIMER_ABSTIME: convert from the requested clock domain.
-        uint64_t deadline = static_cast<uint64_t>(req.tv_sec) * 1000000000ULL + req.tv_nsec;
+        uint64_t deadline;
+        if (__builtin_mul_overflow(static_cast<uint64_t>(req.tv_sec), 1000000000ULL, &deadline) ||
+            __builtin_add_overflow(deadline, static_cast<uint64_t>(req.tv_nsec), &deadline))
+            return -EINVAL;
         uint64_t now = ClockNowNs(clockid);
         if (deadline <= now) return 0;
-        uint64_t duration = deadline - now;
         Process* proc = ProcessCurrent();
         if (!proc) return -EINVAL;
-        proc->wakeupTick = g_lapicTickCount + (duration + 999999ULL) / 1000000ULL;
-        SchedulerBlock(proc);
-        return HasPendingSignals() ? -EINTR : 0;
+        while (now < deadline) {
+            if (HasPendingSignals()) return -EINTR;
+            const uint64_t remaining = deadline - now;
+            const uint64_t ticks = remaining / 1000000ULL + (remaining % 1000000ULL != 0);
+            proc->wakeupTick = g_lapicTickCount + ticks;
+            SchedulerBlock(proc);
+            // LAPIC ticks and unrelated wakeups are scheduling hints, not
+            // evidence that the selected clock's absolute deadline expired.
+            now = ClockNowNs(clockid);
+        }
+        return 0;
     }
     return sys_nanosleep(reqAddr, remAddr, 0, 0, 0, 0);
 }
