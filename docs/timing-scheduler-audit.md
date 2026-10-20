@@ -46,7 +46,11 @@ Later evidence supersedes several early leads:
   excess completion time. Quake also shows repeated physical silence gaps.
   The probe is off by default; publication lead, FIFO trailer and guards stay
   unchanged. Observer-effect and representative host-contention controls remain
-  necessary before a lead experiment.
+  necessary before a lead experiment. Four matched observer controls retain
+  the same roughly four-second stretching with recording off. Combined host
+  and guest CPU load reproduces a genuine sample-gap stop and multi-second
+  mixer delays; its empty capture is explicitly rejected as a headroom test.
+  Host-only and guest-only isolation now precedes any lead reduction.
 
 RR remains the default, with no further RR tuning planned. MLFQ and EEVDF are
 optional. Remaining acceptance includes default-path and broader desktop/game

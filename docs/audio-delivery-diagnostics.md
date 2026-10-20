@@ -147,3 +147,97 @@ Astra's read-only review agrees with the reservation interpretation and recommen
 matched off/on observer controls and representative contention before any lead experiment. Diagnostic
 reads/recording may perturb timing; no reduction in safety margin follows from
 these unloaded measurements alone. This instrumentation is not a playback fix.
+
+
+## Matched observer controls
+
+The refined frozen capsule runs four thirty-second direct-writer cases in one
+fresh private VM, in off/on/on/off order, always with 4,096-frame capacity. Each
+case drains, exports its guest size/hash receipt, and leaves the source closed
+before the next case. No CPU stress runs during these comparisons.
+
+| Diagnostic case | Completion | Source seconds / stored PCM second | Quiet 1-ms bins | Reserved physical silence |
+| --- | ---: | ---: | ---: | ---: |
+| off1 | 33.928 s | 0.8835 | 10.39% | not recorded |
+| on1 | 34.039 s | 0.8839 | 10.50% | 4.014 s |
+| on2 | 34.012 s | 0.8838 | 10.45% | 3.991 s |
+| off2 | 34.037 s | 0.8816 | 10.59% | not recorded |
+
+The pairs do not show a consistent observer slowdown. Mean completion differs by
+approximately 43 ms (0.13%); two cases per state do not establish zero overhead.
+The four-second stretching is present with recording disabled. Pitch remains
+approximately 1.0000. Both enabled cases account for all 5,292,000 source bytes,
+with no invalid samples, unsafe publications, saturation or contention drops.
+Default-off state, exact kernel/module identities, eight native control cases,
+job drains, original launcher/router exits, heap/runtime, four filesystem checks
+and saved-data preservation pass. Evidence is under `delivery-observer-*`.
+
+The initial analysis assertion requiring every coarse decoded ID failed on
+`on1`: its 50-ms FFT decoder missed symbol 53 between 52 and 54. That failed
+analysis/log is retained. A diagnostic report records the gap explicitly rather
+than converting it into a continuity pass. An independent 20-ms raw-spectrum
+check finds the expected unique 14,200-Hz tone in fourteen windows around that
+interval. This establishes tone presence, not complete frame delivery; source
+rate fits and consecutive coarse runs are not bit-exact continuity proofs.
+There are no backwards decoded transitions in these four captures.
+
+## Combined-load failure, not a headroom acceptance
+
+A further private Quake run adds the existing `SCHEDMIX` workload: 24 CPU workers
+and four periodic sleepers in the guest, plus twelve CPU workers and four
+periodic sleepers on the host for thirty seconds. All seventeen host threads
+(including their parent) are verified on CPUs 0–13 after workload readiness;
+CPUs 14–15 remain outside that affinity. Original host and guest jobs finish
+normally, and the capture interval is bracketed inside both timed load intervals.
+The reported guest/host elapsed-rate bracket is 0.99938–1.00665, consistent with
+1× elapsed KVM time. The demo observation interval grows to 44.355 s; it does
+not demonstrate the historical accelerated playback.
+
+This run **fails audio acceptance**. The original controller's local
+`Q2_MUSIC_VM_ACCEPTED` completion message covered job/clock/heap/filesystem
+checks, not all audio failure gates. The independent serial/stream/capture audit
+supersedes it:
+
+- HDA reports `reason=sample-gap` after an 800.636-ms interval from its preceding
+  position-sample start. The unchanged half-ring bound is approximately
+  185.760 ms. The last proven completion is preserved; no wrap is guessed.
+- Cached stream diagnostics latch a discontinuity. There are no new accepted
+  copies between the capture's surrounding delivery snapshots. The capture is
+  inactive and contains **zero frames**, so it supplies no loaded headroom or
+  source-rate measurement.
+- Mixer service timing retains a 790.620-ms late wake at the fault, followed by
+  2.463 s in the service bracket. Other retained wake delays reach 4.640 s.
+  Those brackets include host delay and locks; they do not identify a scheduler
+  queue wait or prove a particular lock owner.
+- `unsafe == 0` in the copy probe does **not** exclude this fault: it counts
+  post-copy publication rejection, whereas this failure occurs in progress
+  sampling before another accepted copy. Serial faults, stream discontinuities,
+  capture activity/frame count and clock/model validity are separate gates.
+
+Across surrounding guest-clock observations at 29.992 and 61.524 s, accumulated
+reported steal rises from 0.027 to 116.352 **CPU seconds** across eight vCPUs.
+This is not 116 seconds of wall time, and it does not localize individual late
+wakes. A post-run check finds no CPU quota or recorded throttling in the
+launching process's cgroup hierarchy. Direct QEMU/worker membership and per-CPU
+timer/ready-watch observations should be recorded in the isolated follow-ups.
+
+The run is retained as an expected failure reproduction under
+`q2-delivery-loaded-r2`, with an explicit false audio-acceptance artifact and a
+verifier that checks the fault rather than hiding it. Original host/guest jobs
+and VM/router owners exit normally; runtime accounting, heap integrity, four
+filesystem checks, saved data and staged identities pass. The final extrema
+are from before the stress period and cannot certify loaded headroom.
+
+An earlier `q2-delivery-loaded` fixture fails a host-side affinity assertion
+because it checks immediately after spawning `taskset`, before `taskset` applies
+the mask. Its original Quake job and bounded host worker drain, and normal VM
+shutdown/filesystem/preservation checks pass. The original host exit status is
+not recovered, so this is not a performance control. Its retained serial log also
+contains a sample-gap fault; guest CPU stress was never started. That is a lead
+for a clean host-only repeat, not a substitute for one. The corrected fixture
+checks all actual host thread affinities only after workload readiness.
+
+No publication lead, FIFO trailer, sampling bound or scheduler default changes
+follow from these results. Before a smaller-lead experiment, separate guest-only
+from host-only load and enable the existing worker ready-watch/BSP/AP timing
+probes to distinguish late wake publication, ready-queue delay and host stalls.
