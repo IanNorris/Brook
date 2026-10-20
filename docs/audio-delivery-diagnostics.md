@@ -922,3 +922,85 @@ kept separately in `syscall-return-verified-results.json` and
 failure; neither the quiet control nor diagnostic coverage establishes broad
 browser acceptance, fixes the historical speedup, or justifies changing the
 default scheduler.
+
+
+## Correlating remaining producer gaps with context switches
+
+Two further private host-load runs retain the same phase-separated kernel and
+thirteen driver modules, adding a five-second existing CPU/CS capture:
+`q2-syscall-profile-try-1` and `q2-syscall-profile-try-2`. They complete the demo
+in 41.734 and 42.594 seconds. All original workload/load/CPU-clock jobs,
+ledger/heap/clock checks, VM/router exits, filesystem checks and saved-data
+preservation pass; both full-window audio gates still fail without native
+faults or stream discontinuities. The captures contain respectively 1,219
+samples/5,311 CS events and 679 samples/3,365 CS events, with matching event
+counts, zero reported drops and successful exact-kernel symbolization.
+
+The verified DSP writer has six user samples in the first profile and sixteen
+in the second, all at `0x10217922`. Kernel samples are mostly poll/block and
+kernel-region enter/leave paths. Kernel-region samples at the post-STI
+instructions remain a biased observation, not a measure of ticket spinning.
+The first profile has twenty-two additional writer kernel samples; the second
+has nineteen. These are delivered-IRQ counts, not percentages of CPU time.
+
+Profile ticks are converted using the recorded pvclock origin and the
+capture's global start tick. Correlation retains the full one-millisecond
+quantization interval and excludes records touching a gap boundary. A sample
+records an interrupted frame after interrupt entry; descheduling or IRQ-prefix
+work can separate that frame from the record time. CS events mark scheduler
+bookkeeping before the physical switch, not proof of completed dispatch.
+These limitations apply even with zero reported ring drops.
+
+In the second capture, an observed 1,321.415-ms inter-phase gap contains nine
+same-address user samples and nineteen outgoing writer CS records, seventeen
+with timer-handler stacks. Another 1,151.764-ms gap contains five same-address
+user samples and twenty-five outgoing records, twenty-four from timer stacks.
+The first capture independently has repeated timer switch-outs during its
+1,994.408-ms and 581.444-ms gaps. This fits repeated preemption before useful
+user progress; it does not establish the decision reason or attribute every
+millisecond of a gap. The third capture below verifies the libc mapping independently, rather
+than relying solely on the matching page offset of its syscall-return
+instruction.
+
+Astra's read-only source review rules out moving `sliceStartTick` as a sufficient
+experiment: these are MLFQ runs, and its expiry uses retained `usedNs` after
+service observations begin. Incoming runtime ownership precedes the physical
+switch and post-switch drain; kernel/IRQ work is charged to the owner, minus
+reported host steal. MLFQ may preempt either for exhausted service budget or a
+queued higher-priority task, and it retains overrun debt. Consequently the
+next bounded diagnostic should retain the actual decision reason, used service,
+quantum/priority, dispatch generation and interrupted RIP, alongside service
+and timestamps at dispatch and after post-switch draining. Only then can an
+experiment separate debt/charged kernel work from higher-priority arrivals.
+Renewing budgets at dispatch, dropping debt, moving accounting ownership
+without preserving intervening service, or enabling arbitrary kernel
+preemption would change semantics without proving the cause.
+
+
+A third fresh run (`q2-syscall-profile-try-3`) preserves loader output in its own
+file, independently of the game output. The second run's mixed output does not
+retain the initial libc map and is not treated as a successful address
+verification. In the third run, the loader explicitly reports libc at
+`0x10171000`, needed by the actual Quake executable. The exact libc extracted
+from that run's stopped disk has `__syscall_cancel_arch_end` at `0xa6922`:
+`syscall` at `0xa6920`, then `ret` at `0xa6922`. Their sum is exactly
+`0x10217922`, matching all eight writer user samples in that capture.
+`user-address-resolution.json` retains the map, ELF hashes and scope. This is
+loader/disk-image resolution, not a direct instruction-retirement measurement;
+earlier same-address captures are consistent but lack their own preserved
+startup libc maps.
+
+The third demo takes 41.955 seconds. Its profile has 524 samples/1,159 CS events,
+matching counts and zero reported drops. All original workload/load/CPU-clock,
+ledger/heap/clock, VM/router, filesystem and saved-data checks pass again;
+audio acceptance remains false without native faults/discontinuities. Thus
+three profiles reproduce host-load failure on the unchanged frozen kernel.
+The verified syscall-return location strengthens the repeated-preemption
+hypothesis, but neither proves its decision reason nor resolves the historical
+fast-tempo symptom. A bounded decision/service trace is the next experiment;
+there is no new scheduler behavior or default change in this evidence update.
+
+Exact controllers, analysis and verification scripts, kernel/driver identity,
+profile/correlation/loader-resolution results and hashes are archived in
+`syscall-profile-sources` under the ignored timing workload root. The three
+outcomes are retained in `syscall-profile-verified-results.json`.
