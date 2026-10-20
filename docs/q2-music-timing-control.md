@@ -27,8 +27,8 @@ The initial 0.85–1.65 search landed at its lower edge, so the retained follow-
 widens the range to 0.50–1.65. Independently generated 1× and pitch-preserving
 1.3× controls recover 1.000×/1.300× with similarities 0.948/0.913. Thus this is
 a supported slower-source-progression lead, not a fitted historical speedup or
-a reason to claim the music is fixed. It still needs a matched old-module
-control and repeat before attributing it to MLFQ or any other component.
+a reason to claim the music is fixed. Matched controls below do not attribute
+it to MLFQ or to BSP-only wake scanning.
 
 The game job exits zero with no live lineage tasks. Runtime/clock checks pass,
 all eight pvclock/steal slots are active, policy service exactly matches the
@@ -41,6 +41,39 @@ subwindow results, control results and input/script SHA-256 identities. The
 initial host-Python NumPy import failure and successful isolated Nix analysis
 are retained separately. No copyrighted asset is committed or put in a Nix
 derivation.
+
+### Matched module and wake-scan controls
+
+Three more fresh private boots retain the same kernel, other twelve modules,
+GL3 scene, music source, SDL/private null output and capture procedure. The old
+MLFQ module is the exact preserved control used in the browser comparisons.
+The shared-scanning run uses the candidate module and records 1,555 AP scans,
+valid consistent counters, then restores BSP mode before shutdown.
+
+| Run | MLFQ / wake scanning | Guest demo interval | Whole music fit | Similarity | Longest silent 10 ms bins |
+| --- | --- | ---: | ---: | ---: | ---: |
+| q2-mlfq-current | candidate / BSP | 15.2415 s | 0.825× | 0.796 | 1 |
+| q2-mlfq-control | old / BSP | 15.2122 s | 0.830× | 0.815 | 3 |
+| q2-mlfq-repeat | candidate / BSP | 15.2359 s | 0.830× | 0.800 | 3 |
+| q2-mlfq-shared | candidate / shared | 15.2687 s | 0.825× | 0.804 | 3 |
+
+This closely repeated slower-progression lead is independent of the tested
+MLFQ change and survives AP wake-scan handoff. It does not establish which
+shared component causes it. Every recording has approximately eight seconds
+of PCM over eight host seconds; that output sample count alone cannot establish
+source pacing. Sampled stream counters likewise progress below the nominal
+44.1-kHz output rate, but sparse observations do not distinguish producer delay,
+silence insertion, resampling or other causes.
+
+All four runs pass job-lineage drain, original launcher/router completion,
+clock/runtime checks, heap, four filesystems and preservation. Staged module
+hashes verify the intended variants; candidate service/queue snapshots agree
+with the kernel ledger and actual queue walk. No native HDA fault or sampled
+stream discontinuity is retained. Ignored `q2-mlfq-music-comparison.json` records
+the comparison, with raw evidence in the four named directories. To avoid
+depending solely on commercial-music alignment, the next diagnostic sends the
+existing synthetic packet-code-v1 signal through Quake's actual OGG music path
+in fresh private clones. Original OST files and golden disks remain untouched.
 
 ## Earlier controls
 
