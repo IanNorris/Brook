@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include "audio_service_timing.h"
+#include "audio_delivery_timing.h"
 
 namespace brook {
 

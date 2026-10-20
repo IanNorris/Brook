@@ -28,6 +28,33 @@ extern "C" uint64_t AudioClockNowNs()
     return KvmClockReadStableNs(&now) ? now : 0;
 }
 
+static SpinLock g_deliveryTimingLock;
+static AudioDeliveryTimingModel g_deliveryTiming;
+static uint64_t g_deliveryTimingEpoch=0,g_deliveryTimingContention=0;
+extern "C" uint64_t AudioDeliveryTimingToken(){return __atomic_load_n(&g_deliveryTimingEpoch,__ATOMIC_ACQUIRE);}
+void AudioDeliveryTimingEnable(bool on){
+    SpinLockAcquire(&g_deliveryTimingLock);g_deliveryTiming.Enable(on);
+    __atomic_store_n(&g_deliveryTimingEpoch,g_deliveryTiming.Token(),__ATOMIC_RELEASE);SpinLockRelease(&g_deliveryTimingLock);
+}
+void AudioDeliveryTimingReset(){
+    SpinLockAcquire(&g_deliveryTimingLock);g_deliveryTiming.Reset();
+    __atomic_store_n(&g_deliveryTimingEpoch,g_deliveryTiming.Token(),__ATOMIC_RELEASE);SpinLockRelease(&g_deliveryTimingLock);
+}
+AudioDeliveryTimingSnapshot AudioDeliveryTimingRead(){
+    SpinLockAcquire(&g_deliveryTimingLock);auto s=g_deliveryTiming.Snapshot();SpinLockRelease(&g_deliveryTimingLock);
+    s.contendedRecords=__atomic_load_n(&g_deliveryTimingContention,__ATOMIC_RELAXED);return s;
+}
+extern "C" void AudioDeliveryTimingRecord(uint64_t token,const AudioDeliveryEvent* e){
+    if(!e || !(token&1))return;
+    // Driver owns its playback lock. Never wait for a diagnostic reader.
+    if(!SpinLockTryAcquire(&g_deliveryTimingLock)){
+        auto old=__atomic_load_n(&g_deliveryTimingContention,__ATOMIC_RELAXED);
+        while(old!=~uint64_t(0) && !__atomic_compare_exchange_n(&g_deliveryTimingContention,&old,old+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+        return;
+    }
+    g_deliveryTiming.Observe(token,*e);SpinLockRelease(&g_deliveryTimingLock);
+}
+
 static const AudioDriver* g_audioDriver = nullptr;
 static SpinLock g_mixerLock;
 static SpinLock g_audioTimingLock;

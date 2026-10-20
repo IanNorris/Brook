@@ -40,6 +40,13 @@ Later evidence supersedes several early leads:
   do not establish a consistent desktop benefit. That candidate is preserved
   as an experiment and removed from the default path. Quake's residual gaps
   remain, separate from historical acceleration.
+- [HDA delivery diagnostics](audio-delivery-diagnostics.md) now account for
+  reserved silence separately from application bytes. In the 4,096-frame
+  direct control, 3.981 s of reservations explains nearly all the 4.023 s of
+  excess completion time. Quake also shows repeated physical silence gaps.
+  The probe is off by default; publication lead, FIFO trailer and guards stay
+  unchanged. Observer-effect and representative host-contention controls remain
+  necessary before a lead experiment.
 
 RR remains the default, with no further RR tuning planned. MLFQ and EEVDF are
 optional. Remaining acceptance includes default-path and broader desktop/game

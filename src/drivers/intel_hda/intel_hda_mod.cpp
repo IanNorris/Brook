@@ -42,6 +42,8 @@ MODULE_IMPORT_SYMBOL(VmmMapPage);
 MODULE_IMPORT_SYMBOL(PmmAllocPage);
 MODULE_IMPORT_SYMBOL(AudioRegister);
 MODULE_IMPORT_SYMBOL(AudioClockNowNs);
+MODULE_IMPORT_SYMBOL(AudioDeliveryTimingToken);
+MODULE_IMPORT_SYMBOL(AudioDeliveryTimingRecord);
 MODULE_IMPORT_SYMBOL(SchedulerYield);
 MODULE_IMPORT_SYMBOL(SchedulerSleepMs);
 
@@ -904,7 +906,10 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
         }
         g_nativeRingBase = g_nativeClock.submitted;
     }
-    if (g_streamRunning && g_nativeClock.Pending() < NATIVE_WRITE_LEAD) {
+    const uint64_t timingToken=AudioDeliveryTimingToken();
+    const uint64_t pendingBeforeReserve=g_nativeClock.Pending();
+    uint64_t reservedForTiming=0;
+    if (g_streamRunning && pendingBeforeReserve < NATIVE_WRITE_LEAD) {
         const uint64_t oldEnd=g_nativeClock.submitted;
         if (g_nativeClock.completed > ~uint64_t(0) - NATIVE_WRITE_LEAD ||
             !g_nativeClock.ReserveGap(g_nativeClock.completed + NATIVE_WRITE_LEAD)) {
@@ -915,6 +920,7 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
         // fetch during memcpy. Leave it intact, clear only the unowned gap,
         // and place the new receipt beyond the existing conservative lead.
         const uint64_t gapBytes=g_nativeClock.submitted-oldEnd;
+        reservedForTiming=gapBytes;
         if(oldEnd<g_nativeRingBase || gapBytes>=AUDIO_BUF_SIZE){
             FailNativeLocked("reserve-gap-range");
             receipt.error=-5;PlayUnlock();return receipt;
@@ -933,6 +939,7 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
     const uint32_t offset = static_cast<uint32_t>((g_nativeClock.submitted - g_nativeRingBase) % AUDIO_BUF_SIZE);
     uint32_t first = AUDIO_BUF_SIZE - offset;
     if (first > bytes) first = bytes;
+    const uint64_t beforeCopyForTiming=(timingToken&1)?AudioClockNowNs():0;
     memcpy(g_audioBuf + offset, samples, first);
     if (bytes > first) memcpy(g_audioBuf, static_cast<const uint8_t*>(samples) + first, bytes - first);
 #ifdef BROOK_HOST_TEST
@@ -961,6 +968,19 @@ static AudioSubmitReceipt HdaTrySubmit(const void* samples, uint32_t bytes)
             afterPosition - g_nativeClock.SampleBeforeNs() < AudioDmaClock::MaxSampleNs &&
             g_nativeClock.RawCompleted() <= ~uint64_t(0) - delta &&
             g_nativeClock.RawCompleted() + delta <= receipt.begin;
+    }
+    if(timingToken&1){
+        // Diagnostic-only extra pre-copy clock read. Reuse the exact post-copy
+        // position/clock samples used by the unchanged publication predicate.
+        const bool validPosition=position<AUDIO_BUF_SIZE && afterPosition &&
+            afterPosition>=afterCopy && afterPosition>=g_nativeClock.SampleBeforeNs() &&
+            afterPosition-g_nativeClock.SampleBeforeNs()<AudioDmaClock::MaxSampleNs &&
+            g_nativeClock.RawCompleted()<=~uint64_t(0)-delta && receipt.begin>=g_nativeClock.RawCompleted();
+        const AudioDeliveryEvent event{g_nativeClock.epoch,beforeCopyForTiming,afterCopy,afterPosition,
+            pendingBeforeReserve,reservedForTiming,
+            receipt.begin>=g_nativeClock.RawCompleted()?receipt.begin-g_nativeClock.RawCompleted():0,
+            receipt.accepted,delta,g_streamRunning,validPosition,publishSafe};
+        AudioDeliveryTimingRecord(timingToken,&event);
     }
     if (!publishSafe) {
         // Some copied samples may have escaped. Charge the interval to this

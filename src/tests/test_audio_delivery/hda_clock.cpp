@@ -353,6 +353,39 @@ int RunMixerClockTests() {
     VERIFY(AudioMixerGetProgress(a,&pa) && !pa.completedFrames && pa.queuedFrames==2);
     AudioMixerFlush();advanceNative(g_nativeClock.Pending());AudioMixerRefresh();
     VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==2 && !pa.queuedFrames);
+    // Probe actual production reserve/copy samples without changing the
+    // publication predicate. MMIO advances during the synthetic copy hook.
+    AudioStop();initialize();AudioMixerRefresh();
+    AudioDeliveryTimingEnable(true);AudioDeliveryTimingReset();
+    VERIFY(AudioMixerSubmit(first.data(),2,a)==2);AudioMixerFlush();
+    advanceNative(4);AudioMixerRefresh();
+    afterCopyHook=[] {move(4,49000);};
+    VERIFY(AudioMixerSubmit(second.data(),2,a)==2);AudioMixerFlush();
+    auto timing=AudioDeliveryTimingRead();
+    VERIFY(timing.observations==2 && timing.reservations==1 && timing.reservedBytes==12284);
+    VERIFY(timing.maxCopyNs==49000 && timing.maxAdvanceBytes==4 && timing.minHeadroomBytes==12284);
+    VERIFY(!timing.invalidClock && !timing.invalidPosition && !timing.unsafe);
+    afterCopyHook=[] {move(20000,49000);};
+    VERIFY(AudioMixerSubmit(first.data(),2,a)==2);AudioMixerFlush();
+    timing=AudioDeliveryTimingRead();
+    VERIFY(timing.observations==3 && timing.unsafe==1 && timing.minHeadroomBytes==0);
+    VERIFY(g_nativeClock.discontinuity); // instrumentation never relaxes guard
+    AudioDeliveryTimingEnable(false);AudioStop();initialize();AudioMixerRefresh();
+    VERIFY(AudioMixerSubmit(first.data(),2,a)==2);AudioMixerFlush();
+    VERIFY(AudioDeliveryTimingRead().observations==3); // off means no recording
+    // A stale device sample may have a valid raw position but cannot establish
+    // headroom. Keep it out of extrema while preserving the publication fault.
+    AudioStop();initialize();AudioMixerRefresh();
+    AudioDeliveryTimingEnable(true);AudioDeliveryTimingReset();
+    VERIFY(AudioMixerSubmit(first.data(),2,a)==2);AudioMixerFlush();
+    advanceNative(4);AudioMixerRefresh();
+    afterCopyHook=[] {nowNs+=AudioDmaClock::MaxSampleNs;};
+    VERIFY(AudioMixerSubmit(second.data(),2,a)==2);AudioMixerFlush();
+    timing=AudioDeliveryTimingRead();
+    VERIFY(timing.observations==2 && timing.unsafe==1 && timing.invalidPosition==1);
+    VERIFY(!timing.runningSamples && !timing.maxAdvanceEvent.hardwareEpoch && !timing.minHeadroomEvent.hardwareEpoch);
+    VERIFY(g_nativeClock.discontinuity);
+    AudioDeliveryTimingEnable(false);
     VERIFY(AudioMixerClose(a) && AudioMixerClose(b));mixerClockEnabled=false;AudioStop();
     std::printf("MIXER_CLOCK %s\n",failures?"FAIL":"PASS");return failures;
 }

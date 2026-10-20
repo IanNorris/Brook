@@ -3676,6 +3676,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  audio stats - cached stream queues, completion and guest clock\n"
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
+            "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
             "  timer peers on|off|reset|status - per-CPU timer arrivals (default off)\n"
@@ -3980,6 +3981,42 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             row.text(",\"worked\":");row.text(e.worked?"true":"false");row.text("}");row.send();
         }
         DebugChannelSend("]}\n");
+    }
+    else if(NetStrEq(cmd,"audio delivery on") || NetStrEq(cmd,"audio delivery off") ||
+            NetStrEq(cmd,"audio delivery reset") || NetStrEq(cmd,"audio delivery status")) {
+        if(NetStrEq(cmd,"audio delivery on"))AudioDeliveryTimingEnable(true);
+        else if(NetStrEq(cmd,"audio delivery off"))AudioDeliveryTimingEnable(false);
+        else if(NetStrEq(cmd,"audio delivery reset"))AudioDeliveryTimingReset();
+        const auto s=AudioDeliveryTimingRead();BridgeReply h;h.text("{");h.field("epoch",s.epoch);
+        h.text(",\"enabled\":");h.text((s.epoch&1)?"true":"false");
+        h.text(",\"scope\":\"accepted HDA submissions only; physical bytes include unowned silence; diagnostic adds pre-copy KVM read, no extra MMIO; recent events not full timeline; contention since boot\",");h.send();
+        BridgeReply r;
+        r.field("observations",s.observations);r.text(",");r.field("accepted_bytes",s.acceptedBytes);
+        r.text(",");r.field("reservations",s.reservations);r.text(",");r.field("reserved_bytes",s.reservedBytes);
+        r.text(",");r.field("invalid_clock",s.invalidClock);r.text(",");r.field("invalid_position",s.invalidPosition);
+        r.text(",");r.field("unsafe",s.unsafe);r.text(",");r.field("running_samples",s.runningSamples);
+        r.text(",");r.send();BridgeReply m;
+        m.field("max_copy_ns",s.maxCopyNs);m.text(",");m.field("max_copy_and_position_ns",s.maxSubmissionNs);
+        m.text(",");m.field("max_advance_bytes",s.maxAdvanceBytes);m.text(",");m.field("min_headroom_bytes",s.runningSamples?s.minHeadroomBytes:0);
+        m.text(",");m.field("max_reserved_bytes",s.maxReservedBytes);m.text(",");m.field("contended_records",s.contendedRecords);
+        m.text(",\"saturated\":");m.text(s.saturated?"true":"false");
+        m.text(",\"copy_bin_edges_ns\":[1000,10000,100000,1000000,10000000,100000000],\"copy_bins\":[");
+        for(unsigned i=0;i<7;++i){if(i)m.text(",");m.number(s.copyBins[i]);}m.text("],\"events\":[");m.send();
+        auto emit=[](const AudioDeliveryEvent& e){BridgeReply row;
+            row.text("{");row.field("hardware_epoch",e.hardwareEpoch);
+            row.text(",");row.field("before_copy_ns",e.beforeCopyNs);row.text(",");row.field("after_copy_ns",e.afterCopyNs);
+            row.text(",");row.field("after_position_ns",e.afterPositionNs);row.text(",");row.field("pending_before_reserve",e.pendingBeforeReserve);
+            row.text(",");row.field("reserved_bytes",e.reservedBytes);row.text(",");row.field("lead_before_bytes",e.leadBeforeBytes);
+            row.text(",");row.field("accepted_bytes",e.acceptedBytes);row.text(",");row.field("advanced_bytes",e.advancedBytes);
+            row.text(",\"running\":");row.text(e.running?"true":"false");row.text(",\"position_valid\":");row.text(e.positionValid?"true":"false");
+            row.text(",\"publish_safe\":");row.text(e.publishSafe?"true":"false");row.text("}");row.send();
+        };
+        for(unsigned i=0;i<s.retained;++i){
+            if(i)DebugChannelSend(",");emit(s.events[(s.next+AudioDeliveryEventSlots-s.retained+i)%AudioDeliveryEventSlots]);
+        }
+        DebugChannelSend("],\"max_advance_event\":");emit(s.maxAdvanceEvent);
+        DebugChannelSend(",\"min_headroom_event\":");emit(s.minHeadroomEvent);
+        DebugChannelSend("}\n");
     }
     else if (NetStrEq(cmd, "audio stats")) {
         DebugAudioDiagnostics();
