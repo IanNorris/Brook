@@ -21,6 +21,10 @@ launcher now defaults to callback HDA with a 20-ms requested host buffer; RR
 remains the scheduler default. The historical larger application factor and
 intermittent native discontinuity remain open.
 
+The [six scheduler repeats with the new audio defaults](scheduler-small-buffer-comparison.md)
+retain the latency/presentation tradeoff: EEVDF wakes periodic tasks sooner,
+MLFQ presents more video, and RR shows browser audio-producer starvation.
+
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
 `f932600c7ef0ac9606057f8e976e47b3f397695aae69383dc965a6d342e2f1b3`.
 The native review initially estimated roughly 1.5× playback in Quake II and

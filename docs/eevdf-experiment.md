@@ -6,6 +6,10 @@ reported Quake II/Firefox playback acceleration has been reproduced or fixed.
 Current limits and earlier measurements are in
 [timing-scheduler-audit.md](timing-scheduler-audit.md).
 
+The latest [callback/20-ms browser repeats](scheduler-small-buffer-comparison.md)
+retain EEVDF's wakeup-latency advantage while MLFQ presents more video. RR
+remains the default; clean collection is separate from playback acceptance.
+
 ## Policy contract
 
 This is an original Brook implementation of EEVDF's eligibility/deadline model,
