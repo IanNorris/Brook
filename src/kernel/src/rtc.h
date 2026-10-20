@@ -8,8 +8,8 @@ namespace brook {
 // Call after KvmClockInit, before AP/application readers; source fixed at boot.
 void RtcInit();
 
-// Re-align g_lapicTickCount against the CMOS RTC.  Called once per second
-// from the BSP's LAPIC timer ISR to correct for timer calibration drift.
+// Fallback CMOS-based timer-frequency discipline. Never rebase elapsed time.
+// The stable-pvclock timer path does not call this routine.
 void RtcRecalibrateLapic();
 
 // Nanoseconds since Unix epoch, advanced from one boot CMOS/elapsed anchor.

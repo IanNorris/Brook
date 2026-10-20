@@ -10,4 +10,13 @@ constexpr bool ClockIntervalElapsed(uint64_t now, uint64_t started, uint64_t del
     const uint64_t elapsed = now - started;
     return elapsed <= (~uint64_t{0} >> 1) && elapsed >= delay;
 }
+
+// Sample once after a boundary even if IRQ delivery skips its exact tick.
+// Keep the original phase, but do not invent historical samples after a gap.
+inline bool ClockTakePeriodicSample(uint64_t now, uint64_t interval, uint64_t& previous)
+{
+    if (!interval || !ClockIntervalElapsed(now, previous, interval)) return false;
+    previous = now - (now - previous) % interval;
+    return true;
+}
 }

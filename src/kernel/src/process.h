@@ -361,7 +361,7 @@ struct Process
     volatile uint32_t inReadyQueue;  // 0 or 1 — debug guard against double-insert
 
     // Blocking info (e.g. nanosleep wakeup tick)
-    uint64_t wakeupTick;        // g_lapicTickCount value to unblock at (0 = N/A)
+    uint64_t wakeupTick;        // ApicTickCount() elapsed-ms deadline (0 = N/A)
 
     // BRO-176 lost-enqueue diagnostic: a small ring of recent scheduler events
     // touching this process. Each entry packs (tick<<16 | site<<8 | state).

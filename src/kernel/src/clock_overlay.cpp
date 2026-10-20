@@ -1,3 +1,4 @@
+#include "apic.h"
 // clock_overlay.cpp — Kernel thread that renders uptime in the top-right
 // corner of the physical framebuffer. Serves as a proof-of-concept for
 // kernel threads and verifies they schedule, sleep, and wake correctly.
@@ -10,7 +11,6 @@
 #include "serial.h"
 
 // LAPIC tick counter (1 tick = 1ms).
-namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
 namespace brook {
 
@@ -119,7 +119,7 @@ static void ClockThreadFn(void* /*arg*/)
         {
             // Sleep 100ms and try again.
             Process* self = ProcessCurrent();
-            self->wakeupTick = g_lapicTickCount + 100;
+            self->wakeupTick = ApicTickCount() + 100;
             SchedulerBlock(self);
         }
     }
@@ -132,7 +132,7 @@ static void ClockThreadFn(void* /*arg*/)
 
     for (;;)
     {
-        uint64_t uptimeMs = g_lapicTickCount;
+        uint64_t uptimeMs = ApicTickCount();
         uint64_t uptimeSec = uptimeMs / 1000;
 
         char buf[16];
@@ -152,7 +152,7 @@ static void ClockThreadFn(void* /*arg*/)
 
         // Sleep 1 second
         Process* self = ProcessCurrent();
-        self->wakeupTick = g_lapicTickCount + 1000;
+        self->wakeupTick = ApicTickCount() + 1000;
         SchedulerBlock(self);
     }
 }

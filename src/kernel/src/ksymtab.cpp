@@ -196,6 +196,7 @@ EXPORT_SYMBOL(memset);
 EXPORT_SYMBOL(memmove);
 
 // Timer / timing
+EXPORT_SYMBOL(ApicTickCount);
 namespace brook { extern volatile uint64_t g_lapicTickCount; }
 static __attribute__((section(".ksymtab"), used)) const brook::KernelSymbol
     __ksym_named_g_lapicTickCount = {

@@ -1,3 +1,4 @@
+#include "apic.h"
 #include "posix_timer.h"
 #include "process.h"
 #include "scheduler.h"
@@ -8,7 +9,6 @@
 namespace brook {
 static_assert(sizeof(SignalInfo) == 128);
 static_assert(offsetof(SignalInfo, _data) == 16);
-extern volatile uint64_t g_lapicTickCount;
 namespace {
 constexpr unsigned TimerLimit = 128;
 constexpr uint64_t Billion = 1000000000ULL;
@@ -34,7 +34,7 @@ uint64_t Now(int clock)
     // Realtime's seconds and fraction must share the RTC driver's immutable
     // epoch. Pvclock's fractional phase is unrelated to that epoch.
     if (clock == 0) return RtcNowNs();
-    return KvmClockAvailable() ? KvmClockReadNs() : g_lapicTickCount * 1000000ULL;
+    return KvmClockAvailable() ? KvmClockReadNs() : ApicTickCount() * 1000000ULL;
 }
 uint64_t OwnerIncarnation(Process* p)
 {

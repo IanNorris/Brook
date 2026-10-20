@@ -1,3 +1,4 @@
+#include "apic.h"
 // profiler.cpp — Sampling profiler implementation
 //
 // See profiler.h for overview.  The hot path (ProfilerSample) runs in ISR
@@ -30,7 +31,6 @@
 extern "C" uint8_t __text_start[], __text_end[];
 
 // LAPIC tick counter (defined in apic.cpp).
-namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
 namespace brook {
 
@@ -131,7 +131,7 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
     if (!g_profilerEnabled) return;
 
     // Auto-stop after duration
-    uint64_t now = g_lapicTickCount;
+    uint64_t now = ApicTickCount();
     if (g_profilerEndTick != 0 && now >= g_profilerEndTick) {
         g_profilerEnabled = false;
         g_profilerFlushReq = true;
@@ -214,7 +214,7 @@ void ProfilerContextSwitch(uint16_t oldPid, uint16_t newPid,
         return;
     }
 
-    uint64_t now = g_lapicTickCount;
+    uint64_t now = ApicTickCount();
 
     ProfileSample& s = buf.samples[wi];
     s.type   = ProfileEventType::ContextSwitch;
@@ -590,12 +590,12 @@ static void ProfilerThreadFn(void* /*arg*/)
             while (g_profilerEnabled) {
                 Process* self = ProcessCurrent();
                 if (self) {
-                    self->wakeupTick = g_lapicTickCount + 1000; // 1 s
+                    self->wakeupTick = ApicTickCount() + 1000; // 1 s
                     SchedulerBlock(self);
                 }
                 // Use real wall time for progress messages, not wake count
                 uint32_t elapsed = static_cast<uint32_t>(
-                    (g_lapicTickCount - g_profilerStartTick) / 1000);
+                    (ApicTickCount() - g_profilerStartTick) / 1000);
                 if (elapsed % 10 == 0 && elapsed > 0)
                     SerialPrintf("PROFILER: recording (%u s)\n", elapsed);
 
@@ -679,7 +679,7 @@ void ProfilerStart(uint32_t durationMs)
         return;
     }
 
-    g_profilerStartTick = g_lapicTickCount;
+    g_profilerStartTick = ApicTickCount();
     g_profilerEndTick   = durationMs > 0 ? (g_profilerStartTick + durationMs) : 0;
     g_profilerFlushReq  = false;
 

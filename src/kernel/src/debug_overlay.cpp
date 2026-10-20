@@ -1,3 +1,4 @@
+#include "apic.h"
 // debug_overlay.cpp — Kernel console: ring buffer + WM window + TCP debug server.
 //
 // A kernel thread owns a VFB and renders the last N lines of kernel log
@@ -199,7 +200,6 @@ static void RenderGlyph(uint32_t* vfb, uint32_t stride, uint32_t w, uint32_t h,
     }
 }
 
-extern volatile uint64_t g_lapicTickCount;
 
 static void KernelConsoleThread(void* /*arg*/)
 {
@@ -295,7 +295,7 @@ static void KernelConsoleThread(void* /*arg*/)
         }
 
         // Sleep briefly, then check for new content
-        self->wakeupTick = g_lapicTickCount + 100; // ~100ms
+        self->wakeupTick = ApicTickCount() + 100; // ~100ms
         SchedulerBlock(self);
     }
 }
@@ -369,7 +369,7 @@ static void DebugTcpThread(void* /*arg*/)
         {
             // Brief pause then retry
             Process* self = ProcessCurrent();
-            self->wakeupTick = g_lapicTickCount + 500;
+            self->wakeupTick = ApicTickCount() + 500;
             SchedulerBlock(self);
             continue;
         }
@@ -389,7 +389,7 @@ static void DebugTcpThread(void* /*arg*/)
         char cmdBuf[256];
         int  cmdLen = 0;
         bool framedClient=false,classifiedClient=false;
-        const uint64_t classifyDeadline=g_lapicTickCount+50;
+        const uint64_t classifyDeadline=ApicTickCount()+50;
 
         for (;;)
         {
@@ -422,7 +422,7 @@ static void DebugTcpThread(void* /*arg*/)
             // Framed bridge RPCs carry their own replies and read serial logs
             // separately. Replaying the entire log ring after each short RPC
             // delays FIN handling/accept and can fill the pending TCP queue.
-            if(framedClient || (!classifiedClient && g_lapicTickCount<classifyDeadline)) {
+            if(framedClient || (!classifiedClient && ApicTickCount()<classifyDeadline)) {
                 SchedulerSleepMs(2);
                 continue;
             }
@@ -449,7 +449,7 @@ static void DebugTcpThread(void* /*arg*/)
             {
                 // No new data — sleep briefly
                 Process* self = ProcessCurrent();
-                self->wakeupTick = g_lapicTickCount + 200; // ~200ms
+                self->wakeupTick = ApicTickCount() + 200; // ~200ms
                 SchedulerBlock(self);
             }
         }

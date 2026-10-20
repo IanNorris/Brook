@@ -1,3 +1,4 @@
+#include "apic.h"
 // serial_writer.cpp — Async serial/TTY output via lockless MPSC queue.
 //
 // All userspace writes (sys_write fd 1/2) and profiler drain output enqueue
@@ -20,7 +21,6 @@
 #include "scheduler.h"
 
 // Defined in apic.cpp — monotonic tick counter (1 tick ≈ 1ms).
-namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
 namespace brook {
 

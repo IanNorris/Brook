@@ -1,3 +1,4 @@
+#include "apic.h"
 #include "terminal.h"
 #include "desktop_identity.h"
 #include "pipe.h"
@@ -69,7 +70,6 @@ struct TerminalCreationGuard {
     }
 };
 
-extern volatile uint64_t g_lapicTickCount;
 
 // ---------------------------------------------------------------------------
 // Terminal instances
@@ -836,7 +836,7 @@ static void TerminalThreadFn(void* arg)
             // Check if child still alive — use a delay to avoid racing
             // with transient pipe-empty conditions (e.g. child forked a
             // subprocess that just closed its write end).
-            self->wakeupTick = g_lapicTickCount + 200;
+            self->wakeupTick = ApicTickCount() + 200;
             SchedulerBlock(self);
 
             // Only close when bash is truly gone AND no writers remain on

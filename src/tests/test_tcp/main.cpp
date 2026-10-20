@@ -14,6 +14,7 @@ using namespace brook;
 
 namespace brook {
     volatile uint64_t g_lapicTickCount = 0;
+uint64_t ApicTickCount() { return g_lapicTickCount; }
 }
 
 static int g_pass = 0;

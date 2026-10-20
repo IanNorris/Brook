@@ -25,6 +25,7 @@ brook::GpuCompositorOps ops{};
 }
 namespace brook {
 volatile uint64_t g_lapicTickCount=0;
+uint64_t ApicTickCount() { return g_lapicTickCount; }
 void KMutexLock(KMutex*) { queueMutex.lock();++locks; }
 void KMutexUnlock(KMutex*) { CHECK(locks==1);--locks;queueMutex.unlock(); }
 extern "C" void* kmalloc(uint64_t bytes) { return allocationFails?nullptr:std::calloc(1,bytes); }

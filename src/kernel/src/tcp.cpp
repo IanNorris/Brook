@@ -1,3 +1,4 @@
+#include "apic.h"
 #include "tcp.h"
 #ifndef BROOK_HOST_TEST
 #include "serial.h"
@@ -42,8 +43,7 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpSndUna = ack;s.tcpState = TcpState::Established;s.connected = true;
             act.justConnected = true;
             {
-                extern volatile uint64_t g_lapicTickCount;
-                s.tcpLastRxTick = g_lapicTickCount;
+                s.tcpLastRxTick = ApicTickCount();
             }
             if (dataLen > 0 && seq == s.tcpRcvNxt) {
                 act.enqueueData = true;act.dataPtr = data;act.dataLen = dataLen;
@@ -66,14 +66,13 @@ TcpAction TcpProcessSegment(Socket& s,
             act.justConnected = true;
             act.sendAck = true;
             {
-                extern volatile uint64_t g_lapicTickCount;
                 // Seed the idle-timeout clock so SockPollHangup can detect
                 // connections that establish but never deliver data (e.g. TLS
                 // stall).  Without this, tcpLastRxTick stays 0 and the 60s
                 // idle timeout never fires.
-                s.tcpLastRxTick = g_lapicTickCount;
+                s.tcpLastRxTick = ApicTickCount();
                 SerialPrintf("[NET_DIAG] tcp_established t=%lums lport=%u rport=%u nonblock=%d waiter=%s\n",
-                             g_lapicTickCount, ntohs(s.localPort), ntohs(s.remotePort),
+                             ApicTickCount(), ntohs(s.localPort), ntohs(s.remotePort),
                              s.nonblock, s.pollWaiter ? "yes" : "no");
             }
         } else if (flags & TCP_RST) {
@@ -113,10 +112,9 @@ TcpAction TcpProcessSegment(Socket& s,
                         SerialPrintf("tcp: OOO STALE pid=%u seq=%u rcvNxt=%u gap=%d len=%u count=%u\n",
                                      s.ownerPid, dataSeq, s.tcpRcvNxt, gap, len, s.oooDropCount);
                     }
-                    extern volatile uint64_t g_lapicTickCount;
-                    if (g_lapicTickCount - s.lastStaleAckTick > 100) {
+                    if (ApicTickCount() - s.lastStaleAckTick > 100) {
                         act.sendAck = true;
-                        s.lastStaleAckTick = g_lapicTickCount;
+                        s.lastStaleAckTick = ApicTickCount();
                     }
                     return act;
                 }
@@ -155,8 +153,7 @@ TcpAction TcpProcessSegment(Socket& s,
             s.tcpFinRecv = true;
             act.sendAck = true;
             s.tcpState = TcpState::CloseWait;
-            extern volatile uint64_t g_lapicTickCount;
-            s.tcpCloseWaitTick = g_lapicTickCount;
+            s.tcpCloseWaitTick = ApicTickCount();
         }
         break;
 

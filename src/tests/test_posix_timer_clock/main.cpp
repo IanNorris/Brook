@@ -13,6 +13,7 @@ unsigned failures = 0;
 
 namespace brook {
 volatile uint64_t g_lapicTickCount = 0;
+uint64_t ApicTickCount() { return g_lapicTickCount; }
 bool KvmClockAvailable() { return pvclock; }
 uint64_t KvmClockReadNs() { return monotonicNs; }
 uint64_t RtcNowNs() { return realtimeNs; }

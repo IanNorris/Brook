@@ -1,3 +1,4 @@
+#include "apic.h"
 #include "scene_damage.h"
 #include "desktop_pointer_route.h"
 #include "compositor.h"
@@ -41,7 +42,6 @@ struct CompositorMutexGuard {
     ~CompositorMutexGuard() { KMutexUnlock(mutex); }
 };
 
-extern volatile uint64_t g_lapicTickCount;
 
 // Cached physical framebuffer info.
 static volatile uint32_t* g_physFb       = nullptr;
@@ -330,7 +330,7 @@ static constexpr uint64_t DEBUG_FRAME_LEASE_MS=30000;
 
 static void ExpireDebugFrameLocked()
 {
-    if (g_debugFrame.token && g_lapicTickCount>=g_debugFrameDeadline)
+    if (g_debugFrame.token && ApicTickCount()>=g_debugFrameDeadline)
         g_debugFrame={};
 }
 
@@ -347,7 +347,7 @@ DebugFrameSnapshot CompositorRequestDebugFrame()
     }
     g_debugFrame={};g_debugFrame.token=++g_debugFrameNextToken;
     g_debugFrame.state=DebugFrameState::Pending;
-    g_debugFrameDeadline=g_lapicTickCount+DEBUG_FRAME_LEASE_MS;
+    g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
     CompositorWake();
     return g_debugFrame;
 }
@@ -409,14 +409,14 @@ static void CaptureCompletedDebugFrame(uint64_t epoch,const DebugFrameGeometry& 
     for (uint32_t y=0;y<height;++y)
         memcpy(destination+static_cast<uint64_t>(y)*width,source+static_cast<uint64_t>(y)*stride,width*4);
     g_debugFrame.width=width;g_debugFrame.height=height;g_debugFrame.stride=width;
-    g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=g_lapicTickCount;g_debugFrame.epoch=epoch;
-    g_debugFrameDeadline=g_lapicTickCount+DEBUG_FRAME_LEASE_MS;
+    g_debugFrame.address=g_debugFrameBuffer.raw();g_debugFrame.tick=ApicTickCount();g_debugFrame.epoch=epoch;
+    g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
     g_debugFrame.state=DebugFrameState::Ready;
 }
 
 static void PresentStatsReport()
 {
-    uint64_t now = g_lapicTickCount;
+    uint64_t now = ApicTickCount();
     if (g_presentLastReportTick == 0) g_presentLastReportTick = now;
     if (now - g_presentLastReportTick < 50000) return;
     g_presentLastReportTick = now;
@@ -552,14 +552,14 @@ int CompositorCaptureExternal(Process* caller,const WmCaptureToken& token,
     if (g_captureTail) g_captureTail->next=request;else g_captureHead=request;
     g_captureTail=request;KMutexUnlock(&g_captureLock);
     CompositorWake();
-    const uint64_t deadline=g_lapicTickCount+5000;
+    const uint64_t deadline=ApicTickCount()+5000;
     int result;
     for (;;) {
         KMutexLock(&g_captureLock);
         if (request->state==CaptureState::Done) {
             result=request->result;KMutexUnlock(&g_captureLock);break;
         }
-        const bool cancel=g_lapicTickCount>=deadline ||
+        const bool cancel=ApicTickCount()>=deadline ||
             (caller && __atomic_load_n(&caller->terminalPending,__ATOMIC_ACQUIRE));
         if (cancel && request->state==CaptureState::Queued) {
             CaptureRequest* previous=nullptr;
@@ -1677,7 +1677,7 @@ static void CompositorLoopWM()
         CompositorUnregisterProcess(owner);
         ProcessUnref(owner);
     }
-    uint64_t now = g_lapicTickCount;
+    uint64_t now = ApicTickCount();
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
 
@@ -2740,7 +2740,7 @@ static void CompositorDrawClock()
     uint32_t stride = g_backBuffer ? g_backBufStride : g_physFbStride;
     if (!dst) return;
 
-    uint64_t uptimeSec = g_lapicTickCount / 1000;
+    uint64_t uptimeSec = ApicTickCount() / 1000;
     char buf[16];
     FormatUptime(buf, uptimeSec);
 
@@ -3246,7 +3246,7 @@ static void CompositorLoop()
         __atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) != 0;
 
     // Present-timing: sample period (wakeup-to-wakeup) and mark loop start.
-    uint64_t loopStartTick = g_lapicTickCount;
+    uint64_t loopStartTick = ApicTickCount();
     uint64_t periodMs = g_presentLastLoopTick
         ? (loopStartTick - g_presentLastLoopTick) : 0;
     g_presentLastLoopTick = loopStartTick;
@@ -3287,7 +3287,7 @@ static void CompositorLoop()
     uint32_t compCount = __atomic_load_n(&g_compositedCount, __ATOMIC_ACQUIRE);
     if (compCount > 0)
     {
-    uint64_t now = g_lapicTickCount;
+    uint64_t now = ApicTickCount();
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
 
@@ -3396,7 +3396,7 @@ static void CompositorLoop()
         // Periodic thumbnail dump for in-guest visual verification.
         if (g_gpuThumbDump)
         {
-            uint64_t now = g_lapicTickCount;
+            uint64_t now = ApicTickCount();
             if (now - g_lastThumbTick >= 5000)
             {
                 g_lastThumbTick = now;
@@ -3432,7 +3432,7 @@ static void CompositorLoop()
     // One-shot full-resolution frame dump (parity check), once the desktop has
     // settled (~15s uptime). Works in both GPU mode (GPUFULL via scanout
     // readback) and CPU mode (CPUFULL from g_backBuffer) for a direct diff.
-    if (g_fullDump && !g_fullDumpDone && g_lapicTickCount >= 15000)
+    if (g_fullDump && !g_fullDumpDone && ApicTickCount() >= 15000)
     {
         g_fullDumpDone = true;
         DumpFullFrameOnce();
@@ -3440,7 +3440,7 @@ static void CompositorLoop()
 
     // Present-timing: record this frame's period + loop time and
     // periodically emit a summary on serial.  Additive diagnostics.
-    uint64_t loopEndTick = g_lapicTickCount;
+    uint64_t loopEndTick = ApicTickCount();
     uint64_t loopMs = loopEndTick - loopStartTick;
     if (periodMs > 0)
     {
@@ -3496,7 +3496,7 @@ static void CompositorThreadFn(void* /*arg*/)
         // the fallback interval elapses (ensures cursor updates even with
         // no dirty frames).
         Process* self = ProcessCurrent();
-        self->wakeupTick = g_lapicTickCount + COMPOSITE_INTERVAL;
+        self->wakeupTick = ApicTickCount() + COMPOSITE_INTERVAL;
         SchedulerBlock(self);
     }
 }
@@ -3574,7 +3574,6 @@ void CompositorWaitFrame()
 
     // Yield the CPU repeatedly to let the compositor thread run.
     // Check epoch between yields. Worst case: compositor frame is ~16ms.
-    extern volatile uint64_t g_lapicTickCount;
     for (int attempt = 0; attempt < 50; ++attempt)
     {
         if (__atomic_load_n(&g_compositorEpoch, __ATOMIC_ACQUIRE) != epoch)
@@ -3583,7 +3582,7 @@ void CompositorWaitFrame()
         Process* self = ProcessCurrent();
         if (self)
         {
-            self->wakeupTick = g_lapicTickCount + 1;
+            self->wakeupTick = ApicTickCount() + 1;
             SchedulerBlock(self);
         }
     }

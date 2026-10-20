@@ -1718,8 +1718,7 @@ static int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
         }
         if(nonblock || socket->nonblock)return -EAGAIN;
         auto* self=ProcessCurrent();pipe->writerWaiter=self;
-        extern volatile uint64_t g_lapicTickCount;
-        self->wakeupTick=g_lapicTickCount+10;SchedulerBlock(self);
+        self->wakeupTick=ApicTickCount()+10;SchedulerBlock(self);
         if(HasPendingSignals()) {
             if(pipe->writerWaiter==self)pipe->writerWaiter=nullptr;
             return -EINTR;
@@ -1744,8 +1743,7 @@ static int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
            __atomic_load_n(&pipe->unixWriteShutdown,__ATOMIC_ACQUIRE))return 0;
         if(nonblock || socket->nonblock)return -EAGAIN;
         auto* self=ProcessCurrent();pipe->readerWaiter=self;
-        extern volatile uint64_t g_lapicTickCount;
-        self->wakeupTick=g_lapicTickCount+10;SchedulerBlock(self);
+        self->wakeupTick=ApicTickCount()+10;SchedulerBlock(self);
         if(HasReadInterruptSignal()) {
             if(pipe->readerWaiter==self)pipe->readerWaiter=nullptr;
             return -EINTR;
@@ -1931,7 +1929,6 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
     if (fde->type == FdType::DevDsp && fde->handle)
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
-        extern volatile uint64_t g_lapicTickCount;
         for (;;) {
             SpinLockAcquire(ProcessFdLock(proc));
             const bool nonblock = (fde->statusFlags & 0x800) != 0;
@@ -1990,7 +1987,7 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
             if (nonblock) return -EAGAIN;
             if (HasReadInterruptSignal()) return -EINTR;
             Process* self = SchedulerCurrentProcess();
-            if (self) { self->wakeupTick = g_lapicTickCount + 5; SchedulerBlockInterruptible(self); }
+            if (self) { self->wakeupTick = ApicTickCount() + 5; SchedulerBlockInterruptible(self); }
         }
     }
 
@@ -2069,8 +2066,7 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
             }
             __atomic_fetch_add(&pipe->fullWriteWaits,1,__ATOMIC_RELAXED);
             // Safety timeout — recheck every 10ms in case wakeup was missed
-            extern volatile uint64_t g_lapicTickCount;
-            self->wakeupTick = g_lapicTickCount + 10;
+            self->wakeupTick = ApicTickCount() + 10;
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return written > 0 ? static_cast<int64_t>(written) : -EINTR;
@@ -2103,8 +2099,7 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
             // Existing eventfd wait hooks have one slot; bounded polling also
             // supplies progress to writers waiting for counter capacity.
             Process* self = ProcessCurrent();
-            extern volatile uint64_t g_lapicTickCount;
-            self->wakeupTick = g_lapicTickCount + 10;
+            self->wakeupTick = ApicTickCount() + 10;
             SchedulerBlockInterruptible(self);
             if (HasPendingSignals()) return -EINTR;
         }
@@ -2129,7 +2124,6 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
         if (brook::SockIsStream(sockIdx))
         {
-            extern volatile uint64_t g_lapicTickCount;
             return brook::SockSend(sockIdx,
                                    reinterpret_cast<const void*>(bufAddr),
                                    static_cast<uint32_t>(count));
@@ -2185,8 +2179,7 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
                 PipeWakeEpoll(pipe);
                 break;
             }
-            extern volatile uint64_t g_lapicTickCount;
-            self->wakeupTick = g_lapicTickCount + 10;
+            self->wakeupTick = ApicTickCount() + 10;
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return written > 0 ? static_cast<int64_t>(written) : -EINTR;
@@ -2323,8 +2316,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         if (written == 0 && !(fde->statusFlags & 0x800)) { // O_NONBLOCK
             // Blocking mode: sleep briefly and retry once
             Process* self = ProcessCurrent();
-            extern volatile uint64_t g_lapicTickCount;
-            self->wakeupTick = g_lapicTickCount + 100;
+            self->wakeupTick = ApicTickCount() + 100;
             SchedulerBlock(self);
 
             uint32_t nread = DebugOverlayReadFrom(cursor, reinterpret_cast<char*>(lineBuf),
@@ -2616,8 +2608,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             }
             // Use timed wakeup to recheck writer count periodically
             // (avoids permanent deadlock if close notification was missed)
-            extern volatile uint64_t g_lapicTickCount;
-            self->wakeupTick = g_lapicTickCount + 10; // recheck every ~10ms
+            self->wakeupTick = ApicTickCount() + 10; // recheck every ~10ms
             SchedulerBlock(self);
             pipe->removeReadWait(self);
             if (HasReadInterruptSignal()) {
@@ -2662,8 +2653,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             // Block until counter becomes non-zero
             Process* self = ProcessCurrent();
             efd->readerWaiter = self;
-            extern volatile uint64_t g_lapicTickCount;
-            self->wakeupTick = g_lapicTickCount + 10;
+            self->wakeupTick = ApicTickCount() + 10;
             SchedulerBlock(self);
             if (HasPendingSignals())
                 return -EINTR;
@@ -2756,8 +2746,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
             Process* self = ProcessCurrent();
             pipe->readerWaiter = self;
-            extern volatile uint64_t g_lapicTickCount;
-            self->wakeupTick = g_lapicTickCount + 10;
+            self->wakeupTick = ApicTickCount() + 10;
             SchedulerBlock(self);
             if (HasReadInterruptSignal()) {
                 if (pipe->readerWaiter == self) pipe->readerWaiter = nullptr;
@@ -3547,7 +3536,6 @@ void FinalizeClosedFd(const FdClaimResult& c)
     if (c.type == FdType::Socket && c.handle)
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(c.handle)) - 1;
-        extern volatile uint64_t g_lapicTickCount;
         brook::SockUnref(sockIdx);
     }
 
@@ -4579,10 +4567,9 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     SchedulerAddProcess(child);
 
     {
-        extern volatile uint64_t g_lapicTickCount;
         if (!(flags & CLONE_THREAD))
             SerialPrintf("[PROFILE] fork t=%lums parent_pid=%u child_pid=%u\n",
-                         g_lapicTickCount, parent->pid, child->pid);
+                         ApicTickCount(), parent->pid, child->pid);
     }
 
     DbgPrintf("CLONE: parent '%s' pid=%u tgid=%u -> child pid=%u tgid=%u flags=0x%lx %s\n",
@@ -4712,8 +4699,7 @@ static int WaitChildEvent(Process* caller, int selector, uint32_t id,
         if (ChildWaitInterrupted(caller)) return -EINTR;
         // Exit publication sets pendingWakeup on every parent-group waiter;
         // SchedulerBlock consumes it even if notification preceded the block.
-        extern volatile uint64_t g_lapicTickCount;
-        caller->wakeupTick = g_lapicTickCount + 1000;
+        caller->wakeupTick = ApicTickCount() + 1000;
         SchedulerBlock(caller);
         if (ChildWaitInterrupted(caller)) return -EINTR;
     }
@@ -4834,9 +4820,8 @@ static int64_t sys_execve(uint64_t pathAddr, uint64_t argvAddr, uint64_t envpAdd
     DbgPrintf("sys_execve: pid=%u path='%s'\n", proc->pid, kPath);
     if (!g_hotLogQuiet)
     {
-        extern volatile uint64_t g_lapicTickCount;
         SerialPrintf("[PROFILE] execve t=%lums pid=%u '%s'\n",
-                     g_lapicTickCount, proc->pid, kPath);
+                     ApicTickCount(), proc->pid, kPath);
     }
 
     // Resolve path: try as-is, then /boot/BIN/<UPPER>, then /boot/<UPPER>
@@ -5296,7 +5281,6 @@ static int64_t sys_set_tid_address(uint64_t tidptr, uint64_t, uint64_t,
 // ---------------------------------------------------------------------------
 
 // LAPIC fires every 1ms — monotonic tick counter.
-extern volatile uint64_t g_lapicTickCount; // defined in apic.cpp
 
 struct timespec {
     int64_t  tv_sec;
@@ -5315,7 +5299,7 @@ static uint64_t ClockNowNs(uint64_t clockid)
 {
     if (clockid == 0 || clockid == 5) return RtcNowNs();
     return KvmClockAvailable() ? KvmClockReadNs()
-                               : g_lapicTickCount * 1000000ULL;
+                               : ApicTickCount() * 1000000ULL;
 }
 
 static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
@@ -5416,7 +5400,7 @@ static int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
         // another event can unblock this process before the sleep expires.
         uint64_t remaining = deadline - now;
         uint64_t ticks = remaining / 1000000ULL + (remaining % 1000000ULL != 0);
-        proc->wakeupTick = g_lapicTickCount + ticks;
+        proc->wakeupTick = ApicTickCount() + ticks;
         SchedulerBlock(proc);
         now = ClockNowNs(1);
     }
@@ -5452,7 +5436,7 @@ static int64_t sys_clock_nanosleep(uint64_t clockid, uint64_t flags, uint64_t re
             if (HasPendingSignals()) return -EINTR;
             const uint64_t remaining = deadline - now;
             const uint64_t ticks = remaining / 1000000ULL + (remaining % 1000000ULL != 0);
-            proc->wakeupTick = g_lapicTickCount + ticks;
+            proc->wakeupTick = ApicTickCount() + ticks;
             SchedulerBlock(proc);
             // LAPIC ticks and unrelated wakeups are scheduling hints, not
             // evidence that the selected clock's absolute deadline expired.
@@ -5524,7 +5508,7 @@ static int64_t sys_alarm(uint64_t seconds, uint64_t, uint64_t,
     if (proc->alarmTick != 0)
     {
         // Calculate remaining seconds from previous alarm
-        uint64_t now = g_lapicTickCount;
+        uint64_t now = ApicTickCount();
         if (proc->alarmTick > now)
             prevRemaining = (proc->alarmTick - now + 999) / 1000; // round up
     }
@@ -5532,7 +5516,7 @@ static int64_t sys_alarm(uint64_t seconds, uint64_t, uint64_t,
     if (seconds == 0)
         proc->alarmTick = 0; // Cancel alarm
     else
-        proc->alarmTick = g_lapicTickCount + seconds * 1000;
+        proc->alarmTick = ApicTickCount() + seconds * 1000;
 
     return static_cast<int64_t>(prevRemaining);
 }
@@ -5550,7 +5534,7 @@ static int64_t sys_pause(uint64_t, uint64_t, uint64_t,
     // Block until a signal is delivered
     while (!HasPendingSignals())
     {
-        proc->wakeupTick = g_lapicTickCount + 100; // recheck every 100ms
+        proc->wakeupTick = ApicTickCount() + 100; // recheck every 100ms
         SchedulerBlock(proc);
     }
 
@@ -5574,7 +5558,7 @@ static int64_t sys_rt_sigsuspend(uint64_t maskAddr, uint64_t sigsetsize, uint64_
     // Block until a signal that isn't blocked is pending
     while (!HasPendingSignals())
     {
-        proc->wakeupTick = g_lapicTickCount + 100;
+        proc->wakeupTick = ApicTickCount() + 100;
         SchedulerBlock(proc);
     }
 
@@ -5634,7 +5618,7 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
         uint64_t sleepMs = timeoutAddr ? (deadline - now) / 1000000ULL +
             ((deadline - now) % 1000000ULL != 0) : 100;
         if (sleepMs > 100) sleepMs = 100;
-        proc->wakeupTick = g_lapicTickCount + sleepMs;
+        proc->wakeupTick = ApicTickCount() + sleepMs;
         SchedulerBlockInterruptible(proc);
     }
 }
@@ -6521,8 +6505,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             if(!pending)break;
             if(HasPendingSignals())return -EINTR;
             if(ClockNowNs(1)>=deadline)return -110; // ETIMEDOUT
-            extern volatile uint64_t g_lapicTickCount;
-            proc->wakeupTick=g_lapicTickCount+1;
+            proc->wakeupTick=ApicTickCount()+1;
             SchedulerBlockInterruptible(proc);
         }
         const int descriptor=CreateCompletedSyncFile(proc);
@@ -6995,8 +6978,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
                 else if (now - lastProgressTime >= 2000000000ULL) return -EIO;
                 Process* self = SchedulerCurrentProcess();
                 if (self) {
-                    extern volatile uint64_t g_lapicTickCount;
-                    self->wakeupTick = g_lapicTickCount + 5;
+                    self->wakeupTick = ApicTickCount() + 5;
                     SchedulerBlockInterruptible(self);
                 }
             }
@@ -8380,7 +8362,7 @@ static uint64_t WaitWakeupTick(uint64_t deadlineNs, uint64_t safetyMs)
     uint64_t remaining = deadlineNs > now ? deadlineNs - now : 0;
     uint64_t ticks = remaining / 1000000ULL + (remaining % 1000000ULL != 0);
     if (ticks > safetyMs) ticks = safetyMs;
-    return g_lapicTickCount + ticks;
+    return ApicTickCount() + ticks;
 }
 
 // Trusted kernel array; syscall wrappers validate/copy user memory separately.
@@ -8390,7 +8372,6 @@ static int64_t PollWait(pollfd* fds, uint64_t nfds, uint64_t timeout_ms, bool se
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EFAULT;
-    extern volatile uint64_t g_lapicTickCount;
     const bool infinite = timeout_ms == ~0ULL;
     const uint64_t deadline = WaitDeadlineNs(timeout_ms);
 
@@ -8403,7 +8384,6 @@ static int64_t PollWait(pollfd* fds, uint64_t nfds, uint64_t timeout_ms, bool se
     logPoll = proc->straceEnabled && !proc->straceErrorsOnly &&
         (proc->straceFilter == 0 || (proc->straceFilter & pollTraceCategory));
     if (logPoll) {
-        extern volatile uint64_t g_lapicTickCount;
         for (uint64_t i = 0; i < nfds && i < 8; i++) {
             FdEntry* fde = fds[i].fd >= 0 ? FdGet(proc, fds[i].fd) : nullptr;
             const char* tname = "?";
@@ -8797,7 +8777,6 @@ retry_poll:
     }
 
     if (logPoll && ready > 0) {
-        extern volatile uint64_t g_lapicTickCount;
         int logged = 0;
         for (uint64_t i = 0; i < nfds && logged < 8; i++) {
             if (fds[i].revents) {
@@ -9953,8 +9932,7 @@ static int64_t sys_sysinfo(uint64_t infoAddr, uint64_t, uint64_t,
     auto* info = reinterpret_cast<sysinfo_s*>(infoAddr);
     __builtin_memset(info, 0, sizeof(sysinfo_s));
 
-    extern volatile uint64_t g_lapicTickCount;
-    info->uptime = static_cast<int64_t>(g_lapicTickCount / 1000);
+    info->uptime = static_cast<int64_t>(ApicTickCount() / 1000);
 
     uint64_t totalPages = PmmGetRamPageCount();
     uint64_t freePages  = PmmGetFreePageCount();
@@ -10011,8 +9989,7 @@ static int64_t sys_times(uint64_t bufAddr, uint64_t, uint64_t,
     }
 
     // Return value: clock ticks since boot
-    extern volatile uint64_t g_lapicTickCount;
-    return static_cast<int64_t>(g_lapicTickCount);
+    return static_cast<int64_t>(ApicTickCount());
 }
 
 // ---------------------------------------------------------------------------
@@ -11234,7 +11211,6 @@ static int64_t SelectWait(uint64_t nfds, uint64_t readfdsAddr, uint64_t writefds
         if (!ref.get() || ref.get()->type == FdType::None) return -EBADF;
         fds[count++] = {static_cast<int>(fd), events, 0};
     }
-    extern volatile uint64_t g_lapicTickCount;
     uint64_t started = ClockNowNs(1);
     int64_t result = PollWait(fds, count, timeoutMs, true);
     if (timeoutAddr && !nanoseconds) {
@@ -11787,14 +11763,13 @@ static int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
     }
     buf[sizeof(buf) - 1] = '\0';
     {
-        extern volatile uint64_t g_lapicTickCount;
         extern volatile uint64_t g_blockCacheHits;
         extern volatile uint64_t g_blockCacheMisses;
         SerialPrintf("[PROFILE] set_title t=%lums pid=%u '%s'"
                      " opens=%lu mmaps=%lu faults=%lu"
                      " cache_hit=%lu cache_miss=%lu preloaded=%lu"
                      " blkcache_hit=%lu blkcache_miss=%lu\n",
-                     g_lapicTickCount, proc->pid, buf,
+                     ApicTickCount(), proc->pid, buf,
                      g_profOpenCount, g_profMmapCount, g_profFaultCount,
                      g_profCacheHit, g_profCacheMiss, g_profPreloadPages,
                      g_blockCacheHits, g_blockCacheMisses);
@@ -12450,7 +12425,6 @@ struct FutexLogEntry { uint64_t uaddr; uint64_t tick; uint32_t pid; int32_t resu
 static constexpr uint32_t FUTEX_LOG_SIZE = 512;
 static FutexLogEntry g_futexLog[FUTEX_LOG_SIZE];
 static volatile uint32_t g_futexLogIdx = 0;  // monotonic; & (SIZE-1) for slot
-extern volatile uint64_t g_lapicTickCount;
 // op: 0=WAIT-enqueue 1=WAIT-return 2=WAKE 3=WAKE_OP 4=REQUEUE
 static inline void FutexLog(uint8_t op, uint64_t uaddr, uint32_t pid, int32_t result)
 {
@@ -12459,7 +12433,7 @@ static inline void FutexLog(uint8_t op, uint64_t uaddr, uint32_t pid, int32_t re
     g_futexLog[i].uaddr = uaddr;
     g_futexLog[i].pid = pid;
     g_futexLog[i].result = result;
-    g_futexLog[i].tick = g_lapicTickCount;
+    g_futexLog[i].tick = ApicTickCount();
 }
 
 // BRO-196 diagnostic: dump every blocked futex waiter (uaddr + owner + pid).
@@ -12600,16 +12574,15 @@ static uint64_t FutexTimeoutDeadlineMs(int op, uint64_t opVal, uint64_t timeoutA
 
     uint64_t timeoutMs = static_cast<uint64_t>(ts->tv_sec) * 1000ULL
                        + (static_cast<uint64_t>(ts->tv_nsec) + 999999ULL) / 1000000ULL;
-    extern volatile uint64_t g_lapicTickCount;
 
     if (op == FUTEX_WAIT) {
-        return g_lapicTickCount + timeoutMs;
+        return ApicTickCount() + timeoutMs;
     }
 
     uint64_t nowMs = ClockNowNs((opVal & FUTEX_CLOCK_REALTIME) ? 0 : 1) / 1000000ULL;
     if (timeoutMs <= nowMs)
-        return g_lapicTickCount;
-    return g_lapicTickCount + (timeoutMs - nowMs);
+        return ApicTickCount();
+    return ApicTickCount() + (timeoutMs - nowMs);
 }
 
 static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
@@ -12763,8 +12736,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             // 0/EAGAIN/EINTR — ETIMEDOUT included. Returning ETIMEDOUT here for a
             // spurious wake crashed every glibc app that re-locks a contended
             // mutex after a condvar wait (yquake2/mesa llvmpipe, intermittently).
-            extern volatile uint64_t g_lapicTickCount;
-            if (deadline != ~0ULL && g_lapicTickCount >= deadline)
+            if (deadline != ~0ULL && ApicTickCount() >= deadline)
                 return -ETIMEDOUT;
 
             // Spurious / early wake — behave like a spurious FUTEX_WAKE: return 0
@@ -12853,7 +12825,6 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
     if (domain != AF_INET) {
         // Only log interesting rejections (AF_INET6), not AF_NETLINK spam
         if (domain == 10) { // AF_INET6
-            extern volatile uint64_t g_lapicTickCount;
         }
         return -EAFNOSUPPORT;
     }
@@ -13079,7 +13050,6 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     // For TCP, perform the 3-way handshake
     int connectResult = brook::SockConnect(sockIdx, uaddr);
     {
-        extern volatile uint64_t g_lapicTickCount;
     }
     return connectResult;
 }
@@ -13109,7 +13079,6 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     // For connected TCP sockets, use SockSend (stream send)
     if (brook::SockIsStream(sockIdx))
     {
-        extern volatile uint64_t g_lapicTickCount;
         int ret = brook::SockSend(sockIdx,
                                    reinterpret_cast<const void*>(bufVal),
                                    static_cast<uint32_t>(lenVal));
@@ -13176,7 +13145,6 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     if (ret > 0) {
         uint16_t sport = brook::ntohs(src->sin_port);
         if (sport == 53) {
-            extern volatile uint64_t g_lapicTickCount;
         }
     }
 
@@ -13319,7 +13287,6 @@ static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
     local.sin_port = tmpPort;
 
     {
-        extern volatile uint64_t g_lapicTickCount;
     }
 
     uint32_t copyLen = *ulen;
@@ -13333,7 +13300,6 @@ static int64_t sys_getpeername(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
                                 uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    extern volatile uint64_t g_lapicTickCount;
 
     if (!proc) return -ENOSYS;
     int fd = static_cast<int>(fdVal);
@@ -13497,7 +13463,7 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
             }
             usd->acceptWaiter = proc;
             SpinLockRelease(&g_unixRegistryLock);
-            proc->wakeupTick = g_lapicTickCount + 100;
+            proc->wakeupTick = ApicTickCount() + 100;
             SchedulerBlock(proc);
             SpinLockAcquire(&g_unixRegistryLock);
             if (usd->acceptWaiter == proc) usd->acceptWaiter = nullptr;

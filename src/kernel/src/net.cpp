@@ -310,18 +310,17 @@ bool ArpResolve(uint32_t ip, MacAddr* outMac)
     g_arpReplyIp = ip;
     __asm__ volatile("mfence" ::: "memory");
 
-    extern volatile uint64_t g_lapicTickCount;
     Process* self = SchedulerCurrentProcess();
 
     for (int attempt = 0; attempt < 3; attempt++) {
         ArpSendRequest(ip);
 
         // Block until ARP reply arrives (500ms timeout per attempt)
-        uint64_t deadline = g_lapicTickCount + 500;
-        while (!g_arpReplyPending && g_lapicTickCount < deadline) {
+        uint64_t deadline = ApicTickCount() + 500;
+        while (!g_arpReplyPending && ApicTickCount() < deadline) {
             if (self) {
                 g_arpWaiter = self;
-                self->wakeupTick = g_lapicTickCount + 500;
+                self->wakeupTick = ApicTickCount() + 500;
                 SchedulerBlock(self);
             } else if (g_netIf && g_netIf->poll) {
                 // Early-boot: no scheduler yet, fall back to polling
@@ -725,7 +724,6 @@ void NetStartPollThread()
     // IMPORTANT: must be called AFTER SchedulerInit(), not from NetRegisterIf,
     // because SchedulerAddProcess requires the MLFQ to be initialised.
     Process* pollThread = KernelThreadCreate("net_poll", [](void* /*arg*/) {
-        extern volatile uint64_t g_lapicTickCount;
         while (true) {
             uint32_t n = NetIfCount();
             for (int burst = 0; burst < 16; burst++) {
@@ -749,7 +747,7 @@ void NetStartPollThread()
                 // require 10+ round trips; at 50ms poll interval each RT
                 // added ~25ms average latency. 5ms keeps RT latency under
                 // 3ms average while not starving other threads.
-                self->wakeupTick = g_lapicTickCount + 5;
+                self->wakeupTick = ApicTickCount() + 5;
                 SchedulerBlock(self);
             }
         }
@@ -1359,7 +1357,6 @@ uint32_t DnsResolve(const char* hostname)
     g_dnsResolvedIp = 0;
     g_dnsQueryId = qid;
 
-    extern volatile uint64_t g_lapicTickCount;
     Process* self = SchedulerCurrentProcess();
 
     for (int attempt = 0; attempt < 3; attempt++) {
@@ -1367,11 +1364,11 @@ uint32_t DnsResolve(const char* hostname)
         NetSendUdp(g_netIf->dns, DNS_LOCAL_PORT, DNS_PORT, pkt, pktLen);
 
         // Block until DNS reply arrives (500ms timeout per attempt)
-        uint64_t deadline = g_lapicTickCount + 500;
-        while (!g_dnsGotReply && g_lapicTickCount < deadline) {
+        uint64_t deadline = ApicTickCount() + 500;
+        while (!g_dnsGotReply && ApicTickCount() < deadline) {
             if (self) {
                 g_dnsWaiter = self;
-                self->wakeupTick = g_lapicTickCount + 50; // check every 50ms
+                self->wakeupTick = ApicTickCount() + 50; // check every 50ms
                 SchedulerBlock(self);
             } else if (g_netIf->poll) {
                 // Early-boot: no scheduler yet, fall back to polling
@@ -1513,9 +1510,8 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
 
     // Profile DNS sends (port 53)
     if (dstPort == 53) {
-        extern volatile uint64_t g_lapicTickCount;
         SerialPrintf("[PROFILE] dns_query t=%lums -> %u.%u.%u.%u\n",
-                     g_lapicTickCount,
+                     ApicTickCount(),
                      (ntohl(dstIp) >> 24) & 0xFF,
                      (ntohl(dstIp) >> 16) & 0xFF,
                      (ntohl(dstIp) >> 8) & 0xFF,
@@ -1638,17 +1634,16 @@ void SockClose(int sockIdx)
         // returns immediately when no other thread is ready, so the FIN-ACK can
         // arrive via IRQ but we've already zeroed the socket. SchedulerBlock
         // suspends us and lets the IRQ handler wake us when the FIN-ACK arrives.
-        extern volatile uint64_t g_lapicTickCount;
         Process* self = ProcessCurrent();
         if (self) {
-            uint64_t deadline = g_lapicTickCount + 500;
+            uint64_t deadline = ApicTickCount() + 500;
             while (s.tcpState == TcpState::FinWait1 ||
                    s.tcpState == TcpState::FinWait2 ||
                    s.tcpState == TcpState::LastAck) {
-                if (g_lapicTickCount >= deadline) break;
+                if (ApicTickCount() >= deadline) break;
                 SpinLockAcquire(&s.lock);
                 s.pollWaiter = self;
-                self->wakeupTick = g_lapicTickCount + 50; // check every 50ms
+                self->wakeupTick = ApicTickCount() + 50; // check every 50ms
                 SpinLockRelease(&s.lock);
                 SchedulerBlock(self);
             }
@@ -1717,9 +1712,8 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
 {
     // Profile DNS responses (from port 53)
     if (srcPort == 53) {
-        extern volatile uint64_t g_lapicTickCount;
         SerialPrintf("[PROFILE] dns_response t=%lums from %u.%u.%u.%u\n",
-                     g_lapicTickCount,
+                     ApicTickCount(),
                      (ntohl(srcIp) >> 24) & 0xFF,
                      (ntohl(srcIp) >> 16) & 0xFF,
                      (ntohl(srcIp) >> 8) & 0xFF,
@@ -1830,8 +1824,7 @@ static uint32_t TcpReceiveFree(const Socket& s);
 
 static void TcpStatsMaybeFlush()
 {
-    extern volatile uint64_t g_lapicTickCount;
-    uint64_t now = g_lapicTickCount;
+    uint64_t now = ApicTickCount();
     if (g_tcpStatsLastTick == 0) g_tcpStatsLastTick = now;
 
     // Flush delayed ACKs every call (~each packet) if >40ms old.
@@ -2114,10 +2107,9 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
         // ACKs and data segments roll up into the 5s summary instead.
         bool isControl = (flags & (TCP_SYN | TCP_FIN | TCP_RST)) != 0;
         if (isControl) {
-            extern volatile uint64_t g_lapicTickCount;
             int sockIdx = static_cast<int>(&s - g_sockets);
             SerialPrintf("tcp: TX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s [pkt#%u]\n",
-                          s.ownerPid, sockIdx, g_lapicTickCount, flags,
+                          s.ownerPid, sockIdx, ApicTickCount(), flags,
                           seq, s.tcpRcvNxt, dataLen, why, s.txPktCount);
         }
     }
@@ -2168,7 +2160,6 @@ static void PruneAcceptQueue(Socket& listener)
 {
     int retired[Socket::ACCEPT_QUEUE_MAX];
     int retiredCount = 0;
-    extern volatile uint64_t g_lapicTickCount;
     uint64_t queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
     for (int qi = 0; listener.listening && qi < listener.acceptQueueCount;) {
         int childIdx = listener.acceptQueue[qi];
@@ -2177,7 +2168,7 @@ static void PruneAcceptQueue(Socket& listener)
         if (valid) {
             Socket& child = g_sockets[childIdx];
             SpinLockAcquire(&child.lock);
-            discard = RetireAbandonedQueuedChild(child, g_lapicTickCount);
+            discard = RetireAbandonedQueuedChild(child, ApicTickCount());
             if (discard) child.listenSockIdx = -1;
             SpinLockRelease(&child.lock);
         }
@@ -2248,18 +2239,16 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // packets from the first connection).
         s.rxPktCount++;
         {
-            extern volatile uint64_t g_lapicTickCount;
             if (dataLen > 0 && s.tcpState != TcpState::SynRecv)
-                s.tcpLastRxTick = g_lapicTickCount;
+                s.tcpLastRxTick = ApicTickCount();
         }
         TcpStatsRecord(/*tx=*/false, flags, dataLen);
         bool isControl = (flags & (TCP_SYN | TCP_FIN | TCP_RST)) != 0;
         if (isControl)
         {
-            extern volatile uint64_t g_lapicTickCount;
             int sockIdx = static_cast<int>(&s - g_sockets);
             SerialPrintf("tcp: RX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u rcvNxt=%u [pkt#%u]\n",
-                         s.ownerPid, sockIdx, g_lapicTickCount, flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
+                         s.ownerPid, sockIdx, ApicTickCount(), flags, seq, ack, dataLen, s.tcpRcvNxt, s.rxPktCount);
         }
         // BRO-163: TcpStatsMaybeFlush() is no longer called per-RX-packet here.
         // It is driven once per cycle from the net_poll loop, decoupling TCP
@@ -2273,8 +2262,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         // total segment length, which could make a partially-stale retransmit
         // look fully stale — dropping its useful tail and stalling the
         // connection on large downloads.
-        extern volatile uint64_t g_lapicTickCount;
-        TcpReapOoo(s, g_lapicTickCount);
+        TcpReapOoo(s, ApicTickCount());
         uint32_t freeSpace = TcpReceiveFree(s);
         bool bufferWasFull = false;
         if (dataLen > 0) {
@@ -2309,7 +2297,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             TcpEnqueueData(s, act.dataPtr, act.dataLen);
         if (act.holdOooData && act.oooDataPtr && act.oooDataLen > 0)
             TcpStoreOoo(s, act.oooSeq, act.oooDataPtr,
-                        act.oooDataLen, g_lapicTickCount);
+                        act.oooDataLen, ApicTickCount());
         if (TcpDrainOoo(s))
             act.sendAck = true;
 
@@ -2358,7 +2346,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             } else {
                 s.tcpUnackedSegs++;
                 if (s.tcpUnackedSegs == 1)
-                    s.tcpLastDataTick = g_lapicTickCount;
+                    s.tcpLastDataTick = ApicTickCount();
             }
         }
 
@@ -2411,8 +2399,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             child.remotePort = srcPort;
             child.bound      = true;
             child.tcpState   = TcpState::SynRecv;
-            extern volatile uint64_t g_lapicTickCount;
-            child.tcpLastRxTick = g_lapicTickCount; // passive-open deadline origin
+            child.tcpLastRxTick = ApicTickCount(); // passive-open deadline origin
             child.tcpRcvNxt  = seq + 1;
             child.listenSockIdx = static_cast<int>(i);
 
@@ -2437,7 +2424,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             queueFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
             SpinLockAcquire(&child.lock);
             bool publish = s.listening && s.acceptQueueCount < s.listenBacklog
-                           && !RetireAbandonedQueuedChild(child, g_lapicTickCount)
+                           && !RetireAbandonedQueuedChild(child, ApicTickCount())
                            && (child.tcpState == TcpState::SynRecv
                                || child.tcpState == TcpState::Established
                                || child.tcpState == TcpState::CloseWait);
@@ -2550,9 +2537,8 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect");
     s.tcpSndNxt++; // SYN consumes one sequence number
 
-    extern volatile uint64_t g_lapicTickCount;
     SerialPrintf("[PROFILE] tcp_connect t=%lums -> %u.%u.%u.%u:%u%s\n",
-                 g_lapicTickCount,
+                 ApicTickCount(),
                  (ntohl(s.remoteIp) >> 24) & 0xFF,
                  (ntohl(s.remoteIp) >> 16) & 0xFF,
                  (ntohl(s.remoteIp) >> 8) & 0xFF,
@@ -2576,18 +2562,18 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
             s.tcpSndNxt++;
         }
 
-        uint64_t deadline = g_lapicTickCount + 5000;
-        while (s.tcpState == TcpState::SynSent && g_lapicTickCount < deadline) {
+        uint64_t deadline = ApicTickCount() + 5000;
+        while (s.tcpState == TcpState::SynSent && ApicTickCount() < deadline) {
             SpinLockAcquire(&s.lock);
             s.pollWaiter = self;
-            self->wakeupTick = g_lapicTickCount + 5000;
+            self->wakeupTick = ApicTickCount() + 5000;
             SpinLockRelease(&s.lock);
             SchedulerBlock(self);
         }
 
         if (s.tcpState == TcpState::Established) {
             SerialPrintf("[PROFILE] tcp_established t=%lums%s\n",
-                         g_lapicTickCount, attempt ? " (retry)" : "");
+                         ApicTickCount(), attempt ? " (retry)" : "");
             return 0;
         }
         if (s.tcpState == TcpState::Closed || s.tcpRstRecv) {
@@ -2604,16 +2590,15 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
 static int TcpWaitForDataAck(Socket& s, int sockIdx,
                              uint32_t seq, const uint8_t* data, uint32_t len)
 {
-    extern volatile uint64_t g_lapicTickCount;
 
     Process* self = SchedulerCurrentProcess();
     uint32_t seqEnd = seq + len;
-    uint64_t deadline = g_lapicTickCount + 30000;
-    uint64_t nextRetransmit = g_lapicTickCount + 200;  // 200ms initial RTO (was 1000ms)
+    uint64_t deadline = ApicTickCount() + 30000;
+    uint64_t nextRetransmit = ApicTickCount() + 200;  // 200ms initial RTO (was 1000ms)
     uint32_t retransmits = 0;
 
     while (true) {
-        uint64_t now = g_lapicTickCount;
+        uint64_t now = ApicTickCount();
 
         SpinLockAcquire(&s.lock);
         bool acked = TcpSeqAcked(s.tcpSndUna, seqEnd);
@@ -2719,17 +2704,16 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
     if (s.rxCount == 0 && !s.tcpRstRecv && !s.tcpFinRecv &&
         s.tcpState != TcpState::Closed) {
 
-        extern volatile uint64_t g_lapicTickCount;
         Process* self = SchedulerCurrentProcess();
         // 30-second hard deadline — enough for slow TLS handshakes but
         // won't hang the browser for 3 minutes on a dead peer.
-        uint64_t hardDeadline = g_lapicTickCount + 30000;
+        uint64_t hardDeadline = ApicTickCount() + 30000;
 
         while (true) {
             SpinLockAcquire(&s.lock);
             bool ready = s.rxCount > 0 || s.tcpRstRecv || s.tcpFinRecv
                          || s.tcpState == TcpState::Closed
-                         || g_lapicTickCount >= hardDeadline;
+                         || ApicTickCount() >= hardDeadline;
             if (ready) {
                 SpinLockRelease(&s.lock);
                 break;
@@ -2737,7 +2721,7 @@ int SockRecv(int sockIdx, void* buf, uint32_t len)
             // Set pollWaiter while holding the lock so HandleTcp can never
             // enqueue data and miss the wakeup in a race window.
             s.pollWaiter = self;
-            self->wakeupTick = g_lapicTickCount + 100; // heartbeat every 100ms
+            self->wakeupTick = ApicTickCount() + 100; // heartbeat every 100ms
             SpinLockRelease(&s.lock);
             SchedulerBlock(self);
 
@@ -2872,7 +2856,6 @@ bool SockPollHangup(int sockIdx)
     Socket& s = g_sockets[sockIdx];
     if (s.type != SOCK_STREAM) return false;
 
-    extern volatile uint64_t g_lapicTickCount;
 
     SpinLockAcquire(&s.lock);
     bool hungUp = s.tcpFinRecv || s.tcpRstRecv ||
@@ -2888,7 +2871,7 @@ bool SockPollHangup(int sockIdx)
     // silently stops delivering data and curl's --max-time can't fire because
     // it relies on poll() returning.
     static constexpr uint64_t TCP_IDLE_TIMEOUT_MS = 60000;
-    const uint64_t now = g_lapicTickCount;
+    const uint64_t now = ApicTickCount();
     if (!hungUp && s.tcpState == TcpState::Established &&
         s.tcpLastRxTick != 0 &&
         TcpTimerElapsed(now, s.tcpLastRxTick, TCP_IDLE_TIMEOUT_MS))
@@ -2965,8 +2948,7 @@ int SockAccept(int sockIdx, SockAddrIn* addr)
             if (valid) {
                 Socket& child = g_sockets[childIdx];
                 SpinLockAcquire(&child.lock);
-                extern volatile uint64_t g_lapicTickCount;
-                discard = RetireAbandonedQueuedChild(child, g_lapicTickCount);
+                discard = RetireAbandonedQueuedChild(child, ApicTickCount());
                 accept = !discard && (child.tcpState == TcpState::Established ||
                                       child.tcpState == TcpState::CloseWait);
                 if (discard || accept) {
@@ -3598,6 +3580,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap check      - validate heap block metadata\n"
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  audio stats - cached stream queues, completion and guest clock\n"
+            "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
             "  sched policy status|rr|mlfq - inspect or select a registered policy\n"
             "  mem exec-cache  - executable page sharing counters\n"
@@ -3827,6 +3810,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     }
     else if (NetStrEq(cmd, "heap check")) {
         DebugChannelSend(HeapCheckIntegrity() ? "heap integrity: OK\n" : "heap integrity: CORRUPT\n");
+    }
+    else if (NetStrEq(cmd, "clock status")) {
+        const auto clock = ApicGetClockSnapshot();
+        BridgeReply reply;
+        reply.text("{\"source\":\""); reply.text(clock.pvclock ? "pvclock" : "lapic-irqs");
+        reply.text("\","); reply.field("elapsed_ms", clock.elapsedMs);
+        reply.text(","); reply.field("raw_bsp_irqs", clock.rawBspIrqs);
+        reply.text(","); reply.field("origin_ns", clock.originNs);
+        reply.text(","); reply.field("origin_ms", clock.originMs);
+        reply.text(","); reply.field("rejected_samples", clock.rejectedSamples);
+        reply.text(","); reply.field("rate_adjustments", clock.rateAdjustments);
+        reply.text(","); reply.field("timer_ticks_per_ms", clock.timerTicksPerMs);
+        reply.text(","); reply.field("initial_timer_ticks_per_ms", clock.initialTimerTicksPerMs);
+        reply.text("}\n"); reply.send();
     }
     else if (NetStrEq(cmd, "audio stats")) {
         DebugAudioDiagnostics();
@@ -4335,10 +4332,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             ParseUint(sub + 6, &ms);
             if (ms > 10000) ms = 10000; // cap at 10 seconds
 
-            extern volatile uint64_t g_lapicTickCount;
             Process* self = ProcessCurrent();
             if (self && ms > 0) {
-                self->wakeupTick = g_lapicTickCount + ms;
+                self->wakeupTick = ApicTickCount() + ms;
                 SchedulerBlock(self);
             }
             DebugChannelSend("inject: sleep done\n");

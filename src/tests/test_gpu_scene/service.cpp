@@ -53,6 +53,7 @@ brook::GpuCaptureResult Capture(uint32_t id,int32_t producer,uint32_t resource,u
 }
 namespace brook {
 volatile uint64_t g_lapicTickCount=0;
+uint64_t ApicTickCount() { return g_lapicTickCount; }
 extern "C" void* kmalloc(uint64_t bytes) { return std::malloc(bytes); }
 extern "C" void kfree(void* ptr) { std::free(ptr); }
 void KMutexLock(KMutex*) { EXPECT(sceneLockDepth++==0); }

@@ -11,14 +11,10 @@
 
 namespace brook {
 
-extern volatile uint64_t g_lapicTickCount;
 extern volatile uint64_t g_lapicRawTickCount;  // never touched outside ISR
 
 // Boot-time Unix epoch (seconds since 1970-01-01 00:00:00 UTC).
 static uint64_t g_bootEpochSec = 0;
-
-// LAPIC tick value when RTC was read (to compute elapsed time).
-static uint64_t g_bootTick = 0;
 
 // Immutable after BSP boot, before application/AP clock readers start. The
 // CMOS read has one-second precision; fractional time must share its epoch.
@@ -29,14 +25,11 @@ static bool g_wallUsesPvclock = false;
 // Timezone offset in seconds east of UTC.
 static int32_t g_tzOffsetSec = 0;
 
-// Last RTC epoch sampled by RtcRecalibrateLapic, and the g_lapicTickCount
-// reading that accompanied it.  Used to detect RTC jumps and throttle work.
+// Last CMOS second used by fallback timer-frequency discipline.
 static uint64_t g_lastRtcSec = 0;
-static uint64_t g_lastRtcTick = 0;
 
 // Separate longer-window state for LAPIC rate correction: CMOS resolution is
-// 1 second, so to get a drift signal below our 5% deadband we need ≥3 real
-// seconds of observation.  These are advanced only after we actually take
+// 1 second; use a ten-second observation window with a 10% deadband.  These are advanced only after we actually take
 // a rate sample.
 static uint64_t g_lastRateSec  = 0;
 static uint64_t g_lastRateTick = 0;
@@ -177,12 +170,13 @@ void RtcInit()
     uint32_t fullYear = (yr < 70) ? 2000 + yr : 1900 + yr;
 
     g_bootEpochSec = DateToEpoch(fullYear, mon, day, hr, min, sec);
-    g_bootTick = g_lapicTickCount;
     g_wallUsesPvclock = KvmClockAvailable();
-    g_wallStarted = g_wallUsesPvclock ? KvmClockReadNs() : g_lapicRawTickCount;
+    g_wallStarted = g_wallUsesPvclock ? KvmClockReadNs() :
+        __atomic_load_n(&g_lapicRawTickCount, __ATOMIC_RELAXED);
     g_wallEpochNs = g_bootEpochSec * 1000000000ULL;
     g_lastRtcSec = g_bootEpochSec;
-    g_lastRtcTick = g_bootTick;
+    g_lastRateSec = 0;
+    g_lastRateTick = 0;
 
     // Default timezone: UTC+0 (configurable via RtcSetTimezoneOffset)
     g_tzOffsetSec = 0;
@@ -228,21 +222,12 @@ static uint64_t TryReadCmosEpoch()
     return DateToEpoch(fullYear, mon, day, hr, min, sec);
 }
 
-// Re-align g_lapicTickCount against the CMOS RTC.  Called periodically from
-// the BSP's LAPIC timer ISR.  The LAPIC timer is calibrated once at boot
-// against the PIT; under real hardware turbo-boost (or KVM timer drift)
-// it can skew by 10-20% from wall-clock. Legacy scheduler/tick consumers
-// still depend on this counter; realtime no longer uses its rebased value.
-// We rebase by reading CMOS (1-second resolution) once a second
-// and nudging g_lapicTickCount so it matches wall time.
-//
-// This legacy apparent counter can be nudged backwards. It is not the elapsed
-// source for RtcNowNs; raw IRQ ticks remain unadjusted. KVM realtime uses
-// pvclock independently. Recalibration still adjusts the hardware timer rate.
+// Coarse frequency discipline for the non-pvclock fallback only. CMOS has
+// one-second resolution and may jump, so it must never rewrite an elapsed
+// deadline counter. Stable-pvclock hosts keep their PIT-calibrated IRQ period.
 void RtcRecalibrateLapic()
 {
-    uint64_t tickNow = g_lapicTickCount;
-    uint64_t rawNow  = g_lapicRawTickCount;
+    uint64_t rawNow  = __atomic_load_n(&g_lapicRawTickCount, __ATOMIC_RELAXED);
     uint64_t rtcSec = TryReadCmosEpoch();
     if (rtcSec == 0) return;  // RTC busy, try again next pass
 
@@ -252,17 +237,13 @@ void RtcRecalibrateLapic()
     if (rtcSec < g_lastRtcSec) {
         // Clock went backwards (user changed RTC?) — resync baseline.
         g_lastRtcSec = rtcSec;
-        g_lastRtcTick = tickNow;
-        g_bootEpochSec = rtcSec - (tickNow - g_bootTick) / 1000;
+        g_lastRateSec = rtcSec;
+        g_lastRateTick = rawNow;
         return;
     }
 
-    // Require ≥3 elapsed RTC seconds so phase noise (±1s at each endpoint
-    // of a CMOS-resolution measurement) is damped below our 5% deadband.
-    // Uses separate state (g_lastRate*) because the nudge code below always
-    // updates g_lastRtc* every 1s.  IMPORTANT: measure against the RAW
-    // tick counter (pure ISR increments) — not g_lapicTickCount, which is
-    // paused/jumped by the nudge code below and would mask the true rate.
+    // Use a separate, longer window to limit CMOS phase noise. Measure actual
+    // delivered IRQs; never use the elapsed source or alter its epoch.
     if (g_lastRateSec == 0) {
         g_lastRateSec  = rtcSec;
         g_lastRateTick = rawNow;
@@ -277,31 +258,13 @@ void RtcRecalibrateLapic()
         }
     }
 
-    uint64_t expectedMsSinceBoot = (rtcSec - g_bootEpochSec) * 1000;
-    uint64_t actualMsSinceBoot = tickNow - g_bootTick;
-
-    // Aim to land halfway through the current RTC second (add 500ms).
-    uint64_t targetMs = expectedMsSinceBoot + 500;
-
-    if (actualMsSinceBoot > targetMs + 1000) {
-        // LAPIC is running fast by more than 1 second — pause increments
-        // by nudging the apparent count backward.  This is the only time
-        // we touch the counter from outside the ISR increment path; both
-        // writes happen on the BSP from within the ISR so the store is
-        // safe.
-        g_lapicTickCount = g_bootTick + targetMs;
-    } else if (actualMsSinceBoot + 1000 < targetMs) {
-        // LAPIC is running slow — jump forward.
-        g_lapicTickCount = g_bootTick + targetMs;
-    }
-
     g_lastRtcSec = rtcSec;
-    g_lastRtcTick = g_lapicTickCount;
 }
 
 uint64_t RtcNowNs()
 {
-    const uint64_t now = g_wallUsesPvclock ? KvmClockReadNs() : g_lapicRawTickCount;
+    const uint64_t now = g_wallUsesPvclock ? KvmClockReadNs() :
+        __atomic_load_n(&g_lapicRawTickCount, __ATOMIC_RELAXED);
     // Never combine integer seconds from one clock with another clock's phase.
     // Raw delivered ticks avoid RTC rebasing on the fallback path; their rate
     // still depends on timer calibration and interrupt delivery.

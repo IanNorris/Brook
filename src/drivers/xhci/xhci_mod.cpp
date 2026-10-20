@@ -58,10 +58,10 @@ MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
 MODULE_IMPORT_SYMBOL(DeviceRegister);
 MODULE_IMPORT_SYMBOL(ApicSendEoi);
+MODULE_IMPORT_SYMBOL(ApicTickCount);
 
 using namespace brook;
 
-namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
 // Suppress unused-const-variable for forward-declared constants needed in later phases
 #pragma clang diagnostic push
@@ -829,8 +829,8 @@ static Trb* XhciWaitForEvent(XhciController& ctrl, uint32_t expectedType,
         }
 
         if (flag) {
-            uint64_t deadline = brook::g_lapicTickCount + timeoutMs;
-            while (brook::g_lapicTickCount < deadline) {
+            uint64_t deadline = brook::ApicTickCount() + timeoutMs;
+            while (brook::ApicTickCount() < deadline) {
                 __asm__ volatile("" ::: "memory"); // compiler barrier
                 if (*flag) {
                     *flag = false;
@@ -846,10 +846,10 @@ static Trb* XhciWaitForEvent(XhciController& ctrl, uint32_t expectedType,
 
     // Direct polling — checks event ring at least once even with timeout=0.
     // This is the path used by poll functions (timeout=0) and during init.
-    uint64_t deadline = brook::g_lapicTickCount + timeoutMs;
+    uint64_t deadline = brook::ApicTickCount() + timeoutMs;
     bool firstPass = true;
 
-    while (firstPass || brook::g_lapicTickCount < deadline) {
+    while (firstPass || brook::ApicTickCount() < deadline) {
         firstPass = false;
         uint32_t idx = ctrl.evtDequeue;
         Trb& evt = ctrl.evtRing[idx];
@@ -1506,8 +1506,8 @@ static bool XhciHubInit(XhciController& ctrl, XhciDevice& dev)
     // Simple busy-wait using LAPIC tick count (~1ms per tick)
     uint32_t delayMs = dev.hubPwrOnDelay * 2;
     if (delayMs < 100) delayMs = 100; // minimum 100ms for safety
-    uint64_t start = brook::g_lapicTickCount;
-    while ((brook::g_lapicTickCount - start) < delayMs) {
+    uint64_t start = brook::ApicTickCount();
+    while ((brook::ApicTickCount() - start) < delayMs) {
         __asm__ volatile("pause");
     }
 
@@ -1589,8 +1589,8 @@ static void XhciHubPollPorts(XhciController& ctrl, XhciDevice& hub)
             XhciHubSetPortFeature(ctrl, hub, p, USB_PORT_FEAT_RESET);
 
             // Wait for reset complete (~50ms)
-            uint64_t start = brook::g_lapicTickCount;
-            while ((brook::g_lapicTickCount - start) < 50) {
+            uint64_t start = brook::ApicTickCount();
+            while ((brook::ApicTickCount() - start) < 50) {
                 __asm__ volatile("pause");
             }
 

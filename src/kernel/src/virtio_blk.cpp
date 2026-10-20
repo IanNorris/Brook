@@ -1,3 +1,4 @@
+#include "apic.h"
 #include "virtio_blk.h"
 #include "pci.h"
 #include "portio.h"
@@ -75,12 +76,11 @@ static constexpr uint64_t VIRTIO_WAIT_DEADLINE_MS = 5000;        // 5 s on the s
 static constexpr uint32_t VIRTIO_WAIT_ITER_CAP    = 2000000000u; // ~tens of seconds of pure spin
 
 // Global millisecond tick, incremented by the LAPIC timer ISR.
-extern volatile uint64_t g_lapicTickCount;
 
 // Clock selection is fixed during boot, before block requests are submitted.
 static inline uint64_t CompletionClockMs()
 {
-    return KvmClockAvailable() ? KvmClockReadNs() / 1000000ULL : g_lapicTickCount;
+    return KvmClockAvailable() ? KvmClockReadNs() / 1000000ULL : ApicTickCount();
 }
 
 static inline bool WaitBudgetExhausted(uint32_t iter, uint64_t startedMs)

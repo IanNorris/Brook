@@ -22,9 +22,8 @@
 #include "process_ids.h"
 
 #include <stdint.h>
+#include "clock_interval.h"
 
-// LAPIC tick counter (defined in apic.cpp, volatile because ISR-modified).
-namespace brook { extern volatile uint64_t g_lapicTickCount; }
 
 // Context switch — implemented in context_switch.S
 extern "C" void context_switch(brook::SavedContext* oldCtx, brook::SavedContext* newCtx,
@@ -500,7 +499,7 @@ enum SchedTraceSite : uint8_t {
 static inline void SchedTrace(Process* proc, uint8_t site)
 {
     if (!proc) return;
-    uint64_t e = (g_lapicTickCount << 16) | ((uint64_t)site << 8)
+    uint64_t e = (ApicTickCount() << 16) | ((uint64_t)site << 8)
                | ((uint64_t)(uint8_t)proc->state);
     uint8_t h = proc->schedTraceHead;
     proc->schedTrace[h % 12] = e;
@@ -614,7 +613,7 @@ static Process* PickNextLocked(uint32_t cpu)
         if (pid >= SCHED_MAX_PIDS)
         {
             static uint64_t s_lastOob = 0;
-            uint64_t now = g_lapicTickCount;
+            uint64_t now = ApicTickCount();
             if (now - s_lastOob >= 100)
             {
                 s_lastOob = now;
@@ -636,7 +635,7 @@ static Process* PickNextLocked(uint32_t cpu)
             if (!heapish || proc->magic != PROCESS_MAGIC)
             {
                 static uint64_t s_lastBad = 0;
-                uint64_t now = g_lapicTickCount;
+                uint64_t now = ApicTickCount();
                 if (now - s_lastBad >= 100)
                 {
                     s_lastBad = now;
@@ -1531,7 +1530,7 @@ Process* SchedulerCurrentProcess()
 // Check blocked processes for timed wakeups (called with NO locks held).
 static void CheckBlockedWakeups()
 {
-    uint64_t now = g_lapicTickCount;
+    uint64_t now = ApicTickCount();
     Process* toUnblock[MAX_PROCESSES];
     uint32_t unblockCount = 0;
 
@@ -1788,7 +1787,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         // contended between CPUs (e.g. a long-running nar-unpack).  It's a
         // benign avoided-race, not a bug; log once per second per CPU.
         static uint64_t lastLogMs[SCHED_MAX_CPUS] = {};
-        uint64_t nowMs = g_lapicTickCount;
+        uint64_t nowMs = ApicTickCount();
         if (nowMs - lastLogMs[cpu] >= 1000)
         {
             lastLogMs[cpu] = nowMs;
@@ -1845,7 +1844,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
     // BRO-176/SIG1: also record this CPU in the address-space footprint mask
     // (leader-owned union) so shootdowns reach every sibling-thread CPU.
     __atomic_or_fetch(AddressSpaceTlbMaskPtr(newProc), 1ULL << cpu, __ATOMIC_RELEASE);
-    g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
+    g_perCpu[cpu].sliceStartTick = ApicTickCount();
 
     // A pending slot owns a reference until DrainPostSwitch's final access.
     // A remote kill may publish reapable as soon as assembly releases the old
@@ -1961,7 +1960,7 @@ void SchedulerTimerTick(bool allowPreempt)
         CheckBlockedWakeups();
 
         // Check alarm timers for all processes
-        uint64_t now = g_lapicTickCount;
+        uint64_t now = ApicTickCount();
         // Signal delivery can acquire g_readyLock. Snapshot with references
         // rather than inverting ready->allProc lock order while delivering.
         static Process* alarmTargets[MAX_PROCESSES]; // BSP-only, IRQs disabled
@@ -2006,11 +2005,12 @@ void SchedulerTimerTick(bool allowPreempt)
 
         // Notify policy of time passing (for anti-starvation boosts etc.).
         uint64_t rlf_tick = SchedLockAcquire(g_readyLock);
-        g_schedOps->Tick(g_schedState, g_lapicTickCount);
+        g_schedOps->Tick(g_schedState, ApicTickCount());
         SchedLockRelease(g_readyLock, rlf_tick);
 
         // Sample load average every 5 seconds (on CPU 0 only)
-        if (g_lapicTickCount % LOAD_SAMPLE_INTERVAL == 0)
+        static uint64_t lastLoadSampleMs = 0; // BSP-only
+        if (ClockTakePeriodicSample(ApicTickCount(), LOAD_SAMPLE_INTERVAL, lastLoadSampleMs))
         {
             uint32_t running = 0;
             uint64_t alf_load = SchedLockAcquire(g_allProcLock);
@@ -2079,7 +2079,7 @@ void SchedulerTimerTick(bool allowPreempt)
             // longer than the requeue window, which never survives it).
             static uint64_t s_lastStallLog = 0;
             static uint16_t s_lastStrandedPid = SCHED_PID_NONE;
-            uint64_t now = g_lapicTickCount;
+            uint64_t now = ApicTickCount();
             if (now - s_lastStallLog >= 500)
             {
                 uint64_t alf = SchedLockAcquire(g_allProcLock);
@@ -2204,7 +2204,7 @@ void SchedulerTimerTick(bool allowPreempt)
     // synchronized; even a read can race an MLFQ boost or full state reset.
     uint64_t rlf8 = SchedLockAcquire(g_readyLock);
     uint64_t timeslice = g_schedOps->Timeslice(g_schedState, cur->pid);
-    if (g_lapicTickCount - g_perCpu[cpu].sliceStartTick < timeslice)
+    if (ApicTickCount() - g_perCpu[cpu].sliceStartTick < timeslice)
     {
         SchedLockRelease(g_readyLock, rlf8);
         return;
@@ -2246,7 +2246,7 @@ void SchedulerTimerTick(bool allowPreempt)
     {
         SchedLockRelease(g_readyLock, rlf8);
         // Nothing else — keep running.
-        g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
+        g_perCpu[cpu].sliceStartTick = ApicTickCount();
         return;
     }
 
@@ -2310,7 +2310,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
         return;
     }
 
-    proc->wakeupTick = g_lapicTickCount + ms;
+    proc->wakeupTick = ApicTickCount() + ms;
     SchedulerBlock(proc);
 }
 
@@ -2438,7 +2438,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // matching the shootdown target), leaving a stale writable COW TLB entry —
     // a COW double-free / UAF. DoSwitch updates this; this exit path must too.
     SmpSetCurrentCr3(cpu, next->savedCtx.cr3);
-    g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
+    g_perCpu[cpu].sliceStartTick = ApicTickCount();
     GdtSetTssRsp0ForCpu(cpu, next->kernelStackTop);
     SetSyscallStack(cpu, next->kernelStackTop);
 
@@ -2514,7 +2514,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(AddressSpaceTlbMaskPtr(first), 1ULL << cpu, __ATOMIC_RELEASE);
     SmpSetCurrentCr3(cpu, first->savedCtx.cr3);  // keep tracking in sync (see exit path)
-    g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
+    g_perCpu[cpu].sliceStartTick = ApicTickCount();
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
 
@@ -2539,13 +2539,13 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // Try to pick a process from the global queue.
 #ifdef BROOK_SCHED_START_TEST_HOOKS
     Process* first = nullptr;
-    const uint64_t testDeadline = g_lapicTickCount + 10000;
+    const uint64_t testDeadline = ApicTickCount() + 10000;
     for (;;) {
         SchedLockAcquire(g_readyLock);
         first = PickNextLocked(cpu);
         if (first || cpu < 1 || cpu > 3) break;
         SchedLockReleaseRaw(g_readyLock);
-        if (g_lapicTickCount >= testDeadline)
+        if (ApicTickCount() >= testDeadline)
             KernelPanic("SCHED_START_TEST timed out waiting for CPU%u case", cpu);
         __asm__ volatile("sti; hlt" ::: "memory");
     }
@@ -2572,7 +2572,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     __atomic_or_fetch(&first->tlbCpuMask, 1ULL << cpu, __ATOMIC_RELEASE);
     __atomic_or_fetch(AddressSpaceTlbMaskPtr(first), 1ULL << cpu, __ATOMIC_RELEASE);
     SmpSetCurrentCr3(cpu, first->savedCtx.cr3);  // keep tracking in sync (see exit path)
-    g_perCpu[cpu].sliceStartTick = g_lapicTickCount;
+    g_perCpu[cpu].sliceStartTick = ApicTickCount();
     GdtSetTssRsp0ForCpu(cpu, first->kernelStackTop);
     SetSyscallStack(cpu, first->kernelStackTop);
 
@@ -3261,7 +3261,7 @@ extern "C" void SchedulerDumpHang()
     FutexDumpWaiters();
     Ext2DumpLockState();
     FatFsDumpLockState();
-    HangPuts("now="); HangDec((int64_t)g_lapicTickCount); HangPuts("\n");
+    HangPuts("now="); HangDec((int64_t)ApicTickCount()); HangPuts("\n");
     HangPuts("==================== END HANG DUMP ====================\n\n");
 }
 
@@ -3681,8 +3681,7 @@ void SchedulerDumpThreadStates()
                      p->pid, p->tgid, p->name, st,
                      p->runningOnCpu, p->currentSyscallNum, p->wakeupTick);
     }
-    extern volatile uint64_t g_lapicTickCount;
-    SerialPrintf("  now=%lu\n", g_lapicTickCount);
+    SerialPrintf("  now=%lu\n", ApicTickCount());
     Ext2DumpLockState();
     FatFsDumpLockState();
     SerialPrintf("=========================\n\n");

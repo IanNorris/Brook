@@ -11,13 +11,15 @@ short wakeup latency. The first repeated RR results have roughly 7–8 ms sleepe
 p95 at eight busy threads and 91–94 ms at 24 on eight vCPUs. The completed
 same-kernel comparison gives MLFQ roughly 21–23 ms at both worker counts: better
 under heavier load, worse under lighter load. Its earlier pilot includes a
-roughly one-second shared outlier, which the matched runs do not reproduce or
-explain. Browser/audio/input workloads must validate any policy choice; a
+roughly one-second shared outlier. Later browser pilots reproduce this
+outlier and expose backwards CMOS rebases of the legacy scheduler clock;
+the elapsed-clock candidate needs matched browser acceptance. Browser/audio/input workloads must validate any policy choice; a
 synthetic sleeper is not an input-to-presentation test.
 
 A missing prerequisite is observable runtime accounting. Brook currently
-charges one CPU tick per delivered interrupt and uses the BSP's adjustable
-apparent tick counter for slices. Stable KVM elapsed time, delivered IRQ count,
+charges one CPU tick per delivered interrupt. The elapsed-clock candidate
+now uses stable KVM pvclock for slices instead of the BSP's adjustable
+apparent tick counter; this does not establish actual CPU-service accounting. Stable KVM elapsed time, delivered IRQ count,
 actual CPU service and host stolen time are different quantities. Log which
 one each statistic represents; do not use the existing `/proc` CPU ticks as
 proof of precise EEVDF service accounting.

@@ -10,6 +10,8 @@
 #include "smp.h"
 #include "spinlock.h"
 #include "panic.h"
+#include "kvmclock.h"
+#include "tick_clock.h"
 
 // Declared at global scope in idt.cpp
 void IdtInstallHandler(uint8_t vector, void* handler);
@@ -177,9 +179,35 @@ static void SoftEnableLapic()
 // LAPIC timer spurious ISR — just send EOI.
 // ---------------------------------------------------------------------------
 
-// Global tick counter (incremented every ~1ms by LAPIC timer).
-// Used by syscall timing (clock_gettime, nanosleep).
+// Compatibility cache for older modules. Current callers use ApicTickCount().
+// Stable elapsed samples publish a global monotonic floor; IRQ counts remain
+// separate and are never interpreted as precise service/wall time on KVM.
 volatile uint64_t g_lapicTickCount = 0;
+static bool g_tickUsesPvclock = false;
+static uint64_t g_tickOriginNs = 0;
+static uint64_t g_tickOriginMs = 0;
+static uint64_t g_tickRejectedSamples = 0;
+static uint64_t g_timerRateAdjustments = 0;
+
+bool ApicInitElapsedClock()
+{
+    if (__atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE)) return true;
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    bool selected = __atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE);
+    if (!selected) {
+        uint64_t now = 0;
+        if (KvmClockReadStableNs(&now)) {
+            g_tickOriginNs = now;
+            g_tickOriginMs = __atomic_load_n(&g_lapicTickCount, __ATOMIC_ACQUIRE);
+            __atomic_store_n(&g_tickUsesPvclock, true, __ATOMIC_RELEASE);
+            selected = true;
+            SerialPrintf("APIC: elapsed clock KVM pvclock (origin_ms=%lu)\n", g_tickOriginMs);
+        }
+    }
+    if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+    return selected;
+}
 
 // Forward-declare scheduler tick (defined in scheduler.cpp).
 void SchedulerTimerTick(bool allowPreempt);
@@ -303,20 +331,26 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
     // when up to date.
     TlbEpochFlushLocal();
 
-    // Only BSP maintains the global tick and composites framebuffers.
+    // Only BSP counts delivered timer interrupts. Every CPU refreshes stable
+    // elapsed time so AP slices do not depend on BSP interrupt availability.
     // Using LAPIC ID check (cheaper than SmpCurrentCpuIndex).
     uint8_t cpuId = static_cast<uint8_t>(LapicRead(LapicReg::ID) >> 24);
     if (cpuId == 0)
     {
-        g_lapicTickCount++;
-        g_lapicRawTickCount++;
-
-        // Re-check CMOS every ~1024 ticks (~1 second) to correct for
-        // LAPIC calibration drift under host turbo / KVM dilation.
-        if ((g_lapicTickCount & 0x3FF) == 0)
-        {
+        __atomic_add_fetch(&g_lapicRawTickCount, 1, __ATOMIC_RELAXED);
+        if (!__atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE))
+            ApicInitElapsedClock();
+    }
+    if (__atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE)) {
+        ApicTickCount();
+    } else if (cpuId == 0) {
+        const uint64_t previous = __atomic_load_n(&g_lapicTickCount, __ATOMIC_ACQUIRE);
+        if (previous != ~uint64_t(0)) TickClockPublishFloor(&g_lapicTickCount, previous + 1);
+        // CMOS may discipline the fallback interrupt frequency, never rebase
+        // the deadline domain. Lost IRQs are not clock-frequency evidence on
+        // a stable-pvclock host, so this controller is disabled there.
+        if ((__atomic_load_n(&g_lapicRawTickCount, __ATOMIC_RELAXED) & 0x3FF) == 0)
             RtcRecalibrateLapic();
-        }
     }
 
     // Propagate rate changes to every CPU: when BSP adjusts the timer rate,
@@ -538,7 +572,7 @@ bool ApicInit(uint64_t localApicPhysical)
             constexpr uint32_t CHUNK_MS = 50;
             constexpr uint32_t PIT_CHUNK = (PIT_FREQUENCY * CHUNK_MS) / 1000;
 
-            uint64_t tStart = g_lapicTickCount;
+            uint64_t tStart = ApicTickCount();
             uint32_t chunks = windowMs / CHUNK_MS;
             uint8_t  prev61 = inb(0x61);
             for (uint32_t i = 0; i < chunks; i++)
@@ -551,7 +585,7 @@ bool ApicInit(uint64_t localApicPhysical)
                 while (!(inb(0x61) & 0x20)) {}
             }
             outb(0x61, prev61);
-            uint64_t tEnd = g_lapicTickCount;
+            uint64_t tEnd = ApicTickCount();
 
             uint64_t dMs   = tEnd - tStart;
             uint32_t realMs = chunks * CHUNK_MS;
@@ -590,11 +624,12 @@ uint32_t ApicGetTimerTicksPerMs()
 // `observedTicksPerSec` is how many ISR-increments actually occurred in the
 // last real wall-clock second (measured from CMOS).  If the LAPIC is firing
 // too fast, observed > 1000 and we increase INIT_COUNT so the next interval
-// is longer (fewer ticks/sec).  Proportional control with 50% damping and a
-// 2% deadband to avoid oscillation.  Clamped to [0.25×, 4×] the original
+// is longer (fewer ticks/sec). Apply 25% of the correction with a
+// 10% deadband to avoid oscillation. Clamped to [0.25×, 4×] the original
 // boot-time calibration so we can never brick the scheduler tick.
 void ApicAdjustTimerRate(uint32_t observedTicksPerSec)
 {
+    if (__atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE)) return;
     if (g_timerTicksPerMs == 0 || g_timerTicksOrigCalibration == 0) return;
 
     // Reject wildly implausible observations — likely a missed RTC second
@@ -621,6 +656,7 @@ void ApicAdjustTimerRate(uint32_t observedTicksPerSec)
     if (damped == cur) return;
 
     g_timerTicksPerMs = static_cast<uint32_t>(damped);
+    __atomic_add_fetch(&g_timerRateAdjustments, 1, __ATOMIC_RELAXED);
     LapicWrite(LapicReg::TIMER_INIT_CNT, g_timerTicksPerMs);
     // Bump epoch so APs pick up the new rate in their next LAPIC timer ISR.
     __atomic_add_fetch(&g_timerRateEpoch, 1, __ATOMIC_RELEASE);
@@ -1540,7 +1576,33 @@ void ApicInitTimerOnAp()
 
 uint64_t ApicTickCount()
 {
-    return g_lapicTickCount;
+    if (__atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE)) {
+        uint64_t now = 0, sample = 0;
+        if (KvmClockReadStableNs(&now) &&
+            TickClockElapsedMs(g_tickOriginNs, g_tickOriginMs, now, &sample))
+            return TickClockPublishFloor(&g_lapicTickCount, sample);
+        // Retain the last published floor through an unavailable/regressing
+        // sample. Falling back to a freshly counted IRQ would invent time.
+        __atomic_add_fetch(&g_tickRejectedSamples, 1, __ATOMIC_RELAXED);
+    }
+    return __atomic_load_n(&g_lapicTickCount, __ATOMIC_ACQUIRE);
+}
+
+ApicClockSnapshot ApicGetClockSnapshot()
+{
+    ApicClockSnapshot snapshot{};
+    snapshot.elapsedMs = ApicTickCount();
+    snapshot.pvclock = __atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE);
+    snapshot.rawBspIrqs = __atomic_load_n(&g_lapicRawTickCount, __ATOMIC_RELAXED);
+    if (snapshot.pvclock) {
+        snapshot.originNs = g_tickOriginNs;
+        snapshot.originMs = g_tickOriginMs;
+    }
+    snapshot.rejectedSamples = __atomic_load_n(&g_tickRejectedSamples, __ATOMIC_RELAXED);
+    snapshot.rateAdjustments = __atomic_load_n(&g_timerRateAdjustments, __ATOMIC_RELAXED);
+    snapshot.timerTicksPerMs = g_timerTicksPerMs;
+    snapshot.initialTimerTicksPerMs = g_timerTicksOrigCalibration;
+    return snapshot;
 }
 
 } // namespace brook

@@ -2,7 +2,9 @@
 
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
 `f932600c7ef0ac9606057f8e976e47b3f397695aae69383dc965a6d342e2f1b3`.
-The native review reported roughly 1.5× playback in Quake II and Firefox.
+The native review initially estimated roughly 1.5× playback in Quake II and
+Firefox. A later subjective comparison with the original music suggested
+approximately 1.3×; neither estimate is a measured playback factor.
 No repair has yet been shown to resolve the playback speedup, and no scheduler
 default change has been made.
 
@@ -18,8 +20,10 @@ TSC/migration coverage; per-vCPU registration is not currently implemented.
 
 The KVM clocksource is not an interrupt timer. Per-CPU periodic LAPIC timers
 still generate vector 32. Brook calibrates their reload count against PIT
-channel 2 and later changes that count using raw delivered BSP interrupts
-versus coarse CMOS seconds. No TSC-deadline timer programming is implemented.
+channel 2. The baseline later changes that count using raw delivered BSP
+interrupts versus coarse CMOS seconds. The elapsed-clock candidate below
+disables that controller on stable-pvclock hosts; fallback hosts retain it.
+No TSC-deadline timer programming is implemented.
 See the upstream [KVM clock ABI](https://docs.kernel.org/virt/kvm/x86/msr.html)
 and [x86 timekeeping explanation](https://docs.kernel.org/virt/kvm/x86/timekeeping.html).
 
@@ -33,20 +37,22 @@ host seconds. It does not exclude intermittent errors or another timing path.
 ## Source map
 
 Paths below are relative to the repository. The selected source is the KVM path
-unless explicitly marked as fallback.
+unless explicitly marked as fallback. This table describes the current
+elapsed-clock candidate; historical baseline results follow below.
 
 | Consumer | Source / delivery | Code | Remaining concern |
 | --- | --- | --- | --- |
-| Syscall MONOTONIC, RAW, COARSE, BOOTTIME | `KvmClockReadNs`; adjustable LAPIC-ms fallback | `src/kernel/src/syscall.cpp`, `ClockNowNs` | IDs currently alias; validate unsupported IDs and RAW semantics separately |
+| Syscall MONOTONIC, RAW, COARSE, BOOTTIME | `KvmClockReadNs`; monotonic `ApicTickCount()` fallback | `src/kernel/src/syscall.cpp`, `ClockNowNs` | IDs currently alias; validate unsupported IDs and RAW semantics separately |
+| CPU-time / unsupported clock IDs | Currently fall through to elapsed time in `ClockNowNs`; `clock_getres` also accepts any ID | `syscall.cpp`, `sys_clock_gettime`, `sys_clock_getres` | CLOCK_PROCESS_CPUTIME_ID=2 and THREAD=3 must report charged CPU time; unsupported IDs need errors. This is an additional unresolved semantic defect, not a measured playback cause |
 | libc MONOTONIC fast path | read-only pvclock/TSC vDSO | `src/kernel/vdso/clock.c` | Compare forced syscall, libc, migration and version-update races |
 | REALTIME, gettimeofday, RTC display | immutable CMOS epoch plus pvclock elapsed | `src/kernel/src/rtc.cpp`, `RtcNowNs` | CMOS precision is one second; physical/unstable-clock fallback unaccepted |
 | timerfd expiry | selected nanosecond clock, lazy readiness refresh | `syscall.cpp`, `timerfd_state.h` | Delivery depends on readiness/wakeup paths; existing timerfd tests are not scheduler latency tests |
-| POSIX timer expiry | pvclock; REALTIME recomposes `RtcNow()*1e9 + pvclock%1e9` | `src/kernel/src/posix_timer.cpp`, `Now` | Epoch/fraction mismatch repaired in this branch; host boundary regression passes, guest pending |
-| Relative nanosleep | monotonic deadline rechecked after each wake | `syscall.cpp`, `sys_nanosleep` | Wake requests still expressed in adjustable LAPIC ticks |
-| Absolute clock_nanosleep | selected-clock deadline, LAPIC wake hints | `syscall.cpp`, `sys_clock_nanosleep` | Recheck and request-overflow repair passes short guest regression; signal/load coverage remains |
-| futex, poll/select/epoll waits | nanosecond deadlines plus LAPIC wake hints in several paths | `syscall.cpp`, deadline conversion and waiter loops | Audit each retry, clock selection, signal and overflow path individually |
-| alarm and scheduler sleep | adjustable `g_lapicTickCount` | `scheduler.cpp`, `syscall.cpp` | CMOS rebases can move this counter in either direction |
-| Scheduler slice expiry / policy aging | BSP apparent LAPIC-ms counter | `scheduler.cpp`, `SchedulerTimerTick` | Unsigned elapsed subtraction after a backward rebase; AP delivery differs from BSP time |
+| POSIX timer expiry | pvclock; REALTIME uses `RtcNowNs()` | `src/kernel/src/posix_timer.cpp`, `Now` | Epoch/fraction mismatch repaired; actual selector/expiry host regressions pass |
+| Relative nanosleep | monotonic deadline rechecked after each wake | `syscall.cpp`, `sys_nanosleep` | Wake hints use the elapsed-millisecond domain; actual deadline recheck remains authoritative |
+| Absolute clock_nanosleep | selected-clock deadline, elapsed-millisecond wake hints | `syscall.cpp`, `sys_clock_nanosleep` | Recheck and request-overflow repair passes short guest regression; signal/load coverage remains |
+| futex, poll/select/epoll waits | nanosecond deadlines plus elapsed-millisecond wake hints in several paths | `syscall.cpp`, deadline conversion and waiter loops | Audit each retry, clock selection, signal and overflow path individually |
+| alarm and scheduler sleep | `ApicTickCount()`: stable pvclock with preserved boot origin, IRQ fallback otherwise | `scheduler.cpp`, `syscall.cpp` | Delivery still depends on BSP interrupt/wakeup scans; fallback is not a precise wall clock |
+| Scheduler slice expiry / policy aging | `ApicTickCount()` refreshed by each CPU; periodic local IRQ delivery | `scheduler.cpp`, `SchedulerTimerTick` | Stable time removes CMOS rebases; kernel non-preemptibility and IRQ delivery still bound responsiveness |
 | CPU accounting | one user/sys/idle charge per delivered local IRQ | `scheduler.cpp`, `SchedulerTimerTick` | Counts interrupts, not actual elapsed CPU time; stolen time and masked IRQs bias results |
 | Ready-queue latency diagnostic | stable KVM clock, incarnation-guarded episodes | `scheduler.cpp`, `ReadyLatencyNow` | Optional; does not measure time waiting for device completion |
 | HDA completion | LPIB modulo ring position; stable pvclock bounds ambiguity | `intel_hda_mod.cpp`, `audio_dma_clock.h` | Check native 44.1-kHz progress against host audio capture, underruns and position discontinuities |
@@ -460,3 +466,127 @@ RR stays the default. Evidence and frozen harnesses are under
 `scheduler-safety/`, including `summary.json`, the native transition receipts,
 the source snapshot and compiled audit reports. Mixed browser/audio/CPU policy
 comparisons remain outstanding.
+
+### Elapsed-clock correction: native candidate (2026-10-20)
+
+The legacy scheduler clock could step in both directions. In the diagnostic
+MLFQ browser run, adjacent QMP observations show apparent elapsed time falling
+892 ms over 104 ms of host time while the raw BSP IRQ counter increases by 117.
+The RTC discipline changes the apparent-clock offset by -1009 ms in that pair.
+Other retained observations include forward steps exceeding one second. The
+frequency controller also treated delayed IRQ delivery as a slow timer and
+reduced the LAPIC reload. These are confirmed clock defects; they do not yet
+establish the exact cause or factor of the user's accelerated YouTube playback.
+Evidence is in `lapic-monitor-mlfq-clock{,-v2}/`. The v2 observer retained its
+samples but exited nonzero when the VM stopped during session-lock acquisition;
+that stop race is not counted as a clean observer run.
+
+The candidate selects stable KVM pvclock for elapsed milliseconds, preserving
+the prior boot origin and publishing an atomic monotonic floor across CPUs.
+Scheduler, deadline, compositor, networking and module consumers use
+`ApicTickCount()`. LAPIC periodic interrupts still deliver scheduling events;
+they no longer define elapsed time when pvclock is selected. RTC code no longer
+rebases the counter, and pvclock mode disables IRQ-count-based frequency tuning.
+The legacy data export remains for module compatibility. IRQ-based CPU accounting
+and the bare-metal fallback remain approximate; this is not a new scheduler or
+a TSC-deadline timer implementation.
+
+Four actual-RTC no-rebase assertions fail before the change and pass afterward.
+All 58 hosted tests pass, including clock conversion/failure checks and an
+8-thread atomic-floor stress test. Compiled entry/start audits pass for the
+candidate ELF SHA256
+`863dd3a60c7a74f8e7920adf59a45cfade8ceeb8e22d7ac81fbd79cc1a98847d`.
+
+A first native smoke uses eight vCPUs, six GiB, MLFQ, silent audio and fresh
+private disks with the matching XHCI module in both the initrd artifacts and
+boot filesystem. Across 60 seconds and 12,278 uptime samples there are zero
+backwards steps, zero large jumps and zero malformed centisecond fields. Stable
+pvclock remains selected, rejected samples and timer-rate adjustments stay zero,
+and the timer reload remains its initial 62,527 ticks/ms. Host brackets over
+about 55 seconds bound the elapsed-clock rate to approximately 0.990–1.001x.
+All 32 libc/syscall clock brackets and 36 relative/absolute sleep checks pass
+under load. Twenty-four CPU workers complete a bounded 30-second run; periodic
+sleepers have p95 around 24 ms and worst lateness around 43 ms. Unlike the prior
+browser pilots, this smoke does not include Firefox and cannot alone prove that
+the earlier ~1.16-second mixed-workload outlier is gone.
+
+All three tracked job lineages drain, the heap check completes, the owned
+launcher exits zero and all four primary offline filesystem checks pass.
+Evidence is under `tick-clock/native/` and the private review root
+`build/reviews/timing-mix-tickclock0-20261020`. Browser/audio acceptance and exact
+accelerated-playback reproduction remain outstanding. RR remains the default.
+
+The user also supplied a 17.567-second 1280x720/30-fps recording of Thriller in
+YouTube. The playback timestamp is hidden; initial audio-onset autocorrelation
+has competing peaks and does not justify an exact speed factor. The taskbar FPS
+value is smoothed and updated per rendered frame, so rapid visible changes are
+not an independent calibrated timer. Analysis artifacts remain local under
+`user-speedup-video/`; no recording or licensed media is included in git.
+
+
+### Same-fixture browser comparison with the elapsed-clock candidate
+
+The original generated 30-second looping clip, fresh Firefox profile, eight
+vCPUs/six GiB, fixed 24-worker/30-second load and private 44.1-kHz null sink
+were repeated with the elapsed-clock candidate. HDA callback mode remains an
+explicit diagnostic setting, not a default change. Screenshot capture occurs
+after measurement. These are single pilot runs, not statistical acceptance.
+
+| Candidate policy | Periodic p95 / max | CPU batches / worker max:min | Loaded media/page time | PCM sample duration / 8-s host capture | Input HTTP acknowledgment upper bounds |
+| --- | --- | --- | --- | --- | --- |
+| RR | 90.1 / 102.3 ms | 6,881,957 / 1.005 | No causally aligned samples | 0.023x | 19.2–20.8 s |
+| MLFQ | 22.2 / 119.8 ms | 5,307,734 / 1.031 | 0.961x over 26.8 page seconds | 0.997x | 0.37–1.96 s |
+
+The previous legacy-clock MLFQ browser pilots had shared worst sleeper delays
+of 1.163 and 1.168 seconds. The corrected-clock MLFQ pilot no longer shows that
+outlier, but this does not establish a bound or reproduce the user’s exact
+accelerated playback. RR still suffers severe application audio starvation;
+fixing the clock alone does not fix contention. MLFQ improves loaded latency
+and audio in this fixture at a substantial throughput cost. RR remains default.
+
+HTTP input acknowledgment includes network and browser processing; it is not
+pure device-to-presentation latency. RR's loaded telemetry stalls, leaving no
+causally aligned video samples. The WAV contains only periods when audio is
+active, so counting stored silent bins alone would hide most of RR's dropout.
+An independently buffered page trace and longer clip are the next measurement
+improvements. Evidence is under `browser-mix/{tickrr,tickmlfq}/`, with original
+controls under `browser-mix/{rr0,mlfq1,mlfq-clock}/`. Both candidate browser jobs
+and worker lineages drain; heap checks complete, owned launchers exit zero and
+all four primary offline filesystem checks pass. Each review also passes the
+12-document/four-profile preservation audit.
+
+Load-average sampling also needed migration: its exact-multiple check could
+miss a skipped 5,000-ms boundary or charge twice at the same millisecond.
+`ClockTakePeriodicSample` now claims each elapsed boundary once, preserves the
+original phase and skips unavailable historical samples. Hosted regressions
+cover skipped ticks, duplicate reads, backwards samples, long gaps and wrap.
+
+
+Migration verification has a specific limitation: guest `sched_setaffinity`
+currently succeeds without applying a mask, while `sched_getaffinity` always
+reports eight CPUs. A test that only requests different masks would not prove
+forced migration or CPU residency. The current clock/sleep probes and global
+floor host stress must not be described as per-vCPU clock validation. Actual
+residency observation or affinity support is needed for that gate.
+
+
+### Final clock candidate: RR, default HDA and Quake II
+
+After the load-average gate correction, all 58 hosted suites and both compiled
+entry/start audits pass for ELF SHA256
+`dd5cc190a495cee5ad49efcc526568a6ccb470c146f7ce358d58d7b648061f2c`.
+A fresh private eight-vCPU/six-GiB RR boot with default HDA timer mode repeats
+the 60-second observer and bounded 24-worker load. All 13,283 uptime samples
+are monotonic with no large jumps; all 32 libc/syscall clock brackets and 36
+sleep checks pass. Periodic sleeper p95 is 90.9–92.0 ms and worst is 100.1 ms.
+
+The same boot then runs the owned Quake II demo probe using GL3 at 1280x720.
+The 15.1-second expected demo interval is observed at 16.367 seconds including
+log visibility/reader scheduling. The game exits zero and its lineage drains.
+This is slower than nominal, not a reproduction of accelerated playback; the
+original user's reported factor remains unmeasured. No game assets or derived
+demo are tracked. Evidence is under `tick-clock/native-final/` and
+`q2-clock-final-default-hda/`. The owned launcher exits zero, all four primary
+filesystems pass offline checks, and the 12-document/four-profile preservation
+audit passes. Further browser trace, actual migration/residency, CPU-time clock
+semantics and scheduler runtime/lifetime work remain open.

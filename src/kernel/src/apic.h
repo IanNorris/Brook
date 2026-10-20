@@ -86,9 +86,26 @@ void IoApicMaskIrq(uint8_t irq);
 // ticks-per-ms value. Must be called after the AP has enabled its LAPIC.
 void ApicInitTimerOnAp();
 
-// Return the global monotonic tick count (incremented once per LAPIC timer
-// interrupt on the BSP — approximately 1 ms resolution).
+// Monotonic elapsed milliseconds. Stable KVM pvclock is selected after its
+// initialization; otherwise this is an approximate delivered-IRQ clock.
 uint64_t ApicTickCount();
+
+// BSP only. Preserve the existing origin when selecting stable elapsed time.
+// A BSP timer interrupt retries if the initial stable-page read is unavailable.
+bool ApicInitElapsedClock();
+
+struct ApicClockSnapshot {
+    bool pvclock;
+    uint64_t elapsedMs;
+    uint64_t rawBspIrqs;
+    uint64_t originNs;
+    uint64_t originMs;
+    uint64_t rejectedSamples;
+    uint64_t rateAdjustments;
+    uint32_t timerTicksPerMs;
+    uint32_t initialTimerTicksPerMs;
+};
+ApicClockSnapshot ApicGetClockSnapshot();
 
 // Send an NMI to a specific CPU by LAPIC ID.
 void ApicSendNmi(uint8_t targetApicId);

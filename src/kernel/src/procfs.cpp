@@ -1,3 +1,4 @@
+#include "apic.h"
 // procfs — virtual /proc filesystem for Brook OS
 //
 // Provides read-only process and system information compatible with the
@@ -18,7 +19,6 @@
 
 namespace brook {
 
-extern volatile uint64_t g_lapicTickCount;
 
 // ---- Helpers ----
 
@@ -372,7 +372,7 @@ static Vnode* GenUptime()
     auto* buf = static_cast<char*>(kmalloc(64));
     if (!buf) return nullptr;
 
-    uint64_t ticks = g_lapicTickCount;
+    uint64_t ticks = ApicTickCount();
     uint64_t secs = ticks / 1000;
     uint64_t frac = (ticks % 1000) / 10;  // centiseconds
 

@@ -19,7 +19,6 @@
 
 namespace brook {
 
-extern volatile uint64_t g_lapicTickCount;
 
 extern "C" uint64_t AudioClockNowNs()
 {
@@ -499,7 +498,7 @@ static void AudioMixerThreadFn(void* /*arg*/)
     {
         // Sleep ~10ms
         Process* self = ProcessCurrent();
-        self->wakeupTick = g_lapicTickCount + 10;
+        self->wakeupTick = ApicTickCount() + 10;
         SchedulerBlock(self);
 
         // Flush whatever has accumulated

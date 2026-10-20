@@ -1,3 +1,4 @@
+#include "apic.h"
 #include "compositor_scene.h"
 #include "gpu_scene_versions.h"
 #include "compositor.h"
@@ -21,7 +22,6 @@ inline void* operator new(size_t,void* storage) noexcept { return storage; }
 #endif
 
 namespace brook {
-extern volatile uint64_t g_lapicTickCount;
 namespace {
 constexpr uint32_t VersionSlots=64,MaxJobs=64,MaxScenes=32;
 constexpr uint64_t PixelLimit=256ull*1024*1024,SnapshotLimit=256ull*1024*1024;
@@ -160,7 +160,7 @@ int Enqueue(SceneJob* job) {
     g_tail=job;KMutexUnlock(&g_sceneLock);CompositorWake();return 0;
 }
 int64_t WaitJob(Process* caller,SceneJob* job) {
-    const uint64_t deadline=g_lapicTickCount+5000;
+    const uint64_t deadline=ApicTickCount()+5000;
     int64_t result;
     for (;;) {
         bool dropWorker=false;
@@ -168,7 +168,7 @@ int64_t WaitJob(Process* caller,SceneJob* job) {
         if (job->state==JobState::Done) {
             result=job->result;KMutexUnlock(&g_sceneLock);break;
         }
-        if (g_lapicTickCount>=deadline ||
+        if (ApicTickCount()>=deadline ||
             (caller && __atomic_load_n(&caller->terminalPending,__ATOMIC_ACQUIRE))) {
             job->canceled=true;
             if (job->state==JobState::Queued) {

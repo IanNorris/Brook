@@ -1,10 +1,10 @@
+#include "apic.h"
 #include "mapping_fault_test.h"
 #include "process.h"
 #include "scheduler.h"
 #include "spinlock.h"
 
 namespace brook {
-extern volatile uint64_t g_lapicTickCount;
 uint64_t MappingRendererTestEpoch();
 namespace {
 IrqSpinLock lock;
@@ -56,10 +56,10 @@ static bool Barrier(uint64_t spaceIdentity,uint64_t page,uint32_t phase) {
     // to proceed. Restore IF before returning to the real exception handler.
     uint64_t flags;
     __asm__ volatile("pushfq; popq %0; sti":"=r"(flags)::"memory");
-    const uint64_t start=__atomic_load_n(&g_lapicTickCount,__ATOMIC_RELAXED);
+    const uint64_t start=__atomic_load_n(&ApicTickCount(),__ATOMIC_RELAXED);
     for (;;) {
         const uint64_t waitFlags=IrqSpinLockAcquire(&lock);
-        const bool expired=__atomic_load_n(&g_lapicTickCount,__ATOMIC_RELAXED)-start>=10000;
+        const bool expired=__atomic_load_n(&ApicTickCount(),__ATOMIC_RELAXED)-start>=10000;
         if (released || observedEpoch!=epoch || expired) {
             --waiting;
             if (expired) { timedOut=true;armed=false;released=true; }
