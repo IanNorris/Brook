@@ -20,7 +20,10 @@ see the [upstream explanation](https://docs.kernel.org/scheduler/sched-eevdf.htm
 Brook's explicit choices are:
 
 - Initial per-thread weight is 1024. Existing priority hints select physical
-  requests of 1/2/4/8 ms. Live nice/weight controls and process/app-group fairness
+  requests of 1/2/4/8 ms by default. A build-only
+  [normal-request control](desktop-scheduler-tuning.md#normal-request-control-build)
+  permits 2.8 ms for hint 2 while keeping the other requests unchanged.
+  Live nice/weight controls and process/app-group fairness
   are not implemented. An internal initial-weight setter exercises unequal
   weights in host tests without exposing an unfinished user API.
 - Virtual time is the weighted mean of runnable entities, including tasks

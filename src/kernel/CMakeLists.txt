@@ -12,6 +12,8 @@ if(NOT DEFINED BROOK_ROOT)
     set(BROOK_ROOT "${CMAKE_SOURCE_DIR}/../..")
 endif()
 
+include("${BROOK_ROOT}/cmake/EevdfExperiment.cmake")
+
 set(SHARED_INCLUDE_DIRS
     "${BROOK_ROOT}/src/shared"
     "${BROOK_ROOT}/src/shared/inc_km"

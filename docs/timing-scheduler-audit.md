@@ -25,6 +25,12 @@ The [six scheduler repeats with the new audio defaults](scheduler-small-buffer-c
 retain the latency/presentation tradeoff: EEVDF wakes periodic tasks sooner,
 MLFQ presents more video, and RR shows browser audio-producer starvation.
 
+The [desktop/gaming scheduler direction](desktop-scheduler-tuning.md) makes
+input, frame cadence and continuous audio the primary tuning criteria, stops
+further RR investigation, and verifies live Linux 2.8-ms requests against
+Brook EEVDF's 4-ms normal baseline. It also documents the isolated build-time
+request control and its model/module validation.
+
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
 `f932600c7ef0ac9606057f8e976e47b3f397695aae69383dc965a6d342e2f1b3`.
 The native review initially estimated roughly 1.5× playback in Quake II and

@@ -7,6 +7,8 @@ if(NOT DEFINED BROOK_ROOT)
     set(BROOK_ROOT "${CMAKE_SOURCE_DIR}/../../..")
 endif()
 
+include("${BROOK_ROOT}/cmake/EevdfExperiment.cmake")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -224,6 +226,8 @@ set_target_properties(sched_mlfq PROPERTIES PREFIX "lib" SUFFIX ".so")
 add_library(sched_eevdf SHARED "${BROOK_ROOT}/src/modules/sched_eevdf.cpp")
 target_include_directories(sched_eevdf PRIVATE "${BROOK_ROOT}/src/kernel/src")
 set_target_properties(sched_eevdf PROPERTIES PREFIX "lib" SUFFIX ".so")
+target_compile_definitions(sched_eevdf PRIVATE BROOK_EEVDF_NORMAL_REQUEST_NS=${BROOK_EEVDF_NORMAL_REQUEST_NS})
+target_compile_definitions(test_eevdf PRIVATE BROOK_EEVDF_NORMAL_REQUEST_NS=${BROOK_EEVDF_NORMAL_REQUEST_NS})
 add_dependencies(test_eevdf sched_eevdf)
 target_link_libraries(test_eevdf PRIVATE ${CMAKE_DL_LIBS})
 add_test(NAME test_eevdf_module COMMAND test_eevdf "$<TARGET_FILE:sched_eevdf>")

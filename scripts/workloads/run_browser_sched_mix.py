@@ -136,6 +136,14 @@ def main():
      while 'READY workers=' not in bench.evidence['stdout']:
       bench.poll();assert bench.evidence['status']['state']!='completed';assert time.monotonic()<deadline;time.sleep(.2)
      save('load-ready',dict(host_monotonic_ns=time.monotonic_ns()))
+    # SCHEDMIX announces READY one second before its timed interval. Fast
+    # transport can otherwise put the start of the audio capture before load.
+    # Match the Linux controller's grace period; the final clock brackets still
+    # decide whether the entire capture is proven to be inside that interval.
+    if not has('load-grace'):
+     earliest=read('load-ready')['host_monotonic_ns']+1100000000
+     while time.monotonic_ns()<earliest:time.sleep(.05)
+     save('load-grace',dict(not_before_host_ns=earliest,host_monotonic_ns=time.monotonic_ns()))
     if args.profile_ms and not has('profile-start'):
      if has('profile-intent'):raise RuntimeError('Prior profile start delivery unresolved; inspect existing capture')
      save('profile-intent',dict(duration_ms=args.profile_ms,host_monotonic_ns=time.monotonic_ns()))
@@ -199,6 +207,8 @@ def main():
     counts=[x['batches'] for x in result['cpu']];assert len(counts)==24 and min(counts)>0 and all(x['samples']>0 and not x['early'] for x in result['periodic'])
     summary=dict(phase=phase,policy=policy,kernel=d['kernel_sha256'],guest_memory_gib=6,vcpus=8,hda_use_timer=hda_use_timer,audio_buffer_us=metadata.get('audio_buffer_us',200000),scope='headless GPU VM, fresh Firefox profile, generated local video, 24 bounded CPU workers; input ack includes HTTP and DOM RAF opportunity, not physical display latency; load alignment assumes 1x KVM clock checked by reported brackets',host_guest_rate_low=clock_low,host_guest_rate_high=clock_high,load_host_start_latest_ns=load_start,load_host_end_earliest_ns=load_end,idle=media_summary(read('idle')['rows']),loaded=media_summary(loaded),cpu_batches=sum(counts),cpu_service_ratio=max(counts)/min(counts),periodic_p95_ms=max(x['p95_ns'] for x in result['periodic'])/1e6,periodic_max_ms=max(x['max_ns'] for x in result['periodic'])/1e6,inputs=inputs,audio_frames=n,audio_host_s=capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0],audio_host_rate_ratio=n/rate/(capture['host_monotonic_interval'][1]-capture['host_monotonic_interval'][0]),audio_longest_silent_10ms_bins=longest)
     summary['profile_ms']=args.profile_ms
+    c0,c1=capture['host_monotonic_interval']
+    summary['audio_capture_inside_load']=load_start<=c0*1e9<=c1*1e9<=load_end
     save('summary',summary);save('rms-10ms',levels);print('MIX_SUMMARY',json.dumps(summary),flush=True)
     import importlib.util
     spec=importlib.util.spec_from_file_location('trace_analysis',str(Path(__file__).with_name('analyze_browser_sched_trace.py')));analysis=importlib.util.module_from_spec(spec);spec.loader.exec_module(analysis)

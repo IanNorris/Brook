@@ -32,6 +32,8 @@ int main(int argc,char** argv){
                     void* storage=std::calloc(1,ops->stateSize);CHECK(storage);
                     if(storage){
                         ops->Init(storage);ops->InitProcess(storage,1,2);ops->InitProcess(storage,2,0);
+                        CHECK(static_cast<EevdfPolicy*>(storage)->Inspect(1).requestNs==EevdfNormalRequestNs);
+                        CHECK(ops->Timeslice(storage,1)==(EevdfNormalRequestNs+999999)/1000000);
                         ops->Enqueue(storage,1);ops->Enqueue(storage,2);CHECK(ops->PickNext(storage)==2);
                         ops->AccountService(storage,2,1000000);CHECK(ops->ShouldPreempt(storage,2,0));
                         ops->Remove(storage,2);ops->SetRunnable(storage,2,false);CHECK(ops->PickNext(storage)==1);
@@ -51,6 +53,25 @@ int main(int argc,char** argv){
         }
     }
     EevdfPolicy p;p.Init();
+    // Request configuration changes only normal/fallback hints, not weights
+    // or the other priority levels. Verify nanosecond residuals survive yield,
+    // sleep and enqueue up to the exact request boundary (including 2.8 ms).
+    const uint32_t expectedRequests[]={1000000,2000000,EevdfNormalRequestNs,8000000};
+    for(uint8_t priority=0;priority<4;++priority){
+        p.InitProcess(1,priority);
+        CHECK(p.Inspect(1).requestNs==expectedRequests[priority]);
+        CHECK(p.Inspect(1).weight==1024);
+    }
+    p.InitProcess(1,255);CHECK(p.Inspect(1).requestNs==EevdfNormalRequestNs);
+    p.Enqueue(1);CHECK(p.PickNext()==1);
+    p.AccountService(1,EevdfNormalRequestNs-1);
+    CHECK(p.Inspect(1).remainingNs==1);
+    p.VoluntaryYield(1);p.SetRunnable(1,false);p.Enqueue(1);
+    CHECK(p.Inspect(1).remainingNs==1);CHECK(p.PickNext()==1);
+    p.AccountService(1,1);CHECK(p.Inspect(1).remainingNs==0);
+    p.TimesliceExpired(1);CHECK(p.Inspect(1).remainingNs==EevdfNormalRequestNs);
+    CHECK(p.Inspect(1).deadline-p.Inspect(1).virtualRuntime==EevdfNormalRequestNs);
+    p.Init();
     CHECK(p.PickNext()==SCHED_PID_NONE && p.ReadyCount()==0);
     p.AccountService(17,1234); // final old-epoch service, no terminated entity resurrection
     CHECK(p.Statistics().serviceNs==1234 && p.Statistics().inactiveServiceNs==1234);
@@ -68,13 +89,13 @@ int main(int argc,char** argv){
     p.Init();p.InitProcess(1,2);p.InitProcess(2,2);p.Enqueue(1);p.Enqueue(2);
     CHECK(p.PickNext()==1);
     p.AccountService(1,1500000);CHECK(p.ShouldPreempt(1,0));p.VoluntaryYield(1);
-    CHECK(p.Inspect(1).remainingNs==2500000);
+    CHECK(p.Inspect(1).remainingNs==EevdfNormalRequestNs-1500000);
     p.Enqueue(1);CHECK(p.PickNext()==2);
     p.AccountService(2,2000000);p.Remove(2);p.SetRunnable(2,false);
     const auto debt=p.Inspect(2);CHECK(debt.deferred && debt.savedLag<0);
     p.SetRunnable(2,true);p.Enqueue(2);
     CHECK(p.Inspect(2).virtualRuntime==debt.virtualRuntime); // short sleep cannot erase debt
-    CHECK(p.Inspect(2).remainingNs==2000000);
+    CHECK(p.Inspect(2).remainingNs==EevdfNormalRequestNs-2000000);
     CHECK(!p.InitialWeight(2,2048));
     p.InitProcess(2,2);CHECK(p.InitialWeight(2,2048)); // PID reuse resets membership/debt
     CHECK(!p.Inspect(2).queued && !p.Inspect(2).deferred);
@@ -82,7 +103,7 @@ int main(int argc,char** argv){
     p.Init();p.InitProcess(1,2);CHECK(p.InitialWeight(1,1u<<20));p.Enqueue(1);CHECK(p.PickNext()==1);
     for(unsigned n=0;n<100000;++n)p.AccountService(1,1);
     CHECK(p.Inspect(1).virtualRuntime==int64_t(100000ULL*1024/(1u<<20))); // fractional service is not lost per query
-    CHECK(p.Inspect(1).remainingNs==3900000);
+    CHECK(p.Inspect(1).remainingNs==EevdfNormalRequestNs-100000);
 
     // Weighted one-CPU service: each task is always runnable, initial weights
     // vary. Compare normalized physical service against an independent ideal.
@@ -145,7 +166,7 @@ int main(int argc,char** argv){
     p.Init();p.InitProcess(1,2);p.InitProcess(2,2);p.Enqueue(1);p.Enqueue(2);
     CHECK(p.PickNext()==1);p.SetRunnable(1,false);p.AccountService(1,1000000);p.Enqueue(1);
     CHECK(p.Inspect(1).virtualRuntime-p.VirtualTime()==1000000);
-    CHECK(p.Inspect(1).remainingNs==3000000);
+    CHECK(p.Inspect(1).remainingNs==EevdfNormalRequestNs-1000000);
     // Deferred negative debt decays through competitors' actual virtual work.
     p.Remove(1);p.SetRunnable(1,false);CHECK(p.Inspect(1).deferred);
     p.AccountService(2,10000000);p.Tick(1);
@@ -154,7 +175,7 @@ int main(int argc,char** argv){
     // Exceptional positive sleeper credit is bounded rather than hoarded.
     p.Init();p.InitProcess(1,2);p.InitProcess(2,2);p.Enqueue(1);p.Enqueue(2);
     p.AccountService(1,20000000);p.Remove(2);p.SetRunnable(2,false);p.Enqueue(2);
-    CHECK(p.VirtualTime()-p.Inspect(2).virtualRuntime==8000000);
+    CHECK(p.VirtualTime()-p.Inspect(2).virtualRuntime==2*EevdfNormalRequestNs);
 
     // Unequal weights on eight CPUs, with demand feasible below one CPU per
     // task: compare physical service against aggregate weighted fair shares.

@@ -1,7 +1,14 @@
 #pragma once
 #include "sched_ops.h"
 
+#ifndef BROOK_EEVDF_NORMAL_REQUEST_NS
+#define BROOK_EEVDF_NORMAL_REQUEST_NS 4000000
+#endif
+
 namespace brook {
+inline constexpr uint32_t EevdfNormalRequestNs=BROOK_EEVDF_NORMAL_REQUEST_NS;
+static_assert(EevdfNormalRequestNs==4000000 || EevdfNormalRequestNs==2800000,
+              "Unsupported EEVDF normal-request experiment");
 // Original Brook EEVDF core, not a Linux scheduler port. Fixed global storage,
 // caller serialization, equal initial weight 1024; request length follows the
 // existing priority hint. No userspace nice/weight API is introduced here.
@@ -184,7 +191,7 @@ public:
     void InitProcess(uint16_t pid,uint8_t priority) {
         if(!pid || pid>=SCHED_MAX_PIDS)return;
         auto& t=tasks_[pid];if(t.queued)--ready_;Leave(pid);t={};t.active=true;t.weight=1024;
-        const uint32_t requests[]={1000000,2000000,4000000,8000000};
+        const uint32_t requests[]={1000000,2000000,EevdfNormalRequestNs,8000000};
         t.request=requests[priority<4?priority:2];t.remaining=t.request;
     }
     // Test/internal capability only: no live nice/weight control is exposed.
@@ -256,7 +263,12 @@ public:
     void TimesliceExpired(uint16_t pid) {if(Valid(pid))Renew(tasks_[pid]);}
     void VoluntaryYield(uint16_t) {} // preserve remaining request and debt
     void Tick(uint64_t) {CleanupDeferred();}
-    uint64_t Timeslice(uint16_t pid) const {return Valid(pid)?tasks_[pid].request/1000000:4;}
+    // ABI metadata is whole milliseconds, rounded up. Actual service/deadline
+    // decisions below remain nanoseconds and never consult this value.
+    uint64_t Timeslice(uint16_t pid) const {
+        const uint32_t ns=Valid(pid)?tasks_[pid].request:EevdfNormalRequestNs;
+        return (uint64_t(ns)+999999)/1000000;
+    }
     uint32_t ReadyCount() const {return ready_;}
     bool ShouldPreempt(uint16_t current,uint64_t) {
         if(!Valid(current) || !tasks_[current].runnable)return true;

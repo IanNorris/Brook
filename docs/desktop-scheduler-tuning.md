@@ -94,7 +94,7 @@ request is a worthwhile controlled experiment, not proof that it alone will
 close the gap. Compositor/IPC work, blocked dependencies, preemption, per-CPU
 placement and application/group scheduling also need separate evidence.
 
-Next compare MLFQ and EEVDF using desktop criteria, beginning with a clearly
+Compare MLFQ and EEVDF using desktop criteria, beginning with a clearly
 labelled 2.8-ms normal-request control against the existing 4-ms EEVDF baseline.
 Keep frame cadence and input/audio results alongside wakeup latency. Preserve
 background progress and bounded starvation; do not promote a candidate solely
@@ -128,3 +128,44 @@ if profiling is needed again. These diagnostics are separate from the six
 unprofiled controls. Evidence is under `rr-dependency-profiles{,-fixed}` in the
 ignored workload directory; the historical directory name is not a plan to
 continue RR work.
+
+## Normal-request control build
+
+The [four forward/reverse native controls](eevdf-normal-request-control.md)
+show no repeatable desktop benefit from 2.8 ms. They retain a native HDA fault
+in one baseline and a partially pre-load audio window in another; neither is
+silently accepted as clean loaded audio. The build default remains 4 ms.
+
+`BROOK_EEVDF_NORMAL_REQUEST_NS` is a build-time control, accepted as either
+`4000000` (the unchanged default) or `2800000`. It changes only priority-2 and
+invalid-priority fallback requests. Hints 0/1/3 remain 1/2/8 ms, and weights,
+queue selection, service accounting and boot policy selection remain unchanged.
+The top-level build forwards it to the kernel subproject; standalone kernel and
+host-test configurations accept the same cache variable. For example:
+
+```sh
+nix-shell --run 'cmake -S src/kernel -B build/private-eevdf-28 -DCMAKE_TOOLCHAIN_FILE=/data/Programming/Codex/Brook/cmake/toolchains/kernel-x86_64-clang.cmake -DBROOK_ROOT=/data/Programming/Codex/Brook -DCMAKE_BUILD_TYPE=Release -DBROOK_EEVDF_NORMAL_REQUEST_NS=2800000'
+```
+
+Build and stage only while QEMU is stopped, following the normal ABI-34 staging
+procedure in [the EEVDF experiment](eevdf-experiment.md). The ABI's whole-ms
+`Timeslice` metadata rounds up (2.8 ms reports 3 ms); actual request/deadline and
+remaining-service calculations stay in nanoseconds. Kernel preemption still
+occurs only at safe user-mode timer boundaries, so the configured request does
+not guarantee dispatch at that exact wall-clock interval.
+
+Both values pass the EEVDF core and shared-module suites, including the
+100,000-step ownership/fairness models. Added checks preserve the last single
+nanosecond of a request through yield/block/enqueue, then renew at exhaustion;
+module inspection checks the compiled request and metadata. The 4-ms build's
+complete 62 hosted suites pass. Both native builds pass import resolution for
+13 modules/106 kernel exports. These checks do not establish desktop performance
+or justify changing the selected scheduler or default request.
+
+The native comparison uses one common kernel and twelve common modules. Only
+`sched_eevdf.mod` differs in the frozen candidate. Independent build directories
+produce debug-path differences and a kernel `.rodata` difference; section hashes
+show other modules' allocated sections match. Freezing the common kernel/modules
+removes those differences from the workload comparison. Build hashes and section
+inventories are retained under the ignored timing-workload directory. Native
+workload acceptance is recorded separately from these build/model checks.

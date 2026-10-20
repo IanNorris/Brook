@@ -13,6 +13,7 @@ add_driver_module(sched_eevdf
     "${BROOK_ROOT}/src/drivers/sched_eevdf/sched_eevdf_mod.cpp"
     "${BROOK_ROOT}/src/modules/sched_eevdf.cpp"
     EXTRA_FLAGS "-O2" "-mgeneral-regs-only" "-mno-sse" "-mno-sse2" "-mfpmath="
+        "-DBROOK_EEVDF_NORMAL_REQUEST_NS=${BROOK_EEVDF_NORMAL_REQUEST_NS}"
 )
 
 add_driver_module(sched_mlfq
