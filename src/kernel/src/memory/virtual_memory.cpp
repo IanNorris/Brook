@@ -2,6 +2,7 @@
 #include "physical_memory.h"
 #include "serial.h"
 #include "spinlock.h"
+#include "vmalloc_arena.h"
 
 namespace brook {
 
@@ -18,7 +19,7 @@ static constexpr uint64_t PHYS_MASK = 0x000FFFFFFFFFF000ULL;
 // VMALLOC bump allocator state
 // ---------------------------------------------------------------------------
 
-static uint64_t g_vmallocNext = VMALLOC_BASE;
+static VmallocArena<VMALLOC_SIZE / PAGE_SIZE> g_vmallocArena;
 
 // SMP lock protecting VMALLOC/module bump allocators and allocation registry.
 // IrqSpinLock: prevents preemption deadlock when timer interrupt
@@ -230,7 +231,6 @@ static uint64_t* WalkToPtr(PageTable pageTable, VirtualAddress virtAddr,
 
 void VmmInit()
 {
-    g_vmallocNext = VMALLOC_BASE;
     g_kernelCR3 = PhysicalAddress(ReadCR3() & PHYS_MASK);
 
     uint64_t cr3 = ReadCR3() & PHYS_MASK;
@@ -659,155 +659,84 @@ void VmmUnmapPage(PageTable pt, VirtualAddress virtAddr)
     (void)VmmDetachPage(pt, virtAddr);
 }
 
-VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t pid)
+// g_vmmLock covers reservation, construction, teardown and retirement. Physical
+// failures use the same delayed VA retirement path as ordinary frees.
+static VirtualAddress AllocVmalloc(uint64_t pageCount, uint64_t flags, MemTag tag,
+                                   uint16_t pid, bool guards)
 {
-    if (pageCount == 0) return VirtualAddress{};
-
-    uint64_t vmmFlags = IrqSpinLockAcquire(&g_vmmLock);
-
-    if (g_vmallocNext + pageCount * PAGE_SIZE > VMALLOC_BASE + VMALLOC_SIZE)
-    {
-        IrqSpinLockRelease(&g_vmmLock, vmmFlags);
+    uint64_t saved = IrqSpinLockAcquire(&g_vmmLock);
+    uint64_t usablePage = 0;
+    if (!g_vmallocArena.Reserve(pageCount, guards, usablePage)) {
+        IrqSpinLockRelease(&g_vmmLock, saved);
         return VirtualAddress{};
     }
-
-    uint64_t virtBase = g_vmallocNext;
-    g_vmallocNext += pageCount * PAGE_SIZE;
-
-    for (uint64_t i = 0; i < pageCount; i++)
-    {
-        PhysicalAddress phys = PmmAllocPage(tag, pid);
-        if (!phys)
-        {
-            for (uint64_t j = 0; j < i; j++)
-            {
-                VirtualAddress v(virtBase + j * PAGE_SIZE);
-                uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
-                if (pte && (*pte & VMM_PRESENT))
-                {
-                    PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
-                    *pte = 0;
-                    Invlpg(v);
-                }
-            }
-            g_vmallocNext = virtBase;
-            IrqSpinLockRelease(&g_vmmLock, vmmFlags);
-            return VirtualAddress{};
-        }
-
-        if (!VmmMapPage(KernelPageTable, VirtualAddress(virtBase + i * PAGE_SIZE), phys, flags, tag, pid))
-        {
+    const uint64_t base = VMALLOC_BASE + usablePage * PAGE_SIZE;
+    uint64_t mapped = 0;
+    for (; mapped < pageCount; ++mapped) {
+        const PhysicalAddress phys = PmmAllocPage(tag, pid);
+        if (!phys) break;
+        if (!VmmMapPage(KernelPageTable, VirtualAddress(base + mapped * PAGE_SIZE),
+                        phys, flags, tag, pid)) {
             PmmFreePage(phys);
-            for (uint64_t j = 0; j < i; j++)
-            {
-                VirtualAddress v(virtBase + j * PAGE_SIZE);
-                uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
-                if (pte && (*pte & VMM_PRESENT))
-                {
-                    PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
-                    *pte = 0;
-                    Invlpg(v);
-                }
-            }
-            g_vmallocNext = virtBase;
-            IrqSpinLockRelease(&g_vmmLock, vmmFlags);
-            return VirtualAddress{};
+            break;
         }
     }
-
-    VmmAllocation* slot = FindFreeSlot();
-    if (slot)
-    {
-        slot->virtBase  = virtBase;
-        slot->pageCount = pageCount;
-        slot->tag       = tag;
-        slot->pid       = pid;
+    if (mapped != pageCount) {
+        for (uint64_t i = 0; i < mapped; ++i) {
+            const uint64_t leaf = VmmDetachPage(KernelPageTable, VirtualAddress(base + i * PAGE_SIZE));
+            if (leaf) PmmFreePage(VmmLeafPhysical(leaf));
+        }
+        if (!g_vmallocArena.Retire(usablePage, pageCount)) __builtin_trap();
+        IrqSpinLockRelease(&g_vmmLock, saved);
+        return VirtualAddress{};
     }
+    if (VmmAllocation* slot = FindFreeSlot()) {
+        slot->virtBase = base; slot->pageCount = pageCount;
+        slot->tag = tag; slot->pid = pid;
+    }
+    IrqSpinLockRelease(&g_vmmLock, saved);
+    return VirtualAddress(base);
+}
 
-    IrqSpinLockRelease(&g_vmmLock, vmmFlags);
-    return VirtualAddress(virtBase);
+VirtualAddress VmmAllocPages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t pid)
+{
+    return AllocVmalloc(pageCount, flags, tag, pid, false);
 }
 
 VirtualAddress VmmAllocKernelStack(uint64_t pageCount, MemTag tag, uint16_t pid)
 {
-    if (pageCount == 0) return VirtualAddress{};
-
-    // Reserve pageCount + 2 virtual pages: [guard] [usable * pageCount] [guard]
-    uint64_t totalPages = pageCount + 2;
-
-    uint64_t vmmFlags = IrqSpinLockAcquire(&g_vmmLock);
-
-    if (g_vmallocNext + totalPages * PAGE_SIZE > VMALLOC_BASE + VMALLOC_SIZE)
-    {
-        IrqSpinLockRelease(&g_vmmLock, vmmFlags);
-        return VirtualAddress{};
-    }
-
-    uint64_t virtBase = g_vmallocNext;
-    g_vmallocNext += totalPages * PAGE_SIZE;
-
-    // Map only the middle pages — guard pages stay unmapped.
-    uint64_t usableBase = virtBase + PAGE_SIZE;  // skip bottom guard
-    for (uint64_t i = 0; i < pageCount; i++)
-    {
-        PhysicalAddress phys = PmmAllocPage(tag, pid);
-        if (!phys)
-        {
-            for (uint64_t j = 0; j < i; j++)
-            {
-                VirtualAddress v(usableBase + j * PAGE_SIZE);
-                uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
-                if (pte && (*pte & VMM_PRESENT))
-                {
-                    PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
-                    *pte = 0;
-                    Invlpg(v);
-                }
-            }
-            g_vmallocNext = virtBase;
-            IrqSpinLockRelease(&g_vmmLock, vmmFlags);
-            return VirtualAddress{};
-        }
-
-        if (!VmmMapPage(KernelPageTable, VirtualAddress(usableBase + i * PAGE_SIZE), phys, VMM_WRITABLE, tag, pid))
-        {
-            PmmFreePage(phys);
-            for (uint64_t j = 0; j < i; j++)
-            {
-                VirtualAddress v(usableBase + j * PAGE_SIZE);
-                uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
-                if (pte && (*pte & VMM_PRESENT))
-                {
-                    PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
-                    *pte = 0;
-                    Invlpg(v);
-                }
-            }
-            g_vmallocNext = virtBase;
-            IrqSpinLockRelease(&g_vmmLock, vmmFlags);
-            return VirtualAddress{};
-        }
-    }
-
-    VmmAllocation* slot = FindFreeSlot();
-    if (slot)
-    {
-        slot->virtBase  = usableBase;
-        slot->pageCount = pageCount;
-        slot->tag       = tag;
-        slot->pid       = pid;
-    }
-
-    IrqSpinLockRelease(&g_vmmLock, vmmFlags);
-    return VirtualAddress(usableBase);
+    return AllocVmalloc(pageCount, VMM_WRITABLE, tag, pid, true);
 }
 
 void VmmFreeKernelStack(VirtualAddress virtAddr, uint64_t pageCount)
 {
-    // Free the mapped pages (guard pages have no physical backing).
+    // The arena recognizes the complete guarded reservation from the usable
+    // range. The existing caller remains responsible for being off this stack.
     VmmFreePages(virtAddr, pageCount);
-    // The guard page virtual addresses are simply leaked from the vmalloc region.
-    // This is acceptable — kernel stacks are long-lived and few in number.
+}
+
+bool VmmBeginReclaim()
+{
+    const uint64_t saved = IrqSpinLockAcquire(&g_vmmLock);
+    const bool result = g_vmallocArena.BeginReclaim();
+    IrqSpinLockRelease(&g_vmmLock, saved);
+    return result;
+}
+
+VmmArenaStatistics VmmArenaReadStatistics()
+{
+    const uint64_t saved = IrqSpinLockAcquire(&g_vmmLock);
+    const auto stats = g_vmallocArena.Stats();
+    IrqSpinLockRelease(&g_vmmLock, saved);
+    return {stats.reserved, stats.retired, stats.peak, stats.totalReserved,
+            stats.totalReclaimed, stats.failed};
+}
+
+void VmmCompleteReclaim()
+{
+    const uint64_t saved = IrqSpinLockAcquire(&g_vmmLock);
+    if (!g_vmallocArena.CompleteReclaim()) __builtin_trap();
+    IrqSpinLockRelease(&g_vmmLock, saved);
 }
 
 VirtualAddress VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag tag, uint16_t pid)
@@ -881,25 +810,29 @@ VirtualAddress VmmAllocModulePages(uint64_t pageCount, uint64_t flags, MemTag ta
 
 void VmmFreePages(VirtualAddress virtAddr, uint64_t pageCount)
 {
-    uint64_t vmmFlags = IrqSpinLockAcquire(&g_vmmLock);
-
-    for (uint64_t i = 0; i < pageCount; i++)
-    {
-        VirtualAddress v = virtAddr + i * PAGE_SIZE;
-        uint64_t* pte = WalkToPtr(KernelPageTable, v, false);
-        if (pte && (*pte & VMM_PRESENT))
-        {
-            PmmFreePage(PhysicalAddress(*pte & PHYS_MASK));
-            *pte = 0;
-            Invlpg(v);
-        }
+    const uint64_t address = virtAddr.raw();
+    if (!pageCount || (address & (PAGE_SIZE - 1))) return;
+    const bool vmalloc = address >= VMALLOC_BASE && address < VMALLOC_BASE + VMALLOC_SIZE;
+    const bool module = address >= MODULE_BASE && address < MODULE_BASE + MODULE_SIZE;
+    if (!vmalloc && !module) return;
+    const uint64_t limit = vmalloc ? VMALLOC_BASE + VMALLOC_SIZE : MODULE_BASE + MODULE_SIZE;
+    if (pageCount > (limit - address) / PAGE_SIZE) return;
+    const uint64_t saved = IrqSpinLockAcquire(&g_vmmLock);
+    const uint64_t page = vmalloc ? (address - VMALLOC_BASE) / PAGE_SIZE : 0;
+    VmallocArena<VMALLOC_SIZE / PAGE_SIZE>::Range reservation{};
+    if (vmalloc && !g_vmallocArena.Describe(page, pageCount, reservation)) {
+        IrqSpinLockRelease(&g_vmmLock, saved);
+        return;
     }
-
-    // Clear registration.
-    VmmAllocation* alloc = FindAllocSlot(virtAddr.raw());
-    if (alloc) alloc->virtBase = 0;
-
-    IrqSpinLockRelease(&g_vmmLock, vmmFlags);
+    for (uint64_t i = 0; i < pageCount; ++i) {
+        // Clear the PTE under its lock BEFORE queuing the frame for the PMM
+        // barrier. A barrier cannot protect a still-present mapping.
+        const uint64_t leaf = VmmDetachPage(KernelPageTable, virtAddr + i * PAGE_SIZE);
+        if (leaf) PmmFreePage(VmmLeafPhysical(leaf));
+    }
+    if (vmalloc && !g_vmallocArena.Retire(page, pageCount)) __builtin_trap();
+    if (VmmAllocation* alloc = FindAllocSlot(address)) alloc->virtBase = 0;
+    IrqSpinLockRelease(&g_vmmLock, saved);
 }
 
 PhysicalAddress VmmVirtToPhys(PageTable pt, VirtualAddress virtAddr)

@@ -476,14 +476,16 @@ static void PmmDrainThread(void* /*arg*/)
             g_quarCount = 0;
             IrqSpinLockRelease(&g_pmmLock, f);
 
-            if (head == PMM_NULL_PAGE)
-                break;  // caught up — nap until more frames are retired
+            const bool virtualBatch = VmmBeginReclaim();
+            if (head == PMM_NULL_PAGE && !virtualBatch)
+                break;  // no physical or virtual reservations awaiting reuse
 
             // One barrier for the whole batch: every frame in `head` was freed
             // before this point, so a single all-CPU flush since now covers all
             // of them. MUST run with no g_pmmLock held (it busy-waits for remote
             // CPUs).
             TlbFlushAllCpusBarrier();
+            if (virtualBatch) VmmCompleteReclaim();
 
             // Now safe to return the batch's frames to the allocatable pool. Walk
             // the list (reading next BEFORE releasing, since release may let the

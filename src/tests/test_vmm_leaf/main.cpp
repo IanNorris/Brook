@@ -27,7 +27,7 @@
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#c); std::abort(); } } while (0)
 using namespace brook;
 namespace {
-constexpr size_t pageSize = 4096, pageCount = 1024;
+constexpr size_t pageSize = 4096, pageCount = 4096;
 alignas(pageSize) unsigned char frames[pageCount][pageSize];
 struct Frame { unsigned refs=0, maps=0; } records[pageCount];
 std::mutex frameLock;
@@ -2027,6 +2027,50 @@ void sharedFilePublicationAndSync() {
     std::puts("SHARED FILE PUBLICATION/SYNC PASS canonical/exposure/protection/range/errors/unmap-during-sync/cleanup");
 }
 }
+// Real kernel allocation/rollback/free paths; the barrier is explicitly modeled
+// here. This does not substitute for native SMP TLB-barrier acceptance.
+static void freeEmptyKernelTables(PhysicalAddress physical, unsigned level) {
+    auto* entries=reinterpret_cast<uint64_t*>(physical.raw());
+    for (unsigned i=0;i<512;++i) if (entries[i]&VMM_PRESENT) {
+        CHECK(level>1 && !(entries[i]&(1ULL<<7)));
+        freeEmptyKernelTables(VmmLeafPhysical(entries[i]),level-1);
+    }
+    PmmFreePage(physical);
+}
+static void vmallocIntegration() {
+    auto root=table();VmmHostSetKernelRoot(root);
+    auto warm=VmmAllocPages(2);CHECK(warm);
+    VmmFreePages(warm,2);CHECK(VmmBeginReclaim());VmmCompleteReclaim();
+    // Existing page tables remove intermediate allocation noise from this
+    // injection: two data pages map, then the third PMM allocation fails.
+    failFrameAfter=2;CHECK(!VmmAllocPages(8));CHECK(failFrameAfter==-1);
+    for (unsigned i=0;i<8;++i) CHECK(!VmmReadLeaf(KernelPageTable,warm+i*pageSize));
+    auto other=VmmAllocPages(2);CHECK(other && other.raw()>=warm.raw()+8*pageSize);
+    CHECK(VmmBeginReclaim());
+    VmmFreePages(other,2); // belongs to the NEXT barrier generation
+    VmmCompleteReclaim();
+    auto reused=VmmAllocPages(8);CHECK(reused==warm);
+    CHECK(VmmReadLeaf(KernelPageTable,reused));
+    VmmFreePages(reused,7); // wrong-size free must leave ownership intact
+    CHECK(VmmReadLeaf(KernelPageTable,reused));
+    VmmFreePages(reused,8);VmmFreePages(reused,8); // repeated free is harmless
+    CHECK(VmmBeginReclaim());VmmCompleteReclaim();
+    auto stack=VmmAllocKernelStack(2);CHECK(stack==warm+pageSize);
+    CHECK(!VmmReadLeaf(KernelPageTable,stack-pageSize));
+    CHECK(!VmmReadLeaf(KernelPageTable,stack+2*pageSize));
+    CHECK(VmmReadLeaf(KernelPageTable,stack));
+    VmmFreeKernelStack(stack,2);CHECK(VmmBeginReclaim());VmmCompleteReclaim();
+    // The bounded diagnostic registry must not limit safe ordinary frees.
+    VirtualAddress many[1100];
+    for (auto& address:many) {address=VmmAllocPages(1);CHECK(address);}
+    for (auto address:many) VmmFreePages(address,1);
+    CHECK(VmmBeginReclaim());VmmCompleteReclaim();
+    auto combined=VmmAllocPages(1100);CHECK(combined);
+    VmmFreePages(combined,1100);CHECK(VmmBeginReclaim());VmmCompleteReclaim();
+    CHECK(!VmmBeginReclaim());
+    freeEmptyKernelTables(root.pml4,4);VmmHostSetKernelRoot({});empty();
+    std::puts("VMALLOC INTEGRATION PASS partial failure/delayed reuse/guards/wrong-size/double-free/1100 allocations");
+}
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
@@ -2038,5 +2082,6 @@ int main(int argc,char** argv) {
     anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
+    vmallocIntegration();
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");
 }

@@ -4414,6 +4414,17 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("collisions",stats.collisions);
         r.text(",");r.field("trimmed",stats.trimmed);r.text("}\n");r.send();
     }
+    else if (NetStrEq(cmd, "mem vmalloc")) {
+        const auto d=VmmArenaReadStatistics();
+        BridgeReply r;r.text("{\"scope\":\"vmalloc virtual pages including guards; reserved includes pending retirement; not physical RAM\",");
+        r.field("capacity_pages",VMALLOC_SIZE/4096);r.text(",");
+        r.field("reserved_pages",d.reservedPages);r.text(",");
+        r.field("retired_pages",d.retiredPages);r.text(",");
+        r.field("peak_pages",d.peakPages);r.text(",");
+        r.field("total_reserved_pages",d.totalReservedPages);r.text(",");
+        r.field("total_reclaimed_pages",d.totalReclaimedPages);r.text(",");
+        r.field("failed_reservations",d.failedReservations);r.text("}\n");r.send();
+    }
     else if (NetStrEq(cmd, "mem drm")) {
         const auto d=DrmBackingDiagnosticsRead();
         BridgeReply r;r.text("{\"scope\":\"rolling cumulative DRM kernel backing mappings; not physical RAM or host VRAM\",");

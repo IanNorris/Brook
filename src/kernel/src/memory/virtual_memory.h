@@ -208,6 +208,17 @@ void VmmForkCommitCowShare(uint64_t* parentLeaf, uint64_t* childLeaf,
 // VMALLOC / module allocators (always kernel page table)
 // ---------------------------------------------------------------------------
 
+// Single PMM drain worker only: snapshot detached virtual ranges before its
+// all-CPU barrier, then publish them reusable after that barrier. Neither call
+// performs a barrier or waits while holding an IRQ lock.
+bool VmmBeginReclaim();
+void VmmCompleteReclaim();
+struct VmmArenaStatistics {
+    uint64_t reservedPages, retiredPages, peakPages;
+    uint64_t totalReservedPages, totalReclaimedPages, failedReservations;
+};
+VmmArenaStatistics VmmArenaReadStatistics();
+
 // Allocate contiguous virtual pages from the VMALLOC region.
 // Returns the virtual base address, or 0 on failure.
 VirtualAddress VmmAllocPages(uint64_t pageCount,

@@ -1486,3 +1486,68 @@ later reports roughly 10 fps for Chrome's main video but only 1/779 dropped
 frames. Low reported drops do not establish real-time media-clock progress.
 The attempted main-video capture finds no active producer after Chrome exits
 and remains a failed observation, not a successful playback sample.
+
+The subsequent live-run failures have a confirmed kernel allocation cause.
+In session `0aabf2974f884c7e99313201e38e2549`, a read of the matched
+kernel's `g_vmallocNext` symbol returned `0xffffc00800000000`: all 32 GiB of
+the vmalloc virtual-address arena had been consumed. Physical RAM still had
+about 7.3 GiB free and the heap check passed. `VmmFreePages` releases physical
+pages but does not return virtual ranges to the bump allocator. Chromium's
+retained-scene allocation failed with `-12`; a later GL3 Quake launch crashed,
+and terminal backing-page allocation failed. The exact failed allocation in
+each application path has not been instrumented. Evidence is retained in
+`build/reviews/live-firefox-only-20261021/quake-shell-allocation-failures`,
+including the cursor bytes and matched-symbol receipt.
+
+Desktop shutdown then remained in `closing` with orphan Chromium tasks and
+no remaining Quake tasks. Launch inhibition during that operation explains
+why a new terminal could not open. Reclaiming vmalloc ranges requires an SMP
+TLB invalidation audit before addresses can safely be reused; increasing the
+arena alone would only postpone exhaustion.
+
+The user approved a forced stop. The stop path acknowledged a checked metadata
+flush before QEMU exited, but application writers had not completed orderly
+shutdown; this is not an orderly-shutdown acceptance pass. The original wrapper
+returned zero. All four read-only filesystem checks passed, as did checks on
+separate copies of the preserved disks (`preserved-check-copies/checks.json`).
+
+The bounded host ALSA readiness reproduction subsequently completed at both
+44.1 kHz and a 48 kHz outer plug rate. With progress held at one native fragment,
+all 128 raw polls and ALSA revents reported writable while logical availability
+remained below the configured period (64/1102 and 70/1200 frames respectively).
+No data was transferred; advancing enough native frames allowed a full logical
+period transfer in both controls. This establishes the mismatch for the tested
+plugin/libasound configuration, not Firefox's actual negotiated settings.
+Sources and the successful build log are retained under
+`build/workloads/timing-scheduler-20261020/alsa-readiness-repro`; the first fixture
+attempt blocked because duplicated eventfd descriptors share status flags.
+The corrected fixture checks readability before draining and bounds each client
+run with a ten-second alarm. No host audio device is used.
+
+The vmalloc candidate now reserves virtual ranges independently of the optional
+1,024-entry diagnostic registry. Page boundary markers validate exact frees and
+include both stack guards. Two retirement generations keep freed ranges
+unavailable until the existing single PMM drainer completes its all-CPU TLB
+barrier. Frees during a barrier wait for the next generation. Mapping teardown
+now detaches each PTE under the kernel page-table lock before retiring its frame.
+Partial construction failures use the same deferred retirement path.
+
+All 70 host suites and the compiled entry/scheduler-start audits pass.
+The new arena suite includes 100,000 reference-model operations. Actual VMM
+integration covers partial PMM failure after mapped pages, guarded reuse,
+wrong-size/repeated frees and 1,100 simultaneous allocations. A muted eight-vCPU
+native test (`build/reviews/vmalloc-reuse-20261021`) reached Firefox's local
+animated page, reclaimed 33,504 virtual pages during the observation, and
+reported zero failed reservations. Window close, coordinator sync/commit,
+original launcher exit zero and all four filesystem checks succeeded. This is
+basic reclamation acceptance, not a 32-GiB cumulative endurance test or evidence
+of an audio/scheduler performance improvement.
+
+Limitations remain explicit: arena metadata consumes 5,275,720 static bytes;
+a host adversarial full-arena alternating-page benchmark measured 16.636 ms
+for reclaim and 20.245 ms for an unsuccessful two-page reservation. These are
+host durations, not native IRQ-latency measurements, but the serialized scans
+must be improved before claiming bounded low latency at extreme fragmentation.
+Also, the pre-existing `VmmKillPid` API still depends on the bounded allocation
+registry; ordinary explicit frees no longer do. No native caller of that API
+was found in this audit, and registry-overflow PID cleanup is not accepted.
