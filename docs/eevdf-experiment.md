@@ -181,3 +181,43 @@ All six accepted cohorts drain tasks and pass heap, actual original launcher
 exit, four filesystems and saved-data/profile preservation. The excluded
 orchestration run is retained separately. Browser video/audio/input comparisons
 and broader contention/real-workload acceptance remain open; RR stays default.
+
+## First mixed-browser controls
+
+Three further fresh boots use the same final kernel/modules as the CPU controls,
+eight vCPUs/six GiB, affinity 0–13, an 800×600 Firefox window on 1080p,
+private 44.1-kHz PipeWire null sink, callback HDA, generated buffered 24-fps
+video, four input probes and 24 CPU workers for 30 seconds. This is one trial
+per policy, not a repeat/reverse-order browser acceptance campaign.
+
+| Policy | Periodic p95 | Worst periodic delay | Buffered video callbacks/s | Input dispatch → DOM bounds |
+| --- | ---: | ---: | ---: | --- |
+| EEVDF | 3.405 ms | 2634.765 ms | 4.646 | 0–263 ms |
+| RR | 89.415 ms | 98.127 ms | Insufficient loaded samples | 17.21–19.69 s |
+| MLFQ | 22.250 ms | 77.412 ms | 8.155 | 0–157 ms |
+
+Input bounds come from the buffered trace's guest/host clock brackets, not the
+much larger HTTP receipt latency. EEVDF and MLFQ each advance media at about
+1.001× page time and decode about 24 frames/s, but drop many frames. EEVDF's
+low periodic p95 therefore does not establish a better desktop: presentation
+is worse than MLFQ here, with a 2.89-second trace gap and a 2.63-second worst
+periodic wakeup. Kernel code remains non-preemptible. More profiling is needed
+to attribute those stalls rather than assuming the policy alone caused them.
+
+All three cohorts capture **zero audio frames** and log Firefox cubeb
+`OnMediaSinkAudioError`. A page reporting an audio track is not evidence of
+successful output. This shared failure needs an independent audio-path
+investigation; it prevents desktop acceptance for every policy, and must not
+be reported as an EEVDF-specific regression or as successful silent playback.
+The first Linux reference delivered about 23.07 callbacks/s with nonzero
+captured audio, subject to its documented software-vsync workaround and other
+reference configuration limits.
+
+All three application lineages drain, original launchers exit zero, four offline
+filesystem checks pass and the twelve saved documents/four original profile
+trees retain their checked data and ownership. Those structural gates passed;
+**desktop acceptance did not**. Evidence and explicit gate distinctions:
+`build/workloads/timing-scheduler-20261020/eevdf-browser-cohorts/gates.json`.
+The optional module is committed; RR remains the default. Next work is the
+common Firefox audio-sink failure, scheduler/kernel stall profiles, and repeated
+browser/game trials before proposing a default policy change.
