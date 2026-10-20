@@ -85,7 +85,8 @@ before its deadline; after the fix it reports zero. Relative POSIX realtime
 timers select a monotonic basis, so this defect chiefly affects absolute
 realtime timers. This is not yet a reproduction of the playback-speed issue.
 
-Other audit leads, not established safety failures:
+Initial audit leads (the policy-transition defects are repaired in the later
+candidate and validation section):
 
 - Runtime switching clears shared policy storage, then re-registers tasks under
   ready/all-process locks. Audit running, Ready-but-on-CPU, terminated and idle
@@ -410,3 +411,52 @@ orchestration helpers are retained under the ignored evidence root's
 presentation, human listening, repeated alternating-order backend trials and
 real mixed-app policy comparisons remain outstanding. RR and timer-paced HDA
 are still the defaults.
+
+## Scheduler transition hardening
+
+Kernel `4840083bb12e5242a70b544cee92eb63921f4aa2e546410c6b74c8965b76f5a6`
+serializes timeslice reads, expiry decisions, policy registry access and final
+ready-count reporting with `g_readyLock`. Registration rejects missing required
+callbacks, oversized/zero-sized state and conflicting name/table registrations.
+The optional debug callback is checked under the same lock as its invocation.
+
+Replacement restores published tasks with their original `schedPriority`, skips
+terminated tasks and PID-zero idle tasks, and enqueues only off-CPU Ready tasks.
+The previous name-prefix idle heuristic incorrectly excluded ordinary apps.
+Ready tasks still owning a CPU are left to the existing post-switch publication
+path. Newborn policy initialization, PID-map publication and first enqueue now
+share the birth critical section: replacement cannot clear an initialized task
+that has not yet appeared in the all-process registry.
+
+The shared production restore helper is exercised against both actual policy
+modules, including off-CPU ownership, blocked/running/terminated states and
+priority preservation. Required-callback/state validation is also exercised.
+There are 55 passing module cases and all 58 hosted CTest targets pass. Compiled
+entry/start audits pass within their documented supported-template scope.
+
+A private eight-vCPU/six-GiB boot completes 24 alternating RR/MLFQ transitions
+alongside 24 CPU workers and four periodic sleepers over 20 seconds. Concurrent
+churn completes 128 forked children with four threads each (512 child threads).
+The kernel census verifies actual `idle-sched-bench-v4` and
+`idle-sched-bench-v4_t` task names. Both tracked job lineages drain; heap checks,
+guest sync, owned launcher exit zero and all four primary offline filesystem
+checks pass. The 12 saved documents (including UID/GID) and four original
+profile trees pass the preservation audit. This is a single native switch/churn regression, not an exhaustive
+SMP ownership proof or a steady-policy performance comparison.
+
+Earlier fixture failures remain under `scheduler-safety/live-switch{,-v2,-v3}`:
+a 120-ms loop can perform zero iterations after being descheduled; `PR_SET_NAME`
+currently returns success without changing the kernel name; a symlink is not
+sufficient evidence of an executable's census name; and `copy2` requests
+unsupported `listxattr`. The accepted v4 fixture uses a plain byte copy, waits
+for native `READY`, verifies names from the census and observes all task exits.
+These attempts are not counted as passing churn acceptance.
+
+`sched policy status|rr|mlfq` is available through the normal process-context
+debug channel for controlled tests; it selects only already registered policies.
+The bridge rejects normal guest RPCs after panic. Scheduler-module unload and
+unregister quiescence remain unresolved: registered modules must stay resident.
+RR stays the default. Evidence and frozen harnesses are under
+`scheduler-safety/`, including `summary.json`, the native transition receipts,
+the source snapshot and compiled audit reports. Mixed browser/audio/CPU policy
+comparisons remain outstanding.

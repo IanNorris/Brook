@@ -97,6 +97,14 @@ struct SchedOps {
     void (*DebugDump)(void* state, uint16_t pid, SchedDebugInfo* out);
 };
 
+inline bool SchedOpsUsable(const SchedOps* ops) {
+    return ops && ops->name && ops->name[0] && ops->stateSize &&
+           ops->stateSize <= SCHED_POLICY_STATE_CAPACITY &&
+           ops->Init && ops->InitProcess && ops->Enqueue && ops->PickNext &&
+           ops->Remove && ops->TimesliceExpired && ops->VoluntaryYield &&
+           ops->Tick && ops->Timeslice && ops->ReadyCount;
+}
+
 } // namespace brook
 
 // Module entry point — each scheduler .mod / .so exports this symbol.

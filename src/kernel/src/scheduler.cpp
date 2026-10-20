@@ -14,6 +14,7 @@
 #include "serial.h"
 #include "spinlock.h"
 #include "sched_ops.h"
+#include "sched_restore.h"
 #include "profiler.h"
 #include "device.h"
 #include "sync/krwlock.h"
@@ -1044,20 +1045,13 @@ void SchedulerAddProcess(Process* proc)
     proc->savedCtx.cr3 = proc->addressSpace->pageTable.pml4.raw();
     proc->savedCtx.fsBase = proc->fsBase;
 
-    // Register with pid lookup and policy module.
+    // Register with pid lookup and policy module atomically with birth below.
     // BRO-176/SIG2: g_pidToProcess[] and the policy state (RrState) are protected
     // by g_readyLock — PickNextLocked reads g_pidToProcess[pid] and the RR ops
     // mutate RrState all under it. These two writes were previously done WITHOUT
     // the lock, racing those locked readers/writers on other CPUs and corrupting
     // the intrusive ready-list (head/pid), which surfaced as a wild stack-region
     // pointer being scheduled as a Process*. Serialize them under g_readyLock.
-    {
-        uint64_t rlf0 = SchedLockAcquire(g_readyLock);
-        if (proc->pid < SCHED_MAX_PIDS)
-            g_pidToProcess[proc->pid] = proc;
-        g_schedOps->InitProcess(g_schedState, proc->pid, proc->schedPriority);
-        SchedLockRelease(g_readyLock, rlf0);
-    }
 
     // BRO-173: serialize thread birth against group exit.  A new thread of an
     // already-exiting group must NOT become runnable — it was born after the
@@ -1081,6 +1075,12 @@ void SchedulerAddProcess(Process* proc)
     // runnable thread from dispatching before its leader lifetime is counted.
     uint64_t birthFlags = SchedLockAcquire(g_readyLock);
     uint64_t alf1 = SchedLockAcquire(g_allProcLock);
+    // A policy switch must see either the whole published birth or none of it.
+    // Initializing before this lock allowed replacement to erase the newborn's
+    // policy entry before it reached g_allProcesses and the ready queue.
+    if (proc->pid < SCHED_MAX_PIDS)
+        g_pidToProcess[proc->pid] = proc;
+    g_schedOps->InitProcess(g_schedState, proc->pid, proc->schedPriority);
     if (proc->isThread && !proc->isKernelThread)
     {
         Process* ldr = proc->threadLeader;
@@ -2119,11 +2119,11 @@ void SchedulerTimerTick(bool allowPreempt)
                                  stranded->pid, stranded->name, readyN);
                     // Dump the policy's internal view to distinguish a LOGIC desync
                     // (queued flag stale) from STRUCT CORRUPTION (listLen != readyCount).
-                    if (g_schedOps->DebugDump)
                     {
                         brook::SchedDebugInfo di = {};
                         uint64_t rlfd = SchedLockAcquire(g_readyLock);
-                        g_schedOps->DebugDump(g_schedState, stranded->pid, &di);
+                        if (g_schedOps->DebugDump)
+                            g_schedOps->DebugDump(g_schedState, stranded->pid, &di);
                         SchedLockRelease(g_readyLock, rlfd);
                         SerialPrintf("  RR[pid=%u]: queued=%u active=%u next=%u prev=%u | "
                                      "head=%u tail=%u readyCount=%u listLen=%u%s\n",
@@ -2199,19 +2199,23 @@ void SchedulerTimerTick(bool allowPreempt)
     if (!allowPreempt)
         return;
 
-    // Check timeslice (per-process, from policy module).
+    // Keep the policy read and expiry decision in the same critical section as
+    // policy replacement and queue mutation. Module state is not internally
+    // synchronized; even a read can race an MLFQ boost or full state reset.
+    uint64_t rlf8 = SchedLockAcquire(g_readyLock);
     uint64_t timeslice = g_schedOps->Timeslice(g_schedState, cur->pid);
     if (g_lapicTickCount - g_perCpu[cpu].sliceStartTick < timeslice)
+    {
+        SchedLockRelease(g_readyLock, rlf8);
         return;
+    }
 
-    // Only preempt if the process is still Running. It might have been
-    // marked Blocked (by SchedulerBlock in a syscall) between the lock
-    // release and the yield — the timer fired in that window.
+    // A syscall can publish Blocked before yielding, or a remote CPU can
+    // publish a stop before this tick acquires the ready lock.
     // Also deschedule Stopped processes (SIGTSTP/SIGSTOP).
     if (cur->state == ProcessState::Stopped)
     {
         // Stopped process — remove from ready queue and switch away
-        uint64_t rlf_stop = SchedLockAcquire(g_readyLock);
         ReadyQueueRemoveLocked(cur);
         Process* next = PickNextLocked(cpu);
         if (next)
@@ -2220,7 +2224,7 @@ void SchedulerTimerTick(bool allowPreempt)
         }
         else
         {
-            SchedLockRelease(g_readyLock, rlf_stop);
+            SchedLockRelease(g_readyLock, rlf8);
             // No other process — switch to idle
             Process* idle = g_perCpu[cpu].idleProcess;
             if (idle && idle != cur)
@@ -2228,18 +2232,13 @@ void SchedulerTimerTick(bool allowPreempt)
         }
         return;
     }
-    if (cur->state != ProcessState::Running)
-        return;
-
-    // Timeslice expired — notify policy, pick next, and switch.
-    uint64_t rlf8 = SchedLockAcquire(g_readyLock);
-    // A remote terminal/stop publication may have won after the unlocked
-    // Running check above. Do not overwrite it with Ready below.
+    // A remote terminal publication may have won before lock acquisition.
     if (cur->state != ProcessState::Running)
     {
         SchedLockRelease(g_readyLock, rlf8);
         return;
     }
+    // Timeslice expired — notify the same policy, pick next, and switch.
     g_schedOps->TimesliceExpired(g_schedState, cur->pid);
     Process* next = PickNextLocked(cpu);
 
@@ -3533,15 +3532,19 @@ bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap, uint64_t inca
 
 void SchedulerRegisterPolicy(const SchedOps* ops)
 {
-    if (!ops || !ops->name)
+    if (!SchedOpsUsable(ops))
     {
-        SerialPuts("SCHED: register — null policy\n");
+        SerialPuts("SCHED: register — incomplete or oversized policy\n");
         return;
     }
+    const uint64_t flags = SchedLockAcquire(g_readyLock);
     // Check for duplicate
     for (uint32_t i = 0; i < g_registeredPolicyCount; ++i)
     {
-        if (g_registeredPolicies[i] == ops) return; // already registered
+        if (g_registeredPolicies[i] == ops) {
+            SchedLockRelease(g_readyLock, flags);
+            return; // already registered
+        }
         // Compare names
         const char* a = g_registeredPolicies[i]->name;
         const char* b = ops->name;
@@ -3552,20 +3555,23 @@ void SchedulerRegisterPolicy(const SchedOps* ops)
         }
         if (same)
         {
-            // Replace existing registration with new pointer
-            g_registeredPolicies[i] = ops;
-            SerialPrintf("SCHED: updated policy '%s'\n", ops->name);
+            // Replacing a name could orphan an active table and its module
+            // lifetime. Registration is idempotent only for the same pointer.
+            SerialPrintf("SCHED: policy name '%s' already registered\n", ops->name);
+            SchedLockRelease(g_readyLock, flags);
             return;
         }
     }
     if (g_registeredPolicyCount >= MAX_SCHED_POLICIES)
     {
         SerialPrintf("SCHED: policy registry full, cannot register '%s'\n", ops->name);
+        SchedLockRelease(g_readyLock, flags);
         return;
     }
     g_registeredPolicies[g_registeredPolicyCount++] = ops;
     SerialPrintf("SCHED: registered policy '%s' (state=%lu bytes)\n",
                  ops->name, ops->stateSize);
+    SchedLockRelease(g_readyLock, flags);
 }
 
 static bool StrEq(const char* a, const char* b)
@@ -3576,6 +3582,8 @@ static bool StrEq(const char* a, const char* b)
 
 bool SchedulerSwitchPolicy(const char* name)
 {
+    if (!name) return false;
+    const uint64_t flags = SchedLockAcquire(g_readyLock);
     const SchedOps* newOps = nullptr;
     for (uint32_t i = 0; i < g_registeredPolicyCount; ++i)
     {
@@ -3588,22 +3596,22 @@ bool SchedulerSwitchPolicy(const char* name)
     if (!newOps)
     {
         SerialPrintf("SCHED: policy '%s' not registered\n", name);
+        SchedLockRelease(g_readyLock, flags);
         return false;
     }
     if (newOps == g_schedOps)
     {
         SerialPrintf("SCHED: already using '%s'\n", name);
+        SchedLockRelease(g_readyLock, flags);
         return true;
     }
     if (newOps->stateSize > sizeof(g_schedStateStorage))
     {
         SerialPrintf("SCHED: policy '%s' state %lu > storage %lu\n",
                      name, newOps->stateSize, sizeof(g_schedStateStorage));
+        SchedLockRelease(g_readyLock, flags);
         return false;
     }
-
-    // Switch under the scheduler lock — migrate all active processes.
-    uint64_t flags = SchedLockAcquire(g_readyLock);
 
     const SchedOps* oldOps = g_schedOps;
     SerialPrintf("SCHED: switching '%s' → '%s'\n", oldOps->name, newOps->name);
@@ -3621,29 +3629,26 @@ bool SchedulerSwitchPolicy(const char* name)
     {
         Process* p = g_allProcesses[i];
         if (!p) continue;
-        // Skip idle processes (pid 0 or idle-named)
-        if (p->name[0] == 'i' && p->name[1] == 'd' &&
-            p->name[2] == 'l' && p->name[3] == 'e')
-            continue;
-        newOps->InitProcess(g_schedState, p->pid, 2); // default priority
-        if (p->state == ProcessState::Ready) {
-            newOps->Enqueue(g_schedState, p->pid);
-            if (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) == -1)
-                RecordReadyEnqueue(p);
-        }
+        if (SchedRestoreProcess(newOps, g_schedState, p->pid, p->schedPriority,
+                                p->state == ProcessState::Terminated,
+                                p->state == ProcessState::Ready,
+                                __atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE)))
+            RecordReadyEnqueue(p);
     }
     SchedLockRelease(g_allProcLock, allFlags);
 
-    SchedLockRelease(g_readyLock, flags);
-
     SerialPrintf("SCHED: now using '%s' (%u ready)\n",
                  newOps->name, newOps->ReadyCount(g_schedState));
+    SchedLockRelease(g_readyLock, flags);
     return true;
 }
 
 const char* SchedulerPolicyName()
 {
-    return g_schedOps ? g_schedOps->name : "none";
+    const uint64_t flags = SchedLockAcquire(g_readyLock);
+    const char* name = g_schedOps ? g_schedOps->name : "none";
+    SchedLockRelease(g_readyLock, flags);
+    return name;
 }
 
 // Panic-safe process enumeration — no locks, assumes all other CPUs halted.

@@ -131,8 +131,8 @@ Max CPUs: 64 (SCHED_MAX_CPUS).
 
 | Function | Description |
 |----------|-------------|
-| `SchedulerRegisterPolicy(ops)` | Add to registry (max 8). Deduplicates by name |
-| `SchedulerSwitchPolicy(name)` | Switch under lock: re-init, migrate all processes |
+| `SchedulerRegisterPolicy(ops)` | Validate callbacks/capacity, register under ready lock (max 8); reject conflicting names |
+| `SchedulerSwitchPolicy(name)` | Rebuild under ready/all-process locks, preserve task priority, enqueue only off-CPU Ready tasks |
 | `SchedulerPolicyName()` | Return current policy name |
 
 ---
@@ -150,6 +150,17 @@ acquire `g_readyLock` first (see `SchedulerSwitchPolicy`). However, most paths
 acquire them independently. `ReapTerminated` drops `g_allProcLock` before calling
 `ProcessDestroy` (which calls `SchedulerRemoveProcess` → `g_readyLock`), then
 re-acquires `g_allProcLock`.
+
+Policy initialization for a newborn, PID lookup publication, group lifetime
+accounting and first enqueue share the birth critical section. Replacement
+therefore cannot erase an initialized but not-yet-published task. Timeslice
+reads and their expiry decisions also hold the ready lock. Idle identity is
+PID zero, not a name prefix. A Ready task still on a CPU is republished by the
+existing post-switch drain after its stack is released.
+
+Registered policy modules must remain resident. Unload/unregister quiescence
+is not implemented; these locking rules do not make scheduler-module unloading
+safe. The timing/scheduling audit records the native test scope and limitations.
 
 ---
 

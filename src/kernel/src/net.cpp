@@ -3599,6 +3599,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  audio stats - cached stream queues, completion and guest clock\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
+            "  sched policy status|rr|mlfq - inspect or select a registered policy\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
@@ -3829,6 +3830,22 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     }
     else if (NetStrEq(cmd, "audio stats")) {
         DebugAudioDiagnostics();
+    }
+    else if (NetStrEq(cmd, "sched policy status") ||
+             NetStrEq(cmd, "sched policy rr") || NetStrEq(cmd, "sched policy mlfq")) {
+        // This normal debug-channel thread is process context. Panic inspection
+        // uses its separate read-only path; never attempt a transition there.
+        if (!ProcessCurrent()) {
+            DebugChannelSend("{\"error\":\"process_context_required\"}\n");
+            return;
+        }
+        bool selected = true;
+        if (NetStrEq(cmd, "sched policy rr")) selected = SchedulerSwitchPolicy("rr");
+        else if (NetStrEq(cmd, "sched policy mlfq")) selected = SchedulerSwitchPolicy("mlfq");
+        BridgeReply reply;
+        reply.text("{\"selected\":"); reply.text(selected ? "true" : "false");
+        reply.text(",\"policy\":\""); reply.text(SchedulerPolicyName());
+        reply.text("\"}\n"); reply.send();
     }
     else if (NetStrEq(cmd, "sched timing on") || NetStrEq(cmd, "sched timing off") ||
              NetStrEq(cmd, "sched timing reset") || NetStrEq(cmd, "sched timing status")) {

@@ -35,9 +35,12 @@ speedup or kernel stalls.
 
 ## Mechanism prerequisites
 
-1. Serialize every policy-state access. `Timeslice` currently reads outside
-   `g_readyLock`; policy replacement reinitializes that storage. Fix this and
-   establish referenced migration snapshots before supporting hot replacement.
+1. Preserve serialization of every policy-state access. Timeslice reads and
+   expiry decisions now hold `g_readyLock`, as do registry lookup and replacement.
+   Rebuild holds ready/all-process locks, excludes terminated and still-on-CPU
+   ready tasks, and preserves initial priorities. Task policy registration is
+   atomic with birth, closing the initialize/publish gap. Native switch/churn
+   coverage is recorded in the audit; module lifetime remains separate work.
 2. Define task lifetime and queue ownership across Ready-but-on-CPU windows,
    post-switch requeue, exit, stop/continue, wake races and PID reuse. Preserve
    the existing off-CPU publication and lifetime holds. Never dispatch the same

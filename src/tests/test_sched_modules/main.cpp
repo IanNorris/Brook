@@ -18,6 +18,7 @@
 // Include the shared ABI header via relative path (no -I on kernel/src
 // to avoid kernel string.h shadowing system headers).
 #include "../../kernel/src/sched_ops.h"
+#include "../../kernel/src/sched_restore.h"
 
 using namespace brook;
 
@@ -708,7 +709,59 @@ TEST(mlfq_priority_fairness) {
 // Main
 // ---------------------------------------------------------------------------
 
+TEST(policy_registration_contract) {
+    (void)state;
+    ASSERT(SchedOpsUsable(ops));
+    ASSERT(!SchedOpsUsable(nullptr));
+    SchedOps copy = *ops;
+    copy.DebugDump = nullptr; // explicitly optional
+    ASSERT(SchedOpsUsable(&copy));
+    copy.stateSize = SCHED_POLICY_STATE_CAPACITY + 1;
+    ASSERT(!SchedOpsUsable(&copy));
+    copy = *ops; copy.stateSize = 0;
+    ASSERT(!SchedOpsUsable(&copy));
+    copy = *ops; copy.name = nullptr;
+    ASSERT(!SchedOpsUsable(&copy));
+    copy = *ops; copy.name = "";
+    ASSERT(!SchedOpsUsable(&copy));
+#define REJECT_MISSING(member) do { copy = *ops; copy.member = nullptr; \
+    ASSERT(!SchedOpsUsable(&copy)); } while (0)
+    REJECT_MISSING(Init); REJECT_MISSING(InitProcess);
+    REJECT_MISSING(Enqueue); REJECT_MISSING(PickNext); REJECT_MISSING(Remove);
+    REJECT_MISSING(TimesliceExpired); REJECT_MISSING(VoluntaryYield);
+    REJECT_MISSING(Tick); REJECT_MISSING(Timeslice); REJECT_MISSING(ReadyCount);
+#undef REJECT_MISSING
+}
+
+TEST(policy_restore_ownership_and_priority) {
+    ASSERT(!SchedRestoreProcess(ops, state, 0, 0, false, true, -1));
+    ASSERT(!SchedRestoreProcess(ops, state, SCHED_PID_NONE, 0, false, true, -1));
+    // Blocked tasks retain a policy entry, ready tasks still on a CPU do not
+    // become dispatchable, and terminated tasks are not resurrected.
+    ASSERT(!SchedRestoreProcess(ops, state, 1, 0, false, false, -1));
+    ASSERT(!SchedRestoreProcess(ops, state, 2, 1, false, true, 3));
+    ASSERT(SchedRestoreProcess(ops, state, 3, 3, false, true, -1));
+    ASSERT(!SchedRestoreProcess(ops, state, 4, 0, true, true, -1));
+    ASSERT(!SchedRestoreProcess(ops, state, 5, 2, false, false, 2));
+    ASSERT(ops->ReadyCount(state) == 1);
+    ASSERT(ops->PickNext(state) == 3);
+    ASSERT(ops->PickNext(state) == NONE);
+    for (uint16_t pid = 1; pid <= 3; ++pid) {
+        const uint8_t priorities[] = {0, 0, 1, 3};
+        ops->InitProcess(state, pid + 10, priorities[pid]);
+        ASSERT(ops->Timeslice(state, pid) == ops->Timeslice(state, pid + 10));
+    }
+    // Normal unblock and post-switch publication must both work after restore.
+    ops->Enqueue(state, 1);
+    ASSERT(ops->PickNext(state) == 1);
+    ops->Enqueue(state, 2);
+    ASSERT(ops->PickNext(state) == 2);
+    ASSERT(ops->PickNext(state) == NONE);
+}
+
 static void RunCommonTests(const SchedOps* ops, void* state) {
+    invoke_policy_registration_contract(ops,state);
+    invoke_policy_restore_ownership_and_priority(ops,state);
     invoke_vtable_complete(ops, state);
     invoke_empty_pick_returns_none(ops, state);
     invoke_single_enqueue_dequeue(ops, state);

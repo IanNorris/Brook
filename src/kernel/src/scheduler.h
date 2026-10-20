@@ -221,11 +221,14 @@ void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idle
 Process* SchedulerGetCpuProcess(uint32_t cpuIndex);
 
 // Register a scheduling policy. Called by scheduler modules during init().
-// Multiple policies can be registered; only the active one is used.
+// Required callbacks and the shared state bound are validated. A different
+// table cannot replace an existing name. Registered modules must stay resident;
+// the module loader does not yet have an unregister/quiescence contract.
 extern "C" void SchedulerRegisterPolicy(const SchedOps* ops);
 
 // Switch to a registered policy by name. Returns true on success.
-// Safe to call at runtime — migrates all processes to the new policy.
+// Serializes policy state replacement with callbacks and task birth. Rebuilds
+// only off-CPU Ready entries; running/blocked tasks retain initialized entries.
 bool SchedulerSwitchPolicy(const char* name);
 
 // Get the name of the currently active scheduling policy.
