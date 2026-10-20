@@ -245,6 +245,16 @@ one compiled kernel, not the cost of compiling it in compared with its absence.
 Failure-owner review and native validation remain required before interpreting
 any result from the prepared scripts.
 
+The prepared independent verifier rejects empty or duplicate trial selections
+and checks the original outer-wrapper wait, tracked job identities, collected
+exit, empty task groups, both output EOFs, byte cursors and retained loss receipts.
+It distinguishes a single verified trial from the complete off/on/on/off cohort.
+Twenty-six offline checks use retained successful job evidence and mutations for
+stale identities, nonzero/signalled exits, surviving tasks and incomplete output.
+The actual earlier exit-zero game run with no END marker is rejected, as is a
+complete run whose stored duration is replaced with the expected duration.
+These checks validate evidence handling, not scheduler or audio performance.
+
 While the authorized baseline live review remains running, six read-only audio
 counter queries span roughly ten seconds. Independently bracketed host requests
 bound the guest/host elapsed-clock ratio to 0.980752–1.003470. `clock status`
