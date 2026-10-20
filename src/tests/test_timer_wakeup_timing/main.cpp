@@ -1,7 +1,12 @@
 #include <cstdio>
+#include <string>
+#include <vector>
+#include "../../kernel/src/bridge_reply.h"
 #include "../../kernel/src/timer_wakeup_timing.h"
 #include "../../kernel/src/timer_irq_arrivals.h"
-namespace {int failed=0;}
+namespace {int failed=0;std::string reply;std::vector<size_t> chunks;
+void CaptureReply(const char* text){std::string chunk(text);chunks.push_back(chunk.size());reply+=chunk;}
+}
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"timer wake line %d: %s\n",__LINE__,#x);++failed;}}while(0)
 int main(){
     using namespace brook;TimerWakeTimingModel m;
@@ -138,5 +143,27 @@ int main(){
     cpu[0].Reset(17);outer=cpu[0].Observe(17,100,0,8,0,1);inner=cpu[0].Observe(17,110,0,8,0,2);
     CHECK(cpu[0].Complete(inner,120,130,0,2));CHECK(cpu[0].Complete(outer,105,140,0,2));
     peer=cpu[0].Observe(17,150,0,8,0,2);CHECK(!peer.previousEndNs);
+    cpu[0].Reset(19);peer=cpu[0].Observe(19,100,0,8,0,10);
+    TimerIrqSchedulerStages stages{130,170};
+    CHECK(cpu[0].Complete(peer,110,200,0,10,&stages));p=cpu[0].Snapshot();
+    CHECK(p.stageSamples==1 && p.sumAcquireNs==20 && p.sumAccountingNs==40 && p.sumRemainingNs==30);
+    CHECK(p.maxAcquireEvent.acquireNs==20 && p.maxAccountingEvent.accountingNs==40);
+    stages={109,170};CHECK(!cpu[0].Complete(peer,110,200,0,10,&stages));
+    stages={130,129};CHECK(!cpu[0].Complete(peer,110,200,0,10,&stages));
+    stages={130,201};CHECK(!cpu[0].Complete(peer,110,200,0,10,&stages));
+    stages={0,0};CHECK(!cpu[0].Complete(peer,110,200,0,10,&stages));
+    CHECK(cpu[0].Snapshot().handlerInvalidClock==4 && cpu[0].Snapshot().stageSamples==1);
+    // Suspended frames retain their stage timestamps but do not pollute
+    // no-switch stage aggregates or maxima.
+    stages={130,170};CHECK(cpu[0].Complete(peer,110,3000000,0,11,&stages));
+    p=cpu[0].Snapshot();CHECK(p.handlerSwitched==1 && p.stageSamples==1 && p.sumAcquireNs==20);
+    // Exercise the same streaming reply implementation used by net.cpp.
+    // Large JSON rows and numbers crossing the buffer boundary must survive.
+    BridgeReplyBuffer<CaptureReply> bridge;std::string expected(765,'x');bridge.text(expected.c_str());
+    bridge.number(~uint64_t(0));expected+="18446744073709551615";
+    bridge.text(",");expected+=",";bridge.number(~uint64_t(0),true);expected+="ffffffffffffffff";
+    for(unsigned i=0;i<200;++i){bridge.text(",");bridge.field("duration_ns",i);expected+=",\"duration_ns\":"+std::to_string(i);}
+    bridge.send();CHECK(reply==expected && chunks.size()>1);
+    for(auto count:chunks)CHECK(count<768);
     std::printf("TIMER_WAKE_TIMING %s\n",failed?"FAIL":"PASS");return failed?1:0;
 }

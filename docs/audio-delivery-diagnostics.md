@@ -435,3 +435,76 @@ latency improvement claim. Lifetime per-CPU probe drops are 2/1/1/1/1/0/0/1.
 All 68 hosted tests and the bounded compiled-entry audit pass on the final
 source. Scripts, final source patch/hashes and independent verifiers are
 retained under `handler-generation-sources` in the ignored workload root.
+
+## Initial ready-lock acquisition dominates AP timer spans
+
+The `runtime-stages-frozen` diagnostic adds two default-off samples inside
+`SchedulerTimerTick`: immediately after acquiring its initial ready lock and
+after runtime/policy accounting plus the ready-watch observation, before
+releasing that lock. The no-switch stages are:
+
+- `runtime_acquire_ns`: scheduler-call entry through acquisition and the first
+  clock sample, including flag save and ticket wait;
+- `runtime_accounting_ns`: clock/runtime/policy/watch work and the second sample
+  while the ready lock is held;
+- `remaining_ns`: lock release through the rest of the scheduler call.
+
+All are elapsed wall brackets, including host descheduling. Clock-order errors
+reject the completed sample. Separate no-switch acquisition/accounting extrema
+are retained alongside the existing bounded slow events. Switched frames keep
+their timestamps but do not enter these aggregates. Sampling adds two clock
+reads only when the peer timing probe supplies a stage pointer; IPIs and the
+disabled path do not add those reads. No lock acquisition policy changes yet.
+
+The larger response exposes a pre-existing limitation in `BridgeReply`: its
+768-byte buffer silently discards further text/numeric digits. The shared
+`BridgeReplyBuffer` now emits bounded chunks when full and continues the same
+reply without allocation. A hosted regression runs the actual shared template
+through multi-kilobyte fields, maximum decimal/hex values and buffer-crossing
+numbers. Native peer responses parse with all stage/extrema fields present.
+
+The private `q2-runtime-stages-host` repeat keeps the previous MLFQ, callback
+audio, eight-vCPU and host-affinity settings, with twelve host CPU workers and
+four periodic sleepers for thirty seconds. The controller records/retries
+read-only observation failures, samples cached audio at most once per second
+and retains original host/guest job owners through failure classification.
+Guest acceptance is now explicit and separate from audio acceptance. It does
+not retry unknown mutating commands or replace a job on observation timeout.
+
+This run completes with original host worker exit zero, Quake START/END and
+guest exit zero, no live guest tasks, normal VM/router exits, matching staged
+identities, correct runtime/policy ledger totals, heap, clock brackets, four
+filesystem checks and saved-data preservation. The independent verifier checks
+those gates. Quake's demo observation is 43.387 s. Audio **fails**: native
+sample-gap 1,605.318 ms, sampled discontinuity and zero captured frames. The
+mixer's longest ready queue is 1,700.507 ms; every CPU's periodic observations
+during that interval are KernelBusy. These outcomes remain failures despite
+successful lifecycle completion.
+
+Across the recorded no-switch scheduler brackets, the seven APs each accumulate
+approximately 27.0–27.1 s in initial acquisition, versus only 5.3–6.0 ms in
+accounting. Acquisition is 99.713–99.944% of each AP's measured scheduler span;
+individual acquisition maxima are 19.1–24.0 ms. BSP splits approximately
+13.51 s acquisition and 13.35 s remaining work, with 3.12 ms accounting.
+There are no invalid clocks, unknown switch generations, saturation or
+contention drops in these snapshots. The largest retained acquisition events
+do not overlap the longest mixer queue; they must not be presented as its
+individual lock-owner explanation. Wall-time sums are not CPU consumption.
+
+The evidence supports an **opt-in experiment** deferring only initial
+accounting/watch sampling on a contended AP periodic busy-kernel tick. It does
+not justify skipping retirement/wake/termination handling or changing the
+default. Required gates include genuine ticket-lock try-acquire semantics
+(failure leaves no abandoned ticket), unchanged IF, exact elapsed-minus-steal
+catch-up at later sample/dispatch/block/CPU-clock boundaries, explicit skipped
+watch-observation counters, and matched native load trials with settled
+ledger/policy agreement and actual audio/workload outcomes. A smaller measured
+acquisition span alone is insufficient acceptance.
+
+The frozen kernel is
+`a8de913a360fd140361a2d1db834bc82d53f0bb5aeade898c8b7404903986f53`,
+with the same thirteen control modules. All 68 hosted tests and the bounded
+compiled-entry audit pass. `runtime-stages-analysis.json` retains stage sums,
+maxima and exact overlap checks. Controller/generator, analysis, independent
+verifier, final source patch and hashes are archived under
+`runtime-stages-sources` in the ignored workload root.

@@ -1,3 +1,4 @@
+#include "bridge_reply.h"
 // net.cpp — Brook OS network stack.
 //
 // Ethernet → ARP / IPv4 → ICMP / UDP
@@ -3257,17 +3258,7 @@ static int DebugReplySend(const char* data, uint32_t length)
 }
 
 // Fixed-buffer replies: no dependency on a userspace printf implementation.
-struct BridgeReply {
-    char data[768] = {}; uint32_t size = 0;
-    void text(const char* s) { while (*s && size+1 < sizeof(data)) data[size++]=*s++; }
-    void number(uint64_t v, bool hex=false) {
-        char digits[32]; uint32_t n=0;
-        do {uint32_t d=v%(hex?16:10);digits[n++]=d<10?'0'+d:'a'+d-10;v/=hex?16:10;} while(v);
-        while(n && size+1 < sizeof(data)) data[size++]=digits[--n];
-    }
-    void field(const char* name, uint64_t v) {text("\"");text(name);text("\":");number(v);}
-    void send() {data[size]=0;DebugChannelSend(data);}
-};
+using BridgeReply = BridgeReplyBuffer<DebugChannelSend>;
 
 static void DebugEpollDiagnostics()
 {
@@ -3328,6 +3319,9 @@ static void DebugTimerIrqHandlerEvent(const TimerIrqHandlerEvent& e)
     r.text(",\"interrupted_rip\":\"0x");r.number(e.token.rip,true);r.text("\",");r.field("interrupted_cs",e.token.cs);
     r.text(",");r.field("entry_switch_generation",e.token.switchGeneration);r.text(",");r.field("completion_switch_generation",e.completionGeneration);
     r.text(",");r.field("previous_handler_end_ns",e.token.previousEndNs);r.text(",\"no_switch\":");r.text(e.noSwitch?"true":"false");
+    r.text(",\"has_runtime_stages\":");r.text(e.hasStages?"true":"false");r.text(",");r.field("runtime_acquired_ns",e.acquiredNs);
+    r.text(",");r.field("runtime_accounted_ns",e.accountedNs);r.text(",");r.field("runtime_acquire_ns",e.acquireNs);
+    r.text(",");r.field("runtime_accounting_ns",e.accountingNs);r.text(",");r.field("remaining_ns",e.remainingNs);
     r.text("}");r.send();
 }
 
@@ -3357,9 +3351,15 @@ static void DebugTimerIrqArrivals()
         tail.text(",");tail.field("max_no_switch_total_ns",s.maxNoSwitchTotalNs);tail.text(",");tail.field("max_no_switch_scheduler_ns",s.maxNoSwitchSchedulerNs);
         tail.text(",");tail.field("adjacent_no_switch_pairs",s.adjacentNoSwitchPairs);tail.text(",");tail.field("near_returns",s.nearReturns);
         tail.text(",");tail.field("sum_between_ns",s.sumBetweenNs);tail.text(",");tail.field("max_between_ns",s.maxBetweenNs);
+        tail.text(",");tail.field("runtime_stage_samples",s.stageSamples);tail.text(",");tail.field("sum_runtime_acquire_ns",s.sumAcquireNs);
+        tail.text(",");tail.field("sum_runtime_accounting_ns",s.sumAccountingNs);tail.text(",");tail.field("sum_remaining_ns",s.sumRemainingNs);
+        tail.text(",");tail.field("max_runtime_acquire_ns",s.maxAcquireNs);tail.text(",");tail.field("max_runtime_accounting_ns",s.maxAccountingNs);
+        tail.text(",");tail.field("max_remaining_ns",s.maxRemainingNs);
         tail.text(",");tail.field("handler_slow",s.handlerSlow);tail.text(",");tail.field("handler_excluded",s.handlerExcluded);
         tail.text(",\"saturated\":");tail.text(s.saturated?"true":"false");tail.text(",\"max_prefix_event\":");tail.send();
         DebugTimerIrqHandlerEvent(s.maxPrefixEvent);DebugChannelSend(",\"max_scheduler_event\":");DebugTimerIrqHandlerEvent(s.maxSchedulerEvent);
+        DebugChannelSend(",\"max_runtime_acquire_event\":");DebugTimerIrqHandlerEvent(s.maxAcquireEvent);
+        DebugChannelSend(",\"max_runtime_accounting_event\":");DebugTimerIrqHandlerEvent(s.maxAccountingEvent);
         DebugChannelSend(",\"handler_events\":[");
         for(unsigned i=0;i<s.handlerRetained;++i){if(i)DebugChannelSend(",");DebugTimerIrqHandlerEvent(s.handlerEvents[i]);}
         DebugChannelSend("]}");

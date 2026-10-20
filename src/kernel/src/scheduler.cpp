@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "timer_irq_arrivals.h"
 #include "module.h"
 #include "posix_timer.h"
 #include "process.h"
@@ -2081,7 +2082,7 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 #endif
 }
 
-void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool periodicTimer,uint64_t interruptedRip)
+void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool periodicTimer,uint64_t interruptedRip,TimerIrqSchedulerStages* stages)
 {
     if (!g_schedulerRunning)
         return;
@@ -2089,6 +2090,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
 
     {
         const uint64_t runtimeFlags = SchedLockAcquire(g_readyLock);
+        if(stages)stages->acquiredNs=TimerWakeTimingNow();
         const uint32_t runtimeCpu = ThisCpu();
         RuntimeChargeLocked(runtimeCpu, RuntimeNow(runtimeCpu));
         // Delivered periodic-IRQ observations only. Ring-0 idle is a dispatch
@@ -2101,6 +2103,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
                 observed && observed->state==ProcessState::Running?ReadyWatchTick::KernelBusy:ReadyWatchTick::Other;
             g_readyLatency.WatchTick(runtimeCpu,kind,interruptedRip,observed?observed->pid:0,observed?observed->incarnation:0);
         }
+        if(stages)stages->accountedNs=TimerWakeTimingNow();
         SchedLockRelease(g_readyLock, runtimeFlags);
     }
 

@@ -212,7 +212,7 @@ bool ApicInitElapsedClock()
 }
 
 // Forward-declare scheduler tick (defined in scheduler.cpp).
-void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool periodicTimer,uint64_t interruptedRip);
+void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool periodicTimer,uint64_t interruptedRip,TimerIrqSchedulerStages* stages);
 
 uint64_t SchedulerContextSwitchGeneration(unsigned cpu);
 
@@ -354,13 +354,13 @@ static TimerIrqHandlerToken TimerIrqArrivalsObserve(uint64_t rip,uint64_t cs){
     const auto token=g_timerIrqSlots[cpu].model.Observe(epoch,now,rip,cs,cpu,SchedulerContextSwitchGeneration(cpu));
     SpinLockRelease(&g_timerIrqSlots[cpu].lock);return token;
 }
-static void TimerIrqHandlerComplete(const TimerIrqHandlerToken& token,uint64_t scheduler){
+static void TimerIrqHandlerComplete(const TimerIrqHandlerToken& token,uint64_t scheduler,const TimerIrqSchedulerStages& stages){
     if(!token.epoch || token.cpu>=MAX_CPUS)return;
     const unsigned cpu=SmpCurrentCpuIndex();
     uint64_t end=0;if(!KvmClockReadStableNs(&end))end=0;
     auto& slot=g_timerIrqSlots[token.cpu];
     if(!SpinLockTryAcquire(&slot.lock)){TimerWakeDrop(&slot.dropped);return;}
-    slot.model.Complete(token,scheduler,end,cpu,SchedulerContextSwitchGeneration(cpu));SpinLockRelease(&slot.lock);
+    slot.model.Complete(token,scheduler,end,cpu,SchedulerContextSwitchGeneration(cpu),&stages);SpinLockRelease(&slot.lock);
 }
 void TimerWakeTimingEnable(bool enabled){
     SpinLockAcquire(&g_timerWakeLock);g_timerWake.Enable(enabled);
@@ -471,8 +471,9 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
     // code is not generally safe to timeslice while holding internal locks.
     bool userMode = (interruptedCs & 3) != 0;
     const uint64_t peerScheduler=peerProbe.epoch?TimerWakeTimingNow():0;
-    SchedulerTimerTick(userMode,timerProbe.epoch?&timerProbe:nullptr,true,interruptedRip);
-    TimerIrqHandlerComplete(peerProbe,peerScheduler);
+    TimerIrqSchedulerStages stages{};
+    SchedulerTimerTick(userMode,timerProbe.epoch?&timerProbe:nullptr,true,interruptedRip,peerProbe.epoch?&stages:nullptr);
+    TimerIrqHandlerComplete(peerProbe,peerScheduler,stages);
 }
 
 // Naked ISR entry for LAPIC timer (vector 32).
@@ -836,7 +837,7 @@ extern "C" void ReschedIpiHandlerInner(uint64_t interruptedCs)
     // (KMutex, KRwLock, ticket locks) that would deadlock or corrupt
     // callee-saved register state if the process were descheduled mid-hold.
     bool userMode = (interruptedCs & 3) != 0;
-    SchedulerTimerTick(userMode,nullptr,false,0);
+    SchedulerTimerTick(userMode,nullptr,false,0,nullptr);
 }
 
 __attribute__((naked))

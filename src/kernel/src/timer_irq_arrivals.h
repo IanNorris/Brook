@@ -8,11 +8,14 @@ struct TimerIrqHandlerToken {
     unsigned cpu=0;
     uint64_t switchGeneration=~uint64_t(0),sequence=0,previousEndNs=0;
 };
+struct TimerIrqSchedulerStages {uint64_t acquiredNs=0,accountedNs=0;};
 struct TimerIrqHandlerEvent {
     TimerIrqHandlerToken token{};
     uint64_t schedulerNs=0,endNs=0,prefixNs=0,schedulerWallNs=0,totalNs=0;
     uint64_t completionGeneration=~uint64_t(0);
     bool noSwitch=false;
+    bool hasStages=false;
+    uint64_t acquiredNs=0,accountedNs=0,acquireNs=0,accountingNs=0,remainingNs=0;
 };
 struct TimerIrqArrivalSnapshot {
     uint64_t epoch=0,arrivals=0,gaps=0,invalidClock=0;
@@ -25,6 +28,9 @@ struct TimerIrqArrivalSnapshot {
     uint64_t handlerNoSwitch=0,handlerSwitched=0,handlerUnknownGeneration=0;
     uint64_t sumNoSwitchTotalNs=0,maxNoSwitchTotalNs=0,maxNoSwitchSchedulerNs=0;
     uint64_t adjacentNoSwitchPairs=0,nearReturns=0,sumBetweenNs=0,maxBetweenNs=0;
+    uint64_t stageSamples=0,sumAcquireNs=0,sumAccountingNs=0,sumRemainingNs=0;
+    uint64_t maxAcquireNs=0,maxAccountingNs=0,maxRemainingNs=0;
+    TimerIrqHandlerEvent maxAcquireEvent{},maxAccountingEvent{};
     unsigned handlerRetained=0;
     TimerIrqHandlerEvent maxPrefixEvent{},maxSchedulerEvent{};
     TimerIrqHandlerEvent handlerEvents[TimerIrqHandlerSlots]{};
@@ -66,11 +72,18 @@ public:
             token.previousEndNs=lastCompletionEnd_;
         return token;
     }
-    bool Complete(const TimerIrqHandlerToken& t,uint64_t scheduler,uint64_t end,unsigned cpu,uint64_t generation=~uint64_t(0)){
+    bool Complete(const TimerIrqHandlerToken& t,uint64_t scheduler,uint64_t end,unsigned cpu,uint64_t generation=~uint64_t(0),const TimerIrqSchedulerStages* stages=nullptr){
         if(!(t.epoch&1) || t.epoch!=data_.epoch)return false;
         if(cpu!=t.cpu){Add(data_.handlerMigrated);lastCompletionNoSwitch_=false;return false;}
         if(!t.entryNs || scheduler<t.entryNs || end<scheduler){Add(data_.handlerInvalidClock);lastCompletionNoSwitch_=false;return false;}
         TimerIrqHandlerEvent e{t,scheduler,end,scheduler-t.entryNs,end-scheduler,end-t.entryNs,generation,false};
+        if(stages){
+            if(stages->acquiredNs<scheduler || stages->accountedNs<stages->acquiredNs || end<stages->accountedNs){
+                Add(data_.handlerInvalidClock);lastCompletionNoSwitch_=false;return false;
+            }
+            e.hasStages=true;e.acquiredNs=stages->acquiredNs;e.accountedNs=stages->accountedNs;
+            e.acquireNs=e.acquiredNs-scheduler;e.accountingNs=e.accountedNs-e.acquiredNs;e.remainingNs=end-e.accountedNs;
+        }
         const bool known=t.switchGeneration!=~uint64_t(0) && generation!=~uint64_t(0);
         e.noSwitch=known && t.switchGeneration==generation;
         lastCompletionSequence_=t.sequence;lastCompletionEnd_=end;lastCompletionGeneration_=generation;lastCompletionNoSwitch_=e.noSwitch;
@@ -78,6 +91,12 @@ public:
         else if(!e.noSwitch)Add(data_.handlerSwitched);
         else {
             Add(data_.handlerNoSwitch);Sum(data_.sumNoSwitchTotalNs,e.totalNs);
+            if(e.hasStages){
+                Add(data_.stageSamples);Sum(data_.sumAcquireNs,e.acquireNs);Sum(data_.sumAccountingNs,e.accountingNs);Sum(data_.sumRemainingNs,e.remainingNs);
+                if(e.acquireNs>data_.maxAcquireNs){data_.maxAcquireNs=e.acquireNs;data_.maxAcquireEvent=e;}
+                if(e.accountingNs>data_.maxAccountingNs){data_.maxAccountingNs=e.accountingNs;data_.maxAccountingEvent=e;}
+                if(e.remainingNs>data_.maxRemainingNs)data_.maxRemainingNs=e.remainingNs;
+            }
             if(e.totalNs>data_.maxNoSwitchTotalNs)data_.maxNoSwitchTotalNs=e.totalNs;
             if(e.schedulerWallNs>data_.maxNoSwitchSchedulerNs)data_.maxNoSwitchSchedulerNs=e.schedulerWallNs;
             if(t.previousEndNs){
