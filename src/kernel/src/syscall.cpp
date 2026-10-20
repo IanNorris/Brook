@@ -1932,7 +1932,6 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
         extern volatile uint64_t g_lapicTickCount;
-        const uint64_t deadline = g_lapicTickCount + 500;
         for (;;) {
             SpinLockAcquire(ProcessFdLock(proc));
             const bool nonblock = (fde->statusFlags & 0x800) != 0;
@@ -1985,7 +1984,10 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
             }
             // A paused/full writer must not prevent another thread from resetting
             // or enabling this same open description. Revalidate after every wait.
-            if (nonblock || g_lapicTickCount >= deadline) return -EAGAIN;
+            // Blocking output has no 500-ms expiry. A paused/full stream may
+            // legitimately wait for another thread's reset/enable operation.
+            // Signals and a reported device discontinuity still abort it.
+            if (nonblock) return -EAGAIN;
             if (HasReadInterruptSignal()) return -EINTR;
             Process* self = SchedulerCurrentProcess();
             if (self) { self->wakeupTick = g_lapicTickCount + 5; SchedulerBlockInterruptible(self); }
