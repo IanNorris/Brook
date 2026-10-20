@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "module.h"
 #include "posix_timer.h"
 #include "process.h"
 #include "panic.h"
@@ -3532,9 +3533,32 @@ bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap, uint64_t inca
 
 void SchedulerRegisterPolicy(const SchedOps* ops)
 {
+    // Pin the table before dereferencing it, then its name and callback owners
+    // before publishing any pointer. Pins are permanent: inactive policies are
+    // still registered and can be selected later. A failed registration may
+    // conservatively retain its provider until reboot.
+    const uintptr_t table = reinterpret_cast<uintptr_t>(ops);
+    if (!ModuleRetainAddresses(&table, 1)) {
+        SerialPuts("SCHED: register — provider not resident or unloading\n");
+        return;
+    }
     if (!SchedOpsUsable(ops))
     {
         SerialPuts("SCHED: register — incomplete or oversized policy\n");
+        return;
+    }
+    const uintptr_t dependencies[] = {
+        reinterpret_cast<uintptr_t>(ops->name),
+        reinterpret_cast<uintptr_t>(ops->Init), reinterpret_cast<uintptr_t>(ops->InitProcess),
+        reinterpret_cast<uintptr_t>(ops->Enqueue), reinterpret_cast<uintptr_t>(ops->PickNext),
+        reinterpret_cast<uintptr_t>(ops->Remove), reinterpret_cast<uintptr_t>(ops->TimesliceExpired),
+        reinterpret_cast<uintptr_t>(ops->VoluntaryYield), reinterpret_cast<uintptr_t>(ops->Tick),
+        reinterpret_cast<uintptr_t>(ops->Timeslice), reinterpret_cast<uintptr_t>(ops->ReadyCount),
+        reinterpret_cast<uintptr_t>(ops->DebugDump ? ops->DebugDump : nullptr),
+    };
+    const uint32_t count = sizeof(dependencies) / sizeof(dependencies[0]) - (ops->DebugDump ? 0 : 1);
+    if (!ModuleRetainAddresses(dependencies, count)) {
+        SerialPuts("SCHED: register — callback provider not resident or unloading\n");
         return;
     }
     const uint64_t flags = SchedLockAcquire(g_readyLock);

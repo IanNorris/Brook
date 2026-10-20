@@ -7,6 +7,7 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "mem_tag.h"
+#include "spinlock.h"
 #ifdef BROOK_HOST_TEST
 #include <cstring>
 #else
@@ -19,6 +20,75 @@ namespace brook {
 
 static constexpr uint32_t MODULE_MAX = 64;
 static ModuleHandle g_modules[MODULE_MAX];
+static IrqSpinLock g_moduleLock;
+#ifndef BROOK_HOST_TEST
+extern "C" uint8_t __text_start[], __kernel_end[];
+#endif
+
+static bool ModuleAddressIsKernel(uintptr_t address)
+{
+#ifdef BROOK_HOST_TEST
+    (void)address;
+    return false; // Host fixtures supply explicit module mappings.
+#else
+    return address >= reinterpret_cast<uintptr_t>(__text_start) &&
+           address < reinterpret_cast<uintptr_t>(__kernel_end);
+#endif
+}
+
+bool ModuleRetainAddresses(const uintptr_t* addresses, uint32_t count)
+{
+    if (!addresses || !count) return false;
+    const uint64_t flags = IrqSpinLockAcquire(&g_moduleLock);
+    uint64_t owners = 0;
+    for (uint32_t a = 0; a < count; ++a) {
+        bool found = false;
+        for (uint32_t i = 0; i < MODULE_MAX; ++i) {
+            const ModuleHandle& m = g_modules[i];
+            if (!m.pageCount || addresses[a] < m.baseVirt ||
+                (addresses[a] - m.baseVirt) / 4096 >= m.pageCount) continue;
+            if (m.unloading || (!m.active && !m.loading)) {
+                IrqSpinLockRelease(&g_moduleLock, flags);
+                return false;
+            }
+            owners |= uint64_t(1) << i;
+            found = true;
+            break;
+        }
+        if (!found && !ModuleAddressIsKernel(addresses[a])) {
+            IrqSpinLockRelease(&g_moduleLock, flags);
+            return false;
+        }
+    }
+    for (uint32_t i = 0; i < MODULE_MAX; ++i)
+        if (owners & (uint64_t(1) << i)) g_modules[i].resident = true;
+    IrqSpinLockRelease(&g_moduleLock, flags);
+    return true;
+}
+
+// Reserve before blocking I/O. Abandoned reservations have not published any
+// callbacks; once a mapping is published, init completion owns its teardown.
+struct ModuleReservation {
+    ModuleHandle* slot = nullptr;
+    ModuleReservation() {
+        const uint64_t flags = IrqSpinLockAcquire(&g_moduleLock);
+        for (auto& m : g_modules) {
+            if (m.active || m.loading || m.unloading) continue;
+            m = {};
+            m.loading = true;
+            slot = &m;
+            break;
+        }
+        IrqSpinLockRelease(&g_moduleLock, flags);
+    }
+    ~ModuleReservation() {
+        if (!slot) return;
+        const uint64_t flags = IrqSpinLockAcquire(&g_moduleLock);
+        *slot = {};
+        IrqSpinLockRelease(&g_moduleLock, flags);
+    }
+};
+
 
 // ---- Simple string helpers (avoid depending on string.h here) ----
 
@@ -455,18 +525,39 @@ static bool ParseAndLoad(const uint8_t* data, uint64_t size, ParseResult& out)
     return true;
 }
 
+// Finish under the same lock used by retention and unload. Failed init may
+// already have exported callbacks, so its pages then remain resident even
+// though the original load still reports failure.
+static bool ModuleCompleteInit(ModuleHandle* slot, int rc)
+{
+    uint64_t flags = IrqSpinLockAcquire(&g_moduleLock);
+    slot->loading = false;
+    slot->initFailed = rc != 0;
+    const bool retain = rc == 0 || slot->resident;
+    slot->active = retain;
+    slot->unloading = !retain;
+    const ModuleInfo* info = slot->info;
+    const uint64_t baseVirt = slot->baseVirt, pages = slot->pageCount;
+    IrqSpinLockRelease(&g_moduleLock, flags);
+    if (rc == 0) return true;
+    SerialPrintf("module: '%s' init() returned %d%s\n", info->name, rc,
+                 retain ? " — retaining registered callbacks" : " — unloading");
+    if (!retain) {
+        VmmFreePages(VirtualAddress(baseVirt), pages);
+        flags = IrqSpinLockAcquire(&g_moduleLock);
+        *slot = {};
+        IrqSpinLockRelease(&g_moduleLock, flags);
+    }
+    return false;
+}
+
 // ---- Public API ----
 
 ModuleHandle* ModuleLoad(const char* path)
 {
-    // Find a free registry slot.
-    ModuleHandle* slot = nullptr;
-    for (uint32_t i = 0; i < MODULE_MAX; ++i)
-    {
-        if (!g_modules[i].active) { slot = &g_modules[i]; break; }
-    }
-    if (!slot)
-    {
+    ModuleReservation reservation;
+    ModuleHandle* slot = reservation.slot;
+    if (!slot) {
         SerialPuts("module: registry full\n");
         return nullptr;
     }
@@ -531,67 +622,71 @@ ModuleHandle* ModuleLoad(const char* path)
     }
     kfree(buf);
 
-    // Skip if a module with the same name is already loaded.
-    if (pr.info && pr.info->name)
-    {
-        for (uint32_t i = 0; i < MODULE_MAX; ++i)
-        {
-            if (g_modules[i].active && g_modules[i].info &&
-                ModStrEq(g_modules[i].info->name, pr.info->name))
-            {
-                SerialPrintf("module: '%s' already loaded — skipping '%s'\n",
-                             pr.info->name, path);
-                VmmFreePages(VirtualAddress(pr.baseVirt), pr.pageCount);
-                return &g_modules[i]; // return existing handle
-            }
-        }
+    // Publish mapping identity BEFORE init can register permanent callbacks.
+    // The short registry hold never covers VFS, module code or page teardown.
+    uint64_t flags = IrqSpinLockAcquire(&g_moduleLock);
+    for (auto& m : g_modules) {
+        if (&m == slot || !m.info || (!m.active && !m.loading && !m.unloading) ||
+            !ModStrEq(m.info->name, pr.info->name)) continue;
+        ModuleHandle* existing = m.active && !m.initFailed ? &m : nullptr;
+        IrqSpinLockRelease(&g_moduleLock, flags);
+        SerialPrintf("module: '%s' already loaded or initializing — skipping '%s'\n",
+                     pr.info->name, path);
+        VmmFreePages(VirtualAddress(pr.baseVirt), pr.pageCount);
+        return existing;
     }
-
-    // Call module init.
-    if (pr.info->init)
-    {
-        int rc = pr.info->init();
-        if (rc != 0)
-        {
-            SerialPrintf("module: '%s' init() returned %d — unloading\n",
-                         pr.info->name, rc);
-            VmmFreePages(VirtualAddress(pr.baseVirt), pr.pageCount);
-            return nullptr;
-        }
-    }
-
-    slot->info      = pr.info;
-    slot->baseVirt  = pr.baseVirt;
+    slot->info = pr.info;
+    slot->baseVirt = pr.baseVirt;
     slot->pageCount = pr.pageCount;
-    slot->active    = true;
+    reservation.slot = nullptr; // mapping now owns its lifecycle
+    IrqSpinLockRelease(&g_moduleLock, flags);
 
-    SerialPrintf("module: '%s' v%s loaded OK at 0x%lx (%lu pages)\n",
-                 pr.info->name, pr.info->version,
-                 pr.baseVirt, pr.pageCount);
-    return slot;
+    const int rc = pr.info->init ? pr.info->init() : 0;
+    if (rc == 0)
+        SerialPrintf("module: '%s' v%s loaded OK at 0x%lx (%lu pages)\n",
+                     pr.info->name, pr.info->version, pr.baseVirt, pr.pageCount);
+    return ModuleCompleteInit(slot, rc) ? slot : nullptr;
 }
 
-void ModuleUnload(ModuleHandle* handle)
+bool ModuleUnload(ModuleHandle* handle)
 {
-    if (!handle || !handle->active) return;
-    if (handle->info && handle->info->exit)
-        handle->info->exit();
-    VmmFreePages(VirtualAddress(handle->baseVirt), handle->pageCount);
-    handle->active    = false;
-    handle->info      = nullptr;
-    handle->baseVirt  = 0;
-    handle->pageCount = 0;
+    const uint64_t flags = IrqSpinLockAcquire(&g_moduleLock);
+    // Only registry-owned handles are accepted. Keep the identity reserved
+    // through exit/free; retaining callbacks and claiming unload are exclusive.
+    bool owned = false;
+    for (auto& m : g_modules) if (&m == handle) owned = true;
+    if (!owned || !handle->active || handle->loading || handle->unloading || handle->resident) {
+        IrqSpinLockRelease(&g_moduleLock, flags);
+        SerialPuts("module: unload refused (inactive, busy or permanently retained)\n");
+        return false;
+    }
+    handle->active = false;
+    handle->unloading = true;
+    const ModuleInfo* info = handle->info;
+    const uint64_t baseVirt = handle->baseVirt, pages = handle->pageCount;
+    IrqSpinLockRelease(&g_moduleLock, flags);
+    if (info && info->exit) info->exit();
+    VmmFreePages(VirtualAddress(baseVirt), pages);
+    const uint64_t finishFlags = IrqSpinLockAcquire(&g_moduleLock);
+    *handle = {};
+    IrqSpinLockRelease(&g_moduleLock, finishFlags);
+    return true;
 }
 
 ModuleHandle* ModuleFind(const char* name)
 {
     if (!name) return nullptr;
+    const uint64_t flags = IrqSpinLockAcquire(&g_moduleLock);
     for (uint32_t i = 0; i < MODULE_MAX; ++i)
     {
         if (g_modules[i].active && g_modules[i].info &&
             ModStrEq(g_modules[i].info->name, name))
+        {
+            IrqSpinLockRelease(&g_moduleLock, flags);
             return &g_modules[i];
+        }
     }
+    IrqSpinLockRelease(&g_moduleLock, flags);
     return nullptr;
 }
 
@@ -599,13 +694,11 @@ void ModuleDump()
 {
     KPrintf("Loaded modules:\n");
     uint32_t count = 0;
-    for (uint32_t i = 0; i < MODULE_MAX; ++i)
-    {
-        if (!g_modules[i].active) continue;
-        KPrintf("  %-16s v%-6s %s\n",
-                g_modules[i].info->name,
-                g_modules[i].info->version,
-                g_modules[i].info->description);
+    for (uint32_t i = 0; i < MODULE_MAX; ++i) {
+        const ModuleSnapshot snap = ModuleSnapshotAt(i);
+        if (!snap.active) continue;
+        KPrintf("  %-16s v%-6s %s%s%s\n", snap.name, snap.version, snap.description,
+                snap.resident ? " [resident]" : "", snap.initFailed ? " [init failed]" : "");
         ++count;
     }
     if (!count) KPrintf("  (none)\n");
@@ -663,12 +756,23 @@ ModuleSnapshot ModuleSnapshotAt(uint32_t idx)
 {
     ModuleSnapshot snap = {};
     if (idx >= MODULE_MAX) return snap;
+    const uint64_t flags = IrqSpinLockAcquire(&g_moduleLock);
     const auto& m = g_modules[idx];
-    snap.active = m.active;
-    if (!m.active || !m.info) return snap;
-    snap.name = m.info->name;
-    snap.version = m.info->version;
-    snap.sizeBytes = m.pageCount * 4096;
+    if (m.active && m.info) {
+        snap.active = true;
+        const auto copy = [](char* out, uint32_t size, const char* in) {
+            uint32_t n = 0;
+            if (in) while (n + 1 < size && in[n]) { out[n] = in[n]; ++n; }
+            out[n] = 0;
+        };
+        copy(snap.name, sizeof(snap.name), m.info->name);
+        copy(snap.version, sizeof(snap.version), m.info->version);
+        copy(snap.description, sizeof(snap.description), m.info->description);
+        snap.resident = m.resident;
+        snap.initFailed = m.initFailed;
+        snap.sizeBytes = m.pageCount * 4096;
+    }
+    IrqSpinLockRelease(&g_moduleLock, flags);
     return snap;
 }
 

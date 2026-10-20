@@ -224,6 +224,8 @@ Process* SchedulerGetCpuProcess(uint32_t cpuIndex);
 // Required callbacks and the shared state bound are validated. A different
 // table cannot replace an existing name. Registered modules must stay resident;
 // the module loader does not yet have an unregister/quiescence contract.
+// Providers of the table/name/callbacks are permanently retained before publish.
+// Heap-owned tables and policy unregister/hot replacement are not supported.
 extern "C" void SchedulerRegisterPolicy(const SchedOps* ops);
 
 // Switch to a registered policy by name. Returns true on success.

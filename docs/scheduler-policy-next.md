@@ -42,17 +42,21 @@ speedup or kernel stalls.
    Rebuild holds ready/all-process locks, excludes terminated and still-on-CPU
    ready tasks, and preserves initial priorities. Task policy registration is
    atomic with birth, closing the initialize/publish gap. Native switch/churn
-   coverage is recorded in the audit; module lifetime remains separate work.
+   coverage is recorded in the audit; permanent provider ownership is now enforced as described below.
 2. Define task lifetime and queue ownership across Ready-but-on-CPU windows,
    post-switch requeue, exit, stop/continue, wake races and PID reuse. Preserve
    the existing off-CPU publication and lifetime holds. Never dispatch the same
    task on two CPUs.
-3. Give policy registration a module-lifetime contract. `ModuleUnload` calls the
-   module exit callback and frees its pages; `sched_mlfq` does not unregister
-   its `SchedOps`. Both selected and merely registered policy pointers can
-   outlive module memory. Do not unload scheduler modules during experiments.
-   Pin registrations or implement synchronized unregister/rejection before
-   treating unload as supported.
+3. Policy registration now permanently retains the table, name and callback
+   providers before publishing registry pointers. Module mappings are published
+   before init; registered providers refuse unload even when inactive or when
+   initialization later fails. A short loader registry lock serializes slot
+   reservation, retention and unload claims, never module code or page teardown.
+   Metadata snapshots copy strings under that lock. This deliberately does not
+   implement policy unregister/hot replacement; providers remain resident until
+   reboot. Targeted host races and native active/inactive unload refusal are
+   recorded in the audit. New EEVDF callbacks must join the retained dependency
+   list when its policy ABI is extended.
 4. Add a runtime-accounting callback at dispatch/block/preemption boundaries.
    Timestamp per CPU with a validated monotonic source; account each running
    interval once, excluding blocked intervals and handling migration. State

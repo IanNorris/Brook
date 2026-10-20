@@ -989,13 +989,13 @@ static Vnode* GenModules()
     for (uint32_t i = 0; i < maxSlots; ++i)
     {
         ModuleSnapshot snap = ModuleSnapshotAt(i);
-        if (!snap.active || !snap.name) continue;
+        if (!snap.active || !snap.name[0]) continue;
         if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
         // Linux format: name size refcount deps state
         p = AppendStr(p, snap.name);
         *p++ = ' ';
         p = U64ToDec(p, snap.sizeBytes);
-        p = AppendStr(p, " 0 - Live\n");
+        p = AppendStr(p, snap.resident ? " 1 - Live\n" : " 0 - Live\n");
     }
 
     if (p == buf) {

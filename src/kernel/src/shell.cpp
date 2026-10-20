@@ -1351,7 +1351,7 @@ static int ExecCommand(int argc, const char* const* argv)
         if (h)
         {
             KPrintf("Unloading module '%s'\n", argv[1]);
-            ModuleUnload(h);
+            if (!ModuleUnload(h)) { KPrintf("Module is busy or permanently retained\n"); return -1; }
         }
         else
         {

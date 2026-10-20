@@ -764,3 +764,57 @@ Its 1-ms relative median is 2.002 ms. The native job, tracked lineage drain,
 heap check, clean launcher exit and four stopped-filesystem checks pass as on
 RR. Before saving the change, original document/profile preservation is checked
 on this separate clone too. Neither policy is selected as a new default.
+
+
+### Permanent scheduler provider ownership
+
+`ModuleUnload` previously freed a module even after it registered SchedOps.
+The registry includes inactive policies too, so switching back to RR did not
+make unloading MLFQ safe. Registration now first retains the table's owning
+module, validates the table, then retains its name and all callback providers
+before publishing it. Built-in addresses must lie in the linked kernel image;
+other addresses must belong to a published active/initializing module mapping.
+The registration dependency set is checked atomically. Existing pins can be
+conservatively permanent after a rejected registration; this is a lifetime
+contract, not policy unregister or hot replacement.
+
+A short IRQ-safe loader lock reserves distinct slots before blocking file I/O,
+publishes mapping ownership before module init, and serializes retention with
+unload claims. It is not held across module code or VMM page teardown. An unload
+of a retained provider returns failure without invoking its exit or freeing its
+pages. Initialization failure after exported callbacks also retains those pages,
+marks failed initialization and still reports the original load failure. Metadata
+snapshots copy bounded names/version/description under the lock instead of
+returning pointers that unload could invalidate. `/proc/modules` exposes a
+permanent reference as refcount 1; the module diagnostic marks resident/failed
+providers explicitly. This does not establish lifetime ownership for unrelated
+device/filesystem registrations or turn borrowed ModuleFind handles into leases.
+
+The production retention/unload/init-completion code is exercised by the host
+module suite: 300 concurrent retain/unload races, refusal during claimed page
+teardown, active versus initializing providers, multi-provider retention failure
+without partial pins, init failure before/after exports, snapshot independence,
+and 32 simultaneous unique slot reservations. All 58 host suites and compiled
+entry/first-dispatch mutation audits pass.
+
+An initial native boot (`abb3411a...`, `timing-mix-lifetime0-20261020`) refuses
+MLFQ unload while selected and after switching to RR, then successfully selects
+MLFQ/RR again. Twenty-four additional live policy transitions run with 24 CPU
+workers/four periodic sleepers and 128 forked children, each with four threads.
+Both tracked jobs exit zero and drain, heap integrity passes, the launcher exits
+zero after shutdown, all four filesystem checks pass, and twelve documents/four
+original profiles remain unchanged. Performance numbers from this mixed-switch
+safety run are not a policy baseline. The final build also copies metadata
+strings; its separate acceptance is retained with the final candidate below.
+
+The final kernel (`f072996e...`, `timing-mix-lifetime1-20261020`) repeats both
+unload refusals and the 24-switch/128-child/eight-vCPU stress acceptance. Its
+tracked `/proc/modules` read reports `sched_mlfq 4096 1 - Live`, confirming the
+permanent provider reference is observable. Three guest jobs (metadata, CPU,
+churn) exit zero and drain; heap integrity, clean launcher shutdown and all four
+filesystem checks pass. Final document/profile preservation is checked on the
+stopped clone. Boot-script order and the exact serial refusal/switch events are
+saved in `boot-unload-acceptance.json`; workload receipts remain under
+`build/workloads/timing-scheduler-20261020/scheduler-safety/policy-lifetime-native1`.
+RR remains the default; actual running-interval accounting, CPU-time clocks,
+preemption/EEVDF policy ABI and repeated real-workload acceptance remain open.
