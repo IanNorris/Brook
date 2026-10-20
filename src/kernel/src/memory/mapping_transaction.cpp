@@ -400,10 +400,10 @@ void FileMappingInvalidation::Acknowledge() {
 }
 void FileMappingInvalidation::LockTargetFileAlreadyHeld() {
     if (locked_) KernelPanic("mapping: recursive target AS lock");
-    RequireTargetGate();KMutexLock(&space_->mutation);locked_=true;
+    RequireTargetGate();KRwLockWriteLock(&space_->mutation);locked_=true;
 }
 void FileMappingInvalidation::Unlock() {
-    if (locked_) { locked_=false;KMutexUnlock(&space_->mutation); }
+    if (locked_) { locked_=false;KRwLockWriteUnlock(&space_->mutation); }
 }
 static bool FileInterval(const MappingRange& range,FileObject* file,uint64_t begin,uint64_t end,
                          uint64_t& virtualBegin,uint64_t& virtualEnd) {

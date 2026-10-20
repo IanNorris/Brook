@@ -5,7 +5,7 @@
 namespace brook {
 static constexpr uint64_t UserEnd = 0x0000800000000000ULL;
 static void InvalidateLookup(MappingRangeTable& table) {
-    for (auto& entry : table.lookup) entry = nullptr;
+    for (auto& entry : table.lookup) __atomic_store_n(&entry,static_cast<const MappingRange*>(nullptr),__ATOMIC_RELAXED);
 }
 static uint32_t Height(const MappingRangeNode* node) { return node ? node->height : 0; }
 static void UpdateHeight(MappingRangeNode* node) {
@@ -220,13 +220,13 @@ bool MappingRangePlan::Protect(MappingRangeTable& table, uint64_t begin, uint64_
 const MappingRange* MappingRangeFind(const MappingRangeTable& table, uint64_t address) {
     const uint64_t page = address >> 12;
     const unsigned slot = (page ^ (page >> 8) ^ (page >> 16)) & (MappingRangeTable::LookupSlots-1);
-    if (const auto* cached = table.lookup[slot])
+    if (const auto* cached = __atomic_load_n(&table.lookup[slot],__ATOMIC_RELAXED))
         if (cached->begin <= address && address < cached->end) return cached;
     for (auto* node = table.root; node;) {
         if (address < node->range.begin) node = node->left;
         else if (address >= node->range.end) node = node->right;
         else {
-            table.lookup[slot] = &node->range;
+            __atomic_store_n(&table.lookup[slot],&node->range,__ATOMIC_RELAXED);
             return &node->range;
         }
     }

@@ -8,6 +8,7 @@
 #include <random>
 #include <set>
 #include <vector>
+#include <thread>
 #include "memory/mapping_ranges.h"
 
 using namespace brook;
@@ -268,7 +269,26 @@ static void failedEditsAndReuse() {
     }
     MappingRangeDestroy(table); assert(!allocations);
 }
+static void concurrentLookupCache() {
+    MappingRangeTable table{};
+    for(unsigned i=1;i<=16;++i){
+        MappingRangePlan plan;assert(plan.Prepare(1));
+        auto range=anonymous(uint64_t(i)<<24,(uint64_t(i)<<24)+4096);
+        mutation=true;assert(plan.Insert(table,range));mutation=false;
+    }
+    std::vector<std::thread> readers;
+    for(unsigned worker=0;worker<8;++worker)readers.emplace_back([&,worker]{
+        for(unsigned n=0;n<20000;++n){
+            const uint64_t begin=uint64_t(1+(n*7+worker)%16)<<24;
+            const auto* range=MappingRangeFind(table,begin+17);
+            assert(range && range->begin==begin && range->end==begin+4096);
+        }
+    });
+    for(auto& reader:readers)reader.join();
+    MappingRangeDestroy(table);assert(!allocations);
+}
 int main() {
+    concurrentLookupCache();
     orderedAndDeletion(); mixedEdits(); backingAndExtend(); backedTransplant(); failedEditsAndReuse();
     std::puts("MAPPING_RANGE_INDEX_PASS ordered/random rotations, edits, lookup oracle, OOM, backing lifetime");
 }

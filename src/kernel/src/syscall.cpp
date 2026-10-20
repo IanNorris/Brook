@@ -12156,7 +12156,7 @@ static int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
         MappingTransaction lifetime(proc, proc->addressSpace);
         // Read-only resident copy: mutation serializes leaf retirement,
         // protection changes and file invalidation. No backing escapes this lock.
-        KMutexLock(&proc->addressSpace->mutation);
+        KRwLockWriteLock(&proc->addressSpace->mutation);
         uint64_t offset = 0;
         while (!result && offset < byteSize) {
             const uint64_t address = pixelsAddr + offset;
@@ -12170,7 +12170,7 @@ static int64_t sys_brook_wm_set_cursor_image(uint64_t pixelsAddr, uint64_t w,
             memcpy(staged + offset, reinterpret_cast<const void*>(address), chunk);
             offset += chunk;
         }
-        KMutexUnlock(&proc->addressSpace->mutation);
+        KRwLockWriteUnlock(&proc->addressSpace->mutation);
     }
     // Cursor publication reads kernel memory only, after releasing the AS lock.
     if (!result && !brook::CompositorSetCursorImage(reinterpret_cast<const uint32_t*>(staged),

@@ -10,6 +10,9 @@
 #include "mapping_access_timing.h"
 
 namespace brook {
+static bool g_mappingSharedReads=false;
+bool MappingSharedReadsEnabled(){return __atomic_load_n(&g_mappingSharedReads,__ATOMIC_ACQUIRE);}
+void MappingSharedReadsEnable(bool enabled){__atomic_store_n(&g_mappingSharedReads,enabled,__ATOMIC_RELEASE);}
 // Source metadata and leaves are stable under AS.mutation. Destination is not
 // published to the scheduler until the operation's parent shootdown completes.
 static bool CloneLeaves(MappingTransaction& operation, AddressSpaceState* destination, uint16_t pid) {
@@ -513,12 +516,13 @@ UserPageAccess UserMappingPageAccess(Process* actor, AddressSpaceState* space, u
     // blocking mutation lock. Read-only PTE/range checks need no file gates.
     MappingTransaction operation(actor,space);
     const uint64_t timingToken=MappingAccessTimingToken();
+    const bool shared=MappingSharedReadsEnabled();
     const uint64_t timingBefore=(timingToken&1)?MappingAccessTimingClock():0;
-    KMutexLock(&space->mutation);
+    if(shared)KRwLockReadLock(&space->mutation);else KRwLockWriteLock(&space->mutation);
     const uint64_t timingAcquired=(timingToken&1)?MappingAccessTimingClock():0;
     bool cow=false;auto status=CheckPage(space,address,access,cow);
     const uint64_t timingEnded=(timingToken&1)?MappingAccessTimingClock():0;
-    KMutexUnlock(&space->mutation);
+    if(shared)KRwLockReadUnlock(&space->mutation);else KRwLockWriteUnlock(&space->mutation);
     if(timingToken&1)MappingAccessTimingRecord(timingToken,(access&2)!=0,timingBefore,
         timingAcquired,timingEnded,actor->pid,actor->incarnation);
     if (!resolveCow || !cow) return status;
@@ -534,7 +538,7 @@ UserPageAccess UserMappingPageAccess(Process* actor, AddressSpaceState* space, u
     return UserPageAccess::Ready;
 }
 static int64_t SnapshotProgramBreak(AddressSpaceState* space) {
-    KMutexLock(&space->mutation);auto value=space->programBreak;KMutexUnlock(&space->mutation);
+    KRwLockWriteLock(&space->mutation);auto value=space->programBreak;KRwLockWriteUnlock(&space->mutation);
     return static_cast<int64_t>(value);
 }
 int64_t UserMappingBreak(Process* actor,AddressSpaceState* space,uint64_t requested) {
