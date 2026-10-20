@@ -107,3 +107,38 @@ Retain startup and steady-state measurements separately. Add host contention
 with fixed worker/time bounds and reserve control capacity. Verify normal app
 exit, task drain, heap integrity, sync, authoritative QEMU/launcher exit and
 filesystem/user-data preservation. Keep RR as the control and retain failures.
+
+
+## Matched Linux reference and EEVDF trial order
+
+The user requested a Linux VM reference for Firefox and games before a heavy-load
+EEVDF experiment. Extend the existing diskless Linux/Venus control infrastructure
+(`tools/vulkan-linux-control`, `scripts/vulkan_linux_control.py`) into a separate,
+persistent benchmark image; do not run the small Vulkan probe and call it a
+browser/game baseline. Use the pinned nixpkgs source already used by Brook.
+
+Match eight vCPUs, six GiB RAM, host CPU affinity 0–13, the same QEMU binary,
+Intel render node, virtio-GPU/Venus path, display resolution/visibility and silent
+44.1-kHz host audio sink. Preserve a manifest of all QEMU arguments, host load,
+app/driver/kernel versions, scheduler, image checksums and fixture hashes. Run
+one VM at a time. Native SDL/human audio acceptance is a separate cohort.
+
+Use private persistent root/data images with disposable overlays or clones and
+fresh profiles. Avoid benchmarking application startup through a shared host
+9p/Nix-store mount or copying the full browser closure into guest RAM: those
+would change the storage path or available RAM. No licensed assets belong in
+the image derivation or git; stage locally owned game data separately. Start
+with the same generated Firefox video/input/CPU fixture, then Quake II GL3 demo
+and a free game such as SuperTuxKart. Separate startup, warm steady-state,
+CPU throughput, buffered video progression, input-to-DOM/RAF opportunity,
+audio continuity and storage measurements. Linux is a reference target rather
+than a mathematically guaranteed upper bound: compositor, filesystem and guest
+Mesa differences must remain visible.
+
+After the current clock and workload measurement corrections, use this control
+to guide an optional EEVDF trial under bounded heavy load. Retain RR and MLFQ
+controls and the existing default. Implement runtime accounting and module
+lifetime prerequisites first, then independently test eligibility/service debt,
+wakeup placement, weights, overflow and SMP/lifecycle invariants before native
+comparison. Do not substitute IRQ counts for precise virtual runtime or select
+a default merely because one playback run appears smooth.
