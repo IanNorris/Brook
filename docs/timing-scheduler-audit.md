@@ -150,3 +150,75 @@ verification and browser/game regression remain pending. No mixed-workload or br
    and overflow/lifetime contracts. Select implementation based on measured
    bottlenecks and safety gates, not only browser smoothness. Keep the default
    unchanged until evidence supports a change.
+
+
+## First bounded RR saturation results
+
+The `scheduler_mix.c` workload uses fixed CPU loops and four independent
+16-ms absolute-deadline sleeper threads. CPU work is counted in identical
+32,768-step batches. It skips missed periods rather than generating a catch-up
+busy loop. Inputs are bounded to 64 CPU workers and 30 seconds; the initial
+runs use eight or 24 CPU workers and ten timed seconds each. QEMU is confined
+to host CPUs 0–13 on the 16-logical-CPU host. These runs contain no browser or
+audio stream and do not establish mixed real-workload acceptance.
+
+| RR CPU workers | Total batches | Largest/smallest worker count | Sleeper p95 lateness | Worst lateness | Missed periods per sleeper |
+| --- | ---: | ---: | --- | ---: | --- |
+| 8 | 1,921,931 | 1.0055 | 7.55–7.59 ms | 97.54 ms | 8 |
+| 24 | 1,962,419 | 1.0175 | 94.26–95.59 ms | 165.51 ms | 492 |
+
+Each worker made progress; no sleeper returned early. The service-count result
+shows even distribution of this fixed CPU work, while periodic latency worsens
+with runnable count. It is not per-app fairness or proof that RR alone causes
+the latency. Ready-queue accounting spans setup/teardown as well as the timed
+interval and must not be labelled a steady-state-only distribution. Coarse
+host/RPC clock brackets under load are too wide to infer a small drift change.
+The owned launcher exited zero after guest sync; all four primary filesystems
+passed offline checks. Evidence is under `rr-load/` in the workload directory.
+
+The first MLFQ comparison intentionally selects policy from INIT.RC before
+`SchedulerStart`/AP activation, avoiding live hot switching. Its assertion
+caught policy selection failing: registered MLFQ needs 8,240 bytes, but kernel
+storage was 8,192. No MLFQ performance result was collected from that RR boot.
+The rejected attempt was shut down cleanly and its four primary filesystems
+pass. A shared 16-KiB storage contract, compile-time policy checks and hosted
+size assertion now cover this mismatch. The assertion fails on the old bound
+and all 51 module checks pass on the new bound. The rebuilt guest selects MLFQ successfully before scheduler/AP activation;
+its boot log and timing-status reply agree. All 58 hosted suites and both
+compiled audits pass again. Matched RR/MLFQ performance verification remains
+pending; the first MLFQ run below uses the storage-corrected kernel.
+
+
+## MLFQ pilot and procfs observation correction
+
+On the storage-corrected kernel
+`1471ce537a84563d409a21443acfe2f4abef6718c186af70bbd5589b80c0a48c`,
+MLFQ finishes both bounded runs with all CPU workers progressing and no early
+sleeper returns. At 24 workers, the pilot gives 2,043,281 batches, a maximum/minimum
+worker-count ratio of 1.0246, sleeper p95 21.25–21.26 ms, maximum 63.94 ms and
+75 skipped periods per sleeper. At eight workers it gives 1,984,538 batches,
+ratio 1.016, p95 up to 20.36 ms, maximum 999.47 ms and 136 skipped periods.
+These single trials, on different boots and kernel hashes from the first RR
+pilot, do not justify a default switch or a causal performance claim. The
+roughly one-second shared outlier still needs explanation. Retained evidence
+is under `mlfq-storage-load/`.
+
+The first `lapic_clock_observer.py` run parsed `/proc/uptime` as normal decimal
+seconds and reported repeated backward jumps. Inspection found a separate
+formatting defect: `GenUptime` prints integer centiseconds without zero padding,
+so 226.09 becomes `226.9`. Those apparent jumps are not evidence of actual
+counter reversal. Keep the failed diagnostic under `lapic-observation/`.
+
+A second 24-second observation uses explicit `--brook-centiseconds` decoding
+of the known legacy field, records raw strings and brackets reads with KVM
+monotonic time. With a concurrent, bounded 24-worker/12-second load it takes
+5,456 samples, sees zero backward counter steps and zero jumps exceeding the
+read-window/quantization bound. Largest per-sample offset change is 24.36 ms;
+maximum read window is 0.862 ms. Heap integrity passes afterwards. This does
+not rule out early-boot or intermittent CMOS rebasing, and no playback speedup
+is reproduced. Evidence is under `lapic-counter-observation/`.
+
+The procfs source now emits both centisecond digits explicitly for uptime and
+idle time (its formatter has no width modifiers). Rebuilt-guest verification
+of that formatting change remains pending. The default decimal observer must
+be rerun without the compatibility decoding to validate the actual file ABI.

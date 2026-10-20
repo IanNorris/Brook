@@ -176,12 +176,14 @@ is only modified by `Enqueue` (+1), `Remove` (-1), and `PickNext` (-1),
 `BoostAll` correctly doesn't touch it. The per-queue counts stay consistent.
 **No bug here.**
 
-### 3. g_schedStateStorage is fixed 4KB
+### 3. Shared policy storage capacity
 
-The policy state storage is a static 4KB buffer. If a policy module requires
-more (e.g., a complex scheduler with per-process extended metadata), init
-panics. Adequate for current MLFQ (4 queues × 3 pointers + counters ≈ ~200
-bytes) but could be a limitation for future policies.
+The policy state storage uses `SCHED_POLICY_STATE_CAPACITY` from `sched_ops.h`
+(16 KiB). RR and MLFQ have compile-time size checks, and the hosted module
+contract test checks the same bound. At 1,024 PIDs MLFQ requires 8,240 bytes;
+the former 8,192-byte buffer allowed registration but refused selection.
+Larger future policies still require an explicit capacity/allocation design;
+this change does not establish safe hot switching under SMP load.
 
 ### 4. SchedulerKillThreadGroup state write race
 
