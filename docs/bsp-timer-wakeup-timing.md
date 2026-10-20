@@ -235,3 +235,83 @@ QEMU binary exposes `kvm_run_exit` and virtio GPU command/fence trace events,
 which may help attribute host-side delays without another guest policy change.
 The scheduler fairness and historical playback-speedup investigations remain
 open; no default or quantum change is made here.
+
+## Host KVM/device trace checkpoint
+
+Two further fresh EEVDF boots use the same frozen kernel and mixed workload,
+with twelve seconds of QEMU KVM exit/device trace and approximately 20 ms host
+thread samples. These are diagnostic runs, not unprofiled performance controls.
+Audio remains callback-driven through the private PipeWire null sink. No kernel,
+policy or quantum is changed.
+
+The first attempted trace (`ht-e1`) held its QMP connection while sampling. QEMU
+accepts one connection on this endpoint, so the workload's audio-capture greeting
+timed out before `wavcapture`. This attempt is explicitly rejected as a workload
+control. Its trace is retained; the same tracked CPU/browser jobs were drained,
+probes saved and disabled, and the same VM normally shut down. The original
+launcher/router, four filesystem checks and saved-data preservation passed.
+The controller then failed because it assumed every workload failure had a
+runtime-gate receipt; `recovery.py` records the actual disposition instead.
+
+The corrected helper serializes short QMP connections with the bridge operation
+lock and releases QMP during sampling. Both `ht-e2` and `ht-e3` complete the
+original workload, including the eight-second audio capture inside its CPU-load
+interval. Runtime gates, original launcher/router exit, all filesystem checks
+and twelve-document/four-profile-tree preservation pass. No native HDA fault is
+logged. Every enabled trace event is restored to its previously disabled state.
+All VMs and private services are stopped.
+
+`ht-e2` records three retained timer episodes wholly within the trace window;
+the largest is 44.990 ms. Host intervals from CPU 0's successful KVM exit trace
+to its next `KVM_RUN` trace reach 30.268 ms. `ht-e3` additionally traces memory
+region accesses, exposing these CPU 0 intervals:
+
+| Host exit-to-next-run interval | Exit | Access observed in that interval | CPU 0 host samples strictly inside it |
+| --- | --- | --- | --- |
+| 34.694 ms | port I/O | COM2 status read, `serial`, address `0x2fd` | two sleeping in `futex_wait_queue` |
+| 32.828 ms | MMIO | HDA position read, `intel-hda`, address `0x80840104` | one sleeping in `futex_wait_queue` |
+| 25.192 ms | port I/O | COM1 status read, `serial`, address `0x3fd` | one sleeping in `futex_wait_queue` |
+
+The main QEMU thread is sampled running during those same waits. Corresponding
+nearby guest timer gaps are 34.745, 32.928 and 43.988 ms; their arrival RIPs
+symbolize to the COM2 lifecycle worker, the HDA module and `SerialPrintf`.
+Reported steal for the two near-equal-duration episodes is tiny, and enclosing
+CPU 0 host run-queue delay is zero or a few microseconds. Host sleeping/device
+handling cannot be dismissed just because reported steal is small.
+
+Clock alignment is deliberately bounded: guest RPC brackets leave 23.113 ms
+offset uncertainty in `ht-e2` and 31.812 ms in `ht-e3`, assuming a 1x clock.
+The observed realtime/monotonic envelopes add about 1.8–2.0 ms. These numbers
+do **not** establish exact one-to-one causality for every nearby episode. The
+COM2 interval still overlaps its nearby timer gap by at least 1.513 ms across
+all recorded offset bounds; the COM1 interval overlaps by at least 10.777 ms.
+The HDA pair does not have a positive minimum overlap under those bounds.
+Other traced gaps reach 68.610 ms while individual nearby userspace handling
+intervals are much shorter. The larger-gap cause remains open.
+
+Source interpretation uses the exact QEMU 10.2.2
+[KVM loop](https://raw.githubusercontent.com/qemu/qemu/v10.2.2/accel/kvm/kvm-all.c):
+exit tracing precedes I/O dispatch, while the ioctl trace precedes reentry.
+An exit-to-next-run interval therefore bounds host handling and other work,
+not one device callback alone. KVM-run intervals also include host kernel time.
+[Memory access preparation](https://raw.githubusercontent.com/qemu/qemu/v10.2.2/system/physmem.c)
+acquires BQL for non-lockless regions.
+[Read traces follow the callback; write traces precede it](https://raw.githubusercontent.com/qemu/qemu/v10.2.2/system/memory.c).
+BQL/device contention is a supported next hypothesis, not an identified mutex
+owner. No memory-slot-update event occurs in either trace. Requested generic
+`cpu_exec_start/end` events produce no records, so they supply no timing proof.
+
+The source also exposes a scheduler bottleneck independent of policy choice:
+`SchedulerTimerTick` calls `CheckBlockedWakeups` only on CPU 0. A CPU 0 device
+wait can delay all sleeping tasks even while other CPUs run. Next measure timer
+availability on those other CPUs and audit a serialized wake-scan handoff or
+deadline wake mechanism, preserving process references, SMP ownership and lock
+order. Do not move reaping/static BSP housekeeping wholesale or treat extra
+scans on every CPU as a free change. Attribute host lock waits separately and
+retain the unexplained gap cases before claiming the audio problem resolved.
+
+Ignored `host-kvm-trace`, `host-kvm-trace2` and `host-kvm-trace3` evidence retains
+controllers, launchers, frozen source hashes, trace windows, raw host thread
+samples, guest probe snapshots, tracked-job/lifecycle receipts and reproducible
+`analyze-results.py` analysis with offset bounds. Scheduler default, safety gates
+and the unresolved historical playback-speedup conclusion remain unchanged.
