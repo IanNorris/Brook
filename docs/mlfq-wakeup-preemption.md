@@ -1,0 +1,102 @@
+# MLFQ wakeup preemption with retained service budgets
+
+The [targeted queue probe](targeted-queue-activity.md) found long mixer waits
+while CPUs continued running user code. MLFQ previously waited for its current
+5/10/20/40 ms wall slice to expire even when a higher-priority task became ready.
+The optional MLFQ policy now requests preemption for higher-ready-priority work.
+RR remains the default; EEVDF remains available independently.
+
+## Accounting and safety
+
+Simply adding a priority check would treat every interruption as expiry: the
+kernel calls `TimesliceExpired` for every positive `ShouldPreempt` decision.
+MLFQ distinguishes early interruption from actual budget expiry. Early
+interruption preserves priority and consumed service, including when the core
+cannot select an eligible peer. Actual expiry consumes one quantum and demotes
+one level, retaining excess service debt. Expiry wins over a simultaneous wakeup.
+Changing a queued task's priority unlinks and relinks it without changing the
+ready count. PID initialization clears the old identity's budget and reason.
+
+Budgets use the existing service ledger, including partial dispatches and
+migration, rather than renewing a wall slice on every dispatch. Kernel ownership
+and IRQ work remain included; reported KVM steal is excluded. Host blocking not
+classified as steal can still consume service. Legacy callers with no positive
+service observations retain wall-expiry behavior; an initial entirely stolen
+interval is a known fallback edge case.
+
+The existing voluntary-yield/block reward remains: reset budget and boost toward
+HIGH. Deliberate yield/block gaming is not solved by this change. On native
+blocking, `ReadyQueueRemoveLocked` charges the outgoing owner before
+`VoluntaryYield` resets its budget. The later dispatch flush charges only the
+remaining scheduler bookkeeping tail. A source review initially questioned
+this ordering but withdrew that concern after checking the removal flush.
+
+Debug snapshots expose total policy service and a bounded actual queue walk.
+They permit comparison with the kernel ledger without changing policy ABI 2 or
+module ABI 34. No default policy or wake-scan mode changes.
+
+## Matched native comparison
+
+Four fresh private eight-vCPU/six-GiB boots run the same generated local Firefox
+video/audio fixture with 24 CPU workers and private PipeWire null output.
+Order is control, candidate, candidate, control. All explicitly enable the
+optional shared wake-scan handoff. This isolates the MLFQ module change **under
+shared wake scanning**, not the default BSP configuration.
+
+The kernel is byte-identical in all four cases:
+`2c114615fa3af49f3c78d56de7dc17d31bbf94f88362ba53459eb72e36c47aea`.
+All other twelve modules are identical. The candidate MLFQ SHA-256 is
+`298c4362ffd028cd8d03bd23e7d459bd434aad0cc121c3a5d3fdedbfe98c0304`;
+the ignored comparison manifest records both variants and verifies that only
+`drivers/sched_mlfq.mod` differs. Control source hashes include the current
+checkout; its staged MLFQ binary deliberately comes from the preserved prior
+module. An earlier binary comparison against an older kernel failed because
+the rebuilt kernel differed, so that older kernel is not used as the control.
+
+| Run | Periodic p95 | Mixer max ready wait | Browser video callbacks/s | CPU batches | Longest silent 10 ms bins |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| mp-b1, control | 20.397 ms | 50.125 ms | 6.806 | 5,834,816 | 8 |
+| mp-c1, candidate | 1.979 ms | 22.652 ms | 7.958 | 5,328,796 | 9 |
+| mp-c2, candidate | 2.086 ms | 25.880 ms | 7.999 | 5,365,216 | 3 |
+| mp-b2, control | 19.257 ms | 49.179 ms | 6.137 | 5,748,742 | 3 |
+
+Browser callbacks use only the buffered loaded interval, with no under-half-
+second buffer samples. They measure presentation callbacks, not decoded frame
+throughput. Compared by two-run means, periodic p95 drops about 90%, browser
+callbacks increase about 23%, and CPU batches decrease about 8%. These few
+repeats show a useful responsiveness tradeoff, not statistical confidence or
+general desktop acceptance. Silence results overlap and do not establish an
+audio continuity fix. Residual 23–26 ms ready waits and mixer service gaps remain.
+Captured PCM rate stays close to one; historical accelerated playback is not
+reproduced or conclusively explained by this experiment.
+
+All four runs pass original launcher/router completion, drained CPU/browser
+lineages, runtime accounting, heap integrity, four filesystem checks and saved
+data preservation. Candidate policy service exactly matches the kernel ledger;
+reported and walked queue counts agree, with no saturation. Timer/watch clock
+and activity validity checks pass. No native HDA publication fault occurs.
+The original controller completes, all QEMU executables are absent afterward,
+and private services are stopped through their original owners.
+
+Ignored evidence lives under
+`build/workloads/timing-scheduler-20261020/mlfq-wakeup-cohorts`, including raw
+snapshots, source identities, original controller/launchers and verification.
+The comparison manifest and frozen capsules sit alongside that directory.
+
+## Regression coverage and remaining acceptance
+
+Hosted tests load the production policy through its vtable. They cover repeated
+early interruptions, exact service boundaries, multi-quantum debt at lowest
+priority, simultaneous expiry/wakeup, continuation without an eligible peer,
+block/reset/final-charge callback order, queue relinking, PID reuse, saturation
+and inactive accounting. An eight-CPU model checks unique ownership, periodic
+wakeup latency, background progress and exact service totals; the existing
+100,000-step interleaved model also remains. Callback models do not prove native
+affinity rejection or assembly context-switch correctness.
+
+The initial candidate passed all 66 hosted suites, thirteen-module import audit
+and the compiled entry audit (twelve supported templates, 56 mutations; four
+paths unsupported). Additional review tests are recorded separately. Broader
+desktop/gaming acceptance, default BSP wake scanning, adversarial yield
+behavior and direct EEVDF eligibility/debt diagnostics remain open. This is an
+optional policy improvement, not a default scheduler decision.

@@ -112,8 +112,8 @@ struct SchedOps {
     void (*SetRunnable)(void* state, uint16_t pid, bool runnable);
 
     // Called under the ready lock only at a preemptible user-mode timer boundary.
-    // RR/MLFQ retain wall-slice semantics; service policies can retain unfinished
-    // requests across early preemption. May update policy request state.
+    // RR uses wall slices; MLFQ uses observed service budgets when available.
+    // Policies may retain unfinished requests across early preemption.
     bool (*ShouldPreempt)(void* state, uint16_t currentPid, uint64_t elapsedWallMs);
 
 };

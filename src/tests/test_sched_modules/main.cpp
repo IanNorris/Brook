@@ -596,6 +596,151 @@ TEST(mlfq_model_interleaved_cpus) {
 // MLFQ-specific tests (only run for mlfq)
 // ---------------------------------------------------------------------------
 
+TEST(mlfq_wakeup_preemption_preserves_budget) {
+    ops->InitProcess(state,1,2);ops->InitProcess(state,2,1);
+    ops->Enqueue(state,1);ASSERT(ops->PickNext(state)==1);
+    // Three partial dispatches must consume the original 20 ms budget, not
+    // renew it or demote merely because a higher-priority task woke up.
+    for(unsigned part=0;part<2;++part){
+        ops->AccountService(state,1,7000000);ops->Enqueue(state,2);
+        ASSERT(ops->ShouldPreempt(state,1,0));ops->TimesliceExpired(state,1);
+        ASSERT(ops->Timeslice(state,1)==20);
+        ASSERT(ops->PickNext(state)==2);ops->VoluntaryYield(state,2);
+        ops->Enqueue(state,1);ASSERT(ops->PickNext(state)==1);
+    }
+    ASSERT(!ops->ShouldPreempt(state,1,100000)); // wall time cannot spend CPU budget
+    ops->AccountService(state,1,5999999);ASSERT(!ops->ShouldPreempt(state,1,100000));
+    ops->AccountService(state,1,1);ASSERT(ops->ShouldPreempt(state,1,0));
+    ops->TimesliceExpired(state,1);ASSERT(ops->Timeslice(state,1)==40);
+    ASSERT(!ops->ShouldPreempt(state,1,100000));
+    // Equal priority does not trigger an early preemption.
+    ops->InitProcess(state,3,3);ops->Enqueue(state,3);
+    ASSERT(!ops->ShouldPreempt(state,1,100000));
+    ASSERT(ops->DebugDump!=nullptr);SchedDebugInfo debug{};ops->DebugDump(state,1,&debug);
+    ASSERT(debug.hasServiceInfo && debug.serviceNs==20000000 && !debug.saturations);
+}
+
+TEST(mlfq_many_early_preemptions_and_overrun) {
+    ops->InitProcess(state,1,3);ops->InitProcess(state,2,1);
+    ops->Enqueue(state,1);ASSERT(ops->PickNext(state)==1);
+    for(unsigned n=0;n<39;++n){
+        ops->AccountService(state,1,1000000);ops->Enqueue(state,2);
+        ASSERT(ops->ShouldPreempt(state,1,0));ops->TimesliceExpired(state,1);
+        ASSERT(ops->Timeslice(state,1)==40 && ops->PickNext(state)==2);
+        ops->VoluntaryYield(state,2);ops->Enqueue(state,1);ASSERT(ops->PickNext(state)==1);
+    }
+    ASSERT(!ops->ShouldPreempt(state,1,100000));
+    ops->AccountService(state,1,1000000);ASSERT(ops->ShouldPreempt(state,1,0));
+    ops->TimesliceExpired(state,1);ASSERT(!ops->ShouldPreempt(state,1,100000));
+    // Service beyond the old quantum carries into the next level exactly.
+    ops->InitProcess(state,1,2);ops->AccountService(state,1,25000001);
+    ASSERT(ops->ShouldPreempt(state,1,0));ops->TimesliceExpired(state,1);
+    ASSERT(ops->Timeslice(state,1)==40);
+    ops->AccountService(state,1,34999998);ASSERT(!ops->ShouldPreempt(state,1,100000));
+    ops->AccountService(state,1,1);ASSERT(ops->ShouldPreempt(state,1,0));
+    ops->TimesliceExpired(state,1);ASSERT(!ops->ShouldPreempt(state,1,100000));
+}
+
+TEST(mlfq_early_preemption_without_eligible_peer) {
+    ops->InitProcess(state,1,2);ops->InitProcess(state,2,1);
+    ops->AccountService(state,1,7000000);ops->Enqueue(state,2);
+    ASSERT(ops->ShouldPreempt(state,1,0));ops->TimesliceExpired(state,1);
+    // Model the core rejecting the peer for CPU ownership/affinity. Policy
+    // continuation must preserve both priority and the already consumed budget.
+    ASSERT(ops->PickNext(state)==2 && ops->PickNext(state)==NONE);
+    ASSERT(ops->Timeslice(state,1)==20 && !ops->ShouldPreempt(state,1,100000));
+    ops->AccountService(state,1,12999999);ASSERT(!ops->ShouldPreempt(state,1,0));
+    ops->AccountService(state,1,1);ASSERT(ops->ShouldPreempt(state,1,0));
+    ops->TimesliceExpired(state,1);ASSERT(ops->Timeslice(state,1)==40);
+}
+
+TEST(mlfq_expiry_wins_over_wakeup_and_retains_debt) {
+    ops->InitProcess(state,1,2);ops->InitProcess(state,2,1);
+    ops->AccountService(state,1,100000001);ops->Enqueue(state,2);
+    // A wakeup coincident with expiry must not turn expiry into a free
+    // interruption. Consume 20 ms, then two 40 ms quanta at lowest priority.
+    ASSERT(ops->ShouldPreempt(state,1,0));ops->TimesliceExpired(state,1);
+    ASSERT(ops->Timeslice(state,1)==40 && ops->PickNext(state)==2);
+    for(unsigned i=0;i<2;++i){
+        ASSERT(ops->ShouldPreempt(state,1,0));ops->TimesliceExpired(state,1);
+        ASSERT(ops->Timeslice(state,1)==40);
+    }
+    ASSERT(!ops->ShouldPreempt(state,1,100000));
+    ops->AccountService(state,1,39999998);ASSERT(!ops->ShouldPreempt(state,1,0));
+    ops->AccountService(state,1,1);ASSERT(ops->ShouldPreempt(state,1,0));
+}
+
+TEST(mlfq_block_charge_reset_and_switch_tail) {
+    ops->InitProcess(state,1,2);
+    // ReadyQueueRemoveLocked flushes the current owner's interval before
+    // SchedulerBlockImpl calls VoluntaryYield. The later dispatch flush can
+    // legitimately charge only the remaining switch/bookkeeping tail.
+    ops->AccountService(state,1,19000000);ops->Remove(state,1);
+    ops->SetRunnable(state,1,false);ops->VoluntaryYield(state,1);
+    ops->AccountService(state,1,1000000);
+    ASSERT(ops->Timeslice(state,1)==10 && !ops->ShouldPreempt(state,1,100000));
+    ops->AccountService(state,1,8999999);ASSERT(!ops->ShouldPreempt(state,1,0));
+    ops->AccountService(state,1,1);ASSERT(ops->ShouldPreempt(state,1,0));
+    SchedDebugInfo debug{};ops->DebugDump(state,1,&debug);
+    ASSERT(debug.serviceNs==29000000);
+}
+
+TEST(mlfq_service_identity_and_queue_relink) {
+    ops->InitProcess(state,1,2);ops->InitProcess(state,2,2);
+    ops->Enqueue(state,1);ops->Enqueue(state,2);
+    // Diagnostic/administrative queued notifications must not strand a node
+    // under its old priority or change the ready count.
+    ops->TimesliceExpired(state,1);ASSERT(ops->ReadyCount(state)==2);
+    ASSERT(ops->PickNext(state)==2 && ops->PickNext(state)==1);
+    ops->Enqueue(state,1);ops->Enqueue(state,2);ops->VoluntaryYield(state,1);
+    ASSERT(ops->ReadyCount(state)==2 && ops->PickNext(state)==2 && ops->PickNext(state)==1);
+    ops->AccountService(state,1,~uint64_t(0));ops->AccountService(state,1,1);
+    SchedDebugInfo debug{};ops->DebugDump(state,1,&debug);
+    ASSERT(debug.serviceNs==~uint64_t(0) && debug.saturations);
+    ops->InitProcess(state,1,2);ASSERT(!ops->ShouldPreempt(state,1,0));
+    ops->Init(state);ops->AccountService(state,900,123);
+    ops->DebugDump(state,900,&debug);ASSERT(!debug.active && debug.inactiveServiceNs==123 && debug.serviceNs==123);
+}
+
+TEST(mlfq_service_smp_periodic_model) {
+    constexpr unsigned CPUS=8,CPU_TASKS=32,PERIODIC=4,N=CPU_TASKS+PERIODIC;
+    std::array<uint16_t,CPUS> current{};
+    std::array<bool,N+1> queued{},running{};
+    std::array<uint64_t,N+1> service{},wakeAt{},readyAt{},wakeCount{};
+    uint64_t maximumWakeDelay=0;
+    for(unsigned p=1;p<=N;++p){ops->InitProcess(state,p,p<=CPU_TASKS?2:0);wakeAt[p]=10;}
+    for(unsigned p=1;p<=CPU_TASKS;++p){ops->Enqueue(state,p);queued[p]=true;}
+    for(unsigned c=0;c<CPUS;++c){auto p=ops->PickNext(state);ASSERT(p!=NONE && queued[p] && !running[p]);queued[p]=false;running[p]=true;current[c]=p;}
+    for(uint64_t now=1;now<=10000;++now){
+        // All service belongs to the previous interval's CPU owner; policy
+        // calls serialize, but no PID may execute on two model CPUs at once.
+        for(unsigned c=0;c<CPUS;++c){auto p=current[c];ASSERT(p && running[p]);ops->AccountService(state,p,1000000);++service[p];
+            if(p>CPU_TASKS){ops->VoluntaryYield(state,p);running[p]=false;current[c]=0;wakeAt[p]=now+10;}
+        }
+        for(unsigned p=CPU_TASKS+1;p<=N;++p)if(!queued[p] && !running[p] && now>=wakeAt[p]){
+            ops->Enqueue(state,p);queued[p]=true;readyAt[p]=now;
+        }
+        ops->Tick(state,now);
+        for(unsigned c=0;c<CPUS;++c){auto old=current[c];
+            if(old && !ops->ShouldPreempt(state,old,0))continue;
+            if(old)ops->TimesliceExpired(state,old);
+            auto p=ops->PickNext(state);if(p==NONE)continue;
+            ASSERT(p<=N && queued[p] && !running[p]);queued[p]=false;
+            if(old){ASSERT(!queued[old] && running[old]);running[old]=false;ops->Enqueue(state,old);queued[old]=true;}
+            running[p]=true;current[c]=p;
+            if(p>CPU_TASKS){auto delay=now-readyAt[p];if(delay>maximumWakeDelay)maximumWakeDelay=delay;++wakeCount[p];}
+        }
+        unsigned readyCount=0;for(unsigned p=1;p<=N;++p){ASSERT(!(running[p] && queued[p]));readyCount+=queued[p];}
+        ASSERT(ops->ReadyCount(state)==readyCount);
+    }
+    uint64_t minimum=~uint64_t(0),maximum=0;
+    for(unsigned p=1;p<=CPU_TASKS;++p){if(service[p]<minimum)minimum=service[p];if(service[p]>maximum)maximum=service[p];}
+    ASSERT(minimum>1000 && maximum*100<minimum*120 && maximumWakeDelay<=1);
+    for(unsigned p=CPU_TASKS+1;p<=N;++p)ASSERT(wakeCount[p]>800);
+    SchedDebugInfo debug{};ops->DebugDump(state,1,&debug);
+    ASSERT(debug.serviceNs==uint64_t(CPUS)*10000*1000000 && !debug.saturations);
+}
+
 TEST(mlfq_priority_ordering) {
     ops->Init(state);
     // Higher priority (lower number) should be picked first.
@@ -797,6 +942,13 @@ static void RunMlfqTests(const SchedOps* ops, void* state) {
     invoke_mlfq_voluntary_yield_boosts(ops,state);
     invoke_mlfq_priority_fairness(ops,state);
     invoke_mlfq_model_interleaved_cpus(ops,state);
+    invoke_mlfq_wakeup_preemption_preserves_budget(ops,state);
+    invoke_mlfq_many_early_preemptions_and_overrun(ops,state);
+    invoke_mlfq_early_preemption_without_eligible_peer(ops,state);
+    invoke_mlfq_expiry_wins_over_wakeup_and_retains_debt(ops,state);
+    invoke_mlfq_block_charge_reset_and_switch_tail(ops,state);
+    invoke_mlfq_service_identity_and_queue_relink(ops,state);
+    invoke_mlfq_service_smp_periodic_model(ops,state);
 }
 
 int main(int argc, char* argv[]) {
