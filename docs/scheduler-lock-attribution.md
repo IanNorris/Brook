@@ -216,3 +216,43 @@ publications, malformed identities/flags, candidate holders and wrong-ELF hash
 rejection. Astra's review identified the backward-clock bound issue; the final
 analyser excludes those records and retains a regression for either side of the
 proposed handoff. This work is offline and leaves the live review VM untouched.
+
+## Prepared loaded comparison
+
+The ignored `build/workloads/timing-scheduler-20261020/lock-cost-preparation`
+directory retains a source-only controller, launcher, independent verifier and
+hashed plan. None has run a private trial yet. Both launch paths reject execution
+before explicit handback, and the controller checks for existing QEMU processes
+before creating its trial directory. Syntax checks and the handback rejection
+paths pass; these checks do not establish native acceptance.
+
+The proposed order is off/on/on/off on the same frozen `a065ff1d…` kernel and
+thirteen matched modules. Each run uses fresh checked disk clones, eight vCPUs,
+6 GiB, MLFQ, IRQ-accounting try, the same producer/syscall/decision probes, and
+the controlled Quake demo with synthetic music. Twelve bounded host workers
+and four sleepers run for thirty seconds on CPUs 0–13; CPUs 14–15 remain free
+of these workers. A newly owned private null sink receives SDL/PipeWire audio.
+Do not reuse a previous daemon's metadata as proof that it is running.
+
+Compare complete demo host-time brackets, producer gaps, HDA faults and
+full-window PCM continuity, alongside worker completion and the existing runtime,
+IF, heap, filesystem and saved-data gates. Keep missing END markers, short audio
+captures and unknown trace publications as failures or incomplete evidence.
+Tracing off must retain zero events; tracing on must expose losses, clock errors
+and incomplete publications. The retained maxima still cannot guarantee an
+identified predecessor/successor. This measures the cost of enabling tracing in
+one compiled kernel, not the cost of compiling it in compared with its absence.
+Failure-owner review and native validation remain required before interpreting
+any result from the prepared scripts.
+
+While the authorized baseline live review remains running, six read-only audio
+counter queries span roughly ten seconds. Independently bracketed host requests
+bound the guest/host elapsed-clock ratio to 0.980752–1.003470. `clock status`
+reports pvclock, all eight registered CPUs, zero rejected samples and zero rate
+adjustments. This excludes a continuous 1.3–1.5× elapsed-clock rate during that
+short observation; it does not reproduce or close the intermittent speedup.
+The same stream identity/epoch advances submitted/completed counters without a
+reported discontinuity, which is not a PCM-continuity or listening test. This
+live launcher displays Quake's OpenGL 1.4 renderer, not the controlled GL3
+diagnostic cohort. The raw requests, host brackets and clock reply are retained
+in `build/reviews/live-timing-baseline-20261020/audio-live-clock-observation.json`.
