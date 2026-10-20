@@ -3,6 +3,7 @@
 #include "process.h"
 #include "sched_ops.h"
 #include "ready_latency.h"
+#include "runtime_accounting.h"
 
 struct KernelCpuEnv;
 
@@ -219,6 +220,17 @@ void SchedulerGetCpuTicks(uint32_t cpuIndex, uint64_t& busyTicks, uint64_t& idle
 
 // Return the process currently running on the given CPU (nullptr if none/invalid).
 Process* SchedulerGetCpuProcess(uint32_t cpuIndex);
+
+// Running-interval total; remote siblings are committed at their own timer/
+// dispatch boundary. Includes kernel/IRQ work, excludes reported host steal.
+bool SchedulerCpuTime(Process* proc, bool group, uint64_t* result);
+void SchedulerCpuTimeRebind(Process* proc);
+struct RuntimeStatus {
+    RuntimeDiagnostics diagnostics{};
+    uint64_t storageBytes = 0, stealCpuMask = 0;
+    bool stableClock = false;
+};
+void SchedulerRuntimeStatus(RuntimeStatus* output);
 
 // Register a scheduling policy. Called by scheduler modules during init().
 // Required callbacks and the shared state bound are validated. A different

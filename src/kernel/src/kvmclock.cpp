@@ -1,10 +1,8 @@
 // kvmclock.cpp — KVM paravirt clock (CLOCKSOURCE2) support.
 //
-// The CMOS/LAPIC clock has second-granularity correctness after the RTC
-// re-anchor in rtc.cpp, but ns-precision queries (clock_gettime with
-// CLOCK_MONOTONIC) still drift within each one-second window.  Under KVM,
-// the host exports a pvclock page that converts rdtsc() into nanoseconds
-// with guaranteed monotonicity — we use that when available.
+// Stable pvclock supplies elapsed nanoseconds independently of timer delivery.
+// Per-vCPU steal records separately report host descheduling; pvclock alone
+// cannot distinguish elapsed wall time from actual vCPU running time.
 //
 // Reference: Documentation/virt/kvm/msr.rst in the Linux kernel, and
 // pvclock_vcpu_time_info in include/uapi/linux/pvclock-abi.h.
@@ -105,6 +103,8 @@ bool KvmClockInit()
     return true;
 }
 
+bool KvmClockStableAvailable() { return g_enabled && g_stableFeature; }
+
 bool KvmClockAvailable()
 {
     return g_enabled;
@@ -187,6 +187,67 @@ bool KvmClockReadStableNs(uint64_t* result)
         const uint64_t elapsed = static_cast<uint64_t>((static_cast<unsigned __int128>(delta) * multiplier) >> 32);
         if (base > ~uint64_t(0) - elapsed) return false;
         *result = base + elapsed;
+        return true;
+    }
+    return false;
+}
+
+// KVM ABI: one aligned record per vCPU, sharing one permanently pinned page.
+// Never expose this host-writable kernel page through a userspace alias.
+struct alignas(64) KvmStealRecord {
+    uint64_t steal;
+    uint32_t version, flags;
+    uint8_t preempted, pad0[3];
+    uint32_t pad[11];
+};
+static_assert(sizeof(KvmStealRecord) == 64, "KVM steal ABI");
+static constexpr uint32_t KvmStealCpus = 64;
+static_assert(KvmStealCpus * sizeof(KvmStealRecord) == 4096, "steal record page capacity");
+static volatile KvmStealRecord* g_stealRecords = nullptr;
+static PhysicalAddress g_stealPage;
+static bool g_stealEnabled[KvmStealCpus]{};
+
+bool KvmStealInit(uint32_t cpu)
+{
+    if (cpu >= KvmStealCpus) return false;
+    if (__atomic_load_n(&g_stealEnabled[cpu], __ATOMIC_ACQUIRE)) return true;
+    uint32_t features = 0;
+    if (!DetectKvm(features) || !(features & (1u << 5))) return false;
+    if (cpu == 0 && !g_stealRecords) {
+        const auto page = PmmAllocPage(MemTag::KernelData);
+        if (!page.raw()) return false;
+        auto* words = reinterpret_cast<volatile uint64_t*>(PhysToVirt(page).raw());
+        for (uint32_t n = 0; n < 4096 / 8; ++n) words[n] = 0;
+        g_stealPage = page;
+        g_stealRecords = reinterpret_cast<volatile KvmStealRecord*>(words);
+    }
+    if (!g_stealRecords) return false;
+    // Called on the vCPU owning this MSR, after BSP publication/activation.
+    WriteMsr(0x4b564d03, (g_stealPage.raw() + cpu * sizeof(KvmStealRecord)) | 1ULL);
+    __atomic_store_n(&g_stealEnabled[cpu], true, __ATOMIC_RELEASE);
+    SerialPrintf("KvmSteal: CPU%u registered\n", cpu);
+    return true;
+}
+
+bool KvmStealAvailable(uint32_t cpu)
+{
+    return cpu < KvmStealCpus && __atomic_load_n(&g_stealEnabled[cpu], __ATOMIC_ACQUIRE);
+}
+
+bool KvmStealReadNs(uint32_t cpu, uint64_t* result)
+{
+    if (!result || !KvmStealAvailable(cpu) || !g_stealRecords) return false;
+    const auto* page = &g_stealRecords[cpu];
+    for (uint32_t attempt = 0; attempt < 32; ++attempt) {
+        const uint32_t first = __atomic_load_n(&page->version, __ATOMIC_ACQUIRE);
+        if (first & 1) { __asm__ volatile("pause"); continue; }
+        const uint64_t value = __atomic_load_n(&page->steal, __ATOMIC_RELAXED);
+        const uint32_t flags = __atomic_load_n(&page->flags, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        const uint32_t second = __atomic_load_n(&page->version, __ATOMIC_ACQUIRE);
+        if (first != second || (second & 1)) continue;
+        if (flags) return false; // Reserved by the current ABI.
+        *result = value;
         return true;
     }
     return false;

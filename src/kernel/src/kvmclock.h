@@ -12,6 +12,14 @@ bool KvmClockInit();
 
 // True if pvclock was successfully registered.
 bool KvmClockAvailable();
+bool KvmClockStableAvailable();
+
+// Register zeroed, permanently pinned 64-byte KVM steal records. BSP first,
+// then once on each AP before scheduler entry. No-op when CPUID lacks support.
+bool KvmStealInit(uint32_t cpu);
+bool KvmStealAvailable(uint32_t cpu);
+// Bounded version-checked read; failure leaves output unchanged.
+bool KvmStealReadNs(uint32_t cpu, uint64_t* result);
 
 // Sanitized, permanently pinned page, only on stable-clock-capable KVM hosts.
 // Borrowed kernel reference; every user PTE must acquire a separate PMM ref.

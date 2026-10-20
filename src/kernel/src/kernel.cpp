@@ -389,6 +389,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // Select the elapsed clock before anchoring the CMOS wall-clock epoch.
         // Falls back silently on bare metal / non-KVM hosts.
         brook::KvmClockInit();
+        brook::KvmStealInit(0);
         if (!brook::ApicInitElapsedClock())
             brook::SerialPuts("APIC: elapsed clock delivered IRQ fallback\n");
         brook::RtcInit();

@@ -3583,6 +3583,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
             "  sched policy status|rr|mlfq - inspect or select a registered policy\n"
+            "  sched runtime status - running intervals, steal availability and read errors\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
@@ -3843,6 +3844,26 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text("{\"selected\":"); reply.text(selected ? "true" : "false");
         reply.text(",\"policy\":\""); reply.text(SchedulerPolicyName());
         reply.text("\"}\n"); reply.send();
+    }
+    else if (NetStrEq(cmd, "sched runtime status")) {
+        RuntimeStatus status{}; SchedulerRuntimeStatus(&status);
+        const auto& d = status.diagnostics;
+        BridgeReply reply;
+        reply.text("{\"source\":\"");
+        reply.text(status.stableClock ? "stable_kvm_pvclock" : "elapsed_ms_fallback");
+        reply.text("\",\"includes_kernel_irq\":true,");
+        reply.field("storage_bytes",status.storageBytes); reply.text(",");
+        reply.field("steal_cpu_mask",status.stealCpuMask); reply.text(",");
+        reply.field("samples",d.samples); reply.text(",");
+        reply.field("charged_ns",d.chargedNs); reply.text(",");
+        reply.field("observed_steal_ns",d.observedStealNs); reply.text(",");
+        reply.field("idle_ns",d.idleNs); reply.text(",");
+        reply.field("invalid_samples",d.invalidSamples); reply.text(",");
+        reply.field("backwards_wall",d.backwardsWall); reply.text(",");
+        reply.field("backwards_steal",d.backwardsSteal); reply.text(",");
+        reply.field("clamped_service",d.clampedService); reply.text(",");
+        reply.field("stale_identity",d.staleIdentity); reply.text(",");
+        reply.field("saturated",d.saturated); reply.text("}\n"); reply.send();
     }
     else if (NetStrEq(cmd, "sched timing on") || NetStrEq(cmd, "sched timing off") ||
              NetStrEq(cmd, "sched timing reset") || NetStrEq(cmd, "sched timing status")) {

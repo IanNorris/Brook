@@ -9,6 +9,7 @@
 #include "serial.h"
 #include "kprintf.h"
 #include "scheduler.h"
+#include "kvmclock.h"
 #include "process.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -220,6 +221,8 @@ void ApEntryFunction()
 
     // Set up SYSCALL MSRs.
     CpuInitSyscallMsrs(reinterpret_cast<uint64_t>(&BrookSyscallDispatcher));
+
+    KvmStealInit(myCpuIndex);
 
     // Start LAPIC timer on this AP.
     ApicInitTimerOnAp();

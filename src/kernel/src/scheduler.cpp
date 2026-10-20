@@ -24,6 +24,7 @@
 
 #include <stdint.h>
 #include "clock_interval.h"
+#include "runtime_accounting.h"
 
 
 // Context switch — implemented in context_switch.S
@@ -210,6 +211,62 @@ static Process* g_pidToProcess[SCHED_MAX_PIDS] = {};
 // Global scheduler lock (interrupt-safe, protects all policy calls).
 static SchedLock g_readyLock;
 static ReadyLatencyTracker<SCHED_MAX_PIDS> g_readyLatency;
+// Separate bounded accounting storage; it is not policy-owned and survives
+// policy switches. All ledger mutation/read is under g_readyLock.
+static RuntimeAccounting<SCHED_MAX_PIDS, SCHED_MAX_CPUS> g_runtime;
+static bool g_runtimeStableClock = false;
+
+static RuntimeSample RuntimeNow(uint32_t cpu)
+{
+    return RuntimeReadSample(KvmStealAvailable(cpu), [](uint64_t* wall) {
+        if (g_runtimeStableClock) return KvmClockReadStableNs(wall);
+        *wall = ApicTickCount() * 1000000ULL;
+        return true;
+    }, [cpu](uint64_t* steal) { return KvmStealReadNs(cpu, steal); });
+}
+static void RuntimeDispatchLocked(uint32_t cpu, const Process* next)
+{
+    g_runtime.Dispatch(cpu, next == g_perCpu[cpu].idleProcess ? 0 : next->pid,
+                       next->incarnation, RuntimeNow(cpu));
+}
+
+bool SchedulerCpuTime(Process* proc, bool group, uint64_t* result)
+{
+    if (!proc || !result) return false;
+    const uint64_t flags = SchedLockAcquire(g_readyLock);
+    g_runtime.Sample(ThisCpu(), RuntimeNow(ThisCpu()));
+    const uint16_t pid = group ? (proc->tgid ? proc->tgid : proc->pid) : proc->pid;
+    const uint64_t incarnation = group && proc->isThread ? proc->leaderIncarnation : proc->incarnation;
+    const bool found = g_runtime.Read(pid, incarnation, group, result);
+    SchedLockRelease(g_readyLock, flags);
+    return found;
+}
+
+void SchedulerCpuTimeRebind(Process* proc)
+{
+    if (!proc) return;
+    const uint64_t flags = SchedLockAcquire(g_readyLock);
+    const uint32_t cpu = ThisCpu();
+    g_runtime.Sample(cpu, RuntimeNow(cpu));
+    g_runtime.Rebind(proc->pid, proc->incarnation, proc->tgid ? proc->tgid : proc->pid,
+                     proc->isThread ? proc->leaderIncarnation : proc->incarnation);
+    SchedLockRelease(g_readyLock, flags);
+}
+
+void SchedulerRuntimeStatus(RuntimeStatus* output)
+{
+    if (!output) return;
+    const uint64_t flags = SchedLockAcquire(g_readyLock);
+    g_runtime.Sample(ThisCpu(), RuntimeNow(ThisCpu()));
+    output->diagnostics = g_runtime.Diagnostics();
+    output->stableClock = g_runtimeStableClock;
+    output->storageBytes = sizeof(g_runtime);
+    output->stealCpuMask = 0;
+    for (uint32_t cpu = 0; cpu < SmpGetCpuCount() && cpu < 64; ++cpu)
+        if (KvmStealAvailable(cpu)) output->stealCpuMask |= uint64_t(1) << cpu;
+    SchedLockRelease(g_readyLock, flags);
+}
+
 
 // All non-idle enqueue/dispatch calls below already hold g_readyLock. A missing
 // stable clock is reported, never replaced with delivered timer-tick time.
@@ -858,6 +915,7 @@ static void IdleLoop()
 
 void SchedulerInit()
 {
+    g_runtimeStableClock = KvmClockStableAvailable();
     // Load the scheduling policy module.
     // The statically-linked default (sched_rr) is always available.
     // Dynamic modules can register additional policies at runtime.
@@ -1081,6 +1139,8 @@ void SchedulerAddProcess(Process* proc)
     if (proc->pid < SCHED_MAX_PIDS)
         g_pidToProcess[proc->pid] = proc;
     g_schedOps->InitProcess(g_schedState, proc->pid, proc->schedPriority);
+    g_runtime.Register(proc->pid, proc->incarnation, proc->tgid ? proc->tgid : proc->pid,
+                       proc->isThread ? proc->leaderIncarnation : proc->incarnation);
     if (proc->isThread && !proc->isKernelThread)
     {
         Process* ldr = proc->threadLeader;
@@ -1831,6 +1891,12 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
         }
     }
 
+    if (holdingReadyLock) RuntimeDispatchLocked(cpu, newProc);
+    else {
+        const uint64_t runtimeFlags = SchedLockAcquire(g_readyLock);
+        RuntimeDispatchLocked(cpu, newProc);
+        SchedLockRelease(g_readyLock, runtimeFlags);
+    }
     g_perCpu[cpu].currentProcess = newProc;
     if (g_perCpu[cpu].cpuEnv) {
         g_perCpu[cpu].cpuEnv->currentPid = newProc->pid;
@@ -1941,6 +2007,13 @@ void SchedulerTimerTick(bool allowPreempt)
 {
     if (!g_schedulerRunning)
         return;
+
+    {
+        const uint64_t runtimeFlags = SchedLockAcquire(g_readyLock);
+        const uint32_t runtimeCpu = ThisCpu();
+        g_runtime.Sample(runtimeCpu, RuntimeNow(runtimeCpu));
+        SchedLockRelease(g_readyLock, runtimeFlags);
+    }
 
     // Drain pendingRetire on EVERY CPU, every tick. Without this, a process
     // that exits on CPU N while idle is running may leave pendingRetire set
@@ -2422,6 +2495,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     // Exiting process will never run again — clear its TLB CPU mask
     __atomic_and_fetch(&proc->tlbCpuMask, ~(1ULL << cpu), __ATOMIC_RELEASE);
 
+    RuntimeDispatchLocked(cpu, next);
     g_perCpu[cpu].currentProcess = next;
     if (g_perCpu[cpu].cpuEnv) {
         g_perCpu[cpu].cpuEnv->currentPid = next->pid;
@@ -2505,6 +2579,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
 
     if (!first) first = g_perCpu[cpu].idleProcess;
 
+    RuntimeDispatchLocked(cpu, first);
     g_perCpu[cpu].currentProcess = first;
     if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
     
@@ -2563,6 +2638,7 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
     }
 #endif
 
+    RuntimeDispatchLocked(cpu, first);
     g_perCpu[cpu].currentProcess = first;
     if (g_perCpu[cpu].cpuEnv) { g_perCpu[cpu].cpuEnv->currentPid = first->pid; g_perCpu[cpu].cpuEnv->currentProcess = reinterpret_cast<uint64_t>(first); }
     

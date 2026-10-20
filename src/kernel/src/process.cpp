@@ -1696,6 +1696,7 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
         proc->tgid = proc->pid;
         proc->threadLeader = proc;
         proc->leaderIncarnation = 0;
+        SchedulerCpuTimeRebind(proc);
     }
     // The source was cleared through framebufferLock before AS replacement.
     proc->fbDestX = 0;proc->fbDestY = 0;proc->fbScale = 0;proc->fbExitColor = 0;

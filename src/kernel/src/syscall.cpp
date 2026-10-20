@@ -5298,7 +5298,7 @@ struct timeval {
 // CLOCK_REALTIME=0, REALTIME_COARSE=5; MONOTONIC=1, RAW=4, COARSE=6, BOOTTIME=7.
 static uint64_t ClockNowNs(uint64_t clockid)
 {
-    if (clockid == 0 || clockid == 5) return RtcNowNs();
+    if (clockid == 0 || clockid == 5 || clockid == 8) return RtcNowNs();
     return KvmClockAvailable() ? KvmClockReadNs()
                                : ApicTickCount() * 1000000ULL;
 }
@@ -5306,9 +5306,12 @@ static uint64_t ClockNowNs(uint64_t clockid)
 static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
                                   uint64_t, uint64_t, uint64_t)
 {
+    if (clockid > 9) return -EINVAL; // No TAI/dynamic CPU clock support yet.
     timespec value{};auto* ts=&value;
-
-    const uint64_t ns = ClockNowNs(clockid);
+    uint64_t ns = 0;
+    if (clockid == 2 || clockid == 3) {
+        if (!SchedulerCpuTime(ProcessCurrent(), clockid == 2, &ns)) return -EINVAL;
+    } else ns = ClockNowNs(clockid);
     ts->tv_sec = static_cast<int64_t>(ns / 1000000000ULL);
     ts->tv_nsec = static_cast<int64_t>(ns % 1000000000ULL);
     return CopyToUser(tsAddr,&value,sizeof(value))?0:-EFAULT;
@@ -5317,12 +5320,12 @@ static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
 static int64_t sys_clock_getres(uint64_t clockid, uint64_t tsAddr, uint64_t,
                                  uint64_t, uint64_t, uint64_t)
 {
-    (void)clockid;
+    if (clockid > 9) return -EINVAL;
     if (!tsAddr) return 0;
     timespec value{};auto* ts=&value;
 
     ts->tv_sec = 0;
-    ts->tv_nsec = KvmClockAvailable() ? 1 : 1000000;
+    ts->tv_nsec = clockid == 2 || clockid == 3 ? 1000000 : (KvmClockAvailable() ? 1 : 1000000);
     return CopyToUser(tsAddr,&value,sizeof(value))?0:-EFAULT;
 }
 

@@ -47,6 +47,22 @@ uint64_t KvmClockTestTsc() {
 }
 int main() {
     using namespace brook;
+    // Real bounded steal-reader code: unsupported CPUs, odd versions and
+    // reserved flags must not publish a partial/invalid value.
+    KvmStealRecord stealPages[2]{};
+    g_stealRecords=stealPages;g_stealEnabled[0]=true;g_stealEnabled[1]=true;
+    uint64_t stolen=777;
+    CHECK(KvmStealReadNs(0,&stolen) && stolen==0);
+    stealPages[1].version=2;stealPages[1].steal=123456789;
+    CHECK(KvmStealReadNs(1,&stolen) && stolen==123456789);
+    stealPages[1].version=3;
+    CHECK(!KvmStealReadNs(1,&stolen) && stolen==123456789);
+    stealPages[1].version=4;stealPages[1].flags=1;
+    CHECK(!KvmStealReadNs(1,&stolen) && stolen==123456789);
+    CHECK(!KvmStealReadNs(64,&stolen) && !KvmStealReadNs(0,nullptr));
+    g_stealEnabled[0]=false;
+    CHECK(!KvmStealReadNs(0,&stolen));
+    g_stealEnabled[1]=false;g_stealRecords=nullptr;
     // Futex deadlines retain ns precision and selected clock identity. A
     // rounded scheduler hint may not turn a not-yet-expired deadline into timeout.
     uint64_t nsValue=123;

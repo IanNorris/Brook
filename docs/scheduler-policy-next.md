@@ -16,13 +16,16 @@ outlier and expose backwards CMOS rebases of the legacy scheduler clock;
 the elapsed-clock candidate needs matched browser acceptance. Browser/audio/input workloads must validate any policy choice; a
 synthetic sleeper is not an input-to-presentation test.
 
-A missing prerequisite is observable runtime accounting. Brook currently
-charges one CPU tick per delivered interrupt. The elapsed-clock candidate
-now uses stable KVM pvclock for slices instead of the BSP's adjustable
-apparent tick counter; this does not establish actual CPU-service accounting. Stable KVM elapsed time, delivered IRQ count,
-actual CPU service and host stolen time are different quantities. Log which
-one each statistic represents; do not use the existing `/proc` CPU ticks as
-proof of precise EEVDF service accounting.
+Observable running-interval accounting is now available independently of the
+legacy delivered-interrupt CPU ticks. A generation-keyed ledger uses stable KVM
+elapsed nanoseconds minus reported per-vCPU host steal, sampled at dispatch,
+exit and timer boundaries. Standard thread/process CPU clocks use this ledger;
+`sched runtime status` exposes source, steal availability and errors. It includes
+kernel/IRQ work while a task owns the CPU; legacy user/system ticks remain
+separate. See the native idle/loaded acceptance and limitations in the audit.
+EEVDF still needs the policy callback/ABI integration below: a correct counter
+alone does not charge a policy's virtual runtime. Do not treat old `/proc` CPU
+ticks or fixed-work batch counts as precise service accounting.
 
 ## Why consider EEVDF
 
@@ -57,11 +60,17 @@ speedup or kernel stalls.
    reboot. Targeted host races and native active/inactive unload refusal are
    recorded in the audit. New EEVDF callbacks must join the retained dependency
    list when its policy ABI is extended.
-4. Add a runtime-accounting callback at dispatch/block/preemption boundaries.
-   Timestamp per CPU with a validated monotonic source; account each running
-   interval once, excluding blocked intervals and handling migration. State
-   explicitly whether host stolen time and IRQ execution are included. Per-vCPU
-   KVM steal accounting is separate work if needed for loaded-host fairness.
+4. Wire the measured runtime ledger into an explicit policy ABI callback.
+   The existing ledger accounts each running interval once, survives policy
+   switches, retains exited siblings in the live group's total, detects PID
+   reuse and rebinding on Brook nonleader exec, and subtracts available KVM
+   steal. Every flush matters, including CPU-clock queries before a later
+   block/preemption: do not silently omit that already-committed partial service
+   from the policy. Define transition baselines for running tasks. CPU accounting
+   includes kernel/IRQ work; source failures discard an unknown interval rather
+   than charging it to the next task. Fallback/unsupported-steal modes must stay
+   explicit. Separate user/system accounting and legacy CPU statistics remain
+   future work.
 5. Add an explicit policy preemption decision. Ordering `PickNext` alone cannot
    preempt a low-priority 40-ms MLFQ slice promptly when a sleeper wakes. At a
    safe user-mode timer boundary, evaluate the decision and pick under the
@@ -168,5 +177,7 @@ compositors, Firefox vsync settings and caches preclude assigning this entire
 gap to the scheduler. This supplies a useful performance target rather than an
 isolated EEVDF proof. Retain both Brook controls and require the runtime/lifetime
 and SMP prerequisites above before enabling an experimental Brook EEVDF policy.
-CPU-time clock IDs currently alias wall time and also need correction; precise
-runtime accounting should serve both those APIs and policy service accounting.
+Standard CPU-time clock IDs 2/3 now use measured task/group running intervals;
+the next policy ABI should consume that same accounting. Dynamic encoded CPU
+clocks, CPU timers and separate user/system/IRQ classification remain unsupported
+or separate legacy work, rather than being silently called elapsed time.

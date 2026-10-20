@@ -45,6 +45,8 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_runtime_accounting)
+set_tests_properties(test_runtime_accounting PROPERTIES TIMEOUT 15)
 add_host_test(test_smp_boot_policy)
 add_host_test(test_gpu_retirement)
 add_host_test(test_gpu_capture)

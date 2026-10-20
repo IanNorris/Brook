@@ -42,8 +42,8 @@ elapsed-clock candidate; historical baseline results follow below.
 
 | Consumer | Source / delivery | Code | Remaining concern |
 | --- | --- | --- | --- |
-| Syscall MONOTONIC, RAW, COARSE, BOOTTIME | `KvmClockReadNs`; monotonic `ApicTickCount()` fallback | `src/kernel/src/syscall.cpp`, `ClockNowNs` | IDs currently alias; validate unsupported IDs and RAW semantics separately |
-| CPU-time / unsupported clock IDs | Currently fall through to elapsed time in `ClockNowNs`; `clock_getres` also accepts any ID | `syscall.cpp`, `sys_clock_gettime`, `sys_clock_getres` | CLOCK_PROCESS_CPUTIME_ID=2 and THREAD=3 must report charged CPU time; unsupported IDs need errors. This is an additional unresolved semantic defect, not a measured playback cause |
+| Syscall MONOTONIC, RAW, COARSE, BOOTTIME | `KvmClockReadNs`; monotonic `ApicTickCount()` fallback | `src/kernel/src/syscall.cpp`, `ClockNowNs` | These elapsed IDs still alias; RAW semantics need separate validation |
+| CPU-time clock IDs 2/3 | Generation-keyed task/group running intervals minus available KVM steal | `runtime_accounting.h`, `scheduler.cpp`, `sys_clock_gettime` | Includes kernel/IRQ time; remote commits may lag. Dynamic encoded clocks/TAI reject with EINVAL; precise user/system split remains open |
 | libc MONOTONIC fast path | read-only pvclock/TSC vDSO | `src/kernel/vdso/clock.c` | Compare forced syscall, libc, migration and version-update races |
 | REALTIME, gettimeofday, RTC display | immutable CMOS epoch plus pvclock elapsed | `src/kernel/src/rtc.cpp`, `RtcNowNs` | CMOS precision is one second; physical/unstable-clock fallback unaccepted |
 | timerfd expiry | selected nanosecond clock, lazy readiness refresh | `syscall.cpp`, `timerfd_state.h` | Delivery depends on readiness/wakeup paths; existing timerfd tests are not scheduler latency tests |
@@ -53,7 +53,8 @@ elapsed-clock candidate; historical baseline results follow below.
 | futex, poll/select/epoll waits | nanosecond deadlines plus elapsed-millisecond wake hints in several paths | `syscall.cpp`, deadline conversion and waiter loops | Audit each retry, clock selection, signal and overflow path individually |
 | alarm and scheduler sleep | `ApicTickCount()`: stable pvclock with preserved boot origin, IRQ fallback otherwise | `scheduler.cpp`, `syscall.cpp` | Delivery still depends on BSP interrupt/wakeup scans; fallback is not a precise wall clock |
 | Scheduler slice expiry / policy aging | `ApicTickCount()` refreshed by each CPU; periodic local IRQ delivery | `scheduler.cpp`, `SchedulerTimerTick` | Stable time removes CMOS rebases; kernel non-preemptibility and IRQ delivery still bound responsiveness |
-| CPU accounting | one user/sys/idle charge per delivered local IRQ | `scheduler.cpp`, `SchedulerTimerTick` | Counts interrupts, not actual elapsed CPU time; stolen time and masked IRQs bias results |
+| Legacy user/sys/idle CPU statistics | one charge per delivered local IRQ | `scheduler.cpp`, `SchedulerTimerTick` | Existing ticks/proc/rusage/times remain approximate and distinct from the new running-interval ledger |
+| Running-interval ledger | stable KVM elapsed minus paired per-vCPU steal reads; explicit coarse fallback | `runtime_accounting.h`, `RuntimeNow` | Policy ABI has not yet consumed these totals; host/IRQ/failure limits and native validation are recorded below |
 | Ready-queue latency diagnostic | stable KVM clock, incarnation-guarded episodes | `scheduler.cpp`, `ReadyLatencyNow` | Optional; does not measure time waiting for device completion |
 | HDA completion | LPIB modulo ring position; stable pvclock bounds ambiguity | `intel_hda_mod.cpp`, `audio_dma_clock.h` | Check native 44.1-kHz progress against host audio capture, underruns and position discontinuities |
 | Mixer stream completion | driver receipts attributed by identity/epoch | `audio.cpp`, `Reconcile` | Acceptance/completion are separate; stateless resampling remains a separate concern |
@@ -818,3 +819,112 @@ saved in `boot-unload-acceptance.json`; workload receipts remain under
 `build/workloads/timing-scheduler-20261020/scheduler-safety/policy-lifetime-native1`.
 RR remains the default; actual running-interval accounting, CPU-time clocks,
 preemption/EEVDF policy ABI and repeated real-workload acceptance remain open.
+
+
+### Running intervals, KVM steal records and CPU-time clocks
+
+The previous kernel (`f072996e...`, `cpu-time-native0`) returns uptime for
+CLOCK_PROCESS_CPUTIME_ID and CLOCK_THREAD_CPUTIME_ID. The native negative control
+shows 251 ms of CPU time for a 251-ms sleep, child CPU time near the VM's
+37.7-second uptime, and seven failed checks including lost group/thread
+semantics. `clock_gettime(-1)` also incorrectly succeeds. The same bounded,
+asset-free `scripts/workloads/cpu_time_probe.py` passes on the Linux host.
+
+The new bounded ledger is separate from policy state and legacy delivered-IRQ
+user/system ticks. It registers task and group incarnations at birth, accounts
+at timer, first-dispatch, ordinary-switch and final-exit boundaries, and lets
+CPU-clock reads flush their own CPU. All ledger access uses the ready lock;
+there are no Process pointers or per-tick allocations. Group totals retain work
+from exited siblings until the group's PID generation is replaced. Fork starts
+at zero; normal exec/policy replacement preserve history. Brook nonleader exec
+rebinding keeps that thread's history and stops future charges to its old group.
+Remote running siblings are committed at their own next boundary, not
+extrapolated from possibly stale remote steal data.
+
+KVM CPUID bit 5 gates MSR_KVM_STEAL_TIME registration on each vCPU. One sanitized,
+permanently pinned 4-KiB kernel-only page provides 64 aligned records. Versioned
+reads are bounded and reject odd/changing versions or reserved flags. The KVM
+ABI defines steal as host time the vCPU did not run, excluding vCPU idle; this
+is separate from pvclock elapsed time and LAPIC interrupt delivery. References:
+[CPUID](https://docs.kernel.org/virt/kvm/x86/cpuid.html) and
+[MSRs](https://docs.kernel.org/virt/kvm/x86/msr.html). The ledger costs 43,600
+bytes with 1,024 task slots/64 CPU slots, in addition to the 4-KiB steal page.
+No Process or SchedOps layout is changed in this stage.
+
+The final sample brackets its elapsed-clock read with steal reads and retries
+the entire pair on change, at most eight times. A host preemption between the
+two different KVM records therefore cannot publish a new wall timestamp with
+an old steal value. The host test simulates exactly that interleaving and a
+perpetually changing record; it also covers unavailable sources. Invalid samples
+break an interval instead of charging an unknown gap to the next task. Regressing
+wall/steal samples are counted and discarded; delayed steal correction is
+carried through a monotonic service floor. Such correction can affect precise
+per-task attribution if the hypervisor update lags, so it is observable.
+
+Standard clock IDs 2/3 now return measured task/group service. The vDSO already
+falls back to syscalls for these IDs. CPU getres advertises 1 ms because remote
+group commits are periodic. Unsupported TAI/dynamic encoded clocks return EINVAL;
+realtime-alarm reads use the realtime epoch and boot-alarm reads the uptime
+basis. POSIX timers currently explicitly accept only realtime/monotonic clocks.
+The total includes kernel and IRQ work while a task owns its CPU; it is not
+separate precise user/system accounting. `/proc` CPU ticks, getrusage/times and
+reaped-user/system statistics still use their previous approximate counters.
+Bare-metal/unstable-clock and unavailable-steal modes are exposed, not claimed
+as equivalent precision. Read-only runtime diagnostics are normal debug-thread
+operations, not a new panic-safe inspection path.
+
+All 59 host suites and compiled entry/start mutation audits pass. The new host
+suite compares 100,000 eight-CPU events against an independent elapsed-minus-
+steal oracle, plus migration, sleeping intervals, task/group generation reuse,
+exited sibling totals, exec rebinding, discontinuities and saturation. Actual
+steal-reader code is tested for unsupported CPU/odd version/reserved flags.
+The first native RR pilot (`cbbddef0...`, native1) passes the API probe: a 251-ms
+sleep charges 0.108 ms to the thread, exited siblings retain 293.8 ms of measured
+work in the process total, and a fork child starts around 1.93 ms. All eight
+vCPUs register steal records; runtime diagnostics report no invalid/backwards/
+stale/clamped samples. These are functional measurements, not hard realtime
+latency or a default-policy recommendation.
+
+An initial loaded MLFQ trial (native2) runs 24 guest workers/30 seconds and twelve
+host workers/25 seconds, with host/QEMU affinity 0–13 and CPUs 14–15 reserved.
+The API checks pass and about 82.5 aggregate vCPU-seconds of steal are observed.
+Its interpreter starts after contention begins, so complete-command overlap
+cannot be proven; that limitation is retained, not silently treated as matched
+coverage. A separate final-kernel gate trial below warms the interpreter first.
+
+The final paired-reader kernel (`0d02e37b...`, native3) warms the interpreter
+behind a private host HTTP gate, then starts the 24-worker guest workload and
+12 bounded host workers. The gate opens only after all host workers report
+ready. Its response and the observed guest completion both precede the first
+host worker's end, proving the measurement window lies inside contention. The
+API checks pass: 262.9-ms sleep/0.073-ms thread CPU, 276.0-ms busy wall interval/
+40.9-ms thread CPU; 81.4 aggregate vCPU-seconds of reported steal are observed.
+There are zero invalid, backwards, clamped, stale-identity or saturation events.
+The JSON source, gate, worker identities/deadlines, process/thread receipts and
+host QEMU task CPU counters are retained. Host and ledger counter snapshots have
+different intervals; they are diagnostic evidence, not an exact host/guest
+CPU-time equivalence certificate.
+
+Heavy-load latency is still a limitation: the four periodic workers have p95
+26.4–28.1 ms and maxima 2.82–3.07 seconds during the churn/fork probe. The load
+trial is functional accounting acceptance, not an EEVDF or MLFQ performance
+win. BSP-only timeout delivery and long non-preemptible kernel work need
+profiling alongside the policy experiment. Do not hide these outliers behind
+zero accounting errors or claim EEVDF alone will eliminate them.
+
+A fresh final-kernel RR boot (native4) passes the same API probe after Quake II:
+251.0-ms sleep/0.082-ms thread CPU, exited siblings' 240.4-ms total retained by
+the process, and a fork child starts near 1.47 ms. All eight steal records remain
+active with zero accounting error counters. The GL3/720p demo exits zero and
+observes 16.451 seconds for the nominal 15.1-second packet sequence, compared
+with the earlier clock-fixed 16.367-second pilot. Neither run reproduces the
+reported acceleration; one comparison is not a throughput claim. Licensed game
+data remains only in ignored private images/homes. All three candidate probe
+cohorts (native1/2/3) and the final RR cohort (native4) drain tracked tasks and
+pass heap checks, clean launcher exit, four filesystem checks and saved-data
+preservation (12 documents/four original profiles). Native0's expected failing
+negative control is also preserved and cleanly shut down.
+
+The next step is the versioned policy ABI/service/preemption integration and an
+optional EEVDF heavy-load comparison. RR remains the default; the playback-
+speedup reproduction and the full timing/SMP goal are still open.
