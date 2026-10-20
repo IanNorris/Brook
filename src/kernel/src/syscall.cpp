@@ -2221,6 +2221,25 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
 // sys_read (0)
 // ---------------------------------------------------------------------------
 
+// SockRecv holds a socket spinlock while copying its receive ring. Never pass
+// a userspace pointer: even a previously validated writable page may need CoW
+// or be remapped before that copy, and fault resolution can sleep on mapping
+// mutexes. Stage resident kernel bytes, then copy out after the socket unlocks.
+static int64_t ReceiveTcpToUser(int sockIdx, uint64_t address, uint64_t count)
+{
+    if (!count) return 0;
+    const uint32_t size = static_cast<uint32_t>(count < 65536 ? count : 65536);
+    if (!UserBufferWritable(address, size)) return -EFAULT;
+    KernelOperationGuard operation(ProcessCurrent());
+    auto* staged = static_cast<uint8_t*>(kmalloc(size));
+    if (!staged) return -ENOMEM;
+    int result = brook::SockRecv(sockIdx, staged, size);
+    if (result > 0 && !CopyToUser(address, staged, static_cast<uint32_t>(result)))
+        result = -EFAULT;
+    kfree(staged);
+    return result;
+}
+
 static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                          uint64_t, uint64_t, uint64_t)
 {
@@ -2670,9 +2689,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
         {
             if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
                 return -EAGAIN;
-            return brook::SockRecv(sockIdx,
-                                   reinterpret_cast<void*>(bufAddr),
-                                   static_cast<uint32_t>(count));
+            return ReceiveTcpToUser(sockIdx, bufAddr, count);
         }
         // UDP: read() pulls one datagram from the rx queue.  SockRecvFrom
         // returns -EAGAIN when empty; non-blocking sockets propagate that,
@@ -13134,10 +13151,7 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
         bool nonblock = (fde && (fde->statusFlags & 0x800) != 0) || brook::SockIsNonblock(sockIdx);
         if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
             return -EAGAIN;
-        int ret = brook::SockRecv(sockIdx,
-                                   reinterpret_cast<void*>(bufVal),
-                                   static_cast<uint32_t>(lenVal));
-        return static_cast<int64_t>(ret);
+        return ReceiveTcpToUser(sockIdx, bufVal, lenVal);
     }
 
     // UDP path
