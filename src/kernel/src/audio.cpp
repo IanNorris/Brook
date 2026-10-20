@@ -7,6 +7,7 @@
 // decoupling application write timing from hardware playback timing.
 
 #include "audio.h"
+#include "dsp_producer_timing.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "memory/heap.h"
@@ -26,6 +27,32 @@ extern "C" uint64_t AudioClockNowNs()
     // fallback as a bound on elapsed DMA time. Add a hardware clock separately.
     uint64_t now = 0;
     return KvmClockReadStableNs(&now) ? now : 0;
+}
+
+static SpinLock g_dspProducerLock;
+static DspProducerTimingModel g_dspProducerTiming;
+static uint64_t g_dspProducerEpoch=0,g_dspProducerContention=0;
+uint64_t DspProducerTimingToken(){return __atomic_load_n(&g_dspProducerEpoch,__ATOMIC_ACQUIRE);}
+void DspProducerTimingEnable(bool on){
+    SpinLockAcquire(&g_dspProducerLock);g_dspProducerTiming.Enable(on);
+    __atomic_store_n(&g_dspProducerEpoch,g_dspProducerTiming.Token(),__ATOMIC_RELEASE);SpinLockRelease(&g_dspProducerLock);
+}
+void DspProducerTimingReset(){
+    SpinLockAcquire(&g_dspProducerLock);g_dspProducerTiming.Reset();
+    __atomic_store_n(&g_dspProducerEpoch,g_dspProducerTiming.Token(),__ATOMIC_RELEASE);SpinLockRelease(&g_dspProducerLock);
+}
+DspProducerSnapshot DspProducerTimingRead(){
+    SpinLockAcquire(&g_dspProducerLock);auto s=g_dspProducerTiming.Snapshot();SpinLockRelease(&g_dspProducerLock);
+    s.contended=__atomic_load_n(&g_dspProducerContention,__ATOMIC_RELAXED);return s;
+}
+void DspProducerTimingRecord(uint64_t token,const DspProducerEvent& event){
+    // No diagnostic wait while returning from a user write. Drops remain visible.
+    if(!SpinLockTryAcquire(&g_dspProducerLock)){
+        auto old=__atomic_load_n(&g_dspProducerContention,__ATOMIC_RELAXED);
+        while(old!=~uint64_t(0) && !__atomic_compare_exchange_n(&g_dspProducerContention,&old,old+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+        return;
+    }
+    g_dspProducerTiming.Observe(token,event);SpinLockRelease(&g_dspProducerLock);
 }
 
 static SpinLock g_deliveryTimingLock;

@@ -56,6 +56,7 @@
 #include "kvmclock.h"
 #include "audio.h"
 #include "dsp_write_plan.h"
+#include "dsp_producer_timing.h"
 #include "profiler.h"
 #include "smp.h"
 #include "apic.h"
@@ -1933,16 +1934,18 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
     {
         auto* dsp = static_cast<DspState*>(fde->handle);
         DspWritePlan plan;
+        DspProducerCall timing(proc->pid,proc->incarnation,dsp->mixerStreamId,count);
         auto finish = [&](int64_t error) -> int64_t {
             const uint64_t bytes = plan.ConsumedBytes();
-            return bytes ? static_cast<int64_t>(bytes) : error;
+            return timing.Result(bytes ? static_cast<int64_t>(bytes) : error);
         };
         for (;;) {
             SpinLockAcquire(ProcessFdLock(proc));
             const bool nonblock = (fde->statusFlags & 0x800) != 0;
             SpinLockRelease(ProcessFdLock(proc));
             {
-                DspIoGuard held(dsp);
+                const auto mutexBefore=timing.Mark();
+                DspIoGuard held(dsp);timing.Mutex(mutexBefore);
                 AudioStreamProgress progress{};
                 if (!AudioMixerGetProgress(dsp->mixerStreamId, &progress)) return finish(-EBADF);
                 if (progress.discontinuity) return finish(-32); // EPIPE: explicit RESET required.
@@ -1954,10 +1957,10 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
                     // A reset/pause/reconfiguration cannot splice the rest of an
                     // already accepted chunk into a different stream epoch.
                     if (plan.Accepted()) return finish(0);
-                    if (count / frameBytes == 0) return 0;
+                    if (count / frameBytes == 0) return timing.Result(0);
                     if (!plan.Begin(count, rate, dsp->channels, dsp->bitsPerSample,
                                     progress.capacityFrames, dsp->controlEpoch, progress.epoch))
-                        return -EINVAL;
+                        return timing.Result(-EINVAL);
                 }
                 const uint32_t offered = plan.Offer(AudioMixerAvailableFrames(dsp->mixerStreamId));
                 if (offered) {
@@ -1989,7 +1992,11 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
             if (nonblock) return finish(-EAGAIN);
             if (HasReadInterruptSignal()) return finish(-EINTR);
             Process* self = SchedulerCurrentProcess();
-            if (self) { self->wakeupTick = ApicTickCount() + 5; SchedulerBlockInterruptible(self); }
+            if (self) {
+                const auto before=timing.Mark();
+                self->wakeupTick = ApicTickCount() + 5; SchedulerBlockInterruptible(self);
+                timing.Sleep(before);
+            }
         }
     }
 

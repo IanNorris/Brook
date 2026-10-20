@@ -1,4 +1,5 @@
 #include "irq_accounting.h"
+#include "dsp_producer_timing.h"
 #include "bridge_reply.h"
 // net.cpp — Brook OS network stack.
 //
@@ -3708,6 +3709,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap check      - validate heap block metadata\n"
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  audio stats - cached stream queues, completion and guest clock\n"
+            "  audio producer on|off|reset|status - DSP producer elapsed brackets (default off)\n"
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
@@ -3988,6 +3990,48 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text(","); reply.field("timer_ticks_per_ms", clock.timerTicksPerMs);
         reply.text(","); reply.field("initial_timer_ticks_per_ms", clock.initialTimerTicksPerMs);
         reply.text("}\n"); reply.send();
+    }
+    else if(NetStrEq(cmd,"audio producer on") || NetStrEq(cmd,"audio producer off") ||
+            NetStrEq(cmd,"audio producer reset") || NetStrEq(cmd,"audio producer status")) {
+        if(NetStrEq(cmd,"audio producer on"))DspProducerTimingEnable(true);
+        else if(NetStrEq(cmd,"audio producer off"))DspProducerTimingEnable(false);
+        else if(NetStrEq(cmd,"audio producer reset"))DspProducerTimingReset();
+        const auto s=DspProducerTimingRead();BridgeReply h;h.text("{");h.field("epoch",s.epoch);
+        h.text(",\"enabled\":");h.text((s.epoch&1)?"true":"false");
+        h.text(",\"scope\":\"completed DSP branch calls only; KVM elapsed wall time includes scheduling/host delay, no CPU/steal apportionment; gap from previous recorded terminal measurement to next branch entry includes syscall tails/user/prefix and recording overhead; dropped records inflate gaps; mutex acquisition and backpressure sleeps disjoint; top 16 slow events, 8 writer identities; control-crossing/incomplete calls excluded; contention since boot\"");
+        h.text(",");h.field("completed",s.completed);
+        h.text(",");h.field("errors",s.errors);
+        h.text(",");h.field("accepted_bytes",s.acceptedBytes);
+        h.text(",");h.field("invalid",s.invalid);
+        h.text(",");h.field("overflow_writers",s.overflowWriters);
+        h.text(",");h.field("sum_call_ns",s.sumCallNs);
+        h.text(",");h.field("sum_mutex_ns",s.sumMutexNs);
+        h.text(",");h.field("sum_backpressure_ns",s.sumBackpressureNs);
+        h.text(",");h.field("max_call_ns",s.maxCallNs);
+        h.text(",");h.field("max_mutex_ns",s.maxMutexNs);
+        h.text(",");h.field("max_backpressure_ns",s.maxBackpressureNs);
+        h.text(",");h.field("max_gap_ns",s.maxGapNs);
+        h.text(",");h.field("slow",s.slow);
+        h.text(",");h.field("excluded",s.excluded);
+        h.text(",");h.field("contended_records",s.contended);
+        h.text(",");h.field("writers",s.writers);
+        h.text(",\"saturated\":");h.text(s.saturated?"true":"false");h.text(",\"events\":[");h.send();
+        for(unsigned i=0;i<s.retained;++i){const auto& e=s.events[i];BridgeReply r;if(i)r.text(",");r.text("{");
+            r.field("pid",e.pid);
+            r.text(",");r.field("incarnation",e.incarnation);
+            r.text(",");r.field("stream",e.stream);
+            r.text(",");r.field("begin_ns",e.beginNs);
+            r.text(",");r.field("end_ns",e.endNs);
+            r.text(",");r.field("requested_bytes",e.requested);
+            r.text(",");r.field("mutex_ns",e.mutexNs);
+            r.text(",");r.field("backpressure_ns",e.backpressureNs);
+            r.text(",");r.field("attempts",e.attempts);
+            r.text(",");r.field("sleeps",e.sleeps);
+            r.text(",");r.field("gap_ns",e.gapNs);
+            r.text(",");r.field("call_ns",e.endNs-e.beginNs);r.text(",");r.field("other_ns",e.endNs-e.beginNs-e.mutexNs-e.backpressureNs);
+            r.text(",\"result\":");if(e.result<0)r.text("-");r.number(e.result<0?uint64_t(0)-uint64_t(e.result):uint64_t(e.result));
+            r.text(",\"has_gap\":");r.text(e.hasGap?"true":"false");r.text("}");r.send();
+        }DebugChannelSend("]}\n");
     }
     else if(NetStrEq(cmd,"audio timing on") || NetStrEq(cmd,"audio timing off") ||
             NetStrEq(cmd,"audio timing reset") || NetStrEq(cmd,"audio timing status")) {

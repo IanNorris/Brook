@@ -727,3 +727,99 @@ no zero exit is invented. That run is excluded from performance acceptance.
 The corrected repetition uses descriptor-link metadata instead of opening
 the descriptors themselves. `irq-writer-sources` retains both controllers,
 recovery, independent verifier, failure disposition and analysis evidence.
+
+## Default-off completed DSP write brackets
+
+`audio producer on|off|reset|status` adds a bounded diagnostic without changing
+DSP return values, queue capacity or scheduling defaults. Each completed DSP
+branch call records PID/incarnation/stream, requested and returned bytes,
+entry/terminal KVM timestamps, description-mutex acquisition time and explicit
+backpressure-sleep time. Those two phase sums are disjoint; the remainder
+includes conversion/copy/other locks and measurement overhead. All are elapsed
+wall time including scheduling and host descheduling, with no CPU/steal
+apportionment. The probe makes no clock reads when its per-call token is off.
+
+Per-writer gaps run from the previous recorded terminal measurement to the
+next DSP branch entry, including recording overhead, prior syscall tail,
+userspace and the next syscall's preflight/fd pinning. They do not prove an
+application was executing throughout the gap. Controls invalidate crossing
+calls and reset gap continuity; clock errors reject observations. Missing
+terminal calls are excluded. Eight writer identities and sixteen largest
+slow episodes are bounded explicitly. Writer overflow, saturation and
+lifetime diagnostic try-lock drops remain visible; dropped records can inflate
+gaps. The recorder never waits for a diagnostic reader.
+
+Hosted tests exercise the actual RAII measurement code with deterministic
+clocks: disabled clock-read exclusion, unchanged partial/error results,
+disjoint phases, between-call gaps, reset-crossing rejection, missing terminal
+results, backwards clocks even when later timestamps recover, independent
+incarnations/streams, writer limits, top-event retention and saturation. All
+68 hosted tests and the compiled entry audit pass. The frozen kernel is
+`40f90fdcdaad0087a06d643ce11da6de3fe22f7afe8aa65c70320261704ef3c4`
+with the same thirteen control modules.
+
+The first host-loaded probe (`q2-dsp-spans-try-1`) is a **failed workload**,
+not a passing performance control. Quake does not reach END within its
+original 110-second limit, then fails to terminate within ten seconds. Its
+Python leader exits one while seven descendants remain. The original
+controller eventually exits one; original host-worker and outer-launcher
+wait statuses are unavailable and explicitly null, despite the surviving host
+RESULT. Recovery preserves all eight CPU register snapshots, probe/heap
+state, explicitly kills the verified game PID and drains the original job.
+The same VM/router then shut down normally and filesystem/saved-data gates
+pass. One register snapshot lies in the GPU submission pause helper; it does
+not establish a unique stuck command or prove the new probe unrelated to the
+stall.
+
+Completed-call data from that failed run have no invalid clocks, contention
+drops, writer overflow or saturation. The maximum inter-record gap is
+6,280.105 ms, maximum completed branch duration 2.468 ms, maximum description
+mutex wait 0.289 ms and explicit backpressure sleep total zero. This locates
+the observed long gap outside the measured DSP branch; write preflight/fd
+pinning, other syscalls, application waits and userspace remain candidates.
+The independent failure verifier preserves failure classification while
+checking probe arithmetic, original job drain, settled ledgers and clean
+inner VM/router/filesystem/preservation evidence. It does not invent missing
+wait statuses or convert the timeout into acceptance.
+
+A guest-only repetition (`q2-dsp-spans-guest-try-1`) completes the demo in
+15.206 seconds, with 24 guest CPU workers/four periodic sleepers and clean
+original jobs, CPU-clock, ledger, heap and lifecycle/preservation gates. Its
+391 measured writes have a maximum branch duration of 0.996 ms, mutex wait
+0.870 microseconds, gap 73.764 ms and no backpressure sleeps or probe losses.
+The same kernel then passes all eight existing DSP control cases with the
+probe on: fault-before, signal-before, signal-after, reset, pause,
+format-before, fault-after and two-writers. The control diagnostic reaches
+its eight-writer bound and reports seven overflow observations; it is not a
+complete diagnostic trace of every control writer. Native return/control
+acceptance remains independent of that deliberately bounded coverage.
+
+That repetition's eight-second audio capture crosses normal demo shutdown: it
+contains 7.561 seconds of PCM and the aligned HDA trace turns off only for the
+final 456.812 ms, with no native fault/discontinuity. Full-window audio
+acceptance correctly remains false. A six-second capture repeat on the same
+frozen kernel addresses this fixture overlap; it does not relax the audio
+safety or full-window capture criteria.
+
+The six-second repeat (`q2-dsp-spans-guest-try-2`) completes the demo in
+15.192 seconds and passes the full-window capture gate: 6.019773 seconds of
+PCM during 6.005786 host seconds, with HDA active throughout, no native
+fault/discontinuity, and no publication/clock safety failures. All original
+guest/CPU-load/CPU-clock/control jobs, settled ledger/heap/clock gates, original
+VM/router exits, filesystem checks and saved-data preservation pass. Its
+341 observed writes have maximum branch/mutex/gap times of 0.910 ms,
+0.606 microseconds and 71.721 ms, with no backpressure sleeps, invalid records,
+writer overflow, saturation or contention drops. All eight DSP return/control
+cases pass again; their separate bounded diagnostic still reports seven
+writer-overflow observations. This validates diagnostic integration and
+return semantics, not a host-loaded performance improvement or a fix for the
+historical tempo symptom.
+
+`dsp-producer-guest-verified-results.json` keeps both guest repetitions and
+their distinct capture outcomes. `failure-verified.json` keeps the rejected
+host-loaded workload separate. Exact source snapshots, patch, controllers,
+recovery, verifiers, test/audit evidence and hashes are archived in
+`dsp-producer-sources` in the ignored workload root. The next measurement
+should distinguish the leading write preflight/fd-pinning interval from the
+rest of the inter-branch gap and observe other blocking syscalls by the
+verified producer, without attributing all that gap to userspace.
