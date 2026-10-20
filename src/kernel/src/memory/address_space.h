@@ -4,7 +4,6 @@
 #include "address.h"
 #include "spinlock.h"
 #include "sync/kmutex.h"
-#include "sync/krwlock.h"
 
 namespace brook {
 struct Process;
@@ -18,7 +17,7 @@ struct AddressSpaceState {
     volatile uint32_t references;
     uint64_t identity;
     uint64_t generation;
-    KRwLock mutation; // mutations exclusive; initial validation may share
+    KMutex mutation;
     PageTable pageTable;
     uint16_t allocationPid;
     bool kernel;

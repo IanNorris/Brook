@@ -37,7 +37,7 @@ void AddressSpaceKernelInit() {
     g_kernelSpace.references = 1;
     g_kernelSpace.ranges.owner = &g_kernelSpace;
     g_kernelSpace.pageTable = VmmKernelCR3();
-    KRwLockInitNested(&g_kernelSpace.mutation);
+    KMutexInit(&g_kernelSpace.mutation);
 }
 AddressSpaceState* AddressSpaceKernel() { return &g_kernelSpace; }
 AddressSpaceState* AddressSpaceCreate(uint16_t pid) {
@@ -50,7 +50,7 @@ AddressSpaceState* AddressSpaceCreate(uint16_t pid) {
     space->ranges.owner = space;
     if(!space->identity)KernelPanic("AS: identity exhausted");
     space->allocationPid = pid;
-    KRwLockInitNested(&space->mutation);
+    KMutexInit(&space->mutation);
     space->pageTable = VmmCreateUserPageTable();
     if (!space->pageTable) { kfree(space); return nullptr; }
     const auto flags=IrqSpinLockAcquire(&g_cleanupLock);

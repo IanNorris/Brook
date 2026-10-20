@@ -87,7 +87,9 @@ order. Preserve range permissions, PTE/CoW synchronization, cancellation and AS
 lifetime, concurrent unmap/protect, file gates, TLB acknowledgements and fault
 retry behavior. These results do not justify skipping preflight or weakening
 memory isolation. Long other-mutator holds and grant-to-run delay remain
-unmeasured; a read/write change is not yet implemented or proven beneficial.
+unmeasured. The subsequent [shared-validation experiment](shared-mapping-experiment.md)
+reduces measured waiting but does not improve presentation in its controls;
+its code is retained on a separate local branch and not adopted here.
 
 For context, the counter-off EEVDF control presents 4.063 video callbacks/s,
 counter-on EEVDF 4.379, and counter-on MLFQ 6.296. Their periodic wakeup p95s

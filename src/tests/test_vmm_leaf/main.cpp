@@ -8,7 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <shared_mutex>
 #include <thread>
 #include <memory>
 #include <unordered_map>
@@ -37,8 +36,8 @@ std::atomic<int> failFrameAfter{-1};
 std::atomic<int> heapAllocations{0};
 std::atomic<int> failHeapAfter{-1};
 std::mutex mutexRegistryGuard;
-std::unordered_map<void*,std::unique_ptr<std::shared_mutex>> mutexRegistry;
-std::shared_mutex& hostMutex(void* mutex) {
+std::unordered_map<KMutex*,std::unique_ptr<std::mutex>> mutexRegistry;
+std::mutex& hostMutex(KMutex* mutex) {
     std::lock_guard<std::mutex> guard(mutexRegistryGuard);
     CHECK(mutexRegistry.count(mutex));return *mutexRegistry.at(mutex);
 }
@@ -64,13 +63,9 @@ struct Gate {
 };
 // Test-only pause before the CoW slow path acquires a file gate. The reader
 // thread opts in; mutation performed by the main thread is never intercepted.
-void* pageAccessPauseMutex=nullptr;
+KMutex* pageAccessPauseMutex=nullptr;
 Gate* pageAccessPause=nullptr;
 thread_local bool pageAccessPauseOnce=false;
-Gate* validationReaders=nullptr;
-KRwLock* validationLock=nullptr;
-thread_local bool parkValidationReader=false;
-std::atomic<unsigned> validationWriterAttempts{0};
 PageTable table() {
     auto p=PmmAllocPage(MemTag::PageTable);CHECK(p);std::memset(reinterpret_cast<void*>(p.raw()),0,pageSize);return PageTable(p);
 }
@@ -104,7 +99,7 @@ extern "C" void* kmalloc(uint64_t size) {
 extern "C" void kfree(void* p) { if(p){--heapAllocations;std::free(p);} }
 void KMutexInit(KMutex* mutex) {
     std::memset(mutex,0,sizeof(*mutex));
-    std::lock_guard<std::mutex> guard(mutexRegistryGuard);mutexRegistry[mutex]=std::make_unique<std::shared_mutex>();
+    std::lock_guard<std::mutex> guard(mutexRegistryGuard);mutexRegistry[mutex]=std::make_unique<std::mutex>();
 }
 void KMutexLock(KMutex* mutex) {
     if(pageAccessPauseOnce && mutex==pageAccessPauseMutex) {
@@ -113,25 +108,6 @@ void KMutexLock(KMutex* mutex) {
     hostMutex(mutex).lock();
 }
 void KMutexUnlock(KMutex* mutex) { hostMutex(mutex).unlock(); }
-
-void KRwLockInit(KRwLock* mutex) {
-    std::memset(mutex,0,sizeof(*mutex));mutex->recordHeldHints=true;
-    std::lock_guard<std::mutex> guard(mutexRegistryGuard);mutexRegistry[mutex]=std::make_unique<std::shared_mutex>();
-}
-void KRwLockInitNested(KRwLock* mutex){KRwLockInit(mutex);mutex->recordHeldHints=false;}
-void KRwLockWriteLock(KRwLock* mutex){
-    if(mutex==validationLock)++validationWriterAttempts;
-    if(pageAccessPauseOnce && mutex==pageAccessPauseMutex){pageAccessPauseOnce=false;pageAccessPause->park();}
-    hostMutex(mutex).lock();
-}
-void KRwLockWriteUnlock(KRwLock* mutex){hostMutex(mutex).unlock();}
-void KRwLockReadLock(KRwLock* mutex){
-    hostMutex(mutex).lock_shared();
-    if(parkValidationReader && mutex==validationLock)validationReaders->park();
-}
-void KRwLockReadUnlock(KRwLock* mutex){hostMutex(mutex).unlock_shared();}
-bool KRwLockTryReadLock(KRwLock* mutex){return hostMutex(mutex).try_lock_shared();}
-
 bool KvmClockReadStableNs(uint64_t* result) {
     *result=std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();return true;
@@ -1809,7 +1785,7 @@ static void pageAccessWithoutUnrelatedGate() {
     // Force a genuine private CoW candidate, then change its permissions in
     // the gap before full-gate acquisition. The slow path must recheck and
     // deny the write, without allocating/copying a replacement physical page.
-    KRwLockWriteLock(&space->mutation);cow(space->pageTable);KRwLockWriteUnlock(&space->mutation);
+    KMutexLock(&space->mutation);cow(space->pageTable);KMutexUnlock(&space->mutation);
     PmmRefPage(physical); // external pin forces copy if stale CoW were attempted
     Gate beforeFullGate;pageAccessPauseMutex=&unrelated.gate;pageAccessPause=&beforeFullGate;
     UserPageAccess result=UserPageAccess::Ready;
@@ -1970,7 +1946,7 @@ int sharedFileWrite(Vnode* vnode,const void* input,uint64_t length,uint64_t* off
 int sharedFileSync(Vnode* vnode) {
     auto* b=static_cast<SharedFileBackend*>(vnode->priv);++b->syncs;
     // Backend I/O must run after both AS and file gates have been released.
-    for(auto* mutex:{static_cast<void*>(&b->file.gate),static_cast<void*>(&b->actor->addressSpace->mutation)}) {
+    for(auto* mutex:{&b->file.gate,&b->actor->addressSpace->mutation}) {
         CHECK(hostMutex(mutex).try_lock());hostMutex(mutex).unlock();
     }
     if(b->unmapOnSync) {
@@ -2051,34 +2027,8 @@ void sharedFilePublicationAndSync() {
     std::puts("SHARED FILE PUBLICATION/SYNC PASS canonical/exposure/protection/range/errors/unmap-during-sync/cleanup");
 }
 }
-static void concurrentSharedValidation() {
-    const bool previous=MappingSharedReadsEnabled();MappingSharedReadsEnable(true);
-    auto root=table();VmmHostSetKernelRoot(root);auto* space=AddressSpaceCreate(62);CHECK(space);
-    Process builder{},a{},b{},writer{};builder.addressSpace=a.addressSpace=b.addressSpace=writer.addressSpace=space;
-    UserMappingRequest request{};request.range=rangeRecord(0,pageSize,nullptr);
-    request.hint=va.raw();request.length=pageSize;request.preparedPages=1;request.fixed=true;request.prepare=prepareMappingPages;
-    CHECK(UserMappingCreate(&builder,space,request)==static_cast<int64_t>(va.raw()));
-    Gate readers;validationReaders=&readers;validationLock=&space->mutation;validationWriterAttempts=0;
-    UserPageAccess first=UserPageAccess::Denied,second=UserPageAccess::Denied;
-    std::thread ra([&]{parkValidationReader=true;first=UserMappingPageAccess(&a,space,va.raw(),1,true);});
-    std::thread rb([&]{parkValidationReader=true;second=UserMappingPageAccess(&b,space,va.raw(),2,true);});
-    readers.wait(2);std::atomic<bool> done{false};int64_t result=-1;
-    std::thread change([&]{result=UserMappingProtect(&writer,space,va.raw(),pageSize,0);done=true;});
-    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
-    while(!validationWriterAttempts && std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
-    CHECK(validationWriterAttempts && !done);readers.release();ra.join();rb.join();change.join();
-    CHECK(first==UserPageAccess::Ready && second==UserPageAccess::Ready && result==0 && done);
-    validationReaders=nullptr;validationLock=nullptr;
-    CHECK(UserMappingPageAccess(&builder,space,va.raw(),1,true)==UserPageAccess::Denied);
-    MappingSharedReadsEnable(false);
-    CHECK(UserMappingPageAccess(&builder,space,va.raw(),1,true)==UserPageAccess::Denied);
-    MappingSharedReadsEnable(previous);
-    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
-    std::puts("SHARED VALIDATION PASS parallel readers, pending protect exclusion, cache invalidation and mode switch");
-}
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
-    if(argc==2 && !std::strcmp(argv[1],"--shared-mapping-reads"))MappingSharedReadsEnable(true);
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
@@ -2086,7 +2036,6 @@ int main(int argc,char** argv) {
     fileMappingRegistrations();fileMappingGateOom();addressFileGateScope();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
     targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();
     anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
-    concurrentSharedValidation();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
     std::puts("VMM LEAF PASS install/detach races=64 concurrent-cow=32 retirement/OOM/in-place/reuse");

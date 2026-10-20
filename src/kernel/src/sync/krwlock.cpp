@@ -90,7 +90,7 @@ static uint32_t GrantReadBatch(KRwLock* rw, Process** readers) {
     while (rw->readWaitHead && count < ReadWakeBatch) {
         Process* reader = Dequeue(rw->readWaitHead,rw->readWaitTail);
         ProcessRef(reader);
-        if(rw->recordHeldHints)reader->heldReadLock = rw;
+        reader->heldReadLock = rw;
         reader->blockedOnRwLock = nullptr;
         __atomic_store_n(&reader->pendingWakeup,1,__ATOMIC_RELEASE);
         readers[count++] = reader;
@@ -120,22 +120,6 @@ void KRwLockInit(KRwLock* rw)
     rw->writeWaitTail  = nullptr;
     rw->guardNext      = 0;
     rw->guardServing   = 0;
-    rw->recordHeldHints = true;
-}
-void KRwLockInitNested(KRwLock* rw) {KRwLockInit(rw);rw->recordHeldHints=false;}
-
-bool KRwLockTryReadLock(KRwLock* rw) {
-    Process* self=SchedulerCurrentProcess();
-    if(self)SchedulerKernelRegionEnter(self);
-    const uint64_t flags=RwGuardAcquire(rw);
-    if(!rw->writerActive && !rw->writersWaiting && !rw->readWaitHead){
-        ++rw->readerCount;
-        if(self && rw->recordHeldHints)self->heldReadLock=rw;
-        RwGuardRelease(rw,flags);return true;
-    }
-    RwGuardRelease(rw,flags);
-    if(self)SchedulerKernelRegionLeave(self);
-    return false;
 }
 
 void KRwLockReadLock(KRwLock* rw)
@@ -149,7 +133,7 @@ void KRwLockReadLock(KRwLock* rw)
     {
         rw->readerCount++;
         // Track ownership for the terminal-state invariant check.
-        if (self && rw->recordHeldHints) self->heldReadLock = rw;
+        if (self) self->heldReadLock = rw;
         RwGuardRelease(rw, flags);
         return;
     }
@@ -197,7 +181,7 @@ void KRwLockReadUnlock(KRwLock* rw)
 {
     // BRO-162: drop recorded read ownership (mirrors heldWriteLock handling).
     Process* self = SchedulerCurrentProcess();
-    if (self && rw->recordHeldHints && self->heldReadLock == rw)
+    if (self && self->heldReadLock == rw)
         self->heldReadLock = nullptr;
 
     uint64_t flags = RwGuardAcquire(rw);
@@ -212,7 +196,7 @@ void KRwLockReadUnlock(KRwLock* rw)
         // Record the grant before unblock; the queued acquisition remains
         // protected and referenced until its eventual unlock.
         ProcessRef(writer);
-        if(rw->recordHeldHints)writer->heldWriteLock = rw;
+        writer->heldWriteLock = rw;
         writer->blockedOnRwLock = nullptr;
         __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
         RwGuardRelease(rw, flags);
@@ -249,7 +233,7 @@ void KRwLockWriteLock(KRwLock* rw)
         rw->writerActive = 1;
         RwGuardRelease(rw, flags);
         // Track ownership.
-        if (self && rw->recordHeldHints) self->heldWriteLock = rw;
+        if (self) self->heldWriteLock = rw;
         return;
     }
 
@@ -287,14 +271,14 @@ void KRwLockWriteLock(KRwLock* rw)
             break;
     }
     RwGuardRelease(rw, flags);
-    if(rw->recordHeldHints)self->heldWriteLock = rw; // already set by the waker
+    self->heldWriteLock = rw;   // already set by the waker; reasserted for clarity
 }
 
 void KRwLockWriteUnlock(KRwLock* rw)
 {
     // Clear ownership tracking.
     Process* self = SchedulerCurrentProcess();
-    if (self && rw->recordHeldHints && self->heldWriteLock == rw)
+    if (self && self->heldWriteLock == rw)
         self->heldWriteLock = nullptr;
 
     uint64_t flags = RwGuardAcquire(rw);
@@ -320,7 +304,7 @@ void KRwLockWriteUnlock(KRwLock* rw)
         rw->writersWaiting--;
         // BRO-162: record ownership on the woken writer before unblock.
         ProcessRef(writer);
-        if(rw->recordHeldHints)writer->heldWriteLock = rw;
+        writer->heldWriteLock = rw;
         writer->blockedOnRwLock = nullptr;
         __atomic_store_n(&writer->pendingWakeup, 1, __ATOMIC_RELEASE);
         RwGuardRelease(rw, flags);

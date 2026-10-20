@@ -17,7 +17,6 @@
 #include "memory/exec_page_cache.h"
 #include "memory/address_space.h"
 #include "memory/mapping_access_timing.h"
-#include "memory/user_mapping.h"
 #include "memory/virtual_memory.h"
 #include "klog.h"
 #include "profiler.h"
@@ -3400,7 +3399,7 @@ static void DebugMemoryCensus()
         constexpr unsigned kinds=static_cast<unsigned>(MappingKind::Heap)+1;
         struct Category { uint64_t virtualPages=0,ramPages=0,ranges=0;VmmRangeStats pages; } categories[kinds]{};
         uint64_t generation=0;bool valid=true;
-        KRwLockWriteLock(&space->mutation);
+        KMutexLock(&space->mutation);
         generation=space->generation;
         for(auto* node=space->ranges.head;node;node=node->next) {
             const auto& range=node->range;const unsigned index=static_cast<unsigned>(range.kind);
@@ -3419,7 +3418,7 @@ static void DebugMemoryCensus()
             total.proportionalUnits+=pages.proportionalUnits;
             total.tableEntriesVisited+=pages.tableEntriesVisited;total.lockBatches+=pages.lockBatches;
         }
-        KRwLockWriteUnlock(&space->mutation);
+        KMutexUnlock(&space->mutation);
         pin.release(); // backpressured output must not pin a large exiting AS
         // Never format or send while holding AS/PT/registry locks.
         if(!valid) {
@@ -3586,7 +3585,6 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
             "  mapping timing on|off|reset|status - preflight mutex timings (default off)\n"
-            "  mapping reads shared|exclusive|status - experimental initial validation mode\n"
             "  sched policy status|rr|mlfq|eevdf - inspect or select a registered policy\n"
             "  sched runtime status - running intervals, steal availability and read errors\n"
             "  mem exec-cache  - executable page sharing counters\n"
@@ -3807,13 +3805,6 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         char report[768];
         HeapTimingFormat(report, sizeof(report));
         DebugChannelSend(report);
-    }
-    else if (NetStrEq(cmd,"mapping reads shared") || NetStrEq(cmd,"mapping reads exclusive") ||
-             NetStrEq(cmd,"mapping reads status")) {
-        if(NetStrEq(cmd,"mapping reads shared"))MappingSharedReadsEnable(true);
-        else if(NetStrEq(cmd,"mapping reads exclusive"))MappingSharedReadsEnable(false);
-        BridgeReply reply;reply.text("{\"shared\":");reply.text(MappingSharedReadsEnabled()?"true":"false");
-        reply.text(",\"scope\":\"initial validation only; all mutations and CoW revalidation stay exclusive; reset timing counters after mode changes\"}\n");reply.send();
     }
     else if (NetStrEq(cmd, "mapping timing on") || NetStrEq(cmd, "mapping timing off") ||
              NetStrEq(cmd, "mapping timing reset") || NetStrEq(cmd, "mapping timing status")) {

@@ -2,10 +2,6 @@
 #include "mapping_transaction.h"
 
 namespace brook {
-// Experimental initial-validation sharing. Mutators and the CoW slow path
-// always acquire exclusive access; disabled by default for native comparison.
-bool MappingSharedReadsEnabled();
-void MappingSharedReadsEnable(bool enabled);
 // Device/file preparation happens outside AS.mutation and must stage every
 // requested page before returning success. The caller retains range.backing
 // and cancellation protection until this request returns.

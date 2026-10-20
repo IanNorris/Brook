@@ -37,16 +37,9 @@ struct KRwLock {
     // Internal guard spinlock
     volatile uint32_t guardNext;
     volatile uint32_t guardServing;
-    // Legacy Process held-lock hints have one slot per mode. Nested AS locks
-    // skip these hints; acquisitions still pin and protect the process, and
-    // every wait queue remains tracked.
-    bool recordHeldHints = true;
 };
 
 void KRwLockInit(KRwLock* rw);
-void KRwLockInitNested(KRwLock* rw);
-// Nonblocking read admission, respecting queued writers/deferred readers.
-bool KRwLockTryReadLock(KRwLock* rw);
 
 // Acquire for reading. Blocks if a writer is active or writers are waiting.
 void KRwLockReadLock(KRwLock* rw);
@@ -61,8 +54,7 @@ void KRwLockWriteLock(KRwLock* rw);
 // Release the write lock. Grants a bounded reader cohort, or the next writer.
 void KRwLockWriteUnlock(KRwLock* rw);
 
-// Validate legacy held/wait hints after protected operations unwind. Never
-// release an abandoned lock or expose partially completed work on thread exit.
+// Cleanup on thread exit: release held write lock and/or remove from wait queues.
 void KRwLockCleanupOnExit(Process* p);
 
 } // namespace brook

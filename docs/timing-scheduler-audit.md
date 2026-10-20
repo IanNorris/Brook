@@ -41,6 +41,12 @@ validation acquisition wait and check-hold brackets with a runtime probe off by
 default. Native EEVDF/MLFQ measurements show sub-microsecond typical checks and
 long waiting tails; other holders and grant-to-run delays remain unmeasured.
 
+The [shared-validation prototype](shared-mapping-experiment.md) lowers measured
+waiting without establishing a desktop gain, so the working implementation
+returns to the original exclusive mutex/ABI 34. The experiment also retains a
+real HDA sample gap of about 202 ms and an unresolved sanitizer lock-stress
+timeout that also appears with isolated pre-experiment source.
+
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
 `f932600c7ef0ac9606057f8e976e47b3f397695aae69383dc965a6d342e2f1b3`.
 The native review initially estimated roughly 1.5× playback in Quake II and

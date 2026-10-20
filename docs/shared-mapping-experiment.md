@@ -1,9 +1,12 @@
 # Shared initial mapping-validation experiment
 
 Shared validation reduced measured mutex waits but did not establish better
-browser presentation. Preserve this prototype as research, rather than adopting
-it for the desktop. The working timing branch will retain the original exclusive
-mutex implementation. The broad timing/audio/scheduler investigation remains open.
+browser presentation. The local branch
+`experiment/shared-mapping-reads-20261020` preserves prototype commit `04bb8e08`.
+The working timing branch restores the implementation from `d07bd8d3`, including
+the original exclusive mutex and module ABI 34. ABI 35 and the commands below
+apply only to the retained prototype. The broad timing/audio/scheduler
+investigation remains open.
 
 ## Prototype and safety scope
 

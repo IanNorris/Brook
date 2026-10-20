@@ -242,7 +242,7 @@ static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
     // Fatal exception context must not sleep or traverse a mutable linked list.
     // Keep only scalar summaries, then release the lock before serial output.
     auto* space=p->addressSpace;
-    if (!brook::KRwLockTryReadLock(&space->mutation)) {
+    if (!brook::KMutexTryLock(&space->mutation)) {
         ExcPutsRaw("  addr-space map unavailable: mutation lock busy\n");return;
     }
     const uint64_t programBreak=space->programBreak,mmapNext=space->mmapNext;
@@ -251,7 +251,7 @@ static void ExcDumpUserAddrSpace(brook::Process* p, uint64_t addr, uint64_t rip,
         const auto& range=node->range;unsigned kind=static_cast<unsigned>(range.kind);
         consider(range.begin,range.end-range.begin,kind<7?kinds[kind]:"unknown",range.identity);
     }
-    brook::KRwLockReadUnlock(&space->mutation);
+    brook::KMutexUnlock(&space->mutation);
 
     ExcPutsRaw(tag); ExcPutsRaw("  --- BRO-194 addr-space map (CR2=");
     ExcPutHex(addr); ExcPutsRaw(") ---\n");

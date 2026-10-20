@@ -130,7 +130,7 @@ bool FileMappingGateSet::Lock(AddressSpaceState* space,MappingBacking* incoming,
     if(space_ || count_)KernelPanic("file mapping: recursive gate set");
     for(;;) {
         if(index_)memset(index_,0,indexCapacity_*sizeof(uint64_t));
-        KRwLockWriteLock(&space->mutation);
+        KMutexLock(&space->mutation);
         uint64_t generation=space->generation,needed=1;bool fits=Add(incoming);
         for(auto* node=space->ranges.head;node;node=node->next) {
             if(onlyBacking && node->range.backing!=onlyBacking)continue;
@@ -138,7 +138,7 @@ bool FileMappingGateSet::Lock(AddressSpaceState* space,MappingBacking* incoming,
             if(fits)fits=Add(node->range.backing);
         }
         if(fits && !count_) { space_=space;return true; }
-        KRwLockWriteUnlock(&space->mutation);
+        KMutexUnlock(&space->mutation);
         if(!fits) {
             ReleasePins();
             if(needed>~uint64_t{0}/sizeof(Pin) || needed>~uint64_t{0}/2)return false;
@@ -157,9 +157,9 @@ bool FileMappingGateSet::Lock(AddressSpaceState* space,MappingBacking* incoming,
         }
         SortPins();
         for(uint64_t i=0;i<count_;++i)KMutexLock(&pins_[i].file->gate);
-        KRwLockWriteLock(&space->mutation);
+        KMutexLock(&space->mutation);
         if(space->generation==generation) { space_=space;return true; }
-        KRwLockWriteUnlock(&space->mutation);
+        KMutexUnlock(&space->mutation);
         for(uint64_t i=count_;i>0;--i)KMutexUnlock(&pins_[i-1].file->gate);
         ReleasePins();
     }
@@ -170,7 +170,7 @@ bool FileMappingGateSet::LockAddress(AddressSpaceState* space,uint64_t address) 
         // A gate set may be reused after a full-space snapshot. Its hashed
         // slots contain indices into the previous pin array until cleared.
         if(index_)memset(index_,0,indexCapacity_*sizeof(uint64_t));
-        KRwLockWriteLock(&space->mutation);
+        KMutexLock(&space->mutation);
         const uint64_t generation=space->generation;
         const auto* range=MappingRangeFind(space->ranges,address);
         if(range && !Add(range->backing))
@@ -178,18 +178,18 @@ bool FileMappingGateSet::LockAddress(AddressSpaceState* space,uint64_t address) 
         // Anonymous or absent ranges need only AS serialization. No backing
         // pointer escapes this lock without a retained descriptor pin.
         if(!count_) { space_=space;return true; }
-        KRwLockWriteUnlock(&space->mutation);
+        KMutexUnlock(&space->mutation);
         KMutexLock(&pins_[0].file->gate);
-        KRwLockWriteLock(&space->mutation);
+        KMutexLock(&space->mutation);
         if(space->generation==generation) { space_=space;return true; }
-        KRwLockWriteUnlock(&space->mutation);
+        KMutexUnlock(&space->mutation);
         KMutexUnlock(&pins_[0].file->gate);
         ReleasePins();
     }
 }
 void FileMappingGateSet::Unlock() {
     if(!space_)return;
-    KRwLockWriteUnlock(&space_->mutation);space_=nullptr;
+    KMutexUnlock(&space_->mutation);space_=nullptr;
     for(uint64_t i=count_;i>0;--i)KMutexUnlock(&pins_[i-1].file->gate);
     ReleasePins();
 }

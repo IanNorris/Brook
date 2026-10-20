@@ -283,8 +283,6 @@ target_compile_options(test_vmm_leaf PRIVATE
     "-iquote${BROOK_ROOT}/src/shared/inc_km"
 )
 target_link_options(test_vmm_leaf PRIVATE -Wl,--gc-sections)
-add_test(NAME test_vmm_leaf_shared COMMAND test_vmm_leaf --shared-mapping-reads)
-set_tests_properties(test_vmm_leaf test_vmm_leaf_shared PROPERTIES TIMEOUT 30)
 
 # Actual canonical cache adoption under simultaneous independent-open misses.
 add_host_test(test_file_page_cache
