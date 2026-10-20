@@ -25,6 +25,17 @@ bool KvmStealAvailable(uint32_t cpu);
 // Bounded version-checked read; failure leaves output unchanged.
 bool KvmStealReadNs(uint32_t cpu, uint64_t* result);
 
+// Read-only diagnostic, not a scheduler decision or an atomic system snapshot.
+// CPUID availability is separate from registered records and implemented users.
+// A zero preemption hint does not prove a vCPU is running (host support and
+// reporting are incomplete). The byte is sampled independently of steal time.
+struct KvmVirtualizationStatus {
+    uint32_t features = 0, hints = 0, cpus = 0;
+    uint64_t registeredStealMask = 0, preemptedHintMask = 0, otherHintMask = 0;
+    bool present = false;
+};
+void KvmVirtualizationRead(uint32_t cpus, KvmVirtualizationStatus* output);
+
 // Sanitized, permanently pinned page, only on stable-clock-capable KVM hosts.
 // Borrowed kernel reference; every user PTE must acquire a separate PMM ref.
 PhysicalAddress KvmClockPublicPage();

@@ -33,9 +33,14 @@ static PhysicalAddress g_clockPage;
 static inline void Cpuid(uint32_t leaf, uint32_t sub,
                          uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d)
 {
+#ifdef BROOK_HOST_TEST
+    extern void KvmClockTestCpuid(uint32_t, uint32_t, uint32_t&, uint32_t&, uint32_t&, uint32_t&);
+    KvmClockTestCpuid(leaf, sub, a, b, c, d);
+#else
     __asm__ volatile("cpuid"
                      : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
                      : "a"(leaf), "c"(sub));
+#endif
 }
 
 static uint32_t ClockCpuIndex() {
@@ -86,7 +91,7 @@ uint64_t KvmClockRegisteredCpuMask() {
     return mask;
 }
 
-static bool DetectKvm(uint32_t& features)
+static bool DetectKvm(uint32_t& features, uint32_t* hints = nullptr)
 {
     uint32_t a, b, c, d;
     Cpuid(KVM_CPUID_BASE, 0, a, b, c, d);
@@ -94,6 +99,7 @@ static bool DetectKvm(uint32_t& features)
     if (b != 0x4b4d564bu || c != 0x564b4d56u || d != 0x0000004du) return false;
     uint32_t fb, fc, fd;
     Cpuid(KVM_CPUID_BASE + 1, 0, features, fb, fc, fd);
+    if (hints) *hints = fd;
     return true;
 }
 
@@ -219,6 +225,7 @@ struct alignas(64) KvmStealRecord {
     uint32_t pad[11];
 };
 static_assert(sizeof(KvmStealRecord) == 64, "KVM steal ABI");
+static_assert(__builtin_offsetof(KvmStealRecord, preempted) == 16, "KVM preemption hint ABI");
 static constexpr uint32_t KvmStealCpus = 64;
 static_assert(KvmStealCpus * sizeof(KvmStealRecord) == 4096, "steal record page capacity");
 static volatile KvmStealRecord* g_stealRecords = nullptr;
@@ -250,6 +257,26 @@ bool KvmStealInit(uint32_t cpu)
 bool KvmStealAvailable(uint32_t cpu)
 {
     return cpu < KvmStealCpus && __atomic_load_n(&g_stealEnabled[cpu], __ATOMIC_ACQUIRE);
+}
+
+void KvmVirtualizationRead(uint32_t cpus, KvmVirtualizationStatus* output)
+{
+    if (!output) return;
+    *output = {};
+    output->cpus = cpus < KvmStealCpus ? cpus : KvmStealCpus;
+    output->present = DetectKvm(output->features, &output->hints);
+    if (!output->present) return;
+    for (uint32_t cpu = 0; cpu < output->cpus; ++cpu) {
+        // Acquire pairs with registration publication. Records stay pinned;
+        // the host can update this byte at any time, outside versioned steal
+        // reads. Never clear it or participate in the PV TLB flush protocol.
+        if (!KvmStealAvailable(cpu) || !g_stealRecords) continue;
+        const uint64_t mask = uint64_t(1) << cpu;
+        output->registeredStealMask |= mask;
+        const uint8_t hint = __atomic_load_n(&g_stealRecords[cpu].preempted, __ATOMIC_ACQUIRE);
+        if (hint & 1u) output->preemptedHintMask |= mask; // KVM_VCPU_PREEMPTED
+        if (hint & ~1u) output->otherHintMask |= mask;
+    }
 }
 
 bool KvmStealReadNs(uint32_t cpu, uint64_t* result)

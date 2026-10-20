@@ -1261,3 +1261,50 @@ holder-descheduling question. `profile-irq-boundary-analysis.json` retains raw
 profile hashes, per-CPU counts, exact STI/shadow/resume instruction receipts
 and the scope limitation; `profile-irq-boundary-sources` preserves the checker.
 No VM restart, kernel instrumentation or scheduler behavior change was needed.
+
+## Read-only KVM capability and preemption-hint query
+
+`sched kvm status` now reports raw KVM CPUID feature/hint words, separate
+advertised steal-time/PV-unhalt/PV-yield booleans, the mask of registered steal
+records, and independently sampled per-vCPU preemption hints. It also reports
+that Brook implements neither PV lock waiting nor PV scheduler yield. This is
+an on-demand debug-worker query: it acquires no scheduler lock, charges no
+runtime ledger, issues no hypercall/MSR write, allocates no storage and never
+clears the host-owned hint byte. It is not a new panic-safe query guarantee.
+
+Only bit zero of the shared byte contributes to `preempted_hint_cpu_mask`;
+other bits are reported separately and do not imply preemption. The byte's ABI
+offset is asserted. Unlike cumulative steal time, this byte is read without a
+versioned time snapshot, matching its independent hint semantics. Querying all
+CPUs is not simultaneous. A zero bit is not proof a vCPU is running: reporting
+can be unsupported or incomplete. These masks are evidence for a later lock
+diagnostic, not authorization to skip tickets, halt, or alter fairness.
+
+The hosted test drives the actual query with deterministic CPUID and registered
+records. It checks feature/hint preservation, absence of KVM, missing records,
+unregistered CPUs, zero CPU count, a clamped 64-CPU limit including CPU 63,
+independence from an odd steal-time version, exclusion of other byte bits from
+the preemption mask, no writes to those bytes, and a null output. This verifies
+the diagnostic's handling, not what the current VM advertises; that requires a
+new-kernel guest capture. The prepared live-review image remains unchanged and
+does not include this command.
+
+The final diagnostic kernel builds in both symbol-table passes; all thirteen
+module imports resolve. All 68 hosted suites and the compiled entry audit pass
+(twelve supported templates, 56 mutation rejections, four unsupported templates
+still outside scope). Native feature availability remains unmeasured for this
+kernel; build success does not establish PV-unhalt or PV-yield support.
+
+One full-suite repeat exposed an existing schedule-dependent wake-scan test
+assertion. With failure-only counters added, a one-host-CPU replay reproduces
+`consistent=1 active=0 completed=10000 bsp=10001 ap=0 invalid=0`: every stress
+claim won by the BSP, while all APs exhausted their bounded failed attempts.
+The nonblocking primitive does not promise an AP winner within such a loop.
+The corrected test gives each real worker a controlled completion before
+releasing all workers into the original 10,000-attempt contention phase. It
+retains overlap, stale/reentrant ownership, non-revocation, accounting and clock
+checks, requires all eight workers to complete, and reports counters on failure.
+This covers AP execution deterministically; it is not a fairness or starvation
+guarantee. The corrected test passes 100 single-host-CPU and 100 normal repeats,
+then the full suite passes. The original failed suite log, diagnostic failure
+receipt and repeat results remain preserved alongside the new kernel evidence.

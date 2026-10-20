@@ -3726,6 +3726,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sched policy status|rr|mlfq|eevdf - inspect or select a registered policy\n"
             "  sched wakes status|bsp|shared|reset - optional wake-scan handoff (default bsp)\n"
             "  sched runtime status - running intervals, steal availability and read errors\n"
+            "  sched kvm status - advertised PV features and independent preemption hints\n"
             "  mem exec-cache  - executable page sharing counters\n"
             "  mem census      - rolling per-address-space mapping/RAM attribution\n"
             "  mem pids        - per-PID PMM page counts (to serial)\n"
@@ -4230,6 +4231,22 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("attempts",c.attempts);r.text(",");r.field("successes",c.successes);r.text(",");r.field("deferred",c.deferred);
             r.text(",");r.field("potential_watch_ticks_skipped",c.deferred);r.text(",");r.field("if_errors",c.ifErrors);r.text(",");r.field("stale_ticket_waits",c.staleTicketWaits);r.text("}");r.send();
         }DebugChannelSend("]}\n");
+    }
+    else if (NetStrEq(cmd, "sched kvm status")) {
+        KvmVirtualizationStatus status{}; KvmVirtualizationRead(SmpGetCpuCount(), &status);
+        BridgeReply reply; reply.text("{\"kvm_present\":"); reply.text(status.present?"true":"false");
+        reply.text(","); reply.field("feature_bits", status.features);
+        reply.text(","); reply.field("hint_bits", status.hints);
+        reply.text(",\"steal_time_advertised\":"); reply.text((status.features&(1u<<5))?"true":"false");
+        reply.text(",\"pv_unhalt_advertised\":"); reply.text((status.features&(1u<<7))?"true":"false");
+        reply.text(",\"pv_sched_yield_advertised\":"); reply.text((status.features&(1u<<13))?"true":"false");
+        reply.text(","); reply.field("cpus", status.cpus);
+        reply.text(","); reply.field("registered_steal_cpu_mask", status.registeredStealMask);
+        reply.text(","); reply.field("preempted_hint_cpu_mask", status.preemptedHintMask);
+        reply.text(","); reply.field("other_preempted_byte_bits_cpu_mask", status.otherHintMask);
+        reply.text(",\"pv_lock_wait_implemented\":false,\"pv_sched_yield_implemented\":false,");
+        reply.text("\"scope\":\"CPUID and per-vCPU hint bytes sampled independently, not a coherent running-state snapshot; zero does not prove running or host support; hints are not used for scheduling\"}\n");
+        reply.send();
     }
     else if (NetStrEq(cmd, "sched runtime status")) {
         RuntimeStatus status{}; SchedulerRuntimeStatus(&status);

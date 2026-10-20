@@ -16,6 +16,8 @@ uint32_t currentCpu=0,registeredCpu=0;
 uint64_t registeredAddress=0;
 bool rdtscpSupported=true,registeredAux=false;
 unsigned registrations=0;
+bool testKvmPresent=true;
+uint32_t testKvmFeatures=0, testKvmHints=0, testCpuidCalls=0;
 uint64_t sampledTsc=1600;
 unsigned samples=0;
 void (*duringSample)()=nullptr;
@@ -36,6 +38,13 @@ void initialize() {
 }
 }
 namespace brook {
+void KvmClockTestCpuid(uint32_t leaf,uint32_t sub,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d) {
+    ++testCpuidCalls;a=b=c=d=0;
+    CHECK(sub==0);
+    if (leaf==0x40000000 && testKvmPresent) {
+        a=0x40000001;b=0x4b4d564b;c=0x564b4d56;d=0x4d;
+    } else if (leaf==0x40000001) {a=testKvmFeatures;d=testKvmHints;}
+}
 uint32_t KvmClockTestCpu() {return currentCpu;}
 bool KvmClockTestRdtscpSupported() {return rdtscpSupported;}
 void KvmClockTestRegister(uint32_t cpu,uint64_t address,bool aux) {
@@ -65,8 +74,38 @@ int main() {
     using namespace brook;
     // Real bounded steal-reader code: unsupported CPUs, odd versions and
     // reserved flags must not publish a partial/invalid value.
-    KvmStealRecord stealPages[2]{};
+    KvmStealRecord stealPages[64]{};
     g_stealRecords=stealPages;g_stealEnabled[0]=true;g_stealEnabled[1]=true;
+    // Query advertised features separately from registered record hints. A
+    // preemption hint is not versioned steal time and must not be cleared.
+    testKvmFeatures=(1u<<5)|(1u<<7)|(1u<<13);testKvmHints=1;
+    stealPages[0].preempted=1;stealPages[1].preempted=2;stealPages[1].version=3;
+    KvmVirtualizationStatus virtualization{};
+    KvmVirtualizationRead(2,&virtualization);
+    CHECK(virtualization.present && virtualization.features==testKvmFeatures && virtualization.hints==1);
+    CHECK(virtualization.cpus==2 && virtualization.registeredStealMask==3);
+    CHECK(virtualization.preemptedHintMask==1 && virtualization.otherHintMask==2);
+    CHECK(stealPages[0].preempted==1 && stealPages[1].preempted==2 && stealPages[1].version==3);
+    stealPages[1].preempted=0xff;g_stealEnabled[63]=true;stealPages[63].preempted=1;
+    KvmVirtualizationRead(UINT32_MAX,&virtualization);
+    CHECK(virtualization.cpus==64 && virtualization.registeredStealMask==(uint64_t(1)<<63|3));
+    CHECK(virtualization.preemptedHintMask==(uint64_t(1)<<63|3) && virtualization.otherHintMask==2);
+    g_stealEnabled[63]=false;g_stealEnabled[1]=false;
+    KvmVirtualizationRead(2,&virtualization);
+    CHECK(virtualization.registeredStealMask==1 && virtualization.preemptedHintMask==1 && !virtualization.otherHintMask);
+    testKvmFeatures=0x80000000;testKvmHints=0x80000001;
+    KvmVirtualizationRead(2,&virtualization);
+    CHECK(virtualization.features==0x80000000 && virtualization.hints==0x80000001);
+    CHECK(virtualization.registeredStealMask==1); // Advertised bits do not invent/erase registration.
+    g_stealRecords=nullptr;KvmVirtualizationRead(2,&virtualization);
+    CHECK(!virtualization.registeredStealMask && !virtualization.preemptedHintMask);
+    g_stealRecords=stealPages;testKvmFeatures=0;testKvmHints=0;
+    KvmVirtualizationRead(0,&virtualization);
+    CHECK(virtualization.present && !virtualization.features && !virtualization.cpus && !virtualization.registeredStealMask);
+    testKvmPresent=false;KvmVirtualizationRead(2,&virtualization);
+    CHECK(!virtualization.present && !virtualization.features && !virtualization.hints && !virtualization.registeredStealMask);
+    const auto calls=testCpuidCalls;KvmVirtualizationRead(64,nullptr);CHECK(testCpuidCalls==calls);
+    testKvmPresent=true;g_stealEnabled[1]=true;stealPages[1]={};
     uint64_t stolen=777;
     CHECK(KvmStealReadNs(0,&stolen) && stolen==0);
     stealPages[1].version=2;stealPages[1].steal=123456789;
