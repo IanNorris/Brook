@@ -352,12 +352,15 @@ fi
 
 # Diagnostic comparison: QEMU's timer-paced codec adjusts DMA progress based on
 # backend occupancy. Keep its normal default until both modes are validated.
-HDA_USE_TIMER="${BROOK_HDA_USE_TIMER:-on}"
+# Timer-paced HDA can discard full codec buffers while advancing guest DMA.
+# Callback pacing with a small host buffer preserves source progression in the
+# matched native/browser controls. Keep explicit overrides for diagnostics.
+HDA_USE_TIMER="${BROOK_HDA_USE_TIMER:-off}"
 case "${HDA_USE_TIMER}" in
     on|off) ;;
     *) echo "BROOK_HDA_USE_TIMER must be on or off" >&2; exit 2 ;;
 esac
-AUDIO_BUFFER_US="${BROOK_AUDIO_BUFFER_US:-200000}"
+AUDIO_BUFFER_US="${BROOK_AUDIO_BUFFER_US:-20000}"
 if ! [[ "$AUDIO_BUFFER_US" =~ ^[0-9]{4,7}$ ]] || (( 10#$AUDIO_BUFFER_US < 1000 || 10#$AUDIO_BUFFER_US > 1000000 )); then
     echo "BROOK_AUDIO_BUFFER_US must be 1000..1000000 microseconds" >&2; exit 2
 fi

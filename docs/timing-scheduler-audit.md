@@ -7,15 +7,19 @@ the Quake II timing smoke run, and seven backward nanosecond samples. The subseq
 pause/resume and records the replacement clock layout and native checks. [EEVDF experiments](eevdf-experiment.md) records the optional policy,
 Linux reference comparison, corrected silent-audio routes and GPU-wait trials.
 
-The latest [Linux buffer controls](linux-audio-buffer-control.md) reproduce
+The [Linux buffer controls](linux-audio-buffer-control.md) reproduce
 the SDL slowdown on Linux and improve both guests with a smaller requested
-buffer; defaults remain unchanged. The earlier [backend pacing controls](audio-backend-pacing.md) retain a recovered
+buffer; those experiments left defaults unchanged. The earlier [backend pacing controls](audio-backend-pacing.md) retain a recovered
 SDL acceleration lead and a separate SDL callback half-rate discrepancy.
 
 The [native packet-coded controls](audio-packet-code-controls.md) reproduce
 roughly 10–12% accelerated source progression without a fitted pitch increase
-in timer mode, while callback captures progress near 1×. The historical larger
-application factor and precise mechanism remain open.
+in timer mode, while callback captures progress near 1×. The subsequent
+[timestamped HDA traces](hda-timer-discard-control.md) strongly identify codec
+buffer discards as the source of that native control's acceleration. The
+launcher now defaults to callback HDA with a 20-ms requested host buffer; RR
+remains the scheduler default. The historical larger application factor and
+intermittent native discontinuity remain open.
 
 This is an active investigation. The baseline is main `7d005ae0`, kernel SHA-256
 `f932600c7ef0ac9606057f8e976e47b3f397695aae69383dc965a6d342e2f1b3`.

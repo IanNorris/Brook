@@ -2,7 +2,9 @@
 
 The historical recording [matches roughly 1.3× tempo](playback-recording-rate.md),
 but current audio results depend strongly on backend and HDA mode. Keep these
-cohorts separate. Neither the default scheduler nor default HDA mode changes.
+cohorts separate. These initial cohorts changed neither default. The later
+[timestamped discard controls](hda-timer-discard-control.md) change launcher
+audio defaults to callback/20 ms; the scheduler remains RR.
 
 All tests here use kernel
 `a9627f6fb5fcb7fd1f976f5c03138a03c68396f6c8ede195bef8ad4ec372d7a1`,
