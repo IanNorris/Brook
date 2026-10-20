@@ -491,6 +491,31 @@ TEST(full_capacity_recycle) {
     ASSERT(ops->ReadyCount(state)==0);
 }
 
+TEST(reinitialize_queued_pid_preserves_neighbours) {
+    // Re-registration must retire the old queue membership before resetting
+    // links, including when the replacement has a different priority.
+    for (uint16_t replaced = 1; replaced <= 3; ++replaced) {
+        for (uint8_t priority = 0; priority < 4; ++priority) {
+            ops->Init(state);
+            for (uint16_t pid = 1; pid <= 3; ++pid) {
+                ops->InitProcess(state, pid, 2);
+                ops->Enqueue(state, pid);
+            }
+            ops->InitProcess(state, replaced, priority);
+            ASSERT(ops->ReadyCount(state) == 2);
+            for (uint16_t pid = 1; pid <= 3; ++pid)
+                if (pid != replaced) ASSERT(ops->PickNext(state) == pid);
+            ASSERT(ops->PickNext(state) == NONE);
+            ops->Enqueue(state, replaced);
+            ops->Enqueue(state, replaced);
+            ASSERT(ops->ReadyCount(state) == 1);
+            ASSERT(ops->PickNext(state) == replaced);
+            ASSERT(ops->ReadyCount(state) == 0);
+            ASSERT(ops->PickNext(state) == NONE);
+        }
+    }
+}
+
 TEST(mlfq_model_interleaved_cpus) {
     constexpr unsigned N=96,CPUS=8;
     std::array<std::deque<uint16_t>,4> ready;
@@ -704,6 +729,7 @@ static void RunCommonTests(const SchedOps* ops, void* state) {
     invoke_idle_repeated_block_unblock_cycle(ops, state);
     invoke_idle_simulation(ops, state);
     invoke_full_capacity_recycle(ops,state);
+    invoke_reinitialize_queued_pid_preserves_neighbours(ops,state);
 }
 
 static void RunMlfqTests(const SchedOps* ops, void* state) {

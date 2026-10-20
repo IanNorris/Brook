@@ -113,6 +113,10 @@ static void MlfqInitProcess(void* state, uint16_t pid, uint8_t priority) {
     auto* s = static_cast<MlfqState*>(state);
     if (pid >= SCHED_MAX_PIDS) return;
     if (priority >= MLFQ_NUM_PRIORITIES) priority = MLFQ_PRIORITY_NORMAL;
+    // A reused PID may still be linked under its old priority. Unlink before
+    // overwriting either the priority or neighbour pointers, as RR does.
+    if (s->procs[pid].queued)
+        QueueRemove(s, &s->queues[s->procs[pid].priority], pid);
     s->procs[pid].active       = true;
     s->procs[pid].queued       = false;
     s->procs[pid].priority     = priority;
