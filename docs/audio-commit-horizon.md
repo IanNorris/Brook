@@ -634,5 +634,78 @@ the hardware target. Query duration/gap aggregates and admission details are
 retained in `large-control/latency-and-admission.json` under review
 `unattended-refill-production-fixed-mlfq-a-20261021`.
 
-A fresh real Firefox/Quake/load cohort remains required. No default is
-promoted, and the earlier real-cohort accounting clamps remain failed evidence.
+A fresh real Firefox/Quake/load cohort was then run as described below. No
+default is promoted, and earlier accounting clamps remain failed evidence.
+
+### Real Firefox geometry regression and matched control
+
+The prospective planner fails real-application acceptance despite passing the
+finite-source controls. Review `unattended-refill-mixed-fixed-mlfq-a-20261021`
+uses the frozen kernel above, eight vCPUs, 8 GiB, the physical PipeWire route
+with a 20-ms host buffer, HDA callback mode and the unchanged 12-KiB HDA lead.
+Firefox negotiates physical capacity/fragment 6,016/128. Its first solo window
+delivers about 0.685 nominal source completion, then stops at 643,374 frames
+and media position 14.588979 seconds. All seven later windows have no Firefox
+completion or video callbacks. Its stream is enabled, completely drained and
+has no discontinuity. Quake continues near nominal. Full media transfer and
+browser looping both fail. All nine original guest jobs, current runtime,
+native HDA fault guards, heap/policy, owner exit and four filesystem checks
+pass; these do not waive the failed application gate.
+
+A matched control, `unattended-refill-original-fixed-mlfq-a-20261021`, keeps the
+same kernel/modules/apps and host configuration. It configures Firefox while
+the opt-in mode is off, verifies the original physical 4,416/64 geometry, then
+enables the guarded horizon before the first capture. Quake still configures
+with the mode on and obtains 8,192/2,048. The original Firefox endpoint remains
+unchanged across the eight phases:
+
+| Phase | Firefox completion / nominal | Quake completion / nominal |
+| --- | ---: | ---: |
+| Firefox alone, horizon on | 1.000 | — |
+| Both, on | 0.904 | 1.000 |
+| Both, off | 0.458 | 0.775 |
+| Both, on again | 0.922 | 0.999 |
+| Eight-worker load, Quake focused | 0.914 | 0.999 |
+| Eight-worker load, Firefox focused | 0.935 | 1.002 |
+| Firefox after closing Quake, off | 0.998 | — |
+| Quake reopened, off | 0.458 | 0.780 |
+
+All nine original jobs, full transfers, error-free browser loop, native audio,
+heap/policy, owner exit and four filesystems pass in this control. Runtime
+acceptance fails one 17.159-μs clamp with one owner transition and later
+catch-up; final debt is zero. Neither the completion deficits nor that clamp
+are waived. The comparison implicates the changed physical geometry in the
+stall; it does not identify a specific bridge or browser defect.
+
+The ALSA plugin retains a separate roughly 4,410-frame logical ring. Enlarging
+physical OSS capacity does not by itself increase the producer's usable ALSA
+backlog. With 6,016 physical frames, physical free space can exceed the native
+128-frame writable threshold even when the logical ring is full. This is a
+readiness compatibility lead. Permanent readiness alone does not explain why
+production remains stopped after the queue drains.
+
+The new `tools/alsa-oss-pkg/test_playback{,_plugin}.c` fixture exercises the
+unchanged production plugin through real libasound conversion and sustained
+`writei`/availability/delay/start/drain calls. Sixteen cases compare both
+physical geometries with 22.05/44.1/48/96-kHz integer/float clients, delayed
+completion, oversized/whole-buffer writes and partial returns. Accepted native
+frames drain exactly with no logical-ring overflow. Both normal and optional
+low-water package builds pass the fixture, existing callback checks and thirty
+negotiation cases. This weakens the proposed logical-overfill mechanism;
+it does not model a poll-driven browser backend or establish audible continuity.
+The optional low-water patch retains its known partial-rate readiness failure
+and remains disabled.
+
+A Firefox-only enlarged-geometry repeat, review
+`unattended-refill-mixed-fixed-mlfq-b-20261021`, stalls at 538,448 frames and
+media position 12.209705 seconds. Its post-stall two-second profile has 1,362
+samples, of which 1,058 belong to idle, and 16,818 dropped events. It does not
+prove an ongoing hot loop or reconstruct the initiating failure. The diagnostic
+controller attempted export during an asynchronous profiler-start race; the
+same capture was recovered after it became idle. An oversized process report
+also lost output; its original job nevertheless exited zero with an empty
+group, and the failure is retained. A separate bounded log read completed.
+Firefox closed through its original job, shutdown and four filesystem checks
+passed. This diagnostic is not a full acceptance cohort. The next discriminator
+is the actual backend's polling/error transition, with origin/pointer guards
+preserved and no scheduler default change.

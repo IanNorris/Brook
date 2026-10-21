@@ -37,9 +37,32 @@ Later evidence supersedes several early leads:
   Runtime acceptance fails two clamps (12.796-us maximum deficit, later caught
   up), so full mixed acceptance is not claimed. Actual Firefox 4,416/64 and
   Quake 8,192/2,048 capacity/fragment tuples stay invariant across reversal;
-  asymmetric hosted coverage is the next discriminator for remaining underfeed.
+  asymmetric hosted coverage was the next discriminator for remaining underfeed.
   Rebuilt production ASan/UBSan audio/geometry suites pass with documented
   global-redzone/leak-detector exclusions. No default is changed.
+
+  Subsequent asymmetric/native finite controls reproduce small-buffer loss
+  even with fresh completion and pregenerated sources. Explicit modeled refill
+  delays support a prospective forty-ms allowance; native original→20-ms→40-ms
+  →original geometry gives decoded source rates 0.956/0.982/1.000/0.968 with
+  fixed writes and queries. The opt-in planner now shares a time-based reserve
+  helper with diagnostics and negotiates actual size/count under the requested
+  maximum. All 1,158 hosted cases, 75 suites, bounded sanitizers and fresh native
+  ABI/large-write lifecycle checks pass, including oversized partial returns.
+  Large-write capture reservations retain a failed uninterrupted-playback gate.
+  The subsequent real mixed cohort fails: Firefox's enlarged physical
+  6,016/128-frame ring drains at 14.589 seconds and receives no more source
+  frames; full media transfer and browser looping fail. A matched same-kernel
+  control configuring Firefox with its original 4,416/64 geometry completes
+  the transfer and loop, but still fails runtime acceptance with one clamp.
+  Both arms retain full lifecycle checks; neither is full acceptance. A new
+  real-libasound sustained-playback fixture passes both physical geometries
+  without logical-ring overflow, so that proposed bridge failure is not
+  established. A Firefox-only enlarged-buffer repeat also stalls; its lossy
+  post-stall profile is mostly idle. The backend's readiness/error transition
+  remains the next discriminator. Software backlog and source-credit latency bounds remain
+  explicit. Earlier runtime failures and the historical fast-playback cause
+  remain open; no default is promoted.
 
 - [Shared IRQ registration](shared-irq-routing.md) has confirmed vector-collision,
   duplicate-dispatch and empty-line reactivation defects. Actual-body host tests

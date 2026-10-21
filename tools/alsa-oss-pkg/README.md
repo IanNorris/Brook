@@ -31,11 +31,24 @@ It also opens the production plugin against a synthetic `/dev/null` endpoint
 through real ALSA `plug` negotiation: 8, 22.05, 44.1, 48 and 96 kHz, integer and
 float samples, and 50/100/200-ms requested latencies (30 cases).
 
+The sustained-playback fixture additionally runs the unchanged production
+callbacks through real libasound `plug` conversion, `writei`, availability,
+delay, automatic start and drain. Sixteen cases cover 22.05/44.1/48/96-kHz
+integer/float clients, whole-buffer and oversized writes, partial admissions,
+and delayed completion. It compares the original physical 4416/64-frame
+geometry with the experimental 6016/128 geometry while retaining ALSA's
+separate logical ring. Accepted native frames must drain exactly and the
+logical queue must never overflow. Both geometries pass this fixture; a larger
+physical ring alone has not reproduced Firefox's native stall. Descriptor
+readiness, scheduling, audible continuity and Firefox are separate gates:
+this fixture opens only `/dev/null` and advances completion explicitly.
+
 Logical periods and buffers can have arbitrary frame geometry. Requiring both
 power-of-two periods and an integer count of periods rejected rate conversion,
-including Firefox's 48-kHz YouTube audio. Physical OSS fragments remain 256
-bytes, with enough whole fragments to cover the software ring. The unused
-physical capacity is less than 64 stereo frames; transfer/pointer accounting
+including Firefox's 48-kHz YouTube audio. By default physical OSS fragments are
+256 bytes, with enough whole fragments to cover the software ring. The unused
+physical capacity is then less than 64 stereo frames. The opt-in kernel refill
+experiment can enlarge the physical geometry; transfer/pointer accounting
 continues to use accepted application frames and actual per-stream delay.
 Hardware capacity never substitutes for the logical ring size. The kernel's
 16,384-frame capacity limit is preserved. The old plugin failed 20/30 host

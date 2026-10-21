@@ -19,6 +19,9 @@ pkgs.alsa-plugins.overrideAttrs (old: {
     $CC -DPIC -fPIC -shared -I. -Ioss ${./test_rate_plugin.c} $(pkg-config --cflags --libs alsa) -o test-oss-rate.so
     $CC ${./test_rate_negotiation.c} $(pkg-config --cflags --libs alsa) -o test-oss-rate-negotiation
     ./test-oss-rate-negotiation "$PWD/test-oss-rate.so"
+    $CC -DPIC -fPIC -shared -I. -Ioss ${./test_playback_plugin.c} $(pkg-config --cflags --libs alsa) -o test-oss-playback.so
+    $CC ${./test_playback.c} $(pkg-config --cflags --libs alsa) -ldl -o test-oss-playback
+    ./test-oss-playback "$PWD/test-oss-playback.so"
     ${pkgs.lib.optionalString lowWaterReadiness ''
     $CC -DPIC -fPIC -shared -I. -Ioss ${./test_readiness_plugin.c} $(pkg-config --cflags --libs alsa) -o test-oss-readiness.so
     $CC ${./test_readiness.c} $(pkg-config --cflags --libs alsa) -ldl -o test-oss-readiness
