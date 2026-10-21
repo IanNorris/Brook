@@ -125,6 +125,23 @@ class FrameEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'attribution'):
             analyze(data)
 
+    def test_pending_preparation_is_a_subset_not_extra_frame_time(self):
+        data = fixture()
+        for row in data['frames']['frames']:
+            build = PHASES.index('command_build')
+            other = PHASES.index('other')
+            row['phase_ns'][other] -= 10
+            row['phase_ns'][build] += 10
+            row['command_preparation_ns'] = 10
+            row['command_ns_by_parent'] = [0]*len(PHASES)
+            row['commands_by_parent'] = [0]*len(PHASES)
+            row['command_ns_by_parent'][0] = 800_010
+            row['commands_by_parent'][0] = 3
+        self.assertEqual(analyze(data)['body']['sum_ns'], 2_000_000)
+        data['frames']['frames'][0]['command_preparation_ns'] = 11
+        with self.assertRaisesRegex(ValueError, 'preparation overlap'):
+            analyze(data)
+
     def test_unfenced_rows_do_not_invent_gpu_fence_latency(self):
         data = fixture()
         for row in data['frames']['frames']:

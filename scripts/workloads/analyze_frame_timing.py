@@ -96,7 +96,11 @@ def analyze(bundle):
             require(sum(counts) == row['commands'], 'Command attribution count mismatch')
             nested = sum(row['phase_ns'][PHASES.index(k)] for k in
                          ('queue_setup', 'fence_wait', 'ack_wait'))
-            require(sum(durations) == nested, 'Command attribution elapsed mismatch')
+            overlap = row.get('command_preparation_ns', 0)
+            require(isinstance(overlap, int) and
+                    0 <= overlap <= row['phase_ns'][PHASES.index('command_build')],
+                    'Invalid command preparation overlap')
+            require(sum(durations) == nested + overlap, 'Command attribution elapsed mismatch')
             for name, ns, count in zip(PHASES, durations, counts):
                 command_values[name].append(ns)
                 command_counts[name] += count
@@ -119,6 +123,8 @@ def analyze(bundle):
                              fenced_commands=row['fenced_commands'], first_fence=row['first_fence'],
                              last_fence=row['last_fence'], sleep_deadline_ticks=row['sleep_deadline_ticks'],
                              sleep_deadline_kvm_ns=deadline)
+        if 'command_preparation_ns' in row:
+            detail['command_preparation_ns'] = row['command_preparation_ns']
         if attribution:
             detail.update({f'command_ns_{name}': ns for name, ns in zip(PHASES, durations)})
             detail.update({f'commands_{name}': count for name, count in zip(PHASES, counts)})
@@ -135,6 +141,7 @@ def analyze(bundle):
                 early_resumes=sum(v < 0 for v in deadline_lateness),
                 stages={name: dict(distribution(values), share_of_body=sum(values)/total)
                         for name, values in phase_values.items()}, rows=detailed,
+                pending_command_preparation=distribution([r.get('command_preparation_ns', 0) for r in rows]),
                 command_attribution_available=attribution,
                 per_frame_control_call_elapsed_by_parent={
                     name: dict(distribution(values), commands=command_counts[name])
@@ -144,7 +151,9 @@ def analyze(bundle):
                       'Sleep/wake gaps are separate, early dirty/input wakes are permitted. '
                       'Request bytes exclude transferred pixel/backing bytes. '
                       'Tick deadlines mapped with validated APIC/KVM origins; queue_setup includes response validation. '
-                      'Control-call attribution is an alternative inclusive view of queue_setup+waits, not extra frame time. '
+                      'Control-call attribution includes queue_setup+waits+command_preparation_ns, not extra frame time. '
+                      'command_preparation_ns is the subset of command_build while a request is logically outstanding; '
+                      'it does not prove concurrent GPU execution. '
                       'No app FPS, physical scanout, GPU execution or scheduler latency attribution. '
                       'Do not sum distribution percentiles into a synthetic frame.')
 

@@ -4329,6 +4329,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             f.text(",");f.field("commands",row.commands);f.text(",");f.field("command_bytes",row.commandBytes);
             f.text(",");f.field("fenced_commands",row.fencedCommands);
             f.text(",");f.field("first_fence",row.firstFence);f.text(",");f.field("last_fence",row.lastFence);
+            f.text(",");f.field("command_preparation_ns",row.commandPreparationNs);
             f.text(",\"phase_ns\":[");f.send();
             for(unsigned k=0;k<FramePhaseCount;++k){BridgeReply v;if(k)v.text(",");v.number(row.phases[k]);v.send();}
             DebugChannelSend("],\"command_ns_by_parent\":[");

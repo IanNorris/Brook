@@ -24,6 +24,7 @@ struct FrameTimingRow {
     uint64_t phases[FramePhaseCount]{};
     uint64_t commands=0, commandBytes=0, fencedCommands=0;
     uint64_t firstFence=0,lastFence=0;
+    uint64_t commandPreparationNs=0; // subset of exclusive CommandBuild time
     uint64_t commandNsByParent[FramePhaseCount]{}, commandsByParent[FramePhaseCount]{};
 };
 struct FrameTimingStatus {
@@ -46,7 +47,11 @@ template<unsigned Capacity=256> class FrameTimingModel {
     FramePhase phase_=FramePhase::Other;
     bool Charge(uint64_t now) {
         if(now<last_){Invalidate();return false;}
-        current_.phases[unsigned(phase_)]+=now-last_;last_=now;return true;
+        const auto elapsed=now-last_;
+        current_.phases[unsigned(phase_)]+=elapsed;
+        if(commandScope_ && phase_==FramePhase::CommandBuild)
+            current_.commandPreparationNs+=elapsed;
+        last_=now;return true;
     }
 public:
     bool Active(uintptr_t owner) const { return s_.enabled && owner_ && owner_==owner; }

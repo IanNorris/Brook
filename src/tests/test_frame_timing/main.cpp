@@ -29,6 +29,25 @@ int main() {
           row.phases[unsigned(FramePhase::QueueSetup)]+row.phases[unsigned(FramePhase::FenceWait)]);
     CHECK(!row.previousEndNs && row.sleepDeadlineTicks==1116);
 
+    {
+        FrameTimingModel<1> overlap;overlap.Control(1);overlap.Begin(1,0);
+        auto outer=overlap.Enter(1,FramePhase::VertexUpload,1);
+        auto command=overlap.Enter(1,FramePhase::QueueSetup,2);
+        overlap.Command(1,64,false,0);
+        auto build=overlap.Enter(1,FramePhase::CommandBuild,3);
+        overlap.Leave(1,build,13);
+        auto wait=overlap.Enter(1,FramePhase::AckWait,14);
+        overlap.Leave(1,wait,18);overlap.Leave(1,command,19);
+        overlap.Leave(1,outer,20);overlap.End(1,21,30);overlap.Control(0);
+        FrameTimingRow result;CHECK(overlap.Read(overlap.Status().epoch,0,&result));
+        CHECK(result.commandPreparationNs==10);
+        CHECK(result.phases[unsigned(FramePhase::CommandBuild)]==10);
+        CHECK(result.commandNsByParent[unsigned(FramePhase::VertexUpload)]==17);
+        CHECK(result.commandNsByParent[unsigned(FramePhase::VertexUpload)]==
+            result.phases[unsigned(FramePhase::QueueSetup)]+
+            result.phases[unsigned(FramePhase::AckWait)]+result.commandPreparationNs);
+    }
+
     CHECK(m.Control(1));CHECK(m.Status().epoch==epoch+1 && !m.Status().count);
     m.Begin(1,2000);m.End(2,2050,2060);CHECK(m.Active(1));m.End(1,2100,2116);
     m.Begin(1,3000);m.End(1,3100,3116);

@@ -6,6 +6,7 @@
 #include <functional>
 #include <new>
 #include "../../drivers/virtio_gpu/control_storage.h"
+#include "../../drivers/virtio_gpu/preparation_sequence.h"
 #include "../../drivers/virtio_gpu/retirement_protocol.h"
 using namespace brook;
 namespace {
@@ -26,8 +27,8 @@ unsigned notifications,warnings,clocks,failures,completeAtClock;
 uint64_t now;
 bool runtime=true,clockAvailable=true,completeOnNotify;
 std::function<void()> notifyHook;
-enum class FramePhase {QueueSetup,FenceWait,AckWait};
-struct FrameTimingScope {explicit FrameTimingScope(FramePhase){}};
+enum class FramePhase {QueueSetup,FenceWait,AckWait,VertexUpload,CommandBuild,DisplayFlush};
+struct FrameTimingScope {explicit FrameTimingScope(FramePhase){} void Change(FramePhase){}};
 static void FrameTimingCommand(uint32_t,bool,uint64_t){}
 static void* ProcessCurrent(){return runtime?reinterpret_cast<void*>(1):nullptr;}
 static bool KvmClockReadStableNs(uint64_t*);
@@ -75,10 +76,11 @@ constexpr GpuCompletionWaitLimits limits{1000,40,4};
 static uint8_t* g_fbBacking=vertices;
 static uint32_t g_fbW=640,g_fbH=480;
 constexpr uint32_t RESOURCE_FB=1;
-static unsigned emergencyCalls;
+static unsigned emergencyCalls,frameFlushes;
+static bool frameTestActive;
 static bool SetScanout(uint32_t,uint32_t,uint32_t,uint32_t){++emergencyCalls;return true;}
 static bool TransferToHost2D(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint64_t){++emergencyCalls;return true;}
-static bool ResourceFlush(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){++emergencyCalls;return true;}
+static bool ResourceFlush(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){++emergencyCalls;if(frameTestActive){++frameFlushes;CHECK(!g_pendingCommand);}return true;}
 #include "../../drivers/virtio_gpu/panic_present.inc"
 
 static void ownership() {
@@ -167,7 +169,99 @@ static void wrapAndEmergency() {
     CHECK(!BeginCommand(g_legacyCommand,128,CMD_RESP_CAP) && g_controlQueuePoisoned);
 }
 } // namespace
+static void preparationSequence() {
+    for(unsigned mode=0;mode<5;++mode) {
+        reset();bool prepared=false,finished=false;unsigned draws=0;
+        const bool ready=GpuPrepareWhilePending(
+            [&]{return BeginCommand(g_legacyCommand,128,CMD_RESP_CAP);},
+            [&]{
+                prepared=true;CHECK(g_pendingCommand==&g_legacyCommand);
+                uint8_t request[128];std::memcpy(request,firstBytes,sizeof(request));
+                VirtqDesc descriptorsBefore[8];std::memcpy(descriptorsBefore,descriptors,sizeof(descriptors));
+                std::memset(secondBytes+24,0xa7,1000);
+                CHECK(!std::memcmp(request,firstBytes,sizeof(request)));
+                CHECK(!std::memcmp(descriptorsBefore,descriptors,sizeof(descriptors)));
+                for(auto v:vertices)CHECK(v==0x5a);
+                // Early complete, rejected packet, rejected transfer, timeout,
+                // and normal delayed completion respectively.
+                if(mode==0)complete();
+                if(mode==3)now+=limits.timeoutNs;
+                return mode!=1;
+            },
+            [&](GpuCommandToken token){
+                finished=true;
+                if(mode!=3 && mode!=0)complete();
+                if(mode==2)reinterpret_cast<VirtioGpuCtrlHdr*>(firstBytes+CMD_RESP_OFF)->type=0x1200;
+                const auto len=FinishCommand(token,limits);
+                return len>=sizeof(VirtioGpuCtrlHdr) &&
+                    reinterpret_cast<VirtioGpuCtrlHdr*>(firstBytes+CMD_RESP_OFF)->type==0x1100;
+            });
+        if(ready){++draws;CHECK(!g_pendingCommand);}
+        CHECK(prepared && finished);
+        CHECK(draws==((mode==0 || mode==4)?1u:0u));
+        CHECK((g_pendingCommand!=nullptr)==(mode==3));
+    }
+    reset();g_controlQueuePoisoned=true;
+    CHECK(!GpuPrepareWhilePending(
+        [&]{return BeginCommand(g_legacyCommand,128,CMD_RESP_CAP);},
+        [&]{CHECK(false);return true;},
+        [&](GpuCommandToken){CHECK(false);return true;}));
+}
+
+// The real frame orchestration with instrumented packet construction and
+// display primitive; actual packet construction has its own boundary suite.
+GpuCommandStorage& g_composeCommand=second;
+uint32_t g_compScanoutW=1920,g_compScanoutH=1080,g_drawQuadCount,g_blurBarrierCount;
+constexpr uint32_t COMP_CTX_ID=2,COMP_DRAW_VBUF_RES=13,COMP_SCANOUT_RES=16;
+struct DrawQuadRec {int32_t dx,dy,dx2,dy2;uint32_t u0,v0,u1,v1,opacity;};
+DrawQuadRec g_drawQuads[1];uint32_t* g_drawVtxBuf=reinterpret_cast<uint32_t*>(vertices);
+unsigned frameMode,buildCalls;
+uint32_t NdcBits(int32_t p,int32_t){return static_cast<uint32_t>(p);}
+GpuCommandToken BeginVertexTransfer(uint32_t,uint32_t,uint32_t) {
+    return BeginCommand(g_legacyCommand,128,CMD_RESP_CAP);
+}
+uint32_t BuildComposePacket(GpuCommandStorage& storage,int32_t,int32_t) {
+    ++buildCalls;CHECK(g_pendingCommand==&g_legacyCommand);
+    CHECK(storage.bytes!=g_legacyCommand.bytes);
+    auto* hdr=reinterpret_cast<VirtioGpuCtrlHdr*>(storage.bytes);*hdr={};hdr->ctx_id=2;hdr->type=0x207;
+    if(frameMode==4)now+=5000000000ull;
+    return frameMode==1?0:128;
+}
+bool CmdRespOk(const GpuCommandStorage& storage,uint32_t len) {
+    return len>=sizeof(VirtioGpuCtrlHdr) && storage.state==GpuCommandStorageState::Completed &&
+        reinterpret_cast<const VirtioGpuCtrlHdr*>(storage.bytes+CMD_RESP_OFF)->type==0x1100;
+}
+bool CmdRespOk(uint32_t len){return CmdRespOk(g_legacyCommand,len);}
+#include "../../drivers/virtio_gpu/compose_frame.inc"
+void frameFailures() {
+    for(unsigned mode=0;mode<5;++mode){
+        reset();frameMode=mode;frameTestActive=true;frameFlushes=buildCalls=0;
+        g_drawQuadCount=g_blurBarrierCount=1;
+        notifyHook=[&]{
+            if(frameMode==4)return;
+            complete();
+            if((frameMode==2 && notifications==1) || (frameMode==3 && notifications==2))
+                reinterpret_cast<VirtioGpuCtrlHdr*>(g_pendingCommand->bytes+CMD_RESP_OFF)->type=0x1200;
+        };
+        CompEndFrameDraw();
+        CHECK(buildCalls==1);CHECK(frameFlushes==(mode==0?1u:0u));
+        CHECK(notifications==((mode==0 || mode==3)?2u:1u));
+        CHECK(g_drawQuadCount==(mode==0?0u:1u));
+        if(mode==4){CHECK(g_controlQueuePoisoned && g_pendingCommand);}
+        else {
+            CHECK(!g_pendingCommand && !g_controlQueuePoisoned);
+            // Retained storage/generations remain usable after a failed build,
+            // valid transfer error or valid compose error, without device reset.
+            frameMode=0;g_drawQuadCount=g_blurBarrierCount=1;
+            const auto prior=frameFlushes;CompEndFrameDraw();CHECK(frameFlushes==prior+1);
+        }
+        frameTestActive=false;
+    }
+}
+
 int main(){
+    frameFailures();
+    preparationSequence();
     ownership();malformed();boundsAndTimeout();wrapAndEmergency();
     std::printf("GPU_CONTROL_ACTUAL_BODY %s failures=%u\n",failures?"FAIL":"PASS",failures);
     return failures?1:0;

@@ -45,3 +45,53 @@ Next, allocate disjoint persistent compose storage, construct its packet while
 the vertex transfer is outstanding, and validate that transfer before publishing
 the fenced draw. Preserve the render fence before display flush. Additional
 frames in flight require separate vertex/resource/display ownership contracts.
+
+## Independent compose storage and within-frame preparation
+
+The next implementation allocates another persistent contiguous 64 KiB request
+and response buffer during pipeline setup. Each frame constructs its compose
+packet there after publishing the vertex transfer in legacy storage. The vertex
+backing, original request, response pages and descriptor pair remain untouched
+until the transfer completion is validated. Only then is the compose packet
+published and fenced; only a successful draw completion permits display flush.
+There is still one outstanding control request and one GPU frame at a time.
+No per-frame allocation, shared command-pointer redirection or asynchronous
+scanout is introduced.
+
+Preparation failure still drains the published transfer. Valid transfer or draw
+errors suppress presentation and permit a later frame to rebuild; an ambiguous
+completion retains the queue quarantine. The actual frame-ordering body is
+shared with hosted failure tests, and the actual packet builder is shared with
+guarded boundary tests covering maximum quads, changing shader/blend/sampler
+state, maximum-strength blur barriers, command framing and rejected capacity.
+The request capacity now subtracts the submit header, and blur reservations
+conservatively cover all emitted passes. Oversized construction fails rather
+than publishing a truncated scene. Build and all 80 hosted suites pass.
+
+`command_preparation_ns` records the subset of exclusive `command_build` time
+inside a control-call scope. Thus inclusive control intervals reconcile with
+queue setup, completion waits and this preparation subset. It is not added to
+frame elapsed time, and it proves neither simultaneous device execution nor
+time saved: the transfer may already have completed before CPU construction.
+The model test and 11 analyzer tests check this accounting.
+
+The private native review is
+`build/reviews/unattended-preparation-overlap-gpu-1ms-fixed-mlfq-a-20261021`.
+Kernel SHA-256 is
+`ee2170484ef363761018dbce47604d323733480f4bf890e1c0cd7c295ff1e250`;
+GPU module SHA-256 is
+`81ab428a1b8f19d2978231343241f4b972012cc2784b26b6f00ebd36d157379b`.
+The same native configuration retains 256 exactly reconciled frames, with no
+invalid frames, clock failures or recording contention. Preparation while the
+transfer remains unconsumed has p50 0.953 µs and p95 1.279 µs. Frame body has
+p50 2.339 ms and p95 3.598 ms; start interval has p50 18.007 ms and p95
+19.021 ms. Against the preceding ownership-only run's p50 18.011 ms, this is
+no demonstrated throughput improvement. The earlier measurement correctly
+predicted a very small construction opportunity.
+
+Native GPU readback/capture self-tests, heap/runtime checks, original controller
+and VM owner exits, and all four offline filesystem checks pass. The raw
+off/on/off capture, analyzer source and verification receipt remain in that
+review. GL/Vulkan app performance, input response and full presentation
+correctness remain unverified. Fence observation and additive post-frame pacing
+remain the larger measured targets; this result does not close the goal.
