@@ -7,6 +7,10 @@ Try admission avoids the observed native audio discontinuity in its cohort,
 but the renderer still freezes for approximately twenty seconds. There is no
 scheduler, IRQ-accounting or HDA default change.
 
+The subsequent [direct OSS eight/one/eight-vCPU control](direct-oss-smp-pressure.md)
+reproduces poor progress without Quake and finds a substantial single-vCPU
+improvement, with limits on attributing that difference to one mechanism.
+
 ## Fixed conditions
 
 - Eight vCPUs, 8 GiB, QEMU 10.2.2, physical PipeWire output, callback HDA with a

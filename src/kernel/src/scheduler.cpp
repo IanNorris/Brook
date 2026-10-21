@@ -2254,7 +2254,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
             }
         }
         if(!mayDefer || (runtimeFlags&0x200)){
-            runtimeFlags=SchedLockAcquire(g_readyLock);acquired=true;
+            runtimeFlags=SchedLockAcquire(g_readyLock,"irq-accounting-blocking");acquired=true;
         }
         if(stages){stages->acquiredNs=TimerWakeTimingNow();stages->deferred=!acquired;}
         if(acquired){
@@ -2400,7 +2400,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
     // Idle — if something became ready, switch to it.
     if (cur == g_perCpu[cpu].idleProcess)
     {
-        uint64_t rlf7 = SchedLockAcquire(g_readyLock);
+        uint64_t rlf7 = SchedLockAcquire(g_readyLock,"irq-idle-dispatch");
         Process* next = PickNextLocked(cpu);
         uint32_t readyN = g_schedOps->ReadyCount(g_schedState);
         if (next)

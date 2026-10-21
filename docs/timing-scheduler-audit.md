@@ -5,6 +5,14 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Direct OSS eight/one/eight-vCPU controls](direct-oss-smp-pressure.md)
+  reproduce poor loaded audio progress without Quake rendering. One vCPU
+  improves completion to roughly 0.89 nominal per guest second; the eight-vCPU
+  reversal falls to 0.23. This supports an SMP-dependent contribution, without
+  identifying a lock. Initial timer accounting and idle dispatch acquire the
+  ready lock separately and need distinct trace attribution before changing
+  their admission behaviour.
+
 - [MLFQ under restricted host contention](mlfq-host-pressure.md) retains
   approximately twenty-second Quake swap stalls with blocking and try AP
   accounting. Try avoids the observed discontinuity but does not restore
