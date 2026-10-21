@@ -337,3 +337,59 @@ the current branch. Record each actual build identity and keep invalid runs
 unclassified; missing markers, timing faults, incomplete jobs or lifecycle
 failures must not become performance passes. A compile-time diagnostic-removal
 control is a separate experiment if disabled runtime checks remain suspect.
+
+
+### Diagnostics-disabled historical/current controls
+
+Two completed alternating cohorts use the earlier matched `irq-safe-frozen`
+(`112db7da…`) and current complete capsule (`fc41f3db…`). Every trial starts from
+fresh checked copies of the same golden source disks and fresh Q2 home, with
+MLFQ, IRQ-accounting try, eight vCPUs, 6 GiB, fixed graphics/audio backends and
+the same synthetic music/demo. Guest diagnostic controls are read back disabled;
+the older kernel reports four newer commands unavailable, which is preserved
+rather than described as a successful control operation. QEMU HDA trace flags
+are removed. No profiling, screenshots or PCM capture occur during these runs.
+Only the original tracked job is polled every two host seconds; its guest log
+reader still polls every twenty guest milliseconds. These are guest-observed
+marker intervals, not a new independently bracketed host/guest clock-rate test.
+
+| Condition | Earlier first | Current first | Current repeat | Earlier repeat |
+| --- | ---: | ---: | ---: | ---: |
+| No intentional host load | 15.888 s | 15.747 s | 15.952 s | 18.752 s |
+| Twelve bounded host workers plus four sleepers | 44.393 s | 48.175 s | 46.047 s | 46.171 s |
+
+The quiet runs pass runtime accounting, original collected job exits/EOF/empty
+groups, original VM/router/null-sink exits, matched artifacts, heap, four
+filesystem checks and saved-data preservation. They do not reproduce a large
+current-build pacing regression with probes off. No intentional host load is
+not a guarantee of an otherwise idle host; the final older quiet run's variation
+is retained, not dropped in favor of the first score.
+
+In loaded runs the thirty-second host fixture begins after the controller
+observes demo START. It is not a guarantee of load covering the entire demo.
+All seventeen host threads have affinity 0–13; all workers complete and original
+waits/filesystem/preservation checks pass. Both current runs and the last older
+run have clean runtime counters. The first older run has two service-floor
+clamps, largest deficit 12,452 ns; the strict zero-clamp comparison gate therefore
+remains false. The raw current/earlier mean ratio is 1.0404, not an accepted
+4-percent regression estimate. All source/status/results and this gate remain
+explicit in the independent verifier's output.
+
+Evidence and hashed plans are beneath
+`build/workloads/timing-scheduler-20261021/diagnostics-off-v2` and
+`diagnostics-off-loaded`, with source launchers/controllers/verifiers in their
+sibling preparation directories. An initial quiet launch stopped before QEMU
+because its private-audio runtime variable was missing; it remains separately
+preserved. The corrected cohort supplies and verifies the newly owned audio
+service identity. These results narrow the search: the large host-loaded
+slowdown exists in the earlier build without its available probes enabled.
+They neither clear all instrumentation nor explain the user's browser report,
+audio continuity, or the cost of compiled-in disabled checks. A usable commit
+bisect still needs a reproducible same-condition good/bad endpoint pair.
+
+After both cohorts' original owners terminated, a separate native review was
+prepared in `build/reviews/live-diagnostics-off-20261021`, from the checked
+user-review baseline with original game music and profiles. It uses the current
+complete capsule, eight vCPUs/8 GiB, MLFQ/try, normal host PipeWire audio, and all
+nine controls verified off. The running user review must be handed back before
+rebuilding, staging, shutdown or further automated input.
