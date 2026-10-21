@@ -43,9 +43,9 @@ def main():
     parser.add_argument('--channels', choices=('left', 'right', 'both'), default='both')
     parser.add_argument('--first', type=int, choices=(0, 1), default=0,
                         help='Initial descriptor refill order; alternates each loop')
-    parser.add_argument('--fragments', type=int, choices=(4, 8, 69), default=4,
+    parser.add_argument('--fragments', type=int, choices=(4, 8, 40, 47, 69), default=4,
                         help='OSS fragment count; write requests default to 4096 bytes')
-    parser.add_argument('--fragment-bytes', type=int, choices=(256, 4096, 8192), default=4096,
+    parser.add_argument('--fragment-bytes', type=int, choices=(256, 512, 4096, 8192), default=4096,
                         help='Explicit fragment geometry, independent of the mixer mode')
     parser.add_argument('--write-bytes', type=int, choices=(256, 4096, 8192), default=4096)
     parser.add_argument('--refresh-before-refill', action='store_true',

@@ -447,3 +447,69 @@ controls and justify a reserve against the unchanged HDA safety lead and
 service interval. Existing queued endpoints must remain unchanged. Evidence:
 `asymmetric-control/summary.json` and `write-gap-analysis.json`. No production
 bound/default or scheduler policy is changed by these results.
+
+### Explicit post-discovery refill budgets
+
+A further 390 hosted cases keep the 4,096-frame horizon and fixed HDA lead.
+After each one-ms physical DMA step, explicit refresh discovers completion.
+When a whole fragment first becomes writable, producer 0 waits a declared
+0/1/9/10/19/20/21/39/40/41/50/75 ms before greedily refilling. Producer 1 admits
+immediately. Mixer submission retains a ten-ms cadence at phase 0/1/4 ms;
+producer order varies independently. This separates fragment size from a
+post-discovery execution delay. Discovery itself is idealized, and these
+constant delays do not represent every bounded varying jitter sequence.
+
+The proposed reserve formula is `C >= H + F + ceil(44100 × J / 1000)`, for
+capacity C, target H=4096, actual fragment F and declared delay J in ms. Under
+the original maximum of 69 fragments and a power-of-two size starting at 64
+frames, the first viable size is 128 frames. Minimum counts are then:
+
+| Declared delay | Capacity / fragment frames | Count | Reserve after fragment eligibility |
+| --- | --- | ---: | ---: |
+| 20 ms | 5,120 / 128 | 40 | 896 frames, about 20.32 ms |
+| 40 ms | 6,016 / 128 | 47 | 1,792 frames, about 40.63 ms |
+
+Both counts respect the original maximum; actual geometry must still be
+reported to the caller. These are explicit test inputs, not implemented
+prospective negotiation. Quake's 8,192/2,048 tuple supports either declared
+budget. The test also delays the large-fragment producer against an immediate
+small-fragment peer. It does not delay the small producer in both channel
+positions, and should not be described as a complete permutation proof.
+
+All 180 enumerated regular cases within the proposed budgets have exactly
+176,400 contributed/physically played/completed frames per source over the
+central four seconds, no short/empty contributions and no driver reservations.
+All sixteen within-budget dormant/disabled-peer controls preserve exact active
+progress without reservations. The old 4,416/64 geometry instead runs about
+0.9796 at ten-ms delay and 0.9088 at twenty ms, while its supplying peer remains
+nominal. The twenty-ms tuple first loses data at twenty-one ms; the forty-ms
+tuple at forty-one ms. These small losses remain failures even when a looser
+one-percent average-rate gate would pass. Beyond-budget outcomes stay in the
+analysis rather than being discarded.
+
+Missing four mixer service opportunities still causes one central reservation,
+a sampled 2,960-byte target excursion and about 0.9933 source rates. Pending
+returns within target seventeen ms after the first resumed service. Explicit
+completion refresh continues during this scenario; it is not total observer
+starvation. The recovery measurement now waits for that actual resumed service
+(3,041 ms at phase one), rather than declaring recovery in the preceding
+below-target gap. The older phase-zero measurements are unchanged.
+
+Exact source PCM order/drains pass in all 390 cases; the separate 468 and 144
+matrices remain intact. All 75 hosted suites pass. The expanded sanitizer run
+exceeded the test's fifteen-second CTest limit; that timeout is retained
+separately from the bounded direct-binary rerun. No sanitizer acceptance should
+be inferred merely from the absence of a diagnostic before timeout. The same
+instrumented binary subsequently completed successfully in 18.85 seconds under
+an explicit ninety-second process budget, with the existing global-redzone and
+leak-detector exclusions. This is a successful direct sanitizer run, not a
+successful execution under the original CTest timeout.
+
+`analyze_mixer_refill_budget.py` requires the exact matrix, verifies delay and
+geometry, and rejects missing/duplicate rows or fabricated nominal results.
+Its `budget_contract_accepted` means acceptance of this enumerated model only.
+Evidence: `mixer-refill-budget-final.log` and `mixer-refill-budget-analysis.json`
+under `reboot-resume`. A native original→20-ms→40-ms→original explicit-geometry
+comparison is prepared, keeping per-refill queries and 256-byte writes constant.
+Its write granularity differs from this model's whole-128-frame refills. The
+production planner, horizon, HDA lead and scheduler defaults remain unchanged.
