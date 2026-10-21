@@ -590,3 +590,87 @@ bisect in its separate checkout. Current guest artifacts are frozen private
 copies, so selecting source does not change that running VM. No build or staging
 starts before its handback. Audio and rendering observations remain separate
 in `historical-regression-bisect.json` and the saved bisect log.
+
+
+The user independently timed 30 seconds of YouTube track progression against a
+stopwatch at 24 seconds of wall time: approximately **1.25x** end-to-end playback
+speed. This manual measurement has unquantified uncertainty but establishes
+source progression separately from the device counters. It is consistent with
+the captured counter/clock split, without establishing its cause. After explicit
+handback, candidate `044678fa` completed guest sync, the original launcher exited
+zero, and all four offline filesystem checks returned zero.
+
+The next candidate `01334a6a` was built unchanged in a fresh per-revision build
+directory, twice for its final symbol table. Its private frozen capsule contains
+12 matching ABI-33 modules (not the ABI-34/13-module set from the later candidate).
+Kernel SHA-256 is
+`2224d7aadbcd2f2eb53b2ee6017e43f69bde827e7d97ff23947ccc60d312d1da`.
+The second native review preserves the same historical launcher, RR, eight CPUs,
+eight GiB, PipeWire buffer and HDA timer settings.
+
+
+### Second candidate: rendering nearer baseline, fast playback persists
+
+At `01334a6a`, session `8397b8e85cd94537a1a2932bfcf6a4b7`, the user reports
+Quake still running fast but approximately 12–14 FPS. This is near the historical
+13–14-FPS range, unlike candidate `044678fa` at approximately 10 FPS. Keep the
+rendering and playback classifications separate; reported application FPS is
+not independent of its clock and does not alone establish wall-time throughput.
+No good/bad classification is applied to this candidate yet.
+
+A two-second capture retains 1,589 samples, 6,589 context switches and zero
+reported drops. Exact-kernel/module symbol resolution identifies 1,174 idle
+samples, 191 inclusive GPU SubmitCommand samples and 161 GPU command-lock spin
+samples. The historical good run had 1,202, 196 and 125 respectively. The latest
+slow matched-settings run instead had 1,407 idle samples, sleeping command-lock
+ownership and 154 inclusive SubmitCommand samples. These are IRQ-biased
+observations in unmatched scenes, not CPU occupancy or a quantified speed gain.
+The earlier candidate's profile resembles the old GPU ownership behavior while
+fast playback remains present. This makes the later GPU sleeping-lock change a
+useful rendering lead, without identifying it as causal.
+
+The HDA driver has no source changes between the good endpoint and `01334a6a`.
+The mixer changes only its ten-millisecond wake deadline from raw BSP-delivered
+IRQ count to `ApicTickCount()`, which now uses elapsed pvclock time. By
+`044678fa`, driver changes add retained terminal-fault/publication evidence; the
+normal accepted publication predicate and sampled reads remain unchanged.
+These source observations do not rule out changed scheduling or servicing
+patterns triggering the known host HDA timer-mode discard behavior. The latter
+already has an independent synthetic traced control in
+`docs/hda-timer-discard-control.md`; the present application reproduction has
+not yet received an equivalent causal trace. Historical timer=true/200-ms
+settings remain fixed during this bisect rather than silently applying the
+new callback/20-ms defaults.
+
+Machine-readable comparison: ignored workload artifact
+`timing-scheduler-20261021/live-three-revision-quake-profiles.json`; each review
+retains its own module-aware analysis and original raw profile. The VM remains
+with the user for Firefox testing; no kernel build or staging occurs.
+
+
+The user confirms YouTube video and audio also run fast on `01334a6a`, with very
+few stutters. The saved 500-ms Firefox profile has 392 samples, 11,555 context
+switches and zero drops. Same-identity stream 49/epoch 7 completes 343,305
+frames across independent host brackets of 6.007439–6.085792 seconds:
+**1.27916–1.29584x** nominal 44.1-kHz progression. The separately sampled native
+audio clock bounds **0.99252–1.00547x**. This reproduces the device/clock split
+before the later GPU sleeping-lock change. It does not identify the HDA timer
+path as causal in this application capture, nor establish a decoded media rate.
+Evidence is retained in the review's `firefox-fast-capture` directory.
+
+A diagnostic ownership-only patch is prepared in ignored workload directory
+`gpu-lock-isolation-preparation`, with its base-file hash and comparison plan.
+It passes `git apply --check` but is not applied or built. It swaps only the
+GPU command guard back to historical ticket-spin ownership while preserving
+current completion validation, stable timeout and uncertain-DMA quarantine.
+This will isolate ownership cost if the bisect points there; a wholesale revert
+would confound that result and remove safety fixes. No default change is made.
+
+
+After explicit handback, `01334a6a` syncs and exits via its original launcher
+with code zero; all four offline filesystem checks pass. For the existing
+reported-FPS bisect criterion it is marked good (12–14 versus baseline 13–14),
+while audio/video pace is explicitly still bad. The overlapping FPS ranges and
+non-matched scenes limit this classification; it must be revisited if later
+controlled wall-time results disagree. Git selects
+`7c3c243670783faf1432bbdc7ab4be79316baf99` next, leaving five revisions after it.
