@@ -5,6 +5,13 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Accepted mix contributions](audio-mix-contributions.md) now classify actual
+  receipt prefixes without changing PCM policy. In two native independent-writer
+  windows, short positive tails account for 94–99% of missing frames, all with
+  substantial in-flight occupancy. All 74 hosted suites and narrow native gates
+  pass. This motivates a headroom-gated shared-prefix experiment, not another
+  empty-queue wait or a scheduler-default change.
+
 - [Current mixed MLFQ/EEVDF pair](mixed-policy-comparison.md) reproduces nearly
   identical concurrent audio slowdown on both policies, with close/reopen
   recovery and clean current runtime/lifecycle gates. Neither fixes the issue

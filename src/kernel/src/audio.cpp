@@ -161,6 +161,18 @@ enum class DriverMode { Unknown, Legacy, Native };
 static DriverMode g_driverMode = DriverMode::Unknown; // flush owner only
 static uint64_t g_hardwareEpoch = 0;
 static bool g_clockSupported = false; // mixer lock
+static AudioMixContributionModel g_mixContributions; // existing mixer lock
+void AudioMixerContributionsEnable(bool enabled) {
+    SpinLockAcquire(&g_mixerLock);g_mixContributions.Enable(enabled);SpinLockRelease(&g_mixerLock);
+}
+void AudioMixerContributionsReset() {
+    SpinLockAcquire(&g_mixerLock);g_mixContributions.Reset();SpinLockRelease(&g_mixerLock);
+}
+AudioMixContributionSnapshot AudioMixerContributionsRead() {
+    SpinLockAcquire(&g_mixerLock);const auto result=g_mixContributions.Snapshot();
+    SpinLockRelease(&g_mixerLock);return result;
+}
+
 
 // All coalescing state is protected by g_mixerLock, including configuration.
 // A return from Flush still allows Tick to call the driver's service routine.
@@ -353,7 +365,7 @@ static void Consume(const Contribution* contributions, uint32_t frames, bool clo
 }
 // Snapshot a new whole-frame attempt. Rebuilding unaccepted frames removes
 // closed/reset/paused contributors without subtracting already-clamped sums.
-static uint32_t Prepare(Contribution* contributions)
+static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* prepared)
 {
     uint32_t frames = 0;
     for (const auto& stream : g_streams)
@@ -364,10 +376,17 @@ static uint32_t Prepare(Contribution* contributions)
     g_batchRemaining = frames;
     for (uint32_t slot = 0; slot < MIXER_MAX_STREAMS; ++slot) {
         const auto& stream = g_streams[slot];
+        if (prepared) prepared[slot]={};
         if (!stream.identity || !stream.enabled || stream.discontinuity) continue;
         uint32_t count = static_cast<uint32_t>(stream.write - stream.read);
         if (count > frames) count = frames;
         contributions[slot] = {stream.identity, stream.epoch, stream.read, count};
+        // An opened-but-never-written endpoint is not a producer. A previously
+        // written drained-open endpoint remains observationally included; its
+        // missing frames are not evidence that the app currently demands audio.
+        if (prepared && stream.submittedFrames)
+            prepared[slot]={stream.identity,stream.epoch,count,
+                static_cast<uint32_t>(stream.write-stream.read),stream.inFlight,stream.capacity};
     }
     for (uint32_t i = 0; i < frames; ++i) {
         int32_t left = 0, right = 0;
@@ -565,6 +584,7 @@ void AudioMixerFlush()
     AudioDeviceProgress device{};
     RefreshDevice(epoch, coalesce ? &device : nullptr);
     Contribution contributions[MIXER_MAX_STREAMS]{};
+    AudioMixPreparedStream prepared[MIXER_MAX_STREAMS]; // initialized only when recording
     const bool partial = g_partialOffset != 0;
     SpinLockAcquire(&g_mixerLock);
     if (!g_mixerReady || !g_audioDriver || !g_audioDriver->play) {
@@ -573,7 +593,8 @@ void AudioMixerFlush()
     if (!partial && CoalesceRefill(device, sampledBefore)) {
         SpinLockRelease(&g_mixerLock); return;
     }
-    const uint32_t frames = partial ? 0 : Prepare(contributions);
+    const uint64_t contributionToken=g_driverMode==DriverMode::Native?g_mixContributions.Token():0;
+    const uint32_t frames = partial ? 0 : Prepare(contributions,(contributionToken&1)?prepared:nullptr);
     SpinLockRelease(&g_mixerLock);
     if (!partial && !frames) return;
     if (__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE) != epoch) {
@@ -591,6 +612,8 @@ void AudioMixerFlush()
         }
         const uint32_t acceptedFrames = receipt.accepted / MIXER_FRAME_BYTES;
         SpinLockAcquire(&g_mixerLock);
+        if (contributionToken&1)
+            g_mixContributions.Observe(contributionToken,frames,acceptedFrames,prepared,MIXER_MAX_STREAMS);
         auto& entry = g_completions[(g_completionHead + g_completionCount) % COMPLETION_SLOTS];
         entry.receipt = receipt; entry.credited = 0;
         for (uint32_t i = 0; i < MIXER_MAX_STREAMS; ++i) {

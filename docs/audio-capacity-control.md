@@ -87,3 +87,7 @@ The current result is retained in
 `build/reviews/unattended-audio-capacity-mlfq-a-20261021/audio-capacity-control/summary.json`,
 with exact executed sources, configured-barrier receipts, geometry, PCM/decodes,
 write traces, original lifecycle evidence and filesystem checks.
+
+The [accepted-contribution follow-up](audio-mix-contributions.md) implements
+these counters and identifies positive short tails as the dominant category in
+two native windows. It does not alter the capacity control or accept a fix.

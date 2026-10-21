@@ -3786,6 +3786,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio producer on|off|reset|status - DSP producer elapsed brackets (default off)\n"
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
+            "  audio contributions on|off|reset|status - accepted native mix contributions (default off)\n"
             "  audio coalesce on|off|reset|status - experimental HDA 12-KiB refill grace (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
@@ -4215,6 +4216,29 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             row.text(",");row.field("late_lower_ns",e.lateLowerNs);row.text(",");row.field("service_ns",e.serviceNs);
             row.text(",");row.field("tail_ns",e.tailNs);row.text(",");row.field("score_ns",e.scoreNs);
             row.text(",\"worked\":");row.text(e.worked?"true":"false");row.text("}");row.send();
+        }
+        DebugChannelSend("]}\n");
+    }
+    else if(NetStrEq(cmd,"audio contributions on") || NetStrEq(cmd,"audio contributions off") ||
+            NetStrEq(cmd,"audio contributions reset") || NetStrEq(cmd,"audio contributions status")) {
+        if(NetStrEq(cmd,"audio contributions on"))AudioMixerContributionsEnable(true);
+        else if(NetStrEq(cmd,"audio contributions off"))AudioMixerContributionsEnable(false);
+        else if(NetStrEq(cmd,"audio contributions reset"))AudioMixerContributionsReset();
+        const auto s=AudioMixerContributionsRead();BridgeReply h;h.text("{\"enabled\":");h.text((s.epoch&1)?"true":"false");
+        h.text(",");h.field("epoch",s.epoch);h.text(",");h.field("observations",s.observations);
+        h.text(",");h.field("output_frames",s.outputFrames);h.text(",");h.field("omitted_stream_frames",s.omittedStreamFrames);
+        h.text(",");h.field("omitted_observations",s.omittedObservations);h.text(",");h.field("invalid",s.invalid);
+        h.text(",\"saturated\":");h.text(s.saturated?"true":"false");h.text(",\"exhausted\":");h.text(s.exhausted?"true":"false");
+        h.text(",");h.field("capacity",AudioMixContributionSlots);h.text(",");h.field("count",s.count);
+        h.text(",\"scope\":\"validated native accepted prefixes only; controls/delivery retirement racing copy excluded; captured stream epoch, not completion or demand; drained-open producers included, never-written/disabled excluded; software bins 0/1..440/441..1023/1024+, in-flight bins 0/positive below half/half+; bins weight missing frames; omissions are stream-frames\",\"streams\":[");h.send();
+        for(unsigned i=0;i<s.count;++i){
+            const auto& row=s.rows[i];BridgeReply r;if(i)r.text(",");r.text("{");
+            r.field("identity",row.identity);r.text(",");r.field("epoch",row.epoch);
+            r.text(",");r.field("accepted_output_frames",row.acceptedOutputFrames);r.text(",");r.field("contributed_frames",row.contributedFrames);
+            r.text(",");r.field("missing_empty_frames",row.missingEmptyFrames);r.text(",");r.field("missing_short_frames",row.missingShortFrames);
+            r.text(",\"missing_software_bins\":[");for(unsigned b=0;b<4;++b){if(b)r.text(",");r.number(row.missingSoftwareBins[b]);}
+            r.text("],\"missing_inflight_bins\":[");for(unsigned b=0;b<3;++b){if(b)r.text(",");r.number(row.missingInFlightBins[b]);}
+            r.text("]}");r.send();
         }
         DebugChannelSend("]}\n");
     }

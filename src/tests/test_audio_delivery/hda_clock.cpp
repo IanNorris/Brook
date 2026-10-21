@@ -338,6 +338,86 @@ void verifyDma(uint32_t byteOffset,uint32_t frames,bool right) {
         VERIFY(pair[0]==1000 && pair[1]==(right?2000:0));
     }
 }
+const brook::AudioMixContributionRow* contributionRow(const brook::AudioMixContributionSnapshot& s,
+                                                     uint64_t id,uint64_t epoch) {
+    for(unsigned i=0;i<s.count;++i)if(s.rows[i].identity==id && s.rows[i].epoch==epoch)return &s.rows[i];
+    return nullptr;
+}
+void contributionConservation(const brook::AudioMixContributionSnapshot& s) {
+    VERIFY(!s.invalid && !s.saturated && !s.omittedObservations);
+    for(unsigned i=0;i<s.count;++i){
+        const auto& r=s.rows[i];uint64_t software=0,flight=0;
+        for(auto n:r.missingSoftwareBins)software+=n;
+        for(auto n:r.missingInFlightBins)flight+=n;
+        VERIFY(r.acceptedOutputFrames==r.contributedFrames+r.missingEmptyFrames+r.missingShortFrames);
+        VERIFY(software==r.missingEmptyFrames+r.missingShortFrames && flight==software);
+    }
+}
+void contributionTests(brook::AudioStreamId a,brook::AudioStreamId& b) {
+    using namespace brook;
+    VERIFY(!(AudioMixerContributionsRead().epoch&1));
+    coalesceSetup(a,b);AudioMixerContributionsEnable(true);AudioMixerContributionsReset();
+    AudioStreamProgress pa{},pb{};VERIFY(AudioMixerGetProgress(a,&pa) && AudioMixerGetProgress(b,&pb));
+    queueChannel(a,false);queueChannel(b,true,128);AudioMixerFlush();
+    auto s=AudioMixerContributionsRead();auto* r=contributionRow(s,b,pb.epoch);
+    VERIFY(s.outputFrames==1024 && s.observations==1 && s.count==2);
+    VERIFY(r && r->contributedFrames==128 && r->missingShortFrames==896 && !r->missingEmptyFrames);
+    VERIFY(r && r->missingSoftwareBins[1]==896 && r->missingInFlightBins[1]==896);
+    contributionConservation(s);verifyDma(16384,128,true);verifyDma(16384+512,896,false);
+
+    // A drained-open producer is observable, not proof of current app demand.
+    coalesceSetup(a,b);finishPhysical();AudioMixerRefresh();AudioMixerContributionsReset();
+    VERIFY(AudioMixerGetProgress(b,&pb));queueChannel(a,false);AudioMixerFlush();
+    s=AudioMixerContributionsRead();r=contributionRow(s,b,pb.epoch);
+    VERIFY(r && r->missingEmptyFrames==1024 && r->missingInFlightBins[0]==1024);
+    contributionConservation(s);
+
+    coalesceSetup(a,b);AudioMixerContributionsReset();VERIFY(AudioMixerSetEnabled(b,false));
+    auto unused=AudioMixerOpen();VERIFY(unused);queueChannel(a,false);AudioMixerFlush();
+    s=AudioMixerContributionsRead();VERIFY(s.count==1 && s.rows[0].identity==a && s.outputFrames==1024);
+    VERIFY(AudioMixerClose(unused));contributionConservation(s);
+
+    // Only the accepted prefix counts. Full-ring retries contribute nothing;
+    // the later accepted suffix is rebuilt and sees B's now-empty software FIFO.
+    coalesceSetup(a,b);AudioMixerContributionsReset();VERIFY(AudioMixerGetProgress(b,&pb));
+    std::array<int16_t,16384> silence{};
+    VERIFY(HdaTrySubmit(silence.data(),31744).accepted==31744);
+    queueChannel(a,false);queueChannel(b,true,128);AudioMixerFlush();
+    s=AudioMixerContributionsRead();r=contributionRow(s,b,pb.epoch);
+    VERIFY(s.outputFrames==256 && r && r->contributedFrames==128 && r->missingShortFrames==128);
+    AudioMixerFlush();VERIFY(AudioMixerContributionsRead().outputFrames==256);
+    advanceNative(4096);AudioMixerFlush();s=AudioMixerContributionsRead();r=contributionRow(s,b,pb.epoch);
+    VERIFY(s.outputFrames==1024 && s.observations==2 && r && r->missingEmptyFrames==768);
+    contributionConservation(s);
+
+    // A refill during copying cannot retroactively alter the prepared mix.
+    coalesceSetup(a,b);AudioMixerContributionsReset();VERIFY(AudioMixerGetProgress(b,&pb));
+    queueChannel(a,false);resetDuringCopy=b;
+    afterCopyHook=[] {queueChannel(resetDuringCopy,true);};AudioMixerFlush();
+    s=AudioMixerContributionsRead();r=contributionRow(s,b,pb.epoch);
+    VERIFY(r && r->missingEmptyFrames==1024 && !r->contributedFrames);
+    contributionConservation(s);verifyDma(16384,1024,false);
+
+    // Epoch reset/close/reuse after preparation changes completion ownership,
+    // but the accepted PCM retains the old identity and epoch for this diagnostic.
+    for(unsigned action=0;action<3;++action){
+        coalesceSetup(a,b);AudioMixerContributionsReset();VERIFY(AudioMixerGetProgress(b,&pb));
+        const auto old=b;queueChannel(a,false);queueChannel(b,true,128);resetDuringCopy=b;
+        if(action==0)afterCopyHook=[] {VERIFY(AudioMixerReset(resetDuringCopy));queueChannel(resetDuringCopy,true);};
+        if(action==1)afterCopyHook=[] {VERIFY(AudioMixerClose(resetDuringCopy));resetDuringCopy=AudioMixerOpen();VERIFY(resetDuringCopy);queueChannel(resetDuringCopy,true);};
+        if(action==2)afterCopyHook=[] {VERIFY(AudioMixerSetEnabled(resetDuringCopy,false));};
+        AudioMixerFlush();b=resetDuringCopy;s=AudioMixerContributionsRead();r=contributionRow(s,old,pb.epoch);
+        VERIFY(s.count==2 && r && r->contributedFrames==128 && r->missingShortFrames==896);
+        contributionConservation(s);verifyDma(16384,128,true);
+    }
+
+    // A diagnostic control racing the copy fences it out without modifying PCM.
+    coalesceSetup(a,b);AudioMixerContributionsReset();queueChannel(a,false);queueChannel(b,true,128);
+    afterCopyHook=[] {AudioMixerContributionsReset();};AudioMixerFlush();
+    s=AudioMixerContributionsRead();VERIFY(!s.outputFrames && !s.count && !s.observations);
+    verifyDma(16384,128,true);verifyDma(16384+512,896,false);
+    AudioMixerContributionsEnable(false);AudioStop();initialize();AudioMixerRefresh();
+}
 void coalesceTests(brook::AudioStreamId a,brook::AudioStreamId b) {
     using namespace brook;
     VERIFY(!AudioMixerCoalesceRead().enabled);
@@ -573,6 +653,7 @@ int RunMixerClockTests() {
     VERIFY(!timing.runningSamples && !timing.maxAdvanceEvent.hardwareEpoch && !timing.minHeadroomEvent.hardwareEpoch);
     VERIFY(g_nativeClock.discontinuity);
     AudioDeliveryTimingEnable(false);
+    contributionTests(a,b);
     coalesceTests(a,b);
     VERIFY(AudioMixerClose(a));mixerClockEnabled=false;AudioStop();
     std::printf("MIXER_CLOCK %s\n",failures?"FAIL":"PASS");return failures;

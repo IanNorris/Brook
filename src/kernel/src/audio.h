@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "audio_service_timing.h"
 #include "audio_delivery_timing.h"
+#include "audio_mix_contributions.h"
 
 namespace brook {
 
@@ -133,6 +134,11 @@ struct AudioMixerDiagnostic {
     AudioStreamDiagnostic streams[MIXER_MAX_STREAMS]{};
 };
 void AudioMixerDiagnosticSnapshot(AudioMixerDiagnostic* result);
+
+// Default-off accepted native PCM attribution; no driver poll or clock read.
+void AudioMixerContributionsEnable(bool enabled);
+void AudioMixerContributionsReset();
+AudioMixContributionSnapshot AudioMixerContributionsRead();
 
 // Experimental, default-off refill coalescing for the unchanged intel_hda
 // 12-KiB publication lead. Not a generic driver latency guarantee.
