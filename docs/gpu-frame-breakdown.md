@@ -1117,3 +1117,33 @@ completion credit, silently enlarge the buffer, or lower the guard on this
 argument alone. The next controlled trace should target the actual producer
 PID/incarnation and distinguish sleeping, ready-queue delay and time inside
 ioctls/write, with capacity and app configuration fixed.
+
+
+The next private default-buffer run (`…-mlfq-b-20261022`) selects the actual
+producer PID/incarnation 21/21 from bounded write records. The syscall watcher
+records maximum `poll` dispatch wall time 95.472 ms, versus maximum write
+1.961 ms and maximum between-syscall-phase gap 0.647 ms. The selected ready
+watch records maximum queue delay 0.225 ms and timer lateness 8 ms, with no
+invalid records. Syscall continuity/drops/invalid counters are zero; one poll
+is active at the endpoint and excluded from completed spans. This locates the
+long write-to-write gaps inside poll for this interval; it does not alone prove
+that poll readiness was wrong, because source space can genuinely remain full.
+OpenAL 1.24.3's pinned source confirms poll → render fragment → blocking write.
+The source was fetched read-only from its exact Nix source path. Original app
+and VM exit zero; all four filesystems pass. See `thread-watch/attribution.json`.
+
+The user suggests maintaining one extra buffer ahead. Standard multi-period
+rings permit refill while another period is consumed; availability and playout
+delay are separate concepts ([ALSA PCM](https://www.alsa-project.org/alsa-doc/alsa-lib/pcm.html)).
+A bounded kernel-owned downstream period is a candidate, not yet implemented:
+keep client capacity4096, retain true completed-frame counters and all source
+in GETODELAY, and separately expose software/in-flight/staging/available counts.
+One1024-frame period adds up to23.2ms of outstanding source; it is not unchanged
+total buffering. Grant any reuse allowance only after a validated native copy,
+keep invariant bounds explicit, and freeze per-stream limits while outstanding
+data exists. Update every poll/epoll `capacity-queued` assumption to avoid
+unsigned underflow when total source exceeds client capacity. Partial/rejected
+receipts, drain, resets, close, multiple streams and format transitions need
+actual-body validation. The existing ALSA plugin rejects device delay above its
+logical ring, so a Quake result would not establish Firefox compatibility.
+Do not casually add shared reserved silence to per-stream GETODELAY.
