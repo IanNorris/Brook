@@ -156,20 +156,32 @@ int main() {
     CHECK(!FutexTimeoutNanoseconds(-1,0,&nsValue) && nsValue==2999999999);
     CHECK(!FutexTimeoutNanoseconds(0,-1,&nsValue));
     CHECK(!FutexTimeoutNanoseconds(0,1000000000,&nsValue));
-    CHECK(!FutexTimeoutNanoseconds(INT64_MAX,0,&nsValue));
+    CHECK(FutexTimeoutNanoseconds(INT64_MAX,0,&nsValue) && nsValue==uint64_t(INT64_MAX));
     CHECK(!FutexTimeoutNanoseconds(0,0,nullptr));
-    CHECK(FutexTimeoutNanoseconds(18446744073LL,709551615,&nsValue) && nsValue==~uint64_t(0));
-    CHECK(!FutexTimeoutNanoseconds(18446744073LL,709551616,&nsValue));
+    for(int64_t sec:{9223372035LL,9223372036LL,9223372037LL,9223372036854775807LL})
+        for(int64_t fraction:{0LL,999999999LL}) {
+            const auto expected=sec==9223372035LL?uint64_t(sec)*1000000000+fraction:uint64_t(INT64_MAX);
+            CHECK(FutexTimeoutNanoseconds(sec,fraction,&nsValue) && nsValue==expected);
+        }
+    CHECK(!FutexTimeoutNanoseconds(INT64_MAX,-1,&nsValue));
+    CHECK(!FutexTimeoutNanoseconds(INT64_MAX,1000000000,&nsValue));
     FutexWaitDeadline futex;
     CHECK(!futex.expired(~uint64_t(0)) && futex.wakeupTick(0,100)==~uint64_t(0));
     CHECK(FutexMakeDeadline(true,1000000,123456789,1,&futex));
     CHECK(futex.nanoseconds==124456789 && futex.clockId==1 && futex.finite);
     CHECK(!futex.expired(124456788) && futex.expired(124456789));
-    CHECK(!FutexMakeDeadline(true,1,~uint64_t(0),1,&futex) && futex.nanoseconds==124456789);
+    CHECK(FutexMakeDeadline(true,2,uint64_t(INT64_MAX)-1,1,&futex) &&
+          futex.nanoseconds==uint64_t(INT64_MAX) && futex.finite);
+    CHECK(!futex.expired(uint64_t(INT64_MAX)-1) && futex.wakeupTick(0,10)!=~uint64_t(0));
     CHECK(FutexMakeDeadline(false,123456789,999999999,0,&futex));
     CHECK(futex.clockId==0 && futex.nanoseconds==123456789 && futex.expired(999999999));
     CHECK(!FutexMakeDeadline(false,1,0,2,&futex));
     CHECK(!FutexMakeDeadline(false,1,0,0,nullptr));
+    CHECK(TimeoutAddSafe(0,0)==0);
+    CHECK(TimeoutAddSafe(uint64_t(INT64_MAX)-2,1)==uint64_t(INT64_MAX)-1);
+    CHECK(TimeoutAddSafe(uint64_t(INT64_MAX)-1,1)==uint64_t(INT64_MAX));
+    CHECK(TimeoutAddSafe(uint64_t(INT64_MAX)-1,2)==uint64_t(INT64_MAX));
+    CHECK(TimeoutAddSafe(100,uint64_t(INT64_MAX))==uint64_t(INT64_MAX));
     for (uint64_t remaining : {1ULL,99999ULL,500000ULL,999999ULL,1000000ULL,1000001ULL,10000000ULL}) {
         CHECK(FutexMakeDeadline(true,remaining,987654321,1,&futex));
         const uint64_t tick=futex.wakeupTick(987654321,4321);
@@ -356,9 +368,18 @@ int main() {
     CHECK(!TimerFdNanoseconds(-1,0,&ns));
     CHECK(!TimerFdNanoseconds(0,-1,&ns));
     CHECK(!TimerFdNanoseconds(0,1000000000,&ns));
-    CHECK(!TimerFdNanoseconds(INT64_MAX,0,&ns));
-    CHECK(TimerFdNanoseconds(18446744073LL,709551615,&ns) && ns==~uint64_t(0));
-    CHECK(!TimerFdNanoseconds(18446744073LL,709551616,&ns));
+    CHECK(TimerFdNanoseconds(INT64_MAX,0,&ns) && ns==uint64_t(INT64_MAX));
+    for(int64_t sec:{9223372035LL,9223372036LL,9223372036854775807LL})for(int64_t fraction:{0LL,999999999LL}){
+        const auto expected=sec==9223372035LL?uint64_t(sec)*1000000000+fraction:uint64_t(INT64_MAX);
+        CHECK(TimerFdNanoseconds(sec,fraction,&ns) && ns==expected);
+    }
+    CHECK(!TimerFdNanoseconds(INT64_MAX,-1,&ns) && ns==uint64_t(INT64_MAX));
+    CHECK(!TimerFdNanoseconds(INT64_MAX,1000000000,&ns) && ns==uint64_t(INT64_MAX));
+    timer={};timer.armed=true;timer.deadline=10;timer.interval=uint64_t(INT64_MAX);
+    timer.refresh(100);CHECK(timer.pending==1 && timer.deadline==uint64_t(INT64_MAX) && timer.armed);
+    timer.refresh(100);CHECK(timer.pending==1);
+    timer.refresh(uint64_t(INT64_MAX));CHECK(timer.pending==2 && !timer.armed);
+    timer.refresh(uint64_t(INT64_MAX));CHECK(timer.pending==2); // no manufactured terminal repeats
 
     std::printf("PVCLOCK_STABLE %s\n",failures?"FAIL":"PASS");return failures?1:0;
 }

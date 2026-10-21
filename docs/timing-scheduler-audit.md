@@ -5,13 +5,20 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Large timeout saturation](timeout-saturation.md) fixes thirteen confirmed
+  EINVAL failures for valid huge waits/timers. The same executable passes all
+  24 cases on Linux and fixed Brook; all 73 hosted suites and the earlier
+  eighteen timer/thirteen restart cases pass. Original job, VM, filesystem and
+  runtime gates are clean. This is correctness evidence, not an audio or
+  scheduler performance fix.
+
 - [POSIX timer/block admission](posix-timer-wakeups.md) now executes the actual
   timer, block and unblock bodies in arranged hosted interleavings. The same
   eighteen-case ELF passes on Linux and Brook, including masked/ignored
   notifications, overruns, timerfd rearming and thread targeting, with clean
   original job/VM/filesystem/runtime gates. No production change is needed for
-  those cases. Very large timeout semantics, arbitrary load and fallback clock
-  acceptance remain separate.
+  those cases. Large timeout saturation is addressed above; arbitrary load and
+  fallback clock acceptance remain separate.
 
 - [Mixed real applications](mixed-desktop-timing.md) complete Firefox, two
   finite GL3 attract runs and eight guest CPU workers with clean original task,

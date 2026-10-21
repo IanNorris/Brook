@@ -151,11 +151,11 @@ void timerDomainsAndOwnership() {
     CHECK(PosixTimerSet(&p,id,1,{{0,0},FromNs(absolute)},nullptr)==0 && timer->basis==0);
     monotonicNs+=1000000000;CHECK(PosixTimerGet(&p,id,&remaining)==0 && remaining.value.nsec==7000000);
     const auto deadline=timer->deadline;
-    for(PosixItimerspec invalid: {PosixItimerspec{{0,0},{-1,0}},{{0,0},{0,1000000000}},{{0,0},{INT64_MAX,0}},{{-1,0},{0,1}}}) {
+    for(PosixItimerspec invalid: {PosixItimerspec{{0,0},{-1,0}},{{0,0},{0,1000000000}},{{0,0},{INT64_MAX,1000000000}},{{-1,0},{0,1}}}) {
         CHECK(PosixTimerSet(&p,id,0,invalid,nullptr)==-22 && timer->deadline==deadline);
     }
-    const auto savedMono=monotonicNs;monotonicNs=~uint64_t(0)-4;
-    CHECK(PosixTimerSet(&p,id,0,{{0,0},{0,5}},nullptr)==-22 && timer->deadline==deadline);
+    const auto savedMono=monotonicNs;monotonicNs=uint64_t(INT64_MAX)-4;
+    CHECK(PosixTimerSet(&p,id,0,{{0,0},{0,5}},nullptr)==0 && timer->deadline==uint64_t(INT64_MAX));
     monotonicNs=savedMono;CHECK(PosixTimerDelete(&p,id)==0);
 
     init(p);Process peer{};init(peer,8);peer.tgid=p.tgid;peer.isThread=true;peer.leaderIncarnation=p.incarnation;
@@ -199,6 +199,20 @@ void timerLifecycle() {
     PosixTimersTickLocked(processes,1);CHECK(pendingCount==1 && !Lookup(&p,id)->armed);
     CHECK(PosixTimerDequeue(&p,bit,&info)==10 && PosixTimerOverrun(&p,id)==0x7fffffff);
     monotonicNs=saved;CHECK(PosixTimerDelete(&p,id)==0 && !pendingCount && !usedCount);
+    init(p);id=arm(p);
+    CHECK(PosixTimerSet(&p,id,0,{{INT64_MAX,0},{0,1}},nullptr)==0);
+    ++monotonicNs;PosixTimersTickLocked(processes,1);
+    auto* large=Lookup(&p,id);CHECK(large && large->interval==uint64_t(INT64_MAX));
+    CHECK(large && large->deadline==uint64_t(INT64_MAX) && large->armed && pendingCount==1);
+    PosixTimersTickLocked(processes,1);CHECK(pendingCount==1);
+    CHECK(PosixTimerDequeue(&p,bit,&info)==10);
+    const auto beforeHorizon=monotonicNs;monotonicNs=uint64_t(INT64_MAX);
+    PosixTimersTickLocked(processes,1);CHECK(pendingCount==1 && !large->armed);
+    p.pendingWakeup=0;PosixTimersTickLocked(processes,1);
+    CHECK(pendingCount==1 && !p.pendingWakeup && large->overrun==0 && large->interval==uint64_t(INT64_MAX));
+    CHECK(PosixTimerDequeue(&p,bit,&info)==10 && !pendingCount);
+    monotonicNs=beforeHorizon;
+    CHECK(PosixTimerDelete(&p,id)==0 && !pendingCount && !usedCount);
 }
 }
 

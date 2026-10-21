@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "timeout_value.h"
 
 namespace brook {
 struct FutexWaitDeadline {
@@ -28,20 +29,14 @@ struct FutexWaitDeadline {
 };
 
 inline bool FutexTimeoutNanoseconds(int64_t sec, int64_t nsec, uint64_t* output) {
-    constexpr uint64_t Billion = 1000000000ULL, Max = ~uint64_t(0);
-    if (!output || sec < 0 || nsec < 0 || nsec >= int64_t(Billion)) return false;
-    if (uint64_t(sec) > Max / Billion) return false;
-    const uint64_t whole = uint64_t(sec) * Billion;
-    if (uint64_t(nsec) > Max - whole) return false;
-    *output = whole + uint64_t(nsec);
-    return true;
+    return TimeoutNanoseconds(sec, nsec, output);
 }
 
 inline bool FutexMakeDeadline(bool relative, uint64_t valueNs, uint64_t nowNs,
                               unsigned clockId, FutexWaitDeadline* output) {
     if (!output || clockId > 1) return false;
-    if (relative && valueNs > ~uint64_t(0) - nowNs) return false;
-    *output = {relative ? nowNs + valueNs : valueNs, clockId, true};
+    *output = {relative ? TimeoutAddSafe(nowNs, valueNs)
+        : (valueNs > TimeoutMaxNs ? TimeoutMaxNs : valueNs), clockId, true};
     return true;
 }
 } // namespace brook

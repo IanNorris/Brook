@@ -6,6 +6,7 @@
 
 #include "syscall.h"
 #include "posix_timer.h"
+#include "timeout_value.h"
 #include "timerfd_state.h"
 #include "futex_timeout.h"
 #include "sync_file.h"
@@ -5401,13 +5402,9 @@ static int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
 {
     if (!UserBufferReadable(reqAddr, sizeof(timespec))) return -EFAULT;
     timespec req = *reinterpret_cast<const timespec*>(reqAddr);
-    if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1000000000LL)
-        return -EINVAL;
-    uint64_t duration, deadline;
-    if (__builtin_mul_overflow(static_cast<uint64_t>(req.tv_sec), 1000000000ULL, &duration) ||
-        __builtin_add_overflow(duration, static_cast<uint64_t>(req.tv_nsec), &duration) ||
-        __builtin_add_overflow(ClockNowNs(1), duration, &deadline))
-        return -EINVAL;
+    uint64_t duration;
+    if (!TimeoutNanoseconds(req.tv_sec, req.tv_nsec, &duration)) return -EINVAL;
+    const uint64_t deadline = TimeoutAddSafe(ClockNowNs(1), duration);
 
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
@@ -5452,13 +5449,10 @@ static int64_t sys_clock_nanosleep(uint64_t clockid, uint64_t flags, uint64_t re
     if (flags & ~1ULL) return -EINVAL;
     if (!UserBufferReadable(reqAddr, sizeof(timespec))) return -EFAULT;
     timespec req = *reinterpret_cast<const timespec*>(reqAddr);
-    if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1000000000LL)
-        return -EINVAL;
+    uint64_t requested;
+    if (!TimeoutNanoseconds(req.tv_sec, req.tv_nsec, &requested)) return -EINVAL;
     if (flags & 1) { // TIMER_ABSTIME: convert from the requested clock domain.
-        uint64_t deadline;
-        if (__builtin_mul_overflow(static_cast<uint64_t>(req.tv_sec), 1000000000ULL, &deadline) ||
-            __builtin_add_overflow(deadline, static_cast<uint64_t>(req.tv_nsec), &deadline))
-            return -EINVAL;
+        const uint64_t deadline = requested;
         uint64_t now = ClockNowNs(clockid);
         if (deadline <= now) return 0;
         Process* proc = ProcessCurrent();
@@ -5620,10 +5614,8 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
         if (!UserBufferReadable(timeoutAddr, sizeof(timespec))) return -EFAULT;
         timespec ts = *reinterpret_cast<const timespec*>(timeoutAddr);
         uint64_t duration;
-        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000LL ||
-            __builtin_mul_overflow((uint64_t)ts.tv_sec, 1000000000ULL, &duration) ||
-            __builtin_add_overflow(duration, (uint64_t)ts.tv_nsec, &duration) ||
-            __builtin_add_overflow(ClockNowNs(1), duration, &deadline)) return -EINVAL;
+        if (!TimeoutNanoseconds(ts.tv_sec, ts.tv_nsec, &duration)) return -EINVAL;
+        deadline = TimeoutAddSafe(ClockNowNs(1), duration);
     }
     for (;;) {
         // A fatal group exit must unwind this synchronous wait even though
@@ -9771,13 +9763,12 @@ static int64_t sys_timerfd_settime(uint64_t fd, uint64_t flagsVal,
     auto* timer = static_cast<TimerFdData*>(fde->handle);
     TimerFdGuard guard(timer);
     const uint64_t now = ClockNowNs(timer->clockId);
-    if (initial && !(flagsVal & TFD_TIMER_ABSTIME) && initial > ~0ULL - now) return -EINVAL;
     const ITimerSpec old = TimerFdSnapshotLocked(timer);
     if (oldValAddr && !CopyToUser(oldValAddr, &old, sizeof(old))) return -EFAULT;
     timer->state.interval = interval;
     timer->state.pending = 0;
     timer->state.armed = initial != 0;
-    timer->state.deadline = !initial ? 0 : (flagsVal & TFD_TIMER_ABSTIME) ? initial : now + initial;
+    timer->state.deadline = !initial ? 0 : (flagsVal & TFD_TIMER_ABSTIME) ? initial : TimeoutAddSafe(now, initial);
     __atomic_fetch_add(&timer->rearmGeneration, 1, __ATOMIC_RELEASE);
     TimerFdWakeLocked(timer);
     return 0;

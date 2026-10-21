@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "kvmclock.h"
 #include "rtc.h"
+#include "timeout_value.h"
 
 namespace brook {
 static_assert(sizeof(SignalInfo) == 128);
@@ -63,9 +64,7 @@ Timer* Lookup(Process* p, int32_t id)
 }
 bool ToNs(const PosixTimespec& ts, uint64_t* ns)
 {
-    return ts.sec >= 0 && ts.nsec >= 0 && ts.nsec < (int64_t)Billion &&
-        !__builtin_mul_overflow((uint64_t)ts.sec, Billion, ns) &&
-        !__builtin_add_overflow(*ns, (uint64_t)ts.nsec, ns);
+    return TimeoutNanoseconds(ts.sec, ts.nsec, ns);
 }
 PosixTimespec FromNs(uint64_t ns)
 {
@@ -81,7 +80,8 @@ void Advance(Timer& t, uint64_t now)
         // Avoid both quotient+1 and deadline+interval*n overflow.
         expirations = quotient == ~uint64_t{0} ? ~uint64_t{0} : quotient + 1;
         uint64_t untilNext = t.interval - elapsed % t.interval;
-        if (__builtin_add_overflow(now, untilNext, &t.deadline)) t.armed = false;
+        if (now >= TimeoutMaxNs) t.armed = false;
+        else t.deadline = TimeoutAddSafe(now, untilNext);
     } else t.armed = false;
     if (t.notify == 1) return; // SIGEV_NONE
     uint64_t extra = t.pending ? expirations : expirations - 1;
@@ -156,9 +156,7 @@ int PosixTimerSet(Process* p, int32_t id, unsigned flags,
     // monotonic clock; absolute realtime timers track the realtime clock.
     int basis = t->clock == 0 && !(flags & 1) ? 1 : t->clock;
     uint64_t now = Now(basis), deadline = initial;
-    if (initial && !(flags & 1) && __builtin_add_overflow(now, initial, &deadline)) {
-        IrqSpinLockRelease(&timerLock, lockFlags); return -22;
-    }
+    if (initial && !(flags & 1)) deadline = TimeoutAddSafe(now, initial);
     if (old) ReadValue(*t, Now(t->basis), old);
     // Match Linux: disarming clears the interval and settime resets overrun
     // accounting. A notification already pending is not erased here.

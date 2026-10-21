@@ -5,6 +5,11 @@ the production block/unblock bodies, plus a finite native syscall probe.
 The tested cases pass without a production change. This strengthens coverage
 of timer delivery; it does not establish scheduler latency under load.
 
+The original overflow-rejection observations below describe the pre-fix
+implementation. The subsequent [timeout saturation fix](timeout-saturation.md)
+accepts structurally valid huge values and safely caps deadlines; the same
+eighteen-case timer probe still passes.
+
 ## Expiry and admission protocol
 
 The BSP timer interrupt calls `PosixTimersTickLocked` with the process registry
