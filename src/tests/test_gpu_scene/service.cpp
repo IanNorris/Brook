@@ -18,8 +18,11 @@ unsigned imagePreparations=0;
 uint64_t windowIncarnation=1,windowGeneration=1;
 bool liveWindow=true,failCopy=false,failAllocation=false,failRetire=false,failRoot=false;
 bool deferWorker=false;
+bool drainOnWake=false,completeBeforeBlock=false,fakeBlocked=false;
+unsigned blockCalls=0,wakeCalls=0,latchedWakes=0;
 brook::GpuCaptureResult operationResult=brook::GpuCaptureResult::Complete;
-std::function<void()> atGpu,atSleep;
+std::function<void()> atGpu,atSleep,atDeadline,atAdmission,atNotify;
+uint64_t timerPending=0;
 brook::GpuCompositorOps fakeGpu{};
 brook::GpuAppOps fakeApp{};
 brook::Process* fakeOwner;
@@ -58,11 +61,36 @@ extern "C" void* kmalloc(uint64_t bytes) { return std::malloc(bytes); }
 extern "C" void kfree(void* ptr) { std::free(ptr); }
 void KMutexLock(KMutex*) { EXPECT(sceneLockDepth++==0); }
 void KMutexUnlock(KMutex*) { EXPECT(sceneLockDepth--==1); }
-extern "C" void CompositorWake() {}
-extern "C" void SchedulerSleepMs(uint32_t ms) {
-    EXPECT(!sceneLockDepth);g_lapicTickCount+=ms;Callback(atSleep);
+extern "C" void CompositorWake() {
+    if (drainOnWake) { drainOnWake=false;CompositorDrainScenes(); }
+}
+uint64_t PosixTimerPending(Process*) { return timerPending; }
+void SchedulerUnblock(Process* p) {
+    EXPECT(!sceneLockDepth && p==fakeOwner && p->refCount>=3);
+    Callback(atNotify);
+    ++wakeCalls;
+    if (fakeBlocked) fakeBlocked=false;
+    else p->pendingWakeup=1;
+}
+void SchedulerBlockInterruptible(Process* p) {
+    EXPECT(!sceneLockDepth && p==fakeOwner && p->refCount>=2);
+    ++blockCalls;
+    if (completeBeforeBlock) {
+        completeBeforeBlock=false;Callback(atSleep);CompositorDrainScenes();
+    }
+    if (p->pendingWakeup) { p->pendingWakeup=0;++latchedWakes;return; }
+    Callback(atAdmission);
+    if (p->terminalPending || ((p->sigPending | timerPending) & ~p->sigMask)) return;
+    fakeBlocked=true;Callback(atSleep);
     if (!deferWorker) CompositorDrainScenes();
     deferWorker=false;
+    if (fakeBlocked) { g_lapicTickCount=p->wakeupTick;fakeBlocked=false;Callback(atDeadline); }
+}
+extern "C" void SchedulerSleepMs(uint32_t ms) {
+    EXPECT(!sceneLockDepth);fakeBlocked=true;g_lapicTickCount+=ms;Callback(atSleep);
+    if (!deferWorker) CompositorDrainScenes();
+    deferWorker=false;
+    fakeBlocked=false;
 }
 VirtualAddress VmmAllocPages(uint64_t count,uint64_t,MemTag,uint16_t) {
     EXPECT(!sceneLockDepth);
@@ -135,6 +163,7 @@ void CheckedEmpty() {
     Drain();EXPECT(!brook::g_scenes && !brook::g_jobs && !brook::g_sceneCount);
     EXPECT(!brook::g_snapshotBytes && !brook::g_head && !brook::g_tail && !brook::g_quarantine);
     EXPECT(pages.empty() && textures.empty() && !sceneLockDepth);
+    EXPECT(fakeOwner->refCount==1);
 }
 // Test fixture destruction only, after asserting quarantine remains retained.
 // Represents host/device destruction; no production reset support is claimed.
@@ -219,12 +248,13 @@ void SharedQuarantine(unsigned mode) {
 }
 void CaptureReservations() {
     using namespace brook;
-    struct State { GpuReservation reservation;MappingBacking* backing;unsigned calls=0;bool safe=false,captured=false; };
+    struct State { GpuReservation reservation;MappingBacking* backing;unsigned calls=0;bool safe=false,captured=false;SceneJob* job=nullptr; };
     const auto finish=[](void* context,bool safe,bool captured) {
         auto& state=*static_cast<State*>(context);EXPECT(++state.calls==1 && state.backing->references);
+        if (state.job) EXPECT(state.job->state!=JobState::Done);
         state.safe=safe;state.captured=captured;state.reservation.FinishCapture(safe,captured);
     };
-    for(unsigned mode=0;mode<6;++mode) {
+    for(unsigned mode=0;mode<7;++mode) {
         auto* scene=OpenScene();MappingBacking backing{1,nullptr,nullptr,nullptr};
         State state{};state.backing=&backing;
         EXPECT(state.reservation.ImportCompleted(2) && state.reservation.BeginCapture());
@@ -237,6 +267,8 @@ void CaptureReservations() {
             // Both exported WRITE snapshots and conflicting BO submissions
             // see this source as busy while its actual scene job is queued.
             ++waits;
+            state.job=g_head;
+            if (mode==6) SceneHandleUnref(scene);
         };
         if(mode==1)g_jobs=MaxJobs; // admission fails without a GPU read
         if(mode==2)fakeOwner->terminalPending=true; // queued cancellation
@@ -253,18 +285,91 @@ void CaptureReservations() {
         else if(mode==3 || mode==5)EXPECT(result==-5 && !state.safe && !state.captured && state.reservation.uncertain);
         else EXPECT(result<0 && state.safe && !state.captured && state.reservation.BeginCapture());
         if(mode!=0 && mode!=3 && mode!=5)state.reservation.FinishCapture(true,false);
-        EXPECT(waits==(mode==1?0u:1u));
-        EXPECT(imagePreparations==(mode==1 || mode==2 || mode==4?0u:1u));
-        SceneHandleUnref(scene);Drain();
+        EXPECT(waits==((mode==1 || mode==2)?0u:1u));
+        EXPECT(imagePreparations==(mode==1 || mode==2 || mode==4 || mode==6?0u:1u));
+        if(mode!=6)SceneHandleUnref(scene);Drain();
         if(mode==3 || mode==5) { EXPECT(backing.references==2);DropDeviceFixture(); }
         EXPECT(backing.references==1);MappingBackingUnref(&backing);CheckedEmpty();
     }
     fakeApp={};
 }
+void CompletionWakes() {
+    using namespace brook;
+    auto* legacy=OpenScene();const auto oldWakeCount=wakeCalls,oldBlockCount=blockCalls;
+    SceneCompletionWakeEnable(false);EXPECT(!SceneCompletionWakeEnabled());
+    EXPECT(UploadPixels(legacy,9)>0 && wakeCalls==oldWakeCount && blockCalls==oldBlockCount);
+    SceneHandleUnref(legacy);CheckedEmpty();SceneCompletionWakeEnable(true);
+    for (unsigned mode=0;mode<3;++mode) {
+        auto* scene=OpenScene();const auto oldBlocks=blockCalls,oldWakes=wakeCalls,oldLatched=latchedWakes;
+        drainOnWake=mode==0;completeBeforeBlock=mode==1;
+        EXPECT(UploadPixels(scene,mode+10)>0);
+        EXPECT(blockCalls-oldBlocks==(mode==0?0u:1u));
+        EXPECT(wakeCalls-oldWakes==(mode==0?0u:1u));
+        EXPECT(latchedWakes-oldLatched==(mode==1?1u:0u));
+        EXPECT(fakeOwner->refCount==1 && !fakeOwner->wakeupTick);
+        SceneHandleUnref(scene);CheckedEmpty();
+    }
+    // A signal racing admission must not busy-spin or return before the job's
+    // ownership is resolved. Keep the former bounded sleep path in that case.
+    auto* scene=OpenScene();fakeOwner->sigPending=1;
+    EXPECT(UploadPixels(scene,20)>0);fakeOwner->sigPending=0;
+    fakeOwner->pendingWakeup=0;SceneHandleUnref(scene);CheckedEmpty();
+    for (bool timer:{false,true}) {
+        scene=OpenScene();const auto oldBlocks=blockCalls;
+        atAdmission=[&] { if (timer) timerPending=1;else fakeOwner->sigPending=1; };
+        EXPECT(UploadPixels(scene,21)>0 && blockCalls==oldBlocks+1);
+        fakeOwner->sigPending=timerPending=0;fakeOwner->pendingWakeup=0;
+        SceneHandleUnref(scene);CheckedEmpty();
+    }
+    scene=OpenScene();fakeOwner->sigPending=fakeOwner->sigMask=1;
+    const auto oldBlocks=blockCalls;
+    EXPECT(UploadPixels(scene,22)>0 && blockCalls==oldBlocks+1);
+    fakeOwner->sigPending=fakeOwner->sigMask=0;SceneHandleUnref(scene);CheckedEmpty();
+    scene=OpenScene();const auto oldWake=wakeCalls;
+    atAdmission=[] { SceneCompletionWakeEnable(false); };
+    EXPECT(UploadPixels(scene,23)>0 && wakeCalls==oldWake+1);
+    EXPECT(!SceneCompletionWakeEnabled());SceneCompletionWakeEnable(true);
+    SceneHandleUnref(scene);CheckedEmpty();
+    // Notifier's temporary pin survives the caller dropping registration and
+    // its job reference between the notifier's snapshot and scheduler wake.
+    scene=OpenScene();auto* raced=NewJob(scene->scene,JobKind::Upload);
+    EXPECT(raced && !ReserveImage(raced,4,4,1,0));
+    KMutexLock(&g_sceneLock);EXPECT(CancelMetadata(raced));
+    raced->state=JobState::Done;raced->references=2;raced->waiter=fakeOwner;
+    ProcessRef(fakeOwner);KMutexUnlock(&g_sceneLock);
+    atNotify=[&] {
+        KMutexLock(&g_sceneLock);raced->waiter=nullptr;KMutexUnlock(&g_sceneLock);
+        ProcessUnref(fakeOwner);JobUnref(raced);
+        EXPECT(fakeOwner->refCount==2 && raced->references==1);
+    };
+    WakeJobWaiter(raced);EXPECT(fakeOwner->refCount==1 && !raced->waiter);
+    JobUnref(raced);fakeOwner->pendingWakeup=0;SceneHandleUnref(scene);CheckedEmpty();
+    for (bool terminal:{false,true}) {
+        scene=OpenScene();auto* job=NewJob(scene->scene,JobKind::Upload);
+        EXPECT(job && !ReserveImage(job,4,4,1,0));
+        job->state=JobState::Running;job->references=2;
+        fakeOwner->terminalPending=terminal;
+        // Simulate the worker's completion only after WaitJob marks a running
+        // operation canceled. The caller must keep its registration/ref alive.
+        std::function<void()> complete=[&] {
+            EXPECT(job->canceled && job->waiter==fakeOwner && fakeOwner->refCount==2);
+            KMutexLock(&g_sceneLock);EXPECT(CancelMetadata(job));
+            job->result=-110;job->state=JobState::Done;KMutexUnlock(&g_sceneLock);
+            WakeJobWaiter(job);JobUnref(job);
+        };
+        if (terminal) atSleep=complete;
+        else atDeadline=[&] { atSleep=complete; };
+        EXPECT(WaitJob(fakeOwner,job)==-110);
+        fakeOwner->terminalPending=false;fakeOwner->pendingWakeup=0;
+        SceneHandleUnref(scene);CheckedEmpty();
+    }
+}
 }
 void TestSceneService() {
     using namespace brook;
     fakeOwner=static_cast<Process*>(std::calloc(1,sizeof(Process)));EXPECT(fakeOwner);
+    fakeOwner->refCount=1;
+    EXPECT(!SceneCompletionWakeEnabled());SceneCompletionWakeEnable(true);
     fakeGpu.CreateOwnedTexture=CreateTexture;fakeGpu.DestroyOwnedTexture=DestroyTexture;
     fakeGpu.UploadOwnedTexture=Upload;fakeGpu.CaptureExternal=Capture;
     fakeGpu.ComposeOwnedLayers=[](uint32_t destination,const GpuSceneLayer* layers,uint32_t count) {
@@ -360,6 +465,7 @@ void TestSceneService() {
     CloneImages();
     SharedQuarantine(0);SharedQuarantine(1);SharedQuarantine(2);
     CaptureReservations();
+    CompletionWakes();
     std::free(fakeOwner);fakeOwner=nullptr;
     std::puts("SCENE_SERVICE_PASS real queue/ownership transitions with fake GPU: packing, source leases, close, replacement, reuse, capacity, uncertainty");
 }

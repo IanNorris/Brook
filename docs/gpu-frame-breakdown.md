@@ -373,3 +373,109 @@ Request-level GPU ioctl timing is the next diagnostic needed to separate
 command-lock acquisition, producer fences and other waits. Evidence is
 `unattended-uncapped-q2-gpu-1ms-fixed-mlfq-c-20261021/uncapped-syscalls/`;
 original VM/controller exit and four offline filesystem checks pass.
+
+## Request-level client timing and scene completion candidate
+
+`tools/profiling/drm_ioctl_trace.c` is an optional libdrm preload probe. It
+uses fixed-size per-thread/request/phase aggregates, logarithmic duration
+histograms, explicit overflow/clock/in-flight quality counters and teardown
+output. Optional hooks in the SDL2 swap probe classify the swap thread's
+calls after 50 skipped swaps; other threads/startup remain unscoped. The
+analyzer rejects lost/incomplete/inconsistent aggregates. Histogram percentile
+outputs are bucket bounds. Elapsed time includes scheduling, not just CPU.
+The eight actual-probe host tests cover phases, errno/return preservation,
+concurrent threads, disabled output, overflow/corruption, in-flight teardown,
+late RTLD_LOCAL libdrm lookup and actual SDL swap-interval metadata.
+
+In private `unattended-drm-q2-gpu-1ms-fixed-mlfq-a-20261021/drm-q2-retry/`,
+618 swaps after the skipped prefix take 17.782 s inside SDL, of which
+2.530 s is inside libdrm; the explicit non-DRM residual is 15.252 s. There
+are 617 complete between-swap intervals totaling 5.897 s. Outside-swap
+libdrm aggregates include shutdown; conservatively bounding that 201.632 ms
+tail gives 3.802–4.004 s within the intervals and a 1.893–2.095 s residual.
+These are a longer diagnostic scene span, not the earlier short benchmark
+or exact observed demo-marker bounds. Probes and different later demo scenes
+preclude treating its throughput as a clean performance comparison.
+
+Between-swap EXECBUFFER requests account for 3.367 s across 3,360 calls,
+while 267,986 WAIT calls account for 0.531 s. Inside-swap EXECBUFFER calls
+account for 2.529 s across 618 calls. Thus submission serialization is real,
+but the large inside-swap residual requires investigation of the Wayland
+server/callback path as well. The shared queue is not established as the sole
+presentation bottleneck. The first launch failed because Mesa loads libdrm
+locally; the probe's guarded loaded-library lookup fixes that case, with a
+regression test. The failed original job remains retained.
+
+A separate `unattended-drm-q2-gpu-1ms-fixed-mlfq-b-20261021/drm-q2/` capture
+queries SDL2's getter: all 668 swaps report interval zero, with no missing
+queries, dropped rows or incomplete swaps. This verifies the API state beyond
+the saved cvar. Existing Wayland `--trace-frames` is enabled in this capture.
+The pinned Mesa 26.0.6 source's `dri2_wl_swap_buffers_with_damage` explicitly
+uses a display-sync callback even when the interval is zero, allowing the
+server to process commits and buffer releases. This is not a vblank guarantee.
+Both diagnostic VMs exit cleanly, with trace hashes checked after four clean
+offline filesystem checks and zero runtime error counters.
+
+The next candidate changes scene-job completion notification. Previously the
+server's capture and dependent present calls each polled `WaitJob` with 1 ms
+sleeps; the worker never woke the waiting caller directly. The candidate
+registers a pinned caller under the scene lock, publishes completion under
+that same lock, then takes a temporary reference and notifies outside the
+lock. Scheduler pending wakes cover completion before block admission.
+Notification precedes potentially expensive retirement of the old immutable
+root; the worker retains its job reference through retirement. Absolute
+timeout and finish-before-return ownership remain. Pending ordinary signals
+and already-canceled running jobs retain the previous bounded sleep fallback.
+
+The worker-canceled path also now completes its source-ownership callback
+before publishing Done, closing a pre-existing cancellation-ordering race.
+Actual service tests cover completion before registration, between registration
+and block, after blocking, signal/timer admission races, masked signals,
+notifier/caller reference handoff, worker close, running cancellation/timeouts
+and uncertain results. The final build passes all 81 hosted tests, eight
+preload tests and 15 frame/swap analyzer tests. The first native results below do not demonstrate a performance gain;
+the completion-wakeup path remains an opt-in experiment. No GPU fence or scheduler default
+is removed or changed. The separately identified legacy AppBufferUpload
+attachment/teardown lifetime hazard remains open before wider concurrency.
+
+The always-on candidate's traced 600-record Quake interval is 24.656 s versus
+23.564 s in the preceding traced control, with the same probes, driver modules
+and actual SDL interval zero. Inside-swap non-DRM residual grows from
+15.777 to 16.939 s; between-swap totals remain approximately 5.85 s. This
+single ordered pair does not prove a regression, but it does not support a
+speedup claim. Its separate loaded cohort reports Quake VSync-on observed
+swap completions 20.80/s, vkmark vertex/texture 33/33 FPS, versus earlier
+1 ms controls around 21–22/s and 37–38 FPS. Native heap/runtime/output,
+original VM/controller exit and four offline filesystem checks pass.
+Inspected Quake, vkcube and vkmark snapshots show plausible scenes without
+obvious geometry/surface corruption; these are not frame-by-frame goldens.
+Minimize/restore acknowledgements include bridge latency and do not establish
+input-to-photon responsiveness.
+
+Accordingly, `gpu scene wake on|off|status` controls a **default-off** runtime
+experiment. Each WaitJob snapshots the setting; switching it off never
+discards an existing registered waiter or its notification. The source
+ownership-before-Done cancellation fix remains unconditional. A final build
+with the control passes all 81 hosted tests and the same 23 profiling/analyzer
+tests, including switching the control off during an active registration.
+A same-kernel off/on/off diagnostic is required before reconsidering the
+default. Broader concurrency, the legacy upload lifetime hazard, server-side
+commit/sync attribution, physical-audio and scheduler acceptance remain open.
+
+The same-kernel off/on/off run completes in 23.853 / 25.182 / 22.562
+guest-clock seconds over the observed demo-marker span. All three runs use
+the same hash-checked private demo and preload binaries, and all 668 swaps
+report actual SDL interval zero. The on run is slower than both adjacent
+off controls, chiefly in the inside-swap non-DRM residual (17.609 s versus
+15.839 / 14.785 s), while inside-swap DRM is 2.470 s versus 2.544 / 2.526 s.
+The native control switch works and remains off after the trial. Heap,
+runtime counters, original controllers/VM and four offline filesystem checks
+pass; raw traces are hash-checked. This is one ordered trial, not a statistical
+regression proof. It gives no reason to promote completion wakes to default.
+Evidence is `unattended-scene-wake-control-gpu-1ms-fixed-mlfq-a-20261021/`.
+
+Next, instrument a bounded Wayland commit/scene-control/display-sync/output-
+flush timeline with explicit client, surface and callback identity. A protocol
+event queued and a flush attempt are not proof of delivery to the client.
+Only after attributing this residual should we consider combining capture
+and present into a transactional job or allowing more owned GPU submissions.

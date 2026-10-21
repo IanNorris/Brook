@@ -43,6 +43,7 @@
 #include "mouse.h"
 #include "shell.h"
 #include "compositor.h"
+#include "compositor_scene.h"
 #include "debug_jobs.h"
 #include "debug_epoch.h"
 #include "debug_ui.h"
@@ -3791,6 +3792,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
             "  gpu frame timing on|off|reset|status|frames - bounded exclusive compositor stages\n"
+            "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
             "  audio contributions on|off|reset|status - accepted native mix contributions (default off)\n"
@@ -4307,6 +4309,13 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("invalid_clock",s.invalidClock);r.text(",");r.field("unsupported_driver",s.unsupportedDriver);
         r.text(",");r.field("late_resumes",s.lateResumes);
         r.text(",\"scope\":\"default-off fixed intel_hda 12-KiB lead experiment; one deferred opportunity, not a wall-time guarantee; recovered means ready at next preparation, not proven playback\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"gpu scene wake on") || NetStrEq(cmd,"gpu scene wake off") ||
+            NetStrEq(cmd,"gpu scene wake status")) {
+        if(NetStrEq(cmd,"gpu scene wake on"))SceneCompletionWakeEnable(true);
+        if(NetStrEq(cmd,"gpu scene wake off"))SceneCompletionWakeEnable(false);
+        BridgeReply r;r.text("{\"enabled\":");r.text(SceneCompletionWakeEnabled()?"true":"false");
+        r.text(",\"scope\":\"default-off scene completion wake experiment; per-wait snapshot, existing registrations retained\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"gpu frame timing on") || NetStrEq(cmd,"gpu frame timing off") ||
             NetStrEq(cmd,"gpu frame timing reset") || NetStrEq(cmd,"gpu frame timing status") ||

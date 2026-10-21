@@ -12,6 +12,10 @@ bool SceneActivate(SceneHandle*);
 void SceneHandleRef(SceneHandle*);
 void SceneHandleUnref(SceneHandle*);
 void SceneGetStats(SceneHandle*,SceneStatsDesc&);
+// Default-off completion-notification experiment. Each waiting syscall takes
+// one snapshot; changing the flag never removes an existing registration.
+void SceneCompletionWakeEnable(bool);
+bool SceneCompletionWakeEnabled();
 int64_t SceneUpload(Process*,SceneHandle*,const SceneUploadDesc&);
 struct SceneCaptureSync {
     void* context=nullptr;

@@ -6,6 +6,7 @@
 #include "window.h"
 #include "process.h"
 #include "scheduler.h"
+#include "posix_timer.h"
 #include "sync/kmutex.h"
 #include "memory/heap.h"
 #include "memory/virtual_memory.h"
@@ -44,6 +45,9 @@ struct SceneJob {
     uint32_t references;
     JobKind kind;
     JobState state;
+    // g_sceneLock protects registration. The waiting syscall pins this process;
+    // a notifier takes its own temporary reference before dropping the lock.
+    Process* waiter;
     bool canceled;
     int64_t result;
     SceneImageInfo image;
@@ -66,6 +70,7 @@ SceneJob* g_tail;
 SceneJob* g_quarantine;
 uint32_t g_jobs,g_sceneCount;
 uint64_t g_snapshotBytes;
+bool g_completionWake;
 
 void ApplyClose(Scene* scene) {
     if (scene->closing || !(__atomic_load_n(&scene->lifecycle,__ATOMIC_ACQUIRE)&2u)) return;
@@ -161,12 +166,16 @@ int Enqueue(SceneJob* job) {
 }
 int64_t WaitJob(Process* caller,SceneJob* job) {
     const uint64_t deadline=ApicTickCount()+5000;
+    const bool completionWake=SceneCompletionWakeEnabled();
     int64_t result;
+    bool registered=false;
     for (;;) {
         bool dropWorker=false;
         KMutexLock(&g_sceneLock);
         if (job->state==JobState::Done) {
-            result=job->result;KMutexUnlock(&g_sceneLock);break;
+            result=job->result;
+            if (registered) job->waiter=nullptr;
+            KMutexUnlock(&g_sceneLock);break;
         }
         if (ApicTickCount()>=deadline ||
             (caller && __atomic_load_n(&caller->terminalPending,__ATOMIC_ACQUIRE))) {
@@ -186,11 +195,43 @@ int64_t WaitJob(Process* caller,SceneJob* job) {
                 }
             }
         }
+        const bool done=job->state==JobState::Done;
+        const bool canceled=job->canceled;
+        if (!done && caller && completionWake) {
+            if (!registered) { ProcessRef(caller);job->waiter=caller;registered=true; }
+            // Ordinary waits use one absolute timeout, not 1ms polling. A
+            // running job still owns its source after cancellation/timeout;
+            // retain the former bounded retry until that worker finishes.
+            caller->wakeupTick=ApicTickCount()<deadline?deadline:ApicTickCount()+1;
+        }
         KMutexUnlock(&g_sceneLock);
         if (dropWorker) JobUnref(job);
-        SchedulerSleepMs(1);
+        if (done) continue;
+        if (!completionWake) { SchedulerSleepMs(1);continue; }
+        if (caller && !canceled) {
+            const uint64_t pending=__atomic_load_n(&caller->sigPending,__ATOMIC_ACQUIRE) |
+                                   PosixTimerPending(caller);
+            // Preserve the existing finish-before-return ownership rule for
+            // ordinary signals. Do not busy-spin if interruptible admission
+            // rejects an already-pending signal. Terminal cancellation wakes
+            // ordinary waits and then uses the existing bounded retry path.
+            if (!(pending & ~__atomic_load_n(&caller->sigMask,__ATOMIC_ACQUIRE)))
+                SchedulerBlockInterruptible(caller);
+            else SchedulerSleepMs(1);
+        } else SchedulerSleepMs(1);
     }
+    if (registered) { caller->wakeupTick=0;ProcessUnref(caller); }
     JobUnref(job);return result;
+}
+// Caller retains a job reference across this function. Registration and Done
+// share a lock: completion before block is remembered by pendingWakeup, while
+// completion before registration is observed directly by WaitJob.
+void WakeJobWaiter(SceneJob* job) {
+    KMutexLock(&g_sceneLock);
+    Process* waiter=job->state==JobState::Done?job->waiter:nullptr;
+    if (waiter) ProcessRef(waiter);
+    KMutexUnlock(&g_sceneLock);
+    if (waiter) { SchedulerUnblock(waiter);ProcessUnref(waiter); }
 }
 // Bounded, compositor-thread-only cleanup. A marked eviction holds the scene
 // alive until this worker records the driver result. No callbacks under lock.
@@ -230,6 +271,8 @@ void ReapScenes() {
 }
 
 struct SceneHandle { uint32_t references;Scene* scene; };
+void SceneCompletionWakeEnable(bool on) { __atomic_store_n(&g_completionWake,on,__ATOMIC_RELEASE); }
+bool SceneCompletionWakeEnabled() { return __atomic_load_n(&g_completionWake,__ATOMIC_ACQUIRE); }
 
 SceneHandle* SceneCreate(Process* caller,uint32_t window,int* error) {
     *error=-95;
@@ -385,8 +428,8 @@ void CompositorDrainScenes() {
         const bool canceled=job->scene->closing || job->canceled;
         bool canceledUncertain=false,inputsReady=true;
         if (canceled) {
-            if (CancelMetadata(job)) { job->state=JobState::Done;job->result=-125; }
-            else { QuarantineJob(job,true);canceledUncertain=true; }
+            if (CancelMetadata(job)) job->result=-125;
+            else canceledUncertain=true;
         } else if (job->kind==JobKind::Present) {
             for (uint32_t i=0;i<job->count;++i) {
                 SceneImageInfo image{};
@@ -399,6 +442,13 @@ void CompositorDrainScenes() {
         KMutexUnlock(&g_sceneLock);
         if (canceled) {
             FinishSource(job,!canceledUncertain,false);
+            // Even a timeout/signal wake must not observe Done before the
+            // source ownership callback completes. Keep Running until then.
+            KMutexLock(&g_sceneLock);
+            if (canceledUncertain) QuarantineJob(job,true);
+            else job->state=JobState::Done;
+            KMutexUnlock(&g_sceneLock);
+            WakeJobWaiter(job);
             if (!canceledUncertain) JobUnref(job);continue;
         }
         auto* scene=job->scene;GpuCaptureResult result=GpuCaptureResult::Rejected;
@@ -462,6 +512,7 @@ void CompositorDrainScenes() {
         job->state=JobState::Done;
         if (uncertain) QuarantineJob(job,true);
         KMutexUnlock(&g_sceneLock);
+        WakeJobWaiter(job);
         CompositorRetireSceneRoot(retired);
         if (!uncertain) JobUnref(job);
     }
