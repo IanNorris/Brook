@@ -299,10 +299,55 @@ original playback controller and VM owner exited zero. Evidence is in the same
 review's `horizon-control/summary.json`; production sanitizer results are in
 `reboot-resume/horizon-production-sanitized.log`.
 
-A fresh real Firefox/Quake/load cohort is the next gate. Horizon must be enabled
-before endpoint configuration for prospective negotiation, with actual stream
-capacity, fragment size and low-water threshold observed. Policy reversal on
-those established endpoints must preserve geometry and settle prior accepted
-credits. This is distinct from a comparison with default small geometry.
-Real mixed-app acceptance and historical fast playback remain open. No audio
-or scheduler default is promoted.
+### Real Firefox/Quake/load follow-up
+
+Fresh review `unattended-horizon-mixed-fixed-mlfq-b-20261021` enables horizon
+before endpoint configuration. Firefox negotiates capacity/fragment/low-water
+of 4,416/64/64 frames; Quake negotiates 8,192/2,048/2,048. Each identity/epoch
+keeps that geometry through captures and policy reversals. Prior accepted
+source frames drain across transitions before warmup/capture. This compares
+policy on established enlarged buffers, not default small-buffer geometry.
+
+| Phase | Firefox completion / nominal | Quake completion / nominal | Quake swaps / guest second |
+| --- | ---: | ---: | ---: |
+| Firefox alone, on | 1.0003 | — | — |
+| Both, on A | 0.9183 | 0.9989 | 8.63 |
+| Same endpoints, off B | 0.4566 | 0.7616 | 8.83 |
+| Same endpoints, on C | 0.9308 | 1.0001 | 8.52 |
+| Eight CPU workers, Quake focused, on | 0.9403 | 1.0012 | 8.00 |
+| Eight CPU workers, Firefox focused, on | 0.8946 | 1.0001 | 8.27 |
+| Firefox after Quake close, off | 0.9981 | — | — |
+| Reopened Quake, negotiated on then captured off | 0.4607 | 0.7769 | 8.51 |
+
+All eight browser windows are valid, with rate one, audio enabled and no media
+error. These counters measure per-stream completion, not decoded music tempo;
+swaps are application presentation calls, not scanout. The policy reversal
+supports an audio-throughput improvement, not a graphics throughput claim.
+Firefox still underfeeds with both apps active. Its observed 4,416/64 geometry
+is not one of the earlier symmetric hosted tuples; an asymmetric actual-body
+control is needed before attributing its remaining deficit or changing bounds.
+
+All nine original jobs pass complete-output/identity/empty-group checks; both
+bounded-load captures lie inside all workers' active intervals. The independent
+guest media hash, every full sender transfer, reconciled request receipts and
+an observed error-free browser loop pass. All eight heavy probes stay disabled
+at capture endpoints; cached audio snapshots, WAV recording and buffered SDL
+frame traces remain. Accepted-contribution categories were not recorded in
+these performance windows and cannot be inferred from completion alone.
+Current native audio, heap, policy, clean owner/server exits and all four
+filesystem checks pass.
+
+**Runtime acceptance fails:** two clamps form one debt episode, maximum
+12,796 ns, one owner transition and one catchup; final known debt is zero.
+There are no backwards clocks, invalid samples or stale identities. Catchup
+does not waive the failed gate or earlier attribution limitations. Cleanup
+history was enabled after the timed windows and did not capture this episode;
+do not claim a new complete positive history from its later ring contents.
+
+The first mixed attempt stopped at an empty-stream admission assertion before
+launching apps. Its three original preflight jobs, clean shutdown and filesystem
+checks are retained separately under replica A; they are not a workload cohort.
+Replica B's `mixed-prefix-control/verification.json`, `geometry-transitions.json`
+and `summary.json` retain the actual horizon results despite the inherited
+directory/phase names. No audio or scheduler default is promoted. Full mixed
+acceptance and historical fast playback remain open.

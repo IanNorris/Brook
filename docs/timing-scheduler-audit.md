@@ -28,7 +28,16 @@ Later evidence supersedes several early leads:
   off/on/off control gives decoded rates about 0.949/1.000/0.991 and quiet-bin
   fractions about 3%/0%/0.75%. All twelve producer/export jobs, current runtime,
   heap, HDA, policy and four filesystem checks pass. Disabled-arm variability
-  limits general effect-size claims; real mixed-app acceptance remains pending.
+  limits general effect-size claims. A fresh real Firefox/Q2/load reversal on
+  unchanged negotiated buffers gives Firefox 0.918/0.457/0.931 and Quake
+  0.999/0.762/1.000 completion ratios on/off/on. Quake remains near nominal
+  under bounded load; Firefox retains a deficit, and swap throughput stays
+  similar across reversal. All nine original jobs, full media transfers, browser
+  loop, native audio, heap/policy, shutdown and four filesystem checks pass.
+  Runtime acceptance fails two clamps (12.796-us maximum deficit, later caught
+  up), so full mixed acceptance is not claimed. Actual Firefox 4,416/64 and
+  Quake 8,192/2,048 capacity/fragment tuples stay invariant across reversal;
+  asymmetric hosted coverage is the next discriminator for remaining underfeed.
   Rebuilt production ASan/UBSan audio/geometry suites pass with documented
   global-redzone/leak-detector exclusions. No default is changed.
 
