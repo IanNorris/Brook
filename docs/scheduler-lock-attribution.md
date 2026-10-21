@@ -881,3 +881,54 @@ filesystem gates passing. Reducing publication distance remains an experiment
 requiring hosted production-driver fault/burst tests and native contention
 controls. Keep the 8,192-byte codec tail trailer and all publication guards.
 All original launchers and jobs are terminal and the VMs are stopped.
+
+
+## Verified host-contention attribution, 21 October
+
+The corrected eight-vCPU RR/Quake control uses the unchanged 12-KiB HDA lead,
+callback HDA/20-ms PipeWire buffering and eight finite CPU workers for twenty
+seconds. Every QMP-identified vCPU is verified on CPUs 0–7 before and after
+load. Two resetting I/O helpers retain their 0–15 masks; this is a vCPU-focused
+control, not a full-thread CPU reservation. Ready-lock and audio-service probes
+and a bounded read-only host observer are enabled; CPU profiling is off.
+
+The trace retains 24 complete consistent events, 974,875 lifetime completions,
+zero lost/clock-error/inconsistent/old-window rows and two conditional ticket
+handoff matches. The largest observed hold is 988,247 ns in `SchedulerTimerTick`,
+with 983,940 ns reported steal. The largest wait is 21,998,935 ns, with
+21,951,858 ns reported steal between its observations. Other retained maximum
+holds are below a millisecond. The frozen kernel hash is checked before caller
+strings are resolved from its ELF load segments.
+
+In the same run, the mixer resumes 10.694 seconds late and then spends 3.387
+seconds in service; a later wake is 3.603 seconds late. A native sample-gap
+fault follows the first delayed resumption. The ready trace therefore does
+**not support a retained multi-second ready-lock hold** as the explanation.
+It is still a bounded observation protocol with publication gaps, not proof
+that every possible locking contribution is absent or permission to change
+lock admission/default policy.
+
+The 21.93-second host observer records 44 snapshots. Eight ordinary-priority,
+nice-zero vCPU threads accumulate 16.77–19.78 seconds of runnable-wait and
+0.40–3.64 seconds of host CPU execution each. Some have hundreds of thousands
+of scheduling slices: CPU 1 has 503,858 slices over 3.642 seconds of execution,
+and CPU 6 has 529,978 over 3.211 seconds. These are not guest context-switch
+counts. They motivate checking host exit/yield churn, not a conclusion about
+which guest instruction or host scheduling rule caused it.
+
+Astra's source follow-up identifies a specific candidate: synchronous GPU
+completion polling executes PAUSE on every missed used-ring check while its
+command mutex remains owned. KVM pause-loop handling can direct a yield toward
+another vCPU, although device completion depends on host backend progress.
+That mechanism is plausible, not established by these aggregate observations.
+The next measurement should use per-VM KVM exit/yield counters where available,
+with a narrow isolated PAUSE/NOP completion-poll control if needed. Kernel-wide
+tracepoint access is unavailable to this app's nonprivileged process; the
+noninteractive readability check failed because the process has no-new-privileges.
+No host privilege policy or global KVM parameter is changed.
+
+Evidence is retained under
+`build/reviews/unattended-hda-12k-q2-lock-callback-20261021`, including the
+original trace, exact-kernel offline analysis, host scheduling/context-switch
+snapshots and all original owner/lifecycle/filesystem receipts. Audio acceptance
+remains failed despite clean trace/runtime/heap and lifecycle checks.

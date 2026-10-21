@@ -14,4 +14,9 @@ fi
 # to create it, and a freshly copied review need not contain this directory.
 mkdir -p -- "$review_dir/tmp-host"
 export TMPDIR="$review_dir/tmp-host"
+# Apply affinity before QEMU creates vCPU, audio and renderer threads. Changing
+# only QEMU's process leader later leaves its existing threads unrestricted.
+if [ -n "${BROOK_REVIEW_CPUSET:-}" ]; then
+    exec taskset --cpu-list "$BROOK_REVIEW_CPUSET" "$review_dir/launch.sh"
+fi
 exec "$review_dir/launch.sh"

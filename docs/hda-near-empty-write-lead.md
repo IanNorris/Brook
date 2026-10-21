@@ -1,5 +1,15 @@
 # HDA near-empty write publication
 
+**21 October affinity correction:** the first loaded-control scripts changed
+only QEMU's main-thread CPU mask after launch. They did not constrain existing
+vCPU/audio/renderer threads. A live QMP/host audit of the nominal eight-CPU
+pressure run confirms all eight KVM vCPU threads still allowed CPUs 0–15.
+Earlier host workers were bounded and pinned, but VM CPU reservations and
+fully shared contention were not established. Keep their functional/audio
+results; do not use them as proof of a pinned contention margin. A corrected
+launch-time-affinity pair and per-thread verification are recorded below.
+
+
 The [mixer timing baseline](audio-mixer-service-timing.md) reproduces a native
 write-publication hazard. The device has consumed all but 744 bytes of the
 submitted audio when a new 3,072-byte write begins. Its position then advances
@@ -195,9 +205,10 @@ worktree and private capsules.
 Both frozen leads completed sequential four- and eight-fragment OSS writers
 (4,096 bytes per fragment), each submitting and completing exactly 882,000
 frames at 44.1 kHz. Each run overlapped eight host CPU workers and four sleepers
-for twenty seconds on CPUs 0–13, with the VM restricted to those CPUs and two
-host CPUs reserved. This is finite host contention, not a worst-case scheduling
-or DMA guarantee.
+for twenty seconds on CPUs 0–13. Only the VM main thread was restricted
+to those CPUs; existing vCPU threads were not pinned by that call. Thus no
+VM-wide reservation or fully shared CPU contention was established. This
+remains a finite functional load test, not a worst-case DMA guarantee.
 
 | Lead | Fragments | Guest delivery seconds | Reserved bytes | Decoded source seconds / stored PCM second |
 | --- | ---: | ---: | ---: | ---: |
