@@ -5,6 +5,15 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Mixed real applications](mixed-desktop-timing.md) complete Firefox, two
+  finite GL3 attract runs and eight guest CPU workers with clean original task,
+  VM and filesystem lifecycles. Concurrent stream completion falls near
+  0.62/0.54 nominal, returns to 1.00 for Firefox after Quake closes and repeats
+  on reopen; CPU load changes it little. Two clamps retain a failed runtime
+  gate. [Coordinated channel-separated OSS sources](audio-mix-timing.md) sustain both
+  near 0.96–0.98 nominal with exact drains and clean gates; independent writers
+  are next. The independent debt-reference tests do not waive existing failures.
+
 - [Signal interruption of timed waits](signal-wait-restart.md) fixes confirmed
   SA_RESTART replay of poll/sleeps/timed futex waits and the ordinary-signal
   block-admission race. The unchanged thirteen-case executable passes on host
