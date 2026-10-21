@@ -47,6 +47,7 @@
 #include "debug_epoch.h"
 #include "debug_ui.h"
 #include "drm_backing_diagnostics.h"
+#include "frame_timing.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -3788,6 +3789,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio producer on|off|reset|status - DSP producer elapsed brackets (default off)\n"
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
+            "  gpu frame timing on|off|reset|status|frames - bounded exclusive compositor stages\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
             "  audio contributions on|off|reset|status - accepted native mix contributions (default off)\n"
@@ -4304,6 +4306,41 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("invalid_clock",s.invalidClock);r.text(",");r.field("unsupported_driver",s.unsupportedDriver);
         r.text(",");r.field("late_resumes",s.lateResumes);
         r.text(",\"scope\":\"default-off fixed intel_hda 12-KiB lead experiment; one deferred opportunity, not a wall-time guarantee; recovered means ready at next preparation, not proven playback\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"gpu frame timing on") || NetStrEq(cmd,"gpu frame timing off") ||
+            NetStrEq(cmd,"gpu frame timing reset") || NetStrEq(cmd,"gpu frame timing status") ||
+            NetStrEq(cmd,"gpu frame timing frames")) {
+        const int mode=NetStrEq(cmd,"gpu frame timing on")?1:NetStrEq(cmd,"gpu frame timing off")?0:-1;
+        const bool applied=FrameTimingControl(mode,NetStrEq(cmd,"gpu frame timing reset"));
+        const auto s=FrameTimingReadStatus();BridgeReply r;r.text("{\"applied\":");r.text(applied?"true":"false");
+        r.text(",\"enabled\":");r.text(s.enabled?"true":"false");r.text(",");r.field("epoch",s.epoch);
+        r.text(",");r.field("completed",s.completed);r.text(",");r.field("retained",s.count);
+        r.text(",");r.field("overwritten",s.overwritten);r.text(",");r.field("invalid_frames",s.invalidFrames);
+        r.text(",");r.field("aborted_frames",s.abortedFrames);r.text(",");r.field("clock_failures",s.clockFailures);
+        r.text(",");r.field("contended_records",s.contendedRecords);r.text(",\"capacity\":256,\"phase_names\":[");r.send();
+        for(unsigned i=0;i<FramePhaseCount;++i){BridgeReply name;if(i)name.text(",");name.text("\"");name.text(FramePhaseName(i));name.text("\"");name.send();}
+        DebugChannelSend("],\"frames\":[");
+        const bool exportRows=NetStrEq(cmd,"gpu frame timing frames");bool consistent=!exportRows || !s.enabled;
+        if(exportRows && !s.enabled)for(unsigned i=0;i<s.count;++i){
+            FrameTimingRow row;if(!FrameTimingReadRow(s.epoch,i,&row)){consistent=false;break;}
+            BridgeReply f;if(i)f.text(",");f.text("{");f.field("frame",row.frame);
+            f.text(",");f.field("begin_ns",row.beginNs);f.text(",");f.field("end_ns",row.endNs);
+            f.text(",");f.field("previous_end_ns",row.previousEndNs);f.text(",");f.field("sleep_deadline_ticks",row.sleepDeadlineTicks);
+            f.text(",");f.field("commands",row.commands);f.text(",");f.field("command_bytes",row.commandBytes);
+            f.text(",");f.field("fenced_commands",row.fencedCommands);
+            f.text(",");f.field("first_fence",row.firstFence);f.text(",");f.field("last_fence",row.lastFence);
+            f.text(",\"phase_ns\":[");f.send();
+            for(unsigned k=0;k<FramePhaseCount;++k){BridgeReply v;if(k)v.text(",");v.number(row.phases[k]);v.send();}
+            DebugChannelSend("],\"command_ns_by_parent\":[");
+            for(unsigned k=0;k<FramePhaseCount;++k){BridgeReply v;if(k)v.text(",");v.number(row.commandNsByParent[k]);v.send();}
+            DebugChannelSend("],\"commands_by_parent\":[");
+            for(unsigned k=0;k<FramePhaseCount;++k){BridgeReply v;if(k)v.text(",");v.number(row.commandsByParent[k]);v.send();}
+            DebugChannelSend("]}");
+        }
+        const auto after=FrameTimingReadStatus();
+        if(exportRows && (after.epoch!=s.epoch || after.enabled || after.completed!=s.completed))consistent=false;
+        BridgeReply end;end.text("],\"export_consistent\":");end.text(consistent?"true":"false");
+        end.text(",\"scope\":\"default off; stable-pvclock elapsed phases, includes preemption/host steal; nested scopes exclusive; 256 retained compositor thread cycles, not app frames or physical scanout; driver commands filtered to current compositor owner; stop before frames; contention lifetime counter; incomplete in-flight frame aborted on stop; not panic-safe export\"}\n");end.send();
     }
     else if(NetStrEq(cmd,"audio delivery on") || NetStrEq(cmd,"audio delivery off") ||
             NetStrEq(cmd,"audio delivery reset") || NetStrEq(cmd,"audio delivery status")) {

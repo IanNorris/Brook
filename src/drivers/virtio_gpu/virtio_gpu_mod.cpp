@@ -35,6 +35,7 @@
 #include "process.h"
 #include "kvmclock.h"
 #include "completion_wait.h"
+#include "frame_timing.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
 MODULE_IMPORT_SYMBOL(PciEnableMemSpace);
@@ -55,6 +56,9 @@ MODULE_IMPORT_SYMBOL(KMutexLock);
 MODULE_IMPORT_SYMBOL(KMutexUnlock);
 MODULE_IMPORT_SYMBOL(ProcessCurrent);
 MODULE_IMPORT_SYMBOL(KvmClockReadStableNs);
+MODULE_IMPORT_SYMBOL(FrameTimingEnter);
+MODULE_IMPORT_SYMBOL(FrameTimingLeave);
+MODULE_IMPORT_SYMBOL(FrameTimingCommand);
 MODULE_IMPORT_SYMBOL(DisplayRegister);
 MODULE_IMPORT_SYMBOL(DisplaySet3DActive);
 MODULE_IMPORT_SYMBOL(GpuCompositorRegister);
@@ -544,6 +548,7 @@ static KMutex g_gpuCmdLock{};
 struct GpuCmdGuard {
     bool locked;
     GpuCmdGuard() : locked(ProcessCurrent() != nullptr) {
+        FrameTimingScope phase(FramePhase::CommandLock);
         if (locked) KMutexLock(&g_gpuCmdLock);
     }
     ~GpuCmdGuard() { if (locked) KMutexUnlock(&g_gpuCmdLock); }
@@ -750,6 +755,7 @@ static void PoisonControlQueue() {
 static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = false)
 {
     if (g_controlQueuePoisoned) return 0;
+    FrameTimingScope phase(FramePhase::QueueSetup);
     const auto* requestHeader=reinterpret_cast<const VirtioGpuCtrlHdr*>(g_cmdBuf+CMD_REQ_OFF);
     const bool timeline=fenced && (requestHeader->flags&2u);
     const uint32_t expectedContext=requestHeader->ctx_id;
@@ -760,6 +766,7 @@ static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = f
         hdr->flags |= 1u; // VIRTIO_GPU_FLAG_FENCE
         hdr->fence_id = expectedFence=++g_nextRenderFence;
     }
+    FrameTimingCommand(reqLen,fenced,expectedFence);
     uint16_t head = static_cast<uint16_t>(g_availIdxShadow % g_queueSize);
     uint16_t d1   = static_cast<uint16_t>((head + 1) % g_queueSize);
 
@@ -781,10 +788,14 @@ static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = f
 
     NotifyControlQueue();
 
-    const bool completed = GpuWaitForCompletion(ProcessCurrent() != nullptr,
+    bool completed;
+    {
+    FrameTimingScope waitPhase(fenced?FramePhase::FenceWait:FramePhase::AckWait);
+    completed = GpuWaitForCompletion(ProcessCurrent() != nullptr,
         [] { return *g_usedIdx != g_usedIdxShadow; },
         [](uint64_t* ns) { return KvmClockReadStableNs(ns); },
         [] { __asm__ volatile("pause" ::: "memory"); });
+    }
     if (completed) {
         __asm__ volatile("mfence" ::: "memory");
         uint16_t slot = g_usedIdxShadow % g_queueSize;
@@ -2412,6 +2423,7 @@ static void CompBlurBarrier(uint32_t strength)
 // command buffer is never aliased.
 static void CompEndFrameDraw()
 {
+    FrameTimingScope phase(FramePhase::VertexUpload);
     // 1. Fill the vertex staging buffer: 4 verts/quad, {pos.xy, uv.xy, opacity}.
     //    NDC positions derived from integer pixel rects via NdcBits (no FP).
     int32_t W = static_cast<int32_t>(g_compScanoutW);
@@ -2432,6 +2444,7 @@ static void CompEndFrameDraw()
         TransferToHostBuffer(COMP_CTX_ID, COMP_DRAW_VBUF_RES, g_drawQuadCount * 80);
 
     // 2. Build the compose stream.
+    phase.Change(FramePhase::CommandBuild);
     auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
     memset(sub, 0, sizeof(*sub));
     sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D; sub->hdr.ctx_id = COMP_CTX_ID;
@@ -2587,12 +2600,14 @@ static void CompEndFrameDraw()
         return;
     g_drawQuadCount = 0;
     g_blurBarrierCount = 0;
+    phase.Change(FramePhase::DisplayFlush);
     ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
 }
 
 static void CompEndFrame()
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
+    FrameTimingScope phase(FramePhase::CommandBuild);
     struct FinishAssembly { ~FinishAssembly() { g_compFrameAssembling=false; } } finish;
     if (!g_compReady) return;
     if (g_drawReady && g_drawQuadCount > 0) { CompEndFrameDraw(); return; }
@@ -2606,6 +2621,7 @@ static void CompEndFrame()
         return;
     g_composeN = 0;
     // Present the composed scanout RT.
+    phase.Change(FramePhase::DisplayFlush);
     ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
 }
 

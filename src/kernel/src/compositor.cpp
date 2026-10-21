@@ -24,6 +24,7 @@
 #include "net.h"
 #include "display.h"
 #include "gpu_compositor.h"
+#include "frame_timing.h"
 #include "fw_cfg.h"
 #include "font_atlas.h"
 #include "debug_overlay.h"
@@ -2994,6 +2995,7 @@ static bool WindowContentSource(Window* w, uint64_t* vaddr,
 
 static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
 {
+    FrameTimingScope framePhase(FramePhase::TextureUpload);
     const GpuCompositorOps* gpu = GpuCompositorGet();
     if (!gpu) return;
     uint32_t scrW = 0, scrH = 0;
@@ -3132,6 +3134,7 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     }
 
     // 4. Compose into the scanout RT.
+    framePhase.Change(FramePhase::QuadRecord);
     gpu->BeginFrame(0);
 
     // Base: desktop = wallpaper (chrome and taskbar/launcher are separate alpha
@@ -3235,6 +3238,7 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
 
 static void CompositorLoop()
 {
+    FrameTimingScope framePhase(FramePhase::Preparation);
     if (!g_physFb)
         return;
     DebugFrameGeometry presented;
@@ -3427,6 +3431,7 @@ static void CompositorLoop()
         brook::DisplayFlush(minY, maxY);
     }
 
+    framePhase.Change(FramePhase::DebugCapture);
     CaptureCompletedDebugFrame(epoch,presented);
 
     // One-shot full-resolution frame dump (parity check), once the desktop has
@@ -3483,20 +3488,22 @@ static void CompositorThreadFn(void* /*arg*/)
 
     for (;;)
     {
+        FrameTimingBegin();
         if (!g_compositorHalted) {
-            DrainOwnedCaptures();
-            CompositorDrainScenes();
+            { FrameTimingScope phase(FramePhase::DeferredCaptures);DrainOwnedCaptures(); }
+            { FrameTimingScope phase(FramePhase::SceneDrain);CompositorDrainScenes(); }
             CompositorLoop();
         }
 
         // Poll debug channel for incoming commands
-        brook::DebugChannelPoll();
+        { FrameTimingScope phase(FramePhase::DebugPoll);brook::DebugChannelPoll(); }
 
         // Block until either a process signals dirty (CompositorWake) or
         // the fallback interval elapses (ensures cursor updates even with
         // no dirty frames).
         Process* self = ProcessCurrent();
         self->wakeupTick = ApicTickCount() + COMPOSITE_INTERVAL;
+        FrameTimingEnd(self->wakeupTick);
         SchedulerBlock(self);
     }
 }

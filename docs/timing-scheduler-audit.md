@@ -5,6 +5,13 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- The current priority is the [GPU frame breakdown](gpu-frame-breakdown.md).
+  An empty-desktop host polling control and a default-off exclusive frame
+  recorder separate completion waiting from the additive post-frame sleep.
+  Per-frame phases and command attribution reconcile; no pacing/buffering or
+  scheduler default has changed. Earlier timing/audio/scheduler findings stay
+  open while independent command ownership and preparation overlap are tested.
+
 - [Idle stall diagnostic lifetime](scheduler-stall-lifetime.md) fixes a raw
   process pointer used after releasing registry protection, protects pending
   requeue and policy reads with the ready lock, and checks PID incarnation.

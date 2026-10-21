@@ -28,6 +28,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "sched_decision_trace.h"
 #include "display.h"
 #include "gpu_compositor.h"
+#include "frame_timing.h"
 #include "gpu_app.h"
 #include "cpu.h"
 #include "tty.h"
@@ -117,6 +118,9 @@ EXPORT_SYMBOL(PciConfigWrite16);
 EXPORT_SYMBOL(DisplayRegister);
 EXPORT_SYMBOL(DisplaySet3DActive);
 EXPORT_SYMBOL(GpuCompositorRegister);
+EXPORT_SYMBOL(FrameTimingEnter);
+EXPORT_SYMBOL(FrameTimingLeave);
+EXPORT_SYMBOL(FrameTimingCommand);
 EXPORT_SYMBOL(GpuAppRegister);
 EXPORT_SYMBOL(CpuWriteCombiningReady);
 
