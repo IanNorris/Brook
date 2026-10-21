@@ -71,9 +71,10 @@ benign. That earlier runtime gate remains failed.
 
 All four boots report zero invalid/backwards/clamped/stale/saturated runtime
 counters, with all eight paravirtual-clock and steal records active. Both new
-evidence objects correctly report `valid:false` with no clamp. No native
-positive-clamp record has yet been collected; positive-record behavior is tested
-in the hosted accounting model. No native HDA fault is logged. Original launch
+evidence objects correctly report `valid:false` with no clamp. At this stage no native
+positive-clamp record had been collected; the 21 October follow-up below
+records the first positive native samples. Positive-record behavior is also
+tested in the hosted accounting model. No native HDA fault is logged. Original launch
 wrappers and audio routers exit zero, all four filesystem checks pass per boot,
 and twelve-document/four-profile preservation checks pass. All test VMs, private
 services and host load workers are stopped.
@@ -87,3 +88,74 @@ host load ownership/exits and the result verifier are retained under the ignored
 do not relax the accounting gate from a non-reproduction. The next latency
 measurement should separate BSP timer arrival from time spent reaching and
 performing the blocked-wakeup scan.
+
+
+## First positive native record, physical-output RR browser control
+
+On 21 October the isolated 8-KiB HDA experiment records one correction while
+Firefox plays the generated local 640×360 video with eight bounded host CPU
+workers and four sleepers. This is unchanged RR, eight vCPUs/eight GiB,
+physical PipeWire output, historical timer HDA and 200-ms host buffering.
+It is a different cohort from the earlier MLFQ/EEVDF null-sink controls.
+The runtime gate fails; a small deficit is not grounds to silently waive it.
+
+| Field | Captured value |
+| --- | ---: |
+| CPU / task PID / incarnation | 6 / 226 / 226 |
+| Sample sequence | 3,477,285 |
+| Previous wall / current wall (ns) | 107,095,032,872 / 107,095,055,241 |
+| Previous steal / current steal (ns) | 199,972,129 / 199,994,778 |
+| Previous service floor (ns) | 106,895,060,743 |
+| Current wall minus steal (ns) | 106,895,060,463 |
+| Deficit (ns) | 280 |
+
+The wall increment is 22,369 ns and steal increment 22,649 ns. Neither raw
+counter regresses. The first and maximum records are identical, and a later
+snapshot still reports exactly one clamp. The floor equals the previous raw
+wall-minus-steal value. This directly demonstrates an inter-sample correction;
+it does not identify which host event or shared-record publication produced it.
+There are no invalid, backwards, stale-owner or saturated runtime samples.
+
+[KVM's steal-time ABI](https://www.kernel.org/doc/html/latest/virt/kvm/x86/msr.html)
+allows implementation-dependent update intervals for its independently versioned
+steal record. Brook brackets a stable pvclock read with two validated steal
+reads and retries if their values differ. That prevents an observed change
+inside the bracket, but does not guarantee that successive raw wall-minus-steal
+values are monotonic when a previously delayed correction is published.
+This is a plausible mechanism for the record, not a host-level causal trace.
+The existing floor prevents cumulative service from moving backwards and
+carries the correction forward; no sampling/accounting or acceptance rule is
+changed on the strength of this observation.
+
+The controller saves a complete 148-sample browser trace with zero trace drops
+before stopping at the runtime gate. Idle and loaded audio completion relative
+to guest elapsed time are approximately 0.99871 and 0.98909 respectively;
+these are completion counters, not decoded source or speaker timing. Both
+intervals retain the same stream epoch with zero discontinuity. The loaded
+HDA probe records zero unsafe/invalid publications and 12,884 reserved bytes
+in four reservations. Browser video still drops many frames, so near-real-time
+audio completion is not a smooth-desktop acceptance result.
+
+After saving additional clock/process/runtime evidence, the original Firefox
+group closes normally with complete output and no remaining group tasks. The
+original VM launcher exits zero and all four offline filesystem checks pass.
+The planned second browser launch is not performed in this failed cohort.
+Evidence remains ignored under
+`build/reviews/unattended-hda-8k-browser-20261021/browser-lead-control`, including
+`browser-lead-1/runtime-after.json` and `accounting-followup`. A later diagnostic
+may complete cleanup/restart collection while retaining an explicit failed
+runtime result; that must not turn this failed gate into a passing one.
+
+
+The subsequent matched **original 12-KiB** browser control with today's callback
+HDA/20-ms buffer also records one correction, already present before the loaded
+interval. CPU 7/task 298/sample 1,301,550 advances wall from 48,059,413,840 to
+48,059,433,002 ns and steal from 5,222,574 to 5,254,982 ns. The previous service
+floor is 48,054,191,266 ns and the deficit is 13,246 ns. Other runtime quality
+counters stay zero. Both fresh-profile browser groups and the original VM
+exit normally, with clean heap and filesystem checks, but cumulative runtime
+acceptance remains failed. The correction class is therefore observed with
+both lead modules; this does not prove identical causes or rehabilitate either
+failed cohort. The candidate's callback/20-ms two-launch browser run is
+separately clean. Matched original evidence lives under
+`build/reviews/unattended-hda-12k-browser-callback-20261021/browser-lead-control`.

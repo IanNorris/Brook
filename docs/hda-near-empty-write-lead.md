@@ -230,3 +230,96 @@ the alternating Quake reproduction. Broader browser and application restart
 acceptance remains required before changing the production default. Full
 receipts and decoded excerpts are indexed by the ignored
 `build/workloads/timing-scheduler-20261021/hda-lead-loaded-summary.json`.
+
+
+### Physical-route Firefox playback and restart controls
+
+Fresh private eight-vCPU/eight-GiB VMs compare the same two frozen lead modules
+with current callback HDA and 20-ms requested PipeWire buffering. Each uses
+the same generated local 120-second 640×360 H.264/AAC fixture, a fresh Firefox
+profile, an idle eight-second audio capture, a twenty-second host load with
+eight CPU workers/four sleepers and an overlapping eight-second capture, then
+a graceful browser exit and second fresh-profile launch/idle capture.
+No CPU profiler or screenshots run during timing; delivery diagnostics are on.
+
+| Lead | Phase | Completion / guest elapsed | Quiet approximately 1-ms bins | Reserved bytes |
+| --- | --- | ---: | ---: | ---: |
+| 8 KiB | First idle | 0.99772 | 19 / 8026 | 3608 |
+| 8 KiB | Host load | 0.99145 | 51 / 8013 | 9544 |
+| 8 KiB | Relaunch idle | 0.99785 | 15 / 8026 | 2840 |
+| 12 KiB | First idle | 0.98163 | 148 / 8021 | 27864 |
+| 12 KiB | Host load | 0.96595 | 256 / 8013 | 49624 |
+| 12 KiB | Relaunch idle | 0.97596 | 178 / 8023 | 46736 |
+
+All six captures retain stable application stream epochs and zero discontinuity,
+invalid clock/position, unsafe publication, diagnostic contention or saturation.
+Quiet-bin counts come from stored PCM RMS, with a threshold of 10 in signed
+16-bit samples, not speaker listening or proof of no missing delivery intervals.
+Capture host duration and stored frame counts remain available separately.
+These results show substantially fewer short quiet gaps; they are one matched
+pair, not statistical confidence or proof of all browser audio behavior.
+
+After the first three media seconds, buffered trace video callbacks average
+11.23/10.94 per page second across the candidate's two launches versus
+10.64/10.03 for the original. Those whole-trace intervals mix idle/load/recovery
+and many frames are still dropped. They are not physical presentation rates
+or a smooth-browser acceptance claim. Broader graphics scheduling work remains.
+
+The candidate callback run has clean cumulative runtime/accounting counters.
+The original callback run records a 13,246-ns wall-minus-steal correction during
+startup, so its cumulative runtime gate remains failed. A separate candidate
+historical timer/200-ms cohort records a 280-ns correction and stops before
+relaunch. Preserve those failures as described in
+[runtime clamp evidence](runtime-clamp-evidence.md); do not infer either cause
+or benignity from their size. The completed callback cohorts retain successful
+original browser-group exits, heap checks, original VM-owner exits and all
+four filesystem checks. These lifecycle gates do not override failed runtime
+acceptance.
+
+The ignored `hda-lead-browser-summary.json` indexes the full trace/capture
+receipts under `unattended-hda-{8k,12k}-browser-callback-20261021`. A final
+matched Quake attract pair with current audio defaults and bounded host load
+combines the actual small-queue failure trigger with contention before a
+production lead decision.
+
+
+### Loaded Quake gate fails: production default retained
+
+The final current-callback/20-ms pair runs the default GL3 attract launcher with
+eight host CPU workers and four sleepers for twenty seconds. The original
+12-KiB module again completes application audio at 0.84356 of guest elapsed
+with 183,552 reserved bytes in 149 reservations. Runtime and HDA diagnostic
+quality counters are clean, with no stream discontinuity.
+
+The 8-KiB candidate instead records a native `sample-gap` fault and stream
+discontinuity. Last observation is 64,662,401,701 ns and the next read bracket
+is 65,212,274,036–65,212,302,082 ns: approximately 549.900 ms. This exceeds the
+185.76-ms observation limit and even the roughly 371.52-ms full-ring duration.
+The guard correctly refuses ambiguous completion. Its measured 0.90434
+completion ratio crosses that discontinuity and is **not** an accepted tempo
+comparison. There are no silence reservations or recorded unsafe/invalid
+publications; the guard can fail before copy diagnostics are recorded.
+Observed maximum advance is 1,024 bytes and minimum publication headroom
+8,192 bytes. Those values do not explain or bound the missed observation.
+
+Actual host worker timestamps overlap 5.662 seconds of each approximately
+6.007-second PCM capture. `READY` precedes the workers' scheduled start, so
+the beginning of each capture predates CPU work. This is overlapping bounded
+load, not an entirely stressed capture window. The exact timings and full
+worker progress are saved. Both runtime ledgers, heaps, original app groups,
+host loads, original VM owners and all filesystem checks pass; they do not
+override the candidate's failed audio gate.
+
+The lead only changes reservation threshold/target; it does not change the
+mixer's nominal ten-millisecond deadline, unconditional driver service,
+idle trailer or observation limit. A timing/load feedback effect remains
+possible. One passing original and one failed candidate do not establish
+which mechanism caused the missed observation. Astra's follow-up recommends
+one matched diagnostic pair with the existing audio-service timing probe,
+aligning sleep/deadline/wake/service-end events to the fault interval. No
+sampling or publication guard is weakened. The production lead remains
+12,288 bytes pending that diagnosis.
+
+Full original receipts, serial fault and load timestamps remain under
+`unattended-hda-{12k,8k}-q2-loaded-callback-20261021`; the ignored
+`hda-lead-q2-loaded-summary.json` explicitly records the failed candidate gate.
