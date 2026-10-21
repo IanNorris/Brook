@@ -14,7 +14,8 @@ The test compares every nonzero played sample to its expected source sequence
 and requires exact submitted, physically played and credited totals at drain.
 The deterministic sample pattern is not a unique frame-ID encoding.
 
-The matrix has 156 configurations:
+The original quantum-only matrix has 156 configurations (the later horizon
+follow-up below expands it to 468):
 
 - 4,096 or 8,192 frames of endpoint capacity: four/eight 4,096-byte fragments.
   Fragment size remains 1,024 frames; the HDA write lead stays 12 KiB.
@@ -118,3 +119,98 @@ integrity from the failed playback gate. Local evidence is retained under
 `mixer-steady-reviewed.log`, `mixer-steady-reviewed-analysis.json`,
 `mixer-steady-reviewed-all-host.log` and `mixer-native-preprocessed.json`.
 Earlier exploratory logs are retained with their superseded model limitations.
+
+## Guarded target horizon follow-up
+
+A second host-only mode targets 4,096 frames of physically pending output,
+rather than capping each individual submission at 441 frames. With a fresh
+current-epoch HDA snapshot whose pending bytes cover the unchanged 12-KiB lead
+plus snapshot age and one nominal service interval, it requests at most:
+
+```
+max(0, 4096 - (submitted_bytes - completed_bytes) / 4)
+```
+
+At the target it defers submission, consuming no source frames and creating no
+receipt or retained retry budget. The next ordinary service still refreshes
+progress. Missing, stale or insufficient headroom retains ordinary batching and
+the existing driver guards. This is a **guarded target**, not a hard maximum:
+startup and recovery can exceed it. A stalled device still requires existing
+driver fault/progress handling. No producer waits, extra flush opportunities,
+synthetic source credits or native runtime option are added.
+
+The expanded fixture has 468 configurations. It adds 5,120/6,144-frame boundary
+capacities and 2,048-frame fragment controls at 6,144/8,192 capacity. Producer
+order, phase, prefix/whole-fragment writing and refresh cadence remain distinct.
+Each row below comprises twenty-four regular cases (two orders × three phases
+× two writer types × two refresh modes):
+
+| Capacity / fragment, frames | Source-rate range | Cases failing regular playback gate | Central driver reservations | Above-target sampled instants, summed |
+| --- | --- | ---: | ---: | ---: |
+| 4,096 / 1,024 | 0.7871–1.0000 | 16 | 598 | 4,358 |
+| 5,120 / 1,024 | 0.9677–1.0000 | 2 | 0 | 4,992 |
+| 6,144 / 1,024 | 1.0000 | 0 | 0 | 0 |
+| 6,144 / 2,048 | 0.9951–1.0000 | 0 | 0 | 8,196 |
+| 8,192 / 1,024 | 1.0000 | 0 | 0 | 0 |
+| 8,192 / 2,048 | 1.0000 | 0 | 0 | 0 |
+
+Counts sum separate runs, not a combined interval. The 6,144/2,048 tuple meets
+the 0.99–1.01 rate gate but repeatedly uses the recovery path above target; it
+does not establish the same regular target behavior as the three exact-rate
+tuples. These results support specific tested geometry/cadence/horizon tuples,
+not a universal minimum capacity or arbitrary scheduling-latency guarantee.
+The original quantum cap remains rejected; the analyzer labels its separate
+`candidate_playback_accepted` field explicitly as the 441-frame quantum policy.
+
+At 6,144/1,024 and 8,192/1,024, the dormant-peer case leaves the active source
+at 1.0 with no central reservations. Missing four service opportunities causes
+one driver reservation and a 2,960-byte maximum sampled target excursion.
+Pending output returns to the target seventeen ms after ordinary service
+resumes. Both source rates over the central interval are about 0.9933: a gap
+still occurred. Exact drains and source PCM comparison remain intact. Recovery
+does not retroactively fill the missed audio or erase that reservation.
+
+Focused tests cover deferral without ownership, setting changes during copy,
+stale/low-headroom recovery, and genuine rejected/partial receipts after the
+driver fills between preparation and submission. They preserve the captured
+proposal's full-acceptance budget clearing and ordinary recovery after a failed
+or partial submission. Initial fixture mistakes (absolute versus pending byte
+expectations and too-small synthetic filler storage) were corrected before the
+final passing run; the failing diagnostic log remains retained.
+
+All 468 integrity cases and all 75 hosted suites pass. ASan/UBSan also pass,
+with explicit coverage limits: ASan global redzones are disabled because module
+metadata otherwise retains unused PCI initialization symbols, and LeakSanitizer
+is disabled because the sandbox's ptrace environment prevents it from running.
+The original linker/LeakSanitizer failures remain retained; no leak/global-redzone
+acceptance is claimed. Native preprocessing excludes all six hosted experiment
+state/API names. Native scheduler/audio behavior and defaults are unchanged.
+
+### Geometry compatibility before native testing
+
+Do not silently enlarge a four-fragment maximum to six. Linux stores the upper
+field of `SNDCTL_DSP_SETFRAGMENT` as `maxfrags` and applies it while selecting
+period count; see [`pcm_oss.c`](https://raw.githubusercontent.com/torvalds/linux/master/sound/core/oss/pcm_oss.c),
+`snd_pcm_oss_set_fragment1` and `snd_pcm_oss_period_size`. Buffer selection also
+depends on device constraints, so a Linux comparison is a compatibility probe,
+not a demand for identical hardware geometry.
+
+The tested 8,192/2,048 tuple represents **four 8-KiB fragments**, preserving a
+four-fragment count while changing the fragment size. This is a viable hosted
+geometry control, not implemented OSS negotiation. Before a native mode:
+
+1. Test explicit fragment requests and honest returned `GETBLKSIZE`/`GETOSPACE`
+   geometry, byte/frame conversions, write acceptance and `POLLOUT` thresholds.
+2. Preserve established queued/in-flight streams. Enabling a commit policy may
+   let backlog settle, but must not resize, retract receipts or discard credits.
+   Pause alone is not permission to change geometry.
+3. Add a default-off native control only after those API checks, then run the
+   private mixed Firefox/Quake/load gate with observed geometry, source drains,
+   full media loop and all runtime/HDA/filesystem checks. Unsupported/smaller
+   tuples must not inherit the successful tuple's acceptance claim.
+
+Final local evidence: `mixer-horizon-final.log`,
+`mixer-horizon-final-analysis.json`, `mixer-horizon-final-all-host.log`,
+`mixer-horizon-native-exclusion.json` and `mixer-horizon-asan-ubsan-final.log`
+under the same `reboot-resume` directory. Full timing/scheduler acceptance,
+historical fast playback and earlier failed native gates remain open.

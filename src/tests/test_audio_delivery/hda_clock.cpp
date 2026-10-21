@@ -15,6 +15,7 @@ bool clockAvailable = true, failSetup = false;
 int failures = 0;
 void (*legacyWaitHook)() = nullptr;
 void (*afterCopyHook)() = nullptr;
+void (*beforeSubmitHook)() = nullptr;
 #define VERIFY(x) do { if(!(x)) { std::fprintf(stderr,"HDA FAIL line %d: %s\n",__LINE__,#x);++failures; } } while(0)
 void store(uint32_t offset, uint32_t width, uint32_t value) {
     memcpy(registers.data()+offset,&value,width);
@@ -23,7 +24,7 @@ void initialize() {
     registers.fill(0);dma.fill(0);nowNs=1000000000;clockAvailable=true;failSetup=false;
     g_nativeClock=brook::AudioDmaClock{};g_nativeFaultEvidence={};g_nativeMode=false;g_nativeRingBase=0;
     g_nativeLastDataEnd=g_nativePrimedAt=0;
-    g_streamRunning=g_streamConfigured=false;g_playLock=g_legacyActive=0;g_legacyEpoch=0;legacyWaitHook=afterCopyHook=nullptr;
+    g_streamRunning=g_streamConfigured=false;g_playLock=g_legacyActive=0;g_legacyEpoch=0;legacyWaitHook=afterCopyHook=beforeSubmitHook=nullptr;
     g_submittedBytes=g_playedBytes=0;g_lastLpib=0;
     g_initialized=true;g_dacNid=2;g_outStreamBase=0x80;
     g_audioBuf=dma.data();g_bdl=descriptors.data();
@@ -302,7 +303,10 @@ int RunHdaClockTests() {
 }
 
 namespace { bool mixerClockEnabled = false; uint64_t resetDuringCopy = 0, mixerProgressDelayNs = 0; }
-brook::AudioSubmitReceipt TestMixerNativeSubmit(const void* samples,uint32_t bytes) { return HdaTrySubmit(samples,bytes); }
+brook::AudioSubmitReceipt TestMixerNativeSubmit(const void* samples,uint32_t bytes) {
+    if(beforeSubmitHook){auto hook=beforeSubmitHook;beforeSubmitHook=nullptr;hook();}
+    return HdaTrySubmit(samples,bytes);
+}
 bool TestMixerNativeProgress(brook::AudioDeviceProgress* result) {
     const bool valid=mixerClockEnabled && HdaNativeProgress(result);
     nowNs+=mixerProgressDelayNs;return valid;
@@ -702,16 +706,60 @@ static void commitQuantumGuards(brook::AudioStreamId a,brook::AudioStreamId b) {
         AudioMixerTestCommitQuantum(0);
     }
 }
+static void commitHorizonGuards(brook::AudioStreamId a,brook::AudioStreamId b) {
+    using namespace brook;
+    for(unsigned action=0;action<5;++action) {
+        AudioMixerTestCommitQuantum(0);coalesceSetup(a,b);AudioMixerTestCommitHorizon(4096);
+        queueChannel(a,false);queueChannel(b,true);
+        AudioMixerFlush();VERIFY(g_nativeClock.submitted==16384);
+        VERIFY(AudioMixerTestCommitCount()==1); // Full horizon owns no receipt.
+        if(action==0) {
+            advanceNative(441*4);
+            afterCopyHook=[] {AudioMixerTestCommitQuantum(0);};AudioMixerFlush();
+            VERIFY(g_nativeClock.submitted==16384+441*4);
+            queueChannel(a,false,441);queueChannel(b,true,441);AudioMixerFlush();
+            VERIFY(g_nativeClock.submitted==16384+(441+1024)*4);
+        } else if(action<3) {
+            if(action==1)mixerProgressDelayNs=10000001;
+            else advanceNative(16384-(12288+441*4-4));
+            AudioMixerFlush();mixerProgressDelayNs=0;
+            VERIFY(g_nativeClock.submitted==16384+1024*4); // Ordinary recovery may exceed target.
+        } else {
+            advanceNative(441*4);
+            const uint64_t full=g_nativeClock.completed+49152;
+            if(action==3)beforeSubmitHook=[] {
+                std::array<int16_t,AUDIO_BUF_SIZE/2> silence{};const auto bytes=49152-g_nativeClock.Pending();
+                VERIFY(HdaTrySubmit(silence.data(),bytes).accepted==bytes);
+            };
+            else beforeSubmitHook=[] {
+                std::array<int16_t,AUDIO_BUF_SIZE/2> silence{};const auto bytes=49152-g_nativeClock.Pending()-1024;
+                VERIFY(HdaTrySubmit(silence.data(),bytes).accepted==bytes);
+            };
+            AudioMixerFlush();VERIFY(g_nativeClock.submitted==full);
+            advanceNative(g_nativeClock.Pending()-(12288+441*4-4));AudioMixerFlush();
+            VERIFY(g_nativeClock.submitted==full+(action==3?1024u:768u)*4);
+        }
+        finishPhysical();AudioMixerRefresh();
+        for(auto id:{a,b}) {
+            AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(id,&p));
+            VERIFY(p.completedFrames==p.submittedFrames && !p.queuedFrames && !p.discontinuity);
+        }
+        AudioMixerTestCommitQuantum(0);
+    }
+}
 static void steadyCommitExperiment() {
     using namespace brook;
-    constexpr uint32_t total=44100*8,fragment=1024;
-    for(uint32_t capacity:{4096u,8192u})
-    for(unsigned mode=0;mode<3;++mode)for(bool wholeFragment:{false,true})
+    constexpr uint32_t total=44100*8;
+    for(uint32_t capacity:{4096u,5120u,6144u,8192u})
+    for(unsigned mode=0;mode<4;++mode)for(uint32_t fragment:{1024u,2048u})for(bool wholeFragment:{false,true})
     for(bool refreshProducer:{false,true})for(unsigned offset:{0u,1u,4u})for(bool reverse:{false,true})
     for(unsigned scenario=0;scenario<3;++scenario) {
+        // Honest four-fragment/eight-KiB-fragment geometry control: larger
+        // fragments, rather than silently exceeding an application's count.
+        if(fragment==2048 && ((capacity!=6144 && capacity!=8192) || mode!=3))continue;
         // Additional absence/late-service probes use one fixed phase/geometry,
         // not an unbounded Cartesian sweep. Scenario 0 is ordinary cadence.
-        if(scenario && (capacity!=4096 || !wholeFragment || !refreshProducer || offset!=1))continue;
+        if(scenario && ((capacity!=4096 && mode!=3) || !wholeFragment || !refreshProducer || offset!=1))continue;
         AudioMixerTestCommitQuantum(0);AudioMixerSharedPrefixEnable(false);
         AudioMixerCoalesceEnable(false);AudioStop();initialize();AudioMixerRefresh();
         AudioStreamId ids[2]={AudioMixerOpen(),AudioMixerOpen()};VERIFY(ids[0] && ids[1]);
@@ -743,6 +791,7 @@ static void steadyCommitExperiment() {
         for(unsigned i=0;i<(capacity+1763)/1764;++i)AudioMixerFlush();
         VERIFY(g_nativeClock.submitted==capacity*4);prime();AudioMixerRefresh();
         AudioMixerSharedPrefixEnable(mode==1);AudioMixerTestCommitQuantum(mode==2?441:0);
+        if(mode==3)AudioMixerTestCommitHorizon(4096);
         AudioMixerContributionsEnable(true);AudioMixerContributionsReset();
         AudioDeliveryTimingEnable(true);AudioDeliveryTimingReset();
         uint64_t before[2]{},after[2]{},physicalBefore[2]{},physicalAfter[2]{};
@@ -750,6 +799,7 @@ static void steadyCommitExperiment() {
         uint64_t dmaBytes=0;
         uint32_t minPending=~uint32_t(0),maxPending=0;
         uint64_t minPhysicalPending=~uint64_t(0),maxPhysicalPending=0;
+        uint64_t maxHorizonExcess=0;unsigned overHorizonSamples=0,recoveryMs=~0u;
         unsigned elapsed=0;bool finished=false;
         for(unsigned ms=1;ms<=25000;++ms) {
             // Exact 44.1-kHz physical advancement, independent of driver reads.
@@ -799,6 +849,12 @@ static void steadyCommitExperiment() {
                 const uint64_t physicalPending=g_nativeClock.submitted>dmaBytes?g_nativeClock.submitted-dmaBytes:0;
                 minPhysicalPending=std::min(minPhysicalPending,physicalPending);
                 maxPhysicalPending=std::max(maxPhysicalPending,physicalPending);
+                if(physicalPending>4096*4) {
+                    ++overHorizonSamples;
+                    maxHorizonExcess=std::max(maxHorizonExcess,physicalPending-4096*4);
+                }
+                if(scenario==2 && ms>=3040 && recoveryMs==~0u && physicalPending<=4096*4)
+                    recoveryMs=ms-3040;
             }
             AudioStreamProgress p[2]{};
             for(unsigned s=0;s<2;++s)VERIFY(AudioMixerGetProgress(ids[s],&p[s]));
@@ -816,11 +872,12 @@ static void steadyCommitExperiment() {
         VERIFY(!delivery.unsafe && !delivery.invalidClock && !delivery.invalidPosition && !g_nativeClock.discontinuity);
         contributionConservation(contributions);
         VERIFY(after[0]>before[0]); // An absent peer cannot stall the supplier.
+        if(mode==3 && capacity>=6144 && scenario==2)VERIFY(recoveryMs<100);
         for(unsigned s=0;s<2;++s)VERIFY(after[s]-before[s]==physicalAfter[s]-physicalBefore[s]);
         // Extrema are sampled after the producer/service actions each ms, not
         // a continuous minimum immediately before every replenishment.
-        std::printf("MIXER_STEADY mode=%u capacity=%u fragment=%u refresh=%u offset=%u reverse=%u scenario=%u completion=%llu,%llu physical=%llu,%llu interval_frames=176400 drain_ms=%u cached_pending=%u,%u sampled_physical_pending=%llu,%llu reservations=%llu steady_reservations=%llu missing_short=%llu missing_empty=%llu caps=%llu\n",
-            mode,capacity,unsigned(wholeFragment),unsigned(refreshProducer),offset,unsigned(reverse),scenario,
+        std::printf("MIXER_STEADY mode=%u capacity=%u fragment_frames=%u fragment=%u refresh=%u offset=%u reverse=%u scenario=%u completion=%llu,%llu physical=%llu,%llu interval_frames=176400 drain_ms=%u cached_pending=%u,%u sampled_physical_pending=%llu,%llu reservations=%llu steady_reservations=%llu missing_short=%llu missing_empty=%llu caps=%llu over_horizon_samples=%u max_horizon_excess_bytes=%llu recovery_ms=%u\n",
+            mode,capacity,fragment,unsigned(wholeFragment),unsigned(refreshProducer),offset,unsigned(reverse),scenario,
             (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]),
             (unsigned long long)(physicalAfter[0]-physicalBefore[0]),(unsigned long long)(physicalAfter[1]-physicalBefore[1]),
             elapsed,minPending,maxPending,
@@ -829,7 +886,8 @@ static void steadyCommitExperiment() {
             (unsigned long long)(metricsAfter[0]-metricsBefore[0]),
             (unsigned long long)(metricsAfter[1]-metricsBefore[1]),
             (unsigned long long)(metricsAfter[2]-metricsBefore[2]),
-            (unsigned long long)AudioMixerTestCommitCount());
+            (unsigned long long)AudioMixerTestCommitCount(),overHorizonSamples,
+            (unsigned long long)maxHorizonExcess,recoveryMs);
         AudioMixerTestCommitQuantum(0);AudioMixerSharedPrefixEnable(false);
         AudioMixerContributionsEnable(false);AudioDeliveryTimingEnable(false);
         VERIFY(AudioMixerClose(ids[0]) && AudioMixerClose(ids[1]));AudioStop();
@@ -957,6 +1015,7 @@ int RunMixerClockTests() {
     contributionTests(a,b);
     sharedPrefixTests(a,b);
     commitQuantumGuards(a,b);
+    commitHorizonGuards(a,b);
     steadyCommitExperiment();
     coalesceTests(a,b);
     VERIFY(AudioMixerClose(a));mixerClockEnabled=false;AudioStop();

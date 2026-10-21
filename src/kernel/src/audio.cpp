@@ -162,10 +162,19 @@ static DriverMode g_driverMode = DriverMode::Unknown; // flush owner only
 #ifdef BROOK_HOST_TEST
 // Hosted commitment-horizon experiment only; no native state, API or branch.
 static uint32_t g_testCommitQuantum = 0;
+static uint32_t g_testCommitHorizon = 0;
 static uint64_t g_testCommitCount = 0;
 void AudioMixerTestCommitQuantum(uint32_t frames) {
     SpinLockAcquire(&g_mixerLock);
     g_testCommitQuantum = frames <= MIXER_BATCH_FRAMES ? frames : 0;
+    g_testCommitHorizon = 0;
+    g_testCommitCount = 0;
+    SpinLockRelease(&g_mixerLock);
+}
+void AudioMixerTestCommitHorizon(uint32_t frames) {
+    SpinLockAcquire(&g_mixerLock);
+    g_testCommitQuantum = 0;
+    g_testCommitHorizon = frames >= 3072+882 && frames <= 12288 ? frames : 0;
     g_testCommitCount = 0;
     SpinLockRelease(&g_mixerLock);
 }
@@ -447,7 +456,7 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
     const uint32_t normalFrames=frames;
     frames=SharedPrefixFrames(frames,device,sampledBefore,prefix);
 #ifdef BROOK_HOST_TEST
-    if (g_testCommitQuantum && frames > g_testCommitQuantum &&
+    if (((g_testCommitQuantum && frames > g_testCommitQuantum) || (g_testCommitHorizon && frames)) &&
         g_driverMode == DriverMode::Native && !strcmp(g_audioDriver->name,"intel_hda")) {
         const uint64_t now=AudioClockNowNs();
         constexpr uint64_t serviceNs=10000000;
@@ -456,11 +465,18 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
             device.epoch==g_hardwareEpoch && device.submitted>=device.completed) {
             const uint64_t travelFrames=((now-sampledBefore+serviceNs)*MIXER_HW_RATE+999999999)/1000000000;
             if (device.submitted-device.completed>=12288+travelFrames*MIXER_FRAME_BYTES) {
-                frames=g_testCommitQuantum;
-                ++g_testCommitCount;
-                // Captured proposal owns remainder clearing even if a test
-                // changes configuration while the driver copies it.
-                prefix={~uint64_t(0),normalFrames,frames};
+                uint32_t limit=g_testCommitQuantum;
+                if(g_testCommitHorizon) {
+                    const uint64_t pending=(device.submitted-device.completed)/MIXER_FRAME_BYTES;
+                    limit=pending>=g_testCommitHorizon?0:uint32_t(g_testCommitHorizon-pending);
+                }
+                if(frames>limit) {
+                    frames=limit;
+                    ++g_testCommitCount;
+                    // Captured proposal owns remainder clearing even if a test
+                    // changes configuration while the driver copies it.
+                    prefix={~uint64_t(0),normalFrames,frames};
+                }
             }
         }
     }
@@ -469,6 +485,10 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
     // short proposal. Keep the ordinary remainder bound so a low-headroom
     // retry can restore ordinary batching after rejection/partial acceptance.
     g_batchRemaining = normalFrames;
+#ifdef BROOK_HOST_TEST
+    // A deferred horizon decision never owned a submission/retry budget.
+    if(g_testCommitHorizon && !frames)g_batchRemaining=0;
+#endif
     for (uint32_t slot = 0; slot < MIXER_MAX_STREAMS; ++slot) {
         const auto& stream = g_streams[slot];
         if (prepared) prepared[slot]={};
@@ -677,7 +697,7 @@ void AudioMixerFlush()
     bool controlled = __atomic_load_n(&g_coalesceActive, __ATOMIC_ACQUIRE) ||
                             __atomic_load_n(&g_sharedPrefixActive, __ATOMIC_ACQUIRE);
 #ifdef BROOK_HOST_TEST
-    controlled = controlled || g_testCommitQuantum;
+    controlled = controlled || g_testCommitQuantum || g_testCommitHorizon;
 #endif
     const uint64_t sampledBefore = controlled ? AudioClockNowNs() : 0;
     AudioDeviceProgress device{};

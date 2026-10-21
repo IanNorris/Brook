@@ -18,6 +18,7 @@ namespace brook {
 #ifdef BROOK_HOST_TEST
 // Deterministic hosted experiment; not exported to the guest or modules.
 void AudioMixerTestCommitQuantum(uint32_t frames);
+void AudioMixerTestCommitHorizon(uint32_t frames);
 uint64_t AudioMixerTestCommitCount();
 #endif
 

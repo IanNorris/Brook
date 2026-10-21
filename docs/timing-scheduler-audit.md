@@ -14,6 +14,12 @@ Later evidence supersedes several early leads:
   all 75 hosted suites pass, while real mixed playback and historical runtime
   failures remain open. The next mixer direction needs both a bounded global
   commit horizon and sufficient refill slack, not fictitious silence credit.
+  The subsequent guarded-target experiment expands this to 468 configurations:
+  6,144/1,024, 8,192/1,024 and 8,192/2,048 capacity/fragment tuples sustain exact
+  nominal source rates across twenty-four regular cases each. Smaller tuples
+  still fail and missed service still inserts a gap. Native geometry/API
+  compatibility and mixed-workload validation remain required; the experiment
+  is hosted only and does not change native behavior.
 
 - [Shared IRQ registration](shared-irq-routing.md) has confirmed vector-collision,
   duplicate-dispatch and empty-line reactivation defects. Actual-body host tests
