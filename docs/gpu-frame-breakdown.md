@@ -159,3 +159,59 @@ The final review's `frame-breakdown-control/` holds `raw-capture.json`,
 `capture.json`, `reconciled-breakdown.json`, `frame-breakdown.csv`, off/on/off
 cost brackets and the verification receipt. Artifacts remain private below
 `build/`; no licensed application data is committed.
+
+## Loaded recorder validation
+
+The first Quake capture exposed two diagnostic problems. Foreign GPU callers
+attempted the recorder lock before the model rejected their owner identity;
+the stopped frame export also sent each scalar separately. Its export exceeded
+60 seconds. That failed capture remains under
+`build/reviews/unattended-preparation-overlap-gpu-1ms-fixed-mlfq-b-20261021`.
+Frozen rows were recovered read-only after app exit, but the unpersisted original
+start/stop acknowledgements prevent accepting it as a normal capture. A bulk
+stdout trace download also failed its loss gate. The complete timestamp file
+was subsequently recovered from the checked offline private disk; neither
+original transport failure is counted as a pass.
+
+Runtime probes now check an atomic owner hint before attempting the lock or
+reading the clock, then retain the model's authoritative ownership check under
+the lock. Stop/reset clear the hint. Actual-owner contention remains counted
+and rejected by the analyzer. Each row is serialized through one bounded reply
+buffer, preserving exact JSON while reducing socket writes. Hosted tests compile
+the actual wrappers and row serializer, checking foreign admission, genuine
+owner loss, reset/stale tokens, unavailable clocks and maximum-value chunking.
+Release build, all 81 hosted suites and 11 analyzer tests pass.
+
+Native review
+`build/reviews/unattended-loaded-recorder-gpu-1ms-fixed-mlfq-a-20261021`
+uses kernel
+`f254dca9431761b3ed83befe56138118ae2d3612fd60fb6247208052fe10f0aa`
+and unchanged overlap GPU module
+`81ab428a1b8f19d2978231343241f4b972012cc2784b26b6f00ebd36d157379b`.
+It retains eight vCPUs, 8 GiB, MLFQ, 1920×1080 GPU composition and the private
+1 ms host fence poll. Quake GL3, Venus vkcube and vkmark run sequentially, each
+with 256 reconciled compositor rows and no recorder contention delta.
+
+| Workload | Actual client | Body p50 | Compositor interval p50 |
+| --- | --- | --- | --- |
+| Quake 2 GL3 | 1280×720 | 4.185 ms | 11.017 ms |
+| Venus vkcube | 800×600 | 4.999 ms | 5.997 ms |
+| Venus vkmark | 1280×720 | 6.015 ms | 6.043 ms |
+
+These compositor intervals are not application frame times. Quake's buffered
+SDL trace, hash-checked after offline extraction, completes 72 swaps within the
+retained 3.225-second guest-clock window (22.33 swaps/s); complete inter-swap
+interval p50 is 49.95 ms and p95 61.99 ms. Boundary-crossing gaps remain explicit.
+Vkmark reports vertex 37 FPS / 27.027 ms and texture 38 FPS / 26.316 ms, both on
+Virtio-GPU Venus backed by Intel UHD 630. Vkcube requested 1280×720 but negotiated
+800×600, so it must not be presented as a 720p performance result.
+
+Quake's stopped row export takes 1.42 seconds. Window minimize/restore replies
+are separately timed (about 255/137 ms for Quake), including bridge overhead;
+they are not input-to-photon measurements. Screenshots, CPU profiles and timing
+windows are separate. All owned apps exit with complete output, no remaining
+tasks or windows, clean heap/runtime checks, successful original VM owner exit
+and four clean offline filesystem checks. This is one candidate cohort without
+a matched performance control or comprehensive rendering-correctness verdict.
+The outstanding GL/Vulkan comparisons and larger fence/pacing targets remain
+open.

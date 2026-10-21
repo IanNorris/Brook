@@ -48,6 +48,7 @@
 #include "debug_ui.h"
 #include "drm_backing_diagnostics.h"
 #include "frame_timing.h"
+#include "frame_timing_reply.h"
 
 // External C functions used by debug channel
 extern "C" void MouseGetPosition(int32_t*, int32_t*);
@@ -4323,20 +4324,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         const bool exportRows=NetStrEq(cmd,"gpu frame timing frames");bool consistent=!exportRows || !s.enabled;
         if(exportRows && !s.enabled)for(unsigned i=0;i<s.count;++i){
             FrameTimingRow row;if(!FrameTimingReadRow(s.epoch,i,&row)){consistent=false;break;}
-            BridgeReply f;if(i)f.text(",");f.text("{");f.field("frame",row.frame);
-            f.text(",");f.field("begin_ns",row.beginNs);f.text(",");f.field("end_ns",row.endNs);
-            f.text(",");f.field("previous_end_ns",row.previousEndNs);f.text(",");f.field("sleep_deadline_ticks",row.sleepDeadlineTicks);
-            f.text(",");f.field("commands",row.commands);f.text(",");f.field("command_bytes",row.commandBytes);
-            f.text(",");f.field("fenced_commands",row.fencedCommands);
-            f.text(",");f.field("first_fence",row.firstFence);f.text(",");f.field("last_fence",row.lastFence);
-            f.text(",");f.field("command_preparation_ns",row.commandPreparationNs);
-            f.text(",\"phase_ns\":[");f.send();
-            for(unsigned k=0;k<FramePhaseCount;++k){BridgeReply v;if(k)v.text(",");v.number(row.phases[k]);v.send();}
-            DebugChannelSend("],\"command_ns_by_parent\":[");
-            for(unsigned k=0;k<FramePhaseCount;++k){BridgeReply v;if(k)v.text(",");v.number(row.commandNsByParent[k]);v.send();}
-            DebugChannelSend("],\"commands_by_parent\":[");
-            for(unsigned k=0;k<FramePhaseCount;++k){BridgeReply v;if(k)v.text(",");v.number(row.commandsByParent[k]);v.send();}
-            DebugChannelSend("]}");
+            FrameTimingWriteRow<DebugChannelSend>(row,i!=0);
         }
         const auto after=FrameTimingReadStatus();
         if(exportRows && (after.epoch!=s.epoch || after.enabled || after.completed!=s.completed))consistent=false;
