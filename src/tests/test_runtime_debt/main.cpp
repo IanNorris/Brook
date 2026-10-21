@@ -50,7 +50,7 @@ struct ConsumedSteal {
     }
 };
 
-brook::RuntimeSample at(uint64_t w, uint64_t s) { return {w, s, true}; }
+brook::RuntimeSample at(uint64_t w, uint64_t s = 0) { return {w, s, true}; }
 
 void nativePair(uint64_t beforeWall, uint64_t wall, uint64_t beforeSteal,
                 uint64_t steal, uint64_t deficit) {

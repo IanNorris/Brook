@@ -78,3 +78,21 @@ diagnostic and stays off by default. Frozen kernel SHA-256 is
 Evidence and checked receipt are retained under
 `build/reviews/unattended-runtime-debt-mlfq-a-20261021/runtime-debt-control/`.
 These measurements are not a performance comparison against the prior kernel.
+
+## Verification correction
+
+The later shared-prefix experiment's fail-fast full build exposed a fixture
+compile error in the final debt edge cases: the synthetic `at` helper required
+two arguments, while new cases used its intended zero-steal shorthand. Earlier
+multi-command build invocations continued to ctest after this failure, running
+the preceding debt executable. Those aggregate green results did not prove the
+final added edge cases compiled. The previously compiled 30,000-event diagnostic
+comparison and the native integration evidence remain separate.
+
+The helper now defaults its steal argument to zero. A successful full build
+followed by all 74 hosted suites passes, covering the current edge cases too.
+Build/test commands now fail immediately on compilation failure. The original
+failed build and corrected verification logs are preserved under
+`build/workloads/timing-scheduler-20261021/shared-prefix/`, including
+`final-host-build.log`, `verified-host-build.log` and `verified-host-tests.log`.
+This corrects test evidence; production runtime accounting is unchanged.
