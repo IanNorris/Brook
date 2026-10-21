@@ -786,3 +786,114 @@ The change builds and all 86 hosted suites pass; the frozen live review kernel
 is `8d58bcd688797127eb2eafcfe2c7510dcd9fc62da5b225cadfa99026fbec5f36`.
 Audio, clock and scheduler acceptance remain open, and GPU IRQ waits and the
 platform-specific level-route option remain opt-in.
+
+
+### Live host fence/audio correlation and remaining acceptance (2026-10-21)
+
+A separate six-second manual Quake host trace pairs 1,330 compositor-context
+fences: median 1.837 ms, p95 7.214 ms, maximum 22.894 ms. Its 467 app-context
+fences have median 0.019 ms and p95 7.513 ms. These are QEMU control-to-response
+observations, not physical GPU duration. The independent trace is retained in
+`live-fps-window-gpu-1ms-fixed-mlfq-a-20261021/live-host-cost-72356514854698/`.
+
+A subsequent joint GPU/PipeWire/HDA trace uses a conservative common window
+of 6.015193 seconds. QEMU accepts 1,061,120 PCM bytes, approximately 44,101.66
+S16LE/stereo frames per host second. All 1,473 interior next-write-index
+transitions independently match the inferred accepted byte count, with zero
+short writes among 1,474 calls. QEMU's `qpw_write` trace precedes its capacity
+clamp, so requested lengths alone would not suffice; both capacity and index
+checks are required. See the pinned
+[QEMU v10.2.2 PipeWire implementation](https://github.com/qemu/qemu/blob/v10.2.2/audio/pwaudio.c).
+Host ring enqueue can include silence and does not measure source continuity,
+decoded music tempo or physical speaker output. It therefore does not reconcile
+the slower guest stream-completion rate by itself.
+
+The joint trace's compositor fence median/p95/max is 2.237/8.602/50.734 ms,
+showing tails remain. Three delayed audio-timer events fall inside the common
+window (7/29/7 ms); none is itself inside a retained fenced interval. This
+simple overlap check does not establish causality or exclude a common event-loop
+cause. The busiest QEMU host threads use about 0.248, 0.231 and 0.190 cores;
+the PipeWire data-loop thread uses about 0.015 cores. Measurements include trace
+cost and are not an uninstrumented performance control. Raw events, clock
+brackets, task counters and reconciliation are retained in
+`live-joint-trace-72440545332936/`, particularly `pipewire-write-analysis.json`
+and `joint-fence-analysis.json`.
+
+The goal remains open. Command timeout handling currently provides permanent
+quarantine and fail-closed containment; it does not reconstruct the queue,
+reclaim uncertain backing or restore rendering after a device reset. Hosted
+failure injection does not establish native transport-timeout recovery. Input
+checks currently prove window-action applied-state responsiveness, rather than
+physical input-to-photon latency. Rendering checks support no observed new
+corruption in representative captures, not exhaustive correctness. Final live
+interaction/rendering acceptance remains pending. That FPS-window VM later
+completes its original owner exit and all four filesystem checks; the subsequent
+SDL live run is a separate, still-active acceptance run. Within-frame preparation overlap is
+demonstrated; triple buffering and multiple outstanding GPU commands are not
+required to describe that implementation accurately. Existing timing, audio and
+scheduler failures remain open regardless of the GPU throughput gains.
+
+
+### Manual-equivalent controls and refill-headroom discriminator (2026-10-21)
+
+The completed VSync 1/0/1 cohort checks actual SDL intervals 1/0/1, with no
+incomplete/dropped probe records. Its last-256-frame steady SDL rates are
+28.428/19.430/19.039 per guest second and p95 intervals
+59.790/81.058/90.973 ms. The two on arms differ substantially, so this ordered
+trial does not isolate a rendering-speed effect. Audio completion is nearly
+invariant at 37,271/37,317/37,266 frames per guest second. The final vkmark
+vertex/texture result is 40/36 FPS. All accepted app owners and the original VM
+exit zero, raw swap hashes match, heap/runtime checks pass and four filesystem
+checks pass. An initial pre-existing-window guard stopped before a benchmark
+launch; its failed guard, original client close and recovered controller remain
+explicit in `unattended-vsync-window-gpu-1ms-fixed-mlfq-a-20261021/`.
+
+Fresh old/new FPS-display controls use identical explicit Quake cvars and actual
+SDL interval 1. Quake rates are 38.713/26.386 swaps per guest second, while
+vkmark vertex/texture goes 30/33 to 37/34 FPS. Both builds are well below the
+earlier 58–59 FPS vkmark checkpoint, and the directions differ by workload.
+This single ordered pair is not proof of a display-counter regression. Source
+review finds no FPS-value consumer that controls wake/dirty admission: the
+taskbar is cleared/redrawn/marked dirty each frame independently of its text.
+The optional host DRM-client sample was collected after the workload finished
+and must not be used to exclude contention during it. Source manifests,
+original exits, fsck4, raw trace hashes, actual audio/SDL settings and bounded
+window acknowledgements are retained in the `unattended-fps-audio-{old,new}-
+pipewire-gpu-1ms-fixed-mlfq-a-20261021/` reviews and `matched-cohort/verification.json`.
+
+The queued PulseAudio phase was canceled before any image copy or QEMU launch
+when the user requested SDL next. The outer matched-cohort controller therefore
+ends nonzero at the exclusive-create cancellation guard; both actual PipeWire
+VMs and their workloads complete successfully. There is no PulseAudio playback
+result from this sequence. SDL is independently verified by QMP
+`query-audiodevs`, with 44.1-kHz S16/stereo, 20-ms requested output buffer,
+5-ms timer period and HDA `use-timer=false`. The user reports both Quake and
+Firefox slow/stuttering on this verified SDL run.
+
+A six-second Quake QEMU-output capture has 0.795 seconds of exact stereo-zero
+runs of at least 32 frames. Firefox captures have 1.139 and 1.409 seconds.
+Silence alone is not proof of inserted gaps; source content can be silent.
+However, an accompanying Firefox HDA diagnostic records 72 actual silence
+reservations totaling 275,552 bytes (about 1.562 seconds at native format),
+with zero invalid clock/position, unsafe publication, contention or saturation
+counters. Boundaries and hardware buffering differ, so these totals are not an
+exact time alignment. Firefox's actual stream capacity is 4,416 frames; Quake's
+is 4,096 with 1,024-frame fragments. The unchanged HDA write lead is 12,288
+bytes/3,072 frames. Quake consequently has only about 23.2 ms of owned capacity
+beyond that lead before new completion/refill is needed. Observed 34–80-ms
+accepted-submission gaps support a refill-headroom problem but do not identify
+whether source production, worker service or completion discovery was late.
+
+The approved private Quake OpenAL periods 4→8 test changes actual capacity to
+8,192 frames while retaining the 1,024-frame fragment, saved profile, SDL
+backend, HDA lead and scheduler. The installed wrapper/config is untouched; a
+private copied wrapper selects a temporary config. The user reports no
+stuttering. Its six-second capture has zero exact-zero runs of 32 frames or
+longer, zero HDA silence reservations, zero unsafe/invalid diagnostic counters,
+and about 43,979 completed source frames per guest second. This is a promising
+bounded candidate, not general latency/scheduling acceptance. Possible queued
+latency increases and Firefox's separate logical geometry remain to test.
+Evidence is under `live-sdl-window-gpu-1ms-fixed-mlfq-a-20261021/`, including
+`quake-periods8-live/`, the earlier Quake/Firefox PCM folders, original job
+identity and the prelaunch host-directory failure (no guest request published).
+No recorded PCM or commercial game assets are submitted to Git.
