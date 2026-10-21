@@ -61,6 +61,8 @@ target_compile_options(test_mapping_access_timing PRIVATE -DBROOK_HOST_TEST "-iq
 set_tests_properties(test_eevdf PROPERTIES TIMEOUT 20)
 add_host_test(test_runtime_accounting)
 add_host_test(test_sched_lock_trace)
+add_host_test(test_sched_lock_owner)
+set_tests_properties(test_sched_lock_owner PROPERTIES TIMEOUT 20)
 add_host_test(test_vmalloc_arena)
 set_tests_properties(test_vmalloc_arena PROPERTIES TIMEOUT 20)
 set_tests_properties(test_sched_lock_trace PROPERTIES TIMEOUT 20)

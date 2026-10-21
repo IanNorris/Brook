@@ -22,6 +22,9 @@ bool KvmClockStableAvailable();
 // then once on each AP before scheduler entry. No-op when CPUID lacks support.
 bool KvmStealInit(uint32_t cpu);
 bool KvmStealAvailable(uint32_t cpu);
+// Independent host hint byte; read-only, bounded, no CPUID/version retry.
+// False leaves output unchanged; a clear bit does not prove the CPU is running.
+bool KvmStealReadPreempted(uint32_t cpu,uint8_t* output);
 // Bounded version-checked read; failure leaves output unchanged.
 bool KvmStealReadNs(uint32_t cpu, uint64_t* result);
 

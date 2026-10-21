@@ -1,5 +1,6 @@
 #include "irq_accounting.h"
 #include "idle_irq_accounting.h"
+#include "sched_lock_owner.h"
 #include "dsp_producer_timing.h"
 #include "syscall_timing.h"
 #include "sched_decision_trace.h"
@@ -3788,6 +3789,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
             "  sched irq-accounting try|blocking|status - experimental AP accounting deferral\n"
+            "  sched lock-owner on|off|status - bounded ready-lock owner observations (default off)\n"
             "  sched irq-idle-accounting on|off|status - experimental idle sample coalescing\n"
             "  timer peers on|off|reset|status - per-CPU timer arrivals (default off)\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
@@ -4302,6 +4304,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for(unsigned cpu=0;cpu<s.cpus;++cpu){const auto& c=s.cpu[cpu];BridgeReply r;if(cpu)r.text(",");r.text("{");r.field("cpu",cpu);
             r.text(",");r.field("attempts",c.attempts);r.text(",");r.field("successes",c.successes);r.text(",");r.field("deferred",c.deferred);
             r.text(",");r.field("potential_watch_ticks_skipped",c.deferred);r.text(",");r.field("if_errors",c.ifErrors);r.text(",");r.field("stale_ticket_waits",c.staleTicketWaits);r.text("}");r.send();
+        }DebugChannelSend("]}\n");
+    }
+    else if(NetStrEq(cmd,"sched lock-owner on") || NetStrEq(cmd,"sched lock-owner off") || NetStrEq(cmd,"sched lock-owner status")){
+        if(NetStrEq(cmd,"sched lock-owner on"))SchedulerReadyLockOwnerMode(true);
+        if(NetStrEq(cmd,"sched lock-owner off"))SchedulerReadyLockOwnerMode(false);
+        ReadyLockOwnerSnapshot s{};SchedulerReadyLockOwnerRead(&s);BridgeReply header;
+        header.text("{\"enabled\":");header.text(s.enabled?"true":"false");header.text(",\"saturated\":");header.text(s.saturated?"true":"false");
+        header.text(",");header.field("owner_descriptor",s.owner);
+        header.text(",\"scope\":\"default off; advisory ready-lock owner published after ownership and cleared before release; at most20 observations per wait at exponential spin counts64..33554432; counts not durations or exposure rates; unavailable publication includes handoff gaps; independently sampled preempted hint, clear is not running proof; no hypercalls or lock admission changes; cumulative independent rows; disable and drain before reconciliation\",\"cpus\":[");header.send();
+        static const char* names[]={"missing_owner","ticket_mismatch","changed","self","missing_steal","preempted","not_preempted"};
+        for(unsigned cpu=0;cpu<s.cpus;++cpu){const auto& c=s.cpu[cpu];BridgeReply r;if(cpu)r.text(",");r.text("{");r.field("cpu",cpu);
+            r.text(",");r.field("published",c.published);r.text(",");r.field("cleared",c.cleared);r.text(",");r.field("waits",c.waits);
+            r.text(",");r.field("observations",c.observations);r.text(",");r.field("other_hints",c.otherHints);r.text(",");r.field("errors",c.errors);
+            for(unsigned k=0;k<OwnerWaitKinds;++k){r.text(",");r.field(names[k],c.kind[k]);}r.text("}");r.send();
         }DebugChannelSend("]}\n");
     }
     else if(NetStrEq(cmd,"sched irq-idle-accounting on") || NetStrEq(cmd,"sched irq-idle-accounting off") || NetStrEq(cmd,"sched irq-idle-accounting status")){

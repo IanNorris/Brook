@@ -5,6 +5,14 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Ready-lock owner observations](ready-lock-owner-observations.md) add a
+  default-off advisory descriptor after actual ticket ownership and clear it
+  before release. All 71 host suites and a same-kernel native off/on pair pass
+  narrow accounting/ownership gates, while audio remains badly underfed. The
+  enabled interval records 82 owner-qualified preempted hints; counts span
+  setup/load/drain and do not establish a dominant cause. Missing publications
+  remain ambiguous. No yield, lock protocol or scheduler default changes.
+
 - [Timer ready-lock site attribution](irq-ready-lock-sites.md) retains complete
   9–18-ms initial-accounting wait observations inside a loaded direct-audio
   interval, mostly reported steal time. The bounded idle-dispatch records fall

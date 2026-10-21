@@ -86,6 +86,13 @@ int main() {
     CHECK(virtualization.cpus==2 && virtualization.registeredStealMask==3);
     CHECK(virtualization.preemptedHintMask==1 && virtualization.otherHintMask==2);
     CHECK(stealPages[0].preempted==1 && stealPages[1].preempted==2 && stealPages[1].version==3);
+    uint8_t hintByte=0x77;const auto hintCpuidCalls=testCpuidCalls;
+    CHECK(KvmStealReadPreempted(0,&hintByte) && hintByte==1);
+    CHECK(KvmStealReadPreempted(1,&hintByte) && hintByte==2); // odd steal version doesn't govern hint byte
+    CHECK(!KvmStealReadPreempted(64,&hintByte) && hintByte==2);
+    CHECK(!KvmStealReadPreempted(2,&hintByte) && hintByte==2);
+    CHECK(!KvmStealReadPreempted(0,nullptr));
+    CHECK(testCpuidCalls==hintCpuidCalls && stealPages[1].preempted==2 && stealPages[1].version==3);
     stealPages[1].preempted=0xff;g_stealEnabled[63]=true;stealPages[63].preempted=1;
     KvmVirtualizationRead(UINT32_MAX,&virtualization);
     CHECK(virtualization.cpus==64 && virtualization.registeredStealMask==(uint64_t(1)<<63|3));

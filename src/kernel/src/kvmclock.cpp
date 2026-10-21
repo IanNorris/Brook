@@ -259,6 +259,12 @@ bool KvmStealAvailable(uint32_t cpu)
     return cpu < KvmStealCpus && __atomic_load_n(&g_stealEnabled[cpu], __ATOMIC_ACQUIRE);
 }
 
+bool KvmStealReadPreempted(uint32_t cpu,uint8_t* output)
+{
+    if(!output || !KvmStealAvailable(cpu) || !g_stealRecords)return false;
+    *output=__atomic_load_n(&g_stealRecords[cpu].preempted,__ATOMIC_ACQUIRE);return true;
+}
+
 void KvmVirtualizationRead(uint32_t cpus, KvmVirtualizationStatus* output)
 {
     if (!output) return;

@@ -3,6 +3,7 @@
 #include "idle_irq_accounting.h"
 #include "sched_decision_trace.h"
 #include "sched_lock_trace.h"
+#include "sched_lock_owner.h"
 #include "timer_irq_arrivals.h"
 #include "module.h"
 #include "posix_timer.h"
@@ -66,7 +67,12 @@ struct SchedLock {
     volatile uint32_t next   = 0;
     volatile uint32_t serving = 0;
     bool traced = false;
+    bool ownerObserved = false;
 };
+
+static ReadyLockOwnerObservation g_readyOwner;
+void SchedulerReadyLockOwnerMode(bool enabled){g_readyOwner.Mode(enabled);}
+void SchedulerReadyLockOwnerRead(ReadyLockOwnerSnapshot* out){g_readyOwner.Read(SmpGetCpuCount(),out);}
 
 static SchedulerLockTrace g_lockTrace;
 static RuntimeSample LockTraceNow(uint32_t cpu)
@@ -101,9 +107,19 @@ static constexpr uint64_t SCHEDLOCK_TIMEOUT_SPINS = 50000000ULL;
 
 static inline void SchedLockWaitForTicket(SchedLock& lock,uint32_t ticket,const char* caller)
 {
-    uint64_t spins = 0;
+    uint64_t spins = 0,nextOwnerSample=64;
+    const bool observeOwner=lock.ownerObserved && g_readyOwner.Enabled();
+    const auto observerCpu=observeOwner?SmpCurrentCpuIndex():0;
     while (__atomic_load_n(&lock.serving, __ATOMIC_ACQUIRE) != ticket)
     {
+        if(observeOwner){
+            if(!spins)g_readyOwner.Waiting(observerCpu);
+            if(spins==nextOwnerSample){
+                g_readyOwner.Observe(observerCpu,[&]{return __atomic_load_n(&lock.serving,__ATOMIC_ACQUIRE);},
+                    [](unsigned cpu,uint8_t* hint){return KvmStealReadPreempted(cpu,hint);});
+                nextOwnerSample*=2;
+            }
+        }
         __asm__ volatile("pause" ::: "memory");
         if (++spins > SCHEDLOCK_TIMEOUT_SPINS)
         {
@@ -129,6 +145,7 @@ static inline uint64_t SchedLockAcquire(SchedLock& lock,const char* caller=__bui
     const auto ticket=__atomic_fetch_add(&lock.next,1,__ATOMIC_RELAXED);
     const auto trace=LockTraceReserved(lock,ticket,caller);
     SchedLockWaitForTicket(lock,ticket,caller);
+    if(lock.ownerObserved && g_readyOwner.Enabled())g_readyOwner.Acquired(SmpCurrentCpuIndex(),ticket);
     LockTraceAcquired(trace);
     return flags;
 }
@@ -136,6 +153,7 @@ static inline uint64_t SchedLockAcquire(SchedLock& lock,const char* caller=__bui
 static inline void SchedLockRelease(SchedLock& lock, uint64_t savedFlags)
 {
     const auto trace=LockTraceReleasing(lock);
+    if(lock.ownerObserved && g_readyOwner.Owner())g_readyOwner.Releasing(SmpCurrentCpuIndex(),__atomic_load_n(&lock.serving,__ATOMIC_RELAXED));
     __atomic_fetch_add(&lock.serving, 1, __ATOMIC_RELEASE);
     LockTraceReleased(trace);
     if (savedFlags & 0x200)
@@ -155,6 +173,7 @@ static inline void SchedLockRelease(SchedLock& lock, uint64_t savedFlags)
 static inline void SchedLockReleaseRaw(SchedLock& lock)
 {
     const auto trace=LockTraceReleasing(lock);
+    if(lock.ownerObserved && g_readyOwner.Owner())g_readyOwner.Releasing(SmpCurrentCpuIndex(),__atomic_load_n(&lock.serving,__ATOMIC_RELAXED));
     __atomic_fetch_add(&lock.serving, 1, __ATOMIC_RELEASE);
     LockTraceReleased(trace);
 }
@@ -273,7 +292,7 @@ static uint32_t g_registeredPolicyCount = 0;
 static Process* g_pidToProcess[SCHED_MAX_PIDS] = {};
 
 // Global scheduler lock (interrupt-safe, protects all policy calls).
-static SchedLock g_readyLock{0,0,true};
+static SchedLock g_readyLock{0,0,true,true};
 
 bool SchedulerLockTraceControl(int mode,bool reset){return g_lockTrace.Control(mode,reset);}
 void SchedulerLockTraceRead(SchedulerLockTraceSnapshot* output)
@@ -2280,12 +2299,12 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
             if(runtimeFlags&0x200)IrqAccountingIncrement(counts.ifErrors);
             else {
                 IrqAccountingIncrement(counts.attempts);
-                LockTraceToken trace{};
+                LockTraceToken trace{};uint32_t acquiredTicket=0;
                 acquired=TicketTryClaim(&g_readyLock.next,&g_readyLock.serving,[&](uint32_t ticket){
                     IrqAccountingIncrement(counts.staleTicketWaits);
                     SchedLockWaitForTicket(g_readyLock,ticket,"irq-accounting-try-wrap");
-                },TicketNoHook{},[&](uint32_t ticket){trace=LockTraceReserved(g_readyLock,ticket,"irq-accounting-try");});
-                if(acquired)LockTraceAcquired(trace);
+                },TicketNoHook{},[&](uint32_t ticket){acquiredTicket=ticket;trace=LockTraceReserved(g_readyLock,ticket,"irq-accounting-try");});
+                if(acquired){g_readyOwner.Acquired(runtimeCpu,acquiredTicket);LockTraceAcquired(trace);}
                 uint64_t afterFlags;__asm__ volatile("pushfq; pop %0" : "=r"(afterFlags) :: "memory");
                 if((afterFlags^runtimeFlags)&0x200)IrqAccountingIncrement(counts.ifErrors);
                 IrqAccountingIncrement(acquired?counts.successes:counts.deferred);
