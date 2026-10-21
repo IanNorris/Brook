@@ -120,6 +120,7 @@ struct AudioStreamProgress {
     bool discontinuity = false;
     uint32_t capacityFrames = MIXER_RING_FRAMES;
     uint32_t writableFrames = 1;
+    uint32_t fragmentFrames = 1;
 };
 // Refresh calls the driver without the mixer lock. GetProgress reads cached
 // accounting only and is safe for descriptor scans that cannot sleep.
@@ -133,6 +134,7 @@ struct AudioStreamDiagnostic {
     uint64_t epoch = 0, submittedFrames = 0, completedFrames = 0;
     uint32_t softwareFrames = 0, inFlightFrames = 0, capacityFrames = 0;
     bool enabled = false, discontinuity = false;
+    uint32_t fragmentFrames = 1, writableFrames = 1;
 };
 struct AudioMixerDiagnostic {
     uint64_t clockNs = 0;
@@ -145,6 +147,19 @@ void AudioMixerDiagnosticSnapshot(AudioMixerDiagnostic* result);
 void AudioMixerContributionsEnable(bool enabled);
 void AudioMixerContributionsReset();
 AudioMixContributionSnapshot AudioMixerContributionsRead();
+
+// Fixed intel_hda 12-KiB-lead experiment, default off. A guarded target,
+// not a hard pending bound or a scheduling-latency guarantee.
+struct AudioMixerHorizonSnapshot {
+    uint64_t epoch=0,decisions=0,deferrals=0,shortenedAttempts=0,shortenedReceipts=0,acceptedFrames=0;
+    uint64_t headroomBypasses=0,invalidClock=0,unsupportedDriver=0;
+    uint32_t targetFrames=4096,qualifiedStreams=0,unqualifiedStreams=0;
+    bool enabled=false,saturated=false,exhausted=false;
+};
+bool AudioMixerHorizonEnable(bool enabled);
+void AudioMixerHorizonReset();
+AudioMixerHorizonSnapshot AudioMixerHorizonRead();
+bool AudioMixerHorizonEnabled();
 
 // Experimental shared-positive-prefix batching for fixed intel_hda 12-KiB
 // publication lead. No additional wait or submission loop; default off.

@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <vector>
 #include "../../kernel/src/dsp_write_plan.h"
+#include "../../kernel/src/dsp_geometry.h"
 
 #define CHECK(x) do { if(!(x)){std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::abort();} }while(0)
 using brook::DspWritePlan;
@@ -78,4 +79,34 @@ static void writersRestageSharedBuffer() {
     }
     for(unsigned i=0;i<2;++i)CHECK(emitted[i]==std::vector<int16_t>(sources[i],sources[i]+8));
 }
-int main(){prefixesMatchWholeConversion();refillBeforeEmpty();epochsAndBounds();writersRestageSharedBuffer();std::puts("DSP write plan checks passed");}
+static void geometryNegotiation() {
+    using namespace brook;
+    DspGeometry g{};
+    CHECK(DspPlanGeometry((4u<<16)|12,4,16384,false,&g));
+    CHECK(g.fragments==4 && g.fragmentBytes==4096 && g.totalBytes==16384 && !g.changed && !g.horizonQualified);
+    CHECK(DspPlanGeometry((4u<<16)|12,4,16384,true,&g));
+    CHECK(g.fragments==4 && g.fragmentBytes==8192 && g.capacityFrames==8192 && g.writableFrames==2048 && g.changed && g.horizonQualified);
+    CHECK(DspPlanGeometry((6u<<16)|12,4,16384,true,&g));
+    CHECK(g.fragments==6 && g.fragmentBytes==4096 && !g.changed && g.horizonQualified);
+    CHECK(DspPlanGeometry((2u<<16)|12,4,16384,true,&g));
+    CHECK(g.fragments==2 && g.fragmentBytes==4096 && !g.changed && !g.horizonQualified);
+    CHECK(DspPlanGeometry(12,4,16384,true,&g));
+    CHECK(g.fragments==16 && g.fragmentBytes==4096 && g.totalBytes==65536);
+    for(uint32_t frame:{1u,2u,4u})for(uint32_t count:{1u,2u,3u,4u,6u,16u,65u,65535u})
+    for(uint32_t exp:{7u,8u,10u,12u,14u,16u,17u})for(bool enabled:{false,true}) {
+        const uint32_t request=(count<<16)|exp;
+        const bool valid=exp>=8 && exp<=16 && uint64_t(count)*(1u<<exp)<=16384*frame;
+        const DspGeometry previous=g;
+        CHECK(DspPlanGeometry(request,frame,16384,enabled,&g)==valid);
+        if(!valid){CHECK(g.fragmentBytes==previous.fragmentBytes && g.totalBytes==previous.totalBytes);continue;}
+        CHECK(g.fragments<=count && g.fragments && g.fragmentBytes>=(1u<<exp));
+        CHECK((g.fragmentBytes&(g.fragmentBytes-1))==0);
+        CHECK(g.totalBytes==g.fragments*g.fragmentBytes && g.totalBytes<=16384*frame);
+        CHECK(g.capacityFrames*frame==g.totalBytes && g.writableFrames*frame==g.fragmentBytes);
+        if(!enabled)CHECK(!g.changed && g.fragments==count && g.fragmentBytes==(1u<<exp));
+        if(g.horizonQualified)CHECK(g.capacityFrames>=4096+2*g.writableFrames);
+    }
+    CHECK(!DspPlanGeometry(12,3,16384,true,&g));CHECK(!DspPlanGeometry(12,4,0,true,&g));
+    CHECK(!DspPlanGeometry(12,4,16385,true,&g));CHECK(!DspPlanGeometry(12,4,16384,true,nullptr));
+}
+int main(){prefixesMatchWholeConversion();refillBeforeEmpty();epochsAndBounds();writersRestageSharedBuffer();geometryNegotiation();std::puts("DSP write plan checks passed");}

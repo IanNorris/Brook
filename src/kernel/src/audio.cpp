@@ -129,6 +129,7 @@ struct MixerStream {
     uint32_t inFlight = 0;
     uint32_t capacity = MIXER_RING_FRAMES;
     uint32_t writableFrames = 1;
+    uint32_t fragmentFrames = 1;
     bool discontinuity = false;
     bool coalesceUsed = false; // one grace per empty software-queue episode
 };
@@ -159,32 +160,33 @@ static Completion g_completions[COMPLETION_SLOTS];
 static uint32_t g_completionHead = 0, g_completionCount = 0;
 enum class DriverMode { Unknown, Legacy, Native };
 static DriverMode g_driverMode = DriverMode::Unknown; // flush owner only
+static AudioMixerHorizonSnapshot g_horizon;
+static bool g_horizonActive=false;
 #ifdef BROOK_HOST_TEST
-// Hosted commitment-horizon experiment only; no native state, API or branch.
+// Hosted negative quantum control; the horizon wrapper exercises native policy.
 static uint32_t g_testCommitQuantum = 0;
-static uint32_t g_testCommitHorizon = 0;
 static uint64_t g_testCommitCount = 0;
 void AudioMixerTestCommitQuantum(uint32_t frames) {
+    AudioMixerHorizonEnable(false);
     SpinLockAcquire(&g_mixerLock);
     g_testCommitQuantum = frames <= MIXER_BATCH_FRAMES ? frames : 0;
-    g_testCommitHorizon = 0;
     g_testCommitCount = 0;
     SpinLockRelease(&g_mixerLock);
 }
 void AudioMixerTestCommitHorizon(uint32_t frames) {
-    SpinLockAcquire(&g_mixerLock);
-    g_testCommitQuantum = 0;
-    g_testCommitHorizon = frames >= 3072+882 && frames <= 12288 ? frames : 0;
-    g_testCommitCount = 0;
-    SpinLockRelease(&g_mixerLock);
+    AudioMixerTestCommitQuantum(0);
+    if(frames==4096){AudioMixerHorizonEnable(true);AudioMixerHorizonReset();}
 }
-uint64_t AudioMixerTestCommitCount() { return g_testCommitCount; }
+uint64_t AudioMixerTestCommitCount() {
+    const auto h=AudioMixerHorizonRead();return h.enabled?h.decisions:g_testCommitCount;
+}
 #endif
 static uint64_t g_hardwareEpoch = 0;
 static bool g_clockSupported = false; // mixer lock
 static AudioMixerSharedPrefixSnapshot g_sharedPrefix; // existing mixer lock
 static bool g_sharedPrefixActive=false;
-struct SharedPrefixAttempt {uint64_t token=0;uint32_t normal=0, requested=0;};
+enum class MixLimitKind {None,SharedPrefix,Horizon,HostQuantum};
+struct SharedPrefixAttempt {uint64_t token=0;uint32_t normal=0, requested=0;MixLimitKind kind=MixLimitKind::None;};
 static void PrefixAdd(uint64_t& value,uint64_t amount=1) {
     AudioMixSaturatingAdd(value,amount,g_sharedPrefix.saturated);
 }
@@ -196,7 +198,7 @@ static void PrefixAdvance(bool on) {
     __atomic_store_n(&g_sharedPrefixActive,on,__ATOMIC_RELEASE);
 }
 void AudioMixerSharedPrefixEnable(bool enabled) {
-    SpinLockAcquire(&g_mixerLock);PrefixAdvance(enabled);SpinLockRelease(&g_mixerLock);
+    SpinLockAcquire(&g_mixerLock);PrefixAdvance(enabled && !g_horizon.enabled);SpinLockRelease(&g_mixerLock);
 }
 void AudioMixerSharedPrefixReset() {
     SpinLockAcquire(&g_mixerLock);
@@ -238,7 +240,33 @@ static uint32_t SharedPrefixFrames(uint32_t normal,const AudioDeviceProgress& de
         PrefixAdd(g_sharedPrefix.headroomBypasses);return normal;
     }
     PrefixAdd(g_sharedPrefix.shortenedAttempts);
-    attempt={g_sharedPrefix.epoch,normal,shortest};return shortest;
+    attempt={g_sharedPrefix.epoch,normal,shortest,MixLimitKind::SharedPrefix};return shortest;
+}
+static void HorizonCount(uint64_t& count) {
+    AudioMixSaturatingAdd(count,1,g_horizon.saturated);
+}
+static uint32_t HorizonFrames(uint32_t normal,const AudioDeviceProgress& device,
+                               uint64_t sampledBefore,SharedPrefixAttempt& attempt) {
+    if(!g_horizon.enabled || !normal)return normal;
+    HorizonCount(g_horizon.decisions);
+    if(g_driverMode!=DriverMode::Native || strcmp(g_audioDriver->name,"intel_hda")) {
+        HorizonCount(g_horizon.unsupportedDriver);return normal;
+    }
+    const uint64_t now=AudioClockNowNs();constexpr uint64_t serviceNs=10000000;
+    if(!sampledBefore || !now || now<sampledBefore || now-sampledBefore>serviceNs || now>~uint64_t(0)-serviceNs) {
+        HorizonCount(g_horizon.invalidClock);return normal;
+    }
+    const uint64_t travel=((now-sampledBefore+serviceNs)*MIXER_HW_RATE+999999999)/1000000000;
+    if(!device.running || device.discontinuity || device.epoch!=g_hardwareEpoch ||
+       device.submitted<device.completed || device.submitted-device.completed<12288+travel*MIXER_FRAME_BYTES) {
+        HorizonCount(g_horizon.headroomBypasses);return normal;
+    }
+    const uint64_t pending=(device.submitted-device.completed)/MIXER_FRAME_BYTES;
+    const uint32_t limit=pending>=g_horizon.targetFrames?0:uint32_t(g_horizon.targetFrames-pending);
+    if(normal<=limit)return normal;
+    attempt={g_horizon.epoch,normal,limit,MixLimitKind::Horizon};
+    if(limit)HorizonCount(g_horizon.shortenedAttempts);else HorizonCount(g_horizon.deferrals);
+    return limit;
 }
 static AudioMixContributionModel g_mixContributions; // existing mixer lock
 void AudioMixerContributionsEnable(bool enabled) {
@@ -274,6 +302,7 @@ static void CoalesceCount(uint64_t& value)
 void AudioMixerCoalesceEnable(bool enabled)
 {
     SpinLockAcquire(&g_mixerLock);
+    enabled=enabled && !g_horizon.enabled;
     g_coalesce.enabled = enabled;
     __atomic_store_n(&g_coalesceActive, enabled, __ATOMIC_RELEASE);
     CoalesceClearPending();
@@ -295,6 +324,36 @@ AudioMixerCoalesceSnapshot AudioMixerCoalesceRead()
     const auto result = g_coalesce;
     SpinLockRelease(&g_mixerLock);
     return result;
+}
+
+static void HorizonAdvance(bool enabled) {
+    if(g_horizon.exhausted || g_horizon.epoch>~uint64_t(0)-2) {
+        g_horizon.exhausted=true;g_horizon.epoch=0;enabled=false;
+    } else g_horizon.epoch=((g_horizon.epoch&~uint64_t(1))+2)|(enabled?1:0);
+    g_horizon.enabled=enabled;
+    __atomic_store_n(&g_horizonActive,enabled,__ATOMIC_RELEASE);
+}
+bool AudioMixerHorizonEnable(bool enabled) {
+    SpinLockAcquire(&g_mixerLock);
+    if(enabled && (g_sharedPrefix.enabled || g_coalesce.enabled)) {
+        SpinLockRelease(&g_mixerLock);return false;
+    }
+    HorizonAdvance(enabled);const bool accepted=g_horizon.enabled==enabled;
+    SpinLockRelease(&g_mixerLock);return accepted;
+}
+void AudioMixerHorizonReset() {
+    SpinLockAcquire(&g_mixerLock);const auto old=g_horizon;g_horizon={};
+    g_horizon.epoch=old.epoch;g_horizon.exhausted=old.exhausted;HorizonAdvance(old.enabled);
+    SpinLockRelease(&g_mixerLock);
+}
+bool AudioMixerHorizonEnabled() { return __atomic_load_n(&g_horizonActive,__ATOMIC_ACQUIRE); }
+AudioMixerHorizonSnapshot AudioMixerHorizonRead() {
+    SpinLockAcquire(&g_mixerLock);auto out=g_horizon;
+    for(const auto& stream:g_streams)if(stream.identity) {
+        if(stream.capacity>=out.targetFrames+2*stream.fragmentFrames)++out.qualifiedStreams;
+        else ++out.unqualifiedStreams;
+    }
+    SpinLockRelease(&g_mixerLock);return out;
 }
 
 
@@ -346,7 +405,7 @@ AudioStreamId AudioMixerOpen()
             if (stream.identity) continue;
             identity = (g_nextStreamIdentity++ << 4) | (i + 1);
             ResetStream(stream); stream.enabled = true; stream.capacity = MIXER_RING_FRAMES;
-            stream.writableFrames = 1; stream.identity = identity;
+            stream.writableFrames = stream.fragmentFrames = 1; stream.identity = identity;
             break;
         }
     }
@@ -385,7 +444,7 @@ bool AudioMixerSetCapacity(AudioStreamId identity, uint32_t frames, uint32_t wri
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
     const bool empty = stream && stream->read == stream->write && !stream->inFlight;
-    if (empty) { stream->capacity = frames; stream->writableFrames = writableFrames; }
+    if (empty) { stream->capacity = frames; stream->writableFrames = stream->fragmentFrames = writableFrames; }
     SpinLockRelease(&g_mixerLock);
     return empty;
 }
@@ -455,8 +514,9 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
     if (g_batchRemaining && frames > g_batchRemaining) frames = g_batchRemaining;
     const uint32_t normalFrames=frames;
     frames=SharedPrefixFrames(frames,device,sampledBefore,prefix);
+    frames=HorizonFrames(frames,device,sampledBefore,prefix);
 #ifdef BROOK_HOST_TEST
-    if (((g_testCommitQuantum && frames > g_testCommitQuantum) || (g_testCommitHorizon && frames)) &&
+    if (g_testCommitQuantum && frames > g_testCommitQuantum &&
         g_driverMode == DriverMode::Native && !strcmp(g_audioDriver->name,"intel_hda")) {
         const uint64_t now=AudioClockNowNs();
         constexpr uint64_t serviceNs=10000000;
@@ -465,17 +525,13 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
             device.epoch==g_hardwareEpoch && device.submitted>=device.completed) {
             const uint64_t travelFrames=((now-sampledBefore+serviceNs)*MIXER_HW_RATE+999999999)/1000000000;
             if (device.submitted-device.completed>=12288+travelFrames*MIXER_FRAME_BYTES) {
-                uint32_t limit=g_testCommitQuantum;
-                if(g_testCommitHorizon) {
-                    const uint64_t pending=(device.submitted-device.completed)/MIXER_FRAME_BYTES;
-                    limit=pending>=g_testCommitHorizon?0:uint32_t(g_testCommitHorizon-pending);
-                }
+                const uint32_t limit=g_testCommitQuantum;
                 if(frames>limit) {
                     frames=limit;
                     ++g_testCommitCount;
                     // Captured proposal owns remainder clearing even if a test
                     // changes configuration while the driver copies it.
-                    prefix={~uint64_t(0),normalFrames,frames};
+                    prefix={~uint64_t(0),normalFrames,frames,MixLimitKind::HostQuantum};
                 }
             }
         }
@@ -485,10 +541,8 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
     // short proposal. Keep the ordinary remainder bound so a low-headroom
     // retry can restore ordinary batching after rejection/partial acceptance.
     g_batchRemaining = normalFrames;
-#ifdef BROOK_HOST_TEST
     // A deferred horizon decision never owned a submission/retry budget.
-    if(g_testCommitHorizon && !frames)g_batchRemaining=0;
-#endif
+    if(prefix.kind==MixLimitKind::Horizon && !frames)g_batchRemaining=0;
     for (uint32_t slot = 0; slot < MIXER_MAX_STREAMS; ++slot) {
         const auto& stream = g_streams[slot];
         if (prepared) prepared[slot]={};
@@ -607,7 +661,7 @@ bool AudioMixerGetProgress(AudioStreamId identity, AudioStreamProgress* result)
     auto* stream = FindStream(identity);
     if (stream) *result = {stream->epoch, stream->submittedFrames, stream->completedFrames,
         static_cast<uint32_t>(stream->write - stream->read) + stream->inFlight,
-        g_clockSupported, stream->discontinuity, stream->capacity, stream->writableFrames};
+        g_clockSupported, stream->discontinuity, stream->capacity, stream->writableFrames,stream->fragmentFrames};
     SpinLockRelease(&g_mixerLock);
     return stream != nullptr;
 }
@@ -625,7 +679,7 @@ void AudioMixerDiagnosticSnapshot(AudioMixerDiagnostic* result)
         result->streams[i] = {stream.identity, stream.epoch,
             stream.submittedFrames, stream.completedFrames,
             static_cast<uint32_t>(stream.write - stream.read), stream.inFlight,
-            stream.capacity, stream.enabled, stream.discontinuity};
+            stream.capacity, stream.enabled, stream.discontinuity,stream.fragmentFrames,stream.writableFrames};
     }
     SpinLockRelease(&g_mixerLock);
 }
@@ -695,9 +749,10 @@ void AudioMixerFlush()
     const uint64_t epoch = __atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE);
     // Default-off avoids any additional clock reads on the normal path.
     bool controlled = __atomic_load_n(&g_coalesceActive, __ATOMIC_ACQUIRE) ||
-                            __atomic_load_n(&g_sharedPrefixActive, __ATOMIC_ACQUIRE);
+                            __atomic_load_n(&g_sharedPrefixActive, __ATOMIC_ACQUIRE) ||
+                            __atomic_load_n(&g_horizonActive,__ATOMIC_ACQUIRE);
 #ifdef BROOK_HOST_TEST
-    controlled = controlled || g_testCommitQuantum || g_testCommitHorizon;
+    controlled = controlled || g_testCommitQuantum;
 #endif
     const uint64_t sampledBefore = controlled ? AudioClockNowNs() : 0;
     AudioDeviceProgress device{};
@@ -732,12 +787,16 @@ void AudioMixerFlush()
         }
         const uint32_t acceptedFrames = receipt.accepted / MIXER_FRAME_BYTES;
         SpinLockAcquire(&g_mixerLock);
-        if(prefix.token && prefix.token==g_sharedPrefix.epoch && g_sharedPrefix.enabled){
+        if(prefix.kind==MixLimitKind::SharedPrefix && prefix.token && prefix.token==g_sharedPrefix.epoch && g_sharedPrefix.enabled){
             PrefixAdd(g_sharedPrefix.shortenedReceipts);
             PrefixAdd(g_sharedPrefix.acceptedPrefixFrames,acceptedFrames);
             // This is planned/requested surplus, not counterfactual driver
             // acceptance or proven avoided missing contributions.
             PrefixAdd(g_sharedPrefix.requestedTailFrames,prefix.normal-prefix.requested);
+        }
+        if(prefix.kind==MixLimitKind::Horizon && prefix.token==g_horizon.epoch && g_horizon.enabled) {
+            HorizonCount(g_horizon.shortenedReceipts);
+            AudioMixSaturatingAdd(g_horizon.acceptedFrames,acceptedFrames,g_horizon.saturated);
         }
         if (contributionToken&1)
             g_mixContributions.Observe(contributionToken,frames,acceptedFrames,prepared,MIXER_MAX_STREAMS);

@@ -82,7 +82,8 @@ All 156 configurations pass exact drain, PCM comparison and ownership/integrity
 checks. The host-only cap nevertheless fails the regular playback criterion in
 **20 of 48** regular candidate cases: each active source within 0.99–1.01 nominal
 and no central driver reservations. It is rejected as a general native fix.
-No new guest command, runtime flag, native state or default change is introduced.
+At this first stage no guest command, runtime flag, native state or default
+change was introduced. The later native follow-up below adds an opt-in control.
 Preprocessing `audio.cpp` with its actual native compiler flags confirms all four
 test-state/API names are absent. The guarded proposal and snapshot sampling are
 compiled only with `BROOK_HOST_TEST`.
@@ -183,8 +184,9 @@ with explicit coverage limits: ASan global redzones are disabled because module
 metadata otherwise retains unused PCI initialization symbols, and LeakSanitizer
 is disabled because the sandbox's ptrace environment prevents it from running.
 The original linker/LeakSanitizer failures remain retained; no leak/global-redzone
-acceptance is claimed. Native preprocessing excludes all six hosted experiment
-state/API names. Native scheduler/audio behavior and defaults are unchanged.
+acceptance is claimed. At this hosted-only stage native preprocessing excluded
+all six hosted experiment state/API names. That historical exclusion does not
+apply to the production horizon implementation described below.
 
 ### Geometry compatibility before native testing
 
@@ -214,3 +216,93 @@ Final local evidence: `mixer-horizon-final.log`,
 `mixer-horizon-native-exclusion.json` and `mixer-horizon-asan-ubsan-final.log`
 under the same `reboot-resume` directory. Full timing/scheduler acceptance,
 historical fast playback and earlier failed native gates remain open.
+
+## Default-off native follow-up
+
+The guarded target now has a production implementation exposed through
+`audio horizon on|off|reset|status`. It starts disabled and is mutually exclusive
+with shared-prefix and coalescing experiments. Unsupported drivers, stale clocks
+and insufficient headroom retain ordinary recovery; 4,096 frames is a guarded
+target, not a hard queue bound or a scheduling guarantee. Captured attempt kinds
+and epochs prevent receipts from being attributed to another experiment or to
+an earlier reset. Enabling the control never resizes existing streams or resets
+queued data and credits.
+
+New `SETFRAGMENT` requests may negotiate larger power-of-two fragment sizes
+while respecting the upper field's maximum fragment count and the endpoint
+capacity bound. Four 4-KiB fragments become four 8-KiB fragments; six 4-KiB
+fragments already qualify. Valid requests that cannot qualify, such as a
+two-fragment maximum, retain honest smaller geometry. The original invalid
+requests remain invalid. `GETBLKSIZE`, `GETOSPACE`, writable thresholds and
+diagnostics report actual geometry. Fragment size is recorded separately from
+the writable threshold so changing low-water readiness does not falsify refill
+qualification. Qualification counts all open endpoints, including paused ones;
+it is not a count of active playback streams.
+
+Geometry is committed only after the capacity operation succeeds. A mode toggle
+is not a barrier against an already-started negotiation: the ioctl snapshots
+the flag once. Tests serialize controls and inspect the returned geometry.
+Queued streams still reject renegotiation until explicit reset; pausing is not
+permission to discard data.
+
+All 468 hosted integrity configurations now exercise the production horizon
+body and pass; all 75 hosted suites pass. The expanded pure geometry helper
+checks byte/frame sizes, request bounds, unchanged output on invalid requests
+and count limits. Rebuilt ASan/UBSan audio and geometry suites also pass for
+this production source, with the same global-redzone and leak-detector limits
+described above. An initial missing libc++ link-path failure was corrected
+before building and running the suites; no stale test binary was accepted.
+
+A fresh private eight-CPU VM booted kernel
+`b286425bd29487eb73f3b6da1782b41a9220c88e87f98d003de2ccea8b5ff36b`
+with the same frozen thirteen ABI-34 modules. Four original guest jobs pass:
+serialized geometry off/on/off and the existing endpoint pointer/drain/signal
+regression. They verify full-buffer `EAGAIN`, `POLLOUT`, honest returned sizes,
+queued-paused `EBUSY`, and geometry preserved across reset. All original job
+identities, successful exits, complete output and empty process groups were
+verified. The collection controller incorrectly parsed the endpoint's text
+output as JSON and exited unsuccessfully; a separate offline verifier accepted
+the original evidence without relaunching any guest job. This collection error
+is retained rather than presented as a successful controller exit.
+
+Evidence lives in
+`build/reviews/unattended-horizon-geometry-fixed-mlfq-a-20261021/geometry-control/`.
+These are ABI checks, not playback acceptance or a Linux hardware comparison.
+The subsequent native control uses identical four-by-8-KiB geometry off/on/off,
+two independent finite producers and six-second stereo WAV capture through
+the physical PipeWire route. Write requests remain 4 KiB in all arms. Both
+sources are generated and both endpoints configured before a shared release.
+Each finite twelve-second source drains exactly; source-completion counters
+and decoded packet progression provide separate measurements.
+
+| Mode | Completion rates, two streams | Decoded source seconds / stored PCM second | Quiet 1-ms bins, two channels |
+| --- | --- | --- | --- |
+| Off A | 0.9578 / 0.9575 | 0.9492 / 0.9493 | 3.00% / 2.79% |
+| On B | 1.0007 / 1.0007 | 1.0002 / 1.0002 | 0% / 0% |
+| Off C | 0.9873 / 0.9873 | 0.9909 / 0.9909 | 0.75% / 0.75% |
+
+Pitch fits 1.0 in all captures; stored PCM duration / host capture interval
+is 1.00052, 0.99991 and 0.99964 respectively. Packet timing is approximate,
+not a sample-level integrity proof or a direct speaker measurement. Quiet bins
+use the existing roughly one-ms RMS threshold and can miss shorter gaps.
+The second disabled arm's smaller loss demonstrates phase variability: this is
+a positive controlled result, not a general improvement percentage. The enabled
+run records 1,166 accepted shortened submissions, 44 deferrals, 24 recovery
+bypasses and no invalid-clock/unsupported-driver events over the whole source;
+the target still does not promise uninterrupted service under arbitrary load.
+
+All twelve original producer/report-export jobs pass identity, collected exit,
+complete output and empty-group checks. Current HDA/delivery, heap, policy
+accounting, IRQ, runtime and shutdown gates pass, as do all four filesystem
+checks. The ABI jobs are separate and are not counted in those twelve. Both
+original playback controller and VM owner exited zero. Evidence is in the same
+review's `horizon-control/summary.json`; production sanitizer results are in
+`reboot-resume/horizon-production-sanitized.log`.
+
+A fresh real Firefox/Quake/load cohort is the next gate. Horizon must be enabled
+before endpoint configuration for prospective negotiation, with actual stream
+capacity, fragment size and low-water threshold observed. Policy reversal on
+those established endpoints must preserve geometry and settle prior accepted
+credits. This is distinct from a comparison with default small geometry.
+Real mixed-app acceptance and historical fast playback remain open. No audio
+or scheduler default is promoted.

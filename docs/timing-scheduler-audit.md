@@ -18,8 +18,19 @@ Later evidence supersedes several early leads:
   6,144/1,024, 8,192/1,024 and 8,192/2,048 capacity/fragment tuples sustain exact
   nominal source rates across twenty-four regular cases each. Smaller tuples
   still fail and missed service still inserts a gap. Native geometry/API
-  compatibility and mixed-workload validation remain required; the experiment
-  is hosted only and does not change native behavior.
+  compatibility and mixed-workload validation remained required at that stage.
+  A subsequent default-off production horizon and prospective OSS negotiation
+  now pass all 468 hosted integrity cases and all 75 hosted suites. Four native
+  guest jobs verify geometry off/on/off plus endpoint pointer/drain/signal
+  behavior, including honest maximum fragment counts and queued-data rejection.
+  A controller output-parser failure is retained separately from those verified
+  original job results. An identical-geometry independent-producer native
+  off/on/off control gives decoded rates about 0.949/1.000/0.991 and quiet-bin
+  fractions about 3%/0%/0.75%. All twelve producer/export jobs, current runtime,
+  heap, HDA, policy and four filesystem checks pass. Disabled-arm variability
+  limits general effect-size claims; real mixed-app acceptance remains pending.
+  Rebuilt production ASan/UBSan audio/geometry suites pass with documented
+  global-redzone/leak-detector exclusions. No default is changed.
 
 - [Shared IRQ registration](shared-irq-routing.md) has confirmed vector-collision,
   duplicate-dispatch and empty-line reactivation defects. Actual-body host tests

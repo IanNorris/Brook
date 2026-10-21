@@ -708,14 +708,17 @@ static void commitQuantumGuards(brook::AudioStreamId a,brook::AudioStreamId b) {
 }
 static void commitHorizonGuards(brook::AudioStreamId a,brook::AudioStreamId b) {
     using namespace brook;
-    for(unsigned action=0;action<5;++action) {
+    for(unsigned action=0;action<6;++action) {
         AudioMixerTestCommitQuantum(0);coalesceSetup(a,b);AudioMixerTestCommitHorizon(4096);
         queueChannel(a,false);queueChannel(b,true);
         AudioMixerFlush();VERIFY(g_nativeClock.submitted==16384);
         VERIFY(AudioMixerTestCommitCount()==1); // Full horizon owns no receipt.
-        if(action==0) {
+        if(action==0 || action==5) {
             advanceNative(441*4);
-            afterCopyHook=[] {AudioMixerTestCommitQuantum(0);};AudioMixerFlush();
+            if(action==0)afterCopyHook=[] {AudioMixerTestCommitQuantum(0);};
+            else afterCopyHook=[] {AudioMixerHorizonReset();};
+            AudioMixerFlush();VERIFY(!AudioMixerHorizonRead().shortenedReceipts);
+            AudioMixerHorizonEnable(false);
             VERIFY(g_nativeClock.submitted==16384+441*4);
             queueChannel(a,false,441);queueChannel(b,true,441);AudioMixerFlush();
             VERIFY(g_nativeClock.submitted==16384+(441+1024)*4);
@@ -746,6 +749,29 @@ static void commitHorizonGuards(brook::AudioStreamId a,brook::AudioStreamId b) {
         }
         AudioMixerTestCommitQuantum(0);
     }
+}
+static void horizonControlContracts() {
+    using namespace brook;
+    AudioMixerTestCommitQuantum(0);AudioMixerCoalesceEnable(false);AudioMixerSharedPrefixEnable(false);
+    const auto id=AudioMixerOpen();VERIFY(id);VERIFY(AudioMixerSetCapacity(id,4096,1024));
+    const std::array<int16_t,64> samples{};VERIFY(AudioMixerSubmit(samples.data(),32,id)==32);
+    VERIFY(AudioMixerSetEnabled(id,false));AudioStreamProgress before{},after{};
+    VERIFY(AudioMixerGetProgress(id,&before));VERIFY(AudioMixerHorizonEnable(true));
+    VERIFY(AudioMixerGetProgress(id,&after));
+    VERIFY(after.capacityFrames==before.capacityFrames && after.epoch==before.epoch &&
+        after.submittedFrames==before.submittedFrames && after.completedFrames==before.completedFrames &&
+        after.queuedFrames==before.queuedFrames && after.fragmentFrames==1024);
+    VERIFY(AudioMixerHorizonRead().unqualifiedStreams>0);
+    VERIFY(AudioMixerSetWritableFrames(id,1));VERIFY(AudioMixerGetProgress(id,&after));
+    VERIFY(after.writableFrames==1 && after.fragmentFrames==1024); // LOW_WATER cannot fake qualification.
+    VERIFY(AudioMixerHorizonRead().unqualifiedStreams>0);
+    VERIFY(!AudioMixerSetCapacity(id,8192,2048)); // Paused is not empty.
+    AudioMixerSharedPrefixEnable(true);AudioMixerCoalesceEnable(true);
+    VERIFY(!AudioMixerSharedPrefixRead().enabled && !AudioMixerCoalesceRead().enabled);
+    AudioMixerHorizonEnable(false);AudioMixerSharedPrefixEnable(true);
+    VERIFY(!AudioMixerHorizonEnable(true));AudioMixerSharedPrefixEnable(false);
+    AudioMixerCoalesceEnable(true);VERIFY(!AudioMixerHorizonEnable(true));AudioMixerCoalesceEnable(false);
+    VERIFY(AudioMixerClose(id));AudioMixerHorizonReset();
 }
 static void steadyCommitExperiment() {
     using namespace brook;
@@ -1014,6 +1040,7 @@ int RunMixerClockTests() {
     AudioDeliveryTimingEnable(false);
     contributionTests(a,b);
     sharedPrefixTests(a,b);
+    horizonControlContracts();
     commitQuantumGuards(a,b);
     commitHorizonGuards(a,b);
     steadyCommitExperiment();

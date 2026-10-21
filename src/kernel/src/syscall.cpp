@@ -8,6 +8,7 @@
 #include "posix_timer.h"
 #include "timeout_value.h"
 #include "timerfd_state.h"
+#include "dsp_geometry.h"
 #include "futex_timeout.h"
 #include "sync_file.h"
 #include "gpu_reservation.h"
@@ -7112,19 +7113,14 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         else if (cmd == SNDCTL_DSP_SETFRAGMENT) {
             if (progress.submittedFrames) return -16; // RESET before changing pointer geometry.
             if (dsp->sampleRate != MIXER_HW_RATE) return -95;
-            const uint32_t exponent = value & 0xffff;
-            if (exponent < 8 || exponent > 16) return -EINVAL;
-            const uint32_t size = 1u << exponent;
             const uint32_t frameBytes = dsp->channels * (dsp->bitsPerSample / 8);
-            const uint32_t maximum = MIXER_RING_FRAMES * frameBytes;
-            uint32_t fragments = static_cast<uint32_t>(value) >> 16;
-            if (!fragments) fragments = maximum / size; // Unspecified count: use capacity.
-            if (!fragments || uint64_t(fragments) * size > maximum) return -EINVAL;
-            const uint32_t bytes = fragments * size;
-            if (!AudioMixerSetCapacity(dsp->mixerStreamId, bytes / frameBytes, size / frameBytes)) return -16;
-            dsp->fragmentSize = size; dsp->ringBytes = bytes;
+            DspGeometry geometry;
+            if(!DspPlanGeometry(static_cast<uint32_t>(value),frameBytes,MIXER_RING_FRAMES,
+                                AudioMixerHorizonEnabled(),&geometry))return -EINVAL;
+            if (!AudioMixerSetCapacity(dsp->mixerStreamId, geometry.capacityFrames, geometry.writableFrames)) return -16;
+            dsp->fragmentSize = geometry.fragmentBytes; dsp->ringBytes = geometry.totalBytes;
             ++dsp->controlEpoch;
-            return 0; // Exact requested nonzero count; never silently clamp it.
+            return 0; // Actual negotiated size/count are reported by GETBLKSIZE/GETOSPACE.
         } else if (cmd == SNDCTL_DSP_LOW_WATER) {
             // This endpoint's readiness accounting is in native mixer frames.
             // Do not silently reinterpret converted-rate byte counts.

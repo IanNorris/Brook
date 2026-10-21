@@ -3569,6 +3569,8 @@ static void DebugAudioDiagnostics()
         row.text(","); row.field("software_frames", stream.softwareFrames);
         row.text(","); row.field("inflight_frames", stream.inFlightFrames);
         row.text(","); row.field("capacity_frames", stream.capacityFrames);
+        row.text(","); row.field("fragment_frames", stream.fragmentFrames);
+        row.text(","); row.field("writable_frames", stream.writableFrames);
         row.text(","); row.field("enabled", stream.enabled);
         row.text(","); row.field("discontinuity", stream.discontinuity);
         row.text("}"); row.send();
@@ -3787,6 +3789,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
+            "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
             "  audio contributions on|off|reset|status - accepted native mix contributions (default off)\n"
             "  audio coalesce on|off|reset|status - experimental HDA 12-KiB refill grace (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
@@ -4232,6 +4235,23 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             row.text(",\"worked\":");row.text(e.worked?"true":"false");row.text("}");row.send();
         }
         DebugChannelSend("]}\n");
+    }
+    else if(NetStrEq(cmd,"audio horizon on") || NetStrEq(cmd,"audio horizon off") ||
+            NetStrEq(cmd,"audio horizon reset") || NetStrEq(cmd,"audio horizon status")) {
+        bool accepted=true;
+        if(NetStrEq(cmd,"audio horizon on"))accepted=AudioMixerHorizonEnable(true);
+        else if(NetStrEq(cmd,"audio horizon off"))accepted=AudioMixerHorizonEnable(false);
+        else if(NetStrEq(cmd,"audio horizon reset"))AudioMixerHorizonReset();
+        const auto s=AudioMixerHorizonRead();BridgeReply r;r.text("{\"enabled\":");r.text(s.enabled?"true":"false");
+        r.text(",\"accepted\":");r.text(accepted?"true":"false");r.text(",");r.field("epoch",s.epoch);
+        r.text(",");r.field("target_frames",s.targetFrames);r.text(",");r.field("decisions",s.decisions);
+        r.text(",");r.field("deferrals",s.deferrals);r.text(",");r.field("shortened_attempts",s.shortenedAttempts);
+        r.text(",");r.field("shortened_receipts",s.shortenedReceipts);r.text(",");r.field("accepted_prefix_frames",s.acceptedFrames);
+        r.text(",");r.field("headroom_bypasses",s.headroomBypasses);r.text(",");r.field("invalid_clock",s.invalidClock);
+        r.text(",");r.field("unsupported_driver",s.unsupportedDriver);r.text(",");r.field("qualified_streams",s.qualifiedStreams);
+        r.text(",");r.field("unqualified_streams",s.unqualifiedStreams);r.text(",\"saturated\":");r.text(s.saturated?"true":"false");
+        r.text(",\"exhausted\":");r.text(s.exhausted?"true":"false");
+        r.text(",\"scope\":\"default off; fixed intel_hda 12KiB lead; guarded4096-frame target, startup/recovery may exceed it; no receipt on deferral; no source credit for silence; prospective SETFRAGMENT may enlarge size while respecting maximum count; existing queues unchanged; qualification is tested refill reserve, not scheduling guarantee; exclusive with coalesce/shared-prefix\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"audio shared-prefix on") || NetStrEq(cmd,"audio shared-prefix off") ||
             NetStrEq(cmd,"audio shared-prefix reset") || NetStrEq(cmd,"audio shared-prefix status")) {
