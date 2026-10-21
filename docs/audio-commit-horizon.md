@@ -351,3 +351,56 @@ Replica B's `mixed-prefix-control/verification.json`, `geometry-transitions.json
 and `summary.json` retain the actual horizon results despite the inherited
 directory/phase names. No audio or scheduler default is promoted. Full mixed
 acceptance and historical fast playback remain open.
+
+### Observed asymmetric geometry discriminator
+
+The hosted fixture adds 144 cases alongside the unchanged 468-case matrix.
+Shape 1 uses Firefox's observed 4,416/64 capacity/fragment frames against
+Quake's 8,192/2,048. Shape 2 increases only Firefox capacity to 8,192 while
+retaining its 64-frame fragment. Each producer opportunity greedily submits
+whole fragments until space is exhausted; these are not measured application
+write patterns. Firefox opportunities occur every 1/5/10 ms; Quake retains a
+five-ms period with 0/1/4-ms phase offsets. Both source orders, cached completion
+versus explicit refresh, and ordinary versus guarded batching are covered.
+
+Selected central source rates (all orders/phases/cadences in each stated group):
+
+| Geometry | Policy / completion observation | Firefox-like / Quake-like rate |
+| --- | --- | --- |
+| Observed asymmetric | Ordinary, cached | 0.4546 / 0.7854 |
+| Observed asymmetric | Horizon, cached | 0.9635 / 1.0000 |
+| Observed asymmetric | Horizon, refresh before refill | 1.0000 / 1.0000 |
+| Larger Firefox capacity only | Horizon, cached or refreshed | 1.0000 / 1.0000 |
+
+The observed asymmetric horizon passes 18 of 36 regular playback cases: every
+refreshed case passes, every cached case misses Firefox's rate gate. The larger
+Firefox-capacity horizon passes all 36. All 72 ordinary-batching cases fail
+the playback gate; enlarging capacity without guarding commitment does not
+solve the problem. All added cases have zero central driver reservations,
+preserve exact PCM order and source drain totals, and match physical data to
+cached completion over the central interval. Missing source throughput is not
+automatically an HDA underrun or scheduler failure.
+
+Initial priming still commits 8,192 output frames even when Firefox supplies
+only 4,416 initially. The two-to-six-second measurement window excludes that
+startup, and the second source cannot mask missing first-source PCM. Direct
+`AudioMixerRefresh()` is an experimental variable, not a simulation of browser
+ioctls, decode or thread timing. Brook's DSP ioctl entry already refreshes
+completion before taking the per-open mutex, so the cached-only result does
+not establish the cause of the native Firefox deficit. No production geometry
+or policy bound is changed from this experiment.
+
+`analyze_mixer_asymmetric.py` requires the exact 144-case matrix and rejects
+missing/duplicate configurations, wrong geometry and physical/completion
+mismatches. The original analyzer independently accepts the original 468 rows.
+Evidence is `mixer-asymmetric-final.log` and `mixer-asymmetric-analysis.json`
+under `reboot-resume`. All 75 hosted suites and the expanded audio fixture's
+bounded ASan/UBSan run pass (same redzone/leak-detector limits as above).
+
+The next discriminator is native finite synthetic sources with these exact
+asymmetric geometries, horizon enabled, and real `GETOSPACE` before refill.
+If these sustain nominal progress while Firefox does not, inspect actual
+application production/readiness and accepted short/empty contributions before
+changing capacity. If they also fall short, known source availability isolates
+completion/refill scheduling more directly. The two runtime clamps and the
+broader timing/scheduler acceptance remain separate open issues.

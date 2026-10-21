@@ -776,10 +776,17 @@ static void horizonControlContracts() {
 static void steadyCommitExperiment() {
     using namespace brook;
     constexpr uint32_t total=44100*8;
+    for(unsigned shape:{0u,1u,2u})for(unsigned producerPeriod:{1u,5u,10u})
     for(uint32_t capacity:{4096u,5120u,6144u,8192u})
     for(unsigned mode=0;mode<4;++mode)for(uint32_t fragment:{1024u,2048u})for(bool wholeFragment:{false,true})
     for(bool refreshProducer:{false,true})for(unsigned offset:{0u,1u,4u})for(bool reverse:{false,true})
     for(unsigned scenario=0;scenario<3;++scenario) {
+        // Preserve the original symmetric matrix. Additional controls model
+        // observed Firefox 4416/64 versus Quake 8192/2048 endpoints; shape 2
+        // changes only Firefox capacity. No scheduler or browser is simulated.
+        if(!shape && producerPeriod!=5)continue;
+        if(shape && (capacity!=8192 || (mode!=0 && mode!=3) || fragment!=1024 ||
+                     !wholeFragment || scenario))continue;
         // Honest four-fragment/eight-KiB-fragment geometry control: larger
         // fragments, rather than silently exceeding an application's count.
         if(fragment==2048 && ((capacity!=6144 && capacity!=8192) || mode!=3))continue;
@@ -789,10 +796,12 @@ static void steadyCommitExperiment() {
         AudioMixerTestCommitQuantum(0);AudioMixerSharedPrefixEnable(false);
         AudioMixerCoalesceEnable(false);AudioStop();initialize();AudioMixerRefresh();
         AudioStreamId ids[2]={AudioMixerOpen(),AudioMixerOpen()};VERIFY(ids[0] && ids[1]);
+        const uint32_t capacities[2]={shape==1?4416u:capacity,capacity};
+        const uint32_t fragments[2]={shape?64u:fragment,shape?2048u:fragment};
         const uint32_t targets[2]={total,scenario==1?capacity:total};
         std::vector<int16_t> pcm[2];uint32_t written[2]{},played[2]{};
         for(unsigned s=0;s<2;++s) {
-            VERIFY(AudioMixerSetCapacity(ids[s],capacity,fragment));
+            VERIFY(AudioMixerSetCapacity(ids[s],capacities[s],fragments[s]));
             pcm[s].resize(total*2);
             for(uint32_t f=0;f<total;++f) {
                 const uint64_t code=(uint64_t(f)*48271+uint64_t(s)*65537) ^ (uint64_t(f)*f>>3);
@@ -806,8 +815,8 @@ static void steadyCommitExperiment() {
             if(refreshProducer)AudioMixerRefresh();
             for(;;) {
                 const uint32_t free=AudioMixerAvailableFrames(ids[s]);
-                if(!free || written[s]==targets[s] || (wholeFragment && free<fragment))break;
-                const uint32_t count=std::min({free,fragment,targets[s]-written[s]});
+                if(!free || written[s]==targets[s] || (wholeFragment && free<fragments[s]))break;
+                const uint32_t count=std::min({free,fragments[s],targets[s]-written[s]});
                 const auto accepted=AudioMixerSubmit(pcm[s].data()+written[s]*2,count,ids[s]);
                 VERIFY(accepted==count);written[s]+=accepted;
                 if(!accepted)break;
@@ -847,7 +856,7 @@ static void steadyCommitExperiment() {
             // reconciliation or flush between the two producer opportunities.
             for(unsigned order=0;order<2;++order) {
                 const unsigned s=reverse?1-order:order;
-                if(ms%5==(s?offset:0))refill(s);
+                if(ms%(s?5:producerPeriod)==(s?offset:0))refill(s);
             }
             // Four missed service opportunities, followed by the original
             // cadence; never compensate with an immediate extra flush.
@@ -902,7 +911,11 @@ static void steadyCommitExperiment() {
         for(unsigned s=0;s<2;++s)VERIFY(after[s]-before[s]==physicalAfter[s]-physicalBefore[s]);
         // Extrema are sampled after the producer/service actions each ms, not
         // a continuous minimum immediately before every replenishment.
-        std::printf("MIXER_STEADY mode=%u capacity=%u fragment_frames=%u fragment=%u refresh=%u offset=%u reverse=%u scenario=%u completion=%llu,%llu physical=%llu,%llu interval_frames=176400 drain_ms=%u cached_pending=%u,%u sampled_physical_pending=%llu,%llu reservations=%llu steady_reservations=%llu missing_short=%llu missing_empty=%llu caps=%llu over_horizon_samples=%u max_horizon_excess_bytes=%llu recovery_ms=%u\n",
+        if(shape)std::printf("MIXER_ASYMMETRIC shape=%u producer_period_ms=%u capacities=%u,%u fragments=%u,%u ",
+                            shape,producerPeriod,capacities[0],capacities[1],fragments[0],fragments[1]);
+        std::printf(shape?
+            "mode=%u legacy_capacity_anchor=%u legacy_fragment_anchor=%u fragment=%u refresh=%u offset=%u reverse=%u scenario=%u completion=%llu,%llu physical=%llu,%llu interval_frames=176400 drain_ms=%u cached_pending=%u,%u sampled_physical_pending=%llu,%llu reservations=%llu steady_reservations=%llu missing_short=%llu missing_empty=%llu caps=%llu over_horizon_samples=%u max_horizon_excess_bytes=%llu recovery_ms=%u\n":
+            "MIXER_STEADY mode=%u capacity=%u fragment_frames=%u fragment=%u refresh=%u offset=%u reverse=%u scenario=%u completion=%llu,%llu physical=%llu,%llu interval_frames=176400 drain_ms=%u cached_pending=%u,%u sampled_physical_pending=%llu,%llu reservations=%llu steady_reservations=%llu missing_short=%llu missing_empty=%llu caps=%llu over_horizon_samples=%u max_horizon_excess_bytes=%llu recovery_ms=%u\n",
             mode,capacity,fragment,unsigned(wholeFragment),unsigned(refreshProducer),offset,unsigned(reverse),scenario,
             (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]),
             (unsigned long long)(physicalAfter[0]-physicalBefore[0]),(unsigned long long)(physicalAfter[1]-physicalBefore[1]),
