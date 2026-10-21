@@ -43,10 +43,14 @@ def main():
     parser.add_argument('--channels', choices=('left', 'right', 'both'), default='both')
     parser.add_argument('--first', type=int, choices=(0, 1), default=0,
                         help='Initial descriptor refill order; alternates each loop')
-    parser.add_argument('--fragments', type=int, choices=(4, 8), default=4,
-                        help='OSS fragment count; write requests stay 4096 bytes')
-    parser.add_argument('--fragment-bytes', type=int, choices=(4096, 8192), default=4096,
+    parser.add_argument('--fragments', type=int, choices=(4, 8, 69), default=4,
+                        help='OSS fragment count; write requests default to 4096 bytes')
+    parser.add_argument('--fragment-bytes', type=int, choices=(256, 4096, 8192), default=4096,
                         help='Explicit fragment geometry, independent of the mixer mode')
+    parser.add_argument('--write-bytes', type=int, choices=(256, 4096, 8192), default=4096)
+    parser.add_argument('--refresh-before-refill', action='store_true',
+                        help='Query actual GETOSPACE and limit each write to available bytes; '
+                             'both modes still query GETOPTR every 100 ms')
     parser.add_argument('--gate-stage', choices=('generated', 'configured'), default='generated',
                         help='Barrier after generation (legacy) or after all descriptors are configured')
     parser.add_argument('--gate-url',
@@ -65,6 +69,8 @@ def main():
     played = [0] * len(channels)
     eagain = [0] * len(channels)
     partial = [0] * len(channels)
+    space_queries = [0] * len(channels)
+    empty_space = [0] * len(channels)
     started = finished = None
     barrier = None
     failure = None
@@ -113,7 +119,18 @@ def main():
                 if submitted[index] == len(payloads[index]):
                     continue
                 offset = submitted[index]
-                count = min(4096, len(payloads[index]) - offset)
+                count = min(args.write_bytes, len(payloads[index]) - offset)
+                if args.refresh_before_refill:
+                    available = array.array('i', [0] * 4)
+                    fcntl.ioctl(devices[index], 0x8010500C, available, True)
+                    space_queries[index] += 1
+                    if (available[1] != args.fragments or available[2] != args.fragment_bytes
+                            or not 0 <= available[3] <= args.fragments * args.fragment_bytes):
+                        raise RuntimeError(('changed refill geometry', list(available)))
+                    count = min(count, available[3])
+                    if not count:
+                        empty_space[index] += 1
+                        continue
                 before = time.monotonic_ns()
                 try:
                     accepted = os.write(devices[index], views[index][offset:offset+count])
@@ -168,6 +185,8 @@ def main():
     report = dict(schema=1, channels=channels, requested_seconds=args.seconds,
                   frames_each=args.seconds * 44100, rate=44100, stereo=True,
                   geometry=geometry, fragments=args.fragments, fragment_bytes=args.fragment_bytes,
+                  write_bytes=args.write_bytes, refresh_before_refill=args.refresh_before_refill,
+                  space_queries=space_queries, empty_space=empty_space,
                   first=args.first, start_barrier=barrier, start_ns=started, end_ns=finished,
                   duration_guest_seconds=(finished-started)/1e9 if started is not None else None,
                   submitted_bytes=submitted, completed_bytes=played, eagain=eagain,

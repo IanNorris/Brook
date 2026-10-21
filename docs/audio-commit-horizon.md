@@ -404,3 +404,46 @@ application production/readiness and accepted short/empty contributions before
 changing capacity. If they also fall short, known source availability isolates
 completion/refill scheduling more directly. The two runtime clamps and the
 broader timing/scheduler acceptance remain separate open issues.
+
+### Native finite asymmetric sources
+
+Review `unattended-horizon-asymmetric-fixed-mlfq-a-20261021` keeps horizon on
+and negotiates exactly 69 × 256-byte fragments (4,416/64 frames) for the left
+source, four × 8-KiB fragments (8,192/2,048) for the right. Write requests are
+256 and 8,192 bytes respectively. Each source is finite, pregenerated and
+independently owned. All arms query `GETOPTR` every 100 ms. The refreshed arms
+add real `GETOSPACE` before each refill and limit the write to returned space;
+the middle arm retains nonblocking write/retry admission. It is not a pure
+cached-only experiment, nor a replay of Firefox's write sequence.
+
+| Arm | Decoded left / right source seconds per PCM second | Quiet bins, left / right |
+| --- | --- | --- |
+| Per-refill space A | 0.9828 / 0.9979 | 1.91% / 0.13% |
+| Periodic pointer B | 0.9383 / 1.0002 | 4.90% / 0% |
+| Per-refill space C | 0.9501 / 0.9993 | 4.19% / 0.07% |
+
+Pitch fits 1.0 and stored PCM/host interval ratios remain 1.00090, 1.00002 and
+0.99945. All twelve original producer/export jobs, exact source drains,
+current delivery/HDA, runtime, heap/policy, clean controller/VM exits and four
+filesystem checks pass. This verifies data integrity and lifecycle; the small
+source fails the real-time playback gate even with real fresh-space queries.
+Delivery/contribution recording is enabled for this discriminator, unlike the
+reduced-probe real-app windows; do not pool the two performance cohorts.
+
+The first capture records 4,676 missing-short frames and no missing-empty
+frames for the small source; the large source contributes every accepted output
+frame. A snapshot has 4,096 small-source frames in flight and only 320 in
+software. At 44.1 kHz that software reserve lasts about 7.26 ms. Accepted-write
+gaps in the fresh-space windows reach 20.88 and 29.01 ms (p99 about 7.87/7.90
+ms); the periodic-pointer maximum is 31.92 ms. These intervals include query
+time, bookkeeping, retries, sleeps and scheduling. They are not measured
+dispatch latency or proof that all lost frames belong to those maximum gaps.
+
+Fresh completion alone therefore does not guarantee this small geometry's
+throughput under native refill timing. The current `target + 2 × fragment`
+qualification provides less than one ten-ms service interval here. Before
+changing prospective geometry or the target, add explicit bounded producer-gap
+controls and justify a reserve against the unchanged HDA safety lead and
+service interval. Existing queued endpoints must remain unchanged. Evidence:
+`asymmetric-control/summary.json` and `write-gap-analysis.json`. No production
+bound/default or scheduler policy is changed by these results.
