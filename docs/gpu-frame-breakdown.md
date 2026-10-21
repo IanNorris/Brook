@@ -897,3 +897,109 @@ Evidence is under `live-sdl-window-gpu-1ms-fixed-mlfq-a-20261021/`, including
 `quake-periods8-live/`, the earlier Quake/Firefox PCM folders, original job
 identity and the prelaunch host-directory failure (no guest request published).
 No recorded PCM or commercial game assets are submitted to Git.
+
+
+### Firefox larger logical buffer and live-run closure (2026-10-21)
+
+A private ALSA OSS module built with `minimumBufferFrames=6174` and a temporary
+per-process configuration leaves the installed Firefox wrapper and package
+unchanged. Actual native stream capacity is 6,208 frames with 64-frame
+fragments, versus the earlier 4,416-frame stream. SDL, the 3,072-frame HDA lead,
+GPU completion mode and scheduler remain unchanged. The user reports occasional
+drops with pacing feeling right; this is not a measured tempo result.
+
+The six-second capture records 0.574580 seconds of exact stereo-zero runs of
+at least 32 frames, across 25 runs with a maximum 84.830 ms. HDA diagnostics
+record 31 reservations totaling 101,788 bytes, or 0.577029 seconds at native
+format; source completion is 39,859.8 frames per guest second (90.4% of nominal).
+Invalid-clock, invalid-position and unsafe-publication counters are zero.
+Compared with earlier unmatched Firefox captures (1.139–1.409 seconds of zeros),
+this supports improvement but is not a balanced media-matched A/B result.
+Capture and device-buffer boundaries differ; silence totals are not exact
+sample alignment. See `firefox-buffer6174-live/capture-74467351043704/`.
+
+Astra's read-only review agrees that these results support insufficient refill
+tolerance as a contributor, not an established cause of late refills. Capacity
+beyond the fixed lead grows from about 23 to 116 ms for Quake, while Firefox's
+candidate provides about 71 ms. These are capacity-based ceilings, not measured
+post-submission headroom or guaranteed scheduling allowances. The next useful
+discriminator is fixed-geometry Firefox worker timing plus delivery-position
+observations: distinguish late wake/service from timely service without queued
+source data, and compare actual post-submit headroom with DMA advancement.
+Do not infer worker sleep from accepted-submission gaps. Neither lowering the
+HDA safety lead nor changing scheduler defaults follows from this evidence.
+Both larger-buffer candidates remain private; potential queued-latency cost and
+longer/mixed-workload continuity are unverified.
+
+The user also reports changing background patterns after selecting 720p.
+Six completed-frame captures under `patterns-74576495633379/` retain the
+reported smearing and colored patterns. Each capture briefly pauses/copies the
+VM frame and is not unperturbed video. Ambient-effect versus rendering-fault
+classification remains unresolved; rendering acceptance is qualified. The exact
+original Firefox job exits successfully before clean shutdown. The original
+VM owner exits zero and all four offline filesystem checks pass. This closes
+the run's lifecycle, not the outstanding audio/rendering acceptance gates.
+
+
+### Reset acknowledgement prerequisite and recovery contract (2026-10-21)
+
+The initialization path now writes device status zero and waits for a read of
+zero before ACK/DRIVER and feature negotiation, as required by
+[Virtio 1.2 section 4.1.4.3.2](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html).
+`device_reset.inc` uses the existing bounded completion waiter: elapsed stable
+clock when available, bounded polling otherwise. Failure stops initialization.
+Hosted tests compile the actual primitive and exercise immediate, delayed and
+missing acknowledgement, including no clock dependency in early boot and an
+elapsed runtime deadline. Source inspection establishes that the caller returns
+before ACK/DRIVER on failure; the hosted fixture does not execute the entire
+initialization branch. Release build and all 86 hosted suites pass, with logs
+`reboot-resume/gpu-reset-ack-{build,tests}.log`. This changes reset ordering at
+initialization; no runtime reset/reclamation is enabled.
+
+Astra's recovery review identifies a useful complete contract: restore desktop
+rendering and admit fresh GL/Vulkan clients while invalidating every pre-reset
+GPU object. Transparent continuation of existing contexts is not assumed.
+Implementing that contract still requires all of the following:
+
+- Close admission and mark the device generation lost outside `FinishCommand`;
+  allow active callers to unwind before a reset worker acquires exclusive use.
+- Quiesce compositor/scene operations and completion waiters/IRQ readers without
+  masking a shared interrupt line globally. The present completion binding
+  assumes queue/MMIO lifetime until reboot and needs an explicit rebind contract.
+- Drain old DRM owners, mappings, imported scene leases and aperture aliases.
+  Old Venus host-visible mappings must be revoked with TLB completion, or all
+  owners fully reaped, before aperture reuse. Ioctl errors alone are insufficient.
+- Observe reset completion under a bound; retain uncertain device-owned pages
+  if reset fails. Rebuild transport, scanout and compositor resources only after
+  successful reset, invalidate cached resource versions, and verify a draw and
+  readback before reopening admission for a new generation.
+- Keep stale handles, tokens and old cleanup paths unable to submit resource IDs
+  into the rebuilt device. Test concurrent close/submission, delayed completion,
+  reset/rebuild failure, mappings/aliases and repeated recovery. Native acceptance
+  needs an induced fault followed by restored desktop and successful new GL and
+  Vulkan clients, with old objects safely rejected.
+
+These requirements are not satisfied by today's quarantine path or by the new
+initialization wait. They remain open alongside final interaction/rendering
+acceptance and the independent timing/audio/scheduler investigations.
+
+
+The reset-acknowledgement native smoke reaches the desktop, passes owned GPU
+self-tests and renders Quake GL and vkmark. Original guest jobs ultimately exit
+zero, the original VM owner exits zero, raw swap bytes/SHA round-trip correctly,
+and all four filesystem checks pass. Representative images show no obvious new
+fault; they do not resolve the Firefox background report. Performance acceptance
+is **rejected**: the user independently launched Quake during the automated
+startup, so the harness initially selected that unrelated window (client 18
+versus tracked client 28). Its rejected close led to a controller observation
+deadline; refreshed same-client minimize/restore/close actions succeeded and the
+original job was collected without duplication. The strict runtime gate also
+finds two clamped-service samples, retained rather than waived. No clean timing
+or scheduler-safety claim follows from this smoke. The private harness now
+requires tracked PID/incarnation for window selection, refreshes that client's
+reference before actions, and explicitly rejects unapplied actions. Evidence:
+`unattended-reset-ack-gpu-1ms-fixed-mlfq-a-20261021/native/`, especially
+`lifecycle-and-rejection.json`. The frozen matched build differs in kernel and
+GPU module bytes; manifests record both hashes. An inherited old expected-hash
+guard failed before image creation/QEMU and was corrected to the exact fresh
+build hash, with the failed prelaunch receipt preserved.
