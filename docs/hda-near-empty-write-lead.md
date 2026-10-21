@@ -123,3 +123,110 @@ and host steal. The current timer path checks blocked deadlines on the BSP
 only. That is a source observation and a measurement target, not a proven cause
 of the captured stall or justification for changing timer ownership without
 SMP safety tests.
+
+
+## Isolated write-distance experiment, 21 October
+
+The postreboot physical-output Quake controls in
+[scheduler attribution](scheduler-lock-attribution.md) reproduce roughly
+0.84x application completion and measure about 0.95 seconds of reserved
+silence alongside 0.94 seconds of missing application progression. Read
+windows are not exactly aligned; outstanding application receipts and unplayed
+reserved gaps also matter for exact conservation. This supports testing the
+write distance separately from the codec's stop trailer.
+
+An isolated module experiment names the write distance independently and
+compares 12,288 with 8,192 bytes, retaining the 8,192-byte stop trailer. The
+main branch's driver and default remain unchanged. Matched modules use the
+same compiler/worktree, byte-identical kernel and other modules, private
+images and physical speaker route. Alternating 12/8/8/12-KiB controls are
+complete with the results below; bounded synthetic contention checks are also
+complete, while broader application acceptance remains pending.
+
+The production-driver hosted tests now cover pending tail at lead minus four,
+exactly lead, and lead plus four. They also sample raw DMA positions one to
+three bytes beyond aligned completion, then inject fetches ending exactly at
+the receipt and one byte beyond. Exact-boundary acceptance and beyond-boundary
+fault/unchanged proven completion are checked. Existing near-empty wrapped
+burst, larger fetch, ambiguous sample gap, ownership, epoch and tail-drain
+cases remain. Diagnostic reservation/headroom expectations use the selected
+lead minus four instead of hard-coding 12,284. Both lead settings pass these
+actual-driver tests and the timing-model tests.
+
+Astra's independent review supports this default-off experiment and emphasizes
+that the post-copy guard is **detection and containment**: copied bytes may
+already have escaped before detection. Preserving it retains conservative
+completion and fault handling, not a universal absence-of-corruption proof.
+Neither observed maximum DMA advance nor finite host-contention tests bound
+future host preemption. No smaller default is accepted without the planned
+repeated application, packet-code, queue-geometry, drain/restart and bounded
+contention controls.
+
+
+The four matched physical-output attract controls return to the slow state
+when switching back to the original lead:
+
+| Run | Nominal application completion / guest elapsed | Reserved silence bytes | Nominal silence seconds |
+| --- | ---: | ---: | ---: |
+| 12k-a | 0.83806 | 173248 | 0.98213 |
+| 8k-b | 0.99838 | 248 | 0.00141 |
+| 8k-c | 1.00001 | 0 | 0.00000 |
+| 12k-d | 0.84325 | 184832 | 1.04780 |
+
+All four have zero unsafe publications, invalid clock/position samples,
+diagnostic contention or saturation. Their bounded profiles report zero drops.
+Each original guest job exits zero with complete output and no group tasks;
+its window closes gracefully, original VM launcher exits zero, and all four
+offline filesystem checks pass. These short clock/counter controls support a
+causal reservation effect in Quake; they are not independently decoded source
+progression or a universal safety bound. No smaller production default is
+accepted yet. Synthetic packet-code, finite drains, queue geometry and bounded
+CPU contention are the next gates.
+
+The frozen pair and complete evidence remain ignored under
+`build/workloads/timing-scheduler-20261021/hda-lead-{12k,8k}-frozen` and
+`hda-lead-cohort`. Main-branch changes at this stage are focused regression
+tests and this evidence log; the experimental driver lives in an isolated
+worktree and private capsules.
+
+
+### Bounded packet-code load controls
+
+Both frozen leads completed sequential four- and eight-fragment OSS writers
+(4,096 bytes per fragment), each submitting and completing exactly 882,000
+frames at 44.1 kHz. Each run overlapped eight host CPU workers and four sleepers
+for twenty seconds on CPUs 0–13, with the VM restricted to those CPUs and two
+host CPUs reserved. This is finite host contention, not a worst-case scheduling
+or DMA guarantee.
+
+| Lead | Fragments | Guest delivery seconds | Reserved bytes | Decoded source seconds / stored PCM second |
+| --- | ---: | ---: | ---: | ---: |
+| 8 KiB | 4 | 19.95581 | 0 | 1.00009 |
+| 8 KiB | 8 | 19.99841 | 0 | 1.00009 |
+| 12 KiB | 4 | 20.00258 | 8204 | 0.99894 |
+| 12 KiB | 8 | 19.99542 | 496 | 1.00014 |
+
+The eight-second PCM excerpts all decode with approximately unchanged pitch,
+no missing packet IDs between decoded runs, and no backwards or repeated
+transitions. The 8-KiB excerpts have no quiet approximately one-millisecond
+bins. The original 12-KiB four-fragment excerpt has six quiet bins out of
+8,026 (longest two consecutive); the eight-fragment excerpt has none. These
+are stored PCM measurements, not direct physical speaker timing, and do not
+cover the entire twenty-second writers.
+
+All four controls have clean delivery diagnostics and runtime clock/accounting
+quality counters, successful finite writer drains, successful original job and
+host-load exits, and clean heap checks. Both original VM owners terminate zero
+and all four filesystem checks per VM pass. The first 8-KiB report read exceeded
+the bridge stdout retention window after the writer had completed; its failed
+read receipt remains preserved. A read-only, size/hash-verified HTTP transfer
+recovered the original report without rerunning that writer. Later reports use
+the same bounded file-transfer method.
+
+The synthetic writer does **not** reproduce Quake's large slowdown with the
+original lead: both settings deliver approximately real time here. Its value
+is an independent load/drain/queue-geometry check of the candidate, alongside
+the alternating Quake reproduction. Broader browser and application restart
+acceptance remains required before changing the production default. Full
+receipts and decoded excerpts are indexed by the ignored
+`build/workloads/timing-scheduler-20261021/hda-lead-loaded-summary.json`.

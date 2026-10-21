@@ -243,6 +243,36 @@ int RunHdaClockTests() {
         snapshot=progress();VERIFY(!snapshot.discontinuity && snapshot.completed==priorCompleted+1024);
         for(uint64_t at=previousEnd;at<receipt.begin;++at)VERIFY(dma[at%AUDIO_BUF_SIZE]==0);
     }
+    // The reservation trigger is strict, with no gap when the full lead is
+    // already owned. Exercise this using the selected production lead so the
+    // same safety checks can validate an isolated alternative lead.
+    for(uint32_t pending:{NATIVE_WRITE_LEAD-4,NATIVE_WRITE_LEAD,NATIVE_WRITE_LEAD+4}) {
+        initialize();receipt=HdaTrySubmit(tone.data(),49152);
+        VERIFY(receipt.accepted==49152);
+        advanceNative(49152-pending);
+        const auto completed=g_nativeClock.completed;
+        receipt=HdaTrySubmit(tone.data(),4);
+        const uint64_t expected=pending<NATIVE_WRITE_LEAD?completed+NATIVE_WRITE_LEAD:49152;
+        VERIFY(!receipt.error && receipt.accepted==4 && receipt.begin==expected);
+        VERIFY(g_nativeClock.completed==completed && dma[49151]!=0);
+        for(uint64_t at=49152;at<expected;++at)VERIFY(dma[at%AUDIO_BUF_SIZE]==0);
+    }
+    // Completion is frame-aligned, but the raw DMA position is not. Fetching
+    // exactly up to the new receipt is accepted; one byte past it is detected
+    // and faults without crediting those exposed application bytes.
+    for(uint32_t rawOffset:{1u,2u,3u})for(bool beyond:{false,true}) {
+        initialize();receipt=HdaTrySubmit(tone.data(),8192);advanceNative(8192-744);
+        move(rawOffset,1000);progress();
+        const auto completed=g_nativeClock.completed;
+        static uint32_t fetchBytes;
+        fetchBytes=NATIVE_WRITE_LEAD-rawOffset+(beyond?1:0);
+        afterCopyHook=[] {move(fetchBytes,49000);};
+        receipt=HdaTrySubmit(tone.data(),4);
+        VERIFY(receipt.begin==completed+NATIVE_WRITE_LEAD && receipt.accepted==4);
+        VERIFY(receipt.error==(beyond?-32:0));
+        VERIFY(g_nativeClock.completed==completed && g_nativeClock.discontinuity==beyond);
+        if(beyond)VERIFY(g_nativeFaultEvidence.publish.failedChecks==PublishDmaCaughtWrite);
+    }
     // These independent rejections used to look identical in native logs.
     initialize();receipt=HdaTrySubmit(tone.data(),8192);advanceNative(8188);
     afterCopyHook=[] {nowNs+=AudioDmaClock::MaxSampleNs;};
@@ -362,8 +392,8 @@ int RunMixerClockTests() {
     afterCopyHook=[] {move(4,49000);};
     VERIFY(AudioMixerSubmit(second.data(),2,a)==2);AudioMixerFlush();
     auto timing=AudioDeliveryTimingRead();
-    VERIFY(timing.observations==2 && timing.reservations==1 && timing.reservedBytes==12284);
-    VERIFY(timing.maxCopyNs==49000 && timing.maxAdvanceBytes==4 && timing.minHeadroomBytes==12284);
+    VERIFY(timing.observations==2 && timing.reservations==1 && timing.reservedBytes==NATIVE_WRITE_LEAD-4);
+    VERIFY(timing.maxCopyNs==49000 && timing.maxAdvanceBytes==4 && timing.minHeadroomBytes==NATIVE_WRITE_LEAD-4);
     VERIFY(!timing.invalidClock && !timing.invalidPosition && !timing.unsafe);
     afterCopyHook=[] {move(20000,49000);};
     VERIFY(AudioMixerSubmit(first.data(),2,a)==2);AudioMixerFlush();
