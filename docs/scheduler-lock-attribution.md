@@ -430,3 +430,63 @@ prove complete handoff history, or authorize a lock/yield implementation change
 without its own safety and workload checks. The hashed kernel symbol inventories
 and selected trace record are saved in
 `build/workloads/timing-scheduler-20261021/disabled-probe-audit`.
+
+
+## Pre-investigation live good endpoint
+
+The user requested moving the search before timing/scheduler iteration. The
+branch point is `7d005ae088a7f1ee8c0ca15f45760ae08ed67c19`, committed 20 October
+at 00:26 BST, immediately before the first scheduler/timer fixes. A detached
+checkout at `/data/Programming/Codex/Brook-pre-timing-7d005ae0` builds that exact
+revision with its two pinned required submodules. Its matched kernel is
+`916a4ceba52f200d5331d4f3012f378a49cebff87bf8c30a75779809bad815d0`, with twelve
+ABI-33 modules. This does not replace the current branch or artifacts.
+
+After the previous review's approved clean shutdown, original owner exit and
+four filesystem checks, fresh private clones from the same checked review
+baseline booted those artifacts through the historical launcher. The native
+review is `build/reviews/live-pre-timing-7d005ae0-20261021`, session
+`a3147b54e38247d4afcbdec6eca38a2a`. It uses eight vCPUs/8 GiB and historical RR,
+PipeWire's 200-ms requested output buffer, and QOM-confirmed HDA `use-timer=true`.
+The old network debug interface lacks `sched policy status`; the host readiness
+assertion initially encountered that schema mismatch. The same original VM was
+retained, not restarted. Its boot serial independently confirms loaded RR and
+its saved kernel/module hashes match the frozen manifest. The original wrapper
+handle remains authoritative until handback/shutdown.
+
+The user reports Quake smooth at **13–14 FPS, without audio stutter**, compared
+with approximately 11 FPS and slow/stuttering music on the current MLFQ/try,
+callback/20-ms run. After closing Quake and running Firefox, the user reports
+vastly improved audio/video playback, including at 720p, while still observing
+reported dropped frames. These are user observations of live scenes, not a
+controlled timedemo or an independently established media progression rate.
+They establish a useful historical good endpoint on today's host, but the
+kernel, scheduler selection and audio defaults all differ.
+
+Two-second Quake profiles use independently matched kernel/module symbols.
+Current slow: 1,596 samples, 7,385 switches, zero drops. Historical good: 1,584
+samples, 6,988 switches, zero drops. Non-idle retained stacks include virtio-GPU
+command/completion waits in both; the old driver also samples its command spin
+lock, whereas current uses the newer command-ownership/completion helper. Counts
+are not CPU occupancy because interrupts mask sampling, and scenes/policies/
+audio are not matched. Only `290c5646` changes the GPU driver between these
+source endpoints; it is a candidate for a later controlled test, not an
+identified culprit. The historical two-second Firefox capture has 1,483 samples,
+37,584 recorded switches and 9,644 dropped events. It remains explicitly lossy.
+
+Host inventory records Intel i915 render node `/dev/dri/renderD128` as the
+selected path, with the secondary NVIDIA GPU on renderD129. `nvidia-smi` reports
+a driver/library mismatch; this is retained as environmental context, not
+attributed as the cause on the selected Intel path. No intentional CPU load was
+active during these live comparisons. A separate next control is prepared with
+current kernel/modules but the same historical launcher, RR and audio defaults.
+That separates a kernel change from configuration before starting a commit
+bisect. Do not stage or switch until the user hands this VM back.
+
+The supplied reference recording exists at
+`/home/ian/2026-10-19 00-05-40.mp4`. Its metadata reports creation at
+18 October 23:05:40 UTC (19 October 00:05:40 BST), 447.033 seconds, and a
+1280x720/30-fps recording stream. Recording FPS is not guest game FPS. The latest
+commit preceding that timestamp is `8e1ab908`; timestamp proximity alone does
+not identify the actual running kernel. The video remains a further-back
+reference if this live good endpoint does not support a reproducible bisect.
