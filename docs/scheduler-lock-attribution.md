@@ -490,3 +490,54 @@ The supplied reference recording exists at
 commit preceding that timestamp is `8e1ab908`; timestamp proximity alone does
 not identify the actual running kernel. The video remains a further-back
 reference if this live good endpoint does not support a reproducible bisect.
+
+
+### Matched-settings bad endpoint and first bisect candidate
+
+The historical good run completed its approved clean shutdown, original wrapper
+exit and four read-only filesystem checks. Current kernel `fc41f3db…` then
+booted with the same historical launcher, RR, eight vCPUs/8 GiB, Intel render
+node and 200-ms PipeWire/HDA timer settings. Its QOM confirms timer mode and its
+nine probe controls read disabled; host `/proc` captures the actual QEMU options
+and selected library paths. A first attempt at instance 543 exited before boot
+because historical forwarding computes `11237 + 100*instance`, exceeding 65535.
+The corrected fresh review uses valid instance 541 and preserves that failure.
+
+In `build/reviews/live-current-historical-settings-v2-20261021`, session
+`7a2ece10853342f6bb9fe4e3ded1c674`, the user observes Quake at **11–12 FPS with
+slow, stuttering music**. This reproduces the Quake regression while holding
+scheduler selection and host/audio settings fixed. Firefox under this particular
+control has not been tested; do not infer its result from the earlier MLFQ run.
+The two-second Quake profile contains 1,591 samples and 7,282 switches with zero
+drops. Its original owner later exits zero after approved clean shutdown and all
+four filesystem checks pass. Thus the comparison supplies a useful kernel/module
+bisect boundary while the same host can run the historical good build.
+
+A stack-based offline pass finds 21 paired outgoing-poll gaps totaling 930 guest
+ticks in the slow capture, versus eight totaling 211 in the good capture. Generic
+mutex-stack paired gaps total 596 ticks across 92 pairs versus 13 ticks across 19
+pairs. These include both blocked and ready time, are guest tick observations,
+and retain capture-edge/same-tick/cross-CPU ambiguities. They do not independently
+measure host wall time or mutex grant-to-dispatch latency. The changed GPU mutex
+is one concrete lead; poll readiness/wakeup behavior is another. Similar overall
+switch counts do not support a large switch-count explosion, but cannot rule out
+expensive individual switches. Profiles and machine-readable analyses remain in
+the two reviews and `matched-quake-{switch-analysis,gap-by-reason}.json` beneath
+the workload root.
+
+A genuine `git bisect` runs only in the detached checkout
+`/data/Programming/Codex/Brook-timing-bisect`, using good `7d005ae0` and bad
+`8df35535`. Its path filter includes kernel, drivers, shared ABI, CMake and
+toolchain source, leaving 46 relevant changes. The primary classification is
+Quake rendering; audio is recorded separately because it may have another first
+bad commit. No intermediate is marked based on intent or profiling alone.
+
+First candidate `044678fa9a953c07a4d71d7f1afdf289d4d089f0` (20 October 14:59 BST)
+builds unchanged with matched ABI-34 modules. Its frozen kernel is
+`9c791159f1bbb65cd65a5e33465aa2b49fd9d7f003f433f267da3f4895fbbd94`.
+Native review `build/reviews/live-bisect-044678fa-20261021`, session
+`c68a4e1f97c94b02bbaf77ec019b8baa`, is running with the same historical settings
+and awaits the user's classification. Available probe defaults are verified off;
+commands absent at that revision are explicitly retained as unavailable. The
+current working branch remains separate and unchanged by bisect checkout.
+`historical-regression-bisect.json` and the saved bisect log retain this state.
