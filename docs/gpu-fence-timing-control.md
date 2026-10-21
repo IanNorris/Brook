@@ -173,3 +173,51 @@ Actual executable SHA-256 values are
 No defaults or scheduler policy were promoted. Historical fast playback,
 uninterrupted audio, prior accounting failures and the full clock/SMP/fairness
 audit remain open.
+
+## Worker/HDA diagnostic with the 1-ms host, second run
+
+The fresh private review `unattended-qemu-poll-1ms-fixed-mlfq-b-20261021`
+repeats all eight ordinary windows with heavy probes disabled, then separately
+enables worker timing alongside HDA delivery and host fence traces for six
+seconds. The frozen guest, 12-KiB HDA lead, logical6174 ALSA geometry and MLFQ
+remain unchanged. All nine original jobs, full clip/loop and media transfers,
+current runtime/native fault, heap/policy, original controller/owner exit and
+four filesystem checks pass. No VM remains from this run.
+
+Ordinary mixed horizon-on windows give Firefox 15.83 and 18.33 callbacks/s and
+Quake 16.64 and 16.72 swaps/s. Loaded windows give Firefox 21.36/20.89 and
+Quake 16.24/16.20. Firefox audio completion in the first mixed window is
+0.98594; subsequent enabled/loaded windows are about 0.9996–1.0001. Retain that
+startup variation. The first mixed WAV has two zero runs at least one
+millisecond long, with maximum 8.707 ms; the later enabled mixed window has
+two, maximum 1.451 ms. Good average completion does not erase these gaps.
+
+The separate diagnostic records 630 completed worker cycles: maximum sleep
+11.436 ms, late-resume lower bound 1.436 ms, service 6.840 ms and tail 21.542
+microseconds. There are zero slow cycles (threshold 20 ms), invalid clocks,
+contended records or saturation. HDA records two reservations of 512 bytes
+each, no overwritten entries and clean position/publication quality. The WAV
+has two 128-frame (2.902-ms) exact-zero runs. Preceding accepted-submission gaps
+are 26.021 and 21.804 ms; each reserves exactly the 512-byte deficit from
+11,776 bytes pending to the unchanged 12,288-byte lead.
+
+These reservations coexist with short observed worker sleep/service brackets;
+this sample does not support a long worker stall as their explanation. There
+are no retained slow cycles to join to either reservation. It does not prove
+source availability or distinguish timely empty/refill-limited calls and bursty
+DMA. Source inspection finds the mixer worker is the only production caller
+of `AudioMixerTick`/`AudioMixerFlush`; the worker probe still retains only slow
+cycles, not each attempt and its source availability. A gap between submissions
+alone is not a missed worker deadline. Next inspect existing mix
+contribution/source and DMA records without changing lead or horizon geometry.
+
+The reusable analyzer is
+`scripts/workloads/analyze_audio_service_delivery.py READINGS --lead-bytes 12288 --output REPORT`.
+It verifies control generations, worker identity, retained-counter consistency
+and exact lead deficits before reporting positive interval overlaps; missing
+worker records stay unknown. The actual capture and five mutated-input controls
+(identity, generation, reservation size, contention and duplicate control)
+validate rejection of misleading joins. Evidence and the executed analyzer are
+retained in the review's `post-timing-gpu-host-trace` directory. The compositor
+fence median/p95 remain 2.518/3.317 ms in this diagnostic. This is an additional
+1-ms observation, not a balanced repeat of the 10/1-ms comparison.
