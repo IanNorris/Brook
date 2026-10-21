@@ -13,9 +13,44 @@ import math
 import os
 from pathlib import Path
 import shutil
+import socket
 import threading
 import time
 from urllib.parse import urlsplit
+
+
+class FixtureServer(http.server.ThreadingHTTPServer):
+    # A clean server exit must include every handler's terminal transfer record.
+    daemon_threads = False
+    block_on_close = True
+
+    def __init__(self, *args, **kwargs):
+        self.connections = set()
+        self.connections_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        with self.connections_lock:
+            self.connections.add(connection)
+        return connection, address
+
+    def close_request(self, connection):
+        try:
+            super().close_request(connection)
+        finally:
+            with self.connections_lock:
+                self.connections.discard(connection)
+
+    def stop_requests(self):
+        # Call after shutdown has stopped accepting/starting new requests.
+        with self.connections_lock:
+            connections = list(self.connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # The handler may have completed and closed it already.
 
 
 def copy_media_stream(source, output, record):
@@ -116,7 +151,7 @@ def main():
             with lock, (root / 'http.log').open('a') as output:
                 output.write(fmt % values + '\n')
 
-    server = http.server.ThreadingHTTPServer(
+    server = FixtureServer(
         ('127.0.0.1', 0), functools.partial(Handler, directory=str(media)))
     (root / 'server.json').write_text(json.dumps({
         'port': server.server_port, 'clip_sha256': clip_sha,
@@ -132,6 +167,7 @@ def main():
             time.sleep(.2)
     finally:
         server.shutdown()
+        server.stop_requests()
         server.server_close()
         worker.join()
     print('BROWSER_MIX_SERVER_STOPPED', flush=True)

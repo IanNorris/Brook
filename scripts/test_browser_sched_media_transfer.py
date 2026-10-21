@@ -103,6 +103,43 @@ class TransferTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('--media-write-timeout must be', result.stderr)
 
+    def test_shutdown_waits_for_terminal_record_of_blocked_reader(self):
+        with tempfile.TemporaryDirectory(prefix='brook-media-shutdown-') as tmp:
+            root = Path(tmp)
+            clip = root / 'source.mp4'
+            # Sparse and larger than socket buffers, so a non-reading client
+            # leaves the sender blocked without writing a large test artifact.
+            with clip.open('wb') as source:
+                source.truncate(64 * 1024 * 1024)
+            output = root / 'fixture'
+            process = subprocess.Popen(
+                [sys.executable, str(SERVER), '--output', str(output), '--clip', str(clip),
+                 '--media-write-timeout', '60'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            connection = None
+            try:
+                self.assertTrue(process.stdout.readline().startswith('BROWSER_MIX_SERVER '))
+                port = json.loads((output / 'server.json').read_text())['port']
+                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+                connection.request('GET', '/clip.mp4')
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                # Leave the response body unread through server shutdown.
+                (output / 'stop').touch()
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, stderr)
+                rows = [json.loads(line) for line in (output / 'media-transfers.jsonl').read_text().splitlines()]
+                self.assertEqual(len(rows), 1)
+                self.assertFalse(rows[0]['complete'])
+                self.assertIn('error', rows[0])
+                self.assertLess(rows[0]['completed_write_bytes'], clip.stat().st_size)
+            finally:
+                if connection is not None:
+                    connection.close()
+                if process.poll() is None:
+                    process.terminate()
+                process.communicate(timeout=5)
+
 
 if __name__ == '__main__':
     unittest.main()

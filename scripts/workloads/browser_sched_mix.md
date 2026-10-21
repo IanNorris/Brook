@@ -59,6 +59,11 @@ its uncertain block: completed write counts are a lower bound, not exact wire
 delivery or proof of guest receipt. Require a complete, full-length matching
 transfer before accepting media-tail or looping results; guest-side byte
 verification and browser errors remain separate checks.
+On shutdown the server stops accepting requests, shuts down active sockets and
+joins request handlers so their terminal records are written before clean exit.
+Earlier daemon-thread versions could omit active transfers at exit: reconcile
+HTTP media GET counts with terminal records, and retain missing records as
+unknown rather than assuming success.
 
 On an observation timeout, inspect the existing receipts/job/VM. Re-running with
 the same output directory resumes known tracked operations; it never creates a
