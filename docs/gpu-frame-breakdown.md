@@ -739,3 +739,50 @@ IRQ waits are enabled. Sleeping removes CPU spent spinning but does not remove
 those waits or the single outstanding control command. Further throughput work
 should target that serialization and command/fence frequency with the existing
 ownership and quarantine contracts intact.
+
+
+### Live audio and manual-launch qualifications (2026-10-21)
+
+Live review reports a substantial Quake frame-rate improvement (roughly
+30–42 FPS across observations), but slow/stuttering music remains. Firefox
+also drops audio and, once vocals make tempo easier to judge, sounds slow.
+Reconnecting the host Audient EVO4 does not resolve it. Negotiated snapshots
+show QEMU S16LE/stereo/44.1 kHz into a host S32LE/four-channel/48 kHz sink;
+resampling is present, but those formats alone do not establish a fault.
+
+A bounded two-second live Quake profile has 1,590 samples and 11,135 context
+switches, no dropped events or event-count mismatch. Exact loaded module
+hashes are checked for symbolization. Most samples are idle; independent
+scheduler counter deltas over the enclosing 8.262-second observation show
+about 0.324 charged cores, 7.190 idle cores and 0.003 steal cores. These
+independently sampled counters do not exactly partition the interval and
+IRQ-masked execution is not uniformly sampled. Runtime error counters remain
+zero. This does not support simple all-core saturation as the audio cause.
+GPU waits reach their safety tick 232 times over the enclosing capture.
+
+A same-VM GPU-wait on/off/on comparison records approximately
+37,350/37,216/37,327 completed mixer frames per guest-clock second for the
+same stream identity/epoch. The user hears no noticeable improvement with
+waits disabled. This is negative evidence for the new interrupt-sleep mode
+being the cause of the live audio slowdown; it does not prove an alternative
+cause. Completion accounting is not a measurement of decoded content tempo
+or physical speaker rate. GPU waits are restored on after the comparison.
+Evidence is retained in `live-fps-window-gpu-1ms-fixed-mlfq-a-20261021/`,
+`live-profile-72060698299309/` and `live-gpu-wake-off-comparison/`.
+
+The manual Quake saved profile also has `r_vsync 1`, `cl_maxfps 60`,
+`cl_async 1` and `vid_maxfps 300`; the uncapped timing harness explicitly
+uses VSync off. This is an important configuration difference, not proof
+that VSync explains the audio or all throughput differences. Controlled
+manual-equivalent VSync comparisons remain outstanding. Automated SDL swap
+completion rates must not be presented as equivalent to the user's in-game
+FPS counter or physical display cadence.
+
+The taskbar compositor rate now uses completed-loop counts over windows of
+at least one second, including long gaps and multiple loops per clock tick.
+It replaces the eight-frame interval EMA and updates only at window boundaries.
+The label still measures compositor cadence, not application FPS/scanout.
+The change builds and all 86 hosted suites pass; the frozen live review kernel
+is `8d58bcd688797127eb2eafcfe2c7510dcd9fc62da5b225cadfa99026fbec5f36`.
+Audio, clock and scheduler acceptance remain open, and GPU IRQ waits and the
+platform-specific level-route option remain opt-in.
