@@ -25,7 +25,12 @@ Later evidence supersedes several early leads:
   Linux, fails eight pre-fix Brook cases, and passes thirteen with the final
   reviewed kernel. All 72 hosted suites pass. Original VM/group/EOF and four
   filesystem gates pass per native arm. Stopped-state handling retains priority;
-  special after-block SIGCONT wake and wider timer races remain follow-up work.
+  the [special after-block SIGCONT follow-up](sigcont-wakeup.md) subsequently
+  fixes a missed infinite-futex wake and four spurious read interruptions.
+  Its identical eleven-case probe goes from five baseline failures to eleven
+  passes; the earlier thirteen-case probe and all 73 hosted suites pass. Final
+  original job/VM/filesystem/runtime gates are clean. Wider timer races remain
+  follow-up work.
   These correctness results do not establish an audio or frame-pacing fix.
   The matched browser follow-up records two runtime clamps under MLFQ after
   its second pre-close snapshot. Its lifecycle is clean but runtime acceptance

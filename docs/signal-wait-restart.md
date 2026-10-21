@@ -71,9 +71,12 @@ job evidence rather than rewritten into a successful job.
 
 ## Limits and follow-up
 
-The special SIGCONT sender branch still queues a caught SIGCONT without waking
-a target already blocked in an infinite wait. That pre-existing after-block gap
-is outside the ordinary sender fix; it needs its own native regression and fix.
+The special SIGCONT after-block gap is now fixed in a separate
+[notification/resumption follow-up](sigcont-wakeup.md): the identical eleven-case
+ELF fails five baseline cases and passes all eleven after the fix, while the
+original thirteen-case restart probe still passes. Default/ignored SIGCONT no
+longer spuriously interrupts unrelated reads. This does not certify complete
+job-control ordering or pending stop-signal cancellation.
 POSIX timer expiry before/after real block admission and broader timeout
 restart/overflow semantics remain follow-up coverage. No scheduler default,
 quantum, audio lead or diagnostic default changes here.
