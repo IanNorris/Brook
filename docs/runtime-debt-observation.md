@@ -115,3 +115,20 @@ The original evidence is
 `build/reviews/unattended-mixed-prefix-mlfq-b-20261021/mixed-prefix-control/runtime-final.json`
 and the phase snapshots beside it. Earlier clean runs do not supersede this
 failure or earlier cross-policy clamps.
+
+
+A separate diagnostic repeats the mixed workload with history enabled before
+the first Quake launch and no later reset. It records 12,120,321 history events
+without reproducing a clamp; 512 retained tail rows replay against the
+consumed-steal reference. Original eight guest jobs, controller and VM owner
+exit zero, all four filesystem checks and current runtime/heap/policy gates
+pass. This negative, history-enabled cohort does not clear the preceding
+positive failure and is not pooled with ordinary performance measurements.
+Evidence is under
+`build/reviews/unattended-mixed-prefix-history-mlfq-a-20261021/mixed-prefix-control/`,
+including `debt-history-replay.json`. The private replay checker distinguishes
+owner events from samples, validates shared export/trigger/catchup metadata,
+and seeds only at the first retained boundary. A synthetic positive
+clamp→owner change→catchup passes; ten mutations of floors, credits, sequences,
+identities, raw trigger pairs and catchup claims are rejected. This verifies
+the checker, not a positive native history that has still not been captured.
