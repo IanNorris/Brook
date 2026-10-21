@@ -59,8 +59,22 @@ Later evidence supersedes several early leads:
   real-libasound sustained-playback fixture passes both physical geometries
   without logical-ring overflow, so that proposed bridge failure is not
   established. A Firefox-only enlarged-buffer repeat also stalls; its lossy
-  post-stall profile is mostly idle. The backend's readiness/error transition
-  remains the next discriminator. Software backlog and source-credit latency bounds remain
+  post-stall profile is mostly idle. A positively bound callback capture then
+  shows successful writes followed by cessation above the plugin. An isolated
+  native test proves a [full nonblocking control-pipe defect](audio-commit-horizon.md#full-nonblocking-control-pipe-writes):
+  both `F_SETFL` and `pipe2` still block when full. The actual production branch
+  now returns `EAGAIN` before waiter registration, with matching descriptor-flag
+  locking. The regression fails before the guard and passes afterward; all 76
+  hosted suites pass. Native errors change from roughly 100-ms blocking until
+  a helper drains to 10–12-μs immediate rejection. The first fixed-kernel mixed
+  run completes the full browser transfer and 120-second loop with the same
+  enlarged geometry, but retains three runtime clamps and loaded source
+  underfeed. The final locking companion also completes the full browser loop,
+  transfers, all eight progress windows, nine jobs and lifecycle/filesystem
+  checks, but retains eight clamps (13.473-μs maximum debt, later caught up)
+  and variable underfeed. Both fixed cohorts avoid the permanent freeze; they
+  do not establish general throughput or full timing acceptance.
+  Software backlog and source-credit latency bounds remain
   explicit. Earlier runtime failures and the historical fast-playback cause
   remain open; no default is promoted.
 

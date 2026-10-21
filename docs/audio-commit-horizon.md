@@ -709,3 +709,90 @@ Firefox closed through its original job, shutdown and four filesystem checks
 passed. This diagnostic is not a full acceptance cohort. The next discriminator
 is the actual backend's polling/error transition, with origin/pointer guards
 preserved and no scheduler default change.
+
+### Full nonblocking control-pipe writes
+
+A positively bound callback recorder narrows the enlarged-geometry stall in
+review `unattended-refill-callback-files-fixed-mlfq-a-20261021`. The first-write
+marker identifies actual playback, not just a device probe. A hashed 206,150-byte
+process log shows 2,970 write attempts and roughly 75,000 callback events before
+refill stops at 646,302 accepted/completed native frames (14.655374 media
+seconds). The recent writes succeed, with no non-`EAGAIN` callback errors.
+The writer stops querying the pointer while another thread continues querying
+zero delay. ALSA's last hardware pointer is 641,892, exactly its 4,410-frame
+logical ring behind accepted application frames. Six original jobs, complete
+log export, shutdown and four filesystems pass. The recorder perturbs execution
+and retains sampled tails; it does not prove the writer's blocking call.
+
+The [release-tagged Firefox 150.0.1 Cubeb ALSA backend](https://hg.mozilla.org/releases/mozilla-release/raw-file/FIREFOX_150_0_1_RELEASE/media/libcubeb/src/cubeb_alsa.c)
+writes wake bytes for both processing and running state transitions and reads
+one control byte per ready loop. Its control pipe is explicitly nonblocking.
+An always-ready audio descriptor can fill that pipe. Brook's pipe-write branch
+nevertheless ignored `O_NONBLOCK` on a full queue and registered a blocking
+writer. A separate syscall watch started after the stall records no entries;
+it is not a capture of the blocked call.
+
+The bounded `scripts/workloads/pipe_nonblock.py` probe confirms the kernel bug
+independently. It fills the declared capacity minus one, then attempts a
+two-byte nonblocking write. A reader scheduled 100 ms later releases broken
+kernels, so the probe leaves no orphan. Both `F_SETFL` and `pipe2` report flags
+2049, yet the old native kernel waits about 100.8/100.6 ms and returns two bytes
+only after that reader. Linux returns `EAGAIN` in about 12/10 μs before the
+reader. Brook does not implement `F_GETPIPE_SZ`; the first probe's failure is
+retained, and the corrected native command explicitly uses the kernel's
+configured 65,536-byte capacity. This does not add a fictional capacity ioctl.
+
+The actual production pipe-write branch is now shared with its hosted test
+through `pipe_write.inc`. If a write accepts no bytes, it checks `O_NONBLOCK`
+under the descriptor-table lock and returns `EAGAIN` before waiter registration.
+`F_GETFL` and `F_SETFL` take that same lock. Successful/partial returns, empty
+writes and broken-reader `SIGPIPE` behavior retain their existing behavior.
+No lock spans the pipe copy or blocking wait. The actual-body test fails two
+assertions before the guard and passes afterward. Additional cases cover the
+socketpair write direction, preservation of an existing waiter, a bounded
+two-writes/one-read self-pipe loop, and ordinary blocking writer progress.
+Small-write `PIPE_BUF` atomicity, multiple blocking waiters, interrupted-writer
+cleanup and shared open-file-description flag aliases remain separate limits.
+
+The first candidate kernel
+`f3d6df1a3a99e9de52b2e02ad2643b716647071bac3716d5c5cf65defd82e39e`
+returns `EAGAIN` in about 10/12 μs for both native probe modes. Its fresh real
+Firefox/Quake/load cohort retains the same enlarged Firefox 6,016/128 physical
+tuple, original application packages, host audio configuration and driver
+modules, with the optional callback recorder absent. Firefox completes and
+loops the full 120-second clip. All eight windows have positive audio/video
+progress; all nine original workload jobs, the separate pipe job, full media
+transfers, native audio fault/discontinuity checks, heap/policy, shutdown and
+four filesystems pass. This removes the geometry-triggered permanent freeze;
+it is not complete audio/performance acceptance.
+
+That candidate still fails runtime acceptance with three clamps, a 7.392-μs
+maximum debt, one owner transition and later catch-up to zero final debt.
+Firefox completion is about 0.935/0.937 with Quake about 0.996/0.992 in the two
+guarded mixed windows. Under eight-worker load they fall to roughly 0.81/0.87.
+These deficits and earlier failed gates remain open. The final matching
+`F_GETFL`/`F_SETFL` locking companion passes all 76 hosted suites, stable two-pass
+symbol generation and the thirteen ABI-34 module import checks. The default
+scheduler and audio experiment flags are unchanged.
+
+The final kernel
+`44b64074d04aa396495b7e00c52787133b692fe4fb68e0366c5afc7666018020`
+passes both native pipe modes before the delayed reader (about 9 μs and
+395 μs observed elapsed time; this is an API test, not a pipe benchmark).
+Review `unattended-pipe-nonblock-final-fixed-mlfq-a-20261021` repeats the full
+mixed workload without the optional callback recorder. The independent pipe
+job and all nine workload jobs complete with original identities, output and
+empty groups. All media transfers, the error-free 120-second browser loop,
+eight positive-progress windows, native audio fault/discontinuity checks,
+heap/policy, original controller/VM exit and four filesystem checks pass.
+
+Full timing acceptance still fails: eight clamps occur in one 13.473-μs maximum
+debt episode with four owner transitions and later catch-up to zero final debt.
+The two guarded mixed windows give Firefox about 0.854/0.864 and Quake
+0.916/0.937 nominal completion. Loaded windows give about 0.890/0.872 and
+0.927/0.930. These are separate cohorts with variable source completion;
+they do not establish a throughput benefit or cost for the flag-lock companion.
+The permanent freeze is absent in both fixed-kernel cohorts, while the runtime
+and underfeed failures remain. The separate logical ALSA ring still has no
+extra refill reserve merely because physical OSS capacity increased. That
+negotiation/readiness problem and the broader clock/scheduler audit remain open.
