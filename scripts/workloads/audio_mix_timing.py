@@ -43,6 +43,8 @@ def main():
     parser.add_argument('--channels', choices=('left', 'right', 'both'), default='both')
     parser.add_argument('--first', type=int, choices=(0, 1), default=0,
                         help='Initial descriptor refill order; alternates each loop')
+    parser.add_argument('--gate-url',
+                        help='Optional finite HTTP start barrier after source generation, before device open')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():
@@ -56,8 +58,20 @@ def main():
     eagain = [0] * len(channels)
     partial = [0] * len(channels)
     started = finished = None
+    barrier = None
     failure = None
     try:
+        if args.gate_url:
+            import urllib.request
+            before = time.monotonic_ns()
+            print('AUDIO_MIX_PREPARED', json.dumps(dict(channels=channels,
+                  frames_each=args.seconds * 44100)), flush=True)
+            with urllib.request.urlopen(args.gate_url, timeout=45) as response:
+                receipt = json.load(response)
+            after = time.monotonic_ns()
+            if receipt.get('released') is not True or type(receipt.get('release_host_ns')) is not int or receipt['release_host_ns'] <= 0:
+                raise RuntimeError(('invalid start-barrier receipt', receipt))
+            barrier = dict(before_guest_ns=before, after_guest_ns=after, receipt=receipt)
         for channel in channels:
             fd = os.open('/dev/dsp', os.O_WRONLY | os.O_NONBLOCK)
             devices.append(fd)
@@ -140,7 +154,7 @@ def main():
             os.close(fd)
     report = dict(schema=1, channels=channels, requested_seconds=args.seconds,
                   frames_each=args.seconds * 44100, rate=44100, stereo=True,
-                  geometry=geometry, first=args.first, start_ns=started, end_ns=finished,
+                  geometry=geometry, first=args.first, start_barrier=barrier, start_ns=started, end_ns=finished,
                   duration_guest_seconds=(finished-started)/1e9 if started is not None else None,
                   submitted_bytes=submitted, completed_bytes=played, eagain=eagain,
                   partial_writes=partial, writes=writes, observations=observations,

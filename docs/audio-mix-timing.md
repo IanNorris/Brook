@@ -1,11 +1,11 @@
-# Coordinated finite audio streams
+# Finite audio stream controls
 
 The [mixed Firefox/Quake test](mixed-desktop-timing.md) slows both stream
 completions near 0.62/0.54 nominal. A cheap native control removes application
 rendering/decoding and coordinates two pregenerated OSS sources. It sustains
-both near real time, narrowing the next investigation toward independent
-producer timing and application/graphics interaction. It does not identify a
-specific scheduler or mixer defect.
+both near real time. A subsequent control with independent writers loses
+progress without graphics, narrowing the investigation toward refill timing
+and mixing. These controls do not identify a specific scheduler or mixer defect.
 
 `scripts/workloads/audio_mix_timing.py` generates all source samples before
 opening devices. A packet changes frequency every 100 ms using the existing
@@ -68,9 +68,55 @@ Raw evidence and checked per-channel decoding remain under that review's
 and arguments are preserved per case in `guest-source.py` and original job
 receipts.
 
-The next discrimination is two independent writers with the same pregenerated
-sources, geometry and a finite start barrier. If that also sustains concurrency,
-return to the real-app producer waits and graphics interaction. If it fails,
-inspect refill scheduling/phase and actual unconsumed queue availability before
-changing mixer lookahead. The writer-immediate-flush hypothesis is ruled out
-by the current source: writes enqueue; the mixer performs periodic submission.
+## Independent writer control
+
+The optional `--gate-url` waits for a finite HTTP barrier after source generation
+and before device open. Its response must contain `released: true` and a positive
+integer `release_host_ns`; the report retains that receipt and surrounding guest
+timestamps. The socket timeout is 45 seconds. Without this option, the original
+single-process coordinator behavior remains unchanged. A controller can launch
+separate `--channels left` and `--channels right` original jobs, with unique
+barrier URLs, and release both once their sources are prepared. Barrier release
+does not guarantee simultaneous device configuration or start.
+
+The fresh `unattended-independent-audio-mlfq-a-20261021` VM uses the same frozen
+kernel, original modules, geometry, audio backend and policy as above, with no
+graphics applications or CPU workers. Both cases submit and complete exactly
+529,200 frames per source. Two six-second steady captures lie inside both
+sources; the full source reports separately certify their exact drains.
+
+| Job submission order | Left / right source drain | Per-stream nominal completion | Fitted source seconds / stored PCM second |
+| --- | ---: | ---: | ---: |
+| Left job first | 12.932 / 12.926 s | 0.9180 / 0.9176 | 0.9256 / 0.9272 |
+| Right job first | 14.637 / 14.533 s | 0.8221 / 0.8221 | 0.8207 / 0.8180 |
+
+Both-channel pitch fits remain near 1×. Stored PCM covers 99.997% and 99.976%
+of the respective host capture brackets; omitted inactive-output time does not
+explain this slowdown. Aligned approximately one-ms RMS bins (threshold 10 in
+signed-16 sample units) show left-only/right-only quiet fractions of 5.55%/5.00%
+and 13.56%/14.53%, with no bins where both channels are quiet. HDA delivery
+diagnostics record zero silence reservations and zero unsafe, invalid,
+contended or saturated records in both windows.
+
+Complementary quiet intervals support missing mix contributions, but do not
+prove that both software queues held samples when the mixer prepared a batch.
+Cached stream totals include frames already in flight: the snapshots contain
+0–448 software frames and 3,648–4,096 in-flight frames per stream. Accepted-write
+gaps have a roughly 12-ms p95, with maxima of 28.72 ms in the first case and
+83.65/33.02 ms in the second. Actual source starts differ by 2.2 microseconds
+and 498 ms respectively. These phase differences, and the lack of repeats,
+prevent attributing the variation to job submission order.
+
+Eight original source/report jobs finish with complete identity/group/output/EOF
+receipts, the original VM owner exits zero, and all four filesystem checks pass.
+Runtime, policy, heap and IRQ gates pass with zero clamps in this cohort;
+previous failed browser/game runtime gates remain failed. Checked results,
+channel decoding and joint quiet-bin classification are retained under the
+review's `independent-audio-control/` directory.
+
+The next experiment is a bounded, default-off opportunity to coalesce a refill
+from a recently contributing empty stream, with explicit device headroom and
+forced-resume limits. It needs actual mixer-body tests before native trials.
+It must not wait indefinitely for every stream or alter driver publication
+safety. The writer-immediate-flush hypothesis is ruled out by the current
+source: writes enqueue; the mixer performs periodic submission.
