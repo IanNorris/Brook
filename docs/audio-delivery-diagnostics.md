@@ -1784,3 +1784,48 @@ correction episode with one owner transition and catchup. Cleanup history starts
 after that episode and does not capture it; its clean replay does not clear the
 failure. The earlier complete positive native history remains the mechanism
 regression. No scheduler, lead, batching or wake-scan default changes follow.
+
+### Ready-lock overlap follow-up
+
+A fresh same-kernel private run,
+`unattended-reservation-lock-mlfq-a-20261021`, adds the existing ready-lock
+trace in those same three selected phases. Off/status preserves each window
+after capture. The extra reservation/acquisition/release clock reads make this
+another diagnostic cohort, not a performance comparison. No production code or
+default changes are needed.
+
+Thirteen slow worker cycles uniquely match ready records and BSP scans: four
+before Quake, one in mixed on-C, and eight after Quake. Their deadlines precede
+handler arrival by 20.401–165.168 ms. Queue waits are 3.964–29.884 μs and
+dispatch-to-worker intervals are 2.221–10.201 μs. One additional mixed slow
+worker cycle has no unique ready match and stays unassigned.
+
+None of those thirteen deadline→arrival intervals overlaps a retained valid
+CPU-0 ready-lock reservation→post-release record. Largest observed CPU-0
+wait/hold durations are 200.643/64.333 μs before Quake, 47.591/33.756 μs
+in mixed on-C, and 1,138.754/42.069 μs after Quake. All trace rows are
+consistent and released, with no lifetime losses/clock errors, no active
+publishers or stale-window rows. The maxima are evidence about observed lock
+episodes, not a full journal or a measurement of every IRQ-masked region.
+Their absence from the joined gaps does not exclude other locks, unobserved
+publication edges, host scheduling or delivery delays.
+
+Arrival RIPs again include block/release/idle epilogues and user instructions.
+GPU-module arrival addresses resolve against the frozen module and actual
+boot base to the instruction after `NotifyControlQueue`'s MMIO store, the
+completion-wait pause helper entry and the instruction immediately after its
+`pause`. These identify arrival contexts, not preceding execution
+cost. The [earlier bounded host traces](bsp-timer-wakeup-timing.md#host-kvmdevice-trace-checkpoint)
+already demonstrate some CPU-0 userspace device-handling/futex waits with small
+reported steal deltas; repeating a guest ready-lock experiment is not enough
+to attribute these new gaps to the host or the GPU.
+
+`mixed-prefix-control/lock-wake-join.json` clips and unions valid same-CPU lock
+wait/hold/release observations against each matched deadline→arrival interval,
+retains uncovered time and original records, and checks trace-window identity
+and the exact kernel hash before decoding caller strings. The executed launcher,
+controller and join script are retained with the review. All nine original jobs,
+controller and original VM owner exit zero, with complete EOF/groups, full
+media hash/transfer reconciliation, error-free browser loop, four clean
+filesystems, heap/policy and current runtime/debt checks. This clean run does
+not waive the preceding two-clamp failure or establish playback acceptance.
