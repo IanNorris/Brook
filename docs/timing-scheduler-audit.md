@@ -20,6 +20,13 @@ Later evidence supersedes several early leads:
   complete lifecycle/media/filesystem checks, but the fixed arm fails runtime
   acceptance with one 13.463-μs clamp. The [reduced-probe results](shared-irq-routing.md#reduced-probe-control)
   retain the non-improving phases and instrumentation limits.
+  A separate [zero-status NIC IRQ filter](shared-irq-routing.md#separate-network-wake-filter)
+  removes network-worker wakes caused solely by other devices sharing the line.
+  Actual-body tests reproduce 257 failures before the guard and pass afterward;
+  all 75 hosted suites and one fresh native mixed cohort's lifecycle, media,
+  filesystem, HDA and runtime checks pass. That cohort does not materially
+  change default mixed audio completion (~0.61/0.53); general performance and
+  historical runtime failures remain open.
 
 - [Targeted wake joins](audio-delivery-diagnostics.md#separating-deadline-ready-dispatch-and-worker-resumption)
   match seventeen slow audio-worker cycles to ready records and BSP timer scans.

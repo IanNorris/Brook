@@ -11,6 +11,8 @@ std::atomic<unsigned> notifications{0},badFrames{0};
 std::atomic<bool> pauseFirst{false},entered{false},releaseFirst{false};
 enum Mode { Normal, NoCompletion, BadId, BadAdvance };
 Mode mode=Normal;
+unsigned irqReads=0,irqWakes=0;
+volatile uint8_t irqStatus=0;
 thread_local unsigned expectedId=1;
 uint8_t dma[RX_BUF_SIZE];
 uint16_t avail=0;volatile uint16_t used=0;
@@ -32,7 +34,19 @@ void send(unsigned id) {
     if(VirtioNetTransmit(nullptr,payload,sizeof(payload))!=0)++badFrames;
 }
 }
+uint8_t VirtioNetTestReadIsr(volatile uint8_t* address) {
+    CHECK(address==&irqStatus);
+    ++irqReads;
+    const uint8_t status=*address;
+    *address=0; // PCI ISR is read-clear, unlike ordinary RAM.
+    return status;
+}
 namespace brook {
+void NetWakePollThread() {
+    CHECK(irqReads==1); // Acknowledge once, before waking the worker.
+    CHECK(irqStatus==0);
+    ++irqWakes;
+}
 extern "C" void SerialPuts(const char*) {}
 extern "C" void SerialPrintf(const char*,...) {}
 }
@@ -52,6 +66,20 @@ void VirtioNetTestNotify(uint16_t queue) {
     *g_txq.usedIdx=static_cast<uint16_t>(g_txq.usedIdxShadow+(mode==BadAdvance?2:1));
 }
 int main() {
+    // Invoke the production IRQ body with a read-clear device backend. A
+    // shared disk-only interrupt must not admit the network poll worker;
+    // preserve queue, configuration and unexpected nonzero notifications.
+    g_isrCfg=&irqStatus;
+    for(unsigned status=0;status<256;++status) {
+        irqStatus=static_cast<uint8_t>(status);irqReads=irqWakes=0;
+        VirtioNetIrqBody();
+        CHECK(irqReads==1 && irqStatus==0);
+        CHECK(irqWakes==(status?1u:0u));
+        irqReads=irqWakes=0;
+        VirtioNetIrqBody();
+        CHECK(irqReads==1 && irqWakes==0 && irqStatus==0);
+    }
+    g_isrCfg=nullptr;
     initialize();pauseFirst=true;
     std::thread first([]{send(0x31);});
     auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);

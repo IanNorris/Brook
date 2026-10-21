@@ -97,6 +97,65 @@ duplicate-dispatch corrections and does not isolate their individual effects.
 Prior audio/accounting failures stay open. Scheduler/audio defaults remain
 unchanged.
 
+## Separate network wake filter
+
+The routing repair deliberately retains the network driver's existing wake
+behavior. A subsequent source audit finds that `VirtioNetIrqBody` acknowledges
+the NIC's read-clear ISR byte but ignores its value, waking `net_poll` on every
+shared-line dispatch. A disk interrupt with zero NIC status therefore causes
+unnecessary scheduler admissions. This is separate from duplicate registration.
+
+The bounded correction reads the byte exactly once and returns on zero.
+All nonzero values retain the existing worker wake, including queue bit 0,
+configuration-change bit 1, their combination and unexpected reserved bits.
+See the [Virtio PCI ISR status capability](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html#x1-740004.1.4.5).
+No packet processing moves into IRQ context, no MMIO access is added, and EOI
+remains the shared dispatcher's responsibility. This does not implement link or
+configuration-change handling, device teardown or callback quiescence.
+
+The handler is the only located reader of this ISR register. Ordinary polling
+does not consume its read-clear notification. Existing pending-wake admission
+covers a wake between draining and blocking; the periodic five-ms poll remains
+a fallback, not a hard latency bound. Mapping precedes registration, and a
+missing early poll thread remains tolerated by the existing wake function.
+
+The extended `test_virtio_net_tx` invokes the actual IRQ body with a read-clear
+device backend and worker stub. It checks all 256 status values, one read per
+dispatch, acknowledgement before wake and a second zero-status dispatch without
+an extra wake. The old handler fails 257 assertions; the corrected handler and
+all 75 hosted suites pass. The native network module builds and its imports
+resolve against the unchanged ABI-34 kernel. Astra reviewed the narrow design.
+
+The native workload cohort completes in
+`build/reviews/unattended-net-irq-filter-fixed-mlfq-b-20261021/`.
+The capsule keeps kernel `163bb95f...99844` and twelve modules byte-identical;
+only `virtio_net.mod` changes (`ed22e246...547c` → `bc8ee35c...61d0`).
+Its `net-module-comparison.json` retains complete hashes. The same reduced-probe
+controller tests bidirectional local media traffic, disk activity and mixed
+apps. All nine original jobs, full resource bytes/hash and HTTP transfers,
+error-free browser loop, heap, policy/ledger, HDA, runtime/debt and four
+filesystem checks pass. Original controller and VM owner exit zero. Heavy
+probe flags remain off around all eight captures. The 512-row cleanup history
+replays with no debt episode; this negative observation does not clear the
+previous cohort's clamp or earlier positive accounting failures.
+
+Compared with the preceding corrected-IRQ cohort, ordinary mixed source
+completion is essentially unchanged: 0.621/0.539 → 0.613/0.534 with batching
+off, and 0.610/0.535 → 0.615/0.534 after reopening Quake. Prefix-on-C changes
+0.846/0.685 → 0.884/0.717, while prefix-on-A changes 0.872/0.709 → 0.864/0.700.
+Browser callbacks improve in some phases and worsen in others. This is a
+single fresh-image follow-up, not a replicated population comparison or a
+general playback-performance win. Native worker admissions are not counted in
+this reduced-probe run: the zero-status wake elimination is established by
+the actual-body tests, not inferred from unrelated FPS changes.
+
+`mixed-prefix-control/net-irq-comparison.json` retains all eight phase metrics,
+common controller hash, twelve matching modules, explicit changed-module
+hashes and both quality reports. Full policy acceptance stays false and all
+defaults remain unchanged. An earlier sandboxed staging attempt ends
+before starting a VM because the pinned Nix dependency cannot resolve GitHub;
+that incomplete review is retained separately as replica A.
+
 `mixed-prefix-control/shared-irq-comparison.json` retains all eight phase rows,
 including non-improving default-path captures; `verification.json` and the raw
 records preserve the current checks. Repeated uninstrumented acceptance and

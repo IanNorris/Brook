@@ -491,7 +491,17 @@ static void ProcessRxPackets()
 
 static void VirtioNetIrqBody()
 {
-    (void)mmio_read8(g_isrCfg, 0); // acknowledge ISR
+#ifdef BROOK_HOST_TEST
+    extern uint8_t VirtioNetTestReadIsr(volatile uint8_t* address);
+    const uint8_t status = VirtioNetTestReadIsr(g_isrCfg);
+#else
+    const uint8_t status = mmio_read8(g_isrCfg, 0); // acknowledge once (read-clear)
+#endif
+    // INTx is shared with other devices. An interrupt from a disk must not
+    // wake net_poll when this NIC has no pending cause. Preserve all nonzero
+    // causes, including configuration changes (bit 1), as well as queues
+    // (bit 0); this does not add configuration-change handling to the worker.
+    if (!status) return;
 
     // Do NOT process packets inline in IRQ context. NetReceive → HandleTcp /
     // ARP take plain (non-IRQ) SpinLocks; processing them here would allow a
