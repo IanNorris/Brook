@@ -1,13 +1,19 @@
 # Clocked native playback slave for Brook. Select through an outer ALSA plug;
 # keep the existing default until guest pointer/delay/drain acceptance passes.
-{ pkgs ? import ../../nix/nixpkgs.nix {}, lowWaterReadiness ? false, callbackTrace ? false }:
+{ pkgs ? import ../../nix/nixpkgs.nix {}, lowWaterReadiness ? false, callbackTrace ? false,
+  minimumBufferFrames ? 64 }:
+assert builtins.isInt minimumBufferFrames && minimumBufferFrames >= 64 && minimumBufferFrames <= 16384;
 pkgs.alsa-plugins.overrideAttrs (old: {
   pname = "alsa-plugins-oss-brook";
   buildInputs = [ pkgs.alsa-lib ];
   patches = (old.patches or []) ++ [ ./clocked-oss.patch ]
     ++ pkgs.lib.optional lowWaterReadiness ./low-water.patch
     ++ pkgs.lib.optional callbackTrace ./trace-callbacks.patch;
-  postPatch = (old.postPatch or "") + pkgs.lib.optionalString callbackTrace ''
+  postPatch = (old.postPatch or "") + ''
+    substituteInPlace oss/pcm_oss.c --replace-fail \
+      'SND_PCM_IOPLUG_HW_BUFFER_BYTES, 256, 65536' \
+      'SND_PCM_IOPLUG_HW_BUFFER_BYTES, ${toString (minimumBufferFrames * 4)}, 65536'
+  '' + pkgs.lib.optionalString callbackTrace ''
     cp ${./trace_callbacks.h} oss/trace_callbacks.h
   '';
   configureFlags = (old.configureFlags or []) ++ [
@@ -26,7 +32,7 @@ pkgs.alsa-plugins.overrideAttrs (old: {
     ./test-oss-rate-negotiation "$PWD/test-oss-rate.so"
     $CC -DPIC -fPIC -shared -I. -Ioss ${./test_playback_plugin.c} $(pkg-config --cflags --libs alsa) -o test-oss-playback.so
     $CC ${./test_playback.c} $(pkg-config --cflags --libs alsa) -ldl -o test-oss-playback
-    ./test-oss-playback "$PWD/test-oss-playback.so"
+    ./test-oss-playback "$PWD/test-oss-playback.so" ${toString minimumBufferFrames}
     ${pkgs.lib.optionalString lowWaterReadiness ''
     $CC -DPIC -fPIC -shared -I. -Ioss ${./test_readiness_plugin.c} $(pkg-config --cflags --libs alsa) -o test-oss-readiness.so
     $CC ${./test_readiness.c} $(pkg-config --cflags --libs alsa) -ldl -o test-oss-readiness

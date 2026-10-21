@@ -54,6 +54,31 @@ Hardware capacity never substitutes for the logical ring size. The kernel's
 16,384-frame capacity limit is preserved. The old plugin failed 20/30 host
 negotiations; the corrected plugin passes all 30.
 
+An optional logical-buffer experiment can be built separately:
+
+```sh
+nix-build --expr 'import ./tools/alsa-oss-pkg { minimumBufferFrames = 6174; }' --no-out-link
+```
+
+The parameter is a native 44.1-kHz stereo frame constraint (64 through 16384),
+not a physical-device capacity override. The default remains 64. The 6174-frame
+candidate requests at least 140 ms of actual logical storage. It passes all 30
+negotiation and 16 sustained-playback cases; native rate conversion can round
+its logical size up by a frame. The existing default fixture retains its exact
+4410–4412 logical and 4416/64 or 6016/128 physical assertions. Candidate tests
+separately require the negotiated logical minimum, ordinary rounded physical
+capacity, exact accepted-frame drain and no logical overfill.
+
+This is not a general guarantee for every parameter value. Isolated host probes
+found six negotiation failures at 6016 and 8192 frames, and two at 6000 and
+6144 frames, predominantly float clients requiring rate conversion. Those
+failures are retained under
+`build/workloads/timing-scheduler-20261021/logical-buffer-probe/`.
+A physical reserve alone does not enlarge ALSA's ring; a larger logical ring
+also increases possible audio backlog. Native mixed playback and source-credit
+latency must be evaluated before promotion. Readiness and scheduler accounting
+remain separate checks.
+
 An **opt-in, incomplete** readiness experiment is available with:
 
 ```sh

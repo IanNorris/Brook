@@ -27,6 +27,12 @@ int main(int argc, char **argv) {
             if (result >= 0) result = snd_pcm_set_params(pcm, formats[f],
                 SND_PCM_ACCESS_RW_INTERLEAVED, 2, rates[r], 1, latencies[l]);
             if (result < 0) ++failed;
+            if (result >= 0) {
+                snd_pcm_uframes_t buffer, period;
+                assert(snd_pcm_get_params(pcm, &buffer, &period) == 0);
+                printf("NEGOTIATED rate=%u format=%s latency_us=%u buffer=%lu period=%lu\n",
+                    rates[r], snd_pcm_format_name(formats[f]), latencies[l], buffer, period);
+            }
             printf("rate=%u format=%s latency_us=%u result=%d (%s)\n", rates[r],
                 snd_pcm_format_name(formats[f]), latencies[l], result, snd_strerror(result));
             if (pcm) assert(snd_pcm_close(pcm) == 0);

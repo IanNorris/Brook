@@ -74,6 +74,16 @@ Later evidence supersedes several early leads:
   checks, but retains eight clamps (13.473-μs maximum debt, later caught up)
   and variable underfeed. Both fixed cohorts avoid the permanent freeze; they
   do not establish general throughput or full timing acceptance.
+  An optional 140-ms logical ALSA minimum subsequently passes the thirty
+  negotiation and sixteen sustained-playback cases and one full native mixed
+  cohort. With the guarded horizon enabled, both real apps sustain roughly
+  0.997–1.001 nominal completion even under eight-worker load. The full clip
+  loops; all nine jobs, native faults/discontinuities, heap/policy, shutdown,
+  four filesystems and current runtime checks pass (zero clamps). Disabled
+  horizon phases still underfeed, graphics remain slow, and prior accounting
+  failures are unresolved. This single cohort changes both logical and physical
+  Firefox capacity; repeatability and wider coverage remain required. Neither
+  optional feature nor a scheduler policy is promoted.
   Software backlog and source-credit latency bounds remain
   explicit. Earlier runtime failures and the historical fast-playback cause
   remain open; no default is promoted.

@@ -8,7 +8,9 @@
 #include <alsa/asoundlib.h>
 
 int main(int argc, char **argv) {
-    assert(argc == 2);
+    assert(argc == 2 || argc == 3);
+    unsigned minimum = argc == 3 ? strtoul(argv[2], NULL, 10) : 64;
+    assert(minimum >= 64 && minimum <= 16384);
     void *library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!library) { fprintf(stderr, "%s\n", dlerror()); return 1; }
     void (*geometry)(unsigned) = dlsym(library, "playback_geometry");
@@ -82,9 +84,19 @@ int main(int argc, char **argv) {
         assert(running && stat(4) > 44100);
         assert(snd_pcm_nonblock(pcm, 0) == 0);
         assert(snd_pcm_drain(pcm) == 0);
-        assert(stat(0) == (enlarged ? 6016 : 4416));
-        assert(stat(1) == (enlarged ? 128 : 64));
-        assert(stat(8) >= 4410 && stat(8) <= 4412);
+        if (minimum == 64) {
+            /* Preserve the original regression controls exactly. */
+            assert(stat(0) == (enlarged ? 6016 : 4416));
+            assert(stat(1) == (enlarged ? 128 : 64));
+            assert(stat(8) >= 4410 && stat(8) <= 4412);
+        } else {
+            unsigned expected = minimum > 4410 ? minimum : 4410;
+            assert(stat(8) >= expected && stat(8) <= expected + 2);
+            unsigned long long physical = ((stat(8) + 63) / 64) * 64;
+            int enlarged_control = enlarged && physical == 4416;
+            assert(stat(1) == (enlarged_control ? 128 : 64));
+            assert(stat(0) == (enlarged_control ? 6016 : physical));
+        }
         assert(stat(2) == 0 && stat(3) == stat(4));
         printf("OSS_PLAYBACK geometry=%u rate=%u format=%s buffer=%lu period=%lu "
             "physical=%llu fragment=%llu logical=%llu submitted=%llu "

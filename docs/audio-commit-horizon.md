@@ -796,3 +796,74 @@ The permanent freeze is absent in both fixed-kernel cohorts, while the runtime
 and underfeed failures remain. The separate logical ALSA ring still has no
 extra refill reserve merely because physical OSS capacity increased. That
 negotiation/readiness problem and the broader clock/scheduler audit remain open.
+
+## Optional logical ALSA refill reserve — 21 October 2026
+
+The physical planner alone cannot give Firefox usable refill slack: libasound
+still enforces its separate roughly 4410-frame logical ring. An isolated
+production-plugin constraint experiment tests a larger logical minimum through
+real libasound `plug` negotiation. At 6016 and 8192 native frames, six of thirty
+rate/format/latency cases fail; 6000 and 6144 each fail two. A 6174-frame
+(140-ms) candidate passes all thirty. These failures are retained, not treated
+as acceptable negotiation changes. The parameter remains optional with its
+original 64-frame default.
+
+Both the default and candidate packages pass the production callback tests,
+thirty negotiations and sixteen sustained-playback cases. The original fixture
+keeps its exact logical 4410–4412 and physical 4416/64 or 6016/128 assertions.
+Candidate cases instead require their larger logical minimum, actual rounded
+physical geometry, zero logical overfills and exact accepted-frame drain.
+Client rate conversion can round the candidate's native logical size up by a
+frame. The synthetic fixture does not establish audible/source-tail continuity
+or poll-driven scheduling behavior.
+
+Private review `unattended-logical-buffer-140ms-fixed-mlfq-a-20261021` uses the
+same final pipe-fixed kernel `44b64074d04aa396495b7e00c52787133b692fe4fb68e0366c5afc7666018020`,
+eight vCPUs, 8 GiB, host CPU mask 0–15, 12-KiB HDA lead and physical PipeWire
+20-ms callback route. Only Firefox selects the candidate module
+`cw7bbkbaij7bhlvmvbf93cb9rq0i92ks-alsa-plugins-oss-brook-1.2.12` through a
+private configuration. Callback tracing and low-water experiments are absent.
+The module is transferred and hash checked within the original tracked upload
+job; the executed controller and source/configuration are retained. MLFQ is
+selected only for this matched test; the system scheduler default is unchanged.
+
+Observed Firefox physical geometry is 6208/64 frames, with Quake 8192/2048.
+Firefox's host-tested logical constraint is 6174 frames, subject to native
+rate-conversion rounding; the guest cached counters expose physical geometry,
+not the exact ALSA logical size. This changes both logical and physical capacity
+from the earlier 6016/128 control, so it is not an identical-physical-geometry
+comparison. A native-fragment refill reserve requires 4096 + 64 + 1764 = 5924
+usable frames. The larger ring also permits more software backlog; it is not
+a bound on end-to-end audio latency.
+
+Audio completion ratios (Firefox / Quake, measured against guest elapsed time):
+
+| Phase | Ratio |
+| --- | --- |
+| Firefox alone | 1.0001 / — |
+| Both, horizon on A | 0.9969 / 0.9986 |
+| Both, horizon off B | 0.5443 / 0.6722 |
+| Both, horizon on C | 0.9982 / 0.9982 |
+| Eight CPU workers, Quake focused | 0.9999 / 0.9999 |
+| Eight CPU workers, Firefox focused | 1.0009 / 1.0009 |
+| Firefox after Quake closes | 0.9996 / — |
+| Reopened Quake, horizon off | 0.5470 / 0.6718 |
+
+The full 120-second browser clip transfers and loops, all eight windows have
+positive progress, all nine original jobs terminate with complete output and
+empty groups, and native audio fault/discontinuity, heap/policy, original
+controller/VM exit and all four filesystem checks pass. Current runtime counters
+show zero clamps, invalid/backward samples, stale identities or debt. Earlier
+clamp episodes remain unresolved; this single clean cohort does not fix their
+cause.
+
+This is a promising bounded audio result, not full desktop acceptance. Quake
+swap rates remain about 7.8–8.8/s and Firefox video callbacks about 5.0–5.8/s
+with both open. Completion counters are not proof of source tempo or gap-free
+speaker output. Disabled-horizon mixed phases still fail nominal audio rate.
+Repeatability, broader/default-policy coverage, backlog and uninterrupted-output
+checks remain required before promoting either optional feature. Historical
+normal-pitch fast playback and the wider clock/scheduler audit remain open.
+
+Host evidence: `build/workloads/timing-scheduler-20261021/logical-buffer-probe/`.
+Native evidence and all verifier results are under the private review above.
