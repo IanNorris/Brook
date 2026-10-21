@@ -10,6 +10,12 @@ struct AudioDeliveryEvent {
     bool running=false, positionValid=false, publishSafe=false;
 };
 inline constexpr unsigned AudioDeliveryEventSlots=16;
+inline constexpr unsigned AudioDeliveryReservationSlots=16;
+struct AudioDeliveryReservation {
+    uint64_t controlEpoch=0, observation=0;
+    bool hasPrevious=false;
+    AudioDeliveryEvent previous{}, current{};
+};
 struct AudioDeliveryTimingSnapshot {
     uint64_t epoch=0, observations=0, acceptedBytes=0, reservations=0, reservedBytes=0;
     uint64_t invalidClock=0, invalidPosition=0, unsafe=0, runningSamples=0;
@@ -20,13 +26,18 @@ struct AudioDeliveryTimingSnapshot {
     uint32_t retained=0, next=0;
     AudioDeliveryEvent events[AudioDeliveryEventSlots]{};
     AudioDeliveryEvent maxAdvanceEvent{}, minHeadroomEvent{};
+    uint64_t reservationsOverwritten=0;
+    uint32_t reservationsRetained=0, reservationNext=0;
+    AudioDeliveryReservation reservationEvents[AudioDeliveryReservationSlots]{};
 };
 // Caller serializes this model. Tokens reject controls racing an in-flight copy.
 class AudioDeliveryTimingModel {
     AudioDeliveryTimingSnapshot s_{};
     bool exhausted_=false;
+    uint64_t previousToken_=0;
     void Add(uint64_t& v,uint64_t n){if(v>~uint64_t(0)-n){v=~uint64_t(0);s_.saturated=true;}else v+=n;}
     void Advance(bool on){
+        previousToken_=0;
         if(exhausted_ || s_.epoch>~uint64_t(0)-2){exhausted_=true;s_.epoch=0;return;}
         s_.epoch=((s_.epoch&~uint64_t(1))+2)|(on?1:0);
     }
@@ -38,7 +49,16 @@ public:
     bool Observe(uint64_t token,const AudioDeliveryEvent& e){
         if(!(token&1) || token!=s_.epoch)return false;
         Add(s_.observations,1);Add(s_.acceptedBytes,e.acceptedBytes);
-        if(e.reservedBytes){Add(s_.reservations,1);Add(s_.reservedBytes,e.reservedBytes);if(e.reservedBytes>s_.maxReservedBytes)s_.maxReservedBytes=e.reservedBytes;}
+        if(e.reservedBytes){
+            Add(s_.reservations,1);Add(s_.reservedBytes,e.reservedBytes);if(e.reservedBytes>s_.maxReservedBytes)s_.maxReservedBytes=e.reservedBytes;
+            auto& pair=s_.reservationEvents[s_.reservationNext];pair={};
+            pair.controlEpoch=token;pair.observation=s_.observations;pair.current=e;
+            pair.hasPrevious=previousToken_==token && s_.retained;
+            if(pair.hasPrevious)pair.previous=s_.events[(s_.next+AudioDeliveryEventSlots-1)%AudioDeliveryEventSlots];
+            s_.reservationNext=(s_.reservationNext+1)%AudioDeliveryReservationSlots;
+            if(s_.reservationsRetained<AudioDeliveryReservationSlots)++s_.reservationsRetained;
+            else Add(s_.reservationsOverwritten,1);
+        }
         if(!e.publishSafe)Add(s_.unsafe,1);
         if(!e.beforeCopyNs || e.afterCopyNs<e.beforeCopyNs || (e.running && e.afterPositionNs<e.afterCopyNs))Add(s_.invalidClock,1);
         else {
@@ -61,6 +81,7 @@ public:
         }
         s_.events[s_.next]=e;s_.next=(s_.next+1)%AudioDeliveryEventSlots;
         if(s_.retained<AudioDeliveryEventSlots)++s_.retained;
+        previousToken_=token;
         return true;
     }
 };

@@ -4277,7 +4277,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         else if(NetStrEq(cmd,"audio delivery reset"))AudioDeliveryTimingReset();
         const auto s=AudioDeliveryTimingRead();BridgeReply h;h.text("{");h.field("epoch",s.epoch);
         h.text(",\"enabled\":");h.text((s.epoch&1)?"true":"false");
-        h.text(",\"scope\":\"accepted HDA submissions only; physical bytes include unowned silence; diagnostic adds pre-copy KVM read, no extra MMIO; recent events not full timeline; contention since boot\",");h.send();
+        h.text(",\"scope\":\"accepted HDA submissions only; physical bytes include unowned silence; diagnostic adds pre-copy KVM read, no extra MMIO; recent events and reservation pairs not full timeline; previous means observed same-control submission, not wakeup; contention since boot\",");h.send();
         BridgeReply r;
         r.field("observations",s.observations);r.text(",");r.field("accepted_bytes",s.acceptedBytes);
         r.text(",");r.field("reservations",s.reservations);r.text(",");r.field("reserved_bytes",s.reservedBytes);
@@ -4304,6 +4304,19 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         }
         DebugChannelSend("],\"max_advance_event\":");emit(s.maxAdvanceEvent);
         DebugChannelSend(",\"min_headroom_event\":");emit(s.minHeadroomEvent);
+        BridgeReply retained;retained.text(",");retained.field("reservation_capacity",AudioDeliveryReservationSlots);
+        retained.text(",");retained.field("reservations_retained",s.reservationsRetained);
+        retained.text(",");retained.field("reservations_overwritten",s.reservationsOverwritten);
+        retained.text(",\"reservation_events\":[");retained.send();
+        for(unsigned i=0;i<s.reservationsRetained;++i){
+            const auto& pair=s.reservationEvents[(s.reservationNext+AudioDeliveryReservationSlots-s.reservationsRetained+i)%AudioDeliveryReservationSlots];
+            BridgeReply row;if(i)row.text(",");row.text("{");row.field("control_epoch",pair.controlEpoch);
+            row.text(",");row.field("observation",pair.observation);row.text(",\"has_previous\":");row.text(pair.hasPrevious?"true":"false");
+            row.text(",\"previous\":");row.send();
+            if(pair.hasPrevious)emit(pair.previous);else DebugChannelSend("null");
+            DebugChannelSend(",\"current\":");emit(pair.current);DebugChannelSend("}");
+        }
+        DebugChannelSend("]");
         DebugChannelSend("}\n");
     }
     else if (NetStrEq(cmd, "audio stats")) {

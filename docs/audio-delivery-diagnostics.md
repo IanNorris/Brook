@@ -1551,3 +1551,107 @@ must be improved before claiming bounded low latency at extreme fragmentation.
 Also, the pre-existing `VmmKillPid` API still depends on the bounded allocation
 registry; ordinary explicit frees no longer do. No native caller of that API
 was found in this audit, and registry-overflow PID cleanup is not accepted.
+
+
+## Reservation context retention
+
+The later real Firefox/Quake reversal tests expose a retention gap: rare
+reservations can disappear from the sixteen most recent submissions, leaving
+no preceding sample for timing/queue comparisons. A separate bounded ring now
+retains the latest sixteen reservation events together with their preceding
+observed accepted submission. It reuses existing `AudioDeliveryEvent` samples;
+there are no additional clock reads, MMIO polls, driver calls or changes to
+publication, ownership, pacing or watermarks. Driver event layout and ABI 34
+remain unchanged.
+
+`reservation_events` is chronological. Each row has its own `control_epoch`,
+`observation`, `has_previous`, `previous` (or null) and `current` event.
+`reservations_retained`, `reservation_capacity` and `reservations_overwritten`
+make truncation explicit. Without saturation, reservation count equals retained
+plus overwritten. On/off controls preserve cumulative observations as before,
+but fence adjacency: the first reservation after a control cannot acquire a
+previous event from the old control epoch. Reset clears both rings/counters.
+Hardware-epoch changes are retained visibly rather than silently paired as
+comparable data.
+
+Analysis must require matching control/hardware epochs, usable running-position
+and clock samples, no saturation and zero contention losses before describing
+these as adjacent accepted submissions. Otherwise they are only adjacent
+retained observations. Copy-clock spacing includes rejected attempts, producer
+or mixer work and descheduling; it is not mixer wakeup latency. The timestamp
+starts after reservation clearing, not at initial driver entry. Physical pending
+bytes include silence. A small earlier receipt does not alone establish why a
+later reservation occurred. Overwritten events prevent whole-interval
+reservation distributions, and a missing previous event remains unknown.
+
+Model tests retain a rare reservation after ordinary events overwrite their
+ring, check exact bounded overwrite counts/chronology, stale tokens, controls
+without reset, reset and visible hardware-epoch changes. The actual production
+HDA test checks the original startup receipt and following reservation together,
+while preserving rejection when DMA overtakes publication. A successful
+fail-fast hosted build followed by all 74 suites passes. Native two-pass linking,
+independent symbol-table comparison and thirteen original modules/109 exports
+pass; the frozen diagnostic kernel is
+`4506f7bbf02588dcdb772affc1b835829fd301c7423c7b9f1a4f00e402fdd2b0`.
+Astra reviewed the actual diff and the analysis limits. Native context collection
+is a separate diagnostic cohort, not a new performance-default acceptance.
+
+
+### First native reservation-context collection
+
+A fresh private eight-vCPU/eight-GiB MLFQ VM uses the frozen diagnostic kernel,
+the thirteen original ABI-34 modules and unchanged 12-KiB HDA lead, physical
+PipeWire callback output/requested 20-ms buffering and host mask 0–15. The
+browser/GL3-Quake workload follows the prior on/off/on control with observed
+source-credit drains, independent guest resource hash, 60-second media-write
+bound and a full Firefox loop. This is a new diagnostic kernel/cohort, not a
+performance comparison against the preceding kernel.
+
+| Phase | Reservations / bytes | Qualified preceding pairs | Copy-bracket gap range |
+| --- | --- | --- | --- |
+| Firefox alone before | 11 / 21,440 | 11 | 13.41–73.87 ms |
+| Both, prefix on A | 1 / 536 | 1 | 29.04 ms |
+| Both, prefix off B | 0 / 0 | 0 | — |
+| Both, prefix on C | 2 / 7,448 | 2 | 10.07–72.51 ms |
+| On, CPU load, Quake focused | 3 / 9,800 | 3 | 24.59–65.41 ms |
+| On, CPU load, Firefox focused | 1 / 256 | 1 | 26.36 ms |
+| Firefox alone after | 2 / 816 | 2 | 20.97–24.35 ms |
+| Both after Quake reopen, off | 0 / 0 | 0 | — |
+
+All twenty reservations/40,296 bytes retain their previous event, with matching
+control/hardware epochs, running valid-position samples and no saturation,
+contention losses or overwritten reservations. The gap is from the preceding
+post-copy position clock to the reservation's pre-copy clock; its latter
+endpoint is after reservation clearing. It is not an exact device-sampling or
+scheduler-wakeup interval.
+
+Using the preceding event's physical lead plus accepted bytes minus observed
+advance gives its queued bytes at the post-copy position. Eighteen of twenty
+leave at least a nominal ten milliseconds above the 12-KiB lead at 176,400 B/s.
+Two leave only 2.90/4.35 ms after 512/768-byte receipts; their next observed gaps
+are 73.87/10.07 ms and reservations are 12,288/1,280 bytes. These nominal
+comparisons are not burst-rate bounds or guarantees until the next submission:
+service work, the subsequent sleep and wake delay all contribute. Neither low-
+slack predecessor is identified as an experimental shortened receipt by this
+record alone. They show both limited earlier headroom
+and long intersubmission opportunities; they do not prove either cause alone.
+There is no basis here to reduce the lead or add another producer grace period.
+
+The production call-site audit finds `AudioMixerThreadFn` as the sole caller
+of `AudioMixerTick`, which calls `AudioMixerFlush`; ordinary submission only
+enqueues source samples. Even so, gaps between *accepted* submissions can
+contain cycles with no ready data or a rejected attempt. The next discriminator
+is a separate per-phase collection of the existing `audio timing` sleep/service
+records, joined to reservation clocks. Its sixteen worst slow episodes are not
+a full timeline: missing overlaps cannot exclude normal empty/rejected cycles.
+
+All nine original guest jobs, controller and VM owner exit zero with complete
+identity/output/EOF and empty groups. Four filesystem checks, heap, current
+runtime/debt, policy ledger/ready-count and delivery validity gates pass.
+Firefox completes an error-free full media loop; independent guest and both
+terminal HTTP transfers match full source size/hash. Those clean current gates
+do not clear earlier runtime failures, playback gaps or historical acceleration.
+Raw/checked evidence is under
+`build/reviews/unattended-reservation-context-mlfq-a-20261021/mixed-prefix-control/`,
+including `reservation-context-analysis.json`, original snapshots and receipts.
+The diagnostic and all mixer/scheduler defaults remain unchanged.

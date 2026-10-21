@@ -754,6 +754,13 @@ int RunMixerClockTests() {
     VERIFY(timing.observations==2 && timing.reservations==1 && timing.reservedBytes==NATIVE_WRITE_LEAD-4);
     VERIFY(timing.maxCopyNs==49000 && timing.maxAdvanceBytes==4 && timing.minHeadroomBytes==NATIVE_WRITE_LEAD-4);
     VERIFY(!timing.invalidClock && !timing.invalidPosition && !timing.unsafe);
+    VERIFY(timing.reservationsRetained==1 && !timing.reservationsOverwritten);
+    const auto& reservePair=timing.reservationEvents[0];
+    VERIFY(reservePair.hasPrevious && reservePair.observation==2 && reservePair.controlEpoch==timing.epoch);
+    VERIFY(reservePair.previous.acceptedBytes==8 && reservePair.current.acceptedBytes==8);
+    VERIFY(reservePair.previous.hardwareEpoch==reservePair.current.hardwareEpoch);
+    VERIFY(!reservePair.previous.running && reservePair.current.running);
+    VERIFY(reservePair.current.reservedBytes==NATIVE_WRITE_LEAD-4);
     afterCopyHook=[] {move(20000,49000);};
     VERIFY(AudioMixerSubmit(first.data(),2,a)==2);AudioMixerFlush();
     timing=AudioDeliveryTimingRead();
