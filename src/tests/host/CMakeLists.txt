@@ -47,6 +47,7 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_shared_irq_registry)
 add_host_test(test_gpu_completion_wait)
 target_compile_options(test_gpu_completion_wait PRIVATE -UNDEBUG)
 add_host_test(test_eevdf)

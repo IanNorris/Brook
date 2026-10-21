@@ -2050,39 +2050,15 @@ IRQ_SPURIOUS(47)
 // Shared IRQ handler chain — supports multiple drivers on the same IOAPIC IRQ
 // ---------------------------------------------------------------------------
 
-// Handlers registered here must be plain functions (NOT __attribute__((interrupt))).
-// They must NOT call ApicSendEoi() — the dispatch stub handles that.
-using IrqHandlerFn = void (*)();
-
-static constexpr int MAX_IRQ_CHAIN = 4;
-static constexpr int MAX_SHARED_IRQS = 24;
-
-struct SharedIrqEntry {
-    uint8_t      vector;
-    uint8_t      irq;
-    uint8_t      count;
-    IrqHandlerFn handlers[MAX_IRQ_CHAIN];
-};
-
-static SharedIrqEntry g_sharedIrqs[MAX_SHARED_IRQS];
-static int g_sharedIrqCount = 0;
-
-static SharedIrqEntry* FindSharedIrq(uint8_t irq)
-{
-    for (int i = 0; i < g_sharedIrqCount; i++)
-        if (g_sharedIrqs[i].irq == irq) return &g_sharedIrqs[i];
-    return nullptr;
-}
+#include "shared_irq_registry.h"
+static void SharedIrqDispatch(unsigned slot);
 
 // Per-IRQ dispatch stubs with proper SWAPGS handling.
 // Each inner function iterates handlers[0..count) for one SharedIrqEntry,
 // then sends EOI.  The naked wrapper handles SWAPGS + GPR save/restore.
 #define SHARED_IRQ_INNER(N) \
     extern "C" void SharedIrqInner##N(void) { \
-        SharedIrqEntry& e = g_sharedIrqs[N]; \
-        for (int j = 0; j < e.count; j++) \
-            e.handlers[j](); \
-        ApicSendEoi(); \
+        SharedIrqDispatch(N); \
     }
 
 #define SHARED_IRQ_STUB(N) \
@@ -2099,80 +2075,12 @@ static StubFn g_sharedIrqStubs[] = {
     SharedIrqStub0, SharedIrqStub1, SharedIrqStub2, SharedIrqStub3
 };
 
-// Register a plain (non-interrupt) handler for an IOAPIC IRQ.
-// The handler must NOT be __attribute__((interrupt)) and must NOT call ApicSendEoi().
-// IoApicRegisterHandler installs a proper interrupt stub that dispatches to all
-// chained handlers and sends EOI once.
-uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handler)
-{
-    SharedIrqEntry* existing = FindSharedIrq(irq);
-    if (existing)
-    {
-        // IRQ already mapped — add to chain
-        if (existing->count < MAX_IRQ_CHAIN)
-        {
-            existing->handlers[existing->count++] =
-                reinterpret_cast<IrqHandlerFn>(handler);
-            SerialPrintf("IRQ: chained handler on IRQ %u (vector %u, %u handlers)\n",
-                         irq, existing->vector, existing->count);
-            // Stub already installed on first registration — no IDT change needed
-        }
-        else
-        {
-            SerialPrintf("IRQ: WARNING — chain full for IRQ %u\n", irq);
-        }
-        return existing->vector;
-    }
-
-    // New IRQ — allocate a slot, install per-slot stub, unmask
-    int slot = g_sharedIrqCount;
-    if (slot < static_cast<int>(sizeof(g_sharedIrqStubs) / sizeof(g_sharedIrqStubs[0])))
-    {
-        SharedIrqEntry& e = g_sharedIrqs[g_sharedIrqCount++];
-        e.irq = irq;
-        e.vector = preferredVector;
-        e.count = 1;
-        e.handlers[0] = reinterpret_cast<IrqHandlerFn>(handler);
-
-        // Always use the per-slot stub (even for single handler) so we
-        // can add more handlers later without swapping the IDT entry.
-        IdtInstallHandler(preferredVector,
-                          reinterpret_cast<void*>(g_sharedIrqStubs[slot]));
-        IoApicUnmaskIrq(irq, preferredVector);
-        return preferredVector;
-    }
-
-    SerialPrintf("IRQ: WARNING — shared IRQ table full\n");
-    return preferredVector;
-}
-
-void IoApicUnregisterHandler(uint8_t irq, void* handler)
-{
-    SharedIrqEntry* entry = FindSharedIrq(irq);
-    if (!entry) return;
-
-    auto fn = reinterpret_cast<IrqHandlerFn>(handler);
-    for (int i = 0; i < entry->count; ++i)
-    {
-        if (entry->handlers[i] == fn)
-        {
-            // Shift remaining handlers down
-            for (int j = i; j < entry->count - 1; ++j)
-                entry->handlers[j] = entry->handlers[j + 1];
-            entry->handlers[--entry->count] = nullptr;
-
-            SerialPrintf("IRQ: unregistered handler from IRQ %u (vector %u, %u remaining)\n",
-                         irq, entry->vector, entry->count);
-
-            if (entry->count == 0)
-                IoApicMaskIrq(irq);
-            return;
-        }
-    }
-}
+#include "shared_irq_registration.inc"
 
 void IdtInstallHandler(uint8_t vector, void* handler)
 {
+    if (!SharedIrqMayInstall(vector, handler))
+        KernelPanic("direct IDT install conflicts with shared IRQ vector %u", vector);
     // Preserve the IST setting from the existing entry
     uint8_t ist = g_idt[vector].ist;
     SetIdtEntry(vector, handler, ist);

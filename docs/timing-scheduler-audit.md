@@ -5,6 +5,16 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Shared IRQ registration](shared-irq-routing.md) has confirmed vector-collision,
+  duplicate-dispatch and empty-line reactivation defects. Actual-body host tests
+  go from four failures to passing, all 75 hosted suites pass, and the corrected
+  native boot assigns IRQ 10/11 distinct vectors with no duplicate disk callback.
+  A matched diagnostic cohort completes with clean original jobs, filesystem,
+  HDA and current runtime checks. Selected BSP gap maxima fall from 77.7/50.5 ms
+  to 14.2/14.2 ms and retained slow worker episodes disappear, while default-path
+  mixed audio remains underfed. This is a routing repair, not full playback
+  acceptance or a scheduler/audio default change.
+
 - [Targeted wake joins](audio-delivery-diagnostics.md#separating-deadline-ready-dispatch-and-worker-resumption)
   match seventeen slow audio-worker cycles to ready records and BSP timer scans.
   Deadlines are 21.62–91.09 ms overdue at handler arrival, followed by only

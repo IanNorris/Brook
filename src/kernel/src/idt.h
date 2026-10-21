@@ -39,7 +39,8 @@ static_assert(__builtin_offsetof(FullExceptionFrame,rsp)==152);
 // Set up 32 exception handlers and 16 IRQ stubs, then load the IDT via lidt.
 void IdtInit(brook::Framebuffer* fb);
 
-// Install a handler for any vector 0-255.  Safe to call after IdtInit().
+// Install a handler after IdtInit(). Vectors 48-63 except 49 belong to the
+// shared IOAPIC dispatcher; direct installs may not consume/replace that pool.
 // handler must be a function with C linkage and standard interrupt ABI
 // (__attribute__((interrupt)) or raw ISR that saves all registers).
 extern "C" void IdtInstallHandler(uint8_t vector, void* handler);
@@ -47,9 +48,12 @@ extern "C" void IdtInstallHandler(uint8_t vector, void* handler);
 // Register a plain handler for an IOAPIC IRQ with shared-IRQ chaining.
 // handler must be a plain void(*)(void) function — NOT __attribute__((interrupt)),
 // and must NOT call ApicSendEoi(). The dispatch stub handles both.
-// Returns the actual vector assigned (may differ from preferredVector if
-// the IRQ is already mapped).
+// Returns the actual vector assigned (preferences outside the reserved pool or
+// already owned by another line select a free vector). Repeated (IRQ,handler)
+// registrations count ownership but dispatch once; pair each with unregister.
+// Invalid/exhausted kernel configurations panic, never return a fake vector.
 extern "C" uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handler);
 
-// Remove a handler from an IRQ chain. If the chain becomes empty, masks the IRQ.
+// Drop one registration. The last reference removes the handler; an empty
+// chain masks its line. Callback/unload quiescence requires external ownership.
 extern "C" void IoApicUnregisterHandler(uint8_t irq, void* handler);
