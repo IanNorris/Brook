@@ -1,4 +1,5 @@
 #include "signal_defaults.h"
+#include "signal_restart.h"
 #include "syscall_timing.h"
 #include "file_locks.h"
 #include "unix_lifetime_trace.h"
@@ -1965,11 +1966,9 @@ int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
 
     // Synchronous sigtimedwait also consumes masked signals. Keep its wake;
     // ordinary waits recheck their deliverable mask after a spurious wake.
-    if (proc->state == ProcessState::Blocked)
-    {
-        proc->pendingWakeup = 1;
-        SchedulerUnblock(proc);
-    }
+    // Serialize with block admission even while Running/Ready: the signal
+    // may arrive between a caller's last pending check and its block call.
+    SchedulerUnblock(proc);
 
     return 0;
 }
@@ -2182,35 +2181,12 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // this for SIGWINCH while blocked in terminal read(); otherwise resize
     // converts the read into EINTR and the interactive shell can exit.
     //
-    // SA_RESTART applies to most "slow" syscalls: read, write, open, ioctl,
-    // wait4, nanosleep, poll, futex, etc.
-    // The exceptions (never restarted) are: connect, accept, recvfrom,
-    // sendto, epoll_wait, epoll_pwait, pselect6 and ppoll — we don't restart those.
-    //
-    // We read the syscall number from the per-process snapshot rather than
-    // gs:120 (per-CPU) because other processes may have overwritten gs:120
-    // while this process was blocked in SchedulerBlock().
-    uint64_t syscallNum = proc->currentSyscallNum;
-    bool restartable = false;
-    switch (syscallNum)
-    {
-    case 0:   // read
-    case 1:   // write
-    case 2:   // open
-    case 3:   // close
-    case 7:   // poll
-    case 16:  // ioctl
-    case 17:  // pread64
-    case 18:  // pwrite64
-    case 19:  // readv
-    case 20:  // writev
-    case 35:  // nanosleep
-    case 61:  // wait4
-    case 202: // futex
-    case 230: // clock_nanosleep
-        restartable = true;
-        break;
-    }
+    // Polling and sleeping waits return EINTR even with SA_RESTART. Timed
+    // futex waits do too; only untimed WAIT/WAIT_BITSET are replayable here.
+    // Use the process's syscall snapshot and its saved argument frame: another
+    // process may have overwritten per-CPU syscall scratch while we slept.
+    const uint64_t syscallNum = proc->currentSyscallNum;
+    const bool restartable = brook::SignalSyscallMayRestart(syscallNum, mc.rsi, mc.r10);
     if (syscallResult == -4 /* -EINTR */ && (sa.flags & SA_RESTART) &&
         restartable && mc.rip >= 2)
     {

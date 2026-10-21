@@ -5432,7 +5432,7 @@ static int64_t sys_nanosleep(uint64_t reqAddr, uint64_t remAddr, uint64_t,
         uint64_t remaining = deadline - now;
         uint64_t ticks = remaining / 1000000ULL + (remaining % 1000000ULL != 0);
         proc->wakeupTick = ApicTickCount() + ticks;
-        SchedulerBlock(proc);
+        SchedulerBlockInterruptible(proc);
         now = ClockNowNs(1);
     }
 
@@ -5468,7 +5468,7 @@ static int64_t sys_clock_nanosleep(uint64_t clockid, uint64_t flags, uint64_t re
             const uint64_t remaining = deadline - now;
             const uint64_t ticks = remaining / 1000000ULL + (remaining % 1000000ULL != 0);
             proc->wakeupTick = ApicTickCount() + ticks;
-            SchedulerBlock(proc);
+            SchedulerBlockInterruptible(proc);
             // LAPIC ticks and unrelated wakeups are scheduling hints, not
             // evidence that the selected clock's absolute deadline expired.
             now = ClockNowNs(clockid);
@@ -5566,7 +5566,7 @@ static int64_t sys_pause(uint64_t, uint64_t, uint64_t,
     while (!HasPendingSignals())
     {
         proc->wakeupTick = ApicTickCount() + 100; // recheck every 100ms
-        SchedulerBlock(proc);
+        SchedulerBlockInterruptible(proc);
     }
 
     return -EINTR; // pause always returns EINTR
@@ -5590,7 +5590,7 @@ static int64_t sys_rt_sigsuspend(uint64_t maskAddr, uint64_t sigsetsize, uint64_
     while (!HasPendingSignals())
     {
         proc->wakeupTick = ApicTickCount() + 100;
-        SchedulerBlock(proc);
+        SchedulerBlockInterruptible(proc);
     }
 
     // Select and deliver the signal under the temporary mask. The shared

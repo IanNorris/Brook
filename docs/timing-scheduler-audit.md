@@ -5,6 +5,15 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Signal interruption of timed waits](signal-wait-restart.md) fixes confirmed
+  SA_RESTART replay of poll/sleeps/timed futex waits and the ordinary-signal
+  block-admission race. The unchanged thirteen-case executable passes on host
+  Linux, fails eight pre-fix Brook cases, and passes thirteen with the final
+  reviewed kernel. All 72 hosted suites pass. Original VM/group/EOF and four
+  filesystem gates pass per native arm. Stopped-state handling retains priority;
+  special after-block SIGCONT wake and wider timer races remain follow-up work.
+  These correctness results do not establish an audio or frame-pacing fix.
+
 - [Bounded owner-directed yield](ready-lock-owner-yield.md) follows positive
   owner-qualified preemption observations. Its matched native pair exercises
   19 guest calls and 15 successful host yields in the separately bracketed
