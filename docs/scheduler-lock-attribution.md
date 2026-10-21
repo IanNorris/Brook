@@ -684,3 +684,13 @@ with all four offline fsck checks returning zero. Git selects
 `31f52bb7808b1d97b6aa99a072d5e0c95de39e27` next (two revisions after it),
 which predates the GPU sleeping-ownership change. No causal conclusion follows
 before testing the selected candidate.
+
+
+Fourth candidate `31f52bb7` is reported at approximately 10 FPS with fast audio
+and marked bad for the rendering criterion. This predates GPU sleeping command
+ownership, so that change cannot be the sole first regression under this
+classification. User-directed shutdown completes guest sync, original launcher
+exit zero and four zero-exit offline fsck checks. Next selected candidate is
+`88008cdf2532ded9bccfab7956ba6c3e1ab0f6e8`. Its optional EEVDF registration
+is not evidence that the live RR-selected VM uses EEVDF; verify boot policy as
+for every earlier candidate.
