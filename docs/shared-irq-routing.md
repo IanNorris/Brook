@@ -110,3 +110,49 @@ Evidence paths:
   the pre-fix boot, bounded host/guest traces, clock anchors and strict checks.
 - `build/reviews/unattended-shared-irq-mlfq-a-20261021/` retains the candidate
   capsule, original process ownership and `boot-irq-route-check.json`.
+
+## Reduced-probe control
+
+A fresh pair repeats all eight phases with the same executed controller,
+thirteen module hashes, media hashes, host boot, affinity, MLFQ policy and
+physical PipeWire output. Audio timing/delivery/contribution probes, scheduler
+timing/decision/lock probes and timer timing/peer probes are verified off before
+and after every capture; actual QEMU arguments contain no host trace options.
+Cached counters, WAV capture and buffered SDL swap tracing remain enabled, so
+this is reduced instrumentation rather than an instrumentation-free test.
+
+| Phase | Baseline source completion | Fixed source completion | Browser callbacks/s, baseline → fixed |
+| --- | --- | --- | --- |
+| Firefox alone | 0.992 | 0.998 | 11.87 → 11.15 |
+| Both, prefix on A | 0.820 / 0.660 | 0.872 / 0.709 | 5.28 → 6.05 |
+| Both, prefix off B | 0.612 / 0.535 | 0.621 / 0.539 | 0.52 → 4.76 |
+| Both, prefix on C | 0.853 / 0.696 | 0.846 / 0.685 | 5.65 → 5.54 |
+| CPU load, Quake focused | 0.912 / 0.731 | 0.870 / 0.698 | 5.80 → 5.26 |
+| CPU load, Firefox focused | 0.936 / 0.745 | 0.869 / 0.692 | 6.06 → 6.05 |
+| Firefox after Quake | 1.001 | 0.999 | 12.50 → 12.36 |
+| Both, Quake reopened | 0.616 / 0.546 | 0.610 / 0.535 | 5.34 → 5.71 |
+
+Source completion is nominal PCM frames completed per measured second, ordered
+Firefox/Quake when both run. It is not decoded-media tempo. Browser callbacks
+and SDL swaps do not establish physical scanout rate. This single pair has no
+consistent overall performance benefit: the isolated baseline video dip is not
+a population result, and attract scene, phase and host variance remain possible.
+Do not pool it with the heavier diagnostic cohort to claim a general FPS win.
+The unchanged default batching path still underfeeds simultaneous sources.
+
+Both arms complete all nine original jobs, full media transfers and a browser
+loop, with zero browser trace drops, clean original VM/controller exits and
+four clean filesystem checks. Neither logs a native HDA fault. The fixed arm
+nevertheless **fails runtime acceptance**: one 13,463-ns service clamp, one debt
+episode and catchup, no owner transition or discarded debt. Cleanup history was
+enabled later and cannot reconstruct that earlier event. The baseline has no
+clamp in this run; this pair alone does not attribute the fixed arm's event to
+the routing patch or clear the older accounting failures.
+
+The two review directories are
+`build/reviews/unattended-irq-clean-{baseline,fixed}-mlfq-a-20261021/`.
+Each retains helper sources and `mixed-prefix-control/verification.json`;
+the fixed arm's `mixed-prefix-control/irq-clean-comparison.json` retains all
+phase metrics, frame-time percentiles, common-controller hash and both quality
+reports. Full policy acceptance remains false. Scheduler/audio defaults stay
+unchanged.

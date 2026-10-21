@@ -14,6 +14,12 @@ Later evidence supersedes several early leads:
   to 14.2/14.2 ms and retained slow worker episodes disappear, while default-path
   mixed audio remains underfed. This is a routing repair, not full playback
   acceptance or a scheduler/audio default change.
+  A subsequent eight-phase comparison with all eight heavy probes disabled
+  finds no consistent overall performance improvement. Default-path concurrent
+  audio remains about 0.61/0.53 nominal; Firefox alone is about 1.0. Both arms
+  complete lifecycle/media/filesystem checks, but the fixed arm fails runtime
+  acceptance with one 13.463-μs clamp. The [reduced-probe results](shared-irq-routing.md#reduced-probe-control)
+  retain the non-improving phases and instrumentation limits.
 
 - [Targeted wake joins](audio-delivery-diagnostics.md#separating-deadline-ready-dispatch-and-worker-resumption)
   match seventeen slow audio-worker cycles to ready records and BSP timer scans.
