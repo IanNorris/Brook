@@ -846,3 +846,38 @@ completion validation, stable deadlines and uncertain-DMA quarantine. Fresh
 capsules differ only in that module. The optional SDL swap probe is common to
 the pair, with native validity and observer overhead still requiring checks.
 No default scheduler, driver behavior or TCP safety fix has been reverted.
+
+
+### Native application frame times and physical-route silence accounting
+
+The buffered SDL probe validates natively (268 complete single-thread records
+for mutex, 327 for spin, no overflow/incomplete/clock-error records). Latest
+GPU mutex ownership yields median frame completion interval 84.015 ms,
+p95 97.306 ms, worst 166.894 ms; median SDL swap call is 60.748 ms. The
+otherwise-matched spin module yields median 63.027 ms, p95 97.237 ms, worst
+244.897 ms; median swap call is 20.246 ms. Aggregate observed swap cadence
+is 11.880 versus 14.557 FPS. These whole-capture distributions include
+startup/menu and are one pair, not matched per-scene repeats. The unchanged
+p95 and worse maximum prevent claiming universal frame-time improvement.
+Audio completion remains 0.84251x versus 0.84097x of guest elapsed time.
+GPU ownership therefore affects rendering in this control without fixing slow
+audio. No default driver or scheduler change follows.
+
+A separate uninstrumented-swap latest-kernel attract control enables only the
+existing delivery probe, in addition to the common bounded profile. Slow
+completion persists at 0.84446x. During the diagnostic interval it reserves
+167,500 bytes across 143 reservations: 0.94955 seconds of physical silence.
+The cached stream/clock interval shows approximately 0.94 seconds of elapsed
+time beyond nominal completed application frames. The diagnostic and clock
+snapshot intervals are not identical, so this is approximate accounting
+consistency, not exact conservation. No invalid clock/position, unsafe
+publication, contention drop or saturation is recorded. Maximum observed
+device advance is 424 bytes and minimum headroom 12,108 bytes; neither is a
+worst-case bound under host contention.
+
+This extends the existing synthetic small-queue/reservation mechanism to the
+actual Quake reproduction on physical USB output, with all lifecycle and
+filesystem gates passing. Reducing publication distance remains an experiment
+requiring hosted production-driver fault/burst tests and native contention
+controls. Keep the 8,192-byte codec tail trailer and all publication guards.
+All original launchers and jobs are terminal and the VMs are stopped.
