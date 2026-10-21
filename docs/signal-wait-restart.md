@@ -104,3 +104,49 @@ exits zero and all four primary filesystem checks pass.
 
 This validates the bounded caught-SIGUSR1 cases and reviewed admission body;
 it is not evidence that browser or game playback has recovered.
+
+## Browser follow-up: correctness pass is not runtime acceptance
+
+One matched baseline/final Firefox pair uses fresh private profiles and images,
+original thirteen modules/12-KiB HDA, MLFQ, blocking AP accounting, eight vCPUs,
+eight GiB, physical PipeWire callback audio and normal host masks 0–15. Owner,
+yield, idle coalescing, history and expensive timing recorders remain off.
+Each arm includes two browser launches, twenty seconds of eight guest CPU
+workers during the first, one timestamped input, and finite four/eight-fragment
+OSS sources. Both VMs exit zero; all eight primary filesystem checks pass.
+Sixteen original guest jobs have complete identity/group/EOF/exit receipts.
+
+| Observation | Baseline | Final signal fix |
+| --- | ---: | ---: |
+| Loaded audio completion / guest second | 0.9794 | 0.9569 |
+| Loaded video callbacks / page second | 10.97 | 10.68 |
+| Relaunch quiet video callbacks / page second | 11.82 | 11.54 |
+| Finite four-fragment source drain | 10.0646 s | 10.0757 s |
+| Finite eight-fragment source drain | 10.0216 s | 10.0232 s |
+| Final runtime clamps | 0 | **2 — failed gate** |
+
+This single shared-host pair does not establish a performance change. Stored
+PCM covers approximately the full host capture interval in both arms; its
+quiet bins do not measure speaker glitches. Finite packet fits are near 1× per
+stored PCM second and do not reproduce the historical playback speedup.
+
+The final arm's first clamp is CPU3/PID621/incarnation621 at guest wall
+132.683339517 s: wall advances 58,758 ns while reported steal advances 66,440 ns,
+leaving a 7,682-ns deficit. The second browser's pre-close runtime snapshot has
+zero clamps; the first finite OSS source starts later at 143.139288498 s.
+Thus the retained counter places this failure after that browser snapshot and
+before the finite source, not inside its measured audio interval. No causal
+history was enabled, so it does not identify the faulty publication or prove
+that the signal change caused the failure.
+
+This is now a native **MLFQ** runtime-gate failure in addition to the older
+EEVDF failures. Those older failures remain valid; the symptom is no longer
+observed only under EEVDF. A bounded history capture is the next diagnostic,
+without changing clamp classification or scheduler defaults.
+
+Raw browser evidence is under
+`build/reviews/unattended-signal-browser-{baseline,fixed}-a-20261021`.
+The checked reduction is
+`build/workloads/timing-scheduler-20261021/signal-browser-cohort/policy-summary.json`;
+`signal-waits/verification.json` records the unchanged probe binary, frozen
+module/kernel checks, original guest jobs and separate failed browser gate.

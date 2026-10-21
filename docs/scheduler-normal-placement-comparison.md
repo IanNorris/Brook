@@ -139,3 +139,18 @@ Raw reviews are `unattended-hda-browser-normal-12k-r2-20261021` and
 `unattended-policy-normal-{mlfq-a,eevdf-a,rr-a,eevdf-b,mlfq-b}-20261021`.
 Each review preserves its exact executed controller, raw phase/final gates,
 trace and PCM provenance, original owner receipts and filesystem results.
+
+## Later signal-fix follow-up: MLFQ also exposes a clamp
+
+The [signal/wait correctness follow-up](signal-wait-restart.md#browser-follow-up-correctness-pass-is-not-runtime-acceptance)
+subsequently records two runtime clamps in a fresh MLFQ browser/relaunch/finite
+OSS cohort on kernel `b3ffe02c…`. Its first deficit is 7,682 ns on CPU3/PID621,
+after the second browser's zero-clamp pre-close snapshot and before the finite
+OSS source begins. Its paired baseline has no clamps. All original job/VM and
+filesystem gates pass, but that final arm fails runtime acceptance.
+
+This later kernel comparison does not alter the earlier six-policy measurements
+or establish a scheduler-specific cause. It does mean the observed symptom is
+no longer exclusive to EEVDF. Keep both the old and new failed gates open until
+causal evidence explains the wall/steal correction; do not promote MLFQ on the
+basis of the older clean runs alone.

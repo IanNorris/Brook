@@ -13,6 +13,9 @@ Later evidence supersedes several early leads:
   filesystem gates pass per native arm. Stopped-state handling retains priority;
   special after-block SIGCONT wake and wider timer races remain follow-up work.
   These correctness results do not establish an audio or frame-pacing fix.
+  The matched browser follow-up records two runtime clamps under MLFQ after
+  its second pre-close snapshot. Its lifecycle is clean but runtime acceptance
+  fails; the earlier clamp symptom is no longer seen only under EEVDF.
 
 - [Bounded owner-directed yield](ready-lock-owner-yield.md) follows positive
   owner-qualified preemption observations. Its matched native pair exercises
