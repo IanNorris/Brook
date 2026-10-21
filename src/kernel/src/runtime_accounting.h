@@ -1,10 +1,12 @@
 #pragma once
 #include <stdint.h>
+#include "runtime_history.h"
 
 namespace brook {
 struct RuntimeSample {
     uint64_t wallNs = 0, stealNs = 0;
     bool valid = false;
+    uint8_t attempts = 0; // metadata only; zero for synthetic/failed samples
 };
 // A host preemption can occur between the two different KVM shared records.
 // Bracket the wall read with steal reads; retry the entire pair on change.
@@ -16,7 +18,7 @@ RuntimeSample RuntimeReadSample(bool hasSteal, WallReader wallReader, StealReade
         if (hasSteal && !stealReader(&before)) return {};
         if (!wallReader(&wall)) return {};
         if (hasSteal && !stealReader(&after)) return {};
-        if (before == after) return {wall, before, true};
+        if (before == after) return {wall, before, true, uint8_t(attempt+1)};
     }
     return {};
 }
@@ -50,11 +52,12 @@ template<unsigned Tasks, unsigned Cpus> class RuntimeAccounting {
         uint16_t group = 0;
     } tasks_[Tasks]{};
     struct Cpu {
-        uint64_t wall = 0, steal = 0, serviceFloor = 0, incarnation = 0;
-        uint16_t pid = 0;
-        bool baseline = false;
+        uint64_t wall, steal, serviceFloor, incarnation;
+        uint16_t pid;
+        bool baseline;
     } cpus_[Cpus]{};
     RuntimeDiagnostics diagnostics_{};
+    RuntimeHistory<Cpus>* history_=nullptr;
 
     void Add(uint64_t& value, uint64_t amount) {
         if (amount > ~uint64_t(0) - value) {
@@ -62,6 +65,7 @@ template<unsigned Tasks, unsigned Cpus> class RuntimeAccounting {
         } else value += amount;
     }
 public:
+    void SetHistory(RuntimeHistory<Cpus>* history) { history_=history; }
     bool Register(uint16_t pid, uint64_t incarnation, uint16_t group, uint64_t groupIncarnation) {
         if (!pid || pid >= Tasks || !incarnation || !group || group >= Tasks || !groupIncarnation)
             return false;
@@ -75,13 +79,29 @@ public:
     uint64_t Sample(unsigned cpu, RuntimeSample sample) {
         if (cpu >= Cpus) return 0;
         auto& state = cpus_[cpu]; ++diagnostics_.samples;
+        const bool recording=history_ && history_->Recording();
+        RuntimeHistoryEntry event;
+        if(recording){
+            event={};event.sample=diagnostics_.samples;event.wallNs=sample.wallNs;
+            event.stealNs=sample.stealNs;event.valid=sample.valid;event.attempts=sample.attempts;
+            event.floorBeforeNs=state.serviceFloor;event.pidBefore=state.pid;
+            event.incarnationBefore=state.incarnation;event.baselineBefore=state.baseline;
+        }
+        auto finish=[&](RuntimeHistoryKind kind,uint64_t charged=0,uint64_t idle=0){
+            if(recording){
+                event.kind=kind;event.floorAfterNs=state.serviceFloor;event.pidAfter=state.pid;
+                event.incarnationAfter=state.incarnation;event.baselineAfter=state.baseline;
+                event.chargedNs=charged;event.idleNs=idle;history_->Record(cpu,event);
+            }
+            return charged;
+        };
         if (!sample.valid || sample.stealNs > sample.wallNs) {
-            ++diagnostics_.invalidSamples; state.baseline = false; return 0;
+            ++diagnostics_.invalidSamples; state.baseline = false; return finish(RuntimeHistoryKind::Invalid);
         }
         const uint64_t service = sample.wallNs - sample.stealNs;
         if (!state.baseline) {
             state.wall = sample.wallNs; state.steal = sample.stealNs;
-            state.serviceFloor = service; state.baseline = true; return 0;
+            state.serviceFloor = service; state.baseline = true; return finish(RuntimeHistoryKind::Baseline);
         }
         if (sample.wallNs < state.wall || sample.stealNs < state.steal) {
             if (sample.wallNs < state.wall) {
@@ -104,7 +124,7 @@ public:
             diagnostics_.lastStealNs = sample.stealNs;
             // Drop the unknown interval, including across the next dispatch.
             // Per-task cumulative clocks themselves never regress.
-            state.baseline = false; return 0;
+            state.baseline = false; return finish(RuntimeHistoryKind::Backwards);
         }
         Add(diagnostics_.observedStealNs, sample.stealNs - state.steal);
         const uint64_t previousWall=state.wall,previousSteal=state.steal;
@@ -116,20 +136,20 @@ public:
                 state.incarnation,cpu,state.pid};
             if(diagnostics_.clampedService==1)diagnostics_.firstClamp=evidence;
             if(evidence.deficitNs>diagnostics_.maxClamp.deficitNs)diagnostics_.maxClamp=evidence;
-            return 0;
+            return finish(RuntimeHistoryKind::Clamp);
         }
         const uint64_t delta = service - state.serviceFloor;
         state.serviceFloor = service;
-        if (!state.pid) { Add(diagnostics_.idleNs, delta); return 0; }
+        if (!state.pid) { Add(diagnostics_.idleNs, delta); return finish(RuntimeHistoryKind::Idle,0,delta); }
         if (state.pid >= Tasks || tasks_[state.pid].incarnation != state.incarnation) {
-            ++diagnostics_.staleIdentity; return 0;
+            ++diagnostics_.staleIdentity; return finish(RuntimeHistoryKind::StaleOwner);
         }
         auto& task = tasks_[state.pid];
         Add(task.threadNs, delta); Add(diagnostics_.chargedNs, delta);
         if (tasks_[task.group].incarnation == task.groupIncarnation)
             Add(tasks_[task.group].groupNs, delta);
-        else ++diagnostics_.staleIdentity;
-        return delta;
+        else {++diagnostics_.staleIdentity;return finish(RuntimeHistoryKind::StaleGroup,delta);}
+        return finish(RuntimeHistoryKind::Charged,delta);
     }
     void Dispatch(unsigned cpu, uint16_t pid, uint64_t incarnation, RuntimeSample sample) {
         if (cpu >= Cpus) return;
@@ -140,6 +160,16 @@ public:
     // only the ledger owner. Dispatch above remains the combined model API.
     void SetOwner(unsigned cpu, uint16_t pid, uint64_t incarnation) {
         if (cpu >= Cpus) return;
+        if(history_ && history_->Recording()){
+            const auto& c=cpus_[cpu];RuntimeHistoryEntry event{};
+            event.kind=RuntimeHistoryKind::Owner;event.sample=diagnostics_.samples;
+            event.wallNs=c.wall;event.stealNs=c.steal;
+            event.floorBeforeNs=event.floorAfterNs=c.serviceFloor;
+            event.pidBefore=c.pid;event.incarnationBefore=c.incarnation;
+            event.pidAfter=pid;event.incarnationAfter=incarnation;
+            event.baselineBefore=event.baselineAfter=c.baseline;
+            history_->Record(cpu,event);
+        }
         cpus_[cpu].pid = pid; cpus_[cpu].incarnation = incarnation;
     }
     bool Read(uint16_t pid, uint64_t incarnation, bool group, uint64_t* output) const {

@@ -19,7 +19,7 @@ int main() {
         if(wallReads==1) sampledSteal=40; // preempted between first steal and wall
         return true;
     },[&](uint64_t* steal){++stealReads;*steal=sampledSteal;return true;});
-    CHECK(pair.valid && pair.wallNs==200 && pair.stealNs==40 && wallReads==2 && stealReads==4);
+    CHECK(pair.valid && pair.wallNs==200 && pair.stealNs==40 && pair.attempts==2 && wallReads==2 && stealReads==4);
     wallReads=0;
     pair=brook::RuntimeReadSample(true,[&](uint64_t* wall){++wallReads;*wall=1000;++sampledSteal;return true;},
         [&](uint64_t* steal){*steal=sampledSteal;return true;});
@@ -274,6 +274,112 @@ int main() {
     CHECK(skipped.Sample(0,at(1400,210))==200);CHECK(skipped.Read(2,2,false,&value) && value==200);
     skipped.Sample(0,{}); // failed later sample discards unknown deferred gap
     skipped.Dispatch(0,1,1,at(10000,210));CHECK(skipped.Read(2,2,false,&value) && value==200);
+    // The observer must preserve all ledger results, including failures and
+    // corrections across ownership changes. It reuses exactly the input pair.
+    {
+        RuntimeAccounting<8,2> plain, watched;
+        brook::RuntimeHistory<2> history;
+        watched.SetHistory(&history); // attached but disabled is also inert
+        for(unsigned pid=1;pid<=4;++pid){
+            CHECK(plain.Register(pid,100+pid,pid,100+pid));
+            CHECK(watched.Register(pid,100+pid,pid,100+pid));
+        }
+        auto sampleBoth=[&](unsigned cpu,brook::RuntimeSample p){
+            auto a=plain.Sample(cpu,p),b=watched.Sample(cpu,p);CHECK(a==b);return b;
+        };
+        for(unsigned cpu=0;cpu<2;++cpu){plain.Dispatch(cpu,cpu+1,101+cpu,at(1000,100));watched.Dispatch(cpu,cpu+1,101+cpu,at(1000,100));}
+        brook::RuntimeHistorySnapshot h{};
+        CHECK(history.Read(0,&h) && !h.enabled && !h.count && !h.epoch);
+        CHECK(!history.Start(0) && !history.Start(3));
+        CHECK(history.Start(2));
+        sampleBoth(0,at(123792817503ULL,118281443));
+        CHECK(sampleBoth(0,at(123792870751ULL,118339578))==0);
+        CHECK(history.Read(0,&h) && h.triggered && h.triggerCpu==0 && !h.caughtUp);
+        CHECK(h.triggerFloorNs==123674536060ULL);
+        const auto triggeredEpoch=h.epoch,triggeredSequence=h.triggerSequence;
+        CHECK(history.Start(2)); // duplicate on preserves the positive event
+        CHECK(history.Read(0,&h) && h.epoch==triggeredEpoch && h.triggerSequence==triggeredSequence);
+        plain.SetOwner(0,3,103);watched.SetOwner(0,3,103);
+        CHECK(sampleBoth(0,at(123792970751ULL,118339578))==95113);
+        CHECK(history.Read(0,&h) && h.caughtUp && h.catchupSequence>h.triggerSequence);
+        bool sawOwner=false,sawCorrection=false;
+        for(unsigned i=0;i<h.count;++i){const auto& e=h.entries[i];
+            if(e.kind==brook::RuntimeHistoryKind::Owner && e.pidBefore==1 && e.pidAfter==3){
+                sawOwner=true;CHECK(e.wallNs==123792870751ULL && !e.valid);
+            }
+            if(e.sequence==h.catchupSequence){sawCorrection=true;CHECK(e.pidBefore==3 && e.chargedNs==95113);}
+        }
+        CHECK(sawOwner && sawCorrection);
+        uint64_t wall[2]{123792970751ULL,1000},steal[2]{118339578,100};
+        for(unsigned i=0;i<24;++i)sampleBoth(0,at(wall[0]+=1000,steal[0]));
+        CHECK(history.Read(0,&h) && h.frozen && !h.allFrozen && h.omittedAfterFreeze>0);
+        for(unsigned i=0;i<16;++i)sampleBoth(1,at(wall[1]+=1000,steal[1]));
+        CHECK(history.Read(0,&h) && h.allFrozen && h.caughtUp && !history.Recording());
+        const auto frozenSequence=h.sequence, frozenOmitted=h.omittedAfterFreeze;
+        CHECK(h.count==18 && h.postEvents==16 && h.entries[1].kind==brook::RuntimeHistoryKind::Clamp);
+        sampleBoth(0,at(wall[0]+=1000,steal[0]));
+        CHECK(history.Read(0,&h) && h.sequence==frozenSequence && h.omittedAfterFreeze==frozenOmitted);
+        h.entries[0].sequence=0x1234;CHECK(history.Read(0,&h,false) && h.count==18 && h.entries[0].sequence==0x1234);
+        CHECK(history.Reset(2));
+        for(unsigned i=0;i<96;++i)sampleBoth(0,at(wall[0]+=1000,steal[0]));
+        CHECK(history.Read(0,&h) && h.count==64 && h.prefixOverwritten==32 && !h.triggered);
+        for(unsigned i=1;i<h.count;++i)CHECK(h.entries[i-1].sequence<h.entries[i].sequence);
+        CHECK(h.epoch>triggeredEpoch);
+        steal[0]+=1100;sampleBoth(0,at(wall[0]+=1000,steal[0])); // new clamp, despite nonzero lifetime clamp counter
+        CHECK(history.Read(0,&h) && h.triggered && !h.caughtUp);
+        sampleBoth(0,{}); // unknown interval must prevent a false catch-up claim
+        for(unsigned cpu=0;cpu<2;++cpu)for(unsigned i=0;i<20;++i)sampleBoth(cpu,at(wall[cpu]+=1000,steal[cpu]));
+        CHECK(history.Read(0,&h) && h.allFrozen && h.baselineLost && !h.caughtUp);
+        CHECK(h.count==64 && h.postEvents==16 && h.entries[47].sequence==h.triggerSequence && h.entries[47].kind==brook::RuntimeHistoryKind::Clamp);
+        history.Stop();CHECK(!history.Recording() && !history.Enabled());
+        CHECK(!history.Read(2,&h) && !history.Read(0,nullptr));
+        // Exercise observer reset/stop with invalid/backwards pairs, new owners
+        // and PID generations. Comparing all diagnostic fields avoids treating
+        // agreement of just the successful charges as sufficient.
+        auto equalEvidence=[&](const brook::RuntimeClampEvidence& a,const brook::RuntimeClampEvidence& b){
+#define EQUAL_EVIDENCE(field) CHECK(a.field==b.field)
+            EQUAL_EVIDENCE(sample);EQUAL_EVIDENCE(previousWallNs);EQUAL_EVIDENCE(wallNs);
+            EQUAL_EVIDENCE(previousStealNs);EQUAL_EVIDENCE(stealNs);EQUAL_EVIDENCE(serviceFloorNs);
+            EQUAL_EVIDENCE(deficitNs);EQUAL_EVIDENCE(incarnation);EQUAL_EVIDENCE(cpu);EQUAL_EVIDENCE(pid);
+#undef EQUAL_EVIDENCE
+        };
+        uint32_t random=0x46b8c123;uint64_t generation[5]{0,101,102,103,104};
+        for(unsigned i=0;i<40000;++i){
+            random=random*1664525+1013904223;unsigned cpu=random%2;
+            if(i%251==0)CHECK(history.Reset(2));
+            if(i%997==0)history.Stop();else if(i%997==1)CHECK(history.Start(2));
+            if(i%683==0){unsigned pid=(random>>10)%4+1;generation[pid]+=1000;CHECK(plain.Register(pid,generation[pid],pid,generation[pid]));CHECK(watched.Register(pid,generation[pid],pid,generation[pid]));}
+            auto p=at(wall[cpu]+=1000+(random>>8)%10000,steal[cpu]+=(random>>16)%100);
+            if(i%101==0)p={};
+            if(i%127==0)p.wallNs=1;
+            if(i%137==0)p.stealNs=0;
+            sampleBoth(cpu,p);
+            if(i%7==0){unsigned pid=(random>>20)%5;plain.SetOwner(cpu,pid,generation[pid]);watched.SetOwner(cpu,pid,generation[pid]);}
+            const auto& a=plain.Diagnostics();const auto& b=watched.Diagnostics();
+#define EQUAL_DIAGNOSTIC(field) CHECK(a.field==b.field)
+            EQUAL_DIAGNOSTIC(samples);EQUAL_DIAGNOSTIC(chargedNs);EQUAL_DIAGNOSTIC(idleNs);
+            EQUAL_DIAGNOSTIC(invalidSamples);EQUAL_DIAGNOSTIC(backwardsWall);EQUAL_DIAGNOSTIC(backwardsSteal);
+            EQUAL_DIAGNOSTIC(clampedService);EQUAL_DIAGNOSTIC(staleIdentity);EQUAL_DIAGNOSTIC(saturated);
+            EQUAL_DIAGNOSTIC(observedStealNs);EQUAL_DIAGNOSTIC(maxWallRewindNs);EQUAL_DIAGNOSTIC(maxStealRewindNs);
+            EQUAL_DIAGNOSTIC(backwardsCpuMask);EQUAL_DIAGNOSTIC(lastBackwardsSample);
+            EQUAL_DIAGNOSTIC(lastPreviousWallNs);EQUAL_DIAGNOSTIC(lastWallNs);
+            EQUAL_DIAGNOSTIC(lastPreviousStealNs);EQUAL_DIAGNOSTIC(lastStealNs);
+            EQUAL_DIAGNOSTIC(lastBackwardsCpu);EQUAL_DIAGNOSTIC(lastBackwardsPid);
+#undef EQUAL_DIAGNOSTIC
+            equalEvidence(a.firstClamp,b.firstClamp);equalEvidence(a.maxClamp,b.maxClamp);
+        }
+        for(unsigned pid=1;pid<=4;++pid)for(bool group:{false,true}){
+            uint64_t a=0,b=0;CHECK(plain.Read(pid,generation[pid],group,&a) && watched.Read(pid,generation[pid],group,&b) && a==b);
+        }
+        // Prefix/tail exhaustion is explicitly incomplete when debt has not
+        // caught up. No observer event may reset the floor to manufacture time.
+        RuntimeAccounting<4,1> debt;brook::RuntimeHistory<1> debtHistory;debt.SetHistory(&debtHistory);
+        CHECK(debt.Register(1,1,1,1));debt.Dispatch(0,1,1,at(1000,100));CHECK(debtHistory.Start(1));
+        debt.Sample(0,at(1100,300));
+        for(unsigned i=1;i<=16;++i)debt.Sample(0,at(1100+i,300+2*i));
+        CHECK(debtHistory.Read(0,&h) && h.allFrozen && !h.caughtUp && !h.baselineLost);
+        CHECK(debt.Read(1,1,false,&value) && value==0);
+    }
     std::printf("RUNTIME_ACCOUNTING %s\n",failures?"FAIL":"PASS");
     return failures?1:0;
 }

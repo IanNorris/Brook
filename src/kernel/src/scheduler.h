@@ -236,6 +236,8 @@ struct RuntimeStatus {
     bool stableClock = false;
 };
 void SchedulerRuntimeStatus(RuntimeStatus* output);
+bool SchedulerRuntimeHistoryControl(int mode, bool reset);
+bool SchedulerRuntimeHistoryRead(unsigned cpu, RuntimeHistorySnapshot* output, bool entries=true);
 struct PolicyServiceStatus {
     const char* name = "none";
     uint64_t stateBytes = 0, ledgerSinceSelectionNs = 0;

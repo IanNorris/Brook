@@ -3265,6 +3265,39 @@ static int DebugReplySend(const char* data, uint32_t length)
 // Fixed-buffer replies: no dependency on a userspace printf implementation.
 using BridgeReply = BridgeReplyBuffer<DebugChannelSend>;
 
+static void DebugRuntimeHistory(unsigned cpu,bool rows)
+{
+    RuntimeHistorySnapshot s{};
+    if(!SchedulerRuntimeHistoryRead(cpu,&s,rows)){DebugChannelSend("{\"error\":\"invalid online CPU\"}\n");return;}
+    BridgeReply r;r.text("{\"enabled\":");r.text(s.enabled?"true":"false");
+    auto flag=[&](const char* name,bool value){r.text(",\"");r.text(name);r.text("\":");r.text(value?"true":"false");};
+    flag("entries_included",rows);flag("triggered",s.triggered);flag("frozen",s.frozen);flag("all_frozen",s.allFrozen);
+    flag("trigger_caught_up",s.caughtUp);flag("baseline_lost",s.baselineLost);flag("overflow",s.overflow);
+    r.text(",");r.field("epoch",s.epoch);r.text(",");r.field("sequence",s.sequence);
+    r.text(",");r.field("online_cpus",SmpGetCpuCount());r.text(",");r.field("capture_cpus",s.cpus);
+    r.text(",");r.field("cpu",s.cpu);r.text(",");r.field("capacity",s.capacity);r.text(",");r.field("count",s.count);
+    r.text(",");r.field("post_events",s.postEvents);r.text(",");r.field("prefix_overwritten",s.prefixOverwritten);
+    r.text(",");r.field("omitted_after_freeze",s.omittedAfterFreeze);r.text(",");r.field("trigger_cpu",s.triggerCpu);
+    r.text(",");r.field("trigger_sequence",s.triggerSequence);r.text(",");r.field("trigger_sample",s.triggerSample);
+    r.text(",");r.field("trigger_floor_ns",s.triggerFloorNs);r.text(",");r.field("catchup_sequence",s.catchupSequence);
+    r.text(",\"scope\":\"opt-in; existing samples only; 64 total rows per CPU including trigger and 16 post events (owners count); stop before multi-CPU export; owner rows reuse last pair; omitted count stops when all frozen; caught-up does not prove attribution; not panic-safe\"");
+    r.text(",\"entries\":[");r.send();
+    if(rows)for(unsigned i=0;i<s.count;++i){
+        const auto& e=s.entries[i];BridgeReply v;if(i)v.text(",");v.text("{");
+        v.field("sequence",e.sequence);v.text(",");v.field("sample",e.sample);
+        v.text(",\"kind\":\"");v.text(RuntimeHistoryKindName(e.kind));v.text("\",");
+        v.field("wall_ns",e.wallNs);v.text(",");v.field("steal_ns",e.stealNs);
+        v.text(",");v.field("floor_before_ns",e.floorBeforeNs);v.text(",");v.field("floor_after_ns",e.floorAfterNs);
+        v.text(",");v.field("pid_before",e.pidBefore);v.text(",");v.field("pid_after",e.pidAfter);
+        v.text(",");v.field("incarnation_before",e.incarnationBefore);v.text(",");v.field("incarnation_after",e.incarnationAfter);
+        v.text(",");v.field("charged_ns",e.chargedNs);v.text(",");v.field("idle_ns",e.idleNs);
+        v.text(",");v.field("attempts",e.attempts);v.text(",\"valid\":");v.text(e.valid?"true":"false");
+        v.text(",\"baseline_before\":");v.text(e.baselineBefore?"true":"false");
+        v.text(",\"baseline_after\":");v.text(e.baselineAfter?"true":"false");v.text("}");v.send();
+    }
+    DebugChannelSend("]}\n");
+}
+
 static void DebugSchedulerLockTrace()
 {
     SchedulerLockTraceSnapshot s{};SchedulerLockTraceRead(&s);
@@ -3761,6 +3794,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  sched policy status|rr|mlfq|eevdf - inspect or select a registered policy\n"
             "  sched wakes status|bsp|shared|reset - optional wake-scan handoff (default bsp)\n"
             "  sched runtime status - running intervals, steal availability and read errors\n"
+            "  sched runtime history on|off|reset|status|cpu N - bounded clamp/owner history\n"
             "  sched kvm status - advertised PV features and independent preemption hints\n"
             "  sched lock-trace on|off|reset|status - ready-lock ticket and clock observations\n"
             "  mem exec-cache  - executable page sharing counters\n"
@@ -4293,6 +4327,21 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text(",\"pv_lock_wait_implemented\":false,\"pv_sched_yield_implemented\":false,");
         reply.text("\"scope\":\"CPUID and per-vCPU hint bytes sampled independently, not a coherent running-state snapshot; zero does not prove running or host support; hints are not used for scheduling\"}\n");
         reply.send();
+    }
+    else if(NetStrEq(cmd,"sched runtime history on") || NetStrEq(cmd,"sched runtime history off") ||
+            NetStrEq(cmd,"sched runtime history reset") || NetStrEq(cmd,"sched runtime history status")) {
+        const int mode=NetStrEq(cmd,"sched runtime history on")?1:NetStrEq(cmd,"sched runtime history off")?0:-1;
+        if(!SchedulerRuntimeHistoryControl(mode,NetStrEq(cmd,"sched runtime history reset")))
+            DebugChannelSend("{\"error\":\"runtime history control failed; no accounting reset\"}\n");
+        else DebugRuntimeHistory(0,false);
+    }
+    else if(StrStartsWith(cmd,"sched runtime history cpu ")) {
+        const char* a=cmd+sizeof("sched runtime history cpu ")-1;unsigned cpu=0;bool valid=*a!=0;
+        for(;*a && valid;++a){
+            if(*a<'0' || *a>'9' || cpu>(~unsigned(0)-unsigned(*a-'0'))/10)valid=false;
+            else cpu=cpu*10+unsigned(*a-'0');
+        }
+        if(!valid)DebugChannelSend("{\"error\":\"invalid CPU index\"}\n");else DebugRuntimeHistory(cpu,true);
     }
     else if (NetStrEq(cmd, "sched runtime status")) {
         RuntimeStatus status{}; SchedulerRuntimeStatus(&status);

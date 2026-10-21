@@ -311,6 +311,7 @@ void SchedulerIrqAccountingRead(IrqAccountingSnapshot* output){
 // Separate bounded accounting storage; it is not policy-owned and survives
 // policy switches. All ledger mutation/read is under g_readyLock.
 static RuntimeAccounting<SCHED_MAX_PIDS, SCHED_MAX_CPUS> g_runtime;
+static RuntimeHistory<SCHED_MAX_CPUS> g_runtimeHistory;
 static bool g_runtimeStableClock = false;
 static uint64_t g_policyLedgerBaseNs = 0;
 
@@ -403,6 +404,25 @@ void SchedulerRuntimeStatus(RuntimeStatus* output)
     SchedLockRelease(g_readyLock, flags);
 }
 
+bool SchedulerRuntimeHistoryControl(int mode, bool reset)
+{
+    if(mode < -1 || mode > 1)return false;
+    const uint64_t flags=SchedLockAcquire(g_readyLock);
+    unsigned cpus=SmpGetCpuCount();if(cpus>SCHED_MAX_CPUS)cpus=SCHED_MAX_CPUS;
+    bool applied=true;
+    if(reset)applied=g_runtimeHistory.Reset(cpus);
+    if(applied && mode==1)applied=g_runtimeHistory.Start(cpus);
+    if(applied && mode==0)g_runtimeHistory.Stop();
+    g_runtime.SetHistory(g_runtimeHistory.Enabled()?&g_runtimeHistory:nullptr);
+    SchedLockRelease(g_readyLock,flags);return applied;
+}
+bool SchedulerRuntimeHistoryRead(unsigned cpu,RuntimeHistorySnapshot* output,bool entries)
+{
+    if(cpu>=SmpGetCpuCount())return false;
+    const uint64_t flags=SchedLockAcquire(g_readyLock);
+    const bool found=g_runtimeHistory.Read(cpu,output,entries);
+    SchedLockRelease(g_readyLock,flags);return found;
+}
 
 void SchedulerPolicyServiceStatus(PolicyServiceStatus* output)
 {

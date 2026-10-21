@@ -179,3 +179,9 @@ correction. A bounded history of accepted pairs, owner transitions, floor and
 catch-up is the next diagnostic. Two RR and two MLFQ cohorts in the same study
 remain runtime-clean; that does not identify EEVDF as the publication cause.
 All original owners, heaps, audio drains and filesystem checks pass separately.
+
+The subsequent [bounded runtime history](runtime-accounting-history.md) adds an
+opt-in capture of existing samples and owner transitions without changing the
+ledger's decisions. Its first native four-launch browser run verifies export
+functionality but reproduces no clamp. This negative capture does not clear
+either failed EEVDF cohort or identify the cause of their corrections.
