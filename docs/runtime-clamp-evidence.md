@@ -206,3 +206,12 @@ That is compatible with separately maintained host accounting clocks, but does
 not prove arbitrary delayed publication while a vCPU continues executing or
 explain this particular event. No retry-until-monotonic, tolerance, floor reset
 or acceptance relaxation follows from these observations.
+
+
+The [independent consumed-steal reference](runtime-accounting-debt-reference.md)
+subsequently proves the valid-epoch algebraic equivalence of Brook's floor to
+Linux v6.12's steal-debt recurrence, excluding Linux's separate IRQ deduction.
+An independent hosted model checks 30,000 four-CPU owner/group/idle and unknown
+interval events, plus three positive native adjacent pairs and edge cases.
+This strengthens input-handling evidence without identifying native publication
+causes, replaying missing full native history or changing any acceptance gate.
