@@ -90,6 +90,13 @@ Later evidence supersedes several early leads:
   completion averages do not establish uninterrupted output. A separate lossy
   post-timing profile identifies compositor GPU completion polling and existing
   mapping-lock waits as leads, without establishing CPU percentages or causality.
+  A separate [host fence trace](gpu-fence-timing-control.md) measures compositor
+  dispatch at 55-µs median but fence response at 9.502 ms, supporting a private
+  QEMU polling-cadence control while preserving every guest fence. Its three
+  audio zero runs match the three HDA reservation sizes/order exactly; wide
+  alignment bounds prevent a causal claim. That third cohort retains a poor
+  initial Firefox-only window and four runtime clamps, despite near-nominal
+  guarded mixed/loaded audio. Earlier passing cohorts do not waive these.
   Software backlog and source-credit latency bounds remain
   explicit. Earlier runtime failures and the historical fast-playback cause
   remain open; no default is promoted.
