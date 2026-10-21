@@ -111,3 +111,36 @@ can affect the workload. Evidence and the verification receipt remain ignored
 under `build/reviews/unattended-runtime-history-eevdf-a-20261021/runtime-history-control`.
 A focused clock/accounting workload is the next capture attempt; this negative
 browser run does not justify changing sampling decisions or clearing errors.
+
+### Focused CPU-clock and ownership probe
+
+`scripts/workloads/runtime_clock_mix.py` runs bounded waves of child processes,
+each creating two threads that alternate arithmetic, thread/process CPU-clock
+reads and 1-ms sleeps. Its default one/eight-process waves run for six seconds
+each. Python's GIL serializes Python execution within each process; these are
+ownership and clock-read stimuli, not two independent CPU burners per process.
+The caller must retain the original job and enforce a separate host deadline.
+The report checks monotonic clocks, non-early sleeps, progress and the thread
+CPU-time delta against its enclosing wall-time bracket. It is not a general
+scheduler safety proof or observer-free performance benchmark.
+
+A second native EEVDF VM collected two stopped history epochs:
+
+| Condition | Probe threads | Read cycles | Sleeps | Ledger samples | Observed steal delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Quiet one/eight-process waves | 18 | 907,364 | 53,373 | 2,431,541 | 21.87 ms |
+| Eight processes with finite host load | 16 | 535,030 | 31,470 | 1,485,038 | 2.7647 s |
+
+Both probe reports pass and both runtime gates stay clean. Each stopped epoch
+exports 512 rows with ordered sequences and consistent floor/owner transitions;
+the retained tails contain 34 and 35 ownership events respectively. No clamp
+is captured. The pressure job's complete host observation bracket lies within
+the measured execution intervals of all eight host workers, each running for
+twenty seconds. Host workers use CPUs 0–7, while all QEMU threads retain 0–15:
+this is a descheduling stimulus, **not the earlier severe restricted-placement
+test**. Enabled history and CPU-clock reads perturb scheduling.
+
+The original VM owner exits zero and all four filesystem checks pass. The host
+probe smoke check also passes. Evidence and a checked receipt remain ignored
+under `build/reviews/unattended-runtime-history-eevdf-b-20261021/clock-mix-control`.
+These additional negative captures preserve all earlier failed runtime gates.
