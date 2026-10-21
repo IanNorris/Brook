@@ -27,3 +27,9 @@ a guest fence is redundant. Faster polling can add host wakeups/CPU cost.
 
 See [the timing audit](../../docs/timing-scheduler-audit.md) for unresolved
 clock, scheduling, audio continuity and default-promotion requirements.
+
+Both variants now pass build, QMP smoke, timestamp and disassembly checks. One
+matched native pair shows a substantial presentation improvement with 1-ms
+polling, with variable additional CPU cost and remaining short audio gaps. See
+[the measured comparison](../../docs/gpu-fence-timing-control.md). This remains
+a private diagnostic override; no launch default changes.

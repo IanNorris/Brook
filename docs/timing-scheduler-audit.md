@@ -1382,3 +1382,14 @@ negative control is also preserved and cleanly shut down.
 The next step is the versioned policy ABI/service/preemption integration and an
 optional EEVDF heavy-load comparison. RR remains the default; the playback-
 speedup reproduction and the full timing/SMP goal are still open.
+
+## Matched host fence cadence experiment
+
+The [matched QEMU comparison](gpu-fence-timing-control.md) retains guest
+synchronization and frozen binaries while changing host polling from 10 to
+1 ms. In one ordered pair, mixed Firefox callbacks rise roughly 5–6 to 18–21/s
+and Quake swaps roughly 8–9 to 16–18/s. Current lifecycle, native audio fault
+and runtime gates pass, but short silence reservations remain. CPU costs vary;
+this is not repeated policy acceptance. Existing worker/HDA probes are the next
+attribution step. Historical fast playback, prior runtime clamps and the full
+clock/scheduler audit remain unresolved; defaults stay unchanged.
