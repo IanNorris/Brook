@@ -1,5 +1,6 @@
 #include "scheduler.h"
 #include "irq_accounting.h"
+#include "idle_irq_accounting.h"
 #include "sched_decision_trace.h"
 #include "sched_lock_trace.h"
 #include "timer_irq_arrivals.h"
@@ -305,6 +306,29 @@ void SchedulerIrqAccountingRead(IrqAccountingSnapshot* output){
         o.attempts=__atomic_load_n(&c.attempts,__ATOMIC_RELAXED);o.successes=__atomic_load_n(&c.successes,__ATOMIC_RELAXED);
         o.deferred=__atomic_load_n(&c.deferred,__ATOMIC_RELAXED);o.ifErrors=__atomic_load_n(&c.ifErrors,__ATOMIC_RELAXED);
         o.staleTicketWaits=__atomic_load_n(&c.staleTicketWaits,__ATOMIC_RELAXED);
+    }
+}
+
+static bool g_idleIrqAccountingCoalesce=false;
+struct alignas(64) IdleIrqAccountingCounters {
+    uint64_t coalesced=0,lateSamples=0,fallbacks=0,identityErrors=0,ifErrors=0,lateWatchTicks=0;
+    uint64_t lateNoNext=0,lateDispatch=0;
+};
+static IdleIrqAccountingCounters g_idleIrqAccountingCounters[SCHED_MAX_CPUS]{};
+void SchedulerIdleIrqAccountingMode(bool enabled){
+    __atomic_store_n(&g_idleIrqAccountingCoalesce,enabled,__ATOMIC_RELEASE);
+}
+void SchedulerIdleIrqAccountingRead(IdleIrqAccountingSnapshot* output){
+    if(!output)return;
+    *output={};output->enabled=__atomic_load_n(&g_idleIrqAccountingCoalesce,__ATOMIC_ACQUIRE);
+    output->cpus=SmpGetCpuCount();if(output->cpus>SCHED_MAX_CPUS)output->cpus=SCHED_MAX_CPUS;
+    for(unsigned cpu=0;cpu<output->cpus;++cpu){
+        const auto& c=g_idleIrqAccountingCounters[cpu];auto& o=output->cpu[cpu];
+#define IDLE_IRQ_COPY(field) o.field=__atomic_load_n(&c.field,__ATOMIC_RELAXED)
+        IDLE_IRQ_COPY(coalesced);IDLE_IRQ_COPY(lateSamples);IDLE_IRQ_COPY(fallbacks);
+        IDLE_IRQ_COPY(identityErrors);IDLE_IRQ_COPY(ifErrors);IDLE_IRQ_COPY(lateWatchTicks);
+        IDLE_IRQ_COPY(lateNoNext);IDLE_IRQ_COPY(lateDispatch);
+#undef IDLE_IRQ_COPY
     }
 }
 
@@ -2227,6 +2251,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
     if (!g_schedulerRunning)
         return;
     const uint64_t timerScheduler=timerProbe?TimerWakeTimingNow():0;
+    IdleIrqAccountingPending idleAccounting;
 
     {
         const uint32_t runtimeCpu=ThisCpu();
@@ -2234,9 +2259,20 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
         const bool runtimeCurrent=local!=nullptr;
         const bool runtimeIdle=local==g_perCpu[runtimeCpu].idleProcess;
         bool acquired=false;uint64_t runtimeFlags=0;
+        const bool coalesceEnabled=__atomic_load_n(&g_idleIrqAccountingCoalesce,__ATOMIC_ACQUIRE);
+        if(IdleIrqAccountingContext(coalesceEnabled,runtimeCpu,periodicTimer,allowPreempt,
+                                   reinterpret_cast<uintptr_t>(local),
+                                   reinterpret_cast<uintptr_t>(g_perCpu[runtimeCpu].idleProcess))){
+            __asm__ volatile("pushfq; pop %0" : "=r"(runtimeFlags) :: "memory");
+            if(runtimeFlags&0x200)IrqAccountingIncrement(g_idleIrqAccountingCounters[runtimeCpu].ifErrors);
+            else if(idleAccounting.Begin(coalesceEnabled,runtimeCpu,periodicTimer,allowPreempt,
+                    reinterpret_cast<uintptr_t>(local),
+                    reinterpret_cast<uintptr_t>(g_perCpu[runtimeCpu].idleProcess),runtimeFlags))
+                IrqAccountingIncrement(g_idleIrqAccountingCounters[runtimeCpu].coalesced);
+        }
         const bool mayDefer=IrqAccountingMayDefer(__atomic_load_n(&g_irqAccountingTry,__ATOMIC_ACQUIRE),
             runtimeCpu,periodicTimer,allowPreempt,runtimeCurrent,runtimeIdle);
-        if(mayDefer){
+        if(!idleAccounting.active && mayDefer){
             auto& counts=g_irqAccountingCounters[runtimeCpu];
             __asm__ volatile("pushfq; pop %0" : "=r"(runtimeFlags) :: "memory");
             // Timer entry has IF=0. Unexpected enabled interrupts retain the
@@ -2255,7 +2291,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
                 IrqAccountingIncrement(acquired?counts.successes:counts.deferred);
             }
         }
-        if(!mayDefer || (runtimeFlags&0x200)){
+        if(!idleAccounting.active && (!mayDefer || (runtimeFlags&0x200))){
             // Classify the same captured admission inputs, not a later task
             // snapshot. These are diagnostic names, never admission choices.
             const char* site="irq-accounting-blocking";
@@ -2284,9 +2320,10 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
             if(stages)stages->accountedNs=TimerWakeTimingNow();
             SchedLockRelease(g_readyLock, runtimeFlags);
         }else if(stages)stages->accountedNs=stages->acquiredNs;
-        // Failure touched no ledger/policy/watch state. Continue all existing
+        // Deferral touched no ledger/policy/watch state. Continue all existing
         // housekeeping; a later successful sample or ownership boundary catches
-        // up elapsed-minus-steal service. Missing watch ticks are not idle.
+        // up elapsed-minus-steal service. A coalesced idle sample is mandatory
+        // below, including no-next dispatch. Missing watch ticks are not idle.
     }
 
     const uint64_t timerRuntime=timerProbe?TimerWakeTimingNow():0;
@@ -2391,6 +2428,27 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
     else if(periodicTimer)TryBlockedWakeScan(cpu);
 
     Process* cur = g_perCpu[cpu].currentProcess;
+    if(idleAccounting.active){
+        // AP housekeeping cannot voluntarily switch. Verify rather than assume
+        // that invariant. Keep IF clear through validation and the IRQ tail;
+        // an unexpected enabled IF is a failed candidate gate, not a new mode.
+        uint64_t flags;__asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+        cpu=ThisCpu();cur=g_perCpu[cpu].currentProcess;
+        if(!idleAccounting.Matches(cpu,reinterpret_cast<uintptr_t>(cur),
+                                  reinterpret_cast<uintptr_t>(g_perCpu[cpu].idleProcess),flags)){
+            auto& counts=g_idleIrqAccountingCounters[idleAccounting.cpu];
+            IrqAccountingIncrement(counts.fallbacks);
+            if(flags&0x200)IrqAccountingIncrement(counts.ifErrors);
+            if(cpu!=idleAccounting.cpu || reinterpret_cast<uintptr_t>(cur)!=idleAccounting.identity ||
+               cur!=g_perCpu[cpu].idleProcess)IrqAccountingIncrement(counts.identityErrors);
+            // Charge the actual current ledger owner, never the earlier pointer
+            // by assumption. Ownership changes themselves retain their flushes.
+            const uint64_t fallbackFlags=SchedLockAcquire(g_readyLock,"irq-idle-accounting-fallback");
+            RuntimeChargeLocked(cpu,RuntimeNow(cpu));
+            SchedLockRelease(g_readyLock,fallbackFlags);
+            idleAccounting.Finish();
+        }
+    }
     if (!cur)
         return;
 
@@ -2413,7 +2471,22 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
     if (cur == g_perCpu[cpu].idleProcess)
     {
         uint64_t rlf7 = SchedLockAcquire(g_readyLock,"irq-idle-dispatch");
+        const bool coalescedIdleSample=idleAccounting.active;
+        if(coalescedIdleSample){
+            RuntimeChargeLocked(cpu,RuntimeNow(cpu));
+            auto& counts=g_idleIrqAccountingCounters[idleAccounting.cpu];
+            IrqAccountingIncrement(counts.lateSamples);
+            if(g_readyLatency.Enabled()){
+                g_readyLatency.WatchTick(cpu,ReadyWatchTick::Idle,interruptedRip,cur->pid,cur->incarnation);
+                IrqAccountingIncrement(counts.lateWatchTicks);
+            }
+            idleAccounting.Finish();
+        }
         Process* next = PickNextLocked(cpu);
+        if(coalescedIdleSample){
+            auto& counts=g_idleIrqAccountingCounters[idleAccounting.cpu];
+            IrqAccountingIncrement(next?counts.lateDispatch:counts.lateNoNext);
+        }
         uint32_t readyN = g_schedOps->ReadyCount(g_schedState);
         if (next)
         {

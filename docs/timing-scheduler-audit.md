@@ -11,8 +11,12 @@ Later evidence supersedes several early leads:
   outside that interval and cannot exclude earlier waits. Refined context labels
   subsequently identify a complete 19.981-ms periodic AP-idle accounting wait
   inside poor audio progression. A default-off idle-accounting coalescing
-  contract now preserves the later blocking dispatch acquisition and mandatory
-  ownership-boundary flush; it remains unimplemented and unaccepted.
+  candidate preserves the later blocking dispatch acquisition and mandatory
+  ownership-boundary flush. All 70 host suites and the native build pass;
+  same-kernel eager/coalesced/eager pressure remains badly underfed and does
+  not justify promotion. A separate branch/lifecycle control exercises both
+  next/no-next outcomes and shared AP wake scans with clean accounting and
+  ownership gates. Defaults stay unchanged.
 
 - [Direct OSS eight/one/eight-vCPU controls](direct-oss-smp-pressure.md)
   reproduce poor loaded audio progress without Quake rendering. One vCPU

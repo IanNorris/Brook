@@ -1,4 +1,5 @@
 #include "irq_accounting.h"
+#include "idle_irq_accounting.h"
 #include "dsp_producer_timing.h"
 #include "syscall_timing.h"
 #include "sched_decision_trace.h"
@@ -3787,6 +3788,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
             "  sched irq-accounting try|blocking|status - experimental AP accounting deferral\n"
+            "  sched irq-idle-accounting on|off|status - experimental idle sample coalescing\n"
             "  timer peers on|off|reset|status - per-CPU timer arrivals (default off)\n"
             "  sched timing on|off|reset|status - ready-queue latency (default off)\n"
             "  sched timing watch PID - target wake/queue timing; 0 clears target\n"
@@ -4300,6 +4302,19 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         for(unsigned cpu=0;cpu<s.cpus;++cpu){const auto& c=s.cpu[cpu];BridgeReply r;if(cpu)r.text(",");r.text("{");r.field("cpu",cpu);
             r.text(",");r.field("attempts",c.attempts);r.text(",");r.field("successes",c.successes);r.text(",");r.field("deferred",c.deferred);
             r.text(",");r.field("potential_watch_ticks_skipped",c.deferred);r.text(",");r.field("if_errors",c.ifErrors);r.text(",");r.field("stale_ticket_waits",c.staleTicketWaits);r.text("}");r.send();
+        }DebugChannelSend("]}\n");
+    }
+    else if(NetStrEq(cmd,"sched irq-idle-accounting on") || NetStrEq(cmd,"sched irq-idle-accounting off") || NetStrEq(cmd,"sched irq-idle-accounting status")){
+        if(NetStrEq(cmd,"sched irq-idle-accounting on"))SchedulerIdleIrqAccountingMode(true);
+        if(NetStrEq(cmd,"sched irq-idle-accounting off"))SchedulerIdleIrqAccountingMode(false);
+        IdleIrqAccountingSnapshot s{};SchedulerIdleIrqAccountingRead(&s);BridgeReply header;
+        header.text("{\"enabled\":");header.text(s.enabled?"true":"false");
+        header.text(",\"scope\":\"default off; periodic AP idle only with IF=0; samples under existing blocking idle-dispatch hold before pick; mandatory outgoing flush retained; moved sampling may omit transient errors and does not repair earlier clamps; idle watch observation moves later; cumulative saturating counters, independently read rows; reject saturated counts; disable and drain in-flight handlers before checking coalesced=late_samples+fallbacks and late_samples=late_no_next+late_dispatch\",\"cpus\":[");header.send();
+        for(unsigned cpu=0;cpu<s.cpus;++cpu){const auto& c=s.cpu[cpu];BridgeReply r;if(cpu)r.text(",");r.text("{");r.field("cpu",cpu);
+            r.text(",");r.field("coalesced",c.coalesced);r.text(",");r.field("late_samples",c.lateSamples);
+            r.text(",");r.field("fallbacks",c.fallbacks);r.text(",");r.field("identity_errors",c.identityErrors);
+            r.text(",");r.field("if_errors",c.ifErrors);r.text(",");r.field("late_watch_ticks",c.lateWatchTicks);
+            r.text(",");r.field("late_no_next",c.lateNoNext);r.text(",");r.field("late_dispatch",c.lateDispatch);r.text("}");r.send();
         }DebugChannelSend("]}\n");
     }
     else if(NetStrEq(cmd,"sched lock-trace on") || NetStrEq(cmd,"sched lock-trace off") ||

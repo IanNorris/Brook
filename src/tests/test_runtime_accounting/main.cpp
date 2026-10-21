@@ -4,6 +4,7 @@
 #include <thread>
 #include <vector>
 #include "../../kernel/src/irq_accounting.h"
+#include "../../kernel/src/idle_irq_accounting.h"
 #include "../../kernel/src/runtime_accounting.h"
 namespace {
 int failures=0;
@@ -379,6 +380,91 @@ int main() {
         for(unsigned i=1;i<=16;++i)debt.Sample(0,at(1100+i,300+2*i));
         CHECK(debtHistory.Read(0,&h) && h.allFrozen && !h.caughtUp && !h.baselineLost);
         CHECK(debt.Read(1,1,false,&value) && value==0);
+    }
+    {
+        using brook::IdleIrqAccountingPending;
+        unsigned eligible=0;
+        for(bool enabled:{false,true})for(unsigned cpu:{0u,1u,63u,64u})
+        for(bool periodic:{false,true})for(bool user:{false,true})
+        for(uintptr_t current:{uintptr_t(0),uintptr_t(1),uintptr_t(2)})
+        for(uintptr_t idle:{uintptr_t(0),uintptr_t(1),uintptr_t(2)})for(uint64_t flags:{0ull,0x200ull}){
+            IdleIrqAccountingPending pending;
+            if(pending.Begin(enabled,cpu,periodic,user,current,idle,flags)){
+                ++eligible;CHECK(pending.Matches(cpu,current,idle,flags));
+                // A second begin (including a runtime off) cannot overwrite an
+                // in-flight IRQ's owner. Every changed late invariant rejects.
+                CHECK(!pending.Begin(false,0,false,true,0,0,0x200));
+                CHECK(pending.Matches(cpu,current,idle,flags));
+                CHECK(!pending.Matches(cpu^1,current,idle,flags));
+                CHECK(!pending.Matches(cpu,current+1,idle,flags));
+                CHECK(!pending.Matches(cpu,current,idle+1,flags));
+                CHECK(!pending.Matches(cpu,current,idle,0x200));
+                pending.Finish();CHECK(!pending.Matches(cpu,current,idle,flags));
+            }else CHECK(!pending.active);
+        }
+        CHECK(eligible==4); // two APs, two non-null equal identities, IF clear
+
+        // Exercise the actual ledger, not arithmetic substitutes. Idle samples
+        // move across housekeeping; readiness can appear or remain absent.
+        // Each task has its own CPU, and both threads share a process clock.
+        RuntimeAccounting<8,3> eager,coalesced;
+        for(auto* ledger:{&eager,&coalesced}){
+            CHECK(ledger->Register(1,11,1,11));CHECK(ledger->Register(2,22,1,11));
+            ledger->Dispatch(1,0,0,at(1000));ledger->Dispatch(2,0,0,at(1000));
+        }
+        uint64_t wall=1000,steal=0,expected[3]{};
+        for(unsigned tick=1;tick<=1000;++tick){
+            for(unsigned cpu=1;cpu<=2;++cpu){
+                IdleIrqAccountingPending pending;
+                CHECK(pending.Begin(true,cpu,true,false,100+cpu,100+cpu,0));
+                CHECK(eager.Sample(cpu,at(wall+1000,steal+20))==0);
+                const bool ready=(tick+cpu)%3!=0;
+                CHECK(pending.Matches(cpu,100+cpu,100+cpu,0));
+                CHECK(coalesced.Sample(cpu,at(wall+1100,steal+30))==0);
+                pending.Finish();
+                if(ready){
+                    eager.Dispatch(cpu,cpu,cpu==1?11:22,at(wall+1200,steal+40));
+                    coalesced.Dispatch(cpu,cpu,cpu==1?11:22,at(wall+1200,steal+40));
+                    eager.Dispatch(cpu,0,0,at(wall+2000,steal+80));
+                    coalesced.Dispatch(cpu,0,0,at(wall+2000,steal+80));
+                    expected[cpu]+=760;
+                }
+                eager.Sample(cpu,at(wall+3000,steal+100));
+                coalesced.Sample(cpu,at(wall+3000,steal+100));
+                uint64_t a=0,b=0;
+                CHECK(eager.Read(cpu,cpu==1?11:22,false,&a) && coalesced.Read(cpu,cpu==1?11:22,false,&b));
+                CHECK(a==b && a==expected[cpu]);
+            }
+            CHECK(eager.Diagnostics().idleNs==coalesced.Diagnostics().idleNs);
+            CHECK(eager.Diagnostics().chargedNs==coalesced.Diagnostics().chargedNs);
+            uint64_t group=0;CHECK(coalesced.Read(1,11,true,&group) && group==expected[1]+expected[2]);
+            wall+=3000;steal+=100;
+        }
+        CHECK(coalesced.Diagnostics().idleNs+coalesced.Diagnostics().chargedNs==2*1000*2900);
+        CHECK(!coalesced.Diagnostics().invalidSamples && !coalesced.Diagnostics().staleIdentity && !coalesced.Diagnostics().clampedService);
+
+        // A moved sample can miss an eager-only transient invalid read. Retain
+        // that diagnostic difference; it is not an invalid-clock repair.
+        RuntimeAccounting<4,2> transientEager,transientLate;
+        for(auto* ledger:{&transientEager,&transientLate}){CHECK(ledger->Register(1,1,1,1));ledger->Dispatch(1,0,0,at(100,10));}
+        transientEager.Sample(1,{});transientLate.Sample(1,at(200,20));
+        for(auto* ledger:{&transientEager,&transientLate}){ledger->Dispatch(1,1,1,at(210,20));ledger->Sample(1,at(310,30));}
+        CHECK(transientEager.Diagnostics().invalidSamples==1 && transientLate.Diagnostics().invalidSamples==0);
+        uint64_t value=0;CHECK(transientLate.Read(1,1,false,&value) && value==90);
+        CHECK(transientEager.Read(1,1,false,&value) && value==90);
+
+        // Faults at the late sample still use the ledger's real unknown-interval
+        // and floor rules. Mandatory dispatch samples never reset them by fiat.
+        for(unsigned fault=0;fault<3;++fault){
+            RuntimeAccounting<4,2> ledger;CHECK(ledger.Register(1,1,1,1));ledger.Dispatch(1,0,0,at(200,20));
+            ledger.Sample(1,fault==0?brook::RuntimeSample{}:fault==1?at(190,20):at(210,40));
+            ledger.Dispatch(1,1,1,at(220,40));ledger.Sample(1,at(300,50));
+            CHECK(ledger.Read(1,1,false,&value) && value==70);
+            CHECK(ledger.Diagnostics().idleNs==0 && !ledger.Diagnostics().staleIdentity);
+            CHECK(fault!=0 || ledger.Diagnostics().invalidSamples==1);
+            CHECK(fault!=1 || ledger.Diagnostics().backwardsWall==1);
+            CHECK(fault!=2 || ledger.Diagnostics().clampedService==1);
+        }
     }
     std::printf("RUNTIME_ACCOUNTING %s\n",failures?"FAIL":"PASS");
     return failures?1:0;

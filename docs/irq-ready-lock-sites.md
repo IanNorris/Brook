@@ -162,9 +162,9 @@ the snapshots. The earlier failed off source on `34ac8f8a…` remains failed.
 
 ## Narrow candidate contract
 
-The next proposed experiment is **default-off coalescing of periodic AP-idle
-accounting**, leaving idle dispatch blocking. It is not implemented or accepted
-by this capture. The purpose is to remove one redundant ready-lock acquisition
+The next experiment implements **default-off coalescing of periodic AP-idle
+accounting**, leaving idle dispatch blocking. Host tests and the native build
+pass. Native accounting/lifecycle checks pass; loaded audio acceptance fails. The purpose is to remove one redundant ready-lock acquisition
 per eligible idle AP tick; it does not eliminate the later acquisition or every
 possible convoy.
 
@@ -195,8 +195,9 @@ The candidate must satisfy the following before native acceptance:
   no-next/next and intervening-ready cases, steal changes, pending bookkeeping
   and shared wake scans. Test actual invalid/backwards/clamp handling and
   preserve every observed failed runtime gate.
-- Removing a sample can omit a transient invalid input or correction seen by
-  eager sampling. Do not promise identical diagnostics for different sample
+- Moving the initial sample later can omit a transient invalid input or correction
+  seen by eager sampling. The ordinary tick still takes a late sample and, when
+  dispatching, the mandatory outgoing sample; fewer total samples are not promised. Do not promise identical diagnostics for different sample
   sequences, or treat fewer detected clamps as a repair. Preserve the ledger's
   semantics for every sample actually taken.
 - Keep idle-watch tick coverage explicit if its observation moves to the late
@@ -207,3 +208,112 @@ The candidate must satisfy the following before native acceptance:
 
 Neither this design nor a passing narrow control changes the scheduler default,
 clears earlier clock-clamp failures or completes the broader timing goal.
+
+## Candidate implementation and validation boundary
+
+`sched irq-idle-accounting on|off|status` controls new admissions only; it is
+off at boot. Each eligible IRQ owns a local pending token. Late CPU, idle-owner
+and IF checks precede the existing blocking idle-dispatch hold; mismatches take
+ordinary blocking accounting against the actual current owner and increment
+fallback/error counters. Every fallback or IF/identity error fails acceptance.
+Disabling the flag does not cancel an admitted token. Counters saturate and
+are read independently: native validation must disable admission, drain work
+and require stable reconciled rows, with positive AP exposure and zero BSP
+coalescing. Flag-off alone does not prove in-flight handlers have retired.
+
+The existing timer-stage `runtimeDeferred` observation now includes coalesced
+idle accounting. Its early `accountingNs` stage excludes the moved work, which
+falls in the later remainder; it cannot serve as an unchanged accounting-cost
+comparison. Idle-watch observations also move to the late hold.
+`late_watch_ticks` counts enabled watch calls, not accepted watched-task samples.
+
+All 70 host suites pass, including exhaustive admission/token checks and actual
+ledger conservation across idle/task boundaries, no-next/next outcomes, steal
+and invalid/backwards/clamp cases. These tests do not execute the scheduler's
+housekeeping wiring, pending requeues or retirement paths; native integration
+and lifecycle checks remain necessary. The kernel links through both generated
+symbol passes, the independently regenerated table matches, and all thirteen
+preserved modules resolve against 109 exports at ABI 34. The ignored
+`idle-accounting-frozen` capsule uses kernel SHA-256
+`b215f9ace49f23ed577d114e7422d1b7259e8f62dc810427f335d45aea0bff9c`;
+only the kernel and symbol table differ from the preserved module capsule.
+
+The same-kernel eager/coalesced pair keeps history and lock recording
+off, original 12-KiB HDA lead, MLFQ/AP try, eight vCPUs and finite direct OSS
+pressure. Exact drain, useful loaded progress, final runtime/policy/ownership
+and filesystem checks are separate gates. The results below do not justify promotion, and
+no defaults change.
+
+## Native coalescing experiment
+
+Three private eager/coalesced/eager boots use the same `b215f9ac…` kernel,
+original thirteen modules and pressure protocol above. Both bounded lock and
+runtime-history recorders stay off. All complete audio-query host brackets
+and WAV captures are inside the actual execution interval of every host worker.
+
+| Mode | Loaded nominal completion / guest second | Finite source | vCPU host execution over roughly 19.8 s |
+| --- | ---: | --- | ---: |
+| Eager a | Unavailable after stream failure | EPIPE at 16.948 guest s, 654,720 frames submitted | 7.19 CPU-s |
+| Coalesced a | 0.09524 | Exactly 1,764,000 frames drain in 57.920 guest s | 8.98 CPU-s |
+| Eager b | 0.03269 | Exactly 1,764,000 frames drain in 58.901 guest s | 11.24 CPU-s |
+
+The first eager stream disappears between endpoint queries. Its missing rate
+is **not zero measured progress**; the failed original job exits 1 with complete
+output, empty group and original identity verified. Its report is preserved.
+Both successful sources finish exact four-fragment drains and leave no stream.
+All three final runtime, policy/ledger, heap and IRQ IF/stale-ticket checks pass.
+All original VM owners exit zero and all twelve filesystem checks pass.
+
+The coalesced run records **381,605** admitted idle tokens and exactly as many
+late samples. Every AP has positive exposure; CPU 0 has none. Three stable
+disabled snapshots reconcile with zero fallback, identity or IF errors. This
+shows the intended path ran, but playback remains badly underfed. Its WAV stores
+1.454 seconds of PCM across a 6.054-second host capture; approximately 38% of
+stored millisecond bins are quiet. Packet decoding fits pitch near 1× and source
+progression around 0.688 source seconds per stored PCM second. WAV omits some
+inactive delivery intervals, so this fit is not physical-host playback tempo.
+Same-symbol runs separated by gaps need not indicate replay.
+
+The bounded sample supports **no promotion as an audio fix**. It does not
+quantify a general improvement or causal overhead from three variable runs.
+Removing an acquisition does not remove later blocking dispatch, AP-user or
+nonperiodic waits, and it does not clear historical accelerated playback or
+earlier EEVDF clamp failures. Raw evidence is under
+`build/reviews/unattended-idle-accounting-{off-a,on-a,off-b}-20261021`;
+`reboot-resume/summarize-idle-accounting.py` independently checks and reduces
+original jobs, mode exposure, counter reconciliation, native gates, observed
+host overlap and original VM/filesystem ownership into
+`build/workloads/timing-scheduler-20261021/idle-accounting-summary.json`.
+
+## Native branch and lifecycle coverage
+
+A subsequent build adds only two cumulative branch counters: `late_no_next`
+and `late_dispatch`, updated after `PickNextLocked` under the existing hold,
+only when that IRQ consumed a coalesced token. Its separately frozen kernel is
+`12eb6d3ac07f4359699eca0ea4260fab6f1ece0c7ad3be3707f2a8a9d558dfeb`;
+this is **not** the kernel used for the pressure table. Both symbol passes and
+the independent table/import checks pass, as does the affected host ledger suite.
+
+One private native boot exercises quiet idle phases, bounded CPU-clock waves
+with one/eight processes and two fresh threads each, and 24 CPU workers plus
+four periodic sleepers for eight seconds. It toggles coalescing off/on while
+work is live and runs optional shared wake scanning, then restores BSP mode.
+Both original workload jobs finish with complete output, joined/reaped groups
+and verified identity. Native snapshots record:
+
+- **179,061** late samples with no next task and **3,929** with a task selected.
+- **182,990** total tokens, equal to both late samples and the two outcomes' sum.
+- Positive admission on every AP, none on CPU 0, with zero fallback/identity/IF
+  errors and unsaturated counters after three stable disabled snapshots.
+- **90** completed AP wake scans, demonstrating actual shared-mode execution.
+
+Final runtime, policy/ledger, IRQ and heap gates pass after job/report drain.
+The original VM owner exits zero and all four filesystems pass. This exercises
+real housekeeping across wake, exit, join and retirement workloads. It does not
+prove every pending-requeue/retirement interleaving, force mode-off at a specific
+in-flight instruction, test enabled idle-watch coverage, establish general
+starvation bounds or restore useful loaded audio. The feature remains off.
+Evidence lives under
+`build/reviews/unattended-idle-accounting-lifecycle-on-a-20261021/idle-lifecycle`,
+with `build/workloads/timing-scheduler-20261021/idle-accounting-lifecycle-summary.json`
+including original VM and filesystem gates.
