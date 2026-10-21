@@ -1056,3 +1056,64 @@ An unfenced acknowledgement is not by itself a GPU-execution fence. Such an
 experiment would not restore a permanently nonresponsive device or prove
 transparent recovery of arbitrary DRM/Venus operations; those broader recovery
 requirements remain open.
+
+
+### Audio goal: preserve original approximately 4K buffers (2026-10-22)
+
+The user explicitly requires smooth playback with unmodified applications and
+original approximately 4K buffers. The earlier larger-buffer tests are diagnostic
+probes, not the proposed fix or a default to promote. Preserve truthful source
+completion and the current HDA safety guard while investigating why ordinary
+refills miss it. Audio stutter and playback-tempo correctness are now explicit
+goal requirements in addition to the GPU work.
+
+The unfinished opt-in late-vertex recovery experiment is preserved separately
+on local branch `wip/late-vertex-recovery-20261022` (`a9486a7a`). Its build and
+86 hosted suites pass, but native injection has not run, and dirty texture
+content can be acknowledged before recovery in BeginFrame. That content-refresh
+hole and fresh upload/compose/flush coverage must be addressed before claiming
+recovery. The active branch is restored to the committed ownership guard;
+no experimental recovery is enabled. `build/release` contains the WIP binary,
+so use a named frozen capsule or rebuild without any live QEMU before staging.
+
+The private `unattended-firefox-refill-gpu-1ms-fixed-mlfq-a-20261022/` review name
+predates the user's baseline clarification. Its actual workload is the installed
+original Quake wrapper/config: capacity 4096, fragment/readiness 1024, HDA lead
+3072 frames, same SDL backend and MLFQ policy. No application buffering override
+is used. A first 12-second diagnostic request was rejected by the bridge's
+10-second limit before capture; its finally block restored probes off. The
+resumed controller observes the exact same guest job, collecting distinct
+plain/diagnostic/plain intervals before successful original job/VM exit and
+four passing filesystem checks. See `quake-default4096-refill/capture-retry/`.
+
+Plain six-second captures before/after diagnostics contain 1.438/1.429 seconds
+of exact stereo-zero runs of at least 32 frames. Source completions are about
+33,443/33,529 frames per guest second; the diagnostic interval is about 33,544.
+These do not measure decoded musical tempo. The diagnostic PCM contains 2.402
+seconds of zeros in 10.040 seconds; HDA records 146 silence reservations totaling
+434,688 bytes (2.464 seconds), with zero invalid-clock/position/unsafe counters.
+Control and PCM boundaries differ, so this is not exact sample reconciliation.
+The after-control source counter bracket lasts 6.538 guest seconds while its PCM
+lasts 5.981 seconds; do not treat them as identical windows.
+
+During the aggregate diagnostic, 1065 mixer cycles have maximum sleep 13.483 ms,
+maximum nominal wake lateness lower bound 3.483 ms and maximum service 8.447 ms.
+No mixer cycle meets the 20-ms slow threshold. In contrast, the producer has a
+97.625-ms maximum gap between completed write brackets, maximum write duration
+1.907 ms, zero backpressure time and zero write errors. Top records are selective;
+the gaps include code outside writes, syscall tails and instrumentation, not
+pure scheduler latency. This supports tracing the producer's intervening syscalls
+and ready-queue timing next rather than attributing the interval to large mixer
+wake delays. Retain the uninstrumented controls when assessing probe overhead.
+
+Astra's source review also identifies a conditional zero-margin cycle: with a
+single 4096-frame endpoint refilled only in full 1024-frame chunks, eligibility
+can begin when outstanding source reaches 3072 frames. Without prior reserved
+silence, physical pending cannot exceed that source, leaving no margin beyond
+the unchanged HDA lead for subsequent production/publication delay. Previously
+reserved silence changes that relationship. Determine whether the app enters
+write early enough for prefix acceptance or waits outside it; do not manufacture
+completion credit, silently enlarge the buffer, or lower the guard on this
+argument alone. The next controlled trace should target the actual producer
+PID/incarnation and distinguish sleeping, ready-queue delay and time inside
+ioctls/write, with capacity and app configuration fixed.
