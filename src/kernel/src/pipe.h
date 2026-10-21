@@ -12,6 +12,9 @@
 namespace brook {
 
 struct Process;  // forward declaration for waiter
+struct PipePollNode;
+struct PipeBuffer;
+void PipePollNotify(PipeBuffer* pipe, uint32_t events);
 
 // Kernel pipe buffer — ring buffer with reader/writer reference counts.
 // Blocking read/write via SchedulerBlock() when buffer is empty/full.
@@ -37,6 +40,13 @@ struct PipeBuffer
     // pipes leave these false. Shutdown must never release a live pipe's refs.
     bool unixReadShutdown = false;
     bool unixWriteShutdown = false;
+
+    // Poll subscriptions own storage-only holds; these do not keep an endpoint
+    // open or suppress EOF. The list and destruction state use lock.
+    PipePollNode* pollWaiters = nullptr;
+    uint64_t pollHolds = 0;
+    uint64_t pollSequence = 0;
+    bool destroyPending = false;
 
     // Waiter processes (set before blocking, cleared on wake)
     Process* volatile readerWaiter = nullptr;
@@ -114,6 +124,7 @@ struct PipeBuffer
         head = (head + len) % capacity;
 
         SpinLockRelease(&lock);
+        if (len) PipePollNotify(this, 1);
         return len;
     }
 
@@ -142,6 +153,7 @@ struct PipeBuffer
         tail = (tail + len) % capacity;
 
         SpinLockRelease(&lock);
+        if (len) PipePollNotify(this, 4);
         return len;
     }
 };
@@ -166,12 +178,43 @@ static inline PipeBuffer* PipeBufferCreate(uint32_t capacity)
     return pipe;
 }
 
-static inline void PipeBufferDestroy(PipeBuffer* pipe)
+static inline void PipeBufferFree(PipeBuffer* pipe)
 {
     if (!pipe) return;
     if (pipe->data)
         kfree(pipe->data);
     kfree(pipe);
+}
+
+// Callers must own a live endpoint or storage hold when acquiring another hold.
+static inline void PipeBufferHold(PipeBuffer* pipe)
+{
+    SpinLockAcquire(&pipe->lock);
+    // Corrupted/wrapped ownership must never make live storage reclaimable.
+    if (pipe->pollHolds == ~0ULL) __builtin_trap();
+    ++pipe->pollHolds;
+    SpinLockRelease(&pipe->lock);
+}
+
+static inline void PipeBufferDrop(PipeBuffer* pipe, bool destroy = false)
+{
+    SpinLockAcquire(&pipe->lock);
+    if (!pipe->pollHolds) __builtin_trap();
+    --pipe->pollHolds;
+    if (destroy) pipe->destroyPending = true;
+    const bool release = pipe->destroyPending && !pipe->pollHolds;
+    SpinLockRelease(&pipe->lock);
+    if (release) PipeBufferFree(pipe);
+}
+
+static inline void PipeBufferDestroy(PipeBuffer* pipe)
+{
+    if (!pipe) return;
+    SpinLockAcquire(&pipe->lock);
+    pipe->destroyPending = true;
+    const bool release = !pipe->pollHolds;
+    SpinLockRelease(&pipe->lock);
+    if (release) PipeBufferFree(pipe);
 }
 
 void PipeReleaseEnd(PipeBuffer* pipe,bool writer);

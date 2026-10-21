@@ -479,3 +479,88 @@ flush timeline with explicit client, surface and callback identity. A protocol
 event queued and a flush attempt are not proof of delivery to the client.
 Only after attributing this residual should we consider combining capture
 and present into a transactional job or allowing more owned GPU submissions.
+
+### Shared Unix-socket poll notification (2026-10-21)
+
+The next experiment followed a more specific clue: the three same-kernel
+completion-wake controls all had median SDL completion intervals near 50 ms,
+with actual SDL swap interval zero. `PollWait` has a 50 ms fallback and stored
+connected Unix-socket pollers in the ordinary single `readerWaiter` slot.
+`scripts/workloads/poll_shared_socket.py` keeps a byte unread until all pollers
+return, reverses thread launch order, and compares shared, separate and single
+socket endpoints. Entry markers are observation bounds, not proof of kernel
+registration. These are elapsed times including scheduling, not CPU costs.
+
+On the checked baseline, one of two shared-socket pollers returned promptly
+and the other returned about 22–23 ms after the write. With three pollers, two
+were delayed about 17–22 ms. Single/separate endpoints returned promptly.
+The Linux two-poller control woke both promptly. Sources, raw writer timestamp
+bounds and results are retained under `unattended-poll-reader-control-gpu-1ms-
+fixed-mlfq-a-20261021/poll-reader-probe/` and
+`reboot-resume/poll-readers-linux-control.json` in the ignored experiment tree.
+
+The candidate gives each poll operation exact subscriptions, separate from
+ordinary blocking readers/writers and the existing epoll slot. Registrations
+retain the process and buffer storage without incrementing open endpoint
+counts, so they preserve EOF. Allocation failure unwinds exact registrations
+before legacy hooks are installed. Notification snapshots monotonically
+ordered subscription identities and takes process references across unlocked
+wakeups; no registration pointer survives unlock. A notifier also retains
+storage when the last subscriber unregisters during its wake. Cleanup uses
+saved backend identity rather than looking up a reused numeric descriptor.
+The 50 ms fallback is unchanged. Listening sockets, pipe-backed epoll and
+other legacy descriptor hooks are outside this patch's scope.
+
+The first candidate private VM removes the shared-endpoint delay: all two-
+and three-poller observations return within about 1.05 ms after the write.
+The same 600-record uncapped Quake diagnostic takes 13.557 s between observed
+markers, versus 22.562–25.182 s in the recent controls. After the same first
+50 swaps are excluded, SDL completion rate is 44.393/s, median interval
+22.037 ms and p95 32.933 ms, versus about 24–27/s and a median near 50 ms.
+These are guest-clock swap observations, not physical scanout or normal-speed
+audio acceptance, and this initial before/after is not an independent host-
+load-controlled statistical trial.
+
+The reconciled candidate interval includes 6.581 s inside SDL swap: 2.643 s
+inside DRM and 3.938 s residual. Between swaps contributes 7.321 s, of which
+DRM is bounded at 5.086–5.307 s after preserving a 0.222 s shutdown-tail bound.
+The reduction is chiefly the inside-swap non-DRM residual, previously about
+15–18 s. All 668 actual SDL interval queries return zero. Probe quality,
+original VM/controller exits, heap, runtime counters and four offline disk
+checks pass; raw traces are checked against hashes recorded before shutdown.
+Evidence: `unattended-poll-reader-fixed-gpu-1ms-fixed-mlfq-a-20261021/`.
+
+The candidate passes all 82 hosted suites. Its subscription tests execute the
+actual registration, notification and destruction implementation under real
+competing threads, including repeated/overlapping notification, exact removal,
+merged interests, backend replacement, allocation failure, identity exhaustion
+and last-subscriber destruction during notification. ASan/UBSan passes. These
+hosted tests do not execute the complete `PollWait` admission body; the native
+socket reproduction exercises that integration. Desktop/GL/Vulkan validation
+and repetition remain required before a broader performance claim.
+
+The subsequent fresh-image desktop/GL/Vulkan cohort also finishes cleanly
+(`unattended-poll-reader-loaded-gpu-1ms-fixed-mlfq-a-20261021/`). Representative
+Quake, cube and vkmark horse captures show no obvious corruption; this is not
+pixel-golden or frame-by-frame validation. Quake's separately controlled normal
+demo reaches 35.535 SDL completions/s in the retained compositor-trace window,
+versus the previous roughly 21–22/s controls. Its compositor body has median
+5.992 ms and p95 9.070 ms. Summed exclusive body shares are about 61.0% fence
+wait, 21.0% command-lock wait, 8.4% acknowledgement wait and 5.4% queue setup;
+command construction itself is about 0.03%. More frequent work now increases
+whole-QEMU CPU use to approximately 0.991 cores (previously about 0.77), so the
+throughput gain does not mean lower absolute CPU use.
+
+Vkcube's compositor body median/p95 is 5.071/8.011 ms, with approximately
+0.724 cores of whole-QEMU cost. Vkmark reports 38 FPS (vertex, 26.316 ms) and
+39 FPS (texture, 25.641 ms), approximately the earlier 37–38 FPS baseline
+rather than the Quake-sized improvement. Its compositor body median/p95 is
+6.034/10.958 ms, whole-QEMU cost about 0.871 cores. Empty-desktop body median
+is 2.591 ms with an 18.147 ms start-to-start median; this trial does not show
+an empty-desktop speedup. Quake minimize/restore applied-state acknowledgements
+are 170/130 ms and vkcube 334/132 ms; these include bridge round trips and
+are not input-to-photon measurements. All app exits, runtime counters, heap
+checks and four offline filesystem checks pass. Quake raw swap data is
+hash-checked after shutdown. An additional fresh baseline/candidate comparison
+remains useful given historical host-environment variability. Scheduler
+promotion and unresolved timing/audio findings remain outside these passes.

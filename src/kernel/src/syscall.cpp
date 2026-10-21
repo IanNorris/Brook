@@ -442,6 +442,8 @@ static void WakeProcess(Process* proc)
     SchedulerUnblock(proc);
 }
 
+#include "pipe_poll.inc"
+
 static void SyncFileRef(SyncFileData* file) { __atomic_fetch_add(&file->references,1,__ATOMIC_RELAXED); }
 static void SyncFileUnref(SyncFileData* file) { if(__atomic_fetch_sub(&file->references,1,__ATOMIC_ACQ_REL)==1)kfree(file); }
 
@@ -1486,6 +1488,7 @@ static inline void PipeWakeEpollRaw(PipeBuffer* pipe)
 void PipeReleaseEnd(PipeBuffer* pipe, bool writer)
 {
     if (!pipe) return;
+    PipeBufferHold(pipe);
     // Finish every access before surrendering this endpoint. An opposite-end
     // closer cannot destroy the object while we still hold its lock/reference.
     SpinLockAcquire(&pipe->lock);
@@ -1501,7 +1504,8 @@ void PipeReleaseEnd(PipeBuffer* pipe, bool writer)
     bool destroy = __atomic_load_n(&pipe->readers, __ATOMIC_ACQUIRE) == 0 &&
                    __atomic_load_n(&pipe->writers, __ATOMIC_ACQUIRE) == 0;
     SpinLockRelease(&pipe->lock);
-    if (destroy) PipeBufferDestroy(pipe);
+    PipePollNotify(pipe, 1 | 4);
+    PipeBufferDrop(pipe, destroy);
 }
 
 // The receiver owns delivery, even while the sender still references the
@@ -1584,6 +1588,7 @@ static inline void PipeWakeEpoll(PipeBuffer* pipe)
 {
     if (!pipe) return;
     SpinLockAcquire(&pipe->lock);PipeWakeEpollRaw(pipe);SpinLockRelease(&pipe->lock);
+    PipePollNotify(pipe, 1 | 4);
 }
 
 static void UnixShutdownDirection(PipeBuffer* pipe, bool writer)
@@ -1599,6 +1604,7 @@ static void UnixShutdownDirection(PipeBuffer* pipe, bool writer)
     if(waitingWriter) WakeProcess(waitingWriter);
     PipeWakeEpollRaw(pipe);
     SpinLockRelease(&pipe->lock);
+    PipePollNotify(pipe, 1 | 4);
 }
 
 // Linux poll/epoll bits share these values. Closed directions remain ready:
@@ -8575,6 +8581,41 @@ retry_poll:
         uint64_t waiterCap = nfds;
         uint64_t safetyMs = 50;
         TimerWaitGroup timerWaiters;
+        PipePollGroup pipeWaiters;
+        // Allocate pipe subscriptions before installing legacy wait hooks, so
+        // ENOMEM unwinds only RAII-owned exact registrations, never stale hooks.
+        for (uint64_t i = 0; i < waiterCap; ++i) {
+            if (fds[i].fd < 0) continue;
+            FdRef fde_ref(proc, fds[i].fd);
+            FdEntry* fde = fde_ref.get();
+            if (!fde) continue;
+            if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* pb = static_cast<PipeBuffer*>(fde->handle);
+                if (!(fde->flags & 1)) // read end
+                    if (!pipeWaiters.add(pb, self, POLLIN)) return -ENOMEM;
+            }
+            if (fde->type == FdType::DevTty && fde->handle && (fds[i].events & POLLIN))
+            {
+                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
+                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
+                if (!pipeWaiters.add(rp, self, POLLIN)) return -ENOMEM;
+            }
+            if (fde->type == FdType::UnixSocket && fde->handle)
+            {
+                auto* usd = static_cast<UnixSocketData*>(fde->handle);
+                if ((fds[i].events & POLLIN) &&
+                    usd->state == UnixSocketData::State::Connected && usd->rxPipe)
+                {
+                    if (!pipeWaiters.add(usd->rxPipe, self, POLLIN)) return -ENOMEM;
+                }
+                if ((fds[i].events & POLLOUT) &&
+                    usd->state == UnixSocketData::State::Connected && usd->txPipe)
+                {
+                    if (!pipeWaiters.add(usd->txPipe, self, POLLOUT)) return -ENOMEM;
+                }
+            }
+        }
         for (uint64_t i = 0; i < waiterCap; i++)
         {
             if (fds[i].fd < 0) continue;
@@ -8584,37 +8625,17 @@ retry_poll:
             if (fde->type == FdType::TimerFd && fde->handle && (fds[i].events & POLLIN))
                 timerWaiters.add(static_cast<TimerFdData*>(fde->handle), self);
             if (fde->type == FdType::DevDsp) safetyMs = 5; // Cached DMA readiness has no IRQ waiter yet.
-            if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
-            {
-                auto* pb = static_cast<PipeBuffer*>(fde->handle);
-                if (!(fde->flags & 1)) // read end
-                    pb->readerWaiter = self;
-            }
             if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN))
                 InputAddWaiter(self);
-            if (fde->type == FdType::DevTty && fde->handle && (fds[i].events & POLLIN))
-            {
-                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
-                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
-                rp->readerWaiter = self;
-            }
             if (fde->type == FdType::Socket && fde->handle)
             {
                 int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
                 brook::SockSetPollWaiter(sockIdx, self);
             }
-            if (fde->type == FdType::UnixSocket && fde->handle)
-            {
+            if (fde->type == FdType::UnixSocket && fde->handle) {
                 auto* usd = static_cast<UnixSocketData*>(fde->handle);
-                if ((fds[i].events & POLLIN) &&
-                    usd->state == UnixSocketData::State::Connected && usd->rxPipe)
-                    usd->rxPipe->readerWaiter = self;
-                else if ((fds[i].events & POLLIN) &&
-                         usd->state == UnixSocketData::State::Listening)
+                if ((fds[i].events & POLLIN) && usd->state == UnixSocketData::State::Listening)
                     usd->epollWaiter = self;
-                if ((fds[i].events & POLLOUT) &&
-                    usd->state == UnixSocketData::State::Connected && usd->txPipe)
-                    usd->txPipe->writerWaiter = self;
             }
             if (fde->type == FdType::EventFd && fde->handle)
             {
@@ -8698,34 +8719,13 @@ retry_poll:
             FdRef fde_ref(proc, fds[i].fd);  // BRO-156: pin across handle deref
             FdEntry* fde = fde_ref.get();
             if (!fde) continue;
-            if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
-            {
-                auto* pb = static_cast<PipeBuffer*>(fde->handle);
-                if (!(fde->flags & 1) && pb->readerWaiter == self)
-                    pb->readerWaiter = nullptr;
-            }
-            if (fde->type == FdType::DevTty && fde->handle && (fds[i].events & POLLIN))
-            {
-                auto* pair = static_cast<TtyDevicePair*>(fde->handle);
-                auto* rp = static_cast<PipeBuffer*>(pair->readPipe);
-                if (rp->readerWaiter == self)
-                    rp->readerWaiter = nullptr;
-            }
             if (fde->type == FdType::UnixSocket && fde->handle)
             {
                 auto* usd = static_cast<UnixSocketData*>(fde->handle);
                 if ((fds[i].events & POLLIN) &&
-                    usd->state == UnixSocketData::State::Connected && usd->rxPipe &&
-                    usd->rxPipe->readerWaiter == self)
-                    usd->rxPipe->readerWaiter = nullptr;
-                if ((fds[i].events & POLLIN) &&
                     usd->state == UnixSocketData::State::Listening &&
                     usd->epollWaiter == self)
                     usd->epollWaiter = nullptr;
-                if ((fds[i].events & POLLOUT) &&
-                    usd->state == UnixSocketData::State::Connected && usd->txPipe &&
-                    usd->txPipe->writerWaiter == self)
-                    usd->txPipe->writerWaiter = nullptr;
             }
             if (fde->type == FdType::EventFd && fde->handle)
             {

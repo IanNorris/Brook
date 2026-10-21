@@ -9,6 +9,7 @@
 #include "../../kernel/src/pipe.h"
 
 namespace brook {
+void PipePollNotify(PipeBuffer*, uint32_t) {}
 enum class FdType { Pipe, Other };
 struct FdEntry { FdType type=FdType::Pipe; void *handle=nullptr; uint64_t seekPos=0; unsigned flags=1, statusFlags=1; };
 struct Process { uint64_t wakeupTick=0; SpinLock fdLock{}; };

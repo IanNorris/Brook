@@ -25,6 +25,9 @@
 #include "pipe.h"
 #include <chrono>
 
+// These tests exercise FD ownership and pipe I/O, without a scheduler.
+namespace brook { void PipePollNotify(PipeBuffer*, uint32_t) {} }
+
 using brook::FdEntry;
 using brook::FdType;
 using brook::FdClaimResult;
