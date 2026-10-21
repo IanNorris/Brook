@@ -541,3 +541,52 @@ and awaits the user's classification. Available probe defaults are verified off;
 commands absent at that revision are explicitly retained as unavailable. The
 current working branch remains separate and unchanged by bisect checkout.
 `historical-regression-bisect.json` and the saved bisect log retain this state.
+
+
+### First candidate reproduces fast media at normal clock rate
+
+At `044678fa`, the user reports Quake at approximately 10 FPS, music fast but
+without stutter, and the game demo faster than intended. Firefox/YouTube also
+plays video and audio fast, with normal pitch/faster tempo and a higher reported
+dropped-frame rate than the historical successful run. This is a distinct audio
+state from the latest kernel's slow/stuttering output. The rendering bisect marks
+this candidate bad on the user FPS criterion only; it does not identify a first
+bad commit for all audio symptoms.
+
+`q2-fast-capture` retains a clean two-second profile (1,594 samples, 7,242
+switches, zero drops) and 265,306 stereo PCM frames during a 6.004-second host
+window (6.016 seconds of nominal samples). Around that interval, the same cached
+stream identity/epoch advances its native completed-frame counter by 378,960.
+The host brackets are 6.643–6.723 seconds; the KVM-backed audio clock advances
+6.682889 seconds, bounding its rate to **0.9940–1.0060x**. The completed-frame
+counter advances **1.2781–1.2935x** nominal 44.1-kHz progression. The counter is
+not itself decoded source progression, sample pitch, or proof of physical output.
+
+A separate bounded guest helper measures actual userspace clocks between
+independent host HTTP brackets. Python realtime/monotonic, libc/vDSO and raw
+syscall realtime/monotonic/raw/coarse clocks, plus raw gettimeofday, all have
+bounds enclosing 1x (approximately 0.9897–1.0160x). The requested two-second sleep
+is not assumed accurate: its actual host brackets are 2.539–2.606 seconds.
+The same original guest job exits zero with complete output/no live tasks, and
+its private local HTTP service is shut down. This particular reproduction does
+not show a global userspace/KVM clock speedup or justify blaming LAPIC calibration.
+An app-specific calculation or another timing path remains possible.
+
+`firefox-fast-capture` retains a deliberately shorter 500-ms profile to avoid
+the previous browser overflow: 402 samples, 12,762 switches, zero dropped events.
+Its six-second PCM capture has 265,711 frames. Same-identity stream 49/epoch 7
+completes 407,769 frames across host brackets 6.635–7.183 seconds, bounding
+counter progression to **1.2873–1.3937x** nominal. The bounds remain wide because
+the read-only RPC itself can wait; they are not narrowed using its midpoint.
+Normal-pitch fast tempo and this device/clock split support investigating source
+content skips/device progression, including the independently known HDA timer
+mode discard behavior, rather than claiming a resampling or global clock error.
+They do not by themselves prove a decoded track speed or a causal video clock.
+All captures leave the display unpaused and preserve the speaker route.
+
+The next rendering candidate is
+`01334a6a628e411a4cc120c6b4a1f38e74e2cb21` (20 October 06:09 BST), selected by git
+bisect in its separate checkout. Current guest artifacts are frozen private
+copies, so selecting source does not change that running VM. No build or staging
+starts before its handback. Audio and rendering observations remain separate
+in `historical-regression-bisect.json` and the saved bisect log.
