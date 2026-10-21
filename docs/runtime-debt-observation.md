@@ -184,3 +184,73 @@ Evidence is under
 `build/reviews/unattended-reservation-service-mlfq-a-20261021/mixed-prefix-control/`,
 including `debt-history-replay.json`, `cleanup-history-cpu-3.json`,
 `regression-fixture-check.json` and `regression-host-test.log`.
+
+## Reusable history replay and early-arm follow-up
+
+`scripts/workloads/replay_runtime_history.py` promotes the private checker to
+a reusable diagnostic. Run it on a stopped export containing
+`cleanup-history-off.json`, `cleanup-history-cpu-N.json` for every captured CPU,
+and `runtime-final.json`:
+
+```sh
+python3 scripts/workloads/replay_runtime_history.py REVIEW/mixed-prefix-control \
+  --arm-review REVIEW --output REVIEW/mixed-prefix-control/debt-history-replay.json
+python3 scripts/test_replay_runtime_history.py
+```
+
+The optional arm review contains `early-history-arm.json` (the acknowledged
+RPC result) and `early-runtime-after-arm.json`. The checker verifies the same
+recording epoch across arm and export. If the arm snapshot has zero lifetime
+clamps, a subsequent lifetime clamp must have a matching retained trigger.
+An earlier lifetime clamp is reported separately rather than pretending the
+new epoch captured it. Do not run the checker with Python `-O`.
+
+The reference tracks consumed steal, separately from the kernel's service
+floor. At each retained clock sample it deducts the lesser of elapsed wall
+time and outstanding published steal, carrying the remainder forward. Owner
+events retain the last raw pair and charge nothing. Every charge and idle
+credit after the first retained row must match, including across ownership
+changes. The first row is an unverified seed; overwritten prefixes, incomplete
+post-trigger tails and whole-run runtime failures remain visible. Invalid or
+backwards samples, lost baselines, inconsistent epochs, ordering, identity,
+trigger/catchup or freeze metadata are rejected. No per-task attribution or
+host publication timing can be proved from this bounded export alone.
+
+Eight focused tests exercise a hand-calculated clamp/owner/partial-recovery/
+catchup sequence, deliberately incomplete tails, unverified seed credit,
+preexisting lifetime clamps and corrupted evidence. The original positive
+native capture above also replays successfully through the reusable checker;
+five mutations of its actual charge, owner clock, epoch, preceding raw pair
+and catchup metadata are rejected. The three-clamp runtime failure is preserved.
+
+Two additional private runs arm the existing recorder at the first confirmed
+debug RPC, before the ordinary policy/workload preflights. The boot shell's
+`sched` command only switches policy, so it cannot arm this debug recorder.
+Repeated `on` is idempotent while enabled; neither run resets or re-arms the
+epoch during cleanup. Both arm snapshots report zero lifetime clamps and all
+eight CPUs covered. Neither reproduces a clamp:
+
+| Review suffix | Workload | Retained replay | Limitation |
+| --- | --- | --- | --- |
+| `early-runtime-history-1ms-fixed-mlfq-a` | Full eight mixed Firefox/Quake/load windows and browser loop | 512 rows, no clamp | History enabled throughout; not pooled with performance controls |
+| `early-runtime-history-1ms-fixed-mlfq-b` | Eight guest processes with two clock-probe threads each; 12 finite host CPU workers | 512 rows, no clamp | Complete guest-job host bracket outlasts host workers; not a fully loaded acceptance run |
+
+Both names have the full prefix/suffix `unattended-…-20261021` under
+`build/reviews/`. They use the unchanged pipe-fixed frozen kernel and optional
+MLFQ, 1-ms host GPU fence polling and 1-ms host audio timer. Those are diagnostic
+settings, not promoted defaults. In the short pressure run the nominal
+six-second child waves span about 16.3 guest seconds because child startup is
+staggered; the complete original job takes about 27.1 host seconds. Host load
+lasts 20 seconds and overlaps only part of that bracket. Sixteen thread reports
+pass monotonicity/sleep/CPU-time checks, but this does not repair the failed
+whole-job overlap gate. The earlier fully overlapping pressure result remains
+separate evidence.
+
+The mixed run's nine original jobs, full browser/media transfer and loop,
+geometry transitions, heap/policy, runtime/native-fault and filesystem checks
+pass. The pressure run's probe and report-export jobs, original host workers,
+heap and filesystem checks pass. Both original controllers and VM owners exit
+zero; all four filesystems per run check cleanly. Early history remains an
+additional enabled probe even where the eight ordinary heavy probes are off.
+These negative captures do not clear any earlier failed runtime gate. Further
+broad recurrence hunts are unnecessary without a new discriminating hypothesis.

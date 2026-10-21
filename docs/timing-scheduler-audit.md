@@ -139,6 +139,11 @@ Later evidence supersedes several early leads:
   regression preserves its intermediate debts and 44,619-ns final credit.
   Runtime acceptance remains failed; the mechanism capture does not prove true
   per-task host-steal attribution or waive historical gates.
+  The [reusable history checker and early-arm follow-up](runtime-debt-observation.md#reusable-history-replay-and-early-arm-follow-up)
+  preserve that failed gate, validate charge/owner/trigger evidence, and reject
+  corrupted native captures. Two early-arm runs remain negative; the short
+  pressure run has only partial host-load overlap. Neither is a performance
+  control or a reason to continue broad recurrence hunts.
 
 - [Guarded shared-prefix batching](audio-shared-prefix.md) has a narrow positive
   off/on/off control: enabled finite-source completion is about 0.95 nominal
