@@ -1881,3 +1881,38 @@ transfers, plus an error-free browser loop. They are recorded separately in
 replacement passing `verification.json` is created. Raw traces, rational clock
 vertices and joined records are in `host-wake-analysis.json`, with executed
 sources retained alongside the review. Defaults remain unchanged.
+
+### Compact clock sampling and connection latency
+
+`clock sample` returns `{"ns":...}` from `KvmClockReadStableNs`, or an explicit
+`{"error":"stable clock unavailable"}`. It never substitutes IRQ-count time.
+The read occurs before formatting/sending the reply. The command is an on-demand
+diagnostic with no periodic hooks, new module exports or scheduling changes.
+
+Native validation on frozen kernel
+`d9765b358b222fc3c439847bed1f9d4e66658132aab66d3ad30b38ccbf2c8dfc`
+checks sixteen strictly increasing replies against origin-correct before/after
+`clock status` bounds. Both native build passes, an independently regenerated
+symbol table and all thirteen old modules/109 imports pass. The unavailable-clock
+branch is explicit in source; this KVM-native check exercises the available path.
+
+A fresh-connection comparison disproves reply-size dominance on the quiet
+desktop: median compact and `audio stats` RPCs are both about 508 ms. A subsequent
+single framed connection takes 370.541 ms for its warmup, then sixteen sequential
+compact samples have median 3.669 ms and maximum 5.025 ms. Each sample retains
+its own send→complete-frame host bracket; no midpoint is substituted. Warmup
+is excluded from the clock anchors, not silently subtracted from other RPCs.
+This is transport evidence, not proof of clock accuracy at a sub-RPC scale or
+workload performance under load. Fresh connection/teardown delay remains a
+separate transport issue.
+
+Evidence is retained in
+`build/reviews/unattended-reservation-host-compact-mlfq-b-20261021/`, including
+`compact-clock-native-check.json` and `compact-clock-warm-check.json`.
+The preceding review-a smoke test correctly rejected the old kernel accidentally
+selected by an unmatched launcher substitution; it ran no workload and shut down
+with its original owner exit zero/four clean filesystems. The corrected launcher
+checks the expected new hash before staging. A host-trace follow-up now uses
+four warmed compact samples before and after each selected phase, retaining
+warmup records and the two ordinary audio snapshots separately. Playback and
+the full timing/scheduler goal remain unaccepted.

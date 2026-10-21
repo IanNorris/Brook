@@ -3790,6 +3790,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio contributions on|off|reset|status - accepted native mix contributions (default off)\n"
             "  audio coalesce on|off|reset|status - experimental HDA 12-KiB refill grace (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
+            "  clock sample - compact stable pvclock nanoseconds, or explicit error\n"
             "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
             "  sched irq-accounting try|blocking|status - experimental AP accounting deferral\n"
             "  sched lock-yield on|off|status - bounded owner hint (default off; requires lock-owner)\n"
@@ -4058,6 +4059,18 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     }
     else if (NetStrEq(cmd, "heap check")) {
         DebugChannelSend(HeapCheckIntegrity() ? "heap integrity: OK\n" : "heap integrity: CORRUPT\n");
+    }
+    else if (NetStrEq(cmd, "clock sample")) {
+        // Compact reply for host/guest probes on a warmed connection. Clients
+        // bracket actual command/reply; connection latency is not clock precision.
+        // Failure is explicit; IRQ-count time is not a stable-ns substitute.
+        uint64_t ns = 0;
+        if (!KvmClockReadStableNs(&ns)) {
+            DebugChannelSend("{\"error\":\"stable clock unavailable\"}\n");
+        } else {
+            BridgeReply reply;
+            reply.text("{"); reply.field("ns", ns); reply.text("}\n"); reply.send();
+        }
     }
     else if (NetStrEq(cmd, "clock status")) {
         const auto clock = ApicGetClockSnapshot();
