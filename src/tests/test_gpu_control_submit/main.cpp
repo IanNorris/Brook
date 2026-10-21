@@ -238,20 +238,54 @@ bool CmdRespOk(const GpuCommandStorage& storage,uint32_t len) {
 bool CmdRespOk(uint32_t len){return CmdRespOk(g_legacyCommand,len);}
 #include "../../drivers/virtio_gpu/compose_frame.inc"
 void frameFailures() {
-    for(unsigned mode=0;mode<5;++mode){
+    reset();g_drawQuadCount=1;
+    const auto inFlight=BeginCommand(g_legacyCommand,128,CMD_RESP_CAP);
+    CHECK(inFlight && !g_controlQueuePoisoned);
+    CompEndFrameDraw();
+    for(auto value:vertices)CHECK(value==0x5a);
+    CHECK(notifications==1 && g_pendingCommand==inFlight.storage);
+    complete();CHECK(FinishCommand(inFlight,limits)==sizeof(VirtioGpuCtrlHdr));
+    for(unsigned mode=0;mode<6;++mode){
         reset();frameMode=mode;frameTestActive=true;frameFlushes=buildCalls=0;
         g_drawQuadCount=g_blurBarrierCount=1;
         notifyHook=[&]{
             if(frameMode==4)return;
+            if(frameMode==5 && notifications==2){now+=5000000000ull;return;}
             complete();
             if((frameMode==2 && notifications==1) || (frameMode==3 && notifications==2))
                 reinterpret_cast<VirtioGpuCtrlHdr*>(g_pendingCommand->bytes+CMD_RESP_OFF)->type=0x1200;
         };
         CompEndFrameDraw();
         CHECK(buildCalls==1);CHECK(frameFlushes==(mode==0?1u:0u));
-        CHECK(notifications==((mode==0 || mode==3)?2u:1u));
+        CHECK(notifications==((mode==0 || mode==3 || mode==5)?2u:1u));
         CHECK(g_drawQuadCount==(mode==0?0u:1u));
-        if(mode==4){CHECK(g_controlQueuePoisoned && g_pendingCommand);}
+        if(mode==4 || mode==5){
+            CHECK(g_controlQueuePoisoned && g_pendingCommand);
+            // The next frame's vertices differ, but the timed-out transfer
+            // still owns their backing. Re-entry must not write them, rebuild
+            // a packet, or publish any new descriptors. A late used entry by
+            // itself also does not release quarantine.
+            uint8_t heldVertices[sizeof(vertices)];
+            uint8_t heldRequest[sizeof(firstBytes)];
+            uint8_t heldCompose[sizeof(secondBytes)];
+            VirtqDesc heldDescriptors[8];
+            std::memcpy(heldVertices,vertices,sizeof(vertices));
+            std::memcpy(heldRequest,firstBytes,sizeof(firstBytes));
+            std::memcpy(heldCompose,secondBytes,sizeof(secondBytes));
+            std::memcpy(heldDescriptors,descriptors,sizeof(descriptors));
+            const unsigned published=notifications,built=buildCalls;
+            g_drawQuads[0].dx+=17;g_drawQuads[0].dy+=31;
+            for(unsigned attempt=0;attempt<2;++attempt) {
+                if(attempt)complete();
+                CompEndFrameDraw();
+                CHECK(!std::memcmp(heldVertices,vertices,sizeof(vertices)));
+                CHECK(!std::memcmp(heldRequest,firstBytes,CMD_RESP_OFF));
+                CHECK(!std::memcmp(heldCompose,secondBytes,CMD_RESP_OFF));
+                CHECK(!std::memcmp(heldDescriptors,descriptors,sizeof(descriptors)));
+                CHECK(notifications==published && buildCalls==built);
+                CHECK(g_pendingCommand && g_controlQueuePoisoned);
+            }
+        }
         else {
             CHECK(!g_pendingCommand && !g_controlQueuePoisoned);
             // Retained storage/generations remain usable after a failed build,

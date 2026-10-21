@@ -2223,7 +2223,8 @@ static void CompUpdateTexture(GpuTexId t, uint32_t x, uint32_t y, uint32_t w, ui
 static void CompBeginFrame(uint32_t clearArgb)
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
-    if (!g_compReady) return;
+    if (!g_compReady || g_controlQueuePoisoned ||
+        __atomic_load_n(&g_pendingCommand,__ATOMIC_ACQUIRE)) return;
     g_compFrameAssembling = true;
     (void)clearArgb;   // see note below
     // First GPU frame: point scanout 0 at the RT (switches away from the 2D FB).
@@ -2361,7 +2362,8 @@ static void CompEndFrame()
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     FrameTimingScope phase(FramePhase::CommandBuild);
     struct FinishAssembly { ~FinishAssembly() { g_compFrameAssembling=false; } } finish;
-    if (!g_compReady) return;
+    if (!g_compReady || g_controlQueuePoisoned ||
+        __atomic_load_n(&g_pendingCommand,__ATOMIC_ACQUIRE)) return;
     if (g_drawReady && g_drawQuadCount > 0) { CompEndFrameDraw(); return; }
     if (g_composeN == 0) return;
     auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);

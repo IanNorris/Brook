@@ -1,6 +1,11 @@
 // Actual upload/preparation/draw/presentation ordering; hosted failure tests share it.
 static void CompEndFrameDraw()
 {
+    // A timed-out transfer may still read the vertex backing. Reject a later
+    // frame before writing any of it, not merely when BeginCommand rejects the
+    // next publication. The command mutex serializes this ownership check.
+    if (g_controlQueuePoisoned ||
+        __atomic_load_n(&g_pendingCommand,__ATOMIC_ACQUIRE)) return;
     FrameTimingScope phase(FramePhase::VertexUpload);
     // 1. Fill the vertex staging buffer: 4 verts/quad, {pos.xy, uv.xy, opacity}.
     //    NDC positions derived from integer pixel rects via NdcBits (no FP).

@@ -1003,3 +1003,56 @@ reference before actions, and explicitly rejects unapplied actions. Evidence:
 GPU module bytes; manifests record both hashes. An inherited old expected-hash
 guard failed before image creation/QEMU and was corrected to the exact fresh
 build hash, with the failed prelaunch receipt preserved.
+
+
+### Measured-interval repeat and timeout re-entry ownership fix (2026-10-21)
+
+The separate `unattended-reset-ack-gpu-1ms-fixed-mlfq-b-20261021/` run retains
+another host observation failure: the first controller read a missing guest
+PID while the launch was queued. The private harness now waits for published
+identity. Recovery resumes the exact original Quake request; it does not launch
+a replacement. A fresh measured interval selects the tracked client and verifies
+minimize, restore and graceful close. The original jobs and VM exit zero,
+heap/runtime checks pass with all quality counters zero, four filesystem checks
+pass, and raw SDL trace bytes/SHA match the guest receipt. Its measured SDL rate
+is 28.661 swaps per guest second; median/p95/max intervals are
+29.068/50.357/65.339 ms. Compositor body median/p95 is 11.972/25.351 ms. vkmark
+reports vertex/texture 36/33 FPS. This is a valid separately measured interval,
+not uninterrupted controller success or a matched before/after speed claim.
+The user still hears stutter with the original small Quake buffer; the private
+larger-buffer override is absent. The previous run's runtime clamps and other
+unresolved timing/audio/scheduler evidence remain open. See `native/verification.json`.
+
+Review of the timeout path finds a concrete ownership hole: after vertex upload
+timeout, `CompEndFrameDraw` could fill the same vertex backing on the next frame
+before the next command admission rejected the poisoned queue. Retaining the
+command allocation alone did not prevent this write. The actual draw body now
+rejects poison or any pending command before touching vertices; frame begin/end
+have matching guards under the existing command mutex. No automatic reuse or
+recovery is enabled by this change.
+
+Actual-body tests exercise frame entry with an outstanding request, transfer
+timeout, and fenced compose timeout. A subsequent frame and then a late used
+entry must leave vertex backing, both independent request regions and all
+descriptors unchanged, with no packet rebuild or new publication. The new test
+against a private pre-fix compose body fails its backing-mutation assertions
+(82 assertion failures, not 82 distinct bugs). With the guard, the Release build
+and all 86 hosted suites pass; after adding the separate compose-timeout case,
+the affected actual-body suite passes again. Logs and negative fixture are in
+`reboot-resume/gpu-frame-timeout-reentry-*` and `timeout-reentry-negative/`.
+These tests prove the guarded paths in the hosted fixture; native induced-timeout
+and fresh-frame recovery acceptance remain to implement. The preceding native
+run uses the reset-acknowledgement capsule, not this later ownership fix.
+
+Astra confirms the hole and the guard. A delayed validated completion can be a
+scoped transient-timeout recovery route without device reset, provided the
+original operation is reconciled before new admission. It must distinguish
+timeout from malformed/unowned completions, revalidate the pending identity and
+exact used advance/head/length/fence/context, consume once, retain uncertain
+operation-specific resources, restore the legacy builder deliberately, discard
+abandoned frame assembly and require a fresh complete frame. It must neither
+replay the failed operation nor report its abandoned return value as success.
+An unfenced acknowledgement is not by itself a GPU-execution fence. Such an
+experiment would not restore a permanently nonresponsive device or prove
+transparent recovery of arbitrary DRM/Venus operations; those broader recovery
+requirements remain open.
