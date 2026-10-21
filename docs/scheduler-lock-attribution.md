@@ -266,3 +266,74 @@ reported discontinuity, which is not a PCM-continuity or listening test. This
 live launcher displays Quake's OpenGL 1.4 renderer, not the controlled GL3
 diagnostic cohort. The raw requests, host brackets and clock reply are retained
 in `build/reviews/live-timing-baseline-20261020/audio-live-clock-observation.json`.
+
+
+## Loaded cost comparison checkpoint (21 October)
+
+The current matched capsule is kernel
+`fc41f3dbf97797d1f349754303090fee0b6e14976f8350ae717e1636a104d8bb`
+with thirteen ABI-34 modules, including vmalloc reclamation and reserved-band
+MLFQ expiry. Its complete manifest also includes the generated symbol table.
+Two preparatory attempts stopped before QEMU: the first capsule omitted that
+table; the second launcher retained an obsolete GPU-module hash. Both failures
+remain preserved. Staging now rejects a missing/empty symbol table before
+changing staged artifacts, and the corrected launcher checks every frozen
+artifact against its manifest rather than a separate historical module hash.
+
+The corrected run retains private evidence beneath
+`build/workloads/timing-scheduler-20261021/lock-cost-v3` and its source/owner plan
+in `build/workloads/timing-scheduler-20261020/lock-cost-current-v3-20261021`.
+Both trials use fresh checked disks, eight vCPUs, 6 GiB, MLFQ with IRQ-accounting
+try, synthetic Q2 music, the controlled 150-packet demo and identical diagnostic
+settings except ready-lock tracing. Twelve host workers and four periodic
+sleepers are bounded to thirty seconds on CPUs 0–13. Audio goes to a separately
+owned private null sink.
+
+| Trial | Observed demo interval | PCM during six host seconds | Runtime gate |
+| --- | ---: | ---: | --- |
+| Trace off, first | 45.211 s | 0.260 s | Pass |
+| Trace on, second | 46.262 s | 0.480 s | Fail: one service-floor clamp |
+
+The clamp is retained with identity CPU 1, PID/incarnation 15/15, at guest
+38.500 seconds, before the demo START at 45.890 seconds. Its deficit is 16,268
+ns. This is not proof that tracing caused the clamp or the playback failure.
+The runtime model explicitly handles lagging steal updates using a monotonic
+service floor; this trial does not meet the stricter zero-clamp comparison gate.
+The cohort stopped after this failure; there are no third/fourth trial results
+and no accepted enabled-cost estimate. Both original VM wrappers and the private
+audio service exited zero. Both sets of four filesystem checks and saved-data
+preservation pass. The off trial's full verifier passes while retaining failed
+audio acceptance and an HDA sample-gap fault.
+
+The on trace records 8,891,699 completions with zero reported loss, clock errors,
+partial/unknown/inconsistent retained rows, or active publishers at the final
+read. Offline decoding against the matched kernel retains 24 events and two
+conditional handoff candidates. These limited retained maxima are not a journal
+or causal proof. In particular, they do not establish the cost of disabled
+instrumentation or the cause of the historical live regression.
+
+### Regression isolation before bisection
+
+The user reports a recent regression and suspects accumulated instrumentation.
+First reproduce it with diagnostics disabled, then bisect a demonstrated
+same-workload good/bad pair. The earlier `irq-safe-frozen` build already produced
+40.370–42.813-second host-loaded demos and failed audio, so comparing those with
+a quiet approximately 15.2-second result cannot establish a new regression.
+
+Use matched checked source disks, fresh homes, the same synthetic music/demo,
+QEMU/GPU/audio backends, CPU affinity/count, RAM, policy and timer mode. Retain
+all defaults and explicitly read back disabled producer, syscall, decision,
+ready-lock, mixer, delivery, ready-watch and timer probes. Avoid sampling,
+strace, image capture and repeated status polling during the measured interval;
+collect start/end evidence after the job drains. Use separate quiet and bounded
+host-loaded cohorts, rather than mixing their scores. Repeat endpoint runs in
+alternating order before using a performance threshold for commit bisection.
+
+Compare the preserved earlier capsule and current capsule with probes disabled.
+Also compare disabled/enabled probes on the same current build to distinguish
+runtime instrumentation effects. If a repeatable same-condition build regression
+remains, bisect complete kernel/module builds in a separate worktree, preserving
+the current branch. Record each actual build identity and keep invalid runs
+unclassified; missing markers, timing faults, incomplete jobs or lifecycle
+failures must not become performance passes. A compile-time diagnostic-removal
+control is a separate experiment if disabled runtime checks remain suspect.
