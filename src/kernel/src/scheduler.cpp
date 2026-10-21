@@ -2231,9 +2231,11 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
     {
         const uint32_t runtimeCpu=ThisCpu();
         const auto* local=g_perCpu[runtimeCpu].currentProcess;
+        const bool runtimeCurrent=local!=nullptr;
+        const bool runtimeIdle=local==g_perCpu[runtimeCpu].idleProcess;
         bool acquired=false;uint64_t runtimeFlags=0;
         const bool mayDefer=IrqAccountingMayDefer(__atomic_load_n(&g_irqAccountingTry,__ATOMIC_ACQUIRE),
-            runtimeCpu,periodicTimer,allowPreempt,local!=nullptr,local==g_perCpu[runtimeCpu].idleProcess);
+            runtimeCpu,periodicTimer,allowPreempt,runtimeCurrent,runtimeIdle);
         if(mayDefer){
             auto& counts=g_irqAccountingCounters[runtimeCpu];
             __asm__ volatile("pushfq; pop %0" : "=r"(runtimeFlags) :: "memory");
@@ -2254,7 +2256,17 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
             }
         }
         if(!mayDefer || (runtimeFlags&0x200)){
-            runtimeFlags=SchedLockAcquire(g_readyLock,"irq-accounting-blocking");acquired=true;
+            // Classify the same captured admission inputs, not a later task
+            // snapshot. These are diagnostic names, never admission choices.
+            const char* site="irq-accounting-blocking";
+            if(runtimeCurrent && !(allowPreempt && runtimeIdle)){
+                if(!periodicTimer)site="irq-accounting-nonperiodic";
+                else if(runtimeCpu==0)site="irq-accounting-bsp";
+                else if(runtimeIdle)site="irq-accounting-ap-idle";
+                else if(allowPreempt)site="irq-accounting-ap-user";
+                else site="irq-accounting-ap-kernel";
+            }
+            runtimeFlags=SchedLockAcquire(g_readyLock,site);acquired=true;
         }
         if(stages){stages->acquiredNs=TimerWakeTimingNow();stages->deferred=!acquired;}
         if(acquired){

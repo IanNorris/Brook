@@ -7,6 +7,11 @@ control improves playback substantially, and returning to eight vCPUs degrades
 it again. This supports an SMP-dependent contribution; it does not identify
 a particular lock or justify changing scheduler defaults.
 
+The subsequent [timer lock-site capture](irq-ready-lock-sites.md) retains
+initial-accounting waits during poor progress, but needs a finer context label
+to distinguish AP idle from AP user execution. It does not justify changing
+idle-dispatch admission.
+
 ## Conditions and checks
 
 Three fresh private boots use the same frozen kernel and thirteen modules as

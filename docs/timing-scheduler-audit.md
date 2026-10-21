@@ -5,6 +5,13 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Timer ready-lock site attribution](irq-ready-lock-sites.md) retains complete
+  9–18-ms initial-accounting wait observations inside a loaded direct-audio
+  interval, mostly reported steal time. The bounded idle-dispatch records fall
+  outside that interval and cannot exclude earlier waits. Finer context labels
+  are built, with native classification pending; no dispatch or accounting
+  admission change follows from this capture.
+
 - [Direct OSS eight/one/eight-vCPU controls](direct-oss-smp-pressure.md)
   reproduce poor loaded audio progress without Quake rendering. One vCPU
   improves completion to roughly 0.89 nominal per guest second; the eight-vCPU
