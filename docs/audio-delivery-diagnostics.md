@@ -1829,3 +1829,55 @@ controller and original VM owner exit zero, with complete EOF/groups, full
 media hash/transfer reconciliation, error-free browser loop, four clean
 filesystems, heap/policy and current runtime/debt checks. This clean run does
 not waive the preceding two-clamp failure or establish playback acceptance.
+
+### Current workload with bounded QEMU host traces
+
+`unattended-reservation-host-mlfq-a-20261021` uses the same frozen kernel and
+physical audio path, with three bounded host-trace windows alongside the
+worker/ready/timer probes. Each trace thread is joined and all seven selected
+KVM/device events return to their original disabled state. Host task identities,
+20-ms scheduling samples, trace offsets, timestamp envelopes and six guest-clock
+RPC brackets per phase are retained. This is an instrumented diagnostic, not a
+performance control.
+
+The offline join fits all increasing affine guest→host clock models consistent
+with the RPC brackets, using exact rational bounds. It does not assume a unit
+rate or pick one midpoint offset. Synthetic checks recover an exact 1.2× clock,
+retain a known 0.99–1.01 rate range and reject inconsistent non-affine anchors.
+Realtime/monotonic translations retain the observed envelope plus microsecond
+trace quantization; an unobserved clock step is not excluded. Successful KVM
+exit→next-run intervals include handling and other host work, not one callback.
+Consecutive same-kind events remain explicit unpaired records.
+
+Nine Firefox-only and two mixed slow cycles fall wholly inside their host trace
+windows for every feasible clock model. No individual host handling interval
+has guaranteed positive overlap with those deadline→arrival gaps. Maximum
+observed CPU-0 exit→next-run durations are 2.804, 2.948 and 3.002 ms across the
+three windows; maximum traced KVM-run spans are 22.856, 43.796 and 25.169 ms.
+KVM-run spans include host-kernel time, not proof of guest execution. These
+observations do not reproduce the earlier long userspace-device/futex intervals
+or identify another cause of the current gaps.
+
+Alignment precision is the limiting measurement here: large `audio stats`
+responses leave feasible rate ranges about 0.944–1.006 and 0.938–1.006 in the
+first two windows, and broad enclosing host intervals. Those are uncertainty
+bounds, not measured clock-rate errors. Summing per-event minimum overlaps
+would not recover exact coverage. A compact stable-clock reply is the next
+instrument improvement before another host correlation run.
+
+The strict verifier fails on an HDA native sample-gap fault: successive samples
+at 226.293 and 226.480 guest seconds are 187.172 ms apart. This lies after the
+recovery capture (213.243–220.980 s) and before the reopened-Quake capture
+(244.854–251.569 s), not inside either timed audio window. Five accounting
+clamps occur in two caught-up debt episodes, with maximum debt 16,270 ns and
+three ownership crossings. Cleanup history begins later and cannot capture
+those episodes. **Native audio and runtime acceptance remain failed.**
+
+Independent unaffected checks verify all nine original jobs with complete
+EOF/empty groups, original controller/VM/server exits, four clean filesystems,
+heap/policy/load-overlap checks, full resource hashes and reconciled terminal
+transfers, plus an error-free browser loop. They are recorded separately in
+`failure-lifecycle-verification.json`; the strict gate is not bypassed and no
+replacement passing `verification.json` is created. Raw traces, rational clock
+vertices and joined records are in `host-wake-analysis.json`, with executed
+sources retained alongside the review. Defaults remain unchanged.
