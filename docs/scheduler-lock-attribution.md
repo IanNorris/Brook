@@ -393,3 +393,40 @@ user-review baseline with original game music and profiles. It uses the current
 complete capsule, eight vCPUs/8 GiB, MLFQ/try, normal host PipeWire audio, and all
 nine controls verified off. The running user review must be handed back before
 rebuilding, staging, shutdown or further automated input.
+
+
+### Disabled-path source audit during the native review
+
+This audit reads source and saved binaries only; it does not enable probes or
+send automated input to the user's review. A disabled `SyscallTimingEnter`
+returns after its epoch check, before reading clocks or acquiring the recording
+guard. Although `SyscallTimingLeave` itself performs those operations, its
+`SyscallTimingCall` destructor calls it only for an enabled ticket. Thus the
+ordinary disabled RAII path does not execute them. Ready-lock reservation checks
+its selected-lock flag and enabled state before `LockTraceNow`; release checks
+active publishers, so it can still finish an already-started observation after
+the control is disabled. That completion behavior must be preserved.
+
+Disabled diagnostics still have costs. `RuntimeDispatchLocked` clears its
+per-CPU `DecisionDispatchTiming` structure before checking the decision token on
+every dispatch. Decision-observer calls and epoch reads remain compiled in.
+The older scheduler-event ring also writes unconditionally on queue/switch
+operations. These source facts are not measurements of their native cost.
+Functional CPU-time/service accounting and KVM steal reads are not disposable
+diagnostics: MLFQ policy charging and Linux CPU-clock APIs depend on them.
+
+Saved symbol inventories also show a layout change: the earlier eight-byte
+ready lock lives in BSS; the current twelve-byte selected lock lives in data,
+adjacent to the PID allocator. This is a lead for cache-line isolation, not proof
+of false sharing or a regression. Do not attribute a workload difference to the
+probe body while overlooking compiled layout and other module changes.
+
+The retained enabled-trace maximum hold is 1.990270 ms, with 1.972981 ms reported
+steal during that observation, at `SchedulerTimerTick` on CPU 3. Its
+wall-minus-reported-steal interval is 17.289 microseconds, not exact execution
+time. This supports host descheduling while a ready-lock holder exists in that
+retained observation. It does not identify which waiter caused an audio stall,
+prove complete handoff history, or authorize a lock/yield implementation change
+without its own safety and workload checks. The hashed kernel symbol inventories
+and selected trace record are saved in
+`build/workloads/timing-scheduler-20261021/disabled-probe-audit`.
