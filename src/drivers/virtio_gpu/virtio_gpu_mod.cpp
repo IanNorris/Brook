@@ -35,6 +35,7 @@
 #include "process.h"
 #include "kvmclock.h"
 #include "completion_wait.h"
+#include "control_storage.h"
 #include "frame_timing.h"
 
 MODULE_IMPORT_SYMBOL(PciFindDevice);
@@ -164,14 +165,7 @@ static constexpr uint32_t VIRTIO_GPU_CMD_SUBMIT_3D             = 0x0207;
 // Single framebuffer resource id used for scanout 0.
 static constexpr uint32_t RESOURCE_FB = 1;
 
-struct __attribute__((packed)) VirtioGpuCtrlHdr {
-    uint32_t type;
-    uint32_t flags;
-    uint64_t fence_id;
-    uint32_t ctx_id;
-    uint8_t  ring_idx;
-    uint8_t  padding[3];
-};
+
 
 struct __attribute__((packed)) VirtioGpuRect {
     uint32_t x, y, width, height;
@@ -444,17 +438,9 @@ enum VirtioGpuConfigReg : uint32_t {
 // Virtqueue structures
 // ---------------------------------------------------------------------------
 
-struct __attribute__((packed)) VirtqDesc {
-    uint64_t addr;
-    uint32_t len;
-    uint16_t flags;
-    uint16_t next;
-};
 
-struct __attribute__((packed)) VirtqUsedElem {
-    uint32_t id;
-    uint32_t len;
-};
+
+
 
 static constexpr uint32_t MAX_QUEUE_SIZE = 64;
 
@@ -523,6 +509,7 @@ static uint64_t g_cmdBufPhys = 0;
 static constexpr uint32_t CMD_PAGES    = 16;
 static constexpr uint32_t CMD_REQ_OFF  = 0;
 static constexpr uint32_t CMD_RESP_OFF = (CMD_PAGES - 1) * 4096;
+static GpuCommandStorage g_legacyCommand;
 static constexpr uint32_t CMD_RESP_CAP = 4096;
 
 // BRO-189: the control queue + the single shared staging buffer (g_cmdBuf) are a
@@ -727,6 +714,7 @@ static bool AllocControlQueue()
     g_cmdBufPhys = cmdPhys.raw();
     g_cmdBuf     = reinterpret_cast<uint8_t*>(PhysToVirt(cmdPhys).raw());
     memset(g_cmdBuf, 0, CMD_PAGES * 4096);
+    g_legacyCommand.bytes=g_cmdBuf;g_legacyCommand.physical=g_cmdBufPhys;
 
     return true;
 }
@@ -742,84 +730,7 @@ static void NotifyControlQueue()
 // response written to g_cmdBuf+CMD_RESP_OFF. Returns the response length, or 0
 // on timeout. Synchronous poll of the used ring (no IRQs) — the display path
 // runs from the compositor thread, never an ISR.
-static uint64_t g_nextRenderFence = 0;
-static bool g_controlQueuePoisoned;
-// After uncertain completion the original DMA pages must remain untouched.
-// Public operations may still prepare requests before SubmitCommand rejects
-// them; redirect that preparation into scratch storage, never the DMA buffer.
-alignas(16) static uint8_t g_quarantinedCmdBuf[CMD_PAGES * 4096];
-static void PoisonControlQueue() {
-    g_controlQueuePoisoned = true;
-    g_cmdBuf = g_quarantinedCmdBuf;
-}
-static uint32_t SubmitCommand(uint32_t reqLen, uint32_t respCap, bool fenced = false)
-{
-    if (g_controlQueuePoisoned) return 0;
-    FrameTimingScope phase(FramePhase::QueueSetup);
-    const auto* requestHeader=reinterpret_cast<const VirtioGpuCtrlHdr*>(g_cmdBuf+CMD_REQ_OFF);
-    const bool timeline=fenced && (requestHeader->flags&2u);
-    const uint32_t expectedContext=requestHeader->ctx_id;
-    const uint8_t expectedRing=requestHeader->ring_idx;
-    uint64_t expectedFence=0;
-    if (fenced) {
-        auto* hdr = reinterpret_cast<VirtioGpuCtrlHdr*>(g_cmdBuf + CMD_REQ_OFF);
-        hdr->flags |= 1u; // VIRTIO_GPU_FLAG_FENCE
-        hdr->fence_id = expectedFence=++g_nextRenderFence;
-    }
-    FrameTimingCommand(reqLen,fenced,expectedFence);
-    uint16_t head = static_cast<uint16_t>(g_availIdxShadow % g_queueSize);
-    uint16_t d1   = static_cast<uint16_t>((head + 1) % g_queueSize);
-
-    g_descTable[head].addr  = g_cmdBufPhys + CMD_REQ_OFF;
-    g_descTable[head].len   = reqLen;
-    g_descTable[head].flags = VIRTQ_DESC_F_NEXT;
-    g_descTable[head].next  = d1;
-
-    g_descTable[d1].addr  = g_cmdBufPhys + CMD_RESP_OFF;
-    g_descTable[d1].len   = respCap;
-    g_descTable[d1].flags = VIRTQ_DESC_F_WRITE;
-    g_descTable[d1].next  = 0;
-
-    __asm__ volatile("mfence" ::: "memory");
-    g_availRing[g_availIdxShadow % g_queueSize] = head;
-    __asm__ volatile("mfence" ::: "memory");
-    *g_availIdx = ++g_availIdxShadow;
-    __asm__ volatile("mfence" ::: "memory");
-
-    NotifyControlQueue();
-
-    bool completed;
-    {
-    FrameTimingScope waitPhase(fenced?FramePhase::FenceWait:FramePhase::AckWait);
-    completed = GpuWaitForCompletion(ProcessCurrent() != nullptr,
-        [] { return *g_usedIdx != g_usedIdxShadow; },
-        [](uint64_t* ns) { return KvmClockReadStableNs(ns); },
-        [] { __asm__ volatile("pause" ::: "memory"); });
-    }
-    if (completed) {
-        __asm__ volatile("mfence" ::: "memory");
-        uint16_t slot = g_usedIdxShadow % g_queueSize;
-        uint32_t len  = g_usedRing[slot].len;
-        ++g_usedIdxShadow;
-        const auto* reply=reinterpret_cast<const VirtioGpuCtrlHdr*>(g_cmdBuf+CMD_RESP_OFF);
-        static_assert(sizeof(*reply)==brook::GpuControlHeaderBytes);
-        if (!brook::GpuControlCompletionValid(head,g_usedRing[slot].id,len,respCap,
-                                              reply->flags,reply->fence_id,expectedFence) ||
-            // QEMU10.2.2 echoes fence+context, not INFO_RING_IDX/ring_idx.
-            // The globally unique fence belongs to our single owned request.
-            (fenced && reply->ctx_id!=expectedContext)) {
-            PoisonControlQueue();
-            SerialPrintf("virtio_gpu: invalid completion head=%u/%u bytes=%u/%u flags=0x%x fence=%lu/%lu ctx=%u/%u ring=%u/%u timeline=%u; queue quarantined\n",
-                         g_usedRing[slot].id,head,len,respCap,reply->flags,reply->fence_id,expectedFence,
-                         reply->ctx_id,expectedContext,unsigned(reply->ring_idx),unsigned(expectedRing),timeline?1u:0u);
-            return 0;
-        }
-        return len;
-    }
-    PoisonControlQueue();
-    SerialPuts("virtio_gpu: command timeout; control queue quarantined\n");
-    return 0;
-}
+#include "control_submit.inc"
 
 // ---------------------------------------------------------------------------
 // GET_DISPLAY_INFO
@@ -1172,21 +1083,10 @@ static uint64_t VgpuGetFramebufferPhys() { return g_fbBackingPhys; }
 //
 // Best-effort and lock-free BY DESIGN: all other CPUs are halted, and one of
 // them may hold g_gpuCmdLock mid-present, so we must NOT take it. SubmitCommand
-// uses a bounded spin (no infinite hang) and QEMU processes avail-ring
-// descriptors in order, so the scanout→transfer→flush sequence presents
-// correctly even if an in-flight command perturbs the used-ring bookkeeping.
-static void VgpuPanicPresent()
-{
-    if (!g_fbBacking || g_fbW == 0 || g_fbH == 0) return;
-
-    // Revert scanout to the 2D framebuffer the panic was drawn into. Idempotent
-    // if it was already RESOURCE_FB (non-composite path).
-    SetScanout(0, RESOURCE_FB, g_fbW, g_fbH);
-
-    // Push the whole framebuffer to the host and scan it out.
-    TransferToHost2D(RESOURCE_FB, 0, 0, g_fbW, g_fbH, 0);
-    ResourceFlush(RESOURCE_FB, 0, 0, g_fbW, g_fbH);
-}
+// uses a bounded completion wait. Halting CPUs does not stop device DMA:
+// if a request is reserved/in flight, the queue is poisoned, or an unexpected
+// completion exists, preserve the current display rather than overwrite it.
+#include "panic_present.inc"
 
 static const brook::DisplayOps g_vgpuDisplayOps = {
     "virtio-gpu",
@@ -2440,8 +2340,9 @@ static void CompEndFrameDraw()
         v[10]=nx0; v[11]=ny1; v[12]=q.u0; v[13]=q.v1; v[14]=a;
         v[15]=nx1; v[16]=ny1; v[17]=q.u1; v[18]=q.v1; v[19]=a;
     }
-    if (g_drawQuadCount > 0)
-        TransferToHostBuffer(COMP_CTX_ID, COMP_DRAW_VBUF_RES, g_drawQuadCount * 80);
+    if (g_drawQuadCount > 0 &&
+        !TransferToHostBuffer(COMP_CTX_ID, COMP_DRAW_VBUF_RES, g_drawQuadCount * 80))
+        return; // Do not draw using stale vertices after a rejected transfer.
 
     // 2. Build the compose stream.
     phase.Change(FramePhase::CommandBuild);

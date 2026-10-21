@@ -48,5 +48,22 @@ int main() {
         [&](uint64_t* ns){*ns=clocks++ ? 1000 : 0;return true;},pause,
         GpuCompletionWaitLimits{1000,40,8}));
     assert(clocks==1);
+
+    // Split command: CPU preparation cannot restart the publication deadline.
+    clocks=pauses=0;now=100;
+    auto start=brook::GpuCompletionOrigin(true,[&](uint64_t* ns){++clocks;*ns=now;return true;});
+    now=1100;
+    assert(!brook::GpuWaitForCompletionSince(start,[]{return false;},
+        [&](uint64_t* ns){++clocks;*ns=now;return true;},pause,limits));
+    assert(clocks==2 && pauses==0);
+    assert(brook::GpuWaitForCompletionSince(start,[]{return true;},
+        [&](uint64_t*){assert(false);return false;},pause,limits));
+
+    // A failed publication clock does not silently obtain a new origin later.
+    clocks=pauses=0;
+    auto missing=brook::GpuCompletionOrigin(true,[&](uint64_t*){++clocks;return false;});
+    assert(!brook::GpuWaitForCompletionSince(missing,[]{return false;},
+        [&](uint64_t*){assert(false);return true;},pause,limits));
+    assert(clocks==1 && pauses==40);
     std::puts("GPU_COMPLETION_WAIT_PASS");
 }
