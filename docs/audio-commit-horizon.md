@@ -513,3 +513,40 @@ under `reboot-resume`. A native original→20-ms→40-ms→original explicit-geo
 comparison is prepared, keeping per-refill queries and 256-byte writes constant.
 Its write granularity differs from this model's whole-128-frame refills. The
 production planner, horizon, HDA lead and scheduler defaults remain unchanged.
+
+### Matched native reserve control
+
+Fresh review `unattended-horizon-budget-fixed-mlfq-a-20261021` explicitly requests
+original → twenty-ms → forty-ms → original geometry from the **unchanged**
+kernel. The left source keeps 256-byte writes in every arm; the right keeps
+8,192/2,048 geometry and 8-KiB writes. Both query real `GETOSPACE` before each
+refill and `GETOPTR` periodically. All source data is pregenerated, both
+endpoints are configured before release, and horizon stays on throughout.
+
+| Left geometry, frames | Decoded left / right progression per PCM second | Quiet bins, left / right |
+| --- | --- | --- |
+| Original 4,416 / 64 | 0.9563 / 0.9991 | 4.22% / 0.07% |
+| Twenty-ms 5,120 / 128 | 0.9818 / 1.0001 | 1.16% / 0.02% |
+| Forty-ms 6,016 / 128 | 1.0002 / 1.0003 | 0% / 0% |
+| Original again | 0.9679 / 0.9988 | 3.39% / 0.13% |
+
+The forty-ms arm has no accepted short/empty contributions for either stream.
+The left source loses 13,476, 3,968 and 9,620 short-contribution frames in the
+other arms' counter windows respectively; the right contributes fully in those
+windows. Counters enclose the WAV recording but are not sample-aligned to it.
+Decoded pitch fits 1.0, and stored PCM/host interval ratios are all within about
+0.1% of one. Decoder quantization and quiet-bin limits described above remain.
+
+All sixteen original producer/report-export jobs pass identity, collected exit,
+complete output and empty-group checks. Exact finite source drains, current
+HDA/delivery, runtime, heap/policy, original controller/VM exits and all four
+filesystem checks pass. This does not clear the two accounting clamps in the
+earlier real-browser cohort. Accepted-write gaps remain descriptive intervals,
+not measured eligibility-to-refill delay or a guarantee of forty-ms service.
+
+Evidence is `budget-control/summary.json` and `write-gap-analysis.json` under
+that review. Together with the enumerated hosted boundaries, the reversal
+supports a prospective time-based reserve rather than fragment size alone.
+No production negotiation, existing queue, HDA lead, horizon target or default
+has yet changed. A production planner change still requires its own geometry,
+source-integrity and real mixed-workload validation.
