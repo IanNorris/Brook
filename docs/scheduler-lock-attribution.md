@@ -932,3 +932,46 @@ Evidence is retained under
 original trace, exact-kernel offline analysis, host scheduling/context-switch
 snapshots and all original owner/lifecycle/filesystem receipts. Audio acceptance
 remains failed despite clean trace/runtime/heap and lifecycle checks.
+
+### Completion-poll instruction control
+
+A following pair changes only the GPU completion callback from PAUSE to NOP
+in an isolated module. Both capsules retain the same kernel, command KMutex,
+original 12-KiB HDA module and other modules. RR, physical callback audio with
+20-ms buffering, eight vCPUs and the verified finite host-contention setup
+remain common. Audio-service and delivery probes and the read-only host
+observer are enabled; CPU profiling and SDL swap instrumentation are off.
+
+Both runs fail audio acceptance: the mixer resumes up to 11.018 seconds late
+with PAUSE and 9.096 seconds late with NOP, and both streams record a native
+sample-gap discontinuity. Ratios crossing that discontinuity do not measure
+playback tempo. Runtime accounting records no invalid/backwards observations
+or service clamps. Original app/controller/VM owners terminate successfully;
+all four filesystem checks pass for each VM. Neither run reports a GPU
+completion timeout/quarantine or renderer error in the retained logs.
+
+Sequential per-vCPU QMP KVM snapshots cover approximately 22.53 and 22.55
+seconds. Total exits rise from 982,846 with PAUSE to 1,967,056 with NOP
+(approximately 43,625 versus 87,238 per snapshot second). This single pair
+does not establish an instruction-specific exit cause or performance gain.
+Removing PAUSE alone is insufficient to prevent the stall.
+
+The zero `directed_yield_attempted` and `directed_yield_successful` counters
+require particular care: Linux v6.12 increments them in the guest PV
+`kvm_sched_yield()` hypercall path, not the PLE path through
+`handle_pause` / `kvm_vcpu_on_spin`. Zero does not exclude PLE-directed yields.
+Likewise, `preemption_other` counts a preemption-accounting branch, not PAUSE
+exits. These aggregate statistics are not an exit-reason/guest-RIP histogram.
+See the upstream [x86 accounting implementation](https://github.com/torvalds/linux/blob/v6.12/arch/x86/kvm/x86.c)
+and [vCPU yield implementation](https://github.com/torvalds/linux/blob/v6.12/virt/kvm/kvm_main.c).
+
+Pure NOP remains diagnostic. The numeric poll cap also applies with a working
+clock; faster polling can hit it sooner than the nominal five-second timeout.
+Without a usable clock, the same cap has a different wall duration. Clock
+checks every 2,048 iterations also change their temporal frequency, and polling
+traffic/SMT competition can change. No production wait-loop or scheduler default
+is changed on this evidence.
+
+Receipts are under `build/reviews/unattended-gpu-poll-{pause,nop}-20261021`;
+the derived comparison is
+`build/workloads/timing-scheduler-20261021/gpu-poll-pressure-summary.json`.
