@@ -694,3 +694,39 @@ exit zero and four zero-exit offline fsck checks. Next selected candidate is
 `88008cdf2532ded9bccfab7956ba6c3e1ab0f6e8`. Its optional EEVDF registration
 is not evidence that the live RR-selected VM uses EEVDF; verify boot policy as
 for every earlier candidate.
+
+
+Fifth candidate `88008cdf` returns to a user-reported 13–14 FPS, with fast audio
+still present. Its requested two-second profile contains 1,598 samples, 7,658
+context switches and zero reported drops. Exact-symbol analysis has 1,307 idle
+samples, 174 inclusive GPU SubmitCommand samples and 84 command-lock spin
+samples; unmatched-scene/IRQ-bias limitations still apply.
+
+Marking this revision good for reported rendering FPS makes git bisect identify
+`31f52bb7` as the first bad revision. **This is a provisional observational
+boundary, not an established causal defect.** Its source delta stages TCP reads
+in kernel memory before fault-aware copy-out, fixing a demonstrated socket-lock
+page-fault deadlock. Offline Quake rendering has no obvious direct dependency
+on that receive path. Adjacent repeats with controlled wall-time rendering and
+matching scene/configuration must verify this unexpected boundary before any
+implementation change. Do not revert the TCP safety fix on this evidence.
+Accounting and optional EEVDF registration already exist in the observed good
+revision, while the actual policy is verified RR. Fast playback spans both sides.
+The running VM is retained pending handback; no build or staging occurs.
+
+
+### Adjacent repeat contradicts the single-pass boundary
+
+On a fresh `31f52bb7` repeat, the user manually launches Quake and reports fast
+audio but 13–14 FPS. This contradicts the earlier approximately 10-FPS result
+on that same revision. The single-pass bisect therefore does not establish a
+causal TCP regression. Keep the safety fix. Host conditions, workload/config
+matching and repeat variability still require controlled comparison.
+
+The first automated adjacent attempt is rejected. An unwritable `/data` test
+home fails before game launch; its same-VM retry uses a writable `/tmp` home
+but overlaps the user's manual game and exits with only the START marker. The
+original retry job is terminal with exit one, complete output and no live group
+tasks. Its logs are retained; no measured throughput is accepted. The separate
+manual game/VM remains running pending handback. Future unattended runs must
+verify no existing game before launching and require both markers.
