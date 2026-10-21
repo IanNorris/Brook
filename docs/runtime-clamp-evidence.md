@@ -185,3 +185,24 @@ opt-in capture of existing samples and owner transitions without changing the
 ledger's decisions. Its first native four-launch browser run verifies export
 functionality but reproduces no clamp. This negative capture does not clear
 either failed EEVDF cohort or identify the cause of their corrections.
+
+
+## Final signal-fix MLFQ follow-up
+
+The [signal/wait comparison](signal-wait-restart.md#browser-follow-up-correctness-pass-is-not-runtime-acceptance)
+adds two clamped samples on MLFQ with the final reviewed kernel. Its first
+7,682-ns deficit has wall/steal increments 58,758/66,440 ns on CPU3/PID621,
+after the second browser's pre-close snapshot and before the first finite OSS
+source. Original group/VM/filesystem gates pass independently. The baseline
+arm has no clamp; a single pair does not identify the signal fix as a cause.
+
+A repeat with existing-sample history enabled records 8,585,266 events without
+a clamp; its retained 512 rows and clean lifecycle verify. It leaves all old
+failed gates open. Equal steal values around a wall sample establish local
+consistency, not monotonicity of wall minus steal across pairs. KVM's steal
+update interval is implementation-dependent; its pinned v6.12 implementation
+adds host sched_info run_delay and processes the update before guest entry.
+That is compatible with separately maintained host accounting clocks, but does
+not prove arbitrary delayed publication while a vCPU continues executing or
+explain this particular event. No retry-until-monotonic, tolerance, floor reset
+or acceptance relaxation follows from these observations.

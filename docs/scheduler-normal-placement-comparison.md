@@ -150,7 +150,8 @@ OSS source begins. Its paired baseline has no clamps. All original job/VM and
 filesystem gates pass, but that final arm fails runtime acceptance.
 
 This later kernel comparison does not alter the earlier six-policy measurements
-or establish a scheduler-specific cause. It does mean the observed symptom is
-no longer exclusive to EEVDF. Keep both the old and new failed gates open until
+or establish a scheduler-specific cause. Earlier targeted-wakeup MLFQ and physical-output RR controls already exposed
+clamps, as recorded in [the cumulative evidence](runtime-clamp-evidence.md).
+This recurrence reinforces that cross-policy uncertainty. Keep both the old and new failed gates open until
 causal evidence explains the wall/steal correction; do not promote MLFQ on the
 basis of the older clean runs alone.

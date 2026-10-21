@@ -139,9 +139,11 @@ before the finite source, not inside its measured audio interval. No causal
 history was enabled, so it does not identify the faulty publication or prove
 that the signal change caused the failure.
 
-This is now a native **MLFQ** runtime-gate failure in addition to the older
-EEVDF failures. Those older failures remain valid; the symptom is no longer
-observed only under EEVDF. A bounded history capture is the next diagnostic,
+This is another native **MLFQ** runtime-gate failure. Earlier targeted-wakeup
+MLFQ and physical-output RR controls already had clamps; the later matched
+normal-placement study had clean MLFQ/RR cohorts and two failed EEVDF cohorts.
+All of those older failures remain valid; the latest recurrence reinforces a
+cross-policy accounting question. A bounded history capture is the next diagnostic,
 without changing clamp classification or scheduler defaults.
 
 Raw browser evidence is under
@@ -150,3 +152,13 @@ The checked reduction is
 `build/workloads/timing-scheduler-20261021/signal-browser-cohort/policy-summary.json`;
 `signal-waits/verification.json` records the unchanged probe binary, frozen
 module/kernel checks, original guest jobs and separate failed browser gate.
+
+
+The follow-up `unattended-signal-clamp-history-fixed-a-20261021` repeats two
+Firefox launches, first-launch guest CPU load and both finite sources with only
+the existing-sample history enabled. It records 8,585,266 events/6,561,854 runtime
+samples with no clamp. The stopped export retains 512 rows; per-CPU sequence,
+owner/floor continuity, fresh sample attempts/charges and total overwritten
+prefix accounting verify. Eight original guest jobs, the original VM owner and
+all four filesystem checks pass. This negative capture does not explain or
+clear any failed run and cannot establish an absence of observer effects.
