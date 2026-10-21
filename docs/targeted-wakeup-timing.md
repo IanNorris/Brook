@@ -253,3 +253,23 @@ disable expensive timer/peer/watch recording while retaining mixer timing,
 mode counters and the same bounded workload. Reversal evidence is under
 `build/reviews/unattended-q2-irq-blocking-reversal-20261021` and in the same
 derived comparison JSON. Defaults remain unchanged.
+
+The lighter-recording follow-up reverses order to try/blocking and explicitly
+verifies `timer timing`, `timer peers` and `sched timing` are all disabled.
+Mixer/delivery recording, QMP counter endpoints and the read-only host observer
+remain enabled. Try records 184.006 ms maximum mixer late resume and no native
+fault/discontinuity; blocking records 8.604 seconds and a native fault with
+discontinuity. Both have clean runtime accounting, original app/controller/VM
+exits and all filesystem checks. Expensive timer/peer/watch recording is
+therefore not necessary for this long-stall mode sensitivity; this does not
+measure the remaining probes' overhead or establish a completely uninstrumented
+result.
+
+The try run still delivers only approximately 0.100 nominal application audio
+seconds per guest-clock second during the loaded capture. It also records a
+644-ms maximum service bracket, which can include lock sleeps and host delay.
+Other HDA callers may observe the device while the mixer is delayed, so mixer
+delay alone does not determine whether the native sample-gap guard fires.
+Avoiding that fault is not continuous playback acceptance. Evidence and derived
+receipts are under `build/reviews/unattended-q2-light-{try,blocking}-20261021`
+and `build/workloads/timing-scheduler-20261021/irq-accounting-light-pressure-summary.json`.

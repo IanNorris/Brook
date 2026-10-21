@@ -62,6 +62,26 @@ Later evidence supersedes several early leads:
   mixer delays; its empty capture is explicitly rejected as a headroom test.
   Host-only and guest-only isolation now precedes any lead reduction.
 
+- [Physical-output lead controls](hda-near-empty-write-lead.md) now alternate
+  12/8/8/12-KiB publication targets on one frozen kernel. They reproduce roughly
+  0.84/1.00/1.00/0.84 nominal Quake completion per guest-clock second, consistent
+  with separately recorded reserved silence. The smaller target is still an
+  experiment: genuine sampling faults occur under verified host contention,
+  and runtime floor corrections remain explicit failed gates in some controls.
+  A launch-affinity correction invalidates earlier full-VM CPU-reservation
+  claims, without discarding their recorded functional results.
+- [Verified timer/ready attribution](targeted-wakeup-timing.md) correlates
+  multi-second mixer stalls both after dispatch bookkeeping and in the queue.
+  Existing per-CPU probes show repeated no-switch timer-handler chains with
+  long initial ready-lock-acquisition wall brackets under host pressure.
+  A blocking/try/blocking accounting-admission sequence measures worst mixer
+  lateness of 7.136/0.176/9.969 seconds, with native audio faults only in the
+  two blocking runs. Application delivery remains poor even in the try run;
+  a lighter-probe comparison and broader acceptance remain required. This is
+  mechanism attribution, not RR quantum tuning or a default-policy change.
+  [GPU poll controls](scheduler-lock-attribution.md) separately fail with both
+  PAUSE and NOP; zero KVM PV-yield counters do not exclude PLE-driven yields.
+
 RR remains the default, with no further RR tuning planned. MLFQ and EEVDF are
 optional. Remaining acceptance includes default-path and broader desktop/game
 workloads, direct EEVDF eligibility/debt evidence, timing-path retry/signal/load
