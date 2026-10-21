@@ -30,6 +30,7 @@ extern "C" brook::KernelSymbol __stop_ksymtab[];
 #include "gpu_compositor.h"
 #include "frame_timing.h"
 #include "gpu_app.h"
+#include "gpu_completion.h"
 #include "cpu.h"
 #include "tty.h"
 #include "compositor.h"
@@ -293,3 +294,7 @@ void KsymDump()
 }
 
 } // namespace brook
+
+EXPORT_SYMBOL(GpuCompletionRegister);
+EXPORT_SYMBOL(GpuCompletionEnabled);
+EXPORT_SYMBOL(GpuCompletionPause);

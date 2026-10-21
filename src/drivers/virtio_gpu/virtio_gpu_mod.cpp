@@ -18,6 +18,7 @@
 #include "display.h"
 #include "gpu_compositor.h"
 #include "gpu_app.h"
+#include "gpu_completion.h"
 #include "tty.h"
 #include "compositor.h"
 #include "memory/virtual_memory.h"
@@ -66,6 +67,9 @@ MODULE_IMPORT_SYMBOL(DisplayRegister);
 MODULE_IMPORT_SYMBOL(DisplaySet3DActive);
 MODULE_IMPORT_SYMBOL(GpuCompositorRegister);
 MODULE_IMPORT_SYMBOL(GpuAppRegister);
+MODULE_IMPORT_SYMBOL(GpuCompletionRegister);
+MODULE_IMPORT_SYMBOL(GpuCompletionEnabled);
+MODULE_IMPORT_SYMBOL(GpuCompletionPause);
 MODULE_IMPORT_SYMBOL(CpuWriteCombiningReady);
 MODULE_IMPORT_SYMBOL(TtyGetFramebuffer);
 MODULE_IMPORT_SYMBOL(TtyRemap);
@@ -4185,7 +4189,16 @@ static int VirtioGpuModuleInit()
         KPrintf("virtio_gpu: secondary head (class %02x:%02x) — not driving display\n",
                 baseClass, subClass);
     }
-    if (g_gpu3dWorks && !g_controlQueuePoisoned) GpuAppRegister(&g_gpuAppOps);
+    if (g_gpu3dWorks && !g_controlQueuePoisoned) {
+        // Queue/MMIO allocations are permanent until reboot. The kernel retains
+        // this provider before publishing its own IRQ callback. EVENT_IDX is
+        // absent from negotiated low features; interrupt waiting stays off.
+        const uint8_t irq=PciConfigRead8(dev.bus,dev.dev,dev.fn,0x3C);
+        const bool wake=GpuCompletionRegister(&g_legacyCommand,g_isrCfg,g_usedIdx,g_availFlags,
+                                              irq,(g_gpu3dFeatures&(1u<<29))!=0);
+        SerialPrintf("virtio_gpu: completion wake registered=%u irq=%u (default off)\n",wake?1u:0u,irq);
+        GpuAppRegister(&g_gpuAppOps);
+    }
     return 0;
 }
 

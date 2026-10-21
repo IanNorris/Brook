@@ -622,3 +622,120 @@ zero, four offline filesystem checks pass and raw swap traces match saved
 hashes. Evidence and exact frozen kernel/module manifests are retained in
 `unattended-upload-backing-gpu-1ms-fixed-mlfq-a-20261021/` and
 `gpu-upload-backing-frozen/` under the ignored experiment tree.
+
+
+### Experimental GPU completion IRQ waits (2026-10-21)
+
+`gpu completion wake on|off|status` controls a new kernel-owned notification
+service, off by default. It can sleep inside the existing validated control
+queue completion loop after 50 microseconds of polling. The original command
+publication deadline, exclusive command lock, used-entry validation and timeout
+quarantine remain authoritative. Notifications do not consume queue entries or
+permit more outstanding commands. A ten-millisecond safety wake bounds a missed
+notification within the original command deadline; the final submillisecond
+remains polling. Early boot, panic, interrupts disabled, pending unmasked signals
+and unsuitable process states use polling.
+
+Registration is boot-only for one device without EVENT_IDX. The provider module
+is permanently retained, and its ISR/queue mappings and device configuration
+must remain valid until reboot. Device reset, unregister and reclamation are
+not implemented. A built-in general-register-only ISR reads/clears the device
+ISR and retains a process reference before notifying outside the registration
+lock. Generation checks prevent stale waiter cleanup from removing a later
+registration. Hosted tests exercise actual wait/control bodies, notification
+races, cancellation, references, deadlines and malformed completion poisoning.
+
+The first native trial lost GPU notifications after a mode transition. QMP
+showed IRQ11 configured edge/high and still asserted while the IRQ count stopped
+increasing. This trial is retained as failed evidence in
+`unattended-completion-wake-gpu-1ms-fixed-mlfq-a-20261021/`; its original bounded
+Quake job failed and was observed to terminal state before clean shutdown.
+All four offline filesystem checks pass. It is not a successful enabled trial.
+
+A separate boot option, `-fw_cfg name=opt/irq11-level,string=1`, selects level
+triggering for this QEMU platform's shared pin 11 before its first unmask.
+Polarity and the neighboring pin are preserved. This is an explicit platform
+experiment, not general ACPI/PCI interrupt routing. Repeated unmask now preserves
+the original destination and unrelated route bits; that behavior is also a
+change without the option. Native QMP confirms pin 11 level/high/vector 50 and
+pin 10 edge/high/vector 48. Ten off/on transitions with legacy uploads and
+verified disk write/fsync/read pass, with notifications continuing and no
+persistent IRQ11 assertion in the retained post-work snapshots.
+
+The first level-route off/on/off trial nevertheless regresses performance:
+uncapped Quake marker spans are 13.470/26.276/13.577 seconds, post-warmup SDL
+rates 44.716/22.900/44.276 per second and p95 intervals 31.068/51.160/31.952 ms.
+Normal Quake whole-QEMU CPU falls from about 1.105 to 0.558 cores, while its
+steady SDL rate falls from 39.545 to 28.549 per second, recovering to 38.672
+after disabling waits. Enabled notifications reach 52,651 across the loaded
+phases; five incomplete resumes reach the safety tick. IRQ latency is measured
+from the first qualifying ISR timestamp to post-wait cleanup, not pure dispatch
+latency. Block counts measure admission attempts, and a safety expiry does not
+prove that the timer caused the wake. Original jobs and VM wrapper exit zero,
+raw swap hashes reconcile, and four offline filesystem checks pass. Evidence:
+`unattended-completion-level-gpu-1ms-fixed-mlfq-a-20261021/completion-cohort/`.
+
+This slowdown motivates a separate compositor pacing fix. A nested GPU or mutex
+wait can consume the scheduler's generic pending-wake latch before the end-frame
+wait uses it. A durable compositor work generation now survives those nested
+waits. Frame-end admission rechecks the generation and skips its fallback sleep
+when a wake occurred during that frame; scheduler admission covers a later wake.
+The skipped timer deadline is cleared. A wake may already have been serviced,
+so an extra immediate frame is intentional. Generation exhaustion fails busy
+rather than wrapping. Tests cover consumed latches, frame-end/admission races,
+saturation and concurrent publishers. All 86 hosted suites and the actual pacing
+helper under ASan/UBSan pass. Native off/on/off validation must also measure idle
+CPU: source analysis alone does not prove this explains the throughput loss.
+
+
+The next fresh native trial uses that durable generation in all three arms.
+Uncapped off/on/off marker spans are 11.952/11.816/12.076 seconds, with actual
+SDL swap interval zero throughout. Post-warmup swap rates are
+50.274/50.988/49.667 per second; p95 intervals are 25.994/25.001/25.982 ms.
+Maximum intervals remain 105.041/119.038/107.043 ms: the CPU improvement does
+not eliminate long stalls. Normal 720p Quake's separately sampled steady swap
+rates are 53.920/55.421/52.327 per second, using approximately
+1.598/1.022/1.606 whole-QEMU cores. Enabled CPU cost is about 36% lower than
+the controls while throughput is preserved. Median compositor periods are
+5.995/5.993/6.020 ms. Quake minimize/restore acknowledgements are
+202/144, 213/140 and 271/137 ms; these are applied-state round trips, not
+input-to-photon measurements.
+
+Vkmark reports 59/58/59 FPS for both vertex and texture scenes. Its separate
+frame-capture CPU windows use approximately 1.310/0.608/1.322 cores, about
+54% less when enabled, at similar six-millisecond compositor periods. The first
+enabled Vulkan capture was rejected: one invalid frame, one diagnostic-record
+contention event, zero clock failures. Its original job was observed to a clean
+terminal exit and the rejected raw measurement remains intact. An independently
+labeled retry passes the strict analyzer; it supplies the enabled Vulkan timing
+and CPU results. This is not an uninterrupted successful cohort. The recovery
+controller, original VM wrapper and all accepted workload jobs exit zero.
+
+Empty-desktop unrecorded CPU ranges overlap (about 0.24–0.33 whole-QEMU cores),
+and median frame periods remain 18–19 ms. The generation mechanism does not
+produce continuous idle rendering in these windows. Representative Quake and
+Vulkan captures show no obvious new corruption. Heap/runtime checks and four
+offline filesystem checks pass; raw Quake swap files match their saved hashes.
+Evidence is in
+`unattended-completion-generation-gpu-1ms-fixed-mlfq-a-20261021/completion-cohort/`,
+including `comparison.json`, `measurement-failure.json` and the separately
+labeled `on-a-vkmark-retry/`. The frozen kernel/module manifest is in
+`gpu-completion-generation-frozen/`.
+
+Enabled IRQ counters across the loaded phases, including both Vulkan attempts,
+record 160,186 notifications and 11 incomplete resumes that reach the safety
+tick. None of those safety expiries occurs in the uncapped or normal Quake
+phases. Mean first-ISR-to-cleanup latency is about 7.54 microseconds, cumulative
+maximum 1.640 ms, with 46 invalid latency observations excluded by the counter.
+Those safety expiries and the rejected diagnostic capture remain findings to
+investigate before default promotion. This ordered same-VM trial supports the
+lost-work pacing explanation and a CPU-saving experiment; it does not establish
+physical scanout cadence, audio acceptance, cross-platform IRQ routing or
+scheduler safety/default promotion.
+
+The remaining normal Quake compositor body is still about 59% elapsed fence
+wait, 18% command-lock wait, 13% acknowledgement wait and 4.5% queue setup when
+IRQ waits are enabled. Sleeping removes CPU spent spinning but does not remove
+those waits or the single outstanding control command. Further throughput work
+should target that serialization and command/fence frequency with the existing
+ownership and quarantine contracts intact.

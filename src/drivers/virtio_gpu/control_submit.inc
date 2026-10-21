@@ -71,13 +71,20 @@ static uint32_t FinishCommand(GpuCommandToken token,GpuCompletionWaitLimits limi
        pending->state!=GpuCommandStorageState::Published ||
        __atomic_load_n(&g_controlQueuePoisoned,__ATOMIC_ACQUIRE))return 0;
     if(g_usedIdxShadow!=pending->usedPosition){PoisonControlQueue();return 0;}
+    const bool useWake=GpuCompletionEnabled();
     bool completed;
     {
         FrameTimingScope phase(pending->expectedFence?FramePhase::FenceWait:FramePhase::AckWait);
         completed=GpuWaitForCompletionSince(pending->origin,
             []{return *g_usedIdx!=g_usedIdxShadow;},
             [](uint64_t* ns){return KvmClockReadStableNs(ns);},
-            []{__asm__ volatile("pause" ::: "memory");},limits);
+            [&]{
+                if(useWake && pending->origin.timed &&
+                   pending->origin.startNs<=~uint64_t(0)-limits.timeoutNs &&
+                   GpuCompletionPause(pending->usedPosition,pending->origin.startNs,
+                                      pending->origin.startNs+limits.timeoutNs))return;
+                __asm__ volatile("pause" ::: "memory");
+            },limits);
     }
     if(!completed){
         PoisonControlQueue();SerialPuts("virtio_gpu: command timeout; control queue quarantined\n");return 0;

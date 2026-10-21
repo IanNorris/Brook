@@ -75,8 +75,14 @@ uint64_t ApicGetLapicVirtBase();
 // Must be called before IoApicUnmaskIrq/IoApicMaskIrq.
 bool IoApicInit(uint64_t ioApicPhysical, uint32_t gsiBase);
 
-// Program an I/O APIC redirection table entry to deliver irq at vector,
-// edge-triggered, active-high, to the BSP (LAPIC ID from ApicGetId()).
+// Select an opt-in boot trigger override before first unmask through this API.
+// Caller starts from IoApicInit's masked table; direct hardware writers are outside this policy.
+// Polarity is unchanged; this is a routed pin, not a PCI nominal IRQ lookup.
+bool IoApicSelectBootLevelPin(uint8_t pin);
+
+// Program an I/O APIC redirection table entry to deliver irq at vector.
+// Defaults remain edge/high from init; boot trigger selection persists.
+// First unmask targets this BSP; subsequent unmask preserves destination.
 // irq is the ISA IRQ number (0-based from GSI base).
 extern "C" void IoApicUnmaskIrq(uint8_t irq, uint8_t vector);
 

@@ -57,3 +57,6 @@ extern "C" uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, v
 // Drop one registration. The last reference removes the handler; an empty
 // chain masks its line. Callback/unload quiescence requires external ownership.
 extern "C" void IoApicUnregisterHandler(uint8_t irq, void* handler);
+
+// Optional boot-only provider preflight; caller serializes boot registration.
+bool IoApicHandlerCapacity(uint8_t irq, void* handler);

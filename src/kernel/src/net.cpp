@@ -15,6 +15,7 @@
 #include "epoll_diagnostics.h"
 #include "audio.h"
 #include "gpu_app.h"
+#include "gpu_completion.h"
 #include "serial.h"
 #include "kprintf.h"
 #include "scheduler.h"
@@ -3792,6 +3793,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
             "  gpu frame timing on|off|reset|status|frames - bounded exclusive compositor stages\n"
+            "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
             "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio horizon on|off|reset|status - experimental guarded output target and prospective OSS geometry (default off)\n"
@@ -4309,6 +4311,24 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("invalid_clock",s.invalidClock);r.text(",");r.field("unsupported_driver",s.unsupportedDriver);
         r.text(",");r.field("late_resumes",s.lateResumes);
         r.text(",\"scope\":\"default-off fixed intel_hda 12-KiB lead experiment; one deferred opportunity, not a wall-time guarantee; recovered means ready at next preparation, not proven playback\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"gpu completion wake on") || NetStrEq(cmd,"gpu completion wake off") ||
+            NetStrEq(cmd,"gpu completion wake status")) {
+        const bool applied=NetStrEq(cmd,"gpu completion wake status") ||
+            GpuCompletionControl(NetStrEq(cmd,"gpu completion wake on"));
+        const auto s=GpuCompletionRead();BridgeReply r;r.text("{\"applied\":");r.text(applied?"true":"false");
+        r.text(",\"registered\":");r.text(s.registered?"true":"false");
+        r.text(",\"enabled\":");r.text(s.enabled?"true":"false");
+        r.text(",\"waiting\":");r.text(s.waiting?"true":"false");
+        r.text(",\"saturated\":");r.text(s.saturated?"true":"false");
+        r.text(",");r.field("irq",s.irq);r.text(",");r.field("vector",s.vector);
+        r.text(",");r.field("irq_calls",s.irqCalls);r.text(",");r.field("queue_irqs",s.queueIrqs);
+        r.text(",");r.field("notifications",s.notifications);r.text(",");r.field("waits",s.waits);
+        r.text(",");r.field("block_calls",s.blockCalls);r.text(",");r.field("ready_before_block",s.readyBeforeBlock);
+        r.text(",");r.field("incomplete_resumes",s.incompleteResumes);r.text(",");r.field("safety_expiries",s.safetyExpiries);
+        r.text(",");r.field("latency_samples",s.latencySamples);r.text(",");r.field("latency_sum_ns",s.latencySumNs);
+        r.text(",");r.field("latency_max_ns",s.latencyMaxNs);r.text(",");r.field("invalid_latency",s.invalidLatency);
+        r.text(",\"scope\":\"default-off notification experiment; IRQ never consumes completion; latency to waiter cleanup, not scanout\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"gpu scene wake on") || NetStrEq(cmd,"gpu scene wake off") ||
             NetStrEq(cmd,"gpu scene wake status")) {

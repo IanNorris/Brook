@@ -33,6 +33,10 @@ static void FrameTimingCommand(uint32_t,bool,uint64_t){}
 static void* ProcessCurrent(){return runtime?reinterpret_cast<void*>(1):nullptr;}
 static bool KvmClockReadStableNs(uint64_t*);
 static void NotifyControlQueue();
+bool eventWait=false;
+std::function<bool(uint16_t,uint64_t,uint64_t)> eventPauseHook;
+static bool GpuCompletionEnabled(){return eventWait;}
+static bool GpuCompletionPause(uint16_t used,uint64_t start,uint64_t deadline){return eventPauseHook?eventPauseHook(used,start,deadline):false;}
 static void SerialPuts(const char*){++warnings;}
 static void SerialPrintf(const char*,...){++warnings;}
 #include "../../drivers/virtio_gpu/control_submit.inc"
@@ -68,7 +72,7 @@ static void reset() {
     second.bytes=secondBytes;second.physical=0x200000;
     g_availIdxShadow=g_usedIdxShadow=usedIndex=availIndex=0;
     notifications=warnings=clocks=completeAtClock=0;now=100;
-    runtime=clockAvailable=true;completeOnNotify=false;notifyHook={};
+    runtime=clockAvailable=true;completeOnNotify=false;notifyHook={};eventWait=false;eventPauseHook={};
     auto* hdr=reinterpret_cast<VirtioGpuCtrlHdr*>(firstBytes);hdr->type=0x205;hdr->ctx_id=2;
     auto* next=reinterpret_cast<VirtioGpuCtrlHdr*>(secondBytes);*next=*hdr;
 }
@@ -259,7 +263,33 @@ void frameFailures() {
     }
 }
 
+static void notificationOwnership() {
+    reset();eventWait=true;
+    auto token=BeginCommand(g_legacyCommand,128,CMD_RESP_CAP,true);
+    eventPauseHook=[&](uint16_t used,uint64_t start,uint64_t deadline) {
+        CHECK(used==token.storage->usedPosition && start==100 && deadline==1100);
+        CHECK(token.storage->state==GpuCommandStorageState::Published && g_pendingCommand==token.storage);
+        CHECK(!BeginCommand(second,128,CMD_RESP_CAP));
+        complete();return true;
+    };
+    CHECK(FinishCommand(token,limits)==sizeof(VirtioGpuCtrlHdr));
+    CHECK(!g_pendingCommand && token.storage->state==GpuCommandStorageState::Completed);
+    reset();eventWait=true;token=BeginCommand(g_legacyCommand,128,CMD_RESP_CAP,true);
+    eventPauseHook=[&](uint16_t,uint64_t start,uint64_t deadline) {
+        CHECK(start==100&&deadline==1100);now=deadline;return true;
+    };
+    CHECK(!FinishCommand(token,limits) && g_controlQueuePoisoned);
+    CHECK(token.storage->state==GpuCommandStorageState::Quarantined && g_pendingCommand==token.storage);
+    reset();eventWait=true;token=BeginCommand(g_legacyCommand,128,CMD_RESP_CAP,true);
+    eventPauseHook=[&](uint16_t,uint64_t,uint64_t) {
+        complete();reinterpret_cast<VirtioGpuCtrlHdr*>(g_pendingCommand->bytes+CMD_RESP_OFF)->fence_id++;
+        return true;
+    };
+    CHECK(!FinishCommand(token,limits)&&g_controlQueuePoisoned);
+}
+
 int main(){
+    notificationOwnership();
     frameFailures();
     preparationSequence();
     ownership();malformed();boundsAndTimeout();wrapAndEmergency();

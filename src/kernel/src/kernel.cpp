@@ -528,6 +528,14 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     // ---- QEMU fw_cfg ----
     brook::FwCfgInit();
+    // QEMU legacy PIRQ discriminator: change only routed pin11's trigger,
+    // before storage/shared-line traffic. No default or polarity change.
+    char irq11Level[2]{};
+    const uint32_t irq11Option=brook::FwCfgReadFile("opt/irq11-level",irq11Level,sizeof(irq11Level));
+    if(irq11Level[0]=='1' && (irq11Option==1 || (irq11Option==2 && !irq11Level[1]))) {
+        const bool applied=brook::IoApicSelectBootLevelPin(11);
+        brook::SerialPrintf("IOAPIC: opt/irq11-level selected pin11 level trigger=%u (polarity unchanged)\n",applied?1u:0u);
+    }
     brook::LifecycleChannelConfigure();
 
     // ---- virtio-blk: enumerate all PCI virtio drives ----

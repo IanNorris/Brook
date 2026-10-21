@@ -1,3 +1,4 @@
+#include "ioapic_route_policy.h"
 #include "apic.h"
 #include "idt.h"
 #include "gs_paranoid.h"
@@ -1574,6 +1575,8 @@ void TlbFlushAllCpusBarrier()
 
 static uint64_t  g_ioApicVirt   = 0;
 static uint32_t  g_ioApicGsiBase = 0;
+static uint32_t g_ioApicEntries;
+static IoApicRoutePolicy g_ioApicRoutePolicy;
 
 static inline void IoApicWrite(uint8_t reg, uint32_t val)
 {
@@ -1618,6 +1621,7 @@ bool IoApicInit(uint64_t ioApicPhysical, uint32_t gsiBase)
 
     uint32_t version  = IoApicRead(0x01);
     uint32_t maxEntry = (version >> 16) & 0xFF;
+    g_ioApicEntries=maxEntry+1;g_ioApicRoutePolicy={};
 
     // Mask all redirection entries at startup.
     for (uint32_t i = 0; i <= maxEntry; ++i)
@@ -1633,25 +1637,7 @@ bool IoApicInit(uint64_t ioApicPhysical, uint32_t gsiBase)
     return true;
 }
 
-void IoApicUnmaskIrq(uint8_t irq, uint8_t vector)
-{
-    uint32_t entry = irq;
-    uint8_t  dest  = ApicGetId();
-
-    // hi: destination LAPIC ID in bits 31:24
-    IoApicWrite(static_cast<uint8_t>(0x11 + 2 * entry),
-                static_cast<uint32_t>(dest) << 24);
-    // lo: vector, fixed delivery, edge-triggered, active-high, unmasked
-    IoApicWrite(static_cast<uint8_t>(0x10 + 2 * entry),
-                static_cast<uint32_t>(vector));
-}
-
-void IoApicMaskIrq(uint8_t irq)
-{
-    uint32_t entry = irq;
-    uint32_t lo = IoApicRead(static_cast<uint8_t>(0x10 + 2 * entry));
-    IoApicWrite(static_cast<uint8_t>(0x10 + 2 * entry), lo | 0x00010000u);
-}
+#include "ioapic_route.inc"
 
 void ApicInitTimerOnAp()
 {

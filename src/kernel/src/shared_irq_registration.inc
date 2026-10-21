@@ -22,6 +22,27 @@ static bool SharedIrqMayInstall(uint8_t vector, void* handler)
     return false;
 }
 
+// Boot-only preflight for optional providers. Caller must serialize with boot
+// registration; this is not a runtime registration/quiescence mechanism.
+bool IoApicHandlerCapacity(uint8_t irq, void* handler)
+{
+    if (!handler || irq==255) return false;
+    if (auto* entry=FindSharedIrq(irq)) {
+        for (int i=0;i<entry->count;++i)
+            if (entry->handlers[i]==reinterpret_cast<IrqHandlerFn>(handler))
+                return entry->references[i]!=~uint32_t(0);
+        return entry->count<MAX_IRQ_CHAIN;
+    }
+    if (g_sharedIrqCount==MAX_SHARED_IRQS) return false;
+    for (unsigned vector=48;vector<=63;++vector) {
+        if (!SharedIrqVectorAllowed(static_cast<uint8_t>(vector))) continue;
+        bool free=true;
+        for (int i=0;i<g_sharedIrqCount;++i) if(g_sharedIrqs[i].vector==vector)free=false;
+        if(free)return true;
+    }
+    return false;
+}
+
 uint8_t IoApicRegisterHandler(uint8_t irq, uint8_t preferredVector, void* handler)
 {
     // The legacy ABI returns a vector, and existing drivers do not check a

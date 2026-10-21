@@ -110,18 +110,23 @@ int main(){
     reset();
     for(auto fn:{handlerA,handlerB,handlerC,handlerD})
         IoApicRegisterHandler(11,50,reinterpret_cast<void*>(fn));
+    CHECK(!IoApicHandlerCapacity(11,reinterpret_cast<void*>(handlerE)));
+    CHECK(IoApicHandlerCapacity(11,reinterpret_cast<void*>(handlerA)));
     rejects([]{IoApicRegisterHandler(11,50,reinterpret_cast<void*>(handlerE));});
     CHECK(FindSharedIrq(11)->count==4 && installs==1 && unmasks==1);
     IoApicUnregisterHandler(11,reinterpret_cast<void*>(handlerB));
     CHECK(FindSharedIrq(11)->handlers[1]==handlerC && FindSharedIrq(11)->references[1]==1);
     reset();
     for(uint8_t line=1;line<=4;++line)IoApicRegisterHandler(line,50,reinterpret_cast<void*>(handlerA));
+    CHECK(!IoApicHandlerCapacity(5,reinterpret_cast<void*>(handlerB)));
     rejects([]{IoApicRegisterHandler(5,50,reinterpret_cast<void*>(handlerB));});
     CHECK(g_sharedIrqCount==4 && installs==4 && unmasks==4 && !FindSharedIrq(5));
     for(uint8_t line=1;line<=4;++line)reinterpret_cast<StubFn>(installed[routed[line]])();
     CHECK(callsA==4 && eois==4 && callsB==0);
     reset();
     rejects([]{IoApicRegisterHandler(11,50,nullptr);});
+    CHECK(!IoApicHandlerCapacity(255,reinterpret_cast<void*>(handlerA)));
+    CHECK(!IoApicHandlerCapacity(11,nullptr));
     rejects([]{IoApicRegisterHandler(255,50,reinterpret_cast<void*>(handlerA));});
     CHECK(g_sharedIrqCount==0 && !installs && !unmasks);
     IoApicRegisterHandler(11,50,reinterpret_cast<void*>(handlerA));

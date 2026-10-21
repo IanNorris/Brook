@@ -1,3 +1,4 @@
+#include "compositor_wake_sequence.h"
 #include "apic.h"
 #include "scene_damage.h"
 #include "desktop_pointer_route.h"
@@ -1536,6 +1537,7 @@ static volatile bool g_compositorHalted = false;
 
 // The compositor Process pointer — set once the thread starts.
 static Process* g_compositorProcess = nullptr;
+static CompositorWakeSequence g_compositorWakeSequence;
 
 // Forward declaration
 static void CompositorHandleMouseWM();
@@ -3480,14 +3482,17 @@ static void CompositorLoop()
     PresentStatsReport();
 }
 
+#include "compositor_frame_wait.inc"
+
 static void CompositorThreadFn(void* /*arg*/)
 {
-    g_compositorProcess = ProcessCurrent();
+    __atomic_store_n(&g_compositorProcess, ProcessCurrent(), __ATOMIC_RELEASE);
     SerialPrintf("COMPOSITOR: thread started (%ux%u, %u processes)\n",
                  g_physFbWidth, g_physFbHeight, g_compositedCount);
 
     for (;;)
     {
+        const uint64_t frameGeneration=g_compositorWakeSequence.Snapshot();
         FrameTimingBegin();
         if (!g_compositorHalted) {
             { FrameTimingScope phase(FramePhase::DeferredCaptures);DrainOwnedCaptures(); }
@@ -3501,10 +3506,7 @@ static void CompositorThreadFn(void* /*arg*/)
         // Block until either a process signals dirty (CompositorWake) or
         // the fallback interval elapses (ensures cursor updates even with
         // no dirty frames).
-        Process* self = ProcessCurrent();
-        self->wakeupTick = ApicTickCount() + COMPOSITE_INTERVAL;
-        FrameTimingEnd(self->wakeupTick);
-        SchedulerBlock(self);
+        CompositorWaitForWork(frameGeneration);
     }
 }
 
@@ -3527,7 +3529,8 @@ void CompositorHalt()
 
 void CompositorWake()
 {
-    Process* p = g_compositorProcess;
+    g_compositorWakeSequence.Publish();
+    Process* p = __atomic_load_n(&g_compositorProcess, __ATOMIC_ACQUIRE);
     // Forward Running/Ready wakes too: SchedulerUnblock records pendingWakeup
     // under the ready lock, covering work arriving before SchedulerBlock.
     // Testing state here loses that wake and delays queued work until the timer.

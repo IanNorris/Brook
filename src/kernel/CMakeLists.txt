@@ -258,6 +258,7 @@ add_executable(kernel
     src/gpu_compositor.cpp
     src/frame_timing.cpp
     src/gpu_app.cpp
+    src/gpu_completion.cpp
     src/mouse.cpp
     src/shell.cpp
     src/audio.cpp
@@ -460,6 +461,8 @@ target_compile_definitions(kernel PRIVATE BROOK_SMP_BOOT_TEST_STAGE=${BROOK_SMP_
 # panic.cpp is included because KernelPanic may be called from interrupt context.
 set_source_files_properties(
     src/idt.cpp
+    src/gpu_completion.cpp
+    src/kvmclock.cpp
     src/apic.cpp
     src/tlb_test.cpp
     src/scheduler.cpp
