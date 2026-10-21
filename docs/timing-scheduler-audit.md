@@ -5,6 +5,16 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Historical-build live bisect](scheduler-lock-attribution.md) now reproduces
+  fast Quake/Firefox playback under the historical RR, HDA-timer and 200-ms
+  host-buffer settings. The user measures 30 seconds of YouTube progression
+  in 24 wall seconds (approximately 1.25×; manual uncertainty unquantified).
+  On two intermediate revisions, cached device completion advances about
+  1.28–1.30× nominal while separately bracketed native clocks remain near 1×.
+  Forced syscall/libc clock checks on one reproduce near-normal clock rates.
+  This is not yet a causal application-level HDA-discard trace. Rendering
+  regression bisect and fast-playback classification remain separate.
+
 - [Per-CPU pvclock](pvclock-percpu.md) repairs pause/resume backwards samples;
   elapsed KVM time remains distinct from periodic LAPIC interrupt delivery.
 - [HDA near-empty publication repair](hda-near-empty-write-lead.md) fixes the
@@ -115,8 +125,10 @@ approximately 1.3×; neither estimate is a measured playback factor.
 No repair has yet been shown to resolve the playback speedup, and no scheduler
 default change has been made.
 Later [local audio alignment of the historical recording](playback-recording-rate.md)
-supports roughly 1.3× playback with a slower later section; the current controlled
-VM has not yet reproduced that acceleration.
+supports roughly 1.3× playback with a slower later section. Subsequent live
+historical-settings comparisons reproduce fast playback as described above;
+the earlier recording analysis and new application observations are separate
+evidence with different uncertainty.
 
 ## Clocksource versus interrupt delivery
 
@@ -171,6 +183,25 @@ elapsed-clock candidate; historical baseline results follow below.
 | HDA completion | LPIB modulo ring position; stable pvclock bounds ambiguity | `intel_hda_mod.cpp`, `audio_dma_clock.h` | Check native 44.1-kHz progress against host audio capture, underruns and position discontinuities |
 | Mixer stream completion | driver receipts attributed by identity/epoch | `audio.cpp`, `Reconcile` | Acceptance/completion are separate; stateless resampling remains a separate concern |
 | QEMU host output | selected PipeWire/SDL/none backend | `scripts/run-qemu.sh` | Compare native review backend with silent controlled backend without changing game settings |
+
+### Residual low-level clock reads checked on 21 October
+
+A fresh source search finds no direct consumers of `g_lapicTickCount` outside
+the APIC implementation and its compatibility symbol export. `g_lapicRawTickCount`
+remains in the APIC IRQ counter and RTC fallback/calibration, distinct from
+KVM elapsed time. Raw RDTSC in `process.cpp` and `syscall.cpp` seeds fallback
+random generation; `panic.cpp` and `idt.cpp` retain raw crash metadata. The
+heap's serialized TSC reads measure optional diagnostic cycles, not elapsed
+application time. Kernel pvclock conversion itself samples serialized TSC as
+part of the versioned KVM record protocol. These categories are source findings,
+not a claim that arbitrary userspace RDTSC consumers have been validated.
+
+`virtio_blk.cpp` still uses permissive `KvmClockReadNs()` for elapsed wait
+checks and probe durations; POSIX timers, syscall clock reads and RTC also use
+that interface. Its semantics differ from the stable-required audio/GPU and
+scheduler reads. Physical/unstable-pvclock fallback, raw/coarse clock semantics,
+and all signal/retry/overflow paths remain open acceptance items. No clock
+consumer is changed during the user's live bisect test.
 
 ## Active scheduler and safety audit
 
