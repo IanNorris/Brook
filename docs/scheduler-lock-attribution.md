@@ -779,3 +779,33 @@ Quake probe run or regression repair is claimed. Host-check evidence is in
 `timing-scheduler-20261021/swap-probe-host-check`. The VMs remain stopped while
 the user prepares to reboot; the durable reboot checkpoint retains the exact
 frozen capsules and comparison caveats.
+
+
+### Host reboot control: same revision, normal observed audio
+
+The host boot ID changes from `99dd72f2-6f59-4efd-8acf-f8bb7f5820b5` to
+`f2227bd4-abc2-47dd-b91d-f1fae297a283`. The user requests a single control of
+the last-tested build. Review `live-post-reboot-control-31f52bb7-20261021`,
+session `360433e02a274d6ea56f672cd1bf880d`, uses the exact frozen kernel
+`7753dfde261d93c754cac2dffdd53724c3c65a5c773c7ec8e602bb509881bb2a`, matching
+ABI-34 modules and fresh clones of the same seed. No automated game or new
+frame-time probe is used; the user launches normal menu/attract mode.
+The live QEMU executable, selected machine/CPU/memory/GPU/audio/display options,
+selected graphics environment and affinity all match the preserved pre-reboot
+historical-settings launch. RR and HDA timer=true are verified.
+
+The user reports that audio speedup is gone and rendering is 12–14 FPS. A
+two-second profile has 1,585 samples, 6,567 context switches and zero drops.
+An unpaused six-second PCM capture and cached-counter bracket retain same-stream
+17/epoch 1 progression of 288,202 frames. Host interval bounds are broad at
+6.037066–6.574507 seconds: completed-frame rate is 0.9940–1.0825x nominal, and
+separately sampled guest-clock rate is 0.9939–1.0824x. The measured completed
+frame/guest-clock progression is near unity, unlike the prior roughly 1.28x
+split; no sampled stream discontinuity is present. This is not a decoded-music
+rate fit or a causal identification of which host component changed.
+
+This directly weakens a deterministic source-only interpretation of the initial
+FPS bisect and supports investigating persistent host/audio/device state and
+repeat variability. It does not prove that reboot repairs all rendering or
+that the TCP change has no performance effect. Evidence and actual launch
+comparison are retained in the review; the user's VM remains running.
