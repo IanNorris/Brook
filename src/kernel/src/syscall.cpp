@@ -6986,6 +6986,14 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             dsp->pointerBaseFrames = base;
             return 0;
         }
+        if (cmd == BROOK_DSP_GETQUEUE) {
+            // Exact native units only: converted OSS frame rounding cannot
+            // represent reusable storage and physical completion coherently.
+            if (!progress.clocked || dsp->sampleRate != MIXER_HW_RATE ||
+                dsp->channels != 2 || dsp->bitsPerSample != 16) return -95;
+            const auto state=AudioStreamQueueSnapshot(progress);
+            return CopyToUser(arg,&state,sizeof(state))?0:-EFAULT;
+        }
         if (cmd == SNDCTL_DSP_GETOSPACE) {
             struct AudioBufInfo { int fragments, fragstotal, fragsize, bytes; } info{};
             // Software plus in-flight capacity in negotiated input bytes.
@@ -8543,7 +8551,7 @@ retry_poll:
             if (dsp && AudioMixerGetProgress(dsp->mixerStreamId, &progress)) {
                 if (progress.discontinuity) fds[i].revents |= POLLERR;
                 else if ((fds[i].events & POLLOUT) &&
-                         progress.capacityFrames - progress.queuedFrames >= progress.writableFrames)
+                         AudioStreamWritable(progress))
                     fds[i].revents |= POLLOUT;
             } else fds[i].revents |= POLLERR;
             if (fds[i].revents) ready++;
@@ -9112,7 +9120,7 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
         AudioStreamProgress progress{};
         if (!dsp || !AudioMixerGetProgress(dsp->mixerStreamId, &progress) || progress.discontinuity)
             return EPOLLERR;
-        return (events & EPOLLOUT) && progress.capacityFrames - progress.queuedFrames >= progress.writableFrames
+        return (events & EPOLLOUT) && AudioStreamWritable(progress)
             ? EPOLLOUT : 0;
     }
 

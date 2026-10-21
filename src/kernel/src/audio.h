@@ -1,4 +1,5 @@
 #pragma once
+#include "../../shared/audio_queue.h"
 
 // Brook audio subsystem — minimal API for kernel audio output.
 //
@@ -112,6 +113,13 @@ bool AudioMixerSetCapacity(AudioStreamId stream, uint32_t frames, uint32_t writa
 // Readiness threshold only; may change on an active stream without resetting
 // its queue, playback epoch or completion clock.
 bool AudioMixerSetWritableFrames(AudioStreamId stream, uint32_t frames);
+// Default-off downstream budget experiment; applies to future native capacity
+// negotiations only. Existing stream limits never shrink on configuration.
+void AudioMixerStagingEnable(bool enabled);
+bool AudioMixerStagingEnabled();
+bool AudioMixerStagingSetFrameLimit(uint32_t frames);
+uint32_t AudioMixerStagingFrameLimit();
+void AudioMixerConfigureBoot();
 
 struct AudioStreamProgress {
     uint64_t epoch = 0;
@@ -123,7 +131,18 @@ struct AudioStreamProgress {
     uint32_t capacityFrames = MIXER_RING_FRAMES;
     uint32_t writableFrames = 1;
     uint32_t fragmentFrames = 1;
+    uint32_t availableFrames = 0, stagingFrames = 0;
 };
+inline bool AudioStreamWritable(const AudioStreamProgress& progress) {
+    return !progress.discontinuity && progress.availableFrames>=progress.writableFrames;
+}
+inline BrookAudioQueue AudioStreamQueueSnapshot(const AudioStreamProgress& p) {
+    return {BROOK_AUDIO_QUEUE_VERSION,
+        (p.clocked?BROOK_AUDIO_QUEUE_CLOCKED:0u) |
+        (p.discontinuity?BROOK_AUDIO_QUEUE_DISCONTINUITY:0u),
+        p.epoch,p.submittedFrames,p.completedFrames,p.capacityFrames,
+        p.availableFrames,p.queuedFrames,p.stagingFrames,44100,4};
+}
 // Refresh calls the driver without the mixer lock. GetProgress reads cached
 // accounting only and is safe for descriptor scans that cannot sleep.
 void AudioMixerRefresh();
@@ -137,6 +156,7 @@ struct AudioStreamDiagnostic {
     uint32_t softwareFrames = 0, inFlightFrames = 0, capacityFrames = 0;
     bool enabled = false, discontinuity = false;
     uint32_t fragmentFrames = 1, writableFrames = 1;
+    uint32_t availableFrames = 0, stagingFrames = 0;
 };
 struct AudioMixerDiagnostic {
     uint64_t clockNs = 0;

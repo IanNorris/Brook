@@ -1,0 +1,140 @@
+--- a/oss/pcm_oss.c
++++ b/oss/pcm_oss.c
+@@ -21,6 +21,7 @@
+ #include "config.h"
+ #include <stdio.h>
+ #include <pthread.h>
++#include "brook_audio_queue.h"
+ #include <sys/ioctl.h>
+ #include <alsa/asoundlib.h>
+ #include <alsa/pcm_external.h>
+@@ -45,32 +46,64 @@
+ 	pthread_mutex_t lock;
+ 	snd_pcm_uframes_t boundary;
+ 	snd_pcm_uframes_t expected_appl;
++	uint64_t queue_epoch;
++	uint32_t queue_capacity, queue_staging;
+ } snd_pcm_oss_t;
+ 
+-/* Called under the private mutex. ALSA serializes ordinary transfers and
+- * pointer calls; guard the accepted application origin against forward/rewind
+- * and software-only reset. Prepared configuration must be serialized by users. */
++/* Native Brook snapshot separates reusable client storage from physical
++ * playback delay. Never infer the downstream allowance from sampled deltas. */
++static int oss_read_queue(snd_pcm_ioplug_t *io, struct BrookAudioQueue *q)
++{
++    snd_pcm_oss_t *oss = io->private_data;
++    if (ioctl(oss->fd, BROOK_DSP_GETQUEUE, q) < 0)
++        return -errno;
++    if (q->version != BROOK_AUDIO_QUEUE_VERSION ||
++        q->flags != BROOK_AUDIO_QUEUE_CLOCKED || !q->epoch ||
++        q->rate != 44100 || q->frame_bytes != 4 || oss->frame_bytes != 4 ||
++        !q->capacity_frames || q->capacity_frames > 16384 ||
++        q->capacity_frames < io->buffer_size ||
++        q->staging_frames > q->capacity_frames || q->staging_frames > 4096 ||
++        q->available_frames > q->capacity_frames ||
++        q->completed_frames > q->submitted_frames ||
++        q->submitted_frames - q->completed_frames != q->queued_frames ||
++        q->queued_frames > q->capacity_frames + q->staging_frames)
++        return -EPIPE;
++    unsigned charged = q->capacity_frames - q->available_frames;
++    if (charged > io->buffer_size || charged > q->queued_frames ||
++        q->queued_frames - charged > q->staging_frames)
++        return -EPIPE;
++    return 0;
++}
++
++/* One serialized writer owns the accepted application origin. A software-only
++ * reset may rebase only after real downstream playback has drained too. */
++static int oss_queue_state_locked(snd_pcm_ioplug_t *io,
++    snd_pcm_uframes_t *queued, snd_pcm_uframes_t *physical)
++{
++    snd_pcm_oss_t *oss = io->private_data;
++    struct BrookAudioQueue q;
++    if (!oss->boundary || !io->buffer_size)
++        return -EBADFD;
++    int result = oss_read_queue(io, &q);
++    if (result < 0)
++        return result;
++    if (q.epoch != oss->queue_epoch || q.capacity_frames != oss->queue_capacity ||
++        q.staging_frames != oss->queue_staging)
++        return -EPIPE;
++    if (oss->expected_appl != io->appl_ptr) {
++        if (!io->appl_ptr && !io->hw_ptr && !q.queued_frames)
++            oss->expected_appl = 0;
++        else
++            return -EPIPE;
++    }
++    *queued = q.capacity_frames - q.available_frames;
++    if (physical)
++        *physical = q.queued_frames;
++    return 0;
++}
+ static int oss_queue_locked(snd_pcm_ioplug_t *io, snd_pcm_uframes_t *queued)
+ {
+-	snd_pcm_oss_t *oss = io->private_data;
+-	int bytes;
+-	if (!oss->boundary || !oss->frame_bytes || !io->buffer_size)
+-		return -EBADFD;
+-	if (ioctl(oss->fd, SNDCTL_DSP_GETODELAY, &bytes) < 0)
+-		return -errno;
+-	if (bytes < 0 || (unsigned int)bytes % oss->frame_bytes)
+-		return -EPIPE;
+-	*queued = (unsigned int)bytes / oss->frame_bytes;
+-	if (*queued > io->buffer_size)
+-		return -EPIPE;
+-	if (oss->expected_appl != io->appl_ptr) {
+-		/* A software-only reset is safe only after the actual queue drains. */
+-		if (!io->appl_ptr && !io->hw_ptr && !*queued)
+-			oss->expected_appl = 0;
+-		else
+-			return -EPIPE;
+-	}
+-	return 0;
++    return oss_queue_state_locked(io, queued, NULL);
+ }
+ 
+ static snd_pcm_sframes_t oss_write(snd_pcm_ioplug_t *io,
+@@ -130,8 +163,8 @@
+ 	result = oss_queue_locked(io, &queued);
+ 	if (result < 0)
+ 		goto out;
+-	/* Native frames accepted by ALSA minus this stream's actual unfinished
+-	 * frames gives completion, including a whole ring between queries. */
++	/* Accepted frames minus charged client occupancy gives reusable storage,
++	 * including a whole ring between queries; not physical playback completion. */
+ 	position = oss->expected_appl >= queued ? oss->expected_appl - queued :
+ 		oss->boundary - (queued - oss->expected_appl);
+ 	delta = position >= io->hw_ptr ? position - io->hw_ptr :
+@@ -145,12 +178,12 @@
+ static int oss_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delay)
+ {
+ 	snd_pcm_oss_t *oss = io->private_data;
+-	snd_pcm_uframes_t queued;
++	snd_pcm_uframes_t queued, physical;
+ 	int result;
+ 	pthread_mutex_lock(&oss->lock);
+-	result = oss_queue_locked(io, &queued);
++	result = oss_queue_state_locked(io, &queued, &physical);
+ 	if (!result)
+-		*delay = queued;
++		*delay = physical;
+ 	pthread_mutex_unlock(&oss->lock);
+ 	return result;
+ }
+@@ -230,6 +263,15 @@
+ 	 * contract before using its per-stream completion-based delay as a clock. */
+ 	if (ioctl(oss->fd, SNDCTL_DSP_GETOPTR, &pointer) < 0)
+ 		goto device_error;
++	struct BrookAudioQueue queue;
++	result = oss_read_queue(io, &queue);
++	if (result < 0) goto out;
++	if (queue.queued_frames || queue.available_frames != queue.capacity_frames) {
++		result = -EPIPE; goto out;
++	}
++	oss->queue_epoch = queue.epoch;
++	oss->queue_capacity = queue.capacity_frames;
++	oss->queue_staging = queue.staging_frames;
+ 	oss->expected_appl = 0;
+ 	oss->boundary = boundary;
+ 	result = 0;

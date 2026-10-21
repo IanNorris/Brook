@@ -9,7 +9,10 @@
 #include <linux/soundcard.h>
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
+#include "brook_audio_queue.h"
 static int ioctl_error, transfer_error, queued_bytes, write_calls;
+static snd_pcm_ioplug_t *queue_io;
+static unsigned downstream_frames, charged_override = ~0u;
 static unsigned long fail_request;
 static ssize_t transferred;
 static int fake_ioctl(int fd, unsigned long request, ...) {
@@ -22,6 +25,14 @@ static int fake_ioctl(int fd, unsigned long request, ...) {
         *va_arg(arguments, int*) = queued_bytes;
     else if (request == SNDCTL_DSP_GETOPTR)
         memset(va_arg(arguments, struct count_info*), 0, sizeof(struct count_info));
+    else if (request == BROOK_DSP_GETQUEUE) {
+        struct BrookAudioQueue *q=va_arg(arguments, struct BrookAudioQueue*);
+        unsigned queued=queued_bytes<0?~0u:(unsigned)queued_bytes/4;
+        unsigned charged=charged_override==~0u?queued:charged_override;
+        *q=(struct BrookAudioQueue){BROOK_AUDIO_QUEUE_VERSION,BROOK_AUDIO_QUEUE_CLOCKED,
+            1,queued,0,queue_io->buffer_size,queue_io->buffer_size-charged,
+            queued,downstream_frames,44100,queued_bytes%4?0:4};
+    }
     va_end(arguments);
     return 0;
 }
@@ -46,9 +57,13 @@ int main(void) {
     oss.io.channels = 2;
     oss.io.rate = 44100;
     oss.io.buffer_size = 16;
+    queue_io = &oss.io;
     oss.frame_bytes = 4;
     oss.format = AFMT_S16_LE;
     oss.boundary = 1024;
+#ifdef BROOK_OSS_DOWNSTREAM
+    oss.queue_epoch=1;oss.queue_capacity=16;
+#endif
     assert(pthread_mutex_init(&oss.lock, NULL) == 0);
     /* Real ALSA params exercise prepare without any host audio device. */
     assert(snd_pcm_open(&oss.io.pcm, "null", SND_PCM_STREAM_PLAYBACK, 0) == 0);
@@ -111,6 +126,25 @@ int main(void) {
     oss.expected_appl = oss.io.appl_ptr = 1;
     oss.io.hw_ptr = 1023;
     assert(oss_pointer(&oss.io) == 1); // Actual ALSA boundary wrap.
+#ifdef BROOK_OSS_DOWNSTREAM
+    /* Reusable space is not a drained device. An old origin cannot rebase
+     * while only downstream samples remain, even with zero charged occupancy. */
+    oss.queue_staging=downstream_frames=16;
+    oss.expected_appl=1;oss.io.appl_ptr=oss.io.hw_ptr=0;
+    charged_override=0;queued_bytes=32;
+    assert(oss_pointer(&oss.io)==-EPIPE);
+    oss.io.appl_ptr=oss.expected_appl=16;
+    assert(oss_pointer(&oss.io)==16);
+    assert(oss_delay(&oss.io,&delay)==0 && delay==8);
+    /* Full client occupancy plus downstream exceeds the logical ring; delay
+     * remains physical while the reusable cursor stays at the old origin. */
+    oss.io.hw_ptr=0;charged_override=16;queued_bytes=128;
+    assert(oss_pointer(&oss.io)==0);
+    assert(oss_delay(&oss.io,&delay)==0 && delay==32);
+    ++oss.queue_epoch;assert(oss_pointer(&oss.io)==-EPIPE);--oss.queue_epoch;
+    ++oss.queue_capacity;assert(oss_pointer(&oss.io)==-EPIPE);--oss.queue_capacity;
+    queued_bytes=132;assert(oss_pointer(&oss.io)==-EPIPE); // >client+staging
+#endif
     assert(snd_pcm_close(oss.io.pcm) == 0);
     assert(pthread_mutex_destroy(&oss.lock) == 0);
     puts("OSS_CALLBACK_ERRORS PASS");

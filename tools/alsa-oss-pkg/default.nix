@@ -1,15 +1,17 @@
 # Clocked native playback slave for Brook. Select through an outer ALSA plug;
 # keep the existing default until guest pointer/delay/drain acceptance passes.
 { pkgs ? import ../../nix/nixpkgs.nix {}, lowWaterReadiness ? false, callbackTrace ? false,
-  minimumBufferFrames ? 64 }:
+  minimumBufferFrames ? 64, downstreamStaging ? false }:
 assert builtins.isInt minimumBufferFrames && minimumBufferFrames >= 64 && minimumBufferFrames <= 16384;
 pkgs.alsa-plugins.overrideAttrs (old: {
   pname = "alsa-plugins-oss-brook";
   buildInputs = [ pkgs.alsa-lib ];
   patches = (old.patches or []) ++ [ ./clocked-oss.patch ]
+    ++ pkgs.lib.optional downstreamStaging ./downstream-queue.patch
     ++ pkgs.lib.optional lowWaterReadiness ./low-water.patch
     ++ pkgs.lib.optional callbackTrace ./trace-callbacks.patch;
   postPatch = (old.postPatch or "") + ''
+    cp ${../../src/shared/audio_queue.h} oss/brook_audio_queue.h
     substituteInPlace oss/pcm_oss.c --replace-fail \
       'SND_PCM_IOPLUG_HW_BUFFER_BYTES, 256, 65536' \
       'SND_PCM_IOPLUG_HW_BUFFER_BYTES, ${toString (minimumBufferFrames * 4)}, 65536'
@@ -22,6 +24,8 @@ pkgs.alsa-plugins.overrideAttrs (old: {
     "--disable-libav" "--disable-a52" "--disable-lavrate" "--disable-speexdsp"
   ];
   makeFlags = (old.makeFlags or []) ++ [ "SUBDIRS=oss" ];
+  NIX_CFLAGS_COMPILE = (old.NIX_CFLAGS_COMPILE or "")
+    + pkgs.lib.optionalString downstreamStaging " -DBROOK_OSS_DOWNSTREAM";
   doCheck = true;
   checkPhase = ''
     runHook preCheck

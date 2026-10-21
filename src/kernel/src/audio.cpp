@@ -7,6 +7,8 @@
 // decoupling application write timing from hardware playback timing.
 
 #include "audio.h"
+#include "audio_queue_capacity.h"
+#include "fw_cfg.h"
 #include "dsp_producer_timing.h"
 #include "serial.h"
 #include "kprintf.h"
@@ -130,12 +132,15 @@ struct MixerStream {
     uint32_t capacity = MIXER_RING_FRAMES;
     uint32_t writableFrames = 1;
     uint32_t fragmentFrames = 1;
+    uint32_t stagingFrames = 0;
     bool discontinuity = false;
     bool coalesceUsed = false; // one grace per empty software-queue episode
 };
 static MixerStream g_streams[MIXER_MAX_STREAMS];
 static uint64_t g_nextStreamIdentity = 1;
 static bool g_mixerReady = false;
+static bool g_stagingEnabled = false;
+static uint32_t g_stagingFrameLimit = 1024;
 static int16_t* g_flushBuf = nullptr;
 static uint32_t g_flushBusy = 0;
 static uint64_t g_deliveryEpoch = 0, g_flushEpoch = 0;
@@ -364,6 +369,40 @@ static MixerStream* FindStream(AudioStreamId identity)
     auto& stream = g_streams[slot - 1];
     return identity && stream.identity == identity ? &stream : nullptr;
 }
+static uint32_t StreamAvailableLocked(MixerStream& stream) {
+    uint32_t available=0;
+    if(stream.discontinuity)return 0;
+    if(!AudioQueueAvailable(stream.capacity,stream.write-stream.read,stream.inFlight,
+                            stream.stagingFrames,&available)) {
+        stream.discontinuity=true;return 0;
+    }
+    return available;
+}
+void AudioMixerStagingEnable(bool enabled) {
+    SpinLockAcquire(&g_mixerLock);
+    __atomic_store_n(&g_stagingEnabled,enabled,__ATOMIC_RELEASE);
+    SpinLockRelease(&g_mixerLock);
+}
+bool AudioMixerStagingEnabled(){return __atomic_load_n(&g_stagingEnabled,__ATOMIC_ACQUIRE);}
+bool AudioMixerStagingSetFrameLimit(uint32_t frames) {
+    if(!frames || frames>4096)return false;
+    SpinLockAcquire(&g_mixerLock);
+    __atomic_store_n(&g_stagingFrameLimit,frames,__ATOMIC_RELEASE);
+    SpinLockRelease(&g_mixerLock);return true;
+}
+uint32_t AudioMixerStagingFrameLimit(){return __atomic_load_n(&g_stagingFrameLimit,__ATOMIC_ACQUIRE);}
+void AudioMixerConfigureBoot() {
+#ifndef BROOK_HOST_TEST
+    char option[6]{};
+    const uint32_t size=FwCfgReadFile("opt/audio-staging-frames",option,sizeof(option));
+    uint32_t frames=0;
+    if(size && AudioParseStagingFrames(option,size,&frames)) {
+        if(frames)AudioMixerStagingSetFrameLimit(frames);
+        AudioMixerStagingEnable(frames!=0);
+        SerialPrintf("audio: prospective downstream allowance %u frames\n",frames);
+    } else if(size)SerialPuts("audio: invalid opt/audio-staging-frames; staging remains off\n");
+#endif
+}
 static void ResetStream(MixerStream& stream)
 {
     ++stream.epoch;
@@ -405,7 +444,7 @@ AudioStreamId AudioMixerOpen()
             if (stream.identity) continue;
             identity = (g_nextStreamIdentity++ << 4) | (i + 1);
             ResetStream(stream); stream.enabled = true; stream.capacity = MIXER_RING_FRAMES;
-            stream.writableFrames = stream.fragmentFrames = 1; stream.identity = identity;
+            stream.writableFrames = stream.fragmentFrames = 1; stream.stagingFrames=0;stream.identity = identity;
             break;
         }
     }
@@ -444,7 +483,11 @@ bool AudioMixerSetCapacity(AudioStreamId identity, uint32_t frames, uint32_t wri
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
     const bool empty = stream && stream->read == stream->write && !stream->inFlight;
-    if (empty) { stream->capacity = frames; stream->writableFrames = stream->fragmentFrames = writableFrames; }
+    if (empty) {
+        stream->capacity = frames; stream->writableFrames = stream->fragmentFrames = writableFrames;
+        stream->stagingFrames=g_stagingEnabled && g_clockSupported
+            ? (frames<g_stagingFrameLimit?frames:g_stagingFrameLimit):0;
+    }
     SpinLockRelease(&g_mixerLock);
     return empty;
 }
@@ -462,7 +505,7 @@ uint32_t AudioMixerAvailableFrames(AudioStreamId identity)
 {
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
-    uint32_t available = stream && !stream->discontinuity ? stream->capacity - static_cast<uint32_t>(stream->write - stream->read) - stream->inFlight : 0;
+    uint32_t available = stream?StreamAvailableLocked(*stream):0;
     SpinLockRelease(&g_mixerLock);
     return available;
 }
@@ -472,7 +515,8 @@ uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frames, AudioStreamId
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
     if (!stream || stream->discontinuity) { SpinLockRelease(&g_mixerLock); return 0; }
-    const uint32_t available = stream->capacity - static_cast<uint32_t>(stream->write - stream->read) - stream->inFlight;
+    const uint32_t available = StreamAvailableLocked(*stream);
+    if(stream->discontinuity) { SpinLockRelease(&g_mixerLock);return 0; }
     if (frames > available) frames = available;
     // Empty queues may restart their indices, avoiding lifetime counter wrap.
     if (stream->read == stream->write) stream->read = stream->write = 0;
@@ -659,9 +703,11 @@ bool AudioMixerGetProgress(AudioStreamId identity, AudioStreamProgress* result)
     if (!result) return false;
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
+    const uint32_t available=stream?StreamAvailableLocked(*stream):0;
     if (stream) *result = {stream->epoch, stream->submittedFrames, stream->completedFrames,
         static_cast<uint32_t>(stream->write - stream->read) + stream->inFlight,
-        g_clockSupported, stream->discontinuity, stream->capacity, stream->writableFrames,stream->fragmentFrames};
+        g_clockSupported, stream->discontinuity, stream->capacity, stream->writableFrames,stream->fragmentFrames,
+        available,stream->stagingFrames};
     SpinLockRelease(&g_mixerLock);
     return stream != nullptr;
 }
@@ -674,12 +720,14 @@ void AudioMixerDiagnosticSnapshot(AudioMixerDiagnostic* result)
     result->ready = g_mixerReady;
     result->clocked = g_clockSupported;
     for (uint32_t i = 0; i < MIXER_MAX_STREAMS; ++i) {
-        const auto& stream = g_streams[i];
+        auto& stream = g_streams[i];
         if (!stream.identity) continue;
+        const uint32_t available=StreamAvailableLocked(stream);
         result->streams[i] = {stream.identity, stream.epoch,
             stream.submittedFrames, stream.completedFrames,
             static_cast<uint32_t>(stream.write - stream.read), stream.inFlight,
-            stream.capacity, stream.enabled, stream.discontinuity,stream.fragmentFrames,stream.writableFrames};
+            stream.capacity, stream.enabled, stream.discontinuity,stream.fragmentFrames,stream.writableFrames,
+            available,stream.stagingFrames};
     }
     SpinLockRelease(&g_mixerLock);
 }

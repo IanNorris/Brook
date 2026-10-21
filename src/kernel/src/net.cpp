@@ -3574,6 +3574,8 @@ static void DebugAudioDiagnostics()
         row.text(","); row.field("inflight_frames", stream.inFlightFrames);
         row.text(","); row.field("capacity_frames", stream.capacityFrames);
         row.text(","); row.field("fragment_frames", stream.fragmentFrames);
+        row.text(","); row.field("available_frames", stream.availableFrames);
+        row.text(","); row.field("staging_frames", stream.stagingFrames);
         row.text(","); row.field("writable_frames", stream.writableFrames);
         row.text(","); row.field("enabled", stream.enabled);
         row.text(","); row.field("discontinuity", stream.discontinuity);
@@ -3787,6 +3789,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  heap check      - validate heap block metadata\n"
             "  epoll diag on|off|status - bounded per-task epoll counters (default off)\n"
             "  audio stats - cached stream queues, completion and guest clock\n"
+            "  audio staging on|off|1024|4096|status - prospective native downstream budget (default off)\n"
             "  sched decision watch PID INC | off | reset | status - MLFQ decisions (default off)\n"
             "  sched syscall watch PID INC | off | reset | status - thread syscall brackets (default off)\n"
             "  audio producer on|off|reset|status - DSP producer elapsed brackets (default off)\n"
@@ -4408,6 +4411,18 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         }
         DebugChannelSend("]");
         DebugChannelSend("}\n");
+    }
+    else if(NetStrEq(cmd,"audio staging on") || NetStrEq(cmd,"audio staging off") ||
+            NetStrEq(cmd,"audio staging 1024") || NetStrEq(cmd,"audio staging 4096") ||
+            NetStrEq(cmd,"audio staging status")) {
+        if(NetStrEq(cmd,"audio staging 1024") || NetStrEq(cmd,"audio staging 4096")) {
+            AudioMixerStagingSetFrameLimit(NetStrEq(cmd,"audio staging 4096")?4096:1024);
+            AudioMixerStagingEnable(true);
+        } else if(!NetStrEq(cmd,"audio staging status"))
+            AudioMixerStagingEnable(NetStrEq(cmd,"audio staging on"));
+        BridgeReply r;r.text("{\"enabled\":");r.text(AudioMixerStagingEnabled()?"true":"false");
+        r.text(",");r.field("frame_limit",AudioMixerStagingFrameLimit());
+        r.text(",\"scope\":\"Prospective native capacity negotiations only; downstream budget capped by client capacity and configured frame limit. Existing per-stream limits unchanged on configuration; completion and queued delay remain physical-source accounting.\"}\n");r.send();
     }
     else if (NetStrEq(cmd, "audio stats")) {
         DebugAudioDiagnostics();

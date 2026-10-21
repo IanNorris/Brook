@@ -31,7 +31,11 @@ int main(int argc, char **argv) {
     assert(snd_input_close(input) == 0);
     unsigned cases = 0;
     const unsigned rates[] = {22050, 44100, 48000, 96000};
-    for (unsigned enlarged = 0; enlarged < 2; ++enlarged)
+    unsigned geometries=2;
+#ifdef BROOK_OSS_DOWNSTREAM
+    geometries=4;
+#endif
+    for (unsigned enlarged = 0; enlarged < geometries; ++enlarged)
     for (unsigned r = 0; r < sizeof(rates)/sizeof(rates[0]); ++r)
     for (unsigned f = 0; f < 2; ++f) {
         geometry(enlarged);
@@ -54,11 +58,19 @@ int main(int argc, char **argv) {
         unsigned long long submitted = 0;
         const unsigned long long target = (unsigned long long)rates[r] * 4;
         unsigned steps = 0, partial = 0, blocked = 0, running = 0;
+        unsigned extra_delay = 0, downstream_only = 0, reused_before_completion = 0;
         while (submitted < target) {
             assert(++steps < 10000);
             /* Alternate whole-ring, period-sized and oversized requests.
              * Delayed completion is explicit, so no blind immediate drain. */
-            if (steps % 4) advance((steps % 3 == 0) ? 128 : 441);
+            if(enlarged>=2 && steps<=8) {
+                /* Allow actual libasound to refill reusable storage while
+                 * physical completion remains frozen at zero. */
+            } else if(enlarged>=2 && steps%40==0) {
+                /* Leave only downstream source: client occupancy is zero
+                 * while physical delay remains nonzero. */
+                if(stat(2)>stat(9))advance(stat(2)-stat(9));
+            } else if (steps % 4) advance((steps % 3 == 0) ? 128 : 441);
             snd_pcm_sframes_t available = snd_pcm_avail_update(pcm), delay;
             if (available < 0) {
                 fprintf(stderr, "avail error=%ld step=%u queued=%llu logical=%llu\n",
@@ -66,6 +78,9 @@ int main(int argc, char **argv) {
                 return 1;
             }
             assert(snd_pcm_delay(pcm, &delay) == 0 && delay >= 0);
+            extra_delay |= stat(2)>stat(8);
+            downstream_only |= stat(2)>0 && stat(10)==0;
+            reused_before_completion |= stat(3)>stat(8) && stat(4)==0;
             snd_pcm_uframes_t request = steps % 3 == 0 ? period : buffer * (steps % 3 == 1 ? 2 : 1);
             if (request > target - submitted) request = target - submitted;
             snd_pcm_sframes_t result = snd_pcm_writei(pcm, samples, request);
@@ -86,18 +101,21 @@ int main(int argc, char **argv) {
         assert(snd_pcm_drain(pcm) == 0);
         if (minimum == 64) {
             /* Preserve the original regression controls exactly. */
-            assert(stat(0) == (enlarged ? 6016 : 4416));
-            assert(stat(1) == (enlarged ? 128 : 64));
+            assert(stat(0) == ((enlarged%2) ? 6016 : 4416));
+            assert(stat(1) == ((enlarged%2) ? 128 : 64));
             assert(stat(8) >= 4410 && stat(8) <= 4412);
         } else {
             unsigned expected = minimum > 4410 ? minimum : 4410;
             assert(stat(8) >= expected && stat(8) <= expected + 2);
             unsigned long long physical = ((stat(8) + 63) / 64) * 64;
-            int enlarged_control = enlarged && physical == 4416;
+            int enlarged_control = (enlarged%2) && physical == 4416;
             assert(stat(1) == (enlarged_control ? 128 : 64));
             assert(stat(0) == (enlarged_control ? 6016 : physical));
         }
         assert(stat(2) == 0 && stat(3) == stat(4));
+#ifdef BROOK_OSS_DOWNSTREAM
+        if(enlarged>=2) assert(extra_delay && downstream_only && reused_before_completion);
+#endif
         printf("OSS_PLAYBACK geometry=%u rate=%u format=%s buffer=%lu period=%lu "
             "physical=%llu fragment=%llu logical=%llu submitted=%llu "
             "accepted=%llu completed=%llu partial=%u blocked=%u overfills=%llu\n",

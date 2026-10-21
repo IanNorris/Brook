@@ -10,6 +10,7 @@
 #include <linux/soundcard.h>
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
+#include "brook_audio_queue.h"
 
 static unsigned capacity_frames, fragment_frames, queued_frames, frame_bytes = 4;
 static unsigned geometry;
@@ -17,9 +18,14 @@ static int triggered;
 static unsigned long long accepted_frames, completed_frames, write_calls;
 static unsigned long long max_request_frames, logical_overfills;
 static snd_pcm_ioplug_t *observed_io;
+static unsigned staging_frames;
+static unsigned charged_frames(void) {
+    return queued_frames>staging_frames?queued_frames-staging_frames:0;
+}
 
 void playback_geometry(unsigned enlarged) {
     geometry = enlarged;
+    staging_frames = enlarged>=2?4096:0;
     capacity_frames = fragment_frames = queued_frames = 0;
     accepted_frames = completed_frames = write_calls = 0;
     max_request_frames = logical_overfills = 0;
@@ -43,6 +49,8 @@ unsigned long long playback_stat(unsigned key) {
     case 6: return max_request_frames;
     case 7: return logical_overfills;
     case 8: return observed_io ? observed_io->buffer_size : 0;
+    case 9: return staging_frames;
+    case 10: return charged_frames();
     default: assert(0); return 0;
     }
 }
@@ -54,6 +62,11 @@ static int playback_ioctl(int fd, unsigned long request, ...) {
     else if (request == SNDCTL_DSP_GETFMTS) *va_arg(arguments, int *) = AFMT_S16_LE;
     else if (request == SNDCTL_DSP_GETODELAY)
         *va_arg(arguments, int *) = queued_frames * frame_bytes;
+    else if (request == BROOK_DSP_GETQUEUE)
+        *va_arg(arguments, struct BrookAudioQueue*)=(struct BrookAudioQueue){
+            BROOK_AUDIO_QUEUE_VERSION,BROOK_AUDIO_QUEUE_CLOCKED,1,
+            accepted_frames,completed_frames,capacity_frames,
+            capacity_frames-charged_frames(),queued_frames,staging_frames,44100,4};
     else if (request == SNDCTL_DSP_GETOPTR) {
         struct count_info *p = va_arg(arguments, struct count_info *);
         memset(p, 0, sizeof(*p));
@@ -64,7 +77,7 @@ static int playback_ioctl(int fd, unsigned long request, ...) {
         memset(space, 0, sizeof(*space));
         space->fragstotal = capacity_frames / fragment_frames;
         space->fragsize = fragment_frames * frame_bytes;
-        space->bytes = (capacity_frames - queued_frames) * frame_bytes;
+        space->bytes = (capacity_frames - charged_frames()) * frame_bytes;
         space->fragments = space->bytes / space->fragsize;
     } else if (request == SNDCTL_DSP_SETFRAGMENT) {
         unsigned value = *va_arg(arguments, int *);
@@ -74,7 +87,7 @@ static int playback_ioctl(int fd, unsigned long request, ...) {
         fragment_frames = (1U << exponent) / frame_bytes;
         /* The regression control uses a 4410-frame logical ring. Other ring
          * sizes keep the ordinary rounded-up geometry, not a guessed model. */
-        if (geometry && capacity_frames == 4416 && fragment_frames == 64) {
+        if ((geometry%2) && capacity_frames == 4416 && fragment_frames == 64) {
             capacity_frames = 6016;
             fragment_frames = 128;
         }
@@ -99,11 +112,11 @@ static ssize_t playback_write(int fd, const void *data, size_t bytes) {
     unsigned long long frames = bytes / frame_bytes;
     ++write_calls;
     if (frames > max_request_frames) max_request_frames = frames;
-    if (frames > capacity_frames - queued_frames) frames = capacity_frames - queued_frames;
+    if (frames > capacity_frames - charged_frames()) frames = capacity_frames - charged_frames();
     if (!frames) { errno = EAGAIN; return -1; }
     queued_frames += frames;
     accepted_frames += frames;
-    if (observed_io && queued_frames > observed_io->buffer_size) ++logical_overfills;
+    if (observed_io && charged_frames() > observed_io->buffer_size) ++logical_overfills;
     return frames * frame_bytes;
 }
 /* Observe parameters without replacing any production callbacks. */

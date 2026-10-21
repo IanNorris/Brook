@@ -7,6 +7,7 @@
 #include <linux/soundcard.h>
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
+#include "brook_audio_queue.h"
 static unsigned physical_fragments = 256, physical_fragment_bytes = 256;
 static int rate_test_ioctl(int fd, unsigned long request, ...) {
     (void)fd;
@@ -15,6 +16,12 @@ static int rate_test_ioctl(int fd, unsigned long request, ...) {
     if (request == SNDCTL_DSP_GETCAPS) *va_arg(arguments, int *) = DSP_CAP_TRIGGER;
     else if (request == SNDCTL_DSP_GETFMTS) *va_arg(arguments, int *) = AFMT_S16_LE;
     else if (request == SNDCTL_DSP_GETODELAY) *va_arg(arguments, int *) = 0;
+    else if (request == BROOK_DSP_GETQUEUE) {
+        unsigned capacity=physical_fragments*physical_fragment_bytes/4;
+        *va_arg(arguments, struct BrookAudioQueue*)=(struct BrookAudioQueue){
+            BROOK_AUDIO_QUEUE_VERSION,BROOK_AUDIO_QUEUE_CLOCKED,1,0,0,
+            capacity,capacity,0,0,44100,4};
+    }
     else if (request == SNDCTL_DSP_GETOPTR)
         memset(va_arg(arguments, struct count_info *), 0, sizeof(struct count_info));
     else if (request == SNDCTL_DSP_GETOSPACE) {
