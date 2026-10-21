@@ -674,3 +674,13 @@ while audio/video pace is explicitly still bad. The overlapping FPS ranges and
 non-matched scenes limit this classification; it must be revisited if later
 controlled wall-time results disagree. Git selects
 `7c3c243670783faf1432bbdc7ab4be79316baf99` next, leaving five revisions after it.
+
+
+At third candidate `7c3c2436`, the user reports approximately 8 FPS in Quake,
+no audio for about ten seconds after startup, then fast audio. The user requests
+no further testing on this candidate and continuation of the bisect. Marked bad
+for rendering. Guest sync and original wrapper exit complete successfully,
+with all four offline fsck checks returning zero. Git selects
+`31f52bb7808b1d97b6aa99a072d5e0c95de39e27` next (two revisions after it),
+which predates the GPU sleeping-ownership change. No causal conclusion follows
+before testing the selected candidate.
