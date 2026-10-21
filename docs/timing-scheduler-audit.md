@@ -5,6 +5,14 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [POSIX timer/block admission](posix-timer-wakeups.md) now executes the actual
+  timer, block and unblock bodies in arranged hosted interleavings. The same
+  eighteen-case ELF passes on Linux and Brook, including masked/ignored
+  notifications, overruns, timerfd rearming and thread targeting, with clean
+  original job/VM/filesystem/runtime gates. No production change is needed for
+  those cases. Very large timeout semantics, arbitrary load and fallback clock
+  acceptance remain separate.
+
 - [Mixed real applications](mixed-desktop-timing.md) complete Firefox, two
   finite GL3 attract runs and eight guest CPU workers with clean original task,
   VM and filesystem lifecycles. Concurrent stream completion falls near
@@ -285,7 +293,7 @@ elapsed-clock candidate; historical baseline results follow below.
 | libc MONOTONIC fast path | read-only pvclock/TSC vDSO | `src/kernel/vdso/clock.c` | Compare forced syscall, libc, migration and version-update races |
 | REALTIME, gettimeofday, RTC display | immutable CMOS epoch plus pvclock elapsed | `src/kernel/src/rtc.cpp`, `RtcNowNs` | CMOS precision is one second; physical/unstable-clock fallback unaccepted |
 | timerfd expiry | selected nanosecond clock, lazy readiness refresh | `syscall.cpp`, `timerfd_state.h` | Delivery depends on readiness/wakeup paths; existing timerfd tests are not scheduler latency tests |
-| POSIX timer expiry | pvclock; REALTIME uses `RtcNowNs()` | `src/kernel/src/posix_timer.cpp`, `Now` | Epoch/fraction mismatch repaired; actual selector/expiry host regressions pass |
+| POSIX timer expiry | pvclock; REALTIME uses `RtcNowNs()` | `src/kernel/src/posix_timer.cpp`, `Now` | Epoch/fraction mismatch repaired; actual selector/expiry and arranged admission tests plus eighteen native cases pass; load/fallback and huge-timeout semantics remain |
 | Relative nanosleep | monotonic deadline rechecked after each wake | `syscall.cpp`, `sys_nanosleep` | Wake hints use the elapsed-millisecond domain; actual deadline recheck remains authoritative |
 | Absolute clock_nanosleep | selected-clock deadline, elapsed-millisecond wake hints | `syscall.cpp`, `sys_clock_nanosleep` | Recheck and request-overflow repair passes short guest regression; signal/load coverage remains |
 | futex, poll/select/epoll waits | nanosecond deadlines plus elapsed-millisecond wake hints in several paths | `syscall.cpp`, deadline conversion and waiter loops | Audit each retry, clock selection, signal and overflow path individually |
