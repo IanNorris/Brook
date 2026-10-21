@@ -5,6 +5,13 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Runtime correction debt visibility](runtime-debt-observation.md) now separates
+  known outstanding debt, valid CPU baselines, catchup, discarded epochs and
+  ownership crossings without changing charges or acceptance. All 73 hosted
+  suites and a bounded native clock/host-pressure test pass. About 4.2 million
+  native samples produce no correction; positive native history and all older
+  failed gates remain open.
+
 - [Large timeout saturation](timeout-saturation.md) fixes thirteen confirmed
   EINVAL failures for valid huge waits/timers. The same executable passes all
   24 cases on Linux and fixed Brook; all 73 hosted suites and the earlier

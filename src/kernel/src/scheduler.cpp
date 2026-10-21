@@ -442,6 +442,7 @@ void SchedulerRuntimeStatus(RuntimeStatus* output)
     const uint64_t flags = SchedLockAcquire(g_readyLock);
     RuntimeChargeLocked(ThisCpu(), RuntimeNow(ThisCpu()));
     output->diagnostics = g_runtime.Diagnostics();
+    output->debt = g_runtime.DebtStatus();
     output->stableClock = g_runtimeStableClock;
     output->storageBytes = sizeof(g_runtime);
     output->stealCpuMask = 0;

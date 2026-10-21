@@ -28,6 +28,14 @@ struct RuntimeClampEvidence {
     uint32_t cpu=0;
     uint16_t pid=0;
 };
+// Snapshot of known correction debt, not a bound on task attribution error.
+// baselineCpuMask distinguishes known zero from an unknown/discarded epoch.
+struct RuntimeDebtStatus {
+    uint64_t knownDebtNs=0, baselineCpuMask=0, maxCpuDebtNs=0;
+    uint64_t episodes=0, catchups=0, discardedDebtNs=0, invalidatedEpochs=0;
+    uint64_t ownerTransitions=0;
+    bool saturated=false;
+};
 struct RuntimeDiagnostics {
     uint64_t samples = 0, chargedNs = 0, idleNs = 0, invalidSamples = 0;
     uint64_t backwardsWall = 0, backwardsSteal = 0, clampedService = 0;
@@ -52,11 +60,12 @@ template<unsigned Tasks, unsigned Cpus> class RuntimeAccounting {
         uint16_t group = 0;
     } tasks_[Tasks]{};
     struct Cpu {
-        uint64_t wall, steal, serviceFloor, incarnation;
+        uint64_t wall, steal, serviceFloor, incarnation, debt;
         uint16_t pid;
         bool baseline;
     } cpus_[Cpus]{};
     RuntimeDiagnostics diagnostics_{};
+    RuntimeDebtStatus debt_{};
     RuntimeHistory<Cpus>* history_=nullptr;
 
     void Add(uint64_t& value, uint64_t amount) {
@@ -64,7 +73,32 @@ template<unsigned Tasks, unsigned Cpus> class RuntimeAccounting {
             value = ~uint64_t(0); ++diagnostics_.saturated;
         } else value += amount;
     }
+    void DebtAdd(uint64_t& value, uint64_t amount) {
+        if (amount > ~uint64_t(0)-value) { value=~uint64_t(0); debt_.saturated=true; }
+        else value+=amount;
+    }
+    void DiscardDebt(Cpu& cpu) {
+        if (cpu.baseline) {
+            DebtAdd(debt_.invalidatedEpochs,1);
+            DebtAdd(debt_.discardedDebtNs,cpu.debt);
+        }
+        cpu.debt=0;
+    }
 public:
+    // Compute the sum only on diagnostic reads, avoiding aggregate overflow
+    // bookkeeping in the hot path. A saturated snapshot is never exact.
+    RuntimeDebtStatus DebtStatus() const {
+        auto out=debt_;
+        for (unsigned i=0;i<Cpus;++i) {
+            const auto& cpu=cpus_[i];
+            if (!cpu.baseline) continue;
+            if (i<64) out.baselineCpuMask|=uint64_t(1)<<i;
+            if (cpu.debt>~uint64_t(0)-out.knownDebtNs) {
+                out.knownDebtNs=~uint64_t(0);out.saturated=true;
+            } else out.knownDebtNs+=cpu.debt;
+        }
+        return out;
+    }
     void SetHistory(RuntimeHistory<Cpus>* history) { history_=history; }
     bool Register(uint16_t pid, uint64_t incarnation, uint16_t group, uint64_t groupIncarnation) {
         if (!pid || pid >= Tasks || !incarnation || !group || group >= Tasks || !groupIncarnation)
@@ -96,7 +130,7 @@ public:
             return charged;
         };
         if (!sample.valid || sample.stealNs > sample.wallNs) {
-            ++diagnostics_.invalidSamples; state.baseline = false; return finish(RuntimeHistoryKind::Invalid);
+            ++diagnostics_.invalidSamples; DiscardDebt(state); state.baseline = false; return finish(RuntimeHistoryKind::Invalid);
         }
         const uint64_t service = sample.wallNs - sample.stealNs;
         if (!state.baseline) {
@@ -124,13 +158,16 @@ public:
             diagnostics_.lastStealNs = sample.stealNs;
             // Drop the unknown interval, including across the next dispatch.
             // Per-task cumulative clocks themselves never regress.
-            state.baseline = false; return finish(RuntimeHistoryKind::Backwards);
+            DiscardDebt(state); state.baseline = false; return finish(RuntimeHistoryKind::Backwards);
         }
         Add(diagnostics_.observedStealNs, sample.stealNs - state.steal);
         const uint64_t previousWall=state.wall,previousSteal=state.steal;
         state.wall = sample.wallNs; state.steal = sample.stealNs;
         if (service < state.serviceFloor) {
             ++diagnostics_.clampedService;
+            if (!state.debt) DebtAdd(debt_.episodes,1);
+            state.debt=state.serviceFloor-service;
+            if (state.debt>debt_.maxCpuDebtNs) debt_.maxCpuDebtNs=state.debt;
             const RuntimeClampEvidence evidence{diagnostics_.samples,previousWall,sample.wallNs,
                 previousSteal,sample.stealNs,state.serviceFloor,state.serviceFloor-service,
                 state.incarnation,cpu,state.pid};
@@ -138,6 +175,7 @@ public:
             if(evidence.deficitNs>diagnostics_.maxClamp.deficitNs)diagnostics_.maxClamp=evidence;
             return finish(RuntimeHistoryKind::Clamp);
         }
+        if (state.debt) { DebtAdd(debt_.catchups,1); state.debt=0; }
         const uint64_t delta = service - state.serviceFloor;
         state.serviceFloor = service;
         if (!state.pid) { Add(diagnostics_.idleNs, delta); return finish(RuntimeHistoryKind::Idle,0,delta); }
@@ -170,7 +208,10 @@ public:
             event.baselineBefore=event.baselineAfter=c.baseline;
             history_->Record(cpu,event);
         }
-        cpus_[cpu].pid = pid; cpus_[cpu].incarnation = incarnation;
+        auto& state=cpus_[cpu];
+        if (state.baseline && state.debt && (state.pid!=pid || state.incarnation!=incarnation))
+            DebtAdd(debt_.ownerTransitions,1);
+        state.pid = pid; state.incarnation = incarnation;
     }
     bool Read(uint16_t pid, uint64_t incarnation, bool group, uint64_t* output) const {
         if (!output || !pid || pid >= Tasks || tasks_[pid].incarnation != incarnation) return false;

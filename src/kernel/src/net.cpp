@@ -4431,7 +4431,18 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("previous_steal_ns",e.previousStealNs);r.text(",");r.field("steal_ns",e.stealNs);
             r.text(",");r.field("service_floor_ns",e.serviceFloorNs);r.text(",");r.field("deficit_ns",e.deficitNs);r.text("}");r.send();
         };
-        clamp("first_clamp",d.firstClamp);clamp("max_clamp",d.maxClamp);DebugChannelSend("}\n");
+        clamp("first_clamp",d.firstClamp);clamp("max_clamp",d.maxClamp);
+        const auto& debt=status.debt;
+        BridgeReply r;r.text(",\"debt\":{");
+        r.field("known_ns",debt.knownDebtNs);r.text(",");
+        r.field("baseline_cpu_mask",debt.baselineCpuMask);r.text(",");
+        r.field("max_cpu_ns",debt.maxCpuDebtNs);r.text(",");
+        r.field("episodes",debt.episodes);r.text(",");
+        r.field("catchups",debt.catchups);r.text(",");
+        r.field("discarded_ns",debt.discardedDebtNs);r.text(",");
+        r.field("invalidated_epochs",debt.invalidatedEpochs);r.text(",");
+        r.field("owner_transitions",debt.ownerTransitions);r.text(",\"saturated\":");
+        r.text(debt.saturated?"true":"false");r.text("}}\n");r.send();
     }
     else if(NetStrEq(cmd,"timer peers on") || NetStrEq(cmd,"timer peers off") ||
             NetStrEq(cmd,"timer peers reset") || NetStrEq(cmd,"timer peers status")) {

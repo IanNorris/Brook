@@ -368,6 +368,12 @@ int main() {
             EQUAL_DIAGNOSTIC(lastBackwardsCpu);EQUAL_DIAGNOSTIC(lastBackwardsPid);
 #undef EQUAL_DIAGNOSTIC
             equalEvidence(a.firstClamp,b.firstClamp);equalEvidence(a.maxClamp,b.maxClamp);
+            const auto da=plain.DebtStatus(),db=watched.DebtStatus();
+#define EQUAL_DEBT(field) CHECK(da.field==db.field)
+            EQUAL_DEBT(knownDebtNs);EQUAL_DEBT(baselineCpuMask);EQUAL_DEBT(maxCpuDebtNs);
+            EQUAL_DEBT(episodes);EQUAL_DEBT(catchups);EQUAL_DEBT(discardedDebtNs);
+            EQUAL_DEBT(invalidatedEpochs);EQUAL_DEBT(ownerTransitions);EQUAL_DEBT(saturated);
+#undef EQUAL_DEBT
         }
         for(unsigned pid=1;pid<=4;++pid)for(bool group:{false,true}){
             uint64_t a=0,b=0;CHECK(plain.Read(pid,generation[pid],group,&a) && watched.Read(pid,generation[pid],group,&b) && a==b);

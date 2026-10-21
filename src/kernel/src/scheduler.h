@@ -232,6 +232,7 @@ bool SchedulerCpuTime(Process* proc, bool group, uint64_t* result);
 void SchedulerCpuTimeRebind(Process* proc);
 struct RuntimeStatus {
     RuntimeDiagnostics diagnostics{};
+    RuntimeDebtStatus debt{};
     uint64_t storageBytes = 0, stealCpuMask = 0;
     bool stableClock = false;
 };

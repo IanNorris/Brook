@@ -84,3 +84,8 @@ replay a positive retained native history through the independent model.
 No accounting acceptance rule, scheduler default, native sample retry or
 service charge changes in this work. See the [cumulative failed evidence](runtime-clamp-evidence.md)
 and [bounded history limitations](runtime-accounting-history.md).
+
+The [debt observation follow-up](runtime-debt-observation.md) adds these
+prospective diagnostic prerequisites and checks them against the independent
+model after every event. Its native integration capture is negative; positive
+full-history evidence and any new acceptance contract remain outstanding.

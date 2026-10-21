@@ -15,6 +15,7 @@ struct ConsumedSteal {
     uint64_t wall = 0, published = 0, consumed = 0;
     uint64_t originWall = 0, originSteal = 0, epochCredit = 0;
     uint64_t discardedDebt = 0, discardedEpochs = 0;
+    uint64_t episodes = 0, catchups = 0, peak = 0;
     bool valid = false;
 
     uint64_t debt() const { return valid ? published - consumed : 0; }
@@ -30,12 +31,16 @@ struct ConsumedSteal {
             epochCredit = 0; valid = true; return 0;
         }
         if (s.wallNs < wall || s.stealNs < published) { discard(); return 0; }
+        const auto previousDebt = debt();
         const uint64_t elapsed = s.wallNs - wall;
         const uint64_t pending = s.stealNs - consumed;
         const uint64_t deducted = pending < elapsed ? pending : elapsed;
         consumed += deducted;
         const uint64_t credit = elapsed - deducted;
         epochCredit += credit; wall = s.wallNs; published = s.stealNs;
+        if (!previousDebt && debt()) ++episodes;
+        if (previousDebt && !debt()) ++catchups;
+        if (debt() > peak) peak = debt();
         // Wide signed arithmetic makes the conservation check meaningful even
         // when new published steal temporarily exceeds elapsed epoch wall.
         CHECK(static_cast<__int128>(epochCredit) ==
@@ -128,6 +133,19 @@ int main() {
             owner[cpu] = selected;
             ledger.SetOwner(cpu, owner[cpu], owner[cpu] ? 100 + owner[cpu] : 0);
         }
+        const auto debt = ledger.DebtStatus();
+        uint64_t known = 0, mask = 0, lost = 0, epochs = 0, episodes = 0, catchups = 0, peak = 0;
+        for (unsigned c = 0; c < 4; ++c) {
+            const auto& r = refs[c]; known += r.debt();
+            if (r.valid) mask |= uint64_t(1) << c;
+            lost += r.discardedDebt; epochs += r.discardedEpochs;
+            episodes += r.episodes; catchups += r.catchups;
+            if (r.peak > peak) peak = r.peak;
+        }
+        CHECK(debt.knownDebtNs == known && debt.baselineCpuMask == mask);
+        CHECK(debt.discardedDebtNs == lost && debt.invalidatedEpochs == epochs);
+        CHECK(debt.episodes == episodes && debt.catchups == catchups);
+        CHECK(debt.maxCpuDebtNs == peak && debt.ownerTransitions == debtCrossings && !debt.saturated);
         CHECK(ledger.Diagnostics().chargedNs == active && ledger.Diagnostics().idleNs == idle);
         for (unsigned pid = 1; pid <= 8; ++pid) {
             uint64_t value = 0;
@@ -141,6 +159,41 @@ int main() {
     CHECK(lost > 0 && epochs > 0 && debtCrossings > 0 && ledger.Diagnostics().clampedService > 0);
     CHECK(ledger.Diagnostics().invalidSamples > 0 && ledger.Diagnostics().backwardsWall > 0 && ledger.Diagnostics().backwardsSteal > 0);
     CHECK(!ledger.Diagnostics().staleIdentity && !ledger.Diagnostics().saturated);
+
+    // Attribution exposure counts actual owner identity changes, including
+    // PID reuse and idle, without erasing debt or counting idempotent writes.
+    {
+        brook::RuntimeAccounting<4,2> l;
+        l.Dispatch(0,1,11,at(1000));l.Sample(0,at(1000,100));
+        l.SetOwner(0,1,11);CHECK(l.DebtStatus().ownerTransitions==0);
+        l.SetOwner(0,1,12);l.SetOwner(0,0,0);
+        CHECK(l.DebtStatus().ownerTransitions==2 && l.DebtStatus().knownDebtNs==100);
+        l.Sample(0,at(1050,100));CHECK(l.DebtStatus().knownDebtNs==50);
+        l.Sample(0,at(1100,100));
+        CHECK(l.DebtStatus().catchups==1 && !l.DebtStatus().knownDebtNs);
+        l.Sample(0,at(1100,150));l.Sample(0,{});l.Sample(0,{});
+        auto d=l.DebtStatus();
+        CHECK(d.episodes==2 && d.catchups==1 && d.discardedDebtNs==50);
+        CHECK(d.invalidatedEpochs==1 && d.baselineCpuMask==0);
+        l.Sample(0,at(2000,150));d=l.DebtStatus();
+        CHECK(d.baselineCpuMask==1 && d.catchups==1 && !d.knownDebtNs);
+        l.Sample(0,at(1999,150));l.Sample(0,{});
+        CHECK(l.DebtStatus().invalidatedEpochs==2); // zero-debt lost epoch too
+    }
+    // An overflowing diagnostic sum/cumulative counter is explicit and cannot
+    // change charges. Snapshot sum saturation is not a persistent debt value.
+    {
+        constexpr uint64_t top=~uint64_t(0);
+        brook::RuntimeAccounting<2,2> l;
+        for(unsigned c=0;c<2;++c){l.Sample(c,at(top));l.Sample(c,at(top,top));}
+        auto d=l.DebtStatus();CHECK(d.knownDebtNs==top && d.saturated && d.maxCpuDebtNs==top);
+        l.Sample(1,{});d=l.DebtStatus();
+        CHECK(d.knownDebtNs==top && !d.saturated && d.discardedDebtNs==top);
+        l.Sample(0,{});d=l.DebtStatus();
+        CHECK(d.saturated && d.discardedDebtNs==top && !d.knownDebtNs);
+        CHECK(d.invalidatedEpochs==2 && d.episodes==2 && !d.catchups);
+        CHECK(!l.Diagnostics().chargedNs && !l.Diagnostics().idleNs);
+    }
 
     // The reference comparison deliberately stays in Linux's signed-delta
     // domain, while checking subtraction near its representable upper edge.
