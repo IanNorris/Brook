@@ -45,6 +45,21 @@ requests guest shutdown on success. The caller must still wait for its owned
 launcher, verify authoritative QEMU exit, inspect serial/heap results, run offline
 filesystem checks and verify saved-user-data preservation.
 
+The historical media socket write timeout is ten seconds. Slow guest readers
+can exhaust it and receive a truncated resource even though the host clip is
+valid. A separate cohort may explicitly pass `--media-write-timeout 60`
+(finite, positive, at most 300 seconds). This bounds individual writes, not the
+whole transfer, and does not change the ten-second request-read timeout. Record
+the timeout as a fixture change; do not pool its results with earlier cohorts.
+`server.json` pins the source length/hash and timeout. Each media GET appends
+`media-transfers.jsonl` with completed write bytes/hash, source identity, host
+brackets, any requested range and failure details. Range requests retain the
+historical HTTP 200/full-file behavior. A failed write can partially transmit
+its uncertain block: completed write counts are a lower bound, not exact wire
+delivery or proof of guest receipt. Require a complete, full-length matching
+transfer before accepting media-tail or looping results; guest-side byte
+verification and browser errors remain separate checks.
+
 On an observation timeout, inspect the existing receipts/job/VM. Re-running with
 the same output directory resumes known tracked operations; it never creates a
 replacement job merely because observation timed out. An unresolved input or
