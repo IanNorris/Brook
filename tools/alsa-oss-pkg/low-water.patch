@@ -1,0 +1,76 @@
+--- a/oss/pcm_oss.c
++++ b/oss/pcm_oss.c
+@@ -22,6 +22,12 @@
+ #include <stdio.h>
+ #include <pthread.h>
+ #include <sys/ioctl.h>
++#include <limits.h>
++
++/* OSS4 poll/select low-water control, absent from Linux OSS3 headers. */
++#ifndef SNDCTL_DSP_LOW_WATER
++#define SNDCTL_DSP_LOW_WATER _IOW('P', 34, int)
++#endif
+ #include <alsa/asoundlib.h>
+ #include <alsa/pcm_external.h>
+ #if defined(__linux__)
+@@ -240,6 +246,44 @@
+ 	pthread_mutex_unlock(&oss->lock);
+ 	return result;
+ }
++/* Make the descriptor itself block until ALSA's native software ring has
++ * avail_min frames available. Filtering revents alone leaves a level-ready
++ * descriptor spinning. The physical OSS ring may include rounded spare space.
++ * The ioplug sw_params callback receives the slave's native geometry, including
++ * when this PCM is behind an outer rate-converting plug. */
++static int oss_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params)
++{
++    snd_pcm_oss_t *oss = io->private_data;
++    snd_pcm_uframes_t minimum;
++    struct audio_buf_info space;
++    unsigned long long capacity, threshold;
++    int bytes, result;
++    result = snd_pcm_sw_params_get_avail_min(params, &minimum);
++    if (result < 0) return result;
++    if (!oss->frame_bytes || !io->buffer_size || !io->period_size || !minimum || minimum > io->buffer_size)
++        return -EINVAL;
++    pthread_mutex_lock(&oss->lock);
++    if (ioctl(oss->fd, SNDCTL_DSP_GETOSPACE, &space) < 0) { result = -errno; goto out; }
++    if (space.fragstotal <= 0 || space.fragsize <= 0) { result = -EPROTO; goto out; }
++    capacity = (unsigned long long)space.fragstotal * (unsigned int)space.fragsize;
++    if (capacity % oss->frame_bytes || capacity / oss->frame_bytes < io->buffer_size) {
++        result = -EPROTO; goto out;
++    }
++    /* The rate plugin commits whole native periods and can leave the final
++     * partial period of this logical ring unused. Count that tail as spare
++     * capacity too; one native frame also covers conversion rounding. This
++     * is a conservative threshold for the direct native path. */
++    snd_pcm_uframes_t spare = io->buffer_size % io->period_size + 1;
++    minimum += spare < io->buffer_size - minimum ? spare : io->buffer_size - minimum;
++    threshold = (capacity / oss->frame_bytes - io->buffer_size + minimum) * oss->frame_bytes;
++    if (capacity > INT_MAX || threshold > INT_MAX) { result = -EOVERFLOW; goto out; }
++    bytes = (int)threshold;
++    result = ioctl(oss->fd, SNDCTL_DSP_LOW_WATER, &bytes) < 0 ? -errno : 0;
++out:
++    pthread_mutex_unlock(&oss->lock);
++    return result;
++}
++
+ static int oss_hw_params(snd_pcm_ioplug_t *io,
+ 			 snd_pcm_hw_params_t *params ATTRIBUTE_UNUSED)
+ {
+@@ -395,6 +433,7 @@
+ 	.delay = oss_delay,
+ 	.close = oss_close,
+ 	.hw_params = oss_hw_params,
++	.sw_params = oss_sw_params,
+ 	.prepare = oss_prepare,
+ 	.drain = oss_drain,
+ };
+@@ -407,6 +446,7 @@
+ 	.delay = oss_delay,
+ 	.close = oss_close,
+ 	.hw_params = oss_hw_params,
++	.sw_params = oss_sw_params,
+ 	.prepare = oss_prepare,
+ 	.drain = oss_drain,
+ };

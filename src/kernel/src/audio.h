@@ -100,6 +100,9 @@ bool AudioMixerReset(AudioStreamId stream);
 bool AudioMixerSetEnabled(AudioStreamId stream, bool enabled);
 // Empty streams may negotiate a smaller capacity; reset preserves geometry.
 bool AudioMixerSetCapacity(AudioStreamId stream, uint32_t frames, uint32_t writableFrames = 1);
+// Readiness threshold only; may change on an active stream without resetting
+// its queue, playback epoch or completion clock.
+bool AudioMixerSetWritableFrames(AudioStreamId stream, uint32_t frames);
 
 struct AudioStreamProgress {
     uint64_t epoch = 0;

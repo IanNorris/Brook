@@ -41,6 +41,40 @@ Hardware capacity never substitutes for the logical ring size. The kernel's
 16,384-frame capacity limit is preserved. The old plugin failed 20/30 host
 negotiations; the corrected plugin passes all 30.
 
+An **opt-in, incomplete** readiness experiment is available with:
+
+```sh
+nix-build --expr 'import ./tools/alsa-oss-pkg { lowWaterReadiness = true; }' --no-out-link
+```
+
+It uses the OSS4 `SNDCTL_DSP_LOW_WATER` byte threshold so raw descriptor polling
+can block instead of waking every 64 native frames. Brook's native-rate setter
+changes readiness without changing queued data or the completion clock, and
+reset preserves the threshold. The
+[FreeBSD OSS implementation](https://cgit.freebsd.org/src/tree/sys/dev/sound/pcm/dsp.c)
+documents the same select/poll byte contract. Linux ioctl encoding is used.
+
+The fixture uses the real ALSA plugin, libasound and `poll`, with an eventfd
+modeling device readiness. Aligned-period tests pass at 8, 22.05, 44.1, 48 and
+96 kHz, including threshold boundaries, live `avail_min` changes, reprepare and
+unsupported-device errors. These are not general converted-client acceptance.
+The optional `test-oss-readiness PLUGIN 8000 --partial` gate fails: accepting
+799/800 client frames leaves a partial period in the rate layer. After one
+native frame advances, raw poll is ready with only 1/200 client frames free.
+The static slave threshold cannot observe that pending client data. The normal
+package therefore leaves this experiment disabled. A correct general solution
+must incorporate the outer rate layer's pending state and verify irregular
+refills across ring wrap.
+
+The exploratory native Firefox pair is retained under
+`build/reviews/alsa-low-water-pair-2-20261021`. Its selected audio-thread ioctl
+count fell from 2,634 to 857 for similarly sized accepted audio payloads, but
+this same-boot control/candidate order is not balanced. Page progress telemetry
+was missing during the capture windows, and PCM samples are not aligned to a
+decoded reference. This is not acceptance of playback pace or smoothness.
+The first pair failed at a guest-script substitution before playback; its clean
+shutdown and failure evidence are retained separately.
+
 Export for an isolated guest installation:
 
 ```sh

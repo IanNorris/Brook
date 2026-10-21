@@ -108,6 +108,33 @@ void diagnosticSnapshot() {
     CHECK(found == 1);
     CHECK(AudioMixerClose(replacement));
 }
+void writableThreshold() {
+    using namespace brook;
+    auto stream=AudioMixerOpen();CHECK(stream);
+    CHECK(AudioMixerSetCapacity(stream,256,64));
+    std::vector<int16_t> samples(128,42);
+    CHECK(AudioMixerSubmit(samples.data(),64,stream)==64);
+    AudioStreamProgress before{},after{};
+    CHECK(AudioMixerGetProgress(stream,&before));
+    CHECK(before.capacityFrames==256 && before.writableFrames==64);
+    CHECK(AudioMixerSetWritableFrames(stream,193));
+    CHECK(AudioMixerGetProgress(stream,&after));
+    CHECK(after.writableFrames==193 && after.queuedFrames==before.queuedFrames);
+    CHECK(after.epoch==before.epoch && after.submittedFrames==before.submittedFrames &&
+          after.completedFrames==before.completedFrames);
+    CHECK(after.capacityFrames-after.queuedFrames<after.writableFrames);
+    CHECK(AudioMixerSetWritableFrames(stream,192));
+    CHECK(AudioMixerGetProgress(stream,&after));
+    CHECK(after.capacityFrames-after.queuedFrames>=after.writableFrames);
+    CHECK(!AudioMixerSetWritableFrames(stream,0));
+    CHECK(!AudioMixerSetWritableFrames(stream,257));
+    CHECK(AudioMixerGetProgress(stream,&after) && after.writableFrames==192);
+    CHECK(AudioMixerReset(stream));
+    CHECK(AudioMixerGetProgress(stream,&after) && after.writableFrames==192 && !after.queuedFrames);
+    CHECK(AudioMixerSetCapacity(stream,128,32));
+    CHECK(AudioMixerGetProgress(stream,&after) && after.writableFrames==32);
+    CHECK(AudioMixerClose(stream));CHECK(!AudioMixerSetWritableFrames(stream,1));
+}
 void concurrentFlush() {
     std::vector<int16_t> first(80,1234),second(60,-2345);
     auto expected=raw(first),tail=raw(second);expected.insert(expected.end(),tail.begin(),tail.end());
@@ -276,6 +303,7 @@ int main() {
     primary=brook::AudioMixerOpen();secondary=brook::AudioMixerOpen();
     CHECK(primary && secondary && primary!=secondary);
     diagnosticSnapshot();
+    writableThreshold();
     // The baseline must fail cleanly on lost partial data before concurrency.
     if(!partialAndErrors())return 1;
     concurrentFlush();stopInvalidatesSuffix();ringAndClamping();ownedQueues();

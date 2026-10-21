@@ -249,6 +249,16 @@ bool AudioMixerSetCapacity(AudioStreamId identity, uint32_t frames, uint32_t wri
     SpinLockRelease(&g_mixerLock);
     return empty;
 }
+bool AudioMixerSetWritableFrames(AudioStreamId identity, uint32_t frames)
+{
+    if (!frames) return false;
+    SpinLockAcquire(&g_mixerLock);
+    auto* stream = FindStream(identity);
+    const bool valid = stream && frames <= stream->capacity;
+    if (valid) stream->writableFrames = frames;
+    SpinLockRelease(&g_mixerLock);
+    return valid;
+}
 uint32_t AudioMixerAvailableFrames(AudioStreamId identity)
 {
     SpinLockAcquire(&g_mixerLock);

@@ -1650,6 +1650,7 @@ static constexpr uint64_t SNDCTL_DSP_SETTRIGGER= 0x40045010; // _IOW('P', 0x10, 
 static constexpr uint64_t SNDCTL_DSP_GETFMTS   = 0x8004500B; // _IOR('P', 0x0B, int)
 static constexpr uint64_t SNDCTL_DSP_SETFRAGMENT= 0xC004500A;// _IOWR('P', 0x0A, int)
 static constexpr uint64_t SNDCTL_DSP_GETBLKSIZE = 0xC0045004;// _IOWR('P', 4, int)
+static constexpr uint64_t SNDCTL_DSP_LOW_WATER = 0x40045022;// OSS4 _IOW('P', 34, int), poll threshold in input bytes
 
 // OSS audio formats
 static constexpr int AFMT_U8     = 0x00000008;
@@ -7066,7 +7067,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         int value = 0;
         const bool input = cmd == SNDCTL_DSP_SPEED || cmd == SNDCTL_DSP_SETFMT ||
             cmd == SNDCTL_DSP_CHANNELS || cmd == SNDCTL_DSP_STEREO ||
-            cmd == SNDCTL_DSP_SETFRAGMENT || cmd == SNDCTL_DSP_SETTRIGGER;
+            cmd == SNDCTL_DSP_SETFRAGMENT || cmd == SNDCTL_DSP_SETTRIGGER ||
+            cmd == SNDCTL_DSP_LOW_WATER;
         if (input && !CopyFromUser(&value, arg, sizeof(value))) return -EFAULT;
         if (cmd == SNDCTL_DSP_SPEED) {
             if (value > 0) {
@@ -7131,6 +7133,15 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             dsp->fragmentSize = size; dsp->ringBytes = bytes;
             ++dsp->controlEpoch;
             return 0; // Exact requested nonzero count; never silently clamp it.
+        } else if (cmd == SNDCTL_DSP_LOW_WATER) {
+            // This endpoint's readiness accounting is in native mixer frames.
+            // Do not silently reinterpret converted-rate byte counts.
+            if (!progress.clocked || dsp->sampleRate != MIXER_HW_RATE) return -95;
+            const uint32_t frameBytes = dsp->channels * (dsp->bitsPerSample / 8);
+            if (value <= 0 || static_cast<uint32_t>(value) % frameBytes ||
+                static_cast<uint32_t>(value) / frameBytes > progress.capacityFrames) return -EINVAL;
+            if (!AudioMixerSetWritableFrames(dsp->mixerStreamId, static_cast<uint32_t>(value) / frameBytes)) return -EBADF;
+            return 0; // _IOW: no output copy and no queue/pointer reset.
         } else if (cmd == SNDCTL_DSP_GETBLKSIZE) value = static_cast<int>(dsp->fragmentSize);
         else if (cmd == SNDCTL_DSP_SETTRIGGER) {
             if (value & ~2) return -95; // EOPNOTSUPP: output only; no capture endpoint.

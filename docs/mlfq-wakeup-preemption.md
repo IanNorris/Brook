@@ -199,3 +199,17 @@ Evidence is retained in `mlfq-realtime-before.log`,
 `build/workloads/timing-scheduler-20261020`. Astra reviewed the production
 policy change read-only. Native workload impact on the reported stutter has
 not yet been established.
+
+The candidate subsequently passed all 70 host suites and the compiled entry
+and scheduler-start audits. Native review
+`build/reviews/mlfq-reserved-native-20261021` ran Firefox animation alongside
+four 20-second anonymous-memory workers. All four completed, with 2,320 verified
+16-MiB allocation/touch/free cycles (36.25 GiB total traffic, bounded simultaneous
+working set). The original wrapper exited zero; heap integrity and all four
+filesystem checks passed. The drainer's identity-bound decision watch recorded
+zero expiry decisions. `SchedulerTimerTick` returns before the preemption
+decision for interrupted kernel execution, so this does not exercise native
+drainer demotion or establish an audio benefit. The reserved-band expiry rule
+is verified by the production-module host regression, not by that empty native
+trace. The native workload is also not a 32-GiB vmalloc endurance test: anonymous
+user pages are a different allocation path.

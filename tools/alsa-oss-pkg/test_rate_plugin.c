@@ -7,6 +7,7 @@
 #include <linux/soundcard.h>
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
+static unsigned physical_fragments = 256, physical_fragment_bytes = 256;
 static int rate_test_ioctl(int fd, unsigned long request, ...) {
     (void)fd;
     va_list arguments;
@@ -16,6 +17,11 @@ static int rate_test_ioctl(int fd, unsigned long request, ...) {
     else if (request == SNDCTL_DSP_GETODELAY) *va_arg(arguments, int *) = 0;
     else if (request == SNDCTL_DSP_GETOPTR)
         memset(va_arg(arguments, struct count_info *), 0, sizeof(struct count_info));
+    else if (request == SNDCTL_DSP_GETOSPACE) {
+        struct audio_buf_info *space = va_arg(arguments, struct audio_buf_info *);
+        memset(space, 0, sizeof(*space));
+        space->fragstotal = physical_fragments; space->fragsize = physical_fragment_bytes;
+    }
     else if (request == SNDCTL_DSP_SETFRAGMENT) {
         unsigned value = (unsigned)*va_arg(arguments, int *);
         unsigned exponent = value & 0xffff, count = value >> 16;
@@ -24,6 +30,7 @@ static int rate_test_ioctl(int fd, unsigned long request, ...) {
             (unsigned long long)count * (1U << exponent) > 65536) {
             va_end(arguments);errno = EINVAL;return -1;
         }
+        physical_fragments = count; physical_fragment_bytes = 1U << exponent;
     }
     va_end(arguments);
     return 0;
