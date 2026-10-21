@@ -31,6 +31,10 @@ def notify_marker(url, name):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, required=True)
+    parser.add_argument('--uncapped', action='store_true',
+                        help='Benchmark with timedemo=1 and r_vsync=0; bypass engine frame pacing')
+    parser.add_argument('--measured-frames', type=int, default=150,
+                        help='Original demo frame records after 49 warmup records (default: 150)')
     parser.add_argument('--engine', type=Path, help='Direct engine path for the Linux reference; default uses Brook wrapper')
     parser.add_argument('--pak-dir', type=Path,
                         default=Path('/data/games/quake2/baseq2'))
@@ -42,6 +46,9 @@ def main():
                         help='Optional host HTTP endpoint acknowledging /START and /END '
                              'with JSON marker and host_ns fields')
     args = parser.parse_args()
+    if not 1 <= args.measured_frames <= 2000:
+        parser.error('--measured-frames must be between 1 and 2000')
+    total_frames = 50 + args.measured_frames
     if args.music_only and args.music_track is None:
         parser.error('--music-only requires --music-track')
     home = args.home
@@ -84,12 +91,13 @@ def main():
         if packet[:1] == b'\x14':  # svc_frame at the start of this packet
             frame_records.append((len(records), struct.unpack_from('<i', packet, 1)[0]))
         records.append(packet)
-        if len(frame_records) >= 200:
+        if len(frame_records) >= total_frames:
             break
-    assert len(frame_records) == 200
-    first, last = frame_records[49][0], frame_records[199][0]
-    assert last - first == 150, 'Unexpected non-frame records in measured section'
-    assert frame_records[199][1] - frame_records[49][1] == 150, 'Nonconsecutive frames'
+    assert len(frame_records) == total_frames, 'Owned demo is shorter than requested capture'
+    first, last = frame_records[49][0], frame_records[total_frames-1][0]
+    measured = frame_records[49:total_frames]
+    assert all(b[1] > a[1] for a, b in zip(measured, measured[1:])), 'Non-increasing frame numbers'
+    server_frame_delta = measured[-1][1] - measured[0][1]
 
     def marker(text):
         return b'\x0b' + text.encode() + b'\n\0'  # svc_stufftext
@@ -108,11 +116,14 @@ def main():
             stream.write(struct.pack('<i', len(packet)))
             stream.write(packet)
         stream.write(struct.pack('<i', -1))
-    metadata = dict(recorded_frame_delta=150, measured_demo_records=150,
+    metadata = dict(recorded_frame_delta=server_frame_delta, measured_frame_records=args.measured_frames,
+                    measured_demo_records=last-first,
+                    uncapped=args.uncapped,
                     music_track=args.music_track,
                     music_only=args.music_only,
-                    inserted_start_record=1, expected_server_interval_s=15.1,
-                    scope='150 original packets plus the start marker tick; '
+                    inserted_start_record=1,
+                    expected_server_interval_s=None if args.uncapped else (server_frame_delta+1)/10,
+                    scope=str(args.measured_frames) + ' original frame records with embedded packets and frame-number gaps preserved, plus the start marker tick; '
                           'log observations include reader scheduling latency')
     print('Q2_TIMING_PREPARED', json.dumps(metadata), flush=True)
     if args.engine:
@@ -132,7 +143,29 @@ def main():
             '+set', 'r_customheight', '720', '+set', 'vid_fullscreen', '0',
             '+set', 'cl_maxfps', '60', '+set', 'timedemo', '0',
             '+set', 'nextdemo', 'quit', '+demomap', 'brook-timing.dm2']
-    if args.music_only:
+    if args.uncapped:
+        # Yamagi 8.60 separates packet (cl_maxfps) and render (vid_maxfps)
+        # limits. Its true bypass is timedemo: common/frame.c skips both
+        # pacing tests. vid_maxfps=0 alone would be clamped to 999, not infinity.
+        argv = prefix + [
+            '+set', 'r_vsync', '0',
+        ] + argv[len(prefix):]
+        argv[argv.index('cl_maxfps')+1] = '250'
+        timedemo = argv.index('timedemo')
+        argv[timedemo+1] = '1'
+        # The wrapper adds arguments of its own and Yamagi accepts at most 50.
+        # Keep initialization-sensitive values above; use a private late script
+        # for the remaining settings and queries instead of overflowing argv.
+        queries = 'set vid_maxfps 999\nset cl_async 1\n'
+        if args.music_only:
+            queries += 'set s_volume 0\nset ogg_volume 0.7\n'
+        queries += 'r_vsync\nvid_maxfps\ncl_maxfps\ncl_async\ntimedemo\n'
+        query_name = 'brook-benchmark-query.cfg'
+        (demo_dir.parent / query_name).write_text(queries)
+        # Print effective cvars into the retained log as an independent check
+        # of command-line intent; saved configuration remains another check.
+        argv += ['+exec', query_name]
+    if args.music_only and not args.uncapped:
         # OpenAL streams use ogg_volume separately from the effects gain.
         argv = prefix + ['+set', 's_volume', '0', '+set', 'ogg_volume', '0.7'] + argv[len(prefix):]
     started = time.monotonic_ns()
@@ -162,7 +195,7 @@ def main():
 
     with (home / 'timing-stdout.log').open('wb') as output:
         process = subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT)
-        deadline = time.monotonic() + 110
+        deadline = time.monotonic() + max(110, args.measured_frames/5+30)
         try:
             while process.poll() is None:
                 inspect_log()
@@ -195,7 +228,8 @@ def main():
     (home / 'timing-result.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result), flush=True)
     assert exit_code == 0 and set(markers) == {'START', 'END'}, result
-    assert result['observed_demo_interval_s'] > 5, 'Buffered markers invalidate timing'
+    if not args.uncapped:
+        assert result['observed_demo_interval_s'] > min(5, (args.measured_frames+1)/20), 'Buffered markers invalidate timing'
 
 
 if __name__ == '__main__':

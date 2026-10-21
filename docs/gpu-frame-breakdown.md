@@ -215,3 +215,161 @@ and four clean offline filesystem checks. This is one candidate cohort without
 a matched performance control or comprehensive rendering-correctness verdict.
 The outstanding GL/Vulkan comparisons and larger fence/pacing targets remain
 open.
+
+## Matched host controls and uncapped Quake benchmark
+
+The loaded experiment repeats the same frozen guest and actual client sizes
+with only the matched host fence-poll build changed. The 1 ms → 10 ms → 1 ms
+sequence gives:
+
+| Application measurement | 1 ms, A | 10 ms, A | 1 ms, B |
+| --- | ---: | ---: | ---: |
+| Quake GL3 observed swap completions/s | 22.33 | 11.59 | 21.33 |
+| vkmark vertex FPS | 37 | 16 | 37 |
+| vkmark texture FPS | 38 | 16 | 37 |
+
+**These Quake runs had VSync enabled.** The saved config explicitly contains
+`r_vsync "1"`; they remain application pacing measurements, not uncapped GPU
+throughput. `cl_maxfps=60` is the packet limit with Yamagi's default async
+rendering, not its render cap. Quake's recorded compositor body p50 is
+4.185 ms at 1 ms polling versus 20.026 ms at 10 ms. Separate host traces show
+compositor-context fence-response p50 2.049 versus 9.517 ms. That observation
+includes host polling/scheduling and is not GPU execution duration. The
+host trace analyzer excludes sequential-enable/disable transitions using a
+known-enabled clock interval; boundary partials stay explicit and interior
+identity/ordering failures remain errors.
+
+At the user's request, a separate fixed-demo benchmark explicitly disables
+VSync and bypasses engine frame pacing. The exact Yamagi source uses
+`timedemo=1` to skip both packet and render pacing; `vid_maxfps=0` alone would
+be clamped to 999. The new `--uncapped` option in
+`scripts/workloads/q2_demo_timing.py` sets `r_vsync=0`, `timedemo=1`,
+`cl_async=1`, `cl_maxfps=250` and `vid_maxfps=999`. Effective cvar queries and
+saved config confirm these values in both runs. The extra queries use a
+private config script because the engine's 50-argument limit rejected the
+first attempt. That failed launch and a failed verification query remain
+retained; the completed benchmark was not rerun to recover its evidence.
+
+| Uncapped Quake measurement | 1 ms host poll | 10 ms host poll |
+| --- | ---: | ---: |
+| Built-in timedemo, 200 frames | 38.6 FPS | 13.5 FPS |
+| Observed steady SDL completions/s | 43.09 | 13.43 |
+| Complete inter-swap interval p50 / p95 | 19.04 / 47.32 ms | 75.08 / 100.05 ms |
+
+The built-in numbers include the warmup section. The SDL window uses observed
+START through the final available swap; END is observed about 20.58/10.49 ms
+after that swap. Strict analysis rejects the original uncovered bounds, so
+the adjusted bounds and uncovered tails are explicit. Marker timing is not
+an exact GPU frame boundary. Timedemo is unpaced simulation and does not test
+normal-speed demo/audio playback. This is one ordered uncapped pair, not a
+balanced repeated benchmark or a claim that GPU work itself became 2.9× faster.
+
+Evidence is in private reviews
+`unattended-loaded-recorder-gpu-{1,10}ms-fixed-mlfq-{a,b}-20261021`
+(only existing combinations), and
+`unattended-uncapped-q2-gpu-{1,10}ms-fixed-mlfq-a-20261021`.
+The successful 1 ms uncapped run is under `uncapped-q2-retry/`; the 10 ms run
+uses `uncapped-q2/`. Both raw traces are hash-checked against guest metadata
+after original owner exit and four clean offline filesystem checks. The
+VSync-on reversal likewise passes its health, output and disk checks.
+
+`tools/qemu-fence-poll-pkg/default.nix` makes the host controls reproducible.
+With the repository's pinned package set, its 1 ms and 10 ms derivations and
+realized outputs exactly match the tested binaries. It changes the guarded
+single `virtio_gpu_fence_poll` timer site, preserving the shared patches and
+configure options. The normal launcher selection remains unchanged. To opt
+in before using an existing GL/Venus launch command:
+
+```sh
+export BROOK_GPU_QEMU="$(nix-build tools/qemu-fence-poll-pkg \
+  --no-out-link --arg fencePollMs 1)"
+```
+
+The package is guarded to QEMU 10.2.2 and rejects a changed patch site. The
+measured gain belongs to faster host completion observation; the independent
+compose storage remains a correctness foundation with no demonstrated material
+throughput gain on its own. Additive pacing, remaining app-side waits and
+broader input/rendering acceptance still require investigation. Timing, audio
+and scheduler findings remain open.
+
+The 1 ms uncapped VM also records one scheduler service clamp of 427 ns
+(PID 14, CPU 1); its runtime acceptance gate fails. The debt is subsequently
+caught up, but this is retained as an unresolved accounting finding, not
+waived by the clean process exit, heap or filesystem checks. The 10 ms
+uncapped VM has zero runtime error counters. These throughput observations
+therefore do not establish full acceptance or a scheduler-default change.
+
+For the 1 ms uncapped trace, complete frame intervals partition exactly into
+41.16% inside SDL swap and 58.84% between calls. The respective p50/p95
+durations are 4.05/40.10 ms and 14.77/18.66 ms. Between-call time includes
+simulation, rendering, driver calls, kernel waits and scheduling; it is not
+a vblank wait or pure CPU time. The detailed compositor stage percentages
+above belong to the separate VSync-on capture; a matching uncapped capture
+is needed before attributing this residual to framebuffer ownership.
+
+## Uncapped compositor and submission diagnosis
+
+A separate 600-frame-record diagnostic uses the same frozen guest and 1 ms
+host poll, with effective VSync/pacing settings checked again. Longer
+captures use `--measured-frames`; original embedded packets and frame-number
+gaps are preserved and reported. An oversized request and two earlier
+helper assumptions failed before launching the game; their jobs remain in
+the private review. The successful capture has 601 server-frame deltas over
+600 original frame records. It is not pooled with the short throughput pair.
+
+The retained 256 compositor rows reconcile exclusive body time exactly:
+
+| Exclusive stage | Share of body | p50 | p95 |
+| --- | ---: | ---: | ---: |
+| Fence completion waits | 72.85% | 3.308 ms | 5.068 ms |
+| Acknowledgement waits | 9.39% | 0.372 ms | 0.518 ms |
+| GPU command-lock acquisition | 6.97% | 0.002 ms | 3.446 ms |
+| Queue setup | 5.72% | 0.272 ms | 0.451 ms |
+| Scene preparation | 4.37% | 0.188 ms | 0.280 ms |
+| Other exclusive stages combined | 0.70% | — | — |
+
+Body p50/p95 is 4.556/8.995 ms; start-to-start p50/p95 is
+5.077/13.647 ms. Between-frame gap p50/p95 is 0.000495/9.082 ms,
+with 247 of 255 resumes before the installed fallback deadline. The
+nominal additive 16 ms fallback is therefore not an unconditional sleep in
+this loaded capture. Ring overwrite drops the earlier 213 rows; one
+in-flight row is explicitly aborted when recording stops. Retained rows
+pass the analyzer's conservation and contention gates.
+
+A separate two-second sample records 1,593 CPU samples and 7,774 context
+switches with no producer drops or count mismatch. Quake's main thread has
+only 30 CPU samples: 17 include GPU completion waiting, of which 15 include
+`AppPresentBarrier`. These are small, biased sample counts, not percentages
+of frame wall time. Its 320 outgoing context-switch stacks include 215
+`AppSubmit3D` command-lock waits; 247 include a DRM ioctl and mutex lock.
+The compositor has 139 command-lock yield stacks. Categories overlap and
+must not be added. The profiler writer itself has 58 samples, so this
+diagnostic must not be substituted for an uninstrumented throughput run.
+
+Source inspection confirms the mechanism: `GpuCmdGuard` serializes app and
+compositor control submissions, and synchronous completion is retained
+through the protected operation. `FENCE_FD_OUT` performs a real producer
+fence before returning a completed sync file. This is necessary for current
+cross-context correctness; removing that wait would falsely signal completion.
+The next target is measured app-side lock/completion wall time and a design
+for multiple owned in-flight submissions, not assuming extra framebuffers
+alone remove these waits.
+
+Evidence: private review
+`unattended-uncapped-q2-gpu-1ms-fixed-mlfq-b-20261021/uncapped-diagnostic-d/`.
+The original VM/controller exit successfully; heap, runtime counters and
+four offline filesystems pass. The raw SDL trace is recovered after shutdown
+and hash-checked. No new visual/input or physical-audio acceptance is claimed.
+
+A fresh VM repeats the 600-record unpaced workload with only the existing
+main-thread syscall watch enabled for approximately four seconds. Reported
+dispatch totals are 2.224 s in 78,672 ioctls, 1.049 s in 108 futex calls,
+and 0.698 s in 238 ppoll calls. Elapsed spans include preemption and host
+scheduling. The fixed 16-kind recorder overflows 1,986 kind assignments;
+therefore this capture **fails full syscall reconciliation** and the listed
+totals are partial, not wall-time percentages or a replacement for the
+SDL split. No continuity, clock or contention errors are reported.
+Request-level GPU ioctl timing is the next diagnostic needed to separate
+command-lock acquisition, producer fences and other waits. Evidence is
+`unattended-uncapped-q2-gpu-1ms-fixed-mlfq-c-20261021/uncapped-syscalls/`;
+original VM/controller exit and four offline filesystem checks pass.
