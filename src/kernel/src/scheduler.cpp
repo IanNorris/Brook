@@ -2080,6 +2080,8 @@ static void DoSwitch(Process* oldProc, Process* newProc, bool requeueOld = false
 #endif
 }
 
+#include "scheduler_stall.inc"
+
 void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool periodicTimer,uint64_t interruptedRip,TimerIrqSchedulerStages* stages)
 {
     if (!g_schedulerRunning)
@@ -2331,99 +2333,7 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
         else
         {
             SchedLockRelease(g_readyLock, rlf7);
-            if (cpu == 0)
-            {
-            // BRO-176 HANG detector: this CPU is idle and PickNext found nothing,
-            // yet a process may be marked state==Ready but missing from the policy
-            // ready queue — a genuine strand would idle every CPU forever. But a
-            // process is LEGITIMATELY Ready-but-unqueued for a brief window during
-            // preemption: SchedulerPreempt/Yield set state=Ready and stash the proc
-            // in g_perCpu[].pendingRequeue; DrainPostSwitch enqueues it a few
-            // instructions later on the resuming CPU. Sampling during that window is
-            // a FALSE positive. To report only REAL strands, require (a) the proc is
-            // not any CPU's pendingRequeue, not running, and (b) the SAME pid stays
-            // stranded across two consecutive checks (the rate-limit interval is far
-            // longer than the requeue window, which never survives it).
-            static uint64_t s_lastStallLog = 0;
-            static uint16_t s_lastStrandedPid = SCHED_PID_NONE;
-            uint64_t now = ApicTickCount();
-            if (now - s_lastStallLog >= 500)
-            {
-                uint64_t alf = SchedLockAcquire(g_allProcLock);
-                Process* stranded = nullptr;
-                for (uint32_t i = 0; i < g_processCount; ++i)
-                {
-                    Process* p = g_allProcesses[i];
-                    if (!(p && p->magic == PROCESS_MAGIC
-                          && p->state == ProcessState::Ready
-                          && ProcessCanRunOnCpu(p, cpu)))
-                        continue;
-                    // Skip if running or mid-context-switch on any CPU.
-                    if (__atomic_load_n(&p->runningOnCpu, __ATOMIC_ACQUIRE) != -1)
-                        continue;
-                    // Skip the legitimate preemption requeue window: a proc parked
-                    // in any CPU's pendingRequeue is about to be enqueued by that
-                    // CPU's DrainPostSwitch — not a strand.
-                    bool pendingRequeue = false;
-                    for (uint32_t c = 0; c < SCHED_MAX_CPUS; ++c)
-                        if (g_perCpu[c].pendingRequeue == p) { pendingRequeue = true; break; }
-                    if (pendingRequeue)
-                        continue;
-                    stranded = p;
-                    break;
-                }
-                SchedLockRelease(g_allProcLock, alf);
-                // Only log a strand that PERSISTS: the same pid must be caught on
-                // two consecutive checks (>=500 ticks apart). A transient requeue
-                // window cannot survive one interval, so this kills false positives.
-                uint16_t prevStrandedPid = s_lastStrandedPid;
-                s_lastStrandedPid = stranded ? stranded->pid : SCHED_PID_NONE;
-                s_lastStallLog = now;
-                if (stranded && stranded->pid == prevStrandedPid)
-                {
-                    SerialPrintf("SCHED STALL: pid=%u '%s' state=Ready but PickNext "
-                                 "returned null (RR readyCount=%u) — persists, real strand!\n",
-                                 stranded->pid, stranded->name, readyN);
-                    // Dump the policy's internal view to distinguish a LOGIC desync
-                    // (queued flag stale) from STRUCT CORRUPTION (listLen != readyCount).
-                    {
-                        brook::SchedDebugInfo di = {};
-                        uint64_t rlfd = SchedLockAcquire(g_readyLock);
-                        if (g_schedOps->DebugDump)
-                            g_schedOps->DebugDump(g_schedState, stranded->pid, &di);
-                        SchedLockRelease(g_readyLock, rlfd);
-                        SerialPrintf("  RR[pid=%u]: queued=%u active=%u next=%u prev=%u | "
-                                     "head=%u tail=%u readyCount=%u listLen=%u%s\n",
-                                     stranded->pid, di.queued, di.active, di.nextPid,
-                                     di.prevPid, di.head, di.tail, di.readyCount,
-                                     di.listLen,
-                                     (di.listLen != di.readyCount)
-                                         ? "  <<< STRUCT CORRUPT (listLen != readyCount)"
-                                         : (di.queued
-                                             ? "  <<< LOGIC DESYNC (queued but not picked)"
-                                             : "  <<< NOT ENQUEUED (queued=0)"));
-                    }
-                    // Dump the stranded process's recent scheduler-event ring:
-                    // the op sequence reveals exactly where state became Ready
-                    // without a following ENQUEUE (the lost-enqueue site).
-                    SerialPrintf("  SCHEDTRACE pid=%u (oldest->newest):\n", stranded->pid);
-                    for (uint32_t k = 0; k < 12; ++k)
-                    {
-                        uint8_t slot = (uint8_t)((stranded->schedTraceHead + k) % 12);
-                        uint64_t e = stranded->schedTrace[slot];
-                        if (e == 0) continue;
-                        SerialPrintf("    site=%u state=%u tick=%lu\n",
-                                     (unsigned)((e >> 8) & 0xFF),
-                                     (unsigned)(e & 0xFF),
-                                     (unsigned long)(e >> 16));
-                    }
-                    SerialPrintf("  (sites 1=ENQ 2=REM 3=RDY_UNBLK 4=DEFER_RR 5=DEFER_CPU "
-                                 "6=BLOCK 7=BLOCK_SKIP 8=PREEMPT 9=YIELD 10=REQ_ENQ "
-                                 "11=REQ_SKIP 12=RUN 13=PICK_RET 14=PICK_SKIP_RUN "
-                                 "15=DS_BAIL_ENQ 16=DS_BAIL_SKIP 17=REM_PROC)\n");
-                }
-            }
-            }
+            if (cpu == 0) ReportPersistentReadyStall(cpu, readyN);
         }
         return;
     }

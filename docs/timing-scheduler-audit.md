@@ -5,6 +5,13 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Idle stall diagnostic lifetime](scheduler-stall-lifetime.md) fixes a raw
+  process pointer used after releasing registry protection, protects pending
+  requeue and policy reads with the ready lock, and checks PID incarnation.
+  The actual original body faults under arranged post-unlock retirement;
+  eight fixed cases and all 77 hosted suites pass. This does not establish
+  arbitrary SMP safety or change scheduler policy.
+
 - An [actual-body audio commitment discriminator](audio-commit-horizon.md)
   reproduces slow simultaneous sources without scheduler contention. Its
   156-case hosted matrix separates late fragment refills/driver reservations
