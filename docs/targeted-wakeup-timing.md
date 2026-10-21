@@ -273,3 +273,46 @@ delay alone does not determine whether the native sample-gap guard fires.
 Avoiding that fault is not continuous playback acceptance. Evidence and derived
 receipts are under `build/reviews/unattended-q2-light-{try,blocking}-20261021`
 and `build/workloads/timing-scheduler-20261021/irq-accounting-light-pressure-summary.json`.
+
+### QEMU backend logical-CPU pools
+
+Two further fresh boots retain the eight vCPUs and finite host workers on
+logical CPUs 0–7, but move every current non-vCPU QEMU thread to 8–15 before
+load. QMP identifies the vCPU TIDs; both endpoint audits verify every current
+thread's expected mask. The separate pools share physical SMT cores. External
+PipeWire/server processes are not moved. This tests combined QEMU host-thread
+placement, not a particular helper or physical CPU isolation.
+
+| Host-thread placement | Accounting | Maximum mixer late resume | Maximum service bracket | Stream discontinuity |
+| --- | --- | ---: | ---: | ---: |
+| Original masks | blocking | 8.604 s | 32.352 ms | 1 |
+| Original masks | try | 184.006 ms | 644.041 ms | 0 |
+| Non-vCPU threads on 8–15 | blocking | 9.681 s | 6.958 s | 1 |
+| Non-vCPU threads on 8–15 | try | 156.742 ms | 174.206 ms | 0 |
+
+Read-only host snapshots wholly inside each nominal twenty-second worker
+window cover approximately 19.88 seconds. Matching non-vCPU thread lifetimes
+accumulate 0.537 CPU-seconds of runnable wait in the original blocking control,
+versus 0.000265 with separate pools. The matched lifetime subsets differ
+(27 versus 30 threads), and the samples are sequential, not atomic CPU
+residency measurements. In the separated try run, 31 matching backend threads
+accumulate 0.001757 CPU-seconds of runnable wait. The eight vCPU threads still
+accumulate approximately 145–149 CPU-seconds of runnable wait in these two
+separated runs, with substantial scheduling-slice churn. These are host
+`schedstat` observations, not guest policy service or proof of PLE exits.
+
+Thus backend placement alone is insufficient to prevent this failure. Both
+accounting-try runs still have poor application delivery; the separated run
+completes only approximately 0.064 nominal audio seconds per guest-clock
+second in the loaded capture. No general audio/performance gain is accepted.
+All original app/controller/VM owners, heap/runtime checks and four filesystem
+checks pass for the separated runs; blocking still records the native HDA fault.
+
+Mask endpoints do not prove continuous placement: short-lived helpers or
+temporary resets can escape them. New threads inherit their creator's mask.
+The second controller additionally records per-thread starttime and policy/nice
+endpoints around pinning, but numeric-TID affinity operations are not an atomic
+thread-lifetime guarantee. No evidence of TID reuse is observed. Full masks,
+host observations, exact controller copies and lifecycle receipts are retained
+under `build/reviews/unattended-q2-backend-{blocking,try}-20261021`; derived
+comparisons are in `build/workloads/timing-scheduler-20261021/backend-pool-summary.json`.
