@@ -1393,3 +1393,12 @@ and runtime gates pass, but short silence reservations remain. CPU costs vary;
 this is not repeated policy acceptance. Existing worker/HDA probes are the next
 attribution step. Historical fast playback, prior runtime clamps and the full
 clock/scheduler audit remain unresolved; defaults stay unchanged.
+
+## Host audio cadence control
+
+The [host audio comparison](host-audio-cadence.md) finds regular PipeWire writes
+and a well-filled backend ring despite native silence reservations. A private
+1-ms timer/requested-latency candidate reduces some ordinary gaps but retains
+reservations and fails runtime acceptance with five clamps. Results are mixed;
+the normal 5-ms host audio period is unchanged. Capture first-clamp/ownership
+history earlier in a separate diagnostic before further scheduler acceptance.
