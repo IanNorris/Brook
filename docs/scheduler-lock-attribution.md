@@ -746,3 +746,36 @@ offline filesystem checks return zero. A durable ignored checkpoint and
 controller copies are in `timing-scheduler-20261021/reboot-resume`. The offered
 host reboot can now be used as an environmental control without discarding the
 frozen kernels, private disks, failed attempts or contradictory observations.
+
+
+### Measurement-mode correction and saved next instrumentation
+
+The user clarifies that manual observations use the menu's normal attract demo.
+An early rejected automated attempt used unconstrained `timedemo 1`; these
+results must not be pooled. The existing paced fixture uses `timedemo 0` and a
+60-FPS cap, with 150 fixed demo records. Demo duration measures source progression
+and may be affected by simulation pacing; it is not frame-time throughput.
+The user requests actual frame times as the primary rendering metric.
+
+`q2_demo_timing.py` now accepts optional `--marker-url`, requiring independently
+returned host timestamps and matching marker names. This removes fragile source
+rewriting from the saved controller. Three local tests exercise valid/invalid
+acknowledgements and the real process/log loop using a synthetic PAK and fake
+engine; no licensed data is in the fixtures. Native HTTP validation remains due.
+
+`tools/profiling/sdl_swap_trace.c` is an optional LD_PRELOAD probe: two guest
+monotonic samples per SDL GL swap, buffered records, no per-frame allocation or
+I/O, and exit-time CSV with explicit drop/incomplete/clock-error counts.
+`analyze_swap_trace.py` rejects incomplete traces, reordered/overlapping frames
+and multiple swap threads. It reports frame-completion intervals and swap-call
+durations (p50/p90/p95/max), stall counts and aggregate FPS. These are application
+swap cadence, not compositor/scanout presentation. Independently validate the
+guest clock and observer overhead, match attract mode/configuration, and retain
+uninstrumented controls before drawing performance conclusions.
+
+The probe builds with warnings as errors and an actual host fake-SDL executable
+produces five records/four intervals; bad quality headers are rejected. No native
+Quake probe run or regression repair is claimed. Host-check evidence is in
+`timing-scheduler-20261021/swap-probe-host-check`. The VMs remain stopped while
+the user prepares to reboot; the durable reboot checkpoint retains the exact
+frozen capsules and comparison caveats.

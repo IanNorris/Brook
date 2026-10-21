@@ -11,6 +11,21 @@ from pathlib import Path
 import struct
 import subprocess
 import time
+import urllib.request
+
+
+def notify_marker(url, name):
+    """Receive an independent host timestamp; transport remains in the interval."""
+    before = time.monotonic_ns()
+    with urllib.request.urlopen(url.rstrip('/') + '/' + name, timeout=10) as response:
+        receipt = json.load(response)
+    after = time.monotonic_ns()
+    if not isinstance(receipt, dict):
+        raise ValueError('Invalid host marker acknowledgement')
+    host = receipt.get('host_ns')
+    if type(host) is not int or host <= 0 or receipt.get('marker') != name:
+        raise ValueError('Invalid host marker acknowledgement')
+    return dict(before_guest_ns=before, after_guest_ns=after, host_ns=host)
 
 
 def main():
@@ -23,6 +38,9 @@ def main():
                         help='Restart this locally supplied OGG track at the START marker')
     parser.add_argument('--music-only', action='store_true',
                         help='Mute sound effects for a music-track capture')
+    parser.add_argument('--marker-url',
+                        help='Optional host HTTP endpoint acknowledging /START and /END '
+                             'with JSON marker and host_ns fields')
     args = parser.parse_args()
     if args.music_only and args.music_track is None:
         parser.error('--music-only requires --music-track')
@@ -118,7 +136,7 @@ def main():
         # OpenAL streams use ogg_volume separately from the effects gain.
         argv = prefix + ['+set', 's_volume', '0', '+set', 'ogg_volume', '0.7'] + argv[len(prefix):]
     started = time.monotonic_ns()
-    markers, cursor, pending = {}, 0, b''
+    markers, host_markers, cursor, pending = {}, {}, 0, b''
 
     def inspect_log():
         nonlocal cursor, pending
@@ -139,6 +157,8 @@ def main():
                         and name not in markers):
                     markers[name] = dict(before_ns=before, after_ns=after)
                     print('Q2_MARKER', name, after, flush=True)
+                    if args.marker_url:
+                        host_markers[name] = notify_marker(args.marker_url, name)
 
     with (home / 'timing-stdout.log').open('wb') as output:
         process = subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT)
@@ -162,6 +182,16 @@ def main():
     if set(markers) == {'START', 'END'}:
         result['observed_demo_interval_s'] = (
             markers['END']['after_ns'] - markers['START']['after_ns']) / 1e9
+    if args.marker_url:
+        result['host_markers'] = host_markers
+        result['host_timing_scope'] = ('HTTP acknowledgement timestamps on the host; '
+                                      'includes guest log-reader and transport latency; '
+                                      'not exact rendered-frame throughput')
+        if set(host_markers) == {'START', 'END'}:
+            interval = host_markers['END']['host_ns'] - host_markers['START']['host_ns']
+            if interval <= 0:
+                raise ValueError('Non-increasing host marker timestamps')
+            result['host_marker_interval_s'] = interval / 1e9
     (home / 'timing-result.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result), flush=True)
     assert exit_code == 0 and set(markers) == {'START', 'END'}, result
