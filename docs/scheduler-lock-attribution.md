@@ -730,3 +730,19 @@ original retry job is terminal with exit one, complete output and no live group
 tasks. Its logs are retained; no measured throughput is accepted. The separate
 manual game/VM remains running pending handback. Future unattended runs must
 verify no existing game before launching and require both markers.
+
+
+Before the user-offered host reboot, the unattended retry of the existing
+paced demo protocol completes with guest exit zero, both markers, no live job
+tasks and a 15.885733844-second guest observation interval. Host HTTP marker
+injection was inadvertently removed while dropping the timedemo changes, so
+this run is not independently host-validated and the outer comparator rejects
+it. The saved controller restores the notification injection (syntax checked,
+not native revalidated yet). No rendering-throughput result is inferred.
+The manual Quake window is gracefully closed by exact incarnation reference
+and all client group tasks are observed exited before the paced retry.
+The VM then completes guest sync and original launcher exit zero, and all four
+offline filesystem checks return zero. A durable ignored checkpoint and
+controller copies are in `timing-scheduler-20261021/reboot-resume`. The offered
+host reboot can now be used as an environmental control without discarding the
+frozen kernels, private disks, failed attempts or contradictory observations.
