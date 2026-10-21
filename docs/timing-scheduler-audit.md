@@ -84,6 +84,12 @@ Later evidence supersedes several early leads:
   failures are unresolved. This single cohort changes both logical and physical
   Firefox capacity; repeatability and wider coverage remain required. Neither
   optional feature nor a scheduler policy is promoted.
+  A second fresh cohort repeats nominal guarded/loaded audio and passes all
+  current runtime/lifecycle checks. Offline PCM still contains occasional
+  4.354-ms all-channel zero runs absent from the generated browser reference;
+  completion averages do not establish uninterrupted output. A separate lossy
+  post-timing profile identifies compositor GPU completion polling and existing
+  mapping-lock waits as leads, without establishing CPU percentages or causality.
   Software backlog and source-credit latency bounds remain
   explicit. Earlier runtime failures and the historical fast-playback cause
   remain open; no default is promoted.

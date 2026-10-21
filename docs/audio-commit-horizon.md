@@ -867,3 +867,57 @@ normal-pitch fast playback and the wider clock/scheduler audit remain open.
 
 Host evidence: `build/workloads/timing-scheduler-20261021/logical-buffer-probe/`.
 Native evidence and all verifier results are under the private review above.
+
+### Repeat and remaining gaps
+
+A second fresh review, `unattended-logical-buffer-140ms-fixed-mlfq-b-20261021`,
+uses the final checked package `8qqb4k7ygrpdnhpymbzjz9lqqdx2z7rf-alsa-plugins-oss-brook-1.2.12`.
+Its module is byte-identical to the first native candidate. The same eight
+uninstrumented-by-profiler windows repeat near-nominal enabled audio:
+0.9986/0.9986 and 1.0002/1.0002 for the two guarded mixed windows, and
+0.9996/0.9996 and 1.0002/1.0002 under eight-worker load. Disabled mixed audio
+remains about 0.539/0.668 and 0.538/0.661. Firefox again transfers and loops
+the full clip; all nine jobs, heap/policy, native faults/discontinuities,
+original controller/VM exits and four filesystems pass. Current accounting
+again has zero clamps or debt. This repeats the bounded improvement without
+resolving earlier accounting episodes.
+
+Offline PCM inspection deliberately keeps a stricter remaining issue visible.
+The first run has three and two all-channel zero runs of at least 1 ms in its
+two guarded mixed captures, with a 4.354-ms maximum. The second has one
+4.354-ms run in guarded mixed A and one in the Firefox-focused loaded capture.
+The other captures have no runs of at least 1 ms. The generated browser clip,
+decoded separately by pinned FFmpeg 8.0.1 to stereo S16_LE/44100, has no such
+runs: its longest is 0.136 ms. Reference and WAV hashes, exact positions and
+counts are retained under `logical-buffer-probe/reference-audio.json` and each
+review's `mixed-prefix-control/zero-run-analysis.json`.
+
+This distinguishes average source completion from uninterrupted output. The
+mixed capture is not sample-aligned to both source references, and QEMU WAV
+capture is not a recording of the physical speakers. These results do not
+identify whether the short output gaps originate in scheduling, mixer/device
+reservation, or a client, nor prove per-source continuity when the mix remains
+nonzero. The remaining gaps are not waived by near-unity completion ratios.
+
+After all eight timed windows and the browser loop gate, a separate two-second
+profile enables the guarded horizon and records 1243 samples plus 51073
+context-switch events, with 23498 producer drops. Its exported counts reconcile,
+but loss and IRQ-masked sampling bias prohibit CPU-percentage claims. Frozen
+module ELFs are resolved using the actual loader's SHF_ALLOC section placement
+and each symbol's section index, rather than adding all ET_REL values to a
+single module base. This resolves 93 leaf samples to virtio-GPU's pause callback
+inside synchronous command completion, with another eight in its wait helper.
+The compositor owns most of these samples. Outgoing switch stacks include
+address-space validation mutex waits, a previously measured contention path.
+1039 samples are in `IdleLoop`; that is a sampled observation, not an unbiased
+utilization estimate. Profiler file writes also appear. These are diagnostic
+leads, not causal proof of the low frame rate, and occur outside every timing
+window used for the audio comparison. The existing shared-validation branch
+already reduced lock waiting without improving presentation; this profile does
+not justify reintroducing it without a new discriminator.
+
+Profile identity/loss, relocated module identities and stack counts are retained
+in the second review's `post-timing-profile-{export,analysis}.json`. Both VMs
+are stopped; scheduler/audio defaults remain unchanged. Further work needs
+source-aligned gap attribution and bounded GPU/host wait correlation, while the
+original clock and scheduler acceptance work remains open.
