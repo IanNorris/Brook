@@ -159,6 +159,18 @@ static Completion g_completions[COMPLETION_SLOTS];
 static uint32_t g_completionHead = 0, g_completionCount = 0;
 enum class DriverMode { Unknown, Legacy, Native };
 static DriverMode g_driverMode = DriverMode::Unknown; // flush owner only
+#ifdef BROOK_HOST_TEST
+// Hosted commitment-horizon experiment only; no native state, API or branch.
+static uint32_t g_testCommitQuantum = 0;
+static uint64_t g_testCommitCount = 0;
+void AudioMixerTestCommitQuantum(uint32_t frames) {
+    SpinLockAcquire(&g_mixerLock);
+    g_testCommitQuantum = frames <= MIXER_BATCH_FRAMES ? frames : 0;
+    g_testCommitCount = 0;
+    SpinLockRelease(&g_mixerLock);
+}
+uint64_t AudioMixerTestCommitCount() { return g_testCommitCount; }
+#endif
 static uint64_t g_hardwareEpoch = 0;
 static bool g_clockSupported = false; // mixer lock
 static AudioMixerSharedPrefixSnapshot g_sharedPrefix; // existing mixer lock
@@ -434,6 +446,25 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
     if (g_batchRemaining && frames > g_batchRemaining) frames = g_batchRemaining;
     const uint32_t normalFrames=frames;
     frames=SharedPrefixFrames(frames,device,sampledBefore,prefix);
+#ifdef BROOK_HOST_TEST
+    if (g_testCommitQuantum && frames > g_testCommitQuantum &&
+        g_driverMode == DriverMode::Native && !strcmp(g_audioDriver->name,"intel_hda")) {
+        const uint64_t now=AudioClockNowNs();
+        constexpr uint64_t serviceNs=10000000;
+        if (sampledBefore && now>=sampledBefore && now-sampledBefore<=serviceNs &&
+            now<=~uint64_t(0)-serviceNs && device.running && !device.discontinuity &&
+            device.epoch==g_hardwareEpoch && device.submitted>=device.completed) {
+            const uint64_t travelFrames=((now-sampledBefore+serviceNs)*MIXER_HW_RATE+999999999)/1000000000;
+            if (device.submitted-device.completed>=12288+travelFrames*MIXER_FRAME_BYTES) {
+                frames=g_testCommitQuantum;
+                ++g_testCommitCount;
+                // Captured proposal owns remainder clearing even if a test
+                // changes configuration while the driver copies it.
+                prefix={~uint64_t(0),normalFrames,frames};
+            }
+        }
+    }
+#endif
     // Unsubmitted surplus is still in the source FIFO, not owned by this
     // short proposal. Keep the ordinary remainder bound so a low-headroom
     // retry can restore ordinary batching after rejection/partial acceptance.
@@ -643,8 +674,11 @@ void AudioMixerFlush()
     struct FlushOwner { ~FlushOwner() { __atomic_store_n(&g_flushBusy, 0u, __ATOMIC_RELEASE); } } owner;
     const uint64_t epoch = __atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE);
     // Default-off avoids any additional clock reads on the normal path.
-    const bool controlled = __atomic_load_n(&g_coalesceActive, __ATOMIC_ACQUIRE) ||
+    bool controlled = __atomic_load_n(&g_coalesceActive, __ATOMIC_ACQUIRE) ||
                             __atomic_load_n(&g_sharedPrefixActive, __ATOMIC_ACQUIRE);
+#ifdef BROOK_HOST_TEST
+    controlled = controlled || g_testCommitQuantum;
+#endif
     const uint64_t sampledBefore = controlled ? AudioClockNowNs() : 0;
     AudioDeviceProgress device{};
     RefreshDevice(epoch, controlled ? &device : nullptr);

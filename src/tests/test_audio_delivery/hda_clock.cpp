@@ -663,6 +663,178 @@ void coalesceTests(brook::AudioStreamId a,brook::AudioStreamId b) {
     std::printf("MIXER_COALESCE %s\n",failures?"FAIL":"PASS");
 }
 }
+// Deterministic finite-source experiment, using actual mixer/HDA transactions.
+// DMA movement does not reconcile mixer credits. Producers inspect the same
+// cached capacity as a write; an explicit refresh variant models ioctl/poll.
+static void commitQuantumGuards(brook::AudioStreamId a,brook::AudioStreamId b) {
+    using namespace brook;
+    for(unsigned action=0;action<5;++action) {
+        AudioMixerTestCommitQuantum(0);coalesceSetup(a,b);
+        AudioMixerTestCommitQuantum(441);
+        if(action==2)advanceNative(16384-(12288+441*4-4));
+        if(action>=3) {
+            std::array<int16_t,16384> silence{};
+            const uint32_t bytes=action==3?32768:31744;
+            VERIFY(HdaTrySubmit(silence.data(),bytes).accepted==bytes);
+        }
+        queueChannel(a,false);queueChannel(b,true);
+        const auto initial=g_nativeClock.submitted;
+        if(action==0)afterCopyHook=[] {AudioMixerTestCommitQuantum(0);};
+        if(action==1)mixerProgressDelayNs=10000001;
+        AudioMixerFlush();mixerProgressDelayNs=0;
+        if(action==0) {
+            VERIFY(g_nativeClock.submitted==initial+441*4);
+            queueChannel(a,false,441);queueChannel(b,true,441);
+            AudioMixerFlush();VERIFY(g_nativeClock.submitted==initial+(441+1024)*4);
+        } else if(action<3)VERIFY(g_nativeClock.submitted==initial+1024*4);
+        else {
+            VERIFY(g_nativeClock.submitted==49152);
+            VERIFY(AudioMixerTestCommitCount()==1);
+            advanceNative(g_nativeClock.Pending()-(12288+441*4-4));
+            AudioMixerFlush();
+            VERIFY(g_nativeClock.submitted==49152+(action==3?1024u:768u)*4);
+        }
+        finishPhysical();AudioMixerRefresh();
+        for(auto id:{a,b}) {
+            AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(id,&p));
+            VERIFY(p.completedFrames==p.submittedFrames && !p.queuedFrames && !p.discontinuity);
+        }
+        AudioMixerTestCommitQuantum(0);
+    }
+}
+static void steadyCommitExperiment() {
+    using namespace brook;
+    constexpr uint32_t total=44100*8,fragment=1024;
+    for(uint32_t capacity:{4096u,8192u})
+    for(unsigned mode=0;mode<3;++mode)for(bool wholeFragment:{false,true})
+    for(bool refreshProducer:{false,true})for(unsigned offset:{0u,1u,4u})for(bool reverse:{false,true})
+    for(unsigned scenario=0;scenario<3;++scenario) {
+        // Additional absence/late-service probes use one fixed phase/geometry,
+        // not an unbounded Cartesian sweep. Scenario 0 is ordinary cadence.
+        if(scenario && (capacity!=4096 || !wholeFragment || !refreshProducer || offset!=1))continue;
+        AudioMixerTestCommitQuantum(0);AudioMixerSharedPrefixEnable(false);
+        AudioMixerCoalesceEnable(false);AudioStop();initialize();AudioMixerRefresh();
+        AudioStreamId ids[2]={AudioMixerOpen(),AudioMixerOpen()};VERIFY(ids[0] && ids[1]);
+        const uint32_t targets[2]={total,scenario==1?capacity:total};
+        std::vector<int16_t> pcm[2];uint32_t written[2]{},played[2]{};
+        for(unsigned s=0;s<2;++s) {
+            VERIFY(AudioMixerSetCapacity(ids[s],capacity,fragment));
+            pcm[s].resize(total*2);
+            for(uint32_t f=0;f<total;++f) {
+                const uint64_t code=(uint64_t(f)*48271+uint64_t(s)*65537) ^ (uint64_t(f)*f>>3);
+                pcm[s][f*2+s]=int16_t(1000+code%28000);
+            }
+        }
+        auto refill=[&](unsigned s) {
+            // A finite exhausted producer is dormant, not a hidden periodic
+            // completion observer that helps the still-active source refill.
+            if(written[s]==targets[s])return;
+            if(refreshProducer)AudioMixerRefresh();
+            for(;;) {
+                const uint32_t free=AudioMixerAvailableFrames(ids[s]);
+                if(!free || written[s]==targets[s] || (wholeFragment && free<fragment))break;
+                const uint32_t count=std::min({free,fragment,targets[s]-written[s]});
+                const auto accepted=AudioMixerSubmit(pcm[s].data()+written[s]*2,count,ids[s]);
+                VERIFY(accepted==count);written[s]+=accepted;
+                if(!accepted)break;
+            }
+        };
+        refill(0);refill(1);
+        for(unsigned i=0;i<(capacity+1763)/1764;++i)AudioMixerFlush();
+        VERIFY(g_nativeClock.submitted==capacity*4);prime();AudioMixerRefresh();
+        AudioMixerSharedPrefixEnable(mode==1);AudioMixerTestCommitQuantum(mode==2?441:0);
+        AudioMixerContributionsEnable(true);AudioMixerContributionsReset();
+        AudioDeliveryTimingEnable(true);AudioDeliveryTimingReset();
+        uint64_t before[2]{},after[2]{},physicalBefore[2]{},physicalAfter[2]{};
+        uint64_t metricsBefore[3]{},metricsAfter[3]{};
+        uint64_t dmaBytes=0;
+        uint32_t minPending=~uint32_t(0),maxPending=0;
+        uint64_t minPhysicalPending=~uint64_t(0),maxPhysicalPending=0;
+        unsigned elapsed=0;bool finished=false;
+        for(unsigned ms=1;ms<=25000;++ms) {
+            // Exact 44.1-kHz physical advancement, independent of driver reads.
+            const uint32_t frames=(ms*441u/10)-((ms-1)*441u/10);
+            if(g_streamRunning) {
+                const auto pos=HdaTestRead(g_outStreamBase+SD_LPIB,4);
+                for(uint32_t f=0;f<frames;++f) {
+                    int16_t pair[2]{};memcpy(pair,dma.data()+(pos+f*4)%AUDIO_BUF_SIZE,4);
+                    for(unsigned s=0;s<2;++s)if(pair[s]) {
+                        VERIFY(played[s]<targets[s]);
+                        if(played[s]<targets[s])VERIFY(pair[s]==pcm[s][played[s]*2+s]);
+                        ++played[s];
+                    }
+                }
+                move(frames*4,1000000);
+                dmaBytes+=frames*4;
+            } else nowNs+=1000000;
+            // Sweep order independently of polling phase, without an extra
+            // reconciliation or flush between the two producer opportunities.
+            for(unsigned order=0;order<2;++order) {
+                const unsigned s=reverse?1-order:order;
+                if(ms%5==(s?offset:0))refill(s);
+            }
+            // Four missed service opportunities, followed by the original
+            // cadence; never compensate with an immediate extra flush.
+            if(ms%10==0 && !(scenario==2 && ms>=3000 && ms<3040))AudioMixerTick();
+            if(ms==2000 || ms==6000) {
+                // Use existing cached completion, avoiding an observer-driven
+                // reconciliation or submission at the measurement endpoints.
+                AudioStreamProgress p[2]{};
+                for(unsigned s=0;s<2;++s)VERIFY(AudioMixerGetProgress(ids[s],&p[s]));
+                if(ms==2000)for(unsigned s=0;s<2;++s){before[s]=p[s].completedFrames;physicalBefore[s]=played[s];}
+                else for(unsigned s=0;s<2;++s){after[s]=p[s].completedFrames;physicalAfter[s]=played[s];if(!(scenario==1 && s==1))VERIFY(written[s]<targets[s]);}
+                const auto delivery=AudioDeliveryTimingRead();
+                const auto contributions=AudioMixerContributionsRead();
+                VERIFY(contributions.count==2);contributionConservation(contributions);
+                auto* metrics=ms==2000?metricsBefore:metricsAfter;
+                metrics[0]=delivery.reservations;
+                for(unsigned i=0;i<contributions.count;++i) {
+                    metrics[1]+=contributions.rows[i].missingShortFrames;
+                    metrics[2]+=contributions.rows[i].missingEmptyFrames;
+                }
+            }
+            if(ms>=2000 && ms<=6000) {
+                minPending=std::min(minPending,g_nativeClock.Pending());
+                maxPending=std::max(maxPending,g_nativeClock.Pending());
+                const uint64_t physicalPending=g_nativeClock.submitted>dmaBytes?g_nativeClock.submitted-dmaBytes:0;
+                minPhysicalPending=std::min(minPhysicalPending,physicalPending);
+                maxPhysicalPending=std::max(maxPhysicalPending,physicalPending);
+            }
+            AudioStreamProgress p[2]{};
+            for(unsigned s=0;s<2;++s)VERIFY(AudioMixerGetProgress(ids[s],&p[s]));
+            if(p[0].completedFrames==targets[0] && p[1].completedFrames==targets[1]) {
+                elapsed=ms;finished=true;break;
+            }
+        }
+        VERIFY(finished && elapsed>6000);
+        for(unsigned s=0;s<2;++s) {
+            AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(ids[s],&p));
+            VERIFY(written[s]==targets[s] && played[s]==targets[s] && p.submittedFrames==targets[s] &&
+                p.completedFrames==targets[s] && !p.queuedFrames && !p.discontinuity);
+        }
+        const auto delivery=AudioDeliveryTimingRead();const auto contributions=AudioMixerContributionsRead();
+        VERIFY(!delivery.unsafe && !delivery.invalidClock && !delivery.invalidPosition && !g_nativeClock.discontinuity);
+        contributionConservation(contributions);
+        VERIFY(after[0]>before[0]); // An absent peer cannot stall the supplier.
+        for(unsigned s=0;s<2;++s)VERIFY(after[s]-before[s]==physicalAfter[s]-physicalBefore[s]);
+        // Extrema are sampled after the producer/service actions each ms, not
+        // a continuous minimum immediately before every replenishment.
+        std::printf("MIXER_STEADY mode=%u capacity=%u fragment=%u refresh=%u offset=%u reverse=%u scenario=%u completion=%llu,%llu physical=%llu,%llu interval_frames=176400 drain_ms=%u cached_pending=%u,%u sampled_physical_pending=%llu,%llu reservations=%llu steady_reservations=%llu missing_short=%llu missing_empty=%llu caps=%llu\n",
+            mode,capacity,unsigned(wholeFragment),unsigned(refreshProducer),offset,unsigned(reverse),scenario,
+            (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]),
+            (unsigned long long)(physicalAfter[0]-physicalBefore[0]),(unsigned long long)(physicalAfter[1]-physicalBefore[1]),
+            elapsed,minPending,maxPending,
+            (unsigned long long)minPhysicalPending,(unsigned long long)maxPhysicalPending,
+            (unsigned long long)delivery.reservations,
+            (unsigned long long)(metricsAfter[0]-metricsBefore[0]),
+            (unsigned long long)(metricsAfter[1]-metricsBefore[1]),
+            (unsigned long long)(metricsAfter[2]-metricsBefore[2]),
+            (unsigned long long)AudioMixerTestCommitCount());
+        AudioMixerTestCommitQuantum(0);AudioMixerSharedPrefixEnable(false);
+        AudioMixerContributionsEnable(false);AudioDeliveryTimingEnable(false);
+        VERIFY(AudioMixerClose(ids[0]) && AudioMixerClose(ids[1]));AudioStop();
+    }
+}
 int RunMixerClockTests() {
     using namespace brook;
     mixerClockEnabled=true;AudioStop();initialize();AudioMixerRefresh();
@@ -784,6 +956,8 @@ int RunMixerClockTests() {
     AudioDeliveryTimingEnable(false);
     contributionTests(a,b);
     sharedPrefixTests(a,b);
+    commitQuantumGuards(a,b);
+    steadyCommitExperiment();
     coalesceTests(a,b);
     VERIFY(AudioMixerClose(a));mixerClockEnabled=false;AudioStop();
     std::printf("MIXER_CLOCK %s\n",failures?"FAIL":"PASS");return failures;

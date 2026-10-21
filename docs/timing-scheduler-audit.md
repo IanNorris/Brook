@@ -5,6 +5,16 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- An [actual-body audio commitment discriminator](audio-commit-horizon.md)
+  reproduces slow simultaneous sources without scheduler contention. Its
+  156-case hosted matrix separates late fragment refills/driver reservations
+  from asynchronous empty-tail commitment with zero central reservations.
+  A guarded host-only ten-ms batch cap fails twenty of forty-eight regular
+  candidate cases; it is not promoted to a guest feature. Exact PCM/drains and
+  all 75 hosted suites pass, while real mixed playback and historical runtime
+  failures remain open. The next mixer direction needs both a bounded global
+  commit horizon and sufficient refill slack, not fictitious silence credit.
+
 - [Shared IRQ registration](shared-irq-routing.md) has confirmed vector-collision,
   duplicate-dispatch and empty-line reactivation defects. Actual-body host tests
   go from four failures to passing, all 75 hosted suites pass, and the corrected

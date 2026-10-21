@@ -15,6 +15,11 @@
 #include "audio_mix_contributions.h"
 
 namespace brook {
+#ifdef BROOK_HOST_TEST
+// Deterministic hosted experiment; not exported to the guest or modules.
+void AudioMixerTestCommitQuantum(uint32_t frames);
+uint64_t AudioMixerTestCommitCount();
+#endif
 
 // Native clocked submission: all byte watermarks describe 44.1k stereo S16.
 // A receipt is one bounded, nonblocking interval in one hardware epoch.
