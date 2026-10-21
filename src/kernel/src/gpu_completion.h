@@ -12,6 +12,10 @@ extern "C" bool GpuCompletionRegister(const void* provider, volatile uint8_t* is
 // from the original command publication and is never renewed by a wake.
 extern "C" bool GpuCompletionEnabled();
 extern "C" bool GpuCompletionPause(uint16_t expectedUsed, uint64_t startNs, uint64_t deadlineNs);
+// Read once by the module during serialized boot initialization. These private
+// experiments are off unless an exact named fw_cfg file contains the byte '1'.
+// 1: scoped late vertex completion recovery; 2: inject one outstanding timeout.
+extern "C" bool GpuRecoveryBootOption(uint32_t option);
 bool GpuCompletionControl(bool enabled);
 struct GpuCompletionStats {
     bool registered, enabled, waiting, saturated;

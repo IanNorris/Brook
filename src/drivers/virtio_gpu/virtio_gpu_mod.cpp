@@ -70,6 +70,7 @@ MODULE_IMPORT_SYMBOL(GpuAppRegister);
 MODULE_IMPORT_SYMBOL(GpuCompletionRegister);
 MODULE_IMPORT_SYMBOL(GpuCompletionEnabled);
 MODULE_IMPORT_SYMBOL(GpuCompletionPause);
+MODULE_IMPORT_SYMBOL(GpuRecoveryBootOption);
 MODULE_IMPORT_SYMBOL(CpuWriteCombiningReady);
 MODULE_IMPORT_SYMBOL(TtyGetFramebuffer);
 MODULE_IMPORT_SYMBOL(TtyRemap);
@@ -1714,6 +1715,8 @@ static inline uint32_t* ComposeDwBase(uint8_t* bytes=nullptr)
 static bool ResourceCreateBuffer(uint32_t resId, uint32_t bind, uint32_t byteLen);
 static bool TransferToHostBuffer(uint32_t ctxId, uint32_t resId, uint32_t byteLen);
 static GpuCommandToken BeginVertexTransfer(uint32_t ctxId, uint32_t resId, uint32_t byteLen);
+static bool AppFenceLocked(uint32_t ctxId);
+#include "late_vertex_recovery.inc"
 static bool CreateShaderObj(uint32_t ctxId, uint32_t handle, uint32_t shaderType,
                             const char* text);
 
@@ -2223,6 +2226,8 @@ static void CompUpdateTexture(GpuTexId t, uint32_t x, uint32_t y, uint32_t w, ui
 static void CompBeginFrame(uint32_t clearArgb)
 {
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
+    if(g_controlQueuePoisoned && g_lateVertexRecoveryEnabled)
+        TryRecoverLateVertexTransfer();
     if (!g_compReady || g_controlQueuePoisoned ||
         __atomic_load_n(&g_pendingCommand,__ATOMIC_ACQUIRE)) return;
     g_compFrameAssembling = true;
@@ -3598,7 +3603,9 @@ static GpuCommandToken BeginVertexTransfer(uint32_t ctxId, uint32_t resId, uint3
     req->resource_id  = resId;
     req->stride       = byteLen;
     req->layer_stride = byteLen;
-    return BeginCommand(g_legacyCommand,sizeof(*req),CMD_RESP_CAP);
+    return BeginCommand(g_legacyCommand,sizeof(*req),CMD_RESP_CAP,false,
+        ctxId==COMP_CTX_ID && resId==COMP_DRAW_VBUF_RES
+            ? GpuCommandPurpose::CompositorVertexTransfer:GpuCommandPurpose::General);
 }
 
 static bool TransferToHostBuffer(uint32_t ctxId, uint32_t resId, uint32_t byteLen)
@@ -4203,6 +4210,10 @@ static int VirtioGpuModuleInit()
         const uint8_t irq=PciConfigRead8(dev.bus,dev.dev,dev.fn,0x3C);
         const bool wake=GpuCompletionRegister(&g_legacyCommand,g_isrCfg,g_usedIdx,g_availFlags,
                                               irq,(g_gpu3dFeatures&(1u<<29))!=0);
+        g_lateVertexRecoveryEnabled=GpuRecoveryBootOption(1);
+        g_injectVertexTimeoutOnce=GpuRecoveryBootOption(2);
+        SerialPrintf("virtio_gpu: late vertex recovery optin=%u inject-once=%u\n",
+            g_lateVertexRecoveryEnabled?1u:0u,g_injectVertexTimeoutOnce?1u:0u);
         SerialPrintf("virtio_gpu: completion wake registered=%u irq=%u (default off)\n",wake?1u:0u,irq);
         GpuAppRegister(&g_gpuAppOps);
     }

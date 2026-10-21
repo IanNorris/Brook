@@ -49,5 +49,9 @@ static void CompEndFrameDraw()
     g_drawQuadCount = 0;
     g_blurBarrierCount = 0;
     phase.Change(FramePhase::DisplayFlush);
-    ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
+    if(ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH) &&
+       g_recoveryFreshFramePending) {
+        g_recoveryFreshFramePending=false;
+        SerialPuts("virtio_gpu: fresh compositor frame flush verified after recovery\n");
+    }
 }

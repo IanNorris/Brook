@@ -298,3 +298,4 @@ void KsymDump()
 EXPORT_SYMBOL(GpuCompletionRegister);
 EXPORT_SYMBOL(GpuCompletionEnabled);
 EXPORT_SYMBOL(GpuCompletionPause);
+EXPORT_SYMBOL(GpuRecoveryBootOption);

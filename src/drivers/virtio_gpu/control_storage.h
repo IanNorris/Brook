@@ -19,6 +19,8 @@ struct __attribute__((packed)) VirtqUsedElem { uint32_t id,len; };
 static_assert(sizeof(VirtioGpuCtrlHdr)==24 && sizeof(VirtqDesc)==16 && sizeof(VirtqUsedElem)==8);
 
 enum class GpuCommandStorageState:uint8_t { Writable,Preparing,Published,Completed,Quarantined };
+enum class GpuCommandPurpose:uint8_t { General,CompositorVertexTransfer };
+enum class GpuControlFault:uint8_t { None,Timeout,UnexpectedUsed,InvalidCompletion,RecoveryFailed };
 // Allocated outside the frame loop. Buffer pages and this metadata outlive every
 // token and remain retained after quarantine. Caller serializes normal access.
 struct GpuCommandStorage {
@@ -30,6 +32,7 @@ struct GpuCommandStorage {
     bool timeline=false;
     GpuCompletionWaitOrigin origin{};
     GpuCommandStorageState state=GpuCommandStorageState::Writable;
+    GpuCommandPurpose purpose=GpuCommandPurpose::General;
     GpuCommandStorage()=default;
     GpuCommandStorage(const GpuCommandStorage&)=delete;
     GpuCommandStorage& operator=(const GpuCommandStorage&)=delete;

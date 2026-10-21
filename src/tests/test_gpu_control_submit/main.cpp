@@ -63,6 +63,8 @@ static void NotifyControlQueue(){
 static void reset() {
     // Each case is a fresh fake device with no concurrent DMA producer.
     g_pendingCommand=nullptr;g_controlQueuePoisoned=false;g_nextRenderFence=0;
+    g_controlFault=GpuControlFault::None;g_timeoutToken={};
+    g_lateVertexRecoveryEnabled=g_injectVertexTimeoutOnce=g_recoveryFreshFramePending=false;
     g_legacyCommand.~GpuCommandStorage();new(&g_legacyCommand) GpuCommandStorage{};
     second.~GpuCommandStorage();new(&second) GpuCommandStorage{};
     std::memset(firstBytes,0,sizeof(firstBytes));std::memset(secondBytes,0,sizeof(secondBytes));
@@ -222,7 +224,7 @@ DrawQuadRec g_drawQuads[1];uint32_t* g_drawVtxBuf=reinterpret_cast<uint32_t*>(ve
 unsigned frameMode,buildCalls;
 uint32_t NdcBits(int32_t p,int32_t){return static_cast<uint32_t>(p);}
 GpuCommandToken BeginVertexTransfer(uint32_t,uint32_t,uint32_t) {
-    return BeginCommand(g_legacyCommand,128,CMD_RESP_CAP);
+    return BeginCommand(g_legacyCommand,128,CMD_RESP_CAP,false,GpuCommandPurpose::CompositorVertexTransfer);
 }
 uint32_t BuildComposePacket(GpuCommandStorage& storage,int32_t,int32_t) {
     ++buildCalls;CHECK(g_pendingCommand==&g_legacyCommand);
@@ -236,7 +238,64 @@ bool CmdRespOk(const GpuCommandStorage& storage,uint32_t len) {
         reinterpret_cast<const VirtioGpuCtrlHdr*>(storage.bytes+CMD_RESP_OFF)->type==0x1100;
 }
 bool CmdRespOk(uint32_t len){return CmdRespOk(g_legacyCommand,len);}
+uint32_t g_composeN;
+bool g_compFrameAssembling,fenceTimesOut,fenceReturnsError;
+unsigned recoveryFences;
+bool AppFenceLocked(uint32_t context) {
+    ++recoveryFences;CHECK(context==COMP_CTX_ID && !g_pendingCommand && !g_controlQueuePoisoned);
+    auto* hdr=reinterpret_cast<VirtioGpuCtrlHdr*>(g_cmdBuf);*hdr={};hdr->ctx_id=context;
+    const auto token=BeginCommand(g_legacyCommand,128,CMD_RESP_CAP,true);
+    if(fenceTimesOut)now+=5000000000ull;
+    else {complete();if(fenceReturnsError)reinterpret_cast<VirtioGpuCtrlHdr*>(firstBytes+CMD_RESP_OFF)->type=0x1200;}
+    return CmdRespOk(FinishCommand(token));
+}
+#include "../../drivers/virtio_gpu/late_vertex_recovery.inc"
 #include "../../drivers/virtio_gpu/compose_frame.inc"
+
+void lateVertexRecovery() {
+    for(unsigned mode=0;mode<12;++mode) {
+        reset();g_lateVertexRecoveryEnabled=true;recoveryFences=0;
+        fenceTimesOut=mode==9;fenceReturnsError=mode==10;
+        g_drawQuadCount=g_blurBarrierCount=g_composeN=7;g_compFrameAssembling=true;
+        if(mode==11)g_availIdxShadow=g_usedIdxShadow=availIndex=usedIndex=65535;
+        auto& storage=mode==7?second:g_legacyCommand;
+        const auto token=BeginCommand(storage,128,CMD_RESP_CAP,false,
+            mode==6?GpuCommandPurpose::General:GpuCommandPurpose::CompositorVertexTransfer);
+        now+=limits.timeoutNs;CHECK(!FinishCommand(token,limits));
+        CHECK(g_controlFault==GpuControlFault::Timeout);
+        CHECK(!TryRecoverLateVertexTransfer() && recoveryFences==0); // still no completion
+        complete();
+        if(mode==1)usedRing[token.storage->usedPosition%g_queueSize].id=7;
+        if(mode==2)++usedIndex;
+        if(mode==3)reinterpret_cast<VirtioGpuCtrlHdr*>(storage.bytes+CMD_RESP_OFF)->type=0x1200;
+        if(mode==4)++storage.generation;
+        if(mode==5)PoisonControlQueue(GpuControlFault::InvalidCompletion);
+        if(mode==8)g_lateVertexRecoveryEnabled=false;
+        const bool recovered=TryRecoverLateVertexTransfer();
+        CHECK(recovered==(mode==0 || mode==11));
+        for(auto value:vertices)CHECK(value==0x5a); // recovery never modifies backing
+        CHECK(recoveryFences==((mode==0 || mode==9 || mode==10 || mode==11)?1u:0u));
+        CHECK(!FinishCommand(token,limits)); // no resurrection of abandoned return
+        if(recovered) {
+            CHECK(!g_pendingCommand && !g_controlQueuePoisoned && g_cmdBuf==firstBytes);
+            CHECK(g_recoveryFreshFramePending && !g_drawQuadCount && !g_blurBarrierCount &&
+                  !g_composeN && !g_compFrameAssembling);
+            CHECK(!TryRecoverLateVertexTransfer() && recoveryFences==1); // consume once
+            const auto next=BeginCommand(second,128,CMD_RESP_CAP,true);
+            CHECK(next && !FinishCommand(token,limits) && g_pendingCommand==next.storage);
+            complete();CHECK(FinishCommand(next,limits)==sizeof(VirtioGpuCtrlHdr));
+        } else CHECK(g_controlQueuePoisoned && !g_recoveryFreshFramePending);
+        if(mode==9)CHECK(g_pendingCommand && g_pendingCommand->purpose==GpuCommandPurpose::General &&
+                         !TryRecoverLateVertexTransfer());
+        if(mode==1)CHECK(g_controlFault==GpuControlFault::InvalidCompletion);
+        if(mode==2)CHECK(g_controlFault==GpuControlFault::UnexpectedUsed);
+        if(mode==3 || mode==10)CHECK(g_controlFault==GpuControlFault::RecoveryFailed);
+    }
+    reset();g_injectVertexTimeoutOnce=true;
+    const auto token=BeginVertexTransfer(COMP_CTX_ID,COMP_DRAW_VBUF_RES,80);
+    CHECK(!FinishCommand(token,limits) && g_controlFault==GpuControlFault::Timeout &&
+          !g_injectVertexTimeoutOnce && *g_usedIdx==0); // genuine outstanding request, no fake used entry
+}
 void frameFailures() {
     reset();g_drawQuadCount=1;
     const auto inFlight=BeginCommand(g_legacyCommand,128,CMD_RESP_CAP);
@@ -353,6 +412,7 @@ static void exercise() {
 }
 
 int main(){
+    lateVertexRecovery();
     reset_device::exercise();
     notificationOwnership();
     frameFailures();
