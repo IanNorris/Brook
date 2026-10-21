@@ -46,6 +46,9 @@ def main():
     kernel = build/'BROOK.elf'
     if sha(kernel) != args.expected_kernel_sha256:
         raise RuntimeError('Built kernel differs from the requested hash')
+    symbols = build/'ksym_addr_table.cpp'
+    if not symbols.is_file() or not symbols.stat().st_size:
+        raise RuntimeError('Incomplete build: missing or empty ksym_addr_table.cpp; nothing staged')
     modules = sorted((build/'drivers').glob('*.mod'))
     if not modules:
         raise RuntimeError('No built modules')
@@ -79,14 +82,14 @@ def main():
     for module in modules:
         shutil.copy2(module,artifacts/'drivers'/module.name)
     shutil.copy2(kernel,artifacts/'BROOK.elf')
-    shutil.copy2(build/'ksym_addr_table.cpp',artifacts/'ksym_addr_table.cpp')
+    shutil.copy2(symbols,artifacts/'ksym_addr_table.cpp')
     if sha(kernel) != args.expected_kernel_sha256 or sha(artifacts/'BROOK.elf') != args.expected_kernel_sha256:
         raise RuntimeError('Kernel changed during staging; inspect this review')
     for module, row in zip(modules, inventory):
         if sha(module) != row['sha256'] or sha(artifacts/'drivers'/module.name) != row['sha256']:
             raise RuntimeError('Module changed during staging: '+module.name)
     os.replace(temporary,boot)
-    report=dict(passed=True,kernel_sha256=args.expected_kernel_sha256,module_abi=args.module_abi,
+    report=dict(passed=True,kernel_sha256=args.expected_kernel_sha256,symbol_table_sha256=sha(symbols),module_abi=args.module_abi,
                 build=str(build),review=str(review),modules=inventory,scope='Stopped private boot/artifact kernel pair; data/nix/tmp disks untouched')
     (review/'staged-kernel.json').write_text(json.dumps(report,indent=2)+'\n')
     print('STAGED_KERNEL_MODULES_PASS',args.module_abi,len(modules),flush=True)
