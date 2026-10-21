@@ -809,3 +809,40 @@ FPS bisect and supports investigating persistent host/audio/device state and
 repeat variability. It does not prove that reboot repairs all rendering or
 that the TCP change has no performance effect. Evidence and actual launch
 comparison are retained in the review; the user's VM remains running.
+
+
+### Postreboot matched attract controls separate slow output from fast output
+
+The user tests the full latest kernel (`fc41f3db…`) with current launcher
+callback/20-ms defaults, still RR, on the same rebooted host. Quake is roughly
+11 FPS, with slow tempo and stuttering. The saved two-second profile has
+1,589 samples, 8,747 context switches and zero drops. Cached completion is
+0.84506 seconds of nominal frames per guest-clock second; host brackets bound
+it to 0.83994–0.91519x, excluding 1x over that interval. Guest-clock bounds
+contain 1x. The speaker route is actually QEMU 44.1-kHz s16 stereo into the
+EVO4 USB four-channel 48-kHz S32LE hardware sink, not a null sink. This alone
+does not identify conversion as causal.
+
+After explicit unattended handback, two fresh clones use one shared harness:
+normal `/nix/bin/brook-yquake2-gl gl3`, default menu/attract demo, ten seconds
+after its window appears, no frame probe, same current host launcher with
+explicit HDA timer=true and 200-ms buffer, RR, same disk seed/speaker path.
+Latest kernel gives **0.83495x** frame-completion/guest-clock progression;
+earlier `31f52bb7` gives **1.00034x**. Their profiles report zero drops. Original
+guest-identity/output gates, graceful game close, original VM launcher zero
+exits and all four offline fsck checks pass for both.
+
+These short single runs do not prove decoded musical tempo or render frame
+times, but they reproduce a kernel-dependent slow-delivery difference after
+holding host audio settings fixed. The earlier fast-media problem remains
+separate. Host null-sink controls cannot establish physical-output acceptance.
+Ignored summary is `unattended-audio-kernel-controls.json`; complete raw data is
+in `unattended-{latest,31}-historical-audio-20261021/attract-audio-control`.
+
+The next isolated control keeps the latest kernel and all other modules fixed.
+Two GPU modules are built in the same separate worktree/compiler, one unchanged
+KMutex ownership and one historical ticket-spin guard; both retain current
+completion validation, stable deadlines and uncertain-DMA quarantine. Fresh
+capsules differ only in that module. The optional SDL swap probe is common to
+the pair, with native validity and observer overhead still requiring checks.
+No default scheduler, driver behavior or TCP safety fix has been reverted.
