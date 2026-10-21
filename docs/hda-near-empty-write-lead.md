@@ -334,3 +334,133 @@ sampling or publication guard is weakened. The production lead remains
 Full original receipts, serial fault and load timestamps remain under
 `unattended-hda-{12k,8k}-q2-loaded-callback-20261021`; the ignored
 `hda-lead-q2-loaded-summary.json` explicitly records the failed candidate gate.
+
+### Normal placement, guest-load control
+
+A further matched pair separates the write-lead effect from the severe host
+oversubscription experiments. Both private VMs use the original QEMU 10.2.2,
+physical PipeWire output, callback HDA with requested 20-ms buffering, eight
+vCPUs/eight GiB, production RR and blocking AP accounting. Launch-time and
+endpoint audits allow all QEMU threads on logical CPUs 0–15. No host CPU
+workers, private PAUSE-exit modification, CPU profiler, timer/ready recorder or
+AP accounting intervention is used. The delivery probe runs around captures.
+
+The candidate derives from the current GPU capsule and replaces **only HDA**.
+The older 8-KiB capsule also contains a different GPU module, so copying that
+whole capsule would confound the comparison. The common kernel is
+`fc41f3dbf97797d1f349754303090fee0b6e14976f8350ae717e1636a104d8bb`;
+HDA hashes are `f05fdc31f3ea5c1737dfe732c3acc2dc4ca6820217d8be9e4253d9bea83e1b3e`
+(12 KiB) and `69289ccc84462a4158b59ed98e3942787fcff9d66eb64134c3ced68652b19c71`
+(8 KiB). The idle trailer and publication/fault guards remain unchanged.
+
+Each VM launches GL3 Quake in menu/attract mode, captures six seconds after
+warming, runs eight finite guest CPU workers plus four periodic sleepers for
+twenty seconds, then closes and reopens Quake for a second quiet capture. The
+loaded capture lies between every worker's observed first and last work
+samples; all eight perform nonzero work. Those endpoints do not assert that
+workers execute continuously. The guest benchmark SHA is checked before use.
+
+| Lead | Condition | App completion / guest second | Quiet PCM bins | Reserved silence bytes |
+| --- | --- | ---: | ---: | ---: |
+| 12 KiB | Quiet | 0.84345 | 13.725% | 182784 |
+| 8 KiB | Quiet | 0.99927 | 0.033% | 512 |
+| 12 KiB | Guest CPU load | 0.83213 | 15.321% | 201728 |
+| 8 KiB | Guest CPU load | 0.95512 | 4.117% | 50176 |
+| 12 KiB | Close/reopen quiet | 0.84254 | 13.659% | 184576 |
+| 8 KiB | Close/reopen quiet | 0.99899 | 0.033% | 768 |
+
+Quiet bins use approximately one-ms RMS windows below 10 in signed 16-bit
+samples; the soundtrack can contain natural silence. Application completion
+is not decoded music tempo, and QEMU PCM files do not timestamp speaker
+playback. Both streams retain their epochs with zero discontinuities. All
+captures have zero invalid clock/position, unsafe publication, diagnostic
+contention and saturation. Both cumulative runtime ledgers, original app-group
+exits, empty audio-stream teardown, heaps, original VM-owner exits and all four
+filesystem checks pass. Observed headroom and advance remain empirical samples,
+not worst-case safety bounds.
+
+This pair reproduces the independent pacing improvement under ordinary host
+placement, including application restart, but does not establish a complete
+audio fix. Some silence remains under guest load. The earlier heavy host-load
+faults remain failed gates; these results do not narrow the supported workload
+or override them. Fresh Firefox, finite exact stream-drain checks and reversal
+of the decisive contrast remain required before a production lead decision.
+RR and the production HDA lead remain unchanged.
+
+Full receipts and the derived summary remain in ignored
+`build/workloads/timing-scheduler-20261021/hda-normal-cohort/q2-summary.json` and
+`build/reviews/unattended-hda-normal-{12k,8k}-20261021`.
+
+#### Fresh Firefox and exact finite drains
+
+The next matched pair uses the same normal-placement settings and HDA-only
+contrast. Each VM launches a fresh Firefox profile twice against the generated
+local video/audio fixture. The first launch includes eight guest CPU workers
+for twenty seconds. Buffered schema-2 page traces retain the expected phase
+and epoch, monotonic samples and zero dropped trace records. Host/page clock
+anchors select samples wholly inside each audio capture's host brackets,
+allowing two milliseconds of timestamp quantization. These calculations assume
+a 1× clock; independent capture clock brackets contain that rate. They are
+callback opportunities, not physical display presentation.
+
+| Lead | Condition | App audio / guest second | Quiet PCM bins | Video callbacks / page second |
+| --- | --- | ---: | ---: | ---: |
+| 12 KiB | Quiet | 0.96935 | 2.919% | 11.686 |
+| 8 KiB | Quiet | 0.98774 | 0.387% | 11.459 |
+| 12 KiB | Guest CPU load | 0.14670 | 47.556% | 0.132 |
+| 8 KiB | Guest CPU load | 0.16246 | 42.398% | 0.381 |
+| 12 KiB | Fresh relaunch quiet | 0.99143 | 0.748% | 11.579 |
+| 8 KiB | Fresh relaunch quiet | 0.98779 | 1.097% | 10.665 |
+
+Neither loaded condition is acceptable playback. The smaller lead does not
+repair browser contention. A single key dispatched after the loaded capture
+reaches the DOM in approximately 3.219–3.522 seconds for 12 KiB and
+4.183–4.348 seconds for 8 KiB, followed by 844/733 ms until its RAF callback.
+These are individual observations, not a statistically established input
+regression or proof that a particular scheduler policy caused the delay.
+Quiet relaunch variability also prevents a general browser performance claim.
+
+After both browser groups exit and their audio streams disappear, each VM
+plays two finite ten-second packet-coded streams. Requested and actual OSS
+geometry agree: four/eight fragments of 4,096 bytes. Every stream submits and
+completes exactly 441,000 frames, synchronizes and tears down; each six-second
+capture lies inside the observed stream lifetime. Packet decoding finds pitch
+near 1×, no backwards/repeated symbol transitions or unobserved intermediate
+symbols, with approximate source/PCM rates 0.99586/1.00016 for the original
+four/eight-fragment cases and 1.00016/1.00033 for the candidate. This finite
+stream check runs after CPU load ends; it does not establish loaded drain
+behavior. Stored PCM is not timestamped physical speaker output.
+
+Both cohorts retain zero stream discontinuities, invalid clock/position,
+unsafe publication, diagnostic contention and saturation. Runtime ledgers,
+heaps, original browser/load/export jobs, the original fixture servers and VM
+owners, and all four filesystem checks pass. The original invalid-instance
+launch attempt is separately preserved: QEMU never started, its original
+wrapper exited 2, and all four private filesystem checks passed before retry.
+No failed attempt is relabeled successful.
+
+The complete results are indexed by ignored
+`build/workloads/timing-scheduler-20261021/hda-normal-cohort/browser-summary.json`.
+Review directories are `unattended-hda-browser-normal-12k-r2-20261021` and
+`unattended-hda-browser-normal-8k-20261021`. The controller is copied verbatim
+into each review. These controls separate a reproducible small-queue lead
+problem from the larger loaded-browser scheduling/service problem; neither
+the historical acceleration nor severe host-overcommit failure is closed.
+
+#### Original-lead reversal
+
+A final fresh Quake VM restores only the original 12-KiB HDA module under the
+same normal-placement settings. Completion returns to 0.84256 quiet, 0.82257
+under guest load and 0.84407 after close/reopen; quiet PCM bins return to
+13.908%, 15.828% and 13.863%, respectively. Every loaded capture lies within
+all eight workers' observed work lifetimes. Runtime, publication diagnostics,
+stream continuity, original app exits, teardown, heaps, original VM-owner exit
+and all four filesystem checks pass again. The result strengthens the causal
+write-lead contrast without attributing the separate loaded-browser failure to
+that lead. The summary above now includes `12k-reversal` and its raw review
+`unattended-hda-normal-12k-reversal-20261021`.
+
+The production lead and scheduler remain unchanged. The next policy comparison
+should keep HDA and the host placement fixed, use the same buffered browser
+fixture and finite guest workload, and preserve the failed host-overcommit and
+historical-acceleration cases as separate open gates.

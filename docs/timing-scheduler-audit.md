@@ -21,6 +21,11 @@ Later evidence supersedes several early leads:
   publication lead found after the initial diagnostics. Callback HDA avoids
   the independently demonstrated timer-mode source discards; neither repair
   proves that the historical roughly 1.3× browser/game acceleration is resolved.
+  A later normal-placement control changes only HDA's write lead from 12 to
+  8 KiB: Quake application-audio completion rises from about 0.843 to 0.999
+  per guest second on both quiet launches, and from 0.832 to 0.955 during
+  eight finite guest CPU workers. The default remains unchanged pending the
+  remaining gates. Earlier severe host-contention failures stay unresolved.
 - [BSP timer/wakeup measurements](bsp-timer-wakeup-timing.md) separate late
   interrupt entry from wake-scan execution. Independent AP arrivals demonstrate
   opportunities during some long BSP gaps. Host traces support QEMU device/BQL
