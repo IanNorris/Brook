@@ -114,7 +114,7 @@ previous failed browser/game runtime gates remain failed. Checked results,
 channel decoding and joint quiet-bin classification are retained under the
 review's `independent-audio-control/` directory.
 
-The next experiment is a bounded, default-off opportunity to coalesce a refill
+The [next experiment](audio-refill-coalescing.md) is a bounded, default-off opportunity to coalesce a refill
 from a recently contributing empty stream, with explicit device headroom and
 forced-resume limits. It needs actual mixer-body tests before native trials.
 It must not wait indefinitely for every stream or alter driver publication

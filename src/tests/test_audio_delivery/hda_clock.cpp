@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <vector>
 #include "../../drivers/intel_hda/intel_hda_mod.cpp"
 
 namespace {
@@ -300,10 +301,166 @@ int RunHdaClockTests() {
     std::printf("HDA_CLOCK %s\n",failures?"FAIL":"PASS");return failures;
 }
 
-namespace { bool mixerClockEnabled = false; uint64_t resetDuringCopy = 0; }
+namespace { bool mixerClockEnabled = false; uint64_t resetDuringCopy = 0, mixerProgressDelayNs = 0; }
 brook::AudioSubmitReceipt TestMixerNativeSubmit(const void* samples,uint32_t bytes) { return HdaTrySubmit(samples,bytes); }
-bool TestMixerNativeProgress(brook::AudioDeviceProgress* result) { return mixerClockEnabled && HdaNativeProgress(result); }
+bool TestMixerNativeProgress(brook::AudioDeviceProgress* result) {
+    const bool valid=mixerClockEnabled && HdaNativeProgress(result);
+    nowNs+=mixerProgressDelayNs;return valid;
+}
 bool TestMixerNativeRestart(uint64_t epoch) { return HdaNativeRestart(epoch); }
+namespace { unsigned nativeServiceCalls = 0; }
+void TestMixerNativeService() { if (mixerClockEnabled) { ++nativeServiceCalls; HdaService(); } }
+
+namespace {
+// Drive the production mixer and HDA bodies. An owned 16-KiB device queue
+// leaves enough lead for the explicit 12-KiB + 10-ms experiment. Neither
+// producer has software samples after priming, but both still own DMA frames.
+void coalesceSetup(brook::AudioStreamId a, brook::AudioStreamId b) {
+    using namespace brook;
+    AudioMixerCoalesceEnable(false); AudioStop(); initialize(); AudioMixerRefresh();
+    VERIFY(AudioMixerSetEnabled(a,true) && AudioMixerSetEnabled(b,true));
+    std::vector<int16_t> left(4096*2), right(4096*2);
+    for(unsigned i=0;i<4096;++i) {left[i*2]=1000;right[i*2+1]=2000;}
+    VERIFY(AudioMixerSubmit(left.data(),4096,a)==4096);
+    VERIFY(AudioMixerSubmit(right.data(),4096,b)==4096);
+    for(unsigned i=0;i<3;++i)AudioMixerFlush();
+    VERIFY(g_nativeClock.submitted==16384 && !g_nativeClock.completed);
+    prime(); AudioMixerRefresh(); AudioMixerCoalesceReset();
+}
+void queueChannel(brook::AudioStreamId id, bool right, uint32_t frames=1024) {
+    std::vector<int16_t> samples(frames*2);
+    for(unsigned i=0;i<frames;++i)samples[i*2+(right?1:0)]=right?2000:1000;
+    VERIFY(brook::AudioMixerSubmit(samples.data(),frames,id)==frames);
+}
+void verifyDma(uint32_t byteOffset,uint32_t frames,bool right) {
+    for(unsigned i=0;i<frames;++i) {
+        int16_t pair[2]{};memcpy(pair,dma.data()+byteOffset+i*4,4);
+        VERIFY(pair[0]==1000 && pair[1]==(right?2000:0));
+    }
+}
+void coalesceTests(brook::AudioStreamId a,brook::AudioStreamId b) {
+    using namespace brook;
+    VERIFY(!AudioMixerCoalesceRead().enabled);
+    // Baseline locks in the exact opportunity: A is irrevocably submitted
+    // without B, which arrives before the following service invocation.
+    coalesceSetup(a,b);queueChannel(a,false);AudioMixerFlush();
+    VERIFY(g_nativeClock.submitted==20480);verifyDma(16384,1024,false);
+    queueChannel(b,true);AudioMixerTick();
+    VERIFY(g_nativeClock.submitted==24576 && !AudioMixerCoalesceRead().deferrals);
+    finishPhysical();AudioMixerRefresh();
+    AudioStreamProgress pa{},pb{};
+    VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==5120 && !pa.queuedFrames);
+    VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==5120 && !pb.queuedFrames);
+
+    coalesceSetup(a,b);AudioMixerCoalesceEnable(true);queueChannel(a,false);
+    const auto services=nativeServiceCalls;AudioMixerTick();
+    VERIFY(nativeServiceCalls==services+1); // deferred Flush still services DMA
+    VERIFY(g_nativeClock.submitted==16384 && AudioMixerCoalesceRead().deferrals==1);
+    advanceNative(1764);queueChannel(b,true);AudioMixerTick();
+    VERIFY(g_nativeClock.submitted==20480);verifyDma(16384,1024,true);
+    auto status=AudioMixerCoalesceRead();
+    VERIFY(status.deferrals==1 && status.forcedResumes==1 && status.recoveredContributors==1);
+    VERIFY(status.lateResumes==1); // a delayed invocation must still submit
+    finishPhysical();AudioMixerRefresh();
+    VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==5120 && !pa.queuedFrames);
+    VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==5120 && !pb.queuedFrames);
+
+    // B's finite source never refills: at most one grace for that empty
+    // episode, and A progresses on the next invocation without duplication.
+    coalesceSetup(a,b);AudioMixerCoalesceEnable(true);queueChannel(a,false);
+    AudioMixerFlush();AudioMixerFlush();
+    VERIFY(g_nativeClock.submitted==20480);verifyDma(16384,1024,false);
+    VERIFY(AudioMixerSetEnabled(b,true)); // idempotent trigger cannot rearm grace
+    queueChannel(a,false);AudioMixerFlush();VERIFY(g_nativeClock.submitted==24576);
+    status=AudioMixerCoalesceRead();VERIFY(status.deferrals==1 && status.forcedResumes==1);
+    finishPhysical();AudioMixerRefresh();
+    VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==6144 && !pa.queuedFrames);
+    VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==4096 && !pb.queuedFrames);
+
+    // No hold for paused, reset, closed/replaced, or fully drained peers.
+    for(unsigned action=0;action<4;++action) {
+        coalesceSetup(a,b);AudioMixerCoalesceEnable(true);
+        if(action==0)VERIFY(AudioMixerSetEnabled(b,false));
+        if(action==1)VERIFY(AudioMixerReset(b));
+        if(action==2){auto old=b;VERIFY(AudioMixerClose(b));b=AudioMixerOpen();VERIFY(b && b!=old);}
+        if(action==3){finishPhysical();AudioMixerRefresh();}
+        queueChannel(a,false);AudioMixerFlush();
+        VERIFY(!AudioMixerCoalesceRead().deferrals);
+    }
+
+    // Losing a missing identity during an existing grace cannot recover its
+    // replacement or introduce another consecutive deferred opportunity.
+    coalesceSetup(a,b);AudioMixerCoalesceEnable(true);queueChannel(a,false);AudioMixerFlush();
+    VERIFY(AudioMixerReset(b));queueChannel(b,true);AudioMixerFlush();
+    status=AudioMixerCoalesceRead();VERIFY(status.deferrals==1 && status.forcedResumes==1 && !status.recoveredContributors);
+    verifyDma(16384,1024,true); // new epoch's PCM still mixes normally
+
+    // A short but positive B queue is deliberately outside this policy:
+    // retain the existing maximum-length mix and its silent suffix.
+    coalesceSetup(a,b);AudioMixerCoalesceEnable(true);
+    queueChannel(a,false);queueChannel(b,true,128);AudioMixerFlush();
+    VERIFY(!AudioMixerCoalesceRead().deferrals && g_nativeClock.submitted==20480);
+    verifyDma(16384,128,true);verifyDma(16384+128*4,1024-128,false);
+
+    // Changing the missing participant cannot extend an existing grace.
+    coalesceSetup(a,b);AudioMixerCoalesceEnable(true);queueChannel(a,false);AudioMixerFlush();
+    VERIFY(AudioMixerReset(a));queueChannel(b,true);AudioMixerFlush();
+    VERIFY(AudioMixerCoalesceRead().deferrals==1 && g_nativeClock.submitted==20480);
+
+    // Close and reuse while deferred must not count the replacement identity
+    // as recovery of the previous contributor, even when it supplies PCM.
+    coalesceSetup(a,b);AudioMixerCoalesceEnable(true);queueChannel(a,false);AudioMixerFlush();
+    const auto old=b;VERIFY(AudioMixerClose(b));b=AudioMixerOpen();VERIFY(b && b!=old);
+    queueChannel(b,true);AudioMixerFlush();
+    VERIFY(!AudioMixerCoalesceRead().recoveredContributors);
+    verifyDma(16384,1024,true);
+
+    // Partial native acceptance retains both unaccepted source suffixes.
+    coalesceSetup(a,b);AudioMixerCoalesceEnable(true);
+    std::array<int16_t,16384> silence{};
+    VERIFY(HdaTrySubmit(silence.data(),31744).accepted==31744);
+    queueChannel(a,false);AudioMixerFlush();queueChannel(b,true);AudioMixerFlush();
+    VERIFY(g_nativeClock.submitted==49152);verifyDma(48128,256,true);
+    AudioMixerDiagnostic diagnostic{};AudioMixerDiagnosticSnapshot(&diagnostic);
+    for(const auto& stream:diagnostic.streams)if(stream.identity==a || stream.identity==b)
+        VERIFY(stream.softwareFrames==768 && stream.inFlightFrames==4352);
+    AudioMixerFlush();VERIFY(g_nativeClock.submitted==49152); // full, no loss
+    advanceNative(4096);AudioMixerFlush();
+    VERIFY(g_nativeClock.submitted==52224);verifyDma(49152,768,true);
+    finishPhysical();AudioMixerRefresh();
+    VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==5120 && !pa.queuedFrames);
+    VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==5120 && !pb.queuedFrames);
+
+    // Headroom boundary includes a full additional service interval.
+    constexpr uint32_t threshold=12288+441*4;
+    for(uint32_t pending:{threshold-4,threshold,threshold+4}) {
+        coalesceSetup(a,b);AudioMixerCoalesceEnable(true);
+        advanceNative(16384-pending);queueChannel(a,false);const auto before=g_nativeClock.submitted;
+        AudioMixerFlush();status=AudioMixerCoalesceRead();
+        VERIFY(status.deferrals==(pending>=threshold?1:0));
+        VERIFY(status.headroomBypasses==(pending<threshold?1:0));
+        VERIFY(g_nativeClock.submitted==before+(pending<threshold?4096:0));
+    }
+    // Age begins before the progress callback. A slow callback cannot present
+    // an old queue snapshot as fresh headroom, or renew grace after a delay.
+    coalesceSetup(a,b);AudioMixerCoalesceEnable(true);queueChannel(a,false);
+    mixerProgressDelayNs=10000001;AudioMixerFlush();mixerProgressDelayNs=0;
+    status=AudioMixerCoalesceRead();
+    VERIFY(!status.deferrals && status.invalidClock==1 && g_nativeClock.submitted==20480);
+    // Even an allowed snapshot age consumes part of the lead budget.
+    coalesceSetup(a,b);AudioMixerCoalesceEnable(true);
+    advanceNative(16384-threshold);queueChannel(a,false);
+    mixerProgressDelayNs=1000000;AudioMixerFlush();mixerProgressDelayNs=0;
+    status=AudioMixerCoalesceRead();VERIFY(!status.deferrals && status.headroomBypasses==1);
+    coalesceSetup(a,b);AudioMixerCoalesceEnable(true);queueChannel(a,false);
+    clockAvailable=false;AudioMixerFlush();
+    VERIFY(!AudioMixerCoalesceRead().deferrals);
+    clockAvailable=true;AudioMixerCoalesceEnable(false);AudioStop();initialize();AudioMixerRefresh();
+    // b may have been replaced above; retire its current local identity.
+    VERIFY(AudioMixerClose(b));
+    std::printf("MIXER_COALESCE %s\n",failures?"FAIL":"PASS");
+}
+}
 int RunMixerClockTests() {
     using namespace brook;
     mixerClockEnabled=true;AudioStop();initialize();AudioMixerRefresh();
@@ -416,6 +573,7 @@ int RunMixerClockTests() {
     VERIFY(!timing.runningSamples && !timing.maxAdvanceEvent.hardwareEpoch && !timing.minHeadroomEvent.hardwareEpoch);
     VERIFY(g_nativeClock.discontinuity);
     AudioDeliveryTimingEnable(false);
-    VERIFY(AudioMixerClose(a) && AudioMixerClose(b));mixerClockEnabled=false;AudioStop();
+    coalesceTests(a,b);
+    VERIFY(AudioMixerClose(a));mixerClockEnabled=false;AudioStop();
     std::printf("MIXER_CLOCK %s\n",failures?"FAIL":"PASS");return failures;
 }

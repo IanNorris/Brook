@@ -130,6 +130,7 @@ struct MixerStream {
     uint32_t capacity = MIXER_RING_FRAMES;
     uint32_t writableFrames = 1;
     bool discontinuity = false;
+    bool coalesceUsed = false; // one grace per empty software-queue episode
 };
 static MixerStream g_streams[MIXER_MAX_STREAMS];
 static uint64_t g_nextStreamIdentity = 1;
@@ -161,6 +162,50 @@ static DriverMode g_driverMode = DriverMode::Unknown; // flush owner only
 static uint64_t g_hardwareEpoch = 0;
 static bool g_clockSupported = false; // mixer lock
 
+// All coalescing state is protected by g_mixerLock, including configuration.
+// A return from Flush still allows Tick to call the driver's service routine.
+static AudioMixerCoalesceSnapshot g_coalesce;
+static bool g_coalesceActive = false;
+static bool g_coalescePending = false;
+static uint64_t g_coalesceDeadline = 0;
+static Contribution g_coalesceMissing[MIXER_MAX_STREAMS]{};
+static void CoalesceClearPending()
+{
+    g_coalescePending = false;
+    g_coalesceDeadline = 0;
+    for (auto& part : g_coalesceMissing) part = {};
+}
+static void CoalesceCount(uint64_t& value)
+{
+    if (value == ~uint64_t(0)) g_coalesce.saturated = true;
+    else ++value;
+}
+void AudioMixerCoalesceEnable(bool enabled)
+{
+    SpinLockAcquire(&g_mixerLock);
+    g_coalesce.enabled = enabled;
+    __atomic_store_n(&g_coalesceActive, enabled, __ATOMIC_RELEASE);
+    CoalesceClearPending();
+    for (auto& stream : g_streams) stream.coalesceUsed = false;
+    SpinLockRelease(&g_mixerLock);
+}
+void AudioMixerCoalesceReset()
+{
+    SpinLockAcquire(&g_mixerLock);
+    const bool enabled = g_coalesce.enabled;
+    g_coalesce = {}; g_coalesce.enabled = enabled;
+    CoalesceClearPending();
+    for (auto& stream : g_streams) stream.coalesceUsed = false;
+    SpinLockRelease(&g_mixerLock);
+}
+AudioMixerCoalesceSnapshot AudioMixerCoalesceRead()
+{
+    SpinLockAcquire(&g_mixerLock);
+    const auto result = g_coalesce;
+    SpinLockRelease(&g_mixerLock);
+    return result;
+}
+
 
 static MixerStream* FindStream(AudioStreamId identity)
 {
@@ -175,11 +220,13 @@ static void ResetStream(MixerStream& stream)
     stream.read = stream.write = 0;
     stream.submittedFrames = stream.completedFrames = stream.inFlight = 0;
     stream.discontinuity = false;
+    stream.coalesceUsed = false;
 }
 static void ResetAllStreams()
 {
     SpinLockAcquire(&g_mixerLock);
     for (auto& stream : g_streams) ResetStream(stream);
+    CoalesceClearPending();
     SpinLockRelease(&g_mixerLock);
 }
 void AudioMixerInit()
@@ -235,7 +282,9 @@ bool AudioMixerSetEnabled(AudioStreamId identity, bool enabled)
 {
     SpinLockAcquire(&g_mixerLock);
     auto* stream = FindStream(identity);
-    if (stream) stream->enabled = enabled;
+    if (stream && stream->enabled != enabled) {
+        stream->enabled = enabled; stream->coalesceUsed = false;
+    }
     SpinLockRelease(&g_mixerLock);
     return stream != nullptr;
 }
@@ -287,6 +336,7 @@ uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frames, AudioStreamId
     }
     stream->write += frames;
     stream->submittedFrames += frames;
+    if (frames) stream->coalesceUsed = false;
     SpinLockRelease(&g_mixerLock);
     return frames;
 }
@@ -374,8 +424,9 @@ static void Reconcile(const AudioDeviceProgress& device)
     }
     SpinLockRelease(&g_mixerLock);
 }
-static void RefreshDevice(uint64_t epoch)
+static void RefreshDevice(uint64_t epoch, AudioDeviceProgress* fresh = nullptr)
 {
+    if (fresh) *fresh = {};
     if (g_flushEpoch != epoch) {
         g_batchRemaining = g_partialOffset = g_completionHead = g_completionCount = 0;
         g_driverMode = DriverMode::Unknown;
@@ -404,6 +455,7 @@ static void RefreshDevice(uint64_t epoch)
     g_hardwareEpoch = device.epoch;
     SpinLockAcquire(&g_mixerLock); g_clockSupported = true; SpinLockRelease(&g_mixerLock);
     Reconcile(device);
+    if (fresh) *fresh = device;
     // The terminal snapshot was reconciled before retiring this epoch. A failed
     // restart leaves the driver's fault and its last proven watermark latched.
     if (device.discontinuity) g_audioDriver->restart(device.epoch);
@@ -443,16 +495,82 @@ void AudioMixerDiagnosticSnapshot(AudioMixerDiagnostic* result)
     }
     SpinLockRelease(&g_mixerLock);
 }
+
+// Called under the mixer lock, before preparing or consuming any samples.
+// The native device snapshot was taken outside this lock by this flush owner.
+static bool CoalesceRefill(const AudioDeviceProgress& device, uint64_t sampledBefore)
+{
+    if (!g_coalesce.enabled) return false;
+    constexpr uint64_t graceNs = 10000000; // one nominal service opportunity
+    const uint64_t now = AudioClockNowNs();
+    if (g_coalescePending) {
+        // Never defer two consecutive opportunities, even if another stream
+        // becomes empty or this invocation arrives long after the deadline.
+        CoalesceCount(g_coalesce.forcedResumes);
+        if (now && now > g_coalesceDeadline) CoalesceCount(g_coalesce.lateResumes);
+        for (const auto& part : g_coalesceMissing) {
+            auto* stream = FindStream(part.identity);
+            if (stream && stream->epoch == part.epoch && stream->enabled &&
+                !stream->discontinuity && stream->write > stream->read)
+                CoalesceCount(g_coalesce.recoveredContributors);
+        }
+        CoalesceClearPending();
+        return false;
+    }
+    bool ready = false, missing = false;
+    for (const auto& stream : g_streams) {
+        if (!stream.identity || !stream.enabled || stream.discontinuity) continue;
+        ready |= stream.write > stream.read;
+        missing |= stream.write == stream.read && stream.inFlight && !stream.coalesceUsed;
+    }
+    if (!ready || !missing) return false;
+    if (g_driverMode != DriverMode::Native || strcmp(g_audioDriver->name, "intel_hda")) {
+        CoalesceCount(g_coalesce.unsupportedDriver); return false;
+    }
+    if (!sampledBefore || !now || now < sampledBefore || now - sampledBefore > graceNs ||
+        now > ~uint64_t(0) - graceNs) {
+        CoalesceCount(g_coalesce.invalidClock); return false;
+    }
+    // Fixed-HDA experiment only: retain the full unchanged 12-KiB safe write
+    // lead plus sample age and one prospective 10-ms interval. This is an
+    // opportunity bound, not a promise that the thread will run within 10 ms.
+    const uint64_t travelNs = now - sampledBefore + graceNs;
+    const uint64_t travelFrames = (travelNs * MIXER_HW_RATE + 999999999) / 1000000000;
+    const uint64_t requiredBytes = 12288 + travelFrames * MIXER_FRAME_BYTES;
+    if (!device.running || device.discontinuity || device.epoch != g_hardwareEpoch ||
+        device.submitted < device.completed || device.submitted - device.completed < requiredBytes) {
+        CoalesceCount(g_coalesce.headroomBypasses); return false;
+    }
+    for (uint32_t i = 0; i < MIXER_MAX_STREAMS; ++i) {
+        auto& stream = g_streams[i];
+        if (stream.identity && stream.enabled && !stream.discontinuity &&
+            stream.write == stream.read && stream.inFlight && !stream.coalesceUsed) {
+            stream.coalesceUsed = true;
+            g_coalesceMissing[i] = {stream.identity, stream.epoch, 0, 0};
+        }
+    }
+    g_coalescePending = true;
+    g_coalesceDeadline = now + graceNs;
+    CoalesceCount(g_coalesce.deferrals);
+    return true;
+}
 void AudioMixerFlush()
 {
     if (__atomic_exchange_n(&g_flushBusy, 1u, __ATOMIC_ACQUIRE)) return;
     struct FlushOwner { ~FlushOwner() { __atomic_store_n(&g_flushBusy, 0u, __ATOMIC_RELEASE); } } owner;
     const uint64_t epoch = __atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE);
-    RefreshDevice(epoch);
+    // Default-off avoids any additional clock reads on the normal path.
+    const bool coalesce = __atomic_load_n(&g_coalesceActive, __ATOMIC_ACQUIRE);
+    const uint64_t sampledBefore = coalesce ? AudioClockNowNs() : 0;
+    AudioDeviceProgress device{};
+    RefreshDevice(epoch, coalesce ? &device : nullptr);
     Contribution contributions[MIXER_MAX_STREAMS]{};
     const bool partial = g_partialOffset != 0;
     SpinLockAcquire(&g_mixerLock);
     if (!g_mixerReady || !g_audioDriver || !g_audioDriver->play) {
+        SpinLockRelease(&g_mixerLock); return;
+    }
+    if (!partial && CoalesceRefill(device, sampledBefore)) {
         SpinLockRelease(&g_mixerLock); return;
     }
     const uint32_t frames = partial ? 0 : Prepare(contributions);

@@ -3786,6 +3786,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio producer on|off|reset|status - DSP producer elapsed brackets (default off)\n"
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
+            "  audio coalesce on|off|reset|status - experimental HDA 12-KiB refill grace (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
             "  sched irq-accounting try|blocking|status - experimental AP accounting deferral\n"
@@ -4216,6 +4217,19 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             row.text(",\"worked\":");row.text(e.worked?"true":"false");row.text("}");row.send();
         }
         DebugChannelSend("]}\n");
+    }
+    else if(NetStrEq(cmd,"audio coalesce on") || NetStrEq(cmd,"audio coalesce off") ||
+            NetStrEq(cmd,"audio coalesce reset") || NetStrEq(cmd,"audio coalesce status")) {
+        if(NetStrEq(cmd,"audio coalesce on"))AudioMixerCoalesceEnable(true);
+        else if(NetStrEq(cmd,"audio coalesce off"))AudioMixerCoalesceEnable(false);
+        else if(NetStrEq(cmd,"audio coalesce reset"))AudioMixerCoalesceReset();
+        const auto s=AudioMixerCoalesceRead();BridgeReply r;r.text("{\"enabled\":");r.text(s.enabled?"true":"false");
+        r.text(",\"saturated\":");r.text(s.saturated?"true":"false");
+        r.text(",");r.field("deferrals",s.deferrals);r.text(",");r.field("recovered_ready_contributors",s.recoveredContributors);
+        r.text(",");r.field("forced_resumes",s.forcedResumes);r.text(",");r.field("headroom_bypasses",s.headroomBypasses);
+        r.text(",");r.field("invalid_clock",s.invalidClock);r.text(",");r.field("unsupported_driver",s.unsupportedDriver);
+        r.text(",");r.field("late_resumes",s.lateResumes);
+        r.text(",\"scope\":\"default-off fixed intel_hda 12-KiB lead experiment; one deferred opportunity, not a wall-time guarantee; recovered means ready at next preparation, not proven playback\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"audio delivery on") || NetStrEq(cmd,"audio delivery off") ||
             NetStrEq(cmd,"audio delivery reset") || NetStrEq(cmd,"audio delivery status")) {

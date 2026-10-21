@@ -291,13 +291,14 @@ int RunMixerClockTests();
 brook::AudioSubmitReceipt TestMixerNativeSubmit(const void*,uint32_t);
 bool TestMixerNativeProgress(brook::AudioDeviceProgress*);
 bool TestMixerNativeRestart(uint64_t);
+void TestMixerNativeService();
 int main() {
     const auto timing=brook::AudioServiceTimingRead();CHECK(timing.epoch==0 && !timing.cycles && !timing.contendedRecords);
     brook::AudioServiceTimingEnable(true);brook::AudioServiceTimingReset();
     CHECK(brook::AudioServiceTimingRead().epoch&1);
     brook::AudioServiceTimingEnable(false);CHECK(!(brook::AudioServiceTimingRead().epoch&1));
     brook::AudioMixerInit();
-    const brook::AudioDriver driver{"test",play,stop,nullptr,nullptr,nullptr,
+    const brook::AudioDriver driver{"intel_hda",play,stop,nullptr,nullptr,TestMixerNativeService,
         TestMixerNativeSubmit,TestMixerNativeProgress,TestMixerNativeRestart};
     CHECK(brook::AudioRegister(&driver));
     primary=brook::AudioMixerOpen();secondary=brook::AudioMixerOpen();

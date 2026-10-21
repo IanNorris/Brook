@@ -134,6 +134,18 @@ struct AudioMixerDiagnostic {
 };
 void AudioMixerDiagnosticSnapshot(AudioMixerDiagnostic* result);
 
+// Experimental, default-off refill coalescing for the unchanged intel_hda
+// 12-KiB publication lead. Not a generic driver latency guarantee.
+struct AudioMixerCoalesceSnapshot {
+    bool enabled = false, saturated = false;
+    uint64_t deferrals = 0, recoveredContributors = 0, forcedResumes = 0;
+    uint64_t headroomBypasses = 0, invalidClock = 0, unsupportedDriver = 0;
+    uint64_t lateResumes = 0;
+};
+void AudioMixerCoalesceEnable(bool enabled);
+void AudioMixerCoalesceReset();
+AudioMixerCoalesceSnapshot AudioMixerCoalesceRead();
+
 // Submit pre-resampled 44100/stereo/16-bit PCM into this stream's FIFO.
 // Returns the number of frames actually accepted; callers must retry the rest.
 uint32_t AudioMixerSubmit(const int16_t* samples, uint32_t frameCount, AudioStreamId stream);

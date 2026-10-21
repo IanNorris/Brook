@@ -12,7 +12,12 @@ Later evidence supersedes several early leads:
   on reopen; CPU load changes it little. Two clamps retain a failed runtime
   gate. [Coordinated channel-separated OSS sources](audio-mix-timing.md) sustain both
   near 0.96–0.98 nominal with exact drains and clean gates; independent writers
-  are next. The independent debt-reference tests do not waive existing failures.
+  fall near 0.82–0.92 without graphics, with complementary channel gaps and no
+  HDA reservations. A [bounded refill-coalescing experiment](audio-refill-coalescing.md)
+  exercises actual recovery opportunities with clean narrow gates, but its
+  off/on/off comparison has no consistent progress benefit. It remains off;
+  source phase and short positive queues need discrimination before broadening
+  the policy. The independent debt-reference tests do not waive existing failures.
 
 - [Signal interruption of timed waits](signal-wait-restart.md) fixes confirmed
   SA_RESTART replay of poll/sleeps/timed futex waits and the ordinary-signal
