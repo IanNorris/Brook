@@ -577,3 +577,48 @@ CPU/memory/scheduler/audio configuration and Wayland tracing; it is not a
 randomized or statistically powered trial. Receipts and reconciliation are in
 `reboot-resume/poll-readers-replication/comparison.json` and the two
 `unattended-poll-reader-{control,fixed}-gpu-1ms-fixed-mlfq-b-20261021/` reviews.
+
+### Upload backing ownership before additional overlap (2026-10-21)
+
+Review of the legacy `AppBufferUpload` path found two unsafe lifetime cases:
+failed attach/transfer freed pages after an attach command might have reached
+the host, and context destroy freed upload pages without resource detach/unref
+verification. The upload table now records resource identity, context
+incarnation and private backing before publication. A possible backing attach
+makes subsequent failure quarantine the allocation. Never-attached private
+pages can still be released after a create failure; an uncertain unbacked
+host object may remain. This is conservative retention, not complete rollback.
+
+Normal retirement verifies producer/compositor fences, context detach, backing
+detach and resource unref before freeing the upload's pages and clearing its
+record. Context teardown performs this while its producer context remains
+live, then verifies context destruction. Failure retains the context slot;
+incarnation checks prevent a retained upload from being claimed by a later
+context. The existing command guard is acquired once at the public boundary;
+context teardown uses a locked retirement helper. A raw duplicate retirement
+request remains subject to the pre-existing issued-ID namespace limitation;
+canonical resource owners must exclude duplicate closes. Clearing the upload
+record prevents a subsequent context teardown from freeing it twice.
+
+All 83 hosted suites pass. New fault tests compile the actual context create,
+upload, resource retire and context destroy bodies, injecting failures at each
+publication/retirement stage, partial two-upload retirement and context-slot
+reuse with a new incarnation and non-recycled resource IDs. The host fixture
+tracks attachment against each resource's allocation, and ASan/UBSan passes.
+These are hosted command-failure tests, not native transport-timeout injection
+or implementation of device reset/reclamation.
+
+A fresh private VM executes 40 legacy ABI context cycles with two uploads per
+cycle. All 80 resource IDs are distinct, the same context slot is reused and
+40 verified destroy messages are independently checked in serial output.
+Heap and runtime checks pass. The uncapped Quake marker span is 13.687 s,
+consistent with the earlier 13.56–13.77 s candidates. Subsequent normal Quake,
+vkcube and vkmark controls complete, with representative captures inspected
+and no obvious new corruption. Vkmark remains 38/38 FPS; this safety change
+is not a throughput optimization. Quake/vkcube window-state acknowledgement
+latencies vary substantially (Quake 275/633 ms, cube 804/132 ms), so these
+checks do not establish tighter input latency. Original controllers/VM exit
+zero, four offline filesystem checks pass and raw swap traces match saved
+hashes. Evidence and exact frozen kernel/module manifests are retained in
+`unattended-upload-backing-gpu-1ms-fixed-mlfq-a-20261021/` and
+`gpu-upload-backing-frozen/` under the ignored experiment tree.

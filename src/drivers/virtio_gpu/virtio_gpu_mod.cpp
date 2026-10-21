@@ -29,6 +29,7 @@
 #include "virgl_submit.h"
 #include "retirement_protocol.h"
 #include "resource_ids.h"
+#include "upload_backing.h"
 #include "aperture_allocator.h"
 #include "cpu.h"
 #include "sync/kmutex.h"
@@ -2483,12 +2484,14 @@ static const uint32_t* CompCaptureFull(uint32_t* outW, uint32_t* outH)
 static constexpr uint32_t APP_FIRST_CTX  = 0x100;   // app ctx ids start here (1,2 = kernel)
 static constexpr uint32_t MAX_APP_CTX = brook::GpuResourceNamespace::ContextSlots;
 static brook::GpuAppResourceIds<> g_appResourceIds;
-struct AppCtx { bool used; uint32_t ctxId; uint32_t pid; brook::GpuContextConfig config; };
+struct AppCtx { bool used; uint32_t ctxId; uint32_t pid; brook::GpuContextConfig config; uint64_t incarnation; };
+static uint64_t g_appContextIncarnation;
 static AppCtx g_appCtx[MAX_APP_CTX] = {};
 
 // Kernel bounce-buffers backing app resources uploaded from user memory (e.g.
-// vertex buffers). Tracked so they're freed when the owning context is gone.
-struct AppUpload { bool used; int32_t ctxId; uint64_t vaddr; uint64_t pages; };
+// vertex buffers). Freed only after verified resource retirement; uncertain
+// host ownership retains the allocation and its context incarnation.
+using AppUpload = brook::GpuUploadBacking;
 static constexpr uint32_t MAX_APP_UPLOADS = 64;
 static AppUpload g_appUploads[MAX_APP_UPLOADS] = {};
 
@@ -2512,27 +2515,7 @@ static brook::GpuAppCapabilities AppCapabilities()
     return {mask, context, blobs, blobs};
 }
 
-static int32_t AppCtxCreate(uint32_t pid, const brook::GpuContextConfig& config = {})
-{
-    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
-    const auto caps = AppCapabilities();
-    if (!g_gpu3dWorks || g_controlQueuePoisoned || config.capsetId >= 64 || config.numRings > 64 ||
-        config.pollRingsMask || !(caps.capsetMask & (uint64_t{1} << config.capsetId))) return -1;
-    for (uint32_t i = 0; i < MAX_APP_CTX; ++i)
-    {
-        if (g_appCtx[i].used) continue;
-        uint32_t ctxId = APP_FIRST_CTX + i;
-        if (!CtxCreate(ctxId, config.capsetId))
-        { SerialPuts("virtio_gpu: app ctx create failed\n"); return -1; }
-        g_appCtx[i] = { true, ctxId, pid, config };
-        g_appResourceIds.BeginContext(i);
-        SerialPrintf("virtio_gpu: app ctx %u capset %u rings %u for pid %u\n",
-                     ctxId, config.capsetId, config.numRings, pid);
-        return static_cast<int32_t>(ctxId);
-    }
-    SerialPuts("virtio_gpu: app ctx table full\n");
-    return -1;
-}
+#include "app_ctx_create.inc"
 
 static AppCtx* AppCtxFind(int32_t ctxId)
 {
@@ -2542,29 +2525,8 @@ static AppCtx* AppCtxFind(int32_t ctxId)
     return &g_appCtx[i];
 }
 
-static void AppCtxDestroy(int32_t ctxId)
-{
-    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
-    AppCtx* c = AppCtxFind(ctxId);
-    if (!c) return;
-    auto* req = reinterpret_cast<VirtioGpuCtrlHdr*>(g_cmdBuf + CMD_REQ_OFF);
-    memset(req, 0, sizeof(*req));
-    req->type   = VIRTIO_GPU_CMD_CTX_DESTROY;
-    req->ctx_id = (uint32_t)ctxId;
-    if (!CmdRespOk(SubmitCommand(sizeof(*req),CMD_RESP_CAP))) {
-        SerialPrintf("virtio_gpu: app ctx %d teardown unverified; retained\n",ctxId);
-        return;
-    }
-    c->used = false;
-    // Free any upload bounce-buffers owned by this context.
-    for (uint32_t i = 0; i < MAX_APP_UPLOADS; ++i)
-        if (g_appUploads[i].used && g_appUploads[i].ctxId == ctxId)
-        {
-            VmmFreePages(VirtualAddress(g_appUploads[i].vaddr), g_appUploads[i].pages);
-            g_appUploads[i].used = false;
-        }
-    SerialPrintf("virtio_gpu: app virgl ctx %d destroyed\n", ctxId);
-}
+static int32_t AppRetireResourceLocked(int32_t ctxId, int32_t gres);
+#include "app_ctx_destroy.inc"
 
 static bool AppFenceLocked(uint32_t ctxId);
 
@@ -2749,38 +2711,8 @@ static int32_t AppResourceAttachUser(int32_t ctxId, int32_t gres,
 // buffer holding a copy of `bytes` from `src` (kernel-readable; the syscall
 // validated it), attach it to the context, and push the contents to the host.
 // Returns the new resource's host-global id (usable directly in the app's virgl
-// SET_VERTEX_BUFFERS command) or <0. The bounce buffer is freed on ctx destroy.
-static int32_t AppBufferUpload(int32_t ctxId, const void* src, uint32_t bytes)
-{
-    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
-    AppCtx* c = AppCtxFind(ctxId);
-    if (!c || !src || bytes == 0 || bytes > 16u * 1024 * 1024) return -1;
-    uint32_t slot = MAX_APP_UPLOADS;
-    for (uint32_t i = 0; i < MAX_APP_UPLOADS; ++i)
-        if (!g_appUploads[i].used) { slot = i; break; }
-    if (slot == MAX_APP_UPLOADS) return -1;
-
-    uint32_t ci = (uint32_t)ctxId - APP_FIRST_CTX;
-    uint32_t gres = g_appResourceIds.Allocate(ci);
-    if (!gres) return -1;
-
-    uint64_t pages = (bytes + 4095) / 4096;
-    VirtualAddress va = VmmAllocPages(pages, VMM_WRITABLE, MemTag::Device, KernelPid);
-    if (!va) return -1;
-    memcpy(reinterpret_cast<void*>(va.raw()), src, bytes);
-    bool cr = ResourceCreateBuffer(gres, VIRGL_BIND_VERTEX_BUFFER, bytes);
-    bool ab = cr && ResourceAttachBackingVirt(gres, va.raw(), bytes);
-    bool ca = ab && CtxAttachResource((uint32_t)ctxId, gres);
-    bool tr = ca && TransferToHostBuffer((uint32_t)ctxId, gres, bytes);
-    if (!tr)
-    {
-        SerialPrintf("virtio_gpu: AppBufferUpload FAILED ctx=%d gres=%u bytes=%u create=%d attach=%d ctxattach=%d xfer=%d\n",
-                     ctxId, gres, bytes, cr, ab, ca, tr);
-        VmmFreePages(va, pages); return -1;
-    }
-    g_appUploads[slot] = { true, ctxId, va.raw(), pages };
-    return static_cast<int32_t>(gres);
-}
+// SET_VERTEX_BUFFERS command) or <0. Retirement releases backing before ctx destroy.
+#include "app_buffer_upload.inc"
 
 static int32_t AppSubmit3D(int32_t ctxId, const uint32_t* dwords, uint32_t n)
 {
@@ -2832,31 +2764,7 @@ static int32_t AppPresentBarrier(int32_t ctxId)
     GpuCmdGuard guard;
     return AppCtxFind(ctxId) && AppFenceLocked(static_cast<uint32_t>(ctxId)) ? 0 : -1;
 }
-static int32_t AppRetireResource(int32_t ctxId,int32_t gres)
-{
-    GpuCmdGuard guard;
-    if (auto* blob=AppBlobFind(ctxId,static_cast<uint32_t>(gres))) return AppRetireBlobLocked(blob);
-    if (g_controlQueuePoisoned || !AppCtxFind(ctxId) || !AppResValid(ctxId,static_cast<uint32_t>(gres))) return -1;
-    auto command=[&](uint32_t type,uint32_t context) {
-        auto* req=reinterpret_cast<VirtioGpuCtxResource*>(g_cmdBuf+CMD_REQ_OFF);
-        memset(req,0,sizeof(*req));req->hdr.type=type;req->hdr.ctx_id=context;
-        req->resource_id=static_cast<uint32_t>(gres);
-        return CmdRespOk(SubmitCommand(sizeof(*req),CMD_RESP_CAP));
-    };
-    // Retiring callers exclude future users. Any failure leaves the guest
-    // allocation quarantined rather than treating ambiguous DMA as complete.
-    const bool retired=brook::GpuRetirementSequence(g_compReady,[&](brook::GpuRetirementStep step) {
-        switch (step) {
-        case brook::GpuRetirementStep::ProducerFence:return AppFenceLocked(static_cast<uint32_t>(ctxId));
-        case brook::GpuRetirementStep::CompositorFence:return AppFenceLocked(COMP_CTX_ID);
-        case brook::GpuRetirementStep::DetachContext:return command(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,static_cast<uint32_t>(ctxId));
-        case brook::GpuRetirementStep::DetachBacking:return command(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING,0);
-        case brook::GpuRetirementStep::Unref:return command(VIRTIO_GPU_CMD_RESOURCE_UNREF,0);
-        }
-        return false;
-    });
-    return retired ? 0 : -1;
-}
+#include "app_retire_resource.inc"
 
 // These operations run on the compositor thread between frames (or during
 // pre-publication boot verification). They never borrow a window's guest pages.
