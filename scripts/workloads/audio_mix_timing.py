@@ -43,10 +43,16 @@ def main():
     parser.add_argument('--channels', choices=('left', 'right', 'both'), default='both')
     parser.add_argument('--first', type=int, choices=(0, 1), default=0,
                         help='Initial descriptor refill order; alternates each loop')
+    parser.add_argument('--fragments', type=int, choices=(4, 8), default=4,
+                        help='OSS fragments of 4096 bytes; write requests stay 4096 bytes')
+    parser.add_argument('--gate-stage', choices=('generated', 'configured'), default='generated',
+                        help='Barrier after generation (legacy) or after all descriptors are configured')
     parser.add_argument('--gate-url',
-                        help='Optional finite HTTP start barrier after source generation, before device open')
+                        help='Optional finite HTTP barrier; stage chooses whether devices are already configured')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if args.gate_stage == 'configured' and not args.gate_url:
+        parser.error('--gate-stage configured requires --gate-url')
     if args.output.exists():
         parser.error('Refusing to overwrite prior evidence')
     channels = [0, 1] if args.channels == 'both' else [0 if args.channels == 'left' else 1]
@@ -60,25 +66,28 @@ def main():
     started = finished = None
     barrier = None
     failure = None
+    def start_barrier():
+        import urllib.request
+        before = time.monotonic_ns()
+        print('AUDIO_MIX_PREPARED', json.dumps(dict(channels=channels,
+              frames_each=args.seconds * 44100)), flush=True)
+        with urllib.request.urlopen(args.gate_url, timeout=45) as response:
+            receipt = json.load(response)
+        after = time.monotonic_ns()
+        if receipt.get('released') is not True or type(receipt.get('release_host_ns')) is not int or receipt['release_host_ns'] <= 0:
+            raise RuntimeError(('invalid start-barrier receipt', receipt))
+        return dict(stage=args.gate_stage, before_guest_ns=before, after_guest_ns=after, receipt=receipt)
+
     try:
-        if args.gate_url:
-            import urllib.request
-            before = time.monotonic_ns()
-            print('AUDIO_MIX_PREPARED', json.dumps(dict(channels=channels,
-                  frames_each=args.seconds * 44100)), flush=True)
-            with urllib.request.urlopen(args.gate_url, timeout=45) as response:
-                receipt = json.load(response)
-            after = time.monotonic_ns()
-            if receipt.get('released') is not True or type(receipt.get('release_host_ns')) is not int or receipt['release_host_ns'] <= 0:
-                raise RuntimeError(('invalid start-barrier receipt', receipt))
-            barrier = dict(before_guest_ns=before, after_guest_ns=after, receipt=receipt)
+        if args.gate_url and args.gate_stage == 'generated':
+            barrier = start_barrier()
         for channel in channels:
             fd = os.open('/dev/dsp', os.O_WRONLY | os.O_NONBLOCK)
             devices.append(fd)
             for request, value in ((0xC0045005, 16), (0xC0045006, 2), (0xC0045002, 44100)):
                 if integer(fd, request, value) != value:
                     raise RuntimeError(('format negotiation', request, value))
-            hint = (4 << 16) | 12
+            hint = (args.fragments << 16) | 12
             returned = integer(fd, 0xC004500A, hint)
             space = array.array('i', [0, 0, 0, 0])
             fcntl.ioctl(fd, 0x8010500C, space, True)
@@ -86,8 +95,10 @@ def main():
                        available_fragments=space[0], total_fragments=space[1],
                        fragment_bytes=space[2], available_bytes=space[3])
             geometry.append(row)
-            if space[1] != 4 or space[2] != 4096:
+            if space[1] != args.fragments or space[2] != 4096:
                 raise RuntimeError(('geometry mismatch', row))
+        if args.gate_url and args.gate_stage == 'configured':
+            barrier = start_barrier()
         started = time.monotonic_ns()
         print('AUDIO_MIX_READY', json.dumps(dict(start_ns=started, channels=channels,
               frames_each=args.seconds * 44100, geometry=geometry)), flush=True)
@@ -154,7 +165,7 @@ def main():
             os.close(fd)
     report = dict(schema=1, channels=channels, requested_seconds=args.seconds,
                   frames_each=args.seconds * 44100, rate=44100, stereo=True,
-                  geometry=geometry, first=args.first, start_barrier=barrier, start_ns=started, end_ns=finished,
+                  geometry=geometry, fragments=args.fragments, first=args.first, start_barrier=barrier, start_ns=started, end_ns=finished,
                   duration_guest_seconds=(finished-started)/1e9 if started is not None else None,
                   submitted_bytes=submitted, completed_bytes=played, eagain=eagain,
                   partial_writes=partial, writes=writes, observations=observations,

@@ -120,3 +120,9 @@ forced-resume limits. It needs actual mixer-body tests before native trials.
 It must not wait indefinitely for every stream or alter driver publication
 safety. The writer-immediate-flush hypothesis is ruled out by the current
 source: writes enqueue; the mixer performs periodic submission.
+
+The later [capacity control](audio-capacity-control.md) adds explicit four/eight
+fragment selection and an optional barrier after device configuration. Its
+four/eight/four sequence retains first-write phase variance, so larger buffers
+are not accepted as a fix. It motivates accepted-prefix contribution accounting
+rather than more empty-queue waiting.

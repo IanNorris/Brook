@@ -5,6 +5,14 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Current mixed MLFQ/EEVDF pair](mixed-policy-comparison.md) reproduces nearly
+  identical concurrent audio slowdown on both policies, with close/reopen
+  recovery and clean current runtime/lifecycle gates. Neither fixes the issue
+  and prior failures remain open. Independent producer capacity/refill phase
+  is tested in a [configured-barrier capacity control](audio-capacity-control.md);
+  phase variance remains and larger buffers are not a fix. Accepted-contribution
+  categories are the next discriminator; no default or waiting-policy change.
+
 - [Runtime correction debt visibility](runtime-debt-observation.md) now separates
   known outstanding debt, valid CPU baselines, catchup, discarded epochs and
   ownership crossings without changing charges or acceptance. All 73 hosted
