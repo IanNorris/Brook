@@ -766,6 +766,14 @@ static void horizonControlContracts() {
     VERIFY(after.writableFrames==1 && after.fragmentFrames==1024); // LOW_WATER cannot fake qualification.
     VERIFY(AudioMixerHorizonRead().unqualifiedStreams>0);
     VERIFY(!AudioMixerSetCapacity(id,8192,2048)); // Paused is not empty.
+    for(auto tuple:{std::array<uint32_t,2>{6016,128},{5120,128},{16384,8192},{6144,1024}}) {
+        const auto previous=AudioMixerHorizonRead();const auto probe=AudioMixerOpen();VERIFY(probe);
+        VERIFY(AudioMixerSetCapacity(probe,tuple[0],tuple[1]));const auto next=AudioMixerHorizonRead();
+        const bool qualified=AudioRefillQualified(tuple[0],tuple[1]);
+        VERIFY(next.qualifiedStreams==previous.qualifiedStreams+unsigned(qualified));
+        VERIFY(next.unqualifiedStreams==previous.unqualifiedStreams+unsigned(!qualified));
+        VERIFY(AudioMixerClose(probe));
+    }
     AudioMixerSharedPrefixEnable(true);AudioMixerCoalesceEnable(true);
     VERIFY(!AudioMixerSharedPrefixRead().enabled && !AudioMixerCoalesceRead().enabled);
     AudioMixerHorizonEnable(false);AudioMixerSharedPrefixEnable(true);
@@ -776,14 +784,14 @@ static void horizonControlContracts() {
 static void steadyCommitExperiment() {
     using namespace brook;
     constexpr uint32_t total=44100*8;
-    for(unsigned shape:{0u,1u,2u,3u,4u,5u,6u,7u})
+    for(unsigned shape:{0u,1u,2u,3u,4u,5u,6u,7u,8u,9u})
     for(unsigned producerPeriod:{0u,1u,5u,9u,10u,19u,20u,21u,39u,40u,41u,50u,75u})
     for(uint32_t capacity:{4096u,5120u,6144u,8192u})
     for(unsigned mode=0;mode<4;++mode)for(uint32_t fragment:{1024u,2048u})for(bool wholeFragment:{false,true})
     for(bool refreshProducer:{false,true})for(unsigned offset:{0u,1u,4u})for(bool reverse:{false,true})
     for(unsigned scenario=0;scenario<4;++scenario) {
         const bool delayed=shape>=3;
-        const unsigned budgetMs=(shape==5 || shape==7)?40:20;
+        const unsigned budgetMs=(shape==5 || shape>=7)?40:20;
         // Preserve the original symmetric matrix. Additional controls model
         // observed Firefox 4416/64 versus Quake 8192/2048 endpoints; shape 2
         // changes only Firefox capacity. No scheduler or browser is simulated.
@@ -815,11 +823,18 @@ static void steadyCommitExperiment() {
             fragments[0]=shape==3?64:(shape>=6?2048:128);
             capacities[1]=shape>=6?chosen:8192;
             fragments[1]=shape>=6?128:2048;
+            if(shape==8){capacities[0]=16384;fragments[0]=8192;}
+            if(shape==9){capacities[0]=6016;fragments[0]=128;capacities[1]=16384;fragments[1]=8192;}
             const uint32_t travel=(44100*budgetMs+999)/1000;
             VERIFY(chosen%128==0 && chosen/128<=69 && chosen>=4096+128+travel);
             VERIFY(69*64<4096+64+travel && chosen-128<4096+128+travel);
         }
         const uint32_t maximumCapacity=std::max(capacities[0],capacities[1]);
+        // Prime a supported driver amount, not the full software capacity:
+        // a16384-frame source FIFO exceeds the HDA ring's writable lead.
+        const uint32_t primeFrames=std::min(maximumCapacity,8192u);
+        const uint32_t primeCalls=(primeFrames+1763)/1764;
+        const uint32_t primedFrames=std::min(maximumCapacity,primeCalls*1764);
         const uint32_t targets[2]={total,scenario==1?capacities[1]:total};
         std::vector<int16_t> pcm[2];uint32_t written[2]{},played[2]{};
         for(unsigned s=0;s<2;++s) {
@@ -845,8 +860,8 @@ static void steadyCommitExperiment() {
             }
         };
         refill(0);refill(1);
-        for(unsigned i=0;i<(maximumCapacity+1763)/1764;++i)AudioMixerFlush();
-        VERIFY(g_nativeClock.submitted==maximumCapacity*4);prime();AudioMixerRefresh();
+        for(unsigned i=0;i<primeCalls;++i)AudioMixerFlush();
+        VERIFY(g_nativeClock.submitted==primedFrames*4);prime();AudioMixerRefresh();
         if(scenario==3)VERIFY(AudioMixerSetEnabled(ids[1],false));
         AudioMixerSharedPrefixEnable(mode==1);AudioMixerTestCommitQuantum(mode==2?441:0);
         if(mode==3)AudioMixerTestCommitHorizon(4096);
@@ -861,6 +876,7 @@ static void steadyCommitExperiment() {
         unsigned recoveryServiceResumeMs=~0u;
         unsigned elapsed=0;bool finished=false;
         uint32_t eligibleAt[2]{},opportunities[2]{},maxRefillDelay[2]{};
+        unsigned firstDataMs[2]{};
         for(unsigned ms=1;ms<=25000;++ms) {
             // Exact 44.1-kHz physical advancement, independent of driver reads.
             const uint32_t frames=(ms*441u/10)-((ms-1)*441u/10);
@@ -869,6 +885,7 @@ static void steadyCommitExperiment() {
                 for(uint32_t f=0;f<frames;++f) {
                     int16_t pair[2]{};memcpy(pair,dma.data()+(pos+f*4)%AUDIO_BUF_SIZE,4);
                     for(unsigned s=0;s<2;++s)if(pair[s]) {
+                        if(!firstDataMs[s])firstDataMs[s]=ms;
                         VERIFY(played[s]<targets[s]);
                         if(played[s]<targets[s])VERIFY(pair[s]==pcm[s][played[s]*2+s]);
                         ++played[s];
@@ -955,9 +972,9 @@ static void steadyCommitExperiment() {
         }
         // Extrema are sampled after the producer/service actions each ms, not
         // a continuous minimum immediately before every replenishment.
-        if(delayed)std::printf("MIXER_REFILL_BUDGET shape=%u budget_ms=%u delay_ms=%u capacities=%u,%u fragments=%u,%u opportunities=%u,%u max_refill_delay_ms=%u,%u recovery_service_resume_ms=%u ",
+        if(delayed)std::printf("MIXER_REFILL_BUDGET shape=%u budget_ms=%u delay_ms=%u capacities=%u,%u fragments=%u,%u opportunities=%u,%u max_refill_delay_ms=%u,%u recovery_service_resume_ms=%u first_data_ms=%u,%u ",
                             shape,budgetMs,producerPeriod,capacities[0],capacities[1],fragments[0],fragments[1],
-                            opportunities[0],opportunities[1],maxRefillDelay[0],maxRefillDelay[1],recoveryServiceResumeMs);
+                            opportunities[0],opportunities[1],maxRefillDelay[0],maxRefillDelay[1],recoveryServiceResumeMs,firstDataMs[0],firstDataMs[1]);
         else if(shape)std::printf("MIXER_ASYMMETRIC shape=%u producer_period_ms=%u capacities=%u,%u fragments=%u,%u ",
                             shape,producerPeriod,capacities[0],capacities[1],fragments[0],fragments[1]);
         std::printf(shape?

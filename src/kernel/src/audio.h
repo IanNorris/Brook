@@ -10,6 +10,7 @@
 // AudioMixerFlush() mixes streams when delivering a batch to the driver.
 
 #include <stdint.h>
+#include "audio_refill_budget.h"
 #include "audio_service_timing.h"
 #include "audio_delivery_timing.h"
 #include "audio_mix_contributions.h"
@@ -93,6 +94,7 @@ bool     AudioAvailable();
 // Queues retain unaccepted samples; mixing/clamping happens at delivery.
 
 static constexpr uint32_t MIXER_HW_RATE     = 44100;
+static_assert(MIXER_HW_RATE==AudioRefillRate);
 static constexpr uint8_t  MIXER_HW_CHANNELS = 2;
 static constexpr uint8_t  MIXER_HW_BITS     = 16;
 static constexpr uint32_t MIXER_FRAME_BYTES  = MIXER_HW_CHANNELS * (MIXER_HW_BITS / 8); // 4
@@ -153,7 +155,7 @@ AudioMixContributionSnapshot AudioMixerContributionsRead();
 struct AudioMixerHorizonSnapshot {
     uint64_t epoch=0,decisions=0,deferrals=0,shortenedAttempts=0,shortenedReceipts=0,acceptedFrames=0;
     uint64_t headroomBypasses=0,invalidClock=0,unsupportedDriver=0;
-    uint32_t targetFrames=4096,qualifiedStreams=0,unqualifiedStreams=0;
+    uint32_t targetFrames=AudioCommitHorizonFrames,qualifiedStreams=0,unqualifiedStreams=0;
     bool enabled=false,saturated=false,exhausted=false;
 };
 bool AudioMixerHorizonEnable(bool enabled);

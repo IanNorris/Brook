@@ -550,3 +550,89 @@ supports a prospective time-based reserve rather than fragment size alone.
 No production negotiation, existing queue, HDA lead, horizon target or default
 has yet changed. A production planner change still requires its own geometry,
 source-integrity and real mixed-workload validation.
+
+### Default-off prospective 40-ms planner
+
+`audio_refill_budget.h` now defines the shared fixed-rate qualification:
+`capacity >= 4096 + actual_fragment + 1764` frames. The 1,764 frames represent
+a declared forty-ms refill allowance at 44.1 kHz, not a scheduler guarantee.
+Planning and diagnostic qualification use the same helper; low-water readiness
+remains independent. The hardware target and HDA publication lead are unchanged.
+
+With horizon off, valid requests keep their original geometry. With it on,
+already-qualified requests also remain unchanged. Otherwise the planner tries
+supported power-of-two fragment sizes and selects the minimum qualifying count
+at the first viable size, bounded by the requested nonzero maximum and physical
+endpoint capacity. Required frames, bytes and ceiling counts use checked
+64-bit arithmetic before multiplication/commit. A valid request that cannot
+qualify keeps its honestly reported original tuple. No queued stream is resized
+and mode changes retain their existing snapshot semantics.
+
+Stereo16 examples (count × bytes):
+
+| Request | Negotiated with horizon on |
+| --- | --- |
+| 69 × 256 | 47 × 512: 6,016/128 frames |
+| 6 × 4,096 | 4 × 8,192 |
+| 4 × 4,096 | 4 × 8,192 |
+| 2 × 4,096 | 2 × 32,768: 16,384/8,192 frames |
+| 1 × 4,096 | Original, unqualified |
+
+Count reduction is valid negotiation under a maximum-count request. The
+two-fragment tuple is a materially larger operating point: up to about
+372 ms of source backlog, which is not bounded by the hardware horizon.
+Tests cover that range explicitly rather than declaring it unsupported merely
+because the previous formula did not qualify it.
+
+The actual-body matrix now has 1,158 cases: the original 468, asymmetric 144
+and expanded budget 546. Large-fragment cases include whole 8,192-frame
+writers, exact PCM/drains, readiness-delay boundaries, dormant/disabled peers
+and interrupted service. Software capacity can exceed immediately writable HDA
+space; priming is bounded to the accepted driver amount (up to 8,820 frames),
+then physical DMA advances normally. First-data/drain fixture timestamps are
+relative to that prime, not VM startup. All 288 within-budget regular and 24
+inactive-peer cases pass their exact-progress checks.
+
+The actual write-plan test additionally converts a 204,800-byte request in
+four bounded transactions with partial FIFO admissions and verifies exact source
+ordering across the 64-KiB staging limit. This is not a substitute for native
+user-copy/syscall-return validation. All 75 hosted suites and direct bounded
+ASan/UBSan audio/geometry runs pass, with the previously stated exclusions.
+
+Native kernel `bf37b8497ca3657e5d9651345b42491a99d3090475106a3cf84b33ea0b39266b`
+passes two-pass symbol generation and all thirteen frozen ABI-34 module imports.
+A fresh private VM passes four original jobs: seven geometry requests off/on/off
+and the endpoint regression. Checks include two large fragments, `POLLOUT`
+below the actual fragment threshold, prefix admission despite that threshold,
+full-buffer `EAGAIN`, queued-paused `EBUSY` and reset preservation. Diagnostic
+output reports the forty-ms assumption explicitly.
+
+The same VM then completes twelve original finite-source/export jobs in three
+arms: whole 32-KiB fragment writes, 128-KiB requests with whole-fragment space
+admission, and the 6,016/128 versus 8,192/2,048 control. Both large-source arms
+use the 16,384/8,192 tuple against a 6,016/128 peer. The oversized arm makes
+63 partial returns, accepting at most 65,536 bytes per syscall; all source totals
+drain exactly. Decoded source rates are approximately 0.9990/0.9980,
+1.0001/1.0001 and 0.9994/0.9979. Current runtime, HDA safety, heap/policy,
+original controller/VM exits and all four filesystem checks pass. These twelve
+jobs are separate from the four ABI jobs.
+
+**Uninterrupted playback acceptance fails:** delivery counters record 1,280,
+1,280 and 1,024 reserved bytes across those three windows, with a few quiet bins
+in the large-write captures. Safe reservation is still an inserted gap. Near
+nominal source progress and clean driver fault guards do not waive it. The
+separate `large-control/performance-gate.json` retains this failed gate while
+`summary.json` records successful lifecycle and data checks.
+
+Source-credit observations every 100 ms bound first observed completion at
+about 0–102 ms after the first write. Tail completion after the last accepted
+large-source write is bounded at 302–403 ms for whole fragments and 336–437 ms
+for oversized requests. These are guest source-credit bounds, not physical
+speaker onset or cold-boot latency; the polling uncertainty is included. They
+make the larger software backlog visible rather than inferring latency from
+the hardware target. Query duration/gap aggregates and admission details are
+retained in `large-control/latency-and-admission.json` under review
+`unattended-refill-production-fixed-mlfq-a-20261021`.
+
+A fresh real Firefox/Quake/load cohort remains required. No default is
+promoted, and the earlier real-cohort accounting clamps remain failed evidence.

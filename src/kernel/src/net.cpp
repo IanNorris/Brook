@@ -4245,13 +4245,15 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         const auto s=AudioMixerHorizonRead();BridgeReply r;r.text("{\"enabled\":");r.text(s.enabled?"true":"false");
         r.text(",\"accepted\":");r.text(accepted?"true":"false");r.text(",");r.field("epoch",s.epoch);
         r.text(",");r.field("target_frames",s.targetFrames);r.text(",");r.field("decisions",s.decisions);
+        r.text(",");r.field("refill_allowance_ms",AudioRefillAllowanceMs);
+        r.text(",");r.field("refill_allowance_frames",AudioRefillAllowanceFrames);
         r.text(",");r.field("deferrals",s.deferrals);r.text(",");r.field("shortened_attempts",s.shortenedAttempts);
         r.text(",");r.field("shortened_receipts",s.shortenedReceipts);r.text(",");r.field("accepted_prefix_frames",s.acceptedFrames);
         r.text(",");r.field("headroom_bypasses",s.headroomBypasses);r.text(",");r.field("invalid_clock",s.invalidClock);
         r.text(",");r.field("unsupported_driver",s.unsupportedDriver);r.text(",");r.field("qualified_streams",s.qualifiedStreams);
         r.text(",");r.field("unqualified_streams",s.unqualifiedStreams);r.text(",\"saturated\":");r.text(s.saturated?"true":"false");
         r.text(",\"exhausted\":");r.text(s.exhausted?"true":"false");
-        r.text(",\"scope\":\"default off; fixed intel_hda 12KiB lead; guarded4096-frame target, startup/recovery may exceed it; no receipt on deferral; no source credit for silence; prospective SETFRAGMENT may enlarge size while respecting maximum count; existing queues unchanged; qualification is tested refill reserve, not scheduling guarantee; exclusive with coalesce/shared-prefix\"}\n");r.send();
+        r.text(",\"scope\":\"default off; fixed intel_hda 12KiB lead; guarded4096-frame target, startup/recovery may exceed it; no receipt on deferral; no source credit for silence; prospective SETFRAGMENT may enlarge size/reduce count within requested maximum; existing queues unchanged; qualification requires target+actual fragment+40ms refill allowance, not scheduling guarantee; hardware target does not bound software backlog; exclusive with coalesce/shared-prefix\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"audio shared-prefix on") || NetStrEq(cmd,"audio shared-prefix off") ||
             NetStrEq(cmd,"audio shared-prefix reset") || NetStrEq(cmd,"audio shared-prefix status")) {

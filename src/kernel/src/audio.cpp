@@ -350,7 +350,7 @@ bool AudioMixerHorizonEnabled() { return __atomic_load_n(&g_horizonActive,__ATOM
 AudioMixerHorizonSnapshot AudioMixerHorizonRead() {
     SpinLockAcquire(&g_mixerLock);auto out=g_horizon;
     for(const auto& stream:g_streams)if(stream.identity) {
-        if(stream.capacity>=out.targetFrames+2*stream.fragmentFrames)++out.qualifiedStreams;
+        if(AudioRefillQualified(stream.capacity,stream.fragmentFrames))++out.qualifiedStreams;
         else ++out.unqualifiedStreams;
     }
     SpinLockRelease(&g_mixerLock);return out;

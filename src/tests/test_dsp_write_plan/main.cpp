@@ -87,26 +87,66 @@ static void geometryNegotiation() {
     CHECK(DspPlanGeometry((4u<<16)|12,4,16384,true,&g));
     CHECK(g.fragments==4 && g.fragmentBytes==8192 && g.capacityFrames==8192 && g.writableFrames==2048 && g.changed && g.horizonQualified);
     CHECK(DspPlanGeometry((6u<<16)|12,4,16384,true,&g));
-    CHECK(g.fragments==6 && g.fragmentBytes==4096 && !g.changed && g.horizonQualified);
+    CHECK(g.fragments==4 && g.fragmentBytes==8192 && g.changed && g.horizonQualified);
     CHECK(DspPlanGeometry((2u<<16)|12,4,16384,true,&g));
-    CHECK(g.fragments==2 && g.fragmentBytes==4096 && !g.changed && !g.horizonQualified);
+    CHECK(g.fragments==2 && g.fragmentBytes==32768 && g.capacityFrames==16384 && g.changed && g.horizonQualified);
+    CHECK(DspPlanGeometry((69u<<16)|8,4,16384,true,&g));
+    CHECK(g.fragments==47 && g.fragmentBytes==512 && g.capacityFrames==6016 && g.writableFrames==128 && g.changed);
+    CHECK(DspPlanGeometry((47u<<16)|9,4,16384,true,&g));
+    CHECK(g.fragments==47 && g.fragmentBytes==512 && !g.changed && g.horizonQualified);
+    CHECK(DspPlanGeometry((1u<<16)|12,4,16384,true,&g));
+    CHECK(g.fragments==1 && g.fragmentBytes==4096 && !g.changed && !g.horizonQualified);
+    CHECK(!AudioRefillQualified(5987,128) && AudioRefillQualified(5988,128));
+    CHECK(!AudioRefillQualified(5120,128) && !AudioRefillQualified(4416,64));
+    CHECK(AudioRefillQualified(8192,2048) && !AudioRefillQualified(6144,1024));
+    CHECK(!AudioRefillQualified(16384,0) && !AudioRefillQualified(1,2));
+    CHECK(AudioRefillRequiredFrames(~uint32_t(0))>~uint32_t(0));
     CHECK(DspPlanGeometry(12,4,16384,true,&g));
     CHECK(g.fragments==16 && g.fragmentBytes==4096 && g.totalBytes==65536);
-    for(uint32_t frame:{1u,2u,4u})for(uint32_t count:{1u,2u,3u,4u,6u,16u,65u,65535u})
+    for(uint32_t frame:{1u,2u,4u})for(uint32_t count:{0u,1u,2u,3u,4u,6u,16u,47u,65u,69u,65535u})
     for(uint32_t exp:{7u,8u,10u,12u,14u,16u,17u})for(bool enabled:{false,true}) {
         const uint32_t request=(count<<16)|exp;
-        const bool valid=exp>=8 && exp<=16 && uint64_t(count)*(1u<<exp)<=16384*frame;
+        const uint32_t originalCount=count?count:16384*frame/(1u<<exp);
+        const bool valid=exp>=8 && exp<=16 && originalCount && uint64_t(originalCount)*(1u<<exp)<=16384*frame;
         const DspGeometry previous=g;
         CHECK(DspPlanGeometry(request,frame,16384,enabled,&g)==valid);
         if(!valid){CHECK(g.fragmentBytes==previous.fragmentBytes && g.totalBytes==previous.totalBytes);continue;}
-        CHECK(g.fragments<=count && g.fragments && g.fragmentBytes>=(1u<<exp));
+        CHECK((!count || g.fragments<=count) && g.fragments && g.fragmentBytes>=(1u<<exp));
         CHECK((g.fragmentBytes&(g.fragmentBytes-1))==0);
         CHECK(g.totalBytes==g.fragments*g.fragmentBytes && g.totalBytes<=16384*frame);
         CHECK(g.capacityFrames*frame==g.totalBytes && g.writableFrames*frame==g.fragmentBytes);
-        if(!enabled)CHECK(!g.changed && g.fragments==count && g.fragmentBytes==(1u<<exp));
-        if(g.horizonQualified)CHECK(g.capacityFrames>=4096+2*g.writableFrames);
+        if(!enabled)CHECK(!g.changed && g.fragments==originalCount && g.fragmentBytes==(1u<<exp));
+        CHECK(g.horizonQualified==AudioRefillQualified(g.capacityFrames,g.writableFrames));
+        if(g.changed) {
+            CHECK(g.horizonQualified);
+            CHECK(g.capacityFrames-g.writableFrames<AudioRefillRequiredFrames(g.writableFrames));
+            for(uint32_t smaller=1u<<exp;smaller<g.fragmentBytes;smaller*=2) {
+                uint32_t available=16384*frame/smaller;
+                if(count && available>count)available=count;
+                CHECK(!AudioRefillQualified(available*smaller/frame,smaller/frame));
+            }
+        }
     }
     CHECK(!DspPlanGeometry(12,3,16384,true,&g));CHECK(!DspPlanGeometry(12,4,0,true,&g));
     CHECK(!DspPlanGeometry(12,4,16385,true,&g));CHECK(!DspPlanGeometry(12,4,16384,true,nullptr));
 }
-int main(){prefixesMatchWholeConversion();refillBeforeEmpty();epochsAndBounds();writersRestageSharedBuffer();geometryNegotiation();std::puts("DSP write plan checks passed");}
+static void largeNegotiatedWrites() {
+    // A32KiB fragment and a request exceeding the64KiB copy staging limit.
+    // Preserve source order across partial FIFO admission and bounded syscalls.
+    std::vector<int16_t> source(102400),result;
+    for(size_t i=0;i<source.size();++i)source[i]=int16_t((i*48271) ^ (i>>3));
+    uint64_t offset=0;unsigned transactions=0;
+    while(offset<source.size()*2) {
+        DspWritePlan plan;CHECK(plan.Begin(source.size()*2-offset,44100,2,16,16384,1,1));
+        CHECK(plan.InputBytes()<=65536 && plan.Remaining()<=16384);++transactions;
+        while(plan.Remaining()) {
+            const uint32_t offered=plan.Offer(137+(plan.Accepted()*17)%8192);
+            std::vector<int16_t> output(offered*2);CHECK(plan.Convert(reinterpret_cast<const uint8_t*>(source.data())+offset,output.data(),offered));
+            const uint32_t accepted=std::max(1u,offered/2);
+            result.insert(result.end(),output.begin(),output.begin()+accepted*2);CHECK(plan.Accept(accepted));
+        }
+        CHECK(plan.ConsumedBytes()==plan.InputBytes());offset+=plan.ConsumedBytes();
+    }
+    CHECK(transactions==4 && result==source);
+}
+int main(){prefixesMatchWholeConversion();refillBeforeEmpty();epochsAndBounds();writersRestageSharedBuffer();geometryNegotiation();largeNegotiatedWrites();std::puts("DSP write plan checks passed");}

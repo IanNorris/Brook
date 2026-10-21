@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "audio_refill_budget.h"
 
 namespace brook {
 struct DspGeometry {
@@ -20,17 +21,19 @@ inline bool DspPlanGeometry(uint32_t request,uint32_t frameBytes,uint32_t maxFra
     if(!originalCount || uint64_t(originalCount)*originalSize>maximum)return false;
     auto geometry=[&](uint32_t size,uint32_t count){
         DspGeometry g{size,count,size*count,size*count/frameBytes,size/frameBytes};
-        g.horizonQualified=g.capacityFrames>=4096+2*g.writableFrames;
+        g.horizonQualified=AudioRefillQualified(g.capacityFrames,g.writableFrames);
         g.changed=size!=originalSize || count!=originalCount;
         return g;
     };
     const auto original=geometry(originalSize,originalCount);
     if(!horizon || original.horizonQualified){*result=original;return true;}
     for(uint32_t size=originalSize;size<=maximum;) {
-        uint32_t count=maximum/size;
-        if(limit && count>limit)count=limit;
-        const auto candidate=geometry(size,count);
-        if(count && candidate.horizonQualified){*result=candidate;return true;}
+        const uint64_t required=AudioRefillRequiredFrames(size/frameBytes)*frameBytes;
+        const uint64_t count=(required+size-1)/size;
+        if(count && count<=maximum/size && (!limit || count<=limit)) {
+            const auto candidate=geometry(size,uint32_t(count));
+            if(candidate.horizonQualified){*result=candidate;return true;}
+        }
         if(size>maximum/2)break;
         size*=2;
     }
