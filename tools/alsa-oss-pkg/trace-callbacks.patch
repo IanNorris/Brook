@@ -1,0 +1,25 @@
+--- a/oss/pcm_oss.c
++++ b/oss/pcm_oss.c
+@@ -390,7 +390,8 @@
++#include "trace_callbacks.h"
+ static const snd_pcm_ioplug_callback_t oss_playback_callback = {
+-	.start = oss_start,
+-	.stop = oss_stop,
+-	.transfer = oss_write,
+-	.pointer = oss_pointer,
+-	.delay = oss_delay,
+-	.close = oss_close,
++	.start = trace_start,
++	.stop = trace_stop,
++	.transfer = trace_write,
++	.pointer = trace_pointer,
++	.delay = trace_delay,
++	.close = trace_close,
+@@ -398,5 +399,5 @@
+-	.prepare = oss_prepare,
+-	.drain = oss_drain,
++	.prepare = trace_prepare,
++	.drain = trace_drain,
+ };
+ 
+ static const snd_pcm_ioplug_callback_t oss_capture_callback = {

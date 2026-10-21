@@ -1,10 +1,15 @@
 # Clocked native playback slave for Brook. Select through an outer ALSA plug;
 # keep the existing default until guest pointer/delay/drain acceptance passes.
-{ pkgs ? import ../../nix/nixpkgs.nix {}, lowWaterReadiness ? false }:
+{ pkgs ? import ../../nix/nixpkgs.nix {}, lowWaterReadiness ? false, callbackTrace ? false }:
 pkgs.alsa-plugins.overrideAttrs (old: {
   pname = "alsa-plugins-oss-brook";
   buildInputs = [ pkgs.alsa-lib ];
-  patches = (old.patches or []) ++ [ ./clocked-oss.patch ] ++ pkgs.lib.optional lowWaterReadiness ./low-water.patch;
+  patches = (old.patches or []) ++ [ ./clocked-oss.patch ]
+    ++ pkgs.lib.optional lowWaterReadiness ./low-water.patch
+    ++ pkgs.lib.optional callbackTrace ./trace-callbacks.patch;
+  postPatch = (old.postPatch or "") + pkgs.lib.optionalString callbackTrace ''
+    cp ${./trace_callbacks.h} oss/trace_callbacks.h
+  '';
   configureFlags = (old.configureFlags or []) ++ [
     "--enable-oss" "--disable-mix" "--disable-usbstream" "--disable-arcamav"
     "--disable-jack" "--disable-pulseaudio" "--disable-samplerate"

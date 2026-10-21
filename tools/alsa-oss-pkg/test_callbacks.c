@@ -62,8 +62,10 @@ int main(void) {
     transfer_error = 0;
     ioctl_error = EPIPE;
     assert(oss_pointer(&oss.io) == -EPIPE);
+    assert(oss_playback_callback.pointer(&oss.io) == -EPIPE);
     snd_pcm_sframes_t delay = 123;
     assert(oss_delay(&oss.io, &delay) == -EPIPE && delay == 123);
+    assert(oss_playback_callback.delay(&oss.io, &delay) == -EPIPE && delay == 123);
     assert(oss_drain(&oss.io) == -EPIPE);
     ioctl_error = ENODEV;
     assert(oss_start(&oss.io) == -ENODEV);

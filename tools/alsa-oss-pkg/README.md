@@ -88,6 +88,31 @@ decoded reference. This is not acceptance of playback pace or smoothness.
 The first pair failed at a guest-script substitution before playback; its clean
 shutdown and failure evidence are retained separately.
 
+An optional callback recorder can be built separately:
+
+```sh
+nix-build --expr 'import ./tools/alsa-oss-pkg { callbackTrace = true; }' --no-out-link
+```
+
+It wraps the production playback callbacks and preserves their results and
+origin/pointer guards. It adds no ALSA or device queries. Callback timings,
+thread/PCM identity, requested/returned frames and logical pointer state go to
+a bounded ring, with a separate recent-write history. A positive `first_write`
+snapshot establishes playback binding; a device-probe close with zero buffer
+size does not. Up to 32 periodic snapshots, eight non-`EAGAIN` error dumps and eight
+stop/close/drain dumps are appended to `/tmp/brook-alsa-trace-PID.log`.
+This preserves evidence when a browser child exits without closing its plugin.
+Snapshots retain a tail rather than every call. Limits are per process, and
+periodic snapshots require another callback; missing records cannot prove a
+backend exited or remained blocked.
+
+The ring uses fixed storage, but timestamps, a private mutex and file dumps
+perturb execution. Dumps can run while ALSA holds its PCM lock.
+It is a diagnostic build, with separate native acceptance, and remains disabled
+in the normal package. Collect all process files from the private VM with byte
+counts/hashes and verify actual playback activation before interpreting an
+absence of errors. An entry into `close` is not proof that close returned.
+
 Export for an isolated guest installation:
 
 ```sh
