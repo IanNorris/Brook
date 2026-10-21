@@ -14,6 +14,7 @@
 #include "memory/virtual_memory.h"
 #include "smp.h"
 #include "pvclock_page.h"
+#include "apic.h"
 
 namespace brook {
 
@@ -232,6 +233,45 @@ static volatile KvmStealRecord* g_stealRecords = nullptr;
 static PhysicalAddress g_stealPage;
 static bool g_stealEnabled[KvmStealCpus]{};
 
+// Immutable after each CPU's registration publication. No CPUID or LAPIC
+// access occurs in the wait-path hypercall wrapper.
+static uint8_t g_yieldInstruction[KvmStealCpus]{}; // 0 unsupported, 1 VMX, 2 SVM
+static uint32_t g_yieldApicId[KvmStealCpus]{};
+static bool g_yieldTargetReady[KvmStealCpus]{};
+static void ConfigureSchedYield(uint32_t cpu,uint32_t features,uint32_t apicId)
+{
+    if(cpu>=KvmStealCpus)return;
+    uint8_t instruction=0;
+    if(features&(1u<<13)){
+        uint32_t a,b,c,d;Cpuid(0,0,a,b,c,d);
+        if(b==0x756e6547 && d==0x49656e69 && c==0x6c65746e)instruction=1;
+        else if(b==0x68747541 && d==0x69746e65 && c==0x444d4163)instruction=2;
+    }
+    g_yieldInstruction[cpu]=instruction;g_yieldApicId[cpu]=apicId;g_yieldTargetReady[cpu]=true;
+}
+uint64_t KvmSchedYieldIssuerMask()
+{
+    uint64_t mask=0;
+    for(unsigned cpu=0;cpu<KvmStealCpus;++cpu)
+        if(KvmStealAvailable(cpu) && g_yieldInstruction[cpu])mask|=uint64_t(1)<<cpu;
+    return mask;
+}
+bool KvmSchedYield(uint32_t targetCpu,int64_t* result)
+{
+    const auto cpu=ClockCpuIndex();
+    if(!result || cpu>=KvmStealCpus || targetCpu==cpu || !KvmStealAvailable(cpu) ||
+       !KvmStealAvailable(targetCpu) || !g_yieldTargetReady[targetCpu] || !g_yieldInstruction[cpu])return false;
+    int64_t value=11;const uint64_t destination=g_yieldApicId[targetCpu];
+#ifdef BROOK_HOST_TEST
+    extern int64_t KvmClockTestHypercall(uint8_t,uint64_t,uint64_t);
+    value=KvmClockTestHypercall(g_yieldInstruction[cpu],11,destination);
+#else
+    if(g_yieldInstruction[cpu]==1)__asm__ volatile("vmcall" : "+a"(value) : "b"(destination) : "memory","cc");
+    else __asm__ volatile("vmmcall" : "+a"(value) : "b"(destination) : "memory","cc");
+#endif
+    *result=value;return true;
+}
+
 bool KvmStealInit(uint32_t cpu)
 {
     if (cpu >= KvmStealCpus) return false;
@@ -249,6 +289,7 @@ bool KvmStealInit(uint32_t cpu)
     if (!g_stealRecords) return false;
     // Called on the vCPU owning this MSR, after BSP publication/activation.
     WriteMsr(0x4b564d03, (g_stealPage.raw() + cpu * sizeof(KvmStealRecord)) | 1ULL);
+    ConfigureSchedYield(cpu,features,ApicGetId());
     __atomic_store_n(&g_stealEnabled[cpu], true, __ATOMIC_RELEASE);
     SerialPrintf("KvmSteal: CPU%u registered\n", cpu);
     return true;

@@ -16,6 +16,7 @@ uint32_t currentCpu=0,registeredCpu=0;
 uint64_t registeredAddress=0;
 bool rdtscpSupported=true,registeredAux=false;
 unsigned registrations=0;
+unsigned testVendor=1,hypercallCalls=0;uint8_t hypercallInstruction=0;uint64_t hypercallNumber=0,hypercallTarget=0;int64_t hypercallReturn=0;
 bool testKvmPresent=true;
 uint32_t testKvmFeatures=0, testKvmHints=0, testCpuidCalls=0;
 uint64_t sampledTsc=1600;
@@ -41,9 +42,15 @@ namespace brook {
 void KvmClockTestCpuid(uint32_t leaf,uint32_t sub,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d) {
     ++testCpuidCalls;a=b=c=d=0;
     CHECK(sub==0);
-    if (leaf==0x40000000 && testKvmPresent) {
+    if(leaf==0){
+        if(testVendor==1){b=0x756e6547;d=0x49656e69;c=0x6c65746e;}
+        else if(testVendor==2){b=0x68747541;d=0x69746e65;c=0x444d4163;}
+    } else if (leaf==0x40000000 && testKvmPresent) {
         a=0x40000001;b=0x4b4d564b;c=0x564b4d56;d=0x4d;
     } else if (leaf==0x40000001) {a=testKvmFeatures;d=testKvmHints;}
+}
+int64_t KvmClockTestHypercall(uint8_t instruction,uint64_t number,uint64_t target){
+    ++hypercallCalls;hypercallInstruction=instruction;hypercallNumber=number;hypercallTarget=target;return hypercallReturn;
 }
 uint32_t KvmClockTestCpu() {return currentCpu;}
 bool KvmClockTestRdtscpSupported() {return rdtscpSupported;}
@@ -76,6 +83,23 @@ int main() {
     // reserved flags must not publish a partial/invalid value.
     KvmStealRecord stealPages[64]{};
     g_stealRecords=stealPages;g_stealEnabled[0]=true;g_stealEnabled[1]=true;
+    // Actual cached wrapper: real APIC IDs differ deliberately from CPU indices.
+    ConfigureSchedYield(0,1u<<13,51);ConfigureSchedYield(1,1u<<13,99);
+    int64_t hypercallResult=777;const auto cachedCalls=testCpuidCalls;
+    CHECK(KvmSchedYieldIssuerMask()==3);
+    CHECK(KvmSchedYield(1,&hypercallResult) && hypercallResult==0 && hypercallCalls==1);
+    CHECK(hypercallInstruction==1 && hypercallNumber==11 && hypercallTarget==99 && testCpuidCalls==cachedCalls);
+    CHECK(!KvmSchedYield(0,&hypercallResult) && !KvmSchedYield(64,&hypercallResult) && !KvmSchedYield(1,nullptr) && hypercallCalls==1);
+    currentCpu=1;CHECK(KvmSchedYield(0,&hypercallResult) && hypercallTarget==51);currentCpu=0;
+    testVendor=2;ConfigureSchedYield(0,1u<<13,51);hypercallReturn=-1000;
+    CHECK(KvmSchedYield(1,&hypercallResult) && hypercallInstruction==2 && hypercallResult==-1000);
+    hypercallResult=777;const auto performed=hypercallCalls;
+    ConfigureSchedYield(0,0,51);CHECK(!KvmSchedYield(1,&hypercallResult) && hypercallResult==777);
+    testVendor=0;ConfigureSchedYield(0,1u<<13,51);CHECK(!KvmSchedYield(1,&hypercallResult));
+    testVendor=1;ConfigureSchedYield(0,1u<<13,51);g_stealEnabled[1]=false;
+    CHECK(!KvmSchedYield(1,&hypercallResult) && hypercallResult==777);g_stealEnabled[1]=true;
+    g_yieldTargetReady[1]=false;CHECK(!KvmSchedYield(1,&hypercallResult));g_yieldTargetReady[1]=true;
+    CHECK(hypercallCalls==performed);hypercallReturn=0;
     // Query advertised features separately from registered record hints. A
     // preemption hint is not versioned steal time and must not be cleared.
     testKvmFeatures=(1u<<5)|(1u<<7)|(1u<<13);testKvmHints=1;

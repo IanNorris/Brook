@@ -5,6 +5,13 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Bounded owner-directed yield](ready-lock-owner-yield.md) follows positive
+  owner-qualified preemption observations. Its matched native pair exercises
+  19 guest calls and 15 successful host yields in the separately bracketed
+  QMP interval, with clean accounting/IF/lifecycle checks, but loaded audio
+  remains around 0.05 nominal versus 0.10 with hints off. It stays default off;
+  native yield success is not useful playback or a causal performance estimate.
+
 - [Ready-lock owner observations](ready-lock-owner-observations.md) add a
   default-off advisory descriptor after actual ticket ownership and clear it
   before release. All 71 host suites and a same-kernel native off/on pair pass

@@ -37,6 +37,37 @@ int main(){
     owner.Acquired(64,0);CHECK(!owner.Owner());owner.Observe(64,[]{return 1u;},hint);
     const auto old=snap.cpu[0].observations;owner.Read(64,nullptr);CHECK(snap.cpu[0].observations==old);
 
+    // Drive the exact wait-path decision with fake hypercalls, not lock entry.
+    ReadyLockOwnerObservation hinted;CHECK(!hinted.YieldMode(true));hinted.Mode(true);CHECK(hinted.YieldMode(true));
+    hinted.Acquired(1,10);unsigned yields=0,flagReads=0;bool spent=false;
+    auto preempted=[](unsigned cpu,uint8_t* out){CHECK(cpu==1);*out=1;return true;};
+    auto perform=[&](unsigned cpu,int64_t* returned){CHECK(cpu==1);++yields;*returned=0;return true;};
+    auto flags=[&]{++flagReads;return uint64_t(0);};
+    hinted.ObserveWait(2,10,spent,[]{return 10u;},preempted,perform,flags);
+    CHECK(!spent && !yields); // ticket granted; no hint or hint-byte read needed
+    hinted.ObserveWait(2,11,spent,[]{return 10u;},preempted,perform,[]{return uint64_t(0x200);});
+    CHECK(!spent && !yields); // never hint with IF enabled
+    hinted.ObserveWait(2,11,spent,[]{return 10u;},preempted,perform,flags);CHECK(spent && yields==1);
+    for(unsigned i=0;i<20;++i)hinted.ObserveWait(2,11,spent,[]{return 10u;},preempted,perform,flags);
+    CHECK(yields==1 && flagReads==2);hinted.Read(3,&snap);
+    CHECK(snap.cpu[2].hintAttempted==1 && snap.cpu[2].hintBudgetExhausted==20 && snap.cpu[2].ifErrors==1);
+    CHECK(snap.cpu[2].kind[unsigned(OwnerWaitObservation::AlreadyGranted)]==1);
+    // Unsupported and nonzero returns each consume a single per-wait budget.
+    spent=false;hinted.ObserveWait(2,11,spent,[]{return 10u;},preempted,[](unsigned,int64_t*){return false;},flags);CHECK(spent);
+    spent=false;hinted.ObserveWait(2,11,spent,[]{return 10u;},preempted,[](unsigned,int64_t* result){*result=-1000;return true;},flags);CHECK(spent);
+    // Ownership can change after qualification, before the final hint recheck.
+    spent=false;unsigned reads=0;
+    hinted.ObserveWait(2,11,spent,[&]{return ++reads<3?10u:11u;},preempted,perform,flags);CHECK(!spent && yields==1);
+    // A callback changing IF is diagnosed; no code repairs/masks it silently.
+    spent=false;unsigned ifReads=0;
+    hinted.ObserveWait(2,11,spent,[]{return 10u;},preempted,perform,[&]{return ++ifReads==1?uint64_t(0):uint64_t(0x200);});
+    CHECK(spent && yields==2);hinted.Read(3,&snap);
+    CHECK(snap.cpu[2].hintUnsupported==1 && snap.cpu[2].hintErrors==1 && snap.cpu[2].hintRaces==1 && snap.cpu[2].ifErrors==2);
+    hinted.Mode(false);CHECK(!hinted.YieldEnabled() && !hinted.Enabled());hinted.Releasing(1,10);
+    hinted.Mode(true);CHECK(!hinted.YieldEnabled());hinted.Acquired(1,10);spent=false;
+    hinted.ObserveWait(2,11,spent,[]{return 10u;},preempted,perform,flags);CHECK(!spent && yields==2);
+    hinted.Releasing(1,10);
+
     // Actual atomic ticket admission, concurrent owners/readers, uint32 wrap,
     // normal and successful try claims. Publication never grants ownership.
     ReadyLockOwnerObservation concurrent;concurrent.Mode(true);

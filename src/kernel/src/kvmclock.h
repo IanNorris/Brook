@@ -25,6 +25,10 @@ bool KvmStealAvailable(uint32_t cpu);
 // Independent host hint byte; read-only, bounded, no CPUID/version retry.
 // False leaves output unchanged; a clear bit does not prove the CPU is running.
 bool KvmStealReadPreempted(uint32_t cpu,uint8_t* output);
+// Advisory KVM_HC_SCHED_YIELD, using cached per-CPU instruction/APIC mapping.
+// False means no hypercall; output unchanged. Return value never grants a lock.
+bool KvmSchedYield(uint32_t targetCpu,int64_t* result);
+uint64_t KvmSchedYieldIssuerMask();
 // Bounded version-checked read; failure leaves output unchanged.
 bool KvmStealReadNs(uint32_t cpu, uint64_t* result);
 

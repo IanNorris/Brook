@@ -3789,6 +3789,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
             "  timer timing on|off|reset|status - BSP timer/wake-scan brackets (default off)\n"
             "  sched irq-accounting try|blocking|status - experimental AP accounting deferral\n"
+            "  sched lock-yield on|off|status - bounded owner hint (default off; requires lock-owner)\n"
             "  sched lock-owner on|off|status - bounded ready-lock owner observations (default off)\n"
             "  sched irq-idle-accounting on|off|status - experimental idle sample coalescing\n"
             "  timer peers on|off|reset|status - per-CPU timer arrivals (default off)\n"
@@ -4306,17 +4307,22 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("potential_watch_ticks_skipped",c.deferred);r.text(",");r.field("if_errors",c.ifErrors);r.text(",");r.field("stale_ticket_waits",c.staleTicketWaits);r.text("}");r.send();
         }DebugChannelSend("]}\n");
     }
-    else if(NetStrEq(cmd,"sched lock-owner on") || NetStrEq(cmd,"sched lock-owner off") || NetStrEq(cmd,"sched lock-owner status")){
+    else if(NetStrEq(cmd,"sched lock-owner on") || NetStrEq(cmd,"sched lock-owner off") || NetStrEq(cmd,"sched lock-owner status") || NetStrEq(cmd,"sched lock-yield on") || NetStrEq(cmd,"sched lock-yield off") || NetStrEq(cmd,"sched lock-yield status")){
         if(NetStrEq(cmd,"sched lock-owner on"))SchedulerReadyLockOwnerMode(true);
         if(NetStrEq(cmd,"sched lock-owner off"))SchedulerReadyLockOwnerMode(false);
+        if(NetStrEq(cmd,"sched lock-yield on") || NetStrEq(cmd,"sched lock-yield off")){
+            if(!SchedulerReadyLockYieldMode(NetStrEq(cmd,"sched lock-yield on"))){DebugChannelSend("{\"applied\":false,\"error\":\"enable lock-owner first, or concurrent control raced\"}\n");return;}
+        }
         ReadyLockOwnerSnapshot s{};SchedulerReadyLockOwnerRead(&s);BridgeReply header;
         header.text("{\"enabled\":");header.text(s.enabled?"true":"false");header.text(",\"saturated\":");header.text(s.saturated?"true":"false");
-        header.text(",");header.field("owner_descriptor",s.owner);
-        header.text(",\"scope\":\"default off; advisory ready-lock owner published after ownership and cleared before release; at most20 observations per wait at exponential spin counts64..33554432; counts not durations or exposure rates; unavailable publication includes handoff gaps; independently sampled preempted hint, clear is not running proof; no hypercalls or lock admission changes; cumulative independent rows; disable and drain before reconciliation\",\"cpus\":[");header.send();
-        static const char* names[]={"missing_owner","ticket_mismatch","changed","self","missing_steal","preempted","not_preempted"};
+        header.text(",");header.field("owner_descriptor",s.owner);header.text(",\"yield_enabled\":");header.text(s.yieldEnabled?"true":"false");
+        header.text(",\"scope\":\"default off; advisory ready-lock owner published after ownership and cleared before release; at most20 observations per wait at exponential spin counts64..33554432; counts not durations or exposure rates; unavailable publication includes handoff gaps; independently sampled preempted hint, clear is not running proof; yield off by default; optional at most one advisory hint per wait; no admission/IF changes; cumulative independent rows; disable and drain before reconciliation\",\"cpus\":[");header.send();
+        static const char* names[]={"missing_owner","ticket_mismatch","changed","self","missing_steal","preempted","not_preempted","already_granted"};
         for(unsigned cpu=0;cpu<s.cpus;++cpu){const auto& c=s.cpu[cpu];BridgeReply r;if(cpu)r.text(",");r.text("{");r.field("cpu",cpu);
             r.text(",");r.field("published",c.published);r.text(",");r.field("cleared",c.cleared);r.text(",");r.field("waits",c.waits);
             r.text(",");r.field("observations",c.observations);r.text(",");r.field("other_hints",c.otherHints);r.text(",");r.field("errors",c.errors);
+            r.text(",");r.field("hint_eligible",c.hintEligible);r.text(",");r.field("hint_attempted",c.hintAttempted);r.text(",");r.field("hint_unsupported",c.hintUnsupported);
+            r.text(",");r.field("hint_errors",c.hintErrors);r.text(",");r.field("hint_budget_exhausted",c.hintBudgetExhausted);r.text(",");r.field("hint_races",c.hintRaces);r.text(",");r.field("if_errors",c.ifErrors);
             for(unsigned k=0;k<OwnerWaitKinds;++k){r.text(",");r.field(names[k],c.kind[k]);}r.text("}");r.send();
         }DebugChannelSend("]}\n");
     }
@@ -4355,8 +4361,9 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text(","); reply.field("registered_steal_cpu_mask", status.registeredStealMask);
         reply.text(","); reply.field("preempted_hint_cpu_mask", status.preemptedHintMask);
         reply.text(","); reply.field("other_preempted_byte_bits_cpu_mask", status.otherHintMask);
-        reply.text(",\"pv_lock_wait_implemented\":false,\"pv_sched_yield_implemented\":false,");
-        reply.text("\"scope\":\"CPUID and per-vCPU hint bytes sampled independently, not a coherent running-state snapshot; zero does not prove running or host support; hints are not used for scheduling\"}\n");
+        reply.text(",\"pv_lock_wait_implemented\":false,\"pv_sched_yield_implemented\":true,");
+        reply.field("pv_sched_yield_issuer_mask",KvmSchedYieldIssuerMask());reply.text(",");
+        reply.text("\"scope\":\"CPUID and per-vCPU hint bytes sampled independently, not a coherent running-state snapshot; zero does not prove running or host support; hints used only by explicit default-off ready-lock experiment\"}\n");
         reply.send();
     }
     else if(NetStrEq(cmd,"sched runtime history on") || NetStrEq(cmd,"sched runtime history off") ||

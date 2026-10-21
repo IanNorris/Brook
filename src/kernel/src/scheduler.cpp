@@ -72,6 +72,7 @@ struct SchedLock {
 
 static ReadyLockOwnerObservation g_readyOwner;
 void SchedulerReadyLockOwnerMode(bool enabled){g_readyOwner.Mode(enabled);}
+bool SchedulerReadyLockYieldMode(bool enabled){return g_readyOwner.YieldMode(enabled);}
 void SchedulerReadyLockOwnerRead(ReadyLockOwnerSnapshot* out){g_readyOwner.Read(SmpGetCpuCount(),out);}
 
 static SchedulerLockTrace g_lockTrace;
@@ -107,7 +108,7 @@ static constexpr uint64_t SCHEDLOCK_TIMEOUT_SPINS = 50000000ULL;
 
 static inline void SchedLockWaitForTicket(SchedLock& lock,uint32_t ticket,const char* caller)
 {
-    uint64_t spins = 0,nextOwnerSample=64;
+    uint64_t spins = 0,nextOwnerSample=64;bool ownerHintSpent=false;
     const bool observeOwner=lock.ownerObserved && g_readyOwner.Enabled();
     const auto observerCpu=observeOwner?SmpCurrentCpuIndex():0;
     while (__atomic_load_n(&lock.serving, __ATOMIC_ACQUIRE) != ticket)
@@ -115,8 +116,10 @@ static inline void SchedLockWaitForTicket(SchedLock& lock,uint32_t ticket,const 
         if(observeOwner){
             if(!spins)g_readyOwner.Waiting(observerCpu);
             if(spins==nextOwnerSample){
-                g_readyOwner.Observe(observerCpu,[&]{return __atomic_load_n(&lock.serving,__ATOMIC_ACQUIRE);},
-                    [](unsigned cpu,uint8_t* hint){return KvmStealReadPreempted(cpu,hint);});
+                g_readyOwner.ObserveWait(observerCpu,ticket,ownerHintSpent,[&]{return __atomic_load_n(&lock.serving,__ATOMIC_ACQUIRE);},
+                    [](unsigned cpu,uint8_t* hint){return KvmStealReadPreempted(cpu,hint);},
+                    [](unsigned cpu,int64_t* result){return KvmSchedYield(cpu,result);},
+                    []{uint64_t flags;__asm__ volatile("pushfq; pop %0" : "=r"(flags) :: "memory");return flags;});
                 nextOwnerSample*=2;
             }
         }
