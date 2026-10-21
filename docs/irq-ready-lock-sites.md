@@ -102,9 +102,9 @@ regenerated table matches the final ELF, and all thirteen preserved modules
 resolve against 109 exports with ABI 34 unchanged. Its ignored
 `irq-context-sites-frozen` capsule has kernel SHA-256
 `0e1d8a35f305ac8e7c37365b71dc1404d39b0dc4d7f6cdda9ec494a4b2c63664`.
-Native context classification remains pending. Seek a positive AP-idle
-initial-accounting wait before an idle-specific intervention; do not broaden
-idle dispatch or move samples relative to housekeeping on this evidence.
+The subsequent native pair below supplies a positive AP-idle initial-accounting
+wait. That supports auditing an idle-specific intervention; it does not justify
+broadening idle-dispatch admission or moving samples without an ownership audit.
 
 Ignored raw evidence lives under
 `build/reviews/unattended-irq-sites-{off,on}-a-20261021`. Failed-source cleanup
@@ -114,3 +114,96 @@ snapshots and their `.site-analysis.json` reductions retain epochs, tickets,
 clocks and exclusions. `reboot-resume/analyze-irq-sites.py` resolves and reduces
 the bounded records. Earlier clamp failures, historical acceleration and
 broader scheduler/HDA acceptance remain open.
+
+## Refined-context native pair
+
+The refined `0e1d8a35…` kernel subsequently completes matched recording-off/on
+direct-OSS cohorts with the same modules and workload. Both sources submit and
+complete exactly 1,764,000 frames, leave no stream and pass their final runtime,
+policy/ledger, IRQ IF/stale-ticket and heap gates. Both original VM owners exit
+zero and all eight filesystem checks pass. History remains off.
+
+| Cohort | Loaded nominal completion / guest second | Source drain time | Aggregate vCPU host execution over roughly 19.9 s |
+| --- | ---: | ---: | ---: |
+| Refined recording off a | 0.08879 | 58.888 s | 4.48 CPU-s |
+| Refined recording on a | 0.07519 | 57.595 s | 2.15 CPU-s |
+
+Both WAV captures and complete audio-query host brackets lie inside every
+worker's observed execution interval. Playback remains poor in both runs.
+Their variation and different host execution retain observer sensitivity; this
+is not a measured causal overhead or general performance acceptance result.
+
+The stopped on snapshot retains 24 complete unique records at epoch 4, with
+208,803 lifetime completions, active mask zero and no lost/clock-error,
+inconsistent, old-window, partial or invalid-clock rows. No analysed wait/hold
+bracket has an excessive steal increment. Four retained records identify
+periodic AP-idle initial accounting. One is wholly inside the native audio
+interval **112.928720703–121.296464741 seconds**:
+
+- CPU 6, ticket 3,807,726, local serial 4,838, epoch 4.
+- Reserved 118.030635197 s; acquired 118.050616396 s.
+- Observed wait **19.981199 ms**, reported steal **19.925516 ms**.
+- Elapsed minus reported steal **55.683 µs**, not exact CPU time.
+- Acquired-to-release-before hold bracket **584 ns**, with zero reported steal.
+
+This is positive AP-idle initial-accounting wait evidence during poor source
+progress. It does not establish that the lock holder spent twenty milliseconds
+working or that this site explains the entire stall. The same snapshot retains
+an AP-user wait of 17.998960 ms and a nonperiodic wait of 18.991843 ms inside
+that interval. Five retained idle-dispatch records have a maximum wait of
+1.506 µs, all outside it; their absence inside the interval cannot exclude
+unretained dispatch delays.
+
+Raw evidence lives under
+`build/reviews/unattended-irq-context-sites-{off,on}-a-20261021`; the checked
+aggregate is `build/workloads/timing-scheduler-20261021/irq-context-sites-summary.json`.
+The matched ELF resolves the labels, and final stopped reductions remain beside
+the snapshots. The earlier failed off source on `34ac8f8a…` remains failed.
+
+## Narrow candidate contract
+
+The next proposed experiment is **default-off coalescing of periodic AP-idle
+accounting**, leaving idle dispatch blocking. It is not implemented or accepted
+by this capture. The purpose is to remove one redundant ready-lock acquisition
+per eligible idle AP tick; it does not eliminate the later acquisition or every
+possible convoy.
+
+The source audit finds that AP `DrainPostSwitch` releases references/requeues
+prior tasks without voluntarily switching; optional AP wake scanning unblocks
+tasks without switching its caller. With incoming IF clear, these paths preserve
+the CPU and idle owner. BSP expiry/reaping is excluded. A candidate must still
+check CPU, current idle identity and interrupt state explicitly at the late
+sample, with a counted ordinary-accounting fallback on any mismatch.
+
+The candidate must satisfy the following before native acceptance:
+
+- Eligibility requires a live AP, periodic entry, idle current process,
+  non-user interruption and IF clear. BSP, user, nonperiodic, missing/changed
+  owner and unsupported interrupt state retain the ordinary path.
+- Skip only the initial idle accounting acquisition/sample. Preserve all
+  housekeeping and the existing **blocking** idle-dispatch lock acquisition.
+  Sample the same idle owner there **before `PickNextLocked`**, including the
+  no-next-task outcome. Do not create retry-dependent dispatch liveness.
+- Preserve `RuntimeDispatchLocked`'s outgoing sample before `SetOwner` when a
+  task is selected. No idle service may become incoming task/group service or
+  trigger an idle policy-service callback.
+- Keep pending coalescing state local to the IRQ invocation. Runtime off must
+  not discard an already pending late sample. Cumulative per-CPU entry,
+  late-sample and fallback/error counts must expose bypassed paths; validate
+  them after disabling new entries and allowing in-flight handlers to finish.
+- Test clean monotonic task/group/idle conservation after boundary flushes,
+  no-next/next and intervening-ready cases, steal changes, pending bookkeeping
+  and shared wake scans. Test actual invalid/backwards/clamp handling and
+  preserve every observed failed runtime gate.
+- Removing a sample can omit a transient invalid input or correction seen by
+  eager sampling. Do not promise identical diagnostics for different sample
+  sequences, or treat fewer detected clamps as a repair. Preserve the ledger's
+  semantics for every sample actually taken.
+- Keep idle-watch tick coverage explicit if its observation moves to the late
+  hold. An observer-count change is not less idle execution or useful progress.
+- Compare eager/coalesced on the same kernel with recorders off, exact source
+  and loaded progress gates, final runtime/ownership checks and original-owner
+  filesystem gates. Retain failures and require reversal before promotion.
+
+Neither this design nor a passing narrow control changes the scheduler default,
+clears earlier clock-clamp failures or completes the broader timing goal.

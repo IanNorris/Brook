@@ -8,9 +8,11 @@ Later evidence supersedes several early leads:
 - [Timer ready-lock site attribution](irq-ready-lock-sites.md) retains complete
   9–18-ms initial-accounting wait observations inside a loaded direct-audio
   interval, mostly reported steal time. The bounded idle-dispatch records fall
-  outside that interval and cannot exclude earlier waits. Finer context labels
-  are built, with native classification pending; no dispatch or accounting
-  admission change follows from this capture.
+  outside that interval and cannot exclude earlier waits. Refined context labels
+  subsequently identify a complete 19.981-ms periodic AP-idle accounting wait
+  inside poor audio progression. A default-off idle-accounting coalescing
+  contract now preserves the later blocking dispatch acquisition and mandatory
+  ownership-boundary flush; it remains unimplemented and unaccepted.
 
 - [Direct OSS eight/one/eight-vCPU controls](direct-oss-smp-pressure.md)
   reproduce poor loaded audio progress without Quake rendering. One vCPU
