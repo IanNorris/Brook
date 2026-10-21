@@ -781,6 +781,140 @@ static void horizonControlContracts() {
     AudioMixerCoalesceEnable(true);VERIFY(!AudioMixerHorizonEnable(true));AudioMixerCoalesceEnable(false);
     VERIFY(AudioMixerClose(id));AudioMixerHorizonReset();
 }
+// Keep worker cadence independent of DMA observation cadence. A regular
+// ten-ms worker does not imply that an emulated callback device advances its
+// position smoothly. Exercise actual mixer/HDA bodies, source order and drain
+// with the current geometry, without changing lead/horizon to make it pass.
+static void burstDmaRefillExperiment() {
+    using namespace brook;
+    constexpr uint32_t total=44100*4;
+    for(unsigned burstMs:{1u,20u,26u})for(unsigned refillDelay:{0u,40u})
+    for(unsigned serviceGapMs:{0u,40u}) {
+        // One combined stress case, rather than multiplying the matrix:
+        // delayed producer, burst DMA and four missed worker opportunities.
+        if(serviceGapMs && (burstMs!=26 || refillDelay!=40))continue;
+        AudioMixerTestCommitQuantum(0);AudioMixerSharedPrefixEnable(false);
+        AudioMixerCoalesceEnable(false);AudioMixerHorizonEnable(false);
+        AudioStop();initialize();AudioMixerRefresh();
+        AudioStreamId ids[2]={AudioMixerOpen(),AudioMixerOpen()};
+        VERIFY(ids[0] && ids[1]);
+        const uint32_t capacities[2]={6208,8192},logical[2]={6174,8192},fragments[2]={64,2048};
+        std::vector<int16_t> pcm[2];uint32_t written[2]{},played[2]{},eligibleAt[2]{};
+        for(unsigned s=0;s<2;++s) {
+            VERIFY(AudioMixerSetCapacity(ids[s],capacities[s],fragments[s]));
+            pcm[s].resize(total*2);
+            for(uint32_t f=0;f<total;++f)
+                pcm[s][f*2+s]=int16_t(1000+((uint64_t(f)*48271+uint64_t(f)*f)%28000));
+        }
+        auto refill=[&](unsigned s) {
+            for(;;) {
+                AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(ids[s],&p));
+                const uint32_t logicalFree=p.queuedFrames<logical[s]?logical[s]-p.queuedFrames:0;
+                const uint32_t free=std::min(AudioMixerAvailableFrames(ids[s]),logicalFree);
+                if(written[s]==total || !free || (free<fragments[s] && total-written[s]>free))break;
+                const uint32_t count=std::min({free,fragments[s],total-written[s]});
+                VERIFY(AudioMixerSubmit(pcm[s].data()+written[s]*2,count,ids[s])==count);
+                written[s]+=count;
+            }
+        };
+        refill(0);refill(1);
+        for(unsigned i=0;i<5;++i)AudioMixerFlush();
+        prime();AudioMixerRefresh();
+        VERIFY(AudioMixerHorizonEnable(true));AudioMixerHorizonReset();
+        AudioDeliveryTimingEnable(true);AudioDeliveryTimingReset();
+        AudioMixerContributionsEnable(true);AudioMixerContributionsReset();
+        uint64_t physicalFrames=0,steadyReservationsBefore=0,steadyReservationsAfter=0;
+        unsigned noReceiptWithData=0,emptyAttempts=0,horizonDeferralsWithData=0;
+        uint64_t completedAt[2][2]{},playedAt[2][2]{},physicalAt[2]{};unsigned finishMs=0;
+        for(unsigned ms=1;ms<=15000;++ms) {
+            uint32_t advance=0;
+            if(ms%burstMs==0) {
+                // The one-ms control advances exact 44.1-kHz frames. Callback
+                // controls expose 64-frame quanta in 20/26-ms bursts, with
+                // conserved cumulative nominal advancement and bounded lag.
+                uint64_t due=uint64_t(ms)*44100/1000;
+                if(burstMs!=1)due=due/64*64;
+                advance=uint32_t(due-physicalFrames);physicalFrames=due;
+            }
+            const auto pos=HdaTestRead(g_outStreamBase+SD_LPIB,4);
+            if(g_streamRunning)for(uint32_t f=0;f<advance;++f) {
+                int16_t pair[2]{};memcpy(pair,dma.data()+(pos+f*4)%AUDIO_BUF_SIZE,4);
+                for(unsigned s=0;s<2;++s)if(pair[s]) {
+                    VERIFY(played[s]<total);
+                    if(played[s]<total)VERIFY(pair[s]==pcm[s][played[s]*2+s]);
+                    ++played[s];
+                }
+            }
+            move(advance*4,1000000);AudioMixerRefresh();
+            for(unsigned s=0;s<2;++s) {
+                AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(ids[s],&p));
+                const uint32_t free=std::min(AudioMixerAvailableFrames(ids[s]),
+                    p.queuedFrames<logical[s]?logical[s]-p.queuedFrames:0);
+                if(written[s]<total && !eligibleAt[s] && free>=fragments[s])eligibleAt[s]=ms;
+                if(eligibleAt[s] && ms-eligibleAt[s]>=(s?0:refillDelay)) {
+                    refill(s);eligibleAt[s]=0;
+                }
+            }
+            if(ms%10==0 && !(serviceGapMs && ms>=1500 && ms<1500+serviceGapMs)) {
+                AudioMixerDiagnostic snapshot{};AudioMixerDiagnosticSnapshot(&snapshot);
+                bool data=false;
+                for(const auto& stream:snapshot.streams)
+                    if(stream.enabled && !stream.discontinuity && stream.softwareFrames)data=true;
+                const auto before=g_nativeClock.submitted;
+                const auto deferrals=AudioMixerHorizonRead().deferrals;
+                AudioMixerTick();
+                if(g_nativeClock.submitted==before) {
+                    if(data)++noReceiptWithData;else ++emptyAttempts;
+                    if(data && AudioMixerHorizonRead().deferrals>deferrals)++horizonDeferralsWithData;
+                }
+            }
+            if(ms==1000 || ms==3000) {
+                const unsigned side=ms==1000?0:1;
+                for(unsigned s=0;s<2;++s) {
+                    AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(ids[s],&p));
+                    completedAt[side][s]=p.completedFrames;
+                    playedAt[side][s]=played[s];
+                    VERIFY(completedAt[side][s]==playedAt[side][s]);
+                }
+                physicalAt[side]=physicalFrames;
+                if(side)steadyReservationsAfter=AudioDeliveryTimingRead().reservations;
+                else steadyReservationsBefore=AudioDeliveryTimingRead().reservations;
+            }
+            AudioStreamProgress a{},b{};VERIFY(AudioMixerGetProgress(ids[0],&a));
+            VERIFY(AudioMixerGetProgress(ids[1],&b));
+            if(a.completedFrames==total && b.completedFrames==total){finishMs=ms;break;}
+        }
+        VERIFY(finishMs>3000 && finishMs<15000);
+        for(unsigned s=0;s<2;++s) {
+            AudioStreamProgress p{};VERIFY(AudioMixerGetProgress(ids[s],&p));
+            VERIFY(written[s]==total && played[s]==total && p.submittedFrames==total &&
+                   p.completedFrames==total && !p.queuedFrames && !p.discontinuity);
+        }
+        const auto delivery=AudioDeliveryTimingRead();
+        VERIFY(!delivery.invalidClock && !delivery.invalidPosition && !delivery.unsafe &&
+               !delivery.saturated && !g_nativeClock.discontinuity);
+        contributionConservation(AudioMixerContributionsRead());
+        const auto physicalInterval=physicalAt[1]-physicalAt[0];
+        const auto reservations=steadyReservationsAfter-steadyReservationsBefore;
+        if(burstMs==1 || (burstMs==20 && !refillDelay)) {
+            VERIFY(!reservations);
+            for(unsigned s=0;s<2;++s)VERIFY(completedAt[1][s]-completedAt[0][s]==physicalInterval);
+        }
+        if(burstMs==26 && !refillDelay) {
+            // Known diagnostic failure: do not turn source buffering or
+            // nominal worker cadence into an uninterrupted-output claim.
+            VERIFY(reservations>0 && horizonDeferralsWithData>0);
+            for(unsigned s=0;s<2;++s)VERIFY(completedAt[1][s]-completedAt[0][s]<physicalInterval);
+        }
+        std::printf("MIXER_BURST_DMA burst_ms=%u producer_delay_ms=%u service_gap_ms=%u completion=%llu,%llu nominal_interval_frames=88200 physical_interval_frames=%llu steady_reservations=%llu no_receipt_with_data=%u horizon_deferrals_with_data=%u empty_attempts=%u drain_ms=%u\n",
+            burstMs,refillDelay,serviceGapMs,(unsigned long long)(completedAt[1][0]-completedAt[0][0]),
+            (unsigned long long)(completedAt[1][1]-completedAt[0][1]),
+            (unsigned long long)physicalInterval,(unsigned long long)reservations,
+            noReceiptWithData,horizonDeferralsWithData,emptyAttempts,finishMs);
+        AudioMixerContributionsEnable(false);AudioDeliveryTimingEnable(false);
+        AudioMixerHorizonEnable(false);VERIFY(AudioMixerClose(ids[0]) && AudioMixerClose(ids[1]));AudioStop();
+    }
+}
 static void steadyCommitExperiment() {
     using namespace brook;
     constexpr uint32_t total=44100*8;
@@ -1120,6 +1254,7 @@ int RunMixerClockTests() {
     horizonControlContracts();
     commitQuantumGuards(a,b);
     commitHorizonGuards(a,b);
+    burstDmaRefillExperiment();
     steadyCommitExperiment();
     coalesceTests(a,b);
     VERIFY(AudioMixerClose(a));mixerClockEnabled=false;AudioStop();

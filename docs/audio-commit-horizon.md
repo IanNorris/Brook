@@ -921,3 +921,61 @@ in the second review's `post-timing-profile-{export,analysis}.json`. Both VMs
 are stopped; scheduler/audio defaults remain unchanged. Further work needs
 source-aligned gap attribution and bounded GPU/host wait correlation, while the
 original clock and scheduler acceptance work remains open.
+
+## Bursty DMA and delayed refill control
+
+The actual mixer/HDA-body suite now separates service cadence from DMA
+observation cadence with seven focused cases. The worker is invoked every
+10 ms; one case omits four consecutive opportunities. The first endpoint
+models the current 6208-frame physical FIFO, 64-frame fragment and 6174-frame
+logical admission budget; the second uses 8192/2048. This finite-source model
+admits whole fragments (plus the final tail), so it is not an exact Cubeb/ALSA
+ring-pointer implementation. Logical admission can leave a sub-fragment remainder.
+The guarded horizon remains 4096 frames and HDA lead remains 12 KiB.
+
+A smooth control advances exact nominal 44.1-kHz frames each millisecond.
+Callback controls advance conserved cumulative nominal frames in 64-frame
+quanta every 20 or 26 ms; this deliberately models burst observation rather
+than measured QEMU callback timing. Producers refill at the first eligible
+opportunity or, for the first endpoint, after a 40-ms eligibility delay.
+Discovery is explicit each millisecond, unlike real application scheduling.
+Each source has distinct nonzero sample sequences in its own stereo channel.
+The test checks every emitted source sample, exact completed/physically emitted
+counts at both measurement endpoints, no duplicate/lost/reordered source
+frames, full four-second source drains and unchanged native publication guards.
+
+| DMA cadence | First producer delay | Missed service | Source frames completed, first / second | Physical frames advanced | Reservations |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Smooth 1 ms | 0 ms | 0 | 88200 / 88200 | 88200 | 0 |
+| Smooth 1 ms | 40 ms | 0 | 88200 / 88200 | 88200 | 0 |
+| Bursts 20 ms | 0 ms | 0 | 88192 / 88192 | 88192 | 0 |
+| Bursts 20 ms | 40 ms | 0 | 83136 / 88192 | 88192 | 0 |
+| Bursts 26 ms | 0 ms | 0 | 83648 / 83648 | 88320 | 39 |
+| Bursts 26 ms | 40 ms | 0 | 77504 / 83648 | 88320 | 39 |
+| Bursts 26 ms | 40 ms | 40 ms | 77220 / 83236 | 88320 | 39 |
+
+The table measures simulated wall time from 1000 through 3000 ms. Quantized
+DMA endpoints differ from the nominal 88200-frame wall interval; source progress
+must be compared against the recorded physical interval, not silently rounded
+to nominal time. Reservation counts are for the same interval. All seven
+cases finish with all 176400 frames from each source emitted once, in order,
+credited once and drained; completion times range from 4047 to 4576 ms.
+No invalid clock/position, unsafe publication, saturation or discontinuity occurs.
+These safety/conservation passes do not mean uninterrupted output passed.
+
+With immediate producers, changing only DMA from smooth to 26-ms bursts causes
+reservations despite regular service. Skipped attempts with available software
+data are independently identified as horizon deferrals. This demonstrates a
+mechanism by which a full horizon followed by burst advancement crosses the
+write-lead threshold; it is not proof of the native gaps' cause. The constructed
+26-ms pattern is more severe than the occasional native reservations. Delayed
+refill also reduces the first source's progress in the 20-ms case without HDA
+reservations, separating source underfeed from physical silence reservation.
+The combined missed-service case preserves exact drains but remains slower.
+
+The focused suite passes with the seven-case assertions and the existing broader
+steady/refill/ownership/driver cases intact. No production code, driver, buffer
+configuration or scheduler default changes. Evidence is retained in
+`build/workloads/timing-scheduler-20261021/logical-buffer-probe/burst-dma-host-final.{log,json}`.
+Next native attribution must inspect source availability and horizon decisions
+around reservations, rather than infer a scheduler stall from submission gaps.
