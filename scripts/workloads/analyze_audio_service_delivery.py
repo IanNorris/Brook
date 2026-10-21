@@ -14,6 +14,62 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def mix_context(readings):
+    """Optional enclosing counters, never a per-reservation attribution."""
+    commands = [r['command'] for r in readings]
+    if not any(c.startswith('audio contributions ') for c in commands):
+        return None
+
+    def one(command):
+        rows = [r for r in readings if r['command'] == command]
+        require(len(rows) == 1, 'missing or duplicate mix control: ' + command)
+        return rows[0]['result']
+
+    before, after = one('audio contributions reset'), one('audio contributions off')
+    require(commands.index('audio contributions reset') < commands.index('audio delivery reset') <
+            commands.index('audio delivery off') < commands.index('audio contributions off'),
+            'contribution interval must contain delivery interval')
+    require(before['enabled'] and not after['enabled'] and
+            after['epoch'] == (before['epoch'] & ~1) + 2 and not before['observations'],
+            'contribution generation changed or not reset')
+    require(not any(after[k] for k in ('invalid', 'omitted_observations',
+                'omitted_stream_frames', 'saturated', 'exhausted')), 'incomplete contribution accounting')
+    require(after['count'] == len(after['streams']) <= after['capacity'], 'contribution row count mismatch')
+    require(len({(r['identity'], r['epoch']) for r in after['streams']}) == len(after['streams']),
+            'duplicate contribution identity')
+    for row in after['streams']:
+        missing = row['missing_empty_frames'] + row['missing_short_frames']
+        require(row['accepted_output_frames'] == row['contributed_frames'] + missing,
+                'contribution conservation mismatch')
+        require(sum(row['missing_software_bins']) == sum(row['missing_inflight_bins']) == missing,
+                'contribution histogram mismatch')
+        require(row['accepted_output_frames'] <= after['output_frames'], 'stream exceeds unique output')
+    horizon = [r for r in readings if r['command'] == 'audio horizon status']
+    require(len(horizon) == 2, 'requires enclosing horizon snapshots')
+    require(commands.index('audio contributions reset') < commands.index('audio horizon status') <
+            commands.index('audio delivery reset'), 'horizon begin does not precede delivery reset')
+    require(readings.index(horizon[1]) > commands.index('audio delivery off') and
+            readings.index(horizon[1]) < commands.index('audio contributions off'),
+            'horizon end does not enclose delivery stop')
+    a, z = (r['result'] for r in horizon)
+    for key in ('epoch', 'target_frames', 'refill_allowance_frames', 'refill_allowance_ms'):
+        require(a[key] == z[key], 'horizon configuration changed: ' + key)
+    for value in (a, z):
+        require(value['enabled'] and not any(value[k] for k in ('saturated', 'exhausted',
+                    'invalid_clock', 'unsupported_driver')), 'invalid horizon counters')
+    delta = {}
+    for key in ('decisions', 'deferrals', 'shortened_attempts', 'shortened_receipts',
+                'accepted_prefix_frames', 'headroom_bypasses'):
+        require(z[key] >= a[key], 'horizon counter regressed: ' + key)
+        delta[key] = z[key] - a[key]
+    return dict(contributions=after, horizon_before=a, horizon_after=z, horizon_delta=delta,
+                scope='Counters enclose HDA recording but controls are sequential, not sample-aligned. '
+                      'Accepted contribution conservation is not source demand or per-reservation cause. '
+                      'Horizon decisions require positive source data, while zero-source attempts are '
+                      'unrecorded here. Deferrals have no receipt. Do not subtract decisions from worker '
+                      'cycles to infer exact empty attempts or attach aggregate loss to a particular gap.')
+
+
 def analyze(readings, lead_bytes):
     require(lead_bytes > 0 and lead_bytes % 4 == 0, 'invalid fixed HDA lead')
 
@@ -83,6 +139,25 @@ def analyze(readings, lead_bytes):
                 p['position_valid'] and p['running'], 'unqualified preceding submission')
         lo, hi = p['after_position_ns'], c['before_copy_ns']
         require(0 < lo <= hi <= c['after_position_ns'], 'invalid delivery interval')
+        # Previous publication end is unchanged before the next recorded
+        # submission reserves its gap. lead_before uses raw completion;
+        # pending_before_reserve uses completion rounded down to four bytes.
+        # Therefore the position advance has at most three bytes uncertainty.
+        # Previous position is read AFTER after_copy, current progress BEFORE
+        # before_copy: these clocks give an upper bound on read-to-read time.
+        raw_pending = p['lead_before_bytes'] + p['accepted_bytes'] - p['advanced_bytes']
+        advance = raw_pending - c['pending_before_reserve']
+        require(advance + 3 >= 0 and p['after_copy_ns'] <= lo, 'invalid position advance bracket')
+        elapsed_upper = hi - p['after_copy_ns']
+        position = dict(previous_raw_pending_bytes=raw_pending,
+                        advance_bytes_bounds=[max(0, advance), advance + 3],
+                        position_read_elapsed_upper_ns=elapsed_upper,
+                        nominal_bytes_per_second=176400,
+                        exceeds_nominal_upper=max(0, advance) * 1_000_000_000 > elapsed_upper * 176400,
+                        scope='Fixed 44100-Hz stereo S16 HDA. Adjacent accepted observations, '
+                              'same epoch and no omitted records; quantization bound, not physical '
+                              'DAC timing. Compressed position advancement may reflect burst/catchup '
+                              'or a clock discrepancy; not proof of sustained fast playback.')
         overlaps = []
         for index, e in enumerate(cycles):
             pieces = dict(sleep=(e['after_deadline_ns'], e['wake_ns']),
@@ -94,10 +169,12 @@ def analyze(readings, lead_bytes):
                 overlaps.append(dict(index=index, cycle=e, positive_overlap_ns=overlap,
                                      contains_current_copy=bool(current_service)))
         row.update(status='qualified interval; unrecorded worker cycles remain unknown',
-                   previous_submission_gap_ns=hi-lo, worker_overlaps=overlaps)
+                   previous_submission_gap_ns=hi-lo, worker_overlaps=overlaps,
+                   position_advance=position)
         rows.append(row)
     return dict(worker_identity=identity, service=service, delivery=delivery, reservations=rows,
                 fixed_lead_bytes=lead_bytes,
+                mix_context=mix_context(readings),
                 scope='Separate diagnostic, not performance acceptance. Worker top16 slow episodes '
                       'are not a timeline. Positive interval overlap is not unique cause. Missing '
                       'records cannot prove timely wake/service, sufficient source data or uninterrupted '

@@ -221,3 +221,78 @@ validate rejection of misleading joins. Evidence and the executed analyzer are
 retained in the review's `post-timing-gpu-host-trace` directory. The compositor
 fence median/p95 remain 2.518/3.317 ms in this diagnostic. This is an additional
 1-ms observation, not a balanced repeat of the 10/1-ms comparison.
+
+## Accepted source contributions and position-advance bounds
+
+A third private 1-ms review,
+`unattended-qemu-poll-1ms-fixed-mlfq-c-20261021`, keeps the same frozen guest
+and repeats all ordinary windows before adding contribution counters to the
+separate diagnostic. All nine original jobs, full browser clip/loop and byte
+transfers, runtime/native fault, heap/policy, original owner/controller exits,
+geometry reversal and four filesystem checks pass. There are no runtime
+clamps in this run. The VM is stopped. These passes retain, rather than
+resolve, earlier failed cohorts and the historical fast-playback issue.
+
+Enabled mixed Firefox callbacks are 18.64 and 20.19/s, with Quake swaps 16.78
+and 15.85/s; loaded callbacks are 19.81/19.84 and swaps 17.93/17.24. Enabled
+audio completion is about 0.9993–1.0011; disabled mixed phases remain slow.
+The first enabled mixed WAV has no all-channel zeros; the second has three
+runs of at least one millisecond, maximum 2.902 ms. Uninterrupted-output
+acceptance therefore still fails despite good average progress.
+
+The separate diagnostic records 634 worker cycles, maximum sleep 12.656 ms,
+service 5.299 ms and no 20-ms slow cycle. The contribution interval has 583
+accepted batches / 288072 unique output frames. Both Firefox identity 33/epoch4
+and reopened Quake identity 66/epoch4 contribute all 288072 frames: zero
+missing-empty and zero missing-short frames, exact histogram/conservation
+identities and no omissions, invalid records, saturation or exhaustion. The
+fixed horizon snapshots show 621 decisions, 45 deferrals, 551 shortened
+receipts and 25 headroom bypasses. Controls are sequential: these enclosing
+intervals are not sample-aligned and cannot be subtracted to count exact empty
+worker attempts. Full contributions exclude missing contributors in accepted
+batches; they do not prove data existed at every unsubmitted opportunity.
+
+HDA still reserves two gaps, 768 and 1024 bytes, matching two all-channel WAV
+zero runs of 192 and 256 frames by count/order/size. Both preceding submissions
+leave exactly 16384 raw pending bytes at their post-copy position observations.
+Before the next reservation, rounded pending is 11520 and 11264 bytes. There
+are no omitted observations, overwritten reservations, invalid positions or
+unsafe publications, and both pairs retain the same hardware/control epochs.
+
+The analyzer derives a conservative position bound from adjacent observations:
+`R = previous.lead_before_bytes + previous.accepted_bytes − previous.advanced_bytes`.
+If `P` is the next pre-reservation rounded pending count, actual position
+advancement lies in `[max(0,R−P), R−P+3]` bytes. The three-byte uncertainty comes
+from whole-frame completion rounding. The previous post-copy position read
+follows its `after_copy_ns`; the next progress position read precedes the
+current `before_copy_ns`. Their clock difference is an upper elapsed bound.
+
+| Reservation | Position advance | Nominal PCM time, lower bound | Read-to-read elapsed upper bound |
+| --- | ---: | ---: | ---: |
+| 768 bytes | 4864–4867 bytes | 27.574 ms | 25.451 ms |
+| 1024 bytes | 5120–5123 bytes | 29.025 ms | 24.020 ms |
+
+Astra reviewed the derivation against the driver and clock model. Intervening
+progress polls do not change the submission end. Unrecorded acceptance or
+reservation, control fencing/omissions, hardware epoch change or drain/restart
+would invalidate this interpretation; they must remain excluded. The generic
+analyzer now permits a raw lower estimate of −1 through −3 bytes by clipping
+only the lower bound to zero, rejecting a negative upper bound.
+
+Observed DMA-position advancement exceeds nominal PCM travel in these short
+clock brackets. This supports burst/catch-up advancement or a clock discrepancy,
+not sustained fast playback or accelerated physical speaker output. It is a
+stronger discriminator than submission-gap length alone and is consistent with
+the constructed [burst-DMA control](audio-commit-horizon.md). Native source
+availability during unsubmitted attempts remains unknown. The next control
+should inspect callback/position cadence or bounded attempt context, retaining
+12-KiB lead, 4096-frame horizon and the source geometry. No policy or buffering
+default is promoted.
+
+The analyzer validates optional contribution conservation, identity and histogram
+counts plus fixed horizon generations and monotonic counters. Nine focused
+Python tests cover missing-context inference, raw rounding and inconsistent
+upper bounds, omitted records, stale identities and malformed controls. The
+actual capture also passes ten mutated-input rejection controls. Full artifacts,
+executed helpers/analyzer and scope are retained under the review's
+`mixed-prefix-control/post-timing-gpu-host-trace/`.
