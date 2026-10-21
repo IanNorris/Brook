@@ -288,7 +288,38 @@ static void notificationOwnership() {
     CHECK(!FinishCommand(token,limits)&&g_controlQueuePoisoned);
 }
 
+namespace reset_device {
+uint8_t config;
+volatile uint8_t* g_commonCfg=&config;
+constexpr unsigned VIRTIO_COMMON_STATUS=20;
+unsigned reads,writes,acknowledgeAfter;
+static void mmio_write8(volatile uint8_t* address,unsigned offset,uint8_t value) {
+    CHECK(address==g_commonCfg && offset==VIRTIO_COMMON_STATUS && value==0);
+    ++writes;
+}
+static uint8_t mmio_read8(volatile uint8_t* address,unsigned offset) {
+    CHECK(address==g_commonCfg && offset==VIRTIO_COMMON_STATUS && writes==1);
+    now+=100;
+    return ++reads>=acknowledgeAfter?0:0x0f;
+}
+#include "../../drivers/virtio_gpu/device_reset.inc"
+static void exercise() {
+    // An asynchronous reset retains old device state until acknowledgement.
+    // The actual driver body must read status, including for immediate reset.
+    for(unsigned delay:{1u,4u,100u}) {
+        reset();runtime=false;reads=writes=0;acknowledgeAfter=delay;
+        const bool stopped=ResetGpuDevice(limits);
+        CHECK(stopped==(delay<=40) && writes==1 && reads==(delay<=40?delay:40));
+        CHECK(clocks==0); // early boot cannot depend on scheduler/clock startup
+    }
+    reset();reads=writes=0;acknowledgeAfter=100;
+    CHECK(!ResetGpuDevice(limits));
+    CHECK(writes==1 && reads<40 && clocks>1); // elapsed runtime bound
+}
+}
+
 int main(){
+    reset_device::exercise();
     notificationOwnership();
     frameFailures();
     preparationSequence();

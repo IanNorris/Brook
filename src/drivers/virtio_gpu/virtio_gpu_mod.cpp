@@ -737,6 +737,7 @@ static void NotifyControlQueue()
 // on timeout. Synchronous poll of the used ring (no IRQs) — the display path
 // runs from the compositor thread, never an ISR.
 #include "control_submit.inc"
+#include "device_reset.inc"
 
 // ---------------------------------------------------------------------------
 // GET_DISPLAY_INFO
@@ -4040,8 +4041,12 @@ static int VirtioGpuModuleInit()
         return -1;
     }
 
-    // Reset, then ACK + DRIVER.
-    mmio_write8(g_commonCfg, VIRTIO_COMMON_STATUS, 0);
+    // Observe reset completion before ACK/feature negotiation (virtio 1.2
+    // section 4.1.4.3.2). A failed reset does not permit queue/backing reuse.
+    if (!ResetGpuDevice()) {
+        SerialPuts("virtio_gpu: device reset did not complete; initialization stopped\n");
+        return -1;
+    }
     mmio_write8(g_commonCfg, VIRTIO_COMMON_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
     mmio_write8(g_commonCfg, VIRTIO_COMMON_STATUS,
                 VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
