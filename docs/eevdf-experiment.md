@@ -6,6 +6,12 @@ reported Quake II/Firefox playback acceleration has been reproduced or fixed.
 Current limits and earlier measurements are in
 [timing-scheduler-audit.md](timing-scheduler-audit.md).
 
+The later [normal-placement repeats](scheduler-normal-placement-comparison.md)
+record two failed EEVDF runtime gates: wall-minus-steal regresses during second
+Firefox launches despite monotonic raw counters and exact policy/ledger totals.
+Those failures require further accounting evidence; improved loaded playback
+does not make these cohorts accepted or justify a default-policy change.
+
 The latest [callback/20-ms browser repeats](scheduler-small-buffer-comparison.md)
 retain EEVDF's wakeup-latency advantage while MLFQ presents more video. RR
 remains the default; clean collection is separate from playback acceptance.

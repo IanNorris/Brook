@@ -159,3 +159,23 @@ both lead modules; this does not prove identical causes or rehabilitate either
 failed cohort. The candidate's callback/20-ms two-launch browser run is
 separately clean. Matched original evidence lives under
 `build/reviews/unattended-hda-12k-browser-callback-20261021/browser-lead-control`.
+
+## Normal-placement policy repeats, 21 October
+
+The [fixed-HDA policy comparison](scheduler-normal-placement-comparison.md)
+records two further failed EEVDF runtime gates during second Firefox launches.
+The loaded phase initially has zero clamps; reopen then records two samples in
+cohort a and three in cohort b. First/max deficits are 4,887 ns (CPU5, PID and
+incarnation 498) and 17,115 ns (CPU4, idle owner 0). The raw increments are
+53,248/58,135 ns wall/steal and 43,814/60,929 ns respectively. Each retained
+floor equals the preceding accepted pair's difference. These first clamps
+therefore capture new subtraction regressions, not merely repeated observations
+below an older floor.
+
+Neither raw counter moves backwards; policy/ledger totals still agree. Those
+facts do not establish accurate attribution or excuse the failed gates.
+First/max records cannot reconstruct ownership changes around a delayed steal
+correction. A bounded history of accepted pairs, owner transitions, floor and
+catch-up is the next diagnostic. Two RR and two MLFQ cohorts in the same study
+remain runtime-clean; that does not identify EEVDF as the publication cause.
+All original owners, heaps, audio drains and filesystem checks pass separately.

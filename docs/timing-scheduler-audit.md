@@ -5,6 +5,14 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Normal-placement policy repeats](scheduler-normal-placement-comparison.md)
+  keep original HDA, host placement and the kernel/module capsule fixed. Two
+  MLFQ cohorts maintain roughly 10.6–11.6 video callbacks/s under eight guest
+  CPU workers, versus 0.13/s on two RR cohorts, with clean runtime gates.
+  EEVDF also improves loaded playback, but both cohorts record service clamps
+  during a second browser launch and remain unaccepted. The next diagnostic
+  must retain those failures rather than infer safety from clean shutdowns.
+
 - [Historical-build live bisect](scheduler-lock-attribution.md) now reproduces
   fast Quake/Firefox playback under the historical RR, HDA-timer and 200-ms
   host-buffer settings. The user measures 30 seconds of YouTube progression
