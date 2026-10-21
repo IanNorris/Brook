@@ -161,6 +161,64 @@ enum class DriverMode { Unknown, Legacy, Native };
 static DriverMode g_driverMode = DriverMode::Unknown; // flush owner only
 static uint64_t g_hardwareEpoch = 0;
 static bool g_clockSupported = false; // mixer lock
+static AudioMixerSharedPrefixSnapshot g_sharedPrefix; // existing mixer lock
+static bool g_sharedPrefixActive=false;
+struct SharedPrefixAttempt {uint64_t token=0;uint32_t normal=0, requested=0;};
+static void PrefixAdd(uint64_t& value,uint64_t amount=1) {
+    AudioMixSaturatingAdd(value,amount,g_sharedPrefix.saturated);
+}
+static void PrefixAdvance(bool on) {
+    if(g_sharedPrefix.exhausted || g_sharedPrefix.epoch>~uint64_t(0)-2){
+        g_sharedPrefix.exhausted=true;g_sharedPrefix.epoch=0;on=false;
+    }else g_sharedPrefix.epoch=((g_sharedPrefix.epoch&~uint64_t(1))+2)|(on?1:0);
+    g_sharedPrefix.enabled=on;
+    __atomic_store_n(&g_sharedPrefixActive,on,__ATOMIC_RELEASE);
+}
+void AudioMixerSharedPrefixEnable(bool enabled) {
+    SpinLockAcquire(&g_mixerLock);PrefixAdvance(enabled);SpinLockRelease(&g_mixerLock);
+}
+void AudioMixerSharedPrefixReset() {
+    SpinLockAcquire(&g_mixerLock);
+    const auto old=g_sharedPrefix;g_sharedPrefix={};g_sharedPrefix.epoch=old.epoch;
+    g_sharedPrefix.exhausted=old.exhausted;PrefixAdvance(old.enabled);
+    SpinLockRelease(&g_mixerLock);
+}
+AudioMixerSharedPrefixSnapshot AudioMixerSharedPrefixRead() {
+    SpinLockAcquire(&g_mixerLock);const auto result=g_sharedPrefix;
+    SpinLockRelease(&g_mixerLock);return result;
+}
+// Called with the preparation lock held. Empty queues do not restrict the
+// shared prefix. A tiny positive prefix can postpone surplus only while fresh
+// physical lead covers snapshot age plus one nominal service opportunity.
+static uint32_t SharedPrefixFrames(uint32_t normal,const AudioDeviceProgress& device,
+                                   uint64_t sampledBefore,SharedPrefixAttempt& attempt) {
+    if(!g_sharedPrefix.enabled || !normal)return normal;
+    unsigned positive=0;uint32_t shortest=normal;
+    for(const auto& stream:g_streams){
+        if(!stream.identity || !stream.enabled || stream.discontinuity || stream.write==stream.read)continue;
+        ++positive;const uint32_t available=static_cast<uint32_t>(stream.write-stream.read);
+        if(available<shortest)shortest=available;
+    }
+    if(positive<2 || shortest==normal)return normal;
+    PrefixAdd(g_sharedPrefix.candidates);
+    if(g_driverMode!=DriverMode::Native || strcmp(g_audioDriver->name,"intel_hda")){
+        PrefixAdd(g_sharedPrefix.unsupportedDriver);return normal;
+    }
+    constexpr uint64_t serviceNs=10000000;
+    const uint64_t now=AudioClockNowNs();
+    if(!sampledBefore || !now || now<sampledBefore || now-sampledBefore>serviceNs || now>~uint64_t(0)-serviceNs){
+        PrefixAdd(g_sharedPrefix.invalidClock);return normal;
+    }
+    const uint64_t travelNs=now-sampledBefore+serviceNs;
+    const uint64_t frames=(travelNs*MIXER_HW_RATE+999999999)/1000000000;
+    const uint64_t requiredBytes=12288+frames*MIXER_FRAME_BYTES;
+    if(!device.running || device.discontinuity || device.epoch!=g_hardwareEpoch ||
+       device.submitted<device.completed || device.submitted-device.completed<requiredBytes){
+        PrefixAdd(g_sharedPrefix.headroomBypasses);return normal;
+    }
+    PrefixAdd(g_sharedPrefix.shortenedAttempts);
+    attempt={g_sharedPrefix.epoch,normal,shortest};return shortest;
+}
 static AudioMixContributionModel g_mixContributions; // existing mixer lock
 void AudioMixerContributionsEnable(bool enabled) {
     SpinLockAcquire(&g_mixerLock);g_mixContributions.Enable(enabled);SpinLockRelease(&g_mixerLock);
@@ -365,7 +423,8 @@ static void Consume(const Contribution* contributions, uint32_t frames, bool clo
 }
 // Snapshot a new whole-frame attempt. Rebuilding unaccepted frames removes
 // closed/reset/paused contributors without subtracting already-clamped sums.
-static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* prepared)
+static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* prepared,
+                        const AudioDeviceProgress& device,uint64_t sampledBefore,SharedPrefixAttempt& prefix)
 {
     uint32_t frames = 0;
     for (const auto& stream : g_streams)
@@ -373,7 +432,12 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
             frames = static_cast<uint32_t>(stream.write - stream.read);
     if (frames > MIXER_BATCH_FRAMES) frames = MIXER_BATCH_FRAMES;
     if (g_batchRemaining && frames > g_batchRemaining) frames = g_batchRemaining;
-    g_batchRemaining = frames;
+    const uint32_t normalFrames=frames;
+    frames=SharedPrefixFrames(frames,device,sampledBefore,prefix);
+    // Unsubmitted surplus is still in the source FIFO, not owned by this
+    // short proposal. Keep the ordinary remainder bound so a low-headroom
+    // retry can restore ordinary batching after rejection/partial acceptance.
+    g_batchRemaining = normalFrames;
     for (uint32_t slot = 0; slot < MIXER_MAX_STREAMS; ++slot) {
         const auto& stream = g_streams[slot];
         if (prepared) prepared[slot]={};
@@ -579,10 +643,11 @@ void AudioMixerFlush()
     struct FlushOwner { ~FlushOwner() { __atomic_store_n(&g_flushBusy, 0u, __ATOMIC_RELEASE); } } owner;
     const uint64_t epoch = __atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE);
     // Default-off avoids any additional clock reads on the normal path.
-    const bool coalesce = __atomic_load_n(&g_coalesceActive, __ATOMIC_ACQUIRE);
-    const uint64_t sampledBefore = coalesce ? AudioClockNowNs() : 0;
+    const bool controlled = __atomic_load_n(&g_coalesceActive, __ATOMIC_ACQUIRE) ||
+                            __atomic_load_n(&g_sharedPrefixActive, __ATOMIC_ACQUIRE);
+    const uint64_t sampledBefore = controlled ? AudioClockNowNs() : 0;
     AudioDeviceProgress device{};
-    RefreshDevice(epoch, coalesce ? &device : nullptr);
+    RefreshDevice(epoch, controlled ? &device : nullptr);
     Contribution contributions[MIXER_MAX_STREAMS]{};
     AudioMixPreparedStream prepared[MIXER_MAX_STREAMS]; // initialized only when recording
     const bool partial = g_partialOffset != 0;
@@ -594,7 +659,8 @@ void AudioMixerFlush()
         SpinLockRelease(&g_mixerLock); return;
     }
     const uint64_t contributionToken=g_driverMode==DriverMode::Native?g_mixContributions.Token():0;
-    const uint32_t frames = partial ? 0 : Prepare(contributions,(contributionToken&1)?prepared:nullptr);
+    SharedPrefixAttempt prefix;
+    const uint32_t frames = partial ? 0 : Prepare(contributions,(contributionToken&1)?prepared:nullptr,device,sampledBefore,prefix);
     SpinLockRelease(&g_mixerLock);
     if (!partial && !frames) return;
     if (__atomic_load_n(&g_deliveryEpoch, __ATOMIC_ACQUIRE) != epoch) {
@@ -612,6 +678,13 @@ void AudioMixerFlush()
         }
         const uint32_t acceptedFrames = receipt.accepted / MIXER_FRAME_BYTES;
         SpinLockAcquire(&g_mixerLock);
+        if(prefix.token && prefix.token==g_sharedPrefix.epoch && g_sharedPrefix.enabled){
+            PrefixAdd(g_sharedPrefix.shortenedReceipts);
+            PrefixAdd(g_sharedPrefix.acceptedPrefixFrames,acceptedFrames);
+            // This is planned/requested surplus, not counterfactual driver
+            // acceptance or proven avoided missing contributions.
+            PrefixAdd(g_sharedPrefix.requestedTailFrames,prefix.normal-prefix.requested);
+        }
         if (contributionToken&1)
             g_mixContributions.Observe(contributionToken,frames,acceptedFrames,prepared,MIXER_MAX_STREAMS);
         auto& entry = g_completions[(g_completionHead + g_completionCount) % COMPLETION_SLOTS];
@@ -623,6 +696,10 @@ void AudioMixerFlush()
         ++g_completionCount;
         Consume(contributions, acceptedFrames, true);
         g_batchRemaining -= acceptedFrames;
+        // A fully accepted shortened proposal is complete. Its unsubmitted
+        // surplus has no ownership claim on a later batch. This decision uses
+        // the captured attempt, even if controls changed during the copy.
+        if(prefix.token && acceptedFrames==prefix.requested)g_batchRemaining=0;
         SpinLockRelease(&g_mixerLock);
         return;
     }

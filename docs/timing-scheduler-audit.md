@@ -5,6 +5,14 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Guarded shared-prefix batching](audio-shared-prefix.md) has a narrow positive
+  off/on/off control: enabled finite-source completion is about 0.95 nominal
+  versus 0.91/0.86 disabled, with reduced short tails/quiet gaps, exact drains
+  and clean current accounting/lifecycle gates. It remains default off pending
+  real browser/game testing; phase variance and capture granularity remain
+  explicit. Review-driven retry/completion tests and the corrected fail-fast
+  full build pass all 74 hosted suites.
+
 - [Accepted mix contributions](audio-mix-contributions.md) now classify actual
   receipt prefixes without changing PCM policy. In two native independent-writer
   windows, short positive tails account for 94–99% of missing frames, all with

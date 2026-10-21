@@ -3786,6 +3786,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio producer on|off|reset|status - DSP producer elapsed brackets (default off)\n"
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
+            "  audio shared-prefix on|off|reset|status - experimental headroom-gated mix batching (default off)\n"
             "  audio contributions on|off|reset|status - accepted native mix contributions (default off)\n"
             "  audio coalesce on|off|reset|status - experimental HDA 12-KiB refill grace (default off)\n"
             "  clock status - elapsed source, raw IRQs and timer calibration\n"
@@ -4218,6 +4219,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             row.text(",\"worked\":");row.text(e.worked?"true":"false");row.text("}");row.send();
         }
         DebugChannelSend("]}\n");
+    }
+    else if(NetStrEq(cmd,"audio shared-prefix on") || NetStrEq(cmd,"audio shared-prefix off") ||
+            NetStrEq(cmd,"audio shared-prefix reset") || NetStrEq(cmd,"audio shared-prefix status")) {
+        if(NetStrEq(cmd,"audio shared-prefix on"))AudioMixerSharedPrefixEnable(true);
+        else if(NetStrEq(cmd,"audio shared-prefix off"))AudioMixerSharedPrefixEnable(false);
+        else if(NetStrEq(cmd,"audio shared-prefix reset"))AudioMixerSharedPrefixReset();
+        const auto s=AudioMixerSharedPrefixRead();BridgeReply r;r.text("{\"enabled\":");r.text(s.enabled?"true":"false");
+        r.text(",");r.field("epoch",s.epoch);r.text(",");r.field("candidates",s.candidates);
+        r.text(",");r.field("shortened_attempts",s.shortenedAttempts);r.text(",");r.field("shortened_receipts",s.shortenedReceipts);
+        r.text(",");r.field("accepted_prefix_frames",s.acceptedPrefixFrames);r.text(",");r.field("requested_tail_frames",s.requestedTailFrames);
+        r.text(",");r.field("headroom_bypasses",s.headroomBypasses);r.text(",");r.field("invalid_clock",s.invalidClock);
+        r.text(",");r.field("unsupported_driver",s.unsupportedDriver);r.text(",\"saturated\":");r.text(s.saturated?"true":"false");
+        r.text(",\"exhausted\":");r.text(s.exhausted?"true":"false");
+        r.text(",\"scope\":\"default-off fixed intel_hda 12-KiB shared-positive-prefix experiment; nominal headroom only, not response guarantee; requested tail is planned surplus per accepted shortened receipt, not avoided loss; one ordinary submission, empty queues do not restrict\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"audio contributions on") || NetStrEq(cmd,"audio contributions off") ||
             NetStrEq(cmd,"audio contributions reset") || NetStrEq(cmd,"audio contributions status")) {

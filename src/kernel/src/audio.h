@@ -140,6 +140,18 @@ void AudioMixerContributionsEnable(bool enabled);
 void AudioMixerContributionsReset();
 AudioMixContributionSnapshot AudioMixerContributionsRead();
 
+// Experimental shared-positive-prefix batching for fixed intel_hda 12-KiB
+// publication lead. No additional wait or submission loop; default off.
+struct AudioMixerSharedPrefixSnapshot {
+    uint64_t epoch=0, candidates=0, shortenedAttempts=0, shortenedReceipts=0;
+    uint64_t acceptedPrefixFrames=0, requestedTailFrames=0;
+    uint64_t headroomBypasses=0, invalidClock=0, unsupportedDriver=0;
+    bool enabled=false, saturated=false, exhausted=false;
+};
+void AudioMixerSharedPrefixEnable(bool enabled);
+void AudioMixerSharedPrefixReset();
+AudioMixerSharedPrefixSnapshot AudioMixerSharedPrefixRead();
+
 // Experimental, default-off refill coalescing for the unchanged intel_hda
 // 12-KiB publication lead. Not a generic driver latency guarantee.
 struct AudioMixerCoalesceSnapshot {

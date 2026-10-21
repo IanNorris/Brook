@@ -317,7 +317,8 @@ namespace {
 // producer has software samples after priming, but both still own DMA frames.
 void coalesceSetup(brook::AudioStreamId a, brook::AudioStreamId b) {
     using namespace brook;
-    AudioMixerCoalesceEnable(false); AudioStop(); initialize(); AudioMixerRefresh();
+    AudioMixerCoalesceEnable(false);AudioMixerSharedPrefixEnable(false);
+    AudioStop(); initialize(); AudioMixerRefresh();
     VERIFY(AudioMixerSetEnabled(a,true) && AudioMixerSetEnabled(b,true));
     std::vector<int16_t> left(4096*2), right(4096*2);
     for(unsigned i=0;i<4096;++i) {left[i*2]=1000;right[i*2+1]=2000;}
@@ -417,6 +418,127 @@ void contributionTests(brook::AudioStreamId a,brook::AudioStreamId& b) {
     s=AudioMixerContributionsRead();VERIFY(!s.outputFrames && !s.count && !s.observations);
     verifyDma(16384,128,true);verifyDma(16384+512,896,false);
     AudioMixerContributionsEnable(false);AudioStop();initialize();AudioMixerRefresh();
+}
+void sharedPrefixTests(brook::AudioStreamId a,brook::AudioStreamId b) {
+    using namespace brook;
+    VERIFY(!AudioMixerSharedPrefixRead().enabled);
+    // Same completion-driven refill: baseline commits the unmatched tail and
+    // later submits B alone. Candidate retains A's surplus and mixes it with B.
+    for(bool enabled:{false,true}){
+        coalesceSetup(a,b);AudioMixerSharedPrefixEnable(enabled);AudioMixerSharedPrefixReset();
+        AudioMixerContributionsEnable(true);AudioMixerContributionsReset();
+        AudioStreamProgress pa{},pb{};VERIFY(AudioMixerGetProgress(a,&pa) && AudioMixerGetProgress(b,&pb));
+        queueChannel(a,false);queueChannel(b,true,128);AudioMixerFlush();
+        VERIFY(g_nativeClock.submitted==16384+(enabled?128:1024)*4);
+        const auto services=nativeServiceCalls;advanceNative(1764);queueChannel(b,true,896);AudioMixerTick();
+        VERIFY(nativeServiceCalls==services+1);
+        const auto diag=AudioMixerContributionsRead();contributionConservation(diag);
+        const auto* ar=contributionRow(diag,a,pa.epoch);const auto* br=contributionRow(diag,b,pb.epoch);
+        VERIFY(ar && br && ar->contributedFrames==1024 && br->contributedFrames==1024);
+        VERIFY(diag.outputFrames==(enabled?1024:1920));
+        VERIFY(ar && ar->missingEmptyFrames==(enabled?0:896));
+        VERIFY(br && br->missingShortFrames==(enabled?0:896));
+        if(enabled)verifyDma(16384,1024,true);
+        finishPhysical();AudioMixerRefresh();
+        VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==5120 && !pa.queuedFrames);
+        VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==5120 && !pb.queuedFrames);
+        const auto st=AudioMixerSharedPrefixRead();
+        VERIFY(st.shortenedAttempts==(enabled?1:0) && st.shortenedReceipts==(enabled?1:0));
+        VERIFY(st.acceptedPrefixFrames==(enabled?128:0) && st.requestedTailFrames==(enabled?896:0));
+    }
+    AudioMixerContributionsEnable(false);
+    // Fully accepted 512 -> 448 shortening must not impose a 64-frame cap
+    // after both producers refill. Reset/off during copy fences counters only.
+    for(unsigned control=0;control<3;++control){
+        coalesceSetup(a,b);AudioMixerSharedPrefixEnable(true);AudioMixerSharedPrefixReset();
+        queueChannel(a,false,512);queueChannel(b,true,448);
+        if(control==1)afterCopyHook=[] {AudioMixerSharedPrefixReset();};
+        if(control==2)afterCopyHook=[] {AudioMixerSharedPrefixEnable(false);};
+        AudioMixerFlush();VERIFY(g_nativeClock.submitted==16384+448*4);
+        advanceNative(1764);queueChannel(a,false,448);queueChannel(b,true,512);AudioMixerFlush();
+        VERIFY(g_nativeClock.submitted==16384+960*4);verifyDma(16384,960,true);
+        finishPhysical();AudioMixerRefresh();AudioStreamProgress pa{},pb{};
+        VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==5056 && !pa.queuedFrames);
+        VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==5056 && !pb.queuedFrames);
+    }
+    // Never-refilling producer and tiny shared prefixes cannot retain surplus
+    // forever: empty queues do not restrict, and inadequate lead bypasses.
+    coalesceSetup(a,b);AudioMixerSharedPrefixEnable(true);AudioMixerSharedPrefixReset();
+    queueChannel(a,false);queueChannel(b,true,128);AudioMixerFlush();
+    advanceNative(1764);AudioMixerFlush();
+    VERIFY(g_nativeClock.submitted==20480 && AudioMixerSharedPrefixRead().shortenedAttempts==1);
+    finishPhysical();AudioMixerRefresh();AudioStreamProgress pa{},pb{};
+    VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==5120 && !pa.queuedFrames);
+    VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==4224 && !pb.queuedFrames);
+
+    coalesceSetup(a,b);AudioMixerSharedPrefixEnable(true);AudioMixerSharedPrefixReset();
+    queueChannel(a,false);
+    for(unsigned i=0;i<4;++i){
+        queueChannel(b,true,1);advanceNative(1764);AudioMixerTick();
+        AudioMixerDiagnostic d{};AudioMixerDiagnosticSnapshot(&d);bool aQueued=false;
+        for(const auto& row:d.streams)if(row.identity==a)aQueued=row.softwareFrames>0;
+        if(!aQueued)break;
+    }
+    auto st=AudioMixerSharedPrefixRead();VERIFY(st.shortenedAttempts && st.headroomBypasses);
+    finishPhysical();AudioMixerRefresh();
+    VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==pa.submittedFrames && !pa.queuedFrames);
+    VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==pb.submittedFrames && !pb.queuedFrames);
+
+    constexpr uint32_t threshold=12288+441*4;
+    for(uint32_t pending:{threshold-4,threshold,threshold+4}){
+        coalesceSetup(a,b);AudioMixerSharedPrefixEnable(true);AudioMixerSharedPrefixReset();
+        advanceNative(16384-pending);queueChannel(a,false);queueChannel(b,true,128);
+        const auto before=g_nativeClock.submitted;AudioMixerFlush();st=AudioMixerSharedPrefixRead();
+        VERIFY(st.shortenedAttempts==(pending>=threshold?1:0));
+        VERIFY(st.headroomBypasses==(pending<threshold?1:0));
+        VERIFY(g_nativeClock.submitted==before+(pending<threshold?4096:512));
+    }
+    coalesceSetup(a,b);AudioMixerSharedPrefixEnable(true);AudioMixerSharedPrefixReset();
+    queueChannel(a,false);queueChannel(b,true,128);mixerProgressDelayNs=10000001;AudioMixerFlush();mixerProgressDelayNs=0;
+    st=AudioMixerSharedPrefixRead();VERIFY(!st.shortenedAttempts && st.invalidClock==1 && g_nativeClock.submitted==20480);
+    coalesceSetup(a,b);AudioMixerSharedPrefixEnable(true);AudioMixerSharedPrefixReset();
+    advanceNative(16384-threshold);queueChannel(a,false);queueChannel(b,true,128);
+    mixerProgressDelayNs=1000000;AudioMixerFlush();mixerProgressDelayNs=0;
+    st=AudioMixerSharedPrefixRead();VERIFY(!st.shortenedAttempts && st.headroomBypasses==1);
+
+    // Partial acceptance owns only a prefix; retry retains the ordinary
+    // remainder budget and rebuilds its next proposal. Full-ring rejection cannot manufacture receipt counts.
+    coalesceSetup(a,b);AudioMixerSharedPrefixEnable(true);AudioMixerSharedPrefixReset();
+    std::array<int16_t,16384> silence{};VERIFY(HdaTrySubmit(silence.data(),31744).accepted==31744);
+    queueChannel(a,false);queueChannel(b,true,512);AudioMixerFlush();
+    st=AudioMixerSharedPrefixRead();VERIFY(st.shortenedReceipts==1 && st.acceptedPrefixFrames==256);
+    VERIFY(st.requestedTailFrames==512 && g_nativeClock.submitted==49152);
+    AudioMixerFlush();VERIFY(AudioMixerSharedPrefixRead().shortenedReceipts==1);
+    advanceNative(4096);AudioMixerFlush();st=AudioMixerSharedPrefixRead();
+    VERIFY(st.shortenedReceipts==2 && g_nativeClock.submitted==50176);
+    AudioMixerFlush();finishPhysical();AudioMixerRefresh();
+    VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==5120 && !pa.queuedFrames);
+    VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==4608 && !pb.queuedFrames);
+
+    // A rejected/partially accepted short proposal must not leave a tiny cap
+    // preventing the next low-headroom call from restoring ordinary batching.
+    for(bool partial:{false,true}){
+        coalesceSetup(a,b);AudioMixerSharedPrefixEnable(true);AudioMixerSharedPrefixReset();
+        AudioDeliveryTimingEnable(true);AudioDeliveryTimingReset();
+        VERIFY(HdaTrySubmit(silence.data(),partial?32512:32768).accepted==(partial?32512u:32768u));
+        queueChannel(a,false);queueChannel(b,true,partial?128:1);AudioMixerFlush();
+        VERIFY(g_nativeClock.submitted==49152);
+        advanceNative(g_nativeClock.Pending()-(threshold-4));
+        const auto before=g_nativeClock.submitted;AudioMixerFlush();
+        st=AudioMixerSharedPrefixRead();VERIFY(st.headroomBypasses==1);
+        VERIFY(g_nativeClock.submitted==before+(partial?960u:1024u)*4);
+        const auto delivery=AudioDeliveryTimingRead();VERIFY(!delivery.reservations && !delivery.unsafe && !delivery.invalidClock && !delivery.invalidPosition);
+        finishPhysical();AudioMixerRefresh();
+        VERIFY(AudioMixerGetProgress(a,&pa) && pa.completedFrames==5120 && !pa.queuedFrames);
+        VERIFY(AudioMixerGetProgress(b,&pb) && pb.completedFrames==(partial?4224u:4097u) && !pb.queuedFrames);
+        AudioDeliveryTimingEnable(false);
+    }
+
+    coalesceSetup(a,b);AudioMixerSharedPrefixEnable(true);AudioMixerSharedPrefixReset();
+    queueChannel(a,false);queueChannel(b,true,128);
+    afterCopyHook=[] {AudioMixerSharedPrefixReset();};AudioMixerFlush();
+    st=AudioMixerSharedPrefixRead();VERIFY(!st.shortenedReceipts && !st.acceptedPrefixFrames && !st.shortenedAttempts);
+    verifyDma(16384,128,true);AudioMixerSharedPrefixEnable(false);AudioStop();initialize();AudioMixerRefresh();
 }
 void coalesceTests(brook::AudioStreamId a,brook::AudioStreamId b) {
     using namespace brook;
@@ -654,6 +776,7 @@ int RunMixerClockTests() {
     VERIFY(g_nativeClock.discontinuity);
     AudioDeliveryTimingEnable(false);
     contributionTests(a,b);
+    sharedPrefixTests(a,b);
     coalesceTests(a,b);
     VERIFY(AudioMixerClose(a));mixerClockEnabled=false;AudioStop();
     std::printf("MIXER_CLOCK %s\n",failures?"FAIL":"PASS");return failures;

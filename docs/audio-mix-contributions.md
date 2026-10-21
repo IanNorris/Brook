@@ -137,3 +137,8 @@ source progress without more inactive output, reservations, faults or drain
 inflation. If substantial shortening exposure provides no benefit, stop that
 batching approach rather than adding more grace conditions. No default change
 is justified by the current diagnostic alone.
+
+The [guarded shared-prefix trial](audio-shared-prefix.md) subsequently exercises
+this intervention in actual-body tests and one native off/on/off cohort. It
+reduces short-tail loss and improves finite-source progress, but remains off
+pending real browser/game acceptance.
