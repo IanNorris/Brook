@@ -5,6 +5,13 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [MLFQ under restricted host contention](mlfq-host-pressure.md) retains
+  approximately twenty-second Quake swap stalls with blocking and try AP
+  accounting. Try avoids the observed discontinuity but does not restore
+  useful audio delivery or rendering. The next discriminator is direct OSS
+  without Quake rendering under the same host pressure, with exact progress,
+  drain and final runtime gates.
+
 - [Normal-placement policy repeats](scheduler-normal-placement-comparison.md)
   keep original HDA, host placement and the kernel/module capsule fixed. Two
   MLFQ cohorts maintain roughly 10.6–11.6 video callbacks/s under eight guest
