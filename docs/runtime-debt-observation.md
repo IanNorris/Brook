@@ -132,3 +132,55 @@ and seeds only at the first retained boundary. A synthetic positive
 clamp→owner change→catchup passes; ten mutations of floors, credits, sequences,
 identities, raw trigger pairs and catchup claims are rejected. This verifies
 the checker, not a positive native history that has still not been captured.
+
+
+## First complete positive native history
+
+The later worker/reservation timing cohort finally captures a positive episode
+in cleanup, after all eight measured-phase snapshots still reported zero clamps.
+The unchanged frozen kernel is
+`4506f7bbf02588dcdb772affc1b835829fd301c7423c7b9f1a4f00e402fdd2b0`.
+History epoch one triggers on CPU 3 at sequence 2,179,657 / runtime sample
+14,509,269. All eight per-CPU buffers freeze without overflow or baseline loss;
+512 retained rows pass independent consumed-steal replay from their recorded
+initial boundaries. The raw trigger/preceding pair, identity, floor and deficit
+match the cumulative runtime evidence exactly.
+
+| Boundary | Owner | Wall advance | New published steal | Credit | Remaining debt |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| First clamp | 315 | 14,640 ns | 32,530 ns | 0 | 17,890 ns |
+| Owner changes to 149 | 149 | no new sample | — | 0 | 17,890 ns |
+| Second clamp | 149 | 6,956 ns | 0 | 0 | 10,934 ns |
+| Third clamp | 149 | 767 ns | 0 | 0 | 10,167 ns |
+| Owner changes to 226 | 226 | no new sample | — | 0 | 10,167 ns |
+| Catchup | 226 | 54,786 ns | 0 | 44,619 ns | 0 |
+
+This is one debt episode spanning three clamped samples and two debt-bearing
+owner transitions. Across the observed interval, 77,149 ns wall minus 32,530 ns
+steal equals 44,619 ns total credit exactly. Catchup is retained at sequence
+2,179,682; no invalid/backwards pair, discarded epoch, stale identity or
+saturation explains the result. Brook carries correction across owners without
+subtracting already credited task time, matching the independent reference.
+This demonstrates the local mechanism; it does not identify which task actually
+incurred the delayed host steal or prove true per-task attribution correct.
+
+`nativeOwnershipEpisode` in `src/tests/test_runtime_debt/main.cpp` replays the
+exact captured samples and owner changes through the actual ledger and the
+independent consumed-steal reference. It asserts every intermediate debt,
+three clamps, two owner transitions, final thread/group credit and conservation.
+It seeds at the retained preceding boundary, not the original epoch origin;
+self-groups are synthetic because native history does not contain group IDs.
+A successful fail-fast rebuild and the affected runtime-debt suite pass. The
+sample pairs and intermediate debts are also checked against raw native rows.
+This is a regression fixture, not a production accounting change.
+
+All nine original guest jobs, controller and VM owner exit zero with complete
+identity/output/EOF and empty groups. Four filesystem checks, heap, policy
+ledger/ready-count and full browser/media transfer gates pass. **Runtime
+acceptance remains failed with three clamps**; the positive replay does not
+waive older failures or introduce a tolerance. The missing positive-mechanism
+evidence has now been obtained, so another broad recurrence hunt is unnecessary.
+Evidence is under
+`build/reviews/unattended-reservation-service-mlfq-a-20261021/mixed-prefix-control/`,
+including `debt-history-replay.json`, `cleanup-history-cpu-3.json`,
+`regression-fixture-check.json` and `regression-host-test.log`.

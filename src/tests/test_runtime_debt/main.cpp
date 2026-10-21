@@ -79,9 +79,59 @@ void nativePair(uint64_t beforeWall, uint64_t wall, uint64_t beforeSteal,
     CHECK(ledger.Read(1, 11, true, &total) && total == 0);
     CHECK(ledger.Read(2, 22, true, &total) && total == 1000);
 }
+
+void nativeOwnershipEpisode() {
+    // First complete positive native history: reservation-service-mlfq-a,
+    // CPU 3, trigger sample 14509269. Seed at its retained preceding boundary;
+    // this does not reconstruct the epoch origin or KVM's publication cause.
+    // Keep real PIDs/incarnations and SetOwner boundaries: Dispatch would add
+    // samples absent from the trace and incorrectly inflate clamp counts.
+    brook::RuntimeAccounting<320,4> ledger;
+    for (unsigned pid : {315u,149u,226u}) CHECK(ledger.Register(pid,pid,pid,pid));
+    ConsumedSteal ref;
+    const auto start=at(307772672519,69874881);
+    ref.sample(start);ledger.Dispatch(3,315,315,start);
+    auto sample=[&](uint64_t wall,uint64_t steal,uint64_t credit,
+                    uint64_t debt,uint64_t clamps) {
+        const auto raw=at(wall,steal);
+        CHECK(ref.sample(raw)==credit);
+        CHECK(ledger.Sample(3,raw)==credit);
+        const auto state=ledger.DebtStatus();
+        CHECK(ref.debt()==debt && state.knownDebtNs==debt);
+        CHECK(state.baselineCpuMask==8 && !state.saturated);
+        CHECK(state.episodes==1 && state.catchups==(debt?0u:1u));
+        CHECK(state.maxCpuDebtNs==17890 && !state.discardedDebtNs && !state.invalidatedEpochs);
+        CHECK(ledger.Diagnostics().clampedService==clamps);
+    };
+    sample(307772687159,69907411,0,17890,1);
+    CHECK(ledger.Diagnostics().firstClamp.previousWallNs==start.wallNs);
+    CHECK(ledger.Diagnostics().firstClamp.previousStealNs==start.stealNs);
+    CHECK(ledger.Diagnostics().firstClamp.pid==315 && ledger.Diagnostics().firstClamp.incarnation==315);
+    CHECK(ledger.Diagnostics().firstClamp.cpu==3 && ledger.Diagnostics().firstClamp.deficitNs==17890);
+    ledger.SetOwner(3,149,149);
+    CHECK(ledger.DebtStatus().ownerTransitions==1);
+    sample(307772694115,69907411,0,10934,2);
+    sample(307772694882,69907411,0,10167,3);
+    ledger.SetOwner(3,226,226);
+    CHECK(ledger.DebtStatus().ownerTransitions==2);
+    sample(307772749668,69907411,44619,0,3);
+    CHECK(ref.episodes==1 && ref.catchups==1 && ref.peak==17890);
+    for (unsigned pid : {315u,149u,226u}) {
+        uint64_t value=0;const uint64_t expected=pid==226?44619:0;
+        CHECK(ledger.Read(pid,pid,false,&value) && value==expected);
+        CHECK(ledger.Read(pid,pid,true,&value) && value==expected);
+    }
+    const auto& d=ledger.Diagnostics();
+    CHECK(d.chargedNs==44619 && d.observedStealNs==32530 && d.idleNs==0);
+    CHECK((307772749668ULL-start.wallNs)-(69907411ULL-start.stealNs)==d.chargedNs);
+    CHECK(!d.invalidSamples && !d.backwardsWall && !d.backwardsSteal && !d.staleIdentity && !d.saturated);
+    // Correct local replay does not clear the native zero-clamp acceptance
+    // failure or prove the true task attribution of delayed published steal.
+}
 }
 
 int main() {
+    nativeOwnershipEpisode();
     // Positive retained native adjacent pairs. They reproduce the arithmetic
     // only, not missing native ownership history or the host publication cause.
     nativePair(132683280759, 132683339517, 17197816, 17264256, 7682);

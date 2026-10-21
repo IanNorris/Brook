@@ -1655,3 +1655,57 @@ Raw/checked evidence is under
 `build/reviews/unattended-reservation-context-mlfq-a-20261021/mixed-prefix-control/`,
 including `reservation-context-analysis.json`, original snapshots and receipts.
 The diagnostic and all mixer/scheduler defaults remain unchanged.
+
+
+### Joining reservation gaps to audio-worker service
+
+A separate cohort uses the same frozen kernel/modules/workload and enables the
+existing four-clock `audio timing` probe separately for each capture. Its largest
+sixteen slow worker cycles are reset per phase and joined by guest-clock
+interval to the reservation pairs. No scheduling, lead, batching or queue-capacity
+policy changes. Added clock reads mean this is diagnostic evidence, not a
+performance comparison with the preceding cohort.
+
+Positive matches inside the audio-rate snapshot brackets include:
+
+| Phase | Reservation | Intersubmission gap | Worker late-sleep lower bound | Current mixer service |
+| --- | ---: | ---: | ---: | ---: |
+| Firefox alone before | 5,632 B | 40.605 ms | 30.435 ms | 66.494 μs |
+| Both, prefix on C | 4,608 B | 54.260 ms | 44.213 ms | 55.184 μs |
+| Both, prefix on C | 1,904 B | 49.131 ms | 39.078 ms | 60.298 μs |
+| Firefox alone after | 4,632 B | 50.525 ms | 40.442 ms | 141.576 μs |
+| Firefox alone after | 3,608 B | 49.892 ms | 39.837 ms | 62.019 μs |
+
+Each reservation's complete copy/position bracket lies inside the matching
+worked mixer-service record. These particular gaps are dominated by elapsed
+time before the current service, rather than lengthy copying/current service.
+“Sleep” includes block-entry/return overhead, IRQ and host descheduling; its
+excess over setup plus ten milliseconds is not continuously runnable latency.
+The next targeted measurement must separate deadline→ready, ready→dispatch and
+dispatch→worker resume. No margin reduction or extra waiting follows from this.
+
+Another 109.008-ms gap contains a worked cycle with an 89.040-ms late-sleep
+portion, then a later accepted submission. That intervening call is positive
+service evidence, not proof of an empty source queue: no receipt can also mean
+rejection or unavailable completion slots. The reopened-Quake phase's 74.335-ms
+gap has only 26.520 ms of positive late-sleep coverage and 37.632 ms uncovered;
+it is not assigned the same dominant cause. A further matched 37.641-ms gap is
+outside the stricter audio-rate snapshot brackets and remains diagnostic-only.
+
+All eight service phases are present, with stable worker identity/control epoch,
+valid clock ordering, no saturation or contention and no excluded slow cycles.
+The absence of a slow event still does not prove timely/empty normal cycles.
+Thirty of thirty-four reservations retain pairs; four recovery-phase pairs are
+explicitly overwritten. Intervals are clipped/unioned, the late subset is not
+double-counted with sleep, and uncovered time remains unknown. Both four-second
+loaded captures lie inside every bounded thirty-second CPU worker interval.
+
+All nine original guest jobs, controller and VM owner exit zero, with complete
+identity/output/EOF, empty groups, four clean filesystems, heap and policy gates.
+Firefox loops the complete resource without errors and media hashes/transfers
+reconcile. A subsequent cleanup episode records three runtime clamps; the
+[positive native debt trace](runtime-debt-observation.md#first-complete-positive-native-history)
+now replays exactly but **runtime acceptance fails**. Raw results are under
+`build/reviews/unattended-reservation-service-mlfq-a-20261021/mixed-prefix-control/`,
+including `reservation-service-join.json`, recording gaps and all original
+receipts. Mixer/scheduler defaults remain unchanged.

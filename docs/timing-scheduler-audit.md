@@ -5,6 +5,19 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
+- [Worker/reservation joins](audio-delivery-diagnostics.md#joining-reservation-gaps-to-audio-worker-service)
+  positively match several 40–54-ms audio gaps to 30–44-ms excess worker sleep,
+  followed by only 55–142 μs of current service. This locates elapsed time before
+  service, without distinguishing timer/wakeup, queue or host delay. Targeted
+  wake attribution is next; no lead/default changes.
+
+- [Positive native debt history](runtime-debt-observation.md#first-complete-positive-native-history)
+  finally captures one 17.89-μs episode across three clamps and two owner changes,
+  with retained catchup and exact independent replay. A checked-in actual-ledger
+  regression preserves its intermediate debts and 44,619-ns final credit.
+  Runtime acceptance remains failed; the mechanism capture does not prove true
+  per-task host-steal attribution or waive historical gates.
+
 - [Guarded shared-prefix batching](audio-shared-prefix.md) has a narrow positive
   off/on/off control: enabled finite-source completion is about 0.95 nominal
   versus 0.91/0.86 disabled, with reduced short tails/quiet gaps, exact drains
