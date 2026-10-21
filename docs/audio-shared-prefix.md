@@ -258,3 +258,73 @@ The two repetitions strengthen the narrow audio-progress finding, but full
 acceptance and all default changes remain withheld. The next diagnostic enables
 runtime history before the first Quake launch, separately from performance
 comparisons, to seek the missing positive recurrence and ownership trace.
+
+
+## Reverse order, observed drains and a complete browser loop
+
+A further fresh VM reverses the order to on/off/on, keeping the frozen kernel,
+all thirteen modules, policy, physical backend and application settings fixed.
+This is a **separate fixture cohort**: it adds an independent guest HTTP
+length/hash probe, explicit 60-second per-write media timeout and transfer
+accounting. The historical server's ten-second write timeout remains the
+command-line default. Source bytes and page sampling are unchanged. Guest
+fetching before Firefox may warm host/source state, so this cohort is not pooled
+with the earlier off/on/off measurements.
+
+After each mode control, a source snapshot captures every current stream's
+submitted-frame target. Later snapshots must show those targets completed in
+the same identities/epochs, with no discontinuities, before the usual 1.1-second
+warmup. The three main transitions observe completion in roughly 618–626 ms;
+capture starts a further 1.75–1.78 seconds later. These are observed cached
+source-credit boundaries, not physical speaker latency guarantees. They replace
+an assumed drain with checked FIFO progress.
+
+| Setting | Firefox / Quake nominal audio completion | Firefox media / page second | Firefox video callbacks / page second | Quake swaps / guest second |
+| --- | --- | --- | --- | --- |
+| On A | 0.8376 / 0.6858 | 0.8344 | 5.39 | 7.71 |
+| Off B | 0.6279 / 0.5437 | 0.6255 | 5.22 | 7.70 |
+| On C | 0.8421 / 0.6833 | 0.8393 | 5.20 | 8.22 |
+
+Both enabled main captures exercise substantial shortening: 314/340 accepted
+receipts, 127,820/136,570 accepted prefix frames and 19/18 headroom bypasses.
+Firefox's missing-short shares are 3.07%/29.76%/2.06%. Quake's missing-empty
+shares are 27.91%/43.98%/30.67%. All contribution and histogram identities hold
+without omissions, invalid records, epoch changes or saturation. This reversed
+response strengthens the mixer finding despite advancing attract/video scenes.
+It is not proof of a frame-pacing improvement: Quake p95 times vary
+239.4/192.0/164.6 ms, and video callbacks barely change.
+
+HDA reservations remain a failed performance requirement: main reserved
+bytes/events are 64,696/9, 9,856/4 and 6,984/3. There is no consistent
+reservation-free or inactive-output improvement. Enabled-only loaded audio
+completion is 0.9110/0.7286 and 0.8786/0.7064 with Quake/Firefox focus;
+these still lack matched disabled load controls. Guards and lead margins stay
+unchanged; this result does not justify adding waits or reducing headroom.
+
+The independent guest download receives exactly 28,013,968 bytes with SHA-256
+`0ad4cc105e1600a91c686d8517ca4f059411c2cfc2d6c907d0206e8197a47aed`.
+Its HTTP 200/full-file response explicitly ignores the requested range. That
+verifies the probe's bytes, not Firefox's separate channel/cache. Firefox's own
+GET independently completes full-length matching server writes over about
+75.44 host seconds. Both logged media GETs reconcile with two terminal
+transfer records. The running server predates the later handler-joining fix;
+this reconciliation is essential to exclude missing daemon-thread records.
+Successful writes alone still do not prove guest receipt.
+
+Firefox subsequently plays through the 120.028-second resource and loops,
+with a retained position of 119.9995 seconds before wrap, no trace errors or
+ambiguous gaps, audio enabled, playbackRate one and readyState four. All eight
+measured browser windows are valid. Combined with the two earlier timeout/error
+coincidences and the timeout-free repeat, this supports fixture truncation as
+a cause to investigate rather than attributing the old demux errors to Brook.
+It does not causally prove every earlier failure or certify general seeking,
+all media formats or smooth playback.
+
+All nine original guest jobs have exit zero, complete identities/output/EOF
+and empty groups; original controller/VM owner exit zero, all four filesystem
+checks, heap, current runtime/debt, policy ledger/ready-count and delivery
+validity gates pass. Older positive runtime clamps remain failed. Evidence is
+`build/reviews/unattended-mixed-prefix-order-mlfq-a-20261021/mixed-prefix-control/`,
+including checked source drains, full-transfer reconciliation, the browser loop,
+raw trace/PCM and original receipts. Full audio/mixed-desktop acceptance remains
+incomplete, and both mixer and scheduler defaults are unchanged.

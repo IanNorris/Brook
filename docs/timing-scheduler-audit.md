@@ -14,10 +14,16 @@ Later evidence supersedes several early leads:
   is unproven, HDA reservations persist, and the final browser/reopen window
   reports a media-read error. An identical fresh repeat reproduces the audio
   reversal but records a 16.7-μs runtime clamp during the first Quake launch,
-  before batching is enabled. Full acceptance therefore fails; positive runtime
-  history is the next diagnostic. It remains default off. Phase variance and
-  capture granularity stay explicit. Review-driven retry/completion tests and
-  the corrected fail-fast full build pass all 74 hosted suites.
+  before batching is enabled. A reversed on/off/on cohort with observed source
+  drains repeats the audio effect (0.84/0.69→0.63/0.54→0.84/0.68), with clean
+  current runtime gates and a verified full Firefox media loop. Its explicit
+  longer server-write bound and byte/transfer checks are a separate fixture
+  cohort; older timeout/media errors remain retained. HDA reservations persist,
+  so full audio acceptance and default promotion remain withheld. An early-history
+  diagnostic records 12.12 million events without reproducing the clamp; it
+  does not clear positive failures. Phase variance and capture granularity stay
+  explicit. Review-driven retry/completion tests and the corrected fail-fast
+  full build pass all 74 hosted suites.
 
 - [Accepted mix contributions](audio-mix-contributions.md) now classify actual
   receipt prefixes without changing PCM policy. In two native independent-writer
