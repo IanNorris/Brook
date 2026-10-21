@@ -180,7 +180,10 @@ static void MlfqTimesliceExpired(void* state, uint16_t pid) {
     if(p.earlyPreemption){p.earlyPreemption=false;return;}
     const uint64_t quantum=MLFQ_TIMESLICE[p.priority]*1000000;
     p.usedNs=p.usedNs>=quantum?p.usedNs-quantum:0;
-    if (p.priority < MLFQ_PRIORITY_LOW)ChangePriority(s,pid,p.priority+1);
+    // Band zero is reserved for critical kernel work (including PMM reclaim).
+    // Expiry rotates its peers and consumes budget, but must not turn it into
+    // an ordinary interactive task that can be starved by application load.
+    if (p.priority > 0 && p.priority < MLFQ_PRIORITY_LOW)ChangePriority(s,pid,p.priority+1);
 }
 
 static void MlfqVoluntaryYield(void* state, uint16_t pid) {

@@ -230,13 +230,16 @@ TEST(round_robin_fairness) {
 }
 
 TEST(no_starvation_all_get_time) {
-    // Even with different priorities, every process must eventually run.
-    // Simulate with Tick calls to trigger anti-starvation boosts.
+    // Ordinary application bands must not starve one another. Band zero is
+    // reserved for bounded critical kernel work, not an always-runnable app.
+    // Its peer rotation and return to ordinary work after blocking are tested
+    // separately; strict reserved priority cannot promise app service while
+    // enough reserved tasks remain permanently runnable to occupy every CPU.
     static constexpr int N = 16;
     static constexpr int TOTAL_PICKS = 5000;
 
     for (uint16_t i = 0; i < N; i++)
-        ops->InitProcess(state, i, (uint8_t)(i % 4)); // mixed priorities
+        ops->InitProcess(state, i, (uint8_t)(1 + i % 3)); // ordinary mixed priorities
     for (uint16_t i = 0; i < N; i++)
         ops->Enqueue(state, i);
 
@@ -557,7 +560,7 @@ TEST(mlfq_model_interleaved_cpus) {
         const unsigned cpu=(random>>8)%CPUS,action=random%5;
         const uint16_t pid=(random>>16)%N,old=current[cpu];
         if(action==0 && old!=NONE) {
-            if(priority[old]<3)++priority[old];ops->TimesliceExpired(state,old);
+            if(priority[old]>0 && priority[old]<3)++priority[old];ops->TimesliceExpired(state,old);
             uint16_t expected=pick(),actual=ops->PickNext(state);ASSERT(actual==expected);
             if(actual!=NONE) {
                 running[old]=false;enqueue(old);ops->Enqueue(state,old);
@@ -777,6 +780,33 @@ TEST(mlfq_demotion) {
     ASSERT(ops->PickNext(state) == 0); // 0 is LOW, picked second
 }
 
+TEST(mlfq_realtime_budget_preserves_band_and_rotates_peers) {
+    ops->InitProcess(state,1,0);ops->InitProcess(state,2,0);
+    ops->InitProcess(state,3,1);ops->InitProcess(state,4,2);
+    for (uint16_t pid=1;pid<=4;++pid) ops->Enqueue(state,pid);
+    uint16_t current=ops->PickNext(state);ASSERT(current==1);
+    for (unsigned turn=0;turn<100;++turn) {
+        ops->AccountService(state,current,5000000);
+        ASSERT(ops->ShouldPreempt(state,current,0));
+        ops->TimesliceExpired(state,current);
+        ASSERT(ops->Timeslice(state,current)==5); // reserved band survives expiry
+        const auto next=ops->PickNext(state);
+        ASSERT(next==(current==1?2:1)); // peers still rotate at the quantum
+        ops->Enqueue(state,current);current=next;
+    }
+    // Blocking is not an admission to the ordinary interactive band either.
+    ops->VoluntaryYield(state,current);ASSERT(ops->Timeslice(state,current)==5);
+    const auto other=ops->PickNext(state);ASSERT(other==(current==1?2:1));
+    ops->VoluntaryYield(state,other);ASSERT(ops->Timeslice(state,other)==5);
+    ASSERT(ops->PickNext(state)==3);ASSERT(ops->PickNext(state)==4);
+    // Expiry keeps excess consumed service, including for a reserved task.
+    ops->AccountService(state,current,12000000);
+    ASSERT(ops->ShouldPreempt(state,current,0));ops->TimesliceExpired(state,current);
+    ASSERT(ops->ShouldPreempt(state,current,0));ops->TimesliceExpired(state,current);
+    ASSERT(!ops->ShouldPreempt(state,current,100000));
+    ASSERT(ops->Timeslice(state,current)==5);
+}
+
 TEST(mlfq_boost) {
     ops->Init(state);
     // Process demoted to LOW, then boost should bring it back to HIGH.
@@ -961,6 +991,7 @@ static void RunMlfqTests(const SchedOps* ops, void* state) {
     invoke_mlfq_decision_observations(ops,state);
     invoke_mlfq_priority_ordering(ops,state);
     invoke_mlfq_demotion(ops,state);
+    invoke_mlfq_realtime_budget_preserves_band_and_rotates_peers(ops,state);
     invoke_mlfq_boost(ops,state);
     invoke_mlfq_timeslice_by_priority(ops,state);
     invoke_mlfq_voluntary_yield_boosts(ops,state);

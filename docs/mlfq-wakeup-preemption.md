@@ -172,3 +172,30 @@ Broader
 desktop/gaming acceptance, adversarial yield
 behavior and direct EEVDF eligibility/debt diagnostics remain open. This is an
 optional policy improvement, not a default scheduler decision.
+
+## Reserved kernel band on quantum expiry
+
+The loaded MLFQ policy also demoted priority zero to ordinary HIGH on expiry.
+This contradicted the reserved-kernel-band contract in `sched_policy.h` and the
+pure policy, and the PMM drainer's explicit priority-zero admission to avoid
+reclamation starvation. Expiry now consumes the same five-millisecond budget
+and rotates reserved peers without demoting that band. Excess consumed service
+remains charged. Ordinary-band demotion and the default scheduler are unchanged.
+
+The focused regression fails on the previous module at its first quantum
+expiry and passes after the change. It checks 100 peer rotations with ordinary
+competitors queued, preservation across blocking, ordinary picks once the
+reserved tasks block, and multiple-quantum debt. The 100,000-operation SMP queue
+model now reflects this rule. The general no-starvation test covers the three
+ordinary application bands; its old workload included permanently runnable
+reserved tasks. Strict reserved priority cannot promise application progress
+when reserved work permanently occupies every CPU. Kernel work in that band
+must therefore be bounded or block. This is an explicit limitation, not a
+general starvation guarantee.
+
+Evidence is retained in `mlfq-realtime-before.log`,
+`mlfq-realtime-after.log` (the old starvation assumption fails), and
+`mlfq-realtime-after-2.log` beneath
+`build/workloads/timing-scheduler-20261020`. Astra reviewed the production
+policy change read-only. Native workload impact on the reported stutter has
+not yet been established.
