@@ -564,3 +564,16 @@ checks and four offline filesystem checks pass. Quake raw swap data is
 hash-checked after shutdown. An additional fresh baseline/candidate comparison
 remains useful given historical host-environment variability. Scheduler
 promotion and unresolved timing/audio findings remain outside these passes.
+
+A fresh baseline/candidate repetition confirms the main effect: marker spans
+23.550/13.771 s, post-warmup SDL rates 25.612/43.707 per second, median
+49.963/22.470 ms and p95 50.260/33.577 ms. Both actual SDL interval ranges
+are zero. The maximum interval is 98.847/117.267 ms, so improved typical
+cadence does not establish elimination of long stalls. Original wrappers and
+controllers exit zero, raw traces match their saved hashes, runtime counters
+are zero and four filesystem checks pass for each image. The ordered repeat
+uses the same frozen control and candidate, private host QEMU, probes, demo,
+CPU/memory/scheduler/audio configuration and Wayland tracing; it is not a
+randomized or statistically powered trial. Receipts and reconciliation are in
+`reboot-resume/poll-readers-replication/comparison.json` and the two
+`unattended-poll-reader-{control,fixed}-gpu-1ms-fixed-mlfq-b-20261021/` reviews.
