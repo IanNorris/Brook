@@ -81,6 +81,12 @@ Later evidence supersedes several early leads:
   mechanism attribution, not RR quantum tuning or a default-policy change.
   [GPU poll controls](scheduler-lock-attribution.md) separately fail with both
   PAUSE and NOP; zero KVM PV-yield counters do not exclude PLE-driven yields.
+- [Per-VM PAUSE-exit controls](kvm-pause-exit-control.md) now isolate suppression
+  without changing guest PAUSE loops or host-global settings. A same-private-
+  QEMU four-cell experiment gives vCPUs much more host execution when exits are
+  suppressed, but audio still faults with blocking accounting and remains badly
+  underfed with try accounting. This is not a production workaround. All four
+  runtime/lifecycle/filesystem gates pass; application audio acceptance does not.
 
 RR remains the default, with no further RR tuning planned. MLFQ and EEVDF are
 optional. Remaining acceptance includes default-path and broader desktop/game
