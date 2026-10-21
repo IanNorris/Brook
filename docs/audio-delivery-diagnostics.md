@@ -1709,3 +1709,78 @@ now replays exactly but **runtime acceptance fails**. Raw results are under
 `build/reviews/unattended-reservation-service-mlfq-a-20261021/mixed-prefix-control/`,
 including `reservation-service-join.json`, recording gaps and all original
 receipts. Mixer/scheduler defaults remain unchanged.
+
+### Separating deadline, ready, dispatch and worker resumption
+
+`unattended-reservation-wake-mlfq-a-20261021` retains the same frozen kernel,
+old thirteen modules, physical PipeWire callback path and 12-KiB lead. It adds
+the existing one-worker ready watch and BSP timer probe in three selected
+phases: Firefox alone before Quake, both applications with prefix on C, and
+Firefox after Quake. Ready timing samples **all** enqueue/dispatch operations,
+not just the watched PID. This is a separate diagnostic cohort with observer
+cost; its performance numbers are not pooled with uninstrumented controls.
+
+Both clock-domain snapshots report pvclock on all eight CPUs, identical origins
+(`origin_ns=2302485800`, `origin_ms=754`), no rejected samples or adjustments,
+and unchanged LAPIC calibration. A deadline tick maps to
+`origin_ns + (deadline_tick_ms - origin_ms) * 1000000`; multiplying the absolute
+tick alone would use the wrong clock origin. The ten-ms sleep deadline must
+also fall within the setup-clock bounds after allowing millisecond rounding.
+Worker PID/incarnation, reset generations and probe epochs remain consistent.
+
+Seventeen retained slow cycles uniquely match a ready event and a timer scan:
+nine of nine before Quake, eight of ten after it. Each converted deadline falls
+inside the matching timer's previous-arrival→arrival gap. Across these records:
+
+| Interval | Observed range |
+| --- | ---: |
+| Deadline → timer-handler arrival | 21.621–91.086 ms |
+| Handler arrival → ready observation | 12.899–42.340 μs |
+| Ready → dispatch bookkeeping | 4.295–13.947 μs |
+| Dispatch bookkeeping → worker resumption | 1.974–22.325 μs |
+
+For example, one 100.396-ms intersubmission gap ends in a 15,616-byte silence
+reservation. Its current service contains the complete receipt; the worker
+deadline precedes timer-handler arrival by 91.086 ms, ready publication follows
+24.809 μs later, queue wait is 13.947 μs, and worker resumption follows after
+5.597 μs. Eleven reservations match current service in these seventeen cycles;
+ten lie entirely inside the stricter audio-rate snapshot brackets. One is
+outside those brackets and remains diagnostic-only.
+
+This positively locates these worker delays before timer-handler arrival,
+rather than in ready-queue scheduling or the subsequent context switch.
+`ready_ns` follows queue insertion; `dispatch_ns` precedes the completed switch.
+The later integer `late_ms` sample is not substituted for the ready clock.
+Scan containment is temporal association, not independent proof of the unique
+wake source. IRQ gaps alone cannot distinguish masked interrupts, late delivery,
+pre-entry delay or host scheduling. Small separately sampled steal deltas do
+not provide an atomic host-delay decomposition. Interrupted RIPs include idle,
+lock-release, block, futex and GPU-module locations; these are arrival contexts,
+not proof that each location consumed the preceding gap.
+
+Two recovery cycles remain unmatched and are not assigned a cause. The mixed
+on-C phase has no retained slow worker/watch/timer records; this is not proof
+of absence of shorter delays. Largest-slow-event buffers are not timelines.
+
+The reusable analyzer checks clock origins, identity/control epochs, record
+ordering and queue conservation. It rejects stale intermediate worker records
+and reservation intervals, and preserves absent/ambiguous matches. Eight
+focused tests cover known nonzero-origin segments, missing/duplicate records,
+incorrect deadlines/order, corrupted durations and stale joins. Reproduce after
+the reservation/service analysis with:
+
+```sh
+python3 scripts/workloads/analyze_audio_wake.py \
+  build/reviews/unattended-reservation-wake-mlfq-a-20261021/mixed-prefix-control \
+  --output build/reviews/unattended-reservation-wake-mlfq-a-20261021/mixed-prefix-control/audio-wake-join.json
+python3 scripts/test_analyze_audio_wake.py
+```
+
+All nine original guest jobs, controller and VM owner exit zero with complete
+identity/output/EOF and empty groups. Four filesystem checks, heap and policy
+gates pass; Firefox completes the error-free loop and resource hashes/transfers
+reconcile. **Runtime acceptance fails two clamped samples** in one 8,374-ns
+correction episode with one owner transition and catchup. Cleanup history starts
+after that episode and does not capture it; its clean replay does not clear the
+failure. The earlier complete positive native history remains the mechanism
+regression. No scheduler, lead, batching or wake-scan default changes follow.

@@ -5,11 +5,14 @@
 The chronological entries below retain their original experimental scope.
 Later evidence supersedes several early leads:
 
-- [Worker/reservation joins](audio-delivery-diagnostics.md#joining-reservation-gaps-to-audio-worker-service)
-  positively match several 40–54-ms audio gaps to 30–44-ms excess worker sleep,
-  followed by only 55–142 μs of current service. This locates elapsed time before
-  service, without distinguishing timer/wakeup, queue or host delay. Targeted
-  wake attribution is next; no lead/default changes.
+- [Targeted wake joins](audio-delivery-diagnostics.md#separating-deadline-ready-dispatch-and-worker-resumption)
+  match seventeen slow audio-worker cycles to ready records and BSP timer scans.
+  Deadlines are 21.62–91.09 ms overdue at handler arrival, followed by only
+  4.30–13.95 μs queued and 1.97–22.33 μs to worker resumption. Ten associated
+  reservations lie inside the audio-rate brackets. This locates these delays
+  before timer-handler arrival, without distinguishing interrupt masking,
+  delivery or host delay. Two unmatched cycles stay unknown. Runtime acceptance
+  fails two clamps; no lead/default changes.
 
 - [Positive native debt history](runtime-debt-observation.md#first-complete-positive-native-history)
   finally captures one 17.89-μs episode across three clamps and two owner changes,
