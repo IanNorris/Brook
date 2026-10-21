@@ -8,10 +8,16 @@ Later evidence supersedes several early leads:
 - [Guarded shared-prefix batching](audio-shared-prefix.md) has a narrow positive
   off/on/off control: enabled finite-source completion is about 0.95 nominal
   versus 0.91/0.86 disabled, with reduced short tails/quiet gaps, exact drains
-  and clean current accounting/lifecycle gates. It remains default off pending
-  real browser/game testing; phase variance and capture granularity remain
-  explicit. Review-driven retry/completion tests and the corrected fail-fast
-  full build pass all 74 hosted suites.
+  and clean current accounting/lifecycle gates. The first real Firefox/Quake
+  off/on/off sequence improves concurrent audio completion from 0.63/0.54 to
+  0.85/0.70, reversing to 0.62/0.54 when disabled. Video/frame-time improvement
+  is unproven, HDA reservations persist, and the final browser/reopen window
+  reports a media-read error. An identical fresh repeat reproduces the audio
+  reversal but records a 16.7-μs runtime clamp during the first Quake launch,
+  before batching is enabled. Full acceptance therefore fails; positive runtime
+  history is the next diagnostic. It remains default off. Phase variance and
+  capture granularity stay explicit. Review-driven retry/completion tests and
+  the corrected fail-fast full build pass all 74 hosted suites.
 
 - [Accepted mix contributions](audio-mix-contributions.md) now classify actual
   receipt prefixes without changing PCM policy. In two native independent-writer

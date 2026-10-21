@@ -96,3 +96,22 @@ failed build and corrected verification logs are preserved under
 `build/workloads/timing-scheduler-20261021/shared-prefix/`, including
 `final-host-build.log`, `verified-host-build.log` and `verified-host-tests.log`.
 This corrects test evidence; production runtime accounting is unchanged.
+
+
+## Positive counter episode during a mixed-app repeat
+
+The later [shared-prefix real-app repeat](audio-shared-prefix.md#fresh-real-app-repeat)
+records one clamp during the first Quake launch, before the experiment is enabled.
+CPU 4's wall pair advances 28,567 ns and its steal pair 45,293 ns, leaving
+16,726 ns of known debt. Counters subsequently record one catchup and one owner
+transition; known debt is zero at the first mixed capture and final snapshot.
+This demonstrates the new counters observing a native positive episode, not
+correct attribution or a complete native history replay. History was enabled
+only for cleanup, after the event, and remains negative for that later interval.
+The runtime acceptance gate fails without a tolerance; the next targeted
+collection must enable history before the first game launch.
+
+The original evidence is
+`build/reviews/unattended-mixed-prefix-mlfq-b-20261021/mixed-prefix-control/runtime-final.json`
+and the phase snapshots beside it. Earlier clean runs do not supersede this
+failure or earlier cross-policy clamps.
