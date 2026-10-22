@@ -343,3 +343,77 @@ should attribute the long between-swap intervals to the main thread's syscalls,
 GPU lock waits and scheduled/runnable time, retaining host response versus guest
 return timing where needed. No discarded upload or notification experiment
 changes the default configuration.
+
+### GPU timestamp capability and cube instrumentation
+
+The slower layer-damage experiment is parked on
+`wip/layer-damage-experiment-20261022` (`88875cf2`). The independent quiet-window
+invalidation fix is retained on the baseline (`8de68d6c`). Rebuilding that ABI 34
+baseline passes all 86 hosted suites. Native timestamp tests use the separate
+`timestamp-baseline-frozen` capsule, kernel
+`3d1c279d005174f4ffe0fe23837b75578570f1686ef15473f43821a73167f818`.
+
+The opt-in `BROOK_VULKAN_TIMESTAMPS` correctness probe now retains GPU timestamps
+around upload, compute and readback, CPU submit/completion brackets and optional
+calibrated device/guest-monotonic samples with advertised maximum deviation.
+Query reads follow the existing completion wait, use availability flags and add
+no blocking query wait. Timestamp writes introduce pipeline dependencies, so the
+measurements are instrumented intervals, not exclusive execution costs.
+
+Both host Intel and native Venus return 36 valid timestamp bits with an
+83.3333359 ns period and support calibrated guest monotonic timestamps. Native
+default, timestamp and timestamp-plus-sync-fd modes all pass the existing
+transfer/compute/readback and offscreen triangle correctness checks. The three
+single-dispatch GPU intervals are 0.087–0.092 ms, while CPU submit-to-completion
+return spans 0.765–8.324 ms. This establishes a working measurement mechanism,
+not the cause of Quake/cube hitches. The first native calibration advertises
+0.911 ms maximum deviation; its uncertainty must remain attached to estimates.
+The sync-fd mode intentionally uses 256 dispatches rather than one, so it is
+not a throughput comparison against ordinary mode.
+
+Evidence is in `timestamp-capability-off-gpu-1ms-fixed-mlfq-a-20261022` under
+`timestamp-control-b`. The original launcher and corrected controller exit zero
+and four offline filesystem checks are clean; runtime sampling ends with zero
+clamps/invalid samples/backwards clocks. The first `/bin/VKTIME` request failed
+before creating a process; a retained path diagnostic identified
+`/boot/BIN/VKTIME`, then separate tracked commands exercised the corrected path.
+
+The separate `tools/vulkan-cube-timing-pkg` instruments the pinned Khronos cube
+with a bounded two-slot query pool reused only after its existing frame fence.
+It records CPU fence/acquire/prepare/submit/present intervals and GPU start/end
+ticks without per-frame allocation/output or an additional blocking wait. Final
+queries drain after the cube's existing idle wait. The trace fails analysis on
+query errors, unavailable results, missing frames, overflow or reversed clocks.
+Cube GPU values are currently durations only; the capability probe's clock
+calibration is not automatically transferred to another process or device.
+
+The first cube capture completes with 600/600 submitted, available query pairs,
+zero errors and zero overflow. Both original control and instrumented processes,
+the controller and VM launcher exit zero; all four offline filesystem checks
+are clean. Raw CSV size and SHA-256 match guest metadata after extraction. The
+runtime census ends with zero clamps, invalid samples or backwards clocks.
+
+| Cube interval | Median | p95 | Maximum |
+| --- | ---: | ---: | ---: |
+| GPU start to end | 1.54 ms | 6.39 ms | 15.92 ms |
+| CPU acquire call | 15.74 ms | 26.48 ms | 45.91 ms |
+| CPU submit call | 0.029 ms | 12.08 ms | 31.91 ms |
+| Present-return interval | 17.45 ms | 29.79 ms | 46.10 ms |
+
+At the longest present-return interval (frame 105), acquire takes 45.91 ms while
+the same frame's GPU interval is 0.76 ms. This directs the next investigation to
+swapchain-image availability, Wayland callback/release timing and scheduling
+delays, rather than assuming shader cost dominates that hitch. The cube uses
+its default FIFO presentation: approximately one refresh of acquire waiting is
+expected, so eliminating all acquire waits is not a correctness target. CPU
+stages include descheduling, and GPU/CPU intervals overlap. Wayland's existing
+aggregate trace records a 46 ms maximum callback request/commit delay on this
+cube surface, but per-event correlation is still required for causal attribution.
+
+Evidence is `cube-timestamps-off-gpu-1ms-fixed-mlfq-a-20261022` under
+`cube-control/timestamps/{cube-timestamps.csv,analysis.json}`. The same separate
+diagnostic binary runs once without timestamps and once with them; whole-app
+host durations are 16.83 and 16.35 seconds, including startup/shutdown and
+observer RPCs. These are not frame throughput measurements or a complete
+instrumentation-overhead assessment. No scheduler defaults or buffer-release
+ownership rules change.

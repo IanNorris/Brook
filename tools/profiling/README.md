@@ -60,3 +60,60 @@ python3 scripts/test_drm_ioctl_trace.py
 Only the opt-in preload environment activates these probes. They do not change
 normal application launchers or VM settings. Keep instrumented results separate
 from uninstrumented throughput controls.
+
+## Vulkan timestamp capability probe
+
+Build `nix-build tools/vulkan-probe-pkg --no-out-link` and run its
+`bin/vulkan-probe --expect-driver venus` inside a private Venus VM with
+`BROOK_VULKAN_TIMESTAMPS=1`. This opt-in mode brackets upload, compute and
+readback in the existing three-round correctness workload. It reads query
+availability after the existing completion wait, without `WAIT_BIT` or a new
+queue-idle operation. Default mode has no query pool or timestamp writes.
+`BROOK_VULKAN_SYNC_FD=1` additionally exercises the existing external sync-file
+completion path with data checked before the ordinary fence wait.
+
+The final JSON retains raw GPU ticks, queue valid-bit width, timestamp period,
+CPU timestamps around submit and completion return, and two calibration samples
+when `VK_EXT_calibrated_timestamps` advertises device and `CLOCK_MONOTONIC`
+domains. Missing calibration is explicit; unsupported timestamp queues fail the
+requested probe. Inspect the complete exit/result before analysis:
+
+```sh
+python3 scripts/workloads/analyze_vulkan_timestamps.py /absolute/path/result.json
+python3 scripts/test_vulkan_timestamps.py
+```
+
+These are instrumented GPU intervals, including stalls and dependencies, not
+exclusive hardware-engine costs. Boundary timestamps can affect pipeline
+overlap. CPU calls include descheduling. Calibrated estimates retain each
+sample's advertised maximum deviation; the guest monotonic domain does not
+establish host clock alignment. This short, offscreen capability test does not
+measure cube pacing, the compositor, WSI or physical presentation. Use bounded
+query rings and deferred reads when extending it to real frame workloads.
+
+## Timestamped Vulkan cube
+
+`nix-build tools/vulkan-cube-timing-pkg --no-out-link` builds a separate
+instrumented version of the pinned Khronos `vkcube` (the C executable).
+Set `BROOK_CUBE_TRACE=/tmp/unique-cube.csv` in its guest environment and use a
+bounded run such as `--wsi wayland --c 600`. The trace is written exclusively at
+normal teardown. Without that variable it allocates no timestamp pool.
+
+The query pool has two pairs, matching the cube's existing two frame slots.
+Results are read after each slot's existing fence wait and before reuse; final
+slots are collected after its existing device-idle wait. An 8,192-row fixed
+array avoids per-frame allocation and output. The CSV records CPU wait, acquire,
+prepare, submit and present markers alongside GPU start/end ticks. Metadata
+retains errors and overflow, and each row retains submission/availability state.
+After clean shutdown, offline filesystem checks and extraction/hash validation:
+
+```sh
+python3 scripts/workloads/analyze_cube_timing.py /absolute/path/cube.csv
+```
+
+The cube defaults to FIFO presentation, so normal acquire blocking is expected.
+Investigate outliers rather than treating every acquire wait as wasted time.
+Its GPU intervals can include semaphore dependencies; CPU/GPU durations overlap
+and must not be summed. Cube traces currently have no clock calibration or
+scanout timestamp. Keep an uninstrumented control and assess observer overhead
+before using these results as a throughput benchmark.

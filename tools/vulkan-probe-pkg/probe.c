@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <poll.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -63,6 +64,7 @@ static void json_string(const char* text)
     fprintf(stderr, "VULKAN_PROBE_ERROR %s result=%d\n", #call, status); goto cleanup; } } while (0)
 
 #include "triangle.h"
+#include "timestamps.h"
 
 int main(int argc, char** argv)
 {
@@ -73,6 +75,8 @@ int main(int argc, char** argv)
         fprintf(stderr, "usage: vulkan-probe [--expect-driver hardware|intel|venus]\n"); return 2;
     }
     int passed = 0;
+    const int timestamping = getenv("BROOK_VULKAN_TIMESTAMPS") != NULL;
+    ProbeTiming timing = {0};
     const int externalSync=getenv("BROOK_VULKAN_SYNC_FD")!=NULL;
     int exportedFd=-1;
     VkSemaphore exportedSemaphore=VK_NULL_HANDLE;
@@ -117,14 +121,35 @@ int main(int argc, char** argv)
     for (uint32_t i = 0; i < families; ++i)
         if (queues[i].queueCount && ((queues[i].queueFlags & (VK_QUEUE_COMPUTE_BIT|VK_QUEUE_GRAPHICS_BIT)) == (VK_QUEUE_COMPUTE_BIT|VK_QUEUE_GRAPHICS_BIT))) { family = i; break; }
     if (family == UINT32_MAX) goto cleanup;
+    if (timestamping) {
+        timing.bits = queues[family].timestampValidBits;
+        timing.period = properties.limits.timestampPeriod;
+        if (!timing.bits || timing.bits > 64 || !(timing.period > 0)) {
+            fprintf(stderr, "VULKAN_PROBE_ERROR timestamp support unavailable\n"); goto cleanup;
+        }
+    }
+    const int calibration = timestamping && timing_calibration_supported(instance, physical);
     float priority = 1;
     VkDeviceQueueCreateInfo queueInfo = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority };
-    const char* deviceExtensions[]={VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME};
+    const char* deviceExtensions[2];
+    uint32_t extensionCount = 0;
+    if (externalSync) deviceExtensions[extensionCount++] = VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME;
+    if (calibration) deviceExtensions[extensionCount++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
     VkDeviceCreateInfo deviceInfo = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &queueInfo,
-        .enabledExtensionCount=externalSync?1:0,.ppEnabledExtensionNames=deviceExtensions };
+        .enabledExtensionCount=extensionCount,.ppEnabledExtensionNames=deviceExtensions };
     CHECK_VK(vkCreateDevice(physical, &deviceInfo, NULL, &device));
+    if (timestamping) {
+        VkQueryPoolCreateInfo info = {.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType=VK_QUERY_TYPE_TIMESTAMP, .queryCount=ROUNDS * TIMING_POINTS};
+        CHECK_VK(vkCreateQueryPool(device, &info, NULL, &timing.pool));
+        if (calibration) {
+            timing.calibrate = (PFN_vkGetCalibratedTimestampsEXT)vkGetDeviceProcAddr(device, "vkGetCalibratedTimestampsEXT");
+            if (!timing.calibrate) goto cleanup;
+        }
+        CHECK_VK(timing_calibrate(device, &timing));
+    }
     if(externalSync) {
         VkExportSemaphoreCreateInfo exportInfo={.sType=VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
             .handleTypes=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
@@ -191,6 +216,10 @@ int main(int argc, char** argv)
         CHECK_VK(vkResetCommandBuffer(command, 0));
         VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         CHECK_VK(vkBeginCommandBuffer(command, &begin));
+        if (timestamping) {
+            vkCmdResetQueryPool(command, timing.pool, round * TIMING_POINTS, TIMING_POINTS);
+            vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timing.pool, round * TIMING_POINTS);
+        }
         VkBufferCopy copy = { .size = bytes };
         vkCmdCopyBuffer(command, upload.buffer, storage.buffer, 1, &copy);
         VkMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -201,6 +230,7 @@ int main(int argc, char** argv)
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &barrier, 0, NULL, 0, NULL);
+        if (timestamping) vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing.pool, round * TIMING_POINTS + 1);
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &set, 0, NULL);
         vkCmdPushConstants(command, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(seed), &seed);
@@ -217,16 +247,20 @@ int main(int argc, char** argv)
         barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 1, &barrier, 0, NULL, 0, NULL);
+        if (timestamping) vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing.pool, round * TIMING_POINTS + 2);
         vkCmdCopyBuffer(command, storage.buffer, readback.buffer, 1, &copy);
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                              0, 1, &barrier, 0, NULL, 0, NULL);
+        if (timestamping) vkCmdWriteTimestamp(command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timing.pool, round * TIMING_POINTS + 3);
         CHECK_VK(vkEndCommandBuffer(command));
         CHECK_VK(vkResetFences(device, 1, &fence));
         VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .commandBufferCount = 1, .pCommandBuffers = &command,
             .signalSemaphoreCount=externalSync?1:0,.pSignalSemaphores=&exportedSemaphore };
+        if (timestamping && !monotonic_ns(&timing.cpu[round][0])) goto cleanup;
         CHECK_VK(vkQueueSubmit(queue, 1, &submit, fence));
+        if (timestamping && !monotonic_ns(&timing.cpu[round][1])) goto cleanup;
         if(externalSync) {
             VkSemaphoreGetFdInfoKHR info={.sType=VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
                 .semaphore=exportedSemaphore,.handleType=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
@@ -241,6 +275,10 @@ int main(int argc, char** argv)
             close(exportedFd);exportedFd=-1;
         } else {
             CHECK_VK(vkWaitForFences(device, 1, &fence, VK_TRUE, 10000000000ULL));
+        }
+        if (timestamping) {
+            if (!monotonic_ns(&timing.cpu[round][2])) goto cleanup;
+            CHECK_VK(timing_read(device, &timing, round));
         }
         if (!(readback.flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
             VkMappedMemoryRange range = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
@@ -260,6 +298,7 @@ int main(int argc, char** argv)
         // Readback above must be correct BEFORE this ordinary fence wait.
         if(externalSync)CHECK_VK(vkWaitForFences(device,1,&fence,VK_TRUE,10000000000ULL));
     }
+    if (timestamping) CHECK_VK(timing_calibrate(device, &timing));
     CHECK_VK(render_triangle(device,physical,&memory,queue,command,fence,&readback));
     CHECK_VK(vkDeviceWaitIdle(device));
     passed = 1;
@@ -269,6 +308,7 @@ cleanup:
         // Process/VM supervisors also bound failures where a driver cannot finish.
         if (!passed) (void)vkDeviceWaitIdle(device);
         if(exportedSemaphore)vkDestroySemaphore(device,exportedSemaphore,NULL);
+        if (timing.pool) vkDestroyQueryPool(device, timing.pool, NULL);
         if (fence) vkDestroyFence(device, fence, NULL);
         if (commands) vkDestroyCommandPool(device, commands, NULL);
         if (descriptors) vkDestroyDescriptorPool(device, descriptors, NULL);
@@ -283,8 +323,10 @@ cleanup:
     printf("{\"passed\":%s,\"device\":", passed ? "true" : "false"); json_string(properties.deviceName);
     printf(",\"driver\":"); json_string(driver.driverName);
     printf(",\"driver_id\":%u,\"vendor_id\":%u,\"device_id\":%u,\"words_per_round\":%u,\"rounds\":%u,"
-           "\"upload_memory_flags\":%u,\"readback_memory_flags\":%u,\"triangle_passed\":%s,\"sync_fd_readback\":%s}\n",
+           "\"upload_memory_flags\":%u,\"readback_memory_flags\":%u,\"triangle_passed\":%s,\"sync_fd_readback\":%s",
            driver.driverID, properties.vendorID, properties.deviceID, WORDS, passed ? ROUNDS : 0,
            upload.flags, readback.flags, passed ? "true" : "false", passed && externalSync ? "true" : "false");
+    if (timestamping) timing_print(&timing);
+    puts("}");
     return passed ? 0 : 1;
 }
