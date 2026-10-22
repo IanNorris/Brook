@@ -119,6 +119,11 @@ int ProcessFsSetCwd(Process* process,const VfsPath& path)
     FsContext* context=ProcessFsAcquire(process);int error=FsContextSetCwd(context,path);
     FsContextRelease(context);if(!error)ProcessFsRefreshDisplay(process);return error;
 }
+int ProcessFsSetResolvedCwd(Process* process,const VfsPath& path,const FsSnapshot& expected)
+{
+    FsContext* context=ProcessFsAcquire(process);int error=FsContextSetResolvedCwd(context,path,expected);
+    FsContextRelease(context);if(!error)ProcessFsRefreshDisplay(process);return error;
+}
 int ProcessFsSetInitialCwd(Process* process,const char* absolute)
 {
     if(!absolute || absolute[0]!='/')return -22;

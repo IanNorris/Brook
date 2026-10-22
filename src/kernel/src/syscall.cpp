@@ -10040,10 +10040,13 @@ static int64_t sys_umask(uint64_t newMask, uint64_t, uint64_t,
 static int64_t sys_chdir(uint64_t pathAddr,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
 {
     char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
-    AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
-    VfsPath cwd{};int error=VfsPathResolve(lookup.fs.root,lookup.start(),path,&cwd);
-    if(!error)error=ProcessFsSetCwd(ProcessCurrent(),cwd);
-    VfsPathRelease(cwd);return error;
+    for(unsigned attempt=0;attempt<8;++attempt) {
+        AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
+        VfsPath cwd{};int error=VfsPathResolve(lookup.fs.root,lookup.start(),path,&cwd);
+        if(!error)error=ProcessFsSetResolvedCwd(ProcessCurrent(),cwd,lookup.fs);
+        VfsPathRelease(cwd);if(error!=-EAGAIN)return error;
+    }
+    return -EAGAIN;
 }
 
 static int64_t sys_fchdir(uint64_t fd,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
@@ -14070,6 +14073,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_FSYNC]           = sys_fsync;
     g_syscallTable[SYS_FDATASYNC]       = sys_fsync;
     g_syscallTable[SYS_SYNC]            = sys_sync;
+    g_syscallTable[SYS_PIVOT_ROOT]      = sys_pivot_root;
     g_syscallTable[SYS_MOUNT]           = sys_mount;
     g_syscallTable[SYS_UMOUNT2]         = sys_umount2;
     g_syscallTable[SYS_GETCWD]          = sys_getcwd;

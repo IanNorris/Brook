@@ -197,6 +197,14 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
     }
     *out=ns;return 0;
 }
+int VfsMountNamespacePublishContext(MountNamespace* ns,const VfsPath& root,void (*publish)(void*),void* argument)
+{
+    if(!ns || !root.object || !root.attachment || !publish)return -22;
+    FileMutationGuard transaction;
+    if(ns->life.IsRetired() || !ns->root)return -3;
+    if(root.attachment!=ns->root || root.object->identity!=ns->root->rootIdentity || root.object->ops!=ns->root->rootObjectOps)return -11;
+    publish(argument);return 0;
+}
 int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
     const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv)
 {
@@ -381,6 +389,76 @@ int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath
     StrCopy(mount->fsType,static_cast<MountEntry*>(source.attachment)->fsType,sizeof(mount->fsType));
     g_mounts.Publish(mount);return 0;
 }
+int VfsMountNamespacePivotRoot(MountNamespace* ns,const VfsPath& oldRoot,const VfsPath& newRoot,const VfsPath& putOld)
+{
+    if(!ns || !oldRoot.object || !newRoot.object || !putOld.object)return -22;
+    FileMutationGuard transaction;
+    if(!ns->life.Published())return -3;
+    if(ns->initial)return -95; // initial legacy/kernel namespace stays fixed
+    auto* oldMount=static_cast<MountEntry*>(oldRoot.attachment);
+    auto* newMount=static_cast<MountEntry*>(newRoot.attachment);
+    auto* putMount=static_cast<MountEntry*>(putOld.attachment);
+    if(!oldMount || !newMount || !putMount)return -22;
+    if(oldMount!=ns->root || oldMount->owner!=ns || newMount->owner!=ns || putMount->owner!=ns ||
+       !VfsMountPublished(*oldMount) || !VfsMountPublished(*newMount) || !VfsMountPublished(*putMount))return -22;
+    if(newMount->lockedInherited)return -22;
+    if(newMount==oldMount || putMount==oldMount)return -16;
+    if(oldRoot.object->identity!=oldMount->rootIdentity || oldRoot.object->ops!=oldMount->rootObjectOps ||
+       newRoot.object->identity!=newMount->rootIdentity || newRoot.object->ops!=newMount->rootObjectOps ||
+       oldMount->covered.object || !newMount->covered.object)return -22;
+    VnodeStat stat{};
+    const VfsPath* directoryPaths[2]={&newRoot,&putOld};
+    for(const auto* path:directoryPaths) {
+        int error=VfsObjectStatLocked(path->object,&stat);if(error)return error;if(!stat.isDir)return -20;
+    }
+    bool reachable=false;int error=VfsBindContainsLocked(oldRoot,newRoot,&reachable);
+    if(error)return error;if(!reachable)return -22;
+    error=VfsBindContainsLocked(newRoot,putOld,&reachable);if(error)return error;if(!reachable)return -22;
+    char newLabel[512],putLabel[512];
+    if((error=VfsGlobalDirectoryLocked(newRoot,newLabel,sizeof(newLabel))))return error;
+    if((error=VfsGlobalDirectoryLocked(putOld,putLabel,sizeof(putLabel))))return error;
+    if(StrEq(newLabel,"/") || !VfsComponentPrefix(newLabel,putLabel))return -22;
+    const char* oldPrefix=putLabel+StrLen(newLabel);if(!*oldPrefix)oldPrefix="/";
+    VfsRenameLabels labels;
+    for(auto& mount:g_mounts) {
+        if(mount.owner!=ns || !VfsMountPublished(mount))continue;
+        bool movesWithNew=false;auto* ancestor=&mount;uint32_t depth=0;
+        for(;ancestor && depth<VFS_MAX_MOUNT_DEPTH;++depth) {
+            if(ancestor==newMount) {movesWithNew=true;break;}
+            ancestor=static_cast<MountEntry*>(ancestor->covered.attachment);
+        }
+        if(depth==VFS_MAX_MOUNT_DEPTH)return -40;
+        const char* prefix="";const char* suffix=mount.mountPoint;
+        if(movesWithNew) {
+            if(!VfsComponentPrefix(newLabel,suffix))return -2;
+            suffix+=StrLen(newLabel);if(!*suffix)suffix="/";
+        } else {
+            prefix=StrEq(oldPrefix,"/")?"":oldPrefix;
+            if(StrEq(suffix,"/"))suffix="";
+            if(!*prefix && !*suffix)suffix="/";
+        }
+        if(StrLen(prefix)+StrLen(suffix)>=sizeof(mount.mountPoint))return -36;
+        if((error=labels.Add(&mount,prefix,suffix)))return error;
+    }
+    struct Pivot {
+        MountNamespace* ns;MountEntry* oldMount;MountEntry* newMount;
+        VfsRenameLabels* labels;VfsPath putOld;VfsPath removedCover;
+    } pivot{ns,oldMount,newMount,&labels,putOld,{}};
+    VfsPathRetain(putOld);
+    auto publish=[](void* argument) {
+        auto& p=*static_cast<Pivot*>(argument);
+        // Registry -> metadata view. This callback is stores only; release the
+        // removed parent path after both short locks have been dropped.
+        MountViewGuard view;
+        p.removedCover=p.newMount->covered;p.newMount->covered={};
+        p.oldMount->covered=p.putOld;p.putOld={};
+        p.newMount->lockedInherited=p.oldMount->lockedInherited;p.oldMount->lockedInherited=false;
+        p.ns->root=p.newMount;
+        for(auto* c=p.labels->head;c;c=c->next)StrCopy(c->mount->mountPoint,c->label,sizeof(c->mount->mountPoint));
+    };
+    error=FsContextCommitRootMove(oldRoot,newRoot,publish,&pivot);
+    VfsPathRelease(pivot.putOld);VfsPathRelease(pivot.removedCover);return error;
+}
 int VfsMountNamespacePrivatePropagation(MountNamespace* ns,const VfsPath& target)
 {
     if(!ns || !target.object || !target.attachment)return -22;
@@ -400,9 +478,15 @@ int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target)
     if(!ns || !target.object || !target.attachment)return -22;
     FileMutationGuard transaction;
     if(!ns->life.Published())return -3;
-    auto* selected=static_cast<MountEntry*>(target.attachment);
+    // Mount syscalls operate on the top covering mount, even for a retained
+    // start path or ".". Ordinary directory-fd traversal keeps its existing
+    // view; only this mount target follows down (notably after self-pivot).
+    struct TargetLease {VfsPath value;~TargetLease(){VfsPathRelease(value);}} lease{target};
+    VfsPathRetain(lease.value);
+    if(int error=VfsEnterMountsLocked(&lease.value))return error;
+    auto* selected=static_cast<MountEntry*>(lease.value.attachment);
     if(!VfsMountPublished(*selected) || selected->owner!=ns ||
-       target.object->identity!=selected->rootIdentity || target.object->ops!=selected->rootObjectOps)return -22;
+       lease.value.object->identity!=selected->rootIdentity || lease.value.object->ops!=selected->rootObjectOps)return -22;
     if(selected==ns->root)return -95;
     if(selected->lockedInherited)return -22;
     // Pre-mark the subtree before changing parent edges, so recursive detach

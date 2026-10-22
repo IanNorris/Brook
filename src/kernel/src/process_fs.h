@@ -20,6 +20,7 @@ void ProcessFsFinishMountRetirement(MountNamespace* owned);
 FsContext* ProcessFsCopy(Process* process,int* error);
 int ProcessFsSnapshot(Process* process,FsSnapshot* out);
 int ProcessFsSetCwd(Process* process,const VfsPath& path);
+int ProcessFsSetResolvedCwd(Process* process,const VfsPath& path,const FsSnapshot& expected);
 int ProcessFsSetInitialCwd(Process* process,const char* absolute);
 int ProcessFsGetcwdFromVfsCallback(Process* process,char* out,uint32_t capacity);
 int ProcessFsGetcwd(Process* process,char* out,uint32_t capacity);

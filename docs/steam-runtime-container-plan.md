@@ -12,7 +12,9 @@ to tmpfs. The [fresh-instance foundation](tmpfs-foundation-checkpoint.md) and
 [bounded tmpfs backend](tmpfs-checkpoint.md) then supply independent memory
 filesystems with accounting and explicit mapping rejection. The subsequent [recursive bind checkpoint](recursive-bind-checkpoint.md) copies
 nested and stacked mount subtrees and advances unchanged bubblewrap to
-`pivot_root: Function not implemented`.
+`pivot_root: Function not implemented`. The subsequent
+[private root-relocation checkpoint](pivot-root-checkpoint.md) implements both
+pivot forms and advances the same binary to missing `/proc/self/mountinfo`.
 Remaining mount/root integration requires separate designs
 for write/mapping enforcement, tmpfs and root publication. There is no Brook login
 acceptance.

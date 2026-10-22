@@ -2,6 +2,7 @@
 #include "vfs_object.h"
 #include "vfs_path.h"
 #include "mount_namespace.h"
+#include "fs_context.h"
 #include "user_namespace.h"
 #include "mount_namespace_state.h"
 #if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)

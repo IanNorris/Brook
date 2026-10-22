@@ -58,6 +58,7 @@ static constexpr uint64_t SYS_FCNTL           = 72;
 static constexpr uint64_t SYS_FSYNC           = 74;
 static constexpr uint64_t SYS_FDATASYNC       = 75;
 static constexpr uint64_t SYS_SYNC           = 162;
+static constexpr uint64_t SYS_PIVOT_ROOT     = 155;
 static constexpr uint64_t SYS_MOUNT          = 165;
 static constexpr uint64_t SYS_UMOUNT2        = 166;
 static constexpr uint64_t SYS_GETCWD          = 79;

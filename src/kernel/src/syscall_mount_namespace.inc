@@ -72,3 +72,18 @@ static int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,
     if(!error)error=VfsMountNamespaceDetach(lookup.fs.mountNamespace,path);
     VfsPathRelease(path);return error;
 }
+
+static int64_t sys_pivot_root(uint64_t newRootAddr,uint64_t putOldAddr,uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    auto* process=ProcessCurrent();if(!process)return -EPERM;
+    char newName[512],oldName[512];
+    if(!CopyUserCString(newRootAddr,newName,sizeof(newName)) || !CopyUserCString(putOldAddr,oldName,sizeof(oldName)))return -EFAULT;
+    AtLookup lookup;if(int error=lookup.Init(-100,newName))return error;
+    auto* owner=VfsMountNamespaceUserOwnerAcquire(lookup.fs.mountNamespace);
+    bool authorized=ProcessCapable(process,owner,CapSysAdmin);UserNamespaceRelease(owner);
+    if(!authorized)return -EPERM;
+    VfsPath newRoot{},putOld{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,newName,&newRoot);
+    if(!error)error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,oldName,&putOld);
+    if(!error)error=VfsMountNamespacePivotRoot(lookup.fs.mountNamespace,lookup.fs.root,newRoot,putOld);
+    VfsPathRelease(putOld);VfsPathRelease(newRoot);return error;
+}

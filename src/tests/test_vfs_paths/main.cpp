@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 #include "process.h"
 #include "process_fs.h"
 #include "../../kernel/src/vfs.cpp"
@@ -308,6 +309,78 @@ static void testProcessContexts(const brook::VfsPath& root,const brook::VfsPath&
     VfsPathRelease(heldBind);FsSnapshotRelease(&isolatedFs);VfsDrainMountCleanup();
     ProcessFsClear(&parent);ProcessFsClear(&copy);ProcessFsClear(&shared);ProcessFsClear(&privateThread);
     assert(!parent.fsContext && !copy.fsContext && !shared.fsContext && !privateThread.fsContext);
+}
+static void testPivotRoots(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    auto allocated=allocations.size();auto records=g_mounts.count;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};
+    assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
+    auto a=resolve(root,root,"/ns-a"),b=resolve(root,root,"/ns-b"),target=resolve(root,root,"/ns-target");
+    assert(!VfsMountNamespaceBind(ns,a,target));auto newRoot=resolve(root,root,"/ns-target");
+    auto putOld=resolve(root,newRoot,"sub");
+    int error=0;auto* exact=FsContextCreate(root,root,022,&error,ns);assert(exact&&!error);
+    auto* descendant=FsContextCreate(root,a,077,&error,ns);assert(descendant&&!error);
+    FsContextRetain(exact); // shared CLONE_FS references remain one context
+    FsSnapshot stale{};assert(!FsContextSnapshot(exact,&stale));
+    bool succeeded=false;
+    for(long failure=0;failure<256;++failure) {
+        auto before=allocations.size();failAllocation=failure;
+        int result=VfsMountNamespacePivotRoot(ns,root,newRoot,putOld);failAllocation=-1;
+        if(!result) {succeeded=true;break;}
+        assert(result==-12);assert(allocations.size()==before);
+        FsSnapshot snap{};assert(!FsContextSnapshot(exact,&snap));assert(VfsPathSame(snap.root,root)&&VfsPathSame(snap.cwd,root)&&snap.revision==stale.revision);FsSnapshotRelease(&snap);
+        auto still=resolve(root,root,"/ns-target");assert(VfsPathSame(still,newRoot));VfsPathRelease(still);
+    }
+    assert(succeeded);
+    FsSnapshot snap{};assert(!FsContextSnapshot(exact,&snap));assert(VfsPathSame(snap.root,newRoot)&&VfsPathSame(snap.cwd,newRoot)&&snap.revision>stale.revision);FsSnapshotRelease(&snap);
+    assert(!FsContextSnapshot(descendant,&snap));assert(VfsPathSame(snap.root,newRoot)&&VfsPathSame(snap.cwd,a));FsSnapshotRelease(&snap);
+    assert(FsContextSetResolvedCwd(exact,root,stale)==-11);FsSnapshotRelease(&stale);
+    auto* obsolete=FsContextCreate(root,root,022,&error,ns);assert(!obsolete&&error==-11);
+    auto* copied=FsContextCopy(exact,&error);assert(copied&&!error);
+    auto oldLookup=resolve(newRoot,newRoot,"/sub");assert(VfsPathSame(oldLookup,root));VfsPathRelease(oldLookup);
+    expect(newRoot,newRoot,"..",newRoot);
+    auto marker=resolve(newRoot,newRoot,"/value");VnodeStat stat{};assert(!VfsPathStat(marker,&stat)&&stat.ino==101);VfsPathRelease(marker);
+    marker=resolve(newRoot,newRoot,"/sub/ns-target/value");assert(!VfsPathStat(marker,&stat)&&stat.ino==301);VfsPathRelease(marker);
+    char label[64];assert(!VfsPathDirectoryPath(root,label,sizeof(label))&&!std::strcmp(label,"/sub"));
+    // Retained fchdir is intentional and is never epoch-translated.
+    assert(!FsContextSetCwd(exact,root));assert(!FsContextSnapshot(exact,&snap));assert(VfsPathSame(snap.cwd,root)&&VfsPathSame(snap.root,newRoot));FsSnapshotRelease(&snap);
+    assert(!FsContextSetCwd(exact,newRoot));
+    // Alternative pivot('.', '.') stacks the old root on the new mount root.
+    auto onOldRoot=resolve(newRoot,newRoot,"/sub");assert(!VfsMountNamespaceBind(ns,b,onOldRoot));VfsPathRelease(onOldRoot);
+    auto second=resolve(newRoot,newRoot,"/sub");
+    std::vector<FsContext*> concurrentCopies;
+    std::atomic<unsigned> copiesStarted{0};std::atomic<bool> moveDone{false};
+    std::thread copier([&] {
+        for(unsigned i=0;i<256 && (!moveDone.load(std::memory_order_acquire)||i<32);++i) {
+            int copyError=0;auto* context=FsContextCopy(exact,&copyError);assert(context&&!copyError);
+            if(i%2)FsContextRelease(context);else concurrentCopies.push_back(context);
+            copiesStarted.fetch_add(1,std::memory_order_release);
+            std::this_thread::yield();
+        }
+    });
+    while(!copiesStarted.load(std::memory_order_acquire))std::this_thread::yield();
+    FsSnapshot beforeMove{};assert(!FsContextSnapshot(copied,&beforeMove));
+    std::atomic<bool> setReady{false};int setResult=0;
+    std::thread setter([&] {setReady.store(true,std::memory_order_release);setResult=FsContextSetResolvedCwd(copied,a,beforeMove);});
+    while(!setReady.load(std::memory_order_acquire))std::this_thread::yield();
+    assert(!VfsMountNamespacePivotRoot(ns,newRoot,second,second));
+    moveDone.store(true,std::memory_order_release);copier.join();setter.join();
+    assert(setResult==0 || setResult==-11);FsSnapshotRelease(&beforeMove);
+    for(auto* context:concurrentCopies) {
+        FsSnapshot state{};assert(!FsContextSnapshot(context,&state));
+        assert(VfsPathSame(state.root,second));FsSnapshotRelease(&state);FsContextRelease(context);
+    }
+    assert(!FsContextSnapshot(copied,&snap));assert(VfsPathSame(snap.root,second));
+    assert(VfsPathSame(snap.cwd,setResult==0?a:second));FsSnapshotRelease(&snap);
+    assert(!FsContextSnapshot(exact,&snap));assert(VfsPathSame(snap.root,second)&&VfsPathSame(snap.cwd,second));FsSnapshotRelease(&snap);
+    marker=resolve(second,second,"/value");assert(!VfsPathStat(marker,&stat)&&stat.ino==201);VfsPathRelease(marker);
+    auto dot=resolve(second,second,".");assert(VfsPathSame(dot,second));
+    assert(!VfsMountNamespaceDetach(ns,dot));VfsPathRelease(dot);
+    marker=resolve(second,second,"/value");assert(!VfsPathStat(marker,&stat)&&stat.ino==201);VfsPathRelease(marker);
+    FsContextRelease(copied);FsContextRelease(descendant);FsContextRelease(exact);FsContextRelease(exact);
+    VfsPathRelease(second);VfsPathRelease(putOld);VfsPathRelease(newRoot);VfsPathRelease(target);VfsPathRelease(a);VfsPathRelease(b);
+    VfsMountNamespaceLeave(ns);VfsDrainMountCleanup();VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
+    assert(allocations.size()==allocated && g_mounts.count==records);
 }
 static void testRecursiveBinds(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
     using namespace brook;
@@ -622,6 +695,7 @@ int main(){
     auto* initial=VfsMountNamespaceInitial();
     testFreshMounts(initial,stableRoot,originalTarget,aPath);
     testRecursiveBinds(initial,stableRoot);
+    testPivotRoots(initial,stableRoot);
     MountNamespace* parentNs=nullptr;VfsPath parentRoot{},parentCwd{};
     assert(!VfsMountNamespaceCopy(initial,stableRoot,originalSynthetic,&parentNs,&parentRoot,&parentCwd));
     assert(VfsMountNamespaceBind(parentNs,aPath,parentCwd)==-3);
