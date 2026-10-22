@@ -543,3 +543,43 @@ diagnostic uses existing QEMU `virtio_gpu_fence_ctrl` / `virtio_gpu_fence_resp`
 trace events and separate guest CPU captures to distinguish host fence dwell
 from guest completion-return delays. These are instrumented diagnostic windows,
 not another throughput control or a direct measure of exclusive GPU busy time.
+
+### Host fence diagnostic, 22 October
+
+One separate instrumented cohort records existing QEMU fence events in short
+solo and mixed windows, then captures guest CPU samples separately. Host logs
+are size/hash checked, fence IDs are unique, paired spans do not overlap and
+unpaired commands are confined to the enable/disable edges. QMP enables the two
+events separately, so an edge can contain a submission without its response.
+
+| Post-dispatch host fence span | Quake alone | With Firefox |
+| --- | ---: | ---: |
+| Measured trace span | 3.680 s | 3.478 s |
+| Complete fence pairs | 1,110 | 1,179 |
+| Fence span median | 1.416 ms | 1.211 ms |
+| Fence span p95 | 7.969 ms | 7.126 ms |
+| Fence span maximum | 20.157 ms | 20.225 ms |
+| Summed paired span / observed trace span | 65.8% | 64.1% |
+
+All paired commands are `SUBMIT_3D` (`0x207`). Source inspection matters here:
+`virtio_gpu_fence_ctrl` is emitted **after** command dispatch and immediately
+before fence insertion; `virtio_gpu_fence_resp` is emitted before publishing
+the guest response. These spans exclude initial dispatch and guest wake/return,
+and include GPU dependencies, QEMU polling and host scheduling. They are not
+exclusive GPU execution times. Frame records retain only first/last fence IDs
+and a count; other clients can interleave, so assigning every fence in that
+numeric range to the compositor would overcount its work.
+
+The solo CPU capture contains 2,370 samples and 20,113 context switches with
+no reported producer drops; many CPU leaf samples are idle. The mixed capture
+reports **39,367 dropped events** despite successful export/conversion. Retain
+it as lossy evidence, not a precise CPU or scheduler breakdown. The exact QEMU
+SDL source already requests `SDL_GL_SetSwapInterval(0)`; merely requesting zero
+again is not a supported explanation for the variance.
+
+Evidence is `gpu-host-fence-off-off-gpu-1ms-fixed-mlfq-a-20261022/gpu-host-fence-control`.
+Both original application runs, Firefox, controller and VM terminate, and all
+four offline filesystem checks pass. No synchronization/default changes result
+from this diagnostic. A final small experiment can test finer host fence-poll
+cadence against the existing 1-ms control, retaining guest ownership and timeout
+rules and explicitly measuring additional host CPU cost.
