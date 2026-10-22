@@ -668,3 +668,28 @@ offline script/report are under `build/workloads/mixed-desktop-20261022/astra-fo
 Astra endorses one finite off/on/off test of the existing guarded commit horizon,
 after both apps configure their original buffers, with settling time and exact
 identity/geometry checks. Keep it opt-in even if positive, then pivot to Steam.
+
+The finite off/on/off control is complete. Both clients retain their original
+IDs, epochs and geometry throughout: Firefox 4,416 client frames, Quake 4,096,
+and 4,096 downstream staging frames each. After settling between arms, the
+six-second windows show:
+
+| Horizon | Firefox missing contributions | Quake missing contributions | Completed frames/s (Firefox / Quake) |
+| --- | ---: | ---: | ---: |
+| Off A | 31.01% | 36.20% | 30,261 / 28,167 |
+| On B | 0% | 0% | 43,814 / 43,814 |
+| Off C | 30.66% | 35.57% | 30,540 / 28,397 |
+
+This is reversible evidence that committing sparse mixes ahead of asynchronous
+refill materially reduces source pacing. It is not a default-ready fix: the
+on arm adds four HDA silence reservations totalling 8,912 bytes (2,228 stereo
+frames, about 50.5 ms). PCM contains three silence runs of at least 1 ms, with
+a maximum of 17.4 ms, versus no such runs in either off arm. The browser fixture
+has insufficient samples to claim an independently measured media tempo.
+
+Evidence is `audio-admission-horizon-off-off-gpu-1ms-fixed-mlfq-a-20261022/audio-admission-horizon-control`,
+including `comparison.json`, `pcm-zero-run-comparison.json` and exact geometry.
+The horizon is restored off, all original jobs and the VM terminate, heap
+integrity passes, runtime error counters stay zero, and all four filesystem
+checks pass. Keep the horizon opt-in. Further GPU/audio tuning is deferred;
+the next bounded compatibility target is the Steam login screen.
