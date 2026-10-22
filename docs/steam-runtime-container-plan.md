@@ -4,8 +4,10 @@ Status (2026-10-22): the bounded mount-namespace and
 [user-namespace foundation](user-namespace-checkpoint.md) checkpoints are accepted
 after source review, Linux differential probes and native regression/teardown
 checks. The subsequent [unchanged bubblewrap checkpoint](bubblewrap-checkpoint.md)
-fixes missing overflow-ID reporting and identifies proc namespace handles as the
-next observed blocker. Remaining mount/root integration requires separate designs
+fixes missing overflow-ID reporting. The accepted
+[proc namespace-handle checkpoint](proc-namespace-handles.md) then advances the
+same executable to its unsupported mount-propagation operation (`make / slave`).
+Remaining mount/root integration requires separate designs
 for write/mapping enforcement, tmpfs and root publication. There is no Brook login
 acceptance.
 

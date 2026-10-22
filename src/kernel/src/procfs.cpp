@@ -1380,6 +1380,8 @@ static Vnode* MakePidDirectory(const ProcLookup& path, VnodeOps* ops)
     return vn;
 }
 
+static Vnode* MakeProcNsDirectory(const ProcessSnapshot&);
+
 void ProcFsInit() { SerialPuts("procfs: initialised\n"); }
 
 static uint8_t ProcMapKind(const char* name) {
@@ -1415,7 +1417,7 @@ Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
     if (StrEqProc(resolved, "net/sockstat")) return GenNetSockstat();
     ProcLookup path;
     if (!LookupProcPid(resolved, &path)) return nullptr;
-    if (!path.rest[0] || StrEqProc(path.rest, "fd")) return ProcFsOpenDir(resolved);
+    if (!path.rest[0] || StrEqProc(path.rest, "fd") || StrEqProc(path.rest,"ns")) return ProcFsOpenDir(resolved);
     for (uint32_t i = 0; i < NUM_PID_ENTRIES; ++i)
         if (StrEqProc(path.rest, g_pidEntries[i].name)) return g_pidEntries[i].gen(path.snap);
     if(auto kind=ProcMapKind(path.rest))return GenPidUserMap(path.snap,kind);
@@ -1439,7 +1441,7 @@ int ProcFsStatPath(const char* relPath, VnodeStat* st)
     { st->size = 0; st->isDir = false; return 0; }
     ProcLookup path;
     if (!LookupProcPid(resolved, &path)) return -1;
-    if (!path.rest[0] || StrEqProc(path.rest, "fd"))
+    if (!path.rest[0] || StrEqProc(path.rest, "fd") || StrEqProc(path.rest,"ns"))
     {
         st->size = 0; st->isDir = true;
         st->nlink = path.taskRoot ? 2 + path.snap.threadCount : 2;
@@ -1469,6 +1471,7 @@ Vnode* ProcFsOpenDir(const char* relPath)
     if (path.taskRoot) return MakePidDirectory(path, &g_procTaskDirOps);
     if (!path.rest[0]) return MakePidDirectory(path, &g_procPidDirOps);
     if (StrEqProc(path.rest, "fd")) return MakePidDirectory(path, &g_procFdDirOps);
+    if (StrEqProc(path.rest, "ns")) return MakeProcNsDirectory(path.snap);
     return nullptr;
 }
 
@@ -1521,11 +1524,11 @@ static int ProcPidReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
         *cookie = idx + 1;
         return 1;
     }
-    if(idx<NUM_PID_ENTRIES+3) {
-        const char* names[]={"uid_map","gid_map","setgroups"};
-        ProcStrCopy(out->name,names[idx-NUM_PID_ENTRIES],sizeof(out->name));out->size=0;out->isDir=false;*cookie=idx+1;return 1;
+    if(idx<NUM_PID_ENTRIES+4) {
+        const char* names[]={"uid_map","gid_map","setgroups","ns"};
+        ProcStrCopy(out->name,names[idx-NUM_PID_ENTRIES],sizeof(out->name));out->size=0;out->isDir=idx==NUM_PID_ENTRIES+3;*cookie=idx+1;return 1;
     }
-    idx-=3;
+    idx-=4;
     // After regular entries, emit "fd" directory
     auto* pp = static_cast<ProcPriv*>(vn->priv);
     if (idx == NUM_PID_ENTRIES || (idx == NUM_PID_ENTRIES + 1 && !pp->taskMember))
@@ -1533,7 +1536,7 @@ static int ProcPidReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
         ProcStrCopy(out->name, idx == NUM_PID_ENTRIES ? "fd" : "task", sizeof(out->name));
         out->size = 0;
         out->isDir = true;
-        *cookie = idx + 4;
+        *cookie = idx + 5;
         return 1;
     }
     return 0;
@@ -1598,6 +1601,7 @@ static Vnode* GenPidFdLink(uint16_t pid, int fd, uint64_t incarnation)
     return MakeProcVnode(buf, len);
 }
 
+#include "procfs_namespaces.inc"
 #include "procfs_objects.inc"
 
 } // namespace brook

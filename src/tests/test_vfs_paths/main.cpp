@@ -62,7 +62,8 @@ brook::Vnode* objectOpen(brook::VfsObject* object,int,int* error){
     *vn={};vn->ops=&nodeOps;vn->type=node(object).dir?brook::VnodeType::Dir:brook::VnodeType::File;vn->refCount=1;
     vn->backendObject=object;brook::VfsObjectRetain(object);return vn;
 }
-int objectFollow(brook::VfsObject* object,brook::VfsPath* out) {
+int objectFollow(const brook::VfsPath& path,brook::VfsPath* out) {
+    auto* object=path.object;
     *out={};if(node(object).target!="magic-reporting-only")return 0;
     *out=magicTarget;brook::VfsPathRetain(*out);return 1;
 }
@@ -501,6 +502,26 @@ int main(){
         if(copiedAfterFailures)break;
     }
     assert(copiedAfterFailures);
+    // A namespace FD is an active topology lease, unlike a directory path.
+    // The last task can leave while two independent namespace handles keep
+    // nested mounts searchable through a foreign retained directory.
+    MountNamespace* heldNs=nullptr;VfsPath heldRoot{},heldCwd{};
+    assert(!VfsMountNamespaceCopy(initial,stableRoot,aPath,&heldNs,&heldRoot,&heldCwd));
+    assert(!VfsMountNamespaceHandleAcquire(heldNs)); // never revive prepared state
+    assert(VfsMountNamespaceActivate(heldNs));
+    assert(VfsMountNamespaceIdentity(heldNs)!=VfsMountNamespaceIdentity(initial));
+    auto heldSub=resolve(heldRoot,heldCwd,"sub");
+    assert(!VfsMountNamespaceBind(heldNs,bPath,heldSub));VfsPathRelease(heldSub);
+    assert(VfsMountNamespaceHandleAcquire(heldNs));assert(VfsMountNamespaceHandleAcquire(heldNs));
+    VfsMountNamespaceLeave(heldNs);VfsDrainMountCleanup();
+    inode(heldRoot,heldCwd,"sub/value",201);
+    VfsMountNamespaceHandleRelease(heldNs);VfsDrainMountCleanup();
+    inode(heldRoot,heldCwd,"sub/value",201);
+    VfsMountNamespaceHandleRelease(heldNs);
+    assert(!VfsMountNamespaceHandleAcquire(heldNs)); // storage cannot revive retirement
+    VfsDrainMountCleanup();
+    VfsPath disappeared{};assert(VfsPathResolve(heldRoot,heldCwd,"sub/value",&disappeared)==-2);
+    VfsPathRelease(heldRoot);VfsPathRelease(heldCwd);VfsMountNamespaceRelease(heldNs);VfsDrainMountCleanup();
     // Less-privileged user owner pins its identity and locks inherited
     // attachments; stacking a fresh bind does not unlock the covered mount.
     auto* userOwner=static_cast<UserNamespace*>(kmalloc(sizeof(UserNamespace)));*userOwner={};userOwner->owner=1000;

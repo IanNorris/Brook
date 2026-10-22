@@ -160,6 +160,7 @@ struct MountEntry;
 struct MountNamespace {
     MountNamespaceState life;
     MountEntry* root=nullptr;
+    uint64_t identity=1; // initial namespace; private IDs never reused
     MountNamespace* retireNext=nullptr;
     bool initial=false;
     UserNamespace* userOwner=nullptr; // owned; immutable after activation

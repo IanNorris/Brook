@@ -66,6 +66,19 @@ int VfsMountNamespaceSetUserOwnerPrepared(MountNamespace* ns,UserNamespace* owne
     for(auto& mount:g_mounts)if(mount.owner==ns)mount.lockedInherited=true;
     UserNamespaceRelease(old);return 0;
 }
+uint64_t VfsMountNamespaceIdentity(MountNamespace* ns) { return ns?ns->identity:0; }
+bool VfsMountNamespaceHandleAcquire(MountNamespace* ns)
+{
+    if(!ns)return false;
+    VfsMountNamespaceRetain(ns);
+    if(!ns->life.TryJoin()) {VfsMountNamespaceRelease(ns);return false;}
+    return true;
+}
+void VfsMountNamespaceHandleRelease(MountNamespace* ns)
+{
+    if(!ns)return;
+    VfsMountNamespaceLeave(ns);VfsMountNamespaceRelease(ns);
+}
 bool VfsMountNamespaceActivate(MountNamespace* ns) { return ns && ns->life.ActivatePrepared(); }
 bool VfsMountNamespaceJoin(MountNamespace* ns) { return ns && ns->life.TryJoin(); }
 bool VfsMountNamespaceAbandon(MountNamespace* ns,bool wake)
@@ -143,7 +156,11 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
     validation=VfsObjectStatLocked(cwd.object,&stat);
     if(validation)return validation;if(!stat.isDir)return -20;
     void* memory=kmalloc(sizeof(MountNamespace));if(!memory)return -12;
-    auto* ns=::new(memory)MountNamespace();ns->userOwner=source->userOwner;UserNamespaceRetain(ns->userOwner);ns->life.RetainStorage(); // registry lease
+    auto* ns=::new(memory)MountNamespace();
+    static uint64_t nextIdentity=2;
+    if(nextIdentity==~uint64_t{0})__builtin_trap();
+    ns->identity=nextIdentity++;
+    ns->userOwner=source->userOwner;UserNamespaceRetain(ns->userOwner);ns->life.RetainStorage(); // registry lease
     VfsNamespaceCloneMap map;int error=0;
     for(auto* original=g_mounts.head;original;original=original->next) {
         if(original->owner!=source || !VfsMountPublished(*original))continue;

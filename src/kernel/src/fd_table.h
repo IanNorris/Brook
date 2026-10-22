@@ -56,6 +56,7 @@ enum class FdType : uint8_t
     CompositorScene, // Scene capability; fd aliases own a shared close handle
     SyncFile,      // Immutable completed GPU timeline fence, Linux sync_file ABI
     SignalFd,      // Read pending signals for the calling task through a shared mask
+    Path,          // O_PATH metadata-only VFS reference; never data I/O
 };
 
 struct FdEntry

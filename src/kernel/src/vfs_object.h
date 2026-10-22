@@ -42,8 +42,9 @@ struct VfsObjectOps {
     int (*directory_path)(VfsObject*,char* out,uint32_t capacity) = nullptr;
     // 0: ordinary textual symlink; 1: owned exact magic-link target in out;
     // negative: explicit unsupported/error. Called only for actual following,
-    // never for readlink reporting, within the namespace transaction.
-    int (*follow_link)(VfsObject*,VfsPath* out) = nullptr;
+    // never for readlink reporting, within the namespace transaction. Source is
+    // borrowed and pins its attachment, allowing exact pseudo-object targets.
+    int (*follow_link)(const VfsPath& source,VfsPath* out) = nullptr;
 };
 struct VfsObject {
     const VfsObjectOps* ops;

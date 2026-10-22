@@ -3076,7 +3076,7 @@ struct AtLookup {
         if(fd==-100)return 0;
         FdRef ref(ProcessCurrent(),fd);
         if(!ref)return -EBADF;
-        if(ref->type!=FdType::Vnode || !ref->handle)return -ENOTDIR;
+        if((ref->type!=FdType::Vnode && ref->type!=FdType::Path) || !ref->handle)return -ENOTDIR;
         auto* vnode=static_cast<Vnode*>(ref->handle);
         if(vnode->type!=VnodeType::Dir)return -ENOTDIR;
         return VfsPathFromVnode(vnode,&directory);
@@ -3138,6 +3138,19 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     bool hasSyntheticName=!at.SyntheticName(path,resolvedPath,sizeof(resolvedPath));
     const char* lookupPath=hasSyntheticName?resolvedPath:path;
     const char* syntheticPath=hasSyntheticName?resolvedPath:"";
+
+    if(flags&0x200000) { // O_PATH: retained metadata, never synthetic data I/O.
+        const uint64_t normalized=flags&(0x200000u|0x10000u|0x20000u);
+        int error=0;
+        auto* node=VfsOpenAt(at.fs.root,at.start(),path,VFS_O_METADATA,0,at.fs.mask,&error,!(flags&0x20000));
+        if(!node)return error?error:-ENOENT;
+        if((flags&0x10000) && node->type!=VnodeType::Dir) {VfsRelease(node);return -ENOTDIR;}
+        int fd=FdAlloc(proc,FdType::Path,node);
+        if(fd<0) {VfsRelease(node);return -EMFILE;}
+        proc->fds[fd].statusFlags=normalized;
+        proc->fds[fd].fdFlags=(flags&0x80000)?1:0; // FD_CLOEXEC
+        return fd;
+    }
 
     bool procFdPath = false;
     int procFdResult = OpenProcMemFd(proc, syntheticPath, flags, &procFdPath);
@@ -3549,7 +3562,7 @@ static int64_t sys_creat(uint64_t path,uint64_t mode,uint64_t,uint64_t,uint64_t,
 void FinalizeClosedFd(const FdClaimResult& c)
 {
     KernelOperationGuard operation(ProcessCurrent());
-    if (c.type == FdType::Vnode && c.handle)
+    if ((c.type == FdType::Vnode || c.type == FdType::Path) && c.handle)
     {
         auto* vn = static_cast<Vnode*>(c.handle);
         uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);
@@ -3787,6 +3800,7 @@ static void FdBumpRefcount(const FdEntry* fde)
             __atomic_fetch_add(&pipe->readers, 1, __ATOMIC_RELEASE);
         break;
     }
+    case FdType::Path:
     case FdType::Vnode:
         __atomic_fetch_add(&static_cast<Vnode*>(fde->handle)->refCount, 1, __ATOMIC_RELEASE);
         break;
@@ -3935,6 +3949,8 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     if(fde->type==FdType::SignalFd)return whence<=4?0:-EINVAL; // Linux noop_llseek
     if(fde->type==FdType::SyncFile)return -29; // ESPIPE
 
+    if(fde->type==FdType::Path)return -EBADF;
+    if(fde->type==FdType::Vnode && fde->handle && static_cast<Vnode*>(fde->handle)->type==VnodeType::Namespace)return -29;
     int64_t soff = static_cast<int64_t>(offset);
 
     switch (static_cast<int>(whence))
@@ -4089,6 +4105,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     FdRef descriptor(proc,static_cast<int>(fd));
     if (!descriptor) return -EBADF;
     auto* entry=descriptor.get();
+    if(entry->type==FdType::Path)return -EBADF;
     if (entry->type == FdType::MemFd && entry->handle) {
         if ((entry->statusFlags & 3) == 1 ||
             ((flags & MAP_SHARED) && (prot & 2) && (entry->statusFlags & 3) == 0)) return -13;
@@ -6553,8 +6570,10 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     if (!proc || fd >= MAX_FDS) return -EBADF;
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
-    if (!fde) return -EBADF;
+    if (!fde || fde->type==FdType::Path) return -EBADF;
 
+    if(fde->type==FdType::Vnode && fde->handle && static_cast<Vnode*>(fde->handle)->type==VnodeType::Namespace)
+        return cmd==0xb703?0x20000:-25; // NS_GET_NSTYPE; other namespace ioctls unsupported.
     if(fde->type==FdType::SyncFile) {
         if(!fde->handle)return -EBADF;
         if(cmd!=SYNC_FILE_INFO_IOCTL)return -25;
@@ -7564,7 +7583,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
-    if (fde->type == FdType::Vnode && fde->handle) {
+    if ((fde->type == FdType::Vnode || fde->type == FdType::Path) && fde->handle) {
         auto* vn = static_cast<Vnode*>(fde->handle);
         VnodeStat vs{};
         if (VfsStat(vn, &vs) < 0) return -EBADF;
@@ -7827,7 +7846,7 @@ static int64_t sys_fsync(uint64_t fd, uint64_t, uint64_t,
     if (!proc) return -EBADF;
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
-    if (!fde || fde->type == FdType::None) return -EBADF;
+    if (!fde || fde->type == FdType::None || fde->type==FdType::Path) return -EBADF;
 
     if (fde->type == FdType::Vnode && fde->handle)
         return VfsFsync(static_cast<Vnode*>(fde->handle));
@@ -8275,6 +8294,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
     if (!ref) return -EBADF;
     FdEntry* fde = ref.get();
 
+    if(fde->type==FdType::Path && cmd!=F_DUPFD && cmd!=F_DUPFD_CLOEXEC && cmd!=F_GETFD && cmd!=F_SETFD && cmd!=F_GETFL)return -EBADF;
     switch (static_cast<int>(cmd))
     {
     case 5: // F_GETLK
@@ -8452,6 +8472,7 @@ retry_poll:
         }
 
         // Regular files are always ready
+        if(fde->type==FdType::Path) {fds[i].revents=POLLNVAL;++ready;continue;}
         if (fde->type == FdType::Vnode)
         {
             if (fds[i].events & POLLIN)  fds[i].revents |= POLLIN;
@@ -9441,7 +9462,7 @@ static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
     if (!proc) return -EBADF;
     FdRef epref(proc, static_cast<int>(epfd));
     FdRef watchref(proc, static_cast<int>(watchfd));
-    if (!epref || !watchref) return -EBADF;
+    if (!epref || !watchref || epref->type==FdType::Path || watchref->type==FdType::Path) return -EBADF;
     if (epref->type != FdType::EpollFd || !epref->handle) return -EINVAL;
     if (op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD && op != EPOLL_CTL_DEL) return -EINVAL;
     auto* ep = static_cast<EpollInstance*>(epref->handle);
@@ -10029,7 +10050,7 @@ static int64_t sys_fchdir(uint64_t fd,uint64_t,uint64_t,uint64_t,uint64_t,uint64
     VfsPath cwd{};int error=0;
     { FdRef ref(proc,static_cast<int>(fd));
       if(!ref)return -EBADF;
-      if(ref->type!=FdType::Vnode || !ref->handle)return -ENOTDIR;
+      if((ref->type!=FdType::Vnode && ref->type!=FdType::Path) || !ref->handle)return -ENOTDIR;
       error=VfsPathFromVnode(static_cast<Vnode*>(ref->handle),&cwd); }
     if(!error)error=ProcessFsSetCwd(proc,cwd);
     VfsPathRelease(cwd);return error;
@@ -10185,6 +10206,7 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
     FdRef ref(proc, static_cast<int>(fd));
     if (!ref || !ref.get()->handle) return -EBADF;
     FdEntry* fde = ref.get();
+    if(fde->type==FdType::Path)return -EBADF;
     if (fde->type == FdType::Vnode) {
         if ((fde->statusFlags & 3) == 0) return -EINVAL;
         return VfsTruncate(static_cast<Vnode*>(fde->handle), length);
@@ -10257,8 +10279,8 @@ static int64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    FdEntry* entry = proc ? FdGet(proc, static_cast<int>(fd)) : nullptr;
-    if (!entry || !entry->handle) return -EBADF;
+    FdRef ref(proc,static_cast<int>(fd));FdEntry* entry=ref.get();
+    if (!entry || !entry->handle || entry->type==FdType::Path) return -EBADF;
     if (entry->type != FdType::Vnode) return -95; // EOPNOTSUPP
     return VfsChmod(static_cast<Vnode*>(entry->handle), static_cast<uint16_t>(mode & 07777));
 }
@@ -10307,9 +10329,10 @@ static int64_t sys_fchown(uint64_t fd, uint64_t uid, uint64_t gid,
                            uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    if (!proc || !ProcessCapable(proc,nullptr,CapChown)) return -EPERM;
+    if (!proc)return -EBADF;
     FdRef ref(proc, static_cast<int>(fd));
-    if (!ref) return -EBADF;
+    if (!ref || ref->type==FdType::Path) return -EBADF;
+    if(!ProcessCapable(proc,nullptr,CapChown))return -EPERM;
     if (ref->type != FdType::Vnode) return -95;
     return VfsChown(static_cast<Vnode*>(ref->handle), static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
 }
@@ -10717,7 +10740,7 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (!proc) return -EBADF;
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
-    if (!fde) return -EBADF;
+    if (!fde || fde->type==FdType::Path) return -EBADF;
     if (offset > 0x7fffffffffffffffULL) return -EINVAL;
     if (fde->type == FdType::MemFd && fde->handle) {
         if ((fde->statusFlags & 3) == 0) return -EBADF;
@@ -12188,7 +12211,7 @@ static int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (!proc) return -EBADF;
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
-    if (!fde) return -EBADF;
+    if (!fde || fde->type==FdType::Path) return -EBADF;
 
     if (offset > 0x7fffffffffffffffULL) return -EINVAL;
     if (count && !UserBufferWritable(bufAddr, count)) return -EFAULT;
@@ -13564,6 +13587,7 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
         case FdType::MemFd:
             if (src->handle) MemFdRef(static_cast<MemFdData*>(src->handle));
             break;
+        case FdType::Path:
         case FdType::Vnode:
             if (src->handle)
                 __atomic_fetch_add(&static_cast<Vnode*>(src->handle)->refCount,
@@ -13638,6 +13662,7 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap)
         case FdType::MemFd:
             MemFdUnref(static_cast<MemFdData*>(snap->handle));
             break;
+        case FdType::Path:
         case FdType::Vnode: {
             auto* vn = static_cast<Vnode*>(snap->handle);
             uint32_t prev = __atomic_fetch_sub(&vn->refCount, 1, __ATOMIC_ACQ_REL);

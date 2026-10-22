@@ -5,6 +5,11 @@ shipped bubblewrap unchanged, fixes its first reporting prerequisite, and record
 the remaining implementation boundaries. Bubblewrap has not launched its child
 command on Brook; Steam login remains unavailable.
 
+The subsequent accepted [proc namespace-handle checkpoint](proc-namespace-handles.md)
+resolves the proc access failure recorded below. The identical executable now
+stops at unsupported mount propagation (`Failed to make / slave: Invalid argument`).
+The observations here retain the earlier checkpoint history.
+
 ## Observed progress
 
 The private Steam payload's `srt-bwrap --version` reports bubblewrap 0.12.0.

@@ -7,14 +7,15 @@ namespace brook {
 // caller must own a storage reference throughout every operation below.
 //
 // Each task owns a member lease independently of FsContext sharing or snapshot
-// references. Last departure makes ALL this namespace's edges unsearchable at
+// references. Followed namespace handles also own active leases. The last active
+// task/handle departure makes ALL this namespace's edges unsearchable at
 // the release CAS. Retired records may remain on a deferred cleanup list, but
 // every lookup must check Published(); retaining storage never revives edges.
 // No callback, allocation, destructor, scheduler call or lock is taken here.
 class MountNamespaceState {
     static constexpr uint32_t Retired = uint32_t{1} << 31;
     uint32_t storageReferences_ = 1;
-    uint32_t members_ = 0; // zero is a private, prepared namespace, not published
+    uint32_t members_ = 0; // active tasks + namespace handles; zero is prepared
 public:
     MountNamespaceState() = default;
     MountNamespaceState(const MountNamespaceState&) = delete;

@@ -195,7 +195,7 @@ struct VfsRetainedProvider {
         VfsPathRelease(current);return -40;
     }
     int FollowLink(const VfsPath& path,VfsPath& out) {
-        out={};int result=path.object->ops->follow_link?path.object->ops->follow_link(path.object,&out):0;
+        out={};int result=path.object->ops->follow_link?path.object->ops->follow_link(path,&out):0;
         return result==1 && (!out.object || !out.attachment)?-5:result;
     }
     int Readlink(const VfsPath& path,char* out,uint32_t size) {

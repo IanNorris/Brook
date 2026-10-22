@@ -13,7 +13,7 @@
 namespace brook {
 
 // ---- Vnode types ----
-enum class VnodeType : uint8_t { File, Dir, Device };
+enum class VnodeType : uint8_t { File, Dir, Device, Namespace };
 
 struct Vnode;
 struct FileObject;

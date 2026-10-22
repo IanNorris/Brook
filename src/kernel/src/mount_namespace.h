@@ -3,6 +3,11 @@
 namespace brook {
 struct MountNamespace;
 struct UserNamespace;
+// Namespace handles own an active topology lease plus storage, independently
+// of task membership. Plain paths/snapshots retain storage only.
+bool VfsMountNamespaceHandleAcquire(MountNamespace* borrowed);
+void VfsMountNamespaceHandleRelease(MountNamespace* owned);
+uint64_t VfsMountNamespaceIdentity(MountNamespace* borrowed);
 UserNamespace* VfsMountNamespaceUserOwnerAcquire(MountNamespace* ns);
 int VfsMountNamespaceSetUserOwnerPrepared(MountNamespace* ns,UserNamespace* owner);
 // Storage references never count as live task membership. All returned paths
