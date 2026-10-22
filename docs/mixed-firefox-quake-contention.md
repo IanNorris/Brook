@@ -626,3 +626,45 @@ clock/scheduler findings remain open. Further work needs stronger attribution
 of interleaved client commands and guest wait/run delays before choosing a
 larger submission/completion redesign; the present evidence does not justify
 dropping a fence or changing ownership/timeout rules.
+
+### Astra review and audio admission attribution
+
+Astra recommends command-volume/dispatch attribution instead of more timer
+tuning. Offline analysis of the retained host diagnostic finds about 302
+complete fences/s solo versus 339/s mixed, while median inter-fence gaps fall
+from 801 to 661 us. Enclosed compositor rows average 9.97 versus 10.78 commands
+and 2.48 versus 2.96 fenced commands per frame. These short instrumented windows
+do not establish exact scene alignment or explain omitted unfenced/client work.
+The unmatched Linux display and fixture remain comparison confounds.
+
+The queue ledger also corrects the earlier broad description of "producer
+starvation." In the latest 1-ms mixed control, Firefox has 8,506/8,512 frames
+outstanding at both endpoints, only six available frames, and matching submitted
+and completed deltas. Quake has 640/798 available frames, below its 1,024-frame
+wake threshold. This is reduced source throughput with endpoint evidence of
+admission backpressure; low software occupancy alone does not show idle demand.
+
+The contribution diagnostic originally rejected valid outstanding queues larger
+than client capacity, overlooking configured downstream staging. Commit
+`84ebb513` passes staging into its captured preparation and uses the actual
+admission validator. Histogram thresholds still refer to original client
+capacity. The observed Firefox geometry is a regression test; impossible
+overcommit remains rejected. The host test and compiled entry/start audits pass.
+Audio admission, mixing, completion credit and defaults are unchanged.
+
+One new six-second mixed capture with that diagnostic-only fix records 275,200
+accepted output frames. Firefox contributes 188,802, missing 86,398 (31.4%);
+Quake contributes 173,036, missing 102,164 (37.1%). Every missing-frame weight is
+in the high-in-flight bin. HDA reports zero added silence reservations, zero
+unsafe/invalid records, and a minimum observed headroom of 39,352 bytes. Both
+streams finish near full admission. Sequential batch endpoints have explicit
+host brackets; contribution acceptance and physical completion are not the
+same boundary. This supports sparse contribution committed ahead of asynchronous
+refill, rather than attributing the entire problem to app CPU starvation.
+
+Evidence is `audio-admission-off-off-gpu-1ms-fixed-mlfq-a-20261022/audio-admission-control`;
+original jobs and VM terminate, with all four filesystem checks passing. The
+offline script/report are under `build/workloads/mixed-desktop-20261022/astra-followup`.
+Astra endorses one finite off/on/off test of the existing guarded commit horizon,
+after both apps configure their original buffers, with settling time and exact
+identity/geometry checks. Keep it opt-in even if positive, then pivot to Steam.
