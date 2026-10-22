@@ -1,6 +1,8 @@
 // Retained procfs directory identities. A PID number alone is never authority:
 // every per-task operation checks the captured incarnation. No Process strong
 // reference is kept (cwd=/proc/self must not create a Process ownership cycle).
+static constexpr uint32_t PROC_PID_EXE=5,PROC_PID_CWD=6,PROC_PID_ROOT=8;
+static_assert(NUM_PID_ENTRIES==9,"Update retained proc PID entry indices when changing the catalog");
 enum class ProcObjectKind : uint8_t { Root,Net,Pid,Task,Fds,GlobalFile,NetFile,PidFile,FdLink,Self,ThreadSelf };
 struct ProcObject {
     VfsObject object;
@@ -79,7 +81,7 @@ static int ProcObjectStat(VfsObject* object,VnodeStat* out)
     *out={};out->isDir=ProcObjectDirectory(value->kind);
     out->isSymlink=value->kind==ProcObjectKind::FdLink || value->kind==ProcObjectKind::Self ||
                    value->kind==ProcObjectKind::ThreadSelf ||
-                   (value->kind==ProcObjectKind::PidFile && (value->index==5 || value->index==6));
+                   (value->kind==ProcObjectKind::PidFile && (value->index==PROC_PID_EXE || value->index==PROC_PID_CWD || value->index==PROC_PID_ROOT));
     out->mode=out->isDir?0040555:out->isSymlink?0120777:0100444;
     out->ino=object->identity;out->dev=0x70726f63;out->nlink=out->isDir?2:1;
     return 0;
@@ -148,12 +150,16 @@ static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
     } else if(value->kind==ProcObjectKind::FdLink) {
         FdSnapshot fd{};if(!SchedulerGetFdInfo(value->pid,value->index,&fd,value->incarnation))return -2;
         ProcStrCopy(target,fd.path,sizeof(target));
-    } else if(value->kind==ProcObjectKind::PidFile && value->index==5) {
+    } else if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_EXE) {
         ProcStrCopy(target,snapshot.exePath,sizeof(target));
-    } else if(value->kind==ProcObjectKind::PidFile && value->index==6) {
+    } else if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_CWD) {
         Process* live=SchedulerFindProcessReference(value->pid);if(!live)return -2;
         int error=live->incarnation==value->incarnation?ProcessFsGetcwdFromVfsCallback(live,target,sizeof(target)):-2;
         ProcessUnref(live);if(error)return error;
+    } else if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_ROOT) {
+        FsSnapshot fs{};int error=ProcAcquireFsTarget(value->pid,value->incarnation,value->tgid,value->group,&fs);
+        if(!error)error=VfsPathDirectoryPathFromCallback(fs.root,target,sizeof(target));
+        FsSnapshotRelease(&fs);if(error)return error;
     } else return -22;
     uint32_t bytes=ProcStrLen(target);if(bytes>capacity)bytes=capacity;
     memcpy(out,target,bytes);return bytes;
@@ -204,20 +210,14 @@ static int ProcObjectFollow(VfsObject* object,VfsPath* out)
     // spelling preserves an executable/FD identity. Existing explicit proc FD
     // brokers remain separate; general magic FD/ELF following is unsupported.
     if(value->kind==ProcObjectKind::FdLink ||
-       (value->kind==ProcObjectKind::PidFile && value->index==5))return -95;
-    if(value->kind!=ProcObjectKind::PidFile || value->index!=6)return 0;
-    // A ptrace-style cross-process inspection policy is outside this slice.
-    // Export exact cwd targets only inside the current process/thread group;
-    // checking the target directory alone would bypass private ancestors.
-    Process* self=ProcessCurrent();ProcessSnapshot caller{};
-    if(!self || !SchedulerSnapshotProcess(self->pid,&caller) || caller.tgid!=value->tgid ||
-       caller.groupIncarnation!=value->group)return -13;
-    Process* live=SchedulerFindProcessReference(value->pid);if(!live)return -2;
-    FsSnapshot fs{};
-    int error=live->incarnation==value->incarnation && live->tgid==value->tgid &&
-              (live->isThread?live->leaderIncarnation:live->incarnation)==value->group?ProcessFsSnapshot(live,&fs):-2;
-    ProcessUnref(live);
-    if(!error) {*out=fs.cwd;fs.cwd={};}
+       (value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_EXE))return -95;
+    if(value->kind!=ProcObjectKind::PidFile ||
+       (value->index!=PROC_PID_CWD && value->index!=PROC_PID_ROOT))return 0;
+    FsSnapshot fs{};int error=ProcAcquireFsTarget(value->pid,value->incarnation,value->tgid,value->group,&fs);
+    if(!error) {
+        VfsPath& selected=value->index==PROC_PID_ROOT?fs.root:fs.cwd;
+        *out=selected;selected={};
+    }
     FsSnapshotRelease(&fs);return error?error:1;
 }
 static const VfsObjectOps g_procObjectOps={

@@ -271,3 +271,17 @@ the actual user/mount namespace and filesystem operations, source-confirmed
 i386/helper and hardlink fallbacks, and the reviewed object/lifetime design.
 Both comparison guests stop cleanly. This does not change Brook's container
 support or establish a Brook login window; implementation needs a separate scope.
+
+Retained proc root acceptance (2026-10-22): `/proc/self/root` now follows the
+exact retained FsContext root, with the same incarnation and thread-group
+checks as cwd. Native proc-root checks pass (34 Brook, 33 Linux), together
+with all seven filesystem/credentials/IPC regressions, 96 host tests and the
+compiled entry/scheduler audits. Unsupported clone namespace flags now fail
+explicitly instead of creating an ordinary process.
+
+Kernel `64ae922e1b0f6cbdfa1d5a9f8c2a234a3038fa843aa8a2f45a5f4e0012e70874`
+(ABI 38), review `steam-root-off-gpu-1ms-fixed-mlfq-a-20261022`, reaches
+`bwrap: prctl(PR_SET_NO_NEW_PRIVS) failed: Invalid argument`. The original
+Steam job exits 1 with no live tasks; no Brook login UI is established.
+The proc-FD directory warning remains separate. Heap integrity, checked
+shutdown, original wrapper exit and all four offline filesystem checks pass.

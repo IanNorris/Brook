@@ -4583,6 +4583,11 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     static constexpr uint64_t CLONE_VFORK           = 0x00004000;
     static constexpr uint64_t CLONE_CLEAR_SIGHAND   = 0x100000000ULL;
 
+    // Namespace requests must not fall through to an ordinary global-namespace
+    // fork. None of these isolation domains has an implementation yet.
+    constexpr uint64_t unsupportedNamespaces=0x00020000ULL|0x02000000ULL|0x04000000ULL|
+                                           0x08000000ULL|0x10000000ULL|0x20000000ULL|0x40000000ULL;
+    if(flags&unsupportedNamespaces)return -EINVAL;
     Process* parent = ProcessCurrent();
     if (!parent) return -ENOSYS;
 
@@ -4704,6 +4709,10 @@ static int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
         return -EFAULT;
 
     const CloneArgs* ca = reinterpret_cast<const CloneArgs*>(argsPtr);
+    const uint64_t cloneFlags=ca->flags;
+    // CLONE_NEWTIME occupies an exit-signal bit in legacy clone, but it is an
+    // independent unsupported namespace request in clone3.
+    if(cloneFlags&0x80)return -EINVAL;
 
     // Stack: clone3 passes base+size; clone expects the top (stack grows down)
     uint64_t stackTop = ca->stack;
@@ -4712,7 +4721,7 @@ static int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
 
     // Delegate to sys_clone with the same argument layout:
     //   flags, newStack, parentTidAddr, childTidAddr, tlsAddr
-    return sys_clone(ca->flags, stackTop, ca->parent_tid, ca->child_tid, ca->tls, 0);
+    return sys_clone(cloneFlags, stackTop, ca->parent_tid, ca->child_tid, ca->tls, 0);
 }
 
 // ---------------------------------------------------------------------------

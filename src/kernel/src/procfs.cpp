@@ -708,6 +708,32 @@ static Vnode* GenPidCwd(const ProcessSnapshot& proc)
     return MakeProcVnode(buf, len + 1);
 }
 
+// Proc magic targets are capabilities, not names. Export only inside the
+// caller's thread group until a cross-process inspection policy is available.
+static int ProcAcquireFsTarget(uint16_t pid,uint64_t incarnation,uint16_t tgid,uint64_t group,FsSnapshot* out)
+{
+    *out={};Process* self=ProcessCurrent();ProcessSnapshot caller{};
+    if(!self || !SchedulerSnapshotProcess(self->pid,&caller) || caller.tgid!=tgid ||
+       caller.groupIncarnation!=group)return -13;
+    Process* live=SchedulerFindProcessReference(pid);if(!live)return -2;
+    int error=live->incarnation==incarnation && live->tgid==tgid &&
+              (live->isThread?live->leaderIncarnation:live->incarnation)==group?ProcessFsSnapshot(live,out):-2;
+    ProcessUnref(live);return error;
+}
+// Legacy proc content generation is reporting only; normal following uses the
+// retained magic-link target below. Called within a VFS namespace transaction.
+static Vnode* GenPidRoot(const ProcessSnapshot& proc)
+{
+    FsSnapshot fs{};int error=ProcAcquireFsTarget(proc.pid,proc.incarnation,proc.tgid,proc.groupIncarnation,&fs);
+    char root[512]{};
+    if(!error)error=VfsPathDirectoryPathFromCallback(fs.root,root,sizeof(root));
+    FsSnapshotRelease(&fs);if(error)return nullptr;
+    uint32_t length=ProcStrLen(root);auto* buffer=static_cast<char*>(kmalloc(length+2));
+    if(!buffer)return nullptr;
+    memcpy(buffer,root,length);buffer[length]='\n';buffer[length+1]=0;
+    return MakeProcVnode(buffer,length+1);
+}
+
 // /proc/[pid]/limits — resource limits (Linux-compatible format)
 static Vnode* GenPidLimits(const ProcessSnapshot& /*proc*/)
 {
@@ -1209,6 +1235,7 @@ static ProcPidEntry g_pidEntries[] = {
     { "exe",     GenPidExe },
     { "cwd",     GenPidCwd },
     { "limits",  GenPidLimits },
+    { "root",    GenPidRoot },
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 
