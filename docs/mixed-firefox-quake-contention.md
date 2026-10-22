@@ -527,3 +527,19 @@ comparison finds only this experiment's changes. However, the new off arm is
 substantially slower than the earlier 58-FPS baseline. A repeat off arm is
 required before attributing the pair's difference to the timer. The experiment
 is not promoted, and desktop/GL/Vulkan/input acceptance remains incomplete.
+
+The subsequent unchanged off repeat (`phase-clock-off-off-gpu-1ms-fixed-mlfq-b-20261022`)
+returns **43.76 / 25.06 / 44.52 swaps/s** for solo/mixed/solo. Its mixed p95
+is 62.76 ms, close to the enabled arm's 60.66 ms. Both original owners exit
+zero, all four filesystem checks pass, and the extracted traces match guest
+sizes/hashes. Thus the apparent near-doubling in the first pair does **not**
+survive the control repeat and cannot be credited to phase preservation. Stop
+timer tuning here; retain the opt-in branch as an unproven experiment.
+
+The repeat's mixed source audio rates are 30.65k Firefox / 28.14k Quake frames/s
+and whole-QEMU CPU is 2.171–2.174 cores in the short observation. Mixed audio
+and the 60-solo/40-mixed acceptance targets remain unmet. The next bounded
+diagnostic uses existing QEMU `virtio_gpu_fence_ctrl` / `virtio_gpu_fence_resp`
+trace events and separate guest CPU captures to distinguish host fence dwell
+from guest completion-return delays. These are instrumented diagnostic windows,
+not another throughput control or a direct measure of exclusive GPU busy time.
