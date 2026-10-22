@@ -650,6 +650,8 @@ Process* KernelThreadCreate(const char* name, KernelThreadFn fn, void* arg,
 
 // Destroy a process and free all its resources.
 void ProcessDestroy(Process* proc);
+// Synchronous unwind before SchedulerAddProcess; never use for published tasks.
+void ProcessDiscardUnpublished(Process* proc);
 
 // BRO-173/175 liveness refcount.  ProcessRef takes a reference on a Process the
 // caller is about to hold a raw pointer to across a window where the reaper

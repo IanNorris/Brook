@@ -9,6 +9,7 @@
 
 #include "process.h"
 #include "posix_timer.h"
+#include "sysv_sem.h"
 #include "exec_limits.h"
 #include "exec_image.h"
 #include "scheduler.h"
@@ -1105,80 +1106,7 @@ void ProcessDestroy(Process* proc)
     if (proc) ProcessQueueDestroy(proc);
 }
 
-void ProcessDestroyNow(Process* proc)
-{
-    if (!proc) return;
-
-    PosixTimersCleanup(proc, false);
-    bool isThread = proc->isThread;
-
-    // Filesystem operations finish cooperatively before terminal publication;
-    // there are no abandoned mutexes or backend mutations to force-release.
-    ProcessReleaseFileFault(proc);
-
-    // Threads don't own FDs — the leader does. Kernel threads never had
-    // an fd table allocated (proc->fds is NULL), so skip the close loop
-    // for them as well; otherwise ProcessCloseAllFds would deref NULL.
-    if (!isThread && !proc->isKernelThread && proc->fds)
-        ProcessCloseAllFds(proc);
-
-    // Free the shared fd table once the leader (or fork root) is destroyed.
-    // Threads get their fds pointer cleared so the leader still sees the
-    // live table until its own ProcessDestroy runs.
-    if (!isThread && proc->fds)
-    {
-        kfree(proc->fds);
-        proc->fds = nullptr;
-    }
-    else if (isThread)
-    {
-        proc->fds = nullptr;
-    }
-
-    // Remove compositor/window references before retiring graphics backing.
-    // This finalizer runs on the cleanup worker, outside scheduler IRQ context.
-    if (!isThread)
-    {
-        CompositorUnregisterProcess(proc);
-        WmDestroyWindowForProcess(proc);
-        // Release the app's GPU (virgl) context, if it created one.
-        if (proc->gpuAppCtx > 0)
-        {
-            const brook::GpuAppOps* ga = brook::GpuAppGet();
-            if (ga && ga->CtxDestroy) ga->CtxDestroy(proc->gpuAppCtx);
-            proc->gpuAppCtx = 0;
-        }
-    }
-
-    // Address-space ownership, not PID-tag sweeps, retires mappings. Final
-    // AS release is queued independently and cannot touch a reused PID's pages.
-
-    // Free per-process kernel stack (each thread has its own).  This must be
-    // after teardown work that may still need helper calls using this proc.
-    if (proc->kernelStackBase)
-        VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase), KERNEL_STACK_PAGES);
-
-    // Clear signal handler slot so the PID can be safely reused without
-    // the next process inheriting our handler pointers (which would
-    // reference user memory no longer mapped and cause a #PF on signal).
-    //
-    // Signal handlers are shared across all threads in a thread group
-    // (CLONE_SIGHAND semantics) and indexed by tgid. Only clear when
-    // the leader (pid == tgid) is destroyed, otherwise a thread exiting
-    // before the leader would wipe the still-live process's handlers.
-    if (proc->pid == proc->tgid) {
-        ResetSignalActions(proc->tgid);
-    }
-
-    // Release the PID only after clearing its signal slots and exact resources.
-    SchedulerRemoveProcess(proc);
-
-    // Publish the final shared-address-space release only after thread cleanup.
-    if (isThread && !proc->isKernelThread)
-        SchedulerReleaseThreadAddressSpace(proc);
-
-    FreeProcessStruct(proc);
-}
+#include "process_destroy.inc"
 
 // ---------------------------------------------------------------------------
 // ProcessFork -- create a child process that is a copy of the parent.
@@ -1201,6 +1129,8 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
 
     // Copy entire parent process struct as a starting point
     memcpy(child, parent, sizeof(Process));
+    child->gpuAppCtx = 0; // Legacy GPU context belongs to the parent, not the fork.
+
     InheritCredentials(child, parent);
     child->sigPending = 0;
     memset(child->sigSenders, 0, sizeof(child->sigSenders));

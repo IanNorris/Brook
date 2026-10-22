@@ -233,6 +233,7 @@ add_executable(kernel
     src/user_copy_fault.cpp
     src/user_copy.S
     src/posix_timer.cpp
+    src/sysv_sem.cpp
     src/process.cpp
     src/memory/address_space.cpp
     src/memory/mapping_transaction.cpp

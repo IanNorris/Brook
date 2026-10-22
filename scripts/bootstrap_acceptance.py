@@ -27,9 +27,9 @@ import server
 # Independent expected inventory for the source revision under acceptance.
 # Keep this in step with src/tests/host/CMakeLists.txt; never accept whatever
 # count a partial build happens to report.
-NATIVE_TEST_COUNT = 62
+NATIVE_TEST_COUNT = 89
 # test_eevdf_module invokes test_eevdf a second time with the loadable policy.
-NATIVE_EXECUTABLE_COUNT = 61
+NATIVE_EXECUTABLE_COUNT = 88
 KERNEL_MODULE_COUNT = 13
 NATIVE_PASS_MARKER = f"100% tests passed, 0 tests failed out of {NATIVE_TEST_COUNT}"
 

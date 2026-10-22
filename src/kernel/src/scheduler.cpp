@@ -7,6 +7,7 @@
 #include "timer_irq_arrivals.h"
 #include "module.h"
 #include "posix_timer.h"
+#include "sysv_sem.h"
 #include "process.h"
 #include "panic.h"
 #include "cpu.h"
@@ -1605,6 +1606,7 @@ void SchedulerMarkTerminated(Process* proc, int waitStatus)
     // could retire this CPU forever with the hold still on its dead stack.
     SchedLockReleaseRaw(g_readyLock);
     PosixTimersCleanup(proc, false);
+    SysvSemExit(proc);
     if (offCpu) FutexCancelProcess(proc);
     ProcessUnref(proc);
     if (rlf & 0x200) __asm__ volatile("sti" ::: "memory");
