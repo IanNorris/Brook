@@ -445,3 +445,63 @@ virtual source binds currently fail EOPNOTSUPP in the core. Process-context
 storage, independent task member tokens at birth/logical exit, namespace-aware
 reporting and real syscall/native tests are the next required integration step.
 Steam/container security and authentication remain outside this checkpoint.
+
+
+## Process ownership and logical membership checkpoint
+
+FsContext and its snapshots now own immutable namespace storage references along
+with root, cwd and mask. Ordinary copied/shared filesystem contexts retain that
+namespace; every user task independently joins it with a separately owned
+storage/member token. Raw Process inheritance excludes both filesystem ownership
+fields. Process layout changes require ABI 40 and a matched set of modules.
+
+The unpublished-only ProcessFsIsolateMounts helper copies topology and remaps
+root/cwd, constructs a private FsContext, activates membership and replaces the
+unpublished child's inherited token/context. Allocation failures leave the
+inherited state intact and abandon private prepared storage for deferred cleanup.
+This is deliberately not an unshare implementation: its private replacements
+are not atomic for concurrent observers. Ordinary context replacement enforces
+the task's existing immutable namespace.
+
+Scheduler birth and logical terminal publication now retire a task's token
+exactly once, including stillborn threads. Protected kernel operations retain
+membership while termination is pending; the final operation boundary publishes
+termination and retires membership. Retirement under ready/registry locks does
+only the atomic member transition and deferred-queue insertion with wake=false.
+Storage release and cleanup wake happen after those locks are released. Final
+Process cleanup is an idempotent fallback for unpublished construction unwind,
+not the lifetime event that keeps a zombie namespace published.
+
+The actual SchedulerAddProcess, SchedulerKernelOperationBoundary and
+SchedulerMarkTerminated bodies are included from small production .inc files.
+The VFS host fixture compiles those same bodies against real Process/FsContext
+and namespace code, with inert IRQ/policy/registry adapters. It covers stillborn
+publication, protected-region and operation deferral, repeated termination,
+last-member retirement while observers retain contexts/snapshots, and final
+cleanup. Allocation/free and cleanup wake assert that no scheduler fixture lock
+is held. This establishes the production decision/ownership paths, not real IRQ
+interleaving or arbitrary scheduler correctness. Astra reviewed both integration
+and fixture and found no new blocker. The Process tail guard permits alignment
+padding, so a future small field inserted into that padding needs manual review.
+
+All 97 host tests pass in one run without competing builds. Affected VFS, real
+Ext2/FAT and VMM cleanup tests pass ASan/UBSan, including the actual scheduler
+membership fixture. ABI-40 kernel and all 13 matched modules build; compiled
+entry/start audits and mutation checks pass. Frozen kernel SHA:
+`9d024f9c5d46e427593a8707af68682439c251155e1c78ed3a6290f522cc5d42`.
+Evidence is under `build/workloads/mount-namespace-20261022/process`.
+
+Native process-membership regression VM `dc5fd39cc0784e48b296e2160440cfc8`
+completed all nine existing filesystem/credentials/IPC jobs with zero live job
+tasks. Mousepad launched through the normal UI, rendered a completed frame and
+closed with its exact client group gone. Heap integrity passed. Checked sync
+and shutdown completed; the original wrapper exited zero and all four offline
+filesystem checks exited zero. These exercises cover real initial-namespace
+birth/inheritance/termination, not a successful user-facing private namespace.
+The checked review is
+`build/reviews/mount-process-off-gpu-1ms-fixed-mlfq-a-20261022`.
+
+This is still an intermediate checkpoint within the active goal. CLONE_NEWNS
+continues to fail honestly; privileged bind/detach syscall dispatch, initial
+arbitrary-bind legacy dispatch, namespace-aware root enumeration and proc mount
+reporting, and native namespace isolation/exec/teardown acceptance remain.

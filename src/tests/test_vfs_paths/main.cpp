@@ -19,6 +19,7 @@ brook::VfsPath magicTarget{};
 std::mutex allocationLock;
 std::unordered_set<void*> allocations;
 long failAllocation=-1;
+unsigned schedulerLockDepth=0;
 struct Mount;
 struct Node { Mount* mount;uint64_t id;bool dir;Node* parent;std::map<std::string,Node*> children;std::string target; };
 struct Mount { bool alive=false;unsigned live=0;unsigned closed=0;Node root{}; };
@@ -121,8 +122,9 @@ void expect(const brook::VfsPath& root,const brook::VfsPath& start,const char* t
 }
 namespace brook {
 bool ModuleRetainAddresses(const uintptr_t* addresses,uint32_t count){assert(addresses&&count);++providerCalls;return !rejectProvider;}
-extern "C" void* kmalloc(uint64_t size){if(failAllocation==0){failAllocation=-1;return nullptr;}if(failAllocation>0)--failAllocation;void* p=std::malloc(size);if(p){std::memset(p,0xcc,size);std::lock_guard<std::mutex> lock(allocationLock);allocations.insert(p);}return p;}
-extern "C" void kfree(void* p){if(p){std::lock_guard<std::mutex> lock(allocationLock);assert(allocations.erase(p)==1);std::free(p);}}
+extern "C" void* kmalloc(uint64_t size){assert(!schedulerLockDepth);if(failAllocation==0){failAllocation=-1;return nullptr;}if(failAllocation>0)--failAllocation;void* p=std::malloc(size);if(p){std::memset(p,0xcc,size);std::lock_guard<std::mutex> lock(allocationLock);allocations.insert(p);}return p;}
+extern "C" void kfree(void* p){assert(!schedulerLockDepth);if(p){std::lock_guard<std::mutex> lock(allocationLock);assert(allocations.erase(p)==1);std::free(p);}}
+void WakeVfsCleanupWorker(){assert(!schedulerLockDepth);}
 void KRwLockInit(KRwLock* lock){*lock={};}
 void KRwLockReadLock(KRwLock*){namespaceLock.lock_shared();}
 void KRwLockReadUnlock(KRwLock*){namespaceLock.unlock_shared();}
@@ -134,13 +136,16 @@ int FileObjectWritebackAll(){return 0;}
 int FileObjectWriteback(FileObject*,Vnode*,uint64_t,uint64_t){assert(false);return -5;}
 int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -5;}
 }
+#include "scheduler_membership_fixture.inc"
 // Actual Process publication helpers and FsContext core. These exercise owned
 // context handoff/failure/races; native acceptance covers actual clone/exec.
 static void testProcessContexts(const brook::VfsPath& root,const brook::VfsPath& cwd) {
     using namespace brook;
     Process parent{},copy{},shared{},privateThread{};
     int error=0;auto* context=FsContextCreate(root,cwd,022,&error);assert(context&&!error);
+    assert(!ProcessFsInitialize(&parent,"/"));
     ProcessFsReplaceOwned(&parent,context);
+    scheduler_membership_fixture::test(parent);
     assert(!ProcessFsInherit(&copy,&parent,false));
     assert(!ProcessFsInherit(&shared,&parent,true));
     assert(!ProcessFsInherit(&privateThread,&parent,false));
@@ -175,6 +180,35 @@ static void testProcessContexts(const brook::VfsPath& root,const brook::VfsPath&
         ProcessFsReplaceOwned(&parent,replacement);
     }
     reader.join();
+    // Real process-context integration: failure never replaces inherited
+    // state; copied/shared contexts own storage while each task owns a member.
+    Process isolated{},sibling{};assert(!ProcessFsInherit(&isolated,&copy,false));
+    const auto originalMember=isolated.mountNamespaceMember;
+    bool isolatedSuccessfully=false;
+    for(long failure=0;failure<128;++failure) {
+        const auto before=allocations.size();const auto records=g_mounts.count;
+        failAllocation=failure;int result=ProcessFsIsolateMounts(&isolated);failAllocation=-1;
+        if(!result) {isolatedSuccessfully=true;break;}
+        assert(result==-12 && isolated.mountNamespaceMember==originalMember);
+        VfsDrainMountCleanup();assert(allocations.size()==before && records==g_mounts.count);
+    }
+    assert(isolatedSuccessfully && isolated.mountNamespaceMember!=originalMember);
+    FsSnapshot isolatedFs{};assert(!ProcessFsSnapshot(&isolated,&isolatedFs));
+    assert(isolatedFs.mountNamespace==isolated.mountNamespaceMember && isolatedFs.root.attachment!=root.attachment);
+    assert(isolatedFs.mask==022 && !ProcessFsInherit(&sibling,&isolated,true));
+    auto isolatedTarget=resolve(isolatedFs.root,isolatedFs.root,"/namespace-target");
+    assert(!VfsMountNamespaceBind(isolatedFs.mountNamespace,isolatedFs.cwd,isolatedTarget));VfsPathRelease(isolatedTarget);
+    auto heldBind=resolve(isolatedFs.root,isolatedFs.root,"/namespace-target");
+    auto* retired=ProcessFsRetireMounts(&isolated);assert(retired && !isolated.mountNamespaceMember);
+    assert(!ProcessFsRetireMounts(&isolated));ProcessFsFinishMountRetirement(retired);VfsDrainMountCleanup();
+    auto stillBound=resolve(isolatedFs.root,isolatedFs.root,"/namespace-target");assert(VfsPathSame(stillBound,heldBind));VfsPathRelease(stillBound);
+    ProcessFsClear(&sibling); // last member: publication ends despite snapshot/context holds
+    auto uncovered=resolve(isolatedFs.root,isolatedFs.root,"/namespace-target");
+    assert(!VfsPathSame(uncovered,heldBind));VfsPathRelease(uncovered);
+    Process refused{};assert(ProcessFsInherit(&refused,&isolated,false)==-3 && !refused.fsContext && !refused.mountNamespaceMember);
+    VfsDrainMountCleanup();expect(isolatedFs.root,heldBind,"..",heldBind);
+    ProcessFsClear(&refused);ProcessFsClear(&isolated);
+    VfsPathRelease(heldBind);FsSnapshotRelease(&isolatedFs);VfsDrainMountCleanup();
     ProcessFsClear(&parent);ProcessFsClear(&copy);ProcessFsClear(&shared);ProcessFsClear(&privateThread);
     assert(!parent.fsContext && !copy.fsContext && !shared.fsContext && !privateThread.fsContext);
 }
@@ -183,8 +217,8 @@ int main(){
     VfsInit();rejectProvider=true;assert(!VfsRegisterFs("rejected",&fsOps));rejectProvider=false;
     assert(VfsRegisterFs("objects",&fsOps));assert(providerCalls==3);assert(VfsRegisterFs("unsupported",&unsupportedOps));
     assert(VfsMount("/","objects",0));assert(!VfsMount("/","objects",1));
-    Node directory{&mounts[0],2,true,&mounts[0].root,{},{}}, marker{&mounts[0],3,false,&directory,{},{}}, poison{&mounts[0],4,true,&mounts[0].root,{},{}}, file{&mounts[0],5,false,&mounts[0].root,{},{}}, link{&mounts[0],6,false,&directory,{},"/dir/marker"};
-    mounts[0].root.children={{"dir",&directory},{"file",&file}};directory.children={{"marker",&marker},{"absolute",&link}};
+    Node directory{&mounts[0],2,true,&mounts[0].root,{},{}}, marker{&mounts[0],3,false,&directory,{},{}}, poison{&mounts[0],4,true,&mounts[0].root,{},{}}, file{&mounts[0],5,false,&mounts[0].root,{},{}}, link{&mounts[0],6,false,&directory,{},"/dir/marker"}, namespaceTarget{&mounts[0],900,true,&mounts[0].root,{},{}};
+    mounts[0].root.children={{"dir",&directory},{"file",&file},{"namespace-target",&namespaceTarget}};directory.children={{"marker",&marker},{"absolute",&link}};
     VfsPath root{},held{};assert(!VfsPathRoot(&root));held=resolve(root,root,"/dir");
     testProcessContexts(root,held);
     auto original=resolve(root,held,"marker");expect(root,held,"absolute",original);

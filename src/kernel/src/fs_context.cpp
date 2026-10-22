@@ -1,6 +1,7 @@
 #include "fs_context.h"
 #include "memory/heap.h"
 #include "spinlock.h"
+#include "mount_namespace.h"
 
 namespace brook {
 struct FsContext {
@@ -8,6 +9,7 @@ struct FsContext {
     uint32_t references;
     VfsPath root,cwd;
     uint16_t mask;
+    MountNamespace* mountNamespace;
 };
 struct FsContextGuard {
     FsContext* context;
@@ -19,15 +21,16 @@ void FsSnapshotRelease(FsSnapshot* snapshot)
     if(!snapshot)return;
     FsSnapshot owned=*snapshot;*snapshot={};
     VfsPathRelease(owned.cwd);VfsPathRelease(owned.root);
+    VfsMountNamespaceRelease(owned.mountNamespace);
 }
 static FsContext* FsAdoptSnapshot(FsSnapshot* owned,int* error)
 {
     auto* context=static_cast<FsContext*>(kmalloc(sizeof(FsContext)));
     if(!context) { if(error)*error=-12;return nullptr; }
     *context={};context->references=1;context->root=owned->root;context->cwd=owned->cwd;
-    context->mask=owned->mask&0777;*owned={};return context;
+    context->mask=owned->mask&0777;context->mountNamespace=owned->mountNamespace;*owned={};return context;
 }
-FsContext* FsContextCreate(const VfsPath& root,const VfsPath& cwd,uint16_t mask,int* error)
+FsContext* FsContextCreate(const VfsPath& root,const VfsPath& cwd,uint16_t mask,int* error,MountNamespace* ns)
 {
     int local=0;if(!error)error=&local;*error=0;
     VnodeStat stat{};*error=VfsPathStat(root,&stat);
@@ -38,6 +41,8 @@ FsContext* FsContextCreate(const VfsPath& root,const VfsPath& cwd,uint16_t mask,
     if(*error)return nullptr;
     FsSnapshot snapshot{root,cwd,uint16_t(mask&0777)};
     VfsPathRetain(root);VfsPathRetain(cwd);
+    if(ns) {VfsMountNamespaceRetain(ns);snapshot.mountNamespace=ns;}
+    else snapshot.mountNamespace=VfsMountNamespaceInitial();
     FsContext* context=FsAdoptSnapshot(&snapshot,error);FsSnapshotRelease(&snapshot);return context;
 }
 void FsContextRetain(FsContext* context)
@@ -47,6 +52,7 @@ void FsContextRetain(FsContext* context)
     do { if(!count || count==~uint32_t{0})__builtin_trap(); }
     while(!__atomic_compare_exchange_n(&context->references,&count,count+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED));
 }
+MountNamespace* FsContextMountNamespace(FsContext* context) {return context?context->mountNamespace:nullptr;}
 void FsContextRelease(FsContext* context)
 {
     if(!context)return;
@@ -54,14 +60,15 @@ void FsContextRelease(FsContext* context)
     do { if(!count)__builtin_trap(); }
     while(!__atomic_compare_exchange_n(&context->references,&count,count-1,false,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED));
     if(count!=1)return;
-    FsSnapshot owned{context->root,context->cwd,context->mask};kfree(context);FsSnapshotRelease(&owned);
+    FsSnapshot owned{context->root,context->cwd,context->mask,context->mountNamespace};kfree(context);FsSnapshotRelease(&owned);
 }
 int FsContextSnapshot(FsContext* context,FsSnapshot* out)
 {
     if(!out)return -22;
     *out={};if(!context)return -9;
     FsContextGuard held(context);
-    *out={context->root,context->cwd,context->mask};VfsPathRetain(out->root);VfsPathRetain(out->cwd);return 0;
+    *out={context->root,context->cwd,context->mask,context->mountNamespace};
+    VfsPathRetain(out->root);VfsPathRetain(out->cwd);VfsMountNamespaceRetain(out->mountNamespace);return 0;
 }
 FsContext* FsContextCopy(FsContext* context,int* error)
 {

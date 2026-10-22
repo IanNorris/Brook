@@ -62,7 +62,8 @@ namespace brook {
 // ABI 37 appends retained-parent mutation and metadata callbacks to VfsObjectOps.
 // ABI 38 appends Process filesystem-context ownership and replaces cwd/mask authority.
 // ABI 39 assigns per-task no_new_privs state in Process (previously padding).
-static constexpr uint32_t MODULE_ABI_VERSION = 39;
+// ABI 40 adds independent per-task mount-namespace membership to Process.
+static constexpr uint32_t MODULE_ABI_VERSION = 40;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

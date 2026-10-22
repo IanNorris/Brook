@@ -1,6 +1,7 @@
 #include "process_fs.h"
 #include "process.h"
 #include "spinlock.h"
+#include "mount_namespace.h"
 namespace brook {
 static IrqSpinLock g_fsPublicationLock;
 FsContext* ProcessFsAcquire(Process* process)
@@ -13,11 +14,38 @@ FsContext* ProcessFsAcquire(Process* process)
 void ProcessFsReplaceOwned(Process* process,FsContext* owned)
 {
     if(!process) { FsContextRelease(owned);return; }
+    // This helper replaces cwd/mask state in the task's existing namespace.
+    // Only unpublished isolation may change the member token before calling it.
+    if(owned && FsContextMountNamespace(owned)!=__atomic_load_n(&process->mountNamespaceMember,__ATOMIC_ACQUIRE))__builtin_trap();
     const uint64_t irqFlags=IrqSpinLockAcquire(&g_fsPublicationLock);
     FsContext* previous=process->fsContext;process->fsContext=owned;
     IrqSpinLockRelease(&g_fsPublicationLock,irqFlags);FsContextRelease(previous);
 }
-void ProcessFsClear(Process* process) { ProcessFsReplaceOwned(process,nullptr); }
+MountNamespace* ProcessFsRetireMounts(Process* process)
+{
+    if(!process)return nullptr;
+    auto* ns=__atomic_exchange_n(&process->mountNamespaceMember,static_cast<MountNamespace*>(nullptr),__ATOMIC_ACQ_REL);
+    VfsMountNamespaceLeave(ns,false);return ns;
+}
+void ProcessFsFinishMountRetirement(MountNamespace* owned)
+{
+    if(!owned)return;
+    VfsMountNamespaceRelease(owned);VfsWakeMountCleanup();
+}
+void ProcessFsClear(Process* process)
+{
+    ProcessFsFinishMountRetirement(ProcessFsRetireMounts(process));
+    ProcessFsReplaceOwned(process,nullptr);
+}
+static int ProcessFsAdoptMember(Process* process,FsContext* context)
+{
+    FsSnapshot snapshot{};int error=FsContextSnapshot(context,&snapshot);
+    if(error)return error;
+    if(!VfsMountNamespaceJoin(snapshot.mountNamespace)) {FsSnapshotRelease(&snapshot);return -3;}
+    if(process->mountNamespaceMember)__builtin_trap(); // unpublished fresh task only
+    process->mountNamespaceMember=snapshot.mountNamespace;snapshot.mountNamespace=nullptr;
+    FsSnapshotRelease(&snapshot);return 0;
+}
 int ProcessFsSnapshot(Process* process,FsSnapshot* out)
 {
     FsContext* context=ProcessFsAcquire(process);
@@ -36,7 +64,28 @@ int ProcessFsInherit(Process* child,Process* parent,bool share)
         FsContext* copied=FsContextCopy(context,&error);FsContextRelease(context);context=copied;
     }
     if(error)return error;
+    if((error=ProcessFsAdoptMember(child,context))) {FsContextRelease(context);return error;}
     ProcessFsReplaceOwned(child,context);return 0;
+}
+int ProcessFsIsolateMounts(Process* child)
+{
+    if(!child)return -22;
+    FsSnapshot snapshot{};int error=ProcessFsSnapshot(child,&snapshot);
+    if(error)return error;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};
+    error=VfsMountNamespaceCopy(snapshot.mountNamespace,snapshot.root,snapshot.cwd,&ns,&root,&cwd);
+    FsContext* context=nullptr;
+    if(!error)context=FsContextCreate(root,cwd,snapshot.mask,&error,ns);
+    VfsPathRelease(cwd);VfsPathRelease(root);FsSnapshotRelease(&snapshot);
+    if(error) {
+        if(ns) {if(!VfsMountNamespaceAbandon(ns))__builtin_trap();VfsMountNamespaceRelease(ns);}
+        return error;
+    }
+    if(!VfsMountNamespaceActivate(ns))__builtin_trap();
+    auto* old=__atomic_exchange_n(&child->mountNamespaceMember,ns,__ATOMIC_ACQ_REL);
+    VfsMountNamespaceLeave(old,false);
+    ProcessFsReplaceOwned(child,context);
+    ProcessFsFinishMountRetirement(old);return 0;
 }
 static void ProcessFsRefreshDisplay(Process* process)
 {
@@ -61,6 +110,7 @@ int ProcessFsInitialize(Process* process,const char* cwd)
     if(!error)context=FsContextCreate(root,directory,022,&error);
     VfsPathRelease(directory);VfsPathRelease(root);
     if(error)return error;
+    if((error=ProcessFsAdoptMember(process,context))) {FsContextRelease(context);return error;}
     ProcessFsReplaceOwned(process,context);ProcessFsRefreshDisplay(process);return 0;
 }
 int ProcessFsSetCwd(Process* process,const VfsPath& path)

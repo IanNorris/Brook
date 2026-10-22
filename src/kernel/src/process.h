@@ -13,6 +13,7 @@ namespace brook {
 
 struct Vnode;
 struct FsContext;
+struct MountNamespace;
 struct KRwLock;
 struct SupplementaryGroups {
     volatile uint32_t references;
@@ -537,6 +538,9 @@ struct Process
     // threads inherit it; exec preserves it. This grants no Linux credentials.
     ProcessLifecycleRole lifecycleRole;
 
+    // Independent live-task membership and owned namespace storage reference.
+    // Exchange only through process_fs.h; logical exit retires before reaping.
+    MountNamespace* mountNamespaceMember;
     // Owned reference; access only through process_fs.h publication helpers.
     FsContext* fsContext;
 };

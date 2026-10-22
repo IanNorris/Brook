@@ -41,8 +41,10 @@
 #include "vdso.h"
 
 namespace brook {
-static_assert(offsetof(Process,fsContext)+sizeof(Process::fsContext)==sizeof(Process),
-              "fork/thread snapshot boundary must remain the final field");
+static_assert(offsetof(Process,mountNamespaceMember)+sizeof(Process::mountNamespaceMember)==offsetof(Process,fsContext),
+              "fork/thread snapshot must exclude both filesystem ownership fields");
+static_assert(sizeof(Process)-(offsetof(Process,fsContext)+sizeof(Process::fsContext))<alignof(Process),
+              "filesystem ownership fields must remain last, allowing alignment padding");
 
 namespace {
 IrqSpinLock signalActionLock;
@@ -185,7 +187,7 @@ static void CopyParentProcess(Process* child, Process* parent) {
     memcpy(reinterpret_cast<char*>(child)+nnpEnd,reinterpret_cast<const char*>(parent)+nnpEnd,
            offsetof(Process,cwdDisplay)-nnpEnd);
     memcpy(reinterpret_cast<char*>(child)+displayEnd,reinterpret_cast<const char*>(parent)+displayEnd,
-           offsetof(Process,fsContext)-displayEnd);
+           offsetof(Process,mountNamespaceMember)-displayEnd);
     ProcessFsReadDisplay(parent,child->cwdDisplay,sizeof(child->cwdDisplay));
 }
 
