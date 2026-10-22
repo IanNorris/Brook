@@ -455,7 +455,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::ProcFsInit();
     brook::ProcFsVfsRegister();  // register "procfs" filesystem driver
     brook::NetInit();
-    brook::VfsMount("/proc", "procfs", 0);
 
     // Mount initrd from bootloader (or fall back to embedded image).
     if (bootProtocol->initrdPhysBase && bootProtocol->initrdSize > 0)
@@ -525,6 +524,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             brook::KPuts("VFS: ramdisk buffer allocation failed\n");
         }
     }
+
+    // Child attachments require the root identity to exist first.
+    brook::VfsMount("/proc", "procfs", 0);
 
     // ---- QEMU fw_cfg ----
     brook::FwCfgInit();

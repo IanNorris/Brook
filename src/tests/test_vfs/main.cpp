@@ -1,5 +1,10 @@
 #include "test_framework.h"
 #include "vfs.h"
+#include "vfs_path.h"
+#include "fatfs_vfs.h"
+#include "fatfs_glue.h"
+#include "fat_test_image.h"
+#include "ramdisk.h"
 #include "device.h"
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
@@ -266,6 +271,45 @@ TEST_MAIN("vfs", {
     unsupported.name = "unknown";
     unsupported.type = brook::DeviceType::Block;
     ASSERT_EQ(brook::DeviceFlush(&unsupported), -95);
+
+    // Native real-backend coverage: kernel heap/VMM, real KMutex/KRwLock,
+    // FatFs disk glue, and retained object/attachment lifetimes together.
+    brook::FatFsVfsRegister();
+    auto* rootBytes=static_cast<uint8_t*>(brook::kmalloc(g_fatTestImageSize));
+    auto* childBytes=static_cast<uint8_t*>(brook::kmalloc(g_fatTestImageSize));
+    ASSERT_TRUE(rootBytes && childBytes);
+    for(uint32_t i=0;i<g_fatTestImageSize;++i)rootBytes[i]=childBytes[i]=g_fatTestImage[i];
+    auto* rootDevice=brook::RamdiskCreate(rootBytes,g_fatTestImageSize,512,"vfs-root");
+    auto* childDevice=brook::RamdiskCreate(childBytes,g_fatTestImageSize,512,"vfs-child");
+    ASSERT_TRUE(rootDevice && childDevice);
+    ASSERT_TRUE(brook::DeviceRegister(rootDevice));ASSERT_TRUE(brook::DeviceRegister(childDevice));
+    ASSERT_TRUE(brook::FatFsBindDrive(0,rootDevice));ASSERT_TRUE(brook::FatFsBindDrive(1,childDevice));
+    ASSERT_TRUE(brook::VfsMount("/","fatfs",0));
+    brook::VfsPath rootPath{};brook::VfsPath cwdPath{};brook::VfsPath filePath{};brook::VfsPath aliasPath{};
+    ASSERT_EQ(brook::VfsPathRoot(&rootPath),0);
+    ASSERT_EQ(brook::VfsPathResolve(rootPath,rootPath,"/TEST",&cwdPath),0);
+    ASSERT_EQ(brook::VfsPathResolve(rootPath,cwdPath,"HELLO.TXT",&filePath),0);
+    ASSERT_EQ(brook::VfsRename("/TEST","/MOVED"),0);
+    ASSERT_EQ(brook::VfsMkdir("/TEST",0755),0);
+    ASSERT_EQ(brook::VfsPathResolve(rootPath,cwdPath,"HELLO.TXT",&aliasPath),0);
+    ASSERT_TRUE(brook::VfsPathSame(aliasPath,filePath));brook::VfsPathRelease(aliasPath);
+    ASSERT_TRUE(brook::VfsMount("/MOVED","fatfs",1));
+    ASSERT_EQ(brook::VfsPathResolve(rootPath,rootPath,"/MOVED/HELLO.TXT",&aliasPath),-2);
+    ASSERT_EQ(brook::VfsPathResolve(rootPath,cwdPath,"HELLO.TXT",&aliasPath),0);
+    ASSERT_TRUE(brook::VfsPathSame(aliasPath,filePath));brook::VfsPathRelease(aliasPath);
+    ASSERT_TRUE(brook::VfsUnmount("/MOVED"));
+    int retainedError=0;auto* exact=brook::VfsPathOpen(filePath,brook::VFS_O_READ,&retainedError);
+    ASSERT_TRUE(exact!=nullptr);ASSERT_EQ(retainedError,0);
+    char hello[32]{};uint64_t helloOffset=0;
+    ASSERT_EQ(brook::VfsRead(exact,hello,19,&helloOffset),19);
+    const char expectedHello[]="Hello from the VFS!\n";
+    for(unsigned i=0;i<19;++i)ASSERT_EQ(hello[i],expectedHello[i]);
+    brook::VfsPathRelease(filePath);brook::VfsPathRelease(cwdPath);brook::VfsPathRelease(rootPath);
+    ASSERT_FALSE(brook::VfsUnmount("/")); // Only exact vnode still owns backing.
+    brook::VfsClose(exact);ASSERT_TRUE(brook::VfsUnmount("/"));
+    ASSERT_TRUE(brook::DeviceUnregister(childDevice));ASSERT_TRUE(brook::DeviceUnregister(rootDevice));
+    brook::kfree(childDevice->priv);brook::kfree(childDevice);brook::kfree(rootDevice->priv);brook::kfree(rootDevice);
+    brook::kfree(childBytes);brook::kfree(rootBytes);
 
     brook::SerialPrintf("All VFS tests passed\n");
 })

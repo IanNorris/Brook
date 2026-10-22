@@ -173,17 +173,8 @@ add_custom_command(
 set(FATFS_SRC_DIR "${BROOK_ROOT}/src/third_party/fatfs/source")
 set(FATFS_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/fatfs")
 
-file(MAKE_DIRECTORY "${FATFS_BUILD_DIR}")
-file(COPY
-    "${FATFS_SRC_DIR}/ff.c"
-    "${FATFS_SRC_DIR}/ff.h"
-    "${FATFS_SRC_DIR}/ffsystem.c"
-    "${FATFS_SRC_DIR}/ffunicode.c"
-    "${FATFS_SRC_DIR}/diskio.h"
-    DESTINATION "${FATFS_BUILD_DIR}"
-)
-# Overlay our custom config (LFN=1, VOLUMES=4, etc.)
-file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/src/ffconf.h" DESTINATION "${FATFS_BUILD_DIR}")
+include("${BROOK_ROOT}/cmake/PrepareFatFs.cmake")
+brook_prepare_fatfs("${FATFS_BUILD_DIR}")
 
 # ---------------------------------------------------------------------------
 # Kernel symbol address table (addr → name reverse lookup for crash dumps)

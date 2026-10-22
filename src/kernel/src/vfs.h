@@ -19,6 +19,7 @@ struct Vnode;
 struct FileObject;
 struct DirEntry;
 struct VnodeStat;
+struct VfsObject;
 // Mount accounting, in blockSize units. Callbacks fill a kernel buffer only.
 struct VfsSpace {
     uint64_t type, blockSize, blocks, freeBlocks, availableBlocks;
@@ -81,6 +82,9 @@ struct Vnode {
     // Opaque retained initial-namespace mount instance. Set by VFS dispatch,
     // not by a backend. Its hold prevents unmount/reuse until final close.
     void*           mountOwner = nullptr;
+    // Optional backend identity pin, independent of file/iterator state.
+    // Final VFS close releases it after backend close, before the mount hold.
+    VfsObject*      backendObject = nullptr;
 };
 
 // Caller must already own a live vnode reference. The returned name is for
@@ -215,6 +219,10 @@ struct VfsFsOps {
     // after unlink until its owner closes it. Unsupported filesystems omit it.
     Vnode* (*create_socket)(void* mountPriv, uint8_t pdrv, const char* relPath,
                            uint16_t mode, int* error) = nullptr;
+    // Retained backend identities. Optional until the backend implements the
+    // object-relative contract; callers must return EOPNOTSUPP if absent.
+    int (*root_object)(void* mountPriv, uint8_t pdrv, VfsObject** out) = nullptr;
+    int (*vnode_object)(Vnode* vnode, VfsObject** out) = nullptr;
 };
 
 // Register a filesystem driver with the VFS.

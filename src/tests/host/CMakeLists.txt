@@ -420,6 +420,49 @@ add_host_test(test_launch_history)
 target_compile_options(test_launch_history PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 
 # Shared component walker: symlink/dotdot ordering, search and typed failures.
+# Production FatFs object adapter on a disposable FAT16 image.
+if(NOT DEFINED CMAKE_C_COMPILER AND DEFINED ENV{HOST_CC})
+    set(CMAKE_C_COMPILER "$ENV{HOST_CC}" CACHE FILEPATH "Wrapped host C compiler")
+endif()
+enable_language(C)
+include("${BROOK_ROOT}/cmake/PrepareFatFs.cmake")
+set(FATFS_OBJECT_HOST_DIR "${CMAKE_CURRENT_BINARY_DIR}/fatfs-object-adapter")
+brook_prepare_fatfs("${FATFS_OBJECT_HOST_DIR}")
+add_executable(test_fat_object_adapter
+    "${BROOK_ROOT}/src/tests/test_fat_object_adapter/main.cpp"
+    "${FATFS_OBJECT_HOST_DIR}/ff.c" "${FATFS_OBJECT_HOST_DIR}/ffunicode.c")
+target_include_directories(test_fat_object_adapter PRIVATE "${FATFS_OBJECT_HOST_DIR}")
+target_compile_options(test_fat_object_adapter PRIVATE -UNDEBUG)
+target_compile_options(test_fat_object_adapter PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>")
+target_compile_options(test_fat_object_adapter PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_test(NAME test_fat_object_adapter COMMAND python3 "${BROOK_ROOT}/src/tests/test_fat_object_adapter/run.py" "$<TARGET_FILE:test_fat_object_adapter>")
+set_tests_properties(test_fat_object_adapter PROPERTIES TIMEOUT 60)
+add_executable(test_fat_objects
+    "${BROOK_ROOT}/src/tests/test_fat_objects/main.cpp"
+    "${FATFS_OBJECT_HOST_DIR}/ff.c" "${FATFS_OBJECT_HOST_DIR}/ffunicode.c")
+target_include_directories(test_fat_objects PRIVATE "${FATFS_OBJECT_HOST_DIR}")
+target_compile_options(test_fat_objects PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections)
+target_compile_options(test_fat_objects PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-Wno-unused-function;-Wno-unused-parameter;-Wno-attributes>")
+target_compile_options(test_fat_objects PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_fat_objects PRIVATE -Wl,--gc-sections)
+target_link_libraries(test_fat_objects PRIVATE Threads::Threads)
+add_test(NAME test_fat_objects COMMAND python3 "${BROOK_ROOT}/src/tests/test_fat_objects/run.py" "$<TARGET_FILE:test_fat_objects>")
+set_tests_properties(test_fat_objects PROPERTIES TIMEOUT 60)
+add_executable(test_ext2_objects "${BROOK_ROOT}/src/tests/test_ext2_objects/main.cpp"
+    "${BROOK_ROOT}/src/kernel/src/vfs.cpp" "${BROOK_ROOT}/src/kernel/src/memory/mapping_pin_registry.cpp")
+target_link_libraries(test_ext2_objects PRIVATE Threads::Threads)
+add_test(NAME test_ext2_objects COMMAND python3 "${BROOK_ROOT}/src/tests/test_ext2_objects/run.py" "$<TARGET_FILE:test_ext2_objects>")
+target_compile_options(test_ext2_objects PRIVATE -Wall -Wextra -Werror -Wno-unused-function -UNDEBUG -DBROOK_HOST_TEST
+    -ffunction-sections -fdata-sections -Wno-unused-parameter -Wno-attributes
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_ext2_objects PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_ext2_objects PROPERTIES TIMEOUT 60)
+add_host_test(test_vfs_object_refs)
+target_compile_options(test_vfs_object_refs PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_retained_path_walk)
+target_compile_options(test_retained_path_walk PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 add_host_test(test_path_walk)
 target_compile_options(test_path_walk PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 
@@ -460,3 +503,11 @@ target_compile_options(test_dmabuf_layout PRIVATE -UNDEBUG)
 
 add_host_test(test_gpu_reservation)
 target_compile_options(test_gpu_reservation PRIVATE -UNDEBUG)
+
+# Production VFS mount topology, walk and object-to-vnode ownership transfer.
+add_host_test(test_vfs_paths "${BROOK_ROOT}/src/kernel/src/memory/mapping_pin_registry.cpp")
+target_compile_options(test_vfs_paths PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    -Wno-unused-function -Wno-unused-parameter -Wno-attributes
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_vfs_paths PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_vfs_paths PROPERTIES TIMEOUT 20)

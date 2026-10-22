@@ -1,6 +1,55 @@
-# Retained filesystem contexts: implementation checkpoint
+# Retained filesystem contexts: implementation progress
 
-## Status and bounded stopping point
+## Active object-relative implementation
+
+The renewed goal continues beyond the historical checkpoint below. This is an
+intermediate implementation report, not completion of the process-context goal.
+
+Implemented so far:
+
+- Distinct `VfsObject` identities, independent file descriptions and directory
+  iterators, checked reference ownership, and ABI **36** backend factories.
+- Ext2 component lookup, parent, link reading and exact-object opens backed by
+  retained open-inode records. A held removed inode cannot be reused.
+- FAT component operations using the upstream implementation's internals without
+  changing the submodule. Held directories pin clusters; held file objects pin
+  directory-entry slots. Conflicting FAT removal/file rename returns `EBUSY`.
+  FAT16 and FAT32 are covered. FAT replacement-rename atomicity remains an old
+  limitation; the existing delete-destination-first implementation is not fixed.
+- A retained VFS walker with explicit attachment edges, virtual missing mount
+  ancestors, root clamping, stacked-root parent traversal and no pathname
+  reconstruction for lookup authority. Root replacement is rejected. Production
+  boot now installs FAT root before procfs. Unsupported object backends return
+  `EOPNOTSUPP`; old APIs remain available while consumers are migrated.
+- Legacy mount dispatch follows the visible attachment tree so an overmount
+  also hides older descendants. Successful ancestor rename updates legacy mount
+  labels only in the affected attachment subtree. Virtual links and mountpoints
+  are reserved against conflicting VFS mutations.
+- Exact-object opens transfer a mount hold to the vnode before the retained path
+  can be released. A held path pins backing through its final object destructor.
+
+Not implemented yet: retained parent mutation callbacks, process `FsContext`,
+`CLONE_FS`/exec sharing rules, the complete relative-syscall/exec/shell migration,
+and retained proc PID/fd broker objects. No namespace, chroot or Steam container
+support is claimed. Steam authentication is still blocked by those later layers.
+
+Validation for this phase: all **96 hosted tests** pass; six targeted tests pass
+with AddressSanitizer and UndefinedBehaviorSanitizer. The tests combine the
+production VFS and Ext2 implementation on a disposable real filesystem image,
+plus actual FAT16/FAT32 backend images checked with filesystem repair tools in
+read-only mode. They cover rename and replacement, retained overmount behavior,
+stacked roots, hidden-descendant visibility parity with legacy opens, unrelated
+hidden-tree rename, virtual ancestor detach, concurrent namespace transactions,
+allocation failure unwind, orphan identity, independent iterators and object-to-
+vnode lifetime transfer. The expanded native VFS suite also passes with the
+real FAT backend, kernel locks and private memory disks. These tests do not prove the not-yet-
+implemented context/syscall semantics. A complete ABI-36 desktop acceptance VM
+has not been run in this phase.
+
+Current evidence: `build/workloads/retained-fs-objects-20261022/` (ignored).
+The earlier ABI-35 acceptance and its kernel hash below are historical evidence.
+
+## Historical mount-ownership checkpoint (`8ea2322c`)
 
 The first implementation checkpoint fixes **mount ownership of open vnodes**.
 It does not implement process filesystem contexts, an object-relative walker,

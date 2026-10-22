@@ -74,16 +74,8 @@ add_brook_test(test_device_registry
 # FatFS build-directory copy for tests (same approach as kernel — see kernel CMakeLists)
 set(FATFS_SRC_DIR "${BROOK_ROOT}/src/third_party/fatfs/source")
 set(FATFS_TEST_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/fatfs")
-file(MAKE_DIRECTORY "${FATFS_TEST_BUILD_DIR}")
-file(COPY
-    "${FATFS_SRC_DIR}/ff.c"
-    "${FATFS_SRC_DIR}/ff.h"
-    "${FATFS_SRC_DIR}/ffsystem.c"
-    "${FATFS_SRC_DIR}/ffunicode.c"
-    "${FATFS_SRC_DIR}/diskio.h"
-    DESTINATION "${FATFS_TEST_BUILD_DIR}"
-)
-file(COPY "${BROOK_ROOT}/src/kernel/src/ffconf.h" DESTINATION "${FATFS_TEST_BUILD_DIR}")
+include("${BROOK_ROOT}/cmake/PrepareFatFs.cmake")
+brook_prepare_fatfs("${FATFS_TEST_BUILD_DIR}")
 
 add_brook_test(test_vfs
     "${BROOK_ROOT}/src/kernel/src/vfs.cpp"
@@ -102,7 +94,12 @@ target_include_directories(test_vfs PRIVATE
     "${FATFS_TEST_BUILD_DIR}"
 )
 target_compile_definitions(test_vfs PRIVATE BROOK_HOST_TEST BROOK_STANDALONE_TEST)
+set(VFS_TEST_FAT_IMAGE "${CMAKE_CURRENT_BINARY_DIR}/vfs_test_image.cpp")
+add_custom_command(OUTPUT "${VFS_TEST_FAT_IMAGE}"
+    COMMAND python3 "${BROOK_ROOT}/scripts/make_fat_image.py" "${VFS_TEST_FAT_IMAGE}" 360
+    DEPENDS "${BROOK_ROOT}/scripts/make_fat_image.py" VERBATIM)
 target_sources(test_vfs PRIVATE
+    "${BROOK_ROOT}/src/kernel/src/fatfs_vfs.cpp" "${VFS_TEST_FAT_IMAGE}"
     "${FATFS_TEST_BUILD_DIR}/ff.c"
     "${FATFS_TEST_BUILD_DIR}/ffunicode.c"
 )

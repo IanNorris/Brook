@@ -7,6 +7,7 @@
 
 #include "ext2_vfs.h"
 #include "vfs.h"
+#include "vfs_object.h"
 #include "memory/file_object.h"
 #include "device.h"
 #include "process.h"
@@ -14,7 +15,11 @@
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
 #include "serial.h"
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
+#include <cstring>
+#else
 #include "string.h"
+#endif
 #include "sync/krwlock.h"
 #include "spinlock.h"
 #include "rtc.h"
@@ -437,7 +442,7 @@ static uint64_t Ext2InodeSize(const Ext2Inode* ino);
 static uint32_t Ext2BlockMap(Ext2Mount* mnt, const Ext2Inode* ino, uint32_t fileBlock);
 static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
                              void* buf, uint64_t len, uint64_t offset);
-static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name);
+static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name, int* error=nullptr);
 static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
                                 const char* path, int symlinkDepth);
 
@@ -1923,8 +1928,9 @@ static int Ext2ReadInodeData(Ext2Mount* mnt, const Ext2Inode* ino,
 // ---------------------------------------------------------------------------
 
 // Look up a name in a directory inode. Returns the inode number or 0 on failure.
-static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name)
+static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inode* dirIno, const char* name, int* error)
 {
+    if(error)*error=-2;
     uint64_t dirSize = Ext2InodeSize(dirIno);
     if (dirSize == 0) return 0;
 
@@ -1932,22 +1938,30 @@ static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inod
     for (const char* p = name; *p; ++p) ++nameLen;
 
     uint32_t cached = 0;
-    if (parentIno && Ext2DirentCacheLookup(mnt, parentIno, name, nameLen, &cached))
+    if (parentIno && Ext2DirentCacheLookup(mnt, parentIno, name, nameLen, &cached)) {
+        if(error)*error=0;
         return cached;
+    }
 
     auto* buf = static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-    if (!buf) return 0;
+    if (!buf) { if(error)*error=-12; return 0; }
 
     uint64_t off = 0;
     while (off < dirSize) {
         uint32_t fileBlock = static_cast<uint32_t>(off >> mnt->blockShift);
         uint32_t diskBlock = Ext2BlockMap(mnt, dirIno, fileBlock);
-        if (!diskBlock || !Ext2ReadBlock(mnt, diskBlock, buf)) break;
+        if (!diskBlock || !Ext2ReadBlock(mnt, diskBlock, buf)) {
+            if(error)*error=-5;
+            break;
+        }
 
         uint32_t pos = 0;
         while (pos < mnt->blockSize && off + pos < dirSize) {
             auto* de = reinterpret_cast<Ext2DirEntry2*>(buf + pos);
-            if (!Ext2DirEntryValid(de, pos, mnt->blockSize)) break;
+            if (!Ext2DirEntryValid(de, pos, mnt->blockSize)) {
+                if(error)*error=-5;
+                kfree(buf);return 0;
+            }
             if (de->inode != 0 && de->name_len == nameLen) {
                 bool match = true;
                 for (uint32_t i = 0; i < nameLen; ++i) {
@@ -1957,6 +1971,7 @@ static uint32_t Ext2DirLookup(Ext2Mount* mnt, uint32_t parentIno, const Ext2Inod
                     uint32_t result = de->inode;
                     kfree(buf);
                     if (parentIno) Ext2DirentCachePut(mnt, parentIno, name, nameLen, result);
+                    if(error)*error=0;
                     return result;
                 }
             }
@@ -2096,6 +2111,7 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     // read-only CoW pages). Never copy to it while holding filesystem/cache
     // locks: a fault can wait for TLB acknowledgements from another CPU which
     // is itself waiting for those locks with interrupts disabled.
+#if !defined(BROOK_HOST_TEST) || defined(BROOK_STANDALONE_TEST)
     if (len && reinterpret_cast<uint64_t>(buf) < 0x0000800000000000ULL) {
         constexpr uint64_t MAX_BOUNCE = 64 * 1024;
         uint64_t capacity = len < MAX_BOUNCE ? len : MAX_BOUNCE;
@@ -2116,6 +2132,7 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
         kfree(bounce);
         return done ? static_cast<int>(done) : error;
     }
+#endif
     auto* fp = static_cast<Ext2FilePriv*>(vn->priv);
     KRwLockReadLock(&g_ext2Lock);
     Ext2Inode data;
@@ -2781,6 +2798,9 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
 
     auto* mnt = static_cast<Ext2Mount*>(kmalloc(sizeof(Ext2Mount)));
     if (!mnt) { kfree(bgdt); return false; }
+    // kmalloc does not value-initialize aggregates. In particular, stale
+    // write/deferred-sync errors must not poison a newly mounted filesystem.
+    *mnt = {};
 
     uint64_t cacheNamespace = __atomic_fetch_add(&g_nextExt2CacheNamespace, 1, __ATOMIC_RELAXED);
     if (cacheNamespace > 0xffffffffULL) {
@@ -2952,6 +2972,66 @@ static int Ext2FsSync(void* mountPriv)
     return result;
 }
 
+// Consumes hold on every path; no filesystem lock is held during allocation.
+// Each opened directory has independent iteration state.
+static Vnode* Ext2VnodeFromHold(Ext2Mount* mnt,uint32_t ino,
+                               const Ext2Inode& inodeData,Ext2OpenInode* hold)
+{
+    uint16_t mode=inodeData.i_mode & EXT2_S_IFMT;
+    if (mode == EXT2_S_IFDIR) {
+        auto* dp = static_cast<Ext2DirPriv*>(kmalloc(sizeof(Ext2DirPriv)));
+        if (!dp) { Ext2ReleaseInode(hold); return nullptr; }
+        dp->mnt = mnt;
+        dp->inode = ino;
+        dp->inodeData = inodeData;
+        dp->readOffset = 0;
+        dp->hold = hold;
+
+        auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
+        if (!vn) { kfree(dp); Ext2ReleaseInode(hold); return nullptr; }
+        vn->directoryPath = nullptr;
+        vn->mountOwner = nullptr;
+        vn->backendObject = nullptr;
+        vn->ops = &g_ext2DirOps;
+        vn->type = VnodeType::Dir;
+        vn->priv = dp;
+        vn->refCount = 1;
+        vn->cacheId = Ext2CacheId(mnt, ino);
+        return vn;
+    }
+
+    if (mode == EXT2_S_IFREG || mode == EXT2_S_IFSOCK || mode == EXT2_S_IFLNK) {
+        auto* fp = static_cast<Ext2FilePriv*>(kmalloc(sizeof(Ext2FilePriv)));
+        if (!fp) { Ext2ReleaseInode(hold); return nullptr; }
+        fp->mnt = mnt;
+        fp->inode = ino;
+        fp->inodeData = inodeData;
+        fp->hold = hold;
+
+        auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
+        if (!vn) { kfree(fp); Ext2ReleaseInode(hold); return nullptr; }
+        vn->directoryPath = nullptr;
+        vn->mountOwner = nullptr;
+        vn->backendObject = nullptr;
+        vn->ops = mode == EXT2_S_IFREG ? &g_ext2FileOps : &g_ext2SocketOps;
+        vn->type = VnodeType::File;
+        vn->priv = fp;
+        vn->refCount = 1;
+        // Every ext2 mount is currently writable, including /nix. The global
+        // mmap cache has no write/truncate/inode-reuse invalidation protocol,
+        // so caching these pages can return old source or library bytes.
+        // Keep demand paging and the coherent ext2 block cache, but bypass
+        // shared mmap-page caching until mutation synchronization is available.
+        // Ext2CacheId remains the namespace-safe identity for future caching;
+        // stat uses the real inode independently of this opt-out value.
+        vn->cacheId = 0;
+        return vn;
+    }
+
+    Ext2ReleaseInode(hold);
+    return nullptr;
+}
+
 static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
                             const char* relPath, int flags, uint16_t createMode, int* error)
 {
@@ -3091,56 +3171,7 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
     else KRwLockReadUnlock(&g_ext2Lock);
     if (!hold) return nullptr;
 
-    if (mode == EXT2_S_IFDIR) {
-        auto* dp = static_cast<Ext2DirPriv*>(kmalloc(sizeof(Ext2DirPriv)));
-        if (!dp) { Ext2ReleaseInode(hold); return nullptr; }
-        dp->mnt = mnt;
-        dp->inode = ino;
-        dp->inodeData = inodeData;
-        dp->readOffset = 0;
-        dp->hold = hold;
-
-        auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
-        if (!vn) { kfree(dp); Ext2ReleaseInode(hold); return nullptr; }
-        vn->directoryPath = nullptr;
-        vn->mountOwner = nullptr;
-        vn->ops = &g_ext2DirOps;
-        vn->type = VnodeType::Dir;
-        vn->priv = dp;
-        vn->refCount = 1;
-        vn->cacheId = Ext2CacheId(mnt, ino);
-        return vn;
-    }
-
-    if (mode == EXT2_S_IFREG || mode == EXT2_S_IFSOCK) {
-        auto* fp = static_cast<Ext2FilePriv*>(kmalloc(sizeof(Ext2FilePriv)));
-        if (!fp) { Ext2ReleaseInode(hold); return nullptr; }
-        fp->mnt = mnt;
-        fp->inode = ino;
-        fp->inodeData = inodeData;
-        fp->hold = hold;
-
-        auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
-        if (!vn) { kfree(fp); Ext2ReleaseInode(hold); return nullptr; }
-        vn->directoryPath = nullptr;
-        vn->mountOwner = nullptr;
-        vn->ops = mode == EXT2_S_IFSOCK ? &g_ext2SocketOps : &g_ext2FileOps;
-        vn->type = VnodeType::File;
-        vn->priv = fp;
-        vn->refCount = 1;
-        // Every ext2 mount is currently writable, including /nix. The global
-        // mmap cache has no write/truncate/inode-reuse invalidation protocol,
-        // so caching these pages can return old source or library bytes.
-        // Keep demand paging and the coherent ext2 block cache, but bypass
-        // shared mmap-page caching until mutation synchronization is available.
-        // Ext2CacheId remains the namespace-safe identity for future caching;
-        // stat uses the real inode independently of this opt-out value.
-        vn->cacheId = 0;
-        return vn;
-    }
-
-    // Symlinks should have been resolved during path resolution
-    return nullptr;
+    return Ext2VnodeFromHold(mnt,ino,inodeData,hold);
 }
 
 static Vnode* Ext2FsOpenMode(void* mountPriv, uint8_t pdrv,
@@ -3867,6 +3898,190 @@ static int Ext2CheckRealAccess(void* mountPriv,const VnodeStat* st,uint8_t requi
     return Ext2AccessMetadata(static_cast<Ext2Mount*>(mountPriv),st,required,true);
 }
 
+// Retained backend identities never contain an opening pathname or an iterator.
+// The owning VFS path separately retains this object's mount attachment.
+static const VfsObjectOps* Ext2ObjectOperations();
+
+// Caller holds g_ext2Lock. Inode retention precedes publication, so unlink and
+// reallocation cannot replace the object behind a successful lookup.
+static int Ext2AcquireObject(Ext2Mount* mount,uint32_t ino,VfsObject** out)
+{
+    *out=nullptr;
+    Ext2Inode data;
+    if(!ino || !Ext2ReadInode(mount,ino,&data))return -5;
+    auto* hold=Ext2HoldInode(mount,ino);
+    if(!hold)return -12;
+    auto* object=static_cast<VfsObject*>(kmalloc(sizeof(VfsObject)));
+    if(!object){Ext2ReleaseInode(hold);return -12;}
+    *object={Ext2ObjectOperations(),hold,ino,1};
+    *out=object;return 0;
+}
+
+static void Ext2DestroyObject(VfsObject* object)
+{
+    Ext2ReleaseInode(static_cast<Ext2OpenInode*>(object->priv));kfree(object);
+}
+
+static int Ext2ObjectStat(VfsObject* object,VnodeStat* stat)
+{
+    if(!stat)return -22;
+    auto* hold=static_cast<Ext2OpenInode*>(object->priv);
+    Ext2Inode data;
+    KRwLockReadLock(&g_ext2Lock);
+    bool ok=Ext2ReadInode(hold->mnt,hold->inode,&data);
+    if(ok)Ext2FillStat(stat,hold->mnt,hold->inode,data);
+    KRwLockReadUnlock(&g_ext2Lock);return ok?0:-5;
+}
+
+static int Ext2ObjectAccess(VfsObject* object,uint8_t required,bool realIds)
+{
+    auto* hold=static_cast<Ext2OpenInode*>(object->priv);
+    VnodeStat stat{};int error=Ext2ObjectStat(object,&stat);
+    return error?error:Ext2AccessMetadata(hold->mnt,&stat,required,realIds);
+}
+
+static int Ext2ObjectChild(VfsObject* directory,const char* name,VfsObject** out)
+{
+    if(!out)return -22;
+    *out=nullptr;
+    if(!name || !name[0])return -22;
+    uint32_t length=0;
+    for(;name[length];++length) {
+        if(name[length]=='/')return -22;
+        if(length>=255)return -36;
+    }
+    if((name[0]=='.' && !name[1]) ||
+       (name[0]=='.' && name[1]=='.' && !name[2]))return -22;
+    auto* hold=static_cast<Ext2OpenInode*>(directory->priv);
+    KRwLockReadLock(&g_ext2Lock);
+    Ext2Inode data;int error=0;
+    if(!Ext2ReadInode(hold->mnt,hold->inode,&data))error=-5;
+    else if((data.i_mode&EXT2_S_IFMT)!=EXT2_S_IFDIR)error=-20;
+    else {
+        VnodeStat stat{};Ext2FillStat(&stat,hold->mnt,hold->inode,data);
+        error=Ext2AccessMetadata(hold->mnt,&stat,1,false);
+        if(!error) {
+            int lookupError=0;
+            uint32_t child=Ext2DirLookup(hold->mnt,hold->inode,&data,name,&lookupError);
+            error=child?Ext2AcquireObject(hold->mnt,child,out):lookupError;
+        }
+    }
+    KRwLockReadUnlock(&g_ext2Lock);return error;
+}
+
+static int Ext2ObjectParent(VfsObject* directory,VfsObject** out)
+{
+    if(!out)return -22;
+    *out=nullptr;
+    auto* hold=static_cast<Ext2OpenInode*>(directory->priv);
+    KRwLockReadLock(&g_ext2Lock);
+    Ext2Inode data;int error=0;
+    if(!Ext2ReadInode(hold->mnt,hold->inode,&data))error=-5;
+    else if((data.i_mode&EXT2_S_IFMT)!=EXT2_S_IFDIR)error=-20;
+    else {
+        VnodeStat stat{};Ext2FillStat(&stat,hold->mnt,hold->inode,data);
+        error=Ext2AccessMetadata(hold->mnt,&stat,1,false);
+        if(!error) {
+            int lookupError=0;
+            uint32_t parent=hold->inode==EXT2_ROOT_INO?EXT2_ROOT_INO:
+                Ext2DirLookup(hold->mnt,hold->inode,&data,"..",&lookupError);
+            error=parent?Ext2AcquireObject(hold->mnt,parent,out):lookupError;
+        }
+    }
+    KRwLockReadUnlock(&g_ext2Lock);return error;
+}
+
+static int Ext2ObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
+{
+    if(!out || !capacity)return -22;
+    auto* hold=static_cast<Ext2OpenInode*>(object->priv);
+    KRwLockReadLock(&g_ext2Lock);
+    Ext2Inode data;int result=0;
+    if(!Ext2ReadInode(hold->mnt,hold->inode,&data))result=-5;
+    else if((data.i_mode&EXT2_S_IFMT)!=EXT2_S_IFLNK)result=-22;
+    else if(data.i_size>4095)result=-36;
+    else if(!data.i_size)result=0;
+    else {
+        char* target=Ext2ReadSymlink(hold->mnt,&data);
+        if(!target)result=-5;
+        else {
+            uint32_t bytes=data.i_size<capacity?data.i_size:capacity;
+            for(uint32_t i=0;i<bytes;++i)out[i]=target[i];
+            result=static_cast<int>(bytes);kfree(target);
+        }
+    }
+    KRwLockReadUnlock(&g_ext2Lock);return result;
+}
+
+static Vnode* Ext2ObjectOpen(VfsObject* object,int flags,int* error)
+{
+    int localError=0;if(!error)error=&localError;*error=0;
+    // Never bypass the central VFS truncate/mapping gate or create by object.
+    constexpr int allowed=VFS_O_WRITE|VFS_O_READWRITE|VFS_O_APPEND|VFS_O_METADATA|VFS_O_EXEC;
+    if(flags&~allowed){*error=-22;return nullptr;}
+    if((flags&VFS_O_READWRITE) && !(flags&VFS_O_WRITE)){*error=-22;return nullptr;}
+    if((flags&VFS_O_EXEC) && (flags&(VFS_O_WRITE|VFS_O_READWRITE|VFS_O_APPEND))){*error=-22;return nullptr;}
+    if((flags&VFS_O_METADATA) && (flags&~VFS_O_METADATA)){*error=-22;return nullptr;}
+    auto* source=static_cast<Ext2OpenInode*>(object->priv);
+    Ext2Inode data;Ext2OpenInode* hold=nullptr;
+    KRwLockReadLock(&g_ext2Lock);
+    if(!Ext2ReadInode(source->mnt,source->inode,&data))*error=-5;
+    else {
+        uint16_t type=data.i_mode&EXT2_S_IFMT;
+        if(type!=EXT2_S_IFDIR && type!=EXT2_S_IFREG && type!=EXT2_S_IFSOCK &&
+           type!=EXT2_S_IFLNK)*error=-95;
+        else if(type==EXT2_S_IFLNK && !(flags&VFS_O_METADATA))*error=-40;
+        else if(type==EXT2_S_IFDIR && (flags&VFS_O_WRITE))*error=-21;
+        else if(type!=EXT2_S_IFDIR && type!=EXT2_S_IFREG &&
+                !(flags&VFS_O_METADATA))*error=-6;
+        if(!*error && !(flags&VFS_O_METADATA)) {
+            uint8_t required=(flags&VFS_O_EXEC)?1:((flags&VFS_O_WRITE)?2:4);
+            if(flags&VFS_O_READWRITE)required|=4;
+            VnodeStat stat{};Ext2FillStat(&stat,source->mnt,source->inode,data);
+            *error=(flags&VFS_O_EXEC) && type!=EXT2_S_IFREG ? -13:
+                Ext2AccessMetadata(source->mnt,&stat,required,false);
+        }
+        if(!*error) {
+            hold=Ext2HoldInode(source->mnt,source->inode);
+            if(!hold)*error=-12;
+        }
+    }
+    KRwLockReadUnlock(&g_ext2Lock);
+    if(!hold)return nullptr;
+    Vnode* node=Ext2VnodeFromHold(source->mnt,source->inode,data,hold);
+    if(!node)*error=-12;
+    return node;
+}
+
+static const VfsObjectOps g_ext2ObjectOps={
+    Ext2DestroyObject,Ext2ObjectStat,Ext2ObjectAccess,Ext2ObjectChild,
+    Ext2ObjectParent,Ext2ObjectReadlink,Ext2ObjectOpen,
+};
+static const VfsObjectOps* Ext2ObjectOperations(){return &g_ext2ObjectOps;}
+
+static int Ext2RootObject(void* privateMount,uint8_t,VfsObject** out)
+{
+    if(!out)return -22;
+    *out=nullptr;
+    if(!privateMount)return -22;
+    KRwLockReadLock(&g_ext2Lock);
+    int error=Ext2AcquireObject(static_cast<Ext2Mount*>(privateMount),EXT2_ROOT_INO,out);
+    KRwLockReadUnlock(&g_ext2Lock);return error;
+}
+static int Ext2ObjectFromVnode(Vnode* vnode,VfsObject** out)
+{
+    if(!out)return -22;
+    *out=nullptr;
+    Ext2OpenInode* hold=nullptr;
+    if(vnode && vnode->ops==&g_ext2DirOps)hold=static_cast<Ext2DirPriv*>(vnode->priv)->hold;
+    else if(vnode && (vnode->ops==&g_ext2FileOps || vnode->ops==&g_ext2SocketOps))
+        hold=static_cast<Ext2FilePriv*>(vnode->priv)->hold;
+    if(!hold)return -9;
+    KRwLockReadLock(&g_ext2Lock);
+    int error=Ext2AcquireObject(hold->mnt,hold->inode,out);
+    KRwLockReadUnlock(&g_ext2Lock);return error;
+}
+
 static const VfsFsOps g_ext2FsOps = {
     .mount      = Ext2FsMount,
     .unmount    = Ext2FsUnmount,
@@ -3889,6 +4104,8 @@ static const VfsFsOps g_ext2FsOps = {
     .check_access = Ext2CheckAccess,
     .check_access_real = Ext2CheckRealAccess,
     .create_socket = Ext2FsCreateSocket,
+    .root_object = Ext2RootObject,
+    .vnode_object = Ext2ObjectFromVnode,
 };
 
 // ---------------------------------------------------------------------------

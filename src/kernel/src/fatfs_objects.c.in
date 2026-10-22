@@ -1,0 +1,3 @@
+/* Compile upstream once, with Brook's configuration and object adapter. */
+#include "ff_upstream.c"
+#include "@BROOK_ROOT@/src/kernel/src/fatfs_object_adapter.inc"

@@ -1,4 +1,7 @@
 #include "vfs.h"
+#include "vfs_object.h"
+#include "vfs_path.h"
+#include "retained_path_walk.h"
 #include "memory/file_object.h"
 #include "memory/mapping_pin_registry.h"
 #include "panic.h"
@@ -103,9 +106,18 @@ struct MountEntry {
     uint8_t          pdrv;        // physical drive (for block FS)
     bool             used;
     uint64_t         vnodeHolds;
+    uint64_t         pathHolds;
+    uint64_t         publication;
+    VfsPath          covered;
+    uint64_t         rootIdentity;
+    const VfsObjectOps* rootObjectOps;
+    bool             rootIdentityKnown;
+    bool             linked;
 };
 
 static MountEntry g_mounts[VFS_MAX_MOUNTS];
+static MountEntry* g_rootMount;
+static uint64_t g_mountPublication;
 
 // Called under the namespace lock before a newly opened vnode is published.
 // Final close drops the hold only after the backend has finished using it.
@@ -143,6 +155,26 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
 {
     MountEntry* best      = nullptr;
     uint32_t    bestLen   = 0;
+    if(g_rootMount && g_rootMount->rootIdentityKnown) {
+        // A longest-prefix scan can resurrect descendants hidden by an
+        // overmount. Follow visible attachment edges from the current root.
+        best=g_rootMount;
+        for(uint32_t step=0;step<VFS_MAX_MOUNTS;++step) {
+            MountEntry* next=nullptr;uint32_t nextLength=~uint32_t{0};
+            for(auto& mount:g_mounts) {
+                if(!mount.used || !mount.linked || mount.covered.attachment!=best)continue;
+                const uint32_t length=StrLen(mount.mountPoint);bool match=true;
+                for(uint32_t i=0;i<length;++i)if(absPath[i]!=mount.mountPoint[i]) { match=false;break; }
+                if(!match || (absPath[length] && absPath[length]!='/'))continue;
+                if(length<nextLength) { next=&mount;nextLength=length; }
+            }
+            if(!next)break;
+            best=next;
+        }
+        bestLen=StrLen(best->mountPoint);
+        if(relPath) { const char* rem=absPath+bestLen;*relPath=*rem?rem:"/"; }
+        return best;
+    }
 
     for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i)
     {
@@ -154,7 +186,7 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
         }
         if (!match) continue;
         if (mpLen > 1 && absPath[mpLen] != '\0' && absPath[mpLen] != '/') continue;
-        if (mpLen > bestLen) { bestLen = mpLen; best = &g_mounts[i]; }
+        if (mpLen > bestLen || (mpLen==bestLen && best && g_mounts[i].publication>best->publication)) { bestLen = mpLen; best = &g_mounts[i]; }
     }
 
     if (best && relPath)
@@ -188,6 +220,7 @@ static int VfsLstatPathRaw(const char* path, VnodeStat* st)
         uint32_t length = StrLen(path);
         for (const auto& candidate : g_mounts) {
             if (!candidate.used || StrLen(candidate.mountPoint) <= length) continue;
+            if(g_rootMount && g_rootMount->rootIdentityKnown && FindMount(candidate.mountPoint,nullptr)!=&candidate)continue;
             bool match = true;
             for (uint32_t i = 0; i < length; ++i)
                 if (path[i] != candidate.mountPoint[i]) { match = false; break; }
@@ -247,11 +280,16 @@ static int VfsResolvePath(const char* path,char* out,uint32_t size,PathWalkOptio
 }
 static bool VfsTrailingSlash(const char* path) { uint32_t n=StrLen(path);return n>1 && path[n-1]=='/'; }
 
+// Object traversal shares the namespace transaction used by legacy mutations.
+#include "vfs_retained.inc"
+
 // ---- Public API ----
 
 void VfsInit()
 {
     KRwLockInit(&g_fileMutationLock);
+    g_rootMount=nullptr;
+    g_mountPublication=0;
     for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i) g_mounts[i].used = false;
     for (uint32_t i = 0; i < VFS_MAX_FS_DRIVERS; ++i) g_fsDrivers[i].used = false;
     SerialPuts("VFS: initialised\n");
@@ -260,7 +298,13 @@ void VfsInit()
 bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
 {
     FileMutationGuard mutation;
-    if (!mountPoint || !fsName) return false;
+    if (!mountPoint || mountPoint[0]!='/' || !fsName ||
+        StrLen(mountPoint)>=sizeof(MountEntry::mountPoint)) return false;
+    const bool isRoot=StrEq(mountPoint,"/");
+    // Root replacement and unresolved object attachments are deliberately not
+    // supported. Production boot installs the root before any child mounts.
+    if(isRoot && g_rootMount)return false;
+    if(isRoot)for(const auto& mount:g_mounts)if(mount.used)return false;
 
     const VfsFsOps* ops = FindFsDriver(fsName);
     if (!ops)
@@ -285,13 +329,33 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
         return false;
     }
 
-    slot->fsOps      = ops;
-    slot->mountPriv  = priv;
-    slot->pdrv       = pdrv;
-    slot->vnodeHolds = 0;
-    slot->used       = true;
-    StrCopy(slot->mountPoint, mountPoint, sizeof(slot->mountPoint));
-    StrCopy(slot->fsType, fsName, sizeof(slot->fsType));
+    *slot={};
+    slot->fsOps=ops;slot->mountPriv=priv;slot->pdrv=pdrv;
+    StrCopy(slot->mountPoint,mountPoint,sizeof(slot->mountPoint));
+    StrCopy(slot->fsType,fsName,sizeof(slot->fsType));
+    int error=0;
+    if(ops->root_object) {
+        VfsObject* object=nullptr;
+        error=ops->root_object(priv,pdrv,&object);
+        if(!error && (!object || !object->ops || !object->ops->stat))error=-5;
+        VnodeStat stat{};
+        if(!error)error=object->ops->stat(object,&stat);
+        if(!error && !stat.isDir)error=-20;
+        if(!error) { slot->rootIdentity=object->identity;slot->rootObjectOps=object->ops;slot->rootIdentityKnown=true; }
+        VfsObjectRelease(object);
+    }
+    if(!error && !isRoot && g_rootMount && g_rootMount->rootIdentityKnown)
+        error=VfsPrepareMountpointLocked(mountPoint,&slot->covered);
+    if(error) {
+        VfsPathRelease(slot->covered);*slot={};
+        // Rollback is private: no path or vnode has observed this mount.
+        if(ops->unmount)ops->unmount(priv);
+        return false;
+    }
+    slot->linked=isRoot || slot->covered.object;
+    slot->publication=++g_mountPublication;
+    slot->used=true;
+    if(isRoot)g_rootMount=slot;
 
     DbgPrintf("VFS: mounted '%s' at '%s' (pdrv=%u)\n", fsName, mountPoint, pdrv);
     return true;
@@ -299,30 +363,34 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
 
 bool VfsUnmount(const char* mountPoint)
 {
-    FileMutationGuard mutation;
-    if (!mountPoint) return false;
-    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i)
+    VfsPath covered{};
     {
-        if (!g_mounts[i].used) continue;
-        if (!StrEq(g_mounts[i].mountPoint, mountPoint)) continue;
-
-        // Backend-specific busy checks are additional policy, not substitutes
-        // for the VFS ownership of directories, metadata and procfs handles.
-        if (__atomic_load_n(&g_mounts[i].vnodeHolds,__ATOMIC_ACQUIRE)) return false;
-
-        if (g_mounts[i].fsOps && g_mounts[i].fsOps->can_unmount &&
-            !g_mounts[i].fsOps->can_unmount(g_mounts[i].mountPriv))
-            return false;
-
-        if (g_mounts[i].fsOps && g_mounts[i].fsOps->unmount &&
-            g_mounts[i].fsOps->unmount(g_mounts[i].mountPriv) != 0)
-            return false;
-
-        g_mounts[i].used = false;
-        SerialPrintf("VFS: unmounted '%s'\n", mountPoint);
-        return true;
+        FileMutationGuard mutation;
+        if(!mountPoint)return false;
+        MountEntry* selected=nullptr;
+        // Stacked attachments are removed top-first, identified by their edge
+        // rather than mount-table slot ordering.
+        for(auto& mount:g_mounts) {
+            if(!mount.used || !StrEq(mount.mountPoint,mountPoint))continue;
+            bool coveredByChild=false;
+            for(const auto& child:g_mounts)
+                if(child.used && child.covered.attachment==&mount)coveredByChild=true;
+            if(!coveredByChild)selected=&mount;
+        }
+        if(!selected)return false;
+        auto& mount=*selected;
+        if(__atomic_load_n(&mount.vnodeHolds,__ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&mount.pathHolds,__ATOMIC_ACQUIRE))return false;
+        if(mount.fsOps && mount.fsOps->can_unmount &&
+           !mount.fsOps->can_unmount(mount.mountPriv))return false;
+        if(mount.fsOps && mount.fsOps->unmount && mount.fsOps->unmount(mount.mountPriv))return false;
+        covered=mount.covered;mount.covered={};mount.used=false;
+        if(g_rootMount==selected)g_rootMount=nullptr;
     }
-    return false;
+    // Namespace edge is unpublished before its parent/object holds are dropped.
+    VfsPathRelease(covered);
+    SerialPrintf("VFS: unmounted '%s'\n",mountPoint);
+    return true;
 }
 
 uint32_t VfsRootMountCount()
@@ -474,6 +542,9 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
         return nullptr;
     }
     FileMutationGuard mutation((flags & (VFS_O_TRUNC | VFS_O_CREATE)) != 0);
+    if(flags & VFS_O_CREATE)if(int result=VfsReservedMutationLocked(path)) {
+        if(error)*error=result;return nullptr;
+    }
     if (!path || !path[0]) return nullptr;
 
     char resolved[512];
@@ -804,6 +875,7 @@ int VfsUnlink(const char* path) { return VfsRemovePath(path,false); }
 int VfsRemovePath(const char* path, bool directory)
 {
     FileMutationGuard mutation;
+    if(int error=VfsReservedMutationLocked(path,directory))return error;
     char resolved[512];
     if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{false,false,true})) return error;
     if (VfsTrailingSlash(resolved)) {
@@ -824,6 +896,7 @@ int VfsRemovePath(const char* path, bool directory)
 int VfsMkdir(const char* path,uint16_t mode)
 {
     FileMutationGuard mutation;
+    if(int error=VfsReservedMutationLocked(path))return error;
     char resolved[512];
     if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{false,true,true})) return error;
     const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative);
@@ -837,6 +910,7 @@ Vnode* VfsCreateSocket(const char* path, uint16_t mode, int* error)
     int localError = 0;
     if (!error) error = &localError;
     *error = 0;
+    if((*error=VfsReservedMutationLocked(path)))return nullptr;
     char resolved[512];
     if ((*error = VfsResolvePath(path, resolved, sizeof(resolved), {false, true, true})))
         return nullptr;
@@ -858,9 +932,12 @@ Vnode* VfsCreateSocket(const char* path, uint16_t mode, int* error)
 int VfsRename(const char* oldPath,const char* newPath)
 {
     FileMutationGuard mutation;
+    if(int error=VfsReservedMutationLocked(oldPath))return error;
+    if(int error=VfsReservedMutationLocked(newPath))return error;
     char oldResolved[512],newResolved[512];
     if (int error=VfsResolvePath(oldPath,oldResolved,sizeof(oldResolved),{false,false,true})) return error;
     if (int error=VfsResolvePath(newPath,newResolved,sizeof(newResolved),{false,true,true})) return error;
+    if(!StrEq(oldResolved,newResolved))if(int error=VfsReservedMutationLocked(newResolved,true))return error;
     if (VfsTrailingSlash(oldResolved) || VfsTrailingSlash(newResolved)) {
         VnodeStat st{};
         if (int error=VfsLstatPathRaw(oldResolved,&st)) return error;
@@ -874,13 +951,34 @@ int VfsRename(const char* oldPath,const char* newPath)
     MountEntry* oldMount=FindMount(oldResolved,&oldRelative);MountEntry* newMount=FindMount(newResolved,&newRelative);
     if (!oldMount || !newMount || !oldMount->fsOps) return -2;
     if (oldMount!=newMount) return -18;
-    return oldMount->fsOps->rename ? oldMount->fsOps->rename(oldMount->mountPriv,oldMount->pdrv,oldRelative,newRelative) : -95;
+    const uint32_t oldLength=StrLen(oldResolved),newLength=StrLen(newResolved);
+    auto renamedAncestor=[&](const MountEntry& mount) {
+        if(!mount.used || StrLen(mount.mountPoint)<=oldLength)return false;
+        // An upper attachment rename must not relabel a hidden lower tree
+        // whose opening labels happen to share the same textual prefix.
+        const MountEntry* ancestor=&mount;
+        for(uint32_t step=0;ancestor && ancestor!=oldMount && step<VFS_MAX_MOUNTS;++step)
+            ancestor=static_cast<MountEntry*>(ancestor->covered.attachment);
+        if(ancestor!=oldMount)return false;
+        for(uint32_t i=0;i<oldLength;++i)if(mount.mountPoint[i]!=oldResolved[i])return false;
+        return mount.mountPoint[oldLength]=='/';
+    };
+    for(const auto& mount:g_mounts)if(renamedAncestor(mount) &&
+        newLength+StrLen(mount.mountPoint+oldLength)>=sizeof(mount.mountPoint))return -36;
+    const int error=oldMount->fsOps->rename ? oldMount->fsOps->rename(oldMount->mountPriv,oldMount->pdrv,oldRelative,newRelative) : -95;
+    if(!error)for(auto& mount:g_mounts)if(renamedAncestor(mount)) {
+        char label[sizeof(mount.mountPoint)];StrCopy(label,newResolved,sizeof(label));
+        StrCopy(label+newLength,mount.mountPoint+oldLength,sizeof(label)-newLength);
+        StrCopy(mount.mountPoint,label,sizeof(mount.mountPoint));
+    }
+    return error;
 }
 
 int VfsSymlink(const char* target,const char* linkPath)
 {
     if (!target || !target[0]) return -22;
     FileMutationGuard mutation;
+    if(int error=VfsReservedMutationLocked(linkPath))return error;
     char resolved[512];
     if (int error=VfsResolvePath(linkPath,resolved,sizeof(resolved),{false,true,true})) return error;
     if (VfsTrailingSlash(resolved)) {
@@ -906,9 +1004,11 @@ void VfsClose(Vnode* vn)
 {
     if (!vn) return;
     auto* mount=static_cast<MountEntry*>(vn->mountOwner);
+    VfsObject* object=vn->backendObject;
     if (vn->ops && vn->ops->close) vn->ops->close(vn);
     kfree(vn->directoryPath);
     kfree(vn);
+    VfsObjectRelease(object);
     if (mount) __atomic_fetch_sub(&mount->vnodeHolds,uint64_t{1},__ATOMIC_RELEASE);
 }
 
