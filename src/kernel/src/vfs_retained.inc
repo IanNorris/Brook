@@ -188,6 +188,10 @@ struct VfsRetainedProvider {
         }
         VfsPathRelease(current);return -40;
     }
+    int FollowLink(const VfsPath& path,VfsPath& out) {
+        out={};int result=path.object->ops->follow_link?path.object->ops->follow_link(path.object,&out):0;
+        return result==1 && (!out.object || !out.attachment)?-5:result;
+    }
     int Readlink(const VfsPath& path,char* out,uint32_t size) {
         return path.object->ops->readlink?path.object->ops->readlink(path.object,out,size):-95;
     }
@@ -267,6 +271,10 @@ static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capac
         out[total]=0;
     }
     return 0;
+}
+int VfsPathDirectoryPathFromCallback(const VfsPath& path,char* out,uint32_t capacity)
+{
+    return VfsGlobalDirectoryLocked(path,out,capacity);
 }
 int VfsPathDirectoryPath(const VfsPath& path,char* out,uint32_t capacity)
 {

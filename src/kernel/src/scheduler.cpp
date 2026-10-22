@@ -1,3 +1,4 @@
+#include "process_fs.h"
 #include "scheduler.h"
 #include "irq_accounting.h"
 #include "idle_irq_accounting.h"
@@ -3481,8 +3482,7 @@ static void FillProcessSnapshot(const Process* p, ProcessSnapshot* out)
     for (; j + 1 < sizeof(out->name) && p->name[j]; ++j) out->name[j] = p->name[j];
     j = 0;
     for (; j + 1 < sizeof(out->exePath) && p->exePath[j]; ++j) out->exePath[j] = p->exePath[j];
-    j = 0;
-    for (; j + 1 < sizeof(out->cwd) && p->cwd[j]; ++j) out->cwd[j] = p->cwd[j];
+    ProcessFsReadDisplay(p,out->cwd,sizeof(out->cwd));
 }
 
 uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount)

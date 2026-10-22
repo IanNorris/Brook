@@ -1,3 +1,4 @@
+#include "process_fs.h"
 #include "unix_lifetime_trace.h"
 // Brook kernel shell — boot script executor and interactive command line.
 //
@@ -522,7 +523,9 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
 
     // Configure the unpublished child completely. Once SchedulerAddProcess
     // makes it runnable, even the next instruction may race its final reaping.
-    if (g_shellCwd[0]) StrCopy(proc->cwd, g_shellCwd, sizeof(proc->cwd));
+    if (g_shellCwd[0] && ProcessFsSetInitialCwd(proc,g_shellCwd)) {
+        ProcessDiscardUnpublished(proc);return -1;
+    }
     proc->straceEnabled = strace || straceErrors;
     proc->straceErrorsOnly = straceErrors;
     if (quiet) {
@@ -1722,7 +1725,7 @@ Process* ShellCreateDebugJob(int argc, const char* const* argv, const char* cwd,
 {
     ShellDispatchGuard dispatch;
     if (argc<1 || argc>64 || envc<0 || envc>64 || argv[0][0]!='/' ||
-        StrLen(argv[0])>=256 || StrLen(cwd)>=sizeof(Process::cwd) || cwd[0]!='/') return nullptr;
+        StrLen(argv[0])>=256 || StrLen(cwd)>=512 || cwd[0]!='/') return nullptr;
     VnodeStat stat;
     if (VfsStatPath(cwd,&stat)!=0 || !stat.isDir) return nullptr;
     char paths[5][256]{};char extra[4][256]{};
@@ -1771,7 +1774,8 @@ Process* ShellCreateDebugJob(int argc, const char* const* argv, const char* cwd,
     if (!proc) return nullptr;
     StrCopy(proc->exePath,executable,sizeof(proc->exePath));
     const char* base=argv[0];for (const char* p=base;*p;++p) if (*p=='/') base=p+1;
-    StrCopy(proc->name,base,sizeof(proc->name));StrCopy(proc->cwd,cwd,sizeof(proc->cwd));
+    StrCopy(proc->name,base,sizeof(proc->name));
+    if(ProcessFsSetInitialCwd(proc,cwd)) { ProcessDiscardUnpublished(proc);return nullptr; }
     return proc;
 }
 

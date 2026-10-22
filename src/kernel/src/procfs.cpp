@@ -1,3 +1,6 @@
+#include "process_fs.h"
+#include "spinlock.h"
+#include "vfs_object.h"
 #include "apic.h"
 // procfs — virtual /proc filesystem for Brook OS
 //
@@ -181,7 +184,8 @@ static int ProcFileStat(Vnode* vn, VnodeStat* st)
 {
     auto* pp = static_cast<ProcPriv*>(vn->priv);
     st->size = pp ? pp->size : 0;
-    st->isDir = false;
+    st->isDir = false;st->mode=0100444;st->dev=0x70726f63;
+    st->ino=vn->backendObject?vn->backendObject->identity:0;st->nlink=1;
     return 0;
 }
 
@@ -217,7 +221,8 @@ static int ProcDirStat(Vnode* vn, VnodeStat* st)
     }
     else st->nlink = 2;
     st->size = 0;
-    st->isDir = true;
+    st->isDir = true;st->mode=0040555;st->dev=0x70726f63;
+    if(vn->backendObject)st->ino=vn->backendObject->identity;
     return 0;
 }
 
@@ -689,14 +694,16 @@ static Vnode* GenPidExe(const ProcessSnapshot& proc)
 // /proc/[pid]/cwd — current working directory
 static Vnode* GenPidCwd(const ProcessSnapshot& proc)
 {
-    uint32_t len = ProcStrLen(proc.cwd);
-    if (len == 0) len = 1;  // fallback to "/"
-    auto* buf = static_cast<char*>(kmalloc(len + 2));
-    if (!buf) return nullptr;
-    if (proc.cwd[0])
-        ProcStrCopy(buf, proc.cwd, len + 1);
-    else
-        ProcStrCopy(buf, "/", 2);
+    Process* live=SchedulerFindProcessReference(proc.pid);
+    if(!live)return nullptr;
+    char cwd[512]{};
+    int error=live->incarnation==proc.incarnation?ProcessFsGetcwdFromVfsCallback(live,cwd,sizeof(cwd)):-2;
+    ProcessUnref(live);
+    if(error)return nullptr;
+    uint32_t len=ProcStrLen(cwd);
+    auto* buf=static_cast<char*>(kmalloc(len+2));
+    if(!buf)return nullptr;
+    ProcStrCopy(buf,cwd,len+1);
     buf[len] = '\n';
     return MakeProcVnode(buf, len + 1);
 }
@@ -1463,5 +1470,7 @@ static Vnode* GenPidFdLink(uint16_t pid, int fd, uint64_t incarnation)
     buf[len] = '\0';
     return MakeProcVnode(buf, len);
 }
+
+#include "procfs_objects.inc"
 
 } // namespace brook

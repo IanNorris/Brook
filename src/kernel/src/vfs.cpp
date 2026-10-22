@@ -773,14 +773,16 @@ int VfsTruncate(Vnode* vn, uint64_t size)
     return VfsTruncateLocked(vn, size);
 }
 
+static bool VfsMappedMutationBusy(const VnodeStat& stat)
+{
+    // Match the established mutation policy: Ext2 open-inode holders preserve
+    // orphaned/moved backing; FAT must protect the physical directory entry.
+    if(((stat.dev>>8)&0xfff)!=253)return false;
+    return g_mappingPins.Busy(stat.dev,stat.ino,stat.isDir);
+}
 static bool VfsMappedPathBusy(const char* path)
 {
-    VnodeStat st;
-    if (VfsLstatPathRaw(path, &st)) return false;
-    // ext2 open-inode holders preserve deleted/renamed backing. FAT has no
-    // persistent inode and must retain its physical directory entry instead.
-    if (((st.dev >> 8) & 0xfff) != 253) return false;
-    return g_mappingPins.Busy(st.dev,st.ino,st.isDir);
+    VnodeStat stat{};return !VfsLstatPathRaw(path,&stat) && VfsMappedMutationBusy(stat);
 }
 
 

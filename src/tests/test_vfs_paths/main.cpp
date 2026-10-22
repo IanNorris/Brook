@@ -9,10 +9,13 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include "process.h"
+#include "process_fs.h"
 #include "../../kernel/src/vfs.cpp"
 
 namespace {
 std::shared_mutex namespaceLock;
+brook::VfsPath magicTarget{};
 std::mutex allocationLock;
 std::unordered_set<void*> allocations;
 long failAllocation=-1;
@@ -48,7 +51,12 @@ brook::Vnode* objectOpen(brook::VfsObject* object,int,int* error){
     *vn={};vn->ops=&nodeOps;vn->type=node(object).dir?brook::VnodeType::Dir:brook::VnodeType::File;vn->refCount=1;
     vn->backendObject=object;brook::VfsObjectRetain(object);return vn;
 }
-const brook::VfsObjectOps objectOps={destroyObject,objectStat,objectAccess,objectChild,objectParent,objectReadlink,objectOpen};
+int objectFollow(brook::VfsObject* object,brook::VfsPath* out) {
+    *out={};if(node(object).target!="magic-reporting-only")return 0;
+    *out=magicTarget;brook::VfsPathRetain(*out);return 1;
+}
+const brook::VfsObjectOps objectOps={.destroy=destroyObject,.stat=objectStat,.access=objectAccess,
+    .lookup=objectChild,.parent=objectParent,.readlink=objectReadlink,.open=objectOpen,.follow_link=objectFollow};
 bool mountBackend(uint8_t drive,void** out){assert(drive<8 && !mounts[drive].alive);auto& m=mounts[drive];m.alive=true;m.root={&m,1,true,&m.root,{}, {}};*out=&m;return true;}
 int unmountBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive && !m->live);m->alive=false;return 0;}
 int rootObject(void* priv,uint8_t,brook::VfsObject** out){return makeObject(&static_cast<Mount*>(priv)->root,out);}
@@ -99,6 +107,50 @@ extern "C" void SerialPrintf(const char*,...){}
 void SerialPuts(const char*){}
 int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -5;}
 }
+// Actual Process publication helpers and FsContext core. These exercise owned
+// context handoff/failure/races; native acceptance covers actual clone/exec.
+static void testProcessContexts(const brook::VfsPath& root,const brook::VfsPath& cwd) {
+    using namespace brook;
+    Process parent{},copy{},shared{},privateThread{};
+    int error=0;auto* context=FsContextCreate(root,cwd,022,&error);assert(context&&!error);
+    ProcessFsReplaceOwned(&parent,context);
+    assert(!ProcessFsInherit(&copy,&parent,false));
+    assert(!ProcessFsInherit(&shared,&parent,true));
+    assert(!ProcessFsInherit(&privateThread,&parent,false));
+    assert(ProcessFsExchangeMask(&shared,077)==022);
+    assert(ProcessFsMask(&parent)==077 && ProcessFsMask(&copy)==022 && ProcessFsMask(&privateThread)==022);
+    assert(!ProcessFsSetCwd(&shared,root));
+    FsSnapshot snapshot{};assert(!ProcessFsSnapshot(&parent,&snapshot));
+    assert(VfsPathSame(snapshot.cwd,root));FsSnapshotRelease(&snapshot);
+    assert(!ProcessFsSnapshot(&copy,&snapshot));assert(VfsPathSame(snapshot.cwd,cwd));FsSnapshotRelease(&snapshot);
+    // Failed independent copy cannot publish a borrowed reference or mutate
+    // the source. Subsequent unpublished-child cleanup is safe.
+    Process failed{};failAllocation=0;assert(ProcessFsInherit(&failed,&parent,false)==-12);failAllocation=-1;
+    assert(!failed.fsContext && ProcessFsMask(&parent)==077);ProcessFsClear(&failed);
+    // Exercise explicit context replacement, including preparation OOM.
+    failAllocation=0;assert(!ProcessFsCopy(&parent,&error)&&error==-12);failAllocation=-1;
+    auto* prepared=ProcessFsCopy(&parent,&error);assert(prepared&&!error);
+    ProcessFsReplaceOwned(&parent,prepared);
+    assert(ProcessFsExchangeMask(&parent,027)==077 && ProcessFsMask(&shared)==077);
+    std::atomic<bool> start{false};
+    std::thread reader([&] {
+        while(!start.load(std::memory_order_acquire))std::this_thread::yield();
+        for(unsigned i=0;i<4000;++i) {
+            auto* held=ProcessFsAcquire(&parent);assert(held);
+            FsSnapshot fs{};assert(!FsContextSnapshot(held,&fs));
+            assert(VfsPathSame(fs.root,root));
+            FsSnapshotRelease(&fs);FsContextRelease(held);
+        }
+    });
+    start.store(true,std::memory_order_release);
+    for(unsigned i=0;i<1000;++i) {
+        auto* replacement=ProcessFsCopy(&parent,&error);assert(replacement&&!error);
+        ProcessFsReplaceOwned(&parent,replacement);
+    }
+    reader.join();
+    ProcessFsClear(&parent);ProcessFsClear(&copy);ProcessFsClear(&shared);ProcessFsClear(&privateThread);
+    assert(!parent.fsContext && !copy.fsContext && !shared.fsContext && !privateThread.fsContext);
+}
 int main(){
     using namespace brook;
     VfsInit();assert(VfsRegisterFs("objects",&fsOps));assert(VfsRegisterFs("unsupported",&unsupportedOps));
@@ -106,6 +158,7 @@ int main(){
     Node directory{&mounts[0],2,true,&mounts[0].root,{},{}}, marker{&mounts[0],3,false,&directory,{},{}}, poison{&mounts[0],4,true,&mounts[0].root,{},{}}, file{&mounts[0],5,false,&mounts[0].root,{},{}}, link{&mounts[0],6,false,&directory,{},"/dir/marker"};
     mounts[0].root.children={{"dir",&directory},{"file",&file}};directory.children={{"marker",&marker},{"absolute",&link}};
     VfsPath root{},held{};assert(!VfsPathRoot(&root));held=resolve(root,root,"/dir");
+    testProcessContexts(root,held);
     auto original=resolve(root,held,"marker");expect(root,held,"absolute",original);
     // The actual namespace lock stabilizes lookup against a hostile rename.
     {
@@ -127,6 +180,15 @@ int main(){
     assert(VfsMount("/moved","objects",1));
     auto mounted=resolve(root,root,"/moved");assert(mounted.attachment!=held.attachment);
     expect(root,held,"marker",original);expect(root,mounted,"..",root);
+    Node magic{&mounts[0],11,false,&mounts[0].root,{},"magic-reporting-only"};
+    mounts[0].root.children["magic"]=&magic;magicTarget=held;
+    // The reported text is intentionally invalid. Following must use the
+    // retained lower cwd even after it is covered by another mount.
+    expect(root,root,"/magic/marker",original);
+    auto magicDirectory=resolve(root,root,"/magic");assert(VfsPathSame(magicDirectory,held));VfsPathRelease(magicDirectory);
+    char reported[64]{};assert(VfsReadlinkAt(root,root,"/magic",reported,sizeof(reported))==20);
+    assert(!std::strcmp(reported,"magic-reporting-only"));magicTarget={};
+    mounts[0].root.children.erase("magic");
     assert(VfsRemovePath("/moved",true)==-16);
     assert(VfsRename("/moved","/bad")==-16);
     assert(VfsMount("/moved/inside","objects",3));

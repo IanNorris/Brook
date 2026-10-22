@@ -8,6 +8,8 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process.h"
+#include "process_fs.h"
+#include <stddef.h>
 #include "posix_timer.h"
 #include "sysv_sem.h"
 #include "exec_limits.h"
@@ -39,6 +41,8 @@
 #include "vdso.h"
 
 namespace brook {
+static_assert(offsetof(Process,fsContext)+sizeof(Process::fsContext)==sizeof(Process),
+              "fork/thread snapshot boundary must remain the final field");
 
 namespace {
 IrqSpinLock signalActionLock;
@@ -223,6 +227,7 @@ static inline void FreeProcessStruct(Process* p)
                          haveSym ? sym : "?", off);
         }
 
+        ProcessFsClear(p);
         ProcessGroupsRelease(p->groups); p->groups = nullptr;
         MappingBackingUnref(p->fbBacking);p->fbBacking=nullptr;
         AddressSpaceUnref(p->addressSpace);
@@ -657,10 +662,17 @@ static constexpr uint64_t INTERP_LOAD_BASE = 0x7F0000000000ULL; // ~127 TB
 // proc->elf.interpPath.  Returns the interpreter entry point, or 0 on
 // failure.  The interpreter is loaded at INTERP_LOAD_BASE.
 // ---------------------------------------------------------------------------
-static int ReadInterpreterImage(const char* path,ExecutableImage* image)
+static int ReadInterpreterImage(Process* process,const char* path,ExecutableImage* image)
 {
     *image={};Vnode* vnode=nullptr;char resolved[256];
-    int error=VfsOpenExecutable(path,&vnode,resolved,sizeof(resolved));
+    FsSnapshot fs{};int error=ProcessFsSnapshot(process,&fs);
+    if(error && (!process || process->isKernelThread)) {
+        error=VfsPathRoot(&fs.root);
+        if(!error) {fs.cwd=fs.root;VfsPathRetain(fs.cwd);}
+    }
+    if(error)return error;
+    struct Drop {FsSnapshot* fs;~Drop(){FsSnapshotRelease(fs);}} drop{&fs};
+    error=VfsOpenExecutableAt(fs.root,fs.cwd,path,&vnode,resolved,sizeof(resolved));
     // Historical aliases remain compatibility fallbacks for missing paths,
     // never a way around an existing interpreter's permission denial.
     char alternate[256];
@@ -668,7 +680,7 @@ static int ReadInterpreterImage(const char* path,ExecutableImage* image)
         const uint32_t length=strlen(path);
         if(length+5>=sizeof(alternate))return -36;
         memcpy(alternate,"/boot",5);memcpy(alternate+5,path,length+1);
-        error=VfsOpenExecutable(alternate,&vnode,resolved,sizeof(resolved));
+        error=VfsOpenExecutableAt(fs.root,fs.cwd,alternate,&vnode,resolved,sizeof(resolved));
     }
     if(error==-2) {
         const char* name=path;
@@ -676,7 +688,7 @@ static int ReadInterpreterImage(const char* path,ExecutableImage* image)
         const uint32_t length=strlen(name);
         if(length+10>=sizeof(alternate))return -36;
         memcpy(alternate,"/boot/lib/",10);memcpy(alternate+10,name,length+1);
-        error=VfsOpenExecutable(alternate,&vnode,resolved,sizeof(resolved));
+        error=VfsOpenExecutableAt(fs.root,fs.cwd,alternate,&vnode,resolved,sizeof(resolved));
     }
     if(error)return error;
     error=ReadExecutableImage(vnode,image);VfsClose(vnode);
@@ -693,7 +705,7 @@ int PrepareExecInterpreter(const ExecutableImage& main,ExecutableImage* output)
     if(!output)return -22;
     *output={};char path[sizeof(ElfBinary{}.interpPath)];
     if(!ElfMainInterpreter(main.data,main.size,path,sizeof(path)))return -8;
-    return path[0]?ReadInterpreterImage(path,output):0;
+    return path[0]?ReadInterpreterImage(ProcessCurrent(),path,output):0;
 }
 
 static uint64_t LoadInterpreter(Process* proc,const ExecutableImage* prepared=nullptr)
@@ -701,7 +713,7 @@ static uint64_t LoadInterpreter(Process* proc,const ExecutableImage* prepared=nu
     if(!proc->elf.interpPath[0])return 0;
     ExecutableImage owned{};
     if(!prepared) {
-        const int error=ReadInterpreterImage(proc->elf.interpPath,&owned);
+        const int error=ReadInterpreterImage(proc,proc->elf.interpPath,&owned);
         if(error) {SerialPrintf("INTERP: open/load error %d for '%s'\n",error,proc->elf.interpPath);return 0;}
         prepared=&owned;
     }
@@ -752,7 +764,6 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     proc->tlbCpuMask = 0;
 
     proc->schedPriority = 2;  // SCHED_PRIORITY_NORMAL
-    proc->umask = 022;         // Default umask
 
     // Allocate shared fd table (shared across CLONE_FILES threads).
     proc->fds = AllocFdTable();
@@ -764,9 +775,9 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
         return nullptr;
     }
 
-    // Default working directory
-    proc->cwd[0] = '/'; proc->cwd[1] = 'b'; proc->cwd[2] = 'o';
-    proc->cwd[3] = 'o'; proc->cwd[4] = 't'; proc->cwd[5] = '\0';
+    if(ProcessFsInitialize(proc)) {
+        kfree(proc->fds);SchedulerFreePid(proc->pid);FreeProcessStruct(proc);return nullptr;
+    }
 
     // Allocate per-process kernel stack with guard pages (for ring 3→0 transitions).
     VirtualAddress kstackAddr = VmmAllocKernelStack(KERNEL_STACK_PAGES,
@@ -1119,7 +1130,7 @@ void ProcessDestroy(Process* proc)
 // The child's trampoline returns to user mode with RAX=0 (fork return value).
 
 Process* ProcessFork(Process* parent, uint64_t userRip,
-                     uint64_t userRsp, uint64_t userRflags)
+                     uint64_t userRsp, uint64_t userRflags,bool shareFs)
 {
     if (!parent || parent->isKernelThread) return nullptr;
     ProcessOperationGuard operation(parent);
@@ -1128,7 +1139,13 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     if (!child) return nullptr;
 
     // Copy entire parent process struct as a starting point
-    memcpy(child, parent, sizeof(Process));
+    // Exclude the concurrently replaceable filesystem-context pointer from
+    // the raw snapshot. No borrowed reference can escape into an unwind.
+    memset(child,0,sizeof(Process));memcpy(child,parent,offsetof(Process,cwdDisplay));
+    constexpr size_t displayEnd=offsetof(Process,cwdDisplay)+sizeof(child->cwdDisplay);
+    memcpy(reinterpret_cast<char*>(child)+displayEnd,reinterpret_cast<const char*>(parent)+displayEnd,
+           offsetof(Process,fsContext)-displayEnd);
+    ProcessFsReadDisplay(parent,child->cwdDisplay,sizeof(child->cwdDisplay));
     child->gpuAppCtx = 0; // Legacy GPU context belongs to the parent, not the fork.
 
     InheritCredentials(child, parent);
@@ -1169,6 +1186,10 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
         SerialPuts("FORK: PID allocation failed\n");
         FreeProcessStruct(child);
         return nullptr;
+    }
+
+    if(ProcessFsInherit(child,parent,shareFs)) {
+        SchedulerFreePid(child->pid);FreeProcessStruct(child);return nullptr;
     }
 
     // Fork gets its own fd table (copied from parent below). The memcpy
@@ -1321,7 +1342,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
 
 Process* ProcessCreateThread(Process* parent, uint64_t userRip,
                              uint64_t userRsp, uint64_t userRflags,
-                             uint64_t tlsBase)
+                             uint64_t tlsBase,bool shareFs)
 {
     if (!parent || parent->isKernelThread) return nullptr;
     ProcessOperationGuard credentialOperation(ProcessCurrent());
@@ -1330,7 +1351,11 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     if (!thread) return nullptr;
 
     // Copy parent process struct as starting point
-    memcpy(thread, parent, sizeof(Process));
+    memset(thread,0,sizeof(Process));memcpy(thread,parent,offsetof(Process,cwdDisplay));
+    constexpr size_t displayEnd=offsetof(Process,cwdDisplay)+sizeof(thread->cwdDisplay);
+    memcpy(reinterpret_cast<char*>(thread)+displayEnd,reinterpret_cast<const char*>(parent)+displayEnd,
+           offsetof(Process,fsContext)-displayEnd);
+    ProcessFsReadDisplay(parent,thread->cwdDisplay,sizeof(thread->cwdDisplay));
     InheritCredentials(thread, parent);
     thread->addressSpace = nullptr;
     thread->fbBacking = nullptr;
@@ -1346,6 +1371,10 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     {
         FreeProcessStruct(thread);
         return nullptr;
+    }
+
+    if(ProcessFsInherit(thread,parent,shareFs)) {
+        SchedulerFreePid(thread->pid);FreeProcessStruct(thread);return nullptr;
     }
 
     // Thread group: inherit parent's tgid directly. We must NOT dereference
@@ -1595,7 +1624,7 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
 
     ProcessOperationGuard operation(proc);
     AddressSpaceState* replacement = AddressSpaceCreate(proc->pid);
-    if (!replacement) return 0;
+    if (!replacement)return 0;
     bool wasThread = proc->isThread;
     FdEntry* privateFds = nullptr;
     if (wasThread) {
@@ -1628,6 +1657,8 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     // The source was cleared through framebufferLock before AS replacement.
     proc->fbDestX = 0;proc->fbDestY = 0;proc->fbScale = 0;proc->fbExitColor = 0;
 
+    // Linux exec preserves CLONE_FS sharing of cwd/root/umask. Only the
+    // descriptor table above is unshared; this process keeps its context ref.
     AddressSpaceUnref(previous);
 
     // Any user-space pointers the kernel held into the old address space are

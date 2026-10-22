@@ -1,3 +1,4 @@
+#include "process_fs.h"
 #include "unix_lifetime_trace.h"
 #include "file_locks.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
@@ -3057,10 +3058,51 @@ DrmBackingDiagnostics DrmBackingDiagnosticsRead() {
             __atomic_load_n(&d.failedRetirements,__ATOMIC_RELAXED)};
 }
 
-static int ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize);
+// Own a filesystem snapshot and, when used, an independently retained dirfd
+// object. Descriptor pins are dropped after acquisition, never under VFS locks.
+struct AtLookup {
+    FsSnapshot fs{};
+    VfsPath directory{};
+    const VfsPath& start() const { return directory.object?directory:fs.cwd; }
+    void Clear() { VfsPathRelease(directory);directory={};FsSnapshotRelease(&fs); }
+    ~AtLookup() { Clear(); }
+    int Init(int fd,const char* text) {
+        if(!text)return -EINVAL;
+        if(!text[0])return -ENOENT;
+        int error=ProcessFsSnapshot(ProcessCurrent(),&fs);if(error)return error;
+        if(text[0]=='/') {directory=fs.root;VfsPathRetain(directory);return 0;}
+        if(fd==-100)return 0;
+        FdRef ref(ProcessCurrent(),fd);
+        if(!ref)return -EBADF;
+        if(ref->type!=FdType::Vnode || !ref->handle)return -ENOTDIR;
+        auto* vnode=static_cast<Vnode*>(ref->handle);
+        if(vnode->type!=VnodeType::Dir)return -ENOTDIR;
+        return VfsPathFromVnode(vnode,&directory);
+    }
+    // Synthetic proc/dev and historical aliases only. Never feed this name to
+    // normal filesystem operations. Reject hidden retained starts: a current
+    // global label must not redirect a lower cwd into an overmount.
+    int SyntheticName(const char* text,char* out,uint32_t capacity) const {
+        if(text[0]=='/') {
+            size_t bytes=strlen(text)+1;if(bytes>capacity)return -36;
+            memcpy(out,text,bytes);return 0;
+        }
+        char parent[512];int error=VfsPathDirectoryPath(start(),parent,sizeof(parent));
+        if(error)return error;
+        VfsPath visible{};error=VfsPathResolve(fs.root,fs.root,parent,&visible);
+        bool same=!error && VfsPathSame(start(),visible);VfsPathRelease(visible);
+        if(!same)return error?error:-95;
+        size_t prefix=strlen(parent),suffix=strlen(text);
+        bool slash=prefix && parent[prefix-1]!='/';
+        if(prefix+slash+suffix>=capacity)return -36;
+        memcpy(out,parent,prefix);if(slash)out[prefix++]='/';
+        memcpy(out+prefix,text,suffix+1);return 0;
+    }
+    AtLookup()=default;AtLookup(const AtLookup&)=delete;AtLookup& operator=(const AtLookup&)=delete;
+};
 
-static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
-                         uint64_t, uint64_t, uint64_t)
+
+static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_t mode)
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
@@ -3087,21 +3129,18 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return -EFAULT;
     }
 
-    // Resolve relative paths against the process's CWD.
-    char resolvedPath[256];
-    const char* lookupPath = path;
-    if (!path[0]) return -ENOENT;
-    if (path[0] != '/') {
-        if (int error = ResolveAtPath(-100, path, resolvedPath, sizeof(resolvedPath))) return error;
-        lookupPath = resolvedPath;
-    }
+    AtLookup at;if(int error=at.Init(dirfd,path))return error;
+    char resolvedPath[512];
+    bool hasSyntheticName=!at.SyntheticName(path,resolvedPath,sizeof(resolvedPath));
+    const char* lookupPath=hasSyntheticName?resolvedPath:path;
+    const char* syntheticPath=hasSyntheticName?resolvedPath:"";
 
     bool procFdPath = false;
-    int procFdResult = OpenProcMemFd(proc, lookupPath, flags, &procFdPath);
+    int procFdResult = OpenProcMemFd(proc, syntheticPath, flags, &procFdPath);
     if (procFdPath) return procFdResult;
 
     // Device paths
-    if (StrEq(path, "/dev/fb0"))
+    if (StrEq(syntheticPath, "/dev/fb0"))
     {
         int fd = FdAlloc(proc, FdType::DevFramebuf, nullptr);
         if (fd < 0) return -EMFILE;
@@ -3109,7 +3148,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         return fd;
     }
 
-    if (StrEq(path, "keyboard") || StrEq(path, "/dev/keyboard"))
+    if (StrEq(syntheticPath, "keyboard") || StrEq(syntheticPath, "/dev/keyboard"))
     {
         int fd = FdAlloc(proc, FdType::DevKeyboard, nullptr);
         if (fd < 0) return -EMFILE;
@@ -3121,7 +3160,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     // In WM terminal mode (stdin is a pipe), dup the stdin pipe so bash's
     // /dev/tty reads go through the terminal's input pipe instead of consuming
     // raw keyboard events from the input subsystem.
-    if (StrEq(path, "/dev/tty") || StrEq(path, "/dev/console"))
+    if (StrEq(syntheticPath, "/dev/tty") || StrEq(syntheticPath, "/dev/console"))
     {
         if (proc->fds[0].type == FdType::Pipe && proc->fds[0].handle &&
             proc->fds[1].type == FdType::Pipe && proc->fds[1].handle)
@@ -3152,7 +3191,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     // drive it. Only the render node (no card0/KMS) is offered. Available only
     // when a 3D driver has registered GpuAppOps. (GL shim — see
     // artifacts/gl-drm-enumeration-spike.md.)
-    if (StrEq(path, "/dev/dri/renderD128"))
+    if (StrEq(syntheticPath, "/dev/dri/renderD128"))
     {
         if (!brook::GpuAppGet()) return -ENODEV;
         auto* dctx = static_cast<DrmCtx*>(kmalloc(sizeof(DrmCtx)));
@@ -3172,7 +3211,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     // /dev/dri directory — enumerable so libdrm's drmGetDevices2 can list the
     // render node. Allocate a synthetic-directory fd (recognised by the marker
     // handle in getdents64/fstat). Only when a 3D driver is present.
-    if (StrEq(path, "/dev/dri") && brook::GpuAppGet())
+    if (StrEq(syntheticPath, "/dev/dri") && brook::GpuAppGet())
     {
         int fd = FdAlloc(proc, FdType::SyntheticMem,
                          const_cast<char*>(g_drmDriDirTag));
@@ -3186,7 +3225,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     // Served as read-only synthetic memory files for libdrm PCI device parsing.
     if (brook::GpuAppGet())
     {
-        const char* drmAttr = DrmSysAttrContent(path);
+        const char* drmAttr = DrmSysAttrContent(syntheticPath);
         if (drmAttr)
         {
             int fd = FdAlloc(proc, FdType::SyntheticMem, const_cast<char*>(drmAttr));
@@ -3197,7 +3236,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     }
 
     // /dev/null — discard writes, EOF on read
-    if (StrEq(path, "/dev/null"))
+    if (StrEq(syntheticPath, "/dev/null"))
     {
         int fd = FdAlloc(proc, FdType::DevNull, nullptr);
         if (fd < 0) return -EMFILE;
@@ -3205,7 +3244,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     }
 
     // /dev/urandom, /dev/random — RDRAND-backed random bytes
-    if (StrEq(path, "/dev/urandom") || StrEq(path, "/dev/random"))
+    if (StrEq(syntheticPath, "/dev/urandom") || StrEq(syntheticPath, "/dev/random"))
     {
         int fd = FdAlloc(proc, FdType::DevUrandom, nullptr);
         if (fd < 0) return -EMFILE;
@@ -3213,7 +3252,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     }
 
     // /dev/klog — kernel log ring buffer reader
-    if (StrEq(path, "/dev/klog"))
+    if (StrEq(syntheticPath, "/dev/klog"))
     {
         // Allocate a cursor (uint32_t) to track read position in ring buffer.
         auto* cursor = static_cast<uint32_t*>(kmalloc(sizeof(uint32_t)));
@@ -3226,7 +3265,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     }
 
     // /dev/dsp — OSS audio output
-    if (StrEq(path, "/dev/dsp"))
+    if (StrEq(syntheticPath, "/dev/dsp"))
     {
         if (!AudioAvailable()) return -ENODEV;
         auto* dsp = static_cast<DspState*>(kmalloc(sizeof(DspState)));
@@ -3282,7 +3321,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 
         for (auto* sf = syntheticFiles; sf->path; ++sf)
         {
-            if (StrEq(lookupPath, sf->path))
+            if (StrEq(syntheticPath, sf->path))
             {
                 // Store pointer to static content in handle, seekPos=0
                 int fd = FdAlloc(proc, FdType::SyntheticMem, const_cast<char*>(sf->content));
@@ -3293,7 +3332,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         }
 
         // Dynamic /etc/resolv.conf — generated from DHCP DNS server
-        if (StrEq(lookupPath, "/etc/resolv.conf"))
+        if (StrEq(syntheticPath, "/etc/resolv.conf"))
         {
             static char resolvBuf[128];
             auto* nif = brook::NetGetIf();
@@ -3330,17 +3369,17 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     }
 
     // /proc/self/exe → return ENOENT for now (readlink handles it)
-    if (StrEq(lookupPath, "/proc/self/exe"))
+    if (StrEq(syntheticPath, "/proc/self/exe"))
         return -ENOENT;
 
     // /dev/shm/<name> — POSIX shared memory via memfd
     // glibc shm_open() calls open("/dev/shm/<name>", flags, mode)
-    if (lookupPath[0] == '/' &&
-        lookupPath[1] == 'd' && lookupPath[2] == 'e' && lookupPath[3] == 'v' &&
-        lookupPath[4] == '/' && lookupPath[5] == 's' && lookupPath[6] == 'h' &&
-        lookupPath[7] == 'm' && lookupPath[8] == '/')
+    if (syntheticPath[0] == '/' &&
+        syntheticPath[1] == 'd' && syntheticPath[2] == 'e' && syntheticPath[3] == 'v' &&
+        syntheticPath[4] == '/' && syntheticPath[5] == 's' && syntheticPath[6] == 'h' &&
+        syntheticPath[7] == 'm' && syntheticPath[8] == '/')
     {
-        return NamedShmOpen(proc,lookupPath+9,static_cast<uint32_t>(flags));
+        return NamedShmOpen(proc,syntheticPath+9,static_cast<uint32_t>(flags));
     }
 
     // Translate Linux open flags to VFS flags
@@ -3360,7 +3399,13 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     if (flags & LINUX_O_APPEND) vfsFlags |= VFS_O_APPEND;
 
     int openError = 0;
-    Vnode* vn = VfsOpenModeChecked(lookupPath, vfsFlags, static_cast<uint16_t>(mode & 07777), &openError);
+    Vnode* vn=VfsOpenAt(at.fs.root,at.start(),path,vfsFlags,static_cast<uint16_t>(mode&07777),at.fs.mask,&openError,
+                          !(flags&0x20000)); // O_NOFOLLOW
+    // procfs remains an explicit synthetic namespace broker. It does not
+    // implement retained objects and is never used to reconstruct disk paths.
+    if(!vn && openError==-95 && hasSyntheticName &&
+       (!strncmp(syntheticPath,"/proc/",6) || StrEq(syntheticPath,"/proc")))
+        vn=VfsOpenModeChecked(syntheticPath,vfsFlags,static_cast<uint16_t>(mode&07777),&openError);
     if (!vn && openError && openError != -ENOENT) return openError;
 
     // Preserve /boot aliases for legacy applications, but Nix store paths
@@ -3368,7 +3413,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
     // a compiler's -L directory must not resolve to the boot disk's musl:
     // doing so links musl into otherwise glibc-based executables.
     bool nixStorePath = strncmp(lookupPath, "/nix/store/", 11) == 0;
-    if (!vn && lookupPath[0] == '/' && !nixStorePath)
+    if (!vn && hasSyntheticName && lookupPath[0] == '/' && !nixStorePath)
     {
         // Try /boot prefix first
         char bootPath[256] = "/boot";
@@ -3377,8 +3422,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
         while (*p && bi + 1 < sizeof(bootPath)) bootPath[bi++] = *p++;
         bootPath[bi] = '\0';
         if (!*p) { // Never open a silently truncated alias.
-            vn = VfsOpenModeChecked(bootPath, vfsFlags,
-                                    static_cast<uint16_t>(mode & 07777), &openError);
+            vn=VfsOpenAt(at.fs.root,at.fs.root,bootPath,vfsFlags,static_cast<uint16_t>(mode&07777),at.fs.mask,&openError);
             if (!vn && openError && openError != -ENOENT) return openError;
         }
 
@@ -3417,7 +3461,7 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
                 uint32_t li = 10;
                 while (*fname && li + 1 < sizeof(libPath)) libPath[li++] = *fname++;
                 libPath[li] = '\0';
-                if (!*fname) vn = VfsOpenMode(libPath, vfsFlags, 0);
+                if (!*fname) vn=VfsOpenAt(at.fs.root,at.fs.root,libPath,vfsFlags,0,at.fs.mask,&openError);
                 if (vn && vn->type != VnodeType::File) {
                     VfsClose(vn);
                     vn = nullptr;
@@ -3477,6 +3521,11 @@ static int64_t sys_open(uint64_t pathAddr, uint64_t flags, uint64_t mode,
 
     return fd;
 }
+static int64_t sys_open(uint64_t path,uint64_t flags,uint64_t mode,uint64_t,uint64_t,uint64_t)
+{
+    return OpenAtInternal(-100,path,flags,mode);
+}
+
 
 // Linux creat is precisely open(O_WRONLY|O_CREAT|O_TRUNC), including mode,
 // umask, descriptor access and the regular-file truncate/mapping safeguards.
@@ -4526,6 +4575,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     // Clone flags used by musl pthread_create:
     //   CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
     //   CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID
+    static constexpr uint64_t CLONE_FS             = 0x00000200;
     static constexpr uint64_t CLONE_THREAD         = 0x00010000;
     static constexpr uint64_t CLONE_SETTLS          = 0x00080000;
     static constexpr uint64_t CLONE_PARENT_SETTID   = 0x00100000;
@@ -4553,7 +4603,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     {
         // Thread creation: share address space
         uint64_t tls = (flags & CLONE_SETTLS) ? tlsAddr : parent->fsBase;
-        child = ProcessCreateThread(parent, userRip, userRsp, userRflags, tls);
+        child = ProcessCreateThread(parent, userRip, userRsp, userRflags, tls,(flags & CLONE_FS)!=0);
         if (!child) return -ENOMEM;
 
         // CLONE_CHILD_CLEARTID: store address for thread exit cleanup
@@ -4563,7 +4613,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     else
     {
         // Fork: copy address space
-        child = ProcessFork(parent, userRip, userRsp, userRflags);
+        child = ProcessFork(parent, userRip, userRsp, userRflags,(flags & CLONE_FS)!=0);
         if (!child) return -ENOMEM;
     }
 
@@ -4897,35 +4947,27 @@ resolve_path:
         if(bytes>sizeof(kPath))return -36;
         memcpy(kPath,proc->exePath,bytes);
     }
+    AtLookup executableLookup;if(int error=executableLookup.Init(-100,kPath))return error;
     char resolvedPath[256];
-    bool found = false;
-
-    // Try path as-is (or with CWD prefix)
-    const char* lookupPath = kPath;
-    if (kPath[0] != '/' && proc->cwd[0] != '\0')
-    {
-        uint32_t ci = 0;
-        for (uint32_t j = 0; proc->cwd[j] && ci < 250; ++j)
-            resolvedPath[ci++] = proc->cwd[j];
-        if (ci > 0 && resolvedPath[ci - 1] != '/')
-            resolvedPath[ci++] = '/';
-        for (uint32_t j = 0; kPath[j] && ci < 254; ++j)
-            resolvedPath[ci++] = kPath[j];
-        resolvedPath[ci] = '\0';
-        lookupPath = resolvedPath;
+    char newExePath[sizeof(Process::exePath)];
+    Vnode* vn=nullptr;
+    const char* lookupPath=kPath;
+    int openResult=VfsOpenExecutableAt(executableLookup.fs.root,executableLookup.start(),kPath,
+                                       &vn,newExePath,sizeof(newExePath));
+    if(openResult && openResult!=-ENOENT)return openResult;
+    bool found=vn!=nullptr;
+    char aliasName[512];
+    bool commandAlias=!strchr(kPath,'/');
+    if(!commandAlias) {
+        static const char* directories[]={"/bin/","/usr/bin/","/usr/local/bin/","/sbin/","/usr/sbin/","/boot/BIN/","/boot/bin/"};
+        for(const char* prefix:directories) {
+            size_t length=strlen(prefix);
+            if(!strncmp(kPath,prefix,length) && kPath[length] && !strchr(kPath+length,'/'))commandAlias=true;
+        }
     }
+    const bool allowAliases=commandAlias && !executableLookup.SyntheticName(kPath,aliasName,sizeof(aliasName));
 
-    {
-        VnodeStat st;
-        const int result=VfsStatPath(lookupPath,&st);
-        if(!result) {
-            if(st.isDir)return -13; // EACCES
-            found=true;
-        } else if(result!=-ENOENT)return result; // Never alias an inaccessible path.
-
-    }
-
-    if (!found)
+    if (!found && allowAliases)
     {
         // Extract basename for fallback lookups
         const char* baseName = kPath;
@@ -4944,8 +4986,10 @@ resolve_path:
                 tryPath[pLen++] = *s;
             tryPath[pLen] = '\0';
 
-            VnodeStat st;
-            if (VfsStatPath(tryPath, &st) == 0 && !st.isDir)
+            openResult=VfsOpenExecutableAt(executableLookup.fs.root,executableLookup.fs.root,tryPath,
+                                           &vn,newExePath,sizeof(newExePath));
+            if(openResult && openResult!=-ENOENT)return openResult;
+            if(vn)
             {
                 for (uint32_t k = 0; k <= pLen; ++k) resolvedPath[k] = tryPath[k];
                 lookupPath = resolvedPath;
@@ -4964,7 +5008,7 @@ resolve_path:
     //      (bash resolves these via stat's BusyboxStatFallback, then calls
     //       execve with the full path)
     bool busyboxFallback = false;
-    if (!found)
+    if (!found && allowAliases)
     {
         bool useBusybox = false;
         bool simpleCommand = true;
@@ -5003,14 +5047,16 @@ resolve_path:
             if (*p == '/') applet = p + 1;
         if (useBusybox && BusyboxHasApplet(applet))
         {
-            VnodeStat st;
             static const char* busyboxPaths[] = {
                 "/boot/BIN/busybox", "/boot/BIN/BUSYBOX",
                 "/boot/bin/busybox", "/bin/busybox"
             };
             for (int i = 0; i < 4; i++)
             {
-                if (VfsStatPath(busyboxPaths[i], &st) == 0 && !st.isDir)
+                openResult=VfsOpenExecutableAt(executableLookup.fs.root,executableLookup.fs.root,busyboxPaths[i],
+                                               &vn,newExePath,sizeof(newExePath));
+                if(openResult && openResult!=-ENOENT)return openResult;
+                if(vn)
                 {
                     uint32_t k = 0;
                     const char* p = busyboxPaths[i];
@@ -5034,15 +5080,11 @@ resolve_path:
         return -ENOENT;
     }
 
-    char newExePath[sizeof(Process::exePath)];
     SerialPrintf("sys_execve: envpAddr=0x%lx envc=%d argc=%d path='%s'\n",
                  envpAddr, envc, argc, lookupPath);
 
     // Keep the original lookup spelling for script argv, but record the final
     // ELF's resolved location (including a shebang interpreter's symlinks).
-    Vnode* vn = nullptr;
-    int openResult = VfsOpenExecutable(lookupPath, &vn, newExePath, sizeof(newExePath));
-    if (openResult != 0) return openResult;
     uint32_t newExeLen = strlen(newExePath);
 
     ExecutableImage image{};
@@ -5177,6 +5219,9 @@ resolve_path:
     ExecutableImage interpreterImage{};
     const int interpreterResult=PrepareExecInterpreter(image,&interpreterImage);
     if(interpreterResult) {FreeExecutableImage(&image);return interpreterResult;}
+    // exec enters user mode without returning through this C++ frame. Drop
+    // the lookup snapshot explicitly before all non-returning commit paths.
+    executableLookup.Clear();
 
     // --- Kill sibling threads before replacing the process image ---
     // Linux: execve terminates all other threads in the thread group
@@ -5675,33 +5720,18 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
                 return VfsAccess(static_cast<Vnode*>(entry->handle),static_cast<uint8_t>(mode),!(flags&EACCESS));
             return mode ? -95 : 0; // EOPNOTSUPP: non-vnode permission metadata is not implemented.
         }
-        return VfsAccessPath(proc->cwd,static_cast<uint8_t>(mode),!(flags&EACCESS));
+        FsSnapshot fs{};int error=ProcessFsSnapshot(proc,&fs);
+        if(!error)error=VfsPathAccess(fs.cwd,static_cast<uint8_t>(mode),!(flags&EACCESS));
+        FsSnapshotRelease(&fs);return error;
     }
-    char resolved[512];
-    const char* lookup = path;
-    if (path[0] != '/') {
-        char prefix[256];
-        if (dirfd == -100) {
-            memcpy(prefix, proc->cwd, sizeof(prefix));
-            prefix[sizeof(prefix) - 1] = 0;
-        } else {
-            FdRef ref(proc, dirfd);
-            FdEntry* entry = ref.get();
-            if (!entry) return -EBADF;
-            if (entry->type != FdType::Vnode || !entry->handle ||
-                static_cast<Vnode*>(entry->handle)->type != VnodeType::Dir) return -ENOTDIR;
-            if(int error=VfsDirectoryPath(static_cast<Vnode*>(entry->handle),prefix,sizeof(prefix)))return error;
-        }
-        uint32_t pos = 0;
-        while (prefix[pos]) { resolved[pos] = prefix[pos]; ++pos; }
-        if (!pos || resolved[pos-1] != '/') resolved[pos++] = '/';
-        if (pos + length >= sizeof(resolved)) return -36;
-        memcpy(resolved + pos, path, length + 1);
-        lookup = resolved;
-    }
+    AtLookup at;if(int error=at.Init(dirfd,path))return error;
+    char resolved[512];bool hasSyntheticName=!at.SyntheticName(path,resolved,sizeof(resolved));
+    const char* lookup=hasSyntheticName?resolved:"";
     VnodeStat st{};
     bool realIds=!(flags&EACCESS);
-    int result=VfsAccessPath(lookup,static_cast<uint8_t>(mode),realIds,flags&NOFOLLOW);
+    int result=VfsAccessAt(at.fs.root,at.start(),path,static_cast<uint8_t>(mode),realIds,!(flags&NOFOLLOW));
+    if(result==-95 && hasSyntheticName && (!strncmp(lookup,"/proc/",6) || StrEq(lookup,"/proc")))
+        result=VfsAccessPath(lookup,static_cast<uint8_t>(mode),realIds,flags&NOFOLLOW);
     if (result == 0) return 0;
     if (result != -ENOENT && result != -1) return result;
     static const char* syntheticPaths[] = {
@@ -7345,39 +7375,15 @@ static bool DrmStatFill(const char* path, LinuxStat* st)
 
 // Internal stat helper — takes a kernel-space path directly (no user copy).
 // statAddr is the user-space address of the stat buffer.
-static int64_t do_stat_internal(const char* path, uint64_t statAddr)
+static int64_t do_stat_internal(const char* path, uint64_t statAddr,int dirfd=-100)
 {
     if (!UserBufferWritable(statAddr, sizeof(LinuxStat))) return -EFAULT;
     auto* st = reinterpret_cast<LinuxStat*>(statAddr);
 
     // Resolve relative paths (including ".") against CWD
-    char resolved[256];
-    const char* lookup = path;
-    if (path[0] != '/')
-    {
-        Process* proc = ProcessCurrent();
-        const char* cwd = (proc && proc->cwd[0]) ? proc->cwd : "/";
-        uint32_t ci = 0;
-        if (path[0] == '.' && (path[1] == '\0' || path[1] == '/'))
-        {
-            for (uint32_t j = 0; cwd[j] && ci < 254; ++j)
-                resolved[ci++] = cwd[j];
-            if (path[1] == '/')
-                for (uint32_t j = 1; path[j] && ci < 254; ++j)
-                    resolved[ci++] = path[j];
-        }
-        else
-        {
-            for (uint32_t j = 0; cwd[j] && ci < 250; ++j)
-                resolved[ci++] = cwd[j];
-            if (ci > 0 && resolved[ci - 1] != '/')
-                resolved[ci++] = '/';
-            for (uint32_t j = 0; path[j] && ci < 254; ++j)
-                resolved[ci++] = path[j];
-        }
-        resolved[ci] = '\0';
-        lookup = resolved;
-    }
+    AtLookup at;if(int error=at.Init(dirfd,path))return error;
+    char resolved[512];bool hasSyntheticName=!at.SyntheticName(path,resolved,sizeof(resolved));
+    const char* lookup=hasSyntheticName?resolved:"";
 
     // GL shim (M0): stat the synthetic DRM devfs/sysfs entries so libdrm can
     // enumerate the render node. Only when a 3D driver is present.
@@ -7385,7 +7391,9 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr)
         return 0;
 
     VnodeStat vs{};
-    int pathError = VfsStatPath(lookup, &vs);
+    int pathError=VfsStatAt(at.fs.root,at.start(),path,&vs,true);
+    if(pathError==-95 && hasSyntheticName && (!strncmp(lookup,"/proc/",6) || StrEq(lookup,"/proc")))
+        pathError=VfsStatPath(lookup,&vs);
     if (pathError < 0)
     {
         if (pathError != -ENOENT && pathError != -1) return pathError;
@@ -7419,38 +7427,14 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr)
 }
 
 // Internal lstat helper — takes a kernel-space path directly.
-static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
+static int64_t do_lstat_internal(const char* path, uint64_t statAddr,int dirfd=-100)
 {
     if (!UserBufferWritable(statAddr, sizeof(LinuxStat))) return -EFAULT;
     auto* st = reinterpret_cast<LinuxStat*>(statAddr);
 
-    char resolved[256];
-    const char* lookup = path;
-    if (path[0] != '/')
-    {
-        Process* proc = ProcessCurrent();
-        const char* cwd = (proc && proc->cwd[0]) ? proc->cwd : "/";
-        uint32_t ci = 0;
-        if (path[0] == '.' && (path[1] == '\0' || path[1] == '/'))
-        {
-            for (uint32_t j = 0; cwd[j] && ci < 254; ++j)
-                resolved[ci++] = cwd[j];
-            if (path[1] == '/')
-                for (uint32_t j = 1; path[j] && ci < 254; ++j)
-                    resolved[ci++] = path[j];
-        }
-        else
-        {
-            for (uint32_t j = 0; cwd[j] && ci < 250; ++j)
-                resolved[ci++] = cwd[j];
-            if (ci > 0 && resolved[ci - 1] != '/')
-                resolved[ci++] = '/';
-            for (uint32_t j = 0; path[j] && ci < 254; ++j)
-                resolved[ci++] = path[j];
-        }
-        resolved[ci] = '\0';
-        lookup = resolved;
-    }
+    AtLookup at;if(int error=at.Init(dirfd,path))return error;
+    char resolved[512];bool hasSyntheticName=!at.SyntheticName(path,resolved,sizeof(resolved));
+    const char* lookup=hasSyntheticName?resolved:"";
 
     // GL shim (M0): the synthetic DRM entries are not symlinks, so lstat
     // returns the same as stat (lets glibc realpath() resolve the device dir).
@@ -7458,7 +7442,9 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr)
         return 0;
 
     VnodeStat vs{};
-    int pathError = VfsLstatPath(lookup, &vs);
+    int pathError=VfsStatAt(at.fs.root,at.start(),path,&vs,false);
+    if(pathError==-95 && hasSyntheticName && (!strncmp(lookup,"/proc/",6) || StrEq(lookup,"/proc")))
+        pathError=VfsLstatPath(lookup,&vs);
     if (pathError < 0)
     {
         if (pathError != -ENOENT && pathError != -1) return pathError;
@@ -7680,15 +7666,8 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAd
     static constexpr uint64_t AT_SYMLINK_NOFOLLOW = 0x100;
     bool noFollow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
 
-    // Resolve relative path against dirfd
-    char resolved[256];
-    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        return error;
-    const char* finalPath = resolved;
-
-    if (noFollow)
-        return do_lstat_internal(finalPath, statAddr);
-    return do_stat_internal(finalPath, statAddr);
+    if(noFollow)return do_lstat_internal(path,statAddr,static_cast<int>(dirfd));
+    return do_stat_internal(path,statAddr,static_cast<int>(dirfd));
 }
 
 // ---------------------------------------------------------------------------
@@ -8141,78 +8120,9 @@ static int64_t sys_getrandom(uint64_t bufAddr, uint64_t count, uint64_t,
 // sys_openat (257) -- delegate to sys_open
 // ---------------------------------------------------------------------------
 
-static int64_t sys_openat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
-                           uint64_t mode, uint64_t, uint64_t)
+static int64_t sys_openat(uint64_t dirfd,uint64_t path,uint64_t flags,uint64_t mode,uint64_t,uint64_t)
 {
-    __atomic_fetch_add(&g_profOpenCount, 1, __ATOMIC_RELAXED);
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) {
-        // Diagnostic: identify exactly where the path copy failed.
-        Process* p = ProcessCurrent();
-        uint32_t validBytes = 0;
-        for (uint32_t i = 0; i < 256; ++i) {
-            if (!UserBufferReadable(pathAddr + i, 1)) break;
-            validBytes = i + 1;
-        }
-        SerialPrintf("openat: EFAULT pathAddr=0x%lx validBytes=%u pid=%u (%s)\n",
-                     pathAddr, validBytes, p ? p->pid : 0, p ? p->name : "?");
-        if (validBytes > 0) {
-            char partial[64];
-            uint32_t show = validBytes < 63 ? validBytes : 63;
-            for (uint32_t i = 0; i < show; ++i)
-                partial[i] = *reinterpret_cast<const char*>(pathAddr + i);
-            partial[show] = '\0';
-            SerialPrintf("openat: partial path='%s'\n", partial);
-        }
-        return -EFAULT;
-    }
-    const char* path = pathBuf;
-
-    // If path is absolute or dirfd is AT_FDCWD, delegate to sys_open
-    static constexpr int64_t AT_FDCWD = -100;
-    if (path[0] == '/' || static_cast<int64_t>(dirfd) == AT_FDCWD)
-        return sys_open(pathAddr, flags, mode, 0, 0, 0);
-
-    char resolved[256];
-    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        return error;
-    return sys_open(reinterpret_cast<uint64_t>(resolved), flags, mode, 0, 0, 0);
-}
-
-// Shared bounded path join for *at syscalls. This is not an inode resolver:
-// Ext2 resolves retained directory inodes; other backends retain opening names.
-// Namespace lookup and the eventual operation are not yet one atomic *at walk.
-static int ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSize)
-{
-    if (!path || !out || outSize < 2) return -EINVAL;
-    if (!path[0]) return -ENOENT;
-    if (path[0] == '/') {
-        uint32_t length = strlen(path);
-        if (length >= outSize) return -36; // ENAMETOOLONG; never truncate.
-        memcpy(out, path, length + 1);
-        return 0; // Absolute paths ignore dirfd.
-    }
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-    char prefix[sizeof(proc->cwd)];
-    if (dirfd == -100) {
-        memcpy(prefix, proc->cwd, sizeof(prefix));
-        prefix[sizeof(prefix) - 1] = 0;
-    } else {
-        FdRef ref(proc, dirfd);
-        FdEntry* entry = ref.get();
-        if (!entry) return -EBADF;
-        if (entry->type != FdType::Vnode || !entry->handle ||
-            static_cast<Vnode*>(entry->handle)->type != VnodeType::Dir) return -ENOTDIR;
-        if(int error=VfsDirectoryPath(static_cast<Vnode*>(entry->handle),prefix,sizeof(prefix)))return error;
-    }
-    uint32_t length = strlen(prefix), suffix = strlen(path);
-    bool slash = length && prefix[length - 1] != '/';
-    if (length + slash + suffix >= outSize) return -36;
-    memcpy(out, prefix, length);
-    if (slash) out[length++] = '/';
-    memcpy(out + length, path, suffix + 1);
-    return 0;
+    return OpenAtInternal(static_cast<int>(dirfd),path,flags,mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -8222,15 +8132,11 @@ static int ResolveAtPath(int dirfd, const char* path, char* out, uint32_t outSiz
 static int64_t sys_getcwd(uint64_t bufAddr, uint64_t size, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    Process* proc = ProcessCurrent();
-    const char* cwd = (proc && proc->cwd[0]) ? proc->cwd : "/";
-    uint32_t len = 0;
-    while (cwd[len]) len++;
-    if (size < len + 1) return -ERANGE;
-    if (!UserBufferWritable(bufAddr, len + 1)) return -EFAULT;
-    auto* buf = reinterpret_cast<char*>(bufAddr);
-    memcpy(buf, cwd, len + 1);
-    return static_cast<int64_t>(len + 1);
+    char cwd[512];int error=ProcessFsGetcwd(ProcessCurrent(),cwd,sizeof(cwd));
+    if(error)return error;
+    size_t bytes=strlen(cwd)+1;
+    if(size<bytes)return -ERANGE;
+    return CopyToUser(bufAddr,cwd,bytes)?static_cast<int64_t>(bytes):-EFAULT;
 }
 
 // ---------------------------------------------------------------------------
@@ -8889,9 +8795,11 @@ static int64_t sys_ppoll(uint64_t fdsAddr, uint64_t nfds, uint64_t tspecAddr,
 // sys_readlink (89) / sys_readlinkat (267)
 // ---------------------------------------------------------------------------
 
-static int64_t DoReadlink(const char* path, uint64_t bufAddr, uint64_t bufsiz)
+static int64_t DoReadlink(const char* original,uint64_t bufAddr,uint64_t bufsiz,int dirfd=-100)
 {
-    if (!path) return -EFAULT;
+    AtLookup at;if(int error=at.Init(dirfd,original))return error;
+    char synthetic[512];
+    const char* path=!at.SyntheticName(original,synthetic,sizeof(synthetic))?synthetic:"";
     if (bufsiz == 0) return -EINVAL;
 
     // GL shim (M0): the DRM device's 'subsystem' symlink. libdrm's
@@ -9004,7 +8912,7 @@ static int64_t DoReadlink(const char* path, uint64_t bufAddr, uint64_t bufsiz)
     // Try VFS readlink for real symlinks
     char linkTarget[1024];
     uint64_t cap = (bufsiz < sizeof(linkTarget)) ? bufsiz : sizeof(linkTarget);
-    int r = VfsReadlink(path, linkTarget, cap);
+    int r=VfsReadlinkAt(at.fs.root,at.start(),original,linkTarget,static_cast<uint32_t>(cap));
     if (r >= 0 && !CopyToUser(bufAddr, linkTarget, static_cast<uint64_t>(r)))
         return -EFAULT;
     if (r >= 0) return static_cast<int64_t>(r);
@@ -9017,9 +8925,7 @@ static int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz
     char path[256];
     if (!CopyUserCString(pathAddr, path, sizeof(path)))
         return -EFAULT;
-    char resolved[256];
-    if (int error = ResolveAtPath(-100,path,resolved,sizeof(resolved))) return error;
-    return DoReadlink(resolved, bufAddr, bufsiz);
+    return DoReadlink(path,bufAddr,bufsiz);
 }
 
 static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAddr,
@@ -9029,10 +8935,7 @@ static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAdd
     if (!CopyUserCString(pathAddr, path, sizeof(path)))
         return -EFAULT;
 
-    char resolved[256];
-    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved)))
-        return error;
-    return DoReadlink(resolved, bufAddr, bufsiz);
+    return DoReadlink(path,bufAddr,bufsiz,static_cast<int>(dirfd));
 }
 
 // ---------------------------------------------------------------------------
@@ -9042,24 +8945,19 @@ static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAdd
 static int64_t sys_symlink(uint64_t targetAddr, uint64_t linkpathAddr, uint64_t,
                             uint64_t, uint64_t, uint64_t)
 {
-    char targetBuf[256], linkBuf[256];
-    if (!CopyUserCString(targetAddr, targetBuf, sizeof(targetBuf))) return -EFAULT;
-    if (!CopyUserCString(linkpathAddr, linkBuf, sizeof(linkBuf))) return -EFAULT;
-    char resolved[512];
-    if (int error = ResolveAtPath(-100, linkBuf, resolved, sizeof(resolved))) return error;
-    int r = VfsSymlink(targetBuf, resolved);
-    return (r == 0) ? 0 : static_cast<int64_t>(r);
+    char target[512],path[512];
+    if(!CopyUserCString(targetAddr,target,sizeof(target)) || !CopyUserCString(linkpathAddr,path,sizeof(path)))return -EFAULT;
+    AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
+    return VfsSymlinkAt(lookup.fs.root,lookup.start(),target,path);
 }
 
 static int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t linkpathAddr,
                               uint64_t, uint64_t, uint64_t)
 {
-    char targetBuf[256], linkBuf[256];
-    if (!CopyUserCString(targetAddr, targetBuf, sizeof(targetBuf))) return -EFAULT;
-    if (!CopyUserCString(linkpathAddr, linkBuf, sizeof(linkBuf))) return -EFAULT;
-    char resolved[256];
-    if (int error = ResolveAtPath(static_cast<int>(newdirfd), linkBuf, resolved, sizeof(resolved))) return error;
-    return VfsSymlink(targetBuf, resolved);
+    char target[512],path[512];
+    if(!CopyUserCString(targetAddr,target,sizeof(target)) || !CopyUserCString(linkpathAddr,path,sizeof(path)))return -EFAULT;
+    AtLookup lookup;if(int error=lookup.Init(static_cast<int>(newdirfd),path))return error;
+    return VfsSymlinkAt(lookup.fs.root,lookup.start(),target,path);
 }
 
 // ---------------------------------------------------------------------------
@@ -10064,9 +9962,7 @@ static int64_t sys_umask(uint64_t newMask, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    uint16_t old = proc->umask;
-    proc->umask = static_cast<uint16_t>(newMask & 0777);
-    return old;
+    return ProcessFsExchangeMask(proc,static_cast<uint16_t>(newMask));
 }
 
 // ---------------------------------------------------------------------------
@@ -10075,28 +9971,23 @@ static int64_t sys_umask(uint64_t newMask, uint64_t, uint64_t,
 
 static int64_t sys_chdir(uint64_t pathAddr,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
 {
-    char path[256];
-    if (!CopyUserCString(pathAddr,path,sizeof(path))) return -EFAULT;
-    Process* proc=ProcessCurrent();if (!proc) return -EBADF;
-    char joined[512],canonical[sizeof(proc->cwd)];
-    if (int error=ResolveAtPath(-100,path,joined,sizeof(joined))) return error;
-    if (int error=VfsResolveDirectory(joined,canonical,sizeof(canonical))) return error;
-    memcpy(proc->cwd,canonical,strlen(canonical)+1);
-    return 0;
+    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
+    VfsPath cwd{};int error=VfsPathResolve(lookup.fs.root,lookup.start(),path,&cwd);
+    if(!error)error=ProcessFsSetCwd(ProcessCurrent(),cwd);
+    VfsPathRelease(cwd);return error;
 }
 
 static int64_t sys_fchdir(uint64_t fd,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
 {
-    Process* proc=ProcessCurrent();if (!proc) return -EBADF;
-    FdRef ref(proc,static_cast<int>(fd));FdEntry* entry=ref.get();
-    if (!entry) return -EBADF;
-    if (entry->type!=FdType::Vnode || !entry->handle ||
-        static_cast<Vnode*>(entry->handle)->type!=VnodeType::Dir) return -ENOTDIR;
-    char current[sizeof(proc->cwd)],canonical[sizeof(proc->cwd)];
-    if(int error=VfsDirectoryPath(static_cast<Vnode*>(entry->handle),current,sizeof(current)))return error;
-    if (int error=VfsResolveDirectory(current,canonical,sizeof(canonical))) return error;
-    memcpy(proc->cwd,canonical,strlen(canonical)+1);
-    return 0;
+    Process* proc=ProcessCurrent();if(!proc)return -EBADF;
+    VfsPath cwd{};int error=0;
+    { FdRef ref(proc,static_cast<int>(fd));
+      if(!ref)return -EBADF;
+      if(ref->type!=FdType::Vnode || !ref->handle)return -ENOTDIR;
+      error=VfsPathFromVnode(static_cast<Vnode*>(ref->handle),&cwd); }
+    if(!error)error=ProcessFsSetCwd(proc,cwd);
+    VfsPathRelease(cwd);return error;
 }
 
 // ---------------------------------------------------------------------------
@@ -10119,29 +10010,11 @@ static int64_t sys_rmdir(uint64_t pathAddr, uint64_t, uint64_t,
 
 static int64_t DoUnlink(const char* path, bool directory)
 {
-    char resolved[256];
-    if (int error = ResolveAtPath(-100, path, resolved, sizeof(resolved))) return error;
-    path = resolved;
-
-    // /dev/shm/<name> — shm_unlink: mark entry as free
-    if (!directory && path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' &&
-        path[4]=='/' && path[5]=='s' && path[6]=='h' && path[7]=='m' && path[8]=='/') {
-        return NamedShmUnlink(path+9);
-    }
-
-    // Try as-is first, then with /boot prefix
-    int rc = VfsRemovePath(path, directory);
-    if (rc == 0) return 0;
-    if (rc != -ENOENT) return rc;
-
-    char bootPath[256] = "/boot";
-    uint32_t bi = 5;
-    if (strlen(path) + bi >= sizeof(bootPath)) return rc;
-    for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
-        bootPath[bi++] = *p;
-    bootPath[bi] = '\0';
-    rc = VfsRemovePath(bootPath, directory);
-    return rc;
+    AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
+    char synthetic[512];
+    if(!directory && !lookup.SyntheticName(path,synthetic,sizeof(synthetic)) &&
+       !strncmp(synthetic,"/dev/shm/",9))return NamedShmUnlink(synthetic+9);
+    return VfsRemoveAt(lookup.fs.root,lookup.start(),path,directory);
 }
 
 static int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
@@ -10158,29 +10031,10 @@ static int64_t sys_unlink(uint64_t pathAddr, uint64_t, uint64_t,
 
 static int64_t DoRename(const char* oldBuf, const char* newBuf)
 {
-    char oldResolved[512], newResolved[512];
-    if (int error = ResolveAtPath(-100, oldBuf, oldResolved, sizeof(oldResolved))) return error;
-    if (int error = ResolveAtPath(-100, newBuf, newResolved, sizeof(newResolved))) return error;
-    const char* oldPath = oldResolved;
-    const char* newPath = newResolved;
-
-    int rc = VfsRename(oldPath, newPath);
-    if (rc == 0) return 0;
-    if (rc != -ENOENT) return rc;
-
-    // Try with /boot prefix on both
-    char bootOld[256] = "/boot", bootNew[256] = "/boot";
-    uint32_t oi = 5, ni = 5;
-    if (strlen(oldPath) + oi >= sizeof(bootOld) ||
-        strlen(newPath) + ni >= sizeof(bootNew)) return rc;
-    for (const char* p = oldPath; *p && oi + 1 < sizeof(bootOld); ++p)
-        bootOld[oi++] = *p;
-    bootOld[oi] = '\0';
-    for (const char* p = newPath; *p && ni + 1 < sizeof(bootNew); ++p)
-        bootNew[ni++] = *p;
-    bootNew[ni] = '\0';
-    rc = VfsRename(bootOld, bootNew);
-    return rc;
+    AtLookup oldLookup,newLookup;
+    if(int error=oldLookup.Init(-100,oldBuf))return error;
+    if(int error=newLookup.Init(-100,newBuf))return error;
+    return VfsRenameAt(oldLookup.fs.root,oldLookup.start(),oldBuf,newLookup.start(),newBuf);
 }
 
 static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
@@ -10194,24 +10048,8 @@ static int64_t sys_rename(uint64_t oldAddr, uint64_t newAddr, uint64_t,
 
 static int64_t DoMkdir(const char* path, uint16_t mode)
 {
-    char resolved[256];
-    if (int error = ResolveAtPath(-100, path, resolved, sizeof(resolved))) return error;
-    path = resolved;
-
-    int rc = VfsMkdir(path,mode);
-    if (rc == 0) return 0;
-    if (rc != -1 && rc != -ENOENT) return rc;
-
-    char bootPath[256] = "/boot";
-    uint32_t bi = 5;
-    if (strlen(path) + bi >= sizeof(bootPath)) return rc == -1 ? -ENOENT : rc;
-    for (const char* p = path; *p && bi + 1 < sizeof(bootPath); ++p)
-        bootPath[bi++] = *p;
-    bootPath[bi] = '\0';
-    rc = VfsMkdir(bootPath,mode);
-    if (rc == 0) return 0;
-
-    return rc == -1 ? -ENOENT : rc;
+    AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
+    return VfsMkdirAt(lookup.fs.root,lookup.start(),path,mode,lookup.fs.mask);
 }
 
 static int64_t sys_mkdir(uint64_t pathAddr, uint64_t mode, uint64_t,
@@ -10229,12 +10067,9 @@ static int64_t sys_mkdir(uint64_t pathAddr, uint64_t mode, uint64_t,
 static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
                             uint64_t, uint64_t, uint64_t)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    const char* path = pathBuf;
-    char resolved[256];
-    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved))) return error;
-    return DoMkdir(resolved,static_cast<uint16_t>(mode));
+    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    AtLookup lookup;if(int error=lookup.Init(static_cast<int>(dirfd),path))return error;
+    return VfsMkdirAt(lookup.fs.root,lookup.start(),path,static_cast<uint16_t>(mode),lookup.fs.mask);
 }
 
 // ---------------------------------------------------------------------------
@@ -10244,13 +10079,13 @@ static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
 static int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
                              uint64_t, uint64_t, uint64_t)
 {
-    if (flags & ~0x200ULL) return -EINVAL;
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    const char* path = pathBuf;
-    char resolved[256];
-    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved))) return error;
-    return DoUnlink(resolved, (flags & 0x200) != 0);
+    if(flags & ~0x200ULL)return -EINVAL;
+    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    AtLookup lookup;if(int error=lookup.Init(static_cast<int>(dirfd),path))return error;
+    char synthetic[512];
+    if(!(flags&0x200) && !lookup.SyntheticName(path,synthetic,sizeof(synthetic)) &&
+       !strncmp(synthetic,"/dev/shm/",9))return NamedShmUnlink(synthetic+9);
+    return VfsRemoveAt(lookup.fs.root,lookup.start(),path,(flags&0x200)!=0);
 }
 
 // ---------------------------------------------------------------------------
@@ -10261,15 +10096,12 @@ static int64_t sys_renameat(uint64_t olddirfd, uint64_t oldAddr,
                              uint64_t newdirfd, uint64_t newAddr,
                              uint64_t, uint64_t)
 {
-    char oldBuf[256], newBuf[256];
-    if (!CopyUserCString(oldAddr, oldBuf, sizeof(oldBuf))) return -EFAULT;
-    if (!CopyUserCString(newAddr, newBuf, sizeof(newBuf))) return -EFAULT;
-    const char* oldP = oldBuf;
-    const char* newP = newBuf;
-    char oldR[256], newR[256];
-    if (int error = ResolveAtPath(static_cast<int>(olddirfd), oldP, oldR, sizeof(oldR))) return error;
-    if (int error = ResolveAtPath(static_cast<int>(newdirfd), newP, newR, sizeof(newR))) return error;
-    return DoRename(oldR, newR);
+    char oldP[512],newP[512];
+    if(!CopyUserCString(oldAddr,oldP,sizeof(oldP)) || !CopyUserCString(newAddr,newP,sizeof(newP)))return -EFAULT;
+    AtLookup oldLookup,newLookup;
+    if(int error=oldLookup.Init(static_cast<int>(olddirfd),oldP))return error;
+    if(int error=newLookup.Init(static_cast<int>(newdirfd),newP))return error;
+    return VfsRenameAt(oldLookup.fs.root,oldLookup.start(),oldP,newLookup.start(),newP);
 }
 
 static int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldAddr,
@@ -10342,16 +10174,10 @@ static int64_t sys_truncate(uint64_t pathAddr, uint64_t length, uint64_t,
     char path[256];
     if (!CopyUserCString(pathAddr, path, sizeof(path))) return -EFAULT;
     if (!path[0]) return -ENOENT;
-    char resolved[512];
-    if (int error = ResolveAtPath(-100, path, resolved, sizeof(resolved))) return error;
-    VnodeStat st;
-    int result = VfsStatPath(resolved, &st);
-    if (result) return result < -1 ? result : -ENOENT;
-    if (st.isDir) return -21; // EISDIR
-    // Match the existing VFS open credential model. Descriptor access modes
-    // are checked above; global path permission enforcement remains separate.
-    Vnode* vn = VfsOpen(resolved, VFS_O_WRITE);
-    if (!vn) return -13;
+    AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
+    int result=0;
+    Vnode* vn=VfsOpenAt(lookup.fs.root,lookup.start(),path,VFS_O_WRITE,0,lookup.fs.mask,&result);
+    if(!vn)return result?result:-ENOENT;
     result = VfsTruncate(vn, length);
     VfsClose(vn);
     return result;
@@ -10377,12 +10203,9 @@ static int64_t sys_flock(uint64_t fd, uint64_t operation, uint64_t,
 static int64_t sys_chmod(uint64_t pathAddr, uint64_t mode, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    if (!pathBuf[0]) return -ENOENT;
-    char resolved[512];
-    if (int error = ResolveAtPath(-100, pathBuf, resolved, sizeof(resolved))) return error;
-    return VfsChmodPath(resolved, static_cast<uint16_t>(mode & 07777));
+    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
+    return VfsChmodAt(lookup.fs.root,lookup.start(),path,static_cast<uint16_t>(mode&07777));
 }
 
 static int64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t,
@@ -10398,12 +10221,9 @@ static int64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t,
 static int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
                              uint64_t, uint64_t, uint64_t)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
-    if (!pathBuf[0]) return -ENOENT;
-    char resolved[512];
-    if (int error = ResolveAtPath(static_cast<int>(dirfd), pathBuf, resolved, sizeof(resolved))) return error;
-    return VfsChmodPath(resolved, static_cast<uint16_t>(mode & 07777));
+    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    AtLookup lookup;if(int error=lookup.Init(static_cast<int>(dirfd),path))return error;
+    return VfsChmodAt(lookup.fs.root,lookup.start(),path,static_cast<uint16_t>(mode&07777));
 }
 
 // ---------------------------------------------------------------------------
@@ -10413,42 +10233,23 @@ static int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
 
 static int64_t ChownAt(int dirfd, uint64_t pathAddr, uint32_t uid, uint32_t gid, uint64_t flags)
 {
-    constexpr uint64_t NOFOLLOW = 0x100, EMPTY_PATH = 0x1000;
-    if (flags & ~(NOFOLLOW | EMPTY_PATH)) return -EINVAL;
-    Process* proc = ProcessCurrent();
-    if (!proc || proc->euid != 0) return -EPERM;
-    char path[256];
-    if (!CopyUserCString(pathAddr, path, sizeof(path))) return -EFAULT;
-    FdRef directory(proc, dirfd);
-    if (!path[0]) {
-        if (!(flags & EMPTY_PATH)) return -ENOENT;
-        if (dirfd == -100) return VfsChownPath(proc->cwd, uid, gid);
-        if (!directory) return -EBADF;
-        if (directory->type != FdType::Vnode) return -95;
-        return VfsChown(static_cast<Vnode*>(directory->handle), uid, gid);
-    }
-    const char* lookup = path;
-    char resolved[512];
-    if (path[0] != '/') {
-        char directoryPath[512];
-        const char* prefix = proc->cwd;
-        if (dirfd != -100) {
-            if (!directory) return -EBADF;
-            if (directory->type != FdType::Vnode || !directory->handle ||
-                static_cast<Vnode*>(directory->handle)->type != VnodeType::Dir) return -ENOTDIR;
-            if(int error=VfsDirectoryPath(static_cast<Vnode*>(directory->handle),directoryPath,sizeof(directoryPath)))return error;
-            prefix = directoryPath;
+    constexpr uint64_t NOFOLLOW=0x100,EMPTY_PATH=0x1000;
+    if(flags & ~(NOFOLLOW|EMPTY_PATH))return -EINVAL;
+    Process* proc=ProcessCurrent();if(!proc || proc->euid!=0)return -EPERM;
+    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    if(!path[0]) {
+        if(!(flags&EMPTY_PATH))return -ENOENT;
+        if(dirfd==-100) {
+            FsSnapshot fs{};int error=ProcessFsSnapshot(proc,&fs);
+            if(!error)error=VfsChownAt(fs.root,fs.cwd,".",uid,gid);
+            FsSnapshotRelease(&fs);return error;
         }
-        const uint32_t plen = strlen(prefix), length = strlen(path);
-        const bool slash = plen && prefix[plen - 1] != '/';
-        if (plen + slash + length >= sizeof(resolved)) return -36;
-        memcpy(resolved, prefix, plen);
-        uint32_t pos = plen;
-        if (slash) resolved[pos++] = '/';
-        memcpy(resolved + pos, path, length + 1);
-        lookup = resolved;
+        FdRef ref(proc,dirfd);if(!ref)return -EBADF;
+        if(ref->type!=FdType::Vnode || !ref->handle)return -95;
+        return VfsChown(static_cast<Vnode*>(ref->handle),uid,gid);
     }
-    return VfsChownPath(lookup, uid, gid, (flags & NOFOLLOW) != 0);
+    AtLookup lookup;if(int error=lookup.Init(dirfd,path))return error;
+    return VfsChownAt(lookup.fs.root,lookup.start(),path,uid,gid,!(flags&NOFOLLOW));
 }
 
 static int64_t sys_chown(uint64_t pathAddr, uint64_t uid, uint64_t gid,
@@ -10513,9 +10314,8 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathAddr, uint64_t timesAd
         return VfsSetTimes(static_cast<Vnode*>(entry->handle), times);
     }
     if (!path[0]) return -ENOENT;
-    char resolved[512];
-    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved))) return error;
-    return VfsSetTimesPath(resolved, times, (flags & NOFOLLOW) != 0);
+    AtLookup lookup;if(int error=lookup.Init(static_cast<int>(dirfd),path))return error;
+    return VfsSetTimesAt(lookup.fs.root,lookup.start(),path,times,!(flags&NOFOLLOW));
 }
 
 // ---------------------------------------------------------------------------
@@ -10673,21 +10473,14 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
 
     VnodeStat st{};
 
-    char resolved[256];
-    if (int error = ResolveAtPath(static_cast<int>(dirfd), path, resolved, sizeof(resolved))) return error;
-
-    // GL shim (M0): synthetic DRM devfs/sysfs entries (glibc stat() may route
-    // through statx). Reuse the shared LinuxStat filler, then convert.
-    {
+    AtLookup at;if(int error=at.Init(static_cast<int>(dirfd),path))return error;
+    char resolved[512];
+    if(!at.SyntheticName(path,resolved,sizeof(resolved))) {
         LinuxStat dst;
-        if (DrmStatFill(resolved, &dst)) { fillStatxFromLinuxStat(dst); return 0; }
+        if(DrmStatFill(resolved,&dst)) {fillStatxFromLinuxStat(dst);return 0;}
     }
-
-    static constexpr uint64_t AT_SYMLINK_NOFOLLOW = 0x100;
-    int ret = (flags & AT_SYMLINK_NOFOLLOW)
-        ? VfsLstatPath(resolved, &st)
-        : VfsStatPath(resolved, &st);
-    if (ret != 0) return ret == -1 ? -ENOENT : ret;
+    int ret=VfsStatAt(at.fs.root,at.start(),path,&st,!(flags&0x100));
+    if(ret)return ret==-1?-ENOENT:ret;
 
     // Use the same filesystem metadata as stat/fstatat. Inventing mode0644
     // made Git reject installed HTTPS helpers; inode1 hid file identities.
@@ -11209,19 +11002,10 @@ static int64_t CopySpaceResult(uint64_t address, const VfsSpace& source)
 static int64_t sys_statfs(uint64_t pathAddr, uint64_t bufAddr, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
-    char path[512], resolved[512];
-    int error = CopyUserCStringResult(pathAddr, path, sizeof(path));
-    if (error) return error;
-    if ((error = ResolveAtPath(-100, path, resolved, sizeof(resolved)))) return error;
-    unsigned component = 0;
-    for (const char* p = resolved; *p; ++p) {
-        if (*p == '/') component = 0;
-        else if (++component > 255) return -36;
-    }
-    // Keep a vnode reference through the metadata query (including deleted or
-    // concurrently renamed files); do not require data-read permission or cache
-    // a large file merely to identify its filesystem.
-    Vnode* vn = VfsOpenModeChecked(resolved, VFS_O_METADATA, 0, &error);
+    char path[512];
+    int error=CopyUserCStringResult(pathAddr,path,sizeof(path));if(error)return error;
+    AtLookup at;if((error=at.Init(-100,path)))return error;
+    Vnode* vn=VfsOpenAt(at.fs.root,at.start(),path,VFS_O_METADATA,0,at.fs.mask,&error);
     if (!vn) return error ? error : -ENOENT;
     VfsSpace space{};
     error = VfsSpaceInfo(vn, &space);
@@ -12960,10 +12744,9 @@ static int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         Vnode* node = nullptr;
         VnodeStat identity{};
         if (path[0]) {
-            char resolved[512];
-            if (int error = ResolveAtPath(-100, path, resolved, sizeof(resolved))) return error;
-            int error = 0;
-            node = VfsCreateSocket(resolved, 0777, &error);
+            AtLookup lookup;if(int error=lookup.Init(-100,path))return error;
+            int error=0;
+            node=VfsCreateSocketAt(lookup.fs.root,lookup.start(),path,0777,lookup.fs.mask,&error);
             if (!node) return error;
             if ((error = VfsStat(node, &identity))) { VfsClose(node); return error; }
         }
@@ -13024,10 +12807,9 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         } lookup;
         VnodeStat identity{};
         if (path[0]) {
-            char resolved[512];
-            if (int error = ResolveAtPath(-100, path, resolved, sizeof(resolved))) return error;
-            int error = 0;
-            lookup.node = VfsOpenModeChecked(resolved, VFS_O_METADATA, 0, &error);
+            AtLookup at;if(int error=at.Init(-100,path))return error;
+            int error=0;
+            lookup.node=VfsOpenAt(at.fs.root,at.start(),path,VFS_O_METADATA,0,at.fs.mask,&error);
             if (!lookup.node) return error ? error : -ENOENT;
             if ((error = VfsAccess(lookup.node, 2, false))) return error;
             if ((error = VfsStat(lookup.node, &identity))) return error;

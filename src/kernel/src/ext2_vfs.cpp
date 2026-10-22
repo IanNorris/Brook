@@ -11,6 +11,7 @@
 #include "memory/file_object.h"
 #include "device.h"
 #include "process.h"
+#include "process_fs.h"
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
 #include "memory/virtual_memory.h"
@@ -3207,7 +3208,8 @@ static Vnode* Ext2FsOpenModeAt(void* mountPriv,uint8_t pdrv,const char* relPath,
 static Vnode* Ext2FsOpenModeChecked(void* mountPriv,uint8_t pdrv,const char* relPath,
                                    int flags,uint16_t mode,int* error)
 {
-    Process* current=ProcessCurrent();const uint16_t mask=current?current->umask:022;
+    Process* current=ProcessCurrent();const int currentMask=ProcessFsMask(current);const uint16_t mask=currentMask<0?0:currentMask;
+    if(currentMask<0) { if(error)*error=currentMask;return nullptr; }
     return Ext2FsOpenModeAt(mountPriv,pdrv,relPath,flags,mode,error,EXT2_ROOT_INO,mask);
 }
 
@@ -3442,7 +3444,8 @@ static Vnode* Ext2FsCreateSocketAt(void* mountPriv,uint8_t pdrv,const char* path
 
 static Vnode* Ext2FsCreateSocket(void* mountPriv,uint8_t pdrv,const char* path,uint16_t mode,int* error)
 {
-    Process* current=ProcessCurrent();const uint16_t mask=current?current->umask:022;
+    Process* current=ProcessCurrent();const int currentMask=ProcessFsMask(current);const uint16_t mask=currentMask<0?0:currentMask;
+    if(currentMask<0) { if(error)*error=currentMask;return nullptr; }
     return Ext2FsCreateSocketAt(mountPriv,pdrv,path,mode,error,EXT2_ROOT_INO,mask);
 }
 
@@ -3560,7 +3563,8 @@ static int Ext2FsMkdirAt(void* mountPriv,uint8_t pdrv,const char* relPath,uint16
 
 static int Ext2FsMkdir(void* mountPriv,uint8_t pdrv,const char* path,uint16_t mode)
 {
-    Process* current=ProcessCurrent();const uint16_t mask=current?current->umask:022;
+    Process* current=ProcessCurrent();const int currentMask=ProcessFsMask(current);const uint16_t mask=currentMask<0?0:currentMask;
+    if(currentMask<0)return currentMask;
     return Ext2FsMkdirAt(mountPriv,pdrv,path,mode,EXT2_ROOT_INO,mask);
 }
 

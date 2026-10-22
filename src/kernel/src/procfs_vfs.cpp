@@ -44,6 +44,8 @@ static const VfsFsOps g_procFsOps = {
     .readlink   = nullptr,
     .sync       = nullptr,
     .opaque_symlinks = true,
+    .root_object=ProcFsRootObject,
+    .vnode_object=ProcFsVnodeObject,
 };
 
 void ProcFsVfsRegister()

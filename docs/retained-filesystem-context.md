@@ -1,73 +1,103 @@
-# Retained filesystem contexts: implementation progress
+# Retained filesystem contexts
 
-## Active object-relative implementation
+## Process integration accepted, 2026-10-22
 
-The renewed goal continues beyond the historical checkpoint below. This is an
-intermediate implementation report, not completion of the process-context goal.
+User processes now own a refcounted filesystem context containing retained root
+and cwd objects plus the authoritative umask. Relative disk operations use held
+backend identities and mount attachments rather than reconstructing a global
+pathname. ABI **38** requires rebuilding the kernel and all 13 driver modules.
 
-Implemented so far:
+Process context acquisition retains the published pointer under a short IRQ-safe
+lock. Replacement and final destruction drop old references after unlocking.
+Fork copies the context; `CLONE_FS` shares it. A thread without `CLONE_FS` gets an
+independent copy. Ordinary exec **preserves** sharing, as demonstrated by the
+Linux 6.12.112 control and confirmed by Astra. The original proposal to unshare
+filesystem state at exec was incorrect; descriptor-table unsharing is separate.
+Unpublished failure paths and deferred process destruction release owned
+contexts. Raw Process copies exclude both the context pointer and its concurrent
+display cache, with a compile-time assertion on the final-field copy boundary.
 
-- Distinct `VfsObject` identities, independent file descriptions and directory
-  iterators, checked reference ownership, and backend factories introduced in
-  ABI 36. ABI **37** adds mutation/metadata operations and real/effective-ID
-  selection through component and parent search checks.
-- Ext2 component lookup, parent, link reading and exact-object opens backed by
-  retained open-inode records. A held removed inode cannot be reused.
-- Ext2 retained-parent create, mkdir, remove, cross-parent rename, symlink and
-  socket creation, plus exact-object metadata changes. The VFS keeps lookup and
-  the operation in one namespace transaction, preserves mapping/busy gates and
-  applies a supplied umask snapshot once. Exclusive create checks the entry
-  itself, including dangling symlinks, after checking parent search permission.
-- Retained rename precomputes mount labels by physical ancestry before mutation;
-  moving through a covered lower directory does not relabel an unrelated upper
-  tree. Reporting/capacity failure aborts before the backend operation. Saved
-  labels publish only after confirmed success.
-- An opaque `FsContext` core owns root/cwd/umask, supports independent copies and
-  retained sharing, and snapshots under a short lock. Final path destruction and
-  backend work run outside that lock. This core is not yet attached to Process.
-- FAT component operations using the upstream implementation's internals without
-  changing the submodule. Held directories pin clusters; held file objects pin
-  directory-entry slots. Conflicting FAT removal/file rename returns `EBUSY`.
-  FAT16 and FAT32 are covered; native tests also use the embedded FAT image.
-  Current directory names are reported by cluster identity after rename. New
-  retained-parent FAT mutations explicitly return `EOPNOTSUPP`; they do not fall
-  back to opening names. FAT replacement-rename atomicity remains an old
-  limitation; the existing delete-destination-first implementation is not fixed.
-- A retained VFS walker with explicit attachment edges, virtual missing mount
-  ancestors, root clamping, stacked-root parent traversal and no pathname
-  reconstruction for lookup authority. Root replacement is rejected. Production
-  boot now installs FAT root before procfs. Unsupported object backends return
-  `EOPNOTSUPP`; old APIs remain available while consumers are migrated.
-- Legacy mount dispatch follows the visible attachment tree so an overmount
-  also hides older descendants. Successful ancestor rename updates legacy mount
-  labels only in the affected attachment subtree. Virtual links and mountpoints
-  are reserved against conflicting VFS mutations.
-- Exact-object opens transfer a mount hold to the vnode before the retained path
-  can be released. A held path pins backing through its final object destructor.
+The syscall migration covers open/openat, metadata, creation/removal/rename,
+symlinks, pathname sockets, executable/interpreter lookup, chdir/fchdir/getcwd,
+umask, and shell-created children. Dirfd acquisition pins the descriptor until
+an independent object/attachment reference exists. Absolute paths ignore dirfd.
+Scheduler snapshots copy only advisory display text; proc cwd reporting snapshots
+the live context outside scheduler locks. Reporting names never dispatch normal
+disk operations. Legacy command aliases are restricted to command/bin forms and
+are rejected from a hidden retained cwd. Exec explicitly releases its lookup
+snapshot before entering user mode without C++ stack unwinding.
 
-Not integrated yet: Process ownership/publication of `FsContext`, real fork and
-`CLONE_FS`/exec sharing rules, the complete relative-syscall/exec/shell migration,
-and retained proc PID/fd broker objects. No namespace, chroot or Steam container
-support is claimed. Steam authentication is still blocked by those later layers.
+Procfs now exposes typed root/PID/task/fd directories and generated files.
+Interned object keys include parent identity and PID/group incarnations, avoiding
+PID reuse and incorrect parent traversal. They hold no strong Process reference,
+so a cwd inside the process's own proc directory cannot create a lifetime cycle.
+Following `/proc/PID/cwd` returns an exact retained target, with no text reopen;
+this bounded implementation permits only the current process/thread group.
+Cross-process following returns EACCES pending a proper inspection policy.
+Readlink reporting is distinct from following. Proc generators use an explicitly
+callback-only reporting helper to avoid recursive namespace locking.
 
-Validation for this phase: all **96 hosted tests** pass; six targeted tests pass
-with AddressSanitizer and UndefinedBehaviorSanitizer. The tests combine the
-production VFS, Ext2 and context core on four independent disposable filesystem images,
-plus actual FAT16/FAT32 backend images checked with filesystem repair tools in
-read-only mode. They cover rename and replacement, retained overmount behavior,
-stacked roots, hidden-descendant visibility parity with legacy opens, unrelated
-hidden-tree rename, virtual ancestor detach, concurrent namespace transactions,
-allocation failure unwind, orphan identity, independent iterators and object-to-
-vnode lifetime transfer. The expanded native VFS suite also passes with the
-real FAT backend, kernel locks and private memory disks, including retained open,
-current-name reporting and context copy/mask ownership. Host tests additionally
-cover context snapshot lifetime, concurrent cwd/mask updates, copy allocation
-failure and real/effective traversal disagreement through `..`. These are core
-mechanics tests; they do not establish actual Process fork, CLONE_FS or exec
-semantics. A complete ABI-37 desktop acceptance VM has not been run in this phase.
+Ext2 supports retained parent mutations and orphan lifetime. An acceptance test
+caught a newly over-conservative mapped-file gate; the corrected old and retained
+APIs now share the established backend-specific policy. Mapped Ext2 sources and
+replaced destinations preserve their backing; FAT protects physical entries.
+The earlier retained walker, child/stacked mount edges, root clamping, symlinks,
+virtual ancestors, rename-label preflight and exact-open lifetime work remain.
 
-Current evidence: `build/workloads/retained-fs-objects-20261022/` (ignored).
-The earlier ABI-35 acceptance and its kernel hash below are historical evidence.
+Explicit boundaries:
+
+- Retained FAT root/component lookup and existing-object opens work on FAT16 and
+  FAT32. New parent mutations return EOPNOTSUPP. In particular, guest creation,
+  mkdir, remove and rename on FAT no longer use the old pathname-only mutation
+  route. This is a known compatibility reduction; writable workloads use Ext2.
+  Existing FAT replacement-rename atomicity has not been fixed.
+- General proc fd/exe magic-link following remains unsupported, with readlink
+  names available for reporting. Existing explicit proc descriptor brokers and
+  the pathname-based `/proc/self/exe` exec compatibility exception remain; this
+  does not establish retained executable identity across rename/unlink.
+- Ext4 retained lookup is unsupported. There are no namespaces, chroot, bind
+  mounts, container isolation or cross-process inspection implementation here.
+  `/proc/self/root` and genuine Steam runtime-container requirements remain
+  later gates before authentication; no credentials were entered.
+
+Acceptance combines actual Linux/Brook execution with hosted fault/concurrency
+coverage. The exact static `fscontextcheck` binary passes **78 checks on both**:
+renamed cwd/dirfd with replacement at the old name, relative mutation/link
+handling, absolute/bad dirfd, independent and shared contexts, thread copying,
+successful/failed exec sharing, proc-relative access and creation masks. The
+existing file-lifetime, relative-at and cwd probes also pass, alongside **974
+credential checks**, signalfd and SysV semaphore regression jobs. All seven
+original native jobs exited zero with no remaining tasks. A separate native
+shell check permits self cwd and rejects other-process cwd with EACCES. Mousepad
+launched through the normal app UI, rendered, and its exact client group exited
+through normal close.
+
+All **96 hosted tests** pass. Six filesystem targets pass ASan/UBSan; the final
+mapped Ext2 mutation regression additionally passes under those sanitizers.
+Hosted tests exercise actual Process publication helpers, copy OOM, explicit
+owned replacement/final drops and acquisition racing replacement, plus the
+production VFS and real disposable Ext2/FAT backends. They do not inject failures
+at every allocation site in actual ProcessFork. Native VFS tests cover real FAT,
+locks and private memory disks. Supported-family entry and scheduler-start audits
+pass; unsupported return families are not certified. No performance claim is made.
+
+The accepted runtime kernel hash is
+`7d817e60fbb2fd5dc540368bb5d9f6f6045ef44150baf953d629968212f5dc9b`.
+The matched 13-module ABI-38 inventory was validated and round-tripped through the
+private boot disk. Heap integrity was OK after the probes and GUI close. Checked
+guest sync completed; the original VM wrapper exited zero; all four offline
+filesystem checks passed. No VM remains running. This stop is checked sync plus
+QMP termination, not a serial-confirmed guest ACPI shutdown.
+
+Private source capsule, request/job identities, module checks, logs and receipts:
+`build/workloads/fs-context-mapped-20261022/` and
+`build/reviews/fs-context-mapped-off-gpu-1ms-fixed-mlfq-a-20261022/`.
+The source capsule includes the precommit diff and new files. Its launch metadata
+inherited an outdated capsule label; the actual capsule location/hash are verified
+and recorded in `completion-audit.json`. The first native run and its mapped-file
+failure remain under the corresponding `fs-context-20261022` paths. Earlier
+object/core evidence is under `build/workloads/retained-fs-objects-20261022/`.
+Binaries, disks, screenshots and proprietary data remain ignored.
 
 ## Historical mount-ownership checkpoint (`8ea2322c`)
 
@@ -186,8 +216,11 @@ or backend work. VFS namespace lock precedes backend inode locks. No backend
 callbacks, final destructors or scheduler calls run under publication locks.
 
 Fork copies the context while retaining paths. CLONE_FS shares it, including
-umask; absence of CLONE_FS copies it even for a thread. Exec privately prepares
-an unshared context before commit. All unpublished-child failure paths and
+umask; absence of CLONE_FS copies it even for a thread. Ordinary exec preserves
+CLONE_FS sharing, matching Linux. The original plan incorrectly called for
+unsharing the filesystem context at exec; the static Linux 6.12.112 control
+proved that cwd and umask changes after successful exec remain shared. Exec
+still unshares the descriptor table separately. All unpublished-child failure paths and
 final deferred process destruction release owned contexts. A memcpy of Process
 must not leave a borrowed context pointer that an unwind treats as owned.
 Concurrent chdir uses retained snapshots and last-commit-wins publication;
@@ -219,7 +252,7 @@ native Brook tests for:
 - Overmount before and after retaining a directory, child-mount entry, `..`,
   absolute/relative symlinks, permission failures and removed directories.
 - Fork independence, CLONE_FS sharing of cwd/umask, absence of CLONE_FS on
-  threads, exec unsharing and unpublished-child allocation-failure unwind.
+  threads, exec preserving CLONE_FS sharing and unpublished-child allocation-failure unwind.
 - Last-reference teardown, mount busy behavior, synthetic proc/dev paths,
   supported FAT root behavior and explicit unsupported mutable-FAT cases.
 

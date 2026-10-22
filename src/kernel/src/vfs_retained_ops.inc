@@ -88,6 +88,27 @@ Vnode* VfsOpenAt(const VfsPath& root,const VfsPath& start,const char* text,int f
     if(!node) { if(!*error)*error=-5;return nullptr; }
     VfsAttachMount(node,static_cast<MountEntry*>(result.parent.attachment));return node;
 }
+int VfsOpenExecutableAt(const VfsPath& root,const VfsPath& start,const char* text,
+                        Vnode** out,char* resolved,uint32_t capacity)
+{
+    if(!out || !resolved || capacity<2)return -22;
+    *out=nullptr;resolved[0]=0;
+    FileMutationGuard lookup(false);VfsOwnedWalk walk;
+    if(int error=VfsWalkAtLocked(root,start,text,walk))return error;
+    VnodeStat stat{};if(int error=VfsObjectStatLocked(walk.value.object.object,&stat))return error;
+    if(stat.isDir)return -13;
+    // Reporting happens from the completed retained walk; it never reopens
+    // the executable by a global name, including beneath an overmount.
+    if(!walk.value.parent.object)return -2;
+    if(int error=VfsGlobalDirectoryLocked(walk.value.parent,resolved,capacity))return error;
+    uint32_t prefix=StrLen(resolved),leaf=StrLen(walk.value.leaf);
+    if(prefix==1 && resolved[0]=='/')prefix=0;
+    if(prefix+leaf+1>=capacity) {resolved[0]=0;return -36;}
+    resolved[prefix++]='/';StrCopy(resolved+prefix,walk.value.leaf,capacity-prefix);
+    int error=0;Vnode* node=VfsPathOpenLocked(walk.value.object,VFS_O_EXEC,&error);
+    if(!node)return error?error:-5;
+    *out=node;return 0;
+}
 int VfsStatAt(const VfsPath& root,const VfsPath& start,const char* text,VnodeStat* out,bool followFinal)
 {
     if(!out)return -22;
@@ -130,7 +151,7 @@ int VfsRemoveAt(const VfsPath& root,const VfsPath& start,const char* text,bool d
     if(walk.value.trailing && (!stat.isDir || stat.isSymlink))return -20;
     if(stat.isDir!=directory)return directory?-20:-21;
     if(directory && VfsVirtualChildrenLocked({parent.attachment,target.value}))return -39;
-    if(!stat.isDir && g_mappingPins.Busy(stat.dev,stat.ino))return -16;
+    if(VfsMappedMutationBusy(stat))return -16;
     return parent.object->ops->remove?parent.object->ops->remove(parent.object,leaf,directory):-95;
 }
 int VfsSymlinkAt(const VfsPath& root,const VfsPath& start,const char* targetText,const char* text)
@@ -217,8 +238,7 @@ int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
     if(newWalk.value.trailing && target.value && (!newStat.isDir || newStat.isSymlink))return -20;
     const bool same=target.value && VfsPathSame({oldParent.attachment,source.value},{newParent.attachment,target.value});
     if(!same && target.value && newStat.isDir && VfsVirtualChildrenLocked({newParent.attachment,target.value}))return -39;
-    if((!oldStat.isDir && g_mappingPins.Busy(oldStat.dev,oldStat.ino)) ||
-       (target.value && !newStat.isDir && g_mappingPins.Busy(newStat.dev,newStat.ino)))return -16;
+    if(VfsMappedMutationBusy(oldStat) || (target.value && VfsMappedMutationBusy(newStat)))return -16;
     auto* ops=oldParent.object->ops;if(!ops->rename || ops!=newParent.object->ops)return -95;
     VfsRenameLabels labels;
     if(!same && oldStat.isDir)if(int error=VfsPrepareRenameLabelsLocked(oldParent,oldName,newParent,newName,labels))return error;

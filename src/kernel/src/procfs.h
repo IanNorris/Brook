@@ -6,6 +6,8 @@ namespace brook {
 
 // Initialise procfs.  Call once during boot, before VfsMount("/proc", "procfs", 0).
 void ProcFsInit();
+int ProcFsRootObject(void*,uint8_t,VfsObject**);
+int ProcFsVnodeObject(Vnode*,VfsObject**);
 
 // ProcFS VnodeOps — used by the VFS layer when a path falls under /proc.
 // Open a procfs path.  relPath is relative to /proc (e.g. "meminfo", "1/stat").

@@ -59,8 +59,9 @@ namespace brook {
 // ABI 34 versions SchedOps and adds measured-service/runnable/preemption hooks.
 // ABI 35 adds retained VFS mount ownership to Vnode.
 // ABI 36 adds retained backend-object factories and Vnode identity pins.
+// ABI 38 appends Process filesystem-context ownership and replaces cwd/mask authority.
 // ABI 37 appends retained-parent mutation and metadata callbacks to VfsObjectOps.
-static constexpr uint32_t MODULE_ABI_VERSION = 37;
+static constexpr uint32_t MODULE_ABI_VERSION = 38;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

@@ -6,6 +6,7 @@ struct Vnode;
 struct VnodeStat;
 struct VnodeTime;
 struct VfsObject;
+struct VfsPath;
 
 // Backend identity, independent of a file description's flags, offset and
 // directory-iteration state. Its owner must separately pin the mount backing.
@@ -39,6 +40,10 @@ struct VfsObjectOps {
     int (*chown)(VfsObject*,uint32_t uid,uint32_t gid) = nullptr;
     // Reporting only; never re-resolve this name for a subsequent operation.
     int (*directory_path)(VfsObject*,char* out,uint32_t capacity) = nullptr;
+    // 0: ordinary textual symlink; 1: owned exact magic-link target in out;
+    // negative: explicit unsupported/error. Called only for actual following,
+    // never for readlink reporting, within the namespace transaction.
+    int (*follow_link)(VfsObject*,VfsPath* out) = nullptr;
 };
 struct VfsObject {
     const VfsObjectOps* ops;

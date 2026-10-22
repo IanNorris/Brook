@@ -17,6 +17,9 @@ int VfsPathFromVnode(Vnode* vnode,VfsPath* out);
 int VfsPathResolve(const VfsPath& root,const VfsPath& start,const char* text,
                    VfsPath* out,bool followFinal=true,bool realIds=false);
 // Reporting only, including current backend directory names after rename.
+// Backend callbacks already run inside a VFS namespace transaction. Only
+// those callbacks may use this non-locking reporting variant.
+int VfsPathDirectoryPathFromCallback(const VfsPath& path,char* out,uint32_t capacity);
 int VfsPathDirectoryPath(const VfsPath& path,char* out,uint32_t capacity);
 int VfsPathStat(const VfsPath& path,VnodeStat* out);
 int VfsPathAccess(const VfsPath& path,uint8_t required,bool realIds=false);
@@ -27,6 +30,10 @@ Vnode* VfsPathOpen(const VfsPath& path,int flags,int* error);
 // name to dispatch a backend mutation.
 Vnode* VfsOpenAt(const VfsPath& root,const VfsPath& start,const char* text,int flags,
                  uint16_t mode,uint16_t mask,int* error,bool followFinal=true);
+// Open and executable permission check use held identities in one walk. The
+// resolved name is reporting only, derived from that walk's final parent/leaf.
+int VfsOpenExecutableAt(const VfsPath& root,const VfsPath& start,const char* text,
+                        Vnode** out,char* resolved,uint32_t capacity);
 int VfsStatAt(const VfsPath& root,const VfsPath& start,const char* text,VnodeStat* out,bool followFinal=true);
 int VfsAccessAt(const VfsPath& root,const VfsPath& start,const char* text,uint8_t required,bool realIds=false,bool followFinal=true);
 int VfsReadlinkAt(const VfsPath& root,const VfsPath& start,const char* text,char* out,uint32_t capacity);

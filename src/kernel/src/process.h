@@ -12,6 +12,7 @@
 namespace brook {
 
 struct Vnode;
+struct FsContext;
 struct KRwLock;
 struct SupplementaryGroups {
     volatile uint32_t references;
@@ -282,7 +283,7 @@ struct Process
     SupplementaryGroups* groups; // per-task immutable shared list, owns one ref
     ProcessState state;
     uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
-    uint16_t umask;              // File creation mask (default 022)
+    uint16_t reservedFsMask;     // Retained layout padding; mask lives only in FsContext
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
     int32_t  cpuAffinity;    // CPU affinity pin (-1 = any CPU, >=0 = pinned to that CPU)
     volatile uint64_t tlbCpuMask;  // Bitmask of CPUs that have this process's CR3 loaded in TLB
@@ -449,8 +450,8 @@ struct Process
     // Absolute path of the current executable for /proc/self/exe.
     char exePath[256];
 
-    // Working directory (for relative path resolution)
-    char cwd[256];
+    // Advisory initial-namespace name only. Never used for lookup authority.
+    char cwdDisplay[256];
 
     // True if this is a kernel-mode thread (ring 0, kernel CR3, no user stack).
     bool isKernelThread;
@@ -535,6 +536,9 @@ struct Process
     // Kernel launcher classification, immutable after publication. Fork and
     // threads inherit it; exec preserves it. This grants no Linux credentials.
     ProcessLifecycleRole lifecycleRole;
+
+    // Owned reference; access only through process_fs.h publication helpers.
+    FsContext* fsContext;
 };
 
 // User backing pages belong to the shared address space, not the allocating
@@ -673,14 +677,14 @@ static inline void ProcessUnref(Process* p)
 // The caller must provide the user-mode context so the child can resume.
 // Returns the child Process* on success, or null on failure.
 Process* ProcessFork(Process* parent, uint64_t userRip,
-                     uint64_t userRsp, uint64_t userRflags);
+                     uint64_t userRsp, uint64_t userRflags,bool shareFs=false);
 
 // Create a new thread in the same address space as parent (CLONE_VM|CLONE_THREAD).
 // Shares the page table (no copy), shares fd table, uses the provided user stack.
 // Returns the thread Process* on success, or null on failure.
 Process* ProcessCreateThread(Process* parent, uint64_t userRip,
                              uint64_t userRsp, uint64_t userRflags,
-                             uint64_t tlsBase);
+                             uint64_t tlsBase,bool shareFs=true);
 
 // Create a new user-mode thread inside `target`'s address space, running at
 // `entry` with a freshly-allocated user stack.  `argBytes` (length `argLen`)

@@ -28,6 +28,7 @@ std::mutex trackingLock;
 thread_local long failAllocation=-1;
 unsigned requiredAccess=0;
 brook::Process process{};
+uint16_t legacyTestMask=022;
 std::vector<unsigned char> disk;
 int readDisk(brook::Device* device,uint64_t offset,void* out,uint64_t bytes){
     auto& storage=device->priv?*static_cast<std::vector<unsigned char>*>(device->priv):disk;
@@ -44,6 +45,7 @@ const brook::DeviceOps diskOps={readDisk,writeDisk,ioctlDisk,nullptr};
 void closeNode(brook::Vnode* node){assert(node);node->ops->close(node);brook::kfree(node);}
 }
 namespace brook {
+extern "C" [[noreturn]] void KernelPanic(const char*,...) {std::abort();}
 extern "C" void* kmalloc(uint64_t size){
     if(failAllocation==0){failAllocation=-1;return nullptr;}
     if(failAllocation>0)--failAllocation;
@@ -63,6 +65,7 @@ void FileObjectInit(FileObject* object){*object={};}
 int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -95;}
 void FileObjectDispose(FileObject* object){assert(!object->mappings && !object->mappingRegistrations);for(auto* p:object->pages)assert(!p);}
 Process* ProcessCurrent(){return &process;}
+int ProcessFsMask(Process*){return legacyTestMask;}
 CredentialIds ProcessReadIds(Process* p,bool group){return group?CredentialIds{p->gid,p->egid,p->sgid}:CredentialIds{p->uid,p->euid,p->suid};}
 FileCredentialAccess ProcessFileAccess(Process* p,uint32_t owner,uint32_t group,uint16_t mode,bool realIds){
     auto uid=realIds?p->uid:p->euid;auto gid=realIds?p->gid:p->egid;
@@ -103,7 +106,7 @@ int main(int argc,char** argv){
     assert(argc==2);std::ifstream input(argv[1],std::ios::binary);assert(input);
     disk.assign(std::istreambuf_iterator<char>(input),{});input.close();
     using namespace brook;
-    process.uid=process.euid=process.suid=1000;process.gid=process.egid=process.sgid=1000;process.umask=022;
+    process.uid=process.euid=process.suid=1000;process.gid=process.egid=process.sgid=1000;legacyTestMask=022;
     Device device{&diskOps,"host-ext2-object-fixture",DeviceType::Block,nullptr};
     g_ext2Devices[0]=&device;void* mount=nullptr;assert(Ext2FsMount(0,&mount));
     auto* m=static_cast<Ext2Mount*>(mount);
@@ -153,7 +156,7 @@ int main(int argc,char** argv){
     // Mutations use the held parent inode after its old global name has been
     // replaced. Modes are already masked by the context snapshot, never by a
     // second read of the process mask inside the inode lock.
-    process.umask=077;
+    legacyTestMask=077;
     Vnode* newlyCreated=held->ops->create(held,"created",VFS_O_WRITE,0640,&error);assert(newlyCreated&&!error);
     assert(!held->ops->create(held,"created",VFS_O_WRITE,0600,&error)&&error==-17);
     assert(!held->ops->symlink(held,"nonexistent","dangling"));
@@ -188,7 +191,7 @@ int main(int argc,char** argv){
     assert(!held->ops->remove(held,"nested",true));VfsObjectRelease(nested);
     assert(held->ops->mkdir(held,"..",0700)==-22);assert(held->ops->remove(held,"a/b",false)==-22);
     assert(!held->ops->create(held,"/escape",VFS_O_WRITE,0600,&error)&&error==-22);
-    process.umask=022;
+    legacyTestMask=022;
     assert(!held->ops->chmod(held,0600));m->skipPermChecks=false;
     assert(!held->ops->create(held,"marker",VFS_O_WRITE,0600,&error)&&error==-13);
     assert(held->ops->mkdir(held,"marker",0700)==-13);
@@ -248,6 +251,16 @@ int main(int argc,char** argv){
     VfsPath fsRoot{},cwd{},value{},resolved{};assert(!VfsPathRoot(&fsRoot));
     assert(!VfsPathResolve(fsRoot,fsRoot,"/container/context-dir",&cwd));
     assert(!VfsPathResolve(fsRoot,cwd,"value",&value));
+    // Mapped Ext2 backing survives unlink and replacement. Retained mutations
+    // must use the same backend-specific gate as the legacy pathname API.
+    auto* mappedSource=VfsOpenAt(fsRoot,cwd,"mapped-source",VFS_O_CREATE|VFS_O_WRITE,0600,0,&error);
+    auto* mappedTarget=VfsOpenAt(fsRoot,cwd,"mapped-target",VFS_O_CREATE|VFS_O_WRITE,0600,0,&error);
+    assert(mappedSource && mappedTarget && !VfsFileMapPin(mappedSource) && !VfsFileMapPin(mappedTarget));
+    assert(!VfsRenameAt(fsRoot,cwd,"mapped-source",cwd,"mapped-target"));
+    VnodeStat mappedStat{};assert(!VfsStat(mappedTarget,&mappedStat) && !mappedStat.nlink);
+    assert(!VfsRemoveAt(fsRoot,cwd,"mapped-target",false));
+    assert(!VfsStat(mappedSource,&mappedStat) && !mappedStat.nlink);
+    VfsFileMapUnpin(mappedSource);VfsFileMapUnpin(mappedTarget);VfsClose(mappedSource);VfsClose(mappedTarget);
     FsContext* context=FsContextCreate(fsRoot,cwd,022,&error);assert(context&&!error);
     FsContext* copied=FsContextCopy(context,&error);assert(copied&&!error);
     FsContextRetain(context);FsContext* shared=context;

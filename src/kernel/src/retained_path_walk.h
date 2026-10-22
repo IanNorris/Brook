@@ -17,6 +17,12 @@ template<class Path> struct RetainedWalkResult {
     bool trailing=false;
 };
 
+template<class Provider,class Path>
+auto RetainedFollowLink(Provider& fs,const Path& path,Path& target,int)
+    -> decltype(fs.FollowLink(path,target)) {return fs.FollowLink(path,target);}
+template<class Provider,class Path>
+int RetainedFollowLink(Provider&,const Path&,Path&,long) {return 0;}
+
 // Path{} is empty. Retain/Release operate on live references, including empty
 // handles. Lookup(parent, oneName, out) returns a held child without following
 // symlinks, entering a child mount only at that looked-up child (not at start).
@@ -98,6 +104,17 @@ int WalkRetainedPath(const Path& root, const Path& start, const char* text,
         if(int e=fs.Stat(child.value,childInfo))return e;
         if(childInfo.isSymlink && (!final || options.followFinal || trailing)) {
             if(++links>40)return -40;
+            Owned magic{fs};
+            int followed=RetainedFollowLink(fs,child.value,magic.value,0);
+            if(followed<0)return followed;
+            if(followed) {
+                if(tail[0]) {
+                    RetainedNodeInfo targetInfo{};
+                    if(int targetError=fs.Stat(magic.value,targetInfo))return targetError;
+                    if(!targetInfo.isDir)return -20;
+                }
+                current.take(magic);copy(remaining,tail);continue;
+            }
             char target[512];
             const int bytes=fs.Readlink(child.value,target,sizeof(target));
             if(bytes<0)return bytes;

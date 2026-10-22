@@ -506,7 +506,8 @@ add_host_test(test_gpu_reservation)
 target_compile_options(test_gpu_reservation PRIVATE -UNDEBUG)
 
 # Production VFS mount topology, walk and object-to-vnode ownership transfer.
-add_host_test(test_vfs_paths "${BROOK_ROOT}/src/kernel/src/memory/mapping_pin_registry.cpp")
+add_host_test(test_vfs_paths "${BROOK_ROOT}/src/kernel/src/memory/mapping_pin_registry.cpp"
+    "${BROOK_ROOT}/src/kernel/src/fs_context.cpp" "${BROOK_ROOT}/src/kernel/src/process_fs.cpp")
 target_compile_options(test_vfs_paths PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
     -Wno-unused-function -Wno-unused-parameter -Wno-attributes
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
