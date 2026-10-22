@@ -33,3 +33,20 @@ matched native pair shows a substantial presentation improvement with 1-ms
 polling, with variable additional CPU cost and remaining short audio gaps. See
 [the measured comparison](../../docs/gpu-fence-timing-control.md). This remains
 a private diagnostic override; no launch default changes.
+
+The later bounded follow-up in `tools/qemu-fence-poll-pkg` also accepts
+`fencePollUs = 250` or `1000` with `fencePollMs = 1`:
+
+```sh
+nix-build tools/qemu-fence-poll-pkg --arg fencePollUs 250 --no-out-link --cores 8 --max-jobs 1
+```
+
+This opt-in variant changes the fence timer allocation to nanosecond units and
+rearms from `qemu_clock_get_ns`, with an explicit microsecond interval. Both
+patch sites must match exactly. Other timers, fence creation/response handling,
+guest synchronization and ownership remain unchanged. Comparing it with the
+legacy 1-ms output tests finer polling including its deadline quantization;
+use the nanosecond-unit 1,000-us arm to isolate interval from quantization if
+the broader comparison justifies further work. Leaving `fencePollUs` unset
+resolves to the exact existing legacy derivation/output, verified by evaluation.
+No finer-poll performance or correctness acceptance is established by a build.
