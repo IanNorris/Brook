@@ -36,10 +36,10 @@ static int VfsMountRootLocked(MountEntry* mount,VfsPath* out)
 {
     *out={};
     if(!mount || !mount->used)return -2;
-    if(!mount->rootIdentityKnown || !mount->fsOps->root_object)return -95;
+    if(!mount->rootIdentityKnown || !mount->backing->fsOps->root_object)return -95;
     VfsPathHoldMount(mount);
     VfsObject* object=nullptr;
-    int error=mount->fsOps->root_object(mount->mountPriv,mount->pdrv,&object);
+    int error=mount->backing->fsOps->root_object(mount->backing->mountPriv,mount->backing->pdrv,&object);
     if(!error && (!object || object->identity!=mount->rootIdentity || object->ops!=mount->rootObjectOps))error=-5;
     if(error) {
         VfsObjectRelease(object);
@@ -289,7 +289,7 @@ static int VfsPathFromVnodeLocked(Vnode* node,VfsPath* out)
     VfsObject* object=nullptr;int error=0;
     if(node->backendObject && node->backendObject->ops==&g_virtualDirectoryOps) {
         object=node->backendObject;VfsObjectRetain(object);
-    } else if(mount->fsOps->vnode_object)error=mount->fsOps->vnode_object(node,&object);
+    } else if(mount->backing->fsOps->vnode_object)error=mount->backing->fsOps->vnode_object(node,&object);
     else error=-95;
     if(error || !object) { VfsObjectRelease(object);return error?error:-5; }
     VfsPathHoldMount(mount);*out={mount,object};return 0;

@@ -23,6 +23,9 @@ struct Mount;
 struct Node { Mount* mount;uint64_t id;bool dir;Node* parent;std::map<std::string,Node*> children;std::string target; };
 struct Mount { bool alive=false;unsigned live=0;unsigned closed=0;Node root{}; };
 Mount mounts[8];
+unsigned mountCalls[8]{},unmountCalls[8]{},syncCalls[8]{};
+bool rejectRoot[8]{},rejectUnmount[8]{};
+bool rejectProvider=false;unsigned providerCalls=0;
 extern const brook::VfsObjectOps objectOps;
 Node& node(brook::VfsObject* object){return *static_cast<Node*>(object->priv);}
 int makeObject(Node* source,brook::VfsObject** out){
@@ -57,9 +60,9 @@ int objectFollow(brook::VfsObject* object,brook::VfsPath* out) {
 }
 const brook::VfsObjectOps objectOps={.destroy=destroyObject,.stat=objectStat,.access=objectAccess,
     .lookup=objectChild,.parent=objectParent,.readlink=objectReadlink,.open=objectOpen,.follow_link=objectFollow};
-bool mountBackend(uint8_t drive,void** out){assert(drive<8 && !mounts[drive].alive);auto& m=mounts[drive];m.alive=true;m.root={&m,1,true,&m.root,{}, {}};*out=&m;return true;}
-int unmountBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive && !m->live);m->alive=false;return 0;}
-int rootObject(void* priv,uint8_t,brook::VfsObject** out){return makeObject(&static_cast<Mount*>(priv)->root,out);}
+bool mountBackend(uint8_t drive,void** out){assert(drive<8 && !mounts[drive].alive);auto& m=mounts[drive];++mountCalls[drive];m.alive=true;m.root={&m,1,true,&m.root,{}, {}};*out=&m;return true;}
+int unmountBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive && !m->live);auto index=m-mounts;++unmountCalls[index];if(rejectUnmount[index])return -5;m->alive=false;return 0;}
+int rootObject(void* priv,uint8_t drive,brook::VfsObject** out){if(rejectRoot[drive]){*out=nullptr;return -5;}return makeObject(&static_cast<Mount*>(priv)->root,out);}
 int vnodeObject(brook::Vnode* vn,brook::VfsObject** out){*out=vn->backendObject;brook::VfsObjectRetain(*out);return 0;}
 Node* legacyLookup(Mount* mount,const char* path){
     Node* current=&mount->root;std::string text(path);std::size_t start=0;
@@ -90,12 +93,14 @@ int legacyRename(void* priv,uint8_t,const char* oldPath,const char* newPath){
     if(it==children.end())return -2;
     Node* original=it->second;children.erase(it);children[newName]=original;return 0;
 }
-const brook::VfsFsOps fsOps={.mount=mountBackend,.unmount=unmountBackend,.open=legacyOpen,.stat_path=legacyStat,.lstat_path=legacyStat,.unlink=nullptr,.mkdir=nullptr,.rename=legacyRename,.symlink=nullptr,.readlink=nullptr,.sync=nullptr,.root_object=rootObject,.vnode_object=vnodeObject};
+int syncBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive);++syncCalls[m-mounts];return 0;}
+const brook::VfsFsOps fsOps={.mount=mountBackend,.unmount=unmountBackend,.open=legacyOpen,.stat_path=legacyStat,.lstat_path=legacyStat,.unlink=nullptr,.mkdir=nullptr,.rename=legacyRename,.symlink=nullptr,.readlink=nullptr,.sync=syncBackend,.root_object=rootObject,.vnode_object=vnodeObject};
 const brook::VfsFsOps unsupportedOps={.mount=mountBackend,.unmount=unmountBackend,.open=nullptr,.stat_path=nullptr,.lstat_path=nullptr,.unlink=nullptr,.mkdir=nullptr,.rename=nullptr,.symlink=nullptr,.readlink=nullptr,.sync=nullptr};
 brook::VfsPath resolve(const brook::VfsPath& root,const brook::VfsPath& start,const char* text){brook::VfsPath out{};int error=brook::VfsPathResolve(root,start,text,&out);if(error)std::fprintf(stderr,"resolve %s: %d\n",text,error);assert(!error);return out;}
 void expect(const brook::VfsPath& root,const brook::VfsPath& start,const char* text,const brook::VfsPath& expected){auto p=resolve(root,start,text);assert(brook::VfsPathSame(p,expected));brook::VfsPathRelease(p);}
 }
 namespace brook {
+bool ModuleRetainAddresses(const uintptr_t* addresses,uint32_t count){assert(addresses&&count);++providerCalls;return !rejectProvider;}
 extern "C" void* kmalloc(uint64_t size){if(failAllocation==0){failAllocation=-1;return nullptr;}if(failAllocation>0)--failAllocation;void* p=std::malloc(size);if(p){std::memset(p,0xcc,size);std::lock_guard<std::mutex> lock(allocationLock);allocations.insert(p);}return p;}
 extern "C" void kfree(void* p){if(p){std::lock_guard<std::mutex> lock(allocationLock);assert(allocations.erase(p)==1);std::free(p);}}
 void KRwLockInit(KRwLock* lock){*lock={};}
@@ -105,6 +110,8 @@ void KRwLockWriteLock(KRwLock*){namespaceLock.lock();}
 void KRwLockWriteUnlock(KRwLock*){namespaceLock.unlock();}
 extern "C" void SerialPrintf(const char*,...){}
 void SerialPuts(const char*){}
+int FileObjectWritebackAll(){return 0;}
+int FileObjectWriteback(FileObject*,Vnode*,uint64_t,uint64_t){assert(false);return -5;}
 int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -5;}
 }
 // Actual Process publication helpers and FsContext core. These exercise owned
@@ -153,7 +160,8 @@ static void testProcessContexts(const brook::VfsPath& root,const brook::VfsPath&
 }
 int main(){
     using namespace brook;
-    VfsInit();assert(VfsRegisterFs("objects",&fsOps));assert(VfsRegisterFs("unsupported",&unsupportedOps));
+    VfsInit();rejectProvider=true;assert(!VfsRegisterFs("rejected",&fsOps));rejectProvider=false;
+    assert(VfsRegisterFs("objects",&fsOps));assert(providerCalls==3);assert(VfsRegisterFs("unsupported",&unsupportedOps));
     assert(VfsMount("/","objects",0));assert(!VfsMount("/","objects",1));
     Node directory{&mounts[0],2,true,&mounts[0].root,{},{}}, marker{&mounts[0],3,false,&directory,{},{}}, poison{&mounts[0],4,true,&mounts[0].root,{},{}}, file{&mounts[0],5,false,&mounts[0].root,{},{}}, link{&mounts[0],6,false,&directory,{},"/dir/marker"};
     mounts[0].root.children={{"dir",&directory},{"file",&file}};directory.children={{"marker",&marker},{"absolute",&link}};
@@ -231,11 +239,15 @@ int main(){
     VfsPath virtualFrom{};assert(!VfsPathFromVnode(virtualNode,&virtualFrom)&&VfsPathSame(virtualFrom,synthetic));
     VfsPathRelease(virtualFrom);VfsClose(virtualNode);VfsPathRelease(synthetic);
     assert(!VfsMount("/file/nested","objects",2));assert(!mounts[2].alive);
-    for(long failure=0;failure<4;++failure){
+    bool mountedAfterFailures=false;
+    for(long failure=0;failure<30;++failure){
         const auto before=allocations.size();failAllocation=failure;
-        assert(!VfsMount("/new/child","objects",2));failAllocation=-1;
+        bool mounted=VfsMount("/new/child","objects",2);failAllocation=-1;
+        if(mounted){assert(VfsUnmount("/new/child"));mountedAfterFailures=true;}
         assert(!mounts[2].alive && allocations.size()==before);
+        if(mounted)break;
     }
+    assert(mountedAfterFailures);
     assert(VfsMount("/opaque","unsupported",2));
     assert(VfsPathResolve(root,root,"/opaque",&missing)==-95 && !missing.object);
     assert(VfsUnmount("/opaque"));
@@ -266,5 +278,45 @@ int main(){
     const auto before=allocations.size();assert(!VfsPathOpen(original,VFS_O_TRUNC,&error)&&error==-5);assert(allocations.size()==before);
     assert(!VfsUnmount("/"));VfsPathRelease(original);VfsPathRelease(held);VfsPathRelease(root);
     assert(VfsUnmount("/"));for(const auto& mount:mounts)assert(!mount.alive && !mount.live);
+    // A copied attachment pins one real backing without remounting its driver.
+    assert(!g_backings);assert(VfsMount("/","objects",6));
+    MountEntry alias{};
+    {
+        FileMutationGuard transaction;
+        alias=g_mounts[0];alias.pathHolds=0;alias.vnodeHolds=0;
+        alias.backing->RetainLocked();
+    }
+    VfsPath aliasRoot{};
+    { FileMutationGuard transaction;assert(!VfsMountRootLocked(&alias,&aliasRoot)); }
+    assert(mountCalls[6]==1 && alias.backing->references==2);
+    assert(!VfsSync(nullptr) && syncCalls[6]==1); // one sync per backing, not per attachment
+    assert(VfsUnmount("/") && mounts[6].alive && !unmountCalls[6]);
+    VnodeStat aliasStat{};assert(!VfsPathStat(aliasRoot,&aliasStat) && aliasStat.isDir);
+    VfsPathRelease(aliasRoot);
+    {
+        FileMutationGuard transaction;
+        rejectUnmount[6]=true;
+        assert(VfsBackingDropLocked(alias.backing)==-5 && alias.backing->references==1);
+        rejectUnmount[6]=false;
+        assert(!VfsBackingDropLocked(alias.backing));alias.backing=nullptr;alias.used=false;
+    }
+    assert(!mounts[6].alive && unmountCalls[6]==2 && !g_backings);
+    // Failed private construction must retain failed teardown for sync/retry.
+    rejectRoot[6]=true;rejectUnmount[6]=true;
+    assert(!VfsMount("/","objects",6));
+    assert(!g_rootMount && g_backings && !g_backings->references && mounts[6].alive);
+    const auto callsBeforeRemount=mountCalls[6];
+    assert(!VfsMount("/","objects",6) && mountCalls[6]==callsBeforeRemount);
+    assert(VfsSync(nullptr)==-5 && mounts[6].alive);
+    rejectUnmount[6]=false;assert(!VfsSync(nullptr));rejectRoot[6]=false;
+    assert(!g_backings && !mounts[6].alive);
+    assert(VfsMount("/","objects",6) && mountCalls[6]==callsBeforeRemount+1);
+    const auto callsBeforeAlias=mountCalls[6];
+    assert(VfsMount("/same","objects",6) && mountCalls[6]==callsBeforeAlias);
+    auto* sameBacking=g_rootMount->backing;assert(sameBacking->references==2);
+    const auto syncBeforeAlias=syncCalls[6];assert(!VfsSync(nullptr));
+    assert(syncCalls[6]==syncBeforeAlias+1);
+    assert(VfsUnmount("/same") && sameBacking->references==1);
+    assert(VfsUnmount("/"));assert(!g_backings);
     assert(allocations.empty());std::puts("VFS_PATHS_PASS rename/overmount/stacked-dotdot/root-clamp/virtual/rollback/unsupported/open-transfer");
 }

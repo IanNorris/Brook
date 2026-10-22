@@ -146,7 +146,8 @@ static constexpr int VFS_O_EXEC = 0x80;
 struct VfsFsOps {
     // Mount: called when VfsMount() is invoked with this FS name.
     // pdrv is passed through for block-device filesystems (0 for virtual FS).
-    // *mountPriv is stored in the mount entry for later use by other callbacks.
+    // One backing per live driver/device owns *mountPriv. Additional attachments
+    // retain that backing without invoking mount again.
     // Return true on success.
     bool (*mount)(uint8_t pdrv, void** mountPriv);
 
@@ -228,6 +229,7 @@ struct VfsFsOps {
 // Register a filesystem driver with the VFS.
 // name: short identifier (e.g. "fatfs").  Must remain valid for lifetime of driver.
 // ops: pointer to VfsFsOps vtable.  Must remain valid for lifetime of driver.
+// Registration permanently retains callback/data owner modules until reboot.
 // Returns true on success.
 extern "C" bool VfsRegisterFs(const char* name, const VfsFsOps* ops);
 

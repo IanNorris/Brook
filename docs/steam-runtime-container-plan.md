@@ -289,3 +289,45 @@ existing ASan/UBSan build (0.17 seconds). Receipts are under
 `build/workloads/mount-namespace-20261022/state`. No kernel/module build, ABI
 change, live Brook test, topology implementation or scheduler behavior change
 is claimed for this component checkpoint.
+
+
+### Backing/attachment ownership component acceptance
+
+The real VFS now separates a reference-counted `MountBacking` (driver callbacks,
+private filesystem state and device) from its mount attachment records. Additional
+attachments of an active driver/device retain its backing; they do not mount the
+driver again. Sync visits each backing once. Explicit final-unmount failure
+preserves the attachment and its reference. Private construction rollback that
+cannot unmount leaves an unreachable zero-reference backing in the registry,
+where checked sync retries retirement and reports failures. Such pending backing
+blocks a fresh mount of the same driver/device until retirement succeeds; this
+prevents FAT's later cleanup from unregistering a newly mounted drive slot.
+
+Filesystem provider registration pins its table before reading it and then pins
+all callback/name owners through the existing permanent module-retention API.
+Unregistering a name does not free callback owners still referenced by live or
+retired backing. Hosted fixtures have process-lifetime providers and a mocked
+retention contract; the actual kernel uses the production module check.
+
+Accepted ABI-39 kernel:
+`dcf1e2447cb9fe4a439b44fcdcc0c31559513815a752b2c809333d13e1d6f02f`.
+All 97 host tests pass in the final run; VFS paths and real Ext2/FAT tests also
+pass under ASan/UBSan. The VFS path regression exercises shared backing without
+remount, sync deduplication, exact access after another attachment releases,
+final unmount failure/retry, failed private rollback/remount rejection, provider
+registration rejection, and allocation failure through the first successful
+mount construction. An earlier high-parallel run timed out audio-delivery; the
+isolated retry and final four-way full suite both pass.
+
+Private review `mount-backing-off-gpu-1ms-fixed-mlfq-a-20261022` verifies all
+13 matching modules, nine original native filesystem/credentials/IPC jobs with
+zero live tasks, normal Mousepad launch/render/close, heap integrity, checked
+sync/stop, original wrapper exit zero and all four offline filesystem checks.
+The frozen capsule and `component-acceptance.json` remain under
+`build/workloads/mount-backing-20261022`; the frozen HEAD and source diff are
+code provenance (the reused CMake build banner has an older cached git label).
+
+This accepts backing ownership only. Attachment records still use the initial
+eight-slot topology; dynamic attachments, process namespace ownership, clone
+remapping, namespace retirement, bind/detach syscall dispatch and their isolation
+acceptance remain unfinished. No container or Steam login support is claimed.
