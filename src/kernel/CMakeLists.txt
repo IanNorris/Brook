@@ -234,6 +234,7 @@ add_executable(kernel
     src/user_copy.S
     src/posix_timer.cpp
     src/sysv_sem.cpp
+    src/signal_fd.cpp
     src/process.cpp
     src/memory/address_space.cpp
     src/memory/mapping_transaction.cpp

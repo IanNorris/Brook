@@ -10,7 +10,7 @@
 namespace brook {
 static bool SemInterrupted(Process* p) {
     return __atomic_load_n(&p->terminalPending,__ATOMIC_ACQUIRE) ||
-        ((p->sigPending | PosixTimerPending(p)) & ~p->sigMask);
+        ((ProcessPendingSignals(p) | PosixTimerPending(p)) & ~p->sigMask);
 }
 static uint64_t SemNowNs() {
     return KvmClockAvailable()?KvmClockReadNs():ApicTickCount()*1000000ULL;

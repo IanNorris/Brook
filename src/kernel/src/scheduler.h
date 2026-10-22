@@ -229,7 +229,7 @@ Process* SchedulerGetCpuProcess(uint32_t cpuIndex);
 // Running-interval total; remote siblings are committed at their own timer/
 // dispatch boundary. Includes kernel/IRQ work, excludes reported host steal.
 bool SchedulerCpuTime(Process* proc, bool group, uint64_t* result);
-void SchedulerCpuTimeRebind(Process* proc);
+void SchedulerCommitExecThreadIdentity(Process* proc);
 struct RuntimeStatus {
     RuntimeDiagnostics diagnostics{};
     RuntimeDebtStatus debt{};

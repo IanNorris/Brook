@@ -7,6 +7,7 @@
 #include "syscall.h"
 #include "posix_timer.h"
 #include "sysv_sem.h"
+#include "signal_fd.h"
 #include "timeout_value.h"
 #include "timerfd_state.h"
 #include "dsp_geometry.h"
@@ -414,7 +415,7 @@ static bool HasPendingSignals()
     Process* proc = ProcessCurrent();
     if (!proc) return false;
     return __atomic_load_n(&proc->terminalPending, __ATOMIC_ACQUIRE) ||
-           ((proc->sigPending | PosixTimerPending(proc)) & ~proc->sigMask) != 0;
+           ((ProcessPendingSignals(proc) | PosixTimerPending(proc)) & ~proc->sigMask) != 0;
 }
 
 // Child exit also queues default-ignored SIGCHLD to wake wait4. Blocking
@@ -426,7 +427,7 @@ static bool HasReadInterruptSignal()
     Process* proc = ProcessCurrent();
     if (!proc) return false;
     constexpr uint64_t childBit = 1ULL << (17 - 1);
-    if ((proc->sigPending & ~proc->sigMask & childBit) && proc->tgid < MAX_PROCESSES) {
+    if ((ProcessPendingSignals(proc) & ~proc->sigMask & childBit) && proc->tgid < MAX_PROCESSES) {
         uint64_t handler = ReadSignalAction(proc->tgid,17 - 1).handler;
         if (handler == 0 || handler == 1)
             ProcessDequeueSignal(proc, 17, nullptr);
@@ -2030,6 +2031,7 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
 #include "pipe_write.inc"
 
     // Write to eventfd — adds value to counter
+    if (fde->type == FdType::SignalFd) return -EINVAL;
     if (fde->type == FdType::SyncFile) return -EBADF;
 
     if (fde->type == FdType::EventFd && fde->handle)
@@ -2590,6 +2592,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             }
         }
     }
+
+    if(fde->type==FdType::SignalFd && fde->handle)
+        return SignalFdRead(proc,static_cast<SignalFd*>(fde->handle),bufAddr,count,(fde->statusFlags&0x800)!=0);
 
     // Read from eventfd — returns counter as uint64, resets to 0
     if (fde->type == FdType::SyncFile) return -EINVAL;
@@ -3511,6 +3516,7 @@ void FinalizeClosedFd(const FdClaimResult& c)
         brook::SockUnref(sockIdx);
     }
 
+    if (c.type == FdType::SignalFd && c.handle) SignalFdUnref(static_cast<SignalFd*>(c.handle));
     if (c.type == FdType::SyncFile && c.handle) SyncFileUnref(static_cast<SyncFileData*>(c.handle));
 
     if (c.type == FdType::EventFd && c.handle)
@@ -3741,6 +3747,8 @@ static void FdBumpRefcount(const FdEntry* fde)
     case FdType::MemFd:
         MemFdRef(static_cast<MemFdData*>(fde->handle));
         break;
+    case FdType::SignalFd:
+        SignalFdRef(static_cast<SignalFd*>(fde->handle));break;
     case FdType::SyncFile:
         SyncFileRef(static_cast<SyncFileData*>(fde->handle));break;
     case FdType::EventFd:
@@ -3873,6 +3881,7 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     if (!ref) return -EBADF;
     FdEntry* fde = ref.get();
 
+    if(fde->type==FdType::SignalFd)return whence<=4?0:-EINVAL; // Linux noop_llseek
     if(fde->type==FdType::SyncFile)return -29; // ESPIPE
 
     int64_t soff = static_cast<int64_t>(offset);
@@ -4697,7 +4706,7 @@ static void CopyWaitUsage(uint64_t address, const ChildWaitSnapshot& event)
 static bool ChildWaitInterrupted(Process* caller)
 {
     if (__atomic_load_n(&caller->terminalPending, __ATOMIC_ACQUIRE)) return true;
-    uint64_t pending = (__atomic_load_n(&caller->sigPending, __ATOMIC_ACQUIRE) |
+    uint64_t pending = (ProcessPendingSignals(caller) |
                         PosixTimerPending(caller)) & ~caller->sigMask;
     constexpr uint64_t childBit = 1ULL << (17 - 1);
     if (pending & ~childBit) return true;
@@ -5614,7 +5623,7 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
         // return boundary publishes termination before any return to user code.
         if (__atomic_load_n(&proc->terminalPending, __ATOMIC_ACQUIRE))
             return -EINTR;
-        uint64_t pending = __atomic_load_n(&proc->sigPending, __ATOMIC_ACQUIRE) |
+        uint64_t pending = ProcessPendingSignals(proc) |
                            PosixTimerPending(proc);
         uint64_t matched = pending & waitSet;
         if (matched) {
@@ -7600,7 +7609,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
-    if (fde->type == FdType::EventFd || fde->type==FdType::SyncFile) {
+    if (fde->type == FdType::EventFd || fde->type==FdType::SyncFile || fde->type==FdType::SignalFd) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0100666; // S_IFREG | rw-rw-rw-
@@ -8018,7 +8027,7 @@ static int64_t sys_rt_sigpending(uint64_t setAddr, uint64_t sigsetsize,
     if (!proc) return -ESRCH;
     // Observe without consuming. Ordinary signals currently have per-task
     // storage; unioning sibling queues would leak thread-directed signals.
-    uint64_t pending = (__atomic_load_n(&proc->sigPending, __ATOMIC_ACQUIRE) |
+    uint64_t pending = (ProcessPendingSignals(proc) |
                         PosixTimerPending(proc)) & proc->sigMask;
     return CopyToUser(setAddr, &pending, sigsetsize) ? 0 : -EFAULT;
 }
@@ -8564,6 +8573,12 @@ retry_poll:
             continue;
         }
 
+        if(fde->type==FdType::SignalFd && fde->handle) {
+            fds[i].revents=SignalFdReady(proc,static_cast<SignalFd*>(fde->handle),fds[i].events);
+            if(fds[i].revents)++ready;
+            continue;
+        }
+
         // EventFd: readable when nonempty, writable below counter capacity.
         if (fde->type == FdType::EventFd && fde->handle)
         {
@@ -9079,6 +9094,26 @@ static int64_t sys_pipe2(uint64_t pipefdAddr, uint64_t flags, uint64_t,
     return ret;
 }
 
+static int64_t sys_signalfd4(uint64_t descriptor,uint64_t maskAddress,uint64_t size,uint64_t flags,uint64_t,uint64_t)
+{
+    if(size!=8 || (flags&~uint64_t(0x800|0x80000)))return -EINVAL;
+    uint64_t mask=0;if(!CopyFromUser(&mask,maskAddress,sizeof(mask)))return -EFAULT;
+    Process* p=ProcessCurrent();
+    if(int(descriptor)!=-1) {
+        FdRef ref(p,int(descriptor));if(!ref)return -EBADF;
+        if(ref->type!=FdType::SignalFd || !ref->handle)return -EINVAL;
+        SignalFdSetMask(static_cast<SignalFd*>(ref->handle),mask);return int(descriptor);
+    }
+    KernelOperationGuard guard(p);
+    auto* object=SignalFdCreate(mask);if(!object)return -ENOMEM;
+    FdEntry entry{};entry.type=FdType::SignalFd;entry.handle=object;
+    entry.statusFlags=flags&0x800;entry.fdFlags=(flags&0x80000)?1:0;
+    int fd=FdTablePublishOwned(p->fds,ProcessFdLock(p),entry,0,-1,nullptr,nullptr);
+    if(fd<0){SignalFdUnref(object);return -EMFILE;}return fd;
+}
+static int64_t sys_signalfd(uint64_t descriptor,uint64_t mask,uint64_t size,uint64_t,uint64_t,uint64_t)
+{ return sys_signalfd4(descriptor,mask,size,0,0,0); }
+
 // ---------------------------------------------------------------------------
 // sys_eventfd2 (290) — event notification file descriptor
 // ---------------------------------------------------------------------------
@@ -9151,6 +9186,8 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
     if (!fde) return 0;
 
     if(fde->type==FdType::SyncFile && fde->handle)return SyncFileReady(events);
+    if(fde->type==FdType::SignalFd && fde->handle)
+        return SignalFdReady(ProcessCurrent(),static_cast<SignalFd*>(fde->handle),events);
 
     if (fde->type == FdType::EventFd && fde->handle)
         return EventFdReady(static_cast<EventFdData*>(fde->handle), events).ready;
@@ -11100,7 +11137,11 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,
         SchedulerKernelRegionLeave(self);
         return -ESRCH;
     }
-    int result = signal ? ProcessSendSignal(target, signal) : 0;
+    SignalInfo info{};info.si_signo=signal;info.si_code=0; // SI_USER
+    const int32_t sender=self?self->tgid:0;
+    const uint32_t senderUid=self?ProcessReadIds(self,false).real:0;
+    memcpy(info._data,&sender,4);memcpy(info._data+4,&senderUid,4);
+    int result = signal ? ProcessSendSignal(target, signal, &info) : 0;
     ProcessUnref(target);
     SchedulerKernelRegionLeave(self);
     return result;
@@ -13662,6 +13703,7 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
     if (!src || src->type == FdType::None) return false;
     switch (src->type) {
         case FdType::Pipe:
+        case FdType::SignalFd:
         case FdType::SyncFile:
         case FdType::EventFd:
         case FdType::EpollFd:
@@ -13735,6 +13777,8 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap)
         case FdType::Pipe:
             PipeReleaseEnd(static_cast<PipeBuffer*>(snap->handle), (snap->flags & 1) != 0);
             break;
+        case FdType::SignalFd:
+            SignalFdUnref(static_cast<SignalFd*>(snap->handle));break;
         case FdType::SyncFile:
             SyncFileUnref(static_cast<SyncFileData*>(snap->handle));break;
         case FdType::EventFd:
@@ -14224,6 +14268,8 @@ void SyscallTableInit()
     g_syscallTable[SYS_GETRESGID]       = sys_getresgid;
     g_syscallTable[SYS_PRCTL]           = sys_prctl;
     g_syscallTable[SYS_FUTEX]           = sys_futex;
+    g_syscallTable[SYS_SIGNALFD]        = sys_signalfd;
+    g_syscallTable[SYS_SIGNALFD4]       = sys_signalfd4;
     g_syscallTable[SYS_SEMGET]          = sys_semget;
     g_syscallTable[SYS_SEMOP]           = sys_semop;
     g_syscallTable[SYS_SEMTIMEDOP]      = sys_semtimedop;

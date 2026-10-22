@@ -1498,3 +1498,19 @@ The private review D3D11 shader launcher passed an unsupported `--window`
 argument. It has been removed from the staged recipe and running review image;
 a live retry is still needed. Keep generated launch recipes consistent with
 each probe's argument parser.
+
+
+### Steam compatibility follow-ups (22 October)
+
+- Keep the bounded native64 login effort separate from complete Steam runtime
+  containers. Real user/mount namespaces, privilege restrictions and multilib
+  are not established by the SysV semaphore or signal-fd acceptance.
+- General process-directed user-signal routing and realtime signal queues still
+  need a deliberate shared/private queue design. The current signal-fd milestone
+  establishes shared kernel-generated SIGCHLD and private tgkill isolation;
+  edge-triggered signal-fd epoll and broader nonleader-exec identity equivalence
+  are not accepted.
+- Stock rootful Xwayland starts with software shared-memory rendering inside
+  Brook. Normal user launch needs real hard-link lockfiles; the guest-root
+  `-nolock` diagnostic is not a launch default. Rootless integration and GPU
+  acceleration are separate future milestones.

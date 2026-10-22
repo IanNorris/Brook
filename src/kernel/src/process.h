@@ -744,6 +744,11 @@ void ProcessCloseCloexecFds(Process* proc); // close FD_CLOEXEC fds on execve
 // Returns 0 on success, -ESRCH if not found, -EINVAL if bad signal.
 int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info = nullptr);
 bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info);
+// Non-allocating queue only; caller may hold scheduler locks. No wake/lock inversion.
+void ProcessQueueChildSignal(Process* parent,Process* child);
+uint64_t ProcessPendingSignals(Process*);
+// Scheduler commit only: caller holds ready and registry locks.
+void ProcessCommitExecIdentity(Process*);
 
 // Send a signal to all processes in the given process group.
 // Returns the number of processes signalled.

@@ -1623,12 +1623,7 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
         // Drop the old group's liveness hold while its identity is still saved.
         proc->fds = privateFds;
         proc->fdLock.next = proc->fdLock.serving = 0;
-        SchedulerReleaseThreadAddressSpace(proc);
-        proc->isThread = false;
-        proc->tgid = proc->pid;
-        proc->threadLeader = proc;
-        proc->leaderIncarnation = 0;
-        SchedulerCpuTimeRebind(proc);
+        SchedulerCommitExecThreadIdentity(proc);
     }
     // The source was cleared through framebufferLock before AS replacement.
     proc->fbDestX = 0;proc->fbDestY = 0;proc->fbScale = 0;proc->fbExitColor = 0;
@@ -1772,43 +1767,7 @@ uint64_t ProcessExecPreparedExecutable(Process* proc,const ExecutableImage& imag
 static constexpr int SIGKILL = 9;
 [[maybe_unused]] static constexpr int SIGSTOP = 19;
 
-// Publish sender information and the pending bit together. Dequeue clears both
-// under this short IRQ lock; no allocation or scheduler locks are taken here.
-static IrqSpinLock g_signalSenderLock;
-static void QueueSignal(Process* proc, int signum, const SignalInfo* info)
-{
-    uint64_t flags = IrqSpinLockAcquire(&g_signalSenderLock);
-    uint64_t bit = 1ULL << (signum - 1);
-    if (!(__atomic_load_n(&proc->sigPending, __ATOMIC_ACQUIRE) & bit)) {
-        auto& sender = proc->sigSenders[signum - 1];
-        sender = {};
-        sender.code = info ? info->si_code : 128; // SI_KERNEL
-        if (info) {
-            memcpy(&sender.pid, info->_data, sizeof(sender.pid));
-            memcpy(&sender.uid, info->_data + 4, sizeof(sender.uid));
-        }
-    }
-    __atomic_or_fetch(&proc->sigPending, bit, __ATOMIC_RELEASE);
-    IrqSpinLockRelease(&g_signalSenderLock, flags);
-}
-
-bool ProcessDequeueSignal(Process* proc, int signum, SignalInfo* info)
-{
-    uint64_t flags = IrqSpinLockAcquire(&g_signalSenderLock);
-    uint64_t bit = 1ULL << (signum - 1);
-    uint64_t previous = __atomic_fetch_and(&proc->sigPending, ~bit, __ATOMIC_ACQ_REL);
-    auto& sender = proc->sigSenders[signum - 1];
-    if (info) {
-        *info = {};
-        info->si_signo = signum;
-        info->si_code = sender.code;
-        memcpy(info->_data, &sender.pid, sizeof(sender.pid));
-        memcpy(info->_data + 4, &sender.uid, sizeof(sender.uid));
-    }
-    sender = {};
-    IrqSpinLockRelease(&g_signalSenderLock, flags);
-    return (previous & bit) != 0;
-}
+#include "signal_pending.inc"
 
 #include "process_signal_send.inc"
 
@@ -1914,7 +1873,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // --- Signal delivery ---
     if (proc->inSignalHandler) return timing.Result(syscallResult);
 
-    uint64_t deliverable = (proc->sigPending | PosixTimerPending(proc)) & ~proc->sigMask;
+    uint64_t deliverable = (ProcessPendingSignals(proc) | PosixTimerPending(proc)) & ~proc->sigMask;
     if (deliverable == 0) return timing.Result(syscallResult);
 
     // Find lowest pending signal

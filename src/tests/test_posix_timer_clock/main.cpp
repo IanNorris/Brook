@@ -69,6 +69,7 @@ extern "C" void SchedulerYield(){
     ++yields;if(atYield)atYield();g_perCpu[0].currentProcess->state=ProcessState::Running;
 }
 #define BROOK_SCHED_BLOCK_HOST_TEST
+uint64_t ProcessPendingSignals(Process* p){return p->sigPending;}
 #include "../../kernel/src/scheduler_block.inc"
 #include "../../kernel/src/scheduler_unblock.inc"
 }

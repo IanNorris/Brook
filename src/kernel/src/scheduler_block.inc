@@ -92,7 +92,7 @@ static void SchedulerBlockImpl(Process* proc, bool interruptible)
     }
 
     if (interruptible) {
-        const uint64_t pending = __atomic_load_n(&proc->sigPending, __ATOMIC_ACQUIRE) |
+        const uint64_t pending = ProcessPendingSignals(proc) |
                                  PosixTimerPending(proc);
         const uint64_t mask = __atomic_load_n(&proc->sigMask, __ATOMIC_ACQUIRE);
         // A caller (notably futex enqueue) may have cleared the wake latch

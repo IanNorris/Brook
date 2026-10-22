@@ -36,6 +36,7 @@ static void SchedulerKernelRegionEnter(Process* p){++p->depth;}
 static void SchedulerKernelRegionLeave(Process* p){--p->depth;}
 [[maybe_unused]] static uint64_t PosixTimerPending(Process*){return timerPending;}
 #define BROOK_SCHED_BLOCK_HOST_TEST
+uint64_t ProcessPendingSignals(Process* p){return p->sigPending;}
 #include "../../kernel/src/scheduler_block.inc"
 static unsigned inserts=0,notifications=0,kicks=0,queued=0;
 static void ReadyQueueInsertLocked(Process*){++inserts;}

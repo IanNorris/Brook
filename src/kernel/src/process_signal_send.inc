@@ -46,7 +46,7 @@ int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
         const KernelSigaction sa = ReadSignalAction(proc->tgid,signum - 1);
         if (sa.handler == 0 || sa.handler == 1) // SIG_DFL or SIG_IGN
         {
-            if (sa.handler == 1) return 0; // SIG_IGN — ignore
+            if (sa.handler == 1 && !(proc->sigMask & (1ULL << (signum-1)))) return 0;
             // Catchable default stop signals respect the target mask.
             if (proc->sigMask & (1ULL << (signum - 1))) {
                 QueueSignal(proc, signum, info);
@@ -70,8 +70,8 @@ int ProcessSendSignal(Process* proc, int signum, const SignalInfo* info)
     {
         const KernelSigaction sa = ReadSignalAction(proc->tgid,signum - 1);
         bool defaultIsIgnore = (signum == 17 || signum == 23 || signum == 28);
-        if (sa.handler == 1 ||
-            (sa.handler == 0 && defaultIsIgnore))
+        if (!(proc->sigMask & (1ULL << (signum-1))) &&
+            (sa.handler == 1 || (sa.handler == 0 && defaultIsIgnore)))
         {
             return 0;
         }

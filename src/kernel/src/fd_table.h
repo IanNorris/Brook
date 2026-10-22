@@ -55,6 +55,7 @@ enum class FdType : uint8_t
     DebugSerial,   // Direct debug UART output; initially fd 3, preserved by dup/fork
     CompositorScene, // Scene capability; fd aliases own a shared close handle
     SyncFile,      // Immutable completed GPU timeline fence, Linux sync_file ABI
+    SignalFd,      // Read pending signals for the calling task through a shared mask
 };
 
 struct FdEntry

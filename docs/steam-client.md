@@ -160,3 +160,51 @@ watching. Its original tracked group reaches zero live tasks. Named FIFO
 assertions remain, as do the separate runtime-container requirements. Evidence
 is the `xwayland-install`, `xwayland-first`, `xwayland-nolock`,
 `xwayland-root-nolock` and `steam-client-x11` subdirectories of that review.
+
+## Signal-fd implementation and native acceptance
+
+Native `signalfd`/`signalfd4` now create a refcounted shared-mask description with
+real reads, nonblocking/CLOEXEC flags, mask updates, poll/epoll readiness and
+fork/dup/SCM_RIGHTS ownership. Reads consume the calling task's signals rather
+than the creator's; SIGKILL/SIGSTOP are excluded. The 128-byte record carries
+available sender, timer and child status information. Signal delivery already
+wakes masked targets; existing bounded wait rechecks cover shared mask updates.
+This is standard-signal acceptance, not realtime queue or edge-triggered epoll
+acceptance. Generic kill-to-thread-group routing retains its earlier model.
+
+Astra identified two necessary companion fixes. Kernel-generated SIGCHLD now
+has process-shared pending state, separate from thread-private signals. A worker
+can consume its group's child exit without stealing a leader's private tgkill.
+Child status/sender information is retained through reap with incarnation checks.
+Blocked signals are retained even when their default or explicit disposition is
+ignore, making them available to synchronous readers. Ordinary kill also now
+supplies SI_USER sender metadata.
+
+The exec handoff is one scheduler commit: ready lock, registry lock, old runtime
+charge/address-space membership release, then signal-locked identity and shared
+child-record transfer, followed by runtime rebind. This prevents notification or
+signal readers seeing a half-written group identity and keeps the old leader
+protected until the handoff. A hosted interleaving pauses exactly at that point
+and verifies both readers and parent notification remain excluded. This does not
+claim broader Linux nonleader-exec identity equivalence.
+
+All 90 host tests pass. The compiled supported-entry and startup mutation audits
+pass. The native `tools/signalfd-probe-pkg` passes on Linux and as UID 1000 in
+Brook, including worker-thread SIGCHLD consumption, private tgkill isolation,
+blocked ignored signals, sender/status data, fork reader identity, poll/epoll,
+blocking reads, mask sharing, CLOEXEC and final alias cleanup. The expanded
+semaphore probe also passes against this kernel, and heap integrity passes.
+Kernel/module ABI remains 34; the FD type is appended without shifting existing
+values or changing the process layout.
+
+Evidence is `steam-signalfd-off-gpu-1ms-fixed-mlfq-a-20261022`, kernel
+`85f65c8a42e58ce723e36fd52a6b847c45db628257eed040f925ad115276762a`.
+The same UID-1000 Steam/Xwayland launch no longer fails signal watching; its
+launcher reaches D-Bus authentication and reports unsupported explicit Unix
+credentials during sendmsg. The tracked Steam group exits 125 with zero live
+tasks. Named FIFO assertions and the separate runtime-container requirements
+remain unresolved. No login window or account authentication is claimed.
+
+The signalfd review stops cleanly after graceful Xwayland group exit; the
+original launcher exits zero, final heap integrity passes, and all four
+offline filesystem checks pass. The checked image is retained as the next seed.

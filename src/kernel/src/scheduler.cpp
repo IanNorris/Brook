@@ -426,16 +426,6 @@ bool SchedulerCpuTime(Process* proc, bool group, uint64_t* result)
     return found;
 }
 
-void SchedulerCpuTimeRebind(Process* proc)
-{
-    if (!proc) return;
-    const uint64_t flags = SchedLockAcquire(g_readyLock);
-    const uint32_t cpu = ThisCpu();
-    RuntimeChargeLocked(cpu, RuntimeNow(cpu));
-    g_runtime.Rebind(proc->pid, proc->incarnation, proc->tgid ? proc->tgid : proc->pid,
-                     proc->isThread ? proc->leaderIncarnation : proc->incarnation);
-    SchedLockRelease(g_readyLock, flags);
-}
 
 void SchedulerRuntimeStatus(RuntimeStatus* output)
 {
@@ -1004,7 +994,7 @@ static void NotifyParentGroupLocked(Process* child)
         if (!recipient || ((recipient->sigMask & bit) && !(parent->sigMask & bit)))
             recipient = parent;
     }
-    if (recipient) __atomic_or_fetch(&recipient->sigPending, bit, __ATOMIC_RELEASE);
+    if (recipient) ProcessQueueChildSignal(recipient,child);
 }
 
 static void NotifyExitedParentLocked(Process* child)
@@ -3180,12 +3170,11 @@ void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
 
 
 
-void SchedulerReleaseThreadAddressSpace(Process* thread)
+static void ReleaseThreadAddressSpaceLocked(Process* thread)
 {
     // The count keeps the leader alive until this transition. Serialize its
     // final decrement with waitpid's scan, and never dereference the leader
     // after releasing this lock: another CPU may immediately reap it.
-    uint64_t alf = SchedLockAcquire(g_allProcLock);
     Process* leader = nullptr;
     for (uint32_t i = 0; i < g_processCount; ++i) {
         if (g_allProcesses[i] == thread->threadLeader) {
@@ -3217,8 +3206,15 @@ void SchedulerReleaseThreadAddressSpace(Process* thread)
                               magicOk ? leader->incarnation : 0,
                               thread->leaderIncarnation, -1, magicOk ? 2 : 3);
     }
-    SchedLockRelease(g_allProcLock, alf);
 }
+void SchedulerReleaseThreadAddressSpace(Process* thread)
+{
+    uint64_t flags=SchedLockAcquire(g_allProcLock);
+    ReleaseThreadAddressSpaceLocked(thread);
+    SchedLockRelease(g_allProcLock,flags);
+}
+
+#include "scheduler_exec_identity.inc"
 
 int SchedulerWaitChild(Process* caller, int selector, uint32_t id,
                        uint32_t options, ChildWaitSnapshot* result)
