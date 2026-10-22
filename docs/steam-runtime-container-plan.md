@@ -10,9 +10,9 @@ same executable to its mount-propagation operation. The accepted
 [private propagation checkpoint](mount-propagation-checkpoint.md) advances it
 to tmpfs. The [fresh-instance foundation](tmpfs-foundation-checkpoint.md) and
 [bounded tmpfs backend](tmpfs-checkpoint.md) then supply independent memory
-filesystems with accounting and explicit mapping rejection. The unchanged
-command now stops at `setting up newroot bind`: recursive bind remains the next
-observed blocker.
+filesystems with accounting and explicit mapping rejection. The subsequent [recursive bind checkpoint](recursive-bind-checkpoint.md) copies
+nested and stacked mount subtrees and advances unchanged bubblewrap to
+`pivot_root: Function not implemented`.
 Remaining mount/root integration requires separate designs
 for write/mapping enforcement, tmpfs and root publication. There is no Brook login
 acceptance.

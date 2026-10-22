@@ -4,11 +4,14 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
                          uint64_t flags,uint64_t dataAddr,uint64_t)
 {
     constexpr uint64_t Bind=0x1000,Recursive=0x4000,Silent=0x8000;
+    // Linux accepts the historical magic prefix only when all its bits match.
+    if((flags&0xffff0000ULL)==0xc0ed0000ULL)flags&=~0xffff0000ULL;
     constexpr uint64_t Private=0x40000,Slave=0x80000;
     const uint64_t type=flags&~(Recursive|Silent);
     const bool privatePropagation=type==Private || type==Slave;
     const bool memoryMount=(flags&~Silent)==6; // bounded NODEV|NOSUID tmpfs
-    if(flags!=Bind && !privatePropagation && !memoryMount)return -EINVAL;
+    const bool bindMount=type==Bind;
+    if(!bindMount && !privatePropagation && !memoryMount)return -EINVAL;
     if(memoryMount) {
         char fsType[32],data[256];
         if(!CopyUserCString(fsAddr,fsType,sizeof(fsType)))return -EFAULT;
@@ -52,7 +55,7 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
     VfsPath sourcePath{},targetPath{};
     int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,source,&sourcePath);
     if(!error)error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
-    if(!error)error=VfsMountNamespaceBind(lookup.fs.mountNamespace,sourcePath,targetPath);
+    if(!error)error=VfsMountNamespaceBind(lookup.fs.mountNamespace,sourcePath,targetPath,(flags&Recursive)!=0);
     VfsPathRelease(targetPath);VfsPathRelease(sourcePath);return error;
 }
 static int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,

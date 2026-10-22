@@ -309,6 +309,95 @@ static void testProcessContexts(const brook::VfsPath& root,const brook::VfsPath&
     ProcessFsClear(&parent);ProcessFsClear(&copy);ProcessFsClear(&shared);ProcessFsClear(&privateThread);
     assert(!parent.fsContext && !copy.fsContext && !shared.fsContext && !privateThread.fsContext);
 }
+static void testRecursiveBinds(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    const auto initialAllocations=allocations.size();const auto initialRecords=g_mounts.count;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};
+    assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));
+    assert(VfsMountNamespaceActivate(ns));
+    auto target=resolve(root,root,"/ns-target");
+    auto originalSynthetic=resolve(root,root,"/synthetic/deep/mount");
+    const auto before=VfsMountNamespaceCount(ns);
+    std::atomic<bool> stopReader{false};std::atomic<unsigned> observations{0};
+    std::thread reader([&] {
+        while(!stopReader.load(std::memory_order_acquire)) {
+            auto count=VfsMountNamespaceCount(ns);assert(count==before || count==2*before);
+            observations.fetch_add(1,std::memory_order_release);
+        }
+    });
+    while(!observations.load(std::memory_order_acquire))std::this_thread::yield();
+    bool succeeded=false;
+    // Root into its own descendant freezes the old topology, including virtual
+    // boot ancestors, rather than discovering the just-created graft forever.
+    for(long failure=0;failure<512;++failure) {
+        auto allocated=allocations.size();auto records=g_mounts.count;
+        failAllocation=failure;int error=VfsMountNamespaceBind(ns,root,target,true);failAllocation=-1;
+        if(error) {
+            if(error!=-12)std::fprintf(stderr,"rbind failure=%ld error=%d\n",failure,error);
+            assert(error==-12);VfsDrainMountCleanup();
+            assert(allocations.size()==allocated && g_mounts.count==records);
+            assert(VfsMountNamespaceCount(ns)==before);
+            continue;
+        }
+        assert(VfsMountNamespaceCount(ns)==2*before);
+        stopReader.store(true,std::memory_order_release);reader.join();assert(observations.load());
+        auto graft=resolve(root,root,"/ns-target");
+        auto synthetic=resolve(root,graft,"synthetic/deep/mount");
+        assert(synthetic.attachment!=originalSynthetic.attachment);
+        assert(synthetic.object->identity==originalSynthetic.object->identity);
+        auto up=resolve(root,graft,"synthetic/deep/../..");assert(VfsPathSame(up,graft));VfsPathRelease(up);
+        VfsPathRelease(synthetic);
+        assert(!VfsMountNamespaceDetach(ns,graft));VfsPathRelease(graft);VfsDrainMountCleanup();
+        assert(allocations.size()==allocated && g_mounts.count==records);succeeded=true;break;
+    }
+    if(reader.joinable()) {stopReader.store(true,std::memory_order_release);reader.join();}
+    assert(succeeded);
+    // Self-bind, nested and stacked mounts; partial sources must not copy
+    // unrelated siblings. Retained covered dirfds keep their original view.
+    auto a=resolve(root,root,"/ns-a"),b=resolve(root,root,"/ns-b");
+    auto sub=resolve(root,a,"sub");assert(!VfsMountNamespaceBind(ns,b,sub));
+    auto stack=resolve(root,a,"sub");assert(!VfsMountNamespaceBind(ns,a,stack));VfsPathRelease(stack);
+    auto nested=resolve(root,a,"sub/sub");assert(!VfsMountNamespaceBind(ns,b,nested));VfsPathRelease(nested);
+    const auto nestedCount=VfsMountNamespaceCount(ns);
+    // Source on a different attachment from the namespace root: the root has
+    // no covered edge and must be excluded without dereferencing an empty path.
+    auto mountedSource=resolve(root,a,"sub");
+    assert(!VfsMountNamespaceBind(ns,mountedSource,target,true));
+    assert(VfsMountNamespaceCount(ns)==nestedCount+2);
+    auto mountedGraft=resolve(root,root,"/ns-target");
+    auto mountedValue=resolve(root,mountedGraft,"sub/value");VnodeStat mountedStat{};
+    assert(!VfsPathStat(mountedValue,&mountedStat)&&mountedStat.ino==201);VfsPathRelease(mountedValue);
+    assert(!VfsMountNamespaceDetach(ns,mountedGraft));VfsPathRelease(mountedGraft);VfsPathRelease(mountedSource);
+    assert(VfsMountNamespaceCount(ns)==nestedCount);
+    assert(!VfsMountNamespaceBind(ns,a,target,true));assert(VfsMountNamespaceCount(ns)==nestedCount+4);
+    auto graft=resolve(root,root,"/ns-target");
+    auto value=resolve(root,graft,"sub/sub/value");VnodeStat st{};assert(!VfsPathStat(value,&st)&&st.ino==201);VfsPathRelease(value);
+    value=resolve(root,target,"value");assert(!VfsPathStat(value,&st)&&st.ino==301);VfsPathRelease(value);
+    char label[64];value=resolve(root,graft,"sub/sub");assert(!VfsPathDirectoryPath(value,label,sizeof(label)));
+    assert(!std::strcmp(label,"/ns-target/sub/sub"));VfsPathRelease(value);
+    assert(!VfsRenameAt(root,root,"ns-a",root,"rbind-renamed"));
+    value=resolve(root,graft,"sub/sub/value");assert(!VfsPathStat(value,&st)&&st.ino==201);VfsPathRelease(value);
+    assert(!VfsRenameAt(root,root,"rbind-renamed",root,"ns-a"));
+    assert(!VfsMountNamespaceDetach(ns,graft));VfsPathRelease(graft);
+    assert(VfsMountNamespaceCount(ns)==nestedCount);
+    assert(!VfsMountNamespaceBind(ns,b,b,true));
+    graft=resolve(root,root,"/ns-b");assert(!VfsMountNamespaceDetach(ns,graft));VfsPathRelease(graft);
+    // A less-privileged namespace copy locks inherited descendant mounts.
+    auto* owner=static_cast<UserNamespace*>(kmalloc(sizeof(UserNamespace)));*owner={};owner->owner=1000;
+    MountNamespace* locked=nullptr;VfsPath lockedRoot{},lockedCwd{};
+    assert(!VfsMountNamespaceCopy(ns,root,root,&locked,&lockedRoot,&lockedCwd));
+    assert(!VfsMountNamespaceSetUserOwnerPrepared(locked,owner));assert(VfsMountNamespaceActivate(locked));
+    auto lockedA=resolve(lockedRoot,lockedRoot,"/ns-a"),lockedTarget=resolve(lockedRoot,lockedRoot,"/ns-target");
+    assert(!VfsMountNamespaceBind(locked,lockedA,lockedTarget,true));
+    auto lockedSub=resolve(lockedRoot,lockedRoot,"/ns-target/sub");
+    assert(VfsMountNamespaceDetach(locked,lockedSub)==-22);VfsPathRelease(lockedSub);
+    auto fresh=resolve(lockedRoot,lockedRoot,"/ns-target");assert(!VfsMountNamespaceDetach(locked,fresh));VfsPathRelease(fresh);
+    VfsPathRelease(lockedA);VfsPathRelease(lockedTarget);VfsMountNamespaceLeave(locked);VfsDrainMountCleanup();
+    VfsPathRelease(lockedRoot);VfsPathRelease(lockedCwd);VfsMountNamespaceRelease(locked);VfsDrainMountCleanup();UserNamespaceRelease(owner);
+    VfsPathRelease(a);VfsPathRelease(b);VfsPathRelease(sub);VfsPathRelease(target);VfsPathRelease(originalSynthetic);
+    VfsMountNamespaceLeave(ns);VfsDrainMountCleanup();VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
+    assert(allocations.size()==initialAllocations && g_mounts.count==initialRecords);
+}
 int main(){
     using namespace brook;
     VfsInit();rejectProvider=true;assert(!VfsRegisterFs("rejected",&fsOps));rejectProvider=false;
@@ -532,6 +621,7 @@ int main(){
     auto aPath=resolve(stableRoot,stableRoot,"/ns-a"),bPath=resolve(stableRoot,stableRoot,"/ns-b");
     auto* initial=VfsMountNamespaceInitial();
     testFreshMounts(initial,stableRoot,originalTarget,aPath);
+    testRecursiveBinds(initial,stableRoot);
     MountNamespace* parentNs=nullptr;VfsPath parentRoot{},parentCwd{};
     assert(!VfsMountNamespaceCopy(initial,stableRoot,originalSynthetic,&parentNs,&parentRoot,&parentCwd));
     assert(VfsMountNamespaceBind(parentNs,aPath,parentCwd)==-3);

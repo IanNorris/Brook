@@ -234,7 +234,130 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
     mount->publication=++g_mountPublication;StrCopy(mount->fsType,fsName,sizeof(mount->fsType));
     backing->next=g_backings;g_backings=backing;g_mounts.Publish(mount);return 0;
 }
-int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath& target)
+// Test exact retained ancestry, never reporting-label prefixes. The first edge
+// on the source attachment determines whether the entire child mount belongs
+// to a recursive bind of a partial directory on that attachment.
+static int VfsBindContainsLocked(const VfsPath& source,const VfsPath& covered,bool* included)
+{
+    *included=false;if(!covered.object || !covered.attachment)return 0;
+    VfsPath current=covered;VfsPathRetain(current);
+    int error=0;VfsRetainedProvider provider;
+    for(uint32_t depth=0;depth<VFS_MAX_MOUNT_DEPTH;++depth) {
+        auto* mount=static_cast<MountEntry*>(current.attachment);
+        if(current.attachment!=source.attachment) {
+            if(!mount->linked || !mount->covered.object)break;
+            VfsPath next=mount->covered;VfsPathRetain(next);VfsPathRelease(current);current=next;
+            continue;
+        }
+        if(VfsPathSame(current,source)) {*included=true;break;}
+        if(current.object->identity==mount->rootIdentity && current.object->ops==mount->rootObjectOps)break;
+        VfsPath next{};error=provider.Parent(current,source,next);
+        if(error)break;
+        if(VfsPathSame(current,next)) {VfsPathRelease(next);break;}
+        VfsPathRelease(current);current=next;
+        if(depth+1==VFS_MAX_MOUNT_DEPTH)error=-40;
+    }
+    VfsPathRelease(current);return error;
+}
+static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath& source,const VfsPath& target)
+{
+    auto* sourceMount=static_cast<MountEntry*>(source.attachment);
+    if(!VfsMountPublished(*sourceMount))return -22;
+    char sourceLabel[512];
+    if(int error=VfsGlobalDirectoryLocked(source,sourceLabel,sizeof(sourceLabel)))return error;
+    VfsNamespaceCloneMap map;
+    auto prepare=[&](MountEntry* original,MountEntry** out)->int {
+        *out=nullptr;
+        auto* memo=static_cast<VfsNamespaceCloneMap::Attachment*>(kmalloc(sizeof(VfsNamespaceCloneMap::Attachment)));
+        if(!memo)return -12;
+        auto* mount=static_cast<MountEntry*>(kmalloc(sizeof(MountEntry)));
+        if(!mount) {kfree(memo);return -12;}
+        *mount={};mount->owner=ns;mount->referenceState=1;mount->linked=true;
+        mount->backing=original->backing;mount->backing->RetainLocked();
+        mount->lockedInherited=original->lockedInherited;
+        mount->rootIdentity=original->rootIdentity;mount->rootObjectOps=original->rootObjectOps;
+        mount->rootIdentityKnown=original->rootIdentityKnown;
+        StrCopy(mount->fsType,original->fsType,sizeof(mount->fsType));
+        memo->oldMount=original;memo->newMount=mount;memo->next=map.attachments;map.attachments=memo;
+        *out=mount;return 0;
+    };
+    if(g_mounts.count==~uint32_t{0})return -12;
+    MountEntry* graft=nullptr;int error=prepare(sourceMount,&graft);
+    uint32_t count=error?0:1;
+    if(!error) {
+        graft->lockedInherited=false; // new bind root; copied descendants keep restrictions
+        graft->rootObject=source.object;VfsObjectRetain(source.object);
+        graft->rootIdentity=source.object->identity;graft->rootObjectOps=source.object->ops;graft->rootIdentityKnown=true;
+        graft->covered=target;VfsPathRetain(target);
+        error=VfsGlobalDirectoryLocked(target,graft->mountPoint,sizeof(graft->mountPoint));
+    }
+    // Freeze the complete pre-operation set. Nothing is added to g_mounts until
+    // every edge, virtual ancestor and reporting label has been prepared.
+    if(!error)for(auto* original=g_mounts.head;original;original=original->next) {
+        if(!VfsMountPublished(*original) || original->owner!=sourceMount->owner || original==sourceMount || !original->linked)continue;
+        bool included=false;error=VfsBindContainsLocked(source,original->covered,&included);
+        if(error)break;if(!included)continue;
+        if(count>=VFS_MAX_MOUNT_DEPTH || count>=~uint32_t{0}-g_mounts.count) {error=-12;break;}
+        MountEntry* mount=nullptr;error=prepare(original,&mount);if(error)break;++count;
+    }
+    if(!error)for(auto* entry=map.attachments;entry;entry=entry->next) {
+        if(entry->newMount==graft)continue;
+        error=map.ClonePath(entry->oldMount->covered,&entry->newMount->covered);
+        if(!error && entry->oldMount->rootObject) {
+            error=map.CloneObject(entry->oldMount->rootObject,&entry->newMount->rootObject);
+            if(!error) {entry->newMount->rootIdentity=entry->newMount->rootObject->identity;entry->newMount->rootObjectOps=entry->newMount->rootObject->ops;}
+        }
+        if(error)break;
+    }
+    if(!error)for(auto* entry=map.attachments;entry;entry=entry->next) {
+        auto* mount=entry->newMount;
+        if(mount!=graft) {
+            // Reporting alone uses names. New virtual ancestors are deliberately
+            // unpublished, so derive their labels from the frozen old tree.
+            char oldLabel[512];
+            error=VfsGlobalDirectoryLocked(entry->oldMount->covered,oldLabel,sizeof(oldLabel));
+            if(!error) {
+                const bool sourceRoot=StrEq(sourceLabel,"/");
+                if(!sourceRoot && !VfsComponentPrefix(sourceLabel,oldLabel))error=-2;
+                else {
+                    const char* suffix=oldLabel+(sourceRoot?0:StrLen(sourceLabel));
+                    uint32_t prefix=StrEq(graft->mountPoint,"/")?0:StrLen(graft->mountPoint);
+                    if(prefix+StrLen(suffix)>=sizeof(mount->mountPoint))error=-36;
+                    else {for(uint32_t i=0;i<prefix;++i)mount->mountPoint[i]=graft->mountPoint[i];StrCopy(mount->mountPoint+prefix,suffix,sizeof(mount->mountPoint)-prefix);}
+                }
+            }
+        }
+        if(error)break;
+        auto* ancestor=mount;uint32_t depth=0;
+        for(;ancestor && depth<VFS_MAX_MOUNT_DEPTH;++depth)ancestor=static_cast<MountEntry*>(ancestor->covered.attachment);
+        if(ancestor) {error=-40;break;}
+    }
+    if(!error && (!ns->life.Published() || !VfsMountPublished(*sourceMount)))error=-3;
+    if(error) {
+        // Release all cross-edges before freeing any attachment. The memoized
+        // virtual objects may own further parent paths into this prepared set.
+        for(auto* entry=map.attachments;entry;entry=entry->next) {
+            auto* mount=entry->newMount;VfsPathRelease(mount->covered);mount->covered={};
+            VfsObjectRelease(mount->rootObject);mount->rootObject=nullptr;
+        }
+        while(map.objects) {auto* memo=map.objects;map.objects=memo->next;VfsObjectRelease(memo->newObject);kfree(memo);}
+        for(auto* entry=map.attachments;entry;entry=entry->next) {
+            auto* mount=entry->newMount;if(mount->referenceState!=1)__builtin_trap();
+            VfsBackingDropLocked(mount->backing,true);kfree(mount);
+        }
+        return error;
+    }
+    // Normal walkers hold the outer transaction; metadata readers hold only
+    // viewLock. Publish the entire graft in one window for both classes.
+    auto flags=IrqSpinLockAcquire(&g_mountViewLock);
+    for(auto* entry=map.attachments;entry;entry=entry->next) {
+        auto* mount=entry->newMount;mount->used=true;mount->linked=true;
+        mount->publication=++g_mountPublication;mount->next=g_mounts.head;g_mounts.head=mount;++g_mounts.count;
+    }
+    IrqSpinLockRelease(&g_mountViewLock,flags);
+    return 0;
+}
+int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath& target,bool recursive)
 {
     if(!ns || !source.object || !source.attachment || !target.object || !target.attachment)return -22;
     FileMutationGuard transaction;
@@ -247,6 +370,7 @@ int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath
     VnodeStat stat{};int error=VfsObjectStatLocked(source.object,&stat);
     if(error)return error;if(!stat.isDir)return -20;
     if((error=VfsObjectStatLocked(target.object,&stat)))return error;if(!stat.isDir)return -20;
+    if(recursive)return VfsMountNamespaceRecursiveBindLocked(ns,source,target);
     auto* mount=static_cast<MountEntry*>(kmalloc(sizeof(MountEntry)));if(!mount)return -12;
     *mount={};error=VfsGlobalDirectoryLocked(target,mount->mountPoint,sizeof(mount->mountPoint));
     if(error) {kfree(mount);return error;}

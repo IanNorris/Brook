@@ -1,3 +1,8 @@
+Latest container checkpoint: [recursive bind](recursive-bind-checkpoint.md)
+passes Linux/native probes and advances unchanged bubblewrap through tmpfs and
+its newroot self-bind to `pivot_root: Function not implemented`. The child has
+not run; SteamRT/login acceptance remains outstanding.
+
 # Native Steam client checkpoint
 
 Update (2026-10-22): retained proc-root access, privilege ceilings, mount namespaces
