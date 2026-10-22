@@ -266,6 +266,7 @@ add_executable(kernel
     src/elf_loader.cpp
     src/exec_image.cpp
     src/vfs.cpp
+    src/fs_context.cpp
     src/fatfs_vfs.cpp
     src/ext2_vfs.cpp
     src/ext4_vfs.cpp

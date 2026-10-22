@@ -1,6 +1,7 @@
 #include "test_framework.h"
 #include "vfs.h"
 #include "vfs_path.h"
+#include "fs_context.h"
 #include "fatfs_vfs.h"
 #include "fatfs_glue.h"
 #include "fat_test_image.h"
@@ -289,6 +290,14 @@ TEST_MAIN("vfs", {
     ASSERT_EQ(brook::VfsPathRoot(&rootPath),0);
     ASSERT_EQ(brook::VfsPathResolve(rootPath,rootPath,"/TEST",&cwdPath),0);
     ASSERT_EQ(brook::VfsPathResolve(rootPath,cwdPath,"HELLO.TXT",&filePath),0);
+    int contextError=0;auto* fsContext=brook::FsContextCreate(rootPath,cwdPath,022,&contextError);
+    ASSERT_TRUE(fsContext!=nullptr);ASSERT_EQ(contextError,0);
+    auto* copiedContext=brook::FsContextCopy(fsContext,&contextError);ASSERT_TRUE(copiedContext!=nullptr);
+    ASSERT_EQ(brook::FsContextExchangeMask(fsContext,0077),022);ASSERT_EQ(brook::FsContextReadMask(copiedContext),022);
+    ASSERT_EQ(brook::FsContextSetCwd(fsContext,rootPath),0);
+    brook::FsSnapshot fsSnapshot{};ASSERT_EQ(brook::FsContextSnapshot(copiedContext,&fsSnapshot),0);
+    ASSERT_TRUE(brook::VfsPathSame(fsSnapshot.cwd,cwdPath));
+    brook::FsContextRelease(copiedContext);brook::FsContextRelease(fsContext);brook::FsSnapshotRelease(&fsSnapshot);
     ASSERT_EQ(brook::VfsRename("/TEST","/MOVED"),0);
     ASSERT_EQ(brook::VfsMkdir("/TEST",0755),0);
     ASSERT_EQ(brook::VfsPathResolve(rootPath,cwdPath,"HELLO.TXT",&aliasPath),0);
@@ -298,7 +307,12 @@ TEST_MAIN("vfs", {
     ASSERT_EQ(brook::VfsPathResolve(rootPath,cwdPath,"HELLO.TXT",&aliasPath),0);
     ASSERT_TRUE(brook::VfsPathSame(aliasPath,filePath));brook::VfsPathRelease(aliasPath);
     ASSERT_TRUE(brook::VfsUnmount("/MOVED"));
-    int retainedError=0;auto* exact=brook::VfsPathOpen(filePath,brook::VFS_O_READ,&retainedError);
+    char currentCwd[32]{};ASSERT_EQ(brook::VfsPathDirectoryPath(cwdPath,currentCwd,sizeof(currentCwd)),0);
+    const char expectedCwd[]="/MOVED";for(unsigned i=0;i<sizeof(expectedCwd);++i)ASSERT_EQ(currentCwd[i],expectedCwd[i]);
+    // Mutable FAT parent operations are explicitly unsupported by the new
+    // interface until implemented; never fall back to the opening pathname.
+    ASSERT_EQ(brook::VfsMkdirAt(rootPath,cwdPath,"unimplemented",0755,0),-95);
+    int retainedError=0;auto* exact=brook::VfsOpenAt(rootPath,cwdPath,"HELLO.TXT",brook::VFS_O_READ,0,0,&retainedError);
     ASSERT_TRUE(exact!=nullptr);ASSERT_EQ(retainedError,0);
     char hello[32]{};uint64_t helloOffset=0;
     ASSERT_EQ(brook::VfsRead(exact,hello,19,&helloOffset),19);

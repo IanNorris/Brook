@@ -18,6 +18,7 @@
 #include <atomic>
 #include "retained_path_walk.h"
 #include "vfs_path.h"
+#include "fs_context.h"
 #include "../../kernel/src/ext2_vfs.cpp"
 
 namespace {
@@ -28,13 +29,15 @@ thread_local long failAllocation=-1;
 unsigned requiredAccess=0;
 brook::Process process{};
 std::vector<unsigned char> disk;
-int readDisk(brook::Device*,uint64_t offset,void* out,uint64_t bytes){
-    if(offset>disk.size() || bytes>disk.size()-offset)return -5;
-    std::memcpy(out,disk.data()+offset,bytes);return bytes;
+int readDisk(brook::Device* device,uint64_t offset,void* out,uint64_t bytes){
+    auto& storage=device->priv?*static_cast<std::vector<unsigned char>*>(device->priv):disk;
+    if(offset>storage.size() || bytes>storage.size()-offset)return -5;
+    std::memcpy(out,storage.data()+offset,bytes);return bytes;
 }
-int writeDisk(brook::Device*,uint64_t offset,const void* in,uint64_t bytes){
-    if(offset>disk.size() || bytes>disk.size()-offset)return -5;
-    std::memcpy(disk.data()+offset,in,bytes);return bytes;
+int writeDisk(brook::Device* device,uint64_t offset,const void* in,uint64_t bytes){
+    auto& storage=device->priv?*static_cast<std::vector<unsigned char>*>(device->priv):disk;
+    if(offset>storage.size() || bytes>storage.size()-offset)return -5;
+    std::memcpy(storage.data()+offset,in,bytes);return bytes;
 }
 int ioctlDisk(brook::Device*,uint32_t,void*){return 0;}
 const brook::DeviceOps diskOps={readDisk,writeDisk,ioctlDisk,nullptr};
@@ -92,8 +95,8 @@ struct BackendProvider {
         brook::VnodeStat stat{};int e=o->ops->stat(o,&stat);info={stat.isDir,stat.isSymlink};return e;
     }
     int Search(brook::VfsObject* o){return o->ops->access(o,1,false);}
-    int Lookup(brook::VfsObject* o,const char* n,brook::VfsObject*& out){return o->ops->lookup(o,n,&out);}
-    int Parent(brook::VfsObject* o,brook::VfsObject*,brook::VfsObject*& out){return o->ops->parent(o,&out);}
+    int Lookup(brook::VfsObject* o,const char* n,brook::VfsObject*& out){return o->ops->lookup(o,n,&out,false);}
+    int Parent(brook::VfsObject* o,brook::VfsObject*,brook::VfsObject*& out){return o->ops->parent(o,&out,false);}
     int Readlink(brook::VfsObject* o,char* out,uint32_t cap){return o->ops->readlink(o,out,cap);}
 };
 int main(int argc,char** argv){
@@ -147,6 +150,50 @@ int main(int argc,char** argv){
     begin.store(true,std::memory_order_release);
     for(unsigned i=0;i<200;++i)walk("relative",marker);
     writer.join();
+    // Mutations use the held parent inode after its old global name has been
+    // replaced. Modes are already masked by the context snapshot, never by a
+    // second read of the process mask inside the inode lock.
+    process.umask=077;
+    Vnode* newlyCreated=held->ops->create(held,"created",VFS_O_WRITE,0640,&error);assert(newlyCreated&&!error);
+    assert(!held->ops->create(held,"created",VFS_O_WRITE,0600,&error)&&error==-17);
+    assert(!held->ops->symlink(held,"nonexistent","dangling"));
+    assert(!held->ops->create(held,"dangling",VFS_O_WRITE,0600,&error)&&error==-17);
+    assert(!held->ops->remove(held,"dangling",false));
+    VfsObject* createdObject=nullptr;assert(!Ext2ObjectChild(held,"created",&createdObject));
+    VnodeStat createdStat{};assert(!createdObject->ops->stat(createdObject,&createdStat)&&(createdStat.mode&0777)==0640);
+    assert(!held->ops->mkdir(held,"nested",0750));
+    VfsObject* nested=nullptr;assert(!Ext2ObjectChild(held,"nested",&nested));
+    assert(!nested->ops->stat(nested,&createdStat)&&(createdStat.mode&0777)==0750);
+    assert(!held->ops->rename(held,"created",nested,"renamed"));
+    assert(!held->ops->symlink(held,"nested/renamed","made-link"));
+    VfsObject* madeLink=nullptr;assert(!Ext2ObjectChild(held,"made-link",&madeLink));
+    char madeTarget[64];assert(madeLink->ops->readlink(madeLink,madeTarget,sizeof(madeTarget))==14);
+    VfsObjectRelease(madeLink);
+    assert(!held->ops->remove(held,"made-link",false));
+    Vnode* madeSocket=held->ops->create_socket(held,"made-socket",0660,&error);assert(madeSocket&&!error);
+    assert(!madeSocket->ops->stat(madeSocket,&createdStat)&&(createdStat.mode&0777)==0660);closeNode(madeSocket);
+    assert(!held->ops->remove(held,"made-socket",false));
+    assert(!createdObject->ops->chmod(createdObject,0604));
+    VnodeTime changedTimes[2]={{1234,0},{5678,0}};assert(!createdObject->ops->set_times(createdObject,changedTimes));
+    assert(!createdObject->ops->stat(createdObject,&createdStat)&&createdStat.mtime.sec==5678&&(createdStat.mode&0777)==0604);
+    assert(createdObject->ops->chown(createdObject,2000,2000)==-1);
+    process.euid=0;assert(!createdObject->ops->chown(createdObject,1000,1000));process.euid=1000;
+    char liveDirectory[128];assert(!held->ops->directory_path(held,liveDirectory,sizeof(liveDirectory))&&!std::strcmp(liveDirectory,"/moved"));
+    assert(!held->ops->chmod(held,01777));m->skipPermChecks=false;process.uid=process.euid=2000;
+    assert(nested->ops->remove(nested,"renamed",false)==-13); // Nested directory search/write denied.
+    assert(held->ops->remove(held,"nested",true)==-1); // Sticky parent ownership.
+    process.uid=process.euid=1000;m->skipPermChecks=true;assert(!held->ops->chmod(held,0755));
+    closeNode(newlyCreated);assert(!nested->ops->remove(nested,"renamed",false));
+    assert(!createdObject->ops->stat(createdObject,&createdStat)&&!createdStat.nlink);VfsObjectRelease(createdObject);
+    assert(!held->ops->remove(held,"nested",true));VfsObjectRelease(nested);
+    assert(held->ops->mkdir(held,"..",0700)==-22);assert(held->ops->remove(held,"a/b",false)==-22);
+    assert(!held->ops->create(held,"/escape",VFS_O_WRITE,0600,&error)&&error==-22);
+    process.umask=022;
+    assert(!held->ops->chmod(held,0600));m->skipPermChecks=false;
+    assert(!held->ops->create(held,"marker",VFS_O_WRITE,0600,&error)&&error==-13);
+    assert(held->ops->mkdir(held,"marker",0700)==-13);
+    assert(!held->ops->create_socket(held,"marker",0600,&error)&&error==-13);
+    m->skipPermChecks=true;assert(!held->ops->chmod(held,0755));
     // Real object-open authorization path: inspect exact required bits through
     // the host's single-identity credential shim, with on-disk mode changes.
     assert(!Ext2FsChmod(m,0,"/moved/marker",0444));m->skipPermChecks=false;
@@ -180,6 +227,11 @@ int main(int argc,char** argv){
     VfsObjectRelease(marker);assert(!Ext2FsRemovePath(m,0,"/moved/relative",false));
     assert(!Ext2FsRemovePath(m,0,"/moved",true));
     assert(!Ext2ObjectStat(held,&orphan) && !orphan.nlink && orphan.isDir);
+    assert(!held->ops->create(held,"new",VFS_O_WRITE,0600,&error)&&error==-2);
+    assert(held->ops->mkdir(held,"new",0700)==-2);
+    assert(held->ops->symlink(held,"target","new")==-2);
+    assert(!held->ops->create_socket(held,"new",0600,&error)&&error==-2);
+    char detachedName[64];assert(held->ops->directory_path(held,detachedName,sizeof(detachedName))==-2);
     assert(!Ext2FsMkdir(m,0,"/fresh",0755));
     VfsObject* fresh=nullptr;assert(!Ext2ObjectChild(root,"fresh",&fresh));assert(fresh->identity!=held->identity);
     after=reinterpret_cast<VfsObject*>(1);assert(Ext2ObjectChild(held,"marker",&after)==-2 && !after);
@@ -187,31 +239,112 @@ int main(int argc,char** argv){
     VfsObjectRelease(held);assert(!Ext2FsCanUnmount(m)); // root still held
     VfsObjectRelease(root);assert(Ext2FsCanUnmount(m));assert(!Ext2FsUnmount(m));
     assert(!g_ext2OpenInodes && allocations.empty() && frames.empty());
-    // Compose the production backend and production namespace, using distinct
-    // locks rather than a shared host shim that would mask lock-order errors.
+    // Production VFS transactions with distinct backend/namespace locks and
+    // independent device images, so overmount writes never share stale caches.
     VfsInit();assert(VfsRegisterFs("ext2",&g_ext2FsOps));assert(VfsMount("/","ext2",0));
     process.uid=process.euid=process.suid=0;process.gid=process.egid=process.sgid=0;
-    assert(!VfsMkdir("/context-dir",0755));
-    Vnode* created=VfsOpen("/context-dir/value",VFS_O_CREATE|VFS_O_WRITE);assert(created);VfsClose(created);
+    assert(!VfsMkdir("/container",0755));assert(!VfsMkdir("/container/context-dir",0755));
+    Vnode* created=VfsOpen("/container/context-dir/value",VFS_O_CREATE|VFS_O_WRITE);assert(created);VfsClose(created);
     VfsPath fsRoot{},cwd{},value{},resolved{};assert(!VfsPathRoot(&fsRoot));
-    assert(!VfsPathResolve(fsRoot,fsRoot,"/context-dir",&cwd));
+    assert(!VfsPathResolve(fsRoot,fsRoot,"/container/context-dir",&cwd));
     assert(!VfsPathResolve(fsRoot,cwd,"value",&value));
-    Vnode* legacyDirectory=VfsOpen("/context-dir");assert(legacyDirectory);
-    VfsPath captured{};assert(!VfsPathFromVnode(legacyDirectory,&captured));assert(VfsPathSame(captured,cwd));
-    VfsPathRelease(captured);VfsClose(legacyDirectory);
-    assert(!VfsRename("/context-dir","/context-moved"));assert(!VfsMkdir("/context-dir",0755));
+    FsContext* context=FsContextCreate(fsRoot,cwd,022,&error);assert(context&&!error);
+    FsContext* copied=FsContextCopy(context,&error);assert(copied&&!error);
+    FsContextRetain(context);FsContext* shared=context;
+    assert(FsContextExchangeMask(shared,0077)==022);assert(FsContextReadMask(context)==0077&&FsContextReadMask(copied)==022);
+    assert(!FsContextSetCwd(shared,fsRoot));FsSnapshot snapshot{};
+    assert(!FsContextSnapshot(context,&snapshot)&&VfsPathSame(snapshot.cwd,fsRoot));FsSnapshotRelease(&snapshot);
+    assert(!FsContextSnapshot(copied,&snapshot)&&VfsPathSame(snapshot.cwd,cwd));FsSnapshotRelease(&snapshot);
+    assert(FsContextSetCwd(context,value)==-20);
+    const auto contextAllocations=allocations.size();failAllocation=0;
+    assert(!FsContextCopy(context,&error)&&error==-12);failAllocation=-1;assert(allocations.size()==contextAllocations);
+    assert(!FsContextCreate(fsRoot,value,022,&error)&&error==-20);
+    assert(!FsContextSetCwd(context,cwd));
+    std::thread contextWriter([&]{
+        for(unsigned i=0;i<100;++i){assert(!FsContextSetCwd(shared,i&1?cwd:fsRoot));FsContextExchangeMask(shared,i&1?022:077);}
+    });
+    for(unsigned i=0;i<200;++i){
+        FsSnapshot current{};assert(!FsContextSnapshot(context,&current));
+        assert(VfsPathSame(current.root,fsRoot)&&(VfsPathSame(current.cwd,cwd)||VfsPathSame(current.cwd,fsRoot)));
+        assert(current.mask==022||current.mask==077);FsSnapshotRelease(&current);
+    }
+    contextWriter.join();FsContextRelease(shared);FsContextRelease(context);
+    assert(!FsContextSnapshot(copied,&snapshot));FsContextRelease(copied);
+    assert(VfsPathSame(snapshot.cwd,cwd));FsSnapshotRelease(&snapshot);
+    Vnode* legacyDirectory=VfsOpen("/container/context-dir");assert(legacyDirectory);
+    VfsPath captured{};assert(!VfsPathFromVnode(legacyDirectory,&captured));assert(VfsPathSame(captured,cwd));VfsPathRelease(captured);
+    assert(!VfsRename("/container/context-dir","/container/context-moved"));assert(!VfsMkdir("/container/context-dir",0755));
+    char cwdName[128];assert(!VfsDirectoryPath(legacyDirectory,cwdName,sizeof(cwdName))&&!std::strcmp(cwdName,"/container/context-moved"));VfsClose(legacyDirectory);
+    assert(!VfsPathDirectoryPath(cwd,cwdName,sizeof(cwdName))&&!std::strcmp(cwdName,"/container/context-moved"));
+    auto* exactDirectory=VfsPathOpen(cwd,VFS_O_METADATA,&error);assert(exactDirectory);
+    assert(!VfsDirectoryPath(exactDirectory,cwdName,sizeof(cwdName))&&!std::strcmp(cwdName,"/container/context-moved"));VfsClose(exactDirectory);
+    auto* atFile=VfsOpenAt(fsRoot,cwd,"at-created",VFS_O_CREATE|VFS_O_WRITE,0666,0027,&error);assert(atFile&&!error);
+    VnodeStat atStat{};assert(!VfsStatAt(fsRoot,cwd,"at-created",&atStat)&&(atStat.mode&0777)==0640);
+    assert(!VfsOpenAt(fsRoot,cwd,"at-created",VFS_O_CREATE|VFS_O_EXCL|VFS_O_WRITE,0600,0,&error)&&error==-17);
+    assert(VfsMkdirAt(fsRoot,cwd,".",0755,0)==-17);assert(VfsMkdirAt(fsRoot,fsRoot,"/",0755,0)==-17);
+    assert(!VfsMkdirAt(fsRoot,cwd,"nested",0777,0027));
+    assert(!VfsStatAt(fsRoot,cwd,"nested",&atStat)&&(atStat.mode&0777)==0750);
+    assert(!VfsSymlinkAt(fsRoot,cwd,"at-created","at-link"));
+    assert(VfsReadlinkAt(fsRoot,cwd,"at-link",cwdName,sizeof(cwdName))==10);
+    assert(!VfsStatAt(fsRoot,cwd,"at-link",&atStat,false)&&atStat.isSymlink);
+    assert(!VfsStatAt(fsRoot,cwd,"at-link",&atStat)&&!atStat.isSymlink);
+    VfsPath nestedPath{};assert(!VfsPathResolve(fsRoot,cwd,"nested",&nestedPath));
+    g_ext2Mounts[0]->skipPermChecks=false;
+    assert(!VfsChmodAt(fsRoot,cwd,".",0700));assert(!VfsChmodAt(fsRoot,nestedPath,".",0700));
+    process.uid=0;process.euid=1000;
+    assert(!VfsAccessAt(fsRoot,nestedPath,"../at-created",4,true));
+    assert(VfsAccessAt(fsRoot,nestedPath,"../at-created",4,false)==-13);
+    process.uid=1000;process.euid=0;
+    assert(VfsAccessAt(fsRoot,nestedPath,"../at-created",4,true)==-13);
+    assert(!VfsAccessAt(fsRoot,nestedPath,"../at-created",4,false));
+    process.uid=process.euid=0;
+    assert(!VfsChmodAt(fsRoot,cwd,".",0755));assert(!VfsChmodAt(fsRoot,nestedPath,".",0750));
+    assert(!VfsRenameAt(fsRoot,cwd,"at-created",nestedPath,"renamed"));
+    assert(VfsStatAt(fsRoot,cwd,"at-created",&atStat)==-2);
+    assert(!VfsChmodAt(fsRoot,nestedPath,"renamed",0604));
+    assert(!VfsChownAt(fsRoot,nestedPath,"renamed",0,0));
+    assert(!VfsSetTimesAt(fsRoot,nestedPath,"renamed",changedTimes));
+    assert(!VfsAccessAt(fsRoot,nestedPath,"renamed",4));
+    auto* atSocket=VfsCreateSocketAt(fsRoot,cwd,"at-socket",0777,0077,&error);assert(atSocket&&!error);VfsClose(atSocket);
+    assert(!VfsRemoveAt(fsRoot,cwd,"at-socket",false));
+    assert(!VfsRemoveAt(fsRoot,cwd,"at-link",false));
+    VfsClose(atFile);assert(!VfsRemoveAt(fsRoot,nestedPath,"renamed",false));
+    VfsPathRelease(nestedPath);assert(!VfsRemoveAt(fsRoot,cwd,"nested",true));
     assert(!VfsPathResolve(fsRoot,cwd,"value",&resolved)&&VfsPathSame(resolved,value));VfsPathRelease(resolved);
-    // A second attachment on a separate memory-device number covers the held
-    // cwd. No writes are made while the same backing bytes are mounted twice.
-    g_ext2Devices[1]=&device;assert(VfsMount("/context-moved","ext2",1));
-    assert(!VfsPathResolve(fsRoot,fsRoot,"/context-moved",&resolved));assert(resolved.attachment!=cwd.attachment);
-    VfsPathRelease(resolved);
+    std::vector<unsigned char> otherDisks[4];Device otherDevices[4]{};
+    auto prepareVolume=[&](unsigned number){
+        assert(number>0 && number<4);assert(!Ext2FsSync(g_ext2Mounts[0]));otherDisks[number]=disk;
+        otherDevices[number]={&diskOps,"private-independent-ext2",DeviceType::Block,&otherDisks[number]};g_ext2Devices[number]=&otherDevices[number];
+    };
+    auto parity=[&](const char* text){
+        VfsPath path{};assert(!VfsPathResolve(fsRoot,fsRoot,text,&path));
+        Vnode* legacy=VfsOpen(text);assert(legacy&&legacy->mountOwner==path.attachment);
+        VfsClose(legacy);VfsPathRelease(path);
+    };
+    assert(!VfsMkdirAt(fsRoot,cwd,"d",0755,0));prepareVolume(2);
+    assert(VfsMount("/container/context-moved/d/m","ext2",2));prepareVolume(1);
+    assert(VfsMount("/container/context-moved","ext2",1));
+    assert(!VfsPathResolve(fsRoot,fsRoot,"/container/context-moved",&resolved));assert(resolved.attachment!=cwd.attachment);
+    assert(cwd.object->ops->rename(cwd.object,"value",resolved.object,"new-value")==-18);
+    assert(VfsRenameAt(fsRoot,cwd,"value",resolved,"new-value")==-18);VfsPathRelease(resolved);
+    assert(!VfsMkdir("/container/context-moved/d",0755));prepareVolume(3);
+    assert(VfsMount("/container/context-moved/d/m","ext2",3));
+    assert(!VfsRenameAt(fsRoot,cwd,"d",cwd,"e")); // Held lower parent while covered.
+    parity("/container/context-moved/d/m");
+    assert(!VfsRenameAt(fsRoot,fsRoot,"container",fsRoot,"renamed-container"));
+    parity("/renamed-container/context-moved/d/m");assert(!VfsOpen("/container/context-moved/d/m"));
+    assert(VfsUnmount("/renamed-container/context-moved/d/m"));
+    assert(VfsUnmount("/renamed-container/context-moved"));
+    parity("/renamed-container/context-moved/e/m");assert(!VfsOpen("/renamed-container/context-moved/d/m"));
+    assert(VfsUnmount("/renamed-container/context-moved/e/m"));assert(!VfsRemoveAt(fsRoot,cwd,"e",true));
     assert(!VfsPathResolve(fsRoot,cwd,"value",&resolved)&&VfsPathSame(resolved,value));VfsPathRelease(resolved);
-    assert(VfsUnmount("/context-moved"));
-    Vnode* exact=VfsPathOpen(value,VFS_O_READ,&error);assert(exact&&!error);
+    Vnode* exact=VfsOpenAt(fsRoot,cwd,"value",VFS_O_READ,0,0,&error);assert(exact&&!error);
     VfsPathRelease(value);VfsPathRelease(cwd);VfsPathRelease(fsRoot);assert(!VfsUnmount("/"));
-    VfsClose(exact);assert(VfsUnmount("/"));
-    assert(!g_ext2OpenInodes && allocations.empty() && frames.empty());
+    VfsClose(exact);assert(VfsUnmount("/"));assert(!g_ext2OpenInodes && allocations.empty() && frames.empty());
+    for(unsigned i=1;i<4;++i){
+        std::ofstream child(std::string(argv[1])+".child"+std::to_string(i),std::ios::binary|std::ios::trunc);
+        child.write(reinterpret_cast<char*>(otherDisks[i].data()),otherDisks[i].size());assert(child);
+    }
     std::ofstream output(argv[1],std::ios::binary|std::ios::trunc);output.write(reinterpret_cast<char*>(disk.data()),disk.size());assert(output);output.close();
     std::puts("EXT2_OBJECTS_PASS production-backend rename/orphan/independent-opens/permission-modes/allocation-unwind/teardown");
 }

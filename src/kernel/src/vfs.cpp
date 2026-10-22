@@ -612,8 +612,15 @@ int VfsDirectoryPath(Vnode* vn,char* out,uint32_t capacity)
 {
     if(!vn || vn->type!=VnodeType::Dir)return -20;
     if(!out || !capacity)return -22;
-    if(!vn->directoryPath)return -9;
     FileMutationGuard lookup(false);
+    auto* actual=static_cast<MountEntry*>(vn->mountOwner);
+    if(actual && (actual->fsOps->vnode_object ||
+                  (vn->backendObject && vn->backendObject->ops==&g_virtualDirectoryOps))) {
+        VfsPath retained{};int error=VfsPathFromVnodeLocked(vn,&retained);
+        if(!error)error=VfsGlobalDirectoryLocked(retained,out,capacity);
+        VfsPathRelease(retained);return error;
+    }
+    if(!vn->directoryPath)return -9;
     const char* path=vn->directoryPath;
     char current[512];
     if(vn->ops && vn->ops->directory_path) {
@@ -1017,5 +1024,7 @@ void VfsRelease(Vnode* vn)
     if (vn && __atomic_fetch_sub(&vn->refCount,uint32_t{1},__ATOMIC_ACQ_REL)==1)
         VfsClose(vn);
 }
+
+#include "vfs_retained_ops.inc"
 
 } // namespace brook

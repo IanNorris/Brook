@@ -100,6 +100,7 @@ add_custom_command(OUTPUT "${VFS_TEST_FAT_IMAGE}"
     DEPENDS "${BROOK_ROOT}/scripts/make_fat_image.py" VERBATIM)
 target_sources(test_vfs PRIVATE
     "${BROOK_ROOT}/src/kernel/src/fatfs_vfs.cpp" "${VFS_TEST_FAT_IMAGE}"
+    "${BROOK_ROOT}/src/kernel/src/fs_context.cpp"
     "${FATFS_TEST_BUILD_DIR}/ff.c"
     "${FATFS_TEST_BUILD_DIR}/ffunicode.c"
 )

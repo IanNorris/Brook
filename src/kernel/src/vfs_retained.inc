@@ -66,8 +66,8 @@ static int VfsVirtualStat(VfsObject* object,VnodeStat* out)
     *out={};out->isDir=true;out->mode=0040555;out->ino=object->identity;return 0;
 }
 static int VfsVirtualAccess(VfsObject*,uint8_t required,bool) { return required&2?-30:0; }
-static int VfsVirtualChild(VfsObject*,const char*,VfsObject** out) { *out=nullptr;return -2; }
-static int VfsVirtualParent(VfsObject* object,VfsObject** out)
+static int VfsVirtualChild(VfsObject*,const char*,VfsObject** out,bool) { *out=nullptr;return -2; }
+static int VfsVirtualParent(VfsObject* object,VfsObject** out,bool)
 {
     auto* directory=static_cast<VfsVirtualDirectory*>(object->priv);
     *out=directory->parent.object;VfsObjectRetain(*out);return 0;
@@ -151,13 +151,13 @@ struct VfsRetainedProvider {
             // Reservation conflicts through ordinary VFS mutations are refused.
             // A backend-direct mutation must not silently hide a real child.
             VfsObject* conflict=nullptr;
-            int error=parent.object->ops->lookup?parent.object->ops->lookup(parent.object,name,&conflict):-95;
+            int error=parent.object->ops->lookup?parent.object->ops->lookup(parent.object,name,&conflict,realIds):-95;
             VfsObjectRelease(conflict);
             if(error!=-2) { VfsPathRelease(out);out={};return error?error:-16; }
         } else {
             if(!parent.object->ops->lookup)return -95;
             VfsObject* object=nullptr;
-            int error=parent.object->ops->lookup(parent.object,name,&object);
+            int error=parent.object->ops->lookup(parent.object,name,&object,realIds);
             if(error || !object) { VfsObjectRelease(object);return error?error:-5; }
             auto* mount=static_cast<MountEntry*>(parent.attachment);
             VfsPathHoldMount(mount);
@@ -173,14 +173,14 @@ struct VfsRetainedProvider {
             if(Same(current,root)) { out=current;return 0; }
             auto* mount=static_cast<MountEntry*>(current.attachment);
             if(!VfsVirtual(current) && mount->rootIdentityKnown &&
-               current.object->identity==mount->rootIdentity && mount->covered.object) {
+               current.object->identity==mount->rootIdentity && current.object->ops==mount->rootObjectOps && mount->covered.object) {
                 VfsPath next=mount->covered;VfsPathRetain(next);VfsPathRelease(current);current=next;continue;
             }
             if(VfsVirtual(current)) {
                 out=static_cast<VfsVirtualDirectory*>(current.object->priv)->parent;VfsPathRetain(out);
             } else {
                 VfsObject* parent=nullptr;
-                const int error=current.object->ops->parent?current.object->ops->parent(current.object,&parent):-95;
+                const int error=current.object->ops->parent?current.object->ops->parent(current.object,&parent,realIds):-95;
                 if(error || !parent) { VfsObjectRelease(parent);VfsPathRelease(current);return error?error:-5; }
                 VfsPathHoldMount(mount);out={mount,parent};
             }
@@ -221,11 +221,61 @@ static int VfsPrepareMountpointLocked(const char* text,VfsPath* out)
     if(error) { VfsPathRelease(current);return error; }
     *out=current;return 0;
 }
-int VfsPathFromVnode(Vnode* node,VfsPath* out)
+// Global-name reporting for cwd/proc/debug consumers. Lookup never calls this.
+static int VfsBackendDirectoryLocked(const VfsPath& path,char* out,uint32_t capacity)
+{
+    if(!out || capacity<2)return -36;
+    out[0]=0;if(!path.object)return -9;
+    char suffix[512];uint32_t position=sizeof(suffix)-1;suffix[position]=0;
+    VfsPath current=path;
+    for(uint32_t depth=0;VfsVirtual(current);++depth) {
+        if(depth>=256)return -40;
+        auto* directory=static_cast<VfsVirtualDirectory*>(current.object->priv);
+        VfsPath visible{};
+        bool linked=VfsReservedVirtualLocked(directory->parent,directory->name,&visible) && VfsPathSame(visible,current);
+        VfsPathRelease(visible);if(!linked)return -2;
+        const uint32_t length=StrLen(directory->name);
+        if(position<length+1)return -36;
+        position-=length;for(uint32_t i=0;i<length;++i)suffix[position+i]=directory->name[i];
+        suffix[--position]='/';current=directory->parent;
+    }
+    if(!current.object->ops->directory_path)return -95;
+    char relative[512];int error=current.object->ops->directory_path(current.object,relative,sizeof(relative));
+    if(error)return error;
+    if(relative[0]!='/')return -5;
+    uint32_t written=StrLen(relative);const uint32_t tail=sizeof(suffix)-position-1;
+    if(tail && written==1)written=0;
+    if(written+tail>=capacity)return -36;
+    if(written)StrCopy(out,relative,capacity);
+    for(uint32_t i=0;i<=tail;++i)out[written+i]=suffix[position+i];
+    return 0;
+}
+static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capacity)
+{
+    if(!out || capacity<2)return -36;
+    out[0]=0;char relative[512];int error=VfsBackendDirectoryLocked(path,relative,sizeof(relative));
+    if(error)return error;
+    auto* mount=static_cast<MountEntry*>(path.attachment);
+    const uint32_t prefix=StrLen(mount->mountPoint),length=StrLen(relative);
+    const bool root=prefix==1 && mount->mountPoint[0]=='/';
+    const uint32_t total=root?length:prefix+(length==1?0:length);
+    if(total>=capacity)return -36;
+    if(root)StrCopy(out,relative,capacity);
+    else {
+        for(uint32_t i=0;i<prefix;++i)out[i]=mount->mountPoint[i];
+        if(length>1)for(uint32_t i=0;i<length;++i)out[prefix+i]=relative[i];
+        out[total]=0;
+    }
+    return 0;
+}
+int VfsPathDirectoryPath(const VfsPath& path,char* out,uint32_t capacity)
+{
+    FileMutationGuard lookup(false);return VfsGlobalDirectoryLocked(path,out,capacity);
+}
+static int VfsPathFromVnodeLocked(Vnode* node,VfsPath* out)
 {
     if(!out)return -22;
     *out={};if(!node)return -9;
-    FileMutationGuard lookup(false);
     auto* mount=static_cast<MountEntry*>(node->mountOwner);
     if(!mount || !mount->used)return -9;
     VfsObject* object=nullptr;int error=0;
@@ -235,6 +285,10 @@ int VfsPathFromVnode(Vnode* node,VfsPath* out)
     else error=-95;
     if(error || !object) { VfsObjectRelease(object);return error?error:-5; }
     VfsPathHoldMount(mount);*out={mount,object};return 0;
+}
+int VfsPathFromVnode(Vnode* node,VfsPath* out)
+{
+    FileMutationGuard lookup(false);return VfsPathFromVnodeLocked(node,out);
 }
 int VfsPathResolve(const VfsPath& root,const VfsPath& start,const char* text,VfsPath* out,bool followFinal,bool realIds)
 {
@@ -260,7 +314,7 @@ int VfsPathAccess(const VfsPath& path,uint8_t required,bool realIds)
     FileMutationGuard lookup(false);
     return path.object->ops->access?path.object->ops->access(path.object,required,realIds):-95;
 }
-Vnode* VfsPathOpen(const VfsPath& path,int flags,int* error)
+static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
 {
     int localError=0;if(!error)error=&localError;*error=0;
     if(!path.object || !path.attachment) { *error=-9;return nullptr; }
@@ -270,7 +324,6 @@ Vnode* VfsPathOpen(const VfsPath& path,int flags,int* error)
        ((flags&VFS_O_EXEC) && (flags&(VFS_O_WRITE|VFS_O_READWRITE|VFS_O_TRUNC|VFS_O_APPEND)))) {
         *error=-22;return nullptr;
     }
-    FileMutationGuard lookup(flags&VFS_O_TRUNC);
     if(!path.object->ops->open) { *error=-95;return nullptr; }
     int openFlags=flags&~VFS_O_TRUNC;
     if(flags&VFS_O_TRUNC) { if(!(openFlags&VFS_O_WRITE))openFlags|=VFS_O_READWRITE;openFlags|=VFS_O_WRITE; }
@@ -283,6 +336,11 @@ Vnode* VfsPathOpen(const VfsPath& path,int flags,int* error)
         if(*error) { VfsClose(node);return nullptr; }
     }
     return node;
+}
+
+Vnode* VfsPathOpen(const VfsPath& path,int flags,int* error)
+{
+    FileMutationGuard lookup(flags&VFS_O_TRUNC);return VfsPathOpenLocked(path,flags,error);
 }
 
 // Compatibility callers still use pathname mutation APIs. Reserve all live
@@ -305,7 +363,7 @@ static int VfsReservedMutationLocked(const char* text,bool rejectVirtualChildren
     int failure=busy?-16:0;
     if(!busy && result.parent.object->ops->lookup) {
         VfsObject* child=nullptr;
-        int found=result.parent.object->ops->lookup(result.parent.object,result.leaf,&child);
+        int found=result.parent.object->ops->lookup(result.parent.object,result.leaf,&child,false);
         if(!found && child)for(const auto& mount:g_mounts) {
             if(!mount.used)continue;
             VfsPath identity{result.parent.attachment,child};

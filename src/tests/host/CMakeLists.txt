@@ -450,6 +450,7 @@ target_link_libraries(test_fat_objects PRIVATE Threads::Threads)
 add_test(NAME test_fat_objects COMMAND python3 "${BROOK_ROOT}/src/tests/test_fat_objects/run.py" "$<TARGET_FILE:test_fat_objects>")
 set_tests_properties(test_fat_objects PROPERTIES TIMEOUT 60)
 add_executable(test_ext2_objects "${BROOK_ROOT}/src/tests/test_ext2_objects/main.cpp"
+    "${BROOK_ROOT}/src/kernel/src/fs_context.cpp"
     "${BROOK_ROOT}/src/kernel/src/vfs.cpp" "${BROOK_ROOT}/src/kernel/src/memory/mapping_pin_registry.cpp")
 target_link_libraries(test_ext2_objects PRIVATE Threads::Threads)
 add_test(NAME test_ext2_objects COMMAND python3 "${BROOK_ROOT}/src/tests/test_ext2_objects/run.py" "$<TARGET_FILE:test_ext2_objects>")

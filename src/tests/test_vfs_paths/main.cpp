@@ -33,10 +33,10 @@ int objectStat(brook::VfsObject* object,brook::VnodeStat* stat){
     auto& n=node(object);assert(n.mount->alive);*stat={};stat->isDir=n.dir;stat->isSymlink=!n.target.empty();stat->ino=n.id;stat->dev=n.mount-mounts+1;stat->mode=n.dir?0040755:0100644;return 0;
 }
 int objectAccess(brook::VfsObject*,uint8_t,bool){return 0;}
-int objectChild(brook::VfsObject* parent,const char* name,brook::VfsObject** out){
+int objectChild(brook::VfsObject* parent,const char* name,brook::VfsObject** out,bool=false){
     auto& n=node(parent);assert(n.mount->alive);*out=nullptr;auto it=n.children.find(name);return it==n.children.end()?-2:makeObject(it->second,out);
 }
-int objectParent(brook::VfsObject* object,brook::VfsObject** out){return makeObject(node(object).parent,out);}
+int objectParent(brook::VfsObject* object,brook::VfsObject** out,bool=false){return makeObject(node(object).parent,out);}
 int objectReadlink(brook::VfsObject* object,char* out,uint32_t size){auto& t=node(object).target;if(t.size()>size)return -36;std::memcpy(out,t.data(),t.size());return t.size();}
 void nodeClose(brook::Vnode* vn){assert(node(vn->backendObject).mount->alive);++node(vn->backendObject).mount->closed;}
 int nodeStat(brook::Vnode* vn,brook::VnodeStat* out){return objectStat(vn->backendObject,out);}

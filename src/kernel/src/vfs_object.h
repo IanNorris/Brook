@@ -4,6 +4,7 @@
 namespace brook {
 struct Vnode;
 struct VnodeStat;
+struct VnodeTime;
 struct VfsObject;
 
 // Backend identity, independent of a file description's flags, offset and
@@ -16,12 +17,28 @@ struct VfsObjectOps {
     int (*stat)(VfsObject*,VnodeStat*);
     int (*access)(VfsObject*,uint8_t required,bool realIds);
     // Exactly one component, no symlink following or mount transitions.
-    int (*lookup)(VfsObject* directory,const char* name,VfsObject**);
-    int (*parent)(VfsObject* directory,VfsObject**);
+    // Match the walk's real/effective-ID selection when rechecking search.
+    int (*lookup)(VfsObject* directory,const char* name,VfsObject**,bool realIds);
+    int (*parent)(VfsObject* directory,VfsObject**,bool realIds);
     int (*readlink)(VfsObject*,char*,uint32_t capacity);
     // Open this exact object, not its name. Creation is a parent operation;
     // truncation remains at the VFS mapping/alias invalidation gate.
     Vnode* (*open)(VfsObject*,int flags,int* error);
+    // Parent operations receive exactly one validated non-dot component.
+    // Creation modes are already masked by the caller's FsContext snapshot;
+    // callbacks must not acquire process/context locks under backend locks.
+    // create exclusively publishes a new regular file and returns its vnode.
+    Vnode* (*create)(VfsObject* parent,const char* name,int flags,uint16_t mode,int* error) = nullptr;
+    int (*mkdir)(VfsObject* parent,const char* name,uint16_t mode) = nullptr;
+    int (*remove)(VfsObject* parent,const char* name,bool directory) = nullptr;
+    int (*rename)(VfsObject* oldParent,const char* oldName,VfsObject* newParent,const char* newName) = nullptr;
+    int (*symlink)(VfsObject* parent,const char* target,const char* name) = nullptr;
+    Vnode* (*create_socket)(VfsObject* parent,const char* name,uint16_t mode,int* error) = nullptr;
+    int (*set_times)(VfsObject*,const VnodeTime*) = nullptr;
+    int (*chmod)(VfsObject*,uint16_t mode) = nullptr;
+    int (*chown)(VfsObject*,uint32_t uid,uint32_t gid) = nullptr;
+    // Reporting only; never re-resolve this name for a subsequent operation.
+    int (*directory_path)(VfsObject*,char* out,uint32_t capacity) = nullptr;
 };
 struct VfsObject {
     const VfsObjectOps* ops;
