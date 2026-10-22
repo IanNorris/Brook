@@ -70,6 +70,8 @@ struct VnodeOps {
     // Resolve a retained directory's current filesystem-relative name.
     // Optional: legacy backends use the canonical opening path instead.
     int (*directory_path)(Vnode* vn, char* out, uint32_t capacity) = nullptr;
+    // Explicit backend policy; default preserves all existing mapping paths.
+    bool deny_mapping = false;
 };
 
 struct Vnode {

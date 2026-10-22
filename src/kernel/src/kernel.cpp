@@ -24,6 +24,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "ramdisk.h"
 #include "fatfs_glue.h"
 #include "vfs.h"
+#include "tmpfs.h"
 #include "virtio_blk.h"
 #include "gpt.h"
 #include "syscall.h"
@@ -450,6 +451,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // ---- Device / VFS layer ----
     brook::BootLogoProgress(35, "Filesystem");
     brook::VfsInit();
+    if(!brook::VfsRegisterFs("tmpfs",brook::TmpfsOperations()))
+        KernelPanic("tmpfs registration failed");
     brook::FatFsVfsRegister();   // register "fatfs" filesystem driver
     brook::Ext2VfsRegister();    // register "ext2" filesystem driver
     brook::ProcFsInit();

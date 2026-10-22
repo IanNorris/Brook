@@ -521,3 +521,14 @@ target_compile_options(test_vfs_paths PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunct
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_link_options(test_vfs_paths PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_vfs_paths PROPERTIES TIMEOUT 20)
+
+add_executable(test_tmpfs "${BROOK_ROOT}/src/tests/test_tmpfs/main.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/file_object.cpp")
+target_link_libraries(test_tmpfs PRIVATE Threads::Threads)
+target_compile_options(test_tmpfs PRIVATE -Wall -Wextra -Werror -Wno-unused-function -UNDEBUG -DBROOK_HOST_TEST
+    -ffunction-sections -fdata-sections -Wno-unused-parameter -Wno-attributes
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_tmpfs PRIVATE -Wl,--gc-sections)
+add_test(NAME test_tmpfs COMMAND test_tmpfs)
+set_tests_properties(test_tmpfs PROPERTIES TIMEOUT 60)

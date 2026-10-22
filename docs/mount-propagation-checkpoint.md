@@ -97,3 +97,6 @@ container-security acceptance are outside this checkpoint.
 The subsequent [fresh-instance foundation](tmpfs-foundation-checkpoint.md) adds
 independent backing publication for a future memory filesystem. It does not
 resolve the tmpfs failure recorded here.
+
+The later [bounded tmpfs backend](tmpfs-checkpoint.md) resolves that tmpfs
+request and advances the identical command to its recursive newroot bind.

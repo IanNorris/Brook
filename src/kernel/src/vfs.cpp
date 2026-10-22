@@ -966,6 +966,7 @@ static MappingPinRegistry g_mappingPins;
 
 int VfsFileMapPin(Vnode* vn)
 {
+    if(vn && vn->ops && vn->ops->deny_mapping)return -95;
     if (g_mappingPins.RetainIfPinned(vn)) return 0;
     FileMutationGuard mutation;
     VnodeStat st;

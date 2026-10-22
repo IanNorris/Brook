@@ -73,6 +73,32 @@ FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t g
     SpinLockRelease(&g_credentialsLock);
     return access;
 }
+FileActorSnapshot ProcessFileActorAcquire(Process* proc,UserNamespace* filesystemOwner,bool realIds) {
+    FileActorSnapshot result{};
+    if(!proc)return result;
+    ProcessOperationGuard operation(ProcessCurrent());
+    SpinLockAcquire(&g_credentialsLock);
+    result.uid=realIds?proc->uid:proc->euid;result.gid=realIds?proc->gid:proc->egid;
+    result.initialNamespace=!proc->userNamespace;
+    if(proc->userNamespace) {
+        const auto& users=proc->userNamespace->users;const auto& groups=proc->userNamespace->groups;
+        if(users.written)result.mappedUid=users.canonical;
+        if(groups.written)result.mappedGid=groups.canonical;
+    }
+    auto actor=UserAuthorityLocked(proc);
+    const unsigned wanted[]={CapChown,CapDacOverride,CapFowner,CapFsetid};
+    for(unsigned cap:wanted)
+        if(UserNamespaceCapable(actor,filesystemOwner,cap))result.capabilities|=uint64_t{1}<<cap;
+    if(realIds) {
+        // Preserve access(real-ID) policy: non-root uses permission bits, not
+        // effective capabilities. Initial real root retains its DAC override.
+        if(!result.initialNamespace || result.uid!=0)result.capabilities=0;
+        else result.capabilities|=uint64_t{1}<<CapDacOverride;
+    }
+    result.groups=proc->groups;
+    if(result.groups)__atomic_fetch_add(&result.groups->references,1,__ATOMIC_RELAXED);
+    SpinLockRelease(&g_credentialsLock);return result;
+}
 int ProcessCheckFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode,
                            uint8_t required, bool realIds) {
     if (required & ~7u) return -22;

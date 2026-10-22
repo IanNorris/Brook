@@ -1,5 +1,6 @@
 #include "process_fs.h"
 #include "mount_namespace.h"
+#include "tmpfs.h"
 #include "process_user_namespace.h"
 #include "unix_lifetime_trace.h"
 #include "file_locks.h"
@@ -4187,6 +4188,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return result;
     };
     auto* vnode=static_cast<Vnode*>(entry->handle);
+    if(vnode->ops->deny_mapping)return -95;
     auto* fileObject=vnode->ops->file_object?vnode->ops->file_object(vnode):nullptr;
     if((flags&MAP_SHARED) && (prot&2) && (!fileObject || !vnode->ops->write))return -95;
     int pin=VfsFileMapPin(vnode);if (pin && pin != -95) return fileFailure("mapping-pin",pin);
@@ -10295,14 +10297,16 @@ static int64_t sys_fchmodat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
 
 // ---------------------------------------------------------------------------
 // sys_chown (92) / sys_fchown (93) / sys_lchown (94) / sys_fchownat (260)
-// — apply ownership changes to ext2 files (root only)
+// — resolve caller IDs, then authorize against the retained backend owner
 // ---------------------------------------------------------------------------
 
 static int64_t ChownAt(int dirfd, uint64_t pathAddr, uint32_t uid, uint32_t gid, uint64_t flags)
 {
     constexpr uint64_t NOFOLLOW=0x100,EMPTY_PATH=0x1000;
     if(flags & ~(NOFOLLOW|EMPTY_PATH))return -EINVAL;
-    Process* proc=ProcessCurrent();if(!proc || !ProcessCapable(proc,nullptr,CapChown))return -EPERM;
+    Process* proc=ProcessCurrent();if(!proc)return -EPERM;
+    if(uid!=0xffffffffu){uid=ProcessResolveId(proc,false,uid);if(uid==UserIdInvalid)return -EINVAL;}
+    if(gid!=0xffffffffu){gid=ProcessResolveId(proc,true,gid);if(gid==UserIdInvalid)return -EINVAL;}
     char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
     if(!path[0]) {
         if(!(flags&EMPTY_PATH))return -ENOENT;
@@ -10332,9 +10336,11 @@ static int64_t sys_fchown(uint64_t fd, uint64_t uid, uint64_t gid,
     if (!proc)return -EBADF;
     FdRef ref(proc, static_cast<int>(fd));
     if (!ref || ref->type==FdType::Path) return -EBADF;
-    if(!ProcessCapable(proc,nullptr,CapChown))return -EPERM;
     if (ref->type != FdType::Vnode) return -95;
-    return VfsChown(static_cast<Vnode*>(ref->handle), static_cast<uint32_t>(uid), static_cast<uint32_t>(gid));
+    uint32_t owner=static_cast<uint32_t>(uid),group=static_cast<uint32_t>(gid);
+    if(owner!=0xffffffffu){owner=ProcessResolveId(proc,false,owner);if(owner==UserIdInvalid)return -EINVAL;}
+    if(group!=0xffffffffu){group=ProcessResolveId(proc,true,group);if(group==UserIdInvalid)return -EINVAL;}
+    return VfsChown(static_cast<Vnode*>(ref->handle),owner,group);
 }
 
 static int64_t sys_lchown(uint64_t pathAddr, uint64_t uid, uint64_t gid,

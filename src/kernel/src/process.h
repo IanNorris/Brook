@@ -652,6 +652,15 @@ struct FileCredentialAccess {
     uint8_t permissions;
 };
 FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode, bool realIds = false);
+// Immutable authority snapshot for filesystem callbacks. Acquire before any
+// backend mutex; groups owns one reference released with ProcessGroupsRelease.
+struct FileActorSnapshot {
+    uint32_t uid=0,gid=0,mappedUid=UserIdInvalid,mappedGid=UserIdInvalid;
+    uint64_t capabilities=0;
+    bool initialNamespace=true;
+    SupplementaryGroups* groups=nullptr;
+};
+FileActorSnapshot ProcessFileActorAcquire(Process*,UserNamespace* filesystemOwner,bool realIds=false);
 // Per-task, inherited on fork/clone and preserved across exec.
 void ProcessSetNoNewPrivs(Process* proc);
 bool ProcessGetNoNewPrivs(Process* proc);

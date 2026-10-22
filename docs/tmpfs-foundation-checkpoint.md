@@ -1,5 +1,9 @@
 # Fresh mount instances and the tmpfs implementation boundary
 
+The subsequent [bounded tmpfs checkpoint](tmpfs-checkpoint.md) implements the
+backend/accounting and explicit mapping-rejection contract identified here.
+The notes below preserve the earlier foundation checkpoint.
+
 This is a mount-instance prerequisite, not a tmpfs implementation. Brook still
 rejects bubblewrap's tmpfs request. The next backend must be implemented and
 accepted before that syscall can return success.

@@ -34,6 +34,18 @@ int main(){using namespace brook;
  assert(!ProcessUserMapWrite(ns,opened,"0 100 1\n",8,true,false));assert(!ProcessSetgroupsAllowed(&child));
  assert(!ProcessChangeIds(&child,false,CredentialChange::Single,0));assert(child.euid==1000);
  assert(!ProcessFileAccess(&child,0,0,0100600).privileged);assert(ProcessCheckFileAccess(&child,0,0,0100600,4)==-13);
+ // Production filesystem authority snapshot owns immutable group storage and
+ // copies maps/capabilities under the same credential publication lock.
+ auto* fileGroups=static_cast<SupplementaryGroups*>(kmalloc(sizeof(SupplementaryGroups)));*fileGroups={1,1,{200}};
+ ProcessGroupsReplace(&child,fileGroups);
+ auto fileActor=ProcessFileActorAcquire(&child,ns);
+ assert(!fileActor.initialNamespace && fileActor.uid==1000 && fileActor.gid==100);
+ assert(fileActor.mappedUid==1000 && fileActor.mappedGid==100 && (fileActor.capabilities&(uint64_t{1}<<CapChown)));
+ assert(fileActor.groups==fileGroups && fileGroups->references==2);
+ ProcessGroupsRelease(fileActor.groups);assert(fileGroups->references==1);
+ auto realActor=ProcessFileActorAcquire(&child,ns,true);assert(!realActor.capabilities);ProcessGroupsRelease(realActor.groups);
+ auto creatorActor=ProcessFileActorAcquire(&parent,ns);assert(creatorActor.initialNamespace && (creatorActor.capabilities&(uint64_t{1}<<CapFowner)));ProcessGroupsRelease(creatorActor.groups);
+ ProcessGroupsReplace(&child,nullptr);
  Process inherited{};InheritCredentials(&inherited,&child);assert(inherited.userNamespace==ns && inherited.capabilities.effective==UserCapabilities);
  char text[80];auto n=ProcessUserMapRead(ns,child.userNamespace,false,false,text,sizeof(text));assert(n==9&&!memcmp(text,"0 1000 1\n",n));
  current=&parent;n=ProcessUserMapRead(ns,parent.userNamespace,false,false,text,sizeof(text));assert(n==9&&!memcmp(text,"0 1000 1\n",n));
