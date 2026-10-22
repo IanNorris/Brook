@@ -174,7 +174,8 @@ int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath
     if(!ns || !source.object || !source.attachment || !target.object || !target.attachment)return -22;
     FileMutationGuard transaction;
     if(!ns->life.Published())return -3;
-    if(ns->initial || VfsVirtual(source))return -95; // legacy initial bind dispatch not integrated yet
+    if(VfsVirtual(source))return -95; // synthetic source roots need explicit legacy reporting support
+    if(ns->initial && !source.object->ops->directory_path)return -95;
     auto* parent=static_cast<MountEntry*>(target.attachment);
     if(parent->owner!=ns || !VfsMountPublished(*parent))return -22;
     if(parent==ns->root && target.object->identity==parent->rootIdentity && target.object->ops==parent->rootObjectOps)return -95;

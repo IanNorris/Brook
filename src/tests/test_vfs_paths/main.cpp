@@ -49,7 +49,13 @@ int objectReadlink(brook::VfsObject* object,char* out,uint32_t size){auto& t=nod
 void nodeClose(brook::Vnode* vn){assert(node(vn->backendObject).mount->alive);++node(vn->backendObject).mount->closed;}
 int nodeStat(brook::Vnode* vn,brook::VnodeStat* out){return objectStat(vn->backendObject,out);}
 int nodeTruncate(brook::Vnode*,uint64_t){return -5;}
-const brook::VnodeOps nodeOps={.open=nullptr,.read=nullptr,.write=nullptr,.readdir=nullptr,.close=nodeClose,.stat=nodeStat,.fsync=nullptr,.truncate=nodeTruncate};
+int nodeReaddir(brook::Vnode* vn,brook::DirEntry* out,uint32_t* cookie) {
+    auto& directory=node(vn->backendObject);assert(directory.dir);
+    auto it=directory.children.begin();for(uint32_t i=0;i<*cookie && it!=directory.children.end();++i)++it;
+    if(it==directory.children.end())return 0;
+    *out={};std::strncpy(out->name,it->first.c_str(),sizeof(out->name)-1);out->isDir=it->second->dir;++*cookie;return 1;
+}
+const brook::VnodeOps nodeOps={.open=nullptr,.read=nullptr,.write=nullptr,.readdir=nodeReaddir,.close=nodeClose,.stat=nodeStat,.fsync=nullptr,.truncate=nodeTruncate};
 brook::Vnode* objectOpen(brook::VfsObject* object,int,int* error){
     *error=0;auto* vn=static_cast<brook::Vnode*>(brook::kmalloc(sizeof(brook::Vnode)));
     if(!vn){*error=-12;return nullptr;}
@@ -119,6 +125,12 @@ const brook::VfsFsOps fsOps={.mount=mountBackend,.unmount=unmountBackend,.open=l
 const brook::VfsFsOps unsupportedOps={.mount=mountBackend,.unmount=unmountBackend,.open=nullptr,.stat_path=nullptr,.lstat_path=nullptr,.unlink=nullptr,.mkdir=nullptr,.rename=nullptr,.symlink=nullptr,.readlink=nullptr,.sync=nullptr};
 brook::VfsPath resolve(const brook::VfsPath& root,const brook::VfsPath& start,const char* text){brook::VfsPath out{};int error=brook::VfsPathResolve(root,start,text,&out);if(error)std::fprintf(stderr,"resolve %s: %d\n",text,error);assert(!error);return out;}
 void expect(const brook::VfsPath& root,const brook::VfsPath& start,const char* text,const brook::VfsPath& expected){auto p=resolve(root,start,text);assert(brook::VfsPathSame(p,expected));brook::VfsPathRelease(p);}
+std::map<std::string,unsigned> directoryEntries(const brook::VfsPath& path) {
+    int error=0;auto* vn=brook::VfsPathOpen(path,brook::VFS_O_READ,&error);assert(vn&&!error);
+    std::map<std::string,unsigned> result;uint32_t cookie=0;brook::DirEntry entry{};int status;
+    while((status=brook::VfsReaddir(vn,&entry,&cookie))>0) {assert(cookie<1000);++result[entry.name];}
+    assert(!status);brook::VfsClose(vn);return result;
+}
 }
 namespace brook {
 bool ModuleRetainAddresses(const uintptr_t* addresses,uint32_t count){assert(addresses&&count);++providerCalls;return !rejectProvider;}
@@ -438,6 +450,8 @@ int main(){
     assert(!VfsMountNamespaceCopy(initial,stableRoot,originalSynthetic,&parentNs,&parentRoot,&parentCwd));
     assert(VfsMountNamespaceBind(parentNs,aPath,parentCwd)==-3);
     assert(VfsMountNamespaceActivate(parentNs));
+    assert(VfsMountNamespaceCount(parentNs)==VfsMountNamespaceCount(initial));
+    assert(directoryEntries(parentRoot)["synthetic"]==1);
     // Backend names are shared: rename through a copied attachment must also
     // update initial legacy dispatch, and an initial rename must update copies.
     assert(!VfsRenameAt(parentRoot,parentRoot,"rename-tree",parentRoot,"renamed-tree"));
@@ -455,6 +469,12 @@ int main(){
     assert(parentSyntheticUp.attachment==parentRoot.attachment);VfsPathRelease(parentSyntheticUp);VfsPathRelease(parentSynthetic);
     auto parentTarget=resolve(parentRoot,parentRoot,"/ns-target");
     assert(!VfsMountNamespaceBind(parentNs,aPath,parentTarget));
+    bool brokerAllowed=false;
+    assert(!VfsPathBrokerAllowed(parentRoot,"/ns-target/missing-synthetic-tail",&brokerAllowed)&&!brokerAllowed);
+    assert(!VfsPathBrokerAllowed(parentRoot,"/ns-b/missing-synthetic-tail",&brokerAllowed)&&brokerAllowed);
+    assert(!VfsPathBrokerAllowed(stableRoot,"/ns-target/missing-synthetic-tail",&brokerAllowed)&&brokerAllowed);
+    assert(VfsMountNamespaceCount(parentNs)==VfsMountNamespaceCount(initial)+1);
+    assert(directoryEntries(parentRoot)["ns-target"]==1); // no duplicate physical mountpoint
     auto inode=[&](const VfsPath& rootPath,const VfsPath& start,const char* name,uint64_t expected) {
         auto path=resolve(rootPath,start,name);VnodeStat st{};assert(!VfsPathStat(path,&st)&&st.ino==expected);VfsPathRelease(path);
     };
@@ -484,6 +504,15 @@ int main(){
     MountNamespace* childNs=nullptr;VfsPath childRoot{},childCwd{};
     assert(!VfsMountNamespaceCopy(parentNs,parentRoot,parentTarget,&childNs,&childRoot,&childCwd));
     assert(VfsMountNamespaceActivate(childNs));
+    assert(VfsMountNamespaceCount(childNs)==VfsMountNamespaceCount(parentNs));
+    auto childSynthetic=resolve(childRoot,childRoot,"/synthetic");
+    auto childSyntheticLeaf=resolve(childRoot,childRoot,"/synthetic/deep/mount");
+    assert(directoryEntries(childSynthetic)["deep"]==1);
+    assert(!VfsMountNamespaceDetach(childNs,childSyntheticLeaf));VfsPathRelease(childSyntheticLeaf);
+    assert(!directoryEntries(childRoot).count("synthetic"));
+    assert(directoryEntries(stableRoot)["synthetic"]==1 && directoryEntries(parentRoot)["synthetic"]==1);
+    assert(directoryEntries(childSynthetic).empty());VfsPathRelease(childSynthetic);
+    assert(VfsMountNamespaceCount(childNs)+1==VfsMountNamespaceCount(parentNs));
     auto parentBound=resolve(parentRoot,parentRoot,"/ns-target");
     assert(!VfsMountNamespaceBind(parentNs,bPath,parentBound));VfsPathRelease(parentBound);
     inode(childRoot,childRoot,"/ns-target/value",101);inode(parentRoot,parentRoot,"/ns-target/value",201);
@@ -520,6 +549,20 @@ int main(){
     VfsPathRelease(parentTarget);VfsPathRelease(parentCwd);VfsPathRelease(parentRoot);
     VfsMountNamespaceLeave(childNs);VfsDrainMountCleanup();VfsMountNamespaceRelease(childNs);
     VfsPathRelease(childCwd);VfsPathRelease(childRoot);VfsDrainMountCleanup();
+    // Initial namespace binds must preserve legacy kernel/driver dispatch:
+    // visible suffixes are relative to the arbitrary bind root, not FS root.
+    assert(!VfsMountNamespaceBind(initial,aPath,originalTarget));
+    auto* legacyBind=VfsOpen("/ns-target/value");assert(legacyBind);
+    VnodeStat legacyBoundStat{};assert(!VfsStat(legacyBind,&legacyBoundStat)&&legacyBoundStat.ino==101);VfsClose(legacyBind);
+    assert(!VfsStatPath("/ns-target/value",&legacyBoundStat)&&legacyBoundStat.ino==101);
+    auto initialBound=resolve(stableRoot,stableRoot,"/ns-target");
+    auto initialSub=resolve(stableRoot,initialBound,"sub");
+    assert(!VfsMountNamespaceBind(initial,bPath,initialSub));VfsPathRelease(initialSub);
+    legacyBind=VfsOpen("/ns-target/sub/value");assert(legacyBind);
+    assert(!VfsStat(legacyBind,&legacyBoundStat)&&legacyBoundStat.ino==201);VfsClose(legacyBind);
+    assert(!VfsMountNamespaceDetach(initial,initialBound));
+    assert(!VfsStatPath("/ns-target/value",&legacyBoundStat)&&legacyBoundStat.ino==301);
+    VfsPathRelease(initialBound);VfsDrainMountCleanup();
     VfsPathRelease(originalSynthetic);VfsPathRelease(originalTarget);VfsPathRelease(aPath);VfsPathRelease(bPath);
     assert(VfsUnmount("/synthetic/deep/mount"));VfsMountNamespaceRelease(initial);
     assert(VfsUnmount("/rename-tree/slot"));

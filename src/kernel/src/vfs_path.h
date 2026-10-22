@@ -10,6 +10,10 @@ void VfsPathRetain(const VfsPath& path);
 void VfsPathRelease(VfsPath path);
 bool VfsPathSame(const VfsPath& a,const VfsPath& b);
 int VfsPathRoot(VfsPath* out);
+// Synthetic syscall brokers may serve only paths whose retained ancestry has
+// not crossed a directory bind. Missing synthetic tails are permitted; a bind
+// must mask broker entries just as it masks ordinary backing entries.
+int VfsPathBrokerAllowed(const VfsPath& root,const char* absolute,bool* allowed);
 // The caller retains vnode through acquisition (e.g. an FD snapshot).
 int VfsPathFromVnode(Vnode* vnode,VfsPath* out);
 // root/start are borrowed live references. Absolute paths restart at root;

@@ -1,9 +1,10 @@
 # SteamRT container feasibility gate
 
-Status (2026-10-22): the feasibility investigation and retained-filesystem
-foundation are accepted. The user has now authorized the bounded mount-namespace
-checkpoint below. User namespaces and the remaining SteamRT container integration
-remain outside this phase. There is no Brook login acceptance.
+Status (2026-10-22): the bounded mount-namespace checkpoint is accepted after
+source review, Linux differential probes and native regression/teardown checks.
+The latest checkpoint is described at the end of this document. User namespaces
+and remaining SteamRT integration are separate phases. There is no Brook login
+acceptance.
 
 The accepted baseline is `3bfc275e` (ABI 39), including retained filesystem
 contexts at `e626b7f8`, retained proc-root links and real per-task no_new_privs.
@@ -29,9 +30,11 @@ point → run → pressure-vessel-unruntime → pressure-vessel-wrap. SDK and cu
 runtime options retain this chain. Astra's script review finds no supported
 native64 non-container route. The legacy STEAM_RUNTIME=0 branch is not one.
 
-## Current implementation boundaries
+## Historical feasibility boundaries
 
-These are source observations, not an exhaustive trace of Steam's requirements.
+These are pre-foundation source observations, not the current implementation
+status or an exhaustive trace of Steam's requirements. Later checkpoints below
+supersede the process-root, privilege-ceiling and mount-namespace rows.
 
 | Area | Current state | Required acceptance before claiming support |
 | --- | --- | --- |
@@ -505,3 +508,103 @@ This is still an intermediate checkpoint within the active goal. CLONE_NEWNS
 continues to fail honestly; privileged bind/detach syscall dispatch, initial
 arbitrary-bind legacy dispatch, namespace-aware root enumeration and proc mount
 reporting, and native namespace isolation/exec/teardown acceptance remain.
+
+
+## Privileged namespace syscall checkpoint (ABI 40)
+
+The earlier “still incomplete” notes describe intermediate commits. The final
+slice adds privileged fork-style `clone(CLONE_NEWNS | SIGCHLD)` and equivalent
+`clone3`, directory `mount(..., MS_BIND, ...)`, and subtree
+`umount2(..., MNT_DETACH)`. Initial administrative authority is numeric euid 0;
+namespace creation grants no privilege. Child root/cwd and topology are copied
+before scheduler publication. Exec preserves membership, and logical task exit
+retires publication independently of storage retained by zombies, snapshots or
+open objects. The foundation is committed in `9a7e32ea` and `21f89df2`.
+
+NEWNS accepts only the fork-style flags above. Shared FS/VM, threads, vfork,
+TLS/TID/pidfd flags, CLEAR_SIGHAND and other namespace domains are rejected.
+The supported clone3 path validates extension bytes, exit signal, unsupported
+fields and stack arithmetic. Mount dispatch accepts exactly MS_BIND or
+MNT_DETACH respectively. Recursive binds, remount, propagation, arbitrary file
+binds, replacing/detaching the namespace root, virtual source binds, unshare,
+pivot_root and tmpfs are outside this slice. Unsupported requests fail rather
+than succeeding without their requested semantics.
+
+Initial-namespace legacy driver callbacks project a bind's suffix onto its
+retained physical source, including after supported source rename. Directory
+enumeration uses the vnode's exact attachment/object to include direct synthetic
+mount children without duplicating physical mountpoints. `/proc/mounts` snapshots
+the caller's namespace storage; each metadata copy is safe, but a concurrent
+mutation can make the whole count/index report non-atomic. Name-based synthetic
+brokers are suppressed below a bind so they cannot bypass its topology. This is
+not a replacement of every broker with an identity-backed filesystem. The
+unbound-root fast path needs separate review before future chroot/root-replacement
+support. Backing file data remains shared; namespace copying is not a snapshot.
+
+### Completion audit and limits
+
+- Ownership, lookup authority and teardown: process-owned namespace references,
+  independent member tokens, retained backing/attachment paths and deferred
+  destruction replace the global eight-slot authority. The initial namespace
+  still serves legacy kernel/driver callers. Host tests exercise final-release
+  races and actual scheduler birth/termination bodies with lock assertions.
+- Failure rollback: allocation injection covers prepared topology, retained
+  rename and context replacement; the child's inherited state survives failed
+  isolation. Unsupported ancestry fails before backend rename. Existing Ext2
+  OOM-to-ENOENT propagation remains explicitly backlogged.
+- Isolation and object semantics: the comprehensive differential probe covers
+  parent/sibling visibility, ordinary fork and exec, both NEWNS clone forms,
+  foreign covered cwd/dirfds, nested detach, root dotdot clamping, bind masking
+  of `/proc/version`, parallel mutation and owner exit while a follower retains
+  foreign objects. Overlapping workers do not prove specific syscall
+  interleavings. These are retained-reference semantics, not a claim that a
+  preexisting foreign dirfd is confined to the caller's new topology.
+- Privilege/argument behavior: native root tests include setuid denial; a
+  separate UID-1000 job checks NEWNS, bind and detach EPERM. Linux comparison
+  uses a single-UID user-namespace fixture only to acquire mount authority;
+  its privilege-denial case runs separately outside that fixture.
+- Component/regression acceptance: all 97 host tests pass together. Affected
+  VFS, Ext2, FAT and VMM tests pass ASan/UBSan. Kernel and all 13 ABI-40 modules
+  build; compiled entry and scheduler-start audits plus mutation checks pass.
+  The same frozen kernel passes nine native filesystem/credentials/IPC jobs,
+  normal Mousepad UI launch/render/close and heap integrity. All tracked jobs
+  finish with zero live tasks. The original native wrapper exits zero after
+  checked sync/shutdown, and all four offline filesystems check clean.
+
+Frozen kernel SHA256:
+`351d0fe314dd7a515073955cf99c5a2b26657b14db06a0b7f41e18f38809407c`.
+Primary evidence is under `build/workloads/mount-namespace-20261022/dispatch`
+and `build/reviews/mount-dispatch-off-gpu-1ms-fixed-mlfq-a-20261022`.
+The comprehensive v1 native probe passed. Review then tightened the probe to
+require successful mount-report EOF and assert the previously printed Linux
+foreign-dirfd/detach observations. Exact v2 passes Linux, including a separate
+unprivileged service; both original services are inactive with MainPID 0 and
+success. Linux shutdown and offline fsck pass. Final v2 native acceptance passes on fresh checked copies and the identical
+frozen kernel. Session `df37e0cbb4b44f6f8d2df12881bf5535` completes both root and
+UID-1000 jobs with zero live tasks; heap integrity, checked shutdown, original
+wrapper exit zero and all four offline filesystem checks pass. Its review is
+`build/reviews/mount-acceptance-off-gpu-1ms-fixed-mlfq-a-20261022`; exact probe
+binary/source hashes are in `dispatch/comprehensive-probe-v2-manifest.json`.
+The nine regression jobs and Mousepad acceptance were on the first dispatch
+review with the identical kernel; only the user-space probe changed afterward. Probe counters are cumulative/inherited, not independent
+checks to sum. Astra found no remaining source-review blocker; the final run and disk checks
+satisfy its remaining acceptance conditions.
+
+### Recommended next phases and estimate
+
+This removes a substantial VFS ownership prerequisite but does not make
+pressure-vessel usable. The next bounded goal should be user-namespace ownership,
+UID/GID mapping and scoped privilege checks, with Linux differential tests for
+mapping restrictions, inheritance, credential transitions and last-reference
+cleanup. Keep unprivileged mount authority unavailable until those invariants
+are implemented and tested together. This is another architectural phase of
+several focused implementation/test iterations, not a few syscall stubs.
+
+A subsequent mount/runtime phase should use the retained launcher trace to
+choose recursive bind, propagation and root-transition operations, implement
+only required semantics, and first run an unchanged bubblewrap trivial child.
+Then rerun pressure-vessel to discover the next genuine dependency before
+promising a Steam QR login. Plan for at least these two further bounded phases;
+exact elapsed time or a login date is not supported by the current evidence.
+PID/network namespaces, seccomp, full capability compatibility and multilib
+remain separate unless the real launch trace establishes them as mandatory.

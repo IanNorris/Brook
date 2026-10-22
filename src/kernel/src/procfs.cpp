@@ -1,4 +1,5 @@
 #include "process_fs.h"
+#include "mount_namespace.h"
 #include "spinlock.h"
 #include "vfs_object.h"
 #include "apic.h"
@@ -1046,15 +1047,21 @@ static Vnode* GenModules()
 
 static Vnode* GenMounts()
 {
-    uint32_t maxSlots = VfsMountMaxSlots();
+    FsSnapshot fs{};auto* process=ProcessCurrent();
+    int error=ProcessFsSnapshot(process,&fs);
+    if(error && process && !process->isKernelThread)return nullptr;
+    auto* ns=error?VfsMountNamespaceInitial():fs.mountNamespace;
+    fs.mountNamespace=nullptr;FsSnapshotRelease(&fs);
+    uint32_t maxSlots = VfsMountNamespaceCount(ns);
+    if(maxSlots>(~uint32_t{0}-128)/128) {VfsMountNamespaceRelease(ns);return nullptr;}
     uint32_t bufSize = 128 + maxSlots * 128;
     auto* buf = static_cast<char*>(kmalloc(bufSize));
-    if (!buf) return nullptr;
+    if (!buf) {VfsMountNamespaceRelease(ns);return nullptr;}
 
     char* p = buf;
     for (uint32_t i = 0; i < maxSlots; ++i)
     {
-        VfsMountSnapshot snap = VfsMountSnapshotAt(i);
+        VfsMountSnapshot snap = VfsMountNamespaceSnapshotAt(ns,i);
         if (!snap.used) continue;
         if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
         // Linux format: device mountpoint type options dump pass
@@ -1066,6 +1073,7 @@ static Vnode* GenMounts()
         p = AppendStr(p, " rw 0 0\n");
     }
     *p = '\0';
+    VfsMountNamespaceRelease(ns);
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 

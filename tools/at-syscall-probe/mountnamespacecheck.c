@@ -62,6 +62,9 @@ int main(int argc,char **argv) {
         ck(value(AT_FDCWD,name)=='A',"parent overmount does not change child absolute lookup");
         int foreign=value(parentfd,"target/value");
         printf("DISCOVERY foreign-parent-dirfd-after-parent-bind=%d (%c)\n",foreign,foreign>0?foreign:'?');
+#ifdef MOUNTNS_ACCEPTANCE
+        ck(foreign=='B',"foreign parent dirfd follows original namespace's bind");
+#endif
         ck(value(oldfd,"value")=='T',"old target dirfd remains exact after both binds");
         joinpath(name,target,"sub");ck(!mount(b,name,NULL,MS_BIND,NULL),"nested child bind");
         ck(value(bound,"sub/value")=='B',"nested mount visible through held bind root");
@@ -70,11 +73,18 @@ int main(int argc,char **argv) {
         joinpath(name,target,"value");
         ck(value(AT_FDCWD,name)=='T',"fresh child absolute lookup returns covered tree");
         ck(value(bound,"value")=='A',"detached root dirfd retains bound backing");
-        printf("DISCOVERY detached-root-dirfd-nested-mount-value=%d\n",value(bound,"sub/value"));
+        int detached_nested=value(bound,"sub/value");
+        printf("DISCOVERY detached-root-dirfd-nested-mount-value=%d\n",detached_nested);
+#ifdef MOUNTNS_ACCEPTANCE
+        ck(detached_nested==-ENOENT,"detached root no longer traverses former nested mount");
+#endif
         ck(value(nested,"value")=='B',"exact nested bind handle survives recursive detach");
         close(nested);
         up=openat(bound,"..",O_RDONLY|O_DIRECTORY);ck(up>=0,"detached root dotdot opens");
         printf("DISCOVERY detached-dotdot-is-root=%d detached-dotdot-is-former-parent=%d\n",same(up,bound),same(up,parentfd));
+#ifdef MOUNTNS_ACCEPTANCE
+        ck(same(up,bound)&&!same(up,parentfd),"detached root dotdot identity clamps");
+#endif
         close(up);close(bound);close(oldfd);close(parentfd);
         printf("MOUNTNS CHILD PASS checks=%d\n",count);_exit(0);
     }

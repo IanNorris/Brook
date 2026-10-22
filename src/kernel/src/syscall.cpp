@@ -1,4 +1,5 @@
 #include "process_fs.h"
+#include "mount_namespace.h"
 #include "unix_lifetime_trace.h"
 #include "file_locks.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
@@ -3085,7 +3086,8 @@ struct AtLookup {
     int SyntheticName(const char* text,char* out,uint32_t capacity) const {
         if(text[0]=='/') {
             size_t bytes=strlen(text)+1;if(bytes>capacity)return -36;
-            memcpy(out,text,bytes);return 0;
+            memcpy(out,text,bytes);bool allowed=false;
+            int error=VfsPathBrokerAllowed(fs.root,out,&allowed);return error?error:allowed?0:-95;
         }
         char parent[512];int error=VfsPathDirectoryPath(start(),parent,sizeof(parent));
         if(error)return error;
@@ -3096,7 +3098,8 @@ struct AtLookup {
         bool slash=prefix && parent[prefix-1]!='/';
         if(prefix+slash+suffix>=capacity)return -36;
         memcpy(out,parent,prefix);if(slash)out[prefix++]='/';
-        memcpy(out+prefix,text,suffix+1);return 0;
+        memcpy(out+prefix,text,suffix+1);bool allowed=false;
+        error=VfsPathBrokerAllowed(fs.root,out,&allowed);return error?error:allowed?0:-95;
     }
     AtLookup()=default;AtLookup(const AtLookup&)=delete;AtLookup& operator=(const AtLookup&)=delete;
 };
@@ -4582,14 +4585,20 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
     static constexpr uint64_t CLONE_CHILD_CLEARTID  = 0x00200000;
     static constexpr uint64_t CLONE_VFORK           = 0x00004000;
     static constexpr uint64_t CLONE_CLEAR_SIGHAND   = 0x100000000ULL;
+    static constexpr uint64_t CLONE_NEWNS           = 0x00020000ULL;
 
-    // Namespace requests must not fall through to an ordinary global-namespace
-    // fork. None of these isolation domains has an implementation yet.
-    constexpr uint64_t unsupportedNamespaces=0x00020000ULL|0x02000000ULL|0x04000000ULL|
+    // Other isolation domains must not fall through to an ordinary fork.
+    constexpr uint64_t unsupportedNamespaces=0x02000000ULL|0x04000000ULL|
                                            0x08000000ULL|0x10000000ULL|0x20000000ULL|0x40000000ULL;
     if(flags&unsupportedNamespaces)return -EINVAL;
     Process* parent = ProcessCurrent();
     if (!parent) return -ENOSYS;
+    if(flags&CLONE_NEWNS) {
+        // Bounded fork-style namespace creation. Do not silently ignore shared
+        // VM/FS/thread, tid, pidfd, TLS, vfork or unknown requested semantics.
+        if((flags&~(CLONE_NEWNS|uint64_t{0xff})) || (flags&0xff)!=17)return -EINVAL;
+        if(parent->euid!=0)return -EPERM;
+    }
 
     if ((flags & CLONE_THREAD) && (flags & CLONE_PARENT_SETTID) &&
         !UserBufferWritable(parentTidAddr, sizeof(int32_t))) return -EFAULT;
@@ -4622,6 +4631,9 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
         if (!child) return -ENOMEM;
     }
 
+    if(flags&CLONE_NEWNS) {
+        if(int error=ProcessFsIsolateMounts(child)) {ProcessDiscardUnpublished(child);return error;}
+    }
     if (int error=SysvSemClone(parent,child,(flags & 0x00040000)!=0)) {
         SysvSemExit(child);
         ProcessDiscardUnpublished(child);
@@ -4708,7 +4720,9 @@ static int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
     if (!UserBufferReadable(argsPtr, size))
         return -EFAULT;
 
-    const CloneArgs* ca = reinterpret_cast<const CloneArgs*>(argsPtr);
+    CloneArgs copied{};
+    __builtin_memcpy(&copied,reinterpret_cast<const void*>(argsPtr),size<sizeof(copied)?size:sizeof(copied));
+    const CloneArgs* ca = &copied;
     const uint64_t cloneFlags=ca->flags;
     // CLONE_NEWTIME occupies an exit-signal bit in legacy clone, but it is an
     // independent unsupported namespace request in clone3.
@@ -4721,6 +4735,13 @@ static int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
 
     // Delegate to sys_clone with the same argument layout:
     //   flags, newStack, parentTidAddr, childTidAddr, tlsAddr
+    if(cloneFlags&0x00020000) {
+        for(uint64_t i=sizeof(CloneArgs);i<size;++i)
+            if(reinterpret_cast<const uint8_t*>(argsPtr)[i])return -E2BIG;
+        if((cloneFlags&0xff) || ca->exit_signal!=17 || ca->pidfd || ca->set_tid || ca->set_tid_size || ca->cgroup)return -EINVAL;
+        if(ca->stack && ca->stack_size>~uint64_t{0}-ca->stack)return -EINVAL;
+        return sys_clone(cloneFlags|ca->exit_signal,stackTop,ca->parent_tid,ca->child_tid,ca->tls,0);
+    }
     return sys_clone(cloneFlags, stackTop, ca->parent_tid, ca->child_tid, ca->tls, 0);
 }
 
@@ -7696,8 +7717,9 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 {
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
-    FdEntry* fde = FdGet(proc, static_cast<int>(fd));
-    if (!fde) return -EBADF;
+    FdRef pinned(proc,static_cast<int>(fd));
+    if(!pinned)return -EBADF;
+    FdEntry* fde=pinned.get();
 
     // Synthetic /dev/dri directory (GL shim M0): list ".", "..", "renderD128"
     // so libdrm's drmGetDevices2 can discover the render node.
@@ -7733,29 +7755,13 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     auto* buf = reinterpret_cast<uint8_t*>(bufAddr);
     uint64_t pos = 0;
     uint32_t cookie = static_cast<uint32_t>(fde->seekPos);
-    bool rootDir = fde->dirPath[0] == '/' && fde->dirPath[1] == '\0';
-    uint32_t rootMountCount = rootDir ? VfsRootMountCount() : 0;
 
     DirEntry de; de.name[0] = 0; de.size = 0; de.isDir = false;
     while (pos < count) {
         uint32_t nextCookie = cookie;
-        if (rootDir && cookie < rootMountCount)
-        {
-            if (!VfsRootMountNameAt(cookie, de.name, sizeof(de.name)))
-            {
-                ++cookie;
-                continue;
-            }
-            de.size = 0;
-            de.isDir = true;
-        }
-        else
-        {
-            uint32_t fsCookie = rootDir ? (cookie - rootMountCount) : cookie;
-            int ret = VfsReaddir(vn, &de, &fsCookie);
-            if (ret <= 0) break;
-            nextCookie = rootDir ? (fsCookie + rootMountCount) : fsCookie;
-        }
+        int ret=VfsReaddir(vn,&de,&nextCookie);
+        if(ret<0) {if(!pos)return ret;break;}
+        if(!ret)break;
 
         uint64_t nameLen = 0;
         while (de.name[nameLen] && nameLen < 255) ++nameLen;
@@ -7780,8 +7786,6 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
             ent->d_name[i] = '\0';
 
         pos += reclen;
-        if (rootDir && cookie < rootMountCount)
-            ++cookie;
     }
 
     fde->seekPos = cookie;
@@ -7793,6 +7797,7 @@ static int64_t sys_sync(uint64_t, uint64_t, uint64_t,
 {
     return VfsSync(nullptr);
 }
+#include "syscall_mount_namespace.inc"
 
 static int64_t sys_fsync(uint64_t fd, uint64_t, uint64_t,
                          uint64_t, uint64_t, uint64_t)
@@ -13993,6 +13998,8 @@ void SyscallTableInit()
     g_syscallTable[SYS_FSYNC]           = sys_fsync;
     g_syscallTable[SYS_FDATASYNC]       = sys_fsync;
     g_syscallTable[SYS_SYNC]            = sys_sync;
+    g_syscallTable[SYS_MOUNT]           = sys_mount;
+    g_syscallTable[SYS_UMOUNT2]         = sys_umount2;
     g_syscallTable[SYS_GETCWD]          = sys_getcwd;
     g_syscallTable[SYS_GETTIMEOFDAY]    = sys_gettimeofday;
     g_syscallTable[SYS_TIME]             = sys_time;

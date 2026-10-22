@@ -1523,3 +1523,9 @@ each probe's argument parser.
   after failures and cover successful retries; they do not establish exact
   Linux errno equivalence for every allocation site. Evidence:
   `build/workloads/mount-namespace-20261022/attachments/rename-failure-test.log`.
+
+- Ordinary clone CLEAR_SIGHAND semantics: source review found the existing path
+  resets ignored dispositions as well as caught handlers. Linux preserves
+  SIG_IGN. Add a differential signal-disposition probe and correct the ordinary
+  clone path in a separate change. The bounded mount-namespace path rejects
+  CLEAR_SIGHAND, so it does not advertise this unsupported combination.

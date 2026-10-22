@@ -326,6 +326,37 @@ int VfsPathResolve(const VfsPath& root,const VfsPath& start,const char* text,Vfs
     if(error)return error;
     VfsPathRelease(result.parent);*out=result.object;return 0;
 }
+int VfsPathBrokerAllowed(const VfsPath& root,const char* absolute,bool* allowed)
+{
+    if(!allowed)return -22;
+    *allowed=false;if(!root.attachment || !root.object || !absolute || absolute[0]!='/')return -22;
+    FileMutationGuard lookup(false);auto* rootMount=static_cast<MountEntry*>(root.attachment);
+    if(!VfsMountPublished(*rootMount) || rootMount->rootObject)return 0;
+    bool hasBind=false;
+    for(const auto& mount:g_mounts)
+        if(VfsMountPublished(mount) && mount.owner==rootMount->owner && mount.rootObject) {hasBind=true;break;}
+    if(!hasBind) {*allowed=true;return 0;} // unchanged initial/copied topology
+    char prefix[512];uint32_t length=StrLen(absolute);if(length>=sizeof(prefix))return -36;
+    StrCopy(prefix,absolute,sizeof(prefix));
+    // Broker files can have entirely synthetic tails. Walk each existing
+    // prefix by identity; only stop at a genuinely absent component. No name
+    // is used to dispatch an ordinary filesystem operation afterward.
+    for(uint32_t end=1;end<=length;++end) {
+        if(prefix[end]!='/' && prefix[end])continue;
+        char saved=prefix[end];prefix[end]=0;
+        VfsRetainedProvider provider;RetainedWalkResult<VfsPath> result{};
+        int error=WalkRetainedPath(root,root,prefix,&result,provider);
+        prefix[end]=saved;
+        if(error) {
+            if(error==-2 || (!saved && error==-95)) {*allowed=true;return 0;}
+            return error;
+        }
+        bool bound=static_cast<MountEntry*>(result.object.attachment)->rootObject!=nullptr;
+        VfsPathRelease(result.object);VfsPathRelease(result.parent);
+        if(bound)return 0;
+    }
+    *allowed=true;return 0;
+}
 int VfsPathStat(const VfsPath& path,VnodeStat* out)
 {
     if(!out)return -22;
