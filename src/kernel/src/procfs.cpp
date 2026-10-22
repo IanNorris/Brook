@@ -251,6 +251,7 @@ static Vnode* MakeProcVnode(char* data, uint32_t size, bool isDir = false, Vnode
     auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
     if (!vn) { kfree(data); kfree(pp); return nullptr; }
     vn->directoryPath = nullptr;
+    vn->mountOwner = nullptr;
     vn->ops = ops ? ops : &g_procFileOps;
     vn->type = isDir ? VnodeType::Dir : VnodeType::File;
     vn->priv = pp;

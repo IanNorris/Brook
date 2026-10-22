@@ -102,9 +102,18 @@ struct MountEntry {
     void*            mountPriv;   // filesystem-private mount data
     uint8_t          pdrv;        // physical drive (for block FS)
     bool             used;
+    uint64_t         vnodeHolds;
 };
 
 static MountEntry g_mounts[VFS_MAX_MOUNTS];
+
+// Called under the namespace lock before a newly opened vnode is published.
+// Final close drops the hold only after the backend has finished using it.
+static void VfsAttachMount(Vnode* vnode, MountEntry* mount)
+{
+    vnode->mountOwner=mount;
+    __atomic_fetch_add(&mount->vnodeHolds,uint64_t{1},__ATOMIC_RELAXED);
+}
 
 // ---- String helpers ----
 
@@ -279,6 +288,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
     slot->fsOps      = ops;
     slot->mountPriv  = priv;
     slot->pdrv       = pdrv;
+    slot->vnodeHolds = 0;
     slot->used       = true;
     StrCopy(slot->mountPoint, mountPoint, sizeof(slot->mountPoint));
     StrCopy(slot->fsType, fsName, sizeof(slot->fsType));
@@ -295,6 +305,10 @@ bool VfsUnmount(const char* mountPoint)
     {
         if (!g_mounts[i].used) continue;
         if (!StrEq(g_mounts[i].mountPoint, mountPoint)) continue;
+
+        // Backend-specific busy checks are additional policy, not substitutes
+        // for the VFS ownership of directories, metadata and procfs handles.
+        if (__atomic_load_n(&g_mounts[i].vnodeHolds,__ATOMIC_ACQUIRE)) return false;
 
         if (g_mounts[i].fsOps && g_mounts[i].fsOps->can_unmount &&
             !g_mounts[i].fsOps->can_unmount(g_mounts[i].mountPriv))
@@ -436,6 +450,7 @@ int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t 
         mount->fsOps->open_mode ? mount->fsOps->open_mode(mount->mountPriv,mount->pdrv,relative,VFS_O_EXEC,0666) :
         mount->fsOps->open ? mount->fsOps->open(mount->mountPriv,mount->pdrv,relative,VFS_O_EXEC) : nullptr;
     if (!opened) return error?error:-2;
+    VfsAttachMount(opened,mount);
     if (opened->type==VnodeType::Dir) { VfsClose(opened);return -13; }
     *vnode=opened;return 0;
 }
@@ -501,6 +516,7 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
         vn = mount->fsOps->open_mode(mount->mountPriv, mount->pdrv, relPath, openFlags, mode);
     else if (mount->fsOps->open)
         vn = mount->fsOps->open(mount->mountPriv, mount->pdrv, relPath, openFlags);
+    if (vn) VfsAttachMount(vn,mount);
     if (vn && (flags & VFS_O_TRUNC)) {
         int result = VfsTruncateLocked(vn, 0);
         if (result) {
@@ -530,9 +546,10 @@ int VfsDirectoryPath(Vnode* vn,char* out,uint32_t capacity)
     const char* path=vn->directoryPath;
     char current[512];
     if(vn->ops && vn->ops->directory_path) {
-        const char* ignored=nullptr;
-        MountEntry* mount=FindMount(path,&ignored);
-        if(!mount)return -2;
+        // The opening name can now resolve through a different overmount.
+        // The retained mount, not that name, owns this backend directory.
+        auto* mount=static_cast<MountEntry*>(vn->mountOwner);
+        if(!mount || !mount->used)return -9;
         int error=vn->ops->directory_path(vn,current,sizeof(current));
         if(error)return error;
         const uint32_t prefix=StrLen(mount->mountPoint),relative=StrLen(current);
@@ -832,6 +849,7 @@ Vnode* VfsCreateSocket(const char* path, uint16_t mode, int* error)
     if (!mount->fsOps->create_socket) { *error = -95; return nullptr; }
     Vnode* node = mount->fsOps->create_socket(mount->mountPriv, mount->pdrv,
                                              relative, mode, error);
+    if (node) VfsAttachMount(node,mount);
     if (*error == -17) *error = -98;
     if (!node && !*error) *error = -5;
     return node;
@@ -887,9 +905,17 @@ int VfsReadlink(const char* path,char* buf,uint64_t bufsiz)
 void VfsClose(Vnode* vn)
 {
     if (!vn) return;
+    auto* mount=static_cast<MountEntry*>(vn->mountOwner);
     if (vn->ops && vn->ops->close) vn->ops->close(vn);
     kfree(vn->directoryPath);
     kfree(vn);
+    if (mount) __atomic_fetch_sub(&mount->vnodeHolds,uint64_t{1},__ATOMIC_RELEASE);
+}
+
+void VfsRelease(Vnode* vn)
+{
+    if (vn && __atomic_fetch_sub(&vn->refCount,uint32_t{1},__ATOMIC_ACQ_REL)==1)
+        VfsClose(vn);
 }
 
 } // namespace brook

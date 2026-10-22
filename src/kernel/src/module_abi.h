@@ -57,7 +57,8 @@ namespace brook {
 // ABI 32 appends validated Venus DMA-BUF image import to GpuAppOps.
 // ABI 33 appends fixed-point source / buffer-transform flags to GpuSceneLayer.
 // ABI 34 versions SchedOps and adds measured-service/runnable/preemption hooks.
-static constexpr uint32_t MODULE_ABI_VERSION = 34;
+// ABI 35 adds retained VFS mount ownership to Vnode.
+static constexpr uint32_t MODULE_ABI_VERSION = 35;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

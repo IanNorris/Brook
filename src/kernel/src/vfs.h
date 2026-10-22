@@ -78,15 +78,23 @@ struct Vnode {
     uint32_t        refCount; // reference count for fork/dup sharing
     uint64_t        cacheId;  // global file identity for page cache; 0 disables caching (not st_ino)
     char*           directoryPath = nullptr; // owned canonical opening path; immutable until final close
+    // Opaque retained initial-namespace mount instance. Set by VFS dispatch,
+    // not by a backend. Its hold prevents unmount/reuse until final close.
+    void*           mountOwner = nullptr;
 };
 
-// Caller must already own a live vnode reference. This is retention, not a
-// safe way to acquire a reference from an unprotected raw pointer.
+// Caller must already own a live vnode reference. The returned name is for
+// reporting/legacy callers, not a capability for subsequent global lookup:
+// an overmount can make that name resolve to a different retained object.
 int VfsDirectoryPath(Vnode* vn, char* out, uint32_t capacity);
 
+// Retention is not safe acquisition from an unprotected raw pointer.
 inline void VfsRetain(Vnode* vn) {
     __atomic_fetch_add(&vn->refCount, 1, __ATOMIC_RELEASE);
 }
+
+// Drop an owned reference; final destruction occurs outside caller locks.
+void VfsRelease(Vnode* vn);
 
 struct DirEntry {
     char     name[256];
@@ -321,6 +329,9 @@ int VfsSymlink(const char* target, const char* linkPath);
 int VfsReadlink(const char* path, char* buf, uint64_t bufsiz);
 
 // Close and free a vnode.
+// Final destruction only: no other reference may remain. Use VfsRelease to
+// drop an owned reference when the vnode can be shared. Backend destruction
+// and the final mount hold release happen here, outside caller spinlocks.
 extern "C" void VfsClose(Vnode* vn);
 
 // Flush one vnode, or all mounted filesystems when vn is nullptr. Return the

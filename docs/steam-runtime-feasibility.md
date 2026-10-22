@@ -211,6 +211,9 @@ bounds, not measured build times or promises of agent wall-clock duration.
    Preserve current desktop behavior; prove rename/dirfd/root lifetime and failure
    unwind before adding namespace creation. This is useful infrastructure but
    does not itself constitute Steam or isolation acceptance.
+   The [first implementation checkpoint](retained-filesystem-context.md) fixes
+   vnode/mount lifetime and records why a backend-relative walker is required
+   before process-context migration; the full slice is still unfinished.
 2. **Mount topology and scoped credentials.** Separate attachment/backing ownership,
    provide genuine namespace creation and validated single-ID maps, implement
    the observed propagation/bind/tmpfs/remount/pivot/detach operations and real

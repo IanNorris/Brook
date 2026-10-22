@@ -3103,6 +3103,7 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) { kfree(dp); Ext2ReleaseInode(hold); return nullptr; }
         vn->directoryPath = nullptr;
+        vn->mountOwner = nullptr;
         vn->ops = &g_ext2DirOps;
         vn->type = VnodeType::Dir;
         vn->priv = dp;
@@ -3122,6 +3123,7 @@ static Vnode* Ext2FsOpenModeChecked(void* mountPriv, uint8_t pdrv,
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) { kfree(fp); Ext2ReleaseInode(hold); return nullptr; }
         vn->directoryPath = nullptr;
+        vn->mountOwner = nullptr;
         vn->ops = mode == EXT2_S_IFSOCK ? &g_ext2SocketOps : &g_ext2FileOps;
         vn->type = VnodeType::File;
         vn->priv = fp;

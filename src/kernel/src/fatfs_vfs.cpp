@@ -731,6 +731,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
                 return nullptr;
             }
             vn->directoryPath = nullptr;
+            vn->mountOwner = nullptr;
             vn->ops = &g_cachedFileOps; vn->type = VnodeType::File;
             vn->priv = existing; vn->refCount = 1; vn->cacheId = 0;
             return vn;
@@ -790,6 +791,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
                 cf->data = nullptr;
                 kfree(cf);
                 vn->directoryPath = nullptr;
+                vn->mountOwner = nullptr;
                 vn->ops = &g_cachedFileOps; vn->type = VnodeType::File;
                 vn->priv = placeholder; vn->refCount = 1; vn->cacheId = 0;
                 return vn;
@@ -806,6 +808,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
                 FileCacheInsert(cf);
                 KMutexUnlock(&g_fatLock);
                 vn->directoryPath = nullptr;
+                vn->mountOwner = nullptr;
                 vn->ops = &g_cachedFileOps; vn->type = VnodeType::File;
                 vn->priv = cf; vn->refCount = 1; vn->cacheId = 0;
                 return vn;
@@ -815,6 +818,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
         }
 
         vn->directoryPath = nullptr;
+        vn->mountOwner = nullptr;
         vn->ops = &g_fatFileOps; vn->type = VnodeType::File;
         vn->priv = fil; vn->refCount = 1; vn->cacheId = 0;
 
@@ -846,6 +850,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
             return nullptr;
         }
         vn->directoryPath = nullptr;
+        vn->mountOwner = nullptr;
         vn->ops = &g_fatDirOps; vn->type = VnodeType::Dir;
         vn->priv = dir; vn->refCount = 1; vn->cacheId = 0;
         return vn;

@@ -89,6 +89,43 @@ static const brook::VfsFsOps g_fixtureFsOps = {
     .sync = FixtureSync,
 };
 
+// Exercise real VFS mount ownership with a backend that has no busy callback.
+// Its live directory name changes independently of the immutable opening label.
+static unsigned g_retainedClosed, g_retainedUnmounted;
+static bool g_retainedProbeClose, g_retainedBusyDuringClose, g_retainedFailOpen;
+static bool RetainedMount(uint8_t,void** out) { *out=nullptr;return true; }
+static int RetainedUnmount(void*) { ++g_retainedUnmounted;return 0; }
+static int RetainedStat(void*,uint8_t,const char*,brook::VnodeStat* st) {
+    *st={};st->isDir=true;st->mode=0040755;return 0;
+}
+static int RetainedCurrentName(brook::Vnode*,char* out,uint32_t size) {
+    const char current[]="/moved";
+    if(size<sizeof(current))return -36;
+    for(unsigned i=0;i<sizeof(current);++i)out[i]=current[i];return 0;
+}
+static void RetainedClose(brook::Vnode*) {
+    ++g_retainedClosed;
+    // Only enabled for an explicit last-reference drop outside VFS locks.
+    // Backend cleanup must finish before unmount is allowed to destroy state.
+    if(g_retainedProbeClose) g_retainedBusyDuringClose=!brook::VfsUnmount("/pin");
+}
+static const brook::VnodeOps g_retainedNodeOps={
+    .open=nullptr,.read=nullptr,.write=nullptr,.readdir=nullptr,
+    .close=RetainedClose,.stat=nullptr,.fsync=nullptr,
+    .directory_path=RetainedCurrentName,
+};
+static brook::Vnode* RetainedOpen(void*,uint8_t,const char*,int) {
+    if(g_retainedFailOpen)return nullptr;
+    auto* vn=static_cast<brook::Vnode*>(brook::kmalloc(sizeof(brook::Vnode)));
+    if(!vn)return nullptr;
+    *vn={};vn->ops=&g_retainedNodeOps;vn->type=brook::VnodeType::Dir;vn->refCount=1;return vn;
+}
+static const brook::VfsFsOps g_retainedFsOps={
+    .mount=RetainedMount,.unmount=RetainedUnmount,.open=RetainedOpen,
+    .stat_path=RetainedStat,.lstat_path=nullptr,.unlink=nullptr,.mkdir=nullptr,
+    .rename=nullptr,.symlink=nullptr,.readlink=nullptr,.sync=nullptr,
+};
+
 TEST_MAIN("vfs", {
 
     // Initialise memory subsystem (VFS needs kmalloc for Vnode allocation)
@@ -174,6 +211,54 @@ TEST_MAIN("vfs", {
     ASSERT_TRUE(brook::VfsUnmount("/flush-a"));
     ASSERT_EQ(g_flush[0].unmountCalls, 2u);
     ASSERT_TRUE(brook::VfsUnmount("/flush-b"));
+
+    ASSERT_TRUE(brook::VfsRegisterFs("retained-fixture",&g_retainedFsOps));
+    ASSERT_TRUE(brook::VfsMount("/","retained-fixture",0));
+    ASSERT_TRUE(brook::VfsMount("/pin","retained-fixture",0));
+    // Failed opens must not leave an orphan mount hold.
+    g_retainedFailOpen=true;
+    ASSERT_TRUE(brook::VfsOpen("/pin/failed")==nullptr);
+    g_retainedFailOpen=false;
+    ASSERT_TRUE(brook::VfsUnmount("/pin"));
+    ASSERT_TRUE(brook::VfsMount("/pin","retained-fixture",0));
+    g_retainedUnmounted=0;
+    // An opened directory rejected as an executable or O_TRUNC must release
+    // its already-attached mount hold through the ordinary error unwind.
+    brook::Vnode* rejected=nullptr;
+    char executableName[64];
+    ASSERT_EQ(brook::VfsOpenExecutable("/pin/held",&rejected,executableName,sizeof(executableName)),-13);
+    ASSERT_TRUE(rejected==nullptr);
+    int openError=0;
+    ASSERT_TRUE(brook::VfsOpenModeChecked("/pin/held",brook::VFS_O_TRUNC,0666,&openError)==nullptr);
+    ASSERT_EQ(openError,-21);
+    ASSERT_EQ(g_retainedClosed,2u);
+    ASSERT_TRUE(brook::VfsUnmount("/pin"));
+    ASSERT_TRUE(brook::VfsMount("/pin","retained-fixture",0));
+    g_retainedClosed=g_retainedUnmounted=0;
+    auto* retained=brook::VfsOpen("/pin/held");
+    ASSERT_TRUE(retained!=nullptr);
+    ASSERT_FALSE(brook::VfsUnmount("/pin"));
+    ASSERT_EQ(g_retainedUnmounted,0u);
+    // Cover the old bug: rediscovering the owner from /pin/held selected this
+    // new overmount instead of the original mount containing the held inode.
+    ASSERT_TRUE(brook::VfsMount("/pin/held","retained-fixture",1));
+    char retainedName[64];
+    ASSERT_EQ(brook::VfsDirectoryPath(retained,retainedName,sizeof(retainedName)),0);
+    const char expectedName[]="/pin/moved";
+    for(unsigned i=0;i<sizeof(expectedName);++i) ASSERT_EQ(retainedName[i],expectedName[i]);
+    brook::VfsRetain(retained);
+    brook::VfsRelease(retained);
+    ASSERT_EQ(g_retainedClosed,0u);
+    ASSERT_FALSE(brook::VfsUnmount("/pin"));
+    g_retainedProbeClose=true;
+    brook::VfsRelease(retained);
+    g_retainedProbeClose=false;
+    ASSERT_EQ(g_retainedClosed,1u);
+    ASSERT_TRUE(g_retainedBusyDuringClose);
+    ASSERT_TRUE(brook::VfsUnmount("/pin"));
+    ASSERT_TRUE(brook::VfsUnmount("/pin/held"));
+    ASSERT_TRUE(brook::VfsUnmount("/"));
+    ASSERT_EQ(g_retainedUnmounted,3u);
 
     brook::DeviceOps unsupportedOps = {};
     brook::Device unsupported = {};
