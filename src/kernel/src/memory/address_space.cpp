@@ -7,6 +7,11 @@
 #include "scheduler.h"
 #include "syscall.h"
 #include "vfs.h"
+#include "mount_namespace.h"
+#ifdef BROOK_HOST_TEST
+namespace brook { bool VfsMountCleanupPending() __attribute__((weak));
+void VfsDrainMountCleanup() __attribute__((weak)); }
+#endif
 #include "apic.h"
 #include "compositor.h"
 #include "panic.h"
@@ -74,6 +79,7 @@ void AddressSpaceRef(AddressSpaceState* space) {
 static void WakeCleanupWorker() {
     if (g_cleanupWorker) SchedulerUnblock(g_cleanupWorker);
 }
+void WakeVfsCleanupWorker() { WakeCleanupWorker(); }
 void AddressSpacePublish(AddressSpaceState* space) {
     if (!space || space->kernel) return;
     const uint64_t flags=IrqSpinLockAcquire(&g_registryLock);
@@ -176,6 +182,13 @@ static void DestroyAddressSpace(AddressSpaceState* space) {
     IrqSpinLockRelease(&g_cleanupLock,flags);
 }
 bool ProcessCleanupStep() {
+#ifdef BROOK_HOST_TEST
+    if(VfsMountCleanupPending && VfsDrainMountCleanup && VfsMountCleanupPending()) {
+#else
+    if(VfsMountCleanupPending()) {
+#endif
+        VfsDrainMountCleanup();return true;
+    }
     uint64_t flags = IrqSpinLockAcquire(&g_cleanupLock);
     AddressSpaceState* space = g_spaceHead;
     Process* process = nullptr;

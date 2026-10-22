@@ -19,6 +19,7 @@
 #include "retained_path_walk.h"
 #include "vfs_path.h"
 #include "fs_context.h"
+#include "mount_namespace.h"
 #include "../../kernel/src/ext2_vfs.cpp"
 
 namespace {
@@ -370,6 +371,29 @@ int main(int argc,char** argv){
     parity("/renamed-container/context-moved/e/m");assert(!VfsOpen("/renamed-container/context-moved/d/m"));
     assert(VfsUnmount("/renamed-container/context-moved/e/m"));assert(!VfsRemoveAt(fsRoot,cwd,"e",true));
     assert(!VfsPathResolve(fsRoot,cwd,"value",&resolved)&&VfsPathSame(resolved,value));VfsPathRelease(resolved);
+    // Exercise namespace leases against actual Ext2 inode objects, including
+    // a vnode surviving both detach and last-member namespace retirement.
+    assert(!VfsMkdirAt(fsRoot,fsRoot,"namespace-bind",0755,0));
+    auto* initialNs=VfsMountNamespaceInitial();MountNamespace* privateNs=nullptr;
+    VfsPath privateRoot{},privateCwd{},bindTarget{},heldBound{},boundValue{},initialMissing{};
+    assert(!VfsMountNamespaceCopy(initialNs,fsRoot,cwd,&privateNs,&privateRoot,&privateCwd));
+    assert(VfsMountNamespaceActivate(privateNs));
+    assert(!VfsPathResolve(privateRoot,privateRoot,"/namespace-bind",&bindTarget));
+    assert(!VfsMountNamespaceBind(privateNs,privateCwd,bindTarget));VfsPathRelease(bindTarget);
+    assert(!VfsPathResolve(privateRoot,privateRoot,"/namespace-bind",&heldBound));
+    assert(!VfsPathResolve(privateRoot,heldBound,"value",&boundValue));
+    assert(VfsPathResolve(fsRoot,fsRoot,"/namespace-bind/value",&initialMissing)==-2);
+    VnodeStat boundStat{},valueStat{};assert(!VfsPathStat(boundValue,&boundStat)&&!VfsPathStat(value,&valueStat));
+    assert(boundStat.ino==valueStat.ino && boundStat.dev==valueStat.dev);
+    auto* retainedBindNode=VfsPathOpen(boundValue,VFS_O_READ,&error);assert(retainedBindNode&&!error);
+    VfsPathRelease(boundValue);assert(!VfsMountNamespaceDetach(privateNs,heldBound));
+    assert(!VfsPathResolve(privateRoot,heldBound,"..",&resolved)&&VfsPathSame(resolved,heldBound));VfsPathRelease(resolved);
+    assert(!VfsPathResolve(privateRoot,heldBound,"value",&boundValue));VfsPathRelease(boundValue);
+    VfsMountNamespaceLeave(privateNs);VfsDrainMountCleanup();VfsMountNamespaceRelease(privateNs);
+    VfsPathRelease(heldBound);VfsPathRelease(privateCwd);VfsPathRelease(privateRoot);
+    VnodeStat retainedStat{};assert(!retainedBindNode->ops->stat(retainedBindNode,&retainedStat)&&retainedStat.ino==valueStat.ino);
+    VfsClose(retainedBindNode);VfsDrainMountCleanup();VfsMountNamespaceRelease(initialNs);
+    assert(!VfsRemoveAt(fsRoot,fsRoot,"namespace-bind",true));
     Vnode* exact=VfsOpenAt(fsRoot,cwd,"value",VFS_O_READ,0,0,&error);assert(exact&&!error);
     VfsPathRelease(value);VfsPathRelease(cwd);VfsPathRelease(fsRoot);assert(!VfsUnmount("/"));
     VfsClose(exact);assert(VfsUnmount("/"));assert(!g_ext2OpenInodes && allocations.empty() && frames.empty());

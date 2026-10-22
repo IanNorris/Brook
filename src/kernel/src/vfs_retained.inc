@@ -14,6 +14,7 @@ bool VfsPathSame(const VfsPath& a,const VfsPath& b)
 }
 static void VfsPathHoldMount(MountEntry* mount)
 {
+    VfsMountHold(mount);
     uint64_t count=__atomic_load_n(&mount->pathHolds,__ATOMIC_RELAXED);
     do { if(count==~uint64_t{0})__builtin_trap(); }
     while(!__atomic_compare_exchange_n(&mount->pathHolds,&count,count+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED));
@@ -31,11 +32,13 @@ void VfsPathRelease(VfsPath path)
     if(!mount)__builtin_trap();
     VfsObjectRelease(path.object); // Backend backing remains pinned through destroy.
     if(!__atomic_fetch_sub(&mount->pathHolds,uint64_t{1},__ATOMIC_ACQ_REL))__builtin_trap();
+    VfsMountDrop(mount);
 }
 static int VfsMountRootLocked(MountEntry* mount,VfsPath* out)
 {
     *out={};
-    if(!mount || !mount->used)return -2;
+    if(!mount || !mount->backing)return -2;
+    if(mount->rootObject) { VfsPathHoldMount(mount);VfsObjectRetain(mount->rootObject);*out={mount,mount->rootObject};return 0; }
     if(!mount->rootIdentityKnown || !mount->backing->fsOps->root_object)return -95;
     VfsPathHoldMount(mount);
     VfsObject* object=nullptr;
@@ -43,7 +46,7 @@ static int VfsMountRootLocked(MountEntry* mount,VfsPath* out)
     if(!error && (!object || object->identity!=mount->rootIdentity || object->ops!=mount->rootObjectOps))error=-5;
     if(error) {
         VfsObjectRelease(object);
-        __atomic_fetch_sub(&mount->pathHolds,uint64_t{1},__ATOMIC_ACQ_REL);
+        __atomic_fetch_sub(&mount->pathHolds,uint64_t{1},__ATOMIC_ACQ_REL);VfsMountDrop(mount);
         return error;
     }
     *out={mount,object};return 0;
@@ -52,7 +55,7 @@ int VfsPathRoot(VfsPath* out)
 {
     if(!out)return -22;
     *out={};FileMutationGuard lookup(false);
-    for(const auto& mount:g_mounts)if(mount.used && !mount.linked)return -95;
+    for(const auto& mount:g_mounts)if(VfsMountPublished(mount) && mount.owner==&g_initialNamespace && !mount.linked)return -95;
     return VfsMountRootLocked(g_rootMount,out);
 }
 static void VfsVirtualDestroy(VfsObject* object)
@@ -105,7 +108,7 @@ static int VfsMakeVirtualLocked(const VfsPath& parent,const char* name,VfsPath* 
 static bool VfsReservedVirtualLocked(const VfsPath& parent,const char* name,VfsPath* out)
 {
     for(const auto& mount:g_mounts) {
-        if(!mount.used)continue;
+        if(!VfsMountPublished(mount))continue;
         VfsPath current=mount.covered;
         while(VfsVirtual(current)) {
             auto* directory=static_cast<VfsVirtualDirectory*>(current.object->priv);
@@ -123,7 +126,7 @@ static int VfsEnterMountsLocked(VfsPath* path)
     for(uint32_t step=0;step<VFS_MAX_MOUNT_DEPTH;++step) {
         MountEntry* child=nullptr;
         for(auto& mount:g_mounts)
-            if(mount.used && mount.linked && VfsPathSame(mount.covered,*path)) { child=&mount;break; }
+            if(VfsMountPublished(mount) && mount.linked && VfsPathSame(mount.covered,*path)) { child=&mount;break; }
         if(!child)return 0;
         VfsPath next{};int error=VfsMountRootLocked(child,&next);
         if(error)return error;
@@ -172,9 +175,12 @@ struct VfsRetainedProvider {
         for(uint32_t step=0;step<=VFS_MAX_MOUNT_DEPTH;++step) {
             if(Same(current,root)) { out=current;return 0; }
             auto* mount=static_cast<MountEntry*>(current.attachment);
-            if(!VfsVirtual(current) && mount->rootIdentityKnown &&
-               current.object->identity==mount->rootIdentity && current.object->ops==mount->rootObjectOps && mount->covered.object) {
+            if(mount->rootIdentityKnown &&
+               current.object->identity==mount->rootIdentity && current.object->ops==mount->rootObjectOps) {
+                if(!VfsMountPublished(*mount)) { out=current;return 0; }
+                if(mount->covered.object) {
                 VfsPath next=mount->covered;VfsPathRetain(next);VfsPathRelease(current);current=next;continue;
+                }
             }
             if(VfsVirtual(current)) {
                 out=static_cast<VfsVirtualDirectory*>(current.object->priv)->parent;VfsPathRetain(out);
@@ -260,6 +266,18 @@ static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capac
     out[0]=0;char relative[512];int error=VfsBackendDirectoryLocked(path,relative,sizeof(relative));
     if(error)return error;
     auto* mount=static_cast<MountEntry*>(path.attachment);
+    if(mount->rootObject) {
+        char boundRoot[512];auto* rootObject=mount->rootObject;
+        if(!rootObject->ops->directory_path)return -95;
+        if((error=rootObject->ops->directory_path(rootObject,boundRoot,sizeof(boundRoot))))return error;
+        uint32_t prefixLength=StrLen(boundRoot);
+        if(prefixLength>1) {
+            for(uint32_t i=0;i<prefixLength;++i)if(relative[i]!=boundRoot[i])return -2;
+            if(relative[prefixLength] && relative[prefixLength]!='/')return -2;
+            if(!relative[prefixLength]) {relative[0]='/';relative[1]=0;}
+            else {uint32_t i=0;do {relative[i]=relative[prefixLength+i];}while(relative[i++]);}
+        }
+    }
     const uint32_t prefix=StrLen(mount->mountPoint),length=StrLen(relative);
     const bool root=prefix==1 && mount->mountPoint[0]=='/';
     const uint32_t total=root?length:prefix+(length==1?0:length);
@@ -285,7 +303,7 @@ static int VfsPathFromVnodeLocked(Vnode* node,VfsPath* out)
     if(!out)return -22;
     *out={};if(!node)return -9;
     auto* mount=static_cast<MountEntry*>(node->mountOwner);
-    if(!mount || !mount->used)return -9;
+    if(!mount || !mount->backing)return -9;
     VfsObject* object=nullptr;int error=0;
     if(node->backendObject && node->backendObject->ops==&g_virtualDirectoryOps) {
         object=node->backendObject;VfsObjectRetain(object);
@@ -373,7 +391,7 @@ static int VfsReservedMutationLocked(const char* text,bool rejectVirtualChildren
         VfsObject* child=nullptr;
         int found=result.parent.object->ops->lookup(result.parent.object,result.leaf,&child,false);
         if(!found && child)for(const auto& mount:g_mounts) {
-            if(!mount.used)continue;
+            if(!VfsMountPublished(mount))continue;
             VfsPath identity{result.parent.attachment,child};
             if(VfsPathSame(mount.covered,identity))failure=-16;
             if(rejectVirtualChildren && !failure) {

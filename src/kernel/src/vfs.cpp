@@ -1,6 +1,13 @@
 #include "vfs.h"
 #include "vfs_object.h"
 #include "vfs_path.h"
+#include "mount_namespace.h"
+#include "mount_namespace_state.h"
+#if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
+#include <new>
+#else
+inline void* operator new(__SIZE_TYPE__,void* pointer) noexcept { return pointer; }
+#endif
 #include "retained_path_walk.h"
 #include "memory/file_object.h"
 #include "memory/mapping_pin_registry.h"
@@ -19,7 +26,8 @@ namespace brook { bool ModuleRetainAddresses(const uintptr_t*,uint32_t) __attrib
 #endif
 
 // Forward-declare SchedulerYield — weak so test builds link without the scheduler.
-namespace brook { __attribute__((weak)) void SchedulerYield(); }
+namespace brook { __attribute__((weak)) void SchedulerYield();
+__attribute__((weak)) void WakeVfsCleanupWorker(); }
 
 namespace brook {
 
@@ -147,8 +155,24 @@ struct MountBacking {
 };
 static MountBacking* g_backings;
 
+struct MountEntry;
+struct MountNamespace {
+    MountNamespaceState life;
+    MountEntry* root=nullptr;
+    MountNamespace* retireNext=nullptr;
+    bool initial=false;
+};
+static MountNamespace g_initialNamespace;
+static IrqSpinLock g_namespaceRetirementLock;
+static MountNamespace* g_namespaceRetirements;
+static bool g_mountCleanupPending;
+static constexpr uint64_t MOUNT_DETACHED=uint64_t{1}<<63;
+
 struct MountEntry {
     MountEntry* next;
+    MountNamespace* owner; // borrowed only while registered; namespace registry lease pins storage
+    uint64_t referenceState; // publication + path/vnode holds; high bit marks detach
+    VfsObject* rootObject; // optional arbitrary bind root, independent of covered-parent paths
     char             mountPoint[64];
     char             fsType[16];     // filesystem type name (e.g. "fatfs", "ext2")
     MountBacking*    backing;     // owned driver-mount reference
@@ -161,6 +185,7 @@ struct MountEntry {
     const VfsObjectOps* rootObjectOps;
     bool             rootIdentityKnown;
     bool             linked;
+    bool             detachSelected;
 };
 
 // Membership is protected by the sleeping VFS transaction. Short metadata
@@ -200,7 +225,29 @@ struct MountViewGuard {
     MountViewGuard():flags(IrqSpinLockAcquire(&g_mountViewLock)) {}
     ~MountViewGuard() { IrqSpinLockRelease(&g_mountViewLock,flags); }
 };
-static MountEntry* g_rootMount;
+static MountEntry*& g_rootMount=g_initialNamespace.root;
+static MountEntry* g_retiredMounts;
+static bool VfsMountPublished(const MountEntry& mount) {
+    return mount.used && mount.owner && mount.owner->life.Published();
+}
+static void VfsMountHold(MountEntry* mount) {
+    const uint64_t before=__atomic_fetch_add(&mount->referenceState,uint64_t{1},__ATOMIC_RELAXED);
+    if(!(before&~MOUNT_DETACHED) || (before&~MOUNT_DETACHED)==MOUNT_DETACHED-1)__builtin_trap();
+}
+void VfsWakeMountCleanup() { if(WakeVfsCleanupWorker)WakeVfsCleanupWorker(); }
+static void VfsRequestMountCleanup(bool wake=true) {
+    __atomic_store_n(&g_mountCleanupPending,true,__ATOMIC_RELEASE);
+    if(wake)VfsWakeMountCleanup();
+}
+bool VfsMountCleanupPending() { return __atomic_load_n(&g_mountCleanupPending,__ATOMIC_ACQUIRE); }
+static void VfsMountDrop(MountEntry* mount) {
+    const uint64_t before=__atomic_fetch_sub(&mount->referenceState,uint64_t{1},__ATOMIC_ACQ_REL);
+    if(!(before&~MOUNT_DETACHED))__builtin_trap();
+    // No pointer dereference after dropping the last hold: a collector may
+    // already have freed this record. Work notification owns no record pointer.
+    if(before==(MOUNT_DETACHED|1))VfsRequestMountCleanup();
+}
+static void VfsCollectRetiredMountsLocked();
 static uint64_t g_mountPublication;
 
 // All backing registry/reference changes occur in a sleeping VFS mutation
@@ -237,7 +284,7 @@ static int VfsBackingDropLocked(MountBacking* backing,bool deferFailure=false)
 // Final close drops the hold only after the backend has finished using it.
 static void VfsAttachMount(Vnode* vnode, MountEntry* mount)
 {
-    vnode->mountOwner=mount;
+    VfsMountHold(mount);vnode->mountOwner=mount;
     __atomic_fetch_add(&mount->vnodeHolds,uint64_t{1},__ATOMIC_RELAXED);
 }
 
@@ -281,6 +328,8 @@ struct VfsRenameLabels {
             StrCopy(change->mount->mountPoint,change->label,sizeof(change->mount->mountPoint));
     }
 };
+static int VfsPrepareBackingRenameLabelsLocked(MountBacking* backing,const char* oldPhysical,
+                                               const char* newPhysical,VfsRenameLabels& labels);
 
 // Find the best (longest-prefix) mount for a given absolute path.
 // Returns the mount entry and sets *relPath to the path within the mount.
@@ -295,7 +344,7 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
         for(uint32_t step=0;step<VFS_MAX_MOUNT_DEPTH;++step) {
             MountEntry* next=nullptr;uint32_t nextLength=~uint32_t{0};
             for(auto& mount:g_mounts) {
-                if(!mount.used || !mount.linked || mount.covered.attachment!=best)continue;
+                if(!VfsMountPublished(mount) || !mount.linked || mount.covered.attachment!=best)continue;
                 const uint32_t length=StrLen(mount.mountPoint);bool match=true;
                 for(uint32_t i=0;i<length;++i)if(absPath[i]!=mount.mountPoint[i]) { match=false;break; }
                 if(!match || (absPath[length] && absPath[length]!='/'))continue;
@@ -311,7 +360,7 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
 
     for(auto& candidate:g_mounts)
     {
-        if (!candidate.used) continue;
+        if (!VfsMountPublished(candidate) || candidate.owner!=&g_initialNamespace) continue;
         uint32_t mpLen = StrLen(candidate.mountPoint);
         bool match = true;
         for (uint32_t j = 0; j < mpLen; ++j) {
@@ -421,7 +470,11 @@ static bool VfsTrailingSlash(const char* path) { uint32_t n=StrLen(path);return 
 void VfsInit()
 {
     KRwLockInit(&g_fileMutationLock);
-    g_rootMount=nullptr;
+    g_initialNamespace.~MountNamespace();::new(&g_initialNamespace)MountNamespace();
+    g_initialNamespace.initial=true;
+    if(!g_initialNamespace.life.ActivatePrepared())__builtin_trap();
+    g_rootMount=nullptr;g_retiredMounts=nullptr;g_namespaceRetirements=nullptr;
+    g_mountCleanupPending=false;g_namespaceRetirementLock={};
     g_backings=nullptr;
     g_mountPublication=0;
     g_mountViewLock={};g_mounts={};
@@ -438,7 +491,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
     // Root replacement and unresolved object attachments are deliberately not
     // supported. Production boot installs the root before any child mounts.
     if(isRoot && g_rootMount)return false;
-    if(isRoot)for(const auto& mount:g_mounts)if(mount.used)return false;
+    if(isRoot)for(const auto& mount:g_mounts)if(mount.used && mount.owner==&g_initialNamespace)return false;
 
     const VfsFsOps* ops = FindFsDriver(fsName);
     if (!ops)
@@ -471,7 +524,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
         backing->mountPriv=privateData;backing->next=g_backings;g_backings=backing;
     }
     void* priv=backing->mountPriv;
-    *slot={};slot->backing=backing;
+    *slot={};slot->backing=backing;slot->owner=&g_initialNamespace;slot->referenceState=1;
     StrCopy(slot->mountPoint,mountPoint,sizeof(slot->mountPoint));
     StrCopy(slot->fsType,fsName,sizeof(slot->fsType));
     int error=0;
@@ -513,7 +566,7 @@ bool VfsUnmount(const char* mountPoint)
         // Stacked attachments are removed top-first, identified by their edge
         // rather than mount-table slot ordering.
         for(auto& mount:g_mounts) {
-            if(!mount.used || !StrEq(mount.mountPoint,mountPoint))continue;
+            if(!VfsMountPublished(mount) || mount.owner!=&g_initialNamespace || !StrEq(mount.mountPoint,mountPoint))continue;
             bool coveredByChild=false;
             for(const auto& child:g_mounts)
                 if(child.used && child.covered.attachment==&mount)coveredByChild=true;
@@ -523,6 +576,10 @@ bool VfsUnmount(const char* mountPoint)
         auto& mount=*selected;
         if(__atomic_load_n(&mount.vnodeHolds,__ATOMIC_ACQUIRE) ||
            __atomic_load_n(&mount.pathHolds,__ATOMIC_ACQUIRE))return false;
+        // Final releases clear their diagnostic counter before dropping the
+        // combined lease. Only the combined count proves backing teardown safe.
+        if(__atomic_load_n(&mount.referenceState,__ATOMIC_ACQUIRE)!=1)return false;
+        if(mount.rootObject)return false; // arbitrary bind roots use namespace detach
         if(VfsBackingDropLocked(mount.backing))return false;
         mount.backing=nullptr;
         covered=mount.covered;mount.covered={};
@@ -541,7 +598,7 @@ uint32_t VfsRootMountCount()
     uint32_t count = 0;
     for(const auto& mount:g_mounts)
     {
-        if (!mount.used) continue;
+        if (!VfsMountPublished(mount) || mount.owner!=&g_initialNamespace) continue;
         const char* mp = mount.mountPoint;
         if (mp[0] != '/' || mp[1] == '\0') continue;
 
@@ -563,7 +620,7 @@ bool VfsRootMountNameAt(uint32_t index, char* out, uint32_t outSize)
     uint32_t seen = 0;
     for(const auto& mount:g_mounts)
     {
-        if (!mount.used) continue;
+        if (!VfsMountPublished(mount) || mount.owner!=&g_initialNamespace) continue;
         const char* mp = mount.mountPoint;
         if (mp[0] != '/' || mp[1] == '\0') continue;
 
@@ -587,12 +644,14 @@ bool VfsRootMountNameAt(uint32_t index, char* out, uint32_t outSize)
     return false;
 }
 
-uint32_t VfsMountMaxSlots() { MountViewGuard held;return g_mounts.count; }
+uint32_t VfsMountMaxSlots() { MountViewGuard held;uint32_t count=0;
+    for(const auto& mount:g_mounts)if(VfsMountPublished(mount) && mount.owner==&g_initialNamespace)++count;return count; }
 
 VfsMountSnapshot VfsMountSnapshotAt(uint32_t idx)
 {
     VfsMountSnapshot snap = {};
-    MountViewGuard held;auto* entry=g_mounts.At(idx);
+    MountViewGuard held;MountEntry* entry=nullptr;
+    for(auto& mount:g_mounts)if(VfsMountPublished(mount) && mount.owner==&g_initialNamespace) { if(!idx--) { entry=&mount;break; } }
     if (!entry) return snap;
     const auto& m = *entry;
     snap.used = m.used;
@@ -1001,6 +1060,7 @@ int VfsSync(Vnode* vn)
     // filesystem/device flush as successful to sync(2) or the VM bridge.
     int result = FileObjectWritebackAll();
     FileMutationGuard mutation;
+    VfsCollectRetiredMountsLocked();
     for(auto* backing=g_backings;backing;) {
         auto* next=backing->next;
         if(backing->fsOps->sync) {
@@ -1112,23 +1172,11 @@ int VfsRename(const char* oldPath,const char* newPath)
     MountEntry* oldMount=FindMount(oldResolved,&oldRelative);MountEntry* newMount=FindMount(newResolved,&newRelative);
     if (!oldMount || !newMount || !oldMount->backing->fsOps) return -2;
     if (oldMount!=newMount) return -18;
-    const uint32_t oldLength=StrLen(oldResolved),newLength=StrLen(newResolved);
-    auto renamedAncestor=[&](const MountEntry& mount) {
-        if(!mount.used || StrLen(mount.mountPoint)<=oldLength)return false;
-        // An upper attachment rename must not relabel a hidden lower tree
-        // whose opening labels happen to share the same textual prefix.
-        const MountEntry* ancestor=&mount;
-        for(uint32_t step=0;ancestor && ancestor!=oldMount && step<VFS_MAX_MOUNT_DEPTH;++step)
-            ancestor=static_cast<MountEntry*>(ancestor->covered.attachment);
-        if(ancestor!=oldMount)return false;
-        for(uint32_t i=0;i<oldLength;++i)if(mount.mountPoint[i]!=oldResolved[i])return false;
-        return mount.mountPoint[oldLength]=='/';
-    };
     VfsRenameLabels labels;
-    for(auto& mount:g_mounts)if(renamedAncestor(mount)) {
-        if(newLength+StrLen(mount.mountPoint+oldLength)>=sizeof(mount.mountPoint))return -36;
-        if(int allocationError=labels.Add(&mount,newResolved,mount.mountPoint+oldLength))return allocationError;
-    }
+    VnodeStat sourceStat{};
+    if(int error=VfsLstatPathRaw(oldResolved,&sourceStat))return error;
+    if(sourceStat.isDir && !StrEq(oldResolved,newResolved))
+        if(int labelError=VfsPrepareBackingRenameLabelsLocked(oldMount->backing,oldRelative,newRelative,labels))return labelError;
     const int error=oldMount->backing->fsOps->rename ? oldMount->backing->fsOps->rename(oldMount->backing->mountPriv,oldMount->backing->pdrv,oldRelative,newRelative) : -95;
     if(!error)labels.Apply();
     return error;
@@ -1169,7 +1217,7 @@ void VfsClose(Vnode* vn)
     kfree(vn->directoryPath);
     kfree(vn);
     VfsObjectRelease(object);
-    if (mount) __atomic_fetch_sub(&mount->vnodeHolds,uint64_t{1},__ATOMIC_RELEASE);
+    if (mount) { __atomic_fetch_sub(&mount->vnodeHolds,uint64_t{1},__ATOMIC_RELEASE);VfsMountDrop(mount); }
 }
 
 void VfsRelease(Vnode* vn)
@@ -1179,5 +1227,6 @@ void VfsRelease(Vnode* vn)
 }
 
 #include "vfs_retained_ops.inc"
+#include "vfs_mount_namespace.inc"
 
 } // namespace brook

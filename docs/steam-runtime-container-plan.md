@@ -376,3 +376,72 @@ Next: introduce owned namespace topology over these records, copy/remap root,
 cwd and synthetic ancestor links by identity, add member tokens to actual
 process birth/exit, and wire real privileged clone/bind/detach. These acceptance
 items remain part of the active goal; the component tests do not replace them.
+
+
+## Private topology core checkpoint (process integration pending)
+
+`mount_namespace.h` and `vfs_mount_namespace.inc` now implement private prepared
+namespace copies, activation/member transitions, directory bind, subtree lazy
+detach and deferred retirement over the allocated attachment/backing model.
+Each record is indexed globally but edges belong to an explicit namespace;
+lookup follows exact attachment/object identities and checks live publication.
+A copied namespace receives new attachment identities and remapped synthetic
+ancestor objects, root and cwd. Foreign retained paths remain foreign
+capabilities instead of being reopened by name. Storage snapshots do not keep
+publication alive after the last member departs.
+
+Attachment lifetime uses a combined atomic publication/path/vnode lease count;
+diagnostic path/vnode counters are not teardown authority. Astra identified a
+last-release window in explicit unmount; the authoritative count is now checked
+before backing teardown, with a deterministic interleaving regression. Detached
+records retain exact objects/backings until their final lease leaves. The final
+atomic decrement never accesses the potentially freed record afterward.
+Namespace membership retirement hides edges synchronously; deferred VFS cleanup
+removes records and releases covered paths, arbitrary roots and backings in a
+sleeping transaction. The existing cleanup worker is notified outside its list
+lock. Future scheduler hooks must use wake=false under scheduler locks and wake
+after releasing them; those hooks are not integrated by this component.
+
+Copy uses explicit attachment and synthetic-object memo tables, never raw copies
+of live reference counters. Fault injection through every allocation until a
+complete successful copy verifies empty outputs and unchanged allocations and
+registry on failure. Host tests reproduce the Linux foreign-dirfd, stacked bind,
+nested detach, detached-root dotdot and last-member publication observations.
+Real Ext2 tests additionally keep an exact vnode alive through detach and
+namespace retirement, then close it before final backing cleanup/offline fsck.
+
+Shared-backing rename labels are reconstructed from retained covered edges in
+each namespace, transforming physical bind roots separately before projecting
+visible names. Tests cover copied-to-initial and initial-to-copied rename, plus
+renaming a bind's physical source with a nested bind. Allocation preflight stays
+before backend mutation and label publication only copies prepared strings under
+the metadata view lock. A remaining bounded compatibility restriction is explicit:
+a directory rename can fail before mutation when another mount on that backing
+has unreportable ancestry. An injected unsupported directory_path regression
+checks this fail-before-mutation behavior. File and no-op legacy renames skip
+label preflight. This does not claim arbitrary disconnected-directory rename
+compatibility.
+
+All host tests passed individually: the full parallel run passed 96/97, with
+one audio-model timeout while builds competed for CPU; that unchanged test
+passed standalone. Affected VFS/Ext2/FAT/VMM tests pass ASan/UBSan, including the
+added real Ext2 namespace case. The ABI-39 kernel and 13 matched modules build;
+compiled entry/start audits and mutations pass. Frozen kernel SHA:
+`71e5dad5323161eadd4cdf218679e18c3a1fe930b8a9aef99baa8388da2a4a99`.
+Native component regression VM `ddfea593d26345c9b45705a4d60f14ed` completed all
+nine filesystem/credentials/IPC jobs with no live job tasks. Mousepad launched
+through the normal UI, rendered a completed frame and closed with its exact
+client group gone. A host screenshot-serialization error was recovered using
+the original launch identity; no second app was launched. Heap checks passed,
+checked sync/shutdown completed, original wrapper exited zero and all four
+offline filesystem checks exited zero. Evidence:
+`build/workloads/mount-namespace-20261022/topology` and
+`build/reviews/mount-topology-off-gpu-1ms-fixed-mlfq-a-20261022`.
+
+The active goal remains incomplete. There is still no process-owned namespace,
+no successful CLONE_NEWNS syscall, no privileged bind/detach dispatch, and no
+native namespace isolation acceptance. Initial namespace arbitrary binds and
+virtual source binds currently fail EOPNOTSUPP in the core. Process-context
+storage, independent task member tokens at birth/logical exit, namespace-aware
+reporting and real syscall/native tests are the next required integration step.
+Steam/container security and authentication remain outside this checkpoint.
