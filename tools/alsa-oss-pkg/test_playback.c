@@ -16,7 +16,8 @@ int main(int argc, char **argv) {
     void (*geometry)(unsigned) = dlsym(library, "playback_geometry");
     void (*advance)(unsigned) = dlsym(library, "playback_advance");
     unsigned long long (*stat)(unsigned) = dlsym(library, "playback_stat");
-    assert(geometry && advance && stat);
+    void (*block_copy)(unsigned) = dlsym(library, "playback_block_copy");
+    assert(geometry && advance && stat && block_copy);
     char text[4096];
     int length = snprintf(text, sizeof(text),
         "pcm_type.oss { lib \"%s\" }\n"
@@ -59,8 +60,17 @@ int main(int argc, char **argv) {
         const unsigned long long target = (unsigned long long)rates[r] * 4;
         unsigned steps = 0, partial = 0, blocked = 0, running = 0;
         unsigned extra_delay = 0, downstream_only = 0, reused_before_completion = 0;
+        unsigned held_software_verified=0;
+        if(enlarged>=2)block_copy(1);
         while (submitted < target) {
             assert(++steps < 10000);
+            if(enlarged>=2 && steps==4) {
+                /* Writes alone cannot release client space. Until an actual
+                 * native copy is accepted, all accepted source is software. */
+                assert(stat(3)>0 && stat(3)==stat(11) && stat(2)==stat(11) &&
+                    stat(10)==stat(11) && stat(3)<=stat(8) && !stat(4));
+                held_software_verified=1;block_copy(0);
+            }
             /* Alternate whole-ring, period-sized and oversized requests.
              * Delayed completion is explicit, so no blind immediate drain. */
             if(enlarged>=2 && steps<=8) {
@@ -114,7 +124,7 @@ int main(int argc, char **argv) {
         }
         assert(stat(2) == 0 && stat(3) == stat(4));
 #ifdef BROOK_OSS_DOWNSTREAM
-        if(enlarged>=2) assert(extra_delay && downstream_only && reused_before_completion);
+        if(enlarged>=2) assert(extra_delay && downstream_only && reused_before_completion && held_software_verified);
 #endif
         printf("OSS_PLAYBACK geometry=%u rate=%u format=%s buffer=%lu period=%lu "
             "physical=%llu fragment=%llu logical=%llu submitted=%llu "

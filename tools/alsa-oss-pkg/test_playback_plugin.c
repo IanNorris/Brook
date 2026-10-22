@@ -19,13 +19,21 @@ static unsigned long long accepted_frames, completed_frames, write_calls;
 static unsigned long long max_request_frames, logical_overfills;
 static snd_pcm_ioplug_t *observed_io;
 static unsigned staging_frames;
+static unsigned software_frames;
+static int copy_blocked;
 static unsigned charged_frames(void) {
-    return queued_frames>staging_frames?queued_frames-staging_frames:0;
+    unsigned native=queued_frames-software_frames;
+    return software_frames+(native>staging_frames?native-staging_frames:0);
+}
+void playback_block_copy(unsigned blocked) {
+    copy_blocked=blocked;
+    if(!blocked)software_frames=0;
 }
 
 void playback_geometry(unsigned enlarged) {
     geometry = enlarged;
     staging_frames = enlarged>=2?4096:0;
+    software_frames=0;copy_blocked=0;
     capacity_frames = fragment_frames = queued_frames = 0;
     accepted_frames = completed_frames = write_calls = 0;
     max_request_frames = logical_overfills = 0;
@@ -34,7 +42,7 @@ void playback_geometry(unsigned enlarged) {
 }
 void playback_advance(unsigned frames) {
     if (!triggered) return;
-    if (frames > queued_frames) frames = queued_frames;
+    if (frames > queued_frames-software_frames) frames = queued_frames-software_frames;
     queued_frames -= frames;
     completed_frames += frames;
 }
@@ -51,6 +59,7 @@ unsigned long long playback_stat(unsigned key) {
     case 8: return observed_io ? observed_io->buffer_size : 0;
     case 9: return staging_frames;
     case 10: return charged_frames();
+    case 11: return software_frames;
     default: assert(0); return 0;
     }
 }
@@ -93,6 +102,7 @@ static int playback_ioctl(int fd, unsigned long request, ...) {
         }
     } else if (request == SNDCTL_DSP_RESET) {
         queued_frames = 0;
+        software_frames = 0;
         accepted_frames = completed_frames = 0;
         triggered = 0;
     } else if (request == SNDCTL_DSP_SETTRIGGER) {
@@ -101,7 +111,7 @@ static int playback_ioctl(int fd, unsigned long request, ...) {
         triggered = (value & PCM_ENABLE_OUTPUT) != 0;
     } else if (request == SNDCTL_DSP_SYNC) {
         completed_frames += queued_frames;
-        queued_frames = 0;
+        queued_frames = software_frames = 0;
     }
     va_end(arguments);
     return 0;
@@ -115,6 +125,7 @@ static ssize_t playback_write(int fd, const void *data, size_t bytes) {
     if (frames > capacity_frames - charged_frames()) frames = capacity_frames - charged_frames();
     if (!frames) { errno = EAGAIN; return -1; }
     queued_frames += frames;
+    if(copy_blocked)software_frames+=frames;
     accepted_frames += frames;
     if (observed_io && charged_frames() > observed_io->buffer_size) ++logical_overfills;
     return frames * frame_bytes;

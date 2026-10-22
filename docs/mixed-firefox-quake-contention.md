@@ -107,3 +107,55 @@ response, fence, backing/resource and timeout ownership; incomplete delayed
 vertex recovery remains separately parked. Retain explicit residual elapsed
 time, native rendering/input checks and original-job shutdown/filesystem gates.
 No completed current-goal or scheduler-promotion claim follows from this capture.
+
+## Controlled single/mixed/reversal baseline
+
+The later private review
+`build/reviews/matched-desktop-baseline-gpu-1ms-fixed-mlfq-b-20261022`
+completed all original application jobs and its original VM wrapper successfully;
+boot, data, Nix and temporary filesystems all checked cleanly. This cohort uses
+the same frozen kernel/modules, MLFQ, 4096-frame downstream allowance, SDL host
+audio and private QEMU. Firefox plays a generated local 720p30 H.264/AAC clip,
+removing YouTube ads and network variation. Quake plays the same 600 original
+demo frame records at normal demo speed. Its render caps are raised, timedemo
+remains off, and the actual SDL getter confirms swap interval zero throughout
+each trace. These are swap completions, not physical display scanout.
+
+After clean shutdown, all three raw SDL traces were extracted from the private
+temporary disk and checked against the byte counts and SHA-256 values collected
+inside the guest. Each is complete with no dropped/incomplete trace records.
+The comparison takes 50 seconds starting five seconds after the observed demo
+start marker. Marker observations include log-reader scheduling latency, so
+these are corresponding central demo windows, not frame-exact scene alignment.
+Boundary-crossing intervals are retained explicitly in the analysis artifact.
+
+| Quake condition | Swaps / guest second | Frame interval p50 | Frame interval p95 |
+| --- | ---: | ---: | ---: |
+| Alone, before Firefox | 58.10 | 16.99 ms | 23.01 ms |
+| Alongside Firefox | 28.80 | 33.76 ms | 51.75 ms |
+| Alone, after Firefox closes | 56.46 | 17.01 ms | 23.95 ms |
+
+Separate approximately six-second plain audio observations preserve stream
+identity and epoch across each counter subtraction. Quake source completion is
+44.09k frames/s alone, 28.07k mixed, and 44.13k alone afterward. Firefox is
+43.96k alone, 30.44k mixed and 44.18k afterward, against 44.1k native frames/s.
+Both applications keep their original logical buffers: Quake 4096/1024 and
+Firefox 4416/64 capacity/fragment frames. This reproduces the concurrent deficit
+despite the downstream allowance; it does not establish decoded tempo or the
+physical speaker rate from counters alone.
+
+Firefox's separate page-state observations advance media by 13.12 seconds over
+13.11 seconds alone, 10.73 over 15.56 seconds mixed, and 15.06 over 15.06 seconds
+afterward. Browser drop counters rise by 60/393, 118/322 and 89/452 respectively.
+Those page intervals overlap diagnostic work and are not the exact plain PCM
+windows. The complete source and analyses remain in `matched-control/`, notably
+`swap-comparison.json`, `media-comparison.json`, per-phase frame/clock/runtime
+bundles and the original job/lifecycle evidence.
+
+The next isolated candidate replaces an ordinary backing-detach acknowledgement
+plus an empty fenced submit with a fenced detach command. It retains the prior
+upload completion fence and conservative source quarantine on failure. Only the
+GPU module changes in the native comparison; the baseline kernel and all other
+modules remain byte-identical. Its release build and 87 hosted suites pass,
+including actual control-response and upload bodies. Native benefit, rendering
+correctness and timeout recovery acceptance remain unproven.

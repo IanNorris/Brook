@@ -33,6 +33,8 @@ def main():
     parser.add_argument('--home', type=Path, required=True)
     parser.add_argument('--uncapped', action='store_true',
                         help='Benchmark with timedemo=1 and r_vsync=0; bypass engine frame pacing')
+    parser.add_argument('--unpaced-render', action='store_true',
+                        help='Disable VSync and lift render caps while keeping normal demo playback time')
     parser.add_argument('--measured-frames', type=int, default=150,
                         help='Original demo frame records after 49 warmup records (default: 150)')
     parser.add_argument('--engine', type=Path, help='Direct engine path for the Linux reference; default uses Brook wrapper')
@@ -119,6 +121,7 @@ def main():
     metadata = dict(recorded_frame_delta=server_frame_delta, measured_frame_records=args.measured_frames,
                     measured_demo_records=last-first,
                     uncapped=args.uncapped,
+                    unpaced_render=args.unpaced_render,
                     music_track=args.music_track,
                     music_only=args.music_only,
                     inserted_start_record=1,
@@ -143,7 +146,7 @@ def main():
             '+set', 'r_customheight', '720', '+set', 'vid_fullscreen', '0',
             '+set', 'cl_maxfps', '60', '+set', 'timedemo', '0',
             '+set', 'nextdemo', 'quit', '+demomap', 'brook-timing.dm2']
-    if args.uncapped:
+    if args.uncapped or args.unpaced_render:
         # Yamagi 8.60 separates packet (cl_maxfps) and render (vid_maxfps)
         # limits. Its true bypass is timedemo: common/frame.c skips both
         # pacing tests. vid_maxfps=0 alone would be clamped to 999, not infinity.
@@ -152,7 +155,7 @@ def main():
         ] + argv[len(prefix):]
         argv[argv.index('cl_maxfps')+1] = '250'
         timedemo = argv.index('timedemo')
-        argv[timedemo+1] = '1'
+        argv[timedemo+1] = '1' if args.uncapped else '0'
         # The wrapper adds arguments of its own and Yamagi accepts at most 50.
         # Keep initialization-sensitive values above; use a private late script
         # for the remaining settings and queries instead of overflowing argv.
@@ -195,6 +198,7 @@ def main():
 
     with (home / 'timing-stdout.log').open('wb') as output:
         process = subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT)
+        print('Q2_ENGINE_STARTED',process.pid,flush=True)
         deadline = time.monotonic() + max(110, args.measured_frames/5+30)
         try:
             while process.poll() is None:
@@ -209,6 +213,7 @@ def main():
                 process.terminate()
                 process.wait(timeout=10)
     result = dict(**metadata, exit=exit_code, markers=markers,
+                  engine_pid=process.pid,
                   launch_to_exit_s=(time.monotonic_ns()-started)/1e9,
                   observation='Per-line-flushed qconsole.log; 20ms guest polling; '
                               'includes reader scheduling and filesystem visibility delay')

@@ -95,6 +95,38 @@ class MarkerTimingTests(unittest.TestCase):
             self.assertEqual(report['measured_demo_records'], 150)
             self.assertGreater(report['observed_demo_interval_s'], 5)
 
+    def test_unpaced_render_preserves_normal_demo_time(self):
+        with tempfile.TemporaryDirectory(prefix='brook-q2-unpaced-') as folder:
+            root=Path(folder);pak=root/'baseq2';pak.mkdir()
+            demo=b''.join(struct.pack('<iBi',5,0x14,n) for n in range(80))
+            demo+=struct.pack('<i',-1)
+            directory=struct.pack('<56sii',b'demos/demo1.dm2',12,len(demo))
+            (pak/'pak0.pak').write_bytes(struct.pack('<4sii',b'PACK',12+len(demo),64)+demo+directory)
+            engine=root/'engine'
+            engine.write_text('#!'+sys.executable+'\n'
+                'import os,sys,time,json\nfrom pathlib import Path\n'
+                "h=Path(os.environ['HOME']);(h/'argv.json').write_text(json.dumps(sys.argv))\n"
+                "with (h/'.yq2/baseq2/qconsole.log').open('w') as f:\n"
+                " f.write('BROOK_DEMO_TIMING_START\\n');f.flush();time.sleep(.25)\n"
+                " f.write('BROOK_DEMO_TIMING_END\\n');f.flush()\n")
+            engine.chmod(0o755);home=root/'home'
+            result=subprocess.run([sys.executable,str(Path(__file__).parent/'workloads/q2_demo_timing.py'),
+                '--engine',str(engine),'--pak-dir',str(pak),'--home',str(home),
+                '--unpaced-render','--measured-frames','1'],capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            argv=json.loads((home/'argv.json').read_text())
+            self.assertEqual(argv[argv.index('r_vsync')+1],'0')
+            self.assertEqual(argv[argv.index('timedemo')+1],'0')
+            self.assertEqual(argv[argv.index('cl_maxfps')+1],'250')
+            query=(home/'.yq2/baseq2/brook-benchmark-query.cfg').read_text()
+            self.assertIn('set vid_maxfps 999\n',query)
+            report=json.loads((home/'timing-result.json').read_text())
+            self.assertFalse(report['uncapped'])
+            self.assertTrue(report['unpaced_render'])
+            self.assertEqual(report['recorded_frame_delta'],1)
+            self.assertEqual(report['expected_server_interval_s'],.2)
+            self.assertGreater(report['engine_pid'],0)
+
 
 if __name__ == '__main__':
     unittest.main()
