@@ -2208,17 +2208,7 @@ static void CompDestroyTexture(GpuTexId t)
     gt->used = false;
 }
 
-static void CompUpdateTexture(GpuTexId t, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
-{
-    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
-    GpuTexture* gt = CompTex(t);
-    if (!gt || gt->owned) return;
-    if (x >= gt->w || y >= gt->h) return;
-    if (x + w > gt->w) w = gt->w - x;
-    if (y + h > gt->h) h = gt->h - y;
-    if (w == 0 || h == 0) return;
-    TransferToHost3D(COMP_CTX_ID, gt->resId, x, y, w, h, gt->w, gt->h);
-}
+#include "texture_update.inc"
 
 static void CompBeginFrame(uint32_t clearArgb)
 {

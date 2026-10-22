@@ -58,8 +58,11 @@ struct GpuCompositorOps {
     void (*DestroyTexture)(GpuTexId tex);
 
     // Upload a dirty rect of the texture's backing into the host texture
-    // (device DMA, not a CPU copy). Call after the window has rendered.
-    void (*UpdateTexture)(GpuTexId tex, uint32_t x, uint32_t y,
+    // (device DMA, not a CPU copy). Call after the window has rendered. True
+    // means a validated transfer response, not permission to free backing;
+    // existing composition fences and backing lifetime rules still apply.
+    // False requires retaining invalidation for a later successful upload.
+    bool (*UpdateTexture)(GpuTexId tex, uint32_t x, uint32_t y,
                           uint32_t w, uint32_t h);
 
     // Begin a composited frame: bind + clear the scanout render-target to

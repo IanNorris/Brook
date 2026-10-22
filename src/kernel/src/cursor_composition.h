@@ -9,6 +9,22 @@ struct CursorImage {
     uint32_t pixels[CursorCapacity * CursorCapacity]{};
 };
 
+struct CursorUploadState {
+    CursorImage accepted{};
+    bool valid=false;
+    bool Matches(const CursorImage& frame) const {
+        if(!valid || accepted.width!=frame.width || accepted.height!=frame.height)return false;
+        for(uint32_t i=0;i<CursorCapacity*CursorCapacity;++i)
+            if(accepted.pixels[i]!=frame.pixels[i])return false;
+        return true;
+    }
+    template<class Upload> bool Update(const CursorImage& frame,bool force,Upload upload) {
+        if(!force && Matches(frame))return true;
+        if(!upload(frame.width,frame.height))return false;
+        accepted=frame;valid=true;return true;
+    }
+};
+
 // Compose into a separate frame: client cursor pixels/hotspot survive busy
 // animation and are restored verbatim when the last pending launch resolves.
 inline void ComposeCursor(const CursorImage& source, CursorImage& frame,

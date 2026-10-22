@@ -1,6 +1,7 @@
 #include "compositor_wake_sequence.h"
 #include "apic.h"
 #include "scene_damage.h"
+#include "texture_damage.h"
 #include "desktop_pointer_route.h"
 #include "compositor.h"
 #include "compositor_scene.h"
@@ -477,6 +478,7 @@ static uint32_t  g_wallpaperHeight = 0;
 // ---------------------------------------------------------------------------
 static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
 static bool      g_gpuDrawReady   = false;   // GL DRAW pipeline available (set in CompositorInit)
+static bool      g_gpuLayerDamage = false;  // default-off matched upload experiment
 static uint32_t  g_gpuTestOpacity = 0;       // BROOK_GPU_OPACITY: demo opacity for all windows (0 = off)
 static uint32_t  g_gpuTestBlur    = 0;       // BROOK_GPU_BLUR: demo blur radius for all windows (0 = off)
 static bool      g_gpuThumbDump   = false;   // BROOK_GPU_THUMB: base64 thumbnail over serial
@@ -485,6 +487,7 @@ static bool      g_fullDump       = false;   // BROOK_GPU_FULL: one-shot full-re
 static bool      g_fullDumpDone   = false;   // full dump already emitted
 static GpuTexId  g_desktopTex     = 0;       // g_backBuffer as a texture
 static uint32_t* g_desktopTexPtr  = nullptr; // backing pointer the tex was made for
+static TextureDamage g_desktopDamage,g_chromeDamage,g_overlayDamage;
 static bool      g_desktopTexNeedsFull = true; // force a full desktop upload
 // GPU DRAW path only: per-window chrome is rendered into a SEPARATE full-screen
 // RGBA layer (transparent gaps, decoration rects alpha=0xFF) so the base desktop
@@ -508,6 +511,7 @@ static bool      g_gpuLaunchDemo  = false;   // opt/gpulaunch: auto-open launche
 static bool      g_gpuMouseDemo   = false;   // opt/gpumouse: warp cursor once for capture
 static int32_t   g_gpuMouseDemoX  = 0;
 static int32_t   g_gpuMouseDemoY  = 0;
+static CursorUploadState g_cursorUpload;
 static GpuTexId  g_cursorTex      = 0;       // ARGB cursor sprite
 // Per-window-slot content texture tracking (recreated when the VFB changes).
 struct WinTexEntry {
@@ -775,6 +779,10 @@ void CompositorInit()
         g_gpuComposite = true;
         SerialPuts("COMPOSITOR: GPU composition requested (BROOK_COMPOSITE=gpu)\n");
     }
+    char damage[4]={};
+    const uint32_t damageBytes=FwCfgReadFile("opt/gpu-layer-damage",damage,sizeof(damage));
+    g_gpuLayerDamage=damage[0]=='1' && (damageBytes==1 || (damageBytes==2 && !damage[1]));
+    if(g_gpuLayerDamage)SerialPuts("COMPOSITOR: independent layer uploads enabled\n");
 
     // Optional: dump a base64 thumbnail of the GPU-composited scanout over serial
     // every few seconds, for in-guest visual verification (no host display).
@@ -1633,6 +1641,7 @@ static bool ClampScreenRect(int& x, int& y, int& w, int& h)
 static void OverlayClearRect(int x, int y, int w, int h)
 {
     if (!g_overlayBuffer || !ClampScreenRect(x, y, w, h)) return;
+    g_overlayDamage.Mark(static_cast<uint32_t>(y),static_cast<uint32_t>(y+h));
     for (int yy = y; yy < y + h; ++yy)
         __builtin_memset(g_overlayBuffer + (uint32_t)yy * g_backBufStride + x, 0,
                          (size_t)w * 4);
@@ -1644,6 +1653,7 @@ static void OverlayClearRect(int x, int y, int w, int h)
 static void OverlaySetAlphaRect(int x, int y, int w, int h)
 {
     if (!g_overlayBuffer || !ClampScreenRect(x, y, w, h)) return;
+    g_overlayDamage.Mark(static_cast<uint32_t>(y),static_cast<uint32_t>(y+h));
     for (int yy = y; yy < y + h; ++yy)
     {
         uint32_t* row = g_overlayBuffer + (uint32_t)yy * g_backBufStride;
@@ -1719,10 +1729,14 @@ static void CompositorLoopWM()
     // can honour per-window opacity. Clear the layer on a full repaint (mirrors
     // the wallpaper redraw of g_backBuffer) so stale chrome from moved/closed
     // windows does not linger.
+    const bool newChromeLayer=g_chromeBuffer==nullptr;
     bool drawChromeLayer = CompositorGpuActive() && EnsureChromeBuffer();
-    if (drawChromeLayer && fullRepaint)
+    if(drawChromeLayer && newChromeLayer)fullRepaint=true;
+    if (drawChromeLayer && fullRepaint) {
         __builtin_memset(g_chromeBuffer, 0,
                          static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4);
+        g_chromeDamage.Mark(0,g_physFbHeight);
+    }
 
     // GPU path: taskbar + launcher go into the separate overlay layer
     // (composited on top of all windows at g_overlayOpacity), so they can be
@@ -1730,6 +1744,7 @@ static void CompositorLoopWM()
     bool drawOverlayLayer = CompositorGpuActive() && EnsureOverlayBuffer();
     if (drawOverlayLayer && fullRepaint)
     {
+        g_overlayDamage.Mark(0,g_physFbHeight);
         __builtin_memset(g_overlayBuffer, 0,
                          static_cast<uint64_t>(g_backBufStride) * g_physFbHeight * 4);
         g_overlayLauncherShown = false;
@@ -1898,7 +1913,9 @@ static void CompositorLoopWM()
         if (drawChromeLayer)
         {
             Window* cw = WmGetWindow(sorted[i]);
-            if (cw && !cw->noChrome)
+            // Geometry, theme, focus, caption hover and title changes request
+            // full repaint. Client-only animation cannot change this layer.
+            if (cw && !cw->noChrome && (fullRepaint || !g_gpuLayerDamage))
             {
                 WmRenderChromeForWindow(g_chromeBuffer, g_backBufStride,
                                          g_physFbWidth, g_physFbHeight, sorted[i],
@@ -1925,7 +1942,7 @@ static void CompositorLoopWM()
         WmRenderTaskbar(g_overlayBuffer, g_backBufStride,
                         g_physFbWidth, g_physFbHeight, now, chromeMx, chromeMy);
         OverlaySetAlphaRect(0, (int)tbY, (int)g_physFbWidth, (int)WmMetric(WM_TASKBAR_HEIGHT));
-        MarkDirtyRows(tbY, g_physFbHeight);
+        if(!g_gpuLayerDamage)MarkDirtyRows(tbY,g_physFbHeight);
 
         int32_t lx, ly; uint32_t lw, lh;
         WmLauncherGetRect(g_physFbWidth, g_physFbHeight, &lx, &ly, &lw, &lh);
@@ -1935,14 +1952,14 @@ static void CompositorLoopWM()
             WmLauncherRender(g_overlayBuffer, g_backBufStride,
                              g_physFbWidth, g_physFbHeight, chromeMx, chromeMy);
             OverlaySetAlphaRect(lx, ly, (int)lw, (int)lh);
-            MarkDirtyRows(ly > 0 ? (uint32_t)ly : 0, (uint32_t)(ly + (int)lh));
+            if(!g_gpuLayerDamage)MarkDirtyRows(ly>0?static_cast<uint32_t>(ly):0,static_cast<uint32_t>(ly+lh));
             g_overlayLauncherShown = true;
         }
         else if (g_overlayLauncherShown)
         {
             // Launcher just closed — erase its pixels from the overlay.
             OverlayClearRect(lx, ly, (int)lw, (int)lh);
-            MarkDirtyRows(ly > 0 ? (uint32_t)ly : 0, (uint32_t)(ly + (int)lh));
+            if(!g_gpuLayerDamage)MarkDirtyRows(ly>0?static_cast<uint32_t>(ly):0,static_cast<uint32_t>(ly+lh));
             g_overlayLauncherShown = false;
         }
     }
@@ -3013,76 +3030,42 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     //    texture, so window animation does NOT dirty this.
     EnsureDesktopTex(gpu);
     if (!g_desktopTex) return;
-    if (g_desktopTexNeedsFull)
-    {
-        gpu->UpdateTexture(g_desktopTex, 0, 0, g_physFbWidth, g_physFbHeight);
-        g_desktopTexNeedsFull = false;
+    g_desktopDamage.Mark(dirtyMinY,dirtyMaxY);
+    if(!g_gpuLayerDamage) {
+        g_chromeDamage.Mark(dirtyMinY,dirtyMaxY);
+        g_overlayDamage.Mark(dirtyMinY,dirtyMaxY);
     }
-    else if (dirtyMinY < dirtyMaxY)
-    {
-        uint32_t maxY = dirtyMaxY > g_physFbHeight ? g_physFbHeight : dirtyMaxY;
-        if (maxY > dirtyMinY)
-            gpu->UpdateTexture(g_desktopTex, 0, dirtyMinY,
-                               g_physFbWidth, maxY - dirtyMinY);
-    }
+    auto uploadLayer=[&](GpuTexId texture,TextureDamage& damage,bool& full) {
+        return damage.Flush(full,g_physFbWidth,g_physFbHeight,
+            [&](uint32_t x,uint32_t y,uint32_t w,uint32_t h) {
+                return gpu->UpdateTexture(texture,x,y,w,h);
+            });
+    };
+    uploadLayer(g_desktopTex,g_desktopDamage,g_desktopTexNeedsFull);
 
-    // 1b. Chrome layer: the per-window decorations as an alpha texture, uploaded
-    //     over the same dirty span as the desktop. (WM mode populates it; in
-    //     legacy mode g_chromeBuffer is null and this is skipped.)
-    bool useChromeLayer = g_chromeBuffer != nullptr;
-    if (useChromeLayer)
-    {
+    bool useChromeLayer=g_chromeBuffer!=nullptr;
+    if(useChromeLayer) {
         EnsureChromeTex(gpu);
-        if (g_chromeTex)
-        {
-            if (g_chromeTexNeedsFull)
-            {
-                gpu->UpdateTexture(g_chromeTex, 0, 0, g_physFbWidth, g_physFbHeight);
-                g_chromeTexNeedsFull = false;
-            }
-            else if (dirtyMinY < dirtyMaxY)
-            {
-                uint32_t maxY = dirtyMaxY > g_physFbHeight ? g_physFbHeight : dirtyMaxY;
-                if (maxY > dirtyMinY)
-                    gpu->UpdateTexture(g_chromeTex, 0, dirtyMinY,
-                                       g_physFbWidth, maxY - dirtyMinY);
-            }
-        }
-        else useChromeLayer = false;
+        if(g_chromeTex)uploadLayer(g_chromeTex,g_chromeDamage,g_chromeTexNeedsFull);
+        else useChromeLayer=false;
     }
-
-    // 1c. Overlay layer (taskbar + launcher) as an alpha texture. (WM mode
-    //     populates it; in legacy mode g_overlayBuffer is null and this is skipped.)
-    bool useOverlayLayer = g_overlayBuffer != nullptr;
-    if (useOverlayLayer)
-    {
+    bool useOverlayLayer=g_overlayBuffer!=nullptr;
+    if(useOverlayLayer) {
         EnsureOverlayTex(gpu);
-        if (g_overlayTex)
-        {
-            if (g_overlayTexNeedsFull)
-            {
-                gpu->UpdateTexture(g_overlayTex, 0, 0, g_physFbWidth, g_physFbHeight);
-                g_overlayTexNeedsFull = false;
-            }
-            else if (dirtyMinY < dirtyMaxY)
-            {
-                uint32_t maxY = dirtyMaxY > g_physFbHeight ? g_physFbHeight : dirtyMaxY;
-                if (maxY > dirtyMinY)
-                    gpu->UpdateTexture(g_overlayTex, 0, dirtyMinY,
-                                       g_physFbWidth, maxY - dirtyMinY);
-            }
-        }
-        else useOverlayLayer = false;
+        if(g_overlayTex)uploadLayer(g_overlayTex,g_overlayDamage,g_overlayTexNeedsFull);
+        else useOverlayLayer=false;
     }
 
-    // 2. Cursor sprite: upload the same composed frame used by CPU drawing.
-    if (!g_cursorTex)
-    {
-        g_cursorTex = gpu->CreateTexture(CURSOR_MAX, CURSOR_MAX,
-                                         reinterpret_cast<uint64_t>(g_cursorFrame.pixels), true);
+    // Position and hotspot affect drawing, not texture contents. Cache exact
+    // pixels and dimensions only after an accepted upload; busy animation and
+    // client cursor replacements therefore invalidate without a hash collision.
+    if(!g_cursorTex) {
+        g_cursorTex=gpu->CreateTexture(CURSOR_MAX,CURSOR_MAX,
+            reinterpret_cast<uint64_t>(g_cursorFrame.pixels),true);
+        g_cursorUpload.valid=false;
     }
-    if (g_cursorTex)
-        gpu->UpdateTexture(g_cursorTex, 0, 0, g_cursorFrame.width, g_cursorFrame.height);
+    if(g_cursorTex)g_cursorUpload.Update(g_cursorFrame,!g_gpuLayerDamage,
+        [&](uint32_t w,uint32_t h){return gpu->UpdateTexture(g_cursorTex,0,0,w,h);});
 
     int sorted[WM_MAX_WINDOWS];
     uint32_t wcount = WmGetZOrder(sorted, WM_MAX_WINDOWS);
@@ -3129,9 +3112,8 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             e.generation=publication.generation;
             contentDirty = true;   // force first upload
         }
-        if (e.tex && contentDirty)
+        if (e.tex && contentDirty && gpu->UpdateTexture(e.tex,0,0,sw,sh))
         {
-            gpu->UpdateTexture(e.tex, 0, 0, sw, sh);
             if (isWayland) WmAcknowledgeContent(idx,publication);
             else if (p)    p->fbDirty = 0;
         }

@@ -454,3 +454,6 @@ target_compile_options(test_dmabuf_layout PRIVATE -UNDEBUG)
 
 add_host_test(test_gpu_reservation)
 target_compile_options(test_gpu_reservation PRIVATE -UNDEBUG)
+
+# Actual persistent texture transfer body and compositor invalidation retry.
+add_host_test(test_texture_damage)
