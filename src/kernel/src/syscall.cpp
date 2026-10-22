@@ -8,6 +8,7 @@
 #include "posix_timer.h"
 #include "sysv_sem.h"
 #include "signal_fd.h"
+#include "unix_credentials.h"
 #include "timeout_value.h"
 #include "timerfd_state.h"
 #include "dsp_geometry.h"
@@ -1185,12 +1186,6 @@ struct UnixFdSnap {
 
 static void UnixFdSnapRelease(const UnixFdSnap* snap);
 
-struct UnixCredentials {
-    int32_t pid;
-    uint32_t uid;
-    uint32_t gid;
-};
-static_assert(sizeof(UnixCredentials) == 12, "Linux ucred ABI");
 static UnixCredentials UnixCurrentCredentials(Process* process)
 {
     return {static_cast<int32_t>((process->tgid ? process->tgid : process->pid)), process->euid, process->egid};
@@ -1220,10 +1215,12 @@ struct UnixFdQueue {
 // bytes arrive; unsynchronized receivers can also install the same ref twice.
 static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
                                   const char* bytes, uint64_t length,
-                                  const UnixFdSnap* descriptors=nullptr, int count=0) {
+                                  const UnixFdSnap* descriptors=nullptr, int count=0,
+                                  const UnixCredentials* explicitCredentials=nullptr) {
     auto* process = ProcessCurrent();
-    const UnixCredentials sender{static_cast<int32_t>(process->tgid ? process->tgid : process->pid),
-        process->uid, process->gid};
+    const UnixCredentials sender=explicitCredentials?*explicitCredentials:UnixCredentials{
+        static_cast<int32_t>(process->tgid ? process->tgid : process->pid),
+        ProcessReadIds(process,false).real,ProcessReadIds(process,true).real};
     SpinLockAcquire(&pipe->lock);
     bool merge = false;
     if (queue && queue->credentialHead != queue->credentialTail) {
@@ -1719,11 +1716,12 @@ struct FdRef
 
 static int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
                                    const char* bytes,uint64_t length,
-                                   const UnixFdSnap* descriptors=nullptr,int count=0,bool noSignal=false) {
+                                   const UnixFdSnap* descriptors=nullptr,int count=0,bool noSignal=false,
+                                   const UnixCredentials* explicitCredentials=nullptr) {
     if(socket->state!=UnixSocketData::State::Connected || !socket->txPipe)return -ENOTCONN;
     auto* pipe=socket->txPipe;
     for(;;) {
-        auto result=UnixStreamTryWrite(pipe,socket->peerIncomingFds,bytes,length,descriptors,count);
+        auto result=UnixStreamTryWrite(pipe,socket->peerIncomingFds,bytes,length,descriptors,count,explicitCredentials);
         if(result!=-EAGAIN) {
             if(result==-EPIPE && !noSignal)ProcessSendSignal(ProcessCurrent(),13);
             if(result>0) {
@@ -13844,8 +13842,9 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     int fd = static_cast<int>(fdVal);
     if (msgVal < 0x1000) return -EFAULT;
 
-    if (!UserBufferReadable(msgVal,sizeof(LinuxMsgHdr))) return -EFAULT;
-    auto* msg = reinterpret_cast<LinuxMsgHdr*>(msgVal);
+    LinuxMsgHdr stagedHeader{};
+    if(!CopyFromUser(&stagedHeader,msgVal,sizeof(stagedHeader)))return -EFAULT;
+    auto* msg=&stagedHeader;
     if (!msg->msg_iovlen || msg->msg_iovlen>1024 || !msg->msg_iov) return -EINVAL;
     if (!UserBufferReadable(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen*sizeof(*msg->msg_iov))) return -EFAULT;
 
@@ -13865,6 +13864,11 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     // rather than send orphaned payload — matches Linux kernel behaviour.
     UnixFdSnap pendingSnaps[UNIX_FD_QUEUE_CAP];
     int pendingCount = 0;
+    UnixCredentials explicitCredentials{};bool hasExplicitCredentials=false;
+    auto failControl=[&](int error)->int64_t {
+        for(int j=0;j<pendingCount;++j)UnixFdSnapRelease(&pendingSnaps[j]);
+        return error;
+    };
 
     if (msg->msg_control && msg->msg_controllen >= sizeof(CmsgHdr)) {
         uint64_t ctlAddr = reinterpret_cast<uint64_t>(msg->msg_control);
@@ -13872,21 +13876,22 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
 
         uint64_t off = 0;
         while (off + sizeof(CmsgHdr) <= msg->msg_controllen) {
-            auto* cm = reinterpret_cast<CmsgHdr*>(ctlAddr + off);
-            if (cm->cmsg_len < sizeof(CmsgHdr) || cm->cmsg_len > msg->msg_controllen - off)
-                break;
-
-            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == 2) {
-                // Automatic sender credentials are supported. Explicit user
-                // credentials require separate identity/capability validation.
-                for (int j = 0; j < pendingCount; ++j) UnixFdSnapRelease(&pendingSnaps[j]);
-                return -95;
+            CmsgHdr cm{};
+            if(!CopyFromUser(&cm,ctlAddr+off,sizeof(cm)))return failControl(-EFAULT);
+            if(cm.cmsg_len<sizeof(cm) || cm.cmsg_len>msg->msg_controllen-off)
+                return failControl(-EINVAL);
+            if(cm.cmsg_level==SOL_SOCKET && cm.cmsg_type==2) { // SCM_CREDENTIALS
+                if(cm.cmsg_len!=sizeof(cm)+sizeof(UnixCredentials))return failControl(-EINVAL);
+                UnixCredentials requested{};
+                if(!CopyFromUser(&requested,ctlAddr+off+sizeof(cm),sizeof(requested)))return failControl(-EFAULT);
+                const auto users=ProcessReadIds(proc,false),groups=ProcessReadIds(proc,true);
+                const int32_t sender=proc->tgid?proc->tgid:proc->pid;
+                if(int error=UnixCredentialsCheck(requested,sender,users,groups))return failControl(error);
+                explicitCredentials=requested;hasExplicitCredentials=true;
             }
-            if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
-                uint64_t dataLen = cm->cmsg_len - sizeof(CmsgHdr);
+            if (cm.cmsg_level == SOL_SOCKET && cm.cmsg_type == SCM_RIGHTS) {
+                uint64_t dataLen = cm.cmsg_len - sizeof(CmsgHdr);
                 uint64_t nFds    = dataLen / sizeof(int);
-                auto* fds = reinterpret_cast<int*>(
-                    reinterpret_cast<uint64_t>(cm) + sizeof(CmsgHdr));
 
                 for (uint64_t i = 0; i < nFds; i++) {
                     if (pendingCount >= UNIX_FD_QUEUE_CAP-1) {
@@ -13894,7 +13899,9 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                             UnixFdSnapRelease(&pendingSnaps[j]);
                         return -90; // EMSGSIZE: this group can never fit.
                     }
-                    FdRef sourceDescriptor(proc, fds[i]);
+                    int transferredFd=0;
+                    if(!CopyFromUser(&transferredFd,ctlAddr+off+sizeof(cm)+i*sizeof(int),sizeof(int)))return failControl(-EFAULT);
+                    FdRef sourceDescriptor(proc, transferredFd);
                     FdEntry* srcFde = sourceDescriptor.get();
                     if (!srcFde || !UnixFdSnapFrom(srcFde, &pendingSnaps[pendingCount])) {
                         for (int j = 0; j < pendingCount; j++)
@@ -13905,7 +13912,7 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                 }
             }
 
-            uint64_t step = CmsgAlign(cm->cmsg_len);
+            uint64_t step = CmsgAlign(cm.cmsg_len);
             if (step == 0) break;
             off += step;
         }
@@ -13921,7 +13928,8 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
             return total?total:-EFAULT;
         }
         auto n=UnixSocketWriteSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
-            static_cast<const char*>(iov.iov_base),iov.iov_len,pendingSnaps,pendingCount,(flagsVal&0x4000)!=0);
+            static_cast<const char*>(iov.iov_base),iov.iov_len,pendingSnaps,pendingCount,(flagsVal&0x4000)!=0,
+            hasExplicitCredentials?&explicitCredentials:nullptr);
         if(n>0) {pendingCount=0;total+=n;}
         if(n<0 || static_cast<uint64_t>(n)<iov.iov_len) {
             for(int j=0;j<pendingCount;++j)UnixFdSnapRelease(&pendingSnaps[j]);

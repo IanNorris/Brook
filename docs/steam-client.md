@@ -1,10 +1,12 @@
 # Native Steam client checkpoint
 
 The 22 October login-screen attempt executes Valve's native x86-64 Linux
-client on Brook, but does not reach a login window. SysV semaphore startup now
-passes real guest lifecycle acceptance, and Steam reaches its updater/launcher.
-Named FIFO, signal-fd watching and an X display remain observed gaps. No account
-credentials are entered. This is not Steam/Proton acceptance.
+client on Brook, but does not reach a login window. SysV semaphores and signal-fd
+watching pass native guest acceptance. Software Xwayland accepts the client's
+connection, and explicit Unix credentials now pass D-Bus authentication. The
+native64 client then enters its required SteamRT container path and fails opening
+`/proc/self/root`. Named FIFO assertions, privilege and namespace requirements
+also remain. No account credentials are entered. This is not Steam/Proton acceptance.
 
 ## Payload and environment
 
@@ -208,3 +210,56 @@ remain unresolved. No login window or account authentication is claimed.
 The signalfd review stops cleanly after graceful Xwayland group exit; the
 original launcher exits zero, final heap integrity passes, and all four
 offline filesystem checks pass. The checked image is retained as the next seed.
+
+## Explicit Unix credentials and the runtime-container boundary
+
+Unix-stream sendmsg now accepts an explicitly supplied SCM_CREDENTIALS record
+when its PID is the sender's TGID, its UID is one of the sender's real/effective/
+saved UIDs, and its GID is one of the equivalent GIDs. Invalid IDs and malformed
+records are rejected. This is the unprivileged subset of
+[Linux credential validation](https://github.com/torvalds/linux/blob/v6.12/net/core/scm.c);
+CAP_SYS_ADMIN/SETUID/SETGID overrides are not implemented or claimed.
+
+The message header, ancillary headers, credential record and descriptor numbers
+are copied before use. Validated credentials are attached to the actual accepted
+byte span; SO_PASSCRED still controls delivery. Rights are privately retained
+until bytes commit and released on control parsing, credential validation or
+write failure. Connection-time SO_PEERCRED identity is unchanged. The older
+iovec/payload copying path is not redesigned by this change.
+
+The expanded `tools/at-syscall-probe/passcredcheck.c`, built separately with
+`tools/unix-credentials-probe-pkg`, passes on Linux and as UID 1000 in Brook.
+It tests automatic and explicit credentials, child sender identity, combined
+credentials/rights, malformed records, rejected identity claims, and exact
+pipe-writer-reference rollback after invalid credentials, full nonblocking
+socket EAGAIN and inaccessible control data EFAULT. The last case verifies
+failure without leaked rights; Brook's whole-control preflight can reject it
+before acquiring the first right. Linux reports 1,030 checks and Brook 974;
+the full-socket test counts each fill/drain operation, so counts vary with socket
+capacity. Both report zero failures. All 90 host tests and supported compiled
+entry/start mutation audits pass. The native signalfd regression also passes
+against this kernel; heap integrity passes. ABI remains 34.
+
+Evidence is `steam-credentials-off-gpu-1ms-fixed-mlfq-a-20261022`, kernel
+`cf48cffbd8e2fb5c88df01b75df2a9be5736886d5d9be3a33472b4d4d8797cb5`.
+The original Steam job 122 and subsequent corrected-environment job 152 each
+exit 2 with zero live tasks. The D-Bus credential error is gone. The first run
+then fails because STEAM_RUNTIME=0 incorrectly identifies an existing runtime.
+The corrected run removes that variable, matching the retained native64
+steam.sh branch and Valve's [launcher guidance](https://github.com/ValveSoftware/steam-for-linux/issues/13597).
+It reaches pressure-vessel-wrap and reports `opendir(/proc/self/root): No such
+file or directory`.
+
+Astra's bounded script review finds no supported native64 non-container path:
+pv-run.sh calls srt-client-container, and the runtime entry point ultimately
+executes pressure-vessel-wrap. SDK/custom-runtime options still use containers.
+The legacy STEAM_RUNTIME=0 branch is explicitly unsupported and does not provide
+a native64 escape hatch. Implementing `/proc/self/root` alone would not establish
+the separately missing no_new_privs, user/mount namespace and mount semantics.
+Full runtime-container support needs a separate scope decision; no checks or
+security operations are replaced with successful stubs. No login page exists yet.
+
+Xwayland exits through semantic close with its exact registered group gone.
+The final heap check passes and shutdown acknowledges the checked filesystem
+and device flush. The original launcher exits zero and all four offline
+filesystem checks pass; their receipts remain with the review image.

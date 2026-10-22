@@ -2,12 +2,23 @@
 #include <cassert>
 #include <cstring>
 #include "../../kernel/src/credential_ids.h"
+#include "../../kernel/src/unix_credentials.h"
 #include "../../kernel/src/desktop_identity.h"
 using namespace brook;
 static void expect(CredentialIds ids, uint32_t r, uint32_t e, uint32_t s) {
     assert(ids.real == r && ids.effective == e && ids.saved == s);
 }
 int main() {
+    const brook::CredentialIds scmUsers{1000,1001,1002},scmGroups{2000,2001,2002};
+    assert(brook::UnixCredentialsCheck({42,1000,2000},42,scmUsers,scmGroups)==0);
+    assert(brook::UnixCredentialsCheck({42,1001,2002},42,scmUsers,scmGroups)==0);
+    assert(brook::UnixCredentialsCheck({43,1000,2000},42,scmUsers,scmGroups)==-1);
+    assert(brook::UnixCredentialsCheck({42,1003,2000},42,scmUsers,scmGroups)==-1);
+    assert(brook::UnixCredentialsCheck({42,1000,2003},42,scmUsers,scmGroups)==-1);
+    assert(brook::UnixCredentialsCheck({42,~uint32_t{0},2000},42,scmUsers,scmGroups)==-22);
+    // Root IDs do not invent capability override support.
+    assert(brook::UnixCredentialsCheck({42,1000,2000},42,{0,0,0},{0,0,0})==-1);
+
     uint32_t parsed = 123;
     assert(ParseLaunchId("0", &parsed) && parsed == 0);
     assert(ParseLaunchId("4294967294", &parsed) && parsed == 0xfffffffeU);
