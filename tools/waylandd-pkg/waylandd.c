@@ -516,9 +516,36 @@ static void surface_send_frame_callbacks(struct brook_surface *surface, uint32_t
     }
 }
 static struct wl_event_source *g_frame_timer;
+#include "frame-clock.h"
+static int g_phase_frame_clock, g_frame_clock_failed;
+static struct brook_frame_clock g_frame_clock;
+static uint64_t g_frame_late_max_ms, g_frame_late_sum_ms, g_frame_late_count;
+static int frame_monotonic_ms(uint64_t *now) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC,&ts) || ts.tv_sec<0 || ts.tv_nsec<0 || ts.tv_nsec>=1000000000L) return -1;
+    *now=(uint64_t)ts.tv_sec*1000u+(uint64_t)ts.tv_nsec/1000000u;return 0;
+}
+static int frame_clock_fail(void) {
+    fprintf(stderr,"[waylandd] FAIL: frame clock/timer\n");
+    g_frame_clock_failed=1;g_shutdown=1;return 0;
+}
 static int frame_clock_tick(void *unused) {
     (void)unused;
     uint32_t now = g_now_ms();
+    if (g_phase_frame_clock || g_trace_frames) {
+        uint64_t tick;
+        if (frame_monotonic_ms(&tick)) return frame_clock_fail();
+        if (g_phase_frame_clock && tick<g_frame_clock.next_ms) {
+            int delay=brook_frame_clock_delay(&g_frame_clock,tick);
+            if (delay<1 || wl_event_source_timer_update(g_frame_timer,delay)<0) return frame_clock_fail();
+            return 0;
+        }
+        if (g_trace_frames && tick>=g_frame_clock.next_ms) {
+            uint64_t late=tick-g_frame_clock.next_ms;
+            if (late>g_frame_late_max_ms) g_frame_late_max_ms=late;
+            g_frame_late_sum_ms+=late;++g_frame_late_count;
+        }
+    }
     if (g_trace_frames) {
         if (g_trace_ticks && now - g_trace_last_tick > g_trace_tick_max_ms)
             g_trace_tick_max_ms = now - g_trace_last_tick;
@@ -530,12 +557,22 @@ static int frame_clock_tick(void *unused) {
         while (root->subsurface_parent) root = root->subsurface_parent;
         if (root->wm_id || surface->is_cursor) surface_send_frame_callbacks(surface, now);
     }
-    wl_event_source_timer_update(g_frame_timer, 16);
+    int delay=BROOK_FRAME_PERIOD_MS;
+    if (g_phase_frame_clock || g_trace_frames) {
+        uint64_t finished;
+        if (frame_monotonic_ms(&finished)) return frame_clock_fail();
+        if (g_phase_frame_clock) delay=brook_frame_clock_delay(&g_frame_clock,finished);
+        else if (brook_frame_clock_start(&g_frame_clock,finished)<0) return frame_clock_fail();
+    }
+    if (delay<1 || wl_event_source_timer_update(g_frame_timer,delay)<0) return frame_clock_fail();
     return 0;
 }
 static void trace_frames_report(uint32_t now) {
     if (!g_trace_frames || now - g_trace_last_report < 1000) return;
     g_trace_last_report = now;
+    fprintf(stderr,"[wayland-frame] phase_clock=%d late_count=%llu late_sum_ms=%llu late_max_ms=%llu\n",
+            g_phase_frame_clock,(unsigned long long)g_frame_late_count,
+            (unsigned long long)g_frame_late_sum_ms,(unsigned long long)g_frame_late_max_ms);
     fprintf(stderr, "[wayland-frame] clock ms=%u ticks=%llu max_tick_gap_ms=%u dispatches=%llu max_dispatch_ms=%u max_input_ms=%u\n",
             now, (unsigned long long)g_trace_ticks, g_trace_tick_max_ms,
             (unsigned long long)g_trace_dispatches, g_trace_dispatch_max_ms, g_trace_input_max_ms);
@@ -2771,6 +2808,7 @@ int main(int argc, char **argv)
     int run_seconds = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--trace-frames")) g_trace_frames = 1;
+        if (!strcmp(argv[i], "--phase-frame-clock")) g_phase_frame_clock = 1;
         if ((!strcmp(argv[i], "--for") || !strcmp(argv[i], "--seconds"))
             && i + 1 < argc)
             run_seconds = atoi(argv[++i]);
@@ -2857,7 +2895,9 @@ int main(int argc, char **argv)
     if (!loop) return 1;
     g_frame_timer = wl_event_loop_add_timer(loop, frame_clock_tick, NULL);
     if (!g_frame_timer) return 1;
-    wl_event_source_timer_update(g_frame_timer, 16);
+    uint64_t initial_frame_ms;
+    if (frame_monotonic_ms(&initial_frame_ms) || brook_frame_clock_start(&g_frame_clock,initial_frame_ms)<0 ||
+        wl_event_source_timer_update(g_frame_timer,BROOK_FRAME_PERIOD_MS)<0) return 1;
 
     uint32_t loop_start = g_now_ms();
     for (;;) {
@@ -2889,6 +2929,6 @@ int main(int argc, char **argv)
 done:
     fprintf(stderr, "[waylandd] shutting down (commits=%d)\n", g_commit_count);
     wl_display_destroy(g_display);
-    fprintf(stderr, "[waylandd] PASS\n");
-    return 0;
+    fprintf(stderr, "[waylandd] %s\n",g_frame_clock_failed?"FAIL":"PASS");
+    return g_frame_clock_failed?1:0;
 }

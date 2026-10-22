@@ -4,6 +4,19 @@
 #include "waylandd.c"
 #undef main
 int main(void) {
+    struct brook_frame_clock phase={0};
+    assert(brook_frame_clock_start(&phase,100)==16 && phase.next_ms==116);
+    assert(brook_frame_clock_delay(&phase,116)==16 && phase.next_ms==132);
+    assert(brook_frame_clock_delay(&phase,139)==9 && phase.next_ms==148);
+    assert(brook_frame_clock_delay(&phase,200)==12 && phase.next_ms==212);
+    assert(brook_frame_clock_delay(&phase,205)==7 && phase.next_ms==212);
+    assert(brook_frame_clock_delay(&phase,100)==-1);
+    // Cross wl_callback's 32-bit timestamp wrap without losing timer phase.
+    assert(brook_frame_clock_start(&phase,UINT32_MAX-7u)==16);
+    assert(brook_frame_clock_delay(&phase,(uint64_t)UINT32_MAX+12u)==13);
+    assert(brook_frame_clock_start(&phase,UINT64_MAX-3)==-1);
+    phase.next_ms=UINT64_MAX-7;
+    assert(brook_frame_clock_delay(&phase,UINT64_MAX)==-1);
     g_trace_frames = 1;
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
@@ -14,6 +27,8 @@ int main(void) {
     g_frame_timer=wl_event_loop_add_timer(loop,frame_clock_tick,NULL);
     assert(g_frame_timer);
     assert(wl_event_source_timer_update(g_frame_timer,16)==0);
+    uint64_t initial;
+    assert(frame_monotonic_ms(&initial)==0 && brook_frame_clock_start(&g_frame_clock,initial)==16);
     struct brook_surface surface={0};
     surface_tree_init(&surface);
     surface.wm_id=1;g_surfaces=&surface;
@@ -25,6 +40,7 @@ int main(void) {
     assert(surface.resource);
     wl_resource_set_user_data(surface.resource,&surface);
     for(unsigned round=0;round<3;++round) {
+        g_phase_frame_clock=(round==1);
         surface_frame(client,surface.resource,3+round);
         assert(wl_list_length(&surface.pending_frames)==1);
         assert(wl_event_loop_dispatch(loop,32)==0);
