@@ -22,7 +22,7 @@ long failAllocation=-1;
 unsigned schedulerLockDepth=0;
 struct Mount;
 struct Node { Mount* mount;uint64_t id;bool dir;Node* parent;std::map<std::string,Node*> children;std::string target; };
-struct Mount { bool alive=false;unsigned live=0;unsigned closed=0;Node root{}; };
+struct Mount { uint64_t identity=0;bool alive=false;unsigned live=0;unsigned closed=0;Node root{}; };
 Mount mounts[8];
 unsigned mountCalls[8]{},unmountCalls[8]{},syncCalls[8]{};
 bool rejectRoot[8]{},rejectUnmount[8]{};
@@ -38,7 +38,7 @@ int makeObject(Node* source,brook::VfsObject** out){
 }
 void destroyObject(brook::VfsObject* object){auto& m=*node(object).mount;assert(m.alive && m.live);--m.live;brook::kfree(object);}
 int objectStat(brook::VfsObject* object,brook::VnodeStat* stat){
-    auto& n=node(object);assert(n.mount->alive);*stat={};stat->isDir=n.dir;stat->isSymlink=!n.target.empty();stat->ino=n.id;stat->dev=n.mount-mounts+1;stat->mode=n.dir?0040755:0100644;return 0;
+    auto& n=node(object);assert(n.mount->alive);*stat={};stat->isDir=n.dir;stat->isSymlink=!n.target.empty();stat->ino=n.id;stat->dev=n.mount->identity;stat->mode=n.dir?0040755:0100644;return 0;
 }
 int objectAccess(brook::VfsObject*,uint8_t,bool){return 0;}
 int objectChild(brook::VfsObject* parent,const char* name,brook::VfsObject** out,bool=false){
@@ -88,8 +88,14 @@ int objectRename(brook::VfsObject* oldParent,const char* oldName,brook::VfsObjec
 }
 const brook::VfsObjectOps objectOps={.destroy=destroyObject,.stat=objectStat,.access=objectAccess,
     .lookup=objectChild,.parent=objectParent,.readlink=objectReadlink,.open=objectOpen,.rename=objectRename,.directory_path=objectDirectoryPath,.follow_link=objectFollow};
-bool mountBackend(uint8_t drive,void** out){assert(drive<8 && !mounts[drive].alive);auto& m=mounts[drive];++mountCalls[drive];m.alive=true;m.root={&m,1,true,&m.root,{}, {}};*out=&m;return true;}
+bool mountBackend(uint8_t drive,void** out){assert(drive<8 && !mounts[drive].alive);auto& m=mounts[drive];++mountCalls[drive];m.alive=true;m.identity=drive+1;m.root={&m,1,true,&m.root,{}, {}};*out=&m;return true;}
 int unmountBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive && !m->live);auto index=m-mounts;++unmountCalls[index];if(rejectUnmount[index])return -5;m->alive=false;return 0;}
+unsigned freshUnmounts=0,freshUnmountAttempts=0;
+bool freshRejectUnmount=false;
+int freshSync(void* priv){assert(static_cast<Mount*>(priv)->alive);return 0;}
+bool freshRejectRoot=false,freshFailAfterRoot=false;
+int freshUnmount(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive && !m->live);++freshUnmountAttempts;if(freshRejectUnmount)return -5;m->alive=false;++freshUnmounts;return 0;}
+int freshRoot(void* priv,uint8_t,brook::VfsObject** out){*out=nullptr;if(freshRejectRoot)return -5;int error=makeObject(&static_cast<Mount*>(priv)->root,out);return !error && freshFailAfterRoot?-5:error;}
 int rootObject(void* priv,uint8_t drive,brook::VfsObject** out){if(rejectRoot[drive]){*out=nullptr;return -5;}return makeObject(&static_cast<Mount*>(priv)->root,out);}
 int vnodeObject(brook::Vnode* vn,brook::VfsObject** out){*out=vn->backendObject;brook::VfsObjectRetain(*out);return 0;}
 Node* legacyLookup(Mount* mount,const char* path){
@@ -123,6 +129,7 @@ int legacyRename(void* priv,uint8_t,const char* oldPath,const char* newPath){
 }
 int syncBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive);++syncCalls[m-mounts];return 0;}
 const brook::VfsFsOps fsOps={.mount=mountBackend,.unmount=unmountBackend,.open=legacyOpen,.stat_path=legacyStat,.lstat_path=legacyStat,.unlink=nullptr,.mkdir=nullptr,.rename=legacyRename,.symlink=nullptr,.readlink=nullptr,.sync=syncBackend,.root_object=rootObject,.vnode_object=vnodeObject};
+const brook::VfsFsOps freshOps={.mount=mountBackend,.unmount=freshUnmount,.open=legacyOpen,.stat_path=legacyStat,.lstat_path=legacyStat,.unlink=nullptr,.mkdir=nullptr,.rename=legacyRename,.symlink=nullptr,.readlink=nullptr,.sync=freshSync,.root_object=freshRoot,.vnode_object=vnodeObject};
 const brook::VfsFsOps unsupportedOps={.mount=mountBackend,.unmount=unmountBackend,.open=nullptr,.stat_path=nullptr,.lstat_path=nullptr,.unlink=nullptr,.mkdir=nullptr,.rename=nullptr,.symlink=nullptr,.readlink=nullptr,.sync=nullptr};
 brook::VfsPath resolve(const brook::VfsPath& root,const brook::VfsPath& start,const char* text){brook::VfsPath out{};int error=brook::VfsPathResolve(root,start,text,&out);if(error)std::fprintf(stderr,"resolve %s: %d\n",text,error);assert(!error);return out;}
 void expect(const brook::VfsPath& root,const brook::VfsPath& start,const char* text,const brook::VfsPath& expected){auto p=resolve(root,start,text);assert(brook::VfsPathSame(p,expected));brook::VfsPathRelease(p);}
@@ -152,6 +159,83 @@ int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return
 #include "scheduler_membership_fixture.inc"
 // Actual Process publication helpers and FsContext core. These exercise owned
 // context handoff/failure/races; native acceptance covers actual clone/exec.
+static void testFreshMounts(brook::MountNamespace* ns,const brook::VfsPath& root,
+    const brook::VfsPath& target,const brook::VfsPath& second) {
+    using namespace brook;
+    assert(VfsRegisterFs("fresh",&freshOps));
+    const auto before=allocations.size();const auto records=g_mounts.count;
+    Mount first{},other{},rollback{};
+    auto prepare=[](Mount& m,uint64_t id) {m.alive=true;m.identity=id;m.root={&m,1,true,&m.root,{},{}};};
+    prepare(first,1001);prepare(other,1002);prepare(rollback,1003);
+    assert(VfsMountNamespaceMountFresh(ns,root,"fresh",&freshOps,&rollback)==-95);
+    assert(VfsMountNamespaceMountFresh(ns,target,"missing",&freshOps,&rollback)==-95);
+    assert(VfsMountNamespaceMountFresh(ns,target,"objects",&freshOps,&rollback)==-95);
+    freshRejectRoot=true;
+    assert(VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&rollback)==-5);
+    freshRejectRoot=false;assert(rollback.alive && !rollback.live && !freshUnmounts);
+    freshFailAfterRoot=true;
+    assert(VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&rollback)==-5);
+    freshFailAfterRoot=false;assert(rollback.alive && !rollback.live && !freshUnmounts);
+    rollback.root.dir=false;
+    assert(VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&rollback)==-20);
+    rollback.root.dir=true;assert(rollback.alive && !rollback.live && !freshUnmounts);
+    bool published=false;
+    for(long failure=0;failure<64;++failure) {
+        failAllocation=failure;
+        int result=VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&rollback);
+        failAllocation=-1;
+        if(!result) {
+            auto path=resolve(root,root,"/ns-target");
+            assert(!VfsMountNamespaceDetach(ns,path));VfsPathRelease(path);VfsDrainMountCleanup();
+            assert(!rollback.alive);published=true;
+        } else {assert(result==-12 && rollback.alive && !rollback.live);}
+        assert(allocations.size()==before && g_mounts.count==records);
+        if(published)break;
+    }
+    assert(published && freshUnmounts==1);
+    assert(!VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&first,0));
+    assert(!VfsMountNamespaceMountFresh(ns,second,"fresh",&freshOps,&other,0));
+    assert(!VfsUnmount("/ns-target")); // retained fresh root requires namespace detach
+    auto held=resolve(root,root,"/ns-target"),otherHeld=resolve(root,root,"/ns-a");
+    VnodeStat a{},b{};assert(!VfsPathStat(held,&a) && !VfsPathStat(otherHeld,&b));
+    assert(a.dev==1001 && b.dev==1002 && a.ino==b.ino);
+    // The old driver/device API must not discover/coalesce a fresh instance.
+    auto oldMountCalls=mountCalls[0];
+    assert(VfsMount("/fresh-legacy","fresh",0));assert(mountCalls[0]==oldMountCalls+1);
+    assert(VfsUnmount("/fresh-legacy"));assert(freshUnmounts==2);
+    int openError=0;auto* vn=VfsPathOpen(held,VFS_O_METADATA,&openError);
+    assert(vn);
+    MountNamespace* copy=nullptr;VfsPath copyRoot{},copyCwd{};
+    assert(!VfsMountNamespaceCopy(ns,root,root,&copy,&copyRoot,&copyCwd));
+    assert(VfsMountNamespaceMountFresh(copy,copyRoot,"fresh",&freshOps,&rollback)==-3);
+    assert(VfsMountNamespaceActivate(copy));
+    assert(VfsMountNamespaceMountFresh(copy,target,"fresh",&freshOps,&rollback)==-22);
+    auto copied=resolve(copyRoot,copyRoot,"/ns-target");
+    VnodeStat c{};assert(!VfsPathStat(copied,&c) && c.dev==a.dev && c.ino==a.ino);
+    assert(!VfsMountNamespaceDetach(ns,held));assert(!VfsMountNamespaceDetach(ns,otherHeld));
+    VfsDrainMountCleanup();assert(first.alive && other.alive && freshUnmounts==2);
+    assert(!VfsPathStat(copied,&c) && c.dev==1001);
+    VfsPathRelease(copied);VfsMountNamespaceLeave(copy);VfsDrainMountCleanup();
+    VfsPathRelease(copyRoot);VfsPathRelease(copyCwd);VfsMountNamespaceRelease(copy);VfsDrainMountCleanup();
+    assert(first.alive && other.alive && freshUnmounts==2);
+    VfsPathRelease(otherHeld);VfsDrainMountCleanup();assert(!other.alive && freshUnmounts==3);
+    VfsPathRelease(held);VfsDrainMountCleanup();assert(first.alive);
+    VfsClose(vn);VfsDrainMountCleanup();assert(!first.alive && freshUnmounts==4);
+    assert(allocations.size()==before && g_mounts.count==records);
+    Mount retirement{};prepare(retirement,1004);
+    assert(!VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&retirement));
+    auto retiring=resolve(root,root,"/ns-target");
+    assert(!VfsMountNamespaceDetach(ns,retiring));VfsPathRelease(retiring);
+    auto attempts=freshUnmountAttempts;freshRejectUnmount=true;VfsDrainMountCleanup();
+    assert(retirement.alive && freshUnmountAttempts==attempts+1 && freshUnmounts==4);
+    bool pending=false;
+    for(auto* backing=g_backings;backing;backing=backing->next)
+        if(backing->mountPriv==&retirement) {assert(backing->independent && !backing->references);pending=true;}
+    assert(pending && VfsSync(nullptr)==-5 && freshUnmountAttempts==attempts+2);
+    freshRejectUnmount=false;assert(!VfsSync(nullptr));
+    assert(!retirement.alive && freshUnmounts==5 && freshUnmountAttempts==attempts+3);
+    assert(allocations.size()==before && g_mounts.count==records);
+}
 static void testProcessContexts(const brook::VfsPath& root,const brook::VfsPath& cwd) {
     using namespace brook;
     Process parent{},copy{},shared{},privateThread{};
@@ -447,6 +531,7 @@ int main(){
     auto originalTarget=resolve(stableRoot,stableRoot,"/ns-target");
     auto aPath=resolve(stableRoot,stableRoot,"/ns-a"),bPath=resolve(stableRoot,stableRoot,"/ns-b");
     auto* initial=VfsMountNamespaceInitial();
+    testFreshMounts(initial,stableRoot,originalTarget,aPath);
     MountNamespace* parentNs=nullptr;VfsPath parentRoot{},parentCwd{};
     assert(!VfsMountNamespaceCopy(initial,stableRoot,originalSynthetic,&parentNs,&parentRoot,&parentCwd));
     assert(VfsMountNamespaceBind(parentNs,aPath,parentCwd)==-3);

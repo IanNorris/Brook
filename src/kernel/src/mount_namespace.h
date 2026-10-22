@@ -3,6 +3,7 @@
 namespace brook {
 struct MountNamespace;
 struct UserNamespace;
+struct VfsFsOps;
 // Namespace handles own an active topology lease plus storage, independently
 // of task membership. Plain paths/snapshots retain storage only.
 bool VfsMountNamespaceHandleAcquire(MountNamespace* borrowed);
@@ -21,6 +22,13 @@ bool VfsMountNamespaceAbandon(MountNamespace* ns,bool wake=true);
 void VfsMountNamespaceLeave(MountNamespace* ns,bool wake=true);
 int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPath& cwd,
                           MountNamespace** out,VfsPath* newRoot,VfsPath* newCwd);
+// Publish a fresh filesystem instance over an existing directory. The registered
+// provider must match ops. On success ownership of privateData transfers to the
+// new backing; on any error the caller still owns it and must dispose it. No
+// driver mount callback or (driver,pdrv) backing coalescing occurs. Bind/copy
+// retain the resulting backing normally. Authorization/options are caller work.
+int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
+    const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv=0);
 // Core topology operations; syscall authorization/flag validation is separate.
 int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath& target);
 // PRIVATE and SLAVE (+ optional REC) coincide while every mount is private

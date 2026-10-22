@@ -10,7 +10,9 @@ readiness is implied by the foundation tests. The subsequent
 reporting; the accepted [proc namespace-handle checkpoint](proc-namespace-handles.md)
 then advances the same executable to mount propagation. The accepted
 [private propagation checkpoint](mount-propagation-checkpoint.md) advances it
-to the unsupported tmpfs mount. Its trivial child has not executed.
+to the unsupported tmpfs mount. The
+[fresh-instance foundation](tmpfs-foundation-checkpoint.md) adds internal mount
+instance ownership without exposing tmpfs yet. Its trivial child has not executed.
 
 The 22 October login-screen attempt executes Valve's native x86-64 Linux
 client on Brook, but does not reach a login window. SysV semaphores and signal-fd

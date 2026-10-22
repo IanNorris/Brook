@@ -93,3 +93,7 @@ The collecting wrapper exits zero while retaining the application's real exit 1
 and stderr. The trivial child has not executed, and no descendants remain. Tmpfs
 and root relocation are subsequent work. Steam authentication and general
 container-security acceptance are outside this checkpoint.
+
+The subsequent [fresh-instance foundation](tmpfs-foundation-checkpoint.md) adds
+independent backing publication for a future memory filesystem. It does not
+resolve the tmpfs failure recorded here.

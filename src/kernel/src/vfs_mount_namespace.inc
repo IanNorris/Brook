@@ -197,6 +197,43 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
     }
     *out=ns;return 0;
 }
+int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
+    const char* fsName,const VfsFsOps* ops,void* privateData,uint8_t pdrv)
+{
+    if(!ns || !target.object || !target.attachment || !fsName || !ops || !privateData)return -22;
+    FileMutationGuard transaction;
+    if(!ns->life.Published())return -3;
+    // Registered tables/callbacks are permanently provider-pinned. Unregistered
+    // or mismatched tables cannot become a backing through this entry point.
+    if(FindFsDriver(fsName)!=ops || !ops->root_object || !ops->unmount)return -95;
+    if(StrLen(fsName)>=sizeof(MountEntry::fsType))return -36;
+    auto* parent=static_cast<MountEntry*>(target.attachment);
+    if(parent->owner!=ns || !VfsMountPublished(*parent))return -22;
+    if(parent==ns->root && target.object->identity==parent->rootIdentity && target.object->ops==parent->rootObjectOps)return -95;
+    VnodeStat stat{};int error=VfsObjectStatLocked(target.object,&stat);
+    if(error)return error;if(!stat.isDir)return -20;
+    if(g_mounts.count==~uint32_t{0})return -12;
+    auto* mount=static_cast<MountEntry*>(kmalloc(sizeof(MountEntry)));if(!mount)return -12;
+    *mount={};error=VfsGlobalDirectoryLocked(target,mount->mountPoint,sizeof(mount->mountPoint));
+    auto* backing=error?nullptr:static_cast<MountBacking*>(kmalloc(sizeof(MountBacking)));
+    if(!error && !backing)error=-12;
+    VfsObject* root=nullptr;
+    if(!error)error=ops->root_object(privateData,pdrv,&root);
+    if(!error && (!root || !root->ops || !root->ops->stat))error=-5;
+    if(!error)error=root->ops->stat(root,&stat);
+    if(!error && !stat.isDir)error=-20;
+    if(error) {
+        // Preparation has not consumed the caller's instance. Release every
+        // temporary object before returning it, never invoke unmount here.
+        VfsObjectRelease(root);kfree(backing);kfree(mount);return error;
+    }
+    *backing={};backing->fsOps=ops;backing->mountPriv=privateData;backing->pdrv=pdrv;backing->references=1;backing->independent=true;
+    mount->owner=ns;mount->referenceState=1;mount->backing=backing;
+    mount->rootObject=root;mount->rootIdentity=root->identity;mount->rootObjectOps=root->ops;mount->rootIdentityKnown=true;
+    mount->covered=target;VfsPathRetain(target);mount->used=true;mount->linked=true;
+    mount->publication=++g_mountPublication;StrCopy(mount->fsType,fsName,sizeof(mount->fsType));
+    backing->next=g_backings;g_backings=backing;g_mounts.Publish(mount);return 0;
+}
 int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath& target)
 {
     if(!ns || !source.object || !source.attachment || !target.object || !target.attachment)return -22;

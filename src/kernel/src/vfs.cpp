@@ -148,6 +148,7 @@ struct MountBacking {
     void* mountPriv;
     uint8_t pdrv;
     uint64_t references;
+    bool independent; // fresh instances never participate in legacy device coalescing
     MountBacking* next;
     void RetainLocked() {
         if(!references || references==~uint64_t{0})__builtin_trap();
@@ -528,7 +529,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
     *slot={};
     MountBacking* backing=nullptr;
     for(auto* candidate=g_backings;candidate;candidate=candidate->next)
-        if(candidate->fsOps==ops && candidate->pdrv==pdrv) { backing=candidate;break; }
+        if(!candidate->independent && candidate->fsOps==ops && candidate->pdrv==pdrv) { backing=candidate;break; }
     if(backing) {
         // FAT's drive slots are global to its driver. Do not remount over a
         // failed retirement: its later unmount could unregister the new mount.

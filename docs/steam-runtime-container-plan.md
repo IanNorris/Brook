@@ -8,7 +8,10 @@ fixes missing overflow-ID reporting. The accepted
 [proc namespace-handle checkpoint](proc-namespace-handles.md) then advances the
 same executable to its mount-propagation operation. The accepted
 [private propagation checkpoint](mount-propagation-checkpoint.md) advances it
-to the next unsupported operation: mounting tmpfs.
+to the next unsupported operation: mounting tmpfs. The subsequent
+[fresh-instance foundation](tmpfs-foundation-checkpoint.md) implements independent
+backing publication; the real tmpfs backend, accounting and mapping policy remain
+the next implementation boundary.
 Remaining mount/root integration requires separate designs
 for write/mapping enforcement, tmpfs and root publication. There is no Brook login
 acceptance.
