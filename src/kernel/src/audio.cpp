@@ -599,7 +599,8 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
         // missing frames are not evidence that the app currently demands audio.
         if (prepared && stream.submittedFrames)
             prepared[slot]={stream.identity,stream.epoch,count,
-                static_cast<uint32_t>(stream.write-stream.read),stream.inFlight,stream.capacity};
+                static_cast<uint32_t>(stream.write-stream.read),stream.inFlight,stream.capacity,
+                stream.stagingFrames};
     }
     for (uint32_t i = 0; i < frames; ++i) {
         int32_t left = 0, right = 0;

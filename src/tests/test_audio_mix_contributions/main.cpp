@@ -70,6 +70,20 @@ int main() {
         CHECK(r.missingInFlightBins[i==0?0:i==1?1:2]==1764-queue[i]);
     }
     conservation(m.Snapshot());
+    // Real downstream-staging geometry: almost full Firefox admission with
+    // six reusable frames is valid even though in-flight exceeds client size.
+    m.Reset();token=m.Token();
+    AudioMixPreparedStream staged{49,7,0,0,8506,4416,4096};
+    CHECK(m.Observe(token,1024,1024,&staged,1));
+    s=m.Snapshot();CHECK(!s.invalid && s.rows[0].missingEmptyFrames==1024);
+    CHECK(s.rows[0].missingInFlightBins[2]==1024);
+    staged.contributionFrames=454;staged.softwareFrames=454;staged.inFlightFrames=8052;
+    CHECK(m.Observe(token,1024,512,&staged,1));conservation(m.Snapshot());
+    // Staging does not excuse overcommit or more software than client capacity.
+    staged.inFlightFrames=8059;CHECK(!m.Observe(token,1024,512,&staged,1));
+    staged.inFlightFrames=0;staged.stagingFrames=4417;
+    CHECK(!m.Observe(token,1024,512,&staged,1));
+    CHECK(m.Snapshot().invalid==2 && m.Snapshot().observations==2);
     uint64_t value=~uint64_t(0)-1;bool saturated=false;
     AudioMixSaturatingAdd(value,1,saturated);CHECK(value==~uint64_t(0) && !saturated);
     AudioMixSaturatingAdd(value,1,saturated);CHECK(value==~uint64_t(0) && saturated);

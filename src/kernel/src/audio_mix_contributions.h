@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "audio_queue_capacity.h"
 
 namespace brook {
 inline constexpr unsigned AudioMixContributionSlots=32;
@@ -9,6 +10,9 @@ inline constexpr unsigned AudioMixPreparedSlots=8;
 struct AudioMixPreparedStream {
     uint64_t identity, epoch;
     uint32_t contributionFrames, softwareFrames, inFlightFrames, capacityFrames;
+    // Validate the same outstanding allowance as admission. Histogram bins
+    // retain the original client capacity as their reference threshold.
+    uint32_t stagingFrames=0;
 };
 struct AudioMixContributionRow {
     uint64_t identity=0, epoch=0, acceptedOutputFrames=0, contributedFrames=0;
@@ -53,8 +57,9 @@ public:
         bool valid=requested && accepted<=requested && count<=AudioMixPreparedSlots && (!count || streams);
         if(valid)for(unsigned i=0;i<count;++i){
             const auto& p=streams[i];if(!p.identity)continue;
-            if(!p.capacityFrames || p.softwareFrames>p.capacityFrames ||
-               p.inFlightFrames>p.capacityFrames-p.softwareFrames ||
+            uint32_t available=0;
+            if(!AudioQueueAvailable(p.capacityFrames,p.softwareFrames,p.inFlightFrames,
+                                    p.stagingFrames,&available) ||
                p.contributionFrames>p.softwareFrames || p.contributionFrames>requested)valid=false;
         }
         if(!valid){Add(s_.invalid,1);return false;}
