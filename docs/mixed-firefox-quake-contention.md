@@ -492,3 +492,38 @@ Evidence is `build/linux-workload-reference-20261022/summary.json` and
 `workload/{solo,mixed,firefox-*-media.json}`. Both original game processes and
 Firefox exit zero. The original controller, VM, fixture and private audio
 owners terminate; serial powerdown and read-only private ext4 checks pass.
+
+### Phase-preserving Wayland timer experiment, first pair
+
+The opt-in experiment on `wip/phase-frame-clock-experiment-20261022`
+(`4d8612bb`) retains the existing 16-ms period and callback eligibility. It
+advances late deadlines to the next future phase, skipping missed periods
+without emitting catch-up callbacks. Both arms use the same rebuilt compositor;
+only `--phase-frame-clock` differs. The scheduler, client audio geometry,
+4,096-frame downstream allowance, kernel/modules and private QEMU are unchanged.
+
+| Central 50-second Quake window | Timer off | Timer on |
+| --- | ---: | ---: |
+| First solo swaps/s | 22.82 | 44.46 |
+| Mixed swaps/s | 13.74 | 25.64 |
+| Final solo swaps/s | 25.90 | 46.30 |
+| Mixed frame interval p95 | 136.53 ms | 60.66 ms |
+| Mixed maximum complete frame interval | 534.93 ms | 610.04 ms |
+| Mixed observation whole-QEMU CPU cores | 1.582–1.585 | 3.176–3.181 |
+
+The six-second mixed audio observations still show approximately 33k Firefox
+and 30–31k Quake completed source frames per guest second in both arms, versus
+44.1k nominal. This pair does not establish an audio fix or better CPU efficiency.
+The 440-Hz reference tone remains measurable at approximately 440.01 Hz; that
+alone does not prove correct media tempo or absence of gaps in either stream.
+
+Both original controllers and VM owners terminate successfully, all four
+offline filesystem checks pass per arm, and extracted swap trace sizes/hashes
+match guest metadata. Evidence is in
+`build/reviews/phase-clock-{off,on}-off-gpu-1ms-fixed-mlfq-a-20261022/phase-clock-control`.
+The actual original compositor binary matches Nix package
+`6b0cwb49r4wrcqb6hql8qmd1hfvg28f6-waylandd-brook-0.1-brook`; derivation source
+comparison finds only this experiment's changes. However, the new off arm is
+substantially slower than the earlier 58-FPS baseline. A repeat off arm is
+required before attributing the pair's difference to the timer. The experiment
+is not promoted, and desktop/GL/Vulkan/input acceptance remains incomplete.
