@@ -1,11 +1,14 @@
 # SteamRT container feasibility gate
 
-Status: the bounded first phase is approved and investigated; see the
-[feasibility result](steam-runtime-feasibility.md) for evidence and the reviewed
-next-slice recommendation. Container implementation is not authorized by this
-investigation, and there is no Brook login acceptance.
-The tested IPC checkpoint is commit `bf453666`; [the client notes](steam-client.md)
-record its native acceptance and private VM evidence.
+Status (2026-10-22): the feasibility investigation and retained-filesystem
+foundation are accepted. The user has now authorized the bounded mount-namespace
+checkpoint below. User namespaces and the remaining SteamRT container integration
+remain outside this phase. There is no Brook login acceptance.
+
+The accepted baseline is `3bfc275e` (ABI 39), including retained filesystem
+contexts at `e626b7f8`, retained proc-root links and real per-task no_new_privs.
+The historical observations below describe the earlier feasibility gate; consult
+[the client notes](steam-client.md) for the latest native acceptance and blocker.
 
 ## Evidence that changes the next step
 
@@ -92,3 +95,159 @@ regressions, exact client-group cleanup, heap integrity, guest sync and offline
 filesystems. Stop when the real Steam login page is visible and responsive;
 authentication remains manual. Payloads, traces containing private paths or
 account data, and writable runtime state stay outside git.
+
+
+## Approved mount-namespace checkpoint
+
+This phase ends at a tested namespace-isolation checkpoint and a new estimate,
+not Steam login. It preserves the checked ABI-39 baseline and its filesystem,
+credentials and IPC acceptance. No user namespace, UID/GID maps, namespace-local
+capability model, pivot_root, propagation groups, tmpfs, seccomp or authentication
+is authorized by this checkpoint.
+
+### Minimum externally visible behavior
+
+- Ordinary fork and clone inherit the existing mount namespace. A supported
+  privileged `clone(CLONE_NEWNS | SIGCHLD)` creates a separate mount topology
+  before publication; the parent keeps its original topology. Exec preserves
+  namespace membership. Reject incompatible NEWNS/CLONE_FS and unsupported
+  namespace combinations before creating a child. Initial-namespace privilege
+  checks remain in force; namespace creation never changes numeric credentials.
+- Implement directory `MS_BIND` without recursive copying, and `umount2` with
+  `MNT_DETACH`, sufficient to demonstrate real namespace-local visibility changes.
+  Validate every supplied flag; unsupported mount classes fail honestly. Both
+  operations require the existing initial-namespace administrative authority.
+  Do not expose an unprivileged substitute for the future user namespace model.
+- Copy existing attachment topology without remounting filesystem drivers or
+  reopening roots by name. Backend writes remain shared between namespaces:
+  topology isolation is not a filesystem data snapshot.
+- Preserve existing kernel/driver mount wrappers against an explicit initial
+  namespace. Root directory enumeration and proc mount reporting must describe
+  the relevant namespace, rather than leaking the initial global table.
+
+### Design constraints established from current code
+
+`MountEntry` currently combines backing ownership, attachment identity, topology,
+labels and live path/vnode counts in one of eight static slots. The retained
+walker, mutation reservation checks, rename labels, directory enumeration, proc
+reporting and global sync all consult that table. Changing only sys_clone would
+leave lookup global and does not satisfy this checkpoint.
+
+Separate filesystem backing (driver ops/private data/device and lifetime) from
+mount attachments (mounted root object, covered parent object, attachment
+identity and lifetime). A bind attachment can start at a subdirectory, so its
+mounted root cannot be inferred by calling the filesystem's root_object.
+Namespace topology owns attachment membership; referenced paths and vnodes pin
+attachments/backing independently of membership. Do not allocate one new driver
+mount for each copied attachment or bind. Global sync must still reach live
+detached backing, and a single namespace's exit must not unmount another's data.
+
+Use an immutable owned namespace reference inside FsContext so root, cwd, mask
+and namespace can be snapshotted consistently through the existing per-process
+context publication helpers. CLONE_FS shares that complete context; ordinary
+fork copies the context while retaining its namespace. Clone-with-NEWNS builds
+the namespace and a private FsContext together,
+remapping root and cwd by old-to-new attachment identity before child publication.
+Do not copy namespace ownership through Process memcpy. Publish a fully prepared
+child or unwind all references through the existing unpublished-child path.
+
+Retained inherited dirfds are different from the remapped root/cwd. Preserve
+their legitimate Linux behavior rather than rebasing them from display names or
+revoking them to make an isolation test pass. Differential probes must establish
+mount crossing and dotdot behavior for these foreign retained attachments before
+choosing the final walker/ownership representation. Namespace ownership must not
+create a namespace/attachment/covered-path cycle that prevents final release.
+Virtual boot mount ancestors embed parent VfsPaths today; copied topology needs
+an explicit remapping design for those objects too.
+
+Shared backing rename is a cross-namespace reporting hazard. Existing mount
+labels cannot be updated in the caller's namespace alone, because another tree
+may attach the same renamed backing elsewhere. Prefer converting remaining
+legacy initial-namespace name dispatch to retained traversal; otherwise changes
+must preflight/update all affected live labels under the global transaction.
+Do not let stale labels become lookup authority or accept a rename before a
+required reporting update can succeed.
+
+Keep the current sleeping VFS mutation transaction as the initial serialization
+boundary unless review demonstrates a required change. Separate namespaces do
+not require per-namespace parallel mutation in this first phase. No scheduler,
+process-publication or IRQ spinlock may span backend callbacks, filesystem work
+or final reference release. Any registry for live backing/attachments must have
+explicit snapshot ownership and teardown; a dangling namespace back-pointer is
+not acceptable. The precise lifetime representation is a review gate, not an
+implementation already claimed complete.
+
+### Acceptance gates
+
+1. Differential Linux probe for inherited dirfd/root/cwd behavior across NEWNS,
+   bind, detach and nested/stacked mount traversal. Check the actual host fixture's
+   permissions; use a disposable Linux guest if host isolation forbids NEWNS.
+2. Host tests of the chosen topology/backing ownership and copy/remap model:
+   independent trees, shared backing, more than eight attachments, stacked mounts,
+   last-reference release and deterministic allocation-failure unwind. Exercise
+   namespace destruction with open paths/vnodes and copied virtual ancestors.
+3. Native root-only namespace probe: parent/sibling topology unchanged; child
+   bind visible only where shared namespace membership allows; fork/exec preserve
+   membership; retained references survive lazy detach and namespace exit; fresh
+   absolute lookup no longer reaches a detached mount. Include root/dotdot and
+   symlink-negative tests, parallel mutations and repeated create/exit cycles.
+4. Rerun retained FSCTX/proc-root/file-lifetime/relative-at/cwd, credential,
+   signalfd and SysV tests plus representative desktop launch/render/close.
+   Check matching kernel/modules, heap integrity, checked shutdown, original
+   jobs/wrapper termination and offline fsck on private checked copies.
+5. Review the accepted changes and remaining gaps, then estimate the next phase.
+   A partial model or green unit tests alone do not establish namespace support,
+   container security, or Steam login.
+
+
+### First Linux lifetime discovery (2026-10-22)
+
+The static `mountnamespacecheck` probe ran in a fresh private Linux 6.18.26
+reference VM. Its bounded named service used a private user/mount namespace
+fixture (`unshare --user --map-root-user --mount --propagation private`) because
+this image deliberately has no passwordless sudo. That outer fixture is not a
+claim of Brook user-namespace support. Versions B, C and D complete successfully;
+D reports 39 child checks and 41 parent checks (counts include shared setup).
+Versioned source/binary hashes and original service receipts are retained under
+`build/workloads/mount-namespace-20261022`.
+
+Observed Linux behavior:
+
+- After parent and child independently bind B and A over the same target, the
+  child's absolute lookup reads A. A pre-clone parent dirfd traversing the target
+  reads B from its original attachment tree. A pre-clone dirfd directly on the
+  covered target still reads T from the original underlying directory.
+- Lazy-detaching a bind with a nested bind makes fresh absolute lookup read T.
+  A held detached-root dirfd still reads A, but traversing its former nested
+  mount sees ENOENT. A separately held nested-root dirfd still reads B.
+- Dotdot at the held detached bind root stays at that root; it does not return
+  to the former covered parent or expose the backend subtree's physical parent.
+- In the Linux-only lifetime extension, a worker creates a namespace and binds
+  A, then clones a follower into a copied namespace. After the worker unshares
+  again, no task remains in its original namespace. The follower's inherited
+  original-namespace dirfd now reads T; the follower's absolute lookup still
+  reads A through its own copied mount. Namespace publication therefore must
+  not remain alive just because a foreign dirfd retains an attachment.
+
+Astra reviewed these results. The implementation must distinguish task membership,
+namespace storage references, and exact attachment/backing references. FsContext
+snapshots and unpublished copied contexts retain storage; their refcounts must
+not substitute for the number of live member tasks. Last-member departure must
+make old namespace edges unsearchable atomically; delayed backing destruction
+must not delay that visibility change.
+
+The reviewed graph has namespace registry membership owning attachment refs,
+child attachments holding their covered-parent paths while attached, and no
+strong child list owned by a parent attachment. Recursive detach removes edges,
+clears parent links and preserves externally held attachment/root/backing refs.
+The walker explicitly clamps detached-root dotdot; merely clearing a covered
+path would incorrectly fall through to the backend's physical parent. Exact
+foreign attachment identity selects edges while its original namespace remains
+published. A global attachment index is an index, not an owner that can keep
+mounts published after namespace membership ends.
+
+Next implementation gate: model these three lifetimes and deterministic failure
+unwind in host tests, including a namespace snapshot held across last-member
+departure. Review process exit/publication hooks so topology visibility never
+waits for final Process or FsContext reference destruction. No kernel namespace
+implementation is claimed by this discovery probe.
