@@ -1,3 +1,4 @@
+#include "process_user_namespace.h"
 #include "register_test.h"
 #include "irq_wrapper.h"
 #include "process.h"
@@ -83,7 +84,7 @@ bool RegisterTestException(FullExceptionFrame* frame,uint64_t vector,uint64_t ad
 }
 
 int64_t RegisterTestControl(uint64_t action,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) {
-    auto* actor=ProcessCurrent();if(!actor || actor->euid!=0)return -1;
+    auto* actor=ProcessCurrent();if(!actor || !ProcessCapable(actor,nullptr,CapSysAdmin))return -1;
     if(action)return -22;
     SchedulerKernelRegionEnter(actor);
     uint32_t expected=0;

@@ -501,6 +501,24 @@ int main(){
         if(copiedAfterFailures)break;
     }
     assert(copiedAfterFailures);
+    // Less-privileged user owner pins its identity and locks inherited
+    // attachments; stacking a fresh bind does not unlock the covered mount.
+    auto* userOwner=static_cast<UserNamespace*>(kmalloc(sizeof(UserNamespace)));*userOwner={};userOwner->owner=1000;
+    MountNamespace* lockedNs=nullptr;VfsPath lockedRoot{},lockedCwd{};
+    assert(!VfsMountNamespaceCopy(parentNs,parentRoot,parentTarget,&lockedNs,&lockedRoot,&lockedCwd));
+    assert(!VfsMountNamespaceSetUserOwnerPrepared(lockedNs,userOwner));assert(userOwner->references==2);
+    auto* ownerLease=VfsMountNamespaceUserOwnerAcquire(lockedNs);assert(ownerLease==userOwner);UserNamespaceRelease(ownerLease);
+    assert(VfsMountNamespaceActivate(lockedNs));
+    assert(VfsMountNamespaceSetUserOwnerPrepared(lockedNs,nullptr)==-22);
+    auto lockedBind=resolve(lockedRoot,lockedRoot,"/ns-target");
+    assert(VfsMountNamespaceDetach(lockedNs,lockedBind)==-22);
+    assert(!VfsMountNamespaceBind(lockedNs,bPath,lockedBind));
+    auto freshBind=resolve(lockedRoot,lockedRoot,"/ns-target");
+    assert(!VfsMountNamespaceDetach(lockedNs,freshBind));VfsPathRelease(freshBind);
+    assert(VfsMountNamespaceDetach(lockedNs,lockedBind)==-22);VfsPathRelease(lockedBind);
+    VfsMountNamespaceLeave(lockedNs);VfsDrainMountCleanup();
+    VfsPathRelease(lockedRoot);VfsPathRelease(lockedCwd);VfsMountNamespaceRelease(lockedNs);VfsDrainMountCleanup();
+    assert(userOwner->references==1);UserNamespaceRelease(userOwner);
     MountNamespace* childNs=nullptr;VfsPath childRoot{},childCwd{};
     assert(!VfsMountNamespaceCopy(parentNs,parentRoot,parentTarget,&childNs,&childRoot,&childCwd));
     assert(VfsMountNamespaceActivate(childNs));

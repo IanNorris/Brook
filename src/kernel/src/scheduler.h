@@ -144,6 +144,7 @@ void SchedulerReleaseThreadAddressSpace(Process* thread);
 
 // Snapshot of a process for procfs.
 struct ProcessSnapshot {
+    uint32_t uid,euid,gid,egid,suid,sgid;
     uint16_t pid;
     uint16_t parentPid;
     uint16_t tgid;
@@ -173,7 +174,7 @@ uint32_t SchedulerSnapshotProcesses(ProcessSnapshot* out, uint32_t maxCount);
 struct DebugTaskSnapshot {
     uint16_t pid,parentPid,tgid;
     uint64_t incarnation,groupIncarnation,launchId,userTicks,sysTicks;
-    uint32_t uid,euid,gid,egid;
+    uint32_t uid,euid,gid,egid,suid,sgid;
     int32_t runningOnCpu;
     ProcessState state;
     bool kernel,systemService;

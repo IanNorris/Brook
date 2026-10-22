@@ -13,6 +13,7 @@
 #include "../../kernel/src/sysv_sem.h"
 #include "../../kernel/src/spinlock.h"
 namespace brook {
+
 constexpr unsigned MAX_PROCESSES=1024;
 struct SupplementaryGroups {unsigned count;unsigned ids[2];};
 struct Process {
@@ -25,6 +26,8 @@ struct Process {
     std::condition_variable cv;
     explicit Process(unsigned id):pid(id),tgid(id){}
 };
+static constexpr unsigned CapSysAdmin=21;
+static bool ProcessCapable(Process* p,void*,unsigned){return p && p->euid==0;}
 static std::atomic<int> allocations{0};
 static bool failAllocation=false;
 extern "C" void* kmalloc(uint64_t size) {if(failAllocation)return nullptr;auto* p=std::malloc(size);if(p)++allocations;return p;}

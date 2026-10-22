@@ -53,9 +53,10 @@ int main(int argc,char** argv) {
     CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
     CHECK(!close(ready[0]));CHECK(!close(finish[1]));
     if(brook) {
-        // These isolation flags must fail before creating a global-namespace
+        // NEWUSER/NEWNS are supported; adding NEWPID must still fail before
+        // creating a global-namespace
         // child. A successful ordinary fork would be false isolation support.
-        errno=0;long isolated=syscall(SYS_clone,0x10020000UL|SIGCHLD,0,0,0,0);
+        errno=0;long isolated=syscall(SYS_clone,0x30020000UL|SIGCHLD,0,0,0,0);
         if(!isolated)_exit(79);
         if(isolated>0)waitpid(isolated,NULL,0);
         CHECK(isolated<0 && errno==EINVAL);

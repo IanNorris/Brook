@@ -2,6 +2,9 @@
 #include "vfs_path.h"
 namespace brook {
 struct MountNamespace;
+struct UserNamespace;
+UserNamespace* VfsMountNamespaceUserOwnerAcquire(MountNamespace* ns);
+int VfsMountNamespaceSetUserOwnerPrepared(MountNamespace* ns,UserNamespace* owner);
 // Storage references never count as live task membership. All returned paths
 // and namespace outputs are independently owned; errors leave outputs empty.
 MountNamespace* VfsMountNamespaceInitial();

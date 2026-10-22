@@ -1,5 +1,12 @@
 # Native Steam client checkpoint
 
+Update (2026-10-22): retained proc-root access, privilege ceilings, mount namespaces
+and the bounded [user-namespace foundation](user-namespace-checkpoint.md) have since
+passed acceptance. The historical Steam attempt below has not been rerun against
+these foundations. The next gate is the remaining mount/root operations with an
+unchanged bubblewrap trivial child, before pressure-vessel and Steam. No login
+readiness is implied by the foundation tests.
+
 The 22 October login-screen attempt executes Valve's native x86-64 Linux
 client on Brook, but does not reach a login window. SysV semaphores and signal-fd
 watching pass native guest acceptance. Software Xwayland accepts the client's

@@ -1,3 +1,5 @@
+#include "../../kernel/src/process.h"
+#include "../../kernel/src/process_user_namespace.h"
 // Actual Ext2 backend bodies on a private mkfs.ext2 image. Host shims supply
 // allocation, a memory disk, synchronization and a single credential identity;
 // filesystem lookup/mutation/inode lifetime/open logic is production code.
@@ -47,6 +49,10 @@ const brook::DeviceOps diskOps={readDisk,writeDisk,ioctlDisk,nullptr};
 void closeNode(brook::Vnode* node){assert(node);node->ops->close(node);brook::kfree(node);}
 }
 namespace brook {
+bool ProcessCapable(Process* p,UserNamespace* target,unsigned capability) {
+    return p && UserNamespaceCapable({p->userNamespace,p->euid,p->egid,p->capabilities.effective},target,capability);
+}
+
 extern "C" [[noreturn]] void KernelPanic(const char*,...) {std::abort();}
 extern "C" void* kmalloc(uint64_t size){
     if(failAllocation==0){failAllocation=-1;failTriggered=true;return nullptr;}

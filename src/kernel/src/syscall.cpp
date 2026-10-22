@@ -1,5 +1,6 @@
 #include "process_fs.h"
 #include "mount_namespace.h"
+#include "process_user_namespace.h"
 #include "unix_lifetime_trace.h"
 #include "file_locks.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
@@ -4461,7 +4462,12 @@ static int64_t sys_semctl(uint64_t id,uint64_t number,uint64_t command,uint64_t 
     KernelOperationGuard guard(ProcessCurrent());
     const int cmd=int(command)&~0x100;
     SysvSemDs ds{};uint16_t* values=nullptr;int count=0;
-    if(cmd==1 && !CopyFromUser(&ds,arg,sizeof(ds)))return -EFAULT;
+    if(cmd==1) {
+        if(!CopyFromUser(&ds,arg,sizeof(ds)))return -EFAULT;
+        ds.permission.uid=ProcessResolveId(ProcessCurrent(),false,ds.permission.uid);
+        ds.permission.gid=ProcessResolveId(ProcessCurrent(),true,ds.permission.gid);
+        if(ds.permission.uid==UserIdInvalid || ds.permission.gid==UserIdInvalid)return -EINVAL;
+    }
     if(cmd==13 || cmd==17) {
         count=SysvSemCount(ProcessCurrent(),int(id));if(count<0)return count;
         values=static_cast<uint16_t*>(kmalloc(unsigned(count)*sizeof(uint16_t)));
@@ -4471,6 +4477,12 @@ static int64_t sys_semctl(uint64_t id,uint64_t number,uint64_t command,uint64_t 
         }
     }
     int result=SysvSemControl(ProcessCurrent(),int(id),int(number),int(command),int(arg),&ds,values,unsigned(count));
+    if(result>=0 && cmd==2) {
+        ds.permission.uid=ProcessReportId(ProcessCurrent(),false,ds.permission.uid);
+        ds.permission.cuid=ProcessReportId(ProcessCurrent(),false,ds.permission.cuid);
+        ds.permission.gid=ProcessReportId(ProcessCurrent(),true,ds.permission.gid);
+        ds.permission.cgid=ProcessReportId(ProcessCurrent(),true,ds.permission.cgid);
+    }
     if(result>=0 && ((cmd==2 && !CopyToUser(arg,&ds,sizeof(ds))) ||
         (cmd==13 && !CopyToUser(arg,values,unsigned(count)*sizeof(uint16_t)))))result=-EFAULT;
     kfree(values);return result;
@@ -4589,15 +4601,20 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
 
     // Other isolation domains must not fall through to an ordinary fork.
     constexpr uint64_t unsupportedNamespaces=0x02000000ULL|0x04000000ULL|
-                                           0x08000000ULL|0x10000000ULL|0x20000000ULL|0x40000000ULL;
+                                           0x08000000ULL|0x20000000ULL|0x40000000ULL;
+    constexpr uint64_t CLONE_NEWUSER=0x10000000ULL;
     if(flags&unsupportedNamespaces)return -EINVAL;
     Process* parent = ProcessCurrent();
     if (!parent) return -ENOSYS;
-    if(flags&CLONE_NEWNS) {
+    if(flags&(CLONE_NEWNS|CLONE_NEWUSER)) {
         // Bounded fork-style namespace creation. Do not silently ignore shared
         // VM/FS/thread, tid, pidfd, TLS, vfork or unknown requested semantics.
-        if((flags&~(CLONE_NEWNS|uint64_t{0xff})) || (flags&0xff)!=17)return -EINVAL;
-        if(parent->euid!=0)return -EPERM;
+        if((flags&~(CLONE_NEWNS|CLONE_NEWUSER|uint64_t{0xff})) || (flags&0xff)!=17)return -EINVAL;
+        if(!(flags&CLONE_NEWUSER)) {
+            auto* owner=ProcessUserNamespaceAcquire(parent);
+            bool allowed=ProcessCapable(parent,owner,CapSysAdmin);UserNamespaceRelease(owner);
+            if(!allowed)return -EPERM;
+        }
     }
 
     if ((flags & CLONE_THREAD) && (flags & CLONE_PARENT_SETTID) &&
@@ -4631,6 +4648,9 @@ static int64_t sys_clone(uint64_t flags, uint64_t newStack, uint64_t parentTidAd
         if (!child) return -ENOMEM;
     }
 
+    if(flags&CLONE_NEWUSER) {
+        if(int error=ProcessUserNamespaceCreate(child)) {ProcessDiscardUnpublished(child);return error;}
+    }
     if(flags&CLONE_NEWNS) {
         if(int error=ProcessFsIsolateMounts(child)) {ProcessDiscardUnpublished(child);return error;}
     }
@@ -4735,7 +4755,7 @@ static int64_t sys_clone3(uint64_t argsPtr, uint64_t size, uint64_t,
 
     // Delegate to sys_clone with the same argument layout:
     //   flags, newStack, parentTidAddr, childTidAddr, tlsAddr
-    if(cloneFlags&0x00020000) {
+    if(cloneFlags&(0x00020000|0x10000000)) {
         for(uint64_t i=sizeof(CloneArgs);i<size;++i)
             if(reinterpret_cast<const uint8_t*>(argsPtr)[i])return -E2BIG;
         if((cloneFlags&0xff) || ca->exit_signal!=17 || ca->pidfd || ca->set_tid || ca->set_tid_size || ca->cgroup)return -EINVAL;
@@ -4856,7 +4876,7 @@ static int64_t sys_waitid(uint64_t rawSelector, uint64_t rawId, uint64_t infoAdd
         info.signo = 17;
         info.code = event.code;
         info.pid = event.pid;
-        info.uid = event.uid;
+        info.uid = ProcessReportId(parent,false,event.uid);
         info.status = event.code == 1 ? (event.status >> 8) & 0xff :
                       event.code == 5 ? (event.status >> 8) & 0xff :
                       event.code == 6 ? 18 : event.status & 0x7f;
@@ -5705,6 +5725,7 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
             if (!PosixTimerDequeue(proc, 1ULL << (signum - 1), &info)) {
                 if (!ProcessDequeueSignal(proc, signum, &info)) continue;
             }
+            ProcessSignalInfoToUser(proc,&info);
             if (infoAddr && !CopyToUser(infoAddr, &info, sizeof(info))) return -EFAULT;
             return signum;
         }
@@ -7298,8 +7319,8 @@ static void FillStat(LinuxStat* st, const VnodeStat& vs, const Vnode* vn = nullp
     st->st_blksize = 4096;
     st->st_size = static_cast<int64_t>(vs.size);
     st->st_blocks = (st->st_size + 511) / 512;
-    st->st_uid = vs.uid;
-    st->st_gid = vs.gid;
+    st->st_uid = ProcessReportId(ProcessCurrent(),false,vs.uid);
+    st->st_gid = ProcessReportId(ProcessCurrent(),true,vs.gid);
     st->st_atime_sec = vs.atime.sec;
     st->st_atime_nsec = vs.atime.nsec;
     st->st_mtime_sec = vs.mtime.sec;
@@ -7825,25 +7846,25 @@ static int64_t sys_getuid(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->uid : 0;
+    return proc ? ProcessReportId(proc,false,proc->uid) : 0;
 }
 static int64_t sys_getgid(uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->gid : 0;
+    return proc ? ProcessReportId(proc,true,proc->gid) : 0;
 }
 static int64_t sys_geteuid(uint64_t, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->euid : 0;
+    return proc ? ProcessReportId(proc,false,proc->euid) : 0;
 }
 static int64_t sys_getegid(uint64_t, uint64_t, uint64_t,
                             uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    return proc ? proc->egid : 0;
+    return proc ? ProcessReportId(proc,true,proc->egid) : 0;
 }
 static int64_t ChangeIds(bool group, CredentialChange operation,
                          uint64_t real, uint64_t effective = CredentialUnchanged,
@@ -7897,7 +7918,8 @@ static int64_t sys_capget(uint64_t header, uint64_t data, uint64_t,
                           uint64_t, uint64_t, uint64_t) {
     auto* proc = ProcessCurrent(); if (!proc) return -ESRCH;
     KernelOperationGuard operation(proc);
-    if (!EmptyCapabilitiesSupported(proc)) return -ENOSYS;
+    UserCapabilityState capabilities{};bool privateCaps=ProcessReadCapabilities(proc,&capabilities)==0;
+    if (!privateCaps && !EmptyCapabilitiesSupported(proc)) return -ENOSYS;
     int words = CapabilityWords(header, !data);
     if (words <= 0) return words;
     if (!data) return 0; // Valid-version null data does not require the PID field.
@@ -7907,14 +7929,18 @@ static int64_t sys_capget(uint64_t header, uint64_t data, uint64_t,
     if (pid < 0) return -EINVAL;
     if (pid && pid != proc->pid) return -ENOSYS; // Foreign queries not implemented.
     if (!UserBufferWritable(data, words * sizeof(uint32_t))) return -EFAULT;
-    memset(reinterpret_cast<void*>(data), 0, words * sizeof(uint32_t));
-    return 0;
+    uint32_t values[6]={};
+    if(privateCaps)for(unsigned i=0;i<unsigned(words/3);++i) {
+        values[i*3]=capabilities.effective>>(i*32);values[i*3+1]=capabilities.permitted>>(i*32);values[i*3+2]=capabilities.inheritable>>(i*32);
+    }
+    memcpy(reinterpret_cast<void*>(data),values,words*sizeof(uint32_t));return 0;
 }
 static int64_t sys_capset(uint64_t header, uint64_t data, uint64_t,
                           uint64_t, uint64_t, uint64_t) {
     auto* proc = ProcessCurrent(); if (!proc) return -ESRCH;
     KernelOperationGuard operation(proc);
-    if (!EmptyCapabilitiesSupported(proc)) return -ENOSYS;
+    UserCapabilityState capabilities{};bool privateCaps=ProcessReadCapabilities(proc,&capabilities)==0;
+    if (!privateCaps && !EmptyCapabilitiesSupported(proc)) return -ENOSYS;
     int words = CapabilityWords(header, false);
     if (words < 0) return words;
     if (!UserBufferReadable(header + sizeof(uint32_t), sizeof(int32_t))) return -EFAULT;
@@ -7924,6 +7950,10 @@ static int64_t sys_capset(uint64_t header, uint64_t data, uint64_t,
     uint32_t values[6] = {};
     if (!UserBufferReadable(data, words * sizeof(uint32_t))) return -EFAULT;
     memcpy(values, reinterpret_cast<const void*>(data), words * sizeof(uint32_t));
+    if(privateCaps) {
+        const uint64_t effective=values[0]|(uint64_t{values[3]}<<32),permitted=values[1]|(uint64_t{values[4]}<<32),inheritable=values[2]|(uint64_t{values[5]}<<32);
+        return ProcessSetCapabilities(proc,effective,permitted,inheritable);
+    }
     for (int i = 0; i < words; ++i) if (values[i]) return -EPERM;
     return 0; // An already-empty state remains empty.
 }
@@ -7941,7 +7971,7 @@ static int64_t sys_getgroups(uint64_t size, uint64_t listAddr, uint64_t,
     if (capacity < 0 || (capacity && static_cast<uint32_t>(capacity) < count)) return -EINVAL;
     if (!capacity) return count;
     if (!UserBufferWritable(listAddr, uint64_t(count) * sizeof(uint32_t))) return -EFAULT;
-    if (count) memcpy(reinterpret_cast<void*>(listAddr), snapshot.groups->ids, count * sizeof(uint32_t));
+    for(uint32_t i=0;i<count;++i)reinterpret_cast<uint32_t*>(listAddr)[i]=ProcessReportId(proc,true,snapshot.groups->ids[i]);
     return count;
 }
 static void SortGroupIds(uint32_t* ids, uint32_t count) {
@@ -7964,7 +7994,7 @@ static int64_t sys_setgroups(uint64_t size, uint64_t listAddr, uint64_t,
                               uint64_t, uint64_t, uint64_t) {
     auto* proc = ProcessCurrent(); if (!proc) return -ESRCH;
     KernelOperationGuard operation(proc);
-    if (ProcessReadIds(proc, false).effective != 0) return -EPERM;
+    if (!ProcessSetgroupsAllowed(proc)) return -EPERM;
     const uint32_t count = static_cast<uint32_t>(size);
     if (count > MAX_SUPPLEMENTARY_GROUPS) return -EINVAL;
     if (!UserBufferReadable(listAddr, uint64_t(count) * sizeof(uint32_t))) return -EFAULT;
@@ -7975,6 +8005,7 @@ static int64_t sys_setgroups(uint64_t size, uint64_t listAddr, uint64_t,
         groups->references = 1; groups->count = count;
         memcpy(groups->ids, reinterpret_cast<const void*>(listAddr), count * sizeof(uint32_t));
         for (uint32_t i = 0; i < count; ++i) {
+            groups->ids[i]=ProcessResolveId(proc,true,groups->ids[i]);
             if (groups->ids[i] == CredentialUnchanged) { kfree(groups); return -EINVAL; }
         }
         SortGroupIds(groups->ids, count); // keep duplicates, like Linux
@@ -10249,7 +10280,7 @@ static int64_t ChownAt(int dirfd, uint64_t pathAddr, uint32_t uid, uint32_t gid,
 {
     constexpr uint64_t NOFOLLOW=0x100,EMPTY_PATH=0x1000;
     if(flags & ~(NOFOLLOW|EMPTY_PATH))return -EINVAL;
-    Process* proc=ProcessCurrent();if(!proc || proc->euid!=0)return -EPERM;
+    Process* proc=ProcessCurrent();if(!proc || !ProcessCapable(proc,nullptr,CapChown))return -EPERM;
     char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
     if(!path[0]) {
         if(!(flags&EMPTY_PATH))return -ENOENT;
@@ -10276,7 +10307,7 @@ static int64_t sys_fchown(uint64_t fd, uint64_t uid, uint64_t gid,
                            uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    if (!proc || proc->euid != 0) return -EPERM;
+    if (!proc || !ProcessCapable(proc,nullptr,CapChown)) return -EPERM;
     FdRef ref(proc, static_cast<int>(fd));
     if (!ref) return -EBADF;
     if (ref->type != FdType::Vnode) return -95;
@@ -10890,8 +10921,8 @@ static int64_t SendThreadSignal(uint64_t tgid, uint64_t tid, uint64_t sig, bool 
     Process* target = SchedulerFindProcessReference(static_cast<uint16_t>(thread));
     int result = -ESRCH;
     if (target && (!checkGroup || target->tgid == group)) {
-        result = 0;
-        if (signal) {
+        result = ProcessCanSignal(self,target) || (signal==18 && self && self->sid==target->sid)?0:-EPERM;
+        if (!result && signal) {
             SignalInfo info{};
             info.si_signo = signal;
             info.si_code = -6; // SI_TKILL
@@ -10942,6 +10973,7 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t,
         SchedulerKernelRegionLeave(self);
         return -ESRCH;
     }
+    if(!ProcessCanSignal(self,target) && !(signal==18 && self && self->sid==target->sid)) {ProcessUnref(target);SchedulerKernelRegionLeave(self);return -EPERM;}
     SignalInfo info{};info.si_signo=signal;info.si_code=0; // SI_USER
     const int32_t sender=self?self->tgid:0;
     const uint32_t senderUid=self?ProcessReadIds(self,false).real:0;
@@ -12133,9 +12165,9 @@ static int64_t GetResIds(bool group, uint64_t real, uint64_t effective, uint64_t
     if (!UserBufferWritable(real, 4) || !UserBufferWritable(effective, 4) || !UserBufferWritable(saved, 4))
         return -EFAULT;
     const auto ids = ProcessReadIds(proc, group);
-    *reinterpret_cast<uint32_t*>(real) = ids.real;
-    *reinterpret_cast<uint32_t*>(effective) = ids.effective;
-    *reinterpret_cast<uint32_t*>(saved) = ids.saved;
+    *reinterpret_cast<uint32_t*>(real) = ProcessReportId(proc,group,ids.real);
+    *reinterpret_cast<uint32_t*>(effective) = ProcessReportId(proc,group,ids.effective);
+    *reinterpret_cast<uint32_t*>(saved) = ProcessReportId(proc,group,ids.saved);
     return 0;
 }
 static int64_t sys_getresuid(uint64_t real, uint64_t effective, uint64_t saved, uint64_t, uint64_t, uint64_t) {
@@ -12196,7 +12228,11 @@ static int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
         if (!proc) return -ESRCH;
         return ProcessGetNoNewPrivs(proc) ? 1 : 0;
     }
-    // Capability/secure-exec operations are unsupported, not successful no-ops.
+    if(option==23 || option==24) {
+        if(arg3 || arg4 || arg5)return -EINVAL;
+        auto* process=ProcessCurrent();return process?ProcessCapabilityControl(process,unsigned(option),arg2):-ESRCH;
+    }
+    // Remaining capability/secure-exec operations are explicit errors.
     switch (option) {
         case 7: case 8:   // GET/SET_KEEPCAPS
         case 21: case 22: // GET/SET_SECCOMP
@@ -13117,6 +13153,9 @@ static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnam
         int index = static_cast<int>(reinterpret_cast<uintptr_t>(entry->handle)) - 1;
         value = brook::SockGetConnectError(index);
     }
+    if(valueSize==sizeof(credentials)) {
+        credentials.uid=ProcessReportId(proc,false,credentials.uid);credentials.gid=ProcessReportId(proc,true,credentials.gid);
+    }
     if (copied) memcpy(reinterpret_cast<void*>(optvalAddr),
                        valueSize == sizeof(credentials) ? static_cast<const void*>(&credentials)
                                                         : static_cast<const void*>(&value), copied);
@@ -13692,6 +13731,7 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
                 if(cm.cmsg_len!=sizeof(cm)+sizeof(UnixCredentials))return failControl(-EINVAL);
                 UnixCredentials requested{};
                 if(!CopyFromUser(&requested,ctlAddr+off+sizeof(cm),sizeof(requested)))return failControl(-EFAULT);
+                requested.uid=ProcessResolveId(proc,false,requested.uid);requested.gid=ProcessResolveId(proc,true,requested.gid);
                 const auto users=ProcessReadIds(proc,false),groups=ProcessReadIds(proc,true);
                 const int32_t sender=proc->tgid?proc->tgid:proc->pid;
                 if(int error=UnixCredentialsCheck(requested,sender,users,groups))return failControl(error);
@@ -13837,6 +13877,7 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         msg->msg_flags=0;msg->msg_controllen=0;
         uint64_t controlUsed = 0;
         if (passCredentials && total > 0) {
+            sender.uid=ProcessReportId(proc,false,sender.uid);sender.gid=ProcessReportId(proc,true,sender.gid);
             const uint64_t required = sizeof(CmsgHdr) + sizeof(sender);
             if (capacity >= sizeof(CmsgHdr)) {
                 auto* header = static_cast<CmsgHdr*>(msg->msg_control);

@@ -35,9 +35,9 @@ SemUndoRecord* semGarbage=nullptr;
 SemWaiter* semWaiters=nullptr;
 uint64_t semWaitSerial=0;
 struct SemCredentials {
-    uint32_t uid,gid;
+    uint32_t uid,gid;bool privileged;
     SupplementaryGroups* groups;
-    explicit SemCredentials(Process* p):uid(p->euid),gid(p->egid),groups(ProcessGroupsAcquire(p)){}
+    explicit SemCredentials(Process* p):uid(p->euid),gid(p->egid),groups(ProcessGroupsAcquire(p)){privileged=ProcessCapable(p,nullptr,CapSysAdmin);}
     ~SemCredentials(){ProcessGroupsRelease(groups);}
     bool member(uint32_t g) const {
         if(g==gid)return true;
@@ -45,7 +45,7 @@ struct SemCredentials {
         return false;
     }
     bool permitted(const SemSet* s,unsigned request) const {
-        if(!uid)return true;
+        if(privileged)return true;
         const auto& p=s->ds.permission;
         unsigned bits=p.mode;
         if(uid==p.uid || uid==p.cuid)bits>>=6;
@@ -53,7 +53,7 @@ struct SemCredentials {
         return (bits&request)==request;
     }
     bool owner(const SemSet* s) const {
-        return !uid || uid==s->ds.permission.uid || uid==s->ds.permission.cuid;
+        return privileged || uid==s->ds.permission.uid || uid==s->ds.permission.cuid;
     }
 };
 SemSet* SemLookup(int id) {

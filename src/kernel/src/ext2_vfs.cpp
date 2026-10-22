@@ -1,3 +1,4 @@
+#include "process_user_namespace.h"
 // ext2_vfs.cpp — Ext2 filesystem driver for Brook VFS (read/write).
 //
 // Implements: superblock parsing, inode lookup, block mapping (direct/indirect/
@@ -2460,7 +2461,7 @@ static int Ext2CheckStickyRemoval(Ext2Mount* mnt, const Ext2Inode& parent, const
     Process* cur = ProcessCurrent();
     if (mnt->skipPermChecks || !(parent.i_mode & 01000) || !cur) return 0;
     uint32_t uid = ProcessReadIds(cur, false).effective;
-    return uid == 0 || uid == Ext2Uid(parent) || uid == Ext2Uid(entry) ? 0 : -1;
+    return ProcessCapable(cur,nullptr,CapFowner) || uid == Ext2Uid(parent) || uid == Ext2Uid(entry) ? 0 : -1;
 }
 
 // Caller holds g_ext2Lock for writing. Ext2's base inode stores whole seconds;
@@ -2543,7 +2544,7 @@ static int Ext2VnodeChmod(Vnode* vn, uint16_t mode)
 static int Ext2SetInodeOwner(Ext2Mount* mnt, uint32_t ino, uint32_t uid, uint32_t gid)
 {
     Process* cur = ProcessCurrent();
-    if (cur && cur->euid != 0) return -1;
+    if (cur && !ProcessCapable(cur,nullptr,CapChown)) return -1;
     Ext2Inode data;
     if (!Ext2ReadInode(mnt, ino, &data)) return -5;
     if (uid != 0xffffffffu) Ext2SetUid(data, uid);

@@ -1,3 +1,4 @@
+#include "process_user_namespace.h"
 #include "apic.h"
 #include "mapping_fault_test.h"
 #include "process.h"
@@ -19,7 +20,7 @@ bool armed,released,timedOut;
 int64_t MappingFaultTestControl(uint64_t action,uint64_t address,uint64_t length,
                                 uint64_t phase,uint64_t count,uint64_t) {
     auto* actor=ProcessCurrent();
-    if (!actor || actor->euid!=0) return -1;
+    if (!actor || !ProcessCapable(actor,nullptr,CapSysAdmin)) return -1;
     const uint64_t lockFlags=IrqSpinLockAcquire(&lock);
     int64_t result=-22;
     if (action==0) {

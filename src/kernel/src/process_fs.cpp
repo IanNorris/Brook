@@ -75,6 +75,7 @@ int ProcessFsIsolateMounts(Process* child)
     MountNamespace* ns=nullptr;VfsPath root{},cwd{};
     error=VfsMountNamespaceCopy(snapshot.mountNamespace,snapshot.root,snapshot.cwd,&ns,&root,&cwd);
     FsContext* context=nullptr;
+    if(!error)error=VfsMountNamespaceSetUserOwnerPrepared(ns,child->userNamespace);
     if(!error)context=FsContextCreate(root,cwd,snapshot.mask,&error,ns);
     VfsPathRelease(cwd);VfsPathRelease(root);FsSnapshotRelease(&snapshot);
     if(error) {

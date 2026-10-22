@@ -3,7 +3,7 @@
 // reference is kept (cwd=/proc/self must not create a Process ownership cycle).
 static constexpr uint32_t PROC_PID_EXE=5,PROC_PID_CWD=6,PROC_PID_ROOT=8;
 static_assert(NUM_PID_ENTRIES==9,"Update retained proc PID entry indices when changing the catalog");
-enum class ProcObjectKind : uint8_t { Root,Net,Pid,Task,Fds,GlobalFile,NetFile,PidFile,FdLink,Self,ThreadSelf };
+enum class ProcObjectKind : uint8_t { Root,Net,Pid,Task,Fds,GlobalFile,NetFile,PidFile,FdLink,Self,ThreadSelf,UserMap };
 struct ProcObject {
     VfsObject object;
     VfsObject* parent;
@@ -13,6 +13,7 @@ struct ProcObject {
     uint64_t incarnation,group;
     bool taskMember;
     uint32_t index;
+    UserNamespace* userNamespace;
 };
 static SpinLock g_procObjectLock;
 static ProcObject* g_procObjects;
@@ -24,6 +25,7 @@ static bool ProcObjectDirectory(ProcObjectKind kind)
 }
 static int ProcObjectSnapshot(const ProcObject* object,ProcessSnapshot* snapshot)
 {
+    if(object->kind==ProcObjectKind::UserMap) {*snapshot={};return 0;}
     if(!object->pid) { *snapshot={};return 0; }
     if(!SchedulerSnapshotProcess(object->pid,snapshot) || snapshot->incarnation!=object->incarnation ||
        snapshot->tgid!=object->tgid || snapshot->groupIncarnation!=object->group ||
@@ -41,6 +43,13 @@ static int ProcObjectMake(ProcObjectKind kind,VfsObject* parent,const ProcessSna
         value->pid=snapshot->pid;value->tgid=snapshot->tgid;
         value->incarnation=snapshot->incarnation;value->group=snapshot->groupIncarnation;
     }
+    if(kind==ProcObjectKind::UserMap) {
+        auto* task=SchedulerFindProcessReference(value->pid);
+        if(!task || task->incarnation!=value->incarnation) {
+            if(task)ProcessUnref(task);VfsObjectRelease(value->parent);kfree(value);return -2;
+        }
+        value->userNamespace=ProcessUserNamespaceAcquire(task);ProcessUnref(task);
+    }
     SpinLockAcquire(&g_procObjectLock);
     for(auto* entry=g_procObjects;entry;entry=entry->next) {
         if(entry->kind==kind && entry->pid==value->pid && entry->incarnation==value->incarnation &&
@@ -49,7 +58,7 @@ static int ProcObjectMake(ProcObjectKind kind,VfsObject* parent,const ProcessSna
            ((!entry->parent && !parent) || (entry->parent && parent && entry->parent->ops==parent->ops && entry->parent->identity==parent->identity)) &&
            VfsObjectTryRetain(&entry->object)) {
             *out=&entry->object;SpinLockRelease(&g_procObjectLock);
-            VfsObjectRelease(value->parent);kfree(value);return 0;
+            UserNamespaceRelease(value->userNamespace);VfsObjectRelease(value->parent);kfree(value);return 0;
         }
     }
     // Only root has a fixed identity across zero-reference intervals. Other
@@ -68,7 +77,7 @@ static void ProcObjectDestroy(VfsObject* object)
     ProcObject** entry=&g_procObjects;while(*entry && *entry!=value)entry=&(*entry)->next;
     if(*entry!=value)__builtin_trap();
     *entry=value->next;SpinLockRelease(&g_procObjectLock);
-    kfree(value);VfsObjectRelease(parent);
+    UserNamespaceRelease(value->userNamespace);kfree(value);VfsObjectRelease(parent);
 }
 static int ProcObjectStat(VfsObject* object,VnodeStat* out)
 {
@@ -83,12 +92,16 @@ static int ProcObjectStat(VfsObject* object,VnodeStat* out)
                    value->kind==ProcObjectKind::ThreadSelf ||
                    (value->kind==ProcObjectKind::PidFile && (value->index==PROC_PID_EXE || value->index==PROC_PID_CWD || value->index==PROC_PID_ROOT));
     out->mode=out->isDir?0040555:out->isSymlink?0120777:0100444;
+    if(value->kind==ProcObjectKind::UserMap) {out->mode=0100644;out->uid=value->userNamespace?value->userNamespace->owner:0;}
     out->ino=object->identity;out->dev=0x70726f63;out->nlink=out->isDir?2:1;
     return 0;
 }
-static int ProcObjectAccess(VfsObject* object,uint8_t required,bool)
+static int ProcObjectAccess(VfsObject* object,uint8_t required,bool realIds)
 {
     VnodeStat stat{};if(int error=ProcObjectStat(object,&stat))return error;
+    auto* value=static_cast<ProcObject*>(object->priv);
+    if(value->kind==ProcObjectKind::UserMap)
+        return ProcessCheckFileAccess(ProcessCurrent(),stat.uid,stat.gid,stat.mode,required,realIds);
     if(required&2)return -13;
     return (required&1) && !stat.isDir?-13:0;
 }
@@ -113,6 +126,7 @@ static int ProcObjectLookup(VfsObject* object,const char* name,VfsObject** out,b
         return -2;
     }
     if(value->kind==ProcObjectKind::Pid) {
+        if(auto kind=ProcMapKind(name))return ProcObjectMake(ProcObjectKind::UserMap,object,&snapshot,kind,value->taskMember,out);
         if(StrEqProc(name,"fd"))return ProcObjectMake(ProcObjectKind::Fds,object,&snapshot,0,value->taskMember,out);
         if(!value->taskMember && StrEqProc(name,"task"))return ProcObjectMake(ProcObjectKind::Task,object,&snapshot,0,false,out);
         for(uint32_t i=0;i<NUM_PID_ENTRIES;++i)
@@ -168,10 +182,18 @@ static Vnode* ProcObjectOpen(VfsObject* object,int flags,int* error)
 {
     *error=0;auto* value=static_cast<ProcObject*>(object->priv);ProcessSnapshot snapshot{};
     if((*error=ProcObjectSnapshot(value,&snapshot)))return nullptr;
-    if(flags&~(VFS_O_METADATA|VFS_O_EXEC)) { *error=-13;return nullptr; }
+    if(flags&~(VFS_O_METADATA|VFS_O_EXEC|(value->kind==ProcObjectKind::UserMap?(VFS_O_WRITE|VFS_O_READWRITE):0))) { *error=-13;return nullptr; }
     if(flags&VFS_O_EXEC) { *error=-13;return nullptr; }
+    if(value->kind==ProcObjectKind::UserMap && !(flags&VFS_O_METADATA)) {
+        uint8_t requested=flags&VFS_O_READWRITE?6:flags&VFS_O_WRITE?2:4;
+        if((*error=ProcObjectAccess(object,requested,false)))return nullptr;
+        if(value->index==3 && (requested&2) && !ProcessCapable(ProcessCurrent(),value->userNamespace,CapSysAdmin)) {
+            *error=-13;return nullptr;
+        }
+    }
     Vnode* node=nullptr;
-    if(value->kind==ProcObjectKind::Root)node=MakeProcVnode(nullptr,0,true,&g_procRootDirOps);
+    if(value->kind==ProcObjectKind::UserMap)node=MakeUserMapVnode(value->userNamespace,uint8_t(value->index));
+    else if(value->kind==ProcObjectKind::Root)node=MakeProcVnode(nullptr,0,true,&g_procRootDirOps);
     else if(value->kind==ProcObjectKind::Net) { *error=-95;return nullptr; }
     else if(ProcObjectDirectory(value->kind)) {
         ProcLookup path{snapshot,"",value->kind==ProcObjectKind::Task,value->taskMember};

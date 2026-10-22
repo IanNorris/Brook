@@ -1,3 +1,4 @@
+#include "process_user_namespace.h"
 #include "sysv_sem.h"
 #include "process.h"
 #include "scheduler.h"

@@ -1,3 +1,4 @@
+#include "process_user_namespace.h"
 #include "signal_fd.h"
 #include "process.h"
 #include "posix_timer.h"

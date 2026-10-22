@@ -5,10 +5,13 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t,
                          uint64_t flags,uint64_t,uint64_t)
 {
     if(flags!=0x1000)return -EINVAL;
-    auto* process=ProcessCurrent();if(!process || process->euid!=0)return -EPERM;
+    auto* process=ProcessCurrent();if(!process)return -EPERM;
     char source[512],target[512];
     if(!CopyUserCString(sourceAddr,source,sizeof(source)) || !CopyUserCString(targetAddr,target,sizeof(target)))return -EFAULT;
     AtLookup lookup;if(int error=lookup.Init(-100,target))return error;
+    auto* owner=VfsMountNamespaceUserOwnerAcquire(lookup.fs.mountNamespace);
+    bool authorized=ProcessCapable(process,owner,CapSysAdmin);UserNamespaceRelease(owner);
+    if(!authorized)return -EPERM;
     if(!source[0])return -ENOENT;
     VfsPath sourcePath{},targetPath{};
     int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,source,&sourcePath);
@@ -20,9 +23,12 @@ static int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,
                            uint64_t,uint64_t,uint64_t)
 {
     if(flags!=2)return -EINVAL;
-    auto* process=ProcessCurrent();if(!process || process->euid!=0)return -EPERM;
+    auto* process=ProcessCurrent();if(!process)return -EPERM;
     char target[512];if(!CopyUserCString(targetAddr,target,sizeof(target)))return -EFAULT;
     AtLookup lookup;if(int error=lookup.Init(-100,target))return error;
+    auto* owner=VfsMountNamespaceUserOwnerAcquire(lookup.fs.mountNamespace);
+    bool authorized=ProcessCapable(process,owner,CapSysAdmin);UserNamespaceRelease(owner);
+    if(!authorized)return -EPERM;
     VfsPath path{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&path);
     if(!error)error=VfsMountNamespaceDetach(lookup.fs.mountNamespace,path);
     VfsPathRelease(path);return error;

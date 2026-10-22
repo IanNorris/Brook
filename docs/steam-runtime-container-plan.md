@@ -1,10 +1,10 @@
 # SteamRT container feasibility gate
 
-Status (2026-10-22): the bounded mount-namespace checkpoint is accepted after
-source review, Linux differential probes and native regression/teardown checks.
-The latest checkpoint is described at the end of this document. User namespaces
-and remaining SteamRT integration are separate phases. There is no Brook login
-acceptance.
+Status (2026-10-22): the bounded mount-namespace and
+[user-namespace foundation](user-namespace-checkpoint.md) checkpoints are accepted
+after source review, Linux differential probes and native regression/teardown
+checks. Remaining SteamRT mount/root integration is a separate phase. There is no
+Brook login acceptance.
 
 The accepted baseline is `3bfc275e` (ABI 39), including retained filesystem
 contexts at `e626b7f8`, retained proc-root links and real per-task no_new_privs.

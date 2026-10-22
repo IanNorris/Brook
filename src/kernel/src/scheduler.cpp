@@ -3281,6 +3281,7 @@ static uint32_t CountTasksLocked(uint16_t tgid, uint64_t generation)
 static void FillProcessSnapshot(const Process* p, ProcessSnapshot* out)
 {
     *out = {};
+    out->uid=p->uid;out->euid=p->euid;out->gid=p->gid;out->egid=p->egid;out->suid=p->suid;out->sgid=p->sgid;
     out->pid = p->pid; out->parentPid = p->parentPid;
     out->tgid = SnapshotTgid(p); out->incarnation = p->incarnation;
     out->groupIncarnation = SnapshotGroup(p);
@@ -3317,7 +3318,7 @@ uint32_t SchedulerSnapshotDebugTasks(DebugTaskSnapshot* out,uint32_t capacity,
         if(count>=capacity)continue;auto& r=out[count++];r={};
         r.pid=p->pid;r.parentPid=p->parentPid;r.tgid=SnapshotTgid(p);
         r.incarnation=p->incarnation;r.groupIncarnation=SnapshotGroup(p);r.launchId=p->launchId;
-        r.uid=p->uid;r.euid=p->euid;r.gid=p->gid;r.egid=p->egid;r.kernel=p->isKernelThread;
+        r.uid=p->uid;r.euid=p->euid;r.gid=p->gid;r.egid=p->egid;r.suid=p->suid;r.sgid=p->sgid;r.kernel=p->isKernelThread;
         r.systemService=!p->isKernelThread && p->lifecycleRole==ProcessLifecycleRole::Service;
         r.runningOnCpu=p->runningOnCpu;r.state=p->state;r.userTicks=p->userTicks;r.sysTicks=p->sysTicks;
         for(unsigned j=0;j+1<sizeof(r.name)&&p->name[j];++j)r.name[j]=p->name[j];

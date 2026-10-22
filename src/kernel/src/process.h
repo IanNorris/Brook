@@ -7,6 +7,7 @@
 #include "spinlock.h"
 #include "fd_table.h"
 #include "credential_ids.h"
+#include "user_namespace.h"
 #include "signal_return.h"
 
 namespace brook {
@@ -537,6 +538,9 @@ struct Process
     // Kernel launcher classification, immutable after publication. Fork and
     // threads inherit it; exec preserves it. This grants no Linux credentials.
     ProcessLifecycleRole lifecycleRole;
+
+    UserCapabilityState capabilities; // credential lock; meaningful in private user namespaces
+    UserNamespace* userNamespace; // owned immutable identity after publication; null is initial
 
     // Independent live-task membership and owned namespace storage reference.
     // Exchange only through process_fs.h; logical exit retires before reaping.

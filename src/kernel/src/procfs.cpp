@@ -1,3 +1,4 @@
+#include "process_user_namespace.h"
 #include "process_fs.h"
 #include "mount_namespace.h"
 #include "spinlock.h"
@@ -154,6 +155,9 @@ struct ProcPriv {
     uint64_t groupIncarnation;
     bool taskRoot;
     bool taskMember;
+    UserNamespace* userNamespace;
+    UserAuthority openedAuthority;
+    uint8_t mapKind; // 1 UID, 2 GID, 3 setgroups; independent namespace lease
 };
 
 // VnodeOps for procfs files
@@ -178,7 +182,7 @@ static int ProcFileWrite(Vnode*, const void*, uint64_t, uint64_t*) { return -1; 
 static void ProcFileClose(Vnode* vn)
 {
     auto* pp = static_cast<ProcPriv*>(vn->priv);
-    if (pp) { kfree(pp->data); kfree(pp); }
+    if (pp) { UserNamespaceRelease(pp->userNamespace);UserNamespaceRelease(pp->openedAuthority.ns);kfree(pp->data); kfree(pp); }
 }
 
 static int ProcFileStat(Vnode* vn, VnodeStat* st)
@@ -199,7 +203,7 @@ static int ProcDirRead(Vnode*, void*, uint64_t, uint64_t*) { return -1; }
 static void ProcDirClose(Vnode* vn)
 {
     auto* pp = static_cast<ProcPriv*>(vn->priv);
-    if (pp) { kfree(pp->data); kfree(pp); }
+    if (pp) { UserNamespaceRelease(pp->userNamespace);UserNamespaceRelease(pp->openedAuthority.ns);kfree(pp->data); kfree(pp); }
 }
 
 // Forward declare readdir
@@ -265,6 +269,26 @@ static Vnode* MakeProcVnode(char* data, uint32_t size, bool isDir = false, Vnode
     vn->refCount = 1; vn->cacheId = 0;
     return vn;
 }
+
+
+static int ProcMapRead(Vnode* vn,void* data,uint64_t length,uint64_t* offset) {
+    auto* pp=static_cast<ProcPriv*>(vn->priv);char text[80];
+    uint32_t size=ProcessUserMapRead(pp->userNamespace,pp->openedAuthority.ns,pp->mapKind==2,pp->mapKind==3,text,sizeof(text));
+    if(*offset>=size)return 0;if(length>size-*offset)length=size-*offset;
+    memcpy(data,text+*offset,length);*offset+=length;return int(length);
+}
+static int ProcMapWrite(Vnode* vn,const void* data,uint64_t length,uint64_t* offset) {
+    if(*offset || !length || length>255)return -22;
+    char text[256];memcpy(text,data,length);
+    auto* pp=static_cast<ProcPriv*>(vn->priv);
+    int error=ProcessUserMapWrite(pp->userNamespace,pp->openedAuthority,text,length,pp->mapKind==2,pp->mapKind==3);
+    if(error)return error;*offset+=length;return int(length);
+}
+static int ProcMapStat(Vnode* vn,VnodeStat* st) {
+    int result=ProcFileStat(vn,st);auto* pp=static_cast<ProcPriv*>(vn->priv);
+    st->mode=0100644;st->uid=pp->userNamespace?pp->userNamespace->owner:0;return result;
+}
+static VnodeOps g_procMapOps={ProcFileOpen,ProcMapRead,ProcMapWrite,nullptr,ProcFileClose,ProcMapStat,nullptr};
 
 // ---- Content generators ----
 
@@ -607,6 +631,8 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         "PPid:\t%u\n"
         "Pgid:\t%u\n"
         "Sid:\t%u\n"
+        "Uid:\t%u\t%u\t%u\t%u\n"
+        "Gid:\t%u\t%u\t%u\t%u\n"
         "VmSize:\t%lu kB\n"
         "VmRSS:\t%lu kB\n"
         "Threads:\t%u\n",
@@ -617,6 +643,10 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
         (uint32_t)proc.parentPid,
         (uint32_t)proc.pgid,
         (uint32_t)proc.sid,
+        ProcessReportId(ProcessCurrent(),false,proc.uid),ProcessReportId(ProcessCurrent(),false,proc.euid),
+        ProcessReportId(ProcessCurrent(),false,proc.suid),ProcessReportId(ProcessCurrent(),false,proc.euid),
+        ProcessReportId(ProcessCurrent(),true,proc.gid),ProcessReportId(ProcessCurrent(),true,proc.egid),
+        ProcessReportId(ProcessCurrent(),true,proc.sgid),ProcessReportId(ProcessCurrent(),true,proc.egid),
         vsize / 1024,
         (proc.stackTop - proc.stackBase) / 1024, proc.threadCount);
 
@@ -1323,6 +1353,24 @@ static Vnode* MakePidDirectory(const ProcLookup& path, VnodeOps* ops)
 
 void ProcFsInit() { SerialPuts("procfs: initialised\n"); }
 
+static uint8_t ProcMapKind(const char* name) {
+    return StrEqProc(name,"uid_map")?1:StrEqProc(name,"gid_map")?2:StrEqProc(name,"setgroups")?3:0;
+}
+static Vnode* MakeUserMapVnode(UserNamespace* ns,uint8_t kind) {
+    auto opened=ProcessUserAuthorityAcquire(ProcessCurrent());
+    auto* vn=MakeProcVnode(nullptr,0,false,&g_procMapOps);
+    if(!vn) {UserNamespaceRelease(opened.ns);return nullptr;}
+    UserNamespaceRetain(ns);
+    auto* pp=static_cast<ProcPriv*>(vn->priv);pp->userNamespace=ns;pp->openedAuthority=opened;pp->mapKind=kind;return vn;
+}
+static Vnode* GenPidUserMap(const ProcessSnapshot& snap,uint8_t kind) {
+    auto* target=SchedulerFindProcessReference(snap.pid);if(!target)return nullptr;
+    UserNamespace* ns=nullptr;bool valid=target->incarnation==snap.incarnation;
+    if(valid)ns=ProcessUserNamespaceAcquire(target);ProcessUnref(target);
+    if(!valid)return nullptr;
+    auto* vn=MakeUserMapVnode(ns,kind);UserNamespaceRelease(ns);return vn;
+}
+
 Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
 {
     char resolved[256];
@@ -1339,6 +1387,7 @@ Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
     if (!path.rest[0] || StrEqProc(path.rest, "fd")) return ProcFsOpenDir(resolved);
     for (uint32_t i = 0; i < NUM_PID_ENTRIES; ++i)
         if (StrEqProc(path.rest, g_pidEntries[i].name)) return g_pidEntries[i].gen(path.snap);
+    if(auto kind=ProcMapKind(path.rest))return GenPidUserMap(path.snap,kind);
     int fd;
     if (ProcFdNumber(path.rest, &fd)) return GenPidFdLink(path.snap.pid, fd, path.snap.incarnation);
     return nullptr;
@@ -1368,6 +1417,7 @@ int ProcFsStatPath(const char* relPath, VnodeStat* st)
     for (uint32_t i = 0; i < NUM_PID_ENTRIES; ++i)
         if (StrEqProc(path.rest, g_pidEntries[i].name))
         { st->size = 0; st->isDir = false; return 0; }
+    if(ProcMapKind(path.rest)) {st->isDir=false;st->mode=0100644;st->size=0;return 0;}
     int fd;
     FdSnapshot snap;
     if (ProcFdNumber(path.rest, &fd) && SchedulerGetFdInfo(path.snap.pid, fd, &snap, path.snap.incarnation))
@@ -1434,6 +1484,11 @@ static int ProcPidReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
         *cookie = idx + 1;
         return 1;
     }
+    if(idx<NUM_PID_ENTRIES+3) {
+        const char* names[]={"uid_map","gid_map","setgroups"};
+        ProcStrCopy(out->name,names[idx-NUM_PID_ENTRIES],sizeof(out->name));out->size=0;out->isDir=false;*cookie=idx+1;return 1;
+    }
+    idx-=3;
     // After regular entries, emit "fd" directory
     auto* pp = static_cast<ProcPriv*>(vn->priv);
     if (idx == NUM_PID_ENTRIES || (idx == NUM_PID_ENTRIES + 1 && !pp->taskMember))
@@ -1441,7 +1496,7 @@ static int ProcPidReaddir(Vnode* vn, DirEntry* out, uint32_t* cookie)
         ProcStrCopy(out->name, idx == NUM_PID_ENTRIES ? "fd" : "task", sizeof(out->name));
         out->size = 0;
         out->isDir = true;
-        *cookie = idx + 1;
+        *cookie = idx + 4;
         return 1;
     }
     return 0;

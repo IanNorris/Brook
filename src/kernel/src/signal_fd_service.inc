@@ -28,6 +28,7 @@ int64_t SignalFdRead(Process* p,SignalFd* fd,uint64_t destination,uint64_t count
         if(matched) {
             const int signo=__builtin_ctzll(matched)+1;SignalInfo info{};
             if(!PosixTimerDequeue(p,1ULL<<(signo-1),&info) && !ProcessDequeueSignal(p,signo,&info))continue;
+            ProcessSignalInfoToUser(p,&info);
             const auto record=SignalFdEncode(info.si_signo,info.si_errno,info.si_code,info._data);
             // Like Linux, a fault can consume this signal after earlier records.
             if(!CopyToUser(destination+copied,&record,sizeof(record)))return copied?int64_t(copied):-14;

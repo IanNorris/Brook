@@ -39,6 +39,7 @@
 #include "user_copy.h"
 #include "signal_frame_layout.h"
 #include "vdso.h"
+#include "process_user_namespace.h"
 
 namespace brook {
 static_assert(offsetof(Process,mountNamespaceMember)+sizeof(Process::mountNamespaceMember)==offsetof(Process,fsContext),
@@ -85,94 +86,7 @@ struct ProcessOperationGuard {
 };
 
 // No credential lock is held across allocation, user copies or scheduling.
-static SpinLock g_credentialsLock;
-CredentialIds ProcessReadIds(Process* proc, bool group) {
-    ProcessOperationGuard credentialOperation(ProcessCurrent());
-    SpinLockAcquire(&g_credentialsLock);
-    CredentialIds ids = group ? CredentialIds{proc->gid, proc->egid, proc->sgid}
-                              : CredentialIds{proc->uid, proc->euid, proc->suid};
-    SpinLockRelease(&g_credentialsLock); return ids;
-}
-int ProcessChangeIds(Process* proc, bool group, CredentialChange operation,
-                     uint32_t real, uint32_t effective, uint32_t saved) {
-    ProcessOperationGuard credentialOperation(ProcessCurrent());
-    SpinLockAcquire(&g_credentialsLock);
-    CredentialIds ids = group ? CredentialIds{proc->gid, proc->egid, proc->sgid}
-                              : CredentialIds{proc->uid, proc->euid, proc->suid};
-    int error = ChangeCredentialIds(ids, operation, proc->euid == 0, real, effective, saved);
-    if (!error) {
-        if (group) { proc->gid = ids.real; proc->egid = ids.effective; proc->sgid = ids.saved; }
-        else { proc->uid = ids.real; proc->euid = ids.effective; proc->suid = ids.saved; }
-    }
-    SpinLockRelease(&g_credentialsLock); return error;
-}
-SupplementaryGroups* ProcessGroupsAcquire(Process* proc) {
-    ProcessOperationGuard credentialOperation(ProcessCurrent());
-    SpinLockAcquire(&g_credentialsLock);
-    auto* groups = proc->groups;
-    if (groups) __atomic_fetch_add(&groups->references, 1, __ATOMIC_RELAXED);
-    SpinLockRelease(&g_credentialsLock); return groups;
-}
-void ProcessGroupsRelease(SupplementaryGroups* groups) {
-    if (groups && __atomic_fetch_sub(&groups->references, 1, __ATOMIC_ACQ_REL) == 1) kfree(groups);
-}
-void ProcessGroupsReplace(Process* proc, SupplementaryGroups* owned) {
-    ProcessOperationGuard credentialOperation(ProcessCurrent());
-    SpinLockAcquire(&g_credentialsLock);
-    auto* old = proc->groups; proc->groups = owned;
-    SpinLockRelease(&g_credentialsLock); ProcessGroupsRelease(old);
-}
-FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode, bool realIds) {
-    if (!proc) return {true, false, false, 7};
-    ProcessOperationGuard credentialOperation(ProcessCurrent());
-    SpinLockAcquire(&g_credentialsLock);
-    uint32_t uid = realIds ? proc->uid : proc->euid;
-    uint32_t gid = realIds ? proc->gid : proc->egid;
-    FileCredentialAccess access = {uid == 0, uid == owner, gid == group, 0};
-    auto* groups = proc->groups;
-    // Published group lists are sorted and immutable. Membership is needed
-    // even for the owner (chmod's setgid rule), unlike the access-bit choice.
-    uint32_t low = 0, high = groups ? groups->count : 0;
-    while (!access.group && low < high) {
-        uint32_t mid = low + (high - low) / 2;
-        if (groups->ids[mid] == group) access.group = true;
-        else if (groups->ids[mid] < group) low = mid + 1;
-        else high = mid;
-    }
-    access.permissions = access.privileged ? 7 : access.owner ? (mode >> 6) & 7
-                         : access.group ? (mode >> 3) & 7 : mode & 7;
-    SpinLockRelease(&g_credentialsLock);
-    return access;
-}
-int ProcessCheckFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode,
-                           uint8_t required, bool realIds) {
-    if (required & ~7u) return -22;
-    auto access = ProcessFileAccess(proc, owner, group, mode, realIds);
-    // Linux root access(X_OK) still requires an execute bit on regular files.
-    // Directory search uses the root override even when its mode is 000.
-    if (access.privileged && (required & 1) && (mode & 0170000) == 0100000 && !(mode & 0111)) return -13;
-    return (access.permissions & required) == required ? 0 : -13;
-}
-uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, uint16_t mode) {
-    return ProcessFileAccess(proc, owner, group, mode).permissions;
-}
-// Exec currently grants neither set-ID nor file capabilities. Any future exec
-// credential-grant path MUST honor this irreversible per-task restriction.
-void ProcessSetNoNewPrivs(Process* proc) {
-    if (!proc) return;
-    ProcessOperationGuard operation(ProcessCurrent());
-    SpinLockAcquire(&g_credentialsLock);
-    proc->noNewPrivs = 1;
-    SpinLockRelease(&g_credentialsLock);
-}
-bool ProcessGetNoNewPrivs(Process* proc) {
-    if (!proc) return false;
-    ProcessOperationGuard operation(ProcessCurrent());
-    SpinLockAcquire(&g_credentialsLock);
-    bool value = proc->noNewPrivs != 0;
-    SpinLockRelease(&g_credentialsLock);
-    return value;
-}
+#include "process_credentials.inc"
 
 // Exclude independently synchronized state from the raw process snapshot.
 // NNP is inherited under the credentials lock below; other credentials are
@@ -187,23 +101,12 @@ static void CopyParentProcess(Process* child, Process* parent) {
     memcpy(reinterpret_cast<char*>(child)+nnpEnd,reinterpret_cast<const char*>(parent)+nnpEnd,
            offsetof(Process,cwdDisplay)-nnpEnd);
     memcpy(reinterpret_cast<char*>(child)+displayEnd,reinterpret_cast<const char*>(parent)+displayEnd,
-           offsetof(Process,mountNamespaceMember)-displayEnd);
+           offsetof(Process,capabilities)-displayEnd);
     ProcessFsReadDisplay(parent,child->cwdDisplay,sizeof(child->cwdDisplay));
 }
 
 // Immediately after memcpy: the copied pointer is borrowed until this retains
 // it. This same lock protects a concurrently running remote-thread target.
-static void InheritCredentials(Process* child, Process* parent) {
-    ProcessOperationGuard credentialOperation(ProcessCurrent());
-    SpinLockAcquire(&g_credentialsLock);
-    child->uid = parent->uid; child->euid = parent->euid; child->suid = parent->suid;
-    child->gid = parent->gid; child->egid = parent->egid; child->sgid = parent->sgid;
-    child->noNewPrivs = parent->noNewPrivs;
-    child->groups = parent->groups;
-    if (child->groups) __atomic_fetch_add(&child->groups->references, 1, __ATOMIC_RELAXED);
-    SpinLockRelease(&g_credentialsLock);
-}
-
 // Copies own references before publication; implemented with fd finalizers.
 bool FdRetainCopy(FdEntry* copy);
 
@@ -267,6 +170,7 @@ static inline void FreeProcessStruct(Process* p)
 
         ProcessFsClear(p);
         ProcessGroupsRelease(p->groups); p->groups = nullptr;
+        UserNamespaceRelease(p->userNamespace);p->userNamespace=nullptr;
         MappingBackingUnref(p->fbBacking);p->fbBacking=nullptr;
         AddressSpaceUnref(p->addressSpace);
         p->addressSpace = nullptr;
@@ -653,10 +557,10 @@ static uint64_t SetupUserStack(Process* proc,
     pushU64(100); pushU64(AT_CLKTCK);                           // AT_CLKTCK = 100
     pushU64(0); pushU64(AT_HWCAP);                              // AT_HWCAP = 0 (conservative; some IFUNC libs may need real bits)
     pushU64(platformAddr); pushU64(AT_PLATFORM);                // AT_PLATFORM = "x86_64"
-    pushU64(proc->egid); pushU64(AT_EGID);                               // AT_EGID
-    pushU64(proc->gid); pushU64(AT_GID);                                // AT_GID
-    pushU64(proc->euid); pushU64(AT_EUID);                               // AT_EUID
-    pushU64(proc->uid); pushU64(AT_UID);                                // AT_UID
+    pushU64(ProcessReportId(proc,true,proc->egid)); pushU64(AT_EGID);                               // AT_EGID
+    pushU64(ProcessReportId(proc,true,proc->gid)); pushU64(AT_GID);                                // AT_GID
+    pushU64(ProcessReportId(proc,false,proc->euid)); pushU64(AT_EUID);                               // AT_EUID
+    pushU64(ProcessReportId(proc,false,proc->uid)); pushU64(AT_UID);                                // AT_UID
     pushU64(proc->elf.entryPoint); pushU64(AT_ENTRY);           // AT_ENTRY
     pushU64(0); pushU64(AT_FLAGS);                              // AT_FLAGS = 0
     pushU64(interpBase); pushU64(AT_BASE);                       // AT_BASE (interpreter load addr, 0 if static)
@@ -1785,6 +1689,11 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     // Ordinary exec preserves real IDs/groups and snapshots effective IDs.
     SpinLockAcquire(&g_credentialsLock);
     proc->suid = proc->euid; proc->sgid = proc->egid;
+    if(proc->userNamespace) {
+        const bool root=UserIdFromCanonical(proc->userNamespace,false,proc->uid)==0 || UserIdFromCanonical(proc->userNamespace,false,proc->euid)==0;
+        UserCapabilitiesExec(proc->capabilities,root,proc->noNewPrivs!=0);
+        if(UserIdFromCanonical(proc->userNamespace,false,proc->euid)!=0)proc->capabilities.effective=0;
+    }
     SpinLockRelease(&g_credentialsLock);
     *outStackPtr = userSP;
 
@@ -2063,6 +1972,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     }
 
     // Fill siginfo
+    ProcessSignalInfoToUser(proc,&signalInfo);
     sf->info = signalInfo;
 
     // Prefault/COW may allocate or sleep. No return-path locks are held, and

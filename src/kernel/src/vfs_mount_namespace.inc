@@ -52,8 +52,19 @@ void VfsMountNamespaceRelease(MountNamespace* ns)
 {
     if(ns && ns->life.ReleaseStorage()) {
         if(ns->initial || ns->root)__builtin_trap();
-        ns->~MountNamespace();kfree(ns);
+        UserNamespaceRelease(ns->userOwner);ns->~MountNamespace();kfree(ns);
     }
+}
+UserNamespace* VfsMountNamespaceUserOwnerAcquire(MountNamespace* ns) {
+    if(!ns)return nullptr;UserNamespaceRetain(ns->userOwner);return ns->userOwner;
+}
+int VfsMountNamespaceSetUserOwnerPrepared(MountNamespace* ns,UserNamespace* owner) {
+    if(!ns || ns->initial || ns->life.Published() || ns->life.IsRetired())return -22;
+    if(ns->userOwner==owner)return 0;
+    FileMutationGuard transaction;
+    UserNamespaceRetain(owner);auto* old=ns->userOwner;ns->userOwner=owner;
+    for(auto& mount:g_mounts)if(mount.owner==ns)mount.lockedInherited=true;
+    UserNamespaceRelease(old);return 0;
 }
 bool VfsMountNamespaceActivate(MountNamespace* ns) { return ns && ns->life.ActivatePrepared(); }
 bool VfsMountNamespaceJoin(MountNamespace* ns) { return ns && ns->life.TryJoin(); }
@@ -132,7 +143,7 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
     validation=VfsObjectStatLocked(cwd.object,&stat);
     if(validation)return validation;if(!stat.isDir)return -20;
     void* memory=kmalloc(sizeof(MountNamespace));if(!memory)return -12;
-    auto* ns=::new(memory)MountNamespace();ns->life.RetainStorage(); // registry lease
+    auto* ns=::new(memory)MountNamespace();ns->userOwner=source->userOwner;UserNamespaceRetain(ns->userOwner);ns->life.RetainStorage(); // registry lease
     VfsNamespaceCloneMap map;int error=0;
     for(auto* original=g_mounts.head;original;original=original->next) {
         if(original->owner!=source || !VfsMountPublished(*original))continue;
@@ -141,7 +152,7 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
         auto* mount=static_cast<MountEntry*>(kmalloc(sizeof(MountEntry)));
         if(!mount) {kfree(memo);error=-12;break;}
         *mount={};mount->owner=ns;mount->referenceState=1;mount->backing=original->backing;
-        mount->backing->RetainLocked();mount->used=true;mount->linked=original->linked;
+        mount->backing->RetainLocked();mount->used=true;mount->linked=original->linked;mount->lockedInherited=original->lockedInherited;
         mount->publication=++g_mountPublication;mount->rootIdentity=original->rootIdentity;
         mount->rootObjectOps=original->rootObjectOps;mount->rootIdentityKnown=original->rootIdentityKnown;
         StrCopy(mount->mountPoint,original->mountPoint,sizeof(mount->mountPoint));
@@ -201,6 +212,7 @@ int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target)
     if(!VfsMountPublished(*selected) || selected->owner!=ns ||
        target.object->identity!=selected->rootIdentity || target.object->ops!=selected->rootObjectOps)return -22;
     if(selected==ns->root)return -95;
+    if(selected->lockedInherited)return -22;
     // Pre-mark the subtree before changing parent edges, so recursive detach
     // cannot lose descendants when a parent is unlinked first.
     for(auto& mount:g_mounts)if(mount.owner==ns) {

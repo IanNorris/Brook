@@ -11,6 +11,7 @@
 #include "../../kernel/src/signal_fd.h"
 #include "../../kernel/src/spinlock.h"
 namespace brook {
+
 constexpr unsigned MAX_PROCESSES=1024;
 enum class ProcessState {Running,Stopped,Terminated};
 struct SignalInfo {int32_t si_signo,si_errno,si_code,pad;uint8_t _data[112];};
@@ -22,6 +23,7 @@ struct Process {
     std::atomic<unsigned> regions{0};std::mutex mutex;std::condition_variable cv;bool wake=false;
     explicit Process(unsigned id):pid(id),tgid(id){}
 };
+static void ProcessSignalInfoToUser(Process*,SignalInfo*) {} // identity namespace fixture
 static std::atomic<int> allocations{0};static bool failAllocation=false,failCopy=false;
 static void* kmalloc(uint64_t n){if(failAllocation)return nullptr;void* p=std::malloc(n);if(p)++allocations;return p;}
 static void kfree(void* p){if(p){--allocations;std::free(p);}}

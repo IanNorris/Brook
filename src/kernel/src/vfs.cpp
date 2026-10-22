@@ -2,6 +2,7 @@
 #include "vfs_object.h"
 #include "vfs_path.h"
 #include "mount_namespace.h"
+#include "user_namespace.h"
 #include "mount_namespace_state.h"
 #if defined(BROOK_HOST_TEST) && !defined(BROOK_STANDALONE_TEST)
 #include <new>
@@ -161,6 +162,7 @@ struct MountNamespace {
     MountEntry* root=nullptr;
     MountNamespace* retireNext=nullptr;
     bool initial=false;
+    UserNamespace* userOwner=nullptr; // owned; immutable after activation
 };
 static MountNamespace g_initialNamespace;
 static IrqSpinLock g_namespaceRetirementLock;
@@ -186,6 +188,7 @@ struct MountEntry {
     bool             rootIdentityKnown;
     bool             linked;
     bool             detachSelected;
+    bool             lockedInherited;
 };
 
 // Membership is protected by the sleeping VFS transaction. Short metadata
