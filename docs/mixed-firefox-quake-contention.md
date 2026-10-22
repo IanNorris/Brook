@@ -159,3 +159,31 @@ GPU module changes in the native comparison; the baseline kernel and all other
 modules remain byte-identical. Its release build and 87 hosted suites pass,
 including actual control-response and upload bodies. Native benefit, rendering
 correctness and timeout recovery acceptance remain unproven.
+
+The first native fenced-detach cohort also shuts down cleanly and passes all
+four filesystem checks. Hash-verified central-window Quake rates are
+57.66 / 29.66 / 56.60 swaps/s alone/mixed/alone. Mixed p95 frame interval is
+52.96 ms versus the baseline's 51.75 ms. Mixed audio source completion remains
+deficient at 31.31k frames/s for Firefox and 28.92k for Quake. Both cohorts have
+zero invalid/backwards/clamped runtime-accounting samples at shutdown.
+
+This pair does not justify promotion: the small throughput difference is not
+an established gain, and the candidate's separate mixed frame-capture bracket
+uses 4.83 whole-QEMU cores versus 1.81 in the baseline. Solo Quake costs remain
+near one core. The cause of that mixed CPU difference is not attributed, and
+these brackets are not simultaneous with the plain PCM observations. Retained
+scene command-count histograms remain dominated by three- and five-command
+cycles in both cohorts; they do not prove the changed owned-upload path was
+substantially exercised. Dedicated owned-upload native acceptance is still
+needed. Evidence is
+`matched-desktop-fenced-detach-gpu-1ms-fixed-mlfq-a-20261022/`.
+
+A more direct next target is desktop-layer upload invalidation. The idle
+baseline retains seven commands per compositor cycle: four texture-upload
+commands, one vertex upload, one fenced compose and one display flush.
+The taskbar is redrawn and marks the shared dirty row range each cycle;
+`CompositorPresentGPU` then uses that same range to upload wallpaper, chrome
+and overlay textures, and uploads the cursor unconditionally. Separate layer
+invalidation or exact unchanged-content detection could remove redundant
+commands. This is a source/trace finding, not a measured speedup or permission
+to discard updates after failed/uncertain GPU completion.
