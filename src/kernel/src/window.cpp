@@ -894,6 +894,8 @@ static void FocusWindowLocked(int idx)
     }
 
     WmPushWmEvent(&g_windows[idx], WM_EVT_FOCUS_GAINED, 0, 0);
+    CompositorMarkDirty();
+    CompositorWake();
 }
 
 void WmSetFocus(int idx) { VfbGuard guard;FocusWindowLocked(idx); }
@@ -928,6 +930,8 @@ void WmSendToBack(int idx)
     for (uint32_t i = 0; i < count; ++i)
         g_windows[sorted[i]].zOrder = (uint8_t)(i + 1);
     g_nextZOrder = (uint8_t)(count + 1);
+    CompositorMarkDirty();
+    CompositorWake();
 }
 
 int WmGetFocusedWindow()
@@ -2857,6 +2861,8 @@ void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
     Window* w = WmFindWindowById(proc, wmId);
     if (!w || !title) return;
     WmStrCopy(w->title, title, sizeof(w->title));
+    CompositorMarkDirty();
+    CompositorWake();
 }
 
 void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t localY)
