@@ -1,7 +1,9 @@
 # SteamRT container feasibility gate
 
-Status: proposed scope expansion, not an implementation or login acceptance.
-The current Steam goal explicitly excludes full runtime-container support.
+Status: the bounded first phase is approved and investigated; see the
+[feasibility result](steam-runtime-feasibility.md) for evidence and the reviewed
+next-slice recommendation. Container implementation is not authorized by this
+investigation, and there is no Brook login acceptance.
 The tested IPC checkpoint is commit `bf453666`; [the client notes](steam-client.md)
 record its native acceptance and private VM evidence.
 

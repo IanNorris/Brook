@@ -263,3 +263,11 @@ Xwayland exits through semantic close with its exact registered group gone.
 The final heap check passes and shutdown acknowledges the checked filesystem
 and device flush. The original launcher exits zero and all four offline
 filesystem checks pass; their receipts remain with the review image.
+
+The separately approved bounded [SteamRT feasibility investigation](steam-runtime-feasibility.md)
+captures the unchanged runtime in a private Linux guest through container setup,
+then observes the real login UI after detaching tracing before CEF. It records
+the actual user/mount namespace and filesystem operations, source-confirmed
+i386/helper and hardlink fallbacks, and the reviewed object/lifetime design.
+Both comparison guests stop cleanly. This does not change Brook's container
+support or establish a Brook login window; implementation needs a separate scope.
