@@ -51,7 +51,7 @@ int main() {
     }
     const std::vector<GpuOwnedUploadStep> upload={GpuOwnedUploadStep::AttachBacking,
         GpuOwnedUploadStep::Transfer,GpuOwnedUploadStep::CompletionFence,
-        GpuOwnedUploadStep::DetachBacking,GpuOwnedUploadStep::DetachFence};
+        GpuOwnedUploadStep::DetachBackingFenced};
     for (unsigned fail=0;fail<=upload.size();++fail) {
         unsigned seen=0;bool attached=false,pendingRead=false;
         const bool complete=GpuOwnedUploadSequence([&](auto step) {
@@ -60,8 +60,7 @@ int main() {
             case GpuOwnedUploadStep::AttachBacking:attached=true;break;
             case GpuOwnedUploadStep::Transfer:CHECK(attached);pendingRead=true;break;
             case GpuOwnedUploadStep::CompletionFence:CHECK(attached && pendingRead);pendingRead=false;break;
-            case GpuOwnedUploadStep::DetachBacking:CHECK(attached && !pendingRead);attached=false;break;
-            case GpuOwnedUploadStep::DetachFence:CHECK(!attached && !pendingRead);break;
+            case GpuOwnedUploadStep::DetachBackingFenced:CHECK(attached && !pendingRead);attached=false;break;
             }
             return true;
         });

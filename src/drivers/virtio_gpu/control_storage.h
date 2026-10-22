@@ -10,6 +10,10 @@ struct __attribute__((packed)) VirtioGpuCtrlHdr {
     uint32_t ctx_id;
     uint8_t ring_idx,padding[3];
 };
+struct __attribute__((packed)) VirtioGpuCtxResource {
+    VirtioGpuCtrlHdr hdr;
+    uint32_t resource_id,padding;
+};
 struct __attribute__((packed)) VirtqDesc {
     uint64_t addr;
     uint32_t len;
@@ -17,6 +21,7 @@ struct __attribute__((packed)) VirtqDesc {
 };
 struct __attribute__((packed)) VirtqUsedElem { uint32_t id,len; };
 static_assert(sizeof(VirtioGpuCtrlHdr)==24 && sizeof(VirtqDesc)==16 && sizeof(VirtqUsedElem)==8);
+static_assert(sizeof(VirtioGpuCtxResource)==32);
 
 enum class GpuCommandStorageState:uint8_t { Writable,Preparing,Published,Completed,Quarantined };
 // Allocated outside the frame loop. Buffer pages and this metadata outlive every

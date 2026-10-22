@@ -18,11 +18,10 @@ bool GpuCaptureSequence(Step step) {
            step(GpuCaptureStep::DetachSource);
 }
 enum class GpuOwnedTextureRetirementStep { UnbindViewAndFence,DetachTexture,UnrefTexture };
-enum class GpuOwnedUploadStep { AttachBacking,Transfer,CompletionFence,DetachBacking,DetachFence };
+enum class GpuOwnedUploadStep { AttachBacking,Transfer,CompletionFence,DetachBackingFenced };
 template<class Step> bool GpuOwnedUploadSequence(Step step) {
     return step(GpuOwnedUploadStep::AttachBacking) && step(GpuOwnedUploadStep::Transfer) &&
-           step(GpuOwnedUploadStep::CompletionFence) && step(GpuOwnedUploadStep::DetachBacking) &&
-           step(GpuOwnedUploadStep::DetachFence);
+           step(GpuOwnedUploadStep::CompletionFence) && step(GpuOwnedUploadStep::DetachBackingFenced);
 }
 template<class Step>
 bool GpuOwnedTextureRetirementSequence(Step step) {

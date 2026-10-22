@@ -236,6 +236,38 @@ bool CmdRespOk(const GpuCommandStorage& storage,uint32_t len) {
         reinterpret_cast<const VirtioGpuCtrlHdr*>(storage.bytes+CMD_RESP_OFF)->type==0x1100;
 }
 bool CmdRespOk(uint32_t len){return CmdRespOk(g_legacyCommand,len);}
+#include "../../drivers/virtio_gpu/resource_control.inc"
+void resourceControlFences() {
+    // Execute the actual resource builder, publication and response validator.
+    // A detach ACK is not enough: validate its own fence before completion.
+    for(unsigned fault=0;fault<8;++fault) {
+        reset();
+        notifyHook=[&] {
+            const auto* request=reinterpret_cast<const VirtioGpuCtxResource*>(g_legacyCommand.bytes);
+            CHECK(request->hdr.type==0x107 && request->hdr.ctx_id==0 &&
+                  request->resource_id==0xabc && !request->padding);
+            CHECK(g_descTable[g_pendingCommand->head].len==sizeof(VirtioGpuCtxResource));
+            if(fault==6){now+=6000000000ULL;return;}
+            complete();auto* reply=reinterpret_cast<VirtioGpuCtrlHdr*>(g_legacyCommand.bytes+CMD_RESP_OFF);
+            if(fault==1)++reply->fence_id;
+            if(fault==2)reply->flags=0;
+            if(fault==3)reply->ctx_id=2;
+            if(fault==4)usedRing[0].len=23;
+            if(fault==5)reply->type=0x1200;
+        };
+        const bool ok=fault==7?ResourceControlLocked(0x107,0,0xabc):
+                              ResourceControlLocked(0x107,0,0xabc,true);
+        CHECK(ok==(fault==0 || fault==7));
+        CHECK(notifications==1);
+        CHECK(g_nextRenderFence==(fault==7?0u:1u));
+        CHECK(g_controlQueuePoisoned==((fault>=1 && fault<=4) || fault==6));
+        if(g_controlQueuePoisoned) {
+            CHECK(g_pendingCommand && g_pendingCommand->state==GpuCommandStorageState::Quarantined);
+            const auto prior=notifications;
+            CHECK(!ResourceControlLocked(0x107,0,0xabc,true) && notifications==prior);
+        }
+    }
+}
 #include "../../drivers/virtio_gpu/compose_frame.inc"
 void frameFailures() {
     reset();g_drawQuadCount=1;
@@ -353,6 +385,7 @@ static void exercise() {
 }
 
 int main(){
+    resourceControlFences();
     reset_device::exercise();
     notificationOwnership();
     frameFailures();

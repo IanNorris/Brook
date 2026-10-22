@@ -260,12 +260,6 @@ struct __attribute__((packed)) VirtioGpuCtxCreate {
     char     debug_name[64];
 };
 
-struct __attribute__((packed)) VirtioGpuCtxResource {
-    VirtioGpuCtrlHdr hdr;
-    uint32_t resource_id;
-    uint32_t padding;
-};
-
 struct __attribute__((packed)) VirtioGpuResourceCreate3D {
     VirtioGpuCtrlHdr hdr;
     uint32_t resource_id;
@@ -2776,14 +2770,8 @@ static int32_t AppPresentBarrier(int32_t ctxId)
 // These operations run on the compositor thread between frames (or during
 // pre-publication boot verification). They never borrow a window's guest pages.
 static bool g_ownedCaptureReady;
-static bool ResourceControlLocked(uint32_t type,uint32_t context,uint32_t resource)
-{
-    if (g_controlQueuePoisoned) return false;
-    auto* req=reinterpret_cast<VirtioGpuCtxResource*>(g_cmdBuf+CMD_REQ_OFF);
-    memset(req,0,sizeof(*req));req->hdr.type=type;req->hdr.ctx_id=context;
-    req->resource_id=resource;
-    return CmdRespOk(SubmitCommand(sizeof(*req),CMD_RESP_CAP));
-}
+#include "resource_control.inc"
+
 static bool DestroyOwnedTextureLocked(GpuTexture& texture)
 {
     if (!texture.owned || texture.quarantined || texture.uploadBackingAttached || g_controlQueuePoisoned) return false;
@@ -2946,44 +2934,7 @@ static brook::GpuCaptureResult CompCaptureExternal(GpuTexId id,int32_t producer,
     return brook::GpuCaptureResult::Complete;
 }
 
-static GpuCaptureResult CompUploadOwnedTexture(GpuTexId destination,uint64_t snapshot,uint32_t bytes)
-{
-    GpuCmdGuard guard;
-    auto* target=CompTex(destination);
-    if (!g_ownedCaptureReady || !g_compReady || !g_drawReady || g_compFrameAssembling ||
-        g_controlQueuePoisoned || !target || !target->owned || target->quarantined ||
-        target->uploadBackingAttached || !GpuCaptureFormatSupported(target->format) ||
-        !target->w || !target->h || target->w>GPU_SCENE_MAX_DIMENSION || target->h>GPU_SCENE_MAX_DIMENSION ||
-        !snapshot || (snapshot&4095u) || !bytes || uint64_t(target->w)*target->h*4!=bytes ||
-        snapshot>~uint64_t{0}-bytes) return GpuCaptureResult::Rejected;
-    bool submitted=false;
-    const bool complete=GpuOwnedUploadSequence([&](GpuOwnedUploadStep step) {
-        switch (step) {
-        case GpuOwnedUploadStep::AttachBacking: {
-            const bool attached=ResourceAttachBackingVirt(target->resId,snapshot,bytes,&submitted);
-            // A submitted attach may have succeeded even when its reply failed.
-            target->uploadBackingAttached=submitted;
-            return attached;
-        }
-        case GpuOwnedUploadStep::Transfer:
-            return TransferToHost3D(COMP_CTX_ID,target->resId,0,0,target->w,target->h,target->w,target->h);
-        case GpuOwnedUploadStep::CompletionFence:return AppFenceLocked(COMP_CTX_ID);
-        case GpuOwnedUploadStep::DetachBacking:
-            if (!ResourceControlLocked(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING,0,target->resId)) return false;
-            target->uploadBackingAttached=false;return true;
-        case GpuOwnedUploadStep::DetachFence:return AppFenceLocked(COMP_CTX_ID);
-        }
-        return false;
-    });
-    if (!complete) {
-        if (!submitted) return GpuCaptureResult::Rejected;
-        target->quarantined=true;
-        // The caller retains the snapshot lease until device reset. Never free
-        // it merely because an attach/transfer/detach acknowledgement failed.
-        return GpuCaptureResult::Uncertain;
-    }
-    return GpuCaptureResult::Complete;
-}
+#include "owned_texture_upload.inc"
 
 // Offscreen composition never borrows desktop vertex backing or mutates the
 // recorded desktop draw list. All handles are pinned by the scene's caller.
