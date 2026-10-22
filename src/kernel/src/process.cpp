@@ -154,6 +154,41 @@ int ProcessCheckFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16
 uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, uint16_t mode) {
     return ProcessFileAccess(proc, owner, group, mode).permissions;
 }
+// Exec currently grants neither set-ID nor file capabilities. Any future exec
+// credential-grant path MUST honor this irreversible per-task restriction.
+void ProcessSetNoNewPrivs(Process* proc) {
+    if (!proc) return;
+    ProcessOperationGuard operation(ProcessCurrent());
+    SpinLockAcquire(&g_credentialsLock);
+    proc->noNewPrivs = 1;
+    SpinLockRelease(&g_credentialsLock);
+}
+bool ProcessGetNoNewPrivs(Process* proc) {
+    if (!proc) return false;
+    ProcessOperationGuard operation(ProcessCurrent());
+    SpinLockAcquire(&g_credentialsLock);
+    bool value = proc->noNewPrivs != 0;
+    SpinLockRelease(&g_credentialsLock);
+    return value;
+}
+
+// Exclude independently synchronized state from the raw process snapshot.
+// NNP is inherited under the credentials lock below; other credentials are
+// refreshed there using the existing path. The FS pointer is acquired separately
+// and must never escape as a borrowed reference.
+static void CopyParentProcess(Process* child, Process* parent) {
+    constexpr size_t nnpEnd = offsetof(Process,noNewPrivs)+sizeof(child->noNewPrivs);
+    constexpr size_t displayEnd = offsetof(Process,cwdDisplay)+sizeof(child->cwdDisplay);
+    static_assert(nnpEnd <= offsetof(Process,cwdDisplay));
+    memset(child,0,sizeof(Process));
+    memcpy(child,parent,offsetof(Process,noNewPrivs));
+    memcpy(reinterpret_cast<char*>(child)+nnpEnd,reinterpret_cast<const char*>(parent)+nnpEnd,
+           offsetof(Process,cwdDisplay)-nnpEnd);
+    memcpy(reinterpret_cast<char*>(child)+displayEnd,reinterpret_cast<const char*>(parent)+displayEnd,
+           offsetof(Process,fsContext)-displayEnd);
+    ProcessFsReadDisplay(parent,child->cwdDisplay,sizeof(child->cwdDisplay));
+}
+
 // Immediately after memcpy: the copied pointer is borrowed until this retains
 // it. This same lock protects a concurrently running remote-thread target.
 static void InheritCredentials(Process* child, Process* parent) {
@@ -161,6 +196,7 @@ static void InheritCredentials(Process* child, Process* parent) {
     SpinLockAcquire(&g_credentialsLock);
     child->uid = parent->uid; child->euid = parent->euid; child->suid = parent->suid;
     child->gid = parent->gid; child->egid = parent->egid; child->sgid = parent->sgid;
+    child->noNewPrivs = parent->noNewPrivs;
     child->groups = parent->groups;
     if (child->groups) __atomic_fetch_add(&child->groups->references, 1, __ATOMIC_RELAXED);
     SpinLockRelease(&g_credentialsLock);
@@ -1141,11 +1177,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     // Copy entire parent process struct as a starting point
     // Exclude the concurrently replaceable filesystem-context pointer from
     // the raw snapshot. No borrowed reference can escape into an unwind.
-    memset(child,0,sizeof(Process));memcpy(child,parent,offsetof(Process,cwdDisplay));
-    constexpr size_t displayEnd=offsetof(Process,cwdDisplay)+sizeof(child->cwdDisplay);
-    memcpy(reinterpret_cast<char*>(child)+displayEnd,reinterpret_cast<const char*>(parent)+displayEnd,
-           offsetof(Process,fsContext)-displayEnd);
-    ProcessFsReadDisplay(parent,child->cwdDisplay,sizeof(child->cwdDisplay));
+    CopyParentProcess(child,parent);
     child->gpuAppCtx = 0; // Legacy GPU context belongs to the parent, not the fork.
 
     InheritCredentials(child, parent);
@@ -1351,11 +1383,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     if (!thread) return nullptr;
 
     // Copy parent process struct as starting point
-    memset(thread,0,sizeof(Process));memcpy(thread,parent,offsetof(Process,cwdDisplay));
-    constexpr size_t displayEnd=offsetof(Process,cwdDisplay)+sizeof(thread->cwdDisplay);
-    memcpy(reinterpret_cast<char*>(thread)+displayEnd,reinterpret_cast<const char*>(parent)+displayEnd,
-           offsetof(Process,fsContext)-displayEnd);
-    ProcessFsReadDisplay(parent,thread->cwdDisplay,sizeof(thread->cwdDisplay));
+    CopyParentProcess(thread,parent);
     InheritCredentials(thread, parent);
     thread->addressSpace = nullptr;
     thread->fbBacking = nullptr;

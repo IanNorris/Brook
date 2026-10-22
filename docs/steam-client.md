@@ -285,3 +285,37 @@ Kernel `64ae922e1b0f6cbdfa1d5a9f8c2a234a3038fa843aa8a2f45a5f4e0012e70874`
 Steam job exits 1 with no live tasks; no Brook login UI is established.
 The proc-FD directory warning remains separate. Heap integrity, checked
 shutdown, original wrapper exit and all four offline filesystem checks pass.
+
+The bounded no_new_privs slice is also accepted (2026-10-22). PR_SET_NO_NEW_PRIVS
+validates its arguments and irreversibly sets a per-task bit; GET reports it.
+Fork/clone inherit the caller's bit, existing sibling tasks remain independent,
+and both successful and failed exec preserve it. Brook currently grants no
+set-ID or file-capability privileges at exec; future exec privilege grants must
+honor this bit. This is not namespace, seccomp, or capability implementation.
+See the [Linux contract](https://docs.kernel.org/userspace-api/no_new_privs.html).
+
+ABI 39 kernel `3a42b8030011780dcabb26002de05c4ce5857aecb1333cef03827e52746e33f7`
+passes the fresh native NNP probe (34 checks plus exec child) and all eight
+retained filesystem/credentials/IPC regressions. The host process already has
+NNP set: its 25-check subset explicitly skips initial transition and sibling
+isolation. The exec probe uses the UID-1000 fixture. These tests do not claim
+to test set-ID/file-capability suppression, since Brook does not implement
+those exec privilege gains. Both compiled entry/start audits pass in their
+supported scope. Hosted tests pass 95/96 in parallel; the timed-out
+audio-delivery test passes separately in 8.30 seconds.
+
+The unchanged Steam retry in `steam-nnp-off-gpu-1ms-fixed-mlfq-a-20261022`
+passes the prior prctl failure, then reports a missing
+`/proc/sys/kernel/overflowuid` while checking user namespace requirements.
+The proc-FD directory warning remains. The separately captured Linux setup
+requires real CLONE_NEWUSER/CLONE_NEWNS, ID mappings, mount isolation and root
+transitions. No Brook QR login is reached. Continuing past these small
+prerequisites needs the container implementation scope described in the
+[feasibility result](steam-runtime-feasibility.md), rather than successful
+namespace stubs.
+
+The original Steam and Xwayland jobs both finish with zero live tasks. Heap
+integrity passes; checked flush/stop completes, the retained original wrapper
+exits zero and all four offline filesystem checks pass. Private launch and
+acceptance receipts are in `build/workloads/steam-nnp-20261022` and the review
+directory; no Steam payload, authentication or account data is committed.

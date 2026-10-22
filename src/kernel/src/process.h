@@ -283,7 +283,7 @@ struct Process
     SupplementaryGroups* groups; // per-task immutable shared list, owns one ref
     ProcessState state;
     uint8_t  schedPriority;  // Initial scheduler priority (0=RT, 1=High, 2=Normal, 3=Low)
-    uint16_t reservedFsMask;     // Retained layout padding; mask lives only in FsContext
+    uint16_t noNewPrivs;         // Irreversible per-task exec privilege restriction; credential lock
     int32_t  runningOnCpu;   // CPU index (-1 = not running, used for double-schedule detection)
     int32_t  cpuAffinity;    // CPU affinity pin (-1 = any CPU, >=0 = pinned to that CPU)
     volatile uint64_t tlbCpuMask;  // Bitmask of CPUs that have this process's CR3 loaded in TLB
@@ -644,6 +644,9 @@ struct FileCredentialAccess {
     uint8_t permissions;
 };
 FileCredentialAccess ProcessFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode, bool realIds = false);
+// Per-task, inherited on fork/clone and preserved across exec.
+void ProcessSetNoNewPrivs(Process* proc);
+bool ProcessGetNoNewPrivs(Process* proc);
 int ProcessCheckFileAccess(Process* proc, uint32_t owner, uint32_t group, uint16_t mode, uint8_t required, bool realIds = false);
 uint8_t ProcessFilePermissions(Process* proc, uint32_t owner, uint32_t group, uint16_t mode);
 

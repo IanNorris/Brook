@@ -12175,16 +12175,28 @@ static int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 // sys_prctl (157) — process control
 // ---------------------------------------------------------------------------
 
-static int64_t sys_prctl(uint64_t option, uint64_t, uint64_t,
-                          uint64_t, uint64_t, uint64_t)
+static int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
+                          uint64_t arg4, uint64_t arg5, uint64_t)
 {
+    if (option == 38) { // PR_SET_NO_NEW_PRIVS
+        if (arg2 != 1 || arg3 || arg4 || arg5) return -EINVAL;
+        auto* proc = ProcessCurrent();
+        if (!proc) return -ESRCH;
+        ProcessSetNoNewPrivs(proc);
+        return 0;
+    }
+    if (option == 39) { // PR_GET_NO_NEW_PRIVS
+        if (arg2 || arg3 || arg4 || arg5) return -EINVAL;
+        auto* proc = ProcessCurrent();
+        if (!proc) return -ESRCH;
+        return ProcessGetNoNewPrivs(proc) ? 1 : 0;
+    }
     // Capability/secure-exec operations are unsupported, not successful no-ops.
     switch (option) {
         case 7: case 8:   // GET/SET_KEEPCAPS
         case 21: case 22: // GET/SET_SECCOMP
         case 23: case 24: // CAPBSET_READ/DROP
         case 27: case 28: // GET/SET_SECUREBITS
-        case 38: case 39: // SET/GET_NO_NEW_PRIVS
         case 47:         // CAP_AMBIENT
             return -EINVAL;
         default: break;
