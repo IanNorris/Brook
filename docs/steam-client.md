@@ -5,7 +5,9 @@ and the bounded [user-namespace foundation](user-namespace-checkpoint.md) have s
 passed acceptance. The historical Steam attempt below has not been rerun against
 these foundations. The next gate is the remaining mount/root operations with an
 unchanged bubblewrap trivial child, before pressure-vessel and Steam. No login
-readiness is implied by the foundation tests.
+readiness is implied by the foundation tests. The subsequent
+[bubblewrap checkpoint](bubblewrap-checkpoint.md) advances past missing overflow-ID
+reporting but stops at proc namespace access; its trivial child has not executed.
 
 The 22 October login-screen attempt executes Valve's native x86-64 Linux
 client on Brook, but does not reach a login window. SysV semaphores and signal-fd

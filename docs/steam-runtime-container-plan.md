@@ -3,8 +3,11 @@
 Status (2026-10-22): the bounded mount-namespace and
 [user-namespace foundation](user-namespace-checkpoint.md) checkpoints are accepted
 after source review, Linux differential probes and native regression/teardown
-checks. Remaining SteamRT mount/root integration is a separate phase. There is no
-Brook login acceptance.
+checks. The subsequent [unchanged bubblewrap checkpoint](bubblewrap-checkpoint.md)
+fixes missing overflow-ID reporting and identifies proc namespace handles as the
+next observed blocker. Remaining mount/root integration requires separate designs
+for write/mapping enforcement, tmpfs and root publication. There is no Brook login
+acceptance.
 
 The accepted baseline is `3bfc275e` (ABI 39), including retained filesystem
 contexts at `e626b7f8`, retained proc-root links and real per-task no_new_privs.

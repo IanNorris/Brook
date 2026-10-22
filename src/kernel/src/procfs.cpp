@@ -158,6 +158,7 @@ struct ProcPriv {
     UserNamespace* userNamespace;
     UserAuthority openedAuthority;
     uint8_t mapKind; // 1 UID, 2 GID, 3 setgroups; independent namespace lease
+    bool sysKernelDirectory;
 };
 
 // VnodeOps for procfs files
@@ -289,6 +290,34 @@ static int ProcMapStat(Vnode* vn,VnodeStat* st) {
     st->mode=0100644;st->uid=pp->userNamespace?pp->userNamespace->owner:0;return result;
 }
 static VnodeOps g_procMapOps={ProcFileOpen,ProcMapRead,ProcMapWrite,nullptr,ProcFileClose,ProcMapStat,nullptr};
+
+// Read-only reporting of Brook's fixed unmapped-ID policy. These values are
+// shared with credential conversion, not mutable sysctl compatibility stubs.
+static Vnode* GenOverflowId()
+{
+    char* text=static_cast<char*>(kmalloc(16));if(!text)return nullptr;
+    char* end=U64ToDec(text,UserIdOverflow);*end++='\n';*end=0;
+    return MakeProcVnode(text,uint32_t(end-text));
+}
+static int ProcSysReaddir(Vnode* node,DirEntry* out,uint32_t* cookie)
+{
+    const bool kernel=static_cast<ProcPriv*>(node->priv)->sysKernelDirectory;
+    const char* names[]={"overflowuid","overflowgid"};
+    if(*cookie>=(kernel?2u:1u))return 0;
+    *out={};ProcStrCopy(out->name,kernel?names[*cookie]:"kernel",sizeof(out->name));
+    out->isDir=!kernel;++*cookie;return 1;
+}
+static VnodeOps g_procSysDirOps={ProcFileOpen,ProcDirRead,ProcFileWrite,ProcSysReaddir,ProcDirClose,ProcDirStat,nullptr};
+static Vnode* MakeProcSysDirectory(bool kernel)
+{
+    auto* node=MakeProcVnode(nullptr,0,true,&g_procSysDirOps);
+    if(node)static_cast<ProcPriv*>(node->priv)->sysKernelDirectory=kernel;
+    return node;
+}
+static bool ProcOverflowPath(const char* path)
+{
+    return !strcmp(path,"sys/kernel/overflowuid") || !strcmp(path,"sys/kernel/overflowgid");
+}
 
 // ---- Content generators ----
 
@@ -1378,6 +1407,8 @@ Vnode* ProcFsOpen(const char* relPath, int /*flags*/)
     if (!resolved[0]) return ProcFsOpenDir(resolved);
     for (uint32_t i = 0; i < NUM_GLOBAL; ++i)
         if (StrEqProc(resolved, g_globalEntries[i].name)) return g_globalEntries[i].gen();
+    if(ProcOverflowPath(resolved))return GenOverflowId();
+    if(StrEqProc(resolved,"sys") || StrEqProc(resolved,"sys/kernel"))return ProcFsOpenDir(resolved);
     if (StrEqProc(resolved, "net/dev")) return GenNetDev();
     if (StrEqProc(resolved, "net/tcp")) return GenNetTcp();
     if (StrEqProc(resolved, "net/udp")) return GenNetUdp();
@@ -1397,7 +1428,8 @@ int ProcFsStatPath(const char* relPath, VnodeStat* st)
 {
     char resolved[256];
     if (!ResolveProcPath(relPath, resolved, sizeof(resolved))) return -1;
-    if (!resolved[0] || StrEqProc(resolved, "net"))
+    if(ProcOverflowPath(resolved)) {st->size=6;st->mode=0100444;st->isDir=false;return 0;}
+    if (!resolved[0] || StrEqProc(resolved, "net") || StrEqProc(resolved,"sys") || StrEqProc(resolved,"sys/kernel"))
     { st->size = 0; st->isDir = true; st->nlink = 2; return 0; }
     for (uint32_t i = 0; i < NUM_GLOBAL; ++i)
         if (StrEqProc(resolved, g_globalEntries[i].name))
@@ -1430,6 +1462,8 @@ Vnode* ProcFsOpenDir(const char* relPath)
     char resolved[256];
     if (!ResolveProcPath(relPath, resolved, sizeof(resolved))) return nullptr;
     if (!resolved[0]) return MakeProcVnode(nullptr, 0, true, &g_procRootDirOps);
+    if(StrEqProc(resolved,"sys"))return MakeProcSysDirectory(false);
+    if(StrEqProc(resolved,"sys/kernel"))return MakeProcSysDirectory(true);
     ProcLookup path;
     if (!LookupProcPid(resolved, &path)) return nullptr;
     if (path.taskRoot) return MakePidDirectory(path, &g_procTaskDirOps);
@@ -1455,8 +1489,11 @@ static int ProcRootReaddir(Vnode* /*vn*/, DirEntry* out, uint32_t* cookie)
         return 1;
     }
 
+    if(idx==NUM_GLOBAL) {
+        *out={};ProcStrCopy(out->name,"sys",sizeof(out->name));out->isDir=true;*cookie=idx+1;return 1;
+    }
     // Then: PID directories — use indexed lookup to avoid large heap allocation
-    uint32_t pidIdx = idx - NUM_GLOBAL;
+    uint32_t pidIdx = idx - NUM_GLOBAL - 1;
     uint16_t pid = 0;
     if (!SchedulerGetPidByIndex(pidIdx, &pid)) return 0;
 

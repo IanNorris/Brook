@@ -3,7 +3,7 @@
 // reference is kept (cwd=/proc/self must not create a Process ownership cycle).
 static constexpr uint32_t PROC_PID_EXE=5,PROC_PID_CWD=6,PROC_PID_ROOT=8;
 static_assert(NUM_PID_ENTRIES==9,"Update retained proc PID entry indices when changing the catalog");
-enum class ProcObjectKind : uint8_t { Root,Net,Pid,Task,Fds,GlobalFile,NetFile,PidFile,FdLink,Self,ThreadSelf,UserMap };
+enum class ProcObjectKind : uint8_t { Root,Net,Pid,Task,Fds,GlobalFile,NetFile,PidFile,FdLink,Self,ThreadSelf,UserMap,Sys,SysKernel,OverflowId };
 struct ProcObject {
     VfsObject object;
     VfsObject* parent;
@@ -21,7 +21,7 @@ static uint64_t g_procObjectIdentity=2;
 static const VfsObjectOps* ProcObjectOperations();
 static bool ProcObjectDirectory(ProcObjectKind kind)
 {
-    return kind<=ProcObjectKind::Fds;
+    return kind<=ProcObjectKind::Fds || kind==ProcObjectKind::Sys || kind==ProcObjectKind::SysKernel;
 }
 static int ProcObjectSnapshot(const ProcObject* object,ProcessSnapshot* snapshot)
 {
@@ -113,12 +113,21 @@ static int ProcObjectLookup(VfsObject* object,const char* name,VfsObject** out,b
     if(value->kind==ProcObjectKind::Root) {
         if(StrEqProc(name,"self"))return ProcObjectMake(ProcObjectKind::Self,object,nullptr,0,false,out);
         if(StrEqProc(name,"thread-self"))return ProcObjectMake(ProcObjectKind::ThreadSelf,object,nullptr,0,false,out);
+        if(StrEqProc(name,"sys"))return ProcObjectMake(ProcObjectKind::Sys,object,nullptr,0,false,out);
         if(StrEqProc(name,"net"))return ProcObjectMake(ProcObjectKind::Net,object,nullptr,0,false,out);
         for(uint32_t i=0;i<NUM_GLOBAL;++i)
             if(StrEqProc(name,g_globalEntries[i].name))return ProcObjectMake(ProcObjectKind::GlobalFile,object,nullptr,i,false,out);
         const char* end=nullptr;uint32_t pid=ParseUint(name,&end);
         if(!IsDigit(name[0]) || !end || *end || !pid || pid>65535 || !FindProcess(pid,&snapshot))return -2;
         return ProcObjectMake(ProcObjectKind::Pid,object,&snapshot,0,false,out);
+    }
+    if(value->kind==ProcObjectKind::Sys) {
+        return StrEqProc(name,"kernel")?ProcObjectMake(ProcObjectKind::SysKernel,object,nullptr,0,false,out):-2;
+    }
+    if(value->kind==ProcObjectKind::SysKernel) {
+        if(StrEqProc(name,"overflowuid") || StrEqProc(name,"overflowgid"))
+            return ProcObjectMake(ProcObjectKind::OverflowId,object,nullptr,StrEqProc(name,"overflowgid"),false,out);
+        return -2;
     }
     if(value->kind==ProcObjectKind::Net) {
         static const char* names[]={"dev","tcp","udp","sockstat"};
@@ -195,6 +204,8 @@ static Vnode* ProcObjectOpen(VfsObject* object,int flags,int* error)
     if(value->kind==ProcObjectKind::UserMap)node=MakeUserMapVnode(value->userNamespace,uint8_t(value->index));
     else if(value->kind==ProcObjectKind::Root)node=MakeProcVnode(nullptr,0,true,&g_procRootDirOps);
     else if(value->kind==ProcObjectKind::Net) { *error=-95;return nullptr; }
+    else if(value->kind==ProcObjectKind::Sys || value->kind==ProcObjectKind::SysKernel)node=MakeProcSysDirectory(value->kind==ProcObjectKind::SysKernel);
+    else if(value->kind==ProcObjectKind::OverflowId)node=GenOverflowId();
     else if(ProcObjectDirectory(value->kind)) {
         ProcLookup path{snapshot,"",value->kind==ProcObjectKind::Task,value->taskMember};
         node=MakePidDirectory(path,value->kind==ProcObjectKind::Task?&g_procTaskDirOps:
@@ -215,6 +226,8 @@ static int ProcObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity
     char path[128];char* end=path;*end++='/';
     if(value->kind==ProcObjectKind::Root) {}
     else if(value->kind==ProcObjectKind::Net)end=AppendStr(end,"net");
+    else if(value->kind==ProcObjectKind::Sys)end=AppendStr(end,"sys");
+    else if(value->kind==ProcObjectKind::SysKernel)end=AppendStr(end,"sys/kernel");
     else {
         if(!ProcObjectDirectory(value->kind))return -20;
         if(value->taskMember) {end=U64ToDec(end,value->tgid);end=AppendStr(end,"/task/");}
