@@ -417,3 +417,29 @@ host durations are 16.83 and 16.35 seconds, including startup/shutdown and
 observer RPCs. These are not frame throughput measurements or a complete
 instrumentation-overhead assessment. No scheduler defaults or buffer-release
 ownership rules change.
+
+### Bounded follow-up and NVIDIA side test
+
+The user limits the next phase to completing GPU-side profiling and two focused
+optimization attempts, preserving monthly budget for Steam. Remaining clock,
+scheduler, mixed audio and ownership-recovery requirements stay open; this
+budget boundary does not turn partial results into acceptance.
+
+A bounded NVIDIA trial identifies a Quadro K1200 with 4 GB VRAM and driver
+580.178.04 on `/dev/dri/renderD129`. Host hardware Vulkan correctness/timestamps
+pass. Diskless QEMU EGL initialization first fails with implicit platform
+discovery, then succeeds using explicit NVIDIA EGL/GBM manifests. A fresh private
+Brook VM boots on that node, confirmed by actual QEMU descriptors and driver
+mappings. Basic virgl self-tests pass, but the combined owned-capture/upload/scene
+self-test fails and correctly prevents publishing 3D operations. The guest
+Venus probe terminates with `VK_ERROR_INITIALIZATION_FAILED` at enumeration;
+no cube or throughput comparison runs after that failure.
+
+The original VM is shut down cleanly, and all four offline filesystem checks
+pass. Its initial setup verifier also rejected the Nix wrapper executable's
+name; recovery verifies the actual `.qemu-system-x86_64-wrapped` ELF inside the
+exact intended package and retains the original VM, without relaunching. The
+guest's completion-wake provider is unregistered because 3D was disabled. This
+is a boot/compatibility finding, not a passing accelerated cohort. Evidence is
+`nvidia-cube-off-gpu-1ms-fixed-mlfq-a-20261022`; further NVIDIA work is deferred
+under RUN-03 in the backlog. Host configuration is unchanged.

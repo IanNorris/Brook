@@ -504,6 +504,21 @@ pipe and full dump manifests are still outstanding.
 | RUN-04 | Quake relative mouse input and capture (after package-install fixes) | Capture the pointer while playing in the native SDL VM window, deliver continuous relative motion without desktop-edge clipping, and release capture on an explicit escape action, focus loss or app exit. Verify aiming and menus with the user; inspect guest Wayland relative-pointer/pointer-lock support and the QEMU input path. |
 | RUN-05 | Wayland window-close timeout targets compositor instead of client | With Writer and Quake open, an unresponsive Quake close must terminate only Quake; keep waylandd and Writer alive. Track the actual client owner separately from the process providing the shared VFB. |
 
+RUN-03 bounded NVIDIA trial (22 October): the host Quadro K1200 (4 GB,
+580.178.04, `/dev/dri/renderD129`) passes hardware Vulkan compute/transfer and
+offscreen triangle checks. QEMU EGL-headless initializes when supplied explicit
+NVIDIA EGL vendor, GBM backend and external-platform manifests; default pinned
+Mesa loader paths fail EGL initialization. Brook boots and its basic virgl
+clear/copy/blit/draw checks pass, but its combined owned-capture/upload/scene
+self-test fails. The existing safety guard disables 3D and retains uncertain
+objects; guest Venus enumeration then fails. Do not bypass this check to obtain
+a benchmark. Isolate the failing self-test stage on a private image before
+attempting a matched throughput comparison. Native SDL and headless display
+paths must be matched, and actual render-device descriptors must be verified;
+an environment variable or launcher label alone is insufficient. Evidence:
+`build/reviews/nvidia-cube-off-gpu-1ms-fixed-mlfq-a-20261022`, including recovered
+Nix wrapper verification, terminal failed guest probe and clean shutdown/fsck.
+
 Showcase session `4267280270f145d9b82dd4b6749207c5` reproduced RUN-05 on
 15 October: the Quake window was registered with `pid=7`, the shared Wayland
 server. A 300 ms mouse hold delivered its close request successfully;
