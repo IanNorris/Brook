@@ -1,17 +1,29 @@
-// Minimum privileged mount slice: directory MS_BIND and subtree MNT_DETACH.
-// Linux ignores filesystem/data for MS_BIND; other mount classes/flags are
-// rejected before any path or topology mutation, never acknowledged as no-ops.
+// Bounded mount slice: directory binds, private-only propagation and detach.
+// No shared/master topology exists; reject types that would create one.
 static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t,
                          uint64_t flags,uint64_t,uint64_t)
 {
-    if(flags!=0x1000)return -EINVAL;
+    constexpr uint64_t Bind=0x1000,Recursive=0x4000,Silent=0x8000;
+    constexpr uint64_t Private=0x40000,Slave=0x80000;
+    const uint64_t type=flags&~(Recursive|Silent);
+    const bool privatePropagation=type==Private || type==Slave;
+    if(flags!=Bind && !privatePropagation)return -EINVAL;
     auto* process=ProcessCurrent();if(!process)return -EPERM;
     char source[512],target[512];
-    if(!CopyUserCString(sourceAddr,source,sizeof(source)) || !CopyUserCString(targetAddr,target,sizeof(target)))return -EFAULT;
+    if(!CopyUserCString(targetAddr,target,sizeof(target)))return -EFAULT;
+    // Propagation has no source operand. A non-null source is still a userspace
+    // string argument to mount(2), so validate it without resolving its path.
+    if((sourceAddr || !privatePropagation) && !CopyUserCString(sourceAddr,source,sizeof(source)))return -EFAULT;
     AtLookup lookup;if(int error=lookup.Init(-100,target))return error;
     auto* owner=VfsMountNamespaceUserOwnerAcquire(lookup.fs.mountNamespace);
     bool authorized=ProcessCapable(process,owner,CapSysAdmin);UserNamespaceRelease(owner);
     if(!authorized)return -EPERM;
+    if(privatePropagation) {
+        VfsPath targetPath{};
+        int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
+        if(!error)error=VfsMountNamespacePrivatePropagation(lookup.fs.mountNamespace,targetPath);
+        VfsPathRelease(targetPath);return error;
+    }
     if(!source[0])return -ENOENT;
     VfsPath sourcePath{},targetPath{};
     int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,source,&sourcePath);

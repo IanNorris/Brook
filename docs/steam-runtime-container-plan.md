@@ -6,7 +6,9 @@ after source review, Linux differential probes and native regression/teardown
 checks. The subsequent [unchanged bubblewrap checkpoint](bubblewrap-checkpoint.md)
 fixes missing overflow-ID reporting. The accepted
 [proc namespace-handle checkpoint](proc-namespace-handles.md) then advances the
-same executable to its unsupported mount-propagation operation (`make / slave`).
+same executable to its mount-propagation operation. The accepted
+[private propagation checkpoint](mount-propagation-checkpoint.md) advances it
+to the next unsupported operation: mounting tmpfs.
 Remaining mount/root integration requires separate designs
 for write/mapping enforcement, tmpfs and root publication. There is no Brook login
 acceptance.

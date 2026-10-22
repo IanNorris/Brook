@@ -508,7 +508,11 @@ int main(){
     MountNamespace* heldNs=nullptr;VfsPath heldRoot{},heldCwd{};
     assert(!VfsMountNamespaceCopy(initial,stableRoot,aPath,&heldNs,&heldRoot,&heldCwd));
     assert(!VfsMountNamespaceHandleAcquire(heldNs)); // never revive prepared state
+    assert(VfsMountNamespacePrivatePropagation(heldNs,heldRoot)==-3);
     assert(VfsMountNamespaceActivate(heldNs));
+    assert(!VfsMountNamespacePrivatePropagation(heldNs,heldRoot));
+    assert(VfsMountNamespacePrivatePropagation(heldNs,stableRoot)==-22);
+    assert(VfsMountNamespacePrivatePropagation(heldNs,heldCwd)==-22);
     assert(VfsMountNamespaceIdentity(heldNs)!=VfsMountNamespaceIdentity(initial));
     auto heldSub=resolve(heldRoot,heldCwd,"sub");
     assert(!VfsMountNamespaceBind(heldNs,bPath,heldSub));VfsPathRelease(heldSub);
@@ -519,6 +523,7 @@ int main(){
     inode(heldRoot,heldCwd,"sub/value",201);
     VfsMountNamespaceHandleRelease(heldNs);
     assert(!VfsMountNamespaceHandleAcquire(heldNs)); // storage cannot revive retirement
+    assert(VfsMountNamespacePrivatePropagation(heldNs,heldRoot)==-3);
     VfsDrainMountCleanup();
     VfsPath disappeared{};assert(VfsPathResolve(heldRoot,heldCwd,"sub/value",&disappeared)==-2);
     VfsPathRelease(heldRoot);VfsPathRelease(heldCwd);VfsMountNamespaceRelease(heldNs);VfsDrainMountCleanup();
@@ -532,6 +537,7 @@ int main(){
     assert(VfsMountNamespaceActivate(lockedNs));
     assert(VfsMountNamespaceSetUserOwnerPrepared(lockedNs,nullptr)==-22);
     auto lockedBind=resolve(lockedRoot,lockedRoot,"/ns-target");
+    assert(!VfsMountNamespacePrivatePropagation(lockedNs,lockedBind));
     assert(VfsMountNamespaceDetach(lockedNs,lockedBind)==-22);
     assert(!VfsMountNamespaceBind(lockedNs,bPath,lockedBind));
     auto freshBind=resolve(lockedRoot,lockedRoot,"/ns-target");
@@ -560,6 +566,10 @@ int main(){
     auto bound=resolve(childRoot,childRoot,"/ns-target");expect(childRoot,bound,"..",childRoot);
     auto nestedTarget=resolve(childRoot,bound,"sub");assert(!VfsMountNamespaceBind(childNs,bPath,nestedTarget));VfsPathRelease(nestedTarget);
     auto nested=resolve(childRoot,bound,"sub");inode(childRoot,nested,"value",201);
+    auto propagationAllocations=allocations.size();
+    assert(!VfsMountNamespacePrivatePropagation(childNs,bound));
+    assert(!VfsMountNamespacePrivatePropagation(childNs,nested));
+    assert(allocations.size()==propagationAllocations);
     // Renaming the physical source of a bind must preserve its namespace
     // label, and the nested bind label beneath it.
     assert(!VfsRenameAt(parentRoot,parentRoot,"ns-a",parentRoot,"renamed-a"));
@@ -576,6 +586,7 @@ int main(){
     assert(mounts[6].root.children.count("rename-tree") && !mounts[6].root.children.count("blocked-tree"));
     rejectDirectoryReport=0;
     assert(!VfsMountNamespaceDetach(childNs,bound));
+    assert(VfsMountNamespacePrivatePropagation(childNs,bound)==-22);
     inode(childRoot,childRoot,"/ns-target/value",301);inode(childRoot,bound,"value",101);
     VfsPath absent{};assert(VfsPathResolve(childRoot,bound,"sub/value",&absent)==-2);
     expect(childRoot,bound,"..",bound);inode(childRoot,nested,"value",201);

@@ -7,7 +7,9 @@ command on Brook; Steam login remains unavailable.
 
 The subsequent accepted [proc namespace-handle checkpoint](proc-namespace-handles.md)
 resolves the proc access failure recorded below. The identical executable now
-stops at unsupported mount propagation (`Failed to make / slave: Invalid argument`).
+reaches mount propagation. The later
+[private propagation checkpoint](mount-propagation-checkpoint.md) advances it
+to `Failed to mount tmpfs: Invalid argument`.
 The observations here retain the earlier checkpoint history.
 
 ## Observed progress

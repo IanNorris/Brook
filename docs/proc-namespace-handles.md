@@ -128,8 +128,10 @@ now advances past proc namespace access and exits 1 at:
 bwrap: Failed to make / slave: Invalid argument
 ```
 
-This is the next unsupported mount-propagation operation, not a successful child
+At this historical checkpoint this is the next unsupported mount-propagation
+operation, not a successful child
 launch. The collecting wrapper exits zero while retaining bubblewrap's actual
 exit 1 and stderr; no descendants remain. Mount propagation, tmpfs and root
 relocation require subsequent bounded work. Steam authentication is not part
-of this phase.
+of this phase. The subsequent [private propagation checkpoint](mount-propagation-checkpoint.md)
+advances the identical command to the unsupported tmpfs mount.

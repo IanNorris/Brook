@@ -23,6 +23,10 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
                           MountNamespace** out,VfsPath* newRoot,VfsPath* newCwd);
 // Core topology operations; syscall authorization/flag validation is separate.
 int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath& target);
+// PRIVATE and SLAVE (+ optional REC) coincide while every mount is private
+// and has no master/peers. Validate a live owned mount root; no topology change.
+// Shared/unbindable support must replace this private-only contract first.
+int VfsMountNamespacePrivatePropagation(MountNamespace* ns,const VfsPath& target);
 int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target);
 // Borrowed namespace must have a live storage owner. Each value is copied
 // under the metadata view lock; count/index sequences may race mutation.

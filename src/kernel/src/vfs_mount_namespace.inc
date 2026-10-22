@@ -220,6 +220,20 @@ int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath
     StrCopy(mount->fsType,static_cast<MountEntry*>(source.attachment)->fsType,sizeof(mount->fsType));
     g_mounts.Publish(mount);return 0;
 }
+int VfsMountNamespacePrivatePropagation(MountNamespace* ns,const VfsPath& target)
+{
+    if(!ns || !target.object || !target.attachment)return -22;
+    FileMutationGuard transaction;
+    if(!ns->life.Published())return -3;
+    auto* mount=static_cast<MountEntry*>(target.attachment);
+    if(!VfsMountPublished(*mount) || mount->owner!=ns ||
+       target.object->identity!=mount->rootIdentity || target.object->ops!=mount->rootObjectOps)return -22;
+    // All construction/copy paths create intrinsically private attachments.
+    // Linux PRIVATE->SLAVE without a master remains PRIVATE. Recursing has the
+    // same result for every descendant; inherited detach locks stay intact.
+    // Do not use this path after introducing shared peers or master links.
+    return 0;
+}
 int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target)
 {
     if(!ns || !target.object || !target.attachment)return -22;
