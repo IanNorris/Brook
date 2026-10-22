@@ -443,3 +443,52 @@ guest's completion-wake provider is unregistered because 3D was disabled. This
 is a boot/compatibility finding, not a passing accelerated cohort. Evidence is
 `nvidia-cube-off-gpu-1ms-fixed-mlfq-a-20261022`; further NVIDIA work is deferred
 under RUN-03 in the backlog. Host configuration is unchanged.
+
+### Linux solo/mixed reference, 22 October
+
+A new private Linux cohort fills the missing Quake rendering-throughput
+measurement. It uses the same 600 original demo frame records, normal demo
+playback (`timedemo=0`), render caps lifted and actual SDL swap interval zero.
+Each central window spans 50 guest seconds beginning five seconds after the
+observed START marker. Both complete source traces pass quality checks; sizes
+and SHA-256 match guest metadata. Boundary-crossing stalls remain explicit.
+
+| Quake GL3, 1280×720 | Solo | With Firefox |
+| --- | ---: | ---: |
+| SDL swap completions/s | 121.06 | 98.70 |
+| Frame interval median | 7.34 ms | 8.64 ms |
+| Frame interval p95 | 17.99 ms | 22.83 ms |
+| Maximum complete frame interval | 47.32 ms | 97.51 ms |
+
+The Linux guest uses eight vCPUs/eight GiB, host affinity 0–15, the private
+1-ms-fence-poll QEMU, Intel render node, 1-GiB hostmem and SDL/PipeWire private
+44.1-kHz null output with a requested 20-ms callback buffer. The checked old
+Linux disk is cloned, with its pinned Linux 6.18.26, Mesa 26.0.6 and Yamagi 8.60.
+The diagnostic SDL trace has the same code with its fixed capacity enlarged
+from 8,192 to 65,536 records; actual solo/mixed traces retain 8,143/6,599 swaps
+without drops, incomplete records or invalid clocks. Demo elapsed time remains
+separate from FPS; the solo observed demo interval is 63.62 seconds versus
+nominal 60.2 seconds, and this test does not close the clock/pacing question.
+
+Firefox decodes the identical generated 1280×720/30-fps H264/AAC clip. Its
+software-vsync workaround under Weston remains explicit. Media/host progression
+bounds are 0.99892–0.99970 before Quake, 0.99870–0.99947 during the observed mixed
+window and 1.00162–1.00204 after Quake. Corresponding video callback opportunity
+rates are about 24.44–24.46, 24.33–24.35 and 24.50–24.51/s. No sampled paused,
+unplayable or ambiguous media-gap states occur in those windows. A separately
+retained six-second HDA capture starts after Quake exits: all 600 complete
+10-ms bins are nonzero. Its 0.727-core QEMU observation is also Firefox-only,
+not a mixed CPU/audio result, despite the observer directory's original name.
+
+This is a useful Linux target, not an exact Brook speed ratio. The fixture
+displays video at CSS width 640 versus 1,280 in the Brook cohort, so page hashes
+differ even though the decoded media is identical. Linux uses headless Weston
+versus the current Brook native SDL window, and its guest compositor, audio,
+filesystem, Mesa and scheduler differ. No Quake OST is staged. Before claiming
+a fully matched mixed-GPU comparison, align the page display size and host
+display path, repeat the run and retain mixed CPU/audio inside actual overlap.
+
+Evidence is `build/linux-workload-reference-20261022/summary.json` and
+`workload/{solo,mixed,firefox-*-media.json}`. Both original game processes and
+Firefox exit zero. The original controller, VM, fixture and private audio
+owners terminate; serial powerdown and read-only private ext4 checks pass.
