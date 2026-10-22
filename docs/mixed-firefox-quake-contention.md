@@ -187,3 +187,159 @@ and overlay textures, and uploads the cursor unconditionally. Separate layer
 invalidation or exact unchanged-content detection could remove redundant
 commands. This is a source/trace finding, not a measured speedup or permission
 to discard updates after failed/uncertain GPU completion.
+
+## Independent layer upload experiment
+
+The next candidate uses module ABI 35: `GpuCompositorOps::UpdateTexture` returns
+whether the transfer command received a validated successful response. This
+does not prove GPU execution completion or authorize freeing its persistent
+backing. Composition fences and existing source ownership rules remain intact.
+Failed transfers retain wallpaper/chrome/overlay damage and do not acknowledge
+window content or update the cursor cache.
+
+The optimization is default off. Passing
+`-fw_cfg name=opt/gpu-layer-damage,string=1` enables independent pending row
+bounds for wallpaper, chrome and taskbar/launcher overlay. Overlay clearing and
+chrome repaint mark their own layer; structural full repaint and first texture
+creation still force complete refresh. Client-only animation does not redraw
+chrome. Cursor upload state compares exact
+pixels and dimensions, independently of draw position/hotspot, and changes only
+after an accepted upload. This adds a small fixed cursor cache, without full
+desktop shadow copies or probabilistic content hashes.
+
+The title setter now requests repaint and wakes the compositor; previously a
+clean window could wait for the 500-ms forced repaint before its new title
+appeared. This fix and the bool-return interface are present in both controls.
+Hosted tests exercise actual driver transfer code with response failure,
+poisoned queue, disjoint retry damage, layer isolation, full refresh, recreated
+texture and overflowing rectangle sizes. Cursor tests cover same-image retry
+after failure, pixel changes, shrink/grow, hotspot-only changes and recreation.
+The complete release build and all 87 hosted tests pass. Native comparisons,
+visual/input/GL/Vulkan gates and the larger timeout recovery work remain open.
+
+The first ABI-35 off cohort is retained as partial evidence: its host harness
+omitted the required restore target after minimizing Firefox. Recovery restores
+and closes the original Firefox job, then shuts down cleanly with all four
+filesystem checks passing. A second private VM is stopped cleanly before any
+workload starts after finding that the off path accumulated window-sized chrome
+damage. That changed its baseline upload extent. The corrected off path uses
+the original shared bounds, and the enabled path redraws chrome only on full
+repaint. These controls must use the new `layer-damage-matched-frozen` capsule;
+neither discarded cohort is a passing optimization comparison. The corrected
+build again passes all 87 hosted suites. Review directories retain the failed
+controller, recovery, idle shutdown and exact artifact provenance separately.
+
+### Matched enabled/disabled results
+
+The corrected pair uses byte-identical ABI-35 artifacts from
+`layer-damage-matched-frozen`, differing only in `opt/gpu-layer-damage=1`.
+Both original controllers and VM owners exit zero; all four filesystems check
+cleanly. Original SDL traces are extracted offline and verified against guest
+byte counts and SHA-256 values. Actual swap interval remains zero.
+
+| Central 50-second Quake window | Disabled swaps/s | Enabled swaps/s |
+| --- | ---: | ---: |
+| Alone before Firefox | 56.56 | 31.00 |
+| Alongside Firefox | 23.50 | 14.38 |
+| Alone after Firefox | 42.92 | 29.12 |
+
+The disabled run itself does not return to its initial solo rate; preserve that
+variance rather than claiming complete reversal recovery. Nevertheless this
+pair provides no reason to promote the optimization. Mixed frame-interval p95
+is 71.20 versus 146.05 ms. The enabled idle command histogram is four commands
+for 245 retained cycles and six for eleven periodic full repaints, versus seven
+for all 256 disabled cycles. Idle median compositor body remains approximately
+2.7 ms and whole-QEMU CPU approximately 0.20 cores in both samples. Removing
+uploads demonstrably removes commands, but does not establish a speedup.
+
+Mixed source audio completion remains approximately 30.21k/28.32k frames/s for
+Firefox/Quake disabled and 30.90k/28.66k enabled. Solo Firefox has a stable
+440-Hz tone and approximately native-rate source completion. The user hears
+Quake stutter in the disabled mixed run while the Firefox tone sounds steady;
+in the enabled run the tone stutters during Quake loading, followed by strong
+Quake stutter and progressive visible hitches. Offline narrowband measurements
+retain these as separate observations: game harmonics overlap the reference
+tone, so they cannot isolate each stream or establish decoded tempo.
+
+The enabled full SDL trace contains late 1.345-s and 3.947-s frame-completion
+gaps. Their inside-swap portions are only 13.40 and 21.03 ms, with 1.332 and
+3.926 seconds between swaps. That interval includes rendering/DRM calls,
+application work and scheduling; it is not exclusive CPU work. Both frame
+captures have 255/255 early resumes and sub-microsecond median between-cycle
+gaps. Continuous compositor activity is therefore common to both arms, not by
+itself an explanation of the enabled slowdown.
+
+Vkcube and vkmark complete with retained plausible images; vkmark reports the
+Venus Intel UHD Graphics 630 device and 43/39 FPS for its vertex/texture scenes.
+The user also observes occasional vkcube hitches. Minimize/restore and original
+job close checks complete. A separate real-pointer launcher test opens the
+menu at 100%, changes scale to 150%, closes it and restores 100%. Its retained
+352x780 background crop has zero mismatched bytes after either restoration.
+These are rendering/input-state checks, not smooth-pacing acceptance.
+
+Strict runtime accounting remains unresolved: the disabled cohort ends with
+one service clamp (maximum deficit 10,633 ns), the enabled cohort with eleven
+(maximum 18,523 ns). Neither is a passing zero-clamp acceptance result; those
+small samples do not explain multi-second stalls by themselves. No scheduler
+default changes follow.
+
+Evidence is under `matched-desktop-layer2-{off,on}-gpu-1ms-fixed-mlfq-a-20261022`.
+After this pair, source fixes add invalidation to successful focus/raise and
+send-to-back mutations. Actual window-body tests verify quiet-window focus,
+ordering, title invalidation and no invalidation on rejected/no-op focus. The
+new release build and all 87 hosted tests pass; these fixes are frozen separately
+in `layer-focus-frozen`, not retroactively attributed to the comparison above.
+
+### Next completion-notification control
+
+Keep layer mode and one original Quake process fixed, and switch GPU completion
+notification on/off/on. Retain per-arm completion counts, frame stages, CPU,
+PCM/source counters and actual SDL windows. Different demo scenes make this a
+diagnostic reversal, not a definitive equal-scene throughput comparison.
+Importantly, zero `safety_expiries` does not prove no timer-delayed completion:
+the current counter increments only if the used index is still unchanged when
+the waiter resumes. Compare notification/latency-sample coverage as well, and
+correlate a common host fence response with guest return if ambiguity remains.
+
+QEMU's actual render descriptors point to i915 at PCI 0000:00:02.0. Linux DRM
+fdinfo execution counters are available for future paired sampling. Its four
+descriptor aliases share client ID 901 and must be counted once, as specified
+by the [kernel DRM accounting documentation](https://docs.kernel.org/gpu/drm-usage-stats.html).
+The separate unlabelled post-GL three-second sample shows about 6.25% render
+execution for that client. It is not the mixed benchmark window or whole-GPU
+utilization, and cannot establish whether GPU saturation caused the reported
+stalls. Original fdinfo, frequency readings and identity/time bounds are saved.
+
+The first notification control completes with original controller/VM exit zero
+and four clean filesystem checks. It uses the separate `layer-focus-frozen`
+build, with layer mode held enabled and the new focus invalidation fixes. One
+original Quake demo stays running across all three notification arms.
+
+| Metric | Wake on A | Wake off B | Wake on C |
+| --- | ---: | ---: | ---: |
+| SDL swaps/s in retained frame window | 39.42 | 37.99 | 30.06 |
+| Compositor body median | 9.26 ms | 6.08 ms | 6.14 ms |
+| Whole-QEMU CPU cores | 0.75 | 1.56 | 0.80 |
+| Audio source frames/s | 44.14k | 44.12k | 44.14k |
+| Completion waits | 10,226 | 0 | 8,118 |
+| Notification samples | 9,012 | 0 | 6,932 |
+| Recorded incomplete safety expiries | 198 | 0 | 161 |
+| Mean notified-return latency | 11.55 us | unavailable | 11.42 us |
+
+Completion counter deltas span each PCM/frame observation and its control RPCs;
+the SDL windows use the validated retained compositor timestamp bounds. Trace
+hashes are checked offline. Different scenes and short, unequal retained windows
+prevent treating these as an equal-scene throughput result. Disabling interrupt
+waits does not show a clear reversal and increases CPU cost; successfully
+notified returns are usually quick. Unnotified/timer-delayed waits remain open,
+particularly given the counter caveat above. One invalid latency sample is
+retained in each enabled arm. This is not proof that all notification paths are
+correct, nor an audio-under-contention test: Quake is alone here.
+
+Evidence is `notification-layer2-on-gpu-1ms-fixed-mlfq-a-20261022`, notably
+`notification-control/analysis.json`, raw per-arm completion snapshots, separate
+PCM/frame windows and the single original application trace. The next diagnostic
+should attribute the long between-swap intervals to the main thread's syscalls,
+GPU lock waits and scheduled/runnable time, retaining host response versus guest
+return timing where needed. No discarded upload or notification experiment
+changes the default configuration.
