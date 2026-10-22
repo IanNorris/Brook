@@ -583,3 +583,46 @@ four offline filesystem checks pass. No synchronization/default changes result
 from this diagnostic. A final small experiment can test finer host fence-poll
 cadence against the existing 1-ms control, retaining guest ownership and timeout
 rules and explicitly measuring additional host CPU cost.
+
+### Final bounded attempt: finer host fence polling
+
+The opt-in package on `wip/fine-fence-poll-experiment-20261022` (`c3b29529`)
+uses a nanosecond-unit timer and a 250-us rearm interval. Legacy arguments still
+evaluate to the exact existing 1-ms package. The candidate builds successfully;
+disassembly confirms `qemu_clock_get_ns` followed by a 250,000-ns deadline
+increment. This compares finer polling **and** deadline quantization with the
+legacy millisecond-unit timer; it is not an isolated interval experiment.
+
+| Central 50-second Quake window | Latest 1-ms control | 250-us candidate |
+| --- | ---: | ---: |
+| First solo swaps/s | 43.76 | 32.90 |
+| Mixed swaps/s | 25.06 | 15.64 |
+| Final solo swaps/s | 44.52 | 32.48 |
+| Mixed frame interval p95 | 62.76 ms | 116.64 ms |
+| Mixed maximum complete frame interval | 391.14 ms | 515.86 ms |
+| Mixed observation QEMU CPU cores | 2.171–2.174 | 2.072–2.075 |
+
+The candidate's mixed source audio rates remain 33.43k Firefox / 30.97k Quake
+frames/s, short of nominal 44.1k. The lower short-window CPU observation is not
+an efficiency win while presenting fewer frames. These are individual ordered
+cohorts with established run variance; they provide no evidence for promoting
+finer polling and do not prove it caused the entire difference. Stop here
+rather than fitting further intervals to noisy results.
+
+Post-benchmark Venus default and timestamp/sync-fd correctness probes pass with
+driver ID 22. A separate cube completes 1,800 frames with no trace errors or
+overflow; extracted CSV size/hash match guest metadata. Its retained completed
+frame shows the textured cube and desktop without visible corruption. That
+screenshot briefly pauses the VM, so this cube run is a correctness/visual
+check, not a comparable pacing benchmark or input-responsiveness test. Final
+heap integrity passes; runtime counters show zero invalid/backwards samples,
+service clamps and stale identities. All original jobs/controller/VM terminate
+and all four offline filesystem checks pass.
+
+Evidence is `fine-fence-off-off-gpu-250us-fixed-mlfq-a-20261022/fine-fence-control`.
+Neither bounded experiment is promoted. The 60-FPS solo / 40-FPS mixed targets,
+mixed audio continuity, broader desktop/GL/Vulkan/input acceptance and unresolved
+clock/scheduler findings remain open. Further work needs stronger attribution
+of interleaved client commands and guest wait/run delays before choosing a
+larger submission/completion redesign; the present evidence does not justify
+dropping a fence or changing ownership/timeout rules.
