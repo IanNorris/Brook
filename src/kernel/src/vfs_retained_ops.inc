@@ -191,7 +191,6 @@ static int VfsAppendLeaf(char* path,uint32_t capacity,const char* leaf)
     if(length+suffix+1>=capacity)return -36;
     path[length++]='/';StrCopy(path+length,leaf,capacity-length);return 0;
 }
-struct VfsRenameLabels { bool changed[VFS_MAX_MOUNTS]{};char labels[VFS_MAX_MOUNTS][64]{}; };
 static int VfsPrepareRenameLabelsLocked(const VfsPath& oldParent,const char* oldName,
                                         const VfsPath& newParent,const char* newName,VfsRenameLabels& labels)
 {
@@ -203,18 +202,17 @@ static int VfsPrepareRenameLabelsLocked(const VfsPath& oldParent,const char* old
     if((error=VfsGlobalDirectoryLocked(newParent,targetGlobal,sizeof(targetGlobal))))return error;
     if((error=VfsAppendLeaf(targetGlobal,sizeof(targetGlobal),newName)))return error;
     const uint32_t oldLength=StrLen(sourceGlobal),newLength=StrLen(targetGlobal);
-    for(uint32_t i=0;i<VFS_MAX_MOUNTS;++i) {
-        const auto& mount=g_mounts[i];if(!mount.used)continue;
+    for(auto& mount:g_mounts) {
+        if(!mount.used)continue;
         VfsPath covered=mount.covered;
-        for(uint32_t depth=0;covered.object && covered.attachment!=oldParent.attachment && depth<VFS_MAX_MOUNTS;++depth)
+        for(uint32_t depth=0;covered.object && covered.attachment!=oldParent.attachment && depth<VFS_MAX_MOUNT_DEPTH;++depth)
             covered=static_cast<MountEntry*>(covered.attachment)->covered;
         if(!covered.object || covered.attachment!=oldParent.attachment)continue;
         char physical[512];if((error=VfsBackendDirectoryLocked(covered,physical,sizeof(physical))))return error;
         if(!VfsComponentPrefix(sourceRelative,physical))continue;
         if(!VfsComponentPrefix(sourceGlobal,mount.mountPoint))return -5;
-        if(newLength+StrLen(mount.mountPoint+oldLength)>=sizeof(labels.labels[i]))return -36;
-        labels.changed[i]=true;StrCopy(labels.labels[i],targetGlobal,sizeof(labels.labels[i]));
-        StrCopy(labels.labels[i]+newLength,mount.mountPoint+oldLength,sizeof(labels.labels[i])-newLength);
+        if(newLength+StrLen(mount.mountPoint+oldLength)>=sizeof(mount.mountPoint))return -36;
+        if(int allocationError=labels.Add(&mount,targetGlobal,mount.mountPoint+oldLength))return allocationError;
     }
     return 0;
 }
@@ -243,8 +241,7 @@ int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
     VfsRenameLabels labels;
     if(!same && oldStat.isDir)if(int error=VfsPrepareRenameLabelsLocked(oldParent,oldName,newParent,newName,labels))return error;
     int error=ops->rename(oldParent.object,oldName,newParent.object,newName);
-    if(!error)for(uint32_t i=0;i<VFS_MAX_MOUNTS;++i)
-        if(labels.changed[i])StrCopy(g_mounts[i].mountPoint,labels.labels[i],sizeof(g_mounts[i].mountPoint));
+    if(!error)labels.Apply();
     return error;
 }
 int VfsChmodAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode)

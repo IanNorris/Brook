@@ -1514,3 +1514,12 @@ each probe's argument parser.
   Brook. Normal user launch needs real hard-link lockfiles; the guest-root
   `-nolock` diagnostic is not a launch default. Rootless integration and GPU
   acceleration are separate future milestones.
+
+- Ext2 allocation-error reporting: the mount-namespace retained-rename fault
+  probe observes ENOENT at injected allocation position 4 rather than ENOMEM.
+  Trace missing/error propagation through directory lookup and backend path
+  reporting, distinguishing a truly absent entry from a failed allocation/read.
+  Current rename fault tests validate unchanged backend paths and mount labels
+  after failures and cover successful retries; they do not establish exact
+  Linux errno equivalence for every allocation site. Evidence:
+  `build/workloads/mount-namespace-20261022/attachments/rename-failure-test.log`.

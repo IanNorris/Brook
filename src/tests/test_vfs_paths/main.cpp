@@ -283,7 +283,7 @@ int main(){
     MountEntry alias{};
     {
         FileMutationGuard transaction;
-        alias=g_mounts[0];alias.pathHolds=0;alias.vnodeHolds=0;
+        alias=*g_rootMount;alias.next=nullptr;alias.pathHolds=0;alias.vnodeHolds=0;
         alias.backing->RetainLocked();
     }
     VfsPath aliasRoot{};
@@ -317,6 +317,55 @@ int main(){
     const auto syncBeforeAlias=syncCalls[6];assert(!VfsSync(nullptr));
     assert(syncCalls[6]==syncBeforeAlias+1);
     assert(VfsUnmount("/same") && sameBacking->references==1);
-    assert(VfsUnmount("/"));assert(!g_backings);
+    VfsPath stableRoot{};assert(!VfsPathRoot(&stableRoot));
+    const auto dynamicMountCalls=mountCalls[6];
+    for(unsigned i=0;i<64;++i) {
+        char point[32];std::snprintf(point,sizeof(point),"/dynamic%u",i);
+        assert(VfsMount(point,"objects",6));
+        auto path=resolve(stableRoot,stableRoot,point);
+        expect(stableRoot,path,"..",stableRoot);VfsPathRelease(path);
+    }
+    assert(VfsMountMaxSlots()==65 && VfsRootMountCount()==64);
+    assert(mountCalls[6]==dynamicMountCalls && sameBacking->references==65);
+    Node enumeratedParent{&mounts[6],42,true,&mounts[6].root,{}, {}};
+    mounts[6].root.children["enum-parent"]=&enumeratedParent;
+    std::atomic<bool> stopEnumeration{false};std::atomic<unsigned> observations{0};
+    std::thread enumerator([&] {
+        while(!stopEnumeration.load(std::memory_order_acquire)) {
+            const auto count=VfsMountMaxSlots();assert(count>=65);
+            auto snap=VfsMountSnapshotAt(observations.load()%count);
+            if(snap.used) {
+                assert(snap.mountPoint[0]=='/' && std::memchr(snap.mountPoint,0,sizeof(snap.mountPoint)));
+                assert(!std::strcmp(snap.fsType,"objects"));
+            }
+            char label[64]{};
+            if(VfsRootMountNameAt(0,label,sizeof(label)))assert(label[0] && std::memchr(label,0,sizeof(label)));
+            assert(VfsRootMountCount()>=64);
+            observations.fetch_add(1,std::memory_order_release);
+        }
+    });
+    while(!observations.load(std::memory_order_acquire))std::this_thread::yield();
+    for(unsigned i=0;i<200;++i) {
+        assert(VfsMount("/enum-parent/alias","objects",6));
+        assert(!VfsRename("/enum-parent","/enum-other"));
+        assert(VfsUnmount("/enum-other/alias"));
+        assert(!VfsRename("/enum-other","/enum-parent"));
+    }
+    stopEnumeration.store(true,std::memory_order_release);enumerator.join();
+    mounts[6].root.children.erase("enum-parent");
+
+    auto retainedDynamic=resolve(stableRoot,stableRoot,"/dynamic0");
+    for(unsigned i=0;i<64;++i) {
+        char point[32];std::snprintf(point,sizeof(point),"/dynamic%u",i);
+        if(!i) {assert(!VfsUnmount(point));VfsPathRelease(retainedDynamic);}
+        assert(VfsUnmount(point));
+    }
+    for(unsigned i=0;i<32;++i)assert(VfsMount("/stacked-dynamic","objects",6));
+    assert(VfsMountMaxSlots()==33);
+    auto stackedDynamic=resolve(stableRoot,stableRoot,"/stacked-dynamic");
+    expect(stableRoot,stackedDynamic,"..",stableRoot);VfsPathRelease(stackedDynamic);
+    for(unsigned i=0;i<32;++i)assert(VfsUnmount("/stacked-dynamic"));
+    VfsPathRelease(stableRoot);
+    assert(VfsUnmount("/"));assert(!g_backings && !g_mounts.count);
     assert(allocations.empty());std::puts("VFS_PATHS_PASS rename/overmount/stacked-dotdot/root-clamp/virtual/rollback/unsupported/open-transfer");
 }

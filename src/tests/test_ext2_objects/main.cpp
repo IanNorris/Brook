@@ -26,6 +26,7 @@ std::map<brook::KRwLock*,std::unique_ptr<std::shared_mutex>> fsLocks;
 std::unordered_set<void*> allocations,frames;
 std::mutex trackingLock;
 thread_local long failAllocation=-1;
+thread_local bool failTriggered=false;
 unsigned requiredAccess=0;
 brook::Process process{};
 uint16_t legacyTestMask=022;
@@ -47,7 +48,7 @@ void closeNode(brook::Vnode* node){assert(node);node->ops->close(node);brook::kf
 namespace brook {
 extern "C" [[noreturn]] void KernelPanic(const char*,...) {std::abort();}
 extern "C" void* kmalloc(uint64_t size){
-    if(failAllocation==0){failAllocation=-1;return nullptr;}
+    if(failAllocation==0){failAllocation=-1;failTriggered=true;return nullptr;}
     if(failAllocation>0)--failAllocation;
     void* p=std::malloc(size);if(p){std::lock_guard<std::mutex> lock(trackingLock);allocations.insert(p);std::memset(p,0xcc,size);}return p;
 }
@@ -342,7 +343,25 @@ int main(int argc,char** argv){
     assert(VfsRenameAt(fsRoot,cwd,"value",resolved,"new-value")==-18);VfsPathRelease(resolved);
     assert(!VfsMkdir("/container/context-moved/d",0755));prepareVolume(3);
     assert(VfsMount("/container/context-moved/d/m","ext2",3));
-    assert(!VfsRenameAt(fsRoot,cwd,"d",cwd,"e")); // Held lower parent while covered.
+    // Fail every allocation through retained rename's label preflight. No
+    // partial backend rename or mount-label publication may escape failure.
+    bool renamedWithLabels=false;
+    for(long failure=0;failure<128;++failure) {
+        failTriggered=false;failAllocation=failure;
+        int renameResult=VfsRenameAt(fsRoot,cwd,"d",cwd,"e");failAllocation=-1;
+        if(!renameResult) {
+            if(!failTriggered) { renamedWithLabels=true;break; }
+            // Backend advisory reads may retry a transient allocation failure.
+            // Undo a successful operation and continue through every position.
+            assert(!VfsRenameAt(fsRoot,cwd,"e",cwd,"d"));continue;
+        }
+        assert(renameResult<0); // Exact backend OOM errno is a separate contract.
+        VnodeStat beforeRename{};
+        assert(!VfsStatAt(fsRoot,cwd,"d",&beforeRename) && beforeRename.isDir);
+        assert(VfsStatAt(fsRoot,cwd,"e",&beforeRename)==-2);
+        parity("/container/context-moved/d/m");
+    }
+    assert(renamedWithLabels); // Held lower parent while covered.
     parity("/container/context-moved/d/m");
     assert(!VfsRenameAt(fsRoot,fsRoot,"container",fsRoot,"renamed-container"));
     parity("/renamed-container/context-moved/d/m");assert(!VfsOpen("/container/context-moved/d/m"));

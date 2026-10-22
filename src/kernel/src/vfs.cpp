@@ -129,7 +129,8 @@ bool VfsUnregisterFs(const char* name)
 
 // ---- Mount table ----
 
-static constexpr uint32_t VFS_MAX_MOUNTS = 8;
+// Traversal safety bound, independent of the number of allocated attachments.
+static constexpr uint32_t VFS_MAX_MOUNT_DEPTH = 4096;
 
 // A driver mount is backing, not a namespace attachment. Copies and binds
 // retain this object instead of calling the driver's mount callback again.
@@ -147,6 +148,7 @@ struct MountBacking {
 static MountBacking* g_backings;
 
 struct MountEntry {
+    MountEntry* next;
     char             mountPoint[64];
     char             fsType[16];     // filesystem type name (e.g. "fatfs", "ext2")
     MountBacking*    backing;     // owned driver-mount reference
@@ -161,7 +163,43 @@ struct MountEntry {
     bool             linked;
 };
 
-static MountEntry g_mounts[VFS_MAX_MOUNTS];
+// Membership is protected by the sleeping VFS transaction. Short metadata
+// readers (including procfs callbacks already in that transaction) use viewLock
+// so they never recursively acquire the sleeping lock or observe freed nodes.
+static IrqSpinLock g_mountViewLock;
+struct MountRegistry {
+    MountEntry* head=nullptr;
+    uint32_t count=0;
+    struct Iterator {
+        MountEntry* value;
+        MountEntry& operator*() const { return *value; }
+        Iterator& operator++() { value=value->next;return *this; }
+        bool operator!=(Iterator other) const { return value!=other.value; }
+    };
+    Iterator begin() const { return {head}; }
+    Iterator end() const { return {nullptr}; }
+    MountEntry* At(uint32_t index) const {
+        auto* node=head;while(node && index--)node=node->next;return node;
+    }
+    void Publish(MountEntry* node) {
+        auto flags=IrqSpinLockAcquire(&g_mountViewLock);
+        node->next=head;head=node;++count;
+        IrqSpinLockRelease(&g_mountViewLock,flags);
+    }
+    void Remove(MountEntry* node) {
+        auto flags=IrqSpinLockAcquire(&g_mountViewLock);
+        auto** entry=&head;while(*entry && *entry!=node)entry=&(*entry)->next;
+        if(!*entry || !count)__builtin_trap();
+        *entry=node->next;node->next=nullptr;node->used=false;--count;
+        IrqSpinLockRelease(&g_mountViewLock,flags);
+    }
+};
+static MountRegistry g_mounts;
+struct MountViewGuard {
+    uint64_t flags;
+    MountViewGuard():flags(IrqSpinLockAcquire(&g_mountViewLock)) {}
+    ~MountViewGuard() { IrqSpinLockRelease(&g_mountViewLock,flags); }
+};
 static MountEntry* g_rootMount;
 static uint64_t g_mountPublication;
 
@@ -225,6 +263,25 @@ static bool StrEq(const char* a, const char* b)
     return *a == *b;
 }
 
+struct VfsRenameLabels {
+    struct Change { Change* next;MountEntry* mount;char label[64]; };
+    Change* head=nullptr;
+    ~VfsRenameLabels() { while(head) { auto* next=head->next;kfree(head);head=next; } }
+    int Add(MountEntry* mount,const char* prefix,const char* suffix) {
+        auto* change=static_cast<Change*>(kmalloc(sizeof(Change)));
+        if(!change)return -12;
+        change->mount=mount;StrCopy(change->label,prefix,sizeof(change->label));
+        const uint32_t length=StrLen(prefix);
+        StrCopy(change->label+length,suffix,sizeof(change->label)-length);
+        change->next=head;head=change;return 0;
+    }
+    void Apply() {
+        MountViewGuard held;
+        for(auto* change=head;change;change=change->next)
+            StrCopy(change->mount->mountPoint,change->label,sizeof(change->mount->mountPoint));
+    }
+};
+
 // Find the best (longest-prefix) mount for a given absolute path.
 // Returns the mount entry and sets *relPath to the path within the mount.
 static MountEntry* FindMount(const char* absPath, const char** relPath)
@@ -235,7 +292,7 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
         // A longest-prefix scan can resurrect descendants hidden by an
         // overmount. Follow visible attachment edges from the current root.
         best=g_rootMount;
-        for(uint32_t step=0;step<VFS_MAX_MOUNTS;++step) {
+        for(uint32_t step=0;step<VFS_MAX_MOUNT_DEPTH;++step) {
             MountEntry* next=nullptr;uint32_t nextLength=~uint32_t{0};
             for(auto& mount:g_mounts) {
                 if(!mount.used || !mount.linked || mount.covered.attachment!=best)continue;
@@ -252,17 +309,17 @@ static MountEntry* FindMount(const char* absPath, const char** relPath)
         return best;
     }
 
-    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i)
+    for(auto& candidate:g_mounts)
     {
-        if (!g_mounts[i].used) continue;
-        uint32_t mpLen = StrLen(g_mounts[i].mountPoint);
+        if (!candidate.used) continue;
+        uint32_t mpLen = StrLen(candidate.mountPoint);
         bool match = true;
         for (uint32_t j = 0; j < mpLen; ++j) {
-            if (absPath[j] != g_mounts[i].mountPoint[j]) { match = false; break; }
+            if (absPath[j] != candidate.mountPoint[j]) { match = false; break; }
         }
         if (!match) continue;
         if (mpLen > 1 && absPath[mpLen] != '\0' && absPath[mpLen] != '/') continue;
-        if (mpLen > bestLen || (mpLen==bestLen && best && g_mounts[i].publication>best->publication)) { bestLen = mpLen; best = &g_mounts[i]; }
+        if (mpLen > bestLen || (mpLen==bestLen && best && candidate.publication>best->publication)) { bestLen = mpLen; best = &candidate; }
     }
 
     if (best && relPath)
@@ -367,7 +424,7 @@ void VfsInit()
     g_rootMount=nullptr;
     g_backings=nullptr;
     g_mountPublication=0;
-    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i) g_mounts[i].used = false;
+    g_mountViewLock={};g_mounts={};
     for (uint32_t i = 0; i < VFS_MAX_FS_DRIVERS; ++i) g_fsDrivers[i].used = false;
     SerialPuts("VFS: initialised\n");
 }
@@ -390,30 +447,26 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
         return false;
     }
 
-    // Find a free slot.
-    MountEntry* slot = nullptr;
-    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i)
-    {
-        if (!g_mounts[i].used) { slot = &g_mounts[i]; break; }
-    }
-    if (!slot) { SerialPuts("VFS: mount table full\n"); return false; }
-
+    if(g_mounts.count==~uint32_t{0})return false;
+    auto* slot=static_cast<MountEntry*>(kmalloc(sizeof(MountEntry)));
+    if(!slot)return false;
+    *slot={};
     MountBacking* backing=nullptr;
     for(auto* candidate=g_backings;candidate;candidate=candidate->next)
         if(candidate->fsOps==ops && candidate->pdrv==pdrv) { backing=candidate;break; }
     if(backing) {
         // FAT's drive slots are global to its driver. Do not remount over a
         // failed retirement: its later unmount could unregister the new mount.
-        if(!backing->references)return false;
+        if(!backing->references) { kfree(slot);return false; }
         backing->RetainLocked();
     } else {
         backing=static_cast<MountBacking*>(kmalloc(sizeof(MountBacking)));
-        if(!backing)return false;
+        if(!backing) { kfree(slot);return false; }
         *backing={};backing->fsOps=ops;backing->pdrv=pdrv;backing->references=1;
         void* privateData=nullptr;
         if(!ops->mount(pdrv,&privateData)) {
             SerialPrintf("VFS: mount failed for '%s' at '%s'\n",fsName,mountPoint);
-            kfree(backing);return false;
+            kfree(backing);kfree(slot);return false;
         }
         backing->mountPriv=privateData;backing->next=g_backings;g_backings=backing;
     }
@@ -438,11 +491,12 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
         VfsPathRelease(slot->covered);*slot={};
         // Rollback is private: no path or vnode has observed this mount.
         VfsBackingDropLocked(backing,true);
-        return false;
+        kfree(slot);return false;
     }
     slot->linked=isRoot || slot->covered.object;
     slot->publication=++g_mountPublication;
     slot->used=true;
+    g_mounts.Publish(slot);
     if(isRoot)g_rootMount=slot;
 
     DbgPrintf("VFS: mounted '%s' at '%s' (pdrv=%u)\n", fsName, mountPoint, pdrv);
@@ -471,8 +525,9 @@ bool VfsUnmount(const char* mountPoint)
            __atomic_load_n(&mount.pathHolds,__ATOMIC_ACQUIRE))return false;
         if(VfsBackingDropLocked(mount.backing))return false;
         mount.backing=nullptr;
-        covered=mount.covered;mount.covered={};mount.used=false;
+        covered=mount.covered;mount.covered={};
         if(g_rootMount==selected)g_rootMount=nullptr;
+        g_mounts.Remove(selected);kfree(selected);
     }
     // Namespace edge is unpublished before its parent/object holds are dropped.
     VfsPathRelease(covered);
@@ -482,11 +537,12 @@ bool VfsUnmount(const char* mountPoint)
 
 uint32_t VfsRootMountCount()
 {
+    MountViewGuard held;
     uint32_t count = 0;
-    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i)
+    for(const auto& mount:g_mounts)
     {
-        if (!g_mounts[i].used) continue;
-        const char* mp = g_mounts[i].mountPoint;
+        if (!mount.used) continue;
+        const char* mp = mount.mountPoint;
         if (mp[0] != '/' || mp[1] == '\0') continue;
 
         bool nested = false;
@@ -501,13 +557,14 @@ uint32_t VfsRootMountCount()
 
 bool VfsRootMountNameAt(uint32_t index, char* out, uint32_t outSize)
 {
+    MountViewGuard held;
     if (!out || outSize == 0) return false;
 
     uint32_t seen = 0;
-    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; ++i)
+    for(const auto& mount:g_mounts)
     {
-        if (!g_mounts[i].used) continue;
-        const char* mp = g_mounts[i].mountPoint;
+        if (!mount.used) continue;
+        const char* mp = mount.mountPoint;
         if (mp[0] != '/' || mp[1] == '\0') continue;
 
         bool nested = false;
@@ -530,13 +587,14 @@ bool VfsRootMountNameAt(uint32_t index, char* out, uint32_t outSize)
     return false;
 }
 
-uint32_t VfsMountMaxSlots() { return VFS_MAX_MOUNTS; }
+uint32_t VfsMountMaxSlots() { MountViewGuard held;return g_mounts.count; }
 
 VfsMountSnapshot VfsMountSnapshotAt(uint32_t idx)
 {
     VfsMountSnapshot snap = {};
-    if (idx >= VFS_MAX_MOUNTS) return snap;
-    const auto& m = g_mounts[idx];
+    MountViewGuard held;auto* entry=g_mounts.At(idx);
+    if (!entry) return snap;
+    const auto& m = *entry;
     snap.used = m.used;
     if (!m.used) return snap;
     StrCopy(snap.mountPoint, m.mountPoint, sizeof(snap.mountPoint));
@@ -1060,20 +1118,19 @@ int VfsRename(const char* oldPath,const char* newPath)
         // An upper attachment rename must not relabel a hidden lower tree
         // whose opening labels happen to share the same textual prefix.
         const MountEntry* ancestor=&mount;
-        for(uint32_t step=0;ancestor && ancestor!=oldMount && step<VFS_MAX_MOUNTS;++step)
+        for(uint32_t step=0;ancestor && ancestor!=oldMount && step<VFS_MAX_MOUNT_DEPTH;++step)
             ancestor=static_cast<MountEntry*>(ancestor->covered.attachment);
         if(ancestor!=oldMount)return false;
         for(uint32_t i=0;i<oldLength;++i)if(mount.mountPoint[i]!=oldResolved[i])return false;
         return mount.mountPoint[oldLength]=='/';
     };
-    for(const auto& mount:g_mounts)if(renamedAncestor(mount) &&
-        newLength+StrLen(mount.mountPoint+oldLength)>=sizeof(mount.mountPoint))return -36;
-    const int error=oldMount->backing->fsOps->rename ? oldMount->backing->fsOps->rename(oldMount->backing->mountPriv,oldMount->backing->pdrv,oldRelative,newRelative) : -95;
-    if(!error)for(auto& mount:g_mounts)if(renamedAncestor(mount)) {
-        char label[sizeof(mount.mountPoint)];StrCopy(label,newResolved,sizeof(label));
-        StrCopy(label+newLength,mount.mountPoint+oldLength,sizeof(label)-newLength);
-        StrCopy(mount.mountPoint,label,sizeof(mount.mountPoint));
+    VfsRenameLabels labels;
+    for(auto& mount:g_mounts)if(renamedAncestor(mount)) {
+        if(newLength+StrLen(mount.mountPoint+oldLength)>=sizeof(mount.mountPoint))return -36;
+        if(int allocationError=labels.Add(&mount,newResolved,mount.mountPoint+oldLength))return allocationError;
     }
+    const int error=oldMount->backing->fsOps->rename ? oldMount->backing->fsOps->rename(oldMount->backing->mountPriv,oldMount->backing->pdrv,oldRelative,newRelative) : -95;
+    if(!error)labels.Apply();
     return error;
 }
 

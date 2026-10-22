@@ -45,9 +45,12 @@ the correct filesystem driver based on mount-point prefix matching.
 
 ## Mount Table
 
-- Fixed 8-entry table (`VFS_MAX_MOUNTS`)
-- Each entry: mount point string, filesystem name, drive number, VfsFsOps*, mount-private data
-- **Longest-prefix matching**: `/nix/store/foo` matches mount at `/nix` over `/`
+- Heap-allocated attachment records with stable addresses while held paths/vnodes exist
+- Attachments retain shared driver/device backing; additional attachments do not remount the driver
+- Retained-object lookup follows attachment edges, preserving overmount and directory-handle identity
+- Legacy global name dispatch follows visible edges, with prefix matching only for unsupported retained backends
+- The registry is still the initial global topology; per-process namespace integration is pending
+- Enumeration copies are individually synchronized; concurrent mutation can omit or repeat entries across calls
 - Mount/unmount at runtime via `VfsMount()` / `VfsUnmount()`
 
 ### Typical Mount Layout

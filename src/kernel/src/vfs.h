@@ -258,12 +258,14 @@ extern "C" bool VfsUnmount(const char* mountPoint);
 uint32_t VfsRootMountCount();
 bool VfsRootMountNameAt(uint32_t index, char* out, uint32_t outSize);
 
-// Mount table snapshot for procfs (/proc/mounts).
+// Initial mount registry metadata for procfs (/proc/mounts). Each copy is
+// synchronized; count/index sequences can omit/repeat entries during mutation.
 struct VfsMountSnapshot {
     char mountPoint[64];
     char fsType[16];
     bool used;
 };
+// Current published record count, not a fixed slot/capacity limit.
 uint32_t VfsMountMaxSlots();
 VfsMountSnapshot VfsMountSnapshotAt(uint32_t idx);
 

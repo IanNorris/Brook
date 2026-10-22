@@ -120,7 +120,7 @@ static bool VfsReservedVirtualLocked(const VfsPath& parent,const char* name,VfsP
 static int VfsEnterMountsLocked(VfsPath* path)
 {
     // Edges always point into a new attachment, so traversal cannot cycle.
-    for(uint32_t step=0;step<VFS_MAX_MOUNTS;++step) {
+    for(uint32_t step=0;step<VFS_MAX_MOUNT_DEPTH;++step) {
         MountEntry* child=nullptr;
         for(auto& mount:g_mounts)
             if(mount.used && mount.linked && VfsPathSame(mount.covered,*path)) { child=&mount;break; }
@@ -169,7 +169,7 @@ struct VfsRetainedProvider {
     }
     int Parent(const VfsPath& path,const VfsPath& root,VfsPath& out) {
         out={};VfsPath current=path;VfsPathRetain(current);
-        for(uint32_t step=0;step<=VFS_MAX_MOUNTS;++step) {
+        for(uint32_t step=0;step<=VFS_MAX_MOUNT_DEPTH;++step) {
             if(Same(current,root)) { out=current;return 0; }
             auto* mount=static_cast<MountEntry*>(current.attachment);
             if(!VfsVirtual(current) && mount->rootIdentityKnown &&

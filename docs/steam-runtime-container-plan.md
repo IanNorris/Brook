@@ -331,3 +331,48 @@ This accepts backing ownership only. Attachment records still use the initial
 eight-slot topology; dynamic attachments, process namespace ownership, clone
 remapping, namespace retirement, bind/detach syscall dispatch and their isolation
 acceptance remain unfinished. No container or Steam login support is claimed.
+
+
+### Dynamic attachment storage component
+
+The initial namespace registry now uses stable heap-allocated `MountEntry`
+records rather than eight reusable slots. Explicit unmount still requires all
+path/vnode holds and child attachments to be gone before unlink/free. This
+component does not yet implement lazy detach or process namespace ownership.
+The traversal guard is a separate depth bound (4096), not storage capacity.
+
+Metadata enumeration uses a dedicated IRQ-safe view lock to copy count/names/
+snapshots without recursively acquiring the sleeping VFS transaction from a
+procfs callback. Writers hold the VFS transaction before the view lock; view
+readers perform no backend callbacks and return no record pointers. Individual
+copies are memory-safe, but a sequence of count/index calls is not a coherent
+snapshot during concurrent mutation. Indexed scans and count/name enumeration
+still scale with registry length; this is not unlimited scalability acceptance.
+
+Both legacy and retained rename label updates allocate a private list of only
+the affected records before the backend mutation. Allocation failure unwinds
+that list without publishing labels or renaming the backend. View-lock label
+publication only copies prepared strings; ancestry scans and allocation stay
+outside that IRQ-disabled section. Astra reviewed the heap/lifetime and lock
+ordering; its requested concurrent enumeration regression is included.
+
+The real VFS host tests cover 64 same-backing mounts, 32 stacked mounts, retained
+handles, allocation-failure construction unwind and metadata enumeration racing
+200 mount/rename/unmount cycles. Real Ext2 retained-rename fault injection checks
+unchanged backend paths/labels on failure and continues past successful retries
+until an entire operation succeeds without an injected failure. The backend's
+existing OOM-to-ENOENT error mapping is recorded separately in the backlog.
+
+All 97 host tests and the VFS/Ext2/FAT ASan/UBSan tests pass. The ABI-39 kernel and
+13 modules build; supported compiled entry/start audits pass. Frozen kernel SHA:
+`48912b7be45fb70590669b5606a232c9ab33fe63e3e41f66cf64ef85a382c386`.
+Evidence and frozen source are under
+`build/workloads/mount-namespace-20261022/attachments`. No VM was started for this
+component; native namespace/integration acceptance remains outstanding. The
+build helper now explicitly reconfigures the nested kernel CMake project before
+building so its git banner is current, rather than only reconfiguring the root.
+
+Next: introduce owned namespace topology over these records, copy/remap root,
+cwd and synthetic ancestor links by identity, add member tokens to actual
+process birth/exit, and wire real privileged clone/bind/detach. These acceptance
+items remain part of the active goal; the component tests do not replace them.
