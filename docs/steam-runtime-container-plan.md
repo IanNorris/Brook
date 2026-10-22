@@ -251,3 +251,41 @@ unwind in host tests, including a namespace snapshot held across last-member
 departure. Review process exit/publication hooks so topology visibility never
 waits for final Process or FsContext reference destruction. No kernel namespace
 implementation is claimed by this discovery probe.
+
+
+### Publication primitive and process-hook audit
+
+`mount_namespace_state.h` introduces only the allocation-free state transitions
+for prepared/active/retired namespace membership and independent storage refs.
+A last-member CAS retires publication synchronously; a retained context/snapshot
+cannot revive it. Hosted tests cover independent member leases with shared
+context storage, prepared-clone abandonment, snapshot survival across final
+member departure, concurrent joins/snapshots/exits, and joining against the last
+leaver. This primitive is not wired into the VFS or scheduler yet and does not
+establish mount-namespace support.
+
+The process audit identifies four required future member-token paths:
+`SchedulerAddProcess` can publish a stillborn thread; `SchedulerMarkTerminated`
+performs ordinary terminal publication; `SchedulerKernelOperationBoundary`
+completes deferred terminal requests through that function; and unpublished
+creation failure reaches `ProcessDiscardUnpublished` or constructor unwind.
+`FreeProcessStruct`/FsContext destruction alone is too late because an exited
+process can retain references while waiting for a parent or observer.
+
+Astra reviewed the primitive and proposed hooks. Each task must own an explicit
+member token and storage hold, independent of FsContext snapshot reference
+counts. Exchange the token once on terminal publication, perform only the
+allocation-free member departure there, and queue any topology cleanup with
+preallocated state. Scheduler/registry locks must never run backend destruction.
+The last member's retirement gates both mount entry and attachment-root parent
+traversal immediately, including a covered-parent pointer awaiting cleanup.
+Mutation admission must check publication under the topology transaction:
+operations already admitted may finish before cleanup obtains that transaction;
+new operations after retirement must fail, so no edge is added after cleanup.
+Full topology and process-hook integration remain acceptance work.
+
+The final primitive tests pass in the normal host build (0.09 seconds) and the
+existing ASan/UBSan build (0.17 seconds). Receipts are under
+`build/workloads/mount-namespace-20261022/state`. No kernel/module build, ABI
+change, live Brook test, topology implementation or scheduler behavior change
+is claimed for this component checkpoint.
