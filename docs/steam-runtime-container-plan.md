@@ -15,6 +15,10 @@ nested and stacked mount subtrees and advances unchanged bubblewrap to
 `pivot_root: Function not implemented`. The subsequent
 [private root-relocation checkpoint](pivot-root-checkpoint.md) implements both
 pivot forms and advances the same binary to missing `/proc/self/mountinfo`.
+The [device bind flags checkpoint](device-bind-flags-checkpoint.md) then accepts
+NOSUID-only restrictions. With a real store-visible coreutils PATH, unchanged
+SteamRT passes its precheck and reaches F_ADD_SEALS during runtime setup.
+
 The [read-only bind checkpoint](read-only-bind-checkpoint.md) enforces RO with
 conservative data/writeback admission and advances unchanged SteamRT to its
 NOSUID-only device bind remount. Its requested child has not executed.

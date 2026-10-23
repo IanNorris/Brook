@@ -16,14 +16,16 @@
 #include <string.h>
 static unsigned checks;
 static int brook;
+static unsigned long restrictions=MS_NOSUID|MS_NODEV;
 #define CK(x) do {++checks;if(!(x)){fprintf(stderr,"ROBIND FAIL line=%d %s errno=%d\n",__LINE__,#x,errno);exit(1);}}while(0)
 #define RO(x) do {errno=0;CK((x)==-1&&errno==EROFS);}while(0)
 static void mapid(const char* path,unsigned id){char text[64];int n=snprintf(text,sizeof(text),"0 %u 1\n",id);int f=open(path,O_WRONLY);CK(f>=0&&write(f,text,n)==n&&!close(f));}
 static void waitok(pid_t child){int status;CK(waitpid(child,&status,0)==child&&WIFEXITED(status)&&!WEXITSTATUS(status));}
 static void filename(char* out,size_t capacity,const char* dir,const char* leaf){CK(snprintf(out,capacity,"%s/%s",dir,leaf)>0);}
 static void makevalue(const char* path){int f=open(path,O_CREAT|O_EXCL|O_RDWR,0600);CK(f>=0&&!ftruncate(f,4096)&&write(f,"A",1)==1&&!close(f));}
-static int readonly(const char* path){return mount(NULL,path,NULL,MS_BIND|MS_REMOUNT|MS_RDONLY|MS_NOSUID|MS_NODEV,NULL);}
+static int readonly(const char* path){return mount(NULL,path,NULL,MS_BIND|MS_REMOUNT|MS_RDONLY|restrictions,NULL);}
 static void exercise(const char* source,const char* destination,int mapping){
+ restrictions=MS_NOSUID|(mapping?0:MS_NODEV);
  CK(!mkdir(destination,0700)&&!mount(source,destination,NULL,MS_BIND,NULL));
  char value[512],newfile[512],newdir[512],moved[512],sourcevalue[512];
  filename(value,sizeof(value),destination,"value");filename(sourcevalue,sizeof(sourcevalue),source,"value");
@@ -54,7 +56,7 @@ static void exercise(const char* source,const char* destination,int mapping){
  }
  // Per-attachment protection: the independent source alias stays writable.
  f=open(sourcevalue,O_WRONLY);CK(f>=0&&write(f,"B",1)==1&&!close(f));f=open(value,O_RDONLY);CK(f>=0&&read(f,&c,1)==1&&c=='B'&&!close(f));
- if(brook){errno=0;CK(mount(NULL,destination,NULL,MS_BIND|MS_REMOUNT|MS_NOSUID|MS_NODEV,NULL)==-1&&errno==EPERM);}
+ if(brook){errno=0;CK(mount(NULL,destination,NULL,MS_BIND|MS_REMOUNT|restrictions,NULL)==-1&&errno==EPERM);}
  pid_t child=syscall(SYS_clone,(unsigned long)(CLONE_NEWNS|SIGCHLD),0L,0L,0L,0L);CK(child>=0);
  if(!child){RO(open(newfile,O_CREAT|O_WRONLY,0600));_exit(0);}waitok(child);
  CK(!umount2(destination,MNT_DETACH));RO(openat(directory,"new",O_CREAT|O_WRONLY,0600));CK(!close(directory)&&!close(metadata));CK(!rmdir(destination));char sourceDir[512];filename(sourceDir,sizeof(sourceDir),source,"dir");CK(!rmdir(sourceDir));

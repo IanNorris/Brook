@@ -11,7 +11,7 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
     const bool privatePropagation=type==Private || type==Slave;
     const bool memoryMount=(flags&~Silent)==6; // bounded NODEV|NOSUID tmpfs
     const bool bindMount=type==Bind;
-    const bool remount=(flags&~(Silent|uint64_t{7}))==(Bind|Remount) && (flags&6)==6;
+    const bool remount=(flags&~(Silent|uint64_t{7}))==(Bind|Remount) && (flags&2)==2;
     if(!bindMount && !privatePropagation && !memoryMount && !remount)return -EINVAL;
     if(memoryMount) {
         char fsType[32],data[256];

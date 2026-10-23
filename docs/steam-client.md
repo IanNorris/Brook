@@ -1,8 +1,9 @@
-Latest container checkpoint: [read-only retained binds](read-only-bind-checkpoint.md)
+Latest container checkpoint: [NOSUID-only bind flags](device-bind-flags-checkpoint.md)
 runs unchanged bubblewrap and its NNP/exec child successfully as UID 1000.
 The real SteamRT launcher now passes directory FD traversal and the retained
-`/usr` layout check and read-only binds, then stops at the NOSUID-only `/dev`
-remount. Its child has not executed.
+`/usr` layout check, read-only binds and the device remount. A container-visible
+coreutils PATH lets its precheck execute true; runtime setup then stops at
+F_ADD_SEALS for etc-passwd. Its requested child has not executed.
 
 # Native Steam client checkpoint
 

@@ -564,7 +564,7 @@ int VfsMountNamespacePrivatePropagation(MountNamespace* ns,const VfsPath& target
 int VfsMountNamespaceRemount(MountNamespace* ns,const VfsPath& target,uint64_t attributes)
 {
     if(!ns || !target.object || !target.attachment)return -22;
-    if(attributes!=6 && attributes!=7)return -22;
+    if(attributes!=2 && attributes!=3 && attributes!=6 && attributes!=7)return -22;
     FileMutationGuard transaction;
     if(!ns->life.Published())return -3;
     if(ns->initial)return -95;

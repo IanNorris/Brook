@@ -417,10 +417,12 @@ static void testMountRestrictions(brook::MountNamespace* initial,const brook::Vf
     int error=0;auto* held=VfsPathOpen(dev,VFS_O_READ,&error);assert(held&&!error);
     auto activations=deviceActivations;
     assert(VfsMountNamespaceRemount(initial,stableRoot,6)==-95);
-    for(uint64_t attributes:{0ULL,2ULL,14ULL,2097158ULL})assert(VfsMountNamespaceRemount(ns,bind,attributes)==-22);
+    for(uint64_t attributes:{0ULL,14ULL,2097158ULL})assert(VfsMountNamespaceRemount(ns,bind,attributes)==-22);
     assert(static_cast<MountEntry*>(bind.attachment)->attributes==0);
     assert(VfsMountNamespaceRemount(ns,dev,6)==-22);
-    assert(!VfsMountNamespaceRemount(ns,bind,6));
+    assert(!VfsMountNamespaceRemount(ns,bind,2));
+    auto* deviceAllowed=VfsPathOpen(dev,VFS_O_READ,&error);assert(deviceAllowed&&!error);VfsRelease(deviceAllowed);activations=deviceActivations;
+    assert(!VfsMountNamespaceRemount(ns,bind,6));assert(VfsMountNamespaceRemount(ns,bind,2)==-1);
     assert(!VfsPathOpen(dev,VFS_O_READ,&error)&&error==-13&&deviceActivations==activations);
     auto* metadata=VfsPathOpen(dev,VFS_O_METADATA,&error);assert(metadata&&!error&&deviceActivations==activations);VfsRelease(metadata);
     VnodeStat stat{};assert(!VfsStat(held,&stat)&&stat.mode==0020666);VfsRelease(held);
@@ -458,17 +460,18 @@ static void testReadOnlyMount(brook::MountNamespace* initial,const brook::VfsPat
     Node file{&mounts[6],701,false,&node(source.object),{},{}};node(source.object).children["ro-file"]=&file;
     assert(VfsMountNamespaceRemount(ns,root,7)==-95);assert(VfsMountAttributes(static_cast<MountEntry*>(root.attachment))==0);
     assert(!VfsMountNamespaceBind(ns,source,target));auto bind=resolve(root,root,"ns-b"),path=resolve(root,bind,"ro-file");
+    assert(!VfsMountNamespaceRemount(ns,bind,2));
     int error=0;auto* metadata=VfsPathOpen(path,VFS_O_METADATA,&error);assert(metadata&&!error&&!metadata->mountDataHold);
     auto* directory=VfsPathOpen(bind,VFS_O_READ,&error);assert(directory&&!error&&!directory->mountDataHold);
     auto* reader=VfsPathOpen(path,VFS_O_READ,&error);assert(reader&&!error&&reader->mountDataHold);
-    assert(VfsMountNamespaceRemount(ns,bind,7)==-16);
+    assert(VfsMountNamespaceRemount(ns,bind,3)==-16);
     // A mapping/writeback owner retaining the vnode must keep admission busy
     // after the descriptor owner retires; final close releases the data hold.
-    VfsRetain(reader);VfsRelease(reader);assert(VfsMountNamespaceRemount(ns,bind,7)==-16);VfsRelease(reader);
-    assert(!VfsMountNamespaceRemount(ns,bind,7));assert(VfsMountReadOnly(metadata)&&VfsMountReadOnly(directory));
-    assert(VfsMountNamespaceRemount(ns,bind,6)==-1);
+    VfsRetain(reader);VfsRelease(reader);assert(VfsMountNamespaceRemount(ns,bind,3)==-16);VfsRelease(reader);
+    assert(!VfsMountNamespaceRemount(ns,bind,3));assert(VfsMountReadOnly(metadata)&&VfsMountReadOnly(directory));
+    assert(VfsMountNamespaceRemount(ns,bind,2)==-1);
     assert(!VfsPathOpen(path,VFS_O_WRITE,&error)&&error==-30);
-    reader=VfsPathOpen(path,VFS_O_READ,&error);assert(reader&&!error);assert(!VfsMountNamespaceRemount(ns,bind,7));
+    reader=VfsPathOpen(path,VFS_O_READ,&error);assert(reader&&!error);assert(!VfsMountNamespaceRemount(ns,bind,7));assert(VfsMountNamespaceRemount(ns,bind,3)==-1);
     uint64_t offset=0;VnodeTime times[2]{};
     assert(VfsWrite(reader,"x",1,&offset)==-30&&VfsAppend(reader,"x",1,&offset)==-30&&VfsTruncate(reader,0)==-30);
     assert(VfsChmod(directory,0700)==-30&&VfsChown(directory,0,0)==-30&&VfsSetTimes(directory,times)==-30);
