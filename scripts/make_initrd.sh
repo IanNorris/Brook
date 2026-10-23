@@ -87,7 +87,7 @@ echo "Hello from initrd!" | mcopy -i "${INITRD_IMG}.tmp" - "::TEST/HELLO.TXT"
 # LibreOffice user profile, XDG_RUNTIME_DIR).
 mmd -i "${INITRD_IMG}.tmp" "::TMP" 2>/dev/null || true
 
-# The kernel implements named shared-memory opens under /dev/shm. Provide the
+# The kernel mounts a real tmpfs for shared-memory files at /dev/shm. Provide the
 # directory so applications discover that backend on a fresh boot.
 mmd -i "${INITRD_IMG}.tmp" "::DEV" "::DEV/SHM"
 

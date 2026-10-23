@@ -14,13 +14,15 @@ import tempfile
 import time
 
 
-def describe(path):
+def describe(path, include_tail=False):
     with path.open('rb') as stream:
         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
         size = path.stat().st_size
-        stream.seek(max(0, size - 3072))
-        tail = stream.read().decode(errors='replace')
-    return dict(path=str(path), bytes=size, sha256=digest, tail=tail)
+        result = dict(path=str(path), bytes=size, sha256=digest)
+        if include_tail:
+            stream.seek(max(0, size - 3072))
+            result['tail'] = stream.read().decode(errors='replace')
+    return result
 
 
 def main():
@@ -31,6 +33,8 @@ def main():
     parser.add_argument('--skip-bootstrap', action='store_true',
                         help='Diagnostic: use the already staged client without testing its updater')
     parser.add_argument('--display', default=':0', help='An already running Xwayland display')
+    parser.add_argument('--include-log-tail', action='store_true',
+                        help='Opt in to exporting bounded raw log text; default reports paths and hashes only')
     args = parser.parse_args()
     if os.geteuid() == 0:
         parser.error('run as the desktop user')
@@ -96,7 +100,8 @@ def main():
     # empty-group/EOF result is required before extracting final log files.
     outcome = dict(exit=result.returncode, elapsed_s=time.monotonic() - started,
                    log_snapshot='wrapper_exit; descendants may append',
-                   stdout=describe(evidence / 'stdout.log'), stderr=describe(evidence / 'stderr.log'))
+                   stdout=describe(evidence / 'stdout.log', args.include_log_tail),
+                   stderr=describe(evidence / 'stderr.log', args.include_log_tail))
     (evidence / 'result.json').write_text(json.dumps(outcome, indent=2) + '\n')
     print(json.dumps(outcome), flush=True)
     return result.returncode

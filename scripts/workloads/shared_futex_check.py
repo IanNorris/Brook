@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """VM-only x86-64 shared-memfd futex regression, including different-VA rights."""
 import array
+import argparse
 import ctypes as c
 import errno
 import json
@@ -11,6 +12,7 @@ import socket
 import struct
 import time
 import threading
+import tempfile
 
 libc = c.CDLL(None, use_errno=True)
 call = libc.syscall
@@ -30,7 +32,15 @@ def futex(addr, op, value, timeout=None, mask=0xffffffff):
     return result, c.get_errno()
 
 
-def remap_race(private):
+def new_file(directory, name):
+    if directory is None:
+        return os.memfd_create(name, os.MFD_CLOEXEC)
+    fd,path=tempfile.mkstemp(prefix=name+'-',dir=directory)
+    os.unlink(path)
+    return fd
+
+
+def remap_race(private, directory=None):
     """Stress admission against replacement mappings; not a deterministic hook."""
     map_page = libc.mmap
     map_page.argtypes = [c.c_void_p, c.c_size_t, c.c_int, c.c_int, c.c_int, c.c_long]
@@ -38,7 +48,7 @@ def remap_race(private):
     unmap = libc.munmap
     unmap.argtypes = [c.c_void_p, c.c_size_t]
     unmap.restype = c.c_int
-    descriptors = [os.memfd_create('futex-remap') for _ in range(2)]
+    descriptors = [new_file(directory, 'futex-remap') for _ in range(2)]
     for fd in descriptors:
         os.ftruncate(fd, 4096)
         os.pwrite(fd, struct.pack('I', 7), 0)
@@ -72,15 +82,15 @@ def remap_race(private):
     return replacements[0]
 
 
-def main():
+def main(directory=None):
     cases = []
     def run(name, offset=0, private=False, bitset=False, anonymous=False, interrupt=False, cancel=False):
-        fd = -1 if anonymous else os.memfd_create('brook-futex-check', os.MFD_CLOEXEC)
+        fd = -1 if anonymous else new_file(directory, 'brook-futex-check')
         if fd >= 0:
             os.ftruncate(fd, 8192)
         view = mmap.mmap(fd, 8192, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
         view[0:4] = struct.pack('I', 7); view[4096:4100] = struct.pack('I', 7)
-        other = os.memfd_create('brook-futex-other', os.MFD_CLOEXEC); os.ftruncate(other, 8192)
+        other = new_file(directory, 'brook-futex-other'); os.ftruncate(other, 8192)
         unrelated = mmap.mmap(other, 8192, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
         a, b = socket.socketpair()
         pid = os.fork()
@@ -173,12 +183,15 @@ def main():
     remaps = {}
     for private in (False, True):
         label = 'private-remap-race' if private else 'shared-remap-race'
-        remaps[label] = remap_race(private)
+        remaps[label] = remap_race(private, directory)
         cases.append(label)
     print(json.dumps(dict(passed=True, cases=cases, remaps=remaps,
-                         scope='shared memfd identity/offset, private isolation, cleanup and remap stress')), flush=True)
+                         backing='file' if directory else 'memfd',
+                         scope='shared object identity/offset, private isolation, cleanup and remap stress')), flush=True)
 
 
 if __name__ == '__main__':
     signal.alarm(90)
-    main()
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--directory',help='Use ordinary unlinked files on this filesystem instead of memfd')
+    main(parser.parse_args().directory)

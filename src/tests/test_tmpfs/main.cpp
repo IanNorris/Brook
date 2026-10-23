@@ -20,6 +20,8 @@ std::unordered_map<brook::KMutex *, std::unique_ptr<std::mutex>> locks;
 thread_local long failAllocation = -1;
 thread_local brook::Process process{};
 uint64_t rtcSeconds = 1792707600;
+bool mappingTest = false,failFrame = false;
+std::unordered_map<uint64_t,unsigned> frames;
 } // namespace
 extern "C" [[noreturn]] void KernelPanic(const char *, ...)
 {
@@ -137,16 +139,20 @@ uint64_t RtcNow()
 }
 PhysicalAddress PmmAllocPage(MemTag, uint16_t)
 {
-    assert(false && "tmpfs ordinary I/O must not allocate canonical pages");
-    return {};
+    assert(mappingTest && "tmpfs ordinary I/O must not allocate canonical pages");
+    if(failFrame)return {};
+    void* memory=nullptr;assert(!posix_memalign(&memory,4096,4096));
+    auto address=reinterpret_cast<uint64_t>(memory);
+    assert(frames.emplace(address,1).second);return PhysicalAddress(address);
 }
-void PmmRefPage(PhysicalAddress)
+void PmmRefPage(PhysicalAddress page)
 {
-    assert(false);
+    assert(frames.at(page.raw()));++frames.at(page.raw());
 }
-void PmmUnrefPage(PhysicalAddress)
+void PmmUnrefPage(PhysicalAddress page)
 {
-    assert(false);
+    assert(frames.at(page.raw()));
+    if(!--frames.at(page.raw())) {frames.erase(page.raw());std::free(reinterpret_cast<void*>(page.raw()));}
 }
 extern "C" void VfsClose(Vnode *vn)
 {
@@ -191,12 +197,51 @@ static Vnode *create(VfsObject *p, const char *name)
 static void clean()
 {
     auto s = TmpfsGlobalUsage();
-    assert(!s.bytes && !s.inodes && !s.mounts && allocations.empty());
+    assert(!s.bytes && !s.inodes && !s.mounts && allocations.empty() && frames.empty());
+}
+static void mappedQuota()
+{
+    mappingTest=true;
+    for(int fail=-1;fail<3;++fail) {
+        auto* fs=make();auto* r=root(fs);auto* f=create(r,"sparse");auto* object=f->ops->file_object(f);
+        assert(!FileObjectTruncateUnmapped(object,f,8192));
+        failAllocation=fail;failFrame=fail==2;
+        int error=0;auto page=FileObjectGetPage(object,f,0,true,&error);
+        failAllocation=-1;failFrame=false;
+        if(fail>=0)assert(!page && (error==-12 || error==-28));
+        else {
+            assert(page && !error && frames.size()==1);
+            auto charged=fs->bytes;
+            auto alias=FileObjectGetPage(object,f,0,true,&error);assert(alias==page && fs->bytes==charged);
+            PmmUnrefPage(alias);PmmUnrefPage(page);
+            assert(!FileObjectTruncateUnmapped(object,f,0) && frames.empty());
+        }
+        assert(!r->ops->remove(r,"sparse",false));VfsClose(f);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
+    }
+    auto* fs=make();auto* r=root(fs);auto* f=create(r,"sparse");auto* object=f->ops->file_object(f);
+    assert(!FileObjectTruncateUnmapped(object,f,8192));
+    int error=0;auto page=FileObjectGetPage(object,f,0,true,&error);assert(page && !error);
+    assert(FindPage(VnodeNode(f),0)); // Persistent writeback storage exists before exposure.
+    KMutexLock(&object->gate);assert(FileObjectExposeWritableLocked(object,f,0,page));KMutexUnlock(&object->gate);
+    reinterpret_cast<unsigned char*>(page.raw())[0]=0x5a;
+    auto spare=InstanceBytes-fs->bytes;assert(Reserve(fs,spare));
+    auto before=fs->bytes;
+    auto denied=FileObjectGetPage(object,f,1,true,&error);assert(!denied && error==-28 && fs->bytes==before);
+    assert(!FileObjectWriteback(object,f,0,4096)); // No ENOSPC despite zero spare quota.
+    char value=0;uint64_t offset=0;assert(f->ops->read(f,&value,1,&offset)==1 && value==0x5a);
+    assert(!r->ops->remove(r,"sparse",false));PmmUnrefPage(page);
+    assert(f->refCount==2);--f->refCount; // Close user description; queue is final vnode owner.
+    // Snapshot allocation itself is outside tmpfs quota. Draining must reclaim
+    // the inode even when the filesystem has no spare capacity.
+    assert(!FileObjectWritebackAll() && frames.empty());
+    Unreserve(fs,spare);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
+    mappingTest=false;
 }
 int main()
 {
     identity(1000);
     clean();
+    mappedQuota();
     {
         auto* fs=make();auto* r=root(fs);int error=0;
         auto* fifo=r->ops->create_fifo(r,"fifo",0640,&error);assert(fifo && !error && fifo->type==VnodeType::Device);
@@ -246,7 +291,7 @@ int main()
     assert(FileObjectRead(file->ops->file_object(file), file, buffer, 10, &off) == 10 && buffer[0] == 'A');
     for (unsigned i = 1; i < 10; ++i)
         assert(!buffer[i]);
-    assert(file->ops->deny_mapping);
+    assert(!file->ops->deny_mapping);
     VfsObject *missing = nullptr;
     assert(r2->ops->lookup(r2, "file", &missing, false) == -2 && !missing);
     assert(!r->ops->mkdir(r, "dir", 0755));

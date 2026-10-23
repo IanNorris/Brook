@@ -32,6 +32,14 @@ struct FileObject {
     Vnode* writebackVnode;
     FileObject* writebackNext;
     FileObjectPage* pages[64];
+    // Optional backend quota for canonical frames and their metadata. Installed
+    // before inode publication. Release must be non-sleeping (IRQ final-close).
+    void* pageBudgetContext;
+    bool (*reservePageBytes)(void*,uint64_t);
+    void (*releasePageBytes)(void*,uint64_t);
+    // Under inode gate, before canonical allocation/exposure. Backends may
+    // materialize sparse storage so later shared writeback cannot need quota.
+    int (*prepareBackingPage)(void*,uint64_t);
 };
 void FileObjectInit(FileObject* object);
 // Quiescent last-inode release only: no sleeping locks or I/O; IRQ-close safe.

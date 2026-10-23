@@ -62,8 +62,12 @@ FileObjectPage* Find(FileObject* object,uint64_t index) {
         if(page->index==index) return page;
     return nullptr;
 }
-void Release(FileObjectPage* page) {
-    while(page) { auto* next=page->next;PmmUnrefPage(page->physical);kfree(page);page=next; }
+void Release(FileObject* object,FileObjectPage* page) {
+    while(page) {
+        auto* next=page->next;PmmUnrefPage(page->physical);kfree(page);
+        if(object->releasePageBytes)object->releasePageBytes(object->pageBudgetContext,4096+sizeof(FileObjectPage));
+        page=next;
+    }
 }
 void Overlay(FileObject* object,uint64_t offset,void* buffer,uint64_t length,bool write) {
     auto* bytes=static_cast<uint8_t*>(buffer);
@@ -151,17 +155,23 @@ void FileObjectInit(FileObject* object) {
     object->recordLocks.head=nullptr;
     KMutexInit(&object->gate);KMutexInit(&object->ioOffsetGate);object->generation=1;
     object->mappingError=0;object->privateValidPrefix=~uint64_t{0};
-    object->orderId=__atomic_add_fetch(&nextIdentity,1,__ATOMIC_RELAXED);
-    if(!object->orderId)KernelPanic("file object: ordering identity exhausted");
+    uint64_t previous=__atomic_load_n(&nextIdentity,__ATOMIC_RELAXED);
+    for(;;) {
+        if(previous>=((uint64_t{1}<<62)-1))KernelPanic("file object: ordering identity exhausted");
+        if(__atomic_compare_exchange_n(&nextIdentity,&previous,previous+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))break;
+    }
+    object->orderId=previous+1;
     object->mappings=nullptr;
     object->mappingRegistrations=0;object->writebackVnode=nullptr;object->writebackNext=nullptr;
+    object->pageBudgetContext=nullptr;object->reservePageBytes=nullptr;object->releasePageBytes=nullptr;
+    object->prepareBackingPage=nullptr;
     for(auto& bucket:object->pages)bucket=nullptr;
 }
 void FileObjectDispose(FileObject* object) {
     if(object->recordLocks.head)KernelPanic("file object: disposing record locks");
     if(object->mappings || object->mappingRegistrations || object->writebackVnode)
         KernelPanic("file object: disposing retained inode");
-    for(auto& bucket:object->pages) { auto* pages=bucket;bucket=nullptr;Release(pages); }
+    for(auto& bucket:object->pages) { auto* pages=bucket;bucket=nullptr;Release(object,pages); }
 }
 static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t index,bool load,int* error,bool* loaded,
                                      const VnodeStat* knownStat=nullptr) {
@@ -174,10 +184,19 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     VnodeStat stat{};int result=0;
     if(knownStat)stat=*knownStat;else result=vnode->ops->stat(vnode,&stat);
     if(result || index*4096>=stat.size) { if(error)*error=result?result:-6;return PhysicalAddress{}; }
+    if(object->prepareBackingPage) {
+        int prepared=object->prepareBackingPage(object->pageBudgetContext,index);
+        if(prepared) {if(error)*error=prepared;return PhysicalAddress{};}
+    }
+    constexpr uint64_t charge=4096+sizeof(FileObjectPage);
+    if(object->reservePageBytes && !object->reservePageBytes(object->pageBudgetContext,charge)) {
+        if(error)*error=-28;return PhysicalAddress{};
+    }
+    auto rollback=[&] {if(object->releasePageBytes)object->releasePageBytes(object->pageBudgetContext,charge);};
     auto* page=static_cast<FileObjectPage*>(kmalloc(sizeof(FileObjectPage)));
-    if(!page) { if(error)*error=-12;return PhysicalAddress{}; }
+    if(!page) { rollback();if(error)*error=-12;return PhysicalAddress{}; }
     auto physical=PmmAllocPage(MemTag::User,KernelPid);
-    if(!physical) { kfree(page);if(error)*error=-12;return PhysicalAddress{}; }
+    if(!physical) { kfree(page);rollback();if(error)*error=-12;return PhysicalAddress{}; }
     auto* bytes=reinterpret_cast<void*>(PhysToVirt(physical).raw());memset(bytes,0,4096);
     uint64_t offset=index*4096;
     uint64_t required=stat.size-offset;if(required>4096)required=4096;
@@ -185,7 +204,7 @@ static PhysicalAddress GetPageLocked(FileObject* object,Vnode* vnode,uint64_t in
     while(done<required) {
         result=vnode->ops->read(vnode,static_cast<uint8_t*>(bytes)+done,required-done,&offset);
         if(result<=0 || static_cast<uint64_t>(result)>required-done) {
-            PmmUnrefPage(physical);kfree(page);
+            PmmUnrefPage(physical);kfree(page);rollback();
             if(error)*error=result<0?result:-5;
             return PhysicalAddress{};
         }
@@ -314,7 +333,7 @@ void FileObjectCompleteMappingRecoveryLocked(FileObject* object) {
     RequireGate(object);
     if(!object->mappingError)KernelPanic("file object: recovery without quarantine");
     if(object->generation==~uint64_t{0})KernelPanic("file object: generation exhausted");
-    for(auto& bucket:object->pages) { auto* retired=bucket;bucket=nullptr;Release(retired); }
+    for(auto& bucket:object->pages) { auto* retired=bucket;bucket=nullptr;Release(object,retired); }
     object->mappingError=0;object->privateValidPrefix=~uint64_t{0};++object->generation;
 }
 bool FileObjectExposeWritableLocked(FileObject* object,Vnode* vnode,uint64_t index,PhysicalAddress physical) {
@@ -429,7 +448,7 @@ int FileObjectWritebackAll() {
                     retired=object->writebackVnode;object->writebackVnode=nullptr;
                     IrqSpinLockRelease(&writebackLock,flags);
                     if(object->mappingError) {
-                        for(auto& bucket:object->pages) { auto* pages=bucket;bucket=nullptr;Release(pages); }
+                        for(auto& bucket:object->pages) { auto* pages=bucket;bucket=nullptr;Release(object,pages); }
                     } else for(auto* bucket:object->pages)for(auto* page=bucket;page;page=page->next)page->writeExposed=false;
                 }
             }
@@ -493,7 +512,7 @@ int FileObjectTruncateUnmapped(FileObject* object,Vnode* vnode,uint64_t length) 
         for(unsigned i=0;i<64;++i) { retired[i]=object->pages[i];object->pages[i]=nullptr; }
         ++object->generation;
     }
-    for(auto* bucket:retired)Release(bucket);
+    for(auto* bucket:retired)Release(object,bucket);
     return result;
 }
 }

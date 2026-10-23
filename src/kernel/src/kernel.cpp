@@ -26,6 +26,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "vfs.h"
 #include "vfs_path.h"
 #include "tmpfs.h"
+#include "mount_namespace.h"
 #include "virtio_blk.h"
 #include "gpt.h"
 #include "syscall.h"
@@ -533,6 +534,29 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::VfsMount("/proc", "procfs", 0);
     const int nullAnchor=brook::VfsCanonicalDeviceAnchorInitialize();
     brook::SerialPrintf("VFS: canonical device parent anchor result=%d\n",nullAnchor);
+    // A real retained filesystem must survive directory binds into containers;
+    // the historical pathname-only shm broker cannot serve those namespaces.
+    {
+        brook::VfsPath root{},target{};
+        int error=brook::VfsPathRoot(&root);
+        if(!error) {
+            brook::VnodeStat stat{};
+            error=brook::VfsStatAt(root,root,"/dev/shm",&stat);
+            if(error==-2)error=brook::VfsMkdirAt(root,root,"/dev/shm",01777,0);
+            if(!error)error=brook::VfsPathResolve(root,root,"/dev/shm",&target);
+        }
+        if(!error) {
+            auto* instance=brook::TmpfsCreate(0,0,nullptr,6,&error);
+            if(instance) {
+                error=brook::VfsMountNamespaceMountFresh(brook::VfsMountNamespaceInitial(),target,
+                    "tmpfs",brook::TmpfsOperations(),instance,0,6);
+                if(error)brook::TmpfsDestroy(instance);
+            }
+        }
+        brook::VfsPathRelease(target);brook::VfsPathRelease(root);
+        if(error)KernelPanic("canonical /dev/shm tmpfs mount failed: %d",error);
+        brook::SerialPuts("VFS: canonical /dev/shm tmpfs ready (01777,nodev,nosuid)\n");
+    }
 
     // ---- QEMU fw_cfg ----
     brook::FwCfgInit();

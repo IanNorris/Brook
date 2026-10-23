@@ -53,9 +53,12 @@ int main(int argc,char** argv) {
   CK(!fchown(f,0,0));CK(!fstat(f,&sa)&&sa.st_uid==0&&sa.st_gid==0);
   errno=0;CK(fchown(f,12345,(gid_t)-1)==-1&&errno==EINVAL);
   CK(!fchownat(da,"value",0,0,0));
-  for(int shared=0;shared<2;++shared){errno=0;CK(mmap(NULL,4096,PROT_READ|PROT_WRITE,shared?MAP_SHARED:MAP_PRIVATE,f,0)==MAP_FAILED&&errno==EOPNOTSUPP);}
-  void* sentinel=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CK(sentinel!=MAP_FAILED);*(volatile unsigned char*)sentinel=0x5a;
-  errno=0;CK(mmap(sentinel,4096,PROT_READ,MAP_PRIVATE|MAP_FIXED,f,0)==MAP_FAILED&&errno==EOPNOTSUPP);CK(*(volatile unsigned char*)sentinel==0x5a);CK(!munmap(sentinel,4096));
+  for(int shared=0;shared<2;++shared){
+   char* view=mmap(NULL,4096,PROT_READ|PROT_WRITE,shared?MAP_SHARED:MAP_PRIVATE,f,0);CK(view!=MAP_FAILED);CK(!memcmp(view,"one",3));
+   view[0]='X';char first=0;CK(pread(f,&first,1,0)==1&&first==(shared?'X':'o'));
+   if(shared){CK(!msync(view,4096,MS_SYNC));view[0]='o';CK(!msync(view,4096,MS_SYNC));}
+   errno=0;CK(ftruncate(f,0)==-1&&errno==EBUSY);CK(!munmap(view,4096));
+  }
   errno=0;CK(mount("tmpfs",b,"tmpfs",MS_NODEV|MS_NOSUID,"size=1M")==-1&&errno==EINVAL);
   struct stat preserved;CK(!stat(b,&preserved)&&preserved.st_dev==sb.st_dev);
   errno=0;CK(mount("tmpfs",b,"tmpfs",MS_NODEV|MS_NOSUID|MS_NOEXEC,NULL)==-1&&errno==EINVAL);
@@ -68,7 +71,7 @@ int main(int argc,char** argv) {
   while((n=write(f,fill,sizeof(fill)))>0){total+=(size_t)n;CK(total<16*1024*1024);}
   CK(n==-1&&errno==ENOSPC&&total>15*1024*1024);
   struct stat exhausted;CK(!fstat(f,&exhausted)&&exhausted.st_size==(off_t)(total+3));off_t stopped=lseek(f,0,SEEK_CUR);CK(stopped==exhausted.st_size);errno=0;CK(write(f,fill,1)==-1&&errno==ENOSPC);CK(lseek(f,0,SEEK_CUR)==stopped);struct stat unchanged;CK(!fstat(f,&unchanged)&&unchanged.st_size==exhausted.st_size);
-  struct statvfs held,reclaimed;CK(!fstatvfs(da,&held));CK(!close(f));CK(!fstatvfs(da,&reclaimed));CK(reclaimed.f_bfree>held.f_bfree&&reclaimed.f_ffree==held.f_ffree+1);
+  struct statvfs held,reclaimed;CK(!fstatvfs(da,&held));CK(!close(f));sync();CK(!fstatvfs(da,&reclaimed));CK(reclaimed.f_bfree>held.f_bfree&&reclaimed.f_ffree==held.f_ffree+1);
   f=openat(da,"resize",O_CREAT|O_EXCL|O_RDWR,0600);CK(f>=0);CK(!unlinkat(da,"resize",0));
  }
  CK(!ftruncate(f,1ULL<<33));CK(pread(f,text,1,(1ULL<<33)-1)==1&&text[0]==0);CK(pwrite(f,"Z",1,(1ULL<<33)-1)==1);CK(!ftruncate(f,3));CK(!close(f));

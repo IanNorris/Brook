@@ -1,5 +1,8 @@
 # Steam GLX checkpoint — 23 October 2026
 
+The subsequent [shared-memory checkpoint](steam-shared-memory-checkpoint.md)
+addresses the controller IPC and `/dev/shm` boundary described below.
+
 Hardware GLX now creates a real X11 window, binds an OpenGL 4.6 context on
 virgl / Intel UHD Graphics 630, clears it red and reads back exactly
 `[255, 0, 0, 255]`, with no GL or X errors. This is a rendering compatibility

@@ -594,7 +594,7 @@ static uint64_t NextMemFdInode()
     for(;;) {
         // The high owner bit distinguishes shared futex keys from task IDs.
         // Saturate instead of ever reusing an identity after wraparound.
-        if(candidate>=(uint64_t{1}<<63))return 0;
+        if(candidate>=(uint64_t{1}<<62))return 0;
         if(__atomic_compare_exchange_n(&next,&candidate,candidate+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))return candidate;
     }
 }
@@ -12388,7 +12388,7 @@ static constexpr int FUTEX_WAKE_BITSET  = 10;
 static constexpr int FUTEX_PRIVATE_FLAG    = 128;
 static constexpr int FUTEX_CLOCK_REALTIME  = 256;
 
-// Futex wait queues use private TGID/VA keys or tagged shared-memfd inode/offset
+// Futex wait queues use private TGID/VA keys or tagged shared-object/offset
 // keys. Waiters retain the chosen value key through wake, timeout and cancellation.
 static constexpr uint32_t FUTEX_HASH_SIZE = 64;
 
@@ -12605,7 +12605,7 @@ static int64_t FutexTimeoutDeadline(int op, uint64_t opVal, uint64_t timeoutAddr
         ? 0 : -EINVAL;
 }
 
-// A shared memfd's monotonic inode is a value identity, not an allocator or
+// Shared memfd/file monotonic IDs are value identities, not an allocator or
 // physical-page address. WAIT keeps its mapping transaction through comparison
 // and queue insertion, then releases both locks before sleeping. Existing
 // aliases keep the object alive; final unmap cannot reuse this key for a new
@@ -12615,15 +12615,23 @@ static int FutexMappedKey(Process* process,uint64_t address,uint64_t operation,
 {
     owner=process?process->tgid:0;keyAddress=address;
     if(address&3)return -EINVAL;
-    if((operation&FUTEX_PRIVATE_FLAG) || !range || range->kind!=MappingKind::MemFd ||
+    if((operation&FUTEX_PRIVATE_FLAG) || !range ||
        range->sharing!=MappingSharing::Shared || !range->backing)return 0;
-    auto* memory=static_cast<MemFdData*>(range->backing->object);
     constexpr uint64_t SharedDomain=uint64_t{1}<<63;
+    constexpr uint64_t FileDomain=uint64_t{1}<<62;
+    uint64_t identity=0,domain=SharedDomain;
+    if(range->kind==MappingKind::MemFd) {
+        auto* memory=static_cast<MemFdData*>(range->backing->object);
+        if(memory)identity=memory->inode;
+    } else if(range->kind==MappingKind::File && range->backing->file) {
+        identity=range->backing->file->orderId;
+        domain|=FileDomain;
+    } else return 0;
     // Reject exhaustion before publishing a key in the tagged owner domain.
-    if(!memory || !memory->inode || memory->inode>=SharedDomain)return -75;
+    if(!identity || identity>=FileDomain)return -75;
     const uint64_t displacement=address-range->begin;
     if(range->offset>~uint64_t{0}-displacement)return -75;
-    owner=SharedDomain|memory->inode;keyAddress=range->offset+displacement;
+    owner=domain|identity;keyAddress=range->offset+displacement;
     return 0;
 }
 static int FutexResolveKey(Process* process,uint64_t address,uint64_t operation,

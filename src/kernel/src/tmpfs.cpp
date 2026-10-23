@@ -69,6 +69,7 @@ struct Node
     char name[256];
     FileObject file;
 };
+int PrepareBackingPage(void* context,uint64_t index);
 struct Guard
 {
     Tmpfs *fs;
@@ -219,6 +220,10 @@ Node *NewNode(Tmpfs *fs, uint16_t mode, uint32_t uid, uint32_t gid)
     n->linked = true;
     n->atime = n->mtime = n->ctime = Now();
     FileObjectInit(&n->file);
+    n->file.pageBudgetContext=n;
+    n->file.reservePageBytes=[](void* context,uint64_t bytes) {return Reserve(static_cast<Node*>(context)->fs,bytes);};
+    n->file.releasePageBytes=[](void* context,uint64_t bytes) {Unreserve(static_cast<Node*>(context)->fs,bytes);};
+    n->file.prepareBackingPage=PrepareBackingPage;
     return n;
 }
 // Capture process authority before the backend mutex. Group lists are immutable.
@@ -448,6 +453,20 @@ Page *FindPage(Node *n, uint64_t index)
         if (p->index == index)
             return p;
     return nullptr;
+}
+int PrepareBackingPage(void* context,uint64_t index)
+{
+    auto* n=static_cast<Node*>(context);
+    Guard held(n->fs);
+    if(FindPage(n,index))return 0;
+    // Materialize sparse storage before exposing a canonical page. Writeback
+    // then needs no persistent allocation, even at quota exhaustion. This can
+    // leave a charged zero page if a later canonical allocation fails; it does
+    // not extend EOF and ordinary inode teardown reclaims it.
+    auto* page=static_cast<Page*>(Allocate(n->fs,sizeof(Page)));
+    if(!page)return -28;
+    page->index=index;page->next=n->pages;n->pages=page;
+    return 0;
 }
 int Read(Vnode *vn, void *buffer, uint64_t length, uint64_t *offset)
 {
@@ -698,7 +717,7 @@ const VnodeOps regularOps = {.open = nullptr,
                              .chown = Vchown,
                              .space = Space,
                              .access = AccessVnode,
-                             .deny_mapping = true};
+                             .deny_mapping = false};
 const VnodeOps metadataOps = {.open = nullptr,
                               .read = nullptr,
                               .write = nullptr,

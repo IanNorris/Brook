@@ -1,5 +1,9 @@
 # Bounded tmpfs backend
 
+Historical backend checkpoint. The later [shared-memory checkpoint](steam-shared-memory-checkpoint.md)
+adds quota-accounted file mappings and provisions canonical `/dev/shm` at boot;
+the original mapping rejection below describes the earlier implementation.
+
 Status (2026-10-22): implementation, Linux comparison, native acceptance and
 checked teardown pass. This checkpoint adds a real memory filesystem through the
 [independent-instance mount API](tmpfs-foundation-checkpoint.md).
