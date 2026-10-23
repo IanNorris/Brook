@@ -534,6 +534,13 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::VfsMount("/proc", "procfs", 0);
     const int nullAnchor=brook::VfsCanonicalDeviceAnchorInitialize();
     brook::SerialPrintf("VFS: canonical device parent anchor result=%d\n",nullAnchor);
+    // Charge tmpfs lazily, within a boot-available-RAM aggregate ceiling. The
+    // desktop gets half that budget; ordinary container mounts retain their
+    // smaller default unless the caller requests an explicit size.
+    // The PMM total is an address-space high-water mark and includes holes.
+    const uint64_t tmpfsBudget=(brook::PmmGetFreePageCount()*4096/8)&~uint64_t{4095};
+    if(brook::TmpfsConfigureByteBudget(tmpfsBudget))KernelPanic("tmpfs memory budget initialization failed");
+    const uint64_t desktopShmBytes=tmpfsBudget/2 & ~uint64_t{4095};
     // A real retained filesystem must survive directory binds into containers;
     // the historical pathname-only shm broker cannot serve those namespaces.
     {
@@ -549,7 +556,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             // Desktop browser shared-memory pools exceed the namespace tmpfs
             // default. This is a quota, not an up-front physical reservation;
             // the global tmpfs budget still bounds aggregate allocations.
-            auto* instance=brook::TmpfsCreate(0,0,nullptr,6,&error,01777,128ULL*1024*1024);
+            auto* instance=brook::TmpfsCreate(0,0,nullptr,6,&error,01777,desktopShmBytes);
             if(instance) {
                 error=brook::VfsMountNamespaceMountFresh(brook::VfsMountNamespaceInitial(),target,
                     "tmpfs",brook::TmpfsOperations(),instance,0,6);
@@ -558,7 +565,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
         brook::VfsPathRelease(target);brook::VfsPathRelease(root);
         if(error)KernelPanic("canonical /dev/shm tmpfs mount failed: %d",error);
-        brook::SerialPuts("VFS: canonical /dev/shm tmpfs ready (128MiB,01777,nodev,nosuid)\n");
+        brook::SerialPrintf("VFS: canonical /dev/shm tmpfs ready (quota=%lu,global=%lu,01777,nodev,nosuid)\n",(unsigned long)desktopShmBytes,(unsigned long)tmpfsBudget);
     }
 
     // ---- QEMU fw_cfg ----

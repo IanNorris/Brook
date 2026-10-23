@@ -1250,6 +1250,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->ttyEcho = parent->ttyEcho;
     child->straceEnabled = parent->straceEnabled;
     child->straceErrorsOnly = parent->straceErrorsOnly;
+    child->straceFilter = parent->straceFilter;
 
     // Inherit parent's signal handlers (POSIX fork semantics).
     // The table is indexed by group identity, so we must explicitly copy;

@@ -19,7 +19,7 @@ inline int ParseTmpfsMountOptions(const char* text,TmpfsMountOptions* out)
             p+=5;
             uint64_t value=0;unsigned digits=0;
             const unsigned radix=mode?8:10;
-            const uint64_t limit=mode?07777:TmpfsMaximumBytes;
+            const uint64_t limit=mode?07777:TmpfsMaximumBytes();
             while(*p>='0' && *p<='9') {
                 const unsigned digit=unsigned(*p-'0');
                 if(digit>=radix || value>(limit-digit)/radix)return -22;
@@ -31,7 +31,7 @@ inline int ParseTmpfsMountOptions(const char* text,TmpfsMountOptions* out)
                 if(*p=='k' || *p=='K'){shift=10;++p;}
                 else if(*p=='m' || *p=='M'){shift=20;++p;}
                 else if(*p=='g' || *p=='G'){shift=30;++p;}
-                if(!value || value>(TmpfsMaximumBytes>>shift))return -22;
+                if(!value || value>(TmpfsMaximumBytes()>>shift))return -22;
                 value<<=shift;
                 options.bytes=(value+4095)&~uint64_t{4095};
             } else options.mode=uint16_t(value);

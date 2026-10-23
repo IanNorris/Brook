@@ -248,14 +248,28 @@ MappingFaultResult FileObjectFaultPages(FileObject* object,Vnode* vnode,uint64_t
     for(uint32_t i=0;i<capacity;++i)pages[i]=PhysicalAddress{};
     if(index>~uint64_t{0}/4096)return MappingFaultResult::EndOfFile;
     Gate held(object);
-    if(object->mappingError)return MappingFaultResult::IoError;
+    auto failure=[&](MappingFaultResult result,int error,uint64_t size) {
+#ifndef BROOK_HOST_TEST
+        static uint32_t reports;
+        if(__atomic_fetch_add(&reports,1,__ATOMIC_RELAXED)<32)
+            SerialPrintf("FILEFAULT pid=%u object=%lu index=%lu size=%lu error=%d result=%u quarantine=%d generation=%lu\n",
+                ProcessCurrent()?ProcessCurrent()->pid:0,
+                (unsigned long)object->orderId,(unsigned long)index,
+                (unsigned long)size,error,(unsigned)result,object->mappingError,
+                (unsigned long)object->generation);
+#else
+        (void)error;(void)size;
+#endif
+        return result;
+    };
+    if(object->mappingError)return failure(MappingFaultResult::IoError,object->mappingError,0);
     VnodeStat stat{};
     const int statResult=vnode->ops->stat(vnode,&stat);
-    if(statResult)return statResult==-12?MappingFaultResult::OutOfMemory:MappingFaultResult::IoError;
-    if(index*4096>=stat.size)return MappingFaultResult::EndOfFile;
+    if(statResult)return failure(statResult==-12?MappingFaultResult::OutOfMemory:MappingFaultResult::IoError,statResult,0);
+    if(index*4096>=stat.size)return failure(MappingFaultResult::EndOfFile,-6,stat.size);
     int error=0;pages[0]=GetPageLocked(object,vnode,index,true,&error,loaded,&stat);
-    if(!pages[0])return error==-12?MappingFaultResult::OutOfMemory:
-                       MappingFaultResult::IoError;
+    if(!pages[0])return failure(error==-12?MappingFaultResult::OutOfMemory:
+                       MappingFaultResult::IoError,error,stat.size);
     for(uint32_t i=1;i<capacity;++i) {
         if(index+i>~uint64_t{0}/4096 || (index+i)*4096>=stat.size)break;
         if(auto* page=Find(object,index+i)) { PmmRefPage(page->physical);pages[i]=page->physical; }

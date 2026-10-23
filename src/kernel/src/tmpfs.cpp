@@ -19,7 +19,7 @@ namespace brook
 {
 namespace
 {
-constexpr uint64_t GlobalBytes = TmpfsMaximumBytes;
+uint64_t GlobalBytes = 256ULL * 1024 * 1024;
 constexpr uint64_t InstanceInodes = 1024, GlobalInodes = 16384, GlobalMounts = 128;
 constexpr uint16_t Regular = 0100000, Directory = 0040000, Link = 0120000, Fifo = 0010000, TypeMask = 0170000;
 struct Node;
@@ -620,7 +620,10 @@ int Space(Vnode *vn, VfsSpace *out)
     out->type = 0x01021994;
     out->blockSize = out->fragmentSize = 4096;
     out->blocks = fs->byteLimit / 4096;
-    out->freeBlocks = out->availableBlocks = (fs->byteLimit - fs->bytes) / 4096;
+    const uint64_t instanceFree=fs->byteLimit-fs->bytes;
+    const uint64_t aggregateFree=GlobalBytes-globalUsage.bytes;
+    out->freeBlocks = out->availableBlocks =
+        (instanceFree<aggregateFree?instanceFree:aggregateFree)/4096;
     out->files = InstanceInodes;
     out->freeFiles = InstanceInodes - fs->inodes;
     out->identity = fs->device;
@@ -1171,6 +1174,19 @@ const VfsFsOps *TmpfsOperations()
 {
     return &fsOps;
 }
+int TmpfsConfigureByteBudget(uint64_t bytes)
+{
+    if(bytes<TmpfsDefaultBytes || bytes>0x7ffffffffffff000ULL || (bytes&4095))return -22;
+    const auto irq=IrqSpinLockAcquire(&budgetLock);
+    int result=globalUsage.mounts || globalUsage.bytes || globalUsage.inodes ? -16 : 0;
+    if(!result)__atomic_store_n(&GlobalBytes,bytes,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&budgetLock,irq);
+    return result;
+}
+uint64_t TmpfsMaximumBytes()
+{
+    return __atomic_load_n(&GlobalBytes,__ATOMIC_ACQUIRE);
+}
 TmpfsUsage TmpfsGlobalUsage()
 {
     auto irq = IrqSpinLockAcquire(&budgetLock);
@@ -1183,12 +1199,15 @@ Tmpfs *TmpfsCreate(uint32_t uid, uint32_t gid, UserNamespace *owner, uint64_t fl
 {
     *error = 0;
     if ((flags & ~uint64_t{6}) || (rootMode & ~uint16_t{07777}) ||
-        byteLimit < 4096 || byteLimit > TmpfsMaximumBytes || (byteLimit & 4095))
+        byteLimit < 4096 || byteLimit > TmpfsMaximumBytes() || (byteLimit & 4095))
     {
         *error = -22;
         return nullptr;
     }
     auto irq = IrqSpinLockAcquire(&budgetLock);
+    if(byteLimit>GlobalBytes) {
+        IrqSpinLockRelease(&budgetLock,irq);*error=-22;return nullptr;
+    }
     bool ok = globalUsage.mounts < GlobalMounts && sizeof(Tmpfs) <= GlobalBytes - globalUsage.bytes &&
               nextDevice < (uint64_t{1} << 32);
     if (ok)

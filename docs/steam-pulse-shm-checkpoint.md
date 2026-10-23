@@ -67,14 +67,14 @@ A final temporary 256 MiB mount comparison retains at least 127,442,944 bytes
 available in 95 one-second samples, with the global ceiling unchanged. The
 quota failure disappears from those samples, but Steam still exits 135 after
 about 85 seconds. Its kernel fault report identifies an unmapped first page in
-a tracked three-page file mapping. This separates capacity pressure from a
-remaining mapping fault; it does not prove every SIGBUS was caused by quota.
+a tracked three-page file mapping. At this point only per-mount availability was recorded; this does not exclude
+exhaustion of the shared global budget or prove a separate mapping bug.
 The CEF fixed-string snapshot no longer contains the previous shared-memory
 allocation failure categories. There is still no login window. The temporary
 mount is diagnostic; the shipped desktop quota remains 128 MiB, and this is
 not a sufficient Steam capacity policy. The next investigation should identify
-the faulting backing object and page-in failure reason, rather than repeatedly
-raising quotas.
+the faulting backing object and page-in failure reason, and account for both
+per-mount and aggregate capacity.
 
 ## Evidence and scope
 

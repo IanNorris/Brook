@@ -252,6 +252,35 @@ int main()
         assert(!r->ops->remove(r,"renamed",false));assert(!fifo->ops->stat(fifo,&stat) && !stat.nlink);
         VfsClose(again);VfsObjectRelease(object);VfsClose(fifo);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
     }
+    // The boot budget scales without preallocating memory. Existing instances
+    // pin the policy so accounting cannot shrink underneath live allocations.
+    const uint64_t originalBudget=TmpfsMaximumBytes();
+    assert(TmpfsConfigureByteBudget(0)==-22);
+    assert(TmpfsConfigureByteBudget(originalBudget+1)==-22);
+    assert(TmpfsMaximumBytes()==originalBudget);
+    assert(!TmpfsConfigureByteBudget(1024ULL*1024*1024));
+    {
+        TmpfsMountOptions large{};
+        assert(!ParseTmpfsMountOptions("size=512M",&large) && large.bytes==512ULL*1024*1024);
+        int error=0;auto* custom=TmpfsCreate(1000,100,nullptr,6,&error,01777,large.bytes);
+        assert(custom && !error && TmpfsConfigureByteBudget(originalBudget)==-16);
+        auto* object=root(custom);auto* file=create(object,"budget");VfsSpace space{};
+        assert(!Space(file,&space) && space.blocks==large.bytes/4096);
+        VfsClose(file);VfsObjectRelease(object);assert(!TmpfsDestroy(custom));clean();
+    }
+    assert(!TmpfsConfigureByteBudget(originalBudget));
+    {
+        int error=0;auto* large=TmpfsCreate(1000,100,nullptr,6,&error,01777,originalBudget);
+        auto* peer=make();assert(large && !error);
+        auto* object=root(peer);auto* file=create(object,"headroom");
+        const auto remaining=originalBudget-TmpfsGlobalUsage().bytes;
+        assert(Reserve(large,remaining));
+        VfsSpace space{};assert(!Space(file,&space) && !space.availableBlocks);
+        Unreserve(large,remaining);
+        assert(!Space(file,&space) && space.availableBlocks);
+        VfsClose(file);VfsObjectRelease(object);
+        assert(!TmpfsDestroy(peer) && !TmpfsDestroy(large));clean();
+    }
     TmpfsMountOptions options{};
     assert(!ParseTmpfsMountOptions(nullptr,&options) && options.mode==01777);
     assert(!ParseTmpfsMountOptions("",&options) && options.mode==01777);
@@ -266,9 +295,9 @@ int main()
     }
     for(auto item:{std::pair{"size=1",uint64_t{4096}}, {"size=4097",uint64_t{8192}},
                    {"size=64k",uint64_t{65536}}, {"mode=0700,size=128M",uint64_t{128}*1024*1024},
-                   {"size=256M",TmpfsMaximumBytes}, {"size=1M,size=8192",uint64_t{8192}}})
+                   {"size=256M",TmpfsMaximumBytes()}, {"size=1M,size=8192",uint64_t{8192}}})
         assert(!ParseTmpfsMountOptions(item.first,&options) && options.bytes==item.second);
-    for(uint64_t quota:{uint64_t{65536},uint64_t{128}*1024*1024,TmpfsMaximumBytes}) {
+    for(uint64_t quota:{uint64_t{65536},uint64_t{128}*1024*1024,TmpfsMaximumBytes()}) {
         int error=0;auto* custom=TmpfsCreate(1000,100,nullptr,6,&error,01777,quota);assert(custom && !error);
         auto* object=root(custom);auto* file=create(object,"quota");VfsSpace space{};
         assert(!Space(file,&space) && space.blocks==quota/4096);
@@ -278,7 +307,7 @@ int main()
         assert(!Space(file,&space) && !space.availableBlocks);
         Unreserve(custom,remaining);VfsClose(file);VfsObjectRelease(object);assert(!TmpfsDestroy(custom));clean();
     }
-    for(uint64_t quota:{uint64_t{0},uint64_t{4095},uint64_t{4097},TmpfsMaximumBytes+4096}) {
+    for(uint64_t quota:{uint64_t{0},uint64_t{4095},uint64_t{4097},TmpfsMaximumBytes()+4096}) {
         int error=0;assert(!TmpfsCreate(1000,100,nullptr,6,&error,01777,quota) && error==-22);clean();
     }
     for(uint16_t mode:{uint16_t(0),uint16_t(0755),uint16_t(01777),uint16_t(07777)}) {
