@@ -369,6 +369,7 @@ static constexpr int64_t EAGAIN  = 11;
 static constexpr int64_t EINTR   = 4;
 static constexpr int64_t ENOTDIR = 20;
 static constexpr int64_t EIO     = 5;
+static constexpr int64_t ENOTSOCK = 88;
 static constexpr int64_t ENOTCONN = 107;
 static constexpr int64_t EAFNOSUPPORT = 97;
 static constexpr int64_t ECONNREFUSED = 111;
@@ -13320,6 +13321,11 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, fd);
     FdEntry* fde = descriptor.get();
+    if (!fde || fde->type == FdType::Path) return -EBADF;
+    // Libraries use ENOTSOCK to fall back from send(MSG_NOSIGNAL) to write
+    // on valid pipe/eventfd/file descriptors (for example PulseAudio pa_write).
+    if (fde->type != FdType::UnixSocket && fde->type != FdType::Socket)
+        return -ENOTSOCK;
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         if(lenVal && !UserBufferReadable(bufVal,lenVal))return -EFAULT;
@@ -13359,6 +13365,9 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, fd);
     FdEntry* fde = descriptor.get();
+    if (!fde || fde->type == FdType::Path) return -EBADF;
+    if (fde->type != FdType::UnixSocket && fde->type != FdType::Socket)
+        return -ENOTSOCK;
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         bool oldNonblock = usd ? usd->nonblock : false;

@@ -546,7 +546,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             if(!error)error=brook::VfsPathResolve(root,root,"/dev/shm",&target);
         }
         if(!error) {
-            auto* instance=brook::TmpfsCreate(0,0,nullptr,6,&error);
+            // Desktop browser shared-memory pools exceed the namespace tmpfs
+            // default. This is a quota, not an up-front physical reservation;
+            // the global tmpfs budget still bounds aggregate allocations.
+            auto* instance=brook::TmpfsCreate(0,0,nullptr,6,&error,01777,128ULL*1024*1024);
             if(instance) {
                 error=brook::VfsMountNamespaceMountFresh(brook::VfsMountNamespaceInitial(),target,
                     "tmpfs",brook::TmpfsOperations(),instance,0,6);
@@ -555,7 +558,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
         brook::VfsPathRelease(target);brook::VfsPathRelease(root);
         if(error)KernelPanic("canonical /dev/shm tmpfs mount failed: %d",error);
-        brook::SerialPuts("VFS: canonical /dev/shm tmpfs ready (01777,nodev,nosuid)\n");
+        brook::SerialPuts("VFS: canonical /dev/shm tmpfs ready (128MiB,01777,nodev,nosuid)\n");
     }
 
     // ---- QEMU fw_cfg ----

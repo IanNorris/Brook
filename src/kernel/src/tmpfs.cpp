@@ -19,7 +19,7 @@ namespace brook
 {
 namespace
 {
-constexpr uint64_t InstanceBytes = 16 * 1024 * 1024, GlobalBytes = 256 * 1024 * 1024;
+constexpr uint64_t GlobalBytes = TmpfsMaximumBytes;
 constexpr uint64_t InstanceInodes = 1024, GlobalInodes = 16384, GlobalMounts = 128;
 constexpr uint16_t Regular = 0100000, Directory = 0040000, Link = 0120000, Fifo = 0010000, TypeMask = 0170000;
 struct Node;
@@ -50,6 +50,7 @@ struct Tmpfs
     Node *root = nullptr;
     uint64_t device = 0, nextInode = 1, bytes = 0, inodes = 0;
     uint64_t flags = 0;
+    uint64_t byteLimit = TmpfsDefaultBytes;
 };
 namespace
 {
@@ -89,7 +90,7 @@ VnodeTime Now()
 bool Reserve(Tmpfs *fs, uint64_t bytes)
 {
     auto irq = IrqSpinLockAcquire(&budgetLock);
-    bool ok = bytes <= InstanceBytes - fs->bytes && bytes <= GlobalBytes - globalUsage.bytes;
+    bool ok = bytes <= fs->byteLimit - fs->bytes && bytes <= GlobalBytes - globalUsage.bytes;
     if (ok)
     {
         fs->bytes += bytes;
@@ -109,11 +110,11 @@ void Unreserve(Tmpfs *fs, uint64_t bytes)
 }
 void *Allocate(Tmpfs *fs, uint64_t bytes)
 {
-    if (bytes > InstanceBytes - sizeof(Allocation))
+    if (bytes > fs->byteLimit - sizeof(Allocation))
         return nullptr;
     const uint64_t charge = bytes + sizeof(Allocation);
     auto irq = IrqSpinLockAcquire(&budgetLock);
-    bool ok = charge <= InstanceBytes - fs->bytes && charge <= GlobalBytes - globalUsage.bytes;
+    bool ok = charge <= fs->byteLimit - fs->bytes && charge <= GlobalBytes - globalUsage.bytes;
     if (ok)
     {
         fs->bytes += charge;
@@ -618,8 +619,8 @@ int Space(Vnode *vn, VfsSpace *out)
     *out = {};
     out->type = 0x01021994;
     out->blockSize = out->fragmentSize = 4096;
-    out->blocks = InstanceBytes / 4096;
-    out->freeBlocks = out->availableBlocks = (InstanceBytes - fs->bytes) / 4096;
+    out->blocks = fs->byteLimit / 4096;
+    out->freeBlocks = out->availableBlocks = (fs->byteLimit - fs->bytes) / 4096;
     out->files = InstanceInodes;
     out->freeFiles = InstanceInodes - fs->inodes;
     out->identity = fs->device;
@@ -1177,10 +1178,12 @@ TmpfsUsage TmpfsGlobalUsage()
     IrqSpinLockRelease(&budgetLock, irq);
     return result;
 }
-Tmpfs *TmpfsCreate(uint32_t uid, uint32_t gid, UserNamespace *owner, uint64_t flags, int *error, uint16_t rootMode)
+Tmpfs *TmpfsCreate(uint32_t uid, uint32_t gid, UserNamespace *owner, uint64_t flags, int *error,
+                   uint16_t rootMode, uint64_t byteLimit)
 {
     *error = 0;
-    if ((flags & ~uint64_t{6}) || (rootMode & ~uint16_t{07777}))
+    if ((flags & ~uint64_t{6}) || (rootMode & ~uint16_t{07777}) ||
+        byteLimit < 4096 || byteLimit > TmpfsMaximumBytes || (byteLimit & 4095))
     {
         *error = -22;
         return nullptr;
@@ -1215,6 +1218,7 @@ Tmpfs *TmpfsCreate(uint32_t uid, uint32_t gid, UserNamespace *owner, uint64_t fl
         return nullptr;
     }
     *fs = {};
+    fs->byteLimit = byteLimit;
     KMutexInit(&fs->mutex);
     fs->bytes = sizeof(Tmpfs);
     fs->flags = flags | 6;

@@ -4,6 +4,13 @@ Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:
 
+`sockettypecheck.c` checks send/receive errors and the send-to-write fallback
+used by PulseAudio. Linux and Brook must pass 85 checks: valid pipes, eventfds,
+memfds and `/dev/null` return ENOTSOCK; absent/closed/O_PATH descriptors return
+EBADF. Zero-length calls and 32-bit FD argument normalization are included.
+Failed socket operations must preserve pipe data, eventfd counters and file
+offsets. Real write fallback and Unix-socket send/receive must still work.
+
 `pifutexcheck.c` checks PI-futex capability reporting. Run `--expect-supported`
 on Linux (15 checks) and `--expect-unsupported` on Brook (219 checks). Brook
 must reject all six PI operation classes with ENOSYS without changing words,

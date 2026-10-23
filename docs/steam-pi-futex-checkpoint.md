@@ -108,3 +108,6 @@ and is not relabeled as a successful tool exit. No VM remains running. Kernel
 build/staging occurs only between stopped, checked runs. A final comment-only
 wording correction distinguishes glibc's zero-valued-word probe from a null
 address; executable behavior is the frozen, accepted candidate described above.
+
+Follow-up: [PulseAudio socket fallback and shared-memory capacity](steam-pulse-shm-checkpoint.md)
+records the memfd investigation and its next bounded application results.

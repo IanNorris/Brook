@@ -224,7 +224,7 @@ static void mappedQuota()
     assert(FindPage(VnodeNode(f),0)); // Persistent writeback storage exists before exposure.
     KMutexLock(&object->gate);assert(FileObjectExposeWritableLocked(object,f,0,page));KMutexUnlock(&object->gate);
     reinterpret_cast<unsigned char*>(page.raw())[0]=0x5a;
-    auto spare=InstanceBytes-fs->bytes;assert(Reserve(fs,spare));
+    auto spare=TmpfsDefaultBytes-fs->bytes;assert(Reserve(fs,spare));
     auto before=fs->bytes;
     auto denied=FileObjectGetPage(object,f,1,true,&error);assert(!denied && error==-28 && fs->bytes==before);
     assert(!FileObjectWriteback(object,f,0,4096)); // No ENOSPC despite zero spare quota.
@@ -260,8 +260,26 @@ int main()
         char text[32];std::snprintf(text,sizeof(text),"mode=%o",mode);
         assert(!ParseTmpfsMountOptions(text,&options) && options.mode==mode);
     }
-    for(const char* text:{"mode=","mode=8","mode=-1","mode=+755","mode=0x755","mode=10000","mode=777777777777777777777777777777777",",mode=755","mode=755,","mode=755,,mode=700","uid=0","size=1M","mode=755,size=1M","mod","mode=755x"}) {
-        options.mode=0123;assert(ParseTmpfsMountOptions(text,&options)==-22 && options.mode==0123);
+    for(const char* text:{"mode=","mode=8","mode=-1","mode=+755","mode=0x755","mode=10000","mode=777777777777777777777777777777777",",mode=755","mode=755,","mode=755,,mode=700","uid=0","size=","size=0","size=-1","size=1%","size=257M","size=1G","size=18446744073709551616","size=1Mx","mod","mode=755x"}) {
+        options.mode=0123;options.bytes=8192;
+        assert(ParseTmpfsMountOptions(text,&options)==-22 && options.mode==0123 && options.bytes==8192);
+    }
+    for(auto item:{std::pair{"size=1",uint64_t{4096}}, {"size=4097",uint64_t{8192}},
+                   {"size=64k",uint64_t{65536}}, {"mode=0700,size=128M",uint64_t{128}*1024*1024},
+                   {"size=256M",TmpfsMaximumBytes}, {"size=1M,size=8192",uint64_t{8192}}})
+        assert(!ParseTmpfsMountOptions(item.first,&options) && options.bytes==item.second);
+    for(uint64_t quota:{uint64_t{65536},uint64_t{128}*1024*1024,TmpfsMaximumBytes}) {
+        int error=0;auto* custom=TmpfsCreate(1000,100,nullptr,6,&error,01777,quota);assert(custom && !error);
+        auto* object=root(custom);auto* file=create(object,"quota");VfsSpace space{};
+        assert(!Space(file,&space) && space.blocks==quota/4096);
+        auto remaining=quota-custom->bytes;assert(Reserve(custom,remaining));
+        auto before=TmpfsGlobalUsage().bytes;
+        assert(!Reserve(custom,1) && !Allocate(custom,1) && TmpfsGlobalUsage().bytes==before);
+        assert(!Space(file,&space) && !space.availableBlocks);
+        Unreserve(custom,remaining);VfsClose(file);VfsObjectRelease(object);assert(!TmpfsDestroy(custom));clean();
+    }
+    for(uint64_t quota:{uint64_t{0},uint64_t{4095},uint64_t{4097},TmpfsMaximumBytes+4096}) {
+        int error=0;assert(!TmpfsCreate(1000,100,nullptr,6,&error,01777,quota) && error==-22);clean();
     }
     for(uint16_t mode:{uint16_t(0),uint16_t(0755),uint16_t(01777),uint16_t(07777)}) {
         int error=0;auto* custom=TmpfsCreate(1000,100,nullptr,6,&error,mode);assert(custom && !error);
@@ -566,7 +584,7 @@ int main()
         auto *block = Allocate(f, 1024 * 1024);
         if (!block)
         {
-            assert(f->bytes < InstanceBytes - 1024 * 1024);
+            assert(f->bytes < TmpfsDefaultBytes - 1024 * 1024);
             full = true;
             break;
         }

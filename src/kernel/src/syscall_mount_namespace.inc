@@ -43,7 +43,7 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
         if(!error) {
             auto* fsOwner=ProcessUserNamespaceAcquire(process);
             auto* instance=TmpfsCreate(ProcessReadIds(process,false).effective,
-                ProcessReadIds(process,true).effective,fsOwner,6,&error,memoryOptions.mode);
+                ProcessReadIds(process,true).effective,fsOwner,6,&error,memoryOptions.mode,memoryOptions.bytes);
             UserNamespaceRelease(fsOwner);
             if(instance) {
                 error=VfsMountNamespaceMountFresh(lookup.fs.mountNamespace,targetPath,"tmpfs",TmpfsOperations(),instance,0,6);

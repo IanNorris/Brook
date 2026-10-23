@@ -1,7 +1,7 @@
-Latest client retry (2026-10-23): [canonical urandom device access](urandom-device-checkpoint.md)
-gets Steam past its in-container urandom assertion. The next blocker is named
-FIFO creation; see [the implementation gate](steam-fifo-next-step.md). No login
-window or authentication has been reached in Brook.
+Latest client retry (2026-10-23): [PulseAudio and shared-memory diagnosis](steam-pulse-shm-checkpoint.md)
+fixes the notification-descriptor error contract needed by a real PulseAudio
+server. Steam advances to shared-memory capacity failures; no login window or
+authentication has been reached in Brook.
 
 Latest container checkpoint: [SteamRT executes its runtime child](steamrt-runtime-checkpoint.md).
 The installed pressure-vessel launcher and bundled bubblewrap now complete two

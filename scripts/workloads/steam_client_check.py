@@ -33,11 +33,18 @@ def main():
     parser.add_argument('--skip-bootstrap', action='store_true',
                         help='Diagnostic: use the already staged client without testing its updater')
     parser.add_argument('--display', default=':0', help='An already running Xwayland display')
+    parser.add_argument('--pulse-server', help='Optional absolute guest Unix-socket endpoint, unix:/path')
+    parser.add_argument('--pulse-cookie', type=Path,
+                        help='Optional guest cookie file visible inside SteamRT; requires --pulse-server')
     parser.add_argument('--include-log-tail', action='store_true',
                         help='Opt in to exporting bounded raw log text; default reports paths and hashes only')
     args = parser.parse_args()
     if os.geteuid() == 0:
         parser.error('run as the desktop user')
+    if args.pulse_server is not None and not args.pulse_server.startswith('unix:/'):
+        parser.error('--pulse-server must name an absolute guest Unix-socket endpoint')
+    if args.pulse_cookie is not None and args.pulse_server is None:
+        parser.error('--pulse-cookie requires --pulse-server')
     client = args.client.resolve(strict=True)
     runtime = client / 'steamrt64/pv-runtime/steam-runtime-steamrt'
     platforms = list(runtime.glob('steamrt3c_platform_*/files'))
@@ -78,9 +85,19 @@ def main():
         env.pop(key, None)
     # SteamRT replaces LD_LIBRARY_PATH. Prefer bundled client libraries inside
     # the container, passing paths as positional arguments rather than shell code.
+    inner_environment = []
+    if args.pulse_server is not None:
+        inner_environment.append('PULSE_SERVER=' + args.pulse_server)
+    if args.pulse_cookie is not None:
+        inner_environment.append('PULSE_COOKIE=' + str(args.pulse_cookie.resolve(strict=True)))
     command = [str(runtime / 'run'), '--batch', '--', '/bin/sh', '-c',
                'export LD_LIBRARY_PATH="$1:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; shift; exec "$@"',
-               'steam-inner', client_libraries, str(client / 'steamrt64/steam'),
+               'steam-inner', client_libraries]
+    # Set these after runtime construction, without shell interpolation or
+    # rewriting guest socket paths. The caller provides a SteamRT-visible path.
+    if inner_environment:
+        command += ['/usr/bin/env'] + inner_environment
+    command += [str(client / 'steamrt64/steam'),
                '-noverifyfiles', '-nobootstrapperupdate', '-srt-logger-opened',
                '-no-cef-sandbox', '-cef-disable-gpu', '-cef-disable-gpu-compositing']
     if args.skip_bootstrap:
