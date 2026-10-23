@@ -758,7 +758,11 @@ int VfsAccess(Vnode* vn,uint8_t required,bool realIds)
     if (!vn) return -9;
     if (required & ~7u) return -22;
     FileMutationGuard lookup(false);
-    if((required&2) && VfsMountReadOnly(vn))return -30;
+    if((required&2) && VfsMountReadOnly(vn)) {
+        VnodeStat stat{};if(int error=VfsStat(vn,&stat))return error;
+        // Connecting sends data to the listener, without modifying its inode.
+        if((stat.mode&0170000)!=0140000)return -30;
+    }
     if (vn->ops && vn->ops->access) return vn->ops->access(vn,required,realIds);
     return required ? -95 : 0;
 }
@@ -1340,7 +1344,7 @@ int VfsRename(const char* oldPath,const char* newPath)
     const int targetError=VfsLstatPathRaw(newResolved,&targetStat);
     if(targetError && targetError!=-2)return targetError;
     const bool same=!targetError && sourceStat.ino==targetStat.ino;
-    if(!StrEq(oldResolved,newResolved) && (sourceStat.isDir || (sourceStat.mode&0170000)==0100000))
+    if(!StrEq(oldResolved,newResolved) && (sourceStat.isDir || (sourceStat.mode&0170000)==0100000 || (sourceStat.mode&0170000)==0140000))
         if(int labelError=VfsPrepareBackingRenameLabelsLocked(oldMount->backing,oldRelative,newRelative,labels,sourceStat.isDir?0:sourceStat.ino))return labelError;
     const int error=oldMount->backing->fsOps->rename ? oldMount->backing->fsOps->rename(oldMount->backing->mountPriv,oldMount->backing->pdrv,oldRelative,newRelative) : -95;
     if(!error) {

@@ -414,7 +414,11 @@ int VfsPathAccess(const VfsPath& path,uint8_t required,bool realIds)
     if(required&~7u)return -22;
     if(!path.object)return -9;
     FileMutationGuard lookup(false);
-    if((required&2) && VfsReadOnly(static_cast<MountEntry*>(path.attachment)))return -30;
+    if((required&2) && VfsReadOnly(static_cast<MountEntry*>(path.attachment))) {
+        VnodeStat stat{};int error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
+        if(error)return error;
+        if((stat.mode&0170000)!=0140000)return -30;
+    }
     return path.object->ops->access?path.object->ops->access(path.object,required,realIds):-95;
 }
 static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)

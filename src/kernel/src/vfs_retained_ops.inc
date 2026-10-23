@@ -122,8 +122,12 @@ int VfsAccessAt(const VfsPath& root,const VfsPath& start,const char* text,uint8_
     if(required&~7u)return -22;
     FileMutationGuard lookup(false);VfsOwnedWalk walk;
     if(int error=VfsWalkAtLocked(root,start,text,walk,{followFinal},realIds))return error;
-    if((required&2) && VfsReadOnly(static_cast<MountEntry*>(walk.value.object.attachment)))return -30;
-    auto* object=walk.value.object.object;return object->ops->access?object->ops->access(object,required,realIds):-95;
+    auto* object=walk.value.object.object;
+    if((required&2) && VfsReadOnly(static_cast<MountEntry*>(walk.value.object.attachment))) {
+        VnodeStat stat{};if(int error=VfsObjectStatLocked(object,&stat))return error;
+        if((stat.mode&0170000)!=0140000)return -30;
+    }
+    return object->ops->access?object->ops->access(object,required,realIds):-95;
 }
 int VfsReadlinkAt(const VfsPath& root,const VfsPath& start,const char* text,char* out,uint32_t capacity)
 {
@@ -335,7 +339,7 @@ int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
     if(VfsMappedMutationBusy(oldStat) || (target.value && VfsMappedMutationBusy(newStat)))return -16;
     auto* ops=oldParent.object->ops;if(!ops->rename || ops!=newParent.object->ops)return -95;
     VfsRenameLabels labels;
-    if(!same && (oldStat.isDir || (oldStat.mode&0170000)==0100000))if(int error=VfsPrepareRenameLabelsLocked(oldParent,oldName,newParent,newName,labels,oldStat.isDir?0:oldStat.ino))return error;
+    if(!same && (oldStat.isDir || (oldStat.mode&0170000)==0100000 || (oldStat.mode&0170000)==0140000))if(int error=VfsPrepareRenameLabelsLocked(oldParent,oldName,newParent,newName,labels,oldStat.isDir?0:oldStat.ino))return error;
     int error=ops->rename(oldParent.object,oldName,newParent.object,newName);
     if(!error) {
         labels.Apply();

@@ -52,13 +52,14 @@ int objectReadlink(brook::VfsObject* object,char* out,uint32_t size){auto& t=nod
 void nodeClose(brook::Vnode* vn){assert(node(vn->backendObject).mount->alive);++node(vn->backendObject).mount->closed;}
 int nodeStat(brook::Vnode* vn,brook::VnodeStat* out){return objectStat(vn->backendObject,out);}
 int nodeTruncate(brook::Vnode*,uint64_t){return -5;}
+int nodeAccess(brook::Vnode* vn,uint8_t required,bool realIds){return objectAccess(vn->backendObject,required,realIds);}
 int nodeReaddir(brook::Vnode* vn,brook::DirEntry* out,uint32_t* cookie) {
     auto& directory=node(vn->backendObject);assert(directory.dir);
     auto it=directory.children.begin();for(uint32_t i=0;i<*cookie && it!=directory.children.end();++i)++it;
     if(it==directory.children.end())return 0;
     *out={};std::strncpy(out->name,it->first.c_str(),sizeof(out->name)-1);out->isDir=it->second->dir;++*cookie;return 1;
 }
-const brook::VnodeOps nodeOps={.open=nullptr,.read=nullptr,.write=nullptr,.readdir=nodeReaddir,.close=nodeClose,.stat=nodeStat,.fsync=nullptr,.truncate=nodeTruncate};
+const brook::VnodeOps nodeOps={.open=nullptr,.read=nullptr,.write=nullptr,.readdir=nodeReaddir,.close=nodeClose,.stat=nodeStat,.fsync=nullptr,.truncate=nodeTruncate,.access=nodeAccess};
 bool omitMetadataReference=false;
 brook::Vnode* objectOpen(brook::VfsObject* object,int flags,int* error){
     if((node(object).mode&0170000)==0020000 && !(flags&brook::VFS_O_METADATA))++deviceActivations;
@@ -578,6 +579,20 @@ static void testFileBinds(brook::MountNamespace* initial,const brook::VfsPath& s
     originalSource->nlink=1;originalSource->parent=mounts[6].root.children["ns-a"];originalSource->parent->children["value"]=originalSource;
     assert(allocations.size()==allocated && g_mounts.count==records);
 }
+static void testSocketBinds(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    const auto allocated=allocations.size();const auto records=g_mounts.count;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};
+    assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
+    auto a=resolve(root,root,"ns-a");Node socket{&mounts[6],950,false,&node(a.object),{},{}};socket.mode=0140777;node(a.object).children["socket"]=&socket;
+    assert(!VfsMountNamespaceBindAt(ns,root,root,"ns-a/socket","ns-b/value"));auto bound=resolve(root,root,"ns-b/value");VnodeStat stat{};assert(!VfsPathStat(bound,&stat) && (stat.mode&0170000)==0140000);
+    assert(!VfsRenameAt(root,a,"socket",a,"socket-renamed"));assert(!std::strcmp(static_cast<MountEntry*>(bound.attachment)->physicalRoot,"/ns-a/socket-renamed"));
+    assert(!VfsMountNamespaceRemount(ns,bound,7));assert(!VfsPathAccess(bound,2));assert(!VfsAccessAt(root,root,"ns-b/value",2,false,true));int error=0;auto* metadata=VfsPathOpen(bound,VFS_O_METADATA,&error);assert(metadata && !error && !VfsAccess(metadata,2,false));VfsClose(metadata);
+    assert(!VfsRename("/ns-a/socket-renamed","/ns-a/socket-final"));assert(!std::strcmp(static_cast<MountEntry*>(bound.attachment)->physicalRoot,"/ns-a/socket-final"));
+    assert(!VfsRemoveAt(root,a,"socket-final",false));assert(static_cast<MountEntry*>(bound.attachment)->rootFileUnlinked);
+    assert(!VfsMountNamespaceDetach(ns,bound));VfsPathRelease(bound);VfsPathRelease(a);VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
+    assert(allocations.size()==allocated && g_mounts.count==records);
+}
 static void testPivotRoots(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
     using namespace brook;
     auto allocated=allocations.size();auto records=g_mounts.count;
@@ -973,6 +988,7 @@ int main(){
     testMountRestrictions(initial,stableRoot);
     testReadOnlyMount(initial,stableRoot);
     testFileBinds(initial,stableRoot);
+    testSocketBinds(initial,stableRoot);
     MountNamespace* parentNs=nullptr;VfsPath parentRoot{},parentCwd{};
     assert(!VfsMountNamespaceCopy(initial,stableRoot,originalSynthetic,&parentNs,&parentRoot,&parentCwd));
     assert(VfsMountNamespaceBind(parentNs,aPath,parentCwd)==-3);

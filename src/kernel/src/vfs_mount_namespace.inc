@@ -480,7 +480,9 @@ static int VfsMountNamespaceBindLocked(MountNamespace* ns,const VfsPath& source,
     if((error=VfsObjectStatLocked(target.object,&targetStat)))return error;
     if(sourceStat.isDir!=targetStat.isDir)return -20;
     if(!sourceStat.isDir) {
-        if((sourceStat.mode&0170000)!=0100000 || (targetStat.mode&0170000)!=0100000)return -95;
+        const auto sourceType=sourceStat.mode&0170000,targetType=targetStat.mode&0170000;
+        if((sourceType!=0100000 && sourceType!=0140000) ||
+           (targetType!=0100000 && targetType!=0140000))return -95;
         // Crossing currently keys on backend identity. Unique targets are
         // unambiguous while link/linkat remain unsupported; attached targets
         // cannot be renamed, unlinked or replaced through VFS mutation gates.
