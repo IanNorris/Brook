@@ -1,7 +1,7 @@
-Latest container checkpoint: [restricted bind remount](mount-restrictions-checkpoint.md)
+Latest container checkpoint: [retained proc directory FD following](proc-directory-fd-checkpoint.md)
 runs unchanged bubblewrap and its NNP/exec child successfully as UID 1000.
-The real SteamRT launcher next exposes directory FD following, the missing
-retained `/usr` layout and read-only binds. SteamRT's child has not executed.
+The real SteamRT launcher now passes directory FD traversal and the retained
+`/usr` layout check, then stops at read-only binds. Its child has not executed.
 
 # Native Steam client checkpoint
 

@@ -1803,25 +1803,27 @@ static int OpenProcMemFd(Process* proc, const char* path, uint64_t flags, bool* 
         self = pid == proc->pid || pid == proc->tgid;
     }
     if (strncmp(part, "fd/", 3)) return -ENOENT;
-    *matched = true;
-    if (!self) return -13;
+    if (!self) { *matched=true;return -13; }
     part += 3;
     uint64_t number = 0;
     if (*part < '0' || *part > '9') return -ENOENT;
     while (*part >= '0' && *part <= '9') {
-        if (number >= MAX_FDS) return -ENOENT;
+        if (number >= MAX_FDS) { *matched=true;return -ENOENT; }
         number = number * 10 + *part++ - '0';
     }
+    if (number >= MAX_FDS) { *matched=true;return -ENOENT; }
+    KernelOperationGuard operation(proc);
+    FdRef source(proc, static_cast<int>(number));
+    if (!source) { *matched=true;return -ENOENT; }
+    // Only memfds belong to this explicit broker. Directory capabilities,
+    // including suffix traversal, must reach retained procfs magic following.
+    if (source.get()->type != FdType::MemFd || !source.get()->handle)return -95;
+    *matched=true;
     if (*part) return -20;
-    if (number >= MAX_FDS) return -ENOENT;
     if ((flags & 3) == 3) return -EINVAL;
     if (flags & 0x20000) return -40; // O_NOFOLLOW on a magic symlink
     if (flags & 0x10000) return -20; // O_DIRECTORY
     if (flags & (0x200000 | 0x200 | 0x40 | 0x80)) return -95;
-    KernelOperationGuard operation(proc);
-    FdRef source(proc, static_cast<int>(number));
-    if (!source) return -ENOENT;
-    if (source.get()->type != FdType::MemFd || !source.get()->handle) return -95;
     return MemFdInstall(proc, static_cast<MemFdData*>(source.get()->handle), static_cast<uint32_t>(flags));
 }
 
@@ -3427,11 +3429,6 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     int openError = 0;
     Vnode* vn=VfsOpenAt(at.fs.root,at.start(),path,vfsFlags,static_cast<uint16_t>(mode&07777),at.fs.mask,&openError,
                           !(flags&0x20000)); // O_NOFOLLOW
-    // procfs remains an explicit synthetic namespace broker. It does not
-    // implement retained objects and is never used to reconstruct disk paths.
-    if(!vn && openError==-95 && hasSyntheticName &&
-       (!strncmp(syntheticPath,"/proc/",6) || StrEq(syntheticPath,"/proc")))
-        vn=VfsOpenModeChecked(syntheticPath,vfsFlags,static_cast<uint16_t>(mode&07777),&openError);
     if (!vn && openError && openError != -ENOENT) return openError;
 
     // Preserve /boot aliases for legacy applications, but Nix store paths
@@ -5808,8 +5805,6 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
     VnodeStat st{};
     bool realIds=!(flags&EACCESS);
     int result=VfsAccessAt(at.fs.root,at.start(),path,static_cast<uint8_t>(mode),realIds,!(flags&NOFOLLOW));
-    if(result==-95 && hasSyntheticName && (!strncmp(lookup,"/proc/",6) || StrEq(lookup,"/proc")))
-        result=VfsAccessPath(lookup,static_cast<uint8_t>(mode),realIds,flags&NOFOLLOW);
     if (result == 0) return 0;
     if (result != -ENOENT && result != -1) return result;
     static const char* syntheticPaths[] = {
@@ -7472,8 +7467,6 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr,int dirfd=-1
 
     VnodeStat vs{};
     int pathError=VfsStatAt(at.fs.root,at.start(),path,&vs,true);
-    if(pathError==-95 && hasSyntheticName && (!strncmp(lookup,"/proc/",6) || StrEq(lookup,"/proc")))
-        pathError=VfsStatPath(lookup,&vs);
     if (pathError < 0)
     {
         if (pathError != -ENOENT && pathError != -1) return pathError;
@@ -7523,8 +7516,6 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr,int dirfd=-
 
     VnodeStat vs{};
     int pathError=VfsStatAt(at.fs.root,at.start(),path,&vs,false);
-    if(pathError==-95 && hasSyntheticName && (!strncmp(lookup,"/proc/",6) || StrEq(lookup,"/proc")))
-        pathError=VfsLstatPath(lookup,&vs);
     if (pathError < 0)
     {
         if (pathError != -ENOENT && pathError != -1) return pathError;

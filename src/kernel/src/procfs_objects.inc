@@ -170,31 +170,30 @@ static int ProcObjectParent(VfsObject* object,VfsObject** out,bool=false)
 // The FD lock protects acquisition of the path's own references. No FD pin or
 // vnode reference is released here: a concurrent close must never make proc's
 // outer VFS callback run final descriptor teardown.
-static int ProcDirectoryFdLink(const ProcObject* value,char* out,uint32_t capacity)
+static int ProcAcquireDirectoryFd(const ProcObject* value,VfsPath* out,char* fallback=nullptr,uint32_t capacity=0)
 {
-    auto* live=SchedulerFindProcessReference(value->pid);if(!live)return -2;
+    *out={};auto* live=SchedulerFindProcessReference(value->pid);if(!live)return -2;
     if(live->incarnation!=value->incarnation || live->tgid!=value->tgid ||
        (live->isThread?live->leaderIncarnation:live->incarnation)!=value->group) {ProcessUnref(live);return -2;}
-    int error=-2;VfsPath path{};
+    int error=-2;
     SpinLockAcquire(ProcessFdLock(live));
     if(live->fds && value->index<MAX_FDS) {
         const auto& fd=live->fds[value->index];
         if(fd.type!=FdType::None && !fd.closing) {
-            error=1;FdDiagnosticPath(fd,out,capacity);
+            error=1;FdDiagnosticPath(fd,fallback,capacity);
             if((fd.type==FdType::Vnode || fd.type==FdType::Path) && fd.handle) {
                 auto* node=static_cast<Vnode*>(fd.handle);
                 if(node->type==VnodeType::Dir) {
                     error=-95;
                     if(node->mountOwner && node->backendObject) {
-                        path={node->mountOwner,node->backendObject};VfsPathRetain(path);error=0;
+                        *out={node->mountOwner,node->backendObject};VfsPathRetain(*out);error=0;
                     }
                 }
             }
         }
     }
     SpinLockRelease(ProcessFdLock(live));ProcessUnref(live);
-    if(!error)error=VfsPathDirectoryPathFromCallback(path,out,capacity);
-    VfsPathRelease(path);return error;
+    return error;
 }
 static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
 {
@@ -208,7 +207,9 @@ static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
         if(value->kind==ProcObjectKind::ThreadSelf) {end=AppendStr(end,"/task/");end=U64ToDec(end,current->pid);}
         *end=0;
     } else if(value->kind==ProcObjectKind::FdLink) {
-        int error=ProcDirectoryFdLink(value,target,sizeof(target));if(error<0)return error;
+        VfsPath path{};int error=ProcAcquireDirectoryFd(value,&path,target,sizeof(target));
+        if(!error)error=VfsPathDirectoryPathFromCallback(path,target,sizeof(target));
+        VfsPathRelease(path);if(error<0)return error;
 
     } else if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_EXE) {
         ProcStrCopy(target,snapshot.exePath,sizeof(target));
@@ -289,11 +290,16 @@ static int ProcObjectFollow(const VfsPath& source,VfsPath* out)
         if(int error=ProcNamespaceObject(value->pid,value->incarnation,value->tgid,value->group,&target))return error;
         *out={source.attachment,target};VfsPathRetain(*out);VfsObjectRelease(target);return 1;
     }
-    // Report names for these links, but never pretend reopening the reported
-    // spelling preserves an executable/FD identity. Existing explicit proc FD
-    // brokers remain separate; general magic FD/ELF following is unsupported.
-    if(value->kind==ProcObjectKind::FdLink ||
-       (value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_EXE))return -95;
+    if(value->kind==ProcObjectKind::FdLink) {
+        // Match retained root/cwd access policy. This is a directory capability
+        // jump, never a reopen of its reported pathname or a mount follow-down.
+        FsSnapshot fs{};int error=ProcAcquireFsTarget(value->pid,value->incarnation,value->tgid,value->group,&fs);
+        FsSnapshotRelease(&fs);if(error)return error;
+        error=ProcAcquireDirectoryFd(value,out);
+        return error==1?-95:error?error:1;
+    }
+    // Executable/regular-file FD identity following remains unsupported.
+    if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_EXE)return -95;
     if(value->kind!=ProcObjectKind::PidFile ||
        (value->index!=PROC_PID_CWD && value->index!=PROC_PID_ROOT))return 0;
     FsSnapshot fs{};int error=ProcAcquireFsTarget(value->pid,value->incarnation,value->tgid,value->group,&fs);

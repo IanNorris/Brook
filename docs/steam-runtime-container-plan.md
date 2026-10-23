@@ -15,6 +15,10 @@ nested and stacked mount subtrees and advances unchanged bubblewrap to
 `pivot_root: Function not implemented`. The subsequent
 [private root-relocation checkpoint](pivot-root-checkpoint.md) implements both
 pivot forms and advances the same binary to missing `/proc/self/mountinfo`.
+The [directory FD checkpoint](proc-directory-fd-checkpoint.md) supplies retained
+proc FD traversal and a real /usr skeleton; unchanged SteamRT now reaches the
+read-only /etc bind remount. Its child has not executed yet.
+
 The [mount graph reporting checkpoint](mountinfo-checkpoint.md) then supplies
 mountinfo and retained directory FD readlink reporting. Unchanged bubblewrap
 advances to bind remount restrictions. The [restricted-remount checkpoint](mount-restrictions-checkpoint.md)
