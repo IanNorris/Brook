@@ -21,6 +21,11 @@ int VfsPathBrokerAllowed(const VfsPath& root,const char* absolute,bool* allowed)
 // retained parent identity and NODEV are checked in one namespace transaction.
 int VfsCanonicalDeviceAnchorInitialize();
 int VfsCanonicalDeviceAllowed(const VfsPath& root,const VfsPath& start,const char* text,bool* allowed,bool followFinal=true,const char* leaf="null");
+// Narrow DRM broker bridge across genuine directory binds. The syscall caller
+// must first restrict the request to the fixed DRM devfs/sysfs path allowlist.
+// A real entry or overmount at the synthetic subtree masks the broker.
+int VfsCanonicalDrmAnchorInitialize();
+int VfsCanonicalDrmBrokerAllowed(const VfsPath& root,bool sysfs,bool* allowed);
 // Device activation only: metadata/O_PATH, directories, /dev/shm and existing
 // device descriptors are unaffected. Called for a recognized broker device.
 int VfsPathDeviceActivation(const VfsPath& root,const char* absolute);

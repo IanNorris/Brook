@@ -534,6 +534,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::VfsMount("/proc", "procfs", 0);
     const int nullAnchor=brook::VfsCanonicalDeviceAnchorInitialize();
     brook::SerialPrintf("VFS: canonical device parent anchor result=%d\n",nullAnchor);
+    const int drmAnchor=brook::VfsCanonicalDrmAnchorInitialize();
+    if(drmAnchor)KernelPanic("canonical DRM sysfs anchor failed (rebuild initrd): %d",drmAnchor);
     // Charge tmpfs lazily, within a boot-available-RAM aggregate ceiling. The
     // desktop gets half that budget; ordinary container mounts retain their
     // smaller default unless the caller requests an explicit size.

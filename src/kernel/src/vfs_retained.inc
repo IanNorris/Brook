@@ -7,6 +7,8 @@ struct VfsVirtualDirectory { VfsObject object; VfsPath parent; char name[256]; }
 extern const VfsObjectOps g_virtualDirectoryOps;
 // Provisioned once before userspace; retains the exact canonical host /dev.
 static VfsPath g_canonicalDeviceAnchor;
+static VfsPath g_canonicalDrmDeviceAnchor;
+static VfsPath g_canonicalDrmSysAnchor;
 static bool VfsVirtual(const VfsPath& p) { return p.object && p.object->ops==&g_virtualDirectoryOps; }
 
 bool VfsPathSame(const VfsPath& a,const VfsPath& b)
@@ -389,6 +391,59 @@ int VfsCanonicalDeviceAllowed(const VfsPath& root,const VfsPath& start,const cha
         }
     }
     VfsPathRelease(walk.parent);VfsPathRelease(walk.object);
+    return error==-2?0:error;
+}
+int VfsCanonicalDrmAnchorInitialize()
+{
+    FileMutationGuard transaction;
+    if(g_canonicalDrmSysAnchor.object || g_canonicalDrmDeviceAnchor.object)return -16;
+    VfsPath root{};int error=VfsMountRootLocked(g_initialNamespace.root,&root);
+    if(error)return error;
+    VfsRetainedProvider provider;RetainedWalkResult<VfsPath> walk{},device{};
+    error=WalkRetainedPath(root,root,"/dev/dri",&device,provider);
+    if(!error) {
+        VnodeStat stat{};error=device.object.object->ops->stat?device.object.object->ops->stat(device.object.object,&stat):-95;
+        if(!error && (!stat.isDir || VfsVirtual(device.object)))error=-20;
+    }
+    if(!error)error=WalkRetainedPath(root,root,"/sys/dev/char",&walk,provider);
+    if(!error) {
+        VnodeStat stat{};error=walk.object.object->ops->stat?walk.object.object->ops->stat(walk.object.object,&stat):-95;
+        if(!error && (!stat.isDir || VfsVirtual(walk.object)))error=-20;
+        if(!error) {
+            g_canonicalDrmDeviceAnchor=device.object;device.object={};
+            g_canonicalDrmSysAnchor=walk.object;walk.object={};
+        }
+    }
+    VfsPathRelease(device.parent);VfsPathRelease(device.object);
+    VfsPathRelease(walk.parent);VfsPathRelease(walk.object);VfsPathRelease(root);return error;
+}
+int VfsCanonicalDrmBrokerAllowed(const VfsPath& root,bool sysfs,bool* allowed)
+{
+    if(!allowed)return -22;
+    *allowed=false;if(!root.object || !root.attachment)return -9;
+    FileMutationGuard transaction(false);
+    const auto& anchor=sysfs?g_canonicalDrmSysAnchor:g_canonicalDrmDeviceAnchor;
+    if(!anchor.object)return 0;
+    VfsRetainedProvider provider;RetainedWalkResult<VfsPath> parent{},child{};
+    int error=WalkRetainedPath(root,root,sysfs?"/sys/dev/char":"/dev/dri",&parent,provider);
+    if(!error && VfsPathSameObject(parent.object,anchor)) {
+        // The entire subtree is synthetic. Never activate it through a real
+        // child, symlink, reserved mount ancestor or a shadowing attachment.
+        const char* leaf=sysfs?"226:128":"renderD128";
+        VfsPath reserved{};
+        if(VfsReservedVirtualLocked(parent.object,leaf,&reserved))VfsPathRelease(reserved);
+        else {
+            error=WalkRetainedPath(root,parent.object,leaf,&child,provider,{false,true});
+            if(!error && !child.object.object && !child.trailing &&
+               StrEq(child.leaf,leaf) && VfsPathSameObject(child.parent,anchor))*allowed=true;
+            // FAT cannot represent a colon-bearing name. This fixed virtual
+            // component is absent there; no arbitrary user path gets this
+            // treatment, and a reserved overmount was excluded above.
+            if(sysfs && error==-22) {*allowed=true;error=0;}
+        }
+    }
+    VfsPathRelease(child.parent);VfsPathRelease(child.object);
+    VfsPathRelease(parent.parent);VfsPathRelease(parent.object);
     return error==-2?0:error;
 }
 int VfsPathBrokerAllowed(const VfsPath& root,const char* absolute,bool* allowed)

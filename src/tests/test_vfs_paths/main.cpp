@@ -626,7 +626,14 @@ static void testNullDeviceBridge(brook::MountNamespace* initial,const brook::Vfs
     using namespace brook;
     const auto allocated=allocations.size();const auto records=g_mounts.count;
     Node dev{&mounts[6],980,true,&mounts[6].root,{},{}};mounts[6].root.children["dev"]=&dev;
+    Node dri{&mounts[6],19799,true,&dev,{},{}};dev.children["dri"]=&dri;
+    assert(!mounts[6].root.children.count("sys"));
+    Node sysRoot{&mounts[6],19800,true,&mounts[6].root,{},{}};
+    Node sysDev{&mounts[6],19801,true,&sysRoot,{},{}};
+    Node sysChar{&mounts[6],19802,true,&sysDev,{},{}};
+    mounts[6].root.children["sys"]=&sysRoot;sysRoot.children["dev"]=&sysDev;sysDev.children["char"]=&sysChar;
     assert(!VfsCanonicalDeviceAnchorInitialize());assert(VfsCanonicalDeviceAnchorInitialize()==-16);
+    assert(!VfsCanonicalDrmAnchorInitialize());assert(VfsCanonicalDrmAnchorInitialize()==-16);
     MountNamespace* ns=nullptr;VfsPath root{},cwd{};assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
     auto original=resolve(root,root,"dev"),unrelated=resolve(root,root,"ns-a");bool allowed=false;
     assert(!VfsCanonicalDeviceAllowed(root,root,"/dev/null",&allowed) && allowed);
@@ -634,6 +641,21 @@ static void testNullDeviceBridge(brook::MountNamespace* initial,const brook::Vfs
     assert(VfsCanonicalDeviceAllowed(root,root,"/dev/random",&allowed,true,"random")==-22 && !allowed);
     assert(!VfsMountNamespaceBind(ns,original,original));auto bound=resolve(root,root,"dev");assert(!VfsMountNamespaceRemount(ns,bound,2));
     assert(!VfsCanonicalDeviceAllowed(root,root,"/dev/null",&allowed) && allowed);assert(!VfsCanonicalDeviceAllowed(root,bound,"null",&allowed) && allowed);
+    assert(!VfsCanonicalDrmBrokerAllowed(root,false,&allowed) && allowed);
+    assert(!VfsPathDeviceActivation(root,"/dev/dri/renderD128"));
+    Node fakeDri{&mounts[6],19803,true,&dev,{},{}};dev.children["dri"]=&fakeDri;
+    assert(!VfsCanonicalDrmBrokerAllowed(root,false,&allowed) && !allowed);dev.children["dri"]=&dri;
+    Node fakeRender{&mounts[6],19805,false,&dri,{},{}};dri.children["renderD128"]=&fakeRender;
+    assert(!VfsCanonicalDrmBrokerAllowed(root,false,&allowed) && !allowed);dri.children.erase("renderD128");
+    auto sys=resolve(root,root,"sys");assert(!VfsMountNamespaceBind(ns,sys,sys));
+    auto sysBound=resolve(root,root,"sys");assert(!VfsMountNamespaceRemount(ns,sysBound,3));
+    assert(!VfsCanonicalDrmBrokerAllowed(root,true,&allowed) && allowed);
+    Node fakeGpu{&mounts[6],19804,true,&sysChar,{},{}};sysChar.children["226:128"]=&fakeGpu;
+    assert(!VfsCanonicalDrmBrokerAllowed(root,true,&allowed) && !allowed);sysChar.children.erase("226:128");
+    auto chars=resolve(root,root,"/sys/dev/char");assert(!VfsMountNamespaceBind(ns,unrelated,chars));
+    auto fakeChars=resolve(root,root,"/sys/dev/char");assert(!VfsCanonicalDrmBrokerAllowed(root,true,&allowed) && !allowed);
+    assert(!VfsMountNamespaceDetach(ns,fakeChars));VfsPathRelease(fakeChars);VfsPathRelease(chars);
+    assert(!VfsCanonicalDrmBrokerAllowed(root,true,&allowed) && allowed);
     bool general=true;assert(!VfsPathBrokerAllowed(root,"/dev/shm/isolated",&general) && !general);
     Node realNull{&mounts[6],981,false,&dev,{},{}};dev.children["null"]=&realNull;assert(!VfsCanonicalDeviceAllowed(root,root,"/dev/null",&allowed) && !allowed);dev.children.erase("null");
     Node alias{&mounts[6],982,false,&node(unrelated.object),{},"/dev/null"};node(unrelated.object).children["null"]=&alias;
@@ -641,17 +663,23 @@ static void testNullDeviceBridge(brook::MountNamespace* initial,const brook::Vfs
     assert(!VfsCanonicalDeviceAllowed(root,unrelated,"null",&allowed,true) && allowed);
     node(unrelated.object).children.erase("null");
     MountNamespace* copy=nullptr;VfsPath cr{},cc{};assert(!VfsMountNamespaceCopy(ns,root,root,&copy,&cr,&cc));assert(VfsMountNamespaceActivate(copy));
-    assert(!VfsCanonicalDeviceAllowed(cr,cr,"/dev/null",&allowed) && allowed);VfsMountNamespaceLeave(copy);VfsPathRelease(cr);VfsPathRelease(cc);VfsMountNamespaceRelease(copy);VfsDrainMountCleanup();
+    assert(!VfsCanonicalDeviceAllowed(cr,cr,"/dev/null",&allowed) && allowed);
+    assert(!VfsCanonicalDrmBrokerAllowed(cr,false,&allowed) && allowed);
+    assert(!VfsCanonicalDrmBrokerAllowed(cr,true,&allowed) && allowed);
+    VfsMountNamespaceLeave(copy);VfsPathRelease(cr);VfsPathRelease(cc);VfsMountNamespaceRelease(copy);VfsDrainMountCleanup();
     std::atomic<bool> stop{false},strict{false};std::atomic<unsigned> observations{0},denials{0};
     std::thread reader([&]{while(!stop.load(std::memory_order_acquire)){bool requireDenial=strict.load(std::memory_order_acquire),ok=false;int e=VfsCanonicalDeviceAllowed(root,root,"/dev/null",&ok);assert((!e)||(e==-13&&!ok));if(requireDenial){assert(e==-13&&!ok);denials.fetch_add(1);}observations.fetch_add(1);}});
     while(!observations.load())std::this_thread::yield();
-    for(unsigned i=0;i<100;++i){assert(!VfsMountNamespaceBind(ns,unrelated,bound));auto shadow=resolve(root,root,"dev");assert(!VfsCanonicalDeviceAllowed(root,root,"/dev/null",&allowed) && !allowed);assert(!VfsMountNamespaceDetach(ns,shadow));VfsPathRelease(shadow);}
+    for(unsigned i=0;i<100;++i){assert(!VfsMountNamespaceBind(ns,unrelated,bound));auto shadow=resolve(root,root,"dev");assert(!VfsCanonicalDeviceAllowed(root,root,"/dev/null",&allowed) && !allowed);assert(!VfsCanonicalDrmBrokerAllowed(root,false,&allowed) && !allowed);assert(!VfsMountNamespaceDetach(ns,shadow));VfsPathRelease(shadow);}
     assert(!VfsMountNamespaceRemount(ns,bound,6));strict.store(true,std::memory_order_release);while(!denials.load())std::this_thread::yield();stop.store(true,std::memory_order_release);reader.join();
     assert(VfsCanonicalDeviceAllowed(root,root,"/dev/null",&allowed)==-13 && !allowed);
     assert(VfsCanonicalDeviceAllowed(root,root,"/dev/urandom",&allowed,true,"urandom")==-13 && !allowed);
+    assert(!VfsCanonicalDrmBrokerAllowed(root,false,&allowed) && allowed); // metadata only
+    assert(VfsPathDeviceActivation(root,"/dev/dri/renderD128")==-13);
+    assert(!VfsMountNamespaceDetach(ns,sysBound));VfsPathRelease(sysBound);VfsPathRelease(sys);
     assert(!VfsMountNamespaceDetach(ns,bound));VfsPathRelease(bound);VfsPathRelease(original);VfsPathRelease(unrelated);VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
-    {FileMutationGuard transaction;VfsPathRelease(g_canonicalDeviceAnchor);g_canonicalDeviceAnchor={};}
-    mounts[6].root.children.erase("dev");VfsDrainMountCleanup();assert(allocations.size()==allocated && g_mounts.count==records);
+    {FileMutationGuard transaction;VfsPathRelease(g_canonicalDeviceAnchor);g_canonicalDeviceAnchor={};VfsPathRelease(g_canonicalDrmDeviceAnchor);g_canonicalDrmDeviceAnchor={};VfsPathRelease(g_canonicalDrmSysAnchor);g_canonicalDrmSysAnchor={};}
+    mounts[6].root.children.erase("dev");mounts[6].root.children.erase("sys");VfsDrainMountCleanup();assert(allocations.size()==allocated && g_mounts.count==records);
 }
 static void testPivotRoots(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
     using namespace brook;

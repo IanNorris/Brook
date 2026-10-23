@@ -904,3 +904,21 @@ nix-shell --run '"$MUSL_CC" -O2 -Wall -Wextra -Werror -static tools/at-syscall-p
 
 Stage only on a stopped disposable VM disk. Use Settings for save/reboot
 acceptance, and check window controls against fresh screenshot coordinates.
+
+
+`drmbindcheck.c` verifies Brook's retained DRM bridge using the public render-node
+ABI: device access/stat/statx (including descriptor metadata), DRM_VERSION,
+virtual sysfs attributes, genuine directory binds, namespace copies, fake-device
+masking, `nodev`, retained open descriptors, and pivot-root/detach.
+
+Compile with the usual static musl toolchain. Run `--brook` as a nonroot user in
+a disposable Brook VM; it creates its own user/mount namespaces. `--linux-root`
+is for a disposable Linux control VM with namespace privileges. `--native`
+performs only the baseline metadata/open checks. Keep execution inside test VMs;
+no host mount tests are needed. Successful Brook output includes
+`DRMBIND_FIXTURE_PASS` and `DRMBIND_PARENT_PASS`.
+
+The initrd must be regenerated with real `/dev/dri` and `/sys/dev/char`
+directories. Broker visibility follows their retained identity, including genuine
+binds; replacing them with unrelated directories must hide the broker. `nodev`
+still denies new device opens without revoking descriptors already opened.

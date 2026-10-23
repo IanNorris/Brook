@@ -533,7 +533,7 @@ static int VfsAppendLeaf(char* path,uint32_t capacity,const char* leaf);
 
 void VfsInit()
 {
-    if(g_canonicalDeviceAnchor.object)__builtin_trap(); // boot-only initialization, never redefine an anchor
+    if(g_canonicalDeviceAnchor.object || g_canonicalDrmDeviceAnchor.object || g_canonicalDrmSysAnchor.object)__builtin_trap(); // boot-only anchors
     KRwLockInit(&g_fileMutationLock);
     g_initialNamespace.~MountNamespace();::new(&g_initialNamespace)MountNamespace();
     g_initialNamespace.initial=true;

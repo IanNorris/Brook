@@ -3130,6 +3130,15 @@ struct AtLookup {
         if(vnode->type!=VnodeType::Dir)return -ENOTDIR;
         return VfsPathFromVnode(vnode,&directory);
     }
+    int BrokerAllowed(const char* absolute,bool* allowed) const {
+        if(GpuAppGet()) {
+            const bool device=StrEq(absolute,"/dev/dri") || StrEq(absolute,"/dev/dri/renderD128");
+            const bool sysfs=DrmSysIsDir(absolute) || DrmSysAttrContent(absolute) ||
+                StrEq(absolute,"/sys/dev/char/226:128/device/subsystem");
+            if(device || sysfs)return VfsCanonicalDrmBrokerAllowed(fs.root,sysfs,allowed);
+        }
+        return VfsPathBrokerAllowed(fs.root,absolute,allowed);
+    }
     // Synthetic proc/dev and historical aliases only. Never feed this name to
     // normal filesystem operations. Reject hidden retained starts: a current
     // global label must not redirect a lower cwd into an overmount.
@@ -3137,7 +3146,7 @@ struct AtLookup {
         if(text[0]=='/') {
             size_t bytes=strlen(text)+1;if(bytes>capacity)return -36;
             memcpy(out,text,bytes);bool allowed=false;
-            int error=VfsPathBrokerAllowed(fs.root,out,&allowed);return error?error:allowed?0:-95;
+            int error=BrokerAllowed(out,&allowed);return error?error:allowed?0:-95;
         }
         char parent[512];int error=VfsPathDirectoryPath(start(),parent,sizeof(parent));
         if(error)return error;
@@ -3149,7 +3158,7 @@ struct AtLookup {
         if(prefix+slash+suffix>=capacity)return -36;
         memcpy(out,parent,prefix);if(slash)out[prefix++]='/';
         memcpy(out+prefix,text,suffix+1);bool allowed=false;
-        error=VfsPathBrokerAllowed(fs.root,out,&allowed);return error?error:allowed?0:-95;
+        error=BrokerAllowed(out,&allowed);return error?error:allowed?0:-95;
     }
     AtLookup()=default;AtLookup(const AtLookup&)=delete;AtLookup& operator=(const AtLookup&)=delete;
 };
@@ -5911,6 +5920,7 @@ static int64_t sys_rt_sigtimedwait(uint64_t setAddr, uint64_t infoAddr,
 // ---------------------------------------------------------------------------
 
 static bool BusyboxStatFallback(const char* path, VnodeStat* vs);
+static bool DrmAccessResult(const char* path,uint8_t mode,bool realIds,int64_t* result);
 
 // Inquiry only: do not use access() as authorization for a later operation.
 static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t flags)
@@ -5946,6 +5956,8 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
     const char* lookup=hasSyntheticName?resolved:"";
     VnodeStat st{};
     bool realIds=!(flags&EACCESS);
+    int64_t deviceAccess=0;
+    if(DrmAccessResult(lookup,static_cast<uint8_t>(mode),realIds,&deviceAccess))return deviceAccess;
     int result=VfsAccessAt(at.fs.root,at.start(),path,static_cast<uint8_t>(mode),realIds,!(flags&NOFOLLOW));
     if (result == 0) return 0;
     if (result != -ENOENT && result != -1) return result;
@@ -7585,6 +7597,13 @@ static bool DrmStatFill(const char* path, LinuxStat* st)
         return true;
     }
     return false;
+}
+static bool DrmAccessResult(const char* path,uint8_t mode,bool realIds,int64_t* result)
+{
+    LinuxStat stat{};
+    if(!DrmStatFill(path,&stat))return false;
+    *result=ProcessCheckFileAccess(ProcessCurrent(),stat.st_uid,stat.st_gid,stat.st_mode,mode,realIds);
+    return true;
 }
 
 // Internal stat helper — takes a kernel-space path directly (no user copy).
@@ -10647,6 +10666,8 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
         stx->stx_ino = st.st_ino;
         stx->stx_dev_major = static_cast<uint32_t>(((st.st_dev >> 8) & 0xfff) | ((st.st_dev >> 32) & 0xfffff000));
         stx->stx_dev_minor = static_cast<uint32_t>((st.st_dev & 0xff) | ((st.st_dev >> 12) & 0xffffff00));
+        stx->stx_rdev_major = static_cast<uint32_t>(((st.st_rdev >> 8) & 0xfff) | ((st.st_rdev >> 32) & 0xfffff000));
+        stx->stx_rdev_minor = static_cast<uint32_t>((st.st_rdev & 0xff) | ((st.st_rdev >> 12) & 0xffffff00));
         stx->stx_size = static_cast<uint64_t>(st.st_size);
         stx->stx_blocks = static_cast<uint64_t>(st.st_blocks);
         stx->stx_atime.tv_sec = static_cast<int64_t>(st.st_atime_sec);

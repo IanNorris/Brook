@@ -89,7 +89,7 @@ mmd -i "${INITRD_IMG}.tmp" "::TMP" 2>/dev/null || true
 
 # The kernel mounts a real tmpfs for shared-memory files at /dev/shm. Provide the
 # directory so applications discover that backend on a fresh boot.
-mmd -i "${INITRD_IMG}.tmp" "::DEV" "::DEV/SHM"
+mmd -i "${INITRD_IMG}.tmp" "::DEV" "::DEV/SHM" "::DEV/DRI"
 
 # Keep /usr a real retained directory even with Nix-managed userland. Container
 # tools bind this host-layout entry; a synthetic executable alias is insufficient.
@@ -97,6 +97,9 @@ mmd -i "${INITRD_IMG}.tmp" "::USR"
 
 # Minimal /sys stub — some apps read /sys/devices/system/cpu/online.
 mmd -i "${INITRD_IMG}.tmp" "::SYS" 2>/dev/null || true
+# Retained ancestry for the fixed DRM sysfs broker. The FAT initrd cannot grow
+# this directory tree at runtime, and container binds must retain real objects.
+mmd -i "${INITRD_IMG}.tmp" "::SYS/DEV" "::SYS/DEV/CHAR"
 mmd -i "${INITRD_IMG}.tmp" "::SYS/DEVICES" 2>/dev/null || true
 mmd -i "${INITRD_IMG}.tmp" "::SYS/DEVICES/SYSTEM" 2>/dev/null || true
 mmd -i "${INITRD_IMG}.tmp" "::SYS/DEVICES/SYSTEM/CPU" 2>/dev/null || true
