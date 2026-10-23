@@ -269,9 +269,17 @@ static int VfsBackendDirectoryLocked(const VfsPath& path,char* out,uint32_t capa
 static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capacity,bool anyObject=false)
 {
     if(!out || capacity<2)return -36;
-    out[0]=0;char relative[512];int error=VfsBackendDirectoryLocked(path,relative,sizeof(relative),anyObject);
+    out[0]=0;auto* mount=static_cast<MountEntry*>(path.attachment);
+    // A regular-file bind has no descendants. Its visible entry is retained
+    // separately from the source inode, whose backend need not report names.
+    // Reconstruct from that entry's live parent, never the source spelling.
+    if(anyObject && mount->rootObject && mount->coveredParent.object &&
+       path.object && path.object->identity==mount->rootIdentity) {
+        int error=VfsGlobalDirectoryLocked(mount->coveredParent,out,capacity);
+        return error?error:VfsAppendLeaf(out,capacity,mount->coveredName);
+    }
+    char relative[512];int error=VfsBackendDirectoryLocked(path,relative,sizeof(relative),anyObject);
     if(error)return error;
-    auto* mount=static_cast<MountEntry*>(path.attachment);
     if(mount->rootObject) {
         char boundRoot[512];auto* rootObject=mount->rootObject;
         if(!rootObject->ops->directory_path)return -95;
@@ -430,10 +438,10 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
     if(flags&VFS_O_TRUNC) { if(!(openFlags&VFS_O_WRITE))openFlags|=VFS_O_READWRITE;openFlags|=VFS_O_WRITE; }
     Vnode* node=path.object->ops->open(path.object,openFlags,error);
     if(!node) { if(!*error)*error=-5;return nullptr; }
-    // Retained directory descriptors expose this exact identity to proc
-    // reporting. Acquiring it under an FD lock must need no backend callback
-    // and must not pin a vnode whose final close could run inside proc lookup.
-    if(node->type==VnodeType::Dir && !node->backendObject) {
+    // Every retained descriptor exposes this exact identity to proc reporting,
+    // including O_PATH regular files. Acquiring it under an FD lock must need
+    // no backend callback or vnode close inside proc lookup.
+    if(!node->backendObject) {
         node->backendObject=path.object;VfsObjectRetain(path.object);
     }
     // Ownership transfer occurs while the borrowed path still pins backing.

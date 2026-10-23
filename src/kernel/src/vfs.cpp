@@ -187,6 +187,9 @@ struct MountEntry {
     uint64_t         pathHolds;
     uint64_t         publication;
     VfsPath          covered;
+    VfsPath          coveredParent; // owned exact parent for a unique regular-file mountpoint
+    char             coveredName[256];
+    bool             rootFileUnlinked; // historical source label, never rebound to a replacement
     uint64_t         rootIdentity;
     const VfsObjectOps* rootObjectOps;
     bool             rootIdentityKnown;
@@ -356,7 +359,16 @@ struct VfsRenameLabels {
     }
 };
 static int VfsPrepareBackingRenameLabelsLocked(MountBacking* backing,const char* oldPhysical,
-                                               const char* newPhysical,VfsRenameLabels& labels);
+                                               const char* newPhysical,VfsRenameLabels& labels,uint64_t exactFileInode=0);
+
+static void VfsMarkFileRootsUnlinkedLocked(MountBacking* backing,uint64_t inode)
+{
+    if(!inode)return;
+    MountViewGuard held;
+    for(auto& mount:g_mounts)
+        if(VfsMountPublished(mount) && mount.coveredParent.object && mount.backing==backing && mount.rootIdentity==inode)
+            mount.rootFileUnlinked=true;
+}
 
 // Legacy kernel/driver path callbacks address the filesystem backing root.
 // A directory bind has a different attachment root: project the visible suffix
@@ -506,6 +518,8 @@ static int VfsResolvePath(const char* path,char* out,uint32_t size,PathWalkOptio
     return WalkPath<VnodeStat>(path,out,size,provider,options);
 }
 static bool VfsTrailingSlash(const char* path) { uint32_t n=StrLen(path);return n>1 && path[n-1]=='/'; }
+
+static int VfsAppendLeaf(char* path,uint32_t capacity,const char* leaf);
 
 // Object traversal shares the namespace transaction used by legacy mutations.
 #include "vfs_retained.inc"
@@ -1247,11 +1261,13 @@ int VfsRemovePath(const char* path, bool directory)
     const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
     if(VfsReadOnly(mount))return -30;
-    if (mount->backing->fsOps->remove_path) return mount->backing->fsOps->remove_path(mount->backing->mountPriv,mount->backing->pdrv,relative,directory);
     VnodeStat st{};
     if (int error=VfsLstatPathRaw(resolved,&st)) return error;
     if (st.isDir!=directory) return directory?-20:-21;
-    return mount->backing->fsOps->unlink ? mount->backing->fsOps->unlink(mount->backing->mountPriv,mount->backing->pdrv,relative) : -95;
+    int error=mount->backing->fsOps->remove_path?mount->backing->fsOps->remove_path(mount->backing->mountPriv,mount->backing->pdrv,relative,directory):
+        mount->backing->fsOps->unlink?mount->backing->fsOps->unlink(mount->backing->mountPriv,mount->backing->pdrv,relative):-95;
+    if(!error && !st.isDir)VfsMarkFileRootsUnlinkedLocked(mount->backing,st.ino);
+    return error;
 }
 
 int VfsMkdir(const char* path,uint16_t mode)
@@ -1319,12 +1335,19 @@ int VfsRename(const char* oldPath,const char* newPath)
     if (oldMount!=newMount) return -18;
     if(VfsReadOnly(oldMount) || VfsReadOnly(newMount))return -30;
     VfsRenameLabels labels;
-    VnodeStat sourceStat{};
+    VnodeStat sourceStat{},targetStat{};
     if(int error=VfsLstatPathRaw(oldResolved,&sourceStat))return error;
-    if(sourceStat.isDir && !StrEq(oldResolved,newResolved))
-        if(int labelError=VfsPrepareBackingRenameLabelsLocked(oldMount->backing,oldRelative,newRelative,labels))return labelError;
+    const int targetError=VfsLstatPathRaw(newResolved,&targetStat);
+    if(targetError && targetError!=-2)return targetError;
+    const bool same=!targetError && sourceStat.ino==targetStat.ino;
+    if(!StrEq(oldResolved,newResolved) && (sourceStat.isDir || (sourceStat.mode&0170000)==0100000))
+        if(int labelError=VfsPrepareBackingRenameLabelsLocked(oldMount->backing,oldRelative,newRelative,labels,sourceStat.isDir?0:sourceStat.ino))return labelError;
     const int error=oldMount->backing->fsOps->rename ? oldMount->backing->fsOps->rename(oldMount->backing->mountPriv,oldMount->backing->pdrv,oldRelative,newRelative) : -95;
-    if(!error)labels.Apply();
+    if(!error) {
+        labels.Apply();
+        if(!same && !targetError && !targetStat.isDir)
+            VfsMarkFileRootsUnlinkedLocked(newMount->backing,targetStat.ino);
+    }
     return error;
 }
 

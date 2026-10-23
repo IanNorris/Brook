@@ -58,11 +58,7 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
         VfsPathRelease(targetPath);return error;
     }
     if(!source[0])return -ENOENT;
-    VfsPath sourcePath{},targetPath{};
-    int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,source,&sourcePath);
-    if(!error)error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
-    if(!error)error=VfsMountNamespaceBind(lookup.fs.mountNamespace,sourcePath,targetPath,(flags&Recursive)!=0);
-    VfsPathRelease(targetPath);VfsPathRelease(sourcePath);return error;
+    return VfsMountNamespaceBindAt(lookup.fs.mountNamespace,lookup.fs.root,lookup.fs.cwd,source,target,(flags&Recursive)!=0);
 }
 static int64_t sys_umount2(uint64_t targetAddr,uint64_t flags,uint64_t,
                            uint64_t,uint64_t,uint64_t)

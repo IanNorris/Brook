@@ -164,7 +164,9 @@ int VfsRemoveAt(const VfsPath& root,const VfsPath& start,const char* text,bool d
     if(stat.isDir!=directory)return directory?-20:-21;
     if(directory && VfsVirtualChildrenLocked({parent.attachment,target.value}))return -39;
     if(VfsMappedMutationBusy(stat))return -16;
-    return parent.object->ops->remove?parent.object->ops->remove(parent.object,leaf,directory):-95;
+    int error=parent.object->ops->remove?parent.object->ops->remove(parent.object,leaf,directory):-95;
+    if(!error && !stat.isDir)VfsMarkFileRootsUnlinkedLocked(static_cast<MountEntry*>(parent.attachment)->backing,stat.ino);
+    return error;
 }
 int VfsSymlinkAt(const VfsPath& root,const VfsPath& start,const char* targetText,const char* text)
 {
@@ -266,7 +268,7 @@ static int VfsProjectedRenameDirectoryLocked(VfsPath path,MountBacking* backing,
     return -40;
 }
 static int VfsPrepareBackingRenameLabelsLocked(MountBacking* backing,const char* oldPhysical,
-                                               const char* newPhysical,VfsRenameLabels& labels)
+                                               const char* newPhysical,VfsRenameLabels& labels,uint64_t exactFileInode)
 {
     char source[512],target[512];
     if(StrLen(oldPhysical)+1>=sizeof(source) || StrLen(newPhysical)+1>=sizeof(target))return -36;
@@ -278,12 +280,15 @@ static int VfsPrepareBackingRenameLabelsLocked(MountBacking* backing,const char*
         // A source rename changes a bind's physical root even when its target
         // label is unchanged, including when that bind is the namespace root.
         char physical[512];StrCopy(physical,mount.physicalRoot,sizeof(physical));
-        int error=VfsRenamePhysicalLocked(mount.backing,backing,source,target,physical,sizeof(physical));
+        int error=0;
+        if(!mount.rootFileUnlinked && (!exactFileInode || (mount.coveredParent.object && mount.rootIdentity==exactFileInode)))
+            error=VfsRenamePhysicalLocked(mount.backing,backing,source,target,physical,sizeof(physical));
         if(error)return error;
         char projected[512];StrCopy(projected,mount.mountPoint,sizeof(projected));
-        bool relevant=VfsRenameMayMoveMountLabelLocked(&mount,backing);
+        bool relevant=!exactFileInode && VfsRenameMayMoveMountLabelLocked(&mount,backing);
         if(relevant && mount.linked && mount.covered.object) {
-            error=VfsProjectedRenameDirectoryLocked(mount.covered,backing,source,target,projected,sizeof(projected));
+            error=VfsProjectedRenameDirectoryLocked(mount.coveredParent.object?mount.coveredParent:mount.covered,backing,source,target,projected,sizeof(projected));
+            if(!error && mount.coveredParent.object)error=VfsAppendLeaf(projected,sizeof(projected),mount.coveredName);
             if(error)return error;
         }
         if(StrEq(projected,mount.mountPoint) && StrEq(physical,mount.physicalRoot))continue;
@@ -293,14 +298,19 @@ static int VfsPrepareBackingRenameLabelsLocked(MountBacking* backing,const char*
     return 0;
 }
 static int VfsPrepareRenameLabelsLocked(const VfsPath& oldParent,const char* oldName,
-                                        const VfsPath& newParent,const char* newName,VfsRenameLabels& labels)
+                                        const VfsPath& newParent,const char* newName,VfsRenameLabels& labels,uint64_t exactFileInode=0)
 {
+    if(exactFileInode) {
+        bool related=false;auto* backing=static_cast<MountEntry*>(oldParent.attachment)->backing;
+        for(const auto& mount:g_mounts)if(VfsMountPublished(mount) && mount.coveredParent.object && !mount.rootFileUnlinked && mount.backing==backing && mount.rootIdentity==exactFileInode) {related=true;break;}
+        if(!related)return 0;
+    }
     char source[512],target[512];int error=VfsBackendDirectoryLocked(oldParent,source,sizeof(source));
     if(error)return error;
     if((error=VfsAppendLeaf(source,sizeof(source),oldName)))return error;
     if((error=VfsBackendDirectoryLocked(newParent,target,sizeof(target))))return error;
     if((error=VfsAppendLeaf(target,sizeof(target),newName)))return error;
-    return VfsPrepareBackingRenameLabelsLocked(static_cast<MountEntry*>(oldParent.attachment)->backing,source,target,labels);
+    return VfsPrepareBackingRenameLabelsLocked(static_cast<MountEntry*>(oldParent.attachment)->backing,source,target,labels,exactFileInode);
 }
 int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,const VfsPath& newStart,const char* newText)
 {
@@ -325,9 +335,13 @@ int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
     if(VfsMappedMutationBusy(oldStat) || (target.value && VfsMappedMutationBusy(newStat)))return -16;
     auto* ops=oldParent.object->ops;if(!ops->rename || ops!=newParent.object->ops)return -95;
     VfsRenameLabels labels;
-    if(!same && oldStat.isDir)if(int error=VfsPrepareRenameLabelsLocked(oldParent,oldName,newParent,newName,labels))return error;
+    if(!same && (oldStat.isDir || (oldStat.mode&0170000)==0100000))if(int error=VfsPrepareRenameLabelsLocked(oldParent,oldName,newParent,newName,labels,oldStat.isDir?0:oldStat.ino))return error;
     int error=ops->rename(oldParent.object,oldName,newParent.object,newName);
-    if(!error)labels.Apply();
+    if(!error) {
+        labels.Apply();
+        if(!same && target.value && !newStat.isDir)
+            VfsMarkFileRootsUnlinkedLocked(static_cast<MountEntry*>(newParent.attachment)->backing,newStat.ino);
+    }
     return error;
 }
 int VfsChmodAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode)

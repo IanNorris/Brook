@@ -23,7 +23,7 @@ std::unordered_set<void*> allocations;
 long failAllocation=-1;
 unsigned schedulerLockDepth=0;
 struct Mount;
-struct Node { Mount* mount;uint64_t id;bool dir;Node* parent;std::map<std::string,Node*> children;std::string target;uint16_t mode=0; };
+struct Node { Mount* mount;uint64_t id;bool dir;Node* parent;std::map<std::string,Node*> children;std::string target;uint16_t mode=0;uint32_t nlink=1; };
 struct Mount { uint64_t identity=0;bool alive=false;unsigned live=0;unsigned closed=0;Node root{}; };
 Mount mounts[8];
 unsigned mountCalls[8]{},unmountCalls[8]{},syncCalls[8]{};
@@ -41,13 +41,13 @@ int makeObject(Node* source,brook::VfsObject** out){
 }
 void destroyObject(brook::VfsObject* object){auto& m=*node(object).mount;assert(m.alive && m.live);--m.live;brook::kfree(object);}
 int objectStat(brook::VfsObject* object,brook::VnodeStat* stat){
-    auto& n=node(object);assert(n.mount->alive);*stat={};stat->isDir=n.dir;stat->isSymlink=!n.target.empty();stat->ino=n.id;stat->dev=n.mount->identity;stat->mode=n.mode?n.mode:n.dir?0040755:0100644;return 0;
+    auto& n=node(object);assert(n.mount->alive);*stat={};stat->isDir=n.dir;stat->isSymlink=!n.target.empty();stat->ino=n.id;stat->dev=n.mount->identity;stat->mode=n.mode?n.mode:n.dir?0040755:0100644;stat->nlink=n.nlink;return 0;
 }
 int objectAccess(brook::VfsObject*,uint8_t,bool){return 0;}
 int objectChild(brook::VfsObject* parent,const char* name,brook::VfsObject** out,bool=false){
     auto& n=node(parent);assert(n.mount->alive);*out=nullptr;auto it=n.children.find(name);return it==n.children.end()?-2:makeObject(it->second,out);
 }
-int objectParent(brook::VfsObject* object,brook::VfsObject** out,bool=false){return makeObject(node(object).parent,out);}
+int objectParent(brook::VfsObject* object,brook::VfsObject** out,bool=false){if(!node(object).dir)return -20;return makeObject(node(object).parent,out);}
 int objectReadlink(brook::VfsObject* object,char* out,uint32_t size){auto& t=node(object).target;if(t.size()>size)return -36;std::memcpy(out,t.data(),t.size());return t.size();}
 void nodeClose(brook::Vnode* vn){assert(node(vn->backendObject).mount->alive);++node(vn->backendObject).mount->closed;}
 int nodeStat(brook::Vnode* vn,brook::VnodeStat* out){return objectStat(vn->backendObject,out);}
@@ -59,12 +59,13 @@ int nodeReaddir(brook::Vnode* vn,brook::DirEntry* out,uint32_t* cookie) {
     *out={};std::strncpy(out->name,it->first.c_str(),sizeof(out->name)-1);out->isDir=it->second->dir;++*cookie;return 1;
 }
 const brook::VnodeOps nodeOps={.open=nullptr,.read=nullptr,.write=nullptr,.readdir=nodeReaddir,.close=nodeClose,.stat=nodeStat,.fsync=nullptr,.truncate=nodeTruncate};
+bool omitMetadataReference=false;
 brook::Vnode* objectOpen(brook::VfsObject* object,int flags,int* error){
     if((node(object).mode&0170000)==0020000 && !(flags&brook::VFS_O_METADATA))++deviceActivations;
     *error=0;auto* vn=static_cast<brook::Vnode*>(brook::kmalloc(sizeof(brook::Vnode)));
     if(!vn){*error=-12;return nullptr;}
     *vn={};vn->ops=&nodeOps;vn->type=node(object).dir?brook::VnodeType::Dir:brook::VnodeType::File;vn->refCount=1;
-    vn->backendObject=object;brook::VfsObjectRetain(object);return vn;
+    if(!omitMetadataReference || !(flags&brook::VFS_O_METADATA)){vn->backendObject=object;brook::VfsObjectRetain(object);}return vn;
 }
 int objectFollow(const brook::VfsPath& path,brook::VfsPath* out) {
     auto* object=path.object;
@@ -90,8 +91,14 @@ int objectRename(brook::VfsObject* oldParent,const char* oldName,brook::VfsObjec
     auto found=old.children.find(oldName);if(found==old.children.end())return -2;
     auto* moved=found->second;old.children.erase(found);next.children[newName]=moved;moved->parent=&next;return 0;
 }
+int objectRemove(brook::VfsObject* parent,const char* name,bool directory) {
+    auto& p=node(parent);auto i=p.children.find(name);if(i==p.children.end())return -2;
+    auto* child=i->second;if(child->dir!=directory)return directory?-20:-21;
+    if(directory&&!child->children.empty())return -39;
+    p.children.erase(i);child->nlink=0;return 0;
+}
 const brook::VfsObjectOps objectOps={.destroy=destroyObject,.stat=objectStat,.access=objectAccess,
-    .lookup=objectChild,.parent=objectParent,.readlink=objectReadlink,.open=objectOpen,.rename=objectRename,.directory_path=objectDirectoryPath,.follow_link=objectFollow};
+    .lookup=objectChild,.parent=objectParent,.readlink=objectReadlink,.open=objectOpen,.remove=objectRemove,.rename=objectRename,.directory_path=objectDirectoryPath,.follow_link=objectFollow};
 bool mountBackend(uint8_t drive,void** out){assert(drive<8 && !mounts[drive].alive);auto& m=mounts[drive];++mountCalls[drive];m.alive=true;m.identity=drive+1;m.root={&m,1,true,&m.root,{}, {}};*out=&m;return true;}
 int unmountBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive && !m->live);auto index=m-mounts;++unmountCalls[index];if(rejectUnmount[index])return -5;m->alive=false;return 0;}
 unsigned freshUnmounts=0,freshUnmountAttempts=0;
@@ -123,13 +130,15 @@ brook::Vnode* legacyOpen(void* priv,uint8_t,const char* path,int flags){
     int error=0;auto* opened=objectOpen(object,flags,&error);brook::VfsObjectRelease(object);return opened;
 }
 int legacyRename(void* priv,uint8_t,const char* oldPath,const char* newPath){
-    // This fixture needs root-level ancestor renames only.
-    std::string oldName(oldPath),newName(newPath);
-    if(oldName[0]=='/')oldName.erase(0,1);if(newName[0]=='/')newName.erase(0,1);
-    assert(oldName.find('/')==std::string::npos && newName.find('/')==std::string::npos);
-    auto& children=static_cast<Mount*>(priv)->root.children;auto it=children.find(oldName);
-    if(it==children.end())return -2;
-    Node* original=it->second;children.erase(it);children[newName]=original;return 0;
+    auto* mount=static_cast<Mount*>(priv);
+    std::string oldText(oldPath),newText(newPath);
+    auto oldSlash=oldText.rfind('/'),newSlash=newText.rfind('/');
+    auto* oldParent=legacyLookup(mount,oldSlash==std::string::npos?"/":oldText.substr(0,oldSlash).c_str());
+    auto* newParent=legacyLookup(mount,newSlash==std::string::npos?"/":newText.substr(0,newSlash).c_str());
+    if(!oldParent || !newParent)return -2;
+    brook::VfsObject oldObject{&objectOps,oldParent,oldParent->id,1},newObject{&objectOps,newParent,newParent->id,1};
+    return objectRename(&oldObject,oldText.substr(oldSlash==std::string::npos?0:oldSlash+1).c_str(),
+                        &newObject,newText.substr(newSlash==std::string::npos?0:newSlash+1).c_str());
 }
 int syncBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive);++syncCalls[m-mounts];return 0;}
 const brook::VfsFsOps fsOps={.mount=mountBackend,.unmount=unmountBackend,.open=legacyOpen,.stat_path=legacyStat,.lstat_path=legacyStat,.unlink=nullptr,.mkdir=nullptr,.rename=legacyRename,.symlink=nullptr,.readlink=nullptr,.sync=syncBackend,.root_object=rootObject,.vnode_object=vnodeObject};
@@ -488,6 +497,86 @@ static void testReadOnlyMount(brook::MountNamespace* initial,const brook::VfsPat
     VfsRelease(metadata);VfsRelease(directory);VfsRelease(reader);VfsPathRelease(path);VfsPathRelease(bind);
     VfsPathRelease(source);VfsPathRelease(target);VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
     mounts[6].root.children["ns-a"]->children.erase("ro-file");assert(allocations.size()==allocated&&g_mounts.count==records);
+}
+static void testFileBinds(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    const auto allocated=allocations.size();const auto records=g_mounts.count;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};
+    assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
+    auto a=resolve(root,root,"ns-a"),b=resolve(root,root,"ns-b"),dest=resolve(root,root,"ns-target");
+    auto* originalSource=node(a.object).children["value"];auto* originalTarget=node(b.object).children["value"];
+    originalTarget->nlink=2;node(b.object).children["alias"]=originalTarget;
+    assert(VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b/value")==-95);
+    auto alias=resolve(root,root,"ns-b/alias");assert(alias.object->identity==201);VfsPathRelease(alias);
+    node(b.object).children.erase("alias");originalTarget->nlink=1;
+    originalSource->nlink=2;assert(VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b/value")==-95);originalSource->nlink=1;
+    assert(VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b")==-20);
+    assert(VfsMountNamespaceBindAt(ns,root,root,"ns-a","ns-b/value")==-20);
+    bool succeeded=false;
+    for(long failure=0;failure<128;++failure) {
+        auto before=allocations.size();auto count=g_mounts.count;failAllocation=failure;
+        int error=VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b/value");failAllocation=-1;
+        if(error) {assert(error==-12);VfsDrainMountCleanup();assert(allocations.size()==before && g_mounts.count==count);continue;}
+        succeeded=true;break;
+    }
+    assert(succeeded);auto bound=resolve(root,root,"ns-b/value");assert(bound.object->identity==101);
+    omitMetadataReference=true;int metadataError=0;auto* metadata=VfsPathOpen(bound,VFS_O_METADATA,&metadataError);omitMetadataReference=false;
+    assert(metadata && !metadataError && metadata->backendObject==bound.object && metadata->mountOwner==bound.attachment);VfsClose(metadata);
+    char fileReport[512];assert(!VfsPathObjectPathFromCallback(bound,fileReport,sizeof(fileReport)) && !std::strcmp(fileReport,"/ns-b/value"));
+    assert(VfsRemoveAt(root,b,"value",false)==-16);
+    assert(VfsRenameAt(root,root,"loose-file",b,"value")==-16);
+    assert(!VfsRenameAt(root,a,"value",a,"renamed"));
+    assert(std::strcmp(static_cast<MountEntry*>(bound.attachment)->physicalRoot,"/ns-a/renamed")==0);
+    Node replacement{&mounts[6],901,false,&node(a.object),{},{}};node(a.object).children["value"]=&replacement;
+    Node overwrite{&mounts[6],902,false,&node(a.object),{},{}};node(a.object).children["overwrite"]=&overwrite;
+    assert(!VfsRenameAt(root,a,"overwrite",a,"renamed"));originalSource->nlink=0;
+    assert(static_cast<MountEntry*>(bound.attachment)->rootFileUnlinked);
+    assert(!VfsRemoveAt(root,a,"renamed",false));
+    assert(!VfsRenameAt(root,root,"ns-a",root,"source-parent-moved"));
+    assert(!std::strcmp(static_cast<MountEntry*>(bound.attachment)->physicalRoot,"/ns-a/renamed"));
+    assert(!VfsRenameAt(root,root,"source-parent-moved",root,"ns-a"));
+    auto retained=resolve(root,root,"ns-b/value");assert(retained.object->identity==101);VfsPathRelease(retained);
+    // Stacking remains unambiguous even after the old bind source is unlinked.
+    assert(!VfsMountNamespaceBindAt(ns,root,root,"loose-file","ns-b/value"));
+    auto stack=resolve(root,root,"ns-b/value");assert(stack.object->identity==500);
+    assert(!VfsRenameAt(root,root,"ns-b",root,"file-target-moved"));
+    auto moved=resolve(root,root,"file-target-moved/value");assert(moved.object->identity==500);VfsPathRelease(moved);
+    assert(!std::strcmp(static_cast<MountEntry*>(bound.attachment)->mountPoint,"/file-target-moved/value"));
+    assert(!VfsPathObjectPathFromCallback(bound,fileReport,sizeof(fileReport)) && !std::strcmp(fileReport,"/file-target-moved/value"));
+    assert(!VfsRenameAt(root,root,"file-target-moved",root,"ns-b"));
+    assert(!VfsMountNamespaceDetach(ns,stack));VfsPathRelease(stack);
+    VfsDrainMountCleanup();assert(!VfsMountNamespaceRemount(ns,bound,7));int error=0;assert(!VfsPathOpen(bound,VFS_O_WRITE,&error)&&error==-30);
+    succeeded=false;
+    for(long failure=0;failure<512;++failure) {
+        auto before=allocations.size();auto count=g_mounts.count;failAllocation=failure;
+        int result=VfsMountNamespaceBind(ns,b,dest,true);failAllocation=-1;
+        if(result) {assert(result==-12);VfsDrainMountCleanup();assert(allocations.size()==before && g_mounts.count==count);continue;}
+        succeeded=true;break;
+    }
+    assert(succeeded);auto graft=resolve(root,root,"ns-target"),copiedFile=resolve(root,root,"ns-target/value");assert(copiedFile.object->identity==101);
+    assert(VfsMountAttributes(static_cast<MountEntry*>(copiedFile.attachment))==7);
+    assert(static_cast<MountEntry*>(copiedFile.attachment)->rootFileUnlinked);
+    MountNamespace* copy=nullptr;VfsPath cr{},cc{};
+    assert(!VfsMountNamespaceCopy(ns,root,root,&copy,&cr,&cc));assert(VfsMountNamespaceActivate(copy));
+    auto childFile=resolve(cr,cr,"ns-b/value");assert(!VfsMountNamespaceDetach(copy,childFile));VfsPathRelease(childFile);
+    childFile=resolve(cr,cr,"ns-b/value");assert(childFile.object->identity==201);VfsPathRelease(childFile);
+    childFile=resolve(cr,cr,"ns-target/value");assert(childFile.object->identity==101);assert(static_cast<MountEntry*>(childFile.attachment)->rootFileUnlinked);VfsPathRelease(childFile);
+    VfsMountNamespaceLeave(copy);VfsPathRelease(cr);VfsPathRelease(cc);VfsMountNamespaceRelease(copy);VfsDrainMountCleanup();
+    assert(!VfsMountNamespaceDetach(ns,bound));auto uncovered=resolve(root,root,"ns-b/value");assert(uncovered.object->identity==201);VfsPathRelease(uncovered);
+    VnodeStat st{};assert(!VfsPathStat(bound,&st)&&st.ino==101);assert(!VfsPathStat(copiedFile,&st)&&st.ino==101);
+    assert(!VfsMountNamespaceDetach(ns,graft));VfsPathRelease(graft);VfsPathRelease(copiedFile);VfsPathRelease(bound);
+    assert(!VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b/value"));
+    auto legacyBound=resolve(root,root,"ns-b/value");
+    assert(!VfsRename("/ns-a/value","/ns-a/renamed"));
+    assert(!std::strcmp(static_cast<MountEntry*>(legacyBound.attachment)->physicalRoot,"/ns-a/renamed"));
+    Node legacyOverwrite{&mounts[6],903,false,&node(a.object),{},{}};node(a.object).children["overwrite"]=&legacyOverwrite;
+    assert(!VfsRename("/ns-a/overwrite","/ns-a/renamed"));
+    assert(static_cast<MountEntry*>(legacyBound.attachment)->rootFileUnlinked);
+    assert(!VfsRemoveAt(root,a,"renamed",false));
+    assert(!VfsMountNamespaceDetach(ns,legacyBound));VfsPathRelease(legacyBound);
+    VfsPathRelease(a);VfsPathRelease(b);VfsPathRelease(dest);VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
+    originalSource->nlink=1;originalSource->parent=mounts[6].root.children["ns-a"];originalSource->parent->children["value"]=originalSource;
+    assert(allocations.size()==allocated && g_mounts.count==records);
 }
 static void testPivotRoots(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
     using namespace brook;
@@ -883,6 +972,7 @@ int main(){
     testMountInfo(initial,stableRoot);
     testMountRestrictions(initial,stableRoot);
     testReadOnlyMount(initial,stableRoot);
+    testFileBinds(initial,stableRoot);
     MountNamespace* parentNs=nullptr;VfsPath parentRoot{},parentCwd{};
     assert(!VfsMountNamespaceCopy(initial,stableRoot,originalSynthetic,&parentNs,&parentRoot,&parentCwd));
     assert(VfsMountNamespaceBind(parentNs,aPath,parentCwd)==-3);

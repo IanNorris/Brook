@@ -38,6 +38,10 @@ struct VfsMountInfo {
 int VfsMountNamespaceInfo(MountNamespace* ns,const VfsPath& root,VfsMountInfo** rows,uint32_t* count);
 void VfsMountInfoFree(VfsMountInfo* rows);
 // Core topology operations; syscall authorization/flag validation is separate.
+// Atomic pathname entry point also supports unique regular-file targets.
+// Hardlinked targets and nonregular nondirectory objects remain unsupported.
+int VfsMountNamespaceBindAt(MountNamespace* ns,const VfsPath& root,const VfsPath& start,
+    const char* source,const char* target,bool recursive=false);
 int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath& target,bool recursive=false);
 // Serialize exact namespace-root validation with creation of an FsContext.
 // The callback only registers a fully allocated context; no backend/free work.

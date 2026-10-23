@@ -21,8 +21,9 @@ static void VfsDetachMountLocked(MountEntry* mount)
     __atomic_fetch_or(&mount->referenceState,MOUNT_DETACHED,__ATOMIC_RELEASE);
     mount->owner=nullptr;mount->linked=false;
     VfsPath covered=mount->covered;mount->covered={};
+    VfsPath coveredParent=mount->coveredParent;mount->coveredParent={};
     mount->next=g_retiredMounts;g_retiredMounts=mount;
-    VfsPathRelease(covered);VfsMountDrop(mount); // publication lease
+    VfsPathRelease(coveredParent);VfsPathRelease(covered);VfsMountDrop(mount); // publication lease
 }
 static void VfsRetireNamespaceLocked(MountNamespace* ns)
 {
@@ -172,8 +173,9 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
         mount->backing->RetainLocked();mount->used=true;mount->linked=original->linked;mount->lockedInherited=original->lockedInherited;
         mount->publication=++g_mountPublication;mount->rootIdentity=original->rootIdentity;
         mount->rootObjectOps=original->rootObjectOps;mount->rootIdentityKnown=original->rootIdentityKnown;
-        mount->rootDevice=original->rootDevice;mount->attributes=original->attributes;
+        mount->rootDevice=original->rootDevice;mount->attributes=original->attributes;mount->rootFileUnlinked=original->rootFileUnlinked;
         StrCopy(mount->physicalRoot,original->physicalRoot,sizeof(mount->physicalRoot));
+        StrCopy(mount->coveredName,original->coveredName,sizeof(mount->coveredName));
         StrCopy(mount->mountPoint,original->mountPoint,sizeof(mount->mountPoint));
         StrCopy(mount->fsType,original->fsType,sizeof(mount->fsType));
         memo->oldMount=original;memo->newMount=mount;memo->next=map.attachments;map.attachments=memo;
@@ -181,6 +183,7 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
     }
     if(!error)for(auto* entry=map.attachments;entry;entry=entry->next) {
         error=map.ClonePath(entry->oldMount->covered,&entry->newMount->covered);
+        if(!error)error=map.ClonePath(entry->oldMount->coveredParent,&entry->newMount->coveredParent);
         if(!error && entry->oldMount->rootObject) {
             error=map.CloneObject(entry->oldMount->rootObject,&entry->newMount->rootObject);
             if(!error) {entry->newMount->rootIdentity=entry->newMount->rootObject->identity;entry->newMount->rootObjectOps=entry->newMount->rootObject->ops;}
@@ -230,6 +233,11 @@ int VfsMountNamespaceInfo(MountNamespace* ns,const VfsPath& root,VfsMountInfo** 
                 auto& row=rows[used++];row.id=id;row.parent=parentId;
                 row.device=mount.rootDevice;row.attributes=mount.attributes;
                 StrCopy(row.root,mount.physicalRoot,sizeof(row.root));
+                if(mount.rootFileUnlinked) {
+                    constexpr const char* suffix=" (deleted)";uint32_t length=StrLen(row.root);
+                    if(length+StrLen(suffix)>=sizeof(row.root)) {error=-36;break;}
+                    StrCopy(row.root+length,suffix,sizeof(row.root)-length);
+                }
                 StrCopy(row.mountPoint,mount.mountPoint,sizeof(row.mountPoint));
                 StrCopy(row.fsType,mount.fsType,sizeof(row.fsType));
             }
@@ -366,8 +374,9 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
         mount->lockedInherited=original->lockedInherited;
         mount->rootIdentity=original->rootIdentity;mount->rootObjectOps=original->rootObjectOps;
         mount->rootIdentityKnown=original->rootIdentityKnown;
-        mount->rootDevice=original->rootDevice;mount->attributes=original->attributes;
+        mount->rootDevice=original->rootDevice;mount->attributes=original->attributes;mount->rootFileUnlinked=original->rootFileUnlinked;
         StrCopy(mount->physicalRoot,original->physicalRoot,sizeof(mount->physicalRoot));
+        StrCopy(mount->coveredName,original->coveredName,sizeof(mount->coveredName));
         StrCopy(mount->fsType,original->fsType,sizeof(mount->fsType));
         memo->oldMount=original;memo->newMount=mount;memo->next=map.attachments;map.attachments=memo;
         *out=mount;return 0;
@@ -387,7 +396,7 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
     // every edge, virtual ancestor and reporting label has been prepared.
     if(!error)for(auto* original=g_mounts.head;original;original=original->next) {
         if(!VfsMountPublished(*original) || original->owner!=sourceMount->owner || original==sourceMount || !original->linked)continue;
-        bool included=false;error=VfsBindContainsLocked(source,original->covered,&included);
+        bool included=false;error=VfsBindContainsLocked(source,original->coveredParent.object?original->coveredParent:original->covered,&included);
         if(error)break;if(!included)continue;
         if(count>=VFS_MAX_MOUNT_DEPTH || count>=~uint32_t{0}-g_mounts.count) {error=-12;break;}
         MountEntry* mount=nullptr;error=prepare(original,&mount);if(error)break;++count;
@@ -395,6 +404,7 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
     if(!error)for(auto* entry=map.attachments;entry;entry=entry->next) {
         if(entry->newMount==graft)continue;
         error=map.ClonePath(entry->oldMount->covered,&entry->newMount->covered);
+        if(!error)error=map.ClonePath(entry->oldMount->coveredParent,&entry->newMount->coveredParent);
         if(!error && entry->oldMount->rootObject) {
             error=map.CloneObject(entry->oldMount->rootObject,&entry->newMount->rootObject);
             if(!error) {entry->newMount->rootIdentity=entry->newMount->rootObject->identity;entry->newMount->rootObjectOps=entry->newMount->rootObject->ops;}
@@ -407,7 +417,10 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
             // Reporting alone uses names. New virtual ancestors are deliberately
             // unpublished, so derive their labels from the frozen old tree.
             char oldLabel[512];
-            error=VfsGlobalDirectoryLocked(entry->oldMount->covered,oldLabel,sizeof(oldLabel));
+            if(entry->oldMount->coveredParent.object) {
+                error=VfsGlobalDirectoryLocked(entry->oldMount->coveredParent,oldLabel,sizeof(oldLabel));
+                if(!error)error=VfsAppendLeaf(oldLabel,sizeof(oldLabel),entry->oldMount->coveredName);
+            } else error=VfsGlobalDirectoryLocked(entry->oldMount->covered,oldLabel,sizeof(oldLabel));
             if(!error) {
                 const bool sourceRoot=StrEq(sourceLabel,"/");
                 if(!sourceRoot && !VfsComponentPrefix(sourceLabel,oldLabel))error=-2;
@@ -430,6 +443,7 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
         // virtual objects may own further parent paths into this prepared set.
         for(auto* entry=map.attachments;entry;entry=entry->next) {
             auto* mount=entry->newMount;VfsPathRelease(mount->covered);mount->covered={};
+            VfsPathRelease(mount->coveredParent);mount->coveredParent={};
             VfsObjectRelease(mount->rootObject);mount->rootObject=nullptr;
         }
         while(map.objects) {auto* memo=map.objects;map.objects=memo->next;VfsObjectRelease(memo->newObject);kfree(memo);}
@@ -449,10 +463,10 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
     IrqSpinLockRelease(&g_mountViewLock,flags);
     return 0;
 }
-int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath& inputTarget,bool recursive)
+static int VfsMountNamespaceBindLocked(MountNamespace* ns,const VfsPath& source,const VfsPath& inputTarget,bool recursive,
+    const char* sourceLabel=nullptr,const char* targetLabel=nullptr,const VfsPath* coveredParent=nullptr,const char* coveredName=nullptr)
 {
     if(!ns || !source.object || !source.attachment || !inputTarget.object || !inputTarget.attachment)return -22;
-    FileMutationGuard transaction;
     if(!ns->life.Published())return -3;
     VfsMountTargetLease lease;if(int error=lease.Follow(inputTarget))return error;
     const auto& target=lease.value;
@@ -461,21 +475,80 @@ int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath
     auto* parent=static_cast<MountEntry*>(target.attachment);
     if(parent->owner!=ns || !VfsMountPublished(*parent))return -22;
     if(parent==ns->root && target.object->identity==parent->rootIdentity && target.object->ops==parent->rootObjectOps)return -95;
-    VnodeStat stat{};int error=VfsObjectStatLocked(source.object,&stat);
-    if(error)return error;if(!stat.isDir)return -20;
-    if((error=VfsObjectStatLocked(target.object,&stat)))return error;if(!stat.isDir)return -20;
-    if(recursive)return VfsMountNamespaceRecursiveBindLocked(ns,source,target);
+    VnodeStat sourceStat{},targetStat{};int error=VfsObjectStatLocked(source.object,&sourceStat);
+    if(error)return error;
+    if((error=VfsObjectStatLocked(target.object,&targetStat)))return error;
+    if(sourceStat.isDir!=targetStat.isDir)return -20;
+    if(!sourceStat.isDir) {
+        if((sourceStat.mode&0170000)!=0100000 || (targetStat.mode&0170000)!=0100000)return -95;
+        // Crossing currently keys on backend identity. Unique targets are
+        // unambiguous while link/linkat remain unsupported; attached targets
+        // cannot be renamed, unlinked or replaced through VFS mutation gates.
+        const bool alreadyUniqueFileMount=parent->coveredParent.object && target.object->identity==parent->rootIdentity && target.object->ops==parent->rootObjectOps;
+        if(targetStat.nlink!=1 && !alreadyUniqueFileMount)return -95;
+        auto* origin=static_cast<MountEntry*>(source.attachment);
+        const bool sourceFileMount=origin->coveredParent.object && source.object->identity==origin->rootIdentity && source.object->ops==origin->rootObjectOps;
+        if((sourceStat.nlink!=1 && !sourceFileMount) || !sourceStat.ino)return -95;
+        if(!sourceLabel || !targetLabel || !coveredParent || !coveredParent->object || !coveredName || !coveredName[0])return -95;
+    }
+    if(recursive && sourceStat.isDir)return VfsMountNamespaceRecursiveBindLocked(ns,source,target);
     auto* mount=static_cast<MountEntry*>(kmalloc(sizeof(MountEntry)));if(!mount)return -12;
-    *mount={};error=VfsGlobalDirectoryLocked(target,mount->mountPoint,sizeof(mount->mountPoint));
-    if(!error)error=VfsBackendDirectoryLocked(source,mount->physicalRoot,sizeof(mount->physicalRoot));
+    *mount={};
+    if(sourceStat.isDir) {
+        error=VfsGlobalDirectoryLocked(target,mount->mountPoint,sizeof(mount->mountPoint));
+        if(!error)error=VfsBackendDirectoryLocked(source,mount->physicalRoot,sizeof(mount->physicalRoot));
+    } else {
+        if(StrLen(sourceLabel)>=sizeof(mount->physicalRoot) || StrLen(targetLabel)>=sizeof(mount->mountPoint) || StrLen(coveredName)>=sizeof(mount->coveredName))error=-36;
+        else {StrCopy(mount->physicalRoot,sourceLabel,sizeof(mount->physicalRoot));StrCopy(mount->mountPoint,targetLabel,sizeof(mount->mountPoint));StrCopy(mount->coveredName,coveredName,sizeof(mount->coveredName));}
+    }
     if(error) {kfree(mount);return error;}
     mount->rootDevice=static_cast<MountEntry*>(source.attachment)->rootDevice;mount->attributes=static_cast<MountEntry*>(source.attachment)->attributes;
     mount->owner=ns;mount->referenceState=1;mount->backing=static_cast<MountEntry*>(source.attachment)->backing;
     mount->backing->RetainLocked();mount->rootObject=source.object;VfsObjectRetain(source.object);
     mount->rootIdentity=source.object->identity;mount->rootObjectOps=source.object->ops;mount->rootIdentityKnown=true;
-    mount->covered=target;VfsPathRetain(target);mount->linked=true;mount->used=true;mount->publication=++g_mountPublication;
+    mount->covered=target;VfsPathRetain(target);
+    if(!sourceStat.isDir) {
+        mount->coveredParent=*coveredParent;VfsPathRetain(mount->coveredParent);
+        auto* origin=static_cast<MountEntry*>(source.attachment);
+        mount->rootFileUnlinked=origin->coveredParent.object && origin->rootFileUnlinked;
+    }
+    mount->linked=true;mount->used=true;mount->publication=++g_mountPublication;
     StrCopy(mount->fsType,static_cast<MountEntry*>(source.attachment)->fsType,sizeof(mount->fsType));
     g_mounts.Publish(mount);return 0;
+}
+int VfsMountNamespaceBind(MountNamespace* ns,const VfsPath& source,const VfsPath& target,bool recursive)
+{
+    FileMutationGuard transaction;return VfsMountNamespaceBindLocked(ns,source,target,recursive);
+}
+// Reporting metadata comes from the same retained walks as the exact operands.
+// These names never select/reopen a source or covered target.
+static int VfsBindWalkLabelLocked(const VfsOwnedWalk& walk,bool backend,char* out,uint32_t capacity)
+{
+    const auto& value=walk.value;VnodeStat stat{};
+    if(int error=VfsObjectStatLocked(value.object.object,&stat))return error;
+    if(stat.isDir)return backend?VfsBackendDirectoryLocked(value.object,out,capacity):VfsGlobalDirectoryLocked(value.object,out,capacity);
+    if(backend) {
+        auto* mount=static_cast<MountEntry*>(value.object.attachment);
+        if(mount->rootObject && value.object.object->identity==mount->rootIdentity && value.object.object->ops==mount->rootObjectOps) {
+            if(StrLen(mount->physicalRoot)>=capacity)return -36;
+            StrCopy(out,mount->physicalRoot,capacity);return 0;
+        }
+    }
+    if(!value.parent.object)return -2;
+    int error=backend?VfsBackendDirectoryLocked(value.parent,out,capacity):VfsGlobalDirectoryLocked(value.parent,out,capacity);
+    return error?error:VfsAppendLeaf(out,capacity,value.leaf);
+}
+int VfsMountNamespaceBindAt(MountNamespace* ns,const VfsPath& root,const VfsPath& start,const char* sourceText,const char* targetText,bool recursive)
+{
+    FileMutationGuard transaction;VfsOwnedWalk source,target;
+    if(int error=VfsWalkAtLocked(root,start,sourceText,source))return error;
+    if(int error=VfsWalkAtLocked(root,start,targetText,target))return error;
+    VnodeStat stat{};if(int error=VfsObjectStatLocked(source.value.object.object,&stat))return error;
+    if(stat.isDir)return VfsMountNamespaceBindLocked(ns,source.value.object,target.value.object,recursive);
+    char sourceLabel[512],targetLabel[512];
+    if(int error=VfsBindWalkLabelLocked(source,true,sourceLabel,sizeof(sourceLabel)))return error;
+    if(int error=VfsBindWalkLabelLocked(target,false,targetLabel,sizeof(targetLabel)))return error;
+    return VfsMountNamespaceBindLocked(ns,source.value.object,target.value.object,recursive,sourceLabel,targetLabel,&target.value.parent,target.value.leaf);
 }
 int VfsMountNamespacePivotRoot(MountNamespace* ns,const VfsPath& oldRoot,const VfsPath& newRoot,const VfsPath& putOld)
 {
@@ -624,8 +697,9 @@ int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target)
     while(removed) {
         auto* mount=removed;removed=mount->next;
         VfsPath covered=mount->covered;mount->covered={};
+    VfsPath coveredParent=mount->coveredParent;mount->coveredParent={};
         mount->next=g_retiredMounts;g_retiredMounts=mount;
-        VfsPathRelease(covered);VfsMountDrop(mount);
+        VfsPathRelease(coveredParent);VfsPathRelease(covered);VfsMountDrop(mount);
     }
     VfsCollectRetiredMountsLocked();return 0;
 }
