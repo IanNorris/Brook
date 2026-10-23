@@ -11,6 +11,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "syscall.h"
+#include "robust_futex.h"
 #include "posix_timer.h"
 #include "sysv_sem.h"
 #include "signal_fd.h"
@@ -1071,14 +1072,13 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
 // Uses the global page cache for sharing and 64KB read-ahead.
 // No metadata pointer survives unlocking. The transaction owns both prepared
 // frames and the immutable backing pin through I/O, validation and retirement.
-MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error) {
+static MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpaceState* space,uint64_t address,uint64_t error,uint32_t retryBudget=0) {
     if (error & 1) return MappingFaultResult::Unhandled;
-    Process* actor=ProcessCurrent();
-    if (!actor || !actor->addressSpace || actor->addressSpace->kernel) return MappingFaultResult::Unhandled;
+    if (!actor || !space || space->kernel) return MappingFaultResult::Unhandled;
     const uint64_t page=address&~uint64_t{4095};
     const uint32_t access=(error&2)?2u:((error&16)?4u:1u);
-    for (;;) {
-        MappingTransaction operation(actor,actor->addressSpace);
+    for(uint32_t attempt=0;!retryBudget || attempt<retryBudget;++attempt) {
+        MappingTransaction operation(actor,space);
         if(!operation.LockFaultRange(page))return MappingFaultResult::Unhandled;MappingFaultSnapshot snapshot{};
         if (!operation.CaptureRange(page,access,snapshot)) return MappingFaultResult::Unhandled;
         if(snapshot.range.backing && snapshot.range.backing->file && snapshot.range.backing->file->mappingError)
@@ -1161,7 +1161,7 @@ MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error) {
             auto* backing=static_cast<MemFdData*>(snapshot.range.backing->object);
             const uint64_t offset=snapshot.range.offset+page-snapshot.range.begin;
             if (offset>=__atomic_load_n(&backing->size,__ATOMIC_ACQUIRE)) return MappingFaultResult::Unhandled;
-            auto physical=MemFdGetOrAllocPage(backing,offset/4096,actor->pid);
+            auto physical=MemFdGetOrAllocPage(backing,offset/4096,space->allocationPid);
             if (!physical || !operation.StagePage(0,physical,false)) return MappingFaultResult::Unhandled;
         } else if (!operation.PrepareZeroed(MemTag::User,operation.Space()->allocationPid)) return MappingFaultResult::Unhandled;
         if (!MappingFaultTestBarrier(operation.Space(),page,2)) return MappingFaultResult::Unhandled;
@@ -1177,6 +1177,11 @@ MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error) {
             if (operation.PreparedPage(i)) (void)operation.PublishFault(snapshot,i,VirtualAddress(page+i*4096),access,cachedPrivate);
         return MappingFaultResult::Resolved;
     }
+    return MappingFaultResult::Unhandled; // bounded remote cleanup under remap churn
+}
+MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error) {
+    auto* actor=ProcessCurrent();
+    return ResolveMappingFaultForSpace(actor,actor?actor->addressSpace:nullptr,address,error);
 }
 extern "C" bool FileMapHandleUserFault(uint64_t address,uint64_t error) {
     return ResolveUserMappingFault(address,error)==MappingFaultResult::Resolved;
@@ -12355,15 +12360,32 @@ static int64_t sys_faccessat2(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
 }
 
 // ---------------------------------------------------------------------------
-// sys_set_robust_list (273) — robust futex list (stub)
+// sys_set/get_robust_list — per-thread x86-64 robust-list registration.
 // ---------------------------------------------------------------------------
-
-static int64_t sys_set_robust_list(uint64_t, uint64_t, uint64_t,
-                                    uint64_t, uint64_t, uint64_t)
+static int64_t sys_set_robust_list(uint64_t head,uint64_t length,uint64_t,uint64_t,uint64_t,uint64_t)
 {
-    return 0; // Success stub — no futex support yet
+    if(length!=24)return -EINVAL;
+    auto* proc=ProcessCurrent();if(!proc || proc->isKernelThread)return -ESRCH;
+    __atomic_store_n(&proc->robustListHead,head,__ATOMIC_RELEASE);
+    return 0; // Like Linux, registration does not dereference user memory.
+}
+static int64_t sys_get_robust_list(uint64_t pid,uint64_t headOut,uint64_t lengthOut,uint64_t,uint64_t,uint64_t)
+{
+    auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
+    if(pid>65535)return -ESRCH;
+    auto* target=pid?SchedulerFindProcessReference(static_cast<uint16_t>(pid)):proc;
+    if(!target)return -ESRCH;
+    const bool held=pid!=0;
+    // Conservative bounded access policy: only the calling thread group.
+    // Cross-process ptrace credential/dumpability policy is not implemented.
+    if(target->tgid!=proc->tgid) {if(held)SchedulerReleaseWaitReference(target);return -EPERM;}
+    const uint64_t head=__atomic_load_n(&target->robustListHead,__ATOMIC_ACQUIRE),length=24;
+    if(held)SchedulerReleaseWaitReference(target);
+    if(!UserBufferWritable(headOut,8) || !UserBufferWritable(lengthOut,8))return -EFAULT;
+    return CopyToUser(lengthOut,&length,8) && CopyToUser(headOut,&head,8)?0:-EFAULT;
 }
 
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // sys_rseq (334) — restartable sequences (stub)
 // ---------------------------------------------------------------------------
@@ -12644,6 +12666,119 @@ static int FutexResolveKey(Process* process,uint64_t address,uint64_t operation,
     if(!transaction.LockFaultRange(address))return -ENOMEM;
     return FutexMappedKey(process,address,operation,
         MappingRangeFind(process->addressSpace->ranges,address),owner,keyAddress);
+}
+
+// Target-AS access never switches CR3 or dereferences the target's virtual
+// address in the cleanup worker. Fault preparation precedes publication locks.
+static bool RobustEnsurePage(Process* actor,AddressSpaceState* space,uint64_t address,uint32_t access)
+{
+    auto state=UserMappingPageAccess(actor,space,address,access,true);
+    if(state==UserPageAccess::Missing) {
+        if(ResolveMappingFaultForSpace(actor,space,address,4|((access&2)?2:0),8)!=MappingFaultResult::Resolved)return false;
+        state=UserMappingPageAccess(actor,space,address,access,true);
+    }
+    return state==UserPageAccess::Ready;
+}
+static bool RobustRead(Process* actor,AddressSpaceState* space,uint64_t address,void* output,uint64_t length)
+{
+    constexpr uint64_t End=0x0000800000000000ULL;
+    if(address<VIRTUAL_NULL_GUARD || address>=End || length>End-address)return false;
+    auto* bytes=static_cast<uint8_t*>(output);
+    while(length) {
+        uint64_t count=4096-(address&4095);if(count>length)count=length;
+        if(!RobustEnsurePage(actor,space,address,1))return false;
+        MappingTransaction mapping(actor,space);
+        if(!mapping.LockFaultRange(address))return false;
+        const auto* range=MappingRangeFind(space->ranges,address);
+        const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(address));
+        if(!range || range->kind==MappingKind::Device || !(range->protection&1) || range->end-address<count ||
+           !(leaf&VMM_PRESENT) || !(leaf&VMM_USER))return false;
+        const auto physical=VmmVirtToPhys(space->pageTable,VirtualAddress(address));
+        if(!physical)return false;
+        memcpy(bytes,reinterpret_cast<const void*>(PhysToVirt(physical).raw()),count);
+        address+=count;bytes+=count;length-=count;
+    }
+    return true;
+}
+static bool RobustWord(Process* actor,Process* target,AddressSpaceState* space,uint64_t address,bool pending)
+{
+    constexpr uint32_t OwnerMask=0x3fffffff,Waiters=0x80000000,Died=0x40000000;
+    if(address&3)return false;
+    uint32_t observed=0;
+    if(!RobustRead(actor,space,address,&observed,4))return false;
+    if((observed&OwnerMask)!=target->pid && !(pending && !(observed&OwnerMask)))return true;
+    for(unsigned retry=0;retry<16;++retry) {
+        const bool released=pending && !(observed&OwnerMask);
+        const uint32_t access=released?1u:2u;
+        if(!RobustEnsurePage(actor,space,address,access))return false;
+        uint64_t owner=0,key=0;bool wake=false,done=false;
+        {
+            MappingTransaction mapping(actor,space);
+            if(!mapping.LockFaultRange(address))return false;
+            const auto* range=MappingRangeFind(space->ranges,address);
+            const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(address));
+            if(!range || range->kind==MappingKind::Device || (range->protection&access)!=access || range->end-address<4 ||
+               !(leaf&VMM_PRESENT) || !(leaf&VMM_USER) || ((access&2) && !(leaf&VMM_WRITABLE)))continue;
+            if(FutexMappedKey(target,address,0,range,owner,key))return false;
+            const auto physical=VmmVirtToPhys(space->pageTable,VirtualAddress(address));
+            if(!physical)return false;
+            auto* word=reinterpret_cast<uint32_t*>(PhysToVirt(physical).raw());
+            const uint64_t flags=IrqSpinLockAcquire(&g_futexLock);
+            observed=__atomic_load_n(word,__ATOMIC_ACQUIRE);
+            if(pending && !(observed&OwnerMask)) {wake=true;done=true;}
+            else if((observed&OwnerMask)!=target->pid)done=true;
+            else if(access&2) {
+                const uint32_t replacement=(observed&Waiters)|Died;
+                wake=(observed&Waiters)!=0;
+                done=__atomic_compare_exchange_n(word,&observed,replacement,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+            }
+            IrqSpinLockRelease(&g_futexLock,flags);
+        }
+        // No mapping/file lock may survive into scheduler wake operations.
+        if(done) {
+            if(wake && !FutexWake(owner,key,1) && (owner>>63))
+                (void)FutexWake(target->tgid,address,1);
+            return true;
+        }
+    }
+    return false;
+}
+void RobustFutexCleanup(Process* target)
+{
+    if(!target || target->isKernelThread)return;
+    auto* actor=ProcessCurrent();if(!actor)return;
+    KernelOperationGuard protectedActor(actor);
+    uint32_t state=__atomic_load_n(&target->robustExitState,__ATOMIC_ACQUIRE);
+    for(;;) {
+        if(state>=2)return;
+        if(__atomic_compare_exchange_n(&target->robustExitState,&state,2,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))break;
+    }
+    auto* space=target->addressSpace;
+    AddressSpaceRef(space);
+    const uint64_t head=__atomic_exchange_n(&target->robustListHead,0,__ATOMIC_ACQ_REL);
+    struct Head {uint64_t next;int64_t offset;uint64_t pending;} list{};
+    if(head && space && !space->kernel && RobustRead(actor,space,head,&list,sizeof(list))) {
+        auto address=[&](uint64_t entry,uint64_t& result) {
+            const uint64_t raw=entry&~uint64_t{1};
+            if(list.offset>=0)return !__builtin_add_overflow(raw,static_cast<uint64_t>(list.offset),&result);
+            const uint64_t distance=uint64_t{0}-static_cast<uint64_t>(list.offset);
+            if(raw<distance)return false;result=raw-distance;return true;
+        };
+        uint64_t entry=list.next;
+        for(unsigned count=0;count<2048 && (entry&~uint64_t{1})!=head;++count) {
+            const uint64_t node=entry&~uint64_t{1};uint64_t next=0,word=0;
+            const bool gotNext=RobustRead(actor,space,node,&next,8);
+            if(node!=(list.pending&~uint64_t{1}) && !(entry&1) &&
+               (!address(entry,word) || !RobustWord(actor,target,space,word,false)))break;
+            if(!gotNext)break;
+            entry=next;
+        }
+        uint64_t word=0;
+        if(list.pending && !(list.pending&1) && address(list.pending,word))
+            (void)RobustWord(actor,target,space,word,true);
+    }
+    AddressSpaceUnref(space);
+    __atomic_store_n(&target->robustExitState,3,__ATOMIC_RELEASE);
 }
 
 static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
@@ -14298,6 +14433,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_SEMTIMEDOP]      = sys_semtimedop;
     g_syscallTable[SYS_SEMCTL]          = sys_semctl;
     g_syscallTable[SYS_SET_ROBUST_LIST] = sys_set_robust_list;
+    g_syscallTable[SYS_GET_ROBUST_LIST] = sys_get_robust_list;
     g_syscallTable[SYS_FACCESSAT]       = sys_faccessat;
     g_syscallTable[SYS_RSEQ]            = sys_rseq;
     g_syscallTable[SYS_CLOSE_RANGE]     = sys_close_range;
@@ -14588,7 +14724,7 @@ static const char* SyscallName(uint64_t num)
     case 230: return "clock_nanosleep"; case 231: return "exit_group";
     case 234: return "tgkill";    case 257: return "openat";
     case 262: return "newfstatat"; case 266: return "symlinkat"; case 267: return "readlinkat";
-    case 270: return "pselect6";  case 271: return "ppoll";     case 273: return "set_robust_list";
+    case 270: return "pselect6";  case 271: return "ppoll";     case 273: return "set_robust_list"; case 274: return "get_robust_list";
     case 292: return "dup3";
     case 290: return "eventfd2";  case 293: return "pipe2";     case 302: return "prlimit64";
     case 299: return "recvmmsg";  case 307: return "sendmmsg";

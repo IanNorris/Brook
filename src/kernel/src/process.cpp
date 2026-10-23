@@ -8,6 +8,7 @@
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
 
 #include "process.h"
+#include "robust_futex.h"
 #include "process_fs.h"
 #include <stddef.h>
 #include "posix_timer.h"
@@ -1109,6 +1110,7 @@ Process* ProcessFork(Process* parent, uint64_t userRip,
     child->threadLeader = child;
     child->isThread = false;
     child->clearChildTid = 0;
+    child->robustListHead=0;child->robustExitState=0;child->robustExitNext=nullptr;
     child->parentSetTid = 0;
     child->vforkParent = nullptr;
     child->blockedOnRwLock = nullptr;
@@ -1332,6 +1334,7 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     }
     thread->threadLeader = leader;
     thread->isThread = true;
+    thread->robustListHead=0;thread->robustExitState=0;thread->robustExitNext=nullptr;
     thread->stopReported = false;
     thread->continuedPending = false;
     thread->resumePending = false;
@@ -1575,6 +1578,8 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
         }
     }
     PosixTimersCleanup(proc, true);
+    RobustFutexCleanup(proc); // old address space and TID, before exec commit
+    proc->robustExitState=0;
     AddressSpaceState* previous = proc->addressSpace;
     UserFramebufferPublish(proc,nullptr,nullptr,0,0,0,0);
     PageTable kernelPt = VmmKernelCR3();

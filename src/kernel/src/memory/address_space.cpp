@@ -6,6 +6,7 @@
 #include "process.h"
 #include "scheduler.h"
 #include "syscall.h"
+#include "robust_futex.h"
 #include "vfs.h"
 #include "mount_namespace.h"
 #ifdef BROOK_HOST_TEST
@@ -28,6 +29,8 @@ static AddressSpaceState* g_spaceHead;
 static AddressSpaceState* g_spaceTail;
 static Process* g_processHead;
 static Process* g_processTail;
+static Process* g_robustHead;
+static Process* g_robustTail;
 static Process* g_cleanupWorker;
 static ProcessCleanupStatus g_cleanupStatus{};
 ProcessCleanupStatus ProcessGetCleanupStatus() {
@@ -142,6 +145,20 @@ void ProcessQueueDestroy(Process* process) {
     IrqSpinLockRelease(&g_cleanupLock, flags);
     WakeCleanupWorker();
 }
+void ProcessQueueRobustExit(Process* process) {
+    if(!process || process->isKernelThread ||
+       !__atomic_load_n(&process->robustListHead,__ATOMIC_ACQUIRE))return;
+    uint32_t expected=0;
+    if(!__atomic_compare_exchange_n(&process->robustExitState,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;
+    ProcessRef(process); // Existing wait/reap gates require this to be zero.
+    const uint64_t flags=IrqSpinLockAcquire(&g_cleanupLock);
+    process->robustExitNext=nullptr;
+    if(g_robustTail)g_robustTail->robustExitNext=process;else g_robustHead=process;
+    g_robustTail=process;
+    ++g_cleanupStatus.queuedProcesses;
+    IrqSpinLockRelease(&g_cleanupLock,flags);
+    WakeCleanupWorker();
+}
 void ProcessDestroyAndWait(Process* process) {
     Process* waiter = ProcessCurrent();
     if (!waiter || !waiter->kernelRegionDepth)
@@ -182,6 +199,31 @@ static void DestroyAddressSpace(AddressSpaceState* space) {
     IrqSpinLockRelease(&g_cleanupLock,flags);
 }
 bool ProcessCleanupStep() {
+    uint64_t robustFlags=IrqSpinLockAcquire(&g_cleanupLock);
+    Process* robust=g_robustHead;
+    bool pendingRobust=false;
+    if(robust) {
+        g_robustHead=robust->robustExitNext;
+        if(!g_robustHead)g_robustTail=nullptr;
+        robust->robustExitNext=nullptr;
+        if(__atomic_load_n(&robust->runningOnCpu,__ATOMIC_ACQUIRE)>=0 ||
+           robust->state!=ProcessState::Terminated) {
+            if(g_robustTail)g_robustTail->robustExitNext=robust;else g_robustHead=robust;
+            g_robustTail=robust;robust=nullptr;pendingRobust=true;
+        } else {
+            --g_cleanupStatus.queuedProcesses;
+            ++g_cleanupStatus.activeFinalizers;
+        }
+    }
+    IrqSpinLockRelease(&g_cleanupLock,robustFlags);
+    if(robust) {
+        RobustFutexCleanup(robust);
+        SchedulerReleaseWaitReference(robust);
+        robustFlags=IrqSpinLockAcquire(&g_cleanupLock);
+        --g_cleanupStatus.activeFinalizers;
+        IrqSpinLockRelease(&g_cleanupLock,robustFlags);
+        return true;
+    }
 #ifdef BROOK_HOST_TEST
     if(VfsMountCleanupPending && VfsDrainMountCleanup && VfsMountCleanupPending()) {
 #else
@@ -237,6 +279,11 @@ bool ProcessCleanupStep() {
         flags=IrqSpinLockAcquire(&g_cleanupLock);
         --g_cleanupStatus.activeFinalizers;
         IrqSpinLockRelease(&g_cleanupLock,flags);
+    }
+    if(!space && !process && pendingRobust) {
+        // Do not stall unrelated finalizers behind a still-running victim.
+        // A short sleep also prevents an on-CPU target from spinning the worker.
+        SchedulerSleepMs(1);return true;
     }
     return space || process;
 }

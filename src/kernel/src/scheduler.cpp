@@ -1,5 +1,6 @@
 #include "process_fs.h"
 #include "scheduler.h"
+#include "robust_futex.h"
 #include "irq_accounting.h"
 #include "idle_irq_accounting.h"
 #include "sched_decision_trace.h"
@@ -1000,6 +1001,8 @@ static void NotifyParentGroupLocked(Process* child)
 
 static void NotifyExitedParentLocked(Process* child)
 {
+    const uint32_t robust=__atomic_load_n(&child->robustExitState,__ATOMIC_ACQUIRE);
+    if(robust==1 || robust==2 || __atomic_load_n(&child->robustListHead,__ATOMIC_ACQUIRE))return;
     if (child->state == ProcessState::Terminated) NotifyParentGroupLocked(child);
 }
 
@@ -2318,6 +2321,8 @@ extern "C" void SchedulerSleepMs(uint32_t ms)
                   procName, proc->pid, proc->tgid, status,
                   proc->isThread ? " [thread]" : "");
     }
+
+    RobustFutexCleanup(proc); // owner-death before pthread_join observes completion
 
     // Thread exit: clear_child_tid + futex_wake for pthread_join
     if (proc->clearChildTid)

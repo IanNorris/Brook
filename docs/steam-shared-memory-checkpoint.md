@@ -105,3 +105,7 @@ the original Xwayland job before issuing its first close request. That failure
 is preserved separately from the successful shutdown.
 The next bounded task is to locate the client exit after controller initialization,
 keeping the real shared-memory and GLX checks as regressions.
+
+The following [robust-futex checkpoint](steam-robust-futex-checkpoint.md)
+identifies and removes that exit-139 assertion, with a separate later startup
+failure still under investigation.

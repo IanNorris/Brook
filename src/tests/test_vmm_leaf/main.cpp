@@ -21,6 +21,7 @@
 #include "serial.h"
 #include "memory/address_space.h"
 #include "process.h"
+#include "robust_futex.h"
 #include "vfs.h"
 #include "panic.h"
 
@@ -121,6 +122,14 @@ void SchedulerUnblock(Process* process) {
     CHECK(ProcessGetCleanupStatus().activeFinalizers!=0);
     ++cleanupWakeups;
 }
+unsigned robustCleanups=0,robustDelays=0;
+void RobustFutexCleanup(Process* process) {
+    CHECK(process->state==ProcessState::Terminated && process->runningOnCpu==-1 && process->refCount==1);
+    CHECK(ProcessGetCleanupStatus().activeFinalizers==1);
+    process->robustListHead=0;process->robustExitState=3;++robustCleanups;
+}
+void SchedulerReleaseWaitReference(Process* process) {CHECK(process->robustExitState==3);ProcessUnref(process);}
+extern "C" void SchedulerSleepMs(uint32_t) {++robustDelays;}
 void ProcessDestroyNow(Process* process) {
     CHECK(process==expectedDestroy);
     CHECK(ProcessGetCleanupStatus().activeFinalizers!=0);
@@ -2071,8 +2080,19 @@ static void vmallocIntegration() {
     freeEmptyKernelTables(root.pml4,4);VmmHostSetKernelRoot({});empty();
     std::puts("VMALLOC INTEGRATION PASS partial failure/delayed reuse/guards/wrong-size/double-free/1100 allocations");
 }
+static void robustExitQueue() {
+    Process process{};process.state=ProcessState::Terminated;process.runningOnCpu=2;process.robustListHead=0x4000;
+    ProcessQueueRobustExit(&process);ProcessQueueRobustExit(&process);
+    CHECK(process.refCount==1 && ProcessGetCleanupStatus().queuedProcesses==1);
+    CHECK(ProcessCleanupStep() && robustCleanups==0 && robustDelays==1 && process.refCount==1);
+    process.runningOnCpu=-1;
+    CHECK(ProcessCleanupStep() && robustCleanups==1 && process.refCount==0);
+    CHECK(!ProcessGetCleanupStatus().queuedProcesses && !ProcessGetCleanupStatus().activeFinalizers);
+    ProcessQueueRobustExit(&process);CHECK(!ProcessCleanupStep() && robustCleanups==1);
+}
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
+    robustExitQueue();
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();

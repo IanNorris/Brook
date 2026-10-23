@@ -349,6 +349,9 @@ struct Process
     bool     isThread;           // True if this is a thread (not the group leader)
     Process* threadLeader;       // Points to the thread group leader (self if leader)
     uint64_t clearChildTid;      // User address to write 0 + futex_wake on exit (set_tid_address / CLONE_CHILD_CLEARTID)
+    uint64_t robustListHead;    // Per-thread Linux robust_list_head user pointer.
+    uint32_t robustExitState;   // 0 idle/registered, 1 queued, 2 cleaning, 3 done.
+    Process* robustExitNext;    // Cleanup queue owns a process reference.
     uint64_t parentSetTid;       // User address where parent's clone() stores child TID (CLONE_PARENT_SETTID)
     Process* vforkParent;        // If non-null, wake this process when we exec/exit (CLONE_VFORK)
 

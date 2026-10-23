@@ -28,6 +28,7 @@ void ReparentDeadGroupLocked(uint16_t) {assert(g_allProcLock.held);}
 void PosixTimersCleanup(Process*,bool) {assert(!schedulerLockDepth);}
 void SysvSemExit(Process*) {assert(!schedulerLockDepth);}
 void FutexCancelProcess(Process*) {assert(!schedulerLockDepth);}
+void ProcessQueueRobustExit(Process*) {assert(!schedulerLockDepth);}
 void SchedulerUnblock(Process*) {assert(!schedulerLockDepth);}
 Process* current=nullptr;
 Process* SchedulerCurrentProcess() {return current;}

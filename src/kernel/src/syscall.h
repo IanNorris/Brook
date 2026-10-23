@@ -139,6 +139,7 @@ static constexpr uint64_t SYS_SEMCTL          = 66;
 static constexpr uint64_t SYS_FUTEX           = 202;
 static constexpr uint64_t SYS_TKILL           = 200;
 static constexpr uint64_t SYS_SET_ROBUST_LIST = 273;
+static constexpr uint64_t SYS_GET_ROBUST_LIST = 274;
 static constexpr uint64_t SYS_TGKILL          = 234;
 static constexpr uint64_t SYS_MBIND           = 237;
 static constexpr uint64_t SYS_SET_MEMPOLICY   = 238;
