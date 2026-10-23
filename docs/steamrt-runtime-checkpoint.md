@@ -1,3 +1,8 @@
+Follow-up: [urandom and runtime output checkpoint](urandom-device-checkpoint.md)
+identifies the missing getconf text as forked output-file offset overwrites.
+Append-mode logs now capture `glibc 2.42`; the historical observations below
+remain the original evidence.
+
 # SteamRT executes its runtime child
 
 The installed Steam Runtime 3c, build 3c.0.20260824.257593, now

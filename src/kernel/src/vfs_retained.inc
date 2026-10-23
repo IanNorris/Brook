@@ -6,7 +6,7 @@
 struct VfsVirtualDirectory { VfsObject object; VfsPath parent; char name[256]; };
 extern const VfsObjectOps g_virtualDirectoryOps;
 // Provisioned once before userspace; retains the exact canonical host /dev.
-static VfsPath g_nullDeviceAnchor;
+static VfsPath g_canonicalDeviceAnchor;
 static bool VfsVirtual(const VfsPath& p) { return p.object && p.object->ops==&g_virtualDirectoryOps; }
 
 bool VfsPathSame(const VfsPath& a,const VfsPath& b)
@@ -347,10 +347,10 @@ int VfsPathResolve(const VfsPath& root,const VfsPath& start,const char* text,Vfs
     if(error)return error;
     VfsPathRelease(result.parent);*out=result.object;return 0;
 }
-int VfsNullDeviceAnchorInitialize()
+int VfsCanonicalDeviceAnchorInitialize()
 {
     FileMutationGuard transaction;
-    if(g_nullDeviceAnchor.object)return -16;
+    if(g_canonicalDeviceAnchor.object)return -16;
     VfsPath root{};int error=VfsMountRootLocked(g_initialNamespace.root,&root);
     if(error)return error;
     VfsRetainedProvider provider;RetainedWalkResult<VfsPath> walk{};
@@ -358,23 +358,24 @@ int VfsNullDeviceAnchorInitialize()
     if(!error) {
         VnodeStat stat{};error=walk.object.object->ops->stat?walk.object.object->ops->stat(walk.object.object,&stat):-95;
         if(!error && (!stat.isDir || VfsVirtual(walk.object)))error=-20;
-        if(!error) {g_nullDeviceAnchor=walk.object;walk.object={};}
+        if(!error) {g_canonicalDeviceAnchor=walk.object;walk.object={};}
     }
     VfsPathRelease(walk.parent);VfsPathRelease(walk.object);VfsPathRelease(root);return error;
 }
-int VfsNullDeviceAllowed(const VfsPath& root,const VfsPath& start,const char* text,bool* allowed,bool followFinal)
+int VfsCanonicalDeviceAllowed(const VfsPath& root,const VfsPath& start,const char* text,bool* allowed,bool followFinal,const char* leaf)
 {
     if(!allowed)return -22;
-    *allowed=false;if(!root.object || !start.object || !text)return -9;
+    *allowed=false;if(!leaf || (!StrEq(leaf,"null") && !StrEq(leaf,"urandom")))return -22;
+    if(!root.object || !start.object || !text)return -9;
     FileMutationGuard transaction(false);
-    if(!g_nullDeviceAnchor.object)return 0;
+    if(!g_canonicalDeviceAnchor.object)return 0;
     VfsRetainedProvider provider;RetainedWalkResult<VfsPath> walk{};
     int error=WalkRetainedPath(root,start,text,&walk,provider,{followFinal,true});
-    if(!error && !walk.object.object && walk.parent.object && !walk.trailing && StrEq(walk.leaf,"null")) {
+    if(!error && !walk.object.object && walk.parent.object && !walk.trailing && StrEq(walk.leaf,leaf)) {
         auto* parent=static_cast<MountEntry*>(walk.parent.attachment);
-        auto* anchor=static_cast<MountEntry*>(g_nullDeviceAnchor.attachment);
-        if(parent->backing==anchor->backing && walk.parent.object->ops==g_nullDeviceAnchor.object->ops &&
-           walk.parent.object->identity==g_nullDeviceAnchor.object->identity) {
+        auto* anchor=static_cast<MountEntry*>(g_canonicalDeviceAnchor.attachment);
+        if(parent->backing==anchor->backing && walk.parent.object->ops==g_canonicalDeviceAnchor.object->ops &&
+           walk.parent.object->identity==g_canonicalDeviceAnchor.object->identity) {
             // Identity and the deepest applicable NODEV flag share this lookup
             // transaction. No reported name is used for later filesystem I/O.
             if(VfsMountAttributes(parent)&4)error=-13;

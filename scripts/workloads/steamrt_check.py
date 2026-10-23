@@ -67,7 +67,9 @@ def main():
     (evidence / "request.json").write_text(json.dumps(request, indent=2) + "\n")
     print(json.dumps(request), flush=True)
     started = time.monotonic()
-    with (evidence / "stdout.log").open("wb") as stdout, (evidence / "stderr.log").open("wb") as stderr:
+    # A unique directory makes append safe. Multiple forked writers must not
+    # overwrite one another while Brook's shared file-offset work is pending.
+    with (evidence / "stdout.log").open("ab") as stdout, (evidence / "stderr.log").open("ab") as stderr:
         result = subprocess.run(command, cwd=runtime, env=env, stdout=stdout, stderr=stderr)
     outcome = dict(exit=result.returncode, elapsed_s=time.monotonic() - started,
                    stdout=describe(evidence / "stdout.log"), stderr=describe(evidence / "stderr.log"))

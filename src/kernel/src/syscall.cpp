@@ -3172,20 +3172,25 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     int procFdResult = OpenProcMemFd(proc, syntheticPath, flags, &procFdPath);
     if (procFdPath) return procFdResult;
 
-    // A genuine /dev bind may expose only this explicitly authorized null
-    // broker. Other synthetic services keep the general bind-masking policy.
-    if(StrEq(path,"/dev/null") || StrEq(path,"null") || StrEq(syntheticPath,"/dev/null")) {
-        bool allowed=false;int error=VfsNullDeviceAllowed(at.fs.root,at.start(),path,&allowed,!(flags&0x20000) && !((flags&0x40)&&(flags&0x80)));
+    // Only the two allowlisted synthetic devices may follow a genuine /dev
+    // bind. Other synthetic services retain the general masking policy.
+    static constexpr const char* canonicalDevices[]={"/dev/null","/dev/urandom"};
+    for(const char* device:canonicalDevices) {
+        const char* leaf=device+5;
+        if(!StrEq(path,device) && !StrEq(path,leaf) && !StrEq(syntheticPath,device))continue;
+        bool allowed=false;
+        int error=VfsCanonicalDeviceAllowed(at.fs.root,at.start(),path,&allowed,
+            !(flags&0x20000) && !((flags&0x40)&&(flags&0x80)),leaf);
         if(error)return error;
-        if(allowed)syntheticPath="/dev/null";
-        else if(StrEq(syntheticPath,"/dev/null"))syntheticPath="";
+        if(allowed)syntheticPath=device;
+        else if(StrEq(syntheticPath,device))syntheticPath="";
     }
 
     // Device paths
     if(StrEq(syntheticPath,"keyboard") || StrEq(syntheticPath,"/dev/fb0") || StrEq(syntheticPath,"/dev/keyboard") ||
        StrEq(syntheticPath,"/dev/tty") || StrEq(syntheticPath,"/dev/console") ||
        StrEq(syntheticPath,"/dev/dri/renderD128") ||
-       StrEq(syntheticPath,"/dev/urandom") || StrEq(syntheticPath,"/dev/random") ||
+       StrEq(syntheticPath,"/dev/random") ||
        StrEq(syntheticPath,"/dev/klog") || StrEq(syntheticPath,"/dev/dsp")) {
         const char* deviceName=StrEq(syntheticPath,"keyboard")?"/dev/keyboard":syntheticPath;
         if(int error=VfsPathDeviceActivation(at.fs.root,deviceName))return error;
@@ -3300,9 +3305,13 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     // /dev/urandom, /dev/random — RDRAND-backed random bytes
     if (StrEq(syntheticPath, "/dev/urandom") || StrEq(syntheticPath, "/dev/random"))
     {
-        int fd = FdAlloc(proc, FdType::DevUrandom, nullptr);
-        if (fd < 0) return -EMFILE;
-        return fd;
+        if((flags&0xc0)==0xc0)return -EEXIST;
+        if(flags&0x10000)return -ENOTDIR;
+        FdEntry owned{};owned.type=FdType::DevUrandom;
+        owned.statusFlags=static_cast<uint32_t>(flags)&~(0x80000u|0x40u|0x80u|0x200u);
+        owned.fdFlags=(flags&0x80000u)?1:0;
+        int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+        return fd<0?-EMFILE:fd;
     }
 
     // /dev/klog — kernel log ring buffer reader

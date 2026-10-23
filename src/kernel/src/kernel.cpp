@@ -531,8 +531,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     // Child attachments require the root identity to exist first.
     brook::VfsMount("/proc", "procfs", 0);
-    const int nullAnchor=brook::VfsNullDeviceAnchorInitialize();
-    brook::SerialPrintf("VFS: canonical null-device parent anchor result=%d\n",nullAnchor);
+    const int nullAnchor=brook::VfsCanonicalDeviceAnchorInitialize();
+    brook::SerialPrintf("VFS: canonical device parent anchor result=%d\n",nullAnchor);
 
     // ---- QEMU fw_cfg ----
     brook::FwCfgInit();

@@ -1,3 +1,8 @@
+Latest client retry (2026-10-23): [canonical urandom device access](urandom-device-checkpoint.md)
+gets Steam past its in-container urandom assertion. The next blocker is named
+FIFO creation; see [the implementation gate](steam-fifo-next-step.md). No login
+window or authentication has been reached in Brook.
+
 Latest container checkpoint: [SteamRT executes its runtime child](steamrt-runtime-checkpoint.md).
 The installed pressure-vessel launcher and bundled bubblewrap now complete two
 separate default runtime-copy runs as UID 1000. The requested shell prints the
