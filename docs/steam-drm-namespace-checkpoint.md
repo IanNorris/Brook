@@ -70,8 +70,11 @@ its exact executable and stopped separately. The guest records one exit-group
 timeout, so the final serial stability acceptance fails. The original owned VM
 wait returns zero, the heap integrity check passes, and all four offline
 filesystem checks return zero. These results do not constitute full Steam or
-whole-system stability acceptance. Fixed diagnostic parsing also identifies GPU
-child launch error 1002; identifying that launch failure is the next lead.
+whole-system stability acceptance. Fixed diagnostic parsing finds GPU child launch code 1002 in the cumulative
+CEF log. A subsequent prelaunch baseline already contains all six occurrences,
+and a later snapshot still contains six. Those entries therefore do not
+establish a current GPU child launch failure and must not be used as a new
+regression boundary.
 
 Raw client logs, binaries, profiles, cookies, disk images and request receipts
 remain private ignored artifacts. No authenticated session is claimed.
