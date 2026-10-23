@@ -69,3 +69,47 @@ remain unsupported. Shared regular-file offsets across fork/dup are separate
 kernel work; unique append-mode logs avoid overwriting diagnostic output but do
 not fix that ABI gap. General flock semantics and full FIFO POSIX coverage are
 not claimed. No paid game files, disks, logs or authentication data belong in git.
+
+## Follow-up: runtime libraries and updater boundary
+
+A new private review clones the checked disks and expands its data disk to
+16 GiB offline. The same ABI 47 kernel boots with over 7 GiB of unreserved free
+space. Default runtime copying completes, and Steam's graphical X11 updater
+appears and extracts packages. Committing that update then fails renaming
+`package/tmp/linux64/crashhandler.so_` to `linux64/crashhandler.so` with EXDEV.
+This needs a mount-layout comparison with Linux before changing rename rules;
+the two directories being on one backing device does not imply they are on the
+same mount attachment.
+
+`scripts/workloads/steam_client_check.py` makes the diagnostic client launch
+repeatable from inside the guest, as a nonroot user with an existing Xwayland
+server. It checks unreserved free space, creates a separate home and unique
+append-mode log directory, launches through the installed SteamRT entry point,
+and reports log sizes and hashes at wrapper exit with bounded tails. Detached
+descendants can append later; wait for the tracked group to drain before
+extracting final files, and verify the wrapper snapshot as a prefix. It restores library
+paths inside the container: the Nix-patched interpreter needs the container's
+standard library directories, including aliases materialized by SteamRT from its
+runtime metadata. Client libraries take priority over host exports so Steam's
+patched FFmpeg symbols resolve to its bundled libraries.
+
+The optional `--skip-bootstrap` switch explicitly separates the already-staged
+client test from updater acceptance. With that diagnostic option, the exact
+launcher gets past the missing GTK 2 library and `av_mallocz_tracked` collision,
+loads `steamui.so`, and starts the Chromium-based `steamwebhelper`. It then fails
+`glXChooseVisual`; the web helper also reports failed shared-memory creation in
+its container's `/dev/shm`. These are the next graphics and IPC integration
+gates. Keep namespace-local shared memory isolated: do not restore the old
+global shared-memory broker through a shadowing container mount.
+
+This is still not a QR-login success. Missing 32-bit helpers, runtime launcher
+bus diagnostics, inotify, and NETLINK warnings are also retained in the logs;
+they have not all been established as fatal requirements. The new review and
+all distinct launch attempts are under ignored
+`build/workloads/steam-space-20261023/` and the associated `steam-space` review.
+
+The follow-up also finishes with all 21 tracked jobs terminal, a healthy heap,
+a clean guest sync/shutdown, and all four offline filesystem checks passing.
+Extracted logs verify the wrapper snapshots as prefixes and retain hashes of
+the final complete files. Distinct failed startup attempts and one failed
+pre-shutdown argument assertion remain recorded as diagnostics.
