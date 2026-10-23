@@ -84,3 +84,6 @@ normal affinity is the final acceptance run; it does not certify every alternate
 host test configuration. No kernel build or staging happened while QEMU ran.
 
 Legacy ABI reference: <https://kernel.org/doc/html/latest/locking/robust-futex-ABI.html>.
+
+The following [packet-pipe checkpoint](steam-packet-pipe-checkpoint.md) implements
+that pipe requirement and removes its assertion. A later abort remains unresolved.

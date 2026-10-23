@@ -2231,6 +2231,43 @@ static int64_t ReceiveTcpToUser(int sockIdx, uint64_t address, uint64_t count)
     return result;
 }
 
+static int64_t PipeReadSome(Process* proc,FdEntry* fde,char* dst,uint64_t count)
+{
+    KernelOperationGuard operation(proc);
+    if(!count)return 0;
+    if(!FdPipeRead(fde))return -EBADF;
+    auto* pipe=FdPipe(fde);
+        for (;;)
+        {
+            uint32_t got = pipe->read(dst, static_cast<uint32_t>(count));
+            if (got > 0)
+            {
+                // Wake blocked writer
+                SpinLockAcquire(&pipe->lock);
+                Process* writer=pipe->writerWaiter;pipe->writerWaiter=nullptr;
+                if(writer)WakeProcess(writer);
+                SpinLockRelease(&pipe->lock);
+                return static_cast<int64_t>(got);
+            }
+
+            Process* self = ProcessCurrent();
+            switch (pipe->prepareReadWait(self, (fde->statusFlags & 0x800) != 0)) {
+                case PipeReadWait::Retry: continue;
+                case PipeReadWait::Eof: return 0;
+                case PipeReadWait::WouldBlock: return -EAGAIN;
+                case PipeReadWait::Registered: break;
+            }
+            // Use timed wakeup to recheck writer count periodically
+            // (avoids permanent deadlock if close notification was missed)
+            self->wakeupTick = ApicTickCount() + 10; // recheck every ~10ms
+            SchedulerBlock(self);
+            pipe->removeReadWait(self);
+            if (HasReadInterruptSignal()) {
+                return -EINTR;
+            }
+        }
+}
+
 static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                          uint64_t, uint64_t, uint64_t)
 {
@@ -2590,44 +2627,18 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     // Read from pipe — block until data available or all writers closed
     if (FdPipe(fde))
     {
-        KernelOperationGuard operation(proc);
-        if (count == 0) return 0;
-        if(!FdPipeRead(fde))return -EBADF;
-        auto* pipe = FdPipe(fde);
-        char staged[4096];
-        auto* dst = staged;
-
-        for (;;)
-        {
-            uint32_t got = pipe->read(dst, static_cast<uint32_t>(
-                count > 4096 ? 4096 : count));
-            if (got > 0)
-            {
-                // Wake blocked writer
-                SpinLockAcquire(&pipe->lock);
-                Process* writer=pipe->writerWaiter;pipe->writerWaiter=nullptr;
-                if(writer)WakeProcess(writer);
-                SpinLockRelease(&pipe->lock);
-                if(!CopyToUser(bufAddr,staged,got))return -EFAULT;
-                return static_cast<int64_t>(got);
-            }
-
-            Process* self = ProcessCurrent();
-            switch (pipe->prepareReadWait(self, (fde->statusFlags & 0x800) != 0)) {
-                case PipeReadWait::Retry: continue;
-                case PipeReadWait::Eof: return 0;
-                case PipeReadWait::WouldBlock: return -EAGAIN;
-                case PipeReadWait::Registered: break;
-            }
-            // Use timed wakeup to recheck writer count periodically
-            // (avoids permanent deadlock if close notification was missed)
-            self->wakeupTick = ApicTickCount() + 10; // recheck every ~10ms
-            SchedulerBlock(self);
-            pipe->removeReadWait(self);
-            if (HasReadInterruptSignal()) {
-                return -EINTR;
-            }
+        auto* pipe=FdPipe(fde);
+        uint64_t capacity=count<pipe->capacity?count:pipe->capacity;
+        char small[4096];
+        char* staged=capacity>sizeof(small)?static_cast<char*>(kmalloc(capacity)):small;
+        if(!staged)return -ENOMEM;
+        int64_t got=PipeReadSome(proc,fde,staged,capacity);
+        if(got>0) {
+            uint64_t copied=CopyToUserBytes(bufAddr,staged,static_cast<uint64_t>(got));
+            got=copied?static_cast<int64_t>(copied):-EFAULT;
         }
+        if(staged!=small)kfree(staged);
+        return got;
     }
 
     if(fde->type==FdType::SignalFd && fde->handle)
@@ -3808,18 +3819,16 @@ static int64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags,
 // sys_pipe (22)
 // ---------------------------------------------------------------------------
 
-static int64_t sys_pipe(uint64_t pipefdAddr, uint64_t, uint64_t,
-                         uint64_t, uint64_t, uint64_t)
+static int64_t CreatePipe(uint64_t pipefdAddr, uint64_t flags)
 {
     if (!UserBufferWritable(pipefdAddr, 2 * sizeof(int32_t))) return -EFAULT;
-    auto* pipefd = reinterpret_cast<int32_t*>(pipefdAddr);
-
     Process* proc = ProcessCurrent();
     if (!proc) return -EMFILE;
 
     // Allocate pipe buffer
     auto* pipe = PipeBufferCreate(PIPE_BUF_DEFAULT_SIZE);
     if (!pipe) return -ENOMEM;
+    if ((flags & 0x4000) && !pipe->enablePackets()) {PipeBufferDestroy(pipe);return -ENOMEM;}
     pipe->readers = 1;
     pipe->writers = 1;
 
@@ -3827,7 +3836,8 @@ static int64_t sys_pipe(uint64_t pipefdAddr, uint64_t, uint64_t,
     int readFd = FdAlloc(proc, FdType::Pipe, pipe);
     if (readFd < 0) { PipeBufferDestroy(pipe); return -EMFILE; }
     proc->fds[readFd].flags = 0;  // read end
-    proc->fds[readFd].statusFlags = 0;  // O_RDONLY
+    proc->fds[readFd].statusFlags = flags & 0x800;
+    proc->fds[readFd].fdFlags = (flags & 0x80000) ? 1 : 0;
 
     int writeFd = FdAlloc(proc, FdType::Pipe, pipe);
     if (writeFd < 0)
@@ -3837,13 +3847,21 @@ static int64_t sys_pipe(uint64_t pipefdAddr, uint64_t, uint64_t,
         return -EMFILE;
     }
     proc->fds[writeFd].flags = 1;  // write end
-    proc->fds[writeFd].statusFlags = 1;  // O_WRONLY
+    proc->fds[writeFd].statusFlags = 1 | (flags & (0x800 | 0x4000));
+    proc->fds[writeFd].fdFlags = (flags & 0x80000) ? 1 : 0;
 
-    pipefd[0] = readFd;
-    pipefd[1] = writeFd;
+    const int32_t result[2]={readFd,writeFd};
+    if(!CopyToUser(pipefdAddr,result,sizeof(result))) {
+        CloseProcessFd(proc,readFd);CloseProcessFd(proc,writeFd);return -EFAULT;
+    }
 
     DbgPrintf("sys_pipe: fd[%d,%d] for pid %u\n", readFd, writeFd, proc->pid);
     return 0;
+}
+
+static int64_t sys_pipe(uint64_t address,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t)
+{
+    return CreatePipe(address,0);
 }
 
 // ---------------------------------------------------------------------------
@@ -4442,12 +4460,67 @@ struct iovec {
     uint64_t iov_len;
 };
 
+static int64_t PipeVectorIo(Process* proc,FdEntry* entry,uint64_t fd,
+                            uint64_t address,uint64_t count,bool writing)
+{
+    struct Stage {
+        iovec* vectors;char* bytes;
+        ~Stage(){if(vectors)kfree(vectors);if(bytes)kfree(bytes);}
+    } stage{static_cast<iovec*>(kmalloc(count?count*sizeof(iovec):1)),nullptr};
+    if(!stage.vectors)return -ENOMEM;
+    if(count && !CopyFromUser(stage.vectors,address,count*sizeof(iovec)))return -EFAULT;
+    uint64_t length=0;
+    for(uint64_t i=0;i<count;++i) {
+        const auto& v=stage.vectors[i];
+        if(v.iov_len>0x7fffffffULL-length)return -EINVAL;
+        length+=v.iov_len;
+        if(v.iov_len && !(writing?UserBufferReadable(v.iov_base,v.iov_len):UserBufferWritable(v.iov_base,v.iov_len)))return -EFAULT;
+    }
+    if(!length)return 0;
+    uint64_t capacity=writing?4096:FdPipe(entry)->capacity;
+    if(capacity>length)capacity=length;
+    stage.bytes=static_cast<char*>(kmalloc(capacity));if(!stage.bytes)return -ENOMEM;
+    uint64_t total=0,index=0,offset=0;
+    if(!writing) {
+        int64_t got=PipeReadSome(proc,entry,stage.bytes,capacity);
+        if(got<=0)return got;
+        for(uint64_t i=0;i<count && total<static_cast<uint64_t>(got);++i) {
+            uint64_t n=stage.vectors[i].iov_len;
+            if(n>static_cast<uint64_t>(got)-total)n=got-total;
+            uint64_t copied=n?CopyToUserBytes(stage.vectors[i].iov_base,stage.bytes+total,n):0;
+            total+=copied;
+            if(copied<n)return total?static_cast<int64_t>(total):-EFAULT;
+        }
+        return got;
+    }
+    while(total<length) {
+        uint64_t chunk=length-total;if(chunk>4096)chunk=4096;
+        uint64_t copied=0;
+        while(copied<chunk) {
+            const auto& v=stage.vectors[index];
+            uint64_t n=v.iov_len-offset;if(n>chunk-copied)n=chunk-copied;
+            if(n && !CopyFromUser(stage.bytes+copied,v.iov_base+offset,n))return total?static_cast<int64_t>(total):-EFAULT;
+            copied+=n;offset+=n;
+            if(offset==v.iov_len){++index;offset=0;}
+        }
+        int64_t n=WriteToPinnedFdByType(proc,entry,fd,reinterpret_cast<uint64_t>(stage.bytes),chunk,false);
+        if(n<0)return total?static_cast<int64_t>(total):n;
+        total+=n;if(static_cast<uint64_t>(n)<chunk)break;
+    }
+    return total;
+}
+
 static int64_t sys_readv(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
                           uint64_t, uint64_t, uint64_t)
 {
     if (iovcnt > 1024) return -EINVAL;
     if (!UserBufferReadable(iovAddr, iovcnt * sizeof(iovec))) return -EFAULT;
     const auto* iov = reinterpret_cast<const iovec*>(iovAddr);
+    Process* proc=ProcessCurrent();FdRef entry(proc,static_cast<int>(fd));
+    if(!entry)return -EBADF;
+    // One readv consumes one packet even across mode changes and iovecs.
+    if(FdPipe(entry.get()))
+        return PipeVectorIo(proc,entry.get(),fd,iovAddr,iovcnt,false);
     int64_t total = 0;
     for (uint64_t i = 0; i < iovcnt; ++i)
     {
@@ -4474,6 +4547,8 @@ static int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
     FdRef ref(proc, static_cast<int>(fd));
     if (!ref) return -EBADF;
     auto* entry = ref.get();
+    if(FdPipe(entry) && (entry->statusFlags&0x4000))
+        return PipeVectorIo(proc,entry,fd,iovAddr,iovcnt,true);
     if (entry->type == FdType::Vnode && entry->handle && (entry->statusFlags & 0x400)) {
         if ((entry->statusFlags & 3) == 0) return -EBADF;
         // Snapshot descriptors before validation: users may change the array.
@@ -8402,7 +8477,9 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
     }
     case F_SETFL:
     {
-        // Only O_NONBLOCK (0x800) and O_APPEND (0x400) are settable via F_SETFL.
+        // Allocate packet metadata before publishing O_DIRECT on a pipe.
+        if ((arg & 0x4000) && FdPipe(fde) && !FdPipe(fde)->enablePackets()) return -ENOMEM;
+        // Preserve the existing mutable flags and access-mode policy.
         // Access mode bits (O_RDONLY/O_WRONLY/O_RDWR) are preserved from open.
         SpinLockAcquire(ProcessFdLock(proc));
         fde->statusFlags = (fde->statusFlags & 0x3) | (static_cast<uint32_t>(arg) & ~0x3u);
@@ -9090,27 +9167,9 @@ static int64_t sys_symlinkat(uint64_t targetAddr, uint64_t newdirfd, uint64_t li
 static int64_t sys_pipe2(uint64_t pipefdAddr, uint64_t flags, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
-    constexpr uint64_t PIPE2_ALLOWED = O_CLOEXEC | O_NONBLOCK;
+    constexpr uint64_t PIPE2_ALLOWED = O_CLOEXEC | O_NONBLOCK | 0x4000;
     if (flags & ~PIPE2_ALLOWED) return -EINVAL;
-
-    int64_t ret = sys_pipe(pipefdAddr, 0, 0, 0, 0, 0);
-    if (ret < 0) return ret;
-
-    Process* proc = ProcessCurrent();
-    auto* pipefd = reinterpret_cast<int32_t*>(pipefdAddr);
-    if (!proc || !pipefd) return ret;
-
-    if (flags & O_CLOEXEC)
-    {
-        proc->fds[pipefd[0]].fdFlags = FD_CLOEXEC;
-        proc->fds[pipefd[1]].fdFlags = FD_CLOEXEC;
-    }
-    if (flags & O_NONBLOCK)
-    {
-        proc->fds[pipefd[0]].statusFlags |= O_NONBLOCK;
-        proc->fds[pipefd[1]].statusFlags |= O_NONBLOCK;
-    }
-    return ret;
+    return CreatePipe(pipefdAddr,flags);
 }
 
 static int64_t sys_signalfd4(uint64_t descriptor,uint64_t maskAddress,uint64_t size,uint64_t flags,uint64_t,uint64_t)

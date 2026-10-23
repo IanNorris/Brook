@@ -17,7 +17,8 @@ struct Process { uint64_t wakeupTick=0; SpinLock fdLock{}; };
 static Process current;
 static unsigned blocks, signals, wakes, notifications, processHolds;
 static unsigned allocationHolds;
-extern "C" void* kmalloc(uint64_t size) {void* p=std::malloc(size);if(p)++allocationHolds;return p;}
+static bool failPacketAllocation;
+extern "C" void* kmalloc(uint64_t size) {if(failPacketAllocation)return nullptr;void* p=std::malloc(size);if(p)++allocationHolds;return p;}
 extern "C" void kfree(void* p) {if(p){if(!allocationHolds)throw std::runtime_error("bad allocation hold");--allocationHolds;std::free(p);}}
 static void ProcessRef(Process*) {++processHolds;}
 static void ProcessUnref(Process*) {if(!processHolds)throw std::runtime_error("bad process hold");--processHolds;;}
@@ -127,6 +128,44 @@ int main() {
     CHECK(writePipe(&fd,samples,1)==-EINTR && !pipe.pollWaiters && !processHolds && !pipe.writerWaiter);
     // Surviving readers can drain and close without a stale writer registration.
     char byte;CHECK(pipe.read(&byte,1)==1 && !processHolds);
+    CHECK(!allocationHolds && !processHolds);
+    // Execute the real syscall write branch with packet boundaries and space
+    // pressure, including short-read discard and a mode change with data queued.
+    auto* packetPipe=PipeBufferCreate(16384);CHECK(packetPipe!=nullptr);
+    packetPipe->readers=packetPipe->writers=1;
+    fd=FdEntry{};fd.handle=packetPipe;fd.statusFlags=1|0x4000|0x800;
+    char payload[16384], output[8192];std::memset(payload,'p',sizeof(payload));
+    failPacketAllocation=true;
+    CHECK(writePipe(&fd,payload,3)==-ENOMEM && packetPipe->empty());
+    CHECK(writePipe(&fd,payload,0)==0);
+    failPacketAllocation=false;
+    CHECK(writePipe(&fd,payload,6000)==6000);
+    CHECK(packetPipe->read(output,sizeof(output))==4096);
+    CHECK(packetPipe->read(output,10)==10 && packetPipe->empty());
+    CHECK(writePipe(&fd,"abc",3)==3 && writePipe(&fd,"defg",4)==4);
+    CHECK(packetPipe->read(output,1)==1 && output[0]=='a');
+    CHECK(packetPipe->read(output,0)==0);
+    CHECK(packetPipe->read(output,sizeof(output))==4 && !std::memcmp(output,"defg",4));
+    CHECK(writePipe(&fd,"old",3)==3);
+    fd.statusFlags=1|0x800;
+    CHECK(writePipe(&fd,"stream",6)==6);
+    CHECK(packetPipe->read(output,sizeof(output))==3 && !std::memcmp(output,"old",3));
+    CHECK(packetPipe->read(output,sizeof(output))==6 && !std::memcmp(output,"stream",6));
+    fd.statusFlags=1|0x4000|0x800;
+    // Fill to one byte short of a packet. A failed packet admission must not
+    // publish a prefix; after one full packet, a large write returns its prefix.
+    CHECK(packetPipe->write(payload,16000)==16000);
+    CHECK(writePipe(&fd,payload,400)==-EAGAIN && packetPipe->count()==16000);
+    CHECK(packetPipe->read(output,sizeof(output))==sizeof(output));
+    CHECK(packetPipe->read(output,sizeof(output))==7808);
+    CHECK(packetPipe->write(payload,12000)==12000);
+    CHECK(writePipe(&fd,payload,8192)==4096 && packetPipe->count()==16096);
+    char drain[16384];CHECK(packetPipe->read(drain,sizeof(drain))==16096);
+    // Allocation failure while waiting for a second packet preserves progress.
+    fd.statusFlags=1|0x4000;
+    CHECK(packetPipe->write(payload,12000)==12000);failPacketAllocation=true;
+    CHECK(writePipe(&fd,payload,8192)==4096);failPacketAllocation=false;
+    PipeBufferDestroy(packetPipe);
     CHECK(!allocationHolds && !processHolds);
     std::printf("PIPE_WRITE_ACTUAL_BODY %s failures=%u\n",failures?"FAIL":"PASS",failures);
     return failures?1:0;

@@ -2,6 +2,7 @@
     // Write to pipe — block until at least some bytes are written
     if (fde->type == FdType::Pipe && fde->handle)
     {
+        if(fde->flags==0)return -EBADF;
         // For bidirectional socketpair (flags==2), write goes to the write pipe
         auto* pipe = (fde->flags == 2)
             ? reinterpret_cast<PipeBuffer*>(fde->seekPos)
@@ -9,6 +10,11 @@
         KernelOperationGuard operation(proc);
         const char* src = reinterpret_cast<const char*>(bufAddr);
         uint64_t written = 0;
+        SpinLockAcquire(ProcessFdLock(proc));
+        const bool packet = (fde->statusFlags & 0x4000) != 0 && fde->flags != 2;
+        SpinLockRelease(ProcessFdLock(proc));
+        if (!count) return 0;
+        if (packet && !pipe->enablePackets()) return -ENOMEM;
 
         while (written < count)
         {
@@ -24,9 +30,9 @@
 
             uint32_t chunk = pipe->write(src + written,
                 static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written),
-                (fde->flags&0x10) && count<=4096);
+                (fde->flags&0x10) && count<=4096, packet);
             written += chunk;
-            if (written > 0)
+            if (chunk > 0)
             {
                 // Wake blocked reader
                 SpinLockAcquire(&pipe->lock);
@@ -34,23 +40,24 @@
                 if(reader)WakeProcess(reader);
                 SpinLockRelease(&pipe->lock);
                 PipeWakeEpoll(pipe);
-                break;  // Return partial writes immediately
+                if(packet && written<count)continue;
+                break;  // Stream pipes retain their existing partial-write policy.
             }
             // A control/self-pipe may be drained only by this same caller.
             // Blocking here despite O_NONBLOCK can deadlock its event loop.
             SpinLockAcquire(ProcessFdLock(proc));
             const bool nonblock = (fde->statusFlags & 0x800) != 0;
             SpinLockRelease(ProcessFdLock(proc));
-            if (nonblock) return -EAGAIN;
+            if (nonblock) return written ? static_cast<int64_t>(written) : -EAGAIN;
             // Buffer full — block until reader drains some
             Process* self = ProcessCurrent();
             PipePollGroup writerWaiters;
-            if(!writerWaiters.add(pipe,self,4|8))return -ENOMEM;
+            if(!writerWaiters.add(pipe,self,4|8))return written ? static_cast<int64_t>(written) : -ENOMEM;
             // Re-check after registering waiter to close the race where
             // a reader drained space between our write() and waiter set.
             chunk = pipe->write(src + written,
                 static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written),
-                (fde->flags&0x10) && count<=4096);
+                (fde->flags&0x10) && count<=4096, packet);
             if (chunk > 0)
             {
                 written += chunk;
@@ -59,6 +66,7 @@
                 if(reader)WakeProcess(reader);
                 SpinLockRelease(&pipe->lock);
                 PipeWakeEpoll(pipe);
+                if(packet && written<count)continue;
                 break;
             }
             __atomic_fetch_add(&pipe->fullWriteWaits,1,__ATOMIC_RELAXED);

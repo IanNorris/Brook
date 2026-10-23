@@ -72,7 +72,8 @@ namespace brook {
 // ABI 47 adds FIFO creation and vnode-owned stream state.
 // ABI 48 appends backend canonical-page quota hooks to FileObject.
 // ABI 49 adds per-thread robust-futex registration and deferred exit state.
-static constexpr uint32_t MODULE_ABI_VERSION = 49;
+// ABI 50 adds optional packet-boundary metadata to PipeBuffer.
+static constexpr uint32_t MODULE_ABI_VERSION = 50;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

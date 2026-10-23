@@ -27,6 +27,8 @@ struct PipeBuffer
 {
     char*    data = nullptr;
     uint32_t capacity = 0;
+    // Optional packet length at each ring offset. Zero means stream data.
+    uint16_t* packets = nullptr;
     volatile uint32_t head = 0;
     volatile uint32_t tail = 0;
     SpinLock lock = {};
@@ -99,8 +101,26 @@ struct PipeBuffer
         SpinLockRelease(&lock);
     }
 
+    // Allocate before taking the spinlock. Only packet-enabled pipes pay for
+    // metadata; keeping it after disabling O_DIRECT preserves queued packets.
+    bool enablePackets()
+    {
+        SpinLockAcquire(&lock);
+        bool ready = packets != nullptr;
+        SpinLockRelease(&lock);
+        if (ready) return true;
+        auto* fresh = static_cast<uint16_t*>(kmalloc(uint64_t(capacity) * sizeof(uint16_t)));
+        if (!fresh) return false;
+        memset(fresh, 0, uint64_t(capacity) * sizeof(uint16_t));
+        SpinLockAcquire(&lock);
+        if (!packets) { __atomic_store_n(&packets,fresh,__ATOMIC_RELEASE); fresh = nullptr; }
+        SpinLockRelease(&lock);
+        if (fresh) kfree(fresh);
+        return true;
+    }
+
     // Non-blocking write. Returns bytes written (may be partial).
-    uint32_t write(const char* src, uint32_t len, bool atomicRecord=false)
+    uint32_t write(const char* src, uint32_t len, bool atomicRecord=false, bool packet=false)
     {
         SpinLockAcquire(&lock);
 
@@ -111,7 +131,8 @@ struct PipeBuffer
         }
 
         uint32_t avail = capacity - 1 - ((head - tail + capacity) % capacity);
-        if(atomicRecord && len>avail) {SpinLockRelease(&lock);return 0;}
+        if(packet && (!packets || len>4096)) {SpinLockRelease(&lock);return 0;}
+        if((atomicRecord || packet) && len>avail) {SpinLockRelease(&lock);return 0;}
         if (len > avail) len = avail;
 
         // Copy in up to two contiguous chunks (ring buffer wrap)
@@ -122,6 +143,10 @@ struct PipeBuffer
         if (len > firstChunk)
             memcpy(data, src + firstChunk, len - firstChunk);
 
+        if (packets && len) {
+            for (uint32_t i=0;i<len;++i) packets[(head+i)%capacity]=0;
+            if (packet) packets[head]=static_cast<uint16_t>(len);
+        }
         head = (head + len) % capacity;
 
         SpinLockRelease(&lock);
@@ -140,22 +165,31 @@ struct PipeBuffer
             return 0;
         }
 
-        uint32_t avail = (head - tail + capacity) % capacity;
-        if (len > avail) len = avail;
-
-        // Copy in up to two contiguous chunks (ring buffer wrap)
-        uint32_t firstChunk = capacity - tail;
-        if (firstChunk > len) firstChunk = len;
-        memcpy(dst, data + tail, firstChunk);
-
-        if (len > firstChunk)
-            memcpy(dst + firstChunk, data, len - firstChunk);
-
-        tail = (tail + len) % capacity;
-
+        uint32_t available = (head - tail + capacity) % capacity;
+        uint32_t copied = 0;
+        while (available && copied < len) {
+            const uint32_t packet = packets ? packets[tail] : 0;
+            uint32_t consume = packet ? packet : available;
+            if (!packet && packets) {
+                for (uint32_t i=1;i<consume;++i)
+                    if (packets[(tail+i)%capacity]) { consume=i; break; }
+            }
+            uint32_t take = consume < len-copied ? consume : len-copied;
+            uint32_t first = capacity-tail;
+            if (first>take) first=take;
+            memcpy(dst+copied,data+tail,first);
+            if(take>first)memcpy(dst+copied+first,data,take-first);
+            // A short packet read discards its unread suffix. Zero-size reads
+            // never enter this loop and therefore never consume a packet.
+            if(!packet)consume=take;
+            if(packets)for(uint32_t i=0;i<consume;++i)packets[(tail+i)%capacity]=0;
+            tail=(tail+consume)%capacity;
+            available-=consume;copied+=take;
+            if(packet)break;
+        }
         SpinLockRelease(&lock);
-        if (len) PipePollNotify(this, 4);
-        return len;
+        if (copied) PipePollNotify(this, 4);
+        return copied;
     }
 };
 
@@ -184,6 +218,7 @@ static inline void PipeBufferFree(PipeBuffer* pipe)
     if (!pipe) return;
     if (pipe->data)
         kfree(pipe->data);
+    if (pipe->packets) kfree(pipe->packets);
     kfree(pipe);
 }
 
