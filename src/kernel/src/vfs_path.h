@@ -28,6 +28,8 @@ int VfsPathResolve(const VfsPath& root,const VfsPath& start,const char* text,
 // those callbacks may use this non-locking reporting variant.
 int VfsPathDirectoryPathFromCallback(const VfsPath& path,char* out,uint32_t capacity);
 int VfsPathDirectoryPath(const VfsPath& path,char* out,uint32_t capacity);
+int VfsPathObjectPathFromCallback(const VfsPath& path,char* out,uint32_t capacity);
+int VfsPathReadlink(const VfsPath& path,char* out,uint32_t capacity);
 int VfsPathStat(const VfsPath& path,VnodeStat* out);
 int VfsPathAccess(const VfsPath& path,uint8_t required,bool realIds=false);
 // Opens an existing exact object. Creation is a separate parent operation.

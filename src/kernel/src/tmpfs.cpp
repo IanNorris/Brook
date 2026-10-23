@@ -405,12 +405,12 @@ int Readlink(VfsObject *o, char *out, uint32_t capacity)
         memcpy(out, n->target, count);
     return count;
 }
-int DirectoryPath(VfsObject *o, char *out, uint32_t capacity)
+int ObjectPath(VfsObject *o, char *out, uint32_t capacity)
 {
     auto *n = Object(o);
     Guard g(n->fs);
-    if ((n->mode & TypeMask) != Directory)
-        return -20;
+    if (!n->linked)
+        return -2;
     char path[512];
     uint32_t cursor = sizeof(path) - 1;
     path[cursor] = 0;
@@ -436,6 +436,12 @@ int DirectoryPath(VfsObject *o, char *out, uint32_t capacity)
     memcpy(out, path + cursor, size);
     return 0;
 }
+int DirectoryPath(VfsObject *o, char *out, uint32_t capacity)
+{
+    if ((Object(o)->mode & TypeMask) != Directory)return -20;
+    return ObjectPath(o,out,capacity);
+}
+
 Page *FindPage(Node *n, uint64_t index)
 {
     for (auto *p = n->pages; p; p = p->next)
@@ -1053,7 +1059,7 @@ depth_checked:
 }
 const VfsObjectOps objectOps = {DestroyObject, StatObject, AccessObject, Child,  Parent,       Readlink,
                                 OpenObject,    Create,     Mkdir,        Remove, Rename,       Symlink,
-                                nullptr,       Times,      Chmod,        Chown,  DirectoryPath};
+                                nullptr,       Times,      Chmod,        Chown,  DirectoryPath, nullptr, ObjectPath};
 const VfsObjectOps *ObjectOperations()
 {
     return &objectOps;

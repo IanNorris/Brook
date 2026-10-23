@@ -14,7 +14,8 @@ without that abort.
 
 The portable raw-getdents64/readdir fixture checks regular files, directories,
 links to files/directories, chained links and dangling links. It passed 54
-checks on Linux and 55 on Brook for both Ext2 and tmpfs (the extra check is the
+checks on Linux and 55 on Brook under /data/home and /tmp, both Ext2-backed
+in that image (the extra check is the
 DT_UNKNOWN fallback). Existing seal, mount/container and nine native regression
 programs plus Mousepad passed. Final-ELF entry/scheduler mutation audits, empty
 job/groups, heap, checked shutdown, original wait and four offline filesystem

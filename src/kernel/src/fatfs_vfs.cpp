@@ -1193,14 +1193,36 @@ static Vnode* FatObjectOpen(VfsObject* object,int flags,int* error)
 // Current-name reporting by cluster identity. The namespace transaction
 // excludes rename; the FAT mutex protects parent scans and the LFN workspace.
 // This string is never used to reopen or mutate a retained directory.
-static int FatObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity)
+static int FatObjectPath(VfsObject* object,char* out,uint32_t capacity)
 {
     if(!out || capacity<2)return -36;
     out[0]=0;auto* retained=static_cast<FatPathObject*>(object->priv);
-    if(!retained->directory)return -20;
     KMutexLock(&g_fatLock);
     auto finish=[&](int error) { KMutexUnlock(&g_fatLock);return error; };
     FF_OBJECT current=retained->location;uint32_t position=capacity-1;out[position]=0;
+    if(!retained->directory) {
+        // File entry coordinates are pinned against rename/unlink/reuse.
+        // Find this exact entry in its retained parent, not another cluster alias.
+        FF_OBJECT parent{};parent.object=current.object;
+        parent.object.attr=AM_DIR;parent.object.sclust=current.parent_cluster;
+        DIR directory{};FRESULT result=f_object_opendir(&parent,&directory);
+        if(result!=FR_OK)return finish(FrToErrno(result));
+        FILINFO entry{};bool found=false;
+        for(;;) {
+            result=f_readdir(&directory,&entry);
+            if(result!=FR_OK || !entry.fname[0])break;
+            if((entry.fattrib&AM_DIR) || !strcmp(entry.fname,".") || !strcmp(entry.fname,".."))continue;
+            FF_OBJECT candidate{};result=f_object_lookup(&parent,entry.fname,&candidate);
+            if(result!=FR_OK)break;
+            if(candidate.entry_sector==current.entry_sector && candidate.entry_offset==current.entry_offset) {found=true;break;}
+        }
+        FRESULT closed=f_closedir(&directory);
+        if(result!=FR_OK)return finish(FrToErrno(result));
+        if(closed!=FR_OK)return finish(FrToErrno(closed));
+        if(!found)return finish(-2);
+        uint32_t length=strlen(entry.fname);if(position<length+1)return finish(-36);
+        position-=length;memcpy(out+position,entry.fname,length);out[--position]='/';current=parent;
+    }
     for(uint32_t depth=0;current.object.sclust;++depth) {
         if(depth>=256)return finish(-40);
         FF_OBJECT parent{};FRESULT result=f_object_parent(&current,&parent);
@@ -1231,10 +1253,15 @@ static int FatObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity)
     for(uint32_t i=0;i<capacity-position;++i)out[i]=out[position+i];
     return finish(0);
 }
+static int FatObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity)
+{
+    if(!static_cast<FatPathObject*>(object->priv)->directory)return -20;
+    return FatObjectPath(object,out,capacity);
+}
 static const VfsObjectOps g_fatObjectOps={
     .destroy=FatObjectDestroy,.stat=FatObjectStat,.access=FatObjectAccess,
     .lookup=FatObjectChild,.parent=FatObjectParent,.readlink=FatObjectReadlink,.open=FatObjectOpen,
-    .directory_path=FatObjectDirectoryPath,
+    .directory_path=FatObjectDirectoryPath,.object_path=FatObjectPath,
 };
 static const VfsObjectOps* FatObjectOperations(){return &g_fatObjectOps;}
 static int FatDirectoryObjectLocked(FatFsMountData* mount,const DIR* directory,VfsObject** out)

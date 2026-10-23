@@ -88,6 +88,11 @@ int main(int argc,char** argv){
     assert(!root->ops->directory_path(root,currentName,sizeof(currentName))&&!std::strcmp(currentName,"/"));
     assert(held->ops->directory_path(held,currentName,4)==-36);
     assert(file->ops->directory_path(file,currentName,sizeof(currentName))==-20);
+    assert(!file->ops->object_path(file,currentName,sizeof(currentName)) &&
+           !std::strcmp(currentName,"/parent/moved/meaningfully-long-name.txt"));
+    assert(!empty->ops->object_path(empty,currentName,sizeof(currentName)) &&
+           !std::strcmp(currentName,"/parent/moved/empty"));
+    assert(file->ops->object_path(file,currentName,4)==-36);
     assert(!FatObjectChild(held,"meaningfully-long-name.txt",&after));assert(after==file);VfsObjectRelease(after);
     assert(FatFsUnlink(mount,0,"/parent/moved/empty")==-16);
     assert(FatFsRename(mount,0,"/parent/moved/empty","/new-empty")==-16);

@@ -232,7 +232,7 @@ static int VfsPrepareMountpointLocked(const char* text,VfsPath* out)
     *out=current;return 0;
 }
 // Global-name reporting for cwd/proc/debug consumers. Lookup never calls this.
-static int VfsBackendDirectoryLocked(const VfsPath& path,char* out,uint32_t capacity)
+static int VfsBackendDirectoryLocked(const VfsPath& path,char* out,uint32_t capacity,bool anyObject=false)
 {
     if(!out || capacity<2)return -36;
     out[0]=0;if(!path.object)return -9;
@@ -249,8 +249,14 @@ static int VfsBackendDirectoryLocked(const VfsPath& path,char* out,uint32_t capa
         position-=length;for(uint32_t i=0;i<length;++i)suffix[position+i]=directory->name[i];
         suffix[--position]='/';current=directory->parent;
     }
-    if(!current.object->ops->directory_path)return -95;
-    char relative[512];int error=current.object->ops->directory_path(current.object,relative,sizeof(relative));
+    auto report=current.object->ops->directory_path;
+    if(anyObject) {
+        VnodeStat stat{};if(int error=current.object->ops->stat(current.object,&stat))return error;
+        if(current.object->ops->object_path)report=current.object->ops->object_path;
+        else if(!stat.isDir)return -95;
+    }
+    if(!report)return -95;
+    char relative[512];int error=report(current.object,relative,sizeof(relative));
     if(error)return error;
     if(relative[0]!='/')return -5;
     uint32_t written=StrLen(relative);const uint32_t tail=sizeof(suffix)-position-1;
@@ -260,10 +266,10 @@ static int VfsBackendDirectoryLocked(const VfsPath& path,char* out,uint32_t capa
     for(uint32_t i=0;i<=tail;++i)out[written+i]=suffix[position+i];
     return 0;
 }
-static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capacity)
+static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capacity,bool anyObject=false)
 {
     if(!out || capacity<2)return -36;
-    out[0]=0;char relative[512];int error=VfsBackendDirectoryLocked(path,relative,sizeof(relative));
+    out[0]=0;char relative[512];int error=VfsBackendDirectoryLocked(path,relative,sizeof(relative),anyObject);
     if(error)return error;
     auto* mount=static_cast<MountEntry*>(path.attachment);
     if(mount->rootObject) {
@@ -289,6 +295,10 @@ static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capac
         out[total]=0;
     }
     return 0;
+}
+int VfsPathObjectPathFromCallback(const VfsPath& path,char* out,uint32_t capacity)
+{
+    return VfsGlobalDirectoryLocked(path,out,capacity,true);
 }
 int VfsPathDirectoryPathFromCallback(const VfsPath& path,char* out,uint32_t capacity)
 {

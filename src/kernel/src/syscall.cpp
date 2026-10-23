@@ -8993,6 +8993,18 @@ static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAdd
     if (!CopyUserCString(pathAddr, path, sizeof(path)))
         return -EFAULT;
 
+    if(!path[0]) {
+        if(!bufsiz)return -EINVAL;
+        if(static_cast<int>(dirfd)==-100)return -ENOENT;
+        FdRef ref(ProcessCurrent(),static_cast<int>(dirfd));if(!ref)return -EBADF;
+        if((ref->type!=FdType::Path && ref->type!=FdType::Vnode) || !ref->handle)return -EINVAL;
+        VfsPath retained{};int error=VfsPathFromVnode(static_cast<Vnode*>(ref->handle),&retained);
+        char target[1024];uint32_t capacity=bufsiz<sizeof(target)?static_cast<uint32_t>(bufsiz):sizeof(target);
+        if(!error)error=VfsPathReadlink(retained,target,capacity);
+        VfsPathRelease(retained);
+        if(error>=0 && !CopyToUser(bufAddr,target,static_cast<uint64_t>(error)))return -EFAULT;
+        return error;
+    }
     return DoReadlink(path,bufAddr,bufsiz,static_cast<int>(dirfd));
 }
 

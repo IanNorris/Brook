@@ -128,19 +128,19 @@ data = (p / 'ld-linux-x86-64.so.2').read_bytes()
 if data[:6] != b'\x7fELF\x02\x01' or data[18:20] != b'\x3e\x00':
     raise SystemExit('Provider loader must be x86-64 ELF')
 PY
-    mmd -i "${INITRD_IMG}.tmp" "::LIB64"
+    mmd -i "${INITRD_IMG}.tmp" "::lib64"
     # mcopy must succeed before atomic publication. Insufficient initrd space
     # fails here and the trap removes the unpublished temporary image.
     mcopy -i "${INITRD_IMG}.tmp" "${BROOK_PROVIDER_PAYLOAD}/ld.so.cache" "::ETC/ld.so.cache"
     mcopy -i "${INITRD_IMG}.tmp" "${BROOK_PROVIDER_PAYLOAD}/ld.so.conf" "::ETC/ld.so.conf"
-    mcopy -i "${INITRD_IMG}.tmp" "${BROOK_PROVIDER_PAYLOAD}/ld-linux-x86-64.so.2" "::LIB64/ld-linux-x86-64.so.2"
+    mcopy -i "${INITRD_IMG}.tmp" "${BROOK_PROVIDER_PAYLOAD}/ld-linux-x86-64.so.2" "::lib64/ld-linux-x86-64.so.2"
     python3 - "${BROOK_PROVIDER_PAYLOAD}" "${INITRD_IMG}.tmp" <<'PY'
 from pathlib import Path
 import hashlib, json, subprocess, sys
 m = json.loads((Path(sys.argv[1]) / 'manifest.json').read_text())
 for target, expected in [('::ETC/ld.so.cache', m['cache_sha256']),
                          ('::ETC/ld.so.conf', m['config_sha256']),
-                         ('::LIB64/ld-linux-x86-64.so.2', m['loader']['sha256'])]:
+                         ('::lib64/ld-linux-x86-64.so.2', m['loader']['sha256'])]:
     data = subprocess.run(['mtype', '-i', sys.argv[2], target],
                           capture_output=True, check=True).stdout
     if hashlib.sha256(data).hexdigest() != expected:

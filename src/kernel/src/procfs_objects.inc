@@ -170,7 +170,7 @@ static int ProcObjectParent(VfsObject* object,VfsObject** out,bool=false)
 // The FD lock protects acquisition of the path's own references. No FD pin or
 // vnode reference is released here: a concurrent close must never make proc's
 // outer VFS callback run final descriptor teardown.
-static int ProcAcquireDirectoryFd(const ProcObject* value,VfsPath* out,char* fallback=nullptr,uint32_t capacity=0)
+static int ProcAcquireDirectoryFd(const ProcObject* value,VfsPath* out,char* fallback=nullptr,uint32_t capacity=0,bool anyObject=false)
 {
     *out={};auto* live=SchedulerFindProcessReference(value->pid);if(!live)return -2;
     if(live->incarnation!=value->incarnation || live->tgid!=value->tgid ||
@@ -183,7 +183,7 @@ static int ProcAcquireDirectoryFd(const ProcObject* value,VfsPath* out,char* fal
             error=1;FdDiagnosticPath(fd,fallback,capacity);
             if((fd.type==FdType::Vnode || fd.type==FdType::Path) && fd.handle) {
                 auto* node=static_cast<Vnode*>(fd.handle);
-                if(node->type==VnodeType::Dir) {
+                if(node->type==VnodeType::Dir || anyObject) {
                     error=-95;
                     if(node->mountOwner && node->backendObject) {
                         *out={node->mountOwner,node->backendObject};VfsPathRetain(*out);error=0;
@@ -207,8 +207,8 @@ static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
         if(value->kind==ProcObjectKind::ThreadSelf) {end=AppendStr(end,"/task/");end=U64ToDec(end,current->pid);}
         *end=0;
     } else if(value->kind==ProcObjectKind::FdLink) {
-        VfsPath path{};int error=ProcAcquireDirectoryFd(value,&path,target,sizeof(target));
-        if(!error)error=VfsPathDirectoryPathFromCallback(path,target,sizeof(target));
+        VfsPath path{};int error=ProcAcquireDirectoryFd(value,&path,target,sizeof(target),true);
+        if(!error)error=VfsPathObjectPathFromCallback(path,target,sizeof(target));
         VfsPathRelease(path);if(error<0)return error;
 
     } else if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_EXE) {

@@ -45,6 +45,9 @@ struct VfsObjectOps {
     // never for readlink reporting, within the namespace transaction. Source is
     // borrowed and pins its attachment, allowing exact pseudo-object targets.
     int (*follow_link)(const VfsPath& source,VfsPath* out) = nullptr;
+    // Reporting only, for an exact retained entry of any type. Unsupported
+    // backends must fail rather than substitute a diagnostic/opening label.
+    int (*object_path)(VfsObject*,char* out,uint32_t capacity) = nullptr;
 };
 struct VfsObject {
     const VfsObjectOps* ops;

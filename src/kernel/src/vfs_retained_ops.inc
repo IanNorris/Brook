@@ -132,6 +132,16 @@ int VfsReadlinkAt(const VfsPath& root,const VfsPath& start,const char* text,char
     if(int error=VfsWalkAtLocked(root,start,text,walk,{false}))return error;
     auto* object=walk.value.object.object;return object->ops->readlink?object->ops->readlink(object,out,capacity):-95;
 }
+int VfsPathReadlink(const VfsPath& path,char* out,uint32_t capacity)
+{
+    if(!out || !capacity)return -22;
+    if(!path.object || !path.attachment)return -9;
+    FileMutationGuard lookup(false);
+    VnodeStat stat{};if(int error=VfsObjectStatLocked(path.object,&stat))return error;
+    // Linux readlinkat(fd, "") returns ENOENT for a non-symlink FD.
+    if(!stat.isSymlink)return -2;
+    return path.object->ops->readlink?path.object->ops->readlink(path.object,out,capacity):-95;
+}
 int VfsMkdirAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode,uint16_t mask)
 {
     FileMutationGuard mutation;VfsOwnedWalk walk;
