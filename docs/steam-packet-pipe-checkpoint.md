@@ -79,3 +79,7 @@ Frozen ELF SHA-256:
 `4e4f727f51bdf717484cdec4d44350bfc1ddd55acf75563e2d38c7f0309023d9`.
 
 Linux interface reference: <https://man7.org/linux/man-pages/man2/pipe.2.html>.
+
+The following [procfs metadata checkpoint](steam-procfs-checkpoint.md) locates
+and removes those CEF task-directory traps. Steam's independent main-client
+abort remains unresolved.

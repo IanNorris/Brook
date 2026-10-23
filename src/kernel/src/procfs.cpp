@@ -11,6 +11,7 @@
 // Linux /proc layout that busybox ps/top expect.
 
 #include "procfs.h"
+#include "proc_inode.h"
 #include "vfs.h"
 #include "process.h"
 #include "scheduler.h"
@@ -162,6 +163,8 @@ struct ProcPriv {
     bool sysKernelDirectory;
 };
 
+static int ProcReportedInode(VfsObject*,uint64_t*);
+
 // VnodeOps for procfs files
 static int ProcFileOpen(Vnode*, int) { return 0; }
 
@@ -192,7 +195,8 @@ static int ProcFileStat(Vnode* vn, VnodeStat* st)
     auto* pp = static_cast<ProcPriv*>(vn->priv);
     st->size = pp ? pp->size : 0;
     st->isDir = false;st->mode=0100444;st->dev=0x70726f63;
-    st->ino=vn->backendObject?vn->backendObject->identity:0;st->nlink=1;
+    st->nlink=1;
+    if(vn->backendObject)if(int error=ProcReportedInode(vn->backendObject,&st->ino))return error;
     return 0;
 }
 
@@ -229,7 +233,7 @@ static int ProcDirStat(Vnode* vn, VnodeStat* st)
     else st->nlink = 2;
     st->size = 0;
     st->isDir = true;st->mode=0040555;st->dev=0x70726f63;
-    if(vn->backendObject)st->ino=vn->backendObject->identity;
+    if(vn->backendObject)if(int error=ProcReportedInode(vn->backendObject,&st->ino))return error;
     return 0;
 }
 

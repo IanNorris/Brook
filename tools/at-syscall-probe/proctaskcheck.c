@@ -42,6 +42,15 @@ static int enumerate(DIR *dir, int leader, int worker, int expected)
     if(errno && errno!=ENOENT && errno!=ESRCH) return -1;
     return count==expected && (!expected || seen_leader==1) && (expected!=2 || seen_worker==1);
 }
+static void checklinks(int procfd,int taskfd,nlink_t expected)
+{
+    struct stat a={0},b={0},c={0};
+    CHECK(fstatat(procfd,"self/task/",&a,0)==0&&S_ISDIR(a.st_mode)&&a.st_nlink==expected);
+    CHECK(stat("/proc/self/task/",&b)==0&&S_ISDIR(b.st_mode)&&b.st_nlink==expected);
+    // The same retained descriptor must observe worker birth and retirement.
+    CHECK(fstat(taskfd,&c)==0&&S_ISDIR(c.st_mode)&&c.st_nlink==expected);
+    CHECK(a.st_ino==b.st_ino&&a.st_ino==c.st_ino);
+}
 static void *worker_main(void *unused)
 {
     (void)unused;
@@ -49,7 +58,11 @@ static void *worker_main(void *unused)
     atomic_store(&tid,me);
     struct stat a,b;
     char path[128]; snprintf(path,sizeof(path),"/proc/%d/task/%d",getpid(),me);
-    int ok=stat("/proc/thread-self",&a)==0&&stat(path,&b)==0&&a.st_ino==b.st_ino;
+    int ok=1;
+    // Repeated unpinned stats must not allocate a different reported inode.
+    for(int i=0;i<32;++i) {
+        if(stat("/proc/thread-self",&a)||stat(path,&b)||a.st_ino!=b.st_ino)ok=0;
+    }
     ok=ok&&status_matches("/proc/thread-self/status",me,getpid(),2);
     ok=ok&&status_matches("/proc/self/status",getpid(),getpid(),2);
     atomic_store(&worker_ok,ok);
@@ -61,13 +74,14 @@ int main(void)
     int procfd=open("/proc",O_RDONLY|O_DIRECTORY);
     CHECK(procfd>=0);
     struct stat st;
-    CHECK(fstatat(procfd,"self/task/",&st,0)==0&&S_ISDIR(st.st_mode)&&st.st_nlink==3);
+    int taskfd=open("/proc/self/task",O_RDONLY|O_DIRECTORY);CHECK(taskfd>=0);
+    checklinks(procfd,taskfd,3);
     pthread_t thread;
     int rc=pthread_create(&thread,NULL,worker_main,NULL);
     CHECK(rc==0); if(rc) return 1;
     for(int i=0;i<5000&&!atomic_load(&tid);++i) usleep(1000);
     int worker=atomic_load(&tid); CHECK(worker>0&&worker!=getpid());
-    CHECK(fstatat(procfd,"self/task/",&st,0)==0&&st.st_nlink==4);
+    checklinks(procfd,taskfd,4);
     DIR *dir=opendir("/proc/self/task"); CHECK(dir!=NULL);
     if(dir) { CHECK(enumerate(dir,getpid(),worker,2)); closedir(dir); }
     char path[128]; snprintf(path,sizeof(path),"/proc/self/task/%d/status",worker);
@@ -80,7 +94,7 @@ int main(void)
     CHECK(atomic_load(&worker_ok));
     for(int i=0;i<2000;++i) { if(stat(path,&st)<0&&errno==ENOENT) break; usleep(1000); }
     CHECK(stat(path,&st)<0&&errno==ENOENT);
-    CHECK(fstatat(procfd,"self/task/",&st,0)==0&&st.st_nlink==3);
+    checklinks(procfd,taskfd,3);
 
     // A live foreign group must never be enumerated or accepted as our task.
     // Keep its task directory open across exit and possible PID reuse.
@@ -110,7 +124,7 @@ int main(void)
         close(pipefd[1]); CHECK(waitpid(next,&status,0)==next&&WIFEXITED(status));
     }
     if(old) closedir(old);
-    close(procfd);
+    close(taskfd);close(procfd);
     if(failures) return 1;
     printf("PROCTASKCHECK PASS live=2 single=1 stale_dir=32 observed_reuse=%d\n",reused);
     return 0;

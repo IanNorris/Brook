@@ -79,6 +79,14 @@ static void ProcObjectDestroy(VfsObject* object)
     *entry=value->next;SpinLockRelease(&g_procObjectLock);
     UserNamespaceRelease(value->userNamespace);kfree(value);VfsObjectRelease(parent);
 }
+static int ProcReportedInode(VfsObject* object,uint64_t* out)
+{
+    static_assert(MAX_FDS<=ProcInodeIndexes,"Expand proc inode index domain with the descriptor limit");
+    static_assert(static_cast<uint32_t>(ProcObjectKind::NsLink)<ProcInodeRoles);
+    auto* value=static_cast<ProcObject*>(object->priv);
+    return ProcInodeNumber(value->incarnation,static_cast<uint32_t>(value->kind),
+                           value->taskMember,value->index,*out)?0:-75; // EOVERFLOW
+}
 static int ProcObjectStat(VfsObject* object,VnodeStat* out)
 {
     if(!out)return -22;
@@ -94,7 +102,10 @@ static int ProcObjectStat(VfsObject* object,VnodeStat* out)
                    (value->kind==ProcObjectKind::PidFile && (value->index==PROC_PID_EXE || value->index==PROC_PID_CWD || value->index==PROC_PID_ROOT));
     out->mode=out->isDir?0040555:out->isSymlink?0120777:0100444;
     if(value->kind==ProcObjectKind::UserMap) {out->mode=0100644;out->uid=value->userNamespace?value->userNamespace->owner:0;}
-    out->ino=object->identity;out->dev=0x70726f63;out->nlink=out->isDir?2:1;
+    if(int error=ProcReportedInode(object,&out->ino))return error;out->dev=0x70726f63;
+    // Chromium uses the task-directory link count to detect a single thread.
+    // Retained object lookup must match the live legacy proc directory stat.
+    out->nlink=value->kind==ProcObjectKind::Task ? 2+snapshot.threadCount : out->isDir?2:1;
     return 0;
 }
 static int ProcObjectAccess(VfsObject* object,uint8_t required,bool realIds)

@@ -47,6 +47,8 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_proc_inode)
+target_compile_options(test_proc_inode PRIVATE -UNDEBUG)
 add_host_test(test_memfd_seals)
 target_compile_options(test_memfd_seals PRIVATE -UNDEBUG)
 add_host_test(test_shared_irq_registry)
