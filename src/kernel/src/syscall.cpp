@@ -7838,7 +7838,10 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t bufAddr, uint64_t count,
         ent->d_ino = cookie + 1;
         ent->d_off = static_cast<int64_t>(cookie);
         ent->d_reclen = static_cast<uint16_t>(reclen);
-        ent->d_type = de.isDir ? 4 : 8; // DT_DIR : DT_REG
+        // DirEntry only distinguishes directories. Other entries can be
+        // symlinks or special files: DT_UNKNOWN asks callers to use lstat,
+        // whereas falsely claiming DT_REG breaks ldconfig's inode cache.
+        ent->d_type = de.isDir ? 4 : 0; // DT_DIR : DT_UNKNOWN
 
         for (uint64_t i = 0; i < nameLen; ++i) ent->d_name[i] = de.name[i];
         ent->d_name[nameLen] = '\0';
