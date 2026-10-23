@@ -100,3 +100,46 @@ original launcher wait and all four filesystem checks pass in
 A controlled call to the installed library's public `cef_version_info` API
 reports CEF 126, commit number 3171, Chromium 126.0.6478.183. This verifies the
 version used for the source comparisons; no client data is exported.
+
+
+## 16 GiB / unrestricted byte-quota experiment
+
+The opt-in QEMU setting `-fw_cfg name=opt/tmpfs-unbounded,string=1`
+sets the aggregate tmpfs and canonical `/dev/shm` byte ceilings to the largest
+page-aligned signed offset. Pages remain lazily allocated and subject to real
+physical-memory availability; inode/mount limits and explicit smaller mount
+quotas remain enforced. The default RAM-derived ceilings are unchanged.
+
+Review `steam-mapped-growth-off-gpu-1ms-fixed-mlfq-d-20261023` uses 16 GiB,
+eight CPUs and the same MLFQ/Intel Venus/1 ms host polling configuration.
+The actual guest reports 16,724,896 KiB RAM and the requested byte ceiling.
+Native IPC, DRM, explicit quota, Pulse and all three mapped-growth filesystem
+controls pass, including the partial-page alias/CoW checks. Production entry
+and scheduler mutation audits pass on frozen ELF
+`b5e5cbfa92bc711f67d040a9346534f969b1f655da3873fe0027bfda2448f52b`.
+
+Unlike the earlier capped runs, Steam remains alive while its shared-memory
+pool count continues increasing. The monitor exceeds 1 GiB of logical files
+and 2 GiB of charged backing/cache memory with abundant physical RAM still
+free. No login appears. The bounded capture still reports the persistent-memory
+corruption warning and multiple `ChildThreadImpl::EnsureConnected()` messages.
+The new probe adds thread IDs: one parent records 52 pool creations, with
+12 on one worker and 40 on its main thread; captured allocation calls have no
+unexpected errors. Thus the old quota was a real constraint but removing it
+does not resolve startup, and repeated same-thread allocation is now observed.
+This supports investigating failed IPC connections/recovery rather than
+assuming the pool count merely reflects distinct workers. It does not prove
+the exact retry cause or an infinite leak.
+
+The experiment is stopped deliberately after continued growth, rather than
+waiting for physical exhaustion. Exit 137 is the agent's forced stop following
+an unsuccessful graceful stop, not a spontaneous crash or an OOM result.
+Proprietary payloads and raw logs remain in private guest evidence.
+
+Final monitor totals: 302 samples, 56 pools, 1,473,993,264 peak logical
+bytes and 2,973,478,912 peak charged bytes. The minimum recorded free physical
+memory is 12,690,672 KiB. The last sample follows the deliberate application
+stop and must not be interpreted as a spontaneous plateau. All original job
+groups drain with stdout/stderr EOF. The pristine wrapper is restored, both
+services exit normally, heap integrity passes, the original VM owner exits 0,
+and final serial acceptance plus all four offline filesystem checks pass.

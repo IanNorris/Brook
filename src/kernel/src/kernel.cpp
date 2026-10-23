@@ -536,13 +536,22 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::SerialPrintf("VFS: canonical device parent anchor result=%d\n",nullAnchor);
     const int drmAnchor=brook::VfsCanonicalDrmAnchorInitialize();
     if(drmAnchor)KernelPanic("canonical DRM sysfs anchor failed (rebuild initrd): %d",drmAnchor);
+    // Read boot options before creating the first tmpfs instance.
+    brook::FwCfgInit();
+    char tmpfsUnbounded[2]{};
+    const uint32_t tmpfsOption=brook::FwCfgReadFile("opt/tmpfs-unbounded",tmpfsUnbounded,sizeof(tmpfsUnbounded));
+    const bool unboundedTmpfs=tmpfsUnbounded[0]=='1' &&
+        (tmpfsOption==1 || (tmpfsOption==2 && !tmpfsUnbounded[1]));
     // Charge tmpfs lazily, within a boot-available-RAM aggregate ceiling. The
     // desktop gets half that budget; ordinary container mounts retain their
     // smaller default unless the caller requests an explicit size.
     // The PMM total is an address-space high-water mark and includes holes.
-    const uint64_t tmpfsBudget=(brook::PmmGetFreePageCount()*4096/8)&~uint64_t{4095};
+    // Diagnostic opt-in removes byte quotas, not physical allocation limits.
+    // Keep the signed-offset, page-aligned maximum so statfs remains valid.
+    const uint64_t tmpfsBudget=unboundedTmpfs ? 0x7ffffffffffff000ULL :
+        (brook::PmmGetFreePageCount()*4096/8)&~uint64_t{4095};
     if(brook::TmpfsConfigureByteBudget(tmpfsBudget))KernelPanic("tmpfs memory budget initialization failed");
-    const uint64_t desktopShmBytes=tmpfsBudget/2 & ~uint64_t{4095};
+    const uint64_t desktopShmBytes=unboundedTmpfs ? tmpfsBudget : tmpfsBudget/2 & ~uint64_t{4095};
     // A real retained filesystem must survive directory binds into containers;
     // the historical pathname-only shm broker cannot serve those namespaces.
     {
@@ -571,7 +580,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     }
 
     // ---- QEMU fw_cfg ----
-    brook::FwCfgInit();
     // QEMU legacy PIRQ discriminator: change only routed pin11's trigger,
     // before storage/shared-line traffic. No default or polarity change.
     char irq11Level[2]{};
