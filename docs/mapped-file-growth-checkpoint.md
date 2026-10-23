@@ -56,3 +56,47 @@ the original owned launcher wait and all four offline filesystem checks pass.
 Private evidence:
 `build/reviews/steam-mapped-growth-off-gpu-1ms-fixed-mlfq-a-20261023` and
 `build/workloads/steam-mapped-growth-20261023/`.
+
+## Partial-page EOF follow-up
+
+The fresh-profile capture exposes another real growth case: CEF requests
+2,048 → 57,344 bytes, 55,296 → 106,496 bytes, and 75,776 → 124,928 bytes.
+The initial aligned-only implementation rejects these. The capture has no new
+persistent-memory corruption warning but still ends in shared-memory pressure;
+clearing the cache has not established login.
+
+The follow-up admits strict growth from partial-page EOF as well. After growth,
+it zeros the entire old canonical page tail, including bytes beyond new EOF
+when growth ends within the same page. Existing shared aliases observe those
+zeros; independent private CoW frames retain their contents. No old frame is
+freed or detached. After a backend error, EOF is re-statted: unchanged EOF keeps
+the old tail, committed growth clears it, and unknown EOF conservatively clears
+only the invalid tail while retaining every valid prefix byte. Same-size
+truncate and shrink remain rejected.
+
+The Linux control confirms both tail behaviors. The new guest also passes them
+on tmpfs, the data disk and the runtime disk, together with the earlier fork,
+alias and fsync cases. All 102 assertion-enabled host tests pass in one run;
+file-object and tmpfs ASan/UBSan fixtures pass. Exact-ELF entry-state and scheduler
+mutation audits pass for ABI 50 ELF
+`1f28dfd3460888052665662bd15399957b82065854d36265f38c323180aee04d`.
+The renewed native IPC, DRM, quota and Pulse controls also pass.
+
+The fresh-profile application capture confirms that the formerly failing
+2,048 → 57,344-byte request and subsequent requests to 106,496 and 124,928 bytes
+now return success. The captured CEF resize calls have no errors. Steam still
+creates ten 25 MiB plus 16-byte pools and exits 135 before login. Its newly
+appended log contains one persistent-memory corruption warning and a
+`ChildThreadImpl::EnsureConnected()` entry. These remaining symptoms have not
+been attributed to the growth failures. Thread-level pool attribution is the
+next diagnostic distinction: repeated caller stacks alone do not prove that
+one thread is retrying rather than multiple threads creating connections.
+
+All original jobs drain, the pristine helper wrapper is restored, and both
+services exit normally. Heap, checked shutdown, final serial acceptance,
+original launcher wait and all four filesystem checks pass in
+`build/reviews/steam-mapped-growth-off-gpu-1ms-fixed-mlfq-c-20261023`.
+
+A controlled call to the installed library's public `cef_version_info` API
+reports CEF 126, commit number 3171, Chromium 126.0.6478.183. This verifies the
+version used for the source comparisons; no client data is exported.

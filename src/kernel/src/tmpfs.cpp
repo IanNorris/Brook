@@ -222,7 +222,7 @@ Node *NewNode(Tmpfs *fs, uint16_t mode, uint32_t uid, uint32_t gid)
     n->linked = true;
     n->atime = n->mtime = n->ctime = Now();
     FileObjectInit(&n->file);
-    // Strict growth cannot retire a page or modify data below aligned old EOF.
+    // Strict growth cannot retire a page or modify data below old EOF.
     n->file.growMappedBacking=Truncate;
     n->file.pageBudgetContext=n;
     n->file.reservePageBytes=[](void* context,uint64_t bytes) {return Reserve(static_cast<Node*>(context)->fs,bytes);};

@@ -35,7 +35,7 @@ struct Backend {
     std::vector<unsigned char> bytes;
     unsigned reads=0;
     unsigned writes=0,errorAtWrite=0,zeroAtWrite=0;
-    bool failRead=false,failWrite=false,failTruncate=false,failAfterTruncate=false,failStat=false;
+    bool failRead=false,failWrite=false,failTruncate=false,failAfterTruncate=false,failStat=false,failGrowRestat=false;
     int readError=-5,statError=-5;
     unsigned char* redirty=nullptr;
     bool blockWrite=false;
@@ -128,6 +128,7 @@ static int grow_preserving_prefix(Vnode* vnode,uint64_t length) {
     auto* backend=static_cast<Backend*>(vnode->priv);
     if(backend->failTruncate)return -5;
     backend->bytes.resize(length);
+    if(backend->failGrowRestat)backend->failStat=true;
     return backend->failAfterTruncate ? -5 : 0;
 }
 static void MappedGrowth() {
@@ -166,11 +167,33 @@ static void MappedGrowth() {
     // Re-check actual EOF, rather than trusting an earlier VFS size snapshot.
     CHECK(FileObjectGrowMapped(&backend.object,&first,270336)==-16);
     CHECK(FileObjectGrowMapped(&backend.object,&first,274433)==0);
-    CHECK(FileObjectGrowMapped(&backend.object,&second,278528)==-16);
+    CHECK(FileObjectGrowMapped(&backend.object,&second,278528)==0);
     CHECK(FileObjectWriteback(&backend.object,&first,0,~uint64_t{0})==0&&backend.bytes[0]==0x7c);
     PmmUnrefPage(page);PmmUnrefPage(alias);
     CHECK(FileObjectWritebackAll()==0);
     FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
+}
+static void PartialMappedGrowth() {
+    CHECK(refs.empty()&&heapBlocks==0);
+    Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(2048,0x31);
+    backend.object.growMappedBacking=grow_preserving_prefix;
+    Vnode vnode{&operations,VnodeType::File,&backend,1,0};
+    int error=0;auto page=FileObjectGetPage(&backend.object,&vnode,0,true,&error);CHECK(page&&!error);
+    auto* bytes=reinterpret_cast<unsigned char*>(page.raw());bytes[3000]=0x7b;
+    backend.failTruncate=true;CHECK(FileObjectGrowMapped(&backend.object,&vnode,2600)==-5);
+    CHECK(bytes[0]==0x31&&bytes[3000]==0x7b&&backend.bytes.size()==2048);
+    // Commit followed by an error still makes the entire old tail zero, even
+    // beyond new EOF. Existing physical aliases remain the same frame.
+    backend.failTruncate=false;backend.failAfterTruncate=true;
+    CHECK(FileObjectGrowMapped(&backend.object,&vnode,2600)==-5);
+    CHECK(backend.bytes.size()==2600&&bytes[2047]==0x31);
+    for(unsigned i=2048;i<4096;++i)CHECK(bytes[i]==0);
+    bytes[3000]=0x7c;backend.failGrowRestat=true;
+    CHECK(FileObjectGrowMapped(&backend.object,&vnode,57344)==-5);
+    CHECK(backend.bytes.size()==57344&&bytes[2599]==0&&bytes[3000]==0&&bytes[2047]==0x31);
+    backend.failGrowRestat=false;backend.failStat=false;backend.failAfterTruncate=false;
+    auto alias=FileObjectGetPage(&backend.object,&vnode,0,false,&error);CHECK(alias==page&&!error);PmmUnrefPage(alias);
+    PmmUnrefPage(page);FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
 }
 static void AppendTransactions() {
     CHECK(refs.empty()&&heapBlocks==0);
@@ -642,5 +665,6 @@ int main() {
     QuarantinedPages();
     PartialUserCopies();
     MappedGrowth();
+    PartialMappedGrowth();
     std::puts("FILE_OBJECT PASS batch/sparse-pins/one-gate/failure-cleanup/concurrent-load/io-coherence/partial-error/truncate/zero-tail/lifetime/writeback-range/snapshot/redirty/error-retry");
 }

@@ -328,8 +328,8 @@ static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
     if (!candidate) return nullptr;
     *candidate = {mnt, inode, 1, false, nullptr, {}};
     FileObjectInit(&candidate->file);
-    // Strict growth from aligned EOF only updates inode length; it neither
-    // prunes blocks nor touches the old prefix, including a failed inode write.
+    // Strict growth never prunes blocks or touches bytes below old EOF,
+    // including a failed inode write. Only an invalid old tail can be zeroed.
     candidate->file.growMappedBacking=Ext2FileTruncate;
     uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
     for (auto* p = g_ext2OpenInodes; p; p = p->next) {

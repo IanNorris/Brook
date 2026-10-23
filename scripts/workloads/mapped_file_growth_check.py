@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run on Linux or Brook: grow a file while aliases in two processes remain live."""
 import argparse
+import ctypes
 import json
 import mmap
 import os
@@ -74,7 +75,41 @@ def check(directory):
                           cross_process_aliases=True, durable_contents=True)), flush=True)
 
 
+def partial_tail(directory):
+    with tempfile.TemporaryFile(dir=directory) as backing:
+        backing.truncate(2048)
+        shared = mmap.mmap(backing.fileno(), 2048, access=mmap.ACCESS_WRITE)
+        private = mmap.mmap(backing.fileno(), 2048, access=mmap.ACCESS_COPY)
+        try:
+            shared[0] = 65
+            private[0] = 66  # Force a private CoW page before growth.
+            shared_address = ctypes.addressof(ctypes.c_char.from_buffer(shared))
+            private_address = ctypes.addressof(ctypes.c_char.from_buffer(private))
+            # The OS maps a full page for this partial file page. Probe its EOF
+            # tail directly; Python's logical buffer bounds stop at 2048.
+            shared_tail = ctypes.c_ubyte.from_address(shared_address + 3000)
+            private_tail = ctypes.c_ubyte.from_address(private_address + 3000)
+            shared_tail.value = 123
+            private_tail.value = 124
+            os.ftruncate(backing.fileno(), 2600)
+            assert shared[0] == 65 and private[0] == 66
+            assert shared_tail.value == 0 and private_tail.value == 124
+            shared_tail.value = 125
+            os.ftruncate(backing.fileno(), 57344)
+            assert shared_tail.value == 0 and private_tail.value == 124
+            assert os.pread(backing.fileno(), 1, 0) == b'A'
+            assert os.pread(backing.fileno(), 4096 - 2048, 2048) == bytes(4096 - 2048)
+            os.fsync(backing.fileno())
+        finally:
+            shared.close()
+            private.close()
+    print(json.dumps(dict(partial_mapped_growth=True, directory=str(directory),
+                          shared_tail_zero=True, private_copy_preserved=True)), flush=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory', type=Path, required=True)
-    check(parser.parse_args().directory)
+    args = parser.parse_args()
+    check(args.directory)
+    partial_tail(args.directory)

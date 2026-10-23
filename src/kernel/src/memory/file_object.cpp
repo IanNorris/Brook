@@ -520,9 +520,23 @@ int FileObjectGrowMapped(FileObject* object,Vnode* vnode,uint64_t length) {
     if(result)return result;
     // Ordinary writes can extend EOF independently of the VFS first-pin gate.
     // Check the current size here so a racing extension cannot turn growth
-    // into shrink. Aligned EOF excludes an old, user-modifiable partial tail.
-    if(length<=before.size || (before.size&4095))return -16;
+    // into shrink.
+    if(length<=before.size)return -16;
     result=object->growMappedBacking(vnode,length);
+    if(before.size&4095) {
+        uint64_t visible=length;
+        if(result) {
+            VnodeStat after{};
+            // Error does not imply rollback. If EOF cannot be observed, clear
+            // the old invalid tail conservatively; the valid prefix survives.
+            visible=vnode->ops->stat(vnode,&after) ? ~uint64_t{0} : after.size;
+        }
+        // Linux clears the whole old partial-page tail even when new EOF is
+        // within that page. Do not touch independent private CoW frames. The
+        // canonical frame stays alive, so no PTE/AS invalidation is needed.
+        if(visible>before.size)
+            ZeroResidentGap(object,before.size,(before.size|uint64_t{4095})+1);
+    }
     // Do not flush or evict old canonical pages: live PTEs borrow these frames.
     // Even an error can commit the larger EOF. Revalidate prepared faults while
     // retaining the still-valid old prefix and every mapping/exposure lease.
