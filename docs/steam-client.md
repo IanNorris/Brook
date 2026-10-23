@@ -1,9 +1,10 @@
-Latest container checkpoint: [NOSUID-only bind flags](device-bind-flags-checkpoint.md)
-runs unchanged bubblewrap and its NNP/exec child successfully as UID 1000.
-The real SteamRT launcher now passes directory FD traversal and the retained
-`/usr` layout check, read-only binds and the device remount. A container-visible
-coreutils PATH lets its precheck execute true; runtime setup then stops at
-F_ADD_SEALS for etc-passwd. Its requested child has not executed.
+Latest container checkpoint: [SteamRT executes its runtime child](steamrt-runtime-checkpoint.md).
+The installed pressure-vessel launcher and bundled bubblewrap now complete two
+separate default runtime-copy runs as UID 1000. The requested shell prints the
+Steam Runtime 3c identity, and its supervisor exits zero with no remaining
+children. This uses the existing locally staged installation with Nix ELF
+interpreter patches described below; it does not claim pristine-archive,
+Steam login, CEF or game acceptance. The older checkpoints below are historical.
 
 # Native Steam client checkpoint
 

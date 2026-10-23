@@ -14,6 +14,11 @@ int VfsPathRoot(VfsPath* out);
 // not crossed a directory bind. Missing synthetic tails are permitted; a bind
 // must mask broker entries just as it masks ordinary backing entries.
 int VfsPathBrokerAllowed(const VfsPath& root,const char* absolute,bool* allowed);
+// Narrow null-device compatibility bridge. Provision once before userspace.
+// Only a missing null entry beneath the pinned canonical /dev is eligible;
+// retained parent identity and NODEV are checked in one namespace transaction.
+int VfsNullDeviceAnchorInitialize();
+int VfsNullDeviceAllowed(const VfsPath& root,const VfsPath& start,const char* text,bool* allowed,bool followFinal=true);
 // Device activation only: metadata/O_PATH, directories, /dev/shm and existing
 // device descriptors are unaffected. Called for a recognized broker device.
 int VfsPathDeviceActivation(const VfsPath& root,const char* absolute);

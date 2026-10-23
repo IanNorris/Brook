@@ -807,7 +807,7 @@ static Vnode* GenPidMountInfo(const ProcessSnapshot& proc)
     }
     if(error)return nullptr;
     // Four-byte escaping is worst case for every cached path and type field.
-    constexpr uint32_t PerRow=4*(512+64+2*16)+128;
+    constexpr uint32_t PerRow=4*(sizeof(VfsMountInfo::root)+sizeof(VfsMountInfo::mountPoint)+2*sizeof(VfsMountInfo::fsType))+128;
     if(count>(~uint32_t{0}-1)/PerRow) {VfsMountInfoFree(rows);return nullptr;}
     uint32_t capacity=count*PerRow+1;
     auto* buffer=static_cast<char*>(kmalloc(capacity));
@@ -1135,8 +1135,9 @@ static Vnode* GenMounts()
     auto* ns=error?VfsMountNamespaceInitial():fs.mountNamespace;
     fs.mountNamespace=nullptr;FsSnapshotRelease(&fs);
     uint32_t maxSlots = VfsMountNamespaceCount(ns);
-    if(maxSlots>(~uint32_t{0}-128)/128) {VfsMountNamespaceRelease(ns);return nullptr;}
-    uint32_t bufSize = 128 + maxSlots * 128;
+    constexpr uint32_t PerRow=sizeof(VfsMountSnapshot::mountPoint)+2*sizeof(VfsMountSnapshot::fsType)+32;
+    if(maxSlots>(~uint32_t{0}-128)/PerRow) {VfsMountNamespaceRelease(ns);return nullptr;}
+    uint32_t bufSize = 128 + maxSlots * PerRow;
     auto* buf = static_cast<char*>(kmalloc(bufSize));
     if (!buf) {VfsMountNamespaceRelease(ns);return nullptr;}
 
@@ -1145,7 +1146,7 @@ static Vnode* GenMounts()
     {
         VfsMountSnapshot snap = VfsMountNamespaceSnapshotAt(ns,i);
         if (!snap.used) continue;
-        if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
+        if (static_cast<uint32_t>(p - buf) + PerRow >= bufSize) break;
         // Linux format: device mountpoint type options dump pass
         p = AppendStr(p, snap.fsType);
         *p++ = ' ';

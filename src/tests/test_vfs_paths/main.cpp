@@ -24,7 +24,7 @@ long failAllocation=-1;
 unsigned schedulerLockDepth=0;
 struct Mount;
 struct Node { Mount* mount;uint64_t id;bool dir;Node* parent;std::map<std::string,Node*> children;std::string target;uint16_t mode=0;uint32_t nlink=1; };
-struct Mount { uint64_t identity=0;bool alive=false;unsigned live=0;unsigned closed=0;Node root{}; };
+struct Mount { uint64_t identity=0;bool alive=false;std::atomic<unsigned> live{0};unsigned closed=0;Node root{}; };
 Mount mounts[8];
 unsigned mountCalls[8]{},unmountCalls[8]{},syncCalls[8]{};
 bool rejectRoot[8]{},rejectUnmount[8]{};
@@ -327,7 +327,9 @@ static void testProcessContexts(const brook::VfsPath& root,const brook::VfsPath&
 }
 static std::vector<brook::VfsMountInfo> infoRows(brook::MountNamespace* ns,const brook::VfsPath& root) {
     brook::VfsMountInfo* rows=nullptr;uint32_t count=0;
-    assert(!brook::VfsMountNamespaceInfo(ns,root,&rows,&count));
+    int error=-11;
+    for(unsigned attempt=0;error==-11 && attempt<64;++attempt) {error=brook::VfsMountNamespaceInfo(ns,root,&rows,&count);if(error==-11)std::this_thread::yield();}
+    assert(!error);
     std::vector<brook::VfsMountInfo> result(rows,rows+count);brook::VfsMountInfoFree(rows);
     assert(!result.empty()&&result.front().parent==0);
     for(size_t i=0;i<result.size();++i) {
@@ -592,6 +594,61 @@ static void testSocketBinds(brook::MountNamespace* initial,const brook::VfsPath&
     assert(!VfsRemoveAt(root,a,"socket-final",false));assert(static_cast<MountEntry*>(bound.attachment)->rootFileUnlinked);
     assert(!VfsMountNamespaceDetach(ns,bound));VfsPathRelease(bound);VfsPathRelease(a);VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
     assert(allocations.size()==allocated && g_mounts.count==records);
+}
+static void testLongMountPaths(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    const auto allocated=allocations.size();const auto records=g_mounts.count;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
+    std::string leaf(200,'x'),renamed(180,'n');
+    Node parent{&mounts[6],960,true,&mounts[6].root,{},{}},target{&mounts[6],961,true,&parent,{},{}};
+    mounts[6].root.children["long-parent"]=&parent;parent.children[leaf]=&target;
+    std::string path="long-parent/"+leaf;
+    assert(!VfsMountNamespaceBindAt(ns,root,root,"ns-a",path.c_str()));
+    auto bound=resolve(root,root,path.c_str());auto rows=infoRows(ns,root);bool found=false;
+    for(auto& row:rows)if(row.mountPoint=="/"+path)found=true;assert(found);
+    found=false;for(uint32_t i=0;i<VfsMountNamespaceCount(ns);++i){auto snap=VfsMountNamespaceSnapshotAt(ns,i);if(snap.mountPoint=="/"+path)found=true;}assert(found);
+    assert(!VfsRenameAt(root,root,"long-parent",root,renamed.c_str()));path=renamed+"/"+leaf;
+    assert(!std::strcmp(static_cast<MountEntry*>(bound.attachment)->mountPoint,("/"+path).c_str()));
+    auto moved=resolve(root,root,path.c_str());assert(VfsPathSame(moved,bound));VfsPathRelease(moved);
+    auto source=resolve(root,root,renamed.c_str()),dest=resolve(root,root,"ns-target");assert(!VfsMountNamespaceBind(ns,source,dest,true));
+    auto graft=resolve(root,root,"ns-target"),value=resolve(root,graft,(leaf+"/value").c_str());assert(value.object->identity==101);VfsPathRelease(value);
+    MountNamespace* copy=nullptr;VfsPath cr{},cc{};assert(!VfsMountNamespaceCopy(ns,root,root,&copy,&cr,&cc));assert(VfsMountNamespaceActivate(copy));
+    auto child=resolve(cr,cr,path.c_str());assert(!VfsMountNamespaceDetach(copy,child));VfsPathRelease(child);
+    child=resolve(cr,cr,path.c_str());assert(child.object->identity==961);VfsPathRelease(child);
+    VfsMountNamespaceLeave(copy);VfsPathRelease(cr);VfsPathRelease(cc);VfsMountNamespaceRelease(copy);VfsDrainMountCleanup();
+    rows=infoRows(ns,root);std::string text(rows.size()*4600+1,'\0');uint32_t written=0;assert(!FormatMountInfo(rows.data(),rows.size(),text.data(),text.size(),&written));assert(text.find("/"+path+" ")!=std::string::npos);
+    assert(!VfsMountNamespaceDetach(ns,graft));VfsPathRelease(graft);assert(!VfsMountNamespaceDetach(ns,bound));VfsPathRelease(bound);VfsPathRelease(source);VfsPathRelease(dest);
+    VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();mounts[6].root.children.erase(renamed);
+    {MountEntry dummy{};VfsRenameLabels labels;std::string boundary="/"+std::string(510,'z');auto before=allocations.size();assert(labels.Add(&dummy,boundary.c_str(),"x","/")==-36 && allocations.size()==before);assert(labels.Add(&dummy,(boundary+"x").c_str(),"","/")==-36 && allocations.size()==before);assert(!labels.Add(&dummy,boundary.c_str(),"","/"));labels.Apply();assert(!std::strcmp(dummy.mountPoint,boundary.c_str()));}
+    assert(allocations.size()==allocated && g_mounts.count==records);
+}
+static void testNullDeviceBridge(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    const auto allocated=allocations.size();const auto records=g_mounts.count;
+    Node dev{&mounts[6],980,true,&mounts[6].root,{},{}};mounts[6].root.children["dev"]=&dev;
+    assert(!VfsNullDeviceAnchorInitialize());assert(VfsNullDeviceAnchorInitialize()==-16);
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
+    auto original=resolve(root,root,"dev"),unrelated=resolve(root,root,"ns-a");bool allowed=false;
+    assert(!VfsNullDeviceAllowed(root,root,"/dev/null",&allowed) && allowed);
+    assert(!VfsMountNamespaceBind(ns,original,original));auto bound=resolve(root,root,"dev");assert(!VfsMountNamespaceRemount(ns,bound,2));
+    assert(!VfsNullDeviceAllowed(root,root,"/dev/null",&allowed) && allowed);assert(!VfsNullDeviceAllowed(root,bound,"null",&allowed) && allowed);
+    bool general=true;assert(!VfsPathBrokerAllowed(root,"/dev/shm/isolated",&general) && !general);
+    Node realNull{&mounts[6],981,false,&dev,{},{}};dev.children["null"]=&realNull;assert(!VfsNullDeviceAllowed(root,root,"/dev/null",&allowed) && !allowed);dev.children.erase("null");
+    Node alias{&mounts[6],982,false,&node(unrelated.object),{},"/dev/null"};node(unrelated.object).children["null"]=&alias;
+    assert(!VfsNullDeviceAllowed(root,unrelated,"null",&allowed,false) && !allowed);
+    assert(!VfsNullDeviceAllowed(root,unrelated,"null",&allowed,true) && allowed);
+    node(unrelated.object).children.erase("null");
+    MountNamespace* copy=nullptr;VfsPath cr{},cc{};assert(!VfsMountNamespaceCopy(ns,root,root,&copy,&cr,&cc));assert(VfsMountNamespaceActivate(copy));
+    assert(!VfsNullDeviceAllowed(cr,cr,"/dev/null",&allowed) && allowed);VfsMountNamespaceLeave(copy);VfsPathRelease(cr);VfsPathRelease(cc);VfsMountNamespaceRelease(copy);VfsDrainMountCleanup();
+    std::atomic<bool> stop{false},strict{false};std::atomic<unsigned> observations{0},denials{0};
+    std::thread reader([&]{while(!stop.load(std::memory_order_acquire)){bool requireDenial=strict.load(std::memory_order_acquire),ok=false;int e=VfsNullDeviceAllowed(root,root,"/dev/null",&ok);assert((!e)||(e==-13&&!ok));if(requireDenial){assert(e==-13&&!ok);denials.fetch_add(1);}observations.fetch_add(1);}});
+    while(!observations.load())std::this_thread::yield();
+    for(unsigned i=0;i<100;++i){assert(!VfsMountNamespaceBind(ns,unrelated,bound));auto shadow=resolve(root,root,"dev");assert(!VfsNullDeviceAllowed(root,root,"/dev/null",&allowed) && !allowed);assert(!VfsMountNamespaceDetach(ns,shadow));VfsPathRelease(shadow);}
+    assert(!VfsMountNamespaceRemount(ns,bound,6));strict.store(true,std::memory_order_release);while(!denials.load())std::this_thread::yield();stop.store(true,std::memory_order_release);reader.join();
+    assert(VfsNullDeviceAllowed(root,root,"/dev/null",&allowed)==-13 && !allowed);
+    assert(!VfsMountNamespaceDetach(ns,bound));VfsPathRelease(bound);VfsPathRelease(original);VfsPathRelease(unrelated);VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
+    {FileMutationGuard transaction;VfsPathRelease(g_nullDeviceAnchor);g_nullDeviceAnchor={};}
+    mounts[6].root.children.erase("dev");VfsDrainMountCleanup();assert(allocations.size()==allocated && g_mounts.count==records);
 }
 static void testPivotRoots(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
     using namespace brook;
@@ -989,6 +1046,8 @@ int main(){
     testReadOnlyMount(initial,stableRoot);
     testFileBinds(initial,stableRoot);
     testSocketBinds(initial,stableRoot);
+    testLongMountPaths(initial,stableRoot);
+    testNullDeviceBridge(initial,stableRoot);
     MountNamespace* parentNs=nullptr;VfsPath parentRoot{},parentCwd{};
     assert(!VfsMountNamespaceCopy(initial,stableRoot,originalSynthetic,&parentNs,&parentRoot,&parentCwd));
     assert(VfsMountNamespaceBind(parentNs,aPath,parentCwd)==-3);

@@ -267,7 +267,7 @@ bool VfsRootMountNameAt(uint32_t index, char* out, uint32_t outSize);
 // Initial mount registry metadata for procfs (/proc/mounts). Each copy is
 // synchronized; count/index sequences can omit/repeat entries during mutation.
 struct VfsMountSnapshot {
-    char mountPoint[64];
+    char mountPoint[512];
     char fsType[16];
     bool used;
 };

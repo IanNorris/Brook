@@ -3127,7 +3127,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
 
-    char pathBuf[256];
+    char pathBuf[512];
     const char* path = nullptr;
     if (pathAddr < 0x0000800000000000ULL)
     {
@@ -3172,10 +3172,19 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     int procFdResult = OpenProcMemFd(proc, syntheticPath, flags, &procFdPath);
     if (procFdPath) return procFdResult;
 
+    // A genuine /dev bind may expose only this explicitly authorized null
+    // broker. Other synthetic services keep the general bind-masking policy.
+    if(StrEq(path,"/dev/null") || StrEq(path,"null") || StrEq(syntheticPath,"/dev/null")) {
+        bool allowed=false;int error=VfsNullDeviceAllowed(at.fs.root,at.start(),path,&allowed,!(flags&0x20000) && !((flags&0x40)&&(flags&0x80)));
+        if(error)return error;
+        if(allowed)syntheticPath="/dev/null";
+        else if(StrEq(syntheticPath,"/dev/null"))syntheticPath="";
+    }
+
     // Device paths
     if(StrEq(syntheticPath,"keyboard") || StrEq(syntheticPath,"/dev/fb0") || StrEq(syntheticPath,"/dev/keyboard") ||
        StrEq(syntheticPath,"/dev/tty") || StrEq(syntheticPath,"/dev/console") ||
-       StrEq(syntheticPath,"/dev/dri/renderD128") || StrEq(syntheticPath,"/dev/null") ||
+       StrEq(syntheticPath,"/dev/dri/renderD128") ||
        StrEq(syntheticPath,"/dev/urandom") || StrEq(syntheticPath,"/dev/random") ||
        StrEq(syntheticPath,"/dev/klog") || StrEq(syntheticPath,"/dev/dsp")) {
         const char* deviceName=StrEq(syntheticPath,"keyboard")?"/dev/keyboard":syntheticPath;
@@ -3279,9 +3288,13 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     // /dev/null — discard writes, EOF on read
     if (StrEq(syntheticPath, "/dev/null"))
     {
-        int fd = FdAlloc(proc, FdType::DevNull, nullptr);
-        if (fd < 0) return -EMFILE;
-        return fd;
+        if((flags&0xc0)==0xc0)return -EEXIST; // O_CREAT|O_EXCL
+        if(flags&0x10000)return -ENOTDIR;
+        FdEntry owned{};owned.type=FdType::DevNull;
+        owned.statusFlags=static_cast<uint32_t>(flags)&~(0x80000u|0x40u|0x80u|0x200u);
+        owned.fdFlags=(flags&0x80000u)?1:0;
+        int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),owned,0,-1,nullptr);
+        return fd<0?-EMFILE:fd;
     }
 
     // /dev/urandom, /dev/random — RDRAND-backed random bytes
@@ -11090,7 +11103,7 @@ static int64_t sys_fstatfs(uint64_t fd, uint64_t bufAddr, uint64_t,
     FdRef ref(process, static_cast<int>(fd));
     FdEntry* entry = ref.get();
     if (!entry) return -EBADF;
-    if (entry->type != FdType::Vnode || !entry->handle) return -ENOSYS;
+    if ((entry->type != FdType::Vnode && entry->type != FdType::Path) || !entry->handle) return -ENOSYS;
     VfsSpace space{};
     int error = VfsSpaceInfo(static_cast<Vnode*>(entry->handle), &space);
     return error ? error : CopySpaceResult(bufAddr, space);

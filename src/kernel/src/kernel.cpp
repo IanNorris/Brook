@@ -24,6 +24,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "ramdisk.h"
 #include "fatfs_glue.h"
 #include "vfs.h"
+#include "vfs_path.h"
 #include "tmpfs.h"
 #include "virtio_blk.h"
 #include "gpt.h"
@@ -530,6 +531,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     // Child attachments require the root identity to exist first.
     brook::VfsMount("/proc", "procfs", 0);
+    const int nullAnchor=brook::VfsNullDeviceAnchorInitialize();
+    brook::SerialPrintf("VFS: canonical null-device parent anchor result=%d\n",nullAnchor);
 
     // ---- QEMU fw_cfg ----
     brook::FwCfgInit();

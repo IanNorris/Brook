@@ -1,3 +1,8 @@
+Current acceptance (2026-10-23): [SteamRT executes its runtime child](steamrt-runtime-checkpoint.md).
+Two distinct default runtime-copy runs reach the requested runtime shell and
+exit zero. Steam authentication and the client UI remain a separate next gate.
+The chronology below records the earlier feasibility and implementation stages.
+
 # SteamRT container feasibility gate
 
 Status (2026-10-22): the bounded mount-namespace and

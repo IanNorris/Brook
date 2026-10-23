@@ -33,7 +33,7 @@ int VfsMountNamespaceMountFresh(MountNamespace* ns,const VfsPath& target,
 // Caller holds namespace/root leases. Rows are ordered parent before child.
 struct VfsMountInfo {
     uint64_t id,parent,device,attributes;
-    char root[512],mountPoint[64],fsType[16];
+    char root[512],mountPoint[512],fsType[16];
 };
 int VfsMountNamespaceInfo(MountNamespace* ns,const VfsPath& root,VfsMountInfo** rows,uint32_t* count);
 void VfsMountInfoFree(VfsMountInfo* rows);

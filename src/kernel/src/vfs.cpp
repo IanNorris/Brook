@@ -178,7 +178,7 @@ struct MountEntry {
     MountNamespace* owner; // borrowed only while registered; namespace registry lease pins storage
     uint64_t referenceState; // publication + path/vnode holds; high bit marks detach
     VfsObject* rootObject; // optional arbitrary bind root, independent of covered-parent paths
-    char             mountPoint[64];
+    char             mountPoint[512];
     char             fsType[16];     // filesystem type name (e.g. "fatfs", "ext2")
     MountBacking*    backing;     // owned driver-mount reference
     bool             used;
@@ -338,10 +338,14 @@ static bool StrEq(const char* a, const char* b)
 }
 
 struct VfsRenameLabels {
-    struct Change { Change* next;MountEntry* mount;char label[64];char physicalRoot[512]; };
+    struct Change { Change* next;MountEntry* mount;char label[512];char physicalRoot[512]; };
     Change* head=nullptr;
     ~VfsRenameLabels() { while(head) { auto* next=head->next;kfree(head);head=next; } }
     int Add(MountEntry* mount,const char* prefix,const char* suffix,const char* physicalRoot=nullptr) {
+        if(!mount || !prefix || !suffix)return -22;
+        const auto prefixLength=StrLen(prefix),suffixLength=StrLen(suffix);
+        if(prefixLength>=sizeof(Change::label) || suffixLength>=sizeof(Change::label)-prefixLength ||
+           StrLen(physicalRoot?physicalRoot:mount->physicalRoot)>=sizeof(Change::physicalRoot))return -36;
         auto* change=static_cast<Change*>(kmalloc(sizeof(Change)));
         if(!change)return -12;
         change->mount=mount;StrCopy(change->label,prefix,sizeof(change->label));
@@ -528,6 +532,7 @@ static int VfsAppendLeaf(char* path,uint32_t capacity,const char* leaf);
 
 void VfsInit()
 {
+    if(g_nullDeviceAnchor.object)__builtin_trap(); // boot-only initialization, never redefine an anchor
     KRwLockInit(&g_fileMutationLock);
     g_initialNamespace.~MountNamespace();::new(&g_initialNamespace)MountNamespace();
     g_initialNamespace.initial=true;
