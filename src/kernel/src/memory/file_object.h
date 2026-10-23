@@ -14,7 +14,7 @@ struct FileMappingRegistration;
 // explicitly retains a vnode until a successful flush after all mappings retire.
 // Ordinary writes are write-through. Writable shared mappings use canonical
 // pages, conservative exposure, msync/fsync and periodic writeback. Mapped
-// truncate remains rejected until resize coordination is enabled.
+// shrink remains rejected until resize coordination is enabled.
 struct FileObject {
     RecordLockTable recordLocks;
     KMutex gate;
@@ -40,6 +40,10 @@ struct FileObject {
     // Under inode gate, before canonical allocation/exposure. Backends may
     // materialize sparse storage so later shared writeback cannot need quota.
     int (*prepareBackingPage)(void*,uint64_t);
+    // Optional, audited strict-growth callback. With a page-aligned old EOF it
+    // must preserve all bytes below that EOF, including on an error, and never
+    // shrink the file. Installed before publication; called under inode gate.
+    int (*growMappedBacking)(Vnode*,uint64_t);
 };
 void FileObjectInit(FileObject* object);
 // Quiescent last-inode release only: no sleeping locks or I/O; IRQ-close safe.
@@ -105,4 +109,9 @@ void FileObjectStopWriteback();
 // Initial integration: caller's mapping-pin gate has established no mappings.
 // Coordinated mapped resize/invalidation must replace that restriction later.
 int FileObjectTruncateUnmapped(FileObject* object,Vnode* vnode,uint64_t length);
+// Retain every canonical frame and borrowed alias. Re-stat under inode gate;
+// reject shrink, unchanged size, partial-page old EOF and unapproved backends.
+// No AS/PT lock or user access spans the operation. Backend errors propagate;
+// a failed growth may have extended EOF, but cannot invalidate the old prefix.
+int FileObjectGrowMapped(FileObject* object,Vnode* vnode,uint64_t length);
 }

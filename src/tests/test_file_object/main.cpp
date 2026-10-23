@@ -124,6 +124,54 @@ void PmmRefPage(PhysicalAddress page) { std::lock_guard<std::mutex> lock(framesG
 void PmmUnrefPage(PhysicalAddress page) { std::lock_guard<std::mutex> lock(framesGuard);CHECK(refs.at(page.raw())>0);if(!--refs.at(page.raw())){refs.erase(page.raw());std::free(reinterpret_cast<void*>(page.raw()));} }
 }
 extern "C" __attribute__((noreturn)) void KernelPanic(const char*,...) { std::abort(); }
+static int grow_preserving_prefix(Vnode* vnode,uint64_t length) {
+    auto* backend=static_cast<Backend*>(vnode->priv);
+    if(backend->failTruncate)return -5;
+    backend->bytes.resize(length);
+    return backend->failAfterTruncate ? -5 : 0;
+}
+static void MappedGrowth() {
+    CHECK(refs.empty()&&heapBlocks==0);
+    Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(8192,0x31);
+    Vnode first{&operations,VnodeType::File,&backend,1,0},second{&operations,VnodeType::File,&backend,1,0};
+    int error=0;auto page=FileObjectGetPage(&backend.object,&first,0,true,&error);CHECK(page&&!error);
+    auto alias=FileObjectGetPage(&backend.object,&second,0,true,&error);CHECK(alias==page&&!error);
+    auto* bytes=reinterpret_cast<unsigned char*>(page.raw());
+    auto generation=backend.object.generation;
+    CHECK(FileObjectGrowMapped(&backend.object,&first,270336)==-16);
+    CHECK(backend.object.generation==generation&&backend.bytes.size()==8192);
+    backend.object.growMappedBacking=grow_preserving_prefix;
+    backend.failStat=true;CHECK(FileObjectGrowMapped(&backend.object,&first,270336)==-5);backend.failStat=false;
+    CHECK(FileObjectGrowMapped(&backend.object,&first,8192)==-16);
+    CHECK(FileObjectGrowMapped(&backend.object,&first,4096)==-16);
+    CHECK(backend.object.generation==generation);
+    // A mapped store must survive growth without being evicted, overwritten or
+    // prematurely written back. The normal writeback lease survives too.
+    KMutexLock(&backend.object.gate);CHECK(FileObjectExposeWritableLocked(&backend.object,&first,0,page));KMutexUnlock(&backend.object.gate);
+    bytes[0]=0x7c;auto references=refs.at(page.raw());auto writes=backend.writes;
+    CHECK(FileObjectGrowMapped(&backend.object,&first,270336)==0);
+    CHECK(backend.object.generation==++generation&&backend.bytes.size()==270336);
+    CHECK(bytes[0]==0x7c&&backend.bytes[0]==0x31&&backend.writes==writes&&refs.at(page.raw())==references);
+    auto retained=FileObjectGetPage(&backend.object,&second,0,false,&error);CHECK(retained==page&&!error);PmmUnrefPage(retained);
+    auto fresh=FileObjectGetPage(&backend.object,&second,2,true,&error);CHECK(fresh&&!error);
+    for(unsigned i=0;i<4096;++i)CHECK(reinterpret_cast<unsigned char*>(fresh.raw())[i]==0);
+    PmmUnrefPage(fresh);
+    // Failure before, or after, a committed growth never retires old frames.
+    backend.failTruncate=true;CHECK(FileObjectGrowMapped(&backend.object,&first,274432)==-5);
+    CHECK(backend.object.generation==++generation&&backend.bytes.size()==270336&&bytes[0]==0x7c);
+    backend.failTruncate=false;backend.failAfterTruncate=true;
+    CHECK(FileObjectGrowMapped(&backend.object,&second,274432)==-5);
+    CHECK(backend.object.generation==++generation&&backend.bytes.size()==274432&&bytes[0]==0x7c);
+    backend.failAfterTruncate=false;
+    // Re-check actual EOF, rather than trusting an earlier VFS size snapshot.
+    CHECK(FileObjectGrowMapped(&backend.object,&first,270336)==-16);
+    CHECK(FileObjectGrowMapped(&backend.object,&first,274433)==0);
+    CHECK(FileObjectGrowMapped(&backend.object,&second,278528)==-16);
+    CHECK(FileObjectWriteback(&backend.object,&first,0,~uint64_t{0})==0&&backend.bytes[0]==0x7c);
+    PmmUnrefPage(page);PmmUnrefPage(alias);
+    CHECK(FileObjectWritebackAll()==0);
+    FileObjectDispose(&backend.object);CHECK(refs.empty()&&heapBlocks==0);
+}
 static void AppendTransactions() {
     CHECK(refs.empty()&&heapBlocks==0);
     Backend backend{};FileObjectInit(&backend.object);backend.bytes.resize(10,0x31);
@@ -593,5 +641,6 @@ int main() {
     FaultPages();
     QuarantinedPages();
     PartialUserCopies();
+    MappedGrowth();
     std::puts("FILE_OBJECT PASS batch/sparse-pins/one-gate/failure-cleanup/concurrent-load/io-coherence/partial-error/truncate/zero-tail/lifetime/writeback-range/snapshot/redirty/error-retry");
 }

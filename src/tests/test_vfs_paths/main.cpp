@@ -171,6 +171,7 @@ int FileObjectWrite(FileObject*,Vnode*,const void*,uint64_t,uint64_t*){assert(fa
 int FileObjectAppend(FileObject*,Vnode*,const void*,uint64_t,uint64_t*){assert(false);return -5;}
 int FileObjectWriteback(FileObject*,Vnode*,uint64_t,uint64_t){assert(false);return -5;}
 int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -5;}
+int FileObjectGrowMapped(FileObject*,Vnode*,uint64_t){assert(false);return -5;}
 }
 #include "scheduler_membership_fixture.inc"
 // Actual Process publication helpers and FsContext core. These exercise owned

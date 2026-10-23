@@ -74,6 +74,7 @@ void FileObjectInit(FileObject* object){*object={};}
 int FileObjectRead(FileObject*,Vnode* vn,void* out,uint64_t bytes,uint64_t* offset){return vn->ops->read(vn,out,bytes,offset);}
 int FileObjectWrite(FileObject*,Vnode* vn,const void* in,uint64_t bytes,uint64_t* offset){return vn->ops->write(vn,in,bytes,offset);}
 int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -95;}
+int FileObjectGrowMapped(FileObject*,Vnode*,uint64_t){assert(false);return -95;}
 void FileObjectDispose(FileObject* object){assert(!object->mappings && !object->mappingRegistrations);for(auto* p:object->pages)assert(!p);}
 Process* ProcessCurrent(){return &process;}
 int ProcessFsMask(Process*){return legacyTestMask;}

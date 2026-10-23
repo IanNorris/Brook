@@ -188,6 +188,7 @@ void Drop(Node *n)
         n = parent;
     }
 }
+int Truncate(Vnode *vn, uint64_t size);
 Node *NewNode(Tmpfs *fs, uint16_t mode, uint32_t uid, uint32_t gid)
 {
     auto irq = IrqSpinLockAcquire(&budgetLock);
@@ -221,6 +222,8 @@ Node *NewNode(Tmpfs *fs, uint16_t mode, uint32_t uid, uint32_t gid)
     n->linked = true;
     n->atime = n->mtime = n->ctime = Now();
     FileObjectInit(&n->file);
+    // Strict growth cannot retire a page or modify data below aligned old EOF.
+    n->file.growMappedBacking=Truncate;
     n->file.pageBudgetContext=n;
     n->file.reservePageBytes=[](void* context,uint64_t bytes) {return Reserve(static_cast<Node*>(context)->fs,bytes);};
     n->file.releasePageBytes=[](void* context,uint64_t bytes) {Unreserve(static_cast<Node*>(context)->fs,bytes);};

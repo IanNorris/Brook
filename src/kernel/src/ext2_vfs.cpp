@@ -319,6 +319,7 @@ struct Ext2OpenInode {
 // bookkeeping; it never nests filesystem I/O, allocation or the ext2 rwlock.
 static IrqSpinLock g_ext2OpenLock;
 static Ext2OpenInode* g_ext2OpenInodes;
+static int Ext2FileTruncate(Vnode* vn, uint64_t size);
 
 // Called with the filesystem lock held, before publishing a vnode.
 static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
@@ -327,6 +328,9 @@ static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
     if (!candidate) return nullptr;
     *candidate = {mnt, inode, 1, false, nullptr, {}};
     FileObjectInit(&candidate->file);
+    // Strict growth from aligned EOF only updates inode length; it neither
+    // prunes blocks nor touches the old prefix, including a failed inode write.
+    candidate->file.growMappedBacking=Ext2FileTruncate;
     uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
     for (auto* p = g_ext2OpenInodes; p; p = p->next) {
         if (p->mnt == mnt && p->inode == inode) {

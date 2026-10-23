@@ -165,6 +165,7 @@ void FileObjectInit(FileObject* object) {
     object->mappingRegistrations=0;object->writebackVnode=nullptr;object->writebackNext=nullptr;
     object->pageBudgetContext=nullptr;object->reservePageBytes=nullptr;object->releasePageBytes=nullptr;
     object->prepareBackingPage=nullptr;
+    object->growMappedBacking=nullptr;
     for(auto& bucket:object->pages)bucket=nullptr;
 }
 void FileObjectDispose(FileObject* object) {
@@ -510,6 +511,24 @@ void FileObjectStopWriteback() {
     KMutexLock(&writebackWorkerGate);KMutexUnlock(&writebackWorkerGate);
 }
 #endif
+int FileObjectGrowMapped(FileObject* object,Vnode* vnode,uint64_t length) {
+    [[maybe_unused]] Operation operation;
+    Gate held(object);
+    if(object->mappingError)return object->mappingError;
+    if(!object->growMappedBacking)return -16;
+    VnodeStat before{};int result=vnode->ops->stat(vnode,&before);
+    if(result)return result;
+    // Ordinary writes can extend EOF independently of the VFS first-pin gate.
+    // Check the current size here so a racing extension cannot turn growth
+    // into shrink. Aligned EOF excludes an old, user-modifiable partial tail.
+    if(length<=before.size || (before.size&4095))return -16;
+    result=object->growMappedBacking(vnode,length);
+    // Do not flush or evict old canonical pages: live PTEs borrow these frames.
+    // Even an error can commit the larger EOF. Revalidate prepared faults while
+    // retaining the still-valid old prefix and every mapping/exposure lease.
+    ++object->generation;
+    return result;
+}
 int FileObjectTruncateUnmapped(FileObject* object,Vnode* vnode,uint64_t length) {
     [[maybe_unused]] Operation operation;
     // The caller excludes mappings and first-pin publication. Persist any

@@ -1075,7 +1075,10 @@ static int VfsTruncateLocked(Vnode* vn, uint64_t size)
     // FileMutationGuard excludes first-pin publication through backend resize.
     // The allocation-free fast path can only retain an already pinned binding,
     // which would make this identity busy. No resize placeholder is necessary.
-    if (g_mappingPins.Busy(st.dev,st.ino)) return -16;
+    if (g_mappingPins.Busy(st.dev,st.ino)) {
+        auto* object=vn->ops->file_object ? vn->ops->file_object(vn) : nullptr;
+        return object ? FileObjectGrowMapped(object,vn,size) : -16;
+    }
     result = vn->ops->file_object ?
         FileObjectTruncateUnmapped(vn->ops->file_object(vn),vn,size) : vn->ops->truncate(vn,size);
     return result;
