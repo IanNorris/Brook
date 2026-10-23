@@ -1228,6 +1228,7 @@ static uint64_t UnixCurrentIncarnation(Process* process)
 struct UnixFdQueue {
     UnixFdSnap   msgs[UNIX_FD_QUEUE_CAP];
     uint64_t offsets[UNIX_FD_QUEUE_CAP];
+    uint32_t records[UNIX_FD_QUEUE_CAP]; // credential-span slot for sequenced records
     // Sender identity belongs to bytes, not the socket's connection-time peer.
     // Forked children can send through an inherited endpoint.
     struct CredentialSpan { uint64_t end; UnixCredentials sender; } credentials[UNIX_FD_QUEUE_CAP];
@@ -1244,14 +1245,14 @@ struct UnixFdQueue {
 static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
                                   const char* bytes, uint64_t length,
                                   const UnixFdSnap* descriptors=nullptr, int count=0,
-                                  const UnixCredentials* explicitCredentials=nullptr) {
+                                  const UnixCredentials* explicitCredentials=nullptr,bool record=false) {
     auto* process = ProcessCurrent();
     const UnixCredentials sender=explicitCredentials?*explicitCredentials:UnixCredentials{
         static_cast<int32_t>(process->tgid ? process->tgid : process->pid),
         ProcessReadIds(process,false).real,ProcessReadIds(process,true).real};
     SpinLockAcquire(&pipe->lock);
     bool merge = false;
-    if (queue && queue->credentialHead != queue->credentialTail) {
+    if (!record && queue && queue->credentialHead != queue->credentialTail) {
         auto& previous = queue->credentials[(queue->credentialHead + UNIX_FD_QUEUE_CAP - 1) % UNIX_FD_QUEUE_CAP];
         merge = previous.sender.pid == sender.pid && previous.sender.uid == sender.uid && previous.sender.gid == sender.gid;
     }
@@ -1259,18 +1260,20 @@ static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
         (queue->credentialHead + 1) % UNIX_FD_QUEUE_CAP != queue->credentialTail;
     int64_t result=-EAGAIN;
     if (!pipe->readers || pipe->unixReadShutdown || pipe->unixWriteShutdown) result=-EPIPE;
-    else if (!length) result=0;
-    else if (pipe->space() && credentialRoom &&
+    else if (!length && !record) result=0;
+    else if (record && length>=pipe->capacity) result=-90; // EMSGSIZE; never publish a prefix.
+    else if ((record?length<=pipe->space():pipe->space()!=0) && credentialRoom &&
              (!count || (queue && (queue->head-queue->tail+UNIX_FD_QUEUE_CAP)%UNIX_FD_QUEUE_CAP+count<UNIX_FD_QUEUE_CAP))) {
         uint32_t n=pipe->space();if (length<n)n=static_cast<uint32_t>(length);
-        if (n) {
+        if (n || record) {
             for(int i=0;i<count;++i) {
                 queue->msgs[queue->head]=descriptors[i];
                 queue->offsets[queue->head]=queue->written;
+                queue->records[queue->head]=queue->credentialHead;
                 queue->head=(queue->head+1)%UNIX_FD_QUEUE_CAP;
             }
             uint32_t first=pipe->capacity-pipe->head;if(first>n)first=n;
-            memcpy(pipe->data+pipe->head,bytes,first);
+            if(first)memcpy(pipe->data+pipe->head,bytes,first);
             if(n>first)memcpy(pipe->data,bytes+first,n-first);
             pipe->head=(pipe->head+n)%pipe->capacity;
             if(queue) {
@@ -1288,8 +1291,33 @@ static int64_t UnixStreamTryWrite(PipeBuffer* pipe, UnixFdQueue* queue,
 }
 static uint32_t UnixStreamTryRead(PipeBuffer* pipe, UnixFdQueue* queue,
                                   char* bytes, uint64_t length,
-                                  UnixFdSnap* descriptors, int& count, UnixCredentials* sender) {
+                                  UnixFdSnap* descriptors, int& count, UnixCredentials* sender,
+                                  bool record=false,bool* consumed=nullptr,uint64_t* recordLength=nullptr) {
     count=0;SpinLockAcquire(&pipe->lock);
+    if(consumed)*consumed=false;
+    if(recordLength)*recordLength=0;
+    if(record) {
+        if(!queue || queue->credentialTail==queue->credentialHead) {SpinLockRelease(&pipe->lock);return 0;}
+        const uint32_t slot=queue->credentialTail;
+        const auto& span=queue->credentials[slot];
+        const uint64_t size=span.end-queue->read;
+        uint32_t n=static_cast<uint32_t>(size<length?size:length);
+        if(sender)*sender=span.sender;
+        while(queue->tail!=queue->head && queue->records[queue->tail]==slot) {
+            descriptors[count++]=queue->msgs[queue->tail];
+            queue->tail=(queue->tail+1)%UNIX_FD_QUEUE_CAP;
+        }
+        uint32_t first=pipe->capacity-pipe->tail;if(first>n)first=n;
+        if(first)memcpy(bytes,pipe->data+pipe->tail,first);
+        if(n>first)memcpy(bytes+first,pipe->data,n-first);
+        // A short receive discards the rest of this record, including bytes
+        // beyond the supplied buffer. Following records remain untouched.
+        pipe->tail=(pipe->tail+static_cast<uint32_t>(size))%pipe->capacity;
+        queue->read=span.end;queue->credentialTail=(slot+1)%UNIX_FD_QUEUE_CAP;
+        if(consumed)*consumed=true;
+        if(recordLength)*recordLength=size;
+        SpinLockRelease(&pipe->lock);return n;
+    }
     uint32_t n=pipe->count();if(length<n)n=static_cast<uint32_t>(length);
     if(queue && n) {
         if (sender && queue->credentialTail != queue->credentialHead) {
@@ -1646,11 +1674,14 @@ static uint32_t UnixSocketReady(UnixSocketData* socket,uint32_t events)
     auto* rx=socket->rxPipe;auto* tx=socket->txPipe;
     SpinLockAcquire(&rx->lock);
     bool readClosed=rx->unixReadShutdown || rx->unixWriteShutdown || !rx->writers;
-    bool readable=rx->count() || readClosed;
+    bool readable=rx->count() || readClosed || (socket->socketType==5 && socket->incomingFds &&
+        socket->incomingFds->credentialHead!=socket->incomingFds->credentialTail);
     SpinLockRelease(&rx->lock);
     SpinLockAcquire(&tx->lock);
     bool writeClosed=tx->unixReadShutdown || tx->unixWriteShutdown || !tx->readers;
-    bool writable=tx->space() || writeClosed;
+    bool room=socket->socketType!=5 || (socket->peerIncomingFds &&
+        (socket->peerIncomingFds->credentialHead+1)%UNIX_FD_QUEUE_CAP!=socket->peerIncomingFds->credentialTail);
+    bool writable=(tx->space() && room) || writeClosed;
     SpinLockRelease(&tx->lock);
     return ((events&1)&&readable?1u:0u) | ((events&4)&&writable?4u:0u) |
         ((events&0x2000)&&readClosed?0x2000u:0u) | (readClosed&&writeClosed?0x10u:0u);
@@ -1744,17 +1775,30 @@ struct FdRef
     FdEntry* get() const            { return fde; }
 };
 
+struct UnixSocketStage {
+    char* bytes=nullptr;
+    ~UnixSocketStage(){if(bytes)kfree(bytes);}
+};
 static int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
                                    const char* bytes,uint64_t length,
                                    const UnixFdSnap* descriptors=nullptr,int count=0,bool noSignal=false,
                                    const UnixCredentials* explicitCredentials=nullptr) {
     if(socket->state!=UnixSocketData::State::Connected || !socket->txPipe)return -ENOTCONN;
     auto* pipe=socket->txPipe;
+    UnixSocketStage staged;
+    if(socket->socketType==5) {
+        if(length>=pipe->capacity)return -90;
+        if(length && reinterpret_cast<uint64_t>(bytes)<0x0000800000000000ULL) {
+            staged.bytes=static_cast<char*>(kmalloc(length));if(!staged.bytes)return -ENOMEM;
+            if(!CopyFromUser(staged.bytes,reinterpret_cast<uint64_t>(bytes),length))return -EFAULT;
+            bytes=staged.bytes;
+        }
+    }
     for(;;) {
-        auto result=UnixStreamTryWrite(pipe,socket->peerIncomingFds,bytes,length,descriptors,count,explicitCredentials);
+        auto result=UnixStreamTryWrite(pipe,socket->peerIncomingFds,bytes,length,descriptors,count,explicitCredentials,socket->socketType==5);
         if(result!=-EAGAIN) {
             if(result==-EPIPE && !noSignal)ProcessSendSignal(ProcessCurrent(),13);
-            if(result>0) {
+            if(result>0 || (!result && socket->socketType==5)) {
                 if(auto* reader=pipe->readerWaiter) {pipe->readerWaiter=nullptr;WakeProcess(reader);}
                 PipeWakeEpoll(pipe);
             }
@@ -1771,16 +1815,30 @@ static int64_t UnixSocketWriteSome(UnixSocketData* socket,bool nonblock,
 }
 static int64_t UnixSocketReadSome(UnixSocketData* socket,bool nonblock,
                                   char* bytes,uint64_t length,UnixFdSnap* descriptors,int& count,
-                                  UnixCredentials* sender=nullptr) {
+                                  UnixCredentials* sender=nullptr,uint64_t* recordLength=nullptr,bool* consumed=nullptr) {
     count=0;
+    if(consumed)*consumed=false;
+    if(recordLength)*recordLength=0;
     if(socket->state!=UnixSocketData::State::Connected || !socket->rxPipe)return -ENOTCONN;
-    if(!length)return 0;
+    if(!length && socket->socketType!=5)return 0;
     auto* pipe=socket->rxPipe;
+    UnixSocketStage staged;
+    char* userTarget=nullptr;
+    if(socket->socketType==5 && length && reinterpret_cast<uint64_t>(bytes)<0x0000800000000000ULL) {
+        if(length>=pipe->capacity)length=pipe->capacity-1;
+        staged.bytes=static_cast<char*>(kmalloc(length));if(!staged.bytes)return -ENOMEM;
+        userTarget=bytes;bytes=staged.bytes;
+    }
     for(;;) {
-        auto n=UnixStreamTryRead(pipe,socket->incomingFds,bytes,length,descriptors,count,sender);
-        if(n) {
+        bool received=false;
+        auto n=UnixStreamTryRead(pipe,socket->incomingFds,bytes,length,descriptors,count,sender,
+            socket->socketType==5,&received,recordLength);
+        if(consumed)*consumed=received;
+        if(n || received) {
             if(auto* writer=pipe->writerWaiter) {pipe->writerWaiter=nullptr;WakeProcess(writer);}
-            PipeWakeEpoll(pipe);return n;
+            PipeWakeEpoll(pipe);
+            if(userTarget && n && !CopyToUser(reinterpret_cast<uint64_t>(userTarget),bytes,n))return -EFAULT;
+            return n;
         }
         if(!__atomic_load_n(&pipe->writers,__ATOMIC_ACQUIRE) ||
            __atomic_load_n(&pipe->unixReadShutdown,__ATOMIC_ACQUIRE) ||
@@ -2783,6 +2841,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
     // A plain read consumes (and closes) ancillary rights accompanying bytes.
     if (fde->type == FdType::UnixSocket && fde->handle) {
+        if(!count)return 0; // read(fd, ..., 0) does not consume a record.
         auto* socket=static_cast<UnixSocketData*>(fde->handle);
         UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;
         auto result=UnixSocketReadSome(socket,(fde->statusFlags&0x800)!=0,
@@ -4470,6 +4529,59 @@ struct iovec {
     uint64_t iov_len;
 };
 
+// One sequenced-packet operation spans the whole vector. Snapshot the vector
+// and fault/copy user pages outside the transport spinlock before publication.
+struct UnixRecordVector {
+    iovec* vectors=nullptr;
+    char* bytes=nullptr;
+    uint64_t count=0,length=0,capacity=0;
+    ~UnixRecordVector(){if(vectors)kfree(vectors);if(bytes)kfree(bytes);}
+    int Init(uint64_t address,uint64_t n,bool writing) {
+        if(n>1024)return -EINVAL;
+        count=n;vectors=static_cast<iovec*>(kmalloc(n?n*sizeof(iovec):1));
+        if(!vectors)return -ENOMEM;
+        if(n && !CopyFromUser(vectors,address,n*sizeof(iovec)))return -EFAULT;
+        for(uint64_t i=0;i<n;++i) {
+            if(vectors[i].iov_len>0x7fffffffULL-length)return -EINVAL;
+            length+=vectors[i].iov_len;
+        }
+        if(writing && length>=PIPE_BUF_UNIX_SIZE)return -90;
+        capacity=length<PIPE_BUF_UNIX_SIZE?length:PIPE_BUF_UNIX_SIZE-1;
+        bytes=static_cast<char*>(kmalloc(capacity?capacity:1));if(!bytes)return -ENOMEM;
+        uint64_t done=0;
+        for(uint64_t i=0;i<n && done<capacity;++i) {
+            uint64_t part=vectors[i].iov_len;if(part>capacity-done)part=capacity-done;
+            if(part) {
+                if(writing) {if(!CopyFromUser(bytes+done,vectors[i].iov_base,part))return -EFAULT;}
+                else if(!UserBufferWritable(vectors[i].iov_base,part))return -EFAULT;
+            }
+            done+=part;
+        }
+        return 0;
+    }
+    int Scatter(uint64_t size) {
+        uint64_t done=0;
+        for(uint64_t i=0;i<count && done<size;++i) {
+            uint64_t part=vectors[i].iov_len;if(part>size-done)part=size-done;
+            if(part && !CopyToUser(vectors[i].iov_base,bytes+done,part))return -EFAULT;
+            done+=part;
+        }
+        return 0;
+    }
+};
+static int64_t UnixRecordVectorIo(FdEntry* entry,uint64_t address,uint64_t count,bool writing)
+{
+    UnixRecordVector stage;if(int error=stage.Init(address,count,writing))return error;
+    if(!stage.length)return 0; // readv/writev with an empty vector are no-ops.
+    auto* socket=static_cast<UnixSocketData*>(entry->handle);
+    if(writing)return UnixSocketWriteSome(socket,(entry->statusFlags&0x800)!=0,stage.bytes,stage.length);
+    UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;
+    auto result=UnixSocketReadSome(socket,(entry->statusFlags&0x800)!=0,stage.bytes,stage.capacity,descriptors,received);
+    for(int i=0;i<received;++i)UnixFdSnapRelease(&descriptors[i]);
+    if(result>0)if(int error=stage.Scatter(result))return error;
+    return result;
+}
+
 static int64_t PipeVectorIo(Process* proc,FdEntry* entry,uint64_t fd,
                             uint64_t address,uint64_t count,bool writing)
 {
@@ -4531,6 +4643,8 @@ static int64_t sys_readv(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
     // One readv consumes one packet even across mode changes and iovecs.
     if(FdPipe(entry.get()))
         return PipeVectorIo(proc,entry.get(),fd,iovAddr,iovcnt,false);
+    if(entry->type==FdType::UnixSocket && static_cast<UnixSocketData*>(entry->handle)->socketType==5)
+        return UnixRecordVectorIo(entry.get(),iovAddr,iovcnt,false);
     int64_t total = 0;
     for (uint64_t i = 0; i < iovcnt; ++i)
     {
@@ -4557,6 +4671,8 @@ static int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
     FdRef ref(proc, static_cast<int>(fd));
     if (!ref) return -EBADF;
     auto* entry = ref.get();
+    if(entry->type==FdType::UnixSocket && static_cast<UnixSocketData*>(entry->handle)->socketType==5)
+        return UnixRecordVectorIo(entry,iovAddr,iovcnt,true);
     if(FdPipe(entry) && (entry->statusFlags&0x4000))
         return PipeVectorIo(proc,entry,fd,iovAddr,iovcnt,true);
     if (entry->type == FdType::Vnode && entry->handle && (entry->statusFlags & 0x400)) {
@@ -13243,6 +13359,8 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
             UnixSocketData* value;
             ~ServerReference() { UnixSocketHandleUnref(value); }
         } serverReference{server};
+        if((usd->socketType==5 || server->socketType==5) && usd->socketType!=server->socketType)
+            return -91; // EPROTOTYPE: both peers must agree on record framing.
         // The pending slot owns the server endpoints before connect returns.
         // A successful local stream connect queues a connection; it does not
         // wait for accept, and must survive the client closing immediately.
@@ -13349,6 +13467,7 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
         return -ENOTSOCK;
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if(usd->socketType==5 && (flagsVal&~(0x40ULL|0x80ULL|0x4000ULL)))return -95;
         if(lenVal && !UserBufferReadable(bufVal,lenVal))return -EFAULT;
         return UnixSocketWriteSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
             reinterpret_cast<const char*>(bufVal),lenVal,nullptr,0,(flagsVal&0x4000)!=0);
@@ -13391,6 +13510,19 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
         return -ENOTSOCK;
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
+        if(usd && usd->socketType==5) {
+            if(flagsVal&~(0x40ULL|0x20ULL|0x4000ULL))return -95;
+            if(lenVal && !UserBufferWritable(bufVal,lenVal))return -EFAULT;
+            UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;uint64_t size=0;
+            auto result=UnixSocketReadSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
+                reinterpret_cast<char*>(bufVal),lenVal,descriptors,received,nullptr,&size);
+            for(int i=0;i<received;++i)UnixFdSnapRelease(&descriptors[i]);
+            if(srcVal && addrLenVal>=0x1000) {
+                if(!UserBufferWritable(addrLenVal,sizeof(uint32_t)))return -EFAULT;
+                *reinterpret_cast<uint32_t*>(addrLenVal)=0;
+            }
+            return result<0?result:(flagsVal&0x20)?static_cast<int64_t>(size):result;
+        }
         bool oldNonblock = usd ? usd->nonblock : false;
         if (usd && (flagsVal & 0x40)) // MSG_DONTWAIT
             usd->nonblock = true;
@@ -14068,8 +14200,8 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     LinuxMsgHdr stagedHeader{};
     if(!CopyFromUser(&stagedHeader,msgVal,sizeof(stagedHeader)))return -EFAULT;
     auto* msg=&stagedHeader;
-    if (!msg->msg_iovlen || msg->msg_iovlen>1024 || !msg->msg_iov) return -EINVAL;
-    if (!UserBufferReadable(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen*sizeof(*msg->msg_iov))) return -EFAULT;
+    if (msg->msg_iovlen>1024 || (msg->msg_iovlen && !msg->msg_iov)) return -EINVAL;
+    if (msg->msg_iovlen && !UserBufferReadable(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen*sizeof(*msg->msg_iov))) return -EFAULT;
 
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, fd);
@@ -14078,8 +14210,13 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     if (fde->type == FdType::UnixSocket) {
 
     auto* usd = static_cast<UnixSocketData*>(fde->handle);
-    auto writable=UnixSocketWriteSome(usd,true,nullptr,0,nullptr,0,(flagsVal&0x4000)!=0);
-    if(writable<0)return writable;
+    if(!usd || usd->state!=UnixSocketData::State::Connected || !usd->txPipe)return -ENOTCONN;
+    if(usd->socketType==5 && (flagsVal&~(0x40ULL|0x80ULL|0x4000ULL)))return -95;
+    // Validation must not enqueue an empty sequenced record.
+    SpinLockAcquire(&usd->txPipe->lock);
+    const bool closed=!usd->txPipe->readers || usd->txPipe->unixReadShutdown || usd->txPipe->unixWriteShutdown;
+    SpinLockRelease(&usd->txPipe->lock);
+    if(closed) {if(!(flagsVal&0x4000))ProcessSendSignal(proc,13);return -EPIPE;}
 
 
     // Parse SCM_RIGHTS cmsg (if any) BEFORE writing payload. If cmsg parsing
@@ -14144,6 +14281,15 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
 
     // Commit the rights with the first actual payload byte. Failed writes own
     // no published snapshots, so there is no rollback racing a receiver.
+    if(usd->socketType==5) {
+        UnixRecordVector stage;
+        if(int error=stage.Init(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen,true))return failControl(error);
+        auto result=UnixSocketWriteSome(usd,(flagsVal&0x40)||(fde->statusFlags&0x800),
+            stage.bytes,stage.length,pendingSnaps,pendingCount,(flagsVal&0x4000)!=0,
+            hasExplicitCredentials?&explicitCredentials:nullptr);
+        if(result<0)return failControl(static_cast<int>(result));
+        return result; // The record, including empty payload rights, owns the snapshots.
+    }
     int64_t total=0;
     for(uint64_t i=0;i<msg->msg_iovlen;++i) {
         auto& iov=msg->msg_iov[i];if(!iov.iov_len)continue;
@@ -14217,9 +14363,11 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     if (msgVal < 0x1000) return -EFAULT;
 
     if (!UserBufferWritable(msgVal,sizeof(LinuxMsgHdr))) return -EFAULT;
-    auto* msg = reinterpret_cast<LinuxMsgHdr*>(msgVal);
-    if (!msg->msg_iovlen || msg->msg_iovlen>1024 || !msg->msg_iov) return -EINVAL;
-    if (!UserBufferReadable(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen*sizeof(*msg->msg_iov))) return -EFAULT;
+    LinuxMsgHdr stagedHeader{};
+    if(!CopyFromUser(&stagedHeader,msgVal,sizeof(stagedHeader)))return -EFAULT;
+    auto* msg=&stagedHeader;
+    if (msg->msg_iovlen>1024 || (msg->msg_iovlen && !msg->msg_iov)) return -EINVAL;
+    if (msg->msg_iovlen && !UserBufferReadable(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen*sizeof(*msg->msg_iov))) return -EFAULT;
 
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, fd);
@@ -14229,14 +14377,26 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
 
         // MSG_NOSIGNAL is also accepted on receive by Linux. Receives never
         // generate SIGPIPE; audio IPC uses it with MSG_CMSG_CLOEXEC.
-        if(flagsVal&~(0x40ULL|0x4000ULL|0x40000000ULL))return -95;
+        const bool record=usd->socketType==5;
+        if(flagsVal&~(0x40ULL|0x4000ULL|0x40000000ULL|(record?0x20ULL:0)))return -95;
         if(msg->msg_controllen && !UserBufferWritable(reinterpret_cast<uint64_t>(msg->msg_control),msg->msg_controllen))return -EFAULT;
         const uint64_t capacity=msg->msg_controllen;
         UnixFdSnap descriptors[UNIX_FD_QUEUE_CAP];int received=0;
         int64_t total=0;
+        uint64_t messageLength=0;bool consumed=false;
         const bool passCredentials = __atomic_load_n(&usd->passCredentials, __ATOMIC_ACQUIRE);
         UnixCredentials sender{};
-        for(uint64_t i=0;i<msg->msg_iovlen;++i) {
+        if(record) {
+            UnixRecordVector stage;
+            if(int error=stage.Init(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen,false))return error;
+            total=UnixSocketReadSome(usd,dontwait || (fde->statusFlags&0x800),stage.bytes,stage.capacity,
+                descriptors,received,passCredentials?&sender:nullptr,&messageLength,&consumed);
+            if(total<0)return total;
+            if(int error=stage.Scatter(total)) {
+                for(int j=0;j<received;++j)UnixFdSnapRelease(&descriptors[j]);
+                return error;
+            }
+        } else for(uint64_t i=0;i<msg->msg_iovlen;++i) {
             auto& iov=msg->msg_iov[i];if(!iov.iov_len)continue;
             if(!UserBufferWritable(reinterpret_cast<uint64_t>(iov.iov_base),iov.iov_len)) {
                 for(int j=0;j<received;++j)UnixFdSnapRelease(&descriptors[j]);
@@ -14250,9 +14410,10 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
             if(n>0)total+=n;
             if(n<=0 || static_cast<uint64_t>(n)<iov.iov_len || received || passCredentials)break;
         }
-        msg->msg_flags=0;msg->msg_controllen=0;
+        msg->msg_flags=record && messageLength>static_cast<uint64_t>(total)?0x20:0;
+        msg->msg_controllen=0;msg->msg_namelen=0;
         uint64_t controlUsed = 0;
-        if (passCredentials && total > 0) {
+        if (passCredentials && (total > 0 || consumed)) {
             sender.uid=ProcessReportId(proc,false,sender.uid);sender.gid=ProcessReportId(proc,true,sender.gid);
             const uint64_t required = sizeof(CmsgHdr) + sizeof(sender);
             if (capacity >= sizeof(CmsgHdr)) {
@@ -14287,12 +14448,14 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
             uint64_t used=CmsgAlign(header->cmsg_len);
             msg->msg_controllen=controlUsed+(used<remaining?used:remaining);
         }
-        return total;
+        if(!CopyToUser(msgVal,msg,sizeof(*msg)))return -EFAULT;
+        return record && (flagsVal&0x20)?static_cast<int64_t>(messageLength):total;
     }
 
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
+    if(!msg->msg_iovlen)return -EINVAL;
     void* buf = msg->msg_iov[0].iov_base;
     uint32_t len = static_cast<uint32_t>(msg->msg_iov[0].iov_len);
     if (!buf || len == 0) return -EINVAL;
@@ -14309,6 +14472,7 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
 
     msg->msg_flags = 0;
     msg->msg_controllen = 0;
+    if(!CopyToUser(msgVal,msg,sizeof(*msg)))return -EFAULT;
     return ret;
 }
 
