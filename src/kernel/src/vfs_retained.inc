@@ -269,12 +269,13 @@ static int VfsBackendDirectoryLocked(const VfsPath& path,char* out,uint32_t capa
 static int VfsGlobalDirectoryLocked(const VfsPath& path,char* out,uint32_t capacity,bool anyObject=false)
 {
     if(!out || capacity<2)return -36;
-    out[0]=0;auto* mount=static_cast<MountEntry*>(path.attachment);
+    out[0]=0;if(!path.attachment || !path.object)return -9;
+    auto* mount=static_cast<MountEntry*>(path.attachment);
     // A regular-file bind has no descendants. Its visible entry is retained
     // separately from the source inode, whose backend need not report names.
     // Reconstruct from that entry's live parent, never the source spelling.
     if(anyObject && mount->rootObject && mount->coveredParent.object &&
-       path.object && path.object->identity==mount->rootIdentity) {
+       path.object->identity==mount->rootIdentity && path.object->ops==mount->rootObjectOps) {
         int error=VfsGlobalDirectoryLocked(mount->coveredParent,out,capacity);
         return error?error:VfsAppendLeaf(out,capacity,mount->coveredName);
     }

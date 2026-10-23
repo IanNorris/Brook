@@ -7,7 +7,7 @@ struct UserNamespace;
 // The prepared instance remains caller-owned until MountFresh succeeds.
 struct Tmpfs;
 const VfsFsOps *TmpfsOperations();
-Tmpfs *TmpfsCreate(uint32_t uid, uint32_t gid, UserNamespace *owner, uint64_t flags, int *error);
+Tmpfs *TmpfsCreate(uint32_t uid, uint32_t gid, UserNamespace *owner, uint64_t flags, int *error, uint16_t rootMode=01777);
 int TmpfsDestroy(Tmpfs *);
 struct TmpfsUsage
 {

@@ -1118,10 +1118,10 @@ TmpfsUsage TmpfsGlobalUsage()
     IrqSpinLockRelease(&budgetLock, irq);
     return result;
 }
-Tmpfs *TmpfsCreate(uint32_t uid, uint32_t gid, UserNamespace *owner, uint64_t flags, int *error)
+Tmpfs *TmpfsCreate(uint32_t uid, uint32_t gid, UserNamespace *owner, uint64_t flags, int *error, uint16_t rootMode)
 {
     *error = 0;
-    if (flags & ~uint64_t{6})
+    if ((flags & ~uint64_t{6}) || (rootMode & ~uint16_t{07777}))
     {
         *error = -22;
         return nullptr;
@@ -1162,7 +1162,7 @@ Tmpfs *TmpfsCreate(uint32_t uid, uint32_t gid, UserNamespace *owner, uint64_t fl
     fs->device = (uint64_t{0x7e} << 8) | ((device & 0xff) | ((device & ~uint64_t{0xff}) << 12));
     fs->owner = owner;
     UserNamespaceRetain(owner);
-    fs->root = NewNode(fs, Directory | 01777, uid, gid);
+    fs->root = NewNode(fs, Directory | rootMode, uid, gid);
     if (!fs->root)
     {
         UserNamespaceRelease(owner);

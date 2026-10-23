@@ -1,6 +1,7 @@
 #include "process_fs.h"
 #include "mount_namespace.h"
 #include "tmpfs.h"
+#include "tmpfs_mount_options.h"
 #include "process_user_namespace.h"
 #include "unix_lifetime_trace.h"
 #include "file_locks.h"

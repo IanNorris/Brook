@@ -13,13 +13,14 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
     const bool bindMount=type==Bind;
     const bool remount=(flags&~(Silent|uint64_t{7}))==(Bind|Remount) && (flags&2)==2;
     if(!bindMount && !privatePropagation && !memoryMount && !remount)return -EINVAL;
+    TmpfsMountOptions memoryOptions{};
     if(memoryMount) {
         char fsType[32],data[256];
         if(!CopyUserCString(fsAddr,fsType,sizeof(fsType)))return -EFAULT;
         if(!StrEq(fsType,"tmpfs"))return -ENODEV;
         if(dataAddr) {
             if(!CopyUserCString(dataAddr,data,sizeof(data)))return -EFAULT;
-            if(data[0])return -EINVAL;
+            if(int error=ParseTmpfsMountOptions(data,&memoryOptions))return error;
         }
     }
     auto* process=ProcessCurrent();if(!process)return -EPERM;
@@ -42,7 +43,7 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
         if(!error) {
             auto* fsOwner=ProcessUserNamespaceAcquire(process);
             auto* instance=TmpfsCreate(ProcessReadIds(process,false).effective,
-                ProcessReadIds(process,true).effective,fsOwner,6,&error);
+                ProcessReadIds(process,true).effective,fsOwner,6,&error,memoryOptions.mode);
             UserNamespaceRelease(fsOwner);
             if(instance) {
                 error=VfsMountNamespaceMountFresh(lookup.fs.mountNamespace,targetPath,"tmpfs",TmpfsOperations(),instance,0,6);

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "../../kernel/src/tmpfs.cpp"
+#include "../../kernel/src/tmpfs_mount_options.h"
 #include "memory/physical_memory.h"
 namespace
 {
@@ -196,6 +197,23 @@ int main()
 {
     identity(1000);
     clean();
+    TmpfsMountOptions options{};
+    assert(!ParseTmpfsMountOptions(nullptr,&options) && options.mode==01777);
+    assert(!ParseTmpfsMountOptions("",&options) && options.mode==01777);
+    assert(!ParseTmpfsMountOptions("mode=0700,mode=0755",&options) && options.mode==0755);
+    for(unsigned mode=0;mode<=07777;++mode) {
+        char text[32];std::snprintf(text,sizeof(text),"mode=%o",mode);
+        assert(!ParseTmpfsMountOptions(text,&options) && options.mode==mode);
+    }
+    for(const char* text:{"mode=","mode=8","mode=-1","mode=+755","mode=0x755","mode=10000","mode=777777777777777777777777777777777",",mode=755","mode=755,","mode=755,,mode=700","uid=0","size=1M","mode=755,size=1M","mod","mode=755x"}) {
+        options.mode=0123;assert(ParseTmpfsMountOptions(text,&options)==-22 && options.mode==0123);
+    }
+    for(uint16_t mode:{uint16_t(0),uint16_t(0755),uint16_t(01777),uint16_t(07777)}) {
+        int error=0;auto* custom=TmpfsCreate(1000,100,nullptr,6,&error,mode);assert(custom && !error);
+        auto* object=root(custom);VnodeStat stat{};assert(!object->ops->stat(object,&stat) && (stat.mode&07777)==mode && stat.uid==1000 && stat.gid==100);
+        VfsObjectRelease(object);assert(!TmpfsDestroy(custom));clean();
+    }
+    int invalidModeError=0;assert(!TmpfsCreate(1000,100,nullptr,6,&invalidModeError,010000) && invalidModeError==-22);clean();
     auto *fs = make();
     auto *other = make();
     auto *r = root(fs);
