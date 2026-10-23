@@ -4,6 +4,7 @@
 #include "process_user_namespace.h"
 #include "unix_lifetime_trace.h"
 #include "file_locks.h"
+#include "memfd_seals.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
 //
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
@@ -582,6 +583,7 @@ struct MemFdData {
     uint64_t  capacity;         // pageMapCount * 4096
     volatile uint32_t lock;     // spinlock protecting pageMap allocations + grow
     volatile uint32_t refCount; // +1 per fd, +1 per live mmap VMA
+    MemFdSealState seals{};     // protected by lock; one lease per mapping backing
 };
 
 static uint64_t NextMemFdInode()
@@ -683,6 +685,14 @@ static inline void MemFdUnref(MemFdData* mfd)
     }
 }
 
+// A backing can be shared by forked/split VMAs. Only its final destruction
+// retires admission, after all mapping/fault snapshots have released it.
+static void MemFdReleaseMapping(void* object) {
+    auto* mfd=static_cast<MemFdData*>(object);
+    MfdLock(mfd);if(!mfd->seals.mappings)__builtin_trap();--mfd->seals.mappings;MfdUnlock(mfd);
+    MemFdUnref(mfd);
+}
+
 struct KernelOperationGuard {
     Process* proc;
     explicit KernelOperationGuard(Process* p) : proc(p) { if (proc) SchedulerKernelRegionEnter(proc); }
@@ -732,6 +742,7 @@ static int64_t MemFdWriteAt(MemFdData* mfd, const void* buffer, uint64_t count,
     MfdLock(mfd);
     uint64_t pos = append ? mfd->size : *offset;
     if (pos > 0x7fffffffffffffffULL || count > 0x7fffffffffffffffULL - pos) { MfdUnlock(mfd); return -EINVAL; }
+    if(int error=MemFdSealedWrite(mfd->seals,mfd->size,pos+count)) {MfdUnlock(mfd);return error;}
     if (!MemFdGrowLocked(mfd, pos + count)) { MfdUnlock(mfd); return -ENOMEM; }
     auto* src = static_cast<const uint8_t*>(buffer);
     uint64_t done = 0;
@@ -1852,16 +1863,9 @@ static int64_t AppendUserBuffer(Vnode* vn, uint64_t address, uint64_t count, uin
     return result;
 }
 
-static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bool userSource = true)
+static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
+                                     uint64_t bufAddr,uint64_t count,bool userSource)
 {
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-    // Pin before inspecting the type or handle, including special devices.
-    // A closed slot must fail, and a reused slot follows its current type.
-    FdRef ref(proc, static_cast<int>(fd));
-    if (!ref) return -EBADF;
-    FdEntry* fde = ref.get();
-
     // Debug serial writes directly, bypassing the async ring buffer.
     // Hold the serial lock across the entire write so multi-CPU output
     // doesn't interleave character-by-character.
@@ -2163,8 +2167,15 @@ static int64_t WriteToFdByType(uint64_t fd, uint64_t bufAddr, uint64_t count, bo
     }
 
     // No fd-type handler above matched — unknown/unsupported descriptor.
-    // (This is the terminal return of WriteToFdByType, not sys_write.)
+    // (This is the terminal return of WriteToPinnedFdByType, not sys_write.)
     return -EBADF;
+}
+
+static int64_t WriteToFdByType(uint64_t fd,uint64_t bufAddr,uint64_t count,bool userSource=true)
+{
+    Process* proc=ProcessCurrent();if(!proc)return -EBADF;
+    FdRef ref(proc,static_cast<int>(fd));if(!ref)return -EBADF;
+    return WriteToPinnedFdByType(proc,ref.get(),fd,bufAddr,count,userSource);
 }
 
 static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
@@ -2176,6 +2187,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
         return -EFAULT;
     return WriteToFdByType(fd, bufAddr, count);
 }
+
 
 // ---------------------------------------------------------------------------
 // sys_read (0)
@@ -4093,11 +4105,12 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (flags & MAP_SHARED) {
             auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
             if (!mfd) return -ENOMEM;
-            memset(mfd,0,sizeof(*mfd));mfd->inode=NextMemFdInode();mfd->refCount=1;
+            memset(mfd,0,sizeof(*mfd));mfd->inode=NextMemFdInode();mfd->refCount=1;mfd->seals={};
             if (!MemFdGrow(mfd,length)) { MemFdUnref(mfd); return -ENOMEM; }
             mfd->size=length;
-            backing.value=MappingBackingCreate(mfd,MemFdHandleUnref);
-            if (!backing.value) { MemFdUnref(mfd); return -ENOMEM; }
+            if(int error=MemFdAdmitMapping(mfd->seals,true,static_cast<uint32_t>(prot),&request.range.maximumProtection)) {MemFdUnref(mfd);return error;}
+            backing.value=MappingBackingCreate(mfd,MemFdReleaseMapping);
+            if (!backing.value) { MemFdReleaseMapping(mfd); return -ENOMEM; }
             request.range.kind=MappingKind::MemFd;request.range.leafOwnership=MappingLeafOwnership::Borrowed;
             request.range.backing=backing.value;
         } else if (prot && (flags & MAP_POPULATE)) {
@@ -4117,11 +4130,17 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             ((flags & MAP_SHARED) && (prot & 2) && (entry->statusFlags & 3) == 0)) return -13;
         if ((flags & MAP_PRIVATE) && (prot & 2)) return -95;
         auto* mfd=static_cast<MemFdData*>(entry->handle);
-        if (!MemFdGrow(mfd,offset+length)) return -ENOMEM;
-        MemFdRef(mfd);backing.value=MappingBackingCreate(mfd,MemFdHandleUnref);
-        if (!backing.value) { MemFdUnref(mfd);return -ENOMEM; }
+        uint32_t maximum=5u|(((flags & MAP_SHARED) && (entry->statusFlags & 3) != 0)?2u:0u);
+        MfdLock(mfd);
+        if((flags&MAP_SHARED) && (prot&2) && (mfd->seals.bits&8)) {MfdUnlock(mfd);return -EPERM;}
+        if (!MemFdGrowLocked(mfd,offset+length)) {MfdUnlock(mfd);return -ENOMEM;}
+        int admitted=MemFdAdmitMapping(mfd->seals,flags&MAP_SHARED,static_cast<uint32_t>(prot),&maximum);
+        if(admitted) {MfdUnlock(mfd);return admitted;}
+        MemFdRef(mfd);MfdUnlock(mfd);
+        backing.value=MappingBackingCreate(mfd,MemFdReleaseMapping);
+        if (!backing.value) { MemFdReleaseMapping(mfd);return -ENOMEM; }
         request.range.kind=MappingKind::MemFd;request.range.leafOwnership=MappingLeafOwnership::Borrowed;
-        request.range.maximumProtection=5u|(((flags & MAP_SHARED) && (entry->statusFlags & 3) != 0)?2u:0u);
+        request.range.maximumProtection=maximum;
         request.range.backing=backing.value;
         return UserMappingCreate(proc,proc->addressSpace,request);
     }
@@ -8306,9 +8325,13 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
     case 37: // F_OFD_SETLK
     case 38: // F_OFD_SETLKW
         return -EINVAL;
-    case 1033: // F_ADD_SEALS: no write/truncate/sandbox seal enforcement yet.
-    case 1034: // F_GET_SEALS: never report fictional successful sealing.
-        return -EINVAL;
+    case 1033: // F_ADD_SEALS
+    case 1034: { // F_GET_SEALS
+        if(fde->type!=FdType::MemFd || !fde->handle)return -EINVAL;
+        auto* mfd=static_cast<MemFdData*>(fde->handle);MfdLock(mfd);
+        int result=cmd==1034?static_cast<int>(mfd->seals.bits):MemFdAddSeals(mfd->seals,static_cast<uint32_t>(arg),(fde->statusFlags&3)!=0);
+        MfdUnlock(mfd);return result;
+    }
     case F_DUPFD:
     case F_DUPFD_CLOEXEC:
     {
@@ -9784,6 +9807,7 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
     mfd->capacity     = 0;
     mfd->lock         = 0;
     mfd->refCount     = 0; // bumped by FdAlloc below
+    mfd->seals        = {flags&MFD_ALLOW_SEALING?0u:1u,0};
 
     int fd = MemFdInstall(proc, mfd, 2u | ((flags & MFD_CLOEXEC) ? 0x80000u : 0));
     if (fd < 0) kfree(mfd);
@@ -9798,65 +9822,45 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
 static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offsetAddr,
                              uint64_t count, uint64_t, uint64_t)
 {
-    Process* proc = ProcessCurrent();
-    if (!proc) return -EBADF;
-    FdEntry* in_fde = FdGet(proc, static_cast<int>(in_fd));
-    FdEntry* out_fde = FdGet(proc, static_cast<int>(out_fd));
-    if (!in_fde || !out_fde) return -EBADF;
-
-    // Read optional offset
-    uint64_t offset = in_fde->seekPos;
-    bool useExplicitOffset = false;
-    if (offsetAddr)
-    {
-        if (!UserBufferReadable(offsetAddr, 8)) return -EFAULT;
-        offset = *reinterpret_cast<uint64_t*>(offsetAddr);
-        useExplicitOffset = true;
+    out_fd=static_cast<uint32_t>(out_fd);in_fd=static_cast<uint32_t>(in_fd);
+    Process* proc=ProcessCurrent();if(!proc)return -EBADF;
+    KernelOperationGuard operation(proc);
+    FdRef input(proc,static_cast<int>(in_fd)),output(proc,static_cast<int>(out_fd));
+    if(!input || !output)return -EBADF;
+    auto* out_fde=output.get();
+    if(out_fde->type==FdType::Path)return -EBADF;
+    if(out_fde->statusFlags&0x400u)return -EINVAL; // Linux forbids append output.
+    if((out_fde->type==FdType::MemFd || (out_fde->type==FdType::Vnode && out_fde->handle)) &&
+       (out_fde->statusFlags&3)==0)return -EBADF;
+    auto* in_fde=input.get();
+    if(in_fde->type==FdType::Path || (in_fde->statusFlags&3)==1)return -EBADF;
+    if((in_fde->type!=FdType::Vnode && in_fde->type!=FdType::MemFd) || !in_fde->handle)return -EINVAL;
+    uint64_t offset=in_fde->seekPos;
+    if(offsetAddr) {
+        if(!UserBufferWritable(offsetAddr,8) || !CopyFromUser(&offset,offsetAddr,8))return -EFAULT;
     }
-
-    if (count > 256 * 1024) count = 256 * 1024; // cap at 256KB per call
-
-    // Allocate kernel bounce buffer
-    uint32_t chunkSize = count > 4096 ? 4096 : static_cast<uint32_t>(count);
-    auto* bounce = static_cast<uint8_t*>(kmalloc(chunkSize));
-    if (!bounce) return -ENOMEM;
-
-    int64_t totalSent = 0;
-    while (static_cast<uint64_t>(totalSent) < count)
-    {
-        uint32_t toRead = chunkSize;
-        if (static_cast<uint64_t>(totalSent) + toRead > count)
-            toRead = static_cast<uint32_t>(count - totalSent);
-
-        // Read from input fd
-        int rd = -1;
-        if (in_fde->type == FdType::Vnode && in_fde->handle)
-        {
-            rd = VfsRead(static_cast<Vnode*>(in_fde->handle), bounce, toRead, &offset);
-        }
-        if (rd <= 0) break;
-
-        // Write to output fd via the shared write dispatch so sendfile works
-        // to ANY destination (terminal/serial, pipe, socket, file, ...), not
-        // just regular files. bounce is a kernel buffer, always readable.
-        // (BRO: previously this only handled FdType::Vnode, so sendfile to a
-        // TTY/pipe — e.g. busybox `cat` to stdout — silently returned 0.)
-        int wr = static_cast<int>(
-            WriteToFdByType(out_fd, reinterpret_cast<uint64_t>(bounce),
-                         static_cast<uint64_t>(rd), false));
-        if (wr <= 0) break;
-
-        totalSent += wr;
-        if (wr < rd) break; // partial write — stop
+    if(offset>0x7fffffffffffffffULL)return -EINVAL;
+    if(!count)return 0;
+    if(count>256*1024)count=256*1024;
+    uint32_t chunk=count>4096?4096:static_cast<uint32_t>(count);
+    auto* bounce=static_cast<uint8_t*>(kmalloc(chunk));if(!bounce)return -ENOMEM;
+    int64_t total=0,error=0;
+    while(static_cast<uint64_t>(total)<count) {
+        uint64_t remaining=count-static_cast<uint64_t>(total),amount=remaining<chunk?remaining:chunk;
+        uint64_t readOffset=offset;
+        int64_t read=in_fde->type==FdType::MemFd?
+            MemFdReadAt(static_cast<MemFdData*>(in_fde->handle),bounce,amount,&readOffset):
+            VfsRead(static_cast<Vnode*>(in_fde->handle),bounce,amount,&readOffset);
+        if(read<=0) {error=read;break;}
+        int64_t written=WriteToPinnedFdByType(proc,output.get(),out_fd,reinterpret_cast<uint64_t>(bounce),static_cast<uint64_t>(read),false);
+        if(written<=0 || written>read) {error=written<0?written:-EIO;break;}
+        offset+=static_cast<uint64_t>(written);total+=written;
+        if(written<read)break;
     }
-
-    if (!useExplicitOffset)
-        in_fde->seekPos = offset;
-    else if (offsetAddr)
-        *reinterpret_cast<uint64_t*>(offsetAddr) = offset;
-
     kfree(bounce);
-    return totalSent > 0 ? totalSent : (totalSent == 0 && count > 0 ? 0 : -EIO);
+    if(offsetAddr) {if(!CopyToUser(offsetAddr,&offset,8))return -EFAULT;}
+    else in_fde->seekPos=offset;
+    return total?total:error;
 }
 
 // ---------------------------------------------------------------------------
@@ -10184,10 +10188,14 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t,
             if ((fde->statusFlags & 3) == 0) return -EINVAL;
             auto* mfd = static_cast<MemFdData*>(fde->handle);
             MfdLock(mfd);
+            if(int error=MemFdSealedResize(mfd->seals,mfd->size,length)) {MfdUnlock(mfd);return error;}
             if (!MemFdGrowLocked(mfd, length)) { MfdUnlock(mfd); return -ENOMEM; }
             // Shrinking ftruncate: free pages past the new tail. (Growth is
             // free — pages are unbacked / read-as-zero until first access.)
             if (length < mfd->size) {
+                const uint64_t tail=length&4095,index=length/4096;
+                if(tail && index<mfd->pageMapCount && mfd->pageMap[index])
+                    memset(reinterpret_cast<void*>(PhysToVirt(PhysicalAddress(mfd->pageMap[index])).raw()+tail),0,4096-tail);
                 uint64_t firstFreeIdx = (length + 4095) / 4096;
                 for (uint64_t i = firstFreeIdx; i < mfd->pageMapCount; i++) {
                     if (mfd->pageMap[i]) {
@@ -10560,6 +10568,8 @@ static int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
     if (end > 16ULL * 1024 * 1024 * 1024) return -27; // Existing memfd index limit.
     auto* mfd = static_cast<MemFdData*>(entry->handle);
     MfdLock(mfd);
+    // Linux forbids beyond-EOF reservation under GROW even with KEEP_SIZE.
+    if(end>mfd->size && (mfd->seals.bits&4)) {MfdUnlock(mfd);return -EPERM;}
     if (!MemFdGrowLocked(mfd, end)) { MfdUnlock(mfd); return -ENOMEM; }
 
     // Stage only new physical pages in a private chain. Its two temporary
