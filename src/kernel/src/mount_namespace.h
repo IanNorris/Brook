@@ -47,6 +47,9 @@ int VfsMountNamespacePivotRoot(MountNamespace* ns,const VfsPath& oldRoot,const V
 // and has no master/peers. Validate a live owned mount root; no topology change.
 // Shared/unbindable support must replace this private-only contract first.
 int VfsMountNamespacePrivatePropagation(MountNamespace* ns,const VfsPath& target);
+// Bounded bind remount: add NOSUID|NODEV only. Unsupported flags, initial
+// namespaces and weakening an inherited restriction fail without mutation.
+int VfsMountNamespaceRemount(MountNamespace* ns,const VfsPath& target,uint64_t attributes);
 int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target);
 // Borrowed namespace must have a live storage owner. Each value is copied
 // under the metadata view lock; count/index sequences may race mutation.

@@ -561,6 +561,20 @@ int VfsMountNamespacePrivatePropagation(MountNamespace* ns,const VfsPath& target
     // Do not use this path after introducing shared peers or master links.
     return 0;
 }
+int VfsMountNamespaceRemount(MountNamespace* ns,const VfsPath& target,uint64_t attributes)
+{
+    if(!ns || !target.object || !target.attachment)return -22;
+    if(attributes!=6)return -22;
+    FileMutationGuard transaction;
+    if(!ns->life.Published())return -3;
+    if(ns->initial)return -95;
+    VfsMountTargetLease lease;if(int error=lease.Follow(target))return error;
+    auto* mount=static_cast<MountEntry*>(lease.value.attachment);
+    if(!VfsMountPublished(*mount) || mount->owner!=ns ||
+       lease.value.object->identity!=mount->rootIdentity || lease.value.object->ops!=mount->rootObjectOps)return -22;
+    if(mount->attributes&~attributes)return -1;
+    MountViewGuard view;mount->attributes=attributes;return 0;
+}
 int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target)
 {
     if(!ns || !target.object || !target.attachment)return -22;

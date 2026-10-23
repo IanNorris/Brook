@@ -364,6 +364,32 @@ int VfsPathStat(const VfsPath& path,VnodeStat* out)
     FileMutationGuard lookup(false);
     return path.object->ops->stat?path.object->ops->stat(path.object,out):-95;
 }
+int VfsPathDeviceActivation(const VfsPath& root,const char* absolute)
+{
+    if(!root.object || !root.attachment || !absolute || absolute[0]!='/')return -22;
+    FileMutationGuard lookup(false);
+    // Synthetic device tails may have no backing inode. The last existing
+    // identity selects the applicable mount; a real submount has its own flags.
+    auto* mount=static_cast<MountEntry*>(root.attachment);
+    if(!VfsMountPublished(*mount))return -2;
+    uint64_t attributes=mount->attributes;
+    char prefix[512];uint32_t length=StrLen(absolute);if(length>=sizeof(prefix))return -36;
+    StrCopy(prefix,absolute,sizeof(prefix));
+    for(uint32_t end=1;end<=length;++end) {
+        if(prefix[end]!='/' && prefix[end])continue;
+        char saved=prefix[end];prefix[end]=0;
+        VfsRetainedProvider provider;RetainedWalkResult<VfsPath> result{};
+        int error=WalkRetainedPath(root,root,prefix,&result,provider);
+        prefix[end]=saved;
+        if(error) {
+            if(error==-2 || (!saved && error==-95))return attributes&4?-13:0;
+            return error;
+        }
+        attributes=static_cast<MountEntry*>(result.object.attachment)->attributes;
+        VfsPathRelease(result.object);VfsPathRelease(result.parent);
+    }
+    return attributes&4?-13:0;
+}
 int VfsPathAccess(const VfsPath& path,uint8_t required,bool realIds)
 {
     if(required&~7u)return -22;
@@ -382,6 +408,12 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
         *error=-22;return nullptr;
     }
     if(!path.object->ops->open) { *error=-95;return nullptr; }
+    auto* mount=static_cast<MountEntry*>(path.attachment);
+    if((mount->attributes&4) && !(flags&VFS_O_METADATA)) {
+        VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
+        if(*error)return nullptr;
+        if(VfsNodevDenied(mount,stat,flags)) {*error=-13;return nullptr;}
+    }
     int openFlags=flags&~VFS_O_TRUNC;
     if(flags&VFS_O_TRUNC) { if(!(openFlags&VFS_O_WRITE))openFlags|=VFS_O_READWRITE;openFlags|=VFS_O_WRITE; }
     Vnode* node=path.object->ops->open(path.object,openFlags,error);

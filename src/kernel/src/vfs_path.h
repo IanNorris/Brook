@@ -14,6 +14,9 @@ int VfsPathRoot(VfsPath* out);
 // not crossed a directory bind. Missing synthetic tails are permitted; a bind
 // must mask broker entries just as it masks ordinary backing entries.
 int VfsPathBrokerAllowed(const VfsPath& root,const char* absolute,bool* allowed);
+// Device activation only: metadata/O_PATH, directories, /dev/shm and existing
+// device descriptors are unaffected. Called for a recognized broker device.
+int VfsPathDeviceActivation(const VfsPath& root,const char* absolute);
 // The caller retains vnode through acquisition (e.g. an FD snapshot).
 int VfsPathFromVnode(Vnode* vnode,VfsPath* out);
 // root/start are borrowed live references. Absolute paths restart at root;

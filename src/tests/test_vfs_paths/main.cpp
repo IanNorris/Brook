@@ -23,13 +23,14 @@ std::unordered_set<void*> allocations;
 long failAllocation=-1;
 unsigned schedulerLockDepth=0;
 struct Mount;
-struct Node { Mount* mount;uint64_t id;bool dir;Node* parent;std::map<std::string,Node*> children;std::string target; };
+struct Node { Mount* mount;uint64_t id;bool dir;Node* parent;std::map<std::string,Node*> children;std::string target;uint16_t mode=0; };
 struct Mount { uint64_t identity=0;bool alive=false;unsigned live=0;unsigned closed=0;Node root{}; };
 Mount mounts[8];
 unsigned mountCalls[8]{},unmountCalls[8]{},syncCalls[8]{};
 bool rejectRoot[8]{},rejectUnmount[8]{};
 uint64_t rejectDirectoryReport=0;
 bool rejectProvider=false;unsigned providerCalls=0;
+unsigned deviceActivations=0;
 extern const brook::VfsObjectOps objectOps;
 Node& node(brook::VfsObject* object){return *static_cast<Node*>(object->priv);}
 int makeObject(Node* source,brook::VfsObject** out){
@@ -40,7 +41,7 @@ int makeObject(Node* source,brook::VfsObject** out){
 }
 void destroyObject(brook::VfsObject* object){auto& m=*node(object).mount;assert(m.alive && m.live);--m.live;brook::kfree(object);}
 int objectStat(brook::VfsObject* object,brook::VnodeStat* stat){
-    auto& n=node(object);assert(n.mount->alive);*stat={};stat->isDir=n.dir;stat->isSymlink=!n.target.empty();stat->ino=n.id;stat->dev=n.mount->identity;stat->mode=n.dir?0040755:0100644;return 0;
+    auto& n=node(object);assert(n.mount->alive);*stat={};stat->isDir=n.dir;stat->isSymlink=!n.target.empty();stat->ino=n.id;stat->dev=n.mount->identity;stat->mode=n.mode?n.mode:n.dir?0040755:0100644;return 0;
 }
 int objectAccess(brook::VfsObject*,uint8_t,bool){return 0;}
 int objectChild(brook::VfsObject* parent,const char* name,brook::VfsObject** out,bool=false){
@@ -58,7 +59,8 @@ int nodeReaddir(brook::Vnode* vn,brook::DirEntry* out,uint32_t* cookie) {
     *out={};std::strncpy(out->name,it->first.c_str(),sizeof(out->name)-1);out->isDir=it->second->dir;++*cookie;return 1;
 }
 const brook::VnodeOps nodeOps={.open=nullptr,.read=nullptr,.write=nullptr,.readdir=nodeReaddir,.close=nodeClose,.stat=nodeStat,.fsync=nullptr,.truncate=nodeTruncate};
-brook::Vnode* objectOpen(brook::VfsObject* object,int,int* error){
+brook::Vnode* objectOpen(brook::VfsObject* object,int flags,int* error){
+    if((node(object).mode&0170000)==0020000 && !(flags&brook::VFS_O_METADATA))++deviceActivations;
     *error=0;auto* vn=static_cast<brook::Vnode*>(brook::kmalloc(sizeof(brook::Vnode)));
     if(!vn){*error=-12;return nullptr;}
     *vn={};vn->ops=&nodeOps;vn->type=node(object).dir?brook::VnodeType::Dir:brook::VnodeType::File;vn->refCount=1;
@@ -401,6 +403,49 @@ static void testMountInfo(brook::MountNamespace* initial,const brook::VfsPath& s
     VfsMountNamespaceLeave(ns);VfsDrainMountCleanup();VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
     mounts[6].root.children.erase(sourceName);mounts[6].root.children.erase(targetName);
     assert(allocations.size()==before&&g_mounts.count==records);
+}
+static void testMountRestrictions(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    auto allocated=allocations.size();auto records=g_mounts.count;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};
+    assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
+    auto source=resolve(root,root,"ns-a"),target=resolve(root,root,"ns-b"),second=resolve(root,root,"ns-target");
+    Node device{&mounts[6],700,false,&node(source.object),{},{},0020666};node(source.object).children["device"]=&device;
+    assert(!VfsMountNamespaceBind(ns,source,target));auto bind=resolve(root,root,"ns-b"),dev=resolve(root,bind,"device");
+    int error=0;auto* held=VfsPathOpen(dev,VFS_O_READ,&error);assert(held&&!error);
+    auto activations=deviceActivations;
+    assert(VfsMountNamespaceRemount(initial,stableRoot,6)==-95);
+    for(uint64_t attributes:{0ULL,2ULL,7ULL,14ULL,2097158ULL})assert(VfsMountNamespaceRemount(ns,bind,attributes)==-22);
+    assert(static_cast<MountEntry*>(bind.attachment)->attributes==0);
+    assert(VfsMountNamespaceRemount(ns,dev,6)==-22);
+    assert(!VfsMountNamespaceRemount(ns,bind,6));
+    assert(!VfsPathOpen(dev,VFS_O_READ,&error)&&error==-13&&deviceActivations==activations);
+    auto* metadata=VfsPathOpen(dev,VFS_O_METADATA,&error);assert(metadata&&!error&&deviceActivations==activations);VfsRelease(metadata);
+    VnodeStat stat{};assert(!VfsStat(held,&stat)&&stat.mode==0020666);VfsRelease(held);
+    auto original=resolve(root,source,"device");held=VfsPathOpen(original,VFS_O_READ,&error);assert(held&&!error);VfsRelease(held);VfsPathRelease(original);
+    assert(!VfsMountNamespaceBind(ns,bind,second));auto alias=resolve(root,root,"ns-target/device");assert(!VfsPathOpen(alias,VFS_O_READ,&error)&&error==-13);VfsPathRelease(alias);
+    assert(!VfsMountNamespaceRemount(ns,root,6));
+    assert(VfsPathDeviceActivation(root,"/dev/null")==-13);
+    // An independent child mount has its own flags, rather than inheriting
+    // NODEV from the namespace root. Generic broker eligibility is unchanged.
+    assert(!VfsPathDeviceActivation(root,"/synthetic/deep/mount/missing"));
+    bool allowed=false;assert(!VfsPathBrokerAllowed(root,"/dev/shm/test",&allowed)&&allowed);
+    MountNamespace* copied=nullptr;VfsPath copyRoot{},copyCwd{};
+    assert(!VfsMountNamespaceCopy(ns,root,root,&copied,&copyRoot,&copyCwd));assert(VfsMountNamespaceActivate(copied));
+    auto copiedDev=resolve(copyRoot,copyRoot,"ns-b/device");assert(!VfsPathOpen(copiedDev,VFS_O_READ,&error)&&error==-13);
+    VfsPathRelease(copiedDev);VfsMountNamespaceLeave(copied);VfsPathRelease(copyRoot);VfsPathRelease(copyCwd);VfsMountNamespaceRelease(copied);VfsDrainMountCleanup();
+    // Legacy initial-namespace opens use the same pre-activation check.
+    auto loose=resolve(stableRoot,stableRoot,"loose-file");node(loose.object).mode=0020666;
+    auto* initialMount=static_cast<MountEntry*>(stableRoot.attachment);
+    {FileMutationGuard transaction;MountViewGuard view;initialMount->attributes=6;}
+    assert(!VfsOpenModeChecked("/loose-file",VFS_O_READ,0666,&error)&&error==-13);
+    Vnode* executable=nullptr;char name[512];assert(VfsOpenExecutable("/loose-file",&executable,name,sizeof(name))==-13&&!executable);
+    {FileMutationGuard transaction;MountViewGuard view;initialMount->attributes=0;}
+    node(loose.object).mode=0;VfsPathRelease(loose);
+    VfsPathRelease(bind);VfsPathRelease(dev);VfsPathRelease(source);VfsPathRelease(target);VfsPathRelease(second);
+    VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
+    mounts[6].root.children["ns-a"]->children.erase("device");
+    assert(allocations.size()==allocated&&g_mounts.count==records);
 }
 static void testPivotRoots(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
     using namespace brook;
@@ -794,6 +839,7 @@ int main(){
     testRecursiveBinds(initial,stableRoot);
     testPivotRoots(initial,stableRoot);
     testMountInfo(initial,stableRoot);
+    testMountRestrictions(initial,stableRoot);
     MountNamespace* parentNs=nullptr;VfsPath parentRoot{},parentCwd{};
     assert(!VfsMountNamespaceCopy(initial,stableRoot,originalSynthetic,&parentNs,&parentRoot,&parentCwd));
     assert(VfsMountNamespaceBind(parentNs,aPath,parentCwd)==-3);

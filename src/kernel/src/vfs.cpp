@@ -198,6 +198,11 @@ struct MountEntry {
     uint64_t         rootDevice;
     uint64_t         attributes;
 };
+static bool VfsNodevDenied(const MountEntry* mount,const VnodeStat& stat,int flags)
+{
+    const uint16_t type=stat.mode&0170000;
+    return (mount->attributes&4) && !(flags&VFS_O_METADATA) && (type==0020000 || type==0060000);
+}
 
 // Membership is protected by the sleeping VFS transaction. Short metadata
 // readers (including procfs callbacks already in that transaction) use viewLock
@@ -754,6 +759,10 @@ int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t 
     const char* relative=nullptr;
     MountEntry* mount=FindMount(resolved,&relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
+    if(mount->attributes&4) {
+        VnodeStat stat{};int result=VfsLstatPathRaw(resolved,&stat);
+        if(result)return result;if(VfsNodevDenied(mount,stat,VFS_O_EXEC))return -13;
+    }
     int error=0;
     Vnode* opened=mount->backing->fsOps->open_mode_checked ?
         mount->backing->fsOps->open_mode_checked(mount->backing->mountPriv,mount->backing->pdrv,relative,VFS_O_EXEC,0666,&error) :
@@ -816,6 +825,13 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
     }
 
     if (!mount->backing->fsOps) return nullptr;
+    if((mount->attributes&4) && !(flags&VFS_O_METADATA)) {
+        VnodeStat stat{};int result=VfsLstatPathRaw(lookup,&stat);
+        if(result!=-2 || !(flags&VFS_O_CREATE)) {
+            if(!result && VfsNodevDenied(mount,stat,flags))result=-13;
+            if(result) {if(error)*error=result;return nullptr;}
+        }
+    }
     // O_TRUNC must use the same resize gate and alias invalidation as truncate.
     int openFlags = flags & ~(VFS_O_TRUNC | VFS_O_EXCL);
     if (flags & VFS_O_TRUNC) {

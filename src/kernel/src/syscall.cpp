@@ -3158,6 +3158,14 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     if (procFdPath) return procFdResult;
 
     // Device paths
+    if(StrEq(syntheticPath,"keyboard") || StrEq(syntheticPath,"/dev/fb0") || StrEq(syntheticPath,"/dev/keyboard") ||
+       StrEq(syntheticPath,"/dev/tty") || StrEq(syntheticPath,"/dev/console") ||
+       StrEq(syntheticPath,"/dev/dri/renderD128") || StrEq(syntheticPath,"/dev/null") ||
+       StrEq(syntheticPath,"/dev/urandom") || StrEq(syntheticPath,"/dev/random") ||
+       StrEq(syntheticPath,"/dev/klog") || StrEq(syntheticPath,"/dev/dsp")) {
+        const char* deviceName=StrEq(syntheticPath,"keyboard")?"/dev/keyboard":syntheticPath;
+        if(int error=VfsPathDeviceActivation(at.fs.root,deviceName))return error;
+    }
     if (StrEq(syntheticPath, "/dev/fb0"))
     {
         int fd = FdAlloc(proc, FdType::DevFramebuf, nullptr);

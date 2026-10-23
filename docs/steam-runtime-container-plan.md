@@ -17,8 +17,11 @@ nested and stacked mount subtrees and advances unchanged bubblewrap to
 pivot forms and advances the same binary to missing `/proc/self/mountinfo`.
 The [mount graph reporting checkpoint](mountinfo-checkpoint.md) then supplies
 mountinfo and retained directory FD readlink reporting. Unchanged bubblewrap
-now requires bind remount restrictions. Remaining write/mapping enforcement
-needs separate acceptance. There is no Brook login acceptance.
+advances to bind remount restrictions. The [restricted-remount checkpoint](mount-restrictions-checkpoint.md)
+then runs unchanged bubblewrap and an NNP/exec child successfully. The real
+SteamRT launcher exposes retained directory FD following, missing `/usr` layout
+and read-only binds. Write/mapping enforcement needs separate acceptance.
+There is no Brook SteamRT-child or login acceptance.
 
 The accepted baseline is `3bfc275e` (ABI 39), including retained filesystem
 contexts at `e626b7f8`, retained proc-root links and real per-task no_new_privs.

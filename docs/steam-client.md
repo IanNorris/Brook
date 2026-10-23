@@ -1,7 +1,7 @@
-Latest container checkpoint: [mount graph and directory FD reporting](mountinfo-checkpoint.md)
-passes Linux/native probes. Unchanged bubblewrap gets past mountinfo and
-retained directory reporting, then requires bind remount restrictions.
-Its child has not run; SteamRT acceptance remains outstanding.
+Latest container checkpoint: [restricted bind remount](mount-restrictions-checkpoint.md)
+runs unchanged bubblewrap and its NNP/exec child successfully as UID 1000.
+The real SteamRT launcher next exposes directory FD following, the missing
+retained `/usr` layout and read-only binds. SteamRT's child has not executed.
 
 # Native Steam client checkpoint
 

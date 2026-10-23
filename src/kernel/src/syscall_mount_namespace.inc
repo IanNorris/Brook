@@ -3,7 +3,7 @@
 static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr,
                          uint64_t flags,uint64_t dataAddr,uint64_t)
 {
-    constexpr uint64_t Bind=0x1000,Recursive=0x4000,Silent=0x8000;
+    constexpr uint64_t Bind=0x1000,Remount=0x20,Recursive=0x4000,Silent=0x8000;
     // Linux accepts the historical magic prefix only when all its bits match.
     if((flags&0xffff0000ULL)==0xc0ed0000ULL)flags&=~0xffff0000ULL;
     constexpr uint64_t Private=0x40000,Slave=0x80000;
@@ -11,7 +11,8 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
     const bool privatePropagation=type==Private || type==Slave;
     const bool memoryMount=(flags&~Silent)==6; // bounded NODEV|NOSUID tmpfs
     const bool bindMount=type==Bind;
-    if(!bindMount && !privatePropagation && !memoryMount)return -EINVAL;
+    const bool remount=(flags&~(Silent|uint64_t{6}))==(Bind|Remount) && (flags&6)==6;
+    if(!bindMount && !privatePropagation && !memoryMount && !remount)return -EINVAL;
     if(memoryMount) {
         char fsType[32],data[256];
         if(!CopyUserCString(fsAddr,fsType,sizeof(fsType)))return -EFAULT;
@@ -26,11 +27,16 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
     if(!CopyUserCString(targetAddr,target,sizeof(target)))return -EFAULT;
     // Propagation has no source operand. A non-null source is still a userspace
     // string argument to mount(2), so validate it without resolving its path.
-    if((sourceAddr || (!privatePropagation && !memoryMount)) && !CopyUserCString(sourceAddr,source,sizeof(source)))return -EFAULT;
+    if((sourceAddr || (!privatePropagation && !memoryMount && !remount)) && !CopyUserCString(sourceAddr,source,sizeof(source)))return -EFAULT;
     AtLookup lookup;if(int error=lookup.Init(-100,target))return error;
     auto* owner=VfsMountNamespaceUserOwnerAcquire(lookup.fs.mountNamespace);
     bool authorized=ProcessCapable(process,owner,CapSysAdmin);UserNamespaceRelease(owner);
     if(!authorized)return -EPERM;
+    if(remount) {
+        VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
+        if(!error)error=VfsMountNamespaceRemount(lookup.fs.mountNamespace,targetPath,6);
+        VfsPathRelease(targetPath);return error;
+    }
     if(memoryMount) {
         VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
         if(!error) {
