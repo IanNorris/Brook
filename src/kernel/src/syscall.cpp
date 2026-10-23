@@ -14854,6 +14854,14 @@ static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
         return -38; // -ENOSYS
     }
 
+    // Successful exec and exit never return to the post-dispatch logger. Emit
+    // their attempted operation here; failed exec still gets its error below.
+    if (!proc->straceErrorsOnly) {
+        if (num == SYS_EXIT || num == SYS_EXIT_GROUP)
+            SerialPrintf("[strace:%u] %s(%lu) [noreturn]\n", proc->pid, name, a0);
+        else if (num == SYS_EXECVE)
+            SerialPrintf("[strace:%u] %s [attempt]\n", proc->pid, name);
+    }
     int64_t ret = fn(a0, a1, a2, a3, a4, a5);
 
     // In errors-only mode, skip successful syscalls entirely

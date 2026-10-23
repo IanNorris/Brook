@@ -75,3 +75,28 @@ child launch error 1002; identifying that launch failure is the next lead.
 
 Raw client logs, binaries, profiles, cookies, disk images and request receipts
 remain private ignored artifacts. No authenticated session is claimed.
+
+
+## Focused tracing follow-up
+
+Optional process tracing now records exit/exit_group before dispatch, and records
+exec attempts before the nonreturning transition. Previously, the post-call
+logger could never report successful exec or exit. The debug command parser also
+accepts `other`, exposing the existing remaining-syscall category (credentials,
+process controls and other calls outside the six named groups).
+
+A native thread/fork control verifies `strace <pid> proc,other`: its child exits
+23, the creating thread's getuid reports 1000, and both thread/process normal
+exits appear in the serial trace. The new exact ELF entry-state and scheduler
+mutation audits pass. This changes optional diagnostics only; it does not fix
+Steam startup. Concurrent syscall trace prefixes and result suffixes can still
+interleave, so a naive regex must not assign their error numbers to a call.
+
+The stopped Linux reference image was inspected read-only for fixed-message
+counts. None of the sampled relative-path, shared-memory corruption, or GPU
+launch-failure messages appear there. Brook's wrapper identifies the relative
+field as browser_subprocess_path, while a reduced SteamRT Python child resolves
+proc/self/exe and relative realpath successfully. The application-specific
+resolution difference remains under investigation. One overlapped SteamRT setup
+attempt exited 75; it is retained as a harness/setup failure, not client
+acceptance or a new kernel regression. Later tests run constructors sequentially.

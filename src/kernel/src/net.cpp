@@ -5310,7 +5310,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         target[ti2] = '\0';
         while (*ap == ' ') ap++;
 
-        // Parse optional filter: net, file, mem, proc, sig, io
+        // Parse optional filter: net, file, mem, proc, sig, io, other
         uint32_t filter = 0;
         while (*ap) {
             if (StrStartsWith(ap, "net"))  { filter |= 1; ap += 3; }
@@ -5319,6 +5319,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             else if (StrStartsWith(ap, "proc")) { filter |= 8; ap += 4; }
             else if (StrStartsWith(ap, "sig"))  { filter |= 16; ap += 3; }
             else if (StrStartsWith(ap, "io"))   { filter |= 32; ap += 2; }
+            else if (StrStartsWith(ap, "other")) { filter |= 64; ap += 5; }
             else break;
             while (*ap == ' ' || *ap == ',') ap++;
         }
