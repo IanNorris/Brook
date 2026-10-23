@@ -3441,28 +3441,7 @@ static void FillFdSnapshot(FdSnapshot* out, const FdEntry& fde)
     out->type = static_cast<uint8_t>(fde.type);
     out->flags = fde.statusFlags;
     out->seekPos = fde.seekPos;
-    // Copy dirPath if it has content, otherwise describe by type
-    if (fde.dirPath[0])
-    {
-        uint32_t j = 0;
-        for (; j < 63 && fde.dirPath[j]; ++j)
-            out->path[j] = fde.dirPath[j];
-        out->path[j] = '\0';
-    }
-    else
-    {
-        static const char* typeNames[] = {
-            "none", "file", "fb", "kbd", "pipe", "/dev/null", "/dev/urandom",
-            "mem", "socket", "tty", "eventfd", "dsp", "epoll", "timerfd",
-            "memfd", "unix", "klog"
-        };
-        uint8_t t = static_cast<uint8_t>(fde.type);
-        const char* name = (t < sizeof(typeNames)/sizeof(typeNames[0])) ? typeNames[t] : "?";
-        uint32_t j = 0;
-        for (; j < 63 && name[j]; ++j)
-            out->path[j] = name[j];
-        out->path[j] = '\0';
-    }
+    FdDiagnosticPath(fde,out->path,sizeof(out->path));
 }
 
 bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot* outSnap, uint64_t incarnation)

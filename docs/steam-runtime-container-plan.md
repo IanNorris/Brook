@@ -15,9 +15,10 @@ nested and stacked mount subtrees and advances unchanged bubblewrap to
 `pivot_root: Function not implemented`. The subsequent
 [private root-relocation checkpoint](pivot-root-checkpoint.md) implements both
 pivot forms and advances the same binary to missing `/proc/self/mountinfo`.
-Remaining mount/root integration requires separate designs
-for write/mapping enforcement, tmpfs and root publication. There is no Brook login
-acceptance.
+The [mount graph reporting checkpoint](mountinfo-checkpoint.md) then supplies
+mountinfo and retained directory FD readlink reporting. Unchanged bubblewrap
+now requires bind remount restrictions. Remaining write/mapping enforcement
+needs separate acceptance. There is no Brook login acceptance.
 
 The accepted baseline is `3bfc275e` (ABI 39), including retained filesystem
 contexts at `e626b7f8`, retained proc-root links and real per-task no_new_privs.

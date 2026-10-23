@@ -192,6 +192,11 @@ struct MountEntry {
     bool             linked;
     bool             detachSelected;
     bool             lockedInherited;
+    // Reporting metadata, never lookup authority. Prepared under the VFS
+    // transaction and copied/updated atomically under the metadata view lock.
+    char             physicalRoot[512];
+    uint64_t         rootDevice;
+    uint64_t         attributes;
 };
 
 // Membership is protected by the sleeping VFS transaction. Short metadata
@@ -317,21 +322,24 @@ static bool StrEq(const char* a, const char* b)
 }
 
 struct VfsRenameLabels {
-    struct Change { Change* next;MountEntry* mount;char label[64]; };
+    struct Change { Change* next;MountEntry* mount;char label[64];char physicalRoot[512]; };
     Change* head=nullptr;
     ~VfsRenameLabels() { while(head) { auto* next=head->next;kfree(head);head=next; } }
-    int Add(MountEntry* mount,const char* prefix,const char* suffix) {
+    int Add(MountEntry* mount,const char* prefix,const char* suffix,const char* physicalRoot=nullptr) {
         auto* change=static_cast<Change*>(kmalloc(sizeof(Change)));
         if(!change)return -12;
         change->mount=mount;StrCopy(change->label,prefix,sizeof(change->label));
         const uint32_t length=StrLen(prefix);
         StrCopy(change->label+length,suffix,sizeof(change->label)-length);
+        StrCopy(change->physicalRoot,physicalRoot?physicalRoot:mount->physicalRoot,sizeof(change->physicalRoot));
         change->next=head;head=change;return 0;
     }
     void Apply() {
         MountViewGuard held;
-        for(auto* change=head;change;change=change->next)
+        for(auto* change=head;change;change=change->next) {
             StrCopy(change->mount->mountPoint,change->label,sizeof(change->mount->mountPoint));
+            StrCopy(change->mount->physicalRoot,change->physicalRoot,sizeof(change->mount->physicalRoot));
+        }
     }
 };
 static int VfsPrepareBackingRenameLabelsLocked(MountBacking* backing,const char* oldPhysical,
@@ -559,7 +567,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
         VnodeStat stat{};
         if(!error)error=object->ops->stat(object,&stat);
         if(!error && !stat.isDir)error=-20;
-        if(!error) { slot->rootIdentity=object->identity;slot->rootObjectOps=object->ops;slot->rootIdentityKnown=true; }
+        if(!error) { slot->rootIdentity=object->identity;slot->rootObjectOps=object->ops;slot->rootIdentityKnown=true;slot->rootDevice=stat.dev;StrCopy(slot->physicalRoot,"/",sizeof(slot->physicalRoot)); }
         VfsObjectRelease(object);
     }
     if(!error && !isRoot && g_rootMount && g_rootMount->rootIdentityKnown)

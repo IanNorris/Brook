@@ -202,6 +202,15 @@ static int VfsRenamePhysicalLocked(MountBacking* current,MountBacking* renamed,
     if(StrLen(target)+StrLen(suffix)>=capacity)return -36;
     StrCopy(path,target,capacity);StrCopy(path+StrLen(target),suffix,capacity-StrLen(target));return 0;
 }
+static bool VfsRenameMayMoveMountLabelLocked(const MountEntry* mount,MountBacking* backing)
+{
+    auto* ancestor=static_cast<MountEntry*>(mount->covered.attachment);
+    for(uint32_t depth=0;ancestor && depth<VFS_MAX_MOUNT_DEPTH;++depth) {
+        if(ancestor->backing==backing)return true;
+        ancestor=static_cast<MountEntry*>(ancestor->covered.attachment);
+    }
+    return false;
+}
 static int VfsProjectedRenameDirectoryLocked(VfsPath path,MountBacking* backing,
                                               const char* source,const char* target,char* out,uint32_t capacity)
 {
@@ -228,7 +237,11 @@ static int VfsProjectedRenameDirectoryLocked(VfsPath path,MountBacking* backing,
         const uint32_t tail=StrLen(suffix);if(length+tail>=sizeof(suffix))return -36;
         for(uint32_t i=tail+1;i;--i)suffix[length+i-1]=suffix[i-1];
         for(uint32_t i=0;i<length;++i)suffix[i]=relative[i];
-        if(attachment->linked && attachment->covered.object) {path=attachment->covered;continue;}
+        // Anchor at an unaffected attachment label. Reconstructing all the
+        // way through legacy case-insensitive ancestors can change /tmp to
+        // /TMP during an unrelated rename inside a mounted tmpfs.
+        if(attachment->linked && attachment->covered.object &&
+           VfsRenameMayMoveMountLabelLocked(attachment,backing)) {path=attachment->covered;continue;}
         uint32_t prefix=StrLen(attachment->mountPoint);
         if(prefix==1 && attachment->mountPoint[0]=='/')prefix=0;
         uint32_t total=prefix+StrLen(suffix);
@@ -249,18 +262,21 @@ static int VfsPrepareBackingRenameLabelsLocked(MountBacking* backing,const char*
     StrCopy(source+(oldPhysical[0]=='/'?0:1),oldPhysical,sizeof(source)-1);
     StrCopy(target+(newPhysical[0]=='/'?0:1),newPhysical,sizeof(target)-1);
     for(auto& mount:g_mounts) {
-        if(!VfsMountPublished(mount) || !mount.linked || !mount.covered.object)continue;
-        bool relevant=false;auto* ancestor=static_cast<MountEntry*>(mount.covered.attachment);
-        for(uint32_t depth=0;ancestor && depth<VFS_MAX_MOUNT_DEPTH;++depth) {
-            if(ancestor->backing==backing) {relevant=true;break;}
-            ancestor=static_cast<MountEntry*>(ancestor->covered.attachment);
-        }
-        if(!relevant)continue;
-        char projected[512];int error=VfsProjectedRenameDirectoryLocked(mount.covered,backing,source,target,projected,sizeof(projected));
+        if(!VfsMountPublished(mount))continue;
+        // A source rename changes a bind's physical root even when its target
+        // label is unchanged, including when that bind is the namespace root.
+        char physical[512];StrCopy(physical,mount.physicalRoot,sizeof(physical));
+        int error=VfsRenamePhysicalLocked(mount.backing,backing,source,target,physical,sizeof(physical));
         if(error)return error;
-        if(StrEq(projected,mount.mountPoint))continue;
+        char projected[512];StrCopy(projected,mount.mountPoint,sizeof(projected));
+        bool relevant=VfsRenameMayMoveMountLabelLocked(&mount,backing);
+        if(relevant && mount.linked && mount.covered.object) {
+            error=VfsProjectedRenameDirectoryLocked(mount.covered,backing,source,target,projected,sizeof(projected));
+            if(error)return error;
+        }
+        if(StrEq(projected,mount.mountPoint) && StrEq(physical,mount.physicalRoot))continue;
         if(StrLen(projected)>=sizeof(mount.mountPoint))return -36;
-        if((error=labels.Add(&mount,projected,"")))return error;
+        if((error=labels.Add(&mount,projected,"",physical)))return error;
     }
     return 0;
 }

@@ -2,7 +2,7 @@
 // every per-task operation checks the captured incarnation. No Process strong
 // reference is kept (cwd=/proc/self must not create a Process ownership cycle).
 static constexpr uint32_t PROC_PID_EXE=5,PROC_PID_CWD=6,PROC_PID_ROOT=8;
-static_assert(NUM_PID_ENTRIES==9,"Update retained proc PID entry indices when changing the catalog");
+static_assert(NUM_PID_ENTRIES==10,"Update retained proc PID entry indices when changing the catalog");
 enum class ProcObjectKind : uint8_t { Root,Net,Pid,Task,Fds,GlobalFile,NetFile,PidFile,FdLink,Self,ThreadSelf,UserMap,Sys,SysKernel,OverflowId,NsDirectory,NsLink };
 struct ProcObject {
     VfsObject object;
@@ -166,6 +166,36 @@ static int ProcObjectParent(VfsObject* object,VfsObject** out,bool=false)
     *out=nullptr;if(int error=ProcObjectSnapshot(value,&snapshot))return error;
     *out=value->parent?value->parent:object;VfsObjectRetain(*out);return 0;
 }
+// Return 1 for a non-directory descriptor, 0 for a captured directory path.
+// The FD lock protects acquisition of the path's own references. No FD pin or
+// vnode reference is released here: a concurrent close must never make proc's
+// outer VFS callback run final descriptor teardown.
+static int ProcDirectoryFdLink(const ProcObject* value,char* out,uint32_t capacity)
+{
+    auto* live=SchedulerFindProcessReference(value->pid);if(!live)return -2;
+    if(live->incarnation!=value->incarnation || live->tgid!=value->tgid ||
+       (live->isThread?live->leaderIncarnation:live->incarnation)!=value->group) {ProcessUnref(live);return -2;}
+    int error=-2;VfsPath path{};
+    SpinLockAcquire(ProcessFdLock(live));
+    if(live->fds && value->index<MAX_FDS) {
+        const auto& fd=live->fds[value->index];
+        if(fd.type!=FdType::None && !fd.closing) {
+            error=1;FdDiagnosticPath(fd,out,capacity);
+            if((fd.type==FdType::Vnode || fd.type==FdType::Path) && fd.handle) {
+                auto* node=static_cast<Vnode*>(fd.handle);
+                if(node->type==VnodeType::Dir) {
+                    error=-95;
+                    if(node->mountOwner && node->backendObject) {
+                        path={node->mountOwner,node->backendObject};VfsPathRetain(path);error=0;
+                    }
+                }
+            }
+        }
+    }
+    SpinLockRelease(ProcessFdLock(live));ProcessUnref(live);
+    if(!error)error=VfsPathDirectoryPathFromCallback(path,out,capacity);
+    VfsPathRelease(path);return error;
+}
 static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
 {
     auto* value=static_cast<ProcObject*>(object->priv);ProcessSnapshot snapshot{};
@@ -178,8 +208,8 @@ static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
         if(value->kind==ProcObjectKind::ThreadSelf) {end=AppendStr(end,"/task/");end=U64ToDec(end,current->pid);}
         *end=0;
     } else if(value->kind==ProcObjectKind::FdLink) {
-        FdSnapshot fd{};if(!SchedulerGetFdInfo(value->pid,value->index,&fd,value->incarnation))return -2;
-        ProcStrCopy(target,fd.path,sizeof(target));
+        int error=ProcDirectoryFdLink(value,target,sizeof(target));if(error<0)return error;
+
     } else if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_EXE) {
         ProcStrCopy(target,snapshot.exePath,sizeof(target));
     } else if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_CWD) {

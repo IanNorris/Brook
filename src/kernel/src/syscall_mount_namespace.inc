@@ -39,7 +39,7 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
                 ProcessReadIds(process,true).effective,fsOwner,6,&error);
             UserNamespaceRelease(fsOwner);
             if(instance) {
-                error=VfsMountNamespaceMountFresh(lookup.fs.mountNamespace,targetPath,"tmpfs",TmpfsOperations(),instance);
+                error=VfsMountNamespaceMountFresh(lookup.fs.mountNamespace,targetPath,"tmpfs",TmpfsOperations(),instance,0,6);
                 if(error)TmpfsDestroy(instance);
             }
         }

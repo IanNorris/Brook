@@ -12,6 +12,7 @@
 #include <vector>
 #include "process.h"
 #include "process_fs.h"
+#include "mount_info_format.h"
 #include "../../kernel/src/vfs.cpp"
 
 namespace {
@@ -310,6 +311,97 @@ static void testProcessContexts(const brook::VfsPath& root,const brook::VfsPath&
     ProcessFsClear(&parent);ProcessFsClear(&copy);ProcessFsClear(&shared);ProcessFsClear(&privateThread);
     assert(!parent.fsContext && !copy.fsContext && !shared.fsContext && !privateThread.fsContext);
 }
+static std::vector<brook::VfsMountInfo> infoRows(brook::MountNamespace* ns,const brook::VfsPath& root) {
+    brook::VfsMountInfo* rows=nullptr;uint32_t count=0;
+    assert(!brook::VfsMountNamespaceInfo(ns,root,&rows,&count));
+    std::vector<brook::VfsMountInfo> result(rows,rows+count);brook::VfsMountInfoFree(rows);
+    assert(!result.empty()&&result.front().parent==0);
+    for(size_t i=0;i<result.size();++i) {
+        assert(result[i].id && result[i].id<=0x7ffffffe);
+        if(!result[i].parent)continue;
+        bool found=false;for(size_t j=0;j<i;++j)found|=result[j].id==result[i].parent;
+        assert(found);
+    }
+    return result;
+}
+static void testMountInfo(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    auto before=allocations.size();auto records=g_mounts.count;
+    const char* sourceName="info source\t\\\n";const char* targetName="info target\t\\\n";
+    Node sourceNode{&mounts[6],610,true,&mounts[6].root,{},{}},targetNode{&mounts[6],611,true,&mounts[6].root,{},{}};
+    mounts[6].root.children[sourceName]=&sourceNode;mounts[6].root.children[targetName]=&targetNode;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
+    auto source=resolve(root,root,sourceName),target=resolve(root,root,targetName),b=resolve(root,root,"ns-b");
+    assert(!VfsMountNamespaceBind(ns,source,target));auto lower=resolve(root,root,targetName);
+    // Reusing a covered target fd must stack on the existing top attachment.
+    assert(!VfsMountNamespaceBind(ns,b,target));auto top=resolve(root,root,targetName);
+    auto* lowerMount=static_cast<MountEntry*>(lower.attachment);auto* topMount=static_cast<MountEntry*>(top.attachment);
+    assert(topMount->covered.attachment==lowerMount);
+    assert(!VfsRenameAt(root,root,sourceName,root,"info renamed\t\\\n"));
+    auto rows=infoRows(ns,root);bool foundLower=false,foundTop=false;
+    for(const auto& row:rows) {
+        if(row.id==lowerMount->publication) {foundLower=true;assert(!std::strcmp(row.root,"/info renamed\t\\\n"));assert(row.device==7);}
+        if(row.id==topMount->publication) {foundTop=true;assert(row.parent==lowerMount->publication&&!std::strcmp(row.root,"/ns-b"));}
+    }
+    assert(foundLower&&foundTop);
+    std::vector<char> text(rows.size()*2600+1);uint32_t written=0;
+    assert(!FormatMountInfo(rows.data(),rows.size(),text.data(),text.size(),&written)&&written);
+    assert(std::strstr(text.data(),"\\040")&&std::strstr(text.data(),"\\011")&&std::strstr(text.data(),"\\012")&&std::strstr(text.data(),"\\134"));
+    std::printf("MOUNTINFO_FIXTURE_BEGIN\n%sMOUNTINFO_FIXTURE_END\n",text.data());
+    char small[8];assert(FormatMountInfo(rows.data(),rows.size(),small,sizeof(small),&written)==-75&&!written);
+    bool complete=false;
+    for(long failure=0;failure<8;++failure) {
+        auto allocated=allocations.size();VfsMountInfo* failed=nullptr;uint32_t count=99;
+        failAllocation=failure;int error=VfsMountNamespaceInfo(ns,root,&failed,&count);failAllocation=-1;
+        if(!error) {VfsMountInfoFree(failed);complete=true;}else assert(error==-12&&!failed&&!count);
+        assert(allocations.size()==allocated);if(complete)break;
+    }
+    assert(complete);
+    uint64_t saved=topMount->publication;
+    {FileMutationGuard transaction;MountViewGuard view;topMount->publication=0x7fffffffULL;}
+    VfsMountInfo* failed=nullptr;uint32_t count=0;assert(VfsMountNamespaceInfo(ns,root,&failed,&count)==-75&&!failed&&!count);
+    {FileMutationGuard transaction;MountViewGuard view;topMount->publication=saved;}
+    assert(!VfsRenameAt(root,root,"info renamed\t\\\n",root,sourceName));
+    assert(!VfsMountNamespaceDetach(ns,top));assert(!VfsMountNamespaceDetach(ns,lower));
+    Node childNode{&mounts[6],612,true,&sourceNode,{},{}};sourceNode.children["child"]=&childNode;
+    std::atomic<bool> done{false};std::atomic<unsigned> snapshots{0};
+    std::thread observer([&] {
+        while(!done.load(std::memory_order_acquire)) {auto copy=infoRows(ns,root);assert(!copy.empty());++snapshots;}
+    });
+    while(!snapshots.load())std::this_thread::yield();
+    for(unsigned i=0;i<100;++i) {
+        assert(!VfsMountNamespaceBind(ns,source,target));
+        auto parent=resolve(root,root,targetName);
+        auto child=resolve(root,parent,"child");
+        assert(!VfsMountNamespaceBind(ns,b,child));
+        assert(!VfsMountNamespaceDetach(ns,parent));
+        VfsPathRelease(child);VfsPathRelease(parent);
+    }
+    done.store(true,std::memory_order_release);observer.join();
+    Mount fresh{};fresh.alive=true;fresh.identity=1100;fresh.root={&fresh,1,true,&fresh.root,{},{}};
+    Node inside{&fresh,2,true,&fresh.root,{},{}},destination{&fresh,3,true,&fresh.root,{},{}};
+    fresh.root.children={{"src",&inside},{"dst",&destination}};
+    assert(!VfsMountNamespaceMountFresh(ns,target,"fresh",&freshOps,&fresh));
+    auto freshRoot=resolve(root,root,targetName);
+    auto insidePath=resolve(root,freshRoot,"src"),destinationPath=resolve(root,freshRoot,"dst");
+    assert(!VfsMountNamespaceBind(ns,insidePath,destinationPath));
+    // A legacy case-insensitive ancestor can report another spelling of the
+    // same covered identity. An unrelated backing rename must preserve the
+    // published fresh mount's lowercase anchor.
+    mounts[6].root.children["INFO target\t\\\n"]=&targetNode;
+    assert(!VfsRenameAt(root,freshRoot,"src",freshRoot,"renamed"));
+    rows=infoRows(ns,root);bool anchored=false;
+    for(const auto& row:rows)if(!std::strcmp(row.root,"/renamed")) {
+        anchored=true;assert(std::string(row.mountPoint)==std::string("/")+targetName+"/dst");
+    }
+    assert(anchored);mounts[6].root.children.erase("INFO target\t\\\n");
+    VfsPathRelease(insidePath);VfsPathRelease(destinationPath);
+    assert(!VfsMountNamespaceDetach(ns,freshRoot));VfsPathRelease(freshRoot);
+    VfsPathRelease(top);VfsPathRelease(lower);VfsPathRelease(source);VfsPathRelease(target);VfsPathRelease(b);
+    VfsMountNamespaceLeave(ns);VfsDrainMountCleanup();VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
+    mounts[6].root.children.erase(sourceName);mounts[6].root.children.erase(targetName);
+    assert(allocations.size()==before&&g_mounts.count==records);
+}
 static void testPivotRoots(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
     using namespace brook;
     auto allocated=allocations.size();auto records=g_mounts.count;
@@ -342,6 +434,11 @@ static void testPivotRoots(brook::MountNamespace* initial,const brook::VfsPath& 
     auto marker=resolve(newRoot,newRoot,"/value");VnodeStat stat{};assert(!VfsPathStat(marker,&stat)&&stat.ino==101);VfsPathRelease(marker);
     marker=resolve(newRoot,newRoot,"/sub/ns-target/value");assert(!VfsPathStat(marker,&stat)&&stat.ino==301);VfsPathRelease(marker);
     char label[64];assert(!VfsPathDirectoryPath(root,label,sizeof(label))&&!std::strcmp(label,"/sub"));
+    // A pivoted root with no covered path still needs physical-root cache
+    // updates when another retained view renames its backing directory.
+    assert(!VfsRenameAt(stableRoot,stableRoot,"ns-a",stableRoot,"info-root-renamed"));
+    auto rootRows=infoRows(ns,newRoot);assert(!std::strcmp(rootRows.front().root,"/info-root-renamed")&&!std::strcmp(rootRows.front().mountPoint,"/"));
+    assert(!VfsRenameAt(stableRoot,stableRoot,"info-root-renamed",stableRoot,"ns-a"));
     // Retained fchdir is intentional and is never epoch-translated.
     assert(!FsContextSetCwd(exact,root));assert(!FsContextSnapshot(exact,&snap));assert(VfsPathSame(snap.cwd,root)&&VfsPathSame(snap.root,newRoot));FsSnapshotRelease(&snap);
     assert(!FsContextSetCwd(exact,newRoot));
@@ -696,6 +793,7 @@ int main(){
     testFreshMounts(initial,stableRoot,originalTarget,aPath);
     testRecursiveBinds(initial,stableRoot);
     testPivotRoots(initial,stableRoot);
+    testMountInfo(initial,stableRoot);
     MountNamespace* parentNs=nullptr;VfsPath parentRoot{},parentCwd{};
     assert(!VfsMountNamespaceCopy(initial,stableRoot,originalSynthetic,&parentNs,&parentRoot,&parentCwd));
     assert(VfsMountNamespaceBind(parentNs,aPath,parentCwd)==-3);

@@ -75,6 +75,18 @@ struct FdEntry
     char     dirPath[64];  // Bounded diagnostic label only; directory resolution uses retained vnode
 };
 
+// Scalar reporting only; the caller protects the descriptor against reuse.
+inline void FdDiagnosticPath(const FdEntry& fd,char* out,uint32_t capacity)
+{
+    if(!out || !capacity)return;
+    static const char* names[]={"none","file","fb","kbd","pipe","/dev/null","/dev/urandom",
+        "mem","socket","tty","eventfd","dsp","epoll","timerfd","memfd","unix","klog"};
+    const auto type=static_cast<uint8_t>(fd.type);
+    const char* text=fd.dirPath[0]?fd.dirPath:(type<sizeof(names)/sizeof(names[0])?names[type]:"?");
+    const uint32_t limit=fd.dirPath[0]?sizeof(fd.dirPath)-1:capacity-1;
+    uint32_t i=0;for(;i+1<capacity && i<limit && text[i];++i)out[i]=text[i];out[i]=0;
+}
+
 // Outcome of an FdTableClose: either the slot was claimed-and-cleared right now
 // (caller must finalize *out immediately), or its teardown was deferred to the
 // last in-flight FdTableUnpin, or the fd was already unused/closing.

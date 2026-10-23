@@ -1,12 +1,7 @@
-Latest container checkpoint: [private root relocation](pivot-root-checkpoint.md)
-passes Linux/native two-pivot and child-execution probes. Unchanged bubblewrap
-advances to `Can't open /proc/self/mountinfo`; its child has not run, and SteamRT
-acceptance remains outstanding.
-
-Latest container checkpoint: [recursive bind](recursive-bind-checkpoint.md)
-passes Linux/native probes and advances unchanged bubblewrap through tmpfs and
-its newroot self-bind to `pivot_root: Function not implemented`. The child has
-not run; SteamRT/login acceptance remains outstanding.
+Latest container checkpoint: [mount graph and directory FD reporting](mountinfo-checkpoint.md)
+passes Linux/native probes. Unchanged bubblewrap gets past mountinfo and
+retained directory reporting, then requires bind remount restrictions.
+Its child has not run; SteamRT acceptance remains outstanding.
 
 # Native Steam client checkpoint
 

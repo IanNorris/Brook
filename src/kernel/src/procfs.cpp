@@ -1,6 +1,7 @@
 #include "process_user_namespace.h"
 #include "process_fs.h"
 #include "mount_namespace.h"
+#include "mount_info_format.h"
 #include "spinlock.h"
 #include "vfs_object.h"
 #include "apic.h"
@@ -794,6 +795,28 @@ static Vnode* GenPidRoot(const ProcessSnapshot& proc)
     return MakeProcVnode(buffer,length+1);
 }
 
+// Per-task mount graph reporting uses the same restricted target policy as
+// retained proc-root handles. No backend callbacks or nested VFS transaction.
+static Vnode* GenPidMountInfo(const ProcessSnapshot& proc)
+{
+    VfsMountInfo* rows=nullptr;uint32_t count=0;int error=-11;
+    for(unsigned attempt=0;attempt<4 && error==-11;++attempt) {
+        FsSnapshot fs{};error=ProcAcquireFsTarget(proc.pid,proc.incarnation,proc.tgid,proc.groupIncarnation,&fs);
+        if(!error)error=VfsMountNamespaceInfo(fs.mountNamespace,fs.root,&rows,&count);
+        FsSnapshotRelease(&fs);
+    }
+    if(error)return nullptr;
+    // Four-byte escaping is worst case for every cached path and type field.
+    constexpr uint32_t PerRow=4*(512+64+2*16)+128;
+    if(count>(~uint32_t{0}-1)/PerRow) {VfsMountInfoFree(rows);return nullptr;}
+    uint32_t capacity=count*PerRow+1;
+    auto* buffer=static_cast<char*>(kmalloc(capacity));
+    if(!buffer) {VfsMountInfoFree(rows);return nullptr;}
+    uint32_t bytes=0;error=FormatMountInfo(rows,count,buffer,capacity,&bytes);VfsMountInfoFree(rows);
+    if(error) {kfree(buffer);return nullptr;}
+    return MakeProcVnode(buffer,bytes);
+}
+
 // /proc/[pid]/limits — resource limits (Linux-compatible format)
 static Vnode* GenPidLimits(const ProcessSnapshot& /*proc*/)
 {
@@ -1303,6 +1326,7 @@ static ProcPidEntry g_pidEntries[] = {
     { "cwd",     GenPidCwd },
     { "limits",  GenPidLimits },
     { "root",    GenPidRoot },
+    { "mountinfo", GenPidMountInfo },
 };
 static constexpr uint32_t NUM_PID_ENTRIES = sizeof(g_pidEntries) / sizeof(g_pidEntries[0]);
 

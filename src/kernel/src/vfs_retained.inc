@@ -386,6 +386,12 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
     if(flags&VFS_O_TRUNC) { if(!(openFlags&VFS_O_WRITE))openFlags|=VFS_O_READWRITE;openFlags|=VFS_O_WRITE; }
     Vnode* node=path.object->ops->open(path.object,openFlags,error);
     if(!node) { if(!*error)*error=-5;return nullptr; }
+    // Retained directory descriptors expose this exact identity to proc
+    // reporting. Acquiring it under an FD lock must need no backend callback
+    // and must not pin a vnode whose final close could run inside proc lookup.
+    if(node->type==VnodeType::Dir && !node->backendObject) {
+        node->backendObject=path.object;VfsObjectRetain(path.object);
+    }
     // Ownership transfer occurs while the borrowed path still pins backing.
     VfsAttachMount(node,static_cast<MountEntry*>(path.attachment));
     if(flags&VFS_O_TRUNC) {
