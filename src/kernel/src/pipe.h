@@ -100,7 +100,7 @@ struct PipeBuffer
     }
 
     // Non-blocking write. Returns bytes written (may be partial).
-    uint32_t write(const char* src, uint32_t len)
+    uint32_t write(const char* src, uint32_t len, bool atomicRecord=false)
     {
         SpinLockAcquire(&lock);
 
@@ -111,6 +111,7 @@ struct PipeBuffer
         }
 
         uint32_t avail = capacity - 1 - ((head - tail + capacity) % capacity);
+        if(atomicRecord && len>avail) {SpinLockRelease(&lock);return 0;}
         if (len > avail) len = avail;
 
         // Copy in up to two contiguous chunks (ring buffer wrap)

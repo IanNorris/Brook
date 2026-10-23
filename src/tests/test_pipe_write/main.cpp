@@ -1,6 +1,7 @@
 // Execute the actual sys_write pipe branch. Real pipe storage/locking;
 // only task blocking, signals and notifications are instrumented.
 #include <cerrno>
+#include <cstdlib>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -9,12 +10,18 @@
 #include "../../kernel/src/pipe.h"
 
 namespace brook {
-void PipePollNotify(PipeBuffer*, uint32_t) {}
+
 enum class FdType { Pipe, Other };
 struct FdEntry { FdType type=FdType::Pipe; void *handle=nullptr; uint64_t seekPos=0; unsigned flags=1, statusFlags=1; };
 struct Process { uint64_t wakeupTick=0; SpinLock fdLock{}; };
 static Process current;
-static unsigned blocks, signals, wakes, notifications;
+static unsigned blocks, signals, wakes, notifications, processHolds;
+static unsigned allocationHolds;
+extern "C" void* kmalloc(uint64_t size) {void* p=std::malloc(size);if(p)++allocationHolds;return p;}
+extern "C" void kfree(void* p) {if(p){if(!allocationHolds)throw std::runtime_error("bad allocation hold");--allocationHolds;std::free(p);}}
+static void ProcessRef(Process*) {++processHolds;}
+static void ProcessUnref(Process*) {if(!processHolds)throw std::runtime_error("bad process hold");--processHolds;;}
+struct KernelOperationGuard {explicit KernelOperationGuard(Process*) {}};
 static bool pending;
 static std::function<void()> onBlock;
 static Process *ProcessCurrent() { return &current; }
@@ -30,6 +37,7 @@ static void SchedulerBlock(Process *) {
     if (!onBlock) throw UnexpectedBlock{};
     onBlock();
 }
+#include "../../kernel/src/pipe_poll.inc"
 static int64_t writePipe(FdEntry *fde, const char *data, uint64_t count) {
     [[maybe_unused]] Process *proc = &current;
     uint64_t bufAddr = reinterpret_cast<uint64_t>(data);
@@ -108,6 +116,18 @@ int main() {
     };
     CHECK(writePipe(&fd,samples,1)==1 && blocks==1 && wakes==1);
     CHECK(pipe.count()==63 && pipe.fullWriteWaits==1 && !pipe.writerWaiter);
+    // Named FIFO records up to PIPE_BUF are all-or-nothing under pressure.
+    reset(true);fd.flags=1|0x10;CHECK(pipe.write(samples,61)==61);
+    CHECK(writePipe(&fd,samples,3)==-EAGAIN && pipe.count()==61 && !blocks);
+    reset(false);fd.flags=1|0x10;CHECK(pipe.write(samples,61)==61);
+    onBlock=[&] {char byte;CHECK(pipe.read(&byte,1)==1);};
+    CHECK(writePipe(&fd,samples,3)==3 && blocks==1 && pipe.count()==63);
+    reset(false);fd.flags=1|0x10;CHECK(pipe.write(samples,63)==63);
+    onBlock=[&] {pending=true;};
+    CHECK(writePipe(&fd,samples,1)==-EINTR && !pipe.pollWaiters && !processHolds && !pipe.writerWaiter);
+    // Surviving readers can drain and close without a stale writer registration.
+    char byte;CHECK(pipe.read(&byte,1)==1 && !processHolds);
+    CHECK(!allocationHolds && !processHolds);
     std::printf("PIPE_WRITE_ACTUAL_BODY %s failures=%u\n",failures?"FAIL":"PASS",failures);
     return failures?1:0;
 }

@@ -6,6 +6,7 @@
         auto* pipe = (fde->flags == 2)
             ? reinterpret_cast<PipeBuffer*>(fde->seekPos)
             : static_cast<PipeBuffer*>(fde->handle);
+        KernelOperationGuard operation(proc);
         const char* src = reinterpret_cast<const char*>(bufAddr);
         uint64_t written = 0;
 
@@ -22,17 +23,16 @@
             }
 
             uint32_t chunk = pipe->write(src + written,
-                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written),
+                (fde->flags&0x10) && count<=4096);
             written += chunk;
             if (written > 0)
             {
                 // Wake blocked reader
-                Process* reader = pipe->readerWaiter;
-                if (reader)
-                {
-                    pipe->readerWaiter = nullptr;
-                    WakeProcess(reader);
-                }
+                SpinLockAcquire(&pipe->lock);
+                Process* reader=pipe->readerWaiter;pipe->readerWaiter=nullptr;
+                if(reader)WakeProcess(reader);
+                SpinLockRelease(&pipe->lock);
                 PipeWakeEpoll(pipe);
                 break;  // Return partial writes immediately
             }
@@ -44,21 +44,20 @@
             if (nonblock) return -EAGAIN;
             // Buffer full — block until reader drains some
             Process* self = ProcessCurrent();
-            pipe->writerWaiter = self;
+            PipePollGroup writerWaiters;
+            if(!writerWaiters.add(pipe,self,4|8))return -ENOMEM;
             // Re-check after registering waiter to close the race where
             // a reader drained space between our write() and waiter set.
             chunk = pipe->write(src + written,
-                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written));
+                static_cast<uint32_t>(count - written > 4096 ? 4096 : count - written),
+                (fde->flags&0x10) && count<=4096);
             if (chunk > 0)
             {
-                pipe->writerWaiter = nullptr;
                 written += chunk;
-                Process* reader = pipe->readerWaiter;
-                if (reader)
-                {
-                    pipe->readerWaiter = nullptr;
-                    WakeProcess(reader);
-                }
+                SpinLockAcquire(&pipe->lock);
+                Process* reader=pipe->readerWaiter;pipe->readerWaiter=nullptr;
+                if(reader)WakeProcess(reader);
+                SpinLockRelease(&pipe->lock);
                 PipeWakeEpoll(pipe);
                 break;
             }

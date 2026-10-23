@@ -741,7 +741,8 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
                 KMutexUnlock(&g_fatLock);
                 return nullptr;
             }
-            vn->directoryPath = nullptr;
+            vn->streamPipe=nullptr;vn->streamOwner=nullptr;vn->streamRelease=nullptr;
+        vn->directoryPath = nullptr;
             vn->mountOwner = nullptr;
             vn->backendObject = nullptr;
             vn->ops = &g_cachedFileOps; vn->type = VnodeType::File;
@@ -802,7 +803,8 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
                 __atomic_store_n(&placeholder->loading, false, __ATOMIC_RELEASE);
                 cf->data = nullptr;
                 kfree(cf);
-                vn->directoryPath = nullptr;
+                vn->streamPipe=nullptr;vn->streamOwner=nullptr;vn->streamRelease=nullptr;
+        vn->directoryPath = nullptr;
                 vn->mountOwner = nullptr;
                 vn->backendObject = nullptr;
                 vn->ops = &g_cachedFileOps; vn->type = VnodeType::File;
@@ -820,7 +822,8 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
                 KMutexLock(&g_fatLock);
                 FileCacheInsert(cf);
                 KMutexUnlock(&g_fatLock);
-                vn->directoryPath = nullptr;
+                vn->streamPipe=nullptr;vn->streamOwner=nullptr;vn->streamRelease=nullptr;
+        vn->directoryPath = nullptr;
                 vn->mountOwner = nullptr;
                 vn->backendObject = nullptr;
                 vn->ops = &g_cachedFileOps; vn->type = VnodeType::File;
@@ -831,6 +834,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
             KMutexUnlock(&g_fatLock);
         }
 
+        vn->streamPipe=nullptr;vn->streamOwner=nullptr;vn->streamRelease=nullptr;
         vn->directoryPath = nullptr;
         vn->mountOwner = nullptr;
         vn->backendObject = nullptr;
@@ -869,6 +873,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
             kfree(dir);
             return nullptr;
         }
+        vn->streamPipe=nullptr;vn->streamOwner=nullptr;vn->streamRelease=nullptr;
         vn->directoryPath = nullptr;
         vn->mountOwner = nullptr;
         vn->backendObject = identity;

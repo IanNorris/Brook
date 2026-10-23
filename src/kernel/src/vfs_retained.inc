@@ -14,6 +14,12 @@ bool VfsPathSame(const VfsPath& a,const VfsPath& b)
     return a.attachment==b.attachment && a.object && b.object &&
            a.object->identity==b.object->identity && a.object->ops==b.object->ops;
 }
+bool VfsPathSameObject(const VfsPath& a,const VfsPath& b)
+{
+    return a.object && b.object && a.attachment && b.attachment &&
+        static_cast<MountEntry*>(a.attachment)->backing==static_cast<MountEntry*>(b.attachment)->backing &&
+        a.object->ops==b.object->ops && a.object->identity==b.object->identity;
+}
 static void VfsPathHoldMount(MountEntry* mount)
 {
     VfsMountHold(mount);
@@ -457,7 +463,7 @@ int VfsPathAccess(const VfsPath& path,uint8_t required,bool realIds)
     if((required&2) && VfsReadOnly(static_cast<MountEntry*>(path.attachment))) {
         VnodeStat stat{};int error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         if(error)return error;
-        if((stat.mode&0170000)!=0140000)return -30;
+        if((stat.mode&0170000)!=0140000 && (stat.mode&0170000)!=0010000)return -30;
     }
     return path.object->ops->access?path.object->ops->access(path.object,required,realIds):-95;
 }
@@ -473,14 +479,24 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
     }
     if(!path.object->ops->open) { *error=-95;return nullptr; }
     auto* mount=static_cast<MountEntry*>(path.attachment);
-    if(VfsReadOnly(mount) && (flags&(VFS_O_WRITE|VFS_O_TRUNC))) { *error=-30;return nullptr; }
+    bool fifo=false;
+    if((flags&VFS_O_TRUNC) || (VfsReadOnly(mount) && (flags&VFS_O_WRITE))) {
+        VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
+        if(*error)return nullptr;
+        fifo=(stat.mode&0170000)==0010000;
+    }
+    if(VfsReadOnly(mount) && (flags&(VFS_O_WRITE|VFS_O_TRUNC))) {
+        VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
+        if(*error)return nullptr;
+        if((stat.mode&0170000)!=0010000) { *error=-30;return nullptr; }
+    }
     if((mount->attributes&4) && !(flags&VFS_O_METADATA)) {
         VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         if(*error)return nullptr;
         if(VfsNodevDenied(mount,stat,flags)) {*error=-13;return nullptr;}
     }
     int openFlags=flags&~VFS_O_TRUNC;
-    if(flags&VFS_O_TRUNC) { if(!(openFlags&VFS_O_WRITE))openFlags|=VFS_O_READWRITE;openFlags|=VFS_O_WRITE; }
+    if((flags&VFS_O_TRUNC) && !fifo) { if(!(openFlags&VFS_O_WRITE))openFlags|=VFS_O_READWRITE;openFlags|=VFS_O_WRITE; }
     Vnode* node=path.object->ops->open(path.object,openFlags,error);
     if(!node) { if(!*error)*error=-5;return nullptr; }
     // Every retained descriptor exposes this exact identity to proc reporting,
@@ -491,7 +507,7 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
     }
     // Ownership transfer occurs while the borrowed path still pins backing.
     VfsAttachMount(node,static_cast<MountEntry*>(path.attachment),flags);
-    if(flags&VFS_O_TRUNC) {
+    if((flags&VFS_O_TRUNC) && !fifo) {
         *error=VfsTruncateLocked(node,0);
         if(*error) { VfsClose(node);return nullptr; }
     }

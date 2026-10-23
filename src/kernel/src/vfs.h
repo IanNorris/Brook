@@ -16,6 +16,7 @@ namespace brook {
 enum class VnodeType : uint8_t { File, Dir, Device, Namespace };
 
 struct Vnode;
+struct PipeBuffer;
 struct FileObject;
 struct DirEntry;
 struct VnodeStat;
@@ -90,6 +91,10 @@ struct Vnode {
     // Set by VFS admission; metadata-only and directory handles do not hold
     // data writeback capability. Requires module ABI 44.
     bool            mountDataHold = false;
+    // Named stream state belongs to this open description, not each fd alias.
+    PipeBuffer*     streamPipe = nullptr;
+    void*           streamOwner = nullptr;
+    void (*streamRelease)(Vnode*) = nullptr;
 };
 
 // Caller must already own a live vnode reference. The returned name is for

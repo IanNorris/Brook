@@ -1,4 +1,7 @@
-# Steam's next gate: named FIFO support
+# Steam's named FIFO implementation plan (completed subset)
+
+Status: the implemented and validated subset is described in
+[the FIFO checkpoint](steam-fifo-checkpoint.md). The original plan follows.
 
 The 23 October urandom candidate reaches the native64 Steam client inside
 pressure-vessel. It no longer asserts opening `/dev/urandom`. It next asserts

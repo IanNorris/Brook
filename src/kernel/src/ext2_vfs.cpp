@@ -88,6 +88,7 @@ static constexpr uint16_t EXT2_S_IFMT   = 0xF000;
 static constexpr uint16_t EXT2_S_IFREG  = 0x8000;
 static constexpr uint16_t EXT2_S_IFDIR  = 0x4000;
 static constexpr uint16_t EXT2_S_IFLNK  = 0xA000;
+static constexpr uint16_t EXT2_S_IFIFO = 0010000;
 static constexpr uint16_t EXT2_S_IFSOCK = 0xC000;
 
 struct Ext2BlockGroupDesc {
@@ -3002,6 +3003,7 @@ static Vnode* Ext2VnodeFromHold(Ext2Mount* mnt,uint32_t ino,
 
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) { kfree(dp); Ext2ReleaseInode(hold); return nullptr; }
+        vn->streamPipe=nullptr;vn->streamOwner=nullptr;vn->streamRelease=nullptr;
         vn->directoryPath = nullptr;
         vn->mountOwner = nullptr;
         vn->backendObject = nullptr;
@@ -3013,7 +3015,7 @@ static Vnode* Ext2VnodeFromHold(Ext2Mount* mnt,uint32_t ino,
         return vn;
     }
 
-    if (mode == EXT2_S_IFREG || mode == EXT2_S_IFSOCK || mode == EXT2_S_IFLNK) {
+    if (mode == EXT2_S_IFREG || mode == EXT2_S_IFSOCK || mode == EXT2_S_IFIFO || mode == EXT2_S_IFLNK) {
         auto* fp = static_cast<Ext2FilePriv*>(kmalloc(sizeof(Ext2FilePriv)));
         if (!fp) { Ext2ReleaseInode(hold); return nullptr; }
         fp->mnt = mnt;
@@ -3023,11 +3025,12 @@ static Vnode* Ext2VnodeFromHold(Ext2Mount* mnt,uint32_t ino,
 
         auto* vn = static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
         if (!vn) { kfree(fp); Ext2ReleaseInode(hold); return nullptr; }
+        vn->streamPipe=nullptr;vn->streamOwner=nullptr;vn->streamRelease=nullptr;
         vn->directoryPath = nullptr;
         vn->mountOwner = nullptr;
         vn->backendObject = nullptr;
         vn->ops = mode == EXT2_S_IFREG ? &g_ext2FileOps : &g_ext2SocketOps;
-        vn->type = VnodeType::File;
+        vn->type = mode==EXT2_S_IFIFO ? VnodeType::Device : VnodeType::File;
         vn->priv = fp;
         vn->refCount = 1;
         // Every ext2 mount is currently writable, including /nix. The global
@@ -3385,7 +3388,7 @@ static int Ext2FsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
 }
 
 static Vnode* Ext2FsCreateSocketAt(void* mountPriv,uint8_t pdrv,const char* path,
-                                  uint16_t mode,int* error,uint32_t startInode,uint16_t mask)
+                                  uint16_t mode,int* error,uint32_t startInode,uint16_t mask,uint16_t type=EXT2_S_IFSOCK)
 {
     (void)pdrv;
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
@@ -3422,18 +3425,18 @@ static Vnode* Ext2FsCreateSocketAt(void* mountPriv,uint8_t pdrv,const char* path
     if (!hold) return fail(-12);
     Ext2Inode data{};
     Process* current = ProcessCurrent();
-    data.i_mode = EXT2_S_IFSOCK | (mode & 0777 & ~mask);
+    data.i_mode = type | (mode & 07777 & ~mask);
     Ext2SetUid(data, current ? current->euid : 0);
     Ext2SetGid(data, (directory.i_mode & 02000) ? Ext2Gid(directory) :
                       (current ? current->egid : 0));
     data.i_links_count = 1;
     Ext2Touch(&data, true);
     if (!Ext2WriteInode(mnt, ino, &data)) return fail(-5);
-    if (!Ext2DirAdd(mnt, parent, &directory, ino, name, 6 /* EXT2_FT_SOCK */, &published))
+    if (!Ext2DirAdd(mnt, parent, &directory, ino, name, type==EXT2_S_IFIFO?5:6 /* FIFO/SOCK */, &published))
         return fail(-5); // An uncertain published entry retains its allocated inode.
     *fp = {mnt, ino, data, hold};
     vn->ops = &g_ext2SocketOps;
-    vn->type = VnodeType::File;
+    vn->type = type==EXT2_S_IFIFO ? VnodeType::Device : VnodeType::File;
     vn->priv = fp;
     vn->refCount = 1;
     vn->cacheId = 0;
@@ -4109,11 +4112,11 @@ static Vnode* Ext2ObjectOpen(VfsObject* object,int flags,int* error)
     if(!Ext2ReadInode(source->mnt,source->inode,&data))*error=-5;
     else {
         uint16_t type=data.i_mode&EXT2_S_IFMT;
-        if(type!=EXT2_S_IFDIR && type!=EXT2_S_IFREG && type!=EXT2_S_IFSOCK &&
+        if(type!=EXT2_S_IFDIR && type!=EXT2_S_IFREG && type!=EXT2_S_IFSOCK && type!=EXT2_S_IFIFO &&
            type!=EXT2_S_IFLNK)*error=-95;
         else if(type==EXT2_S_IFLNK && !(flags&VFS_O_METADATA))*error=-40;
         else if(type==EXT2_S_IFDIR && (flags&VFS_O_WRITE))*error=-21;
-        else if(type!=EXT2_S_IFDIR && type!=EXT2_S_IFREG &&
+        else if(type!=EXT2_S_IFDIR && type!=EXT2_S_IFREG && type!=EXT2_S_IFIFO &&
                 !(flags&VFS_O_METADATA))*error=-6;
         if(!*error && !(flags&VFS_O_METADATA)) {
             uint8_t required=(flags&VFS_O_EXEC)?1:((flags&VFS_O_WRITE)?2:4);
@@ -4180,6 +4183,12 @@ static Vnode* Ext2ObjectSocket(VfsObject* parent,const char* name,uint16_t mode,
     if(*error)return nullptr;
     auto* hold=static_cast<Ext2OpenInode*>(parent->priv);
     return Ext2FsCreateSocketAt(hold->mnt,0,name,mode,error,hold->inode,0);
+}static Vnode* Ext2ObjectFifo(VfsObject* parent,const char* name,uint16_t mode,int* error)
+{
+    int localError=0;if(!error)error=&localError;*error=Ext2ObjectParentLeaf(parent,name);
+    if(*error)return nullptr;
+    auto* hold=static_cast<Ext2OpenInode*>(parent->priv);
+    return Ext2FsCreateSocketAt(hold->mnt,0,name,mode,error,hold->inode,0,EXT2_S_IFIFO);
 }
 static int Ext2ObjectTimes(VfsObject* object,const VnodeTime* times)
 {
@@ -4212,7 +4221,7 @@ static const VfsObjectOps g_ext2ObjectOps={
     Ext2ObjectParent,Ext2ObjectReadlink,Ext2ObjectOpen,
     Ext2ObjectCreate,Ext2ObjectMkdir,Ext2ObjectRemove,Ext2ObjectRename,
     Ext2ObjectSymlink,Ext2ObjectSocket,Ext2ObjectTimes,Ext2ObjectChmod,
-    Ext2ObjectChown,Ext2ObjectDirectoryPath,
+    Ext2ObjectChown,Ext2ObjectDirectoryPath,nullptr,nullptr,Ext2ObjectFifo,
 };
 static const VfsObjectOps* Ext2ObjectOperations(){return &g_ext2ObjectOps;}
 

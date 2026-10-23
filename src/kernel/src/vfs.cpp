@@ -309,6 +309,7 @@ static int VfsBackingDropLocked(MountBacking* backing,bool deferFailure=false)
 // Final close drops the hold only after the backend has finished using it.
 static void VfsAttachMount(Vnode* vnode, MountEntry* mount,int flags)
 {
+    vnode->streamPipe=nullptr;vnode->streamOwner=nullptr;vnode->streamRelease=nullptr;
     VfsMountHold(mount);vnode->mountOwner=mount;
     vnode->mountDataHold=vnode->type!=VnodeType::Dir && !(flags&VFS_O_METADATA);
     if(vnode->mountDataHold && __atomic_fetch_add(&mount->nonDirectoryHolds,uint64_t{1},__ATOMIC_ACQ_REL)==~uint64_t{0})__builtin_trap();
@@ -766,7 +767,7 @@ int VfsAccess(Vnode* vn,uint8_t required,bool realIds)
     if((required&2) && VfsMountReadOnly(vn)) {
         VnodeStat stat{};if(int error=VfsStat(vn,&stat))return error;
         // Connecting sends data to the listener, without modifying its inode.
-        if((stat.mode&0170000)!=0140000)return -30;
+        if((stat.mode&0170000)!=0140000 && (stat.mode&0170000)!=0010000)return -30;
     }
     if (vn->ops && vn->ops->access) return vn->ops->access(vn,required,realIds);
     return required ? -95 : 0;
@@ -1394,6 +1395,7 @@ void VfsClose(Vnode* vn)
     auto* mount=static_cast<MountEntry*>(vn->mountOwner);
     const bool dataHold=mount && vn->mountDataHold;
     VfsObject* object=vn->backendObject;
+    if(vn->streamRelease)vn->streamRelease(vn);
     if (vn->ops && vn->ops->close) vn->ops->close(vn);
     kfree(vn->directoryPath);
     kfree(vn);

@@ -69,7 +69,8 @@ namespace brook {
 // ABI 44 adds per-vnode mount data admission for read-only transitions.
 // ABI 45 appends exact retained-entry path reporting to VfsObjectOps.
 // ABI 46 widens public mount snapshot paths to the existing 512-byte VFS bound.
-static constexpr uint32_t MODULE_ABI_VERSION = 46;
+// ABI 47 adds FIFO creation and vnode-owned stream state.
+static constexpr uint32_t MODULE_ABI_VERSION = 47;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

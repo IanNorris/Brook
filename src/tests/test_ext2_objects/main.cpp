@@ -435,6 +435,16 @@ int main(int argc,char** argv){
     assert(!VfsMountNamespaceDetach(initialNs,heldBound));VfsPathRelease(heldBound);VfsDrainMountCleanup();
     VfsMountNamespaceRelease(initialNs);
     assert(!VfsRemoveAt(fsRoot,fsRoot,"namespace-bind",true));
+    {
+        auto* fifo=VfsCreateFifoAt(fsRoot,cwd,"host-fifo",0640,0020,&error);assert(fifo && !error);
+        VnodeStat stat{};assert(!VfsStat(fifo,&stat) && (stat.mode&0177777)==0010640 && fifo->type==VnodeType::Device);
+        assert(!VfsCreateFifoAt(fsRoot,cwd,"host-fifo",0600,0,&error) && error==-17);
+        auto* again=VfsOpenAt(fsRoot,cwd,"host-fifo",VFS_O_WRITE|VFS_O_READWRITE,0,0,&error);assert(again && !error);
+        VfsPath a{},b{};assert(!VfsPathFromVnode(fifo,&a) && !VfsPathFromVnode(again,&b));assert(VfsPathSameObject(a,b));
+        assert(!VfsRenameAt(fsRoot,cwd,"host-fifo",cwd,"host-fifo-moved"));
+        assert(!VfsRemoveAt(fsRoot,cwd,"host-fifo-moved",false));assert(!VfsStat(again,&stat) && !stat.nlink);
+        VfsPathRelease(a);VfsPathRelease(b);VfsClose(fifo);VfsClose(again);VfsDrainMountCleanup();
+    }
     Vnode* exact=VfsOpenAt(fsRoot,cwd,"value",VFS_O_READ,0,0,&error);assert(exact&&!error);
     VfsPathRelease(value);VfsPathRelease(cwd);VfsPathRelease(fsRoot);assert(!VfsUnmount("/"));
     VfsClose(exact);assert(VfsUnmount("/"));assert(!g_ext2OpenInodes && allocations.empty() && frames.empty());

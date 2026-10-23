@@ -48,6 +48,7 @@ struct VfsObjectOps {
     // Reporting only, for an exact retained entry of any type. Unsupported
     // backends must fail rather than substitute a diagnostic/opening label.
     int (*object_path)(VfsObject*,char* out,uint32_t capacity) = nullptr;
+    Vnode* (*create_fifo)(VfsObject* parent,const char* name,uint16_t mode,int* error) = nullptr;
 };
 struct VfsObject {
     const VfsObjectOps* ops;

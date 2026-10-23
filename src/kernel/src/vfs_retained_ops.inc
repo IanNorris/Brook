@@ -125,7 +125,7 @@ int VfsAccessAt(const VfsPath& root,const VfsPath& start,const char* text,uint8_
     auto* object=walk.value.object.object;
     if((required&2) && VfsReadOnly(static_cast<MountEntry*>(walk.value.object.attachment))) {
         VnodeStat stat{};if(int error=VfsObjectStatLocked(object,&stat))return error;
-        if((stat.mode&0170000)!=0140000)return -30;
+        if((stat.mode&0170000)!=0140000 && (stat.mode&0170000)!=0010000)return -30;
     }
     return object->ops->access?object->ops->access(object,required,realIds):-95;
 }
@@ -182,6 +182,20 @@ int VfsSymlinkAt(const VfsPath& root,const VfsPath& start,const char* targetText
     if(target.value)return -17;
     if(walk.value.trailing)return -2;
     return parent.object->ops->symlink?parent.object->ops->symlink(parent.object,targetText,leaf):-95;
+}
+Vnode* VfsCreateFifoAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode,uint16_t mask,int* error)
+{
+    int local=0;if(!error)error=&local;*error=0;
+    FileMutationGuard mutation;VfsOwnedWalk walk;
+    *error=VfsWalkAtLocked(root,start,text,walk,{false,true,true});if(*error)return nullptr;
+    auto& parent=walk.value.parent;const char* leaf=walk.value.leaf;
+    VfsOwnedObject target;*error=VfsMutationTargetLocked(parent,leaf,target);if(*error)return nullptr;
+    if(target.value) { *error=-17;return nullptr; }
+    if(walk.value.trailing) { *error=-2;return nullptr; }
+    if(!parent.object->ops->create_fifo) { *error=-95;return nullptr; }
+    Vnode* node=parent.object->ops->create_fifo(parent.object,leaf,mode&07777&~(mask&0777),error);
+    if(!node) { if(!*error)*error=-5;return nullptr; }
+    VfsAttachMount(node,static_cast<MountEntry*>(parent.attachment),0);return node;
 }
 Vnode* VfsCreateSocketAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode,uint16_t mask,int* error)
 {
@@ -339,7 +353,7 @@ int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
     if(VfsMappedMutationBusy(oldStat) || (target.value && VfsMappedMutationBusy(newStat)))return -16;
     auto* ops=oldParent.object->ops;if(!ops->rename || ops!=newParent.object->ops)return -95;
     VfsRenameLabels labels;
-    if(!same && (oldStat.isDir || (oldStat.mode&0170000)==0100000 || (oldStat.mode&0170000)==0140000))if(int error=VfsPrepareRenameLabelsLocked(oldParent,oldName,newParent,newName,labels,oldStat.isDir?0:oldStat.ino))return error;
+    if(!same && (oldStat.isDir || (oldStat.mode&0170000)==0100000 || (oldStat.mode&0170000)==0140000 || (oldStat.mode&0170000)==0010000))if(int error=VfsPrepareRenameLabelsLocked(oldParent,oldName,newParent,newName,labels,oldStat.isDir?0:oldStat.ino))return error;
     int error=ops->rename(oldParent.object,oldName,newParent.object,newName);
     if(!error) {
         labels.Apply();

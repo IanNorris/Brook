@@ -1523,6 +1523,8 @@ void PipeReleaseEnd(PipeBuffer* pipe, bool writer)
     PipeBufferDrop(pipe, destroy);
 }
 
+#include "named_fifo.inc"
+
 // The receiver owns delivery, even while the sender still references the
 // queue. Stop new writes and detach all queued capabilities under the stream
 // lock; releasing them can recursively close sockets, so do that unlocked.
@@ -1914,6 +1916,11 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
         // explicitly tee to the inherited debug-serial descriptor.)
     }
 
+    if(auto* opened=FdNamedFifo(fde)) {
+        if((fde->statusFlags&3)==0)return -EBADF;
+        FdEntry endpoint=*fde;endpoint.type=FdType::Pipe;endpoint.handle=opened->state->pipe;endpoint.flags=1|0x10;
+        return WriteToPinnedFdByType(proc,&endpoint,fd,bufAddr,count,userSource);
+    }
     // The pin above also protects handles across blocking writes; its
     // destructor performs any deferred-close teardown on every return path.
     if (fde->type == FdType::Vnode && fde->handle)
@@ -2234,7 +2241,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (count > 0 && !UserBufferReadable(bufAddr, count))
         return -EFAULT;
 
-    if (fde->type == FdType::Vnode && fde->handle)
+    if (fde->type == FdType::Vnode && fde->handle && !FdNamedFifo(fde))
     {
         auto* vn = static_cast<Vnode*>(fde->handle);
         int64_t ret = VfsRead(vn, reinterpret_cast<void*>(bufAddr),
@@ -2570,11 +2577,14 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     }
 
     // Read from pipe — block until data available or all writers closed
-    if (fde->type == FdType::Pipe && fde->handle)
+    if (FdPipe(fde))
     {
+        KernelOperationGuard operation(proc);
         if (count == 0) return 0;
-        auto* pipe = static_cast<PipeBuffer*>(fde->handle);
-        auto* dst = reinterpret_cast<char*>(bufAddr);
+        if(!FdPipeRead(fde))return -EBADF;
+        auto* pipe = FdPipe(fde);
+        char staged[4096];
+        auto* dst = staged;
 
         for (;;)
         {
@@ -2583,12 +2593,11 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             if (got > 0)
             {
                 // Wake blocked writer
-                Process* writer = pipe->writerWaiter;
-                if (writer)
-                {
-                    pipe->writerWaiter = nullptr;
-                    WakeProcess(writer);
-                }
+                SpinLockAcquire(&pipe->lock);
+                Process* writer=pipe->writerWaiter;pipe->writerWaiter=nullptr;
+                if(writer)WakeProcess(writer);
+                SpinLockRelease(&pipe->lock);
+                if(!CopyToUser(bufAddr,staged,got))return -EFAULT;
                 return static_cast<int64_t>(got);
             }
 
@@ -3558,13 +3567,15 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
         VfsClose(vn);
         return -ENOTDIR;
     }
-    int fd = FdAlloc(proc, FdType::Vnode, vn);
-    if (fd < 0)
-    {
-        VfsClose(vn);
-        return -EMFILE;
+    VnodeStat openedStat{};
+    if(int error=VfsStat(vn,&openedStat)) {VfsClose(vn);return error;}
+    if((openedStat.mode&0170000)==0010000) {
+        if(int error=NamedFifoAttach(vn,static_cast<uint32_t>(flags))) {VfsClose(vn);return error;}
     }
-    proc->fds[fd].statusFlags = static_cast<uint32_t>(flags);
+    FdEntry openedEntry{};openedEntry.type=FdType::Vnode;openedEntry.handle=vn;
+    openedEntry.statusFlags=static_cast<uint32_t>(flags);openedEntry.fdFlags=(flags&0x80000)?1:0;
+    int fd=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),openedEntry,0,-1,nullptr);
+    if(fd<0) {VfsClose(vn);return -EMFILE;}
 
     // Keep a bounded diagnostic label; this is never a resolution prefix.
     if (vn->type == VnodeType::Dir)
@@ -3987,6 +3998,7 @@ static int64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     if (!ref) return -EBADF;
     FdEntry* fde = ref.get();
 
+    if(FdPipe(fde))return -29;
     if(fde->type==FdType::SignalFd)return whence<=4?0:-EINVAL; // Linux noop_llseek
     if(fde->type==FdType::SyncFile)return -29; // ESPIPE
 
@@ -6691,7 +6703,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         if (!UserBufferReadable(arg, sizeof(int))) return -EFAULT;
         bool nonblock = *reinterpret_cast<int*>(arg) != 0;
         if (fde->type == FdType::Socket || fde->type == FdType::UnixSocket ||
-            fde->type == FdType::Pipe || fde->type == FdType::DevTty) {
+            FdPipe(fde) || fde->type == FdType::DevTty) {
             if (nonblock)
                 fde->statusFlags |= 0x800; // O_NONBLOCK
             else
@@ -6707,10 +6719,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     {
         if (!UserBufferWritable(arg, sizeof(int))) return -EFAULT;
         int available = 0;
-        if (fde->type == FdType::Pipe && fde->handle) {
-            auto* pipe = (fde->flags == 2)
-                ? reinterpret_cast<PipeBuffer*>(fde->handle)
-                : static_cast<PipeBuffer*>(fde->handle);
+        if (auto* pipe=FdPipe(fde)) {
             available = static_cast<int>(pipe->count());
         } else if (fde->type == FdType::UnixSocket && fde->handle) {
             auto* usd = static_cast<UnixSocketData*>(fde->handle);
@@ -8486,6 +8495,11 @@ retry_poll:
             continue;
         }
 
+        if(FdNamedFifo(fde)) {
+            fds[i].revents=static_cast<int16_t>(NamedFifoReady(fde,fds[i].events));
+            if(fds[i].revents)++ready;
+            continue;
+        }
         // Pipes: check readability/writability
         if (fde->type == FdType::Pipe && fde->handle)
         {
@@ -8681,6 +8695,9 @@ retry_poll:
             FdRef fde_ref(proc, fds[i].fd);
             FdEntry* fde = fde_ref.get();
             if (!fde) continue;
+            if(FdNamedFifo(fde)) {
+                if(!pipeWaiters.add(FdPipe(fde),self,fds[i].events|POLLHUP|POLLERR))return -ENOMEM;
+            }
             if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
             {
                 auto* pb = static_cast<PipeBuffer*>(fde->handle);
@@ -8750,6 +8767,7 @@ retry_poll:
             { ready++; break; }
             if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN) && InputHasEvents())
             { ready++; break; }
+            if(FdNamedFifo(fde) && NamedFifoReady(fde,fds[i].events)) {ready++;break;}
             if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
             {
                 auto* pb = static_cast<PipeBuffer*>(fde->handle);
@@ -9174,6 +9192,7 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
     // do not feed libuv orphan ERR|HUP notifications forever after close.
     if (!fde) return 0;
 
+    if(FdNamedFifo(fde))return NamedFifoReady(fde,events);
     if(fde->type==FdType::SyncFile && fde->handle)return SyncFileReady(events);
     if(fde->type==FdType::SignalFd && fde->handle)
         return SignalFdReady(ProcessCurrent(),static_cast<SignalFd*>(fde->handle),events);
@@ -9555,12 +9574,15 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
             walk->collect(ep);
         }
         TimerWaitGroup timerWaiters;
+        PipePollGroup namedWaiters;bool namedWaitFailed=false;
         auto registerWaiters = [&]() {
             for (int wfd = 0; wfd < EPOLL_MAX_FDS; wfd++) {
                 FdEntry* fde = walk->pins[wfd];
                 if (!walk->masks[wfd]) continue;
                 if (!fde || !fde->handle) continue;
-                if (fde->type == FdType::Pipe) {
+                if(FdNamedFifo(fde)) {
+                    if(!namedWaiters.add(FdPipe(fde),proc,walk->masks[wfd]|16|8))namedWaitFailed=true;
+                } else if (fde->type == FdType::Pipe) {
                     static_cast<PipeBuffer*>(fde->handle)->epollWaiter = proc;
                 } else if (fde->type == FdType::EventFd) {
                     static_cast<EventFdData*>(fde->handle)->epollWaiter = proc;
@@ -9611,6 +9633,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
         };
 
         registerWaiters();
+        if(namedWaitFailed) {unregisterWaiters();return -ENOMEM;}
         // The graph mutex can sleep. Arm the timeout only after this scan:
         // SchedulerUnblock clears wakeupTick when granting a contended mutex.
         n = EpollScanReady(walk, ep, kEvents, maxevents, diag, eventsAddr);
@@ -10141,6 +10164,19 @@ static int64_t sys_mkdir(uint64_t pathAddr, uint64_t mode, uint64_t,
 // sys_mkdirat (258) — create a directory relative to dirfd
 // ---------------------------------------------------------------------------
 
+static int64_t sys_mknodat(uint64_t dirfd,uint64_t pathAddr,uint64_t mode,uint64_t device,uint64_t,uint64_t)
+{
+    if((mode&0170000)!=0010000)return -95;
+    if(device)return -EINVAL;
+    char path[512];if(!CopyUserCString(pathAddr,path,sizeof(path)))return -EFAULT;
+    AtLookup lookup;if(int error=lookup.Init(static_cast<int>(dirfd),path))return error;
+    int error=0;Vnode* node=VfsCreateFifoAt(lookup.fs.root,lookup.start(),path,static_cast<uint16_t>(mode),lookup.fs.mask,&error);
+    if(!node)return error?error:-EIO;
+    VfsClose(node);return 0;
+}
+static int64_t sys_mknod(uint64_t path,uint64_t mode,uint64_t device,uint64_t,uint64_t,uint64_t)
+{ return sys_mknodat(static_cast<uint64_t>(-100),path,mode,device,0,0); }
+
 static int64_t sys_mkdirat(uint64_t dirfd, uint64_t pathAddr, uint64_t mode,
                             uint64_t, uint64_t, uint64_t)
 {
@@ -10598,7 +10634,7 @@ static int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
     if (offset > 0x7fffffffffffffffULL - length) return -27; // EFBIG
     uint32_t options = static_cast<uint32_t>(mode);
     if (options & ~1u) return -95; // EOPNOTSUPP: only KEEP_SIZE is supported.
-    if (entry->type == FdType::Pipe) return -29; // ESPIPE
+    if (FdPipe(entry)) return -29; // ESPIPE
     if (entry->type == FdType::Vnode) return -95; // Backends have no reservation operation.
     if (entry->type != FdType::MemFd || !entry->handle) return -ENODEV;
 
@@ -10762,6 +10798,7 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (!proc) return -EBADF;
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
+    if(FdPipe(fde))return -29;
     if (!fde || fde->type==FdType::Path) return -EBADF;
     if (offset > 0x7fffffffffffffffULL) return -EINVAL;
     if (fde->type == FdType::MemFd && fde->handle) {
@@ -12233,6 +12270,7 @@ static int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (!proc) return -EBADF;
     FdRef ref(proc, static_cast<int>(fd));
     FdEntry* fde = ref.get();
+    if(FdPipe(fde))return -29;
     if (!fde || fde->type==FdType::Path) return -EBADF;
 
     if (offset > 0x7fffffffffffffffULL) return -EINVAL;
@@ -14136,6 +14174,8 @@ void SyscallTableInit()
     g_syscallTable[SYS_CHDIR]           = sys_chdir;
     g_syscallTable[SYS_FCHDIR]          = sys_fchdir;
     g_syscallTable[SYS_RENAME]          = sys_rename;
+    g_syscallTable[SYS_MKNOD] = sys_mknod;
+    g_syscallTable[SYS_MKNODAT] = sys_mknodat;
     g_syscallTable[SYS_MKDIR]           = sys_mkdir;
     g_syscallTable[SYS_RMDIR]           = sys_rmdir;
     g_syscallTable[SYS_UNLINK]          = sys_unlink;

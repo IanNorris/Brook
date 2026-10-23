@@ -9,6 +9,8 @@ struct VfsPath { void* attachment=nullptr; VfsObject* object=nullptr; };
 void VfsPathRetain(const VfsPath& path);
 void VfsPathRelease(VfsPath path);
 bool VfsPathSame(const VfsPath& a,const VfsPath& b);
+// Both operands must be retained; compares the backing object across bind aliases.
+bool VfsPathSameObject(const VfsPath& a,const VfsPath& b);
 int VfsPathRoot(VfsPath* out);
 // Synthetic syscall brokers may serve only paths whose retained ancestry has
 // not crossed a directory bind. Missing synthetic tails are permitted; a bind
@@ -54,6 +56,7 @@ int VfsReadlinkAt(const VfsPath& root,const VfsPath& start,const char* text,char
 int VfsMkdirAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode,uint16_t mask);
 int VfsRemoveAt(const VfsPath& root,const VfsPath& start,const char* text,bool directory);
 int VfsSymlinkAt(const VfsPath& root,const VfsPath& start,const char* target,const char* text);
+Vnode* VfsCreateFifoAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode,uint16_t mask,int* error);
 Vnode* VfsCreateSocketAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode,uint16_t mask,int* error);
 int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
                 const VfsPath& newStart,const char* newText);

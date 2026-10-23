@@ -197,6 +197,16 @@ int main()
 {
     identity(1000);
     clean();
+    {
+        auto* fs=make();auto* r=root(fs);int error=0;
+        auto* fifo=r->ops->create_fifo(r,"fifo",0640,&error);assert(fifo && !error && fifo->type==VnodeType::Device);
+        VnodeStat stat{};assert(!fifo->ops->stat(fifo,&stat) && (stat.mode&0177777)==0010640 && stat.uid==1000);
+        assert(!r->ops->create_fifo(r,"fifo",0600,&error) && error==-17);
+        auto* object=child(r,"fifo");assert(!r->ops->rename(r,"fifo",r,"renamed"));
+        auto* again=object->ops->open(object,VFS_O_WRITE|VFS_O_READWRITE,&error);assert(again && !error);
+        assert(!r->ops->remove(r,"renamed",false));assert(!fifo->ops->stat(fifo,&stat) && !stat.nlink);
+        VfsClose(again);VfsObjectRelease(object);VfsClose(fifo);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
+    }
     TmpfsMountOptions options{};
     assert(!ParseTmpfsMountOptions(nullptr,&options) && options.mode==01777);
     assert(!ParseTmpfsMountOptions("",&options) && options.mode==01777);

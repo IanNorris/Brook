@@ -21,7 +21,7 @@ namespace
 {
 constexpr uint64_t InstanceBytes = 16 * 1024 * 1024, GlobalBytes = 256 * 1024 * 1024;
 constexpr uint64_t InstanceInodes = 1024, GlobalInodes = 16384, GlobalMounts = 128;
-constexpr uint16_t Regular = 0100000, Directory = 0040000, Link = 0120000, TypeMask = 0170000;
+constexpr uint16_t Regular = 0100000, Directory = 0040000, Link = 0120000, Fifo = 0010000, TypeMask = 0170000;
 struct Node;
 struct Entry
 {
@@ -737,7 +737,8 @@ Vnode *MakeVnode(Node *n, int *error)
     }
     *vn = {};
     vn->ops = (n->mode & TypeMask) == Regular ? &regularOps : &metadataOps;
-    vn->type = (n->mode & TypeMask) == Directory ? VnodeType::Dir : VnodeType::File;
+    vn->type = (n->mode & TypeMask) == Directory ? VnodeType::Dir :
+        (n->mode & TypeMask) == Fifo ? VnodeType::Device : VnodeType::File;
     vn->refCount = 1;
     vn->backendObject = o;
     return vn;
@@ -851,6 +852,45 @@ Vnode *Create(VfsObject *o, const char *name, int flags, uint16_t mode, int *err
     }
     Publish(parent, e);
     (void) flags;
+    return vn;
+}
+Vnode *CreateFifo(VfsObject *o, const char *name, uint16_t mode, int *error)
+{
+    *error = 0;
+    auto *parent = Object(o);
+    Actor actor(parent->fs);
+    Guard g(parent->fs);
+    if ((*error = ParentCheck(parent, name, actor)))
+        return nullptr;
+    if (*Find(parent, name))
+    {
+        *error = -17;
+        return nullptr;
+    }
+    uint32_t gid = (parent->mode & 02000) ? parent->gid : actor.gid;
+    auto *n = NewNode(parent->fs, Fifo | (mode & 07777), actor.uid, gid);
+    if (!n)
+    {
+        *error = -28;
+        return nullptr;
+    }
+    if (!actor.Cap(n, CapFsetid) && !actor.Group(n->gid))
+        n->mode &= ~02000;
+    auto *e = PrepareEntry(parent, name, n);
+    if (!e)
+    {
+        Drop(n);
+        *error = -12;
+        return nullptr;
+    }
+    auto *vn = MakeVnode(n, error);
+    if (!vn)
+    {
+        Free(parent->fs, e);
+        Drop(n);
+        return nullptr;
+    }
+    Publish(parent, e);
     return vn;
 }
 int Mkdir(VfsObject *o, const char *name, uint16_t mode)
@@ -1059,7 +1099,7 @@ depth_checked:
 }
 const VfsObjectOps objectOps = {DestroyObject, StatObject, AccessObject, Child,  Parent,       Readlink,
                                 OpenObject,    Create,     Mkdir,        Remove, Rename,       Symlink,
-                                nullptr,       Times,      Chmod,        Chown,  DirectoryPath, nullptr, ObjectPath};
+                                nullptr,       Times,      Chmod,        Chown,  DirectoryPath, nullptr, ObjectPath, CreateFifo};
 const VfsObjectOps *ObjectOperations()
 {
     return &objectOps;
