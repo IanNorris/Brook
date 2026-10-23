@@ -157,6 +157,8 @@ void KRwLockWriteUnlock(KRwLock*){namespaceLock.unlock();}
 extern "C" void SerialPrintf(const char*,...){}
 void SerialPuts(const char*){}
 int FileObjectWritebackAll(){return 0;}
+int FileObjectWrite(FileObject*,Vnode*,const void*,uint64_t,uint64_t*){assert(false);return -5;}
+int FileObjectAppend(FileObject*,Vnode*,const void*,uint64_t,uint64_t*){assert(false);return -5;}
 int FileObjectWriteback(FileObject*,Vnode*,uint64_t,uint64_t){assert(false);return -5;}
 int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -5;}
 }
@@ -415,7 +417,7 @@ static void testMountRestrictions(brook::MountNamespace* initial,const brook::Vf
     int error=0;auto* held=VfsPathOpen(dev,VFS_O_READ,&error);assert(held&&!error);
     auto activations=deviceActivations;
     assert(VfsMountNamespaceRemount(initial,stableRoot,6)==-95);
-    for(uint64_t attributes:{0ULL,2ULL,7ULL,14ULL,2097158ULL})assert(VfsMountNamespaceRemount(ns,bind,attributes)==-22);
+    for(uint64_t attributes:{0ULL,2ULL,14ULL,2097158ULL})assert(VfsMountNamespaceRemount(ns,bind,attributes)==-22);
     assert(static_cast<MountEntry*>(bind.attachment)->attributes==0);
     assert(VfsMountNamespaceRemount(ns,dev,6)==-22);
     assert(!VfsMountNamespaceRemount(ns,bind,6));
@@ -446,6 +448,43 @@ static void testMountRestrictions(brook::MountNamespace* initial,const brook::Vf
     VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
     mounts[6].root.children["ns-a"]->children.erase("device");
     assert(allocations.size()==allocated&&g_mounts.count==records);
+}
+static void testReadOnlyMount(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    auto allocated=allocations.size();auto records=g_mounts.count;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};
+    assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
+    auto source=resolve(root,root,"ns-a"),target=resolve(root,root,"ns-b");
+    Node file{&mounts[6],701,false,&node(source.object),{},{}};node(source.object).children["ro-file"]=&file;
+    assert(VfsMountNamespaceRemount(ns,root,7)==-95);assert(VfsMountAttributes(static_cast<MountEntry*>(root.attachment))==0);
+    assert(!VfsMountNamespaceBind(ns,source,target));auto bind=resolve(root,root,"ns-b"),path=resolve(root,bind,"ro-file");
+    int error=0;auto* metadata=VfsPathOpen(path,VFS_O_METADATA,&error);assert(metadata&&!error&&!metadata->mountDataHold);
+    auto* directory=VfsPathOpen(bind,VFS_O_READ,&error);assert(directory&&!error&&!directory->mountDataHold);
+    auto* reader=VfsPathOpen(path,VFS_O_READ,&error);assert(reader&&!error&&reader->mountDataHold);
+    assert(VfsMountNamespaceRemount(ns,bind,7)==-16);
+    // A mapping/writeback owner retaining the vnode must keep admission busy
+    // after the descriptor owner retires; final close releases the data hold.
+    VfsRetain(reader);VfsRelease(reader);assert(VfsMountNamespaceRemount(ns,bind,7)==-16);VfsRelease(reader);
+    assert(!VfsMountNamespaceRemount(ns,bind,7));assert(VfsMountReadOnly(metadata)&&VfsMountReadOnly(directory));
+    assert(VfsMountNamespaceRemount(ns,bind,6)==-1);
+    assert(!VfsPathOpen(path,VFS_O_WRITE,&error)&&error==-30);
+    reader=VfsPathOpen(path,VFS_O_READ,&error);assert(reader&&!error);assert(!VfsMountNamespaceRemount(ns,bind,7));
+    uint64_t offset=0;VnodeTime times[2]{};
+    assert(VfsWrite(reader,"x",1,&offset)==-30&&VfsAppend(reader,"x",1,&offset)==-30&&VfsTruncate(reader,0)==-30);
+    assert(VfsChmod(directory,0700)==-30&&VfsChown(directory,0,0)==-30&&VfsSetTimes(directory,times)==-30);
+    assert(VfsAccess(reader,2,false)==-30&&VfsPathAccess(path,2)==-30&&VfsAccessAt(root,bind,"ro-file",2)==-30);
+    assert(!VfsOpenAt(root,bind,"new",VFS_O_CREATE|VFS_O_WRITE,0600,0,&error)&&error==-30);
+    assert(VfsMkdirAt(root,bind,"new",0700,0)==-30&&VfsRemoveAt(root,bind,"ro-file",false)==-30);
+    assert(VfsSymlinkAt(root,bind,"ro-file","new")==-30&&VfsRenameAt(root,bind,"ro-file",bind,"other")==-30);
+    assert(VfsChmodAt(root,bind,"ro-file",0600)==-30&&VfsChownAt(root,bind,"ro-file",0,0)==-30&&VfsSetTimesAt(root,bind,"ro-file",times)==-30);
+    assert(!VfsCreateSocketAt(root,bind,"sock",0600,0,&error)&&error==-30);
+    auto alias=resolve(root,source,"ro-file");auto* writer=VfsPathOpen(alias,VFS_O_WRITE,&error);assert(writer&&!error&&!VfsMountReadOnly(writer));VfsRelease(writer);VfsPathRelease(alias);
+    auto rows=infoRows(ns,root);std::string text(16384,0);uint32_t written=0;
+    assert(!FormatMountInfo(rows.data(),rows.size(),text.data(),text.size(),&written));assert(text.find(" ro,nosuid,nodev - objects objects rw\n")!=std::string::npos);
+    assert(!VfsMountNamespaceDetach(ns,bind));assert(!VfsOpenAt(root,bind,"new",VFS_O_CREATE|VFS_O_WRITE,0600,0,&error)&&error==-30);
+    VfsRelease(metadata);VfsRelease(directory);VfsRelease(reader);VfsPathRelease(path);VfsPathRelease(bind);
+    VfsPathRelease(source);VfsPathRelease(target);VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
+    mounts[6].root.children["ns-a"]->children.erase("ro-file");assert(allocations.size()==allocated&&g_mounts.count==records);
 }
 static void testPivotRoots(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
     using namespace brook;
@@ -840,6 +879,7 @@ int main(){
     testPivotRoots(initial,stableRoot);
     testMountInfo(initial,stableRoot);
     testMountRestrictions(initial,stableRoot);
+    testReadOnlyMount(initial,stableRoot);
     MountNamespace* parentNs=nullptr;VfsPath parentRoot{},parentCwd{};
     assert(!VfsMountNamespaceCopy(initial,stableRoot,originalSynthetic,&parentNs,&parentRoot,&parentCwd));
     assert(VfsMountNamespaceBind(parentNs,aPath,parentCwd)==-3);

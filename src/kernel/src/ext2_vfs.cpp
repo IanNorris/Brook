@@ -2148,7 +2148,7 @@ static int Ext2FileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
     // Relatime: avoid a metadata write for every read. Re-read under the
     // exclusive lock so a concurrent write/utimens cannot be overwritten.
     uint32_t now = Ext2Now();
-    if (r > 0 && data.i_atime != now &&
+    if (r > 0 && !VfsMountReadOnly(vn) && data.i_atime != now &&
         (data.i_atime <= data.i_mtime || data.i_atime <= data.i_ctime ||
          (now > data.i_atime && now - data.i_atime >= 86400))) {
         KRwLockWriteLock(&g_ext2Lock);

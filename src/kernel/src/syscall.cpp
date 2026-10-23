@@ -10350,7 +10350,8 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathAddr, uint64_t timesAd
     if (!pathAddr || (!path[0] && (flags & EMPTY_PATH))) {
         if (flags & NOFOLLOW) return -EINVAL;
         Process* proc = ProcessCurrent();
-        FdEntry* entry = proc ? FdGet(proc, static_cast<int>(dirfd)) : nullptr;
+        FdRef descriptor(proc,static_cast<int>(dirfd));
+        FdEntry* entry = descriptor.get();
         if (!entry || !entry->handle || entry->type != FdType::Vnode) return -EBADF;
         return VfsSetTimes(static_cast<Vnode*>(entry->handle), times);
     }

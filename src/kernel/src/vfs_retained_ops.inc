@@ -16,6 +16,7 @@ static int VfsWalkAtLocked(const VfsPath& root,const VfsPath& start,const char* 
 static int VfsMutationLeaf(const VfsPath& parent,const char* name)
 {
     if(!parent.object)return -16;
+    if(VfsReadOnly(static_cast<MountEntry*>(parent.attachment)))return -30;
     if(!name || !name[0] || StrEq(name,".") || StrEq(name,".."))return -22;
     for(uint32_t i=0;name[i];++i)if(name[i]=='/')return -22;
     return 0;
@@ -86,7 +87,7 @@ Vnode* VfsOpenAt(const VfsPath& root,const VfsPath& start,const char* text,int f
     if(flags&VFS_O_TRUNC) { if(!(createFlags&VFS_O_WRITE))createFlags|=VFS_O_READWRITE;createFlags|=VFS_O_WRITE; }
     Vnode* node=ops->create(result.parent.object,result.leaf,createFlags,mode&07777&~(mask&0777),error);
     if(!node) { if(!*error)*error=-5;return nullptr; }
-    VfsAttachMount(node,static_cast<MountEntry*>(result.parent.attachment));return node;
+    VfsAttachMount(node,static_cast<MountEntry*>(result.parent.attachment),createFlags);return node;
 }
 int VfsOpenExecutableAt(const VfsPath& root,const VfsPath& start,const char* text,
                         Vnode** out,char* resolved,uint32_t capacity)
@@ -121,6 +122,7 @@ int VfsAccessAt(const VfsPath& root,const VfsPath& start,const char* text,uint8_
     if(required&~7u)return -22;
     FileMutationGuard lookup(false);VfsOwnedWalk walk;
     if(int error=VfsWalkAtLocked(root,start,text,walk,{followFinal},realIds))return error;
+    if((required&2) && VfsReadOnly(static_cast<MountEntry*>(walk.value.object.attachment)))return -30;
     auto* object=walk.value.object.object;return object->ops->access?object->ops->access(object,required,realIds):-95;
 }
 int VfsReadlinkAt(const VfsPath& root,const VfsPath& start,const char* text,char* out,uint32_t capacity)
@@ -177,7 +179,7 @@ Vnode* VfsCreateSocketAt(const VfsPath& root,const VfsPath& start,const char* te
     if(!parent.object->ops->create_socket) { *error=-95;return nullptr; }
     Vnode* node=parent.object->ops->create_socket(parent.object,leaf,mode&0777&~(mask&0777),error);
     if(!node) { if(!*error)*error=-5;return nullptr; }
-    VfsAttachMount(node,static_cast<MountEntry*>(parent.attachment));return node;
+    VfsAttachMount(node,static_cast<MountEntry*>(parent.attachment),0);return node;
 }
 static bool VfsComponentPrefix(const char* prefix,const char* text)
 {
@@ -322,12 +324,14 @@ int VfsChmodAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_
 {
     FileMutationGuard mutation;VfsOwnedWalk walk;
     if(int error=VfsWalkAtLocked(root,start,text,walk))return error;
+    if(VfsReadOnly(static_cast<MountEntry*>(walk.value.object.attachment)))return -30;
     auto* object=walk.value.object.object;return object->ops->chmod?object->ops->chmod(object,mode):-95;
 }
 int VfsChownAt(const VfsPath& root,const VfsPath& start,const char* text,uint32_t uid,uint32_t gid,bool followFinal)
 {
     FileMutationGuard mutation;VfsOwnedWalk walk;
     if(int error=VfsWalkAtLocked(root,start,text,walk,{followFinal}))return error;
+    if(VfsReadOnly(static_cast<MountEntry*>(walk.value.object.attachment)))return -30;
     auto* object=walk.value.object.object;return object->ops->chown?object->ops->chown(object,uid,gid):-95;
 }
 int VfsSetTimesAt(const VfsPath& root,const VfsPath& start,const char* text,const VnodeTime* times,bool followFinal)
@@ -335,5 +339,6 @@ int VfsSetTimesAt(const VfsPath& root,const VfsPath& start,const char* text,cons
     if(!times)return -22;
     FileMutationGuard mutation;VfsOwnedWalk walk;
     if(int error=VfsWalkAtLocked(root,start,text,walk,{followFinal}))return error;
+    if(VfsReadOnly(static_cast<MountEntry*>(walk.value.object.attachment)))return -30;
     auto* object=walk.value.object.object;return object->ops->set_times?object->ops->set_times(object,times):-95;
 }

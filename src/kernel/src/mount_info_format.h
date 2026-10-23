@@ -18,11 +18,11 @@ inline int FormatMountInfo(const VfsMountInfo* rows,uint32_t count,char* out,uin
     };
     for(uint32_t i=0;i<count&&!error;++i) {
         const auto& r=rows[i];
-        if(!r.id || r.id>0x7ffffffeULL || r.parent>0x7ffffffeULL || (r.attributes&~uint64_t{6}) || r.root[0]!='/' || r.mountPoint[0]!='/') {error=-95;break;}
+        if(!r.id || r.id>0x7ffffffeULL || r.parent>0x7ffffffeULL || (r.attributes&~uint64_t{7}) || r.root[0]!='/' || r.mountPoint[0]!='/') {error=-95;break;}
         number(r.id);character(' ');number(r.parent);character(' ');
         number(((r.device>>8)&0xfff)|((r.device>>32)&0xfffff000));character(':');
         number((r.device&0xff)|((r.device>>12)&0xffffff00));character(' ');
-        escape(r.root);character(' ');escape(r.mountPoint);literal(" rw");
+        escape(r.root);character(' ');escape(r.mountPoint);literal(r.attributes&1?" ro":" rw");
         if(r.attributes&2)literal(",nosuid");if(r.attributes&4)literal(",nodev");
         literal(" - ");escape(r.fsType);character(' ');escape(r.fsType);literal(" rw\n");
     }

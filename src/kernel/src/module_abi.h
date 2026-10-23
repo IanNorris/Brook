@@ -66,7 +66,8 @@ namespace brook {
 // ABI 41 adds private user-namespace/capability state and credential snapshot fields.
 // ABI 42 changes retained magic-link callbacks and adds path/namespace FD kinds.
 // ABI 43 appends explicit vnode mapping policy for the bounded tmpfs backend.
-static constexpr uint32_t MODULE_ABI_VERSION = 43;
+// ABI 44 adds per-vnode mount data admission for read-only transitions.
+static constexpr uint32_t MODULE_ABI_VERSION = 44;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

@@ -87,12 +87,16 @@ struct Vnode {
     // Optional backend identity pin, independent of file/iterator state.
     // Final VFS close releases it after backend close, before the mount hold.
     VfsObject*      backendObject = nullptr;
+    // Set by VFS admission; metadata-only and directory handles do not hold
+    // data writeback capability. Requires module ABI 44.
+    bool            mountDataHold = false;
 };
 
 // Caller must already own a live vnode reference. The returned name is for
 // reporting/legacy callers, not a capability for subsequent global lookup:
 // an overmount can make that name resolve to a different retained object.
 int VfsDirectoryPath(Vnode* vn, char* out, uint32_t capacity);
+extern "C" bool VfsMountReadOnly(const Vnode* vn);
 
 // Retention is not safe acquisition from an unprotected raw pointer.
 inline void VfsRetain(Vnode* vn) {

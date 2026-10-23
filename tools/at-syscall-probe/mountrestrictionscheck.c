@@ -51,7 +51,7 @@ int main(int argc,char** argv){
  map("/proc/self/uid_map",uid);int f=open("/proc/self/setgroups",O_WRONLY);CK(f>=0&&write(f,"deny\n",5)==5&&!close(f));map("/proc/self/gid_map",gid);
  CK(!mount(NULL,"/",NULL,MS_PRIVATE|MS_REC,NULL));unsigned long previous=deviceflags();
  struct stat beforeStat;int hadStat=stat("/dev/null",&beforeStat);int statError=errno;
- if(brook){for(unsigned long extra=1;extra<=8;extra*=8){errno=0;CK(mount(NULL,deviceMount,NULL,MS_BIND|MS_REMOUNT|MS_NOSUID|MS_NODEV|extra,NULL)==-1&&errno==EINVAL);CK(deviceflags()==previous);}errno=0;CK(mount(NULL,deviceMount,NULL,MS_BIND|MS_REMOUNT,NULL)==-1&&errno==EINVAL);}
+ if(brook){for(unsigned long extra=8;extra<=2097152;extra*=262144){errno=0;CK(mount(NULL,deviceMount,NULL,MS_BIND|MS_REMOUNT|MS_NOSUID|MS_NODEV|extra,NULL)==-1&&errno==EINVAL);CK(deviceflags()==previous);}errno=0;CK(mount(NULL,deviceMount,NULL,MS_BIND|MS_REMOUNT,NULL)==-1&&errno==EINVAL);}
  CK(!mount(NULL,deviceMount,NULL,MS_BIND|MS_REMOUNT|MS_SILENT|previous|MS_NOSUID|MS_NODEV,NULL));
  CK((deviceflags()&(MS_NOSUID|MS_NODEV))==(MS_NOSUID|MS_NODEV));
  errno=0;CK(open("/dev/null",O_RDWR)==-1&&errno==EACCES);

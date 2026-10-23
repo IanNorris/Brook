@@ -564,7 +564,7 @@ int VfsMountNamespacePrivatePropagation(MountNamespace* ns,const VfsPath& target
 int VfsMountNamespaceRemount(MountNamespace* ns,const VfsPath& target,uint64_t attributes)
 {
     if(!ns || !target.object || !target.attachment)return -22;
-    if(attributes!=6)return -22;
+    if(attributes!=6 && attributes!=7)return -22;
     FileMutationGuard transaction;
     if(!ns->life.Published())return -3;
     if(ns->initial)return -95;
@@ -572,8 +572,16 @@ int VfsMountNamespaceRemount(MountNamespace* ns,const VfsPath& target,uint64_t a
     auto* mount=static_cast<MountEntry*>(lease.value.attachment);
     if(!VfsMountPublished(*mount) || mount->owner!=ns ||
        lease.value.object->identity!=mount->rootIdentity || lease.value.object->ops!=mount->rootObjectOps)return -22;
-    if(mount->attributes&~attributes)return -1;
-    MountViewGuard view;mount->attributes=attributes;return 0;
+    const uint64_t old=VfsMountAttributes(mount);
+    if(old&~attributes)return -1;
+    // Legacy synthetic storage has no attachment provenance. Only retained
+    // roots suppress those brokers; do not claim RO on an unbounded root.
+    if((attributes&1) && !(old&1) && !mount->rootObject)return -95;
+    // Conservative: even ordinary read handles may trigger atime/writeback.
+    // O_PATH and directories carry no data capability. Pending mapping writeback
+    // retains its vnode and keeps this count nonzero until final retirement.
+    if((attributes&1) && !(old&1) && __atomic_load_n(&mount->nonDirectoryHolds,__ATOMIC_ACQUIRE))return -16;
+    MountViewGuard view;__atomic_store_n(&mount->attributes,attributes,__ATOMIC_RELEASE);return 0;
 }
 int VfsMountNamespaceDetach(MountNamespace* ns,const VfsPath& target)
 {

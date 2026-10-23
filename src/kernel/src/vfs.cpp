@@ -183,6 +183,7 @@ struct MountEntry {
     MountBacking*    backing;     // owned driver-mount reference
     bool             used;
     uint64_t         vnodeHolds;
+    uint64_t         nonDirectoryHolds; // data/exec/read handles, including pending writeback
     uint64_t         pathHolds;
     uint64_t         publication;
     VfsPath          covered;
@@ -198,6 +199,11 @@ struct MountEntry {
     uint64_t         rootDevice;
     uint64_t         attributes;
 };
+static uint64_t VfsMountAttributes(const MountEntry* mount) {
+    return __atomic_load_n(&mount->attributes,__ATOMIC_ACQUIRE);
+}
+static bool VfsReadOnly(const MountEntry* mount) { return mount && (VfsMountAttributes(mount)&1); }
+bool VfsMountReadOnly(const Vnode* vn) { return vn && VfsReadOnly(static_cast<MountEntry*>(vn->mountOwner)); }
 static bool VfsNodevDenied(const MountEntry* mount,const VnodeStat& stat,int flags)
 {
     const uint16_t type=stat.mode&0170000;
@@ -298,9 +304,11 @@ static int VfsBackingDropLocked(MountBacking* backing,bool deferFailure=false)
 
 // Called under the namespace lock before a newly opened vnode is published.
 // Final close drops the hold only after the backend has finished using it.
-static void VfsAttachMount(Vnode* vnode, MountEntry* mount)
+static void VfsAttachMount(Vnode* vnode, MountEntry* mount,int flags)
 {
     VfsMountHold(mount);vnode->mountOwner=mount;
+    vnode->mountDataHold=vnode->type!=VnodeType::Dir && !(flags&VFS_O_METADATA);
+    if(vnode->mountDataHold && __atomic_fetch_add(&mount->nonDirectoryHolds,uint64_t{1},__ATOMIC_ACQ_REL)==~uint64_t{0})__builtin_trap();
     __atomic_fetch_add(&mount->vnodeHolds,uint64_t{1},__ATOMIC_RELAXED);
 }
 
@@ -724,6 +732,8 @@ int VfsAccessPath(const char* path,uint8_t required,bool realIds,bool nofollow)
     FileMutationGuard lookup(false);
     char resolved[512];
     if (int error=VfsResolvePath(path,resolved,sizeof(resolved),{!nofollow},realIds)) return error;
+    const char* relative=nullptr;char physical[512];
+    if((required&2) && VfsReadOnly(FindMount(resolved,&relative,physical)))return -30;
     VnodeStat st{};
     if (int error=VfsLstatPathRaw(resolved,&st)) return error;
     return VfsCheckAccessRaw(resolved,st,required,realIds);
@@ -734,6 +744,7 @@ int VfsAccess(Vnode* vn,uint8_t required,bool realIds)
     if (!vn) return -9;
     if (required & ~7u) return -22;
     FileMutationGuard lookup(false);
+    if((required&2) && VfsMountReadOnly(vn))return -30;
     if (vn->ops && vn->ops->access) return vn->ops->access(vn,required,realIds);
     return required ? -95 : 0;
 }
@@ -769,7 +780,7 @@ int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t 
         mount->backing->fsOps->open_mode ? mount->backing->fsOps->open_mode(mount->backing->mountPriv,mount->backing->pdrv,relative,VFS_O_EXEC,0666) :
         mount->backing->fsOps->open ? mount->backing->fsOps->open(mount->backing->mountPriv,mount->backing->pdrv,relative,VFS_O_EXEC) : nullptr;
     if (!opened) return error?error:-2;
-    VfsAttachMount(opened,mount);
+    VfsAttachMount(opened,mount,VFS_O_EXEC);
     if (opened->type==VnodeType::Dir) { VfsClose(opened);return -13; }
     *vnode=opened;return 0;
 }
@@ -825,6 +836,16 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
     }
 
     if (!mount->backing->fsOps) return nullptr;
+    if(VfsReadOnly(mount)) {
+        bool deny=flags&(VFS_O_WRITE|VFS_O_TRUNC);
+        if(!deny && (flags&VFS_O_CREATE)) {
+            VnodeStat existing{};int status=VfsLstatPathRaw(lookup,&existing);
+            if(status==-2)deny=true;
+            else if(status) {if(error)*error=status;return nullptr;}
+            else flags&=~VFS_O_CREATE;
+        }
+        if(deny) {if(error)*error=-30;return nullptr;}
+    }
     if((mount->attributes&4) && !(flags&VFS_O_METADATA)) {
         VnodeStat stat{};int result=VfsLstatPathRaw(lookup,&stat);
         if(result!=-2 || !(flags&VFS_O_CREATE)) {
@@ -846,7 +867,7 @@ Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error
         vn = mount->backing->fsOps->open_mode(mount->backing->mountPriv, mount->backing->pdrv, relPath, openFlags, mode);
     else if (mount->backing->fsOps->open)
         vn = mount->backing->fsOps->open(mount->backing->mountPriv, mount->backing->pdrv, relPath, openFlags);
-    if (vn) VfsAttachMount(vn,mount);
+    if (vn) VfsAttachMount(vn,mount,flags);
     if (vn && (flags & VFS_O_TRUNC)) {
         int result = VfsTruncateLocked(vn, 0);
         if (result) {
@@ -909,6 +930,7 @@ int VfsDirectoryPath(Vnode* vn,char* out,uint32_t capacity)
 int VfsChmod(Vnode* vn, uint16_t mode)
 {
     FileMutationGuard mutation;
+    if(VfsMountReadOnly(vn))return -30;
     if (!vn) return -9;
     if (!vn->ops || !vn->ops->chmod) return -95;
     return vn->ops->chmod(vn, mode);
@@ -925,6 +947,7 @@ int VfsChmodPath(const char* path, uint16_t mode)
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(lookup, &relPath,physicalRelative);
     if (!mount) return -2;
+    if(VfsReadOnly(mount))return -30;
     if (!mount->backing->fsOps || !mount->backing->fsOps->chmod) return -95;
     return mount->backing->fsOps->chmod(mount->backing->mountPriv, mount->backing->pdrv, relPath, mode);
 }
@@ -932,6 +955,7 @@ int VfsChmodPath(const char* path, uint16_t mode)
 int VfsChown(Vnode* vn, uint32_t uid, uint32_t gid)
 {
     FileMutationGuard mutation;
+    if(VfsMountReadOnly(vn))return -30;
     if (!vn) return -9;
     if (!vn->ops || !vn->ops->chown) return -95;
     return vn->ops->chown(vn, uid, gid);
@@ -948,6 +972,7 @@ int VfsChownPath(const char* path, uint32_t uid, uint32_t gid, bool nofollow)
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(lookup, &relPath,physicalRelative);
     if (!mount) return -2;
+    if(VfsReadOnly(mount))return -30;
     if (!mount->backing->fsOps || !mount->backing->fsOps->chown) return -95;
     return mount->backing->fsOps->chown(mount->backing->mountPriv, mount->backing->pdrv, relPath, uid, gid, nofollow);
 }
@@ -970,6 +995,7 @@ int VfsRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 
 int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
 {
+    if(VfsMountReadOnly(vn))return -30;
     if (!vn || !vn->ops->write) return -1;
     if(vn->ops->file_object)
         return FileObjectWrite(vn->ops->file_object(vn),vn,buf,len,offset);
@@ -978,6 +1004,7 @@ int VfsWrite(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
 
 int VfsAppend(Vnode* vn, const void* buf, uint64_t len, uint64_t* offset)
 {
+    if(VfsMountReadOnly(vn))return -30;
     if (!vn || vn->type != VnodeType::File || !vn->ops->write) return -22;
     if (vn->ops->file_object)
         return FileObjectAppend(vn->ops->file_object(vn), vn, buf, len, offset);
@@ -1013,6 +1040,7 @@ void VfsFileMapUnpin(Vnode* vn)
 
 static int VfsTruncateLocked(Vnode* vn, uint64_t size)
 {
+    if(VfsMountReadOnly(vn))return -30;
     if (!vn) return -9;
     if (size > 0x7fffffffffffffffULL) return -22;
     if (vn->type == VnodeType::Dir) return -21;
@@ -1115,7 +1143,9 @@ int VfsSpaceInfo(Vnode* vn, VfsSpace* out)
     if (!vn || !out) return -22;
     *out = {};
     if (!vn->ops || !vn->ops->space) return -38; // ENOSYS, never fabricated capacity.
-    return vn->ops->space(vn, out);
+    int error=vn->ops->space(vn,out);
+    if(!error && vn->mountOwner)out->flags|=VfsMountAttributes(static_cast<MountEntry*>(vn->mountOwner))&7;
+    return error;
 }
 
 int VfsStatPath(const char* path, VnodeStat* st)
@@ -1138,6 +1168,8 @@ int VfsLstatPath(const char* path, VnodeStat* st)
 
 int VfsSetTimes(Vnode* vn, const VnodeTime* times)
 {
+    FileMutationGuard mutation;
+    if(VfsMountReadOnly(vn))return -30;
     if (!vn || !vn->ops || !times) return -22;
     if (!vn->ops->set_times) return -95; // EOPNOTSUPP
     return vn->ops->set_times(vn, times);
@@ -1154,6 +1186,7 @@ int VfsSetTimesPath(const char* path, const VnodeTime* times, bool nofollow)
     const char* relPath = nullptr;
     MountEntry* mount = FindMount(lookup, &relPath,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
+    if(VfsReadOnly(mount))return -30;
     if (!mount->backing->fsOps->set_times) return -95;
     return mount->backing->fsOps->set_times(mount->backing->mountPriv, mount->backing->pdrv, relPath, times, nofollow);
 }
@@ -1213,6 +1246,7 @@ int VfsRemovePath(const char* path, bool directory)
     char physicalRelative[512];
     const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
+    if(VfsReadOnly(mount))return -30;
     if (mount->backing->fsOps->remove_path) return mount->backing->fsOps->remove_path(mount->backing->mountPriv,mount->backing->pdrv,relative,directory);
     VnodeStat st{};
     if (int error=VfsLstatPathRaw(resolved,&st)) return error;
@@ -1229,6 +1263,7 @@ int VfsMkdir(const char* path,uint16_t mode)
     char physicalRelative[512];
     const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
+    if(VfsReadOnly(mount))return -30;
     return mount->backing->fsOps->mkdir ? mount->backing->fsOps->mkdir(mount->backing->mountPriv,mount->backing->pdrv,relative,mode) : -95;
 }
 
@@ -1249,10 +1284,11 @@ Vnode* VfsCreateSocket(const char* path, uint16_t mode, int* error)
     const char* relative = nullptr;
     MountEntry* mount = FindMount(resolved, &relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) { *error = -2; return nullptr; }
+    if(VfsReadOnly(mount)) { *error=-30;return nullptr; }
     if (!mount->backing->fsOps->create_socket) { *error = -95; return nullptr; }
     Vnode* node = mount->backing->fsOps->create_socket(mount->backing->mountPriv, mount->backing->pdrv,
                                              relative, mode, error);
-    if (node) VfsAttachMount(node,mount);
+    if (node) VfsAttachMount(node,mount,0);
     if (*error == -17) *error = -98;
     if (!node && !*error) *error = -5;
     return node;
@@ -1281,6 +1317,7 @@ int VfsRename(const char* oldPath,const char* newPath)
     MountEntry* oldMount=FindMount(oldResolved,&oldRelative,oldPhysical);MountEntry* newMount=FindMount(newResolved,&newRelative,newPhysical);
     if (!oldMount || !newMount || !oldMount->backing->fsOps) return -2;
     if (oldMount!=newMount) return -18;
+    if(VfsReadOnly(oldMount) || VfsReadOnly(newMount))return -30;
     VfsRenameLabels labels;
     VnodeStat sourceStat{};
     if(int error=VfsLstatPathRaw(oldResolved,&sourceStat))return error;
@@ -1306,6 +1343,7 @@ int VfsSymlink(const char* target,const char* linkPath)
     char physicalRelative[512];
     const char* relative=nullptr;MountEntry* mount=FindMount(resolved,&relative,physicalRelative);
     if (!mount || !mount->backing->fsOps) return -2;
+    if(VfsReadOnly(mount))return -30;
     return mount->backing->fsOps->symlink ? mount->backing->fsOps->symlink(mount->backing->mountPriv,mount->backing->pdrv,target,relative) : -95;
 }
 
@@ -1322,11 +1360,13 @@ void VfsClose(Vnode* vn)
 {
     if (!vn) return;
     auto* mount=static_cast<MountEntry*>(vn->mountOwner);
+    const bool dataHold=mount && vn->mountDataHold;
     VfsObject* object=vn->backendObject;
     if (vn->ops && vn->ops->close) vn->ops->close(vn);
     kfree(vn->directoryPath);
     kfree(vn);
     VfsObjectRelease(object);
+    if(dataHold && !__atomic_fetch_sub(&mount->nonDirectoryHolds,uint64_t{1},__ATOMIC_ACQ_REL))__builtin_trap();
     if (mount) { __atomic_fetch_sub(&mount->vnodeHolds,uint64_t{1},__ATOMIC_RELEASE);VfsMountDrop(mount); }
 }
 

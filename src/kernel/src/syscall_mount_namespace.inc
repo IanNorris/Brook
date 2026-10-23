@@ -11,7 +11,7 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
     const bool privatePropagation=type==Private || type==Slave;
     const bool memoryMount=(flags&~Silent)==6; // bounded NODEV|NOSUID tmpfs
     const bool bindMount=type==Bind;
-    const bool remount=(flags&~(Silent|uint64_t{6}))==(Bind|Remount) && (flags&6)==6;
+    const bool remount=(flags&~(Silent|uint64_t{7}))==(Bind|Remount) && (flags&6)==6;
     if(!bindMount && !privatePropagation && !memoryMount && !remount)return -EINVAL;
     if(memoryMount) {
         char fsType[32],data[256];
@@ -34,7 +34,7 @@ static int64_t sys_mount(uint64_t sourceAddr,uint64_t targetAddr,uint64_t fsAddr
     if(!authorized)return -EPERM;
     if(remount) {
         VfsPath targetPath{};int error=VfsPathResolve(lookup.fs.root,lookup.fs.cwd,target,&targetPath);
-        if(!error)error=VfsMountNamespaceRemount(lookup.fs.mountNamespace,targetPath,6);
+        if(!error)error=VfsMountNamespaceRemount(lookup.fs.mountNamespace,targetPath,flags&7);
         VfsPathRelease(targetPath);return error;
     }
     if(memoryMount) {

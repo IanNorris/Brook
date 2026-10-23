@@ -70,6 +70,9 @@ void KRwLockReadUnlock(KRwLock* lock){fsLocks.at(lock)->unlock_shared();}
 void KRwLockWriteLock(KRwLock* lock){fsLocks.at(lock)->lock();}
 void KRwLockWriteUnlock(KRwLock* lock){fsLocks.at(lock)->unlock();}
 void FileObjectInit(FileObject* object){*object={};}
+// This backend fixture bypasses cache/coherence, which has dedicated tests.
+int FileObjectRead(FileObject*,Vnode* vn,void* out,uint64_t bytes,uint64_t* offset){return vn->ops->read(vn,out,bytes,offset);}
+int FileObjectWrite(FileObject*,Vnode* vn,const void* in,uint64_t bytes,uint64_t* offset){return vn->ops->write(vn,in,bytes,offset);}
 int FileObjectTruncateUnmapped(FileObject*,Vnode*,uint64_t){assert(false);return -95;}
 void FileObjectDispose(FileObject* object){assert(!object->mappings && !object->mappingRegistrations);for(auto* p:object->pages)assert(!p);}
 Process* ProcessCurrent(){return &process;}
@@ -391,6 +394,21 @@ int main(int argc,char** argv){
     assert(VfsPathResolve(fsRoot,fsRoot,"/namespace-bind/value",&initialMissing)==-2);
     VnodeStat boundStat{},valueStat{};assert(!VfsPathStat(boundValue,&boundStat)&&!VfsPathStat(value,&valueStat));
     assert(boundStat.ino==valueStat.ino && boundStat.dev==valueStat.dev);
+    auto* ordinary=VfsPathOpen(boundValue,VFS_O_READ,&error);assert(ordinary&&!error);
+    assert(VfsMountNamespaceRemount(privateNs,heldBound,7)==-16);VfsClose(ordinary);
+    auto* metadataOnly=VfsPathOpen(boundValue,VFS_O_METADATA,&error);assert(metadataOnly&&!error);
+    auto* sourceWriter=VfsPathOpen(value,VFS_O_WRITE,&error);assert(sourceWriter&&!error);
+    uint64_t position=0;assert(VfsWrite(sourceWriter,"A",1,&position)==1);
+    VnodeTime oldTimes[2]={{1,0},{2,0}};assert(!VfsSetTimes(sourceWriter,oldTimes));VfsClose(sourceWriter);
+    assert(!VfsMountNamespaceRemount(privateNs,heldBound,7));assert(VfsMountReadOnly(metadataOnly));VfsClose(metadataOnly);
+    auto* roReader=VfsPathOpen(boundValue,VFS_O_READ,&error);assert(roReader&&!error);
+    char readByte=0;position=0;assert(VfsRead(roReader,&readByte,1,&position)==1&&readByte=='A');
+    VnodeStat roStat{};assert(!VfsStat(roReader,&roStat)&&roStat.atime.sec==1); // no read-only relatime write
+    VfsSpace roSpace{};assert(!VfsSpaceInfo(roReader,&roSpace)&&(roSpace.flags&7)==7);
+    position=0;assert(VfsWrite(roReader,"B",1,&position)==-30&&VfsTruncate(roReader,0)==-30);
+    assert(!VfsOpenAt(privateRoot,heldBound,"forbidden",VFS_O_CREATE|VFS_O_WRITE,0600,0,&error)&&error==-30);
+    sourceWriter=VfsPathOpen(value,VFS_O_WRITE,&error);assert(sourceWriter&&!error&&!VfsMountReadOnly(sourceWriter));VfsClose(sourceWriter);
+    VfsClose(roReader);
     auto* retainedBindNode=VfsPathOpen(boundValue,VFS_O_READ,&error);assert(retainedBindNode&&!error);
     VfsPathRelease(boundValue);assert(!VfsMountNamespaceDetach(privateNs,heldBound));
     assert(!VfsPathResolve(privateRoot,heldBound,"..",&resolved)&&VfsPathSame(resolved,heldBound));VfsPathRelease(resolved);

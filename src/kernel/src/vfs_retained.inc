@@ -395,6 +395,7 @@ int VfsPathAccess(const VfsPath& path,uint8_t required,bool realIds)
     if(required&~7u)return -22;
     if(!path.object)return -9;
     FileMutationGuard lookup(false);
+    if((required&2) && VfsReadOnly(static_cast<MountEntry*>(path.attachment)))return -30;
     return path.object->ops->access?path.object->ops->access(path.object,required,realIds):-95;
 }
 static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
@@ -409,6 +410,7 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
     }
     if(!path.object->ops->open) { *error=-95;return nullptr; }
     auto* mount=static_cast<MountEntry*>(path.attachment);
+    if(VfsReadOnly(mount) && (flags&(VFS_O_WRITE|VFS_O_TRUNC))) { *error=-30;return nullptr; }
     if((mount->attributes&4) && !(flags&VFS_O_METADATA)) {
         VnodeStat stat{};*error=path.object->ops->stat?path.object->ops->stat(path.object,&stat):-95;
         if(*error)return nullptr;
@@ -425,7 +427,7 @@ static Vnode* VfsPathOpenLocked(const VfsPath& path,int flags,int* error)
         node->backendObject=path.object;VfsObjectRetain(path.object);
     }
     // Ownership transfer occurs while the borrowed path still pins backing.
-    VfsAttachMount(node,static_cast<MountEntry*>(path.attachment));
+    VfsAttachMount(node,static_cast<MountEntry*>(path.attachment),flags);
     if(flags&VFS_O_TRUNC) {
         *error=VfsTruncateLocked(node,0);
         if(*error) { VfsClose(node);return nullptr; }
