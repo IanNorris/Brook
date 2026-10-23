@@ -16,6 +16,8 @@ def main():
     parser.add_argument('--ldconfig', type=Path, required=True)
     parser.add_argument('--exports', type=Path, required=True)
     parser.add_argument('--include-directory', type=Path, action='append', default=[])
+    parser.add_argument('--loader', type=Path,
+                        help='Also package the matching installed x86-64 host loader')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     tool = args.ldconfig.resolve(strict=True)
@@ -84,6 +86,19 @@ def main():
                     exports=libraries, directories=sorted(map(str, directories)),
                     targets=targets, cache=str(cache),
                     cache_sha256=hashlib.sha256(cache.read_bytes()).hexdigest())
+    manifest['config_sha256'] = hashlib.sha256(config.read_bytes()).hexdigest()
+    if args.loader:
+        loader = args.loader.resolve(strict=True)
+        data = loader.read_bytes()
+        if (not loader.is_relative_to('/nix/store') or data[:6] != b'\x7fELF\x02\x01'
+                or data[18:20] != b'\x3e\x00'):
+            raise RuntimeError('Expected an installed x86-64 ELF host loader')
+        libc = (loader.parent / 'libc.so.6').resolve(strict=True)
+        if str(libc) not in targets.values():
+            raise RuntimeError('Loader libc is absent from the validated provider cache')
+        (args.output / 'ld-linux-x86-64.so.2').write_bytes(data)
+        manifest['loader'] = dict(source=str(loader), libc=str(libc),
+                                  sha256=hashlib.sha256(data).hexdigest())
     (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps(dict(cache=str(cache), cache_sha256=manifest['cache_sha256'],
                           directories=len(directories), libraries=len(targets), validated=True)))
