@@ -90,3 +90,6 @@ passed and checked sync completed. The original VM launcher was harvested with
 exit 0. Boot, data, Nix and temporary disks each passed offline fsck with exit 0.
 No kernel build or staging took place while QEMU ran. Raw client logs, private
 probes, downloaded binaries and disk images remain outside Git.
+
+The remaining main-client abort is diagnosed in the subsequent
+[PI-futex capability checkpoint](steam-pi-futex-checkpoint.md).
