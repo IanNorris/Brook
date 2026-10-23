@@ -590,7 +590,13 @@ struct MemFdData {
 static uint64_t NextMemFdInode()
 {
     static uint64_t next = 1;
-    return __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED);
+    uint64_t candidate=__atomic_load_n(&next,__ATOMIC_RELAXED);
+    for(;;) {
+        // The high owner bit distinguishes shared futex keys from task IDs.
+        // Saturate instead of ever reusing an identity after wraparound.
+        if(candidate>=(uint64_t{1}<<63))return 0;
+        if(__atomic_compare_exchange_n(&next,&candidate,candidate+1,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED))return candidate;
+    }
 }
 
 static inline void MfdLock(MemFdData* mfd)
@@ -2821,6 +2827,7 @@ static int NamedShmOpen(Process* proc,const char* name,uint32_t flags) {
             auto* backing=static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
             if(!backing) { kfree(entry);return -ENOMEM; }
             *backing={NextMemFdInode(),nullptr,0,0,0,0,1};
+            if(!backing->inode) {kfree(backing);kfree(entry);return -75;}
             memcpy(entry->name,name,strlen(name)+1);
             entry->backing=backing;entry->next=g_namedShm;g_namedShm=entry;
         }
@@ -4140,7 +4147,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (flags & MAP_SHARED) {
             auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
             if (!mfd) return -ENOMEM;
-            memset(mfd,0,sizeof(*mfd));mfd->inode=NextMemFdInode();mfd->refCount=1;mfd->seals={};
+            memset(mfd,0,sizeof(*mfd));mfd->inode=NextMemFdInode();if(!mfd->inode) {kfree(mfd);return -75;}mfd->refCount=1;mfd->seals={};
             if (!MemFdGrow(mfd,length)) { MemFdUnref(mfd); return -ENOMEM; }
             mfd->size=length;
             if(int error=MemFdAdmitMapping(mfd->seals,true,static_cast<uint32_t>(prot),&request.range.maximumProtection)) {MemFdUnref(mfd);return error;}
@@ -9862,6 +9869,7 @@ static int64_t sys_memfd_create(uint64_t nameAddr, uint64_t flags,
     auto* mfd = static_cast<MemFdData*>(kmalloc(sizeof(MemFdData)));
     if (!mfd) return -ENOMEM;
     mfd->inode        = NextMemFdInode();
+    if(!mfd->inode) {kfree(mfd);return -75;}
     mfd->pageMap      = nullptr;
     mfd->pageMapCount = 0;
     mfd->size         = 0;
@@ -12380,8 +12388,8 @@ static constexpr int FUTEX_WAKE_BITSET  = 10;
 static constexpr int FUTEX_PRIVATE_FLAG    = 128;
 static constexpr int FUTEX_CLOCK_REALTIME  = 256;
 
-// Simple futex wait queue: hash table of blocked processes keyed by user VA.
-// Since threads share address space (same page tables), the VA is sufficient.
+// Futex wait queues use private TGID/VA keys or tagged shared-memfd inode/offset
+// keys. Waiters retain the chosen value key through wake, timeout and cancellation.
 static constexpr uint32_t FUTEX_HASH_SIZE = 64;
 
 // FutexWaiter and the slot pool live in sync/futex_waiter_pool.h so the pool's
@@ -12597,18 +12605,52 @@ static int64_t FutexTimeoutDeadline(int op, uint64_t opVal, uint64_t timeoutAddr
         ? 0 : -EINVAL;
 }
 
+// A shared memfd's monotonic inode is a value identity, not an allocator or
+// physical-page address. WAIT keeps its mapping transaction through comparison
+// and queue insertion, then releases both locks before sleeping. Existing
+// aliases keep the object alive; final unmap cannot reuse this key for a new
+// object. Waiter cancellation retains only its existing Process reference.
+static int FutexMappedKey(Process* process,uint64_t address,uint64_t operation,
+                          const MappingRange* range,uint64_t& owner,uint64_t& keyAddress)
+{
+    owner=process?process->tgid:0;keyAddress=address;
+    if(address&3)return -EINVAL;
+    if((operation&FUTEX_PRIVATE_FLAG) || !range || range->kind!=MappingKind::MemFd ||
+       range->sharing!=MappingSharing::Shared || !range->backing)return 0;
+    auto* memory=static_cast<MemFdData*>(range->backing->object);
+    constexpr uint64_t SharedDomain=uint64_t{1}<<63;
+    // Reject exhaustion before publishing a key in the tagged owner domain.
+    if(!memory || !memory->inode || memory->inode>=SharedDomain)return -75;
+    const uint64_t displacement=address-range->begin;
+    if(range->offset>~uint64_t{0}-displacement)return -75;
+    owner=SharedDomain|memory->inode;keyAddress=range->offset+displacement;
+    return 0;
+}
+static int FutexResolveKey(Process* process,uint64_t address,uint64_t operation,
+                           uint64_t& owner,uint64_t& keyAddress)
+{
+    owner=process?process->tgid:0;keyAddress=address;
+    if(address&3)return -EINVAL;
+    if((operation&FUTEX_PRIVATE_FLAG) || !process || !process->addressSpace)return 0;
+    MappingTransaction transaction(process,process->addressSpace);
+    if(!transaction.LockFaultRange(address))return -ENOMEM;
+    return FutexMappedKey(process,address,operation,
+        MappingRangeFind(process->addressSpace->ranges,address),owner,keyAddress);
+}
+
 static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
                           uint64_t arg4, uint64_t arg5, uint64_t arg6)
 {
     int op = static_cast<int>(opVal) & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     Process* proc = ProcessCurrent();
-    // FUTEX_PRIVATE_FLAG is a performance hint on Linux — it tells the kernel
-    // to skip physical-page lookup and use (mm, vaddr) directly.  The flag must
-    // NOT change matching behavior for threads in the same address space.
-    // Brook threads always share their leader's page table, so the owner is
-    // always tgid regardless of the private flag.  A non-private wait must
-    // still be woken by a private wake from a sibling thread.
-    uint64_t owner = proc ? proc->tgid : 0;
+    // Private addresses keep the existing per-thread-group key. Non-private
+    // shared memfd aliases need an object/offset key across different VAs/TGIDs.
+    uint64_t owner=0,keyAddress=0;
+    owner=proc?proc->tgid:0;keyAddress=uaddrVal;
+    if(uaddrVal&3)return -EINVAL;
+    if(op!=FUTEX_WAIT && op!=FUTEX_WAIT_BITSET)
+        if(int error=FutexResolveKey(proc,uaddrVal,opVal,owner,keyAddress))return error;
+    if((owner>>63) && op!=FUTEX_WAKE && op!=FUTEX_WAKE_BITSET && op!=FUTEX_WAKE_OP)return -ENOSYS;
 
     if (op == FUTEX_WAKE || op == FUTEX_WAKE_BITSET) {
         uint32_t maxWake = static_cast<uint32_t>(val);
@@ -12617,11 +12659,15 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             ? static_cast<uint32_t>(arg6)
             : FUTEX_BITSET_MATCH_ANY;
         if (wake_bitset == 0) return -EINVAL;
-        int64_t r = FutexWake(owner, uaddrVal, maxWake, wake_bitset);
+        int64_t r = FutexWake(owner, keyAddress, maxWake, wake_bitset);
         return r;
     }
 
     if (op == FUTEX_WAKE_OP) {
+        uint64_t secondOwner=0,secondAddress=0;
+        if(int error=FutexResolveKey(proc,arg5,opVal,secondOwner,secondAddress))return error;
+        // Shared atomic RMW/requeue/PI operations need separate admission work.
+        if((owner>>63) || (secondOwner>>63))return -95;
         if (!UserBufferWritable(arg5, sizeof(uint32_t)))
             return -EFAULT;
         auto* uaddr2 = reinterpret_cast<volatile uint32_t*>(arg5);
@@ -12664,9 +12710,9 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
 
         uint32_t maxWake1 = static_cast<uint32_t>(val);
         uint32_t maxWake2 = static_cast<uint32_t>(arg4);
-        int64_t woken = maxWake1 ? FutexWake(owner, uaddrVal, maxWake1) : 0;
+        int64_t woken = maxWake1 ? FutexWake(owner, keyAddress, maxWake1) : 0;
         if (cmp && maxWake2)
-            woken += FutexWake(owner, arg5, maxWake2);
+            woken += FutexWake(secondOwner, secondAddress, maxWake2);
         return woken;
     }
 
@@ -12686,7 +12732,22 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             ? static_cast<uint32_t>(arg6) : FUTEX_BITSET_MATCH_ANY;
         if (!waitBitset) return -EINVAL;
 
-        // Acquire futex lock, atomically check value, and enqueue
+        // Fault safely before taking mapping/futex locks. The mapping
+        // transaction then keeps key derivation, value comparison and queue
+        // publication in one admission interval against unmap/remap.
+        uint32_t prefault=0;
+        if(!CopyFromUser(&prefault,uaddrVal,sizeof(prefault)))return -EFAULT;
+        {
+        MappingTransaction mapping(proc,proc->addressSpace);
+        if(!mapping.LockFaultRange(uaddrVal))return -ENOMEM;
+        const auto* range=MappingRangeFind(proc->addressSpace->ranges,uaddrVal);
+        if(!range || !(range->protection&1) || uaddrVal>range->end || range->end-uaddrVal<4)return -EFAULT;
+        // A concurrent remap after prefault may install a new lazy range.
+        // Never fault while holding AS mutation or the IRQ futex lock: let
+        // userspace retry admission instead of touching an absent leaf.
+        const uint64_t leaf=VmmReadLeaf(proc->addressSpace->pageTable,VirtualAddress(uaddrVal));
+        if(!(leaf&VMM_PRESENT) || !(leaf&VMM_USER))return -EAGAIN;
+        if(int error=FutexMappedKey(proc,uaddrVal,opVal,range,owner,keyAddress))return error;
         uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
 
         // Check if *uaddr == val while holding the lock
@@ -12707,11 +12768,11 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             SerialPrintf("sys_futex: ENOMEM (pool exhausted) pid=%u\n", proc->pid);
             return -ENOMEM;
         }
-        w->uaddr = uaddrVal;
+        w->uaddr = keyAddress;
         w->owner = owner;
         w->proc = proc;
         w->bitset = waitBitset;
-        uint32_t bucket = FutexHash(owner, uaddrVal);
+        uint32_t bucket = FutexHash(owner, keyAddress);
         ProcessRef(proc); // owned by linked waiter, then wake/remove/cancel
         w->next = g_futexBuckets[bucket];
         g_futexBuckets[bucket] = w;
@@ -12730,6 +12791,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         // Release the futex lock (restoring interrupts) BEFORE blocking — a
         // process must never be descheduled with interrupts disabled.
         IrqSpinLockRelease(&g_futexLock, fxFlags);
+        } // release mapping transaction, backing pins and AS gates before wait
         FutexLog(0, uaddrVal, proc->pid, (int32_t)val);  // WAIT-enqueue
 
         for (;;) {
@@ -12737,7 +12799,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             const bool interrupted = HasPendingSignals();
             const bool expired = deadline.finite && deadline.expired(ClockNowNs(deadline.clockId));
             if (interrupted || expired || !deadline.finite) {
-                if (!FutexRemoveWaiter(owner, uaddrVal, proc)) break;
+                if (!FutexRemoveWaiter(owner, keyAddress, proc)) break;
                 if (interrupted) return -EINTR;
                 if (expired) return -ETIMEDOUT;
                 // BRO-205: an infinite wait may return spuriously, but must
@@ -12746,7 +12808,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
             }
             // Finite early wake: retain the entry so concurrent FUTEX_WAKE
             // cannot disappear between a dequeue and a new enqueue.
-            if (!FutexRearmWaiter(owner, uaddrVal, proc, deadline)) break;
+            if (!FutexRearmWaiter(owner, keyAddress, proc, deadline)) break;
         }
 
         FutexLog(1, uaddrVal, proc->pid, 0);  // WAIT-return (woken)
@@ -12770,7 +12832,7 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         auto* uaddr = reinterpret_cast<volatile uint32_t*>(uaddrVal);
         if (!UserBufferWritable(uaddrVal, 4)) return -EFAULT;
         __atomic_store_n(uaddr, 0u, __ATOMIC_SEQ_CST);
-        FutexWake(owner, uaddrVal, 1, FUTEX_BITSET_MATCH_ANY);
+        FutexWake(owner, keyAddress, 1, FUTEX_BITSET_MATCH_ANY);
         return 0;
     }
 
@@ -13631,6 +13693,7 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
     if (!src || src->type == FdType::None) return false;
     switch (src->type) {
         case FdType::Pipe:
+        case FdType::DevDri:
         case FdType::SignalFd:
         case FdType::SyncFile:
         case FdType::EventFd:
@@ -13738,6 +13801,11 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap)
             UnixSocketHandleUnref(snap->handle);
             break;
         }
+        case FdType::DevDri:
+            // Queued rights own the same DRM context reference as dup().
+            // Share ordinary final-close retirement when a message is discarded.
+            FinalizeClosedFd({FdType::DevDri,snap->handle,snap->flags});
+            break;
         case FdType::DrmPrime:
             DrmPrimeUnref(static_cast<DrmPrimeObj*>(snap->handle));
             break;

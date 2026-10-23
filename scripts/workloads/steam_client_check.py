@@ -58,6 +58,11 @@ def main():
         platform / 'lib/x86_64-linux-gnu', platform / 'usr/lib/x86_64-linux-gnu']))
     client_libraries = ':'.join(map(str, [client / 'steamrt64', client / 'ubuntu12_64',
         client / 'hostlibs', platform / 'lib/x86_64-linux-gnu', platform / 'usr/lib/x86_64-linux-gnu']))
+    # GLVND loads its vendor by SONAME. The staged exports can omit this
+    # transitive Mesa output even though it is installed in the guest profile.
+    mesa_vendor = Path('/nix/profile/lib/libGLX_mesa.so.0')
+    if mesa_vendor.exists():
+        client_libraries += ':' + str(mesa_vendor.resolve(strict=True).parent)
     env = dict(os.environ, HOME=str(home), DISPLAY=args.display,
                XDG_CONFIG_HOME=str(home / '.config'), XDG_CACHE_HOME=str(home / '.cache'),
                XDG_DATA_HOME=str(home / '.local/share'), XDG_RUNTIME_DIR='/tmp',
