@@ -922,3 +922,21 @@ The initrd must be regenerated with real `/dev/dri` and `/sys/dev/char`
 directories. Broker visibility follows their retained identity, including genuine
 binds; replacing them with unrelated directories must hide the broker. `nodev`
 still denies new device opens without revoking descriptors already opened.
+
+`sharedcontrolcheck.c` tests a small named control channel with an independently
+exec'd helper. It uses an 8,208-byte object (including the final 16-byte partial
+page), separate opens, shared read/write and read-only aliases, and closes file
+descriptors while mappings remain live. Eight pipe-ordered exchanges isolate
+basic coherence; 64 acquire/release exchanges then exercise process-shared
+futex wait/wake after unlinking and replacing the pathname. The replacement
+must remain separate from the still-live old channel. A 30-second watchdog
+bounds the test, and the parent cleans up its owned child and pathname.
+
+Build static musl with `-std=c11 -O2 -Wall -Wextra -Werror`. Run the binary without
+arguments as the desktop user, with writable `/dev/shm`, working proc-exe and
+permission to execute the binary again. Require both `SHAREDCONTROLCHECK
+pipe-coherence PASS` and the final `SHAREDCONTROLCHECK PASS` with exit zero and
+no live descendants. It prints fixed stages/counts, never application contents.
+This tests known-data coherence and ordinary shared-futex handshakes; it does
+not establish Steam protocol correctness, owner-liveness interpretation, or
+all possible shared-memory races.
