@@ -1562,6 +1562,7 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
     if (!g_sockUsed[sockIdx]) return -1;
 
     Socket& s = g_sockets[sockIdx];
+    if (s.type != SOCK_DGRAM) return -95;
 
     // One-shot poll: give the NIC a chance to deliver any already-DMA'd
     // packets, but don't spin. Caller uses non-blocking semantics (returns
@@ -2730,82 +2731,41 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
     return static_cast<int>(sent);
 }
 
-int SockRecv(int sockIdx, void* buf, uint32_t len)
+int SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
     if (!g_sockUsed[sockIdx]) return -1;
 
     Socket& s = g_sockets[sockIdx];
     if (s.type != SOCK_STREAM) return -95;
+    if (!len) return 0;
 
-    // Block until data arrives or the connection closes.
-    //
-    // IMPORTANT: the "is there data?" check must happen while holding the socket
-    // lock.  Without the lock, a packet can arrive between the check and setting
-    // pollWaiter — HandleTcp sees pollWaiter==null, skips the wakeup, and we
-    // sleep for the full 10-second timeout with data sitting in the buffer.
-    //
-    // We use a 10-second wakeupTick as a heartbeat so we re-check state
-    // periodically even without a data wakeup (e.g., after a missed timer).
-    // We do NOT return EAGAIN on a per-heartbeat timeout — blocking sockets
-    // must never surface EAGAIN, because callers (OpenSSL/curl) would retry
-    // immediately and each retry would stall another 10 seconds, giving the
-    // 6 × 10s = 60s failure pattern.  Instead we loop until data arrives,
-    // the connection closes, or a 30-second hard timeout fires.
-    if (s.rxCount == 0 && !s.tcpRstRecv && !s.tcpFinRecv &&
-        s.tcpState != TcpState::Closed) {
-
-        Process* self = SchedulerCurrentProcess();
-        // 30-second hard deadline — enough for slow TLS handshakes but
-        // won't hang the browser for 3 minutes on a dead peer.
-        uint64_t hardDeadline = ApicTickCount() + 30000;
-
-        while (true) {
-            SpinLockAcquire(&s.lock);
-            bool ready = s.rxCount > 0 || s.tcpRstRecv || s.tcpFinRecv
-                         || s.tcpState == TcpState::Closed
-                         || ApicTickCount() >= hardDeadline;
-            if (ready) {
-                SpinLockRelease(&s.lock);
-                break;
-            }
-            // Set pollWaiter while holding the lock so HandleTcp can never
-            // enqueue data and miss the wakeup in a race window.
-            s.pollWaiter = self;
-            self->wakeupTick = ApicTickCount() + 100; // heartbeat every 100ms
+    // Test readiness, install the waiter and consume under the same lock.
+    // Competing readers can drain a prior readiness indication; keep waiting
+    // against the original deadline instead of manufacturing an early timeout.
+    Process* self=SchedulerCurrentProcess();
+    const uint64_t hardDeadline=ApicTickCount()+30000;
+    for (;;) {
+        SpinLockAcquire(&s.lock);
+        if (s.rxCount) break; // retain the lock through the ring copy below
+        const int error=s.tcpRstRecv?-104:
+            (s.tcpFinRecv || s.tcpState==TcpState::Closed)?0:
+            (dontwait || !self)?-11:ApicTickCount()>=hardDeadline?-110:1;
+        if(error!=1) {
             SpinLockRelease(&s.lock);
-            SchedulerBlock(self);
-
-            // Allow signals (e.g. SIGALRM from curl's --max-time) to
-            // interrupt the recv.  Without this, curl can never enforce
-            // its own timeout while blocked in our kernel recv path.
-            {
-                uint64_t pending = self->sigPending & ~self->sigMask;
-                if (pending != 0)
-                    return -4; // EINTR
-            }
+            return error;
         }
+        s.pollWaiter=self;
+        self->wakeupTick=ApicTickCount()+100;
+        SpinLockRelease(&s.lock);
+        SchedulerBlock(self);
+        SpinLockAcquire(&s.lock);
+        if(s.pollWaiter==self)s.pollWaiter=nullptr;
+        SpinLockRelease(&s.lock);
+        if(self->sigPending & ~self->sigMask)return -4;
     }
 
-    if (s.rxCount == 0) {
-        if (s.tcpRstRecv) {
-            SerialPrintf("tcp: SockRecv ECONNRESET (RST) fd=%d\n", sockIdx);
-            return -104; // ECONNRESET
-        }
-        if (s.tcpFinRecv || s.tcpState != TcpState::Established) {
-            SerialPrintf("tcp: SockRecv EOF fd=%d finRecv=%d state=%d\n",
-                         sockIdx, (int)s.tcpFinRecv, (int)s.tcpState);
-            return 0; // EOF
-        }
-        // 30-second hard timeout — connection is established but no data
-        // arrived at all.  Server likely gone without sending RST/FIN.
-        SerialPrintf("tcp: SockRecv hard timeout fd=%d rxPkts=%u state=%d\n",
-                     sockIdx, s.rxPktCount, (int)s.tcpState);
-        return -110; // ETIMEDOUT (not EAGAIN — blocking socket must not return EAGAIN)
-    }
-
-    // Stream read — no framing, just read bytes from ring buffer
-    SpinLockAcquire(&s.lock);
+    // Stream read — no framing, just read bytes from the resident kernel ring.
     uint32_t copyLen = s.rxCount < len ? s.rxCount : len;
     // Capture free space BEFORE consuming, to decide whether window was constrained.
     uint32_t freeBefore = Socket::RX_BUF_SIZE - s.rxCount;

@@ -1365,6 +1365,8 @@ static inline int UnixFdQueueCount(const UnixFdQueue* q)
 struct UnixPendingConn {
     UnixCredentials clientCredentials;
     uint64_t clientIncarnation,clientLaunchId;
+    uint8_t clientAddress[110];
+    uint32_t clientAddressLength;
     PipeBuffer* serverRx;     // server reads this (client→server data)
     PipeBuffer* serverTx;     // server writes this (server→client data)
     UnixFdQueue* serverRxFds; // server reads these fds (client→server)
@@ -1392,6 +1394,8 @@ struct UnixSocketData {
     // locally bound address separately for getsockname and accepted endpoints.
     uint8_t localAddress[110];
     uint32_t localAddressLength;
+    uint8_t peerAddress[110];
+    uint32_t peerAddressLength;
     UnixPendingConn pending[UNIX_ACCEPT_QUEUE];
     int             pendingCount;
     Process*        acceptWaiter;
@@ -13418,6 +13422,8 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         }
         usd->peerCredentials = server->peerCredentials;
         usd->peerIncarnation=server->peerIncarnation;usd->peerLaunchId=server->peerLaunchId;
+        usd->peerAddressLength=server->localAddressLength;
+        memcpy(usd->peerAddress,server->localAddress,sizeof(usd->peerAddress));
         usd->rxPipe = pipeSC;
         usd->txPipe = pipeCS;
         usd->incomingFds = fdqSC;
@@ -13432,6 +13438,8 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         pending.serverTxFds = fdqSC;
         pending.clientCredentials = UnixCurrentCredentials(proc);
         pending.clientIncarnation=UnixCurrentIncarnation(proc);pending.clientLaunchId=proc->launchId;
+        pending.clientAddressLength=usd->localAddressLength;
+        memcpy(pending.clientAddress,usd->localAddress,sizeof(pending.clientAddress));
         pending.used = true;
         ++server->pendingCount;
         if (server->acceptWaiter) {
@@ -13684,6 +13692,28 @@ static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnam
     return 0;
 }
 
+static int64_t UnixSocketName(UnixSocketData* socket,bool peer,uint64_t addrVal,uint64_t addrLenVal)
+{
+    uint8_t address[sizeof(SockAddrUn)]={1,0};uint32_t actual=2;
+    SpinLockAcquire(&g_unixRegistryLock);
+    if(peer && socket->state!=UnixSocketData::State::Connected) {
+        SpinLockRelease(&g_unixRegistryLock);return -ENOTCONN;
+    }
+    const uint32_t length=peer?socket->peerAddressLength:socket->localAddressLength;
+    if(length) {
+        actual=length;
+        memcpy(address,peer?socket->peerAddress:socket->localAddress,length);
+    }
+    SpinLockRelease(&g_unixRegistryLock);
+    uint32_t requested=0;
+    if(!CopyFromUser(&requested,addrLenVal,sizeof(requested)))return -EFAULT;
+    if(requested>0x7fffffffu)return -EINVAL;
+    const uint32_t copied=requested<actual?requested:actual;
+    if((copied && !CopyToUser(addrVal,address,copied)) ||
+       !CopyToUser(addrLenVal,&actual,sizeof(actual)))return -EFAULT;
+    return 0;
+}
+
 static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVal,
                                 uint64_t, uint64_t, uint64_t)
 {
@@ -13693,20 +13723,7 @@ static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
     FdRef descriptor(proc,static_cast<int>(fdVal));
     if (!descriptor) return -EBADF;
     if (descriptor->type==FdType::UnixSocket && descriptor->handle) {
-        uint32_t requested=0;
-        if (!CopyFromUser(&requested,addrLenVal,sizeof(requested))) return -EFAULT;
-        if (requested>0x7fffffffu) return -EINVAL;
-        uint8_t address[sizeof(SockAddrUn)]={1,0};uint32_t actual=2;
-        auto* socket=static_cast<UnixSocketData*>(descriptor->handle);
-        SpinLockAcquire(&g_unixRegistryLock);
-        if (socket->localAddressLength) {
-            actual=socket->localAddressLength;memcpy(address,socket->localAddress,actual);
-        }
-        SpinLockRelease(&g_unixRegistryLock);
-        const uint32_t copied=requested<actual?requested:actual;
-        if ((copied && !CopyToUser(addrVal,address,copied)) ||
-            !CopyToUser(addrLenVal,&actual,sizeof(actual))) return -EFAULT;
-        return 0;
+        return UnixSocketName(static_cast<UnixSocketData*>(descriptor->handle),false,addrVal,addrLenVal);
     }
 
     int fd = static_cast<int>(fdVal);
@@ -13741,10 +13758,15 @@ static int64_t sys_getpeername(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
     Process* proc = ProcessCurrent();
 
     if (!proc) return -ENOSYS;
-    int fd = static_cast<int>(fdVal);
+    KernelOperationGuard operation(proc);
+    FdRef descriptor(proc,static_cast<int>(fdVal));
+    if(!descriptor)return -EBADF;
+    if(descriptor->type==FdType::UnixSocket && descriptor->handle)
+        return UnixSocketName(static_cast<UnixSocketData*>(descriptor->handle),true,addrVal,addrLenVal);
+    if(descriptor->type!=FdType::Socket)return -ENOTSOCK;
 
     // For inet DGRAM sockets that are "connected" via connect(), return the peer address
-    int sockIdx = GetSockIdx(proc, fd);
+    int sockIdx=static_cast<int>(reinterpret_cast<uintptr_t>(descriptor->handle))-1;
     if (sockIdx >= 0) {
         uint32_t remIp = 0;
         uint16_t remPort = 0;
@@ -13870,6 +13892,8 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
                 serverSock->peerLaunchId=pending.clientLaunchId;serverSock->acceptedEndpoint=true;
                 serverSock->localAddressLength=usd->localAddressLength;
                 memcpy(serverSock->localAddress,usd->localAddress,sizeof(serverSock->localAddress));
+                serverSock->peerAddressLength=pending.clientAddressLength;
+                memcpy(serverSock->peerAddress,pending.clientAddress,sizeof(serverSock->peerAddress));
                 serverSock->nonblock = (flags & UNIX_SOCK_NONBLOCK) != 0;
                 serverSock->rxPipe = pending.serverRx;
                 serverSock->txPipe = pending.serverTx;
@@ -14493,8 +14517,55 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         return record && (flagsVal&0x20)?static_cast<int64_t>(messageLength):total;
     }
 
-    int sockIdx = GetSockIdx(proc, fd);
+    if(!fde)return -EBADF;
+    if(fde->type!=FdType::Socket)return -ENOTSOCK;
+    int sockIdx=static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle))-1;
     if (sockIdx < 0) return -EBADF;
+
+    if(brook::SockIsStream(sockIdx)) {
+        // TCP has no datagram header. Stage one stream read, then scatter it
+        // outside the socket lock; user faults must never hold that lock.
+        if(flagsVal&~(0x40ULL|0x4000ULL|0x40000000ULL))return -95;
+        struct Allocations {
+            void* vectors=nullptr;
+            void* bytes=nullptr;
+            ~Allocations(){kfree(bytes);kfree(vectors);}
+        } allocated;
+        const uint64_t vectorBytes=msg->msg_iovlen*sizeof(*msg->msg_iov);
+        if(vectorBytes) {
+            allocated.vectors=kmalloc(static_cast<uint32_t>(vectorBytes));
+            if(!allocated.vectors)return -ENOMEM;
+            if(!CopyFromUser(allocated.vectors,reinterpret_cast<uint64_t>(msg->msg_iov),vectorBytes))return -EFAULT;
+        }
+        auto vectors=static_cast<decltype(msg->msg_iov)>(allocated.vectors);
+        uint64_t capacity=0;
+        for(uint64_t i=0;i<msg->msg_iovlen;++i)
+            if(__builtin_add_overflow(capacity,vectors[i].iov_len,&capacity) || capacity>0x7fffffffffffffffULL)return -EINVAL;
+        const uint32_t count=static_cast<uint32_t>(capacity<65536?capacity:65536);
+        uint32_t remaining=count;
+        for(uint64_t i=0;i<msg->msg_iovlen && remaining;++i) {
+            const uint32_t bytes=static_cast<uint32_t>(vectors[i].iov_len<remaining?vectors[i].iov_len:remaining);
+            if(bytes && !UserBufferWritable(reinterpret_cast<uint64_t>(vectors[i].iov_base),bytes))return -EFAULT;
+            remaining-=bytes;
+        }
+        int result=0;
+        if(count) {
+            allocated.bytes=kmalloc(count);if(!allocated.bytes)return -ENOMEM;
+            const bool nonblock=dontwait || (fde->statusFlags&0x800) || brook::SockIsNonblock(sockIdx);
+            result=brook::SockRecv(sockIdx,allocated.bytes,count,nonblock);
+            if(result<0)return result;
+            uint32_t copied=0;
+            for(uint64_t i=0;i<msg->msg_iovlen && copied<static_cast<uint32_t>(result);++i) {
+                const uint32_t left=static_cast<uint32_t>(result)-copied;
+                const uint32_t bytes=static_cast<uint32_t>(vectors[i].iov_len<left?vectors[i].iov_len:left);
+                if(bytes && !CopyToUser(reinterpret_cast<uint64_t>(vectors[i].iov_base),static_cast<uint8_t*>(allocated.bytes)+copied,bytes))return -EFAULT;
+                copied+=bytes;
+            }
+        }
+        msg->msg_flags=0;msg->msg_controllen=0;msg->msg_namelen=0;
+        if(!CopyToUser(msgVal,msg,sizeof(*msg)))return -EFAULT;
+        return result;
+    }
 
     if(!msg->msg_iovlen)return -EINVAL;
     void* buf = msg->msg_iov[0].iov_base;

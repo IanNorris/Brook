@@ -163,3 +163,36 @@ reliable per-call correlation. The next application probe needs bounded,
 atomic records of socket kind, endpoint category, operation, flags, byte counts
 and error, without exporting payloads. Local and remote transport must be
 distinguished before choosing which compatibility defect to pursue.
+
+## Native socket repairs
+
+A bounded userspace probe confirms both gaps in the real client. On the old
+kernel, a successful Unix connect is immediately followed by `ENOTCONN` from
+`getpeername`. Separately, accepted IPv4 TCP descriptors reach `recvmsg` and
+the UDP decoder returns bogus stream lengths. The probe records only numeric
+socket metadata, never message contents.
+
+Unix endpoints now retain a snapshot of their peer's bound address at connect
+and accept. Unnamed peers report the address family alone, and names survive
+unlink, listener close and peer close without retaining the peer object.
+TCP `recvmsg` stages a stream read and scatters it after releasing the socket
+lock. It honors nonblocking reads and rejects unsupported flags explicitly.
+The receive loop rechecks readiness under its lock, so competing readers do
+not turn a stolen readiness indication into a premature timeout. UDP decoding
+also rejects stream sockets defensively.
+
+The same final candidate passes 21 native Unix-name cases and 17 TCP/UDP cases,
+including invalid-pointer behavior, name truncation and lifetime, scatter
+reads, EOF, competing blocking readers, and a complete 128 KiB transfer.
+Both controls pass on Linux. All 104 host tests and the compiled entry and
+scheduler audits pass; the production kernel builds with all 13 module imports
+resolved. The candidate kernel SHA-256 is
+`d9522fe5a9e89435d4739c41688a74aff6e04a84c77601805f9fa126dde0c898`.
+
+In the repaired Steam retry, the sampled main process records 554 successful
+Unix peer-name queries. Accepted loopback TCP reads now return 544-byte chunks
+where the prior decoder returned 1,024 bytes. Steam reaches its large shared
+pool handoff, but still displays **Unexpected Transport Error**; login is not
+verified. One persistent-memory allocator warning remains in this run, without
+establishing its cause. The isolated red-bar presentation issue also remains
+open. These repairs resolve demonstrated socket defects, not Steam acceptance.

@@ -388,7 +388,7 @@ int  SockSend(int sockIdx, const void* buf, uint32_t len);
 // Destination must be resident kernel memory. The receive-ring copy holds a
 // spinlock; syscall callers stage bytes here and fault-aware copy to userspace
 // only after return.
-int  SockRecv(int sockIdx, void* buf, uint32_t len);
+int  SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait = false);
 bool SockIsStream(int sockIdx);  // returns true for SOCK_STREAM (TCP)
 int  SockGetType(int sockIdx);  // returns SOCK_STREAM(1) or SOCK_DGRAM(2)
 void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port);
