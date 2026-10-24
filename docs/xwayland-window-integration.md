@@ -80,9 +80,12 @@ above Friends. Native activation now raises the matching X window as well as
 focusing it. An overlapping-window control fails on the live baseline helper
 and passes on the corrected helper. The same review confirms both Steam windows
 explicitly request decorations=0; ignoring that property caused double chrome.
-The focus/stack and client-chrome changes pass host controls but still require
-a restarted native Steam acceptance run; they are not applied to the user's
-ongoing review session.
+The restarted native O review verifies Friends' close button while it overlaps
+Steam, plus Steam's own minimize button and taskbar restore, with no duplicate
+chrome. The Q review additionally verifies client maximize/restore and Friends'
+client-driven title drag and bottom-right resize: it moves independently from
+(1070,432) to (752,234), then resizes from 300×650 to a matching 475×710 native
+window and buffer. The maximized main client stays at 1920×1036.
 
 The launcher uses a private `-displayfd` channel and checks the chosen display,
 plus a bounded startup deadline. The first native attempt used `-nolock`, which
@@ -126,7 +129,8 @@ independently while Library stays maximized. The native Wayland editor remains
 on the same compositor. These private captures establish individual-window
 presentation and real application rendering; they do not yet establish all
 dialogs, successful installation or long-term stability. Friends' own client
-close button after movement remains an input-alignment acceptance check.
+close button is verified after the focus/stack correction; the later Q review
+adds client-driven movement and resizing controls.
 
 Known gaps and remaining gates:
 

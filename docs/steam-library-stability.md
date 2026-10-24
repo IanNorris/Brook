@@ -163,3 +163,25 @@ real runtime supervisor reading a newly created, unlinked environment FD and
 launching a no-op child with the expected environment. Supported entry-state,
 scheduler-start and lock/wait mutation audits pass. The actual game retry and
 longer Steam acceptance remain separate gates.
+
+
+On the actual Q game retry, the supervisor's proc-fd error is gone. The next
+failure is an ELF32/EM_386 Steam `reaper` helper falling through to a shell
+syntax error. Header-only inspection of the installed game also finds a 32-bit
+x86 executable; this title requires a separate i386 execution milestone.
+No game launch success is claimed. The authenticated native64 Steam Library
+continues rendering and accepting navigation and window controls in this run.
+Client maximize/restore works, and Friends independently moves and resizes to a
+matching 475×710 native window and buffer without duplicate chrome.
+
+
+Final Q acceptance closes Friends after its move/resize, then exits Steam
+through its own menu. The original Steam wrapper finishes with code zero,
+empty job group and stdout/stderr EOF. One detached helper is drained with
+SIGTERM before orderly VM shutdown; automatic orphan cleanup remains a
+follow-up, not an accepted behavior. Final sync is acknowledged, the original
+VM launcher returns zero, the stopped serial gate passes and all four offline
+filesystem checks return zero. The same main Steam process/window identity
+survives the bounded navigation, game-attempt and window-control sequence;
+this establishes usable authenticated Library/rootless integration, not
+unbounded client uptime or native i386 game execution.

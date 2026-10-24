@@ -1516,8 +1516,9 @@ each probe's argument parser.
   are not accepted.
 - Stock rootful Xwayland starts with software shared-memory rendering inside
   Brook. Normal user launch needs real hard-link lockfiles; the guest-root
-  `-nolock` diagnostic is not a launch default. Rootless integration and GPU
-  acceleration are separate future milestones.
+  `-nolock` diagnostic is not a launch default. Owned rootless integration now
+  supports independent native windows; broader transient policy and Xwayland GPU
+  acceleration remain separate acceptance work.
 
 - Ext2 allocation-error reporting: the mount-namespace retained-rename fault
   probe observes ENOENT at injected allocation position 4 rather than ENOMEM.
@@ -1575,3 +1576,29 @@ each probe's argument parser.
   match alone cannot prove the return belongs to the printed arguments.
 - Scope repeated-error suppression to a task or protect its shared state;
   the current static last-call fields are shared across tracing threads.
+
+
+### Steam game launch: 32-bit execution (24 October)
+
+- Stealth Bastard Deluxe (AppID 209190) installs and verifies in the private
+  authenticated Steam review. Two prior pre-game handoff failures are fixed:
+  the missing companion launcher service and regular proc-fd environment-file
+  reopening (including newly created ext2 descriptors).
+- The next actual retry reaches a 32-bit x86 `reaper` helper, which cannot execute
+  through Brook's current native64 ELF path and falls back to a shell syntax
+  error. Header-only inspection also confirms the installed game's executable
+  is ELF32/EM_386. Replacing one helper alone will not make this title runnable.
+- Plan native i386 execution/multilib deliberately, including entry state,
+  syscalls, signals, TLS and loader ABI. Keep a native64 game acceptance option
+  separate from that milestone. No proprietary game files, binary hashes,
+  authenticated captures or account logs belong in git.
+
+- Normalize restored X window geometry against the current work area. A stored
+  1916×996 Steam client opens at (40,80), partly outside a 1920×1080 desktop;
+  native maximize fits it to 1920×1036. Check initial placement and off-screen
+  clipping/input correspondence separately from the now-verified CSD controls.
+
+- Drain detached Steam/CEF helper groups after normal client Exit so ordinary
+  lifecycle shutdown does not wait on an orphan. The final Q review exits the
+  Steam wrapper cleanly but still needs SIGTERM for one detached helper before
+  the checked shutdown; no forced VM stop is needed.
