@@ -414,3 +414,60 @@ remaining owned Steam leaders. Heap integrity, checked guest sync, original
 QEMU-owner exit zero and all four offline filesystem checks pass. The code and
 portable regression are pushed on `wip/steam-login-20261022`; authentication
 readiness and intermittent red bars remain open.
+
+
+## Shared INET nonblocking state
+
+A bounded main-process probe observes O_NONBLOCK on descriptors whose remote
+connect calls return synchronous success. This observation prompts a direct
+loopback comparison rather than a conclusion from missing I/O records. In the
+native baseline, creation with SOCK_NONBLOCK returns EINPROGRESS, while setting
+the same visible flag afterward with either F_SETFL or FIONBIO returns zero.
+The latter setters update only descriptor metadata; SockConnect consults a
+separate transport flag that they leave unchanged.
+
+The candidate keeps the INET nonblocking bit on the shared socket object,
+accessed atomically. Both setters update it, F_GETFL replaces the cached bit
+with its current value, and connect, TCP receive and listener waiting use that
+canonical state. TCP read/recv pass their effective mode through to the locked
+receive loop, avoiding the old readiness-precheck race. MSG_DONTWAIT remains a
+per-call override. Other file flags and other descriptor classes are not
+claimed to acquire complete shared-open-file-description semantics.
+
+`inet_nonblocking_check.py` passes 24 cases on Linux and the fresh native
+candidate: both controls through duplicate aliases, async connects, delayed
+reads after clearing creation-time nonblocking mode, per-call receive flags,
+competing readers, and both listener/accepted-socket mode policies. The delayed
+and competing-reader cases are bounded behavioral/stress checks, not forced
+proof of every scheduling interleaving. All 18 metadata cases and the three
+public certificate-verified HTTPS controls also pass afterward. The Release
+kernel and three compiled audits pass; again 106 host tests pass in parallel,
+with the existing audio-delivery timeout passing in isolation.
+
+This does not repair SockSend's synchronous ACK waits or blocking UDP receive.
+The instrumented baseline is preserved in
+`build/reviews/steam-remote-trace-j-20261024`, and the uninstrumented candidate
+is `build/reviews/steam-nonblock-login-k-20261024`. The former passes heap,
+sync, original-owner exit and all four offline filesystem checks. Probe caps,
+libc bypasses and serial trace interleaving prevent absence-based conclusions
+about the baseline's later network calls. QR readiness remains unverified.
+
+
+## Native QR login readiness accepted
+
+The uninstrumented nonblocking candidate reaches the native Steam login screen
+with a sharp QR code, replacing the blurred refresh placeholder. An independent
+QR decoder recognizes the Steam login URL shape in two private completed-frame
+captures. Their challenges differ, confirming renewal rather than a frozen
+image. Only decoder success, expected-URL-shape booleans and the renewal boolean
+are exported; no challenge URL, token, hash or screenshot is committed.
+
+The same VM passes the 24 nonblocking cases, all 18 socket metadata cases and
+three public verified-TLS controls. Its original helper wrapper is pristine,
+and the launch source adds no diagnostic preload. Read-only X11 queries succeed
+without protocol errors. The kernel/runtime manifest matches the live bridge
+session. The earlier independent keyboard validation remains documented above.
+The VM is deliberately left running for the user to scan the code. This accepts
+login readiness, not completed account authentication, library use or game
+launches. Intermittent red-bar rendering and the explicitly excluded network
+semantics remain separate open work.

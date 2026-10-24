@@ -2280,7 +2280,7 @@ static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
 // a userspace pointer: even a previously validated writable page may need CoW
 // or be remapped before that copy, and fault resolution can sleep on mapping
 // mutexes. Stage resident kernel bytes, then copy out after the socket unlocks.
-static int64_t ReceiveTcpToUser(int sockIdx, uint64_t address, uint64_t count)
+static int64_t ReceiveTcpToUser(int sockIdx, uint64_t address, uint64_t count, bool dontwait)
 {
     if (!count) return 0;
     const uint32_t size = static_cast<uint32_t>(count < 65536 ? count : 65536);
@@ -2288,7 +2288,7 @@ static int64_t ReceiveTcpToUser(int sockIdx, uint64_t address, uint64_t count)
     KernelOperationGuard operation(ProcessCurrent());
     auto* staged = static_cast<uint8_t*>(kmalloc(size));
     if (!staged) return -ENOMEM;
-    int result = brook::SockRecv(sockIdx, staged, size);
+    int result = brook::SockRecv(sockIdx, staged, size, dontwait);
     if (result > 0 && !CopyToUser(address, staged, static_cast<uint32_t>(result)))
         result = -EFAULT;
     kfree(staged);
@@ -2755,12 +2755,10 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
     if (fde->type == FdType::Socket && fde->handle)
     {
         int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-        bool nonblock = (fde->statusFlags & 0x800) != 0 || brook::SockIsNonblock(sockIdx);
+        bool nonblock = brook::SockIsNonblock(sockIdx);
         if (brook::SockIsStream(sockIdx))
         {
-            if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
-                return -EAGAIN;
-            return ReceiveTcpToUser(sockIdx, bufAddr, count);
+            return ReceiveTcpToUser(sockIdx, bufAddr, count, nonblock);
         }
         // UDP: read() pulls one datagram from the rx queue.  SockRecvFrom
         // returns -EAGAIN when empty; non-blocking sockets propagate that,
@@ -6911,12 +6909,16 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         bool nonblock = *reinterpret_cast<int*>(arg) != 0;
         if (fde->type == FdType::Socket || fde->type == FdType::UnixSocket ||
             FdPipe(fde) || fde->type == FdType::DevTty) {
+            SpinLockAcquire(ProcessFdLock(proc));
             if (nonblock)
                 fde->statusFlags |= 0x800; // O_NONBLOCK
             else
                 fde->statusFlags &= ~0x800u;
             if (fde->type == FdType::UnixSocket && fde->handle)
                 static_cast<UnixSocketData*>(fde->handle)->nonblock = nonblock;
+            if (fde->type == FdType::Socket && fde->handle)
+                brook::SockSetNonblock(static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1, nonblock);
+            SpinLockRelease(ProcessFdLock(proc));
             return 0;
         }
         return -25; // ENOTTY
@@ -8605,7 +8607,12 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
     case F_GETFL:
     {
         SpinLockAcquire(ProcessFdLock(proc));
-        const uint32_t status = fde->statusFlags;
+        uint32_t status = fde->statusFlags;
+        // INET status is shared by dup/fork aliases through the socket object.
+        if (fde->type == FdType::Socket && fde->handle) {
+            const int index = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+            status = (status & ~0x800u) | (brook::SockIsNonblock(index) ? 0x800u : 0);
+        }
         SpinLockRelease(ProcessFdLock(proc));
         return status;
     }
@@ -8617,6 +8624,9 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
         // Access mode bits (O_RDONLY/O_WRONLY/O_RDWR) are preserved from open.
         SpinLockAcquire(ProcessFdLock(proc));
         fde->statusFlags = (fde->statusFlags & 0x3) | (static_cast<uint32_t>(arg) & ~0x3u);
+        if (fde->type == FdType::Socket && fde->handle)
+            brook::SockSetNonblock(static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1,
+                                  (fde->statusFlags & 0x800) != 0);
         SpinLockRelease(ProcessFdLock(proc));
         return 0;
     }
@@ -13549,15 +13559,11 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
-    (void)flagsVal;
-
     // For TCP sockets, use SockRecv (stream receive)
     if (brook::SockIsStream(sockIdx))
     {
-        bool nonblock = (fde && (fde->statusFlags & 0x800) != 0) || brook::SockIsNonblock(sockIdx);
-        if (nonblock && brook::SockRxCount(sockIdx) == 0 && !brook::SockPollReady(sockIdx, true, false))
-            return -EAGAIN;
-        return ReceiveTcpToUser(sockIdx, bufVal, lenVal);
+        const bool nonblock = (flagsVal & 0x40) || brook::SockIsNonblock(sockIdx);
+        return ReceiveTcpToUser(sockIdx, bufVal, lenVal, nonblock);
     }
 
     // UDP path
@@ -13948,7 +13954,7 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
         childIdx = brook::SockAccept(sockIdx, &peerAddr);
         if (childIdx != -EAGAIN) break;
         // accept4 flags apply to the new connection, never the listener wait.
-        if (fde->statusFlags & UNIX_SOCK_NONBLOCK) return -EAGAIN;
+        if (brook::SockIsNonblock(sockIdx)) return -EAGAIN;
         if (HasPendingSignals()) return -EINTR;
         struct ExactSocketWait {
             int index; Process* task;
@@ -14568,7 +14574,7 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
         int result=0;
         if(count) {
             allocated.bytes=kmalloc(count);if(!allocated.bytes)return -ENOMEM;
-            const bool nonblock=dontwait || (fde->statusFlags&0x800) || brook::SockIsNonblock(sockIdx);
+            const bool nonblock=dontwait || brook::SockIsNonblock(sockIdx);
             result=brook::SockRecv(sockIdx,allocated.bytes,count,nonblock);
             if(result<0)return result;
             uint32_t copied=0;

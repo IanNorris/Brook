@@ -1559,3 +1559,15 @@ each probe's argument parser.
 - Avoid reusing host-test directories configured with a different compiler.
   An older GCC directory also rejects existing misleading indentation under
   `-Werror`; this is distinct from the Internet-socket candidate.
+
+
+### Concurrent syscall trace records (2026-10-24)
+
+- Emit each network strace argument/result pair in one serialized log call.
+  The current logger prints the prefix and return value separately. A short
+  29-thread Steam capture interleaves those pieces (and debug-channel messages),
+  yielding apparently impossible argument/result pairs. Keep that capture as
+  diagnostic evidence, not a syscall-correctness conclusion. A parsed regex
+  match alone cannot prove the return belongs to the printed arguments.
+- Scope repeated-error suppression to a task or protect its shared state;
+  the current static last-call fields are shared across tracing threads.

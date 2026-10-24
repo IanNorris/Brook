@@ -1770,14 +1770,14 @@ void SockSetNonblock(int sockIdx, bool nonblock)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
     if (!g_sockUsed[sockIdx]) return;
-    g_sockets[sockIdx].nonblock = nonblock;
+    __atomic_store_n(&g_sockets[sockIdx].nonblock, nonblock, __ATOMIC_RELEASE);
 }
 
 bool SockIsNonblock(int sockIdx)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;
     if (!g_sockUsed[sockIdx]) return false;
-    return g_sockets[sockIdx].nonblock;
+    return __atomic_load_n(&g_sockets[sockIdx].nonblock, __ATOMIC_ACQUIRE);
 }
 
 int SockGetConnectError(int sockIdx)
@@ -2634,10 +2634,10 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
                  (ntohl(s.remoteIp) >> 8) & 0xFF,
                  ntohl(s.remoteIp) & 0xFF,
                  ntohs(s.remotePort),
-                 s.nonblock ? " (nonblock)" : "");
+                 SockIsNonblock(sockIdx) ? " (nonblock)" : "");
 
     // Nonblocking: return immediately, application polls for completion
-    if (s.nonblock) {
+    if (SockIsNonblock(sockIdx)) {
         return -115; // EINPROGRESS
     }
 
