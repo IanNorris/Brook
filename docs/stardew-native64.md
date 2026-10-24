@@ -328,3 +328,13 @@ Steam receives the launch request but displays a confirmation that launching
 here would disconnect another computer's active game session. That confirmation
 has been left untouched pending the owner's decision. A queued request and an
 authenticated client do not yet establish successful through-Steam game launch.
+
+A subsequent read-only inventory confirms all 33 original save files still have
+identical content hashes and sizes, with no added or removed files. One file's
+mtime changed during the Steam launch attempt. The prior byte-and-timestamp
+invariant therefore no longer passes, even though save content is intact.
+Private before/after inventories and Cloud logs are preserved. Steam Cloud
+activity is present; causation for the timestamp change remains unproven.
+Redirecting the game's HOME alone does not establish isolation from the Steam
+client's Cloud synchronization. Before completing acceptance, verify that Cloud
+cannot read or write the original save location during the controlled test.
