@@ -2,7 +2,9 @@
 
 Brook now has an opt-in owned rootless Xwayland path. Native controls show two
 independent xeyes windows, with no enclosing X desktop. Authenticated Steam
-acceptance, broader transient policy and shaped-window rendering remain open.
+Store and Library render in a native window, and Friends opens and moves as a
+separate window. Longer Steam acceptance, broader transient policy and
+shaped-window rendering remain open.
 
 ## Native geometry API
 
@@ -75,7 +77,11 @@ compositor by fresh-image, image-update and private offline-staging scripts.
 The Nix check phase exercises the actual shell and bridge adapters. It covers
 both association orders, protocol errors, retained pixels, independent windows,
 geometry ACK ordering, stale-size frames, NULL-buffer remap, focus/close and EOF
-isolation. A fresh headless Xvfb control additionally exercises the real XCB
+isolation. A mapped native xdg toplevel keeps its native identity and retained
+pixels through helper EOF and server disconnect. A replacement generation can
+reuse XIDs/serials while rejecting delayed messages from the retired generation.
+These are host adapter controls; the corresponding native restart gate remains.
+A fresh headless Xvfb control additionally exercises the real XCB
 worker: InputOnly maps, border suppression, serial association, configure,
 globally active client focus, cooperative close, reparent and XID reuse. The
 stale-XID control also rejected a deliberately broken worker during development.
@@ -90,10 +96,20 @@ Wayland client on the same compositor. The corrected compositor/worker were
 hash-verified runtime overrides in this first review; repeat fresh-boot acceptance
 with the corrected packaged launcher is still required.
 
+The same review preserves the authenticated profile and runs Steam without a
+loader audit or preload. Store renders at 1280x800; native maximize produces a
+1916x996 Library with game artwork. Friends opens at 300x650 and a drag moves it
+independently while Library stays maximized. The native Wayland editor remains
+on the same compositor. These private captures establish individual-window
+presentation and real application rendering; they do not yet establish all
+dialogs, successful installation or long-term stability. Friends' own client
+close button after movement remains an input-alignment acceptance check.
+
 Known gaps and remaining gates:
 
-- Authenticate/use Steam Library, Friends, dialogs, navigation and a small
-  download through the rootless path; verify stability and input alignment.
+- Finish Steam dialogs/navigation, input-alignment and a small-download
+  acceptance run through the rootless path. Initial authenticated Store,
+  Library, Friends and independent movement are verified.
 - Exercise Xwayland retirement/restart with native Wayland clients present.
 - Transient identities currently affect initial placement; later parent motion,
   minimize and stacking need broader policy/acceptance. Existing native popup

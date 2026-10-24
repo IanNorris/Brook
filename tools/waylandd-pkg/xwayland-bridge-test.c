@@ -111,13 +111,50 @@ int main(void) {
     assert(xwayland_accept_message(&dead) && s->wm_id==id);
     state.flags=0;assert(xwayland_accept_message(&state));assert(!s->wm_id && destroyed==2);
     wl_resource_destroy(s->resource);
+    // Keep a mapped native toplevel, not just an unconfigured wl_surface,
+    // through retirement. Its window identity and retained pixels must stay.
+    struct wl_resource *base=wl_resource_create(other,&xdg_wm_base_interface,1,0);assert(base);
+    wm_base_get_xdg_surface(other,base,0,unrelated->resource);
+    xdg_surface_get_toplevel(other,unrelated->xdg_surface,0);
+    surface_commit(other,unrelated->resource);
+    assert(unrelated->next_configure_serial);
+    xdg_surface_ack_configure(other,unrelated->xdg_surface,unrelated->next_configure_serial);
+    image(unrelated,2,2);
+    uint32_t native_id=unrelated->wm_id;assert(native_id && created==4);
+    uint64_t native_incarnation=native[native_id].incarnation;
+    uint64_t first_generation=g_xwayland_generation;
     // Helper EOF retires the complete owned generation, including the popup,
     // without disconnecting an unrelated native Wayland client.
     close(peer);xwayland_control_ready(g_xwm_fd,WL_EVENT_READABLE,NULL);assert(g_xwm_failed);
     xwayland_pump();assert(!g_xwayland_client && !g_xwindows && g_xwm_fd<0);
     assert(destroyed==3 && g_surfaces==unrelated && unrelated->resource);
-    close(wayland_peer);wl_client_destroy(other);close(other_peer);assert(!g_surfaces);
+    assert(unrelated->wm_id==native_id && native[native_id].incarnation==native_incarnation);
+    assert(pixels[native_id][0]==0xff123456 && surface_repaint(unrelated));
+    close(wayland_peer);
+    // A replacement server may reuse XIDs, identities and serials. A delayed
+    // message from the retired generation must not bind to its new window.
+    assert(!socketpair(AF_UNIX,SOCK_STREAM,0,control));
+    g_xwm_fd=control[0];peer=control[1];memset(&rx,0,sizeof(rx));
+    client=new_client(&wayland_peer);assert(xwayland_attach_client(client));
+    assert(g_xwayland_generation>first_generation);
+    state.flags=BXWM_MAPPED|BXWM_INPUT;state.configure_serial=0;
+    assert(!xwayland_accept_message(&state) && !g_xwindows);
+    state.generation=g_xwayland_generation;state.width=2;state.height=2;
+    assert(xwayland_accept_message(&state));s=new_surface(client,55);image(s,2,2);
+    assert(s->wm_id && s->wm_id!=native_id && created==5);
+    configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);
+    assert(configure.generation==g_xwayland_generation && configure.configure_serial==1);
+    struct bxwm_message stale=state;stale.generation=first_generation;stale.type=BXWM_DESTROY;
+    assert(!xwayland_accept_message(&stale) && s->wm_id && g_xwindows);
+    assert(unrelated->wm_id==native_id && pixels[native_id][0]==0xff123456);
+    // Server disconnect takes the other teardown route through the exact
+    // wl_client destroy listener. It must have the same isolation guarantee.
+    wl_client_destroy(client);close(wayland_peer);close(peer);
+    assert(!g_xwayland_client && !g_xwindows && g_xwm_fd<0 && destroyed==4);
+    assert(g_surfaces==unrelated && unrelated->wm_id==native_id);
+    assert(native[native_id].incarnation==native_incarnation && surface_repaint(unrelated));
+    wl_client_destroy(other);close(other_peer);assert(!g_surfaces && destroyed==5);
     wl_display_destroy(g_display);
-    puts("XWAYLAND_BRIDGE_PASS both association orders, independent native windows, pixels, geometry ACK ordering, stale frames, focus/close, transient identity and EOF isolation");
+    puts("XWAYLAND_BRIDGE_PASS association orders, independent windows, geometry ACK ordering, stale frames, focus/close, EOF/server-loss isolation, mapped native survival and generation reuse");
     return 0;
 }

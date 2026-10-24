@@ -61,8 +61,8 @@ whose cookie-authenticated `pactl info` verifies its null sink before Steam star
 Private evidence is under `build/workloads/steam-rejection-20261024` and reviews
 `steam-nonblock-login-k-20261024` and `steam-rlimit-stability-m-20261024`.
 Authenticated images, profiles, raw logs, debugger stack words, downloaded games
-and proprietary binaries remain outside Git. The rootful 800×600 Xwayland
-desktop is still present and does not satisfy individual-window integration.
+and proprietary binaries remain outside Git. These earlier reviews use the
+rootful 800×600 Xwayland desktop and do not prove individual-window integration.
 
 The subsequent live download test collected a lossy CPU/switch profile and a
 separate ten-second counter interval. Of 3,214 CPU samples, 2,592 are idle;
@@ -79,3 +79,20 @@ notes identify the main thread in `libSDL3.so.0.4.2` at module file offset
 guest-panic marker. This identifies a host display-library fault location, not
 its cause. The review disks remain preserved without assuming a clean sync.
 Consequently this run does not yet establish prolonged Steam stability.
+
+The subsequent `steam-rootless-xwayland-n-20261024` review uses the same frozen
+kernel with the owned rootless compositor/worker and a headless host display.
+Authenticated Store and Library render in an independent native window;
+maximized Library has a 1916×996 client buffer. Friends opens as a separate
+300×650 native window and moves independently. A native Wayland editor runs
+on that same compositor. See [the window-integration record](xwayland-window-integration.md)
+for controls and remaining acceptance. Account captures remain private.
+
+A later profiling request in this rootless review captured 755 CPU samples
+with no reported event drops, including 676 idle samples. A separate ten-second
+interval receives about 2.7 KB/s and writes about 164 KB/s to the data disk.
+At observation time Steam shows Library without an active download and its
+content log is unchanged for more than ten minutes. This is not a representative
+download benchmark. Another three-second profile loses 2,461 events and includes
+the profiler's own disk writer; neither capture establishes the download
+bottleneck. A transfer-active capture remains required.
