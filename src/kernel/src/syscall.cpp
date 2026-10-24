@@ -5751,6 +5751,29 @@ static int64_t sys_sched_yield(uint64_t, uint64_t, uint64_t,
     return 0;
 }
 
+// Linux x86-64 membarrier(324). Only private expedited barriers and their
+// registration are advertised; sync-core, rseq and global commands stay EINVAL.
+static int64_t sys_membarrier(uint64_t command,uint64_t flags,uint64_t,
+                              uint64_t,uint64_t,uint64_t)
+{
+    constexpr uint32_t expedited=1u<<3, registration=1u<<4;
+    // Linux arguments are int/unsigned int: ignore upper register halves.
+    if(static_cast<uint32_t>(flags))return -EINVAL;
+    const uint32_t cmd=static_cast<uint32_t>(command);
+    if(!cmd)return expedited|registration;
+    auto* proc=SchedulerCurrentProcess();
+    auto* space=proc ? proc->addressSpace : nullptr;
+    if(!space || space->kernel)return -EINVAL;
+    if(cmd==registration) {
+        __atomic_store_n(&space->membarrierPrivateRegistered,1u,__ATOMIC_RELEASE);
+        return 0;
+    }
+    if(cmd!=expedited)return -EINVAL;
+    if(!__atomic_load_n(&space->membarrierPrivateRegistered,__ATOMIC_ACQUIRE))
+        return -EPERM;
+    return ApicMemoryBarrierAllCpus() ? 0 : -ETIMEDOUT;
+}
+
 // ---------------------------------------------------------------------------
 // sys_nanosleep (35) / sys_clock_nanosleep (230)
 // ---------------------------------------------------------------------------
@@ -14698,6 +14721,7 @@ void SyscallTableInit()
     g_syscallTable[SYS_WRITEV]          = sys_writev;
     g_syscallTable[SYS_ACCESS]          = sys_access;
     g_syscallTable[SYS_SCHED_YIELD]     = sys_sched_yield;
+    g_syscallTable[324]                = sys_membarrier;
     g_syscallTable[SYS_NANOSLEEP]       = sys_nanosleep;
     g_syscallTable[SYS_GETPID]          = sys_getpid;
     g_syscallTable[SYS_PIPE]            = sys_pipe;

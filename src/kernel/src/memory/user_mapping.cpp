@@ -91,6 +91,8 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
         destination->mmapNext=source->mmapNext;
         destination->argumentStart=source->argumentStart;
         destination->argumentEnd=source->argumentEnd;
+        destination->membarrierPrivateRegistered=__atomic_load_n(
+            &source->membarrierPrivateRegistered,__ATOMIC_ACQUIRE);
         bool copied=CloneLeaves(operation,destination,pid);
         operation.Unlock();
         return copied;

@@ -971,6 +971,29 @@ static TlbShootdownRequest g_tlbRequest;
 // this is what makes the protocol ABA-free across the single reused request slot.
 static volatile uint64_t g_cpuTlbAckGen[MAX_CPUS] = {};
 
+// Independent from TLB requests and PMM quarantine. Concurrent publishers may
+// coalesce: acknowledging a newer epoch also satisfies every earlier epoch.
+static volatile uint64_t g_memoryBarrierEpoch=0;
+static volatile uint64_t g_cpuMemoryBarrierAck[MAX_CPUS]={};
+// Caller pins CPU identity with IF=0. No NMI path calls this helper.
+static inline void MemoryBarrierServicePinned(uint32_t cpu)
+{
+    const uint64_t epoch=__atomic_load_n(&g_memoryBarrierEpoch,__ATOMIC_ACQUIRE);
+    if(cpu<MAX_CPUS && __atomic_load_n(&g_cpuMemoryBarrierAck[cpu],__ATOMIC_RELAXED)<epoch) {
+        __asm__ volatile("mfence" ::: "memory");
+        // IRQs disabled through publication: a nested service cannot publish a
+        // newer acknowledgement and then have it overwritten by this one.
+        __atomic_store_n(&g_cpuMemoryBarrierAck[cpu],epoch,__ATOMIC_RELEASE);
+    }
+}
+static void MemoryBarrierServiceLocal()
+{
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    MemoryBarrierServicePinned(SmpCurrentCpuIndex());
+    if(flags & (1ULL<<9))__asm__ volatile("sti" ::: "memory");
+}
+
 // Service the in-flight per-AS shootdown for THIS cpu, if it is a pending target
 // of the current generation. Shared by the IPI handler and the lock-acquire spin.
 // Idempotent and safe at IF=0: touches only this CPU's TLB plus monotonic atomics
@@ -1065,6 +1088,7 @@ extern "C" volatile uint8_t g_tlbNmiActive = 0;
 // Cheap no-op when this CPU is already up to date with g_tlbEpoch.
 void TlbEpochFlushLocal()
 {
+    MemoryBarrierServiceLocal();
     uint32_t cpu;
     __asm__ volatile("movl %%gs:176, %0" : "=r"(cpu));
     if (cpu >= MAX_CPUS) return;
@@ -1113,6 +1137,7 @@ extern "C" void TlbShootdownHandlerInner()
     // shared with the lock-acquire self-service path (TlbLockAcquireServicing).
     uint32_t cpu;
     __asm__ volatile("movl %%gs:176, %0" : "=r"(cpu));
+    MemoryBarrierServicePinned(cpu);
     TlbServiceLocal(cpu);
 
     LapicWrite(LapicReg::EOI, 0);
@@ -1195,6 +1220,52 @@ static void ApicSendTlbShootdownIpi(uint32_t targetCpuIndex)
     LapicWrite(LapicReg::ICR_HI, static_cast<uint32_t>(apicId) << 24);
     // Fixed delivery, level assert, vector = TLB_SHOOTDOWN_VECTOR
     LapicWrite(LapicReg::ICR_LO, TLB_SHOOTDOWN_VECTOR | (1u << 14));
+}
+
+bool ApicMemoryBarrierAllCpus()
+{
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    if(!(flags & (1ULL<<9)))KernelPanic("membarrier: requires interrupts enabled and no caller locks");
+    const uint32_t self=SmpCurrentCpuIndex();
+    const uint32_t count=SmpGetCpuCount();
+    uint64_t targets=0;
+    for(uint32_t i=0;i<count;++i) {
+        const CpuInfo* info=SmpGetCpu(i);
+        if(info && info->online)targets|=1ULL<<i;
+    }
+    __asm__ volatile("mfence" ::: "memory");
+    uint64_t prior=__atomic_load_n(&g_memoryBarrierEpoch,__ATOMIC_ACQUIRE);
+    for(;;) {
+        if(prior==~uint64_t{0}) {
+            __asm__ volatile("sti" ::: "memory");
+            return false; // Never wrap: old ACKs must not satisfy a new request.
+        }
+        if(__atomic_compare_exchange_n(&g_memoryBarrierEpoch,&prior,prior+1,false,
+                                      __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))break;
+    }
+    const uint64_t epoch=prior+1;
+    MemoryBarrierServiceLocal();
+    // CPU identity and the shared per-CPU APIC ICR pair stay pinned until all
+    // IPIs have been sent. No request lock or address-space lock is acquired.
+    for(uint32_t i=0;i<count;++i)
+        if(i!=self && (targets & (1ULL<<i)))ApicSendTlbShootdownIpi(i);
+    __asm__ volatile("sti" ::: "memory");
+    const uint64_t start=ApicTickCount();
+    for(;;) {
+        bool complete=true;
+        for(uint32_t i=0;i<count;++i)
+            if((targets & (1ULL<<i)) &&
+               __atomic_load_n(&g_cpuMemoryBarrierAck[i],__ATOMIC_ACQUIRE)<epoch)complete=false;
+        if(complete) {
+            __asm__ volatile("mfence" ::: "memory");
+            return true;
+        }
+        // Fail closed; an off-CR3 CPU still owes its memory barrier. Timer
+        // ticks and the existing TLB-lock spin service this independent epoch.
+        if(ApicTickCount()-start>1000)return false;
+        __asm__ volatile("pause" ::: "memory");
+    }
 }
 
 // Dump diagnostic info when TLB shootdown times out — called with IF=0.

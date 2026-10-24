@@ -22,6 +22,8 @@ struct AddressSpaceState {
     uint16_t allocationPid;
     bool kernel;
     volatile uint64_t tlbCpuMask;
+    // Shared by CLONE_VM; copied on fork, reset by a fresh exec address space.
+    volatile uint32_t membarrierPrivateRegistered;
     uint64_t programBreak;
     uint64_t mmapNext;
     CompositorVfbAllocation* fbAllocations; // legacy graphics backing owned by this AS

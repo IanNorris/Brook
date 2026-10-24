@@ -172,8 +172,10 @@ def scalar_leaf(path, address, mutation=None):
     Deliberately narrow scalar instruction model, including local branch bounds.
     A new instruction or out-of-function tail call requires an explicit review.
     """
+    # MFENCE is scalar and preserves registers/FPU state; the memory-barrier
+    # epoch shares the TLB IPI's existing GPR-only interrupt wrapper.
     allowed = {"push", "pop", "mov", "cmp", "test", "xor", "bt", "ret",
-               "ja", "je", "jmp", "jae", "jbe", "invlpg", "nop"}
+               "ja", "je", "jmp", "jae", "jbe", "invlpg", "nop", "mfence"}
     with path.open("rb") as stream:
         elf = ELFFile(stream)
         symbols = elf.get_section_by_name(".symtab")
@@ -192,13 +194,15 @@ def scalar_leaf(path, address, mutation=None):
                 data = b"\x66\x0f\xef\xc0" + data[4:]  # PXOR XMM0,XMM0
             else:
                 target = next(x for x in original if
-                              (mutation == "callee-call" and x.size >= 5 and x.mnemonic == "mov")
-                              or (mutation == "external-branch" and x.mnemonic == "ja" and x.size == 2)
+                              (mutation in {"callee-call", "external-branch"} and x.size >= 5 and x.mnemonic == "mov")
                               or (mutation == "missing-return" and x.mnemonic == "ret"))
                 if mutation == "callee-call":
                     replacement = b"\xe8\0\0\0\0" + b"\x90" * (target.size - 5)
                 elif mutation == "external-branch":
-                    replacement = bytes(target.bytes[:1]) + b"\x80"
+                    # A fixed rel8 displacement may land inside a larger leaf.
+                    # Always target well past this function, regardless of size.
+                    displacement=address+len(data)+4096-(target.address+5)
+                    replacement=b"\xe9"+displacement.to_bytes(4,"little",signed=True)+b"\x90"*(target.size-5)
                 else:
                     replacement = b"\x90" * target.size
                 position = target.address - address

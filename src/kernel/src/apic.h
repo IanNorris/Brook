@@ -153,6 +153,10 @@ void TlbShootdown(uint64_t targetCr3, uint64_t virtualAddr, uint64_t cpuMask);
 // Used after bulk PTE changes (exec, fork PTE downgrade).
 void TlbShootdownFull(uint64_t targetCr3, uint64_t cpuMask);
 
+// Synchronous full memory barriers, stronger than process-private scope.
+// No caller locks; IF must be enabled. False means acknowledgement timed out.
+bool ApicMemoryBarrierAllCpus();
+
 // BRO-179: unconditional full-TLB-flush barrier across ALL online CPUs (incl.
 // idle), with positive acknowledgement and NO forgiveness (panics on timeout).
 // The PMM quarantine drain calls this before releasing freed frames so no CPU
