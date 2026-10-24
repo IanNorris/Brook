@@ -26,6 +26,7 @@
 #include "user_copy_fault.h"
 #include "user_copy.h"
 #include "signal_frame_layout.h"
+#include "signal_fp_user.h"
 
 using brook::SerialPrintf;
 using brook::IoApicUnmaskIrq;
@@ -898,7 +899,8 @@ static constexpr int32_t SI_KERNEL = 0x80;
 static constexpr int32_t SEGV_MAPERR = 1;
 static constexpr int32_t SEGV_ACCERR = 2;
 
-extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
+extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
+                                    brook::FxsaveArea* entryFp)
 {
     int mappingSignal=0,mappingSignalCode=0;
     // The assembly stub has already done SWAPGS if needed.
@@ -1664,7 +1666,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
                           !(proc->sigAltstackFlags&2) && !proc->inSignalHandlerOnAltStack;
         uint64_t userRsp=0;
         if(!brook::PlaceSignalFrame(ef->rsp,proc->sigAltstackSp,proc->sigAltstackSize,
-                                    useAlt,sizeof(brook::SignalFrame),&userRsp)) {
+                                    useAlt,sizeof(brook::SignalFrame)+brook::SIGNAL_FP_EXTRA,&userRsp)) {
             SerialPrintf("SIGNAL: invalid fault-frame location pid %u signal %u\n",proc->pid,signum);
             __asm__ volatile("sti":::"memory");
             brook::SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
@@ -1678,6 +1680,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
 
         // Fill ucontext
         sf->uc.uc_sigmask = savedMask;
+        sf->uc.uc_flags = 1; // UC_FP_XSTATE
+        sf->uc.uc_mcontext.fpstate=brook::SignalFpUserAddress(userRsp,sizeof(*sf));
         sf->uc.uc_stack.ss_sp    = proc->sigAltstackSp;
         sf->uc.uc_stack.ss_size  = proc->sigAltstackSize;
         sf->uc.uc_stack.ss_flags = useAlt ? 1
@@ -1722,7 +1726,8 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
         *reinterpret_cast<uint64_t*>(&sf->info._data[0]) = cr2;
 
         __asm__ volatile("sti":::"memory");
-        const bool copied=brook::CopyToUser(userRsp,sf,sizeof(*sf));
+        const bool copied=brook::SignalFpSaveToUser(mc.fpstate,entryFp->data) &&
+                          brook::CopyToUser(userRsp,sf,sizeof(*sf));
         __asm__ volatile("cli":::"memory");
         if(brook::SchedulerKernelOperationBoundary()) {brook::SchedulerYield();__builtin_trap();}
         if(!copied) {
@@ -1731,6 +1736,9 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector)
             brook::SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
             brook::SchedulerExitCurrentProcess(128+11,11);
         }
+        // Linux handlers start in initial FP state, with the interrupted state
+        // available in ucontext. Commit only after both user copies succeed.
+        brook::SignalFpReset(entryFp->data);
         proc->sigSavedMask=savedMask;
         proc->sigMask=handlerMask;
         proc->inSignalHandler=true;

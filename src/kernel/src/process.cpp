@@ -39,6 +39,7 @@
 #include "ksym_addrs.h"
 #include "user_copy.h"
 #include "signal_frame_layout.h"
+#include "signal_fp_user.h"
 #include "vdso.h"
 #include "process_user_namespace.h"
 
@@ -1768,7 +1769,8 @@ using namespace brook;
 
 extern "C" bool SyscallTakeWaitSignalMask(Process* proc, uint64_t* original);
 
-extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResult)
+extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResult,
+                                      FxsaveArea* entryFp)
 {
     Process* proc = ProcessCurrent();
     if (!proc || proc->isKernelThread) return syscallResult;
@@ -1805,10 +1807,12 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         // frame->rsp is the user RSP saved on syscall entry.
         // The SignalFrame starts 8 bytes before the ucontext (pretcode field).
         SignalUcontext context{};
+        SignalFpImage restoredFp{};
         // The dispatcher calls with IF clear. Snapshot without return-path
         // locks held; prefault may need interrupts, I/O and a context switch.
         __asm__ volatile("sti":::"memory");
-        const bool copied=CopyFromUser(&context,frame->rsp,sizeof(context));
+        const bool copied=CopyFromUser(&context,frame->rsp,sizeof(context)) &&
+                          SignalFpReadFromUser(restoredFp,context.uc_mcontext.fpstate);
         __asm__ volatile("cli":::"memory");
         // Copy introduced a new protected operation after the entry boundary.
         if(SchedulerKernelOperationBoundary()) { SchedulerYield();__builtin_trap(); }
@@ -1820,6 +1824,9 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         }
 
         // Restore signal mask
+        // The wrapper's final XRSTOR applies this validated snapshot; restoring
+        // hardware here would be overwritten by that wrapper on return.
+        memcpy(entryFp->data,restoredFp.data,sizeof(entryFp->data));
         proc->sigMask = context.uc_sigmask & ~((1ULL<<8)|(1ULL<<18));
 
         // Restore all registers from mcontext into the SyscallFrame
@@ -1914,7 +1921,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
                       !(proc->sigAltstackFlags&2) && !proc->inSignalHandlerOnAltStack;
     uint64_t userRsp=0;
     if(!PlaceSignalFrame(frame->rsp,proc->sigAltstackSp,proc->sigAltstackSize,
-                         useAlt,sizeof(SignalFrame),&userRsp)) {
+                         useAlt,sizeof(SignalFrame)+SIGNAL_FP_EXTRA,&userRsp)) {
         SerialPrintf("SIGNAL: invalid frame location pid %u signal %d\n",proc->pid,signum);
         __asm__ volatile("sti":::"memory");
         SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
@@ -1928,6 +1935,8 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
 
     // Fill ucontext
     sf->uc.uc_sigmask = savedMask;
+    sf->uc.uc_flags = 1; // UC_FP_XSTATE
+    sf->uc.uc_mcontext.fpstate=SignalFpUserAddress(userRsp,sizeof(*sf));
     sf->uc.uc_stack.ss_sp    = proc->sigAltstackSp;
     sf->uc.uc_stack.ss_size  = proc->sigAltstackSize;
     sf->uc.uc_stack.ss_flags = useAlt ? 1 /*SS_ONSTACK*/
@@ -1990,7 +1999,8 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     // Prefault/COW may allocate or sleep. No return-path locks are held, and
     // precise usercopy faults return failure instead of nesting a kernel #PF.
     __asm__ volatile("sti":::"memory");
-    const bool copied=CopyToUser(userRsp,sf,sizeof(*sf));
+    const bool copied=SignalFpSaveToUser(mc.fpstate,entryFp->data) &&
+                      CopyToUser(userRsp,sf,sizeof(*sf));
     __asm__ volatile("cli":::"memory");
     if(SchedulerKernelOperationBoundary()) {SchedulerYield();__builtin_trap();}
     if(!copied) {
@@ -1999,6 +2009,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);
         SchedulerExitCurrentProcess(128+11,11);
     }
+    SignalFpReset(entryFp->data);
     proc->sigSavedMask=savedMask;
     proc->sigMask=handlerMask;
     proc->inSignalHandler=true;

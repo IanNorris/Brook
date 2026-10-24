@@ -112,3 +112,49 @@ header, bounds and trailer) before replacing the wrapper's final XRSTOR image.
 Support legacy and null reset deliberately, and reject malformed images
 without a kernel fault. Both delivery paths and their compiled entry audits
 need coverage. The current nested-handler bookkeeping is a separate limit.
+
+## Signal FP-state candidate and native acceptance
+
+The U candidate implements the save/restore contract above in both delivery
+paths. The third assembly-to-C argument is set after XSAVE clobbers EDX.
+Export uses a zeroed, field-wise image; init x87/SSE components are materialized,
+AVX presence follows the saved header, and no reserved kernel-slot bytes are
+published. XCR0 and CPUID verify the supported standard x87/SSE/AVX layout;
+the MXCSR mask comes from hardware, never from a user-supplied mask field.
+Handlers begin with initial live FP state while ucontext retains interrupted
+state. Sigreturn validates a copied image before replacing the authoritative
+entry slot restored by the assembly wrapper.
+
+Discovery and validation are separate. Missing magic or invalid discovery
+sizes select legacy state; a readable missing trailer also selects legacy,
+matching the Linux control. An unreadable trailer is an error. Recognized
+extended state still rejects invalid MXCSR, unsupported components and
+compacted/reserved headers. Null state resets x87/SSE/AVX; legacy state restores
+x87/XMM and initializes upper YMM halves.
+
+Validation on Linux and the eight-vCPU U review:
+
+- Eight `signalfpcheck` cases verify nondefault x87 control and ST0, MXCSR,
+  XMM/YMM state, handler edits and live clobber, default handler controls,
+  synchronous versus syscall delivery, and normal versus alternate stacks.
+- Ten `signalfpreturncheck` cases verify legacy/null restoration, discovery
+  fallback, invalid MXCSR/XCOMP/XSTATE/pointer rejection, unreadable trailer
+  rejection, and invalid MXCSR combined with legacy fallback. Invalid contexts
+  terminate the child with SIGSEGV without taking down the VM.
+- Focused host normalization/privacy tests pass, including poisoned init-state
+  storage, x87 padding, unused tail, reserved headers and malformed images.
+  The release build and supported entry/scheduler mutation audits pass. New
+  entry checks reject missing/wrong FP-slot arguments in full exception stubs
+  and the syscall signal-check call site; the broader dispatcher remains an
+  unsupported full-return proof, as before.
+
+The actual game still faults at CoreCLR `FXRSTOR`. Its failing context now has
+capture flags `0x0010000f`; the restore caller is module offset `0x4ddac2`,
+identifying the alternate-stack returnPoint after the signal worker, rather
+than the converted exception context. A breakpoint after that returnPoint's
+capture observes valid MXCSR `0x1f80` and mask `0xffff`. At the later restore,
+the mask is zero and MXCSR invalid. Compare context identity and track the
+intervening write next. A first bounded raw write-watch attempt did not yield
+a writer; its packet acceptance was not verified, and its timeout-side read
+used an idle CPU's CR3, so it is not evidence that no write occurred.
+No title/menu or game-launch success is claimed.

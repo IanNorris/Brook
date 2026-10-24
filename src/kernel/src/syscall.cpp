@@ -274,6 +274,7 @@ extern "C" __attribute__((naked, used)) void BrookSyscallDispatcher()
         // Pass the saved-register frame and syscall return value.
         "mov %%r14, %%rdi\n\t"         // original SyscallFrame, above XSAVE area
         "mov %%rax, %%rsi\n\t"         // RSI = syscall result
+        "mov %%r15, %%rdx\n\t"        // authoritative entry XSAVE slot
         "call SyscallCheckSignals\n\t"  // returns new RAX
         "jmp .Lsyscall_return\n\t"
         ".Lsyscall_invalid:\n\t"

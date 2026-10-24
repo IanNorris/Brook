@@ -47,6 +47,8 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_signal_fp_state)
+target_compile_options(test_signal_fp_state PRIVATE -UNDEBUG)
 add_host_test(test_process_socket_metadata)
 target_compile_options(test_process_socket_metadata PRIVATE -UNDEBUG)
 set_tests_properties(test_process_socket_metadata PROPERTIES TIMEOUT 10)

@@ -80,6 +80,8 @@ def audit(instructions, error_vector=None, profile="irq"):
         take("mov", "eax, 7")
         take("xor", "edx, edx")
         take("xsave64", "ptr [r15]")
+    if error_vector is not None:
+        take("mov", "rdx, r15")
     if profile == "timer":
         take("mov", "rdi, qword ptr [r14 + 0x78]")
         take("mov", "rsi, qword ptr [r14 + 0x80]")
@@ -242,6 +244,10 @@ def mutation_checks(name, data, instructions, vector, profile="irq"):
         ins = next(x for x in instructions if x.mnemonic == "mov" and x.op_str == "rdi, qword ptr [r14 + 0x80]")
         cases.append(("wrong-interrupted-CS-slot", ins, bytes(ins.bytes[:-4]) + b"\x78\0\0\0"))
     if vector is not None:
+        argument=next(x for x in instructions if x.mnemonic=="mov" and x.op_str=="rdx, r15")
+        cases.append(("missing-FP-image-argument",argument,None))
+        changed=bytearray(argument.bytes);changed[-1]^=8
+        cases.append(("wrong-FP-image-argument",argument,bytes(changed)))
         cases.append(("wrong-error-discard", next(x for x in instructions if x.mnemonic == "add" and x.op_str == "rsp, 8"), b"\x48\x83\xc4\x10"))
     for label, ins, replacement in cases:
         if label == "wrong-GS-branch":
@@ -262,6 +268,32 @@ def mutation_checks(name, data, instructions, vector, profile="irq"):
     return results
 
 
+def syscall_fp_contract(instructions,callee):
+    """A narrow call/restore contract; not a full dispatcher return proof."""
+    mask=(1<<64)-1
+    calls=[i for i,x in enumerate(instructions) if x.mnemonic=="call" and
+           len(x.operands)==1 and x.operands[0].type==X86_OP_IMM and
+           x.operands[0].imm&mask==callee]
+    if len(calls)!=1:raise Invalid("expected one signal-return check call")
+    i=calls[0]
+    expected=[("mov","rdi, r14"),("mov","rsi, rax"),("mov","rdx, r15")]
+    if [(x.mnemonic,x.op_str) for x in instructions[i-3:i]]!=expected:
+        raise Invalid("signal check must receive the authoritative R15 XSAVE image")
+    jump=instructions[i+1]
+    if jump.mnemonic!="jmp" or jump.operands[0].type!=X86_OP_IMM:
+        raise Invalid("signal check must use the common restoration path")
+    target=jump.operands[0].imm&mask
+    indices=[j for j,x in enumerate(instructions) if x.address==target]
+    if len(indices)!=1:raise Invalid("missing signal restoration target")
+    j=indices[0]
+    expected=[("mov","r13, rax"),("mov","eax, 7"),("xor","edx, edx"),
+              ("xrstor64","ptr [r15]"),("mov","rsp, r14"),("mov","rax, r13")]
+    if [(x.mnemonic,x.op_str) for x in instructions[j:j+6]]!=expected:
+        raise Invalid("signal check must restore the same R15 XSAVE image")
+    return {"argument_address":hex(instructions[i-1].address),
+            "scope":"authoritative signal FP argument and common XRSTOR image only"}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("elf", type=Path)
@@ -274,8 +306,27 @@ def main():
               "checked": [], "failed": [], "unsupported": [], "mutations": []}
     mandatory = {"ExceptionStub6": 6, "ExceptionStub13": 13, "ExceptionStub14": 14}
     seen = set()
+    with args.elf.open("rb") as stream:
+        elf=ELFFile(stream)
+        signal_check=next(s["st_value"] for s in elf.get_section_by_name(".symtab").iter_symbols()
+                          if s.name=="SyscallCheckSignals")
     for name, data, ins in functions(args.elf):
         seen.add(name)
+        if name=="BrookSyscallDispatcher":
+            try:
+                contract=syscall_fp_contract(ins,signal_check)
+                report["syscall_signal_fp_contract"]=contract
+                if args.mutations:
+                    argument=next(x for x in ins if x.address==int(contract["argument_address"],16))
+                    changed=bytearray(argument.bytes);changed[-1]^=8
+                    for label,replacement in (("missing-FP-image-argument",b"\x90"*argument.size),
+                                              ("wrong-FP-image-argument",bytes(changed))):
+                        offset=argument.address-ins[0].address
+                        mutated=data[:offset]+replacement+data[offset+argument.size:]
+                        try:syscall_fp_contract(list(DECODER.disasm(mutated,ins[0].address)),signal_check)
+                        except Invalid:report["mutations"].append({"function":name,"mutation":label,"rejected":True})
+                        else:raise Invalid("signal FP argument mutation accepted")
+            except Invalid as error:report["failed"].append({"function":name,"reason":str(error)})
         vector = mandatory.get(name)
         profile = SPECIAL_ENTRIES.get(name, "irq")
         # Explicit family nomination: a damaged known wrapper must fail, rather

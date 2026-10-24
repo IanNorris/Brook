@@ -130,6 +130,9 @@ ExceptionStub\vector:
     // Leaves RSP at the 64-aligned XSAVE slot (valid alignment for the call).
     FPU_SAVE_TO_R15
 
+    // XSAVE clobbers EDX. Pass the authoritative interrupted image afterwards.
+    movq %r15, %rdx
+
     // C requires DF clear. The CPU-saved user flags remain in the IRET frame.
     cld
     call HandleExceptionFull
@@ -202,6 +205,8 @@ ExceptionStub\vector:
     // BRO-187: save x87/SSE/AVX before the SSE-using C handler. Leaves RSP at
     // the 64-aligned XSAVE slot (correct alignment for the SysV call).
     FPU_SAVE_TO_R15
+
+    movq %r15, %rdx
 
     // C requires DF clear, including when the fault interrupted STD/REP code.
     cld

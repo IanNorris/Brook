@@ -101,7 +101,7 @@ struct SignalMcontext {
     uint64_t eflags;
     uint16_t cs, gs, fs, ss;
     uint64_t err, trapno, oldmask, cr2;
-    uint64_t fpstate;          // NULL (no FPU state saved)
+    uint64_t fpstate;          // Linux legacy/standard XSAVE image on user stack
     uint64_t __reserved1[8];
 };
 static_assert(__builtin_offsetof(SignalMcontext, ss) == 150,
@@ -787,4 +787,5 @@ int ProcessSendSignalToGroup(uint16_t pgid, int signum);
 // Checks for pending signals and modifies the kernel stack frame to redirect
 // to the user signal handler. Also handles sigreturn frame restoration.
 // Returns the value that should be in RAX on return to userspace.
-extern "C" int64_t SyscallCheckSignals(brook::SyscallFrame* frame, int64_t syscallResult);
+extern "C" int64_t SyscallCheckSignals(brook::SyscallFrame* frame, int64_t syscallResult,
+                                     brook::FxsaveArea* entryFp);
