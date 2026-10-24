@@ -121,3 +121,51 @@ owner exit zero, and all four offline filesystem checks. Astra's read-only
 review finds no introduced blocker in the retry repair. It separately identifies
 an existing exec-publication race and incarnation-zero teardown caveat, recorded
 in the backlog; this change does not claim to fix those lifetime boundaries.
+
+
+## Genuine WebSocket request comparison
+
+A private bounded classifier now inspects at most the first 4 KiB of each
+successful loopback transfer. It exports fixed enums, booleans and status codes,
+never request paths, header values, payloads or authentication material. It does
+not reconstruct streams: complete-header flags apply only to the captured call.
+Synthetic complete/partial headers and rejection categories pass, as does the
+native byte-preservation/error control. Unsupported TCP shutdown remains an
+explicitly reported gap, not a successful acceptance case.
+
+In the repaired Brook kernel run, the helper sends complete HTTP/1.1 GET
+requests to localhost with a Host port matching the receiving listener. Both
+sides observe Upgrade/Connection WebSocket headers, a WebSocket key and version
+13, an Origin differing from Host, and no Authorization or Cookie header. The
+main process sends HTTP 403, and the helper receives it. Eighteen paired
+rejections are recorded without malformed classification rows or hitting its
+output cap. The fixed rejection-term classifier finds no matching body reason.
+The UI capture at the earlier observation is a black Xwayland surface, not a
+verified login screen.
+
+An isolated Linux VM with a fresh private home and the same classifier sends the
+same broad request categories but receives HTTP 101 for both connections. Its
+VM-only screenshot verifies the QR login UI. This supports treating the
+Host/Origin difference as normal for this client; it does not establish exact
+request equivalence. Duplicate headers, Origin scheme/authority, WebSocket key
+validity, subprotocol and route remain acceptance-relevant blind spots.
+
+Whole Steam executable files differ between the two prepared environments.
+Boolean-only offline comparisons establish identical `.text`, `.rodata` and
+`.data` sections in the main executable, both present steamclient.so copies,
+and steamrt64/steamui.so. This is consistent with environment-specific ELF
+patching; it is not a claim that every loaded library or runtime configuration
+is identical. No executable hashes or contents are included in this checkpoint.
+
+A subsequent whole-startup Linux syscall trace is disturbed by the preload's
+own raw metadata calls and does not reproduce a new genuine handshake. It is
+retained as a limited diagnostic and is not used to infer absent application
+checks. The next comparison should isolate application-issued metadata queries
+or capture module-relative callers at the server's 403 versus 101 send, while
+refining request validity flags. Missing INET socket options or incomplete
+socket-owner procfs data are not promoted to causes without those observations.
+
+Both experiments restore their original helper wrappers and complete checked
+sync and original-owner exit zero. Brook's four offline filesystem checks and
+the Linux read-only filesystem check pass. Steam login on Brook remains
+unverified; the Linux login screen is a reference only.
