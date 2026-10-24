@@ -161,8 +161,9 @@ paths are correct.
 The fresh-boot, uninstrumented first phase of review
 `steam-mapped-growth-off-gpu-1ms-fixed-mlfq-f-20261023` uses the same frozen
 kernel, 16 GiB and unrestricted byte quotas. The wrapper hash remains pristine,
-and an audit of every live Steam/webhelper process confirms the probe is absent
-from its maps. It still produces the corruption warning, repeated connection
+and the expected probe file is absent. The attempted maps audit does not
+prove library absence: Brook currently reports only heap/stack approximations
+in `/proc/<pid>/maps`, as the later progress-probe control establishes. It still produces the corruption warning, repeated connection
 timeouts and continued pool growth without a login screen. Before the stop
 request it has 40 pools and approximately 1.05 billion logical shared-memory
 bytes; its full 181-sample capture including the deliberate stop reaches
@@ -270,3 +271,65 @@ wrapper is restored, guest sync completes, and QMP requests system powerdown.
 The original Linux QEMU owner exits zero without reaching its timeout.
 The Linux serial log confirms powerdown, and the read-only offline filesystem
 check exits zero; the reference acceptance report is accepted.
+
+## Progress and readiness probe
+
+A new private probe records scalar/vector socket byte counts, sampled EAGAIN,
+readiness masks, opaque epoll data tokens and interposed close/dup/fork
+lifecycles. Sampling budgets distinguish operation and result class. It records
+the first sixteen calls and later powers of two per descriptor/operation/class,
+with a 16,384-row process cap and an explicit overflow marker. It preserves
+returned errno and uses raw syscalls for its own log output. Its own-process
+smoke test passes both unloaded and preloaded, covering payload/errno retention,
+backpressure, an epoll watch surviving a closed descriptor with a live alias,
+numeric descriptor reuse, eventfd and fork.
+
+The fresh 16-GiB/eight-vCPU Linux control reaches visible QR login with this
+probe. Its captured metadata has 9,405 rows, no overflow and two recurring large
+pools. In Brook review L, the checked offline file has 18,004 schema-valid rows
+with no overflow; the browser PID and child PIDs emit their own probe events.
+The 181-sample memory monitor reaches 52 large pools and 1,369,143,808 logical
+bytes. The longer complete trace records 86 exact-size allocations from the
+same browser PID. The bounded monitor and longer trace are different windows.
+Seven child connection timeout messages and one allocator warning are counted.
+Steam remains a black surface without login.
+
+The first live full-trace export loses bridge output and is explicitly rejected.
+Its original job is drained without replay. After completed guest sync, normal
+original-owner exit, serial acceptance and four passing offline filesystem
+checks, only the probe's exact metadata file is recovered read-only from the
+private data image. Its full schema validates. The Linux service/cgroup is also
+stopped, its wrapper restored, guest sync and normal powerdown complete, and its
+read-only offline filesystem check passes. Raw application logs and payloads
+remain private.
+
+The maps presence audit fails because `GenPidMaps` currently synthesizes heap
+and stack only; this does not establish probe absence. Earlier map-only absence
+claims must not be used as evidence. The corrected uninstrumented control still
+has independent fresh-boot, pristine-wrapper and expected-probe-file-absence
+observations. Actual progress events prove interception for their emitting PIDs
+and calls, not every possible syscall path.
+
+A stronger difference is the shared-memory handoff: on Linux a second PID maps
+both 26,214,416-byte pools successfully with MAP_SHARED and read/write access.
+In Brook's capture only the creating webhelper PID maps this size. A recovered
+older allocation-stack sample has immediate `steamwebhelper` frames; repeated
+pairs share an allocator prefix before worker-thread or libcef callback paths.
+These pools must not be called Mojo pools without further attribution.
+
+Successful-only utility-channel receives also occur on Linux, so the absence of
+sampled EAGAIN on one Brook utility descriptor is not evidence that MSG_DONTWAIT
+is ignored. Source inspection confirms that flag reaches the Unix read helper.
+The simple completed-call watch/alias analysis found no demonstrated matching
+epoll-lifetime failure. Different OUT-event and TCP-progress counts could be
+downstream of missing connection setup. Neither observation justifies an epoll
+repair yet.
+
+The next bounded probe adds socket/bind/listen/accept and endpoint-equivalence
+metadata, plus only a few relative allocation stacks per participating thread.
+It emits no raw addresses, socket paths, SCM_RIGHTS values or payload bytes.
+The purpose is to identify the missing peer handoff and listener lifecycle
+before selecting a kernel change. Interposition remains partial: hidden libc
+calls/direct syscalls and unwrapped fcntl duplication can bypass it, and cached
+FD classifications can outlive such hidden closes. Negative samples and
+interposed generations therefore do not prove full syscall coverage.
