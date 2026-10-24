@@ -48,6 +48,9 @@ def main():
         parser.error('--pulse-cookie requires --pulse-server')
     client = args.client.resolve(strict=True)
     runtime = client / 'steamrt64/pv-runtime/steam-runtime-steamrt'
+    client_container = runtime / 'pressure-vessel/libexec/steam-runtime-tools-0/srt-client-container'
+    if not client_container.is_file():
+        parser.error('installed SteamRT lacks srt-client-container, required for the companion game-launch service')
     platforms = list(runtime.glob('steamrt3c_platform_*/files'))
     if len(platforms) != 1:
         parser.error('expected exactly one installed SteamRT platform')
@@ -91,7 +94,11 @@ def main():
         inner_environment.append('PULSE_SERVER=' + args.pulse_server)
     if args.pulse_cookie is not None:
         inner_environment.append('PULSE_COOKIE=' + str(args.pulse_cookie.resolve(strict=True)))
-    command = [str(runtime / 'run'), '--batch', '--', '/bin/sh', '-c',
+    # The generic runtime runner starts the client but does not create the
+    # companion launcher service. Games launched from inside steamrt3c use
+    # steam-runtime-launch-client --alongside-steam to reach that service.
+    command = [str(client_container), '--pv-entry-point=' + str(runtime / 'run'),
+               '--pv-option=--batch', '--', '/bin/sh', '-c',
                'export LD_LIBRARY_PATH="$1:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; shift; exec "$@"',
                'steam-inner', client_libraries]
     # Set these after runtime construction, without shell interpolation or
@@ -108,6 +115,7 @@ def main():
     evidence.chmod(0o700)
     request = dict(argv=command, uid=os.getuid(), home=str(home), evidence=str(evidence),
                    available_bytes=available, default_runtime_copy=True, skip_bootstrap=args.skip_bootstrap,
+                   companion_launcher_service=True,
                    note='Existing staged client may contain prior ELF interpreter patches')
     (evidence / 'request.json').write_text(json.dumps(request, indent=2) + '\n')
     print(json.dumps(request), flush=True)

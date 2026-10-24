@@ -131,3 +131,22 @@ of all four filesystems return zero. Its original VM launcher wait returns zero;
 the outer review gate separately fails on an earlier recovered virtio-blk queue
 timeout and periodic writeback error. That incident remains a stability lead,
 even though final sync and filesystem checks succeed.
+
+
+The fresh O review uses `srt-client-container`. Its companion service starts,
+the authenticated Store and Library render, and a separate
+`steam-runtime-launch-client --alongside-steam -- /nix/profile/bin/true`
+control returns zero using the explicit service instance. That control uses a
+reconstructed environment outside the client container; the actual game retry
+remains necessary. The installed game still exits 125, now with the supervisor
+reporting `EOPNOTSUPP` when opening `/proc/self/fd/115`. The public supervisor
+source reads its inherited environment file this way. A minimal regular-file
+reopening control reproduces `EOPNOTSUPP` before and after unlinking the file;
+FD 115's exact type has not been captured. Retained regular-file proc-fd
+following is the next native candidate, not yet a successful game launch.
+
+In this review Friends' own close button works while it overlaps Steam, and
+Steam's client minimize button plus taskbar restore work. There is no enclosing
+virtual X desktop or duplicate Brook chrome. Client maximize/drag/resize and
+longer stability acceptance remain open. The O review completes final sync,
+its original launcher returns zero and all four offline filesystem checks pass.
