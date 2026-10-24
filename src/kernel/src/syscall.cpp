@@ -13660,10 +13660,25 @@ static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnam
         default: return -92; // ENOPROTOOPT, never success with untouched output.
         }
     } else {
-        // Preserve the existing INET async-connect error implementation only.
-        if (option != 4) return -92;
         int index = static_cast<int>(reinterpret_cast<uintptr_t>(entry->handle)) - 1;
-        value = brook::SockGetConnectError(index);
+        switch (option) {
+        case 3: // SO_TYPE: required by runtimes before wrapping a TCP socket in TLS.
+            value = brook::SockGetType(index);
+            if (value < 0) return -EBADF;
+            break;
+        case 4: // SO_ERROR: retain the existing async-connect error semantics.
+            value = brook::SockGetConnectError(index);
+            break;
+        case 38: // SO_PROTOCOL: report the resolved creation protocol.
+            value = brook::SockGetProtocol(index);
+            if (value < 0) return -EBADF;
+            break;
+        case 39: // SO_DOMAIN: Internet sockets currently support only AF_INET.
+            if (brook::SockGetType(index) < 0) return -EBADF;
+            value = AF_INET;
+            break;
+        default: return -92; // ENOPROTOOPT
+        }
     }
     if(valueSize==sizeof(credentials)) {
         credentials.uid=ProcessReportId(proc,false,credentials.uid);credentials.gid=ProcessReportId(proc,true,credentials.gid);

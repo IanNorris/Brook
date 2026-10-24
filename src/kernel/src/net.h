@@ -398,6 +398,7 @@ int  SockSend(int sockIdx, const void* buf, uint32_t len);
 int  SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait = false);
 bool SockIsStream(int sockIdx);  // returns true for SOCK_STREAM (TCP)
 int  SockGetType(int sockIdx);  // returns SOCK_STREAM(1) or SOCK_DGRAM(2)
+int  SockGetProtocol(int sockIdx); // immutable creation protocol, or -1 for invalid slot
 void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port);
 void SockGetRemote(int sockIdx, uint32_t* ip, uint16_t* port);
 int  SockListen(int sockIdx, int backlog);

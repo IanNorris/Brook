@@ -1545,3 +1545,17 @@ each probe's argument parser.
   checks; the unrestricted diagnostic behavior predates the retry repair.
 - Neither issue is established as the cause of Steam's HTTP 403 responses or
   intermittent red corruption bars. Keep these separate from that diagnosis.
+
+
+### Host-test build configuration (2026-10-24)
+
+- Keep assertions enabled for every host regression in Release builds. The
+  default Release host phase in `scripts/build.sh Release` passes `-DNDEBUG`;
+  only some targets override it. The current user-namespace test consequently
+  fails `-Werror` on variables used only inside assertions. A successful build
+  with assertions disabled would also weaken the acceptance result. Use a
+  fresh wrapped-Clang Debug host configuration for current acceptance, while
+  retaining the Release production kernel and compiled audits.
+- Avoid reusing host-test directories configured with a different compiler.
+  An older GCC directory also rejects existing misleading indentation under
+  `-Werror`; this is distinct from the Internet-socket candidate.

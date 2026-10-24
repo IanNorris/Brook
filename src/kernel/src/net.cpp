@@ -2848,6 +2848,13 @@ int SockGetType(int sockIdx)
     return g_sockets[sockIdx].type;
 }
 
+int SockGetProtocol(int sockIdx)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return -1;
+    if (!g_sockUsed[sockIdx]) return -1;
+    return g_sockets[sockIdx].protocol;
+}
+
 void SockGetLocal(int sockIdx, uint32_t* ip, uint16_t* port)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;

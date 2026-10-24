@@ -361,3 +361,39 @@ The keymap validation run is preserved at
 integrity and checked sync pass, the original QEMU owner exits zero, and all
 four offline filesystem checks pass. No proprietary payloads, raw application
 logs or authentication material are included in the change.
+
+
+## Internet socket metadata and TLS setup
+
+A public Python HTTPS control resolves three Steam hostnames but fails before
+its TLS handshake with ENOPROTOOPT in SSL socket construction. The Internet
+branch of `getsockopt` supports only SO_ERROR; CPython first queries SO_TYPE.
+Returning the real socket type makes the same unchanged HTTPS control complete
+certificate-verified TLS and receive HTTP responses from all three hosts. This
+is evidence of a runtime compatibility repair, not proof that Steam uses this
+same code path or that its CM connection is ready.
+
+Reconstructing a socket from a duplicated descriptor then exposes missing
+SO_DOMAIN and SO_PROTOCOL queries. The candidate reports AF_INET, the stored
+creation protocol (including its resolved TCP/UDP default), and the socket type
+without creation flags. Existing SO_ERROR behavior and unsupported-option
+errors are preserved. Descriptor references pin these immutable metadata reads.
+Unsupported type/protocol combinations at creation remain a separate existing
+limitation.
+
+`inet_socket_metadata_check.py` passes all 18 cases on Linux and the fresh
+native candidate: default/explicit protocols, stream/datagram sockets,
+nonblocking/cloexec flags, duplicates after original close, accepted sockets,
+short/empty output buffers, untouched canaries on unsupported options, and
+Python SSL object setup. Its local setup check deliberately does not claim a
+TLS handshake; the separate public HTTPS control supplies that evidence. The
+Release kernel and all three compiled safety audits pass. Of 107 host tests,
+106 pass in the final parallel run; `test_audio_delivery` times out, then passes
+in an isolated rerun. The original timeout is preserved rather than reported
+as a clean full-suite run. Earlier SO_TYPE-only changes passed all 107 together.
+
+Private evidence is retained in `build/reviews/steam-inet-type-login-h-20261024`
+and `build/reviews/steam-inet-metadata-login-i-20261024`. Steam QR readiness is
+still a separate acceptance gate. New log classifications use per-file
+prelaunch inode/size baselines; independent word counts do not establish DNS
+failures or identify whether a WebSocket is local IPC or a remote CM transport.
