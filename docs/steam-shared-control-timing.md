@@ -231,3 +231,9 @@ socket-waiter capacity, 50/100 ms poll/epoll fallback intervals and 16 low-level
 queue-check yields remain explicit limitations; no negligible-overhead claim
 is made. Native smoke tests do not directly prove the internal waiter pointer
 was cleared; the lifetime contract also depends on the reviewed pin/guard order.
+
+The subsequent [isolated Xwayland controls](xwayland-controls.md) reproduce
+blackening of an already-working stock xeyes window after a separate GLX
+client, with Steam stopped. This exposes a missing destination-context PRIME
+resource attachment and insufficient importer synchronization/retirement.
+Passing a single-client GLX readback does not certify this multi-client path.
