@@ -32,6 +32,8 @@ def main():
     parser.add_argument('--log-dir', type=Path, required=True)
     parser.add_argument('--skip-bootstrap', action='store_true',
                         help='Diagnostic: use the already staged client without testing its updater')
+    parser.add_argument('--launch-app', type=int,
+                        help='Ask Steam to launch this installed numeric AppID after startup')
     parser.add_argument('--display', default=':0', help='An already running Xwayland display')
     parser.add_argument('--wayland-display', default='wayland-0', help='Guest Wayland socket for native dependencies')
     parser.add_argument('--pulse-server', help='Optional absolute guest Unix-socket endpoint, unix:/path')
@@ -40,6 +42,8 @@ def main():
     parser.add_argument('--include-log-tail', action='store_true',
                         help='Opt in to exporting bounded raw log text; default reports paths and hashes only')
     args = parser.parse_args()
+    if args.launch_app is not None and not 0 < args.launch_app < 2 ** 32:
+        parser.error('--launch-app must be an AppID between 1 and 4294967295')
     if os.geteuid() == 0:
         parser.error('run as the desktop user')
     if args.pulse_server is not None and not args.pulse_server.startswith('unix:/'):
@@ -110,12 +114,15 @@ def main():
                '-no-cef-sandbox', '-cef-disable-gpu', '-cef-disable-gpu-compositing']
     if args.skip_bootstrap:
         command.append('-skipinitialbootstrap')
+    if args.launch_app is not None:
+        command += ['-applaunch', str(args.launch_app)]
     args.log_dir.mkdir(parents=True, exist_ok=True)
     evidence = Path(tempfile.mkdtemp(prefix='steam-client-', dir=args.log_dir))
     evidence.chmod(0o700)
     request = dict(argv=command, uid=os.getuid(), home=str(home), evidence=str(evidence),
                    available_bytes=available, default_runtime_copy=True, skip_bootstrap=args.skip_bootstrap,
                    companion_launcher_service=True,
+                   launch_app=args.launch_app,
                    note='Existing staged client may contain prior ELF interpreter patches')
     (evidence / 'request.json').write_text(json.dumps(request, indent=2) + '\n')
     print(json.dumps(request), flush=True)

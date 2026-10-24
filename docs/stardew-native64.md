@@ -309,3 +309,22 @@ The fresh Release build exposed disabled assertions in host fixtures, leading
 to unused-variable errors and potentially removed fixture operations. Host
 tests now centrally undefine NDEBUG so their assertions run in every build
 type. This corrects test execution, not production-kernel assertion policy.
+
+## Reproducible helper and Steam launch gate
+
+`tools/reaper-pkg` packages the unchanged MIT-licensed upstream implementation
+as a static native64 executable. Its Nix build runs the two orphan lifetime and
+exit-status controls on Linux. The resulting package binary also passes both
+controls on Y, with its digest verified before execution and the tracked job
+fully drained. This is separate from the earlier manually built helper check.
+
+`steam_client_check.py --launch-app 413150` queues the installed game through
+Steam after startup. The current private acceptance profile redirects only this
+game's HOME and XDG directories to an empty test home; existing saves and the
+original Steam configuration are backed up privately. No account or game assets
+are included in the repository.
+
+Steam receives the launch request but displays a confirmation that launching
+here would disconnect another computer's active game session. That confirmation
+has been left untouched pending the owner's decision. A queued request and an
+authenticated client do not yet establish successful through-Steam game launch.
