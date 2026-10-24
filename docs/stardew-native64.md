@@ -79,3 +79,36 @@ The original Steam route independently remains blocked by its i386 reaper and
 the later game-container bind-source failure. A previously tested private
 64-bit reaper was restored to stock after diagnosis; no replacement is shipped.
 Successful direct startup alone will not complete Steam launch acceptance.
+
+## Signal FP-state baseline
+
+Local inspection of the public CoreCLR component identifies the nested #GP at
+module-relative `0x519b2f`: `fxrstor [rdi+0x100]`. A breakpoint at an earlier
+valid invocation is not sufficient evidence; its MXCSR is legal. A subsequent
+capture at the actual `ExceptionStub13` entry uses the selected CPU's CR3 to
+read just the failing operand's alignment/control metadata. The operand is
+16-byte aligned, but MXCSR is 406284485, with reserved bits set. The failing
+instruction and invalid control word explain the #GP. The debugger's first
+virtual-memory read failed; the physical page-table walk corrected that
+observation problem without changing the guest.
+
+Brook's synchronous and syscall-return signal delivery both zero the signal
+frame, leaving `mc.fpstate` null; sigreturn restores only GPRs. The public
+`tools/at-syscall-probe/signalfpcheck.c` passes eight Linux cases: XMM/YMM
+export, handler clobber followed by restoration, handler-edited saved state,
+asynchronous versus synchronous delivery, and normal versus alternate stack.
+On the unchanged T candidate, the first case fails both valid-image and
+restoration checks. This independently reproduces the ABI gap. It does not
+yet prove that repairing it is sufficient for the game to start.
+
+The next implementation must use the interrupted XSAVE slots already owned by
+the exception/syscall entry wrappers, not a potentially stale process save or
+a C-level save after kernel SSE use. Pass the slot explicitly after XSAVE,
+which clobbers EDX. Build a zeroed, standard Linux signal image from defined
+x87/SSE/AVX components, normalizing absent components and reserved bytes;
+never expose all 1088 kernel-slot bytes. Supply aligned FP storage and Linux
+XSAVE metadata. On sigreturn, validate copied user state (including MXCSR,
+header, bounds and trailer) before replacing the wrapper's final XRSTOR image.
+Support legacy and null reset deliberately, and reject malformed images
+without a kernel fault. Both delivery paths and their compiled entry audits
+need coverage. The current nested-handler bookkeeping is a separate limit.
