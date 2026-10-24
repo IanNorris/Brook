@@ -12,6 +12,11 @@ include("${BROOK_ROOT}/cmake/EevdfExperiment.cmake")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# These executables use assert for both checks and fixture operations. Release
+# builds must execute them too, rather than removing checks or failing -Werror
+# because variables used only by assertions become unused.
+add_compile_options(-UNDEBUG)
+
 # Host-native tests — compiled with the system compiler, linked with pthreads.
 # These test kernel data structures in isolation without booting a kernel.
 
