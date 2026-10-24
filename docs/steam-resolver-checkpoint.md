@@ -1,5 +1,9 @@
 # SteamRT resolver-file checkpoint
 
+Later progress: Steam authentication succeeds. See the
+[Library stability checkpoint](steam-library-stability.md) for the post-login
+resource-limit defect and remaining window-integration acceptance.
+
 The socket repairs in `cd7f9914` pass 21 native Unix-name cases and 17 TCP/UDP
 cases. Steam's own numeric probe then records successful Unix peer-name queries
 and plausible accepted-TCP stream lengths, but the client still reaches its

@@ -1045,6 +1045,10 @@ Prioritize:
   Inventory remaining stubs (including socket setters), implement required
   behavior or return a supported error that lets callers choose a fallback;
   verify actual state/output rather than only a zero return value.
+  Steam also exposed inconsistent `getrlimit`/`prlimit64` defaults: the data
+  limit incorrectly inherited the stack's 8 MiB soft limit. Query defaults now
+  agree; persistent limit setters, target-process permission checks, invalid
+  resource handling and enforcement still need a deliberate implementation.
 - Executable/interpreter size and mapped span, brk/mmap/stack address ranges,
   file mappings, segment counts and argument/environment buffers.
 - Processes, threads, file descriptors, futexes, waiters, timers and signal

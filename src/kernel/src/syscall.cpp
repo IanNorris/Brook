@@ -8399,6 +8399,16 @@ static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t setAddr, uint64_t oldAd
 struct rlimit64 { uint64_t rlim_cur; uint64_t rlim_max; };
 static constexpr uint64_t RLIM_INFINITY = ~0ULL;
 
+// Both Linux query entry points describe the same defaults. In particular,
+// the stack's 8 MiB soft limit must not become a data/heap limit when glibc
+// implements getrlimit through prlimit64 (V8 uses RLIMIT_DATA for sizing).
+static rlimit64 ReportedResourceLimit(uint64_t resource)
+{
+    if (resource == 7) return {MAX_FDS, MAX_FDS}; // RLIMIT_NOFILE
+    if (resource == 3) return {8 * 1024 * 1024, RLIM_INFINITY}; // RLIMIT_STACK
+    return {RLIM_INFINITY, RLIM_INFINITY};
+}
+
 static int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitAddr,
                                uint64_t oldlimitAddr, uint64_t, uint64_t)
 {
@@ -8408,24 +8418,7 @@ static int64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newlimitA
     {
         if (!UserBufferWritable(oldlimitAddr, sizeof(rlimit64))) return -EFAULT;
         auto* old = reinterpret_cast<rlimit64*>(oldlimitAddr);
-        switch (resource)
-        {
-        case 7: // RLIMIT_NOFILE
-            old->rlim_cur = MAX_FDS;
-            old->rlim_max = MAX_FDS;
-            break;
-        case 0: // RLIMIT_CPU
-        case 1: // RLIMIT_FSIZE
-        case 2: // RLIMIT_DATA
-        case 3: // RLIMIT_STACK
-            old->rlim_cur = 8 * 1024 * 1024; // 8MB stack
-            old->rlim_max = RLIM_INFINITY;
-            break;
-        default:
-            old->rlim_cur = RLIM_INFINITY;
-            old->rlim_max = RLIM_INFINITY;
-            break;
-        }
+        *old = ReportedResourceLimit(resource);
     }
     return 0;
 }
@@ -11292,25 +11285,7 @@ static int64_t sys_getrlimit(uint64_t resource, uint64_t rlimAddr, uint64_t,
                               uint64_t, uint64_t, uint64_t)
 {
     if (!UserBufferWritable(rlimAddr, 16)) return -EFAULT;
-    auto* rlim = reinterpret_cast<uint64_t*>(rlimAddr);
-    switch (resource)
-    {
-    case 7: // RLIMIT_NOFILE
-        rlim[0] = MAX_FDS;
-        rlim[1] = MAX_FDS;
-        break;
-    case 3: // RLIMIT_STACK
-        rlim[0] = 8 * 1024 * 1024;
-        rlim[1] = RLIM_INFINITY;
-        break;
-    case 0: // RLIMIT_CPU
-    case 1: // RLIMIT_FSIZE
-    case 2: // RLIMIT_DATA
-    default:
-        rlim[0] = RLIM_INFINITY;
-        rlim[1] = RLIM_INFINITY;
-        break;
-    }
+    *reinterpret_cast<rlimit64*>(rlimAddr) = ReportedResourceLimit(resource);
     return 0;
 }
 
