@@ -1602,3 +1602,29 @@ each probe's argument parser.
   lifecycle shutdown does not wait on an orphan. The final Q review exits the
   Steam wrapper cleanly but still needs SIGTERM for one detached helper before
   the checked shutdown; no forced VM stop is needed.
+
+### Stardew Valley native64 acceptance (24 October)
+
+- AppID 413150's default Linux depot installs and verifies through Steam;
+  header-only inspection confirms its game apphost and bundled CoreCLR are
+  x86-64. No saved game was loaded or modified during the startup trial.
+- Steam still invokes its i386 `reaper`. A private diagnostic build of the
+  public MIT helper (Plagman/reaper revision
+  `fb26ffe691718ae149095b2b478ad88628463017`) passes native true/false controls
+  and advances the launch to pressure-vessel. This is not a supported
+  replacement: Brook does not implement child-subreaper adoption. The stock
+  helper was restored after testing.
+- The game container copies its runtime after hard-link failures, then fails
+  opening a bind source with EOPNOTSUPP. That source is a regular executable
+  accessible by stat and O_PATH outside the failing container. Diagnose mount
+  namespace/path following rather than treating it as a missing installation.
+- A separate direct native launch reaches CoreCLR initialization and fails
+  with HRESULT 0x8007FF02. A PID-scoped trace records membarrier ENOSYS, then
+  a one-page mlock ENOSYS immediately before exit. This fits CoreCLR's fallback
+  process-wide barrier initialization, but the shipped caller still needs
+  module-relative confirmation. Assess proper private expedited membarrier
+  support with cross-CPU ordering tests before the broader mlock feature.
+  Returning success without actual barrier/residency semantics is insufficient.
+- Acceptance remains game title/menu plus clean exit. No game window was
+  reached. Proprietary files, saves, authenticated logs and captures remain in
+  ignored private review storage.
