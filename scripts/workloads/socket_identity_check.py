@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Own-socket inode/procfs conformance; exports counts only, never other sockets."""
+import array
 import concurrent.futures
 import errno
 import json
@@ -108,6 +109,25 @@ def main():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
         udp.bind(('127.0.0.1', 0)); table(udp, identity(udp.fileno()), 'udp')
 
+    left, right = socket.socketpair()
+    passed = socket.socket()
+    received = None
+    try:
+        original = identity(passed.fileno())
+        left.sendmsg([b'x'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                              array.array('i', [passed.fileno()]))])
+        data, ancillary, _, _ = right.recvmsg(1, socket.CMSG_SPACE(4))
+        assert data == b'x' and len(ancillary) == 1
+        assert ancillary[0][:2] == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+        descriptors = array.array('i'); descriptors.frombytes(ancillary[0][2])
+        assert len(descriptors) == 1; received = descriptors[0]
+        passed.close()
+        assert identity(received) == original
+    finally:
+        if received is not None:
+            os.close(received)
+        passed.close(); left.close(); right.close()
+
     def churn(_):
         seen = set()
         for _ in range(100):
@@ -125,7 +145,8 @@ def main():
         results = list(pool.map(churn, range(8)))
     assert len(set.union(*results)) == sum(map(len, results)) == 800
     print(json.dumps(dict(socket_identity_pass=True, concurrent_lifetimes=800,
-                         tcp_endpoints=3, udp=True, path_retention=True)), flush=True)
+                         tcp_endpoints=3, udp=True, path_retention=True,
+                         scm_rights_identity=True)), flush=True)
 
 
 if __name__ == '__main__':

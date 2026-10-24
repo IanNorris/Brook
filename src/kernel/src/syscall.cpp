@@ -14172,6 +14172,15 @@ static int UnixFdSnapInstall(Process* dst, const UnixFdSnap* snap)
     owned.flags = snap->flags;
     owned.fdFlags = snap->fdFlags;
     owned.statusFlags = snap->statusFlags;
+    if (owned.type == FdType::Socket) {
+        // The queued snapshot owns a socket reference. Reconstruct its cached
+        // identity before publication, just as socket() and accept() do.
+        brook::SocketIdentity identity{};
+        int index = static_cast<int>(reinterpret_cast<uintptr_t>(owned.handle)) - 1;
+        if (!brook::SockGetIdentity(index, &identity) ||
+            !brook::SocketIdentityLabel(identity.inode, owned.dirPath, sizeof(owned.dirPath)))
+            return -EBADF;
+    }
     return FdTablePublishOwned(dst->fds, ProcessFdLock(dst), owned, 0, -1, nullptr, UnixLifePublished);
 }
 

@@ -233,3 +233,50 @@ is explicitly stopped after excessive host contention, then passes alone in
 0.65 seconds. Both new tests pass, as do the three compiled entry/scheduler
 audits. Login remains unverified; next compare the request/rejection paths
 without attributing synthetic control responses to Steam.
+
+## Descriptor transfer and the remaining peer lookup
+
+A separate native regression exposes an SCM_RIGHTS inconsistency: the received
+INET descriptor retains its socket inode, but loses its cached `socket:[inode]`
+label. `UnixFdSnapInstall` now reconstructs that label from the socket reference
+owned by the queued snapshot, before publishing the received descriptor. The
+portable socket-identity workload transfers a descriptor, closes its original,
+and checks the received descriptor's fstat, readlink and followed-stat identity.
+It passes on Linux and the matched Brook kernel, alongside 800 concurrent
+socket lifetimes, actual SteamRT lsof listener discovery, transport controls,
+and invalid-pointer/errno controls for the private stat probe. The two socket
+identity/metadata host fixtures and all three compiled entry/scheduler mutation
+audits pass. Module ABI remains 52.
+
+This repair does not resolve Steam's HTTP 403. Earlier captured application
+connections already had correctly labelled endpoints. A private keyed equality
+comparison also confirms that the captured rejected request target is identical
+to a target accepted by the Linux reference; no request targets or comparison
+keys are published.
+
+The actual main-client lsof streams still report one PID/descriptor where the
+accepted Linux reference reports two. During four live Brook lsof calls, an
+independent inspector running as UID 1000 finds both established TCP rows and
+both corresponding socket descriptors with matching ownership and valid socket
+metadata. This is useful visibility evidence, not proof of identical inspector
+and lsof authorization contexts. Explicit PID selection also lets the actual
+SteamRT lsof binary inspect the live helper process. Controlled parent/child TCP
+connections return both endpoints, including with the observed `-F pun`, `-P`
+and TCP-filter option shape. Generic peer discovery therefore works in these
+controls; the actual application lookup remains the target of diagnosis.
+
+Private stat-family hooks cover the imported `__xstat64` and `__lxstat64`
+entrypoints of the actual lsof executable. Some unscoped lsof captures reach
+their 256-row diagnostic cap before recording the helper's descriptors, so
+missing rows cannot establish an absent stat call or a permission failure.
+The next capture must retain the relevant helper's results without that blind
+spot. The desktop remains black in the completed-frame capture; usable native
+Steam login and QR authentication readiness remain unverified. The user's
+intermittent red-bar corruption report also remains unresolved.
+
+Own probes, raw application logs, keyed comparison material and disk images
+remain in ignored build directories. The fresh SCM_RIGHTS candidate is
+`build/reviews/steam-rejection-c-20261024`; earlier failure evidence is retained.
+All candidate command groups drain, the original helper wrapper is restored,
+heap integrity and checked sync pass, and the original VM owner exits zero.
+All four offline filesystem checks pass.
