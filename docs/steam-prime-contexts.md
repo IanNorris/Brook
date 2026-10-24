@@ -73,6 +73,11 @@ remains unmapped. Later it draws a readable **Unexpected Transport Error** dialo
 Attempting to move that dialog into the X screen is followed by Xwayland SIGSEGV
 inside libxshmfence at address `0x28427000`, then abort signal 6. Its stack is
 preserved. This is not a usable login or proof that the fence mapping was valid.
+The exact library is retained from the checked offline Nix disk. Its matching
+instruction at ELF offset `0x1397` is `xshmfence_trigger+7`, an atomic
+`lock cmpxchg` through RDI. The next diagnosis must distinguish a removed or
+unwritable four-byte fence mapping from an invalid application-side lifetime;
+the stack alone does not decide which occurred.
 The new CEF segment contains no fixed allocator-corruption or EnsureConnected
 timeout category in this run; absence alone does not prove shared IPC correctness.
 
