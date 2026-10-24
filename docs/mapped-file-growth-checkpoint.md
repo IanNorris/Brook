@@ -410,3 +410,9 @@ Interposed absence remains weaker than complete syscall coverage. N's wrapper
 is restored, all tracked groups drain, heap and checked sync pass, original
 QEMU exits zero, and serial plus four offline filesystem checks pass. Its
 application exit 137 follows agent termination, not successful client shutdown.
+
+The subsequent [shared-control timing investigation](steam-shared-control-timing.md)
+validates small-object coherence and shared-futex wakeups inside SteamRT, then
+identifies an apparent 500 ms handshake budget and slow large shared-file cold
+writes. It records the bounded tmpfs page-index candidate and its before/after
+benchmark separately from full Steam login acceptance.

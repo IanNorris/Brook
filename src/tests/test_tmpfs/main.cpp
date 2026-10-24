@@ -237,11 +237,76 @@ static void mappedQuota()
     Unreserve(fs,spare);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
     mappingTest=false;
 }
+static void indexedSparsePages()
+{
+    auto* fs=make();auto* r=root(fs);auto* f=create(r,"indexed");
+    constexpr unsigned count=320;
+    auto pageIndex=[](unsigned i)->uint64_t {return i<256?i:(uint64_t{1}<<32)+uint64_t{i-256}*64;};
+    auto value=[](unsigned i)->unsigned char {return static_cast<unsigned char>(i*17+3);};
+    for(unsigned ordinal=0;ordinal<count;++ordinal) {
+        unsigned i=(ordinal*73)%count;
+        // Fail only the optional initial/replacement table allocation, after
+        // the backing page allocation. Existing data and write success remain.
+        if(ordinal==31 || ordinal==159)failAllocation=1;
+        auto byte=value(i);uint64_t offset=pageIndex(i)*4096+17;
+        assert(f->ops->write(f,&byte,1,&offset)==1);
+        if(ordinal==31 || ordinal==159)assert(failAllocation==-1);
+    }
+    for(unsigned i=0;i<count;++i) {
+        unsigned char byte=0;uint64_t offset=pageIndex(i)*4096+17;
+        assert(f->ops->read(f,&byte,1,&offset)==1 && byte==value(i));
+    }
+    // Drop sparse high indices and many collision-chain members, keeping an
+    // indexed file and a partially retained final page.
+    unsigned char byte=0x7f;uint64_t offset=128*4096+200;
+    assert(f->ops->write(f,&byte,1,&offset)==1);
+    assert(!f->ops->truncate(f,128*4096+123));
+    assert(!f->ops->truncate(f,256*4096));
+    for(unsigned i=0;i<256;++i) {
+        offset=uint64_t{i}*4096+17;byte=0xff;
+        assert(f->ops->read(f,&byte,1,&offset)==1 && byte==(i<=128?value(i):0));
+    }
+    offset=128*4096+200;byte=0xff;assert(f->ops->read(f,&byte,1,&offset)==1 && !byte);
+    // Crossing below the index threshold preserves survivors, and regrowth
+    // must not resurrect freed buckets/pages or the discarded EOF tail.
+    assert(!f->ops->truncate(f,16*4096));
+    assert(!f->ops->truncate(f,256*4096));
+    for(unsigned i=0;i<256;++i) {
+        offset=uint64_t{i}*4096+17;byte=0xff;
+        assert(f->ops->read(f,&byte,1,&offset)==1 && byte==(i<16?value(i):0));
+        byte=value(i);offset=uint64_t{i}*4096+17;assert(f->ops->write(f,&byte,1,&offset)==1);
+    }
+    assert(!f->ops->truncate(f,0));
+    VfsClose(f);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
+}
+static void indexedMappedQuota()
+{
+    mappingTest=true;
+    auto* fs=make();auto* r=root(fs);auto* f=create(r,"indexed-mapped");auto* node=VnodeNode(f);
+    assert(!f->ops->truncate(f,32*4096));
+    for(unsigned i=0;i<31;++i)assert(!PrepareBackingPage(node,i));
+    // Leave exactly enough for backing page 32 and the first bucket table,
+    // but no canonical-frame quota. Metadata is honestly charged; this fault
+    // must fail without publishing a canonical page or losing the backend.
+    const uint64_t backend=sizeof(Page)+sizeof(Allocation)+64*sizeof(Page*)+sizeof(Allocation);
+    const uint64_t spare=fs->byteLimit-fs->bytes-backend;assert(Reserve(fs,spare));
+    int error=0;auto* object=f->ops->file_object(f);auto page=FileObjectGetPage(object,f,31,true,&error);
+    assert(!page && error==-28 && fs->bytes==fs->byteLimit && frames.empty());
+    unsigned char byte=0x5a;uint64_t offset=31*4096+17;
+    assert(f->ops->write(f,&byte,1,&offset)==1); // Existing indexed page: no allocation.
+    Unreserve(fs,spare);
+    page=FileObjectGetPage(object,f,31,true,&error);assert(page && !error);
+    assert(reinterpret_cast<unsigned char*>(page.raw())[17]==0x5a);PmmUnrefPage(page);
+    assert(!FileObjectTruncateUnmapped(object,f,0) && frames.empty());
+    VfsClose(f);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();mappingTest=false;
+}
 int main()
 {
     identity(1000);
     clean();
     mappedQuota();
+    indexedSparsePages();
+    indexedMappedQuota();
     {
         auto* fs=make();auto* r=root(fs);int error=0;
         auto* fifo=r->ops->create_fifo(r,"fifo",0640,&error);assert(fifo && !error && fifo->type==VnodeType::Device);

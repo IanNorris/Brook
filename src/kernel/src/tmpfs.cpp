@@ -32,6 +32,7 @@ struct Entry
 struct Page
 {
     Page *next;
+    Page *hashNext;
     uint64_t index;
     uint8_t bytes[4096];
 };
@@ -66,6 +67,9 @@ struct Node
     Node *parent;
     Entry *entries;
     Page *pages;
+    Page **pageBuckets;
+    uint64_t pageCount;
+    uint32_t pageBucketCount;
     char *target;
     char name[256];
     FileObject file;
@@ -178,6 +182,7 @@ void Drop(Node *n)
             n->pages = p->next;
             Free(fs, p);
         }
+        Free(fs, n->pageBuckets);
         Free(fs, n->target);
         FileObjectDispose(&n->file);
         Free(fs, n);
@@ -451,12 +456,68 @@ int DirectoryPath(VfsObject *o, char *out, uint32_t capacity)
     return ObjectPath(o,out,capacity);
 }
 
+// The ownership list remains authoritative for sparse truncation and teardown.
+// Larger files gain a quota-charged index; small files need no bucket array.
+// The existing filesystem mutex protects both views. An index-allocation failure
+// retains the old index (or linear lookup), never a partially rebuilt table.
+constexpr uint64_t PageIndexThreshold = 32;
+constexpr uint32_t MaximumPageBuckets = 65536;
+uint32_t PageBucket(uint64_t index, uint32_t count)
+{
+    index *= 0x9e3779b97f4a7c15ULL;
+    index ^= index >> 32;
+    return static_cast<uint32_t>(index) & (count - 1);
+}
 Page *FindPage(Node *n, uint64_t index)
 {
-    for (auto *p = n->pages; p; p = p->next)
+    auto* p = n->pageBuckets ? n->pageBuckets[PageBucket(index,n->pageBucketCount)] : n->pages;
+    for (; p; p = n->pageBuckets ? p->hashNext : p->next)
         if (p->index == index)
             return p;
     return nullptr;
+}
+bool GrowPageIndex(Node* n)
+{
+    // Retry optional allocation only once per 32 insertions under pressure.
+    if(n->pageCount % PageIndexThreshold)return false;
+    uint32_t count=n->pageBucketCount;
+    if(!count) {
+        if(n->pageCount<PageIndexThreshold)return false;
+        count=64;
+    } else {
+        if(n->pageCount<=uint64_t{count}*2 || count>=MaximumPageBuckets)return false;
+        count*=2;
+    }
+    auto** buckets=static_cast<Page**>(Allocate(n->fs,uint64_t{count}*sizeof(Page*)));
+    if(!buckets)return false;
+    for(auto* p=n->pages;p;p=p->next) {
+        auto slot=PageBucket(p->index,count);
+        p->hashNext=buckets[slot];buckets[slot]=p;
+    }
+    auto** old=n->pageBuckets;n->pageBuckets=buckets;n->pageBucketCount=count;
+    Free(n->fs,old);
+    return true;
+}
+void InsertPage(Node* n,Page* p)
+{
+    p->next=n->pages;n->pages=p;++n->pageCount;
+    if(!GrowPageIndex(n) && n->pageBuckets) {
+        auto slot=PageBucket(p->index,n->pageBucketCount);
+        p->hashNext=n->pageBuckets[slot];n->pageBuckets[slot]=p;
+    }
+}
+void RebuildPageIndex(Node* n)
+{
+    if(!n->pageBuckets)return;
+    if(n->pageCount<PageIndexThreshold) {
+        Free(n->fs,n->pageBuckets);n->pageBuckets=nullptr;n->pageBucketCount=0;
+        return;
+    }
+    memset(n->pageBuckets,0,uint64_t{n->pageBucketCount}*sizeof(Page*));
+    for(auto* p=n->pages;p;p=p->next) {
+        auto slot=PageBucket(p->index,n->pageBucketCount);
+        p->hashNext=n->pageBuckets[slot];n->pageBuckets[slot]=p;
+    }
 }
 int PrepareBackingPage(void* context,uint64_t index)
 {
@@ -469,7 +530,7 @@ int PrepareBackingPage(void* context,uint64_t index)
     // not extend EOF and ordinary inode teardown reclaims it.
     auto* page=static_cast<Page*>(Allocate(n->fs,sizeof(Page)));
     if(!page)return -28;
-    page->index=index;page->next=n->pages;n->pages=page;
+    page->index=index;InsertPage(n,page);
     return 0;
 }
 int Read(Vnode *vn, void *buffer, uint64_t length, uint64_t *offset)
@@ -521,8 +582,7 @@ int Write(Vnode *vn, const void *buffer, uint64_t length, uint64_t *offset)
             if (!p)
                 break;
             p->index = at / 4096;
-            p->next = n->pages;
-            n->pages = p;
+            InsertPage(n,p);
         }
         memcpy(p->bytes + (at & 4095), static_cast<const uint8_t *>(buffer) + done, part);
         done += part;
@@ -545,6 +605,7 @@ int Truncate(Vnode *vn, uint64_t size)
     Guard g(n->fs);
     if (size > 0x7fffffffffffffffULL)
         return -27;
+    bool removed=false;
     auto **link = &n->pages;
     while (*link)
     {
@@ -552,6 +613,7 @@ int Truncate(Vnode *vn, uint64_t size)
         if (p->index >= ((size + 4095) / 4096))
         {
             *link = p->next;
+            --n->pageCount;removed=true;
             Free(n->fs, p);
         }
         else
@@ -561,6 +623,7 @@ int Truncate(Vnode *vn, uint64_t size)
             link = &p->next;
         }
     }
+    if(removed)RebuildPageIndex(n);
     n->size = size;
     n->mode &= ~06000;
     n->mtime = n->ctime = Now();
