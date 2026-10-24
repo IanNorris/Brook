@@ -18,6 +18,9 @@
 #include "smp.h"
 #include "memory/physical_memory.h"
 #include "memory/heap.h"
+#include "memory/user_mapping.h"
+#include "exec_limits.h"
+#include "user_copy.h"
 #include "serial.h"
 #include "net.h"
 #include "module.h"
@@ -161,6 +164,7 @@ struct ProcPriv {
     UserAuthority openedAuthority;
     uint8_t mapKind; // 1 UID, 2 GID, 3 setgroups; independent namespace lease
     bool sysKernelDirectory;
+    bool commandLine;
 };
 
 static int ProcReportedInode(VfsObject*,uint64_t*);
@@ -171,6 +175,29 @@ static int ProcFileOpen(Vnode*, int) { return 0; }
 static int ProcFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     auto* pp = static_cast<ProcPriv*>(vn->priv);
+    if (pp && pp->commandLine) {
+        struct ReadOperation {
+            Process* actor=ProcessCurrent();
+            ReadOperation() { if(actor)SchedulerKernelRegionEnter(actor); }
+            ~ReadOperation() { if(actor)SchedulerKernelRegionLeave(actor); }
+        } operation;
+        if (!len) return 0;
+        bool exists=false;
+        auto* space=SchedulerReferenceProcessAddressSpace(pp->pid,pp->incarnation,&exists);
+        if (!space) return exists?0:-3; // zombie/kernel EOF, departed incarnation ESRCH
+        const uint32_t capacity=len>EXEC_ARG_BYTES?EXEC_ARG_BYTES:static_cast<uint32_t>(len);
+        auto* staged=static_cast<uint8_t*>(kmalloc(capacity));
+        if (!staged) { AddressSpaceUnref(space);return -12; }
+        const uint32_t copied=UserMappingReadArguments(space,*offset,staged,capacity);
+        AddressSpaceUnref(space);
+        // Destination can fault; no foreign AS gate or frame reference is held.
+        uint32_t delivered=copied;
+        if (reinterpret_cast<uint64_t>(buf)<0x0000800000000000ULL)
+            delivered=CopyToUserBytes(reinterpret_cast<uint64_t>(buf),staged,copied);
+        else memcpy(buf,staged,copied);
+        kfree(staged);*offset+=delivered;
+        return delivered?static_cast<int>(delivered):copied?-14:0;
+    }
     if (!pp || !pp->data) return 0;
     if (*offset >= pp->size) return 0;
     uint64_t avail = pp->size - *offset;
@@ -688,14 +715,15 @@ static Vnode* GenPidStatus(const ProcessSnapshot& proc)
     return MakeProcVnode(buf, n);
 }
 
-// /proc/[pid]/cmdline — NUL-terminated command name
+// /proc/[pid]/cmdline — live NUL-separated arguments, tied to PID incarnation.
 static Vnode* GenPidCmdline(const ProcessSnapshot& proc)
 {
-    uint32_t len = ProcStrLen(proc.name);
-    auto* buf = static_cast<char*>(kmalloc(len + 1));
-    if (!buf) return nullptr;
-    ProcStrCopy(buf, proc.name, len + 1);
-    return MakeProcVnode(buf, len + 1);  // include NUL terminator
+    auto* node=MakeProcVnode(nullptr,0);
+    if (node) {
+        auto* pp=static_cast<ProcPriv*>(node->priv);
+        pp->commandLine=true;pp->pid=proc.pid;pp->incarnation=proc.incarnation;
+    }
+    return node;
 }
 
 // /proc/[pid]/statm — memory usage in pages

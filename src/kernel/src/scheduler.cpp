@@ -2680,6 +2680,32 @@ Process* SchedulerFindProcessReference(uint16_t pid)
     return found;
 }
 
+AddressSpaceState* SchedulerReferenceProcessAddressSpace(uint16_t pid, uint64_t incarnation, bool* exists)
+{
+    AddressSpaceState* space = nullptr;
+    *exists = false;
+    const auto flags = SchedLockAcquire(g_allProcLock);
+    for (uint32_t i = 0; i < g_processCount; ++i) {
+        const auto* process = g_allProcesses[i];
+        if (process->pid != pid || process->incarnation != incarnation) continue;
+        *exists = true;
+        if (process->state != ProcessState::Terminated && process->addressSpace && !process->addressSpace->kernel) {
+            space = process->addressSpace;
+            AddressSpaceRef(space);
+        }
+        break;
+    }
+    SchedLockRelease(g_allProcLock, flags);
+    return space;
+}
+
+void SchedulerReplaceProcessAddressSpace(Process* process, AddressSpaceState* replacement)
+{
+    const auto flags = SchedLockAcquire(g_allProcLock);
+    process->addressSpace = replacement;
+    SchedLockRelease(g_allProcLock, flags);
+}
+
 Process* ProcessFindByPid(uint16_t pid)
 {
     uint64_t alf = SchedLockAcquire(g_allProcLock);

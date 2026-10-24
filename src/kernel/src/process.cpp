@@ -519,7 +519,7 @@ static uint64_t SetupUserStack(Process* proc,
     // ProcessCreate/ProcessExec validate counts and byte budgets before
     // allocating or replacing the address space. Preserve every entry.
     uint64_t envAddrs[EXEC_MAX_ENV] = {};
-    for (int i = 0; i < envc; ++i)
+    for (int i = envc - 1; i >= 0; --i)
     {
         uint64_t len = 0;
         while (envp[i][len]) ++len;
@@ -528,12 +528,17 @@ static uint64_t SetupUserStack(Process* proc,
 
     // 3. Push argument strings and record pointers
     uint64_t argAddrs[EXEC_MAX_ARGS] = {};
-    for (int i = 0; i < argc; ++i)
+    const uint64_t argumentEnd = sp;
+    for (int i = argc - 1; i >= 0; --i)
     {
         uint64_t len = 0;
         while (argv[i][len]) ++len;
         argAddrs[i] = pushBytes(argv[i], len + 1);
     }
+    KMutexLock(&proc->addressSpace->mutation);
+    proc->addressSpace->argumentStart = sp;
+    proc->addressSpace->argumentEnd = argumentEnd;
+    KMutexUnlock(&proc->addressSpace->mutation);
 
     // 4. Align to 16 bytes
     sp &= ~0xFULL;
@@ -1585,7 +1590,7 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     UserFramebufferPublish(proc,nullptr,nullptr,0,0,0,0);
     PageTable kernelPt = VmmKernelCR3();
     __asm__ volatile("mov %0, %%cr3" : : "r"(kernelPt.pml4.raw()) : "memory");
-    proc->addressSpace = replacement;
+    SchedulerReplaceProcessAddressSpace(proc, replacement);
     proc->tlbCpuMask = 0;
     if (wasThread) {
         // Detach the previous shared FD ownership before becoming a leader.

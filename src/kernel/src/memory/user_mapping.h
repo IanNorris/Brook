@@ -32,6 +32,9 @@ int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, ui
 // clone owned by destination teardown, which the caller must destroy. Parent
 // CoW downgrades may remain after failure; they are acknowledged before return.
 bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceState* destination, uint16_t pid);
+// Caller retains space and supplies a kernel buffer. Copies live argument bytes
+// from readable user leaves while mutation prevents unmap/frame retirement.
+uint32_t UserMappingReadArguments(AddressSpaceState* space, uint64_t offset, void* buffer, uint32_t capacity);
 // Source allocation must remain owned while the snapshot translates and pins
 // its pages. The returned descriptor owns those pins independently of the source.
 MappingBacking* UserMappingBufferSnapshot(uint64_t kernelAddress,uint64_t length);

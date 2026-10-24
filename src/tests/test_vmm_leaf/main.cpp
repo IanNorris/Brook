@@ -1012,8 +1012,23 @@ static void liveMappingClone() {
     auto hidden=VmmReadLeaf(source->pageTable,va+pageSize);
     CHECK((hidden&PTE_HIDDEN_BIT)&&!(hidden&VMM_PRESENT));
     auto hiddenPhysical=VmmLeafPhysical(hidden);
+    source->argumentStart=va.raw()+pageSize-3;
+    source->argumentEnd=source->argumentStart+7;
+    std::memcpy(reinterpret_cast<unsigned char*>(original.raw())+pageSize-3,"A\0B",3);
+    std::memcpy(reinterpret_cast<void*>(hiddenPhysical.raw()),"\0C\0\0",4);
+    char argumentBytes[8]{};
+    CHECK(UserMappingReadArguments(source,0,argumentBytes,sizeof(argumentBytes))==0);
+    CHECK(UserMappingProtect(&actor,source,va.raw()+pageSize,pageSize,1)==0);
+    CHECK(UserMappingReadArguments(source,0,argumentBytes,sizeof(argumentBytes))==7);
+    CHECK(!std::memcmp(argumentBytes,"A\0B\0C\0\0",7));
+    CHECK(UserMappingReadArguments(source,2,argumentBytes,3)==3);
+    CHECK(!std::memcmp(argumentBytes,"B\0C",3));
+    CHECK(UserMappingReadArguments(source,7,argumentBytes,sizeof(argumentBytes))==0);
+    CHECK(UserMappingProtect(&actor,source,va.raw()+pageSize,pageSize,0)==0);
     CHECK(UserMappingProtect(&actor,source,va.raw()+2*pageSize,pageSize,1)==0);
     CHECK(UserMappingClone(&actor,source,child,32));
+    CHECK(child->argumentStart==source->argumentStart && child->argumentEnd==source->argumentEnd);
+    CHECK(UserMappingReadArguments(child,0,argumentBytes,sizeof(argumentBytes))==0);
     CHECK(PmmGetRefCount(original)==2&&maps(original)==2);
     auto parentRaw=VmmReadLeaf(source->pageTable,va),childRaw=VmmReadLeaf(child->pageTable,va);
     CHECK((parentRaw&PTE_COW_BIT)&&!(parentRaw&VMM_WRITABLE));
@@ -1026,6 +1041,12 @@ static void liveMappingClone() {
     CHECK(UserMappingPageAccess(&actor,source,va.raw(),2,true)==UserPageAccess::Ready);
     auto privateCopy=VmmLeafPhysical(VmmReadLeaf(source->pageTable,va));
     CHECK(privateCopy!=original&&*reinterpret_cast<unsigned char*>(privateCopy.raw())==0x73);
+    reinterpret_cast<unsigned char*>(privateCopy.raw())[pageSize-1]='D';
+    CHECK(UserMappingProtect(&actor,source,va.raw()+pageSize,pageSize,1)==0);
+    CHECK(UserMappingReadArguments(source,0,argumentBytes,3)==3);
+    CHECK(!std::memcmp(argumentBytes,"A\0D",3));
+    CHECK(UserMappingReadArguments(child,0,argumentBytes,3)==3);
+    CHECK(!std::memcmp(argumentBytes,"A\0B",3));
     CHECK(PmmGetRefCount(original)==1&&maps(original)==1);
     // Moving a hidden range preserves its bytes, reference and accessibility.
     CHECK(UserMappingProtect(&actor,child,va.raw(),pageSize,0)==0);

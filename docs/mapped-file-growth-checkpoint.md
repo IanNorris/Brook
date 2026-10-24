@@ -143,3 +143,47 @@ stop and must not be interpreted as a spontaneous plateau. All original job
 groups drain with stdout/stderr EOF. The pristine wrapper is restored, both
 services exit normally, heap integrity passes, the original VM owner exits 0,
 and final serial acceptance plus all four offline filesystem checks pass.
+
+
+## Follow-up controls: uninstrumented startup and IPC metadata
+
+The first bounded socket probe records successful descriptor transfers and no
+ancillary truncation in its captured calls. Missing DBus endpoints account for
+many connect errors; IPv4 connection refusals also appear in steamclient, but
+the destination and relevance are not established. X11 consumed much of its
+per-process successful-call budget, so this is not full IPC coverage.
+A revised probe samples successes per descriptor. Its direct CEF calls show
+bidirectional socket traffic and rights transfers before connection timeouts;
+there are no captured unexpected sendmsg/recvmsg errors or MSG_CTRUNC events.
+No peer-credential checks were observed, which is not proof that all credential
+paths are correct.
+
+The fresh-boot, uninstrumented first phase of review
+`steam-mapped-growth-off-gpu-1ms-fixed-mlfq-f-20261023` uses the same frozen
+kernel, 16 GiB and unrestricted byte quotas. The wrapper hash remains pristine,
+and an audit of every live Steam/webhelper process confirms the probe is absent
+from its maps. It still produces the corruption warning, repeated connection
+timeouts and continued pool growth without a login screen. Before the stop
+request it has 40 pools and approximately 1.05 billion logical shared-memory
+bytes; its full 181-sample capture including the deliberate stop reaches
+56 pools, 1,473,993,264 logical bytes and 2,977,292,288 charged bytes. The
+instrumentation is therefore not the sole cause of this failure.
+
+A separate fresh-profile probe phase in the same F VM has a distinct baseline
+and retains the first phase's shared files. Its footprint must not be treated
+as a clean-boot or performance comparison. It localizes later CEF exchanges but
+does not identify the connection failure's cause. Both phases' original jobs
+drain, the original wrapper is restored, services exit normally, heap integrity
+passes, the original VM owner exits 0, and final serial acceptance and all four
+offline filesystem checks pass. The preceding E socket-capture VM has the same
+checked-stop receipts. No new kernel change follows from these probes yet.
+
+
+The G feature-off run remains uninstrumented and does not reach login. Its
+wrapper explicitly appends `--disable-features=MojoIpcz,MojoLinuxChannelSharedMem`
+while preserving the existing disabled-feature list. However, the live argv
+audit fails because current procfs returns only `Process::name` for cmdline,
+not the argv vector. Therefore this run does not independently prove which
+features CEF selected, and is not accepted as ruling out shared-memory IPC.
+The original wrapper is restored; original jobs/groups/EOF, services, heap,
+serial acceptance, original owner and four offline filesystem checks pass.

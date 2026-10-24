@@ -92,6 +92,9 @@ void SchedulerMarkStopped(Process* proc, int signal = 19);
 void SchedulerReleaseWaitReference(Process* proc);
 // Registry-pinned lookup; caller must ProcessUnref the returned identity.
 Process* SchedulerFindProcessReference(uint16_t pid);
+// Registry lock serializes a foreign reader's AS pin with exec replacement.
+AddressSpaceState* SchedulerReferenceProcessAddressSpace(uint16_t pid, uint64_t incarnation, bool* exists);
+void SchedulerReplaceProcessAddressSpace(Process* process, AddressSpaceState* replacement);
 
 // Resolve a timer target under the process registry lock; returns only a token.
 bool SchedulerTimerTargetIncarnation(Process* owner, int32_t tid, uint64_t* incarnation);

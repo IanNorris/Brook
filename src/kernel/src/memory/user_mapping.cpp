@@ -8,6 +8,7 @@
 #include "file_object.h"
 #include "vfs.h"
 #include "mapping_access_timing.h"
+#include "exec_limits.h"
 
 namespace brook {
 // Source metadata and leaves are stable under AS.mutation. Destination is not
@@ -88,10 +89,41 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
         destination->programBreakLow=source->programBreakLow;
         destination->programBreakHigh=source->programBreakHigh;
         destination->mmapNext=source->mmapNext;
+        destination->argumentStart=source->argumentStart;
+        destination->argumentEnd=source->argumentEnd;
         bool copied=CloneLeaves(operation,destination,pid);
         operation.Unlock();
         return copied;
     }
+}
+uint32_t UserMappingReadArguments(AddressSpaceState* space,uint64_t offset,void* buffer,uint32_t capacity) {
+    if (!space || space->kernel || !buffer || !capacity) return 0;
+    KMutexLock(&space->mutation);
+    uint32_t copied=0;
+    const uint64_t begin=space->argumentStart,end=space->argumentEnd;
+    if (begin>=VIRTUAL_NULL_GUARD && end>=begin && end<0x0000800000000000ULL &&
+        end-begin<=EXEC_ARG_BYTES && offset<end-begin) {
+        // Linux probes the final argument byte before reading the vector.
+        // A PROT_NONE argument tail is EOF, not forced access to hidden data.
+        const auto* tail=MappingRangeFind(space->ranges,end-1);
+        const uint64_t last=VmmReadLeaf(space->pageTable,VirtualAddress(end-1));
+        if (!tail || tail->kind==MappingKind::Device || !(tail->protection&1) || !(last&VMM_PRESENT) || !(last&VMM_USER)) {
+            KMutexUnlock(&space->mutation);return 0;
+        }
+        uint64_t address=begin+offset,remaining=end-address;
+        if (remaining>capacity) remaining=capacity;
+        while (remaining) {
+            const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(address));
+            const auto* range=MappingRangeFind(space->ranges,address);
+            if (!range || range->kind==MappingKind::Device || !(range->protection&1) || !(leaf&VMM_PRESENT) || !(leaf&VMM_USER)) break;
+            uint64_t chunk=4096-(address&4095);if (chunk>remaining) chunk=remaining;
+            const auto* source=reinterpret_cast<const uint8_t*>(PhysToVirt(VmmLeafPhysical(leaf)).raw())+(address&4095);
+            memcpy(static_cast<uint8_t*>(buffer)+copied,source,chunk);
+            copied+=chunk;address+=chunk;remaining-=chunk;
+        }
+    }
+    KMutexUnlock(&space->mutation);
+    return copied;
 }
 struct BufferFrame { PhysicalAddress physical; uint64_t retired; };
 struct BufferMapping { KMutex retirementLock;uint64_t pages;BufferFrame frames[1]; };

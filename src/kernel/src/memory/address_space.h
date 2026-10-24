@@ -31,6 +31,7 @@ struct AddressSpaceState {
     bool published;
     uint64_t programBreakLow, programBreakHigh; // bounds of this image, independent of leader exec
     MappingRangeTable ranges; // authoritative mapping extents, permissions and ownership
+    uint64_t argumentStart, argumentEnd; // live, contiguous exec argument strings; mutation protects reads
 };
 
 void AddressSpaceKernelInit();
