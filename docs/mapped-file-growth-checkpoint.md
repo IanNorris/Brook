@@ -379,3 +379,34 @@ exit or login result. The next Brook control uses the focused object probe to
 resolve whether the named opens are absent, rejected, or resolve differently.
 Private sources/receipts are in `build/workloads/steam-object-handoff-20261024/`
 and review M; application payloads, profiles, logs and login images stay private.
+
+The focused Brook review N also fails visually: its Steam surface remains black.
+At the first repeat (111.727 guest seconds), 102 metadata rows identify four
+helper-created pools and only helper mappings. The stop request follows this
+observation; the final checked offline file has 297 validated rows and 26
+helper pool mappings, with no observed parent opens or mappings of those exact
+objects. Neither participant reaches the 1,024-row cap (maximum sequences 174
+and 116). Pool truncate logging intentionally stops after eight calls, so the
+final mapping count must not be described as an unbounded allocation count.
+
+All thirteen captured failed pathname connects share the locally computed
+opaque token for the standard system D-Bus endpoint. None matches either
+helper bind token. They do not demonstrate a failed Steam control connection.
+The bind probe does not establish successful listening; that remains to check.
+There is also positive evidence against a general shared-memory namespace
+split: parent and helper successfully open fifteen common name tokens, and
+matching device/inode identities establish shared backing for small objects.
+For example, the parent creates an object later opened by the helper at size
+8,208 bytes; this occurs repeatedly. The helper opens twelve such small objects
+in N versus one in the successful Linux control. The probe does not capture
+8,208-byte mappings, their contents, or their synchronization, so it cannot yet
+establish correct control-region coherence or explain the retries.
+
+The next discriminator is a bounded check of successful listening and the
+parent's view of the specific helper socket and pool objects, together with
+mapping metadata for these small common control objects. Generic failed
+connects, additional RAM and broad epoll changes are not supported next fixes.
+Interposed absence remains weaker than complete syscall coverage. N's wrapper
+is restored, all tracked groups drain, heap and checked sync pass, original
+QEMU exits zero, and serial plus four offline filesystem checks pass. Its
+application exit 137 follows agent termination, not successful client shutdown.
