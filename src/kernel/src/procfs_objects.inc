@@ -101,11 +101,38 @@ static int ProcObjectStat(VfsObject* object,VnodeStat* out)
                    value->kind==ProcObjectKind::ThreadSelf ||
                    (value->kind==ProcObjectKind::PidFile && (value->index==PROC_PID_EXE || value->index==PROC_PID_CWD || value->index==PROC_PID_ROOT));
     out->mode=out->isDir?0040555:out->isSymlink?0120777:0100444;
+    if(value->pid && value->kind!=ProcObjectKind::UserMap &&
+       value->kind!=ProcObjectKind::NsDirectory && value->kind!=ProcObjectKind::NsLink) {
+        // Process entries belong to the effective owner, like their status
+        // credentials. Syscall stat conversion maps these canonical IDs.
+        out->uid=snapshot.euid;out->gid=snapshot.egid;
+    }
     if(value->kind==ProcObjectKind::UserMap) {out->mode=0100644;out->uid=value->userNamespace?value->userNamespace->owner:0;}
     if(int error=ProcReportedInode(object,&out->ino))return error;out->dev=0x70726f63;
     // Chromium uses the task-directory link count to detect a single thread.
     // Retained object lookup must match the live legacy proc directory stat.
     out->nlink=value->kind==ProcObjectKind::Task ? 2+snapshot.threadCount : out->isDir?2:1;
+    return 0;
+}
+static int ProcOpenedIdentity(Vnode* node,VnodeStat* out)
+{
+    auto* object=node->backendObject;
+    auto* value=static_cast<ProcObject*>(object->priv);
+    auto* opened=static_cast<ProcPriv*>(node->priv);
+    VnodeStat identity{};
+    if(int error=object->ops->stat(object,&identity)) {
+        // Ordinary proc files remain stat-able after their task is reaped.
+        // Keep this opened incarnation's last owner; never adopt a reused PID.
+        if(error!=-2 || value->kind!=ProcObjectKind::PidFile)return error;
+        uint64_t owner=__atomic_load_n(&opened->reportedOwner,__ATOMIC_ACQUIRE);
+        out->uid=uint32_t(owner>>32);out->gid=uint32_t(owner);
+        return ProcReportedInode(object,&out->ino);
+    }
+    if(value->kind==ProcObjectKind::PidFile)
+        __atomic_store_n(&opened->reportedOwner,(uint64_t{identity.uid}<<32)|identity.gid,__ATOMIC_RELEASE);
+    // Keep generated file sizes and directory-specific metadata, while path
+    // and opened-descriptor stats share validated identity and ownership.
+    out->ino=identity.ino;out->uid=identity.uid;out->gid=identity.gid;
     return 0;
 }
 static int ProcObjectAccess(VfsObject* object,uint8_t required,bool realIds)
@@ -270,6 +297,10 @@ static Vnode* ProcObjectOpen(VfsObject* object,int flags,int* error)
     } else if(value->kind==ProcObjectKind::PidFile)node=g_pidEntries[value->index].gen(snapshot);
     else { *error=-40;return nullptr; }
     if(!node) { *error=-12;return nullptr; }
+    if(value->kind==ProcObjectKind::PidFile) {
+        auto* opened=static_cast<ProcPriv*>(node->priv);
+        opened->reportedOwner=(uint64_t{snapshot.euid}<<32)|snapshot.egid;
+    }
     VfsObjectRetain(object);node->backendObject=object;return node;
 }
 static int ProcObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity)

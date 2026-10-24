@@ -165,9 +165,11 @@ struct ProcPriv {
     uint8_t mapKind; // 1 UID, 2 GID, 3 setgroups; independent namespace lease
     bool sysKernelDirectory;
     bool commandLine;
+    uint64_t reportedOwner;
 };
 
 static int ProcReportedInode(VfsObject*,uint64_t*);
+static int ProcOpenedIdentity(Vnode*,VnodeStat*);
 
 // VnodeOps for procfs files
 static int ProcFileOpen(Vnode*, int) { return 0; }
@@ -223,7 +225,7 @@ static int ProcFileStat(Vnode* vn, VnodeStat* st)
     st->size = pp ? pp->size : 0;
     st->isDir = false;st->mode=0100444;st->dev=0x70726f63;
     st->nlink=1;
-    if(vn->backendObject)if(int error=ProcReportedInode(vn->backendObject,&st->ino))return error;
+    if(vn->backendObject)if(int error=ProcOpenedIdentity(vn,st))return error;
     return 0;
 }
 
@@ -260,7 +262,7 @@ static int ProcDirStat(Vnode* vn, VnodeStat* st)
     else st->nlink = 2;
     st->size = 0;
     st->isDir = true;st->mode=0040555;st->dev=0x70726f63;
-    if(vn->backendObject)if(int error=ProcReportedInode(vn->backendObject,&st->ino))return error;
+    if(vn->backendObject)if(int error=ProcOpenedIdentity(vn,st))return error;
     return 0;
 }
 

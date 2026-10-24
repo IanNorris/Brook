@@ -280,3 +280,62 @@ remain in ignored build directories. The fresh SCM_RIGHTS candidate is
 All candidate command groups drain, the original helper wrapper is restored,
 heap integrity and checked sync pass, and the original VM owner exits zero.
 All four offline filesystem checks pass.
+
+## Ordinary proc-entry ownership
+
+A subsequent native control identifies a further metadata mismatch. As UID
+1000/GID 100, pathname and opened-descriptor stats on the process directory,
+FD/task directories and ordinary proc files all report UID/GID zero. The actual
+SteamRT lsof executable consequently emits `u0` for that user's owned listener
+under `-F pun`, although the socket's own inode ownership is already correct.
+
+Ordinary PID-bound proc entries now report their effective owner from the
+incarnation-validated process snapshot. The normal syscall stat conversion
+maps these canonical IDs into the observer's namespace. Opened vnode stats
+share that ownership and inode reporting while preserving their existing file
+size and directory metadata. Namespace special objects and user-map ownership
+keep their existing separate policies. This is a bounded ownership correction,
+not an implementation of Linux dumpability or a change to inspection authority.
+
+Opened ordinary proc files retain their last ownership and immutable inode
+after their task is reaped, as on Linux. Their UID/GID pair is initialized before
+publication and refreshed atomically only after successful validation of the
+original task incarnation; a reused PID cannot supply a replacement owner.
+Astra's review identified this retained-file requirement before native testing.
+
+The portable `scripts/workloads/proc_ownership_check.py` passes on Linux and the
+fresh Brook candidate. It checks pathname/opened-file ownership and identity
+across eight paths, thread aliases, same-owner foreign-process inspection, and
+three retained ordinary proc files after child reaping. The root-only native
+mode additionally distinguishes real from effective IDs and updates already
+opened descriptors across that change. Its explicit dumpability reset supports
+the Linux comparison; passing it does not establish Brook dumpability support.
+The actual SteamRT lsof listener control now reports UID 1000, matching the
+process, and all native socket/probe controls pass. All 107 existing host tests
+pass, as do the three compiled audits on the final ownership kernel.
+
+Ignored evidence is in `build/reviews/steam-rejection-d-20261024` (ownership
+failure) and `build/reviews/steam-rejection-e-20261024` (repair).
+
+The actual executable-qualified main client now returns HTTP 101, replacing
+the previous 403, and its real lsof streams report UID 1000. Its initial two
+streams each contain 34 PID/descriptor records; Brook's root proc enumeration
+also exposes threads, unlike Linux's normal root enumeration. Synthetic probe
+traffic is excluded from the handshake result. The completed-frame screenshot
+shows the Steam account-name/password login form with its QR refresh control.
+Mouse/keyboard interaction is verified by entering and clearing temporary test
+text. No user account credentials are entered or exported.
+
+QR authentication readiness is not accepted yet: clicking refresh closes the
+rootful Xwayland window. The retained original Xwayland job reports signal 6;
+its own server error identifies a caught signal 11 followed by abort. The
+Steam workload then exits 1 with surviving helper tasks. The guest kernel
+continues running without a panic. Diagnostic preloads were active in this
+run; the next required comparison is a fresh launch without those preloads,
+followed by QR refresh and interaction verification. No usable fresh QR code
+or completed native authentication is claimed.
+The surviving owned helper is terminated, all tracked guest command groups
+drain, and the original helper wrapper is restored. Heap integrity, checked
+sync, original VM-owner exit zero and all four offline filesystem checks pass.
+The preserved Xwayland application crash remains a failure, irrespective of
+those successful kernel/filesystem cleanup checks.
