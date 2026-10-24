@@ -333,3 +333,49 @@ before selecting a kernel change. Interposition remains partial: hidden libc
 calls/direct syscalls and unwrapped fcntl duplication can bypass it, and cached
 FD classifications can outlive such hidden closes. Negative samples and
 interposed generations therefore do not prove full syscall coverage.
+
+## Object acquisition control (2026-10-24)
+
+Astra's review identifies an important ambiguity in the preceding capture:
+missing interposed `recvmsg` does not establish a hidden descriptor receive.
+The parent might reopen named objects, and identical mapping sizes alone do not
+prove a common backing object. Pathname equality likewise does not establish
+that separate filesystem contexts resolve the same vnode.
+
+The fresh focused Linux control confirms **named reopening**. Its helper
+truncates and maps two 26,214,416-byte objects. The Steam parent subsequently
+calls `shm_open` twice; each returned descriptor has the same device/inode/size
+as one of the helper's objects, and both parent mappings succeed. It reaches a
+visually verified QR login screen with this probe. No login is authenticated.
+The bounded trace contains 112 numeric/opaque-token metadata rows, compared
+with thousands in the preceding readiness capture. The owned service stops,
+the wrapper is restored, sync and normal powerdown complete, the original
+owner exits zero, and read-only offline filesystem acceptance passes.
+
+The probe's synthetic control passes both unloaded and preloaded. It verifies
+named reopening and SCM_RIGHTS acquisition of the same object across processes,
+shared data integrity, socket-path identity, failed-connect ENOENT, failed
+truncate EBADF, and preserved result/errno behavior. Literal paths, payloads,
+raw pointers and received descriptor values are not exported. It is still
+interposition, not complete syscall coverage; relative open paths and hidden
+libc/direct syscall operations can bypass name classification. A 1,024-row
+per-process limit bounds logging, and the capture must be checked for exhaustion.
+
+Brook endpoint review M remains a failed login: the completed frame is black,
+and the checked offline trace contains 134 helper pool allocations with no
+observed matching-size parent mapping. It contains 22,202 validated IPC/stack
+rows, including a parent overflow marker at approximately 380 guest seconds.
+Earlier observations remain bounded by that marker. Failed pathname connects
+are present, but the old endpoint probe omits tokens for ENOENT/EACCES, so they
+cannot establish the intended endpoint. A later kernel capture also fails its
+identity precondition when two Steam leaders exist; it does not enable tracing.
+The earlier zero-row kernel capture selects one task, excludes sibling threads
+and several relevant operations, and cannot rule out a handoff.
+
+M's stopped-image extraction follows checked sync, original-owner exit zero,
+heap integrity, serial acceptance and four passing filesystem checks. Its
+Steam workload required agent termination and is not a successful application
+exit or login result. The next Brook control uses the focused object probe to
+resolve whether the named opens are absent, rejected, or resolve differently.
+Private sources/receipts are in `build/workloads/steam-object-handoff-20261024/`
+and review M; application payloads, profiles, logs and login images stay private.
