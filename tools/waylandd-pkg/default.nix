@@ -3,6 +3,9 @@
 , wayland-scanner ? (import ../../nix/nixpkgs.nix {}).wayland-scanner
 , wayland-protocols ? (import ../../nix/nixpkgs.nix {}).wayland-protocols
 , patchelf ? (import ../../nix/nixpkgs.nix {}).patchelf
+, xkbcomp ? (import ../../nix/nixpkgs.nix {}).xorg.xkbcomp
+, libxkbfile ? (import ../../nix/nixpkgs.nix {}).xorg.libxkbfile
+, libX11 ? (import ../../nix/nixpkgs.nix {}).xorg.libX11
 }:
 
 # Package the Brook Wayland server.
@@ -25,9 +28,15 @@ stdenv.mkDerivation {
 
   nativeBuildInputs = [ patchelf wayland-scanner ];
   buildInputs = [ wayland ];
+  nativeCheckInputs = [ xkbcomp ];
+  checkInputs = [ libxkbfile libX11 ];
   doCheck = true;
 
   checkPhase = ''
+    $CC -O2 -UNDEBUG -Wall -Wextra -I${libxkbfile.dev}/include -I${libX11.dev}/include \
+        keyboard-keymap-test.c -L${libxkbfile}/lib -L${libX11}/lib \
+        -lxkbfile -lX11 -o keyboard-keymap-test
+    ./keyboard-keymap-test ${xkbcomp}/bin/xkbcomp
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         output-identity-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \

@@ -326,16 +326,38 @@ shows the Steam account-name/password login form with its QR refresh control.
 Mouse/keyboard interaction is verified by entering and clearing temporary test
 text. No user account credentials are entered or exported.
 
-QR authentication readiness is not accepted yet: clicking refresh closes the
-rootful Xwayland window. The retained original Xwayland job reports signal 6;
-its own server error identifies a caught signal 11 followed by abort. The
-Steam workload then exits 1 with surviving helper tasks. The guest kernel
-continues running without a panic. Diagnostic preloads were active in this
-run; the next required comparison is a fresh launch without those preloads,
-followed by QR refresh and interaction verification. No usable fresh QR code
-or completed native authentication is claimed.
+QR authentication readiness is not accepted yet. The first interactive run
+closes the rootful Xwayland window after a sequence including Ctrl+A and QR
+refresh. A fresh launch without diagnostic preloads isolates the trigger:
+mouse-only QR refresh leaves Xwayland alive, whereas Ctrl+A alone reproduces
+the crash. The retained original Xwayland jobs report signal 6; the server
+catches signal 11 before aborting. Both runs have the same symbolized stack in
+XkbUpdateLedAutoState through the keyboard modifier handler. The Steam workload
+then exits with surviving helper tasks; the guest kernel does not panic.
+
+Compiling Brook's actual map shows that it lacks an indicator map. Adding
+standard indicator names and locked-modifier metadata produces one. Inspection
+of the matching Xwayland binary identifies a path that frees an absent
+replacement indicator map while retaining cached LED-map state. This supports
+a stale-pointer explanation; it is not a dynamic freed-allocation proof. A
+candidate adds only the indicator metadata, preserving existing key bindings.
+Its regression compiles and loads the production map, checks indicator state
+and modifier interpretations, and passes along with all ten existing package
+regressions. In a fresh native image, Xwayland survives left/right Ctrl+A,
+Shift and Caps Lock toggles; subsequent X11 requests succeed without errors.
+Steam also survives typing, Ctrl+A, deletion, replacement text and mouse-only
+QR refresh without diagnostic preloads or helper-wrapper changes. Its QR area
+still has a blurred code with a refresh overlay, so usable fresh QR acceptance
+remains required. The intermittent red-bar defect is not claimed fixed.
+No usable fresh QR code or completed native authentication is claimed.
 The surviving owned helper is terminated, all tracked guest command groups
 drain, and the original helper wrapper is restored. Heap integrity, checked
 sync, original VM-owner exit zero and all four offline filesystem checks pass.
 The preserved Xwayland application crash remains a failure, irrespective of
 those successful kernel/filesystem cleanup checks.
+
+The keymap validation run is preserved at
+`build/reviews/steam-keymap-login-g-20261024`. Its tracked groups drain, heap
+integrity and checked sync pass, the original QEMU owner exits zero, and all
+four offline filesystem checks pass. No proprietary payloads, raw application
+logs or authentication material are included in the change.
