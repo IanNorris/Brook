@@ -91,3 +91,75 @@ and final serial acceptance and all four offline filesystem checks pass.
 Private controllers, binary capsule and failure evidence remain under
 `build/workloads/steam-prime-import-20261024` and review X. No proprietary
 payload, raw Steam log, disk image or authentication data is committed.
+
+## Fence crash narrowed to a shortened device mapping
+
+A subsequent fresh run instruments mapping calls and fence triggers in Xwayland.
+The private diagnostic passes a Linux smoke test for four-byte fence mapping,
+trigger, protection changes, same-address remap, unmap and address reuse. It
+reports tracking loss explicitly. Trigger records are written before entering
+libxshmfence; their placeholder result is not evidence of a successful return.
+Brook's current `/proc/self/maps` omits mmap regions, so absence there is not
+used as evidence of an unmapped fence.
+
+The native failure has a decisive sequence: fence mapping 9 at `0x2862c000`
+is created read/write and triggered several times. A later successful
+`munmap(0x28456000, 1996800)` covers that fence, without an explicit fence-unmap
+call. The next trigger faults at precisely that address. The kernel page-table
+walk confirms the page is absent. This distinguishes the observed failure from
+a write-protection fault.
+
+The standalone `gpu_mapping_extent_check.py --brook-guest` reproduces the
+underlying reservation failure without Steam. For an 800-by-600 texture with a
+1,996,800-byte client allocation, the old kernel substitutes 1,920,000 bytes.
+It then silently shortens a successful mmap to that backing size. An immediately
+following anonymous mapping lies inside the original requested extent. A later
+munmap using the original length can therefore remove unrelated mappings.
+The explicit-stride control retains its size, but oversized device mappings are
+silently shortened there too.
+
+The repair preserves the larger client allocation, retaining the existing
+base-level minimum for placeholder sizes and checking arithmetic before
+narrowing. Device mappings reject requests larger than the page-rounded backing
+instead of returning success for a shorter range. A host layout regression and
+the native extent probe cover padded allocation, explicit stride, placeholder
+size, mapping separation, tail access and oversize rejection. The fresh repaired
+native kernel passes all 15 extent-probe checks; all 104 host tests and both
+compiled entry/scheduler audits pass. The isolated GLX readback still passes,
+but the red stripe remains, so this fix does not resolve all presentation
+corruption. In the repaired Steam retry, Xwayland survives moving the transport
+dialog into view and selecting **Continue Anyway**. The final diagnostic has
+11 fence maps, 11 fence unmaps, 27 trigger entries, and no tracking-loss entry.
+Steam still reports startup error `0x3000` and does not reach login. Thus the
+mapping repair resolves the demonstrated overlapping-unmap hazard, without
+claiming that Steam startup or all Xwayland rendering is fixed.
+
+The repaired run drains every tracked group, restores its wrapper, and passes
+heap integrity, checked sync, final serial acceptance, original QEMU-owner exit
+and all four offline filesystem checks. The final source also releases the
+framebuffer reference on its new oversized-mapping error branch; that small
+cleanup is reviewed separately from the first native candidate.
+
+The failed run's owned jobs drain and its wrapper is restored. Heap and checked
+sync pass, QEMU's original owner returns zero, and all four offline filesystem
+checks pass. The controller's final serial acceptance nevertheless fails on an
+`exit_group` timeout for thread 124; this remains separate failure evidence.
+
+## Next transport diagnosis
+
+Astra's source review identifies a concrete INET receive gap: the `recvmsg`
+fallback calls the UDP datagram receiver even for TCP. A small localhost control
+passes on Linux with eight correct bytes, while Brook returns one incorrect
+byte for both a single receive buffer and two scatter buffers. This is a
+verified compatibility defect, not yet an attribution of Steam's startup error.
+Connected Unix-socket peer-name queries are another verified gap: socketpair,
+client and accepted endpoints return `ENOTCONN` on Brook, while the same Linux
+control returns their proper names.
+
+The attempted broader Steam network trace is disabled after collection. Its
+output interleaves syscall entry and return text between threads, so even a
+line with one prefix can contain another call's return. It is unsuitable for
+reliable per-call correlation. The next application probe needs bounded,
+atomic records of socket kind, endpoint category, operation, flags, byte counts
+and error, without exporting payloads. Local and remote transport must be
+distinguished before choosing which compatibility defect to pursue.

@@ -6,6 +6,7 @@
 #include "unix_lifetime_trace.h"
 #include "file_locks.h"
 #include "memfd_seals.h"
+#include "drm_resource_layout.h"
 // syscall.cpp -- SYSCALL/SYSRET dispatcher, syscall table, and user-mode entry.
 //
 // Adapted from Enkel OS (IanNorris/Enkel, MIT license).
@@ -4317,7 +4318,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             available=source->kernelBase ? proc->fbVirtualSize : static_cast<uint64_t>(stride)*height;
             KMutexUnlock(&proc->framebufferLock);
             if (framebuffer) {
-                if (request.length>((available+4095)&~uint64_t{4095})) request.length=(available+4095)&~uint64_t{4095};
+                if (request.length>((available+4095)&~uint64_t{4095})) {
+                    MappingBackingUnref(framebuffer);
+                    return -EINVAL;
+                }
                 MappingBackingUnref(backing.value);backing.value=framebuffer;
                 request.range.offset=0;
                 if (!UserMappingConfigureBuffer(request,framebuffer)) return -EINVAL;
@@ -4327,7 +4331,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             available=(available+4095)&~uint64_t{4095};
         }
         if (!available) return -EINVAL;
-        if (request.length > available) request.length=available;
+        // Returning success for a shorter VMA lets a later mmap occupy the
+        // caller's promised extent; munmap(original_length) then destroys it.
+        if (request.length > available) return -EINVAL;
         request.range.kind=MappingKind::Device;request.range.sharing=MappingSharing::Shared;
         request.range.offset=0;request.range.backing=backing.value;
         request.range.leafOwnership=source->borrowedPhysical?MappingLeafOwnership::Borrowed:MappingLeafOwnership::Managed;
@@ -6545,15 +6551,9 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
             return -EINVAL;
         }
         uint32_t createH = rc.height ? rc.height : 1;   // PIPE_BUFFER is 1D (h=0)
-        // For a buffer the "stride" is its byte length, not width*texel; for a
-        // 2D texture default to width*4 bytes/texel when the client omits stride.
-        uint32_t stride = rc.stride ? rc.stride
-                        : (isBuffer ? rc.width : rc.width * 4);
-        // Mesa allocates no guest storage for host-side textures and passes a
-        // bogus rc.size (often 1), so never honour it for a texture — compute
-        // the full row-stride*height extent. Buffers carry a real byte count.
-        uint32_t size = isBuffer ? (rc.size ? rc.size : rc.width)
-                                 : stride * createH;
+        uint32_t stride = 0, size = 0;
+        if (!DrmLegacyResourceLayout(isBuffer,rc.width,createH,rc.stride,rc.size,
+                                     &stride,&size)) return -EINVAL;
         // Allocate owning metadata before creating a host resource, so every
         // successful host allocation has a tracked rollback/retirement owner.
         uint32_t bo = DrmGemAlloc(dctx,0,size,stride,rc.width,createH,rc.target,rc.format);
