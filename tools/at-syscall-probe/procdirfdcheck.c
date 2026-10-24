@@ -61,11 +61,11 @@ int main(int argc,char** argv){
  CK(!close(ready[1])&&!close(finish[0]));char byte=0;CK(read(ready[0],&byte,1)==1);snprintf(name,sizeof(name),"/proc/%ld/fd/%d",(long)observer,original);errno=0;f=open(name,O_RDONLY|O_DIRECTORY);
  if(brook)CK(f==-1&&errno==EACCES);else CK(f>=0&&readvalue(f)=='A'&&!close(f));
  CK(write(finish[1],"F",1)==1&&!close(finish[1])&&!close(ready[0]));waitok(observer);
- f=open("src/value",O_RDONLY);CK(f>=0);linkname(f,name,sizeof(name));errno=0;int file=open(name,O_RDONLY);if(brook)CK(file==-1&&errno==EOPNOTSUPP);else CK(file>=0&&!close(file));
+ f=open("src/value",O_RDONLY);CK(f>=0);linkname(f,name,sizeof(name));errno=0;int file=open(name,O_RDONLY);CK(file>=0&&!close(file));
  CK(!lstat(name,&st)&&S_ISLNK(st.st_mode));char reported[256];CK(readlink(name,reported,sizeof(reported))>0);
  link=open(name,O_PATH|O_NOFOLLOW);CK(link>=0&&!fstat(link,&st)&&S_ISLNK(st.st_mode)&&!close(link));
- errno=0;int sr=stat(name,&st);if(brook)CK(sr==-1&&errno==EOPNOTSUPP);else CK(!sr&&S_ISREG(st.st_mode));
- errno=0;int ar=access(name,R_OK);if(brook)CK(ar==-1&&errno==EOPNOTSUPP);else CK(!ar);CK(!close(f));
+ errno=0;int sr=stat(name,&st);CK(!sr&&S_ISREG(st.st_mode));
+ errno=0;int ar=access(name,R_OK);CK(!ar);CK(!close(f));
  int memory=syscall(SYS_memfd_create,"procdirfd-regression",0);CK(memory>=0);CK(write(memory,"M",1)==1);linkname(memory,name,sizeof(name));int proxy=open(name,O_RDWR);CK(proxy>=0);byte=0;CK(read(proxy,&byte,1)==1&&byte=='M');CK(!close(proxy));errno=0;CK(open(name,O_RDONLY|O_DIRECTORY)==-1&&errno==ENOTDIR);errno=0;CK(open(name,O_RDONLY|O_NOFOLLOW)==-1&&errno==ELOOP);CK(!close(memory));
  CK(!close(original)&&!close(metadata));CK(!chdir("/")&&!umount2(base,MNT_DETACH));printf("PDIRFD FIXTURE PASS checks=%u brook_cases=%d\n",checks,brook);_exit(0);
 }

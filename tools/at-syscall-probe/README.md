@@ -510,10 +510,12 @@ checks new `/dev/shm` descriptor access modes and namespace ownership after the
 creator closes. Linux passes the same assertions. The probe does not assert
 shared OFD offsets after dup/fork or shm unlink behavior.
 
-Brook currently supports procfd reopening only for memfds in the current fd
-table; foreign-process paths and other descriptor types fail instead of opening
-synthetic link-description text. O_PATH/O_TRUNC/O_CREAT procfd modes are outside
-this scope. Memfd creation returns O_RDWR; read-only reopened mappings carry a
+Brook supports current-thread-group procfd reopening for retained regular
+files and directories in addition to the separate memfd broker. Foreign-process
+regular/directory capability following remains denied. Unsupported descriptor
+types fail rather than opening synthetic link-description text. Regular files
+use normal VFS open permissions and an independent description; the memfd
+broker's O_PATH/O_TRUNC/O_CREAT limitations remain separate. Memfd creation returns O_RDWR; read-only reopened mappings carry a
 maximum permission ceiling (module ABI9). Writable MAP_PRIVATE memfd requests
 remain unsupported rather than sharing writable pages silently. Concurrent VMA
 mutation, mapped memfd shrink/SIGBUS semantics, full private-copy semantics and
@@ -961,3 +963,15 @@ requires the duplicate listener to accept a fresh connection. Linux passes 28
 checks. Parent and forked children use raw alarm watchdogs; also retain the
 whole guest job until all descendants drain. The test does not directly inspect
 kernel waiter pointers or establish wake latency under load.
+
+
+`procregfdcheck.c` exercises retained regular-file proc-fd following as a nonroot
+user: creation, ordinary open, inherited exec, independent offsets, inode
+identity, rename/replacement, unlink, O_PATH, O_NOFOLLOW, O_DIRECTORY, suffix
+rejection, permission rechecks, changed access mode, source-close survival and
+bounded close/reuse contention. Build static musl with `-O2 -Wall -Wextra
+-Werror -pthread`; run without arguments on Linux or with `--brook` in a private
+Brook VM. `procdirfdcheck.c` also retains its mount/directory, memfd and
+foreign-process denial controls; its regular-file cases now expect supported
+stat/access/open results. These probes do not establish arbitrary foreign
+process inspection or support for reopening every descriptor type.

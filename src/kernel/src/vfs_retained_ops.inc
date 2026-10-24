@@ -87,7 +87,23 @@ Vnode* VfsOpenAt(const VfsPath& root,const VfsPath& start,const char* text,int f
     if(flags&VFS_O_TRUNC) { if(!(createFlags&VFS_O_WRITE))createFlags|=VFS_O_READWRITE;createFlags|=VFS_O_WRITE; }
     Vnode* node=ops->create(result.parent.object,result.leaf,createFlags,mode&07777&~(mask&0777),error);
     if(!node) { if(!*error)*error=-5;return nullptr; }
-    VfsAttachMount(node,static_cast<MountEntry*>(result.parent.attachment),createFlags);return node;
+    auto* mount=static_cast<MountEntry*>(result.parent.attachment);
+    VfsAttachMount(node,mount,createFlags);
+    // A newly created ext2 vnode does not yet cache its backend identity.
+    // Capture it before publishing the descriptor, as ordinary retained opens
+    // already do. Proc-fd following must acquire references under the FD lock
+    // without invoking backend callbacks or reopening a reported pathname.
+    if(!node->backendObject && mount->backing->fsOps->vnode_object) {
+        VfsObject* object=nullptr;
+        *error=mount->backing->fsOps->vnode_object(node,&object);
+        if(*error || !object) {
+            VfsObjectRelease(object);VfsClose(node);
+            if(!*error)*error=-5;
+            return nullptr;
+        }
+        node->backendObject=object;
+    }
+    return node;
 }
 int VfsOpenExecutableAt(const VfsPath& root,const VfsPath& start,const char* text,
                         Vnode** out,char* resolved,uint32_t capacity)

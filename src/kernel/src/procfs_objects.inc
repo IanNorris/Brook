@@ -204,33 +204,43 @@ static int ProcObjectParent(VfsObject* object,VfsObject** out,bool=false)
     *out=nullptr;if(int error=ProcObjectSnapshot(value,&snapshot))return error;
     *out=value->parent?value->parent:object;VfsObjectRetain(*out);return 0;
 }
-// Return 1 for a non-directory descriptor, 0 for a captured directory path.
+// Return 1 for an unsupported descriptor, 0 for a captured directory/regular
+// file capability. Reporting may request other retained vnode types as well.
 // The FD lock protects acquisition of the path's own references. No FD pin or
 // vnode reference is released here: a concurrent close must never make proc's
 // outer VFS callback run final descriptor teardown.
-static int ProcAcquireDirectoryFd(const ProcObject* value,VfsPath* out,char* fallback=nullptr,uint32_t capacity=0,bool anyObject=false)
+static int ProcAcquireVnodeFdPath(const ProcObject* value,VfsPath* out,char* fallback=nullptr,uint32_t capacity=0,bool anyObject=false)
 {
     *out={};auto* live=SchedulerFindProcessReference(value->pid);if(!live)return -2;
     if(live->incarnation!=value->incarnation || live->tgid!=value->tgid ||
        (live->isThread?live->leaderIncarnation:live->incarnation)!=value->group) {ProcessUnref(live);return -2;}
     int error=-2;
-    SpinLockAcquire(ProcessFdLock(live));
+    auto* fdLock=ProcessFdLock(live);
+    SpinLockAcquire(fdLock);
     if(live->fds && value->index<MAX_FDS) {
         const auto& fd=live->fds[value->index];
         if(fd.type!=FdType::None && !fd.closing) {
             error=1;FdDiagnosticPath(fd,fallback,capacity);
             if((fd.type==FdType::Vnode || fd.type==FdType::Path) && fd.handle) {
                 auto* node=static_cast<Vnode*>(fd.handle);
-                if(node->type==VnodeType::Dir || anyObject) {
-                    error=-95;
-                    if(node->mountOwner && node->backendObject) {
-                        *out={node->mountOwner,node->backendObject};VfsPathRetain(*out);error=0;
-                    }
+                error=-95;
+                if(node->mountOwner && node->backendObject) {
+                    *out={node->mountOwner,node->backendObject};VfsPathRetain(*out);error=0;
                 }
             }
         }
     }
-    SpinLockRelease(ProcessFdLock(live));ProcessUnref(live);
+    SpinLockRelease(fdLock);ProcessUnref(live);
+    // VnodeType::File also covers FIFOs. Inspect the retained backend identity
+    // after dropping the FD lock; do not broaden magic following to devices or
+    // textual symlinks. Normal VFS open then rechecks permissions and creates
+    // a fresh description, independently of the source offset/access mode.
+    if(!error && !anyObject) {
+        VnodeStat st{};
+        error=out->object->ops->stat?out->object->ops->stat(out->object,&st):-95;
+        if(!error && (st.mode&0170000)!=0040000 && (st.mode&0170000)!=0100000)error=-95;
+        if(error) {VfsPathRelease(*out);*out={};}
+    }
     return error;
 }
 static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
@@ -245,7 +255,7 @@ static int ProcObjectReadlink(VfsObject* object,char* out,uint32_t capacity)
         if(value->kind==ProcObjectKind::ThreadSelf) {end=AppendStr(end,"/task/");end=U64ToDec(end,current->pid);}
         *end=0;
     } else if(value->kind==ProcObjectKind::FdLink) {
-        VfsPath path{};int error=ProcAcquireDirectoryFd(value,&path,target,sizeof(target),true);
+        VfsPath path{};int error=ProcAcquireVnodeFdPath(value,&path,target,sizeof(target),true);
         if(!error)error=VfsPathObjectPathFromCallback(path,target,sizeof(target));
         VfsPathRelease(path);if(error<0)return error;
 
@@ -384,14 +394,14 @@ static int ProcObjectFollow(const VfsPath& source,VfsPath* out)
         int socket = ProcAcquireSocketMetadata(value, &identity);
         if (socket < 0) return socket;
         if (socket == 1) return ProcSocketPath(source, identity, out);
-        // Match retained root/cwd access policy. This is a directory capability
+        // Match retained root/cwd access policy. This is an exact capability
         // jump, never a reopen of its reported pathname or a mount follow-down.
         FsSnapshot fs{};int error=ProcAcquireFsTarget(value->pid,value->incarnation,value->tgid,value->group,&fs);
         FsSnapshotRelease(&fs);if(error)return error;
-        error=ProcAcquireDirectoryFd(value,out);
+        error=ProcAcquireVnodeFdPath(value,out);
         return error==1?-95:error?error:1;
     }
-    // Executable/regular-file FD identity following remains unsupported.
+    // Executable identity following remains unsupported.
     if(value->kind==ProcObjectKind::PidFile && value->index==PROC_PID_EXE)return -95;
     if(value->kind!=ProcObjectKind::PidFile ||
        (value->index!=PROC_PID_CWD && value->index!=PROC_PID_ROOT))return 0;

@@ -150,3 +150,16 @@ Steam's client minimize button plus taskbar restore work. There is no enclosing
 virtual X desktop or duplicate Brook chrome. Client maximize/drag/resize and
 longer stability acceptance remain open. The O review completes final sync,
 its original launcher returns zero and all four offline filesystem checks pass.
+
+
+The next native control isolates a second part of the proc-fd gap: reopening an
+ordinarily opened ext2 descriptor works after regular-file following is enabled,
+but a newly created descriptor still fails. The create branch did not cache its
+backend object before publishing the FD. It now captures that exact identity
+through the backend callback, outside any FD-table lock. The completed fix
+passes the 267-check regular-file probe on Linux and Brook, the existing native
+directory/mount probe (718 fixture checks plus seven parent checks), and the
+real runtime supervisor reading a newly created, unlinked environment FD and
+launching a no-op child with the expected environment. Supported entry-state,
+scheduler-start and lock/wait mutation audits pass. The actual game retry and
+longer Steam acceptance remain separate gates.
