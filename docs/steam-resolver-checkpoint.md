@@ -74,3 +74,50 @@ data/tmp filesystems and clean nix/boot filesystems; it is not a test baseline.
 The subsequent isolated resolver-control VM completes checked sync, original
 owner exit and all four offline filesystem checks successfully. New candidates
 start from the earlier checked baseline, not the failed disks.
+
+
+## FD-diagnostic lock stall
+
+A later full-client run panics on a scheduler-lock timeout in
+`ReleaseSchedulerReference`. The saved NMI state places CPU 1 in
+`SchedulerGetFdInfo` while the other active CPUs wait for scheduler locks.
+Its compiled instruction address is the FD ticket-lock wait, inside the
+process-list critical section. This exposes a lock dependency: a preempted
+FD-lock owner may need the process-list lock during post-switch reference
+release before it can resume and release the FD lock. This is a concrete
+unsafe dependency; the capture does not identify the original FD-lock owner.
+
+FD lookup and enumeration now use a nonblocking FD-lock attempt while holding
+the process-list lock. On contention they release the process-list lock and
+yield, then repeat the PID/incarnation lookup. No borrowed process or FD pointer
+is dereferenced after dropping the registry lock. Snapshot copying remains
+under both locks, preserving the existing lookup and incarnation semantics.
+
+The hosted regression includes the actual implementation and deterministically
+requires scheduler work to resume the FD-lock owner. Both lookup and enumeration
+complete after contention; process removal, PID reuse, termination, invalid FDs,
+and empty enumeration are also checked. The exact old implementation times out
+in this regression. All 105 host tests pass, the production kernel builds, and
+entry, scheduler-start and lock-timeout compiled audits pass. The Linux control
+and an eight-CPU native run each complete 4,000 shared-FD churn iterations and
+2,000 proc FD snapshot iterations. The native command exits zero with no live
+tasks and both output streams drained. This focused test does not prove general
+scheduler deadlock freedom or resolve the intermittent red-bar rendering issue.
+
+The failed full-client run's registers, bounded stack pages, logs, kernel and
+private disks are preserved. It could not sync; offline checks report errors on
+data/tmp and clean nix/boot filesystems. Validation uses fresh checked copies,
+not those failed disks.
+
+Before that panic, the transport probe observed actual helper requests being
+answered with HTTP 403 by the main Steam process. Own wrong-route GET controls
+on one listener produce HTTP 404 instead; the other listener produces no response
+within the bounded read. This narrows the next investigation to the actual
+request/rejection metadata. It does not yet establish an authentication-policy
+or socket-owner-lookup cause. Steam login remains unverified.
+
+The validation VM subsequently passes heap integrity, checked guest sync, original
+owner exit zero, and all four offline filesystem checks. Astra's read-only
+review finds no introduced blocker in the retry repair. It separately identifies
+an existing exec-publication race and incarnation-zero teardown caveat, recorded
+in the backlog; this change does not claim to fix those lifetime boundaries.

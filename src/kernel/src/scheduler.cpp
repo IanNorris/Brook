@@ -3468,75 +3468,7 @@ Process* SchedulerGetCpuProcess(uint32_t cpuIndex)
     return nullptr;
 }
 
-static void FillFdSnapshot(FdSnapshot* out, const FdEntry& fde)
-{
-    out->type = static_cast<uint8_t>(fde.type);
-    out->flags = fde.statusFlags;
-    out->seekPos = fde.seekPos;
-    FdDiagnosticPath(fde,out->path,sizeof(out->path));
-}
-
-bool SchedulerGetFdByIndex(uint16_t pid, uint32_t index, int* outFd, FdSnapshot* outSnap, uint64_t incarnation)
-{
-    uint64_t flags = SchedLockAcquire(g_allProcLock);
-    for (uint32_t i = 0; i < g_processCount; ++i)
-    {
-        Process* p = g_allProcesses[i];
-        if (!p || p->pid != pid) continue;
-        if (incarnation && (p->incarnation != incarnation || p->state == ProcessState::Terminated))
-        { SchedLockRelease(g_allProcLock, flags); return false; }
-        if (!p->fds) { SchedLockRelease(g_allProcLock, flags); return false; }
-
-        SpinLockAcquire(ProcessFdLock(p));
-        uint32_t found = 0;
-        for (uint32_t fd = 0; fd < MAX_FDS; ++fd)
-        {
-            if (p->fds[fd].type == FdType::None) continue;
-            if (found == index)
-            {
-                *outFd = static_cast<int>(fd);
-                FillFdSnapshot(outSnap, p->fds[fd]);
-                SpinLockRelease(ProcessFdLock(p));
-                SchedLockRelease(g_allProcLock, flags);
-                return true;
-            }
-            ++found;
-        }
-        SpinLockRelease(ProcessFdLock(p));
-        SchedLockRelease(g_allProcLock, flags);
-        return false;
-    }
-    SchedLockRelease(g_allProcLock, flags);
-    return false;
-}
-
-bool SchedulerGetFdInfo(uint16_t pid, int fd, FdSnapshot* outSnap, uint64_t incarnation)
-{
-    if (fd < 0 || fd >= static_cast<int>(MAX_FDS)) return false;
-    uint64_t flags = SchedLockAcquire(g_allProcLock);
-    for (uint32_t i = 0; i < g_processCount; ++i)
-    {
-        Process* p = g_allProcesses[i];
-        if (!p || p->pid != pid) continue;
-        if (incarnation && (p->incarnation != incarnation || p->state == ProcessState::Terminated))
-        { SchedLockRelease(g_allProcLock, flags); return false; }
-        if (!p->fds) { SchedLockRelease(g_allProcLock, flags); return false; }
-
-        SpinLockAcquire(ProcessFdLock(p));
-        if (p->fds[fd].type == FdType::None)
-        {
-            SpinLockRelease(ProcessFdLock(p));
-            SchedLockRelease(g_allProcLock, flags);
-            return false;
-        }
-        FillFdSnapshot(outSnap, p->fds[fd]);
-        SpinLockRelease(ProcessFdLock(p));
-        SchedLockRelease(g_allProcLock, flags);
-        return true;
-    }
-    SchedLockRelease(g_allProcLock, flags);
-    return false;
-}
+#include "scheduler_fd_snapshot.inc"
 
 bool SchedulerRegisterPolicy(const SchedOps* ops)
 {

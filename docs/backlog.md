@@ -1529,3 +1529,19 @@ each probe's argument parser.
   SIG_IGN. Add a differential signal-disposition probe and correct the ordinary
   clone path in a separate change. The bounded mount-namespace path rejects
   CLEAR_SIGHAND, so it does not advertise this unsupported combination.
+
+
+### FD snapshot follow-ups from Steam lock-stall review (2026-10-24)
+
+- Publish a thread-exec private FD table and initialize its own FD lock inside
+  the registry-protected exec identity commit. `ProcessExecImpl` currently
+  publishes `proc->fds` and then resets `proc->fdLock` before acquiring that
+  protection. A concurrent proc snapshot can select/acquire the new own lock
+  before its counters are reset. Add a deterministic test using the real
+  `ProcessFdLock` selection across publication, not a fixed mock lock.
+- Remove or explicitly constrain incarnation-zero diagnostic FD lookup during
+  terminated-process finalization. Destruction frees the table before registry
+  removal. Production procfs callers inspected in this review supply incarnation
+  checks; the unrestricted diagnostic behavior predates the retry repair.
+- Neither issue is established as the cause of Steam's HTTP 403 responses or
+  intermittent red corruption bars. Keep these separate from that diagnosis.
