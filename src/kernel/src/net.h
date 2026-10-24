@@ -3,6 +3,7 @@
 // Minimal network stack: Ethernet, ARP, IPv4, ICMP, UDP, TCP.
 
 #pragma once
+#include "socket_identity.h"
 #include "spinlock.h"
 
 #include <stdint.h>
@@ -203,6 +204,7 @@ NetIf* NetIfAt(uint32_t idx);
 
 // Socket table accessors for procfs.
 struct SocketSnapshot {
+    SocketIdentity identity;
     bool     used;
     int      type;        // SOCK_STREAM, SOCK_DGRAM
     uint32_t localIp;
@@ -367,6 +369,7 @@ struct Socket {
 
     // Owner PID (tgid) — set when socket is created via sys_socket. Diagnostic only.
     uint32_t ownerPid;
+    SocketIdentity identity; // inode fixed; accepted credentials finalized before FD publication
 
     // Poll waiter — process to wake when data arrives
     Process* pollWaiter;
@@ -378,6 +381,10 @@ struct Socket {
 
 // Create a kernel socket. Returns socket index or negative error.
 int  SockCreate(int domain, int type, int protocol);
+// Caller owns a socket reference (including a protected live FD). No locks or callbacks.
+bool SockGetIdentity(int sockIdx, SocketIdentity* out);
+// Dequeued child only, before publishing any FD or descriptor alias.
+void SockSetAcceptedOwner(int sockIdx, uint32_t uid, uint32_t gid);
 int  SockBind(int sockIdx, const SockAddrIn* addr);
 int  SockConnect(int sockIdx, const SockAddrIn* addr);
 int  SockSendTo(int sockIdx, const void* buf, uint32_t len,

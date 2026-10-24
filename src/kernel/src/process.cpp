@@ -88,6 +88,7 @@ struct ProcessOperationGuard {
 
 // No credential lock is held across allocation, user copies or scheduling.
 #include "process_credentials.inc"
+#include "process_socket_metadata.inc"
 
 // Exclude independently synchronized state from the raw process snapshot.
 // NNP is inherited under the credentials lock below; other credentials are

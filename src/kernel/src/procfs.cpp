@@ -992,12 +992,12 @@ static Vnode* GenNetTcp()
     // Linux /proc/net/tcp format (one line per socket):
     //  sl  local_address rem_address   st tx_queue rx_queue
     uint32_t maxSock = NetMaxSockets();
-    uint32_t bufSize = 256 + maxSock * 128;
+    uint32_t bufSize = 256 + maxSock * 192;
     auto* buf = static_cast<char*>(kmalloc(bufSize));
     if (!buf) return nullptr;
 
     char* p = buf;
-    p = AppendStr(p, "  sl  local_address rem_address   st tx_queue rx_queue\n");
+    p = AppendStr(p, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
 
     uint32_t sl = 0;
     for (uint32_t i = 0; i < maxSock; ++i)
@@ -1006,7 +1006,7 @@ static Vnode* GenNetTcp()
         if (!snap.used) continue;
         if (snap.type != 1 /* SOCK_STREAM */) continue;
 
-        if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
+        if (static_cast<uint32_t>(p - buf) + 192 >= bufSize) break;
 
         p = AppendStr(p, "  ");
         if (sl < 10) *p++ = ' ';
@@ -1018,13 +1018,13 @@ static Vnode* GenNetTcp()
         // local_address (IP:port in hex)
         p = AppendHex32(p, snap.localIp);
         *p++ = ':';
-        p = AppendHex16(p, snap.localPort);
+        p = AppendHex16(p, ntohs(snap.localPort));
         *p++ = ' ';
 
         // rem_address
         p = AppendHex32(p, snap.remoteIp);
         *p++ = ':';
-        p = AppendHex16(p, snap.remotePort);
+        p = AppendHex16(p, ntohs(snap.remotePort));
         *p++ = ' ';
 
         // state
@@ -1036,6 +1036,10 @@ static Vnode* GenNetTcp()
         p = AppendHex32(p, snap.txQueued);
         *p++ = ':';
         p = AppendHex32(p, snap.rxCount);
+        p = AppendStr(p, " 00:00000000 00000000 ");
+        p = U64ToDec(p, ProcessReportId(ProcessCurrent(), false, snap.identity.uid));
+        p = AppendStr(p, " 0 ");
+        p = U64ToDec(p, snap.identity.inode);
         *p++ = '\n';
 
         ++sl;
@@ -1050,12 +1054,12 @@ static Vnode* GenNetTcp()
 static Vnode* GenNetUdp()
 {
     uint32_t maxSock = NetMaxSockets();
-    uint32_t bufSize = 256 + maxSock * 128;
+    uint32_t bufSize = 256 + maxSock * 192;
     auto* buf = static_cast<char*>(kmalloc(bufSize));
     if (!buf) return nullptr;
 
     char* p = buf;
-    p = AppendStr(p, "  sl  local_address rem_address   st tx_queue rx_queue\n");
+    p = AppendStr(p, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
 
     uint32_t sl = 0;
     for (uint32_t i = 0; i < maxSock; ++i)
@@ -1064,7 +1068,7 @@ static Vnode* GenNetUdp()
         if (!snap.used) continue;
         if (snap.type != 2 /* SOCK_DGRAM */) continue;
 
-        if (static_cast<uint32_t>(p - buf) + 128 >= bufSize) break;
+        if (static_cast<uint32_t>(p - buf) + 192 >= bufSize) break;
 
         p = AppendStr(p, "  ");
         if (sl < 10) *p++ = ' ';
@@ -1075,17 +1079,21 @@ static Vnode* GenNetUdp()
 
         p = AppendHex32(p, snap.localIp);
         *p++ = ':';
-        p = AppendHex16(p, snap.localPort);
+        p = AppendHex16(p, ntohs(snap.localPort));
         *p++ = ' ';
 
         p = AppendHex32(p, snap.remoteIp);
         *p++ = ':';
-        p = AppendHex16(p, snap.remotePort);
+        p = AppendHex16(p, ntohs(snap.remotePort));
         p = AppendStr(p, " 07 "); // UDP is always "07" (Closed equivalent)
 
         p = AppendHex32(p, 0);
         *p++ = ':';
         p = AppendHex32(p, snap.rxCount);
+        p = AppendStr(p, " 00:00000000 00000000 ");
+        p = U64ToDec(p, ProcessReportId(ProcessCurrent(), false, snap.identity.uid));
+        p = AppendStr(p, " 0 ");
+        p = U64ToDec(p, snap.identity.inode);
         *p++ = '\n';
 
         ++sl;

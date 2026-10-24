@@ -124,6 +124,11 @@ static Process* g_arpWaiter = nullptr;
 static constexpr uint32_t MAX_SOCKETS = 1024;
 static Socket g_sockets[MAX_SOCKETS];
 static bool   g_sockUsed[MAX_SOCKETS];
+static bool   g_sockReserved[MAX_SOCKETS];
+// Only slot reservation/publication/retirement and scalar snapshots. Never
+// allocate, transmit, wait, or acquire process/FD locks while held.
+static IrqSpinLock g_socketRegistryLock;
+static SocketInodeAllocator g_socketInodes;
 // Protect listener queue topology/ownership. Never allocate, send, close, or
 // dispose while held. Queue -> child.lock is the only nested lock order.
 static IrqSpinLock g_acceptQueueLock;
@@ -711,9 +716,11 @@ SocketSnapshot NetSnapshotSocket(uint32_t idx)
 {
     SocketSnapshot snap = {};
     if (idx >= MAX_SOCKETS) return snap;
+    uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
     snap.used = g_sockUsed[idx];
-    if (!snap.used) return snap;
+    if (!snap.used) { IrqSpinLockRelease(&g_socketRegistryLock, flags); return snap; }
     const Socket& s = g_sockets[idx];
+    snap.identity   = s.identity;
     snap.type       = s.type;
     snap.localIp    = s.localIp;
     snap.localPort  = s.localPort;
@@ -722,6 +729,7 @@ SocketSnapshot NetSnapshotSocket(uint32_t idx)
     snap.tcpState   = s.tcpState;
     snap.rxCount    = s.rxCount;
     snap.txQueued   = (s.tcpSndNxt - s.tcpSndUna);
+    IrqSpinLockRelease(&g_socketRegistryLock, flags);
     return snap;
 }
 
@@ -1429,43 +1437,58 @@ uint32_t DnsResolve(const char* hostname)
 
 // ---------------------------------------------------------------------------
 
-int SockCreate(int domain, int type, int protocol)
+// Immutable identity reads are safe while the caller owns a socket reference.
+// In particular proc FD inspection must not take a networking lock under its FD lock.
+bool SockGetIdentity(int sockIdx, SocketIdentity* out)
+{
+    if (!out || sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return false;
+    *out = g_sockets[sockIdx].identity;
+    return out->inode != 0;
+}
+
+void SockSetAcceptedOwner(int sockIdx, uint32_t uid, uint32_t gid)
+{
+    uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+    g_sockets[sockIdx].identity.uid = uid;
+    g_sockets[sockIdx].identity.gid = gid;
+    IrqSpinLockRelease(&g_socketRegistryLock, flags);
+}
+
+static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
+                           uint32_t uid, uint32_t gid)
 {
     if (domain != AF_INET) return -1;
     if (type != SOCK_DGRAM && type != SOCK_STREAM) return -1;
-
-    for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
-        if (!g_sockUsed[i]) {
-            g_sockUsed[i] = true;
-            memset(&g_sockets[i], 0, sizeof(Socket));
-            g_sockets[i].domain = domain;
-            g_sockets[i].type = type;
-            g_sockets[i].protocol = protocol ? protocol :
-                (type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP);
-
-            // Allocate receive buffer
-            g_sockets[i].rxBuf = static_cast<uint8_t*>(kmalloc(Socket::RX_BUF_SIZE));
-            if (!g_sockets[i].rxBuf) {
-                g_sockUsed[i] = false;
-                return -1;
-            }
-            if (type == SOCK_STREAM) {
-                g_sockets[i].tcpOooBuf = static_cast<uint8_t*>(
-                    kmalloc(Socket::TCP_OOO_SLOT_COUNT * Socket::TCP_OOO_SLOT_SIZE));
-                if (!g_sockets[i].tcpOooBuf) {
-                    kfree(g_sockets[i].rxBuf);
-                    g_sockUsed[i] = false;
-                    return -1;
-                }
-            }
-
-            g_sockets[i].refCount = 1;
-            {
-                Process* self = ProcessCurrent();
-                g_sockets[i].ownerPid = self ? self->tgid : 0;
-            }
-            return static_cast<int>(i);
+    for (uint32_t i = 0; i < MAX_SOCKETS; ++i) {
+        uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+        bool available = !g_sockReserved[i];
+        if (available) g_sockReserved[i] = true;
+        IrqSpinLockRelease(&g_socketRegistryLock, flags);
+        if (!available) continue;
+        Socket& socket = g_sockets[i];
+        memset(&socket, 0, sizeof(Socket));
+        socket.domain = domain;
+        socket.type = type;
+        socket.protocol = protocol ? protocol : (type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP);
+        socket.identity = {g_socketInodes.allocate(), uid, gid};
+        socket.ownerPid = pid;
+        socket.rxBuf = static_cast<uint8_t*>(kmalloc(Socket::RX_BUF_SIZE));
+        if (socket.rxBuf && type == SOCK_STREAM)
+            socket.tcpOooBuf = static_cast<uint8_t*>(kmalloc(Socket::TCP_OOO_SLOT_COUNT * Socket::TCP_OOO_SLOT_SIZE));
+        if (!socket.identity.inode || !socket.rxBuf || (type == SOCK_STREAM && !socket.tcpOooBuf)) {
+            if (socket.rxBuf) kfree(socket.rxBuf);
+            if (socket.tcpOooBuf) kfree(socket.tcpOooBuf);
+            flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+            memset(&socket, 0, sizeof(Socket));
+            g_sockReserved[i] = false;
+            IrqSpinLockRelease(&g_socketRegistryLock, flags);
+            return -1;
         }
+        socket.refCount = 1;
+        flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+        __atomic_store_n(&g_sockUsed[i], true, __ATOMIC_RELEASE);
+        IrqSpinLockRelease(&g_socketRegistryLock, flags);
+        return static_cast<int>(i);
     }
     // Diagnostic: count sockets by state to identify leaks
     uint32_t nEstab = 0, nCloseWait = 0, nFinWait = 0, nSynSent = 0, nOther = 0;
@@ -1490,6 +1513,15 @@ int SockCreate(int domain, int type, int protocol)
     // Never recover capacity by freeing live/refcounted CLOSE_WAIT sockets.
     return -1;
 
+}
+
+int SockCreate(int domain, int type, int protocol)
+{
+    Process* self = ProcessCurrent();
+    const auto credentials = ProcessFileActorAcquire(self, nullptr);
+    const uint32_t uid = credentials.uid, gid = credentials.gid;
+    ProcessGroupsRelease(credentials.groups);
+    return SockCreateOwned(domain, type, protocol, self ? self->tgid : 0, uid, gid);
 }
 
 int SockBind(int sockIdx, const SockAddrIn* addr)
@@ -1691,8 +1723,11 @@ void SockClose(int sockIdx)
     if (s.rxBuf)
         kfree(s.rxBuf);
 
+    uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+    __atomic_store_n(&g_sockUsed[sockIdx], false, __ATOMIC_RELEASE);
     memset(&g_sockets[sockIdx], 0, sizeof(Socket));
-    g_sockUsed[sockIdx] = false;
+    g_sockReserved[sockIdx] = false;
+    IrqSpinLockRelease(&g_socketRegistryLock, flags);
 }
 
 void SockRef(int sockIdx)
@@ -2436,7 +2471,8 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             }
 
             // Create a new socket for this connection
-            int childIdx = SockCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            int childIdx = SockCreateOwned(AF_INET, SOCK_STREAM, IPPROTO_TCP,
+                                           s.ownerPid, s.identity.uid, s.identity.gid);
             if (childIdx < 0)
             {
                 SerialPrintf("net: TCP SYN dropped — no free sockets\n");

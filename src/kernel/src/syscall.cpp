@@ -7924,6 +7924,13 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
     if (fde->type == FdType::Socket) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
+        brook::SocketIdentity identity{};
+        const int index = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+        if (!brook::SockGetIdentity(index, &identity)) return -EBADF;
+        st->st_ino = identity.inode;
+        st->st_uid = ProcessReportId(ProcessCurrent(), false, identity.uid);
+        st->st_gid = ProcessReportId(ProcessCurrent(), true, identity.gid);
+        st->st_nlink = 1;
         st->st_mode = 0140666; // S_IFSOCK | rw-rw-rw-
         st->st_blksize = 4096;
         return 0;
@@ -13226,7 +13233,17 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
         brook::SockSetNonblock(sockIdx, true);
 
     // Allocate an fd for this socket
-    int fd = FdAlloc(proc, FdType::Socket, reinterpret_cast<void*>(static_cast<uintptr_t>(sockIdx + 1)));
+    FdEntry owned{};
+    owned.type = FdType::Socket;
+    owned.handle = reinterpret_cast<void*>(static_cast<uintptr_t>(sockIdx + 1));
+    owned.statusFlags = type & UNIX_SOCK_NONBLOCK;
+    owned.fdFlags = (type & UNIX_SOCK_CLOEXEC) ? 1 : 0;
+    brook::SocketIdentity identity{};
+    if (!brook::SockGetIdentity(sockIdx, &identity) ||
+        !brook::SocketIdentityLabel(identity.inode, owned.dirPath, sizeof(owned.dirPath))) {
+        SockClose(sockIdx); return -ENOMEM;
+    }
+    int fd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), owned, 0, -1, nullptr);
     if (fd < 0) {
         SockClose(sockIdx);
         return -EMFILE;
@@ -13905,6 +13922,10 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
     // Keep the original pinned slot/socket across waits; a fresh lookup can
     // fail once a concurrent close marks this slot closing.
     const int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
+    // Linux allocates the new sockfs inode before a potentially blocking accept.
+    const auto acceptCredentials = ProcessFileActorAcquire(proc, nullptr);
+    const uint32_t acceptUid = acceptCredentials.uid, acceptGid = acceptCredentials.gid;
+    ProcessGroupsRelease(acceptCredentials.groups);
     brook::SockAddrIn peerAddr = {};
     int childIdx;
     for (;;) {
@@ -13926,6 +13947,7 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
         if (result < 0) return result;
     }
     if (childIdx < 0) return childIdx;
+    brook::SockSetAcceptedOwner(childIdx, acceptUid, acceptGid);
     brook::SockSetNonblock(childIdx, (flags & UNIX_SOCK_NONBLOCK) != 0);
 
     // Allocate a new fd for the accepted connection
@@ -13934,6 +13956,11 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
     accepted.handle = reinterpret_cast<void*>(static_cast<uintptr_t>(childIdx + 1));
     accepted.statusFlags = flags & UNIX_SOCK_NONBLOCK;
     accepted.fdFlags = (flags & UNIX_SOCK_CLOEXEC) ? 1 : 0;
+    brook::SocketIdentity identity{};
+    if (!brook::SockGetIdentity(childIdx, &identity) ||
+        !brook::SocketIdentityLabel(identity.inode, accepted.dirPath, sizeof(accepted.dirPath))) {
+        brook::SockClose(childIdx); return -ENOMEM;
+    }
     int newFd = FdTablePublishOwned(proc->fds, ProcessFdLock(proc), accepted, 0, -1, nullptr);
     if (newFd < 0) {
         brook::SockClose(childIdx);

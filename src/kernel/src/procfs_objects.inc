@@ -64,7 +64,7 @@ static int ProcObjectMake(ProcObjectKind kind,VfsObject* parent,const ProcessSna
     // Only root has a fixed identity across zero-reference intervals. Other
     // live keys are interned, using non-reused checked IDs rather than a lossy
     // hash of PID/incarnation/file index.
-    if(g_procObjectIdentity==~uint64_t{0})__builtin_trap();
+    if(g_procObjectIdentity>=(uint64_t{1}<<62))__builtin_trap();
     uint64_t identity=kind==ProcObjectKind::Root?1:g_procObjectIdentity++;
     value->object={ProcObjectOperations(),value,identity,1};
     value->next=g_procObjects;g_procObjects=value;*out=&value->object;
@@ -292,6 +292,53 @@ static int ProcObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity
     *end=0;uint32_t bytes=end-path+1;if(bytes>capacity)return -36;
     memcpy(out,path,bytes);return 0;
 }
+// A followed socket FD is an inode capability, not a pathname to reopen.
+// Keep immutable metadata after close/reuse without retaining the transport;
+// identities are never recycled. Ordinary opening remains ENXIO like sockfs.
+struct ProcSocketTarget { VfsObject object; SocketIdentity identity; };
+static void ProcSocketDestroy(VfsObject* object) { kfree(object->priv); }
+static int ProcSocketStat(VfsObject* object, VnodeStat* out) {
+    auto* target = static_cast<ProcSocketTarget*>(object->priv);
+    *out = {}; out->ino = target->identity.inode; out->uid = target->identity.uid;
+    out->gid = target->identity.gid; out->mode = 0140666; out->nlink = 1; out->dev = 0;
+    return 0;
+}
+static int ProcSocketAccess(VfsObject* object, uint8_t required, bool realIds) {
+    auto* target = static_cast<ProcSocketTarget*>(object->priv);
+    return ProcessCheckFileAccess(ProcessCurrent(), target->identity.uid, target->identity.gid,
+                                  0140666, required, realIds);
+}
+static Vnode* ProcSocketOpen(VfsObject* object, int flags, int* error) {
+    *error = flags == VFS_O_METADATA ? 0 : -6;
+    if (*error) return nullptr;
+    auto* node = MakeProcVnode(nullptr, 0, false, &g_procMetadataOps);
+    if (!node) { *error = -12; return nullptr; }
+    node->backendObject = object; VfsObjectRetain(object); return node;
+}
+static const VfsObjectOps g_procSocketOps = {
+    .destroy=ProcSocketDestroy, .stat=ProcSocketStat, .access=ProcSocketAccess,
+    .lookup=nullptr, .parent=nullptr, .readlink=nullptr, .open=ProcSocketOpen,
+};
+static int ProcSocketPath(const VfsPath& source, const SocketIdentity& identity, VfsPath* out) {
+    auto* target = static_cast<ProcSocketTarget*>(kmalloc(sizeof(ProcSocketTarget)));
+    if (!target) return -12;
+    *target = {}; target->identity = identity;
+    target->object = {&g_procSocketOps, target, identity.inode, 1};
+    *out = {source.attachment, &target->object};
+    VfsPathRetain(*out); VfsObjectRelease(&target->object); return 1;
+}
+
+static int ProcAcquireSocketMetadata(const ProcObject* value, SocketIdentity* out) {
+    auto* live = SchedulerFindProcessReference(value->pid);
+    if (!live) return -2;
+    int error = -2;
+    if (live->incarnation == value->incarnation && live->tgid == value->tgid &&
+        (live->isThread ? live->leaderIncarnation : live->incarnation) == value->group) {
+        error = ProcessReadSocketMetadata(ProcessCurrent(), live, value->index, out);
+    }
+    ProcessUnref(live); return error;
+}
+
 static int ProcObjectFollow(const VfsPath& source,VfsPath* out)
 {
     auto* object=source.object;
@@ -302,6 +349,10 @@ static int ProcObjectFollow(const VfsPath& source,VfsPath* out)
         *out={source.attachment,target};VfsPathRetain(*out);VfsObjectRelease(target);return 1;
     }
     if(value->kind==ProcObjectKind::FdLink) {
+        SocketIdentity identity{};
+        int socket = ProcAcquireSocketMetadata(value, &identity);
+        if (socket < 0) return socket;
+        if (socket == 1) return ProcSocketPath(source, identity, out);
         // Match retained root/cwd access policy. This is a directory capability
         // jump, never a reopen of its reported pathname or a mount follow-down.
         FsSnapshot fs{};int error=ProcAcquireFsTarget(value->pid,value->incarnation,value->tgid,value->group,&fs);

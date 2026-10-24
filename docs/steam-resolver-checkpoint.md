@@ -169,3 +169,67 @@ Both experiments restore their original helper wrappers and complete checked
 sync and original-owner exit zero. Brook's four offline filesystem checks and
 the Linux read-only filesystem check pass. Steam login on Brook remains
 unverified; the Linux login screen is a reference only.
+
+## Socket discovery repair
+
+Application-only metadata probes identify repeated `lsof` children. Across 47
+matched invocations they observe 91,433 successful proc FD readlinks, none using
+the Linux socket identity syntax. A separate owned-listener control confirms
+that Brook reports inode zero, a generic FD label, and no matching TCP row.
+The Linux control passes those checks and finds its listener with `lsof`.
+These are positive compatibility failures, not proof that every 403 has the same
+cause. Interposition misses internal libc/raw syscalls, successful path calls
+are the recorded subset, and individual process logs have explicit caps.
+
+INET sockets now receive monotonic, non-reused inode identities independent of
+PID, FD number and reusable socket slot. Fully initialized descriptors cache
+their `socket:[inode]` label before publication; aliases retain it. A short
+registry guard protects slot reservation/publication/retirement and scalar proc
+snapshots, with allocation, transmission and close waits outside the guard.
+The guard prevents cross-lifetime identity mixing; mutable connection tuple and
+state writers are not all synchronized by this guard.
+
+`fstat`, followed proc FD metadata, and TCP/UDP rows agree on identity. Ports
+are formatted in host byte order and Linux UID/inode columns are present.
+Accepted ownership uses the accepting task's credentials captured before its
+blocking wait. Matched modules use ABI 52.
+
+Following a socket yields a metadata-only object: ordinary opening returns
+`ENXIO`, while `O_PATH` retains immutable identity after socket close/reuse.
+Same-owner foreign-process inspection is necessary for `lsof`. Its bounded
+policy checks canonical credentials, namespace and capabilities while copying
+the protected socket metadata. A busy FD lock causes both snapshots to retry
+after releasing credentials; the exact acquired lock is released. This does
+not grant process memory access, directory traversal, or reopening another
+process's socket. It does not implement general Linux ptrace/dumpability policy
+or repair the separately recorded exec/FD-table publication race.
+
+Regression coverage includes concurrent inode allocation/exhaustion, label
+bounds and constant initialization; the actual credential/FD snapshot body
+under contention and ownership changes; and native TCP/UDP, aliases, accepted
+ownership, cross-process permission checks, retained `O_PATH`, and 800 socket
+lifetimes across eight workers. A failed early boot exposed a dynamic C++
+initializer dependency; it is corrected with constant initialization and its
+private evidence is preserved. Native tests use fresh checked disk copies.
+
+SteamRT's actual `lsof` finds the owned control listener. Genuine main-client
+responses in the first full-client run continue to return 403, and the captured
+desktop remains black. Endpoint correlation identifies the recorded 101 as
+synthetic probe-control traffic, not a successful client handshake; it must not
+be counted toward login acceptance. Both endpoint-specific rejection and
+rendering remain open. That run restores its helper wrapper, passes heap/sync
+checks, exits its original VM owner zero, and passes all four offline filesystem
+checks. No proprietary files, request payloads, executable hashes or credentials
+are included in this checkpoint.
+
+The final atomic-snapshot kernel repeats all native identity, ownership, actual
+SteamRT lsof, and probe controls successfully, then completes heap integrity,
+checked sync, original-owner exit zero and all four offline filesystem checks.
+Its genuine main-client trace contains 22 HTTP 403 responses across both local
+listeners and no successful main-client upgrade in that capture. Synthetic
+probe records are excluded by executable-qualified application PID. The host
+suite passes 106 of 107 tests in the concurrent run; its existing FD stress test
+is explicitly stopped after excessive host contention, then passes alone in
+0.65 seconds. Both new tests pass, as do the three compiled entry/scheduler
+audits. Login remains unverified; next compare the request/rejection paths
+without attributing synthetic control responses to Steam.
