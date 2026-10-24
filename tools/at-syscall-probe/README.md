@@ -928,7 +928,9 @@ exec'd helper. It uses an 8,208-byte object (including the final 16-byte partial
 page), separate opens, shared read/write and read-only aliases, and closes file
 descriptors while mappings remain live. Eight pipe-ordered exchanges isolate
 basic coherence; 64 acquire/release exchanges then exercise process-shared
-futex wait/wake after unlinking and replacing the pathname. The replacement
+futex wait/wake after unlinking and replacing the pathname. The helper uses a
+fixed free virtual range distinct from the parent, and at least one successful
+blocked wait and nonzero wake result must be observed. The replacement
 must remain separate from the still-live old channel. A 30-second watchdog
 bounds the test, and the parent cleans up its owned child and pathname.
 

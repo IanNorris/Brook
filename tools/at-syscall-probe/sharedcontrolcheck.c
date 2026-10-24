@@ -22,7 +22,9 @@ enum { bytes=8208, header=16, pipe_rounds=8, atomic_rounds=64 };
 struct control { _Atomic uint32_t send,ack;uint32_t magic,guard;unsigned char data[bytes-header]; };
 _Static_assert(sizeof(struct control)==bytes,"control size");
 _Static_assert(ATOMIC_INT_LOCK_FREE==2,"process-shared atomic words must be lock free");
-static pid_t child_pid;
+static volatile sig_atomic_t child_pid;
+static unsigned wake_hits,wait_hits;
+#define HELPER_BASE ((void*)(uintptr_t)0x500000000000ULL)
 static char owned_path[160];
 static int path_owned;
 static void cleanup(void) {
@@ -46,11 +48,11 @@ static void verify(const struct control*c,const unsigned char*tail,unsigned roun
     for(unsigned i=0;i<sizeof(c->data);++i)CHECK(c->data[i]==pattern(round,i));
     for(unsigned i=0;i<16;++i)CHECK(tail[i]==pattern(round,8192-header+i));
 }
-static void wake(_Atomic uint32_t*word) { CHECK(syscall(SYS_futex,word,FUTEX_WAKE,1,NULL,NULL,0)>=0); }
+static void wake(_Atomic uint32_t*word) { long n=syscall(SYS_futex,word,FUTEX_WAKE,1,NULL,NULL,0);CHECK(n>=0);wake_hits+=(unsigned)n; }
 static void wait_word(_Atomic uint32_t*word,uint32_t want) {
     for(;;){uint32_t got=atomic_load_explicit(word,memory_order_acquire);if(got==want)return;
         struct timespec timeout={2,0};long r=syscall(SYS_futex,word,FUTEX_WAIT,got,&timeout,NULL,0);
-        CHECK(r==0||(r<0&&(errno==EAGAIN||errno==EINTR)));
+        CHECK(r==0||(r<0&&(errno==EAGAIN||errno==EINTR)));if(r==0)++wait_hits;
     }
 }
 static struct control* mapped(int fd) {
@@ -65,12 +67,13 @@ static int helper(int argc,char**argv) {
     int fd=open(argv[2],O_RDWR);CHECK(fd>=0);struct stat st;CHECK(!fstat(fd,&st));
     CHECK((unsigned long long)st.st_dev==strtoull(argv[5],NULL,10));
     CHECK((unsigned long long)st.st_ino==strtoull(argv[6],NULL,10)&&st.st_size==bytes);
-    struct control*c=mapped(fd);CHECK(!close(fd));
+    struct control*c=mmap(HELPER_BASE,bytes,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED_NOREPLACE,fd,0);CHECK(c==HELPER_BASE);CHECK(!close(fd));
     int ro=open(argv[2],O_RDONLY);CHECK(ro>=0);const struct control*alias=mmap(NULL,bytes,PROT_READ,MAP_SHARED,ro,0);CHECK(alias!=MAP_FAILED);
     const unsigned char*tail=tail_map(ro);CHECK(!close(ro));byte_write(output,'R');
     for(unsigned r=1;r<=pipe_rounds;++r){byte_read(input,'P');verify(alias,tail,r);fill(c,r+1000);byte_write(output,'A');}
     byte_read(input,'U'); /* parent has unlinked/recreated the name; old aliases must survive */
     for(unsigned r=1;r<=atomic_rounds;++r){wait_word(&c->send,r);verify(alias,tail,r+2000);fill(c,r+3000);atomic_store_explicit(&c->ack,r,memory_order_release);wake(&c->ack);}
+    unsigned counts[2]={wake_hits,wait_hits};CHECK(write(output,counts,sizeof(counts))==(ssize_t)sizeof(counts));
     CHECK(!munmap((void*)tail,16)&&!munmap((void*)alias,bytes)&&!munmap(c,bytes));close(input);close(output);return 0;
 }
 int main(int argc,char**argv) {
@@ -78,7 +81,7 @@ int main(int argc,char**argv) {
     CHECK(argc==1);CHECK(!atexit(cleanup));watchdog();
     struct timespec stamp;CHECK(!clock_gettime(CLOCK_MONOTONIC,&stamp));snprintf(owned_path,sizeof(owned_path),"/dev/shm/brook-control-%ld-%ld-%ld",(long)getpid(),stamp.tv_sec,stamp.tv_nsec);
     int fd=open(owned_path,O_CREAT|O_EXCL|O_RDWR,0600);CHECK(fd>=0);path_owned=1;CHECK(!ftruncate(fd,bytes));
-    struct stat st;CHECK(!fstat(fd,&st));struct control*c=mapped(fd);const unsigned char*tail=tail_map(fd);
+    struct stat st;CHECK(!fstat(fd,&st));struct control*c=mapped(fd);CHECK((void*)c!=HELPER_BASE);const unsigned char*tail=tail_map(fd);
     memset(c,0,bytes);c->magic=0x42524f4f;c->guard=0x4b43544c;CHECK(!close(fd));
     int input[2],output[2];CHECK(!pipe(input)&&!pipe(output));char exe[1024];ssize_t n=readlink("/proc/self/exe",exe,sizeof(exe)-1);CHECK(n>0);exe[n]=0;
     child_pid=fork();CHECK(child_pid>=0);
@@ -89,7 +92,8 @@ int main(int argc,char**argv) {
     CHECK(!unlink(owned_path));path_owned=0;int fresh=open(owned_path,O_CREAT|O_EXCL|O_RDWR,0600);CHECK(fresh>=0);path_owned=1;CHECK(!ftruncate(fresh,bytes));
     struct stat replacement;CHECK(!fstat(fresh,&replacement)&&replacement.st_ino!=st.st_ino);struct control*new_map=mapped(fresh);CHECK(new_map->magic==0&&new_map->guard==0);CHECK(!close(fresh));byte_write(input[1],'U');
     for(unsigned r=1;r<=atomic_rounds;++r){fill(c,r+2000);atomic_store_explicit(&c->send,r,memory_order_release);wake(&c->send);wait_word(&c->ack,r);verify(c,tail,r+3000);CHECK(new_map->magic==0&&new_map->guard==0);}
+    unsigned counts[2];CHECK(read(output[0],counts,sizeof(counts))==(ssize_t)sizeof(counts));CHECK(wake_hits+counts[0]>0&&wait_hits+counts[1]>0);
     close(input[1]);close(output[0]);int status;CHECK(waitpid(child_pid,&status,0)==child_pid);child_pid=0;CHECK(WIFEXITED(status)&&WEXITSTATUS(status)==0);
     CHECK(!munmap((void*)tail,16)&&!munmap(c,bytes)&&!munmap(new_map,bytes));CHECK(!unlink(owned_path));path_owned=0;alarm(0);
-    puts("SHAREDCONTROLCHECK PASS independent-exec/separate-opens/readonly-alias/fd-close/partial-page/unlink-recreate/shared-futex rounds=64");return 0;
+    puts("SHAREDCONTROLCHECK PASS independent-exec/separate-opens/readonly-alias/fd-close/partial-page/unlink-recreate/shared-futex/different-virtual-bases/blocked-wakeup rounds=64");return 0;
 }
