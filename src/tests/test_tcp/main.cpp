@@ -379,6 +379,13 @@ static void TestPassiveHandshake()
 
 int main()
 {
+    ASSERT_TRUE(Ipv4IsLoopback(htonl(0x7f000001)));
+    ASSERT_TRUE(Ipv4IsLoopback(htonl(0x7f123456)));
+    ASSERT_TRUE(!Ipv4IsLoopback(htonl(0x0a00020f)));
+    ASSERT_TRUE(!Ipv4IsLoopback(htonl(0x80000001)));
+    ASSERT_EQ(Ipv4Source(0,htonl(0x7f000002),0),htonl(0x7f000001));
+    ASSERT_EQ(Ipv4Source(0,htonl(0x08080808),htonl(0x0a00020f)),htonl(0x0a00020f));
+    ASSERT_EQ(Ipv4Source(htonl(0x7f000002),htonl(0x7f000003),0),htonl(0x7f000002));
     printf("=== TCP State Machine Tests ===\n");
 
     ASSERT_TRUE(!TcpTimerElapsed(1000, 1001, 40));

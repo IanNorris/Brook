@@ -942,3 +942,12 @@ no live descendants. It prints fixed stages/counts, never application contents.
 This tests known-data coherence and ordinary shared-futex handshakes; it does
 not establish Steam protocol correctness, owner-liveness interpretation, or
 all possible shared-memory races.
+
+`loopbackcheck.c` checks TCP on `127.0.0.1` and `127.0.0.2`, wildcard
+listeners, blocking and nonblocking connect with poll/SO_ERROR, bidirectional
+8,193-byte transfers in both directions, FIN/EOF, accepted local/peer addresses,
+measured close time, and a UDP round trip with
+source verification. It uses a raw alarm watchdog. This probe waits for listener
+readiness before accept; it does not certify blocking accept before connection,
+full UDP demultiplexing, or concurrent close semantics. Close timing is reported,
+not asserted against a scheduling-sensitive threshold.

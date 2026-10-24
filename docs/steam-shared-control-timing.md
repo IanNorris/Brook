@@ -114,3 +114,61 @@ Private diagnostic sources/receipts remain under
 `build/workloads/steam-control-lifetime-20261024`, `steam-pool-cost-20261024` and
 `steam-tmpfs-index-20261024`, plus reviews O/P/Q. Proprietary payloads, profiles,
 raw application logs, login images and VM disks remain outside git.
+
+## Post-handoff diagnosis
+
+Review S repeats Q's indexed-pool controls and reaches parent pool acquisition.
+The network service remains live, while errno 97 repeats on its network thread.
+A targeted twelve-second NET trace confirms rejected AF_INET6 sockets followed
+by successful AF_INET socket creation, then an IPv4 connection refused result.
+Serial connection metadata identifies repeated loopback destinations, not a
+failure to fall back from IPv6. This after-return trace has global repeated-error
+suppression and does not establish syscall frequencies or blocked-call absence.
+
+Direct guest X11 protocol snapshots verify window classes and map state. The
+browser's 200x200 window is unmapped. A later 700x350 mapped window extends past
+the 800x600 X screen; cropping to its visible 464x333 portion avoids GetImage
+BadMatch and produces all-black pixels, as does the root drawable. This is not
+evidence of a correctly rendered login UI being lost only during composition.
+Zygote-derived children retain inherited cmdline information, so argv alone
+cannot establish renderer identity. Proc stat start-time/exit-code placeholders
+also cannot prove child termination status.
+
+A separate known-data TCP listener bound to 127.0.0.1:19001 reproduces connection
+refused on the old kernel. Its early blocking accept also returns EAGAIN; this
+is a distinct existing accept behavior gap, so the stronger routing regression
+waits for listener readiness before accepting. Source inspection finds local
+delivery only for the NIC's own address, with no 127/8 route. The next candidate
+adds local delivery with packet-origin distinction, correct TCP source/checksum
+and passive-open addresses, and state publication before synchronous ACKs.
+`loopbackcheck.c` is public synthetic acceptance. Linux and Brook review T
+pass, including parent and child watchdogs; the checked static helper SHA-256
+is `f408159649d2db9e880b7cd1a97f68d8fc397aacfa17399523a40d52874c60be`.
+The stronger test transfers 8,193 known bytes in both directions, checks EOF,
+and reports close durations of about 8 ms without an encoded latency threshold.
+The tracked guest group drains with exit zero. Steam retry remains pending. Full blocking-accept behavior and broader UDP
+demultiplexing remain separate acceptance gaps, not implied by this probe.
+
+S restores wrappers, drains jobs, passes heap/sync, original-owner exit, serial
+acceptance and four offline filesystem checks. Candidate review T uses 12 GiB
+instead of 16 GiB to preserve host headroom; its measurements must not be treated
+as a normalized performance comparison with Q/S.
+
+T establishes the Steam loopback connections that S repeatedly refused. A
+bounded local HTTP root probe connects to all three local listeners but receives
+no response within one second; their protocols are not established by that probe.
+No new fixed shared-memory-corruption or EnsureConnected category appears in
+the appended CEF log window. The client still does not present usable login.
+
+An independent X11 paint control reveals another layer: a known green background
+reads back black on the accelerated Xwayland display, which subsequently exits
+with signal 6 after its fatal segmentation-fault report. The corresponding
+explicit rectangle control on a separate `--glamor off` Xwayland display reads
+back all 12,800 expected pixels with no X errors. The Steam retry on that
+software display is pending. The user also observed transient red top-edge
+artifacts absent from approximately contemporaneous bridge images. The user
+confirms the captures were at approximately the same time; the discrepancy
+is retained as unresolved and must not be dismissed as merely a time difference. QEMU screendump
+returns `no surface` in this GL display mode, so an independent screenshot-path
+comparison remains unavailable. Neither observation establishes final scanout
+correctness or a usable Steam renderer.

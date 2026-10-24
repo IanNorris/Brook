@@ -137,6 +137,9 @@ static uint32_t g_tcpEphemeralPort = 49200; // accessed via atomic fetch-add
 static void TcpSendSegment(Socket& s, uint8_t flags,
                            const void* data, uint32_t dataLen,
                            const char* why = "?");
+static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
+                                const void* data, uint32_t dataLen,
+                                const char* why);
 static void TcpEnqueueData(Socket& s, const void* data, uint32_t len);
 
 // ---------------------------------------------------------------------------
@@ -361,7 +364,7 @@ bool ArpResolve(uint32_t ip, MacAddr* outMac)
 // IPv4 send/receive
 // ---------------------------------------------------------------------------
 
-static void HandleIpv4(const uint8_t* frame, uint32_t len);
+static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local = false);
 static void TcpStatsMaybeFlush();
 
 // BRO-163 instrument: detect dangerous kernel-stack depth on the egress path.
@@ -430,16 +433,19 @@ static void NetSendStackWatermark(uint32_t dstIp, uint8_t proto, uint32_t payloa
     }
 }
 
-int NetSendIpv4(uint32_t dstIp, uint8_t proto,
-                const void* payload, uint32_t payloadLen)
+static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
+                          const void* payload, uint32_t payloadLen)
 {
     NetSendStackWatermark(dstIp, proto, payloadLen);
 
     NetIf* nif = NetIfForDst(dstIp);
-    if (!nif || !nif->ipAddr) return -1;
+    const bool loopback = Ipv4IsLoopback(dstIp);
+    source = Ipv4Source(source, dstIp, nif ? nif->ipAddr : 0);
+    if (!source || (!loopback && (!nif || !nif->ipAddr || Ipv4IsLoopback(source)))) return -1;
 
-    // Loopback: if destination is our own IP on this iface, inject locally
-    if (dstIp == nif->ipAddr)
+    // 127/8 never leaves the machine and works without a configured NIC.
+    // Connections to our physical interface address are delivered locally too.
+    if (loopback || dstIp == nif->ipAddr)
     {
         uint32_t ipLen = sizeof(Ipv4Header) + payloadLen;
         uint32_t frameLen = sizeof(EthHeader) + ipLen;
@@ -449,8 +455,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         memset(frame, 0, frameLen);
 
         auto* eth = reinterpret_cast<EthHeader*>(frame);
-        eth->src = nif->mac;
-        eth->dst = nif->mac;
+        if (nif) eth->src = eth->dst = nif->mac;
         eth->etherType = htons(ETH_TYPE_IPV4);
 
         auto* ip = reinterpret_cast<Ipv4Header*>(frame + sizeof(EthHeader));
@@ -460,7 +465,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
         ip->flagsFrag = htons(0x4000);
         ip->ttl      = 64;
         ip->protocol = proto;
-        ip->srcIp    = nif->ipAddr;
+        ip->srcIp    = source;
         ip->dstIp    = dstIp;
         ip->checksum = 0;
         ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
@@ -476,7 +481,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
             g_loopbackQueue, g_loopbackDraining, frame, frameLen,
             []() { SpinLockAcquire(&g_loopbackLock); },
             []() { SpinLockRelease(&g_loopbackLock); },
-            [](const uint8_t* f, uint32_t l) { HandleIpv4(f, l); });
+            [](const uint8_t* f, uint32_t l) { HandleIpv4(f, l, true); });
         return 0;
     }
 
@@ -513,7 +518,7 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
     ip->flagsFrag = htons(0x4000);
     ip->ttl      = 64;
     ip->protocol = proto;
-    ip->srcIp    = nif->ipAddr;
+    ip->srcIp    = source;
     ip->dstIp    = dstIp;
     ip->checksum = 0;
     ip->checksum = InetChecksum(ip, sizeof(Ipv4Header));
@@ -525,8 +530,13 @@ int NetSendIpv4(uint32_t dstIp, uint8_t proto,
     return nif->transmit(nif, frame, frameLen);
 }
 
-int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
-               const void* data, uint32_t dataLen)
+int NetSendIpv4(uint32_t dstIp, uint8_t proto, const void* payload, uint32_t payloadLen)
+{
+    return NetSendIpv4From(0, dstIp, proto, payload, payloadLen);
+}
+
+static int NetSendUdpFrom(uint32_t source, uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
+                          const void* data, uint32_t dataLen)
 {
     uint32_t udpLen = sizeof(UdpHeader) + dataLen;
     if (udpLen > ETH_MTU - sizeof(Ipv4Header)) return -1;
@@ -540,7 +550,13 @@ int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
 
     memcpy(buf + sizeof(UdpHeader), data, dataLen);
 
-    return NetSendIpv4(dstIp, IP_PROTO_UDP, buf, udpLen);
+    return NetSendIpv4From(source, dstIp, IP_PROTO_UDP, buf, udpLen);
+}
+
+int NetSendUdp(uint32_t dstIp, uint16_t srcPort, uint16_t dstPort,
+               const void* data, uint32_t dataLen)
+{
+    return NetSendUdpFrom(0, dstIp, srcPort, dstPort, data, dataLen);
 }
 
 // ---------------------------------------------------------------------------
@@ -585,7 +601,7 @@ static bool IsDnsReply(uint16_t dstPort, const void* data, uint32_t len);
 // IPv4 receive
 // ---------------------------------------------------------------------------
 
-static void HandleIpv4(const uint8_t* frame, uint32_t len)
+static void HandleIpv4(const uint8_t* frame, uint32_t len, bool local)
 {
     if (len < sizeof(EthHeader) + sizeof(Ipv4Header)) return;
 
@@ -595,10 +611,12 @@ static void HandleIpv4(const uint8_t* frame, uint32_t len)
 
     if (totalLen < ihl) return;
     if (sizeof(EthHeader) + totalLen > len) return;
+    // A physical NIC must never inject packets from/to the loopback range.
+    if (!local && (Ipv4IsLoopback(ip->srcIp) || Ipv4IsLoopback(ip->dstIp))) return;
 
     // Check destination: accept if it targets any of our interface IPs,
     // the global broadcast, or any of our subnet-directed broadcasts.
-    bool forUs = (ip->dstIp == 0xFFFFFFFF);
+    bool forUs = (ip->dstIp == 0xFFFFFFFF) || (local && Ipv4IsLoopback(ip->dstIp));
     if (!forUs) {
         for (uint32_t i = 0; i < g_netIfCount; i++) {
             NetIf* n = g_netIfs[i];
@@ -1520,7 +1538,7 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
         uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
         if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
         s.localPort = htons(static_cast<uint16_t>(port));
-        s.localIp = g_netIf ? g_netIf->ipAddr : 0;
+        s.localIp = 0; // Unconnected UDP retains a wildcard source; route each send.
         s.bound = true;
     }
 
@@ -1534,7 +1552,7 @@ int SockSendTo(int sockIdx, const void* buf, uint32_t len,
                      ntohl(dstIp) & 0xFF);
     }
 
-    return NetSendUdp(dstIp, ntohs(s.localPort), dstPort, buf, len);
+    return NetSendUdpFrom(s.localIp, dstIp, ntohs(s.localPort), dstPort, buf, len);
 }
 
 int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
@@ -1636,14 +1654,15 @@ void SockClose(int sockIdx)
         (s.tcpState == TcpState::Established ||
          s.tcpState == TcpState::CloseWait))
     {
-        TcpSendSegment(s, TCP_FIN | TCP_ACK, nullptr, 0, "close");
-        s.tcpSndNxt++;
-
         // Active close (Established): wait for FIN-ACK (FinWait1 → FinWait2 → done)
         // Passive close (CloseWait):  wait for ACK of our FIN (LastAck → Closed)
+        const uint32_t seq = s.tcpSndNxt++;
         s.tcpState = (s.tcpState == TcpState::Established)
                          ? TcpState::FinWait1
                          : TcpState::LastAck;
+        // Local delivery may synchronously process the peer's ACK/FIN.
+        // Publish the closing state first, and never overwrite its response.
+        TcpSendSegmentAtSeq(s, seq, TCP_FIN | TCP_ACK, nullptr, 0, "close");
 
         // Wait up to 500ms for the peer to acknowledge our FIN.
         // We must use SchedulerBlock (not SchedulerYield) because SchedulerYield
@@ -2110,9 +2129,9 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
         memcpy(buf + sizeof(TcpHeader) + optLen, data, dataLen);
 
     tcp->checksum = 0;
-    tcp->checksum = TcpChecksum(g_netIf->ipAddr, s.remoteIp, buf, tcpLen);
+    tcp->checksum = TcpChecksum(s.localIp, s.remoteIp, buf, tcpLen);
 
-    int sendResult = NetSendIpv4(s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
+    int sendResult = NetSendIpv4From(s.localIp, s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
     if (sendResult != 0) {
         SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
     } else {
@@ -2221,6 +2240,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         Socket& s = g_sockets[i];
         if (s.type != SOCK_STREAM) continue;
         if (s.localPort != dstPort) continue;
+        if (s.localIp != ip->dstIp) continue;
         if (s.remotePort != srcPort) continue;
         if (s.remoteIp != ip->srcIp) continue;
 
@@ -2387,6 +2407,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             if (s.type != SOCK_STREAM) continue;
             if (!s.listening) continue;
             if (s.localPort != dstPort) continue;
+            if (s.localIp && s.localIp != ip->dstIp) continue;
 
             // Reclaim abandoned children even while accept's consumer is still
             // closing its active FD; dead queue entries must not refuse a SYN.
@@ -2409,7 +2430,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             }
 
             Socket& child = g_sockets[childIdx];
-            child.localIp    = g_netIf->ipAddr;
+            child.localIp    = ip->dstIp;
             child.localPort  = dstPort;
             child.remoteIp   = ip->srcIp;
             child.remotePort = srcPort;
@@ -2463,7 +2484,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
     }
 
     // No matching socket — send RST
-    if (!(flags & TCP_RST) && g_netIf) {
+    if (!(flags & TCP_RST)) {
         SerialPrintf("tcp: no socket for %u.%u.%u.%u:%u→%u (flags=0x%02x) — sending RST\n",
                      (ntohl(ip->srcIp) >> 24) & 0xFF, (ntohl(ip->srcIp) >> 16) & 0xFF,
                      (ntohl(ip->srcIp) >> 8) & 0xFF, ntohl(ip->srcIp) & 0xFF,
@@ -2485,9 +2506,9 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         rst->dataOff = (sizeof(TcpHeader) / 4) << 4;
         rst->window = 0;
         rst->checksum = 0;
-        rst->checksum = TcpChecksum(g_netIf->ipAddr, ip->srcIp,
+        rst->checksum = TcpChecksum(ip->dstIp, ip->srcIp,
                                      rstBuf, sizeof(TcpHeader));
-        NetSendIpv4(ip->srcIp, IP_PROTO_TCP, rstBuf, sizeof(TcpHeader));
+        NetSendIpv4From(ip->dstIp, ip->srcIp, IP_PROTO_TCP, rstBuf, sizeof(TcpHeader));
     }
 }
 
@@ -2508,9 +2529,10 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
             uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
             if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
             s.localPort = htons(static_cast<uint16_t>(port));
-            s.localIp = g_netIf ? g_netIf->ipAddr : 0;
+            s.localIp = Ipv4Source(0, s.remoteIp, g_netIf ? g_netIf->ipAddr : 0);
             s.bound = true;
         }
+        s.localIp = Ipv4Source(s.localIp, s.remoteIp, g_netIf ? g_netIf->ipAddr : 0);
         return 0;
     }
 
@@ -2529,15 +2551,17 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
         uint32_t port = __atomic_fetch_add(&g_tcpEphemeralPort, 1, __ATOMIC_RELAXED);
         if (port >= 65535) __atomic_store_n(&g_tcpEphemeralPort, 49200, __ATOMIC_RELAXED);
         s.localPort = htons(static_cast<uint16_t>(port));
-        s.localIp = g_netIf ? g_netIf->ipAddr : 0;
+        s.localIp = Ipv4Source(0, s.remoteIp, g_netIf ? g_netIf->ipAddr : 0);
         s.bound = true;
     }
+
+    s.localIp = Ipv4Source(s.localIp, s.remoteIp, g_netIf ? g_netIf->ipAddr : 0);
 
     // Initialize TCP state
     // Use a simple ISS from the IP ID counter + port for uniqueness
     s.tcpSndIss = static_cast<uint32_t>(__atomic_load_n(&g_ipId, __ATOMIC_RELAXED)) * 12345 +
                   ntohs(s.localPort) * 67890;
-    s.tcpSndNxt = s.tcpSndIss;
+    s.tcpSndNxt = s.tcpSndIss + 1;
     s.tcpSndUna = s.tcpSndIss;
     s.tcpRcvNxt = 0;
     s.tcpFinRecv = false;
@@ -2550,8 +2574,8 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     s.tcpState = TcpState::SynSent;
 
     // Send SYN
-    TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect");
-    s.tcpSndNxt++; // SYN consumes one sequence number
+    // Publish the consumed SYN before local delivery can return its ACK.
+    TcpSendSegmentAtSeq(s, s.tcpSndIss, TCP_SYN, nullptr, 0, "connect");
 
     SerialPrintf("[PROFILE] tcp_connect t=%lums -> %u.%u.%u.%u:%u%s\n",
                  ApicTickCount(),
@@ -2573,9 +2597,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     for (int attempt = 0; attempt < 2; attempt++) {
         if (attempt == 1) {
             // Retry SYN
-            s.tcpSndNxt = s.tcpSndIss;
-            TcpSendSegment(s, TCP_SYN, nullptr, 0, "connect-retry");
-            s.tcpSndNxt++;
+            TcpSendSegmentAtSeq(s, s.tcpSndIss, TCP_SYN, nullptr, 0, "connect-retry");
         }
 
         uint64_t deadline = ApicTickCount() + 5000;
@@ -2675,8 +2697,8 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
         if (chunk > MSS) chunk = MSS;
 
         uint32_t seq = s.tcpSndNxt;
-        TcpSendSegment(s, TCP_ACK | TCP_PSH, data + sent, chunk, "data");
         s.tcpSndNxt += chunk;
+        TcpSendSegmentAtSeq(s, seq, TCP_ACK | TCP_PSH, data + sent, chunk, "data");
 
         int ackStatus = TcpWaitForDataAck(s, sockIdx, seq, data + sent, chunk);
         if (ackStatus != 0)

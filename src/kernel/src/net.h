@@ -140,6 +140,14 @@ static inline uint16_t ntohs(uint16_t n) { return __builtin_bswap16(n); }
 static inline uint32_t htonl(uint32_t h) { return __builtin_bswap32(h); }
 static inline uint32_t ntohl(uint32_t n) { return __builtin_bswap32(n); }
 
+// Addresses here, like sockaddr_in, are in network byte order.
+static inline bool Ipv4IsLoopback(uint32_t ip) {
+    return (ntohl(ip) >> 24) == 127;
+}
+static inline uint32_t Ipv4Source(uint32_t bound, uint32_t destination, uint32_t primary) {
+    return bound ? bound : Ipv4IsLoopback(destination) ? htonl(0x7f000001) : primary;
+}
+
 // Pack an IPv4 address from four octets (host byte order → big-endian).
 static inline uint32_t Ipv4Addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
 {
