@@ -39,6 +39,7 @@
 #include "ksym_addrs.h"
 #include "user_copy.h"
 #include "signal_frame_layout.h"
+#include "signal_altstack.h"
 #include "signal_fp_user.h"
 #include "vdso.h"
 #include "process_user_namespace.h"
@@ -684,6 +685,7 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     // Zero-initialize
     auto* raw = reinterpret_cast<uint8_t*>(proc);
     memset(raw, 0, sizeof(Process));
+    proc->sigAltstackFlags = 2; // SS_DISABLE until explicitly installed
     proc->magic = PROCESS_MAGIC;
     proc->incarnation = NextIncarnation();
     proc->uid = proc->euid = proc->suid = launchUid;
@@ -1444,6 +1446,10 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->inSignalHandler = false;
     thread->inSignalHandlerOnAltStack = false;
     thread->sigReturnPending = false;
+    // CLONE_VM threads must not share an alternate signal stack.
+    thread->sigAltstackSp = 0;
+    thread->sigAltstackSize = 0;
+    thread->sigAltstackFlags = 2; // SS_DISABLE; fork deliberately inherits
 
     // Threads share the parent's tgid (set above), so they already index
     // into the same group disposition slot — no copy needed.
@@ -1612,6 +1618,12 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     // now stale. If we fail later in ProcessExec, SchedulerExitCurrentProcess
     // must not dereference them. Linux does the same in flush_old_exec().
     proc->clearChildTid = 0;
+    proc->sigAltstackSp = 0;
+    proc->sigAltstackSize = 0;
+    proc->sigAltstackFlags = 2; // successful exec discarded the old stack
+    proc->inSignalHandler = false;
+    proc->inSignalHandlerOnAltStack = false;
+    proc->sigReturnPending = false;
     // exec() replaces the program image; a previously-registered crash
     // entry point is no longer valid (it pointed into the old VAS).
     proc->crashEntry = 0;
@@ -1917,8 +1929,9 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     const uint64_t savedMask=returnMask;
     const uint64_t handlerMask=(proc->sigMask|sa.mask|(1ULL<<(signum-1))) &
                               ~((1ULL<<8)|(1ULL<<18));
-    const bool useAlt=(sa.flags&SA_ONSTACK) && proc->sigAltstackSp!=0 &&
-                      !(proc->sigAltstackFlags&2) && !proc->inSignalHandlerOnAltStack;
+    const int previousStackFlags=SignalAltstackFlags(proc->sigAltstackSp,
+        proc->sigAltstackSize,proc->sigAltstackFlags,frame->rsp);
+    const bool useAlt=(sa.flags&SA_ONSTACK) && previousStackFlags==0;
     uint64_t userRsp=0;
     if(!PlaceSignalFrame(frame->rsp,proc->sigAltstackSp,proc->sigAltstackSize,
                          useAlt,sizeof(SignalFrame)+SIGNAL_FP_EXTRA,&userRsp)) {
@@ -1939,8 +1952,7 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     sf->uc.uc_mcontext.fpstate=SignalFpUserAddress(userRsp,sizeof(*sf));
     sf->uc.uc_stack.ss_sp    = proc->sigAltstackSp;
     sf->uc.uc_stack.ss_size  = proc->sigAltstackSize;
-    sf->uc.uc_stack.ss_flags = useAlt ? 1 /*SS_ONSTACK*/
-                                      : (proc->sigAltstackSp ? 0 : 2 /*SS_DISABLE*/);
+    sf->uc.uc_stack.ss_flags = proc->sigAltstackSize ? proc->sigAltstackFlags : 2;
 
     // Save all registers into mcontext
     SignalMcontext& mc = sf->uc.uc_mcontext;

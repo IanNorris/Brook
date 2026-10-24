@@ -26,6 +26,7 @@
 #include "user_copy_fault.h"
 #include "user_copy.h"
 #include "signal_frame_layout.h"
+#include "signal_altstack.h"
 #include "signal_fp_user.h"
 
 using brook::SerialPrintf;
@@ -1662,8 +1663,9 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
         const uint64_t savedMask=proc->sigMask;
         const uint64_t handlerMask=(savedMask|sa.mask|(1ULL<<(signum-1))) &
                                   ~((1ULL<<8)|(1ULL<<18));
-        const bool useAlt=(sa.flags&brook::SA_ONSTACK) && proc->sigAltstackSp!=0 &&
-                          !(proc->sigAltstackFlags&2) && !proc->inSignalHandlerOnAltStack;
+        const int previousStackFlags=brook::SignalAltstackFlags(proc->sigAltstackSp,
+            proc->sigAltstackSize,proc->sigAltstackFlags,ef->rsp);
+        const bool useAlt=(sa.flags&brook::SA_ONSTACK) && previousStackFlags==0;
         uint64_t userRsp=0;
         if(!brook::PlaceSignalFrame(ef->rsp,proc->sigAltstackSp,proc->sigAltstackSize,
                                     useAlt,sizeof(brook::SignalFrame)+brook::SIGNAL_FP_EXTRA,&userRsp)) {
@@ -1684,8 +1686,7 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
         sf->uc.uc_mcontext.fpstate=brook::SignalFpUserAddress(userRsp,sizeof(*sf));
         sf->uc.uc_stack.ss_sp    = proc->sigAltstackSp;
         sf->uc.uc_stack.ss_size  = proc->sigAltstackSize;
-        sf->uc.uc_stack.ss_flags = useAlt ? 1
-                                          : (proc->sigAltstackSp ? 0 : 2);
+        sf->uc.uc_stack.ss_flags = proc->sigAltstackSize ? proc->sigAltstackFlags : 2;
 
         // Save all registers from the fault context into mcontext
         brook::SignalMcontext& mc = sf->uc.uc_mcontext;

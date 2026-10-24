@@ -16,6 +16,7 @@
 #include "posix_timer.h"
 #include "sysv_sem.h"
 #include "signal_fd.h"
+#include "signal_altstack.h"
 #include "unix_credentials.h"
 #include "timeout_value.h"
 #include "timerfd_state.h"
@@ -11087,26 +11088,23 @@ static int64_t sys_sigaltstack(uint64_t ssAddr, uint64_t oldSsAddr, uint64_t,
     Process* proc = ProcessCurrent();
     if (!proc) return -ESRCH;
 
-    // Return current state
-    if (oldSsAddr)
-    {
-        auto* oss = reinterpret_cast<linux_stack_t*>(oldSsAddr);
-        oss->ss_sp    = proc->sigAltstackSp;
-        oss->ss_size  = proc->sigAltstackSize;
-        oss->ss_flags = proc->sigAltstackFlags;
-        if (proc->inSignalHandler && proc->sigAltstackSp != 0)
-            oss->ss_flags |= SS_ONSTACK;
-    }
-
-    // Set new state
+    const linux_stack_t old{proc->sigAltstackSp,
+        SignalAltstackFlags(proc->sigAltstackSp,proc->sigAltstackSize,
+                            proc->sigAltstackFlags,proc->syscallUserRsp),
+        0,proc->sigAltstackSize};
+    linux_stack_t ss{};
+    // Snapshot input before output: ss and old_ss may alias.
+    if(ssAddr && !CopyFromUser(&ss,ssAddr,sizeof(ss)))return -EFAULT;
     if (ssAddr)
     {
-        // Cannot change altstack while executing on it
-        if (proc->inSignalHandler && proc->sigAltstackSp != 0)
-            return -EPERM;
-
-        auto* ss = reinterpret_cast<const linux_stack_t*>(ssAddr);
-        if (ss->ss_flags & SS_DISABLE)
+        if(old.ss_flags==SS_ONSTACK)return -EPERM;
+        // Linux accepts SS_ONSTACK as an enabled configuration, but never
+        // stores it as execution state. SS_AUTODISARM is not supported yet.
+        if(ss.ss_flags!=0 && ss.ss_flags!=SS_DISABLE && ss.ss_flags!=SS_ONSTACK)
+            return -EINVAL;
+        if(ss.ss_flags!=SS_DISABLE && (ss.ss_size<2048 || ss.ss_size>0xffffffffULL))
+            return -ENOMEM;
+        if (ss.ss_flags == SS_DISABLE)
         {
             proc->sigAltstackSp    = 0;
             proc->sigAltstackSize  = 0;
@@ -11114,15 +11112,13 @@ static int64_t sys_sigaltstack(uint64_t ssAddr, uint64_t oldSsAddr, uint64_t,
         }
         else
         {
-            if (ss->ss_size < 2048) // MINSIGSTKSZ
-                return -ENOMEM;
-            proc->sigAltstackSp    = ss->ss_sp;
-            proc->sigAltstackSize  = static_cast<uint32_t>(ss->ss_size);
+            proc->sigAltstackSp    = ss.ss_sp;
+            proc->sigAltstackSize  = static_cast<uint32_t>(ss.ss_size);
             proc->sigAltstackFlags = 0;
         }
     }
 
-    return 0;
+    return !oldSsAddr || CopyToUser(oldSsAddr,&old,sizeof(old)) ? 0 : -EFAULT;
 }
 
 // ---------------------------------------------------------------------------

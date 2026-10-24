@@ -975,3 +975,12 @@ Brook VM. `procdirfdcheck.c` also retains its mount/directory, memfd and
 foreign-process denial controls; its regular-file cases now expect supported
 stat/access/open results. These probes do not establish arbitrary foreign
 process inspection or support for reopening every descriptor type.
+
+`sigaltstackcheck.c` reproduces CoreCLR's fresh-process alternate-stack query
+and checks install/query/disable, fork inheritance, disabled state in new
+pthreads and after exec, preservation on failed exec, input/output aliasing,
+invalid pointers/flags, and handler placement/query/modification permissions.
+Build static musl with `-O2 -Wall -Wextra -Werror -pthread`; run without
+arguments on Linux and a private Brook VM. Require `sigaltstack_pass:true`
+and exit zero. It does not certify SS_AUTODISARM, nested signal restoration,
+or alternate stacks larger than Brook's current 32-bit size field.

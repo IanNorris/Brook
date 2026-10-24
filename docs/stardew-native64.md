@@ -158,3 +158,45 @@ intervening write next. A first bounded raw write-watch attempt did not yield
 a writer; its packet acceptance was not verified, and its timeout-side read
 used an idle CPU's CR3, so it is not evidence that no write occurred.
 No title/menu or game-launch success is claimed.
+
+## Alternate-stack lifecycle defect
+
+The verified breakpoint/watch comparison uses the same private returnPoint
+address at capture and restore: its control fields change while CoreCLR's
+signal worker runs. A verified raw hardware-watch packet was accepted, but no
+writer stop occurred before the restore fault, so this is not evidence against
+an overwrite.
+
+Source inspection identifies a concrete prerequisite failure: fresh Brook
+processes returned `ss_flags=0` with no configured alternate stack. CoreCLR's
+`EnsureSignalAlternateStack` allocates only when its query returns exactly
+`SS_DISABLE`; Brook's response skips that allocation. CoreCLR can then treat
+the handler as already on an alternate stack and switch its worker onto the
+interrupted stack, overlapping the still-live returnPoint. This overlap is a
+source-supported explanation, pending the repaired game retry.
+
+The static `sigaltstackcheck` passes Linux and fails unchanged Brook at the
+fresh-query/CoreCLR precondition. The candidate canonicalizes fresh disabled
+state, resets configuration for new shared-address-space threads and committed
+exec, preserves fork inheritance, and determines `SS_ONSTACK` from the saved
+user RSP rather than the generic handler flag. Input is safely copied before
+output, including aliased structures. Both signal paths save configured stack
+flags in ucontext and select alternate-stack entry from the interrupted RSP.
+SS_AUTODISARM remains unsupported; configurations exceeding the existing
+32-bit size field fail instead of silently truncating. Sigreturn restoration
+of user-edited uc_stack and nested-handler bookkeeping remain separate gaps.
+
+The eight-vCPU V review (kernel capsule v19) passes the full alternate-stack
+probe plus all eight FP-state and ten FP-return cases. Supported compiled
+entry, scheduler-start and scheduler-lock/wait mutation audits pass. The U
+source review completed orderly shutdown and all four offline filesystem
+checks passed before V was staged. Game startup acceptance remains separate.
+
+The first V game retry progresses past the prior CoreCLR FXRSTOR #GP. It
+handles the initial generated-code null fault and resumes to a later instruction
+in that generated function, where another null fault occurs. Brook then refuses
+handler delivery because its blanket `inSignalHandler` flag remains set; no
+rt_sigreturn occurred between the faults. CoreCLR's direct context restoration
+can bypass sigreturn, making that flag unsuitable for delivery eligibility.
+Signal-mask-based delivery and nested/nonlocal-return tests are the next step.
+No game window has been reached.
