@@ -164,11 +164,22 @@ An independent X11 paint control reveals another layer: a known green background
 reads back black on the accelerated Xwayland display, which subsequently exits
 with signal 6 after its fatal segmentation-fault report. The corresponding
 explicit rectangle control on a separate `--glamor off` Xwayland display reads
-back all 12,800 expected pixels with no X errors. The Steam retry on that
-software display is pending. The user also observed transient red top-edge
+back all 12,800 expected pixels with no X errors. The retry on that software display also completes the pool handoff but
+does not produce usable login. Its browser control window remains unmapped
+at the paired snapshot. This separates the independently reproduced graphics
+problem from the remaining startup/service problem. The user also observed transient red top-edge
 artifacts absent from approximately contemporaneous bridge images. The user
 confirms the captures were at approximately the same time; the discrepancy
 is retained as unresolved and must not be dismissed as merely a time difference. QEMU screendump
 returns `no surface` in this GL display mode, so an independent screenshot-path
 comparison remains unavailable. Neither observation establishes final scanout
 correctness or a usable Steam renderer.
+
+T finishes both client attempts, restores the pristine wrapper, drains all tracked
+groups, passes heap integrity and a checked guest sync, and its original QEMU
+owner exits zero. Serial acceptance and all four offline filesystem checks pass.
+The accelerated Xwayland crash and failed first stop command remain recorded as
+failures; neither is relabeled successful. The software client exits 137 after
+agent termination, not a normal Steam exit. The remaining bounded lead is local
+service acceptance/response, including the independently observed premature
+EAGAIN from blocking accept. There is no login acceptance yet.
