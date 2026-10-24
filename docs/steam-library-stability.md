@@ -110,6 +110,24 @@ in `UserMappingPageAccess`. The access implementation validates and reads each
 pathname byte separately, acquiring the mapping mutex for each byte. This is a
 concrete optimization lead, not a measured blocked-time fraction or proof of the
 entire download bottleneck. The longer transfer capture drops many events and
-cannot support precise timing claims. Runtime installation and game launch
-remain in progress at this checkpoint; the current data filesystem reports
-about 3.9 GiB available to the ordinary user with ample free inodes.
+cannot support precise timing claims. The game and its runtime finish installing; two launch attempts exit 125 in
+`steam-runtime-launch-client`, before any game-code crash is established. A
+separate no-op launch also returns 125 because its companion launcher service
+is missing. The diagnostic launcher is being changed to Valve's
+`srt-client-container`, which supplies that service and its handoff environment.
+The data filesystem reports about 3.9 GiB available to the ordinary user with
+ample free inodes.
+
+`AccessAt` now uses the existing fault-recovering, page-bounded C-string copier
+instead of validating every pathname byte separately. The 256-byte path limit
+and error results are retained. All 29 access checks pass on Linux and in the
+fresh native review, including readable-page crossings, protected-page faults
+and a terminating NUL immediately before an inaccessible page. The release
+build and supported entry/scheduler-start/lock-wait audits pass. This verifies
+semantics; a download throughput improvement has not yet been measured.
+
+The N review shuts down after an acknowledged final sync, and offline checks
+of all four filesystems return zero. Its original VM launcher wait returns zero;
+the outer review gate separately fails on an earlier recovered virtio-blk queue
+timeout and periodic writeback error. That incident remains a stability lead,
+even though final sync and filesystem checks succeed.

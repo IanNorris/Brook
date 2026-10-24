@@ -98,7 +98,10 @@ geometry ACK ordering, stale-size frames, NULL-buffer remap, focus/close and EOF
 isolation. A mapped native xdg toplevel keeps its native identity and retained
 pixels through helper EOF and server disconnect. A replacement generation can
 reuse XIDs/serials while rejecting delayed messages from the retired generation.
-These are host adapter controls; the corresponding native restart gate remains.
+Native review N additionally terminates the owned Xwayland server: its X
+windows disappear while the same native Mousepad window retains its identity,
+receives focus and accepts newly typed text. Replacement-server acceptance
+remains open.
 A fresh headless Xvfb control additionally exercises the real XCB
 worker: InputOnly maps, border suppression, serial association, configure,
 globally active client focus, cooperative close, reparent and XID reuse. The
@@ -112,7 +115,9 @@ moved position. Cropped captures show pupils responding to left/right pointer
 positions. Both window buttons close their X clients. Mousepad runs as a native
 Wayland client on the same compositor. The corrected compositor/worker were
 hash-verified runtime overrides in this first review; repeat fresh-boot acceptance
-with the corrected packaged launcher is still required.
+with the corrected packaged launcher succeeds in review
+`steam-client-container-o-20261024`: the service compositor starts its own
+Xwayland and worker on display `:0`, without runtime executable overrides.
 
 The same review preserves the authenticated profile and runs Steam without a
 loader audit or preload. Store renders at 1280x800; native maximize produces a
@@ -128,7 +133,7 @@ Known gaps and remaining gates:
 - Finish Steam dialogs/navigation, input-alignment and a small-download
   acceptance run through the rootless path. Initial authenticated Store,
   Library, Friends and independent movement are verified.
-- Exercise Xwayland retirement/restart with native Wayland clients present.
+- Exercise replacement-server startup after the verified native Xwayland retirement.
 - Transient identities currently affect initial placement; later parent motion,
   minimize and stacking need broader policy/acceptance. Existing native popup
   raising also groups by provider, which can include unrelated Wayland clients.

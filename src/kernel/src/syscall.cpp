@@ -6020,14 +6020,12 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
     char path[256];
-    uint32_t length = 0;
-    for (; length < sizeof(path); ++length) {
-        if (!UserBufferReadable(pathAddr + length, 1)) return -EFAULT;
-        path[length] = *reinterpret_cast<const char*>(pathAddr + length);
-        if (!path[length]) break;
-    }
-    if (length == sizeof(path)) return -36; // ENAMETOOLONG; never truncate
-    if (!length) {
+    // Copy once per page instead of acquiring the mapping mutex for every
+    // pathname byte. The shared copier recovers concurrent unmap faults and
+    // stops at page boundaries, including a NUL in the last mapped byte.
+    int pathError=CopyUserCStringResult(pathAddr,path,sizeof(path));
+    if (pathError) return pathError;
+    if (!path[0]) {
         if (!(flags & EMPTY_PATH)) return -ENOENT;
         if (dirfd != -100) {
             FdRef ref(proc, dirfd);

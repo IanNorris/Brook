@@ -86,6 +86,17 @@ int main(int argc, char **argv)
     CHECK(syscall(SYS_faccessat, directory, guard+page, F_OK), EFAULT, "unmapped pathname start");
     if (munmap(guard, page)) fatal("munmap");
 
+    char *cross = mmap(NULL, 2*page, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (cross == MAP_FAILED) fatal("mapped pathname pages");
+    char *straddling = cross+page-4;
+    memcpy(straddling, ".git/config", sizeof(".git/config"));
+    CHECK(syscall(SYS_faccessat, directory, straddling, R_OK), 0, "pathname spans two readable pages");
+    if (mprotect(cross+page, page, PROT_NONE)) fatal("protected pathname page");
+    CHECK(syscall(SYS_faccessat, directory, straddling, R_OK), EFAULT, "pathname reaches protected page");
+    cross[page-1] = 0;
+    CHECK(syscall(SYS_faccessat2, file, cross+page-1, F_OK, AT_EMPTY_PATH), 0, "NUL before protected page is sufficient");
+    if (munmap(cross, 2*page)) fatal("pathname pages cleanup");
+
     close(directory); close(file);
     if (chdir(fixture) || unlink("dangling") || unlink(".git/config") ||
         rmdir(".git") || chdir(original) || rmdir(fixture)) fatal("cleanup");
