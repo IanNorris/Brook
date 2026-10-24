@@ -3500,41 +3500,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
             }
         }
 
-        // Dynamic /etc/resolv.conf — generated from DHCP DNS server
-        if (StrEq(syntheticPath, "/etc/resolv.conf"))
-        {
-            static char resolvBuf[128];
-            auto* nif = brook::NetGetIf();
-            if (nif && nif->dns) {
-                uint32_t ip = brook::ntohl(nif->dns);
-                // Format: "nameserver X.X.X.X\n"
-                int pos = 0;
-                const char* prefix = "nameserver ";
-                for (int i = 0; prefix[i]; i++) resolvBuf[pos++] = prefix[i];
-                // Format IP
-                for (int octet = 3; octet >= 0; octet--) {
-                    uint8_t b = static_cast<uint8_t>((ip >> (octet * 8)) & 0xFF);
-                    if (b >= 100) resolvBuf[pos++] = '0' + b / 100;
-                    if (b >= 10) resolvBuf[pos++] = '0' + (b / 10) % 10;
-                    resolvBuf[pos++] = '0' + b % 10;
-                    if (octet > 0) resolvBuf[pos++] = '.';
-                }
-                resolvBuf[pos++] = '\n';
-                const char* opts = "options single-request no-aaaa\n";
-                for (int i = 0; opts[i]; i++) resolvBuf[pos++] = opts[i];
-                resolvBuf[pos] = '\0';
-            } else {
-                // Fallback: QEMU default DNS
-                const char* fb = "nameserver 10.0.2.3\noptions single-request no-aaaa\n";
-                int i = 0;
-                while (fb[i]) { resolvBuf[i] = fb[i]; i++; }
-                resolvBuf[i] = '\0';
-            }
-            int fd = FdAlloc(proc, FdType::SyntheticMem, resolvBuf);
-            if (fd < 0) return -EMFILE;
-            proc->fds[fd].seekPos = 0;
-            return fd;
-        }
+
     }
 
     // /proc/self/exe → return ENOENT for now (readlink handles it)
@@ -6089,7 +6055,7 @@ static int64_t AccessAt(int dirfd, uint64_t pathAddr, uint64_t mode, uint64_t fl
     if (result != -ENOENT && result != -1) return result;
     static const char* syntheticPaths[] = {
         "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
-        "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
+        "/etc/nsswitch.conf", "/etc/hosts",
         "/proc/version", nullptr
     };
     for (auto** sp = syntheticPaths; *sp; ++sp)
@@ -7772,7 +7738,7 @@ static int64_t do_stat_internal(const char* path, uint64_t statAddr,int dirfd=-1
         // Synthetic proc/etc files — stat should succeed for these
         static const char* syntheticPaths[] = {
             "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
-            "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
+            "/etc/nsswitch.conf", "/etc/hosts",
             "/proc/version", nullptr
         };
         bool isSynthetic = false;
@@ -7821,7 +7787,7 @@ static int64_t do_lstat_internal(const char* path, uint64_t statAddr,int dirfd=-
         // Synthetic proc/etc files
         static const char* syntheticPaths[] = {
             "/etc/passwd", "/etc/group", "/etc/shells", "/etc/hostname",
-            "/etc/nsswitch.conf", "/etc/hosts", "/etc/resolv.conf",
+            "/etc/nsswitch.conf", "/etc/hosts",
             "/proc/version", nullptr
         };
         bool isSynthetic = false;

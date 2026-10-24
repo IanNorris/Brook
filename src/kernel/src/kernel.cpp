@@ -58,6 +58,32 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 // All kernel initialization and runtime — called by KernelMain after stack switch.
 __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootProtocol);
 
+// Keep resolver reads, metadata and container binds on the same real initrd
+// file. The initrd seeds it so this only needs an existing-file write.
+static void ConfigureResolverFile()
+{
+    char text[128];unsigned length=0;
+    auto append=[&](const char* value){while(*value)text[length++]=*value++;};
+    const auto* network=brook::NetGetIf();
+    const uint32_t address=network && network->dns?brook::ntohl(network->dns):0x0a000203u;
+    append("nameserver ");
+    for(int shift=24;shift>=0;shift-=8) {
+        const unsigned octet=(address>>shift)&255;
+        if(octet>=100)text[length++]='0'+octet/100;
+        if(octet>=10)text[length++]='0'+(octet/10)%10;
+        text[length++]='0'+octet%10;
+        if(shift)text[length++]='.';
+    }
+    append("\noptions single-request no-aaaa\n");
+    auto* file=brook::VfsOpen("/etc/resolv.conf",brook::VFS_O_WRITE|brook::VFS_O_TRUNC);
+    uint64_t offset=0;
+    const int written=file?brook::VfsWrite(file,text,length,&offset):-2;
+    if(file)brook::VfsClose(file);
+    if(written!=static_cast<int>(length))
+        brook::SerialPrintf("net: resolver file update failed (%d); rebuild initrd if missing\n",written);
+    else brook::SerialPrintf("net: retained resolver configuration ready (%u bytes)\n",length);
+}
+
 // ---------------------------------------------------------------------------
 // IO Benchmark — measures sequential read throughput on a given VFS path.
 // Outputs results to serial.  Uncomment RunIOBenchmarkSuite() call in boot
@@ -760,6 +786,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             brook::DnsResolve("example.com");
         }
     }
+
+    ConfigureResolverFile();
 
     // ---- Syscall table ----
     brook::BootLogoProgress(80, "Syscalls");

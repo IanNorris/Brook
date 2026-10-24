@@ -109,6 +109,11 @@ echo "0-7" | mcopy -i "${INITRD_IMG}.tmp" - "::SYS/DEVICES/SYSTEM/CPU/ONLINE"
 # autolaunch. A deterministic ID is sufficient for Brook's single-VM
 # development images and avoids toolkit startup stalls.
 mmd -i "${INITRD_IMG}.tmp" "::ETC" 2>/dev/null || true
+# Resolver configuration must be a real retained file: container runtimes use
+# O_PATH and bind mounts, which cannot retain syscall-only synthetic contents.
+# The kernel replaces this RAM-backed seed after DHCP/static configuration.
+printf 'nameserver 10.0.2.3\noptions single-request no-aaaa\n' | \
+    mcopy -i "${INITRD_IMG}.tmp" - "::ETC/RESOLV.CONF"
 echo "0123456789abcdef0123456789abcdef" | \
     mcopy -i "${INITRD_IMG}.tmp" - "::ETC/MACHINE-ID"
 
