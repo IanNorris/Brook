@@ -187,3 +187,61 @@ not the argv vector. Therefore this run does not independently prove which
 features CEF selected, and is not accepted as ruling out shared-memory IPC.
 The original wrapper is restored; original jobs/groups/EOF, services, heap,
 serial acceptance, original owner and four offline filesystem checks pass.
+
+## Verified feature switches after live cmdline support
+
+Review `steam-mapped-growth-off-gpu-1ms-fixed-mlfq-j-20261023` repeats the
+feature-off control on the live-cmdline kernel, with a fresh boot/profile,
+16 GiB RAM, unrestricted byte quotas, and no application preload. The live
+browser argument audit passes, and the lifetime capture also observes a utility
+child carrying both disabled-feature tokens. This verifies argument delivery;
+it does not independently inspect the selected transport implementation.
+
+Steam still shows a black Xwayland surface instead of login. Across 181 shared
+memory samples, peak logical bytes reach 1,365,263,200, charged bytes reach
+2,755,887,104, and 52 files have the recurring 26,214,416-byte pool size.
+Two child connection timeout messages and two network-service restart locations
+are counted. The persistent-allocator corruption warning is absent from this
+run, so it is not a necessary accompanying symptom of the login failure.
+
+The agent stops Steam after observation; exit 137 is deliberate, not an OOM or
+spontaneous crash. Original groups drain, the wrapper is restored, services exit
+normally, heap integrity passes, and completed metadata sync precedes QMP quit.
+The original VM owner exits zero; serial acceptance and all four offline
+filesystem checks pass. An earlier attempt, I, exited before guest boot because
+SDL selected an unavailable host display backend and contributes no Steam data.
+
+Astra's independent review identifies two remaining discriminators: a verified
+longer child connection watchdog, then matched Linux/Brook readiness and socket
+backpressure metadata. Existing probes omit `send()` and readiness calls,
+suppress EAGAIN/EINPROGRESS, and share limited success budgets across numeric
+FD reuse. Their healthy early exchanges cannot establish complete channel
+progress. The source-visible epoll open-file-identity gap remains a hypothesis
+until relevant Steam descriptor choreography is observed.
+
+The next fresh-boot control, K, retains default Mojo feature arguments and adds
+only `--ipc-connection-timeout=60`. The complete token is verified in both the
+browser and a live utility child, with no application preload. This child keeps
+the same PID/incarnation and is observed alive from guest monotonic 112.839 s to
+365.127 s, yet no `EnsureConnected()` message appears. Steam still has a black
+surface and no login. Therefore this is not evidence of a completed handshake,
+nor a confirmed change from a 15-second to 60-second executed callback: the
+vendor behavior, watchdog installation and event-loop progress remain unproven.
+
+The original 181-sample memory capture reaches 55 recurring pools,
+1,447,787,056 logical bytes and 2,919,608,320 charged bytes. One allocator warning
+appears. Pool growth thus occurs before a logged connection watchdog or observed
+utility restart; repeated utility restarts alone do not explain it. After the
+bounded deadline observation, a distinct five-second built-in epoll-counter
+phase captures activity in browser tasks. Its counters only cover calls started
+while enabled and cannot exclude older blocked waits in other tasks. The next
+useful comparison needs socket backpressure/readiness metadata on both Linux
+and Brook, without interpreting absent probe samples as absent operations.
+
+K cleanup initially finds eight live descendants after the Steam leader exits
+zero on the agent's stop request. The remaining utility is identified by its
+procfs incarnation and executable, then exits on a targeted SIGTERM; no SIGKILL
+is needed for that utility. The original job subsequently reports zero live
+descendants and both EOF receipts. The wrapper is restored, services exit
+normally, heap integrity and metadata sync pass, the original VM owner exits
+zero, and final serial acceptance plus all four offline filesystem checks pass.
