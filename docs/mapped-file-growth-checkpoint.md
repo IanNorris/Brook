@@ -245,3 +245,28 @@ is needed for that utility. The original job subsequently reports zero live
 descendants and both EOF receipts. The wrapper is restored, services exit
 normally, heap integrity and metadata sync pass, the original VM owner exits
 zero, and final serial acceptance plus all four offline filesystem checks pass.
+
+## Probed Linux control at matching memory capacity
+
+An isolated Linux reference uses 16 GiB and eight vCPUs, the same staged Steam
+version and the v7 probe source with only its output path changed. A private
+root-image copy, guest-only display and loopback key-authenticated SSH keep this
+separate from the host desktop. The instrumented client reaches a visible QR
+login screen. This is Linux evidence, not a Brook login result.
+
+Its captured shared-memory footprint is 58,414,784 logical bytes, with only two
+26,214,416-byte pools. The complete captured CEF log has zero allocator warnings
+and zero child connection timeouts. The metadata capture contains 1,112 events,
+826 IPC events, no unexpected captured IPC errors, no ancillary truncation and
+no observed peer-credential check. Thirteen direct CEF operation/flag/control
+shapes overlap the failing Brook F capture; Linux adds a successful sendmsg with
+24 control bytes. That difference is not a demonstrated cause: call sampling is
+bounded, readiness and EAGAIN remain omitted, and F's second phase retains old
+shared files. Distribution/runtime services also differ. No payload-level
+correctness or syscall equivalence is inferred from these overlapping shapes.
+
+The owned transient Steam service stops successfully with its cgroup, its
+wrapper is restored, guest sync completes, and QMP requests system powerdown.
+The original Linux QEMU owner exits zero without reaching its timeout.
+The Linux serial log confirms powerdown, and the read-only offline filesystem
+check exits zero; the reference acceptance report is accepted.
