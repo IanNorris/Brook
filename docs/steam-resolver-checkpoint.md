@@ -397,3 +397,20 @@ and `build/reviews/steam-inet-metadata-login-i-20261024`. Steam QR readiness is
 still a separate acceptance gate. New log classifications use per-file
 prelaunch inode/size baselines; independent word counts do not establish DNS
 failures or identify whether a WebSocket is local IPC or a remote CM transport.
+
+The native metadata candidate additionally fetches the public unauthenticated
+CM directory (HTTP 200, 36 server entries) and completes three fresh remote
+WebSocket upgrades on whitelisted Valve CM hosts. Each returns HTTP 101 with
+the correct accept value for an independently generated control key. Only
+numeric statuses, counts, timing and an accept-match boolean are exported.
+These are synthetic transport controls, not the proprietary client's requests
+and not an authentication result. Its subsequent native Steam retry still
+shows the blurred QR refresh placeholder. The next comparison must follow the
+actual client's remote connect/readiness/SO_ERROR and send/receive timing;
+working generic network controls do not prove that path correct.
+
+The final metadata review drains its tracked command groups and confirms no
+remaining owned Steam leaders. Heap integrity, checked guest sync, original
+QEMU-owner exit zero and all four offline filesystem checks pass. The code and
+portable regression are pushed on `wip/steam-login-20261022`; authentication
+readiness and intermittent red bars remain open.
