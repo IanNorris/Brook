@@ -129,9 +129,10 @@ static inline void SchedLockWaitForTicket(SchedLock& lock,uint32_t ticket,const 
         __asm__ volatile("pause" ::: "memory");
         if (++spins > SCHEDLOCK_TIMEOUT_SPINS)
         {
-            // Deadlock detected. Re-enable interrupts for serial output.
-            __asm__ volatile("sti" ::: "memory");
-            // Use direct serial write to avoid any lock dependencies
+            // Keep IF=0: a timer interrupt here would reserve another scheduler
+            // ticket on this stack while the original wait is unresolved.
+            // SerialPrintf polls the UART and preserves IF; its serial lock is
+            // still a dependency, so this does not guarantee panic delivery.
             SerialPrintf("\n*** SCHEDLOCK DEADLOCK: %s waiting for ticket %u, "
                          "serving %u (spun %llu times) ***\n",
                          caller, ticket,

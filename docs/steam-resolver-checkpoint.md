@@ -40,6 +40,16 @@ seconds before the repair. The complete runtime job exits 0 with all tasks
 drained and both streams at EOF. This verifies the runtime DNS repair; full
 Steam login remains a separate acceptance gate.
 
+The full retry still reaches Unexpected Transport Error. Its network helper
+now records successful non-loopback receives, while the sampled main process
+records 767 successful Unix peer-name queries. A two-second profile captures
+1,594 CPU samples and 11,619 context switches without reported drops; sampled
+execution is predominantly idle. This supports investigating waits rather than
+CPU saturation, subject to the profiler's IRQ-masked sampling limitation.
+The run drains all tracked groups, restores its wrapper, passes heap integrity
+and checked sync, and exits through the original QEMU owner with all four
+offline filesystem checks clean.
+
 ## Preserved failure evidence
 
 The earlier full Steam run eventually double-faults below PID 122's kernel
@@ -47,8 +57,16 @@ stack. The saved stack contains many repeated scheduler-lock and LAPIC timer
 return addresses. The lock timeout diagnostic enables interrupts before panic;
 Astra's source review confirms that this can permit recursive timer entry while
 waiting for the scheduler ticket. It does not identify the initiating lock
-stall. Removing that interrupt enable and adding a focused compiled regression
-remain a separate necessary safety follow-up.
+stall. The timeout path now leaves interrupts disabled. Serial output polls the
+UART, but still has its own lock dependency; reliable panic delivery and the
+original lock stall are not claimed fixed.
+
+`scripts/audit_scheduler_lock_wait.py` inspects every emitted ticket-wait body,
+rejects interrupt-restoring instructions and fails if no body is found. It
+rejects the preserved old kernel's `STI`; the rebuilt kernel passes, as do
+inserted-STI and missing-body rejection mutations and both existing compiled
+entry/scheduler-start audits. This is a focused compiled property check, not a
+general scheduler-safety proof or a live forced-deadlock acceptance test.
 
 That halted VM's registers, bounded kernel stack, logs and private disks are
 preserved. No clean sync was possible. Post-stop checks report errors on its
