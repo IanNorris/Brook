@@ -1,6 +1,7 @@
 // Actual resource retirement body; caller holds GpuCmdGuard.
 static int32_t AppRetireResourceLocked(int32_t ctxId,int32_t gres)
 {
+    if(!AppDetachSharedResourceLocked(ctxId,static_cast<uint32_t>(gres)))return -1;
     if (auto* blob=AppBlobFind(ctxId,static_cast<uint32_t>(gres))) return AppRetireBlobLocked(blob);
     if (g_controlQueuePoisoned || !AppCtxFind(ctxId) || !AppResValid(ctxId,static_cast<uint32_t>(gres))) return -1;
     AppUpload* upload = nullptr;
@@ -43,4 +44,3 @@ static int32_t AppRetireResource(int32_t ctxId,int32_t gres)
     GpuCmdGuard guard;
     return AppRetireResourceLocked(ctxId, gres);
 }
-

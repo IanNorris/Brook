@@ -121,6 +121,12 @@ struct GpuAppOps {
     // owns its canonical lease and has verified the current producer WRITE
     // fence. Immutable layout; never CPU-map a device-local allocation.
     int32_t (*PrepareBlobImage)(int32_t ctxId,uint32_t resource,const BrookDmabufLayout& layout);
+
+    // Attach a canonical legacy VirGL resource to another application context.
+    // The caller retains its PRIME/resource lease throughout publication. The
+    // driver tracks importer incarnations and synchronizes every sharing
+    // context's submissions, transfers and final detach. Not a blob import.
+    int32_t (*ImportResource)(int32_t destination,int32_t creator,uint32_t resource);
 };
 
 // Register the app-GPU ops (called by the display driver once its 3D path is

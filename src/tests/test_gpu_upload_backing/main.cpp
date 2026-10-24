@@ -76,6 +76,10 @@ static Caps AppCapabilities(){return {2};}
 static bool CtxCreate(uint32_t,unsigned){return advance(11);}
 #include "../../drivers/virtio_gpu/app_ctx_create.inc"
 #include "../../drivers/virtio_gpu/app_buffer_upload.inc"
+// This fixture has no imported resources; their real registry is exercised by
+// test_gpu_shared_contexts, independently of upload ownership fault injection.
+static bool AppDetachSharedResourceLocked(int32_t,uint32_t){return true;}
+static bool AppReleaseSharedContextLocked(int32_t){return true;}
 #include "../../drivers/virtio_gpu/app_retire_resource.inc"
 #include "../../drivers/virtio_gpu/app_ctx_destroy.inc"
 static void reset(){

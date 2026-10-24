@@ -2533,9 +2533,10 @@ static AppCtx* AppCtxFind(int32_t ctxId)
 }
 
 static int32_t AppRetireResourceLocked(int32_t ctxId, int32_t gres);
+static bool AppFenceLocked(uint32_t ctxId);
+#include "shared_contexts.inc"
 #include "app_ctx_destroy.inc"
 
-static bool AppFenceLocked(uint32_t ctxId);
 
 // HOST3D blobs have host aperture backing, never PMM frames or guest IOVs.
 struct AppBlob {
@@ -2721,40 +2722,7 @@ static int32_t AppResourceAttachUser(int32_t ctxId, int32_t gres,
 // SET_VERTEX_BUFFERS command) or <0. Retirement releases backing before ctx destroy.
 #include "app_buffer_upload.inc"
 
-static int32_t AppSubmit3D(int32_t ctxId, const uint32_t* dwords, uint32_t n)
-{
-    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
-    AppCtx* c = AppCtxFind(ctxId);
-    if (!c || c->config.capsetId == VIRTIO_GPU_CAPSET_VENUS || !dwords || n == 0) return -1;
-    // Bound the stream to the request region (last page is the response buffer).
-    const uint32_t maxDw = ((CMD_PAGES - 1) * 4096 - sizeof(VirtioGpuCmdSubmit)) / 4;
-    if (!VirglStreamValid(dwords, n, maxDw)) return -1;
-    auto* sub = reinterpret_cast<VirtioGpuCmdSubmit*>(g_cmdBuf + CMD_REQ_OFF);
-    uint32_t* dst = reinterpret_cast<uint32_t*>(g_cmdBuf + CMD_REQ_OFF + sizeof(VirtioGpuCmdSubmit));
-    for (uint32_t start = 0; start < n;) {
-        uint32_t end = VirglChunkEnd(dwords, n, start, maxDw);
-        if (end == start) return -1;
-        uint32_t count = end - start;
-        memset(sub, 0, sizeof(*sub));
-        sub->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
-        sub->hdr.ctx_id = (uint32_t)ctxId;
-        for (uint32_t i = 0; i < count; ++i) dst[i] = dwords[start + i];
-        sub->size = count * 4;
-        if (!CmdRespOk(SubmitCommand(sizeof(*sub) + count * 4, CMD_RESP_CAP))) {
-            SerialPrintf("virtio_gpu: AppSubmit3D FAILED ctx=%d ndw=%u offset=%u firstcmd=0x%x\n",
-                         ctxId, count, start, dwords[start]);
-            return -1;
-        }
-        start = end;
-    }
-    // Mesa treats NOWAIT errors other than EBUSY as idle. For this initial
-    // host-backed GL path, complete work synchronously instead of claiming an
-    // untracked asynchronous blob is idle. Guest-backed GL stays unchanged.
-    for (const auto& blob:g_appBlobs)
-        if (blob.used && blob.context==ctxId)
-            return AppFenceLocked(static_cast<uint32_t>(ctxId)) ? 0 : -1;
-    return 0;
-}
+#include "app_submit3d.inc"
 
 // Reconstructed BRO-232: a fenced empty submit flushes this app's GL context.
 // QEMU defers used-ring completion until the host GPU signals the fence.
@@ -2920,6 +2888,8 @@ static brook::GpuCaptureResult CompCaptureExternal(GpuTexId id,int32_t producer,
     const auto* context=AppCtxFind(producer);
     auto* blob=AppBlobFind(producer,source);
     const bool venus=context->config.capsetId==VIRTIO_GPU_CAPSET_VENUS;
+    bool shared=false;
+    if(!venus && !AppPrepareSharedUseLocked(producer,shared))return brook::GpuCaptureResult::Rejected;
     if(venus && (!blob || !blob->imagePrepared || blob->quarantined ||
         blob->imageLayout.width!=w || blob->imageLayout.height!=h))return GpuCaptureResult::Rejected;
     const bool completed=brook::GpuCaptureSequence([&](brook::GpuCaptureStep step) {
@@ -2938,6 +2908,7 @@ static brook::GpuCaptureResult CompCaptureExternal(GpuTexId id,int32_t producer,
         return false;
     });
     if (!completed) {
+        if(!venus)AppSharedFailureLocked(producer);
         // A partly completed copy cannot replace an old retained frame. This
         // handle is no longer usable, and the caller must retain its source.
         texture->quarantined=true;
@@ -3077,32 +3048,7 @@ static GpuCaptureResult CompComposeOwnedLayers(GpuTexId destination,
     return GpuCaptureResult::Complete;
 }
 
-static int32_t AppTransfer3D(int32_t ctxId, int32_t gres, int dir,
-                             const brook::GpuTransfer3D& transfer)
-{
-    GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
-    AppCtx* c = AppCtxFind(ctxId);
-    if (!c || !AppResValid(ctxId, (uint32_t)gres) || dir < 0 || dir > 1 ||
-        !transfer.w || !transfer.h || !transfer.d) return -1;
-    auto* req = reinterpret_cast<VirtioGpuTransferHost3D*>(g_cmdBuf + CMD_REQ_OFF);
-    memset(req, 0, sizeof(*req));
-    req->hdr.type = dir == 0 ? VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D
-                             : VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
-    req->hdr.ctx_id = (uint32_t)ctxId;
-    req->resource_id = (uint32_t)gres;
-    req->box = {transfer.x,transfer.y,transfer.z,transfer.w,transfer.h,transfer.d};
-    req->offset = transfer.offset;
-    req->level = transfer.level;
-    req->stride = transfer.stride;
-    req->layer_stride = transfer.layerStride;
-    bool ok = CmdRespOk(SubmitCommand(sizeof(*req), CMD_RESP_CAP));
-    if (!ok)
-        SerialPrintf("virtio_gpu: AppTransfer3D FAILED ctx=%d gres=%u dir=%d box=%u,%u,%u+%u,%u,%u level=%u offset=%lu stride=%u layer=%u\n",
-                     ctxId, (uint32_t)gres, dir, transfer.x,transfer.y,transfer.z,
-                     transfer.w,transfer.h,transfer.d,transfer.level,transfer.offset,
-                     transfer.stride,transfer.layerStride);
-    return ok ? 0 : -1;
-}
+#include "app_transfer3d.inc"
 
 static const brook::GpuAppOps g_gpuAppOps = {
     "virtio-gpu-app",
@@ -3121,6 +3067,7 @@ static const brook::GpuAppOps g_gpuAppOps = {
     AppSubmitVenus,
     AppBlobStatistics,
     AppPrepareBlobImage,
+    AppImportResource,
 };
 
 static const brook::GpuCompositorOps g_gpuCompositorOps = {

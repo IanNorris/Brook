@@ -3,6 +3,10 @@
 Steam login is not yet accepted. Testing stock X11 drawing separately from
 Steam exposes a smaller cross-context graphics failure.
 
+The subsequent [PRIME context repair](steam-prime-contexts.md) fixes the
+illegal-resource/whole-window-blackening regression; presentation and the
+later fence-memory crash are still under investigation.
+
 ## Reusable guest helpers
 
 Install stock `xeyes` and its closure using the normal guest package installer.

@@ -6682,11 +6682,20 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
         if (!UserBufferReadable(eb.command, eb.size)) return -EFAULT;
         const brook::GpuAppOps* ga = brook::GpuAppGet();
         if (!ga || !ga->Submit3D) return -ENODEV;
+        if(eb.num_bo_handles>DRM_MAX_GEM)return -EINVAL;
+        // Snapshot and validate the entire BO list before publishing any GPU
+        // command. The pinned DRM file + mappingLock retain these canonical
+        // GEM references until the driver's shared completion fence returns.
+        struct HandleSnapshot { uint32_t* data; ~HandleSnapshot(){kfree(data);} }
+            handles{eb.num_bo_handles?static_cast<uint32_t*>(kmalloc(eb.num_bo_handles*sizeof(uint32_t))):nullptr};
+        if(eb.num_bo_handles && !handles.data)return -ENOMEM;
+        if(eb.num_bo_handles && !CopyFromUser(handles.data,eb.bo_handles,eb.num_bo_handles*sizeof(uint32_t)))return -EFAULT;
+        for(uint32_t i=0;i<eb.num_bo_handles;++i)
+            if(!DrmGemGet(dctx,handles.data[i]))return -ENOENT;
         uint32_t nDw = eb.size / 4;
         auto* cmd = static_cast<uint32_t*>(kmalloc(eb.size));
         if (!cmd) return -ENOMEM;
-        for (uint32_t i = 0; i < nDw; ++i)
-            cmd[i] = reinterpret_cast<const uint32_t*>(eb.command)[i];
+        if(!CopyFromUser(cmd,eb.command,eb.size)) {kfree(cmd);return -EFAULT;}
         int32_t r = ga->Submit3D(dctx->owner->ctxId, cmd, nDw);
         kfree(cmd);
         if (r < 0) return -EIO;
@@ -6782,6 +6791,18 @@ static int64_t DrmRenderIoctl(DrmCtx* dctx, uint8_t nr, uint64_t arg)
                 return CopyToUser(arg, &ph, sizeof(ph)) ? 0 : -EFAULT;
             }
         }
+        // This bounded import path supports legacy VirGL textures/buffers.
+        // A VirGL fence does not certify a Venus queue or host-blob lifetime.
+        if(p->resource->hostBlob || p->resource->owner->config.capsetId==4 ||
+           dctx->owner->config.capsetId==4)return -95;
+        const auto* ga=GpuAppGet();
+        if(!ga || !ga->ImportResource || !ga->CtxCreate)return -ENODEV;
+        if(dctx->owner->ctxId<=0) {
+            const int32_t context=ga->CtxCreate(proc->pid,dctx->owner->config);
+            if(context<0)return -ENOMEM;
+            dctx->owner->ctxId=context;
+        }
+        if(ga->ImportResource(dctx->owner->ctxId,p->resource->owner->ctxId,p->resource->gres)<0)return -EIO;
         uint32_t bo = DrmGemAllocImported(dctx,p->resource);
         if (bo == 0) return -ENOMEM;
         ph.handle = bo;

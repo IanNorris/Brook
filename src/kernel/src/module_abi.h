@@ -73,7 +73,8 @@ namespace brook {
 // ABI 48 appends backend canonical-page quota hooks to FileObject.
 // ABI 49 adds per-thread robust-futex registration and deferred exit state.
 // ABI 50 adds optional packet-boundary metadata to PipeBuffer.
-static constexpr uint32_t MODULE_ABI_VERSION = 50;
+// ABI 51 appends tracked legacy VirGL cross-context resource import.
+static constexpr uint32_t MODULE_ABI_VERSION = 51;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

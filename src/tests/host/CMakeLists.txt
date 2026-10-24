@@ -536,3 +536,5 @@ target_compile_options(test_tmpfs PRIVATE -Wall -Wextra -Werror -Wno-unused-func
 target_link_options(test_tmpfs PRIVATE -Wl,--gc-sections)
 add_test(NAME test_tmpfs COMMAND test_tmpfs)
 set_tests_properties(test_tmpfs PROPERTIES TIMEOUT 60)
+
+add_host_test(test_gpu_shared_contexts)

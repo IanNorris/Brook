@@ -4,6 +4,10 @@ static void AppCtxDestroy(int32_t ctxId)
     GpuCmdGuard _gcg;  // BRO-189: serialize control-queue submits
     AppCtx* c = AppCtxFind(ctxId);
     if (!c) return;
+    if(!AppReleaseSharedContextLocked(ctxId)) {
+        SerialPrintf("virtio_gpu: app ctx %d import detach unverified; retained\n",ctxId);
+        return;
+    }
     for (auto& upload : g_appUploads) {
         if (!upload.used || upload.ctxId != ctxId) continue;
         if (upload.incarnation != c->incarnation || upload.quarantined ||
@@ -23,4 +27,3 @@ static void AppCtxDestroy(int32_t ctxId)
     c->used = false;
     SerialPrintf("virtio_gpu: app virgl ctx %d destroyed\n", ctxId);
 }
-
