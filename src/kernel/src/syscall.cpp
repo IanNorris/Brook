@@ -12540,6 +12540,12 @@ static int64_t sys_pread64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 static int64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
                           uint64_t arg4, uint64_t arg5, uint64_t)
 {
+    if(option==36 || option==37) { // PR_SET/GET_CHILD_SUBREAPER
+        const int result=SchedulerChildSubreaperControl(ProcessCurrent(),option==36,arg2!=0);
+        if(result<0)return result;
+        if(option==36)return 0;
+        return CopyToUser(arg2,&result,sizeof(result))?0:-EFAULT;
+    }
     if (option == 38) { // PR_SET_NO_NEW_PRIVS
         if (arg2 != 1 || arg3 || arg4 || arg5) return -EINVAL;
         auto* proc = ProcessCurrent();

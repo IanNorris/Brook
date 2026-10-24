@@ -16,8 +16,8 @@ constexpr unsigned MAX_PROCESSES=1024;
 enum class ProcessState {Running,Stopped,Terminated};
 struct SignalInfo {int32_t si_signo,si_errno,si_code,pad;uint8_t _data[112];};
 struct Process {
-    uint32_t pid,tgid,uid=1000;bool isThread=false;uint64_t leaderIncarnation=1;uint64_t incarnation=1,sigPending=0,sigMask=0,wakeupTick=0;
-    bool terminalPending=false,continuedPending=false;int waitStatus=0,stopSignal=0;
+    uint32_t pid,tgid,uid=1000;uint16_t parentPid=0;bool isThread=false;uint64_t leaderIncarnation=1;uint64_t incarnation=1,sigPending=0,sigMask=0,wakeupTick=0;
+    bool terminalPending=false,continuedPending=false,tgidExiting=false;int waitStatus=0,stopSignal=0;
     ProcessState state=ProcessState::Running;Process* threadLeader=nullptr;
     struct Sender{int32_t pid;uint32_t uid;int32_t code;} sigSenders[64]{};
     std::atomic<unsigned> regions{0};std::mutex mutex;std::condition_variable cv;bool wake=false;
@@ -48,6 +48,9 @@ static void RuntimeChargeLocked(uint32_t,uint64_t){}
 static unsigned releasedMembership=0;
 static void ReleaseThreadAddressSpaceLocked(Process*){++releasedMembership;}
 static struct {void Rebind(uint32_t,uint64_t,uint32_t,uint64_t){}} g_runtime;
+static Process* g_allProcesses[MAX_PROCESSES]{};
+static uint32_t g_processCount=0;
+#include "../../kernel/src/scheduler_subreaper.inc"
 #include "../../kernel/src/scheduler_exec_identity.inc"
 #include "../../kernel/src/signal_fd_service.inc"
 }
@@ -56,6 +59,42 @@ using namespace brook;
 static void send(Process& p,int signo,int sender=99){SignalInfo info{};info.si_signo=signo;info.si_code=0;std::memcpy(info._data,&sender,4);uint32_t uid=123;std::memcpy(info._data+4,&uid,4);QueueSignal(&p,signo,&info);wake(p);}
 static int64_t read(Process& p,SignalFd* fd,SignalFdInfo* out,unsigned count=1,bool nonblock=true){return SignalFdRead(&p,fd,reinterpret_cast<uint64_t>(out),uint64_t(count)*128,nonblock);}
 int main(){
+    {
+        Process reaper(101),dying(102),thread(103),child(104),execing(105),pending(106);
+        reaper.incarnation=500;reaper.tgidExiting=true; // exec birth latch, not death
+        dying.parentPid=101;dying.state=ProcessState::Terminated;
+        thread.tgid=101;thread.isThread=true;thread.leaderIncarnation=499;
+        thread.parentPid=999; // a stale member cannot supply canonical ancestry
+        g_allProcesses[0]=&reaper;g_allProcesses[1]=&dying;g_allProcesses[2]=&thread;g_processCount=3;
+        CHECK(!SchedulerChildSubreaperControl(&reaper,true,true));
+        CHECK(FindChildSubreaperLocked(102)==101);
+        reaper.state=ProcessState::Terminated;thread.leaderIncarnation=500;
+        CHECK(FindChildSubreaperLocked(102)==101); // surviving sibling is enough
+        thread.state=ProcessState::Terminated;
+        CHECK(FindChildSubreaperLocked(102)==0);
+        reaper.state=ProcessState::Running;
+        child.parentPid=101;
+        execing.tgid=101;execing.isThread=true;execing.leaderIncarnation=500;
+        g_allProcesses[3]=&child;g_allProcesses[4]=&execing;g_processCount=5;
+        SchedulerCommitExecThreadIdentity(&execing);
+        CHECK(execing.tgid==105 && child.parentPid==101);
+        CHECK(SchedulerChildSubreaperControl(&reaper,false,false)==1);
+        CHECK(SchedulerChildSubreaperControl(&execing,false,false)==1);
+        Process last(107);last.tgid=101;last.isThread=true;last.leaderIncarnation=500;
+        pending.tgid=101;pending.isThread=true;pending.leaderIncarnation=500;pending.terminalPending=true;
+        reaper.state=ProcessState::Terminated;
+        g_allProcesses[5]=&pending;g_allProcesses[6]=&last;g_processCount=7;
+        TransferChildSubreaperExecLocked(&last);
+        CHECK(child.parentPid==101); // pending is still a live old-group peer
+        pending.state=ProcessState::Terminated;
+        SchedulerCommitExecThreadIdentity(&last);
+        CHECK(child.parentPid==107 && last.tgid==107);
+        CHECK(SchedulerChildSubreaperControl(&last,false,false)==1);
+        g_childSubreapers[101]={500,true};
+        Process reused(101);reused.incarnation=501;g_allProcesses[0]=&reused;
+        CHECK(SchedulerChildSubreaperControl(&reused,false,false)==0);
+        g_processCount=0;releasedMembership=0;
+    }
     Process parent(1),child(2);parent.sigMask=~uint64_t{0};child.sigMask=parent.sigMask;
     auto* fd=SignalFdCreate(~uint64_t{0});CHECK(fd && !(fd->mask&(1ULL<<8)) && !(fd->mask&(1ULL<<18)));
     SignalFdInfo info[2]{};CHECK(read(parent,fd,info)==-11);CHECK(SignalFdRead(&parent,fd,0,127,true)==-22);

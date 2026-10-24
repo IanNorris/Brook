@@ -244,3 +244,68 @@ so subsequent game tests use a separate empty HOME/XDG tree. A private hash and
 metadata inventory of the original saves is retained for before/after checks;
 no existing save is loaded. The direct diagnostic must also match the installed
 Mesa GLX vendor path already included by the Steam launcher.
+
+With the installed Mesa GLX vendor directory in its loader path, X reaches
+Stardew's title menu and a mouse click opens the empty acceptance home's
+`No Saved Games Found` screen. A separate SDL/OpenGL control creates a 640x360
+window and reports matching logical/drawable sizes and initial viewport with
+Mesa 4.6 compatibility rendering. The game initially draws a desktop-sized
+menu into a smaller window; maximizing improves visibility but the lower edge
+remains clipped. Escape navigation was not observed. These presentation/input
+limits remain open, rather than being counted as full gameplay acceptance.
+The native title-bar close ends the game with status137, not clean exit; an
+in-game Exit-button test is still required. Original-save content hashes and
+timestamps remain unchanged for all 33 files after the first title trial.
+No through-Steam game-launch success is claimed.
+
+The Exit-menu trial also ends with signal9. A scoped process trace attributes
+this to the game itself calling `kill(getpid(), SIGKILL)`; the synthetic control
+for nonleader `exit_group(37)` exits37 on both Linux and Brook. Thus signal9
+is not, by itself, evidence that Brook forcibly closed a normally exiting game.
+The game-initiated exit drains the tracked group completely. Full startup
+strace heavily delays this workload; reducing it to process calls allows it to
+reach its window again. Original-save hashes and timestamps remain identical
+after all X trials.
+
+## Native64 Steam reaper prerequisite (candidate)
+
+The public 64-bit reaper needs real PR_SET/GET_CHILD_SUBREAPER semantics, rather
+than the prior success stub. The candidate stores settings per group incarnation
+under the scheduler registry lock: threads share, fork starts clear, exec
+preserves. Final group death adopts live and zombie child groups into the nearest
+live ancestor subreaper, with existing SIGCHLD/waitability/robust-exit gates.
+The reaper fallback must not bypass adoption. User copies occur outside locks.
+
+Review identified three important cases: exec's thread-birth latch does not mean
+the surviving subreaper is dead; ancestry must come from the canonical retained
+leader instead of an arbitrary copied thread; thread publication refreshes its
+parent after concurrent reparenting. Nonleader exec currently detaches in Brook
+rather than performing Linux de_thread/PID preservation. The bounded candidate
+keeps children and the setting with any surviving old-group peers, copies the
+setting to the detached exec process, and transfers ownership only when that
+process is the final live member. This prevents a new ownership regression but
+does not claim to repair Brook's pre-existing nonleader-exec ABI difference.
+
+The static `subreapercheck` passes Linux: actual GET output, EFAULT, nonzero SET
+and ignored unused arguments, sibling sharing, fork-clear/exec-preserve, twelve
+running/zombie adoption rounds with exit status, nearest/cleared ancestor and
+SIGCHLD. Unchanged X fails the initial GET-write check, independently confirming
+the stub. Production-code host fixtures cover exec-latch eligibility, stale
+member exclusion, PID reuse, live-old-group retention, final-member transfer
+and ancestry refresh at publication. Native candidate acceptance is pending.
+
+Y (capsule v22) passes the complete native subreaper control, including running
+and zombie adoption while the original leader is dead and a sibling survives.
+The actual unmodified public 64-bit reaper also passes two pipe-controlled
+orphan tests on Linux and Brook: it remains alive while an adopted grandchild
+is blocked, then propagates grandchild success or failure after release. All
+nested/alternate-stack and 18 FP-state/return cases pass again on Y. All 108
+host tests pass with assertions active in Release, along with compiled-entry
+and scheduler mutation audits. General SIGCHLD is observed; the public probe
+does not independently isolate the already-zombie adoption notification from
+other coalescing SIGCHLD events.
+
+The fresh Release build exposed disabled assertions in host fixtures, leading
+to unused-variable errors and potentially removed fixture operations. Host
+tests now centrally undefine NDEBUG so their assertions run in every build
+type. This corrects test execution, not production-kernel assertion policy.

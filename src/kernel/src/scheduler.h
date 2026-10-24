@@ -72,6 +72,7 @@ void KernelThreadTrampoline();
 [[noreturn]] void SchedulerExitCurrentProcess(int status, int terminationSignal = 0);
 void SchedulerKillThreadGroup(uint16_t tgid, Process* caller, int exitStatus,
                               int terminationSignal = 0);
+int SchedulerChildSubreaperControl(Process* proc,bool set,bool enabled);
 // Serialize terminal state publication against block/wake/dispatch transitions.
 // Enter before taking a sleeping-lock guard; leave after releasing it. Entry
 // and fatal-state publication are serialized by readyLock, never a lock guard.

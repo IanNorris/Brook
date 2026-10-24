@@ -62,10 +62,13 @@ void SchedulerAddProcess(Process* proc)
     if (proc->isThread && !proc->isKernelThread)
     {
         Process* ldr = proc->threadLeader;
-        if (ldr && ldr->magic == PROCESS_MAGIC
-            && __atomic_load_n(&ldr->tgidExiting, __ATOMIC_ACQUIRE))
+        if (ldr && ldr->magic == PROCESS_MAGIC && ldr->pid==proc->tgid &&
+            ldr->incarnation==proc->leaderIncarnation)
         {
-            stillborn = true;
+            // Reparenting may have happened after CopyParentProcess but
+            // before publication. Refresh ancestry in the same registry lock.
+            proc->parentPid=ldr->parentPid;
+            if(__atomic_load_n(&ldr->tgidExiting, __ATOMIC_ACQUIRE))stillborn = true;
         }
     }
     if (stillborn)
@@ -127,4 +130,3 @@ void SchedulerAddProcess(Process* proc)
 
     KickIdleCpu();
 }
-

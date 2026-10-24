@@ -993,3 +993,18 @@ Build static musl with `-O2 -Wall -Wextra -Werror`; run without arguments in
 a disposable Linux/Brook environment and require `signal_nested_pass:true`,
 five cases and exit zero. The intentional fatal children must be reaped; retain
 the original guest job until it and all descendants have drained.
+
+`subreapercheck.c` verifies PR_SET/GET_CHILD_SUBREAPER, EFAULT for a bad GET
+pointer, nonzero settings and ignored unused arguments, shared pthread state,
+fork reset, exec preservation, running/zombie adoption and wait status across
+twelve rounds, nearest/cleared nested subreapers and SIGCHLD. Build static musl
+with `-O2 -Wall -Wextra -Werror -pthread`; require `subreaper_pass:true` and
+exit zero on Linux and a disposable Brook VM. It does not establish Linux
+nonleader-exec PID identity or namespace-init behavior.
+
+`reapercheck.c` takes the real public native64 reaper executable as its only
+argument. A pipe-controlled orphan grandchild confirms that the helper remains
+alive after its direct child exits, then propagates grandchild success/failure.
+Build static musl with `-O2 -Wall -Wextra -Werror`; require `reaper_pass:true`,
+two cases and exit zero. The subreaper control also covers a raw-exited leader
+whose surviving worker must retain the group's adoption/wait responsibilities.

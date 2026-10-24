@@ -7,6 +7,7 @@ void SchedulerCommitExecThreadIdentity(Process* proc)
     const uint32_t cpu=ThisCpu();
     RuntimeChargeLocked(cpu,RuntimeNow(cpu));
     const uint64_t allFlags=SchedLockAcquire(g_allProcLock);
+    TransferChildSubreaperExecLocked(proc);
     ReleaseThreadAddressSpaceLocked(proc);
     ProcessCommitExecIdentity(proc);
     g_runtime.Rebind(proc->pid,proc->incarnation,proc->tgid,proc->incarnation);

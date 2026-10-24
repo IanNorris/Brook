@@ -1007,15 +1007,24 @@ static void NotifyExitedParentLocked(Process* child)
     if (child->state == ProcessState::Terminated) NotifyParentGroupLocked(child);
 }
 
-// readyLock -> allProcLock order. Reparent only once the final live member
+#include "scheduler_subreaper.inc"
+
+// Requires allProcLock (terminal publication takes readyLock first).
+// Reparent only once the final live member
 // exits, including a nonleader; an exited leader alone does not orphan children.
 static void ReparentDeadGroupLocked(uint16_t tgid)
 {
     for (uint32_t i = 0; i < g_processCount; ++i)
         if (g_allProcesses[i]->tgid == tgid &&
             g_allProcesses[i]->state != ProcessState::Terminated) return;
+    const uint16_t adopter=FindChildSubreaperLocked(tgid);
     for (uint32_t i = 0; i < g_processCount; ++i)
-        if (g_allProcesses[i]->parentPid == tgid) g_allProcesses[i]->parentPid = 0;
+        if (g_allProcesses[i]->parentPid == tgid) {
+            g_allProcesses[i]->parentPid = adopter;
+            // Already-exited children become waitable too. Robust cleanup's
+            // existing gate will notify later if it is not complete yet.
+            NotifyExitedParentLocked(g_allProcesses[i]);
+        }
 }
 
 // Drain per-CPU bookkeeping that was set before a context_switch.
@@ -1570,24 +1579,14 @@ static void ReapTerminated()
             // If the parent is gone, reparent to 0 so we can reap.
             else if (p->parentPid != 0)
             {
-                bool parentAlive = false;
-                for (uint32_t j = 0; j < g_processCount; j++)
-                {
-                    if (g_allProcesses[j]->tgid == p->parentPid
-                        && g_allProcesses[j]->state != ProcessState::Terminated)
-                    {
-                        parentAlive = true;
-                        break;
-                    }
-                }
-                if (parentAlive)
+                // Do not bypass subreaper adoption in this fallback path.
+                ReparentDeadGroupLocked(p->parentPid);
+                if (p->parentPid != 0)
                 {
                     // Parent may still call wait4 — skip for now
                     ++i;
                     continue;
                 }
-                // Parent is gone — reparent to init (0) for reaping
-                p->parentPid = 0;
             }
 
             // BRO-176: do NOT reap a thread-group LEADER (which frees the shared

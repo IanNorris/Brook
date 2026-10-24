@@ -44,9 +44,12 @@ void test(Process& parent) {
     auto* ns=observer.mountNamespace;
     stillborn.addressSpace=&space;stillborn.pid=41;stillborn.tgid=40;
     stillborn.isThread=true;stillborn.threadLeader=&leader;
-    leader.magic=PROCESS_MAGIC;leader.tgidExiting=true;
+    leader.magic=PROCESS_MAGIC;leader.pid=leader.tgid=40;leader.incarnation=42;
+    stillborn.leaderIncarnation=42;leader.tgidExiting=true;
+    leader.parentPid=71;stillborn.parentPid=99; // snapshot preceded reparenting
     SchedulerAddProcess(&stillborn);
     assert(stillborn.state==ProcessState::Terminated && stillborn.reapable && !queued);
+    assert(stillborn.parentPid==71);
     assert(!stillborn.mountNamespaceMember && ns->life.IsRetired());
     assert(g_processCount==1 && g_allProcesses[0]==&stillborn && leader.asLiveThreads==1);
     // Repeated termination/final cleanup cannot drop membership a second time.
