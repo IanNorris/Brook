@@ -1097,6 +1097,24 @@ bool WmMoveWindowRelativeToParent(Process* proc, uint32_t wmId,
     return true;
 }
 
+int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,
+                       int32_t clientX, int32_t clientY)
+{
+    if (!proc || !incarnation) return -22;
+    VfbGuard guard;
+    Window* w = WmFindWindowById(proc, wmId);
+    if (!w) return -2;
+    if (w->creationIdentity != incarnation) return -116;
+    const int64_t x = static_cast<int64_t>(clientX) - (w->noChrome ? 0 : w->metric(WM_BORDER_WIDTH));
+    const int64_t y = static_cast<int64_t>(clientY) - (w->noChrome ? 0 : w->metric(WM_TITLE_BAR_HEIGHT)+w->metric(WM_BORDER_WIDTH));
+    if (x < -32768 || x > 32767 || y < -32768 || y > 32767) return -22;
+    if (w->x != x || w->y != y) {
+        MoveWindowLocked(static_cast<int>(wmId)-1, static_cast<int16_t>(x), static_cast<int16_t>(y));
+        CompositorWake();
+    }
+    return 0;
+}
+
 static bool ResizeWindowLocked(int idx, uint16_t newClientW, uint16_t newClientH)
 {
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return false;
@@ -2571,6 +2589,31 @@ Window* WmFindWindowById(Process* proc, uint32_t wmId)
     return &w;
 }
 
+int WmSnapshotOwnedWindowState(Process* proc, uint32_t wmId,
+                               uint64_t expectedIncarnation, BrookWindowState* out)
+{
+    if (!proc || !out) return -22; // EINVAL
+    VfbGuard guard;
+    const Window* w = WmFindWindowById(proc, wmId);
+    if (!w) return -2; // ENOENT (also hides foreign windows)
+    if (expectedIncarnation && expectedIncarnation != w->creationIdentity)
+        return -116; // ESTALE
+    BrookWindowState state{};
+    state.version = BROOK_WINDOW_STATE_VERSION;
+    state.window = w->wmId;
+    state.incarnation = w->creationIdentity;
+    state.client_x = w->clientX(); state.client_y = w->clientY();
+    state.width = w->clientW; state.height = w->clientH;
+    state.flags = (w->visible ? BROOK_WINDOW_STATE_VISIBLE : 0) |
+        (w->focused ? BROOK_WINDOW_STATE_FOCUSED : 0) |
+        (w->minimized ? BROOK_WINDOW_STATE_MINIMIZED : 0) |
+        (w->state == WindowState::Maximized ? BROOK_WINDOW_STATE_MAXIMIZED : 0) |
+        (w->noChrome ? BROOK_WINDOW_STATE_CLIENT_CHROME : 0) |
+        (w->focusable ? BROOK_WINDOW_STATE_FOCUSABLE : 0);
+    *out = state;
+    return 0;
+}
+
 WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
                                                uint16_t clientW,
                                                uint16_t clientH,
@@ -2581,8 +2624,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     VfbGuard guard;
 
     if (!proc || clientW == 0 || clientH == 0) return res;
-    if (clientW < WM_MIN_WIDTH)  clientW = WM_MIN_WIDTH;
-    if (clientH < WM_MIN_HEIGHT) clientH = WM_MIN_HEIGHT;
+    // Provider buffers define their exact client extent (including tiny menus
+    // and X11 utility windows). Interactive chrome resize minima are separate.
 
     // Cascade placement: each new window offset 30px from the prior count.
     static int s_cascade = 0;
@@ -2662,8 +2705,7 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
                           WmCreateWindowResult* outResult)
 {
     if (!proc || !outResult) return -22; // -EINVAL
-    if (newW < WM_MIN_WIDTH)  newW = WM_MIN_WIDTH;
-    if (newH < WM_MIN_HEIGHT) newH = WM_MIN_HEIGHT;
+    if (!newW || !newH) return -22;
 
     VfbGuard guard;
     Window* w = WmFindWindowById(proc, wmId);

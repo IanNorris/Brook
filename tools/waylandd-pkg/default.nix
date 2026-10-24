@@ -6,6 +6,9 @@
 , xkbcomp ? (import ../../nix/nixpkgs.nix {}).xorg.xkbcomp
 , libxkbfile ? (import ../../nix/nixpkgs.nix {}).xorg.libxkbfile
 , libX11 ? (import ../../nix/nixpkgs.nix {}).xorg.libX11
+, libxcb ? (import ../../nix/nixpkgs.nix {}).libxcb
+, xorgserver ? (import ../../nix/nixpkgs.nix {}).xorg.xorgserver
+, python3 ? (import ../../nix/nixpkgs.nix {}).python3
 }:
 
 # Package the Brook Wayland server.
@@ -23,12 +26,13 @@ stdenv.mkDerivation {
   postUnpack = ''
     cp ${../../src/shared/surface_geometry.h} "$sourceRoot/surface-geometry.h"
     cp ${../../src/shared/dmabuf_layout.h} "$sourceRoot/dmabuf-layout.h"
+    cp ${../../src/shared/wm_window_state.h} "$sourceRoot/wm-window-state.h"
     cp ${../../src/kernel/src/gpu_scene_abi.h} "$sourceRoot/gpu-scene-abi.h"
   '';
 
   nativeBuildInputs = [ patchelf wayland-scanner ];
-  buildInputs = [ wayland ];
-  nativeCheckInputs = [ xkbcomp ];
+  buildInputs = [ wayland libxcb ];
+  nativeCheckInputs = [ xkbcomp xorgserver python3 ];
   checkInputs = [ libxkbfile libX11 ];
   doCheck = true;
 
@@ -39,7 +43,7 @@ stdenv.mkDerivation {
     ./keyboard-keymap-test ${xkbcomp}/bin/xkbcomp
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         output-identity-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o output-identity-test
     ./output-identity-test
     $CC -O2 -UNDEBUG -Wall -Wextra surface-tree-test.c -o surface-tree-test
@@ -50,44 +54,60 @@ stdenv.mkDerivation {
     ./text-input-test
     $CC -O2 -Wall -Wextra -I${wayland.dev}/include -I. \
         surface-frame-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o surface-frame-test
     ./surface-frame-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         retained-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o retained-surface-test
     ./retained-surface-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         dmabuf-import-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o dmabuf-import-test
     ./dmabuf-import-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         dmabuf-params-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o dmabuf-params-test
     ./dmabuf-params-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         configure-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -lwayland-client -o configure-surface-test
     ./configure-surface-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         scene-surface-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o scene-surface-test
     ./scene-surface-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         viewport-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o viewport-test
     ./viewport-test
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         capture-release-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o capture-release-test
     ./capture-release-test
+    $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
+        xwayland-shell-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
+        -L${wayland}/lib -lwayland-server -o xwayland-shell-test
+    ./xwayland-shell-test
+    $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
+        xwayland-bridge-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
+        -L${wayland}/lib -lwayland-server -o xwayland-bridge-test
+    ./xwayland-bridge-test
+    $CC -O2 -UNDEBUG -Wall -Wextra xwm-wire-test.c -o xwm-wire-test
+    ./xwm-wire-test
+    $CC -O2 -UNDEBUG -Wall -Wextra -I${libxcb.dev}/include xwm-helper-test.c \
+        -L${libxcb}/lib -lxcb -o xwm-helper-test
+    python3 xwm-helper-check.py --xvfb ${xorgserver}/bin/Xvfb \
+        --helper "$PWD/brook-xwm" --fixture "$PWD/xwm-helper-test"
   '';
 
   buildPhase = ''
@@ -96,6 +116,9 @@ stdenv.mkDerivation {
     VP_XML=${wayland-protocols}/share/wayland-protocols/stable/viewporter/viewporter.xml
     DMABUF_XML=${wayland-protocols}/share/wayland-protocols/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
     TEXT_XML=${wayland-protocols}/share/wayland-protocols/unstable/text-input/text-input-unstable-v3.xml
+    XWAYLAND_XML=${wayland-protocols}/share/wayland-protocols/staging/xwayland-shell/xwayland-shell-v1.xml
+    wayland-scanner server-header $XWAYLAND_XML xwayland-shell-v1-server-protocol.h
+    wayland-scanner private-code $XWAYLAND_XML xwayland-shell-v1-protocol.c
     wayland-scanner server-header $TEXT_XML text-input-v3-server-protocol.h
     wayland-scanner private-code $TEXT_XML text-input-v3-protocol.c
     wayland-scanner server-header  $XDG_XML  xdg-shell-server-protocol.h
@@ -112,15 +135,18 @@ stdenv.mkDerivation {
     $CC -O2 -Wall -Wextra \
         -I${wayland.dev}/include -I. \
         waylandd.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
-        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c \
         -L${wayland}/lib -lwayland-server \
         -Wl,-rpath,${wayland}/lib:${stdenv.cc.libc}/lib \
         -o waylandd
+    $CC -O2 -Wall -Wextra -I${libxcb.dev}/include xwm-helper.c \
+        -L${libxcb}/lib -lxcb -lxcb-composite -o brook-xwm
   '';
 
   installPhase = ''
     mkdir -p $out/bin
     install -m 755 waylandd $out/bin/waylandd
+    install -m 755 brook-xwm $out/bin/brook-xwm
     mkdir -p $out/share/licenses/waylandd-brook
     install -m 644 protocols/LGPL-2.1-or-later.txt protocols/README.md \
         $out/share/licenses/waylandd-brook/

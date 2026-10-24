@@ -199,11 +199,13 @@ if [ "${UPDATE_TOOLS}" -eq 1 ]; then
         done
         if [ -n "$WAYLANDD_OUT" ] && [ -x "${MNTDIR}/store/$(basename "$WAYLANDD_OUT")/bin/waylandd" ]; then
             cp "${MNTDIR}/store/$(basename "$WAYLANDD_OUT")/bin/waylandd" "${MNTDIR}/bin/waylandd"
+            cp "${MNTDIR}/store/$(basename "$WAYLANDD_OUT")/bin/brook-xwm" "${MNTDIR}/bin/brook-xwm"
             echo "  waylandd -> /nix/bin/waylandd"
         else
             for d in "${MNTDIR}"/store/*-waylandd-brook-*; do
                 [ -x "$d/bin/waylandd" ] || continue
                 cp "$d/bin/waylandd" "${MNTDIR}/bin/waylandd"
+                [ ! -x "$d/bin/brook-xwm" ] || cp "$d/bin/brook-xwm" "${MNTDIR}/bin/brook-xwm"
                 echo "  waylandd -> /nix/bin/waylandd"
                 break
             done

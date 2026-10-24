@@ -30,6 +30,7 @@
 #include <sys/un.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -49,6 +50,8 @@
 #include "surface-tree.h"
 #include "surface-geometry.h"
 #include "gpu-scene-abi.h"
+#include "wm-window-state.h"
+#include "xwm-wire.h"
 
 #define BROOK_SYS_WM_CREATE_WINDOW   506
 #define BROOK_SYS_WM_DESTROY_WINDOW  507
@@ -274,11 +277,12 @@ struct brook_frame_callback {
 };
 
 struct brook_scene_owner;
+struct brook_xwindow;
 struct brook_surface {
     struct bt_node tree;
     struct brook_scene_owner *scene;
     int scene_disabled;
-    int role; /* permanent: 1=xdg, 2=subsurface, 3=cursor */
+    int role; /* permanent: 1=xdg, 2=subsurface, 3=cursor, 4=Xwayland */
     struct wl_resource *resource;
     struct brook_buffer *pending_buffer;
     int pending_attach;
@@ -292,6 +296,9 @@ struct brook_surface {
     struct wl_resource *xdg_surface;
     struct wl_resource *xdg_toplevel;
     struct wl_resource *xdg_popup;        /* popup role (mutex with toplevel) */
+    struct wl_resource *xwayland_surface;
+    uint64_t xwayland_pending_serial, xwayland_serial, xwayland_generation;
+    struct brook_xwindow *xwindow;
     int  xdg_initial_commit_done;
     int  xdg_acked; /* Initial handshake, not acknowledgement of the newest state. */
     int  toplevel_activated;
@@ -358,7 +365,17 @@ struct brook_surface {
 static struct brook_surface *g_surfaces = NULL;
 static int g_drm_fd = -1;
 static void popup_apply_position(struct brook_surface *);
+static int xwayland_surface_ready(const struct brook_surface *);
+static unsigned xwayland_surface_flags(const struct brook_surface *);
+static void xwayland_surface_created(struct brook_surface *);
+static void xwayland_surface_detach(struct brook_surface *);
+static void xwayland_native_unmapped(struct brook_surface *);
+static void xwayland_pair_surfaces(void);
+static void xwayland_generation_lost(void);
+static int xwayland_accept_view(struct brook_surface *,uint32_t,uint32_t);
 #include "surface-scene.h"
+#include "xwayland-shell.h"
+#include "xwayland-xwm.h"
 
 
 struct brook_surface *find_surface_by_wm_id(uint32_t id);
@@ -594,6 +611,8 @@ static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t hei
 }
 static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     struct brook_surface *s=wl_resource_get_user_data(r);
+    if (!xwayland_surface_commit(s)) return;
+    if (s->role==4) xwayland_pair_surfaces();
     if (g_trace_frames) { ++s->trace_commits;if (s->pending_buffer) ++s->trace_buffers; }
     if (s->window_geometry_pending) {
         s->window_geometry_w=s->pending_geometry_w;s->window_geometry_h=s->pending_geometry_h;s->window_geometry_pending=0;
@@ -711,6 +730,7 @@ static const struct wl_surface_interface surface_impl = {
 static void surface_destroy_userdata(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (!s) return;
+    xwayland_surface_detach(s);
     if (s->viewport) { wl_resource_set_user_data(s->viewport,NULL);s->viewport=NULL; }
     /* Scrub references to this surface from all seat clients before we free
      * it.  Without this, a subsequent input event would dereference freed
@@ -760,6 +780,7 @@ static void surface_destroy_userdata(struct wl_resource *r) {
     if (s->xdg_surface) wl_resource_set_user_data(s->xdg_surface,NULL);
     if (s->xdg_toplevel) wl_resource_set_user_data(s->xdg_toplevel,NULL);
     if (s->xdg_popup) wl_resource_set_user_data(s->xdg_popup,NULL);
+    if (s->xwayland_surface) wl_resource_set_user_data(s->xwayland_surface,NULL);
     s->resource=NULL;
     bt_destroy(&s->tree);
     if (repaint_parent) surface_repaint(repaint_parent);
@@ -1787,6 +1808,7 @@ static void toplevel_set_activated(struct brook_surface *surface, int active) {
 
 static void dispatch_window_event(struct brook_surface *surface,
                                   struct brook_wm_event *event,uint32_t now) {
+    xwayland_window_event(surface,event->type);
     /* Window management requests are per window. Input is per resource: GTK
      * and application libraries can independently bind the same wl_seat. */
     if (event->type == WM_EVT_FOCUS_GAINED) toplevel_set_activated(surface, 1);
@@ -2608,18 +2630,26 @@ int main(int argc, char **argv)
 {
     fprintf(stderr, "[waylandd] starting (Phase D — kernel-WM unified)\n");
     int run_seconds = 0;
+    const char *xwayland_server=NULL,*xwm_helper=NULL,*xdisplay=":0";
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--trace-frames")) g_trace_frames = 1;
+        if (!strcmp(argv[i],"--xwayland") && i+1<argc) xwayland_server=argv[++i];
+        if (!strcmp(argv[i],"--xwm") && i+1<argc) xwm_helper=argv[++i];
+        if (!strcmp(argv[i],"--xdisplay") && i+1<argc) xdisplay=argv[++i];
         if ((!strcmp(argv[i], "--for") || !strcmp(argv[i], "--seconds"))
             && i + 1 < argc)
             run_seconds = atoi(argv[++i]);
     }
+    if (!!xwayland_server!=!!xwm_helper || xdisplay[0]!=':' || !xdisplay[1] ||
+        strspn(xdisplay+1,"0123456789")!=strlen(xdisplay+1) || strlen(xdisplay)>3 || atoi(xdisplay+1)>63) return 2;
 
     g_display = wl_display_create();
     if (!g_display) {
         fprintf(stderr, "[waylandd] FAIL: wl_display_create returned NULL\n");
         return 1;
     }
+
+    if (!xwayland_shell_init(g_display)) return 1;
 
     wl_log_set_handler_server(brook_wl_log);
     wl_display_add_client_created_listener(g_display, &g_client_create_listener);
@@ -2697,6 +2727,9 @@ int main(int argc, char **argv)
     g_frame_timer = wl_event_loop_add_timer(loop, frame_clock_tick, NULL);
     if (!g_frame_timer) return 1;
     wl_event_source_timer_update(g_frame_timer, 16);
+    if (xwayland_server && !xwayland_start(xwayland_server,xwm_helper,xdisplay)) {
+        fprintf(stderr,"[waylandd] owned Xwayland launch failed; native Wayland remains available\n");
+    }
 
     uint32_t loop_start = g_now_ms();
     for (;;) {
@@ -2704,6 +2737,7 @@ int main(int argc, char **argv)
         wl_display_flush_clients(g_display);
         for (int sub = 0; sub < 60 && !g_shutdown; ++sub) {
             uint32_t input_start = g_trace_frames ? g_now_ms() : 0;
+            xwayland_pump();
             pump_input_once();
             uint32_t dispatch_start = g_trace_frames ? g_now_ms() : 0;
             int n = wl_event_loop_dispatch(loop, 16);
@@ -2712,6 +2746,7 @@ int main(int argc, char **argv)
                 goto done;
             }
             wl_display_flush_clients(g_display);
+            xwayland_pump();
             if (g_trace_frames) {
                 uint32_t now = g_now_ms();
                 uint32_t input_ms = dispatch_start - input_start;
@@ -2727,6 +2762,7 @@ int main(int argc, char **argv)
     }
 done:
     fprintf(stderr, "[waylandd] shutting down (commits=%d)\n", g_commit_count);
+    xwayland_generation_lost();
     wl_display_destroy(g_display);
     fprintf(stderr, "[waylandd] PASS\n");
     return 0;

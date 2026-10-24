@@ -4,6 +4,7 @@
 #include "launch_history.h"
 #include "desktop_metrics.h"
 #include "../../shared/brook_theme.h"
+#include "../../shared/wm_window_state.h"
 
 namespace brook {
 
@@ -373,6 +374,11 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
 
 // Look up a Window* given (proc, wmId).  Returns nullptr if mismatch.
 Window* WmFindWindowById(Process* proc, uint32_t wmId);
+// Coherent owned-window geometry; output is unchanged on error.
+int WmSnapshotOwnedWindowState(Process* proc, uint32_t wmId,
+                               uint64_t expectedIncarnation, BrookWindowState* out);
+int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,
+                       int32_t clientX, int32_t clientY);
 
 // Push an input event into a window's per-window queue.  Coords should be
 // client-local for mouse events.  Drops on overflow.

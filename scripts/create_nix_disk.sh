@@ -281,6 +281,7 @@ if [ "${FUSE}" -eq 1 ]; then
                 ;;
             *-waylandd-brook-*)
                 [ -x "$p/bin/waylandd" ] && cp "$p/bin/waylandd" "${MOUNT_DIR}/bin/waylandd"
+                [ -x "$p/bin/brook-xwm" ] && cp "$p/bin/brook-xwm" "${MOUNT_DIR}/bin/brook-xwm"
                 ;;
             *-wayland-calc-brook-*)
                 [ -x "$p/bin/wayland-calc" ] && cp "$p/bin/wayland-calc" "${MOUNT_DIR}/bin/wayland-calc"
@@ -387,6 +388,7 @@ else
         case "$base" in
             *-waylandd-brook-*)
                 [ -x "$p/bin/waylandd" ] && write_to_disk "${DISK_IMG}" "$p/bin/waylandd" "bin/waylandd"
+                [ -x "$p/bin/brook-xwm" ] && write_to_disk "${DISK_IMG}" "$p/bin/brook-xwm" "bin/brook-xwm"
                 ;;
             *-wayland-calc-brook-*)
                 [ -x "$p/bin/wayland-calc" ] && write_to_disk "${DISK_IMG}" "$p/bin/wayland-calc" "bin/wayland-calc"

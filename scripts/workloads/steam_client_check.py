@@ -33,6 +33,7 @@ def main():
     parser.add_argument('--skip-bootstrap', action='store_true',
                         help='Diagnostic: use the already staged client without testing its updater')
     parser.add_argument('--display', default=':0', help='An already running Xwayland display')
+    parser.add_argument('--wayland-display', default='wayland-0', help='Guest Wayland socket for native dependencies')
     parser.add_argument('--pulse-server', help='Optional absolute guest Unix-socket endpoint, unix:/path')
     parser.add_argument('--pulse-cookie', type=Path,
                         help='Optional guest cookie file visible inside SteamRT; requires --pulse-server')
@@ -77,7 +78,7 @@ def main():
     env = dict(os.environ, HOME=str(home), DISPLAY=args.display,
                XDG_CONFIG_HOME=str(home / '.config'), XDG_CACHE_HOME=str(home / '.cache'),
                XDG_DATA_HOME=str(home / '.local/share'), XDG_RUNTIME_DIR='/tmp',
-               WAYLAND_DISPLAY='wayland-0', SDL_VIDEODRIVER='x11', STEAM_RUNTIME_LOGGER='0',
+               WAYLAND_DISPLAY=args.wayland_display, SDL_VIDEODRIVER='x11', STEAM_RUNTIME_LOGGER='0',
                STEAM_COMPAT_CLIENT_INSTALL_PATH=str(client),
                PATH=str(corebin) + ':' + os.environ.get('PATH', ''),
                LD_LIBRARY_PATH=host_libraries)

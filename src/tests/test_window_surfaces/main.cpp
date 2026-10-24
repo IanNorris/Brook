@@ -35,6 +35,43 @@ int main() {
     CHECK(slot==0);auto& window=g_windows[slot];
     CHECK(!window.externalCaptured && !window.externalW && !window.externalH);
     const uint32_t id=window.wmId;
+    BrookWindowState geometry{};
+    CHECK(WmSnapshotOwnedWindowState(owner,id,0,&geometry)==0);
+    CHECK(geometry.version==BROOK_WINDOW_STATE_VERSION && geometry.window==id);
+    const auto originalIncarnation=geometry.incarnation;
+    CHECK(originalIncarnation && originalIncarnation==window.creationIdentity);
+    CHECK(geometry.client_x==window.clientX() && geometry.client_y==window.clientY());
+    CHECK(geometry.width==640 && geometry.height==480 && !geometry.reserved);
+    CHECK(geometry.flags==BROOK_WINDOW_STATE_VISIBLE);
+    CHECK(WmPlaceOwnedWindow(owner,id,originalIncarnation,100,120)==0);
+    CHECK(window.clientX()==100 && window.clientY()==120 && window.clientW==640 && window.clientH==480);
+    CHECK(WmPlaceOwnedWindow(stranger,id,originalIncarnation,1,1)==-2);
+    CHECK(WmPlaceOwnedWindow(owner,id,originalIncarnation+1,1,1)==-116);
+    CHECK(WmPlaceOwnedWindow(owner,id,0,1,1)==-22);
+    CHECK(WmPlaceOwnedWindow(owner,id,originalIncarnation,-32768,-32768)==-22);
+    CHECK(window.clientX()==100 && window.clientY()==120);
+    window.x=0;window.y=0;wakes=dirty=0;
+    const auto unchanged=geometry;
+    CHECK(WmSnapshotOwnedWindowState(stranger,id,0,&geometry)==-2);
+    CHECK(WmSnapshotOwnedWindowState(owner,0,0,&geometry)==-2);
+    CHECK(WmSnapshotOwnedWindowState(owner,WM_MAX_WINDOWS+1,0,&geometry)==-2);
+    CHECK(WmSnapshotOwnedWindowState(nullptr,id,0,&geometry)==-22);
+    CHECK(WmSnapshotOwnedWindowState(owner,id,0,nullptr)==-22);
+    CHECK(!__builtin_memcmp(&geometry,&unchanged,sizeof(geometry)) && !lockDepth);
+    // Client coordinates must include scaled server decorations, but disappear
+    // for client-side chrome. Negative desktop coordinates stay signed.
+    window.x=-30;window.y=-20;window.metrics=&DesktopMetric200;
+    CHECK(WmSnapshotOwnedWindowState(owner,id,originalIncarnation,&geometry)==0);
+    CHECK(geometry.client_x==-26 && geometry.client_y==56);
+    window.noChrome=true;window.focused=true;window.minimized=true;
+    window.visible=false;window.focusable=true;window.state=WindowState::Maximized;
+    CHECK(WmSnapshotOwnedWindowState(owner,id,originalIncarnation,&geometry)==0);
+    CHECK(geometry.client_x==-30 && geometry.client_y==-20);
+    CHECK(geometry.flags==(BROOK_WINDOW_STATE_CLIENT_CHROME|BROOK_WINDOW_STATE_FOCUSED|
+        BROOK_WINDOW_STATE_MINIMIZED|BROOK_WINDOW_STATE_FOCUSABLE|BROOK_WINDOW_STATE_MAXIMIZED));
+    window.x=0;window.y=0;window.metrics=nullptr;window.noChrome=false;
+    window.focused=false;window.minimized=false;window.visible=true;
+    window.focusable=false;window.state=WindowState::Normal;
     WmCaptureToken binding{};
     const auto bindingGeneration=window.publicationGeneration;
     CHECK(WmGetCaptureBinding(owner,id,&binding));
@@ -74,6 +111,12 @@ int main() {
     CHECK(!window.proc && !window.externalCaptured && !window.externalW && !window.externalH);
     CHECK(!WmCaptureCurrent(b) && !WmCompleteCapture(b));
     CHECK(WmCreateWindow(stranger,10,10,640,480,"Chromium SHM",1,false)==slot);
+    const auto beforeStale=geometry;
+    CHECK(WmSnapshotOwnedWindowState(stranger,id,originalIncarnation,&geometry)==-116);
+    CHECK(!__builtin_memcmp(&geometry,&beforeStale,sizeof(geometry)));
+    CHECK(WmSnapshotOwnedWindowState(owner,id,0,&geometry)==-2);
+    CHECK(WmSnapshotOwnedWindowState(stranger,id,0,&geometry)==0);
+    CHECK(geometry.incarnation!=originalIncarnation && geometry.client_x==12 && geometry.client_y==48);
     CHECK(!window.externalCaptured && !window.externalW && !window.externalH);
     CHECK(!WmReserveCapture(owner,id,640,480,&rejected));
     CHECK(!WmReserveBoundCapture(binding,640,480,&rejected));
@@ -115,5 +158,5 @@ int main() {
     WmSetTitleById(owner,window.wmId,"Wrong owner");WmSendToBack(-1);
     CHECK(dirty==previousDirty && wakes==previousWake && !lockDepth);
     std::free(owner);std::free(stranger);
-    std::puts("WINDOW_SURFACES PASS: stale slot, GL/SHM transition, destruction, reuse, owner checks");
+    std::puts("WINDOW_SURFACES PASS: stale slot, GL/SHM transition, destruction, reuse, owned geometry and chrome");
 }

@@ -79,6 +79,13 @@ if args.wayland:
     assert binary.is_file(), binary
     commands += ['rm /bin/waylandd', 'write '+quote(str(binary))+' /bin/waylandd',
                  'set_inode_field /bin/waylandd mode 0100755']
+    helper=args.wayland.resolve()/'bin/brook-xwm'
+    if helper.is_file():
+        bins=subprocess.check_output(['debugfs','-R','ls -p /bin',str(image)],stderr=subprocess.DEVNULL,text=True)
+        if any(line.startswith('/') and line.split('/')[5]=='brook-xwm' for line in bins.splitlines()):
+            commands.append('rm /bin/brook-xwm')
+        commands += ['write '+quote(str(helper))+' /bin/brook-xwm',
+                     'set_inode_field /bin/brook-xwm mode 0100755']
 batch = root / 'install.debugfs'
 batch.write_text('\n'.join(commands) + '\n')
 with (root / 'install.log').open('w') as log:
@@ -96,6 +103,7 @@ with tempfile.TemporaryDirectory(dir=root) as tmp:
                        stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
         assert hashlib.sha256(dumped.read_bytes()).hexdigest()==digest, source
 wayland_override=None
+xwm_override=None
 if args.wayland:
     with tempfile.TemporaryDirectory(dir=root) as tmp:
         dumped=Path(tmp)/'waylandd'
@@ -104,5 +112,12 @@ if args.wayland:
         digest=hashlib.sha256(binary.read_bytes()).hexdigest()
         assert hashlib.sha256(dumped.read_bytes()).hexdigest()==digest
         wayland_override=dict(package=str(args.wayland.resolve()),sha256=digest,target='/nix/bin/waylandd')
-(root / 'closure.json').write_text(json.dumps(dict(roots=roots, closure=closure, copied=copied, regular_files=files, standalone_file_sha256=standalone_files, wayland_override=wayland_override, method='offline debugfs; new private clone'), indent=2) + '\n')
+        if helper.is_file():
+            helper_dump=Path(tmp)/'brook-xwm'
+            subprocess.run(['debugfs','-R','dump /bin/brook-xwm '+quote(str(helper_dump)),str(image)],
+                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
+            helper_digest=hashlib.sha256(helper.read_bytes()).hexdigest()
+            assert hashlib.sha256(helper_dump.read_bytes()).hexdigest()==helper_digest
+            xwm_override=dict(package=str(args.wayland.resolve()),sha256=helper_digest,target='/nix/bin/brook-xwm')
+(root / 'closure.json').write_text(json.dumps(dict(roots=roots, closure=closure, copied=copied, regular_files=files, standalone_file_sha256=standalone_files, wayland_override=wayland_override, xwm_override=xwm_override, method='offline debugfs; new private clone'), indent=2) + '\n')
 print('VULKAN_NIX_SEED_STAGED', len(copied), 'of', len(closure), 'files', files)

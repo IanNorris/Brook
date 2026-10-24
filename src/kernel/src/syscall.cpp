@@ -11721,6 +11721,35 @@ static int64_t sys_brook_wm_present_gres(uint64_t wmId, uint64_t gres,
                                            resource->owner->ctxId,resource->gres,resource->format);
 }
 
+static int64_t sys_brook_wm_place_window(uint64_t window, uint64_t incarnation,
+                                         uint64_t x, uint64_t y, uint64_t flags, uint64_t reserved)
+{
+    auto* proc=ProcessCurrent(); if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    const int64_t clientX=static_cast<int64_t>(x), clientY=static_cast<int64_t>(y);
+    if (!window || window>WM_MAX_WINDOWS || !incarnation || flags || reserved ||
+        clientX < -32768 || clientX > 32767 || clientY < -32768 || clientY > 32767) return -EINVAL;
+    return brook::WmPlaceOwnedWindow(proc,static_cast<uint32_t>(window),incarnation,
+                                     static_cast<int32_t>(clientX),static_cast<int32_t>(clientY));
+}
+
+static int64_t sys_brook_wm_window_state(uint64_t window, uint64_t incarnation,
+                                         uint64_t output, uint64_t size,
+                                         uint64_t flags, uint64_t reserved)
+{
+    auto* proc = ProcessCurrent(); if (!proc) return -ESRCH;
+    KernelOperationGuard operation(proc);
+    if (!window || window > WM_MAX_WINDOWS || size != sizeof(BrookWindowState) || flags || reserved)
+        return -EINVAL;
+    // Prefault outside the window lock. Copy a local snapshot after unlocking,
+    // so user faults never run under the compositor's window mutex.
+    if (!UserBufferWritable(output, sizeof(BrookWindowState))) return -EFAULT;
+    BrookWindowState state{};
+    const int result = brook::WmSnapshotOwnedWindowState(proc, static_cast<uint32_t>(window), incarnation, &state);
+    if (result) return result;
+    return CopyToUser(output, &state, sizeof(state)) ? 0 : -EFAULT;
+}
+
 // 0xB06/0xB07: capability-based retained scenes. See gpu_scene_abi.h.
 static int64_t sys_brook_scene_create(uint64_t window,uint64_t abi,uint64_t flags,
                                       uint64_t a,uint64_t b,uint64_t c)
@@ -14902,6 +14931,8 @@ void SyscallTableInit()
     g_syscallTable[0xB05]                = sys_brook_wm_set_client_socket;
     g_syscallTable[0xB06]                = sys_brook_scene_create;
     g_syscallTable[0xB07]                = sys_brook_scene_ctl;
+    g_syscallTable[0xB08]                = sys_brook_wm_window_state;
+    g_syscallTable[0xB09]                = sys_brook_wm_place_window;
     g_syscallTable[0xB02]                = sys_brook_wm_theme;
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     g_syscallTable[0xB04]                = sys_brook_wm_scale;

@@ -104,6 +104,7 @@ static int surface_tree_commit(struct brook_surface *s,struct brook_image *image
     int result=bt_commit(&s->tree,view);view_unref(view);return result;
 }
 static void surface_unmap(struct brook_surface *s) {
+    if (s->role==4) xwayland_native_unmapped(s);
     if (s->wm_id && (s->xdg_toplevel || s->xdg_popup)) {
         s->xdg_initial_commit_done=0;s->xdg_acked=0;
     }
@@ -113,13 +114,18 @@ static void surface_unmap(struct brook_surface *s) {
     s->wm_id=0;s->vfb=NULL;s->vfb_w=s->vfb_h=s->vfb_stride=0;
 }
 static int surface_window(struct brook_surface *s,struct brook_view *view) {
-    if (!view) { if (s->xdg_toplevel || s->xdg_popup) surface_unmap(s);return 1; }
-    if (!(s->xdg_toplevel || s->xdg_popup)) return 1;
-    if (!s->xdg_acked) return 1;
+    const int xwayland=s->role==4;
+    if (!view || (xwayland && !xwayland_surface_ready(s))) {
+        if (s->xdg_toplevel || s->xdg_popup || xwayland) surface_unmap(s);
+        return 1;
+    }
+    if (!(s->xdg_toplevel || s->xdg_popup || xwayland)) return 1;
+    if (!xwayland && !s->xdg_acked) return 1;
     struct brook_wm_create_out out={0};
     if (!s->wm_id) {
         int csd=s->xdg_popup || s->deco_csd || (s->xdg_toplevel && !s->deco_negotiated);
         unsigned flags=(csd?BROOK_WM_CREATE_FLAG_CSD:0)|(s->xdg_popup?BROOK_WM_CREATE_FLAG_NO_FOCUS:0);
+        if (xwayland) flags=xwayland_surface_flags(s);
         if (wm_create_window(view->geometry.w,view->geometry.h,s->title[0]?s->title:NULL,flags,&out) || !out.wm_id) return 0;
         s->wm_id=out.wm_id;s->scene_disabled=0;
         wm_register_client(s->wm_id,s->resource);
@@ -129,7 +135,9 @@ static int surface_window(struct brook_surface *s,struct brook_view *view) {
         if (wm_resize_vfb(s->wm_id,view->geometry.w,view->geometry.h,&out) || !out.vfb_user) return 0;
     } else return 1;
     s->vfb=(uint32_t *)(uintptr_t)out.vfb_user;s->vfb_stride=out.vfb_stride;
-    s->vfb_w=view->geometry.w;s->vfb_h=view->geometry.h;return 1;
+    s->vfb_w=view->geometry.w;s->vfb_h=view->geometry.h;
+    if (xwayland) xwayland_surface_created(s);
+    return 1;
 }
 static int scene_ensure(struct brook_surface *s) {
     if (s->scene || s->scene_disabled) return 1;
@@ -217,6 +225,7 @@ static uint32_t pixel_straight(uint32_t px) {
 static int surface_render(struct brook_surface *root) {
     if ((root->xdg_toplevel || root->xdg_popup) && !root->xdg_acked) return 1;
     struct brook_view *base=root->tree.current?root->tree.current->value:NULL;
+    if (root->role==4 && base && !xwayland_accept_view(root,base->geometry.w,base->geometry.h)) return 1;
     if (!surface_window(root,base)) return 0;
     if (!root->wm_id || !root->vfb) return 1;
     if (!scene_ensure(root)) return 0;

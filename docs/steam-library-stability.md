@@ -63,3 +63,19 @@ Private evidence is under `build/workloads/steam-rejection-20261024` and reviews
 Authenticated images, profiles, raw logs, debugger stack words, downloaded games
 and proprietary binaries remain outside Git. The rootful 800×600 Xwayland
 desktop is still present and does not satisfy individual-window integration.
+
+The subsequent live download test collected a lossy CPU/switch profile and a
+separate ten-second counter interval. Of 3,214 CPU samples, 2,592 are idle;
+43,764 profiler events were dropped. Frequent Steam switch-out sites include
+mapping-mutex waits during user-buffer validation, including clock queries.
+The counter interval shows about 2.9 KB/s received, 1.27 MB/s data-disk reads
+and 1.35 MB/s writes, averaging roughly 735 and 1,532 bytes per request. These
+are leads for local lock/I/O contention, not proof of blocked-time fractions or
+the Steam install phase; the profiler itself also writes disk data.
+
+After those captures the host QEMU process exits with SIGSEGV. Its saved core
+notes identify the main thread in `libSDL3.so.0.4.2` at module file offset
+`0x274cfc`. The host core is truncated; the bounded serial tail contains no
+guest-panic marker. This identifies a host display-library fault location, not
+its cause. The review disks remain preserved without assuming a clean sync.
+Consequently this run does not yet establish prolonged Steam stability.
