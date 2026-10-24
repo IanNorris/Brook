@@ -225,3 +225,22 @@ restoration, synchronous same-signal SA_NODEFER nesting, a fatal blocked
 hardware fault, and alternate-stack exhaustion. This is focused empirical
 coverage, not complete Linux signal conformance. Deprecated handler fields
 remain diagnostic only, preserving the current process/module ABI.
+
+The W game retry gets past both generated-code null faults. It now reaches a
+managed MonoGame SDL initializer and aborts with a missing macOS
+`/usr/lib/libSystem.dylib`, rather than a corrupted signal return.
+[MonoGame's platform detector](https://github.com/MonoGame/MonoGame/blob/v3.8.1/MonoGame.Framework/Platform/Utilities/CurrentPlatform.cs)
+defaults Unix to macOS unless uname returns exactly `Linux`. A scoped game
+trace confirms both uname calls succeed. Brook currently supplies `Brook` as
+sysname, so the Linux ABI personality must identify as `Linux`; the candidate
+retains Brook branding in the uname version and existing OS metadata. No game
+assembly or library was modified.
+
+X (capsule v21) verifies `sysname=Linux`, `version=#1 Brook`, `machine=x86_64`.
+The unmodified game advances through SDL initialization to graphics-device
+creation; the macOS library failure is absent. Release build and compiled entry/
+scheduler audits pass. The authenticated profile contains existing save files,
+so subsequent game tests use a separate empty HOME/XDG tree. A private hash and
+metadata inventory of the original saves is retained for before/after checks;
+no existing save is loaded. The direct diagnostic must also match the installed
+Mesa GLX vendor path already included by the Steam launcher.

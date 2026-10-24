@@ -4779,10 +4779,12 @@ static int64_t sys_uname(uint64_t bufAddr, uint64_t, uint64_t,
                           uint64_t, uint64_t, uint64_t)
 {
     utsname value{};auto* buf=&value;
-    StrCopyN(buf->sysname,    "Brook",     65);
+    // This syscall describes the Linux ABI personality. Unix libraries such
+    // as MonoGame select native loaders using an exact "Linux" comparison.
+    StrCopyN(buf->sysname,    "Linux",     65);
     StrCopyN(buf->nodename,   "brook",     65);
     StrCopyN(buf->release,    "6.0.0",     65);
-    StrCopyN(buf->version,    "#1",        65);
+    StrCopyN(buf->version,    "#1 Brook",  65);
     StrCopyN(buf->machine,    "x86_64",    65);
     StrCopyN(buf->domainname, "(none)",    65);
     return CopyToUser(bufAddr,&value,sizeof(value))?0:-EFAULT;
