@@ -8,6 +8,11 @@ int main(void) {
     struct bxwm_message m={.version=BXWM_VERSION,.type=BXWM_WINDOW,.generation=7,
         .identity=42,.serial=99,.window=123,.width=320,.height=200,.flags=BXWM_MAPPED|BXWM_INPUT};
     assert(bxwm_valid(&m,7,1));assert(!bxwm_valid(&m,8,1));assert(!bxwm_valid(&m,7,0));
+    m.flags|=BXWM_CLIENT_CHROME|BXWM_MAXIMIZED|BXWM_MINIMIZED;assert(bxwm_valid(&m,7,1));
+    m.flags|=1u<<31;assert(!bxwm_valid(&m,7,1));m.flags=BXWM_MAPPED|BXWM_INPUT;
+    m.type=BXWM_MAXIMIZE;m.x=2;assert(bxwm_valid(&m,7,1));m.x=3;assert(!bxwm_valid(&m,7,1));
+    m.type=BXWM_BEGIN_RESIZE;m.x=7;assert(bxwm_valid(&m,7,1));m.x=8;assert(!bxwm_valid(&m,7,1));
+    m.type=BXWM_WINDOW;m.x=0;
     struct bxwm_message received;
     /* Real stream fragmentation and multiple packets delivered in one write. */
     assert(send(fd[0],&m,17,MSG_NOSIGNAL)==17);

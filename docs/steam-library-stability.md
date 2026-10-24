@@ -95,4 +95,21 @@ At observation time Steam shows Library without an active download and its
 content log is unchanged for more than ten minutes. This is not a representative
 download benchmark. Another three-second profile loses 2,461 events and includes
 the profiler's own disk writer; neither capture establishes the download
-bottleneck. A transfer-active capture remains required.
+bottleneck.
+
+The subsequent user-controlled run completes a small game's download and
+verification, then starts a separate Steam runtime dependency before launching.
+A ten-second transferring interval receives about 1.11 MB/s and records about
+1.02 MB/s logical data-disk reads and 3.43 MB/s logical writes. The driver counts
+logical read/write calls including cache hits, not physical device requests;
+the roughly 158-byte average read-call size is not an SSD IOPS measurement.
+
+Three 100 ms reservation captures and one 100 ms installation capture have no
+reported event drops. They repeatedly show `AccessAt` switch-out stacks waiting
+in `UserMappingPageAccess`. The access implementation validates and reads each
+pathname byte separately, acquiring the mapping mutex for each byte. This is a
+concrete optimization lead, not a measured blocked-time fraction or proof of the
+entire download bottleneck. The longer transfer capture drops many events and
+cannot support precise timing claims. Runtime installation and game launch
+remain in progress at this checkpoint; the current data filesystem reports
+about 3.9 GiB available to the ordinary user with ample free inodes.

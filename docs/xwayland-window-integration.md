@@ -53,6 +53,14 @@ without taking native keyboard focus. Root, support and InputOnly windows are
 excluded from native presentation; InputOnly X map requests are still honored.
 X borders are forced to zero to keep backing pixmaps and client extents aligned.
 
+Follow-up controls honor an explicit `_MOTIF_WM_HINTS` decorations=0 request,
+including a mapped-window change, while missing/malformed hints retain Brook
+chrome. Client chrome remains focusable. The bridge forwards pointer-driven
+`_NET_WM_MOVERESIZE`, maximization requests and `WM_CHANGE_STATE` iconification
+to the existing native window operations. Maximize/minimize state flows back
+through X properties. This implements full-window maximization rather than
+independent horizontal/vertical modes; fullscreen is not implemented here.
+
 The fixed-message stream has bounded queues, framing for partial/coalesced
 reads, and fail-closed generation retirement on EOF, malformed messages or queue
 exhaustion. XID incarnations reject stale commands. Transient parent references
@@ -65,6 +73,16 @@ server timestamp. Close uses `WM_DELETE_WINDOW` when supported, otherwise the
 ordinary X client-close fallback. Reparenting away from the root retires the
 native association; returning creates a fresh identity. Generation retirement
 removes owned X windows without disconnecting native Wayland clients.
+
+The first live Steam review exposed a Friends input defect: native presentation
+put Friends above the main window, while the X root stack put the main window
+above Friends. Native activation now raises the matching X window as well as
+focusing it. An overlapping-window control fails on the live baseline helper
+and passes on the corrected helper. The same review confirms both Steam windows
+explicitly request decorations=0; ignoring that property caused double chrome.
+The focus/stack and client-chrome changes pass host controls but still require
+a restarted native Steam acceptance run; they are not applied to the user's
+ongoing review session.
 
 The launcher uses a private `-displayfd` channel and checks the chosen display,
 plus a bounded startup deadline. The first native attempt used `-nolock`, which

@@ -33,8 +33,10 @@ static int xwayland_surface_ready(const struct brook_surface *s) {
 static unsigned xwayland_surface_flags(const struct brook_surface *s) {
     /* Override-redirect menus/tooltips keep their own pixels and do not steal
      * native keyboard focus. Normal X11 windows get movable Brook chrome. */
-    return s->xwindow && (s->xwindow->state.flags&BXWM_OVERRIDE)?
-        BROOK_WM_CREATE_FLAG_CSD|BROOK_WM_CREATE_FLAG_NO_FOCUS:0;
+    if (!s->xwindow) return 0;
+    unsigned flags=s->xwindow->state.flags;
+    return ((flags&(BXWM_OVERRIDE|BXWM_CLIENT_CHROME))?BROOK_WM_CREATE_FLAG_CSD:0)|
+        ((flags&BXWM_OVERRIDE)?BROOK_WM_CREATE_FLAG_NO_FOCUS:0);
 }
 static void xwayland_native_unmapped(struct brook_surface *s) {
     if (!s->xwindow) return;
@@ -73,6 +75,9 @@ static int xwayland_send(struct brook_xwindow *w,uint32_t type,const BrookWindow
     if (g_xwm_fd<0 || g_xwm_failed) return 0;
     struct bxwm_message message=w->state;message.type=type;
     if (geometry) {
+        message.flags&=~(BXWM_MAXIMIZED|BXWM_MINIMIZED);
+        if (geometry->flags&BROOK_WINDOW_STATE_MAXIMIZED) message.flags|=BXWM_MAXIMIZED;
+        if (geometry->flags&BROOK_WINDOW_STATE_MINIMIZED) message.flags|=BXWM_MINIMIZED;
         message.x=geometry->client_x;message.y=geometry->client_y;
         message.width=geometry->width;message.height=geometry->height;
         if (w->native_sequence==UINT64_MAX) { g_xwm_failed=1;return 0; }
@@ -115,7 +120,8 @@ static void xwayland_native_sync(struct brook_surface *s,int initial) {
         }
     }
     int changed=!w->native_valid || geometry.client_x!=w->native.client_x ||
-        geometry.client_y!=w->native.client_y || geometry.width!=w->native.width || geometry.height!=w->native.height;
+        geometry.client_y!=w->native.client_y || geometry.width!=w->native.width || geometry.height!=w->native.height ||
+        ((geometry.flags^w->native.flags)&(BROOK_WINDOW_STATE_MAXIMIZED|BROOK_WINDOW_STATE_MINIMIZED));
     if (w->native_valid && (geometry.width!=w->native.width || geometry.height!=w->native.height)) {
         w->target_width=geometry.width;w->target_height=geometry.height;
     }
@@ -177,6 +183,27 @@ static int xwayland_accept_message(const struct bxwm_message *message) {
         if (w && w->state.identity==message->identity) { *link=w->next;xwayland_unpair(w);free(w); }
         return 1;
     }
+    if (message->type==BXWM_BEGIN_MOVE || message->type==BXWM_BEGIN_RESIZE ||
+        message->type==BXWM_MAXIMIZE || message->type==BXWM_MINIMIZE) {
+        if (!w || w->state.identity!=message->identity || !w->surface || !w->surface->wm_id ||
+            !w->native_valid || !(w->state.flags&BXWM_MAPPED) || (w->state.flags&BXWM_OVERRIDE)) return 1;
+        uint32_t id=w->surface->wm_id;
+        if (message->type==BXWM_BEGIN_MOVE) (void)wm_begin_move(id);
+        if (message->type==BXWM_BEGIN_RESIZE) {
+            static const uint32_t edges[]={BROOK_WM_EDGE_TOP|BROOK_WM_EDGE_LEFT,BROOK_WM_EDGE_TOP,
+                BROOK_WM_EDGE_TOP|BROOK_WM_EDGE_RIGHT,BROOK_WM_EDGE_RIGHT,
+                BROOK_WM_EDGE_BOTTOM|BROOK_WM_EDGE_RIGHT,BROOK_WM_EDGE_BOTTOM,
+                BROOK_WM_EDGE_BOTTOM|BROOK_WM_EDGE_LEFT,BROOK_WM_EDGE_LEFT};
+            (void)wm_begin_resize(id,edges[message->x]);
+        }
+        if (message->type==BXWM_MINIMIZE) (void)wm_set_minimized(id);
+        if (message->type==BXWM_MAXIMIZE) {
+            xwayland_native_sync(w->surface,0);
+            int enable=message->x==2?!(w->native.flags&BROOK_WINDOW_STATE_MAXIMIZED):message->x;
+            (void)wm_set_maximized(id,enable);
+        }
+        xwayland_native_sync(w->surface,0);return !g_xwm_failed;
+    }
     if (w && w->state.identity!=message->identity) {
         if (message->identity<w->state.identity) return 1;
         *link=w->next;xwayland_unpair(w);free(w);w=NULL;
@@ -186,7 +213,15 @@ static int xwayland_accept_message(const struct bxwm_message *message) {
         w->next=g_xwindows;g_xwindows=w;
     } else if (w->state.serial!=message->serial || !(message->flags&BXWM_MAPPED)) xwayland_unpair(w);
     xwayland_apply_client_geometry(w,message);
+    unsigned old_flags=w->state.flags;
     w->state=*message;
+    if (w->surface && w->surface->wm_id &&
+        ((old_flags^message->flags)&BXWM_CLIENT_CHROME) && !(message->flags&BXWM_OVERRIDE)) {
+        if (wm_set_decoration_mode(w->surface->wm_id,(message->flags&BXWM_CLIENT_CHROME)!=0)<0) {
+            g_xwm_failed=1;return 0;
+        }
+        xwayland_native_sync(w->surface,0);
+    }
     if (w->surface && strcmp(w->surface->title,message->title)) {
         snprintf(w->surface->title,sizeof(w->surface->title),"%s",message->title);
         if (w->surface->wm_id) wm_set_title(w->surface->wm_id,message->title);

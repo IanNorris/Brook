@@ -12,12 +12,14 @@ static long bridge_syscall(long number,...);
 #undef syscall
 static BrookWindowState native[64];
 static uint32_t pixels[64][64*64],next_window,created,destroyed,resized,placed;
+static uint32_t create_flags[64],decoration_changes,moves,edge_resizes;
 static long bridge_syscall(long number,...) {
     va_list ap;va_start(ap,number);long result=0;
     if (number==BROOK_SYS_WM_CREATE_WINDOW) {
         long width=va_arg(ap,long),height=va_arg(ap,long);(void)va_arg(ap,long);
         struct brook_wm_create_out *out=(void *)va_arg(ap,long);long flags=va_arg(ap,long);
         uint32_t id=++next_window;assert(id<64 && width<=64 && height<=64);++created;
+        create_flags[id]=(uint32_t)flags;
         native[id]=(BrookWindowState){.version=1,.window=id,.incarnation=100+id,
             .client_x=40,.client_y=80,.width=width,.height=height,
             .flags=BROOK_WINDOW_STATE_VISIBLE|((flags&1)?BROOK_WINDOW_STATE_CLIENT_CHROME:0)};
@@ -41,6 +43,23 @@ static long bridge_syscall(long number,...) {
         assert(id>0 && id<64 && width<=64 && height<=64);++resized;
         native[id].width=width;native[id].height=height;
         *out=(struct brook_wm_create_out){id,64,(uintptr_t)pixels[id]};
+    } else if (number==BROOK_SYS_WM_SET_DECORATION_MODE) {
+        long id=va_arg(ap,long),csd=va_arg(ap,long);++decoration_changes;
+        if (csd) native[id].flags|=BROOK_WINDOW_STATE_CLIENT_CHROME;
+        else native[id].flags&=~BROOK_WINDOW_STATE_CLIENT_CHROME;
+    } else if (number==BROOK_SYS_WM_BEGIN_MOVE || number==BROOK_SYS_WM_BEGIN_RESIZE) {
+        long id=va_arg(ap,long);assert(native[id].version);
+        if (number==BROOK_SYS_WM_BEGIN_MOVE) ++moves;
+        else { assert(va_arg(ap,long)==(BROOK_WM_EDGE_TOP|BROOK_WM_EDGE_LEFT));++edge_resizes; }
+        // A missing active mouse press is an ordinary declined request, not a
+        // reason to disconnect every X client.
+        errno=EINVAL;result=-1;
+    } else if (number==BROOK_SYS_WM_SET_MAXIMIZED) {
+        long id=va_arg(ap,long),enable=va_arg(ap,long);assert(enable==0 || enable==1);
+        if (enable) native[id].flags|=BROOK_WINDOW_STATE_MAXIMIZED;
+        else native[id].flags&=~BROOK_WINDOW_STATE_MAXIMIZED;
+    } else if (number==BROOK_SYS_WM_SET_MINIMIZED) {
+        long id=va_arg(ap,long);native[id].flags|=BROOK_WINDOW_STATE_MINIMIZED;
     } else if (number==0xB06) { errno=ENOSYS;result=-1; }
     va_end(ap);return result;
 }
@@ -97,6 +116,10 @@ int main(void) {
     image(s,4,2);id=s->wm_id;assert(created==2 && !g_xwm_failed);
     configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);assert(configure.configure_serial==3);
     state.configure_serial=3;assert(xwayland_accept_message(&state));
+    state.flags|=BXWM_CLIENT_CHROME;assert(xwayland_accept_message(&state));
+    assert(decoration_changes==1 && (native[id].flags&BROOK_WINDOW_STATE_CLIENT_CHROME));
+    state.flags&=~BXWM_CLIENT_CHROME;assert(xwayland_accept_message(&state));
+    assert(decoration_changes==2 && !(native[id].flags&BROOK_WINDOW_STATE_CLIENT_CHROME));
     // Second independently managed X window, transient to the first's identity.
     struct bxwm_message menu=state;menu.window=124;menu.identity=2;menu.serial=56;
     menu.configure_serial=0;menu.parent=123;menu.parent_identity=1;menu.x=115;menu.y=125;
@@ -137,15 +160,28 @@ int main(void) {
     g_xwm_fd=control[0];peer=control[1];memset(&rx,0,sizeof(rx));
     client=new_client(&wayland_peer);assert(xwayland_attach_client(client));
     assert(g_xwayland_generation>first_generation);
-    state.flags=BXWM_MAPPED|BXWM_INPUT;state.configure_serial=0;
+    state.flags=BXWM_MAPPED|BXWM_INPUT|BXWM_CLIENT_CHROME;state.configure_serial=0;
     assert(!xwayland_accept_message(&state) && !g_xwindows);
     state.generation=g_xwayland_generation;state.width=2;state.height=2;
     assert(xwayland_accept_message(&state));s=new_surface(client,55);image(s,2,2);
     assert(s->wm_id && s->wm_id!=native_id && created==5);
+    assert((create_flags[s->wm_id]&BROOK_WM_CREATE_FLAG_CSD) &&
+        !(create_flags[s->wm_id]&BROOK_WM_CREATE_FLAG_NO_FOCUS));
     configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);
     assert(configure.generation==g_xwayland_generation && configure.configure_serial==1);
     struct bxwm_message stale=state;stale.generation=first_generation;stale.type=BXWM_DESTROY;
     assert(!xwayland_accept_message(&stale) && s->wm_id && g_xwindows);
+    struct bxwm_message request=state;request.type=BXWM_BEGIN_MOVE;request.identity+=100;
+    assert(xwayland_accept_message(&request) && !moves);
+    request.identity=state.identity;assert(xwayland_accept_message(&request) && moves==1 && !g_xwm_failed);
+    request.type=BXWM_BEGIN_RESIZE;request.x=0;
+    assert(xwayland_accept_message(&request) && edge_resizes==1 && !g_xwm_failed);
+    request.type=BXWM_MAXIMIZE;request.x=1;assert(xwayland_accept_message(&request));
+    configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);assert(configure.flags&BXWM_MAXIMIZED);
+    request.x=2;assert(xwayland_accept_message(&request));
+    configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);assert(!(configure.flags&BXWM_MAXIMIZED));
+    request.type=BXWM_MINIMIZE;assert(xwayland_accept_message(&request));
+    configure=command_from_peer(peer,&rx,BXWM_CONFIGURE);assert(configure.flags&BXWM_MINIMIZED);
     assert(unrelated->wm_id==native_id && pixels[native_id][0]==0xff123456);
     // Server disconnect takes the other teardown route through the exact
     // wl_client destroy listener. It must have the same isolation guarantee.

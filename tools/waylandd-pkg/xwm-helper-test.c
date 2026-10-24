@@ -68,6 +68,8 @@ int main(int argc,char **argv) {
     xcb_window_t id=xcb_generate_id(c);
     xcb_create_window(c,XCB_COPY_FROM_PARENT,id,screen->root,10,20,320,200,3,
         XCB_WINDOW_CLASS_INPUT_OUTPUT,screen->root_visual,0,NULL);
+    xcb_atom_t motif=atom(c,"_MOTIF_WM_HINTS");uint8_t malformed_hint[3]={2,0,0};
+    xcb_change_property(c,XCB_PROP_MODE_REPLACE,id,motif,XCB_ATOM_STRING,8,3,malformed_hint);
     xcb_change_property(c,XCB_PROP_MODE_REPLACE,id,protocols,XCB_ATOM_ATOM,32,2,supported);
     xcb_map_window(c,id);xcb_flush(c);
     struct bxwm_message initial=receive(control,BXWM_WINDOW,id,0,320,200);
@@ -75,7 +77,7 @@ int main(int argc,char **argv) {
     association.data.data32[0]=123;
     xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&association);
     xcb_flush(c);struct bxwm_message mapped=receive(control,BXWM_WINDOW,id,123,0,0);
-    assert(mapped.identity==initial.identity);
+    assert(mapped.identity==initial.identity && !(mapped.flags&BXWM_CLIENT_CHROME));
     xcb_get_geometry_reply_t *border=xcb_get_geometry_reply(c,xcb_get_geometry(c,id),NULL);
     assert(border && !border->border_width);free(border);
     uint32_t requested_border=4;
@@ -95,13 +97,49 @@ int main(int argc,char **argv) {
     xcb_change_property(c,XCB_PROP_MODE_REPLACE,global,protocols,XCB_ATOM_ATOM,32,2,supported);
     uint32_t hints[9]={1,0};xcb_atom_t wm_hints=atom(c,"WM_HINTS");
     xcb_change_property(c,XCB_PROP_MODE_REPLACE,global,wm_hints,wm_hints,32,9,hints);
+    uint32_t decorations[5]={2,0,0,0,0};
+    xcb_change_property(c,XCB_PROP_MODE_REPLACE,global,motif,motif,32,5,decorations);
     xcb_map_window(c,global);xcb_flush(c);
     struct bxwm_message active=receive(control,BXWM_WINDOW,global,0,200,100);
-    assert(!(active.flags&BXWM_INPUT));
+    assert(!(active.flags&BXWM_INPUT) && (active.flags&BXWM_CLIENT_CHROME));
     send_command(control,active,BXWM_FOCUS);xcb_timestamp_t stamp=wait_protocol(c,protocols,focus);assert(stamp);
     focused=xcb_get_input_focus_reply(c,xcb_get_input_focus(c),NULL);assert(focused && focused->focus==id);free(focused);
     xcb_set_input_focus(c,XCB_INPUT_FOCUS_PARENT,global,stamp);
     focused=xcb_get_input_focus_reply(c,xcb_get_input_focus(c),NULL);assert(focused && focused->focus==global);free(focused);
+    // Native activation raises a window as well as focusing it. If the X root
+    // stack is left unchanged, Xwayland can send clicks to a different sibling
+    // from the one Brook actually paints on top (Steam/Friends reproducer).
+    send_command(control,configured,BXWM_FOCUS);assert(wait_protocol(c,protocols,focus));
+    xcb_query_tree_reply_t *tree=xcb_query_tree_reply(c,xcb_query_tree(c,screen->root),NULL);
+    assert(tree && xcb_query_tree_children_length(tree)>0);
+    int children=xcb_query_tree_children_length(tree);
+    assert(xcb_query_tree_children(tree)[children-1]==id);free(tree);
+    xcb_atom_t net_state=atom(c,"_NET_WM_STATE"),max_h=atom(c,"_NET_WM_STATE_MAXIMIZED_HORZ"),
+        max_v=atom(c,"_NET_WM_STATE_MAXIMIZED_VERT"),moveresize=atom(c,"_NET_WM_MOVERESIZE");
+    xcb_client_message_event_t request={.response_type=XCB_CLIENT_MESSAGE,.format=32,.window=id,.type=net_state};
+    request.data.data32[0]=2;request.data.data32[1]=max_h;request.data.data32[2]=max_v;
+    xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&request);
+    xcb_flush(c);struct bxwm_message action=receive(control,BXWM_MAXIMIZE,id,0,0,0);assert(action.x==2 && action.identity==configured.identity);
+    request.type=moveresize;memset(&request.data,0,sizeof(request.data));request.data.data32[2]=8;request.data.data32[3]=1;
+    xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&request);
+    xcb_flush(c);action=receive(control,BXWM_BEGIN_MOVE,id,0,0,0);assert(action.identity==configured.identity);
+    request.data.data32[2]=0;
+    xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&request);
+    xcb_flush(c);action=receive(control,BXWM_BEGIN_RESIZE,id,0,0,0);assert(action.x==0 && action.identity==configured.identity);
+    request.type=atom(c,"WM_CHANGE_STATE");memset(&request.data,0,sizeof(request.data));request.data.data32[0]=3;
+    xcb_send_event(c,0,screen->root,XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,(const char *)&request);
+    xcb_flush(c);action=receive(control,BXWM_MINIMIZE,id,0,0,0);assert(action.identity==configured.identity);
+    struct bxwm_message native_state=configured;native_state.flags|=BXWM_MAXIMIZED|BXWM_MINIMIZED;
+    send_command(control,native_state,BXWM_CONFIGURE);
+    native_state=receive(control,BXWM_WINDOW,id,123,640,360);
+    assert((native_state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED))==(BXWM_MAXIMIZED|BXWM_MINIMIZED));
+    xcb_get_property_reply_t *state_reply=xcb_get_property_reply(c,xcb_get_property(c,0,id,net_state,XCB_ATOM_ATOM,0,2),NULL);
+    assert(state_reply && state_reply->format==32 && xcb_get_property_value_length(state_reply)==8);
+    assert(((xcb_atom_t *)xcb_get_property_value(state_reply))[0]==max_h &&
+        ((xcb_atom_t *)xcb_get_property_value(state_reply))[1]==max_v);free(state_reply);
+    send_command(control,configured,BXWM_CONFIGURE);
+    native_state=receive(control,BXWM_WINDOW,id,123,640,360);
+    assert(!(native_state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED)));
     // Reparenting away retires the native identity. Returning creates a new one.
     xcb_reparent_window(c,global,id,0,0);xcb_flush(c);
     struct bxwm_message retired=receive(control,BXWM_DESTROY,global,0,0,0);assert(retired.identity==active.identity);
@@ -128,6 +166,6 @@ int main(int argc,char **argv) {
     geometry=xcb_get_geometry_reply(c,xcb_get_geometry(c,id),NULL);
     assert(geometry && geometry->width==301 && geometry->height==181);free(geometry);
     xcb_disconnect(c);
-    puts("XWM_HELPER_PASS isolated X server: InputOnly map, serial/configure/focus/cooperative close/destroy/XID reuse");
+    puts("XWM_HELPER_PASS isolated X server: InputOnly, geometry, focus/stack, client chrome/actions, native state, close, reparent and XID reuse");
     return 0;
 }

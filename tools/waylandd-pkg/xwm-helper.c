@@ -24,9 +24,9 @@ struct xwm {
     uint64_t generation,next_identity;
     struct bxwm_stream stream;
     struct window *windows;
-    xcb_atom_t serial,protocols,delete_window,take_focus,hints,transient;
+    xcb_atom_t serial,protocols,delete_window,take_focus,hints,transient,motif;
     xcb_atom_t utf8,name,supporting,supported,active,wm_state;
-    xcb_atom_t time_property;
+    xcb_atom_t time_property,net_state,max_h,max_v,moveresize,change_state;
     xcb_timestamp_t timestamp;
     uint32_t time_counter;
     struct bxwm_message pending_focus;
@@ -80,7 +80,8 @@ static int refresh(struct xwm *wm,struct window *w) {
     }
     w->state.x=geometry->x;w->state.y=geometry->y;
     w->state.width=geometry->width;w->state.height=geometry->height;
-    w->state.flags=(attributes->override_redirect?BXWM_OVERRIDE:0)|
+    w->state.flags=(w->state.flags&(BXWM_MAXIMIZED|BXWM_MINIMIZED))|
+        (attributes->override_redirect?BXWM_OVERRIDE:0)|
         (attributes->map_state!=XCB_MAP_STATE_UNMAPPED?BXWM_MAPPED:0)|BXWM_INPUT;
     free(geometry);free(attributes);
     xcb_get_property_reply_t *hints=property(wm,w->state.window,wm->hints,9);
@@ -89,6 +90,15 @@ static int refresh(struct xwm *wm,struct window *w) {
         if ((values[0]&1) && !values[1]) w->state.flags&=~BXWM_INPUT;
     }
     free(hints);
+    // Only an explicit, well-formed decorations=0 request suppresses native
+    // chrome. Keep ordinary and malformed/no-hint windows server-decorated.
+    xcb_get_property_reply_t *motif=property(wm,w->state.window,wm->motif,5);
+    if (motif && motif->type==wm->motif && motif->format==32 &&
+        xcb_get_property_value_length(motif)>=12) {
+        uint32_t *values=xcb_get_property_value(motif);
+        if ((values[0]&2) && values[2]==0) w->state.flags|=BXWM_CLIENT_CHROME;
+    }
+    free(motif);
     uint32_t parent=property_word(wm,w->state.window,wm->transient,0);
     if (parent!=w->state.parent) w->state.parent_identity=0;
     w->state.parent=parent;
@@ -142,11 +152,27 @@ static int command(struct xwm *wm,const struct bxwm_message *message) {
     switch (message->type) {
     case BXWM_CONFIGURE: {
         w->state.configure_serial=message->configure_serial;
+        unsigned state_mask=BXWM_MAXIMIZED|BXWM_MINIMIZED;
+        if ((w->state.flags^message->flags)&state_mask) {
+            w->state.flags=(w->state.flags&~state_mask)|(message->flags&state_mask);
+            xcb_atom_t states[]={wm->max_h,wm->max_v};
+            xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,message->window,wm->net_state,
+                XCB_ATOM_ATOM,32,(message->flags&BXWM_MAXIMIZED)?2:0,states);
+            uint32_t state[]={(message->flags&BXWM_MINIMIZED)?3:1,XCB_WINDOW_NONE};
+            xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,message->window,wm->wm_state,wm->wm_state,32,2,state);
+        }
         uint32_t values[]={(uint32_t)message->x,(uint32_t)message->y,message->width,message->height};
         xcb_configure_window(wm->xcb,message->window,XCB_CONFIG_WINDOW_X|XCB_CONFIG_WINDOW_Y|
             XCB_CONFIG_WINDOW_WIDTH|XCB_CONFIG_WINDOW_HEIGHT,values);break;
     }
     case BXWM_FOCUS:
+        // Brook already raised this native window. Keep X's hit-test order
+        // aligned: changing keyboard focus alone leaves an overlapping X
+        // sibling on top, so pointer events can reach the wrong application.
+        {
+            uint32_t above=XCB_STACK_MODE_ABOVE;
+            xcb_configure_window(wm->xcb,message->window,XCB_CONFIG_WINDOW_STACK_MODE,&above);
+        }
         // Obtain an X-server timestamp asynchronously. Brook monotonic time is
         // not in the X server's clock domain, and WM_TAKE_FOCUS forbids zero.
         wm->pending_focus=*message;++wm->time_counter;
@@ -240,6 +266,18 @@ static int event(struct xwm *wm,xcb_generic_event_t *generic) {
             uint64_t serial=(uint64_t)e->data.data32[0]|((uint64_t)e->data.data32[1]<<32);
             if (!serial || (w->state.serial && serial<=w->state.serial)) return 0;
             w->state.serial=serial;
+        } else if (w && !(w->state.flags&BXWM_OVERRIDE) && (w->state.flags&BXWM_MAPPED)) {
+            struct bxwm_message request=w->state;
+            if (e->type==wm->moveresize && e->data.data32[3]==1 && e->data.data32[2]<=8) {
+                request.type=e->data.data32[2]==8?BXWM_BEGIN_MOVE:BXWM_BEGIN_RESIZE;
+                request.x=(int32_t)e->data.data32[2];
+            } else if (e->type==wm->change_state && e->data.data32[0]==3) request.type=BXWM_MINIMIZE;
+            else if (e->type==wm->net_state && e->data.data32[0]<=2 &&
+                (e->data.data32[1]==wm->max_h || e->data.data32[1]==wm->max_v ||
+                 e->data.data32[2]==wm->max_h || e->data.data32[2]==wm->max_v)) {
+                request.type=BXWM_MAXIMIZE;request.x=(int32_t)e->data.data32[0];
+            } else return 1;
+            return emit(wm,&request);
         } else return 1;
         break;
     }
@@ -275,10 +313,14 @@ static int initialize(struct xwm *wm,int wm_fd) {
     wm->serial=atom(wm,"WL_SURFACE_SERIAL");wm->protocols=atom(wm,"WM_PROTOCOLS");
     wm->delete_window=atom(wm,"WM_DELETE_WINDOW");wm->take_focus=atom(wm,"WM_TAKE_FOCUS");
     wm->hints=atom(wm,"WM_HINTS");wm->transient=atom(wm,"WM_TRANSIENT_FOR");
+    wm->motif=atom(wm,"_MOTIF_WM_HINTS");
     wm->utf8=atom(wm,"UTF8_STRING");wm->name=atom(wm,"_NET_WM_NAME");
     wm->supporting=atom(wm,"_NET_SUPPORTING_WM_CHECK");wm->supported=atom(wm,"_NET_SUPPORTED");
     wm->active=atom(wm,"_NET_ACTIVE_WINDOW");wm->wm_state=atom(wm,"WM_STATE");
     wm->time_property=atom(wm,"_BROOK_XWM_TIME");
+    wm->net_state=atom(wm,"_NET_WM_STATE");wm->max_h=atom(wm,"_NET_WM_STATE_MAXIMIZED_HORZ");
+    wm->max_v=atom(wm,"_NET_WM_STATE_MAXIMIZED_VERT");wm->moveresize=atom(wm,"_NET_WM_MOVERESIZE");
+    wm->change_state=atom(wm,"WM_CHANGE_STATE");
     if (!wm->serial || !wm->wm_state) return 0;
     uint32_t mask=XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT|XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY|XCB_EVENT_MASK_PROPERTY_CHANGE;
     xcb_generic_error_t *error=xcb_request_check(wm->xcb,xcb_change_window_attributes_checked(wm->xcb,wm->root,XCB_CW_EVENT_MASK,&mask));
@@ -289,8 +331,9 @@ static int initialize(struct xwm *wm,int wm_fd) {
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->root,wm->supporting,XCB_ATOM_WINDOW,32,1,&wm->support);
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->support,wm->supporting,XCB_ATOM_WINDOW,32,1,&wm->support);
     xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->support,wm->name,wm->utf8,8,9,"Brook XWM");
-    xcb_atom_t supported[]={wm->supporting,wm->name};
-    xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->root,wm->supported,XCB_ATOM_ATOM,32,2,supported);
+    xcb_atom_t supported[]={wm->supporting,wm->name,wm->active,wm->net_state,wm->max_h,wm->max_v,wm->moveresize};
+    xcb_change_property(wm->xcb,XCB_PROP_MODE_REPLACE,wm->root,wm->supported,XCB_ATOM_ATOM,32,
+        sizeof(supported)/sizeof(supported[0]),supported);
     xcb_flush(wm->xcb);
     struct bxwm_message ready={.version=BXWM_VERSION,.type=BXWM_READY,.generation=wm->generation,
         .window=wm->root,.width=screens.data->width_in_pixels,.height=screens.data->height_in_pixels};
