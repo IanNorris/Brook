@@ -11131,7 +11131,7 @@ static int64_t sys_rt_sigreturn(uint64_t, uint64_t, uint64_t,
                                  uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
-    if (!proc || !proc->inSignalHandler) return -EINVAL;
+    if (!proc) return -ESRCH;
 
     proc->sigReturnPending = true;
     DbgPrintf("SIGRETURN: pid %u requesting context restore (cur user RIP=0x%lx)\n",

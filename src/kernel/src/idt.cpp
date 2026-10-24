@@ -1609,7 +1609,9 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
     const brook::KernelSigaction sa=proc?brook::ReadSignalAction(proc->tgid,signum-1):brook::KernelSigaction{};
     const bool hasHandler=sa.handler>1;
 
-    if (hasHandler && proc && !proc->inSignalHandler)
+    // A blocked synchronous hardware fault is fatal. A prior handler may have
+    // left by nonlocal context restoration, so its diagnostic flag is irrelevant.
+    if (hasHandler && proc && !(proc->sigMask&(1ULL<<(signum-1))))
     {
         if(!brook::UserReturnAddress(sa.handler)) {
             SerialPrintf("SIGNAL: invalid fault handler pid %u address=%lx\n",proc->pid,sa.handler);
@@ -1661,14 +1663,16 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
         }
 
         const uint64_t savedMask=proc->sigMask;
-        const uint64_t handlerMask=(savedMask|sa.mask|(1ULL<<(signum-1))) &
+        const uint64_t handlerMask=(savedMask|sa.mask|
+                                  ((sa.flags&brook::SA_NODEFER)?0:(1ULL<<(signum-1)))) &
                                   ~((1ULL<<8)|(1ULL<<18));
         const int previousStackFlags=brook::SignalAltstackFlags(proc->sigAltstackSp,
             proc->sigAltstackSize,proc->sigAltstackFlags,ef->rsp);
         const bool useAlt=(sa.flags&brook::SA_ONSTACK) && previousStackFlags==0;
         uint64_t userRsp=0;
         if(!brook::PlaceSignalFrame(ef->rsp,proc->sigAltstackSp,proc->sigAltstackSize,
-                                    useAlt,sizeof(brook::SignalFrame)+brook::SIGNAL_FP_EXTRA,&userRsp)) {
+                                    useAlt,sizeof(brook::SignalFrame)+brook::SIGNAL_FP_EXTRA,&userRsp,
+                                    previousStackFlags==1)) {
             SerialPrintf("SIGNAL: invalid fault-frame location pid %u signal %u\n",proc->pid,signum);
             __asm__ volatile("sti":::"memory");
             brook::SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);

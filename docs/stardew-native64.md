@@ -200,3 +200,28 @@ rt_sigreturn occurred between the faults. CoreCLR's direct context restoration
 can bypass sigreturn, making that flag unsuitable for delivery eligibility.
 Signal-mask-based delivery and nested/nonlocal-return tests are the next step.
 No game window has been reached.
+
+## Nonlocal return and nested signal acceptance
+
+A five-case static Linux control reproduces the next fault independently:
+unchanged V dies with SIGSEGV on the second synchronous recovery through
+`sigsetjmp`/`siglongjmp`. W (kernel capsule v20) passes it, the alternate-stack
+lifecycle probe, all eight FP-state cases and all ten FP-return cases. Focused
+host user-copy/frame-bound and FP-normalization tests pass, as do supported
+compiled entry and scheduler mutation audits.
+
+Delivery now follows per-signal masks instead of a persistent handler-active
+boolean; nonlocal user context restoration can bypass sigreturn without
+stranding kernel delivery state. The boolean prerequisite on sigreturn is
+removed while copied frame/return/FP validation remains. Both delivery paths
+honor SA_NODEFER without discarding explicit sa_mask bits. A blocked or ignored
+synchronous hardware fault remains fatal. Frames allocated while already on
+an alternate stack must stay wholly inside that configured stack, including
+the FP reservation; adjacent mapped pages do not extend it.
+
+The control covers two sequential nonlocal SIGSEGV recoveries, nested
+SIGUSR1/SIGUSR2 on the alternate stack with independent MXCSR and mask
+restoration, synchronous same-signal SA_NODEFER nesting, a fatal blocked
+hardware fault, and alternate-stack exhaustion. This is focused empirical
+coverage, not complete Linux signal conformance. Deprecated handler fields
+remain diagnostic only, preserving the current process/module ABI.

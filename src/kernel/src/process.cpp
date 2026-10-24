@@ -1872,7 +1872,8 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
     }
 
     // --- Signal delivery ---
-    if (proc->inSignalHandler) return timing.Result(syscallResult);
+    // User-space context restoration (e.g. siglongjmp/CoreCLR) may bypass
+    // sigreturn. Eligibility is defined by signal masks, never a handler flag.
 
     uint64_t deliverable = (ProcessPendingSignals(proc) | PosixTimerPending(proc)) & ~proc->sigMask;
     if (deliverable == 0) return timing.Result(syscallResult);
@@ -1927,14 +1928,16 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
                             syscallResult, proc->currentSyscallNum);
 
     const uint64_t savedMask=returnMask;
-    const uint64_t handlerMask=(proc->sigMask|sa.mask|(1ULL<<(signum-1))) &
+    const uint64_t handlerMask=(proc->sigMask|sa.mask|
+                              ((sa.flags&SA_NODEFER)?0:(1ULL<<(signum-1)))) &
                               ~((1ULL<<8)|(1ULL<<18));
     const int previousStackFlags=SignalAltstackFlags(proc->sigAltstackSp,
         proc->sigAltstackSize,proc->sigAltstackFlags,frame->rsp);
     const bool useAlt=(sa.flags&SA_ONSTACK) && previousStackFlags==0;
     uint64_t userRsp=0;
     if(!PlaceSignalFrame(frame->rsp,proc->sigAltstackSp,proc->sigAltstackSize,
-                         useAlt,sizeof(SignalFrame)+SIGNAL_FP_EXTRA,&userRsp)) {
+                         useAlt,sizeof(SignalFrame)+SIGNAL_FP_EXTRA,&userRsp,
+                         previousStackFlags==1)) {
         SerialPrintf("SIGNAL: invalid frame location pid %u signal %d\n",proc->pid,signum);
         __asm__ volatile("sti":::"memory");
         SchedulerKillThreadGroup(proc->tgid,proc,128+11,11);

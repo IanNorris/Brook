@@ -81,6 +81,7 @@ static constexpr uint64_t SA_SIGINFO  = 0x00000004;
 static constexpr uint64_t SA_ONSTACK  = 0x08000000;
 static constexpr uint64_t SA_RESTORER = 0x04000000;
 static constexpr uint64_t SA_RESTART  = 0x10000000;
+static constexpr uint64_t SA_NODEFER  = 0x40000000;
 
 // Group dispositions are snapshotted/exchanged under one short IRQ-safe lock.
 // Replacement is a trusted kernel-local value; perform user copies outside it.
@@ -483,8 +484,8 @@ struct Process
     uint64_t alarmTick;         // LAPIC tick at which to deliver SIGALRM (0 = disabled)
 
     // Signal delivery state
-    bool     inSignalHandler;   // Currently executing a user signal handler
-    bool     inSignalHandlerOnAltStack; // Current handler entered on sigaltstack
+    bool     inSignalHandler;   // Legacy diagnostic hint, not delivery authority
+    bool     inSignalHandlerOnAltStack; // Legacy hint; use actual user RSP instead
     bool     sigReturnPending;  // Set by sys_rt_sigreturn, handled by SyscallCheckSignals
     uint64_t currentSyscallNum;  // Syscall number (RAX) saved per-process for SA_RESTART
 

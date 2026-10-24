@@ -59,6 +59,10 @@ int main() {
     CHECK(!PlaceSignalFrame(0,0x100000,440,true,440,&address)); // alignment needs room
     CHECK(!PlaceSignalFrame(0,0x100000,0,true,440,&address));
     CHECK(!PlaceSignalFrame(0,0,8192,true,440,&address));
+    CHECK(PlaceSignalFrame(0x101000,0x100000,8192,false,1400,&address,true));
+    CHECK(address>=0x100000 && address+1400<0x101000);
+    // A mapped page below the configured stack does not extend that stack.
+    CHECK(!PlaceSignalFrame(0x100100,0x100000,8192,false,1400,&address,true));
     struct sigaction action{};action.sa_sigaction=recover;action.sa_flags=SA_SIGINFO;
     CHECK(!sigaction(SIGSEGV,&action,nullptr));
     const size_t page=static_cast<size_t>(sysconf(_SC_PAGESIZE));CHECK(page==4096);

@@ -984,3 +984,12 @@ Build static musl with `-O2 -Wall -Wextra -Werror -pthread`; run without
 arguments on Linux and a private Brook VM. Require `sigaltstack_pass:true`
 and exit zero. It does not certify SS_AUTODISARM, nested signal restoration,
 or alternate stacks larger than Brook's current 32-bit size field.
+
+`signalnestcheck.c` checks two synchronous SIGSEGV recoveries using
+`sigsetjmp`/`siglongjmp`, nested SIGUSR1/SIGUSR2 with independent MXCSR and
+mask restoration on an alternate stack, same-signal synchronous nesting with
+SA_NODEFER, fatal blocked hardware faults, and alternate-stack exhaustion.
+Build static musl with `-O2 -Wall -Wextra -Werror`; run without arguments in
+a disposable Linux/Brook environment and require `signal_nested_pass:true`,
+five cases and exit zero. The intentional fatal children must be reaped; retain
+the original guest job until it and all descendants have drained.
