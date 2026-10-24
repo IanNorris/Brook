@@ -183,3 +183,51 @@ failures; neither is relabeled successful. The software client exits 137 after
 agent termination, not a normal Steam exit. The remaining bounded lead is local
 service acceptance/response, including the independently observed premature
 EAGAIN from blocking accept. There is no login acceptance yet.
+
+## Blocking accept follow-up
+
+The public `acceptcheck.c` first passes 26 delayed-accept/flags/readiness/signal
+checks on Linux. The same static binary on unchanged review U fails six checks:
+blocking accept and accept4 on a blocking listener return EAGAIN before the
+150 ms delayed client; the handled-signal case also returns prematurely.
+Poll/epoll-then-accept cases pass. U completes the expected-failure group,
+heap/sync, original-owner exit, serial acceptance and four filesystem checks.
+
+The candidate retains the low-level nonblocking SockAccept interface used by
+the kernel debug server. The INET syscall wrapper retries EAGAIN for a blocking
+listener using bounded poll waits; accept4 flags affect only the new socket.
+The socket index comes from the outer pinned descriptor. An exact original-
+socket guard compare-clears this task's waiter under the socket lock on every
+wait exit, including concurrent descriptor close. PollWait's own numeric-FD
+cleanup cannot re-pin an already-closing slot, so it is insufficient alone.
+The accepted socket's internal nonblocking flag is set before publishing its FD.
+Listener readiness and accept use the same predicate: Established/CloseWait,
+excluding reset and incomplete SynRecv children, under queue-to-child lock order.
+
+Astra's read-only review finds no blocking correctness issue. The stronger
+28-check probe adds close-with-duplicate lifetime coverage and passes Linux.
+All 102 host tests and both compiled safety audits pass. Native candidate V
+passes all 28 accept checks, the multi-segment loopback test and both native
+and real-SteamRT shared-control checks. Its software X11 draw reads back all
+12,800 expected pixels, and the composed full-resolution bridge frame visibly
+contains the green rectangle. This is a positive software-path capture control,
+not a resolution of the user-reported accelerated-display discrepancy. The
+Steam retry still does not reach login: the browser's 200-by-200 X11 window
+is unmapped after the parent acquires the large pools at guest 196.590 s.
+The new CEF log segment contains one allocator-corruption warning; this is
+not yet attributed to a particular mapping or established as the UI cause.
+A bounded NET trace of the existing main Steam threads records activity but
+one accept returning EAGAIN and no successful accept. Synthetic connections to three local listeners
+connect and time out waiting for a response; their application protocols are
+unclassified, so an HTTP root probe does not establish a response defect.
+Malformed interleaved serial records are excluded from the trace summary;
+after-return logging and repeated-error suppression limit interpretation.
+Steam requires agent termination (exit 137), and its tracked group drains.
+The pristine wrapper is restored, the guest heap/sync checks succeed, the
+original VM owner exits zero, and serial acceptance and all four offline
+filesystem checks pass. The validated own-probe metadata is retained privately.
+There is still no login acceptance. Existing single
+socket-waiter capacity, 50/100 ms poll/epoll fallback intervals and 16 low-level
+queue-check yields remain explicit limitations; no negligible-overhead claim
+is made. Native smoke tests do not directly prove the internal waiter pointer
+was cleared; the lifetime contract also depends on the reviewed pin/guard order.

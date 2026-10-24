@@ -1714,7 +1714,20 @@ void SockSetPollWaiter(int sockIdx, Process* waiter)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
     if (!g_sockUsed[sockIdx]) return;
-    g_sockets[sockIdx].pollWaiter = waiter;
+    Socket& s = g_sockets[sockIdx];
+    SpinLockAcquire(&s.lock);
+    s.pollWaiter = waiter;
+    SpinLockRelease(&s.lock);
+}
+
+void SockClearPollWaiter(int sockIdx, Process* waiter)
+{
+    if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
+    if (!g_sockUsed[sockIdx]) return;
+    Socket& s = g_sockets[sockIdx];
+    SpinLockAcquire(&s.lock);
+    if (s.pollWaiter == waiter) s.pollWaiter = nullptr;
+    SpinLockRelease(&s.lock);
 }
 
 void SockSetNonblock(int sockIdx, bool nonblock)
@@ -2868,8 +2881,22 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite)
     if (g_netIf && g_netIf->poll) g_netIf->poll(g_netIf);
 
     if (checkRead) {
-        // Listening socket: readable when accept queue is non-empty
-        if (s.listening && s.acceptQueueCount > 0) return true;
+        // A half-open SYN is queued for retransmission/lifetime tracking,
+        // but accept cannot return it before the final handshake ACK.
+        if (s.listening) {
+            bool ready = false;
+            uint64_t flags = IrqSpinLockAcquire(&g_acceptQueueLock);
+            for (int i = 0; i < s.acceptQueueCount && !ready; ++i) {
+                const int childIdx = s.acceptQueue[i];
+                if (childIdx < 0 || childIdx >= static_cast<int>(MAX_SOCKETS) || !g_sockUsed[childIdx]) continue;
+                Socket& child = g_sockets[childIdx];
+                SpinLockAcquire(&child.lock);
+                ready = TcpCanAccept(child);
+                SpinLockRelease(&child.lock);
+            }
+            IrqSpinLockRelease(&g_acceptQueueLock, flags);
+            return ready;
+        }
         if (s.rxCount > 0) return true;
         if (s.tcpFinRecv) return true; // EOF is readable
         if (s.tcpRstRecv) return true; // RST is readable (returns ECONNRESET)
@@ -2987,8 +3014,7 @@ int SockAccept(int sockIdx, SockAddrIn* addr)
                 Socket& child = g_sockets[childIdx];
                 SpinLockAcquire(&child.lock);
                 discard = RetireAbandonedQueuedChild(child, ApicTickCount());
-                accept = !discard && (child.tcpState == TcpState::Established ||
-                                      child.tcpState == TcpState::CloseWait);
+                accept = !discard && TcpCanAccept(child);
                 if (discard || accept) {
                     child.listenSockIdx = -1;
                     if (accept && addr) {

@@ -951,3 +951,13 @@ source verification. It uses a raw alarm watchdog. This probe waits for listener
 readiness before accept; it does not certify blocking accept before connection,
 full UDP demultiplexing, or concurrent close semantics. Close timing is reported,
 not asserted against a scheduling-sensitive threshold.
+
+`acceptcheck.c` requires `-pthread`. It checks delayed blocking accept, accept4
+flags versus listener flags, an empty nonblocking listener, poll and epoll
+registered before connection, handled-signal interruption, accepted connection
+bytes, and closing the accepting descriptor while a duplicate remains live.
+The close case permits either completing the original accept or EBADF, then
+requires the duplicate listener to accept a fresh connection. Linux passes 28
+checks. Parent and forked children use raw alarm watchdogs; also retain the
+whole guest job until all descendants drain. The test does not directly inspect
+kernel waiter pointers or establish wake latency under load.

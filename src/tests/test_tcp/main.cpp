@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 
 // Pull in network types (only needs <stdint.h>)
 #include "net.h"
@@ -400,6 +401,17 @@ int main()
     rewound.tcpState = TcpState::SynRecv;
     rewound.tcpLastRxTick = 2168;
     ASSERT_TRUE(!TcpPassiveOpenExpired(rewound, 1000));
+
+    Socket acceptable = {};
+    for (auto state : {TcpState::Closed, TcpState::SynSent, TcpState::SynRecv,
+                       TcpState::FinWait1, TcpState::FinWait2, TcpState::LastAck,
+                       TcpState::TimeWait, TcpState::Listen}) {
+        acceptable.tcpState = state; ASSERT_TRUE(!TcpCanAccept(acceptable));
+    }
+    acceptable.tcpState = TcpState::Established; ASSERT_TRUE(TcpCanAccept(acceptable));
+    acceptable.tcpState = TcpState::CloseWait; acceptable.tcpFinRecv = true;
+    ASSERT_TRUE(TcpCanAccept(acceptable));
+    acceptable.tcpRstRecv = true; ASSERT_TRUE(!TcpCanAccept(acceptable));
 
     TestPassiveHandshake();
     TestSynAck();

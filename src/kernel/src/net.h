@@ -399,6 +399,8 @@ bool SockPollReady(int sockIdx, bool checkRead, bool checkWrite);
 bool SockPollHangup(int sockIdx);
 uint32_t SockRxCount(int sockIdx);
 void SockSetPollWaiter(int sockIdx, Process* waiter);
+// Remove only this registration, even after its numeric FD starts closing.
+void SockClearPollWaiter(int sockIdx, Process* waiter);
 void SockSetNonblock(int sockIdx, bool nonblock);
 bool SockIsNonblock(int sockIdx);
 int  SockGetConnectError(int sockIdx); // consume async connect error (SO_ERROR)

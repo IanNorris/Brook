@@ -27,6 +27,12 @@ inline bool TcpCanSendData(TcpState state)
     return state == TcpState::Established || state == TcpState::CloseWait;
 }
 
+inline bool TcpCanAccept(const Socket& socket)
+{
+    return !socket.tcpRstRecv &&
+           (socket.tcpState == TcpState::Established || socket.tcpState == TcpState::CloseWait);
+}
+
 // Action the caller should take after processing a segment.
 struct TcpAction {
     bool     sendSynAck;     // retransmit original server SYN-ACK

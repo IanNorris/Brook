@@ -13890,12 +13890,32 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
         }
     }
 
-    int sockIdx = GetSockIdx(proc, fd);
-    if (sockIdx < 0) return -EBADF;
-
+    if (!fde || fde->type != FdType::Socket || !fde->handle) return -EBADF;
+    // Keep the original pinned slot/socket across waits; a fresh lookup can
+    // fail once a concurrent close marks this slot closing.
+    const int sockIdx = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
     brook::SockAddrIn peerAddr = {};
-    int childIdx = brook::SockAccept(sockIdx, &peerAddr);
-    if (childIdx < 0) return childIdx; // EAGAIN or error
+    int childIdx;
+    for (;;) {
+        if (__atomic_load_n(&fde->closing, __ATOMIC_ACQUIRE)) return -EBADF;
+        childIdx = brook::SockAccept(sockIdx, &peerAddr);
+        if (childIdx != -EAGAIN) break;
+        // accept4 flags apply to the new connection, never the listener wait.
+        if (fde->statusFlags & UNIX_SOCK_NONBLOCK) return -EAGAIN;
+        if (HasPendingSignals()) return -EINTR;
+        struct ExactSocketWait {
+            int index; Process* task;
+            ~ExactSocketWait() { brook::SockClearPollWaiter(index, task); }
+        } registration{sockIdx, proc};
+        pollfd wait{fd, POLLIN, 0};
+        // Existing poll registration/recheck/signal handling, with a finite
+        // close check. Its numeric-FD cleanup skips closing slots; the exact
+        // original-socket guard above must therefore run on every exit.
+        const int64_t result = PollWait(&wait, 1, 50);
+        if (result < 0) return result;
+    }
+    if (childIdx < 0) return childIdx;
+    brook::SockSetNonblock(childIdx, (flags & UNIX_SOCK_NONBLOCK) != 0);
 
     // Allocate a new fd for the accepted connection
     FdEntry accepted{};
