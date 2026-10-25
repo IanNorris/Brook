@@ -108,3 +108,24 @@ original launch/close and PCM evidence remains under ignored
 All five Q3 launcher wrappers exit 0 and their exact client groups drain. The
 original VM owner exits 0 after acknowledged final sync; all four offline
 filesystem checks pass. No game assets or account data are included in Git.
+
+### Independent host-clock check
+
+The later PS/2-only review (`build/reviews/pointer-ps2-20261025`) launches Q3
+through its installed shortcut with the same downstream-aware plugin. Three
+successive ten-second measurements bracket each audio-stats request with host
+monotonic timestamps. Source completions are 441344, 441600 and 441216 frames.
+Allowing for each request's full timing uncertainty gives respective rates of
+44029–44133, 44073–44159 and 44034–44120 source frames per host second. Every
+interval includes the intended 44100 rate. Stream identity and epoch remain
+unchanged, with no reported discontinuity; client capacity/period stay 2048/64
+and the downstream allowance is 4096.
+
+This independently supports correct aggregate source pacing without relying
+on guest timer calibration. It cannot exclude short audible underruns or
+prove speaker timing. Four seconds of device capture contains 176640 frames;
+normal WM close removes the exact client group and audio stream. After a
+two-second settling interval, a separate two-second capture is inactive with
+zero frames. Checked VM shutdown and all four offline filesystem checks pass.
+Raw counter brackets, output captures and UI operations remain private in that
+review. Audible acceptance and mixed-workload smoothness remain unverified.

@@ -201,3 +201,26 @@ checked sync and all four offline filesystem checks pass. Its kernel is the
 same `bfd7d1...` build above, provider is
 `/nix/store/6697vcba4gj0zcx8bi61wazybipkbzkl-waylandd-brook-0.1-brook`.
 Physical mouse-look and audible Q3 acceptance remain live-review tasks.
+
+## PS/2-only boot control
+
+The checked quiet image is the source of `build/reviews/pointer-ps2-20261025`.
+This review selects `BROOK_POINTER_DEVICE=ps2` before QEMU starts. `info mice`
+reports only the QEMU PS/2 mouse; no tablet is available. Kernel, provider and
+selected SDL runtime are the versions recorded above.
+
+Native Wayland job `c426401791c04b9ca465e2eb3a60e5ba` passes exact motion
+(+4000,-2000), one press at (+2000,-1000), one release, and the protocol
+locked/unlocked/locked sequence around emergency release and a fresh click.
+Xwayland job `a5cf5a094f044287b3a96de37dc69c18` passes the same motion and
+button totals. Both exit zero with empty job groups and both output EOFs.
+Relative setup uses paced small movements and the actual window position;
+the earlier zero-motion attempts never obtained pointer focus and are retained
+as failed setup controls, not passing capture evidence.
+
+The actual Q3 shortcut also launches and closes normally. Checked shutdown
+acknowledges filesystem/device flush, the original VM controller exits zero,
+and all four offline filesystem checks pass. This is the prepared PS/2 review
+image; physical QEMU frontend grabbing, mouse-look at screen edges, emergency
+release and fresh-click rearm still need a user test. QMP injection does not
+prove the physical frontend behavior.
