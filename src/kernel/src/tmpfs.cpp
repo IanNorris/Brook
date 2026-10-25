@@ -450,6 +450,21 @@ int ObjectPath(VfsObject *o, char *out, uint32_t capacity)
     memcpy(out, path + cursor, size);
     return 0;
 }
+int EntryParent(VfsObject *o,VfsObject **out,char *leaf,uint32_t capacity)
+{
+    if(!out || !leaf || !capacity)return -22;
+    *out=nullptr;leaf[0]=0;
+    auto *n=Object(o);
+    Guard g(n->fs);
+    if(!n->linked || !n->parent || !n->parent->linked)return -2;
+    auto *entry=*Find(n->parent,n->name);
+    if(!entry || entry->node!=n)return -2;
+    auto length=strlen(n->name);
+    if(length>=capacity)return -36;
+    int error=MakeObject(n->parent,out);
+    if(!error)memcpy(leaf,n->name,length+1);
+    return error;
+}
 int DirectoryPath(VfsObject *o, char *out, uint32_t capacity)
 {
     if ((Object(o)->mode & TypeMask) != Directory)return -20;
@@ -1188,7 +1203,7 @@ depth_checked:
 }
 const VfsObjectOps objectOps = {DestroyObject, StatObject, AccessObject, Child,  Parent,       Readlink,
                                 OpenObject,    Create,     Mkdir,        Remove, Rename,       Symlink,
-                                nullptr,       Times,      Chmod,        Chown,  DirectoryPath, nullptr, ObjectPath, CreateFifo};
+                                nullptr,       Times,      Chmod,        Chown,  DirectoryPath, nullptr, ObjectPath, CreateFifo, EntryParent};
 const VfsObjectOps *ObjectOperations()
 {
     return &objectOps;

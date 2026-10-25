@@ -35,6 +35,10 @@ static void pivot_source(const char *base){
   char name[64],actual[256];snprintf(name,sizeof(name),"/proc/self/fd/%d",f);
   ssize_t n=readlink(name,actual,sizeof(actual)-1);CK(n>0);actual[n]=0;CK(!strcmp(actual,expected));CK(!close(f));
  }
+ value("/target",'Z');int sourcefd=openat(root,relative,O_PATH|O_CLOEXEC),targetfd=open("/target",O_PATH|O_CLOEXEC);CK(sourcefd>=0&&targetfd>=0);
+ char sourcepath[64],targetpath[64];snprintf(sourcepath,sizeof(sourcepath),"/proc/self/fd/%d",sourcefd);snprintf(targetpath,sizeof(targetpath),"/proc/self/fd/%d",targetfd);
+ CK(!mount(sourcepath,targetpath,NULL,MS_BIND,NULL));CK(readvalue("/target")=='N');
+ CK(!umount2("/target",MNT_DETACH));CK(readvalue("/target")=='Z');CK(!close(sourcefd)&&!close(targetfd));
  CK(!close(root));_exit(0);
 }
 int main(int argc,char **argv){
@@ -47,6 +51,20 @@ int main(int argc,char **argv){
  // Bubblewrap's safe_openat fallback reads back the O_PATH descriptor name
  // before mounting. Cover an ordinary unbound file as well as bind targets.
  fdpath("source",O_RDONLY);fdpath("source",O_PATH|O_CLOEXEC);
+ // Bubblewrap mounts the exact opened objects via proc magic links.
+ int sourcefd=open("source",O_PATH|O_CLOEXEC),targetfd=open("tree/target",O_PATH|O_CLOEXEC);CK(sourcefd>=0&&targetfd>=0);
+ char sourcepath[64],targetpath[64];snprintf(sourcepath,sizeof(sourcepath),"/proc/self/fd/%d",sourcefd);snprintf(targetpath,sizeof(targetpath),"/proc/self/fd/%d",targetfd);
+ CK(!rename("source","fd-renamed")&&!rename("tree/target","tree/fd-target"));
+ CK(!mount("other","fd-renamed",NULL,MS_BIND,NULL));CK(readvalue("fd-renamed")=='C');
+ CK(mount(sourcepath,targetpath,NULL,MS_BIND,NULL)==0);CK(readvalue("tree/fd-target")=='A');
+ CK(!umount2("fd-renamed",MNT_DETACH));
+ CK(!rename("fd-renamed","source")&&!rename("tree","fd-tree"));
+ int otherfd=open("other",O_PATH|O_CLOEXEC);CK(otherfd>=0);char otherpath[64];snprintf(otherpath,sizeof(otherpath),"/proc/self/fd/%d",otherfd);
+ CK(mount(otherpath,targetpath,NULL,MS_BIND,NULL)==0);CK(readvalue("fd-tree/fd-target")=='C');
+ errno=0;CK(unlink("fd-tree/fd-target")==-1&&errno==EBUSY);
+ CK(umount2("fd-tree/fd-target",MNT_DETACH)==0);CK(readvalue("fd-tree/fd-target")=='A');
+ CK(umount2("fd-tree/fd-target",MNT_DETACH)==0);CK(readvalue("fd-tree/fd-target")=='B');
+ CK(!rename("fd-tree","tree")&&!rename("tree/fd-target","tree/target"));CK(!close(sourcefd)&&!close(targetfd)&&!close(otherfd));
  errno=0;int linked=link("tree/target","tree/alias");
  if(brook)CK(linked==-1&&errno==EPERM);
  else {CK(linked==0);CK(mount("source","tree/target",NULL,MS_BIND,NULL)==0);CK(readvalue("tree/target")=='A'&&readvalue("tree/alias")=='B');CK(umount2("tree/target",MNT_DETACH)==0);CK(unlink("tree/alias")==0);CK(link("source","source-alias")==0);}

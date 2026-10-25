@@ -144,6 +144,15 @@ int main(int argc,char** argv){
             char text[512];assert(object->ops->object_path);
             assert(!object->ops->object_path(object,text,sizeof(text)));
             assert(!std::strcmp(text,expected));
+            VfsObject* parent=nullptr;char leaf[256];
+            int error=object->ops->entry_parent(object,&parent,leaf,sizeof(leaf));
+            if(strstr(expected," (deleted)"))assert(error==-2 && !parent);
+            else {
+                assert(!error && parent);char directory[512];
+                assert(!parent->ops->directory_path(parent,directory,sizeof(directory)));
+                std::string joined=std::string(directory)+(strcmp(directory,"/")?"/":"")+leaf;
+                assert(joined==expected);VfsObjectRelease(parent);
+            }
         };
         auto create=[&](const char* name) {
             int error=0;auto* node=Ext2ObjectCreate(directory,name,VFS_O_WRITE,0600,&error);

@@ -11,7 +11,8 @@ isolates that backend when an inherited host mount restriction prevents the
 separate disk/mapping remount control; it does not count as a full two-backend
 pass. `filebindcheck.c --brook-ext2` additionally checks ordinary and O_PATH
 proc-fd names for unbound files, then the actual `/oldroot` bind/proc/pivot
-containment path. Both probes require a disposable namespace and bounded host
+containment path, including real FD-to-FD mounts, rename and stacking through
+an older covered descriptor. Both probes require a disposable namespace and bounded host
 observation.
 
 `sockettypecheck.c` checks send/receive errors and the send-to-write fallback

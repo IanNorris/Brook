@@ -17,7 +17,7 @@
 
 namespace {
 std::shared_mutex namespaceLock;
-brook::VfsPath magicTarget{};
+brook::VfsPath magicTarget{},magicTarget2{};
 std::mutex allocationLock;
 std::unordered_set<void*> allocations;
 long failAllocation=-1;
@@ -70,8 +70,8 @@ brook::Vnode* objectOpen(brook::VfsObject* object,int flags,int* error){
 }
 int objectFollow(const brook::VfsPath& path,brook::VfsPath* out) {
     auto* object=path.object;
-    *out={};if(node(object).target!="magic-reporting-only")return 0;
-    *out=magicTarget;brook::VfsPathRetain(*out);return 1;
+    *out={};if(node(object).target!="magic-reporting-only" && node(object).target!="magic-second")return 0;
+    *out=node(object).target=="magic-second"?magicTarget2:magicTarget;brook::VfsPathRetain(*out);return 1;
 }
 int objectDirectoryPath(brook::VfsObject* object,char* out,uint32_t capacity) {
     if(node(object).id==rejectDirectoryReport)return -95;
@@ -98,8 +98,18 @@ int objectRemove(brook::VfsObject* parent,const char* name,bool directory) {
     if(directory&&!child->children.empty())return -39;
     p.children.erase(i);child->nlink=0;return 0;
 }
+int objectEntryParent(brook::VfsObject* object,brook::VfsObject** out,char* leaf,uint32_t capacity) {
+    *out=nullptr;auto& n=node(object);
+    if(!n.nlink || !n.parent)return -2;
+    for(auto& child:n.parent->children)if(child.second==&n) {
+        if(child.first.size()>=capacity)return -36;
+        int error=makeObject(n.parent,out);if(error)return error;
+        std::memcpy(leaf,child.first.c_str(),child.first.size()+1);return 0;
+    }
+    return -2;
+}
 const brook::VfsObjectOps objectOps={.destroy=destroyObject,.stat=objectStat,.access=objectAccess,
-    .lookup=objectChild,.parent=objectParent,.readlink=objectReadlink,.open=objectOpen,.remove=objectRemove,.rename=objectRename,.directory_path=objectDirectoryPath,.follow_link=objectFollow};
+    .lookup=objectChild,.parent=objectParent,.readlink=objectReadlink,.open=objectOpen,.remove=objectRemove,.rename=objectRename,.directory_path=objectDirectoryPath,.follow_link=objectFollow,.entry_parent=objectEntryParent};
 bool mountBackend(uint8_t drive,void** out){assert(drive<8 && !mounts[drive].alive);auto& m=mounts[drive];++mountCalls[drive];m.alive=true;m.identity=drive+1;m.root={&m,1,true,&m.root,{}, {}};*out=&m;return true;}
 int unmountBackend(void* priv){auto* m=static_cast<Mount*>(priv);assert(m->alive && !m->live);auto index=m-mounts;++unmountCalls[index];if(rejectUnmount[index])return -5;m->alive=false;return 0;}
 unsigned freshUnmounts=0,freshUnmountAttempts=0;
@@ -582,6 +592,54 @@ static void testFileBinds(brook::MountNamespace* initial,const brook::VfsPath& s
     assert(!VfsMountNamespaceDetach(ns,legacyBound));VfsPathRelease(legacyBound);
     VfsPathRelease(a);VfsPathRelease(b);VfsPathRelease(dest);VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
     originalSource->nlink=1;originalSource->parent=mounts[6].root.children["ns-a"];originalSource->parent->children["value"]=originalSource;
+    assert(allocations.size()==allocated && g_mounts.count==records);
+}
+static void testMagicFileBinds(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
+    using namespace brook;
+    const auto allocated=allocations.size();const auto records=g_mounts.count;
+    MountNamespace* ns=nullptr;VfsPath root{},cwd{};
+    assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
+    Node sourceLink{&mounts[6],970,false,&node(root.object),{},"magic-reporting-only"};
+    Node targetLink{&mounts[6],971,false,&node(root.object),{},"magic-second"};
+    node(root.object).children["fd-source"]=&sourceLink;node(root.object).children["fd-target"]=&targetLink;
+    auto a=resolve(root,root,"ns-a"),b=resolve(root,root,"ns-b");
+    magicTarget=resolve(root,root,"ns-a/value");magicTarget2=resolve(root,root,"ns-b/value");
+    auto* sourceNode=&node(magicTarget.object);
+    auto fileTarget=magicTarget2;magicTarget2=b;
+    assert(VfsMountNamespaceBindAt(ns,root,root,"fd-source","fd-target")==-20);magicTarget2=fileTarget;
+    // Recovery follows a retained entry's rename, not the FD's opening label.
+    assert(!VfsRenameAt(root,a,"value",a,"fd-renamed"));
+    bool succeeded=false;
+    for(long failure=0;failure<128;++failure) {
+        auto before=allocations.size();auto count=g_mounts.count;failAllocation=failure;
+        int error=VfsMountNamespaceBindAt(ns,root,root,"fd-source","fd-target");failAllocation=-1;
+        if(error) {assert(error==-12);VfsDrainMountCleanup();assert(allocations.size()==before && g_mounts.count==count);continue;}
+        succeeded=true;break;
+    }
+    assert(succeeded);auto bound=resolve(root,root,"ns-b/value");assert(VfsPathSameObject(bound,magicTarget));
+    assert(!strcmp(static_cast<MountEntry*>(bound.attachment)->physicalRoot,"/ns-a/fd-renamed"));
+    assert(VfsRemoveAt(root,b,"value",false)==-16);
+    // An old covered FD must stack at the effective mount, retaining its real
+    // covered parent instead of the bound source's backend parent.
+    auto other=resolve(root,root,"loose-file");auto savedSource=magicTarget;magicTarget=other;
+    assert(!VfsMountNamespaceBindAt(ns,root,root,"fd-source","fd-target"));
+    auto stacked=resolve(root,root,"ns-b/value");assert(VfsPathSameObject(stacked,other));
+    assert(VfsRemoveAt(root,b,"value",false)==-16);
+    assert(!VfsMountNamespaceDetach(ns,stacked));VfsPathRelease(stacked);
+    // A detached file-mount FD must not redirect to its replacement entry.
+    VfsPathRelease(magicTarget2);magicTarget2=bound;VfsPathRetain(bound);
+    assert(!VfsMountNamespaceDetach(ns,bound));
+    assert(VfsMountNamespaceBindAt(ns,root,root,"fd-source","fd-target")==-22);
+    VfsPathRelease(magicTarget2);magicTarget2=resolve(root,root,"ns-b/value");
+    // An unlinked source descriptor cannot bind a recreated former name.
+    magicTarget=savedSource;assert(!VfsRemoveAt(root,a,"fd-renamed",false));
+    Node replacement{&mounts[6],972,false,&node(a.object),{},{}};node(a.object).children["fd-renamed"]=&replacement;
+    assert(VfsMountNamespaceBindAt(ns,root,root,"fd-source","fd-target")==-2);
+    node(a.object).children.erase("fd-renamed");sourceNode->nlink=1;node(a.object).children["value"]=sourceNode;
+    VfsPathRelease(magicTarget);magicTarget={};VfsPathRelease(magicTarget2);magicTarget2={};
+    VfsPathRelease(other);VfsPathRelease(bound);VfsPathRelease(a);VfsPathRelease(b);
+    node(root.object).children.erase("fd-source");node(root.object).children.erase("fd-target");
+    VfsMountNamespaceLeave(ns);VfsPathRelease(root);VfsPathRelease(cwd);VfsMountNamespaceRelease(ns);VfsDrainMountCleanup();
     assert(allocations.size()==allocated && g_mounts.count==records);
 }
 static void testSocketBinds(brook::MountNamespace* initial,const brook::VfsPath& stableRoot) {
@@ -1079,6 +1137,7 @@ int main(){
     testMountRestrictions(initial,stableRoot);
     testReadOnlyMount(initial,stableRoot);
     testFileBinds(initial,stableRoot);
+    testMagicFileBinds(initial,stableRoot);
     testSocketBinds(initial,stableRoot);
     testLongMountPaths(initial,stableRoot);
     testNullDeviceBridge(initial,stableRoot);

@@ -4361,12 +4361,36 @@ static int Ext2ObjectPath(VfsObject* object,char* out,uint32_t capacity)
     out[length]=0;return finish(0);
 }
 
+static int Ext2ObjectEntryParent(VfsObject* object,VfsObject** out,char* leaf,uint32_t capacity)
+{
+    if(!out || !leaf || !capacity)return -22;
+    *out=nullptr;leaf[0]=0;
+    auto* hold=static_cast<Ext2OpenInode*>(object->priv);
+    KRwLockReadLock(&g_ext2Lock);
+    auto finish=[&](int error){KRwLockReadUnlock(&g_ext2Lock);return error;};
+    auto* entry=reinterpret_cast<Ext2RetainedObject*>(object)->entry;
+    if(!entry)return finish(-95);
+    if(entry->invalid)return finish(-5);
+    if(entry->detached)return finish(-2);
+    Ext2Inode parent;
+    if(!Ext2ReadInode(hold->mnt,entry->parent->inode,&parent))return finish(-5);
+    if((parent.i_mode&EXT2_S_IFMT)!=EXT2_S_IFDIR || !parent.i_links_count)return finish(-2);
+    int error=0;
+    if(Ext2DirLookup(hold->mnt,entry->parent->inode,&parent,entry->name,&error)!=hold->inode)
+        return finish(error?error:-2);
+    auto length=strlen(entry->name);
+    if(length>=capacity)return finish(-36);
+    error=Ext2AcquireObject(hold->mnt,entry->parent->inode,out);
+    if(!error)memcpy(leaf,entry->name,length+1);
+    return finish(error);
+}
+
 static const VfsObjectOps g_ext2ObjectOps={
     Ext2DestroyObject,Ext2ObjectStat,Ext2ObjectAccess,Ext2ObjectChild,
     Ext2ObjectParent,Ext2ObjectReadlink,Ext2ObjectOpen,
     Ext2ObjectCreate,Ext2ObjectMkdir,Ext2ObjectRemove,Ext2ObjectRename,
     Ext2ObjectSymlink,Ext2ObjectSocket,Ext2ObjectTimes,Ext2ObjectChmod,
-    Ext2ObjectChown,Ext2ObjectDirectoryPath,nullptr,Ext2ObjectPath,Ext2ObjectFifo,
+    Ext2ObjectChown,Ext2ObjectDirectoryPath,nullptr,Ext2ObjectPath,Ext2ObjectFifo,Ext2ObjectEntryParent,
 };
 static const VfsObjectOps* Ext2ObjectOperations(){return &g_ext2ObjectOps;}
 

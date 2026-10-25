@@ -76,6 +76,44 @@ four offline filesystem checks. Its 33 original save-directory files retain
 identical content. Only `steam_autocloud.vdf` has a refreshed mtime; all other
 save-directory timestamps are unchanged. No original saved game is loaded.
 
+### Next container gate: exact file-descriptor bind operands
+
+The following Steam attempt gets beyond both earlier failures and reaches the
+bind mount itself, which returns `ENOENT`. A public FD-to-FD mount succeeds on
+Linux but fails at its first mount on unchanged Brook. Final proc magic-link
+following retains the exact file object but intentionally has no lexical
+parent/leaf; the file-bind preparation previously assumed those were present.
+
+An optional backend callback now supplies an independently retained parent and
+leaf for a live exact entry. Ext2 validates its existing pinned entry under the
+filesystem lock and rejects detached or uncertain records. Tmpfs supplies its
+existing live node parent/name under the filesystem mutex. VFS retains the
+original attachment; it never reopens a printed pathname. File-mount roots use
+their covered parent/name, and older target FDs follow the effective covering
+mount before metadata recovery. Existing type/link-count/namespace/mutation
+restrictions remain enforced. This extends module ABI to 54, requiring all 13
+drivers to be rebuilt and staged with the kernel.
+
+Host tests cover renamed entries, allocation unwind, magic-link type mismatch,
+stacking through an old covered FD, detached mounts and unlink/recreate. The
+production Ext2 fixture checks exact parent ownership alongside existing
+rename, overwrite, unlink and hard-link reporting cases. All 109 host tests and
+compiled entry/scheduler mutation audits pass. Expanded Linux native controls
+pass, including a source FD beneath a later overmount and FD-to-FD bind after
+pivot. The first native candidate passed Ext2 rename/stack/FD binds and exposed
+the missing tmpfs counterpart at the pivot destination. The final Brook candidate passes 228 fixture checks plus 5 parent checks,
+including the tmpfs pivot destination. The read-only suite still passes all
+124 fixture checks plus 8 parent checks. Actual Steam retry is pending.
+
+Kernel SHA-256:
+`bad7d5727931bb5116c29fc3fe70188db5721fb7789c109d496de553021e154a`,
+with all 13 matched ABI-54 modules in private review
+`build/reviews/stardew-proc-bind-tmpfs-20261025/`.
+
+The preceding mkdir review exits Steam normally, completes checked sync and
+passes all four offline filesystem checks. Original save contents remain
+unchanged, with only the Steam cloud marker timestamp refreshed.
+
 ## Memory barriers
 
 The original direct startup reports CoreCLR HRESULT 0x8007FF02. A PID-scoped

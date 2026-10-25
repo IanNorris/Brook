@@ -414,8 +414,14 @@ int main()
     assert(!link->ops->object_path(link,buffer,sizeof(buffer)) && !strcmp(buffer,"/link"));
     assert(!r->ops->rename(r, "file", dir, "moved"));
     assert(!file->backendObject->ops->object_path(file->backendObject,buffer,sizeof(buffer)) && !strcmp(buffer,"/dir/moved"));
+    VfsObject* entryParent=nullptr;char entryLeaf[256];
+    assert(file->backendObject->ops->entry_parent(file->backendObject,&entryParent,entryLeaf,2)==-36 && !entryParent);
+    assert(!file->backendObject->ops->entry_parent(file->backendObject,&entryParent,entryLeaf,sizeof(entryLeaf)));
+    assert(entryParent && entryParent->identity==dir->identity && !strcmp(entryLeaf,"moved"));
+    VfsObjectRelease(entryParent);entryParent=nullptr;
     assert(!dir->ops->remove(dir, "moved", false));
     assert(file->backendObject->ops->object_path(file->backendObject,buffer,sizeof(buffer))==-2);
+    assert(file->backendObject->ops->entry_parent(file->backendObject,&entryParent,entryLeaf,sizeof(entryLeaf))==-2 && !entryParent);
     assert(!file->ops->stat(file, &a) && !a.nlink);
     off = 8193;
     assert(FileObjectRead(file->ops->file_object(file), file, buffer, 1, &off) == 1 && buffer[0] == 'A');

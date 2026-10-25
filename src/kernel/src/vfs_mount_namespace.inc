@@ -540,6 +540,29 @@ static int VfsBindWalkLabelLocked(const VfsOwnedWalk& walk,bool backend,char* ou
     int error=backend?VfsBackendDirectoryLocked(value.parent,out,capacity):VfsGlobalDirectoryLocked(value.parent,out,capacity);
     return error?error:VfsAppendLeaf(out,capacity,value.leaf);
 }
+// Magic links retain the exact object, but a final link has no lexical parent.
+// Recover only its backend entry provenance on the same attachment. A file
+// mount root instead belongs to the covered entry, not its source directory.
+static int VfsBindEntryLocked(VfsOwnedWalk& walk)
+{
+    auto& value=walk.value;
+    auto* mount=static_cast<MountEntry*>(value.object.attachment);
+    if(!mount || !VfsMountPublished(*mount))return -22;
+    if(mount->coveredParent.object && value.object.object->identity==mount->rootIdentity &&
+       value.object.object->ops==mount->rootObjectOps) {
+        VfsPathRelease(value.parent);value.parent=mount->coveredParent;VfsPathRetain(value.parent);
+        StrCopy(value.leaf,mount->coveredName,sizeof(value.leaf));return 0;
+    }
+    if(value.parent.object)return 0;
+    auto* object=value.object.object;
+    if(!object->ops->entry_parent)return -95;
+    VfsObject* parent=nullptr;
+    int error=object->ops->entry_parent(object,&parent,value.leaf,sizeof(value.leaf));
+    if(error) {VfsObjectRelease(parent);return error;}
+    if(!parent || !value.leaf[0]) {VfsObjectRelease(parent);return -5;}
+    value.parent={value.object.attachment,parent};VfsPathRetain(value.parent);VfsObjectRelease(parent);
+    return 0;
+}
 int VfsMountNamespaceBindAt(MountNamespace* ns,const VfsPath& root,const VfsPath& start,const char* sourceText,const char* targetText,bool recursive)
 {
     FileMutationGuard transaction;VfsOwnedWalk source,target;
@@ -547,6 +570,17 @@ int VfsMountNamespaceBindAt(MountNamespace* ns,const VfsPath& root,const VfsPath
     if(int error=VfsWalkAtLocked(root,start,targetText,target))return error;
     VnodeStat stat{};if(int error=VfsObjectStatLocked(source.value.object.object,&stat))return error;
     if(stat.isDir)return VfsMountNamespaceBindLocked(ns,source.value.object,target.value.object,recursive);
+    // Mount operations follow covering mounts even through an older FD. Derive
+    // covered metadata from that effective target as well, before publication.
+    VfsMountTargetLease lease;if(int error=lease.Follow(target.value.object))return error;
+    if(!VfsPathSame(lease.value,target.value.object)) {
+        VfsPathRelease(target.value.object);target.value.object=lease.value;VfsPathRetain(target.value.object);
+        VfsPathRelease(target.value.parent);target.value.parent={};target.value.leaf[0]=0;
+    }
+    VnodeStat targetStat{};if(int error=VfsObjectStatLocked(target.value.object.object,&targetStat))return error;
+    if(targetStat.isDir)return -20;
+    if(int error=VfsBindEntryLocked(source))return error;
+    if(int error=VfsBindEntryLocked(target))return error;
     char sourceLabel[512],targetLabel[512];
     if(int error=VfsBindWalkLabelLocked(source,true,sourceLabel,sizeof(sourceLabel)))return error;
     if(int error=VfsBindWalkLabelLocked(target,false,targetLabel,sizeof(targetLabel)))return error;

@@ -49,6 +49,10 @@ struct VfsObjectOps {
     // backends must fail rather than substitute a diagnostic/opening label.
     int (*object_path)(VfsObject*,char* out,uint32_t capacity) = nullptr;
     Vnode* (*create_fifo)(VfsObject* parent,const char* name,uint16_t mode,int* error) = nullptr;
+    // Exact live entry provenance, independently owned parent plus copied leaf.
+    // Never reconstruct by reopening object_path. Detached/ambiguous entries
+    // must fail. Caller retains the original mount attachment separately.
+    int (*entry_parent)(VfsObject*,VfsObject** parent,char* leaf,uint32_t capacity) = nullptr;
 };
 struct VfsObject {
     const VfsObjectOps* ops;
