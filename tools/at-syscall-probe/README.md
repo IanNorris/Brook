@@ -15,6 +15,16 @@ containment path, including real FD-to-FD mounts, rename and stacking through
 an older covered descriptor. Both probes require a disposable namespace and bounded host
 observation.
 
+`steamrtglcheck.c` is a static diagnostic for a fully constructed SteamRT
+container. Pass the installed 64-bit overlay, exact captured GL file, and a
+fresh output path for a copy of the generated cache. It reports only loader
+variables and public library/cache metadata, then compares bash without the
+overlay, with it, and with the override directory prepended. Read the individual
+statuses: exit zero permits an initial overlay failure if the prepend control
+succeeds. Capture output in append mode for multiple forked writers. A copied
+cache is needed because the original lives on container tmpfs and disappears
+on exit. This probe alone does not establish game startup.
+
 `sockettypecheck.c` checks send/receive errors and the send-to-write fallback
 used by PulseAudio. Linux and Brook must pass 85 checks: valid pipes, eventfds,
 memfds and `/dev/null` return ENOTSOCK; absent/closed/O_PATH descriptors return

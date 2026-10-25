@@ -166,6 +166,42 @@ with all 13 ABI-54 drivers is retained in private
 250 host seconds, drains Steam normally, completes checked sync and passes all
 four offline filesystem checks. Original save contents remain unchanged.
 
+### Provider loader cache location
+
+With pathname socket following fixed, SteamRT reaches `pv-adverb` and command
+loading. Its `/bin/bash` then cannot load `libGL.so.1`. A static control inside
+the normal mutable Soldier setup establishes that the GL files are mounted,
+the regenerated cache is valid and contains their x86-64 SONAMEs, and plain
+bash loads. The 64-bit Steam overlay fails until the override directory is
+prepended. Read/mmap controls agree on the preserved cache bytes.
+
+The provider loader copied into initrd is Nix glibc 2.42. It is compiled to read
+its store-prefix cache instead of `/etc/ld.so.cache`. Runtime logs confirm that
+SteamRT replaces the container interpreter with this `/lib64` provider copy.
+A same-container A/B records the original loader searching its Nix cache and
+failing; a separately adapted loader searches `/etc/ld.so.cache` and loads the
+same overlay/bash without the override prepend. The two normal mutable controls
+take about 154 and 151 host seconds; direct-wrap and no-copy controls encounter
+different setup paths and are not equivalent game controls.
+
+Provider provisioning now relocates only the unique standalone cache-path
+literal in the copied loader's read-only, non-executable ELF load data. It
+preserves file size, layout, executable bytes, the separate help-text occurrence
+and the build ID. It records original/output SHA-256, offset, span and old/new
+paths in the manifest. The installed Nix package remains unchanged. Five tests
+cover exact byte preservation and rejection of missing/duplicate literals,
+malformed headers, writable/code data and partial executable-segment overlap.
+The native explicit-loader A/B passes. Its unchanged help text/build ID must
+not be used to identify this modified compatibility artifact; use the manifest
+hash. The compatibility output SHA-256 is
+`2d544fecc1c8c402834451c37c61d74a193241e3e7968c327940e5e60e57d96a`.
+
+The fresh initrd and real Steam game retry remain pending. Kernel and all
+13 ABI-54 drivers remain the previously checked `a44a3823...` build. The preceding
+review drains Steam and all diagnostic helpers normally, completes checked sync
+and passes all four offline filesystem checks. Original save contents and
+non-cloud-marker timestamps remain unchanged.
+
 ## Memory barriers
 
 The original direct startup reports CoreCLR HRESULT 0x8007FF02. A PID-scoped
