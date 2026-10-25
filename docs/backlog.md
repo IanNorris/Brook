@@ -1,5 +1,23 @@
 # Recovery and VM-control backlog
 
+- Investigate Steam game startup runtime-copy cost. During the 25 October
+  live review Steam marks Stardew running, but no game window exists; the
+  tracked reaper's child is still `pressure-vessel-wrap`. Its Soldier runtime
+  log repeatedly reports hard-link `EPERM` and falls back to copying files.
+  Preserve this as a startup-cost lead, not a demonstrated game hang or a
+  successful through-Steam launch. Measure runtime preparation separately
+  before deciding between real filesystem hard-link support and another
+  compatible runtime-preparation improvement. Evidence remains private under
+  `build/reviews/pointer-live-20261025/stardew-launch/`.
+
+- Extend launch feedback to games started inside Steam or another application.
+  Current feedback is admitted by Brook's app launcher; Steam's internal Play
+  action creates no separate Brook launch record or taskbar placeholder. The
+  25 October Stardew review exposes this while runtime preparation is slow.
+  Define an explicit launch/readiness handoff, a distinct game identity, and
+  timeout/failure/exit cleanup. Do not infer a launch for every child process
+  or clear its indicator merely because the already-open Steam window exists.
+
 - Add a convenient host-integrated/relative pointer mode switch for native VM
   use. The 25 October user review confirms Q3 capture works with PS/2-only
   input, but finds it less convenient than the tablet outside games. Preserve
