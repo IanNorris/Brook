@@ -62,7 +62,7 @@ the table distinguishes tested behavior from remaining limitations.
 | Wine64 | 11.0 | ✅ Basic apps | Console command and Windows Notepad: keyboard input, save, normal close and cold-boot reopen as Brook. Broader Windows coverage remains limited. [Evidence and screenshot](docs/wine-smoke.md#console-and-notepad-acceptance--19-october) |
 | Wine + DXVK | 11.0 / 2.7.1 | ⚠️ Experimental D3D11 | Hardware Venus shader/readback probe and Windows SDL3 Snake; keyboard input, resize, maximize, minimize/restore and repeated launch/close verified. Per-app Unity audio also verified; standalone Proton GE has a separate smoke test. [Results](docs/wine-dxvk.md), [Unity smoke test](docs/wine-unity.md) |
 | Proton GE | 11-10 / DXVK 3.1.1 | ⚠️ Experimental | Standalone Helltaker at 720p: first-puzzle input/reset, captured audio and normal exit verified. Steam client integration remains untested. [Results](docs/proton.md) |
-| Steam | Native64 client | ⚠️ Experimental | QR sign-in, Library, downloads and verification tested through SteamRT; individual Xwayland windows support native controls. Installed game launches remain blocked by runtime and architecture gaps. [Acceptance and limits](docs/steam-library-stability.md) |
+| Steam | Native64 client | ⚠️ Experimental | QR sign-in, Library, downloads and verification tested through SteamRT. Stardew Valley's native64 title/menu, isolated Load screen and Exit work through Steam; runtime preparation is slow, and gameplay/audio acceptance remains open. [Game results](docs/stardew-native64.md), [client limits](docs/steam-library-stability.md) |
 | D3D12 / VKD3D-Proton | 3.1.0 | ⚠️ Experimental | Hardware shader/readback, event fences, 720p swapchain resize, Windows SDL3 Snake and Veloren 3D singleplayer through Proton GE. Per-game native shader compiler required for Veloren. [Results and screenshots](docs/d3d12.md) |
 | SpaceVenture (Windows) | 2.08.12 / Unity 2022.3 | ⚠️ Experimental | D3D11/DXVK main menu, opening sequence and first-room interaction; clocked ALSA PCM captured. [Screenshot and limits](docs/wine-unity.md#spaceventure--unity-2022362f2) |
 | Helltaker (Windows) | Unity 2019.2.9f1 | ⚠️ Experimental | 720p D3D11/DXVK first-puzzle gameplay, keyboard movement/restart, minimize/restore and normal exit; clocked ALSA audio captured. [Screenshot and scope](docs/wine-unity.md) |
@@ -77,10 +77,12 @@ the table distinguishes tested behavior from remaining limitations.
   and individual Xwayland windows with focus, move, resize, maximize and
   minimize/restore. SteamRT startup now uses its companion launcher service;
   retained file descriptors and resource-limit reporting fixes support the
-  client. Game launch acceptance remains open: the tested i386 game requires
-  architecture support, while Stardew Valley's native64 build exposes separate
-  container and .NET initialization gaps. [Acceptance](docs/steam-library-stability.md)
-  and [remaining work](docs/backlog.md#stardew-valley-native64-acceptance-24-october).
+  client. Stardew Valley's native64 build now reaches its interactive title/menu
+  through Steam, with isolated Load, Back and Exit checked. Runtime preparation
+  takes about five minutes; window sizing, cooperative pointer input and audible
+  output need further testing. The tested i386 game still requires architecture
+  support. [Game results](docs/stardew-native64.md) and
+  [remaining work](docs/backlog.md#stardew-valley-native64-acceptance-24-october).
 
 - **D3D12:** Proton GE's VKD3D renders a shader triangle with verified GPU
   readback and a resized 720p window; Windows SDL3 Snake also runs with its
@@ -288,7 +290,7 @@ New captures use native 1920×1080 without upscaling. See
   <a href="docs/images/brook_steam_library_1080.png"><img src="docs/images/brook_steam_library_1080.png" alt="Steam Library on Brook after installing Stardew Valley, with account and community information masked" width="960"></a>
 </p>
 
-<p align="center"><em>Steam Library after downloading and verifying Stardew Valley. Native 1920×1080 capture; account and community information masked. Game startup remains under investigation.</em></p>
+<p align="center"><em>Steam Library after downloading and verifying Stardew Valley. Native 1920×1080 capture; account and community information masked. Stardew's native64 title/menu now launches through Steam.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_wine_spaceventure_1080.png"><img src="docs/images/brook_wine_spaceventure_1080.png" alt="Windows SpaceVenture's first 3D room running through Wine, DXVK and hardware Vulkan on Brook" width="960"></a>

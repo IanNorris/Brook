@@ -1648,26 +1648,33 @@ each probe's argument parser.
 
 ### Stardew Valley native64 acceptance (24 October)
 
-- AppID 413150's default Linux depot installs and verifies through Steam;
-  header-only inspection confirms its game apphost and bundled CoreCLR are
-  x86-64. No saved game was loaded or modified during the startup trial.
-- Steam still invokes its i386 `reaper`. A private diagnostic build of the
-  public MIT helper (Plagman/reaper revision
-  `fb26ffe691718ae149095b2b478ad88628463017`) passes native true/false controls
-  and advances the launch to pressure-vessel. This is not a supported
-  replacement: Brook does not implement child-subreaper adoption. The stock
-  helper was restored after testing.
-- The game container copies its runtime after hard-link failures, then fails
-  opening a bind source with EOPNOTSUPP. That source is a regular executable
-  accessible by stat and O_PATH outside the failing container. Diagnose mount
-  namespace/path following rather than treating it as a missing installation.
-- A separate direct native launch reaches CoreCLR initialization and fails
-  with HRESULT 0x8007FF02. A PID-scoped trace records membarrier ENOSYS, then
-  a one-page mlock ENOSYS immediately before exit. This fits CoreCLR's fallback
-  process-wide barrier initialization, but the shipped caller still needs
-  module-relative confirmation. Assess proper private expedited membarrier
-  support with cross-CPU ordering tests before the broader mlock feature.
-  Returning success without actual barrier/residency semantics is insufficient.
-- Acceptance remains game title/menu plus clean exit. No game window was
-  reached. Proprietary files, saves, authenticated logs and captures remain in
-  ignored private review storage.
+- **25 October checkpoint:** AppID 413150 reaches an interactive native64
+  title/menu through Steam. Load shows the isolated home's empty save list;
+  Back and Exit work. The game/runtime helpers drain, Steam exits 0, checked
+  guest sync succeeds and all four offline filesystem checks pass. Original
+  save contents remain unchanged. [Detailed evidence](stardew-native64.md).
+- The bounded startup prerequisites are implemented and tested: private
+  expedited memory barriers, signal-return fixes, Linux uname personality,
+  child-subreaper adoption with a reproducible public native64 reaper package,
+  exact proc-FD reporting/binds, existing-directory mkdir error ordering,
+  pathname socket FD following, the copied provider loader's cache location,
+  and companion PulseAudio environment propagation. Broader 32-bit support
+  remains outside this work.
+- Runtime copying still takes roughly five minutes before the game appears.
+  Profile hard-link fallback/copy work separately from game initialization.
+- Fix initial smaller-window clipping and cooperative pointer modes. Maximizing
+  exposes the full menu; the captured pointer currently needs relative PS/2
+  input rather than absolute tablet injection.
+- Verify audible output and actual gameplay. The successful startup uses the
+  private PulseAudio null sink. Steam API/IPC warnings remain. The Exit trial
+  drains but reports outer status 1 and a killed child, not a verified zero
+  game exit; see the earlier direct self-SIGKILL trace before attributing cause.
+- Fix stale bridge launch coalescing after an exited application with no
+  correlated window. The UI retry reused an old pending record; a single
+  tracked guest launch provided this acceptance run.
+- Preserve host launcher ownership for long reviews. The original exec
+  controller ended 143 before recording its child's terminal wait; independent
+  exact-QEMU exit/open-disk checks established offline safety for fsck. Do not
+  replace that missing wrapper status with an inferred zero.
+- Proprietary files, saves and authenticated evidence remain in ignored private
+  storage. Game-only screenshots may be shared; account UI must stay masked.

@@ -1,9 +1,10 @@
 # Stardew Valley native64 startup — 24 October 2026
 
-The default Linux depot installs and verifies through Steam, but game startup
-is not yet accepted. The title/menu, basic input and normal exit remain the
-goal; no existing save was loaded during these trials. Game files and account
-evidence stay in ignored private reviews.
+The default native64 Linux depot now reaches an interactive title/menu through
+Steam. Load shows an empty isolated test home, Back returns to the title, and
+the in-game Exit button removes the game and its runtime helpers. This is a
+startup/menu result, not full gameplay or audible-output acceptance. No existing
+save was loaded. Game files and account evidence stay in ignored private reviews.
 
 ## 25 October: container source FD reporting
 
@@ -216,7 +217,39 @@ service confirms that its environment has neither `PULSE_SERVER` nor
 `PULSE_COOKIE`. The public launcher previously supplied these only to the inner
 Steam command, after creating the companion service. It now supplies the explicit
 SteamRT-visible endpoint and cookie path to both branches. No cookie contents
-are exported. Actual game acceptance with that change remains pending.
+are exported. The new companion reports both settings, and a real `pactl info`
+request through it succeeds against PulseAudio 17.0. This diagnostic server uses
+a null sink; its successful connection does not establish speaker output.
+
+### Through-Steam title/menu acceptance
+
+With that environment fix, the actual AppID launch reaches a rendered game
+window after about 310 host seconds. Runtime preparation occupies roughly the
+first 290 seconds. The smaller initial window clips the menu; maximizing makes
+the full title and its buttons visible. Absolute tablet input does not move the
+captured game pointer. Switching the active virtual mouse to PS/2 and injecting
+relative motion/button pairs opens **No Saved Games Found**, returns with Back,
+and activates Exit. No overlay-disable workaround or game-library modification
+is needed. Smaller-window geometry and cooperative absolute/relative input
+remain follow-up work.
+
+After Exit, the game window, reaper and game-runtime helpers disappear and Steam
+removes the AppID from its running list. The outer game launch reports status 1
+and the game shell reports its child as `Killed`; this is not a verified zero
+exit. The earlier direct launch's scoped trace showed the game killing itself
+with SIGKILL, but that cause was not independently retraced in this run. Steam
+API initialization/IPC warnings also remain in the private logs. Broader Steam
+integration and gameplay remain unaccepted.
+
+Steam's normal shutdown completes with its tracked launcher job exiting 0 and
+no remaining client or private-Pulse helpers. All 33 original save files retain
+identical content; non-cloud-marker timestamps are unchanged. Checked guest
+metadata/device sync succeeds. The original host exec controller ended with
+143 before recording its child's terminal wait, so that wrapper status remains
+unavailable and its receipt is preserved. Independent exact-QEMU identity and
+open-disk checks establish that the images are offline. All four read-only
+filesystem checks (data, nix, tmp, boot) return 0. Private evidence is retained
+in `build/reviews/stardew-loader-cache-20261025/`.
 
 ## Memory barriers
 
