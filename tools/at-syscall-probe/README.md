@@ -4,6 +4,16 @@ Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:
 
+`readonlybindcheck.c --disposable-vm DIRECTORY --brook` checks read-only binds
+on tmpfs and the filesystem containing DIRECTORY, including `mkdir(existing)`
+returning EEXIST while new names return EROFS. The Linux `--tmpfs-only` mode
+isolates that backend when an inherited host mount restriction prevents the
+separate disk/mapping remount control; it does not count as a full two-backend
+pass. `filebindcheck.c --brook-ext2` additionally checks ordinary and O_PATH
+proc-fd names for unbound files, then the actual `/oldroot` bind/proc/pivot
+containment path. Both probes require a disposable namespace and bounded host
+observation.
+
 `sockettypecheck.c` checks send/receive errors and the send-to-write fallback
 used by PulseAudio. Linux and Brook must pass 85 checks: valid pipes, eventfds,
 memfds and `/dev/null` return ENOTSOCK; absent/closed/O_PATH descriptors return

@@ -16,6 +16,7 @@
 #include <string.h>
 static unsigned checks;
 static int brook;
+static int tmpfs_only;
 static unsigned long restrictions=MS_NOSUID|MS_NODEV;
 #define CK(x) do {++checks;if(!(x)){fprintf(stderr,"ROBIND FAIL line=%d %s errno=%d\n",__LINE__,#x,errno);exit(1);}}while(0)
 #define RO(x) do {errno=0;CK((x)==-1&&errno==EROFS);}while(0)
@@ -42,6 +43,11 @@ static void exercise(const char* source,const char* destination,int mapping){
   if(brook){int status=readonly(destination);if(status){CK(errno==EBUSY);puts("ROBIND pending writeback retained admission");sync();}else puts("ROBIND writeback retired before remount");}
  }
  CK(!readonly(destination));
+ // Existence is checked before read-only admission for mkdir, as required
+ // by mkdir-p callers preparing already-populated container bind parents.
+ errno=0;CK(mkdir(newdir,0700)==-1&&errno==EEXIST);
+ errno=0;CK(mkdir(value,0700)==-1&&errno==EEXIST);
+ errno=0;CK(mkdir(destination,0700)==-1&&errno==EEXIST);
  struct statvfs space;CK(!statvfs(destination,&space)&&(space.f_flag&ST_RDONLY));
  int f=open(value,O_RDONLY|O_APPEND);CK(f>=0);char c=0;CK(read(f,&c,1)==1&&c=='A');
  RO(fchmod(f,0600));RO(fchown(f,0,0));
@@ -63,7 +69,7 @@ static void exercise(const char* source,const char* destination,int mapping){
  printf("ROBIND BACKEND PASS mapping=%d checks=%u\n",mapping,checks);
 }
 int main(int argc,char** argv){
- setbuf(stdout,NULL);alarm(60);brook=argc==4&&!strcmp(argv[3],"--brook");CK((argc==3||brook)&&!strcmp(argv[1],"--disposable-vm")&&geteuid()!=0);
+ setbuf(stdout,NULL);alarm(60);brook=argc==4&&!strcmp(argv[3],"--brook");tmpfs_only=argc==4&&!strcmp(argv[3],"--tmpfs-only");CK((argc==3||brook||tmpfs_only)&&!strcmp(argv[1],"--disposable-vm")&&geteuid()!=0);
  char base[]="/tmp/robind-XXXXXX",disk[512],diskvalue[512];CK(mkdtemp(base));CK(snprintf(disk,sizeof(disk),"%s/robind-XXXXXX",argv[2])>0&&mkdtemp(disk));filename(diskvalue,sizeof(diskvalue),disk,"value");makevalue(diskvalue);
  uid_t uid=geteuid();gid_t gid=getegid();pid_t child=syscall(SYS_clone,(unsigned long)(CLONE_NEWUSER|CLONE_NEWNS|SIGCHLD),0L,0L,0L,0L);CK(child>=0);
  if(child){waitok(child);CK(!unlink(diskvalue)&&!rmdir(disk)&&!rmdir(base));printf("ROBIND PARENT PASS checks=%u\n",checks);return 0;}
@@ -71,6 +77,6 @@ int main(int argc,char** argv){
  CK(!mount(NULL,"/",NULL,MS_PRIVATE|MS_REC,NULL));
  if(brook){errno=0;CK(readonly("/")==-1&&errno==EOPNOTSUPP);}
  CK(!mount("tmpfs",base,"tmpfs",MS_NOSUID|MS_NODEV,NULL)&&!chdir(base));
- CK(!mkdir("source",0700));makevalue("source/value");exercise("source","target",0);exercise(disk,"disk-target",1);
+ CK(!mkdir("source",0700));makevalue("source/value");exercise("source","target",0);if(!tmpfs_only)exercise(disk,"disk-target",1);
  CK(!chdir("/")&&!umount2(base,MNT_DETACH));printf("ROBIND FIXTURE PASS checks=%u brook_cases=%d\n",checks,brook);_exit(0);
 }

@@ -13,10 +13,10 @@ static int VfsWalkAtLocked(const VfsPath& root,const VfsPath& start,const char* 
     if(!root.object || !start.object)return -9;
     VfsRetainedProvider provider{realIds};return WalkRetainedPath(root,start,text,&walk.value,provider,options);
 }
-static int VfsMutationLeaf(const VfsPath& parent,const char* name)
+static int VfsMutationLeaf(const VfsPath& parent,const char* name,bool requireWritable=true)
 {
     if(!parent.object)return -16;
-    if(VfsReadOnly(static_cast<MountEntry*>(parent.attachment)))return -30;
+    if(requireWritable && VfsReadOnly(static_cast<MountEntry*>(parent.attachment)))return -30;
     if(!name || !name[0] || StrEq(name,".") || StrEq(name,".."))return -22;
     for(uint32_t i=0;name[i];++i)if(name[i]=='/')return -22;
     return 0;
@@ -37,9 +37,9 @@ static bool VfsVirtualChildrenLocked(const VfsPath& path)
 // Return an independently owned uncovered child, or empty for a missing leaf.
 // Every error releases its partial backend output. Parent pins backing through
 // the use and final release of this temporary backend object.
-static int VfsMutationTargetLocked(const VfsPath& parent,const char* name,VfsOwnedObject& child)
+static int VfsMutationTargetLocked(const VfsPath& parent,const char* name,VfsOwnedObject& child,bool requireWritable=true)
 {
-    if(int error=VfsMutationLeaf(parent,name))return error;
+    if(int error=VfsMutationLeaf(parent,name,requireWritable))return error;
     VfsPath reserved{};bool virtualLink=VfsReservedVirtualLocked(parent,name,&reserved);
     VfsPathRelease(reserved);if(virtualLink)return -16;
     if(!parent.object->ops->lookup)return -95;
@@ -168,8 +168,11 @@ int VfsMkdirAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_
     if(int error=VfsWalkAtLocked(root,start,text,walk,{false,true,true}))return error;
     auto& parent=walk.value.parent;const char* leaf=walk.value.leaf;
     if(!parent.object || StrEq(leaf,".") || StrEq(leaf,".."))return -17;
-    VfsOwnedObject target;if(int error=VfsMutationTargetLocked(parent,leaf,target))return error==-16?-17:error;
+    // mkdir(existing) is EEXIST even on a read-only attachment. Container
+    // mkdir-p preparation relies on this without requesting any mutation.
+    VfsOwnedObject target;if(int error=VfsMutationTargetLocked(parent,leaf,target,false))return error==-16?-17:error;
     if(target.value)return -17;
+    if(VfsReadOnly(static_cast<MountEntry*>(parent.attachment)))return -30;
     return parent.object->ops->mkdir?parent.object->ops->mkdir(parent.object,leaf,mode&01777&~(mask&0777)):-95;
 }
 int VfsRemoveAt(const VfsPath& root,const VfsPath& start,const char* text,bool directory)

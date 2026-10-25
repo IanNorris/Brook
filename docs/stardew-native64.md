@@ -46,6 +46,36 @@ All 13 driver modules remain matched at ABI 53. Native evidence is private in
 `build/reviews/stardew-fd-report-20261025/`. Through-Steam game acceptance is
 still pending; the passing file probe alone does not establish it.
 
+### Next container gate: mkdir on existing read-only parents
+
+The actual retry gets beyond the former FD-reporting error and then fails in
+bubblewrap's destination-parent preparation with `EROFS`. A focused Linux/Brook
+comparison confirms an independent error-ordering bug: `mkdir` on an existing
+directory in a read-only bind returns `EEXIST` on Linux but `EROFS` on Brook.
+This prevents normal mkdir-p preparation of already-present `/nix/store` parents.
+
+The candidate looks up the final entry before requiring writable admission for
+`mkdir`. Existing entries return `EEXIST`; missing entries still encounter
+`EROFS` before backend creation. Other mutation operations retain their previous
+ordering. Parent search permission checks and mountpoint handling remain in the
+same namespace transaction.
+
+All 109 host tests and compiled entry/scheduler audits pass. The expanded
+read-only-bind probe passes the Linux tmpfs control (62 fixture checks, 8 parent
+checks). The separate Linux disk/mapping control encounters an inherited host
+mount restriction; it is not a passing full Linux run. The fixed Brook candidate
+passes both tmpfs and ext2 controls (124 fixture checks, 8 parent checks), then
+passes the 190-check file-bind/pivot fixture again. The unchanged candidate
+before this fix fails the first existing-directory assertion with error 30.
+
+Kernel `37f3215728af26e17eae2dd8a8d69fd9857c11fe844a73b25943674aa45d2c4d`
+and matched ABI-53 modules are in the private `stardew-mkdir-20261025` review.
+The preceding FD-reporting review exits Steam normally with no remaining
+client/runtime/private-Pulse helpers, acknowledges checked sync, and passes all
+four offline filesystem checks. Its 33 original save-directory files retain
+identical content. Only `steam_autocloud.vdf` has a refreshed mtime; all other
+save-directory timestamps are unchanged. No original saved game is loaded.
+
 ## Memory barriers
 
 The original direct startup reports CoreCLR HRESULT 0x8007FF02. A PID-scoped

@@ -491,6 +491,8 @@ static void testReadOnlyMount(brook::MountNamespace* initial,const brook::VfsPat
     assert(VfsAccess(reader,2,false)==-30&&VfsPathAccess(path,2)==-30&&VfsAccessAt(root,bind,"ro-file",2)==-30);
     assert(!VfsOpenAt(root,bind,"new",VFS_O_CREATE|VFS_O_WRITE,0600,0,&error)&&error==-30);
     assert(VfsMkdirAt(root,bind,"new",0700,0)==-30&&VfsRemoveAt(root,bind,"ro-file",false)==-30);
+    assert(VfsMkdirAt(root,bind,"ro-file",0700,0)==-17);
+    assert(VfsMkdirAt(root,bind,".",0700,0)==-17);
     assert(VfsSymlinkAt(root,bind,"ro-file","new")==-30&&VfsRenameAt(root,bind,"ro-file",bind,"other")==-30);
     assert(VfsChmodAt(root,bind,"ro-file",0600)==-30&&VfsChownAt(root,bind,"ro-file",0,0)==-30&&VfsSetTimesAt(root,bind,"ro-file",times)==-30);
     assert(!VfsCreateSocketAt(root,bind,"sock",0600,0,&error)&&error==-30);
