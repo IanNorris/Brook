@@ -536,6 +536,15 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
     }
     Process* launcher = ProcessCurrent();
     proc->launchId = trackLaunch && launcher ? launcher->launchId : 0;
+    // Desktop applications have no controlling terminal. Keeping the default
+    // kernel-console stdin makes ioquake3 enter its tty console path and makes
+    // Wine try to transfer that unsupported descriptor to wineserver. Match
+    // the debug-job launch contract for GUI launches while keeping stdout and
+    // stderr available for diagnostics and interactive shell launches intact.
+    if (proc->launchId && g_vfbNone) {
+        proc->fds[0].type = FdType::DevNull;
+        proc->fds[0].handle = nullptr;
+    }
     proc->lifecycleRole = service ? ProcessLifecycleRole::Service : ProcessLifecycleRole::Application;
 
     // Set up compositor placement
