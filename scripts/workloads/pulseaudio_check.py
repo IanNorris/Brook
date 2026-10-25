@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Run inside Brook: private, cookie-authenticated PulseAudio with a null sink.
+"""Run inside Brook: private, cookie-authenticated PulseAudio.
 
-This diagnostic server never selects a hardware output. Use a fresh runtime
+The default is a silent null sink; --output oss explicitly selects /dev/dsp.
+Use a fresh runtime
 directory visible to the intended client, including inside SteamRT if needed.
 Stop the retained process normally when the test ends. Cookies stay in the guest.
 """
@@ -15,6 +16,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--runtime', type=Path, required=True,
                         help='Fresh private guest directory; its parent must already exist')
+    parser.add_argument('--output', choices=['null', 'oss'], default='null',
+                        help='Null diagnostic output, or audible Brook OSS output')
     args = parser.parse_args()
     if os.geteuid() == 0:
         parser.error('run as the desktop user')
@@ -33,14 +36,18 @@ def main():
     socket = pulse / 'native'
     os.environ.update(XDG_RUNTIME_DIR=str(runtime), PULSE_RUNTIME_PATH=str(pulse),
                       PULSE_COOKIE=str(cookie))
+    sink = ('module-null-sink sink_name=brook_workload_test' if args.output == 'null' else
+            'module-oss device=/dev/dsp record=0 playback=1 sink_name=brook_workload_test '
+            'format=s16le rate=44100 channels=2')
     command = [str(program), '--daemonize=no', '--use-pid-file=no',
                '--exit-idle-time=-1', '--high-priority=no', '--realtime=no',
                '--log-target=stderr', '-n',
-               '--load=module-null-sink sink_name=brook_workload_test',
+               '--load=' + sink,
                '--load=module-native-protocol-unix socket=' + str(socket)
                + ' auth-cookie=' + str(cookie)]
     print(json.dumps(dict(uid=os.getuid(), server='unix:' + str(socket),
-                          cookie_path=str(cookie), output='null sink')), flush=True)
+                          cookie_path=str(cookie),
+                          output='null sink' if args.output == 'null' else 'OSS /dev/dsp')), flush=True)
     os.execv(str(program), command)
 
 

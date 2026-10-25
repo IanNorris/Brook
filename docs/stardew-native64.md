@@ -291,6 +291,84 @@ The game is left open and maximized after capture. Its private PulseAudio null
 sink remains silent. A reversible attempt to load `module-oss` for speaker output
 fails at `FIONBIO` with `ENOTTY`, before changing the existing stream's sink.
 
+### Hard links and indexed open inodes — 25 October
+
+The next candidate implements ext2 `link`/`linkat` with retained source identity,
+attachment boundaries, protected-hardlink checks and no resurrection after the
+last unlink. File bind mounts now identify the covered directory entry as well
+as the inode, so a bind over one name cannot hide a sibling hard-link alias.
+An inode hash index replaces the global linear search on open-file hits and
+avoids allocating a candidate on that common path. Module ABI is now 55.
+
+The unprofiled game-window observation falls from 333.5 to 128.3 host seconds
+(about 62% less time). Steam itself takes a separate 98.1 seconds to open in this
+run. Game-start data-image traffic falls from 3.89 GiB read / 1.89 GiB written
+to 1.37 GiB read / 186 MiB written. A subsequent warm launch reaches its window
+in 109.7 seconds with short profiles; this is not a second cold comparison.
+The inode lookup no longer appears among leading hotspots. Retained mount/path
+walks and synchronous I/O remain important; startup is still much too slow.
+
+Native controls pass 58 ordinary-user and 59 privileged hard-link checks,
+242 file-bind fixture checks plus five parent checks, readonly and socket-bind
+suites. Host fixtures exercise hash collisions, allocation failure on an existing
+inode, orphan lifetime, alias mounts and partial directory-publication failure.
+All 109 host tests and compiled entry/scheduler mutation audits pass.
+
+Boundaries: tmpfs and FAT hard links remain unsupported. Empty-source
+`AT_EMPTY_PATH` links require `CAP_DAC_READ_SEARCH`; Linux also supports a
+matching open-time-credential case that Brook cannot yet represent. Ext2 is
+not journaled: uncertain partial media writes retain a conservative link-count
+overestimate and report an error, rather than risking a published undercount.
+
+### Audio output and recovery acceptance
+
+The companion PulseAudio helper now has an explicit `--output oss` option;
+its default null sink remains available for silent diagnostics. OSS `FIONBIO`
+and `SNDCTL_DSP_POST` support allow the unmodified PulseAudio backend to open
+and start the hardware output. The owner initially heard clean game audio,
+but it later stopped and stayed silent past the menu. Captured evidence shows
+a roughly 252 ms HDA sample gap, a latched stream discontinuity, then a fatal
+PulseAudio write `EPIPE` and removal of its OSS sink.
+
+The candidate prepares a fresh OSS stream epoch on the next write or output
+space/delay query, with poll/epoll reporting that recovery can proceed. A write
+returns any already accepted prefix before changing epochs. Old uncertain
+frames are discarded, never reported as completed; explicit drain cancellation
+and hardware clock safety checks remain intact. This follows the recovery
+pattern in [Linux OSS emulation](https://raw.githubusercontent.com/torvalds/linux/v6.12/sound/core/oss/pcm_oss.c),
+while [PulseAudio's OSS backend](https://raw.githubusercontent.com/pulseaudio/pulseaudio/v17.0/src/modules/oss/module-oss.c)
+otherwise treats write errors besides EAGAIN/EINTR as fatal.
+
+The public `ossrecovercheck` probe passes both blocking and nonblocking writes
+through two forced 600 ms host-process stalls each. All four stalls produce
+actual HDA sample-gap evidence, and writes resume without EPIPE. A normal QMP
+pause does not reproduce that fault because virtual time pauses too; its passing
+probe run is not counted as fault-recovery evidence. The probe's low square-wave
+buzz stops on exit, with no streams remaining. A fresh boot then opens Steam in 102.4 seconds and the game in a further
+134.0 seconds. With the actual game playing through PulseAudio, another 600 ms
+host-process stall produces the target sample-gap fault. The same stream
+identity recovers into a new epoch; completion advances through 90 seconds of
+observation without the OSS sink disappearing or a fatal broken-pipe error.
+The owner confirms that music playback sounded good in this run.
+A two-second private QEMU PCM capture after recovery contains non-silent audio
+(88,448 stereo frames at 44.1 kHz). This verifies bounded recovery, not broad
+claims of glitch-free gameplay or long-term audio stability.
+
+The first candidate boot lost Xwayland before application acceptance while
+host stress tests were also running. After a checked stop and four clean offline
+filesystem checks, the fresh boot above retains Xwayland and runs the game.
+The startup failure's cause is not established; do not count that initial
+failed Steam launch as successful application acceptance.
+
+After the successful audio run, normal WM_DELETE closes the game and its
+runtime helpers drain. Steam exits zero with no live descendants. All 33
+original save contents remain unchanged; non-Cloud-marker mtimes also match
+(the Steam Cloud marker's mtime changed). No audio streams remain before the
+checked filesystem/device flush. The original launcher exits zero, and all
+four offline filesystem checks (data, nix, tmp, boot) pass. Private raw evidence
+is retained under `build/reviews/stardew-hardlinks-oss-recovery-20261025/`.
+
+
 ## Memory barriers
 
 The original direct startup reports CoreCLR HRESULT 0x8007FF02. A PID-scoped

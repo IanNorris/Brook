@@ -72,12 +72,12 @@ int main(int argc,char **argv){
  CK(umount2("fd-tree/fd-target",MNT_DETACH)==0);CK(readvalue("fd-tree/fd-target")=='B');
  CK(!rename("fd-tree","tree")&&!rename("tree/fd-target","tree/target"));CK(!close(sourcefd)&&!close(targetfd)&&!close(otherfd));
  errno=0;int linked=link("tree/target","tree/alias");
- if(brook)CK(linked==-1&&errno==EPERM);
+ if(brook&&!disk)CK(linked==-1&&errno==EOPNOTSUPP);
  else {CK(linked==0);CK(mount("source","tree/target",NULL,MS_BIND,NULL)==0);CK(readvalue("tree/target")=='A'&&readvalue("tree/alias")=='B');CK(umount2("tree/target",MNT_DETACH)==0);CK(unlink("tree/alias")==0);CK(link("source","source-alias")==0);}
  errno=0;CK(mount("source","tree",NULL,MS_BIND,NULL)==-1&&errno==ENOTDIR);errno=0;CK(mount("tree","tree/target",NULL,MS_BIND,NULL)==-1&&errno==ENOTDIR);CK(readvalue("tree/target")=='B');
  int old=open("tree/target",O_RDONLY);CK(old>=0);CK(mount("source","tree/target",NULL,MS_BIND,NULL)==0);CK(readvalue("tree/target")=='A'&&readfd(old)=='B');fdpath("tree/target",O_RDONLY);fdpath("tree/target",O_PATH|O_CLOEXEC);
  errno=0;CK(unlink("tree/target")==-1&&errno==EBUSY);errno=0;CK(rename("other","tree/target")==-1&&errno==EBUSY);
- CK(rename("source","renamed")==0);value("source",'N');CK(readvalue("tree/target")=='A');if(!brook)CK(unlink("source-alias")==0);
+ CK(rename("source","renamed")==0);value("source",'N');CK(readvalue("tree/target")=='A');if(!brook||disk)CK(unlink("source-alias")==0);
  CK(mount("other","tree/target",NULL,MS_BIND|MS_REC,NULL)==0);CK(readvalue("tree/target")=='C');
  CK(rename("tree","tree-moved")==0);CK(readvalue("tree-moved/target")=='C');fdpath("tree-moved/target",O_PATH|O_CLOEXEC);CK(rename("tree-moved","tree")==0);
  CK(mount("tree","copy",NULL,MS_BIND|MS_REC,NULL)==0);CK(readvalue("copy/target")=='C');fdpath("copy/target",O_PATH|O_CLOEXEC);CK(umount2("copy/target",MNT_DETACH)==0);CK(readvalue("copy/target")=='A');CK(umount2("copy/target",MNT_DETACH)==0);CK(readvalue("copy/target")=='B');CK(umount2("copy",MNT_DETACH)==0);

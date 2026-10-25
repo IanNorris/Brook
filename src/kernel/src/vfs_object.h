@@ -53,6 +53,9 @@ struct VfsObjectOps {
     // Never reconstruct by reopening object_path. Detached/ambiguous entries
     // must fail. Caller retains the original mount attachment separately.
     int (*entry_parent)(VfsObject*,VfsObject** parent,char* leaf,uint32_t capacity) = nullptr;
+    // Publish a new name for an exact retained non-directory source. The VFS
+    // holds one namespace mutation transaction and enforces mount identity.
+    int (*link)(VfsObject* parent,VfsObject* source,const char* name) = nullptr;
 };
 struct VfsObject {
     const VfsObjectOps* ops;

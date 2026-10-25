@@ -1,14 +1,11 @@
 # Recovery and VM-control backlog
 
-- Investigate Steam game startup runtime-copy cost. During the 25 October
-  live review Steam marks Stardew running, but no game window exists; the
-  tracked reaper's child is still `pressure-vessel-wrap`. Its Soldier runtime
-  log repeatedly reports hard-link `EPERM` and falls back to copying files.
-  Preserve this as a startup-cost lead, not a demonstrated game hang or a
-  successful through-Steam launch. Measure runtime preparation separately
-  before deciding between real filesystem hard-link support and another
-  compatible runtime-preparation improvement. Evidence remains private under
-  `build/reviews/pointer-live-20261025/stardew-launch/`.
+- Continue reducing Steam game startup cost after the 25 October hard-link
+  and inode-index changes: one cold game-window observation improves from
+  333.5 to 128.3 seconds, with data-image writes falling from 1.89 GiB to
+  186 MiB. Retained mount/path walking and synchronous disk I/O remain visible
+  in subsequent short profiles. Use repeatable cold/warm controls before
+  attempting another structural change. [Evidence](stardew-native64.md#hard-links-and-indexed-open-inodes--25-october).
 
 - Extend launch feedback to games started inside Steam or another application.
   Current feedback is admitted by Brook's app launcher; Steam's internal Play
@@ -1660,21 +1657,21 @@ each probe's argument parser.
   pathname socket FD following, the copied provider loader's cache location,
   and companion PulseAudio environment propagation. Broader 32-bit support
   remains outside this work.
-- Runtime copying still takes roughly five minutes before the game appears.
-  Sequential startup profiling now records 3.89 GiB read and 1.89 GiB written
-  through 2.87 million data-disk requests. Implement real `link`/`linkat`
-  semantics, then repeat the controlled launch/counters. Also investigate the
-  global linear inode lookup and allocate-before-hit pattern in `Ext2HoldInode`.
-  [Capture results and limitations](stardew-native64.md#sequential-startup-profiles).
+- Hard links and the open-inode index are implemented and pass native controls;
+  startup is now about two minutes in one measured run. Remaining limitations
+  include unsupported tmpfs/FAT hard links and capability-only empty-source
+  `AT_EMPTY_PATH`. Reduce remaining mount/path walks and synchronous I/O only
+  after another measured control. [Results](stardew-native64.md#hard-links-and-indexed-open-inodes--25-october).
 - Fix initial smaller-window clipping and cooperative pointer modes. Maximizing
   exposes the full menu; the captured pointer currently needs relative PS/2
   input rather than absolute tablet injection.
-- Verify audible output and actual gameplay. The successful startup uses the
-  private PulseAudio null sink. Steam API/IPC warnings remain. The Exit trial
-  drains but reports outer status 1 and a killed child, not a verified zero
-  game exit; see the earlier direct self-SIGKILL trace before attributing cause.
-  Live speaker routing via PulseAudio `module-oss` fails because `FIONBIO`
-  returns `ENOTTY`; verify proper nonblocking-device semantics before retrying.
+- Finish sustained audio and actual gameplay acceptance. The owner heard game
+  audio, but a later HDA sample gap caused persistent OSS EPIPE and PulseAudio
+  sink removal. FIONBIO and POST now work; fresh-epoch recovery passes both
+  blocking/nonblocking forced-fault controls. Real PulseAudio/game recovery
+  now survives one forced gap with 90 seconds of subsequent completion and
+  non-silent PCM capture. Broader gameplay and long-run stability remain open. Keep explicit drain errors and conservative hardware
+  clock checks; do not equate submitted or discarded samples with completion.
 - Fix stale bridge launch coalescing after an exited application with no
   correlated window. The UI retry reused an old pending record; a single
   tracked guest launch provided this acceptance run.

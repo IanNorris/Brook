@@ -521,11 +521,14 @@ static void testFileBinds(brook::MountNamespace* initial,const brook::VfsPath& s
     assert(!VfsMountNamespaceCopy(initial,stableRoot,stableRoot,&ns,&root,&cwd));assert(VfsMountNamespaceActivate(ns));
     auto a=resolve(root,root,"ns-a"),b=resolve(root,root,"ns-b"),dest=resolve(root,root,"ns-target");
     auto* originalSource=node(a.object).children["value"];auto* originalTarget=node(b.object).children["value"];
+    auto detachFile=[&]{auto p=resolve(root,root,"ns-b/value");assert(!VfsMountNamespaceDetach(ns,p));VfsPathRelease(p);VfsDrainMountCleanup();};
     originalTarget->nlink=2;node(b.object).children["alias"]=originalTarget;
-    assert(VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b/value")==-95);
+    assert(!VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b/value"));
     auto alias=resolve(root,root,"ns-b/alias");assert(alias.object->identity==201);VfsPathRelease(alias);
+    detachFile();
     node(b.object).children.erase("alias");originalTarget->nlink=1;
-    originalSource->nlink=2;assert(VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b/value")==-95);originalSource->nlink=1;
+    originalSource->nlink=2;assert(!VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b/value"));
+    detachFile();originalSource->nlink=1;
     assert(VfsMountNamespaceBindAt(ns,root,root,"ns-a/value","ns-b")==-20);
     assert(VfsMountNamespaceBindAt(ns,root,root,"ns-a","ns-b/value")==-20);
     bool succeeded=false;

@@ -313,6 +313,8 @@ struct Ext2OpenInode {
     bool orphan;
     Ext2OpenInode* next;
     FileObject file;
+    Ext2OpenInode* previous = nullptr;
+    Ext2OpenInode* hashNext = nullptr;
 };
 
 // Reporting provenance belongs to a directory entry, not the shared inode.
@@ -334,12 +336,52 @@ struct Ext2RetainedObject {
 // bookkeeping; it never nests filesystem I/O, allocation or the ext2 rwlock.
 static IrqSpinLock g_ext2OpenLock;
 static Ext2OpenInode* g_ext2OpenInodes;
+static constexpr uint32_t EXT2_OPEN_BUCKETS = 1024;
+static Ext2OpenInode* g_ext2OpenIndex[EXT2_OPEN_BUCKETS];
 static Ext2EntryRecord* g_ext2Entries;
 static int Ext2FileTruncate(Vnode* vn, uint64_t size);
+
+// Both indexes are protected by g_ext2OpenLock. The list supports orphan and
+// unmount scans; the hash serves exact identity lookup without allocating.
+static uint32_t Ext2OpenBucket(Ext2Mount* mount,uint32_t inode)
+{
+    uint64_t key=(reinterpret_cast<uintptr_t>(mount)>>4)^uint64_t(inode)*0x9e3779b97f4a7c15ull;
+    key^=key>>32;return static_cast<uint32_t>(key)&(EXT2_OPEN_BUCKETS-1);
+}
+static Ext2OpenInode* Ext2FindOpenLocked(Ext2Mount* mount,uint32_t inode)
+{
+    for(auto* p=g_ext2OpenIndex[Ext2OpenBucket(mount,inode)];p;p=p->hashNext)
+        if(p->mnt==mount && p->inode==inode)return p;
+    return nullptr;
+}
+static void Ext2InsertOpenLocked(Ext2OpenInode* inode)
+{
+    inode->previous=nullptr;inode->next=g_ext2OpenInodes;
+    if(inode->next)inode->next->previous=inode;
+    g_ext2OpenInodes=inode;
+    auto& bucket=g_ext2OpenIndex[Ext2OpenBucket(inode->mnt,inode->inode)];
+    inode->hashNext=bucket;bucket=inode;
+}
+static void Ext2RemoveOpenLocked(Ext2OpenInode* inode)
+{
+    if(inode->previous)inode->previous->next=inode->next;
+    else g_ext2OpenInodes=inode->next;
+    if(inode->next)inode->next->previous=inode->previous;
+    auto** link=&g_ext2OpenIndex[Ext2OpenBucket(inode->mnt,inode->inode)];
+    while(*link && *link!=inode)link=&(*link)->hashNext;
+    if(!*link)__builtin_trap();
+    *link=inode->hashNext;
+    inode->previous=inode->next=inode->hashNext=nullptr;
+}
 
 // Called with the filesystem lock held, before publishing a vnode.
 static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
 {
+    uint64_t flags=IrqSpinLockAcquire(&g_ext2OpenLock);
+    if(auto* found=Ext2FindOpenLocked(mnt,inode)) {
+        ++found->holders;IrqSpinLockRelease(&g_ext2OpenLock,flags);return found;
+    }
+    IrqSpinLockRelease(&g_ext2OpenLock,flags);
     auto* candidate = static_cast<Ext2OpenInode*>(kmalloc(sizeof(Ext2OpenInode)));
     if (!candidate) return nullptr;
     *candidate = {mnt, inode, 1, false, nullptr, {}};
@@ -347,17 +389,14 @@ static Ext2OpenInode* Ext2HoldInode(Ext2Mount* mnt, uint32_t inode)
     // Strict growth never prunes blocks or touches bytes below old EOF,
     // including a failed inode write. Only an invalid old tail can be zeroed.
     candidate->file.growMappedBacking=Ext2FileTruncate;
-    uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
-    for (auto* p = g_ext2OpenInodes; p; p = p->next) {
-        if (p->mnt == mnt && p->inode == inode) {
-            ++p->holders;
-            IrqSpinLockRelease(&g_ext2OpenLock, flags);
-            kfree(candidate);
-            return p;
-        }
+    flags = IrqSpinLockAcquire(&g_ext2OpenLock);
+    // Allocation happens outside the IRQ lock; another reader may publish
+    // the same inode meanwhile. Keep one shared FileObject in that race.
+    if(auto* found=Ext2FindOpenLocked(mnt,inode)) {
+        ++found->holders;IrqSpinLockRelease(&g_ext2OpenLock,flags);
+        FileObjectDispose(&candidate->file);kfree(candidate);return found;
     }
-    candidate->next = g_ext2OpenInodes;
-    g_ext2OpenInodes = candidate;
+    Ext2InsertOpenLocked(candidate);
     IrqSpinLockRelease(&g_ext2OpenLock, flags);
     return candidate;
 }
@@ -368,9 +407,7 @@ static void Ext2ReleaseInode(Ext2OpenInode* inode)
     bool dispose = false;
     uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
     if (--inode->holders == 0 && !inode->orphan) {
-        auto** link = &g_ext2OpenInodes;
-        while (*link && *link != inode) link = &(*link)->next;
-        if (*link) *link = inode->next;
+        Ext2RemoveOpenLocked(inode);
         dispose = true;
     }
     // Zero-holder orphans remain queued until a filesystem writer/sync can
@@ -413,12 +450,10 @@ static void Ext2MoveEntries(Ext2Mount* mnt,uint32_t parent,const char* name,uint
 static bool Ext2MarkOpenOrphan(Ext2Mount* mnt, uint32_t inode)
 {
     uint64_t flags = IrqSpinLockAcquire(&g_ext2OpenLock);
-    for (auto* p = g_ext2OpenInodes; p; p = p->next) {
-        if (p->mnt == mnt && p->inode == inode) {
-            p->orphan = true;
-            IrqSpinLockRelease(&g_ext2OpenLock, flags);
-            return true;
-        }
+    if(auto* p=Ext2FindOpenLocked(mnt,inode)) {
+        p->orphan = true;
+        IrqSpinLockRelease(&g_ext2OpenLock, flags);
+        return true;
     }
     IrqSpinLockRelease(&g_ext2OpenLock, flags);
     return false;
@@ -1496,7 +1531,7 @@ static int Ext2DrainOrphans(Ext2Mount* mnt)
         while (*link && !((*link)->mnt == mnt && (*link)->orphan && (*link)->holders == 0))
             link = &(*link)->next;
         auto* orphan = *link;
-        if (orphan) *link = orphan->next;
+        if (orphan) Ext2RemoveOpenLocked(orphan);
         IrqSpinLockRelease(&g_ext2OpenLock, flags);
         if (!orphan) return 0;
         Ext2Inode data;
@@ -1510,8 +1545,7 @@ static int Ext2DrainOrphans(Ext2Mount* mnt)
         }
         if (!read || !Ext2ReclaimInode(mnt, orphan->inode, &data)) {
             flags = IrqSpinLockAcquire(&g_ext2OpenLock);
-            orphan->next = g_ext2OpenInodes;
-            g_ext2OpenInodes = orphan;
+            Ext2InsertOpenLocked(orphan);
             IrqSpinLockRelease(&g_ext2OpenLock, flags);
             SerialPrintf("ext2: failed reclaiming orphan inode %u\n", orphan->inode);
             return -5;
@@ -1552,9 +1586,11 @@ static bool Ext2PrepareDirectoryWrite(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode
 }
 
 static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
-                       uint32_t childIno, const char* name, uint8_t fileType, bool* committed = nullptr)
+                       uint32_t childIno, const char* name, uint8_t fileType, bool* committed = nullptr,
+                       bool* publicationAttempted = nullptr)
 {
     if (committed) *committed = false;
+    if (publicationAttempted) *publicationAttempted = false;
     uint32_t nameLen = 0;
     for (const char* p = name; *p; ++p) ++nameLen;
     if (nameLen == 0 || nameLen > 255) return false;
@@ -1600,6 +1636,7 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
                 newDe->file_type = fileType;
                 for (uint32_t i = 0; i < nameLen; ++i) newDe->name[i] = name[i];
 
+                if(publicationAttempted)*publicationAttempted=true;
                 bool written = Ext2WriteBlock(mnt, diskBlock, blockBuf);
                 kfree(blockBuf);
                 if (!written) return false;
@@ -1629,6 +1666,7 @@ static bool Ext2DirAdd(Ext2Mount* mnt, uint32_t dirIno, Ext2Inode* dirData,
     newDe->file_type = fileType;
     for (uint32_t i = 0; i < nameLen; ++i) newDe->name[i] = name[i];
 
+    if(publicationAttempted)*publicationAttempted=true;
     bool written = Ext2WriteBlock(mnt, newBlock, blockBuf);
     kfree(blockBuf);
     if (!written) return false;
@@ -4282,6 +4320,67 @@ static int Ext2ObjectSymlink(VfsObject* parent,const char* target,const char* na
     auto* hold=static_cast<Ext2OpenInode*>(parent->priv);
     return Ext2FsSymlinkAt(hold->mnt,0,target,name,hold->inode);
 }
+static int Ext2ObjectLink(VfsObject* parent,VfsObject* source,const char* name)
+{
+    if(!source || source->ops!=parent->ops)return -18;
+    if(int error=Ext2ObjectLeaf(name))return error;
+    auto* directory=static_cast<Ext2OpenInode*>(parent->priv);
+    auto* file=static_cast<Ext2OpenInode*>(source->priv);
+    auto* mnt=directory->mnt;if(mnt!=file->mnt)return -18;
+    KRwLockWriteLock(&g_ext2Lock);
+    auto finish=[&](int result){KRwLockWriteUnlock(&g_ext2Lock);return result;};
+    if(int error=Ext2DrainOrphans(mnt))return finish(error);
+    Ext2Inode parentData{},data{};
+    if(!Ext2ReadInode(mnt,directory->inode,&parentData) ||
+       !Ext2ReadInode(mnt,file->inode,&data))return finish(-5);
+    if(int error=Ext2CheckParentMutation(mnt,parentData))return finish(error);
+    const uint16_t type=data.i_mode&EXT2_S_IFMT;
+    if(type==EXT2_S_IFDIR)return finish(-1);
+    if(!data.i_links_count)return finish(-2);
+    if(data.i_flags&(0x10|0x20))return finish(-1); // immutable / append-only
+    if(data.i_links_count>=32000)return finish(-31);
+    // Linux's protected-hardlink policy: ownership/capability, or an ordinary
+    // non-set-ID regular file for which the caller has both read and write.
+    Process* actor=ProcessCurrent();
+    if(!mnt->skipPermChecks &&
+       !ProcessCapable(actor,nullptr,CapFowner) &&
+       ProcessReadIds(actor,false).effective!=Ext2Uid(data)) {
+        if(type!=EXT2_S_IFREG || (data.i_mode&04000) ||
+           ((data.i_mode&02000) && (data.i_mode&0010)) ||
+           (ProcessFilePermissions(actor,Ext2Uid(data),Ext2Gid(data),data.i_mode)&6)!=6)
+            return finish(-1);
+    }
+    int lookupError=0;
+    if(Ext2DirLookup(mnt,directory->inode,&parentData,name,&lookupError))return finish(-17);
+    if(lookupError && lookupError!=-2)return finish(lookupError);
+    uint8_t entryType=0;
+    switch(type) {
+        case EXT2_S_IFREG:entryType=1;break;
+        case 0020000:entryType=3;break;
+        case 0060000:entryType=4;break;
+        case EXT2_S_IFIFO:entryType=5;break;
+        case EXT2_S_IFSOCK:entryType=6;break;
+        case EXT2_S_IFLNK:entryType=7;break;
+        default:return finish(-1);
+    }
+    const Ext2Inode original=data;
+    ++data.i_links_count;data.i_ctime=Ext2Now();
+    // Persist the extra reference before exposing a name. On an I/O failure,
+    // an overcount is preferable to freeing an inode still named on disk.
+    if(!Ext2WriteInode(mnt,file->inode,&data))return finish(-5);
+    bool attempted=false;
+    if(!Ext2DirAdd(mnt,directory->inode,&parentData,file->inode,name,entryType,nullptr,&attempted)) {
+        if(!attempted) {
+            // Only pre-publication failures may undo the count. An attempted
+            // directory write can publish bytes even when the device reports
+            // a short/error result: keep the conservative count in that case.
+            if(!Ext2WriteInode(mnt,file->inode,&original))
+                Ext2WriteInode(mnt,file->inode,&original);
+        }
+        return finish(-5);
+    }
+    return finish(0);
+}
 static Vnode* Ext2ObjectSocket(VfsObject* parent,const char* name,uint16_t mode,int* error)
 {
     int localError=0;if(!error)error=&localError;*error=Ext2ObjectParentLeaf(parent,name);
@@ -4390,7 +4489,7 @@ static const VfsObjectOps g_ext2ObjectOps={
     Ext2ObjectParent,Ext2ObjectReadlink,Ext2ObjectOpen,
     Ext2ObjectCreate,Ext2ObjectMkdir,Ext2ObjectRemove,Ext2ObjectRename,
     Ext2ObjectSymlink,Ext2ObjectSocket,Ext2ObjectTimes,Ext2ObjectChmod,
-    Ext2ObjectChown,Ext2ObjectDirectoryPath,nullptr,Ext2ObjectPath,Ext2ObjectFifo,Ext2ObjectEntryParent,
+    Ext2ObjectChown,Ext2ObjectDirectoryPath,nullptr,Ext2ObjectPath,Ext2ObjectFifo,Ext2ObjectEntryParent,Ext2ObjectLink,
 };
 static const VfsObjectOps* Ext2ObjectOperations(){return &g_ext2ObjectOps;}
 

@@ -130,13 +130,36 @@ static bool VfsReservedVirtualLocked(const VfsPath& parent,const char* name,VfsP
     }
     return false;
 }
-static int VfsEnterMountsLocked(VfsPath* path)
+static int VfsCoveredEntryMatchesLocked(const MountEntry& mount,const VfsPath& path,
+                                        const VfsPath* parent=nullptr,const char* name=nullptr)
+{
+    if(!VfsPathSame(mount.covered,path))return 0;
+    if(!mount.coveredParent.object)return 1;
+    auto* origin=static_cast<MountEntry*>(path.attachment);
+    // An existing file attachment is already one exact visible mountpoint.
+    if(origin->coveredParent.object && path.object->identity==origin->rootIdentity &&
+       path.object->ops==origin->rootObjectOps)return 1;
+    if(parent && name)return VfsPathSame(mount.coveredParent,*parent) && StrEq(mount.coveredName,name);
+    // Old O_PATH FDs have no current walk parent. Recover exact entry metadata;
+    // never let a sibling hard link with the same inode cross this edge.
+    if(!path.object->ops->entry_parent)return -95;
+    VfsObject* held=nullptr;char leaf[256];
+    int error=path.object->ops->entry_parent(path.object,&held,leaf,sizeof(leaf));
+    if(error){VfsObjectRelease(held);return error;}
+    const bool same=VfsPathSame(mount.coveredParent,{path.attachment,held}) && StrEq(mount.coveredName,leaf);
+    VfsObjectRelease(held);return same;
+}
+static int VfsEnterMountsLocked(VfsPath* path,const VfsPath* parent=nullptr,const char* name=nullptr)
 {
     // Edges always point into a new attachment, so traversal cannot cycle.
     for(uint32_t step=0;step<VFS_MAX_MOUNT_DEPTH;++step) {
         MountEntry* child=nullptr;
-        for(auto& mount:g_mounts)
-            if(VfsMountPublished(mount) && mount.linked && VfsPathSame(mount.covered,*path)) { child=&mount;break; }
+        for(auto& mount:g_mounts) {
+            if(!VfsMountPublished(mount) || !mount.linked)continue;
+            int match=VfsCoveredEntryMatchesLocked(mount,*path,parent,name);
+            if(match<0)return match;
+            if(match) {child=&mount;break;}
+        }
         if(!child)return 0;
         VfsPath next{};int error=VfsMountRootLocked(child,&next);
         if(error)return error;
@@ -176,7 +199,7 @@ struct VfsRetainedProvider {
             VfsPathHoldMount(mount);
             out={mount,object};
         }
-        const int error=VfsEnterMountsLocked(&out);
+        const int error=VfsEnterMountsLocked(&out,&parent,name);
         if(error) { VfsPathRelease(out);out={}; }
         return error;
     }
@@ -598,7 +621,8 @@ static int VfsReservedMutationLocked(const char* text,bool rejectVirtualChildren
         if(!found && child)for(const auto& mount:g_mounts) {
             if(!VfsMountPublished(mount))continue;
             VfsPath identity{result.parent.attachment,child};
-            if(VfsPathSame(mount.covered,identity))failure=-16;
+            int match=VfsCoveredEntryMatchesLocked(mount,identity,&result.parent,result.leaf);
+            if(match<0)failure=match;else if(match)failure=-16;
             if(rejectVirtualChildren && !failure) {
                 VfsPath current=mount.covered;
                 while(VfsVirtual(current)) {

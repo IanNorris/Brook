@@ -943,6 +943,20 @@ struct DspIoGuard {
     explicit DspIoGuard(DspState* value) : state(value) { KMutexLock(&state->ioLock); }
     ~DspIoGuard() { KMutexUnlock(&state->ioLock); }
 };
+// The OSS facade prepares again after an underrun, as Linux's OSS emulation
+// does. Retire the old stream epoch; discarded frames are never completed.
+// Caller holds this open description's ioLock.
+static bool DspResetStreamLocked(DspState* dsp)
+{
+    if(!AudioMixerReset(dsp->mixerStreamId))return false;
+    dsp->bufferOffset=0;dsp->pointerEpoch=dsp->pointerBaseFrames=0;
+    ++dsp->controlEpoch;return true;
+}
+static bool DspRecoverStreamLocked(DspState* dsp,AudioStreamProgress& progress)
+{
+    if(!progress.discontinuity)return true;
+    return DspResetStreamLocked(dsp) && AudioMixerGetProgress(dsp->mixerStreamId,&progress);
+}
 
 void DspHandleRef(void* handle)
 {
@@ -1717,6 +1731,7 @@ static constexpr uint64_t SNDCTL_DSP_SPEED     = 0xC0045002; // _IOWR('P', 2, in
 static constexpr uint64_t SNDCTL_DSP_SETFMT    = 0xC0045005; // _IOWR('P', 5, int)
 static constexpr uint64_t SNDCTL_DSP_CHANNELS  = 0xC0045006; // _IOWR('P', 6, int)
 static constexpr uint64_t SNDCTL_DSP_STEREO    = 0xC0045003; // _IOWR('P', 3, int)
+static constexpr uint64_t SNDCTL_DSP_POST      = 0x5008;
 static constexpr uint64_t SNDCTL_DSP_GETOSPACE = 0x8010500C; // _IOR('P', 12, audio_buf_info), 16-byte payload
 static constexpr uint64_t SNDCTL_DSP_GETODELAY = 0x80045017; // queued output bytes
 static constexpr uint64_t SNDCTL_DSP_GETOPTR  = 0x800C5012; // count_info, 12-byte payload
@@ -2053,7 +2068,12 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                 DspIoGuard held(dsp);timing.Mutex(mutexBefore);
                 AudioStreamProgress progress{};
                 if (!AudioMixerGetProgress(dsp->mixerStreamId, &progress)) return finish(-EBADF);
-                if (progress.discontinuity) return finish(-32); // EPIPE: explicit RESET required.
+                if (progress.discontinuity) {
+                    // Return the already accepted prefix before crossing an
+                    // epoch boundary. A later write retries only unconsumed data.
+                    if(plan.Accepted())return finish(0);
+                    if(!DspRecoverStreamLocked(dsp,progress))return finish(-EBADF);
+                }
                 const uint32_t rate = dsp->sampleRate ? dsp->sampleRate : DSP_HW_RATE;
                 const uint32_t frameBytes = (dsp->bitsPerSample / 8) * dsp->channels;
                 if (!frameBytes) return finish(-EINVAL);
@@ -6933,7 +6953,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         if (!UserBufferReadable(arg, sizeof(int))) return -EFAULT;
         bool nonblock = *reinterpret_cast<int*>(arg) != 0;
         if (fde->type == FdType::Socket || fde->type == FdType::UnixSocket ||
-            FdPipe(fde) || fde->type == FdType::DevTty) {
+            FdPipe(fde) || fde->type == FdType::DevTty || fde->type == FdType::DevDsp) {
             SpinLockAcquire(ProcessFdLock(proc));
             if (nonblock)
                 fde->statusFlags |= 0x800; // O_NONBLOCK
@@ -7402,12 +7422,11 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
         AudioStreamProgress progress{};
         if (!AudioMixerGetProgress(dsp->mixerStreamId, &progress)) return -EBADF;
         if (cmd == SNDCTL_DSP_RESET) {
-            AudioMixerReset(dsp->mixerStreamId);
-            dsp->bufferOffset = 0;
-            dsp->pointerEpoch = dsp->pointerBaseFrames = 0;
-            ++dsp->controlEpoch;
-            return 0;
+            return DspResetStreamLocked(dsp)?0:-EBADF;
         }
+        if(cmd==SNDCTL_DSP_POST || cmd==SNDCTL_DSP_GETOSPACE || cmd==SNDCTL_DSP_GETODELAY)
+            if(!DspRecoverStreamLocked(dsp,progress))return -EBADF;
+        if(cmd==SNDCTL_DSP_POST)return AudioMixerSetEnabled(dsp->mixerStreamId,true)?0:-EBADF;
         if (cmd == SNDCTL_DSP_GETOPTR) {
             if (progress.discontinuity) return -32;
             // The current write-local resampler has no exact cumulative mapping
@@ -8898,9 +8917,8 @@ retry_poll:
             AudioStreamProgress progress{};
             auto* dsp = static_cast<DspState*>(fde->handle);
             if (dsp && AudioMixerGetProgress(dsp->mixerStreamId, &progress)) {
-                if (progress.discontinuity) fds[i].revents |= POLLERR;
-                else if ((fds[i].events & POLLOUT) &&
-                         AudioStreamWritable(progress))
+                if ((fds[i].events & POLLOUT) &&
+                    (progress.discontinuity || AudioStreamWritable(progress)))
                     fds[i].revents |= POLLOUT;
             } else fds[i].revents |= POLLERR;
             if (fds[i].revents) ready++;
@@ -9445,9 +9463,10 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
         // Walks pin the open description; scan only cached mixer state here.
         auto* dsp = static_cast<DspState*>(fde->handle);
         AudioStreamProgress progress{};
-        if (!dsp || !AudioMixerGetProgress(dsp->mixerStreamId, &progress) || progress.discontinuity)
+        if (!dsp || !AudioMixerGetProgress(dsp->mixerStreamId, &progress))
             return EPOLLERR;
-        return (events & EPOLLOUT) && AudioStreamWritable(progress)
+        // Recovery occurs in write/query under ioLock, never in this scan.
+        return (events & EPOLLOUT) && (progress.discontinuity || AudioStreamWritable(progress))
             ? EPOLLOUT : 0;
     }
 
@@ -10468,10 +10487,25 @@ static int64_t sys_linkat(uint64_t olddirfd, uint64_t oldAddr,
                            uint64_t newdirfd, uint64_t newAddr,
                            uint64_t flags, uint64_t)
 {
-    (void)olddirfd; (void)newdirfd; (void)flags;
-    // Hard links not supported yet — return EPERM
-    (void)oldAddr; (void)newAddr;
-    return -EPERM;
+    constexpr uint64_t FOLLOW=0x400,EMPTY_PATH=0x1000;
+    if(flags&~(FOLLOW|EMPTY_PATH))return -EINVAL;
+    char oldPath[512],newPath[512];
+    if(!CopyUserCString(oldAddr,oldPath,sizeof(oldPath)) ||
+       !CopyUserCString(newAddr,newPath,sizeof(newPath)))return -EFAULT;
+    AtLookup destination;if(int error=destination.Init(static_cast<int>(newdirfd),newPath))return error;
+    if(!oldPath[0]) {
+        if(!(flags&EMPTY_PATH))return -ENOENT;
+        // Conservative subset: open-time credential snapshots are not yet
+        // retained, so only capability-authorized empty-source links are admitted.
+        if(!ProcessCapable(ProcessCurrent(),nullptr,CapDacReadSearch))return -ENOENT;
+        FdRef fd(ProcessCurrent(),static_cast<int>(olddirfd));if(!fd)return -EBADF;
+        if((fd->type!=FdType::Path && fd->type!=FdType::Vnode) || !fd->handle)return -95;
+        VfsPath source{};int error=VfsPathFromVnode(static_cast<Vnode*>(fd->handle),&source);
+        if(!error)error=VfsLinkPathAt(destination.fs.root,source,destination.start(),newPath);
+        VfsPathRelease(source);return error;
+    }
+    AtLookup source;if(int error=source.Init(static_cast<int>(olddirfd),oldPath))return error;
+    return VfsLinkAt(source.fs.root,source.start(),oldPath,destination.start(),newPath,flags&FOLLOW);
 }
 
 // ---------------------------------------------------------------------------
@@ -11069,8 +11103,7 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t bufAddr, uint64_t count,
 static int64_t sys_link(uint64_t oldAddr, uint64_t newAddr, uint64_t,
                          uint64_t, uint64_t, uint64_t)
 {
-    (void)oldAddr; (void)newAddr;
-    return -EPERM; // hard links not supported
+    return sys_linkat(static_cast<uint64_t>(-100),oldAddr,static_cast<uint64_t>(-100),newAddr,0,0);
 }
 
 // Linux sigaltstack constants

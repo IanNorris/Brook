@@ -7,7 +7,7 @@ namespace brook {
 // Maps publish once; task/parent/mount/proc references independently pin storage.
 static constexpr uint32_t UserIdInvalid=~uint32_t{0}, UserIdOverflow=65534;
 static constexpr uint64_t UserCapabilities=(uint64_t{1}<<41)-1;
-enum UserCapability : unsigned { CapChown=0,CapDacOverride=1,CapFowner=3,
+enum UserCapability : unsigned { CapChown=0,CapDacOverride=1,CapDacReadSearch=2,CapFowner=3,
     CapFsetid=4,CapSetgid=6,CapSetuid=7,CapSetpcap=8,CapSysAdmin=21,CapSetfcap=31 };
 struct UserIdMap {
     uint32_t inner=UserIdInvalid,canonical=UserIdInvalid;

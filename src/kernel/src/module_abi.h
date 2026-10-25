@@ -77,7 +77,8 @@ namespace brook {
 // ABI 52 adds immutable socket identity and proc socket snapshot fields.
 // ABI 53 carries raw relative motion and publication sequence in InputEvent.
 // ABI 54 appends exact retained entry-parent provenance to VfsObjectOps.
-static constexpr uint32_t MODULE_ABI_VERSION = 54;
+// ABI 55 appends retained hard-link creation to VfsObjectOps.
+static constexpr uint32_t MODULE_ABI_VERSION = 55;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

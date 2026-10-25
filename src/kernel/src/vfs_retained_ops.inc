@@ -7,6 +7,7 @@ struct VfsOwnedObject {
     VfsObject* value=nullptr;
     ~VfsOwnedObject() { VfsObjectRelease(value); }
 };
+static int VfsAppendLeaf(char* path,uint32_t capacity,const char* leaf);
 static int VfsWalkAtLocked(const VfsPath& root,const VfsPath& start,const char* text,
                             VfsOwnedWalk& walk,PathWalkOptions options={},bool realIds=false)
 {
@@ -46,8 +47,12 @@ static int VfsMutationTargetLocked(const VfsPath& parent,const char* name,VfsOwn
     int error=parent.object->ops->lookup(parent.object,name,&child.value,false);
     if(error) { VfsObjectRelease(child.value);child.value=nullptr;return error==-2?0:error; }
     if(!child.value)return -5;
-    for(const auto& mount:g_mounts)
-        if(VfsMountPublished(mount) && VfsPathSame(mount.covered,{parent.attachment,child.value}))return -16;
+    for(const auto& mount:g_mounts) {
+        if(!VfsMountPublished(mount))continue;
+        int match=VfsCoveredEntryMatchesLocked(mount,{parent.attachment,child.value},&parent,name);
+        if(match<0)return match;
+        if(match)return -16;
+    }
     return 0;
 }
 static int VfsObjectStatLocked(VfsObject* object,VnodeStat* stat)
@@ -187,8 +192,15 @@ int VfsRemoveAt(const VfsPath& root,const VfsPath& start,const char* text,bool d
     if(stat.isDir!=directory)return directory?-20:-21;
     if(directory && VfsVirtualChildrenLocked({parent.attachment,target.value}))return -39;
     if(VfsMappedMutationBusy(stat))return -16;
+    char exact[512];const char* removed=nullptr;
+    auto* backing=static_cast<MountEntry*>(parent.attachment)->backing;
+    if(!stat.isDir && stat.nlink>1 && VfsHasFileRootsLocked(backing,stat.ino)) {
+        if(int error=VfsBackendDirectoryLocked(parent,exact,sizeof(exact)))return error;
+        if(int error=VfsAppendLeaf(exact,sizeof(exact),leaf))return error;
+        removed=exact;
+    }
     int error=parent.object->ops->remove?parent.object->ops->remove(parent.object,leaf,directory):-95;
-    if(!error && !stat.isDir)VfsMarkFileRootsUnlinkedLocked(static_cast<MountEntry*>(parent.attachment)->backing,stat.ino);
+    if(!error && !stat.isDir)VfsMarkFileRootsUnlinkedLocked(backing,stat.ino,removed);
     return error;
 }
 int VfsSymlinkAt(const VfsPath& root,const VfsPath& start,const char* targetText,const char* text)
@@ -349,6 +361,37 @@ static int VfsPrepareRenameLabelsLocked(const VfsPath& oldParent,const char* old
     if((error=VfsAppendLeaf(target,sizeof(target),newName)))return error;
     return VfsPrepareBackingRenameLabelsLocked(static_cast<MountEntry*>(oldParent.attachment)->backing,source,target,labels,exactFileInode);
 }
+static int VfsLinkObjectLocked(const VfsPath& root,const VfsPath& source,
+                               const VfsPath& newStart,const char* newText)
+{
+    if(!source.object || !source.attachment)return -9;
+    VfsOwnedWalk destination;
+    if(int error=VfsWalkAtLocked(root,newStart,newText,destination,{false,true,true}))return error;
+    auto& parent=destination.value.parent;const char* name=destination.value.leaf;
+    if(!parent.object)return -17;
+    if(source.attachment!=parent.attachment)return -18;
+    VnodeStat stat{};if(int error=VfsObjectStatLocked(source.object,&stat))return error;
+    if(stat.isDir)return -1;
+    if(!stat.nlink)return -2; // Never resurrect an unlinked retained inode.
+    VfsOwnedObject target;if(int error=VfsMutationTargetLocked(parent,name,target))return error;
+    if(target.value)return -17;
+    if(destination.value.trailing)return -2;
+    auto* ops=parent.object->ops;
+    if(ops!=source.object->ops || !ops->link)return -95;
+    return ops->link(parent.object,source.object,name);
+}
+int VfsLinkAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
+              const VfsPath& newStart,const char* newText,bool followSource)
+{
+    FileMutationGuard mutation;VfsOwnedWalk source;
+    if(int error=VfsWalkAtLocked(root,oldStart,oldText,source,{followSource}))return error;
+    return VfsLinkObjectLocked(root,source.value.object,newStart,newText);
+}
+int VfsLinkPathAt(const VfsPath& root,const VfsPath& source,
+                  const VfsPath& newStart,const char* newText)
+{
+    FileMutationGuard mutation;return VfsLinkObjectLocked(root,source,newStart,newText);
+}
 int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,const VfsPath& newStart,const char* newText)
 {
     FileMutationGuard mutation;VfsOwnedWalk oldWalk,newWalk;
@@ -372,12 +415,19 @@ int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
     if(VfsMappedMutationBusy(oldStat) || (target.value && VfsMappedMutationBusy(newStat)))return -16;
     auto* ops=oldParent.object->ops;if(!ops->rename || ops!=newParent.object->ops)return -95;
     VfsRenameLabels labels;
+    char replacedLabel[512];const char* replaced=nullptr;
+    if(!same && target.value && !newStat.isDir && newStat.nlink>1 &&
+       VfsHasFileRootsLocked(static_cast<MountEntry*>(newParent.attachment)->backing,newStat.ino)) {
+        if(int error=VfsBackendDirectoryLocked(newParent,replacedLabel,sizeof(replacedLabel)))return error;
+        if(int error=VfsAppendLeaf(replacedLabel,sizeof(replacedLabel),newName))return error;
+        replaced=replacedLabel;
+    }
     if(!same && (oldStat.isDir || (oldStat.mode&0170000)==0100000 || (oldStat.mode&0170000)==0140000 || (oldStat.mode&0170000)==0010000))if(int error=VfsPrepareRenameLabelsLocked(oldParent,oldName,newParent,newName,labels,oldStat.isDir?0:oldStat.ino))return error;
     int error=ops->rename(oldParent.object,oldName,newParent.object,newName);
     if(!error) {
         labels.Apply();
         if(!same && target.value && !newStat.isDir)
-            VfsMarkFileRootsUnlinkedLocked(static_cast<MountEntry*>(newParent.attachment)->backing,newStat.ino);
+            VfsMarkFileRootsUnlinkedLocked(static_cast<MountEntry*>(newParent.attachment)->backing,newStat.ino,replaced);
     }
     return error;
 }

@@ -483,14 +483,13 @@ static int VfsMountNamespaceBindLocked(MountNamespace* ns,const VfsPath& source,
         const auto sourceType=sourceStat.mode&0170000,targetType=targetStat.mode&0170000;
         if((sourceType!=0100000 && sourceType!=0140000 && sourceType!=0010000) ||
            (targetType!=0100000 && targetType!=0140000 && targetType!=0010000))return -95;
-        // Crossing currently keys on backend identity. Unique targets are
-        // unambiguous while link/linkat remain unsupported; attached targets
-        // cannot be renamed, unlinked or replaced through VFS mutation gates.
+        // File crossing and mutation gates distinguish exact parent/name from
+        // a sibling hard link; inode identity alone is insufficient.
         const bool alreadyUniqueFileMount=parent->coveredParent.object && target.object->identity==parent->rootIdentity && target.object->ops==parent->rootObjectOps;
-        if(targetStat.nlink!=1 && !alreadyUniqueFileMount)return -95;
+        if(!targetStat.nlink && !alreadyUniqueFileMount)return -2;
         auto* origin=static_cast<MountEntry*>(source.attachment);
         const bool sourceFileMount=origin->coveredParent.object && source.object->identity==origin->rootIdentity && source.object->ops==origin->rootObjectOps;
-        if((sourceStat.nlink!=1 && !sourceFileMount) || !sourceStat.ino)return -95;
+        if((!sourceStat.nlink && !sourceFileMount) || !sourceStat.ino)return -95;
         if(!sourceLabel || !targetLabel || !coveredParent || !coveredParent->object || !coveredName || !coveredName[0])return -95;
     }
     if(recursive && sourceStat.isDir)return VfsMountNamespaceRecursiveBindLocked(ns,source,target);

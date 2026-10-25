@@ -61,6 +61,10 @@ int VfsReadlinkAt(const VfsPath& root,const VfsPath& start,const char* text,char
 int VfsMkdirAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode,uint16_t mask);
 int VfsRemoveAt(const VfsPath& root,const VfsPath& start,const char* text,bool directory);
 int VfsSymlinkAt(const VfsPath& root,const VfsPath& start,const char* target,const char* text);
+int VfsLinkAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
+              const VfsPath& newStart,const char* newText,bool followSource);
+int VfsLinkPathAt(const VfsPath& root,const VfsPath& source,
+                  const VfsPath& newStart,const char* newText);
 Vnode* VfsCreateFifoAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode,uint16_t mask,int* error);
 Vnode* VfsCreateSocketAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode,uint16_t mask,int* error);
 int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,

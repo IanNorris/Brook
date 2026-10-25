@@ -38,6 +38,7 @@ uint64_t failWriteOffset=~uint64_t{0};
 uint64_t nextFailWriteOffset=~uint64_t{0};
 bool writeFailureInjected=false;
 unsigned injectedWriteFailures=0;
+uint64_t shortWriteOffset=~uint64_t{0};
 int readDisk(brook::Device* device,uint64_t offset,void* out,uint64_t bytes){
     auto& storage=device->priv?*static_cast<std::vector<unsigned char>*>(device->priv):disk;
     if(offset>storage.size() || bytes>storage.size()-offset)return -5;
@@ -47,6 +48,11 @@ int writeDisk(brook::Device* device,uint64_t offset,const void* in,uint64_t byte
     if(offset==failWriteOffset){failWriteOffset=nextFailWriteOffset;nextFailWriteOffset=~uint64_t{0};writeFailureInjected=true;++injectedWriteFailures;return -5;}
     auto& storage=device->priv?*static_cast<std::vector<unsigned char>*>(device->priv):disk;
     if(offset>storage.size() || bytes>storage.size()-offset)return -5;
+    if(offset==shortWriteOffset) {
+        shortWriteOffset=~uint64_t{0};
+        // Data reached the disk, but the completion reports a short write.
+        std::memcpy(storage.data()+offset,in,bytes);return bytes-1;
+    }
     std::memcpy(storage.data()+offset,in,bytes);return bytes;
 }
 int ioctlDisk(brook::Device*,uint32_t,void*){return 0;}
@@ -132,6 +138,27 @@ int main(int argc,char** argv){
     m->skipPermChecks=true;
     VfsObject *root=nullptr,*held=nullptr,*marker=nullptr,*link=nullptr,*parent=nullptr;
     assert(!Ext2RootObject(m,0,&root));
+    // Exact inode identity survives hash collisions and cross-mount aliases.
+    // A retained hit must succeed even when allocating a candidate would fail.
+    {
+        const auto live=allocations.size();Ext2Mount otherMount{};
+        std::vector<Ext2OpenInode*> holds;
+        for(uint32_t ino=100000;holds.size()<128;++ino)
+            if(Ext2OpenBucket(m,ino)==0)holds.push_back(Ext2HoldInode(m,ino));
+        for(auto* h:holds)assert(h);
+        auto* alias=Ext2HoldInode(&otherMount,holds[0]->inode);assert(alias && alias!=holds[0]);
+        for(auto* h:holds) {
+            failTriggered=false;failAllocation=0;
+            auto* again=Ext2HoldInode(m,h->inode);
+            failAllocation=-1;assert(again==h && !failTriggered);Ext2ReleaseInode(again);
+        }
+        // Remove interleaved entries, then verify the surviving collision chain.
+        for(size_t i=0;i<holds.size();i+=2)Ext2ReleaseInode(holds[i]);
+        for(size_t i=1;i<holds.size();i+=2) {
+            assert(Ext2FindOpenLocked(m,holds[i]->inode)==holds[i]);Ext2ReleaseInode(holds[i]);
+        }
+        Ext2ReleaseInode(alias);assert(allocations.size()==live);
+    }
     // Exact entry reporting, independently of shared inode identity. These
     // production callbacks back ordinary and O_PATH proc-fd readlink alike.
     {
@@ -177,16 +204,51 @@ int main(int argc,char** argv){
         assert(!other->ops->remove(other,"moved",false));
         VfsObjectRelease(source);VfsObjectRelease(victim);
 
-        // Model prebuilt hard links without adding a link syscall or choosing
-        // an arbitrary inode alias for reporting.
+        // Real hard-link publication preserves separate entry provenance.
         auto* left=create("left");
-        KRwLockWriteLock(&g_ext2Lock);
         auto* dh=static_cast<Ext2OpenInode*>(directory->priv);
-        Ext2Inode dd{},file{};assert(Ext2ReadInode(m,dh->inode,&dd));
-        assert(Ext2ReadInode(m,left->identity,&file));
-        assert(Ext2DirAdd(m,dh->inode,&dd,left->identity,"right",1));
-        ++file.i_links_count;assert(Ext2WriteInode(m,left->identity,&file));
-        KRwLockWriteUnlock(&g_ext2Lock);
+        Ext2Inode dd{};assert(Ext2ReadInode(m,dh->inode,&dd));
+        assert(!directory->ops->link(directory,left,"right"));
+        assert(directory->ops->link(directory,left,"right")==-17);
+        assert(directory->ops->link(directory,directory,"cycle")==-1);
+        VnodeStat linked{};assert(!Ext2ObjectStat(left,&linked) && linked.nlink==2);
+        {
+            assert(!directory->ops->chmod(directory,0777));m->skipPermChecks=false;
+            process.euid=2000;
+            assert(directory->ops->link(directory,left,"protected")==-1);
+            process.euid=1000;assert(!left->ops->chmod(left,0666));process.euid=2000;
+            assert(!directory->ops->link(directory,left,"shared"));
+            assert(!directory->ops->remove(directory,"shared",false));
+            process.euid=1000;assert(!left->ops->chmod(left,04666));process.euid=2000;
+            assert(directory->ops->link(directory,left,"setid")==-1);
+            process.euid=1000;assert(!left->ops->chmod(left,0600));
+            assert(!directory->ops->chmod(directory,0700));m->skipPermChecks=true;
+        }
+        {
+            auto* fault=create("fault-source");
+            assert(Ext2ReadInode(m,dh->inode,&dd));
+            shortWriteOffset=uint64_t(Ext2BlockMap(m,&dd,0))<<m->blockShift;
+            assert(directory->ops->link(directory,fault,"fault-alias")==-5);
+            assert(shortWriteOffset==~uint64_t{0} && m->writeError==-5);
+            VfsObject* alias=nullptr;assert(!Ext2ObjectChild(directory,"fault-alias",&alias));
+            VnodeStat a{},b{};assert(!Ext2ObjectStat(fault,&a)&&!Ext2ObjectStat(alias,&b));
+            assert(a.ino==b.ino && a.nlink==2 && b.nlink==2);
+            // Clear only the injected host failure latch after checking that
+            // a published alias never had its link count rolled back.
+            m->writeError=m->deferredSyncError=0;
+            assert(!directory->ops->remove(directory,"fault-alias",false));
+            assert(!directory->ops->remove(directory,"fault-source",false));
+            VfsObjectRelease(alias);VfsObjectRelease(fault);
+        }
+        for(long failure=0;failure<8;++failure) {
+            failTriggered=false;failAllocation=failure;
+            int result=directory->ops->link(directory,left,"oom-link");
+            const bool injected=failTriggered;failAllocation=-1;
+            if(!result)assert(!directory->ops->remove(directory,"oom-link",false));
+            else {VfsObject* absent=nullptr;assert(Ext2ObjectChild(directory,"oom-link",&absent)==-2 && !absent);}
+            assert(!Ext2ObjectStat(left,&linked) && linked.nlink==2);
+            if(!injected){assert(!result);break;}
+        }
         VfsObject* right=nullptr;assert(!Ext2ObjectChild(directory,"right",&right));
         pathIs(left,"/report-moved/left");pathIs(right,"/report-moved/right");
         assert(!directory->ops->rename(directory,"left",directory,"right"));
@@ -371,8 +433,10 @@ int main(int argc,char** argv){
     }
     assert(factoryComplete);
     for(auto* object : {held,marker})for(long failure=0;failure<3;++failure){
-        const auto live=allocations.size();failAllocation=failure;
-        assert(!Ext2ObjectOpen(object,VFS_O_READ,&error) && error==-12);
+        const auto live=allocations.size();failTriggered=false;failAllocation=failure;
+        auto* opened=Ext2ObjectOpen(object,VFS_O_READ,&error);
+        if(failTriggered)assert(!opened && error==-12);
+        else {assert(opened && !error);closeNode(opened);}
         failAllocation=-1;assert(allocations.size()==live);
         VnodeStat intact{};assert(!Ext2ObjectStat(object,&intact));
     }
@@ -527,6 +591,51 @@ int main(int argc,char** argv){
     // a vnode surviving both detach and last-member namespace retirement.
     assert(!VfsMkdirAt(fsRoot,fsRoot,"namespace-bind",0755,0));
     auto* initialNs=VfsMountNamespaceInitial();MountNamespace* privateNs=nullptr;
+    {
+        MountNamespace* ns=nullptr;VfsPath nr{},nc{},base{};
+        assert(!VfsMountNamespaceCopy(initialNs,fsRoot,fsRoot,&ns,&nr,&nc));assert(VfsMountNamespaceActivate(ns));
+        assert(!VfsMkdirAt(nr,nr,"link-bind-check",0700,0));
+        assert(!VfsPathResolve(nr,nr,"link-bind-check",&base));
+        auto make=[&](const char* name,char c) {
+            auto* n=VfsOpenAt(nr,base,name,VFS_O_CREATE|VFS_O_WRITE,0600,0,&error);assert(n&&!error);
+            uint64_t at=0;assert(VfsWrite(n,&c,1,&at)==1);return n;
+        };
+        auto read=[&](const char* name) {
+            auto* n=VfsOpenAt(nr,base,name,VFS_O_READ,0,0,&error);assert(n&&!error);
+            char c=0;uint64_t at=0;assert(VfsRead(n,&c,1,&at)==1);VfsClose(n);return c;
+        };
+        auto* sourceNode=make("source",'A');auto* targetNode=make("target",'B');VfsClose(make("second",'C'));
+        VfsPath oldTarget{};assert(!VfsPathFromVnode(targetNode,&oldTarget));
+        assert(!VfsLinkAt(nr,base,"source",base,"source-alias",false));
+        assert(!VfsLinkAt(nr,base,"target",base,"target-alias",false));
+        assert(!VfsMountNamespaceBindAt(ns,nr,base,"source","target"));
+        assert(!VfsMountNamespaceBindAt(ns,nr,base,"source-alias","second"));
+        assert(read("target")=='A' && read("target-alias")=='B');
+        assert(VfsRemoveAt(nr,base,"target",false)==-16);
+        // A descriptor from before the overmount links the original inode.
+        assert(!VfsLinkPathAt(nr,oldTarget,base,"from-old-fd"));assert(read("from-old-fd")=='B');
+        assert(!VfsRemoveAt(nr,base,"target-alias",false));
+        assert(!VfsRenameAt(nr,base,"from-old-fd",base,"fd-renamed"));assert(read("fd-renamed")=='B');
+        assert(!VfsRemoveAt(nr,base,"source-alias",false));
+        VfsMountInfo* info=nullptr;uint32_t count=0;assert(!VfsMountNamespaceInfo(ns,nr,&info,&count));
+        bool live=false,deleted=false;
+        for(uint32_t i=0;i<count;++i) {
+            if(!strcmp(info[i].root,"/link-bind-check/source"))live=true;
+            if(!strcmp(info[i].root,"/link-bind-check/source-alias (deleted)"))deleted=true;
+        }
+        VfsMountInfoFree(info);assert(live && deleted);
+        assert(!VfsRenameAt(nr,base,"source",base,"source-renamed"));
+        assert(read("target")=='A' && read("second")=='A');
+        for(const char* name:{"target","second"}) {
+            VfsPath bound{};assert(!VfsPathResolve(nr,base,name,&bound));assert(!VfsMountNamespaceDetach(ns,bound));VfsPathRelease(bound);
+        }
+        assert(read("target")=='B' && read("second")=='C');
+        for(const char* name:{"target","second","source-renamed","fd-renamed"})assert(!VfsRemoveAt(nr,base,name,false));
+        assert(VfsLinkPathAt(nr,oldTarget,base,"resurrect")==-2);
+        VfsPathRelease(oldTarget);VfsClose(sourceNode);VfsClose(targetNode);VfsPathRelease(base);
+        assert(!VfsRemoveAt(nr,nr,"link-bind-check",true));
+        VfsMountNamespaceLeave(ns);VfsPathRelease(nc);VfsPathRelease(nr);VfsDrainMountCleanup();VfsMountNamespaceRelease(ns);
+    }
     VfsPath privateRoot{},privateCwd{},bindTarget{},heldBound{},boundValue{},initialMissing{};
     assert(!VfsMountNamespaceCopy(initialNs,fsRoot,cwd,&privateNs,&privateRoot,&privateCwd));
     assert(VfsMountNamespaceActivate(privateNs));

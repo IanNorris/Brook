@@ -1029,3 +1029,24 @@ alive after its direct child exits, then propagates grandchild success/failure.
 Build static musl with `-O2 -Wall -Wextra -Werror`; require `reaper_pass:true`,
 two cases and exit zero. The subreaper control also covers a raw-exited leader
 whose surviving worker must retain the group's adoption/wait responsibilities.
+
+
+`hardlinkcheck.c DIRECTORY [--require-empty]` checks raw link/linkat, directory
+FDs, symlink-follow modes, aliases, unlink lifetime, protected hard links,
+read-only and attachment boundaries on an ext2 fixture. The ordinary Brook
+user passes 58 checks; the privileged `--require-empty` control passes 59.
+Ordinary empty-source links may be denied: Brook does not yet retain the
+open-time credentials needed for Linux's unprivileged matching-FD exception.
+`filebindcheck --brook-ext2` also exercises alias-specific bind coverage and
+reporting. Build with static musl and run in a disposable VM.
+
+`ossrecovercheck.c --disposable-vm [--blocking]` writes a low-volume square wave
+for 16 seconds, checking FIONBIO, POST, poll, epoll, space and delay queries.
+After `OSS_STREAM_READY`, an external controller can stall only the verified
+private VM process long enough to exercise HDA sample-gap recovery. Run both
+blocking modes; require exit zero and `OSS_RECOVERY PASS`. A probe pass alone
+does not establish that a timing fault occurred: separately retain the HDA
+sample-gap evidence and confirm stream completion resumes. A QMP pause freezes
+virtual time and is not an equivalent fault injection. The probe is audible;
+verify that output stops after it exits. Hardware clock and explicit drain
+semantics are not relaxed by this recovery test.

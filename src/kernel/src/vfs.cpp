@@ -366,13 +366,22 @@ struct VfsRenameLabels {
 static int VfsPrepareBackingRenameLabelsLocked(MountBacking* backing,const char* oldPhysical,
                                                const char* newPhysical,VfsRenameLabels& labels,uint64_t exactFileInode=0);
 
-static void VfsMarkFileRootsUnlinkedLocked(MountBacking* backing,uint64_t inode)
+static bool VfsHasFileRootsLocked(MountBacking* backing,uint64_t inode)
+{
+    for(const auto& mount:g_mounts)
+        if(VfsMountPublished(mount) && mount.coveredParent.object && mount.backing==backing && mount.rootIdentity==inode)return true;
+    return false;
+}
+static void VfsMarkFileRootsUnlinkedLocked(MountBacking* backing,uint64_t inode,const char* exactPath=nullptr)
 {
     if(!inode)return;
     MountViewGuard held;
     for(auto& mount:g_mounts)
-        if(VfsMountPublished(mount) && mount.coveredParent.object && mount.backing==backing && mount.rootIdentity==inode)
-            mount.rootFileUnlinked=true;
+        if(VfsMountPublished(mount) && mount.coveredParent.object && mount.backing==backing && mount.rootIdentity==inode) {
+            const char* label=mount.physicalRoot;while(*label=='/')++label;
+            const char* path=exactPath;while(path && *path=='/')++path;
+            if(!path || StrEq(label,path))mount.rootFileUnlinked=true;
+        }
 }
 
 // Legacy kernel/driver path callbacks address the filesystem backing root.
@@ -1279,7 +1288,7 @@ int VfsRemovePath(const char* path, bool directory)
     if (st.isDir!=directory) return directory?-20:-21;
     int error=mount->backing->fsOps->remove_path?mount->backing->fsOps->remove_path(mount->backing->mountPriv,mount->backing->pdrv,relative,directory):
         mount->backing->fsOps->unlink?mount->backing->fsOps->unlink(mount->backing->mountPriv,mount->backing->pdrv,relative):-95;
-    if(!error && !st.isDir)VfsMarkFileRootsUnlinkedLocked(mount->backing,st.ino);
+    if(!error && !st.isDir)VfsMarkFileRootsUnlinkedLocked(mount->backing,st.ino,relative);
     return error;
 }
 
@@ -1359,7 +1368,7 @@ int VfsRename(const char* oldPath,const char* newPath)
     if(!error) {
         labels.Apply();
         if(!same && !targetError && !targetStat.isDir)
-            VfsMarkFileRootsUnlinkedLocked(newMount->backing,targetStat.ino);
+            VfsMarkFileRootsUnlinkedLocked(newMount->backing,targetStat.ino,newRelative);
     }
     return error;
 }
