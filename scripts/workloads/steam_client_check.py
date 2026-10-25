@@ -55,6 +55,9 @@ def main():
     client_container = runtime / 'pressure-vessel/libexec/steam-runtime-tools-0/srt-client-container'
     if not client_container.is_file():
         parser.error('installed SteamRT lacks srt-client-container, required for the companion game-launch service')
+    supervisor = runtime / 'pressure-vessel/bin/steam-runtime-supervisor'
+    if not supervisor.is_file():
+        parser.error('installed SteamRT lacks steam-runtime-supervisor, required for client descendant cleanup')
     platforms = list(runtime.glob('steamrt3c_platform_*/files'))
     if len(platforms) != 1:
         parser.error('expected exactly one installed SteamRT platform')
@@ -109,7 +112,12 @@ def main():
     # rewriting guest socket paths. The caller provides a SteamRT-visible path.
     if inner_environment:
         command += ['/usr/bin/env'] + inner_environment
-    command += [str(client / 'steamrt64/steam'),
+    # The outer pv-adverb keeps runtime/companion ownership. Its timeout
+    # options alone do not enable termination on main exit. Supervise only
+    # this client subtree with the bundled supervisor's explicit policy.
+    command += [str(supervisor), '--terminate-with-main',
+               '--terminate-idle-timeout=2', '--terminate-timeout=5', '--',
+               str(client / 'steamrt64/steam'),
                '-noverifyfiles', '-nobootstrapperupdate', '-srt-logger-opened',
                '-no-cef-sandbox', '-cef-disable-gpu', '-cef-disable-gpu-compositing']
     if args.skip_bootstrap:
@@ -122,6 +130,8 @@ def main():
     request = dict(argv=command, uid=os.getuid(), home=str(home), evidence=str(evidence),
                    available_bytes=available, default_runtime_copy=True, skip_bootstrap=args.skip_bootstrap,
                    companion_launcher_service=True,
+                   client_descendant_supervisor=str(supervisor),
+                   background_exit_idle_s=2, background_exit_term_s=5,
                    launch_app=args.launch_app,
                    note='Existing staged client may contain prior ELF interpreter patches')
     (evidence / 'request.json').write_text(json.dumps(request, indent=2) + '\n')

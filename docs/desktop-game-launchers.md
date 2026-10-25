@@ -66,6 +66,25 @@ currently return `EPERM` in Brook. Runtime copying is therefore a concrete
 startup-time and disk-space cost to investigate separately; changing file
 ownership cannot provide missing hardlink semantics.
 
+### Bounded client descendant cleanup
+
+The client launcher now wraps the real Steam executable with the bundled
+`pressure-vessel/bin/steam-runtime-supervisor`, using
+`--terminate-with-main --terminate-idle-timeout=2 --terminate-timeout=5`.
+The outer container and companion game-launch service keep their existing
+ownership. No descriptor-closing option or parent-death signal is added.
+Timeout flags on the outer `pv-adverb` alone do not enable main-exit cleanup
+and failed the initial control; they are not retained.
+
+A native owned-child control has its main command exit 7 while a descendant
+ignores SIGTERM. The supervisor reaps that descendant after about 7.42 seconds
+and returns 7. The real UI-launched Steam then renders the authenticated store
+and exits through its own menu: client and desktop wrapper return 0, and no
+launch-tagged client, CEF, container, companion or private Pulse tasks remain.
+No manual signals are needed for that accepted retry. Its transient sign-in
+window resolves automatically without account input. This validates bounded
+exit cleanup, not cooperative CEF shutdown or a game running across Steam exit.
+
 ## Q3 performance and remaining input work
 
 The user's audible live run reports about 15 FPS and heavy stuttering. A later
