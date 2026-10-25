@@ -1,5 +1,20 @@
 # Recovery and VM-control backlog
 
+- Reproduce the host QEMU SIGSEGV from the 25 October pointer-control review
+  before treating the desktop/game image as a broad stability pass. Several
+  SDL Wayland/Xwayland controls and a stock/patched SDL A/B finish normally;
+  the host exits on SIGSEGV during the subsequent Q3 launch attempt. The core
+  is truncated, so the saved debugger attempt cannot attribute a library or
+  recover a useful stack. No guest panic is observed. Unsynced data-disk bitmap
+  discrepancies remain on the preserved failure image; do not use it as a seed.
+  Evidence: `build/reviews/pointer-unmap-sdl-20261025/`. A fresh quiet review
+  from earlier checked images renders Q3, accepts relative mouse input and
+  closes normally, with checked sync and all four fscks passing:
+  `build/reviews/pointer-quiet-20261025/`. The crash is unresolved; do not infer
+  that it was caused or fixed by SDL, pointer focus cleanup or verbose tracing.
+  Bound the follow-up to replaying the app sequence and obtaining a useful
+  host stack/resource-lifetime trace if it repeats, before proposing GPU changes.
+
 - Investigate Chromium fullscreen and off-screen move geometry from the
   21 October live browser review. The user reports that Chrome does not enter
   fullscreen, and moving the window's top-left edge a few pixels past the

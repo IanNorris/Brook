@@ -51,8 +51,8 @@ in the game menu selected a different item from the one under the visible host
 cursor; mouse/menu alignment and captured relative input remain unaccepted.
 Keyboard menu navigation works. The later native SDL/Wayland control validates
 exact relative input and emergency release; the checked Q3 review now uses
-`in_nograb=0` and handles normal window close. Physical host mouse-look and the
-SDL Xwayland path remain unaccepted; see [pointer capture](pointer-capture.md).
+`in_nograb=0` and handles normal window close. Native SDL/Xwayland controls also pass with the Brook SDL backport. Physical
+host mouse-look remains unaccepted; see [pointer capture](pointer-capture.md).
 Fullscreen, persistence, other maps and network play were not tested.
 
 Audio uses SDL's ALSA backend and the existing clocked OSS plugin, with OpenAL

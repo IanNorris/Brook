@@ -93,7 +93,8 @@ contains 160 CPU samples and 840 context switches, with no reported drops;
 substantial sampled CPU time is idle. It does not identify the cause of the
 earlier slowdown or prove consistent framerate. Audio pacing remains open.
 
-The kernel and native SDL/Wayland capture controls now pass; see
+The kernel and native SDL/Wayland capture controls now pass; SDL/Xwayland also
+passes with the Brook SDL metadata backport. See
 [pointer capture](pointer-capture.md) for exact evidence and remaining limits.
 The full path requires raw relative
 motion before screen clamping, focused window/incarnation ownership, button and

@@ -1,8 +1,8 @@
 # Pointer capture foundation
 
-Status: kernel and native SDL/Wayland relative input validated. Xwayland's
-SDL motion control still fails and physical host-pointer grabbing remains
-unaccepted. The checked Q3 review enables grabbing on Wayland; use an explicit
+Status: kernel, native SDL/Wayland and SDL/Xwayland relative input controls
+pass. Xwayland requires the Brook SDL metadata backport described below.
+Physical host-pointer grabbing remains unaccepted. The checked Q3 review enables grabbing on Wayland; use an explicit
 relative QEMU pointing device for a physical game review.
 
 ## Ownership and input
@@ -119,8 +119,8 @@ and both output EOFs. The first pre-fix run delivered all raw Wayland deltas but
 SDL observed only the last piece at each button: adding pointer frame boundaries
 fixes this measured integration failure.
 
-The SDL X11 control exits one with incorrect (-845,-462) totals; it is recorded
-as a failure, not Xwayland acceptance. Quake 3's actual installed shortcut starts
+The initial stock-SDL X11 control exits one with incorrect (-845,-462) totals.
+The later library backport below resolves this measured failure. Quake 3's actual installed shortcut starts
 on Wayland with `in_nograb=0`; its kernel cursor hides in capture and it handles
 normal WM close with an empty exact client group. Observed 43–45 FPS is a scene
 counter, not a performance improvement or timed benchmark.
@@ -137,3 +137,67 @@ other values fail validation. This selects the QEMU relative device, not an
 agent interface to the host desktop. QEMU frontend grabbing/release and physical
 mouse-look still require live acceptance. Do not infer them from injected QMP
 relative input, protocol events or hidden cursors alone.
+
+## Xwayland remap and SDL metadata follow-up
+
+Unmapping now deactivates constraints, sends matching pointer leave/frame and
+keyboard leave, clears pointer/keyboard/text-input focus, then destroys the
+native window. Destruction retains its non-notifying scrub. The same Wayland
+surface may later return and must receive a fresh enter. The production wire
+test unmaps twice, preserves keyboard modifiers, checks that a persistent lock
+cannot reactivate without new pointer focus, then remaps the same surface and
+receives one new pointer enter, keyboard enter and relative motion.
+
+The pinned `SDL2` is sdl2-compat 2.32.66 over SDL3 3.4.2. Its X11 backend caches
+master-device valuator modes but ignores `XI_DeviceChanged`: relative raw data
+can be differentiated as if it were absolute. This matches the
+[upstream report](https://github.com/libsdl-org/SDL/issues/16163). The focused
+[Brook SDL package](../tools/sdl-brook-pkg/default.nix) follows the event-time
+metadata approach in the [upstream fix](https://github.com/libsdl-org/SDL/pull/16267),
+without its broader scroll refactor. Cached axes copy scalar fields from the
+change event and reset absolute-coordinate baselines. It retains no event
+pointers and does not query a newer server state to decode older queued motion.
+The first absolute sample establishes a baseline instead of producing a jump.
+The uncached-device fallback still queries the server, as in the pinned backend;
+this does not claim to exhaust every input-device transition.
+
+The package check imports the patched production struct, extraction helper,
+change-event case and raw decoder. It covers absolute/relative/absolute queues,
+exact (+4000,-2000) totals, destroyed event-class memory and unrelated devices.
+All 25 SDL3 and 13 sdl2-compat suites also pass.
+
+In review `build/reviews/pointer-unmap-sdl-20261025`, cold and repeated X11 jobs
+`c6e06bbfab25430c9723f8d453be4f08` and `f15900236e0c49c386a62c59c31f4dfe`
+pass exact deltas, button location and cleanup. Patched Wayland job
+`0f325111efab4b798bdbd52edcd6ec43` also passes emergency release/rearm and the
+same exact totals. A same-provider, same-VM A/B reintroduces stock SDL in
+`1ee9b86f37174dae899bda7ec7947990`: it reproduces (-845,-462). Restoring the
+patched library in `5f6e00951d424f5eb5daf149afc3aad1` restores (+4000,-2000).
+All these jobs finish with empty groups and output EOFs; the baseline returns
+one for incorrect totals, the fixed controls return zero. Only the library
+search path changes; the SDL probe binary is identical.
+
+Selected compat runtime:
+`/nix/store/p8z101r2d3gd2p5h25nkk2jdy5sz21lf-sdl2-compat-2.32.66`, using
+`/nix/store/n31xg8br7l8847f4qlp9fnl3adv6rfj6-sdl3-3.4.2-lib`.
+Existing SDL2 binaries can select its `lib` through `LD_LIBRARY_PATH`; preserve
+other required library paths. New package recipes can use this SDL2 derivation
+as their dependency. This is an explicit runtime selection, not a claim that
+all bundled SDL versions have been replaced.
+
+That diagnostic VM subsequently loses its host QEMU process to SIGSEGV during
+the Q3 smoke-test attempt. Its core is truncated and cannot provide a usable
+library map/backtrace; its unsynced data disk has bitmap discrepancies. Preserve
+the entire review as failure evidence; it is not an accepted image seed.
+See [backlog](backlog.md) for the bounded follow-up.
+
+A fresh quiet review from the preceding checked images,
+`build/reviews/pointer-quiet-20261025`, stages and round-trips the Q3 runtime
+selection before boot. The actual shortcut launches, firing respawns the player,
+relative mouse input changes the view, Ctrl+Alt+Esc releases, and normal WM
+close completes with no exact client group. Observed counters are 39–42 FPS,
+not a claimed performance improvement. The original VM owner exits zero after
+checked sync and all four offline filesystem checks pass. Its kernel is the
+same `bfd7d1...` build above, provider is
+`/nix/store/6697vcba4gj0zcx8bi61wazybipkbzkl-waylandd-brook-0.1-brook`.
+Physical mouse-look and audible Q3 acceptance remain live-review tasks.
