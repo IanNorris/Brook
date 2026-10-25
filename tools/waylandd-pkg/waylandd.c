@@ -201,6 +201,7 @@ static long wm_get_screen_info(uint32_t *w_out, uint32_t *h_out) {
 struct brook_seat_client;
 struct brook_surface;
 static void seat_clients_scrub_surface(struct brook_surface *s);
+static void seat_clients_unmap_surface(struct brook_surface *s);
 static void pointer_constraints_unmap(struct brook_surface *s,int destroy);
 static void pointer_constraints_commit(struct brook_surface *s);
 static void pointer_constraints_refresh(void);
@@ -1307,6 +1308,21 @@ static void seat_clients_scrub_surface(struct brook_surface *s) {
 
 static void seat_unref(struct brook_seat_client *sc);
 static void pointer_objects_remove_pointer(struct wl_resource *r);
+static void seat_clients_unmap_surface(struct brook_surface *s) {
+    // A wl_surface may survive unmapping and be reused. End focus now so a
+    // remap receives enter again; destroying the surface is a different path.
+    for(struct brook_seat_client *sc=g_seat_clients;sc;sc=sc->next) {
+        if(sc->entered_surface==s && sc->pointer && s->resource &&
+           wl_resource_get_client(s->resource)==sc->client) {
+            wl_pointer_send_leave(sc->pointer,next_serial(),s->resource);
+            if(wl_resource_get_version(sc->pointer)>=5)wl_pointer_send_frame(sc->pointer);
+        }
+        if(sc->kb_focus==s && sc->keyboard && s->resource &&
+           wl_resource_get_client(s->resource)==sc->client)
+            wl_keyboard_send_leave(sc->keyboard,next_serial(),s->resource);
+    }
+    seat_clients_scrub_surface(s);
+}
 static void seat_remove_client(struct brook_seat_client *sc) {
     text_input_remove_seat(sc);
     if (sc && sc->entered_surface && !sc->cursor_visible)

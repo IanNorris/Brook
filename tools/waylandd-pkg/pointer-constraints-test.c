@@ -23,7 +23,8 @@ static long test_syscall(long number,...) {
     if(revoke_during_release) {revoke_during_release=0;kernel_token=0;return -116;}
     if(token!=kernel_token)return -116;kernel_token=0;return 0;
 }
-struct observed {unsigned locked,unlocked,motion,relative,button,frame;int32_t dx,dy;};
+static uint32_t keyboard_id;
+struct observed {unsigned locked,unlocked,motion,relative,button,frame,enter,leave,kb_enter,kb_leave;int32_t dx,dy;};
 static struct observed drain(struct wl_display *d,int fd,uint32_t lock,uint32_t pointer,uint32_t relative) {
     struct observed out={0};uint32_t wire[2048];wl_display_flush_clients(d);
     ssize_t bytes=recv(fd,wire,sizeof(wire),MSG_DONTWAIT);
@@ -32,7 +33,8 @@ static struct observed drain(struct wl_display *d,int fd,uint32_t lock,uint32_t 
         uint32_t *e=(void*)((char*)wire+off);unsigned n=e[1]>>16,op=e[1]&65535;
         assert(n>=8 && !(n&3) && off+n<=(size_t)bytes);
         if(e[0]==lock) {if(op==ZWP_LOCKED_POINTER_V1_LOCKED)++out.locked;else if(op==ZWP_LOCKED_POINTER_V1_UNLOCKED)++out.unlocked;else assert(0);}
-        if(e[0]==pointer) {out.motion+=op==WL_POINTER_MOTION;out.button+=op==WL_POINTER_BUTTON;out.frame+=op==WL_POINTER_FRAME;}
+        if(e[0]==pointer) {out.motion+=op==WL_POINTER_MOTION;out.button+=op==WL_POINTER_BUTTON;out.frame+=op==WL_POINTER_FRAME;out.enter+=op==WL_POINTER_ENTER;out.leave+=op==WL_POINTER_LEAVE;}
+        if(keyboard_id && e[0]==keyboard_id) {out.kb_enter+=op==WL_KEYBOARD_ENTER;out.kb_leave+=op==WL_KEYBOARD_LEAVE;}
         if(e[0]==relative) {
             assert(op==ZWP_RELATIVE_POINTER_V1_RELATIVE_MOTION && n==32);
             ++out.relative;out.dx+=(int32_t)e[4];out.dy+=(int32_t)e[5];
@@ -103,6 +105,27 @@ int main(void) {
     wl_resource_destroy(lock->resource);
     constraint_confine(client,manager,0,s->resource,pointer,NULL,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
     lock=g_pointer_constraints;assert(lock->confined && !lock->token && !kernel_token);
+    wl_resource_destroy(lock->resource);
+    drain(display,sockets[1],0,pointer_id,relative_id);
+    struct wl_resource *keyboard=wl_resource_create(client,&wl_keyboard_interface,5,0);assert(keyboard);
+    wl_resource_set_implementation(keyboard,&keyboard_impl,sc,keyboard_resource_destroy);
+    sc->keyboard=keyboard;++sc->refs;keyboard_id=wl_resource_get_id(keyboard);
+    sc->kb_mods_depressed=4;sc->kb_mods_locked=2;
+    event=(struct brook_wm_event){.type=WM_EVT_FOCUS_GAINED};dispatch_surface_event(s,sc,&event,3);
+    constraint_lock(client,manager,0,s->resource,pointer,NULL,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
+    lock=g_pointer_constraints;assert(lock->token);lock_id=wl_resource_get_id(lock->resource);
+    surface_unmap(s);surface_unmap(s); // Same wl_surface, idempotent unmap.
+    assert(!s->wm_id && !sc->entered_surface && !sc->kb_focus && !lock->token);
+    assert(sc->kb_mods_depressed==4 && sc->kb_mods_locked==2);
+    s->wm_id=1;pointer_constraints_refresh();assert(!lock->token); // No focus inherited by remap.
+    event=(struct brook_wm_event){.type=EVT_MOUSE_MOVE,.x=5,.y=5};dispatch_surface_event(s,sc,&event,3);
+    assert(lock->token);
+    event=(struct brook_wm_event){.type=EVT_MOUSE_RELATIVE,.x=11,.y=-7,.reserved=lock->token};dispatch_surface_event(s,sc,&event,3);
+    event=(struct brook_wm_event){.type=WM_EVT_FOCUS_GAINED};dispatch_surface_event(s,sc,&event,3);
+    out=drain(display,sockets[1],lock_id,pointer_id,relative_id);
+    assert(out.leave==1 && out.enter==1 && out.motion==1 && out.relative==1);
+    assert(out.kb_leave==1 && out.kb_enter==2 && out.locked==2 && out.unlocked==1);
+    wl_resource_destroy(keyboard);keyboard_id=0;
     wl_resource_destroy(lock->resource);
     constraint_lock(client,manager,0,s->resource,pointer,NULL,ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
     lock=g_pointer_constraints;assert(lock->token);
