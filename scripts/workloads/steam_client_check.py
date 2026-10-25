@@ -98,9 +98,13 @@ def main():
     # the container, passing paths as positional arguments rather than shell code.
     inner_environment = []
     if args.pulse_server is not None:
+        # The companion service launches games outside the client container.
+        # Give both branches the explicitly selected, SteamRT-visible endpoint.
+        env['PULSE_SERVER'] = args.pulse_server
         inner_environment.append('PULSE_SERVER=' + args.pulse_server)
     if args.pulse_cookie is not None:
-        inner_environment.append('PULSE_COOKIE=' + str(args.pulse_cookie.resolve(strict=True)))
+        env['PULSE_COOKIE'] = str(args.pulse_cookie.resolve(strict=True))
+        inner_environment.append('PULSE_COOKIE=' + env['PULSE_COOKIE'])
     # The generic runtime runner starts the client but does not create the
     # companion launcher service. Games launched from inside steamrt3c use
     # steam-runtime-launch-client --alongside-steam to reach that service.

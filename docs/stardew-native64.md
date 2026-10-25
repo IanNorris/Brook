@@ -196,11 +196,27 @@ not be used to identify this modified compatibility artifact; use the manifest
 hash. The compatibility output SHA-256 is
 `2d544fecc1c8c402834451c37c61d74a193241e3e7968c327940e5e60e57d96a`.
 
-The fresh initrd and real Steam game retry remain pending. Kernel and all
-13 ABI-54 drivers remain the previously checked `a44a3823...` build. The preceding
+The fresh initrd contains the verified adapted-loader hash. All three native
+regression probes pass again: read-only binds (124 plus 8 checks), file binds
+(228 plus 5) and pathname socket binds (176 plus 5). The real Steam launch now
+passes command loading and reaches game initialization after roughly 290 host
+seconds of runtime preparation. It then exits before mapping a game window:
+OpenAL cannot connect to PipeWire and the fallback ALSA file backend aborts on
+an audio-write assertion after `Bad file descriptor`. This is not yet title/menu
+acceptance. Kernel and all 13 ABI-54 drivers remain the previously checked
+`a44a3823...` build. The preceding
 review drains Steam and all diagnostic helpers normally, completes checked sync
 and passes all four offline filesystem checks. Original save contents and
 non-cloud-marker timestamps remain unchanged.
+
+### Companion audio environment
+
+A probe through the real `steam-runtime-launch-client --alongside-steam`
+service confirms that its environment has neither `PULSE_SERVER` nor
+`PULSE_COOKIE`. The public launcher previously supplied these only to the inner
+Steam command, after creating the companion service. It now supplies the explicit
+SteamRT-visible endpoint and cookie path to both branches. No cookie contents
+are exported. Actual game acceptance with that change remains pending.
 
 ## Memory barriers
 
