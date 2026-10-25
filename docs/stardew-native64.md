@@ -251,6 +251,46 @@ open-disk checks establish that the images are offline. All four read-only
 filesystem checks (data, nix, tmp, boot) return 0. Private evidence is retained
 in `build/reviews/stardew-loader-cache-20261025/`.
 
+### Sequential startup profiles
+
+A fresh live-review launch maps its window after 333.5 host seconds. A subsequent
+launch with sequential captures maps it after 348.7 seconds, about 4.6% longer.
+Snapshots every roughly 20 seconds put pressure-vessel setup through 300 seconds,
+graphics capture around 300 seconds, container command loading around 320 seconds
+and the game process/window in the final 20–30 seconds. These are observation
+bounds, not exact exclusive phase timings.
+
+Eighteen capture windows cover setup and game initialization. The initial busy
+four-second capture drops 3,019 events; the two-second transition capture drops
+163. Both are excluded from aggregate CPU shares. The other 16 windows contain
+24,260 CPU samples with no producer drops or event-count mismatch. About 76.6%
+of these samples are idle across the eight CPUs. One pressure-vessel thread
+occupies most of a core during preparation. Timer sampling underrepresents
+interrupt-masked time, and file export adds observer overhead.
+
+QEMU counters on `data.img` increase by 4,171,635,200 read bytes and
+2,031,413,760 written bytes: about 3.89 GiB read and 1.89 GiB written over
+1,698,884 read and 1,173,669 write requests. Average request sizes are only about
+2.4 KiB and 1.7 KiB. Profile output is on the separate boot image and contributes
+about 35 MiB of writes there. Host block-service times can overlap and must not
+be presented as an additive wall-time partition.
+
+Prominent preparation stacks include retained path walking, `Ext2HoldInode`,
+file writes and the synchronous virtio block submission/completion loop. Module
+addresses are resolved using the recorded module bases and the retained ELF
+section layout. `Ext2HoldInode` allocates a candidate before searching a global
+linked list, even on a hit. This provides an indexing/allocation target alongside
+hard-link support; it does not establish an exclusive percentage of wall time.
+Both `link` and `linkat` currently return `EPERM` unconditionally. Avoiding the
+runtime-copy fallback is therefore a concrete next experiment, followed by the
+same launch/counter controls. No kernel or game binaries changed for this run.
+
+Private raw/Speedscope captures, process snapshots, disk counters and aggregate
+JSON are under `live-user-20261025/startup-profile/` in the review directory.
+The game is left open and maximized after capture. Its private PulseAudio null
+sink remains silent. A reversible attempt to load `module-oss` for speaker output
+fails at `FIONBIO` with `ENOTTY`, before changing the existing stream's sink.
+
 ## Memory barriers
 
 The original direct startup reports CoreCLR HRESULT 0x8007FF02. A PID-scoped

@@ -1661,7 +1661,11 @@ each probe's argument parser.
   and companion PulseAudio environment propagation. Broader 32-bit support
   remains outside this work.
 - Runtime copying still takes roughly five minutes before the game appears.
-  Profile hard-link fallback/copy work separately from game initialization.
+  Sequential startup profiling now records 3.89 GiB read and 1.89 GiB written
+  through 2.87 million data-disk requests. Implement real `link`/`linkat`
+  semantics, then repeat the controlled launch/counters. Also investigate the
+  global linear inode lookup and allocate-before-hit pattern in `Ext2HoldInode`.
+  [Capture results and limitations](stardew-native64.md#sequential-startup-profiles).
 - Fix initial smaller-window clipping and cooperative pointer modes. Maximizing
   exposes the full menu; the captured pointer currently needs relative PS/2
   input rather than absolute tablet injection.
@@ -1669,6 +1673,8 @@ each probe's argument parser.
   private PulseAudio null sink. Steam API/IPC warnings remain. The Exit trial
   drains but reports outer status 1 and a killed child, not a verified zero
   game exit; see the earlier direct self-SIGKILL trace before attributing cause.
+  Live speaker routing via PulseAudio `module-oss` fails because `FIONBIO`
+  returns `ENOTTY`; verify proper nonblocking-device semantics before retrying.
 - Fix stale bridge launch coalescing after an exited application with no
   correlated window. The UI retry reused an old pending record; a single
   tracked guest launch provided this acceptance run.
