@@ -5,6 +5,47 @@ is not yet accepted. The title/menu, basic input and normal exit remain the
 goal; no existing save was loaded during these trials. Game files and account
 evidence stay in ignored private reviews.
 
+## 25 October: container source FD reporting
+
+The live Steam launch ends with wrapper status 1 after roughly four minutes of
+Soldier runtime preparation. The fatal message is bubblewrap's inability to
+open a graphics-library bind source (`EOPNOTSUPP`). Earlier failures to execute
+the i386 capsule helper produce warnings and are not sufficient to explain this
+exit. Hard-link `EPERM` copying fallbacks explain a concrete preparation cost;
+that optimization remains separate from this compatibility fix.
+
+The [upstream safe-open fallback](https://github.com/containers/bubblewrap/blob/main/safe_openat.c)
+opens the source, then reads its proc-fd link to verify containment beneath
+`/oldroot`. On the unchanged Brook kernel, both ordinary and `O_PATH` opens of
+the exact library succeed, while both FD readlinks fail with error 95. The
+parent directory reports correctly. Ext2 lacked non-directory object-path
+reporting; successful stat/open outside the container missed this later check.
+
+The candidate records each retained file entry's pinned parent and leaf,
+separately from the shared inode. Reporting reconstructs the parent's current
+path and validates the entry, without a cached absolute label or reverse inode
+search. Rename and unlink update exact entries, including hard-link aliases.
+Namespace changes update reporting even when a later metadata write returns
+`EIO`. Incomplete rename rollback permanently invalidates uncertain records.
+Deleted leaves retain a deleted marker; deleted ancestors and inode-only legacy
+conversions remain explicitly unreportable. Bubblewrap's containment check is
+unchanged.
+
+All 109 host tests pass, including production ext2 callbacks, concurrent
+report/rename/reference retirement, allocation unwind, post-commit metadata
+failure and both destination/source rollback failures. The public file-bind
+probe adds ordinary/unbound `O_PATH` FD readback and a real bind/proc/pivot-root
+`/oldroot` check. Linux passes (204 fixture checks, 5 parent checks); the candidate
+passes on ext2 (190 fixture checks, 5 parent checks). The exact library's two FD
+readbacks also pass natively. Release entry, scheduler-start and lock/wait
+mutation audits pass.
+
+Candidate kernel SHA-256:
+`9381109685423a1ebaf85cb97ba829aac23c48d179f79acf4178b6b1b6f933c3`.
+All 13 driver modules remain matched at ABI 53. Native evidence is private in
+`build/reviews/stardew-fd-report-20261025/`. Through-Steam game acceptance is
+still pending; the passing file probe alone does not establish it.
+
 ## Memory barriers
 
 The original direct startup reports CoreCLR HRESULT 0x8007FF02. A PID-scoped

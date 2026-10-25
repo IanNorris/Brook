@@ -315,10 +315,26 @@ struct Ext2OpenInode {
     FileObject file;
 };
 
+// Reporting provenance belongs to a directory entry, not the shared inode.
+// In particular, two pre-existing hard links must retain different names.
+struct Ext2EntryRecord {
+    Ext2EntryRecord* next;
+    VfsObject* object;
+    Ext2OpenInode* parent;
+    bool detached;
+    bool invalid;
+    char name[256];
+};
+struct Ext2RetainedObject {
+    VfsObject object;
+    Ext2EntryRecord* entry;
+};
+
 // Final vnode close can run in the timer's reaper. This lock protects only
 // bookkeeping; it never nests filesystem I/O, allocation or the ext2 rwlock.
 static IrqSpinLock g_ext2OpenLock;
 static Ext2OpenInode* g_ext2OpenInodes;
+static Ext2EntryRecord* g_ext2Entries;
 static int Ext2FileTruncate(Vnode* vn, uint64_t size);
 
 // Called with the filesystem lock held, before publishing a vnode.
@@ -361,6 +377,37 @@ static void Ext2ReleaseInode(Ext2OpenInode* inode)
     // reclaim them. Closing from an IRQ never acquires a sleeping lock.
     IrqSpinLockRelease(&g_ext2OpenLock, flags);
     if (dispose) { FileObjectDispose(&inode->file);kfree(inode); }
+}
+
+// Namespace writers hold g_ext2Lock. The short registry lock only excludes
+// final object destruction; no allocation, I/O or release callback nests it.
+static void Ext2DetachEntries(Ext2Mount* mnt,uint32_t parent,const char* name,uint32_t ino,bool invalid=false)
+{
+    uint64_t flags=IrqSpinLockAcquire(&g_ext2OpenLock);
+    for(auto* entry=g_ext2Entries;entry;entry=entry->next) {
+        auto* hold=static_cast<Ext2OpenInode*>(entry->object->priv);
+        if(!entry->detached && hold->mnt==mnt && hold->inode==ino &&
+           entry->parent->inode==parent && !strcmp(entry->name,name)) {
+            if(invalid)entry->invalid=true;else entry->detached=true;
+        }
+    }
+    IrqSpinLockRelease(&g_ext2OpenLock,flags);
+}
+static void Ext2MoveEntries(Ext2Mount* mnt,uint32_t parent,const char* name,uint32_t ino,
+                            Ext2OpenInode* newParent,const char* newName)
+{
+    Ext2OpenInode* oldParent=nullptr;uint32_t releases=0;
+    uint64_t flags=IrqSpinLockAcquire(&g_ext2OpenLock);
+    for(auto* entry=g_ext2Entries;entry;entry=entry->next) {
+        auto* hold=static_cast<Ext2OpenInode*>(entry->object->priv);
+        if(entry->detached || entry->invalid || hold->mnt!=mnt || hold->inode!=ino ||
+           entry->parent->inode!=parent || strcmp(entry->name,name))continue;
+        oldParent=entry->parent;++releases;++newParent->holders;
+        entry->parent=newParent;
+        uint32_t i=0;do {entry->name[i]=newName[i];}while(newName[i++]);
+    }
+    IrqSpinLockRelease(&g_ext2OpenLock,flags);
+    while(releases--)Ext2ReleaseInode(oldParent);
 }
 
 static bool Ext2MarkOpenOrphan(Ext2Mount* mnt, uint32_t inode)
@@ -2638,36 +2685,30 @@ static int Ext2VnodeAccess(Vnode* vn,uint8_t required,bool realIds)
 // spelling. Directory hard links are unsupported; '..' gives the parent and
 // its live entry gives this inode's component. The VFS namespace read lock
 // excludes rename/remove across the complete reconstruction.
-static int Ext2DirectoryPath(Vnode* vn,char* out,uint32_t capacity)
+static int Ext2DirectoryPathLocked(Ext2Mount* mnt,uint32_t current,char* out,uint32_t capacity,uint8_t* buffer)
 {
     if(!out || capacity<2)return -36;
-    auto* dp=static_cast<Ext2DirPriv*>(vn->priv);
-    auto* mnt=dp->mnt;
-    auto* buffer=static_cast<uint8_t*>(kmalloc(mnt->blockSize));
-    if(!buffer)return -12;
-    KRwLockReadLock(&g_ext2Lock);
-    auto finish=[&](int result) {KRwLockReadUnlock(&g_ext2Lock);kfree(buffer);return result;};
-    uint32_t position=capacity-1,current=dp->inode;
+    uint32_t position=capacity-1;
     out[position]=0;
     for(uint32_t depth=0;current!=EXT2_ROOT_INO;++depth) {
-        if(depth>=256)return finish(-40);
+        if(depth>=256)return -40;
         Ext2Inode child,parent;
-        if(!Ext2ReadInode(mnt,current,&child))return finish(-5);
-        if((child.i_mode&EXT2_S_IFMT)!=EXT2_S_IFDIR || !child.i_links_count)return finish(-2);
+        if(!Ext2ReadInode(mnt,current,&child))return -5;
+        if((child.i_mode&EXT2_S_IFMT)!=EXT2_S_IFDIR || !child.i_links_count)return -2;
         uint32_t parentIno=Ext2DirLookup(mnt,current,&child,"..");
-        if(!parentIno || parentIno==current)return finish(-2);
-        if(!Ext2ReadInode(mnt,parentIno,&parent))return finish(-5);
+        if(!parentIno || parentIno==current)return -2;
+        if(!Ext2ReadInode(mnt,parentIno,&parent))return -5;
         bool found=false;
         for(uint64_t offset=0;offset<Ext2InodeSize(&parent) && !found;offset+=mnt->blockSize) {
             uint32_t block=Ext2BlockMap(mnt,&parent,offset>>mnt->blockShift);
-            if(!block || !Ext2ReadBlock(mnt,block,buffer))return finish(-5);
+            if(!block || !Ext2ReadBlock(mnt,block,buffer))return -5;
             for(uint32_t pos=0;pos<mnt->blockSize;) {
                 auto* entry=reinterpret_cast<Ext2DirEntry2*>(buffer+pos);
-                if(!Ext2DirEntryValid(entry,pos,mnt->blockSize))return finish(-5);
+                if(!Ext2DirEntryValid(entry,pos,mnt->blockSize))return -5;
                 const bool dot=entry->name_len==1 && entry->name[0]=='.';
                 const bool dotdot=entry->name_len==2 && entry->name[0]=='.' && entry->name[1]=='.';
                 if(entry->inode==current && !dot && !dotdot) {
-                    if(!entry->name_len || position<uint32_t(entry->name_len)+1)return finish(-36);
+                    if(!entry->name_len || position<uint32_t(entry->name_len)+1)return -36;
                     position-=entry->name_len;
                     for(uint32_t i=0;i<entry->name_len;++i)out[position+i]=entry->name[i];
                     out[--position]='/';found=true;break;
@@ -2675,12 +2716,23 @@ static int Ext2DirectoryPath(Vnode* vn,char* out,uint32_t capacity)
                 pos+=entry->rec_len;
             }
         }
-        if(!found)return finish(-2);
+        if(!found)return -2;
         current=parentIno;
     }
     if(position==capacity-1)out[--position]='/';
     for(uint32_t i=0;i<capacity-position;++i)out[i]=out[position+i];
-    return finish(0);
+    return 0;
+}
+
+static int Ext2DirectoryPath(Vnode* vn,char* out,uint32_t capacity)
+{
+    if(!out || capacity<2)return -36;
+    auto* dp=static_cast<Ext2DirPriv*>(vn->priv);
+    auto* buffer=static_cast<uint8_t*>(kmalloc(dp->mnt->blockSize));
+    if(!buffer)return -12;
+    KRwLockReadLock(&g_ext2Lock);
+    int error=Ext2DirectoryPathLocked(dp->mnt,dp->inode,out,capacity,buffer);
+    KRwLockReadUnlock(&g_ext2Lock);kfree(buffer);return error;
 }
 
 static const VnodeOps g_ext2FileOps = {
@@ -3374,6 +3426,7 @@ static int Ext2FsRemoveAt(void* mountPriv,uint8_t pdrv,const char* relPath,bool 
     bool entryRemoved;
     int error = Ext2DirRemove(mnt, &parent, parentIno, name, &entryRemoved) == ino ? 0 : -5;
     if (!entryRemoved) return finish(-5);
+    Ext2DetachEntries(mnt,parentIno,name,ino);
     if (directory) {
         --parent.i_links_count;
         if (!Ext2WriteInode(mnt, parentIno, &parent)) error = -5;
@@ -3616,7 +3669,9 @@ static int Ext2FsRenameAt(void* mountPriv,uint8_t pdrv,const char* oldRelPath,co
     KRwLockWriteLock(&g_ext2Lock);
     Ext2DrainOrphans(mnt);
     Ext2OpenInode* deletionHold = nullptr;
+    Ext2OpenInode* entryParentHold = nullptr;
     auto finish = [&](int result) {
+        Ext2ReleaseInode(entryParentHold);
         Ext2ReleaseInode(deletionHold);
         KRwLockWriteUnlock(&g_ext2Lock);
         return result;
@@ -3675,6 +3730,11 @@ static int Ext2FsRenameAt(void* mountPriv,uint8_t pdrv,const char* oldRelPath,co
 
     // Install destination first. Replacement uses the existing entry's
     // storage, and keeps the victim inode alive until namespace changes work.
+    // Prepare reporting pins before mutation, so publication cannot allocate.
+    if(!directory) {
+        entryParentHold=Ext2HoldInode(mnt,newParent);
+        if(!entryParentHold)return finish(-12);
+    }
     if (existing) {
         deletionHold = Ext2HoldInode(mnt, existing);
         if (!deletionHold) return finish(-12);
@@ -3683,26 +3743,38 @@ static int Ext2FsRenameAt(void* mountPriv,uint8_t pdrv,const char* oldRelPath,co
     bool installed = existing ? Ext2DirReplace(mnt, newParent, &newDir, newName, ino, type, &entryInstalled)
                               : Ext2DirAdd(mnt, newParent, &newDir, ino, newName, type, &entryInstalled);
     auto restoreDestination = [&]() {
-        if (existing) Ext2DirReplace(mnt, newParent, &newDir, newName, existing, victimType);
-        else Ext2DirRemove(mnt, &newDir, newParent, newName);
+        bool restored=false;
+        if (existing) Ext2DirReplace(mnt, newParent, &newDir, newName, existing, victimType,&restored);
+        else Ext2DirRemove(mnt, &newDir, newParent, newName,&restored);
+        return restored;
+    };
+    auto invalidateReporting = [&]() {
+        // An uncertain rollback must never adopt a later same-inode alias.
+        Ext2DetachEntries(mnt,oldParent,oldName,ino,true);
+        if(existing)Ext2DetachEntries(mnt,newParent,newName,existing,true);
     };
     if (!installed) {
-        if (entryInstalled) restoreDestination();
+        if (entryInstalled && !restoreDestination())invalidateReporting();
         return finish(-5);
     }
     // Same-directory operations must use metadata after the destination edit.
     bool entryRemoved = false;
     if (!Ext2ReadInode(mnt, oldParent, &oldDir) ||
         Ext2DirRemove(mnt, &oldDir, oldParent, oldName, &entryRemoved) != ino) {
-        restoreDestination();
+        bool restored=restoreDestination();
         if (entryRemoved) {
-            Ext2ReadInode(mnt, oldParent, &oldDir);
-            Ext2DirAdd(mnt, oldParent, &oldDir, ino, oldName, type);
+            bool sourceRestored=false;
+            if(Ext2ReadInode(mnt, oldParent, &oldDir))
+                Ext2DirAdd(mnt, oldParent, &oldDir, ino, oldName, type,&sourceRestored);
+            restored=restored&&sourceRestored;
         }
+        if(!restored)invalidateReporting();
         return finish(-5);
     }
     // Namespace committed. Even if a later metadata write fails, complete
     // victim accounting and retain the first error; never skip its unlink.
+    if(existing)Ext2DetachEntries(mnt,newParent,newName,existing);
+    if(entryParentHold)Ext2MoveEntries(mnt,oldParent,oldName,ino,entryParentHold,newName);
     int error = 0;
     // Updating the moved directory's '..' entry is rename bookkeeping, not
     // a user content modification. Preserve its mtime; ctime is set below.
@@ -3975,27 +4047,49 @@ static int Ext2CheckRealAccess(void* mountPriv,const VnodeStat* st,uint8_t requi
     return Ext2AccessMetadata(static_cast<Ext2Mount*>(mountPriv),st,required,true);
 }
 
-// Retained backend identities never contain an opening pathname or an iterator.
-// The owning VFS path separately retains this object's mount attachment.
+// Retained identities have no iterator or cached absolute opening pathname.
+// A non-directory lookup also pins its exact parent/leaf entry for reporting.
+// The owning VFS path separately retains the mount attachment.
 static const VfsObjectOps* Ext2ObjectOperations();
 
 // Caller holds g_ext2Lock. Inode retention precedes publication, so unlink and
 // reallocation cannot replace the object behind a successful lookup.
-static int Ext2AcquireObject(Ext2Mount* mount,uint32_t ino,VfsObject** out)
+static int Ext2AcquireObject(Ext2Mount* mount,uint32_t ino,VfsObject** out,
+                            uint32_t parent=0,const char* name=nullptr)
 {
     *out=nullptr;
     Ext2Inode data;
     if(!ino || !Ext2ReadInode(mount,ino,&data))return -5;
     auto* hold=Ext2HoldInode(mount,ino);
     if(!hold)return -12;
-    auto* object=static_cast<VfsObject*>(kmalloc(sizeof(VfsObject)));
+    auto* object=static_cast<Ext2RetainedObject*>(kmalloc(sizeof(Ext2RetainedObject)));
     if(!object){Ext2ReleaseInode(hold);return -12;}
-    *object={Ext2ObjectOperations(),hold,ino,1};
-    *out=object;return 0;
+    *object={{Ext2ObjectOperations(),hold,ino,1},nullptr};
+    if(parent && name && (data.i_mode&EXT2_S_IFMT)!=EXT2_S_IFDIR) {
+        auto* entry=static_cast<Ext2EntryRecord*>(kmalloc(sizeof(Ext2EntryRecord)));
+        if(!entry){Ext2ReleaseInode(hold);kfree(object);return -12;}
+        auto* parentHold=Ext2HoldInode(mount,parent);
+        if(!parentHold){kfree(entry);Ext2ReleaseInode(hold);kfree(object);return -12;}
+        *entry={nullptr,&object->object,parentHold,false,false,{}};
+        uint32_t i=0;do {entry->name[i]=name[i];}while(name[i++]);
+        object->entry=entry;
+        uint64_t flags=IrqSpinLockAcquire(&g_ext2OpenLock);
+        entry->next=g_ext2Entries;g_ext2Entries=entry;
+        IrqSpinLockRelease(&g_ext2OpenLock,flags);
+    }
+    *out=&object->object;return 0;
 }
 
 static void Ext2DestroyObject(VfsObject* object)
 {
+    auto* retained=reinterpret_cast<Ext2RetainedObject*>(object);
+    if(auto* entry=retained->entry) {
+        uint64_t flags=IrqSpinLockAcquire(&g_ext2OpenLock);
+        auto** link=&g_ext2Entries;while(*link && *link!=entry)link=&(*link)->next;
+        if(*link)*link=entry->next;
+        IrqSpinLockRelease(&g_ext2OpenLock,flags);
+        Ext2ReleaseInode(entry->parent);kfree(entry);
+    }
     Ext2ReleaseInode(static_cast<Ext2OpenInode*>(object->priv));kfree(object);
 }
 
@@ -4051,7 +4145,7 @@ static int Ext2ObjectChild(VfsObject* directory,const char* name,VfsObject** out
         if(!error) {
             int lookupError=0;
             uint32_t child=Ext2DirLookup(hold->mnt,hold->inode,&data,name,&lookupError);
-            error=child?Ext2AcquireObject(hold->mnt,child,out):lookupError;
+            error=child?Ext2AcquireObject(hold->mnt,child,out,hold->inode,name):lookupError;
         }
     }
     KRwLockReadUnlock(&g_ext2Lock);return error;
@@ -4150,6 +4244,13 @@ static Vnode* Ext2ObjectCreate(VfsObject* parent,const char* name,int flags,uint
     auto* hold=static_cast<Ext2OpenInode*>(parent->priv);
     Vnode* node=Ext2FsOpenModeAt(hold->mnt,0,name,flags|VFS_O_CREATE|VFS_O_EXCL,mode,error,hold->inode,0);
     if(!node && !*error)*error=-5;
+    if(node) {
+        auto* created=static_cast<Ext2FilePriv*>(node->priv);
+        KRwLockReadLock(&g_ext2Lock);
+        *error=Ext2AcquireObject(hold->mnt,created->inode,&node->backendObject,hold->inode,name);
+        KRwLockReadUnlock(&g_ext2Lock);
+        if(*error){node->ops->close(node);kfree(node);return nullptr;}
+    }
     return node;
 }
 static int Ext2ObjectMkdir(VfsObject* parent,const char* name,uint16_t mode)
@@ -4220,12 +4321,52 @@ static int Ext2ObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity
     Vnode vnode{};vnode.priv=&directory;return Ext2DirectoryPath(&vnode,out,capacity);
 }
 
+static int Ext2ObjectPath(VfsObject* object,char* out,uint32_t capacity)
+{
+    if(!out || capacity<2)return -36;
+    out[0]=0;
+    auto* hold=static_cast<Ext2OpenInode*>(object->priv);
+    auto* buffer=static_cast<uint8_t*>(kmalloc(hold->mnt->blockSize));
+    if(!buffer)return -12;
+    KRwLockReadLock(&g_ext2Lock);
+    auto finish=[&](int error){KRwLockReadUnlock(&g_ext2Lock);kfree(buffer);return error;};
+    Ext2Inode data;
+    if(!Ext2ReadInode(hold->mnt,hold->inode,&data))return finish(-5);
+    if((data.i_mode&EXT2_S_IFMT)==EXT2_S_IFDIR)
+        return finish(Ext2DirectoryPathLocked(hold->mnt,hold->inode,out,capacity,buffer));
+    auto* entry=reinterpret_cast<Ext2RetainedObject*>(object)->entry;
+    // Inode-only legacy conversions cannot choose between hard-link aliases.
+    if(!entry)return finish(-95);
+    if(entry->invalid)return finish(-5);
+    if(!entry->detached) {
+        Ext2Inode parent;
+        if(!Ext2ReadInode(hold->mnt,entry->parent->inode,&parent))return finish(-5);
+        if((parent.i_mode&EXT2_S_IFMT)!=EXT2_S_IFDIR || !parent.i_links_count)return finish(-2);
+        int error=0;
+        if(Ext2DirLookup(hold->mnt,entry->parent->inode,&parent,entry->name,&error)!=hold->inode)
+            return finish(error?error:-2);
+    }
+    // The namespace read lock covers parent reconstruction and leaf appending.
+    // A deleted ancestor is deliberately unreportable rather than guessed.
+    int error=Ext2DirectoryPathLocked(hold->mnt,entry->parent->inode,out,capacity,buffer);
+    if(error)return finish(error);
+    uint32_t length=strlen(out),leaf=strlen(entry->name);
+    bool slash=length>1;
+    constexpr char deleted[]=" (deleted)";
+    uint32_t suffix=entry->detached?sizeof(deleted)-1:0;
+    if(uint64_t(length)+slash+leaf+suffix>=capacity)return finish(-36);
+    if(slash)out[length++]='/';
+    for(uint32_t i=0;i<leaf;++i)out[length++]=entry->name[i];
+    if(suffix)for(uint32_t i=0;i<suffix;++i)out[length++]=deleted[i];
+    out[length]=0;return finish(0);
+}
+
 static const VfsObjectOps g_ext2ObjectOps={
     Ext2DestroyObject,Ext2ObjectStat,Ext2ObjectAccess,Ext2ObjectChild,
     Ext2ObjectParent,Ext2ObjectReadlink,Ext2ObjectOpen,
     Ext2ObjectCreate,Ext2ObjectMkdir,Ext2ObjectRemove,Ext2ObjectRename,
     Ext2ObjectSymlink,Ext2ObjectSocket,Ext2ObjectTimes,Ext2ObjectChmod,
-    Ext2ObjectChown,Ext2ObjectDirectoryPath,nullptr,nullptr,Ext2ObjectFifo,
+    Ext2ObjectChown,Ext2ObjectDirectoryPath,nullptr,Ext2ObjectPath,Ext2ObjectFifo,
 };
 static const VfsObjectOps* Ext2ObjectOperations(){return &g_ext2ObjectOps;}
 
@@ -4242,6 +4383,9 @@ static int Ext2ObjectFromVnode(Vnode* vnode,VfsObject** out)
 {
     if(!out)return -22;
     *out=nullptr;
+    if(vnode && vnode->backendObject && vnode->backendObject->ops==Ext2ObjectOperations()) {
+        VfsObjectRetain(vnode->backendObject);*out=vnode->backendObject;return 0;
+    }
     Ext2OpenInode* hold=nullptr;
     if(vnode && vnode->ops==&g_ext2DirOps)hold=static_cast<Ext2DirPriv*>(vnode->priv)->hold;
     else if(vnode && (vnode->ops==&g_ext2FileOps || vnode->ops==&g_ext2SocketOps))

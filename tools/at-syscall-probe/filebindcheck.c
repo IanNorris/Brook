@@ -20,6 +20,23 @@ static char readfd(int f){char c=0;CK(lseek(f,0,SEEK_SET)==0);CK(read(f,&c,1)==1
 static char readvalue(const char *p){int f=open(p,O_RDONLY);CK(f>=0);char c=readfd(f);CK(close(f)==0);return c;}
 static void fdpath(const char *path,int flags){char expected[512],link[64],actual[512];CK(getcwd(expected,sizeof(expected)));size_t n=strlen(expected);CK(n+strlen(path)+2<sizeof(expected));expected[n++]='/';strcpy(expected+n,path);int f=open(path,flags);CK(f>=0);snprintf(link,sizeof(link),"/proc/self/fd/%d",f);ssize_t len=readlink(link,actual,sizeof(actual)-1);CK(len>0);actual[len]=0;CK(!strcmp(actual,expected));CK(close(f)==0);}
 static void waitok(pid_t p){int status=0;CK(waitpid(p,&status,0)==p);CK(WIFEXITED(status)&&WEXITSTATUS(status)==0);}
+static void pivot_source(const char *base){
+ char pivot[128],target[160];snprintf(pivot,sizeof(pivot),"%s/pivot",base);CK(!mkdir(pivot,0700));
+ pid_t child=syscall(SYS_clone,(unsigned long)(CLONE_NEWNS|SIGCHLD),0L,0L,0L,0L);CK(child>=0);
+ if(child){waitok(child);CK(!rmdir(pivot));return;}
+ CK(!mount("tmpfs",pivot,"tmpfs",MS_NOSUID|MS_NODEV,NULL));
+ snprintf(target,sizeof(target),"%s/oldroot",pivot);CK(!mkdir(target,0700));
+ snprintf(target,sizeof(target),"%s/proc",pivot);CK(!mkdir(target,0700));CK(!mount("/proc",target,NULL,MS_BIND|MS_REC,NULL));
+ CK(!chdir(pivot));CK(!syscall(SYS_pivot_root,".","oldroot"));CK(!chdir("/"));
+ int root=open("/oldroot",O_PATH|O_DIRECTORY|O_CLOEXEC);CK(root>=0);
+ char relative[128],expected[160];snprintf(relative,sizeof(relative),"%s/source",base+1);snprintf(expected,sizeof(expected),"/oldroot%s/source",base);
+ for(unsigned i=0;i<2;++i){
+  int f=openat(root,relative,(i?O_RDONLY:O_PATH)|O_CLOEXEC);CK(f>=0);
+  char name[64],actual[256];snprintf(name,sizeof(name),"/proc/self/fd/%d",f);
+  ssize_t n=readlink(name,actual,sizeof(actual)-1);CK(n>0);actual[n]=0;CK(!strcmp(actual,expected));CK(!close(f));
+ }
+ CK(!close(root));_exit(0);
+}
 int main(int argc,char **argv){
  setbuf(stdout,NULL);int disk=argc==2&&(!strcmp(argv[1],"--ext2")||!strcmp(argv[1],"--brook-ext2"));int brook=argc==2&&(!strcmp(argv[1],"--brook")||!strcmp(argv[1],"--brook-ext2"));CK(argc==1||brook||disk);CK(geteuid()!=0);uid_t uid=geteuid();gid_t gid=getegid();
  pid_t child=syscall(SYS_clone,(unsigned long)(CLONE_NEWUSER|CLONE_NEWNS|SIGCHLD),0L,0L,0L,0L);CK(child>=0);
@@ -27,6 +44,9 @@ int main(int argc,char **argv){
  alarm(60);map("/proc/self/uid_map",uid);int f=open("/proc/self/setgroups",O_WRONLY);CK(f>=0);CK(write(f,"deny\n",5)==5);CK(close(f)==0);map("/proc/self/gid_map",gid);
  CK(mount(NULL,"/",NULL,MS_PRIVATE|MS_REC,NULL)==0);char base[64];strcpy(base,brook&&disk?"/data/home/filebind-XXXXXX":"/tmp/filebind-XXXXXX");CK(mkdtemp(base));if(!disk)CK(mount("tmpfs",base,"tmpfs",MS_NOSUID|MS_NODEV,NULL)==0);struct statfs fs;CK(statfs(base,&fs)==0&&fs.f_type==(disk?0xef53:0x01021994));CK(chdir(base)==0);
  CK(mkdir("tree",0700)==0&&mkdir("copy",0700)==0);value("source",'A');value("other",'C');value("tree/target",'B');
+ // Bubblewrap's safe_openat fallback reads back the O_PATH descriptor name
+ // before mounting. Cover an ordinary unbound file as well as bind targets.
+ fdpath("source",O_RDONLY);fdpath("source",O_PATH|O_CLOEXEC);
  errno=0;int linked=link("tree/target","tree/alias");
  if(brook)CK(linked==-1&&errno==EPERM);
  else {CK(linked==0);CK(mount("source","tree/target",NULL,MS_BIND,NULL)==0);CK(readvalue("tree/target")=='A'&&readvalue("tree/alias")=='B');CK(umount2("tree/target",MNT_DETACH)==0);CK(unlink("tree/alias")==0);CK(link("source","source-alias")==0);}
@@ -42,5 +62,6 @@ int main(int argc,char **argv){
  CK(mount("tree","copy",NULL,MS_BIND|MS_REC,NULL)==0);CK(readvalue("copy/target")=='A');errno=0;CK(open("copy/target",O_WRONLY)==-1&&errno==EROFS);
  child=syscall(SYS_clone,(unsigned long)(CLONE_NEWNS|SIGCHLD),0L,0L,0L,0L);CK(child>=0);if(!child){CK(umount2("copy/target",MNT_DETACH)==0);CK(readvalue("copy/target")=='B');CK(readvalue("tree/target")=='A');_exit(0);}waitok(child);CK(readvalue("copy/target")=='A');
  CK(unlink("renamed")==0);CK(readvalue("tree/target")=='A'&&readvalue("copy/target")=='A');int held=open("copy/target",O_RDONLY);CK(held>=0);CK(umount2("tree/target",MNT_DETACH)==0);CK(readvalue("tree/target")=='B'&&readvalue("copy/target")=='A');CK(umount2("copy/target",MNT_DETACH)==0);CK(readvalue("copy/target")=='B'&&readfd(held)=='A');CK(umount2("copy",MNT_DETACH)==0);CK(readfd(held)=='A'&&readfd(old)=='B');CK(close(held)==0&&close(old)==0);
+ pivot_source(base);
  if(disk){CK(unlink("source")==0&&unlink("other")==0&&unlink("tree/target")==0);CK(rmdir("tree")==0&&rmdir("copy")==0);}CK(chdir("/")==0);if(!disk)CK(umount2(base,MNT_DETACH)==0);CK(rmdir(base)==0);printf("FILEBIND FIXTURE PASS checks=%u brook_cases=%d\n",checks,brook);return 0;
 }

@@ -34,19 +34,24 @@ unsigned requiredAccess=0;
 brook::Process process{};
 uint16_t legacyTestMask=022;
 std::vector<unsigned char> disk;
+uint64_t failWriteOffset=~uint64_t{0};
+uint64_t nextFailWriteOffset=~uint64_t{0};
+bool writeFailureInjected=false;
+unsigned injectedWriteFailures=0;
 int readDisk(brook::Device* device,uint64_t offset,void* out,uint64_t bytes){
     auto& storage=device->priv?*static_cast<std::vector<unsigned char>*>(device->priv):disk;
     if(offset>storage.size() || bytes>storage.size()-offset)return -5;
     std::memcpy(out,storage.data()+offset,bytes);return bytes;
 }
 int writeDisk(brook::Device* device,uint64_t offset,const void* in,uint64_t bytes){
+    if(offset==failWriteOffset){failWriteOffset=nextFailWriteOffset;nextFailWriteOffset=~uint64_t{0};writeFailureInjected=true;++injectedWriteFailures;return -5;}
     auto& storage=device->priv?*static_cast<std::vector<unsigned char>*>(device->priv):disk;
     if(offset>storage.size() || bytes>storage.size()-offset)return -5;
     std::memcpy(storage.data()+offset,in,bytes);return bytes;
 }
 int ioctlDisk(brook::Device*,uint32_t,void*){return 0;}
 const brook::DeviceOps diskOps={readDisk,writeDisk,ioctlDisk,nullptr};
-void closeNode(brook::Vnode* node){assert(node);node->ops->close(node);brook::kfree(node);}
+void closeNode(brook::Vnode* node){assert(node);auto* object=node->backendObject;node->ops->close(node);brook::kfree(node);brook::VfsObjectRelease(object);}
 }
 namespace brook {
 bool ProcessCapable(Process* p,UserNamespace* target,unsigned capability) {
@@ -126,7 +131,131 @@ int main(int argc,char** argv){
     // Make ownership independent of the host account that generated fixtures.
     m->skipPermChecks=true;
     VfsObject *root=nullptr,*held=nullptr,*marker=nullptr,*link=nullptr,*parent=nullptr;
-    assert(!Ext2RootObject(m,0,&root));assert(!Ext2ObjectChild(root,"dir",&held));
+    assert(!Ext2RootObject(m,0,&root));
+    // Exact entry reporting, independently of shared inode identity. These
+    // production callbacks back ordinary and O_PATH proc-fd readlink alike.
+    {
+        assert(!root->ops->mkdir(root,"report",0700));
+        assert(!root->ops->mkdir(root,"report-other",0700));
+        VfsObject *directory=nullptr,*other=nullptr;
+        assert(!Ext2ObjectChild(root,"report",&directory));
+        assert(!Ext2ObjectChild(root,"report-other",&other));
+        auto pathIs=[](VfsObject* object,const char* expected) {
+            char text[512];assert(object->ops->object_path);
+            assert(!object->ops->object_path(object,text,sizeof(text)));
+            assert(!std::strcmp(text,expected));
+        };
+        auto create=[&](const char* name) {
+            int error=0;auto* node=Ext2ObjectCreate(directory,name,VFS_O_WRITE,0600,&error);
+            assert(node&&!error&&node->backendObject);
+            VfsObject* object=nullptr;assert(!Ext2ObjectFromVnode(node,&object));
+            assert(object==node->backendObject);closeNode(node);return object;
+        };
+        auto* source=create("source");auto* victim=create("victim");
+        pathIs(source,"/report/source");pathIs(victim,"/report/victim");
+        char tiny[4];assert(source->ops->object_path(source,tiny,sizeof(tiny))==-36);
+        assert(!directory->ops->rename(directory,"source",directory,"victim"));
+        pathIs(source,"/report/victim");pathIs(victim,"/report/victim (deleted)");
+        assert(!root->ops->rename(root,"report",root,"report-moved"));
+        pathIs(source,"/report-moved/victim");pathIs(victim,"/report-moved/victim (deleted)");
+        assert(!directory->ops->rename(directory,"victim",other,"moved"));
+        pathIs(source,"/report-other/moved");
+        assert(!other->ops->remove(other,"moved",false));
+        pathIs(source,"/report-other/moved (deleted)");
+        int error=0;auto* replacement=Ext2ObjectCreate(other,"moved",VFS_O_WRITE,0600,&error);
+        assert(replacement&&!error);pathIs(replacement->backendObject,"/report-other/moved");
+        pathIs(source,"/report-other/moved (deleted)");closeNode(replacement);
+        assert(!other->ops->remove(other,"moved",false));
+        VfsObjectRelease(source);VfsObjectRelease(victim);
+
+        // Model prebuilt hard links without adding a link syscall or choosing
+        // an arbitrary inode alias for reporting.
+        auto* left=create("left");
+        KRwLockWriteLock(&g_ext2Lock);
+        auto* dh=static_cast<Ext2OpenInode*>(directory->priv);
+        Ext2Inode dd{},file{};assert(Ext2ReadInode(m,dh->inode,&dd));
+        assert(Ext2ReadInode(m,left->identity,&file));
+        assert(Ext2DirAdd(m,dh->inode,&dd,left->identity,"right",1));
+        ++file.i_links_count;assert(Ext2WriteInode(m,left->identity,&file));
+        KRwLockWriteUnlock(&g_ext2Lock);
+        VfsObject* right=nullptr;assert(!Ext2ObjectChild(directory,"right",&right));
+        pathIs(left,"/report-moved/left");pathIs(right,"/report-moved/right");
+        assert(!directory->ops->rename(directory,"left",directory,"right"));
+        pathIs(left,"/report-moved/left");pathIs(right,"/report-moved/right");
+        assert(!directory->ops->rename(directory,"left",directory,"renamed"));
+        pathIs(left,"/report-moved/renamed");pathIs(right,"/report-moved/right");
+        assert(!directory->ops->remove(directory,"right",false));
+        pathIs(left,"/report-moved/renamed");pathIs(right,"/report-moved/right (deleted)");
+
+        // Report, rename and retire other references concurrently. Every
+        // report must be one complete committed entry, never a mixed label.
+        std::atomic<bool> go{false};
+        std::thread renamer([&]{while(!go.load()){};for(unsigned i=0;i<50;++i){
+            assert(!directory->ops->rename(directory,"renamed",directory,"alternate"));
+            assert(!directory->ops->rename(directory,"alternate",directory,"renamed"));
+        }});
+        std::thread observer([&]{while(!go.load()){};for(unsigned i=0;i<100;++i){
+            VfsObject* temporary=nullptr;int e=Ext2ObjectChild(directory,"renamed",&temporary);
+            assert(e==0||e==-2);VfsObjectRelease(temporary);
+        }});
+        go=true;
+        for(unsigned i=0;i<100;++i){char text[512];assert(!left->ops->object_path(left,text,sizeof(text)));
+            assert(!strcmp(text,"/report-moved/renamed")||!strcmp(text,"/report-moved/alternate"));}
+        renamer.join();observer.join();
+
+        // Fail the final source-inode metadata write, after both directory
+        // entries have committed. EIO must not leave reporting at the old name.
+        uint32_t ino=left->identity,group=(ino-1)/m->inodesPerGroup,index=(ino-1)%m->inodesPerGroup;
+        failWriteOffset=(uint64_t(m->bgdt[group].bg_inode_table)<<m->blockShift)+uint64_t(index)*m->inodeSize;
+        assert(directory->ops->rename(directory,"renamed",directory,"after-error")==-5);
+        assert(writeFailureInjected&&m->writeError==-5);
+        pathIs(left,"/report-moved/after-error");
+        // Restore only the host fault fixture for later unrelated cases. This
+        // is not a production filesystem error-recovery mechanism.
+        m->writeError=0;
+        assert(!directory->ops->remove(directory,"after-error",false));
+        VfsObjectRelease(left);VfsObjectRelease(right);
+
+        auto inodeOffset=[&](uint32_t number){return
+            (uint64_t(m->bgdt[(number-1)/m->inodesPerGroup].bg_inode_table)<<m->blockShift)+
+            uint64_t((number-1)%m->inodesPerGroup)*m->inodeSize;};
+        // Failed destination and source restoration must permanently reject
+        // uncertain reporting, even after the same inode appears there again.
+        for(bool failSource : {false,true}) {
+            auto* uncertain=create("rollback-source");
+            auto* parentHold=static_cast<Ext2OpenInode*>((failSource?directory:other)->priv);
+            Ext2Inode parentData{};
+            KRwLockReadLock(&g_ext2Lock);assert(Ext2ReadInode(m,parentHold->inode,&parentData));
+            auto block=Ext2BlockMap(m,&parentData,0);KRwLockReadUnlock(&g_ext2Lock);assert(block);
+            failWriteOffset=inodeOffset(parentHold->inode);
+            nextFailWriteOffset=uint64_t(block)<<m->blockShift;
+            auto prior=injectedWriteFailures;
+            assert(directory->ops->rename(directory,"rollback-source",other,"rollback-target")==-5);
+            assert(injectedWriteFailures==prior+2);
+            char text[512];assert(uncertain->ops->object_path(uncertain,text,sizeof(text))==-5);
+            // Repair only the memory-disk fixture's directory entry, then
+            // prove the old reporting record cannot resurrect by name reuse.
+            KRwLockWriteLock(&g_ext2Lock);
+            if(failSource) {
+                auto* dh=static_cast<Ext2OpenInode*>(directory->priv);Ext2Inode data{};
+                assert(Ext2ReadInode(m,dh->inode,&data));
+                assert(Ext2DirAdd(m,dh->inode,&data,uncertain->identity,"rollback-source",1));
+            } else {
+                auto* dh=static_cast<Ext2OpenInode*>(other->priv);Ext2Inode data{};
+                assert(Ext2ReadInode(m,dh->inode,&data));
+                assert(Ext2DirRemove(m,&data,dh->inode,"rollback-target")==uncertain->identity);
+            }
+            m->writeError=0;KRwLockWriteUnlock(&g_ext2Lock);
+            assert(uncertain->ops->object_path(uncertain,text,sizeof(text))==-5);
+            VfsObject* fresh=nullptr;assert(!Ext2ObjectChild(directory,"rollback-source",&fresh));
+            pathIs(fresh,"/report-moved/rollback-source");VfsObjectRelease(fresh);
+            assert(!directory->ops->remove(directory,"rollback-source",false));VfsObjectRelease(uncertain);
+        }
+        VfsObjectRelease(directory);VfsObjectRelease(other);
+        assert(!root->ops->remove(root,"report-moved",true));
+        assert(!root->ops->remove(root,"report-other",true));
+    }
+    assert(!Ext2ObjectChild(root,"dir",&held));
     assert(!Ext2ObjectChild(held,"marker",&marker));
     VnodeStat original{};assert(!Ext2ObjectStat(marker,&original));
     int error=0;Vnode* first=Ext2ObjectOpen(marker,VFS_O_READ,&error);assert(first && !error);
@@ -223,11 +352,15 @@ int main(int argc,char** argv){
     // failed acquisition may leave an inode holder or wrapper behind.
     assert(!Ext2ObjectChild(held,"marker",&after));VfsObjectRelease(after);
     const auto before=allocations.size();
-    for(long failure=0;failure<2;++failure){
-        failAllocation=failure;after=reinterpret_cast<VfsObject*>(1);
-        assert(Ext2ObjectChild(held,"marker",&after)==-12 && !after);
+    bool factoryComplete=false;
+    for(long failure=0;failure<32;++failure){
+        failTriggered=false;failAllocation=failure;after=reinterpret_cast<VfsObject*>(1);
+        int result=Ext2ObjectChild(held,"marker",&after);
+        if(result)assert(result==-12&&!after);else VfsObjectRelease(after);
         failAllocation=-1;assert(allocations.size()==before);
+        if(!failTriggered){assert(!result);factoryComplete=true;break;}
     }
+    assert(factoryComplete);
     for(auto* object : {held,marker})for(long failure=0;failure<3;++failure){
         const auto live=allocations.size();failAllocation=failure;
         assert(!Ext2ObjectOpen(object,VFS_O_READ,&error) && error==-12);
