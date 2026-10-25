@@ -26,7 +26,8 @@ is unchanged. This does not add independent receipt epoch/overlap validation.
 `audio staging on|off|1024|4096|status` controls future native capacity
 negotiations. The boot default is off with a 1024-frame configured limit.
 Numeric commands select the limit and enable the experiment; `on` enables the
-current limit. Negotiated staging is capped by client capacity. Changes do not
+current limit. The downstream allowance is independent of client capacity and
+bounded at 4096 frames; it does not enlarge the client FIFO. Changes do not
 shrink active streams. Reset preserves their geometry; empty renegotiation can
 adopt a new limit. This is an explicit downstream frame budget, independent of
 OSS fragment/readiness size.

@@ -136,6 +136,48 @@ int main(int argc, char **argv) {
         free(samples);
         ++cases;
     }
+#ifdef BROOK_OSS_DOWNSTREAM
+    /* Q3's native geometry: a 2048-frame logical ring, 64-frame periods,
+     * with 4096 accepted device frames independent of that ring. */
+    geometry(4);
+    snd_pcm_t *small;
+    assert(snd_pcm_open_lconf(&small, "test", SND_PCM_STREAM_PLAYBACK,
+        SND_PCM_NONBLOCK, config) == 0);
+    snd_pcm_hw_params_t *hw;
+    snd_pcm_hw_params_alloca(&hw);
+    assert(snd_pcm_hw_params_any(small, hw) == 0);
+    assert(snd_pcm_hw_params_set_access(small, hw, SND_PCM_ACCESS_RW_INTERLEAVED) == 0);
+    assert(snd_pcm_hw_params_set_format(small, hw, SND_PCM_FORMAT_S16_LE) == 0);
+    assert(snd_pcm_hw_params_set_channels(small, hw, 2) == 0);
+    assert(snd_pcm_hw_params_set_rate(small, hw, 44100, 0) == 0);
+    assert(snd_pcm_hw_params_set_period_size(small, hw, 64, 0) == 0);
+    assert(snd_pcm_hw_params_set_buffer_size(small, hw, 2048) == 0);
+    assert(snd_pcm_hw_params(small, hw) == 0);
+    snd_pcm_sw_params_t *small_sw;
+    snd_pcm_sw_params_alloca(&small_sw);
+    assert(snd_pcm_sw_params_current(small, small_sw) == 0);
+    assert(snd_pcm_sw_params_set_start_threshold(small, small_sw, 2048) == 0);
+    assert(snd_pcm_sw_params(small, small_sw) == 0);
+    int16_t small_samples[2048*2] = {0};
+    for(unsigned i=0;i<3;++i) {
+        assert(snd_pcm_avail_update(small) == 2048);
+        assert(snd_pcm_writei(small, small_samples, 2048) == 2048);
+    }
+    assert(stat(0)==2048 && stat(1)==64 && stat(2)==6144 && !stat(4));
+    assert(snd_pcm_avail_update(small)==0);
+    assert(snd_pcm_writei(small, small_samples, 1)==-EAGAIN);
+    snd_pcm_sframes_t small_delay;
+    assert(snd_pcm_delay(small, &small_delay)==0 && small_delay==6144);
+    advance(2048);
+    assert(snd_pcm_avail_update(small)==2048);
+    assert(stat(2)==4096 && stat(10)==0); // Downstream-only: still not drained.
+    assert(snd_pcm_delay(small, &small_delay)==0 && small_delay==4096);
+    assert(snd_pcm_nonblock(small, 0)==0);
+    assert(snd_pcm_drain(small)==0);
+    assert(!stat(2) && stat(3)==6144 && stat(4)==6144 && !stat(7));
+    assert(snd_pcm_close(small)==0);
+    puts("OSS_SMALL_RING_STAGING C=2048 period=64 D=4096 PASS");
+#endif
     assert(snd_config_delete(config) == 0);
     assert(dlclose(library) == 0);
     printf("OSS_SUSTAINED_PLAYBACK cases=%u PASS\n", cases);

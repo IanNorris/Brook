@@ -31,7 +31,7 @@
 +        q->rate != 44100 || q->frame_bytes != 4 || oss->frame_bytes != 4 ||
 +        !q->capacity_frames || q->capacity_frames > 16384 ||
 +        q->capacity_frames < io->buffer_size ||
-+        q->staging_frames > q->capacity_frames || q->staging_frames > 4096 ||
++        q->staging_frames > 4096 ||
 +        q->available_frames > q->capacity_frames ||
 +        q->completed_frames > q->submitted_frames ||
 +        q->submitted_frames - q->completed_frames != q->queued_frames ||

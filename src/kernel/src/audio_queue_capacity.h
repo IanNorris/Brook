@@ -21,7 +21,7 @@ inline bool AudioQueueAvailable(uint32_t capacity,uint64_t software,uint32_t inF
                                 uint32_t staging,uint32_t* available) {
     if(!available)return false;
     *available=0;
-    if(!capacity || staging>capacity || software>capacity)return false;
+    if(!capacity || staging>4096 || software>capacity)return false;
     const uint64_t charged=software+(inFlight>staging?inFlight-staging:0);
     if(charged>capacity || software+inFlight>uint64_t(capacity)+staging)return false;
     *available=capacity-static_cast<uint32_t>(charged);return true;

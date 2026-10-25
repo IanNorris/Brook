@@ -486,7 +486,7 @@ bool AudioMixerSetCapacity(AudioStreamId identity, uint32_t frames, uint32_t wri
     if (empty) {
         stream->capacity = frames; stream->writableFrames = stream->fragmentFrames = writableFrames;
         stream->stagingFrames=g_stagingEnabled && g_clockSupported
-            ? (frames<g_stagingFrameLimit?frames:g_stagingFrameLimit):0;
+            ? g_stagingFrameLimit:0;
     }
     SpinLockRelease(&g_mixerLock);
     return empty;

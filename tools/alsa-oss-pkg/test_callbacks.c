@@ -144,6 +144,19 @@ int main(void) {
     ++oss.queue_epoch;assert(oss_pointer(&oss.io)==-EPIPE);--oss.queue_epoch;
     ++oss.queue_capacity;assert(oss_pointer(&oss.io)==-EPIPE);--oss.queue_capacity;
     queued_bytes=132;assert(oss_pointer(&oss.io)==-EPIPE); // >client+staging
+    /* A device copy can own more than the client ring, without advancing
+     * physical completion or admitting more than one logical ring. */
+    oss.queue_staging=downstream_frames=4096;
+    charged_override=0;queued_bytes=4096*4;
+    assert(oss_pointer(&oss.io)==16);
+    assert(oss_delay(&oss.io,&delay)==0 && delay==4096);
+    charged_override=16;queued_bytes=(4096+16)*4;
+    assert(oss_pointer(&oss.io)==0);
+    assert(oss_delay(&oss.io,&delay)==0 && delay==4112);
+    queued_bytes+=4;assert(oss_pointer(&oss.io)==-EPIPE);
+    oss.queue_staging=downstream_frames=4097;
+    queued_bytes=0;charged_override=0;
+    assert(oss_pointer(&oss.io)==-EPIPE);
 #endif
     assert(snd_pcm_close(oss.io.pcm) == 0);
     assert(pthread_mutex_destroy(&oss.lock) == 0);

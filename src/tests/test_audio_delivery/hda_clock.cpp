@@ -1194,43 +1194,69 @@ static void nativeStagingContracts() {
 static brook::AudioStreamId replacementStaged;
 static void nativeStagingFullBuffer() {
     using namespace brook;
+    // Device-owned copies have an independent budget, including when the
+    // application ring is smaller than that budget (Q3: 2048/64, D=4096).
+    for(uint32_t capacity:{4096u,2048u,64u}) {
+        AudioStop();initialize();AudioMixerRefresh();
+        VERIFY(AudioMixerStagingSetFrameLimit(4096));AudioMixerStagingEnable(true);
+        VERIFY(AudioMixerStagingFrameLimit()==4096);
+        VERIFY(!AudioMixerStagingSetFrameLimit(0) && !AudioMixerStagingSetFrameLimit(4097));
+        auto stream=AudioMixerOpen();
+        VERIFY(stream && AudioMixerSetCapacity(stream,capacity,64));
+        std::vector<int16_t> samples(capacity*2,123);AudioStreamProgress p{};
+        const uint32_t total=capacity+4096;
+        for(uint32_t accepted=0;accepted<total;accepted+=capacity) {
+            VERIFY(AudioMixerSubmit(samples.data(),capacity,stream)==capacity);
+            for(unsigned i=0;i<8;++i)AudioMixerFlush();
+            VERIFY(AudioMixerGetProgress(stream,&p) && p.capacityFrames==capacity &&
+                   p.stagingFrames==4096 && p.queuedFrames==accepted+capacity && !p.completedFrames);
+        }
+        VERIFY(!p.availableFrames && !AudioStreamWritable(p));
+        const auto wire=AudioStreamQueueSnapshot(p);
+        VERIFY(wire.version==1 && wire.flags==BROOK_AUDIO_QUEUE_CLOCKED &&
+               wire.epoch==p.epoch && wire.submitted_frames==total &&
+               !wire.completed_frames && wire.capacity_frames==capacity &&
+               !wire.available_frames && wire.queued_frames==total &&
+               wire.staging_frames==4096 && wire.rate==44100 && wire.frame_bytes==4);
+        VERIFY(!AudioMixerSubmit(samples.data(),1,stream));
+        VERIFY(AudioMixerStagingSetFrameLimit(1024)); // Active contract is immutable.
+        VERIFY(AudioMixerGetProgress(stream,&p) && p.stagingFrames==4096);
+        finishPhysical();AudioMixerRefresh();
+        VERIFY(AudioMixerGetProgress(stream,&p) && p.submittedFrames==total &&
+               p.completedFrames==total && !p.queuedFrames && p.availableFrames==capacity);
+        VERIFY(AudioMixerReset(stream));
+        VERIFY(AudioMixerGetProgress(stream,&p) && p.stagingFrames==4096);
+        VERIFY(AudioMixerSetCapacity(stream,capacity,64));
+        VERIFY(AudioMixerGetProgress(stream,&p) && p.stagingFrames==1024);
+        VERIFY(AudioMixerClose(stream));
+    }
+    AudioMixerStagingEnable(false);VERIFY(AudioMixerStagingSetFrameLimit(1024));AudioStop();
+}
+static void nativeSmallStagingPartialCopy() {
+    using namespace brook;
     AudioStop();initialize();AudioMixerRefresh();
     VERIFY(AudioMixerStagingSetFrameLimit(4096));AudioMixerStagingEnable(true);
-    VERIFY(AudioMixerStagingFrameLimit()==4096);
-    VERIFY(!AudioMixerStagingSetFrameLimit(0) && !AudioMixerStagingSetFrameLimit(4097));
-    VERIFY(AudioMixerStagingFrameLimit()==4096);
-    auto stream=AudioMixerOpen();VERIFY(stream && AudioMixerSetCapacity(stream,4096,1024));
-    std::vector<int16_t> samples(8192,123);AudioStreamProgress p{};
-    VERIFY(AudioMixerSubmit(samples.data(),4096,stream)==4096);
-    for(unsigned i=0;i<8;++i)AudioMixerFlush();
-    VERIFY(AudioMixerGetProgress(stream,&p) && p.capacityFrames==4096 &&
-           p.stagingFrames==4096 && p.queuedFrames==4096 &&
-           p.availableFrames==4096 && !p.completedFrames);
-    VERIFY(AudioMixerSubmit(samples.data(),4096,stream)==4096);
-    for(unsigned i=0;i<8;++i)AudioMixerFlush();
-    VERIFY(AudioMixerGetProgress(stream,&p) && p.queuedFrames==8192 &&
-           !p.availableFrames && !p.completedFrames && !AudioStreamWritable(p));
-    const auto wire=AudioStreamQueueSnapshot(p);
-    VERIFY(wire.version==1 && wire.flags==BROOK_AUDIO_QUEUE_CLOCKED &&
-           wire.epoch==p.epoch && wire.submitted_frames==8192 &&
-           !wire.completed_frames && wire.capacity_frames==4096 &&
-           !wire.available_frames && wire.queued_frames==8192 &&
-           wire.staging_frames==4096 && wire.rate==44100 && wire.frame_bytes==4);
-    VERIFY(!AudioMixerSubmit(samples.data(),1,stream));
-    VERIFY(AudioMixerStagingSetFrameLimit(1024)); // Cannot shrink an active contract.
-    VERIFY(AudioMixerGetProgress(stream,&p) && p.stagingFrames==4096);
+    auto stream=AudioMixerOpen();VERIFY(stream && AudioMixerSetCapacity(stream,2048,64));
+    std::vector<int16_t> samples(4096,123);AudioStreamProgress p{};
+    VERIFY(AudioMixerSubmit(samples.data(),2048,stream)==2048);
+    beforeSubmitHook=[] {g_legacyActive=1;};AudioMixerFlush();g_legacyActive=0;
+    VERIFY(AudioMixerGetProgress(stream,&p) && !p.availableFrames && !p.completedFrames);
+    beforeSubmitHook=[] {
+        std::vector<int16_t> filler(TARGET_QUEUE_BYTES/2,0);
+        VERIFY(HdaTrySubmit(filler.data(),TARGET_QUEUE_BYTES-512).accepted==TARGET_QUEUE_BYTES-512);
+    };
+    AudioMixerFlush();
+    VERIFY(AudioMixerGetProgress(stream,&p) && p.stagingFrames==4096 &&
+           p.queuedFrames==2048 && p.availableFrames==128 && !p.completedFrames);
     finishPhysical();AudioMixerRefresh();
-    VERIFY(AudioMixerGetProgress(stream,&p) && p.submittedFrames==8192 &&
-           p.completedFrames==8192 && !p.queuedFrames && p.availableFrames==4096);
-    VERIFY(AudioMixerReset(stream));
-    VERIFY(AudioMixerGetProgress(stream,&p) && p.stagingFrames==4096);
-    VERIFY(AudioMixerSetCapacity(stream,4096,1024));
-    VERIFY(AudioMixerGetProgress(stream,&p) && p.stagingFrames==1024);
-    VERIFY(AudioMixerStagingSetFrameLimit(4096));
-    auto small=AudioMixerOpen();VERIFY(small && AudioMixerSetCapacity(small,64,16));
-    VERIFY(AudioMixerGetProgress(small,&p) && p.stagingFrames==64 && p.availableFrames==64);
-    VERIFY(AudioMixerClose(small) && AudioMixerClose(stream));
-    AudioMixerStagingEnable(false);VERIFY(AudioMixerStagingSetFrameLimit(1024));AudioStop();
+    VERIFY(AudioMixerGetProgress(stream,&p) && p.completedFrames==128 && p.queuedFrames==1920);
+    for(unsigned i=0;i<8 && p.queuedFrames;++i) {
+        AudioMixerFlush();finishPhysical();AudioMixerRefresh();
+        VERIFY(AudioMixerGetProgress(stream,&p));
+    }
+    VERIFY(!p.queuedFrames && p.submittedFrames==2048 && p.completedFrames==2048);
+    VERIFY(AudioMixerClose(stream));AudioMixerStagingEnable(false);
+    VERIFY(AudioMixerStagingSetFrameLimit(1024));AudioStop();
 }
 static void nativeStagingFaults() {
     using namespace brook;
@@ -1427,6 +1453,6 @@ int RunMixerClockTests() {
     burstDmaRefillExperiment();
     steadyCommitExperiment();
     coalesceTests(a,b);
-    VERIFY(AudioMixerClose(a));nativeStagingContracts();nativeStagingFaults();nativeStagingFullBuffer();mixerClockEnabled=false;AudioStop();
+    VERIFY(AudioMixerClose(a));nativeStagingContracts();nativeStagingFaults();nativeStagingFullBuffer();nativeSmallStagingPartialCopy();mixerClockEnabled=false;AudioStop();
     std::printf("MIXER_CLOCK %s\n",failures?"FAIL":"PASS");return failures;
 }

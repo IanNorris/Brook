@@ -61,3 +61,47 @@ does not contain the requested `music/sonic5.wav` map track; missing grenade
 sound warnings also remain. Music playback is not claimed.
 
 ![Quake III Arena demo with a bot on Brook](images/brook_ioquake3_demo_1080.png)
+
+## Small-ring audio follow-up
+
+The first live review reports heavy stutter. Its launcher selects a copied
+clocked OSS plugin predating the downstream-aware queue bridge used in the
+successful Firefox controls. That plugin uses physical unfinished source to
+limit logical reuse, so enabling kernel staging alone does not provide the
+intended producer headroom.
+
+The updated plugin is selected only for Q3 in a fresh private review. A bounded
+kernel extension makes the opt-in downstream budget independent of client
+capacity, still limited to 4096 frames. The client FIFO remains 2048 frames
+with 64-frame periods. There is no change to HDA publication safety, physical
+completion, delay/drain semantics, scheduler settings or application geometry.
+
+Fresh UI launches on one PipeWire-output VM compare the copied legacy plugin,
+then the downstream-aware plugin with allowances 1024/4096/1024/4096. Stable
+stream-identity/epoch counter brackets report about 20,135 source frames/s for
+the legacy setup, 30,129 and 30,118 for the two 1024 controls, and 44,107 and
+44,085 for the two 4096 controls. The intended rate is 44,100. These are
+physical source-completion rates over guest-clock brackets, not independent
+speaker tempo or app framerate measurements. Six-second PCM captures are
+retained separately; content silence in this game is not an underrun detector.
+
+The larger-budget snapshots contain about 5,000–6,000 outstanding frames,
+including samples accepted by the device, while charged client occupancy stays
+within 2048. No sampled stream discontinuity is reported. This repeatable
+reversal supports the refill-headroom diagnosis; audible live confirmation,
+longer runs and mixed-workload acceptance remain open. Do not call Q3 audio
+fully fixed or promote a global staging default from this test.
+
+The actual mixer/HDA suite covers 2048/64/4096 and a 64-frame client, full
+admission without fabricated completion, exhaustion, exact drain and immutable
+active contracts. Existing rejected/partial-copy, reset/replacement and mixed
+stream tests pass. Real libasound tests cover Q3's exact geometry, 6144 physical
+frames outstanding, downstream-only delay, logical availability bounds and
+exact drain, alongside the 32 sustained conversion cases. Binary, queue,
+original launch/close and PCM evidence remains under ignored
+`build/workloads/quake3-20261025/audio-budget-native-results.json` and the
+`q3-audio-budget-20261025` review. Kernel candidate SHA-256:
+`12bb4d4b1c65b530ac277ea9d1975a8b5888a674fe0caa1366a0a8ef8dbd1d65`.
+All five Q3 launcher wrappers exit 0 and their exact client groups drain. The
+original VM owner exits 0 after acknowledged final sync; all four offline
+filesystem checks pass. No game assets or account data are included in Git.

@@ -4473,7 +4473,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             AudioMixerStagingEnable(NetStrEq(cmd,"audio staging on"));
         BridgeReply r;r.text("{\"enabled\":");r.text(AudioMixerStagingEnabled()?"true":"false");
         r.text(",");r.field("frame_limit",AudioMixerStagingFrameLimit());
-        r.text(",\"scope\":\"Prospective native capacity negotiations only; downstream budget capped by client capacity and configured frame limit. Existing per-stream limits unchanged on configuration; completion and queued delay remain physical-source accounting.\"}\n");r.send();
+        r.text(",\"scope\":\"Prospective native capacity negotiations only; independent downstream budget bounded by the configured frame limit (maximum 4096). Existing per-stream limits unchanged on configuration; completion and queued delay remain physical-source accounting.\"}\n");r.send();
     }
     else if (NetStrEq(cmd, "audio stats")) {
         DebugAudioDiagnostics();
