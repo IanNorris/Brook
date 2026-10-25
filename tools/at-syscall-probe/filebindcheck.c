@@ -24,6 +24,7 @@ static void pivot_source(const char *base){
  char pivot[128],target[160];snprintf(pivot,sizeof(pivot),"%s/pivot",base);CK(!mkdir(pivot,0700));
  pid_t child=syscall(SYS_clone,(unsigned long)(CLONE_NEWNS|SIGCHLD),0L,0L,0L,0L);CK(child>=0);
  if(child){waitok(child);CK(!rmdir(pivot));return;}
+ int machinefd=open("/etc/machine-id",O_PATH|O_CLOEXEC);CK(machinefd>=0);char machine=readvalue("/etc/machine-id");
  CK(!mount("tmpfs",pivot,"tmpfs",MS_NOSUID|MS_NODEV,NULL));
  snprintf(target,sizeof(target),"%s/oldroot",pivot);CK(!mkdir(target,0700));
  snprintf(target,sizeof(target),"%s/proc",pivot);CK(!mkdir(target,0700));CK(!mount("/proc",target,NULL,MS_BIND|MS_REC,NULL));
@@ -38,6 +39,11 @@ static void pivot_source(const char *base){
  value("/target",'Z');int sourcefd=openat(root,relative,O_PATH|O_CLOEXEC),targetfd=open("/target",O_PATH|O_CLOEXEC);CK(sourcefd>=0&&targetfd>=0);
  char sourcepath[64],targetpath[64];snprintf(sourcepath,sizeof(sourcepath),"/proc/self/fd/%d",sourcefd);snprintf(targetpath,sizeof(targetpath),"/proc/self/fd/%d",targetfd);
  CK(!mount(sourcepath,targetpath,NULL,MS_BIND,NULL));CK(readvalue("/target")=='N');
+ CK(!umount2("/target",MNT_DETACH));CK(readvalue("/target")=='Z');CK(!close(sourcefd)&&!close(targetfd));
+ // Brook's real machine-id lives in FAT initrd, not Ext2/tmpfs.
+ sourcefd=machinefd;targetfd=open("/target",O_PATH|O_CLOEXEC);CK(targetfd>=0);
+ snprintf(sourcepath,sizeof(sourcepath),"/proc/self/fd/%d",sourcefd);snprintf(targetpath,sizeof(targetpath),"/proc/self/fd/%d",targetfd);
+ CK(!mount(sourcepath,targetpath,NULL,MS_BIND,NULL));CK(readvalue("/target")==machine);
  CK(!umount2("/target",MNT_DETACH));CK(readvalue("/target")=='Z');CK(!close(sourcefd)&&!close(targetfd));
  CK(!close(root));_exit(0);
 }

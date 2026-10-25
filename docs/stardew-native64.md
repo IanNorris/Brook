@@ -114,6 +114,33 @@ The preceding mkdir review exits Steam normally, completes checked sync and
 passes all four offline filesystem checks. Original save contents remain
 unchanged, with only the Steam cloud marker timestamp refreshed.
 
+### FAT initrd bind sources
+
+The actual ABI-54 retry passes the earlier library bind failures, then exits
+with `EOPNOTSUPP` binding `/etc/machine-id`. That source is a real FAT initrd
+file. FAT already pins retained file directory-entry coordinates against
+rename/unlink/reuse, but did not expose the new entry-parent callback.
+
+The counterpart factors the existing exact sector/offset enumeration from
+file-path reporting and returns the interned parent object under the FAT mutex.
+It does not reopen a printed pathname or select files by content cluster. Host
+coverage includes long and empty file names, renamed parents and short output
+buffers. All 109 host tests and compiled entry/scheduler mutation audits pass.
+The public native probe now binds the real machine-id FD across pivot into a
+tmpfs target. The Linux control opens this FD before pivot because its machine-id
+is an absolute host symlink; this keeps the control about the retained object.
+Native Brook passes both complete suites: 228 file-bind fixture checks plus
+5 parent checks (including the separate pivot child), and 124 read-only fixture
+checks plus 8 parent checks. The next actual Steam retry remains pending.
+Kernel `b52588deb9d34fc03e9b430cf8ee772ab76b5742844c98805d8f19ad0e1a6fca`
+and 13 matched ABI-54 drivers are preserved in private review
+`build/reviews/stardew-proc-bind-fat-20261025/`.
+
+The preceding review's game launch reaches the next bind gate after about
+258 host seconds without a game window. Steam exits normally, all helpers
+drain, checked sync succeeds and all four offline filesystem checks pass.
+Original saved-game contents and non-cloud-marker timestamps are unchanged.
+
 ## Memory barriers
 
 The original direct startup reports CoreCLR HRESULT 0x8007FF02. A PID-scoped

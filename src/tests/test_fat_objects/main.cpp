@@ -93,6 +93,12 @@ int main(int argc,char** argv){
     assert(!empty->ops->object_path(empty,currentName,sizeof(currentName)) &&
            !std::strcmp(currentName,"/parent/moved/empty"));
     assert(file->ops->object_path(file,currentName,4)==-36);
+    VfsObject* entryParent=nullptr;char leaf[256];
+    assert(file->ops->entry_parent(file,&entryParent,leaf,4)==-36 && !entryParent);
+    assert(!file->ops->entry_parent(file,&entryParent,leaf,sizeof(leaf)) && entryParent==held);
+    assert(!strcmp(leaf,"meaningfully-long-name.txt"));VfsObjectRelease(entryParent);entryParent=nullptr;
+    assert(!empty->ops->entry_parent(empty,&entryParent,leaf,sizeof(leaf)) && entryParent==held);
+    assert(!strcmp(leaf,"empty"));VfsObjectRelease(entryParent);
     assert(!FatObjectChild(held,"meaningfully-long-name.txt",&after));assert(after==file);VfsObjectRelease(after);
     assert(FatFsUnlink(mount,0,"/parent/moved/empty")==-16);
     assert(FatFsRename(mount,0,"/parent/moved/empty","/new-empty")==-16);
