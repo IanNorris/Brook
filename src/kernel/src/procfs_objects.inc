@@ -205,7 +205,7 @@ static int ProcObjectParent(VfsObject* object,VfsObject** out,bool=false)
     *out=value->parent?value->parent:object;VfsObjectRetain(*out);return 0;
 }
 // Return 1 for an unsupported descriptor, 0 for a captured directory/regular
-// file capability. Reporting may request other retained vnode types as well.
+// file or pathname-socket capability. Reporting may request other vnode types.
 // The FD lock protects acquisition of the path's own references. No FD pin or
 // vnode reference is released here: a concurrent close must never make proc's
 // outer VFS callback run final descriptor teardown.
@@ -232,13 +232,16 @@ static int ProcAcquireVnodeFdPath(const ProcObject* value,VfsPath* out,char* fal
     }
     SpinLockRelease(fdLock);ProcessUnref(live);
     // VnodeType::File also covers FIFOs. Inspect the retained backend identity
-    // after dropping the FD lock; do not broaden magic following to devices or
-    // textual symlinks. Normal VFS open then rechecks permissions and creates
+    // after dropping the FD lock; pathname sockets allow O_PATH/stat/bind while
+    // ordinary opening still fails ENXIO in the backend. These are filesystem
+    // nodes, not transport FDs. Do not follow devices or textual symlinks.
+    // Normal VFS open then rechecks permissions and creates
     // a fresh description, independently of the source offset/access mode.
     if(!error && !anyObject) {
         VnodeStat st{};
         error=out->object->ops->stat?out->object->ops->stat(out->object,&st):-95;
-        if(!error && (st.mode&0170000)!=0040000 && (st.mode&0170000)!=0100000)error=-95;
+        if(!error && (st.mode&0170000)!=0040000 && (st.mode&0170000)!=0100000 &&
+           (st.mode&0170000)!=0140000)error=-95;
         if(error) {VfsPathRelease(*out);*out={};}
     }
     return error;

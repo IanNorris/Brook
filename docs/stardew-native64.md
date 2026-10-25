@@ -141,6 +141,31 @@ The preceding review's game launch reaches the next bind gate after about
 drain, checked sync succeeds and all four offline filesystem checks pass.
 Original saved-game contents and non-cloud-marker timestamps are unchanged.
 
+### Pathname socket FD following
+
+The FAT-fixed Steam retry advances to binding the Wayland socket, then returns
+`EOPNOTSUPP` for `/tmp/wayland-0`. This is a real Ext2 pathname socket with one
+link and working FD readback. The existing socket-bind probe passes textual
+operands but, when changed to proc-FD operands with recursive bind, reproduces
+this failure. Linux passes the descriptor variant.
+
+Proc's exact vnode-FD follow gate allowed only directories and regular files.
+It now also permits retained filesystem socket nodes. Existing FD/process
+identity and access checks remain; transport sockets retain their separate
+metadata policy, and devices, textual symlinks and FIFOs are not broadened.
+Normal open still reaches the filesystem socket's `ENXIO`; O_PATH/stat/bind
+can retain its real inode. The probe checks those boundaries and performs real
+bidirectional socket exchange through the bind.
+
+All 109 host tests and compiled entry/scheduler mutation audits pass. Linux
+passes 176 fixture checks plus 5 parent checks. Brook passes the same 176 plus
+5 checks, then the prior file-bind (228 plus 5) and read-only (124 plus 8) suites.
+Kernel `a44a3823f14b0631682f2902c23cc97d5f7c0125d8c7840b3ae36bd9ef1382c8`
+with all 13 ABI-54 drivers is retained in private
+`build/reviews/stardew-proc-socket-20261025/`. Actual Steam retry is pending. The preceding review reaches its next bind gate after about
+250 host seconds, drains Steam normally, completes checked sync and passes all
+four offline filesystem checks. Original save contents remain unchanged.
+
 ## Memory barriers
 
 The original direct startup reports CoreCLR HRESULT 0x8007FF02. A PID-scoped
