@@ -593,6 +593,14 @@ if [ ! -f "${USB_TEST_IMG}" ]; then
     echo "Created 32MB USB test disk"
 fi
 
+# Absolute tablet remains the automation-friendly default. Native game review
+# can select the built-in PS/2 relative mouse so the frontend can grab it.
+POINTER_INPUT_OPTS=()
+case "${BROOK_POINTER_DEVICE:-tablet}" in
+    tablet) POINTER_INPUT_OPTS=(-device virtio-tablet-pci) ;;
+    ps2) ;;
+    *) echo "BROOK_POINTER_DEVICE must be tablet or ps2" >&2; exit 2 ;;
+esac
 USB_INPUT_OPTS=()
 if [ "${BROOK_USB_KBD:-0}" = "1" ]; then
     USB_INPUT_OPTS+=(-device usb-kbd,bus=xhci.0)
@@ -635,7 +643,7 @@ esac
     ${HOME_DRIVE} \
     ${DATA_DRIVE} \
     "${TMP_DRIVE[@]}" \
-    -device virtio-tablet-pci \
+    "${POINTER_INPUT_OPTS[@]}" \
     ${GPU_OPTS} \
     -device virtio-rng-pci \
     -device virtio-net-pci,netdev=net0${NIC_MAC_ARG} \

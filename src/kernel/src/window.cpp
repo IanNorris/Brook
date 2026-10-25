@@ -156,6 +156,7 @@ static uint32_t g_nextZOrder = 1;  // 0 = backmost, higher = front
 static int g_pointerCaptureIndex=-1;
 static uint64_t g_pointerCaptureIdentity=0,g_pointerCaptureSequence=0,g_pointerCaptureDrops=0;
 static uint64_t g_pointerReleaseSequence=0,g_pointerCaptureRevision=0;
+static uint64_t g_pointerInteractionSerial=0;
 static uint32_t g_pointerQuarantinedButtons=0;
 // Physical-up recovery must retain ownership of a delayed or queued release.
 static uint32_t g_pointerOrphanedReleases=0;
@@ -205,6 +206,9 @@ int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint
     VfbGuard guard;PointerCaptureValidateLocked();
     Window* w=WmFindWindowById(provider,wmId);
     if(!w)return -2;
+    // Physical interaction proof for providers: queued WM events and new
+    // protocol resources cannot manufacture a fresh post-release click.
+    if(operation==3 && !token)return static_cast<int64_t>(g_pointerInteractionSerial);
     const bool owned=g_pointerCaptureIndex==static_cast<int>(wmId)-1 &&
                      g_pointerCaptureIdentity==w->creationIdentity;
     if(operation==0)return owned && (!token || token==g_pointerCaptureToken)?g_pointerCaptureToken:0;
@@ -269,7 +273,11 @@ bool WmRouteCapturedPointer(const InputEvent& event) {
         if(event.type==InputEventType::KeyRelease)g_pointerEscapeHeld=false;
         return true;
     }
-    if(g_pointerCaptureIndex<0)return false;
+    if(g_pointerCaptureIndex<0) {
+        if(event.type==InputEventType::MouseButtonDown && event.scanCode==0 &&
+           g_pointerInteractionSerial<0x7fffffffffffffffull)++g_pointerInteractionSerial;
+        return false;
+    }
     if(event.type==InputEventType::KeyPress && event.scanCode==1 &&
        (event.modifiers&(INPUT_MOD_CTRL|INPUT_MOD_ALT))==(INPUT_MOD_CTRL|INPUT_MOD_ALT)) {
         g_pointerEscapeHeld=true;PointerCaptureReleaseLocked();return true;

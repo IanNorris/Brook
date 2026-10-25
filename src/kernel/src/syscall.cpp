@@ -12010,7 +12010,7 @@ static int64_t sys_brook_wm_pointer_capture(uint64_t wmId,uint64_t operation,uin
                                            uint64_t,uint64_t,uint64_t) {
     Process* proc=ProcessCurrent();
     if(!proc)return -ESRCH;
-    if(!wmId || wmId>WM_MAX_WINDOWS || operation>2 || token>0xffffffffu)return -EINVAL;
+    if(!wmId || wmId>WM_MAX_WINDOWS || operation>3 || token>0xffffffffu)return -EINVAL;
     KernelOperationGuard operationGuard(proc);
     return brook::WmPointerCapture(proc,static_cast<uint32_t>(wmId),
                                    static_cast<uint32_t>(operation),static_cast<uint32_t>(token));

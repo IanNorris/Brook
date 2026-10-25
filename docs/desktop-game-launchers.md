@@ -93,7 +93,9 @@ contains 160 CPU samples and 840 context switches, with no reported drops;
 substantial sampled CPU time is idle. It does not identify the cause of the
 earlier slowdown or prove consistent framerate. Audio pacing remains open.
 
-Mouse capture is not implemented. The required path includes raw relative
+The kernel and native SDL/Wayland capture controls now pass; see
+[pointer capture](pointer-capture.md) for exact evidence and remaining limits.
+The full path requires raw relative
 motion before screen clamping, focused window/incarnation ownership, button and
 wheel routing during capture, synchronous revocation on focus loss/destruction,
 and an emergency release. Wayland needs relative-pointer and pointer-constraints

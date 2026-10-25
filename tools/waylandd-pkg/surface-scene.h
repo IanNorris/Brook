@@ -104,6 +104,7 @@ static int surface_tree_commit(struct brook_surface *s,struct brook_image *image
     int result=bt_commit(&s->tree,view);view_unref(view);return result;
 }
 static void surface_unmap(struct brook_surface *s) {
+    pointer_constraints_unmap(s,0);
     if (s->role==4) xwayland_native_unmapped(s);
     if (s->wm_id && (s->xdg_toplevel || s->xdg_popup)) {
         s->xdg_initial_commit_done=0;s->xdg_acked=0;

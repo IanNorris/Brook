@@ -46,11 +46,14 @@ Escape opens the game menu. Keyboard navigation selects Exit Game; confirming
 Yes displays the credits, and Enter completes a normal zero-status exit.
 All tracked descendants exit and both bridge output streams reach EOF.
 
-The test disables mouse grabbing with `in_nograb=1`. An absolute bridge click
+The initial test disables mouse grabbing with `in_nograb=1`. An absolute bridge click
 in the game menu selected a different item from the one under the visible host
 cursor; mouse/menu alignment and captured relative input remain unaccepted.
-Keyboard menu navigation works. Fullscreen, persistence, other maps and network
-play were not tested.
+Keyboard menu navigation works. The later native SDL/Wayland control validates
+exact relative input and emergency release; the checked Q3 review now uses
+`in_nograb=0` and handles normal window close. Physical host mouse-look and the
+SDL Xwayland path remain unaccepted; see [pointer capture](pointer-capture.md).
+Fullscreen, persistence, other maps and network play were not tested.
 
 Audio uses SDL's ALSA backend and the existing clocked OSS plugin, with OpenAL
 disabled. A four-second gameplay capture contains 179,904 stereo frames at

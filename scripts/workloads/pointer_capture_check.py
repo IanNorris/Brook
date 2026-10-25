@@ -58,6 +58,8 @@ def main():
 
     try:
         first = create('Pointer capture control')
+        click_serial = capture(first, 3)
+        assert click_serial >= 0, click_serial  # Exercise the actual syscall gate.
         lease = capture(first, 1)
         assert lease > 0, lease
         events = (Event * 64)()
@@ -86,6 +88,7 @@ def main():
                 break
             time.sleep(.01)
         assert released, 'emergency release was not observed'
+        assert capture(first, 3) == click_serial  # Captured Down cannot rearm.
         assert (dx, dy) == (4000, -2000), (dx, dy)
         assert downs == [(0, 2000, -1000)], downs
         # Must not re-acquire through a still-held button. Once the host

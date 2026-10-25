@@ -384,8 +384,8 @@ int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,
 // client-local for mouse events.  Drops on overflow.
 bool WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t localY,
                  uint32_t captureToken = 0);
-// WM_POINTER_CAPTURE: query=0, acquire=1, release=2. Positive leases never
-// identify a later incarnation of the same window slot.
+// WM_POINTER_CAPTURE: query=0, acquire=1, release=2, physical-click serial=3.
+// Positive leases never identify a later incarnation of the same window slot.
 int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint32_t token);
 bool WmPointerCaptureActive();
 uint64_t WmPointerCaptureRevision();

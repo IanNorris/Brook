@@ -45,7 +45,8 @@ int main() {
     w->vfb=&pixel;
     CHECK(WmPointerCapture(stranger,id,1,0)==-2);
     CHECK(WmPointerCapture(owner,id,1,1)==-22);
-    CHECK(WmPointerCapture(owner,id,3,0)==-22);
+    CHECK(WmPointerCapture(owner,id,3,0)==0);
+    CHECK(WmPointerCapture(owner,id,4,0)==-22);
     int64_t lease=WmPointerCapture(owner,id,1,0);
     CHECK(lease>0 && WmPointerCaptureActive());
     CHECK(WmPointerCapture(owner,id,0,lease)==lease);
@@ -99,10 +100,13 @@ int main() {
     WmPointerCaptureRefresh();CHECK(!WmPointerSuppressedButtons());
     CHECK(WmRouteCapturedPointer(held));
     held.sequence=++sequence;CHECK(WmRouteCapturedPointer(held)); // Delayed publication.
+    const auto rearm=WmPointerCapture(owner,id,3,0);
     held.type=InputEventType::MouseButtonDown;held.sequence=++sequence;
     CHECK(!WmRouteCapturedPointer(held));
+    CHECK(WmPointerCapture(owner,id,3,0)==rearm+1);
     held.type=InputEventType::MouseButtonUp;held.sequence=++sequence;
     CHECK(!WmRouteCapturedPointer(held)); // New pair remains intact.
+    CHECK(WmPointerCapture(owner,id,3,0)==rearm+1);
     // A genuinely dropped Up also permits reacquisition; its tombstone must
     // not eat the release belonging to the next, fresh press.
     lease=WmPointerCapture(owner,id,1,0);CHECK(lease>0);mouseButtons=1;

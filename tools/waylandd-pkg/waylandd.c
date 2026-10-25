@@ -47,6 +47,9 @@
 #include "dmabuf-layout.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "text-input-v3-server-protocol.h"
+#include "relative-pointer-v1-server-protocol.h"
+#include "pointer-constraints-v1-server-protocol.h"
+#include "pointer-region.h"
 #include "surface-tree.h"
 #include "surface-geometry.h"
 #include "gpu-scene-abi.h"
@@ -57,6 +60,7 @@
 #define BROOK_SYS_WM_DESTROY_WINDOW  507
 #define BROOK_SYS_WM_SIGNAL_DIRTY    508
 #define BROOK_SYS_WM_SET_TITLE       509
+#define BROOK_SYS_WM_POINTER_CAPTURE  0xB0A
 #define BROOK_SYS_WM_SET_APP_ID      0xB01
 #define BROOK_SYS_WM_SET_CLIENT_SOCKET 0xB05
 #define BROOK_SYS_WM_POP_INPUT       510
@@ -103,6 +107,7 @@ struct brook_wm_event {
 #define EVT_MOUSE_BTN_DOWN   3
 #define EVT_MOUSE_BTN_UP     4
 #define EVT_MOUSE_SCROLL     5
+#define EVT_MOUSE_RELATIVE   6
 #define WM_EVT_CLOSE_REQUESTED 0x80
 #define WM_EVT_FOCUS_GAINED    0x81
 #define WM_EVT_FOCUS_LOST      0x82
@@ -196,6 +201,9 @@ static long wm_get_screen_info(uint32_t *w_out, uint32_t *h_out) {
 struct brook_seat_client;
 struct brook_surface;
 static void seat_clients_scrub_surface(struct brook_surface *s);
+static void pointer_constraints_unmap(struct brook_surface *s,int destroy);
+static void pointer_constraints_commit(struct brook_surface *s);
+static void pointer_constraints_refresh(void);
 
 /* xdg_positioner state — captured here so xdg_surface.get_popup can
  * read its size/anchor without a forward declaration dance. */
@@ -284,6 +292,8 @@ struct brook_surface {
     int scene_disabled;
     int role; /* permanent: 1=xdg, 2=subsurface, 3=cursor, 4=Xwayland */
     struct wl_resource *resource;
+    struct pointer_region input_region,pending_input_region;
+    int input_region_pending;
     struct brook_buffer *pending_buffer;
     int pending_attach;
     /* Own committed SHM pixels after releasing the client's buffer. Never use
@@ -574,7 +584,10 @@ static void surface_set_opaque_region(struct wl_client *c, struct wl_resource *r
 }
 static void surface_set_input_region(struct wl_client *c, struct wl_resource *r,
                                       struct wl_resource *reg) {
-    (void)c; (void)r; (void)reg;
+    struct brook_surface *s=wl_resource_get_user_data(r);
+    const struct pointer_region *region=reg?wl_resource_get_user_data(reg):NULL;
+    if(!pointer_region_copy(&s->pending_input_region,region)) {wl_client_post_no_memory(c);return;}
+    s->input_region_pending=1;
 }
 
 static void surface_cursor_commit(struct brook_surface *s) {
@@ -611,6 +624,11 @@ static int toplevel_send_state(struct brook_surface *s,int32_t width,int32_t hei
 }
 static void surface_commit(struct wl_client *c,struct wl_resource *r) {
     struct brook_surface *s=wl_resource_get_user_data(r);
+    if(s->input_region_pending) {
+        pointer_region_clear(&s->input_region);s->input_region=s->pending_input_region;
+        memset(&s->pending_input_region,0,sizeof(s->pending_input_region));s->input_region_pending=0;
+    }
+    pointer_constraints_commit(s);
     if (!xwayland_surface_commit(s)) return;
     if (s->role==4) xwayland_pair_surfaces();
     if (g_trace_frames) { ++s->trace_commits;if (s->pending_buffer) ++s->trace_buffers; }
@@ -730,6 +748,8 @@ static const struct wl_surface_interface surface_impl = {
 static void surface_destroy_userdata(struct wl_resource *r) {
     struct brook_surface *s = wl_resource_get_user_data(r);
     if (!s) return;
+    pointer_constraints_unmap(s,1);
+    pointer_region_clear(&s->input_region);pointer_region_clear(&s->pending_input_region);
     xwayland_surface_detach(s);
     if (s->viewport) { wl_resource_set_user_data(s->viewport,NULL);s->viewport=NULL; }
     /* Scrub references to this surface from all seat clients before we free
@@ -798,6 +818,7 @@ static void compositor_create_surface(struct wl_client *client,
                                                 wl_resource_get_version(res), id);
     if (!sr) { free(s); wl_client_post_no_memory(client); return; }
     surface_tree_init(s);
+    s->input_region.infinite=1;
     s->resource = sr;
     s->next = g_surfaces;
     g_surfaces = s;
@@ -809,11 +830,14 @@ static void region_destroy(struct wl_client *c, struct wl_resource *r) {
 }
 static void region_add(struct wl_client *c, struct wl_resource *r,
                        int32_t x, int32_t y, int32_t w, int32_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+    pointer_region_append(c,r,x,y,w,h,1);
 }
 static void region_subtract(struct wl_client *c, struct wl_resource *r,
                             int32_t x, int32_t y, int32_t w, int32_t h) {
-    (void)c; (void)r; (void)x; (void)y; (void)w; (void)h;
+    pointer_region_append(c,r,x,y,w,h,0);
+}
+static void region_resource_destroy(struct wl_resource *r) {
+    struct pointer_region *region=wl_resource_get_user_data(r);pointer_region_clear(region);free(region);
 }
 static const struct wl_region_interface region_impl = {
     .destroy  = region_destroy,
@@ -827,7 +851,9 @@ static void compositor_create_region(struct wl_client *client,
     struct wl_resource *rr = wl_resource_create(client, &wl_region_interface,
                                                  wl_resource_get_version(res), id);
     if (!rr) { wl_client_post_no_memory(client); return; }
-    wl_resource_set_implementation(rr, &region_impl, NULL, NULL);
+    struct pointer_region *region=calloc(1,sizeof(*region));
+    if(!region) {wl_resource_destroy(rr);wl_client_post_no_memory(client);return;}
+    wl_resource_set_implementation(rr, &region_impl, region, region_resource_destroy);
 }
 
 static const struct wl_compositor_interface compositor_impl = {
@@ -1251,6 +1277,8 @@ struct brook_seat_client {
     struct brook_surface *entered_surface;  /* pointer enter target */
     struct brook_surface *kb_focus;         /* keyboard focus target */
     int cursor_visible;                     /* policy; kernel is mechanism */
+    unsigned refs;
+    int32_t pointer_x,pointer_y;
     uint32_t kb_mods_depressed;
     uint32_t kb_mods_locked;
     int keymap_fd;                          /* kept alive until client receives it */
@@ -1277,6 +1305,8 @@ static void seat_clients_scrub_surface(struct brook_surface *s) {
     }
 }
 
+static void seat_unref(struct brook_seat_client *sc);
+static void pointer_objects_remove_pointer(struct wl_resource *r);
 static void seat_remove_client(struct brook_seat_client *sc) {
     text_input_remove_seat(sc);
     if (sc && sc->entered_surface && !sc->cursor_visible)
@@ -1287,11 +1317,11 @@ static void seat_remove_client(struct brook_seat_client *sc) {
         pp = &(*pp)->next;
     }
 }
+static void seat_unref(struct brook_seat_client *sc) {
+    if(sc && --sc->refs==0)seat_remove_client(sc);
+}
 static struct brook_seat_client *seat_for_resource(struct wl_resource *r) {
-    for (struct brook_seat_client *sc = g_seat_clients; sc; sc = sc->next) {
-        if (sc->seat == r || sc->pointer == r || sc->keyboard == r) return sc;
-    }
-    return NULL;
+    return wl_resource_get_user_data(r);
 }
 
 static void seat_apply_cursor_visibility(struct brook_seat_client *sc) {
@@ -1347,7 +1377,9 @@ static const struct wl_pointer_interface pointer_impl = {
 };
 static void pointer_resource_destroy(struct wl_resource *r) {
     struct brook_seat_client *sc = seat_for_resource(r);
+    pointer_objects_remove_pointer(r);
     if (sc && sc->pointer == r) sc->pointer = NULL;
+    seat_unref(sc);
 }
 static void keyboard_release(struct wl_client *c, struct wl_resource *r) {
     (void)c; wl_resource_destroy(r);
@@ -1358,7 +1390,10 @@ static const struct wl_keyboard_interface keyboard_impl = {
 static void keyboard_resource_destroy(struct wl_resource *r) {
     struct brook_seat_client *sc = seat_for_resource(r);
     if (sc && sc->keyboard == r) sc->keyboard = NULL;
+    seat_unref(sc);
 }
+
+#include "pointer-constraints.h"
 
 #include "keyboard-keymap.h"
 
@@ -1419,7 +1454,7 @@ static void seat_get_pointer(struct wl_client *c, struct wl_resource *r, uint32_
                                                 wl_resource_get_version(r), id);
     if (!p) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(p, &pointer_impl, sc, pointer_resource_destroy);
-    if (sc) sc->pointer = p;
+    if (sc) {sc->pointer = p;++sc->refs;}
 }
 static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32_t id) {
     struct brook_seat_client *sc = seat_for_resource(r);
@@ -1427,7 +1462,7 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r, uint32
                                                 wl_resource_get_version(r), id);
     if (!k) { wl_client_post_no_memory(c); return; }
     wl_resource_set_implementation(k, &keyboard_impl, sc, keyboard_resource_destroy);
-    if (sc) sc->keyboard = k;
+    if (sc) {sc->keyboard = k;++sc->refs;}
 
     size_t kmsize = 0;
     int kfd = make_keymap_fd(&kmsize);
@@ -1469,7 +1504,7 @@ static void seat_resource_destroy(struct wl_resource *r) {
     struct brook_seat_client *sc = seat_for_resource(r);
     if (sc && sc->seat == r) {
         sc->seat = NULL;
-        if (!sc->pointer && !sc->keyboard) seat_remove_client(sc);
+        seat_unref(sc);
     }
 }
 
@@ -1481,7 +1516,7 @@ static void seat_bind(struct wl_client *client, void *data,
     if (!r) { wl_client_post_no_memory(client); return; }
     struct brook_seat_client *sc = calloc(1, sizeof(*sc));
     if (!sc) { wl_resource_destroy(r); wl_client_post_no_memory(client); return; }
-    sc->seat = r;
+    sc->seat = r;sc->refs=1;
     sc->client = client;
     sc->cursor_visible = 1;
     sc->keymap_fd = -1;
@@ -1643,14 +1678,18 @@ static void dispatch_surface_event(struct brook_surface *s,
                                    struct brook_seat_client *sc,
                                    struct brook_wm_event *e, uint32_t now) {
     switch (e->type) {
+    case EVT_MOUSE_RELATIVE:
+        pointer_relative_dispatch(s,sc,e);break;
     case EVT_MOUSE_MOVE: {
-        if (!sc || !sc->pointer) break;
+        if (!sc || !sc->pointer || pointer_surface_locked(s)) break;
+        sc->pointer_x=e->x;sc->pointer_y=e->y;
         pointer_enter_if_needed(sc, s, e->x, e->y);
         wl_pointer_send_motion(sc->pointer, now,
                                wl_fixed_from_int(e->x),
                                wl_fixed_from_int(e->y));
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
+        pointer_constraints_refresh();
         break;
     }
     case EVT_MOUSE_BTN_DOWN:
@@ -1660,6 +1699,8 @@ static void dispatch_surface_event(struct brook_surface *s,
                     s->wm_id);
             break;
         }
+        if(e->reserved && !pointer_event_token(s,e->reserved))break;
+        sc->pointer_x=e->x;sc->pointer_y=e->y;
         pointer_enter_if_needed(sc, s, e->x, e->y);
         /* scan: 0=left, 1=right, 2=middle  →  BTN_LEFT 0x110, etc. */
         uint32_t btn = 0x110 + (e->scan & 0x3);
@@ -1676,7 +1717,7 @@ static void dispatch_surface_event(struct brook_surface *s,
         break;
     }
     case EVT_MOUSE_SCROLL: {
-        if (!sc || !sc->pointer) break;
+        if (!sc || !sc->pointer || (e->reserved && !pointer_event_token(s,e->reserved))) break;
             int32_t dy = (int8_t)e->scan;
             /* Brook wheel ticks are positive upward; Wayland axis values
              * are positive downward. */
@@ -1830,6 +1871,7 @@ static void pump_input_for_surface(struct brook_surface *surface) {
 }
 
 static void pump_input_once(void) {
+    pointer_constraints_refresh();
     for (struct brook_surface *s = g_surfaces; s; s = s->next)
         pump_input_for_surface(s);
 }
@@ -2695,6 +2737,8 @@ int main(int argc, char **argv)
     if (!wl_global_create(g_display, &wl_compositor_interface, 4, NULL, compositor_bind)) return 1;
     if (!wl_global_create(g_display, &xdg_wm_base_interface, 3, NULL, wm_base_bind)) return 1;
     if (!wl_global_create(g_display, &wl_seat_interface, 5, NULL, seat_bind)) return 1;
+    if (!wl_global_create(g_display,&zwp_relative_pointer_manager_v1_interface,1,NULL,relative_manager_bind)) return 1;
+    if (!wl_global_create(g_display,&zwp_pointer_constraints_v1_interface,1,NULL,pointer_constraints_bind)) return 1;
     if (!wl_global_create(g_display, &zwp_text_input_manager_v3_interface, 1, NULL, text_input_manager_bind)) return 1;
     if (!wl_global_create(g_display, &wl_output_interface, 4, NULL, output_bind)) return 1;
     if (!wl_global_create(g_display, &zxdg_decoration_manager_v1_interface, 1, NULL, deco_mgr_bind)) return 1;
