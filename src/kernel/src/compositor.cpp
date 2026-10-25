@@ -1966,15 +1966,24 @@ static void CompositorLoopWM()
 }
 
 static DesktopPointerGate g_desktopPointerGate;
+static void CompositorReconcilePointerCapture();
 
 static void CompositorInputWM()
 {
+    WmPointerCaptureRefresh();
+    CompositorReconcilePointerCapture();
     // Route input events (keyboard + mouse buttons)
     // Must happen before mouse click handling so poll drains the virtqueue
     // and events are latched for CompositorHandleMouseWM.
-    InputEvent ev;
+    InputEvent ev{};
     while (InputPollEvent(&ev))
     {
+        const bool captured=WmRouteCapturedPointer(ev);
+        CompositorReconcilePointerCapture();
+        if(captured)continue;
+        const bool rawRelative=ev.type==InputEventType::MouseRelativeMove;
+        const InputEvent raw=ev;
+        if(rawRelative)ev.type=InputEventType::MouseMove;
         // Desktop overlays own pointer events before either raw grabber or
         // per-window delivery. Keep button ownership through release even if
         // launching/dismissing the menu closes it on the preceding press.
@@ -2079,6 +2088,7 @@ static void CompositorInputWM()
                     WmInputPush(target, ev,
                                 static_cast<int16_t>(mx - target->clientX()),
                                 static_cast<int16_t>(my - target->clientY()));
+                    if(rawRelative)WmInputPushRelative(target,raw);
                 }
             }
             else
@@ -2342,6 +2352,16 @@ static bool    g_wmResizeBottom  = false;
 static bool    g_wmLastBtnDown   = false;
 static bool    g_wmPrimaryDown   = false;
 
+static void CompositorReconcilePointerCapture() {
+    static uint64_t revision=0;
+    const uint64_t current=WmPointerCaptureRevision();
+    if(current==revision)return;
+    revision=current;
+    g_wmDragging=g_wmResizing=g_wmPrimaryDown=g_wmBtnLatch=g_wmBtnReleaseLatch=false;
+    g_desktopPointerGate.ownedButtons=0;
+    g_wmLastBtnDown=(MouseGetButtons()&~WmPointerSuppressedButtons()&MOUSE_BTN_LEFT)!=0;
+}
+
 bool CompositorBeginWindowMove(int windowIdx)
 {
     if (!MouseIsAvailable()) return false;
@@ -2389,6 +2409,13 @@ bool CompositorBeginWindowResize(int windowIdx, bool left, bool right,
 static void CompositorHandleMouseWM()
 {
     if (!MouseIsAvailable()) return;
+    CompositorReconcilePointerCapture();
+    if(WmPointerCaptureActive()) {
+        g_wmBtnLatch=g_wmBtnReleaseLatch=g_wmPrimaryDown=false;
+        g_wmLastBtnDown=(MouseGetButtons()&MOUSE_BTN_LEFT)!=0;
+        g_wmDragging=g_wmResizing=false;
+        return;
+    }
 
     int32_t mx, my;
     MouseGetPosition(&mx, &my);
@@ -2398,7 +2425,7 @@ static void CompositorHandleMouseWM()
     // Also check polled state for held buttons (drag operations).  Some
     // pointer backends report transitions without a reliable polled hold
     // state, so keep an internal primary-button state from the latches.
-    uint8_t polledButtons = MouseGetButtons();
+    uint8_t polledButtons = MouseGetButtons()&~WmPointerSuppressedButtons();
     bool polledDown = (polledButtons & 0x01) != 0;
     bool releaseLatched = g_wmBtnReleaseLatch;
     bool btnDown = g_wmPrimaryDown || polledDown;
@@ -3213,7 +3240,7 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     }
 
     // Cursor (alpha) on top of everything.
-    if (__atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) && g_cursorTex &&
+    if (!WmPointerCaptureActive() && __atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) && g_cursorTex &&
         MouseIsAvailable())
     {
         int32_t mx = 0, my = 0;
@@ -3251,7 +3278,7 @@ static void CompositorLoop()
         presented={g_physFb,g_physFbWidth,g_physFbHeight,g_physFbStride};
     }
     const bool cursorVisibleThisFrame =
-        __atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) != 0;
+        !WmPointerCaptureActive() && __atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) != 0;
 
     // Present-timing: sample period (wakeup-to-wakeup) and mark loop start.
     uint64_t loopStartTick = ApicTickCount();
@@ -3359,9 +3386,15 @@ static void CompositorLoop()
     // (waylandd) can still see them. In WM mode this drain happens inside
     // CompositorLoopWM; in legacy mode we need our own.
     {
-        InputEvent ev;
-        while (InputPollEvent(&ev))
+        WmPointerCaptureRefresh();
+        InputEvent ev{};
+        while (InputPollEvent(&ev)) {
+            // WM disable revokes capture synchronously, but its queued input
+            // and held-button ownership must also be respected in legacy mode.
+            if(WmRouteCapturedPointer(ev))continue;
+            if(ev.type==InputEventType::MouseRelativeMove)ev.type=InputEventType::MouseMove;
             RouteToGrabber(ev);
+        }
     }
     } // end legacy mode
 

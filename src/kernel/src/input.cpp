@@ -6,6 +6,14 @@
 
 namespace brook {
 
+static uint64_t g_inputSequence = 0, g_inputDrops = 0;
+uint64_t InputNextSequence(bool dropped) {
+    if(dropped)__atomic_add_fetch(&g_inputDrops,1,__ATOMIC_RELAXED);
+    return __atomic_add_fetch(&g_inputSequence,1,__ATOMIC_ACQ_REL);
+}
+uint64_t InputLatestSequence() { return __atomic_load_n(&g_inputSequence,__ATOMIC_ACQUIRE); }
+uint64_t InputDroppedEvents() { return __atomic_load_n(&g_inputDrops,__ATOMIC_ACQUIRE); }
+
 // ---------------------------------------------------------------------------
 // Input waiter list — processes blocked waiting for events
 // ---------------------------------------------------------------------------
@@ -138,7 +146,7 @@ bool InputPollEvent(InputEvent* out)
 
 InputEvent InputWaitEvent()
 {
-    InputEvent ev;
+    InputEvent ev{};
     while (!InputPollEvent(&ev))
         __asm__ volatile("hlt"); // sleep until next interrupt
     return ev;

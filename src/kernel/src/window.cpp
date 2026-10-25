@@ -16,6 +16,7 @@
 #include "compositor.h"
 #include "font_atlas.h"
 #include "input.h"
+#include "mouse.h"
 #include "serial.h"
 #include "panic.h"
 #include "rtc.h"
@@ -149,6 +150,141 @@ static int      g_focusedIdx = -1;
 static uint64_t g_windowIdentity = 0;
 static int g_taskbarPageTarget = -1;
 static uint32_t g_nextZOrder = 1;  // 0 = backmost, higher = front
+
+// Protected by g_vfbLock; only the published active bit is read lock-free by
+// rendering. The lease is bound to the window creation identity, not its slot.
+static int g_pointerCaptureIndex=-1;
+static uint64_t g_pointerCaptureIdentity=0,g_pointerCaptureSequence=0,g_pointerCaptureDrops=0;
+static uint64_t g_pointerReleaseSequence=0,g_pointerCaptureRevision=0;
+static uint32_t g_pointerQuarantinedButtons=0;
+// Physical-up recovery must retain ownership of a delayed or queued release.
+static uint32_t g_pointerOrphanedReleases=0;
+static uint32_t g_pointerCaptureToken=0,g_nextPointerCaptureToken=0,g_pointerCapturePublished=0;
+static int32_t g_pointerAnchorX=0,g_pointerAnchorY=0;
+static int16_t g_pointerLocalX=0,g_pointerLocalY=0;
+static bool g_pointerEscapeHeld=false;
+
+static void PointerCaptureReleaseLocked() {
+    if(g_pointerCaptureIndex<0)return;
+    g_pointerReleaseSequence=InputLatestSequence();
+    __atomic_fetch_or(&g_pointerQuarantinedButtons,static_cast<uint32_t>(MouseGetButtons()),__ATOMIC_ACQ_REL);
+    g_pointerCaptureIndex=-1;g_pointerCaptureIdentity=0;g_pointerCaptureToken=0;
+    __atomic_store_n(&g_pointerCapturePublished,0u,__ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_pointerCaptureRevision,1,__ATOMIC_RELEASE);
+    MouseSetPosition(g_pointerAnchorX,g_pointerAnchorY);
+    CompositorMarkDirty();CompositorWake();
+}
+static void PointerCaptureValidateLocked() {
+    if(g_pointerCaptureIndex<0)return;
+    const auto& w=g_windows[g_pointerCaptureIndex];
+    if(!g_wmActive || !w.proc || !w.vfb || !w.visible || w.minimized ||
+       !w.focused || g_focusedIdx!=g_pointerCaptureIndex ||
+       w.creationIdentity!=g_pointerCaptureIdentity ||
+       InputDroppedEvents()!=g_pointerCaptureDrops || WmLauncherVisible())
+        PointerCaptureReleaseLocked();
+}
+bool WmPointerCaptureActive() {
+    return __atomic_load_n(&g_pointerCapturePublished,__ATOMIC_ACQUIRE)!=0;
+}
+uint64_t WmPointerCaptureRevision() { return __atomic_load_n(&g_pointerCaptureRevision,__ATOMIC_ACQUIRE); }
+uint32_t WmPointerSuppressedButtons() { return __atomic_load_n(&g_pointerQuarantinedButtons,__ATOMIC_ACQUIRE); }
+void WmPointerCaptureRefresh() {
+    VfbGuard guard;PointerCaptureValidateLocked();
+    // Recover a dropped Up without forwarding an already-queued (or not yet
+    // published) Up to the next client. Fence published packets; retain a
+    // release tombstone until Up or a new Down establishes a new button pair.
+    const uint32_t recovered=WmPointerSuppressedButtons()&~static_cast<uint32_t>(MouseGetButtons());
+    if(recovered) {
+        g_pointerReleaseSequence=InputLatestSequence();
+        g_pointerOrphanedReleases|=recovered;
+        __atomic_fetch_and(&g_pointerQuarantinedButtons,~recovered,__ATOMIC_ACQ_REL);
+    }
+}
+int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint32_t token) {
+    if(!provider || !wmId || wmId>WM_MAX_WINDOWS)return -22;
+    VfbGuard guard;PointerCaptureValidateLocked();
+    Window* w=WmFindWindowById(provider,wmId);
+    if(!w)return -2;
+    const bool owned=g_pointerCaptureIndex==static_cast<int>(wmId)-1 &&
+                     g_pointerCaptureIdentity==w->creationIdentity;
+    if(operation==0)return owned && (!token || token==g_pointerCaptureToken)?g_pointerCaptureToken:0;
+    if(operation==2) {
+        if(!owned || !token || token!=g_pointerCaptureToken)return -116;
+        PointerCaptureReleaseLocked();return 0;
+    }
+    if(operation!=1 || token)return -22;
+    if(owned)return g_pointerCaptureToken;
+    if(g_pointerCaptureIndex>=0)return -16;
+    if(!g_wmActive || !w->vfb || !w->visible || w->minimized || !w->focused ||
+       g_focusedIdx!=static_cast<int>(wmId)-1 || WmLauncherVisible() || WmPointerSuppressedButtons())return -11;
+    if(g_nextPointerCaptureToken==0xffffffffu)return -75;
+    MouseGetPosition(&g_pointerAnchorX,&g_pointerAnchorY);
+    g_pointerLocalX=static_cast<int16_t>(g_pointerAnchorX-w->clientX());
+    g_pointerLocalY=static_cast<int16_t>(g_pointerAnchorY-w->clientY());
+    g_pointerCaptureIndex=static_cast<int>(wmId)-1;
+    g_pointerCaptureIdentity=w->creationIdentity;
+    g_pointerCaptureSequence=InputLatestSequence();g_pointerCaptureDrops=InputDroppedEvents();
+    g_pointerCaptureToken=++g_nextPointerCaptureToken;
+    __atomic_store_n(&g_pointerCapturePublished,1u,__ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_pointerCaptureRevision,1,__ATOMIC_RELEASE);
+    CompositorMarkDirty();CompositorWake();return g_pointerCaptureToken;
+}
+
+static bool PushRelativeLocked(Window* w,const InputEvent& event,uint32_t token) {
+    int64_t dx=event.deltaX,dy=event.deltaY;
+    while(dx || dy) {
+        const int16_t x=static_cast<int16_t>(dx>32767?32767:dx<(-32768)?(-32768):dx);
+        const int16_t y=static_cast<int16_t>(dy>32767?32767:dy<(-32768)?(-32768):dy);
+        if(!WmInputPush(w,event,x,y,token))return false;
+        dx-=x;dy-=y;
+    }
+    return true;
+}
+bool WmInputPushRelative(Window* window,const InputEvent& event) {
+    VfbGuard guard;
+    if(!window || !window->proc || g_pointerCaptureIndex>=0)return false;
+    return PushRelativeLocked(window,event,0);
+}
+bool WmRouteCapturedPointer(const InputEvent& event) {
+    VfbGuard guard;PointerCaptureValidateLocked();
+    const bool pointer=event.type==InputEventType::MouseMove || event.type==InputEventType::MouseRelativeMove ||
+        event.type==InputEventType::MouseButtonDown || event.type==InputEventType::MouseButtonUp ||
+        event.type==InputEventType::MouseScroll;
+    if(pointer && event.sequence<=g_pointerReleaseSequence)return true;
+    if((event.type==InputEventType::MouseButtonDown || event.type==InputEventType::MouseButtonUp) && event.scanCode<32) {
+        const uint32_t bit=uint32_t(1)<<event.scanCode;
+        if(g_pointerOrphanedReleases&bit) {
+            g_pointerOrphanedReleases&=~bit;
+            if(event.type==InputEventType::MouseButtonUp)return true;
+            // A new press after the recovery fence starts an ordinary pair.
+        }
+        if(WmPointerSuppressedButtons()&bit) {
+            if(event.type==InputEventType::MouseButtonUp)
+                __atomic_fetch_and(&g_pointerQuarantinedButtons,~bit,__ATOMIC_ACQ_REL);
+            return true;
+        }
+    }
+    if(g_pointerEscapeHeld && event.scanCode==1 &&
+       (event.type==InputEventType::KeyPress || event.type==InputEventType::KeyRelease)) {
+        if(event.type==InputEventType::KeyRelease)g_pointerEscapeHeld=false;
+        return true;
+    }
+    if(g_pointerCaptureIndex<0)return false;
+    if(event.type==InputEventType::KeyPress && event.scanCode==1 &&
+       (event.modifiers&(INPUT_MOD_CTRL|INPUT_MOD_ALT))==(INPUT_MOD_CTRL|INPUT_MOD_ALT)) {
+        g_pointerEscapeHeld=true;PointerCaptureReleaseLocked();return true;
+    }
+    if(!pointer)return false;
+    // Never assign already-queued input to a newly granted lease.
+    if(event.sequence<=g_pointerCaptureSequence)return true;
+    Window* w=&g_windows[g_pointerCaptureIndex];
+    if(event.type==InputEventType::MouseMove)return true; // absolute tablet has no raw motion
+    const bool queued=event.type==InputEventType::MouseRelativeMove
+        ?PushRelativeLocked(w,event,g_pointerCaptureToken)
+        :WmInputPush(w,event,g_pointerLocalX,g_pointerLocalY,g_pointerCaptureToken);
+    if(!queued)PointerCaptureReleaseLocked(); // loss must not silently corrupt a locked stream
+    return true;
+}
 
 // Immutable launcher payloads. Only refs change after publication. The single
 // maintenance worker owns building/pending/retired lifetimes; no renderer does
@@ -562,12 +698,16 @@ bool WmIsActive()
     return g_wmActive;
 }
 
+static void SetWmActiveLocked(bool active) {
+    g_wmActive=active;
+    if(!active)PointerCaptureReleaseLocked();
+}
 void WmSetActive(bool active)
 {
     if (active) WmRestoreTheme();
     if (active && !g_launcherLoaded) WmLauncherLoad();
     if (active) LauncherStartWorker();
-    g_wmActive = active;
+    { VfbGuard guard;SetWmActiveLocked(active); }
     if (active)
         SerialPuts("WM: window manager mode enabled\n");
 }
@@ -662,6 +802,7 @@ static void DestroyWindowLocked(int idx)
     Window& w = g_windows[idx];
     if (!w.proc) return;
 
+    if(g_pointerCaptureIndex==idx)PointerCaptureReleaseLocked();
     SerialPrintf("WM: destroyed window %d '%s'\n", idx, w.title);
 
     // Detach the per-window VFB (if any).  The compositor may already have
@@ -863,6 +1004,7 @@ static void FocusWindowLocked(int idx)
     if (!g_windows[idx].focusable) return;
     if (g_focusedIdx == idx) return;
 
+    PointerCaptureReleaseLocked();
     // Unfocus old
     if (g_focusedIdx >= 0 && g_focusedIdx < static_cast<int>(WM_MAX_WINDOWS))
     {
@@ -1227,6 +1369,7 @@ static void MinimizeWindowLocked(int idx)
     Window& w = g_windows[idx];
     if (!w.proc || w.minimized) return;
 
+    if(g_pointerCaptureIndex==idx)PointerCaptureReleaseLocked();
     w.minimized = true;
     SerialPrintf("WM: minimized window %d '%s'\n", idx, w.title);
 
@@ -2907,9 +3050,9 @@ void WmSetTitleById(Process* proc, uint32_t wmId, const char* title)
     CompositorWake();
 }
 
-void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t localY)
+bool WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t localY, uint32_t captureToken)
 {
-    if (!win) return;
+    if (!win) return false;
     uint32_t head = __atomic_load_n(&win->inputHead, __ATOMIC_ACQUIRE);
     uint32_t tail = __atomic_load_n(&win->inputTail, __ATOMIC_ACQUIRE);
     uint32_t next = (head + 1) % Window::WM_INPUT_QUEUE;
@@ -2926,7 +3069,7 @@ void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t loca
                 slot.x = localX;
                 slot.y = localY;
                 slot.modifiers = ev.modifiers;
-                return; // coalesced
+                return true; // coalesced
             }
         }
         // Rate-limit the warning: only print once per ~256 drops per window
@@ -2934,7 +3077,7 @@ void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t loca
         if ((win->inputDropCount & 0xFF) == 1)
             SerialPrintf("WmInputPush: queue FULL wm=%u type=%d (dropped %u)\n",
                          win->wmId, (int)ev.type, win->inputDropCount);
-        return;
+        return false;
     }
     Window::WmInputEvent& slot = win->inputQueue[head];
     slot.type      = static_cast<uint8_t>(ev.type);
@@ -2943,8 +3086,9 @@ void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t loca
     slot.modifiers = ev.modifiers;
     slot.x         = localX;
     slot.y         = localY;
-    slot.reserved  = 0;
+    slot.reserved  = captureToken;
     __atomic_store_n(&win->inputHead, next, __ATOMIC_RELEASE);
+    return true;
 }
 
 uint32_t WmInputPop(Window* win, Window::WmInputEvent* out, uint32_t max)

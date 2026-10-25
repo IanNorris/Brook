@@ -15,6 +15,9 @@ void KMutexLock(KMutex*) { CHECK(lockDepth++ == 0); }
 void KMutexUnlock(KMutex*) { CHECK(lockDepth-- == 1); }
 extern "C" void CompositorWake() { ++wakes; }
 void CompositorMarkDirty() { ++dirty; }
+extern "C" void MouseSetPosition(int32_t,int32_t) {}
+extern "C" uint8_t MouseGetButtons() { return 0; }
+uint64_t InputLatestSequence() { return 0; }
 Process* ProcessCurrent() { std::abort(); }
 int64_t UserMappingRemoveBacking(Process*,AddressSpaceState*,MappingBacking*) { std::abort(); }
 void MappingBackingUnref(MappingBacking*) { std::abort(); }

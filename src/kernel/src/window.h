@@ -382,7 +382,17 @@ int WmPlaceOwnedWindow(Process* proc, uint32_t wmId, uint64_t incarnation,
 
 // Push an input event into a window's per-window queue.  Coords should be
 // client-local for mouse events.  Drops on overflow.
-void WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t localY);
+bool WmInputPush(Window* win, const InputEvent& ev, int16_t localX, int16_t localY,
+                 uint32_t captureToken = 0);
+// WM_POINTER_CAPTURE: query=0, acquire=1, release=2. Positive leases never
+// identify a later incarnation of the same window slot.
+int64_t WmPointerCapture(Process* provider,uint32_t wmId,uint32_t operation,uint32_t token);
+bool WmPointerCaptureActive();
+uint64_t WmPointerCaptureRevision();
+uint32_t WmPointerSuppressedButtons();
+void WmPointerCaptureRefresh();
+bool WmRouteCapturedPointer(const InputEvent& event);
+bool WmInputPushRelative(Window* window,const InputEvent& event);
 
 // Drain up to `max` events from the window's queue into `out`.  Returns
 // number of events actually written.  Non-blocking.

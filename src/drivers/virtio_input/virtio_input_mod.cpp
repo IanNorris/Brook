@@ -44,6 +44,7 @@ MODULE_IMPORT_SYMBOL(CompositorGetPhysDims);
 MODULE_IMPORT_SYMBOL(CompositorWake);
 MODULE_IMPORT_SYMBOL(InputRegister);
 MODULE_IMPORT_SYMBOL(InputWakeWaiters);
+MODULE_IMPORT_SYMBOL(InputNextSequence);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
@@ -105,6 +106,8 @@ static constexpr uint16_t EV_SYN = 0x00;
 static constexpr uint16_t EV_KEY = 0x01;
 static constexpr uint16_t EV_REL = 0x02;
 static constexpr uint16_t EV_ABS = 0x03;
+static constexpr uint16_t REL_X = 0x00;
+static constexpr uint16_t REL_Y = 0x01;
 static constexpr uint16_t ABS_X       = 0x00;
 static constexpr uint16_t ABS_Y       = 0x01;
 static constexpr uint16_t REL_HWHEEL  = 0x06;
@@ -309,7 +312,7 @@ static void ProcessEvent(const VirtioInputEvent& ev)
         // of proper EV_REL. Translate those to scroll events on key-down.
         if ((ev.code == 7 || ev.code == 8) && ev.value)
         {
-            InputEvent ie;
+            InputEvent ie{};
             ie.type = InputEventType::MouseScroll;
             ie.scanCode = 0;
             ie.ascii    = static_cast<uint8_t>(ev.code == 8 ? 1 : -1);
@@ -332,7 +335,7 @@ static void ProcessEvent(const VirtioInputEvent& ev)
             else          cur &= ~btn;
             MouseSetButtons(cur);
 
-            InputEvent ie;
+            InputEvent ie{};
             ie.type = ev.value ? InputEventType::MouseButtonDown
                                : InputEventType::MouseButtonUp;
             ie.scanCode = bit; // bit index (0=L, 1=R, 2=M) — matches PS/2 path
@@ -344,12 +347,27 @@ static void ProcessEvent(const VirtioInputEvent& ev)
     }
     else if (ev.type == EV_REL)
     {
+        if(ev.code==REL_X || ev.code==REL_Y) {
+            const int32_t value=static_cast<int32_t>(ev.value);
+            int32_t x=0,y=0;MouseGetPosition(&x,&y);
+            // Clamp wide additions before handing them to cursor positioning;
+            // the queued raw delta preserves the complete signed input value.
+            int64_t nx=x,ny=y;
+            if(ev.code==REL_X)nx+=value;else ny+=value;
+            if(nx<0)nx=0;if(ny<0)ny=0;
+            if(nx>0x7fffffff)nx=0x7fffffff;if(ny>0x7fffffff)ny=0x7fffffff;
+            MouseSetPosition(static_cast<int32_t>(nx),static_cast<int32_t>(ny));
+            InputEvent ie{};ie.type=InputEventType::MouseRelativeMove;
+            ie.deltaX=ev.code==REL_X?value:0;ie.deltaY=ev.code==REL_Y?value:0;
+            ie.scanCode=MouseGetButtons();InputDevicePush(&g_inputDev,ie);
+            InputWakeWaiters();CompositorWake();return;
+        }
         int8_t dy = 0, dx = 0;
         if (ev.code == REL_WHEEL)       dy = static_cast<int8_t>(static_cast<int32_t>(ev.value));
         else if (ev.code == REL_HWHEEL) dx = static_cast<int8_t>(static_cast<int32_t>(ev.value));
         else return;
 
-        InputEvent ie;
+        InputEvent ie{};
         ie.type = InputEventType::MouseScroll;
         ie.scanCode = static_cast<uint8_t>(dy);
         ie.ascii    = static_cast<uint8_t>(dx);
@@ -385,7 +403,7 @@ static void ProcessEvent(const VirtioInputEvent& ev)
             static int32_t s_lastScreenX = -1, s_lastScreenY = -1;
             if (screenX != s_lastScreenX || screenY != s_lastScreenY)
             {
-                InputEvent ie;
+                InputEvent ie{};
                 ie.type      = InputEventType::MouseMove;
                 ie.scanCode  = MouseGetButtons();
                 ie.ascii     = 0;

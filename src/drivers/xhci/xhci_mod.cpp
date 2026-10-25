@@ -53,6 +53,7 @@ MODULE_IMPORT_SYMBOL(ApicGetId);
 MODULE_IMPORT_SYMBOL(IdtInstallHandler);
 MODULE_IMPORT_SYMBOL(InputRegister);
 MODULE_IMPORT_SYMBOL(InputWakeWaiters);
+MODULE_IMPORT_SYMBOL(InputNextSequence);
 MODULE_IMPORT_SYMBOL(KbdPushChar);
 MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
@@ -1909,7 +1910,7 @@ static const char g_sc1ToAsciiShift[128] = {
 
 static void XhciPushKey(uint8_t scancode, bool pressed, uint8_t modifiers)
 {
-    InputEvent ev;
+    InputEvent ev{};
     ev.type = pressed ? InputEventType::KeyPress : InputEventType::KeyRelease;
     ev.scanCode = scancode;
     ev.modifiers = modifiers;
@@ -2135,8 +2136,10 @@ static void XhciProcessMouseReport(const uint8_t* report)
         // No inversion needed — unlike PS/2 where positive Y = up.
         MouseSetPosition(mx + dx, my + dy);
 
-        InputEvent ev;
-        ev.type     = InputEventType::MouseMove;
+        InputEvent ev{};
+        ev.type     = InputEventType::MouseRelativeMove;
+        ev.deltaX = dx;
+        ev.deltaY = dy;
         ev.scanCode = buttons;
         ev.ascii    = 0;
         ev.modifiers = 0;
@@ -2152,7 +2155,7 @@ static void XhciProcessMouseReport(const uint8_t* report)
         bool now  = (buttons & (1 << btn)) != 0;
         bool prev = (prevButtons & (1 << btn)) != 0;
         if (now != prev) {
-            InputEvent ev;
+            InputEvent ev{};
             ev.type = now ? InputEventType::MouseButtonDown : InputEventType::MouseButtonUp;
             ev.scanCode = static_cast<uint8_t>(btn);
             ev.ascii = 0;

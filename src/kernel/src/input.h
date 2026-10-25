@@ -26,6 +26,7 @@ enum class InputEventType : uint8_t {
     MouseButtonDown = 3,
     MouseButtonUp   = 4,
     MouseScroll     = 5,   // scanCode=int8 dy (up positive), ascii=int8 dx (right positive)
+    MouseRelativeMove = 6, // raw signed motion, independent of cursor clamping
 };
 
 // A single input event.
@@ -34,6 +35,8 @@ struct InputEvent {
     uint8_t  scanCode;   // Hardware scan code (driver-dependent)
     char     ascii;      // Translated ASCII character (0 if non-printable)
     uint8_t  modifiers;  // Bitmask of active modifiers at event time
+    int32_t  deltaX, deltaY; // screen convention: right/down positive
+    uint64_t sequence; // assigned when published to the device queue
 };
 
 // Modifier bits.
@@ -134,6 +137,11 @@ extern "C" void InputWakeWaiters();
 // Driver-side helpers — call from ISR or driver code to enqueue events
 // ---------------------------------------------------------------------------
 
+// Also records failed publication so capture can fail safely on lost input.
+extern "C" uint64_t InputNextSequence(bool dropped);
+uint64_t InputLatestSequence();
+uint64_t InputDroppedEvents();
+
 // Push an event into a device's ring buffer.
 // Safe to call from ISR context.  Uses atomic stores so that the
 // consumer (on another CPU) sees a consistent head/tail.
@@ -141,8 +149,12 @@ inline void InputDevicePush(InputDevice* dev, const InputEvent& ev)
 {
     uint32_t head = __atomic_load_n(&dev->head, __ATOMIC_RELAXED);
     uint32_t next = (head + 1) & (INPUT_RING_SIZE - 1);
-    if (next == __atomic_load_n(&dev->tail, __ATOMIC_ACQUIRE)) return; // full
+    if (next == __atomic_load_n(&dev->tail, __ATOMIC_ACQUIRE)) {
+        InputNextSequence(true);
+        return;
+    }
     dev->ring[head] = ev;
+    dev->ring[head].sequence = InputNextSequence(false);
     __atomic_store_n(&dev->head, next, __ATOMIC_RELEASE);
 }
 

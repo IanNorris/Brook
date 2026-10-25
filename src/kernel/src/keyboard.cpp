@@ -557,7 +557,7 @@ extern "C" void KbdIrqHandlerInner(void)
     // Push raw scan code event to input subsystem (for userspace consumers like DOOM).
     // All keys (including modifiers) and both press/release are forwarded.
     {
-        InputEvent ev;
+        InputEvent ev{};
         ev.type = release ? InputEventType::KeyRelease : InputEventType::KeyPress;
         ev.scanCode = key;
         ev.modifiers = mods;

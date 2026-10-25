@@ -2477,7 +2477,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             uint64_t bytesRead = 0;
             while (bytesRead < count)
             {
-                InputEvent ev;
+                InputEvent ev{};
                 bool got;
                 if (WmIsActive())
                     got = ProcessInputPop(proc, &ev);
@@ -2528,7 +2528,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
             uint64_t bytesRead = 0;
             while (bytesRead < count)
             {
-                InputEvent ev;
+                InputEvent ev{};
                 bool got = wmMode ? ProcessInputPop(proc, &ev)
                                   : InputPollEvent(&ev);
                 if (!got)
@@ -2589,7 +2589,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
         for (;;)
         {
-            InputEvent ev;
+            InputEvent ev{};
             bool got = wmMode ? ProcessInputPop(proc, &ev)
                               : InputPollEvent(&ev);
             if (!got)
@@ -11570,8 +11570,9 @@ static int64_t sys_brook_input_pop(uint64_t bufAddr, uint64_t maxCount,
     auto* out = reinterpret_cast<uint8_t*>(bufAddr);
     uint64_t n = 0;
     while (n < maxCount) {
-        InputEvent ev;
+        InputEvent ev{};
         if (!ProcessInputPop(proc, &ev)) break;
+        if(ev.type==InputEventType::MouseRelativeMove)ev.type=InputEventType::MouseMove;
         uint8_t* slot = out + (n * 16);
         slot[0] = static_cast<uint8_t>(ev.type);
         slot[1] = ev.scanCode;
@@ -12001,6 +12002,18 @@ static int64_t sys_brook_wm_set_title(uint64_t wmId, uint64_t titlePtr,
     }
     brook::WmSetTitleById(proc, static_cast<uint32_t>(wmId), buf);
     return 0;
+}
+
+// 0xB0A: owned-window pointer lease. Query is independent of event delivery,
+// so a full user queue cannot keep a revoked capture active in userspace.
+static int64_t sys_brook_wm_pointer_capture(uint64_t wmId,uint64_t operation,uint64_t token,
+                                           uint64_t,uint64_t,uint64_t) {
+    Process* proc=ProcessCurrent();
+    if(!proc)return -ESRCH;
+    if(!wmId || wmId>WM_MAX_WINDOWS || operation>2 || token>0xffffffffu)return -EINVAL;
+    KernelOperationGuard operationGuard(proc);
+    return brook::WmPointerCapture(proc,static_cast<uint32_t>(wmId),
+                                   static_cast<uint32_t>(operation),static_cast<uint32_t>(token));
 }
 
 // 510: WM_POP_INPUT(wmId, buf*, max) — drain per-window input queue.
@@ -14960,6 +14973,7 @@ void SyscallTableInit()
     g_syscallTable[0xB07]                = sys_brook_scene_ctl;
     g_syscallTable[0xB08]                = sys_brook_wm_window_state;
     g_syscallTable[0xB09]                = sys_brook_wm_place_window;
+    g_syscallTable[0xB0A]                = sys_brook_wm_pointer_capture;
     g_syscallTable[0xB02]                = sys_brook_wm_theme;
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     g_syscallTable[0xB04]                = sys_brook_wm_scale;

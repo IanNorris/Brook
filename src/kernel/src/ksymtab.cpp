@@ -162,6 +162,7 @@ EXPORT_SYMBOL(InputPollEvent);
 EXPORT_SYMBOL(InputWaitEvent);
 EXPORT_SYMBOL(InputHasEvents);
 EXPORT_SYMBOL(InputWakeWaiters);
+EXPORT_SYMBOL(InputNextSequence);
 
 // Scheduler — for dynamic policy modules
 EXPORT_SYMBOL(SchedulerRegisterPolicy);

@@ -191,20 +191,20 @@ extern "C" void MouseIrqHandlerInner(void)
     // Push move event to input subsystem
     if (dx != 0 || dy != 0)
     {
-        InputEvent ev;
-        ev.type     = InputEventType::MouseMove;
+        InputEvent ev{};
+        ev.type     = InputEventType::MouseRelativeMove;
         ev.scanCode = g_buttons;
         ev.ascii    = 0;
         ev.modifiers = 0;
-        // Pack deltaX/deltaY into scanCode + modifiers fields isn't ideal,
-        // but for now the compositor reads g_mouseX/Y directly.
+        ev.deltaX = dx;
+        ev.deltaY = -dy;
         InputDevicePush(&g_mouseInputDev, ev);
     }
 
     // Push scroll event
     if (wheelY != 0 || wheelX != 0)
     {
-        InputEvent ev;
+        InputEvent ev{};
         ev.type     = InputEventType::MouseScroll;
         ev.scanCode = static_cast<uint8_t>(wheelY); // int8 dy (up positive)
         ev.ascii    = static_cast<char>(wheelX);    // int8 dx (right positive)
@@ -231,7 +231,7 @@ extern "C" void MouseIrqHandlerInner(void)
     {
         if (changed & (1 << bit))
         {
-            InputEvent ev;
+            InputEvent ev{};
             ev.type     = (g_buttons & (1 << bit))
                             ? InputEventType::MouseButtonDown
                             : InputEventType::MouseButtonUp;
