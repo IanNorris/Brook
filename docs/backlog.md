@@ -1,5 +1,15 @@
 # Recovery and VM-control backlog
 
+- Add a convenient host-integrated/relative pointer mode switch for native VM
+  use. The 25 October user review confirms Q3 capture works with PS/2-only
+  input, but finds it less convenient than the tablet outside games. Preserve
+  tablet as the launch default. A normal tablet launch has both devices;
+  switching should release any current guest lease safely, select the intended
+  QEMU input device, handle frontend grabbing, and require fresh interaction
+  before recapture. Test desktop cursor alignment, unlimited game turns,
+  emergency escape, mode changes while a button is held and bridge automation.
+  The current PS/2-only review cannot select a tablet that was omitted at boot.
+
 - Reproduce the host QEMU SIGSEGV from the 25 October pointer-control review
   before treating the desktop/game image as a broad stability pass. Several
   SDL Wayland/Xwayland controls and a stock/patched SDL A/B finish normally;

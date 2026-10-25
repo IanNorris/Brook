@@ -129,3 +129,9 @@ two-second settling interval, a separate two-second capture is inactive with
 zero frames. Checked VM shutdown and all four offline filesystem checks pass.
 Raw counter brackets, output captures and UI operations remain private in that
 review. Audible acceptance and mixed-workload smoothness remain unverified.
+
+The subsequent physical review reports that Q3 audio is "much clearer".
+It also reports roughly halved FPS when OBS is open on the host. Treat host
+recording as a performance-test variable; this observation alone neither
+locates the shared resource bottleneck nor measures Brook's isolated FPS.
+Sustained freedom from audible stutter has not yet been explicitly confirmed.

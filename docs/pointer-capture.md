@@ -2,7 +2,10 @@
 
 Status: kernel, native SDL/Wayland and SDL/Xwayland relative input controls
 pass. Xwayland requires the Brook SDL metadata backport described below.
-Physical host-pointer grabbing remains unaccepted. The checked Q3 review enables grabbing on Wayland; use an explicit
+The 25 October live PS/2 review confirms physical mouse capture works, though
+the user finds it less convenient than the previous host-integrated tablet.
+Explicit screen-edge, emergency-release and rearm observations are not yet
+recorded. The checked Q3 review enables grabbing on Wayland; use an explicit
 relative QEMU pointing device for a physical game review.
 
 ## Ownership and input
@@ -224,3 +227,12 @@ and all four offline filesystem checks pass. This is the prepared PS/2 review
 image; physical QEMU frontend grabbing, mouse-look at screen edges, emergency
 release and fresh-click rearm still need a user test. QMP injection does not
 prove the physical frontend behavior.
+
+The subsequent live review (`pointer-live-20261025`, a private copy of the
+checked PS/2 image) reports that mouse capture works. The user prefers the
+previous tablet's host cooperation outside games. Preserve tablet as the
+normal launch default; relative capture should be available when needed.
+The present PS/2-only review has no tablet to select at runtime. Normal tablet
+launches include both the tablet and built-in PS/2 mouse; a runtime selector
+would need to coordinate device selection, release and frontend state rather
+than confuse host QEMU grabbing with the guest's pointer lease.
