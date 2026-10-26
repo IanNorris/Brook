@@ -93,6 +93,9 @@ void SchedulerMarkStopped(Process* proc, int signal = 19);
 void SchedulerReleaseWaitReference(Process* proc);
 // Registry-pinned lookup; caller must ProcessUnref the returned identity.
 Process* SchedulerFindProcessReference(uint16_t pid);
+// PI caller pins proc, serializes donation updates and never calls under a
+// scheduler lock. 255 withdraws donation; 0..3 are internal scheduler ranks.
+void SchedulerSetPiDonation(Process* proc, uint8_t rank);
 // Registry lock serializes a foreign reader's AS pin with exec replacement.
 AddressSpaceState* SchedulerReferenceProcessAddressSpace(uint16_t pid, uint64_t incarnation, bool* exists);
 void SchedulerReplaceProcessAddressSpace(Process* process, AddressSpaceState* replacement);

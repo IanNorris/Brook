@@ -146,8 +146,10 @@ void ProcessQueueDestroy(Process* process) {
     WakeCleanupWorker();
 }
 void ProcessQueueRobustExit(Process* process) {
-    if(!process || process->isKernelThread ||
-       !__atomic_load_n(&process->robustListHead,__ATOMIC_ACQUIRE))return;
+    // PI ownership may exist without a userspace robust list (including raw
+    // futex callers). Forced-exit cleanup must run for every userspace task;
+    // normal exits already completed state 3 and do not enqueue again.
+    if(!process || process->isKernelThread)return;
     uint32_t expected=0;
     if(!__atomic_compare_exchange_n(&process->robustExitState,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return;
     ProcessRef(process); // Existing wait/reap gates require this to be zero.

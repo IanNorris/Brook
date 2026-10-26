@@ -40,6 +40,8 @@
 #include "scheduler.h"
 #include "spinlock.h"
 #include "sync/futex_waiter_pool.h"
+#include "sync/pi_wait_graph.h"
+#include "signal_restart.h"
 #include "sync/kmutex.h"
 #include "string.h"
 #include "memory/virtual_memory.h"
@@ -12715,6 +12717,9 @@ static FutexWaiter* g_futexBuckets[FUTEX_HASH_SIZE];
 // so the holder runs to the release uninterrupted and can never be descheduled
 // or killed mid-section.
 static IrqSpinLock g_futexLock;
+// Defined in syscall_futex_pi.inc; all graph inspection uses g_futexLock.
+static bool PiFutexQueued(uint64_t domain, uint64_t offset);
+static void PiFutexCancelProcess(Process* proc);
 
 // Pool of waiter nodes (avoid kmalloc from IRQ context). Sized to MAX_PROCESSES:
 // a thread blocked in a futex wait cannot start another, so one slot per thread
@@ -12800,6 +12805,11 @@ extern "C" int64_t FutexWake(uint64_t owner, uint64_t uaddr, uint32_t maxWake,
     uint32_t woken = 0;
 
     uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
+
+    if (PiFutexQueued(owner, uaddr)) {
+        IrqSpinLockRelease(&g_futexLock, fxFlags);
+        return -EINVAL; // Ordinary wake must not grant a PI ownership wait.
+    }
 
     FutexWaiter** pp = &g_futexBuckets[bucket];
     while (*pp && woken < maxWake) {
@@ -12895,6 +12905,7 @@ extern "C" void FutexCancelProcess(Process* proc)
         }
     }
     IrqSpinLockRelease(&g_futexLock, flags);
+    PiFutexCancelProcess(proc);
 }
 
 static int64_t FutexTimeoutDeadline(int op, uint64_t opVal, uint64_t timeoutAddr,
@@ -12985,6 +12996,8 @@ static bool RobustRead(Process* actor,AddressSpaceState* space,uint64_t address,
     }
     return true;
 }
+#include "syscall_futex_pi.inc"
+
 static bool RobustWord(Process* actor,Process* target,AddressSpaceState* space,uint64_t address,bool pending)
 {
     constexpr uint32_t OwnerMask=0x3fffffff,Waiters=0x80000000,Died=0x40000000;
@@ -13053,15 +13066,19 @@ void RobustFutexCleanup(Process* target)
         for(unsigned count=0;count<2048 && (entry&~uint64_t{1})!=head;++count) {
             const uint64_t node=entry&~uint64_t{1};uint64_t next=0,word=0;
             const bool gotNext=RobustRead(actor,space,node,&next,8);
-            if(node!=(list.pending&~uint64_t{1}) && !(entry&1) &&
+            if(node!=(list.pending&~uint64_t{1}) &&
                (!address(entry,word) || !RobustWord(actor,target,space,word,false)))break;
             if(!gotNext)break;
             entry=next;
         }
         uint64_t word=0;
-        if(list.pending && !(list.pending&1) && address(list.pending,word))
+        if(list.pending && address(list.pending,word))
             (void)RobustWord(actor,target,space,word,true);
     }
+    // Read every dying-owner list link before waking a PI successor: glibc
+    // immediately reuses the acquired mutex's embedded next pointer when it
+    // links that mutex into the successor's robust list.
+    PiFutexOwnerExit(target);
     AddressSpaceUnref(space);
     __atomic_store_n(&target->robustExitState,3,__ATOMIC_RELEASE);
 }
@@ -13070,13 +13087,11 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
                           uint64_t arg4, uint64_t arg5, uint64_t arg6)
 {
     int op = static_cast<int>(opVal) & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
-    // PI requires ownership, waiter handoff and scheduler priority inheritance.
-    // Reporting success without acquiring a contended word corrupts pthread
-    // mutex ownership. Reject the entire unsupported capability, including glibc's
-    // UNLOCK_PI probe on a zero-valued word in pthread_mutex_init. PulseAudio can
-    // then take its ordinary-mutex fallback.
-    if (op == FUTEX_LOCK_PI || op == FUTEX_UNLOCK_PI || op == FUTEX_TRYLOCK_PI ||
-        op == FUTEX_WAIT_REQUEUE_PI || op == FUTEX_CMP_REQUEUE_PI || op == FUTEX_LOCK_PI2)
+    if (op == FUTEX_LOCK_PI || op == FUTEX_UNLOCK_PI || op == FUTEX_TRYLOCK_PI || op == FUTEX_LOCK_PI2)
+        return PiFutexOperation(uaddrVal,opVal,op,arg4);
+    // PI condition-variable requeue needs its own atomic source/destination
+    // admission protocol. It remains honestly unsupported in this first stage.
+    if (op == FUTEX_WAIT_REQUEUE_PI || op == FUTEX_CMP_REQUEUE_PI)
         return -ENOSYS;
     Process* proc = ProcessCurrent();
     // Private addresses keep the existing per-thread-group key. Non-private
@@ -13102,11 +13117,10 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
     if (op == FUTEX_WAKE_OP) {
         uint64_t secondOwner=0,secondAddress=0;
         if(int error=FutexResolveKey(proc,arg5,opVal,secondOwner,secondAddress))return error;
-        // Shared atomic RMW/requeue/PI operations need separate admission work.
+        // Shared WAKE_OP still needs two-key mapping admission work.
         if((owner>>63) || (secondOwner>>63))return -95;
         if (!UserBufferWritable(arg5, sizeof(uint32_t)))
             return -EFAULT;
-        auto* uaddr2 = reinterpret_cast<volatile uint32_t*>(arg5);
         uint32_t encoded = static_cast<uint32_t>(arg6);
         uint32_t opCode = (encoded >> 28) & 0xF;
         uint32_t cmpCode = (encoded >> 24) & 0xF;
@@ -13116,20 +13130,31 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         if (cmpArg & 0x800) cmpArg |= 0xFFFFF000u;
         if (opCode & 0x8) {
             opCode &= 0x7;
+            if (opArg >= 32) return -EINVAL;
             opArg = 1u << opArg;
         }
 
-        uint32_t oldVal = __atomic_load_n(uaddr2, __ATOMIC_ACQUIRE);
-        uint32_t newVal = oldVal;
-        switch (opCode) {
-        case 0: newVal = opArg; break;              // FUTEX_OP_SET
-        case 1: newVal = oldVal + opArg; break;     // FUTEX_OP_ADD
-        case 2: newVal = oldVal | opArg; break;     // FUTEX_OP_OR
-        case 3: newVal = oldVal & ~opArg; break;    // FUTEX_OP_ANDN
-        case 4: newVal = oldVal ^ opArg; break;     // FUTEX_OP_XOR
-        default: return -ENOSYS;
+        if (opCode > 4 || cmpCode > 5) return -ENOSYS;
+        if (!RobustEnsurePage(proc,proc->addressSpace,arg5,3)) return -EFAULT;
+        uint32_t oldVal = 0;
+        {
+            MappingTransaction mapping(proc,proc->addressSpace);
+            if (!mapping.LockFaultRange(arg5)) return -ENOMEM;
+            auto* uaddr2=PiMappedWord(proc->addressSpace,arg5);
+            if (!uaddr2) return -EFAULT;
+            const auto flags=IrqSpinLockAcquire(&g_futexLock);
+            if (PiFutexQueued(owner,keyAddress) || PiFutexQueued(secondOwner,secondAddress)) {
+                IrqSpinLockRelease(&g_futexLock,flags);return -EINVAL;
+            }
+            switch (opCode) {
+            case 0: oldVal=__atomic_exchange_n(uaddr2,opArg,__ATOMIC_ACQ_REL);break;
+            case 1: oldVal=__atomic_fetch_add(uaddr2,opArg,__ATOMIC_ACQ_REL);break;
+            case 2: oldVal=__atomic_fetch_or(uaddr2,opArg,__ATOMIC_ACQ_REL);break;
+            case 3: oldVal=__atomic_fetch_and(uaddr2,~opArg,__ATOMIC_ACQ_REL);break;
+            case 4: oldVal=__atomic_fetch_xor(uaddr2,opArg,__ATOMIC_ACQ_REL);break;
+            }
+            IrqSpinLockRelease(&g_futexLock,flags);
         }
-        __atomic_store_n(uaddr2, newVal, __ATOMIC_RELEASE);
 
         bool cmp = false;
         int32_t lhs = static_cast<int32_t>(oldVal);
@@ -13147,8 +13172,12 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         uint32_t maxWake1 = static_cast<uint32_t>(val);
         uint32_t maxWake2 = static_cast<uint32_t>(arg4);
         int64_t woken = maxWake1 ? FutexWake(owner, keyAddress, maxWake1) : 0;
-        if (cmp && maxWake2)
-            woken += FutexWake(secondOwner, secondAddress, maxWake2);
+        if (woken < 0) return woken;
+        if (cmp && maxWake2) {
+            const auto second=FutexWake(secondOwner, secondAddress, maxWake2);
+            if (second < 0) return second;
+            woken += second;
+        }
         return woken;
     }
 
@@ -13185,6 +13214,11 @@ static int64_t sys_futex(uint64_t uaddrVal, uint64_t opVal, uint64_t val,
         if(!(leaf&VMM_PRESENT) || !(leaf&VMM_USER))return -EAGAIN;
         if(int error=FutexMappedKey(proc,uaddrVal,opVal,range,owner,keyAddress))return error;
         uint64_t fxFlags = IrqSpinLockAcquire(&g_futexLock);
+
+        if (PiFutexQueued(owner, keyAddress)) {
+            IrqSpinLockRelease(&g_futexLock, fxFlags);
+            return -EINVAL;
+        }
 
         // Check if *uaddr == val while holding the lock
         if (__atomic_load_n(uaddr, __ATOMIC_ACQUIRE) != static_cast<uint32_t>(val)) {

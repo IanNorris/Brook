@@ -2110,6 +2110,14 @@ static void robustExitQueue() {
     CHECK(ProcessCleanupStep() && robustCleanups==1 && process.refCount==0);
     CHECK(!ProcessGetCleanupStatus().queuedProcesses && !ProcessGetCleanupStatus().activeFinalizers);
     ProcessQueueRobustExit(&process);CHECK(!ProcessCleanupStep() && robustCleanups==1);
+    // Raw PI owners need the same forced-exit cleanup even without a registered
+    // robust list. Queue once, wait for off-CPU, then release the lifetime pin.
+    Process rawOwner{};rawOwner.state=ProcessState::Terminated;rawOwner.runningOnCpu=-1;
+    CHECK(!rawOwner.robustListHead);
+    ProcessQueueRobustExit(&rawOwner);ProcessQueueRobustExit(&rawOwner);
+    CHECK(rawOwner.refCount==1 && ProcessGetCleanupStatus().queuedProcesses==1);
+    CHECK(ProcessCleanupStep() && robustCleanups==2 && rawOwner.refCount==0);
+    ProcessQueueRobustExit(&rawOwner);CHECK(!ProcessCleanupStep() && robustCleanups==2);
 }
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }

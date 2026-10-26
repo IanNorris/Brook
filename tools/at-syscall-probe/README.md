@@ -47,7 +47,17 @@ must reject all six PI operation classes with ENOSYS without changing words,
 including null-word capability probes and private/realtime flag combinations.
 Ordinary WAIT/WAKE must still work. `--observe` prints the reduced self-lock and
 unowned-unlock comparison; the old Brook stubs incorrectly succeeded at both.
-This is unsupported-capability acceptance, not priority-inheritance support.
+The unsupported mode preserves the historical capability-rejection check;
+the basic PI implementation instead passes `--expect-supported`.
+
+`picontendcheck.c` requires `-pthread` and glibc on x86-64. Run under a host
+deadline as well as its guest alarm. It checks recursive PI initialization,
+two robust PI mutexes with a contended owner death and an arriving contender,
+absolute timeout clock modes, 3,200 private/shared-alias acquisitions, forced
+death of a raw owner without a robust list, and caught-signal restart without
+SA_RESTART. Every successful lock must exclude peers and name its actual TID.
+These checks do not certify PI condition-variable requeue or Linux realtime
+scheduler policies. See [the implementation checkpoint](../../docs/pi-futex-implementation.md).
 
 `sigpendingcheck.c` requires `-pthread`. It checks raw `rt_sigpending` sizes
 0 through 8, oversized rejection, exact partial writes, null/read-only/unmapped

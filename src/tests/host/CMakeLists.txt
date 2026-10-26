@@ -248,6 +248,10 @@ target_compile_options(test_krwlock_cleanup PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )
 add_host_test(test_futex_pool)
+add_host_test(test_pi_wait_graph)
+target_compile_options(test_pi_wait_graph PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_host_test(test_pi_dispatch)
+target_compile_options(test_pi_dispatch PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 target_compile_options(test_futex_pool PRIVATE
     "-iquote${BROOK_ROOT}/src/kernel/src"
 )

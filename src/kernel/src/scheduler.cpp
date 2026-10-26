@@ -872,6 +872,8 @@ static void PinUserAddressSpaceToCpu(Process* proc, uint32_t cpu)
                                 false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
+#include "scheduler_pi.inc"
+
 static Process* PickNextLocked(uint32_t cpu)
 {
     // Every caller holds g_readyLock with interrupts masked; no pick can run
@@ -884,7 +886,12 @@ static Process* PickNextLocked(uint32_t cpu)
 
     for (uint32_t i = 0; i < tries; ++i)
     {
-        uint16_t pid = g_schedOps->PickNext(g_schedState);
+        uint16_t pid = PiCandidateLocked(cpu);
+        if (pid != SCHED_PID_NONE) {
+            g_piDispatchCursor = pid;
+            g_schedOps->Remove(g_schedState, pid);
+        }
+        else pid = g_schedOps->PickNext(g_schedState);
         if (pid == SCHED_PID_NONE)
             break;
 
@@ -2190,8 +2197,16 @@ void SchedulerTimerTick(bool allowPreempt, const TimerWakeToken* timerProbe,bool
     uint64_t rlf8 = SchedLockAcquire(g_readyLock);
     g_perCpu[cpu].decisionRip=interruptedRip;g_perCpu[cpu].decisionPeriodic=periodicTimer;
     g_perCpu[cpu].decisionActive=true;
-    const bool shouldPreempt=g_schedOps->ShouldPreempt(g_schedState, cur->pid,
+    const auto piCandidate = PiCandidateLocked(cpu);
+    const auto currentRank = PiEffectiveRankLocked(cur);
+    const bool piPreempt = piCandidate != SCHED_PID_NONE &&
+        PiEffectiveRankLocked(g_pidToProcess[piCandidate]) < currentRank;
+    const bool policyPreempt = g_schedOps->ShouldPreempt(g_schedState, cur->pid,
                                   ApicTickCount() - g_perCpu[cpu].sliceStartTick);
+    const bool piCurrent = g_piDispatch[cur->pid].incarnation == cur->incarnation;
+    const bool piPeer = piCandidate != SCHED_PID_NONE &&
+        PiEffectiveRankLocked(g_pidToProcess[piCandidate]) <= currentRank;
+    const bool shouldPreempt = piPreempt || (policyPreempt && (!piCurrent || piPeer));
     g_perCpu[cpu].decisionActive=false;
     if (!shouldPreempt)
     {

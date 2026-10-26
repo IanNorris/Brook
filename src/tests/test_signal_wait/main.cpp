@@ -63,6 +63,17 @@ int main(){using namespace brook;
     for(uint64_t n:{0,1,2,16,17,18,19,20,61})CHECK(SignalSyscallMayRestart(n,0,0));
     for(uint64_t op:{0,128,9,137,393}){CHECK(SignalSyscallMayRestart(202,op,0));CHECK(!SignalSyscallMayRestart(202,op,0x1234));}
     CHECK(!SignalSyscallMayRestart(202,6,0));
+    for(uint64_t op:{6,134,13,141,269,397}) {
+        uint64_t rip=0x1234;int64_t result=-4;
+        CHECK(SignalPrepareUnconditionalRestart(202,op,SignalRestartNoIntr,&rip,&result));
+        CHECK(rip==0x1232 && result==202);
+    }
+    for(uint64_t op:{0,128,7,8,9,137,11,12}) {
+        uint64_t rip=0x1234;int64_t result=-4;
+        CHECK(!SignalPrepareUnconditionalRestart(202,op,SignalRestartNoIntr,&rip,&result));
+        CHECK(rip==0x1234 && result==-4);
+    }
+    {uint64_t rip=1;int64_t result=-4;CHECK(!SignalPrepareUnconditionalRestart(202,6,SignalRestartNoIntr,&rip,&result));}
     auto run=[&](uint64_t pending,uint64_t mask,bool terminal,bool interruptible,ProcessState state=ProcessState::Running){
         Process p;p.state=state;p.sigPending=pending;p.sigMask=mask;p.terminalPending=terminal;g_perCpu[0].currentProcess=&p;
         removes=voluntary=yields=0;irq=true;

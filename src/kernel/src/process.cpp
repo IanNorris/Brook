@@ -1871,6 +1871,13 @@ extern "C" int64_t SyscallCheckSignals(SyscallFrame* frame, int64_t syscallResul
         return timing.Result(static_cast<int64_t>(mc.rax)); // restore original RAX
     }
 
+    if (syscallResult == brook::SignalRestartNoIntr) {
+        int64_t replacement=-4;
+        (void)brook::SignalPrepareUnconditionalRestart(proc->currentSyscallNum,
+            frame->rsi,syscallResult,&frame->rcx,&replacement);
+        syscallResult=replacement;
+    }
+
     // --- Signal delivery ---
     // User-space context restoration (e.g. siglongjmp/CoreCLR) may bypass
     // sigreturn. Eligibility is defined by signal masks, never a handler flag.
