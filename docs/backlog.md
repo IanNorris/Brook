@@ -7,7 +7,8 @@
   in subsequent short profiles. Use repeatable cold/warm controls before
   attempting another structural change. [Evidence](stardew-native64.md#hard-links-and-indexed-open-inodes--25-october).
 
-- Follow up the unreproduced Stardew close on clicking Load with older saves
+- Stardew gameplay is user-verified compatible; prioritize slow loading.
+  Follow up the unreproduced Stardew close on clicking Load with older saves
   present, before selecting a slot. Basic acceptance now passes: older saves
   list/load, sleeping writes day 2, exact bytes survive checked shutdown/reboot,
   and the isolated day-2 slot reloads into its farmhouse. If the close recurs,

@@ -1,5 +1,12 @@
 # Stardew Valley native64 startup — 24 October 2026
 
+**Compatibility status:** the owner verifies Stardew Valley gameplay as compatible
+following live testing. Older saves and a sleep/save/reboot/day-2 reload round
+trip pass. Loading times remain slow and variable and are the next priority.
+The earlier isolated Load-screen close is retained as an unreproduced report,
+not a blocker to this user-approved gameplay classification.
+
+
 The default native64 Linux depot now reaches an interactive title/menu through
 Steam. Load shows an empty isolated test home, Back returns to the title, and
 the in-game Exit button removes the game and its runtime helpers. This is a
