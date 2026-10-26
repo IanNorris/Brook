@@ -78,7 +78,9 @@ namespace brook {
 // ABI 53 carries raw relative motion and publication sequence in InputEvent.
 // ABI 54 appends exact retained entry-parent provenance to VfsObjectOps.
 // ABI 55 appends retained hard-link creation to VfsObjectOps.
-static constexpr uint32_t MODULE_ABI_VERSION = 55;
+// ABI 56 gives desktop draw callbacks signed destination origins. Matched
+// drivers preserve offscreen quads and support their full NDC range.
+static constexpr uint32_t MODULE_ABI_VERSION = 56;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

@@ -191,13 +191,49 @@ evidence is under `build/reviews/stardew-loading-ab-20261026/`.
 Both reverse-pair runs pass the same acceptance checks; their evidence is under
 `build/reviews/stardew-loading-ba-20261026/`.
 
-## Additional-game installer investigation remains open
+## Off-screen window scaling explained the installer clicks
 
-Graveyard Keeper's owned-game install dialog appears, but confirmation does not
-start a download or create an app manifest in these runs. Input/focus controls
-after the first confirmation do not establish whether the initial callback
-blocked or whether the modal received input. Neither Graveyard Keeper nor
-Untitled Goose Game is accepted or marked compatible by this pass.
+The installer was not blocked in its installation callback. Steam created a
+1,920 × 1,036 window at (100, 100) on the 1,920 × 1,080 desktop. The GPU
+compositor shrank its destination to the visible 1,820 × 980 rectangle while
+sampling the complete texture. X11 input retained the original coordinates.
+A native X11 readback and the composed frame measured a 500-pixel modal bar
+shrunk to 474 pixels, matching the horizontal clipping ratio. Maximizing Steam
+removed the clipping; checkbox, Cancel and Install then worked, and Graveyard
+Keeper downloaded successfully.
+
+The fix preserves the full source-to-destination mapping and lets the GPU
+viewport clip it. Desktop draw origins are signed throughout the ABI-56
+kernel/driver interface. Endpoint arithmetic uses 64 bits and rejects overflow;
+NDC conversion retains large off-screen coordinates without narrowing the Q23
+quotient to 32 bits. Chrome and screen-space backdrop helpers retain their
+existing matching source/destination clipping.
+
+The matched kernel and all 13 modules build. Compiled entry and scheduler
+mutation audits pass, as do all 110 host tests (14.79 seconds). A focused test
+covers signed bounds, all edges/corners, unequal texture/window dimensions and
+extreme NDC coordinates. Native Xwayland color-grid readback additionally
+checks 18,466 actual composed pixels across all four edges and two corners,
+with zero mismatches after moving the cursor away. The first corner capture
+had three cursor-covered pixels; its unobstructed repeat passes. Evidence remains private
+under `build/reviews/steam-games-clip-20261026/modal-control/`.
+
+## New-game acceptance remains open
+
+Graveyard Keeper downloaded 553,248,832 bytes and installed 1,893,434,515 bytes.
+The actual Linux launcher and UnityPlayer are ELF64 x86-64. The first launch on
+the old control kernel created no game window: Player.log stopped just after
+display discovery, and saved kernel stacks showed the main and worker threads
+in futex waits. The main user stack reaches UnityPlayer's pthread_mutex_lock
+wrapper. This is a diagnosis lead, not proof of a futex defect. SIGTERM and
+normal Steam shutdown did not clear the game; targeted SIGKILL drained it,
+then checked VM shutdown, original-owner exit zero and all four filesystem
+checks succeeded. No game save was opened.
+
+Neither Graveyard Keeper nor Untitled Goose Game is marked compatible yet.
+Untitled Goose Game's Win64 metadata is preflight evidence; its game payload
+has not been downloaded at this checkpoint. Both titles' assets, account data
+and saves remain in ignored private images.
 
 A transient CEF reason-213 failure preceded recovery of the Library; a normal
 client restart subsequently renders the Store. In Chromium 126.0.6478.183,
@@ -206,9 +242,10 @@ The visible `data:` URL alone does not explain it. No kernel IPC repair or
 cache reset is justified by that observation.
 [Exact-version check](https://github.com/chromium/chromium/blob/126.0.6478.183/content/browser/renderer_host/ipc_utils.cc).
 
-The next bounded discriminator is to test checkbox/hover/Cancel on a fresh
-modal **before** pressing Install, then reopen, press Install once and repeat
-the same harmless control. Responsive-before/dead-after supports a blocked
-installation callback; dead-before keeps initialization/routing ahead of it.
-If necessary, inspect recursive X11 child/focus/map/transient relationships
-rather than assuming the large root child is the actual modal input target.
+The fresh-modal ordering control, recursive X11 tree/focus inspection and
+native/composed pixel comparison resolved the installer issue without changing
+Steam IPC or launcher permissions. On the matched ABI-56 image, Steam's 1,920 × 1,036 window moved to (100, 100)
+retains its modal geometry. The desktop-shortcut checkbox toggles at its
+displayed coordinates and toggles back before confirming the owned Goose
+installation. This verifies actual input alignment as well as pixel mapping.
+Further game changes require evidence from the new launch.

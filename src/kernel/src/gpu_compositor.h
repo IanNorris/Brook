@@ -98,10 +98,12 @@ struct GpuCompositorOps {
     // Draw a src texture region as a textured quad into the scanout at a dst
     // region (scaled), with optional src-alpha blend and a uniform opacity
     // (0..255; 255 = opaque). Recorded per call; the batch is composed +
-    // presented by EndFrame.
+    // presented by EndFrame. Destination origins are signed; preserve the full
+    // destination and let viewport clipping trim offscreen pixels without
+    // changing the source-to-destination mapping.
     void (*DrawQuad)(GpuTexId src,
                      uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
-                     uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
+                     int32_t dx, int32_t dy, uint32_t dw, uint32_t dh,
                      uint32_t opacity, bool alphaBlend);
 
     // Mark the backdrop barrier: everything drawn so far this frame (wallpaper +
@@ -136,7 +138,7 @@ struct GpuCompositorOps {
     // Draw a retained premultiplied root during desktop frame assembly. Opacity
     // scales RGB and alpha together; existing DrawQuad retains its legacy mode.
     void (*DrawPremultipliedQuad)(GpuTexId src,uint32_t sx,uint32_t sy,uint32_t sw,uint32_t sh,
-                                 uint32_t dx,uint32_t dy,uint32_t dw,uint32_t dh,uint32_t opacity);
+                                 int32_t dx,int32_t dy,uint32_t dw,uint32_t dh,uint32_t opacity);
     // Upload tightly packed pixels from a page-aligned, kernel-owned VMM
     // snapshot. Caller pins that snapshot throughout the call. Complete means
     // transfer/fence/detach/fence all succeeded and the snapshot may be freed;

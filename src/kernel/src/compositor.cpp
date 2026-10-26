@@ -25,6 +25,7 @@
 #include "net.h"
 #include "display.h"
 #include "gpu_compositor.h"
+#include "gpu_quad_math.h"
 #include "frame_timing.h"
 #include "fw_cfg.h"
 #include "font_atlas.h"
@@ -2882,7 +2883,7 @@ static void DumpFullFrameOnce()
 // chrome pass the window's opacity so translucent windows composite correctly.
 static inline void GpuComposeLayer(const GpuCompositorOps* gpu, GpuTexId src,
                                    uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
-                                   uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh,
+                                   int32_t dx, int32_t dy, uint32_t dw, uint32_t dh,
                                    bool alphaBlend, uint32_t opacity = 255)
 {
     gpu->DrawQuad(src, sx, sy, sw, sh, dx, dy, dw, dh, opacity, alphaBlend);
@@ -2945,9 +2946,8 @@ static void GpuComposeWindowBlur(const GpuCompositorOps* gpu, const Window* w)
     GpuComposeRectBlur(gpu, w->x, w->y, (int)w->outerWidth(), (int)w->outerHeight());
 }
 
-// Draw a window's content texture into its client area at `opacity`, clamped to
-// the screen (only off-screen left/top is clipped; on-screen windows keep full
-// client size). Shared by the normal and blur present paths.
+// Draw the original client quad. GPU viewport clipping preserves the texture
+// mapping on every edge, including intentionally scaled client buffers.
 static void GpuDrawWindowContent(const GpuCompositorOps* gpu, const Window* w,
                                  const WinTexEntry& e, uint32_t scrW, uint32_t scrH,
                                  uint32_t opacity)
@@ -2957,19 +2957,11 @@ static void GpuDrawWindowContent(const GpuCompositorOps* gpu, const Window* w,
         (content.externalCaptured ? (!e.owned || e.generation!=content.generation) : e.owned)) return;
     int dx = w->clientX(), dy = w->clientY();
     int dw = w->clientW,  dh = w->clientH;
-    if (dx >= (int)scrW || dy >= (int)scrH || dx + dw <= 0 || dy + dh <= 0) return;
-    int clipL = dx < 0 ? -dx : 0;
-    int clipT = dy < 0 ? -dy : 0;
-    uint32_t cdx = (uint32_t)(dx + clipL);
-    uint32_t cdy = (uint32_t)(dy + clipT);
-    uint32_t cdw = (uint32_t)(dw - clipL);
-    uint32_t cdh = (uint32_t)(dh - clipT);
-    if (cdx + cdw > scrW) cdw = scrW - cdx;
-    if (cdy + cdh > scrH) cdh = scrH - cdy;
-    if (cdw == 0 || cdh == 0) return;
+    GpuQuadBounds bounds{};
+    if(dw<=0 || dh<=0 || !GpuWindowQuad(dx,dy,uint32_t(dw),uint32_t(dh),scrW,scrH,bounds))return;
     if (e.premultiplied)
-        gpu->DrawPremultipliedQuad(e.tex,0,0,e.w,e.h,cdx,cdy,cdw,cdh,opacity);
-    else GpuComposeLayer(gpu, e.tex, 0, 0, e.w, e.h, cdx, cdy, cdw, cdh, e.alpha, opacity);
+        gpu->DrawPremultipliedQuad(e.tex,0,0,e.w,e.h,dx,dy,uint32_t(dw),uint32_t(dh),opacity);
+    else GpuComposeLayer(gpu,e.tex,0,0,e.w,e.h,dx,dy,uint32_t(dw),uint32_t(dh),e.alpha,opacity);
 }
 
 static void EnsureDesktopTex(const GpuCompositorOps* gpu)

@@ -380,7 +380,7 @@ void TestSceneService() {
         if (operationResult==GpuCaptureResult::Complete) textures.at(destination)=textures.at(layers[0].texture);
         return operationResult;
     };
-    fakeGpu.DrawPremultipliedQuad=[](uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t) {};
+    fakeGpu.DrawPremultipliedQuad=[](uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,int32_t,int32_t,uint32_t,uint32_t,uint32_t) {};
     auto* scene=OpenScene();SceneStatsDesc stats{};SceneGetStats(scene,stats);
     EXPECT(stats.abi==1 && stats.sceneCount==1 && stats.versionSlots==64);
     const auto a=UploadPixels(scene,0xffaabbcc);EXPECT(a>0 && pages.empty());

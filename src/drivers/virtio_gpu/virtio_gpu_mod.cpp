@@ -17,6 +17,7 @@
 #include "kprintf.h"
 #include "display.h"
 #include "gpu_compositor.h"
+#include "gpu_quad_math.h"
 #include "gpu_app.h"
 #include "gpu_completion.h"
 #include "tty.h"
@@ -398,16 +399,11 @@ static inline uint32_t IntToF32Bits(int32_t v)
 // IEEE-754 bit pattern of the fraction num/den, computed in integer/fixed-point
 // (no runtime FP). Used for texture uv coordinates (s/texDim) and, via NdcBits,
 // for clip-space vertex positions. Exact when num/den is a dyadic-friendly ratio
-// at these magnitudes; |err| < 1.2e-7 otherwise.
+// at UV magnitudes; Q23 truncation contributes less than 1.2e-7 there. Wider
+// NDC values retain float precision without narrowing the quotient to int32_t.
 static inline uint32_t FracBits(int64_t num, int64_t den)
 {
-    if (num == 0 || den == 0) return 0;
-    int64_t q = (static_cast<int64_t>(num) * (int64_t{1} << 23)) / den;   // ~ (num/den) * 2^23
-    if (q == 0) return 0;
-    uint32_t f = IntToF32Bits(static_cast<int32_t>(q));
-    uint32_t exp = (f >> 23) & 0xFF;                 // divide by 2^23 ...
-    exp -= 23;                                       // ... via exponent bias
-    return (f & 0x807FFFFFu) | (exp << 23);
+    return brook::GpuFractionBits(num,den);
 }
 
 // Clip-space (NDC) bit pattern for pixel coordinate `px` on an axis of size
@@ -415,7 +411,7 @@ static inline uint32_t FracBits(int64_t num, int64_t den)
 // pixel rects into vertex positions for the DRAW path.
 static inline uint32_t NdcBits(int32_t px, int32_t dim)
 {
-    return FracBits(2 * px - dim, dim);
+    return brook::GpuNdcBits(px,dim);
 }
 
 // Self-test context/resource ids and render-target dimension.
@@ -2270,10 +2266,12 @@ static void CompBeginFrame(uint32_t clearArgb)
 // yet applied (opaque-parity milestone; per-window opacity is a follow-up).
 static void CompDrawQuad(GpuTexId src,
                          uint32_t sx, uint32_t sy, uint32_t sw, uint32_t sh,
-                         uint32_t dx, uint32_t dy, uint32_t dw_, uint32_t dh,
+                         int32_t dx, int32_t dy, uint32_t dw_, uint32_t dh,
                          uint32_t opacity, bool alphaBlend)
 {
     if (!g_compReady || !g_drawReady || g_drawQuadCount >= MAX_DRAW_QUADS) return;
+    brook::GpuQuadBounds bounds{};
+    if(!brook::GpuQuadDestination(dx,dy,dw_,dh,bounds))return;
 
     // Special source: the blurred backdrop. Sample it at the destination rect's
     // screen-space uv (normalized to the scanout), so the quad shows the frosted
@@ -2282,14 +2280,11 @@ static void CompDrawQuad(GpuTexId src,
     {
         if (!g_blurReady || g_compScanoutW == 0 || g_compScanoutH == 0) return;
         DrawQuadRec& q = g_drawQuads[g_drawQuadCount++];
-        q.dx  = static_cast<int32_t>(dx);
-        q.dy  = static_cast<int32_t>(dy);
-        q.dx2 = static_cast<int32_t>(dx + dw_);
-        q.dy2 = static_cast<int32_t>(dy + dh);
-        q.u0 = FracBits(static_cast<int32_t>(dx),       static_cast<int32_t>(g_compScanoutW));
-        q.v0 = FracBits(static_cast<int32_t>(dy),       static_cast<int32_t>(g_compScanoutH));
-        q.u1 = FracBits(static_cast<int32_t>(dx + dw_), static_cast<int32_t>(g_compScanoutW));
-        q.v1 = FracBits(static_cast<int32_t>(dy + dh),  static_cast<int32_t>(g_compScanoutH));
+        q.dx=bounds.left;q.dy=bounds.top;q.dx2=bounds.right;q.dy2=bounds.bottom;
+        q.u0 = FracBits(bounds.left,g_compScanoutW);
+        q.v0 = FracBits(bounds.top,g_compScanoutH);
+        q.u1 = FracBits(bounds.right,g_compScanoutW);
+        q.v1 = FracBits(bounds.bottom,g_compScanoutH);
         q.opacity = F32Bits(1.0f);
         q.sview = g_blurAView;          // final blurred RT
         q.blend = DRAW_BLEND;           // opaque (the glass chrome blends on top)
@@ -2299,12 +2294,10 @@ static void CompDrawQuad(GpuTexId src,
 
     GpuTexture* gt = CompTex(src);
     if (!gt || gt->sview == 0) return;
+    if(!sw || !sh || sx>gt->w || sy>gt->h || sw>gt->w-sx || sh>gt->h-sy)return;
 
     DrawQuadRec& q = g_drawQuads[g_drawQuadCount++];
-    q.dx  = static_cast<int32_t>(dx);
-    q.dy  = static_cast<int32_t>(dy);
-    q.dx2 = static_cast<int32_t>(dx + dw_);
-    q.dy2 = static_cast<int32_t>(dy + dh);
+    q.dx=bounds.left;q.dy=bounds.top;q.dx2=bounds.right;q.dy2=bounds.bottom;
     q.u0 = FracBits(static_cast<int32_t>(sx),       static_cast<int32_t>(gt->w));
     q.v0 = FracBits(static_cast<int32_t>(sy),       static_cast<int32_t>(gt->h));
     q.u1 = FracBits(static_cast<int32_t>(sx + sw),  static_cast<int32_t>(gt->w));
@@ -2321,7 +2314,7 @@ static void CompDrawQuad(GpuTexId src,
 
 static void CompDrawPremultipliedQuad(GpuTexId src,
     uint32_t sx,uint32_t sy,uint32_t sw,uint32_t sh,
-    uint32_t dx,uint32_t dy,uint32_t w,uint32_t h,uint32_t opacity)
+    int32_t dx,int32_t dy,uint32_t w,uint32_t h,uint32_t opacity)
 {
     auto* texture=CompTex(src);
     if (!texture || !texture->owned || texture->quarantined || opacity>255) return;
