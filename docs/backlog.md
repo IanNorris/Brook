@@ -7,6 +7,52 @@
   in subsequent short profiles. Use repeatable cold/warm controls before
   attempting another structural change. [Evidence](stardew-native64.md#hard-links-and-indexed-open-inodes--25-october).
 
+- Follow up the unreproduced Stardew close on clicking Load with older saves
+  present, before selecting a slot. Basic acceptance now passes: older saves
+  list/load, sleeping writes day 2, exact bytes survive checked shutdown/reboot,
+  and the isolated day-2 slot reloads into its farmhouse. If the close recurs,
+  capture its actual exception/exit and cohort. Continue longer audio/gameplay
+  tests with private copies; distinguish game writes from Steam Cloud activity.
+
+- Separate host storage latency from guest startup costs in the next I/O pass.
+  Similar data-image read counts/bytes accompany 55.6 versus 744.3 seconds of
+  summed QEMU read-service time across 134 versus 212 second game starts on the
+  same kernel. Request intervals overlap; do not sum them into wall-time shares.
+  Record host I/O pressure, cache/state and image-backing configuration alongside
+  cold/warm controls before changing guest filesystem ordering or caching.
+
+- Establish OBS-off host baselines for game performance before another GPU
+  synchronization change. In the same running VM, after the owner closes OBS,
+  observed compositor body p50 falls from 54.08 to 10.87 ms. Scene changes and
+  bounded recorder retention prevent a strict benchmark claim. A narrow future
+  candidate is reusing shared external-capture preparation's producer-fence
+  proof within the same command-lock scope; preserve peer/copy fences and all
+  backing-lifetime failure paths. Require pixel correctness and measured gain.
+
+- Investigate Steam wrapper exit status 137 on the save/load review's normal
+  shutdown request. The wrapper and all descendants drain, no app/audio stream
+  remains, and the VM subsequently completes checked filesystem/device flush.
+  Preserve the nonzero result; do not count it as a zero-exit Steam acceptance.
+
+- Diagnose Python metadata-copy ENOSYS seen while making the save fixture.
+  `shutil.copytree` copies bytes but fails during metadata preservation. The
+  test uses independently hashed byte copies; identify the exact unsupported
+  syscall before changing metadata or extended-attribute semantics.
+
+- Explore paging to disk after the immediate startup/save-load work. Design
+  reclaim and page-fault I/O with bounded memory usage, forward progress under
+  pressure, safe handling of pinned/DMA/kernel pages, and an explicit swap disk
+  or file policy. Compare against compressed memory as a separate option.
+  Paging must complement controlled allocation failure and process recovery;
+  it cannot guarantee safety once all backing storage is exhausted.
+
+- Polish the complete boot presentation. Reduce bootloader text to a concise
+  stage indicator, remove diagnostic/test renders from normal boots, and keep
+  the boot progress screen visible until the desktop's first complete frame is
+  ready. Preserve verbose diagnostics behind a flag and retain panic/error
+  visibility. Test firmware-to-loader, loader-to-kernel and compositor handoff
+  for corruption, blank flashes and premature splash dismissal.
+
 - Extend launch feedback to games started inside Steam or another application.
   Current feedback is admitted by Brook's app launcher; Steam's internal Play
   action creates no separate Brook launch record or taskbar placeholder. The
@@ -1665,7 +1711,8 @@ each probe's argument parser.
 - Fix initial smaller-window clipping and cooperative pointer modes. Maximizing
   exposes the full menu; the captured pointer currently needs relative PS/2
   input rather than absolute tablet injection.
-- Finish sustained audio and actual gameplay acceptance. The owner heard game
+- Extend sustained audio and gameplay acceptance beyond the basic save/reload
+  round trip now verified across reboot. The owner heard game
   audio, but a later HDA sample gap caused persistent OSS EPIPE and PulseAudio
   sink removal. FIONBIO and POST now work; fresh-epoch recovery passes both
   blocking/nonblocking forced-fault controls. Real PulseAudio/game recovery

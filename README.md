@@ -62,7 +62,8 @@ the table distinguishes tested behavior from remaining limitations.
 | Wine64 | 11.0 | ✅ Basic apps | Console command and Windows Notepad: keyboard input, save, normal close and cold-boot reopen as Brook. Broader Windows coverage remains limited. [Evidence and screenshot](docs/wine-smoke.md#console-and-notepad-acceptance--19-october) |
 | Wine + DXVK | 11.0 / 2.7.1 | ⚠️ Experimental D3D11 | Hardware Venus shader/readback probe and Windows SDL3 Snake; keyboard input, resize, maximize, minimize/restore and repeated launch/close verified. Per-app Unity audio also verified; standalone Proton GE has a separate smoke test. [Results](docs/wine-dxvk.md), [Unity smoke test](docs/wine-unity.md) |
 | Proton GE | 11-10 / DXVK 3.1.1 | ⚠️ Experimental | Standalone Helltaker at 720p: first-puzzle input/reset, captured audio and normal exit verified. Steam client integration remains untested. [Results](docs/proton.md) |
-| Steam | Native64 client | ⚠️ Experimental | QR sign-in, Library, downloads and verification tested through SteamRT. Stardew Valley's native64 title/menu, isolated Load screen and Exit work through Steam; hard links reduce one measured game startup from 334 to 128 seconds; game audio and bounded timing-fault recovery verified; broader gameplay remains open. [Game results](docs/stardew-native64.md), [client limits](docs/steam-library-stability.md) |
+| Steam | Native64 client | ⚠️ Experimental | QR sign-in, Library, downloads and verification tested through SteamRT. Native64 Stardew gameplay and save/reload across reboot work; game audio and bounded timing-fault recovery verified. Startup remains slow and variable. [Game results](docs/stardew-native64.md), [client limits](docs/steam-library-stability.md) |
+| Stardew Valley | 1.6.15 native64 | ⚠️ Experimental | Launched through Steam; older-save loading, movement, sleep-to-save and day-2 reload after a clean VM reboot verified. Startup is slow and variable; host recording load affects performance. [Results](docs/stardew-native64.md) |
 | D3D12 / VKD3D-Proton | 3.1.0 | ⚠️ Experimental | Hardware shader/readback, event fences, 720p swapchain resize, Windows SDL3 Snake and Veloren 3D singleplayer through Proton GE. Per-game native shader compiler required for Veloren. [Results and screenshots](docs/d3d12.md) |
 | SpaceVenture (Windows) | 2.08.12 / Unity 2022.3 | ⚠️ Experimental | D3D11/DXVK main menu, opening sequence and first-room interaction; clocked ALSA PCM captured. [Screenshot and limits](docs/wine-unity.md#spaceventure--unity-2022362f2) |
 | Helltaker (Windows) | Unity 2019.2.9f1 | ⚠️ Experimental | 720p D3D11/DXVK first-puzzle gameplay, keyboard movement/restart, minimize/restore and normal exit; clocked ALSA audio captured. [Screenshot and scope](docs/wine-unity.md) |
@@ -78,11 +79,11 @@ the table distinguishes tested behavior from remaining limitations.
   minimize/restore. SteamRT startup now uses its companion launcher service;
   retained file descriptors and resource-limit reporting fixes support the
   client. Stardew Valley's native64 build now reaches its interactive title/menu
-  through Steam, with isolated Load, Back and Exit checked. Runtime preparation
-  now takes about two minutes in one measured run after ext2 hard-link and inode
-  lookup fixes. Game audio and recovery after a forced device timing gap are verified in
-  a bounded run; full gameplay and long-run audio acceptance remain open. The tested i386 game still requires architecture
-  support. [Game results](docs/stardew-native64.md) and
+  through Steam, with older-save loading and a sleep/save/reboot/reload round trip
+  checked. Hard links and inode indexing reduce one measured startup from 334
+  to 128 seconds; later runs remain slow and variable. Game audio and recovery
+  after a forced timing gap work in bounded tests; longer sessions remain open. The tested i386 game still
+  requires architecture support. [Game results](docs/stardew-native64.md) and
   [remaining work](docs/backlog.md#stardew-valley-native64-acceptance-24-october).
 
 - **D3D12:** Proton GE's VKD3D renders a shader triangle with verified GPU
@@ -286,6 +287,12 @@ Click any screenshot to open its original pixels. README previews are smaller
 than the captured desktop; UI text is clearest in the full-resolution image.
 New captures use native 1920×1080 without upscaling. See
 [showcase capture and demo plans](docs/showcase.md).
+
+<p align="center">
+  <a href="docs/images/brook_stardew_valley_1080.png"><img src="docs/images/brook_stardew_valley_1080.png" alt="Stardew Valley's native64 Linux build running on Brook through Steam after loading an older save" width="960"></a>
+</p>
+
+<p align="center"><em>Stardew Valley — native64 Linux build launched through Steam, after loading an older save. Native 1920×1080 capture.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_steam_library_1080.png"><img src="docs/images/brook_steam_library_1080.png" alt="Steam Library on Brook after installing Stardew Valley, with account and community information masked" width="960"></a>

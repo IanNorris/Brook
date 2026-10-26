@@ -369,6 +369,86 @@ four offline filesystem checks (data, nix, tmp, boot) pass. Private raw evidence
 is retained under `build/reviews/stardew-hardlinks-oss-recovery-20261025/`.
 
 
+### Save/load and host recording control
+
+The owner clarified that the reported close occurred on clicking **Load**, before
+selecting a slot, with older saves present. The next private review preserves
+original-save content hashes and makes verified copies for testing. The new
+review save's metadata and game XML parse successfully. Load lists that save,
+and selecting it reaches the farmhouse. The owner sleeps in the bed: the live
+files advance from day 1 to day 2 and retain the previous day's backups. Four
+files are snapshotted and hashed before reboot. This is a real game-written
+save, not a synthesized XML fixture.
+A normal VM shutdown completes checked filesystem/device flush, the original
+launcher exits zero, and all four offline filesystem checks pass. After reboot,
+all four day-2 snapshot files have identical hashes and the main XML still
+reports day 2. After isolating that slot and returning to title, Load lists only the day-2
+entry. Selecting it enters the farmhouse with Tuesday, day 2 on the HUD. This
+completes the sleep/save/checked-shutdown/reboot/reload round trip. A separate
+older slot also loads after reboot; the basic save/load checks pass.
+
+The copied older-save cohort includes saves from 1.4.5, 1.5.6 and 1.6.15 plus
+metadata without a version field. With the older copies added, Load lists the
+slots successfully and the owner loads an older game. The reported close is
+not reproduced; these passes do not establish its cause or a specific fix.
+Extra visible slots come from the deliberate private copies, not proof of Cloud
+downloading them. Steam's Cloud log still watches the original profile paths;
+all 33 original files retain their contents and non-marker mtimes. Cloud-marker
+mtime drift remains separate from game save writes.
+
+Twelve one-second startup captures retain 8,537 samples without reported event
+loss. The instrumented request-to-window observation is 209.3 seconds, including
+capture/export pauses and concurrent private fixture copying; it is not directly
+comparable to the preceding 128–134 second unprofiled controls. A later
+unprofiled launch in this review reaches the window at 154.7 seconds. Startup
+remains slow, and neither number establishes an optimization or regression.
+The subsequent reboot run takes 173.5 seconds to open Steam and 212.0 seconds
+from game request to window, including one initialization profile. Compared
+with the earlier 134-second observation on the same kernel, data-image reads
+are similar (1,342.6 versus 1,320.2 MiB; 413,878 versus 409,086 requests), but
+aggregate QEMU read-service time rises from 55.6 to 744.3 seconds. Those request
+intervals overlap and cannot be added into an exclusive wall-time partition.
+The host also exhibits substantial I/O pressure during offline checks. Treat
+host storage latency/state as a measured lead, not proof of a guest regression
+or of the cause of each individual wait. No new performance change is shipped
+from these variable observations.
+
+Three short low-framerate gameplay captures also report no producer drops.
+Most CPUs are idle; the compositor's GPU-completion wait dominates active
+samples. An independent stopped frame-stage recording reconciles 83 frames:
+body p50 54.08 ms, p95 99.38 ms; exclusive fence waits account for 62.0% of
+body time, command-lock acquisition 28.2%, and CPU preparation 2.0%. These are
+guest elapsed waits, including scheduling/host delay, not physical GPU usage.
+
+The owner then closes host OBS and reports roughly four times the framerate.
+Without any Brook code change, another recording retains the most recent 256
+of 269 completed frames (13 overwritten by the bounded ring): body p50 10.87 ms,
+p95 19.98 ms, fence-wait p50 5.49 ms versus 33.98 ms previously. The game scene
+can change between these observations, so this is not a controlled benchmark.
+It is strong motivation to record host capture/GPU load in future comparisons
+and establish an OBS-off baseline before changing guest synchronization.
+This comparison does not separate physical GPU contention from host CPU
+scheduling or capture overhead.
+The native 1920×1080 README screenshot is taken after OBS closes.
+
+Astra's source review finds one bounded future candidate: shared external-image
+capture prepares/fences the producer, then immediately fences the same producer
+again under the same command lock. Reusing only that within-call completion
+proof may avoid one redundant wait. Peer fences, copy completion, detach,
+quarantine and lock ownership must remain intact. No such optimization is
+implemented or claimed by this diagnostic pass.
+
+Both review shutdowns drain game/Steam descendants and all audio streams, then
+complete checked filesystem/device flush. The original QEMU launchers exit zero,
+and all four offline filesystem checks pass after both stops. Steam's outer
+wrapper returns status 137 on these shutdowns; this remains a separate follow-up,
+not a zero-exit Steam acceptance. A final read-only offline extraction verifies
+all 33 original-save content hashes after Steam has exited. The native screenshot,
+raw profiles, frame rows, isolated-save inventories and shutdown receipts remain
+private under `build/reviews/stardew-save-startup-20261025/`; only the explicitly
+requested screenshot is published.
+
+
 ## Memory barriers
 
 The original direct startup reports CoreCLR HRESULT 0x8007FF02. A PID-scoped
