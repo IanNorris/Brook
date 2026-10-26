@@ -116,7 +116,42 @@ initializes hardware Venus and renders the full title logo and menu buttons.
 Both runs close with normal WM_DELETE and their native tasks drain before
 the next control. No existing save is opened. This narrows the UI issue to
 the renderer path; it does not claim the OpenGL or resize bug fixed. Vulkan
-input/audio/resize acceptance remains the next native-game check.
+input/audio/resize acceptance was checked next on kernel
+`4e47f74440f0a2f5da43a1ad228da5c54368cff3a61dd5a379fb72c169fa4826`.
+
+The full Vulkan menu renders again. A passive HDA capture contains 135,808
+stereo frames at 44.1 kHz (3.080 seconds), peak 3757/32768 and RMS 0.01820.
+That proves sample delivery, not subjective stutter-free sound. Pointer Options
+and keyboard menu attempts do not establish a successful menu transition;
+input remains unaccepted.
+
+Maximizing does not reproduce the earlier fully black GL window, but the
+composited image initially occupies only its old-size area. After restoring,
+the rendered content has the wrong scale/extent for the restored window.
+XGetGeometry reports the maximized X11 drawable at 1916×996, with nonblack
+source samples across it. This distinguishes source drawing from the displayed
+geometry, but does not identify the faulty stage or fix the resize problem.
+
+Normal WM_DELETE eventually removes the window and native PID 760. Steam
+removes app 599140 from its running list and its tracked launcher 697 exits
+zero. Individual native process statuses are reported as unknown (-1), not
+independently collected zero exit codes. Existing saves were not opened:
+both original Graveyard save contents, original Goose save contents/timestamp,
+and all 33 Stardew contents/non-cloud-marker timestamps remain unchanged.
+
+## Final review closure
+
+After the platform-depot architecture checks, normal Steam shutdown completes
+with collected exit zero, zero live descendants and both output streams at EOF.
+The final original-save checks retain the guarantees above. Checked VM stop
+acknowledges filesystem and device flush; the original launcher exits zero.
+The serial acceptance check and all four offline filesystem checks (boot,
+data, Nix and temporary disks) pass. No forced stop was needed for this review.
+
+This closes the bounded PI/presentation investigation. Remaining native
+Graveyard input/resize and OpenGL UI issues are explicit follow-up work;
+the Goose result uses the isolated Mesa candidate and software X11 presentation,
+not repaired direct cross-capset PRIME import or a default-driver deployment.
 
 Private evidence is retained under the followup and unix-vector reviews and
 `build/workloads/pi-futex-20261026`. Licensed data, raw account-bearing frames

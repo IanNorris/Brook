@@ -1,6 +1,6 @@
 # Next Steam game preflight — 26 October 2026
 
-No additional game payload was downloaded during this preflight. Steam's local
+The initial metadata pass downloaded no additional game payload. Steam's local
 public appinfo launch/depot metadata, cached on 26 October, supplies the launch
 entries below. Metadata is a candidate filter; actual executable headers and
 the launch chain remain the final architecture gate. Linux availability alone,
@@ -70,5 +70,38 @@ The [subsequent PI implementation](pi-futex-implementation.md) and
 [presentation checkpoint](steam-api-and-present-wait-checkpoint.md) supersede
 those initial blockers: native Graveyard gets past PI/Mono initialization,
 and Goose now renders interactive menus with the isolated Mesa candidate.
-Graveyard UI/resize and Goose scene loading remain unaccepted; neither is
-promoted to fully compatible by these diagnostic passes.
+The [stream-write and gameplay checkpoint](unix-stream-writev-checkpoint.md)
+subsequently verifies a new Goose tutorial, input, audio responses and normal
+menu-driven exit. Graveyard Vulkan renders its complete menu and delivers
+audio, but input and resize behavior still need work. Neither result establishes
+full-game compatibility.
+
+## Actual platform-depot checks
+
+The signed-in guest Steam console retrieved only the small platform depots,
+without their common game-content depots. Executable headers were read inside
+the private guest; no downloaded binaries or account material are committed.
+
+- **Half-Life 70, Linux depot 8**, manifest `1360709870205537514`:
+  `hl.sh` sets `GAMEEXE=hl_linux`. That executable is ELF32, machine 3 (i386),
+  SHA256 `090e4e3e97ab6ba8264e0666bd2e2909fa1218a46fb5655872182333fbddc671`.
+  Several accompanying libraries, including `hw.so` and `libsteam_api.so`,
+  are also ELF32. The presence of a separate `engine_amd64.so` does not make
+  the configured client launch chain 64-bit. This path is outside current scope.
+- **Original Left 4 Dead 500, Windows depot 503**, manifest
+  `5156732173895269546`: its `left4dead/bin/client.dll` is PE i386
+  (`Machine=0x14c`, PE32 optional-header magic `0x10b`), SHA256
+  `7612545f68a6b670fb4d4a99a79c69f2d3939ebb80c15c1fd5c2b8c864f4daeb`.
+  The accompanying Bink and CRT DLLs are also PE32. The launcher EXE is not in
+  this platform depot and was not inspected; the actual client DLL already
+  excludes this downloaded client path from a 64-bit-only test. No substitution
+  of Left 4 Dead 2 was made.
+- **Torchlight 41500, Linux depot 41504**: the current Steam console returns
+  `Invalid default manifest (Missing configuration)`. No files were retrieved.
+  Its cached x86_64 launch entry remains metadata, not an available installation.
+
+The first two depots completed with 48 files / 127,612,567 unpacked bytes and
+3 files / 6,634,648 unpacked bytes respectively. No full downloads or launches
+of these three excluded paths were attempted. These findings apply to the
+specific retrieved manifests and configured client paths, not every historical
+version, branch or community port.
