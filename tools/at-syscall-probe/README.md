@@ -1,5 +1,15 @@
 # Guest runtime regression probes
 
+`unixwritecheck.c` compares large shrinking `writev` retries with 32 KiB writes
+over a nonblocking Unix stream. Build with `$MUSL_CC -static -O2 -Wall -Wextra
+-Werror`, strip the owned output if staging through a bounded command bridge,
+then run the **same binary** on Linux and Brook as `unixwritecheck large` and
+`unixwritecheck chunk32k`. Each transfers 8 MiB to a forked reader that checks
+every byte, reports requested versus accepted bytes, short-write/EAGAIN counts,
+write-call and overall durations, and checks the reader's actual exit status.
+A 30-second alarm bounds failure. These are diagnostic timings, not thresholds
+for a noisy host. See [the measured writev change](../../docs/unix-stream-writev-checkpoint.md).
+
 Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:

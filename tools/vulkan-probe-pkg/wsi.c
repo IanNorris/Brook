@@ -14,9 +14,16 @@
 #define CK(value) do {if(!(value)){fprintf(stderr,"WSI_FAIL stage=%s\n",#value);goto cleanup;}}while(0)
 
 int main(int argc, char** argv) {
-    const int destroyWindow=argc==2 && !strcmp(argv[1],"--present-wait-lost-window");
-    const int presentWait=destroyWindow || (argc==2 && !strcmp(argv[1],"--present-wait"));
-    if(argc!=1 && !presentWait){fprintf(stderr,"usage: %s [--present-wait|--present-wait-lost-window]\n",argv[0]);return 2;}
+    int destroyWindow=0,presentWait=0,large=0;
+    for(int i=1;i<argc;++i){
+        if(!strcmp(argv[i],"--present-wait") && !presentWait)presentWait=1;
+        else if(!strcmp(argv[i],"--present-wait-lost-window") && !destroyWindow)destroyWindow=1;
+        else if(!strcmp(argv[i],"--large") && !large)large=1;
+        else{fprintf(stderr,"usage: %s [--present-wait|--present-wait-lost-window] [--large]\n",argv[0]);return 2;}
+    }
+    presentWait=presentWait || destroyWindow || large;
+    const unsigned width=large?1920:320,height=large?1080:240;
+    const unsigned frameCount=large?120:(presentWait?8:4);
     int code=1;Display* display=NULL;Window window=0;
     VkInstance instance=VK_NULL_HANDLE;VkSurfaceKHR surface=VK_NULL_HANDLE;
     VkDevice device=VK_NULL_HANDLE;VkSwapchainKHR swapchain=VK_NULL_HANDLE;
@@ -24,7 +31,7 @@ int main(int argc, char** argv) {
     VkSemaphore* rendered=NULL;uint32_t renderSemaphoreCount=0;
     VkFence fence=VK_NULL_HANDLE;VkImage* images=NULL;
     display=XOpenDisplay(NULL);CK(display);
-    window=XCreateSimpleWindow(display,DefaultRootWindow(display),80,80,320,240,0,0,0);CK(window);
+    window=XCreateSimpleWindow(display,DefaultRootWindow(display),80,80,width,height,0,0,0);CK(window);
     XStoreName(display,window,"Brook Vulkan X11 WSI probe");XMapWindow(display,window);XSync(display,False);
     const char* extensions[]={VK_KHR_SURFACE_EXTENSION_NAME,VK_KHR_XLIB_SURFACE_EXTENSION_NAME};
     VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.pApplicationName="Brook WSI probe",.apiVersion=presentWait?VK_API_VERSION_1_2:VK_API_VERSION_1_1};
@@ -77,8 +84,9 @@ int main(int argc, char** argv) {
     for(uint32_t i=0;i<count;++i)if(formats[i].format==VK_FORMAT_B8G8R8A8_UNORM){format=formats[i];break;}
     free(formats);CK(formatResult==VK_SUCCESS);
     VkExtent2D extent=caps.currentExtent;
-    if(extent.width==UINT32_MAX){extent.width=320;extent.height=240;}
+    if(extent.width==UINT32_MAX){extent.width=width;extent.height=height;}
     CK(extent.width && extent.height && (caps.supportedUsageFlags&VK_IMAGE_USAGE_TRANSFER_DST_BIT));
+    printf("WSI_EXTENT width=%u height=%u frames=%u\n",extent.width,extent.height,frameCount);fflush(stdout);
     uint32_t imageCount=caps.minImageCount+1;
     if(caps.maxImageCount && imageCount>caps.maxImageCount)imageCount=caps.maxImageCount;
     VkCompositeAlphaFlagBitsKHR alpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -102,7 +110,8 @@ int main(int argc, char** argv) {
     for(uint32_t i=0;i<imageCount;++i){VK(vkCreateSemaphore(device,&sem,NULL,&rendered[i]));++renderSemaphoreCount;}
     VkFenceCreateInfo fi={.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};VK(vkCreateFence(device,&fi,NULL,&fence));
     const uint32_t expected[]={0xff0000,0x00ff00,0x0000ff,0xffffff};
-    for(unsigned frame=0;frame<(presentWait?8u:4u);++frame) {
+    for(unsigned frame=0;frame<frameCount;++frame) {
+        struct timespec frameStart;CK(clock_gettime(CLOCK_MONOTONIC,&frameStart)==0);
         uint32_t image;VK(vkAcquireNextImageKHR(device,swapchain,2000000000ULL,acquired,VK_NULL_HANDLE,&image));
         CK(image<imageCount);VK(vkResetCommandBuffer(command,0));
         VkCommandBufferBeginInfo begin={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -155,6 +164,9 @@ int main(int argc, char** argv) {
             CK(completed==VK_SUCCESS);
         }
         VK(vkResetFences(device,1,&fence));
+        struct timespec frameEnd;CK(clock_gettime(CLOCK_MONOTONIC,&frameEnd)==0);
+        const int64_t elapsed=(int64_t)(frameEnd.tv_sec-frameStart.tv_sec)*1000000000+(frameEnd.tv_nsec-frameStart.tv_nsec);
+        printf("WSI_FRAME_TIME frame=%u elapsed_ns=%lld\n",frame,(long long)elapsed);fflush(stdout);
     }
     puts("WSI_PASS");code=0;
 cleanup:

@@ -4592,6 +4592,8 @@ static int64_t UnixRecordVectorIo(FdEntry* entry,uint64_t address,uint64_t count
     return result;
 }
 
+#include "unix_stream_vector.inc"
+
 static int64_t PipeVectorIo(Process* proc,FdEntry* entry,uint64_t fd,
                             uint64_t address,uint64_t count,bool writing)
 {
@@ -4685,6 +4687,8 @@ static int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
     if(entry->type==FdType::NetlinkSocket)return NetlinkVectorIo(static_cast<NetlinkSocket*>(entry->handle),iovAddr,iovcnt,true);
     if(entry->type==FdType::UnixSocket && static_cast<UnixSocketData*>(entry->handle)->socketType==5)
         return UnixRecordVectorIo(entry,iovAddr,iovcnt,true);
+    if(entry->type==FdType::UnixSocket && static_cast<UnixSocketData*>(entry->handle)->socketType==1)
+        return UnixStreamWriteVector(entry,iovAddr,iovcnt);
     if(FdPipe(entry) && (entry->statusFlags&0x4000))
         return PipeVectorIo(proc,entry,fd,iovAddr,iovcnt,true);
     if (entry->type == FdType::Vnode && entry->handle && (entry->statusFlags & 0x400)) {

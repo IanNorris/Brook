@@ -31,6 +31,9 @@ Build `tools/vulkan-probe-pkg` and run its `vulkan-wsi-probe` using the candidat
   finite completion waits and zero-time waits after completion.
 - `--present-wait-lost-window`: destroy the window before presentation and
   require surface-lost/out-of-date rather than false successful completion.
+- `--large`: 120 full-HD frames with present-ID completion and exact pixels,
+  reporting guest monotonic per-frame durations. This serializes GPU idle,
+  X11 readback and present waits; it is not a game FPS benchmark.
 
 Keep an external observer/deadline. Probe success does not establish game
 rendering, audio or clean-exit acceptance. See the
