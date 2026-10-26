@@ -53,3 +53,15 @@ manifest-only retrieval; anonymous access is not guaranteed for licensed depots.
 Keep any authentication and retrieved binaries private. A mandatory 32-bit
 engine or helper puts that launch path outside the current 64-bit-only scope.
 [Upstream retrieval options](https://github.com/SteamRE/DepotDownloader#usage).
+
+## Bounded test results
+
+Both selected games' installed launch chains were verified 64-bit. Graveyard
+Keeper's native Unity player ignores ENOTSUP from a recursive PI mutex
+initialization and then blocks locking that mutex. Untitled Goose Game passes
+Wine's original preloader after the interpreter-less PIE placement fix, but its
+X11 Vulkan presentation fails by default; an explicit software-presentation
+control creates a white, silent window and does not complete normal close.
+Neither game is marked compatible. See [measurements and diagnostic controls](loading-throughput-20261026.md)
+for evidence, limitations and save-preservation checks. Full PI futex support
+and the Proton presentation/stall remain separate follow-up work.

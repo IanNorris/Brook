@@ -312,3 +312,54 @@ passes through both direct creation and guest execve: entry
 with `STATICPIE_RESERVE_PASS`. Auxv, initialized data/BSS, brk grow/restore,
 anonymous mmap and execution after the low fixed reservation all pass.
 The original unmodified Wine preloader is the subsequent workload control.
+
+## Restored Proton launch and presentation controls
+
+With the high-placement kernel, the original Proton 11 preloader runs without
+modification. Untitled Goose Game reaches Unity 2018.4 initialization, creates
+its D3D11 device on Intel UHD 630 through Venus, initializes input, loads assets
+and connects to Steam. This validates progress past the earlier loader fault;
+it does not establish game compatibility.
+
+The default X11 presentation path repeatedly fails Vulkan swapchain creation
+with `VK_ERROR_INITIALIZATION_FAILED`. A separate control explicitly sets
+`MESA_VK_WSI_DEBUG=sw,noshm` on the Steam client. That removes the swapchain
+errors and creates a native game window, but the game remains white and silent.
+The effective game environment is recorded before interpreting this result:
+putting the setting only in Proton's `user_settings.py` did not override Brook's
+existing empty environment key, because that Proton mechanism supplies defaults
+only for absent keys. No production environment policy was changed.
+
+Stock Proton Experimental 11 in this image has no Wine Wayland driver. The
+attempted Wayland setup failed before changing the configuration; a subsequent
+X11 launch is explicitly excluded as a Wayland test. The helper now propagates
+guest setup failures to prevent dependent launches after such failures.
+
+The presenting X11 control remains white after explicit X11 focus and native
+maximize. Direct X11 image reads from both the game window and its render child
+also return white, placing that symptom before Brook composition. A three-second
+audio capture is silent. The main thread waits in Wine's reply-pipe readv; worker
+stacks mostly wait in pipes or futexes, with wineserver waiting in epoll. A later
+check finds the address-space mutex unlocked, so transient mapping-lock waits
+are not evidence of a kernel deadlock. There is no justified pipe or compositor
+repair from these stacks alone. An inventory found no installed native Vulkan
+probe at the known paths, so no additional high-address Vulkan control was run.
+
+The game ignores its final normal WM_DELETE request; a targeted termination is
+required. Neither a playable scene nor clean game exit is accepted. These
+presentation and stall issues remain separate follow-up work, alongside real
+PI-futex support for Graveyard Keeper. The bounded investigation stops here
+rather than introducing a speculative synchronization or graphics rewrite.
+
+Final save checks retain all 33 original Stardew save-file contents and every
+non-marker file's timestamp; Steam's cloud marker timestamp changed. Goose's
+existing cloud save retains both contents and timestamp. No existing game save
+was opened during these new-game tests. All game files, logs, account details
+and unredacted screenshots remain private and excluded from git.
+
+The final Steam operation completes with exit zero and zero live tasks. The
+audio mixer reports no streams. Checked VM shutdown confirms filesystem and
+device flush; the original launcher exits zero and all four offline filesystem
+checks (boot, data, nix and tmp) return zero. The work remains on
+`wip/loading-throughput-20261026`; these new-game results do not promote either
+title to the compatibility list.
