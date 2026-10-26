@@ -295,7 +295,7 @@ static int store_path_healthy(const char *store_name) {
         snprintf(path, sizeof(path), "%s/%s", bin_dir, ent->d_name);
         if (stat(path, &st) != 0)
             continue;
-        if (!S_ISREG(st.st_mode))
+        if (!S_ISREG(st.st_mode) || !(st.st_mode & 0111))
             continue;
 
         if (!elf_file_healthy(path)) {

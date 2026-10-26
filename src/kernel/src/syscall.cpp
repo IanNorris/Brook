@@ -8065,21 +8065,47 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
     return -EBADF;
 }
 
+static int FillCurrentDirectoryStat(LinuxStat* result)
+{
+    FsSnapshot fs{};
+    int error = ProcessFsSnapshot(ProcessCurrent(), &fs);
+    if (error) return error;
+    VnodeStat metadata{};
+    error = VfsPathStat(fs.cwd, &metadata);
+    FsSnapshotRelease(&fs);
+    if (error) return error;
+    FillStat(result, metadata);
+    return 0;
+}
+
 static int64_t sys_newfstatat(uint64_t dirfd, uint64_t pathAddr, uint64_t statAddr,
                                uint64_t flags, uint64_t, uint64_t)
 {
-    char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf)))
-    {
-        // Empty path or copy failure — try fstat on dirfd
-        if (!pathAddr) return sys_fstat(dirfd, statAddr, 0, 0, 0, 0);
-        return -EFAULT;
-    }
-    const char* path = pathBuf;
-    if (path[0] == '\0')
-        return sys_fstat(dirfd, statAddr, 0, 0, 0, 0);
-
     static constexpr uint64_t AT_SYMLINK_NOFOLLOW = 0x100;
+    static constexpr uint64_t AT_NO_AUTOMOUNT = 0x800;
+    static constexpr uint64_t AT_EMPTY_PATH = 0x1000;
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH))
+        return -EINVAL;
+    char pathBuf[256];
+    // Linux 6.12 accepts NULL for its real-descriptor empty-path fast path.
+    // NULL with AT_FDCWD still faults; an empty string can name the cwd.
+    if (!pathAddr)
+        return flags == AT_EMPTY_PATH && static_cast<int>(dirfd) != -100
+            ? sys_fstat(dirfd, statAddr, 0, 0, 0, 0) : -EFAULT;
+    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf)))
+        return -EFAULT;
+    const char* path = pathBuf;
+    if (path[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH)) return -ENOENT;
+        if (static_cast<int>(dirfd) == -100) {
+            LinuxStat metadata;
+            if (int error = FillCurrentDirectoryStat(&metadata)) return error;
+            return CopyToUserBytes(statAddr, &metadata, sizeof(metadata)) == sizeof(metadata)
+                ? 0 : -EFAULT;
+        }
+        return sys_fstat(dirfd, statAddr, 0, 0, 0, 0);
+    }
+
     bool noFollow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
 
     if(noFollow)return do_lstat_internal(path,statAddr,static_cast<int>(dirfd));
@@ -10863,9 +10889,19 @@ struct linux_statx {
 static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
                           uint64_t mask, uint64_t bufAddr, uint64_t)
 {
-    (void)mask;
+    static constexpr uint64_t AT_EMPTY_PATH = 0x1000;
+    static constexpr uint64_t AT_NO_AUTOMOUNT = 0x800;
+    static constexpr uint64_t AT_STATX_SYNC_TYPE = 0x6000;
+    if ((mask & 0x80000000) || (flags & AT_STATX_SYNC_TYPE) == AT_STATX_SYNC_TYPE ||
+        (flags & ~(0x100 | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE)))
+        return -EINVAL;
     char pathBuf[256];
-    if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
+    if (!pathAddr) {
+        if ((flags & ~(AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE)) != AT_EMPTY_PATH ||
+            static_cast<int>(dirfd) == -100)
+            return -EFAULT;
+        pathBuf[0] = '\0';
+    } else if (!CopyUserCString(pathAddr, pathBuf, sizeof(pathBuf))) return -EFAULT;
     if (!UserBufferWritable(bufAddr, sizeof(linux_statx))) return -EFAULT;
     const char* path = pathBuf;
     auto* stx = reinterpret_cast<linux_statx*>(bufAddr);
@@ -10894,12 +10930,13 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
         stx->stx_mtime.tv_nsec = static_cast<uint32_t>(st.st_mtime_nsec);
     };
 
-    static constexpr uint64_t AT_EMPTY_PATH = 0x1000;
     if (path[0] == '\0')
     {
         if (!(flags & AT_EMPTY_PATH)) return -ENOENT;
         LinuxStat st;
-        int64_t ret = sys_fstat(dirfd, reinterpret_cast<uint64_t>(&st), 0, 0, 0, 0);
+        int64_t ret = static_cast<int>(dirfd) == -100
+            ? FillCurrentDirectoryStat(&st)
+            : sys_fstat(dirfd, reinterpret_cast<uint64_t>(&st), 0, 0, 0, 0);
         if (ret < 0) return ret;
         fillStatxFromLinuxStat(st);
         return 0;

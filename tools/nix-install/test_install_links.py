@@ -65,6 +65,19 @@ class InstallLinkTests(unittest.TestCase):
         self.links()[0].unlink();self.install()
         self.assertTrue(self.links()[0].is_file())
 
+    def test_nonexecutable_elf_debug_artifact_does_not_trigger_repair(self):
+        debug=self.package/'bin/tool.debug'
+        # Debug-only ELF files retain load headers without their load data;
+        # they are not corrupt executables and must not force a re-download.
+        debug.write_bytes(b'\x7fELF'+bytes(124));debug.chmod(0o644)
+        self.install()
+        result=self.install()
+        self.assertNotIn(b'corrupt ELF',result.stderr)
+        self.assertNotIn(b'incomplete; repairing',result.stdout)
+        debug.chmod(0o755)
+        # The same damaged file *as an executable* still enters repair.
+        self.assertIn(b'corrupt ELF',self.install().stderr)
+
     def test_each_link_class_failure_is_reported_and_retry_repairs(self):
         for relative in ['bin/tool','lib/libfixture.so','share/applications/fixture.desktop']:
             with self.subTest(relative=relative):
