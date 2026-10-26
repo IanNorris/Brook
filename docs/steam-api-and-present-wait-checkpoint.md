@@ -115,6 +115,12 @@ flush; the original launcher exits zero. This review's serial check and all
 four offline filesystem checks pass. Original Stardew, Goose and retained
 Graveyard save checks retain the content/timestamp guarantees listed below.
 
+The subsequent [large stream-write checkpoint](unix-stream-writev-checkpoint.md)
+records a measured Unix writev improvement and a verified empty-slot Goose
+tutorial run with movement, honk/audio responses and normal menu-driven exit.
+That supersedes the earlier new-game acceptance gap, while older-save loading
+and full-game coverage remain unverified.
+
 ## Review closure
 
 Diagnostic Proton settings were restored byte-for-byte. Stalled game cleanup

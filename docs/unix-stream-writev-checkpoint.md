@@ -69,8 +69,54 @@ Steam Store background in separate private reviews. All frames pass.
 
 These include acquire, GPU commands/idle, X11 readback and present completion.
 They measure this serialized control, not game FPS or an isolated syscall's
-cost. Host load and client content can vary. Game scene-loading acceptance
-still requires a real retry; this measurement does not claim it fixed.
+cost. Host load and client content can vary. These native measurements alone
+do not establish game scene-loading acceptance.
+
+## Original-game retry
+
+Goose is launched normally through Steam with the original executable, API DLL
+and restored Proton settings. The new-game test explicitly verifies **Save 02,
+Empty** before confirmation, leaving the existing Save 01 untouched. It reaches
+the rendered tutorial, responds to the prompted Space honk, and accepts
+mouse-directed movement out of the starting bush onto the path. Camera motion,
+the goose model and the movement tutorial render correctly.
+
+A passive 44.1 kHz stereo HDA capture records three honk keypresses. The capture
+contains 5.053 seconds of samples over 5.055 host seconds. Before input its RMS
+is 0.00247 and peak 309/32768; the three response windows have RMS
+0.02710/0.02390/0.02467 and peaks 8957/6958/8979. This establishes audio delivery
+and input-correlated responses, not a subjective stutter-free playback verdict.
+
+The game's pause-menu Quit dialog reports progress saved and returns to the
+title. The title-menu Quit and its Yes confirmation remove the window and
+known main PID 561. Steam removes the app from its running list; its tracked
+launcher PID 410 returns zero. Individual Wine statuses remain unknown (-1 in
+Steam's tracking log), not independently collected direct process exit codes.
+Original Goose save contents/timestamp, the 33 original Stardew file contents
+and non-cloud-marker timestamps, and both retained Graveyard save contents
+remain unchanged after the gameplay save-and-quit path.
+
+Loading is still slow. The earlier loading attempt did not verify the selected
+slot, so this successful new-save run does **not** prove that the stream change
+alone fixed the same old-save scenario. Older Goose saves, long sessions and
+full-game coverage remain unverified. No licensed binary or save is modified
+or submitted to obtain this result.
+
+The review uses a relative PS/2 pointer. An attempted absolute QMP movement
+correctly reports no handler; relative input and a guest XQueryPointer readback
+allow the movement test. Bridge coordinate actions should discover this
+capability and provide a relative fallback or an explicit unsupported result.
+
+## Native Graveyard renderer control
+
+On the preceding kernel, normal Steam launches at the same 1280×720 size give
+different results: OpenGL renders only the title background, while
+`-force-vulkan -screen-width 1280 -screen-height 720 -screen-fullscreen 0`
+initializes hardware Venus and renders the full title logo and menu buttons.
+Both runs close with normal WM_DELETE and their native tasks drain before
+the next control. No existing save is opened. This narrows the UI issue to
+the renderer path; it does not claim the OpenGL or resize bug fixed. Vulkan
+input/audio/resize acceptance remains the next native-game check.
 
 Private evidence is retained under the followup and unix-vector reviews and
 `build/workloads/pi-futex-20261026`. Licensed data, raw account-bearing frames
