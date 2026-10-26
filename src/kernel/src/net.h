@@ -3,6 +3,7 @@
 // Minimal network stack: Ethernet, ARP, IPv4, ICMP, UDP, TCP.
 
 #pragma once
+#include "netlink_route.h"
 #include "socket_identity.h"
 #include "spinlock.h"
 
@@ -201,6 +202,12 @@ NetIf* NetGetIf();
 // Total registered interface count and accessor.
 uint32_t NetIfCount();
 NetIf* NetIfAt(uint32_t idx);
+// Coherent, bounded read-only interface view, including the working loopback.
+// Names/indices remain stable for the lifetime of the registered interface.
+uint32_t NetInterfaceViews(InterfaceView* out,uint32_t capacity);
+SocketIdentity NetAllocateSocketIdentity(uint32_t uid,uint32_t gid);
+// Caller protects the handle with an FD reference/lock; identity is immutable.
+bool NetlinkGetIdentity(void* handle,SocketIdentity* out);
 
 // Socket table accessors for procfs.
 struct SocketSnapshot {

@@ -52,6 +52,8 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_netlink_route)
+add_host_test(test_netlink_endpoint)
 add_host_test(test_signal_fp_state)
 target_compile_options(test_signal_fp_state PRIVATE -UNDEBUG)
 add_host_test(test_process_socket_metadata)

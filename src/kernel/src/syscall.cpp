@@ -1960,9 +1960,13 @@ static int64_t AppendUserBuffer(Vnode* vn, uint64_t address, uint64_t count, uin
     return result;
 }
 
+#include "syscall_netlink.inc"
+
 static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
                                      uint64_t bufAddr,uint64_t count,bool userSource)
 {
+    if(fde->type==FdType::NetlinkSocket)
+        return NetlinkSend(static_cast<NetlinkSocket*>(fde->handle),bufAddr,count,0,0,0,userSource);
     // Debug serial writes directly, bypassing the async ring buffer.
     // Hold the serial lock across the entire write so multi-CPU output
     // doesn't interleave character-by-character.
@@ -2774,6 +2778,9 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                 return -EINTR;
         }
     }
+
+    if(fde->type==FdType::NetlinkSocket)
+        return count?NetlinkReadUser(static_cast<NetlinkSocket*>(fde->handle),bufAddr,count,0):0;
 
     // Read from socket (TCP stream or connected UDP)
     if (fde->type == FdType::Socket && fde->handle)
@@ -3717,6 +3724,7 @@ void FinalizeClosedFd(const FdClaimResult& c)
         brook::SockUnref(sockIdx);
     }
 
+    if(c.type==FdType::NetlinkSocket && c.handle)NetlinkUnref(static_cast<NetlinkSocket*>(c.handle));
     if (c.type == FdType::SignalFd && c.handle) SignalFdUnref(static_cast<SignalFd*>(c.handle));
     if (c.type == FdType::SyncFile && c.handle) SyncFileUnref(static_cast<SyncFileData*>(c.handle));
 
@@ -3953,6 +3961,8 @@ static void FdBumpRefcount(const FdEntry* fde)
         brook::SockRef(sockIdx);
         break;
     }
+    case FdType::NetlinkSocket:
+        NetlinkRef(static_cast<NetlinkSocket*>(fde->handle));break;
     case FdType::MemFd:
         MemFdRef(static_cast<MemFdData*>(fde->handle));
         break;
@@ -4640,6 +4650,7 @@ static int64_t sys_readv(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
     const auto* iov = reinterpret_cast<const iovec*>(iovAddr);
     Process* proc=ProcessCurrent();FdRef entry(proc,static_cast<int>(fd));
     if(!entry)return -EBADF;
+    if(entry->type==FdType::NetlinkSocket)return NetlinkVectorIo(static_cast<NetlinkSocket*>(entry->handle),iovAddr,iovcnt,false);
     // One readv consumes one packet even across mode changes and iovecs.
     if(FdPipe(entry.get()))
         return PipeVectorIo(proc,entry.get(),fd,iovAddr,iovcnt,false);
@@ -4671,6 +4682,7 @@ static int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
     FdRef ref(proc, static_cast<int>(fd));
     if (!ref) return -EBADF;
     auto* entry = ref.get();
+    if(entry->type==FdType::NetlinkSocket)return NetlinkVectorIo(static_cast<NetlinkSocket*>(entry->handle),iovAddr,iovcnt,true);
     if(entry->type==FdType::UnixSocket && static_cast<UnixSocketData*>(entry->handle)->socketType==5)
         return UnixRecordVectorIo(entry,iovAddr,iovcnt,true);
     if(FdPipe(entry) && (entry->statusFlags&0x4000))
@@ -6885,6 +6897,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     FdEntry* fde = ref.get();
     if (!fde || fde->type==FdType::Path) return -EBADF;
 
+    if((fde->type==FdType::Socket || fde->type==FdType::UnixSocket || fde->type==FdType::NetlinkSocket) && ((cmd>=0x8910 && cmd<=0x891b) || cmd==0x8921 || cmd==0x8927 || cmd==0x8933))
+        return NetlinkInterfaceIoctl(cmd,arg);
     if(fde->type==FdType::Vnode && fde->handle && static_cast<Vnode*>(fde->handle)->type==VnodeType::Namespace)
         return cmd==0xb703?0x20000:-25; // NS_GET_NSTYPE; other namespace ioctls unsupported.
     if(fde->type==FdType::SyncFile) {
@@ -6956,13 +6970,15 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
     {
         if (!UserBufferReadable(arg, sizeof(int))) return -EFAULT;
         bool nonblock = *reinterpret_cast<int*>(arg) != 0;
-        if (fde->type == FdType::Socket || fde->type == FdType::UnixSocket ||
+        if (fde->type == FdType::Socket || fde->type == FdType::NetlinkSocket || fde->type == FdType::UnixSocket ||
             FdPipe(fde) || fde->type == FdType::DevTty || fde->type == FdType::DevDsp) {
             SpinLockAcquire(ProcessFdLock(proc));
             if (nonblock)
                 fde->statusFlags |= 0x800; // O_NONBLOCK
             else
                 fde->statusFlags &= ~0x800u;
+            if(fde->type==FdType::NetlinkSocket && fde->handle)
+                __atomic_store_n(&static_cast<NetlinkSocket*>(fde->handle)->nonblock,nonblock,__ATOMIC_RELEASE);
             if (fde->type == FdType::UnixSocket && fde->handle)
                 static_cast<UnixSocketData*>(fde->handle)->nonblock = nonblock;
             if (fde->type == FdType::Socket && fde->handle)
@@ -6984,6 +7000,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t cmd_raw, uint64_t arg,
             if (usd->state != UnixSocketData::State::Connected || !usd->rxPipe)
                 return -ENOTCONN;
             available = static_cast<int>(usd->rxPipe->count());
+        } else if(fde->type==FdType::NetlinkSocket && fde->handle) {
+            available=static_cast<int>(NetlinkAvailable(static_cast<NetlinkSocket*>(fde->handle)));
         } else if (fde->type == FdType::Socket && fde->handle) {
             available = 0;
         } else {
@@ -7971,12 +7989,13 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         return 0;
     }
 
-    if (fde->type == FdType::Socket) {
+    if (fde->type == FdType::Socket || fde->type==FdType::NetlinkSocket) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         brook::SocketIdentity identity{};
         const int index = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
-        if (!brook::SockGetIdentity(index, &identity)) return -EBADF;
+        if(fde->type==FdType::NetlinkSocket)identity=static_cast<NetlinkSocket*>(fde->handle)->identity;
+        else if (!brook::SockGetIdentity(index, &identity)) return -EBADF;
         st->st_ino = identity.inode;
         st->st_uid = ProcessReportId(ProcessCurrent(), false, identity.uid);
         st->st_gid = ProcessReportId(ProcessCurrent(), true, identity.gid);
@@ -8654,6 +8673,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
             const int index = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
             status = (status & ~0x800u) | (brook::SockIsNonblock(index) ? 0x800u : 0);
         }
+        if(fde->type==FdType::NetlinkSocket)status=(status&~0x800u)|(__atomic_load_n(&static_cast<NetlinkSocket*>(fde->handle)->nonblock,__ATOMIC_ACQUIRE)?0x800u:0u);
         SpinLockRelease(ProcessFdLock(proc));
         return status;
     }
@@ -8665,6 +8685,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg,
         // Access mode bits (O_RDONLY/O_WRONLY/O_RDWR) are preserved from open.
         SpinLockAcquire(ProcessFdLock(proc));
         fde->statusFlags = (fde->statusFlags & 0x3) | (static_cast<uint32_t>(arg) & ~0x3u);
+        if(fde->type==FdType::NetlinkSocket)__atomic_store_n(&static_cast<NetlinkSocket*>(fde->handle)->nonblock,(fde->statusFlags&0x800)!=0,__ATOMIC_RELEASE);
         if (fde->type == FdType::Socket && fde->handle)
             brook::SockSetNonblock(static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1,
                                   (fde->statusFlags & 0x800) != 0);
@@ -8833,6 +8854,10 @@ retry_poll:
             continue;
         }
 
+        if(fde->type==FdType::NetlinkSocket) {
+            fds[i].revents=static_cast<int16_t>(NetlinkReady(static_cast<NetlinkSocket*>(fde->handle),fds[i].events));
+            if(fds[i].revents)++ready;continue;
+        }
         // Socket: check TCP/UDP readiness
         if (fde->type == FdType::Socket && fde->handle)
         {
@@ -8959,6 +8984,7 @@ retry_poll:
         // For pipe FDs, register as waiter on the pipe
         uint64_t waiterCap = nfds;
         uint64_t safetyMs = 50;
+        NetlinkWaitGroup netlinkWaiters;
         TimerWaitGroup timerWaiters;
         PipePollGroup pipeWaiters;
         // Allocate pipe subscriptions before installing legacy wait hooks, so
@@ -8968,6 +8994,7 @@ retry_poll:
             FdRef fde_ref(proc, fds[i].fd);
             FdEntry* fde = fde_ref.get();
             if (!fde) continue;
+            if(fde->type==FdType::NetlinkSocket && !netlinkWaiters.add(static_cast<NetlinkSocket*>(fde->handle),self))return -ENOMEM;
             if(FdNamedFifo(fde)) {
                 if(!pipeWaiters.add(FdPipe(fde),self,fds[i].events|POLLHUP|POLLERR))return -ENOMEM;
             }
@@ -9040,6 +9067,7 @@ retry_poll:
             { ready++; break; }
             if (fde->type == FdType::DevKeyboard && (fds[i].events & POLLIN) && InputHasEvents())
             { ready++; break; }
+            if(fde->type==FdType::NetlinkSocket && NetlinkReady(static_cast<NetlinkSocket*>(fde->handle),fds[i].events)){++ready;break;}
             if(FdNamedFifo(fde) && NamedFifoReady(fde,fds[i].events)) {ready++;break;}
             if (fde->type == FdType::Pipe && fde->handle && (fds[i].events & POLLIN))
             {
@@ -9447,6 +9475,7 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
     // do not feed libuv orphan ERR|HUP notifications forever after close.
     if (!fde) return 0;
 
+    if(fde->type==FdType::NetlinkSocket)return NetlinkReady(static_cast<NetlinkSocket*>(fde->handle),events);
     if(FdNamedFifo(fde))return NamedFifoReady(fde,events);
     if(fde->type==FdType::SyncFile && fde->handle)return SyncFileReady(events);
     if(fde->type==FdType::SignalFd && fde->handle)
@@ -9829,6 +9858,7 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
             walk->clearMemo();
             walk->collect(ep);
         }
+        NetlinkWaitGroup netlinkWaiters;
         TimerWaitGroup timerWaiters;
         PipePollGroup namedWaiters;bool namedWaitFailed=false;
         auto registerWaiters = [&]() {
@@ -9836,7 +9866,9 @@ static int64_t epoll_wait_impl(Process* proc, EpollInstance* ep,
                 FdEntry* fde = walk->pins[wfd];
                 if (!walk->masks[wfd]) continue;
                 if (!fde || !fde->handle) continue;
-                if(FdNamedFifo(fde)) {
+                if(fde->type==FdType::NetlinkSocket) {
+                    if(!netlinkWaiters.add(static_cast<NetlinkSocket*>(fde->handle),proc))namedWaitFailed=true;
+                } else if(FdNamedFifo(fde)) {
                     if(!namedWaiters.add(FdPipe(fde),proc,walk->masks[wfd]|16|8))namedWaitFailed=true;
                 } else if (fde->type == FdType::Pipe) {
                     static_cast<PipeBuffer*>(fde->handle)->epollWaiter = proc;
@@ -13319,6 +13351,22 @@ static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
 
     DbgPrintf("sys_socket: domain=%lu type=%lu proto=%lu\n", domain, type, protocol);
 
+    if(domain==16) {
+        if(protocol!=0)return -93;
+        if((type&~uint64_t(0x800|0x80000|0xf)) || ((type&0xf)!=2 && (type&0xf)!=3))return -EINVAL;
+        auto* socket=static_cast<NetlinkSocket*>(kmalloc(sizeof(NetlinkSocket)));
+        if(!socket)return -ENOMEM;
+        *socket=NetlinkSocket{};
+        const auto actor=ProcessFileActorAcquire(proc,nullptr);
+        socket->identity=NetAllocateSocketIdentity(actor.uid,actor.gid);ProcessGroupsRelease(actor.groups);
+        if(!socket->identity.inode){kfree(socket);return -ENOMEM;}
+        socket->type=type&0xf;socket->nonblock=(type&0x800)!=0;
+        SpinLockAcquire(&g_netlinkRegistryLock);socket->next=g_netlinkSockets;g_netlinkSockets=socket;SpinLockRelease(&g_netlinkRegistryLock);
+        FdEntry entry{};entry.type=FdType::NetlinkSocket;entry.handle=socket;entry.statusFlags=2|(type&0x800);entry.fdFlags=(type&0x80000)?1:0;
+        SocketIdentityLabel(socket->identity.inode,entry.dirPath,sizeof(entry.dirPath));
+        int result=FdTablePublishOwned(proc->fds,ProcessFdLock(proc),entry,0,-1,nullptr);
+        if(result<0){NetlinkUnref(socket);return -EMFILE;}return result;
+    }
     if (domain == AF_UNIX) {
         auto* usd = static_cast<UnixSocketData*>(kmalloc(sizeof(UnixSocketData)));
         if (!usd) return -ENOMEM;
@@ -13430,6 +13478,12 @@ static int64_t sys_bind(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
         return 0;
     }
 
+    if(fde && fde->type==FdType::NetlinkSocket) {
+        if(addrLen<sizeof(RouteAddress))return -EINVAL;
+        RouteAddress address{};if(!CopyFromUser(&address,addrVal,sizeof(address)))return -EFAULT;
+        if(address.family!=16)return -EINVAL;if(address.groups)return -95;
+        return NetlinkBind(static_cast<NetlinkSocket*>(fde->handle),address.port);
+    }
     int sockIdx = GetSockIdx(proc, fd);
     if (sockIdx < 0) return -EBADF;
 
@@ -13451,6 +13505,11 @@ static int64_t sys_connect(uint64_t fdVal, uint64_t addrVal, uint64_t addrLen,
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, fd);
     FdEntry* fde = descriptor.get();
+    if(fde && fde->type==FdType::NetlinkSocket) {
+        if(int e=NetlinkDestination(addrVal,addrLen,false))return e;
+        auto* socket=static_cast<NetlinkSocket*>(fde->handle);if(int e=NetlinkBind(socket,0,true))return e;
+        __atomic_store_n(&socket->connected,true,__ATOMIC_RELEASE);return 0;
+    }
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         UnixNameGuard nameGuard;
@@ -13597,6 +13656,7 @@ static int64_t sys_sendto(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     if (!fde || fde->type == FdType::Path) return -EBADF;
     // Libraries use ENOTSOCK to fall back from send(MSG_NOSIGNAL) to write
     // on valid pipe/eventfd/file descriptors (for example PulseAudio pa_write).
+    if(fde->type==FdType::NetlinkSocket)return NetlinkSend(static_cast<NetlinkSocket*>(fde->handle),bufVal,lenVal,flagsVal,destVal,addrLenVal);
     if (fde->type != FdType::UnixSocket && fde->type != FdType::Socket)
         return -ENOTSOCK;
     if (fde && fde->type == FdType::UnixSocket) {
@@ -13640,6 +13700,7 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
     FdRef descriptor(proc, fd);
     FdEntry* fde = descriptor.get();
     if (!fde || fde->type == FdType::Path) return -EBADF;
+    if(fde->type==FdType::NetlinkSocket)return NetlinkReadUser(static_cast<NetlinkSocket*>(fde->handle),bufVal,lenVal,flagsVal,srcVal,addrLenVal);
     if (fde->type != FdType::UnixSocket && fde->type != FdType::Socket)
         return -ENOTSOCK;
     if (fde && fde->type == FdType::UnixSocket) {
@@ -13705,6 +13766,14 @@ static int64_t sys_setsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t option
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, static_cast<int>(fdVal));
     if (!descriptor) return -EBADF;
+    if(descriptor->type==FdType::NetlinkSocket) {
+        if(levelVal!=1 || optionVal!=8)return -92;
+        int32_t value=0;if(length<4)return -EINVAL;if(!CopyFromUser(&value,valueAddr,4))return -EFAULT;
+        if(value<0)return -EINVAL;
+        uint32_t limit=static_cast<uint32_t>(value);if(limit<4096)limit=4096;if(limit>1048576)limit=1048576;
+        auto* socket=static_cast<NetlinkSocket*>(descriptor->handle);
+        SpinLockAcquire(&socket->lock);socket->receiveLimit=2*limit;SpinLockRelease(&socket->lock);return 0;
+    }
     if (descriptor->type != FdType::UnixSocket && descriptor->type != FdType::Socket) return -88;
     if (descriptor->type == FdType::UnixSocket && levelVal == 1 && optionVal == 16) {
         if (length < sizeof(int32_t)) return -EINVAL;
@@ -13725,6 +13794,14 @@ static int64_t sys_getsockopt(uint64_t fdVal, uint64_t levelVal, uint64_t optnam
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, static_cast<int>(fdVal));
     if (!descriptor) return -EBADF;
+    if(descriptor->type==FdType::NetlinkSocket) {
+        if(levelVal!=1)return -92;
+        auto* socket=static_cast<NetlinkSocket*>(descriptor->handle);int32_t value=0;
+        switch(optnameVal){case 3:value=socket->type;break;case 4:value=0;break;case 8:SpinLockAcquire(&socket->lock);value=socket->receiveLimit;SpinLockRelease(&socket->lock);break;case 38:value=0;break;case 39:value=16;break;default:return -92;}
+        uint32_t length=0;if(!CopyFromUser(&length,optlenAddr,4))return -EFAULT;if(length>0x7fffffffu)return -EINVAL;
+        uint32_t copied=length<4?length:4;
+        if((copied && !CopyToUser(optvalAddr,&value,copied)) || !CopyToUser(optlenAddr,&copied,4))return -EFAULT;return 0;
+    }
     FdEntry* entry = descriptor.get();
     if (entry->type != FdType::UnixSocket && entry->type != FdType::Socket)
         return -88; // ENOTSOCK
@@ -13838,6 +13915,7 @@ static int64_t sys_getsockname(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc,static_cast<int>(fdVal));
     if (!descriptor) return -EBADF;
+    if(descriptor->type==FdType::NetlinkSocket)return NetlinkCopyName(__atomic_load_n(&static_cast<NetlinkSocket*>(descriptor->handle)->port,__ATOMIC_ACQUIRE),addrVal,addrLenVal);
     if (descriptor->type==FdType::UnixSocket && descriptor->handle) {
         return UnixSocketName(static_cast<UnixSocketData*>(descriptor->handle),false,addrVal,addrLenVal);
     }
@@ -13877,6 +13955,7 @@ static int64_t sys_getpeername(uint64_t fdVal, uint64_t addrVal, uint64_t addrLe
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc,static_cast<int>(fdVal));
     if(!descriptor)return -EBADF;
+    if(descriptor->type==FdType::NetlinkSocket){if(!__atomic_load_n(&static_cast<NetlinkSocket*>(descriptor->handle)->connected,__ATOMIC_ACQUIRE))return -ENOTCONN;return NetlinkCopyName(0,addrVal,addrLenVal);}
     if(descriptor->type==FdType::UnixSocket && descriptor->handle)
         return UnixSocketName(static_cast<UnixSocketData*>(descriptor->handle),true,addrVal,addrLenVal);
     if(descriptor->type!=FdType::Socket)return -ENOTSOCK;
@@ -13913,7 +13992,7 @@ static int64_t sys_shutdown(uint64_t fdVal, uint64_t howVal, uint64_t,
     Process* proc=ProcessCurrent();if(!proc)return -EBADF;
     KernelOperationGuard operation(proc);
     FdRef fd(proc,static_cast<int>(fdVal));if(!fd)return -EBADF;
-    if(fd->type!=FdType::UnixSocket && fd->type!=FdType::Socket)return -88; // ENOTSOCK
+    if(fd->type!=FdType::UnixSocket && fd->type!=FdType::Socket && fd->type!=FdType::NetlinkSocket)return -88; // ENOTSOCK
     const int how=static_cast<int>(howVal);if(how<0 || how>2)return -EINVAL;
     // Internet socket shutdown needs a separate TCP/UDP state transition.
     if(fd->type!=FdType::UnixSocket)return -95; // EOPNOTSUPP
@@ -13939,6 +14018,7 @@ static int64_t sys_listen(uint64_t fdVal, uint64_t backlog, uint64_t,
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, fd);
     FdEntry* fde = descriptor.get();
+    if(fde && fde->type==FdType::NetlinkSocket)return -95;
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         UnixNameGuard nameGuard;
@@ -13978,6 +14058,7 @@ static int64_t AcceptSocket(uint64_t fdVal, uint64_t addrVal, uint64_t addrLenVa
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, fd);
     FdEntry* fde = descriptor.get();
+    if(fde && fde->type==FdType::NetlinkSocket)return -95;
     if (fde && fde->type == FdType::UnixSocket && fde->handle) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
         if (usd->state != UnixSocketData::State::Listening) return -EINVAL;
@@ -14238,6 +14319,7 @@ static bool UnixFdSnapFrom(const FdEntry* src, UnixFdSnap* out)
 {
     if (!src || src->type == FdType::None) return false;
     switch (src->type) {
+        case FdType::NetlinkSocket:
         case FdType::Pipe:
         case FdType::DevDri:
         case FdType::SignalFd:
@@ -14305,6 +14387,7 @@ static int UnixFdSnapInstall(Process* dst, const UnixFdSnap* snap)
     owned.flags = snap->flags;
     owned.fdFlags = snap->fdFlags;
     owned.statusFlags = snap->statusFlags;
+    if(owned.type==FdType::NetlinkSocket)SocketIdentityLabel(static_cast<NetlinkSocket*>(owned.handle)->identity.inode,owned.dirPath,sizeof(owned.dirPath));
     if (owned.type == FdType::Socket) {
         // The queued snapshot owns a socket reference. Reconstruct its cached
         // identity before publication, just as socket() and accept() do.
@@ -14321,6 +14404,7 @@ static void UnixFdSnapRelease(const UnixFdSnap* snap)
 {
     if (!snap || !snap->handle) return;
     switch (snap->type) {
+        case FdType::NetlinkSocket:NetlinkUnref(static_cast<NetlinkSocket*>(snap->handle));break;
         case FdType::Pipe:
             PipeReleaseEnd(static_cast<PipeBuffer*>(snap->handle), (snap->flags & 1) != 0);
             break;
@@ -14407,6 +14491,11 @@ static int64_t sys_sendmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     FdRef descriptor(proc, fd);
     FdEntry* fde = descriptor.get();
     if (!fde) return -EBADF;
+    if(fde && fde->type==FdType::NetlinkSocket) {
+        if(msg->msg_controllen)return -95;
+        NetlinkVector vector;if(int e=vector.init(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen,true))return e;
+        return NetlinkSend(static_cast<NetlinkSocket*>(fde->handle),reinterpret_cast<uint64_t>(vector.bytes),vector.total,flagsVal,reinterpret_cast<uint64_t>(msg->msg_name),msg->msg_namelen,false);
+    }
     if (fde->type == FdType::UnixSocket) {
 
     auto* usd = static_cast<UnixSocketData*>(fde->handle);
@@ -14572,6 +14661,19 @@ static int64_t sys_recvmsg(uint64_t fdVal, uint64_t msgVal, uint64_t flagsVal,
     KernelOperationGuard operation(proc);
     FdRef descriptor(proc, fd);
     FdEntry* fde = descriptor.get();
+    if(fde && fde->type==FdType::NetlinkSocket) {
+        if(msg->msg_namelen>0x7fffffffu)return -EINVAL;
+        if(msg->msg_name && !UserBufferWritable(reinterpret_cast<uint64_t>(msg->msg_name),msg->msg_namelen<12?msg->msg_namelen:12))return -EFAULT;
+        NetlinkVector vector;if(int e=vector.init(reinterpret_cast<uint64_t>(msg->msg_iov),msg->msg_iovlen,false))return e;
+        uint32_t fullSize=0;auto n=NetlinkReceive(static_cast<NetlinkSocket*>(fde->handle),vector.bytes,vector.capacity,flagsVal,fullSize);
+        if(n<0)return n;
+        if(int e=vector.scatter(n))return e;
+        RouteAddress source{16,0,0,0};
+        if(msg->msg_name && msg->msg_namelen && !CopyToUser(reinterpret_cast<uint64_t>(msg->msg_name),&source,msg->msg_namelen<12?msg->msg_namelen:12))return -EFAULT;
+        msg->msg_namelen=msg->msg_name?12:0;msg->msg_controllen=0;msg->msg_flags=fullSize>static_cast<uint64_t>(n)?0x20:0;
+        if(!CopyToUser(msgVal,msg,sizeof(*msg)))return -EFAULT;
+        return (flagsVal&0x20)?fullSize:n;
+    }
     if (fde && fde->type == FdType::UnixSocket) {
         auto* usd = static_cast<UnixSocketData*>(fde->handle);
 

@@ -42,6 +42,9 @@ static void SchedulerYield() {
     SpinLockRelease(&g_credentialsLock);
     SpinLockRelease(&target->lock);++yields;
 }
+static bool NetlinkGetIdentity(void* handle,SocketIdentity* out) {
+    assert(handle==reinterpret_cast<void*>(3));return SockGetIdentity(2,out);
+}
 #include "../../kernel/src/process_socket_metadata.inc"
 }
 
@@ -53,6 +56,10 @@ int main() {
     current=&actor;target=&other;SocketIdentity identity{};
     slots[7].type=FdType::Socket;slots[7].handle=reinterpret_cast<void*>(3);
     assert(ProcessReadSocketMetadata(&actor,&other,7,&identity)==1 && identity.inode==123);
+    slots[7].type=FdType::NetlinkSocket;
+    assert(ProcessReadSocketMetadata(&actor,&other,7,&identity)==1 && identity.inode==123);
+    other.euid=2000;assert(ProcessReadSocketMetadata(&actor,&other,7,&identity)==-13);other.euid=1000;
+    slots[7].type=FdType::Socket;
     assert(ProcessReadSocketMetadata(&actor,&other,8,&identity)==-2);
     assert(ProcessReadSocketMetadata(&actor,&other,MAX_FDS,&identity)==-2);
     slots[7].closing=true;assert(ProcessReadSocketMetadata(&actor,&other,7,&identity)==-2);

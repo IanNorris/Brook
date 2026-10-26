@@ -74,6 +74,7 @@ namespace brook {
 
 static NetIf* g_netIfs[NET_MAX_IFS] = {};
 static uint32_t g_netIfCount = 0;
+static IrqSpinLock g_interfaceViewLock;
 // Back-compat alias used by legacy single-NIC code paths below. Points at
 // g_netIfs[0] (the primary / default-route interface).
 static NetIf* g_netIf = nullptr;
@@ -694,21 +695,46 @@ void NetInit()
 
 void NetRegisterIf(NetIf* nif)
 {
+    const uint64_t viewFlags=IrqSpinLockAcquire(&g_interfaceViewLock);
     if (g_netIfCount >= NET_MAX_IFS) {
+        IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
         SerialPrintf("net: too many interfaces (max %u), ignoring\n", NET_MAX_IFS);
         return;
     }
-    uint32_t idx = g_netIfCount++;
+    uint32_t idx = g_netIfCount;
     g_netIfs[idx] = nif;
     if (idx == 0) g_netIf = nif;
+    __atomic_store_n(&g_netIfCount,idx+1,__ATOMIC_RELEASE);
+    IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
     SerialPrintf("net: interface %u registered, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
                  idx,
                  nif->mac.b[0], nif->mac.b[1], nif->mac.b[2],
                  nif->mac.b[3], nif->mac.b[4], nif->mac.b[5]);
 }
 
-uint32_t NetIfCount() { return g_netIfCount; }
-NetIf* NetIfAt(uint32_t idx) { return (idx < g_netIfCount) ? g_netIfs[idx] : nullptr; }
+uint32_t NetIfCount() { return __atomic_load_n(&g_netIfCount,__ATOMIC_ACQUIRE); }
+NetIf* NetIfAt(uint32_t idx) { return (idx < NetIfCount()) ? g_netIfs[idx] : nullptr; }
+
+SocketIdentity NetAllocateSocketIdentity(uint32_t uid,uint32_t gid)
+{return {g_socketInodes.allocate(),uid,gid};}
+
+uint32_t NetInterfaceViews(InterfaceView* out,uint32_t capacity)
+{
+    if(!capacity)return 0;
+    uint32_t count=1;
+    out[0]={1,0x49,65536,Ipv4Addr(127,0,0,1),Ipv4Addr(255,0,0,0),772,{},"lo"};
+    const uint64_t flags=IrqSpinLockAcquire(&g_interfaceViewLock);
+    for(uint32_t i=0;i<g_netIfCount && count<capacity;++i) {
+        auto* nif=g_netIfs[i];
+        InterfaceView v{};v.index=i+2;v.hardwareType=1;v.mtu=ETH_MTU;
+        // Registration enables the stack's interface; no carrier indication
+        // exists yet, so do not assert IFF_RUNNING or IFF_LOWER_UP for NICs.
+        v.flags=3;v.address=nif->ipAddr;v.netmask=nif->netmask;
+        memcpy(v.mac,nif->mac.b,6);v.name[0]='e';v.name[1]='t';v.name[2]='h';v.name[3]=static_cast<char>('0'+i);
+        out[count++]=v;
+    }
+    IrqSpinLockRelease(&g_interfaceViewLock,flags);return count;
+}
 
 uint32_t NetMaxSockets() { return MAX_SOCKETS; }
 
@@ -968,10 +994,12 @@ static void HandleDhcpReply(const uint8_t* data, uint32_t len)
         g_dhcpState = 2;
         DhcpSend(DHCP_REQUEST, serverIp, dhcp->yiaddr);
     } else if (msgType == DHCP_ACK && g_dhcpState == 2) {
+        const uint64_t viewFlags=IrqSpinLockAcquire(&g_interfaceViewLock);
         g_netIf->ipAddr  = dhcp->yiaddr;
         g_netIf->netmask = subnetMask;
         g_netIf->gateway = router;
         g_netIf->dns     = dns;
+        IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
 
         SerialPrintf("net: DHCP ACK — IP %d.%d.%d.%d mask %d.%d.%d.%d gw %d.%d.%d.%d\n",
                      g_netIf->ipAddr & 0xFF, (g_netIf->ipAddr >> 8) & 0xFF,
@@ -1103,10 +1131,12 @@ bool NetApplyStaticConfig(NetIf* nif)
 
     if (!isStatic || !haveIp) return false;
 
+    const uint64_t viewFlags=IrqSpinLockAcquire(&g_interfaceViewLock);
     nif->ipAddr  = ip;
     nif->netmask = mask;
     nif->gateway = gw;
     nif->dns     = dns;
+    IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
 
     SerialPrintf("net: static config %u.%u.%u.%u/%u.%u.%u.%u gw=%u.%u.%u.%u dns=%u.%u.%u.%u\n",
         ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF,

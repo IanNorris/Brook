@@ -26,8 +26,9 @@ int ProcessReadSocketMetadata(Process* viewer,Process* target,uint32_t fd,Socket
             const auto& entry=target->fds[fd];
             if(entry.type!=FdType::None && !entry.closing) {
                 error=0; // non-sockets retain the existing, separate policy
-                if(entry.type==FdType::Socket && entry.handle) {
+                if((entry.type==FdType::Socket || entry.type==FdType::NetlinkSocket) && entry.handle) {
                     error=!allowed?-13:
+                        entry.type==FdType::NetlinkSocket?(NetlinkGetIdentity(entry.handle,out)?1:-2):
                         SockGetIdentity(static_cast<int>(reinterpret_cast<uintptr_t>(entry.handle))-1,out)?1:-2;
                 }
             }

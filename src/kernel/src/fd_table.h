@@ -57,6 +57,7 @@ enum class FdType : uint8_t
     SyncFile,      // Immutable completed GPU timeline fence, Linux sync_file ABI
     SignalFd,      // Read pending signals for the calling task through a shared mask
     Path,          // O_PATH metadata-only VFS reference; never data I/O
+    NetlinkSocket, // AF_NETLINK read-only NETLINK_ROUTE datagram endpoint
 };
 
 struct FdEntry

@@ -4,6 +4,16 @@ Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:
 
+`netlinkcheck.c` is a **glibc** control: build it in `nix-shell` with
+`$HOST_CC -O2 -Wall -Wextra -Werror tools/at-syscall-probe/netlinkcheck.c -pthread -o build/netlinkcheck`.
+Run the exact same binary on Linux and Brook. It checks if_nameindex/getifaddrs,
+matching interface ioctls, short rtnetlink dump requests, kernel sender identity,
+sequence/local-port matching, datagram peek/truncation, poll/epoll wakeups,
+dup/fork/SCM_RIGHTS lifetimes and shared nonblocking state. It does not configure
+interfaces, contact remote services or open saves. A 30-second alarm bounds the
+probe; retain an external observer and recover its original operation if that
+observer times out. This does not certify musl's separate interface-query path.
+
 `staticpiecheck.c` is an interpreter-less PIE with no libc dependency. Build it
 separately with `cc -O2 -nostdlib -static-pie -fPIE -fno-stack-protector tools/at-syscall-probe/staticpiecheck.c -o build/staticpiecheck` (one command).
 Run the same binary through direct bridge launch and a guest `execve` parent.
