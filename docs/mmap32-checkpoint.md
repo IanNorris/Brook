@@ -51,7 +51,7 @@ Evidence is private under `build/workloads/pi-futex-20261026` and
 ## Application result
 
 The unmodified native Steam launch now gets through Mono initialization and
-renders the animated title background. The game reports MainMenuGUI and
+renders the title background. The game reports MainMenuGUI and
 completes general initialization. A three-second QEMU capture contains audio
 (RMS 0.0413, peak 5251/32768). This establishes audio delivery, not a subjective
 stutter-free playback verdict. No existing game save is loaded.

@@ -4,7 +4,7 @@ pkgs.stdenv.mkDerivation {
   version = "0.1";
   src = ./.;
   nativeBuildInputs = [ pkgs.glslang pkgs.python3 ];
-  buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader pkgs.libdrm ];
+  buildInputs = [ pkgs.vulkan-headers pkgs.vulkan-loader pkgs.libdrm pkgs.xorg.libX11 ];
   buildPhase = ''
     runHook preBuild
     glslangValidator -V --target-env vulkan1.1 probe.comp -o probe.spv
@@ -25,6 +25,7 @@ pkgs.stdenv.mkDerivation {
     Path('triangle_spv.h').write_text(text)
     PY
     $CC -std=c11 -O2 -Wall -Wextra -Werror probe.c -lvulkan -o vulkan-probe
+    $CC -std=c11 -O2 -Wall -Wextra -Werror wsi.c -lvulkan -lX11 -o vulkan-wsi-probe
     $CC -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror \
       -I${pkgs.libdrm.dev}/include/libdrm virtgpu-query.c -o virtgpu-query
     $CC -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror \
@@ -38,7 +39,7 @@ pkgs.stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin
-    cp vulkan-probe virtgpu-query virtgpu-context virtgpu-blob virtgpu-sync-file $out/bin/
+    cp vulkan-probe vulkan-wsi-probe virtgpu-query virtgpu-context virtgpu-blob virtgpu-sync-file $out/bin/
     runHook postInstall
   '';
 }
