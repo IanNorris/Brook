@@ -15,6 +15,11 @@ import bootstrap_acceptance as base
 
 ROOT = base.ROOT
 
+# These kernel regression probes write directly below root-owned /data and
+# inspect privileged filesystem behavior. Keep their historical root identity
+# explicit now that ordinary bridge/app launches default to the Brook user.
+# This harness does not establish unprivileged application acceptance.
+
 def host_memory():
     memory = Path('/proc/meminfo').read_text()
     vmstat = Path('/proc/vmstat').read_text()
@@ -57,10 +62,10 @@ def flush_probe(process, session, data, serial, artifacts, output, deadline, mou
     import inject_flush_failure
     path = mount+'/flush-check'
     offset = serial.stat().st_size
-    base.server.guest_run(session, 'run /boot/BIN/FLUSHCHK create '+path)
+    base.server.guest_run(session, 'run --uid 0 /boot/BIN/FLUSHCHK create '+path)
     wait_flush(process, serial, offset, 'FLUSHCHECK PASS path='+path, deadline)
     offset = serial.stat().st_size
-    base.server.guest_run(session, 'run /boot/BIN/FLUSHCHK retry '+path+' --wait')
+    base.server.guest_run(session, 'run --uid 0 /boot/BIN/FLUSHCHK retry '+path+' --wait')
     text = wait_flush(process, serial, offset, re.compile(r'FLUSHCHECK READY pid=\d+ path='), deadline)
     pid = int(re.search(r'FLUSHCHECK READY pid=(\d+)', text)[1])
     # This isolated harness attaches boot/data/nix in that exact order. Check
@@ -68,7 +73,7 @@ def flush_probe(process, session, data, serial, artifacts, output, deadline, mou
     if f'virtio-blk: virtio{slot} flush=negotiated test-budget-slot={slot}' not in serial.read_text():
         raise RuntimeError('Unexpected data-device slot or missing negotiated FLUSH')
     first = inject_flush_failure.inject(session, artifacts/'kernel/BROOK.elf', slot=slot, count=1)
-    base.server.guest_run(session, f'run /boot/BIN/FLUSHCHK release {pid}')
+    base.server.guest_run(session, f'run --uid 0 /boot/BIN/FLUSHCHK release {pid}')
     wait_flush(process, serial, offset, 'FLUSHCHECK PASS path='+path, deadline)
     second = inject_flush_failure.inject(session, artifacts/'kernel/BROOK.elf', slot=slot, count=1)
     try:
@@ -95,6 +100,8 @@ def main():
     ap.add_argument('--mixed-append-probe', nargs='?', const='all', default='all', choices=['all','unlink','truncate','chain'])
     ap.add_argument('--block-size', type=int, choices=[1024,2048,4096], default=4096)
     ap.add_argument('--backend', choices=['ram', 'disk'], default='ram')
+    ap.add_argument('--host-cache', choices=['normal', 'cold-cleanup'], default='normal',
+                    help='For disk images, evict only private image file pages before reboot verification')
     ap.add_argument('--artifacts', type=Path, default=ROOT / 'build/release')
     ap.add_argument('--memory', choices=['2G','4G','8G'], default='2G')
     ap.add_argument('--host-headroom-gib', type=int, choices=[1,2,4,8], default=4,
@@ -113,6 +120,8 @@ def main():
     ap.add_argument('--exit-group-probe', nargs='?', const=128, type=int, help='race thread-group exit with sleeping/waking workers for this many rounds')
     ap.add_argument('--deadline', type=int, default=180, help='seconds allowed per guest workload')
     args = ap.parse_args()
+    if args.host_cache != 'normal' and args.backend != 'disk':
+        ap.error('cold-cleanup requires disk-backed images')
     if args.instance is None:
         candidates = list(range(120, 500))
         random.SystemRandom().shuffle(candidates)
@@ -147,7 +156,8 @@ def main():
     success = False
     report = {'settings': vars(args) | {'output': str(output), 'artifacts': str(args.artifacts)},
               'host': base.host_environment(), 'memory_before': host_memory(), 'runtime_directory': str(directory),
-              'kernel_sha256': base.sha(args.artifacts / 'kernel/BROOK.elf'), 'phases': []}
+              'kernel_sha256': base.sha(args.artifacts / 'kernel/BROOK.elf'),
+              'probe_uid': 0, 'phases': []}
     report['settings'] = {k: str(v) if isinstance(v, Path) else v for k,v in report['settings'].items()}
     base.write(output / 'environment.json', report)
     start = time.monotonic()
@@ -190,12 +200,17 @@ def main():
         if args.exit_group_probe:
             base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/exitgroupcheck'), '::BIN/EXITGRP'])
         for mode in ('run', 'cleanup'):
+            if mode == 'cleanup' and args.host_cache == 'cold-cleanup':
+                from io_host_cache import evict_images
+                if process is not None or session is not None:
+                    raise RuntimeError('Original VM must be stopped before cache eviction')
+                base.write(output/'host-cache-eviction.json', evict_images(directory))
             process, session, data, boot_seconds = base.launch(directory, args.instance, artifacts, cpus=args.cpus, memory=args.memory)
             serial = Path(data['serial_log'])
             offset = serial.stat().st_size
             if args.exit_group_probe and mode == 'run':
                 before_exit = base.server.guest(data, 'bridge stats')['process_count']
-                base.server.guest_run(session, f'run /boot/BIN/EXITGRP {args.exit_group_probe}')
+                base.server.guest_run(session, f'run --uid 0 /boot/BIN/EXITGRP {args.exit_group_probe}')
                 expires = time.monotonic()+args.deadline
                 while time.monotonic()<expires:
                     text = serial.read_bytes()[offset:].decode(errors='replace')
@@ -215,7 +230,7 @@ def main():
                 report['exit_group_probe'] = {'rounds': args.exit_group_probe, 'passed': True,
                                               'processes_before': before_exit, 'processes_after': after_exit}
             if args.thread_page_probe and mode == 'run':
-                base.server.guest_run(session, 'run /boot/BIN/ASOWNCHK /data --require-reuse')
+                base.server.guest_run(session, 'run --uid 0 /boot/BIN/ASOWNCHK /data --require-reuse')
                 expires = time.monotonic()+args.deadline
                 while time.monotonic()<expires:
                     text = serial.read_bytes()[offset:].decode(errors='replace')
@@ -234,21 +249,21 @@ def main():
                 else:
                     for mount in ['/data', '/boot']:
                         probe_offset = serial.stat().st_size
-                        base.server.guest_run(session, 'run /boot/BIN/FLUSHCHK cleanup '+mount+'/flush-check')
+                        base.server.guest_run(session, 'run --uid 0 /boot/BIN/FLUSHCHK cleanup '+mount+'/flush-check')
                         wait_flush(process, serial, probe_offset, 'FLUSHCHECK CLEANUP PASS', args.deadline)
             if args.mixed_append_probe and mode == 'run':
-                base.server.guest_run(session, 'run /boot/BIN/MIXAPP /data '+args.mixed_append_probe)
+                base.server.guest_run(session, 'run --uid 0 /boot/BIN/MIXAPP /data '+args.mixed_append_probe)
                 expires = time.monotonic()+args.deadline
                 while time.monotonic()<expires:
                     text = serial.read_bytes()[offset:].decode(errors='replace')
                     if 'MIXAPPEND FAIL' in text or re.search(r'KERNEL PANIC|KERNEL FAULT',text):
-                        raise RuntimeError('Mixed append cache regression')
+                        raise RuntimeError('Mixed-append probe failed; inspect guest errno/serial evidence')
                     if 'MIXAPPEND PASS mode=' in text: break
                     if process.poll() is not None: raise RuntimeError('VM exited during mixed append probe')
                     time.sleep(.2)
                 else: raise TimeoutError('Mixed append probe deadline')
                 report['mixed_append_probe'] = args.mixed_append_probe
-            reply = base.server.guest_run(session, f'run /boot/BIN/IOBENCH /data/io-test {mode} {args.workers} {args.mib} {args.files}')
+            reply = base.server.guest_run(session, f'run --uid 0 /boot/BIN/IOBENCH /data/io-test {mode} {args.workers} {args.mib} {args.files}')
             base.write(output/f'{mode}-launch.json', reply)
             small_profile_started = False
             expires = time.monotonic() + args.deadline
@@ -270,7 +285,7 @@ def main():
                     time.sleep(.2)
                 report['small_profile'] = base.server.profile(session, 'export')
             if args.cache_probe and mode == 'run':
-                base.server.guest_run(session, f'run /boot/BIN/CACHECHK /data/io-test {args.workers} {args.mib}')
+                base.server.guest_run(session, f'run --uid 0 /boot/BIN/CACHECHK /data/io-test {args.workers} {args.mib}')
                 expires = time.monotonic()+args.deadline
                 while time.monotonic()<expires:
                     extra = serial.read_bytes()[offset:].decode(errors='replace')
@@ -279,7 +294,7 @@ def main():
                     time.sleep(.2)
                 else: raise TimeoutError('Concurrent cache probe deadline')
             if args.lifetime_probe and mode == 'cleanup':
-                base.server.guest_run(session, 'run /boot/BIN/FILELIFE /data --require-reuse')
+                base.server.guest_run(session, 'run --uid 0 /boot/BIN/FILELIFE /data --require-reuse')
                 expires = time.monotonic() + args.deadline
                 while time.monotonic() < expires:
                     extra = serial.read_bytes()[offset:].decode(errors='replace')
@@ -291,7 +306,7 @@ def main():
             if args.wait_mask_probe and mode == 'cleanup':
                 for binary, marker in [('WAITMASK','WAITMASKCHECK'),('CHLDSIG','CHILDSIGNALCHECK'),('SELECTCHK','SELECTCHECK')]:
                     probe_offset = serial.stat().st_size
-                    base.server.guest_run(session, 'run /boot/BIN/'+binary+(' 10.0.2.15' if binary == 'SELECTCHK' else ''))
+                    base.server.guest_run(session, 'run --uid 0 /boot/BIN/'+binary+(' 10.0.2.15' if binary == 'SELECTCHK' else ''))
                     expires = time.monotonic()+args.deadline
                     while time.monotonic()<expires:
                         extra = serial.read_bytes()[probe_offset:].decode(errors='replace')

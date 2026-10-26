@@ -1,5 +1,10 @@
 # Fast I/O stability and performance gate
 
+The synthetic kernel probes explicitly run as UID 0 because their fixtures write
+below root-owned `/data`. This preserves the original regression-test identity;
+it is separate from normal Brook-user application testing. The report records
+`probe_uid`. Bridge launches otherwise default to the ordinary Brook user.
+
 From a built checkout, inside `nix-shell`:
 
 ```sh
@@ -72,6 +77,23 @@ Use the same test against disk-backed images with:
 ```sh
 scripts/run_io_benchmark.sh --output build/io-bench/ssd-run --backend disk
 ```
+
+For a host file-page-cache-cold reboot verification, use `--backend disk
+--host-cache cold-cleanup`. After the first VM has stopped and its offline
+checks finish, the harness fsyncs only its three private image inodes, requests
+`POSIX_FADV_DONTNEED`, and measures residency with `mincore` before and after.
+Any remaining resident pages fail the cold-cache gate. Symlinks, hard-link
+aliases, unowned files, empty files and partial-page image sizes are rejected.
+No global cache setting changes. This controls host file pages only; filesystem
+metadata and device caches remain outside the claim, and residency is a snapshot.
+See [fadvise](https://man7.org/linux/man-pages/man2/posix_fadvise.2.html) and
+[mincore](https://man7.org/linux/man-pages/man2/mincore.2.html).
+The ordinary `--host-cache normal` run may retain host pages across a guest
+reboot; neither a fresh guest nor successful persistence verification implies
+physical cold reads. `host-cache-eviction.json` preserves the control evidence.
+
+The [26 October loading investigation](loading-throughput-20261026.md) records
+the first cached/cold controls and their limits for Steam startup diagnosis.
 
 For larger workloads, use `--mib 32 --files 128`. Keep comparisons at equal CPU,
 worker and workload settings. `--artifacts` selects a separate matching kernel,
