@@ -183,6 +183,7 @@ int VfsMountNamespaceCopy(MountNamespace* source,const VfsPath& root,const VfsPa
     }
     if(!error)for(auto* entry=map.attachments;entry;entry=entry->next) {
         error=map.ClonePath(entry->oldMount->covered,&entry->newMount->covered);
+        if(!error)VfsNoteMountLookupEdgesLocked(entry->newMount->covered);
         if(!error)error=map.ClonePath(entry->oldMount->coveredParent,&entry->newMount->coveredParent);
         if(!error && entry->oldMount->rootObject) {
             error=map.CloneObject(entry->oldMount->rootObject,&entry->newMount->rootObject);
@@ -455,6 +456,8 @@ static int VfsMountNamespaceRecursiveBindLocked(MountNamespace* ns,const VfsPath
     }
     // Normal walkers hold the outer transaction; metadata readers hold only
     // viewLock. Publish the entire graft in one window for both classes.
+    for(auto* entry=map.attachments;entry;entry=entry->next)
+        VfsNoteMountLookupEdgesLocked(entry->newMount->covered);
     auto flags=IrqSpinLockAcquire(&g_mountViewLock);
     for(auto* entry=map.attachments;entry;entry=entry->next) {
         auto* mount=entry->newMount;mount->used=true;mount->linked=true;
@@ -641,6 +644,9 @@ int VfsMountNamespacePivotRoot(MountNamespace* ns,const VfsPath& oldRoot,const V
         VfsRenameLabels* labels;VfsPath putOld;VfsPath removedCover;
     } pivot{ns,oldMount,newMount,&labels,putOld,{}};
     VfsPathRetain(putOld);
+    // Mark before the stores-only commit callback. Failed commits may leave a
+    // conservative true hint, which cannot change lookup authority.
+    VfsNoteMountLookupEdgesLocked(putOld);
     auto publish=[](void* argument) {
         auto& p=*static_cast<Pivot*>(argument);
         // Registry -> metadata view. This callback is stores only; release the

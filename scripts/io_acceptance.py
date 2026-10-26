@@ -50,8 +50,8 @@ def wait_flush(process, serial, offset, marker, deadline):
     expires = time.monotonic() + deadline
     while time.monotonic() < expires:
         text = serial.read_bytes()[offset:].decode(errors='replace')
-        if re.search(r'FLUSHCHECK FAIL|KERNEL PANIC|KERNEL FAULT', text):
-            raise RuntimeError('Flush regression: '+text[-2000:])
+        if re.search(r'FLUSHCHECK FAIL|MOUNTFANOUT FAIL|KERNEL PANIC|KERNEL FAULT', text):
+            raise RuntimeError('Guest probe failed: '+text[-2000:])
         if (marker.search(text) if isinstance(marker, re.Pattern) else marker in text): return text
         if process.poll() is not None: raise RuntimeError('VM exited during flush probe')
         time.sleep(.1)
@@ -114,6 +114,7 @@ def main():
     ap.add_argument('--cache-probe', action='store_true', help='also run eight-process random pread/mmap integrity checks')
     ap.add_argument('--wait-mask-probe', action='store_true', help='also run temporary-mask, child-signal and select regression probes')
     ap.add_argument('--profile-small', action='store_true', help='capture CPU/context switches during small-files; timings are instrumented')
+    ap.add_argument('--mount-fanout-probe', action='store_true', help='measure checked path lookups before/during/after 128 unrelated bind mounts')
     ap.add_argument('--lifetime-probe', action='store_true', help='also run the 24 inode-lifetime regression checks')
     ap.add_argument('--flush-probe', action='store_true', help='inject device flush failures, require fsync/stop errors and retry, then verify after reboot')
     ap.add_argument('--thread-page-probe', action='store_true', help='retain worker mappings after thread exit and require safe PID reuse by unrelated processes')
@@ -184,6 +185,8 @@ def main():
         base.command([str(ROOT/'scripts/create_disk.sh')], output/'boot-create.log', env)
         base.command([str(ROOT/'scripts/update_disk.sh')], output/'boot-update.log', env)
         base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/io-bench'), '::BIN/IOBENCH'])
+        if args.mount_fanout_probe:
+            base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/mountfanoutcheck'), '::BIN/MOUNTFAN'])
         if args.cache_probe:
             base.command(['mcopy', '-o', '-i', str(directory/'boot.img'), str(ROOT/'build/io-bench/cachecheck'), '::BIN/CACHECHK'])
         if args.lifetime_probe:
@@ -317,6 +320,18 @@ def main():
                         time.sleep(.2)
                     else: raise TimeoutError(marker+' deadline')
                     report.setdefault('guest_probes', []).append(marker)
+            if args.mount_fanout_probe and mode == 'cleanup':
+                probe_offset = serial.stat().st_size
+                # Legacy stdout goes to serial. Preserve that transport, but
+                # allow slow first path resolution without reissuing a launch.
+                base.server.guest(data, 'bridge run run --uid 0 /boot/BIN/MOUNTFAN --disposable /data', timeout=60)
+                probe_text = wait_flush(process, serial, probe_offset, 'MOUNTFANOUT PARENT PASS', args.deadline)
+                if 'MOUNTFANOUT FAIL' in probe_text:
+                    raise RuntimeError('Mount fanout correctness probe failed')
+                rows = [json.loads(row) for row in re.findall(r'MOUNTFANOUT_RESULT (\{[^\n]+\})', probe_text)]
+                if len(rows) != 9 or [row['phase'] for row in rows] != ['before']*3+['fanout']*3+['after']*3:
+                    raise RuntimeError('Incomplete mount fanout timings')
+                report['mount_fanout_probe'] = rows
             # Program synchronizes before PASS. Stop waits for another guest sync.
             stop = base.server.control(session, 'stop')
             if args.flush_probe and stop.get('sync_guarantee') != 'checked_filesystem_and_device_flush':

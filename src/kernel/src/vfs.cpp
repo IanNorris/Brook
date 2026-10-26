@@ -196,6 +196,10 @@ struct MountEntry {
     bool             linked;
     bool             detachSelected;
     bool             lockedInherited;
+    // Conservative, transaction-protected lookup hints. Once set they stay
+    // true for this attachment's lifetime; a stale true only costs a scan.
+    bool             mayHaveCoveredMounts;
+    bool             mayHaveVirtualMountAncestors;
     // Reporting metadata, never lookup authority. Prepared under the VFS
     // transaction and copied/updated atomically under the metadata view lock.
     char             physicalRoot[512];
@@ -217,6 +221,7 @@ static bool VfsNodevDenied(const MountEntry* mount,const VnodeStat& stat,int fla
 // readers (including procfs callbacks already in that transaction) use viewLock
 // so they never recursively acquire the sleeping lock or observe freed nodes.
 static IrqSpinLock g_mountViewLock;
+static void VfsNoteMountLookupEdgesLocked(const VfsPath& covered);
 struct MountRegistry {
     MountEntry* head=nullptr;
     uint32_t count=0;
@@ -232,6 +237,7 @@ struct MountRegistry {
         auto* node=head;while(node && index--)node=node->next;return node;
     }
     void Publish(MountEntry* node) {
+        VfsNoteMountLookupEdgesLocked(node->covered);
         auto flags=IrqSpinLockAcquire(&g_mountViewLock);
         node->next=head;head=node;++count;
         IrqSpinLockRelease(&g_mountViewLock,flags);

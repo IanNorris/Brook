@@ -95,6 +95,20 @@ physical cold reads. `host-cache-eviction.json` preserves the control evidence.
 The [26 October loading investigation](loading-throughput-20261026.md) records
 the first cached/cold controls and their limits for Steam startup diagnosis.
 
+Use `--mount-fanout-probe` to add a checked metadata control after the reboot
+cleanup workload. It measures three batches of 500 absolute and directory-FD
+lookups before, during and after 128 unrelated bind mounts. Every iteration
+checks the byte and EOF; separate checks cover stacked overmounts and retained
+directory-FD identity. The fixture creates a private mount namespace through
+`clone(CLONE_NEWNS)` and removes all its files before the final allocation gate.
+The report's `mount_fanout_probe` contains all nine timing rows. This is a
+metadata microbenchmark, not a substitute for application startup measurements.
+The static probe can also run on Linux in a private user/mount namespace:
+
+```sh
+unshare -Urnm build/io-bench/mountfanoutcheck --disposable /tmp
+```
+
 For larger workloads, use `--mib 32 --files 128`. Keep comparisons at equal CPU,
 worker and workload settings. `--artifacts` selects a separate matching kernel,
 EFI loader and modules directory. Performance results are informational;

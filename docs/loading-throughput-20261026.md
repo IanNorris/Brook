@@ -70,3 +70,55 @@ small images is insufficient evidence about their layout or cold behavior.
 Raw reports, cache residency, original-controller exit receipts and host samples
 remain under ignored `build/workloads/loading-throughput-20261026/`. No game,
 account, save or authentication data is published.
+
+## Mount fanout experiment and candidate
+
+The added `--mount-fanout-probe` uses the same checked one-byte file throughout
+three stages: before, during and after 128 unrelated bind mounts. Each stage
+contains three batches of 500 absolute lookups and 500 directory-FD-relative
+lookups, including content/EOF verification on every iteration. It separately
+checks overmount restoration and retained-FD identity. Linux passes the same
+fixture in a private user/mount namespace, without the roughly doubled cost
+observed in Brook's short samples.
+
+The complete Brook baseline passes with original controller exit zero, clean
+offline filesystem checks and exact allocation restoration. Median time per
+checked absolute / directory-FD lookup is 26.49 / 29.84 microseconds before
+fanout, 53.18 / 57.98 during fanout and 24.71 / 30.17 after removal. These
+include open, byte/EOF reads and close, not just the pathname walk.
+
+The candidate adds two conservative per-attachment hints: whether an attachment
+may contain a covered mount, and whether it may parent a virtual mount ancestor.
+False permits skipping the corresponding global registry scan; true retains
+the existing exact lookup. Hints only transition to true. They never cache a
+mount result or make a detached entry authoritative. Virtual chains mark every
+actual parent attachment; namespace clone, recursive-bind publication and
+pivot-root preparation also record new edges. Detach/failure may retain a true
+hint, costing a scan without changing behavior.
+
+Candidate kernel SHA256:
+`e30a5e2940a6191319e0eba7c74665e1debb99d5e00dbfbb3713211eb089d2ae`.
+The same native gate passes with controller exit zero and exact allocation
+restoration. Its medians are 24.33 / 29.02 microseconds before fanout, 42.48 /
+45.55 during fanout, and 20.54 / 24.97 after removal. The high-fanout reductions
+are about 20% and 21%; this is not a measured game-loading improvement.
+
+The existing production-VFS host fixture passes namespace copies, recursive
+binds, virtual ancestors, pivot-root, file-bind aliases, failure rollback and
+retirement/lifetime checks. Both compiled entry/scheduler mutation audits pass.
+All 109 host tests pass across the validation: 108 in the full suite and the
+unchanged FD stress test separately in 5.52 seconds. The latter was interrupted
+in the first full-suite attempt after saturating the shared host while a review
+VM was open. That attempt is not a passing full-suite result, and the contended
+VM interval is excluded from performance comparisons. Future stress runs should
+be separated from application timing.
+
+Two earlier fixture attempts are excluded from acceptance: one used unsupported
+`unshare` instead of Brook's supported mount-namespace `clone` path; another's
+legacy launch reply timed out even though the probe completed. The latter was
+recovered with checked shutdown and clean offline checks. The corrected gate
+waits longer for that one launch reply and never retries a launch after timeout.
+An incomplete candidate capsule failed before any VM launch and was replaced by
+one containing its matching symbol table. Successful controls are named
+`io-mount-fanout-owned-baseline` and `io-mount-fanout-candidate-complete` in the
+private evidence directory.

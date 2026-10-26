@@ -10,6 +10,19 @@ static VfsPath g_canonicalDeviceAnchor;
 static VfsPath g_canonicalDrmDeviceAnchor;
 static VfsPath g_canonicalDrmSysAnchor;
 static bool VfsVirtual(const VfsPath& p) { return p.object && p.object->ops==&g_virtualDirectoryOps; }
+static void VfsNoteMountLookupEdgesLocked(const VfsPath& covered)
+{
+    if(!covered.object)return;
+    static_cast<MountEntry*>(covered.attachment)->mayHaveCoveredMounts=true;
+    // Virtual ancestor chains can cross attachments. Mark every actual parent,
+    // not just the attachment at the final covered entry.
+    VfsPath current=covered;
+    while(VfsVirtual(current)) {
+        auto* directory=static_cast<VfsVirtualDirectory*>(current.object->priv);
+        static_cast<MountEntry*>(directory->parent.attachment)->mayHaveVirtualMountAncestors=true;
+        current=directory->parent;
+    }
+}
 
 bool VfsPathSame(const VfsPath& a,const VfsPath& b)
 {
@@ -117,6 +130,7 @@ static int VfsMakeVirtualLocked(const VfsPath& parent,const char* name,VfsPath* 
 }
 static bool VfsReservedVirtualLocked(const VfsPath& parent,const char* name,VfsPath* out)
 {
+    if(!static_cast<MountEntry*>(parent.attachment)->mayHaveVirtualMountAncestors)return false;
     for(const auto& mount:g_mounts) {
         if(!VfsMountPublished(mount))continue;
         VfsPath current=mount.covered;
@@ -153,6 +167,7 @@ static int VfsEnterMountsLocked(VfsPath* path,const VfsPath* parent=nullptr,cons
 {
     // Edges always point into a new attachment, so traversal cannot cycle.
     for(uint32_t step=0;step<VFS_MAX_MOUNT_DEPTH;++step) {
+        if(!static_cast<MountEntry*>(path->attachment)->mayHaveCoveredMounts)return 0;
         MountEntry* child=nullptr;
         for(auto& mount:g_mounts) {
             if(!VfsMountPublished(mount) || !mount.linked)continue;
