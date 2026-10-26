@@ -225,15 +225,39 @@ The actual Linux launcher and UnityPlayer are ELF64 x86-64. The first launch on
 the old control kernel created no game window: Player.log stopped just after
 display discovery, and saved kernel stacks showed the main and worker threads
 in futex waits. The main user stack reaches UnityPlayer's pthread_mutex_lock
-wrapper. This is a diagnosis lead, not proof of a futex defect. SIGTERM and
+wrapper. This is a diagnosis lead, not proof of a futex defect. The adjacent Unity
+initializer requests recursive + priority-inheritance attributes and ignores
+the initialization result. A reduced public control with hash-matched soldier
+libc/pthread 2.31 succeeds on Linux (kind 33) but returns ENOTSUP/95 on Brook
+(kind 0). Brook intentionally reports PI futexes unsupported, as recorded in
+[the PI checkpoint](steam-pi-futex-checkpoint.md); returning fake success is
+not a fix. A passive observer then delegates the real game-container pthread functions
+without changing their results. It records ENOTSUP for mutex `0xc009a680`
+at UnityPlayer offset `0x1bb5756`, followed by a lock of that same mutex at
+`0x1d54395`, the captured blocked call site. This confirms the ignored
+initialization failure. The observer uses the actual container override libc;
+the soldier-2.31 reduced test is an additional control, not a claim that every
+container selects that libc. This diagnostic launch is distinct from normal
+Steam acceptance and is terminated after saving the evidence. SIGTERM and
 normal Steam shutdown did not clear the game; targeted SIGKILL drained it,
 then checked VM shutdown, original-owner exit zero and all four filesystem
 checks succeeded. No game save was opened.
 
 Neither Graveyard Keeper nor Untitled Goose Game is marked compatible yet.
 Untitled Goose Game's Win64 metadata is preflight evidence; its game payload
-has not been downloaded at this checkpoint. Both titles' assets, account data
-and saves remain in ignored private images.
+has since been downloaded and its Unity executable, crash handler and DLLs
+are confirmed PE AMD64. Its default Proton Experimental 11 Wine and wineserver
+are ELF64. The first launch faults in the optional Wine preloader after its
+low-address reservation covers its own 2 MiB image, reproducing the loader
+placement limitation already recorded in [the Proton checkpoint](proton.md).
+A logging-only repeat confirms the same fault; the supported
+`WINELOADERNOEXEC=1` setting alone still executes this build's preloader.
+The previous optional-preloader staging workaround also fails here: Runtime
+4 explicitly selects that path and exits 127 when it is absent. The original
+preloader is restored with the same SHA256 before testing the loader fix.
+The preloader is verified ET_DYN without PT_INTERP, entry `0x1000`, load span
+`0x6000` and maximum PT_LOAD alignment 4096. Its original bytes remain unchanged. Both titles' assets, account data and saves remain in
+ignored private images.
 
 A transient CEF reason-213 failure preceded recovery of the Library; a normal
 client restart subsequently renders the Store. In Chromium 126.0.6478.183,
@@ -249,3 +273,42 @@ retains its modal geometry. The desktop-shortcut checkbox toggles at its
 displayed coordinates and toggles back before confirming the owned Goose
 installation. This verifies actual input alignment as well as pixel mapping.
 Further game changes require evidence from the new launch.
+
+## Interpreter-less PIE placement
+
+The restored preloader needs a loader-policy repair rather than an executable
+mapping exception. Linux distinguishes interpreted PIE programs from ET_DYN
+loaders without PT_INTERP when choosing placement.
+[Linux ELF loader](https://github.com/torvalds/linux/blob/master/fs/binfmt_elf.c).
+The selected Proton 11 preloader's fixed reservations cover the DOS/low-memory
+arena, a 32-bit allocation band and a high allocation band near the stack;
+`0x600000000000` lies outside those ranges.
+[Proton 11 preloader](https://github.com/ValveSoftware/wine/blob/proton_11.0/loader/preloader.c).
+
+Brook now prefers that high address only for interpreter-less ET_DYN main
+images. Interpreted PIEs retain their 2 MiB preferred base, and ET_EXEC retains
+its linked addresses. Bias rounding preserves the largest PT_LOAD alignment;
+unusual interpreted PIEs with nonzero linked addresses or large alignments
+can therefore move slightly higher than before to satisfy that constraint.
+The common preflight/load calculation retains the image-size bound, 128 MiB
+brk reservation and 16 MiB mmap guard below `USER_MMAP_END`. The separately
+loaded PT_INTERP address is unchanged. This is deterministic placement, not
+ASLR or permission protection against a program overwriting itself.
+
+The updated real-loader host tests cover sparse/reversed/overlapping segments,
+COW ownership, collision rejection, TLS template relocation, entry/PHDR/brk,
+unchanged interpreted PIE/ET_EXEC placement, nonzero-address bias alignment
+and oversized-alignment rejection before allocation. All 110 host tests pass
+(14.28 s); exact compiled entry and scheduler mutation audits pass.
+Astra's read-only review found no blocking correctness issue.
+
+The public [staticpiecheck probe](../tools/at-syscall-probe/staticpiecheck.c)
+has no libc or interpreter and no dynamic relocations. The same ELF passes
+on Linux. On the old Brook policy it exits 42 with entry `0x201040`, safely
+reporting low placement before making a fixed reservation. On the new kernel, the same SHA256
+`8856775d2eefe0a7b519ce5cd155919333f2b2333863d0871826f76a1711155c`
+passes through both direct creation and guest execve: entry
+`0x600000001040`, brk `0x600000006000`, mmap `0x600009006000`, and exit zero
+with `STATICPIE_RESERVE_PASS`. Auxv, initialized data/BSS, brk grow/restore,
+anonymous mmap and execution after the low fixed reservation all pass.
+The original unmodified Wine preloader is the subsequent workload control.

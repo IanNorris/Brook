@@ -150,9 +150,32 @@ static bool PrepareMainImage(const uint8_t* data, uint64_t size, ElfLayout* imag
                              uint64_t* slide)
 {
     if (!ValidateElf(data, size, image)) return false;
-    static constexpr uint64_t PIE_LOAD_BASE = 0x200000ULL;
-    *slide = image->header->e_type == ET_DYN && image->first < PIE_LOAD_BASE ?
-        PIE_LOAD_BASE - image->first : 0;
+    *slide = 0;
+    if (image->header->e_type == ET_DYN)
+    {
+        bool hasInterpreter = false;
+        uint64_t alignment = 4096;
+        for (uint16_t i = 0; i < image->header->e_phnum; ++i)
+        {
+            const auto& segment = image->segments[i];
+            if (segment.p_type == PT_INTERP) hasInterpreter = true;
+            if (segment.p_type == PT_LOAD && segment.p_align > alignment)
+                alignment = segment.p_align;
+        }
+        // Interpreter-less PIEs include loaders which reserve low addresses
+        // before loading another executable (Wine's preloader is one). Keep
+        // them away from that arena, below the main-image brk/mmap ceiling and
+        // separate from the fixed PT_INTERP and user-stack regions.
+        const uint64_t preferred = hasInterpreter ? 0x200000ULL : 0x600000000000ULL;
+        if (image->first < preferred)
+        {
+            const uint64_t delta = preferred - image->first;
+            if (delta > ~uint64_t{0} - (alignment - 1)) return false;
+            // The bias must preserve every PT_LOAD's alignment congruence,
+            // including an image whose first page has a nonzero linked VA.
+            *slide = AlignUp(delta, alignment);
+        }
+    }
     // Leave room for brk and the guard preceding the caller's mmap arena.
     static constexpr uint64_t BRK_MMAP_GUARD = 16 * 1024 * 1024;
     return RelocatedElfFits(*image, *slide, USER_MMAP_END - PROGRAM_BREAK_SIZE - BRK_MMAP_GUARD);

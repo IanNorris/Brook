@@ -17,6 +17,7 @@
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#c); std::abort(); } } while (0)
 using namespace brook;
 namespace {
+constexpr uint64_t highPieBase = 0x600000000000ULL;
 std::unordered_map<uint64_t, PhysicalAddress> leaves;
 std::unordered_map<uint64_t,unsigned> frames;
 std::unordered_map<uint64_t,uint64_t> staging, leafFlags;
@@ -166,18 +167,18 @@ void ownedTests() {
     for(bool sourceFirst:{false,true}) {
         auto bytes=fullFixture(true);auto image=stageImage(bytes);AddressSpaceState space{};ElfBinary binary{};
         CHECK(ElfLoadExecutable(image,&binary,&space,7));CHECK(allocations==1&&leaves.size()==5);
-        for(uint64_t va:{0x200000ULL,0x201000ULL,0x602000ULL,0x800000ULL})
+        for(uint64_t va:{(highPieBase+0x0),(highPieBase+0x1000),(highPieBase+0x402000),(highPieBase+0x600000)})
             CHECK((leafFlags.at(va)&(PTE_COW_BIT|VMM_WRITABLE))==PTE_COW_BIT);
-        CHECK(leaves.at(0x201000)==leaves.at(0x800000));
-        CHECK(leaves.at(0x800000).raw()!=reinterpret_cast<uint64_t>(image.data)+0x3000);
-        cowWrite(0x201100,0x55);CHECK(byte(0x201100)==0x55&&byte(0x800100)==0xA3);
+        CHECK(leaves.at((highPieBase+0x1000))==leaves.at((highPieBase+0x600000)));
+        CHECK(leaves.at((highPieBase+0x600000)).raw()!=reinterpret_cast<uint64_t>(image.data)+0x3000);
+        cowWrite((highPieBase+0x1100),0x55);CHECK(byte((highPieBase+0x1100))==0x55&&byte((highPieBase+0x600100))==0xA3);
         CHECK(std::memcmp(image.data,bytes.data(),bytes.size())==0);
-        CHECK(byte(0x603000)==0&&byte(0x6037ff)==0);
+        CHECK(byte((highPieBase+0x403000))==0&&byte((highPieBase+0x4037ff))==0);
         if(sourceFirst){
-            dropImage(image);CHECK(byte(0x800100)==0xA3);
+            dropImage(image);CHECK(byte((highPieBase+0x600100))==0xA3);
             ExecPageCacheClearForTest();
-            const auto unique=leaves.at(0x602000);CHECK(frames.at(unique.raw())==1);
-            cowWrite(0x602100,0x66);CHECK(leaves.at(0x602000)==unique&&byte(0x602100)==0x66);
+            const auto unique=leaves.at((highPieBase+0x402000));CHECK(frames.at(unique.raw())==1);
+            cowWrite((highPieBase+0x402100),0x66);CHECK(leaves.at((highPieBase+0x402000))==unique&&byte((highPieBase+0x402100))==0x66);
             clean(space);
         }
         else{clean(space);dropImage(image);}
@@ -201,7 +202,7 @@ void ownedTests() {
         if(reverse)std::swap(ph[0],ph[1]);
         auto image=stageImage(bytes);AddressSpaceState space{};ElfBinary binary{};
         CHECK(ElfLoadExecutable(image,&binary,&space,7));
-        CHECK(!(leafFlags.at(mode==1?0x602000:0x201000)&PTE_COW_BIT));
+        CHECK(!(leafFlags.at(mode==1?(highPieBase+0x402000):(highPieBase+0x1000))&PTE_COW_BIT));
         CHECK(std::memcmp(image.data,bytes.data(),bytes.size())==0);
         clean(space);dropImage(image);
     }
@@ -257,7 +258,7 @@ int main() {
         CHECK(ElfLoad(bytes.data(),bytes.size(),&binary,&space,7));
         CHECK(leaves.size()==(overlap?3u:4u));
         CHECK(allocations==leaves.size()); // Shared boundary allocated once.
-        constexpr uint64_t base=0x200000;
+        constexpr uint64_t base=highPieBase;
         CHECK(binary.baseAddress==base&&binary.entryPoint==base+0x400);
         CHECK(binary.programBreakLow==base+(overlap?0x3000:0x402000));
         CHECK(binary.allocatedSize==(overlap?0x3000u:0x402000u));
@@ -277,6 +278,50 @@ int main() {
             CHECK(range->leafOwnership==MappingLeafOwnership::Managed);
         }
         clean(space);
+    }
+    // Ordinary dynamically linked PIEs retain their existing low placement.
+    {
+        auto bytes=fixture();auto* h=reinterpret_cast<Elf64_Ehdr*>(bytes.data());
+        auto* ph=reinterpret_cast<Elf64_Phdr*>(bytes.data()+h->e_phoff);
+        const char interpreter[]="/owned/interpreter";
+        h->e_phnum=3;ph[2]={};ph[2].p_type=PT_INTERP;
+        ph[2].p_offset=0x300;ph[2].p_filesz=sizeof(interpreter);
+        std::memcpy(bytes.data()+0x300,interpreter,sizeof(interpreter));
+        AddressSpaceState space{};ElfBinary binary{};
+        CHECK(ElfLoad(bytes.data(),bytes.size(),&binary,&space,7));
+        CHECK(binary.baseAddress==0x200000&&binary.entryPoint==0x200400);
+        CHECK(binary.phdrVaddr==0x200000+sizeof(Elf64_Ehdr));clean(space);
+    }
+    // Bias, rather than merely the first mapped address, preserves alignment.
+    {
+        auto bytes=fixture();auto* h=reinterpret_cast<Elf64_Ehdr*>(bytes.data());
+        auto* ph=reinterpret_cast<Elf64_Phdr*>(bytes.data()+h->e_phoff);
+        h->e_entry+=0x1000;
+        for(unsigned i=0;i<h->e_phnum;++i)ph[i].p_vaddr+=0x1000;
+        ph[0].p_offset=0x1000;ph[0].p_align=0x200000;
+        AddressSpaceState space{};ElfBinary binary{};
+        CHECK(ElfLoad(bytes.data(),bytes.size(),&binary,&space,7));
+        CHECK(binary.baseAddress>=highPieBase);
+        CHECK((binary.baseAddress-0x1000)%0x200000==0);
+        CHECK(binary.entryPoint==binary.baseAddress+0x400);clean(space);
+        ph[0].p_offset=0;ph[0].p_vaddr=0;h->e_entry=0x400;
+        ph[0].p_align=uint64_t{1}<<63;
+        CHECK(!ElfValidateMainImage(bytes.data(),bytes.size()));
+        CHECK(!ElfLoad(bytes.data(),bytes.size(),&binary,&space,7));
+        CHECK(!allocations&&!leaves.size());clean(space);
+    }
+    // Static PIE TLS template metadata receives the same high bias as loads.
+    {
+        auto bytes=fixture();auto* h=reinterpret_cast<Elf64_Ehdr*>(bytes.data());
+        auto* ph=reinterpret_cast<Elf64_Phdr*>(bytes.data()+h->e_phoff);
+        h->e_phnum=3;ph[2]={};ph[2].p_type=PT_TLS;
+        ph[2].p_offset=0x2800;ph[2].p_vaddr=0x400800;
+        ph[2].p_filesz=16;ph[2].p_memsz=32;ph[2].p_align=16;
+        AddressSpaceState space{};ElfBinary binary{};
+        CHECK(ElfLoad(bytes.data(),bytes.size(),&binary,&space,7));
+        CHECK(reinterpret_cast<uint64_t>(binary.tlsInitData)==highPieBase+0x400800);
+        CHECK(binary.tlsInitSize==16&&binary.tlsTotalSize==32&&binary.tlsAlign==16);
+        CHECK(byte(reinterpret_cast<uint64_t>(binary.tlsInitData))==0xB2);clean(space);
     }
     // Static ET_EXEC keeps its linked addresses instead of receiving PIE bias.
     {
@@ -298,8 +343,8 @@ int main() {
         ph[2].p_vaddr=0x100000;ph[2].p_memsz=0x2000;ph[2].p_align=4096;
         AddressSpaceState space{};ElfBinary binary{};
         CHECK(ElfLoad(bytes.data(),bytes.size(),&binary,&space,7));CHECK(leaves.size()==6);
-        for(uint64_t i=0;i<0x2000;++i)CHECK(byte(0x300000+i)==0);
-        CHECK(!MappingRangeFind(space.ranges,0x302000));clean(space);
+        for(uint64_t i=0;i<0x2000;++i)CHECK(byte(highPieBase+0x100000+i)==0);
+        CHECK(!MappingRangeFind(space.ranges,highPieBase+0x102000));clean(space);
     }
     // Malformed input must fail before allocating frames/range metadata.
     auto bytes=fixture();auto* h=reinterpret_cast<Elf64_Ehdr*>(bytes.data());
@@ -318,14 +363,14 @@ int main() {
     bytes=fixture();failHeap=true;
     CHECK(!ElfLoad(bytes.data(),bytes.size(),&binary,&space,7));CHECK(!allocations);clean(space);
     // An unrelated pre-existing mapping must survive rejection unchanged.
-    bytes=fixture();MappingRange foreign{0x200000,0x201000,0,0,nullptr,7,7,
+    bytes=fixture();MappingRange foreign{highPieBase,highPieBase+0x1000,0,0,nullptr,7,7,
         MappingKind::Anonymous,MappingSharing::Private,MappingLeafOwnership::Managed};
     { MappingRangePlan plan;CHECK(plan.Prepare(1)&&plan.Insert(space.ranges,foreign)); }
     auto existing=PmmAllocPage(MemTag::User,7);
-    CHECK(VmmMapPage(space.pageTable,VirtualAddress(0x200000),existing,VMM_WRITABLE|VMM_USER,MemTag::User,7));
+    CHECK(VmmMapPage(space.pageTable,VirtualAddress(highPieBase),existing,VMM_WRITABLE|VMM_USER,MemTag::User,7));
     CHECK(!ElfLoad(bytes.data(),bytes.size(),&binary,&space,7));CHECK(allocations==1&&leaves.size()==1);
-    CHECK(VmmVirtToPhys(space.pageTable,VirtualAddress(0x200000))==existing);
-    CHECK(MappingRangeFind(space.ranges,0x200000)->kind==MappingKind::Anonymous);clean(space);
+    CHECK(VmmVirtToPhys(space.pageTable,VirtualAddress(highPieBase))==existing);
+    CHECK(MappingRangeFind(space.ranges,highPieBase)->kind==MappingKind::Anonymous);clean(space);
     // The unchanged interpreter loader must agree about sparse/overlapping
     // extents and shared boundary pages, including reversed header order.
     for(bool reverse:{false,true})for(bool overlap:{false,true}) {

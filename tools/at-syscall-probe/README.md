@@ -4,6 +4,15 @@ Build the C probes in `nix-shell` using `$MUSL_CC -static -O2` (add
 `-pthread` for `fdstress.c` and `brkcheck.c`). Keep binaries in ignored `build/`.
 Run them inside a disposable Brook VM through `vm_guest_run`:
 
+`staticpiecheck.c` is an interpreter-less PIE with no libc dependency. Build it
+separately with `cc -O2 -nostdlib -static-pie -fPIE -fno-stack-protector tools/at-syscall-probe/staticpiecheck.c -o build/staticpiecheck` (one command).
+Run the same binary through direct bridge launch and a guest `execve` parent.
+It checks entry/PHDR auxv, load alignment, initialized data/BSS, brk growth and
+restoration, anonymous mmap, and continued execution after a low-address
+`MAP_FIXED|PROT_NONE` reservation. Exit 42 reports the old low placement before
+making that reservation; exit 0 with `STATICPIE_RESERVE_PASS` is acceptance.
+All mappings belong to the probe; it neither writes files nor needs root.
+
 `readonlybindcheck.c --disposable-vm DIRECTORY --brook` checks read-only binds
 on tmpfs and the filesystem containing DIRECTORY, including `mkdir(existing)`
 returning EEXIST while new names return EROFS. The Linux `--tmpfs-only` mode
