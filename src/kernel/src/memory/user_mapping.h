@@ -17,6 +17,9 @@ struct UserMappingRequest {
     // Only eager borrowed device mappings may select a nondefault cache type.
     // The caller must establish architectural PAT support and alias safety.
     uint64_t cacheFlags = 0;
+    // x86-64 MAP_32BIT placement constraint, ignored for exact-address requests.
+    // This constrains the gap search rather than moving the ordinary cursor.
+    bool low32 = false;
 };
 int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMappingRequest& request);
 int64_t UserMappingRemove(Process* actor, AddressSpaceState* space, uint64_t address, uint64_t length);

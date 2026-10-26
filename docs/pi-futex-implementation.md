@@ -85,3 +85,9 @@ assembly initialization with `mini-amd64.c:209`, an out-of-range signed-32-bit
 relative call displacement. This is a new blocker, not game compatibility.
 MAP_32BIT handling is under investigation; it has not yet been established as
 the cause for this installed game build.
+
+Follow-up: [bounded MAP_32BIT allocation](mmap32-checkpoint.md) records the
+actual Mono requests, standalone reproducer and next native launch. The game
+gets past Mono and produces graphics/audio, but its UI/resize rendering remains
+unaccepted. The PI review completes checked shutdown, original-owner exit zero
+and all four offline filesystem checks, with original saves unchanged.

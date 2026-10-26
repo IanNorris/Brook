@@ -4150,6 +4150,7 @@ enum MmapFlags : uint64_t {
     MAP_FIXED     = 0x10,
     MAP_FIXED_NOREPLACE = 0x100000,
     MAP_ANONYMOUS = 0x20,
+    MAP_32BIT     = 0x40,
     MAP_DENYWRITE = 0x0800,
     MAP_POPULATE  = 0x8000,
 };
@@ -4225,6 +4226,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     UserMappingRequest request{};
     request.hint = addr; request.length = length; request.fixed = exactAddress;
     request.noReplace = (flags & MAP_FIXED_NOREPLACE) != 0;
+    request.low32 = (flags & MAP_32BIT) != 0 && !exactAddress;
     request.range = {0,length,offset,0,nullptr,static_cast<uint32_t>(prot),7,MappingKind::Anonymous,
                      (flags & MAP_SHARED) ? MappingSharing::Shared : MappingSharing::Private,MappingLeafOwnership::Managed};
     if (flags & MAP_ANONYMOUS) {

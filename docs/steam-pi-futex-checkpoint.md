@@ -1,5 +1,9 @@
 # Steam PI-futex capability checkpoint (2026-10-23)
 
+Later work: [basic PI ownership, handoff and donation](pi-futex-implementation.md)
+records the replacement implementation and its remaining capability limits.
+The rejection behavior below describes the historical checkpoint.
+
 Steam's independent main-client abort is traced to a false-success PI-futex
 implementation. The fix reports the unsupported capability honestly, allowing
 PulseAudio's existing ordinary-mutex fallback. This does not implement priority

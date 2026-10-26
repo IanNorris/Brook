@@ -315,11 +315,13 @@ static bool UserInterval(uint64_t address, uint64_t length, uint64_t& end) {
 }
 static uint64_t PickMappingAddress(AddressSpaceState* space, const UserMappingRequest& request) {
     if (request.fixed) return request.hint;
-    uint64_t start = request.hint >= USER_MMAP_BASE && request.hint < USER_MMAP_END ?
-        request.hint & ~uint64_t{4095} : space->mmapNext;
-    if (start < USER_MMAP_BASE || start >= USER_MMAP_END) start = USER_MMAP_BASE;
-    auto found = MappingRangeFindGap(space->ranges,start,request.length,USER_MMAP_BASE,USER_MMAP_END);
-    return found ? found : MappingRangeFindGap(space->ranges,USER_MMAP_BASE,request.length,USER_MMAP_BASE,USER_MMAP_END);
+    const uint64_t limit=request.low32?0x80000000ULL:USER_MMAP_END;
+    if(request.length>limit-USER_MMAP_BASE)return 0;
+    uint64_t start = request.hint >= USER_MMAP_BASE && request.hint < limit ?
+        request.hint & ~uint64_t{4095} : request.low32?USER_MMAP_BASE:space->mmapNext;
+    if (start < USER_MMAP_BASE || start >= limit) start = USER_MMAP_BASE;
+    auto found = MappingRangeFindGap(space->ranges,start,request.length,USER_MMAP_BASE,limit);
+    return found ? found : MappingRangeFindGap(space->ranges,USER_MMAP_BASE,request.length,USER_MMAP_BASE,limit);
 }
 int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMappingRequest& request) {
     // Declared before every transaction so errors are printed only after AS /
@@ -401,7 +403,7 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
             if (operation.Publish(i,VirtualAddress(address+i*4096),flags,tag,space->allocationPid,
                                   range.protection != 0) != VmmMapResult::Mapped)
                 KernelPanic("mapping: preflighted page publication failed");
-        if (!request.fixed && end > space->mmapNext) space->mmapNext = end;
+        if (!request.fixed && !request.low32 && end > space->mmapNext) space->mmapNext = end;
         return static_cast<int64_t>(address);
     }
 }

@@ -41,10 +41,11 @@ EBADF. Zero-length calls and 32-bit FD argument normalization are included.
 Failed socket operations must preserve pipe data, eventfd counters and file
 offsets. Real write fallback and Unix-socket send/receive must still work.
 
-`pifutexcheck.c` checks PI-futex capability reporting. Run `--expect-supported`
-on Linux (15 checks) and `--expect-unsupported` on Brook (219 checks). Brook
-must reject all six PI operation classes with ENOSYS without changing words,
-including null-word capability probes and private/realtime flag combinations.
+`pifutexcheck.c` checks PI-futex capability reporting. `--expect-supported`
+runs 15 checks on Linux and the new basic-PI Brook kernel. The historical
+`--expect-unsupported` mode runs 219 checks on the earlier ENOSYS-only kernel:
+all six PI classes must fail without changing words, including null-word
+capability probes and private/realtime flag combinations.
 Ordinary WAIT/WAKE must still work. `--observe` prints the reduced self-lock and
 unowned-unlock comparison; the old Brook stubs incorrectly succeeded at both.
 The unsupported mode preserves the historical capability-rejection check;
@@ -58,6 +59,14 @@ death of a raw owner without a robust list, and caught-signal restart without
 SA_RESTART. Every successful lock must exclude peers and name its actual TID.
 These checks do not certify PI condition-variable requeue or Linux realtime
 scheduler policies. See [the implementation checkpoint](../../docs/pi-futex-implementation.md).
+
+`map32check.c` targets x86-64. Build static and non-PIE, for example with
+`$MUSL_CC -O2 -static -fno-pie -no-pie map32check.c -o map32check`. It advances
+the ordinary mmap cursor using a lazy 4 GiB reservation, then checks low-band
+placement, high hints, disjoint writable allocations, exhaustion/reuse and the
+separate fixed-address semantics. It reserves address space rather than 4 GiB
+of physical memory. `--observe` exits 42 on the historical above-2-GiB placement
+before running the remaining acceptance checks; a passing kernel exits zero.
 
 `sigpendingcheck.c` requires `-pthread`. It checks raw `rt_sigpending` sizes
 0 through 8, oversized rejection, exact partial writes, null/read-only/unmapped

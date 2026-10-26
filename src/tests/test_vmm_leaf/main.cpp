@@ -943,6 +943,47 @@ static void sparseLiveRemap() {
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
     std::puts("LIVE SPARSE REMAP PASS 1TiB/two-hidden-leaves/fixed-destination/OOM-atomic/refcounts");
 }
+static void low32Mappings() {
+    auto root=table();VmmHostSetKernelRoot(root);auto* space=AddressSpaceCreate(38);CHECK(space);
+    Process actor{};actor.addressSpace=space;
+    constexpr uint64_t cursor=0x600001000000ULL,limit=0x80000000ULL;
+    space->mmapNext=cursor;
+    UserMappingRequest request{};request.range=rangeRecord(0,pageSize,nullptr);
+    request.length=pageSize;request.low32=true;
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(USER_MMAP_BASE));
+    CHECK(space->mmapNext==cursor);
+    request.hint=USER_MMAP_BASE+4*pageSize;
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(request.hint));
+    request.hint=0x100000000ULL; // An above-band hint cannot defeat the bound.
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(USER_MMAP_BASE+pageSize));
+    CHECK(space->mmapNext==cursor);
+    request.length=limit+pageSize;
+    CHECK(UserMappingCreate(&actor,space,request)==-12);
+    CHECK(UserMappingRemove(&actor,space,USER_MMAP_BASE,5*pageSize)==0);
+    // Fill the entire low range with one lazy reservation. Exhaustion must not
+    // fall through to the high ordinary cursor or allocate physical pages.
+    request.length=limit-USER_MMAP_BASE;request.hint=USER_MMAP_BASE;
+    request.range=rangeRecord(0,request.length,nullptr,0);request.fixed=true;request.noReplace=true;
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(USER_MMAP_BASE));
+    request.fixed=false;request.noReplace=false;request.hint=0;request.length=pageSize;
+    request.range=rangeRecord(0,pageSize,nullptr);
+    CHECK(UserMappingCreate(&actor,space,request)==-12);
+    CHECK(space->mmapNext==cursor);
+    // Exact mappings ignore the low constraint, and NOREPLACE still protects
+    // an existing mapping. Ordinary allocation continues at its prior cursor.
+    request.fixed=true;request.noReplace=true;request.hint=0x200000000ULL;
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(request.hint));
+    CHECK(UserMappingCreate(&actor,space,request)==-17);
+    request.fixed=false;request.noReplace=false;request.hint=0;request.low32=false;
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(cursor));
+    CHECK(space->mmapNext==cursor+pageSize);
+    CHECK(UserMappingRemove(&actor,space,USER_MMAP_BASE,limit-USER_MMAP_BASE)==0);
+    request.low32=true;
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(USER_MMAP_BASE));
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("MAP32 PASS high-cursor/hints/exhaustion/fixed/NOREPLACE/reuse");
+}
 static void exactAddressNoReplace() {
     auto root=table();VmmHostSetKernelRoot(root);
     auto* space=AddressSpaceCreate(39);CHECK(space);
@@ -2121,7 +2162,7 @@ static void robustExitQueue() {
 }
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
-    robustExitQueue();
+    robustExitQueue();low32Mappings();
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
