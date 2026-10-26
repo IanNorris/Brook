@@ -65,3 +65,10 @@ control creates a white, silent window and does not complete normal close.
 Neither game is marked compatible. See [measurements and diagnostic controls](loading-throughput-20261026.md)
 for evidence, limitations and save-preservation checks. Full PI futex support
 and the Proton presentation/stall remain separate follow-up work.
+
+The [subsequent PI implementation](pi-futex-implementation.md) and
+[presentation checkpoint](steam-api-and-present-wait-checkpoint.md) supersede
+those initial blockers: native Graveyard gets past PI/Mono initialization,
+and Goose now renders interactive menus with the isolated Mesa candidate.
+Graveyard UI/resize and Goose scene loading remain unaccepted; neither is
+promoted to fully compatible by these diagnostic passes.

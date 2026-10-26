@@ -81,6 +81,40 @@ derivation now creates that unused output directory explicitly. A copied
 review also initially lacked its pinned boot artifacts and failed before QEMU
 started; those artifacts were copied before the successful fresh boot.
 
+## Real-game retry with the candidate
+
+The original installed game now renders its title menu. Space confirms menu
+choices, reaching the single-player and save-selection screens. Source X11
+pixels also contain the rendered menu, independently of the compositor frame.
+Reading the real game's native loader map confirms the candidate library is
+mapped; an older passive environment receipt alone would have been misleading.
+No API DLL, game executable or original Proton settings were changed for this
+retry. The internal persona assertion still occurs despite the working menus,
+so it is not sufficient evidence of the original presentation blocker.
+
+Scene loading remains unaccepted. An attempt to choose the visibly empty second
+slot did not capture the changed selection before confirmation; do not treat it
+as a verified new-slot test. Unity later logs achievement restoration from a
+save. Original save contents and timestamp nevertheless remain unchanged.
+The loading screen persists, while native condition-wait sequence values advance
+between captures. This is no longer the first-present completion stall.
+
+A five-second profile contains 2,437 samples and 125,231 context switches but
+reports 152,299 dropped events. The export is explicitly lossy and does not
+justify timing percentages or a loading-throughput conclusion. Bounded native
+and Windows wait stacks are retained privately for the next discriminator.
+
+WM_DELETE removes the game window and Steam removes it from its running list.
+The tracked launcher returns zero; individual Wine process statuses are unknown
+(`-1` in Steam's tracking log), not independently verified direct exits. No
+gameplay, audio or save/load compatibility claim is made.
+
+The subsequent normal Steam shutdown returns zero with zero live descendants
+and both output streams at EOF. Checked VM stop confirms filesystem/device
+flush; the original launcher exits zero. This review's serial check and all
+four offline filesystem checks pass. Original Stardew, Goose and retained
+Graveyard save checks retain the content/timestamp guarantees listed below.
+
 ## Review closure
 
 Diagnostic Proton settings were restored byte-for-byte. Stalled game cleanup
