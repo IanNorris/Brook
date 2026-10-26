@@ -95,6 +95,57 @@ possible dependency, not an established cause from this result alone.
 
 Private evidence lives under build/workloads/pi-futex-20261026 and the
 steam-games-netlink[-v2]-20261026 reviews. Licensed assets, saves, account state
-and unredacted screenshots stay outside git. The Goose software-presentation
-Steam retry is the next application gate; successful interface queries do not
-certify that game or repair the separate cross-capset graphics import boundary.
+and unredacted screenshots stay outside git. Successful interface queries do
+not certify a game or repair the separate cross-capset graphics import boundary.
+
+## Subsequent Steam retry and bounded discovery control
+
+The native Steam client is started with software WSI, then Goose is launched
+once through its normal installed Steam chain. The real Steam-tracked root
+exits one; the launch CLI exits zero only as an acknowledgement. Unity reaches
+its initial 3,373-asset stage but no usable game window is accepted. The current
+Proton log has no old NSI access violation. It does contain an assertion that
+IClientFriends::GetPersonaName failed with internal IPC code 2. That code has
+not been decoded, and is not treated as errno, EResult, or lsteamclient's
+Unix-call return status. The assertion's emitting process and its causal
+position in startup versus teardown still need a controlled API probe.
+
+An additional owned GetAdaptersAddresses run enables only iphlpapi/NSI tracing
+while Steam is present. Its explicit file shows main, DLL load and the same
+adapter error 50. The outer child does not drain within 55 seconds; its original
+operation is recovered with no remaining descendants. That is not an API pass
+or evidence that main failed to execute. Its contrast with the earlier run
+also changes Steam presence and tracing, so no single-factor causal conclusion
+is drawn from the exit timing.
+
+[Proton's loader](https://github.com/ValveSoftware/Proton/blob/proton_11.0/lsteamclient/unixlib.cpp)
+uses HOME/.steam/sdk64/steamclient.so. In this review that resolves through a
+directory symlink to client/linux64. The library beside the active Steam
+executable in client/steamrt64 has different bytes. Hash inequality alone does
+not establish an incompatible version: the libraries can target different
+runtime environments. Proc maps expose no identifying steamclient pathname in
+this run, so the active client's precise mapped DSO identity is not established
+by that observation.
+
+One private A/B changes only the sdk64 directory symlink, preserving its exact
+original target and both real libraries. Selecting client/steamrt64 makes
+Proton fail earlier to load the native client and assert in lsteamclient. It
+does not fix Goose. The original directory symlink is restored and the original
+library hash rechecked; no SDK binary or repository launcher is changed.
+After saving that failure, stock wineserver -k stops only the agent-owned
+Goose/diagnostic prefix. All Wine tasks drain.
+
+The next discriminator is an owned Win64 Steam API control in the actual game
+launch context, with phase/timing markers and boolean-only persona results,
+compared with the corresponding native Linux interface sequence in the same
+container. The
+[generated Proton wrapper](https://github.com/ValveSoftware/Proton/blob/proton_11.0/lsteamclient/cppISteamFriends_SteamFriends017.cpp)
+does not by itself identify the internal Steam IPC error. Game saves and
+licensed SDK/game binaries must stay private throughout that test.
+
+Review closure: the original 33 Stardew files retain contents and non-cloud-
+marker timestamps; Goose's original save retains contents and timestamp; both
+original Graveyard save files retain contents. Steam's original operation exits
+zero with no live tasks. Checked VM stop confirms filesystem/device flush,
+the original owner exits zero, and all four offline filesystem checks return
+zero. No gameplay, audio or save/load acceptance is claimed for Goose here.

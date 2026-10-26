@@ -90,6 +90,9 @@ MSG_PEEK/TRUNC, nonblocking reads, poll/epoll, descriptor aliasing and close.
 Unsupported mutation/subscription operations must report errors. Returning an
 empty success list or suppressing the Wine fault does not implement interface
 enumeration. No netlink kernel implementation is claimed in this checkpoint.
+The subsequent [read-only interface implementation](netlink-route-checkpoint.md)
+records the actual kernel feature and native/Proton controls, separately from
+this earlier diagnosis.
 
 ## Review closure and additional games
 
