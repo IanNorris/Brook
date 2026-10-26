@@ -143,6 +143,9 @@ container. The
 does not by itself identify the internal Steam IPC error. Game saves and
 licensed SDK/game binaries must stay private throughout that test.
 
+The subsequent [API and present-wait checkpoint](steam-api-and-present-wait-checkpoint.md)
+records those actual controls and the native worker dependency they exposed.
+
 Review closure: the original 33 Stardew files retain contents and non-cloud-
 marker timestamps; Goose's original save retains contents and timestamp; both
 original Graveyard save files retain contents. Steam's original operation exits

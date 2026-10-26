@@ -1,0 +1,108 @@
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -1511,7 +1511,7 @@
+          xcb_rectangle_t rect = chain->images[image_index].rects[i];
+          const uint8_t *data = (const uint8_t*)myptr + (rect.y * stride_b) + (rect.x * 4);
+          for (int j = 0; j < rect.height; j++) {
+-            cookie = xcb_put_image(chain->conn, XCB_IMAGE_FORMAT_Z_PIXMAP,
++            cookie = xcb_put_image_checked(chain->conn, XCB_IMAGE_FORMAT_Z_PIXMAP,
+                                    chain->window, chain->gc,
+                                    rect.width,
+                                    1,
+@@ -1519,12 +1519,19 @@
+                                    0, chain->depth,
+                                    rect.width * 4,
+                                    data);
+-            xcb_discard_reply(chain->conn, cookie.sequence);
+-            data += stride_b;
++            /* A checked request establishes server processing after PutImage.
++             * Do not report present completion from the earlier geometry reply. */
++            xcb_generic_error_t *put_error = xcb_request_check(chain->conn, cookie);
++            if (put_error) {
++               free(put_error);
++               xcb_discard_reply(chain->conn, geom_cookie.sequence);
++               return VK_ERROR_SURFACE_LOST_KHR;
++            }
++            data += stride_b;
+          }
+       }
+    } else if (size < max_req_len) {
+-      cookie = xcb_put_image(chain->conn, XCB_IMAGE_FORMAT_Z_PIXMAP,
++      cookie = xcb_put_image_checked(chain->conn, XCB_IMAGE_FORMAT_Z_PIXMAP,
+                              chain->window,
+                              chain->gc,
+                              image->base.row_pitches[0] / 4,
+@@ -1532,14 +1539,21 @@
+                              0,0,0,chain->depth,
+                              image->base.row_pitches[0] * chain->extent.height,
+                              image->base.cpu_map);
+-      xcb_discard_reply(chain->conn, cookie.sequence);
+-   } else {
++      /* A checked request establishes server processing after PutImage.
++       * Do not report present completion from the earlier geometry reply. */
++      xcb_generic_error_t *put_error = xcb_request_check(chain->conn, cookie);
++      if (put_error) {
++         free(put_error);
++         xcb_discard_reply(chain->conn, geom_cookie.sequence);
++         return VK_ERROR_SURFACE_LOST_KHR;
++      }
++   } else {
+       int num_lines = ((max_req_len << 2) - hdr_len) / stride_b;
+       int y_start = 0;
+       int y_todo = chain->extent.height;
+       while (y_todo) {
+          int this_lines = MIN2(num_lines, y_todo);
+-         cookie = xcb_put_image(chain->conn, XCB_IMAGE_FORMAT_Z_PIXMAP,
++         cookie = xcb_put_image_checked(chain->conn, XCB_IMAGE_FORMAT_Z_PIXMAP,
+                                 chain->window,
+                                 chain->gc,
+                                 image->base.row_pitches[0] / 4,
+@@ -1547,8 +1561,15 @@
+                                 0,y_start,0,chain->depth,
+                                 this_lines * stride_b,
+                                 (const uint8_t *)myptr + (y_start * stride_b));
+-         xcb_discard_reply(chain->conn, cookie.sequence);
+-         y_start += this_lines;
++         /* A checked request establishes server processing after PutImage.
++          * Do not report present completion from the earlier geometry reply. */
++         xcb_generic_error_t *put_error = xcb_request_check(chain->conn, cookie);
++         if (put_error) {
++            free(put_error);
++            xcb_discard_reply(chain->conn, geom_cookie.sequence);
++            return VK_ERROR_SURFACE_LOST_KHR;
++         }
++         y_start += this_lines;
+          y_todo -= this_lines;
+       }
+    }
+@@ -1571,6 +1592,21 @@
+    }
+    free(err);
+    free(geom);
++
++   /* PutImage has no X Present completion event. Complete its ID only
++    * after the checked draw requests have been processed, before image reuse
++    * can overwrite image->present_id. This path holds thread_state_lock. */
++   if (xcb_connection_has_error(chain->conn))
++      result = VK_ERROR_SURFACE_LOST_KHR;
++
++   if (result == VK_SUCCESS && image->present_id) {
++      mtx_lock(&chain->present_progress_mutex);
++      if (image->present_id > chain->present_id) {
++         chain->present_id = image->present_id;
++         u_cnd_monotonic_broadcast(&chain->present_progress_cond);
++      }
++      mtx_unlock(&chain->present_progress_mutex);
++   }
+ 
+    wsi_queue_push(&chain->acquire_queue, image_index);
+    return result;
+@@ -2514,7 +2550,7 @@
+       int ret = u_cnd_monotonic_timedwait(&chain->present_progress_cond,
+                                           &chain->present_progress_mutex,
+                                           &abs_timespec);
+-      if (ret == ETIMEDOUT) {
++      if (ret == thrd_timedout) {
+          result = VK_TIMEOUT;
+          break;
+       }
