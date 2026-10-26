@@ -3,8 +3,9 @@
 Stardew gameplay is user-verified and marked compatible on main, with slow
 loading explicitly retained as a limitation. The earlier hard-link/inode-index
 change reduced one request-to-window observation from 333.5 to 128.3 seconds;
-subsequent same-kernel observations varied substantially. This pass adds controls
-and repairs the test harness, not a new production performance optimization.
+subsequent same-kernel observations varied substantially. This pass repairs the
+test harness, adds cache/mount-fanout controls, and implements conservative
+mount-lookup hints. Application measurements and their limits follow below.
 
 ## Reproducible small I/O gate
 
@@ -122,3 +123,92 @@ An incomplete candidate capsule failed before any VM launch and was replaced by
 one containing its matching symbol table. Successful controls are named
 `io-mount-fanout-owned-baseline` and `io-mount-fanout-candidate-complete` in the
 private evidence directory.
+
+## Real Steam/Stardew acceptance and first matched loading pair
+
+The candidate opens the signed-in Steam client and renders its Library and
+Store. One warm-client observation reaches Stardew's process after 41.28 s and
+window after 53.04 s without a profiler during that launch. That observation is
+not a matched comparison with earlier 128–212 s runs. It reads 1,049.8 MiB from
+the data image in 336,019 requests, with 29.94 s of overlapping aggregate read
+service time. The game renders its menu and has an active clocked audio stream.
+After normal game close, a one-second QEMU mixed-output capture contains only
+zero samples; no stale last-buffer playback is detected in that capture.
+
+The subsequent matched pair clones both runs from the same checked, stopped
+private disks, using 8 vCPUs, 8 GiB RAM, the same Intel graphics/display/audio
+configuration and ordinary Steam launch path. All six private image inodes have
+zero measured file-page residency before each launcher starts. The launcher can
+repopulate pages; filesystem metadata and device caches remain uncontrolled.
+There is one run per kernel, in baseline-then-candidate order.
+
+- Baseline: Steam main window observed after 72.32 s; game process after
+  157.20 s and game window after 169.38 s from its launch request. Data-image
+  reads are 1,306.87 MiB in 406,137 requests; writes 161.74 MiB; aggregate read
+  service 53.75 s.
+- Candidate: Steam main window observed after 61.10 s; game window after
+  75.78 s from its request. Data-image reads are 1,285.89 MiB in 400,036
+  requests; writes 158.42 MiB; aggregate read service 42.98 s.
+
+This pair observes about 55% less request-to-window time, with similar data
+traffic. It is encouraging application evidence, not a repeated statistical
+benchmark or a promise of the same reduction on other loads. Shared-host CPU
+pressure, order effects and uncontrolled lower-level cache state remain limits;
+service times overlap and cannot form an additive wall-time breakdown.
+Whole-controller CPU `some` pressure is materially different: 16.43% for the
+baseline and 0.35% for the candidate. These intervals include startup and
+shutdown, not just the game load, and do not attribute pressure to a particular
+process. Therefore the pair does **not** establish a causal 55% code speedup.
+A reverse-order control is required before strengthening that claim.
+
+That reverse-order pair is now complete, using fresh copies of the same seed
+and the same pre-launch file-page control. The candidate reaches the game
+process at 66.52 s and window at 77.78 s; the baseline reaches them at 85.31 s
+and 98.12 s. Steam main-window observations are 61.99 and 60.76 s respectively.
+Whole-controller CPU `some` pressure is 0.34% in both runs, versus the substantial
+imbalance in the first pair. The candidate's data reads are 1,287.29 MiB in
+400,416 requests; baseline reads 1,307.42 MiB in 405,973. Their overlapping
+aggregate read-service times are 40.30 and 42.87 s.
+
+The quieter reverse pair observes about **21% less game request-to-window
+time**. Candidate window times are consistent across the two pairs (75.78 and
+77.78 s); the first baseline's 169.38 s remains a contended observation rather
+than the basis for a 55% optimization claim. Much of the quiet-pair difference
+precedes creation of the game process, consistent with the runtime-preparation
+target. These remain two observations per kernel on a shared host, not a broad
+application benchmark. No further performance change is pursued in this pass.
+Whole-QEMU process CPU observations in the reverse pair are 532.90 CPU-seconds
+for the candidate and 544.99 for baseline, spanning most of the VM interval
+rather than an exclusive game-load phase.
+
+Both games close through their normal WM_DELETE protocol. Both Steam groups
+drain with exit zero, audio streams drain, checked filesystem/device sync
+completes, original VM owners exit zero, and all four offline filesystem checks
+pass. All 33 original save content hashes and non-marker mtimes remain unchanged.
+Cloud-marker mtime changes remain separate from gameplay save writes. The
+candidate's earlier standalone review also passes these checks. Private pair
+evidence is under `build/reviews/stardew-loading-ab-20261026/`.
+Both reverse-pair runs pass the same acceptance checks; their evidence is under
+`build/reviews/stardew-loading-ba-20261026/`.
+
+## Additional-game installer investigation remains open
+
+Graveyard Keeper's owned-game install dialog appears, but confirmation does not
+start a download or create an app manifest in these runs. Input/focus controls
+after the first confirmation do not establish whether the initial callback
+blocked or whether the modal received input. Neither Graveyard Keeper nor
+Untitled Goose Game is accepted or marked compatible by this pass.
+
+A transient CEF reason-213 failure preceded recovery of the Library; a normal
+client restart subsequently renders the Store. In Chromium 126.0.6478.183,
+reason 213 is `INVALID_INITIATOR_ORIGIN`, a semantic origin authorization check.
+The visible `data:` URL alone does not explain it. No kernel IPC repair or
+cache reset is justified by that observation.
+[Exact-version check](https://github.com/chromium/chromium/blob/126.0.6478.183/content/browser/renderer_host/ipc_utils.cc).
+
+The next bounded discriminator is to test checkbox/hover/Cancel on a fresh
+modal **before** pressing Install, then reopen, press Install once and repeat
+the same harmless control. Responsive-before/dead-after supports a blocked
+installation callback; dead-before keeps initialization/routing ahead of it.
+If necessary, inspect recursive X11 child/focus/map/transient relationships
+rather than assuming the large root child is the actual modal input target.
