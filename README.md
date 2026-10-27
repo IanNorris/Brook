@@ -64,6 +64,9 @@ the table distinguishes tested behavior from remaining limitations.
 | Proton GE | 11-10 / DXVK 3.1.1 | ⚠️ Experimental | Standalone Helltaker at 720p: first-puzzle input/reset, captured audio and normal exit verified. Steam client integration remains untested. [Results](docs/proton.md) |
 | Steam | Native64 client | ⚠️ Experimental | QR sign-in, Library, downloads and verification tested through SteamRT. Native64 Stardew gameplay and save/reload across reboot work; game audio and bounded timing-fault recovery verified. Startup remains slow and variable. [Game results](docs/stardew-native64.md), [client limits](docs/steam-library-stability.md) |
 | Stardew Valley | 1.6.15 native64 | ✅ Compatible | Gameplay verified by live user testing through Steam; older saves, sleep-to-save and day-2 reload after a clean VM reboot tested. Loading times remain slow and variable. [Results](docs/stardew-native64.md) |
+| Torchlight II | 1.26.0.1 native64 | ⚠️ Experimental | Character creation, 3D gameplay, movement, save/resume and captured audio in a controlled engine launch; requires a UTF-8 locale archive and an active Steam session. The mod launcher can stall waiting for Steam. [Results](docs/three-games-checkpoint-20261026.md) |
+| Factorio demo | 2.1.23 Linux x64 | ⚠️ Experimental | Tutorial gameplay, movement, fresh save/reload, captured audio and normal exit verified through hardware VirGL; low-memory graphics settings required, startup about 73 seconds. [Results](docs/three-games-checkpoint-20261026.md) |
+| Warzone 2100 | 4.7.0 native64 | ⚠️ Experimental | Hardware VirGL tutorial/campaign rendering, unit input, fresh campaign save/reload, captured audio and normal exit verified. [Results](docs/three-games-checkpoint-20261026.md) |
 | D3D12 / VKD3D-Proton | 3.1.0 | ⚠️ Experimental | Hardware shader/readback, event fences, 720p swapchain resize, Windows SDL3 Snake and Veloren 3D singleplayer through Proton GE. Per-game native shader compiler required for Veloren. [Results and screenshots](docs/d3d12.md) |
 | SpaceVenture (Windows) | 2.08.12 / Unity 2022.3 | ⚠️ Experimental | D3D11/DXVK main menu, opening sequence and first-room interaction; clocked ALSA PCM captured. [Screenshot and limits](docs/wine-unity.md#spaceventure--unity-2022362f2) |
 | Helltaker (Windows) | Unity 2019.2.9f1 | ⚠️ Experimental | 720p D3D11/DXVK first-puzzle gameplay, keyboard movement/restart, minimize/restore and normal exit; clocked ALSA audio captured. [Screenshot and scope](docs/wine-unity.md) |
@@ -73,6 +76,14 @@ the table distinguishes tested behavior from remaining limitations.
 | [VLC](https://www.videolan.org/vlc/) | 3.0.23-2 | ⚠️ Experimental | 720p OSS playback; Wayland black flashes fixed; cold 55-second minimize/restore, normal close and SIGKILL audio cleanup verified; audio timing still experimental |
 
 ## Recent progress
+
+- **More native Linux games:** Warzone 2100 and the Factorio demo pass bounded
+  gameplay, input, save/reload, audio-output and normal-exit checks. Torchlight II
+  reaches its 3D world with a new character and working movement. These tests
+  exposed empty-path stat compatibility errors, an artificial GPU buffer-handle
+  ceiling, a package health check that misclassified debug files, and a missing
+  UTF-8 locale. Startup speed and Torchlight's Steam launcher still need work.
+  [Evidence and limitations](docs/three-games-checkpoint-20261026.md).
 
 - **Steam:** authenticated Library browsing, game download and verification,
   and individual Xwayland windows with focus, move, resize, maximize and
@@ -286,8 +297,27 @@ the table distinguishes tested behavior from remaining limitations.
 
 Click any screenshot to open its original pixels. README previews are smaller
 than the captured desktop; UI text is clearest in the full-resolution image.
-New captures use native 1920×1080 without upscaling. See
+New captures use native 1920×1080 without upscaling; the game-window crops
+below retain their original pixels for readable UI text. See
 [showcase capture and demo plans](docs/showcase.md).
+
+<p align="center">
+  <a href="docs/images/brook_torchlight2_gameplay.png"><img src="docs/images/brook_torchlight2_gameplay.png" alt="Torchlight II's native Linux build rendering Echo Pass on Brook, with a new test character and pet" width="816"></a>
+</p>
+
+<p align="center"><em>Torchlight II — native Linux 3D gameplay in Echo Pass. Original-pixel game-window crop.</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_factorio_tutorial.png"><img src="docs/images/brook_factorio_tutorial.png" alt="Factorio's Linux x64 demo tutorial on Brook after saving and reloading the test game" width="960"></a>
+</p>
+
+<p align="center"><em>Factorio demo — playable tutorial after a fresh save/reload, using the low-memory graphics preset.</em></p>
+
+<p align="center">
+  <a href="docs/images/brook_warzone2100_tutorial.png"><img src="docs/images/brook_warzone2100_tutorial.png" alt="Warzone 2100's tutorial terrain, headquarters and units rendered through hardware VirGL on Brook" width="960"></a>
+</p>
+
+<p align="center"><em>Warzone 2100 — hardware VirGL terrain and units. Campaign save/reload also verified.</em></p>
 
 <p align="center">
   <a href="docs/images/brook_stardew_valley_1080.png"><img src="docs/images/brook_stardew_valley_1080.png" alt="Stardew Valley's native64 Linux build running on Brook through Steam after loading an older save" width="960"></a>

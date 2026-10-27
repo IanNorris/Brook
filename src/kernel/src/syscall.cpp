@@ -3020,7 +3020,9 @@ static bool DrmSysIsDir(const char* path) {
 // matching the upstream virtio-gpu uABI.
 // Mesa's GL3 streaming buffers exceed 256 live objects during first present.
 // Reconstructed BRO-227 fix (06a8d07); keep headroom for console/UI transitions.
-static constexpr uint32_t DRM_MAX_GEM = 2048;
+// Warzone's small terrain buffers exceed 2,048 live handles well before RAM
+// exhaustion. Keep this bounded until the table can grow without moving entries.
+static constexpr uint32_t DRM_MAX_GEM = 8192;
 static DrmMapTokenAllocator g_drmMapTokens;
 static DrmBackingDiagnostics g_drmBackingDiagnostics;
 // File contexts own handle tables; resources own only a small GPU-context

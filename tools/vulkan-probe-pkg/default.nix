@@ -30,6 +30,8 @@ pkgs.stdenv.mkDerivation {
       -I${pkgs.libdrm.dev}/include/libdrm virtgpu-query.c -o virtgpu-query
     $CC -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror \
       -I${pkgs.libdrm.dev}/include/libdrm virtgpu-context.c -o virtgpu-context
+    $CC -std=c11 -O2 -Wall -Wextra -Werror \
+      -I${pkgs.libdrm.dev}/include/libdrm gem-capacity.c -o gem-capacity
     $CC -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror \
       -I${pkgs.libdrm.dev}/include/libdrm virtgpu-blob.c -o virtgpu-blob
     $CC -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror \
@@ -39,7 +41,7 @@ pkgs.stdenv.mkDerivation {
   installPhase = ''
     runHook preInstall
     mkdir -p $out/bin
-    cp vulkan-probe vulkan-wsi-probe virtgpu-query virtgpu-context virtgpu-blob virtgpu-sync-file $out/bin/
+    cp vulkan-probe vulkan-wsi-probe virtgpu-query virtgpu-context gem-capacity virtgpu-blob virtgpu-sync-file $out/bin/
     runHook postInstall
   '';
 }
