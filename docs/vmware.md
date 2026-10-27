@@ -43,9 +43,10 @@ device is still present, with no Brook option files supplied.
 
 Both FAT filesystems pass offline checks, and the control's disposable overlay
 leaves the prepared VMDK unchanged. Private evidence is under
-`build/vmware/probe-20261027-a/`. An initial control waited for a screen-only
-echo marker and reached its deadline despite a completed boot; the corrected
-control waits for the serial desktop-presented event.
+`build/vmware/probe-20261027-b/`, with earlier preparation evidence under
+`probe-20261027-a/`. An initial control waited for an unsupported startup echo
+and reached its deadline despite a completed boot; the corrected image removes
+that command and its control waits for the serial desktop-presented event.
 
 ## Host setup and next gates
 

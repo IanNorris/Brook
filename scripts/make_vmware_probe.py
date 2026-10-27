@@ -55,8 +55,7 @@ def main():
     # directory lives in the RAM disk, so no guest storage driver is needed.
     run('mmd', '-i', initrd, '::BOOT')
     script = output/'INIT.RC'
-    script.write_text('set wm\nset vfb none\nkconsole\n'
-                      'echo VMWARE_PROBE: RAM-backed desktop enabled\n')
+    script.write_text('set wm\nset vfb none\nkconsole\n')
     run('mcopy', '-i', initrd, script, '::BOOT/INIT.RC')
     assert subprocess.check_output(['mtype', '-i', str(initrd), '::BOOT/INIT.RC']) == script.read_bytes()
     esp = output/'esp.img'
