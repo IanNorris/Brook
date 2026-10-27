@@ -1,5 +1,8 @@
 # Brook chrome concepts and toolkit appearance
 
+For the later Raven-inspired glass feasibility review, three visual directions
+and interactive prototype, see the [27 October material study](design/glass/README.md).
+
 Design review, 16 October 2026. These are proposals grounded in the native
 renderer and existing [Midnight Settings capture](images/brook_settings_midnight_1080.png).
 They are not implemented themes or new guest captures. No VM, recording, or
