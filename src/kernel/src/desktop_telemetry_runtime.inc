@@ -51,7 +51,7 @@ static void DrawMetricGraph(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_
     for(unsigned i=0;i<shown;++i){const auto& v=history.samples[(history.next+128-shown+i)%128];
         if(now<v.tick || now-v.tick>10000)continue;
         unsigned value=v.ms>100?100:v.ms;int bar=static_cast<uint64_t>(value)*height/100;if(!bar)bar=1;
-        WmFillRect(pixels,stride,sw,sh,x+width-shown+i,y+height-bar,1,bar,0x68acff);
+        WmFillRect(pixels,stride,sw,sh,x+width-shown+i,y+height-bar,1,bar,0xff68acff);
     }
 }
 static void DrawDesktopMetric(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,
@@ -64,8 +64,8 @@ static void DrawDesktopMetric(uint32_t* pixels,uint32_t stride,uint32_t sw,uint3
         unsigned percent=kind?g_desktopStats.memoryPercent:g_desktopStats.cpuPercent;if(percent>100)percent=100;
         const uint32_t color=percent>=90?0xe06c75:percent>=70?0xe5bf69:0x63b782;
         text(r.x,top,kind?"MEM":"CPU",p.secondaryText);
-        WmFillRect(pixels,stride,sw,sh,r.x,bottom,r.w,line,p.taskButton);
-        WmFillRect(pixels,stride,sw,sh,r.x,bottom,r.w*percent/100,line,color);
+        WmFillRect(pixels,stride,sw,sh,r.x,bottom,r.w,line,WmMaterialColor(p.taskButton));
+        WmFillRect(pixels,stride,sw,sh,r.x,bottom,r.w*percent/100,line,color|0xff000000u);
         char value[12];DesktopNumber(value,percent);size_t n=strlen(value);value[n]='%';value[n+1]=0;
         text(r.x+WmMetric(3),bottom,value,p.taskText);return;
     }

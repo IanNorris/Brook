@@ -4,6 +4,7 @@
 #include "launch_history.h"
 #include "desktop_metrics.h"
 #include "../../shared/brook_theme.h"
+#include "../../shared/brook_appearance.h"
 #include "../../shared/wm_window_state.h"
 
 namespace brook {
@@ -43,6 +44,9 @@ using WmPalette = BrookThemePalette;
 const WmPalette& WmCurrentPalette();
 bool WmSetTheme(uint32_t theme);
 uint32_t WmGetTheme();
+uint32_t WmGetAppearance();
+bool WmSetAppearance(uint32_t value);
+void WmSetPerformanceMode(bool enabled);
 void WmObserveDesktopTick(uint64_t now);
 using WmRect = DesktopRect;
 void WmDrawBuildId(uint32_t*,uint32_t,uint32_t,uint32_t,const WmRect* clip=nullptr);

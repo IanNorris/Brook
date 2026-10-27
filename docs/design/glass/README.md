@@ -22,10 +22,22 @@ highlights approximate the material without reproducing Raven's refractive rim.
 The captures below remain browser concepts. The native compositor now has the
 blue title gradient, active-only 160×4 accent and thin focus edge, 5px corners,
 a small cached shadow and rounded task targets. Native Settings opens as a
-compact 440×560 inspector with working palette selection, scale, persistence
-and preview. Smoked is slate blue and Opal is icy blue; Clearwater remains the
-dark default. The native launcher layout and density/softness controls have
-not been ported from this browser study. Unsupported controls are not shown.
+compact 440-pixel-wide inspector with working palette selection, scale,
+persistence and preview. Its height follows the available display area, with
+scrollable controls and a fixed Apply footer. Smoked is slate blue and Opal is
+icy blue; Clearwater remains the dark default. The browser launcher layout
+remains a concept.
+
+Native Settings now offers an independent light/dark switch, glass opacity
+from 40–100%, and None / Light / Moderate / Heavy backdrop blur. The defaults
+are dark, 80% opacity and Light blur. Opacity affects frame, taskbar and launcher
+fills while retaining readable text/icon coverage and opaque app content. None
+retains transparency and shadows without blur. Performance mode uses opaque
+flat frames without blur or material shadows, retaining the chosen glass
+settings for when it is switched off. All choices save in the existing
+`[Desktop]` user settings section. Files and App Gallery follow light/dark
+changes live; Settings previews them before Apply. Third-party GTK/Qt theme
+propagation is not part of this pass.
 
 The GPU path keeps wallpaper, unchanged chrome and cursor images cached rather
 than inheriting the taskbar's per-frame upload damage. A client-accepted buffer

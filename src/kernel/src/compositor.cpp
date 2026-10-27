@@ -488,7 +488,7 @@ static bool      g_gpuComposite   = false;   // BROOK_COMPOSITE=gpu requested
 static bool      g_gpuDrawReady   = false;   // GL DRAW pipeline available (set in CompositorInit)
 static uint32_t  g_gpuTestOpacity = 0;       // BROOK_GPU_OPACITY: demo opacity for all windows (0 = off)
 static uint32_t  g_gpuTestBlur    = 0;       // BROOK_GPU_BLUR: demo blur radius for all windows (0 = off)
-static bool      g_glassRequested = true, g_glassFrameEnabled = true;
+static uint32_t g_materialFrame = BROOK_APPEARANCE_DEFAULT;
 static bool      g_gpuThumbDump   = false;   // BROOK_GPU_THUMB: base64 thumbnail over serial
 static uint64_t  g_lastThumbTick  = 0;
 static bool      g_fullDump       = false;   // BROOK_GPU_FULL: one-shot full-res frame dump
@@ -738,13 +738,15 @@ bool CompositorGpuActive()
     return g_gpuComposite && g_gpuDrawReady && GpuCompositorGet() != nullptr;
 }
 
-bool CompositorGlassRequested(){return __atomic_load_n(&g_glassRequested,__ATOMIC_ACQUIRE);}
+bool CompositorGlassRequested(){return !(WmGetAppearance()&BROOK_APPEARANCE_PERFORMANCE);}
 void CompositorSetGlassEnabled(bool enabled){
-    __atomic_store_n(&g_glassRequested,enabled,__ATOMIC_RELEASE);CompositorWake();
+    WmSetPerformanceMode(!enabled);
 }
+uint32_t CompositorMaterialOpacity(){return brook_appearance_opacity(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE))*255/100;}
+uint32_t CompositorMaterialBlur(){return brook_appearance_blur_strength(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE));}
 bool CompositorGlassActive(){
     const auto* gpu=GpuCompositorGet();
-    return __atomic_load_n(&g_glassFrameEnabled,__ATOMIC_ACQUIRE) && CompositorGpuActive() && gpu && gpu->BlurSupported && gpu->BlurSupported();
+    return !(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)&BROOK_APPEARANCE_PERFORMANCE) && CompositorGpuActive() && gpu && gpu->BlurSupported && gpu->BlurSupported();
 }
 
 void CompositorInit()
@@ -816,7 +818,7 @@ void CompositorInit()
     // every few seconds, for in-guest visual verification (no host display).
     char glass[8] = {};
     if(FwCfgReadFile("opt/glass",glass,sizeof(glass)-1) && (glass[0]=='0' || (glass[0]=='o' && glass[1]=='f')))
-        __atomic_store_n(&g_glassRequested,false,__ATOMIC_RELEASE);
+        CompositorSetGlassEnabled(false);
     char thumb[8] = {};
     if (FwCfgReadFile("opt/gputhumb", thumb, sizeof(thumb) - 1) >= 1 && thumb[0] == '1')
     {
@@ -1622,7 +1624,7 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
     int ow = (int)w.outerWidth(), oh = (int)w.outerHeight();
     int cx = w.clientX(), cy = w.clientY();
     int cw = (int)w.clientW, ch = (int)w.clientH;
-    auto setAlpha = [](int x, int y, int rw, int rh, uint32_t a) {
+    auto setAlpha = [](int x, int y, int rw, int rh, uint32_t a,bool preserve=false) {
         if (rw <= 0 || rh <= 0) return;
         if (x < 0) { rw += x; x = 0; }
         if (y < 0) { rh += y; y = 0; }
@@ -1632,14 +1634,14 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
         for (int yy = y; yy < y + rh; ++yy)
         {
             uint32_t* row = g_chromeBuffer + (uint32_t)yy * g_backBufStride;
-            for (int xx = x; xx < x + rw; ++xx) row[xx] = (row[xx] & 0x00FFFFFFu) | aShift;
+            for (int xx = x; xx < x + rw; ++xx) if(!preserve || !(row[xx]>>24))row[xx] = (row[xx] & 0x00FFFFFFu) | aShift;
         }
     };
     // Top strip = solid top border (WmMetric(WM_BORDER_WIDTH) rows) + glassy titlebar.
     int topBorderH = (int)WmMetric(WM_BORDER_WIDTH);
     int titleBarH  = (cy - oy) - topBorderH;          // == WmMetric(WM_TITLE_BAR_HEIGHT)
     setAlpha(ox, oy, ow, topBorderH, 0xFF);                              // top border (solid)
-    setAlpha(ox, oy + topBorderH, ow, titleBarH, glass?204:255); // titlebar (glass)
+    setAlpha(ox, oy + topBorderH, ow, titleBarH, glass?CompositorMaterialOpacity():255,glass); // titlebar (glass)
     setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF);             // bottom border (solid)
     setAlpha(ox, cy, cx - ox, ch, 0xFF);                                // left border (solid)
     setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF);
@@ -1713,11 +1715,11 @@ static void OverlayClearRect(int x, int y, int w, int h)
 static void OverlaySetAlphaRect(int x, int y, int w, int h,bool opaque=false)
 {
     if (!g_overlayBuffer || !ClampScreenRect(x, y, w, h)) return;
-    const uint32_t alpha=CompositorGlassActive()&&!opaque?0xcc000000u:0xff000000u;
+    const uint32_t alpha=CompositorGlassActive()&&!opaque?CompositorMaterialOpacity()<<24:0xff000000u;
     for (int yy = y; yy < y + h; ++yy)
     {
         uint32_t* row = g_overlayBuffer + (uint32_t)yy * g_backBufStride;
-        for (int xx = x; xx < x + w; ++xx) row[xx] = (row[xx]&0x00ffffffu) | alpha;
+        for (int xx = x; xx < x + w; ++xx)if(opaque||!(row[xx]>>24))row[xx] = (row[xx]&0x00ffffffu) | alpha;
     }
 }
 
@@ -3297,10 +3299,11 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         uint32_t b = w->blurRadius; if (g_gpuTestBlur) b = g_gpuTestBlur; return b;
     };
     auto effOpacity = [&](const Window* w) -> uint32_t {
+        if(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)&BROOK_APPEARANCE_PERFORMANCE)return 255;
         uint32_t o = w->opacity; if (g_gpuTestOpacity) o = g_gpuTestOpacity; return o;
     };
     auto isGlass    = [&](const Window* w) -> bool {
-        return CompositorGlassActive() && useChromeLayer && gpu->BlurBarrier && !w->noChrome && effBlur(w) > 0;
+        return CompositorGlassActive() && CompositorMaterialBlur()>0 && useChromeLayer && gpu->BlurBarrier && !w->noChrome && effBlur(w) > 0;
     };
 
     // Single strict back-to-front pass. Each window composites as a unit
@@ -3322,8 +3325,8 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         if (!w || !w->visible || w->minimized) continue;
         uint32_t op = effOpacity(w);
         if(CompositorGlassActive() && i+ChromeShadowWindowLimit>=wcount)GpuComposeShadow(gpu,w);
-        if(CompositorGlassActive() && i+ChromeGlassWindowLimit>=wcount && !isGlass(w) && !w->noChrome) {
-            gpu->BlurBarrier(2);
+        if(CompositorGlassActive() && CompositorMaterialBlur()>0 && i+ChromeGlassWindowLimit>=wcount && !isGlass(w) && !w->noChrome) {
+            gpu->BlurBarrier(CompositorMaterialBlur());
             GpuComposeTitleBlur(gpu,w);
         }
         if (isGlass(w) && i+ChromeGlassWindowLimit>=wcount)
@@ -3336,24 +3339,25 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
             GpuComposeChrome(gpu, w, op);
     }
 
+    const uint32_t overlayOpacity=(__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)&BROOK_APPEARANCE_PERFORMANCE)?255:g_overlayOpacity;
     // Taskbar (and launcher) on top of all windows, composited from the alpha
     // overlay layer at g_overlayOpacity (translucent-capable; the launcher sits
     // above windows). Populated in WM mode only; legacy mode has no taskbar.
     if (useOverlayLayer)
     {
-        if(CompositorGlassActive()) {
-            gpu->BlurBarrier(2);
+        if(CompositorGlassActive() && CompositorMaterialBlur()>0) {
+            gpu->BlurBarrier(CompositorMaterialBlur());
             GpuComposeRectBlur(gpu,0,scrH-WmMetric(WM_TASKBAR_HEIGHT),scrW,WmMetric(WM_TASKBAR_HEIGHT));
             if(WmLauncherVisible()) {int32_t x,y;uint32_t w,h;WmLauncherGetRect(scrW,scrH,&x,&y,&w,&h);GpuComposeRectBlur(gpu,x,y,w,h);}
         }
         GpuComposeSrcRect(gpu, g_overlayTex, 0, (int)scrH - (int)WmMetric(WM_TASKBAR_HEIGHT),
-                          (int)scrW, (int)WmMetric(WM_TASKBAR_HEIGHT), g_overlayOpacity, true);
+                          (int)scrW, (int)WmMetric(WM_TASKBAR_HEIGHT), overlayOpacity, true);
         if (WmLauncherVisible())
         {
             int32_t lx, ly; uint32_t lw, lh;
             WmLauncherGetRect(scrW, scrH, &lx, &ly, &lw, &lh);
             GpuComposeSrcRect(gpu, g_overlayTex, lx, ly, (int)lw, (int)lh,
-                              g_overlayOpacity, true);
+                              overlayOpacity, true);
         }
     }
 
@@ -3395,9 +3399,9 @@ static void CompositorLoop()
     if (!g_physFb)
         return;
     // Apply material changes at a frame boundary so chrome and GPU backdrops agree.
-    const bool glass=CompositorGlassRequested();
-    if(glass!=__atomic_load_n(&g_glassFrameEnabled,__ATOMIC_ACQUIRE)){
-        __atomic_store_n(&g_glassFrameEnabled,glass,__ATOMIC_RELEASE);CompositorMarkDirty();
+    const auto material=WmGetAppearance();
+    if(material!=__atomic_load_n(&g_materialFrame,__ATOMIC_ACQUIRE)){
+        __atomic_store_n(&g_materialFrame,material,__ATOMIC_RELEASE);CompositorMarkDirty();
     }
     // Keep the same splash through display takeover and asynchronous asset loading.
     if(BootLogoActive() && WmIsActive()) {

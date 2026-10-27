@@ -1,4 +1,5 @@
 #include "chrome_material.h"
+#include "fw_cfg.h"
 // Brook window manager — z-ordered windows with chrome.
 //
 // Each process gets a Window that wraps its VFB with a title bar, border,
@@ -76,6 +77,18 @@ static void FocusWindowLocked(int idx);
 
 static uint32_t g_themeId = BROOK_THEME_BROOK;
 static bool g_themeSettingsLoaded = false;
+static uint32_t g_appearance = BROOK_APPEARANCE_DEFAULT;
+uint32_t WmGetAppearance(){return __atomic_load_n(&g_appearance,__ATOMIC_ACQUIRE);}
+bool WmSetAppearance(uint32_t value){
+    if(!brook_appearance_valid(value))return false;
+    __atomic_store_n(&g_appearance,value,__ATOMIC_RELEASE);
+    CompositorMarkDirty();CompositorWake();return true;
+}
+void WmSetPerformanceMode(bool enabled){
+    if(enabled)__atomic_fetch_or(&g_appearance,uint32_t(BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_ACQ_REL);
+    else __atomic_fetch_and(&g_appearance,~uint32_t(BROOK_APPEARANCE_PERFORMANCE),__ATOMIC_ACQ_REL);
+    CompositorMarkDirty();CompositorWake();
+}
 uint32_t WmGetTheme() { return __atomic_load_n(&g_themeId, __ATOMIC_ACQUIRE); }
 const WmPalette& WmCurrentPalette() { return *brook_theme_palette(WmGetTheme()); }
 bool WmSetTheme(uint32_t theme)
@@ -95,6 +108,7 @@ static void WmRestoreTheme()
     g_themeSettingsLoaded = true;
     uint32_t selected = BROOK_THEME_BROOK;
     uint32_t selectedScale = 100;
+    uint32_t appearance=WmGetAppearance();
     Vnode* vn = VfsOpen("/data/home/.config/brook/settings.ini", 0);
     if (vn)
     {
@@ -143,11 +157,18 @@ static void WmRestoreTheme()
                     while (*p==' ' || *p=='\t' || *p=='\r') ++p;
                     selectedScale=!*p && digits==3 && DesktopMetrics::Supported(value) ? value : 100;
                 }
+                else if(desktopSection)appearance=brook_appearance_setting(appearance,p);
                 if (!more) break;
                 line = end + 1;
             }
         }
     }
+    char glass[8]{};
+    if(FwCfgReadFile("opt/glass",glass,sizeof(glass)-1)) {
+        if(glass[0]=='0'||(glass[0]=='o'&&glass[1]=='f'))appearance|=BROOK_APPEARANCE_PERFORMANCE;
+        else if(glass[0]=='1'||(glass[0]=='o'&&glass[1]=='n'))appearance&=~BROOK_APPEARANCE_PERFORMANCE;
+    }
+    WmSetAppearance(appearance);
     WmSetScale(selectedScale);
     WmSetTheme(selected);
 }
@@ -553,14 +574,11 @@ static int WmRenderGlyph(uint32_t* buf, uint32_t stride,
             if (static_cast<uint32_t>(px) >= screenW) continue;
             if (static_cast<uint32_t>(py) >= screenH) continue;
 
-            // Alpha blend
-            uint32_t c = cov;
-            uint32_t ic = 255 - c;
-            uint32_t r = ((((fg >> 16) & 0xFF) * c + ((bg >> 16) & 0xFF) * ic) + 128) / 255;
-            uint32_t g = ((((fg >> 8) & 0xFF) * c + ((bg >> 8) & 0xFF) * ic) + 128) / 255;
-            uint32_t b = (((fg & 0xFF) * c + (bg & 0xFF) * ic) + 128) / 255;
-
-            buf[py * stride + px] = (r << 16) | (g << 8) | b;
+            // Preserve foreground coverage over a translucent material fill.
+            // Legacy RGB buffers have alpha zero and remain fully opaque.
+            (void)bg;
+            auto& destination=buf[py*stride+px];
+            destination=ChromePixelOver(destination,(uint32_t(cov)<<24)|(fg&0xffffff));
         }
     }
 
@@ -585,6 +603,22 @@ static void WmRenderString(uint32_t* buf, uint32_t stride,
                                clipRight, clip);
         ++str;
     }
+}
+
+// Keep pale launcher labels legible when a low-opacity panel crosses bright
+// client content. The narrow outline follows glyph coverage, not a solid box.
+static void WmRenderMaterialString(uint32_t* buf,uint32_t stride,uint32_t sw,uint32_t sh,
+                                  int x,int y,const char* text,uint32_t fg,uint32_t bg,int width=0)
+{
+    const unsigned brightness=(((fg>>16)&255)+((fg>>8)&255)+(fg&255))/3;
+    if(CompositorGlassActive() && CompositorMaterialOpacity()<180 && brightness>128){
+        const int offset=WmMetric(1);
+        WmRenderString(buf,stride,sw,sh,x-offset,y,text,0x071526,bg,width);
+        WmRenderString(buf,stride,sw,sh,x+offset,y,text,0x071526,bg,width);
+        WmRenderString(buf,stride,sw,sh,x,y-offset,text,0x071526,bg,width);
+        WmRenderString(buf,stride,sw,sh,x,y+offset,text,0x071526,bg,width);
+    }
+    WmRenderString(buf,stride,sw,sh,x,y,text,fg,bg,width);
 }
 
 static bool WmEqualI(const char* a, const char* b)
@@ -670,13 +704,9 @@ static void WmDrawIcon(uint32_t* buf, uint32_t stride, uint32_t screenW, uint32_
                 const int px = x + col, py = y + row;
                 if (px < 0 || py < 0 || px >= static_cast<int>(screenW) || py >= static_cast<int>(screenH)) continue;
                 const uint32_t src = pixels[(row * LAUNCHER_ICON_PX / size) * LAUNCHER_ICON_PX + col * LAUNCHER_ICON_PX / size];
-                const uint32_t alpha = src >> 24, inv = 255 - alpha;
-                if (!alpha) continue;
-                uint32_t& dst = buf[py * stride + px];
-                const uint32_t r = (((src >> 16) & 255) * alpha + ((dst >> 16) & 255) * inv + 127) / 255;
-                const uint32_t g = (((src >> 8) & 255) * alpha + ((dst >> 8) & 255) * inv + 127) / 255;
-                const uint32_t b = ((src & 255) * alpha + (dst & 255) * inv + 127) / 255;
-                dst = (r << 16) | (g << 8) | b;
+                if(!(src>>24))continue;
+                auto& destination=buf[py*stride+px];
+                destination=ChromePixelOver(destination,src);
             }
         return;
     }
@@ -1556,6 +1586,10 @@ uint32_t WmGetZOrder(int* outIndices, uint32_t maxOut)
 // Chrome rendering
 // ---------------------------------------------------------------------------
 
+static uint32_t WmMaterialColor(uint32_t color){
+    return (color&0xffffff)|(CompositorGlassActive()?CompositorMaterialOpacity()<<24:0xff000000u);
+}
+
 static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
                                 const Window& w,
@@ -1565,7 +1599,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     const int border = WmMetric(WM_BORDER_WIDTH);
     const int ow = w.outerWidth(), oh = w.outerHeight();
     const uint32_t edge = w.focused ? WmCurrentPalette().borderActive : WmCurrentPalette().titleInactive;
-    const uint32_t bg = w.focused ? WmCurrentPalette().titleActive : WmCurrentPalette().titleInactive;
+    const uint32_t bg = WmMaterialColor(w.focused ? WmCurrentPalette().titleActive : WmCurrentPalette().titleInactive);
     const uint32_t fg = w.focused ? WmCurrentPalette().text : WmCurrentPalette().mutedText;
     WmFillRect(buf, stride, screenW, screenH, w.x, w.y, ow, border, edge);
     WmFillRect(buf, stride, screenW, screenH, w.x, w.y, border, oh, edge);
@@ -1576,7 +1610,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     const int titleH=WmMetric(WM_TITLE_BAR_HEIGHT);
     for(int row=0;row<titleH;++row)
         WmFillRect(buf,stride,screenW,screenH,tx,ty+row,w.clientW,1,
-            material?ChromeTitleColor(bg,row,titleH):bg);
+            material?WmMaterialColor(ChromeTitleColor(bg,row,titleH)):bg);
     // A restrained one-pixel edge replaces the old heavy double outline.
     if(border>1){
         WmFillRect(buf,stride,screenW,screenH,w.x+1,w.y+1,ow-2,border-1,bg);
@@ -1759,7 +1793,7 @@ static void WmMaterialRect(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t
     const unsigned radius=CompositorGlassActive()?WmMetric(4):0;
     for(int y=0;y<r.h;++y){const unsigned row=y<r.h/2?y:r.h-1-y;
         const int inset=ChromeCornerInset(radius,row);
-        WmFillRect(pixels,stride,sw,sh,r.x+inset,r.y+y,r.w-2*inset,1,color);
+        WmFillRect(pixels,stride,sw,sh,r.x+inset,r.y+y,r.w-2*inset,1,WmMaterialColor(color));
     }
 }
 
@@ -1771,7 +1805,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     LauncherReadGuard icons;
     const TaskbarLayout l = GetTaskbarLayout(screenW, screenH);
     WmFillRect(backBuffer, stride, screenW, screenH, 0, l.y, screenW,
-               screenH - l.y, WmCurrentPalette().taskbar);
+               screenH - l.y, WmMaterialColor(WmCurrentPalette().taskbar));
     WmFillRect(backBuffer, stride, screenW, screenH, 0, l.y, screenW, 1, WmCurrentPalette().separator);
     auto button = [&](const WmRect& r, const char* title, bool active, bool minimized) {
         uint32_t bg = active ? WmCurrentPalette().taskActive :
@@ -2501,7 +2535,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
 
     // Panel background
     WmFillRect(backBuffer, stride, screenW, screenH,
-               px, py, static_cast<int>(pw), static_cast<int>(ph), WmCurrentPalette().launcher);
+               px, py, static_cast<int>(pw), static_cast<int>(ph), WmMaterialColor(WmCurrentPalette().launcher));
 
     // Border
     WmFillRect(backBuffer, stride, screenW, screenH, px, py, static_cast<int>(pw), 1, WmCurrentPalette().launcherBorder);
@@ -2516,7 +2550,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
 
     // Header: "Applications"
     int32_t iy = py + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING));
-    if (pw > WmMetric(56)) WmRenderString(backBuffer, stride, screenW, screenH,
+    if (pw > WmMetric(56)) WmRenderMaterialString(backBuffer, stride, screenW, screenH,
                    px + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)) + static_cast<int>(WmMetric(4)),
                    iy + static_cast<int32_t>(textYOff),
                    g_launcherError == -2 ? "App launch already pending" : g_launcherError ? "Launch queue full" : ShutdownDesktopStatus(), WmCurrentPalette().secondaryText, WmCurrentPalette().launcher, static_cast<int>(pw) - WmMetric(56));
@@ -2532,7 +2566,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
     const int third=(static_cast<int>(pw)-2*WmMetric(LAUNCHER_PADDING))/3;
     const char* labels[]={"Shut down","Restart","Cancel"};
     for(int i=0;i<3;++i)if(third>static_cast<int>(WmMetric(12)))
-        WmRenderString(backBuffer,stride,screenW,screenH,px+WmMetric(LAUNCHER_PADDING)+i*third+WmMetric(4),footerY+textYOff,labels[i],WmCurrentPalette().text,WmCurrentPalette().launcher,third-WmMetric(8));
+        WmRenderMaterialString(backBuffer,stride,screenW,screenH,px+WmMetric(LAUNCHER_PADDING)+i*third+WmMetric(4),footerY+textYOff,labels[i],WmCurrentPalette().text,WmCurrentPalette().launcher,third-WmMetric(8));
 
     // Items — render in multi-column layout based on scroll offset
     uint32_t totalValid = 0;
@@ -2559,7 +2593,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
         const WmRect item = LauncherItemRect(layout, rendered);
         const int itemX = item.x, itemY = item.y;
         bool hovered = item.contains(mouseX, mouseY);
-        uint32_t itemBg = hovered ? WmCurrentPalette().itemHover : WmCurrentPalette().launcher;
+        uint32_t itemBg = WmMaterialColor(hovered ? WmCurrentPalette().itemHover : WmCurrentPalette().launcher);
 
         WmFillRect(backBuffer, stride, screenW, screenH,
                    itemX, itemY,
@@ -2579,7 +2613,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
                         static_cast<int32_t>(WmMetric(LAUNCHER_ICON_MARGIN));
         uint32_t textFg = hovered ? WmCurrentPalette().text : WmCurrentPalette().taskText;
         int maxTextW = static_cast<int>(layout.itemW) - static_cast<int>(WmMetric(LAUNCHER_ICON_SIZE) + WmMetric(LAUNCHER_ICON_MARGIN) + WmMetric(12));
-        if (maxTextW > 0) WmRenderString(backBuffer, stride, screenW, screenH,
+        if (maxTextW > 0) WmRenderMaterialString(backBuffer, stride, screenW, screenH,
                        textX, itemY + static_cast<int32_t>(textYOff),
                        launcher.items[i].title,
                        textFg, itemBg, maxTextW);
@@ -2591,7 +2625,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
     if (pw >= WmMetric(48) && g_launcherScroll > 0)
     {
         // Wheel-scroll hints live in the header, clear of application labels.
-        WmRenderString(backBuffer, stride, screenW, screenH,
+        WmRenderMaterialString(backBuffer, stride, screenW, screenH,
                        px + static_cast<int32_t>(pw) - static_cast<int>(WmMetric(32)),
                        py + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)) + static_cast<int32_t>(textYOff),
                        "^", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher);
@@ -2599,7 +2633,7 @@ void WmLauncherRender(uint32_t* backBuffer, uint32_t stride,
     if (pw >= WmMetric(48) && g_launcherScroll + maxVisible < totalValid)
     {
         // Down arrow beside the up hint.
-        WmRenderString(backBuffer, stride, screenW, screenH,
+        WmRenderMaterialString(backBuffer, stride, screenW, screenH,
                        px + static_cast<int32_t>(pw) - static_cast<int>(WmMetric(16)),
                        py + static_cast<int32_t>(WmMetric(LAUNCHER_PADDING)) + textYOff,
                        "v", WmCurrentPalette().secondaryText, WmCurrentPalette().launcher);

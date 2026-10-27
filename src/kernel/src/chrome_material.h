@@ -16,6 +16,18 @@ inline uint32_t ChromeMix(uint32_t base,uint32_t tint,unsigned alpha) {
         out|=(((((base>>shift)&255)*(255-alpha)+((tint>>shift)&255)*alpha)+127)/255)<<shift;
     return out;
 }
+// Straight-alpha source-over for compositor-owned text/icon rasterization.
+// Zero destination alpha denotes the historical opaque RGB raster convention.
+inline uint32_t ChromePixelOver(uint32_t dst,uint32_t src){
+    const uint32_t sa=src>>24,da=(dst>>24)?dst>>24:255;
+    if(!sa)return dst;
+    const uint32_t weight=sa*255+da*(255-sa);
+    uint32_t out=((weight+127)/255)<<24;
+    for(unsigned shift=0;shift<24;shift+=8){
+        const uint32_t n=((src>>shift)&255)*sa*255+((dst>>shift)&255)*da*(255-sa);
+        out|=((n+weight/2)/weight)<<shift;
+    }return out;
+}
 inline uint32_t ChromeTitleColor(uint32_t base,unsigned row,unsigned height) {
     if(!height)return base;
     const unsigned middle=height/2;

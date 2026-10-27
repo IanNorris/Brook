@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include "brook_gtk_appearance.h"
 
 #define INDEX_PATH "/nix/index/packages.idx"
 #define MANIFEST_PATH "/nix/profile/manifest.tsv"
@@ -227,6 +228,7 @@ int main(int argc,char **argv) {
     gtk_css_provider_load_from_data(brook_css,"window, dialog { background-color: #172335; color: #e5edf8; } headerbar, toolbar { background: #243c5d; color: #e5edf8; } button, combobox, entry { background: #243a56; color: #e5edf8; border-color: #3c5270; } button:hover { background: #355987; } treeview, textview, viewport { background-color: #1c314c; color: #e5edf8; }",-1,NULL);
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),GTK_STYLE_PROVIDER(brook_css),GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(brook_css);
+    BrookGtkAppearance *appearance=brook_gtk_appearance_new(1);
     GtkCssProvider *style=gtk_css_provider_new();
     gtk_css_provider_load_from_data(style,"* { font-family: Sans; font-size: 16px; } window { background: #f4f7fb; } label, entry, treeview, textview, button { color: #25384e; } button:disabled, button:disabled label { color: #8793a3; } treeview:selected { color: #ffffff; }",-1,NULL);
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),GTK_STYLE_PROVIDER(style),GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);g_object_unref(style);
@@ -258,5 +260,5 @@ int main(int argc,char **argv) {
     log_view=gtk_text_view_new();gtk_text_view_set_editable(GTK_TEXT_VIEW(log_view),FALSE);gtk_text_view_set_monospace(GTK_TEXT_VIEW(log_view),TRUE);gtk_container_add(GTK_CONTAINER(scroll),log_view);
     controls();gtk_widget_show_all(window);gtk_spinner_start(GTK_SPINNER(spinner));
     GTask *task=g_task_new(NULL,NULL,catalog_ready,NULL);g_task_run_in_thread(task,load_catalog);g_object_unref(task);
-    gtk_main();if(filter_idle)g_source_remove(filter_idle);if(catalog)g_ptr_array_unref(catalog);g_hash_table_unref(installed);g_free(query);g_free(output_error);g_object_unref(model);return 0;
+    gtk_main();brook_gtk_appearance_free(appearance);if(filter_idle)g_source_remove(filter_idle);if(catalog)g_ptr_array_unref(catalog);g_hash_table_unref(installed);g_free(query);g_free(output_error);g_object_unref(model);return 0;
 }

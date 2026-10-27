@@ -1203,3 +1203,22 @@ same geometry and GPU compositor. Steady captures now contain four control
 commands per frame rather than seven. Requested desktop/chrome/cursor uploads
 stay at zero; the live overlay still updates. Evidence is in the ignored
 `perf-native-post-style/` directory beside the earlier controls.
+
+### Runtime appearance controls
+
+Settings now exposes light/dark content mode, 40–100% glass opacity, four blur
+presets and Performance mode. None skips backdrop filtering while retaining
+transparency and shadows; Light, Moderate and Heavy use one, two and four
+horizontal/vertical blur pass pairs. Heavy is an optional quality setting,
+not the default used for the measurements above. Performance mode disables
+material shadows/blur and makes shell fills opaque without changing the GPU
+compositor. Missing GPU blur support selects the same opaque fallback.
+
+The validated appearance word is snapshotted at a compositor frame boundary.
+The legacy `gpu glass on|off` command changes only its Performance bit, so it
+preserves opacity, blur and light/dark selections. `gpu glass status` reports
+the requested word and effective opacity/blur, including fallback state.
+`BROOK_GLASS=on|off`, when explicitly supplied, overrides the saved Performance
+choice at boot; leave it unset to restore that user preference. Settings can
+change it afterward. The earlier timing values are not measurements of every
+new blur preset or the taller Settings layout.

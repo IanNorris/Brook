@@ -27,6 +27,8 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <poll.h>
+#include "brook_appearance.h"
 
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
@@ -60,20 +62,21 @@ static int memfd_create_shim(const char *name, unsigned int flags) {
 #define PANES_TOP    TOOLBAR_H
 #define CONTENT_H    (WIN_H - STATUS_H)
 
-/* Colours (ARGB8888) */
-#define COL_BG          0xFF172335   /* dark background */
-#define COL_TREE_BG     0xFF1C314C   /* tree pane bg */
-#define COL_TOOLBAR_BG  0xFF243C5D   /* toolbar bg */
-#define COL_TOOLBAR_BTN 0xFF213149   /* toolbar button bg */
-#define COL_HEADER_BG   0xFF213149   /* column header */
-#define COL_STATUS_BG   0xFF213149   /* status bar */
-#define COL_DIVIDER     0xFF32445D   /* pane divider */
-#define COL_TEXT        0xFFE5EDF8   /* main text */
-#define COL_TEXT_DIM    0xFFA4B2C7   /* dimmed text */
-#define COL_SELECT      0xFF32445D   /* selected row bg */
-#define COL_DIR_TEXT    0xFF89B4FA   /* directory name colour */
-#define COL_SYMLINK     0xFFAACBFF   /* symlink colour */
-#define COL_TREE_ARROW  0xFF89B4FA   /* tree expand arrow */
+/* Colours (ARGB8888), following the shared desktop content mode. */
+static int appearance_dark=1;
+#define COL_BG          (appearance_dark?0xFF172335:0xFFF4F7FC)   /* dark background */
+#define COL_TREE_BG     (appearance_dark?0xFF1C314C:0xFFE7EFF9)   /* tree pane bg */
+#define COL_TOOLBAR_BG  (appearance_dark?0xFF243C5D:0xFFD9E5F5)   /* toolbar bg */
+#define COL_TOOLBAR_BTN (appearance_dark?0xFF213149:0xFFFFFFFF)   /* toolbar button bg */
+#define COL_HEADER_BG   (appearance_dark?0xFF213149:0xFFE4ECF6)   /* column header */
+#define COL_STATUS_BG   (appearance_dark?0xFF213149:0xFFE4ECF6)   /* status bar */
+#define COL_DIVIDER     (appearance_dark?0xFF32445D:0xFFCBD8E8)   /* pane divider */
+#define COL_TEXT        (appearance_dark?0xFFE5EDF8:0xFF25364B)   /* main text */
+#define COL_TEXT_DIM    (appearance_dark?0xFFA4B2C7:0xFF65768B)   /* dimmed text */
+#define COL_SELECT      (appearance_dark?0xFF32445D:0xFFDCE8FA)   /* selected row bg */
+#define COL_DIR_TEXT    (appearance_dark?0xFF89B4FA:0xFF255F9B)   /* directory name colour */
+#define COL_SYMLINK     (appearance_dark?0xFFAACBFF:0xFF4C63A3)   /* symlink colour */
+#define COL_TREE_ARROW  (appearance_dark?0xFF89B4FA:0xFF35659C)   /* tree expand arrow */
 
 /* Limits */
 #define MAX_ENTRIES  512
@@ -1372,14 +1375,27 @@ int main(int argc, char *argv[]) {
     while (!g_got_configure)
         wl_display_roundtrip(dpy);
 
+    long appearance=syscall(BROOK_SYS_WM_APPEARANCE,0L,0L);
+    appearance_dark=appearance<0?1:((appearance&BROOK_APPEARANCE_DARK)!=0);
     /* Initial render + commit */
     commit_frame();
     wl_display_flush(dpy);
 
-    /* Event loop */
-    while (g_running && wl_display_dispatch(dpy) >= 0) {
-        if (g_needs_redraw && !g_frame_cb)
-            commit_frame();
+    /* Keep an idle file browser in sync with desktop content-mode changes.
+     * No frame is submitted unless input or the mode actually changes. */
+    while(g_running){
+        if(wl_display_dispatch_pending(dpy)<0)break;
+        long appearance=syscall(BROOK_SYS_WM_APPEARANCE,0L,0L);
+        int dark=appearance<0?1:((appearance&BROOK_APPEARANCE_DARK)!=0);
+        if(dark!=appearance_dark){appearance_dark=dark;g_needs_redraw=1;}
+        if(g_needs_redraw && !g_frame_cb)commit_frame();
+        int flushed=wl_display_flush(dpy);
+        if(flushed<0 && errno!=EAGAIN)break;
+        struct pollfd fd={wl_display_get_fd(dpy),POLLIN|(flushed<0?POLLOUT:0),0};
+        int ready=poll(&fd,1,500);
+        if(ready<0){if(errno==EINTR)continue;break;}
+        if(fd.revents&(POLLHUP|POLLERR|POLLNVAL))break;
+        if((fd.revents&POLLIN) && wl_display_dispatch(dpy)<0)break;
     }
 
     /* Cleanup */

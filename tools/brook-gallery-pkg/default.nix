@@ -3,6 +3,10 @@ pkgs.stdenv.mkDerivation {
   pname = "brook-gallery";
   version = "0.1";
   src = ./.;
+  postPatch = ''
+    cp ${../../src/shared/brook_appearance.h} brook_appearance.h
+    cp ${../../src/shared/brook_gtk_appearance.h} brook_gtk_appearance.h
+  '';
   nativeBuildInputs = [ pkgs.pkg-config ];
   buildInputs = [ pkgs.gtk3 ];
   buildPhase = ''

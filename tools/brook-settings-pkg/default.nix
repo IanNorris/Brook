@@ -5,7 +5,11 @@ pkgs.stdenv.mkDerivation {
   src = ./.;
   nativeBuildInputs = [ pkgs.pkg-config ];
   buildInputs = [ pkgs.gtk3 ];
-  postPatch = ''cp ${../../src/shared/brook_theme.h} brook_theme.h'';
+  postPatch = ''
+    cp ${../../src/shared/brook_theme.h} brook_theme.h
+    cp ${../../src/shared/brook_appearance.h} brook_appearance.h
+    cp ${../../src/shared/brook_gtk_appearance.h} brook_gtk_appearance.h
+  '';
   buildPhase = ''
     $CC -O2 -Wall -Wextra -Werror settings.c $(pkg-config --cflags --libs gtk+-3.0) -o brook-settings
   '';

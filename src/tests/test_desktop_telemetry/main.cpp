@@ -2,10 +2,29 @@
 #include <cstdint>
 #include <vector>
 #include <cmath>
+#include "../../shared/brook_appearance.h"
 #include "../../kernel/src/chrome_material.h"
 #include "../../kernel/src/desktop_telemetry.h"
 #include "../../shared/boot_splash.h"
 int main(){
+    assert(brook_appearance_valid(BROOK_APPEARANCE_DEFAULT));
+    for(unsigned dark:{0u,1u})for(unsigned perf:{0u,1u})for(unsigned opacity:{40u,80u,100u})for(unsigned blur=0;blur<4;++blur){
+        auto value=brook_appearance_pack(dark,perf,opacity,blur);assert(brook_appearance_valid(value));
+        assert(brook_appearance_opacity(value)==opacity && brook_appearance_blur(value)==blur);
+        assert((value&BROOK_APPEARANCE_DARK)==dark);
+        auto normal=value&~BROOK_APPEARANCE_PERFORMANCE;
+        assert(((value|BROOK_APPEARANCE_PERFORMANCE)&~BROOK_APPEARANCE_PERFORMANCE)==normal);
+    }
+    for(unsigned invalid:{0u,39u<<8,101u<<8,0xffffffffu,BROOK_APPEARANCE_DEFAULT|4u})assert(!brook_appearance_valid(invalid));
+    auto value=brook_appearance_setting(BROOK_APPEARANCE_DEFAULT,"dark=0");assert(!(value&1));
+    value=brook_appearance_setting(value,"opacity=100");assert(brook_appearance_opacity(value)==100);
+    for(const char* invalid:{"opacity=-1","opacity=300","opacity=40junk","opacity=1000","blur=4","dark=2"})
+        assert(brook_appearance_setting(value,invalid)==value);
+    value=brook_appearance_setting(value,"blur=0");assert(brook_appearance_blur_strength(value)==0);
+    // Opaque foreground stays opaque, even over a 40%-opaque material fill.
+    assert(brook::ChromePixelOver(0x6628466f,0xffeeeeee)==0xffeeeeee);
+    auto aa=brook::ChromePixelOver(0x6628466f,0x80eeeeee);assert((aa>>24)>0x66 && (aa>>24)<255);
+    assert((brook::ChromePixelOver(0x0028466f,0x80eeeeee)>>24)==255);
     // Reference circle rasterization at every supported native UI scale.
     for(unsigned radius:{5u,8u,10u})for(unsigned row=0;row<radius;++row){
         const unsigned inset=brook::ChromeCornerInset(radius,row);

@@ -28,6 +28,8 @@ uint64_t CompositorBootDurationMs();
 bool CompositorGpuActive();
 bool CompositorGlassActive();
 bool CompositorGlassRequested();
+uint32_t CompositorMaterialOpacity();
+uint32_t CompositorMaterialBlur();
 void CompositorSetGlassEnabled(bool enabled);
 struct CompositorUploadStats { uint64_t calls[4],bytes[4]; };
 CompositorUploadStats CompositorReadUploads();

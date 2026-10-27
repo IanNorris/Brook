@@ -19,6 +19,8 @@ in stdenv.mkDerivation {
 
   src = ./.;
 
+  postPatch = ''cp ${../../src/shared/brook_appearance.h} brook_appearance.h'';
+
   nativeBuildInputs = [ patchelf wayland-scanner pkg-config ];
   buildInputs = [ wayland freetype ];
 
