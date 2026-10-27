@@ -519,8 +519,9 @@ Copy `build/release/esp/` and `*.img` files from a Linux build.
 ### VMware bring-up
 
 A small [UEFI/RAM-disk probe](docs/vmware.md) is available for VMware
-compatibility testing. The image passes a QEMU portability control; actual
-VMware execution and the full desktop remain unverified.
+compatibility testing. Workstation boots it to a 1080p software desktop with
+two CPUs; QEMU/KVM controls also pass. Persistent storage, networking,
+accelerated graphics and the full application desktop still need porting.
 
 ### Headless inspection on a Linux host
 

@@ -110,7 +110,7 @@ serial0.fileType = "file"
 serial0.fileName = "serial.log"
 serial0.startConnected = "TRUE"
 ''')
-    report = dict(scope='UEFI + RAM-backed software desktop; VMware execution not yet verified',
+    report = dict(scope='UEFI + RAM-backed software desktop; this generated image requires runtime acceptance',
                   bootloader_sha256=sha(bootloader), kernel_sha256=sha(kernel),
                   initrd_sha256=sha(initrd), vmdk_sha256=sha(vmdk),
                   modules={m.name: sha(m) for m in modules},

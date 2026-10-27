@@ -1,7 +1,8 @@
 # VMware bring-up
 
-27 October 2026. VMware execution is not yet verified. A standalone boot probe
-and a QEMU portability control are available; this is not the full Nix desktop.
+27 October 2026. Workstation 25H2u1 boots the standalone probe to a
+1920×1080 software desktop with two vCPUs. This is an early portability
+milestone; the full Nix desktop and its applications are not supported yet.
 
 ## Prepare the probe
 
@@ -31,22 +32,40 @@ the native desktop and a kernel log window without requiring a runtime disk
 driver. Missing user applications and wallpaper are expected in this small
 probe. Guest changes are not persistent.
 
-## Current portability control
+## Verified behavior and timing limits
 
-The same VMDK reaches a 1920×1080 software desktop in QEMU with the VMware SVGA
-device, no VirtIO devices and KVM CPUID exposure disabled. Serial confirms the
-non-KVM LAPIC clock fallback, PS/2 keyboard/mouse initialization, successful
-two-CPU TLB shootdown self-tests and the desktop-presented event. This checks
-image layout and removes several QEMU device dependencies; it does not prove
-VMware firmware, interrupt routing or timing compatibility. QEMU's fw_cfg
-device is still present, with no Brook option files supplied.
+Actual VMware boots through UEFI, initializes both CPUs, passes the TLB
+shootdown self-tests and presents the native desktop. The first boot exposed
+a BSP initialization bug: Brook created execute-disabled page mappings before
+enabling EFER.NXE. Brook now explicitly checks and enables that capability,
+rather than depending on firmware to leave it enabled. LAPIC and IOAPIC MMIO
+also use explicit uncached mappings.
 
-Both FAT filesystems pass offline checks, and the control's disposable overlay
-leaves the prepared VMDK unchanged. Private evidence is under
-`build/vmware/probe-20261027-b/`, with earlier preparation evidence under
-`probe-20261027-a/`. An initial control waited for an unsupported startup echo
-and reached its deadline despite a completed boot; the corrected image removes
-that command and its control waits for the serial desktop-presented event.
+On VMware, elapsed milliseconds use its invariant virtual TSC frequency from
+CPUID leaf `0x40000010`, gated by exact vendor detection, RDTSCP/invariant-TSC
+support and an acknowledged lazy-timer notification. This keeps deadlines and
+RTC elapsed time independent of delivered periodic interrupt counts. KVM
+continues to use its existing paravirtual clock. Unsupported platforms retain
+the IRQ fallback. The VMware millisecond path does not claim nanosecond
+precision or implement the KVM vDSO interface.
+
+A warm ten-second sample measured 10.019 guest seconds against 10.018803245
+seconds from VMware's diagnostic real-time counter. The sample ran on one
+vCPU; it does not establish cross-vCPU or suspend/migration correctness.
+Cold probes showed virtual-time catch-up, so early boot timing remains a
+limitation. See VMware's [timekeeping paper](https://www.vmware.com/docs/vmware_timekeeping)
+for apparent-time behavior and diagnostic counter semantics.
+
+The same current image also boots under QEMU/KVM with KVM CPUID exposed:
+serial selects KVM pvclock and all two-CPU TLB tests pass. Earlier portability
+controls hid KVM CPUID and booted with VMware SVGA, no VirtIO devices and the
+IRQ clock fallback. QEMU's fw_cfg device remains present without Brook option
+files. These controls complement actual VMware testing.
+
+Private probe manifests, serial logs, clock samples and disposable QEMU
+controls are retained under `build/vmware/`. They are generated artifacts and
+are not committed. The RAM-only probes have no runtime disk driver or user
+state to sync; powering one off is not a persistent-filesystem shutdown test.
 
 ## Host setup and next gates
 
@@ -66,8 +85,14 @@ from retaining virtualization hardware while idle; it does not permit both
 hypervisors to own that hardware concurrently. See the
 [Linux kernel parameter documentation](https://docs.kernel.org/6.12/admin-guide/kernel-parameters.html).
 
-The next gates are an actual VMware boot, usable keyboard/mouse, a measured
-clock sanity check and a clean stop/reboot. Brook currently has no AHCI/NVMe,
+Native-console keyboard/mouse acceptance is pending. Loopback VNC captures
+confirm that the desktop updates, but initial remote input attempts have not
+established working guest input. The firmware pointer queue was already
+disabled in the tested boot; the defensive PS/2 handoff is not a demonstrated
+fix for this observation.
+
+The next gates are confirmed usable keyboard/mouse, cold-start clock behavior
+and a persistent-filesystem clean stop/reboot. Brook currently has no AHCI/NVMe,
 e1000/vmxnet3 or VMware SVGA acceleration driver. Persistent disks, networking
 and accelerated graphics therefore require additional work after the probe.
 The QMP-based VM bridge also needs a separate VMware transport before its
