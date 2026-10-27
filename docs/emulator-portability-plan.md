@@ -18,7 +18,9 @@ Generate both configurations from the same hashed Brook image: UEFI, Secure
 Boot off, two CPUs, serial logs, PS/2 input, no network/audio/USB initially.
 Observe real guest responses to typing, modifiers, movement, clicks, wheel and
 capture/release. Sending input is insufficient evidence. Preserve the current
-VMware boot evidence and pending input acceptance in [vmware.md](vmware.md).
+VMware boot evidence and remaining input acceptance in [vmware.md](vmware.md).
+The user has confirmed native-console mouse movement and launcher clicks;
+keyboard, wheel and capture/release still need validation.
 
 ### 2. Validate clocks and SMP
 

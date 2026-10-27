@@ -85,13 +85,15 @@ from retaining virtualization hardware while idle; it does not permit both
 hypervisors to own that hardware concurrently. See the
 [Linux kernel parameter documentation](https://docs.kernel.org/6.12/admin-guide/kernel-parameters.html).
 
-Native-console keyboard/mouse acceptance is pending. Loopback VNC captures
-confirm that the desktop updates, but initial remote input attempts have not
-established working guest input. The firmware pointer queue was already
+The user confirmed mouse movement and launcher clicks work in the native
+VMware console on 27 October 2026. Keyboard, wheel and capture/release
+acceptance remain pending. Loopback VNC captures confirm that the desktop
+updates, but initial remote input attempts have not established working guest
+input through that transport. The firmware pointer queue was already
 disabled in the tested boot; the defensive PS/2 handoff is not a demonstrated
 fix for this observation.
 
-The next gates are confirmed usable keyboard/mouse, cold-start clock behavior
+The next gates are keyboard/wheel/capture acceptance, cold-start clock behavior
 and a persistent-filesystem clean stop/reboot. Brook currently has no AHCI/NVMe,
 e1000/vmxnet3 or VMware SVGA acceleration driver. Persistent disks, networking
 and accelerated graphics therefore require additional work after the probe.
