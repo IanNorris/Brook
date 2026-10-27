@@ -541,6 +541,8 @@ target_compile_options(test_gpu_scene PRIVATE -DBROOK_HOST_TEST -Wno-unused-para
 add_host_test(test_gpu_context)
 
 add_host_test(test_cpu_memory_type)
+add_host_test(test_cpu_execute_disable)
+target_compile_options(test_cpu_execute_disable PRIVATE -UNDEBUG)
 
 add_host_test(test_gpu_aperture)
 

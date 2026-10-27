@@ -327,6 +327,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     IdtInit(&bootProtocol->framebuffer);
     brook::KPuts("IDT loaded\n");
 
+    if (!CpuInitExecuteDisable())
+        KernelPanic("CPU execute-disable support is required before creating kernel page mappings");
+
     brook::PmmInit(bootProtocol);
     brook::KPrintf("PMM ready: %u free pages (%u MB)\n",
                    static_cast<uint32_t>(brook::PmmGetFreePageCount()),

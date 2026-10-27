@@ -2,6 +2,7 @@
 #include "gdt.h"
 #include "serial.h"
 #include "cpu_memory_type.h"
+#include "cpu_execute_disable.h"
 
 // ---------------------------------------------------------------------------
 // CR0 / CR4 bit definitions
@@ -24,6 +25,19 @@ static inline void     WriteCr4(uint64_t v) { __asm__ volatile("mov %0,%%cr4"::"
 
 static bool g_patFailed;
 static uint32_t g_patInitialized;
+
+bool CpuInitExecuteDisable()
+{
+    uint64_t before = 0, after = 0;
+    const bool ready = brook::CpuEnableExecuteDisable(
+        [](uint32_t leaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+            __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(leaf), "c"(0));
+        }, [] { return ReadMsr(MSR_EFER); },
+        [](uint64_t value) { WriteMsr(MSR_EFER, value); }, before, after);
+    brook::SerialPrintf("CPU: execute-disable %s (EFER before=0x%lx after=0x%lx)\n",
+                        ready ? "enabled" : "unavailable", before, after);
+    return ready;
+}
 
 void CpuInitMemoryTypes()
 {

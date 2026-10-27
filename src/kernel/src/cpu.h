@@ -18,6 +18,8 @@
 //   FXSAVE64/FXRSTOR64 (or XSAVE/XRSTOR if AVX is enabled).
 
 void CpuInitFpu();
+// BSP prerequisite for VMM_NO_EXEC mappings, independent of firmware state.
+bool CpuInitExecuteDisable();
 // Early BSP/AP initialization, before any slot4 device mapping exists.
 void CpuInitMemoryTypes();
 // Query after SmpInit admission; a failure on any CPU disables this capability.
