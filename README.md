@@ -516,6 +516,12 @@ Windows requires [QEMU for Windows](https://www.qemu.org/download/#windows)
 installed and on PATH. OVMF firmware is auto-detected from the QEMU install.
 Copy `build/release/esp/` and `*.img` files from a Linux build.
 
+### VMware bring-up
+
+A small [UEFI/RAM-disk probe](docs/vmware.md) is available for VMware
+compatibility testing. The image passes a QEMU portability control; actual
+VMware execution and the full desktop remain unverified.
+
 ### Headless inspection on a Linux host
 
 For a fresh checkout, build the native apps and boot/data disks first. The
