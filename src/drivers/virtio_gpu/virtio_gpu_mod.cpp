@@ -485,7 +485,6 @@ static bool              g_haveVenusCapset = false;
 // Set true once the GPU-clear self-test confirms a live host 3D path.
 static bool              g_gpu3dWorks = false;
 // Set true once Gate #1 (scanout-as-3D-RT present path) is verified.
-static bool              g_gpuScanoutRtOk = false;
 // Set true once the COPY_TRANSFER3D readback (Mesa glReadPixels path) reads back
 // correctly — the deterministic in-kernel reproduction of BRO-188.
 static bool              g_gpuCopyTransferOk = false;
@@ -1134,12 +1133,18 @@ static bool VirtioGpuTakeOverDisplay()
     g_fbBackingPhys = phys.raw();
     g_fbBacking     = reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
     g_fbW = w; g_fbH = h;
-    memset(g_fbBacking, 0, bytes);
+    // Keep the boot splash valid even at the instant of display takeover.
+    // Upload it before binding this resource; remapping the TTY then refreshes
+    // progress in the same backing without exposing a blank host surface.
+    for(uint32_t row=0;row<h;++row)
+        memcpy(g_fbBacking+uint64_t(row)*w*4,ttyPix+uint64_t(row)*(strideBytes/4),w*4);
 
     if (!ResourceCreate2D(RESOURCE_FB, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM, w, h))
     { SerialPuts("virtio_gpu: RESOURCE_CREATE_2D failed\n"); return false; }
     if (!ResourceAttachBackingContig(RESOURCE_FB, g_fbBackingPhys, bytes))
     { SerialPuts("virtio_gpu: ATTACH_BACKING failed\n"); return false; }
+    if (!TransferToHost2D(RESOURCE_FB, 0, 0, w, h, 0))
+    { SerialPuts("virtio_gpu: initial splash upload failed\n"); return false; }
     if (!SetScanout(0, RESOURCE_FB, w, h))
     { SerialPuts("virtio_gpu: SET_SCANOUT failed\n"); return false; }
 
@@ -1149,7 +1154,7 @@ static bool VirtioGpuTakeOverDisplay()
     CompositorRemap(g_fbBackingPhys, w, h, w);
     DisplayRegister(&g_vgpuDisplayOps);
 
-    // Present the initial (cleared) frame.
+    // Publish the remapped TTY splash, preserving it until desktop readiness.
     TransferToHost2D(RESOURCE_FB, 0, 0, w, h, 0);
     ResourceFlush(RESOURCE_FB, 0, 0, w, h);
 
@@ -1526,14 +1531,9 @@ static void VirtioGpu3DSelfTest()
                  corner, centre, blitOk ? "PASS" : "FAIL");
     if (!blitOk) return;
 
-    // --- Gate #1: scanout-as-3D-RT present path ---
-    // The GPU compositor composes into a 3D render-target and presents it via
-    // SET_SCANOUT + FLUSH (no guest framebuffer copy). Prove that path here:
-    // create a scanout-capable 3D RT, SET_SCANOUT it, CLEAR it red, BLIT the
-    // green texture's corner into it, FLUSH (present), then read it back and
-    // verify. A backing is attached only so this test can read the result; the
-    // real compositor scanout needs none. Runs before display takeover, which
-    // re-points scanout 0 at the 2D framebuffer afterwards.
+    // Verify the scanout-capable RT's rendering and readback OFFSCREEN. Never
+    // bind a diagnostic target to the live display during normal boot. The
+    // actual SET_SCANOUT is checked when presenting the first complete desktop.
     {
         const uint32_t sdim  = SCANOUT_TEST_DIM;
         const uint32_t sbytes = sdim * sdim * 4;
@@ -1551,10 +1551,6 @@ static void VirtioGpu3DSelfTest()
         { SerialPuts("virtio_gpu: 3D self-test scanout backing failed\n"); return; }
         if (!CtxAttachResource(CTX_ID_SELFTEST, RES_3D_SCANOUT))
         { SerialPuts("virtio_gpu: 3D self-test scanout ctx-attach failed\n"); return; }
-
-        bool scanoutSet = SetScanout(0, RES_3D_SCANOUT, sdim, sdim);
-        SerialPrintf("virtio_gpu: 3D self-test [scanout] SET_SCANOUT(3D RT) -> %s\n",
-                     scanoutSet ? "OK" : "REJECTED");
 
         // Compose: clear red, then BLIT a 32x32 green corner to (64,64).
         if (!Submit3DClear(CTX_ID_SELFTEST, RES_3D_SCANOUT, SURF_SCANOUT,
@@ -1574,10 +1570,9 @@ static void VirtioGpu3DSelfTest()
         uint32_t sFg = sread[80 * sdim + 80];     // (80,80): inside 64..96 → green
         bool bgRed   = (chanR(sBg) > 0xC0) && (chanG(sBg) < 0x40) && (chanB(sBg) < 0x40);
         bool fgGreen = (chanG(sFg) > 0xC0) && (chanR(sFg) < 0x40) && (chanB(sFg) < 0x40);
-        bool scanoutOk = scanoutSet && flushed && bgRed && fgGreen;
-        SerialPrintf("virtio_gpu: 3D self-test [scanout] bg=0x%08x fg=0x%08x flush=%d -> %s\n",
+        bool scanoutOk = flushed && bgRed && fgGreen;
+        SerialPrintf("virtio_gpu: 3D self-test [offscreen RT] bg=0x%08x fg=0x%08x flush=%d -> %s\n",
                      sBg, sFg, flushed ? 1 : 0, scanoutOk ? "PASS" : "FAIL");
-        g_gpuScanoutRtOk = scanoutOk;
     }
 
     g_gpu3dWorks = true;
