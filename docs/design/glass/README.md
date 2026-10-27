@@ -9,7 +9,8 @@ Run `python3 docs/design/glass/serve.py` from the repository, then open
 public assets. Opening `index.html` directly also works. No third-party network
 requests, build step or package installation are needed for the prototype.
 
-Switch the three themes, adjust tint/blur, compare solid fallback, search the
+Switch the three glass palettes and independent light/dark color mode, adjust
+tint/blur, compare solid fallback, search the
 launcher, drag titlebars, minimize/maximize/close and restore from the taskbar.
 “Use this look” stores only the prototype's appearance in browser local storage.
 Files and app listings are illustrative. The prototype never controls the VM or
@@ -29,6 +30,20 @@ than the previous 22-pixel offset / 65-pixel blur. The Settings miniature echoes
 
 The [v1 Clearwater](clearwater.png), [v1 Smoked](smoked.png) and
 [v1 Opal](opal.png) captures are retained for comparison.
+
+## Independent dark mode
+
+The Appearance switch changes app surfaces and text without changing the glass
+palette or its blue focus accent. All three palettes support both light and dark
+content; the selection persists with the other browser-only appearance settings.
+Old saved Smoked preferences migrate to dark mode, preserving their earlier look.
+The switch supports keyboard activation and exposes its state to accessibility.
+
+This Clearwater dark capture uses 80% tint and 16 px softness to match the review
+reference. Defaults remain 70% and 18 px. The 36-pixel titlebar, active-only accent
+and outline, 5-pixel corners and tighter shadow are shared with the light variant.
+
+![Clearwater dark mode](clearwater-dark.png)
 
 ## Three directions
 
@@ -173,7 +188,8 @@ launch, drag, minimize/restore, maximize/restore, close/reopen, browser-only
 persistence and a compact-width overflow check. V2 additionally checks the
 active-only stroke/outline, exact stroke and corner dimensions, and transfer
 between both windows through pointer activation and keyboard focus in all
-three themes. Captures are 1600×995 at device
+three themes. Six palette/mode combinations additionally verify surface tokens
+and unchanged accents; browser reload verifies dark mode persistence. Captures are 1600×995 at device
 scale 1. No page errors or failed asset loads were observed. The images were
 visually checked after theme transitions settled. Main and the VM are unchanged.
 

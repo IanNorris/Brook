@@ -2,7 +2,7 @@
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Brook · Glass material studies</title>
 <link rel="stylesheet" href="study.css">
-<body data-theme="water" data-material="frosted">
+<body data-theme="water" data-material="frosted" data-color-mode="light">
 <header class="study-controls"><div class="study-identity"><img src="../../../data/branding/brook-mark.png" alt=""><div><strong>Brook / material studies</strong><small>V2 · interactive design prototype · not a guest capture</small></div></div><nav aria-label="Theme concepts"><button data-theme-choice="water" class="chosen">01 &nbsp; Clearwater</button><button data-theme-choice="smoke">02 &nbsp; Smoked glass</button><button data-theme-choice="opal">03 &nbsp; Opal</button></nav><button id="reset">Reset layout ↺</button></header>
 <main id="desktop" aria-label="Brook desktop concept">
 <div class="desktop-label"><span>Brook desktop</span><br>Glass material studies<small id="direction-caption">Clearwater / blue glass, quiet opaque content.</small></div>
@@ -14,7 +14,7 @@
 </section>
 <section id="settings" class="window settings" aria-label="Appearance window">
  <header class="titlebar"><img src="../../../data/icons/settings.svg" alt=""><strong>Appearance</strong><div class="caption"><button data-action="minimize" aria-label="Minimize Appearance">−</button><button data-action="maximize" aria-label="Maximize Appearance">□</button><button data-action="close" class="close" aria-label="Close Appearance">×</button></div></header>
- <div class="settings-body"><div class="eyebrow">DESKTOP APPEARANCE</div><h2>Choose your<br>material.</h2><p>Preview the frame, launcher and navigation.</p>
+ <div class="settings-body"><div class="appearance-heading"><div class="eyebrow">APPEARANCE</div><label class="dark-mode-label" for="dark-mode">Dark mode <input id="dark-mode" type="checkbox" role="switch"></label></div><h2>Choose your<br>material.</h2><p>Preview the frame, launcher and navigation.</p>
  <div class="material-preview"><div class="preview-window"><i></i><span>Window preview</span><b>− &nbsp; □ &nbsp; ×</b></div><div class="preview-content"><i></i><i></i><i></i></div></div>
  <div class="theme-swatches" aria-label="Choose appearance"><button data-theme-choice="water" class="swatch water chosen" aria-label="Clearwater"><span></span>Clearwater</button><button data-theme-choice="smoke" class="swatch smoke" aria-label="Smoked glass"><span></span>Smoked</button><button data-theme-choice="opal" class="swatch opal" aria-label="Opal"><span></span>Opal</button></div>
  <label class="range-label" for="tint">Tint density <output id="tint-value">70%</output></label><input type="range" id="tint" min="45" max="96" value="70">
