@@ -1,4 +1,4 @@
-# Brook glass material study
+# Brook glass material study — v2
 
 27 October 2026. Browser-rendered concepts, not Brook guest screenshots or
 implemented desktop themes. They use Brook's existing wallpaper, B mark and
@@ -16,27 +16,41 @@ Files and app listings are illustrative. The prototype never controls the VM or
 accesses the user's filesystem. It is an authored HTML/CSS/JS study; CSS blur and
 highlights approximate the material without reproducing Raven's refractive rim.
 
+## V2 refinement
+
+The shared glass tint and accents now lean blue rather than green/turquoise.
+Only the active window gets the 160×4-pixel accent stroke above its icon/title
+and the white perimeter. Inactive frames keep a transparent perimeter and no
+stroke. Both pointer activation and keyboard focus transfer these treatments.
+Windows use a 5-pixel corner radius (previously 10), and the launcher uses 6
+(previously 11). Shadows are narrower and darker: the active window uses a
+10-pixel vertical offset / 22-pixel blur, plus a compact contact shadow, rather
+than the previous 22-pixel offset / 65-pixel blur. The Settings miniature echoes the accent.
+
+The [v1 Clearwater](clearwater.png), [v1 Smoked](smoked.png) and
+[v1 Opal](opal.png) captures are retained for comparison.
+
 ## Three directions
 
-**Clearwater** uses blue-green tinted glass, a shallow gloss on the frame, a
+**Clearwater** uses blue tinted glass, a shallow gloss on the frame, a
 bright focus edge and pale opaque content. It is the closest to Aero and the
 recommended starting point for Brook's identity.
 
-![Clearwater](clearwater.png)
+![Clearwater v2](clearwater-v2.png)
 
 **Smoked glass** keeps the same geometry but uses deeper surfaces, restrained
 highlights and light content text. Transparency stays in chrome/navigation;
 the file list and settings remain opaque.
 
-![Smoked glass](smoked.png)
+![Smoked glass v2](smoked-v2.png)
 
-**Opal** uses a warm pale tint, dark text and quiet green folders. It explores
+**Opal** uses a cool pale tint, dark text and muted blue folders. It explores
 a light expression of the same materials, rather than a separate layout.
 
-![Opal](opal.png)
+![Opal v2](opal-v2.png)
 
 The study retains 36-pixel titlebars and 46-pixel caption targets. The taskbar
-is 48 pixels here versus Brook's current 44; 10-pixel corner radii, proportional
+is 48 pixels here versus Brook's current 44; 5-pixel corner radii, proportional
 UI text, the content grid and redesigned Settings are proposals. Browser font
 rendering, clipping and corner masks are not evidence of native support.
 
@@ -156,7 +170,10 @@ compatibility or hardware performance.
 
 The browser prototype passed theme switching, opaque fallback, launcher search,
 launch, drag, minimize/restore, maximize/restore, close/reopen, browser-only
-persistence and a compact-width overflow check. Captures are 1600×995 at device
+persistence and a compact-width overflow check. V2 additionally checks the
+active-only stroke/outline, exact stroke and corner dimensions, and transfer
+between both windows through pointer activation and keyboard focus in all
+three themes. Captures are 1600×995 at device
 scale 1. No page errors or failed asset loads were observed. The images were
 visually checked after theme transitions settled. Main and the VM are unchanged.
 

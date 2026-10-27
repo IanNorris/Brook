@@ -9,7 +9,8 @@ import mimetypes
 STUDY = Path(__file__).resolve().parent
 ROOT = STUDY.parents[2]
 FILES = {f'/{name}': STUDY / name for name in
-         ('index.html', 'study.css', 'study.js', 'clearwater.png', 'smoked.png', 'opal.png')}
+         ('index.html', 'study.css', 'study.js', 'clearwater.png', 'smoked.png', 'opal.png',
+          'clearwater-v2.png', 'smoked-v2.png', 'opal-v2.png')}
 FILES['/'] = STUDY / 'index.html'
 for asset in ('data/branding/brook-mark.png', 'data/wallpaper/brook-dawn.png',
               'data/icons/files.svg', 'data/icons/settings.svg'):
