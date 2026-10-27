@@ -109,7 +109,7 @@ bool KvmClockInit()
     uint32_t features = 0;
     if (!DetectKvm(features))
     {
-        SerialPuts("KvmClock: hypervisor is not KVM; using LAPIC-derived clock\n");
+        SerialPuts("KvmClock: hypervisor is not KVM; checking other elapsed sources\n");
         return false;
     }
     if (!(features & KVM_FEATURE_CLOCKSOURCE2))

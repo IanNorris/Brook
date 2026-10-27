@@ -249,6 +249,7 @@ add_executable(kernel
     src/terminal.cpp
     src/rtc.cpp
     src/kvmclock.cpp
+    src/vmware_clock.cpp
     src/vdso.cpp
     src/display.cpp
     src/gpu_compositor.cpp
@@ -383,6 +384,7 @@ set_source_files_properties(
     src/idt.cpp
     src/gpu_completion.cpp
     src/kvmclock.cpp
+    src/vmware_clock.cpp
     src/apic.cpp
     src/tlb_test.cpp
     src/scheduler.cpp

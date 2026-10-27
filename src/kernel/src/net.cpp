@@ -4171,7 +4171,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     else if (NetStrEq(cmd, "clock status")) {
         const auto clock = ApicGetClockSnapshot();
         BridgeReply reply;
-        reply.text("{\"source\":\""); reply.text(clock.pvclock ? "pvclock" : "lapic-irqs");
+        reply.text("{\"source\":\""); reply.text(clock.pvclock ? "pvclock" : clock.vmwareTsc ? "vmware-tsc" : "lapic-irqs");
         reply.text("\","); reply.field("elapsed_ms", clock.elapsedMs);
         reply.text(","); reply.field("raw_bsp_irqs", clock.rawBspIrqs);
         reply.text(","); reply.field("pvclock_cpu_mask",KvmClockRegisteredCpuMask());
@@ -4181,6 +4181,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         reply.text(","); reply.field("rate_adjustments", clock.rateAdjustments);
         reply.text(","); reply.field("timer_ticks_per_ms", clock.timerTicksPerMs);
         reply.text(","); reply.field("initial_timer_ticks_per_ms", clock.initialTimerTicksPerMs);
+        reply.text(","); reply.field("origin_tsc",clock.originTsc);
+        reply.text(","); reply.field("tsc_khz",clock.tscKhz);
         reply.text("}\n"); reply.send();
     }
     else if(StrStartsWith(cmd,"sched decision watch ") || NetStrEq(cmd,"sched decision off") ||

@@ -51,6 +51,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "fw_cfg.h"
 #include "rtc.h"
 #include "kvmclock.h"
+#include "vmware_clock.h"
 #include "vdso.h"
 #include "watchdog.h"
 #include "string.h"
@@ -419,8 +420,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::ApicInitTlbShootdown();
 
         // Select the elapsed clock before anchoring the CMOS wall-clock epoch.
-        // Falls back silently on bare metal / non-KVM hosts.
+        // Try VMware after KVM; retain delivered IRQ time on other platforms.
         brook::KvmClockInit();
+        if (!brook::KvmClockAvailable()) brook::VmwareClockInit();
         brook::KvmStealInit(0);
         if (!brook::ApicInitElapsedClock())
             brook::SerialPuts("APIC: elapsed clock delivered IRQ fallback\n");

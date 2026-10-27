@@ -59,6 +59,7 @@ void KvmClockTestRegister(uint32_t cpu,uint64_t address,bool aux) {
 }
 volatile uint64_t g_lapicTickCount = 0;
 volatile uint64_t g_lapicRawTickCount = 0;
+uint64_t ApicTickCount() { return g_lapicTickCount; }
 uint8_t RtcTestCmosRead(uint8_t reg) {
     switch(reg) {
     case 0x00: return cmosSeconds;
@@ -317,15 +318,19 @@ int main() {
     RtcSetTimezoneOffset(3600);CHECK(RtcNowLocal()==RtcNow()+3600);
     CHECK(RtcNowNs()==epoch+1000000000);
 
-    // Non-KVM realtime uses raw delivered ticks, never adjustable LAPIC ticks.
-    g_enabled=false;g_lapicRawTickCount=713;RtcInit();
+    // Non-KVM realtime uses the selected millisecond elapsed source.
+    g_enabled=false;g_lapicRawTickCount=713;g_lapicTickCount=700;RtcInit();
     const uint64_t fallbackEpoch=g_wallEpochNs;
     CHECK(RtcNowNs()==fallbackEpoch);
-    g_lapicRawTickCount+=999;g_lapicTickCount=90000;
+    g_lapicRawTickCount+=999;g_lapicTickCount=1699;
     CHECK(RtcNowNs()==fallbackEpoch+999000000);
-    g_lapicRawTickCount+=1;g_lapicTickCount=0;
+    g_lapicRawTickCount+=1;g_lapicTickCount=1700;
     CHECK(RtcNowNs()==fallbackEpoch+1000000000);
     CHECK(RtcNow()==fallbackEpoch/1000000000+1);
+    // On VMware elapsed milliseconds come from virtual TSC, independently of
+    // delivered timer IRQs. Raw IRQ changes cannot advance the RTC epoch.
+    g_lapicRawTickCount+=1234567;
+    CHECK(RtcNowNs()==fallbackEpoch+1000000000);
 
     // RTC frequency discipline must not rewrite the elapsed deadline domain.
     // A backwards step postpones already-armed wakeups; a forwards step can

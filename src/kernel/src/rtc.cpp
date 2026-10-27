@@ -171,8 +171,7 @@ void RtcInit()
 
     g_bootEpochSec = DateToEpoch(fullYear, mon, day, hr, min, sec);
     g_wallUsesPvclock = KvmClockAvailable();
-    g_wallStarted = g_wallUsesPvclock ? KvmClockReadNs() :
-        __atomic_load_n(&g_lapicRawTickCount, __ATOMIC_RELAXED);
+    g_wallStarted = g_wallUsesPvclock ? KvmClockReadNs() : ApicTickCount();
     g_wallEpochNs = g_bootEpochSec * 1000000000ULL;
     g_lastRtcSec = g_bootEpochSec;
     g_lastRateSec = 0;
@@ -263,11 +262,10 @@ void RtcRecalibrateLapic()
 
 uint64_t RtcNowNs()
 {
-    const uint64_t now = g_wallUsesPvclock ? KvmClockReadNs() :
-        __atomic_load_n(&g_lapicRawTickCount, __ATOMIC_RELAXED);
+    const uint64_t now = g_wallUsesPvclock ? KvmClockReadNs() : ApicTickCount();
     // Never combine integer seconds from one clock with another clock's phase.
-    // Raw delivered ticks avoid RTC rebasing on the fallback path; their rate
-    // still depends on timer calibration and interrupt delivery.
+    // The millisecond elapsed API also covers VMware's virtual TSC. Raw
+    // delivered IRQs are a diagnostic count, not that platform's wall clock.
     const uint64_t elapsed = now >= g_wallStarted ? now - g_wallStarted : 0;
     return g_wallEpochNs + elapsed * (g_wallUsesPvclock ? 1ULL : 1000000ULL);
 }

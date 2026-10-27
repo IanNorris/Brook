@@ -12,6 +12,8 @@
 #include "spinlock.h"
 #include "panic.h"
 #include "kvmclock.h"
+#include "vmware_clock.h"
+#include "vmware_clock_policy.h"
 #include "tick_clock.h"
 #include "runtime_accounting.h"
 #include "timer_irq_arrivals.h"
@@ -150,8 +152,9 @@ static bool MapLapic(uint64_t physBase)
     VmmUnmapPage(KernelPageTable, VirtualAddress(g_lapicVirt));
     if (oldPhys) PmmFreePage(oldPhys);
 
+    // PAT slot3 (PCD|PWT) is UC: register accesses must not use a RAM cache type.
     if (!VmmMapPage(KernelPageTable, VirtualAddress(g_lapicVirt), PhysicalAddress(physBase),
-                    VMM_WRITABLE | VMM_NO_EXEC,
+                    VMM_WRITABLE | VMM_NO_EXEC | VMM_CACHE_DISABLE | VMM_WRITE_THRU,
                     MemTag::Device, KernelPid))
     {
         SerialPuts("APIC: failed to map LAPIC MMIO\n");
@@ -186,26 +189,35 @@ static void SoftEnableLapic()
 // Stable elapsed samples publish a global monotonic floor; IRQ counts remain
 // separate and are never interpreted as precise service/wall time on KVM.
 volatile uint64_t g_lapicTickCount = 0;
-static bool g_tickUsesPvclock = false;
+enum TickElapsedSource : uint32_t { TickIrqs, TickPvclock, TickVmwareTsc };
+static uint32_t g_tickSource = TickIrqs;
 static uint64_t g_tickOriginNs = 0;
+static uint64_t g_tickOriginTsc = 0;
 static uint64_t g_tickOriginMs = 0;
 static uint64_t g_tickRejectedSamples = 0;
 static uint64_t g_timerRateAdjustments = 0;
 
 bool ApicInitElapsedClock()
 {
-    if (__atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE)) return true;
+    if (__atomic_load_n(&g_tickSource, __ATOMIC_ACQUIRE)!=TickIrqs) return true;
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    bool selected = __atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE);
+    bool selected = __atomic_load_n(&g_tickSource, __ATOMIC_ACQUIRE)!=TickIrqs;
     if (!selected) {
         uint64_t now = 0;
         if (KvmClockReadStableNs(&now)) {
             g_tickOriginNs = now;
             g_tickOriginMs = __atomic_load_n(&g_lapicTickCount, __ATOMIC_ACQUIRE);
-            __atomic_store_n(&g_tickUsesPvclock, true, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_tickSource, uint32_t(TickPvclock), __ATOMIC_RELEASE);
             selected = true;
             SerialPrintf("APIC: elapsed clock KVM pvclock (origin_ms=%lu)\n", g_tickOriginMs);
+        } else if (VmwareClockReadTicks(&now)) {
+            g_tickOriginTsc=now;
+            g_tickOriginMs=__atomic_load_n(&g_lapicTickCount,__ATOMIC_ACQUIRE);
+            __atomic_store_n(&g_tickSource,uint32_t(TickVmwareTsc),__ATOMIC_RELEASE);
+            selected=true;
+            SerialPrintf("APIC: elapsed clock VMware TSC (origin_ms=%lu khz=%u)\n",
+                         g_tickOriginMs,VmwareClockTscKhz());
         }
     }
     if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
@@ -435,10 +447,10 @@ extern "C" void LapicTimerHandlerInner(uint64_t interruptedRip, uint64_t interru
     if (cpuId == 0)
     {
         __atomic_add_fetch(&g_lapicRawTickCount, 1, __ATOMIC_RELAXED);
-        if (!__atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE))
+        if (__atomic_load_n(&g_tickSource, __ATOMIC_ACQUIRE)==TickIrqs)
             ApicInitElapsedClock();
     }
-    if (__atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&g_tickSource, __ATOMIC_ACQUIRE)!=TickIrqs) {
         ApicTickCount();
     } else if (cpuId == 0) {
         const uint64_t previous = __atomic_load_n(&g_lapicTickCount, __ATOMIC_ACQUIRE);
@@ -729,7 +741,7 @@ uint32_t ApicGetTimerTicksPerMs()
 // boot-time calibration so we can never brick the scheduler tick.
 void ApicAdjustTimerRate(uint32_t observedTicksPerSec)
 {
-    if (__atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE)) return;
+    if (__atomic_load_n(&g_tickSource, __ATOMIC_ACQUIRE)!=TickIrqs) return;
     if (g_timerTicksPerMs == 0 || g_timerTicksOrigCalibration == 0) return;
 
     // Reject wildly implausible observations — likely a missed RTC second
@@ -1680,8 +1692,9 @@ bool IoApicInit(uint64_t ioApicPhysical, uint32_t gsiBase)
     VmmUnmapPage(KernelPageTable, VirtualAddress(g_ioApicVirt));
     if (oldPhys) PmmFreePage(oldPhys);
 
+    // Match the LAPIC register mapping's explicit uncached memory type.
     if (!VmmMapPage(KernelPageTable, VirtualAddress(g_ioApicVirt), PhysicalAddress(ioApicPhysical),
-                    VMM_WRITABLE | VMM_NO_EXEC,
+                    VMM_WRITABLE | VMM_NO_EXEC | VMM_CACHE_DISABLE | VMM_WRITE_THRU,
                     MemTag::Device, KernelPid))
     {
         SerialPuts("IOAPIC: failed to map MMIO\n");
@@ -1732,10 +1745,13 @@ void ApicInitTimerOnAp()
 
 uint64_t ApicTickCount()
 {
-    if (__atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE)) {
+    const auto source=__atomic_load_n(&g_tickSource,__ATOMIC_ACQUIRE);
+    if (source!=TickIrqs) {
         uint64_t now = 0, sample = 0;
-        if (KvmClockReadStableNs(&now) &&
-            TickClockElapsedMs(g_tickOriginNs, g_tickOriginMs, now, &sample))
+        const bool valid=source==TickPvclock ?
+            (KvmClockReadStableNs(&now) && TickClockElapsedMs(g_tickOriginNs,g_tickOriginMs,now,&sample)) :
+            (VmwareClockReadTicks(&now) && VmwareTscElapsedMs(g_tickOriginTsc,g_tickOriginMs,now,VmwareClockTscKhz(),&sample));
+        if (valid)
             return TickClockPublishFloor(&g_lapicTickCount, sample);
         // Retain the last published floor through an unavailable/regressing
         // sample. Falling back to a freshly counted IRQ would invent time.
@@ -1748,11 +1764,18 @@ ApicClockSnapshot ApicGetClockSnapshot()
 {
     ApicClockSnapshot snapshot{};
     snapshot.elapsedMs = ApicTickCount();
-    snapshot.pvclock = __atomic_load_n(&g_tickUsesPvclock, __ATOMIC_ACQUIRE);
+    const auto source=__atomic_load_n(&g_tickSource,__ATOMIC_ACQUIRE);
+    snapshot.pvclock = source==TickPvclock;
+    snapshot.vmwareTsc = source==TickVmwareTsc;
     snapshot.rawBspIrqs = __atomic_load_n(&g_lapicRawTickCount, __ATOMIC_RELAXED);
     if (snapshot.pvclock) {
         snapshot.originNs = g_tickOriginNs;
         snapshot.originMs = g_tickOriginMs;
+    }
+    if (snapshot.vmwareTsc) {
+        snapshot.originMs=g_tickOriginMs;
+        snapshot.originTsc=g_tickOriginTsc;
+        snapshot.tscKhz=VmwareClockTscKhz();
     }
     snapshot.rejectedSamples = __atomic_load_n(&g_tickRejectedSamples, __ATOMIC_RELAXED);
     snapshot.rateAdjustments = __atomic_load_n(&g_timerRateAdjustments, __ATOMIC_RELAXED);

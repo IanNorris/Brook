@@ -98,11 +98,12 @@ void ApicInitTimerOnAp();
 uint64_t ApicTickCount();
 
 // BSP only. Preserve the existing origin when selecting stable elapsed time.
-// A BSP timer interrupt retries if the initial stable-page read is unavailable.
+// A BSP timer interrupt retries if the initial elapsed-source sample is unavailable.
 bool ApicInitElapsedClock();
 
 struct ApicClockSnapshot {
     bool pvclock;
+    bool vmwareTsc;
     uint64_t elapsedMs;
     uint64_t rawBspIrqs;
     uint64_t originNs;
@@ -111,6 +112,8 @@ struct ApicClockSnapshot {
     uint64_t rateAdjustments;
     uint32_t timerTicksPerMs;
     uint32_t initialTimerTicksPerMs;
+    uint64_t originTsc;
+    uint32_t tscKhz;
 };
 ApicClockSnapshot ApicGetClockSnapshot();
 

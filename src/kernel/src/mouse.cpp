@@ -5,6 +5,7 @@
 // Updates cursor position and pushes events to the input subsystem.
 
 #include "mouse.h"
+#include "vmware_platform.h"
 #include "input.h"
 #include "compositor.h"
 #include "idt.h"
@@ -259,6 +260,25 @@ IRQ_NAKED_HANDLER(MouseIrqHandler, MouseIrqHandlerInner)
 void MouseInit()
 {
     if (g_mouseInit) return;
+
+    // VMware firmware/tools may leave the paravirtual pointer enabled. This
+    // driver consumes ordinary relative PS/2 packets, not the backdoor queue.
+    // Disable that queue before resetting the PS/2 mouse (Linux vmmouse reset
+    // performs the same handoff). Do not issue these port commands elsewhere.
+    if (VmwarePlatformPresent([](uint32_t leaf,uint32_t& a,uint32_t& b,uint32_t& c,uint32_t& d){
+        __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(leaf),"c"(0));
+    })) {
+        uint32_t a=0x564d5868u,b=0,c=40,d=0x5658;
+        VmwareBackdoor(a,b,c,d);
+        const auto before=a;
+        if ((before&0xffff0000u)!=0xffff0000u) {
+            a=0x564d5868u;b=0xf5;c=41;d=0x5658;
+            VmwareBackdoor(a,b,c,d);
+            a=0x564d5868u;b=0;c=40;d=0x5658;
+            VmwareBackdoor(a,b,c,d);
+        }
+        SerialPrintf("MOUSE: VMware pointer queue before=0x%x after=0x%x (relative PS/2 driver)\n",before,a);
+    }
 
     SerialPuts("MOUSE: initialising PS/2 auxiliary device\n");
 
