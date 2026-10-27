@@ -22,7 +22,11 @@ void CompositorRetireVfb(CompositorVfbAllocation* item);
 // Initialise the compositor (caches physical FB info).
 // Must be called after TtyInit().
 void CompositorInit();
+void CompositorBootAssetsPending(bool pending);
+uint64_t CompositorDesktopReadyTick();
+uint64_t CompositorBootDurationMs();
 bool CompositorGpuActive();
+bool CompositorGlassActive();
 
 // Get physical framebuffer dimensions.
 extern "C" void CompositorGetPhysDims(uint32_t* w, uint32_t* h);

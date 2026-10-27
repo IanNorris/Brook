@@ -846,12 +846,12 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::SmpPrepareAPs();
         brook::KLog("SMP: all APs prepared");
 
-        brook::BootLogoProgress(100, "Ready");
+        brook::BootLogoProgress(92, "Desktop services");
         brook::KLog("BOOT: complete, entering shell/scheduler");
         brook::KLogSync();
 
         // Clear the boot logo before starting the shell/processes.
-        brook::BootLogoClear();
+        // Keep the splash until wallpaper, icons and the first desktop frame are ready.
 
         // Constrain TTY to a status bar at the bottom of the screen so boot
         // script output doesn't overwrite the compositor area.

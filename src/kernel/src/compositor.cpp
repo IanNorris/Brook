@@ -3,6 +3,8 @@
 #include "scene_damage.h"
 #include "desktop_pointer_route.h"
 #include "compositor.h"
+#include "boot_logo.h"
+#include "kvmclock.h"
 #include "compositor_scene.h"
 #include "cursor_composition.h"
 #include "spinlock.h"
@@ -459,6 +461,11 @@ static void PresentStatsReport()
 }
 
 // Wallpaper: raw XRGB pixel data loaded from disk, or solid color fallback.
+static bool g_bootAssetsPending=false;
+static uint64_t g_desktopReadyTick=0,g_bootDurationMs=0;
+void CompositorBootAssetsPending(bool pending){__atomic_store_n(&g_bootAssetsPending,pending,__ATOMIC_RELEASE);CompositorWake();}
+uint64_t CompositorDesktopReadyTick(){return __atomic_load_n(&g_desktopReadyTick,__ATOMIC_ACQUIRE);}
+uint64_t CompositorBootDurationMs(){return __atomic_load_n(&g_bootDurationMs,__ATOMIC_ACQUIRE);}
 static uint32_t* g_wallpaper       = nullptr;
 static uint32_t  g_wallpaperWidth  = 0;
 static uint32_t  g_wallpaperHeight = 0;
@@ -710,6 +717,11 @@ bool CompositorGpuActive()
     // compositor path is the fallback. g_gpuDrawReady is resolved in
     // CompositorInit, which runs after the driver registers its ops.
     return g_gpuComposite && g_gpuDrawReady && GpuCompositorGet() != nullptr;
+}
+
+bool CompositorGlassActive(){
+    const auto* gpu=GpuCompositorGet();
+    return CompositorGpuActive() && gpu && gpu->BlurSupported && gpu->BlurSupported();
 }
 
 void CompositorInit()
@@ -1328,6 +1340,7 @@ static void BlitWallpaper()
         for(uint32_t y=0;y<g_physFbHeight;++y)
             for(uint32_t x=0;x<g_physFbWidth;++x)dstBase[y*dstStride+x]=0x00001a3a;
     }
+    WmDrawBuildId(dstBase,dstStride,g_physFbWidth,g_physFbHeight);
     MarkAllDirty();
 }
 
@@ -1360,6 +1373,9 @@ static void BlitWallpaperRegion(const SceneRect& region)
         __builtin_memcpy(row+left,g_wallpaper+(y-offY)*g_wallpaperWidth+left-offX,(right-left)*4);
         for(int64_t x=right;x<clip.right;++x)row[x]=0x00001a3a;
     }
+    const WmRect badgeClip{static_cast<int>(clip.left),static_cast<int>(clip.top),
+        static_cast<int>(clip.right-clip.left),static_cast<int>(clip.bottom-clip.top)};
+    WmDrawBuildId(dst,stride,g_physFbWidth,g_physFbHeight,&badgeClip);
     MarkDirtyRows(static_cast<uint32_t>(clip.top),static_cast<uint32_t>(clip.bottom));
 }
 
@@ -1572,7 +1588,7 @@ static bool EnsureChromeBuffer()
 // pixels are a hard rectangular mask (no AA against the backdrop), so writing a
 // per-region alpha is exact. The titlebar gets WM_CHROME_TITLE_ALPHA (~85%) for
 // a glassy hint of transparency; the frame borders stay solid (0xFF).
-static void SetChromeDecorAlpha(const Window& w)
+static void SetChromeDecorAlpha(const Window& w, bool glass)
 {
     if (!g_chromeBuffer || w.noChrome) return;
     int ox = w.x, oy = w.y;
@@ -1596,10 +1612,19 @@ static void SetChromeDecorAlpha(const Window& w)
     int topBorderH = (int)WmMetric(WM_BORDER_WIDTH);
     int titleBarH  = (cy - oy) - topBorderH;          // == WmMetric(WM_TITLE_BAR_HEIGHT)
     setAlpha(ox, oy, ow, topBorderH, 0xFF);                              // top border (solid)
-    setAlpha(ox, oy + topBorderH, ow, titleBarH, WM_CHROME_TITLE_ALPHA); // titlebar (glass)
+    setAlpha(ox, oy + topBorderH, ow, titleBarH, glass?204:255); // titlebar (glass)
     setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF);             // bottom border (solid)
     setAlpha(ox, cy, cx - ox, ch, 0xFF);                                // left border (solid)
-    setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF);             // right border (solid)
+    setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF);
+    if(glass) {
+        const uint32_t fg=w.focused?WmCurrentPalette().text:WmCurrentPalette().mutedText;
+        for(int y=oy+topBorderH;y<cy;++y)for(int x=ox;x<ox+ow;++x) {
+            if(x<0||y<0||x>=int(g_physFbWidth)||y>=int(g_physFbHeight))continue;
+            auto& pixel=g_chromeBuffer[uint64_t(y)*g_backBufStride+x];
+            const uint32_t rgb=pixel&0xffffff;
+            if(rgb==fg||rgb==0x68acff)pixel|=0xff000000;
+        }
+    }
 }
 
 // GPU DRAW overlay layer (taskbar + launcher): lazily allocate the full-screen
@@ -1642,13 +1667,14 @@ static void OverlayClearRect(int x, int y, int w, int h)
 // Mark a rect of the overlay buffer opaque (alpha 0xFF). Taskbar and launcher are
 // solid hard-edged rectangles (no AA against the backdrop), so a per-rect alpha OR
 // is exact — same reasoning as the chrome decoration rects.
-static void OverlaySetAlphaRect(int x, int y, int w, int h)
+static void OverlaySetAlphaRect(int x, int y, int w, int h,bool opaque=false)
 {
     if (!g_overlayBuffer || !ClampScreenRect(x, y, w, h)) return;
+    const uint32_t alpha=CompositorGlassActive()&&!opaque?0xcc000000u:0xff000000u;
     for (int yy = y; yy < y + h; ++yy)
     {
         uint32_t* row = g_overlayBuffer + (uint32_t)yy * g_backBufStride;
-        for (int xx = x; xx < x + w; ++xx) row[xx] |= 0xFF000000u;
+        for (int xx = x; xx < x + w; ++xx) row[xx] = (row[xx]&0x00ffffffu) | alpha;
     }
 }
 
@@ -1684,6 +1710,10 @@ static void CompositorLoopWM()
         ProcessUnref(owner);
     }
     uint64_t now = ApicTickCount();
+    static bool summaryShown=false;
+    int32_t summaryX=0,summaryY=0;uint32_t summaryW=0,summaryH=0;
+    const bool showSummary=WmBootSummaryRect(g_physFbWidth,g_physFbHeight,&summaryX,&summaryY,&summaryW,&summaryH);
+    if(summaryShown && !showSummary)CompositorMarkDirty();
     bool forceAll = (now - g_lastForceBlitTick >= FORCE_BLIT_INTERVAL_MS);
     if (forceAll) g_lastForceBlitTick = now;
 
@@ -1744,6 +1774,7 @@ static void CompositorLoopWM()
     int sorted[WM_MAX_WINDOWS];
     uint32_t wcount = WmGetZOrder(sorted, WM_MAX_WINDOWS);
 
+    WmObserveDesktopTick(now);
     SceneRect cpuDamage;
     const bool cpuPartial=!CompositorGpuActive() && !fullRepaint;
     if(cpuPartial) {
@@ -1904,7 +1935,7 @@ static void CompositorLoopWM()
                 WmRenderChromeForWindow(g_chromeBuffer, g_backBufStride,
                                          g_physFbWidth, g_physFbHeight, sorted[i],
                                          chromeMx, chromeMy);
-                SetChromeDecorAlpha(*cw);
+                SetChromeDecorAlpha(*cw, CompositorGlassActive() && i+15>=wcount);
             }
         }
         else if (g_backBuffer)
@@ -1963,7 +1994,18 @@ static void CompositorLoopWM()
             MarkDirtyRows(0, g_physFbHeight);
         }
     }
-
+    if(showSummary) {
+        auto* destination=drawOverlayLayer?g_overlayBuffer:g_backBuffer;
+        if(destination) {
+            WmRenderBootSummary(destination,g_backBufStride,g_physFbWidth,g_physFbHeight);
+            if(drawOverlayLayer)OverlaySetAlphaRect(summaryX,summaryY,summaryW,summaryH,true);
+            MarkDirtyRows(summaryY,summaryY+summaryH);
+        }
+    } else if(summaryShown && drawOverlayLayer) {
+        OverlayClearRect(0,0,g_physFbWidth,WmDesktopFont().lineHeight*4+WmMetric(60));
+        MarkDirtyRows(0,WmDesktopFont().lineHeight*4+WmMetric(60));
+    }
+    summaryShown=showSummary;
 }
 
 static DesktopPointerGate g_desktopPointerGate;
@@ -3199,13 +3241,19 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     // frosts exactly what is beneath it, including lower glass windows. The driver
     // supports multiple barriers per frame; correct for 3+ interleaved/stacked
     // glass windows (BRO-185).
+    // The driver has sixteen backdrop barriers. Reserve one for the shell;
+    // lower windows use opaque title bars rather than sampling a stale backdrop.
     for (uint32_t i = 0; i < wcount; ++i)
     {
         int idx = sorted[i];
         Window* w = WmGetWindow(idx);
         if (!w || !w->visible || w->minimized) continue;
         uint32_t op = effOpacity(w);
-        if (isGlass(w))
+        if(CompositorGlassActive() && i+15>=wcount && !isGlass(w) && !w->noChrome) {
+            gpu->BlurBarrier(2);
+            GpuComposeRectBlur(gpu,w->x,w->y,w->outerWidth(),w->clientY()-w->y);
+        }
+        if (isGlass(w) && i+15>=wcount)
         {
             gpu->BlurBarrier(effBlur(w));                               // blur everything below this window
             GpuComposeWindowBlur(gpu, w);                              // frosted backdrop over the whole window
@@ -3220,6 +3268,11 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
     // above windows). Populated in WM mode only; legacy mode has no taskbar.
     if (useOverlayLayer)
     {
+        if(CompositorGlassActive()) {
+            gpu->BlurBarrier(2);
+            GpuComposeRectBlur(gpu,0,scrH-WmMetric(WM_TASKBAR_HEIGHT),scrW,WmMetric(WM_TASKBAR_HEIGHT));
+            if(WmLauncherVisible()) {int32_t x,y;uint32_t w,h;WmLauncherGetRect(scrW,scrH,&x,&y,&w,&h);GpuComposeRectBlur(gpu,x,y,w,h);}
+        }
         GpuComposeSrcRect(gpu, g_overlayTex, 0, (int)scrH - (int)WmMetric(WM_TASKBAR_HEIGHT),
                           (int)scrW, (int)WmMetric(WM_TASKBAR_HEIGHT), g_overlayOpacity, true);
         if (WmLauncherVisible())
@@ -3231,6 +3284,10 @@ static void CompositorPresentGPU(uint32_t dirtyMinY, uint32_t dirtyMaxY)
         }
     }
 
+    if(useOverlayLayer) {
+        int32_t x,y;uint32_t w,h;
+        if(WmBootSummaryRect(scrW,scrH,&x,&y,&w,&h))GpuComposeSrcRect(gpu,g_overlayTex,x,y,w,h,255,true);
+    }
     // Cursor (alpha) on top of everything.
     if (!WmPointerCaptureActive() && __atomic_load_n(&g_defaultCursorVisible, __ATOMIC_ACQUIRE) && g_cursorTex &&
         MouseIsAvailable())
@@ -3264,6 +3321,20 @@ static void CompositorLoop()
     FrameTimingScope framePhase(FramePhase::Preparation);
     if (!g_physFb)
         return;
+    // Keep the same splash through display takeover and asynchronous asset loading.
+    if(BootLogoActive() && WmIsActive()) {
+        const bool pending=__atomic_load_n(&g_bootAssetsPending,__ATOMIC_ACQUIRE);
+        static unsigned previous=0;
+        const unsigned stage=pending?96:100;
+        if(previous!=stage) {
+            previous=stage;BootLogoProgress(stage,pending?"Desktop assets":"Ready");
+            if(g_backBuffer)for(uint32_t y=0;y<g_physFbHeight;++y)
+                memcpy(const_cast<uint32_t*>(g_physFb)+y*g_physFbStride,g_backBuffer+y*g_backBufStride,g_physFbWidth*4);
+            DisplayFlush(0,g_physFbHeight);
+            if(!pending) SchedulerSleepMs(50);
+        }
+        if(pending)return;
+    }
     DebugFrameGeometry presented;
     {
         CompositorMutexGuard geometry(&g_scanoutMappingLock);
@@ -3474,6 +3545,12 @@ static void CompositorLoop()
 
     // Present-timing: record this frame's period + loop time and
     // periodically emit a summary on serial.  Additive diagnostics.
+    if(BootLogoActive() && WmIsActive()) {
+        uint64_t ns=0;const uint64_t now=ApicTickCount();
+        __atomic_store_n(&g_bootDurationMs,KvmClockReadStableNs(&ns)?ns/1000000:now,__ATOMIC_RELEASE);
+        __atomic_store_n(&g_desktopReadyTick,now?now:1,__ATOMIC_RELEASE);
+        BootLogoFinish();SerialPrintf("BOOT: desktop presented in %lu ms\n",CompositorBootDurationMs());
+    }
     uint64_t loopEndTick = ApicTickCount();
     uint64_t loopMs = loopEndTick - loopStartTick;
     if (periodMs > 0)

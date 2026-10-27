@@ -658,7 +658,7 @@ static void CmdLs(int argc, const char* const* argv);
 static void WallpaperLoaderThread(void* /*arg*/)
 {
     using namespace brook;
-
+    struct FinishAssets { ~FinishAssets(){CompositorBootAssetsPending(false);} } finish;
     VnodeStat st;
     if (VfsStatPath("/boot/WALLPAPER.RAW", &st) != 0 || st.size <= 8)
     {
@@ -838,13 +838,14 @@ static int ExecCommand(int argc, const char* const* argv)
                 return 0;
             }
 
-            // Load wallpaper asynchronously so WM startup isn't blocked.
+            // Prepare assets behind the splash, without blocking service startup.
             {
+                CompositorBootAssetsPending(true);
                 using namespace brook;
                 Process* wpThread = KernelThreadCreate("wp_loader",
                     WallpaperLoaderThread, nullptr);
-                if (wpThread)
-                    SchedulerAddProcess(wpThread);
+                if (wpThread) SchedulerAddProcess(wpThread);
+                else CompositorBootAssetsPending(false);
             }
 
             KPrintf("window manager: enabled\n");

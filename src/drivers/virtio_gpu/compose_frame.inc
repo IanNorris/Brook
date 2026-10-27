@@ -49,5 +49,9 @@ static void CompEndFrameDraw()
     g_drawQuadCount = 0;
     g_blurBarrierCount = 0;
     phase.Change(FramePhase::DisplayFlush);
+    if(!g_compScanoutBound) {
+        if(!SetScanout(0,COMP_SCANOUT_RES,g_compScanoutW,g_compScanoutH))return;
+        g_compScanoutBound=true;
+    }
     ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
 }

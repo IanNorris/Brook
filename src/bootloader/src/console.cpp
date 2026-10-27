@@ -6,6 +6,8 @@ namespace bootloader
 {
 
 static EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL* gConOut = nullptr;
+static bool gQuiet = false;
+void ConsoleSetQuiet(bool quiet){gQuiet=quiet;}
 
 void ConsoleInit(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL* conOut)
 {
@@ -15,7 +17,7 @@ void ConsoleInit(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL* conOut)
 
 void ConsolePrint(const char16_t* message)
 {
-    if (gConOut != nullptr)
+    if (gConOut != nullptr && !gQuiet)
     {
         gConOut->OutputString(gConOut, (CHAR16*)message);
     }
@@ -66,6 +68,7 @@ void ConsolePrintDec(UINT64 value)
 
 [[noreturn]] void Halt(EFI_STATUS status, const char16_t* message)
 {
+    gQuiet=false;
     ConsolePrint(u"\r\nFATAL ERROR (");
     ConsolePrintHex((UINT64)status);
     ConsolePrint(u"): ");

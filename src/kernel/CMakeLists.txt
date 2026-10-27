@@ -114,18 +114,21 @@ add_custom_command(
     VERBATIM
 )
 
-# Native desktop fonts use separate final-size glyphs rather than stretching
-# terminal pixels. Keeping the same source face preserves a consistent family.
+# A separate proportional UI atlas leaves terminal advances unchanged.
+set(BROOK_DESKTOP_FONT_TTF "${BROOK_FONT_TTF}")
+if(DEFINED ENV{BROOK_DESKTOP_FONT_TTF} AND EXISTS "$ENV{BROOK_DESKTOP_FONT_TTF}")
+    set(BROOK_DESKTOP_FONT_TTF "$ENV{BROOK_DESKTOP_FONT_TTF}")
+endif()
 set(DESKTOP_FONT_SOURCES "")
-foreach(DESKTOP_SCALE IN ITEMS 150 200)
+foreach(DESKTOP_SCALE IN ITEMS 100 150 200)
     math(EXPR DESKTOP_FONT_SIZE "16 * ${DESKTOP_SCALE} / 100")
     set(DESKTOP_FONT_CPP "${CMAKE_CURRENT_BINARY_DIR}/desktop_font_${DESKTOP_SCALE}.cpp")
     add_custom_command(
         OUTPUT "${DESKTOP_FONT_CPP}"
         COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/bake_font.py"
-                "${BROOK_FONT_TTF}" "${DESKTOP_FONT_SIZE}" "${DESKTOP_FONT_CPP}"
+                "${BROOK_DESKTOP_FONT_TTF}" "${DESKTOP_FONT_SIZE}" "${DESKTOP_FONT_CPP}"
                 "g_desktopFont${DESKTOP_SCALE}"
-        DEPENDS "${BROOK_ROOT}/scripts/bake_font.py" "${BROOK_FONT_TTF}"
+        DEPENDS "${BROOK_ROOT}/scripts/bake_font.py" "${BROOK_DESKTOP_FONT_TTF}"
         COMMENT "Baking native desktop font (${DESKTOP_SCALE}%)"
         VERBATIM
     )
@@ -346,95 +349,16 @@ target_compile_options(kernel PRIVATE
 # ---------------------------------------------------------------------------
 # Build info defines (git hash + timestamp) for crash dumps
 # ---------------------------------------------------------------------------
-execute_process(
-    COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY "${BROOK_ROOT}"
-    OUTPUT_VARIABLE BROOK_GIT_HASH
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(NOT BROOK_GIT_HASH)
-    set(BROOK_GIT_HASH "unknown")
-endif()
-
-# Mark dirty (uncommitted) trees so a panic's git hash distinguishes a working
-# build from the clean commit. Without this every uncommitted build reports the
-# same short hash and the crash decoder cannot tell which ELF to symbolize
-# against (silently mis-symbolizing). The decoder treats a "-dirty" suffix as
-# "no symbol archive — use the exact local build ELF".
-execute_process(
-    COMMAND git status --porcelain --untracked-files=no
-    WORKING_DIRECTORY "${BROOK_ROOT}"
-    OUTPUT_VARIABLE BROOK_GIT_DIRTY
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(NOT BROOK_GIT_DIRTY STREQUAL "")
-    # Disambiguate dirty builds by a CONTENT hash of the working tree, so two
-    # different uncommitted states don't both report the bare "+". `git stash
-    # create` snapshots the index+worktree as a commit object; its ^{tree} is a
-    # content-addressed SHA that is identical for identical content and changes
-    # the instant any tracked file changes — clock-independent (unlike a build
-    # timestamp, which Nix freezes to 1980 under SOURCE_DATE_EPOCH). The 8-hex
-    # tag rides in the (widened, 20-byte) panic git-hash field. Ian can verify a
-    # booted kernel matches his tree with:
-    #   git rev-parse "$(git stash create)^{tree}" | cut -c1-8
-    execute_process(
-        COMMAND git stash create
-        WORKING_DIRECTORY "${BROOK_ROOT}"
-        OUTPUT_VARIABLE BROOK_DIRTY_OBJ
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
-    if(NOT BROOK_DIRTY_OBJ STREQUAL "")
-        execute_process(
-            COMMAND git rev-parse "${BROOK_DIRTY_OBJ}^{tree}"
-            WORKING_DIRECTORY "${BROOK_ROOT}"
-            OUTPUT_VARIABLE BROOK_DIRTY_TREE
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET
-        )
-    endif()
-    if(BROOK_DIRTY_TREE STREQUAL "")
-        set(BROOK_GIT_HASH "${BROOK_GIT_HASH}+")
-    else()
-        string(SUBSTRING "${BROOK_DIRTY_TREE}" 0 8 BROOK_DIRTY_TAG)
-        set(BROOK_GIT_HASH "${BROOK_GIT_HASH}+${BROOK_DIRTY_TAG}")
-    endif()
-endif()
-
-execute_process(
-    COMMAND git rev-parse --abbrev-ref HEAD
-    WORKING_DIRECTORY "${BROOK_ROOT}"
-    OUTPUT_VARIABLE BROOK_GIT_BRANCH
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(NOT BROOK_GIT_BRANCH)
-    set(BROOK_GIT_BRANCH "unknown")
-endif()
-
-string(TIMESTAMP BROOK_BUILD_DATE "%Y-%m-%d" UTC)
-# In Nix's hermetic build sandbox, SOURCE_DATE_EPOCH forces the above
-# to "1980-01-01" for reproducibility. Use the git commit date instead:
-# it's more informative and doesn't depend on the build clock.
-execute_process(
-    COMMAND git log -1 --format=%cs
-    WORKING_DIRECTORY "${BROOK_ROOT}"
-    OUTPUT_VARIABLE BROOK_GIT_DATE
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(BROOK_GIT_DATE)
-    set(BROOK_BUILD_DATE "${BROOK_GIT_DATE}")
-endif()
-
-target_compile_definitions(kernel PRIVATE
-    BROOK_GIT_HASH="${BROOK_GIT_HASH}"
-    BROOK_GIT_BRANCH="${BROOK_GIT_BRANCH}"
-    BROOK_BUILD_DATE="${BROOK_BUILD_DATE}"
-    __BROOK_KERNEL__=1
-)
+set(BUILD_INFO_CPP "${CMAKE_CURRENT_BINARY_DIR}/build_info_generated.cpp")
+add_custom_target(refresh_build_info
+    COMMAND ${BROOK_PYTHON3} "${BROOK_ROOT}/scripts/write_build_info.py"
+            "${BROOK_ROOT}" "${BUILD_INFO_CPP}"
+    BYPRODUCTS "${BUILD_INFO_CPP}"
+    VERBATIM)
+set_source_files_properties("${BUILD_INFO_CPP}" PROPERTIES GENERATED TRUE)
+target_sources(kernel PRIVATE "${BUILD_INFO_CPP}")
+add_dependencies(kernel refresh_build_info)
+target_compile_definitions(kernel PRIVATE __BROOK_KERNEL__=1)
 if(BROOK_MAPPING_TEST_HOOKS)
     target_sources(kernel PRIVATE src/memory/mapping_fault_test.cpp)
     target_compile_definitions(kernel PRIVATE BROOK_MAPPING_TEST_HOOKS=1)

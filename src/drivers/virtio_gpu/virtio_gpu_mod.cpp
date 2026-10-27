@@ -2223,13 +2223,7 @@ static void CompBeginFrame(uint32_t clearArgb)
         __atomic_load_n(&g_pendingCommand,__ATOMIC_ACQUIRE)) return;
     g_compFrameAssembling = true;
     (void)clearArgb;   // see note below
-    // First GPU frame: point scanout 0 at the RT (switches away from the 2D FB).
-    if (!g_compScanoutBound)
-    {
-        if (SetScanout(0, COMP_SCANOUT_RES, g_compScanoutW, g_compScanoutH))
-            g_compScanoutBound = true;
-    }
-
+    // Bind the initial scanout only after its complete frame's GPU fence.
     // Reset the DRAW record list (whether or not DRAW is used this frame). If
     // the compositor records quads via CompDrawQuad, CompEndFrame builds the
     // batched draw stream and ignores the BLIT compose stream below.
@@ -2367,6 +2361,10 @@ static void CompEndFrame()
     if (!CmdRespOk(SubmitCommand(sizeof(VirtioGpuCmdSubmit) + g_composeN * 4, CMD_RESP_CAP, true)))
         return;
     g_composeN = 0;
+    if(!g_compScanoutBound) {
+        if(!SetScanout(0,COMP_SCANOUT_RES,g_compScanoutW,g_compScanoutH))return;
+        g_compScanoutBound=true;
+    }
     // Present the composed scanout RT.
     phase.Change(FramePhase::DisplayFlush);
     ResourceFlush(COMP_SCANOUT_RES, 0, 0, g_compScanoutW, g_compScanoutH);
@@ -3063,6 +3061,7 @@ static const brook::GpuAppOps g_gpuAppOps = {
     AppImportResource,
 };
 
+static bool CompBlurSupported(){return g_drawReady && g_blurReady;}
 static const brook::GpuCompositorOps g_gpuCompositorOps = {
     "virtio-gpu-draw",
     CompCreateTexture,
@@ -3082,6 +3081,7 @@ static const brook::GpuCompositorOps g_gpuCompositorOps = {
     CompComposeOwnedLayers,
     CompDrawPremultipliedQuad,
     CompUploadOwnedTexture,
+    CompBlurSupported,
 };
 
 // Verify actual host execution before making owned capture available. On any

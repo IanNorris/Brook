@@ -145,6 +145,7 @@ struct GpuCompositorOps {
     // Rejected means no commands; Uncertain requires retaining its lifetime.
     // Only staging images may be updated, outside desktop frame assembly.
     GpuCaptureResult (*UploadOwnedTexture)(GpuTexId dst,uint64_t snapshot,uint32_t bytes);
+    bool (*BlurSupported)();
 };
 
 // Register the GPU compositor ops (called by the display driver once its 3D

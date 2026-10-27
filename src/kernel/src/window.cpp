@@ -5,6 +5,13 @@
 // blitting client areas to draw the window decorations.
 
 #include "window.h"
+#include "desktop_telemetry.h"
+#include "device.h"
+#include "virtio_blk.h"
+#include "net.h"
+#include "smp.h"
+#include "build_info.h"
+#include "kvmclock.h"
 #include "shutdown.h"
 #include "launcher_command.h"
 #include "launch_feedback.h"
@@ -56,7 +63,7 @@ uint32_t WmGetRequestedScale() { return __atomic_load_n(&g_requestedScale,__ATOM
 uint32_t WmGetAppliedScale() { return WmDesktopMetrics().percent; }
 const FontAtlas& WmDesktopFont() {
     uint32_t scale=WmGetAppliedScale();
-    return scale==200 ? g_desktopFont200 : scale==150 ? g_desktopFont150 : g_fontAtlas;
+    return scale==200 ? g_desktopFont200 : scale==150 ? g_desktopFont150 : g_desktopFont100;
 }
 bool WmSetScale(uint32_t percent) {
     if (!DesktopMetricsFor(percent)) return false;
@@ -458,7 +465,7 @@ bool WmLauncherApplyPending()
 // Helpers
 // ---------------------------------------------------------------------------
 
-using WmRect = DesktopRect;
+
 
 // Index 0 is close, 1 maximize/restore, 2 minimize. Rendering and input
 // intentionally use the same full-height rectangular control cells.
@@ -513,7 +520,7 @@ static int WmRenderGlyph(uint32_t* buf, uint32_t stride,
                           uint32_t screenW, uint32_t screenH,
                           int penX, int penY, int code,
                           uint32_t fg, uint32_t bg,
-                          int clipRight = 0)
+                          int clipRight = 0, const WmRect* clip = nullptr)
 {
     const FontAtlas& fa = WmDesktopFont();
     if (code < static_cast<int>(fa.firstChar) ||
@@ -540,6 +547,7 @@ static int WmRenderGlyph(uint32_t* buf, uint32_t stride,
             int px = drawX + col;
             int py = drawY + row;
             if (px < 0 || py < 0) continue;
+            if (clip && !clip->contains(px,py)) continue;
             if (px >= maxX) continue;
             if (static_cast<uint32_t>(px) >= screenW) continue;
             if (static_cast<uint32_t>(py) >= screenH) continue;
@@ -564,7 +572,7 @@ static void WmRenderString(uint32_t* buf, uint32_t stride,
                             uint32_t screenW, uint32_t screenH,
                             int x, int y, const char* str,
                             uint32_t fg, uint32_t bg,
-                            int maxWidth = 0)
+                            int maxWidth = 0, const WmRect* clip = nullptr)
 {
     int penX = x;
     int clipRight = (maxWidth > 0) ? (x + maxWidth) : 0;
@@ -573,7 +581,7 @@ static void WmRenderString(uint32_t* buf, uint32_t stride,
         if (maxWidth > 0 && (penX - x) >= maxWidth) break;
         penX += WmRenderGlyph(buf, stride, screenW, screenH,
                                penX, y, static_cast<uint8_t>(*str), fg, bg,
-                               clipRight);
+                               clipRight, clip);
         ++str;
     }
 }
@@ -1555,7 +1563,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     if (!buf || !stride || !screenW || !screenH || w.noChrome || !w.proc || !w.visible) return;
     const int border = WmMetric(WM_BORDER_WIDTH);
     const int ow = w.outerWidth(), oh = w.outerHeight();
-    const uint32_t edge = w.focused ? WmCurrentPalette().borderActive : WmCurrentPalette().borderInactive;
+    const uint32_t edge = w.focused ? WmCurrentPalette().borderActive : WmCurrentPalette().titleInactive;
     const uint32_t bg = w.focused ? WmCurrentPalette().titleActive : WmCurrentPalette().titleInactive;
     const uint32_t fg = w.focused ? WmCurrentPalette().text : WmCurrentPalette().mutedText;
     WmFillRect(buf, stride, screenW, screenH, w.x, w.y, ow, border, edge);
@@ -1564,6 +1572,9 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     WmFillRect(buf, stride, screenW, screenH, w.x, w.y + oh - border, ow, border, edge);
     const int tx = w.x + border, ty = w.y + border;
     WmFillRect(buf, stride, screenW, screenH, tx, ty, w.clientW, WmMetric(WM_TITLE_BAR_HEIGHT), bg);
+    // Active identity stroke: keep the hit-test geometry and client opacity.
+    if (w.focused) WmFillRect(buf,stride,screenW,screenH,tx+WmMetric(12),ty,
+        w.clientW>WmMetric(184)?WmMetric(160):w.clientW/2,WmMetric(4),0x0068ACFF);
     LauncherReadGuard icons;
     const int iconX = tx + WmMetric(10);
     const int textX = iconX + WmMetric(20) + WmMetric(8);
@@ -1644,10 +1655,13 @@ void WmRenderChromeForWindow(uint32_t* backBuffer, uint32_t stride,
 // Taskbar
 // ---------------------------------------------------------------------------
 
+#include "desktop_telemetry_runtime.inc"
+
 struct TaskbarLayout
 {
     int y, textY;
-    WmRect apps, terminal, next, clock, gpu, fps;
+    WmRect apps, terminal, next, clock;
+    WmRect metrics[6];
     WmRect buttons[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int indices[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity];
     int count, nextIndex;
@@ -1679,16 +1693,8 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
         right -= WmMetric(12);
     };
     reserve(l.clock, WmTextWidth(l.clockText));
-    reserve(l.gpu, WmTextWidth("GPU"));
-    // Reserve the widest possible digits, independent of the live FPS count.
-    int digitW = 0;
-    for (char digit = '0'; digit <= '9'; ++digit)
-    {
-        char str[] = {digit, 0};
-        int width = WmTextWidth(str);
-        if (width > digitW) digitW = width;
-    }
-    reserve(l.fps, digitW * 3 + WmTextWidth(" FPS"));
+    const int widths[6]={64,64,112,112,240,240};
+    for(int i=5;i>=0;--i)reserve(l.metrics[i],WmMetric(widths[i]));
     int ids[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity], total = 0, focused = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {
@@ -1817,7 +1823,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     // Use the already-reserved tray for the hover label. Geometry stays fixed
     // and no additional empty strip is reserved when nothing is hovered.
     int labelX = static_cast<int>(screenW);
-    const WmRect trayRects[] = {l.fps, l.gpu, l.clock};
+    const WmRect trayRects[] = {l.metrics[0],l.metrics[1],l.metrics[2],l.metrics[3],l.metrics[4],l.metrics[5],l.clock};
     for (const auto& r : trayRects) if (r.w && r.x < labelX) labelX = r.x;
     if (hoverTitle && labelX + static_cast<int>(WmMetric(12)) < static_cast<int>(screenW))
     {
@@ -1830,17 +1836,7 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
             r.x, l.textY, text, fg, WmCurrentPalette().taskbar, r.w);
     };
     trayText(l.clock, l.clockText, WmCurrentPalette().secondaryText);
-    const DisplayOps* disp = DisplayGetActive();
-    bool gpuActive = disp && disp->name && strncmp(disp->name, "virt", 4) == 0;
-    trayText(l.gpu, "GPU", DisplayIs3DActive() ? WmCurrentPalette().gpu3d :
-             gpuActive ? WmCurrentPalette().gpu2d : WmCurrentPalette().gpuInactive);
-    uint32_t fps = CompositorGetFps();
-    if (fps > 999) fps = 999;
-    char text[12], digits[4]; int n = 0, count = 0;
-    do { digits[count++] = '0' + fps % 10; fps /= 10; } while (fps);
-    while (count) text[n++] = digits[--count];
-    text[n++] = ' '; text[n++] = 'F'; text[n++] = 'P'; text[n++] = 'S'; text[n] = 0;
-    trayText(l.fps, text, WmCurrentPalette().secondaryText);
+    for(unsigned i=0;i<6;++i)DrawDesktopMetric(backBuffer,stride,screenW,screenH,l.metrics[i],i,uptimeMs);
 }
 
 int WmTaskbarHitTest(int32_t mx, int32_t my, uint32_t screenW, uint32_t screenH)

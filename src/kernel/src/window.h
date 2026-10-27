@@ -43,6 +43,11 @@ using WmPalette = BrookThemePalette;
 const WmPalette& WmCurrentPalette();
 bool WmSetTheme(uint32_t theme);
 uint32_t WmGetTheme();
+void WmObserveDesktopTick(uint64_t now);
+using WmRect = DesktopRect;
+void WmDrawBuildId(uint32_t*,uint32_t,uint32_t,uint32_t,const WmRect* clip=nullptr);
+bool WmBootSummaryRect(uint32_t,uint32_t,int32_t*,int32_t*,uint32_t*,uint32_t*);
+void WmRenderBootSummary(uint32_t*,uint32_t,uint32_t,uint32_t);
 static constexpr uint8_t WM_CHROME_TITLE_ALPHA = 255;
 static constexpr int WM_BTN_RIGHT_PAD = 0;
 

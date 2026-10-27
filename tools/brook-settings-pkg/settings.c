@@ -35,7 +35,7 @@ static gboolean draw_preview(GtkWidget *widget,cairo_t *cr,gpointer unused) {
     rect(cr,0,0,w,h,p->launcher);rect(cr,24,24,w-48,h-92,p->borderActive);
     rect(cr,25,25,w-50,36,p->titleActive);label(cr,38,32,"Window preview",p->text,15);
     label(cr,w-118,32,"−   □   ×",p->text,16);
-    rect(cr,25,61,w-50,h-130,0xf5f7fa);label(cr,44,84,"Brook desktop preview",0x26374b,17);
+    rect(cr,25,61,w-50,h-130,selected==BROOK_THEME_DAWN?0xf5f7fa:0x172335);label(cr,44,84,"Brook desktop preview",selected==BROOK_THEME_DAWN?0x26374b:0xe5edf8,17);
     rect(cr,0,h-44,w,44,p->taskbar);
     for(int i=0;i<4;++i){rect(cr,10+i*44,h-38,34,32,i==1?p->taskActive:p->taskButton);rect(cr,19+i*44,h-30,16,16,p->borderActive);}
     rect(cr,56,h-9,30,2,p->borderActive);label(cr,w-75,h-32,"12:34",p->taskText,14);
@@ -98,6 +98,11 @@ int main(int argc,char **argv) {
     settings_path=g_strdup(configured&&*configured?configured:"/data/home/.config/brook/settings.ini");
     g_set_prgname("brook-settings");g_set_application_name("Settings");
     gtk_init(&argc,&argv);
+    g_object_set(gtk_settings_get_default(),"gtk-application-prefer-dark-theme",TRUE,NULL);
+    GtkCssProvider *brook_css=gtk_css_provider_new();
+    gtk_css_provider_load_from_data(brook_css,"window, dialog { background-color: #172335; color: #e5edf8; } headerbar, toolbar { background: #243c5d; color: #e5edf8; } button, combobox, entry { background: #243a56; color: #e5edf8; border-color: #3c5270; } button:hover { background: #355987; } treeview, textview, viewport { background-color: #1c314c; color: #e5edf8; }",-1,NULL);
+    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),GTK_STYLE_PROVIDER(brook_css),GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(brook_css);
     long active=syscall(0xB02L,0L,0L);selected=active>=0&&active<BROOK_THEME_COUNT?(unsigned)active:0;
     long scale=syscall(0xB04L,0L,0L);
     int scale_index=0;for(int i=0;i<3;++i)if(scale==(long)scales[i]){selected_scale=scales[i];scale_index=i;}

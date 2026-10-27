@@ -61,18 +61,18 @@ static int memfd_create_shim(const char *name, unsigned int flags) {
 #define CONTENT_H    (WIN_H - STATUS_H)
 
 /* Colours (ARGB8888) */
-#define COL_BG          0xFF1E1E2E   /* dark background */
-#define COL_TREE_BG     0xFF181825   /* tree pane bg */
-#define COL_TOOLBAR_BG  0xFF11111B   /* toolbar bg */
-#define COL_TOOLBAR_BTN 0xFF313244   /* toolbar button bg */
-#define COL_HEADER_BG   0xFF313244   /* column header */
-#define COL_STATUS_BG   0xFF313244   /* status bar */
-#define COL_DIVIDER     0xFF45475A   /* pane divider */
-#define COL_TEXT        0xFFCDD6F4   /* main text */
-#define COL_TEXT_DIM    0xFF6C7086   /* dimmed text */
-#define COL_SELECT      0xFF45475A   /* selected row bg */
+#define COL_BG          0xFF172335   /* dark background */
+#define COL_TREE_BG     0xFF1C314C   /* tree pane bg */
+#define COL_TOOLBAR_BG  0xFF243C5D   /* toolbar bg */
+#define COL_TOOLBAR_BTN 0xFF213149   /* toolbar button bg */
+#define COL_HEADER_BG   0xFF213149   /* column header */
+#define COL_STATUS_BG   0xFF213149   /* status bar */
+#define COL_DIVIDER     0xFF32445D   /* pane divider */
+#define COL_TEXT        0xFFE5EDF8   /* main text */
+#define COL_TEXT_DIM    0xFFA4B2C7   /* dimmed text */
+#define COL_SELECT      0xFF32445D   /* selected row bg */
 #define COL_DIR_TEXT    0xFF89B4FA   /* directory name colour */
-#define COL_SYMLINK     0xFFF5C2E7   /* symlink colour */
+#define COL_SYMLINK     0xFFAACBFF   /* symlink colour */
 #define COL_TREE_ARROW  0xFF89B4FA   /* tree expand arrow */
 
 /* Limits */

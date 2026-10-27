@@ -1,5 +1,7 @@
 #include <Uefi.h>
 #include "console.h"
+#include "boot_splash.h"
+#include "brook_boot_logo_data.h"
 #include "config.h"
 #include "graphics.h"
 #include "memory.h"
@@ -14,7 +16,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     using namespace brook::bootloader;
 
     ConsoleInit(systemTable->ConOut);
-    ConsolePrintLine(u"Brook bootloader starting...");
+    ConsoleSetQuiet(true);
 
     // --- Config ---
     LoadConfig(imageHandle, systemTable->BootServices);
@@ -25,7 +27,13 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     {
         Halt(EFI_UNSUPPORTED, u"No GOP framebuffer available");
     }
-    ConsolePrintLine(u"Framebuffer initialized");
+    auto splash=[&](unsigned percent,bool full=false){
+        brook::DrawBootSplash(reinterpret_cast<uint32_t*>(framebuffer.physicalBase),
+            framebuffer.width,framebuffer.height,framebuffer.stride/4,
+            g_bootLogoData,g_bootLogoWidth,g_bootLogoHeight,percent,full,
+            framebuffer.format==brook::PixelFormat::Rgb8);
+    };
+    splash(1,true);
 
     // --- ACPI ---
     brook::AcpiInfo acpi{};
@@ -33,7 +41,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     {
         Halt(EFI_NOT_FOUND, u"ACPI 2.0 not found");
     }
-    ConsolePrintLine(u"ACPI located");
+    splash(2);
 
     // --- Load kernel ---
     UINTN kernelFileSize = 0;
@@ -43,13 +51,13 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     {
         Halt(EFI_NOT_FOUND, u"Kernel not found");
     }
-    ConsolePrintLine(u"Kernel file read");
+    splash(3);
 
     EFI_PHYSICAL_ADDRESS kernelPhysBase = 0;
     UINTN kernelPhysPages = 0;
     KernelEntryFn kernelVirtualEntry = LoadKernelElf(
         systemTable->BootServices, kernelData, kernelFileSize, kernelPhysBase, kernelPhysPages);
-    ConsolePrintLine(u"Kernel loaded");
+    splash(4);
 
     // Free the temporary ELF file buffer (segments already copied out)
     FreePages(systemTable->BootServices,
@@ -72,7 +80,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     // Pass kernelPhysPages so AllocatePageTables can size the kernel PT pool.
     // It also scans the UEFI memory map internally to size the identity map.
     PageTableAllocation pageTableAlloc = AllocatePageTables(systemTable->BootServices, kernelPhysPages);
-    ConsolePrintLine(u"Page table memory allocated");
+    splash(5);
 
     // --- Memory map (must be last thing before ExitBootServices) ---
     brook::MemoryDescriptor* memoryMap = nullptr;

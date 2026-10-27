@@ -80,9 +80,9 @@ constexpr GpuCompletionWaitLimits limits{1000,40,4};
 static uint8_t* g_fbBacking=vertices;
 static uint32_t g_fbW=640,g_fbH=480;
 constexpr uint32_t RESOURCE_FB=1;
-static unsigned emergencyCalls,frameFlushes;
+static unsigned emergencyCalls,frameFlushes,scanoutCalls;
 static bool frameTestActive;
-static bool SetScanout(uint32_t,uint32_t,uint32_t,uint32_t){++emergencyCalls;return true;}
+static bool SetScanout(uint32_t,uint32_t,uint32_t,uint32_t){++emergencyCalls;++scanoutCalls;if(frameTestActive)CHECK(!g_pendingCommand);return true;}
 static bool TransferToHost2D(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint64_t){++emergencyCalls;return true;}
 static bool ResourceFlush(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){++emergencyCalls;if(frameTestActive){++frameFlushes;CHECK(!g_pendingCommand);}return true;}
 #include "../../drivers/virtio_gpu/panic_present.inc"
@@ -220,6 +220,7 @@ constexpr uint32_t COMP_CTX_ID=2,COMP_DRAW_VBUF_RES=13,COMP_SCANOUT_RES=16;
 struct DrawQuadRec {int32_t dx,dy,dx2,dy2;uint32_t u0,v0,u1,v1,opacity;};
 DrawQuadRec g_drawQuads[1];uint32_t* g_drawVtxBuf=reinterpret_cast<uint32_t*>(vertices);
 unsigned frameMode,buildCalls;
+bool g_compScanoutBound=true;
 uint32_t NdcBits(int32_t p,int32_t){return static_cast<uint32_t>(p);}
 GpuCommandToken BeginVertexTransfer(uint32_t,uint32_t,uint32_t) {
     return BeginCommand(g_legacyCommand,128,CMD_RESP_CAP);
@@ -247,6 +248,7 @@ void frameFailures() {
     complete();CHECK(FinishCommand(inFlight,limits)==sizeof(VirtioGpuCtrlHdr));
     for(unsigned mode=0;mode<6;++mode){
         reset();frameMode=mode;frameTestActive=true;frameFlushes=buildCalls=0;
+        g_compScanoutBound=false;const auto initialBindings=scanoutCalls;
         g_drawQuadCount=g_blurBarrierCount=1;
         notifyHook=[&]{
             if(frameMode==4)return;
@@ -257,6 +259,8 @@ void frameFailures() {
         };
         CompEndFrameDraw();
         CHECK(buildCalls==1);CHECK(frameFlushes==(mode==0?1u:0u));
+        CHECK(g_compScanoutBound==(mode==0));
+        CHECK(scanoutCalls==initialBindings+(mode==0?1u:0u));
         CHECK(notifications==((mode==0 || mode==3 || mode==5)?2u:1u));
         CHECK(g_drawQuadCount==(mode==0?0u:1u));
         if(mode==4 || mode==5){

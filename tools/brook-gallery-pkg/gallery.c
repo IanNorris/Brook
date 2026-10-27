@@ -222,6 +222,11 @@ int main(int argc,char **argv) {
     }
 
     g_set_prgname("brook-gallery");g_set_application_name("App Gallery");gtk_init(&argc,&argv);
+    g_object_set(gtk_settings_get_default(),"gtk-application-prefer-dark-theme",TRUE,NULL);
+    GtkCssProvider *brook_css=gtk_css_provider_new();
+    gtk_css_provider_load_from_data(brook_css,"window, dialog { background-color: #172335; color: #e5edf8; } headerbar, toolbar { background: #243c5d; color: #e5edf8; } button, combobox, entry { background: #243a56; color: #e5edf8; border-color: #3c5270; } button:hover { background: #355987; } treeview, textview, viewport { background-color: #1c314c; color: #e5edf8; }",-1,NULL);
+    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),GTK_STYLE_PROVIDER(brook_css),GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(brook_css);
     GtkCssProvider *style=gtk_css_provider_new();
     gtk_css_provider_load_from_data(style,"* { font-family: Sans; font-size: 16px; } window { background: #f4f7fb; } label, entry, treeview, textview, button { color: #25384e; } button:disabled, button:disabled label { color: #8793a3; } treeview:selected { color: #ffffff; }",-1,NULL);
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),GTK_STYLE_PROVIDER(style),GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);g_object_unref(style);

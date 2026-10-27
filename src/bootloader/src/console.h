@@ -6,6 +6,7 @@ namespace brook
 namespace bootloader
 {
 
+void ConsoleSetQuiet(bool quiet);
 void ConsoleInit(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL* conOut);
 void ConsolePrint(const char16_t* message);
 void ConsolePrintLine(const char16_t* message);

@@ -40,29 +40,29 @@ static inline const BrookThemePalette* brook_theme_palette(uint32_t id)
 {
     static const BrookThemePalette palettes[BROOK_THEME_COUNT] = {
         { /* Brook */
-            0x002D3B4Du, /* titleActive */
-            0x00292E36u, /* titleInactive */
-            0x00EDF2F7u, /* text */
-            0x006F9CC5u, /* borderActive */
-            0x00434B57u, /* borderInactive */
+            0x0028466Fu, /* titleActive */
+            0x00253851u, /* titleInactive */
+            0x00E5EDF8u, /* text */
+            0x00D0DEF0u, /* borderActive */
+            0x0034455Fu, /* borderInactive */
             0x00B64048u, /* closeHover */
             0x00FFFFFFu, /* closeText */
-            0x001C232Du, /* taskbar */
-            0x002B3542u, /* taskButton */
-            0x003C526Bu, /* taskActive */
-            0x00E0E7EFu, /* taskText */
-            0x00BAC8D8u, /* secondaryText */
-            0x009DA9B7u, /* mutedText */
-            0x00455466u, /* captionHover */
-            0x003C4859u, /* taskHover */
-            0x00414E60u, /* separator */
-            0x00778596u, /* minimized */
-            0x003D4D62u, /* itemHover */
-            0x00232C38u, /* launcher */
-            0x004B5A6Eu, /* launcherBorder */
-            0x007FC9E8u, /* gpu3d */
-            0x0083C99Bu, /* gpu2d */
-            0x007E8B9Bu, /* gpuInactive */
+            0x0016273Fu, /* taskbar */
+            0x00243A56u, /* taskButton */
+            0x00355987u, /* taskActive */
+            0x00E5EDF8u, /* taskText */
+            0x00A4B2C7u, /* secondaryText */
+            0x00899BB6u, /* mutedText */
+            0x003F6488u, /* captionHover */
+            0x002E4664u, /* taskHover */
+            0x003C5270u, /* separator */
+            0x007086A4u, /* minimized */
+            0x002C496Du, /* itemHover */
+            0x001C314Cu, /* launcher */
+            0x007899C8u, /* launcherBorder */
+            0x0068ACFFu, /* gpu3d */
+            0x008CBAFFu, /* gpu2d */
+            0x00708198u, /* gpuInactive */
         },
         { /* Dawn */
             0x00F5EDE0u, /* titleActive */
@@ -120,7 +120,7 @@ static inline const BrookThemePalette* brook_theme_palette(uint32_t id)
 
 static inline const char* brook_theme_name(uint32_t id)
 {
-    static const char* const names[BROOK_THEME_COUNT] = {"Brook", "Dawn", "Midnight"};
+    static const char* const names[BROOK_THEME_COUNT] = {"Clearwater", "Opal", "Smoked"};
     return id < BROOK_THEME_COUNT ? names[id] : "Unknown";
 }
 #endif

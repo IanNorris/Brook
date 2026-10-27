@@ -573,3 +573,5 @@ set_tests_properties(test_tmpfs PROPERTIES TIMEOUT 60)
 add_host_test(test_gpu_shared_contexts)
 add_host_test(test_drm_resource_layout)
 target_compile_options(test_drm_resource_layout PRIVATE -UNDEBUG)
+
+add_host_test(test_desktop_telemetry)

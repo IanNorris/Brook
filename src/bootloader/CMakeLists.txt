@@ -15,7 +15,15 @@ set(SHARED_INCLUDE_DIRS
     "${BROOK_ROOT}/src/shared/inc_km"
 )
 
+find_program(BOOT_PYTHON python3 REQUIRED)
+set(BOOT_LOGO_HEADER "${CMAKE_CURRENT_BINARY_DIR}/brook_boot_logo_data.h")
+add_custom_command(OUTPUT "${BOOT_LOGO_HEADER}"
+    COMMAND ${BOOT_PYTHON} "${BROOK_ROOT}/scripts/bake_logo.py"
+            "${BROOK_ROOT}/data/branding/brook-mark.png" "${BOOT_LOGO_HEADER}" 300
+    DEPENDS "${BROOK_ROOT}/scripts/bake_logo.py" "${BROOK_ROOT}/data/branding/brook-mark.png"
+    VERBATIM)
 add_executable(bootloader
+    "${BOOT_LOGO_HEADER}"
     src/main.cpp
     src/config.cpp
     src/console.cpp
@@ -29,6 +37,7 @@ add_executable(bootloader
 )
 
 target_include_directories(bootloader PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}"
     ${UEFI_INCLUDE_DIRS}
     ${SHARED_INCLUDE_DIRS}
     src   # so files can include each other without path prefix

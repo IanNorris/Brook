@@ -1,4 +1,5 @@
 #include "tty.h"
+#include "boot_logo.h"
 #include "font_atlas.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
@@ -626,6 +627,8 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
     for (uint32_t y2 = 0; y2 < h; y2++)
         for (uint32_t x2 = 0; x2 < w; x2++)
             g_fbPixels[y2 * stridePixels + x2] = g_bgColor;
+
+    if(BootLogoActive())BootLogoProgress(65,"Display");
 
     SerialPrintf("TTY: remapped to %ux%u at phys 0x%lx, virt 0x%lx\n",
                  w, h, newPhysBase, fbVirt);

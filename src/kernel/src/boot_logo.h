@@ -8,7 +8,7 @@
 // Called during kernel initialization to show boot progress.
 //
 // The logo is baked at build time from data/branding/brook-mark.png into a C header.
-// Progress bar shows percentage and becomes an error code display on failure.
+// The serial log retains stage names; fatal boot errors restore text output.
 
 namespace brook {
 
@@ -18,13 +18,16 @@ namespace brook {
 void BootLogoInit();
 
 // Update the progress bar (0–100).
-// Text is a short status label shown next to the percentage.
+// Text is a short status label recorded in the serial log.
 void BootLogoProgress(uint8_t percent, const char* text);
 
-// Show an error on the progress bar (red bar, error text).
+// Restore text output and record the boot error.
 void BootLogoError(uint8_t percentAtError, const char* errorText);
 
 // Clear the boot logo and restore normal TTY mode.
 void BootLogoClear();
+// Relinquish framebuffer ownership without clearing the completed desktop.
+void BootLogoFinish();
+bool BootLogoActive();
 
 } // namespace brook

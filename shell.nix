@@ -47,6 +47,7 @@ pkgs.mkShellNoCC {
 
     # Font baking (build-time TTF → kernel glyph atlas)
     pkgs.hack-font
+    pkgs.dejavu_fonts
     (pkgs.python3.withPackages (ps: [ ps.freetype-py ps.pillow ps.cairosvg ps.capstone ps.pyelftools ]))
 
     # Storage image creation (build-time FAT32 ramdisk image for VFS tests)
@@ -76,6 +77,7 @@ pkgs.mkShellNoCC {
 
     export OVMF_CODE="${pkgs.OVMF.fd}/FV/OVMF_CODE.fd"
     export OVMF_VARS="${pkgs.OVMF.fd}/FV/OVMF_VARS.fd"
+    export BROOK_DESKTOP_FONT_TTF="${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf"
     export HACK_FONT_TTF="${pkgs.hack-font}/share/fonts/truetype/Hack-Regular.ttf"
     export BROOK_CA_BUNDLE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
 
