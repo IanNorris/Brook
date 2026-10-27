@@ -1,0 +1,10 @@
+node_modules/
+vendor/
+artifacts/
+__pycache__/
+dist/images/
+dist/runtime/qemu-system-*
+dist/runtime/runtime*.json
+dist/runtime/source/
+dist/runtime/COPYING*
+dist/runtime/LICENSE*

@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Brook — Browser Lab</title><meta name="description" content="An experimental browser-local boot of Brook, a from-scratch operating system with Linux compatibility."><link rel="stylesheet" href="style.css"></head>
+<body>
+<header><a class="brand" href="https://github.com/IanNorris/Brook"><img src="brook-mark.png" width="46" height="46" alt=""><span>Brook <small>Browser Lab</small></span></a><span class="badge">Experimental</span></header>
+<main>
+  <section class="intro"><div><p class="eyebrow">A FROM-SCRATCH OPERATING SYSTEM</p><h1>Try Brook in your browser.</h1><p class="description">Boot the actual x86-64 kernel in a local WebAssembly virtual machine.</p></div><a class="source" href="https://github.com/IanNorris/Brook" target="_blank" rel="noopener">Explore the source ↗</a></section>
+  <section class="machine" aria-label="Brook virtual machine">
+    <div class="toolbar"><div class="machine-state"><span id="state-dot"></span><strong id="state">Ready to boot</strong><span id="elapsed"></span></div><div class="actions"><button id="restart" disabled>Restart</button><button id="fullscreen" disabled>Full screen</button><button id="start" class="primary">Start Brook</button></div></div>
+    <div class="display"><canvas id="canvas" width="1024" height="768" tabindex="0" aria-label="Brook guest display. Click to send keyboard and mouse input."></canvas><div id="cover"><img src="brook-mark.png" width="112" height="112" alt="Brook"><p>A real OS. A fresh machine.</p><span>Start Brook to boot the virtual machine.</span></div></div>
+    <div class="statusbar"><span id="detail" role="status" aria-live="polite">The emulator starts only when you press Start.</span><span>Software rendering · 384 MB guest</span></div>
+  </section>
+  <section class="notes"><div><h2>A first boot experiment</h2><p>This compact image starts Brook’s native window manager and kernel console. The full desktop’s Nix applications aren’t included in this first image.</p></div><div><h2>Runs on your device</h2><p>The emulator allocates 1 GB of memory. Guest networking and audio are off. Changes are discarded when you reload.</p></div><div><h2>Take the controls</h2><p>Click the display to focus it. Try moving, minimizing and restoring the console window. Full screen gives the guest more room.</p></div></section>
+  <details id="diagnostics"><summary>Boot log <span id="line-count">0 lines</span></summary><div class="log-actions"><span>Recent serial output from the guest</span><button id="save-log">Download log</button></div><pre id="log" aria-label="Recent guest serial log"></pre></details>
+</main><footer><span>Brook · MIT licensed</span><div><a href="images/BROOK-LICENSE.txt">Brook license</a><a href="runtime/RUNTIME-PROVENANCE.md">Emulator &amp; source</a><a href="images/brook-image.json">Image manifest</a></div></footer>
+<script type="module" src="app.js"></script></body></html>

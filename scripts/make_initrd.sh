@@ -43,6 +43,7 @@ fi
 # 2880KB (2.88MB floppy) accommodates the ext4 module (~800KB debug) plus others.
 SIZE_KB=2880
 
+mkdir -p "${ESP_DIR}"
 echo "Creating initrd image (${SIZE_KB} KB)..."
 
 # Create FAT16 image

@@ -1,0 +1,19 @@
+{
+  "sourceCommit": "8604ed49a3cde392890b014a8d5a959c8a2fe72a",
+  "sourceRepository": "https://github.com/zb3/qemu-wasm-test",
+  "firmwareTag": "edk2-stable202302",
+  "files": {
+    "edk2-x86_64-code.fd.bz2": {
+      "bytes": 1887921,
+      "sha256": "7539a8f1b0746c3e173c116219e95b03a10a2d408343b11cbd323e42fc5202ee"
+    },
+    "edk2-i386-vars.fd.bz2": {
+      "bytes": 190,
+      "sha256": "83470f393b9a200838b2292a65ca5708a109005d65a6422f3fa23cb21c8179b9"
+    },
+    "edk2-licenses.txt": {
+      "bytes": 42903,
+      "sha256": "1ddeaed2e7d2e9ecb960bdfc1b8ee45387aff70d056d985d145949af3951657c"
+    }
+  }
+}

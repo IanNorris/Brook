@@ -523,6 +523,14 @@ compatibility testing. Workstation boots it to a 1080p software desktop with
 two CPUs; QEMU/KVM controls also pass. Persistent storage, networking,
 accelerated graphics and the full application desktop still need porting.
 
+### Browser preview (experimental)
+
+The [local QEMU-Wasm preview](tools/browser_preview/README.md) boots Brook's
+actual x86-64 kernel into a small software-rendered desktop, with verified mouse
+and keyboard input in Chromium. It contains the native desktop and kernel
+console; the full Nix application image, networking and audio are not included.
+It is not publicly hosted yet.
+
 ### Headless inspection on a Linux host
 
 For a fresh checkout, build the native apps and boot/data disks first. The

@@ -1,0 +1,11 @@
+{
+  "name": "brook-browser-lab",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check dist/app.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.58.0"
+  }
+}

@@ -76,6 +76,11 @@ commands for Windows, macOS and Linux, bundled with Brook's MCP scripts and
 VM harness. Inspect the existing package_qemu_folder.sh, run-qemu.sh and
 run-qemu.bat before designing a replacement.
 
+The existing folder packager copies the current ESP and runtime/user disks;
+it is not a public-release allowlist. Its Windows launcher expects QEMU to
+be installed, and MCP packaging is not present. Reuse its launch knowledge,
+not its current copy-everything behavior for a distributable build.
+
 Prefer per-platform/architecture archives sharing a versioned guest image and
 manifest, rather than one giant archive. Investigate legally redistributable,
 pinned QEMU and firmware binaries, their complete license/source obligations,
