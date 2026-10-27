@@ -37,6 +37,8 @@ static void requests(struct wl_display *connection, struct wl_event_loop *loop) 
     assert(wl_display_flush(connection) >= 0);
     assert(wl_event_loop_dispatch(loop, 0) == 0);
 }
+static uint32_t observed_toplevel;
+static int32_t observed_width,observed_height;
 static uint32_t configure_serial(struct wl_display *display, int fd, uint32_t object) {
     wl_display_flush_clients(display);
     uint32_t wire[256];
@@ -47,6 +49,7 @@ static uint32_t configure_serial(struct wl_display *display, int fd, uint32_t ob
     for (size_t i = 0; i < (size_t)bytes / 4;) {
         uint32_t id = wire[i], op = wire[i+1] & 65535, size = wire[i+1] >> 16;
         assert(size >= 8 && i * 4 + size <= (size_t)bytes);
+        if(id==observed_toplevel && op==XDG_TOPLEVEL_CONFIGURE){observed_width=(int32_t)wire[i+2];observed_height=(int32_t)wire[i+3];}
         if (id == object && op == XDG_SURFACE_CONFIGURE) {
             assert(size == 12); serial = wire[i+2]; ++count;
         }
@@ -86,6 +89,8 @@ int main(void) {
     assert(surface.resource && surface.xdg_surface && surface.xdg_toplevel);
     wl_resource_set_user_data(surface.resource, &surface);
     wl_resource_set_user_data(surface.xdg_surface, &surface);
+    wl_resource_set_user_data(surface.xdg_toplevel,&surface);
+    observed_toplevel=wl_resource_get_id(surface.xdg_toplevel);
     uint32_t vfb[4] = {0};
     surface.wm_id = 1; surface.vfb = vfb;
     surface.vfb_w = surface.vfb_h = surface.vfb_stride = 2;
@@ -93,6 +98,35 @@ int main(void) {
     surface_commit(client, surface.resource);
     uint32_t initial = configure_serial(display, sockets[1], wl_resource_get_id(surface.xdg_surface));
     assert(!surface.xdg_acked);
+    assert(observed_width==800 && observed_height==600);
+    // Double-buffered min/max hints influence only the next committed size.
+    struct brook_surface hints={0};surface_tree_init(&hints);
+    hints.resource=wl_resource_create(client,&wl_surface_interface,4,0);
+    hints.xdg_surface=wl_resource_create(client,&xdg_surface_interface,1,0);
+    hints.xdg_toplevel=wl_resource_create(client,&xdg_toplevel_interface,1,0);
+    assert(hints.resource&&hints.xdg_surface&&hints.xdg_toplevel);
+    wl_resource_set_user_data(hints.resource,&hints);wl_resource_set_user_data(hints.xdg_toplevel,&hints);
+    xdg_toplevel_set_max_size(client,hints.xdg_toplevel,440,620);
+    xdg_toplevel_set_min_size(client,hints.xdg_toplevel,440,620);
+    assert(hints.size_hints.min_w==0 && hints.size_hints.max_w==0);
+    observed_toplevel=wl_resource_get_id(hints.xdg_toplevel);
+    surface_commit(client,hints.resource);
+    configure_serial(display,sockets[1],wl_resource_get_id(hints.xdg_surface));
+    assert(observed_width==440 && observed_height==620);
+    // Reset then replace constraints in the opposite request order.
+    surface_unmap(&hints);assert(!hints.size_hints.min_w&&!hints.size_hints.max_w);
+    hints.xdg_initial_commit_done=0;
+    xdg_toplevel_set_min_size(client,hints.xdg_toplevel,0,700);
+    xdg_toplevel_set_max_size(client,hints.xdg_toplevel,0,0);
+    surface_commit(client,hints.resource);
+    configure_serial(display,sockets[1],wl_resource_get_id(hints.xdg_surface));
+    assert(observed_width==800 && observed_height==700);
+    assert(!toplevel_size_valid(&(struct toplevel_size_hints){440,0,400,0}));
+    assert(!toplevel_size_valid(&(struct toplevel_size_hints){-1,0,0,0}));
+    assert(toplevel_initial_axis(800,INT32_MAX,0,1920)==1920);
+    assert(toplevel_initial_axis(600,0,0,1080)==600);
+    observed_toplevel=wl_resource_get_id(surface.xdg_toplevel);
+
     for (unsigned i = 0; i < 4; ++i) pixels[i] = 0x00112233;
     surface_attach(client, surface.resource, server_buffer, 0, 0);
     surface_commit(client, surface.resource);

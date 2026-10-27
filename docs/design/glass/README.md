@@ -17,6 +17,26 @@ Files and app listings are illustrative. The prototype never controls the VM or
 accesses the user's filesystem. It is an authored HTML/CSS/JS study; CSS blur and
 highlights approximate the material without reproducing Raven's refractive rim.
 
+## Native first pass
+
+The captures below remain browser concepts. The native compositor now has the
+blue title gradient, active-only 160×4 accent and thin focus edge, 5px corners,
+a small cached shadow and rounded task targets. Native Settings opens as a
+compact 440×560 inspector with working palette selection, scale, persistence
+and preview. Smoked is slate blue and Opal is icy blue; Clearwater remains the
+dark default. The native launcher layout and density/softness controls have
+not been ported from this browser study. Unsupported controls are not shown.
+
+The GPU path keeps wallpaper, unchanged chrome and cursor images cached rather
+than inheriting the taskbar's per-frame upload damage. A client-accepted buffer
+resize invalidates chrome geometry explicitly. Normal maximize/restore and
+palette save/restore passed native checks. The bounded native material shadow
+is a cached nine-slice approximation, not Raven's refractive shader. Opaque
+fallback and the material-only `BROOK_GLASS=off` switch retain window controls.
+See [frame timing controls](../../gpu-frame-breakdown.md#glass-and-display-backend-control--27-october-2026)
+for the matched native/headless measurements and their limitations. True
+fullscreen transitions and automatic effect bypass remain a separate follow-up.
+
 ## V2 refinement
 
 The shared glass tint and accents now lean blue rather than green/turquoise.

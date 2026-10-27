@@ -3876,6 +3876,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             "  audio producer on|off|reset|status - DSP producer elapsed brackets (default off)\n"
             "  audio timing on|off|reset|status - mixer service brackets (default off)\n"
             "  audio delivery on|off|reset|status - HDA silence/copy diagnostics (default off)\n"
+            "  gpu glass on|off|status - frame-boundary material toggle; keeps GPU composition\n"
+            "  gpu uploads - cumulative requested bytes by desktop/chrome/overlay/cursor layer\n"
             "  gpu frame timing on|off|reset|status|frames - bounded exclusive compositor stages\n"
             "  gpu completion wake on|off|status - default-off IRQ completion wait experiment\n"
             "  gpu scene wake on|off|status - default-off scene completion notification experiment\n"
@@ -4420,6 +4422,20 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         if(NetStrEq(cmd,"gpu scene wake off"))SceneCompletionWakeEnable(false);
         BridgeReply r;r.text("{\"enabled\":");r.text(SceneCompletionWakeEnabled()?"true":"false");
         r.text(",\"scope\":\"default-off scene completion wake experiment; per-wait snapshot, existing registrations retained\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"gpu uploads")) {
+        const auto s=CompositorReadUploads();BridgeReply r;r.text("{\"layers\":[");
+        const char* names[]={"desktop","chrome","overlay","cursor"};
+        for(unsigned i=0;i<4;++i){if(i)r.text(",");r.text("{\"name\":\"");r.text(names[i]);r.text("\",");
+            r.field("calls",s.calls[i]);r.text(",");r.field("requested_bytes",s.bytes[i]);r.text("}");}
+        r.text("],\"scope\":\"Cumulative compositor layer upload requests, not measured bus traffic; fields sampled independently; excludes app-owned captures\"}\n");r.send();
+    }
+    else if(NetStrEq(cmd,"gpu glass on") || NetStrEq(cmd,"gpu glass off") || NetStrEq(cmd,"gpu glass status")) {
+        if(!NetStrEq(cmd,"gpu glass status"))CompositorSetGlassEnabled(NetStrEq(cmd,"gpu glass on"));
+        BridgeReply r;r.text("{\"requested\":");r.text(CompositorGlassRequested()?"true":"false");
+        r.text(",\"active\":");r.text(CompositorGlassActive()?"true":"false");
+        r.text(",\"gpu_composition\":");r.text(CompositorGpuActive()?"true":"false");
+        r.text(",\"scope\":\"Material change applied at the next compositor frame boundary; GPU compositor remains unchanged\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"gpu frame timing on") || NetStrEq(cmd,"gpu frame timing off") ||
             NetStrEq(cmd,"gpu frame timing reset") || NetStrEq(cmd,"gpu frame timing status") ||

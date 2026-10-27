@@ -1147,3 +1147,59 @@ receipts, drain, resets, close, multiple streams and format transitions need
 actual-body validation. The existing ALSA plugin rejects device delay above its
 logical ring, so a Quake result would not establish Firefox compatibility.
 Do not casually add shared reserved silence to per-stream GETODELAY.
+
+
+## Glass and display backend control — 27 October 2026
+
+A matched same-boot GPU-compositor comparison exposed a large display-backend
+confounder. At 1920×1080, eight balanced headless captures gave mean empty
+compositor work of 9.76 ms flat versus 10.46 ms glass. With Settings open,
+10.17 ms became 11.55 ms. About 6.9 ms per frame was attributed to the unfenced
+ResourceFlush call, independently of glass and the number of windows.
+
+With the same staged kernel, images, eight vCPUs, Intel render node and audio
+disabled, a native `sdl,gl=on` ABBA control instead measured 2.98 ms flat versus
+3.91 ms glass on the empty desktop, and 3.41 ms versus 4.97 ms with Settings.
+Native flush attribution was only 0.13–0.15 ms. These are guest elapsed work
+intervals, including host scheduling; they are not pure GPU execution times.
+The separate start-to-start interval also includes the compositor's fallback
+sleep and must not be presented as rendering cost. Four native samples per
+scene are a bounded control, not a long-run performance guarantee.
+
+QEMU 10.2.2's [headless flush](https://github.com/qemu/qemu/blob/v10.2.2/ui/egl-headless.c)
+blits the full framebuffer and calls `egl_fb_read`, whose
+[implementation](https://github.com/qemu/qemu/blob/v10.2.2/ui/egl-helpers.c)
+uses `glReadPixels` for the whole surface. That is about 8.29 MB of synchronous
+readback at 1080p per flush. It explains a substantial headless-only cost;
+it is not evidence that an additional guest render target would eliminate it.
+Keep render completion and display-consumer lifetime guarantees intact.
+Always record the display backend with compositor benchmarks.
+
+The same investigation found avoidable guest uploads: the taskbar's dirty
+rows were being applied to wallpaper and chrome textures too, with another
+full repaint every 500 ms. The GPU path now invalidates wallpaper and chrome
+independently, retains the periodic CPU fallback refresh, and uploads cursor
+pixels only when the image changes. Client-accepted VFB resizes explicitly
+invalidate chrome geometry. `gpu uploads` exposes cumulative requested bytes
+for the four layers; these are not measured PCI/DMA traffic. In a five-second
+idle Settings control, desktop, chrome and cursor requested zero uploads;
+only the taskbar overlay changed (252 uploads, 85,155,840 requested bytes).
+
+The ignored local evidence is under
+`build/workloads/glass-native-20261027/perf-baseline/`,
+`perf-native-baseline/` and `idle-upload-verification.json`. One initial
+instrumentation-invalid headless sample was retained and excluded. Clean
+accepted captures reported no invalid frames or clock failures. Glass remains
+independently switchable with `BROOK_GLASS=off` at launch or `gpu glass off`
+through the VM debug channel, retaining the same GPU compositor for controls.
+
+
+After the upload correction and native material pass, a second SDL ABBA control
+measured 2.62 ms flat versus 3.41 ms glass on the empty desktop, and 2.88 ms
+versus 4.24 ms for the redesigned Settings window. The latter now opens at
+440×560 rather than 800×600, so its before/after totals are not an isolated
+cache-optimization comparison. The within-run material controls retain the
+same geometry and GPU compositor. Steady captures now contain four control
+commands per frame rather than seven. Requested desktop/chrome/cursor uploads
+stay at zero; the live overlay still updates. Evidence is in the ignored
+`perf-native-post-style/` directory beside the earlier controls.

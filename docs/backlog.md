@@ -87,6 +87,16 @@
   Bound the follow-up to replaying the app sequence and obtaining a useful
   host stack/resource-lifetime trace if it repeats, before proposing GPU changes.
 
+- Implement explicit fullscreen game/window transitions before treating maximize
+  as fullscreen. Native Wayland set/unset-fullscreen requests are still stubs;
+  XWayland also needs `_NET_WM_STATE_FULLSCREEN` forwarding. Preserve pre-map
+  requests, configure/ack ordering, prior normal/maximized geometry and focus.
+  While a committed, opaque fullscreen app is active, bypass glass/shadows and
+  covered desktop layers; restore effects on exit, minimize, focus changes or
+  launcher invocation. Verify native and Steam/XWayland game entry/exit rather
+  than inferring fullscreen from a large decorated window. Keep the existing
+  render fence and display-consumer lifetime guarantees.
+
 - Investigate Chromium fullscreen and off-screen move geometry from the
   21 October live browser review. The user reports that Chrome does not enter
   fullscreen, and moving the window's top-left edge a few pixels past the

@@ -9,7 +9,7 @@
 #include <unistd.h>
 #include "brook_theme.h"
 
-static GtkWidget *choice,*scale_choice,*preview,*status;
+static GtkWidget *scale_choice,*preview,*status,*swatches[3];
 static char *settings_path;
 static unsigned selected;
 static unsigned selected_scale=100;
@@ -32,18 +32,36 @@ static void label(cairo_t *cr,int x,int y,const char *text,uint32_t rgb,int size
 static gboolean draw_preview(GtkWidget *widget,cairo_t *cr,gpointer unused) {
     (void)unused;const BrookThemePalette *p=brook_theme_palette(selected);
     int w=gtk_widget_get_allocated_width(widget),h=gtk_widget_get_allocated_height(widget);
-    rect(cr,0,0,w,h,p->launcher);rect(cr,24,24,w-48,h-92,p->borderActive);
-    rect(cr,25,25,w-50,36,p->titleActive);label(cr,38,32,"Window preview",p->text,15);
-    label(cr,w-118,32,"−   □   ×",p->text,16);
-    rect(cr,25,61,w-50,h-130,selected==BROOK_THEME_DAWN?0xf5f7fa:0x172335);label(cr,44,84,"Brook desktop preview",selected==BROOK_THEME_DAWN?0x26374b:0xe5edf8,17);
-    rect(cr,0,h-44,w,44,p->taskbar);
-    for(int i=0;i<4;++i){rect(cr,10+i*44,h-38,34,32,i==1?p->taskActive:p->taskButton);rect(cr,19+i*44,h-30,16,16,p->borderActive);}
-    rect(cr,56,h-9,30,2,p->borderActive);label(cr,w-75,h-32,"12:34",p->taskText,14);
+    cairo_pattern_t *bg=cairo_pattern_create_linear(0,0,w,h);
+    cairo_pattern_add_color_stop_rgb(bg,0,.55,.66,.82);
+    cairo_pattern_add_color_stop_rgb(bg,.5,.70,.83,.96);
+    cairo_pattern_add_color_stop_rgb(bg,1,.36,.50,.69);
+    cairo_set_source(cr,bg);cairo_paint(cr);cairo_pattern_destroy(bg);
+    int x=26,y=15,ww=w-52;
+    rect(cr,x,y,ww,h-y,p->borderActive);
+    rect(cr,x+1,y+3,ww-2,21,p->titleActive);
+    label(cr,x+9,y+6,"•  Window preview",p->text,9);
+    label(cr,x+ww-43,y+6,"−  □  ×",p->text,9);
+    rect(cr,x+1,y+24,ww-2,h-y-24,selected==BROOK_THEME_DAWN?0xf5f7fa:0x172335);
+    for(int i=0;i<3;++i)rect(cr,x+9+i*34,y+31,27,17,p->taskButton);
     return FALSE;
 }
-static void changed(GtkComboBox *box,gpointer unused) {
-    (void)unused;int active=gtk_combo_box_get_active(box);
-    if(active>=0&&(unsigned)active<BROOK_THEME_COUNT)selected=(unsigned)active;
+static gboolean draw_swatch(GtkWidget *widget,cairo_t *cr,gpointer data) {
+    unsigned id=GPOINTER_TO_UINT(data);const BrookThemePalette *p=brook_theme_palette(id);
+    int w=gtk_widget_get_allocated_width(widget),h=gtk_widget_get_allocated_height(widget);
+    cairo_pattern_t *gradient=cairo_pattern_create_linear(0,0,w,h);
+    uint32_t a=p->titleActive,b=id==BROOK_THEME_DAWN?0xEFF5FC:id==BROOK_THEME_MIDNIGHT?0x7087A8:0x9DC3EF;
+    cairo_pattern_add_color_stop_rgb(gradient,0,((a>>16)&255)/255.,((a>>8)&255)/255.,(a&255)/255.);
+    cairo_pattern_add_color_stop_rgb(gradient,1,((b>>16)&255)/255.,((b>>8)&255)/255.,(b&255)/255.);
+    cairo_set_source(cr,gradient);cairo_paint(cr);cairo_pattern_destroy(gradient);return FALSE;
+}
+static void select_theme(GtkButton *button,gpointer data) {
+    (void)button;selected=GPOINTER_TO_UINT(data);
+    for(unsigned i=0;i<BROOK_THEME_COUNT;++i) {
+        GtkStyleContext *context=gtk_widget_get_style_context(swatches[i]);
+        if(i==selected)gtk_style_context_add_class(context,"selected");
+        else gtk_style_context_remove_class(context,"selected");
+    }
     gtk_widget_queue_draw(preview);
 }
 static int save_appearance(unsigned theme,unsigned scale,GError **error) {
@@ -93,6 +111,19 @@ static void apply(GtkButton *button,gpointer unused) {
     printf("BROOK_SETTINGS_SAVED theme=%u scale=%u path=%s\n",selected,selected_scale,settings_path);fflush(stdout);
 }
 
+static void first_paint(GdkFrameClock *clock,gpointer data) {
+    GtkWindow *window=GTK_WINDOW(data);
+    // The first configure has chosen the compact inspector width. Subsequent
+    // resizing and maximize retain only a usable minimum size.
+    GdkGeometry geometry={0};geometry.min_width=380;geometry.min_height=520;
+    gtk_window_set_geometry_hints(window,NULL,&geometry,GDK_HINT_MIN_SIZE);
+    g_signal_handlers_disconnect_by_func(clock,G_CALLBACK(first_paint),window);
+}
+static void realized(GtkWidget *widget,gpointer unused) {
+    (void)unused;GdkFrameClock *clock=gtk_widget_get_frame_clock(widget);
+    if(clock)g_signal_connect_object(clock,"after-paint",G_CALLBACK(first_paint),widget,0);
+}
+
 int main(int argc,char **argv) {
     const char *configured=g_getenv("BROOK_USER_SETTINGS");
     settings_path=g_strdup(configured&&*configured?configured:"/data/home/.config/brook/settings.ini");
@@ -100,33 +131,66 @@ int main(int argc,char **argv) {
     gtk_init(&argc,&argv);
     g_object_set(gtk_settings_get_default(),"gtk-application-prefer-dark-theme",TRUE,NULL);
     GtkCssProvider *brook_css=gtk_css_provider_new();
-    gtk_css_provider_load_from_data(brook_css,"window, dialog { background-color: #172335; color: #e5edf8; } headerbar, toolbar { background: #243c5d; color: #e5edf8; } button, combobox, entry { background: #243a56; color: #e5edf8; border-color: #3c5270; } button:hover { background: #355987; } treeview, textview, viewport { background-color: #1c314c; color: #e5edf8; }",-1,NULL);
+    gtk_css_provider_load_from_data(brook_css,
+        "window { background-color: #172335; color: #e5edf8; }"
+        "label { color: #e5edf8; } .eyebrow { color: #9baec5; font-size: 10px; font-weight: bold; }"
+        ".heading { font-size: 27px; font-weight: 500; } .muted { color: #a4b5ca; font-size: 11px; }"
+        "button, combobox { background: #243a56; color: #e5edf8; border: 1px solid #3c5270; border-radius: 4px; }"
+        "button:hover { background: #355987; } button.swatch { background: transparent; border: 1px solid transparent; padding: 3px; box-shadow: none; }"
+        "button.swatch.selected { border-color: #68acff; } button.swatch label { font-size: 10px; }"
+        "button.primary { background: #326bb2; border-color: #5b8dc7; color: white; padding: 8px 14px; }"
+        "separator { background: #3c5270; min-height: 1px; }",-1,NULL);
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),GTK_STYLE_PROVIDER(brook_css),GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(brook_css);
     long active=syscall(0xB02L,0L,0L);selected=active>=0&&active<BROOK_THEME_COUNT?(unsigned)active:0;
     long scale=syscall(0xB04L,0L,0L);
     int scale_index=0;for(int i=0;i<3;++i)if(scale==(long)scales[i]){selected_scale=scales[i];scale_index=i;}
     GtkWidget *window=gtk_window_new(GTK_WINDOW_TOPLEVEL);gtk_window_set_title(GTK_WINDOW(window),"Settings");
-    gtk_window_set_default_size(GTK_WINDOW(window),640,540);
+    gtk_window_set_default_size(GTK_WINDOW(window),440,560);
+    /* A compact inspector: truthful geometry bounds let the compositor choose
+     * its initial width while retaining bounded defaults for other apps. */
+    GdkGeometry geometry={0};geometry.min_width=380;geometry.max_width=440;
+    geometry.min_height=520;geometry.max_height=560;
+    gtk_window_set_geometry_hints(GTK_WINDOW(window),NULL,&geometry,GDK_HINT_MIN_SIZE|GDK_HINT_MAX_SIZE);
+    g_signal_connect(window,"realize",G_CALLBACK(realized),NULL);
     g_signal_connect(window,"destroy",G_CALLBACK(gtk_main_quit),NULL);
-    GtkWidget *box=gtk_box_new(GTK_ORIENTATION_VERTICAL,16);gtk_container_set_border_width(GTK_CONTAINER(box),24);gtk_container_add(GTK_CONTAINER(window),box);
-    GtkWidget *heading=gtk_label_new("Appearance");gtk_widget_set_halign(heading,GTK_ALIGN_START);gtk_box_pack_start(GTK_BOX(box),heading,FALSE,FALSE,0);
-    GtkWidget *row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,16);gtk_box_pack_start(GTK_BOX(box),row,FALSE,FALSE,0);
-    gtk_box_pack_start(GTK_BOX(row),gtk_label_new("Desktop theme"),FALSE,FALSE,0);
-    choice=gtk_combo_box_text_new();for(unsigned i=0;i<BROOK_THEME_COUNT;++i)gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(choice),brook_theme_name(i));
-    gtk_combo_box_set_active(GTK_COMBO_BOX(choice),(int)selected);gtk_box_pack_start(GTK_BOX(row),choice,TRUE,TRUE,0);
-    GtkWidget *scale_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,16);gtk_box_pack_start(GTK_BOX(box),scale_row,FALSE,FALSE,0);
-    gtk_box_pack_start(GTK_BOX(scale_row),gtk_label_new("Desktop scale"),FALSE,FALSE,0);
+    GtkWidget *box=gtk_box_new(GTK_ORIENTATION_VERTICAL,12);gtk_container_set_border_width(GTK_CONTAINER(box),26);gtk_container_add(GTK_CONTAINER(window),box);
+    GtkWidget *eyebrow=gtk_label_new("APPEARANCE");gtk_widget_set_halign(eyebrow,GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(eyebrow),"eyebrow");gtk_box_pack_start(GTK_BOX(box),eyebrow,FALSE,FALSE,0);
+    GtkWidget *heading=gtk_label_new("Choose your\nmaterial.");gtk_label_set_justify(GTK_LABEL(heading),GTK_JUSTIFY_LEFT);gtk_widget_set_halign(heading,GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(heading),"heading");gtk_box_pack_start(GTK_BOX(box),heading,FALSE,FALSE,0);
+    GtkWidget *helper=gtk_label_new("Preview the frame, launcher and navigation.");gtk_widget_set_halign(helper,GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(helper),"muted");gtk_box_pack_start(GTK_BOX(box),helper,FALSE,FALSE,0);
+    preview=gtk_drawing_area_new();gtk_widget_set_size_request(preview,-1,77);gtk_box_pack_start(GTK_BOX(box),preview,FALSE,FALSE,0);
+    g_signal_connect(preview,"draw",G_CALLBACK(draw_preview),NULL);
+    GtkWidget *swatch_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,8);gtk_box_pack_start(GTK_BOX(box),swatch_row,FALSE,FALSE,0);
+    const unsigned order[]={0,2,1};
+    for(unsigned i=0;i<3;++i) {
+        unsigned id=order[i];GtkWidget *button=gtk_button_new();swatches[id]=button;
+        gtk_style_context_add_class(gtk_widget_get_style_context(button),"swatch");
+        if(id==selected)gtk_style_context_add_class(gtk_widget_get_style_context(button),"selected");
+        GtkWidget *contents=gtk_box_new(GTK_ORIENTATION_VERTICAL,5);gtk_container_add(GTK_CONTAINER(button),contents);
+        GtkWidget *sample=gtk_drawing_area_new();gtk_widget_set_size_request(sample,-1,24);gtk_box_pack_start(GTK_BOX(contents),sample,FALSE,FALSE,0);
+        g_signal_connect(sample,"draw",G_CALLBACK(draw_swatch),GUINT_TO_POINTER(id));
+        gtk_box_pack_start(GTK_BOX(contents),gtk_label_new(brook_theme_name(id)),FALSE,FALSE,0);
+        gtk_box_pack_start(GTK_BOX(swatch_row),button,TRUE,TRUE,0);g_signal_connect(button,"clicked",G_CALLBACK(select_theme),GUINT_TO_POINTER(id));
+    }
+    GtkWidget *scale_row=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,16);gtk_box_pack_start(GTK_BOX(box),scale_row,FALSE,FALSE,4);
+    GtkWidget *scale_label=gtk_label_new("Desktop scale");gtk_widget_set_halign(scale_label,GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(scale_row),scale_label,TRUE,TRUE,0);
     scale_choice=gtk_combo_box_text_new();
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(scale_choice),"100%");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(scale_choice),"150%");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(scale_choice),"200%");
     gtk_combo_box_set_active(GTK_COMBO_BOX(scale_choice),scale_index);
-    gtk_box_pack_start(GTK_BOX(scale_row),scale_choice,TRUE,TRUE,0);
+    gtk_box_pack_end(GTK_BOX(scale_row),scale_choice,FALSE,FALSE,0);
     g_signal_connect(scale_choice,"changed",G_CALLBACK(scale_changed),NULL);
-    preview=gtk_drawing_area_new();gtk_widget_set_size_request(preview,540,250);gtk_box_pack_start(GTK_BOX(box),preview,TRUE,TRUE,0);
-    g_signal_connect(preview,"draw",G_CALLBACK(draw_preview),NULL);g_signal_connect(choice,"changed",G_CALLBACK(changed),NULL);
-    GtkWidget *button=gtk_button_new_with_label("Apply appearance");gtk_widget_set_halign(button,GTK_ALIGN_END);gtk_box_pack_start(GTK_BOX(box),button,FALSE,FALSE,0);g_signal_connect(button,"clicked",G_CALLBACK(apply),NULL);
-    status=gtk_label_new("Choose a theme and scale for the taskbar, launcher and window chrome.");gtk_label_set_line_wrap(GTK_LABEL(status),TRUE);gtk_box_pack_start(GTK_BOX(box),status,FALSE,FALSE,0);
+    GtkWidget *spacer=gtk_box_new(GTK_ORIENTATION_VERTICAL,0);gtk_box_pack_start(GTK_BOX(box),spacer,TRUE,TRUE,0);
+    gtk_box_pack_start(GTK_BOX(box),gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),FALSE,FALSE,0);
+    GtkWidget *footer=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12);gtk_box_pack_start(GTK_BOX(box),footer,FALSE,FALSE,0);
+    status=gtk_label_new("Choose a theme and scale.");gtk_label_set_line_wrap(GTK_LABEL(status),TRUE);gtk_label_set_xalign(GTK_LABEL(status),0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(status),"muted");gtk_box_pack_start(GTK_BOX(footer),status,TRUE,TRUE,0);
+    GtkWidget *button=gtk_button_new_with_label("Apply appearance");gtk_style_context_add_class(gtk_widget_get_style_context(button),"primary");
+    gtk_box_pack_end(GTK_BOX(footer),button,FALSE,FALSE,0);g_signal_connect(button,"clicked",G_CALLBACK(apply),NULL);
     gtk_widget_show_all(window);gtk_main();g_free(settings_path);return 0;
 }

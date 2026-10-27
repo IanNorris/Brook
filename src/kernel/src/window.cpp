@@ -1,3 +1,4 @@
+#include "chrome_material.h"
 // Brook window manager — z-ordered windows with chrome.
 //
 // Each process gets a Window that wraps its VFB with a title bar, border,
@@ -1571,7 +1572,19 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     WmFillRect(buf, stride, screenW, screenH, w.x + ow - border, w.y, border, oh, edge);
     WmFillRect(buf, stride, screenW, screenH, w.x, w.y + oh - border, ow, border, edge);
     const int tx = w.x + border, ty = w.y + border;
-    WmFillRect(buf, stride, screenW, screenH, tx, ty, w.clientW, WmMetric(WM_TITLE_BAR_HEIGHT), bg);
+    const bool material=CompositorGlassActive();
+    const int titleH=WmMetric(WM_TITLE_BAR_HEIGHT);
+    for(int row=0;row<titleH;++row)
+        WmFillRect(buf,stride,screenW,screenH,tx,ty+row,w.clientW,1,
+            material?ChromeTitleColor(bg,row,titleH):bg);
+    // A restrained one-pixel edge replaces the old heavy double outline.
+    if(border>1){
+        WmFillRect(buf,stride,screenW,screenH,w.x+1,w.y+1,ow-2,border-1,bg);
+        WmFillRect(buf,stride,screenW,screenH,w.x+1,w.y+border,border-1,oh-2*border,bg);
+        WmFillRect(buf,stride,screenW,screenH,w.x+ow-border,w.y+border,border-1,oh-2*border,bg);
+        WmFillRect(buf,stride,screenW,screenH,w.x+1,w.y+oh-border,ow-2,border-1,bg);
+    }
+    WmFillRect(buf,stride,screenW,screenH,tx,ty+titleH-1,w.clientW,1,ChromeMix(bg,0xffffff,32));
     // Active identity stroke: keep the hit-test geometry and client opacity.
     if (w.focused) WmFillRect(buf,stride,screenW,screenH,tx+WmMetric(12),ty,
         w.clientW>WmMetric(184)?WmMetric(160):w.clientW/2,WmMetric(4),0x0068ACFF);
@@ -1590,6 +1603,7 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     {
         const WmRect r = CaptionRect(w, button);
         const bool hover = r.contains(mouseX, mouseY);
+        if(material)WmFillRect(buf,stride,screenW,screenH,r.x,r.y,1,r.h,ChromeMix(bg,0xffffff,20));
         if (hover) WmFillRect(buf, stride, screenW, screenH, r.x, r.y, r.w, r.h,
                              button == 0 ? WmCurrentPalette().closeHover : WmCurrentPalette().captionHover);
         if (r.w < static_cast<int>(WmMetric(14))) continue;
@@ -1741,6 +1755,14 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     return l;
 }
 
+static void WmMaterialRect(uint32_t* pixels,uint32_t stride,uint32_t sw,uint32_t sh,const WmRect& r,uint32_t color){
+    const unsigned radius=CompositorGlassActive()?WmMetric(4):0;
+    for(int y=0;y<r.h;++y){const unsigned row=y<r.h/2?y:r.h-1-y;
+        const int inset=ChromeCornerInset(radius,row);
+        WmFillRect(pixels,stride,sw,sh,r.x+inset,r.y+y,r.w-2*inset,1,color);
+    }
+}
+
 void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
                      uint32_t screenW, uint32_t screenH,
                      uint64_t uptimeMs, int32_t mouseX, int32_t mouseY)
@@ -1754,10 +1776,10 @@ void WmRenderTaskbar(uint32_t* backBuffer, uint32_t stride,
     auto button = [&](const WmRect& r, const char* title, bool active, bool minimized) {
         uint32_t bg = active ? WmCurrentPalette().taskActive :
             r.contains(mouseX, mouseY) ? WmCurrentPalette().taskHover : WmCurrentPalette().taskButton;
-        WmFillRect(backBuffer, stride, screenW, screenH, r.x, r.y, r.w, r.h, bg);
+        WmMaterialRect(backBuffer,stride,screenW,screenH,r,bg);
         if (active || minimized)
             WmFillRect(backBuffer, stride, screenW, screenH, r.x + WmMetric(6), r.y + r.h - WmMetric(2),
-                       r.w - WmMetric(12), WmMetric(2), active ? WmCurrentPalette().borderActive : WmCurrentPalette().minimized);
+                       r.w - WmMetric(12), WmMetric(2), active ? 0x68acff : WmCurrentPalette().minimized);
         if (r.w > static_cast<int>(WmMetric(12))) WmRenderString(backBuffer, stride, screenW, screenH,
             r.x + WmMetric(6), l.textY, title, WmCurrentPalette().taskText, bg, r.w - WmMetric(12));
     };
@@ -2923,6 +2945,9 @@ int WmResizeVfbForProcess(Process* proc, uint32_t wmId,
     outResult->wmId      = wmId;
     outResult->vfbUser   = w->vfbUser;
     outResult->vfbStride = w->vfbStride;
+    // Client-accepted sizes can differ from the WM offer. Invalidate cached
+    // caption geometry along with publishing the replacement client buffer.
+    CompositorMarkDirty();CompositorWake();
     return 0;
 }
 

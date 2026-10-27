@@ -27,6 +27,10 @@ uint64_t CompositorDesktopReadyTick();
 uint64_t CompositorBootDurationMs();
 bool CompositorGpuActive();
 bool CompositorGlassActive();
+bool CompositorGlassRequested();
+void CompositorSetGlassEnabled(bool enabled);
+struct CompositorUploadStats { uint64_t calls[4],bytes[4]; };
+CompositorUploadStats CompositorReadUploads();
 
 // Get physical framebuffer dimensions.
 extern "C" void CompositorGetPhysDims(uint32_t* w, uint32_t* h);

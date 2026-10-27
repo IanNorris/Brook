@@ -110,6 +110,7 @@ static void surface_unmap(struct brook_surface *s) {
     if (s->wm_id && (s->xdg_toplevel || s->xdg_popup)) {
         s->xdg_initial_commit_done=0;s->xdg_acked=0;
     }
+    memset(&s->size_hints,0,sizeof(s->size_hints));memset(&s->pending_size_hints,0,sizeof(s->pending_size_hints));s->size_hints_pending=0;
     s->toplevel_maximized=s->toplevel_resizing=0;s->configure_width=s->configure_height=0;s->configure_size_pending=s->configure_size_acked=0;s->configure_size_serial=0;
     scene_owner_unref(s->scene);s->scene=NULL;s->scene_disabled=0;
     if (s->wm_id) wm_destroy_window(s->wm_id);

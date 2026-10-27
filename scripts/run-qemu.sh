@@ -395,6 +395,9 @@ fi
 # compositor only uses it when the virtio-gpu 3D path is also live (otherwise it
 # transparently falls back to the CPU composite path). Default: GPU when available.
 FWCFG_OPTS="-fw_cfg name=opt/composite,string=${BROOK_COMPOSITE:-gpu}"
+if [ -n "${BROOK_GLASS:-}" ]; then
+    FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/glass,string=${BROOK_GLASS}"
+fi
 if [ "${BROOK_GPU_THUMB:-0}" = "1" ]; then
     FWCFG_OPTS="${FWCFG_OPTS} -fw_cfg name=opt/gputhumb,string=1"
 fi

@@ -1,3 +1,4 @@
+#include "toplevel-size.h"
 /*
  * waylandd.c — Brook OS Wayland server (Phase D rewrite).
  *
@@ -312,6 +313,8 @@ struct brook_surface {
     struct brook_xwindow *xwindow;
     int  xdg_initial_commit_done;
     int  xdg_acked; /* Initial handshake, not acknowledgement of the newest state. */
+    struct toplevel_size_hints size_hints,pending_size_hints;
+    unsigned size_hints_pending;
     int  toplevel_activated;
     int  toplevel_maximized,toplevel_resizing;
     int32_t configure_width,configure_height;
@@ -637,6 +640,15 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         s->window_geometry_w=s->pending_geometry_w;s->window_geometry_h=s->pending_geometry_h;s->window_geometry_pending=0;
 
     }
+    if(s->size_hints_pending){
+        struct toplevel_size_hints hints=s->size_hints;
+        if(s->size_hints_pending&1){hints.min_w=s->pending_size_hints.min_w;hints.min_h=s->pending_size_hints.min_h;}
+        if(s->size_hints_pending&2){hints.max_w=s->pending_size_hints.max_w;hints.max_h=s->pending_size_hints.max_h;}
+        if(!toplevel_size_valid(&hints)){
+            wl_resource_post_error(s->xdg_toplevel,XDG_TOPLEVEL_ERROR_INVALID_SIZE,"Maximum size is below minimum size");return;
+        }
+        s->size_hints=hints;s->size_hints_pending=0;
+    }
     const int configure_committed=s->configure_size_pending && s->configure_size_acked;
     /* xdg-shell role: the very first commit must have NO buffer; we
      * respond with a configure. The client acks, then commits with a
@@ -645,15 +657,18 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         s->xdg_initial_commit_done = 1;
         struct wl_array states;
         wl_array_init(&states);
-        /* Suggest a sane default size. Sending 0,0 lets the client pick
-         * its own natural size; for some GTK layouts that produces a
-         * pathological measurement (>65535 px). Bounding it here lets
-         * the SHM pool allocation stay sane. */
-        xdg_toplevel_send_configure(s->xdg_toplevel, 800, 600, &states);
+        /* Keep the bounded GTK fallback, honoring committed client constraints.
+         * Hints are advisory: never turn an absurd minimum into a huge SHM pool. */
+        uint32_t screen_w=0,screen_h=0;wm_get_screen_info(&screen_w,&screen_h);
+        const int32_t cap_w=screen_w && screen_w<4096?(int32_t)screen_w:4096;
+        const int32_t cap_h=screen_h && screen_h<2160?(int32_t)screen_h:2160;
+        const int32_t width=toplevel_initial_axis(800,s->size_hints.min_w,s->size_hints.max_w,cap_w);
+        const int32_t height=toplevel_initial_axis(600,s->size_hints.min_h,s->size_hints.max_h,cap_h);
+        xdg_toplevel_send_configure(s->xdg_toplevel,width,height,&states);
         wl_array_release(&states);
         uint32_t serial = s->next_configure_serial = next_serial();
         xdg_surface_send_configure(s->xdg_surface, serial);
-        fprintf(stderr, "[waylandd] xdg initial configure sent serial=%u (800x600)\n", serial);
+        fprintf(stderr, "[waylandd] xdg initial configure sent serial=%u (%dx%d)\n", serial,width,height);
         return;
     }
     if (s->xdg_popup && !s->xdg_initial_commit_done) {
@@ -935,11 +950,15 @@ static void xdg_toplevel_resize(struct wl_client *c, struct wl_resource *r,
 }
 static void xdg_toplevel_set_max_size(struct wl_client *c, struct wl_resource *r,
                                        int32_t w, int32_t h) {
-    (void)c; (void)r; (void)w; (void)h;
+    (void)c;struct brook_surface *s=wl_resource_get_user_data(r);
+    if(w<0||h<0){wl_resource_post_error(r,XDG_TOPLEVEL_ERROR_INVALID_SIZE,"Negative maximum size");return;}
+    if(s){s->pending_size_hints.max_w=w;s->pending_size_hints.max_h=h;s->size_hints_pending|=2;}
 }
 static void xdg_toplevel_set_min_size(struct wl_client *c, struct wl_resource *r,
                                        int32_t w, int32_t h) {
-    (void)c; (void)r; (void)w; (void)h;
+    (void)c;struct brook_surface *s=wl_resource_get_user_data(r);
+    if(w<0||h<0){wl_resource_post_error(r,XDG_TOPLEVEL_ERROR_INVALID_SIZE,"Negative minimum size");return;}
+    if(s){s->pending_size_hints.min_w=w;s->pending_size_hints.min_h=h;s->size_hints_pending|=1;}
 }
 static void xdg_toplevel_set_maximized(struct wl_client *c, struct wl_resource *r) {
     (void)c;
