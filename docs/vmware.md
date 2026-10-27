@@ -54,11 +54,17 @@ On NixOS, enable Workstation using:
 
 ```nix
 virtualisation.vmware.host.enable = true;
+# Let other hypervisors use VT-x while no KVM VMs are running.
+boot.kernelParams = [ "kvm.enable_virt_at_load=0" ];
 ```
 
 Build the host configuration first. VMware's `vmmon` and `vmnet` modules must
 match the running host kernel; a prepared generation with a different kernel
 requires a reboot. Workstation is not installed inside Brook.
+Stop running KVM guests before starting VMware. The kernel option prevents KVM
+from retaining virtualization hardware while idle; it does not permit both
+hypervisors to own that hardware concurrently. See the
+[Linux kernel parameter documentation](https://docs.kernel.org/6.12/admin-guide/kernel-parameters.html).
 
 The next gates are an actual VMware boot, usable keyboard/mouse, a measured
 clock sanity check and a clean stop/reboot. Brook currently has no AHCI/NVMe,
