@@ -202,6 +202,7 @@ bool MappingTransaction::RemoveMappingWithRetirer(uint64_t begin,uint64_t end,Vm
 }
 bool MappingTransaction::ReplaceMapping(uint64_t begin, uint64_t end, const MappingRange* replacement) {
     if (!locked_ || faultScoped_) KernelPanic("mapping: range replacement without lock or in fault scope");
+    if(!MappingRangeRemovalAllowed(space_->ranges,begin,end))return false;
     if (!ranges_.CanReplace(space_->ranges,begin,end,replacement)) return false;
     uint64_t detached = 0;
     if (!VmmDetachRange(space_->pageTable,begin,end,retiredCapacity_-retiredCount_,
@@ -212,6 +213,7 @@ bool MappingTransaction::ReplaceMapping(uint64_t begin, uint64_t end, const Mapp
 }
 bool MappingTransaction::CanReplaceRange(uint64_t begin, uint64_t end, const MappingRange* replacement) const {
     if (!locked_) KernelPanic("mapping: range preflight without lock");
+    if(!MappingRangeRemovalAllowed(space_->ranges,begin,end))return false;
     return ranges_.CanReplace(space_->ranges,begin,end,replacement);
 }
 void MappingTransaction::CaptureDetachedLeaf(VirtualAddress address, uint64_t leaf, void* context) {

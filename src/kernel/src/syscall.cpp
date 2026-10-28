@@ -50,6 +50,7 @@
 #include "memory/file_object.h"
 #include "memory/user_mapping.h"
 #include "memory/mapping_fault.h"
+#include "memory/pageable_memory.h"
 #include "memory/mapping_fault_test.h"
 #include "register_test.h"
 #include "memory/physical_memory.h"
@@ -713,6 +714,15 @@ struct KernelOperationGuard {
     ~KernelOperationGuard() { if (proc) SchedulerKernelRegionLeave(proc); }
 };
 
+// Experimental explicit single-task paging; unavailable without a recognized
+// boot-selected disposable backing device. No user pointer arguments.
+static int64_t sys_brook_pageable_memory(uint64_t operation,uint64_t value,
+                                         uint64_t a,uint64_t b,uint64_t c,uint64_t d) {
+    auto* actor=ProcessCurrent();KernelOperationGuard guard(actor);
+    if(a||b||c||d)return -EINVAL;
+    return PageableMemoryControl(actor,operation,value);
+}
+
 // Publish a complete independent descriptor while retaining object ownership
 // under fdLock, so a sibling close cannot race partially initialized flags.
 static int MemFdInstall(Process* proc, MemFdData* mfd, uint32_t flags)
@@ -1115,6 +1125,10 @@ static MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpac
                 (!(access&2) || (leaf&VMM_WRITABLE) || cow))?MappingFaultResult::Resolved:MappingFaultResult::Unhandled;
         }
         const auto kind=snapshot.range.kind;
+        if(kind==MappingKind::Pageable) {
+            operation.Unlock();
+            return PageableMemoryFault(actor,space,page,access);
+        }
         if (kind!=MappingKind::File && kind!=MappingKind::MemFd && kind!=MappingKind::Anonymous &&
             kind!=MappingKind::Stack && kind!=MappingKind::Heap && kind!=MappingKind::Image) return MappingFaultResult::Unhandled;
         const uint64_t batch=kind==MappingKind::File?FILE_OBJECT_PAGE_BATCH:1;
@@ -1201,6 +1215,10 @@ static MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpac
 }
 MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error) {
     auto* actor=ProcessCurrent();
+    // Experimental paging never performs disk I/O from an arbitrary kernel
+    // #PF. Safe usercopy retries explicitly supply the user-access error bit.
+    if(actor && actor->addressSpace && actor->addressSpace->pagingAdmission.Exclusive() && !(error&4))
+        return MappingFaultResult::Unhandled;
     return ResolveMappingFaultForSpace(actor,actor?actor->addressSpace:nullptr,address,error);
 }
 extern "C" bool FileMapHandleUserFault(uint64_t address,uint64_t error) {
@@ -15213,6 +15231,7 @@ void SyscallTableInit()
     g_syscallTable[0xB02]                = sys_brook_wm_theme;
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     g_syscallTable[0xB04]                = sys_brook_wm_scale;
+    g_syscallTable[0xB40]                = sys_brook_pageable_memory;
     g_syscallTable[BROOK_SYS_WM_APPEARANCE] = sys_brook_wm_appearance;
     g_syscallTable[BROOK_SYS_WM_TASKBAR_METRICS] = sys_brook_wm_taskbar_metrics;
 #ifdef BROOK_MAPPING_TEST_HOOKS
@@ -15538,6 +15557,11 @@ int64_t SyscallDispatchInternal(uint64_t num, uint64_t a0, uint64_t a1,
 {
     Process* proc = ProcessCurrent();
     SyscallTimingCall timing(proc?proc->pid:0,proc?proc->incarnation:0,num,a0);
+    if(proc && proc->addressSpace && proc->addressSpace->pagingAdmission.Exclusive()) {
+        KernelOperationGuard guard(proc);
+        const int error=PageableMemoryPrepareSyscall(proc,num);
+        if(error)return timing.Result(error);
+    }
 
     if (proc && proc->straceEnabled)
     {

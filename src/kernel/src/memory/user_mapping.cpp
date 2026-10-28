@@ -75,12 +75,14 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
     for (;;) {
         MappingTransaction operation(actor,source);
         if(!operation.Lock())return false;
+        if(source->pagingAdmission.Exclusive())return false;
         uint64_t count=0, generation=source->generation;
         for (auto* node=source->ranges.head; node; node=node->next) ++count;
         operation.Unlock();
         MappingRangePlan plan;
         if (!plan.Prepare(count)) return false;
         if(!operation.Lock())return false;
+        if(source->pagingAdmission.Exclusive())return false;
         if (source->generation!=generation) { operation.Unlock(); continue; }
         for (auto* node=source->ranges.head; node; node=node->next)
             if (!plan.Insert(destination->ranges,node->range))
@@ -365,6 +367,8 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
         const uint64_t address = PickMappingAddress(space,request);
         if (!address) return failure.Fail("address-gap",-12);
         const uint64_t end = address+request.length;
+        if(request.fixed && !request.noReplace && !MappingRangeRemovalAllowed(space->ranges,address,end))
+            return failure.Fail("pageable-partial-replacement",-95);
         if (request.noReplace &&
             MappingRangeFindGap(space->ranges,address,request.length,address,end) != address)
             return failure.Fail("exact-address-occupied",-17); // EEXIST, without retiring anything
@@ -413,6 +417,7 @@ int64_t UserMappingRemove(Process* actor, AddressSpaceState* space, uint64_t add
     for (;;) {
         MappingTransaction operation(actor,space);
         PmmThrottleForDrain(); if(!operation.Lock())return -12;
+        if(!MappingRangeRemovalAllowed(space->ranges,address,end))return -95;
         uint64_t count = 0;
         if (!operation.RangeLeafCount(address,end,count)) return -22;
         uint64_t generation = space->generation;
@@ -436,6 +441,7 @@ int64_t UserMappingProtect(Process* actor, AddressSpaceState* space, uint64_t ad
     for (uint64_t at=address;at<end;) {
         const auto* range = MappingRangeFind(space->ranges,at);
         if (!range) return -12;
+        if(range->kind==MappingKind::Pageable)return -95;
         if (protection & ~range->maximumProtection) return -13;
         if (protection && range->backing && range->backing->file && range->backing->file->mappingError)
             return range->backing->file->mappingError;
@@ -628,6 +634,7 @@ int64_t UserMappingResize(Process* actor,AddressSpaceState* space,uint64_t sourc
         MappingTransaction operation(actor,space);PmmThrottleForDrain();if(!operation.Lock())return -12;
         MappingFaultSnapshot snapshot{};
         if (!operation.CaptureMapping(source,snapshot) || snapshot.range.begin!=source || snapshot.range.end!=oldEnd) return -14;
+        if(snapshot.range.kind==MappingKind::Pageable)return -95;
         if (snapshot.range.kind==MappingKind::Device && newLength>oldLength) return -22;
         if (newLength==oldLength && !(flags&fixed)) return static_cast<int64_t>(source);
         bool shrink=newLength<oldLength && !(flags&fixed),inPlace=false;

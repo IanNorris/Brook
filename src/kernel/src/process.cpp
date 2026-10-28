@@ -1433,6 +1433,13 @@ Process* ProcessCreateThread(Process* parent, uint64_t userRip,
     thread->kernelStackTop  = kstackAddr.raw() + KERNEL_STACK_SIZE;
 
     // CLONE_VM: share the same page table — no page copy
+    // Interlock thread creation with experimental single-task paging before
+    // assigning its owning AS reference. A failed clone may conservatively
+    // leave the parent's ever-shared bit set; ordinary tasks are unaffected.
+    if(!parent->addressSpace->pagingAdmission.Share()) {
+        VmmFreeKernelStack(kstackAddr,KERNEL_STACK_PAGES);
+        SchedulerFreePid(thread->pid);FreeProcessStruct(thread);return nullptr;
+    }
     thread->addressSpace = parent->addressSpace;
     AddressSpaceRef(thread->addressSpace);
 

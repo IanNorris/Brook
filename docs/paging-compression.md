@@ -103,16 +103,23 @@ LZAV candidate was pinned to revision
 `28b9cca2fc91c230575dd65e9ab7c7ed4ed3aad7c2aea543093e897c31d81b04`.
 This source is an ignored benchmark reference, not a new kernel dependency.
 
-One ordered host screening run over the first 8 MiB of the built ELF, in
-independent 4 KiB blocks, found LZ4 ratio 1.99, encode 855 MB/s and decode
-3901 MB/s (~1.05 microseconds/block). LZAV was ratio 1.99 and decode 3241 MB/s;
-Zstd fast3 ratio 2.01/decode 1601 MB/s; Zstd level1 ratio 2.55/decode 867 MB/s.
-LZ4HC-9 achieved ratio 2.14/decode 4380 MB/s but encoded at only 124 MB/s,
-so it is a plausible offline file-image option, not the first paging compressor.
-The memcpy control was 53885 MB/s: none of these compressed-data decoders is
-literally memcpy-speed on this input. Source/text, zero/sparse and random controls,
-and 64/256 KiB blocks are included in the local CSV. These are synthetic/file
-corpora, not captured anonymous browser pages.
+One ordered host screening run over a frozen copy of the built ELF, in
+independent 4 KiB blocks, found LZ4 ratio 1.9896, encode
+767.1 MB/s and decode 3618.6 MB/s
+(~1.132 microseconds/block). LZAV was ratio
+1.9937 and decode 2794.2 MB/s;
+Zstd fast3 ratio 2.0155/decode 1393.4 MB/s;
+Zstd level1 ratio 2.5568/decode 777.4 MB/s.
+LZ4HC-9 achieved ratio 2.1410/decode 3969.6 MB/s,
+so it is a plausible offline file-image option rather than the first paging
+compressor. The memcpy control was 44617.6 MB/s: none of
+these compressed-data decoders is literally memcpy-speed on this input. An
+initial screening had somewhat higher absolute rates with the same ranking;
+these single ordered samples are not statistically controlled performance gates.
+Source/text, zero/sparse and random controls, and 64/256 KiB blocks are included
+in the local CSV. These are synthetic/file corpora, not captured anonymous
+browser pages. Frozen input SHA-256s and exact library paths are recorded in
+`build/paging-compression-20261028/codec-metadata.json` and `codec-command.txt`.
 
 Reproduce with `scripts/workloads/benchmark_page_codecs.cpp`, compiled at -O3
 against the exact external LZAV header and loaded LZ4/Zstd library paths. Each
@@ -123,3 +130,72 @@ reports arithmetic mean per-block cost derived from throughput, not p95 fault
 latency. It uses host dynamic-library SIMD optimizations and cache-hot buffers;
 these rates must not be copied into a guest/kernel capacity estimate. No codec
 format is committed for filesystem storage by this screening result.
+
+
+## Explicit pageout/refault checkpoint
+
+`opt/page-store-device=<device>` separately enables the experimental backing
+for this boot. Without this recognized boot-selected image, syscall `0xB40`
+returns EOPNOTSUPP and does not admit any mappings. With it, initial-namespace
+CAP_SYS_ADMIN is required. Operations are scalar: 0 maps a new RW/NX private
+region (aligned length, at most 16 MiB), 1 explicitly pages out one address,
+2 returns global stored slots, 3 samples free physical frames, and 4 selects a
+one-shot test failure (0 clear, 1 write error, 2 read error, 3 bad read checksum,
+4 short write, 5 short read, 6 write error plus rejected rollback publication).
+Failure controls are experimental diagnostics, not a proposed production ABI.
+
+A sticky AS admission interlock excludes CLONE_VM while the experiment is active
+and rejects admission for an AS that has ever shared task execution. Fork is
+checked under its source mapping gate. These restrictions last until exec,
+even after all pageable regions are unmapped or an opted-in allocation fails.
+The dedicated mapping kind cannot be mprotected or remapped; unmap/MAP_FIXED
+must cover its entire range, preventing unreachable slots from remaining with
+surviving fragments. Other mapping kinds retain their existing behavior.
+
+Pageout reserves its slot before PTE mutation, takes an extra frame reference,
+detaches under AS serialization, and waits for full TLB ACK before disk writes.
+The backing retains the slot through I/O and revalidation. A failed write restores
+the resident PTE; if publication also fails, the backing owns a recovery frame
+that a later fault can republish. Successful pageout drops the retained frame,
+allowing the independent PMM quarantine/barrier worker to return it to allocation.
+Fault-in prepares its frame and reads outside AS/PT locks, checks the immutable
+slot checksum, and revalidates the captured mapping before publication. Bad
+reads never turn into demand-zero data. Entire-region and AS teardown release
+slot and recovery references after normal mapping retirement.
+
+This is still **not automatic reclaim or arbitrary-app paging**. Existing raw
+kernel user-pointer consumers lack scoped eviction pins. For the opted-in AS,
+an ordinary syscall therefore restores every pageable leaf before entering
+handler locks. Scalar paging, numeric signal/exit and restricted mapping calls
+are exemptions. Kernel-origin page faults in an opted-in AS never initiate
+paging I/O; safe usercopy retries explicitly enter the user-fault resolver.
+The conservative barrier loses paging benefits across ordinary syscalls and
+can affect unrelated lazy-file raw accesses in this diagnostic AS. It must be
+replaced with real access exclusion/conversion before production pressure-driven
+reclaim or threaded apps. VirtIO I/O also still uses its existing polling backend.
+No reserved fault-in frame or background paging worker is claimed yet.
+
+The static musl fixture `scripts/workloads/pageable_memory.c` verifies 128 unique
+page patterns through real user #PF refaults, six I/O/recovery failures, raw
+syscall output, evicted signal-altstack construction/return, rejection of fork
+and new threads, whole-region teardown, normal process exit with stored pages,
+previously-shared-AS rejection and non-admin denial. A native eight-vCPU run
+reports free frames 2012643 → 2012777 after 128 pageouts and a userspace wait for
+quarantine drain (net +134 includes background activity, not exactly 128 isolated
+frames). The stored count is 128 before refault and zero after the suite.
+Entry/scheduler compiled audits and targeted host store/admission/range/usercopy
+tests pass. Native logs are under `build/paging-compression-20261028/native/`.
+
+
+Additional native controls pass: all 1024 backing slots fill; the next pageout
+returns ENOSPC without disturbing its resident bytes; refault releases one slot
+and permits another pageout; whole-region unmap returns the store to zero. The
+same exact kernel booted without the option returns EOPNOTSUPP for the private
+ABI and still creates/joins a normal pthread. Both configurations shut down with
+checked guest sync and original QEMU owner exit 0. The test image and server are
+private artifacts; no backing disk or codec corpus is part of Git.
+
+Next priority is scoped kernel-user access exclusion (and fault-in reserves),
+not enabling this eager syscall-entry fallback for existing applications. Then
+add real pressure-driven victim selection with bounded worker I/O, quantify
+mixed-workload throughput/latency, and only then add compressed-RAM storage.

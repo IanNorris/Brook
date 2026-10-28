@@ -12,6 +12,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "memory/heap.h"
 #include "memory/file_object.h"
 #include "memory/page_store_probe.h"
+#include "memory/pageable_memory.h"
 #include "acpi.h"
 #include "apic.h"
 #include "input.h"
@@ -707,6 +708,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::ModuleDiscoverAndLoad("/boot/drivers");
     brook::SerialPuts("module: Phase 2 — done\n");
     brook::PageStoreBootProbe();
+    brook::PageableMemoryBootInit();
 
     // ---- Re-probe deferred devices (e.g. ext4 now registered) ----
     if (g_deferredCount > 0) {

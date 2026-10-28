@@ -233,6 +233,7 @@ add_executable(kernel
     src/memory/address_space.cpp
     src/memory/page_store.cpp
     src/memory/page_store_probe.cpp
+    src/memory/pageable_memory.cpp
     src/memory/mapping_transaction.cpp
     src/memory/file_page_cache.cpp
     src/memory/exec_page_cache.cpp

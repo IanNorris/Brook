@@ -75,7 +75,7 @@ bool MappingRangeValid(const MappingRange& range) {
            !(range.maximumProtection & ~7u) && !(range.protection & ~range.maximumProtection) &&
            (range.leafOwnership != MappingLeafOwnership::Borrowed || range.backing) &&
            ((range.kind != MappingKind::File && range.kind != MappingKind::MemFd &&
-             range.kind != MappingKind::Device) || range.backing);
+             range.kind != MappingKind::Device && range.kind != MappingKind::Pageable) || range.backing);
 }
 MappingBacking* MappingBackingCreate(void* object, void (*release)(void*)) {
     if (!object || !release) return nullptr;

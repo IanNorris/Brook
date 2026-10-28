@@ -19,7 +19,7 @@ MappingBacking* MappingBackingCreate(void* object, void (*release)(void*));
 void MappingBackingRef(MappingBacking* backing);
 void MappingBackingUnref(MappingBacking* backing);
 
-enum class MappingKind : uint8_t { Anonymous, File, MemFd, Device, Image, Stack, Heap };
+enum class MappingKind : uint8_t { Anonymous, File, MemFd, Device, Image, Stack, Heap, Pageable };
 enum class MappingSharing : uint8_t { Private, Shared };
 enum class MappingLeafOwnership : uint8_t { Managed, Borrowed };
 struct MappingRange {
@@ -52,6 +52,16 @@ struct MappingRangeTable {
     mutable const MappingRange* lookup[LookupSlots] = {};
     MappingRangeNode* root = nullptr;
 };
+// The first explicit pager owns a whole private region. Until per-page slot
+// retirement is implemented, forbid splitting it by unmap/MAP_FIXED.
+inline bool MappingRangeRemovalAllowed(const MappingRangeTable& table,uint64_t begin,uint64_t end) {
+    for(auto* node=table.head;node;node=node->next) {
+        const auto& r=node->range;
+        if(r.kind==MappingKind::Pageable && r.begin<end && begin<r.end &&
+           (begin>r.begin || end<r.end))return false;
+    }
+    return true;
+}
 
 // All table access is protected by AS.mutation, except unpublished AS creation
 // and last-reference teardown. Plans allocate before locking and release their
