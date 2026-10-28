@@ -414,3 +414,31 @@ working-set-*.json and working-set-{host,entry-audit,start-audit} files. The VM
 completed checked sync and original owner exit 0. Next acceptance needs actual
 system-pressure/response measurements; compressed RAM can then address the cold
 page latency demonstrated here. General application paging remains disabled.
+
+## Actual constrained-memory comparison
+
+scripts/workloads/pageable_pressure.c compares a 256 MiB dataset on fresh private
+512 MiB, eight-vCPU KVM overlays of the identical accepted seed and exact kernel.
+Both attach 256 MiB raw swap (65536 slots) and hold 128 MiB of ordinary anonymous
+RAM. The pressure is bounded to this guest; there is no host stress process.
+Both begin with 58626 free frames and have 25799 after the ordinary allocation.
+
+Eager mode maps 96 MiB of the dataset, then returns ENOMEM. The serial log confirms
+an actual PMM failure with free_pages=0, not injected failure or a synthetic
+resident cap. Its partial mapping cleanup completes and the VM syncs/shuts down
+with original QEMU owner exit 0. A fresh-overlay paged run completes the entire
+256 MiB dataset, validates every byte after writing and again after faulting from
+disk, preserves the ordinary allocation bytes, and ends with zero stored slots.
+It holds 4096 data frames (16 MiB), stores 61440 pages (240 MiB), and samples a
+minimum 21319 physical free frames (~83.3 MiB, ~83.7% of guest RAM in use). Reserve
+occupancy is seven, separate from data-frame accounting. Filling took 3.552 s and
+full verification 4.092 s; sampled 4 KiB verification p50/p95/max were
+80.9 us /124.0 us /40.85 ms. These include verification and clock overhead.
+
+This proves a larger useful working set and successful cleanup under a real RAM
+limit in the restricted dedicated allocator. It is not ordinary browser paging,
+a desktop responsiveness result, or a statistically controlled disk-speed claim.
+Raw backing was host cached. Inputs, hashes, launch parameters and native result
+JSON are retained in build/paging-compression-20261028/pressure-512/. Both variants
+used the same frozen seed via fresh qcow2 overlays; the control overlay remains
+preserved as eager.qcow2. The original user disks were never used.
