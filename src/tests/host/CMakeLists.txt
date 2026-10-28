@@ -55,6 +55,12 @@ enable_testing()
 add_host_test(test_page_store "${BROOK_ROOT}/src/kernel/src/memory/page_store.cpp")
 add_host_test(test_paging_admission)
 add_host_test(test_user_access_ranges)
+add_host_test(test_fault_frame_reserve)
+add_host_test(test_mapping_record_reserve "${BROOK_ROOT}/src/kernel/src/memory/mapping_transaction.cpp")
+target_compile_options(test_mapping_record_reserve PRIVATE -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    -Wno-unused-parameter -Wno-attributes -Wno-misleading-indentation
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_mapping_record_reserve PRIVATE -Wl,--gc-sections)
 add_host_test(test_unix_stream_vector)
 add_host_test(test_netlink_route)
 add_host_test(test_netlink_endpoint)

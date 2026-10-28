@@ -24,6 +24,11 @@ static void describe(PhysicalAddress page,unsigned expectedRefs,unsigned expecte
     CHECK(PmmGetRefCount(page)==expectedRefs);
     CHECK(PmmGetMapCount(page)==expectedMaps);
 }
+static unsigned owned(uint16_t pid) {
+    unsigned count=0;
+    PmmEnumeratePid(pid,[](PhysicalAddress,MemTag,void* p){++*static_cast<unsigned*>(p);return true;},&count);
+    return count;
+}
 int main() {
     PageDescriptor descriptors[256]{}; PmmHostTestInit(descriptors,256);
     auto page=PmmAllocPage(MemTag::User,7); CHECK(page); describe(page,1,0,1);
@@ -47,5 +52,22 @@ int main() {
     for(auto& worker:workers) worker.join();
     describe(page,1,0,1);
     PmmUnrefPage(page); describe(page,0,0,0); CHECK(!PmmRefPageIfAlive(page));
+    page=PmmAllocPage(MemTag::User,7);CHECK(page);
+    CHECK(!PmmReclassifyPrivateFrame(PhysicalAddress(page.raw()+1),MemTag::User,MemTag::KernelData,KernelPid));
+    CHECK(!PmmReclassifyPrivateFrame(page,MemTag::KernelData,MemTag::User,8));
+    CHECK(!PmmReclassifyPrivateFrame(page,MemTag::User,MemTag::PageTable,8));
+    CHECK(!PmmReclassifyPrivateFrame(page,MemTag::User,MemTag::KernelData,PMM_MAX_PIDS));
+    PmmRefPage(page);CHECK(!PmmReclassifyPrivateFrame(page,MemTag::User,MemTag::KernelData,KernelPid));PmmUnrefPage(page);
+    PmmMapInc(page);CHECK(!PmmReclassifyPrivateFrame(page,MemTag::User,MemTag::KernelData,KernelPid));PmmMapDec(page);
+    CHECK(PmmGetTag(page)==MemTag::User && PmmGetPid(page)==7);
+    auto kernelBefore=owned(KernelPid),userBefore=owned(8);
+    CHECK(PmmReclassifyPrivateFrame(page,MemTag::User,MemTag::KernelData,KernelPid));
+    CHECK(owned(KernelPid)==kernelBefore+1);
+    CHECK(PmmGetTag(page)==MemTag::KernelData && PmmGetPid(page)==KernelPid);describe(page,1,0,1);
+    CHECK(PmmReclassifyPrivateFrame(page,MemTag::KernelData,MemTag::User,8));
+    CHECK(owned(KernelPid)==kernelBefore && owned(8)==userBefore+1);
+    CHECK(PmmGetTag(page)==MemTag::User && PmmGetPid(page)==8);describe(page,1,0,1);
+    PmmUnrefPage(page);CHECK(!PmmReclassifyPrivateFrame(page,MemTag::User,MemTag::KernelData,KernelPid));
+    CHECK(owned(8)==userBefore);
     std::puts("PMM_REFS PASS aliases=70000 concurrent-pins=16384 final-release");
 }

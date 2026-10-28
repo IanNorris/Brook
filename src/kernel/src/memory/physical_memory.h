@@ -98,6 +98,10 @@ bool     PmmRefPageIfAlive(PhysicalAddress physAddr);
 uint32_t PmmGetRefCount(PhysicalAddress physAddr);
 // Atomic user-leaf mapcount snapshot; zero also means untracked/non-RAM.
 uint32_t PmmGetMapCount(PhysicalAddress physAddr);
+// Caller owns the sole reference to a detached frame. Atomically transfer
+// User/KernelData accounting only when live, ref==1 and map==0. This is NOT an
+// eviction exclusion primitive and never grants ownership from a raw address.
+bool PmmReclassifyPrivateFrame(PhysicalAddress frame,MemTag expected,MemTag replacement,uint16_t pid);
 
 // BRO-176 stale-mapping detector: track the number of present USER PTEs that
 // map a physical frame. Call PmmMapInc when installing a present USER PTE and

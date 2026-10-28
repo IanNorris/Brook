@@ -1,5 +1,6 @@
 #include "pageable_memory.h"
 #include "page_store.h"
+#include "fault_frame_reserve.h"
 #include "user_mapping.h"
 #include "physical_memory.h"
 #include "device.h"
@@ -12,12 +13,57 @@
 #include "serial.h"
 #include "string.h"
 #include "sync/kmutex.h"
+#include "scheduler.h"
+#include "panic.h"
 
 namespace brook {
 namespace {
 PageStore store;
 KMutex storeLock;
 bool ready=false;
+FaultFrameReserve faultReserve;
+IrqSpinLock reserveLock;
+unsigned failOrdinaryAllocations=0;
+unsigned ReserveSize() {
+    auto flags=IrqSpinLockAcquire(&reserveLock);auto size=faultReserve.Size();
+    IrqSpinLockRelease(&reserveLock,flags);return size;
+}
+// Consumes the sole detached User reference, whether pooled or freed. Never
+// called until a pageout's TLB acknowledgement and successful storage, or a
+// failed fault-in transaction has dropped its staged reference.
+void ReturnReserveFrame(PhysicalAddress frame) {
+    if(ReserveSize()==FaultFrameReserve::Capacity){PmmUnrefPage(frame);return;}
+    if(!PmmReclassifyPrivateFrame(frame,MemTag::User,MemTag::KernelData,KernelPid))
+        KernelPanic("paging: invalid reserve return ownership");
+    auto flags=IrqSpinLockAcquire(&reserveLock);bool retained=faultReserve.Push(frame);
+    IrqSpinLockRelease(&reserveLock,flags);
+    if(!retained)PmmUnrefPage(frame); // another pageout may have filled the pool
+}
+struct FaultLifetime {
+    Process* actor;AddressSpaceState* space;
+    FaultLifetime(Process* p,AddressSpaceState* s):actor(p),space(s){SchedulerKernelRegionEnter(actor);AddressSpaceRef(space);}
+    ~FaultLifetime(){AddressSpaceUnref(space);SchedulerKernelRegionLeave(actor);}
+};
+// Declared before the transaction: failed fresh-page cleanup runs first.
+// Checkout retains one ref; StagePage owns an additional ref independently.
+struct ReserveCheckout {
+    PhysicalAddress physical;bool published=false;
+    bool Take(uint16_t pid) {
+        auto flags=IrqSpinLockAcquire(&reserveLock);physical=faultReserve.Pop();
+        IrqSpinLockRelease(&reserveLock,flags);
+        if(!physical)return false;
+        if(!PmmReclassifyPrivateFrame(physical,MemTag::KernelData,MemTag::User,pid))
+            KernelPanic("paging: invalid reserve checkout ownership");
+        return true;
+    }
+    ~ReserveCheckout(){if(physical){if(published)PmmUnrefPage(physical);else ReturnReserveFrame(physical);}}
+};
+PhysicalAddress AllocateFaultFrame(uint16_t pid) {
+    auto flags=IrqSpinLockAcquire(&reserveLock);const bool fail=failOrdinaryAllocations!=0;
+    if(fail)--failOrdinaryAllocations;
+    IrqSpinLockRelease(&reserveLock,flags);
+    return fail?PhysicalAddress{}:PmmAllocPage(MemTag::User,pid);
+}
 // Root-only one-shot failure controls for the explicitly boot-enabled test.
 unsigned injectedFailure=0;
 enum class State : uint8_t { Resident, Evicting, OnDisk, Recovery };
@@ -123,7 +169,8 @@ int64_t PageOut(Process* actor,uint64_t page) {
     auto& entry=static_cast<Region*>(backing.value->object)->entries[index];
     if(!result) {
         entry.state=State::OnDisk;
-        KMutexUnlock(&space->mutation);return 4096;
+        KMutexUnlock(&space->mutation);
+        ReturnReserveFrame(frame.physical);frame.physical={};return 4096;
     }
     slot.token=entry.slot;entry.slot=0;
     if(!rejectRollback && VmmTryMapPage(space->pageTable,VirtualAddress(page),frame.physical,Flags(*range),
@@ -153,7 +200,15 @@ void PageableMemoryBootInit() {
     if(!PageStoreHeaderValid(h,block*count) || h.slots>65536)return;
     auto* records=static_cast<PageStoreSlot*>(kmalloc(h.slots*sizeof(PageStoreSlot)));
     if(!records)return;
-    if(!store.Initialize(h,block*count,records,h.slots,{dev,Read,Write})){kfree(records);return;}
+    PhysicalAddress initial[FaultFrameReserve::Capacity]{};unsigned allocated=0;
+    for(;allocated<FaultFrameReserve::Capacity;++allocated) {
+        initial[allocated]=PmmAllocPage(MemTag::KernelData,KernelPid);
+        if(!initial[allocated])break;
+    }
+    if(allocated!=FaultFrameReserve::Capacity || !store.Initialize(h,block*count,records,h.slots,{dev,Read,Write})) {
+        for(unsigned i=0;i<allocated;++i)PmmUnrefPage(initial[i]);kfree(records);return;
+    }
+    for(auto frame:initial)if(!faultReserve.Push(frame))KernelPanic("paging: reserve initialization");
     KMutexInit(&storeLock);ready=true;
     SerialPrintf("paging experiment: backing=%s slots=%lu single-task explicit only\n",name,h.slots);
 }
@@ -164,14 +219,18 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
     if(operation==1)return PageOut(actor,value);
     if(operation==2){StoreGuard guard;return store.Stats().stored;}
     if(operation==3)return PmmGetFreePageCount();
-    if(operation==4 && value<=6){StoreGuard guard;injectedFailure=value;return 0;}
+    if(operation==4 && value<=7){StoreGuard guard;injectedFailure=value;return 0;}
     if(operation==5){UserAccessScope lease(actor);if(!UserBufferReadable(value,4096))return -14;return PageOut(actor,value);}
     if(operation==6){KMutexLock(&actor->addressSpace->mutation);auto count=actor->addressSpace->userAccess.Count();KMutexUnlock(&actor->addressSpace->mutation);return count;}
+    if(operation==7)return ReserveSize();
+    if(operation==8 && value<=32){auto flags=IrqSpinLockAcquire(&reserveLock);failOrdinaryAllocations=value;IrqSpinLockRelease(&reserveLock,flags);return 0;}
     return -22;
 }
 MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,uint64_t page,uint32_t access) {
-    if(!ready || !actor || !space->pagingAdmission.Exclusive())return MappingFaultResult::Unhandled;
+    if(!ready || !actor || !space || !space->pagingAdmission.Exclusive())return MappingFaultResult::Unhandled;
+    FaultLifetime lifetime(actor,space);
     Backing backing;Frame recovery;uint64_t index=0,token=0;
+    ReserveCheckout reserve;
     MappingTransaction op(actor,space);
     if(!op.LockFaultRange(page))return MappingFaultResult::OutOfMemory;
     MappingFaultSnapshot snapshot{};
@@ -187,16 +246,22 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     else if(entry.state!=State::OnDisk)return MappingFaultResult::Unhandled;
     op.Unlock();
     if(!op.Prepare(0,1))return MappingFaultResult::OutOfMemory;
-    auto physical=recovery.physical?recovery.physical:PmmAllocPage(MemTag::User,space->allocationPid);
+    auto physical=recovery.physical?recovery.physical:AllocateFaultFrame(space->allocationPid);
+    if(!physical && reserve.Take(space->allocationPid)){physical=reserve.physical;PmmRefPage(physical);}
     if(!physical)return MappingFaultResult::OutOfMemory;
-    op.StagePage(0,physical,true);recovery.physical={};
+    if(!op.StagePage(0,physical,true)){PmmUnrefPage(physical);recovery.physical={};return MappingFaultResult::OutOfMemory;}
+    recovery.physical={};
     if(token) {
         int result;{StoreGuard guard;result=store.Load(token,reinterpret_cast<void*>(PhysToVirt(physical).raw()));}
         if(result)return MappingFaultResult::IoError;
     }
+    bool rejectPublication=false;
+    {StoreGuard guard;if(injectedFailure==7){rejectPublication=true;injectedFailure=0;}}
     if(!op.LockFaultRange(page))return MappingFaultResult::OutOfMemory;
     if(!op.ValidateRange(snapshot,page,access) || entry.slot!=token)return MappingFaultResult::Unhandled;
+    if(rejectPublication)return MappingFaultResult::Unhandled;
     if(op.PublishFault(snapshot,0,VirtualAddress(page),access,false)!=MappingFaultCommit::Mapped)return MappingFaultResult::Unhandled;
+    reserve.published=true;
     // Release backing-owned recovery/slot only after leaving the AS gate.
     recovery.physical=entry.recovery;entry.recovery={};entry.slot=0;entry.state=State::Resident;
     op.Unlock();ReleaseSlot(token);

@@ -174,7 +174,8 @@ The conservative barrier loses paging benefits across ordinary syscalls and
 can affect unrelated lazy-file raw accesses in this diagnostic AS. It must be
 replaced with real access exclusion/conversion before production pressure-driven
 reclaim or threaded apps. VirtIO I/O also still uses its existing polling backend.
-No reserved fault-in frame or background paging worker is claimed yet.
+The initial checkpoint had no fault-in reserve; the bounded reserve below now
+covers data-frame allocation failure. No background paging worker is claimed yet.
 
 The static musl fixture `scripts/workloads/pageable_memory.c` verifies 128 unique
 page patterns through real user #PF refaults, six I/O/recovery failures, raw
@@ -242,3 +243,60 @@ after scope unwind. Original integrity/failure/signal/exhaustion/exit tests also
 pass on the lease build. Artifacts are in `build/paging-compression-20261028/`,
 including `lease-build.log`, `lease-linux.log` and `native/leases-result.json`.
 No high-pressure throughput claim is made from this functional test.
+
+
+## Fault-in reserve and heap-independent one-page bookkeeping
+
+Single-page MappingTransaction retirement, fresh-page and backing records now
+have zero-initialized inline storage. Larger requests still allocate and retain
+the original partial-failure cleanup. A host test compiles the real transaction
+code with heap allocation denied and verifies that one-page preparation succeeds
+without an allocation, heap-owned partial requests unwind, and no inline address
+is passed to kfree.
+
+An explicitly enabled backing device also reserves eight ordinary PMM frames
+(32 KiB) at boot, owned as KernelData by KernelPid. If normal data-frame allocation
+fails, checkout transfers a sole frame to User accounting for the destination
+allocation PID. The checkout retains one reference and stages an additional one
+in the mapping transaction. Failed I/O, checksum or publication destroys the
+transaction first, then returns the unmapped sole reference to the reserve.
+Successful publication drops the checkout reference, retaining the PTE reference.
+An outer fault lifetime holds AS/cancellation protection through all that cleanup.
+
+Successful pageout may replenish the reserve only after detach/TLB acknowledgement
+and successful storage. It transfers the retained frame directly, rather than
+freeing and hoping to allocate again. Failed-write rollback/Recovery frames never
+replenish the pool. A full reserve releases excess frames normally. Reserve and
+PMM locks are separate and neither covers I/O. PmmReclassifyPrivateFrame requires
+aligned, live, sole-reference, unmapped User/KernelData frames and updates tag/PID
+lists under the PMM lock; it does not grant ownership from a raw physical address
+or constitute an eviction pin. Host tests reject shared/mapped/freed/wrong-tag/
+misaligned transfers and verify ownership-list changes.
+
+Existing detached leaves retain intermediate page tables. Together with inline
+transaction/gate storage and resident slot metadata, this removes heap/page-table
+allocation from the validated dedicated-region fault-in path. The current VirtIO
+read/write request path uses its boot-allocated request/DMA/cache storage. This
+is not a guarantee for arbitrary mappings, backends or every global OOM state.
+An empty reserve returns OutOfMemory; it never waits holding AS/store locks.
+Reserve refill retains RAM, so reserve occupancy is separate from PMM free pages.
+
+Private diagnostic operation 7 reports available reserve frames; operation 8
+forces at most 32 subsequent ordinary pageable data-frame allocation failures.
+Operation-4 mode 7 rejects fault-in publication after preparation. These remain
+boot-opted-in, admin-only test controls. scripts/workloads/pageable_reserve.c
+passes in Brook: successful fallback, failed/short/corrupt reads and publication
+restoring reserve occupancy, exhaustion returning ENOMEM without losing stored
+pages, progress after a resident victim supplies a frame, and eight reuse cycles
+ending with zero slots and all eight reserve frames. Host PMM/reference tests,
+transaction storage tests and the earlier paging/I/O native suite also pass.
+Native evidence: build/paging-compression-20261028/native/reserve-result.json.
+The tests inject data-frame allocation failure; they are not a system-wide memory
+pressure benchmark and do not yet demonstrate automatic victim selection.
+
+Next: bounded victim selection with correct exclusion for its caller context,
+then background I/O where useful and actual pressure/latency controls. In
+particular, reclaim must not evict earlier pages behind the eager preparation
+cursor of an unaudited syscall. That fallback needs whole-AS admission/exclusion
+or explicit no-reclaim behavior before any concurrent/background pager is enabled.
+Compressed RAM and indexed immutable-file compression remain later stages.

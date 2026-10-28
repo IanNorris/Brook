@@ -925,6 +925,20 @@ bool PmmRefPageIfAlive(PhysicalAddress physAddr)
     return true;
 }
 
+bool PmmReclassifyPrivateFrame(PhysicalAddress frame,MemTag expected,MemTag replacement,uint16_t pid) {
+    if(!g_pageDescs || !frame || (frame.raw()&(PAGE_SIZE-1)) || pid>=PMM_MAX_PIDS ||
+       (expected!=MemTag::User && expected!=MemTag::KernelData) ||
+       (replacement!=MemTag::User && replacement!=MemTag::KernelData))return false;
+    const uint64_t index=frame.raw()/PAGE_SIZE;if(index>=g_totalPages)return false;
+    const uint64_t flags=IrqSpinLockAcquire(&g_pmmLock);
+    auto& descriptor=Desc(static_cast<uint32_t>(index));
+    const bool valid=IsUsed(index) && descriptor.refCount==1 && descriptor.pid<PMM_MAX_PIDS &&
+        descriptor.tag==static_cast<uint8_t>(expected) &&
+        !__atomic_load_n(&descriptor.mapCount,__ATOMIC_ACQUIRE);
+    if(valid){ListRemove(index);ListAppend(index,pid,replacement);}
+    IrqSpinLockRelease(&g_pmmLock,flags);return valid;
+}
+
 void PmmUnrefPage(PhysicalAddress physAddr)
 {
     if (!g_pageDescs || !physAddr) return;

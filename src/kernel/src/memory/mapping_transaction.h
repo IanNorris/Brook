@@ -77,6 +77,11 @@ private:
     struct RetiredLeaf { uint64_t raw; bool managed; };
     struct FreshPage { PhysicalAddress physical; VirtualAddress publishedAt; uint64_t publicationEpoch; bool published, settled, managed; };
     struct Backing { void* pointer; void (*release)(void*); };
+    // Single-leaf fault/pageout bookkeeping must not depend on the heap that
+    // reclaim is trying to relieve. Larger transactions keep dynamic storage.
+    RetiredLeaf inlineRetired_[1]{};
+    FreshPage inlineFresh_[1]{};
+    Backing inlineBackings_[1]{};
     bool FaultScopeContains(uint64_t address) const;
     bool Borrowed(VirtualAddress address, uint64_t leaf) const;
     bool HoldBacking(void* backing, void (*release)(void*));

@@ -34,7 +34,9 @@ MappingTransaction::~MappingTransaction() {
     // destructors otherwise run after this body, too late to own finalizers.
     ranges_.Finish();
     MappingBackingUnref(snapshotBacking_);
-    kfree(retired_); kfree(fresh_); kfree(backings_);
+    if(retired_!=inlineRetired_)kfree(retired_);
+    if(fresh_!=inlineFresh_)kfree(fresh_);
+    if(backings_!=inlineBackings_)kfree(backings_);
     fileGates_.Finish();
     MappingBackingUnref(incoming_);MappingBackingUnref(onlyBacking_);
     AddressSpaceUnref(space_);
@@ -51,9 +53,9 @@ bool MappingTransaction::Prepare(uint64_t retiredCapacity, uint64_t freshCapacit
                                  uint64_t backingCapacity) {
     if (locked_ || prepared_) KernelPanic("mapping: prepare under lock or repeated prepare");
     prepared_ = true;
-    retired_ = static_cast<RetiredLeaf*>(AllocateRecords(retiredCapacity, sizeof(RetiredLeaf)));
-    fresh_ = static_cast<FreshPage*>(AllocateRecords(freshCapacity, sizeof(FreshPage)));
-    backings_ = static_cast<Backing*>(AllocateRecords(backingCapacity, sizeof(Backing)));
+    retired_ = retiredCapacity==1?inlineRetired_:static_cast<RetiredLeaf*>(AllocateRecords(retiredCapacity, sizeof(RetiredLeaf)));
+    fresh_ = freshCapacity==1?inlineFresh_:static_cast<FreshPage*>(AllocateRecords(freshCapacity, sizeof(FreshPage)));
+    backings_ = backingCapacity==1?inlineBackings_:static_cast<Backing*>(AllocateRecords(backingCapacity, sizeof(Backing)));
     // Capacity is assigned only for successfully allocated storage, including
     // partial failures: the destructor never indexes a null allocation.
     retiredCapacity_ = retired_ ? retiredCapacity : 0;
