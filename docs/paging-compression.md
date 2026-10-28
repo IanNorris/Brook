@@ -442,3 +442,89 @@ Raw backing was host cached. Inputs, hashes, launch parameters and native result
 JSON are retained in build/paging-compression-20261028/pressure-512/. Both variants
 used the same frozen seed via fresh qcow2 overlays; the control overlay remains
 preserved as eager.qcow2. The original user disks were never used.
+
+## Bounded compressed RAM tier
+
+The existing PageStore token/refcount table now distinguishes immutable RAM and
+raw-disk payloads. A recognized backing can opt in with
+`opt/page-store-ram-mib=1..16` (absent/zero disables). Brook already vendors LZ4
+1.10.0 for panic capture; paging reuses that freestanding, heap-disabled source
+and its scalar build. No new codec source or dependency was added. Official
+API contracts: https://github.com/lz4/lz4/blob/v1.10.0/lib/lz4.h
+
+At boot the tier allocates its arena, bitmap, external LZ4 state and separate
+4 KiB encoding/spill scratch buffers. Those remain resident. The bitmap arena
+allocates contiguous 64-byte units using finite first fit, skipping full words.
+It neither allocates search records nor waits for defragmentation. Offset and
+exact-length pairs are private trusted slot metadata, not public generation
+identities or independently validated allocation handles. Caller serialization
+and exact release lengths remain requirements. Compression is accepted only at
+3072 bytes or less (at least 25% savings after allocation rounding). An
+incompressible page, encoder failure or fragmented/full arena falls directly
+back to the existing raw disk write; it does not retry or spill another entry.
+The configured logical slot limit still applies to both tiers together.
+
+RAM publication occurs only after compression/allocation/copy succeed. Load
+requires exact 4096-byte safe decoding and the original uncompressed checksum.
+Failed decode/checksum leaves slot ownership intact and output unpublished.
+Retained tokens continue to own one immutable payload; last release frees its
+arena allocation exactly once. Explicit Spill preserves token, references and
+checksum: decode into resident scratch, write the slot's fixed raw location,
+then switch to disk and release RAM only on full success. Failed/short writes
+leave RAM authoritative. There is no automatic compressed-entry replacement or
+background spill policy yet, nor return of empty arena pages to PMM.
+
+Private control 14 selectors: 0 arena capacity, 1 rounded allocated bytes,
+2 payload bytes, 3 RAM slots, 4 disk slots, 5 compression fallbacks, 6 requested
+resident allocation bytes (arena+bitmap+workspace+scratch/context), 7 slot-record
+bytes, 8 successful spills, 9 failed spills, 10 decode errors, 11 checksum errors,
+12/13 successful disk writes/reads, 14/15 RAM stores/loads. Requested bytes exclude
+heap allocation headers/rounding/expansion overhead; the boot diagnostic's
+resident-byte value has that same limitation. Region metadata, page tables and
+fault reserve are additional. PageStore writes/reads count logical stores/loads;
+diskWrites additionally includes successful spills, so these are not interchangeable
+counters or a count of failed/partial physical I/O. Private control 15 spills a
+stored page addressed in the caller's dedicated mapping: pin backing, drop AS
+mutation, retain token, perform spill, release pin outside AS mutation. Dedicated
+mapping state is now named Stored because its payload tier is opaque to PTE code.
+
+Host tests cover 30000 allocation operations against an independent fragmentation
+oracle, deterministic sufficient-free-but-fragmented rejection, exact 3072/3073
+thresholds, real freestanding LZ4, incompressible/failed-encoder fallback,
+malformed/corrupt encoded bytes, failed/short spills, retained identity and
+1000 mixed reuse cycles. ASan+UBSan of real LZ4/store/pool tests passes. All eleven
+relevant host tests, both image-tool tests and compiled entry/scheduler audits
+pass. Native pageable_compressed.c verifies RAM/disk/refault integrity, failed
+and short spills, disk read/checksum/publication failure reserve cleanup, forced
+allocation-failure reclamation, and zero slots/arena allocations at teardown.
+Native raw core/reserve/lease/reclaim/long-scan regressions also pass with the
+tier disabled. Both native VMs complete checked sync and original owner exit 0.
+
+A first synthetic 16 MiB comparison uses the same kernel, fresh overlays of the
+same seed, 8 CPUs/8 GiB and 4096 logical slots. The compressed variant allows
+256 resident data pages (1 MiB) plus a fixed 4 MiB arena and 32856 bytes requested
+for bitmap/context/workspace/scratch: 5275736 bytes. The raw variant allows
+1280 data pages: 5242880 bytes (about 0.63% less). Common slot/region metadata,
+page tables and fault reserves are additional in both. The arena's full capacity,
+not merely its used payload, is charged to the compressed variant.
+
+Both write then verify all bytes. Compressed fill/scan: 42.6/87.0 ms, verification
+p50/p95/max: 18.7/23.3/85.0 us; all 3840 stored pages fit RAM, with zero disk I/O.
+Raw fill/scan: 120.9/246.5 ms, p50/p95/max: 34.4/113.1/7994.8 us; 2816 pages remain
+stored on disk, with 6783 successful disk writes and 3967 reads during timed
+phases. Thus this first ordered sample is about 2.8x faster at a similar requested
+resident budget; it is not a statistically controlled result or a browser claim.
+Per-page timings include 4096-byte verification and clock overhead. The data is
+intentionally compressible; native pressure/full-pool and broader corpora remain
+necessary. The separate default 4 MiB lease/clock regression also passes with
+compression enabled. Its fixed 4 MiB arena exceeds the saved data footprint, so
+that regression's timing must not be advertised as a total-memory improvement.
+
+Evidence and frozen hashes/parameters: build/paging-compression-20261028/
+compressed-native/{metadata,result,measure,raw-measure,lease-regression}.json,
+compressed-{all-host,asan,image-tools} logs and entry/start audit JSON. The
+pressure-control seed was preserved; compression used a separate private seed.
+Next: constrained-memory mixed-tier/full-pool measurements, then indexed
+immutable compressed storage and host inspection/extraction tools. General
+application paging and automatic reclaim of arbitrary shared/forked ASes remain
+unfinished and disabled; no completion of the overall goal is claimed here.

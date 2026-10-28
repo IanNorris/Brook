@@ -1,5 +1,7 @@
 #include "pageable_memory.h"
 #include "page_store.h"
+#include "compressed_page_pool.h"
+#include "lz4.h"
 #include "fault_frame_reserve.h"
 #include "user_mapping.h"
 #include "physical_memory.h"
@@ -64,9 +66,50 @@ PhysicalAddress AllocateFaultFrame(uint16_t pid) {
     IrqSpinLockRelease(&reserveLock,flags);
     return fail?PhysicalAddress{}:PmmAllocPage(MemTag::User,pid);
 }
+struct RamCompression {
+    CompressedPagePool pool;
+    alignas(8) LZ4_stream_t workspace;
+    uint8_t encoded[4096],spill[4096];
+    void* arena;
+    uint64_t* bitmap;
+    uint64_t residentBytes;
+};
+RamCompression* ramCompression=nullptr;
+int EncodePage(void* context,const void* in,void* out,int capacity) {
+    auto* ram=static_cast<RamCompression*>(context);
+    return LZ4_compress_fast_extState(&ram->workspace,static_cast<const char*>(in),static_cast<char*>(out),4096,capacity,1);
+}
+int DecodePage(void*,const void* in,int size,void* out,int capacity) {
+    return LZ4_decompress_safe(static_cast<const char*>(in),static_cast<char*>(out),size,capacity);
+}
+void AttachRamCompression() {
+    char value[8]{};auto length=FwCfgReadFile("opt/page-store-ram-mib",value,sizeof(value));
+    if(!length)return;
+    unsigned mib=0;
+    if(length>2){SerialPuts("paging: invalid compressed RAM capacity (raw backing retained)\n");return;}
+    for(unsigned i=0;i<length;++i) {
+        if(value[i]<'0' || value[i]>'9'){SerialPuts("paging: invalid compressed RAM capacity (raw backing retained)\n");return;}
+        mib=mib*10+unsigned(value[i]-'0');
+    }
+    if(!mib)return;
+    if(mib>16){SerialPuts("paging: compressed RAM capacity exceeds 16 MiB (raw backing retained)\n");return;}
+    auto* ram=static_cast<RamCompression*>(kmalloc(sizeof(RamCompression)));
+    if(!ram)return;
+    memset(ram,0,sizeof(*ram));
+    const uint32_t bytes=mib*1024*1024,words=(bytes/64+63)/64;
+    ram->arena=kmalloc(bytes);ram->bitmap=static_cast<uint64_t*>(kmalloc(words*8));
+    if(!ram->arena || !ram->bitmap || (reinterpret_cast<uint64_t>(&ram->workspace)&7) ||
+       LZ4_sizeofState()>int(sizeof(ram->workspace)) ||
+       !ram->pool.Initialize(ram->arena,bytes,ram->bitmap,words) ||
+       !store.AttachCompression({&ram->pool,ram,EncodePage,DecodePage,ram->encoded,ram->spill})) {
+        kfree(ram->arena);kfree(ram->bitmap);kfree(ram);return;
+    }
+    ram->residentBytes=bytes+uint64_t(words)*8+sizeof(*ram);ramCompression=ram;
+    SerialPrintf("paging: LZ4 RAM arena=%u total_resident_bytes=%lu (plus slot metadata)\n",bytes,ram->residentBytes);
+}
 // Root-only one-shot failure controls for the explicitly boot-enabled test.
 unsigned injectedFailure=0;
-enum class State : uint8_t { Resident, Evicting, OnDisk, Recovery, Zero };
+enum class State : uint8_t { Resident, Evicting, Stored, Recovery, Zero };
 struct Entry { uint64_t slot;PhysicalAddress recovery;State state; };
 struct Region { uint64_t pages,heldFrames;Entry entries[1]; };
 struct Frame {
@@ -170,7 +213,7 @@ int64_t PageOut(Process* actor,uint64_t page) {
     }
     auto& entry=static_cast<Region*>(backing.value->object)->entries[index];
     if(!result) {
-        entry.state=State::OnDisk;
+        entry.state=State::Stored;
         --static_cast<Region*>(backing.value->object)->heldFrames;
         KMutexUnlock(&space->mutation);
         ReturnReserveFrame(frame.physical);frame.physical={};return 4096;
@@ -187,6 +230,21 @@ int64_t PageOut(Process* actor,uint64_t page) {
     frame.physical={}; // transferred either to the PTE or to recovery backing
     KMutexUnlock(&space->mutation);
     return result;
+}
+int64_t SpillStoredPage(Process* actor,uint64_t page) {
+    if(page&4095)return -22;
+    MappingTransaction op(actor,actor->addressSpace);
+    if(!op.LockFaultRange(page))return -12;
+    MappingFaultSnapshot snapshot{};
+    if(!op.CaptureRange(page,1,snapshot) || snapshot.range.kind!=MappingKind::Pageable ||
+       !snapshot.range.backing || snapshot.range.backing->release!=ReleaseRegion)return -95;
+    auto* region=static_cast<Region*>(snapshot.range.backing->object);
+    auto index=(snapshot.range.offset+page-snapshot.range.begin)/4096;
+    if(index>=region->pages || region->entries[index].state!=State::Stored)return -16;
+    uint64_t token=region->entries[index].slot;op.Unlock();
+    Slot pin;
+    {StoreGuard guard;if(!store.Retain(token))return -116;pin.token=token;}
+    {StoreGuard guard;return store.Spill(token);}
 }
 // AS mutation held; whole dedicated mappings cannot split or share backings.
 uint64_t HeldFrames(AddressSpaceState* space) {
@@ -269,7 +327,7 @@ void PageableMemoryBootInit() {
         for(unsigned i=0;i<allocated;++i)PmmUnrefPage(initial[i]);kfree(records);return;
     }
     for(auto frame:initial)if(!faultReserve.Push(frame))KernelPanic("paging: reserve initialization");
-    KMutexInit(&storeLock);ready=true;
+    KMutexInit(&storeLock);AttachRamCompression();ready=true;
     SerialPrintf("paging experiment: backing=%s slots=%lu single-task explicit only\n",name,h.slots);
 }
 int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) {
@@ -298,6 +356,23 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
         actor->addressSpace->pagingResidentTarget=value;
         KMutexUnlock(&actor->addressSpace->mutation);return 0;
     }
+    if(operation==14 && value<=15) {
+        StoreGuard guard;auto stats=store.Stats();
+        switch(value) {
+            case 0:return ramCompression?ramCompression->pool.Capacity():0;
+            case 1:return ramCompression?ramCompression->pool.Allocated():0;
+            case 2:return ramCompression?ramCompression->pool.Payload():0;
+            case 3:return stats.ramSlots;case 4:return stats.diskSlots;
+            case 5:return stats.compressionFallbacks;
+            case 6:return ramCompression?ramCompression->residentBytes:0;
+            case 7:return stats.slots*sizeof(PageStoreSlot);
+            case 8:return stats.spillSuccesses;case 9:return stats.spillFailures;
+            case 10:return stats.decodeErrors;case 11:return stats.corruptReads;
+            case 12:return stats.diskWrites;case 13:return stats.diskReads;
+            case 14:return stats.ramWrites;case 15:return stats.ramReads;
+        }
+    }
+    if(operation==15)return SpillStoredPage(actor,value);
     if(operation==13 && value<=4) {
         auto* space=actor->addressSpace;uint64_t count=0;
         KMutexLock(&space->mutation);
@@ -308,7 +383,7 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
             auto* region=static_cast<Region*>(range.backing->object);
             for(uint64_t i=0;i<region->pages;++i) {
                 const auto state=region->entries[i].state;
-                if((value==1 && state==State::Zero) || (value==2 && state==State::OnDisk) ||
+                if((value==1 && state==State::Zero) || (value==2 && state==State::Stored) ||
                    (value==3 && state==State::Recovery) || (value==4 && state==State::Evicting))++count;
             }
         }
@@ -334,7 +409,7 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     auto& entry=region->entries[index];token=entry.slot;
     const auto initialState=entry.state;
     if(initialState==State::Recovery){recovery.physical=entry.recovery;PmmRefPage(recovery.physical);}
-    else if(initialState!=State::OnDisk && initialState!=State::Zero)return MappingFaultResult::Unhandled;
+    else if(initialState!=State::Stored && initialState!=State::Zero)return MappingFaultResult::Unhandled;
     const bool softPressure=allowReclaim && actor->addressSpace==space &&
         space->pagingResidentTarget && HeldFrames(space)>=space->pagingResidentTarget;
     op.Unlock();
