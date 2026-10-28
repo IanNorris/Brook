@@ -22,6 +22,13 @@ UserAccessScope::~UserAccessScope() {
     if(!removed)KernelPanic("uaccess: missing live lease");
     AddressSpaceUnref(space_);SchedulerKernelRegionLeave(actor_);
 }
+bool UserAccessScope::CoversCurrentPage(uint64_t page) {
+    auto* actor=ProcessCurrent();auto* scope=actor?actor->userAccessScope:nullptr;
+    if(!scope || scope->space_!=actor->addressSpace)return false;
+    KMutexLock(&scope->space_->mutation);
+    const bool covered=scope->space_->userAccess.CoversPage(page);
+    KMutexUnlock(&scope->space_->mutation);return covered;
+}
 bool UserAccessScope::PinCurrent(uint64_t address,uint64_t length) {
     auto* actor=ProcessCurrent();auto* scope=actor?actor->userAccessScope:nullptr;
     if(!scope)return true;

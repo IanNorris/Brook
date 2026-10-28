@@ -1103,7 +1103,7 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
 // Uses the global page cache for sharing and 64KB read-ahead.
 // No metadata pointer survives unlocking. The transaction owns both prepared
 // frames and the immutable backing pin through I/O, validation and retirement.
-static MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpaceState* space,uint64_t address,uint64_t error,uint32_t retryBudget=0) {
+static MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpaceState* space,uint64_t address,uint64_t error,uint32_t retryBudget=0,bool allowPageableReclaim=false) {
     if (error & 1) return MappingFaultResult::Unhandled;
     if (!actor || !space || space->kernel) return MappingFaultResult::Unhandled;
     const uint64_t page=address&~uint64_t{4095};
@@ -1128,7 +1128,8 @@ static MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpac
         const auto kind=snapshot.range.kind;
         if(kind==MappingKind::Pageable) {
             operation.Unlock();
-            return PageableMemoryFault(actor,space,page,access);
+            return PageableMemoryFault(actor,space,page,access,
+                actor->addressSpace==space && (allowPageableReclaim || UserAccessScope::CoversCurrentPage(page)));
         }
         if (kind!=MappingKind::File && kind!=MappingKind::MemFd && kind!=MappingKind::Anonymous &&
             kind!=MappingKind::Stack && kind!=MappingKind::Heap && kind!=MappingKind::Image) return MappingFaultResult::Unhandled;
@@ -1214,13 +1215,14 @@ static MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpac
     }
     return MappingFaultResult::Unhandled; // bounded remote cleanup under remap churn
 }
-MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error) {
+MappingFaultResult ResolveUserMappingFault(uint64_t address,uint64_t error,UserFaultOrigin origin) {
     auto* actor=ProcessCurrent();
     // Experimental paging never performs disk I/O from an arbitrary kernel
     // #PF. Safe usercopy retries explicitly supply the user-access error bit.
     if(actor && actor->addressSpace && actor->addressSpace->pagingAdmission.Exclusive() && !(error&4))
         return MappingFaultResult::Unhandled;
-    return ResolveMappingFaultForSpace(actor,actor?actor->addressSpace:nullptr,address,error);
+    return ResolveMappingFaultForSpace(actor,actor?actor->addressSpace:nullptr,address,error,0,
+        origin==UserFaultOrigin::UserInstruction);
 }
 extern "C" bool FileMapHandleUserFault(uint64_t address,uint64_t error) {
     return ResolveUserMappingFault(address,error)==MappingFaultResult::Resolved;

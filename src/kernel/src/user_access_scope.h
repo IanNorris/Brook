@@ -14,6 +14,7 @@ public:
     // No active scope preserves the historical validation-only contract.
     // A scope registers coverage before the caller prefaults or touches bytes.
     static bool PinCurrent(uint64_t address,uint64_t length);
+    static bool CoversCurrentPage(uint64_t page);
 private:
     Process* actor_=nullptr;
     AddressSpaceState* space_=nullptr;

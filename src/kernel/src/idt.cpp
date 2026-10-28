@@ -968,7 +968,12 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
         // Fault transactions finish before the user boundary, including failed
         // captures. Kernel-origin faults retain their outer operation boundary.
         if (fromUser && !pfPresent && isUserAddr && cowProc) {
-            const auto outcome=brook::ResolveUserMappingFault(cr2cow,ef->errorCode);
+            // This user-origin, nonpresent fault owns no outer kernel locks.
+            // Paging may sleep/yield for storage; exception bookkeeping below
+            // resumes with IF clear, as at entry.
+            __asm__ volatile("sti":::"memory");
+            const auto outcome=brook::ResolveUserMappingFault(cr2cow,ef->errorCode,brook::UserFaultOrigin::UserInstruction);
+            __asm__ volatile("cli":::"memory");
             if (brook::SchedulerKernelOperationBoundary()) {
                 brook::SchedulerYield();__builtin_trap();
             }

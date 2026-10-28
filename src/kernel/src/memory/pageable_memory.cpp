@@ -185,6 +185,52 @@ int64_t PageOut(Process* actor,uint64_t page) {
     KMutexUnlock(&space->mutation);
     return result;
 }
+// One finite traversal, in batches of at most 64 metadata/page visits. A sole
+// admitted task cannot concurrently add ranges; never retain a range pointer
+// across unlock/yield/I/O. At most one victim write is attempted per call.
+int64_t ReclaimOne(Process* actor,uint64_t excluded) {
+    auto* space=actor->addressSpace;
+    uint64_t flags;__asm__ volatile("pushfq; popq %0":"=r"(flags));
+    if(!(flags&512))return -16; // no sleeping/I/O from an interrupt-disabled caller
+    KMutexLock(&space->mutation);
+    if(!space->pagingAdmission.Exclusive() || !space->pagingReclaimEnabled) {
+        KMutexUnlock(&space->mutation);return -95;
+    }
+    const uint64_t start=space->pagingReclaimCursor;
+    KMutexUnlock(&space->mutation);
+    uint64_t cursor=start;bool wrapped=false;
+    for(;;) {
+        uint64_t victim=0;bool done=false;
+        KMutexLock(&space->mutation);
+        for(unsigned visited=0;visited<64;++visited) {
+            const auto* range=MappingRangeAtOrAfter(space->ranges,cursor);
+            if(!range) {
+                if(!start || wrapped){done=true;break;}
+                cursor=0;wrapped=true;continue;
+            }
+            const uint64_t page=range->begin>cursor?range->begin:cursor;
+            if(wrapped && page>=start){done=true;break;}
+            cursor=range->kind==MappingKind::Pageable?page+4096:range->end;
+            space->pagingReclaimCursor=cursor;
+            if(range->kind!=MappingKind::Pageable || !range->backing ||
+               range->backing->release!=ReleaseRegion || page==excluded ||
+               space->userAccess.CoversPage(page))continue;
+            auto* region=static_cast<Region*>(range->backing->object);
+            const auto index=(range->offset+page-range->begin)/4096;
+            if(index>=region->pages || region->entries[index].state!=State::Resident)continue;
+            const auto leaf=VmmReadLeaf(space->pageTable,VirtualAddress(page));
+            if(!(leaf&VMM_PRESENT) || !(leaf&VMM_USER) || (leaf&PTE_COW_BIT))continue;
+            const auto physical=VmmLeafPhysical(leaf);
+            if(PmmGetRefCount(physical)!=1 || PmmGetMapCount(physical)!=1)continue;
+            victim=page;break;
+        }
+        KMutexUnlock(&space->mutation);
+        if(victim)return PageOut(actor,victim); // authoritative admission recheck
+        if(done)return -12;
+        SchedulerYield();__asm__ volatile("sti":::"memory");
+    }
+}
+
 }
 void PageableMemoryBootInit() {
     char name[32]{};uint32_t size=FwCfgReadFile("opt/page-store-device",name,sizeof(name));
@@ -224,9 +270,16 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
     if(operation==6){KMutexLock(&actor->addressSpace->mutation);auto count=actor->addressSpace->userAccess.Count();KMutexUnlock(&actor->addressSpace->mutation);return count;}
     if(operation==7)return ReserveSize();
     if(operation==8 && value<=32){auto flags=IrqSpinLockAcquire(&reserveLock);failOrdinaryAllocations=value;IrqSpinLockRelease(&reserveLock,flags);return 0;}
+    if(operation==9 && value<=1) {
+        KMutexLock(&actor->addressSpace->mutation);
+        if(!actor->addressSpace->pagingAdmission.Exclusive()){KMutexUnlock(&actor->addressSpace->mutation);return -95;}
+        actor->addressSpace->pagingReclaimEnabled=value!=0;
+        KMutexUnlock(&actor->addressSpace->mutation);return 0;
+    }
+    if(operation==10)return ReclaimOne(actor,value&~uint64_t{4095});
     return -22;
 }
-MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,uint64_t page,uint32_t access) {
+MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,uint64_t page,uint32_t access,bool allowReclaim) {
     if(!ready || !actor || !space || !space->pagingAdmission.Exclusive())return MappingFaultResult::Unhandled;
     FaultLifetime lifetime(actor,space);
     Backing backing;Frame recovery;uint64_t index=0,token=0;
@@ -248,6 +301,20 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     if(!op.Prepare(0,1))return MappingFaultResult::OutOfMemory;
     auto physical=recovery.physical?recovery.physical:AllocateFaultFrame(space->allocationPid);
     if(!physical && reserve.Take(space->allocationPid)){physical=reserve.physical;PmmRefPage(physical);}
+    if(!physical && allowReclaim && actor->addressSpace==space && ReclaimOne(actor,page)==4096) {
+        // Victim detach deliberately changed AS generation. Recapture only the
+        // SAME target mapping and stored entry; do not weaken final validation.
+        MappingFaultSnapshot refreshed{};
+        if(!op.LockFaultRange(page))return MappingFaultResult::OutOfMemory;
+        if(!op.CaptureRange(page,access,refreshed) ||
+           refreshed.range.identity!=snapshot.range.identity ||
+           !Match(&refreshed.range,backing.value,page,index) ||
+           entry.state!=State::OnDisk || entry.slot!=token)return MappingFaultResult::Unhandled;
+        snapshot=refreshed;op.Unlock();
+        if(reserve.Take(space->allocationPid)){physical=reserve.physical;PmmRefPage(physical);}
+    }
+    // Reclaim failure belongs to resource acquisition, never to the incoming
+    // page's data/checksum. PageOut preserves a failed victim's only good bytes.
     if(!physical)return MappingFaultResult::OutOfMemory;
     if(!op.StagePage(0,physical,true)){PmmUnrefPage(physical);recovery.physical={};return MappingFaultResult::OutOfMemory;}
     recovery.physical={};

@@ -300,3 +300,51 @@ particular, reclaim must not evict earlier pages behind the eager preparation
 cursor of an unaudited syscall. That fallback needs whole-AS admission/exclusion
 or explicit no-reclaim behavior before any concurrent/background pager is enabled.
 Compressed RAM and indexed immutable-file compression remain later stages.
+
+## Synchronous victim-reclaim checkpoint
+
+Private operation 9 enables/disables victim selection for the current exclusive
+experimental address space; it defaults off. Only after ordinary frame allocation
+and the eight-frame reserve both fail may a permitted fault attempt reclamation.
+An explicit fault-origin argument identifies user-instruction faults. Safe
+usercopy additionally requires a live current-AS lease covering the fault page;
+a synthetic user error bit alone never grants reclaim permission. Eager
+preparation for unaudited syscalls and remote cleanup leave reclaim disabled,
+so they cannot evict earlier pages behind their preparation cursor.
+
+Selection is round robin within that same address space and dedicated mapping
+kind. It excludes the incoming page, all leased pages, nonresident/Recovery
+entries, CoW leaves and multiply referenced/mapped frames. The authoritative
+PageOut checks run again after selection unlocks. An AVL successor query skips
+holes and ordinary extents without a linear restart. One traversal visits each
+page/extent at most once, releases the AS gate and yields after at most 64
+visits, and attempts at most one victim write. The whole traversal is bounded
+by the admitted address space's current mappings, not a fixed 64-page limit.
+There is no worker or concurrent/background eviction.
+
+Successful victim storage transfers its frame into the reserve and the incoming
+fault checks it out directly. Victim detach changes the AS generation: the fault
+must recapture the same target mapping identity/backing/page index and OnDisk
+slot before normal final generation validation. Incoming stored bytes survive
+victim write failures; those are resource failures, not incoming-data corruption.
+User-origin nonpresent faults enable interrupts only across their sleeping
+resolver and restore CLI before exception bookkeeping. Reclaim refuses an
+interrupt-disabled caller; yields restore IF in this explicitly admitted path.
+Private operation 10 directly exercises one selection attempt for diagnostics.
+
+This is forward progress for the validated single-page fault scenarios, not a
+proof that arbitrary multi-page instructions or an oversized working set can
+progress under global OOM. General app paging, CoW/fork/shared-AS eviction and
+memory-pressure performance acceptance remain unfinished.
+
+Validation on the native KVM/VirtIO backing: scripts/workloads/pageable_reclaim.c
+passes genuine user-fault and scoped-write reclaim after injected allocation and
+reserve exhaustion, all-victim lease exclusion, unaudited eager no-reclaim,
+victim EIO/short-write/Recovery preservation, and three byte-checked cycling
+rounds. Its --scan case crosses the 64-visit yield boundary and performs a full
+wrapped all-leased traversal; --full-store preserves the resident victim on
+ENOSPC. Existing 128-page/failure/signal, reserve and read/write lease fixtures
+also pass. Eight relevant host binaries and both compiled entry/scheduler audits
+pass. Evidence is in build/paging-compression-20261028/native/reclaim-*.json;
+this kernel's VM completed checked sync and QEMU exit 0. These are deterministic
+allocation-failure tests, not measured system-wide pressure improvement.

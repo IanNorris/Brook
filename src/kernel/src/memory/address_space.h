@@ -24,6 +24,8 @@ struct AddressSpaceState {
     uint16_t allocationPid;
     bool kernel;
     PagingAdmission pagingAdmission;
+    bool pagingReclaimEnabled; // explicit single-task experiment; mutation protects both
+    uint64_t pagingReclaimCursor;
     UserAccessRegistry userAccess;
     volatile uint64_t tlbCpuMask;
     // Shared by CLONE_VM; copied on fork, reset by a fresh exec address space.

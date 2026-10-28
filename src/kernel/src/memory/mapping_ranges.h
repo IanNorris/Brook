@@ -98,6 +98,8 @@ private:
     bool prepared_ = false;
 };
 const MappingRange* MappingRangeFind(const MappingRangeTable& table, uint64_t address);
+// Containing range, or the next range after a hole. AS mutation required.
+const MappingRange* MappingRangeAtOrAfter(const MappingRangeTable& table,uint64_t address);
 uint64_t MappingRangeFindGap(const MappingRangeTable& table, uint64_t hint,
                              uint64_t length, uint64_t floor, uint64_t ceiling);
 void MappingRangeDestroy(MappingRangeTable& table); // unlocked, no live users

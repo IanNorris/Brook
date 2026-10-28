@@ -88,6 +88,10 @@ static void checkLookup(const MappingRangeTable& table, uint64_t address) {
     auto* expected = oracle(table, address);
     failAfter = 0; mutation = true;
     assert(MappingRangeFind(table, address) == expected);
+    const MappingRange* next=nullptr;
+    for(auto* node=table.head;node;node=node->next)
+        if(node->range.end>address){next=&node->range;break;}
+    assert(MappingRangeAtOrAfter(table,address)==next);
     mutation = false; failAfter = -1;
 }
 static MappingRange anonymous(uint64_t begin, uint64_t end, unsigned protection = 3) {

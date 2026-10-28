@@ -232,6 +232,14 @@ const MappingRange* MappingRangeFind(const MappingRangeTable& table, uint64_t ad
     }
     return nullptr;
 }
+const MappingRange* MappingRangeAtOrAfter(const MappingRangeTable& table,uint64_t address) {
+    const MappingRange* best=nullptr;
+    for(auto* node=table.root;node;) {
+        if(node->range.end<=address)node=node->right;
+        else {best=&node->range;node=node->left;}
+    }
+    return best;
+}
 bool MappingRangePlan::Extend(MappingRangeTable& table,uint64_t identity,uint64_t end) {
     if (!prepared_) return false;
     for (auto* node=table.head;node;node=node->next) {
