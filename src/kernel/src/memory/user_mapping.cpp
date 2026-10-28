@@ -385,7 +385,7 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
         }
         for (uint64_t i=0;i<request.preparedPages;++i)
             if (!operation.PreparedPage(i)) return failure.Fail("prepared-page-missing",-12);
-        if (request.preparedPages && !VmmPrepareRange(space->pageTable,address,end)) return failure.Fail("page-table-prepare",-12);
+        if ((request.preparedPages || request.range.kind==MappingKind::Pageable) && !VmmPrepareRange(space->pageTable,address,end)) return failure.Fail("page-table-prepare",-12);
         if(!operation.Lock())return failure.Fail("gate-set-commit",-12);
         if(request.range.backing && request.range.backing->file && request.range.backing->file->mappingError)
             return failure.Fail("file-quarantine",request.range.backing->file->mappingError);

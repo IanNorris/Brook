@@ -468,7 +468,7 @@ static void mappingTransactions() {
     PmmUnrefPage(previous); // external replacement owns its retirement token.
     for(int fail=0;fail<3;++fail) {
         MappingTransaction operation(&actor,space);failHeapAfter=fail;
-        CHECK(!operation.Prepare(1,1,1));CHECK(VmmVirtToPhys(space->pageTable,va)==replacement);
+        CHECK(!operation.Prepare(2,2,2));CHECK(VmmVirtToPhys(space->pageTable,va)==replacement);
     }
     {
         MappingTransaction operation(&actor,space);CHECK(operation.Prepare(1,1));
@@ -942,6 +942,28 @@ static void sparseLiveRemap() {
     AddressSpaceUnref(space);CHECK(ProcessCleanupStep());
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
     std::puts("LIVE SPARSE REMAP PASS 1TiB/two-hidden-leaves/fixed-destination/OOM-atomic/refcounts");
+}
+static void pageableTableSkeleton() {
+    auto root=table();VmmHostSetKernelRoot(root);auto* space=AddressSpaceCreate(38);CHECK(space);
+    Process actor{};actor.addressSpace=space;
+    constexpr uint64_t begin=0x50000000ULL,length=4*1024*1024;
+    auto* backing=MappingBackingCreate(&actor,releaseTestNoop);CHECK(backing);
+    UserMappingRequest request{};request.range=rangeRecord(0,length,backing);
+    request.range.kind=MappingKind::Pageable;request.hint=begin;request.length=length;
+    request.fixed=true;request.noReplace=true;
+    // Metadata-only dedicated region still prepares every intermediate table.
+    CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(begin));
+    auto first=PmmAllocPage(),last=PmmAllocPage();failAllocation=true;
+    CHECK(VmmTryMapPage(space->pageTable,VirtualAddress(begin),first,VMM_USER|VMM_WRITABLE|VMM_NO_EXEC,MemTag::User,38)==VmmMapResult::Mapped);
+    CHECK(VmmTryMapPage(space->pageTable,VirtualAddress(begin+length-pageSize),last,VMM_USER|VMM_WRITABLE|VMM_NO_EXEC,MemTag::User,38)==VmmMapResult::Mapped);
+    CHECK(failAllocation.exchange(false)); // neither install called the allocator
+    request.hint=0x10000000000ULL;failAllocation=true;
+    CHECK(UserMappingCreate(&actor,space,request)==-12);
+    CHECK(!MappingRangeFind(space->ranges,request.hint));
+    CHECK(!failAllocation.load());
+    AddressSpaceUnref(space);CHECK(ProcessCleanupStep());MappingBackingUnref(backing);
+    PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("PAGEABLE TABLES PASS lazy-preparation/allocator-denied-install/OOM-no-publication");
 }
 static void low32Mappings() {
     auto root=table();VmmHostSetKernelRoot(root);auto* space=AddressSpaceCreate(38);CHECK(space);
@@ -2162,7 +2184,7 @@ static void robustExitQueue() {
 }
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
-    robustExitQueue();low32Mappings();
+    robustExitQueue();low32Mappings();pageableTableSkeleton();
     competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();

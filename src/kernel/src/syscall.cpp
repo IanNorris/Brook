@@ -5761,6 +5761,7 @@ static uint64_t ClockNowNs(uint64_t clockid)
 static int64_t sys_clock_gettime(uint64_t clockid, uint64_t tsAddr, uint64_t,
                                   uint64_t, uint64_t, uint64_t)
 {
+    UserAccessScope userAccess(ProcessCurrent());
     if (clockid > 9) return -EINVAL; // No TAI/dynamic CPU clock support yet.
     timespec value{};auto* ts=&value;
     uint64_t ns = 0;

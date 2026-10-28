@@ -66,9 +66,9 @@ PhysicalAddress AllocateFaultFrame(uint16_t pid) {
 }
 // Root-only one-shot failure controls for the explicitly boot-enabled test.
 unsigned injectedFailure=0;
-enum class State : uint8_t { Resident, Evicting, OnDisk, Recovery };
+enum class State : uint8_t { Resident, Evicting, OnDisk, Recovery, Zero };
 struct Entry { uint64_t slot;PhysicalAddress recovery;State state; };
-struct Region { uint64_t pages;Entry entries[1]; };
+struct Region { uint64_t pages,heldFrames;Entry entries[1]; };
 struct Frame {
     PhysicalAddress physical;
     ~Frame(){if(physical)PmmUnrefPage(physical);}
@@ -105,7 +105,7 @@ uint64_t Flags(const MappingRange& r) {
 int Prepare(MappingTransaction& op,const UserMappingRequest&,void*) {
     return op.PrepareZeroed(MemTag::User,op.Space()->allocationPid)?0:-12;
 }
-int64_t Map(Process* actor,uint64_t length) {
+int64_t Map(Process* actor,uint64_t length,bool lazy=false) {
     if(!length || (length&4095) || length>16*1024*1024)return -22;
     auto* space=actor->addressSpace;
     // Claim against CLONE_VM atomically and against fork under its mutation
@@ -118,11 +118,13 @@ int64_t Map(Process* actor,uint64_t length) {
     auto* region=static_cast<Region*>(kmalloc(sizeof(Region)+(pages-1)*sizeof(Entry)));
     if(!region)return -12;
     memset(region,0,sizeof(Region)+(pages-1)*sizeof(Entry));region->pages=pages;
+    region->heldFrames=lazy?0:pages;
+    if(lazy)for(uint64_t i=0;i<pages;++i)region->entries[i].state=State::Zero;
     Backing backing{MappingBackingCreate(region,ReleaseRegion)};
     if(!backing.value){kfree(region);return -12;}
     UserMappingRequest request{};
     request.range={0,length,0,0,backing.value,3,3,MappingKind::Pageable,MappingSharing::Private,MappingLeafOwnership::Managed};
-    request.length=length;request.preparedPages=pages;request.prepare=Prepare;
+    request.length=length;request.preparedPages=lazy?0:pages;request.prepare=lazy?nullptr:Prepare;
     return UserMappingCreate(actor,space,request);
 }
 int64_t PageOut(Process* actor,uint64_t page) {
@@ -169,6 +171,7 @@ int64_t PageOut(Process* actor,uint64_t page) {
     auto& entry=static_cast<Region*>(backing.value->object)->entries[index];
     if(!result) {
         entry.state=State::OnDisk;
+        --static_cast<Region*>(backing.value->object)->heldFrames;
         KMutexUnlock(&space->mutation);
         ReturnReserveFrame(frame.physical);frame.physical={};return 4096;
     }
@@ -185,10 +188,18 @@ int64_t PageOut(Process* actor,uint64_t page) {
     KMutexUnlock(&space->mutation);
     return result;
 }
+// AS mutation held; whole dedicated mappings cannot split or share backings.
+uint64_t HeldFrames(AddressSpaceState* space) {
+    uint64_t total=0;
+    for(auto* node=space->ranges.head;node;node=node->next)
+        if(node->range.kind==MappingKind::Pageable && node->range.backing && node->range.backing->release==ReleaseRegion)
+            total+=static_cast<Region*>(node->range.backing->object)->heldFrames;
+    return total;
+}
 // One finite traversal, in batches of at most 64 metadata/page visits. A sole
 // admitted task cannot concurrently add ranges; never retain a range pointer
 // across unlock/yield/I/O. At most one victim write is attempted per call.
-int64_t ReclaimOne(Process* actor,uint64_t excluded) {
+int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false) {
     auto* space=actor->addressSpace;
     uint64_t flags;__asm__ volatile("pushfq; popq %0":"=r"(flags));
     if(!(flags&512))return -16; // no sleeping/I/O from an interrupt-disabled caller
@@ -215,6 +226,9 @@ int64_t ReclaimOne(Process* actor,uint64_t excluded) {
             if(range->kind!=MappingKind::Pageable || !range->backing ||
                range->backing->release!=ReleaseRegion || page==excluded ||
                space->userAccess.CoversPage(page))continue;
+            bool recent=false;
+            if(protectRecent)for(auto address:space->pagingRecentFaults)if(address==page){recent=true;break;}
+            if(recent)continue;
             auto* region=static_cast<Region*>(range->backing->object);
             const auto index=(range->offset+page-range->begin)/4096;
             if(index>=region->pages || region->entries[index].state!=State::Resident)continue;
@@ -277,6 +291,29 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
         KMutexUnlock(&actor->addressSpace->mutation);return 0;
     }
     if(operation==10)return ReclaimOne(actor,value&~uint64_t{4095});
+    if(operation==11)return Map(actor,value,true);
+    if(operation==12 && value<=65536) {
+        KMutexLock(&actor->addressSpace->mutation);
+        if(!actor->addressSpace->pagingAdmission.Exclusive()){KMutexUnlock(&actor->addressSpace->mutation);return -95;}
+        actor->addressSpace->pagingResidentTarget=value;
+        KMutexUnlock(&actor->addressSpace->mutation);return 0;
+    }
+    if(operation==13 && value<=4) {
+        auto* space=actor->addressSpace;uint64_t count=0;
+        KMutexLock(&space->mutation);
+        if(!value)count=HeldFrames(space);
+        else for(auto* node=space->ranges.head;node;node=node->next) {
+            const auto& range=node->range;
+            if(range.kind!=MappingKind::Pageable || !range.backing || range.backing->release!=ReleaseRegion)continue;
+            auto* region=static_cast<Region*>(range.backing->object);
+            for(uint64_t i=0;i<region->pages;++i) {
+                const auto state=region->entries[i].state;
+                if((value==1 && state==State::Zero) || (value==2 && state==State::OnDisk) ||
+                   (value==3 && state==State::Recovery) || (value==4 && state==State::Evicting))++count;
+            }
+        }
+        KMutexUnlock(&space->mutation);return count;
+    }
     return -22;
 }
 MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,uint64_t page,uint32_t access,bool allowReclaim) {
@@ -295,29 +332,46 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     index=(snapshot.range.offset+page-snapshot.range.begin)/4096;
     if(index>=region->pages)return MappingFaultResult::Unhandled;
     auto& entry=region->entries[index];token=entry.slot;
-    if(entry.state==State::Recovery){recovery.physical=entry.recovery;PmmRefPage(recovery.physical);}
-    else if(entry.state!=State::OnDisk)return MappingFaultResult::Unhandled;
+    const auto initialState=entry.state;
+    if(initialState==State::Recovery){recovery.physical=entry.recovery;PmmRefPage(recovery.physical);}
+    else if(initialState!=State::OnDisk && initialState!=State::Zero)return MappingFaultResult::Unhandled;
+    const bool softPressure=allowReclaim && actor->addressSpace==space &&
+        space->pagingResidentTarget && HeldFrames(space)>=space->pagingResidentTarget;
     op.Unlock();
     if(!op.Prepare(0,1))return MappingFaultResult::OutOfMemory;
-    auto physical=recovery.physical?recovery.physical:AllocateFaultFrame(space->allocationPid);
+    bool reclaimAttempted=softPressure && initialState!=State::Recovery;
+    bool reclaimed=reclaimAttempted && ReclaimOne(actor,page,true)==4096;
+    PhysicalAddress physical=recovery.physical;
+    if(!physical && reclaimed && reserve.Take(space->allocationPid)){physical=reserve.physical;PmmRefPage(physical);}
+    if(!physical)physical=AllocateFaultFrame(space->allocationPid);
     if(!physical && reserve.Take(space->allocationPid)){physical=reserve.physical;PmmRefPage(physical);}
-    if(!physical && allowReclaim && actor->addressSpace==space && ReclaimOne(actor,page)==4096) {
-        // Victim detach deliberately changed AS generation. Recapture only the
+    if(!physical && !reclaimAttempted && allowReclaim && actor->addressSpace==space) {
+        reclaimAttempted=true;reclaimed=ReclaimOne(actor,page)==4096;
+    }
+    if(physical) {
+        if(!op.StagePage(0,physical,true)){PmmUnrefPage(physical);recovery.physical={};return MappingFaultResult::OutOfMemory;}
+        recovery.physical={};
+    }
+    if(reclaimAttempted) {
+        // Even failed victim I/O may detach and restore a leaf, changing AS
+        // generation. A full/no-victim scan may leave it unchanged. Recapture only the
         // SAME target mapping and stored entry; do not weaken final validation.
         MappingFaultSnapshot refreshed{};
         if(!op.LockFaultRange(page))return MappingFaultResult::OutOfMemory;
         if(!op.CaptureRange(page,access,refreshed) ||
            refreshed.range.identity!=snapshot.range.identity ||
            !Match(&refreshed.range,backing.value,page,index) ||
-           entry.state!=State::OnDisk || entry.slot!=token)return MappingFaultResult::Unhandled;
+           entry.state!=initialState || entry.slot!=token)return MappingFaultResult::Unhandled;
         snapshot=refreshed;op.Unlock();
-        if(reserve.Take(space->allocationPid)){physical=reserve.physical;PmmRefPage(physical);}
+        if(!physical && reserve.Take(space->allocationPid)) {
+            physical=reserve.physical;PmmRefPage(physical);
+            if(!op.StagePage(0,physical,true)){PmmUnrefPage(physical);return MappingFaultResult::OutOfMemory;}
+        }
     }
     // Reclaim failure belongs to resource acquisition, never to the incoming
     // page's data/checksum. PageOut preserves a failed victim's only good bytes.
     if(!physical)return MappingFaultResult::OutOfMemory;
-    if(!op.StagePage(0,physical,true)){PmmUnrefPage(physical);recovery.physical={};return MappingFaultResult::OutOfMemory;}
-    recovery.physical={};
+    if(initialState==State::Zero)memset(reinterpret_cast<void*>(PhysToVirt(physical).raw()),0,4096);
     if(token) {
         int result;{StoreGuard guard;result=store.Load(token,reinterpret_cast<void*>(PhysToVirt(physical).raw()));}
         if(result)return MappingFaultResult::IoError;
@@ -331,12 +385,14 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     reserve.published=true;
     // Release backing-owned recovery/slot only after leaving the AS gate.
     recovery.physical=entry.recovery;entry.recovery={};entry.slot=0;entry.state=State::Resident;
+    if(initialState!=State::Recovery)++region->heldFrames;
+    space->pagingRecentFaults[space->pagingRecentNext++%8]=page;
     op.Unlock();ReleaseSlot(token);
     return MappingFaultResult::Resolved;
 }
 int PageableMemoryPrepareSyscall(Process* actor,uint64_t number) {
     if(!ready || !actor || !actor->addressSpace || !actor->addressSpace->pagingAdmission.Exclusive())return 0;
-    if(number==0 || number==1 || number==0xB40 || number==60 || number==231 || number==11 || number==57 || number==56 ||
+    if(number==0 || number==1 || number==228 || number==0xB40 || number==60 || number==231 || number==11 || number==57 || number==56 ||
        number==10 || number==25 || number==28 || number==62 || number==200 || number==234)return 0;
     // A sole task cannot mutate its mappings concurrently, but still take the
     // AS gate against diagnostic/cleanup users. Never retain a node after unlock.

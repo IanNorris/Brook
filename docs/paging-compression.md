@@ -348,3 +348,69 @@ also pass. Eight relevant host binaries and both compiled entry/scheduler audits
 pass. Evidence is in build/paging-compression-20261028/native/reclaim-*.json;
 this kernel's VM completed checked sync and QEMU exit 0. These are deterministic
 allocation-failure tests, not measured system-wide pressure improvement.
+
+## Lazy zero-fill and soft resident target
+
+Private operation 11 maps the same bounded/exclusive dedicated regions lazily.
+An untouched entry is explicitly Zero: no data frame and no disk slot. Mapping
+creation prepares intermediate page tables even with zero prepared data pages,
+so later faults need no table allocation. A host test uses the real mapping/VMM
+code to publish first/last leaves with allocation denied and verifies failed
+skeleton creation publishes no range. Zero faults clear all 4096 bytes before
+publication. Failed preparation/publication leaves Zero unchanged; Recovery
+still republishes its retained good bytes and is never inferred to be zero.
+
+Operation 12 sets a soft per-AS held-frame target (pages, zero disables); victim
+selection still requires operation 9. Before an eligible fault allocates above
+the target it attempts bounded reclaim, excluding eight recent fault addresses
+as well as the incoming page and all leases. No eligible victim, a full store
+or a victim write error permits ordinary allocation above the target rather than
+forcing thrash or rejecting an otherwise satisfiable fault. Hard allocation
+failure remains a separate emergency path; there is at most one victim I/O
+attempt per fault. Failed victim I/O may detach/restore and change generation,
+so even that attempt requires target snapshot refresh. Recent exclusion and a
+soft target improve local progress but are not an arbitrary-instruction OOM proof.
+
+Operation 13 reports held frames (selector 0), Zero pages (1), stored pages (2),
+Recovery pages (3) or Evicting pages (4) within current dedicated regions. Held
+frames include backing-owned Recovery/in-flight source frames until successful
+storage, not only present leaves; reserve, metadata, page tables and transient
+fault-in frames are additional memory. These are admin-only experimental
+snapshots, not production telemetry. Unmapped-but-not-yet-retired frames may
+outlive removal from the current range census.
+
+clock_gettime now has a lexical output-buffer lease and skips experiment eager
+preparation. Its local kernel value is copied after clock/scheduler reads release
+their locks. This permits timing without restoring unrelated cold pages. The
+native fixture verifies a pageable timespec restores only its page and leaves
+other stored pages cold, and checks zero lease count on return.
+
+scripts/workloads/pageable_working_set.c validates eight sparse full-page zero
+reads allocating only eight frames out of a 1024-page region, with no disk writes.
+It forces ordinary allocation failure and publication rejection on a Zero fault
+and checks reserve restoration. Soft reclaim write/short-write/rollback failures
+preserve victim bytes, retain Recovery correctly, publish the incoming zero page
+and account for overshoot. A full-region read lease prefaults safely beyond the
+target and consumes only its actual file bytes; no victim is evicted behind it.
+
+Two native runs, with reversed eager/soft order, use the same 8-vCPU/8-GiB KVM VM
+and 4-MiB backing. A 4-MiB dataset under a 64-page target holds 256 KiB of data
+frames and stores 3.75 MiB (93.75% less mapped data RAM); eager mode holds all
+4 MiB. This excludes metadata, reserve and table memory. Filling the soft region
+took 40.5/63.5 ms versus eager 0.92/0.95 ms; scanning and verifying every byte
+took 56.7/71.5 ms versus 5.33/6.25 ms. Per-page verification p95 was 111.8/82.6 us
+versus 4.55/10.49 us; maxima 6.50/8.30 ms versus 29.6/47.7 us. These timings include
+4096-byte validation and clock overhead, not isolated fault latency. Two ordered
+samples on host-cached raw backing are not a statistically controlled SSD or
+system-wide memory-pressure benchmark. Paging saves RAM while adding cold-I/O
+latency; no throughput improvement over an unconstrained resident set is claimed.
+
+All prior native core/reserve/lease/reclaim/long-scan/full-store fixtures pass on
+this kernel. Nine host binaries including actual VMM/AS ownership tests pass;
+an older VMM heap-failure test now requests multi-record allocations because
+single-record preparation intentionally uses inline storage. Compiled entry and
+scheduler audits pass. Evidence: build/paging-compression-20261028/native/
+working-set-*.json and working-set-{host,entry-audit,start-audit} files. The VM
+completed checked sync and original owner exit 0. Next acceptance needs actual
+system-pressure/response measurements; compressed RAM can then address the cold
+page latency demonstrated here. General application paging remains disabled.

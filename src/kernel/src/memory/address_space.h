@@ -26,6 +26,9 @@ struct AddressSpaceState {
     PagingAdmission pagingAdmission;
     bool pagingReclaimEnabled; // explicit single-task experiment; mutation protects both
     uint64_t pagingReclaimCursor;
+    uint64_t pagingResidentTarget; // soft target in pages; zero disables
+    uint64_t pagingRecentFaults[8];
+    unsigned pagingRecentNext;
     UserAccessRegistry userAccess;
     volatile uint64_t tlbCpuMask;
     // Shared by CLONE_VM; copied on fork, reset by a fresh exec address space.
