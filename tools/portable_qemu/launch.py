@@ -137,7 +137,11 @@ class Control:
             self.lifecycle_socket = socket.create_connection(('127.0.0.1', port), timeout=5)
         sock = self.lifecycle_socket
         sock.settimeout(10)
-        sock.sendall(f'BLC1 {self.session} {request} {boot} {verb}\n'.encode())
+        # Firmware/UART reset can leave a partial pre-boot line or a discard
+        # marker. An empty line before a read-only hello resynchronizes framing
+        # without replaying a power request or changing its retained ID.
+        prefix = '\n' if verb == 'hello' else ''
+        sock.sendall(f'{prefix}BLC1 {self.session} {request} {boot} {verb}\n'.encode())
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if b'\n' not in self.lifecycle_buffer:

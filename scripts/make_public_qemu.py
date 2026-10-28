@@ -166,7 +166,8 @@ def main():
     shutil.copy2(ROOT / 'LICENSE', output / 'BROOK-LICENSE.txt')
     shutil.copytree(ROOT / 'tools/vm_bridge', output / 'linux-development-bridge',
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-    shutil.copytree(ROOT / 'distribution/installers', output / 'installers')
+    shutil.copytree(ROOT / 'distribution/installers', output / 'installers',
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.gitignore'))
     manifest = dict(format=1, status='private-candidate-source-and-notice-review-pending',
                     profile=metadata.get('profile'), seed_manifest=metadata,
                     revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),

@@ -9,11 +9,14 @@
 #include <unistd.h>
 #include "brook_theme.h"
 #include "brook_gtk_appearance.h"
+#include "brook_taskbar.h"
 
 static GtkWidget *scale_choice,*preview,*status,*swatches[3];
 static GtkWidget *dark_switch,*opacity_slider,*opacity_value,*blur_choice,*performance;
 static BrookGtkAppearance *appearance_style;
 static uint32_t selected_appearance=BROOK_APPEARANCE_DEFAULT;
+static uint32_t selected_metrics=BROOK_TASKBAR_DEFAULT;
+static GtkWidget *metric_choices[6];
 static char *settings_path;
 static unsigned selected;
 static unsigned selected_scale=100;
@@ -91,6 +94,7 @@ static int save_appearance(unsigned theme,unsigned scale,uint32_t appearance,GEr
     g_key_file_set_integer(settings,"Desktop","performance",(appearance&BROOK_APPEARANCE_PERFORMANCE)!=0);
     g_key_file_set_integer(settings,"Desktop","opacity",brook_appearance_opacity(appearance));
     g_key_file_set_integer(settings,"Desktop","blur",brook_appearance_blur(appearance));
+    g_key_file_set_integer(settings,"Desktop","taskbar_metrics",selected_metrics);
     gsize length=0;char *contents=g_key_file_to_data(settings,&length,error);
     gboolean ok=contents&&g_file_set_contents_full(settings_path,contents,(gssize)length,
                     G_FILE_SET_CONTENTS_CONSISTENT|G_FILE_SET_CONTENTS_DURABLE,0600,error);
@@ -119,10 +123,10 @@ static void dark_changed(GObject *object,GParamSpec *property,gpointer unused){
 }
 static int saved_matches_selection(void){
     GKeyFile *file=g_key_file_new();int matches=g_key_file_load_from_file(file,settings_path,0,NULL);
-    const char* names[]={"theme","scale","dark","performance","opacity","blur"};
+    const char* names[]={"theme","scale","dark","performance","opacity","blur","taskbar_metrics"};
     const int values[]={(int)selected,(int)selected_scale,(selected_appearance&1)!=0,(selected_appearance&2)!=0,
-        (int)brook_appearance_opacity(selected_appearance),(int)brook_appearance_blur(selected_appearance)};
-    for(unsigned i=0;matches && i<6;++i){GError *error=NULL;int value=g_key_file_get_integer(file,"Desktop",names[i],&error);
+        (int)brook_appearance_opacity(selected_appearance),(int)brook_appearance_blur(selected_appearance),(int)selected_metrics};
+    for(unsigned i=0;matches && i<7;++i){GError *error=NULL;int value=g_key_file_get_integer(file,"Desktop",names[i],&error);
         matches=!error && value==values[i];g_clear_error(&error);}
     g_key_file_unref(file);return matches;
 }
@@ -130,9 +134,13 @@ static void apply(GtkButton *button,gpointer unused) {
     (void)button;(void)unused;
     long previous=syscall(0xB02L,0L,0L),previous_scale=syscall(0xB04L,0L,0L);
     long previous_appearance=syscall(BROOK_SYS_WM_APPEARANCE,0L,0L);
-    if(previous<0||previous_scale<0||previous_appearance<0){gtk_label_set_text(GTK_LABEL(status),"Appearance controls need a matching Brook kernel.");return;}
+    long previous_metrics=syscall(BROOK_SYS_WM_TASKBAR_METRICS,0L,0L);
+    selected_metrics=0;
+    for(unsigned i=0;i<6;++i)if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(metric_choices[i])))selected_metrics|=1u<<i;
+    if(previous<0||previous_scale<0||previous_appearance<0||previous_metrics<0){gtk_label_set_text(GTK_LABEL(status),"Appearance controls need a matching Brook kernel.");return;}
     int applied=syscall(0xB02L,1L,(long)selected)==0 && syscall(0xB04L,1L,(long)selected_scale)==0 &&
-        syscall(BROOK_SYS_WM_APPEARANCE,1L,(long)selected_appearance)==0;
+        syscall(BROOK_SYS_WM_APPEARANCE,1L,(long)selected_appearance)==0 &&
+        syscall(BROOK_SYS_WM_TASKBAR_METRICS,1L,(long)selected_metrics)==0;
     GError *error=NULL;
     if(applied && save_appearance(selected,selected_scale,selected_appearance,&error)) {
         gtk_label_set_text(GTK_LABEL(status),"Appearance applied and saved.");
@@ -144,6 +152,7 @@ static void apply(GtkButton *button,gpointer unused) {
     int restored=syscall(0xB02L,1L,previous)==0;
     restored=(syscall(0xB04L,1L,previous_scale)==0)&&restored;
     restored=(syscall(BROOK_SYS_WM_APPEARANCE,1L,previous_appearance)==0)&&restored;
+    restored=(syscall(BROOK_SYS_WM_TASKBAR_METRICS,1L,previous_metrics)==0)&&restored;
     char *message=g_strdup_printf(restored?"Could not save; previous settings restored: %s":"Could not save or fully restore settings: %s",error?error->message:"apply failed");
     gtk_label_set_text(GTK_LABEL(status),message);g_free(message);g_clear_error(&error);
 }
@@ -180,6 +189,8 @@ int main(int argc,char **argv) {
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),GTK_STYLE_PROVIDER(brook_css),GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(brook_css);
     selected_appearance=brook_appearance_read();appearance_style=brook_gtk_appearance_new(0);
+    long metrics=syscall(BROOK_SYS_WM_TASKBAR_METRICS,0L,0L);
+    if(metrics>=0 && brook_taskbar_metrics_valid((uint32_t)metrics))selected_metrics=(uint32_t)metrics;
     long active=syscall(0xB02L,0L,0L);selected=active>=0&&active<BROOK_THEME_COUNT?(unsigned)active:0;
     long scale=syscall(0xB04L,0L,0L);
     int scale_index=0;for(int i=0;i<3;++i)if(scale==(long)scales[i]){selected_scale=scales[i];scale_index=i;}
@@ -249,6 +260,17 @@ int main(int argc,char **argv) {
     gtk_combo_box_set_active(GTK_COMBO_BOX(scale_choice),scale_index);
     gtk_box_pack_end(GTK_BOX(scale_row),scale_choice,FALSE,FALSE,0);
     g_signal_connect(scale_choice,"changed",G_CALLBACK(scale_changed),NULL);
+
+    GtkWidget *metrics_panel=gtk_expander_new("Taskbar statistics");
+    GtkWidget *metrics_grid=gtk_grid_new();gtk_grid_set_column_spacing(GTK_GRID(metrics_grid),12);gtk_grid_set_row_spacing(GTK_GRID(metrics_grid),6);
+    const char *metric_names[]={"CPU usage","Memory usage","Disk throughput","Network throughput","Compositor frames","Focused app frames"};
+    for(unsigned i=0;i<6;++i){
+        metric_choices[i]=gtk_check_button_new_with_label(metric_names[i]);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(metric_choices[i]),(selected_metrics&(1u<<i))!=0);
+        gtk_grid_attach(GTK_GRID(metrics_grid),metric_choices[i],i%2,i/2,1,1);
+    }
+    gtk_container_add(GTK_CONTAINER(metrics_panel),metrics_grid);
+    gtk_box_pack_start(GTK_BOX(box),metrics_panel,FALSE,FALSE,0);
 
     gtk_box_pack_start(GTK_BOX(outer),gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),FALSE,FALSE,0);
     GtkWidget *footer=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12);gtk_container_set_border_width(GTK_CONTAINER(footer),20);gtk_box_pack_start(GTK_BOX(outer),footer,FALSE,FALSE,0);

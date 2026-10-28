@@ -3,10 +3,18 @@
 #include <vector>
 #include <cmath>
 #include "../../shared/brook_appearance.h"
+#include "../../shared/brook_taskbar.h"
 #include "../../kernel/src/chrome_material.h"
 #include "../../kernel/src/desktop_telemetry.h"
 #include "../../shared/boot_splash.h"
 int main(){
+    assert(BROOK_TASKBAR_DEFAULT==(BROOK_TASKBAR_CPU|BROOK_TASKBAR_MEMORY));
+    for(unsigned mask=0;mask<=BROOK_TASKBAR_ALL;++mask)assert(brook_taskbar_metrics_valid(mask));
+    assert(!brook_taskbar_metrics_valid(64) && !brook_taskbar_metrics_valid(0xffffffffu));
+    assert(brook_taskbar_metrics_setting(3,"taskbar_metrics=0")==0);
+    assert(brook_taskbar_metrics_setting(3,"taskbar_metrics=63\r")==63);
+    for(const char* invalid:{"taskbar_metrics=64","taskbar_metrics=-1","taskbar_metrics=1000","taskbar_metrics=","taskbar_metrics=3junk","theme=1"})
+        assert(brook_taskbar_metrics_setting(BROOK_TASKBAR_DEFAULT,invalid)==BROOK_TASKBAR_DEFAULT);
     assert(brook_appearance_valid(BROOK_APPEARANCE_DEFAULT));
     for(unsigned dark:{0u,1u})for(unsigned perf:{0u,1u})for(unsigned opacity:{40u,80u,100u})for(unsigned blur=0;blur<4;++blur){
         auto value=brook_appearance_pack(dark,perf,opacity,blur);assert(brook_appearance_valid(value));

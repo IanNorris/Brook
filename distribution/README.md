@@ -60,7 +60,7 @@ Primary policy references: [Mozilla](https://www.mozilla.org/en-US/foundation/tr
 
 ## Build and run
 
-Inside `nix-shell`:
+Build the image on an x86-64 Linux host, inside `nix-shell`. The resulting image is used unchanged by the launchers on other host platforms:
 
 ```sh
 python3 scripts/create_experiment_disks.py --public --profile-expression nix/release-packages.nix --nix-gib 12 --data-gib 4 --output build/distribution/new-seed

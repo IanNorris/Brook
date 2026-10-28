@@ -8,6 +8,7 @@ pkgs.stdenv.mkDerivation {
   postPatch = ''
     cp ${../../src/shared/brook_theme.h} brook_theme.h
     cp ${../../src/shared/brook_appearance.h} brook_appearance.h
+    cp ${../../src/shared/brook_taskbar.h} brook_taskbar.h
     cp ${../../src/shared/brook_gtk_appearance.h} brook_gtk_appearance.h
   '';
   buildPhase = ''

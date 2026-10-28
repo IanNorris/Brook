@@ -12042,6 +12042,14 @@ static int64_t sys_brook_wm_appearance(uint64_t op,uint64_t value,uint64_t,uint6
     return WmSetAppearance(static_cast<uint32_t>(value))?0:-EINVAL;
 }
 
+// 0xB0C: independently selectable taskbar telemetry widgets.
+static int64_t sys_brook_wm_taskbar_metrics(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t){
+    if(!ProcessCurrent())return -ESRCH;
+    if(op==0)return WmGetTaskbarMetrics();
+    if(op!=1||value>0xffffffffULL)return -EINVAL;
+    return WmSetTaskbarMetrics(static_cast<uint32_t>(value))?0:-EINVAL;
+}
+
 // 0xB04: native desktop scale. Query requested (0), request (1), query applied (2).
 static int64_t sys_brook_wm_scale(uint64_t op,uint64_t scale,uint64_t,uint64_t,uint64_t,uint64_t)
 {
@@ -15200,6 +15208,7 @@ void SyscallTableInit()
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     g_syscallTable[0xB04]                = sys_brook_wm_scale;
     g_syscallTable[BROOK_SYS_WM_APPEARANCE] = sys_brook_wm_appearance;
+    g_syscallTable[BROOK_SYS_WM_TASKBAR_METRICS] = sys_brook_wm_taskbar_metrics;
 #ifdef BROOK_MAPPING_TEST_HOOKS
     g_syscallTable[0xB30]                = MappingFaultTestControl;
 #endif

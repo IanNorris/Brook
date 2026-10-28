@@ -78,6 +78,13 @@ static void FocusWindowLocked(int idx);
 static uint32_t g_themeId = BROOK_THEME_BROOK;
 static bool g_themeSettingsLoaded = false;
 static uint32_t g_appearance = BROOK_APPEARANCE_DEFAULT;
+static uint32_t g_taskbarMetrics = BROOK_TASKBAR_DEFAULT;
+uint32_t WmGetTaskbarMetrics(){return __atomic_load_n(&g_taskbarMetrics,__ATOMIC_ACQUIRE);}
+bool WmSetTaskbarMetrics(uint32_t value){
+    if(!brook_taskbar_metrics_valid(value))return false;
+    __atomic_store_n(&g_taskbarMetrics,value,__ATOMIC_RELEASE);
+    CompositorMarkDirty();CompositorWake();return true;
+}
 uint32_t WmGetAppearance(){return __atomic_load_n(&g_appearance,__ATOMIC_ACQUIRE);}
 bool WmSetAppearance(uint32_t value){
     if(!brook_appearance_valid(value))return false;
@@ -109,6 +116,7 @@ static void WmRestoreTheme()
     uint32_t selected = BROOK_THEME_BROOK;
     uint32_t selectedScale = 100;
     uint32_t appearance=WmGetAppearance();
+    uint32_t taskbarMetrics=BROOK_TASKBAR_DEFAULT;
     Vnode* vn = VfsOpen("/data/home/.config/brook/settings.ini", 0);
     if (vn)
     {
@@ -157,7 +165,10 @@ static void WmRestoreTheme()
                     while (*p==' ' || *p=='\t' || *p=='\r') ++p;
                     selectedScale=!*p && digits==3 && DesktopMetrics::Supported(value) ? value : 100;
                 }
-                else if(desktopSection)appearance=brook_appearance_setting(appearance,p);
+                else if(desktopSection){
+                    appearance=brook_appearance_setting(appearance,p);
+                    taskbarMetrics=brook_taskbar_metrics_setting(taskbarMetrics,p);
+                }
                 if (!more) break;
                 line = end + 1;
             }
@@ -169,6 +180,7 @@ static void WmRestoreTheme()
         else if(glass[0]=='1'||(glass[0]=='o'&&glass[1]=='n'))appearance&=~BROOK_APPEARANCE_PERFORMANCE;
     }
     WmSetAppearance(appearance);
+    WmSetTaskbarMetrics(taskbarMetrics);
     WmSetScale(selectedScale);
     WmSetTheme(selected);
 }
@@ -1742,7 +1754,16 @@ static TaskbarLayout GetTaskbarLayout(uint32_t screenW, uint32_t screenH)
     };
     reserve(l.clock, WmTextWidth(l.clockText));
     const int widths[6]={64,64,112,112,240,240};
-    for(int i=5;i>=0;--i)reserve(l.metrics[i],WmMetric(widths[i]));
+    const uint32_t enabledMetrics=WmGetTaskbarMetrics();
+    for(int i=5;i>=0;--i)if(enabledMetrics&(1u<<i)){
+        reserve(l.metrics[i],WmMetric(widths[i]));
+        if(l.metrics[i].w){
+            // Two 19-pixel text lines do not fit the 32-pixel task buttons.
+            // Use the full tray height, retaining a scaled top/bottom inset.
+            l.metrics[i].y=l.y+WmMetric(2);
+            l.metrics[i].h=height-2*WmMetric(2);
+        }
+    }
     int ids[WM_MAX_WINDOWS + LaunchFeedbackTable::Capacity], total = 0, focused = 0;
     for (uint32_t i = 0; i < WM_MAX_WINDOWS; ++i)
     {

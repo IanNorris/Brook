@@ -5,6 +5,7 @@
 #include "desktop_metrics.h"
 #include "../../shared/brook_theme.h"
 #include "../../shared/brook_appearance.h"
+#include "../../shared/brook_taskbar.h"
 #include "../../shared/wm_window_state.h"
 
 namespace brook {
@@ -46,6 +47,8 @@ bool WmSetTheme(uint32_t theme);
 uint32_t WmGetTheme();
 uint32_t WmGetAppearance();
 bool WmSetAppearance(uint32_t value);
+uint32_t WmGetTaskbarMetrics();
+bool WmSetTaskbarMetrics(uint32_t value);
 void WmSetPerformanceMode(bool enabled);
 void WmObserveDesktopTick(uint64_t now);
 using WmRect = DesktopRect;
