@@ -2,6 +2,8 @@
 #include <stdint.h>
 
 namespace brook {
+// With a live UserAccessScope, validation also excludes eviction of the range
+// until that lexical scope ends. Without it, these remain validation only.
 bool UserBufferReadable(uint64_t address,uint64_t length);
 bool UserBufferWritable(uint64_t address,uint64_t length);
 // Trusted kernel buffer, user virtual address. Return bytes actually copied;

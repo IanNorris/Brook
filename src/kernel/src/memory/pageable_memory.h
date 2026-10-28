@@ -8,9 +8,10 @@ struct AddressSpaceState;
 void PageableMemoryBootInit();
 int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value);
 MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,uint64_t address,uint32_t access);
-// Conservative experiment-only raw-uaccess barrier: before ordinary syscalls,
+// Conservative experiment-only raw-uaccess barrier: before unaudited syscalls,
 // restore all pageable leaves while no handler lock has yet been acquired.
 // This deliberately sacrifices paging benefit across syscalls until raw user
-// pointer consumers have proper scoped pinning. Scalar paging/exit/unmap skip it.
+// pointer consumers have proper exclusion. Read/write use lexical leases;
+// scalar paging/exit/unmap also skip this barrier.
 int PageableMemoryPrepareSyscall(Process* actor,uint64_t number);
 }

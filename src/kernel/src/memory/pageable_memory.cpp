@@ -7,6 +7,8 @@
 #include "heap.h"
 #include "process.h"
 #include "process_user_namespace.h"
+#include "user_access_scope.h"
+#include "user_copy.h"
 #include "serial.h"
 #include "string.h"
 #include "sync/kmutex.h"
@@ -90,6 +92,7 @@ int64_t PageOut(Process* actor,uint64_t page) {
         MappingTransaction op(actor,space);
         if(!op.Prepare(1,0) || !op.LockFaultRange(page))return -12;
         const auto* range=MappingRangeFind(space->ranges,page);
+        if(space->userAccess.CoversPage(page))return -16;
         if(!range || range->kind!=MappingKind::Pageable || !range->backing ||
            range->backing->release!=ReleaseRegion)return -95;
         auto* region=static_cast<Region*>(range->backing->object);
@@ -162,6 +165,8 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
     if(operation==2){StoreGuard guard;return store.Stats().stored;}
     if(operation==3)return PmmGetFreePageCount();
     if(operation==4 && value<=6){StoreGuard guard;injectedFailure=value;return 0;}
+    if(operation==5){UserAccessScope lease(actor);if(!UserBufferReadable(value,4096))return -14;return PageOut(actor,value);}
+    if(operation==6){KMutexLock(&actor->addressSpace->mutation);auto count=actor->addressSpace->userAccess.Count();KMutexUnlock(&actor->addressSpace->mutation);return count;}
     return -22;
 }
 MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,uint64_t page,uint32_t access) {
@@ -199,7 +204,7 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
 }
 int PageableMemoryPrepareSyscall(Process* actor,uint64_t number) {
     if(!ready || !actor || !actor->addressSpace || !actor->addressSpace->pagingAdmission.Exclusive())return 0;
-    if(number==0xB40 || number==60 || number==231 || number==11 || number==57 || number==56 ||
+    if(number==0 || number==1 || number==0xB40 || number==60 || number==231 || number==11 || number==57 || number==56 ||
        number==10 || number==25 || number==28 || number==62 || number==200 || number==234)return 0;
     // A sole task cannot mutate its mappings concurrently, but still take the
     // AS gate against diagnostic/cleanup users. Never retain a node after unlock.

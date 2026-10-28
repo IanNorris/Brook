@@ -16,6 +16,7 @@ struct Vnode;
 struct FsContext;
 struct MountNamespace;
 struct KRwLock;
+class UserAccessScope;
 struct SupplementaryGroups {
     volatile uint32_t references;
     uint32_t count;
@@ -382,6 +383,7 @@ struct Process
     // cancellation through the complete kernel operation, including gaps between
     // locks (e.g. FAT cache loading). Each queued/held lock owns a Process ref.
     uint32_t kernelRegionDepth;
+    UserAccessScope* userAccessScope;
     bool kernelOperationProtected;
     bool terminalPending;
     bool interruptibleWait; // readyLock: registered wait may unwind on terminalPending

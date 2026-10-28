@@ -30,6 +30,7 @@
 #include "serial.h"
 #include "panic.h"
 #include "process.h"
+#include "user_access_scope.h"
 #include "desktop_identity.h"
 #include "exec_limits.h"
 #include "drm_map_tokens.h"
@@ -2310,6 +2311,7 @@ static int64_t WriteToFdByType(uint64_t fd,uint64_t bufAddr,uint64_t count,bool 
 static int64_t sys_write(uint64_t fd, uint64_t bufAddr, uint64_t count,
                           uint64_t, uint64_t, uint64_t)
 {
+    UserAccessScope access(ProcessCurrent());
     // Validate the user buffer once, up front. EFAULT if any page in the
     // range is unmapped — without this, a bad user pointer faults the kernel.
     if (count > 0 && !UserBufferReadable(bufAddr, count))
@@ -2382,6 +2384,7 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
                          uint64_t, uint64_t, uint64_t)
 {
     Process* proc = ProcessCurrent();
+    UserAccessScope access(proc);
     if (!proc) return -EBADF;
     // Pin the slot for the whole operation: the pipe/socket/tty/timerfd/eventfd
     // paths below block while holding fde->handle, so a bare FdGet would expose
@@ -2393,10 +2396,10 @@ static int64_t sys_read(uint64_t fd, uint64_t bufAddr, uint64_t count,
 
     // Validate user buffer up-front — every read path below ultimately
     // writes to bufAddr. If the user munmapped or never mapped the range,
-    // a kernel #PF would be unrecoverable. UserBufferReadable confirms
-    // every page in [bufAddr, bufAddr+count) is mapped; user pages are
-    // always writable in our model so checking presence is sufficient.
-    if (count > 0 && !UserBufferReadable(bufAddr, count))
+    // a kernel #PF would be unrecoverable. Resolve CoW and verify write access
+    // before backend locks; the lexical scope excludes pager eviction through
+    // a blocking read, but does not make raced unmap/protection changes safe.
+    if (count > 0 && !UserBufferWritable(bufAddr, count))
         return -EFAULT;
 
     if (fde->type == FdType::Vnode && fde->handle && !FdNamedFifo(fde))

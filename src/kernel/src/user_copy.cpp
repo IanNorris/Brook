@@ -1,4 +1,5 @@
 #include "user_copy.h"
+#include "user_access_scope.h"
 #include "user_copy_fault.h"
 #include "process.h"
 #include "scheduler.h"
@@ -35,6 +36,7 @@ bool Check(Operation& operation,uint64_t address,uint64_t length,uint32_t access
     if(!operation.actor || !operation.space || operation.space->kernel ||
        address>=UserLimit || length>UserLimit-address)return false;
     const uint64_t end=address+length;
+    if(!UserAccessScope::PinCurrent(address,length))return false;
     for(uint64_t page=address&~uint64_t{4095};page<end;page+=4096)
         if(!EnsurePage(operation,page,access))return false;
     return true;

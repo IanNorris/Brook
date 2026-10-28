@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "sync/kmutex.h"
 #include "paging_admission.h"
+#include "user_access_ranges.h"
 
 namespace brook {
 struct Process;
@@ -23,6 +24,7 @@ struct AddressSpaceState {
     uint16_t allocationPid;
     bool kernel;
     PagingAdmission pagingAdmission;
+    UserAccessRegistry userAccess;
     volatile uint64_t tlbCpuMask;
     // Shared by CLONE_VM; copied on fork, reset by a fresh exec address space.
     volatile uint32_t membarrierPrivateRegistered;

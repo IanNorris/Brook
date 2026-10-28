@@ -107,6 +107,7 @@ static void CopyParentProcess(Process* child, Process* parent) {
     memcpy(reinterpret_cast<char*>(child)+displayEnd,reinterpret_cast<const char*>(parent)+displayEnd,
            offsetof(Process,capabilities)-displayEnd);
     ProcessFsReadDisplay(parent,child->cwdDisplay,sizeof(child->cwdDisplay));
+    child->userAccessScope=nullptr; // never inherit a pointer into a parent's kernel stack
 }
 
 // Immediately after memcpy: the copied pointer is borrowed until this retains

@@ -164,10 +164,11 @@ reads never turn into demand-zero data. Entire-region and AS teardown release
 slot and recovery references after normal mapping retirement.
 
 This is still **not automatic reclaim or arbitrary-app paging**. Existing raw
-kernel user-pointer consumers lack scoped eviction pins. For the opted-in AS,
-an ordinary syscall therefore restores every pageable leaf before entering
-handler locks. Scalar paging, numeric signal/exit and restricted mapping calls
-are exemptions. Kernel-origin page faults in an opted-in AS never initiate
+kernel user-pointer consumers need scoped eviction exclusion. The initial
+checkpoint restored every pageable leaf before ordinary syscall handler locks;
+read/write now use the lexical leases below and restore only their buffers.
+Unaudited syscalls retain the eager fallback. Scalar paging, numeric signal/exit
+and restricted mapping calls are additional exemptions. Kernel-origin page faults in an opted-in AS never initiate
 paging I/O; safe usercopy retries explicitly enter the user-fault resolver.
 The conservative barrier loses paging benefits across ordinary syscalls and
 can affect unrelated lazy-file raw accesses in this diagnostic AS. It must be
@@ -199,3 +200,45 @@ Next priority is scoped kernel-user access exclusion (and fault-in reserves),
 not enabling this eager syscall-entry fallback for existing applications. Then
 add real pressure-driven victim selection with bounded worker I/O, quantify
 mixed-workload throughput/latency, and only then add compressed-RAM storage.
+
+
+## Lexical read/write eviction exclusion
+
+`UserAccessScope` retains the original AS and cancellation protection for each
+returning read/write handler. A per-process scope chain supports nesting; each
+stack node is also visible in the AS registry until it unlinks. Process copies
+clear inherited scope pointers. Coverage is registered under AS mutation before
+prefaulting, and PageOut checks that same registry before detaching. There is no
+allocation for the registry or its ranges: up to 32 disjoint intervals are
+represented inline, with overflow conservatively covering the entire AS rather
+than rejecting valid I/O. Adjacent/overlapping intervals coalesce. Empty/invalid
+intervals have defined behavior; failed validation may conservatively retain
+coverage until scope exit. A pointer validated by an inner scope must not escape
+that scope for later raw access.
+
+The audited read/write syscall entry points bypass eager preparation. Their
+existing UserBuffer checks now add the relevant range to the current scope.
+Read output admission uses UserBufferWritable, resolving CoW and checking write
+permissions before backend locks. Kernel-buffer internal write helpers remain
+separate; they must not register trusted bounce buffers as user addresses.
+
+This is eviction exclusion, **not a physical/DMA pin or protection from raced
+munmap/mprotect/CoW sharing**. CLONE_VM remains forbidden and the broad syscall
+fallback remains for unaudited consumers. Leases are deliberately lexical in
+returning handlers, not dispatcher-wide: terminal exit/failed-exec paths may not
+unwind ordinary C++ frames. Future broader admission must handle those paths and
+all kernel user-memory consumers explicitly.
+
+Host tests exercise coalescing, overflow-to-whole coverage, bounds, nesting,
+removal and publication/victim-check serialization while a lease owner waits.
+Private diagnostic operations 5 (validate a page under a real scope and attempt
+pageout) and 6 (current AS lease count) verify exclusion and cleanup in the guest.
+The static musl `pageable_io_leases.c` fixture passes both a Linux writable/COW
+oracle and Brook native tests: stdout leaves all 16 cold pages stored, a targeted
+file read restores only its destination, and a targeted write restores only its
+source. Invalid FD/buffer, nonblocking EAGAIN and signal-interrupted blocking
+read paths leave zero leases. A covered page returns EBUSY; it can be paged out
+after scope unwind. Original integrity/failure/signal/exhaustion/exit tests also
+pass on the lease build. Artifacts are in `build/paging-compression-20261028/`,
+including `lease-build.log`, `lease-linux.log` and `native/leases-result.json`.
+No high-pressure throughput claim is made from this functional test.
