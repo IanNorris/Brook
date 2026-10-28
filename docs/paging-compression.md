@@ -787,3 +787,47 @@ mutation audits pass. Evidence and exact hashes: `reserve-refill/` beneath the
 existing build evidence directory. These tests establish reserve recovery and
 bounded pressure behavior, not general threaded application paging or broader
 application throughput acceptance.
+
+## Real compiler acceptance: first high-pressure failure
+
+The next workload packs 41 installed Nix store paths containing GCC 15.3.0,
+C++ runtime/headers, binutils, Bash, jq and coreutils. Unique regular-file data
+is 419,061,933 bytes. Indexed raw/LZ4 images occupy 420,007,936/214,753,280 bytes
+with the same 942,080-byte index. The actual shared C++ reader verifies all 5068
+regular inodes in both images and reports identical sizes and decoded hashes.
+
+The normal-user workload compiles C++17 with -O2/-pthread, links and runs it,
+starts four threads, sorts/checks 100000 values and round-trips a 400000-byte
+file using standard streams/filesystem APIs. A Linux-host run verifies the test
+program itself; it is not a Linux-VM performance baseline. In the first 512 MiB/
+eight-vCPU Brook pilot, compilation/runtime from compressed storage passes in
+about 2.04 s (one pilot, not a controlled raw-versus-LZ4 timing comparison).
+Sources: compiler_accept.cpp and compiler_accept_driver.c under scripts/workloads.
+
+An independent compiler_memory_hold.c process retaining 96 MiB ordinary memory
+makes the unchanged compiler workload fail: PMM reaches zero free frames during
+a cc1plus anonymous-write fault. The compiler and GCC exit with SIGSEGV while
+the kernel remains usable. The bounded holder retains its bytes correctly. A
+second diagnostic run releases pressure in a finally block and records a rolling
+per-AS memory census; the extra observation changes scheduling and is not a
+performance measurement. It again fails under the same 96 MiB pressure.
+
+That capture shows the holder, driver, GCC and cc1plus each have a fully backed
+8 MiB stack (32 MiB total). cc1plus additionally reaches about 46.14 MiB of Image,
+59.14 MiB of Anonymous and 3 MiB of Heap mappings in the sampled observations;
+serial faults show continued anonymous growth afterward. Peak values from
+separate samples must not be summed as a simultaneous physical census. Owned
+ELF staging pages can already be reused through the exec cache; code loading is
+still eager, but should not be described as always duplicating each full page.
+
+The next bounded change is demand-zero user stack growth while retaining the
+existing 8 MiB range/guard and preallocating a derived initial-argument budget.
+Current exec limits (64 KiB arguments, 32 KiB environment, up to 512/256 strings),
+the duplicated argv[0], auxv/random/platform/alignment fit in 42 pages. Stack
+construction currently skips writes when translation is missing; that must become
+an explicit construction failure alongside any sparse-stack change. Re-test the
+original 96 MiB failure unchanged, plus maximum exec vectors, deep growth,
+fork isolation, guard faults and signals. This is a diagnosed failure, not a
+claim that general application paging is complete. Evidence: compiler-acceptance/
+pilot/{result,pressure-result,pressure-capture,after-failure-memory}.json and the
+retained serial/lifecycle logs for session b48d44f87a984eea972d5e2aced3b322.
