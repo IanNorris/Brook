@@ -10,6 +10,7 @@
 #include "vfs.h"
 #include "vfs_object.h"
 #include "memory/file_object.h"
+#include "memory/file_page_cache.h"
 #include "device.h"
 #include "process.h"
 #include "process_fs.h"
@@ -2825,7 +2826,6 @@ static Ext2Mount* g_ext2Mounts[EXT2_MAX_MOUNTS] = {};
 // The global mmap page cache outlives an individual mount. Never reuse its
 // namespace on remount; physical drive numbers and raw inode numbers alone
 // would let cached pages from another filesystem satisfy this file's faults.
-static uint64_t g_nextExt2CacheNamespace = 1;
 
 static uint64_t Ext2CacheId(const Ext2Mount* mnt, uint32_t ino)
 {
@@ -2910,8 +2910,8 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     // write/deferred-sync errors must not poison a newly mounted filesystem.
     *mnt = {};
 
-    uint64_t cacheNamespace = __atomic_fetch_add(&g_nextExt2CacheNamespace, 1, __ATOMIC_RELAXED);
-    if (cacheNamespace > 0xffffffffULL) {
+    uint64_t cacheNamespace = FilePageCacheAllocateNamespace();
+    if (!cacheNamespace) {
         kfree(mnt); kfree(bgdt);
         SerialPuts("ext2: page-cache namespace exhausted\n");
         return false;

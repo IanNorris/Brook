@@ -3,6 +3,7 @@
 #include "compressed_page_pool.h"
 #include "lz4.h"
 #include "fault_frame_reserve.h"
+#include "file_page_cache.h"
 #include "user_mapping.h"
 #include "physical_memory.h"
 #include "device.h"
@@ -373,6 +374,8 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
         }
     }
     if(operation==15)return SpillStoredPage(actor,value);
+    if(operation==16 && value<=2){auto s=FilePageCacheStatistics();return value==0?s.cached:value==1?s.scanned:s.reclaimed;}
+    if(operation==17 && value<=1){FilePageCachePauseReclaim(value!=0);return 0;}
     if(operation==13 && value<=4) {
         auto* space=actor->addressSpace;uint64_t count=0;
         KMutexLock(&space->mutation);

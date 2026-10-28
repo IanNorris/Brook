@@ -1030,7 +1030,7 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
 {
     // FileObject-backed faults use that inode's coherent resident cache and
     // never consult this legacy cache. Preloading here would create unused
-    // duplicate pages and pin the vnode (and its resident cache) indefinitely.
+    // duplicate pages in an unrelated cache.
     // Uncached vnodes likewise must not read batches that Adopt will discard.
     if (!vn->cacheId || (vn->ops->file_object && vn->ops->file_object(vn))) return 0;
     static constexpr uint32_t MAX_PRELOAD_PAGES = 4096; // 16MB
@@ -1071,12 +1071,19 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
         uint64_t chunkBytes = static_cast<uint64_t>(chunkPages) * 4096;
         __builtin_memset(readBuf, 0, chunkBytes);
         int got = VfsRead(vn, readBuf, chunkBytes, &off);
-        if (got < 0) got = 0;
-
-        // Scatter into physical pages and insert into cache
+        // Cache only complete verified file pages. A reader may return a
+        // verified prefix before a later block fails; errors/short reads must
+        // never become zero-filled cached data that hides a subsequent EIO.
+        uint32_t cachedThisChunk = 0;
         for (uint32_t i = 0; i < chunkPages; ++i) {
+            const uint64_t srcOff = i * 4096;
+            const uint64_t fileOff = (startPageIdx + base + i) * 4096;
+            const uint64_t required = fileSize - fileOff < 4096 ? fileSize - fileOff : 4096;
+            if (got < 0 || static_cast<uint64_t>(got) < srcOff + required) {
+                PmmUnrefPage(pages[i]);
+                continue;
+            }
             auto* kp = reinterpret_cast<uint8_t*>(PhysToVirt(pages[i]).raw());
-            uint64_t srcOff = i * 4096;
             if (srcOff < static_cast<uint64_t>(got)) {
                 uint64_t toCopy = static_cast<uint64_t>(got) - srcOff;
                 if (toCopy > 4096) toCopy = 4096;
@@ -1088,9 +1095,10 @@ static uint32_t PageCachePreload(Vnode* vn, uint64_t startPageIdx,
             }
             // Preload needs only the cache's reference, not a caller alias.
             auto canonical = FilePageCacheAdopt(vn, startPageIdx + base + i, pages[i], false);
-            if (canonical) PmmUnrefPage(canonical);
+            if (canonical) { PmmUnrefPage(canonical); ++cachedThisChunk; }
         }
-        totalCached += chunkPages;
+        totalCached += cachedThisChunk;
+        if (got < 0 || static_cast<uint64_t>(got) < chunkBytes) break;
     }
 
     kfree(readBuf);
@@ -1177,7 +1185,8 @@ static MappingFaultResult ResolveMappingFaultForSpace(Process* actor,AddressSpac
                     auto* bytes=reinterpret_cast<void*>(PhysToVirt(physical).raw());memset(bytes,0,4096);
                     uint64_t readOffset=offset;
                     const int readResult=VfsRead(file->vnode,bytes,4096,&readOffset);
-                    if (readResult<0) {
+                    const uint64_t expected=stat.size-offset<4096?stat.size-offset:4096;
+                    if (readResult<0 || static_cast<uint64_t>(readResult)!=expected) {
                         PmmUnrefPage(physical);
                         prepared=readResult==-ENOMEM?MappingFaultResult::OutOfMemory:MappingFaultResult::IoError;break;
                     }

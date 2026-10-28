@@ -550,6 +550,47 @@ capacity/fallbacks and pool cleanup explicitly.
 The next disk stage has a shared validated indexed reader and deterministic host
 build/list/inspect/verify/extract/tar-export tools. Its exact layout, limits,
 extraction contract and outstanding native integration gates are documented in
-[compressed-image-format.md](compressed-image-format.md). The VFS mount adapter
-is not yet implemented; no compressed executable/Nix-closure acceptance or
-whole-goal completion is claimed by that host-format checkpoint.
+[compressed-image-format.md](compressed-image-format.md). That host-format checkpoint did not yet include a VFS adapter; the following
+checkpoint adds native integration without claiming whole-goal completion.
+
+
+## Read-only compressed filesystem and reclaimable file cache
+
+The opt-in `brookimg` adapter now mounts indexed images, including at `/nix/store`.
+See [compressed-image-format.md](compressed-image-format.md) for flags, exact
+format, host tools and restrictions. A native static ELF verifies cross-block
+reads, hardlinks, symlinks, openat, permission denial, private CoW, shared-write
+rejection and EROFS mutations. A detached mount remains usable through retained
+handles. A real 14-path Bash 5.3p9/jq 1.8.1/coreutils 9.10 closure runs as uid 1000
+in a 512 MiB/eight-vCPU VM. Its 53,670,986 unique file bytes occupy a 28,631,040-
+byte indexed image. Bridge job round trips are not cold-launch benchmarks.
+
+The immutable file cache no longer retains vnodes. Never-reused namespaces avoid
+stale identity reuse while allowing detached mount metadata to be freed. Entry
+size falls from 32 to 24 bytes. A bounded pressure worker reclaims cache-only,
+unmapped frames below 64 MiB free, with 128 MiB hysteresis and 256-entry scan
+batches. A pressure fixture primes a mapped libc, unmaps it, holds 184 MiB of
+ordinary allocations and observes 86 cache entries retired, with 69 free pages
+recovered by its sample. Pinned/mapped frames remain excluded; allocation and
+retirement timing mean this is partial progress, not guaranteed OOM prevention.
+The same Nix jq binary executes correctly after reclaim.
+
+Private experiment control 16 returns cached/scanned/reclaimed counters for
+selectors 0/1/2. Control 17 temporarily pauses this worker for a controlled
+pressure test and restores it afterward; it is not a normal application ABI.
+Both controls require the existing root-only experimental page-store setup.
+
+A native payload-corruption test found that legacy mmap read-ahead converted a
+failed read into cached zeroes. Read-ahead now publishes only complete verified
+file pages, retaining a valid prefix when later data fails. Demand reads also
+reject short in-file data. The check covers read EIO, rejected mapped data and
+rejected execution, with the kernel surviving and shutting down cleanly.
+
+Host coverage includes all 18 relevant filesystem/cache/paging tests, Python
+image-tool tests and adapter/cache ASan+UBSan. Native evidence lives in
+`build/paging-compression-20261028/compressed-{nix-native,corrupt-native}`.
+The next useful acceptance step is controlled raw-versus-compressed cold-load
+throughput and resident-memory measurements, followed by larger workloads.
+General anonymous application paging remains restricted to the private dedicated
+mapping API; safe arbitrary threaded/forked application paging, dynamic compressed
+arena return/spill policy and wider workload acceptance remain unfinished.

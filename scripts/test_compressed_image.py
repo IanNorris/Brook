@@ -176,6 +176,17 @@ class Images(unittest.TestCase):
             header[18]=0;data[:ci.HEADER.size]=ci.HEADER.pack(*header);header[18]=ci.checksum(data[:136]);data[:ci.HEADER.size]=ci.HEADER.pack(*header)
             self.both(data,False)
 
+    def test_selected_top_level_paths(self):
+        subset=self.base/'subset.brk'
+        ci.build(self.source,subset,LIBRARY,paths=[self.source/'a',self.source/'executable'])
+        image=ci.Image(subset,LIBRARY)
+        try:
+            self.assertEqual([p for p,i in image.paths()],[b'',b'a',b'a/b',b'a/b/data',b'executable'])
+            image.verify()
+        finally:image.close()
+        self.assertEqual(self.cpp(subset).returncode,0)
+        with self.assertRaises(ValueError):ci.build(self.source,self.base/'bad-subset.brk',LIBRARY,paths=[self.outside])
+
     def test_maximum_depth_and_path_length(self):
         def tree(root,names,leaf):
             root.mkdir();fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY)

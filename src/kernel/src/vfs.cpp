@@ -563,7 +563,10 @@ void VfsInit()
 }
 
 bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
+{ return VfsMountConfigured(mountPoint,fsName,pdrv,0); }
+bool VfsMountConfigured(const char* mountPoint,const char* fsName,uint8_t pdrv,uint64_t attributes)
 {
+    if(attributes&~uint64_t{7})return false;
     FileMutationGuard mutation;
     if (!mountPoint || mountPoint[0]!='/' || !fsName ||
         StrLen(mountPoint)>=sizeof(MountEntry::mountPoint)) return false;
@@ -626,6 +629,7 @@ bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv)
         VfsBackingDropLocked(backing,true);
         kfree(slot);return false;
     }
+    slot->attributes=attributes;
     slot->linked=isRoot || slot->covered.object;
     slot->publication=++g_mountPublication;
     slot->used=true;

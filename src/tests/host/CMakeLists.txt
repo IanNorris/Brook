@@ -64,6 +64,14 @@ target_link_libraries(test_page_store_compressed PRIVATE paging_lz4_host)
 add_host_test(test_compressed_image "${BROOK_ROOT}/src/kernel/src/fs/compressed_image.cpp")
 target_compile_options(test_compressed_image PRIVATE "-iquote${BROOK_ROOT}/src/shared")
 target_link_libraries(test_compressed_image PRIVATE paging_lz4_host)
+add_host_test(test_compressed_vfs
+    "${BROOK_ROOT}/src/kernel/src/fs/compressed_vfs.cpp"
+    "${BROOK_ROOT}/src/kernel/src/fs/compressed_image.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/file_page_cache.cpp")
+target_compile_options(test_compressed_vfs PRIVATE -DBROOK_HOST_TEST -ffunction-sections -fdata-sections -Wno-unused-parameter -Wno-attributes
+    "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared/inc_km" "-iquote${BROOK_ROOT}/src/third_party/lz4")
+target_link_options(test_compressed_vfs PRIVATE -Wl,--gc-sections)
+target_link_libraries(test_compressed_vfs PRIVATE paging_lz4_host)
 add_host_test(test_paging_admission)
 add_host_test(test_user_access_ranges)
 add_host_test(test_fault_frame_reserve)

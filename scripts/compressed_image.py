@@ -225,9 +225,18 @@ class Image:
                     plain_bytes=sum(n.size for n in self.nodes if n.kind == FILE),
                     stored_bytes=sum(b[1] for b in self.blocks), integrity='FNV-1a64 corruption checks; not authentication')
 
-def build(source, destination, library=None, compress=True):
+def build(source, destination, library=None, compress=True, paths=None):
     destination = Path(destination)
     require(not destination.exists(), 'refusing to replace existing image')
+    selected = None
+    if paths is not None:
+        root_path = Path(source).resolve()
+        selected = set()
+        for path in paths:
+            path = Path(path)
+            require(path.is_absolute() and path.parent == root_path, 'selected paths must be immediate children of the source root')
+            selected.add(os.fsencode(path.name))
+        require(selected, 'empty path selection')
     source = os.fsencode(source)
     codec = Codec(library) if compress else None
     root = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -243,9 +252,10 @@ def build(source, destination, library=None, compress=True):
         return Node(kind, stat.S_IFMT(st.st_mode) | (st.st_mode & 0o777), st.st_uid, st.st_gid,
                     size, first, count, target, target_size, 0, 0)
     with tempfile.TemporaryFile() as payload:
-        def directory(fd, parent, path, depth):
+        def directory(fd, parent, path, depth, only=None):
             require(depth <= 128, 'tree too deep')
-            for name in sorted(os.fsencode(name) for name in os.listdir(fd)):
+            names = only if only is not None else (os.fsencode(name) for name in os.listdir(fd))
+            for name in sorted(names):
                 require(len(name) <= 255 and name not in (b'.', b'..') and b'/' not in name and b'\0' not in name, 'invalid source name')
                 full = path+b'/'+name if path else name
                 require(len(full)+1 <= 4095, 'source path too long')
@@ -294,7 +304,7 @@ def build(source, destination, library=None, compress=True):
                     hardlinks[(st.st_dev, st.st_ino)] = child
         try:
             nodes.append(record(os.fstat(root), DIR))
-            directory(root, 0, b'', 0)
+            directory(root, 0, b'', 0, selected)
         finally:
             os.close(root)
         entries.sort(key=lambda e:(e[0], bytes(strings[e[2]:e[2]+e[3]])))
@@ -423,6 +433,7 @@ def main():
         if action == 'build':
             sub.add_argument('source');sub.add_argument('image', type=Path)
             sub.add_argument('--codec', choices=('raw','lz4'), default='lz4')
+            sub.add_argument('--paths-file', type=Path, help='absolute immediate-child paths, e.g. nix-store -qR output')
         else:
             sub.add_argument('image', type=Path)
         if action in ('extract','export'):
@@ -430,7 +441,8 @@ def main():
         sub.add_argument('--lz4-library')
     args = parser.parse_args()
     if args.action == 'build':
-        print(json.dumps(build(args.source, args.image, args.lz4_library, args.codec == 'lz4'), indent=2));return
+        paths = args.paths_file.read_text().splitlines() if args.paths_file else None
+        print(json.dumps(build(args.source, args.image, args.lz4_library, args.codec == 'lz4', paths), indent=2));return
     image = Image(args.image, args.lz4_library)
     try:
         if args.action == 'list':

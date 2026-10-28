@@ -1,9 +1,10 @@
 # BRKPACK1 immutable compressed image
 
-Status: host tooling and shared C++ reader implemented and tested. **The VFS
-mount adapter and native executable/Nix-closure acceptance are not implemented
-yet.** This format is separate from disposable runtime swap. User data and
-package installation remain on ordinary writable filesystems.
+Status: host tools, shared reader and the opt-in read-only `brookimg` VFS adapter
+are implemented. Native ELF and a small real Nix closure pass acceptance in a
+512 MiB VM. Controlled cold-load throughput comparisons and larger workloads
+remain open. This format is separate from disposable runtime swap. User data
+and package installation remain on ordinary writable filesystems.
 
 ## Purpose and layout
 
@@ -75,14 +76,38 @@ already copied verified bytes, it returns that prefix; the failing block remains
 an error on retry. Adjacent 4 KiB reads can reuse one decoded 64 KiB block.
 The index and backing device must remain immutable for this cache lifetime.
 
-The VFS adapter must provide normal path and object-relative operations,
-mount/inode identities without cross-filesystem cache collisions, explicit
-EROFS mutation failures, and backing lifetime through retained objects/vnodes
-and mapped files. It must not free index/cache state on pathname detach while
-retained handles can still use it. Native acceptance requires mounted reads,
-symlinks/hardlinks, cross-block reads, permission/mutation checks, normal ELF
-execution and a representative Nix closure at its expected paths. These remain
-outstanding, not implied by host reader tests.
+The `brookimg` adapter implements path and object-relative operations, permission
+checks, directory enumeration, hardlinks, symlinks, file mappings and explicit
+EROFS mutation failures. Each mount receives a never-reused cache namespace
+shared with ext2's namespace allocator. Retained objects/vnodes and mappings
+keep the mount backing alive after pathname detach; the last reference releases
+its index and scratch buffers. The adapter serializes scratch-buffer reads.
+
+Boot configuration is opt-in:
+
+```
+-fw_cfg name=opt/compressed-image-device,string=virtio2
+-fw_cfg name=opt/compressed-image-mount,string=/nix/store
+```
+
+The drive name depends on attachment order. Attach its image read-only. The
+default mount path is `/data/packed`; the optional path above mounts a prepared
+Nix closure directly at its expected location. Mount attributes are read-only,
+nosuid and nodev before publication; backend mutations remain forbidden even if
+mount attributes change. Private writable CoW mappings are supported, shared
+writable mappings are rejected. Installation into this read-only store and a
+writable overlay are outside v1.
+
+Only immutable regular-file bytes receive a nonzero file-cache identity. Cache
+entries hold physical references rather than vnode references, so clean cached
+bytes cannot pin detached mount metadata forever. Each entry is 24 bytes rather
+than the previous 32 bytes, saving 512 KiB across 65536 slots. A bounded low-
+priority worker starts when a packed image mounts. Below 64 MiB free it scans
+256 entries per batch toward 128 MiB free; a complete no-progress sweep backs
+off. It retires only entries with a sole cache reference and zero mappings,
+then drops the physical reference outside the cache lock. No PTE is changed.
+Retirement/quarantine may delay physical availability, and this asynchronous
+worker does not guarantee recovery faster than arbitrary allocation rates.
 
 ## Host commands
 
@@ -102,6 +127,18 @@ python3 scripts/compressed_image.py extract output.brk NEW_DIRECTORY \
 python3 scripts/compressed_image.py export output.brk output.tar \
   --lz4-library build/host-tools/libbrook-image-lz4.so
 ```
+
+A Nix closure can be selected without copying or scanning the entire store:
+
+```sh
+nix-store -qR /nix/store/EXAMPLE-package > closure.txt
+python3 scripts/compressed_image.py build /nix/store closure.brk \
+  --paths-file closure.txt --lz4-library build/host-tools/libbrook-image-lz4.so
+```
+
+Each manifest line must select an absolute immediate child of the source root.
+The selected entries retain their original names and literal symlink targets;
+include every dependency needed at runtime. This does not rewrite Nix paths.
 
 `build --codec raw` creates the same indexed layout without compressed blocks,
 for correctness/performance controls. Raw-only inspect/list/verify/extract/export
@@ -134,7 +171,7 @@ a standard tar archive with relative entry names and the same literal links.
 It tests table/extent overflows, duplicate names, directory cycles/hardlinks,
 mode and final-block mismatches, raw/LZ4 reads, block-cache hits, malformed
 payload, short/error I/O, recovery and verified-prefix behavior. The same reader
-is built into the kernel, but is not yet mounted. ASan and UBSan pass.
+is used by the mounted kernel adapter. ASan and UBSan pass.
 
 `scripts/test_compressed_image.py` performs deterministic build, byte/hash
 cross-checks against that C++ reader, hardlink/symlink extraction and tar export,
@@ -150,6 +187,20 @@ BROOK_IMAGE_TEST_LZ4_LIBRARY="$PWD/build/host-tools/libbrook-image-lz4.so" \
 ```
 
 Evidence is retained in `build/paging-compression-20261028/compressed-image-*`.
-Full filesystem, executable compatibility and performance claims await native
-mount integration; this checkpoint establishes the format, tools and shared
-reader, not the completion of compressed on-disk OS storage.
+`test_compressed_vfs` exercises the actual adapter and reader with allocation
+failure injection, permission/readonly checks, parallel reads, hardlink identity,
+retained detach and distinct remount cache identities. Adapter and cache tests
+also pass ASan/UBSan. Native acceptance covers cross-block reads, nonroot
+ancestor-search/exec denial, private CoW, shared-write rejection and retained
+handles after detach. Native corrupted-payload checks additionally guard the
+legacy read-ahead path: failed/short reads must never publish zero-filled cache
+pages that conceal EIO.
+
+A 14-path Bash/jq/coreutils closure packs 53,670,986 unique file bytes into a
+28,631,040-byte image (188,416-byte index). All three execute as uid 1000 from
+`/nix/store` in a 512 MiB/eight-vCPU VM. Under controlled ordinary allocation
+pressure, cache occupancy falls from 1393 to 1307 pages and observed free pages
+rise from 14647 to 14716; jq runs correctly afterward. This demonstrates bounded
+partial reclaim, not an OOM guarantee or a cold-launch speedup. Larger GUI
+workloads and raw-versus-compressed cold-load/device-byte measurements remain
+necessary before making general throughput claims.

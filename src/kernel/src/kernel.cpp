@@ -37,6 +37,8 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "procfs.h"
 #include "fatfs_vfs.h"
 #include "ext2_vfs.h"
+#include "fs/compressed_vfs.h"
+#include "memory/file_page_cache.h"
 #include "ext4_vfs.h"
 #include "procfs_vfs.h"
 #include "net.h"
@@ -490,6 +492,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         KernelPanic("tmpfs registration failed");
     brook::FatFsVfsRegister();   // register "fatfs" filesystem driver
     brook::Ext2VfsRegister();    // register "ext2" filesystem driver
+    brook::CompressedVfsRegister();
     brook::ProcFsInit();
     brook::ProcFsVfsRegister();  // register "procfs" filesystem driver
     brook::NetInit();
@@ -720,6 +723,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         g_deferredCount = 0;
     }
 
+    brook::CompressedVfsBootMount();
+
     // ---- USB block devices: probe after xHCI module has loaded ----
     // The xHCI module registers "usb0", "usb1", etc. as block devices.
     // First scan each for GPT partition tables; then probe all resulting
@@ -828,6 +833,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // barrier, closing the freed-while-mapped cross-domain reuse window.
         brook::PmmStartDrainThread();
         brook::ProcessStartCleanupWorker();
+        brook::FilePageCacheStartReclaimWorker();
         brook::FileObjectStartWriteback();
 
         // BRO-179 forensic: arm PID/seq-encoded heap poison now that the per-CPU

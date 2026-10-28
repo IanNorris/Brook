@@ -232,12 +232,14 @@ add_executable(kernel
     src/signal_fd.cpp
     src/process.cpp
     src/memory/address_space.cpp
+    src/fs/compressed_vfs.cpp
     src/fs/compressed_image.cpp
     src/memory/compressed_page_pool.cpp
     src/memory/page_store.cpp
     src/memory/page_store_probe.cpp
     src/memory/pageable_memory.cpp
     src/memory/mapping_transaction.cpp
+    src/memory/file_page_cache_reclaim.cpp
     src/memory/file_page_cache.cpp
     src/memory/exec_page_cache.cpp
     src/memory/file_object.cpp

@@ -258,6 +258,8 @@ extern "C" void VfsInit();
 // mountPoint must start with '/' (e.g. "/", "/boot").
 // Returns true on success.
 extern "C" bool VfsMount(const char* mountPoint, const char* fsName, uint8_t pdrv);
+// Boot-owned mount publication with RDONLY/NOSUID/NODEV attributes.
+bool VfsMountConfigured(const char* mountPoint,const char* fsName,uint8_t pdrv,uint64_t attributes);
 
 // Unmount the filesystem at mountPoint. Returns true after successful detach;
 // a busy mount or failed filesystem/device flush leaves the mount attached.
