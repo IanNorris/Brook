@@ -11,6 +11,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "memory/virtual_memory.h"
 #include "memory/heap.h"
 #include "memory/file_object.h"
+#include "memory/page_store_probe.h"
 #include "acpi.h"
 #include "apic.h"
 #include "input.h"
@@ -705,6 +706,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     brook::SerialPuts("module: Phase 2 — loading from /boot/drivers (virtio)\n");
     brook::ModuleDiscoverAndLoad("/boot/drivers");
     brook::SerialPuts("module: Phase 2 — done\n");
+    brook::PageStoreBootProbe();
 
     // ---- Re-probe deferred devices (e.g. ext4 now registered) ----
     if (g_deferredCount > 0) {
