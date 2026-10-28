@@ -21,6 +21,11 @@
 
 ## What is Brook?
 
+For the portable QEMU candidate and the distinction between tested software,
+redistributable packages and user-owned games, see the
+[distribution inventory](distribution/README.md). The browser-emulation
+experiment is parked; native QEMU is the current portability route.
+
 Brook is a hobby operating system for x86-64, written from scratch in C++ with
 a unified Clang/LLVM toolchain. It boots via UEFI, runs on multiple CPU cores,
 has a compositing window manager with a Wayland compositor, and implements

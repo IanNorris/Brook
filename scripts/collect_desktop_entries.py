@@ -272,10 +272,13 @@ def main():
         binary_name = Path(binary).name
         if binary_name in ('chromium', 'firefox', 'codium', 'vscodium', 'vlc'):
             wrapper = 'brook-' + ('codium' if binary_name == 'vscodium' else binary_name)
-            wrapper_path = Path(store_dir).parent/'bin'/wrapper
-            if wrapper_path.is_file() and os.access(wrapper_path, os.X_OK):
+            candidates = [(Path(store_dir).parent/'bin'/wrapper, '/nix/bin/'),
+                          (Path(store_dir).parent/'profile/bin'/wrapper, '/nix/profile/bin/')]
+            deployed = next((prefix for path, prefix in candidates
+                             if path.is_file() and os.access(path, os.X_OK)), None)
+            if deployed:
                 arguments = shlex.split(exec_cmd)[1:]
-                exec_cmd = shlex.join(['/nix/bin/' + wrapper, *arguments])
+                exec_cmd = shlex.join([deployed + wrapper, *arguments])
                 if binary_name in ('firefox', 'codium', 'vscodium', 'vlc'):
                     exec_cmd = '--uid 1000 ' + exec_cmd
 

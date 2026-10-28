@@ -41,7 +41,11 @@ fi
 
 # Image size in KB — enough for config + all driver modules.
 # 2880KB (2.88MB floppy) accommodates the ext4 module (~800KB debug) plus others.
-SIZE_KB=2880
+SIZE_KB=${BROOK_INITRD_KIB:-2880}
+if ! [[ "$SIZE_KB" =~ ^[0-9]+$ ]] || (( SIZE_KB < 2880 || SIZE_KB > 65536 )); then
+    echo 'BROOK_INITRD_KIB must be 2880..65536' >&2
+    exit 1
+fi
 
 mkdir -p "${ESP_DIR}"
 echo "Creating initrd image (${SIZE_KB} KB)..."

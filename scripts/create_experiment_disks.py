@@ -60,6 +60,8 @@ def install_package_tools(nix_root, manifest):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "build/experiments/seeds")
+    parser.add_argument("--profile-expression", type=Path, help="Explicit Nix profile expression; no existing disks are copied")
+    parser.add_argument("--public", action="store_true", help="Forbid private game/media inputs")
     parser.add_argument("--video", type=Path)
     parser.add_argument("--q2-dir", type=Path, help="baseq2 folder containing pak0.pak")
     parser.add_argument("--q2-music", type=Path, help="OST folder with track*.ogg")
@@ -85,6 +87,10 @@ def main():
                 parser.error("pak0.pak has no Quake PACK header")
     if args.q2_music and not args.q2_music.is_dir():
         parser.error("Music directory does not exist")
+    if args.public and (args.video or args.q2_dir or args.q2_music):
+        parser.error("Public images forbid private media/game inputs")
+    if args.bootstrap_mode and args.profile_expression:
+        parser.error("Choose bootstrap mode or an explicit profile, not both")
     if args.bootstrap_mode and (args.video or args.q2_dir or args.q2_music):
         parser.error("Bootstrap images cannot include experiment media")
 
@@ -93,7 +99,7 @@ def main():
                            "--arg", "withSdk", str(args.bootstrap_mode == "prepared").lower(),
                            "--no-out-link", capture=True))
     else:
-        profile = Path(run("nix-build", str(ROOT / "nix/experiment-packages.nix"),
+        profile = Path(run("nix-build", str(args.profile_expression.resolve() if args.profile_expression else ROOT / "nix/experiment-packages.nix"),
                            "-A", "profile", "--no-out-link", capture=True))
     closure = run("nix-store", "-qR", str(profile), capture=True).splitlines()
     transport_closure = set()
@@ -104,6 +110,8 @@ def main():
     manifest = {"revision": run("git", "-C", str(ROOT), "rev-parse", "HEAD", capture=True),
                 "profile": str(profile), "closure": sorted(closure), "assets": {},
                 "q2_data_present": bool(args.q2_dir),
+                "public_inputs_only": args.public,
+                "profile_expression": str(args.profile_expression.resolve()) if args.profile_expression else None,
                 "bootstrap_mode": args.bootstrap_mode,
                 "bootstrap_sdk_modes": "guest-nar" if args.bootstrap_mode == "prepared" else None,
                 "working_tree_dirty": bool(run("git", "-C", str(ROOT), "status", "--porcelain", capture=True))}
@@ -148,7 +156,7 @@ def main():
         (nix_root / "etc").mkdir(exist_ok=True)
         shutil.copy2(ROOT / "data/asound.conf", nix_root / "etc/asound.conf")
         shutil.copy2(ROOT / "data/config/alsoft-oss.conf", nix_root / "etc/alsoft-oss.conf")
-        for executable in ([] if args.bootstrap_mode else ["waylandd", "wayland-calc", "brook-player", "brook-files", "brook-gallery",
+        for executable in ([] if args.bootstrap_mode or args.profile_expression else ["waylandd", "wayland-calc", "brook-player", "brook-files", "brook-gallery",
                            "brook-office", "brook-ladybird", "brook-vlc", "brook-dbus", "brook-session.conf",
                            "brook-yquake2-gl", "brook-yquake2-soft"]):
             source = profile / "bin" / executable
@@ -210,7 +218,7 @@ def main():
             image.rename(output / f"{name}.img")
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Experiment disks and manifest: {output}")
-    if not args.q2_dir and not args.bootstrap_mode:
+    if not args.q2_dir and not args.bootstrap_mode and not args.profile_expression:
         print("Quake 2 packages are staged; game data is not present yet.")
 
 

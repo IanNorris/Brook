@@ -379,6 +379,17 @@ static void ProcessEvent(const VirtioInputEvent& ev)
     {
         if (g_pendingX >= 0 || g_pendingY >= 0)
         {
+            // A boot script or Settings can change the display after this
+            // module starts. Scaling against the boot GOP size misaligns
+            // tablet clicks and can leave the pointer outside the desktop.
+            uint32_t width = 0, height = 0;
+            CompositorGetPhysDims(&width, &height);
+            if (width && height && (width != g_screenW || height != g_screenH))
+            {
+                g_screenW = width;
+                g_screenH = height;
+                MouseSetBounds(width, height);
+            }
             int32_t absX = (g_pendingX >= 0) ? g_pendingX : g_lastAbsX;
             int32_t absY = (g_pendingY >= 0) ? g_pendingY : g_lastAbsY;
             g_lastAbsX = absX;

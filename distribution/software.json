@@ -1,0 +1,368 @@
+{
+  "review_date": "2026-10-27",
+  "scope": "Compatibility and redistribution are independent. Base inclusion requires exact closure notices/source; this inventory is not a blanket licence grant.",
+  "sources": {
+    "mozilla": "https://www.mozilla.org/en-US/foundation/trademarks/distribution-policy/",
+    "factorio": "https://www.factorio.com/terms-of-service",
+    "steam": "https://store.steampowered.com/subscriber_agreement/",
+    "openttd": "https://wiki.openttd.org/en/Manual/Installation",
+    "gimp": "https://www.gimp.org/about/selling.html",
+    "vlc": "https://github.com/videolan/vlc",
+    "corresponding_source": "https://www.gnu.org/licenses/gpl-faq.en.html#DistributeExtendedBinary"
+  },
+  "software": [
+    {
+      "name": "bash",
+      "tested_version": "5.2 / 5.3",
+      "compatibility": "✅ Working",
+      "tested_scope": "Bundled shell and Nix Bash closures; readline, job control and scripting",
+      "distribution_route": "base-image",
+      "licence_summary": "GPL-3.0-or-later",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "DOOM",
+      "tested_version": "1.9",
+      "compatibility": "✅ Working",
+      "tested_scope": "Runs in a WM window or full-screen, with keyboard input",
+      "distribution_route": "engine-only; proprietary game data excluded",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Quake 2 / Yamagi",
+      "tested_version": "8.60",
+      "compatibility": "✅ Gameplay",
+      "tested_scope": "Software and hardware virgl GL3 renderers, startup demo, OSS audio and OGG music; [GPU resource retirement/repeated launches](docs/gpu-resource-lifetime.md), mouse capture and intermittent audio timing remain open",
+      "distribution_route": "engine-only; proprietary game data excluded",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "GLtron",
+      "tested_version": "0.70",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Compatibility launcher installs through guest `nix-install`; hardware virgl menu and light-cycle gameplay verified, with sound disabled",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "GPL code; audit included assets",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "SuperTuxKart",
+      "tested_version": "1.5",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Guest installation and hardware virgl races verified; current ownership build accepts race input and [reclaims backing after close](docs/gpu-resource-lifetime.md#gpu-workload-transition-acceptance), with clean subsequent Gallery/browser surfaces; launcher sound is disabled, memory pressure and mixed-game acceptance remain open",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "GPL code plus separately licensed assets",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Vulkan / Mesa Venus",
+      "tested_version": "26.0.6",
+      "compatibility": "✅ vkcube + vkmark",
+      "tested_scope": "Intel hardware compute, rendering and direct Wayland DMA-BUF presentation; automatic staging with CPU composition. Repeated window lifecycle and concurrent GL verified. [Results and limits](docs/vulkan-desktop.md)",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "busybox",
+      "tested_version": "1.36",
+      "compatibility": "✅ Working",
+      "tested_scope": "ls, cat, echo, wc, head, tail, grep, and many more",
+      "distribution_route": "legacy-optional; replaced by coreutils in this image",
+      "licence_summary": "GPL-2.0-only",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "TCC",
+      "tested_version": "0.9.27",
+      "compatibility": "✅ Working",
+      "tested_scope": "Compiles and runs C programs natively on Brook",
+      "distribution_route": "base-image",
+      "licence_summary": "LGPL-2.1-or-later",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "CoreMark",
+      "tested_version": "1.0",
+      "compatibility": "✅ Working",
+      "tested_scope": "CPU benchmark, runs to completion",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "musl libc",
+      "tested_version": "1.2",
+      "compatibility": "✅ Working",
+      "tested_scope": "Standard C library, dynamically linked",
+      "distribution_route": "base-image",
+      "licence_summary": "MIT",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Go runtime",
+      "tested_version": "1.22",
+      "compatibility": "✅ Working",
+      "tested_scope": "Static Go binaries (lazy PROT_NONE heap + on-demand mprotect)",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Nix binaries",
+      "tested_version": "—",
+      "compatibility": "✅ Working",
+      "tested_scope": "Stock NixOS closures fetched via `nix-install` (cowsay, coreutils, curl, …)",
+      "distribution_route": "base-image",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "NetSurf",
+      "tested_version": "3.11",
+      "compatibility": "✅ Working",
+      "tested_scope": "Web browser rendering HTML/CSS via custom framebuffer surface",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "GPL-2.0-only plus third-party components",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Ladybird",
+      "tested_version": "2026-04-04",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "HTTPS Google search and Amazon navigation verified; loading/input/scrolling performance remains limited",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "BSD-2-Clause plus third-party licences",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Firefox",
+      "tested_version": "150.0.1",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Included in fresh experiment images; software Wayland HTTPS/JavaScript and YouTube audio through the normal launcher, including pause/resume; synthetic site storage survives reboot; hardware child-surface rendering and local video/PCM capture now verified; low video framerate and intermittent audio gaps remain",
+      "distribution_route": "user-install-or-unbranded-build",
+      "licence_summary": "MPL-2.0 plus Mozilla trademark/distribution policy",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Chromium",
+      "tested_version": "148.0.7778.96",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled",
+      "distribution_route": "base-image",
+      "licence_summary": "BSD-3-Clause plus bundled third-party licences",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "OpenTTD",
+      "tested_version": "15.3",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "World creation and cold-boot save/load verified; music output, normal quit and forced-exit cleanup checked; longer-session gameplay remains experimental",
+      "distribution_route": "base-image",
+      "licence_summary": "GPL-2.0-only; use OpenGFX/OpenSFX/OpenMSX assets",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "VSCodium",
+      "tested_version": "1.112.01907",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Brook-user editing, cold save/reopen and normal exit verified alongside Firefox and Chromium in a 4 GiB VM; startup remains slow; Electron sandbox disabled",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "MIT plus Electron/Chromium dependencies",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Blender",
+      "tested_version": "5.1.1",
+      "compatibility": "🚧 Blocked",
+      "tested_scope": "Guest installation and LLVM dependency correction verified; audio initialization and EGL rendering remain blocked",
+      "distribution_route": "not-in-image; compatibility-blocked",
+      "licence_summary": "GPL-3.0-or-later",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Wine64",
+      "tested_version": "11.0",
+      "compatibility": "✅ Basic apps",
+      "tested_scope": "Console command and Windows Notepad: keyboard input, save, normal close and cold-boot reopen as Brook. Broader Windows coverage remains limited. [Evidence and screenshot](docs/wine-smoke.md#console-and-notepad-acceptance--19-october)",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "LGPL-2.1-or-later",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Wine + DXVK",
+      "tested_version": "11.0 / 2.7.1",
+      "compatibility": "⚠️ Experimental D3D11",
+      "tested_scope": "Hardware Venus shader/readback probe and Windows SDL3 Snake; keyboard input, resize, maximize, minimize/restore and repeated launch/close verified. Per-app Unity audio also verified; standalone Proton GE has a separate smoke test. [Results](docs/wine-dxvk.md), [Unity smoke test](docs/wine-unity.md)",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "LGPL-2.1-or-later / Zlib",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Proton GE",
+      "tested_version": "11-10 / DXVK 3.1.1",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Standalone Helltaker at 720p: first-puzzle input/reset, captured audio and normal exit verified. Later Steam integration results are recorded separately in docs/steam-library-stability.md. [Results](docs/proton.md)",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "mixed open-source component licences; audit exact build",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Steam",
+      "tested_version": "Native64 client",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "QR sign-in, Library, downloads and verification tested through SteamRT. Native64 Stardew gameplay and save/reload across reboot work; game audio and bounded timing-fault recovery verified. Startup remains slow and variable. [Game results](docs/stardew-native64.md), [client limits](docs/steam-library-stability.md)",
+      "distribution_route": "publisher-download-only",
+      "licence_summary": "proprietary client; publisher download and account terms apply",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Stardew Valley",
+      "tested_version": "1.6.15 native64",
+      "compatibility": "✅ Compatible",
+      "tested_scope": "Gameplay verified by live user testing through Steam; older saves, sleep-to-save and day-2 reload after a clean VM reboot tested. Loading times remain slow and variable. [Results](docs/stardew-native64.md)",
+      "distribution_route": "user-owned-import",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Torchlight II",
+      "tested_version": "1.26.0.1 native64",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Character creation, 3D gameplay, movement, save/resume and captured audio in a controlled engine launch; requires a UTF-8 locale archive and an active Steam session. The mod launcher can stall waiting for Steam. [Results](docs/three-games-checkpoint-20261026.md)",
+      "distribution_route": "user-owned-import",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Factorio demo",
+      "tested_version": "2.1.23 Linux x64",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Tutorial gameplay, movement, fresh save/reload, captured audio and normal exit verified through hardware VirGL; low-memory graphics settings required, startup about 73 seconds. [Results](docs/three-games-checkpoint-20261026.md)",
+      "distribution_route": "publisher-download-only",
+      "licence_summary": "proprietary demo; personal publisher download only",
+      "evidence": "README.md compatibility table and linked workload reports",
+      "installer": "installers/factorio-demo.py; base runtime acceptance pending"
+    },
+    {
+      "name": "Warzone 2100",
+      "tested_version": "4.7.0 native64",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Hardware VirGL tutorial/campaign rendering, unit input, fresh campaign save/reload, captured audio and normal exit verified. [Results](docs/three-games-checkpoint-20261026.md)",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "GPL code plus separately licensed assets",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "D3D12 / VKD3D-Proton",
+      "tested_version": "3.1.0",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Hardware shader/readback, event fences, 720p swapchain resize, Windows SDL3 Snake and Veloren 3D singleplayer through Proton GE. Per-game native shader compiler required for Veloren. [Results and screenshots](docs/d3d12.md)",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "SpaceVenture (Windows)",
+      "tested_version": "2.08.12 / Unity 2022.3",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "D3D11/DXVK main menu, opening sequence and first-room interaction; clocked ALSA PCM captured. [Screenshot and limits](docs/wine-unity.md#spaceventure--unity-2022362f2)",
+      "distribution_route": "user-owned-import",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Helltaker (Windows)",
+      "tested_version": "Unity 2019.2.9f1",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "720p D3D11/DXVK first-puzzle gameplay, keyboard movement/restart, minimize/restore and normal exit; clocked ALSA audio captured. [Screenshot and scope](docs/wine-unity.md)",
+      "distribution_route": "publisher-download-only",
+      "licence_summary": "component-specific; source/notice audit required",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Qalculate!",
+      "tested_version": "—",
+      "compatibility": "✅ Working",
+      "tested_scope": "GTK3 calculator via Wayland (CSD decorations)",
+      "distribution_route": "base-image",
+      "licence_summary": "GPL-2.0-or-later",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "GIMP",
+      "tested_version": "3.0.8",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Painting, XCF save/reopen (including cold boot) and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults",
+      "distribution_route": "base-image",
+      "licence_summary": "GPL-3.0-or-later",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "LibreOffice",
+      "tested_version": "25.8.5.2",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Writer save/reopen across cold boot and full native-close cleanup verified as Brook; startup and broader suite coverage remain experimental",
+      "distribution_route": "optional-open-source; component/asset audit required",
+      "licence_summary": "MPL-2.0 / LGPL / Apache components",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "VLC",
+      "tested_version": "3.0.23-2",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "720p OSS playback; Wayland black flashes fixed; cold 55-second minimize/restore, normal close and SIGKILL audio cleanup verified; audio timing still experimental",
+      "distribution_route": "base-image",
+      "licence_summary": "GPL-2.0-or-later (player); LGPL (libVLC); dependency terms also apply",
+      "evidence": "README.md compatibility table and linked workload reports"
+    },
+    {
+      "name": "Mousepad",
+      "tested_version": "0.7.0",
+      "compatibility": "editing tested",
+      "distribution_route": "base-image",
+      "licence_summary": "GPL-2.0-or-later"
+    },
+    {
+      "name": "Vim",
+      "tested_version": "9.2.0340",
+      "compatibility": "interactive ASCII edit/save/reopen and shell return tested",
+      "distribution_route": "base-image",
+      "licence_summary": "Vim"
+    },
+    {
+      "name": "Alpaca Stacka",
+      "compatibility": "launch attempted; loading/performance remains unresolved",
+      "distribution_route": "Steam user download only",
+      "licence_summary": "proprietary freeware; no game payload bundled"
+    },
+    {
+      "name": "Quake III Arena",
+      "compatibility": "gameplay/mouse capture and audio tested; low FPS remains",
+      "distribution_route": "open engine optional; user-owned game data only",
+      "licence_summary": "GPL engine; proprietary maps/art/audio"
+    },
+    {
+      "name": "Freedoom",
+      "compatibility": "not accepted with this image yet; do not inherit original DOOM data acceptance",
+      "distribution_route": "optional-open-source; validate before inclusion",
+      "licence_summary": "BSD-3-Clause"
+    },
+    {
+      "name": "Half-Life / Left 4 Dead",
+      "compatibility": "32-bit requirements prevent current native64 acceptance",
+      "distribution_route": "not-in-image",
+      "licence_summary": "proprietary; user purchase/download only"
+    },
+    {
+      "name": "Graveyard Keeper",
+      "compatibility": "proposed, not accepted",
+      "distribution_route": "not-in-image",
+      "licence_summary": "proprietary; user purchase/download only"
+    }
+  ],
+  "image_profile": "nix/release-packages.nix",
+  "image_status": "private candidate; corresponding-source and notice review incomplete"
+}
