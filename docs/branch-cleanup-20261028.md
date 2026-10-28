@@ -6,10 +6,12 @@ historical comparison worktrees are detached and are left untouched.
 
 Audited 29 non-main local branches and 68 non-main remote branches. Of these
 97 refs, 76 are ancestors of main. The other 21 refs resolve to 20 distinct
-archive names (one local/remote duplicate). Deleted the 23 merged local and 53 merged remote branch names. The six
-unmerged local and 15 unmerged remote branches remain pending explicit
-approval: automatic review rejected the original combined deletion. Unique
-history is also preserved with the published annotated remote tags below.
+archive names (one local/remote duplicate). Deleted the 23 merged local and 53 merged remote branch names. Automatic review initially rejected the unmerged portion. The user then
+explicitly approved removing every remaining remote branch except substantial
+SMBus work. A second exact-tip atomic push removed 14 more remote branches.
+Only `main` and `feature/i2c-driver` remain remotely. Six local experimental
+branches are still retained; the follow-up authorization specifically names
+remote branches. Unique history is preserved with the published archive tags below.
 This is a namespace cleanup, not acceptance or merging of those experiments.
 
 Ancestry was checked with `git merge-base --is-ancestor`; unmerged refs were
@@ -18,7 +20,7 @@ feature is present, and patch-unique commits are not automatically valuable.
 The older selective-recovery assessment in [branch-recovery.md](branch-recovery.md)
 and its REC backlog remain relevant.
 
-## What remains worth recovering selectively
+## Historical recovery candidates (not an active recovery queue)
 
 - `diag/bro208-switch-txn`: 69 patch-distinct commits, including crash/profiler
   tools, read-ahead and old input/window work. It also changes the graphics and
@@ -34,7 +36,16 @@ and its REC backlog remain relevant.
   are historical references. Compare against today's implementation first.
 - The old FPU-state and profiler-fsync fixes are patch-equivalent to main.
 
-No unique tip is discarded merely because its branch name looks obsolete.
+BRO-208 is closed by owner direction. Its old issue database was lost with the
+workspace; these records and code comments are historical provenance, not an
+open bug or a requirement to reconstruct the old tracker. The owner considers
+the project to have moved beyond the other archived recovery candidates.
+
+The SMBus branch is retained: commit `8ec318a0` adds 353 implementation lines
+and a 40-line public header for Intel i801 PCI discovery, quick/byte/word
+transactions, timeout handling, scanning and SPD readout. It is substantial
+source work, not an accepted hardware driver. Its hard-coded TSC delay and
+legacy tick assumptions need review before integration/testing.
 
 ## Recovery tags
 
@@ -67,11 +78,11 @@ removed by this cleanup. Completed remote deletion used exact-tip leases and an 
 push; archive publication was a separate successful non-destructive push.
 The rejected combined operation did not execute.
 
-## Pending branch-name deletion approval
+## Original unmerged inventory (approval resolved for remote branches)
 
-All of these tips have published archive tags above. Deleting the branch names
-would retain their code in those tags. The local ext2 branch and its remote
-counterpart share a tip. Other worktrees and disk images remain untouched.
+All tips below have published archive tags. All listed remote branch names
+except `feature/i2c-driver` have now been deleted with owner approval. The six
+listed local branch names remain. Other worktrees and disk images are untouched.
 
 - `refs/heads/experiment/ext2-indirect-batching-20261015` at `a8e02e50d0e9`
 - `refs/heads/wip/fenced-detach-experiment-20261022` at `031e2d482afe`

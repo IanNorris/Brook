@@ -1,5 +1,15 @@
 # Recovery and VM-control backlog
 
+### Historical branch disposition (28 October 2026)
+
+BRO-208 is closed by owner direction; its deleted issue database will not be
+reconstructed. Historical BRO-208 references are provenance, not an open issue.
+The old branch-recovery candidates are archived references rather than active
+work: the owner approved deleting all remote branches except main and the
+substantial Intel i801 SMBus prototype. Retain that prototype for later hardware
+work, with timing and hardware validation before integration. See the
+[completed branch audit](branch-cleanup-20261028.md).
+
 ### Optional Java desktop workload: muCommander (28 October 2026)
 
 Defer muCommander: the user does not want Java added as a dependency for the
