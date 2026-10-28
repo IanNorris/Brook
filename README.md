@@ -14,10 +14,10 @@
 ---
 
 <p align="center">
-  <a href="docs/images/brook_quake2_gl3_demo_1080.png"><img src="docs/images/brook_quake2_gl3_demo_1080.png" alt="Quake II's Installation demo running through hardware virgl GL3 on Brook in a 1600 by 800 game window" width="960"></a>
+  <a href="docs/images/brook_quake3_rounded_glass_1080.png"><img src="docs/images/brook_quake3_rounded_glass_1080.png" alt="Quake III Arena demo running through hardware VirGL on Brook with rounded dark glass chrome" width="960"></a>
 </p>
 
-<p align="center"><em>Quake II's Installation demo through hardware virgl GL3 — a 1600×800 game window on Brook's native 1920×1080 desktop</em></p>
+<p align="center"><em>Quake III Arena demo through hardware VirGL, with rounded dark glass chrome on Brook's native 1920×1080 desktop</em></p>
 
 ## What is Brook?
 
