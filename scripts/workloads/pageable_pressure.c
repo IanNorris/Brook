@@ -75,6 +75,9 @@ int main(int argc,char** argv) {
         assert(munmap(hogs[h],RegionBytes)==0);
     }
     assert(ctl(2,0)==0 && ctl(6,0)==0 && ctl(14,1)==0 && ctl(14,2)==0);
+    // Healthy soft-target turnover must reuse the retired victim directly,
+    // leaving the eight emergency frames available for a subsequent process.
+    assert(reserve==8 && ctl(7,0)==8);
     qsort(samples,sample,sizeof(samples[0]),order);
     printf("PRESSURE_PAGED_PASS dataset_mib=256 held_pages=%ld stored_pages=%ld reserve=%ld min_free_pages=%ld fill_ns=%llu scan_ns=%llu page_verify_p50_ns=%llu p95_ns=%llu max_ns=%llu ram_slots=%ld disk_slots=%ld arena_capacity=%ld arena_allocated=%ld payload_bytes=%ld fallbacks=%ld cleanup_slots=0 cleanup_pool=0\n",held,stored,reserve,minFree,(unsigned long long)fill,(unsigned long long)scan,(unsigned long long)samples[sample/2],(unsigned long long)samples[sample*95/100],(unsigned long long)samples[sample-1],ramSlots,diskSlots,capacity,allocated,payload,fallbacks);
 }

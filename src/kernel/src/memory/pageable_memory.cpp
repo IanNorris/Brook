@@ -171,7 +171,11 @@ int64_t Map(Process* actor,uint64_t length,bool lazy=false) {
     request.length=length;request.preparedPages=lazy?0:pages;request.prepare=lazy?nullptr:Prepare;
     return UserMappingCreate(actor,space,request);
 }
-int64_t PageOut(Process* actor,uint64_t page) {
+// An optional handoff consumes the sole retained victim reference only after
+// stable storage and full TLB retirement. Same-AS fault reclaim can reuse it
+// directly without first discarding a frame into an already-full reserve.
+int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr) {
+    if(handoff)*handoff={};
     if(page&4095)return -22;
     auto* space=actor->addressSpace;
     if(!space->pagingAdmission.Exclusive())return -95;
@@ -217,7 +221,9 @@ int64_t PageOut(Process* actor,uint64_t page) {
         entry.state=State::Stored;
         --static_cast<Region*>(backing.value->object)->heldFrames;
         KMutexUnlock(&space->mutation);
-        ReturnReserveFrame(frame.physical);frame.physical={};return 4096;
+        if(handoff)*handoff=frame.physical;
+        else ReturnReserveFrame(frame.physical);
+        frame.physical={};return 4096;
     }
     slot.token=entry.slot;entry.slot=0;
     if(!rejectRollback && VmmTryMapPage(space->pageTable,VirtualAddress(page),frame.physical,Flags(*range),
@@ -258,7 +264,8 @@ uint64_t HeldFrames(AddressSpaceState* space) {
 // One finite traversal, in batches of at most 64 metadata/page visits. A sole
 // admitted task cannot concurrently add ranges; never retain a range pointer
 // across unlock/yield/I/O. At most one victim write is attempted per call.
-int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false) {
+int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false,PhysicalAddress* handoff=nullptr) {
+    if(handoff)*handoff={};
     auto* space=actor->addressSpace;
     uint64_t flags;__asm__ volatile("pushfq; popq %0":"=r"(flags));
     if(!(flags&512))return -16; // no sleeping/I/O from an interrupt-disabled caller
@@ -298,7 +305,7 @@ int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false) {
             victim=page;break;
         }
         KMutexUnlock(&space->mutation);
-        if(victim)return PageOut(actor,victim); // authoritative admission recheck
+        if(victim)return PageOut(actor,victim,handoff); // authoritative admission recheck
         if(done)return -12;
         SchedulerYield();__asm__ volatile("sti":::"memory");
     }
@@ -418,13 +425,13 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     op.Unlock();
     if(!op.Prepare(0,1))return MappingFaultResult::OutOfMemory;
     bool reclaimAttempted=softPressure && initialState!=State::Recovery;
-    bool reclaimed=reclaimAttempted && ReclaimOne(actor,page,true)==4096;
+    if(reclaimAttempted)(void)ReclaimOne(actor,page,true,&recovery.physical);
     PhysicalAddress physical=recovery.physical;
-    if(!physical && reclaimed && reserve.Take(space->allocationPid)){physical=reserve.physical;PmmRefPage(physical);}
     if(!physical)physical=AllocateFaultFrame(space->allocationPid);
     if(!physical && reserve.Take(space->allocationPid)){physical=reserve.physical;PmmRefPage(physical);}
     if(!physical && !reclaimAttempted && allowReclaim && actor->addressSpace==space) {
-        reclaimAttempted=true;reclaimed=ReclaimOne(actor,page)==4096;
+        reclaimAttempted=true;(void)ReclaimOne(actor,page,false,&recovery.physical);
+        physical=recovery.physical;
     }
     if(physical) {
         if(!op.StagePage(0,physical,true)){PmmUnrefPage(physical);recovery.physical={};return MappingFaultResult::OutOfMemory;}

@@ -711,3 +711,33 @@ TLB-retired same-AS victim directly to its fault transaction, then address
 bounded healthy refill for genuine emergency consumption. The sequential failure
 is retained as `builtin-accept/after-pressure-reserve.json`; no full reserve-
 recovery or whole-goal completion is claimed by this codec checkpoint.
+
+## Fault-driven victim handoff and sequential reserve retention
+
+Successful same-AS fault-driven reclaim now transfers its retained victim frame
+directly to the fault transaction after storage and TLB acknowledgement. Explicit
+pageout still returns detached frames to the reserve. The incoming transaction
+stages the handed-off reference before fallible snapshot refresh; cancellation,
+failed decode and rejected publication retire it once, while both stored copies
+remain authoritative. Existing Recovery frames do not enter this reclaim branch.
+No new allocation, buffer, refcount-based eviction rule or lock across I/O is
+introduced. This fixes the healthy soft-turnover reserve consumption above.
+
+The pressure fixture now asserts all eight reserve frames are available both
+during its steady state and after cleanup. A new `pageable_handoff.c` regression
+exhausts the reserve, forces allocation failure, verifies successful direct
+reuse, then rejects target publication after a successful victim write through
+a leased user-copy operation. It checks both stored byte copies, released leases,
+subsequent recovery and explicit reserve replenishment. Raw and compressed
+variants are tested separately. Genuine emergency borrowing can still transfer
+reserve capacity into resident PTEs; bounded healthy-memory refill of that case
+remains open rather than being inferred from ordinary unmap/quarantine.
+
+Use `nix-shell --run 'scripts/build_paging_probes.sh'` to rebuild every paging
+probe from the current source. In particular, pageable_memory, pageable_reserve
+and pageable_reclaim inject raw device callbacks and require the RAM tier off;
+pageable_compressed explicitly spills RAM payloads before testing disk failures.
+The working-set probe selects its raw-only failure expectations at runtime.
+Do not reuse pre-compression fixture binaries with a RAM-enabled kernel.
+Evidence: `compressed-image-benchmark/handoff-current-compressed-v2/` and
+`handoff-current-raw/`, with the exact kernel/probe hashes in handoff-metadata.json.
