@@ -227,3 +227,40 @@ visually checked after theme transitions settled. Main and the VM are unchanged.
 
 Private build/test artifacts are under `build/raven-*` and `build/glass-*`.
 The upstream reference checkout remains ignored under `build/references/Raven`.
+
+
+## Native rounded material pass — 28 October 2026
+
+![Native rounded dark chrome](native-rounded-dark.png)
+
+This is an actual Brook GPU-composited desktop capture, rather than the browser
+concept. The dark material now has antialiased seven-logical-pixel upper corners,
+a smooth title highlight, an active-window bright rim and a tighter, darker
+shadow. The client textures remain rectangular: lower rounding is confined to
+the two-logical-pixel owned border. Maximized and Performance-mode frames keep
+square corners. Matching the concept's overall translucency and saturation is
+still a visual refinement to pursue.
+
+The roughly 2 KiB material cache holds both focus variants, tint rows and
+supersampled corner masks. Palette, opacity and display-scale changes rebuild
+it; focus changes reuse it. Rims and masks are baked into the existing chrome
+texture when it is repainted, with no additional chrome draw quads. Backdrop
+blur still reflects the live scene and uses at most six titlebar bands. Dragging
+still incurs the existing chrome-atlas repaint/upload; this pass does not
+replace that architecture. `gpu glass status` reports `material_cache_rebuilds`.
+
+Three two-second captures per build, using the Intel render node, eight vCPUs,
+8 GiB and matching overlapping Files/Mousepad/Settings windows, measured about
+11.1 ms mean compositor frame-body time before and 11.3 ms after. The small
+ordered-comparison difference was largely fence/presentation waiting, not a GPU
+execution measurement or proof of a causal regression. No desktop, chrome or
+cursor texture uploads occurred in the steady captures, and the material cache
+did not rebuild. Existing telemetry overlay uploads continued.
+
+Kernel builds, entry/scheduler audits and host material tests passed, including
+100/150/200% mask invariants, straight-alpha blending and the six-band budget.
+Live palette, opacity and scale changes each rebuilt exactly once; unchanged
+settings and Performance-mode toggles did not rebuild the cache. A native
+visual review at 100% found readable text and no obvious corner halos or gaps.
+Local measurement artifacts are under
+`build/reviews/rounded-glass-20261028/{control,candidate}`.

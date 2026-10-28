@@ -4440,6 +4440,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("appearance",WmGetAppearance());
         r.text(",");r.field("effective_opacity",CompositorGlassActive()?CompositorMaterialOpacity():255);
         r.text(",");r.field("effective_blur_strength",CompositorGlassActive()?CompositorMaterialBlur():0);
+        r.text(",");r.field("material_cache_rebuilds",WmMaterialCacheRebuilds());
         r.text(",\"scope\":\"Material change applied at the next compositor frame boundary; GPU compositor remains unchanged\"}\n");r.send();
     }
     else if(NetStrEq(cmd,"gpu frame timing on") || NetStrEq(cmd,"gpu frame timing off") ||

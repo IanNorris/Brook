@@ -1640,11 +1640,11 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
     // Top strip = solid top border (WmMetric(WM_BORDER_WIDTH) rows) + glassy titlebar.
     int topBorderH = (int)WmMetric(WM_BORDER_WIDTH);
     int titleBarH  = (cy - oy) - topBorderH;          // == WmMetric(WM_TITLE_BAR_HEIGHT)
-    setAlpha(ox, oy, ow, topBorderH, 0xFF);                              // top border (solid)
+    setAlpha(ox, oy, ow, topBorderH, 0xFF,glass);
     setAlpha(ox, oy + topBorderH, ow, titleBarH, glass?CompositorMaterialOpacity():255,glass); // titlebar (glass)
-    setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF);             // bottom border (solid)
-    setAlpha(ox, cy, cx - ox, ch, 0xFF);                                // left border (solid)
-    setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF);
+    setAlpha(ox, cy + ch, ow, (oy + oh) - (cy + ch), 0xFF,glass);
+    setAlpha(ox, cy, cx - ox, ch, 0xFF,glass);
+    setAlpha(cx + cw, cy, (ox + ow) - (cx + cw), ch, 0xFF,glass);
     if(glass) {
         const uint32_t fg=w.focused?WmCurrentPalette().text:WmCurrentPalette().mutedText;
         for(int y=oy+topBorderH;y<cy;++y)for(int x=ox;x<ox+ow;++x) {
@@ -1655,17 +1655,19 @@ static void SetChromeDecorAlpha(const Window& w, bool glass)
         }
     }
     if(glass && w.state!=WindowState::Maximized && !w.blurRadius) {
-        const unsigned radius=WmMetric(5);
-        const uint32_t edge=w.focused?WmCurrentPalette().borderActive:WmCurrentPalette().titleInactive;
-        for(unsigned row=0;row<radius;++row){const unsigned inset=ChromeCornerInset(radius,row);
-            for(unsigned corner=0;corner<4;++corner){
+        const auto& material=WmChromeMaterial();
+        if(ow>=int(material.top.radius*2)&&oh>=int(material.top.radius*2))
+        for(unsigned corner=0;corner<4;++corner){
+            // Client textures remain rectangular. Bottom masks stop within
+            // the owned border rather than pretending to clip client pixels.
+            const auto& mask=corner<2?material.top:material.bottom;
+            for(unsigned row=0;row<mask.radius;++row)for(unsigned col=0;col<mask.radius;++col){
                 const int y=corner<2?oy+int(row):oy+oh-1-int(row);
-                const bool right=corner&1;
-                for(unsigned col=0;col<inset;++col){const int x=right?ox+ow-1-int(col):ox+int(col);
-                    if(x>=0&&y>=0&&x<int(g_physFbWidth)&&y<int(g_physFbHeight))g_chromeBuffer[uint64_t(y)*g_backBufStride+x]=0;}
-                const int x=right?ox+ow-1-int(inset):ox+int(inset);
-                if(w.focused && inset && x>=0&&y>=0&&x<int(g_physFbWidth)&&y<int(g_physFbHeight))
-                    g_chromeBuffer[uint64_t(y)*g_backBufStride+x]=0xc0000000|edge;
+                const int x=(corner&1)?ox+ow-1-int(col):ox+int(col);
+                if(x<0||y<0||x>=int(g_physFbWidth)||y>=int(g_physFbHeight))continue;
+                auto& pixel=g_chromeBuffer[uint64_t(y)*g_backBufStride+x];
+                const uint32_t rim=material.rims[w.focused][corner<2?(row<mask.radius/2?0:1):2];
+                pixel=ChromeMaskedRim(pixel,mask.coverage[row][col],mask.inner[row][col],rim);
             }
         }
     }
@@ -3060,13 +3062,21 @@ static void GpuComposeRectBlur(const GpuCompositorOps* gpu, int x, int y, int wd
 
 static void GpuComposeTitleBlur(const GpuCompositorOps* gpu,const Window* w) {
     const int height=w->clientY()-w->y,width=w->outerWidth();
-    const unsigned radius=w->state==WindowState::Maximized?0:WmMetric(5);
+    const auto& mask=WmChromeMaterial().top;
+    const unsigned radius=w->state==WindowState::Maximized||width<int(mask.radius*2)?0:mask.radius;
+    if(!radius){GpuComposeRectBlur(gpu,w->x,w->y,width,height);return;}
+    // At most five corner bands plus the body: retain the existing GPU quad
+    // budget. Conservative insets leave a sharp rim, never an opaque halo
+    // outside the antialiased material. Masks/tints are cached, scene blur is live.
+    const unsigned step=(radius+4)/5;
     unsigned row=0;
-    while(row<unsigned(height)){
-        const unsigned inset=ChromeCornerInset(radius,row);unsigned next=row+1;
-        while(next<unsigned(height) && ChromeCornerInset(radius,next)==inset)++next;
+    while(row<radius && row<unsigned(height)){
+        const unsigned inset=mask.inset[row];unsigned next=row+step;
+        if(next>radius)next=radius;
+        if(next>unsigned(height))next=height;
         GpuComposeRectBlur(gpu,w->x+inset,w->y+row,width-2*inset,next-row);row=next;
     }
+    if(row<unsigned(height))GpuComposeRectBlur(gpu,w->x,w->y+row,width,height-row);
 }
 
 // Frosted backdrop under a window's whole outer rect (full-window glass): the

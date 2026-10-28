@@ -50,6 +50,33 @@ int main(){
     }
     // Shadows have a transparent client hole and clean tile edges, with no
     // hidden opaque centre that could darken translucent chrome repeatedly.
+    brook::ChromeMaterialCache material;
+    for(unsigned scale:{100u,150u,200u}){
+        const unsigned radius=(7*scale+50)/100,height=36*scale/100;
+        assert(material.Ensure(0x28466f,0x253851,204,height,radius,2*scale/100));
+        const auto saved=material.rows[1][0];
+        for(unsigned frame=0;frame<120;++frame)
+            assert(!material.Ensure(0x28466f,0x253851,204,height,radius,2*scale/100));
+        assert(saved==material.rows[1][0]);
+        unsigned bands=1;
+        for(unsigned row=0;row<radius;row+=(radius+4)/5)++bands;
+        assert(bands<=6);
+        bool partial=false;
+        for(unsigned y=0;y<radius;++y)for(unsigned x=0;x<radius;++x){
+            auto coverage=material.top.coverage[y][x];
+            assert(coverage==material.top.coverage[x][y]);
+            assert(material.top.inner[y][x]<=coverage);
+            partial|=coverage>0&&coverage<255;
+            const auto pixel=brook::ChromeMaskedRim(0xcc28466f,coverage,material.top.inner[y][x],0xe6ddeeff);
+            if(!coverage)assert(pixel==0);
+            assert((pixel>>24)<=coverage);
+        }
+        assert(partial);
+    }
+    assert(material.Ensure(0xd4e3f5,0xd0d9e4,102,72,14,4));
+    assert((material.rows[1][0]>>24)==102);
+    assert(brook::ChromeMaskedRim(0xcc28466f,255,255,0xffffffff)==0xcc28466f);
+    assert(brook::ChromeMaskedRim(0xcc28466f,255,0,0xe6ddeeff)==0xe6ddeeff);
     for(unsigned y=0;y<64;++y)for(unsigned x=0;x<64;++x){
         const auto alpha=brook::ChromeShadowPixel(x,y)>>24;
         if(x>=21&&x<43&&y>=16&&y<48)assert(alpha==0);

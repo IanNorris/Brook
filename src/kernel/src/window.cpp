@@ -1605,6 +1605,17 @@ static uint32_t WmMaterialColor(uint32_t color){
     return (color&0xffffff)|(CompositorGlassActive()?CompositorMaterialOpacity()<<24:0xff000000u);
 }
 
+static ChromeMaterialCache g_chromeMaterial;
+static uint64_t g_materialRebuilds=0;
+const ChromeMaterialCache& WmChromeMaterial(){
+    const auto& p=WmCurrentPalette();
+    if(g_chromeMaterial.Ensure(p.titleActive,p.titleInactive,CompositorMaterialOpacity(),
+                              WmMetric(WM_TITLE_BAR_HEIGHT),WmMetric(7),WmMetric(WM_BORDER_WIDTH)))
+        __atomic_add_fetch(&g_materialRebuilds,1,__ATOMIC_RELAXED);
+    return g_chromeMaterial;
+}
+uint64_t WmMaterialCacheRebuilds(){return __atomic_load_n(&g_materialRebuilds,__ATOMIC_RELAXED);}
+
 static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
                                 uint32_t screenW, uint32_t screenH,
                                 const Window& w,
@@ -1622,10 +1633,11 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
     WmFillRect(buf, stride, screenW, screenH, w.x, w.y + oh - border, ow, border, edge);
     const int tx = w.x + border, ty = w.y + border;
     const bool material=CompositorGlassActive();
+    const auto* cached=material?&WmChromeMaterial():nullptr;
     const int titleH=WmMetric(WM_TITLE_BAR_HEIGHT);
     for(int row=0;row<titleH;++row)
         WmFillRect(buf,stride,screenW,screenH,tx,ty+row,w.clientW,1,
-            material?WmMaterialColor(ChromeTitleColor(bg,row,titleH)):bg);
+            material?cached->rows[w.focused][row]:bg);
     // A restrained one-pixel edge replaces the old heavy double outline.
     if(border>1){
         WmFillRect(buf,stride,screenW,screenH,w.x+1,w.y+1,ow-2,border-1,bg);
@@ -1633,7 +1645,14 @@ static void RenderWindowChrome(uint32_t* buf, uint32_t stride,
         WmFillRect(buf,stride,screenW,screenH,w.x+ow-border,w.y+border,border-1,oh-2*border,bg);
         WmFillRect(buf,stride,screenW,screenH,w.x+1,w.y+oh-border,ow-2,border-1,bg);
     }
-    WmFillRect(buf,stride,screenW,screenH,tx,ty+titleH-1,w.clientW,1,ChromeMix(bg,0xffffff,32));
+    if(material){
+        WmFillRect(buf,stride,screenW,screenH,w.x,w.y,ow,1,cached->rims[w.focused][0]);
+        WmFillRect(buf,stride,screenW,screenH,w.x,w.y+1,1,oh-2,cached->rims[w.focused][1]);
+        WmFillRect(buf,stride,screenW,screenH,w.x+ow-1,w.y+1,1,oh-2,cached->rims[w.focused][1]);
+        WmFillRect(buf,stride,screenW,screenH,w.x,w.y+oh-1,ow,1,cached->rims[w.focused][2]);
+    }
+    WmFillRect(buf,stride,screenW,screenH,tx,ty+titleH-1,w.clientW,1,
+               material?cached->rims[w.focused][2]:ChromeMix(bg,0xffffff,32));
     // Active identity stroke: keep the hit-test geometry and client opacity.
     if (w.focused) WmFillRect(buf,stride,screenW,screenH,tx+WmMetric(12),ty,
         w.clientW>WmMetric(184)?WmMetric(160):w.clientW/2,WmMetric(4),0x0068ACFF);
