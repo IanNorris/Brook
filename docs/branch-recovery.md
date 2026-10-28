@@ -1,5 +1,10 @@
 # Surviving branch audit — 14 October 2026
 
+Update: merged legacy branch names were removed on 28 October; unmerged
+tips were archived, with their branch names retained pending approval. See
+[the cleanup inventory](branch-cleanup-20261028.md) for preserved tags and recovery.
+The historical unmerged branches below also have recovery tags.
+
 Follow-up investigations are now tracked in [backlog.md](backlog.md), deferred
 while VM-only MCP control is the active development focus.
 

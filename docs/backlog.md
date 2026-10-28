@@ -48,6 +48,22 @@ Double Commander's GTK2 build would add an older toolkit/X11 path.
   test uses independently hashed byte copies; identify the exact unsupported
   syscall before changing metadata or extended-attribute semantics.
 
+- Prioritize a bounded memory-reclaim and compression design (28 October).
+  Use resident pages → bounded LZ4 compressed-RAM pool → disk backing for cold
+  anonymous pages. Start with explicit reclaim/fault-in controls before an
+  automatic background policy. Define backing-slot ownership and concurrent
+  fault/exit/unmap/CoW behavior, TLB invalidation and publication before freeing
+  frames. Exclude pinned/DMA/kernel/device pages initially; reserve fault-in and
+  I/O resources so reclaim can progress under pressure. Reject incompressible
+  entries without retry loops; bound metadata, pool occupancy and CPU work.
+  Test byte integrity, exhaustion, process teardown and mixed-app responsiveness.
+  Separately prototype indexed LZ4 immutable Nix-store blocks for fewer disk
+  bytes. Filesystem compression alone does not compress resident app pages or
+  a decompressed page cache; share the codec, not backing/lifetime semantics.
+  Avoid double-compressing swap data and routing critical swap I/O through a
+  filesystem path that needs the memory being reclaimed. See the existing
+  storage-compression item below for crash-consistency and measurement gates.
+
 - Explore paging to disk after the immediate startup/save-load work. Design
   reclaim and page-fault I/O with bounded memory usage, forward progress under
   pressure, safe handling of pinned/DMA/kernel pages, and an explicit swap disk
