@@ -673,6 +673,7 @@ static int parse_desktop_entry(const char *path, char *name, size_t name_sz,
             snprintf(categories, cat_sz, "%s", line + 11);
         else if (strncmp(line, "Hidden=true", 11) == 0) { fclose(f); return -1; }
         else if (strncmp(line, "NoDisplay=true", 14) == 0) { fclose(f); return -1; }
+        else if (strcmp(line, "Terminal=true") == 0) { fclose(f); return -1; }
         else if (strncmp(line, "Type=", 5) == 0 && strcmp(line + 5, "Application") != 0)
             { fclose(f); return -1; }
     }
@@ -813,12 +814,30 @@ static void refresh_desktop_entries(void)
                 char wrapper[1200];
                 snprintf(wrapper, sizeof(wrapper), BROOK_BIN "/brook-%s",
                          strcmp(program, "vscodium") == 0 ? "codium" : program);
+                if (access(wrapper, X_OK) != 0)
+                    snprintf(wrapper, sizeof(wrapper), PROFILE_BIN "/brook-%s",
+                             strcmp(program, "vscodium") == 0 ? "codium" : program);
                 if (access(wrapper, X_OK) != 0) continue;
                 char arguments[sizeof(exec_cmd)];
                 snprintf(arguments, sizeof(arguments), "%s", suffix);
                 const char *identity = strcmp(program, "chromium") == 0 ? "" : "--uid 1000 ";
                 if (strlen(identity) + strlen(wrapper) + strlen(arguments) >= sizeof(exec_cmd)) continue;
                 snprintf(exec_cmd, sizeof(exec_cmd), "%s%s%s", identity, wrapper, arguments);
+                break;
+            }
+
+            /* Preserve the profile's GUI environment after every install, not
+             * just in the host-generated initial index. Keep browsers/media
+             * above on their more specific compatibility launchers. */
+            const char *gui_programs[]={"gimp", "gimp-3.0", "mousepad", "openttd",
+                "qalculate-gtk", "gnome-commander", "thunar"};
+            for(size_t gi=0;gi<sizeof(gui_programs)/sizeof(gui_programs[0]);++gi) {
+                if(strcmp(base,gui_programs[gi]))continue;
+                const char *runtime=PROFILE_BIN "/brook-run";
+                if(access(runtime,X_OK)!=0)break;
+                char original[sizeof(exec_cmd)];snprintf(original,sizeof(original),"%s",exec_cmd);
+                if(strlen(runtime)+strlen(original)+13>=sizeof(exec_cmd))break;
+                snprintf(exec_cmd,sizeof(exec_cmd),"--uid 1000 %s %s",runtime,original);
                 break;
             }
 

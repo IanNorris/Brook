@@ -1261,6 +1261,9 @@ static void MoveWindowLocked(int idx, int16_t newX, int16_t newY)
     if (idx < 0 || idx >= static_cast<int>(WM_MAX_WINDOWS)) return;
     Window& w = g_windows[idx];
     if (!w.proc) return;
+    // CSD can maximize during a title drag; its old offset must not move the
+    // new desktop-sized surface away from the origin.
+    if (w.state == WindowState::Maximized) return;
     w.x = newX;
     w.y = newY;
     w.proc->fbDestX=w.clientX();w.proc->fbDestY=w.clientY();
@@ -2388,14 +2391,15 @@ static void LauncherWorker(void*)
             if(!available)result=-2;
             else if (desktop) {
                 char script[512];
-                const char* hdr = "set wm\nset vfb none\nrun --service --once /nix/bin/waylandd\nrun ";
+                // Helpers can fail independently of a successful app spawn.
+                ShellExecString("set wm\nset vfb none\nrun --service --once waylandd\n");
+                const char* hdr = "run ";
                 uint32_t si = 0;
                 while (*hdr && si < sizeof(script) - 2) script[si++] = *hdr++;
                 const char* exec = command;
                 while (*exec && si < sizeof(script) - 2) script[si++] = *exec++;
-                script[si++] = '\n';
                 script[si] = 0;
-                result = ShellExecString(script);
+                result = ShellLaunchCommand(script);
             } else result = ShellExecScript(command);
             self->launchId = previous;
             SpinLockAcquire(&g_launchLock);

@@ -39,6 +39,11 @@ class DesktopTests(unittest.TestCase):
             self.assertIn('VLC\tvlc --started-from-file\t', collect())
             wrapper.chmod(0o755)
             self.assertIn(f'VLC\t--uid 1000 {wrapper} --started-from-file\t', collect())
+            # Fresh images may deploy compatibility wrappers only in profile/bin.
+            fallback=root/'profile/bin/brook-vlc'
+            wrapper.rename(fallback)
+            self.assertIn(f'VLC\t--uid 1000 {fallback} --started-from-file\t',collect())
+            fallback.rename(wrapper)
             for command in (str(app), f'"{app}"'):
                 (root/'profile/share/applications/vlc.desktop').write_text(
                     f'[Desktop Entry]\nType=Application\nName=VLC\nExec={command} --started-from-file %U\n')
@@ -56,6 +61,16 @@ class DesktopTests(unittest.TestCase):
                 wrapper.write_text('#!/bin/sh\n'); wrapper.chmod(0o755)
                 identity = '' if program=='chromium' else '--uid 1000 '
                 self.assertIn(f'{program}\t{identity}{wrapper} --test-argument\t', collect())
+            runtime=root/'profile/bin/brook-run'
+            runtime.write_text('#!/bin/sh\n');runtime.chmod(0o755)
+            for program in ('gimp-3.0','mousepad','openttd','gnome-commander','thunar'):
+                executable=root/'profile/bin'/program
+                executable.write_text('#!/bin/sh\n');executable.chmod(0o755)
+                desktop=root/'profile/share/applications'/f'{program}.desktop'
+                desktop.write_text(f'[Desktop Entry]\nName={program}\nExec={program} --argument %U\n')
+                self.assertIn(f'{program}\t--uid 1000 {runtime} {program} --argument\t',collect())
+                desktop.write_text(desktop.read_text()+'Terminal=true\n')
+                self.assertNotIn(f'{program}\t',collect())
 
 
 if __name__ == '__main__':

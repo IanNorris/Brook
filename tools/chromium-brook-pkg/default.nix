@@ -1,7 +1,7 @@
 # Keep Chromium's ALSA recovery on the same clocked OSS route as Firefox.
-{ pkgs ? import ../../nix/nixpkgs.nix {} }:
+{ pkgs ? import ../../nix/nixpkgs.nix {}, downstreamStaging ? false }:
 let
-  audio = import ../alsa-oss-pkg { inherit pkgs; };
+  audio = import ../alsa-oss-pkg { inherit pkgs downstreamStaging; };
   config = pkgs.writeText "brook-chromium-asound.conf" ''
     pcm_type.oss {
       lib "${audio}/lib/alsa-lib/libasound_module_pcm_oss.so"

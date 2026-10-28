@@ -4,6 +4,8 @@ import http.client
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -14,11 +16,24 @@ spec.loader.exec_module(launch)
 
 
 class Portable(unittest.TestCase):
+    def test_startup_failure_includes_qemu_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / 'qemu.log'
+            with log_path.open('w') as log:
+                with subprocess.Popen(
+                    [sys.executable, '-c',
+                     'import sys; print("QEMU: display backend unavailable", file=sys.stderr); sys.exit(1)'],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True,
+                ) as proc:
+                    with self.assertRaisesRegex(RuntimeError, 'QEMU: display backend unavailable') as caught:
+                        launch.startup_qmp(proc, log_path)
+                    self.assertIn(str(log_path), str(caught.exception))
+
     def test_cross_isa_and_cpu_fallback(self):
         self.assertEqual(launch.accelerators('Darwin', 'arm64'), [('tcg', 'max')])
         self.assertEqual(launch.accelerators('Linux', 'x86_64'), [('kvm', 'host'), ('tcg', 'max')])
         self.assertEqual(launch.accelerators('Darwin', 'x86_64')[0], ('hvf', 'host'))
-        self.assertEqual(launch.accelerators('Windows', 'AMD64')[0], ('whpx', 'max'))
+        self.assertEqual(launch.accelerators('Windows', 'AMD64')[0], ('whpx', 'max,vmx=off'))
         cmd = launch.command('C:/QEMU λ, tools/qemu.exe', 'tcg', 'max', 2, 8192, 'none', 'none', 'a' * 32)
         self.assertEqual(cmd[0], 'C:/QEMU λ, tools/qemu.exe')
         self.assertNotIn('host', cmd)

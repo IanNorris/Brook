@@ -1,5 +1,13 @@
 # Recovery and VM-control backlog
 
+### Optional Java desktop workload: muCommander (28 October 2026)
+
+Defer muCommander: the user does not want Java added as a dependency for the
+current file-manager test. Revisit it as a separate Java/Swing compatibility
+workload, including its GUI runtime and X11/Wayland requirements. For this pass,
+consider GTK-native twin-panel alternatives: Sunflower or GNOME Commander;
+Double Commander's GTK2 build would add an older toolkit/X11 path.
+
 - Continue reducing Steam game startup cost after the 25 October hard-link
   and inode-index changes: one cold game-window observation improves from
   333.5 to 128.3 seconds, with data-image writes falling from 1.89 GiB to

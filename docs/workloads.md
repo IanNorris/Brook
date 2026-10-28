@@ -2753,3 +2753,53 @@ Local evidence: `build/workloads/boot-panic-analysis-652a01b7-20261018/`,
 including `analysis.json`, `probe-acceptance-audit.json` and stopped diagnostic
 session `027d5d03079946e4912be7924fb93acb`. The original panic disks remain
 failure evidence and were not reused as an accepted seed.
+
+### Minimal portable profile: regular-file epoll and audio (28 October 2026)
+
+The clean software-rendered profile reproduced GNOME Commander hanging before
+its first window. A one-second epoll counter sample recorded 240,040 zero-timeout
+calls in one worker, returning EPOLLIN|EPOLLET for a regular Vnode descriptor.
+Brook accepted the watch and repeatedly reported readiness. Linux rejects such
+watches with EPERM, allowing asynchronous libraries to select their file-I/O
+fallback. The correction rejects regular Vnodes, memfds and synthetic files,
+while retaining named-FIFO readiness; ADD/MOD event-copy checks remain first and
+DEL also rejects unsupported targets. Ordinary poll readiness is unchanged.
+
+`scripts/workloads/epoll_files.py` passes unchanged on Linux and Brook: regular
+files at EOF and with data, directories, memfds, proc files, unchanged interest
+lists, poll fallback and real named-FIFO readiness. All eleven eventfd-edge
+groups still pass. GNOME Commander then reached its first window in about 2.6
+host seconds with no worker epoll storm. GIMP reached its main/welcome windows;
+VM-only UI input created an image, saved a valid XCF and exited normally.
+The exact rebuilt image also lists a test file in both Commander panes with
+standard icons and closes normally; copy/rename acceptance remains separate.
+GTK icon and MIME assets
+were already in the closure but not exposed by the profile; the release profile
+now includes hicolor, Adwaita and shared-mime-info explicitly, adding no new
+asset payload to the prior closure.
+
+A local, generated continuous PCM tone exposed a separate Chromium audio issue.
+A five-second QEMU output capture contained 46.1% exact-zero stereo frames and
+zero spans up to 25.2 ms; media time advanced about 0.54 seconds per host second.
+Enabling the prospective 4096-frame downstream allowance without updating ALSA
+accounting did not fix it (46.0% zero frames in the repeated control).
+The downstream-aware OSS plugin plus that allowance preserved the application's
+2048-frame ring and 64-frame period, while allowing reusable client storage to
+advance independently of physical playback delay. Its five-second output had
+only isolated one-frame sine zero crossings, RMS 2827.9 for the 4000-peak source,
+and normal media-time progression. A fresh-profile run with normal autoplay
+policy required a real Play gesture and then produced the same continuous
+output. The plugin's 30 rate-negotiation and 32 playback cases passed.
+
+The minimal release profile opts into this plugin and its launcher supplies
+`opt/audio-staging-frames=4096`; other Chromium package callers retain their
+existing default. Windows listening and real-site playback remain separate
+acceptance. Private evidence is under `build/minimal-*`; no generated home,
+profiles, saved images or package-install test overlays are release inputs.
+A real guest `nix-install hello` completed and retained the correct browser,
+media and generic GUI wrappers in the refreshed desktop catalogue.
+
+The exact assembled release image also passed Opus output with the packaged
+Chromium configuration (no custom ALSA library/config), icon/MIME exports,
+compiler/Python/Git smoke, guarded restart, durable reopen and synced shutdown.
+The five-second Opus output had RMS 2840.4 and only isolated zero crossings.

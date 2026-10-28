@@ -3,7 +3,7 @@
 let
   fonts = import ../tools/brook-fonts-pkg {};
   cursors = import ../tools/brook-cursor-theme {};
-  chromium = import ../tools/chromium-brook-pkg { inherit pkgs; };
+  chromium = import ../tools/chromium-brook-pkg { inherit pkgs; downstreamStaging = true; };
   vlc = import ../tools/vlc-brook-pkg { inherit pkgs; };
   graphics = import ./runtime-graphics.nix { inherit pkgs; };
   native = map (name: let f = import (../tools + "/${name}"); in
@@ -45,7 +45,8 @@ let
     pkgs.bash pkgs.coreutils pkgs.curl.bin pkgs.xz.bin pkgs.zstd.bin pkgs.cacert
     pkgs.gnutar pkgs.unzip pkgs.python3 pkgs.gitMinimal pkgs.vim pkgs.tinycc
     pkgs.ffmpeg.bin pkgs.wayland graphics.mesaRuntime pkgs.tzdata
-    pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad pkgs.openttd
+    pkgs.hicolor-icon-theme pkgs.adwaita-icon-theme pkgs.shared-mime-info
+    pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad pkgs.openttd pkgs.gnome-commander
     chromium vlc fonts cursors launchers
   ] ++ native;
 in {

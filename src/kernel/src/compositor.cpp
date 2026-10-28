@@ -2441,6 +2441,7 @@ static bool    g_wmResizeTop     = false;
 static bool    g_wmResizeBottom  = false;
 static bool    g_wmLastBtnDown   = false;
 static bool    g_wmPrimaryDown   = false;
+static DesktopTitleClicks g_titleClicks;
 
 static void CompositorReconcilePointerCapture() {
     static uint64_t revision=0;
@@ -2448,6 +2449,7 @@ static void CompositorReconcilePointerCapture() {
     if(current==revision)return;
     revision=current;
     g_wmDragging=g_wmResizing=g_wmPrimaryDown=g_wmBtnLatch=g_wmBtnReleaseLatch=false;
+    g_titleClicks.Reset();
     g_desktopPointerGate.ownedButtons=0;
     g_wmLastBtnDown=(MouseGetButtons()&~WmPointerSuppressedButtons()&MOUSE_BTN_LEFT)!=0;
 }
@@ -2534,6 +2536,9 @@ static void CompositorHandleMouseWM()
 
     if (btnDown && !g_wmLastBtnDown)
     {
+        const auto captionHit=WmHitTest(mx,my);
+        if(WmLauncherVisible()||my>=static_cast<int32_t>(WmDesktopHeight(g_physFbHeight))||
+           captionHit.zone!=WmHitZone::TitleBar)g_titleClicks.Reset();
         DbgPrintf("WM: click at (%d,%d)\n", mx, my);
         // If launcher is open, check launcher panel first
         if (WmLauncherVisible())
@@ -2646,8 +2651,11 @@ static void CompositorHandleMouseWM()
                 break;
             case WmHitZone::TitleBar:
             {
-                // Start drag
-                CompositorBeginWindowMove(hit.windowIndex);
+                Window* w=WmGetWindow(hit.windowIndex);
+                if(w&&g_titleClicks.Press(w->creationIdentity,mx,my,ApicTickCount(),WmMetric(6))){
+                    g_wmDragging=false;g_wmDragWindow=-1;
+                    WmToggleMaximize(hit.windowIndex);
+                }else CompositorBeginWindowMove(hit.windowIndex);
                 break;
             }
             case WmHitZone::ResizeCorner:
@@ -2672,10 +2680,12 @@ static void CompositorHandleMouseWM()
     }
     else if (btnDown && g_wmDragging)
     {
-        // Continue drag
-        WmMoveWindow(g_wmDragWindow,
-                     static_cast<int16_t>(mx - g_wmDragOffsetX),
-                     static_cast<int16_t>(my - g_wmDragOffsetY));
+        g_titleClicks.Motion(mx,my);
+        const Window* dragged=WmGetWindow(g_wmDragWindow);
+        if(!dragged||dragged->state==WindowState::Maximized){g_wmDragging=false;g_wmDragWindow=-1;}
+        else WmMoveWindow(g_wmDragWindow,
+                         static_cast<int16_t>(mx - g_wmDragOffsetX),
+                         static_cast<int16_t>(my - g_wmDragOffsetY));
     }
     else if (btnDown && g_wmResizing)
     {

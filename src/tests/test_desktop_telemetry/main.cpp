@@ -4,10 +4,17 @@
 #include <cmath>
 #include "../../shared/brook_appearance.h"
 #include "../../shared/brook_taskbar.h"
+#include "../../kernel/src/desktop_pointer_route.h"
 #include "../../kernel/src/chrome_material.h"
 #include "../../kernel/src/desktop_telemetry.h"
 #include "../../shared/boot_splash.h"
 int main(){
+    brook::DesktopTitleClicks clicks;
+    assert(!clicks.Press(7,100,30,0,6));assert(clicks.Press(7,102,31,200,6));
+    assert(!clicks.Press(7,100,30,250,6));assert(!clicks.Press(8,100,30,300,6));
+    clicks.Reset();assert(!clicks.Press(8,100,30,400,6));
+    clicks.Motion(140,30);assert(!clicks.Press(8,100,30,500,6));
+    assert(!clicks.Press(8,100,30,1000,6));assert(clicks.Press(8,100,30,1300,6));
     assert(BROOK_TASKBAR_DEFAULT==(BROOK_TASKBAR_CPU|BROOK_TASKBAR_MEMORY));
     for(unsigned mask=0;mask<=BROOK_TASKBAR_ALL;++mask)assert(brook_taskbar_metrics_valid(mask));
     assert(!brook_taskbar_metrics_valid(64) && !brook_taskbar_metrics_valid(0xffffffffu));

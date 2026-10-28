@@ -9835,6 +9835,12 @@ static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t watchfd,
         if (!UserBufferReadable(eventAddr, sizeof(ev))) return -EFAULT;
         __builtin_memcpy(&ev, reinterpret_cast<const void*>(eventAddr), sizeof(ev));
     }
+    // Regular files have poll() readiness but cannot be watched by epoll.
+    // Accepting them produces perpetual readiness and prevents async runtimes
+    // from selecting their EPERM fallback. Named FIFOs use real pipe readiness.
+    if ((watchref->type == FdType::Vnode && !FdNamedFifo(watchref.get())) ||
+        watchref->type == FdType::MemFd || watchref->type == FdType::SyntheticMem)
+        return -EPERM;
     EpollWalkOwner state(proc);
     if (!state.walk) return -ENOMEM;
     EpollGraphGuard guard;

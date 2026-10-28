@@ -24,20 +24,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bundle', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--with-tools', action='store_true', help='Include optional MCP, installer and development/review files')
     args = parser.parse_args()
     bundle = args.bundle.resolve()
     manifest = json.loads((bundle / 'manifest.json').read_text())
-    required = ['brook.qcow2', 'OVMF_CODE.fd', 'OVMF_VARS.fd', 'launch.py', 'mcp.py',
+    required = ['brook.qcow2', 'OVMF_CODE.fd', 'OVMF_VARS.fd', 'launch.py',
                 'run-linux.sh', 'run-macos.command', 'run-windows.cmd', 'README.txt',
-                'software.json', 'BROOK-LICENSE.txt', 'manifest.json']
+                'BROOK-LICENSE.txt']
+    if args.with_tools:
+        required += ['mcp.py', 'software.json', 'manifest.json']
     for name, expected in manifest['files'].items():
         if Path(name).name != name or digest(bundle / name) != expected:
             raise ValueError('Candidate integrity mismatch: ' + name)
     paths = [bundle / name for name in required]
-    for name in ['ACCEPTANCE.txt', 'SOFTWARE-AND-TESTS.md']:
-        if (bundle / name).exists():
+    for name in ['ACCEPTANCE.txt', 'SOFTWARE-AND-TESTS.md', 'RELEASE-NOTES.txt', 'BROOK-CHANGES.patch']:
+        if args.with_tools and (bundle / name).exists():
             paths.append(bundle / name)
-    for name in ['installers', 'linux-development-bridge']:
+    for name in (['installers', 'linux-development-bridge'] if args.with_tools else []):
         for path in sorted((bundle / name).rglob('*')):
             if '__pycache__' not in path.parts and path.is_file() and path.suffix in ('.py', '.sh', '.json', '.nix', '.md', '.txt'):
                 if path.name == 'session.json' or path.is_symlink():

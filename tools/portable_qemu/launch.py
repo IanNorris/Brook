@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Portable Brook runner. Python 3.10+, host QEMU 8+, no third-party modules.
 
-QMP stays on the child's stdin/stdout. The optional local control endpoint is
-authenticated and exposes only VM operations, never host commands or raw QMP.
+The disk beside this script is writable: guest changes stay in that file.
+--mcp enables optional local control; ordinary launches need no setup.
 """
 import argparse
 import contextlib
-import hashlib
 import hmac
 import http.server
 import json
@@ -22,14 +21,6 @@ import sys
 import threading
 import time
 import uuid
-
-
-def sha(path):
-    digest = hashlib.sha256()
-    with open(path, 'rb') as stream:
-        for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 class QMP:
@@ -69,6 +60,29 @@ class QMP:
                     return reply['return']
 
 
+def startup_qmp(proc, log_path):
+    try:
+        return QMP(proc)
+    except Exception as exc:
+        # QMP EOF only describes the broken control channel. QEMU writes the
+        # useful startup failure (display, audio, firmware, etc.) to stderr.
+        with log_path.open('rb') as stream:
+            stream.seek(max(0, stream.seek(0, 2) - 8192))
+            detail = stream.read().decode('utf-8', errors='replace').strip()
+        raise RuntimeError(f'{exc}\nQEMU log: {log_path}\n' +
+                           (detail or '(No QEMU error output was recorded.)')) from exc
+
+
+def cpu_model(accel):
+    if accel in ('kvm', 'hvf'):
+        return 'host'
+    # Some WHPX/Hyper-V versions reject OVMF's IA32_FEATURE_CONTROL write
+    # when VMX is advertised. Brook does not require nested virtualization.
+    if accel == 'whpx':
+        return 'max,vmx=off'
+    return 'max'
+
+
 def accelerators(system=None, machine=None):
     system, machine = system or platform.system(), (machine or platform.machine()).lower()
     x64 = machine in ('amd64', 'x86_64')
@@ -77,12 +91,12 @@ def accelerators(system=None, machine=None):
     if system == 'Darwin' and x64:
         return [('hvf', 'host'), ('tcg', 'max')]
     if system == 'Windows' and x64:
-        return [('whpx', 'max'), ('tcg', 'max')]
+        return [('whpx', cpu_model('whpx')), ('tcg', 'max')]
     return [('tcg', 'max')]  # x86 guest on Apple Silicon: no cross-ISA HVF.
 
 
 def choose_accel(qemu, wanted):
-    candidates = accelerators() if wanted == 'auto' else [(wanted, 'host' if wanted in ('kvm', 'hvf') else 'max')]
+    candidates = accelerators() if wanted == 'auto' else [(wanted, cpu_model(wanted))]
     for accel, cpu in candidates:
         with subprocess.Popen([qemu, '-machine', 'q35', '-accel', accel, '-cpu', cpu,
                                '-m', '64', '-nodefaults', '-display', 'none', '-S', '-qmp', 'stdio'],
@@ -93,11 +107,54 @@ def choose_accel(qemu, wanted):
                 proc.wait(timeout=5)
                 if proc.returncode == 0:
                     return accel, cpu
-            except Exception:
+            except Exception as exc:
                 proc.kill()
                 proc.wait()
-            print('Acceleration probe failed:', accel, file=sys.stderr)
+                detail = proc.stderr.read().strip()
+                print(f'Acceleration probe failed: {accel}: {detail or exc}', file=sys.stderr)
+                continue
+            detail = proc.stderr.read().strip()
+            print(f'Acceleration probe failed: {accel}: {detail or "nonzero exit status"}', file=sys.stderr)
     raise RuntimeError('No usable QEMU accelerator; check virtualization settings or use --accel tcg')
+
+
+def choose_display(qemu, wanted):
+    if wanted != 'auto':
+        return wanted
+    probe = subprocess.run([qemu, '-display', 'help'], capture_output=True, text=True, timeout=10)
+    available = set((probe.stdout + '\n' + probe.stderr).split())
+    # SDL's software renderer in affected QEMU/SDL2 combinations applies
+    # window-to-guest mouse scaling twice after a resize. Prefer GTK's native
+    # event/viewport path; macOS uses Cocoa when available.
+    candidates = ['cocoa', 'gtk', 'sdl'] if platform.system() == 'Darwin' else ['gtk', 'sdl']
+    for backend in candidates:
+        if backend in available:
+            return backend
+    raise RuntimeError('No graphical display backend found; explicitly use --display none for headless operation')
+
+
+def choose_audio(qemu, wanted):
+    if wanted != 'auto':
+        return wanted
+    probe = subprocess.run([qemu, '-audiodev', 'help'], capture_output=True, text=True, timeout=10)
+    available = set((probe.stdout + '\n' + probe.stderr).split())
+    system = platform.system()
+    if system == 'Darwin':
+        candidates = ['coreaudio', 'sdl']
+    elif system == 'Windows':
+        candidates = ['wasapi', 'dsound', 'sdl']
+    else:
+        runtime = Path(os.environ.get('XDG_RUNTIME_DIR', '/run/user/' + str(os.getuid())))
+        candidates = []
+        if (runtime / 'pipewire-0').exists():
+            candidates.append('pipewire')
+        if os.environ.get('PULSE_SERVER') or (runtime / 'pulse/native').exists():
+            candidates.append('pa')
+        candidates += ['sdl', 'alsa', 'pa', 'pipewire']
+    for backend in candidates:
+        if backend in available:
+            return backend
+    raise RuntimeError('No host audio backend found; install an audio-enabled QEMU or explicitly use --audio none')
 
 
 def command(qemu, accel, cpu, cores, memory, display, audio, session, bridge_port=None):
@@ -105,17 +162,18 @@ def command(qemu, accel, cpu, cores, memory, display, audio, session, bridge_por
             '-cpu', cpu, '-smp', str(cores), '-m', str(memory),
             '-drive', 'if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd',
             '-drive', 'if=pflash,format=raw,file=OVMF_VARS.fd',
-            '-drive', 'if=virtio,format=qcow2,file=disk.qcow2',
+            '-drive', 'if=virtio,format=qcow2,file=brook.qcow2',
             '-vga', 'std', '-display', display,
             '-device', 'virtio-tablet-pci', '-device', 'virtio-rng-pci',
             '-device', 'virtio-net-pci,netdev=net0',
             '-netdev', 'user,id=net0' + (f',hostfwd=tcp:127.0.0.1:{bridge_port}-:1234' if bridge_port else ''),
-            '-device', 'ich9-intel-hda', '-device', 'hda-output,audiodev=hda0,use-timer=off',
+            '-device', 'ich9-intel-hda', '-device', 'hda-output,audiodev=hda0',
             '-audiodev', audio + ',id=hda0', '-serial', 'file:serial.log',
             '-chardev', 'socket,id=lifecycle,host=127.0.0.1,port=0,server=on,wait=off',
             '-serial', 'chardev:lifecycle',
             '-fw_cfg', 'name=opt/brook/lifecycle,string=' + session.replace('-', ''),
             '-fw_cfg', 'name=opt/brook/power,string=q35-reset',
+            '-fw_cfg', 'name=opt/audio-staging-frames,string=4096',
             '-fw_cfg', 'name=opt/composite,string=cpu', '-qmp', 'stdio']
     return args
 
@@ -274,72 +332,43 @@ def serve(control, token):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--instance', default='desktop')
+    parser.add_argument('--mcp', action='store_true', help='Enable optional authenticated local VM control')
     parser.add_argument('--accel', choices=['auto', 'kvm', 'hvf', 'whpx', 'tcg'], default='auto')
     parser.add_argument('--cpus', type=int)
     parser.add_argument('--memory', type=int, default=8192, help='MiB')
-    parser.add_argument('--display', choices=['sdl', 'gtk', 'cocoa', 'none'], default=None)
-    parser.add_argument('--audio', choices=['none', 'pipewire', 'pa', 'sdl', 'coreaudio', 'dsound'], default='none')
+    parser.add_argument('--display', choices=['auto', 'sdl', 'gtk', 'cocoa', 'none'], default='auto')
+    parser.add_argument('--audio', choices=['auto', 'none', 'pipewire', 'pa', 'sdl', 'alsa', 'coreaudio', 'dsound', 'wasapi'], default='auto')
     parser.add_argument('--bridge-port', type=int, help='Opt-in guest debug TCP; loopback only, unauthenticated legacy protocol')
     parser.add_argument('--qemu', default='qemu-system-x86_64')
-    parser.add_argument('--qemu-img', default='qemu-img')
     args = parser.parse_args()
-    if not args.instance or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in args.instance):
-        parser.error('Instance name must contain letters, digits, hyphens or underscores')
     if not 256 <= args.memory <= 262144 or (args.cpus is not None and not 1 <= args.cpus <= 64):
         parser.error('Memory/CPU count outside supported range')
     if args.bridge_port is not None and not 1024 <= args.bridge_port <= 65535:
         parser.error('Bridge port must be 1024–65535')
     root = Path(__file__).resolve().parent
-    manifest = json.loads((root / 'manifest.json').read_text())
-    for name, digest in manifest['files'].items():
-        if Path(name).name != name or sha(root / name) != digest:
-            raise RuntimeError('Bundle integrity failed: ' + name)
-    qemu, image_tool = shutil.which(args.qemu), shutil.which(args.qemu_img)
-    if not qemu or not image_tool:
-        parser.error('Install QEMU (including qemu-img); see README.txt')
-    base = Path(os.environ.get('LOCALAPPDATA', Path.home() / '.local/share')) / 'BrookVM'
-    base.mkdir(mode=0o700, parents=True, exist_ok=True)
-    state = base / args.instance
-    state.mkdir(mode=0o700, exist_ok=True)
-    lock = state / 'owner.lock'
-    # OS-level nonblocking lock is released even after a crash. No stale-PID guessing.
-    with lock.open('a+b') as handle:
-        if os.name == 'nt':
-            import msvcrt
-            handle.seek(0)
-            handle.write(b'0')
-            handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        saved = state / 'base.json'
-        identity = dict(base_sha256=manifest['files']['brook.qcow2'], base_path=str(root / 'brook.qcow2'))
-        if saved.exists() and json.loads(saved.read_text()) != identity:
-            raise RuntimeError('Instance uses another base image or location; select a new --instance')
-        saved.write_text(json.dumps(identity))
-        if not (state / 'disk.qcow2').exists():
-            subprocess.run([image_tool, 'create', '-f', 'qcow2', '-F', 'qcow2', '-b', str(root / 'brook.qcow2'), str(state / 'disk.qcow2')], check=True)
-        for name in ('OVMF_CODE.fd', 'OVMF_VARS.fd'):
-            if not (state / name).exists():
-                shutil.copy2(root / name, state / name)
-        # Nix firmware templates are read-only. The instance's variable store
-        # must be writable even when copied from a 0444 distribution template.
-        (state / 'OVMF_VARS.fd').chmod(0o600)
-        accel, cpu = choose_accel(qemu, args.accel)
-        cores = args.cpus or (2 if accel == 'tcg' else 8)
-        session = str(uuid.uuid4())
-        display = args.display or ('cocoa' if platform.system() == 'Darwin' else 'sdl')
-        cmd = command(qemu, accel, cpu, cores, args.memory, display, args.audio, session, args.bridge_port)
-        print(f'Brook: {accel}, {cores} vCPUs, {args.memory} MiB, software graphics, audio={args.audio}', flush=True)
-        with (state / 'qemu.log').open('w') as log:
-            proc = subprocess.Popen(cmd, cwd=state, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True)
-            descriptor = state / 'session.json'
-            server = None
-            try:
-                qmp = QMP(proc)
+    qemu = shutil.which(args.qemu)
+    if not qemu:
+        parser.error('Install QEMU: https://www.qemu.org/download/ ; see README.txt')
+    state = root
+    for name in ('brook.qcow2', 'OVMF_CODE.fd', 'OVMF_VARS.fd'):
+        if not (root / name).is_file():
+            parser.error('Missing bundle file: ' + name)
+    # Firmware variables, like the guest disk, persist beside the launcher.
+    (state / 'OVMF_VARS.fd').chmod(0o600)
+    accel, cpu = choose_accel(qemu, args.accel)
+    audio = choose_audio(qemu, args.audio)
+    cores = args.cpus or (2 if accel == 'tcg' else 8)
+    session = str(uuid.uuid4())
+    display = choose_display(qemu, args.display)
+    cmd = command(qemu, accel, cpu, cores, args.memory, display, audio, session, args.bridge_port)
+    print(f'Brook: {accel}, {cores} vCPUs, {args.memory} MiB, software graphics, audio={audio}', flush=True)
+    with (state / 'qemu.log').open('w') as log:
+        proc = subprocess.Popen(cmd, cwd=state, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, text=True)
+        descriptor = state / 'session.json'
+        server = None
+        try:
+            qmp = startup_qmp(proc, state / 'qemu.log')
+            if args.mcp:
                 control = Control(proc, qmp, state, session, args.bridge_port)
                 token = secrets.token_hex(32)
                 server = serve(control, token)
@@ -348,16 +377,16 @@ def main():
                 if os.name != 'nt':
                     descriptor.chmod(0o600)
                 print('Control descriptor:', descriptor, flush=True)
-                print('Use launcher power menu or MCP vm_shutdown for clean shutdown. Closing QEMU is a forced stop.', flush=True)
-                return proc.wait()
-            finally:
-                if server:
-                    server.shutdown()
+            print('Use the Brook launcher power menu to shut down. Closing QEMU is a forced stop.', flush=True)
+            return proc.wait()
+        finally:
+            if server:
+                server.shutdown()
                 descriptor.unlink(missing_ok=True)
-                if proc.poll() is None:
-                    # Preserve writable state; do not silently terminate a guest on control failure.
-                    print('Control failed; QEMU is still running. Waiting; inspect qemu.log.', file=sys.stderr)
-                    proc.wait()
+            if proc.poll() is None:
+                # Preserve writable state; do not silently terminate a guest on control failure.
+                print('Control failed; QEMU is still running. Waiting; inspect qemu.log.', file=sys.stderr)
+                proc.wait()
 
 
 if __name__ == '__main__':

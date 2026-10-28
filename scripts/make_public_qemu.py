@@ -77,7 +77,7 @@ def main():
     run('mkfs.fat', '-F', '32', '-n', 'BROOK_EFI', esp)
     run('mmd', '-i', esp, '::EFI', '::EFI/BOOT', '::KERNEL', '::BIN')
     script = stage / 'INIT.RC'
-    script.write_text('display 1280x800\nset wm\nset vfb none\n'
+    script.write_text('set wm\nset vfb none\n'
                       'run --service --once --uid 1000 --gid 100 /nix/profile/bin/brook-dbus --config-file=/nix/profile/bin/brook-session.conf --nofork --address=unix:path=/tmp/brook-session-bus --nosyslog\n'
                       'run --service --once /nix/profile/bin/waylandd\n')
     # Brook deliberately skips the GPT ESP during kernel filesystem mounting.
@@ -118,7 +118,7 @@ def main():
         if fields[0] == 'VLC media player':
             fields[1] = '--uid 1000 /nix/profile/bin/brook-vlc'
             entries[number] = '\t'.join(fields)
-        elif fields[0] in ('GNU Image Manipulation Program', 'Mousepad', 'OpenTTD', 'Qalculate!'):
+        elif fields[0] in ('GNU Image Manipulation Program', 'Mousepad', 'OpenTTD', 'Qalculate!', 'Gnome Commander', 'GNOME Commander'):
             # Ensure generic upstream desktop entries get the same profile-
             # relative software graphics paths as browser/media wrappers.
             fields[1] = '--uid 1000 /nix/profile/bin/brook-run ' + fields[1]

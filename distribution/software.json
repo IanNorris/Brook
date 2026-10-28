@@ -1,5 +1,5 @@
 {
-  "review_date": "2026-10-27",
+  "review_date": "2026-10-28",
   "scope": "Compatibility and redistribution are independent. Base inclusion requires exact closure notices/source; this inventory is not a blanket licence grant.",
   "sources": {
     "mozilla": "https://www.mozilla.org/en-US/foundation/trademarks/distribution-policy/",
@@ -150,7 +150,7 @@
       "name": "Chromium",
       "tested_version": "148.0.7778.96",
       "compatibility": "⚠️ Experimental",
-      "tested_scope": "Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled",
+      "tested_scope": "Software-rendered Wayland browsing and 480p YouTube video/audio; long pause/resume and seeking verified under normal autoplay rules; browser sandbox disabled; minimal-profile downstream ALSA configuration passes a continuous local PCM output control on Linux, Windows audio remains unverified",
       "distribution_route": "base-image",
       "licence_summary": "BSD-3-Clause plus bundled third-party licences",
       "evidence": "README.md compatibility table and linked workload reports"
@@ -295,7 +295,7 @@
       "name": "GIMP",
       "tested_version": "3.0.8",
       "compatibility": "⚠️ Experimental",
-      "tested_scope": "Painting, XCF save/reopen (including cold boot) and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults",
+      "tested_scope": "Painting, XCF save/reopen (including cold boot) and PNG export/import verified; Brook-owned legacy profile, settings and saved images verified across reboot; optional plugin discovery still has faults; minimal-profile startup corrected by epoll EPERM behavior, with image creation, valid XCF save and normal exit verified",
       "distribution_route": "base-image",
       "licence_summary": "GPL-3.0-or-later",
       "evidence": "README.md compatibility table and linked workload reports"
@@ -361,6 +361,15 @@
       "compatibility": "proposed, not accepted",
       "distribution_route": "not-in-image",
       "licence_summary": "proprietary; user purchase/download only"
+    },
+    {
+      "name": "GNOME Commander",
+      "tested_version": "1.18.5",
+      "compatibility": "⚠️ Experimental",
+      "tested_scope": "Minimal software-rendered profile: first launch reaches its window in about 2.6 seconds after rejecting regular-file epoll watches; both panes list a test file with standard icons; normal close verified. Copy/rename workflow remains unaccepted.",
+      "distribution_route": "base-image",
+      "licence_summary": "Component-specific; exact closure source/notice review pending",
+      "evidence": "Portable profile review on 2026-10-28"
     }
   ],
   "image_profile": "nix/release-packages.nix",

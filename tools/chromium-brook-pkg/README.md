@@ -1,5 +1,13 @@
 # Chromium clocked audio wrapper
 
+The optional `downstreamStaging = true` parameter selects the downstream-aware
+OSS bridge. The minimal release profile uses it together with the launcher's
+`opt/audio-staging-frames=4096` boot configuration. Both are required: the older
+plugin charges physical downstream backlog against its logical ALSA ring and
+cannot use the extra allowance to keep producing. The application still uses
+its normal negotiated ring and period sizes. Other package callers retain the
+existing default unless they opt in.
+
 Build with `nix-build tools/chromium-brook-pkg --no-out-link`.
 
 This wraps the pinned stock Chromium without rebuilding its engine. Like the

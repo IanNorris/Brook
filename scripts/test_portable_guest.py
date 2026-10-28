@@ -34,7 +34,8 @@ class Guest:
                     raise RuntimeError('Guest disconnected; command completion unknown')
                 data += chunk
         payload = data.split(begin, 1)[1].split(end, 1)[0]
-        result = next(json.loads(line) for line in payload.decode().splitlines() if line.startswith('{'))
+        lines = [line for line in payload.decode().splitlines() if line.startswith('{')]
+        result = json.loads(lines[0]) if lines else {'reply': payload.decode(errors='replace').strip()}
         for field in ('job_error', 'ui_error'):
             if field in result:
                 raise RuntimeError(result[field])
