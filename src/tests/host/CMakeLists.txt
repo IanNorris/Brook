@@ -53,6 +53,7 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_virtio_read_plan)
 add_host_test(test_page_store "${BROOK_ROOT}/src/kernel/src/memory/page_store.cpp" "${BROOK_ROOT}/src/kernel/src/memory/compressed_page_pool.cpp")
 add_host_test(test_compressed_page_pool "${BROOK_ROOT}/src/kernel/src/memory/compressed_page_pool.cpp")
 add_library(paging_lz4_host STATIC "${BROOK_ROOT}/src/third_party/lz4/lz4.c")

@@ -1,5 +1,6 @@
 #include "apic.h"
 #include "virtio_blk.h"
+#include "virtio_blk_read_plan.h"
 #include "pci.h"
 #include "portio.h"
 #include "string.h"
@@ -1023,7 +1024,7 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
 
     static constexpr uint32_t SECTOR_SIZE = 512;
     static constexpr uint32_t DMA_BUF_SIZE = VirtioBlkState::DMA_BUF_PAGES * 4096;
-    static constexpr uint32_t SECTORS_PER_DMA = DMA_BUF_SIZE / SECTOR_SIZE; // 128
+    static constexpr uint32_t SECTORS_PER_DMA = DMA_BUF_SIZE / SECTOR_SIZE; // 512
 
     // Guard against offset+len overflow and reads past device end
     uint64_t deviceBytes = s->sectorCount * SECTOR_SIZE;
@@ -1034,7 +1035,7 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
     uint64_t endSector   = (offset + len + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
     // DMA buffers must be physically contiguous and page-aligned.
-    // Use the persistent 64 KB DMA buffer (up to 128 sectors per request).
+    // Use the persistent 256 KiB DMA buffer (up to 512 sectors per request).
     uint8_t* dstBytes = static_cast<uint8_t*>(buf);
     uint64_t bytesRead = 0;
 
@@ -1110,8 +1111,20 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
             }
         }
 
-        // Submit all misses as async slot reads.
-        if (missCount > 0)
+        // Adjacent cache misses need one transfer, not one request per 4 KiB.
+        // This reuses the persistent DMA buffer under the same request guard.
+        // Holey miss sets retain parallel slots; no extra notification or slot
+        // wait may follow SubmitRequest's own completion/used-ring handling.
+        const uint32_t contiguousBytes=VirtioContiguousReadBytes(missBlocks,missCount,
+            MAX_INFLIGHT,VIRTIO_CACHE_BLOCK_SIZE,DMA_BUF_SIZE);
+        if(contiguousBytes) {
+            if(!SubmitRequest(*s,VIRTIO_BLK_T_IN,missBlocks[0]*VIRTIO_CACHE_BLOCK_SECTORS,
+                              s->dmaBufPhys,contiguousBytes)) {
+                ReleaseRequestLock(*s);return -5; // EIO, matching DeviceOps negative-errno contract
+            }
+            for(uint32_t i=0;i<missCount;++i)
+                CacheStore(*s,missBlocks[i],s->dmaBuf+i*VIRTIO_CACHE_BLOCK_SIZE);
+        } else if (missCount > 0)
         {
             for (uint32_t i = 0; i < missCount; ++i)
             {
@@ -1127,7 +1140,7 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
             if (!WaitAllSlots(*s, missCount))
             {
                 ReleaseRequestLock(*s);
-                return -1;
+                return -5; // EIO, matching DeviceOps negative-errno contract
             }
 
             // Store all completed reads into the cache.
@@ -1138,7 +1151,7 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
                     brook::SerialPrintf("virtio-blk: batch slot %u failed (block %lu)\n",
                                         i, static_cast<unsigned long>(missBlocks[i]));
                     ReleaseRequestLock(*s);
-                    return -1;
+                    return -5; // EIO, matching DeviceOps negative-errno contract
                 }
                 CacheStore(*s, missBlocks[i], s->slots[i].dmaBuf);
             }
@@ -1196,7 +1209,7 @@ static int VirtioBlkRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
             brook::SerialPrintf("virtio-blk: read failed at sector %lu\n",
                                 static_cast<unsigned long>(sec));
             ReleaseRequestLock(*s);
-            return -1;
+            return -5; // EIO, matching DeviceOps negative-errno contract
         }
 
         CacheStoreFullBlocks(*s, batchStart, batch, s->dmaBuf);

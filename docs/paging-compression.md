@@ -594,3 +594,70 @@ throughput and resident-memory measurements, followed by larger workloads.
 General anonymous application paging remains restricted to the private dedicated
 mapping API; safe arbitrary threaded/forked application paging, dynamic compressed
 arena return/spill policy and wider workload acceptance remain unfinished.
+
+## Controlled file-loading comparison and contiguous device reads
+
+The native byte-verifying workload `scripts/workloads/compressed_image_bench.c`
+loads all 1071 unique regular files (53,670,986 bytes) in the same Nix closure.
+Its companion `scripts/compressed_image_bench_manifest.py` generates exact guest
+paths, sizes and FNV checksums from verified image bytes without opening image
+paths on the host. Build the probe with `$MUSL_CC -O2 -static`; generate a
+manifest with `python3 scripts/compressed_image_bench_manifest.py IMAGE MANIFEST
+--prefix /nix/store --lz4-library build/host-tools/libbrook-image-lz4.so`. Put
+both in a private initrd, then run `PROBE MANIFEST read|map HOG_MIB` as root in
+the experimental page-store VM. The optional ordinary allocation is bounded at
+192 MiB and verified afterward. Each file's full contents are checked. Guest
+CLOCK_MONOTONIC timings include opens, stat, read/mmap, hashing and cleanup.
+
+The comparison uses fresh 512 MiB/eight-vCPU VMs, two boots per mode/codec with
+reversed codec order, and two subsequent passes per boot. Host caches are warm;
+this is guest-cold loading, not physical SSD-cold loading. QMP packed-device
+read bytes/requests bracket the whole bridge job, including helper setup outside
+the guest's timed interval. This small sample does not establish browser/game
+launch speed. Holding 128 MiB stays above the cache-worker threshold in this
+fixture; holding 160 MiB activates reclaim and completes all byte checks.
+
+Before further tuning, median guest-cold read passes take 394 ms raw versus
+532 ms LZ4, with 55.43 versus 27.73 MiB of device reads. Mapped passes take
+537 versus 661 ms, with 66.01 versus 28.04 MiB read. Compression reduces I/O but
+is not yet a cold-load throughput win. Both variants retain decompressed cached
+file pages; compression does not itself shrink that resident working set.
+
+The device trace identified adjacent 4 KiB cache misses issued as separate
+requests. The Virtio read path now coalesces only a completely contiguous set of
+2..16 misses into the existing request-guarded DMA buffer. Holey sets keep the
+parallel-slot path. The transfer completes successfully before cache publication;
+SubmitRequest alone owns notification, completion validation and ring advancement.
+There is no new buffer. The actual persistent DMA allocation is 256 KiB; corrected
+comments previously said 64 KiB. Driver read failures now return EIO rather than
+EPERM, matching DeviceOps' negative-errno contract.
+
+With coalescing, cold read requests fall from 4678 to 883 raw and 6709 to 444
+LZ4; mapped requests fall from 4846 to 1051 raw and 6714 to 449 LZ4. Device bytes
+are unchanged. Median read times are 413/557 ms raw/LZ4 and mapped times 487/619
+ms, so the request reduction must not be advertised as a proportional loading
+speedup. Under 160 MiB ordinary allocation, both variants continue to verify
+all bytes while thousands of cache entries are reclaimed per pass. Cache pressure
+results are noisy because asynchronous reclaim overlaps loading.
+
+Acceptance includes bounded planner edge/hole/wrap tests, all 84 benchmark
+passes, eight-worker 64 MiB read/write/boundary/small-file checks and 16384
+concurrent read/mmap page checks followed by persistent verification and cleanup.
+A private QEMU blkdebug rule injects one EIO into a selected compressed data
+transfer: `compressed_image_read_retry.c` observes EIO then verifies the full
+64 KiB decoded block on retry. No failed DMA bytes are cached. The final VM
+completes checked sync and original owner exit zero. This tests device errors;
+it does not simulate a completion timeout or prove every reset path.
+QEMU injection configuration follows its
+[blkdebug documentation](https://www.qemu.org/docs/master/devel/testing/blkdebug.html).
+
+Evidence: `build/paging-compression-20261028/compressed-image-benchmark/`, including
+comparison/metadata JSON, per-VM jobs/QMP counters and shutdown receipts. A
+three-second CPU capture during six verified read passes is retained in
+`final-native/read.profile`: 2345 CPU samples, no dropped events, 276 samples
+belonging to the six probe processes. Of these, 97 land in memcpy called from
+LZ4, 68 in device SubmitRequest, 30 in the workload's hashing loop, 28 in
+LoadBlock and 16 in Read. The freestanding codec currently maps constant-size
+LZ4 copies to out-of-line rep-movsb calls; measuring explicit compiler builtins
+for these small scalar copies is the next concrete CPU lead. These are samples,
+not an exact wall-time attribution or a reason to weaken checksum validation.
