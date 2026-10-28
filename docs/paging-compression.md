@@ -2,7 +2,8 @@
 
 Branch: `wip/paging-compression-20261028`. Goal: reduce memory-pressure failures
 and improve mixed-workload throughput without trading them for corrupt mappings
-or unbounded reclaim stalls. This document records a plan, not shipped paging.
+or unbounded reclaim stalls. This records an opt-in experimental implementation;
+general-purpose application paging is not enabled.
 
 ## Delivery order
 
@@ -640,7 +641,7 @@ speedup. Under 160 MiB ordinary allocation, both variants continue to verify
 all bytes while thousands of cache entries are reclaimed per pass. Cache pressure
 results are noisy because asynchronous reclaim overlaps loading.
 
-Acceptance includes bounded planner edge/hole/wrap tests, all 84 benchmark
+Acceptance includes bounded planner edge/hole/wrap tests, all 90 benchmark
 passes, eight-worker 64 MiB read/write/boundary/small-file checks and 16384
 concurrent read/mmap page checks followed by persistent verification and cleanup.
 A private QEMU blkdebug rule injects one EIO into a selected compressed data
@@ -661,3 +662,52 @@ LoadBlock and 16 in Read. The freestanding codec currently maps constant-size
 LZ4 copies to out-of-line rep-movsb calls; measuring explicit compiler builtins
 for these small scalar copies is the next concrete CPU lead. These are samples,
 not an exact wall-time attribution or a reason to weaken checksum validation.
+
+## Scalar codec copies: measured cold-load improvement
+
+The CPU lead above was confirmed in generated code. Explicitly selecting
+`LZ4_memcpy=__builtin_memcpy` removes 27 out-of-line memcpy call sites from
+LZ4_decompress_safe. The kernel's existing `-mgeneral-regs-only -mno-sse
+-mno-sse2` restrictions remain in force; inspection of the complete kernel LZ4
+object finds no SIMD/FP instructions. Variable-size lowering can still use the
+existing runtime, and LZ4_memmove remains unchanged. No heap, lock or workspace
+is added. This also follows the vendored codec's own freestanding guidance.
+
+Repeated short match offsets 1..32 now have explicit tests at sizes from zero
+to 64 KiB, with exact output capacities, one-byte-short capacities, truncated
+inputs and untouched guard regions. The image, VFS and compressed store tests
+pass with the new definition. ASan+UBSan also pass with the actual freestanding
+codec compiled using -fno-builtin and the explicit builtin override.
+
+Another two fresh boots per mode/codec, with reversed codec order, verify all
+1071 files and all 53,670,986 bytes on each pass. Median guest-cold read time is
+320 ms LZ4 versus 375 ms raw. Against the preceding coalesced LZ4 build's 557 ms,
+that is about 43% less elapsed time. Guest-cold mapped loading is 385 ms LZ4
+versus 503 ms raw. With 160 MiB of extra ordinary allocations and active cache
+reclaim it is 373 ms LZ4 versus 486 ms raw (~23% less); subsequent pressure passes
+continue to verify all bytes while thousands of cache frames are retired.
+Device bytes remain about half of raw. These are byte-hashed fixture load times,
+not app launch timings, and host caches remain warm. Two runs per case do not
+establish broad workload performance. Decoded resident file pages occupy the
+same amount of RAM in both formats.
+
+The 36 additional image passes, generated-instruction audit, sanitizer logs,
+exact kernel hashes and per-VM receipts are retained under
+`compressed-image-benchmark/builtin*`. Final native acceptance enables the 4 MiB
+compressed-RAM arena and repeats explicit RAM/disk spill/read/publication failure
+checks, reserve reclamation and pool cleanup, plus the 256 MiB mixed-tier pressure
+fixture. The injected packed-image EIO/retry check is repeated on the same build.
+General application paging remains experimental; broader real workload
+acceptance and pressure responsiveness/latency gates remain open.
+
+An additional sequential check found a pre-existing reserve policy gap: the
+pressure fixture ends with seven pooled emergency frames, and the next fresh
+compressed-store probe (which expects eight at entry) fails that precondition.
+Slots and compressed-pool allocations are zero. Healthy soft-target turnover
+currently returns the victim to an already-full reserve, frees it to ordinary
+PMM, then checks out another reserve frame for fault-in. This is reserve
+consumption, not a leaked physical frame. Next: transfer a successfully stored,
+TLB-retired same-AS victim directly to its fault transaction, then address
+bounded healthy refill for genuine emergency consumption. The sequential failure
+is retained as `builtin-accept/after-pressure-reserve.json`; no full reserve-
+recovery or whole-goal completion is claimed by this codec checkpoint.

@@ -427,11 +427,13 @@ set_source_files_properties(
 )
 
 # LZ4 — freestanding mode, no heap, panic-safe (no SSE).
+# Explicit builtin keeps constant 2/4/8-byte copies inline under -fno-builtin;
+# variable-size lowering may still call the existing kernel memcpy runtime.
 set_source_files_properties(
     "${BROOK_ROOT}/src/third_party/lz4/lz4.c"
     PROPERTIES
         COMPILE_OPTIONS "-mgeneral-regs-only;-mno-sse;-mno-sse2;-mfpmath=;-include;${BROOK_ROOT}/src/third_party/lz4/lz4_freestanding.h;-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare;-Wno-implicit-fallthrough;-Wno-unused-variable"
-        COMPILE_DEFINITIONS "LZ4_FREESTANDING=1;LZ4_memcpy=memcpy;LZ4_memset=memset;LZ4_memmove=memmove"
+        COMPILE_DEFINITIONS "LZ4_FREESTANDING=1;LZ4_memcpy=__builtin_memcpy;LZ4_memset=memset;LZ4_memmove=memmove"
 )
 
 # Generated symbol table: suppress unused-const-variable (the extern refs are

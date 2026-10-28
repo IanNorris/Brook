@@ -57,7 +57,7 @@ add_host_test(test_virtio_read_plan)
 add_host_test(test_page_store "${BROOK_ROOT}/src/kernel/src/memory/page_store.cpp" "${BROOK_ROOT}/src/kernel/src/memory/compressed_page_pool.cpp")
 add_host_test(test_compressed_page_pool "${BROOK_ROOT}/src/kernel/src/memory/compressed_page_pool.cpp")
 add_library(paging_lz4_host STATIC "${BROOK_ROOT}/src/third_party/lz4/lz4.c")
-target_compile_definitions(paging_lz4_host PRIVATE LZ4_FREESTANDING=1 LZ4_memcpy=memcpy LZ4_memset=memset LZ4_memmove=memmove)
+target_compile_definitions(paging_lz4_host PRIVATE LZ4_FREESTANDING=1 LZ4_memcpy=__builtin_memcpy LZ4_memset=memset LZ4_memmove=memmove)
 target_compile_options(paging_lz4_host PRIVATE -mgeneral-regs-only -mno-sse -mno-sse2
     -include "${BROOK_ROOT}/src/third_party/lz4/lz4_freestanding.h")
 add_host_test(test_page_store_compressed "${BROOK_ROOT}/src/kernel/src/memory/page_store.cpp" "${BROOK_ROOT}/src/kernel/src/memory/compressed_page_pool.cpp")

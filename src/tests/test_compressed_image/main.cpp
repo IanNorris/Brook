@@ -61,6 +61,34 @@ static Disk fixture() {
 static void invalid(const Disk& seed,const std::function<void(Disk&)>& mutate,bool checksum=true) {
     auto d=seed;mutate(d);if(checksum)rehash(d);Reader r;assert(!r.Init(d));
 }
+static void ScalarCodecBoundaries() {
+    // Repetitions exercise match offsets 1..32, including LZ4's short-distance
+    // overlap paths. Exact capacities and sentinels catch copy widening errors.
+    std::array<char,65536> plain{};
+    std::array<char,66000> encoded{};
+    std::array<char,65568> output{};
+    const int lengths[]={0,1,2,3,4,7,8,15,16,31,32,63,64,255,256,4095,4096,65536};
+    for(unsigned period=1;period<=32;++period)for(int size:lengths) {
+        for(int i=0;i<size;++i)plain[i]=char((i%period)*73);
+        int bytes=LZ4_compress_default(plain.data(),encoded.data(),size,encoded.size());assert(bytes>0);
+        auto guards=[&](int capacity) {
+            for(int i=0;i<16;++i)assert(output[i]==char(0xc7));
+            for(unsigned i=16+capacity;i<output.size();++i)assert(output[i]==char(0xc7));
+        };
+        output.fill(char(0xc7));
+        assert(LZ4_decompress_safe(encoded.data(),output.data()+16,bytes,size)==size);
+        assert(!std::memcmp(plain.data(),output.data()+16,size));guards(size);
+        if(size) {
+            output.fill(char(0xc7));
+            assert(LZ4_decompress_safe(encoded.data(),output.data()+16,bytes,size-1)<0);guards(size-1);
+        }
+        const int cuts[]={0,bytes/2,bytes-1};
+        for(int cut:cuts) {
+            output.fill(char(0xc7));
+            assert(LZ4_decompress_safe(encoded.data(),output.data()+16,cut,size)!=size);guards(size);
+        }
+    }
+}
 int main(int argc,char** argv) {
     if(argc==2) {
         Disk d;std::ifstream stream(argv[1],std::ios::binary);d.bytes.assign(std::istreambuf_iterator<char>(stream),{});
@@ -74,6 +102,7 @@ int main(int argc,char** argv) {
         }
         std::puts("\n]");return 0;
     }
+    ScalarCodecBoundaries();
     auto d=fixture();Reader r;assert(r.Init(d));
     assert(r.image.FindPath("/")==0 && r.image.FindPath("sub/data")==2 && r.image.FindPath("sub/data/")==-20);
     assert(r.image.FindPath("link")==3 && r.image.FindPath("missing")==-2 && r.image.FindPath("sub/../data")==-22);
