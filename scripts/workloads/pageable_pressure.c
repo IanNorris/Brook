@@ -65,13 +65,16 @@ int main(int argc,char** argv) {
     uint64_t scan=ns()-start;
     assert(sample==1024 && ctl(13,0)==Target && ctl(13,1)==0 && ctl(13,3)==0 && ctl(2,0)==Regions*RegionPages-Target);
     long held=ctl(13,0),stored=ctl(2,0),reserve=ctl(7,0);
+    long capacity=ctl(14,0),allocated=ctl(14,1),payload=ctl(14,2),ramSlots=ctl(14,3),diskSlots=ctl(14,4),fallbacks=ctl(14,5);
+    assert(ramSlots+diskSlots==stored);
+    if(capacity>0)assert(ramSlots>0 && diskSlots>0 && fallbacks>0 && payload<=allocated && allocated<=capacity);
     assert(ctl(9,0)==0 && ctl(12,0)==0);
     for(unsigned r=0;r<Regions;++r)assert(munmap(regions[r],RegionBytes)==0);
     for(unsigned h=0;h<hogCount;++h) {
         for(unsigned i=0;i<RegionBytes;i+=4096)assert(((volatile unsigned char*)hogs[h])[i]==0x5a);
         assert(munmap(hogs[h],RegionBytes)==0);
     }
-    assert(ctl(2,0)==0 && ctl(6,0)==0);
+    assert(ctl(2,0)==0 && ctl(6,0)==0 && ctl(14,1)==0 && ctl(14,2)==0);
     qsort(samples,sample,sizeof(samples[0]),order);
-    printf("PRESSURE_PAGED_PASS dataset_mib=256 held_pages=%ld stored_pages=%ld reserve=%ld min_free_pages=%ld fill_ns=%llu scan_ns=%llu page_verify_p50_ns=%llu p95_ns=%llu max_ns=%llu cleanup_slots=0\n",held,stored,reserve,minFree,(unsigned long long)fill,(unsigned long long)scan,(unsigned long long)samples[sample/2],(unsigned long long)samples[sample*95/100],(unsigned long long)samples[sample-1]);
+    printf("PRESSURE_PAGED_PASS dataset_mib=256 held_pages=%ld stored_pages=%ld reserve=%ld min_free_pages=%ld fill_ns=%llu scan_ns=%llu page_verify_p50_ns=%llu p95_ns=%llu max_ns=%llu ram_slots=%ld disk_slots=%ld arena_capacity=%ld arena_allocated=%ld payload_bytes=%ld fallbacks=%ld cleanup_slots=0 cleanup_pool=0\n",held,stored,reserve,minFree,(unsigned long long)fill,(unsigned long long)scan,(unsigned long long)samples[sample/2],(unsigned long long)samples[sample*95/100],(unsigned long long)samples[sample-1],ramSlots,diskSlots,capacity,allocated,payload,fallbacks);
 }

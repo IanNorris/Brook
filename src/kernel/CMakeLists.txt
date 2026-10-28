@@ -232,6 +232,7 @@ add_executable(kernel
     src/signal_fd.cpp
     src/process.cpp
     src/memory/address_space.cpp
+    src/fs/compressed_image.cpp
     src/memory/compressed_page_pool.cpp
     src/memory/page_store.cpp
     src/memory/page_store_probe.cpp

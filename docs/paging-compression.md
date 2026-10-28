@@ -528,3 +528,28 @@ Next: constrained-memory mixed-tier/full-pool measurements, then indexed
 immutable compressed storage and host inspection/extraction tools. General
 application paging and automatic reclaim of arbitrary shared/forked ASes remain
 unfinished and disabled; no completion of the overall goal is claimed here.
+
+## Full compressed-arena pressure acceptance
+
+On the tier-capable kernel in a fresh 512 MiB/eight-vCPU VM, the 256 MiB fixture
+holds the same 128 MiB ordinary allocation and a 16 MiB data target, plus the
+fixed 4 MiB arena/workspace overhead. It begins with 57326 free frames and has
+24499 after the ordinary allocation. The complete fill and byte-checked refault
+scan passes: 9361 stored pages in RAM and 52079 on disk, with arena allocation
+4193728/4194304 bytes, payload 3603985 bytes and 104158 disk fallbacks. The pool
+is effectively full and fallback is exercised repeatedly. Minimum sampled free
+frames are 20019 (~78.2 MiB). Fill/scan took 2.514/3.219 s, verification p95
+56.1 us and maximum 6.94 ms. This is one functional mixed-tier pressure run, not
+a controlled performance comparison with the earlier raw-only kernel/budget.
+Ordinary allocation bytes remain intact; teardown leaves zero slots and zero
+arena allocation/payload. Checked sync and original QEMU owner exit 0 pass.
+Evidence: build/paging-compression-20261028/compressed-pressure-512/{result,
+metadata}.json. The pressure fixture now verifies and reports both tier counts,
+capacity/fallbacks and pool cleanup explicitly.
+
+The next disk stage has a shared validated indexed reader and deterministic host
+build/list/inspect/verify/extract/tar-export tools. Its exact layout, limits,
+extraction contract and outstanding native integration gates are documented in
+[compressed-image-format.md](compressed-image-format.md). The VFS mount adapter
+is not yet implemented; no compressed executable/Nix-closure acceptance or
+whole-goal completion is claimed by that host-format checkpoint.
