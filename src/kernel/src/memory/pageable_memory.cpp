@@ -27,9 +27,35 @@ bool ready=false;
 FaultFrameReserve faultReserve;
 IrqSpinLock reserveLock;
 unsigned failOrdinaryAllocations=0;
+bool refillEnabled=true,refillStarted=false;
+uint64_t reserveRefilled=0,reserveLowHeadroom=0,reserveAllocationFailures=0;
+constexpr uint64_t ReserveHeadroomPages=64*1024*1024/4096;
+extern "C" void SchedulerSleepMs(uint32_t ms);
+
 unsigned ReserveSize() {
     auto flags=IrqSpinLockAcquire(&reserveLock);auto size=faultReserve.Size();
     IrqSpinLockRelease(&reserveLock,flags);return size;
+}
+// Only the boot-enabled worker calls this, with no AS/store/reserve lock held.
+// Each attempt owns one new KernelData reference until publication or release.
+// The bound holds even if other faults consume/refill the pool concurrently.
+void RefillReserve() {
+    for(unsigned attempt=0;attempt<FaultFrameReserve::Capacity;++attempt) {
+        if(ReserveSize()==FaultFrameReserve::Capacity)return;
+        if(PmmGetFreePageCount()<=ReserveHeadroomPages) {
+            __atomic_fetch_add(&reserveLowHeadroom,1,__ATOMIC_RELAXED);return;
+        }
+        auto frame=PmmAllocPage(MemTag::KernelData,KernelPid);
+        if(!frame) {__atomic_fetch_add(&reserveAllocationFailures,1,__ATOMIC_RELAXED);return;}
+        auto flags=IrqSpinLockAcquire(&reserveLock);
+        const bool retained=faultReserve.Push(frame);
+        IrqSpinLockRelease(&reserveLock,flags);
+        if(retained)__atomic_fetch_add(&reserveRefilled,1,__ATOMIC_RELAXED);
+        else PmmUnrefPage(frame); // a concurrent pageout may have filled it
+    }
+}
+void ReserveRefillWorker(void*) {
+    for(;;) {RefillReserve();SchedulerSleepMs(100);}
 }
 // Consumes the sole detached User reference, whether pooled or freed. Never
 // called until a pageout's TLB acknowledgement and successful storage, or a
@@ -336,7 +362,20 @@ void PageableMemoryBootInit() {
     }
     for(auto frame:initial)if(!faultReserve.Push(frame))KernelPanic("paging: reserve initialization");
     KMutexInit(&storeLock);AttachRamCompression();ready=true;
+    char refill[2]{};auto refillSize=FwCfgReadFile("opt/page-store-refill",refill,sizeof(refill));
+    if(refillSize) {
+        refillEnabled=refillSize==1 && refill[0]=='1';
+        if(!(refillSize==1 && (refill[0]=='0' || refill[0]=='1')))
+            SerialPuts("paging: invalid reserve-refill flag (worker disabled)\n");
+    }
+
     SerialPrintf("paging experiment: backing=%s slots=%lu single-task explicit only\n",name,h.slots);
+}
+void PageableMemoryStartReserveWorker() {
+    if(!ready || !refillEnabled || __atomic_load_n(&refillStarted,__ATOMIC_ACQUIRE))return;
+    auto* worker=KernelThreadCreate("page_reserve",ReserveRefillWorker,nullptr,1);
+    if(!worker){SerialPuts("paging: reserve refill worker unavailable\n");return;}
+    __atomic_store_n(&refillStarted,true,__ATOMIC_RELEASE);SchedulerAddProcess(worker);
 }
 int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) {
     if(!ready)return -95;
@@ -349,6 +388,14 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
     if(operation==5){UserAccessScope lease(actor);if(!UserBufferReadable(value,4096))return -14;return PageOut(actor,value);}
     if(operation==6){KMutexLock(&actor->addressSpace->mutation);auto count=actor->addressSpace->userAccess.Count();KMutexUnlock(&actor->addressSpace->mutation);return count;}
     if(operation==7)return ReserveSize();
+    if(operation==18) {
+        if(value==0)return __atomic_load_n(&reserveRefilled,__ATOMIC_RELAXED);
+        if(value==1)return __atomic_load_n(&reserveLowHeadroom,__ATOMIC_RELAXED);
+        if(value==2)return __atomic_load_n(&reserveAllocationFailures,__ATOMIC_RELAXED);
+        if(value==3)return __atomic_load_n(&refillStarted,__ATOMIC_ACQUIRE);
+        return -22;
+    }
+
     if(operation==8 && value<=32){auto flags=IrqSpinLockAcquire(&reserveLock);failOrdinaryAllocations=value;IrqSpinLockRelease(&reserveLock,flags);return 0;}
     if(operation==9 && value<=1) {
         KMutexLock(&actor->addressSpace->mutation);

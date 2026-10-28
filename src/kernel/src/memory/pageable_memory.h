@@ -6,6 +6,8 @@ struct Process;
 struct AddressSpaceState;
 // Explicit single-task experiment; opt/page-store-device is absent by default.
 void PageableMemoryBootInit();
+// Bounded healthy-memory reserve replenishment; starts only for an enabled store.
+void PageableMemoryStartReserveWorker();
 int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value);
 MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,uint64_t address,uint32_t access,bool allowReclaim=false);
 // Conservative experiment-only raw-uaccess barrier: before unaudited syscalls,

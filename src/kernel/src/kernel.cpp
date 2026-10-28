@@ -833,6 +833,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         // barrier, closing the freed-while-mapped cross-domain reuse window.
         brook::PmmStartDrainThread();
         brook::ProcessStartCleanupWorker();
+        brook::PageableMemoryStartReserveWorker();
         brook::FilePageCacheStartReclaimWorker();
         brook::FileObjectStartWriteback();
 

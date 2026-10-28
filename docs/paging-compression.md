@@ -741,3 +741,49 @@ The working-set probe selects its raw-only failure expectations at runtime.
 Do not reuse pre-compression fixture binaries with a RAM-enabled kernel.
 Evidence: `compressed-image-benchmark/handoff-current-compressed-v2/` and
 `handoff-current-raw/`, with the exact kernel/probe hashes in handoff-metadata.json.
+
+## Healthy-memory replenishment of genuine reserve loans
+
+A valid boot-enabled page store now starts a low-priority reserve worker after
+PMM drain/cleanup infrastructure is running. Every 100 ms it attempts at most
+eight new KernelData/KernelPid frames, stopping at reserve capacity, allocation
+failure or sampled free memory at/below 64 MiB. Allocation happens outside AS,
+store and reserve locks. Each frame owns one reference, transferred under the
+reserve lock or released afterward if concurrent explicit pageout filled the
+pool. Ordinary PMM allocation and quarantine remain authoritative; no PTE is
+edited and no recently retired frame is reused directly. The 64 MiB headroom
+is advisory across concurrent allocators, not an enforced global memory floor.
+The per-batch allocation bound is 32 KiB; reserve capacity stays eight frames.
+The worker has its own fixed kernel-thread overhead.
+
+This worker is absent when experimental paging is not configured. With a valid
+store it is enabled by default; `-fw_cfg name=opt/page-store-refill,string=0`
+disables it for deterministic reserve-exhaustion/fault-injection tests. Explicit
+`1` enables it. Invalid nonempty values disable it with a diagnostic. Private
+root-only control 18 returns successful refill count, low-headroom deferrals,
+allocation failures and worker-started status for selectors 0..3. It does not
+change state or allocate in a diagnostic caller's context.
+
+`pageable_refill.c` verifies three repeated cycles of eight forced-allocation-
+failure loans, refilling while original User mappings remain resident and byte-
+correct. A separate bounded allocation holds free memory below 48 MiB; all eight
+loans then remain outstanding, the worker records low-headroom deferrals and no
+refill occurs. After releasing the ordinary allocation and allowing normal PMM
+retirement/drain, all eight reserve frames return within a five-second bound
+while the loaned mappings still retain their original bytes. The final unmap
+leaves no stored slots and a full reserve. Disabled-worker control proves it
+stays disabled and explicit pageout still restores capacity.
+
+Native evidence uses the same kernel in four fresh 512 MiB/eight-vCPU VMs:
+raw/compressed backing, each with replenishment on/off. The on variants each run
+the complete refill fixture twice: 64 frames replenished across eight
+cycles of genuine loans, with low-headroom suppression each time. The raw VM
+holds 200 MiB of ordinary allocations and the 4 MiB RAM-tier VM holds 196 MiB.
+Both subsequently verify the 256 MiB mixed working set with reserve eight and
+zero slots/arena use after teardown. Off variants retain the deterministic
+raw/compressed error, publication, lease, exhaustion, long-scan and sequential
+pressure checks. All nineteen relevant host tests and compiled entry/startup
+mutation audits pass. Evidence and exact hashes: `reserve-refill/` beneath the
+existing build evidence directory. These tests establish reserve recovery and
+bounded pressure behavior, not general threaded application paging or broader
+application throughput acceptance.
