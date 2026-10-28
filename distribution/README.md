@@ -65,6 +65,7 @@ Build the image on an x86-64 Linux host, inside `nix-shell`. The resulting image
 ```sh
 python3 scripts/create_experiment_disks.py --public --profile-expression nix/release-packages.nix --nix-gib 12 --data-gib 4 --output build/distribution/new-seed
 python3 scripts/make_public_qemu.py --seed build/distribution/new-seed --output build/distribution/new-bundle
+python3 scripts/archive_public_qemu.py --bundle build/distribution/new-bundle --output build/distribution/Brook-candidate.zip
 ```
 
 Both output directories must be new. The assembler allowlists the ESP files and builds one GPT/QCOW2 disk from the new seed. Existing private review disks are never copied. Read `tools/portable_qemu/README.txt` for prerequisites, launch options, persistent instances and MCP configuration. Host QEMU binaries are deliberately not included yet; Windows/macOS launchers need native-host acceptance.
@@ -77,6 +78,6 @@ Linux KVM (eight CPUs) and TCG (two CPUs) boot and normal-user shell/file/TCC/Py
 
 Fresh-image fixes include writable private UEFI variables, an explicit RAM-backed boot script/Bash/wallpaper, ext2-backed temporary sockets, profile-relative graphics paths, and tablet scaling after resolution changes. Per-widget taskbar preferences are in Settings: CPU and memory default on; disk, network and compositor/app frame histories default off. Settings persist in the normal user configuration.
 
-A close/save confirmation can hold orderly shutdown open. The portable bridge keeps screenshots/input available while a power transaction waits; it never equates closing QEMU with clean guest shutdown. Forced stops remain explicitly labelled. Reboot/control reconnection is still under final acceptance; consult the generated acceptance report rather than assuming all MCP capabilities match the Linux development bridge.
+A close/save confirmation can hold orderly shutdown open. The portable bridge keeps screenshots/input available while a power transaction waits; it never equates closing QEMU with clean guest shutdown. Forced stops remain explicitly labelled. Guarded restart now confirms a fresh boot identity, and the widget choices survived both cold boot and warm restart. The portable MCP subset is smaller than the Linux development bridge; consult the generated acceptance report for its scope.
 
 The separate source-input archive includes the pinned Nixpkgs recipe tree and exact third-party source/patch/vendor inputs. Matching Brook source/submodules are supplied separately. Publication still requires the component notice review; the image remains a private candidate until that is completed. QEMU is a host prerequisite, not bundled binary code.
