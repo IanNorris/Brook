@@ -30,17 +30,30 @@ def checksum_reference(data):
 
 _checksum_library = os.environ.get('BROOK_IMAGE_CHECKSUM_LIBRARY')
 _native_checksum = None
+_native_checksum_update = None
 if _checksum_library:
     _checksum_handle = ctypes.CDLL(_checksum_library)
     _native_checksum = _checksum_handle.brook_image_checksum
     _native_checksum.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     _native_checksum.restype = ctypes.c_uint64
+    _native_checksum_update = _checksum_handle.brook_image_checksum_update
+    _native_checksum_update.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint64]
+    _native_checksum_update.restype = ctypes.c_uint64
 
 def checksum(data):
     if _native_checksum is not None:
         payload = bytes(data)
         return _native_checksum(payload, len(payload))
     return checksum_reference(data)
+
+def checksum_update(seed, data):
+    payload = bytes(data)
+    require(0 <= seed < (1 << 64), 'invalid checksum seed')
+    if _native_checksum_update is not None:
+        return _native_checksum_update(seed, payload, len(payload))
+    for byte in payload:
+        seed = ((seed ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    return seed
 
 def align(value):
     return (value + 4095) & ~4095

@@ -21,7 +21,7 @@ int main(int argc,char** argv){
     assert(argc==4 && (!strcmp(argv[2],"read") || !strcmp(argv[2],"map")));
     int mapped=!strcmp(argv[2],"map");char* end;long mib=strtol(argv[3],&end,10);assert(!*end && mib>=0 && mib<=192);
     FILE* manifest=fopen(argv[1],"rb");assert(manifest);char magic[8];uint64_t count;
-    assert(fread(magic,8,1,manifest)==1 && !memcmp(magic,"BRKBEN01",8));assert(fread(&count,8,1,manifest)==1 && count && count<=65536);
+    assert(fread(magic,8,1,manifest)==1 && !memcmp(magic,"BRKBEN01",8));assert(fread(&count,8,1,manifest)==1 && count && count<=131072);
     uint64_t* samples=calloc(count,sizeof(*samples));assert(samples);
     size_t hogBytes=(size_t)mib*1024*1024;unsigned char* hog=NULL;
     if(hogBytes){hog=mmap(NULL,hogBytes,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);assert(hog!=MAP_FAILED);memset(hog,0x5a,hogBytes);}
@@ -44,6 +44,6 @@ int main(int argc,char** argv){
     uint64_t elapsed=ns()-start;long freeAfter=ctl(3,0),cacheAfter=ctl(16,0),reclaimed=ctl(16,2)-reclaimedBefore;
     assert(fgetc(manifest)==EOF && fclose(manifest)==0);qsort(samples,count,sizeof(*samples),order);
     if(hogBytes){for(size_t i=0;i<hogBytes;i+=4096)assert(hog[i]==0x5a);assert(munmap(hog,hogBytes)==0);}
-    printf("IMAGE_BENCH_PASS mode=%s hog_mib=%ld files=%llu bytes=%llu digest=%llx elapsed_ns=%llu file_p50_ns=%llu file_p95_ns=%llu file_max_ns=%llu free_before=%ld free_after=%ld cached_before=%ld cached_after=%ld reclaimed=%ld\n",argv[2],mib,(unsigned long long)count,(unsigned long long)total,(unsigned long long)combined,(unsigned long long)elapsed,(unsigned long long)samples[count/2],(unsigned long long)samples[(count-1)*95/100],(unsigned long long)samples[count-1],freeBefore,freeAfter,cacheBefore,cacheAfter,reclaimed);
+    printf("IMAGE_BENCH_PASS mode=%s hog_mib=%ld files=%llu bytes=%llu digest=%llx elapsed_ns=%llu start_ns=%llu end_ns=%llu file_p50_ns=%llu file_p95_ns=%llu file_max_ns=%llu free_before=%ld free_after=%ld cached_before=%ld cached_after=%ld reclaimed=%ld\n",argv[2],mib,(unsigned long long)count,(unsigned long long)total,(unsigned long long)combined,(unsigned long long)elapsed,(unsigned long long)start,(unsigned long long)(start+elapsed),(unsigned long long)samples[count/2],(unsigned long long)samples[(count-1)*95/100],(unsigned long long)samples[count-1],freeBefore,freeAfter,cacheBefore,cacheAfter,reclaimed);
     free(samples);return 0;
 }

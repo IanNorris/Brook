@@ -5,11 +5,13 @@ import os
 from pathlib import Path
 import random
 import stat
+import struct
 import subprocess
 import tarfile
 import tempfile
 import unittest
 import compressed_image as ci
+import compressed_image_bench_manifest as benchmark_manifest
 
 LIBRARY = os.environ.get('BROOK_IMAGE_TEST_LZ4_LIBRARY') or os.environ.get('BROOK_IMAGE_LZ4_LIBRARY')
 CPP = Path(os.environ.get('BROOK_IMAGE_TEST_CPP', 'build/release/host_tests/test_compressed_image')).resolve()
@@ -60,6 +62,38 @@ class Images(unittest.TestCase):
         if ci._native_checksum is not None:
             typed=memoryview(bytes(range(256))).cast('I')
             self.assertEqual(ci.checksum(typed),ci.checksum_reference(bytes(typed)))
+
+    def test_incremental_checksum_matches_whole_file(self):
+        data=random.Random(17).randbytes(196625)
+        expected=ci.checksum_reference(data)
+        for chunk in [1,255,4096,65536,65537,len(data)+1]:
+            digest=14695981039346656037
+            for at in range(0,len(data),chunk):
+                digest=ci.checksum_update(digest,memoryview(data)[at:at+chunk])
+            self.assertEqual(digest,expected)
+            self.assertEqual(ci.checksum_update(digest,b''),digest)
+        for invalid in [-1,1<<64]:
+            with self.assertRaises(ValueError):ci.checksum_update(invalid,b'')
+
+    def test_benchmark_manifest_covers_unique_regular_files(self):
+        destination=self.base/'manifest.bin'
+        self.assertEqual(benchmark_manifest.build(self.path,destination,'/nix/store',LIBRARY),3)
+        data=destination.read_bytes();self.assertEqual(data[:8],b'BRKBEN01')
+        count=struct.unpack_from('<Q',data,8)[0];at=16;observed=[]
+        image=self.image()
+        try:
+            paths=dict(image.paths())
+            for _ in range(count):
+                length,size,digest=struct.unpack_from('<IQQ',data,at);at+=20
+                path=data[at:at+length];at+=length
+                self.assertTrue(path.startswith(b'/nix/store/'))
+                inode=paths[path[len(b'/nix/store/'):]]
+                content=image.read(inode,0,size)
+                self.assertEqual((size,digest),(len(content),ci.checksum_reference(content)))
+                observed.append(inode)
+            self.assertEqual(len(set(observed)),3)
+        finally:image.close()
+        self.assertEqual(at,len(data))
 
     def rehash(self, data):
         h = list(ci.HEADER.unpack_from(data));h[17] = ci.checksum(data[ci.HEADER.size:h[15]])

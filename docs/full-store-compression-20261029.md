@@ -144,3 +144,103 @@ are in `first-pair-comparison.json`, `matched-raw/` and `matched-lz4/` under the
 ignored evidence directory. Remaining work includes low-memory full-store
 exercise and broader application/shared-AS paging; this pair does not close
 the overall paging/compression goal.
+
+## Full-store low-memory acceptance
+
+The benchmark manifest now permits up to 131,072 unique regular files, covering
+the full installed store rather than a reduced closure. Its generator computes
+checksums incrementally with bounded 64-KiB reads. The optional native checksum
+library exports an incremental FNV update; differential tests cover arbitrary
+chunk boundaries, empty updates and invalid seeds. The image/tool suite passes
+11 tests with native acceleration and independently with the Python reference.
+
+Four fresh eight-vCPU private native-test VMs use the same frozen boot seed,
+current kernel/module ABI and full raw/LZ4 stores. Sequential reads use 512 MiB
+RAM and a 192 MiB ordinary anonymous allocation, leaving about 32 MiB free.
+Whole-file mmap uses 1 GiB RAM with the same allocation: the largest individual
+file is 477.5 MiB and must fit while actively mapped. This checks full-file
+mapping behavior; it does not assume mapped clean pages can already be evicted.
+Each pass verifies every file against the trusted manifest, checks the ordinary
+allocation afterward, and completes original launch-owner exit zero following
+checked sync/shutdown and QEMU exit zero.
+
+Results from one forward raw/LZ4 pair per access mode:
+
+- Sequential reads: 75.37 s raw versus 60.18 s LZ4, a 20.2% elapsed reduction.
+  Packed-device reads are 11,928.26 versus 5,817.77 MiB. Minimum sampled free
+  memory is 32.28 versus 32.54 MiB. These direct reads use bounded decoder
+  buffers and do not populate the mmap page cache.
+- Whole-file mappings: 121.30 s raw versus 89.32 s LZ4, a 26.4% elapsed
+  reduction. Packed-device reads are 18,485.23 versus 6,622.23 MiB. The cache
+  worker reclaims 81,408 versus 76,544 pages (318 versus 299 MiB). Each ends
+  with the same bounded 65,536-page/256-MiB cache; compression does not shrink
+  its decompressed resident pages.
+
+Every pass verifies 92,590 unique regular files and 11,959,287,571 bytes, with
+the same combined digest `e4712804ff3db47b`. The same-size index, node/link state
+and decoder buffers cost about 23.84 MiB per mount in either codec. Mapped I/O
+includes rereads and preloading; it is not equal to unique file bytes. Host
+caches are not globally flushed, so these are guest-cold workload observations,
+not physical cold-SSD benchmarks or proof of a universal startup improvement.
+The measurements establish a useful full-store throughput gain alongside
+bounded low-memory operation; more repetitions would be needed to quantify
+variance tightly.
+
+The first read-only setup pass itself verified all bytes, but the host harness
+incorrectly required mmap-cache reclamation from the direct-read path. That
+control remains marked failed with its evidence preserved. The four reported
+controls use the corrected criterion: direct reads must start below 64 MiB free;
+mapped passes must actually reclaim cache pages. No failed control is counted
+among the four completed controls.
+
+Evidence lives in `pressure-store/` under the private review directory:
+`results.json`, per-control job/stats/device/shutdown/owner receipts and the
+frozen staging hashes. No packed images or source manifests are committed.
+
+## Remaining bounded responsiveness and boot gates
+
+Before measuring an active desktop under the same pressure workload, use the
+existing instrumented cube from `tools/vulkan-cube-timing-pkg` and its offline
+analyzer. The file benchmark now emits guest monotonic `start_ns`/`end_ns` so
+load windows can be matched to cube timestamps. The four results above predate
+those additional output fields; their timed intervals remain unchanged.
+
+Predeclare the following engineering acceptance thresholds, before inspecting
+any new active-client trace:
+
+- Match GPU, resolution, VM memory and anonymous load between raw/LZ4 boots;
+  leave experimental executable paging enrollment disabled.
+- Retain at least 1,000 complete presentation intervals and 20 seconds wholly
+  inside the load window. Require successful client/workload completion, zero
+  missing/error/overflow trace rows and verified cleanup.
+- Loaded present-return interval p95 must be at most 50 ms and twice idle p95;
+  p99 at most 100 ms and maximum at most 500 ms.
+- LZ4 loaded p95 must be no more than 20% worse than the matched raw control.
+  Report useful-work duration, actual memory headroom and any stalls alongside
+  the latency. A failing idle baseline must be diagnosed without relaxing the
+  criterion after seeing results.
+
+These measure client presentation-call pacing, not physical scanout or input
+latency. Verify visible animation before/during loading through Terra. Keep an
+uninstrumented observer-overhead control. The compositor's short 256-interval
+stats window can explain outliers but cannot replace the complete client trace.
+
+The Steam/boot follow-up also still needs matched repeated controls with both
+host launch and actual guest first-desktop-presented endpoints. The earlier
+host debug-readiness observations are not substitutes for desktop boot time.
+Compressed boot kernels/modules and general shared-AS anonymous paging remain
+future work; neither should be silently added as a new requirement for closing
+the original bounded paging/compression goal.
+
+All twelve read-only ext2 consistency checks of the pressure controls' data,
+Nix and tmp partitions pass after shutdown. The checks export only stopped
+private qcow2 views, retain reports and remove temporary partition copies after
+successful checking. The final timed probe with load-window markers also builds
+with static musl and `-Wall -Wextra -Werror`.
+
+The original Steam pair's actual desktop endpoint can be recovered from the
+existing `BOOT: desktop presented` serial event: 5,060 ms raw and 5,125 ms LZ4.
+Those guest-compositor clock endpoints differ from the 11.53/9.63 s host start
+through debug-readiness measurements. They show no guest boot-time improvement
+in this pair. Exact records are in `first-pair-boot-endpoints.json`. Repeated
+matched controls and the active-client pressure gate remain pending.

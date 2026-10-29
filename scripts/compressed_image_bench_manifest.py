@@ -8,7 +8,7 @@ host. Outputs are exclusive; a failed build may leave an incomplete manifest.
 import argparse
 from pathlib import Path
 import struct
-from compressed_image import Image, FILE, CHUNK
+from compressed_image import Image, FILE, CHUNK, checksum_update
 
 
 def build(image_path, destination, prefix, library=None):
@@ -25,15 +25,14 @@ def build(image_path, destination, prefix, library=None):
             if not 0 < len(guest) < 4096:
                 raise ValueError('guest path exceeds workload limit')
             selected.append((guest, inode))
-        if not 0 < len(selected) <= 65536:
-            raise ValueError('workload requires 1..65536 unique regular files')
+        if not 0 < len(selected) <= 131072:
+            raise ValueError('workload requires 1..131072 unique regular files')
         with Path(destination).open('xb') as output:
             output.write(b'BRKBEN01' + struct.pack('<Q', len(selected)))
             for guest, inode in selected:
                 size, digest = image.nodes[inode].size, 14695981039346656037
                 for offset in range(0, size, CHUNK):
-                    for byte in image.read(inode, offset, min(CHUNK, size-offset)):
-                        digest = ((digest ^ byte) * 1099511628211) & ((1 << 64)-1)
+                    digest = checksum_update(digest, image.read(inode, offset, min(CHUNK, size-offset)))
                 output.write(struct.pack('<IQQ', len(guest), size, digest) + guest)
         return len(selected)
     finally:
