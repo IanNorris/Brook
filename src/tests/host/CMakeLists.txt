@@ -269,6 +269,15 @@ target_compile_options(test_tcp PRIVATE
     -DBROOK_HOST_TEST
 )
 
+add_host_test(test_socket_lifetime "${BROOK_ROOT}/src/kernel/src/tcp.cpp")
+target_compile_options(test_socket_lifetime PRIVATE -DBROOK_HOST_TEST -DBROOK_SOCKET_LIFETIME_TEST
+    -ffunction-sections -fdata-sections -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter -Wno-attributes -Wno-misleading-indentation
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_compile_options(test_socket_lifetime PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wno-class-memaccess>)
+target_link_options(test_socket_lifetime PRIVATE -Wl,--gc-sections)
+set_tests_properties(test_socket_lifetime PROPERTIES TIMEOUT 20)
+
 add_host_test(test_kmutex)
 add_host_test(test_krwlock)
 add_host_test(test_ksemaphore)

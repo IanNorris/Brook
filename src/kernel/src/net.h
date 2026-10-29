@@ -378,11 +378,12 @@ struct Socket {
     uint32_t ownerPid;
     SocketIdentity identity; // inode fixed; accepted credentials finalized before FD publication
 
-    // Poll waiter — process to wake when data arrives
+    // Poll waiter — owns a Process liveness reference until cleared or woken.
     Process* pollWaiter;
 
     // Spinlock protecting rxBuf/rxHead/rxTail/rxCount and TCP state fields.
-    // Acquired by both the IRQ handler (HandleTcp) and userspace syscall paths.
+    // Acquired by RX (HandleTcp) and userspace syscall paths. Permanent slot
+    // synchronization: exclude this field from all incarnation payload resets.
     SpinLock lock;
 };
 

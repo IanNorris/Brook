@@ -90,3 +90,41 @@ count discrepancies. A checked flush does not complete process teardown or reap
 open-but-unlinked objects. The image remains untouched; no repair is applied to
 failure evidence. This adds no passing filesystem/shutdown result to acceptance.
 Use fresh copies of the original checked source for the fixed-kernel rerun.
+
+
+## Repair validation in progress
+
+The repair keeps callback borrow counts, generation and last-close ownership
+outside the resettable payload. The slot ticket lock is permanent. RX, UDP,
+listener creation, maintenance and diagnostic scans pin each candidate before
+reading fields; final close withdraws publication, waits outside all locks for
+borrowers, then frees/reset/releases the reservation. FD and accept-queue refs
+remain separate from callback borrows, whose release never starts graceful close.
+
+RX and maintenance decide ACK state under the socket lock and capture immutable
+route/header scalars before sending outside it. Stored poll waiters own Process
+liveness refs, transferred through deferred wakeup or cleared on replacement,
+operation return and final close. Connect/ACK-wait scoped cleanup covers timeout
+with a socket owner surviving the waiting thread.
+
+The new `test_socket_lifetime` compiles actual net.cpp/Socket/TCP code with
+host allocation/scheduling stubs and a transmit-boundary substitution. It covers
+queued RX ticket versus close, paused transmit tail versus buffer retirement,
+borrow versus unpublish/reuse, stale generation rejection, reentrant FIN/ACK,
+listener close during child allocation, partial allocation failure, concurrent
+last-owner drops, UDP Process refs and blocking timeout with surviving FD owner.
+Both it and existing `test_tcp` pass 100 repetitions under the Nix Clang host
+configuration. Address/undefined-behavior sanitizer checks pass; the production
+kernel builds and compiled entry/startup mutation audits pass. Hosted tests do
+not prove real scheduler/NIC or Steam behavior. The fresh native control remains
+the required acceptance gate; the original failed run remains preserved.
+
+The first repaired raw-store VM (`socket-fixed-raw`) passes 64 native concurrent
+TCP close/reuse sessions and renders the authenticated Steam Store with featured
+content (Terra visual review). Steam reaches its titled window in 97.51 s; this
+is a stability result, not a startup speed improvement. Its normal shutdown
+helper exits with status 0, checked guest sync/shutdown completes and the QEMU
+owner exits 0. Offline read-only checks of its data/Nix/tmp filesystems all exit 0. The
+matching LZ4-store control is still pending. Reusable native stress is
+`scripts/workloads/socket_close_reuse_check.py`; it uses only bounded loopback
+connections and exact bidirectional payload checks.

@@ -28,7 +28,11 @@
 #include "memory/virtual_memory.h"
 #include "klog.h"
 #include "profiler.h"
+#ifdef BROOK_SOCKET_LIFETIME_TEST
+#include <cstring>
+#else
 #include "string.h"
+#endif
 #include "loopback_queue.h"
 #include "ksym_addrs.h"
 #include "window.h"
@@ -126,6 +130,11 @@ static constexpr uint32_t MAX_SOCKETS = 1024;
 static Socket g_sockets[MAX_SOCKETS];
 static bool   g_sockUsed[MAX_SOCKETS];
 static bool   g_sockReserved[MAX_SOCKETS];
+// Slot control survives every payload reset. Callback borrows are independent
+// of FD/accept-queue ownership: releasing one must never enter graceful close.
+static uint32_t g_sockBorrowers[MAX_SOCKETS];
+static uint64_t g_sockGeneration[MAX_SOCKETS];
+static bool g_sockClosing[MAX_SOCKETS];
 // Only slot reservation/publication/retirement and scalar snapshots. Never
 // allocate, transmit, wait, or acquire process/FD locks while held.
 static IrqSpinLock g_socketRegistryLock;
@@ -134,10 +143,95 @@ static SocketInodeAllocator g_socketInodes;
 // dispose while held. Queue -> child.lock is the only nested lock order.
 static IrqSpinLock g_acceptQueueLock;
 
+// A published incarnation is pinned before examining any candidate fields.
+// No registry guard is held while waiting on a socket or running callbacks.
+class SocketBorrow {
+    int index_ = -1;
+public:
+    explicit SocketBorrow(uint32_t index, uint64_t generation = 0) {
+        if (index >= MAX_SOCKETS || !__atomic_load_n(&g_sockUsed[index], __ATOMIC_ACQUIRE)) return;
+        const uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+        if (g_sockUsed[index] && (!generation || generation == g_sockGeneration[index])) {
+            ++g_sockBorrowers[index];
+            index_ = static_cast<int>(index);
+        }
+        IrqSpinLockRelease(&g_socketRegistryLock, flags);
+    }
+    ~SocketBorrow() {
+        if (index_ < 0) return;
+        const uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+        --g_sockBorrowers[index_];
+        IrqSpinLockRelease(&g_socketRegistryLock, flags);
+    }
+    explicit operator bool() const { return index_ >= 0; }
+    SocketBorrow(const SocketBorrow&) = delete;
+    SocketBorrow& operator=(const SocketBorrow&) = delete;
+};
+
+static void ResetSocketPayload(Socket& socket)
+{
+    // The ticket lock belongs to the slot, not its current incarnation. Even
+    // allocation failure must preserve its monotonically advancing counters.
+    memset(&socket, 0, __builtin_offsetof(Socket, lock));
+}
+
+// Caller holds socket.lock. The stored pointer owns a Process liveness ref;
+// replacing/clearing it never frees inline (the process reaper does that).
+static void SetSocketWaiterLocked(Socket& socket, Process* waiter)
+{
+    if (socket.pollWaiter == waiter) return;
+    ProcessRef(waiter);
+    Process* old = socket.pollWaiter;
+    socket.pollWaiter = waiter;
+    ProcessUnref(old);
+}
+
+static Process* TakeSocketWaiterLocked(Socket& socket)
+{
+    Process* waiter = socket.pollWaiter;
+    socket.pollWaiter = nullptr;
+    return waiter; // transfer the stored liveness ref to the caller
+}
+
+// Each blocking operation removes its own registration on every return path.
+// Another waiter may replace it meanwhile; never clear that newer owner.
+class SocketWaitRegistration {
+    Socket& socket_;
+    Process* waiter_;
+public:
+    SocketWaitRegistration(Socket& socket, Process* waiter) : socket_(socket), waiter_(waiter) {}
+    ~SocketWaitRegistration() {
+        if (!waiter_) return;
+        SpinLockAcquire(&socket_.lock);
+        if (socket_.pollWaiter == waiter_) SetSocketWaiterLocked(socket_, nullptr);
+        SpinLockRelease(&socket_.lock);
+    }
+    SocketWaitRegistration(const SocketWaitRegistration&) = delete;
+    SocketWaitRegistration& operator=(const SocketWaitRegistration&) = delete;
+};
+
 // IPv4 identification counter (atomic for SMP safety)
 static volatile uint16_t g_ipId = 1;
 
 static uint32_t g_tcpEphemeralPort = 49200; // accessed via atomic fetch-add
+
+static uint32_t TcpReceiveFree(const Socket& s);
+
+struct TcpTxSnapshot {
+    uint32_t localIp, remoteIp, ack, nextSeq, iss, ownerPid;
+    uint16_t localPort, remotePort, window;
+    uint8_t windowScale;
+};
+static TcpTxSnapshot CaptureTcpTxLocked(const Socket& s)
+{
+    uint32_t window = TcpReceiveFree(s) >> s.tcpRcvWndScale;
+    return {s.localIp, s.remoteIp, s.tcpRcvNxt, s.tcpSndNxt, s.tcpSndIss,
+            s.ownerPid, s.localPort, s.remotePort,
+            static_cast<uint16_t>(window > 65535u ? 65535u : window), s.tcpRcvWndScale};
+}
+static void TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq,
+                            uint8_t flags, const void* data, uint32_t dataLen,
+                            const char* why);
 
 // Forward declaration for TCP send (defined below)
 static void TcpSendSegment(Socket& s, uint8_t flags,
@@ -442,6 +536,10 @@ static void NetSendStackWatermark(uint32_t dstIp, uint8_t proto, uint32_t payloa
 static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
                           const void* payload, uint32_t payloadLen)
 {
+#ifdef BROOK_SOCKET_LIFETIME_TEST
+    extern int SocketLifetimeTestTransmit(uint32_t, uint32_t, uint8_t, const void*, uint32_t);
+    return SocketLifetimeTestTransmit(source, dstIp, proto, payload, payloadLen);
+#else
     NetSendStackWatermark(dstIp, proto, payloadLen);
 
     NetIf* nif = NetIfForDst(dstIp);
@@ -534,6 +632,7 @@ static int NetSendIpv4From(uint32_t source, uint32_t dstIp, uint8_t proto,
     nif->txPackets++;
     nif->txBytes += frameLen;
     return nif->transmit(nif, frame, frameLen);
+#endif
 }
 
 int NetSendIpv4(uint32_t dstIp, uint8_t proto, const void* payload, uint32_t payloadLen)
@@ -1496,7 +1595,7 @@ static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
         IrqSpinLockRelease(&g_socketRegistryLock, flags);
         if (!available) continue;
         Socket& socket = g_sockets[i];
-        memset(&socket, 0, sizeof(Socket));
+        ResetSocketPayload(socket);
         socket.domain = domain;
         socket.type = type;
         socket.protocol = protocol ? protocol : (type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP);
@@ -1509,13 +1608,16 @@ static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
             if (socket.rxBuf) kfree(socket.rxBuf);
             if (socket.tcpOooBuf) kfree(socket.tcpOooBuf);
             flags = IrqSpinLockAcquire(&g_socketRegistryLock);
-            memset(&socket, 0, sizeof(Socket));
+            ResetSocketPayload(socket);
             g_sockReserved[i] = false;
             IrqSpinLockRelease(&g_socketRegistryLock, flags);
             return -1;
         }
         socket.refCount = 1;
         flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+        ++g_sockGeneration[i];
+        if (!g_sockGeneration[i]) ++g_sockGeneration[i];
+        g_sockClosing[i] = false;
         __atomic_store_n(&g_sockUsed[i], true, __ATOMIC_RELEASE);
         IrqSpinLockRelease(&g_socketRegistryLock, flags);
         return static_cast<int>(i);
@@ -1524,7 +1626,8 @@ static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
     uint32_t nEstab = 0, nCloseWait = 0, nFinWait = 0, nSynSent = 0, nOther = 0;
     uint32_t nUdp = 0;
     for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
-        if (!g_sockUsed[i]) continue;
+        SocketBorrow borrow(i);
+        if (!borrow) continue;
         if (g_sockets[i].type == SOCK_DGRAM) { nUdp++; continue; }
         switch (g_sockets[i].tcpState) {
         case TcpState::Established: nEstab++; break;
@@ -1676,7 +1779,7 @@ int SockRecvFrom(int sockIdx, void* buf, uint32_t len,
     return static_cast<int>(copyLen);
 }
 
-void SockClose(int sockIdx)
+static void SockFinalize(int sockIdx)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
     if (!g_sockUsed[sockIdx]) return;
@@ -1692,8 +1795,12 @@ void SockClose(int sockIdx)
         queuedCount = s.acceptQueueCount;
         for (int i = 0; i < queuedCount; ++i) {
             queued[i] = s.acceptQueue[i];
-            if (queued[i] >= 0 && queued[i] < static_cast<int>(MAX_SOCKETS))
-                g_sockets[queued[i]].listenSockIdx = -1;
+            if (queued[i] >= 0 && queued[i] < static_cast<int>(MAX_SOCKETS)) {
+                Socket& child = g_sockets[queued[i]];
+                SpinLockAcquire(&child.lock);
+                child.listenSockIdx = -1;
+                SpinLockRelease(&child.lock);
+            }
         }
         s.acceptQueueCount = 0;
     }
@@ -1713,10 +1820,10 @@ void SockClose(int sockIdx)
     // When the same local port is reused for a new connection to the same peer,
     // the peer sees a new SYN on a 4-tuple it thinks is still open and responds
     // with FIN/RST — killing the new connection immediately.
-    if (s.type == SOCK_STREAM &&
-        (s.tcpState == TcpState::Established ||
-         s.tcpState == TcpState::CloseWait))
-    {
+    SpinLockAcquire(&s.lock);
+    const bool sendFin = s.type == SOCK_STREAM &&
+        (s.tcpState == TcpState::Established || s.tcpState == TcpState::CloseWait);
+    if (sendFin) {
         // Active close (Established): wait for FIN-ACK (FinWait1 → FinWait2 → done)
         // Passive close (CloseWait):  wait for ACK of our FIN (LastAck → Closed)
         const uint32_t seq = s.tcpSndNxt++;
@@ -1725,7 +1832,9 @@ void SockClose(int sockIdx)
                          : TcpState::LastAck;
         // Local delivery may synchronously process the peer's ACK/FIN.
         // Publish the closing state first, and never overwrite its response.
-        TcpSendSegmentAtSeq(s, seq, TCP_FIN | TCP_ACK, nullptr, 0, "close");
+        const auto snapshot = CaptureTcpTxLocked(s);
+        SpinLockRelease(&s.lock);
+        TcpSendSnapshot(s, snapshot, seq, TCP_FIN | TCP_ACK, nullptr, 0, "close");
 
         // Wait up to 500ms for the peer to acknowledge our FIN.
         // We must use SchedulerBlock (not SchedulerYield) because SchedulerYield
@@ -1735,27 +1844,43 @@ void SockClose(int sockIdx)
         Process* self = ProcessCurrent();
         if (self) {
             uint64_t deadline = ApicTickCount() + 500;
-            while (s.tcpState == TcpState::FinWait1 ||
-                   s.tcpState == TcpState::FinWait2 ||
-                   s.tcpState == TcpState::LastAck) {
-                if (ApicTickCount() >= deadline) break;
+            for (;;) {
                 SpinLockAcquire(&s.lock);
-                s.pollWaiter = self;
-                self->wakeupTick = ApicTickCount() + 50; // check every 50ms
+                const bool waiting = s.tcpState == TcpState::FinWait1 ||
+                    s.tcpState == TcpState::FinWait2 || s.tcpState == TcpState::LastAck;
+                if (!waiting || ApicTickCount() >= deadline) {
+                    SpinLockRelease(&s.lock);
+                    break;
+                }
+                SetSocketWaiterLocked(s, self);
+                self->wakeupTick = ApicTickCount() + 50;
                 SpinLockRelease(&s.lock);
                 SchedulerBlock(self);
             }
         }
+    } else {
+        SpinLockRelease(&s.lock);
     }
 
-    if (s.tcpOooBuf)
-        kfree(s.tcpOooBuf);
-    if (s.rxBuf)
-        kfree(s.rxBuf);
-
+    // Stop new callbacks, then let existing RX/TX/wakeup tails finish. Keep
+    // the reservation until both buffers and payload have been retired.
     uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
     __atomic_store_n(&g_sockUsed[sockIdx], false, __ATOMIC_RELEASE);
-    memset(&g_sockets[sockIdx], 0, sizeof(Socket));
+    IrqSpinLockRelease(&g_socketRegistryLock, flags);
+    for (;;) {
+        flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+        const bool drained = g_sockBorrowers[sockIdx] == 0;
+        IrqSpinLockRelease(&g_socketRegistryLock, flags);
+        if (drained) break;
+        SchedulerYield();
+    }
+    SpinLockAcquire(&s.lock);
+    SetSocketWaiterLocked(s, nullptr);
+    SpinLockRelease(&s.lock);
+    if (s.tcpOooBuf) kfree(s.tcpOooBuf);
+    if (s.rxBuf) kfree(s.rxBuf);
+    ResetSocketPayload(s);
+    flags = IrqSpinLockAcquire(&g_socketRegistryLock);
     g_sockReserved[sockIdx] = false;
     IrqSpinLockRelease(&g_socketRegistryLock, flags);
 }
@@ -1763,18 +1888,29 @@ void SockClose(int sockIdx)
 void SockRef(int sockIdx)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
-    if (!g_sockUsed[sockIdx]) return;
-    __atomic_fetch_add(&g_sockets[sockIdx].refCount, 1, __ATOMIC_RELEASE);
+    const uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+    if (g_sockUsed[sockIdx] && !g_sockClosing[sockIdx])
+        ++g_sockets[sockIdx].refCount;
+    IrqSpinLockRelease(&g_socketRegistryLock, flags);
 }
 
 void SockUnref(int sockIdx)
 {
     if (sockIdx < 0 || sockIdx >= static_cast<int>(MAX_SOCKETS)) return;
-    if (!g_sockUsed[sockIdx]) return;
-    uint32_t prev = __atomic_fetch_sub(&g_sockets[sockIdx].refCount, 1, __ATOMIC_ACQ_REL);
-    if (prev <= 1)
-        SockClose(sockIdx);
+    const uint64_t flags = IrqSpinLockAcquire(&g_socketRegistryLock);
+    bool finalize = false;
+    if (g_sockUsed[sockIdx] && !g_sockClosing[sockIdx] && g_sockets[sockIdx].refCount) {
+        if (--g_sockets[sockIdx].refCount == 0) {
+            g_sockClosing[sockIdx] = true;
+            finalize = true;
+        }
+    }
+    IrqSpinLockRelease(&g_socketRegistryLock, flags);
+    if (finalize) SockFinalize(sockIdx);
 }
+
+// Direct close callers own exactly one reference, just like FD/queue teardown.
+void SockClose(int sockIdx) { SockUnref(sockIdx); }
 
 void SockSetPollWaiter(int sockIdx, Process* waiter)
 {
@@ -1782,7 +1918,7 @@ void SockSetPollWaiter(int sockIdx, Process* waiter)
     if (!g_sockUsed[sockIdx]) return;
     Socket& s = g_sockets[sockIdx];
     SpinLockAcquire(&s.lock);
-    s.pollWaiter = waiter;
+    SetSocketWaiterLocked(s, waiter);
     SpinLockRelease(&s.lock);
 }
 
@@ -1792,7 +1928,7 @@ void SockClearPollWaiter(int sockIdx, Process* waiter)
     if (!g_sockUsed[sockIdx]) return;
     Socket& s = g_sockets[sockIdx];
     SpinLockAcquire(&s.lock);
-    if (s.pollWaiter == waiter) s.pollWaiter = nullptr;
+    if (s.pollWaiter == waiter) SetSocketWaiterLocked(s, nullptr);
     SpinLockRelease(&s.lock);
 }
 
@@ -1835,17 +1971,16 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
     }
     uint16_t dstPortBE = htons(dstPort);
     for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
-        if (!g_sockUsed[i]) continue;
+        SocketBorrow borrow(i);
+        if (!borrow) continue;
         Socket& s = g_sockets[i];
-        if (s.type != SOCK_DGRAM) continue;
-        if (!s.bound) continue;
-        if (s.localPort != dstPortBE) continue;
-
-        // Match — enqueue datagram
-        // Format: [len:4][srcIp:4][srcPort:2][data:len]
-        uint32_t needed = 10 + len;
-
         SpinLockAcquire(&s.lock);
+        if (s.type != SOCK_DGRAM || !s.bound || s.localPort != dstPortBE) {
+            SpinLockRelease(&s.lock);
+            continue;
+        }
+        // Datagram layout: [len:4][srcIp:4][srcPort:2][data:len].
+        uint32_t needed = 10 + len;
 
         uint32_t avail = Socket::RX_BUF_SIZE - s.rxCount;
         if (needed > avail) {
@@ -1879,21 +2014,22 @@ void SockDeliverUdp(uint32_t srcIp, uint16_t srcPort,
         __asm__ volatile("mfence" ::: "memory");
         s.rxCount += needed;
 
-        Process* waiter = s.pollWaiter;
-        if (waiter) s.pollWaiter = nullptr;
+        Process* waiter = TakeSocketWaiterLocked(s);
+        const uint32_t deliveredCount = s.rxCount;
 
         SpinLockRelease(&s.lock);
 
         // Log DNS delivery diagnostics
         if (srcPort == 53) {
             SerialPrintf("[NET_DIAG] udp_deliver_dns sock=%u rxCount=%u waiter=%s\n",
-                         i, s.rxCount, waiter ? "yes" : "NO");
+                         i, deliveredCount, waiter ? "yes" : "NO");
         }
 
         // Wake poll waiter after releasing the lock
         if (waiter) {
             __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
             SchedulerUnblock(waiter);
+            ProcessUnref(waiter);
         }
 
         return; // only deliver to first matching socket
@@ -1934,8 +2070,6 @@ static void TcpStatsRecord(bool tx, uint8_t flags, uint32_t dataLen)
     }
 }
 
-static uint32_t TcpReceiveFree(const Socket& s);
-
 static void TcpStatsMaybeFlush()
 {
     uint64_t now = ApicTickCount();
@@ -1952,22 +2086,22 @@ static void TcpStatsMaybeFlush()
     static constexpr uint64_t WINDOW_KEEPALIVE_MS = 2000;
     static constexpr uint32_t WINDOW_KEEPALIVE_MSS = 1460;
     for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
-        if (!g_sockUsed[i]) continue;
+        SocketBorrow borrow(i);
+        if (!borrow) continue;
         Socket& s = g_sockets[i];
-        if (s.type != SOCK_STREAM) continue;
-        if (s.tcpUnackedSegs > 0 && TcpTimerElapsed(now, s.tcpLastDataTick, DELAYED_ACK_MS)) {
-            s.tcpUnackedSegs = 0;
-            TcpSendSegment(s, TCP_ACK, nullptr, 0, "delayed-ack-timer");
-        }
-        // Proactive window update for stalled connections
-        if (s.tcpState == TcpState::Established &&
-            s.tcpLastRxTick != 0 &&
-            TcpTimerElapsed(now, s.tcpLastRxTick, WINDOW_KEEPALIVE_MS) &&
-            TcpReceiveFree(s) >= WINDOW_KEEPALIVE_MSS)
-        {
-            TcpSendSegment(s, TCP_ACK, nullptr, 0, "wnd-keepalive");
-            s.tcpLastRxTick = now; // don't spam — re-arm for next 2s
-        }
+        SpinLockAcquire(&s.lock);
+        bool delayed = s.type == SOCK_STREAM && s.tcpUnackedSegs > 0 &&
+            TcpTimerElapsed(now, s.tcpLastDataTick, DELAYED_ACK_MS);
+        bool keepalive = s.type == SOCK_STREAM && s.tcpState == TcpState::Established &&
+            s.tcpLastRxTick != 0 && TcpTimerElapsed(now, s.tcpLastRxTick, WINDOW_KEEPALIVE_MS) &&
+            TcpReceiveFree(s) >= WINDOW_KEEPALIVE_MSS;
+        if (delayed) s.tcpUnackedSegs = 0;
+        if (keepalive) s.tcpLastRxTick = now;
+        const auto snapshot = CaptureTcpTxLocked(s);
+        SpinLockRelease(&s.lock);
+        if (delayed || keepalive)
+            TcpSendSnapshot(s, snapshot, snapshot.nextSeq, TCP_ACK, nullptr, 0,
+                            delayed ? "delayed-ack-timer" : "wnd-keepalive");
     }
 
     if (!TcpTimerElapsed(now, g_tcpStatsLastTick, 5000)) return;
@@ -1975,10 +2109,14 @@ static void TcpStatsMaybeFlush()
         // No traffic in 5s — dump state of all established sockets to help
         // diagnose stalls (BRO-153).
         for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
-            if (!g_sockUsed[i]) continue;
+            SocketBorrow borrow(i);
+            if (!borrow) continue;
             Socket& sock = g_sockets[i];
-            if (sock.type != SOCK_STREAM) continue;
-            if (sock.tcpState != TcpState::Established) continue;
+            SpinLockAcquire(&sock.lock);
+            if (sock.type != SOCK_STREAM || sock.tcpState != TcpState::Established) {
+                SpinLockRelease(&sock.lock);
+                continue;
+            }
             uint32_t freeSpace = TcpReceiveFree(sock);
             uint32_t wnd = freeSpace >> sock.tcpRcvWndScale;
             if (wnd > 65535u) wnd = 65535u;
@@ -1991,6 +2129,7 @@ static void TcpStatsMaybeFlush()
                          sock.tcpOooBytes,
                          sock.pollWaiter ? "yes" : "no",
                          sock.rxPktCount, sock.txPktCount);
+            SpinLockRelease(&sock.lock);
         }
         g_tcpStatsLastTick = now;
         return;
@@ -2156,7 +2295,7 @@ static bool TcpDrainOoo(Socket& s)
     return drained;
 }
 
-static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
+static void TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq, uint8_t flags,
                                 const void* data, uint32_t dataLen,
                                 const char* why)
 {
@@ -2173,19 +2312,13 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
     memset(buf, 0, tcpLen);
 
     auto* tcp = reinterpret_cast<TcpHeader*>(buf);
-    tcp->srcPort  = s.localPort;
-    tcp->dstPort  = s.remotePort;
+    tcp->srcPort  = snapshot.localPort;
+    tcp->dstPort  = snapshot.remotePort;
     tcp->seqNum   = htonl(seq);
-    tcp->ackNum   = htonl(s.tcpRcvNxt);
+    tcp->ackNum   = htonl(snapshot.ack);
     tcp->dataOff  = ((sizeof(TcpHeader) + optLen) / 4) << 4;
     tcp->flags    = flags;
-    // Advertise actual free space, scaled by our window scale factor
-    {
-        uint32_t freeSpace = TcpReceiveFree(s);
-        uint32_t scaled = freeSpace >> s.tcpRcvWndScale;
-        uint16_t wnd = scaled > 65535u ? 65535u : static_cast<uint16_t>(scaled);
-        tcp->window = htons(wnd);
-    }
+    tcp->window = htons(snapshot.window);
     tcp->urgentPtr = 0;
 
     // Write TCP options for SYN: MSS + NOP + Window Scale
@@ -2201,20 +2334,22 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
         // Window Scale option (kind=3, len=3, shift=tcpRcvWndScale)
         opts[5] = 3;
         opts[6] = 3;
-        opts[7] = s.tcpRcvWndScale;
+        opts[7] = snapshot.windowScale;
     }
 
     if (data && dataLen > 0)
         memcpy(buf + sizeof(TcpHeader) + optLen, data, dataLen);
 
     tcp->checksum = 0;
-    tcp->checksum = TcpChecksum(s.localIp, s.remoteIp, buf, tcpLen);
+    tcp->checksum = TcpChecksum(snapshot.localIp, snapshot.remoteIp, buf, tcpLen);
 
-    int sendResult = NetSendIpv4From(s.localIp, s.remoteIp, IP_PROTO_TCP, buf, tcpLen);
+    int sendResult = NetSendIpv4From(snapshot.localIp, snapshot.remoteIp, IP_PROTO_TCP, buf, tcpLen);
     if (sendResult != 0) {
         SerialPrintf("tcp: send failed flags=0x%02x err=%d\n", flags, sendResult);
     } else {
-        s.txPktCount++;
+        SpinLockAcquire(&s.lock);
+        const uint32_t packetCount = ++s.txPktCount;
+        SpinLockRelease(&s.lock);
         TcpStatsRecord(/*tx=*/true, flags, dataLen);
         // Control segments (SYN/FIN/RST) are still logged inline because they
         // mark connection state transitions worth seeing in real time. Pure
@@ -2223,8 +2358,8 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
         if (isControl) {
             int sockIdx = static_cast<int>(&s - g_sockets);
             SerialPrintf("tcp: TX pid=%u sock=%d t=%lums flags=0x%02x seq=%u ack=%u datalen=%u why=%s [pkt#%u]\n",
-                          s.ownerPid, sockIdx, ApicTickCount(), flags,
-                          seq, s.tcpRcvNxt, dataLen, why, s.txPktCount);
+                          snapshot.ownerPid, sockIdx, ApicTickCount(), flags,
+                          seq, snapshot.ack, dataLen, why, packetCount);
         }
     }
     // BRO-163: do NOT call TcpStatsMaybeFlush() here. It sends ACKs, which
@@ -2233,11 +2368,24 @@ static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
     // Periodic maintenance is driven from the net_poll loop instead.
 }
 
+static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
+                                const void* data, uint32_t dataLen,
+                                const char* why)
+{
+    SpinLockAcquire(&s.lock);
+    const auto snapshot = CaptureTcpTxLocked(s);
+    SpinLockRelease(&s.lock);
+    TcpSendSnapshot(s, snapshot, seq, flags, data, dataLen, why);
+}
+
 static void TcpSendSegment(Socket& s, uint8_t flags,
                            const void* data, uint32_t dataLen,
                            const char* why)
 {
-    TcpSendSegmentAtSeq(s, s.tcpSndNxt, flags, data, dataLen, why);
+    SpinLockAcquire(&s.lock);
+    const auto snapshot = CaptureTcpTxLocked(s);
+    SpinLockRelease(&s.lock);
+    TcpSendSnapshot(s, snapshot, snapshot.nextSeq, flags, data, dataLen, why);
 }
 
 // Append raw bytes to socket RX ring buffer.
@@ -2315,15 +2463,16 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
     // Find matching connected socket (exact 4-tuple match)
     for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
-        if (!g_sockUsed[i]) continue;
+        SocketBorrow borrow(i);
+        if (!borrow) continue;
         Socket& s = g_sockets[i];
-        if (s.type != SOCK_STREAM) continue;
-        if (s.localPort != dstPort) continue;
-        if (s.localIp != ip->dstIp) continue;
-        if (s.remotePort != srcPort) continue;
-        if (s.remoteIp != ip->srcIp) continue;
-
         SpinLockAcquire(&s.lock);
+        if (s.type != SOCK_STREAM || s.localPort != dstPort ||
+            s.localIp != ip->dstIp || s.remotePort != srcPort || s.remoteIp != ip->srcIp) {
+            SpinLockRelease(&s.lock);
+            continue;
+        }
+
 
         // Parse TCP options from SYN-ACK to extract window scale (RFC 1323)
         if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) &&
@@ -2430,14 +2579,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         Process* waiter = nullptr;
         if (s.pollWaiter && shouldWake)
         {
-            waiter = s.pollWaiter;
-            s.pollWaiter = nullptr;
+            waiter = TakeSocketWaiterLocked(s);
         }
 
-        SpinLockRelease(&s.lock);
-
-        if (act.sendSynAck)
-            TcpSendSegmentAtSeq(s, s.tcpSndIss, TCP_SYN | TCP_ACK, nullptr, 0, "synack-retry");
+        bool sendAck = false;
 
         // Delayed ACK: ACK every 2nd data segment, or immediately for
         // control events (FIN, OOO, buffer-full, connect). This halves
@@ -2455,8 +2600,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
                           || !act.enqueueData; // pure ACK / control segment
         if (act.sendAck || bufferWasFull) {
             if (mustAckNow || s.tcpUnackedSegs >= 1) {
-                TcpSendSegment(s, TCP_ACK, nullptr, 0,
-                               bufferWasFull ? "rx-bufferfull" : "rx-action");
+                sendAck = true;
                 s.tcpUnackedSegs = 0;
             } else {
                 s.tcpUnackedSegs++;
@@ -2465,12 +2609,21 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             }
         }
 
+        const auto snapshot = CaptureTcpTxLocked(s);
+        SpinLockRelease(&s.lock);
+        if (act.sendSynAck)
+            TcpSendSnapshot(s, snapshot, snapshot.iss, TCP_SYN | TCP_ACK, nullptr, 0, "synack-retry");
+        if (sendAck)
+            TcpSendSnapshot(s, snapshot, snapshot.nextSeq, TCP_ACK, nullptr, 0,
+                            bufferWasFull ? "rx-bufferfull" : "rx-action");
+
         // Wake the waiter outside the lock — SchedulerUnblock may need the
         // scheduler lock which must not be acquired while holding s.lock.
         if (waiter)
         {
             __atomic_store_n(&waiter->pendingWakeup, 1, __ATOMIC_RELEASE);
             SchedulerUnblock(waiter);
+            ProcessUnref(waiter);
         }
 
         return; // handled
@@ -2481,12 +2634,19 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
     {
         for (uint32_t i = 0; i < MAX_SOCKETS; i++)
         {
-            if (!g_sockUsed[i]) continue;
+            SocketBorrow borrow(i);
+            if (!borrow) continue;
             Socket& s = g_sockets[i];
-            if (s.type != SOCK_STREAM) continue;
-            if (!s.listening) continue;
-            if (s.localPort != dstPort) continue;
-            if (s.localIp && s.localIp != ip->dstIp) continue;
+            SpinLockAcquire(&s.lock);
+            const bool matches = s.type == SOCK_STREAM && s.localPort == dstPort &&
+                (!s.localIp || s.localIp == ip->dstIp);
+            const uint32_t ownerPid = s.ownerPid, uid = s.identity.uid, gid = s.identity.gid;
+            SpinLockRelease(&s.lock);
+            if (!matches) continue;
+            uint64_t listenerFlags = IrqSpinLockAcquire(&g_acceptQueueLock);
+            const bool listening = s.listening;
+            IrqSpinLockRelease(&g_acceptQueueLock, listenerFlags);
+            if (!listening) continue;
 
             // Reclaim abandoned children even while accept's consumer is still
             // closing its active FD; dead queue entries must not refuse a SYN.
@@ -2502,7 +2662,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
             // Create a new socket for this connection
             int childIdx = SockCreateOwned(AF_INET, SOCK_STREAM, IPPROTO_TCP,
-                                           s.ownerPid, s.identity.uid, s.identity.gid);
+                                           ownerPid, uid, gid);
             if (childIdx < 0)
             {
                 SerialPrintf("net: TCP SYN dropped — no free sockets\n");
@@ -2510,6 +2670,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             }
 
             Socket& child = g_sockets[childIdx];
+            SpinLockAcquire(&child.lock);
             child.localIp    = ip->dstIp;
             child.localPort  = dstPort;
             child.remoteIp   = ip->srcIp;
@@ -2527,8 +2688,11 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             child.tcpSndNxt = child.tcpSndIss + 1; // after SYN-ACK
             child.tcpSndUna = child.tcpSndIss;
 
-            // Send at ISS without temporarily changing the live next sequence.
-            TcpSendSegmentAtSeq(child, child.tcpSndIss, TCP_SYN | TCP_ACK, nullptr, 0, "synack");
+            const auto childSnapshot = CaptureTcpTxLocked(child);
+            SpinLockRelease(&child.lock);
+            // Retain the creator ownership through send and queue publication.
+            TcpSendSnapshot(child, childSnapshot, childSnapshot.iss,
+                            TCP_SYN | TCP_ACK, nullptr, 0, "synack");
 
             SerialPrintf("net: TCP SYN-ACK sent for port %u -> %u.%u.%u.%u:%u (childIdx=%d)\n",
                          ntohs(dstPort),
@@ -2672,6 +2836,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     }
 
     Process* self = SchedulerCurrentProcess();
+    SocketWaitRegistration registration(s, self);
 
     // Block until SYN-ACK arrives or timeout (5 second per attempt, 2 attempts)
     for (int attempt = 0; attempt < 2; attempt++) {
@@ -2683,7 +2848,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
         uint64_t deadline = ApicTickCount() + 5000;
         while (s.tcpState == TcpState::SynSent && ApicTickCount() < deadline) {
             SpinLockAcquire(&s.lock);
-            s.pollWaiter = self;
+            SetSocketWaiterLocked(s, self);
             self->wakeupTick = ApicTickCount() + 5000;
             SpinLockRelease(&s.lock);
             SchedulerBlock(self);
@@ -2710,6 +2875,7 @@ static int TcpWaitForDataAck(Socket& s, int sockIdx,
 {
 
     Process* self = SchedulerCurrentProcess();
+    SocketWaitRegistration registration(s, self);
     uint32_t seqEnd = seq + len;
     uint64_t deadline = ApicTickCount() + 30000;
     uint64_t nextRetransmit = ApicTickCount() + 200;  // 200ms initial RTO (was 1000ms)
@@ -2731,7 +2897,7 @@ static int TcpWaitForDataAck(Socket& s, int sockIdx,
         }
 
         if (self) {
-            s.pollWaiter = self;
+            SetSocketWaiterLocked(s, self);
             self->wakeupTick = nextRetransmit < deadline
                                    ? nextRetransmit
                                    : deadline;
@@ -2821,12 +2987,12 @@ int SockRecv(int sockIdx, void* buf, uint32_t len, bool dontwait)
             SpinLockRelease(&s.lock);
             return error;
         }
-        s.pollWaiter=self;
+        SetSocketWaiterLocked(s, self);
         self->wakeupTick=ApicTickCount()+100;
         SpinLockRelease(&s.lock);
         SchedulerBlock(self);
         SpinLockAcquire(&s.lock);
-        if(s.pollWaiter==self)s.pollWaiter=nullptr;
+        if(s.pollWaiter==self)SetSocketWaiterLocked(s, nullptr);
         SpinLockRelease(&s.lock);
         if(self->sigPending & ~self->sigMask)return -4;
     }
@@ -4055,7 +4221,8 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
     // -----------------------------------------------------------------------
     else if (NetStrEq(cmd, "sock")) {
         for (uint32_t i = 0; i < MAX_SOCKETS; i++) {
-            if (!g_sockUsed[i]) continue;
+            SocketBorrow borrow(i);
+            if (!borrow) continue;
             Socket& s = g_sockets[i];
             char buf[128];
             int p = 0;
