@@ -108,7 +108,7 @@ class Ext2Export(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'source changed'):ex.export(source,report,self.base/'bad-export',self.base/'bad.json')
             self.assertFalse((self.base/'bad-export').exists())
         finally:source.close()
-        for name,offset,value in [('dirty',58,struct.pack('<H',0)),('features',96,struct.pack('<I',0x40)),('creator',72,struct.pack('<I',1))]:
+        for name,offset,value in [('dirty',58,struct.pack('<H',0)),('errors',58,struct.pack('<H',3)),('features',96,struct.pack('<I',0x40)),('creator',72,struct.pack('<I',1))]:
             image=self.base/(name+'.img');shutil.copyfile(self.image,image)
             with image.open('r+b') as stream:stream.seek(1024+offset);stream.write(value)
             with self.assertRaises(ValueError):ex.Source(image,LIBRARY)

@@ -106,3 +106,41 @@ The private setup-failure VM was synced and stopped, and its evidence retained.
 The corrected controls pin the packed device to PCI address 0x10 and verify the
 actual `brookimg: ready` serial message before launching Steam. Host QMP block
 names must not be assumed to equal Brook's PCI-enumerated device labels.
+
+## First Steam pair
+
+Both packed-store controls rendered the authenticated Steam Store. Terra
+visually checked the saved completed-frame captures; neither showed a login,
+QR, or error screen. Guest Python confirmed all 1,049 immediate store entries
+and the same resolved Python executable used by the original profile.
+
+The raw main-window title appeared after 87.79 s; LZ4 after 85.26 s. Startup
+reads from the packed device were 221.95 versus 101.92 MiB (54.1% fewer bytes),
+with 3,849 versus 1,873 requests (51.3% fewer). The mutable Steam data disk read
+1,509.52 versus 1,510.23 MiB. Its nearly unchanged, much larger load explains
+why halving package-device traffic barely changes the whole launch time.
+These are one forward pair with unflushed host caches and network activity;
+the 2.53 s elapsed difference does not establish a repeatable startup speedup.
+
+Host launcher start to debug readiness was 11.53 versus 9.63 s, including host
+setup and firmware; it is not the boot-logo-to-desktop interval. At the initial
+OS stats sample, used memory was 362.49 MiB in both controls. The same index and
+runtime metadata are resident regardless of payload codec. These ordinary
+8-GiB application runs establish compatibility and I/O reduction, not paging
+behavior under pressure or compressed boot-kernel/module support.
+
+The raw controller encountered a host-only screenshot serialization error
+after recording startup. Its original VM was retained, the already-written
+frame metadata recovered, and the same run completed the normal Steam
+`-shutdown` helper and checked guest sync/shutdown. QEMU exit zero is verified;
+the outer raw controller exited with its earlier harness error, so this is not
+an all-green controller result. The LZ4 controller includes the corrected
+metadata-only serialization and completes end to end, including normal client
+shutdown, guest sync/shutdown, QEMU exit zero and original launch-owner exit
+zero. Both original signed-in source disks remain untouched.
+
+Detailed per-device deltas, private frames, job receipts and shutdown evidence
+are in `first-pair-comparison.json`, `matched-raw/` and `matched-lz4/` under the
+ignored evidence directory. Remaining work includes low-memory full-store
+exercise and broader application/shared-AS paging; this pair does not close
+the overall paging/compression goal.

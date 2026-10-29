@@ -35,7 +35,7 @@ class Source:
             header = os.pread(self.fd, 1024, 1024)
             require(len(header) == 1024 and struct.unpack_from('<H', header, 56)[0] == 0xef53,
                     'not an ext2 superblock')
-            require(struct.unpack_from('<H', header, 58)[0] & 1, 'source is not clean; use a checked stopped copy')
+            require(struct.unpack_from('<H', header, 58)[0] == 1, 'source is not clean; use a checked stopped copy')
             require(struct.unpack_from('<I', header, 72)[0] == 0,
                     'only Linux-created ext2 inode ownership layouts are supported')
             compat, incompat, rocompat = struct.unpack_from('<III', header, 92)
