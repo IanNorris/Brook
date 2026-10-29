@@ -83,3 +83,10 @@ to force the stranded thread past its lifetime protection.
 
 The bounded paging/compression goal remains active until this discovered
 acceptance failure is addressed and the missing clean control is rerun.
+
+Read-only post-stop e2fsck of the failed data image returns 4: two deleted
+inodes have zero deletion time, with associated inode/block bitmap and directory
+count discrepancies. A checked flush does not complete process teardown or reap
+open-but-unlinked objects. The image remains untouched; no repair is applied to
+failure evidence. This adds no passing filesystem/shutdown result to acceptance.
+Use fresh copies of the original checked source for the fixed-kernel rerun.
