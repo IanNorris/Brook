@@ -25,7 +25,7 @@ static void shrink(void){
     long dr=ctl(14,13),dw=ctl(14,12),rr=ctl(14,15),rw=ctl(14,14);
     assert(mremap(p,8*4096,4*4096,0)==p);counts(0,1,3,0);
     assert(mremap(p,4*4096,4*4096,MREMAP_MAYMOVE)==p);
-    errno=0;assert(mremap(p,4*4096,8*4096,MREMAP_MAYMOVE)==MAP_FAILED && errno==EOPNOTSUPP);counts(0,1,3,0);
+    errno=0;assert(mremap(p,4*4096,32*1024*1024,MREMAP_MAYMOVE)==MAP_FAILED && errno==ENOMEM);counts(0,1,3,0);
     assert(ctl(14,13)==dr && ctl(14,12)==dw && ctl(14,15)==rr && ctl(14,14)==rw);
     for(unsigned j=0;j<4096;++j)assert(((volatile unsigned char*)p)[j]==0x6b);
     assert(munmap(p,4*4096)==0);drain();

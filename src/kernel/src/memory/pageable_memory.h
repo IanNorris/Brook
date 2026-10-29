@@ -6,6 +6,27 @@ struct Process;
 struct AddressSpaceState;
 struct MappingRangeTable;
 struct MappingBacking;
+struct MappingRange;
+// Prepare empty replacement metadata outside AS mutation. TransferLocked moves
+// existing entry ownership only after metadata/PTE commit; no backing I/O or
+// token/reference duplication is needed. Declare before the transaction.
+class PageableMemoryGrowth {
+public:
+    PageableMemoryGrowth(Process*,AddressSpaceState*);
+    ~PageableMemoryGrowth();
+    PageableMemoryGrowth(const PageableMemoryGrowth&) = delete;
+    PageableMemoryGrowth& operator=(const PageableMemoryGrowth&) = delete;
+    bool Prepare(uint64_t bytes);
+    bool ValidateLocked(const MappingRange&) const;
+    bool DestinationDisjointLocked(const MappingRange&,uint64_t begin,uint64_t end) const;
+    void TransferLocked(const MappingRange&);
+    MappingBacking* Backing() const{return replacement_;}
+private:
+    Process* actor_;
+    AddressSpaceState* space_;
+    MappingBacking* replacement_=nullptr;
+    unsigned failure_=0;
+};
 // Outer fork lifetime: source snapshots/pins and child storage outlive the
 // final transaction and its parent COW shootdown. No store lock is taken by
 // the Locked methods; token retention and Recovery copies happen unlocked.

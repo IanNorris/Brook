@@ -138,6 +138,8 @@ void AttachRamCompression() {
 unsigned injectedFailure=0;
 unsigned forkFailure=0;
 uint64_t forkFailureSpace=0;
+unsigned growthFailure=0;
+uint64_t growthFailureSpace=0;
 enum class State : uint8_t { Resident, Evicting, Stored, Recovery, Zero, Discarded };
 struct Entry { uint64_t slot;PhysicalAddress recovery;State state; };
 struct Region { uint64_t pages,heldFrames;bool accountingVisited;Entry entries[1]; };
@@ -347,6 +349,60 @@ int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false,Phy
     }
 }
 
+}
+PageableMemoryGrowth::PageableMemoryGrowth(Process* actor,AddressSpaceState* space):actor_(actor),space_(space) {
+    SchedulerKernelRegionEnter(actor_);AddressSpaceRef(space_);
+}
+PageableMemoryGrowth::~PageableMemoryGrowth() {
+    MappingBackingUnref(replacement_);AddressSpaceUnref(space_);SchedulerKernelRegionLeave(actor_);
+}
+bool PageableMemoryGrowth::Prepare(uint64_t bytes) {
+    if(replacement_)KernelPanic("paging: repeated growth preparation");
+    if(!bytes || (bytes&4095) || bytes>16*1024*1024)return false;
+    if(ready){StoreGuard guard;if(growthFailureSpace==space_->identity){failure_=growthFailure;growthFailure=0;growthFailureSpace=0;}}
+    uint64_t pages=bytes/4096,size=sizeof(Region)+(pages-1)*sizeof(Entry);
+    auto* region=static_cast<Region*>(kmalloc(size));if(!region)return false;
+    memset(region,0,size);region->pages=pages;
+    for(uint64_t i=0;i<pages;++i)region->entries[i].state=State::Zero;
+    replacement_=MappingBackingCreate(region,ReleaseRegion);
+    if(!replacement_){kfree(region);return false;}
+    return failure_!=1;
+}
+bool PageableMemoryGrowth::ValidateLocked(const MappingRange& range) const {
+    if(!replacement_ || failure_==2 || !space_->pagingAdmission.Exclusive() ||
+       range.kind!=MappingKind::Pageable || range.sharing!=MappingSharing::Private ||
+       range.leafOwnership!=MappingLeafOwnership::Managed || !range.backing || range.backing->release!=ReleaseRegion)return false;
+    auto* old=static_cast<Region*>(range.backing->object);auto* next=static_cast<Region*>(replacement_->object);
+    const uint64_t first=range.offset/4096,pages=(range.end-range.begin)/4096;
+    if(first>old->pages || pages>old->pages-first || pages>=next->pages)return false;
+    for(uint64_t i=0;i<pages;++i)
+        if(old->entries[first+i].state==State::Evicting || old->entries[first+i].state==State::Discarded)return false;
+    return true;
+}
+void PageableMemoryGrowth::TransferLocked(const MappingRange& range) {
+    auto* old=static_cast<Region*>(range.backing->object);auto* next=static_cast<Region*>(replacement_->object);
+    const uint64_t first=range.offset/4096,pages=(range.end-range.begin)/4096;
+    // All fallible work and validation precede metadata commit. Neither array
+    // can change under this AS gate, and moved/sibling slices do not alias.
+    for(uint64_t i=0;i<pages;++i) {
+        auto& entry=old->entries[first+i];next->entries[i]=entry;
+        if(entry.state==State::Resident || entry.state==State::Recovery) {
+            if(!old->heldFrames)KernelPanic("paging: growth held-frame underflow");
+            --old->heldFrames;++next->heldFrames;
+        }
+        entry={0,{},State::Discarded};
+    }
+}
+bool PageableMemoryGrowth::DestinationDisjointLocked(const MappingRange& source,uint64_t begin,uint64_t end) const {
+    const uint64_t first=source.offset,last=first+source.end-source.begin;
+    for(auto* node=space_->ranges.head;node && node->range.begin<end;node=node->next) {
+        const auto& range=node->range;
+        if(range.end<=begin || range.kind!=MappingKind::Pageable || range.backing!=source.backing)continue;
+        const uint64_t left=range.begin>begin?range.begin:begin,right=range.end<end?range.end:end;
+        const uint64_t a=range.offset+left-range.begin,b=a+right-left;
+        if(first<b && a<last)return false;
+    }
+    return true;
 }
 struct PageableMemoryFork::Record {
     MappingBacking* parent;
@@ -583,6 +639,7 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
     if(!ready)return -95;
     if(!actor || !ProcessCapable(actor,nullptr,CapSysAdmin))return -1;
     if(operation==20 && value<=5){StoreGuard guard;forkFailure=value;forkFailureSpace=value?actor->addressSpace->identity:0;return 0;}
+    if(operation==21 && value<=2){StoreGuard guard;growthFailure=value;growthFailureSpace=value?actor->addressSpace->identity:0;return 0;}
     if(operation==0)return Map(actor,value);
     if(operation==1)return PageOut(actor,value);
     if(operation==2){StoreGuard guard;return store.Stats().stored;}

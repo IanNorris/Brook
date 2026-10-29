@@ -64,6 +64,9 @@ public:
     bool RangeLeafCount(uint64_t begin, uint64_t end, uint64_t& count) const;
     bool InsertRange(const MappingRange& range);
     bool ExtendRange(uint64_t identity, uint64_t end);
+    // In-place pager growth only: retain existing PTEs while replacing backing
+    // metadata. Caller must atomically transfer entry ownership under this gate.
+    bool GrowPageableMetadata(const MappingFaultSnapshot&,uint64_t end,MappingBacking* replacement);
     bool ProtectRange(uint64_t begin, uint64_t end, uint32_t protection);
     bool ProtectMapping(uint64_t begin, uint64_t end, uint32_t protection);
     // Snapshot backing is retained by this transaction through retirement.

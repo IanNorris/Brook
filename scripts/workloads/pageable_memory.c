@@ -85,11 +85,12 @@ int main(int argc,char** argv) {
             assert(syscall(SYS_getpid)>0);verify(p,0);assert(control(2,0)==baseline);
         }
     }
-    // Permissions preserve evicted pages; remapping is still unsupported.
+    // Permissions preserve evicted pages; oversized backing growth rejects
+    // without materializing or modifying the existing mapping.
     assert(control(1,address)==4096);
     assert(mprotect(p,bytes,PROT_READ)==0);
     assert(mprotect(p,bytes,PROT_READ|PROT_WRITE)==0);
-    assert(syscall(SYS_mremap,address,bytes,bytes*2,1L,0L)==-1 && errno==EOPNOTSUPP);
+    assert(syscall(SYS_mremap,address,bytes,32*1024*1024,1L,0L)==-1 && errno==ENOMEM);
     assert(control(2,0)==baseline+1);
     // Raw syscall output must be populated at safe syscall entry, not in #PF
     // under an unknown handler lock. clock_gettime writes into this page.

@@ -1109,3 +1109,65 @@ fixture is a strengthened version on the same kernel; earlier broad results
 remain intact. Astra reviewed the disjoint retirement, node-capacity and fork-
 span changes without finding a blocker. Backing growth and general anonymous/
 shared-AS enrollment remain open; the goal is not complete.
+
+## Bounded pager backing growth
+
+Pageable nodes can now grow in place or through MAYMOVE/FIXED, retaining the
+current 16 MiB per-backing experimental cap. Oversized requests return ENOMEM
+without changing existing content. The exact-source-node requirement remains.
+Preparation allocates an empty Zero replacement Region outside AS mutation;
+the complete expanded destination has page-table paths prepared before commit.
+No resident content is copied and no stored page is loaded or recompressed.
+
+After all fallible validation/preflight, the source fragment's entry slice
+transfers under AS mutation into new indices starting at zero. Original entries
+become Discarded without releasing tokens or Recovery references: ownership has
+moved, not duplicated. Resident/Recovery held-frame counts move between Regions;
+other old-Region siblings remain unchanged. New tail entries remain Zero.
+CaptureMapping pins the old backing through the transfer and transaction cleanup.
+The replacement's outer lifetime keeps cancellation protection through cleanup.
+
+In-place growth changes only backing/range metadata, preserving existing prefix
+PTEs, including hidden/COW flags. The narrow transaction API requires a distinct
+compatible private managed pager backing, validates the source snapshot, checks
+that the added tail contains neither mappings nor backed leaves, and advances
+AS generation. Moving growth preserves prefix PTEs through the existing move
+path and uses prepared destination retirement. A same-backing logical-slice
+check rejects overlapping transfer/retirement indices before mutation. Once
+metadata/PTE publication starts, entry transfer has no fallible step.
+
+Root-only control 21 injects one-shot source-AS-scoped failures after replacement
+preparation (1) or at final validation (2); zero clears it. Both retain the
+original entries/counters. As with fork tests, these are deterministic rollback
+checks, not exhaustive allocator-failure enumeration. Failed preparation can
+leave reusable empty page-table paths owned by the AS, not new mappings.
+
+The native growth fixture verifies Stored/Recovery ownership transfer with no
+backing I/O, both injected failures, in-place expansion, a protected 4-page
+mapping grown to 4 MiB while a child holds the old hidden/COW mapping, SIGSEGV on
+an inaccessible new tail, a distant reserve-backed Zero fault, automatic move of
+a fragment with nonzero backing offset, and fixed growth replacing siblings of
+the same Region. Parent-first and child-first teardown both preserve the other
+process's original data and release all slots/pool use. Native oversize checks
+now validate the 16 MiB cap rather than treating every growth as unsupported.
+
+Fresh raw/compressed VMs pass all 39 native regression jobs, including growth
+before/after the 256 MiB pressure case. Eleven relevant host tests, compiled
+entry/startup mutation audits and three normal-user compiler/link/run passes
+with the unchanged 96 MiB holder pass. All three VMs sync/stop and original
+owner exits are verified as 0. Exported data/Nix/tmp ext2 partitions from the
+compiler VM pass read-only checks. Evidence: paging-growth/{metadata.json,
+native.log,native-raw/,native-ram/,compiler-accepted-results.json,
+compiler-accepted-0-lz4-96/,fsck-results.json,fsck-partition-*.log}.
+Astra found no ownership/locking blocker. These results do not enable arbitrary
+anonymous/shared-AS paging or claim a new application speedup.
+
+Next application work needs an allocation profile of the unchanged compiler
+(anonymous mmap sizes/flags and brk growth) before choosing an opt-in workload.
+Nested vectored-I/O handlers also need a raw-pointer lifetime audit: eager entry
+prefault is not itself a lease if an inner helper is allowed to reclaim peers.
+Outer dispatch policy must constrain kernel-origin reclaim; a dedicated test
+must establish reachability under the current exclusive/prefault restrictions.
+General shared-AS enrollment additionally requires identity/permission stability
+and explicit asynchronous/device-buffer ownership. A single-thread executable
+whitelist would be an experiment, not a substitute for those requirements.

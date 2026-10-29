@@ -241,6 +241,21 @@ bool MappingTransaction::ProtectRange(uint64_t begin, uint64_t end, uint32_t pro
     if (!ranges_.Protect(space_->ranges,begin,end,protection)) return false;
     Changed(); return true;
 }
+bool MappingTransaction::GrowPageableMetadata(const MappingFaultSnapshot& snapshot,uint64_t end,MappingBacking* replacement) {
+    if(!locked_ || faultScoped_)KernelPanic("mapping: pager growth outside full mutation gate");
+    const auto& old=snapshot.range;
+    if(old.kind!=MappingKind::Pageable || old.sharing!=MappingSharing::Private ||
+       old.leafOwnership!=MappingLeafOwnership::Managed || !old.backing || !replacement || replacement->file ||
+       replacement==old.backing || replacement->release!=old.backing->release || end<=old.end ||
+       !ValidateMapping(snapshot,old.begin))return false;
+    for(auto* node=space_->ranges.head;node && node->range.begin<end;node=node->next)
+        if(node->range.end>old.end)return false;
+    uint64_t leaves=0;
+    if(!RangeLeafCount(old.end,end,leaves) || leaves)return false;
+    MappingRange next=old;next.end=end;next.backing=replacement;next.offset=0;next.identity=0;
+    if(!ranges_.CanReplace(space_->ranges,old.begin,end,&next) || !ranges_.Replace(space_->ranges,old.begin,end,&next))return false;
+    Changed(false);return true;
+}
 bool MappingTransaction::PrivateLeaf(VirtualAddress address, uint64_t, void* context) {
     auto* operation = static_cast<MappingTransaction*>(context);
     const auto* range = MappingRangeFind(operation->space_->ranges,address.raw());
