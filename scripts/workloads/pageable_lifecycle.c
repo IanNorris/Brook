@@ -45,9 +45,6 @@ int main(void){
     assert(mmap(p+8*4096,4*4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==p+8*4096);
     counts(2,2,4,0);
     for(unsigned j=0;j<4*4096;++j)assert(p[8*4096+j]==0);
-    errno=0;
-    assert(mremap(p+8*4096,4*4096,4096,MREMAP_MAYMOVE|MREMAP_FIXED,p)==MAP_FAILED && errno==EOPNOTSUPP);
-    counts(2,2,4,0);
     assert(mprotect(p,4096,PROT_READ)==0);verify(p,0);counts(3,1,4,0);
     assert(mprotect(p+2*4096,4096,PROT_READ)==0);verify(p+2*4096,2);counts(4,0,4,0);
     assert(mprotect(p+3*4096,4096,PROT_READ|PROT_WRITE)==0);verify(p+3*4096,3);verify(p+7*4096,7);

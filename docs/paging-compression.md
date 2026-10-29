@@ -1056,3 +1056,56 @@ ownership, failure cleanup and lock ordering without finding a blocker. General
 anonymous enrollment, remap and shared-AS uaccess exclusion remain open. COW
 resident victims still skip eviction until independently writable/private; this
 checkpoint does not claim arbitrary shared-frame reclaim or an app speedup.
+
+## Pager shrink and fixed moves
+
+Existing Pageable source nodes now support in-place shrink, same-size no-op,
+and fixed moves with an optional cropped tail. Source permissions, backing and
+backing-relative offsets are preserved. Stored/Zero/Recovery prefix entries
+move by metadata; resident/hidden leaves move through the existing VMM path.
+Neither operation reads stored content. Growth of Pageable backing still returns
+EOPNOTSUPP unchanged and is not claimed by this slice. The existing requirement
+for an exact source metadata node remains.
+
+Destination overwrite and cropped source tail have independent retirement
+helpers sized before mutation. Both capture all affected entries, then commit
+only after destination replacement, prefix PTE move and exact source removal
+succeed. Moved prefix entries retain their ownership; overwritten/cropped slots
+and Recovery references release after transaction retirement and required TLB
+acknowledgement. Three prepared range nodes cover destination splits/replacement;
+the exact source removal needs no extra split nodes. Source/destination virtual
+ranges are disjoint; the existing no-alias invariant also keeps their backing
+entry slices disjoint when both are fragments of the same Region.
+
+Ordinary sources can now overwrite pager destinations through this prepared
+retirement path. The default low-level transaction guard still rejects pager
+retirement without explicit preparation. Moving sources prepares every target
+pager page-table path, including Stored/Zero pages, outside the AS gate.
+
+Fork preparation now captures the actual surviving virtual spans while still
+deduplicating mutable Region snapshots/backings. Child table preparation uses
+those spans outside source mutation, replacing the previous original-base
+assumption and avoiding paths for unmapped holes. A moved fragment can retain
+its logical offset while living at a different virtual address from its siblings.
+
+The native remap fixture verifies mixed hidden/Stored/Recovery/Zero shrink-and-
+fixed-move, preserved sibling bytes, unchanged backing-I/O counters, sparse
+fragment move followed by fork and independent writes, same-Region replacement,
+ordinary-over-pager replacement and faults at the vacated source. Focused final
+runs add in-place shrink retiring a Recovery-only tail, no-op/growth-rejection
+state preservation and stored-slot replacement within the same backing.
+All 35 broad native regression jobs pass in fresh raw/compressed VMs, including
+the existing 256 MiB pressure and fork cases. Both focused remap runs pass too.
+Eleven relevant host tests and compiled entry/startup mutation audits pass.
+Three normal-user compiler/link/run passes with the unchanged 96 MiB holder
+also pass. All five VMs sync/stop and original owner exits are verified as 0.
+Read-only checks of the compiler VM's exported data/Nix/tmp ext2 partitions
+return 0. These establish lifecycle compatibility, not a new app speedup.
+
+Evidence: paging-remap/{metadata.json,native.log,native-raw/,native-ram/,
+focused.log,focused-raw/,focused-ram/,compiler-accepted-results.json,
+compiler-accepted-0-lz4-96/,fsck-results.json,fsck-partition-*.log}. The focused
+fixture is a strengthened version on the same kernel; earlier broad results
+remain intact. Astra reviewed the disjoint retirement, node-capacity and fork-
+span changes without finding a blocker. Backing growth and general anonymous/
+shared-AS enrollment remain open; the goal is not complete.

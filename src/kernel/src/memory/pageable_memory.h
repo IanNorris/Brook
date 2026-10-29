@@ -16,7 +16,7 @@ public:
     PageableMemoryFork(const PageableMemoryFork&) = delete;
     PageableMemoryFork& operator=(const PageableMemoryFork&) = delete;
     static bool BudgetLocked(const MappingRangeTable&,uint64_t& regions,uint64_t& pages);
-    bool Prepare(uint64_t regions,uint64_t pages);
+    bool Prepare(uint64_t regions,uint64_t pages,uint64_t ranges);
     bool CaptureLocked();
     bool PrepareUnlocked(uint16_t childPid,AddressSpaceState* destination);
     bool ValidateLocked() const;
@@ -24,10 +24,13 @@ public:
     bool FailAfterCow() const{return failure_==5;}
 private:
     struct Record;
+    struct Span;
     Record* Find(MappingBacking*) const;
     Record* records_=nullptr;
     void* snapshots_=nullptr;
     uint64_t* index_=nullptr;
+    Span* spans_=nullptr;
+    uint64_t spanCapacity_=0,spanCount_=0;
     uint64_t capacity_=0,count_=0,pageCapacity_=0,pageCount_=0,indexCapacity_=0;
     Process* actor_;
     AddressSpaceState* source_;

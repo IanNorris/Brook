@@ -352,8 +352,9 @@ struct PageableMemoryFork::Record {
     MappingBacking* parent;
     MappingBacking* child;
     Entry* snapshot;
-    uint64_t pages,captured,virtualBase;
+    uint64_t pages,captured;
 };
+struct PageableMemoryFork::Span { uint64_t begin,end; };
 PageableMemoryFork::PageableMemoryFork(Process* actor,AddressSpaceState* source):actor_(actor),source_(source) {
     SchedulerKernelRegionEnter(actor_);AddressSpaceRef(source_);
     if(ready && source_->pagingAdmission.Exclusive()) {
@@ -375,17 +376,18 @@ bool PageableMemoryFork::BudgetLocked(const MappingRangeTable& table,uint64_t& r
             static_cast<Region*>(node->range.backing->object)->accountingVisited=false;
     return valid;
 }
-bool PageableMemoryFork::Prepare(uint64_t regions,uint64_t pages) {
+bool PageableMemoryFork::Prepare(uint64_t regions,uint64_t pages,uint64_t ranges) {
     if(!regions)return pages==0;
     if(regions>~uint64_t{0}/(2*sizeof(uint64_t)) || regions>~uint64_t{0}/sizeof(Record) ||
-       pages>~uint64_t{0}/sizeof(Entry))return false;
+       pages>~uint64_t{0}/sizeof(Entry) || ranges>~uint64_t{0}/sizeof(Span))return false;
     indexCapacity_=1;while(indexCapacity_<regions*2)indexCapacity_*=2;
     if(indexCapacity_>~uint64_t{0}/sizeof(uint64_t))return false;
     records_=static_cast<Record*>(kmalloc(regions*sizeof(Record)));
     snapshots_=kmalloc(pages*sizeof(Entry));index_=static_cast<uint64_t*>(kmalloc(indexCapacity_*sizeof(uint64_t)));
-    if(!records_ || !snapshots_ || !index_)return false;
+    spans_=static_cast<Span*>(kmalloc(ranges*sizeof(Span)));
+    if(!records_ || !snapshots_ || !index_ || !spans_)return false;
     memset(records_,0,regions*sizeof(Record));memset(index_,0,indexCapacity_*sizeof(uint64_t));
-    capacity_=regions;pageCapacity_=pages;return true;
+    capacity_=regions;pageCapacity_=pages;spanCapacity_=ranges;return true;
 }
 PageableMemoryFork::Record* PageableMemoryFork::Find(MappingBacking* backing) const {
     if(!indexCapacity_ || !index_)return nullptr;
@@ -400,15 +402,12 @@ bool PageableMemoryFork::CaptureLocked() {
     for(auto* node=source_->ranges.head;node;node=node->next) {
         const auto& range=node->range;if(range.kind!=MappingKind::Pageable)continue;
         if(!source_->pagingAdmission.Exclusive() || !range.backing || range.backing->release!=ReleaseRegion)return false;
-        if(range.offset>range.begin)return false;
-        if(auto* existing=Find(range.backing)) {
-            if(existing->virtualBase!=range.begin-range.offset)return false;
-            continue;
-        }
+        if(spanCount_==spanCapacity_)return false;
+        spans_[spanCount_++]={range.begin,range.end};
+        if(Find(range.backing))continue;
         auto* region=static_cast<Region*>(range.backing->object);
         if(count_==capacity_ || region->pages>pageCapacity_-pageCount_)return false;
         auto& record=records_[count_];record.parent=range.backing;MappingBackingRef(record.parent);
-        record.virtualBase=range.begin-range.offset;
         record.pages=region->pages;record.snapshot=static_cast<Entry*>(snapshots_)+pageCount_;pageCount_+=record.pages;
         uint64_t at=((reinterpret_cast<uint64_t>(range.backing)>>4)*0x9e3779b97f4a7c15ULL)&(indexCapacity_-1);
         while(index_[at])at=(at+1)&(indexCapacity_-1);index_[at]=++count_;
@@ -421,15 +420,13 @@ bool PageableMemoryFork::CaptureLocked() {
     return failure_!=1;
 }
 bool PageableMemoryFork::PrepareUnlocked(uint16_t childPid,AddressSpaceState* destination) {
+    // Prepare every surviving virtual fragment, including moved fragments of
+    // the same backing. Empty holes need no paths and gain no mapping/access.
+    for(uint64_t i=0;i<spanCount_;++i)
+        if(!VmmPrepareRange(destination->pageTable,spans_[i].begin,spans_[i].end))return false;
     for(uint64_t n=0;n<count_;++n) {
         auto& record=records_[n];
         if(!record.pages || record.pages>(~uint64_t{0}-sizeof(Region))/sizeof(Entry))return false;
-        // CloneLeaves copies backed leaves only. Prepare paths for Stored/Zero
-        // pages too, before publication: their reserve-backed faults must not
-        // depend on a fresh page-table allocation under memory exhaustion.
-        constexpr uint64_t userEnd=0x0000800000000000ULL;
-        if(record.pages>userEnd/4096 || record.virtualBase>=userEnd || record.pages*4096>userEnd-record.virtualBase ||
-           !VmmPrepareRange(destination->pageTable,record.virtualBase,record.virtualBase+record.pages*4096))return false;
         const auto bytes=sizeof(Region)+(record.pages-1)*sizeof(Entry);
         auto* child=static_cast<Region*>(kmalloc(bytes));if(!child)return false;
         memset(child,0,bytes);child->pages=record.pages;
@@ -470,7 +467,7 @@ PageableMemoryFork::~PageableMemoryFork() {
         for(uint64_t i=0;i<record.captured;++i)if(record.snapshot[i].recovery)PmmUnrefPage(record.snapshot[i].recovery);
         MappingBackingUnref(record.child);MappingBackingUnref(record.parent);
     }
-    kfree(index_);kfree(snapshots_);kfree(records_);AddressSpaceUnref(source_);SchedulerKernelRegionLeave(actor_);
+    kfree(spans_);kfree(index_);kfree(snapshots_);kfree(records_);AddressSpaceUnref(source_);SchedulerKernelRegionLeave(actor_);
 }
 struct PageableMemoryRetirement::Page {
     MappingBacking* backing;

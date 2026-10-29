@@ -84,7 +84,7 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
         if(!PageableMemoryFork::BudgetLocked(source->ranges,regions,pages))return false;
         operation.Unlock();
         MappingRangePlan plan;
-        if (!plan.Prepare(count) || !paging.Prepare(regions,pages)) return false;
+        if (!plan.Prepare(count) || !paging.Prepare(regions,pages,count)) return false;
         if(!operation.Lock())return false;
         if (source->generation!=generation) { operation.Unlock(); continue; }
         if(regions) {
@@ -679,13 +679,12 @@ int64_t UserMappingResize(Process* actor,AddressSpaceState* space,uint64_t sourc
             (destination<oldEnd && source<newEnd)) return -22;
     }
     for (;;) {
+        PageableMemoryRetirement destinationPaging(actor),tailPaging(actor);
         MappingTransaction operation(actor,space);PmmThrottleForDrain();if(!operation.Lock())return -12;
-        // Remap does not yet prepare per-page pager content retirement, even
-        // when its fixed destination happens to cover an entire split node.
-        if((flags&fixed) && PageableMemoryRetirement::Count(space->ranges,destination,destination+newLength))return -95;
         MappingFaultSnapshot snapshot{};
         if (!operation.CaptureMapping(source,snapshot) || snapshot.range.begin!=source || snapshot.range.end!=oldEnd) return -14;
-        if(snapshot.range.kind==MappingKind::Pageable)return -95;
+        const bool pageable=snapshot.range.kind==MappingKind::Pageable;
+        if(pageable && newLength>oldLength)return -95; // backing growth is a separate ownership transfer
         if (snapshot.range.kind==MappingKind::Device && newLength>oldLength) return -22;
         if (newLength==oldLength && !(flags&fixed)) return static_cast<int64_t>(source);
         bool shrink=newLength<oldLength && !(flags&fixed),inPlace=false;
@@ -709,16 +708,24 @@ int64_t UserMappingResize(Process* actor,AddressSpaceState* space,uint64_t sourc
             uint64_t tail=0;if (!operation.RangeLeafCount(source+newLength,oldEnd,tail)) return -22;
             count+=tail;
         }
+        const uint64_t destinationPages=!shrink && !inPlace ?
+            PageableMemoryRetirement::Count(space->ranges,target,target+newLength):0;
+        const uint64_t tailPages=newLength<oldLength ?
+            PageableMemoryRetirement::Count(space->ranges,source+newLength,oldEnd):0;
         operation.Unlock();
+        if(!destinationPaging.Prepare(destinationPages) || !tailPaging.Prepare(tailPages))return -12;
         if (!operation.Prepare(count,0) || !operation.PrepareRanges(3)) return -12;
         if (newLength>oldLength && prepare) {
             int error=prepare(snapshot.range,newLength,context);if (error) return error;
         }
         if (!shrink && !inPlace && !VmmPrepareMove(space->pageTable,source,source+movedLength,target)) return -12;
+        if(pageable && !shrink && !inPlace && !VmmPrepareRange(space->pageTable,target,target+newLength))return -12;
         if(!operation.Lock())return -12;if (!operation.ValidateMapping(snapshot,source)) continue;
         if (shrink) {
-            if (!operation.CanReplaceRange(source+newLength,oldEnd)) return -12;
-            if (!operation.ReplaceMapping(source+newLength,oldEnd)) continue;
+            if (!operation.CanReplaceRange(source+newLength,oldEnd,nullptr,true)) return -12;
+            if(!tailPaging.Capture(space,source+newLength,oldEnd))return -16;
+            if (!operation.ReplaceMapping(source+newLength,oldEnd,nullptr,true)) continue;
+            tailPaging.Commit();
             return static_cast<int64_t>(source);
         }
         if (inPlace) return operation.ExtendRange(snapshot.range.identity,source+newLength)?static_cast<int64_t>(source):-12;
@@ -728,10 +735,13 @@ int64_t UserMappingResize(Process* actor,AddressSpaceState* space,uint64_t sourc
             (newLength<oldLength && !operation.RangeLeafCount(source+newLength,oldEnd,tailLeaves))) return -22;
         if (destinationLeaves+tailLeaves>count) continue;
         MappingRange replacement=snapshot.range;replacement.begin=target;replacement.end=target+newLength;replacement.identity=0;
-        if (!operation.CanReplaceRange(target,target+newLength,&replacement) || !operation.CanReplaceRange(source,oldEnd)) return -12;
-        if (!operation.ReplaceMapping(target,target+newLength,&replacement)) continue;
+        if (!operation.CanReplaceRange(target,target+newLength,&replacement,true) || !operation.CanReplaceRange(source,oldEnd,nullptr,true)) return -12;
+        if(!destinationPaging.Capture(space,target,target+newLength) ||
+           (newLength<oldLength && !tailPaging.Capture(space,source+newLength,oldEnd)))return -16;
+        if (!operation.ReplaceMapping(target,target+newLength,&replacement,true)) continue;
         if (!VmmMoveRange(space->pageTable,source,source+movedLength,target)) KernelPanic("mapping: preflighted move failed");
-        if (!operation.ReplaceMapping(source,oldEnd)) KernelPanic("mapping: source retirement changed under lock");
+        if (!operation.ReplaceMapping(source,oldEnd,nullptr,true)) KernelPanic("mapping: source retirement changed under lock");
+        destinationPaging.Commit();tailPaging.Commit();
         operation.RequireShootdown();
         if (target+newLength>space->mmapNext) space->mmapNext=target+newLength;
         return static_cast<int64_t>(target);
