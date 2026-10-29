@@ -17,7 +17,7 @@ struct Disk {
     bool Write(uint64_t off,const void* in,uint64_t len) {
         ++calls;order.push_back(off);
         const bool fail=failAll || calls==failAt;
-        if(!fail || partial)std::copy_n(static_cast<const uint8_t*>(in),len,data.data()+off);
+        if(!fail || partial)std::copy_n(static_cast<const uint8_t*>(in),fail?len/2:len,data.data()+off);
         return !fail;
     }
     bool Flush(){++flushes;return !failFlush;}
@@ -77,6 +77,13 @@ int main() {
     assert(flush.q.Write(flush.disk,200,b.data(),32,3));
     assert(flush.disk.order==std::vector<uint64_t>({0,0,0}));
     assert(flush.q.Drain(flush.disk)==R::Ok && flush.disk.order.back()==200);
+    // Empty-batch flush failure still blocks admission until a successful retry.
+    Fixture empty;empty.disk.failFlush=true;
+    assert(empty.q.Drain(empty.disk)==R::FlushError && empty.q.retry && !empty.q.count);
+    assert(!empty.q.Write(empty.disk,0,a.data(),32,1) && !empty.q.count);
+    empty.disk.failFlush=false;
+    assert(empty.q.Write(empty.disk,0,a.data(),32,2) && !empty.q.retry);
+    assert(empty.q.Drain(empty.disk)==R::Ok && empty.disk.data[0]==17);
     // An unowned oversized partial failure cannot be replayed: poison writes.
     Fixture oversized;oversized.disk.failAt=1;oversized.disk.partial=true;
     assert(!oversized.q.Write(oversized.disk,0,big.data(),big.size(),1));

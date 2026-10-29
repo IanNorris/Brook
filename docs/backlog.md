@@ -2,12 +2,25 @@
 
 ### Steam loading and block completion follow-ups (29 October 2026)
 
+An [opt-in bounded ext2 write-behind queue](ext2-write-behind.md) now covers
+ordinary file/inode/directory writes, with tail merging, retained failed batches,
+background drains and native pre-shutdown byte verification. It remains off by
+default. The first Steam pair reduced I/O requests and reached its window in
+69.2 versus 62.4 seconds, but reverse-order repeats were unstable: the off run
+took 189 seconds and did not retire helpers after client Exit; the on run timed
+out waiting for a main window. Both passed native namespace/durability and
+orderly OS-shutdown/filesystem checks. Diagnose these startup/helper-exit stalls
+before treating Steam as a repeatable cache-tuning benchmark. The sparse stalled
+profile is mostly idle with GPU completion waits among the active samples; it
+does not establish the blocking dependency. Interactive tail latency, failed
+completion/reset stress and crash behavior also gate any default enablement.
+
 The bounded [loading performance pass](steam-loading-performance-20261029.md)
 reduces Steam time to its first main window by 20–24% across three paired
 controls. Cold Stardew loading remains variable. Investigate repeated SteamRT
 runtime/filesystem construction and metadata write volume on `/data` next;
 do not assume indexed-store compression addresses that traffic. Measure full
-menu readiness separately from window creation. Any future dirty-cache/write
+menu readiness separately from window creation. Broader dirty-cache/write
 coalescing work needs explicit crash-durability and failed-completion tests.
 
 An exploratory profiled run under overlapping host image preparations reported
