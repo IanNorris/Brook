@@ -202,9 +202,9 @@ bool MappingTransaction::RemoveMappingWithRetirer(uint64_t begin,uint64_t end,Vm
     if (!ranges_.Replace(space_->ranges,begin,end)) KernelPanic("mapping: external retirement preflight changed");
     Changed(detached!=0);return true;
 }
-bool MappingTransaction::ReplaceMapping(uint64_t begin, uint64_t end, const MappingRange* replacement) {
+bool MappingTransaction::ReplaceMapping(uint64_t begin, uint64_t end, const MappingRange* replacement,bool pageableRetirementPrepared) {
     if (!locked_ || faultScoped_) KernelPanic("mapping: range replacement without lock or in fault scope");
-    if(!MappingRangeRemovalAllowed(space_->ranges,begin,end))return false;
+    if(!pageableRetirementPrepared && !MappingRangeRemovalAllowed(space_->ranges,begin,end))return false;
     if (!ranges_.CanReplace(space_->ranges,begin,end,replacement)) return false;
     uint64_t detached = 0;
     if (!VmmDetachRange(space_->pageTable,begin,end,retiredCapacity_-retiredCount_,
@@ -213,9 +213,9 @@ bool MappingTransaction::ReplaceMapping(uint64_t begin, uint64_t end, const Mapp
         KernelPanic("mapping: range preflight changed under lock");
     Changed(detached != 0); return true;
 }
-bool MappingTransaction::CanReplaceRange(uint64_t begin, uint64_t end, const MappingRange* replacement) const {
+bool MappingTransaction::CanReplaceRange(uint64_t begin, uint64_t end, const MappingRange* replacement,bool pageableRetirementPrepared) const {
     if (!locked_) KernelPanic("mapping: range preflight without lock");
-    if(!MappingRangeRemovalAllowed(space_->ranges,begin,end))return false;
+    if(!pageableRetirementPrepared && !MappingRangeRemovalAllowed(space_->ranges,begin,end))return false;
     return ranges_.CanReplace(space_->ranges,begin,end,replacement);
 }
 void MappingTransaction::CaptureDetachedLeaf(VirtualAddress address, uint64_t leaf, void* context) {

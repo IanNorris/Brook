@@ -367,6 +367,9 @@ add_test(NAME test_ext2
 # Platform/PMM, heap and filesystem/scheduler finalizers are instrumented.
 # Address-space queues and page-table ownership transitions run actual code.
 add_host_test(test_vmm_leaf
+    "${BROOK_ROOT}/src/kernel/src/memory/pageable_memory.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/page_store.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/compressed_page_pool.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/virtual_memory.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/address_space.cpp"
     "${BROOK_ROOT}/src/kernel/src/memory/exec_page_cache.cpp"
@@ -378,6 +381,7 @@ add_host_test(test_vmm_leaf
     "${BROOK_ROOT}/src/kernel/src/memory/mapping_access_timing.cpp"
 )
 target_compile_options(test_vmm_leaf PRIVATE
+    "-iquote${BROOK_ROOT}/src/third_party/lz4"
     -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
     "-iquote${BROOK_ROOT}/src/kernel/src"
     "-iquote${BROOK_ROOT}/src/shared"

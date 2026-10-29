@@ -52,13 +52,12 @@ struct MappingRangeTable {
     mutable const MappingRange* lookup[LookupSlots] = {};
     MappingRangeNode* root = nullptr;
 };
-// The first explicit pager owns a whole private region. Until per-page slot
-// retirement is implemented, forbid splitting it by unmap/MAP_FIXED.
+// Callers without prepared per-page content retirement cannot remove even a
+// whole node: it may be one fragment whose siblings keep the Region alive.
 inline bool MappingRangeRemovalAllowed(const MappingRangeTable& table,uint64_t begin,uint64_t end) {
     for(auto* node=table.head;node;node=node->next) {
         const auto& r=node->range;
-        if(r.kind==MappingKind::Pageable && r.begin<end && begin<r.end &&
-           (begin>r.begin || end<r.end))return false;
+        if(r.kind==MappingKind::Pageable && r.begin<end && begin<r.end)return false;
     }
     return true;
 }

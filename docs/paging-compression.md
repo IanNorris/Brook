@@ -881,3 +881,59 @@ stack-paging-{raw,ram}/ and stack-boundary-raw/.
 Source fixture: scripts/workloads/stack_accept.c.
 General-purpose anonymous application paging, automatic compressed-pool spill
 and writable filesystem compression remain outside this checkpoint.
+
+## Pager fragments: partial removal, replacement and protection
+
+Existing opt-in Pageable regions now support partial munmap, MAP_FIXED
+replacement and independent mprotect on fragments. Backing-relative offsets
+remain authoritative across splits. Permission changes do not load stored
+pages; later faults validate the current permission. PROT_NONE leaves remain
+inaccessible, including stored pages with no resident leaf.
+
+Create/remove count every affected pager entry, including Stored/Recovery/Zero
+entries without a present PTE, then allocate retirement snapshots outside the
+AS gate. Capturing pins the backing without transferring entry ownership.
+Only successful metadata/PTE replacement commits removal: it clears affected
+entries and adjusts held-frame accounting under AS mutation. Destruction runs
+after transaction unlock, TLB acknowledgement and resident-PTE retirement,
+then releases stored tokens and Recovery references outside the gate. A
+separate kernel-region guard prevents cancellation between these two cleanup
+phases. Failed preparation/capture/retry retains original content ownership.
+
+Unaudited transaction callers reject any overlapping Pageable node, including
+a whole fragment whose sibling keeps its Region alive. In particular, fixed
+mremap targeting a pager fragment returns EOPNOTSUPP without changing either
+mapping. The prepared create/remove paths explicitly authorize retirement.
+Other remap/discard/fork/thread behavior is not newly enabled here.
+
+The syscall-entry restoration barrier skips PROT_NONE fragments and selects an
+allowed access for other mappings. Scalar mmap joins the audited exemptions:
+its anonymous, memfd, device/framebuffer and file paths use kernel-owned objects
+or staging buffers, not raw user-pointer arguments. The first native attempt
+exposed unnecessary eager Zero-page restoration before MAP_FIXED; diagnostic
+counts localized it to this entry barrier. The corrected test passes without
+changing its cold-page expectations. Failure logs/disks are retained.
+
+HeldFrames aggregates each Region once across split nodes; state counters count
+only each node's backing-relative slice. The current unique-backing aggregation
+is quadratic in node count and must become linear before broad app enrollment.
+Per-page retirement snapshots also have a real allocation cost; allocation
+failure changes no mappings and does not justify claiming OOM-proof mutation.
+
+The native lifecycle fixture combines Resident, Stored, Recovery and Zero
+pages, protects/splits them, removes a failed-rollback Recovery page, replaces
+the middle, rejects unprepared fixed remap, verifies sibling bytes, checks
+read-only/hole/PROT_NONE SIGSEGV and unmaps fragments in different orders.
+It asserts exact held/stored/zero/recovery counts and zero final slots/pool use.
+Fresh raw and 4 MiB compressed-RAM VMs each run it before and after the existing
+256 MiB pressure test: all 23 native jobs pass. Eleven relevant host tests and
+compiled entry/startup mutation audits pass. Both VMs sync/stop and their
+original owner processes exit 0. The disk-installed kernel hash matches the
+symbol copy and built ELF. Evidence: paging-lifecycle/{metadata.json,native-v3.log,
+native-v3-raw/,native-v3-ram/} beneath the build evidence directory. This is
+lifecycle correctness evidence, not an application throughput measurement.
+A further fresh VM runs three normal-user compile/link/execute passes with the
+same 96 MiB holder; all pass and the holder retains its bytes through release.
+It also syncs/stops with owner exit 0. See paging-lifecycle/compiler-results.json
+and compiler-0-lz4-96/. These are regression checks, not new controlled speedup
+claims.

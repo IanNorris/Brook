@@ -11,8 +11,8 @@ int main() {
     assert(exclusive.Exclusive());
     brook::MappingRangeNode node{};brook::MappingRangeTable table{};table.head=&node;
     node.range.kind=brook::MappingKind::Pageable;node.range.begin=0x10000;node.range.end=0x20000;
-    assert(brook::MappingRangeRemovalAllowed(table,0x10000,0x20000));
-    assert(brook::MappingRangeRemovalAllowed(table,0,0x30000));
+    assert(!brook::MappingRangeRemovalAllowed(table,0x10000,0x20000));
+    assert(!brook::MappingRangeRemovalAllowed(table,0,0x30000));
     assert(brook::MappingRangeRemovalAllowed(table,0x20000,0x30000));
     assert(!brook::MappingRangeRemovalAllowed(table,0x10000,0x11000));
     assert(!brook::MappingRangeRemovalAllowed(table,0x11000,0x20000));

@@ -4,6 +4,27 @@
 namespace brook {
 struct Process;
 struct AddressSpaceState;
+struct MappingRangeTable;
+// Declare before the mapping transaction. Capture/Commit run under AS mutation;
+// destruction releases captured slots/recovery refs only after transaction TLB
+// retirement. Preparation is fallible and must precede the mutation gate.
+class PageableMemoryRetirement {
+public:
+    explicit PageableMemoryRetirement(Process* actor);
+    ~PageableMemoryRetirement();
+    PageableMemoryRetirement(const PageableMemoryRetirement&) = delete;
+    PageableMemoryRetirement& operator=(const PageableMemoryRetirement&) = delete;
+    static uint64_t Count(const MappingRangeTable&,uint64_t begin,uint64_t end);
+    bool Prepare(uint64_t pages);
+    bool Capture(AddressSpaceState*,uint64_t begin,uint64_t end);
+    void Commit();
+private:
+    struct Page;
+    Page* pages_=nullptr;
+    uint64_t capacity_=0,count_=0;
+    bool committed_=false;
+    Process* actor_;
+};
 // Explicit single-task experiment; opt/page-store-device is absent by default.
 void PageableMemoryBootInit();
 // Bounded healthy-memory reserve replenishment; starts only for an enabled store.
@@ -14,6 +35,6 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
 // restore all pageable leaves while no handler lock has yet been acquired.
 // This deliberately sacrifices paging benefit across syscalls until raw user
 // pointer consumers have proper exclusion. Read/write use lexical leases;
-// scalar paging/exit/unmap also skip this barrier.
+// Scalar paging/mapping/exit operations also skip this barrier.
 int PageableMemoryPrepareSyscall(Process* actor,uint64_t number);
 }

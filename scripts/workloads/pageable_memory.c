@@ -84,11 +84,10 @@ int main(int argc,char** argv) {
             assert(syscall(SYS_getpid)>0);verify(p,0);assert(control(2,0)==baseline);
         }
     }
-    // Numeric-only operations reject unsupported splits/permissions/remaps
-    // without restoring evicted pages or leaking their slots.
+    // Permissions preserve evicted pages; remapping is still unsupported.
     assert(control(1,address)==4096);
-    assert(munmap(p,4096)==-1 && errno==EOPNOTSUPP);
-    assert(mprotect(p,bytes,PROT_READ)==-1 && errno==EOPNOTSUPP);
+    assert(mprotect(p,bytes,PROT_READ)==0);
+    assert(mprotect(p,bytes,PROT_READ|PROT_WRITE)==0);
     assert(syscall(SYS_mremap,address,bytes,bytes*2,1L,0L)==-1 && errno==EOPNOTSUPP);
     assert(control(2,0)==baseline+1);
     // Raw syscall output must be populated at safe syscall entry, not in #PF

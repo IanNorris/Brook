@@ -9,6 +9,7 @@
 #include "vfs.h"
 #include "mapping_access_timing.h"
 #include "exec_limits.h"
+#include "pageable_memory.h"
 
 namespace brook {
 // Source metadata and leaves are stable under AS.mutation. Destination is not
@@ -359,6 +360,7 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
          request.preparedPages != request.length / 4096))) return failure.Fail("cache-policy",-22);
     for (;;) {
         ++failure.attempts;
+        PageableMemoryRetirement paging(actor);
         MappingTransaction operation(actor,space,request.range.backing);
         PmmThrottleForDrain();
         if(!operation.Lock())return failure.Fail("gate-set-snapshot",-12);
@@ -367,16 +369,17 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
         const uint64_t address = PickMappingAddress(space,request);
         if (!address) return failure.Fail("address-gap",-12);
         const uint64_t end = address+request.length;
-        if(request.fixed && !request.noReplace && !MappingRangeRemovalAllowed(space->ranges,address,end))
-            return failure.Fail("pageable-partial-replacement",-95);
         if (request.noReplace &&
             MappingRangeFindGap(space->ranges,address,request.length,address,end) != address)
             return failure.Fail("exact-address-occupied",-17); // EEXIST, without retiring anything
         uint64_t retired = 0;
         if (request.fixed && !request.noReplace && !operation.RangeLeafCount(address,end,retired)) return failure.Fail("retirement-count",-22);
         failure.retired=retired;
+        const uint64_t pagingPages=request.fixed && !request.noReplace ?
+            PageableMemoryRetirement::Count(space->ranges,address,end):0;
         const uint64_t generation = space->generation;
         operation.Unlock();
+        if(!paging.Prepare(pagingPages))return failure.Fail("pageable-retirement-storage",-12);
         if (!operation.Prepare(retired,request.preparedPages)) return failure.Fail("page-record-storage",-12);
         if (!operation.PrepareRanges(3)) return failure.Fail("range-node-storage",-12);
         if (request.prepare) {
@@ -393,10 +396,12 @@ int64_t UserMappingCreate(Process* actor, AddressSpaceState* space, const UserMa
         MappingRange range = request.range;
         range.begin = address; range.end = end; range.identity = 0;
         if (request.fixed && !request.noReplace) {
-            if (!operation.CanReplaceRange(address,end,&range)) return failure.Fail("range-replace-preflight",-12);
+            if (!operation.CanReplaceRange(address,end,&range,true)) return failure.Fail("range-replace-preflight",-12);
+            if(!paging.Capture(space,address,end))return failure.Fail("pageable-retirement-capture",-16);
             // A fault may have populated another leaf without changing topology
             // while preparation was unlocked. Capacity failure changes nothing.
-            if (!operation.ReplaceMapping(address,end,&range)) continue;
+            if (!operation.ReplaceMapping(address,end,&range,true)) continue;
+            paging.Commit();
         } else if (!operation.InsertRange(range)) return failure.Fail("range-insert",-12);
         uint64_t flags = VMM_USER | request.cacheFlags;
         if (!(range.protection & 4)) flags |= VMM_NO_EXEC;
@@ -415,18 +420,22 @@ int64_t UserMappingRemove(Process* actor, AddressSpaceState* space, uint64_t add
     uint64_t end;
     if (!actor || !space || !UserInterval(address,length,end)) return -22;
     for (;;) {
+        PageableMemoryRetirement paging(actor);
         MappingTransaction operation(actor,space);
         PmmThrottleForDrain(); if(!operation.Lock())return -12;
-        if(!MappingRangeRemovalAllowed(space->ranges,address,end))return -95;
         uint64_t count = 0;
         if (!operation.RangeLeafCount(address,end,count)) return -22;
+        const uint64_t pagingPages=PageableMemoryRetirement::Count(space->ranges,address,end);
         uint64_t generation = space->generation;
         operation.Unlock();
+        if(!paging.Prepare(pagingPages))return -12;
         if (!operation.Prepare(count,0) || !operation.PrepareRanges(2)) return -12;
         if(!operation.Lock())return -12;
         if (space->generation != generation) continue;
-        if (!operation.CanReplaceRange(address,end)) return -12;
-        if (!operation.ReplaceMapping(address,end)) continue;
+        if (!operation.CanReplaceRange(address,end,nullptr,true)) return -12;
+        if(!paging.Capture(space,address,end))return -16;
+        if (!operation.ReplaceMapping(address,end,nullptr,true)) continue;
+        paging.Commit();
         return 0;
     }
 }
@@ -441,7 +450,6 @@ int64_t UserMappingProtect(Process* actor, AddressSpaceState* space, uint64_t ad
     for (uint64_t at=address;at<end;) {
         const auto* range = MappingRangeFind(space->ranges,at);
         if (!range) return -12;
-        if(range->kind==MappingKind::Pageable)return -95;
         if (protection & ~range->maximumProtection) return -13;
         if (protection && range->backing && range->backing->file && range->backing->file->mappingError)
             return range->backing->file->mappingError;
@@ -632,6 +640,9 @@ int64_t UserMappingResize(Process* actor,AddressSpaceState* space,uint64_t sourc
     }
     for (;;) {
         MappingTransaction operation(actor,space);PmmThrottleForDrain();if(!operation.Lock())return -12;
+        // Remap does not yet prepare per-page pager content retirement, even
+        // when its fixed destination happens to cover an entire split node.
+        if((flags&fixed) && PageableMemoryRetirement::Count(space->ranges,destination,destination+newLength))return -95;
         MappingFaultSnapshot snapshot{};
         if (!operation.CaptureMapping(source,snapshot) || snapshot.range.begin!=source || snapshot.range.end!=oldEnd) return -14;
         if(snapshot.range.kind==MappingKind::Pageable)return -95;

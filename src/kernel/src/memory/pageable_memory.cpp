@@ -136,7 +136,7 @@ void AttachRamCompression() {
 }
 // Root-only one-shot failure controls for the explicitly boot-enabled test.
 unsigned injectedFailure=0;
-enum class State : uint8_t { Resident, Evicting, Stored, Recovery, Zero };
+enum class State : uint8_t { Resident, Evicting, Stored, Recovery, Zero, Discarded };
 struct Entry { uint64_t slot;PhysicalAddress recovery;State state; };
 struct Region { uint64_t pages,heldFrames;Entry entries[1]; };
 struct Frame {
@@ -279,12 +279,18 @@ int64_t SpillStoredPage(Process* actor,uint64_t page) {
     {StoreGuard guard;if(!store.Retain(token))return -116;pin.token=token;}
     {StoreGuard guard;return store.Spill(token);}
 }
-// AS mutation held; whole dedicated mappings cannot split or share backings.
+// AS mutation held. Split nodes share a region's accounting, not independent
+// copies of it. Aggregate each backing once, including when fragments have
+// unrelated replacement nodes between them.
 uint64_t HeldFrames(AddressSpaceState* space) {
     uint64_t total=0;
-    for(auto* node=space->ranges.head;node;node=node->next)
-        if(node->range.kind==MappingKind::Pageable && node->range.backing && node->range.backing->release==ReleaseRegion)
-            total+=static_cast<Region*>(node->range.backing->object)->heldFrames;
+    for(auto* node=space->ranges.head;node;node=node->next) {
+        if(node->range.kind!=MappingKind::Pageable || !node->range.backing || node->range.backing->release!=ReleaseRegion)continue;
+        bool seen=false;
+        for(auto* prior=space->ranges.head;prior!=node;prior=prior->next)
+            if(prior->range.backing==node->range.backing){seen=true;break;}
+        if(!seen)total+=static_cast<Region*>(node->range.backing->object)->heldFrames;
+    }
     return total;
 }
 // One finite traversal, in batches of at most 64 metadata/page visits. A sole
@@ -337,6 +343,77 @@ int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false,Phy
     }
 }
 
+}
+struct PageableMemoryRetirement::Page {
+    MappingBacking* backing;
+    Entry* entry;
+    Entry original;
+};
+PageableMemoryRetirement::PageableMemoryRetirement(Process* actor):actor_(actor) {
+    // Outlive the inner transaction's cancellation region: committed content
+    // and backing pins must be released before fatal cancellation can unwind.
+    SchedulerKernelRegionEnter(actor_);
+}
+uint64_t PageableMemoryRetirement::Count(const MappingRangeTable& table,uint64_t begin,uint64_t end) {
+    uint64_t pages=0;
+    for(auto* node=table.head;node && node->range.begin<end;node=node->next) {
+        const auto& range=node->range;
+        if(range.kind!=MappingKind::Pageable || range.end<=begin)continue;
+        const uint64_t left=range.begin>begin?range.begin:begin,right=range.end<end?range.end:end;
+        pages+=(right-left)/4096;
+    }
+    return pages;
+}
+bool PageableMemoryRetirement::Prepare(uint64_t pages) {
+    if(pages_ || capacity_ || count_)KernelPanic("paging: repeated retirement preparation");
+    if(!pages)return true;
+    if(pages>~uint64_t{0}/sizeof(Page))return false;
+    pages_=static_cast<Page*>(kmalloc(pages*sizeof(Page)));
+    if(!pages_)return false;
+    capacity_=pages;return true;
+}
+bool PageableMemoryRetirement::Capture(AddressSpaceState* space,uint64_t begin,uint64_t end) {
+    if(count_ || committed_)KernelPanic("paging: repeated retirement capture");
+    for(auto* node=space->ranges.head;node && node->range.begin<end;node=node->next) {
+        const auto& range=node->range;
+        if(range.kind!=MappingKind::Pageable || range.end<=begin)continue;
+        if(!space->pagingAdmission.Exclusive() || !range.backing || range.backing->release!=ReleaseRegion)return false;
+        auto* region=static_cast<Region*>(range.backing->object);
+        const uint64_t left=range.begin>begin?range.begin:begin,right=range.end<end?range.end:end;
+        for(uint64_t at=left;at<right;at+=4096) {
+            const uint64_t index=(range.offset+at-range.begin)/4096;
+            if(count_==capacity_ || index>=region->pages || region->entries[index].state==State::Evicting ||
+               region->entries[index].state==State::Discarded)return false;
+            auto& page=pages_[count_++];
+            page={range.backing,&region->entries[index],region->entries[index]};
+            MappingBackingRef(page.backing);
+        }
+    }
+    return true;
+}
+void PageableMemoryRetirement::Commit() {
+    if(committed_)KernelPanic("paging: repeated retirement commit");
+    for(uint64_t i=0;i<count_;++i) {
+        auto& page=pages_[i];auto* region=static_cast<Region*>(page.backing->object);
+        if(page.original.state==State::Resident || page.original.state==State::Recovery) {
+            if(!region->heldFrames)KernelPanic("paging: retirement held-frame underflow");
+            --region->heldFrames;
+        }
+        *page.entry={0,{},State::Discarded};
+    }
+    committed_=true;
+}
+PageableMemoryRetirement::~PageableMemoryRetirement() {
+    for(uint64_t i=0;i<count_;++i) {
+        const auto& page=pages_[i];
+        if(committed_) {
+            ReleaseSlot(page.original.slot);
+            if(page.original.recovery)PmmUnrefPage(page.original.recovery);
+        }
+        MappingBackingUnref(page.backing);
+    }
+    kfree(pages_);
+    SchedulerKernelRegionLeave(actor_);
 }
 void PageableMemoryBootInit() {
     char name[32]{};uint32_t size=FwCfgReadFile("opt/page-store-device",name,sizeof(name));
@@ -438,7 +515,8 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
             const auto& range=node->range;
             if(range.kind!=MappingKind::Pageable || !range.backing || range.backing->release!=ReleaseRegion)continue;
             auto* region=static_cast<Region*>(range.backing->object);
-            for(uint64_t i=0;i<region->pages;++i) {
+            const uint64_t first=range.offset/4096,last=first+(range.end-range.begin)/4096;
+            for(uint64_t i=first;i<last && i<region->pages;++i) {
                 const auto state=region->entries[i].state;
                 if((value==1 && state==State::Zero) || (value==2 && state==State::Stored) ||
                    (value==3 && state==State::Recovery) || (value==4 && state==State::Evicting))++count;
@@ -524,23 +602,25 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
 }
 int PageableMemoryPrepareSyscall(Process* actor,uint64_t number) {
     if(!ready || !actor || !actor->addressSpace || !actor->addressSpace->pagingAdmission.Exclusive())return 0;
-    if(number==0 || number==1 || number==228 || number==0xB40 || number==60 || number==231 || number==11 || number==57 || number==56 ||
+    if(number==0 || number==1 || number==228 || number==0xB40 || number==60 || number==231 || number==9 || number==11 || number==57 || number==56 ||
        number==10 || number==25 || number==28 || number==62 || number==200 || number==234)return 0;
     // A sole task cannot mutate its mappings concurrently, but still take the
     // AS gate against diagnostic/cleanup users. Never retain a node after unlock.
     uint64_t cursor=0;
     for(;;) {
-        uint64_t missing=0;
+        uint64_t missing=0;uint32_t access=0;
         KMutexLock(&actor->addressSpace->mutation);
         for(auto* node=actor->addressSpace->ranges.head;node && !missing;node=node->next) {
-            if(node->range.kind!=MappingKind::Pageable || node->range.end<=cursor)continue;
+            if(node->range.kind!=MappingKind::Pageable || node->range.end<=cursor || !node->range.protection)continue;
             uint64_t at=node->range.begin>cursor?node->range.begin:cursor;
             for(;at<node->range.end;at+=4096)
-                if(!(VmmReadLeaf(actor->addressSpace->pageTable,VirtualAddress(at))&VMM_PRESENT)){missing=at;break;}
+                if(!(VmmReadLeaf(actor->addressSpace->pageTable,VirtualAddress(at))&VMM_PRESENT)){
+                    missing=at;access=node->range.protection&1?1:node->range.protection&2?2:4;break;
+                }
         }
         KMutexUnlock(&actor->addressSpace->mutation);
         if(!missing)return 0;
-        auto result=PageableMemoryFault(actor,actor->addressSpace,missing,1);
+        auto result=PageableMemoryFault(actor,actor->addressSpace,missing,access);
         if(result!=MappingFaultResult::Resolved)return result==MappingFaultResult::OutOfMemory?-12:-5;
         cursor=missing+4096;
     }

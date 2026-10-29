@@ -51,12 +51,16 @@ public:
     // Preflights both metadata splits and leaf retirement before any mutation,
     // then detaches old leaves and commits metadata together. New leaves are
     // installed separately while still locked, after preparing all resources.
-    bool ReplaceMapping(uint64_t begin, uint64_t end, const MappingRange* replacement = nullptr);
+    // The pager bypass requires captured entry retirement that commits only
+    // after replacement succeeds and releases content after this transaction.
+    bool ReplaceMapping(uint64_t begin, uint64_t end, const MappingRange* replacement = nullptr,
+                        bool pageableRetirementPrepared = false);
     // Caller provides nonallocating retirement storage and must release captured
     // frame references only after this transaction is destroyed (full TLB ACK).
     // Callback runs under PT spinlock: no allocation, blocking or unref.
     bool RemoveMappingWithRetirer(uint64_t begin,uint64_t end,VmmRetireLeaf retire,void* context);
-    bool CanReplaceRange(uint64_t begin, uint64_t end, const MappingRange* replacement = nullptr) const;
+    bool CanReplaceRange(uint64_t begin, uint64_t end, const MappingRange* replacement = nullptr,
+                         bool pageableRetirementPrepared = false) const;
     bool RangeLeafCount(uint64_t begin, uint64_t end, uint64_t& count) const;
     bool InsertRange(const MappingRange& range);
     bool ExtendRange(uint64_t identity, uint64_t end);
