@@ -5,7 +5,7 @@
 #include "../../kernel/src/memory/mapping_ranges.h"
 int main() {
     brook::PagingAdmission shared;
-    assert(shared.Share());assert(shared.Share());assert(!shared.ClaimExclusive());
+    assert(!shared.EverShared());assert(shared.Share());assert(shared.EverShared());assert(shared.Share());assert(!shared.ClaimExclusive());
     brook::PagingAdmission exclusive;
     assert(exclusive.ClaimExclusive());assert(exclusive.ClaimExclusive());assert(!exclusive.Share());
     assert(exclusive.Exclusive());

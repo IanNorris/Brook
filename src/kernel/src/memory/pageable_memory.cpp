@@ -1,4 +1,5 @@
 #include "pageable_memory.h"
+#include "pageable_application_policy.h"
 #include "page_store.h"
 #include "compressed_page_pool.h"
 #include "lz4.h"
@@ -24,6 +25,19 @@ namespace {
 PageStore store;
 KMutex storeLock;
 bool ready=false;
+PageableApplicationPolicy applicationPolicy;
+// Root-readable diagnostic totals survive worker exit. Held is a sampled
+// per-AS maximum, not an exact process or whole-system RSS high-water mark.
+uint64_t applicationStats[10]{};
+uint64_t applicationBarriers[512]{};
+void ApplicationCount(AddressSpaceState* space,unsigned counter,uint64_t amount=1) {
+    if(space->pagingApplication)__atomic_fetch_add(&applicationStats[counter],amount,__ATOMIC_RELAXED);
+}
+void ApplicationObserveHeld(AddressSpaceState* space,uint64_t held) {
+    if(!space->pagingApplication)return;
+    uint64_t old=__atomic_load_n(&applicationStats[9],__ATOMIC_RELAXED);
+    while(old<held && !__atomic_compare_exchange_n(&applicationStats[9],&old,held,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
+}
 FaultFrameReserve faultReserve;
 IrqSpinLock reserveLock;
 unsigned failOrdinaryAllocations=0;
@@ -249,6 +263,7 @@ int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr) {
     auto& entry=static_cast<Region*>(backing.value->object)->entries[index];
     if(!result) {
         entry.state=State::Stored;
+        ApplicationCount(space,5);
         --static_cast<Region*>(backing.value->object)->heldFrames;
         KMutexUnlock(&space->mutation);
         if(handoff)*handoff=frame.physical;
@@ -349,6 +364,34 @@ int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false,Phy
     }
 }
 
+}
+bool PageableMemoryMapAnonymous(Process* actor,const UserMappingRequest& original,uint64_t flags,int64_t& result) {
+    if(!ready || !actor || !actor->addressSpace ||
+       !applicationPolicy.Matches(actor->exePath,original.length,original.range.protection,flags))return false;
+    if(actor->addressSpace->pagingAdmission.EverShared())return false;
+    const uint64_t pages=original.length/4096;
+    auto* region=static_cast<Region*>(kmalloc(sizeof(Region)+(pages-1)*sizeof(Entry)));
+    if(!region){result=-12;return true;}
+    memset(region,0,sizeof(Region)+(pages-1)*sizeof(Entry));region->pages=pages;
+    for(uint64_t i=0;i<pages;++i)region->entries[i].state=State::Zero;
+    Backing backing{MappingBackingCreate(region,ReleaseRegion)};
+    if(!backing.value){kfree(region);result=-12;return true;}
+    auto* space=actor->addressSpace;
+    {
+        MappingTransaction operation(actor,space);
+        if(!operation.Lock()){result=-12;return true;}
+        // Unsupported/ever-shared ASs fall back before exclusive admission.
+        // A successful claim is sticky even if later publication fails.
+        if(!space->pagingAdmission.ClaimExclusive())return false;
+        space->pagingApplication=true;space->pagingReclaimEnabled=true;
+        space->pagingResidentTarget=applicationPolicy.residentPages;
+    }
+    auto request=original;
+    request.range.kind=MappingKind::Pageable;request.range.backing=backing.value;
+    request.preparedPages=0;request.prepare=nullptr;
+    result=UserMappingCreate(actor,space,request);
+    if(result>=0){ApplicationCount(space,0);ApplicationCount(space,1,request.length);}
+    return true;
 }
 PageableMemoryGrowth::PageableMemoryGrowth(Process* actor,AddressSpaceState* space):actor_(actor),space_(space) {
     SchedulerKernelRegionEnter(actor_);AddressSpaceRef(space_);
@@ -627,7 +670,23 @@ void PageableMemoryBootInit() {
             SerialPuts("paging: invalid reserve-refill flag (worker disabled)\n");
     }
 
-    SerialPrintf("paging experiment: backing=%s slots=%lu single-task explicit only\n",name,h.slots);
+    char executable[256]{};auto executableSize=FwCfgReadFile("opt/page-store-executable",executable,sizeof(executable));
+    if(executableSize) {
+        uint64_t mib=64;char target[8]{};
+        auto targetSize=FwCfgReadFile("opt/page-store-executable-resident-mib",target,sizeof(target));
+        bool valid=targetSize<sizeof(target);
+        if(targetSize) {
+            mib=0;
+            for(unsigned i=0;i<targetSize;++i) {
+                if(target[i]<'0' || target[i]>'9'){valid=false;break;}
+                mib=mib*10+unsigned(target[i]-'0');
+            }
+        }
+        if(!valid || mib<1 || mib>256 || !applicationPolicy.Configure(executable,executableSize,mib*256))
+            SerialPuts("paging: invalid executable policy (ordinary mmap retained)\n");
+        else SerialPrintf("paging: executable experiment path=%s resident_target_mib=%lu (single-task CLONE_VM restriction)\n",executable,mib);
+    }
+    SerialPrintf("paging experiment: backing=%s slots=%lu single-task admission\n",name,h.slots);
 }
 void PageableMemoryStartReserveWorker() {
     if(!ready || !refillEnabled || __atomic_load_n(&refillStarted,__ATOMIC_ACQUIRE))return;
@@ -638,6 +697,8 @@ void PageableMemoryStartReserveWorker() {
 int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) {
     if(!ready)return -95;
     if(!actor || !ProcessCapable(actor,nullptr,CapSysAdmin))return -1;
+    if(operation==22 && value<10)return __atomic_load_n(&applicationStats[value],__ATOMIC_RELAXED);
+    if(operation==23 && value<512)return __atomic_load_n(&applicationBarriers[value],__ATOMIC_RELAXED);
     if(operation==20 && value<=5){StoreGuard guard;forkFailure=value;forkFailureSpace=value?actor->addressSpace->identity:0;return 0;}
     if(operation==21 && value<=2){StoreGuard guard;growthFailure=value;growthFailureSpace=value?actor->addressSpace->identity:0;return 0;}
     if(operation==0)return Map(actor,value);
@@ -728,17 +789,23 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     const auto initialState=entry.state;
     if(initialState==State::Recovery){recovery.physical=entry.recovery;PmmRefPage(recovery.physical);}
     else if(initialState!=State::Stored && initialState!=State::Zero)return MappingFaultResult::Unhandled;
+    const uint64_t observedHeld=(space->pagingResidentTarget || space->pagingApplication)?HeldFrames(space):0;
+    ApplicationObserveHeld(space,observedHeld);
     const bool softPressure=allowReclaim && actor->addressSpace==space &&
-        space->pagingResidentTarget && HeldFrames(space)>=space->pagingResidentTarget;
+        space->pagingResidentTarget && observedHeld>=space->pagingResidentTarget;
     op.Unlock();
     if(!op.Prepare(0,1))return MappingFaultResult::OutOfMemory;
     bool reclaimAttempted=softPressure && initialState!=State::Recovery;
-    if(reclaimAttempted)(void)ReclaimOne(actor,page,true,&recovery.physical);
+    if(reclaimAttempted) {
+        ApplicationCount(space,7);
+        if(ReclaimOne(actor,page,true,&recovery.physical)<0)ApplicationCount(space,8);
+    }
     PhysicalAddress physical=recovery.physical;
     if(!physical)physical=AllocateFaultFrame(space->allocationPid);
     if(!physical && reserve.Take(space->allocationPid)){physical=reserve.physical;PmmRefPage(physical);}
     if(!physical && !reclaimAttempted && allowReclaim && actor->addressSpace==space) {
-        reclaimAttempted=true;(void)ReclaimOne(actor,page,false,&recovery.physical);
+        reclaimAttempted=true;ApplicationCount(space,7);
+        if(ReclaimOne(actor,page,false,&recovery.physical)<0)ApplicationCount(space,8);
         physical=recovery.physical;
     }
     if(physical) {
@@ -779,13 +846,14 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     // Release backing-owned recovery/slot only after leaving the AS gate.
     recovery.physical=entry.recovery;entry.recovery={};entry.slot=0;entry.state=State::Resident;
     if(initialState!=State::Recovery)++region->heldFrames;
+    ApplicationCount(space,initialState==State::Zero?2:initialState==State::Stored?3:4);
     space->pagingRecentFaults[space->pagingRecentNext++%8]=page;
     op.Unlock();ReleaseSlot(token);
     return MappingFaultResult::Resolved;
 }
 int PageableMemoryPrepareSyscall(Process* actor,uint64_t number) {
     if(!ready || !actor || !actor->addressSpace || !actor->addressSpace->pagingAdmission.Exclusive())return 0;
-    if(number==0 || number==1 || number==228 || number==0xB40 || number==60 || number==231 || number==9 || number==11 || number==57 || number==56 ||
+    if(number==0 || number==1 || number==2 || number==3 || number==5 || number==257 || number==228 || number==0xB40 || number==60 || number==231 || number==9 || number==11 || number==12 || number==89 || number==267 || number==57 || number==56 ||
        number==10 || number==25 || number==28 || number==62 || number==200 || number==234)return 0;
     // A sole task cannot mutate its mappings concurrently, but still take the
     // AS gate against diagnostic/cleanup users. Never retain a node after unlock.
@@ -802,9 +870,19 @@ int PageableMemoryPrepareSyscall(Process* actor,uint64_t number) {
                 }
         }
         KMutexUnlock(&actor->addressSpace->mutation);
-        if(!missing)return 0;
+        if(!missing){
+            if(actor->addressSpace->pagingApplication) {
+                KMutexLock(&actor->addressSpace->mutation);
+                ApplicationObserveHeld(actor->addressSpace,HeldFrames(actor->addressSpace));
+                KMutexUnlock(&actor->addressSpace->mutation);
+            }
+            return 0;
+        }
         auto result=PageableMemoryFault(actor,actor->addressSpace,missing,access);
         if(result!=MappingFaultResult::Resolved)return result==MappingFaultResult::OutOfMemory?-12:-5;
+        ApplicationCount(actor->addressSpace,6);
+        if(actor->addressSpace->pagingApplication && number<512)
+            __atomic_fetch_add(&applicationBarriers[number],1,__ATOMIC_RELAXED);
         cursor=missing+4096;
     }
 }

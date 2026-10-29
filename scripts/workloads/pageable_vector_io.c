@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -18,7 +19,8 @@ static void cold(unsigned char* p,unsigned count){
 int main(void){
     char name[]="/tmp/brook-vector-XXXXXX";int fd=mkstemp(name);assert(fd>=0);
     int append=open(name,O_WRONLY|O_APPEND);assert(append>=0 && unlink(name)==0);
-    int pipes[2],packet[2];assert(pipe(pipes)==0 && pipe2(packet,O_DIRECT)==0);
+    int pipes[2],packet[2],sockets[2];assert(pipe(pipes)==0 && pipe2(packet,O_DIRECT)==0);
+    assert(socketpair(AF_UNIX,SOCK_STREAM,0,sockets)==0);
     enum { Pages=66, Count=64, Bytes=128 };
     long address=ctl(0,Pages*4096);assert(address>0);
     unsigned char* p=(void*)(uintptr_t)address;
@@ -60,7 +62,17 @@ int main(void){
         for(unsigned i=0;i<2;++i)for(unsigned j=0;j<Bytes;++j)
             assert(((unsigned char*)vectors[i].iov_base)[j]==i+1);
     }
+    assert(write(sockets[1],"z",1)==1);
+    socklen_t* sourceLength=(void*)(p+3*4096);*sourceLength=sizeof(struct sockaddr);
+    assert(mprotect(p+3*4096,4096,PROT_READ)==0);
+    errno=0;assert(recvfrom(sockets[0],p+8192,1,MSG_DONTWAIT,
+        (struct sockaddr*)(p+4*4096),sourceLength)==-1 && errno==EFAULT);
+    assert(ctl(6,0)==0 && mprotect(p+3*4096,4096,PROT_READ|PROT_WRITE)==0);
+    cold(p,Pages);
+    assert(recvfrom(sockets[0],p+8192,1,MSG_DONTWAIT,
+        (struct sockaddr*)(p+4*4096),sourceLength)==1);
+    assert(p[8192]=='z' && *sourceLength==0 && ctl(6,0)==0);
     assert(munmap(p,Pages*4096)==0 && ctl(2,0)==0 && ctl(6,0)==0);
-    close(fd);close(append);for(unsigned i=0;i<2;++i){close(pipes[i]);close(packet[i]);}
-    puts("PAGEABLE_VECTOR_IO_PASS cold_descriptors 64_buffers generic append stream_packet_pipe readonly EFAULT lease_cleanup");
+    close(fd);close(append);for(unsigned i=0;i<2;++i){close(pipes[i]);close(packet[i]);close(sockets[i]);}
+    puts("PAGEABLE_VECTOR_IO_PASS cold_descriptors 64_buffers generic append stream_packet_pipe readonly EFAULT recvfrom_address lease_cleanup");
 }

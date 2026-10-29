@@ -5,6 +5,7 @@ namespace brook {
 struct Process;
 struct AddressSpaceState;
 struct MappingRangeTable;
+struct UserMappingRequest;
 struct MappingBacking;
 struct MappingRange;
 // Prepare empty replacement metadata outside AS mutation. TransferLocked moves
@@ -80,6 +81,8 @@ private:
     Process* actor_;
 };
 // Explicit single-task experiment; opt/page-store-device is absent by default.
+// False leaves normal mmap unchanged. True returns an enrolled result/error.
+bool PageableMemoryMapAnonymous(Process*,const UserMappingRequest&,uint64_t flags,int64_t& result);
 void PageableMemoryBootInit();
 // Bounded healthy-memory reserve replenishment; starts only for an enabled store.
 void PageableMemoryStartReserveWorker();
@@ -88,7 +91,7 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
 // Conservative experiment-only raw-uaccess barrier: before unaudited syscalls,
 // restore all pageable leaves while no handler lock has yet been acquired.
 // This deliberately sacrifices paging benefit across syscalls until raw user
-// pointer consumers have proper exclusion. Read/write use lexical leases;
-// Scalar paging/mapping/exit operations also skip this barrier.
+// pointer consumers have proper exclusion. Audited read/write, pathname and
+// fstat handlers use leases/snapshots; scalar mapping/fd operations skip it.
 int PageableMemoryPrepareSyscall(Process* actor,uint64_t number);
 }

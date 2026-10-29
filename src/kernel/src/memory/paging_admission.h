@@ -15,6 +15,7 @@ struct PagingAdmission {
         uint32_t old=0;
         return __atomic_compare_exchange_n(&state,&old,2,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE) || old==2;
     }
+    bool EverShared() const { return __atomic_load_n(&state,__ATOMIC_ACQUIRE)==1; }
     bool Exclusive() const { return __atomic_load_n(&state,__ATOMIC_ACQUIRE)==2; }
 };
 }

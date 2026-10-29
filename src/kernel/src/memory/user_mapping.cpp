@@ -104,6 +104,7 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
             if (!plan.Insert(destination->ranges,range))
                 KernelPanic("mapping: preallocated fork metadata failed");
         }
+        destination->pagingApplication=source->pagingApplication;
         destination->pagingReclaimEnabled=source->pagingReclaimEnabled;
         destination->pagingResidentTarget=source->pagingResidentTarget;
         destination->programBreak=source->programBreak;

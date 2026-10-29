@@ -3296,6 +3296,7 @@ static int64_t OpenAtInternal(int dirfd,uint64_t pathAddr,uint64_t flags,uint64_
     Process* proc = ProcessCurrent();
     if (!proc) return -EBADF;
 
+    UserAccessScope pathAccess(proc);
     char pathBuf[512];
     const char* path = nullptr;
     if (pathAddr < 0x0000800000000000ULL)
@@ -4292,6 +4293,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             // Keep explicit population requests eager.
             request.preparedPages=length/4096;request.prepare=PrepareAnonymousMapping;
         }
+        int64_t pageableResult=0;
+        if(PageableMemoryMapAnonymous(proc,request,flags,pageableResult))return pageableResult;
         return UserMappingCreate(proc,proc->addressSpace,request);
     }
     FdRef descriptor(proc,static_cast<int>(fd));
@@ -7939,10 +7942,8 @@ static int64_t sys_lstat(uint64_t pathAddr, uint64_t statAddr, uint64_t,
     return do_lstat_internal(pathBuf, statAddr);
 }
 
-static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
-                          uint64_t, uint64_t, uint64_t)
+static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
 {
-    auto* st = reinterpret_cast<LinuxStat*>(statAddr);
 
     Process* proc = ProcessCurrent();
     if (!proc || fd >= MAX_FDS) return -EBADF;
@@ -8080,7 +8081,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
         for (uint64_t index = 0; index < mfd->pageMapCount; ++index)
             if (mfd->pageMap[index]) allocatedBlocks += 4096 / 512;
         MfdUnlock(mfd);
-        // User-buffer writes stay outside the backing lock: they may fault.
+        // Snapshot construction stays outside the backing lock.
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_dev = 0x01000000; // anonymous shmem namespace, distinct from disk mounts
@@ -8102,6 +8103,16 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statAddr, uint64_t,
     }
 
     return -EBADF;
+}
+
+// Build descriptor metadata entirely in kernel memory; copy only after all
+// backend locks/references have left their scopes. statx also uses the helper.
+static int64_t sys_fstat(uint64_t fd,uint64_t statAddr,uint64_t,uint64_t,uint64_t,uint64_t) {
+    LinuxStat value{};
+    const int64_t result=FstatKernel(fd,&value);
+    if(result)return result;
+    UserAccessScope access(ProcessCurrent());
+    return CopyToUser(statAddr,&value,sizeof(value))?0:-EFAULT;
 }
 
 static int FillCurrentDirectoryStat(LinuxStat* result)
@@ -9391,6 +9402,7 @@ static int64_t DoReadlink(const char* original,uint64_t bufAddr,uint64_t bufsiz,
 static int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz,
                              uint64_t, uint64_t, uint64_t)
 {
+    UserAccessScope access(ProcessCurrent());
     char path[256];
     if (!CopyUserCString(pathAddr, path, sizeof(path)))
         return -EFAULT;
@@ -9400,6 +9412,7 @@ static int64_t sys_readlink(uint64_t pathAddr, uint64_t bufAddr, uint64_t bufsiz
 static int64_t sys_readlinkat(uint64_t dirfd, uint64_t pathAddr, uint64_t bufAddr,
                                uint64_t bufsiz, uint64_t, uint64_t)
 {
+    UserAccessScope access(ProcessCurrent());
     char path[256];
     if (!CopyUserCString(pathAddr, path, sizeof(path)))
         return -EFAULT;
@@ -10981,7 +10994,7 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t pathAddr, uint64_t flags,
         LinuxStat st;
         int64_t ret = static_cast<int>(dirfd) == -100
             ? FillCurrentDirectoryStat(&st)
-            : sys_fstat(dirfd, reinterpret_cast<uint64_t>(&st), 0, 0, 0, 0);
+            : FstatKernel(dirfd,&st);
         if (ret < 0) return ret;
         fillStatxFromLinuxStat(st);
         return 0;
@@ -13820,6 +13833,10 @@ static int64_t sys_recvfrom(uint64_t fdVal, uint64_t bufVal, uint64_t lenVal,
             }
             return result<0?result:(flagsVal&0x20)?static_cast<int64_t>(size):result;
         }
+        // The nested read's lease ends before the address-length store below.
+        UserAccessScope addressAccess(proc);
+        if(srcVal && addrLenVal>=0x1000 &&
+           !UserBufferWritable(addrLenVal,sizeof(uint32_t)))return -EFAULT;
         bool oldNonblock = usd ? usd->nonblock : false;
         if (usd && (flagsVal & 0x40)) // MSG_DONTWAIT
             usd->nonblock = true;

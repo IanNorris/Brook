@@ -75,6 +75,7 @@ target_compile_options(test_compressed_vfs PRIVATE -DBROOK_HOST_TEST -ffunction-
 target_link_options(test_compressed_vfs PRIVATE -Wl,--gc-sections)
 target_link_libraries(test_compressed_vfs PRIVATE paging_lz4_host)
 add_host_test(test_paging_admission)
+add_host_test(test_pageable_application_policy)
 add_host_test(test_user_access_ranges)
 add_host_test(test_fault_frame_reserve)
 add_host_test(test_mapping_record_reserve "${BROOK_ROOT}/src/kernel/src/memory/mapping_transaction.cpp")

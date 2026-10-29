@@ -1236,3 +1236,75 @@ Eleven relevant host tests and compiled entry/startup mutation audits pass.
 Evidence: vector-io-acceptance/{metadata.json,native.log,native-raw/,native-ram/,
 entry-audit.json,scheduler-audit.json}. Ordinary anonymous app paging remains
 disabled pending a scoped enrollment policy and further kernel-access work.
+
+### Unmodified compiler paging experiment (29 October)
+
+The boot-only `opt/page-store-executable` policy now enrolls private anonymous
+RW mmap requests from one exact resolved executable path. It accepts only flags
+0x22 and aligned lengths from 64 KiB through 16 MiB, preserving ordinary hints,
+maximum protection 7 and address selection through the normal mapping core.
+Unsupported shapes and ever-shared address spaces retain ordinary mmap behavior
+before exclusive admission. Region preparation/publication failure can leave
+exclusive admission sticky until exec, as with explicit paging. This mode can
+reject subsequent CLONE_VM; it is an opt-in single-task experiment, not general
+application support. Fork inherits its label with independent Region entries;
+a fresh exec address space resets admission and the label. The new executable
+is evaluated independently when it later requests a qualifying mmap.
+
+Require a valid page-store device. Optional
+`opt/page-store-executable-resident-mib` accepts 1–256 and defaults to 64 MiB.
+The target is soft; leases, COW and eager barriers can prevent enforcement.
+Invalid executable/target configuration disables enrollment. No executable
+policy is enabled by default. This path currently covers mmap allocations,
+not ordinary brk/heap pages or arbitrary shared address spaces.
+
+Root diagnostic control 22 selectors are: 0 successful selected maps, 1 their
+aligned requested bytes, 2/3/4 successful Zero/Stored/Recovery fault publications,
+5 successful pageouts, 6 eager-barrier restorations, 7 reclaim attempts,
+8 failed attempts and 9 maximum sampled held frames of an individual labeled
+AS. Control 23 reads restoration counts by syscall number 0–511. Totals survive
+worker exit, are cumulative per boot, and exclude unlabeled synthetic probes.
+Fault counts include eager restorations; selector 9 is neither exact peak RSS
+nor aggregate process-tree memory. Tier I/O counters remain global and include
+setup probes; do not attribute their full totals to the application.
+
+The first real allocator run exposed needless whole-AS restoration at brk,
+readlink, open/close and fstat. Scalar brk/close no longer require it. Pathname
+handlers now retain lexical leases around kernel pathname snapshots. fstat
+builds descriptor metadata in a kernel snapshot, releases backend locks/FD
+references, then copies through a leased user-access check. statx's internal
+kernel-buffer use calls the snapshot helper directly. The Unix-stream recvfrom
+branch also validates/leases its address-length output before a nested read.
+Other unaudited handlers, including ioctl, retain the conservative barrier.
+
+Four fresh 512 MiB/eight-vCPU VMs run the same unmodified GCC C++17 compile,
+link and threaded output verification as UID 1000 under the same 96 MiB ordinary
+memory holder. One cold observation per case, in order off/16/48/64 MiB:
+
+- Off: compile 2.599 s; minimum sampled free memory 3.41 MiB.
+- 16 MiB: 20.114 s; minimum sampled free 71.14 MiB; 74,649 pageouts.
+- 48 MiB: 5.552 s; minimum sampled free 42.02 MiB; 18,425 pageouts.
+- 64 MiB: 3.281 s; minimum sampled free 26.02 MiB; 8,054 pageouts.
+
+Each enabled run enrolls 57 mappings/93,757,440 requested bytes, has no failed
+reclaim attempts, leaves zero backing slots and zero allocated RAM-pool bytes,
+and reports only 537 eager restorations, all at ioctl. These are successful
+real-allocator paging and a measured memory/latency tradeoff, **not a throughput
+improvement**. The 16 MiB target severely thrashes; choose the more conservative
+64 MiB experiment default. Sampled free memory is not an exact RSS measurement,
+one observation is not a repeatability claim, and tracing/census runs are not
+used for these timings. Pressure-responsive policy and better victim selection
+remain work before broad deployment.
+
+Forty-five native regression jobs and four explicit enrollment jobs pass across
+raw and compressed-RAM backing. Tests cover cold crossing-page pathnames and
+stat output, invalid/read-only buffers, relative directory-FD opens, unrelated
+pages remaining Stored, statx empty-path metadata, mmap hints/lazy Zero,
+maximum-protection RX transitions, Stored instruction faults, fork COW isolation,
+exec reset and ever-shared fallback. Twelve relevant host tests and both
+compiled entry/startup mutation audits pass. All eight final VMs sync/stop with
+original owner exit zero; the 64 MiB compiler VM's data/Nix/tmp ext2 exports
+pass read-only checks. Astra found no checkpoint blocker. Evidence under
+`application-policy-budgets-v2/`: metadata.json, compiler-accepted-results.json,
+compare.log, native.log, enrollment.log, host-tests.log, entry-audit.json,
+scheduler-audit.json, fsck-results.json and the per-VM job/shutdown receipts.
