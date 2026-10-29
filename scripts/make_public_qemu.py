@@ -79,6 +79,7 @@ def main():
     script = stage / 'INIT.RC'
     script.write_text('set wm\nset vfb none\n'
                       'run --service --once --uid 1000 --gid 100 /nix/profile/bin/brook-dbus --config-file=/nix/profile/bin/brook-session.conf --nofork --address=unix:path=/tmp/brook-session-bus --nosyslog\n'
+                      'run --service --once --quiet --uid 1000 --gid 100 /nix/profile/bin/brook-message --watch\n'
                       'run --service --once /nix/profile/bin/waylandd\n')
     # Brook deliberately skips the GPT ESP during kernel filesystem mounting.
     # Keep the early /boot script and terminal shell in the loaded RAM disk.

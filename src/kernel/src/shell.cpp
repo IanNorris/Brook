@@ -12,6 +12,7 @@
 
 #include "shell.h"
 #include "shutdown.h"
+#include "memory/oom_recovery.h"
 #include "exec_image.h"
 #include "vfs.h"
 #include "process.h"
@@ -450,6 +451,8 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
     if(!ShutdownLaunchAllowed()) {
         KPrintf("shell: shutdown in progress\n");return -108;
     }
+    const uint32_t requestedUid=uidOverride==CredentialUnchanged?DesktopUid:uidOverride;
+    if(!service && !OomRecoveryAdmitApplication(path,requestedUid))return -12;
     ExecutableImage image{};
     char executablePath[sizeof(Process::exePath)];
     Vnode* vnode = nullptr;

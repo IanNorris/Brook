@@ -63,7 +63,10 @@ public:
     }
     // Only for a commit rejected before any fatal request was published.
     void SelectionRejected(uint64_t now) {
-        if(phase_==Phase::Waiting)Enter(Phase::Reclaiming,now<lastNow_?lastNow_:now);
+        if(phase_==Phase::Waiting)Enter(Phase::Selecting,now<lastNow_?lastNow_:now);
+    }
+    void SelectionDeferred(uint64_t now) {
+        if(phase_==Phase::Selecting)Enter(Phase::Reclaiming,now<lastNow_?lastNow_:now);
     }
     void NoEligibleVictim(uint64_t now) {
         if(phase_!=Phase::Selecting)return;

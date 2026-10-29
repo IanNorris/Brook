@@ -47,8 +47,10 @@
 namespace brook {
 static_assert(offsetof(Process,mountNamespaceMember)+sizeof(Process::mountNamespaceMember)==offsetof(Process,fsContext),
               "fork/thread snapshot must exclude both filesystem ownership fields");
-static_assert(sizeof(Process)-(offsetof(Process,fsContext)+sizeof(Process::fsContext))<alignof(Process),
-              "filesystem ownership fields must remain last, allowing alignment padding");
+static_assert(offsetof(Process,fsContext)+sizeof(Process::fsContext)==offsetof(Process,oomEpisode),
+              "recovery marker follows independently synchronized filesystem state");
+static_assert(sizeof(Process)-(offsetof(Process,oomEpisode)+sizeof(Process::oomEpisode))<alignof(Process),
+              "explicitly inherited recovery marker must remain last, allowing alignment padding");
 
 namespace {
 IrqSpinLock signalActionLock;
@@ -107,6 +109,7 @@ static void CopyParentProcess(Process* child, Process* parent) {
     memcpy(reinterpret_cast<char*>(child)+displayEnd,reinterpret_cast<const char*>(parent)+displayEnd,
            offsetof(Process,capabilities)-displayEnd);
     ProcessFsReadDisplay(parent,child->cwdDisplay,sizeof(child->cwdDisplay));
+    child->oomEpisode=__atomic_load_n(&parent->oomEpisode,__ATOMIC_ACQUIRE);
     child->userAccessScope=nullptr; // never inherit a pointer into a parent's kernel stack
 }
 

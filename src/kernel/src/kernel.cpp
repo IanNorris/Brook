@@ -8,6 +8,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "gdt.h"
 #include "idt.h"
 #include "memory/physical_memory.h"
+#include "memory/oom_recovery.h"
 #include "memory/virtual_memory.h"
 #include "memory/heap.h"
 #include "memory/file_object.h"
@@ -836,6 +837,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::PageableMemoryStartReserveWorker();
         brook::FilePageCacheStartReclaimWorker();
         brook::FileObjectStartWriteback();
+        brook::OomRecoveryStartWorker();
 
         // BRO-179 forensic: arm PID/seq-encoded heap poison now that the per-CPU
         // GS base is valid, so a kfree that corrupts a live struct stamps the

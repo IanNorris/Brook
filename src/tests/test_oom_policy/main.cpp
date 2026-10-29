@@ -1,8 +1,15 @@
 #include <cassert>
 #include <cstdio>
 #include "../../kernel/src/memory/oom_policy.h"
+#include "../../kernel/src/memory/oom_recovery.h"
 using namespace brook;
 int main() {
+    constexpr auto reserve=OomUserReservePages;
+    assert(!OomUserAllocationFits(reserve,1));
+    assert(OomUserAllocationFits(reserve+1,1));
+    assert(OomUserAllocationFits(2*reserve,reserve));
+    assert(!OomUserAllocationFits(2*reserve,reserve+1));
+    assert(!OomUserAllocationFits(0,1));
     using A=OomPolicy::Action;using P=OomPolicy::Phase;
     OomPolicy policy;
     assert(policy.Tick(0,OomPolicy::HighPages)==A::None);

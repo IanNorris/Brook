@@ -156,7 +156,7 @@ def main():
         (nix_root / "etc").mkdir(exist_ok=True)
         shutil.copy2(ROOT / "data/asound.conf", nix_root / "etc/asound.conf")
         shutil.copy2(ROOT / "data/config/alsoft-oss.conf", nix_root / "etc/alsoft-oss.conf")
-        for executable in ([] if args.bootstrap_mode or args.profile_expression else ["waylandd", "wayland-calc", "brook-player", "brook-files", "brook-gallery",
+        for executable in ([] if args.bootstrap_mode or args.profile_expression else ["waylandd", "wayland-calc", "brook-player", "brook-files", "brook-gallery", "brook-message",
                            "brook-office", "brook-ladybird", "brook-vlc", "brook-dbus", "brook-session.conf",
                            "brook-yquake2-gl", "brook-yquake2-soft"]):
             source = profile / "bin" / executable

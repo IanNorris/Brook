@@ -57,6 +57,20 @@ void test(Process& parent) {
     VfsDrainMountCleanup();FsSnapshotRelease(&observer);VfsDrainMountCleanup();
     g_pidToProcess[41]=nullptr;g_allProcesses[0]=nullptr;g_processCount=0;
 
+    // CLONE_VM without CLONE_THREAD: prepared before selection, published
+    // afterward. The AS latch must catch this regardless of isThread.
+    Process lateClone{};assert(!ProcessFsInherit(&lateClone,&parent,false));
+    assert(!ProcessFsIsolateMounts(&lateClone));
+    assert(!ProcessFsSnapshot(&lateClone,&observer));ns=observer.mountNamespace;
+    lateClone.addressSpace=&space;lateClone.pid=lateClone.tgid=42;
+    lateClone.incarnation=100;lateClone.isThread=false;
+    space.oomTerminating=true;
+    SchedulerAddProcess(&lateClone);
+    assert(lateClone.state==ProcessState::Terminated && lateClone.reapable && !queued);
+    assert(!lateClone.mountNamespaceMember && ns->life.IsRetired());
+    ProcessFsClear(&lateClone);VfsDrainMountCleanup();FsSnapshotRelease(&observer);VfsDrainMountCleanup();
+    g_pidToProcess[42]=nullptr;g_allProcesses[0]=nullptr;g_processCount=0;space.oomTerminating=false;
+
     Process deferred{};assert(!ProcessFsInherit(&deferred,&parent,false));
     assert(!ProcessFsIsolateMounts(&deferred));assert(!ProcessFsSnapshot(&deferred,&observer));
     ns=observer.mountNamespace;deferred.state=ProcessState::Blocked;deferred.runningOnCpu=-1;

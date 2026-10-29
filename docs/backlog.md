@@ -2,7 +2,8 @@
 
 ### Priority: survive memory exhaustion with controlled victim selection (29 October 2026)
 
-Confirmed outstanding after the bounded paging/compression acceptance. The pager
+Implementation and acceptance in progress on `wip/oom-recovery-20261029`; see
+[recovery implementation and current evidence](oom-recovery.md). The pager
 can reclaim only eligible memory and has finite RAM/disk backing; it does not
 implement a system-wide OOM killer. `PmmAllocPage` currently returns failure when
 its physical allocator is exhausted. Recovery policy must execute outside PMM,

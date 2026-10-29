@@ -66,6 +66,17 @@ int main() {
         PmmUnrefPage(sourceFirst?stage:mapping);CHECK(!c.TrimIdle());
         PmmUnrefPage(sourceFirst?mapping:stage);CHECK(c.TrimIdle()==1);empty();
     }
+    // A pressure batch advances only its bounded cursor and never drops live
+    // mappings. Whole-table wrap eventually finds idle entries despite holes.
+    {
+        ExecPageCacheEntry entries[8]{};ExecPageCache c(entries,8,8,8,collision);
+        auto active=c.Adopt(page(1)),idle=c.Adopt(page(2));PmmUnrefPage(idle);
+        CHECK(!c.ReclaimIdleStep(0));
+        uint64_t reclaimed=0;
+        for(unsigned i=0;i<8;++i)reclaimed+=c.ReclaimIdleStep(1);
+        CHECK(reclaimed==1 && c.Stats().entries==1 && PmmGetRefCount(active)==2);
+        PmmUnrefPage(active);CHECK(c.ReclaimIdleStep(8)==1);empty();
+    }
     // Concurrent misses and trim: keep a witness ref so every equal candidate
     // must converge even while other workers and a trimmer release refs.
     {

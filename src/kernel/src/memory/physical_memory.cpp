@@ -1,4 +1,5 @@
 #include "physical_memory.h"
+#include "oom_recovery.h"
 #include "serial.h"
 #include "spinlock.h"
 #include "portio.h"
@@ -18,6 +19,13 @@ namespace brook {
     extern "C" void SchedulerSleepMs(uint32_t ms);
     Process* ProcessCurrent();                 // process.h — current thread or nullptr
 }
+
+#ifdef BROOK_HOST_TEST
+namespace brook {
+bool OomRecoveryEnabled() __attribute__((weak));
+void OomRecoveryAllocationFailure(uint64_t,uint64_t,bool) __attribute__((weak));
+}
+#endif
 
 // Linker-defined symbol — end of the kernel image (virtual address).
 // Declared outside any namespace so the linker resolves it correctly.
@@ -684,10 +692,31 @@ void PmmInit(const BootProtocol* proto)
                  static_cast<uint32_t>((g_totalPages * PAGE_SIZE) / (1024 * 1024)));
 }
 
+static bool RecoveryEnabled() {
+#ifdef BROOK_HOST_TEST
+    return OomRecoveryEnabled && OomRecoveryEnabled();
+#else
+    return OomRecoveryEnabled();
+#endif
+}
+static void ReportAllocationFailure(uint64_t count,uint64_t free,bool contiguous) {
+#ifdef BROOK_HOST_TEST
+    if(OomRecoveryAllocationFailure)OomRecoveryAllocationFailure(count,free,contiguous);
+#else
+    OomRecoveryAllocationFailure(count,free,contiguous);
+#endif
+}
+
 PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
 {
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
+    // Preserve a small physical floor for kernel cleanup/control resources.
+    // No worker, signal or scheduling operation runs under this guard.
+    if(tag==MemTag::User && RecoveryEnabled() && !OomUserAllocationFits(g_freePages,1)) {
+        const auto free=g_freePages;IrqSpinLockRelease(&g_pmmLock,pmmFlags);
+        ReportAllocationFailure(1,free,false);return PhysicalAddress{};
+    }
     // Search from hint forward, then wrap around once.
     uint64_t startWord = g_nextHint / 64;
     uint64_t endWord   = (g_totalPages + 63) / 64;
@@ -724,6 +753,7 @@ PhysicalAddress PmmAllocPage(MemTag tag, uint16_t pid)
     if (report)
         SerialPrintf("PMM: allocation failed pid=%u tag=%u free_pages=%lu total_pages=%lu\n",
                      static_cast<unsigned>(pid),static_cast<unsigned>(tag),freeAtFailure,totalAtFailure);
+    ReportAllocationFailure(1,freeAtFailure,false);
     return PhysicalAddress{}; // out of memory
 }
 
@@ -734,6 +764,10 @@ PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
 
     uint64_t pmmFlags = IrqSpinLockAcquire(&g_pmmLock);
 
+    if(tag==MemTag::User && RecoveryEnabled() && !OomUserAllocationFits(g_freePages,count)) {
+        const auto free=g_freePages;IrqSpinLockRelease(&g_pmmLock,pmmFlags);
+        ReportAllocationFailure(count,free,true);return PhysicalAddress{};
+    }
     // Linear scan for a contiguous run of 'count' free pages.
     uint64_t runStart = 0;
     uint64_t runLen   = 0;
@@ -761,7 +795,9 @@ PhysicalAddress PmmAllocPages(uint64_t count, MemTag tag, uint16_t pid)
             runLen = 0;
         }
     }
+    const auto free=g_freePages;
     IrqSpinLockRelease(&g_pmmLock, pmmFlags);
+    ReportAllocationFailure(count,free,true);
     return PhysicalAddress{}; // no contiguous run found
 }
 

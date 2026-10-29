@@ -278,6 +278,17 @@ target_compile_options(test_socket_lifetime PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wn
 target_link_options(test_socket_lifetime PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_socket_lifetime PROPERTIES TIMEOUT 20)
 
+add_host_test(test_system_message_queue "${BROOK_ROOT}/src/kernel/src/system_message.cpp")
+target_compile_options(test_system_message_queue PRIVATE -DBROOK_HOST_TEST)
+add_host_test(test_scheduler_oom)
+target_compile_options(test_scheduler_oom PRIVATE -DBROOK_HOST_TEST -Wno-attributes -Wno-unused-function -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_scheduler_oom PRIVATE -Wl,--gc-sections)
+add_host_test(test_oom_worker)
+target_compile_options(test_oom_worker PRIVATE -DBROOK_HOST_TEST -Wno-attributes -Wno-misleading-indentation
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_oom_policy)
 add_host_test(test_system_message "${BROOK_ROOT}/tools/brook-message-pkg/message_format.c")
 target_compile_options(test_system_message PRIVATE "-iquote${BROOK_ROOT}/src/shared")

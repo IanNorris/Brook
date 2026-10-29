@@ -765,6 +765,14 @@ void PageableMemoryBootInit() {
     }
     SerialPrintf("paging experiment: backing=%s slots=%lu single-task admission\n",name,h.slots);
 }
+PageableBackingStatus PageableMemoryBackingStatus() {
+    PageableBackingStatus status{};status.configured=ready;
+    if(!ready || !KMutexTryLock(&storeLock))return status;
+    const auto stats=store.Stats();
+    status.usageValid=true;status.logicalCapacityBytes=stats.slots*4096;
+    status.logicalUsedBytes=stats.used*4096;
+    KMutexUnlock(&storeLock);return status;
+}
 void PageableMemoryStartReserveWorker() {
     if(!ready || !refillEnabled || __atomic_load_n(&refillStarted,__ATOMIC_ACQUIRE))return;
     auto* worker=KernelThreadCreate("page_reserve",ReserveRefillWorker,nullptr,1);

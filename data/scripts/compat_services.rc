@@ -1,2 +1,4 @@
 # One Brook-owned bus per desktop session; /tmp is recreated at boot.
 run --service --once --uid 1000 --gid 100 /nix/bin/brook-dbus --config-file=/nix/bin/brook-session.conf --nofork --address=unix:path=/tmp/brook-session-bus --nosyslog
+# Prestarted presenter waits for Wayland, then reads retained per-user events.
+run --service --once --quiet --uid 1000 --gid 100 /nix/profile/bin/brook-message --watch

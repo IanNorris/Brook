@@ -30,6 +30,7 @@
 #include "serial.h"
 #include "panic.h"
 #include "process.h"
+#include "system_message.h"
 #include "user_access_scope.h"
 #include "desktop_identity.h"
 #include "exec_limits.h"
@@ -714,6 +715,23 @@ struct KernelOperationGuard {
     explicit KernelOperationGuard(Process* p) : proc(p) { if (proc) SchedulerKernelRegionEnter(proc); }
     ~KernelOperationGuard() { if (proc) SchedulerKernelRegionLeave(proc); }
 };
+
+// Read-only per-user retained system events. A failed user copy never consumes
+// an event; the caller advances its own cursor only after receiving the record.
+static int64_t sys_brook_system_message(uint64_t after,uint64_t output,uint64_t size,
+                                        uint64_t a,uint64_t b,uint64_t c) {
+    auto* actor=ProcessCurrent();if(!actor)return -ESRCH;
+    KernelOperationGuard guard(actor);
+    if(a||b||c||size!=sizeof(BrookSystemMessage))return -EINVAL;
+    // A prestarted presenter retains the event until there is room to render
+    // it. Low-headroom diagnostics remain on the kernel debug/serial path.
+    if(PmmGetFreePageCount()<8192)return 0;
+    UserAccessScope lease(actor);
+    if(!UserBufferWritable(output,size))return -EFAULT;
+    BrookSystemMessage event{};
+    if(!brook::SystemMessageReadAfter(after,ProcessReadIds(actor,false).effective,&event))return 0;
+    return CopyToUser(output,&event,sizeof(event))?1:-EFAULT;
+}
 
 // Experimental explicit single-task paging; unavailable without a recognized
 // boot-selected disposable backing device. No user pointer arguments.
@@ -5640,7 +5658,8 @@ resolve_path:
         // audio thread) are wrongly stillborn and it blocks forever waiting on
         // a thread that never runs. (This silently broke launcher/makeWrapper
         // style programs that exec then spawn threads.)
-        __atomic_store_n(&proc->tgidExiting, false, __ATOMIC_RELEASE);
+        if(!__atomic_load_n(&proc->oomEpisode,__ATOMIC_ACQUIRE))
+            __atomic_store_n(&proc->tgidExiting, false, __ATOMIC_RELEASE);
     }
 
     // --- Replace the process image ---
@@ -5673,7 +5692,8 @@ resolve_path:
     // a misaligned/parent stack and #GPs inside __vsnprintf_internal (movaps on a
     // 16-byte-unaligned stack).  This is BRO-203 and is why every exec'd threaded
     // app (yquake2, SuperTuxKart, any SDL app) crashed right after window setup.
-    __atomic_store_n(&proc->tgidExiting, false, __ATOMIC_RELEASE);
+    if(!__atomic_load_n(&proc->oomEpisode,__ATOMIC_ACQUIRE))
+        __atomic_store_n(&proc->tgidExiting, false, __ATOMIC_RELEASE);
 
     for (uint32_t i = 0; i <= newExeLen; ++i)
         proc->exePath[i] = newExePath[i];
@@ -5706,6 +5726,14 @@ resolve_path:
             SchedulerExitCurrentProcess(-1);
             __builtin_unreachable();
         }
+    }
+
+    // Exec changes group identity and never returns through the normal syscall
+    // return boundary. A selected task must finish cleanup instead of entering
+    // the new image or clearing its recovery birth fence.
+    if(__atomic_load_n(&proc->oomEpisode,__ATOMIC_ACQUIRE)) {
+        SchedulerRequestFatalSignal(proc,9);
+        SchedulerExitCurrentProcess(128+9,9);
     }
 
     // --- Switch to new address space and enter user mode ---
@@ -15267,6 +15295,7 @@ void SyscallTableInit()
     g_syscallTable[0xB02]                = sys_brook_wm_theme;
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     g_syscallTable[0xB04]                = sys_brook_wm_scale;
+    g_syscallTable[BROOK_SYS_SYSTEM_MESSAGE] = sys_brook_system_message;
     g_syscallTable[0xB40]                = sys_brook_pageable_memory;
     g_syscallTable[BROOK_SYS_WM_APPEARANCE] = sys_brook_wm_appearance;
     g_syscallTable[BROOK_SYS_WM_TASKBAR_METRICS] = sys_brook_wm_taskbar_metrics;

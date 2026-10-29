@@ -2821,40 +2821,9 @@ void SchedulerFreePid(uint16_t pid)
     SchedLockRelease(g_pidLock,flags);
 }
 
-void SchedulerRequestFatalSignal(Process* anchor, int signal)
-{
-    // Signal senders include the timer ISR and TerminalClose with its mutex
-    // held. Never wait for peers or enable IRQs while snapshot refs are live:
-    // the target group can include this very CPU's interrupted/current task.
-    uint64_t flags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    Process* targets[MAX_PROCESSES];
-    uint32_t count = 0;
-    const uint64_t alf = SchedLockAcquire(g_allProcLock);
-    const uint16_t tgid = anchor->tgid;
-    const uint64_t generation = anchor->isThread ? anchor->leaderIncarnation : anchor->incarnation;
-    for (uint32_t i = 0; i < g_processCount; ++i) {
-        Process* p = g_allProcesses[i];
-        const uint64_t identity = p->isThread ? p->leaderIncarnation : p->incarnation;
-        if (p->tgid != tgid || identity != generation) continue;
-        // Same lock as thread publication. A racing clone is either included
-        // here or sees its generation-specific leader's exiting latch.
-        __atomic_store_n(&p->tgidExiting, true, __ATOMIC_RELEASE);
-        ProcessRef(p);
-        targets[count++] = p;
-    }
-    SchedLockRelease(g_allProcLock, alf);
-    PosixTimersCleanup(anchor, true);
-    for (uint32_t i = 0; i < count; ++i) {
-        SchedulerMarkTerminated(targets[i], signal & 0x7f);
-        __atomic_store_n(&targets[i]->reapable, true, __ATOMIC_RELEASE);
-    }
-    // Waiters with protected kernel operations are resumed to unwind. Off-CPU
-    // terminal futex waiters are canceled by this notification-safe ref drop.
-    for (uint32_t i = 0; i < count; ++i)
-        ReleaseSchedulerReference(targets[i], false);
-    if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
-}
+static bool RequestFatalSignalImpl(Process*,int,AddressSpaceState*,uint64_t);
+#include "scheduler_oom.inc"
+#include "scheduler_fatal.inc"
 
 // Mark all threads in a thread group (same tgid) as terminated so they are
 // reaped without running.  Called by sys_exit_group before the calling thread

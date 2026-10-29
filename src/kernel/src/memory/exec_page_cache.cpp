@@ -65,6 +65,22 @@ uint64_t ExecPageCache::Trim(bool all) {
     }
     return removed;
 }
+uint64_t ExecPageCache::ReclaimIdleStep(uint32_t maximumScan) {
+    uint64_t removed=0;
+    const uint32_t visits=maximumScan<slots_?maximumScan:slots_;
+    for(uint32_t n=0;n<visits;++n) {
+        PhysicalAddress retired{};
+        const auto irq=IrqSpinLockAcquire(&lock_);
+        if(!stats_.entries){IrqSpinLockRelease(&lock_,irq);break;}
+        auto& entry=entries_[reclaimCursor_++];if(reclaimCursor_==slots_)reclaimCursor_=0;
+        if(entry.physical && PmmHasSingleReference(entry.physical)) {
+            retired=entry.physical;entry={};--stats_.entries;++stats_.trimmed;
+        }
+        IrqSpinLockRelease(&lock_,irq);
+        if(retired){PmmUnrefPage(retired);++removed;}
+    }
+    return removed;
+}
 uint64_t ExecPageCache::TrimIdle() { return Trim(false); }
 uint64_t ExecPageCache::Clear() { return Trim(true); }
 ExecPageCacheStats ExecPageCache::Stats() {
@@ -80,6 +96,7 @@ ExecPageCache cache(entries,262144,131072);
 }
 PhysicalAddress ExecPageCacheAdopt(PhysicalAddress candidate) { return cache.Adopt(candidate); }
 uint64_t ExecPageCacheTrimIdle() { return cache.TrimIdle(); }
+uint64_t ExecPageCacheReclaimIdleStep(uint32_t maximumScan) {return cache.ReclaimIdleStep(maximumScan);}
 ExecPageCacheStats ExecPageCacheGetStats() { return cache.Stats(); }
 #ifdef BROOK_HOST_TEST
 void ExecPageCacheClearForTest() { cache.Clear(); }

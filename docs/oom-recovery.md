@@ -1,87 +1,85 @@
 # Controlled memory-exhaustion recovery
 
-Branch: `wip/oom-recovery-20261029`, based on the accepted paging/compression
-branch. Implementation is in progress: the coordinator is not enabled yet.
+Branch: `wip/oom-recovery-20261029`, based on accepted paging/compression.
+The integrated worker is initially opt-in with QEMU firmware option
+`opt/oom-recovery=on`. Native acceptance is in progress; this is not a claim
+that unrestricted exhaustion or every application boundary is supported.
 
-## Presentation and preference checkpoint
+## Recovery and ownership
 
-`tools/brook-message-pkg` builds a standalone user-mode GTK app with native
-window decoration. A stable error code selects concise language; an expandable
-technical section includes identity, executable and valid measured numbers.
-`brook-message --code app-closed-memory --app GIMP` is a manual invocation;
-`--event-file` accepts one bounded versioned `BrookSystemMessage` record, and
-`--print` exercises formatting without a display. No launcher entry is added.
+A prestarted kernel worker observes sustained physical pressure below 8 MiB,
+tries bounded file/executable-cache reclaim, and gives existing quarantine and
+cleanup workers time to progress. User allocations preserve a 4 MiB kernel
+floor; a separate 256 KiB emergency reserve can be released during pressure.
+Allocation-failure hooks only update atomics after releasing the PMM guard.
+They do not kill, wait or acquire scheduler locks. Ordinary allocation failure
+returns remain intact; failures with healthy headroom are not global OOM proof.
 
-Settings now saves `[Experience] technical_details=true/false` alongside the
-existing settings. Simple messages are the default; technical details remain
-available in either mode. The checkbox affects presentation only. Both programs
-honor the existing `BROOK_USER_SETTINGS` override and otherwise use
-`/data/home/.config/brook/settings.ini`.
+Selection scores exclusive resident managed private pages, excluding CoW,
+extra references, file/memfd/device mappings and cross-group shared address
+spaces. Huge virtual reservations and swapped bytes do not inflate the score.
+This conservative policy does not account comprehensively for GPU/shared-memory
+consumers or aggregate a multiprocess browser into one application.
 
-The message record distinguishes unknown/disabled/configured/full experimental
-paging. A measured increase in global free RAM is explicitly not attributed
-entirely to the victim. The separate application-released field is displayed
-only when its measurement flag is supplied. Do not populate it with a simple
-before/after global-free subtraction.
+Registry references protect snapshots, bounded page-table batches release AS
+locks between batches, and commit revalidates incarnation, AS identity and all
+sharing users. Explicit kernel/critical-service roles are protected; UID 0 and
+process names are not criticality heuristics. Contention/identity turnover has a
+finite retry budget rather than being mistaken immediately for no eligible app.
+New ordinary app launches are refused below the admission threshold with a
+retained launch-memory event. Diagnostic jobs and critical-service startup keep
+their existing control paths.
 
-Both Nix packages build. The message derivation checks preference parsing
-(missing, malformed, true/false and unrelated settings), and the hosted formatter
-checks exact simple wording, measured/unknown state, contradictory telemetry,
-unsupported records and buffer bounds. Native UI/persistence verification and
-automatic event delivery remain required.
+Termination uses the existing asynchronous fatal-signal machinery. An AS-wide
+birth fence prevents prepared CLONE_VM children escaping. Selected tasks carry
+an episode identity across exec, including changes of PID/group leader. The
+worker releases temporary process/AS references before waiting. Completion
+requires both real AS teardown (including TLB retirement) and retirement of all
+episode-marked tasks; disappearance of the old group is insufficient. A
+10-second cleanup deadline reports stalled recovery without selecting another
+victim. Hysteresis and cooldown prevent rapid repeated selection.
 
-## Kernel foundations
+## User-mode messages and Settings
 
-`memory/oom_policy.h` is the allocation-free policy for the future prestarted
-worker. It requires a bounded reclaim opportunity, rechecks pressure before
-reserving a victim, serializes one pending victim, applies cooldown/hysteresis
-and enters a stalled state rather than cascading when cleanup misses its
-10-second deadline. Initial low/high thresholds are 8/32 MiB; selection timing
-must be validated in real low-memory workloads. Kernel/service, exiting and
-cross-group shared-AS candidates are excluded. This policy has hosted tests but
-is not yet connected to allocation failures.
+`tools/brook-message-pkg` provides a GTK app with native decoration. A fixed,
+versioned 424-byte ABI selects concise wording and expandable technical details.
+`brook-message --watch` is started as a protected service before pressure. A
+16-record allocation-free kernel queue retains events while memory is scarce;
+syscall `0xB41` permits ordinary users to read only their own or broadcast events.
+Presentation waits until at least 32 MiB is free. A bounded user queue coalesces
+progress for the same victim while retaining unrelated messages.
 
-`VmmMeasureRangeStep` measures at most 4,096 page-table entries per batch,
-allowing scoring to release AS locks between batches and resume by address.
-The additional exclusive-managed-page count excludes CoW leaves, multiple user
-mappings and retained extra references. Callers must restrict it to managed
-private RAM; it is a conservative scoring snapshot, not a lifetime pin or a
-promise of memory released. Real VMM tests verify shared-page exclusion and
-bounded traversal across large holes/multiple batches.
+Settings persists `[Experience] technical_details=true/false` alongside existing
+preferences. Simple messages are the default; technical details are always
+expandable. The preference changes presentation only. Both apps honor
+`BROOK_USER_SETTINGS`, otherwise `/data/home/.config/brook/settings.ini`.
+Manual examples are `brook-message --code app-closed-memory --app GIMP`,
+`--event-file` for one ABI record, and `--print` for display-free formatting.
 
-A resident `AddressSpaceDestructionWatch` can observe one recovery victim
-without holding an AS reference that would prevent its destruction. Registration
-requires an existing AS pin; cancellation/completion share the cleanup guard.
-The hosted actual-finalizer test delays TLB acknowledgement, verifies completion
-remains false, then verifies completion and safe observer reuse/cancellation.
-This watches completed AS teardown; PMM quarantine drainage and global headroom
-must still be observed independently.
+Technical text distinguishes unknown, disabled, configured and full experimental
+paging. Paging currently covers opted-in mappings; logical occupied slots are
+not a statement that every app can swap. Global before/after free RAM is not
+claimed as memory independently recovered from the victim. The separate
+released-bytes field is displayed only with a valid attribution flag; the worker
+does not currently set it. MCP `vm_stats` includes the recovery phase, stable
+victim identity, conservative score, observed headroom, failures and event cursor.
 
-## Remaining integration and gates
+## Validation checkpoint
 
-- Publish allocation pressure without allocating, waiting, taking scheduler
-  locks or killing inline. Distinguish fragmentation/oversized requests and
-  ordinary app ENOMEM from global exhaustion. Preserve normal failure returns.
-- Prestart the resident worker and bounded emergency resources. Reclaim clean
-  cache and permit quarantine drainage before selecting an application.
-- Obtain referenced candidates under registry protection, score bounded mapping
-  batches, and atomically revalidate incarnation/AS/roles/all sharing users with
-  the death latch. Skip cross-group shared ASes for the first version. Use
-  existing asynchronous fatal termination and protected-operation unwind.
-- Keep the cleanup watch alive through a stalled episode, release temporary AS
-  and process refs before waiting, and report actual completion/headroom.
-- Add a bounded immutable event queue, safe user-copy API, MCP evidence and a
-  user-mode presenter that can deliver retained events after headroom recovers.
-  Protect presenter/service lifetimes; presenter failure cannot recursively
-  initiate another OOM episode.
-- Fail new app admission transactionally and expose a launch-memory message.
-- Test real scheduler selection-versus-clone/exec/exit/PID reuse and protected
-  service/shared-AS exclusions; simultaneous failures, genuine exhaustion,
-  reclaim success, no eligible victim and stalled cleanup without kill storms.
-- Fresh private native low-RAM runs with paging disabled and backing exhausted
-  must preserve the desktop/control plane, show the truthful user-mode message,
-  recover usable memory, launch another app, and finish checked shutdown/fsck.
+Both Nix UI packages build and package checks pass. Hosted tests exercise the
+actual worker orchestration, allocator reserve/failure callbacks, bounded VMM
+scoring, cache reclaim, destruction watch with delayed TLB acknowledgement,
+scheduler selection/criticality, clone/exec races, immutable queue/UID isolation,
+formatter and persistent preference. No-victim, stalled-cleanup and recovered-
+during-selection cases are covered. Compiled entry/scheduler audits pass.
 
-Current build/test receipts are ignored files prefixed `build/oom-`. No native
-OOM survival, automatic victim selection or native message screenshot is claimed
-by this initial checkpoint.
+First native private test: 512 MiB VM, 8 vCPUs, Intel Venus, no paging backing.
+The worker terminated the anonymous-memory test (PID/incarnation 34) at
+6,578,176 free bytes. After real teardown, observed free RAM was 173,121,536
+bytes. SIGKILL completion was collected through the original bridge job;
+desktop, bridge and protected message service survived. A separate patterned
+memory witness, UI/persistence, later app launch, checked shutdown/filesystems,
+and exhausted-backing acceptance remain to be completed before default enable.
+
+Receipts and private screenshots live under ignored
+`build/reviews/oom-recovery-20261029/`; build/host/audit logs use `build/oom-*`.

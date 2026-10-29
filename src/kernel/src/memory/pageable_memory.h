@@ -2,6 +2,12 @@
 #include "mapping_fault.h"
 #include <stdint.h>
 namespace brook {
+struct PageableBackingStatus {
+    bool configured=false, usageValid=false;
+    uint64_t logicalCapacityBytes=0, logicalUsedBytes=0;
+};
+// Never waits for store I/O; configured usage can be unknown while busy.
+PageableBackingStatus PageableMemoryBackingStatus();
 struct Process;
 struct AddressSpaceState;
 struct MappingRangeTable;

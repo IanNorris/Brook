@@ -22,6 +22,7 @@
 #include "process.h"
 #include "memory/heap.h"
 #include "memory/physical_memory.h"
+#include "memory/oom_recovery.h"
 #include "memory/exec_page_cache.h"
 #include "memory/address_space.h"
 #include "memory/mapping_access_timing.h"
@@ -3977,6 +3978,17 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         r.text(",");r.field("active_finalizers",cleanup.activeFinalizers);
         r.text(",");r.field("completed_processes",cleanup.completedProcesses);
         r.text(",");r.field("completed_address_spaces",cleanup.completedAddressSpaces);r.text("}");
+        const auto oom=OomRecoverySnapshot();
+        const char* phases[]={"idle","reclaiming","selecting","waiting","stalled","cooldown"};
+        r.text(",\"oom\":{\"enabled\":");r.text(oom.enabled?"true":"false");
+        r.text(",\"phase\":\"");r.text(oom.phase<6?phases[oom.phase]:"unknown");r.text("\"");
+        r.text(",");r.field("allocation_failures",oom.failures);
+        r.text(",");r.field("last_victim_pid",oom.lastVictimPid);
+        r.text(",");r.field("last_victim_incarnation",oom.lastVictimIncarnation);
+        r.text(",");r.field("exclusive_pages_estimate",oom.exclusivePagesEstimate);
+        r.text(",");r.field("free_before_bytes",oom.lastFreeBeforeBytes);
+        r.text(",");r.field("free_after_bytes",oom.lastFreeAfterBytes);
+        r.text(",");r.field("last_event_sequence",oom.lastEventSequence);r.text("}");
         r.text(",");r.field("process_count",count);
         r.text(",");r.field("running_process_count",running);
         r.text(",");r.field("sample_tick_ms",t.tick);

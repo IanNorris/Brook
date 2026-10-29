@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cstdio>
 #include "../../../tools/brook-message-pkg/message_format.h"
+#include "../../../tools/brook-message-pkg/message_pending.h"
 static constexpr uint64_t GiB=1024ULL*1024*1024;
 int main() {
     BrookSystemMessage m{};m.version=1;m.size=sizeof(m);
@@ -37,5 +38,20 @@ int main() {
     assert(brook_system_message_format(&m,simple,sizeof(simple),technical,1)==0);
     assert(!simple[0] && !technical[0]);
     assert(!brook_system_message_format(nullptr,simple,sizeof(simple),technical,sizeof(technical)));
+    BrookPendingMessages queue{};
+    m.flags=0;m.code=BROOK_MESSAGE_TERMINATION_REQUESTED;m.victim_uid=1000;
+    m.victim_pid=10;m.victim_incarnation=100;m.sequence=1;
+    brook_pending_message_add(&queue,&m);
+    auto launch=m;launch.code=BROOK_MESSAGE_LAUNCH_MEMORY;launch.victim_pid=0;launch.victim_incarnation=0;
+    std::strcpy(launch.executable,"/nix/store/other/bin/other");launch.sequence=2;
+    brook_pending_message_add(&queue,&launch);
+    m.code=BROOK_MESSAGE_APP_CLOSED_MEMORY;m.sequence=3;brook_pending_message_add(&queue,&m);
+    assert(queue.count==2);BrookSystemMessage next{};
+    assert(brook_pending_message_take(&queue,&next) && next.sequence==3);
+    assert(brook_pending_message_take(&queue,&next) && next.sequence==2);
+    assert(!brook_pending_message_take(&queue,&next));
+    for(unsigned i=0;i<20;++i){m.victim_pid=i+2;m.victim_incarnation=i+1;brook_pending_message_add(&queue,&m);}
+    assert(queue.count==BROOK_PENDING_MESSAGES);
+    assert(brook_pending_message_take(&queue,&next) && next.victim_incarnation==5);
     std::puts("system message: wording, measured/unknown state, contradictory records and truncation PASS");
 }

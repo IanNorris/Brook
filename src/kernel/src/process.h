@@ -553,6 +553,10 @@ struct Process
     MountNamespace* mountNamespaceMember;
     // Owned reference; access only through process_fs.h publication helpers.
     FsContext* fsContext;
+    // Recovery episode identity, independent of PID/tgid/exec identity. Zero
+    // means unselected. Appended so all prior externally consumed offsets stay
+    // stable. Set under the scheduler registry; preserved across exec.
+    uint64_t oomEpisode;
 };
 
 // User backing pages belong to the shared address space, not the allocating

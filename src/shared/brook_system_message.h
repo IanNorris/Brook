@@ -5,6 +5,7 @@
  * Flags describe measured facts; absence means unknown, never implicitly zero. */
 enum {
     BROOK_SYSTEM_MESSAGE_VERSION = 1,
+    BROOK_SYS_SYSTEM_MESSAGE = 0xB41,
     BROOK_MESSAGE_APP_CLOSED_MEMORY = 1,
     BROOK_MESSAGE_LAUNCH_MEMORY = 2,
     BROOK_MESSAGE_RECOVERY_STALLED = 3,
@@ -29,3 +30,9 @@ typedef struct BrookSystemMessage {
     char app_name[64];
     char executable[256];
 } BrookSystemMessage;
+
+#ifdef __cplusplus
+static_assert(sizeof(BrookSystemMessage)==424,"system message ABI layout");
+#else
+_Static_assert(sizeof(BrookSystemMessage)==424,"system message ABI layout");
+#endif

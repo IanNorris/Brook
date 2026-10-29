@@ -24,6 +24,7 @@ public:
     // Candidate must remain immutable throughout this operation. Capacity or
     // probe exhaustion returns it uncached, preserving normal loader behavior.
     PhysicalAddress Adopt(PhysicalAddress candidate);
+    uint64_t ReclaimIdleStep(uint32_t maximumScan); // bounded pressure-worker batch
     uint64_t TrimIdle(); // no allocation/I/O/waits; bounded lock holds
     uint64_t Clear();    // dropping cache refs is safe even with live COW users
     ExecPageCacheStats Stats();
@@ -34,9 +35,11 @@ private:
     ExecPageHasher hasher_;
     IrqSpinLock lock_;
     ExecPageCacheStats stats_;
+    uint32_t reclaimCursor_=0;
 };
 PhysicalAddress ExecPageCacheAdopt(PhysicalAddress candidate);
 uint64_t ExecPageCacheTrimIdle();
+uint64_t ExecPageCacheReclaimIdleStep(uint32_t maximumScan);
 ExecPageCacheStats ExecPageCacheGetStats();
 #ifdef BROOK_HOST_TEST
 void ExecPageCacheClearForTest();

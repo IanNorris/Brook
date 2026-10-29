@@ -68,9 +68,15 @@ void SchedulerAddProcess(Process* proc)
             // Reparenting may have happened after CopyParentProcess but
             // before publication. Refresh ancestry in the same registry lock.
             proc->parentPid=ldr->parentPid;
-            if(__atomic_load_n(&ldr->tgidExiting, __ATOMIC_ACQUIRE))stillborn = true;
+            if(__atomic_load_n(&ldr->tgidExiting, __ATOMIC_ACQUIRE) ||
+               __atomic_load_n(&ldr->oomEpisode,__ATOMIC_ACQUIRE))stillborn = true;
         }
     }
+    // An already-prepared cross-group CLONE_VM child must not escape the
+    // selected AS after the fatal snapshot. Match OOM's registry lock and use
+    // the existing stillborn resource cleanup for every user task.
+    if(!proc->isKernelThread && (__atomic_load_n(&proc->oomEpisode,__ATOMIC_ACQUIRE) ||
+       (proc->addressSpace && __atomic_load_n(&proc->addressSpace->oomTerminating,__ATOMIC_ACQUIRE))))stillborn=true;
     if (stillborn)
     {
         proc->state = ProcessState::Terminated;

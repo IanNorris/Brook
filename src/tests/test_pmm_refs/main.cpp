@@ -3,12 +3,25 @@
 #include <thread>
 #include <vector>
 #include "memory/physical_memory.h"
+#include "memory/oom_recovery.h"
 #include "ksym_addrs.h"
 #include "serial.h"
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#c); std::exit(1); } } while (0)
 using namespace brook;
 namespace brook {
 void PmmHostTestInit(PageDescriptor*,uint32_t);
+bool hostOomEnabled=false;
+uint64_t failureRequests=0,lastRequested=0,lastFree=0;
+bool lastContiguous=false;
+bool OomRecoveryEnabled(){return hostOomEnabled;}
+void OomRecoveryAllocationFailure(uint64_t requested,uint64_t free,bool contiguous) {
+    if(!hostOomEnabled)return;
+    ++failureRequests;lastRequested=requested;lastFree=free;lastContiguous=contiguous;
+    // Prove the failure callback runs outside the PMM guard: this nested
+    // kernel allocation would otherwise deadlock. It can use the reserved floor.
+    auto emergency=PmmAllocPage(MemTag::KernelData,KernelPid);CHECK(emergency);
+    PmmUnrefPage(emergency);
+}
 extern "C" void PmmDescribe(uint64_t,uint32_t*,uint32_t*,uint32_t*,uint32_t*,uint32_t*);
 void SerialPrintf(const char*,...) {}
 void SerialPuts(const char*) {}
@@ -30,7 +43,7 @@ static unsigned owned(uint16_t pid) {
     return count;
 }
 int main() {
-    PageDescriptor descriptors[256]{}; PmmHostTestInit(descriptors,256);
+    PageDescriptor descriptors[2048]{}; PmmHostTestInit(descriptors,2048);
     auto page=PmmAllocPage(MemTag::User,7); CHECK(page); describe(page,1,0,1);
     constexpr unsigned aliases=70000;
     for(unsigned i=0;i<aliases;++i) {
@@ -69,5 +82,25 @@ int main() {
     CHECK(PmmGetTag(page)==MemTag::User && PmmGetPid(page)==8);describe(page,1,0,1);
     PmmUnrefPage(page);CHECK(!PmmReclassifyPrivateFrame(page,MemTag::User,MemTag::KernelData,KernelPid));
     CHECK(owned(8)==userBefore);
+    const uint64_t initialFree=PmmGetFreePageCount();hostOomEnabled=true;
+    PhysicalAddress held[2048]{};unsigned heldCount=0;
+    while(PmmGetFreePageCount()>OomUserReservePages) {
+        held[heldCount]=PmmAllocPage(MemTag::User,9);CHECK(held[heldCount]);++heldCount;
+    }
+    CHECK(PmmGetFreePageCount()==OomUserReservePages);
+    CHECK(!PmmAllocPage(MemTag::User,9));
+    CHECK(failureRequests==1 && lastRequested==1 && lastFree==OomUserReservePages && !lastContiguous);
+    auto kernelEmergency=PmmAllocPage(MemTag::KernelData,KernelPid);CHECK(kernelEmergency);
+    CHECK(PmmGetFreePageCount()==OomUserReservePages-1);PmmUnrefPage(kernelEmergency);
+    for(unsigned i=0;i<heldCount;++i)PmmUnrefPage(held[i]);
+    CHECK(PmmGetFreePageCount()==initialFree);
+    CHECK(!PmmAllocPages(initialFree-OomUserReservePages+1,MemTag::User,9));
+    CHECK(failureRequests==2 && lastContiguous && lastFree==initialFree);
+    const uint64_t bulkCount=initialFree-OomUserReservePages;
+    auto bulk=PmmAllocPages(bulkCount,MemTag::User,9);CHECK(bulk);
+    CHECK(PmmGetFreePageCount()==OomUserReservePages);
+    for(uint64_t i=0;i<bulkCount;++i)PmmUnrefPage(PhysicalAddress(bulk.raw()+i*4096));
+    CHECK(PmmGetFreePageCount()==initialFree);hostOomEnabled=false;
+    std::puts("PMM_OOM_FLOOR PASS user denial/kernel reserve/bulk boundary/callback outside allocator guard");
     std::puts("PMM_REFS PASS aliases=70000 concurrent-pins=16384 final-release");
 }

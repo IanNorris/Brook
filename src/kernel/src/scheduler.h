@@ -93,6 +93,12 @@ void SchedulerMarkStopped(Process* proc, int signal = 19);
 void SchedulerReleaseWaitReference(Process* proc);
 // Registry-pinned lookup; caller must ProcessUnref the returned identity.
 Process* SchedulerFindProcessReference(uint16_t pid);
+// Recovery worker only. Successful enumeration owns both refs; caller drops
+// them with ProcessUnref/AddressSpaceUnref. Selection performs no allocation.
+bool SchedulerNextOomCandidate(uint16_t after,Process**,AddressSpaceState**);
+bool SchedulerOomCommitVictim(Process*,AddressSpaceState*,uint64_t incarnation);
+bool SchedulerOomGroupPresent(uint16_t tgid,uint64_t incarnation);
+bool SchedulerOomEpisodePresent(uint64_t episode);
 // PI caller pins proc, serializes donation updates and never calls under a
 // scheduler lock. 255 withdraws donation; 0..3 are internal scheduler ranks.
 void SchedulerSetPiDonation(Process* proc, uint8_t rank);

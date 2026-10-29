@@ -30,16 +30,16 @@ int brook_system_message_format(const BrookSystemMessage *m, char *simple, size_
     switch (m->code) {
     case BROOK_MESSAGE_APP_CLOSED_MEMORY:
         if (!append(simple, ss, "%s was closed because there wasn't enough memory for it to continue running.", app)) goto fail;
-        action = "was terminated after system memory exhaustion"; break;
+        action = "was terminated to recover memory during system-wide memory pressure"; break;
     case BROOK_MESSAGE_LAUNCH_MEMORY:
         if (!append(simple, ss, "%s couldn't open because there wasn't enough memory. Try closing another application.", app)) goto fail;
-        action = "could not be launched because memory allocation failed"; break;
+        action = "had its launch refused because available memory was below the recovery threshold"; break;
     case BROOK_MESSAGE_RECOVERY_STALLED:
         if (!append(simple, ss, "Brook is low on memory. %s is taking longer than expected to close.", app)) goto fail;
         action = "has not finished closing after a memory recovery request"; break;
     case BROOK_MESSAGE_NO_MEMORY_VICTIM:
         if (!append(simple, ss, "Brook is low on memory and couldn't safely close an application. Save your work and close an application if possible.")) goto fail;
-        action = "has no eligible application to terminate for memory recovery"; app = "Brook"; break;
+        action = "could not safely select an application within the bounded recovery scan"; app = "Brook"; break;
     case BROOK_MESSAGE_TERMINATION_REQUESTED:
         if (!append(simple, ss, "Brook is closing %s to make more memory available.", app)) goto fail;
         action = "was asked to terminate for memory recovery; cleanup is still pending"; break;
@@ -51,7 +51,7 @@ int brook_system_message_format(const BrookSystemMessage *m, char *simple, size_
         m->victim_pid, m->victim_incarnation)) goto fail;
     if (m->requested_bytes) {
         char amount[48]; bytes(amount, sizeof(amount), m->requested_bytes);
-        if (!append(technical, ts, "\nFailed request: %s (%" PRIu64 " bytes).", amount, m->requested_bytes)) goto fail;
+        if (!append(technical, ts, "\nLargest observed failed request in this pressure episode: %s (%" PRIu64 " bytes).", amount, m->requested_bytes)) goto fail;
     }
     if (m->flags & BROOK_MESSAGE_PHYSICAL_VALID) {
         if (!m->physical_total_bytes || m->physical_free_before_bytes > m->physical_total_bytes) goto fail;
@@ -71,6 +71,7 @@ int brook_system_message_format(const BrookSystemMessage *m, char *simple, size_
         char released[48]; bytes(released, sizeof(released), m->released_bytes);
         if (!append(technical, ts, "\nMeasured memory released by application cleanup: %s.", released)) goto fail;
     }
+    if ((m->flags & BROOK_MESSAGE_PAGING_FULL) && !(m->flags & BROOK_MESSAGE_PAGING_USAGE_VALID)) goto fail;
     if (!(m->flags & BROOK_MESSAGE_PAGING_STATE_VALID)) {
         if (m->flags & (BROOK_MESSAGE_PAGING_CONFIGURED | BROOK_MESSAGE_PAGING_USAGE_VALID |
                         BROOK_MESSAGE_PAGING_FULL | BROOK_MESSAGE_PAGING_EXPERIMENTAL)) goto fail;
@@ -86,6 +87,9 @@ int brook_system_message_format(const BrookSystemMessage *m, char *simple, size_
             m->flags & BROOK_MESSAGE_PAGING_EXPERIMENTAL ? "Experimental paging" : "Paging",
             used, capacity, m->flags & BROOK_MESSAGE_PAGING_FULL ? " (full)" : "")) goto fail;
     } else if (!append(technical, ts, "\nPaging backing is configured; usage is unavailable.")) goto fail;
+    if ((m->flags & BROOK_MESSAGE_PAGING_CONFIGURED) && (m->flags & BROOK_MESSAGE_PAGING_EXPERIMENTAL)) {
+        if (!append(technical, ts, "\nExperimental backing is limited to opted-in mappings; usage counts logical paging slots.")) goto fail;
+    }
     return 1;
 fail:
     simple[0] = technical[0] = 0; return 0;

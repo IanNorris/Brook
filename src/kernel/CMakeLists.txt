@@ -231,6 +231,8 @@ add_executable(kernel
     src/sysv_sem.cpp
     src/signal_fd.cpp
     src/process.cpp
+    src/system_message.cpp
+    src/memory/oom_recovery.cpp
     src/memory/address_space.cpp
     src/fs/compressed_vfs.cpp
     src/fs/compressed_image.cpp

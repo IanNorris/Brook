@@ -45,6 +45,9 @@ struct AddressSpaceState {
     uint64_t programBreakLow, programBreakHigh; // bounds of this image, independent of leader exec
     MappingRangeTable ranges; // authoritative mapping extents, permissions and ownership
     uint64_t argumentStart, argumentEnd; // live, contiguous exec argument strings; mutation protects reads
+    // Irreversible for this AS identity. Registry guard serializes publication
+    // of every user sharing task with OOM selection, including non-thread clones.
+    bool oomTerminating;
 };
 
 // Single bounded recovery observer. The caller pins the AS while registering;
