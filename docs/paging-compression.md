@@ -831,3 +831,53 @@ fork isolation, guard faults and signals. This is a diagnosed failure, not a
 claim that general application paging is complete. Evidence: compiler-acceptance/
 pilot/{result,pressure-result,pressure-capture,after-failure-memory}.json and the
 retained serial/lifecycle logs for session b48d44f87a984eea972d5e2aced3b322.
+
+## Sparse user stacks and controlled compiler acceptance
+
+Process creation and exec now reserve the same 8 MiB virtual stack and guard,
+but initially back only the top 42 pages (172032 bytes). Existing Stack faults
+provide zeroed pages on growth; page-table structure is prepared before entry.
+The initial budget derives from the shared exec limits, duplicated AT_EXECFN,
+pointer vectors, auxv, random/platform data and alignment. Stack construction
+copies by page, rejects missing translations/bounds failures and verifies its
+auxv count; creation fails before accepting caller-owned standard descriptors.
+Exec failure uses the existing staged-address-space rollback.
+
+The unchanged 96 MiB holder/compiler case that previously exhausted PMM now
+passes. Separate diagnostic census confirms each of the four processes backs
+about 0.16 MiB of stack instead of 8 MiB, saving about 31.3 MiB collectively.
+This is reduced committed memory, not proof that arbitrary anonymous application
+pages can now be evicted. The full stack range, guard and exec limits remain.
+
+Eight fresh 512 MiB/eight-vCPU VMs compare raw versus LZ4 packed compiler
+closures, with either no holder or the same 96 MiB ordinary-memory holder.
+Each case has two boots with reversed case order and three compile/run passes
+per boot: all 24 succeed, including data checks and successful holder release.
+Cold compile medians (two observations each) are 2.780 s raw / 2.487 s LZ4
+without pressure and 2.726 s / 2.453 s with pressure. Packed-device reads are
+105.10 / 47.03 MiB and 106.34 / 47.83 MiB respectively. That is about 10% less
+cold compile time and 55% fewer device bytes for this workload. Host caches
+are warm; guest caches start cold. Device counters cover a slightly wider
+interval than the compiler timer. Two boots are screening evidence, not a broad
+application speedup guarantee. Free-memory samples are not a true minimum.
+
+The native stack fixture verifies 7 MiB demand-zero growth, a kernel pipe copy
+crossing into an untouched stack page, signal return, fork/CoW isolation, guard
+SIGSEGV, maximum 512/256 argument/environment vectors with 64/32 KiB strings,
+and E2BIG rejection without destroying the caller. Twenty-one relevant host
+tests and compiled entry/startup mutation audits pass. Two additional fresh
+VMs run nineteen native stack/paging regression jobs across raw and compressed
+backing, including fault injection, reserve exhaustion, handoff/publication
+failure, leases and the byte-verified 256 MiB working set. Both finish with
+reserve eight and no retained slots/pool allocation. A final fresh VM repeats
+the stack fixture with its kernel-copy address explicitly aligned to cross a
+page boundary, independently of the alloca alignment; it also passes.
+Eleven controlled/regression
+VMs complete guest sync and stop; harnesses independently verify owner exit 0.
+
+Evidence is under compiler-acceptance/: controls-results.json,
+controls-summary.json, sparse-stack-metadata.json, lazy-stack/, and
+stack-paging-{raw,ram}/ and stack-boundary-raw/.
+Source fixture: scripts/workloads/stack_accept.c.
+General-purpose anonymous application paging, automatic compressed-pool spill
+and writable filesystem compression remain outside this checkpoint.

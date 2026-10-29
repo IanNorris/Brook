@@ -488,14 +488,20 @@ static uint64_t SetupUserStack(Process* proc,
         return phys ? reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw()) : nullptr;
     };
 
-    // Helper: push bytes onto the stack (writes via direct map)
+    bool stackValid=true;
+    // Construction writes an unpublished AS through the direct map. Missing
+    // translations cannot fault against this target; fail instead of skipping.
     auto pushBytes = [&](const void* data, uint64_t len) -> uint64_t {
-        sp -= len;
-        const auto* src = reinterpret_cast<const uint8_t*>(data);
-        for (uint64_t i = 0; i < len; ++i)
-        {
-            uint8_t* dst = toKernel(sp + i);
-            if (dst) *dst = src[i];
+        if(!stackValid || sp<proc->stackBase || len>sp-proc->stackBase) {
+            stackValid=false;return 0;
+        }
+        sp-=len;const auto* src=static_cast<const uint8_t*>(data);
+        for(uint64_t done=0;done<len;) {
+            auto* dst=toKernel(sp+done);
+            if(!dst){stackValid=false;return 0;}
+            uint64_t amount=4096-((sp+done)&4095);
+            if(amount>len-done)amount=len-done;
+            memcpy(dst,src+done,amount);done+=amount;
         }
         return sp;
     };
@@ -553,31 +559,35 @@ static uint64_t SetupUserStack(Process* proc,
     //   envp: (envc + 1) slots (including NULL terminator)
     //   argv: (argc + 1) slots (including NULL terminator)
     //   argc: 1 slot
-    int totalSlots = 38 + (vdsoBase ? 2 : 0) + (envc + 1) + (argc + 1) + 1;
+    int totalSlots = 2 * EXEC_BASE_AUX_ENTRIES + (vdsoBase ? 2 : 0) + (envc + 1) + (argc + 1) + 1;
     if (totalSlots & 1)
         pushU64(0); // padding to maintain 16-byte alignment
 
+    uint32_t auxEntries=0;
+    auto pushAux=[&](uint64_t type,uint64_t value){pushU64(value);pushU64(type);++auxEntries;};
     // 5. Push auxiliary vectors (in reverse order, so first entry is at lowest address)
-    pushU64(0); pushU64(AT_NULL);                               // AT_NULL
-    if (vdsoBase) { pushU64(vdsoBase); pushU64(33); }            // AT_SYSINFO_EHDR
-    pushU64(execfnAddr); pushU64(AT_EXECFN);                    // AT_EXECFN
-    pushU64(0); pushU64(AT_HWCAP2);                             // AT_HWCAP2 = 0
-    pushU64(randomAddr); pushU64(AT_RANDOM);                    // AT_RANDOM
-    pushU64(proc->uid != proc->euid || proc->gid != proc->egid); pushU64(AT_SECURE);                             // AT_SECURE: differing real/effective credentials
-    pushU64(100); pushU64(AT_CLKTCK);                           // AT_CLKTCK = 100
-    pushU64(0); pushU64(AT_HWCAP);                              // AT_HWCAP = 0 (conservative; some IFUNC libs may need real bits)
-    pushU64(platformAddr); pushU64(AT_PLATFORM);                // AT_PLATFORM = "x86_64"
-    pushU64(ProcessReportId(proc,true,proc->egid)); pushU64(AT_EGID);                               // AT_EGID
-    pushU64(ProcessReportId(proc,true,proc->gid)); pushU64(AT_GID);                                // AT_GID
-    pushU64(ProcessReportId(proc,false,proc->euid)); pushU64(AT_EUID);                               // AT_EUID
-    pushU64(ProcessReportId(proc,false,proc->uid)); pushU64(AT_UID);                                // AT_UID
-    pushU64(proc->elf.entryPoint); pushU64(AT_ENTRY);           // AT_ENTRY
-    pushU64(0); pushU64(AT_FLAGS);                              // AT_FLAGS = 0
-    pushU64(interpBase); pushU64(AT_BASE);                       // AT_BASE (interpreter load addr, 0 if static)
-    pushU64(4096); pushU64(AT_PAGESZ);                          // AT_PAGESZ
-    pushU64(proc->elf.phdrNum); pushU64(AT_PHNUM);              // AT_PHNUM
-    pushU64(proc->elf.phdrEntSize); pushU64(AT_PHENT);          // AT_PHENT
-    pushU64(proc->elf.phdrVaddr); pushU64(AT_PHDR);             // AT_PHDR
+    pushAux(AT_NULL, 0);                               // AT_NULL
+    if (vdsoBase) { pushAux(33, vdsoBase); }            // AT_SYSINFO_EHDR
+    pushAux(AT_EXECFN, execfnAddr);                    // AT_EXECFN
+    pushAux(AT_HWCAP2, 0);                             // AT_HWCAP2 = 0
+    pushAux(AT_RANDOM, randomAddr);                    // AT_RANDOM
+    pushAux(AT_SECURE, proc->uid != proc->euid || proc->gid != proc->egid);                             // AT_SECURE: differing real/effective credentials
+    pushAux(AT_CLKTCK, 100);                           // AT_CLKTCK = 100
+    pushAux(AT_HWCAP, 0);                              // AT_HWCAP = 0 (conservative; some IFUNC libs may need real bits)
+    pushAux(AT_PLATFORM, platformAddr);                // AT_PLATFORM = "x86_64"
+    pushAux(AT_EGID, ProcessReportId(proc,true,proc->egid));                               // AT_EGID
+    pushAux(AT_GID, ProcessReportId(proc,true,proc->gid));                                // AT_GID
+    pushAux(AT_EUID, ProcessReportId(proc,false,proc->euid));                               // AT_EUID
+    pushAux(AT_UID, ProcessReportId(proc,false,proc->uid));                                // AT_UID
+    pushAux(AT_ENTRY, proc->elf.entryPoint);           // AT_ENTRY
+    pushAux(AT_FLAGS, 0);                              // AT_FLAGS = 0
+    pushAux(AT_BASE, interpBase);                       // AT_BASE (interpreter load addr, 0 if static)
+    pushAux(AT_PAGESZ, 4096);                          // AT_PAGESZ
+    pushAux(AT_PHNUM, proc->elf.phdrNum);              // AT_PHNUM
+    pushAux(AT_PHENT, proc->elf.phdrEntSize);          // AT_PHENT
+    pushAux(AT_PHDR, proc->elf.phdrVaddr);             // AT_PHDR
+
+    if(auxEntries!=EXEC_BASE_AUX_ENTRIES+(vdsoBase?1u:0u))stackValid=false;
 
     // 6. Push envp array (null-terminated).
     pushU64(0); // envp[envc] = NULL
@@ -592,7 +602,7 @@ static uint64_t SetupUserStack(Process* proc,
     // 8. Push argc
     pushU64(static_cast<uint64_t>(argc));
 
-    return sp;
+    return stackValid && sp>=proc->stackBase ? sp : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -845,8 +855,8 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     }
 
     // Allocate user stack at fixed user-space addresses (below USER_STACK_TOP).
-    // Physical pages are allocated individually and mapped into the process
-    // page table.  No VMALLOC — the stack lives entirely in user-half.
+    // Keep the full virtual range and guard, with demand-zero growth below
+    // the derived initial exec-vector budget. No VMALLOC/user-half alias.
     uint64_t stackPages = USER_STACK_SIZE / 4096;
     uint64_t guardPages = 1;
     uint64_t totalStackPages = stackPages + guardPages;
@@ -855,7 +865,10 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
 
     bool stackOk = RegisterInitialRange(proc,stackVirtBase,stackVirtBase+guardPages*4096,0,MappingKind::Stack) &&
                    RegisterInitialRange(proc,stackVirtBase+guardPages*4096,stackVirtTop,3,MappingKind::Stack);
-    for (uint64_t i = guardPages; stackOk && i < totalStackPages; i++)
+    static_assert(EXEC_INITIAL_STACK_PAGES*4096<=USER_STACK_SIZE);
+    stackOk=stackOk && VmmPrepareRange(proc->addressSpace->pageTable,
+        stackVirtBase+guardPages*4096,stackVirtTop);
+    for (uint64_t i = totalStackPages-EXEC_INITIAL_STACK_PAGES; stackOk && i < totalStackPages; i++)
     {
         VirtualAddress vaddr(stackVirtBase + i * 4096);
         PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
@@ -888,6 +901,15 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
         kfree(proc->fds); SchedulerFreePid(proc->pid); FreeProcessStruct(proc); return nullptr;
     }
 
+    // Complete fallible stack construction before accepting caller-owned FDs.
+    const uint64_t vdsoBase = VdsoInstall(proc->addressSpace, RandomU64());
+    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase, vdsoBase);
+    if(!userSP) {
+        VmmFreeKernelStack(VirtualAddress(proc->kernelStackBase),KERNEL_STACK_PAGES);
+        kfree(proc->fds);SchedulerFreePid(proc->pid);FreeProcessStruct(proc);return nullptr;
+    }
+    proc->stackTop=userSP;
+
     // Set up standard file descriptors
     if (stdFds)
     {
@@ -915,15 +937,6 @@ static Process* ProcessCreateImpl(const uint8_t* elfData, uint64_t elfSize,
     proc->ttyEcho = true;
     proc->straceEnabled = false;
     proc->straceErrorsOnly = false;
-
-    // Build user stack with argc/argv/envp/auxv
-    const uint64_t vdsoBase = VdsoInstall(proc->addressSpace, RandomU64());
-    uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase, vdsoBase);
-
-    // Store the final SP for SwitchToUserMode
-    proc->stackTop = userSP;
-
-    // TLS was constructed before accepting caller-owned standard descriptors.
 
     // Set actual initial entry point (interpreter entry if dynamically linked).
     proc->initialEntry = interpEntry ? interpEntry : proc->elf.entryPoint;
@@ -1677,7 +1690,9 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     if (!RegisterInitialRange(proc,stackVirtBase,stackVirtBase+guardPages*4096,0,MappingKind::Stack) ||
         !RegisterInitialRange(proc,stackVirtBase+guardPages*4096,stackVirtTop,3,MappingKind::Stack)) return 0;
 
-    for (uint64_t i = guardPages; i < totalStackPages; i++)
+    if(!VmmPrepareRange(proc->addressSpace->pageTable,
+        stackVirtBase+guardPages*4096,stackVirtTop))return 0;
+    for (uint64_t i = totalStackPages-EXEC_INITIAL_STACK_PAGES; i < totalStackPages; i++)
     {
         VirtualAddress vaddr(stackVirtBase + i * 4096);
         PhysicalAddress phys = PmmAllocPage(MemTag::User, ProcessAddressSpacePid(proc));
@@ -1701,6 +1716,7 @@ static uint64_t ProcessExecImpl(Process* proc, const uint8_t* elfData, uint64_t 
     // 5. Build user stack with argc/argv/envp/auxv
     const uint64_t vdsoBase = VdsoInstall(proc->addressSpace, RandomU64());
     uint64_t userSP = SetupUserStack(proc, argc, argv, envc, envp, interpBase, vdsoBase);
+    if(!userSP)return 0;
     proc->stackTop = userSP;
 
     // 8. Close FD_CLOEXEC file descriptors — POSIX execve semantics require

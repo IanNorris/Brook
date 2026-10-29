@@ -9,6 +9,17 @@ static constexpr int EXEC_MAX_ARGS = 512;
 static constexpr int EXEC_MAX_ENV = 256;
 static constexpr uint32_t EXEC_ARG_BYTES = 64 * 1024;
 static constexpr uint32_t EXEC_ENV_BYTES = 32 * 1024;
+// SetupUserStack checks its emitted auxv count against this same contract.
+static constexpr uint32_t EXEC_BASE_AUX_ENTRIES = 19;
+static constexpr uint32_t EXEC_MAX_AUX_ENTRIES = EXEC_BASE_AUX_ENTRIES + 1; // optional vDSO
+// Includes a second argv[0] copy (AT_EXECFN), pointer vectors/argc, random,
+// platform, alignment/parity padding, and the initial eight-byte top gap.
+static constexpr uint64_t EXEC_INITIAL_STACK_BYTES =
+    2ULL * EXEC_ARG_BYTES + EXEC_ENV_BYTES +
+    8ULL * (EXEC_MAX_ARGS + EXEC_MAX_ENV + 3 + 2 * EXEC_MAX_AUX_ENTRIES) +
+    16 + sizeof("x86_64") + 15 + 8 + 8;
+static constexpr uint64_t EXEC_INITIAL_STACK_PAGES = (EXEC_INITIAL_STACK_BYTES + 4095) / 4096;
+
 
 // For trusted kernel vectors only; execve validates user memory while copying.
 inline bool ExecVectorFits(int count, const char* const* values,
