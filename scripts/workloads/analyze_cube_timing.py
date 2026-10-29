@@ -9,7 +9,11 @@ import re
 from pathlib import Path
 
 
-def analyze(text):
+def analyze(text, start_ns=None, end_ns=None):
+    window = start_ns is not None or end_ns is not None
+    if window and (type(start_ns) is not int or type(end_ns) is not int or
+                   not 0 <= start_ns < end_ns < (1 << 64)):
+        raise ValueError('window requires ordered uint64 start/end timestamps')
     header, body = text.split('\n', 1)
     match = re.fullmatch(r'# bits=(\d+) period_ns=(\S+) errors=(\d+) overflow=(\d+)', header)
     if not match:
@@ -47,20 +51,29 @@ def analyze(text):
         if previous:
             frame['between_draw_calls_ms'] = (cpu[0] - previous['after_present_ns']) / 1e6
             frame['present_return_interval_ms'] = (cpu[6] - previous['after_present_ns']) / 1e6
-        output.append(frame)
+        # Validate the entire trace, including frames outside the requested
+        # window. Keep only intervals whose two presentation returns are inside.
+        if not window or (previous is not None and
+                          start_ns <= previous['after_present_ns'] and cpu[6] <= end_ns):
+            output.append(frame)
         previous = row
+    if not output:
+        raise ValueError('no complete presentation interval inside window')
     summaries = {}
     for key in output[-1]:
         if key == 'frame': continue
         values = sorted(r[key] for r in output if key in r)
         summaries[key] = {p: values[math.ceil(q * len(values)) - 1] for p, q in [('p50', .5), ('p95', .95), ('p99', .99), ('max', 1)]}
-    return dict(frames=len(rows), summary_ms=summaries,
-        longest_present_intervals=sorted(output[1:], key=lambda r: r['present_return_interval_ms'], reverse=True)[:10],
+    return dict(frames=len(output), captured_frames=len(rows),
+        window_ns=dict(start=start_ns,end=end_ns) if window else None, summary_ms=summaries,
+        longest_present_intervals=sorted((r for r in output if 'present_return_interval_ms' in r), key=lambda r: r['present_return_interval_ms'], reverse=True)[:10],
         scope='CPU wall stages include descheduling; GPU interval includes dependencies and semaphore waits. GPU and CPU overlap. Present return is not physical scanout. Uncalibrated GPU durations only.')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('trace', type=Path)
+    parser.add_argument('--start-ns',type=int)
+    parser.add_argument('--end-ns',type=int)
     args = parser.parse_args()
-    print(json.dumps(analyze(args.trace.read_text()), indent=2))
+    print(json.dumps(analyze(args.trace.read_text(),args.start_ns,args.end_ns), indent=2))

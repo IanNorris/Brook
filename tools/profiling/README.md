@@ -117,3 +117,17 @@ Its GPU intervals can include semaphore dependencies; CPU/GPU durations overlap
 and must not be summed. Cube traces currently have no clock calibration or
 scanout timestamp. Keep an uninstrumented control and assess observer overhead
 before using these results as a throughput benchmark.
+
+To restrict analysis to a workload's guest monotonic interval, pass
+`--start-ns START --end-ns END` to `analyze_cube_timing.py`. The analyzer validates
+the entire capture, then includes only presentation-return intervals whose two
+endpoints lie inside the window. `frames` counts selected intervals for a
+windowed report; `captured_frames` retains the complete trace size. Missing or
+invalid rows outside the selected window still reject the capture.
+
+A successful Vulkan submission trace does not prove a visible client. Verify
+an animated WM window before accepting pacing results. The current legacy
+cross-file PRIME import can reject Venus buffers before Wayland's newer capture
+path is reached. For a matched staged comparison, explicitly use
+`MESA_VK_WSI_DEBUG=sw,noshm` on both clients and label that presentation path;
+do not count a headless failed direct import as high desktop throughput.

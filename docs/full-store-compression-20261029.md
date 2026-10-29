@@ -244,3 +244,59 @@ Those guest-compositor clock endpoints differ from the 11.53/9.63 s host start
 through debug-readiness measurements. They show no guest boot-time improvement
 in this pair. Exact records are in `first-pair-boot-endpoints.json`. Repeated
 matched controls and the active-client pressure gate remain pending.
+
+## Active-client pressure acceptance
+
+The declared responsiveness gate passes for both codecs using explicit staged
+Venus presentation (`MESA_VK_WSI_DEBUG=sw,noshm`), Intel UHD 630, eight vCPUs,
+1 GiB RAM and identical ordinary-memory pressure: two independent 160 MiB
+holders plus the read probe's 192 MiB allocation. All three allocations verify
+their bytes before release. Experimental executable paging enrollment remains
+disabled. The full-store read and the animated 1280×720 client run concurrently.
+
+Both cube traces contain exactly 8,192 submitted/ready frames, zero errors and
+zero overflow. Windowed analysis validates the entire capture before selecting
+only intervals whose two presentation returns fall inside the probe's recorded
+guest monotonic start/end. Each capture spans the complete load window and
+contains more than 1,000 loaded intervals and 20 seconds. Terra independently
+verifies a well-formed cube changing orientation in saved pairs before and
+during loading; those still images are not used to establish continuous pacing.
+
+Measured presentation-return intervals:
+
+- Raw: idle p95 37.64 ms; loaded p95 40.44 ms, p99 45.66 ms, maximum 67.47 ms.
+- LZ4: idle p95 37.97 ms; loaded p95 39.40 ms, p99 43.85 ms, maximum 95.21 ms.
+
+Both pass p95 ≤50 ms and ≤2× idle, p99 ≤100 ms and maximum ≤500 ms. LZ4's loaded
+p95 also passes the ≤1.2× raw comparison. These are instrumented application
+presentation-call intervals, not physical scanout or input latency. Brief
+completed-frame capture pauses are retained in the measured intervals.
+
+The simultaneous full-store verification takes 137.36 s raw versus 100.80 s
+LZ4, a 26.6% reduction in this pair, with identical file counts/bytes/digests.
+At the timed I/O start the probes report 58.16 and 59.01 MiB free. The cache
+worker reclaims 10,866 and 10,908 pages respectively (about 42.5 MiB), preserving
+forward progress while the client animates. Do not compare these absolute load
+times with the earlier desktop-free 512-MiB test as if the configurations were
+identical.
+
+Uninstrumented/traced/uninstrumented 600-frame controls precede each main run.
+Whole-job raw durations are 16.02/17.30/14.28 s; LZ4 durations are
+17.61/16.04/15.84 s. These include startup, teardown and host polling. Their
+variation does not isolate a stable per-frame observer cost; it does establish
+that timestamps are not assumed free. Both codec comparisons use the same
+observer. Do not advertise these captures as uninstrumented cube throughput.
+
+The first automatic-direct setup is excluded: Vulkan work and timestamps
+complete, but Wayland's legacy PRIME import rejects Venus buffers and no WM
+window appears. The same restriction is present on main and predates the paging
+branch. Rebuilding userspace alone does not bypass that source-level import.
+The staged compatibility probe is visibly correct in the same preserved VM;
+the proper matched controls then use fresh source reflinks. The direct-path
+issue is recorded in the backlog, without bypassing its lifetime protections.
+
+Both final staged controllers complete normal client/workload exits, checked
+guest sync/shutdown, QEMU exit zero and original launch-owner exit zero. All six
+read-only ext2 checks of data/Nix/tmp pass afterward. Detailed traces, matched
+request receipts, visual evidence, phase analyses, comparison and filesystem
+reports are retained under `responsiveness/` in the ignored evidence directory.

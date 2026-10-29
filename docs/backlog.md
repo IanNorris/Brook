@@ -1773,3 +1773,22 @@ each probe's argument parser.
   replace that missing wrapper status with an inferred zero.
 - Proprietary files, saves and authenticated evidence remain in ignored private
   storage. Game-only screenshots may be shared; account UI must stay masked.
+
+### Vulkan automatic-presentation compatibility (29 October)
+
+The paging/compression responsiveness setup reproduces an existing mismatch:
+`ShellGetDefaultEnvp()` can select direct Venus presentation, but waylandd's
+`dmabuf_resolve_gres()` first calls `DRM_IOCTL_PRIME_FD_TO_HANDLE`; the current
+cross-file import rejects Venus/host-blob resources with EOPNOTSUPP before the
+newer immutable capture path can run. A cube may complete thousands of Vulkan
+submissions and save valid GPU timestamps without ever producing a WM window.
+Do not use those timings as desktop or presentation acceptance.
+
+The import restriction predates this paging branch (7fabcdc01, 24 October) and
+is present on main. Explicit `MESA_VK_WSI_DEBUG=sw,noshm` renders a correctly
+textured animated cube in the same VM, visually checked by Terra. Use that
+same staged path for both bounded compression controls. Follow up on accurate
+automatic capability selection and the import/capture sequencing; rebuilding
+waylandd alone does not remove the source-level prerequisite. Preserve the
+lifetime/fence checks rather than bypassing the rejection. Private evidence is
+under `build/reviews/paging-steam-20261029/responsiveness/direct-setup-failed/`.

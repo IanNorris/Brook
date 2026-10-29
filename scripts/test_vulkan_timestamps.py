@@ -43,5 +43,18 @@ class Timestamps(unittest.TestCase):
             r = copy.deepcopy(base); r['timing']['rounds'][0].update(ticks=ticks, cpu_ns=cpu)
             with self.assertRaises(ValueError): analyze(r)
 
+    def test_cube_window_requires_complete_intervals_and_validates_all_rows(self):
+        header = '# bits=8 period_ns=2 errors=0 overflow=0\nframe,cycle_start_ns,after_wait_ns,after_acquire_ns,before_submit_ns,after_submit_ns,before_present_ns,after_present_ns,gpu_start,gpu_end,submitted,ready\n'
+        trace=header+''.join(f'{i},{100+i*100},{110+i*100},{120+i*100},{130+i*100},{140+i*100},{150+i*100},{160+i*100},10,20,1,1\n' for i in range(4))
+        result=cube_analyze(trace,200,400)
+        self.assertEqual((result['frames'],result['captured_frames']),(1,4))
+        self.assertEqual(result['longest_present_intervals'][0]['frame'],2)
+        self.assertEqual(result['summary_ms']['present_return_interval_ms']['p95'],.0001)
+        self.assertEqual(cube_analyze(trace,160,460)['frames'],3)
+        for start,end in [(None,400),(200,None),(400,200),(0,1),(True,400),(-1,400),(0,1<<64)]:
+            with self.assertRaises(ValueError):cube_analyze(trace,start,end)
+        # A clipped analysis must not hide an invalid row outside the window.
+        with self.assertRaises(ValueError):cube_analyze(trace.replace('0,100,110','0,100,90'),200,400)
+
 
 if __name__ == '__main__': unittest.main()
