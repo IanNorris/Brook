@@ -138,7 +138,7 @@ void AttachRamCompression() {
 unsigned injectedFailure=0;
 enum class State : uint8_t { Resident, Evicting, Stored, Recovery, Zero, Discarded };
 struct Entry { uint64_t slot;PhysicalAddress recovery;State state; };
-struct Region { uint64_t pages,heldFrames;Entry entries[1]; };
+struct Region { uint64_t pages,heldFrames;bool accountingVisited;Entry entries[1]; };
 struct Frame {
     PhysicalAddress physical;
     ~Frame(){if(physical)PmmUnrefPage(physical);}
@@ -280,17 +280,19 @@ int64_t SpillStoredPage(Process* actor,uint64_t page) {
     {StoreGuard guard;return store.Spill(token);}
 }
 // AS mutation held. Split nodes share a region's accounting, not independent
-// copies of it. Aggregate each backing once, including when fragments have
-// unrelated replacement nodes between them.
+// copies of it. A temporary mark gives two linear passes, including fragments
+// with unrelated replacement nodes between them. Regions belong to one AS;
+// its mutation gate serializes both passes and no mark survives the call.
 uint64_t HeldFrames(AddressSpaceState* space) {
     uint64_t total=0;
     for(auto* node=space->ranges.head;node;node=node->next) {
         if(node->range.kind!=MappingKind::Pageable || !node->range.backing || node->range.backing->release!=ReleaseRegion)continue;
-        bool seen=false;
-        for(auto* prior=space->ranges.head;prior!=node;prior=prior->next)
-            if(prior->range.backing==node->range.backing){seen=true;break;}
-        if(!seen)total+=static_cast<Region*>(node->range.backing->object)->heldFrames;
+        auto* region=static_cast<Region*>(node->range.backing->object);
+        if(!region->accountingVisited){region->accountingVisited=true;total+=region->heldFrames;}
     }
+    for(auto* node=space->ranges.head;node;node=node->next)
+        if(node->range.kind==MappingKind::Pageable && node->range.backing && node->range.backing->release==ReleaseRegion)
+            static_cast<Region*>(node->range.backing->object)->accountingVisited=false;
     return total;
 }
 // One finite traversal, in batches of at most 64 metadata/page visits. A sole
@@ -391,7 +393,7 @@ bool PageableMemoryRetirement::Capture(AddressSpaceState* space,uint64_t begin,u
     }
     return true;
 }
-void PageableMemoryRetirement::Commit() {
+void PageableMemoryRetirement::Commit(bool resetToZero) {
     if(committed_)KernelPanic("paging: repeated retirement commit");
     for(uint64_t i=0;i<count_;++i) {
         auto& page=pages_[i];auto* region=static_cast<Region*>(page.backing->object);
@@ -399,7 +401,7 @@ void PageableMemoryRetirement::Commit() {
             if(!region->heldFrames)KernelPanic("paging: retirement held-frame underflow");
             --region->heldFrames;
         }
-        *page.entry={0,{},State::Discarded};
+        *page.entry={0,{},resetToZero?State::Zero:State::Discarded};
     }
     committed_=true;
 }

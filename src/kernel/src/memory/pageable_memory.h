@@ -17,7 +17,9 @@ public:
     static uint64_t Count(const MappingRangeTable&,uint64_t begin,uint64_t end);
     bool Prepare(uint64_t pages);
     bool Capture(AddressSpaceState*,uint64_t begin,uint64_t end);
-    void Commit();
+    // resetToZero retains the reservation after MADV_DONTNEED; removal leaves
+    // an inaccessible Discarded entry outside all surviving fragments.
+    void Commit(bool resetToZero=false);
 private:
     struct Page;
     Page* pages_=nullptr;

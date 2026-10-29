@@ -1923,6 +1923,10 @@ static void anonymousDiscard() {
     CHECK(UserMappingClone(&actor,space,child,41));
     auto beforeFirst=VmmReadLeaf(space->pageTable,first),beforeSecond=VmmReadLeaf(space->pageTable,second);
     uint64_t addresses[2]={123,456},count=99;
+    CHECK(VmmCollectRangeAddresses(space->pageTable,second.raw()+pageSize,second.raw()+2*pageSize,nullptr,0,&count));
+    CHECK(count==0);
+    CHECK(!VmmCollectRangeAddresses(space->pageTable,first.raw(),second.raw()+pageSize,nullptr,0,&count));
+    CHECK(count==0&&VmmReadLeaf(space->pageTable,first)==beforeFirst&&VmmReadLeaf(space->pageTable,second)==beforeSecond);
     CHECK(!VmmCollectRangeAddresses(space->pageTable,first.raw(),second.raw()+pageSize,addresses,1,&count));
     CHECK(count==0&&addresses[0]==123&&addresses[1]==456);
     CHECK(VmmCollectRangeAddresses(space->pageTable,first.raw(),second.raw()+pageSize,addresses,2,&count));

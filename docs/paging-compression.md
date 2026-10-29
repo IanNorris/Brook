@@ -915,8 +915,8 @@ counts localized it to this entry barrier. The corrected test passes without
 changing its cold-page expectations. Failure logs/disks are retained.
 
 HeldFrames aggregates each Region once across split nodes; state counters count
-only each node's backing-relative slice. The current unique-backing aggregation
-is quadratic in node count and must become linear before broad app enrollment.
+only each node's backing-relative slice. At this checkpoint the unique-backing
+aggregation was quadratic; the following discard checkpoint makes it linear.
 Per-page retirement snapshots also have a real allocation cost; allocation
 failure changes no mappings and does not justify claiming OOM-proof mutation.
 
@@ -937,3 +937,53 @@ same 96 MiB holder; all pass and the holder retains its bytes through release.
 It also syncs/stops with owner exit 0. See paging-lifecycle/compiler-results.json
 and compiler-0-lz4-96/. These are regression checks, not new controlled speedup
 claims.
+
+## Demand-zero discard and linear fragmented accounting
+
+MADV_DONTNEED now accepts existing opt-in Pageable fragments, including a
+contiguous request spanning ordinary private anonymous pages. Complete coverage
+and mapping-kind validation precede any mutation. Retirement storage covers all
+affected pager entries, not just present PTEs. Fresh zeroed replacement frames
+are prepared only for ordinary backed leaves, preserving their existing CoW
+behavior; pager leaves detach and their entries become Zero without backing I/O.
+Their former slots and Recovery references retire after TLB acknowledgement,
+under the helper's cancellation protection. Permissions and reservations remain.
+Repeated discard is idempotent, including entirely nonresident/Zero fragments.
+It does not claim allocation-free mutation: metadata still has a real cost.
+
+The all-nonresident case advances AS generation. A zero-capacity address
+collection is still performed on commit, so a leaf populated during unlocked
+preparation forces a retry rather than surviving a reset to Zero. A real-VMM
+host check verifies empty zero-capacity collection succeeds, while populated
+and hidden leaves reject it without modifying PTEs. Address-array cleanup now
+also occurs before the outer retirement helper leaves cancellation protection.
+
+HeldFrames uses a temporary per-Region mark and two linear passes under the AS
+mutation gate. No mark survives the call. This relies on the current invariant
+that mutable Region metadata belongs to one AS; fork must create independent
+Region state rather than share it. Two regions split into 1280 nodes preserve
+exact counts over repeated queries, discard and teardown. One 100-query batch
+took 1.57 ms with raw backing and 2.06 ms with compressed backing in the final
+runs. These are bounded fixture observations, not a baseline-controlled speedup
+or an application responsiveness claim.
+
+The native discard fixture mixes Resident, Stored, Recovery and Zero entries,
+hidden permissions, raw read/write failure controls, reserve-backed zero
+refault and ordinary anonymous mappings. It checks no backing reads/writes
+during pager discard, exact counts and zero bytes afterward. A range containing
+a hole rejects before mutation and preserves distinct nonzero sentinels on both
+valid sides. Final raw/compressed VMs pass all 27 native jobs, including the
+existing 256 MiB working-set pressure tests and final slot/reserve cleanup.
+Eleven relevant host tests and compiled entry/startup mutation audits pass.
+Three further normal-user compiler/link/run passes succeed with a 96 MiB holder;
+the holder verifies its bytes and releases normally. All three final VMs sync,
+stop and return original owner exit 0. Read-only e2fsck checks on separate exports
+of the compiler VM's data, Nix and tmp partitions all return 0. The exports are
+disposable; source disks and check logs remain intact.
+
+Evidence: paging-discard/{metadata.json,native-final.log,native-final-raw/,
+native-final-ram/,compiler-final-results.json,compiler-final-0-lz4-96/,
+fsck-results.json,fsck-partition-*.log} under the build evidence directory.
+Ordinary anonymous memory enrollment, remap, independent fork metadata and
+shared-AS/kernel-access exclusion remain separate prerequisites, not inferred
+from these private-mapping fixtures.

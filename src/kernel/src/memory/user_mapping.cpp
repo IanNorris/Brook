@@ -501,44 +501,66 @@ int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, ui
     if (!length) return 0;
     if (!UserInterval(address,length,end)) return -22;
     for (;;) {
+        PageableMemoryRetirement paging(actor);
         struct Addresses { uint64_t* data=nullptr; ~Addresses() { kfree(data); } } addresses;
         MappingTransaction operation(actor,space);
         if (!operation.Lock()) return -12;
+        uint64_t pageableLeaves=0;
         for (uint64_t at=address;at<end;) {
             const auto* range=MappingRangeFind(space->ranges,at);
             if (!range) return -12;
+            const bool pageable=range->kind==MappingKind::Pageable;
             if ((range->kind != MappingKind::Anonymous && range->kind != MappingKind::Heap &&
-                 range->kind != MappingKind::Stack) || range->backing ||
+                 range->kind != MappingKind::Stack && !pageable) || (!pageable && range->backing) ||
                 range->sharing != MappingSharing::Private ||
                 range->leafOwnership != MappingLeafOwnership::Managed) return -95;
+            if(pageable) {
+                uint64_t leaves=0;
+                if(!operation.RangeLeafCount(at,range->end<end?range->end:end,leaves))return -22;
+                pageableLeaves+=leaves;
+            }
             at=range->end<end?range->end:end;
         }
         uint64_t count=0;
         if (!operation.RangeLeafCount(address,end,count)) return -22;
-        if (!count) return 0;
+        const uint64_t pagingPages=PageableMemoryRetirement::Count(space->ranges,address,end);
+        if (!count && !pagingPages) return 0;
+        if(pageableLeaves>count)KernelPanic("paging: discard leaf count mismatch");
+        const uint64_t freshCount=count-pageableLeaves;
         const uint64_t generation=space->generation;
         operation.Unlock();
+        if(!paging.Prepare(pagingPages))return -12;
         if (count>~uint64_t{0}/sizeof(uint64_t)) return -12;
-        addresses.data=static_cast<uint64_t*>(kmalloc(count*sizeof(uint64_t)));
-        if (!addresses.data || !operation.Prepare(count,count) ||
-            !operation.PrepareZeroed(MemTag::User,space->allocationPid)) return -12;
+        if(count)addresses.data=static_cast<uint64_t*>(kmalloc(count*sizeof(uint64_t)));
+        if ((count && !addresses.data) || !operation.Prepare(count,freshCount) ||
+            (freshCount && !operation.PrepareZeroed(MemTag::User,space->allocationPid))) return -12;
         if (!operation.Lock()) return -12;
         if (space->generation!=generation) continue;
         uint64_t actual=0;
+        // Zero capacity is also a preflight: a leaf populated while preparation
+        // was unlocked must cause a retry, not survive an entry reset to Zero.
         if (!VmmCollectRangeAddresses(space->pageTable,address,end,addresses.data,count,&actual)) continue;
+        if(!paging.Capture(space,address,end))return -16;
         // Every replacement has storage and an existing page-table path before
         // the first detach. Never zero a shared CoW frame in place.
+        uint64_t fresh=0;
         for (uint64_t i=0;i<actual;++i) {
             const uint64_t at=addresses.data[i];
             const auto* range=MappingRangeFind(space->ranges,at);
+            if(range->kind==MappingKind::Pageable) {
+                if(!operation.Detach(VirtualAddress(at)))KernelPanic("paging: preflighted discard detach failed");
+                continue;
+            }
             uint64_t flags=VMM_USER;
             if (range->protection & 2) flags|=VMM_WRITABLE;
             if (!(range->protection & 4)) flags|=VMM_NO_EXEC;
             if (!operation.Detach(VirtualAddress(at)) ||
-                operation.Publish(i,VirtualAddress(at),flags,MemTag::User,space->allocationPid,
+                operation.Publish(fresh++,VirtualAddress(at),flags,MemTag::User,space->allocationPid,
                                   range->protection!=0)!=VmmMapResult::Mapped)
                 KernelPanic("mapping: preflighted anonymous discard failed");
         }
+        if(pagingPages)operation.Changed(false);
+        paging.Commit(true);
         return 0;
     }
 }
