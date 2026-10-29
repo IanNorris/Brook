@@ -523,7 +523,7 @@ int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, ui
         PageableMemoryRetirement paging(actor);
         struct Addresses { uint64_t* data=nullptr; ~Addresses() { kfree(data); } } addresses;
         MappingTransaction operation(actor,space);
-        if (!operation.Lock()) return -12;
+        if (int error=operation.LockAnonymousInterval(address,end)) return error;
         uint64_t pageableLeaves=0;
         for (uint64_t at=address;at<end;) {
             const auto* range=MappingRangeFind(space->ranges,at);
@@ -553,7 +553,7 @@ int64_t UserMappingDiscardAnonymous(Process* actor, AddressSpaceState* space, ui
         if(count)addresses.data=static_cast<uint64_t*>(kmalloc(count*sizeof(uint64_t)));
         if ((count && !addresses.data) || !operation.Prepare(count,freshCount) ||
             (freshCount && !operation.PrepareZeroed(MemTag::User,space->allocationPid))) return -12;
-        if (!operation.Lock()) return -12;
+        if (int error=operation.LockAnonymousInterval(address,end)) return error;
         if (space->generation!=generation) continue;
         uint64_t actual=0;
         // Zero capacity is also a preflight: a leaf populated while preparation
@@ -613,9 +613,9 @@ UserPageAccess UserMappingPageAccess(Process* actor, AddressSpaceState* space, u
     if(timingToken&1)MappingAccessTimingRecord(timingToken,(access&2)!=0,timingBefore,
         timingAcquired,timingEnded,actor->pid,actor->incarnation);
     if (!resolveCow || !cow) return status;
-    // Reacquire the existing full transaction and revalidate before CoW.
+    // Reacquire only the target range gate and revalidate before CoW.
     if (!operation.Prepare(1,0)) return UserPageAccess::OutOfMemory;
-    if(!operation.Lock())return UserPageAccess::OutOfMemory;status=CheckPage(space,address,access,cow);
+    if(!operation.LockFaultRange(address))return UserPageAccess::OutOfMemory;status=CheckPage(space,address,access,cow);
     if (!cow) return status;
     auto result=VmmCowResolveWrite(space->pageTable,VirtualAddress(address),space->allocationPid);
     if (result.result == VmmCowResult::OutOfMemory) return UserPageAccess::OutOfMemory;

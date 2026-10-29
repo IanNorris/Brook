@@ -187,6 +187,24 @@ bool FileMappingGateSet::LockAddress(AddressSpaceState* space,uint64_t address) 
         ReleasePins();
     }
 }
+int FileMappingGateSet::LockAnonymousInterval(AddressSpaceState* space,uint64_t begin,uint64_t end) {
+    if(space_ || count_)KernelPanic("file mapping: recursive anonymous interval gate");
+    if(begin>=end || (begin&4095) || (end&4095) || end>0x0000800000000000ULL)return -22;
+    KMutexLock(&space->mutation);
+    for(uint64_t at=begin;at<end;) {
+        const auto* range=MappingRangeFind(space->ranges,at);
+        if(!range){KMutexUnlock(&space->mutation);return -12;}
+        const bool pageable=range->kind==MappingKind::Pageable;
+        if((range->kind!=MappingKind::Anonymous && range->kind!=MappingKind::Heap &&
+            range->kind!=MappingKind::Stack && !pageable) ||
+           range->sharing!=MappingSharing::Private || range->leafOwnership!=MappingLeafOwnership::Managed ||
+           (range->backing && (!pageable || range->backing->file))) {
+            KMutexUnlock(&space->mutation);return -95;
+        }
+        at=range->end<end?range->end:end;
+    }
+    space_=space;return 0;
+}
 void FileMappingGateSet::Unlock() {
     if(!space_)return;
     KMutexUnlock(&space_->mutation);space_=nullptr;

@@ -40,6 +40,10 @@ public:
     // backing, acquire its file gate before AS mutation, and retry if topology
     // changes. Caller must not modify range metadata or access another range.
     bool LockAddress(AddressSpaceState* space,uint64_t address);
+    // AS-only leaf mutation over fully covered private anonymous/pageable RAM.
+    // Validates every intersected mapping; no file gate or backing escapes.
+    // Returns zero with AS mutation held, or a negative error unlocked.
+    int LockAnonymousInterval(AddressSpaceState* space,uint64_t begin,uint64_t end);
     void Unlock();
     void Finish();
 private:

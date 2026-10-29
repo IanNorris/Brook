@@ -67,6 +67,7 @@ struct Gate {
 KMutex* pageAccessPauseMutex=nullptr;
 Gate* pageAccessPause=nullptr;
 thread_local bool pageAccessPauseOnce=false;
+thread_local unsigned pageAccessPauseSkip=0;
 PageTable table() {
     auto p=PmmAllocPage(MemTag::PageTable);CHECK(p);std::memset(reinterpret_cast<void*>(p.raw()),0,pageSize);return PageTable(p);
 }
@@ -104,7 +105,8 @@ void KMutexInit(KMutex* mutex) {
 }
 void KMutexLock(KMutex* mutex) {
     if(pageAccessPauseOnce && mutex==pageAccessPauseMutex) {
-        pageAccessPauseOnce=false;pageAccessPause->park();
+        if(pageAccessPauseSkip)--pageAccessPauseSkip;
+        else {pageAccessPauseOnce=false;pageAccessPause->park();}
     }
     hostMutex(mutex).lock();
 }
@@ -1893,14 +1895,14 @@ static void pageAccessWithoutUnrelatedGate() {
     CHECK(space->references==spaceRefs&&actor.kernelRegionDepth==0&&actor.refCount==0);
 
     // Force a genuine private CoW candidate, then change its permissions in
-    // the gap before full-gate acquisition. The slow path must recheck and
+    // the gap before target-scope acquisition. The slow path must recheck and
     // deny the write, without allocating/copying a replacement physical page.
     KMutexLock(&space->mutation);cow(space->pageTable);KMutexUnlock(&space->mutation);
     PmmRefPage(physical); // external pin forces copy if stale CoW were attempted
-    Gate beforeFullGate;pageAccessPauseMutex=&unrelated.gate;pageAccessPause=&beforeFullGate;
+    Gate beforeFullGate;pageAccessPauseMutex=&space->mutation;pageAccessPause=&beforeFullGate;
     UserPageAccess result=UserPageAccess::Ready;
     std::thread writer([&] {
-        pageAccessPauseOnce=true;
+        pageAccessPauseSkip=1;pageAccessPauseOnce=true;
         result=UserMappingPageAccess(&actor,space,va.raw(),2,true);
     });
     bool reachedSlowPath;
@@ -1925,6 +1927,61 @@ static void pageAccessWithoutUnrelatedGate() {
     std::puts("PAGE ACCESS PASS unrelated-gate/no-allocation/read-statuses/CoW-revalidation/lifetime");
 }
 
+static void anonymousIntervalIsolation() {
+    auto root=table();VmmHostSetKernelRoot(root);AddressSpaceKernelInit();
+    auto* space=AddressSpaceCreate(80);auto* child=AddressSpaceCreate(81);CHECK(space&&child);
+    Process actor{};actor.addressSpace=space;
+    FileObject unrelated{};FileObjectInit(&unrelated);unsigned released=0;
+    auto* backing=MappingBackingCreate(&released,rangeBackingReleased);CHECK(backing);backing->file=&unrelated;
+    UserMappingRequest request{};request.range=rangeRecord(0,pageSize,nullptr);
+    request.length=pageSize;request.preparedPages=1;request.prepare=prepareMappingPages;request.fixed=true;
+    request.hint=va.raw();CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(request.hint));
+    request.hint+=pageSize;CHECK(UserMappingCreate(&actor,space,request)==static_cast<int64_t>(request.hint));
+    {
+        MappingTransaction op(&actor,space,backing);CHECK(op.PrepareRanges(1)&&op.Lock());
+        CHECK(op.InsertRange(rangeRecord(va.raw()+8*pageSize,va.raw()+9*pageSize,backing)));
+    }
+    CHECK(UserMappingClone(&actor,space,child,81));
+    auto old=VmmLeafPhysical(VmmReadLeaf(child->pageTable,va));
+    *reinterpret_cast<unsigned char*>(old.raw())=0x51;
+    KMutexLock(&unrelated.gate);
+    std::mutex mutex;std::condition_variable completed;bool done=false;
+    std::thread worker([&]{
+        CHECK(UserMappingPageAccess(&actor,space,va.raw(),2,true)==UserPageAccess::Ready);
+        CHECK(VmmLeafPhysical(VmmReadLeaf(space->pageTable,va))!=old);
+        CHECK(UserMappingDiscardAnonymous(&actor,space,va.raw(),2*pageSize)==0);
+        std::lock_guard<std::mutex> lock(mutex);done=true;completed.notify_all();
+    });
+    bool isolated;
+    {std::unique_lock<std::mutex> lock(mutex);isolated=completed.wait_for(lock,std::chrono::seconds(2),[&]{return done;});}
+    KMutexUnlock(&unrelated.gate);worker.join();CHECK(isolated);
+    CHECK(*reinterpret_cast<unsigned char*>(old.raw())==0x51);
+    for(unsigned i=0;i<2;++i) {
+        auto page=VmmLeafPhysical(VmmReadLeaf(space->pageTable,va+i*pageSize));
+        for(unsigned j=0;j<pageSize;++j)CHECK(reinterpret_cast<unsigned char*>(page.raw())[j]==0);
+    }
+    {
+        MappingTransaction op(&actor,space);
+        CHECK(op.LockAnonymousInterval(va.raw(),va.raw()+3*pageSize)==-12); // hole
+        CHECK(op.LockAnonymousInterval(va.raw()+8*pageSize,va.raw()+9*pageSize)==-95); // file backing
+        CHECK(op.LockAnonymousInterval(va.raw(),va.raw()+2*pageSize)==0);
+        uint64_t count=123;CHECK(!op.RangeLeafCount(va.raw(),va.raw()+3*pageSize,count)&&!count);
+        op.Unlock();
+        CHECK(UserMappingProtect(&actor,space,va.raw(),pageSize,0)==0);
+        CHECK(op.LockAnonymousInterval(va.raw(),va.raw()+2*pageSize)==0);op.Unlock();
+        // A prepared interval is not authority after unlock: replacing even
+        // one covered node with a file mapping must reject reacquisition.
+        UserMappingRequest replacement{};replacement.range=rangeRecord(0,pageSize,backing);
+        replacement.range.kind=MappingKind::File;replacement.hint=va.raw()+pageSize;
+        replacement.length=pageSize;replacement.fixed=true;
+        CHECK(UserMappingCreate(&actor,space,replacement)==static_cast<int64_t>(replacement.hint));
+        CHECK(op.LockAnonymousInterval(va.raw(),va.raw()+2*pageSize)==-95);
+    }
+    AddressSpaceUnref(child);AddressSpaceUnref(space);CHECK(ProcessCleanupStep());CHECK(ProcessCleanupStep());
+    CHECK(!FileMappingRegisteredRanges(&unrelated));MappingBackingUnref(backing);CHECK(released==1);FileObjectDispose(&unrelated);
+    VmmDestroyUserPageTable(root);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
+    std::puts("ANONYMOUS INTERVAL PASS CoW/unrelated-file-held/multi-node-discard/child-integrity/hole/file/bounds/revalidation");
+}
 static void anonymousDiscard() {
     auto root=table();VmmHostSetKernelRoot(root);
     auto* space=AddressSpaceCreate(40);auto* child=AddressSpaceCreate(41);CHECK(space&&child);
@@ -2240,7 +2297,7 @@ int main(int argc,char** argv) {
     liveMappingClone();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();
     fileMappingRegistrations();fileMappingGateOom();addressFileGateScope();targetFileInvalidation();targetPrivateRestore();privateRestoreObservedEof();
     targetQuarantineRecovery();pageAccessWithoutUnrelatedGate();
-    anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
+    anonymousIntervalIsolation();anonymousDiscard();memoryCensus();sharedFilePublicationAndSync();exactAddressNoReplace();
     const auto cleanup=ProcessGetCleanupStatus();
     CHECK(!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers);
     vmallocIntegration();

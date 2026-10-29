@@ -31,6 +31,9 @@ public:
     // Leaf-only scope: current range gate + AS mutation, with generation retry.
     // Cannot be used for range edits or publication outside that range.
     bool LockFaultRange(uint64_t address);
+    // Leaf-only private anonymous interval; revalidated after each unlock.
+    // The same interval may be reacquired, never widened or used for metadata edits.
+    int LockAnonymousInterval(uint64_t begin,uint64_t end);
     void Unlock();
     void Changed(bool requiresShootdown = true);
     // Capture ownership while old metadata is still present; detach before
@@ -108,7 +111,7 @@ private:
     MappingBacking* incoming_;
     MappingBacking* onlyBacking_;
     FileMappingGateSet fileGates_;
-    bool faultScoped_ = false;
+    bool faultScoped_ = false, anonymousScoped_ = false;
     uint64_t faultBegin_ = 0, faultEnd_ = 0;
 };
 // Narrow truncate foundation: the caller retains the file/backing and owns its

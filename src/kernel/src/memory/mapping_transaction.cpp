@@ -91,7 +91,7 @@ bool MappingTransaction::Lock() {
     locked_ = true; ++lockEpoch_;return true;
 }
 bool MappingTransaction::LockFaultRange(uint64_t address) {
-    if (locked_ || incoming_ || onlyBacking_)
+    if (locked_ || incoming_ || onlyBacking_ || anonymousScoped_)
         KernelPanic("mapping: invalid fault range lock");
     faultScoped_ = true;
     if (!fileGates_.LockAddress(space_,address)) return false;
@@ -100,6 +100,14 @@ bool MappingTransaction::LockFaultRange(uint64_t address) {
     faultBegin_ = range ? range->begin : 0;
     faultEnd_ = range ? range->end : 0;
     return true;
+}
+int MappingTransaction::LockAnonymousInterval(uint64_t begin,uint64_t end) {
+    if(locked_ || incoming_ || onlyBacking_ ||
+       (faultScoped_ && (!anonymousScoped_ || begin!=faultBegin_ || end!=faultEnd_)))
+        KernelPanic("mapping: invalid or widened anonymous interval scope");
+    if(int error=fileGates_.LockAnonymousInterval(space_,begin,end))return error;
+    faultScoped_=anonymousScoped_=true;faultBegin_=begin;faultEnd_=end;
+    locked_=true;++lockEpoch_;return 0;
 }
 bool MappingTransaction::FaultScopeContains(uint64_t address) const {
     return !faultScoped_ || (address >= faultBegin_ && address < faultEnd_);
@@ -224,6 +232,7 @@ void MappingTransaction::CaptureDetachedLeaf(VirtualAddress address, uint64_t le
 }
 bool MappingTransaction::RangeLeafCount(uint64_t begin, uint64_t end, uint64_t& count) const {
     if (!locked_) KernelPanic("mapping: range count without lock");
+    if(faultScoped_ && (begin<faultBegin_ || end>faultEnd_)){count=0;return false;}
     return VmmCountRangeLeaves(space_->pageTable,begin,end,&count);
 }
 bool MappingTransaction::InsertRange(const MappingRange& range) {
