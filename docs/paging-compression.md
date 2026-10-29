@@ -1308,3 +1308,63 @@ pass read-only checks. Astra found no checkpoint blocker. Evidence under
 `application-policy-budgets-v2/`: metadata.json, compiler-accepted-results.json,
 compare.log, native.log, enrollment.log, host-tests.log, entry-audit.json,
 scheduler-audit.json, fsck-results.json and the per-VM job/shutdown receipts.
+
+### Application pressure gate (29 October)
+
+Application enrollment now defaults to advisory pressure hysteresis. The boot
+option `opt/page-store-executable-headroom-mib` accepts 0–256 and defaults to
+32 MiB: enter pressure mode at or below that free-PMM threshold and leave at or
+above twice it. Zero explicitly restores target-only reclaim for controlled
+comparisons. The resident target still applies while pressure is active.
+Explicit synthetic paging behavior is unchanged; allocation-failure reclaim
+remains independent of this gate and the target. A skipped soft attempt retains
+the ordinary-allocation/reserve/hard-reclaim path and does not weaken snapshot
+validation after an actual eviction.
+
+Pressure state belongs to the AS under its mutation lock; exec resets it and
+fork recomputes it independently. Free PMM is sampled once per fault and is
+advisory, not a memory reservation. Root control 22 adds selectors 10 pressure
+entries, 11 exits, and 12 target-qualified faults suppressed by the pressure
+gate. Selector 12 is not an avoided-pageout count: it can include Recovery
+faults that would not evict anyway. Updating advisory state on eager-barrier
+faults does not enable reclaim there.
+
+Direct victim handoff maintains free memory rather than refilling the headroom
+band. Nonpageable allocations and eager restorations can consume memory without
+eligible fault-driven reclaim. This is an application experiment, not a global
+memory-pressure daemon or general shared-AS paging solution. The policy's host
+tests cover both hysteresis boundaries, zero mode and configuration limits.
+
+Forward/reverse comparisons use fresh private 512 MiB/eight-vCPU boots, the
+same unmodified compiler and 64 MiB target, with and without the 96 MiB holder.
+Each case runs twice. With ample RAM, off takes 2.825–2.877 s, target-only takes
+3.764–3.801 s and gated takes 2.695–2.744 s. Gating removes all 8,054 application
+pageouts and all application backing I/O, with no pressure entry; sampled free
+memory remains 99.97–101.54 MiB. It avoids unnecessary reclaim when RAM is
+available rather than establishing an application speedup over ordinary mmap.
+
+Under the holder, each gated run enters pressure once before its target is
+reached and leaves it active. Both gated and target-only cases perform exactly
+8,054 pageouts and 2,475 Stored fault publications; gating skips no
+target-qualified fault. Gated compilation takes 3.589–3.837 s, target-only
+4.079 s, off 2.625–2.800 s. The identical work counts do not establish that
+gating improved pressured throughput. Gated sampled free memory is
+25.96–27.12 MiB; off's 3.84–23.27 MiB illustrates the limitation of sparse
+minimum-free observations. Victim selection remains the next distinct lead;
+pressure timing did not remove this workload's reclaim/refault churn.
+
+All 12 compiler/output-verification runs pass with zero retained slots/pool
+allocation. Forty-five native regressions, four enrollment jobs, twelve host
+tests and compiled entry/startup mutation audits pass. All 16 final VMs complete
+checked sync/shutdown with original owner exit zero. The checked pressured
+VM's data/Nix/tmp ext2 exports pass read-only checks; Astra found no blocker.
+Evidence: application-pressure-gate/{metadata.json,compiler-accepted-results.json,
+compare.log,native.log,enrollment.log,host-tests.log,entry-audit.json,
+scheduler-audit.json,fsck-results.json} and application-pressure-ample/.
+
+Existing boot telemetry is retained in that metadata: the six pressured control
+boots report desktop presentation at 6,045–6,424 guest milliseconds. These use a
+32 MiB test initrd and approximately 3.6 MiB kernel ELF; they are fixture timings,
+not a representative installed Steam desktop or whole firmware-to-desktop
+latency. Neither kernel nor initrd is compressed in this comparison, so these
+observations establish no boot-payload compression gain.

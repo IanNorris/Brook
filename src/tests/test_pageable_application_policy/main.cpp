@@ -3,6 +3,15 @@
 #include "../../kernel/src/memory/pageable_application_policy.h"
 int main(){
     brook::PageableApplicationPolicy policy;
+    bool active=false;
+    assert(!policy.ReclaimAllowed(active,8193) && !active);
+    assert(policy.ReclaimAllowed(active,8192) && active);
+    assert(policy.ReclaimAllowed(active,16383) && active);
+    assert(!policy.ReclaimAllowed(active,16384) && !active);
+    assert(policy.ReclaimAllowed(active,0) && active);
+    policy.headroomPages=0;
+    assert(policy.ReclaimAllowed(active,100000) && !active);
+    assert(!policy.Configure("/test/compiler",14,4096,65537));
     assert(!policy.Matches("/test/compiler",65536,3,0x22));
     assert(policy.Configure("/test/compiler",14,4096));
     assert(policy.Matches("/test/compiler",65536,3,0x22));

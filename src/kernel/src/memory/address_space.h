@@ -25,6 +25,7 @@ struct AddressSpaceState {
     bool kernel;
     PagingAdmission pagingAdmission;
     bool pagingApplication; // boot-only executable experiment; fork inherits, exec resets
+    bool pagingPressureActive; // advisory application hysteresis; fresh AS/fork recompute
     bool pagingReclaimEnabled; // explicit single-task experiment; mutation protects both
     uint64_t pagingReclaimCursor;
     uint64_t pagingResidentTarget; // soft target in pages; zero disables

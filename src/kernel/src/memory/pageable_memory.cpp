@@ -28,7 +28,7 @@ bool ready=false;
 PageableApplicationPolicy applicationPolicy;
 // Root-readable diagnostic totals survive worker exit. Held is a sampled
 // per-AS maximum, not an exact process or whole-system RSS high-water mark.
-uint64_t applicationStats[10]{};
+uint64_t applicationStats[13]{};
 uint64_t applicationBarriers[512]{};
 void ApplicationCount(AddressSpaceState* space,unsigned counter,uint64_t amount=1) {
     if(space->pagingApplication)__atomic_fetch_add(&applicationStats[counter],amount,__ATOMIC_RELAXED);
@@ -682,9 +682,19 @@ void PageableMemoryBootInit() {
                 mib=mib*10+unsigned(target[i]-'0');
             }
         }
-        if(!valid || mib<1 || mib>256 || !applicationPolicy.Configure(executable,executableSize,mib*256))
+        uint64_t headroom=32;char pressure[8]{};
+        auto pressureSize=FwCfgReadFile("opt/page-store-executable-headroom-mib",pressure,sizeof(pressure));
+        if(pressureSize) {
+            if(pressureSize>=sizeof(pressure))valid=false;
+            headroom=0;
+            for(unsigned i=0;i<pressureSize && i<sizeof(pressure);++i) {
+                if(pressure[i]<'0' || pressure[i]>'9'){valid=false;break;}
+                headroom=headroom*10+unsigned(pressure[i]-'0');
+            }
+        }
+        if(!valid || mib<1 || mib>256 || headroom>256 || !applicationPolicy.Configure(executable,executableSize,mib*256,headroom*256))
             SerialPuts("paging: invalid executable policy (ordinary mmap retained)\n");
-        else SerialPrintf("paging: executable experiment path=%s resident_target_mib=%lu (single-task CLONE_VM restriction)\n",executable,mib);
+        else SerialPrintf("paging: executable experiment path=%s resident_target_mib=%lu headroom_mib=%lu (single-task CLONE_VM restriction)\n",executable,mib,headroom);
     }
     SerialPrintf("paging experiment: backing=%s slots=%lu single-task admission\n",name,h.slots);
 }
@@ -697,7 +707,7 @@ void PageableMemoryStartReserveWorker() {
 int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) {
     if(!ready)return -95;
     if(!actor || !ProcessCapable(actor,nullptr,CapSysAdmin))return -1;
-    if(operation==22 && value<10)return __atomic_load_n(&applicationStats[value],__ATOMIC_RELAXED);
+    if(operation==22 && value<13)return __atomic_load_n(&applicationStats[value],__ATOMIC_RELAXED);
     if(operation==23 && value<512)return __atomic_load_n(&applicationBarriers[value],__ATOMIC_RELAXED);
     if(operation==20 && value<=5){StoreGuard guard;forkFailure=value;forkFailureSpace=value?actor->addressSpace->identity:0;return 0;}
     if(operation==21 && value<=2){StoreGuard guard;growthFailure=value;growthFailureSpace=value?actor->addressSpace->identity:0;return 0;}
@@ -791,8 +801,16 @@ MappingFaultResult PageableMemoryFault(Process* actor,AddressSpaceState* space,u
     else if(initialState!=State::Stored && initialState!=State::Zero)return MappingFaultResult::Unhandled;
     const uint64_t observedHeld=(space->pagingResidentTarget || space->pagingApplication)?HeldFrames(space):0;
     ApplicationObserveHeld(space,observedHeld);
-    const bool softPressure=allowReclaim && actor->addressSpace==space &&
+    bool pressureAllowed=true;
+    if(space->pagingApplication) {
+        const bool previous=space->pagingPressureActive;
+        pressureAllowed=applicationPolicy.ReclaimAllowed(space->pagingPressureActive,PmmGetFreePageCount());
+        if(previous!=space->pagingPressureActive)ApplicationCount(space,space->pagingPressureActive?10:11);
+    }
+    const bool targetPressure=allowReclaim && actor->addressSpace==space &&
         space->pagingResidentTarget && observedHeld>=space->pagingResidentTarget;
+    if(targetPressure && !pressureAllowed)ApplicationCount(space,12);
+    const bool softPressure=targetPressure && pressureAllowed;
     op.Unlock();
     if(!op.Prepare(0,1))return MappingFaultResult::OutOfMemory;
     bool reclaimAttempted=softPressure && initialState!=State::Recovery;
