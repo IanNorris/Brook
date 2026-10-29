@@ -56,6 +56,7 @@ int writeDisk(brook::Device* device,uint64_t offset,const void* in,uint64_t byte
     std::memcpy(storage.data()+offset,in,bytes);return bytes;
 }
 int ioctlDisk(brook::Device*,uint32_t,void*){return 0;}
+unsigned flushCalls=0;bool failFlush=false;
 const brook::DeviceOps diskOps={readDisk,writeDisk,ioctlDisk,nullptr};
 void closeNode(brook::Vnode* node){assert(node);auto* object=node->backendObject;node->ops->close(node);brook::kfree(node);brook::VfsObjectRelease(object);}
 }
@@ -101,8 +102,10 @@ int ProcessCheckFileAccess(Process* p,uint32_t owner,uint32_t group,uint16_t mod
     return (access.permissions&required)==required?0:-13;
 }
 uint8_t ProcessFilePermissions(Process* p,uint32_t owner,uint32_t group,uint16_t mode){return ProcessFileAccess(p,owner,group,mode).permissions;}
+uint32_t FilePageCacheAllocateNamespace(){static uint32_t next=0;return ++next;}
 uint64_t RtcNow(){return 1792627200;}
-int DeviceFlush(Device*){return 0;}
+uint64_t RtcNowNs(){static uint64_t n=0;return ++n;}
+int DeviceFlush(Device*){++flushCalls;return failFlush?-5:0;}
 extern "C" int DeviceWrite(Device* device,uint64_t offset,const void* bytes,uint64_t size){return device->ops->write(device,offset,bytes,size);}
 extern "C" void SerialPrintf(const char*,...){}
 void SerialPuts(const char*){}
@@ -134,6 +137,36 @@ int main(int argc,char** argv){
     g_ext2Devices[0]=&device;void* mount=nullptr;assert(Ext2FsMount(0,&mount));
     auto* m=static_cast<Ext2Mount*>(mount);
     assert(m->writeError==0 && m->deferredSyncError==0);
+    // Real allocation/free batching, forced durability and retry semantics.
+    assert(Ext2ParseAutoSyncOps("4096",4)==4096);
+    for(const char* bad:{"0","65537","-1","1x","999999",""})
+        assert(Ext2ParseAutoSyncOps(bad,strlen(bad))==256);
+    for(unsigned limit:{256u,4096u}) {
+        assert(!Ext2FsSync(m));m->syncProbe.autoOps=limit;
+        const auto before=m->syncProbe.autoCount;
+        const auto flushBefore=flushCalls;
+        for(unsigned i=0;i<2048;++i) {
+            auto b=Ext2AllocBlock(m);assert(b);assert(Ext2FreeBlock(m,b));
+        }
+        assert(m->syncProbe.autoCount-before==4096/limit);
+        assert(flushCalls-flushBefore==4096/limit);
+        assert(!m->pendingMetaOps);
+    }
+    m->syncProbe.autoOps=1;failFlush=true;
+    auto retainedBlock=Ext2AllocBlock(m);assert(retainedBlock);
+    assert(m->pendingMetaOps==1 && m->bgdtDirty && m->deferredSyncError==-5);
+    assert(m->syncProbe.errors==1);
+    failFlush=false;
+    assert(Ext2FsSync(m)==-5); // sticky automatic error is reported once
+    assert(!m->pendingMetaOps && !m->bgdtDirty);
+    assert(Ext2FreeBlock(m,retainedBlock));assert(!Ext2FsSync(m));
+    m->syncProbe.autoOps=4096;
+    retainedBlock=Ext2AllocBlock(m);assert(retainedBlock && m->pendingMetaOps);
+    const auto fsyncBefore=m->syncProbe.fsyncCount;
+    assert(!Ext2FsSyncReason(m,Ext2SyncReason::Fsync));
+    assert(m->syncProbe.fsyncCount==fsyncBefore+1 && !m->pendingMetaOps);
+    assert(Ext2FreeBlock(m,retainedBlock));assert(!Ext2FsSync(m));
+    m->syncProbe.autoOps=256;
     // Make ownership independent of the host account that generated fixtures.
     m->skipPermChecks=true;
     VfsObject *root=nullptr,*held=nullptr,*marker=nullptr,*link=nullptr,*parent=nullptr;

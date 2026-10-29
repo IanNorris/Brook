@@ -25,6 +25,7 @@
 #include "net.h"
 #include "module.h"
 #include "virtio_blk.h"
+#include "ext2_vfs.h"
 #include "string.h"
 
 namespace brook {
@@ -1334,6 +1335,23 @@ static Vnode* GenBlkprobe()
     return MakeProcVnode(buf, static_cast<uint32_t>(p - buf));
 }
 
+// Counts distinguish allocation batching, vnode fsync, and generic mount sync
+// (sync(), periodic shared-mapping writeback and unmount all use the latter).
+static Vnode* GenExt2probe() {
+    auto* buf=static_cast<char*>(kmalloc(4096));if(!buf)return nullptr;
+    char* p=AppendStr(buf,"pdrv autoOps pendingOps autoSync fsync mountSync errors syncNs autoNs fsyncNs mountNs\n");
+    for(uint8_t i=0;i<16;++i) {
+        Ext2SyncProbe probe{};if(!Ext2GetSyncProbe(i,probe))continue;
+        if(p-buf+256>=4096)break;
+        p=AppendU64(p,i);
+        const uint64_t values[]={probe.autoOps,probe.pendingOps,probe.autoCount,
+            probe.fsyncCount,probe.mountCount,probe.errors,probe.waitNs,
+            probe.autoNs,probe.fsyncNs,probe.mountNs};
+        for(auto v:values){*p++=' ';p=AppendU64(p,v);}*p++='\n';
+    }
+    *p=0;return MakeProcVnode(buf,static_cast<uint32_t>(p-buf));
+}
+
 struct ProcGlobalEntry {
     const char* name;
     Vnode* (*gen)();
@@ -1350,6 +1368,7 @@ static ProcGlobalEntry g_globalEntries[] = {
     { "mounts",  GenMounts },
     { "diskstats", GenDiskstats },
     { "blkprobe", GenBlkprobe },
+    { "ext2probe", GenExt2probe },
     { "filesystems", GenFilesystems },
 };
 static constexpr uint32_t NUM_GLOBAL = sizeof(g_globalEntries) / sizeof(g_globalEntries[0]);

@@ -8,8 +8,17 @@ namespace brook {
 
 struct Device;
 
+// Cumulative mount-lifetime diagnostics, snapshotted under the filesystem lock.
+struct Ext2SyncProbe {
+    uint64_t autoCount, fsyncCount, mountCount, errors, waitNs, autoNs, fsyncNs, mountNs;
+    uint32_t autoOps, pendingOps;
+};
+bool Ext2GetSyncProbe(uint8_t pdrv, Ext2SyncProbe& out);
+
 // Register "ext2" filesystem driver with the VFS.
 void Ext2VfsRegister();
+// Call once after fw_cfg initialization and before mounting block devices.
+void Ext2ConfigureAutoSync();
 
 // Force-release the ext2 lock if held by a dying process.
 void Ext2ForceUnlockForPid(uint32_t pid);

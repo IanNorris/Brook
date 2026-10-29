@@ -26,6 +26,9 @@
 #include "sync/krwlock.h"
 #include "spinlock.h"
 #include "rtc.h"
+#ifndef BROOK_HOST_TEST
+#include "fw_cfg.h"
+#endif
 
 namespace brook {
 
@@ -217,12 +220,13 @@ struct Ext2Mount {
     // same blocks.  Cache dirty-tracks the BGDT and per-group bitmaps
     // and defers writes until Ext2Sync (called on unmount, periodic
     // safety flush, or sys_sync).  Crash window is bounded by
-    // Ext2FsSync being called every OPS_PER_AUTO_SYNC metadata ops.
+    // Ext2FsSync being called at the configured allocation/free threshold.
     bool      bgdtDirty;
     uint8_t** blockBitmapCache;   // [groupCount] — lazy-alloced
     bool*     blockBitmapDirty;   // [groupCount]
     uint8_t** inodeBitmapCache;   // [groupCount]
     bool*     inodeBitmapDirty;   // [groupCount]
+    Ext2SyncProbe syncProbe;
     uint32_t  pendingMetaOps;     // ops since last auto-sync
     int       deferredSyncError;  // an automatic sync failure not yet reported
     // A failed data/pointer/inode write may have been partially committed or
@@ -305,7 +309,18 @@ struct Ext2DirentCacheEntry {
     char     name[EXT2_DIRENT_CACHE_NAMELEN];
 };
 
-static constexpr uint32_t EXT2_OPS_PER_AUTO_SYNC = 256;
+static uint32_t g_ext2AutoSyncOps = 256;
+// Bounded experimental batching knob; zero never disables durability progress.
+static uint32_t Ext2ParseAutoSyncOps(const char* value, uint32_t length) {
+    if(!length || length>5)return 256;
+    uint32_t result=0;
+    for(uint32_t i=0;i<length;++i) {
+        if(value[i]<'0' || value[i]>'9')return 256;
+        result=result*10+static_cast<uint32_t>(value[i]-'0');
+    }
+    return result && result<=65536 ? result : 256;
+}
+enum class Ext2SyncReason { Mount, Auto, Fsync };
 
 struct Ext2OpenInode {
     Ext2Mount* mnt;
@@ -800,11 +815,15 @@ static uint8_t* Ext2GetInodeBitmap(Ext2Mount* mnt, uint32_t group)
 }
 
 // Flush every dirty cached bitmap + the BGDT to disk.  Called from the
-// VFS sync hook, on unmount, and after every EXT2_OPS_PER_AUTO_SYNC
-// metadata mutations as a safety net so the crash window is bounded.
-static int Ext2Sync(Ext2Mount* mnt)
+// VFS sync hook, on unmount, and after the configured allocation/free
+// operation threshold. The threshold is not a wall-clock deadline.
+static int Ext2Sync(Ext2Mount* mnt, Ext2SyncReason reason=Ext2SyncReason::Mount)
 {
     if (!mnt) return -22;
+    const uint64_t began=RtcNowNs();
+    if(reason==Ext2SyncReason::Auto)++mnt->syncProbe.autoCount;
+    else if(reason==Ext2SyncReason::Fsync)++mnt->syncProbe.fsyncCount;
+    else ++mnt->syncProbe.mountCount;
     int result = 0;
     bool bgdtWasDirty = mnt->bgdtDirty;
     for (uint32_t g = 0; g < mnt->groupCount; ++g) {
@@ -841,14 +860,22 @@ static int Ext2Sync(Ext2Mount* mnt)
         }
         mnt->pendingMetaOps = 0;
     }
+    if(result)++mnt->syncProbe.errors;
+    const uint64_t ended=RtcNowNs();
+    if(ended>=began) {
+        const auto elapsed=ended-began;mnt->syncProbe.waitNs+=elapsed;
+        if(reason==Ext2SyncReason::Auto)mnt->syncProbe.autoNs+=elapsed;
+        else if(reason==Ext2SyncReason::Fsync)mnt->syncProbe.fsyncNs+=elapsed;
+        else mnt->syncProbe.mountNs+=elapsed;
+    }
     return result;
 }
 
 // Called from each mutating op to bump the counter + trigger periodic flush.
 static inline void Ext2BumpMetaOps(Ext2Mount* mnt)
 {
-    if (++mnt->pendingMetaOps >= EXT2_OPS_PER_AUTO_SYNC) {
-        int error = Ext2Sync(mnt);
+    if (++mnt->pendingMetaOps >= mnt->syncProbe.autoOps) {
+        int error = Ext2Sync(mnt,Ext2SyncReason::Auto);
         if (error) mnt->deferredSyncError = error;
     }
 }
@@ -2666,13 +2693,14 @@ static int Ext2VnodeChown(Vnode* vn, uint32_t uid, uint32_t gid)
 }
 
 static int Ext2FsSync(void* mountPriv);
+static int Ext2FsSyncReason(void* mountPriv,Ext2SyncReason reason);
 
 static int Ext2VnodeFsync(Vnode* vn)
 {
     auto* mnt = vn->type == VnodeType::Dir
         ? static_cast<Ext2DirPriv*>(vn->priv)->mnt
         : static_cast<Ext2FilePriv*>(vn->priv)->mnt;
-    return Ext2FsSync(mnt);
+    return Ext2FsSyncReason(mnt,Ext2SyncReason::Fsync);
 }
 
 static FileObject* Ext2FileObject(Vnode* vn) {
@@ -2916,6 +2944,7 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
         SerialPuts("ext2: page-cache namespace exhausted\n");
         return false;
     }
+    mnt->syncProbe.autoOps = g_ext2AutoSyncOps;
     mnt->cacheNamespace = static_cast<uint32_t>(cacheNamespace);
     mnt->dev            = dev;
     mnt->blockSize      = blockSize;
@@ -3000,7 +3029,9 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
     }
 
     *mountPriv = mnt;
+    KRwLockWriteLock(&g_ext2Lock);
     g_ext2Mounts[pdrv] = mnt;
+    KRwLockWriteUnlock(&g_ext2Lock);
     mnt->skipPermChecks = false;  // Caller can override for nix mount
     SerialPrintf("ext2: pdrv %u page-cache namespace %u (writable files uncached)\n",
                  pdrv, mnt->cacheNamespace);
@@ -3029,6 +3060,12 @@ static int Ext2FsUnmount(void* mountPriv)
     // Flush any dirty metadata before releasing cache buffers.
     int error = Ext2FsSync(mnt);
     if (error) return error;
+    // Retire from diagnostic lookup before freeing. The write lock also
+    // drains any reader that already acquired this mount's snapshot.
+    KRwLockWriteLock(&g_ext2Lock);
+    for (uint32_t i=0;i<EXT2_MAX_MOUNTS;++i)
+        if(g_ext2Mounts[i]==mnt)g_ext2Mounts[i]=nullptr;
+    KRwLockWriteUnlock(&g_ext2Lock);
     if (mnt->blockBitmapCache) {
         for (uint32_t g = 0; g < mnt->groupCount; ++g)
             if (mnt->blockBitmapCache[g]) kfree(mnt->blockBitmapCache[g]);
@@ -3058,14 +3095,12 @@ static int Ext2FsUnmount(void* mountPriv)
     if (mnt->inodeCache) kfree(mnt->inodeCache);
     if (mnt->direntCache) kfree(mnt->direntCache);
     if (mnt->bgdt) kfree(mnt->bgdt);
-    for (uint32_t i = 0; i < EXT2_MAX_MOUNTS; ++i)
-        if (g_ext2Mounts[i] == mnt) g_ext2Mounts[i] = nullptr;
     kfree(mnt);
     return 0;
 }
 
 // VFS sync hook — flush all dirty metadata to disk.
-static int Ext2FsSync(void* mountPriv)
+static int Ext2FsSyncReason(void* mountPriv,Ext2SyncReason reason)
 {
     auto* mnt = static_cast<Ext2Mount*>(mountPriv);
     if (!mnt) return -22;
@@ -3073,11 +3108,24 @@ static int Ext2FsSync(void* mountPriv)
     int result = mnt->writeError ? mnt->writeError : mnt->deferredSyncError;
     mnt->deferredSyncError = 0;
     int orphanError = Ext2DrainOrphans(mnt);
-    int syncError = Ext2Sync(mnt);
+    int syncError = Ext2Sync(mnt,reason);
     if (!result) result = mnt->writeError ? mnt->writeError :
                          (orphanError ? orphanError : syncError);
     KRwLockWriteUnlock(&g_ext2Lock);
     return result;
+}
+
+static int Ext2FsSync(void* mountPriv) {
+    return Ext2FsSyncReason(mountPriv,Ext2SyncReason::Mount);
+}
+
+bool Ext2GetSyncProbe(uint8_t pdrv,Ext2SyncProbe& out) {
+    if(pdrv>=EXT2_MAX_MOUNTS)return false;
+    KRwLockReadLock(&g_ext2Lock);
+    auto* mnt=g_ext2Mounts[pdrv];
+    if(mnt) {out=mnt->syncProbe;out.pendingOps=mnt->pendingMetaOps;}
+    KRwLockReadUnlock(&g_ext2Lock);
+    return mnt!=nullptr;
 }
 
 // Consumes hold on every path; no filesystem lock is held during allocation.
@@ -4549,9 +4597,19 @@ static const VfsFsOps g_ext2FsOps = {
 // Public API
 // ---------------------------------------------------------------------------
 
+void Ext2ConfigureAutoSync() {
+#ifndef BROOK_HOST_TEST
+    char option[8]{};
+    const uint32_t length=FwCfgReadFile("opt/ext2-auto-sync-ops",option,sizeof(option));
+    g_ext2AutoSyncOps=Ext2ParseAutoSyncOps(option,length);
+    SerialPrintf("ext2: automatic sync every %u allocation/free operations\n",g_ext2AutoSyncOps);
+#endif
+}
+
 void Ext2VfsRegister()
 {
     EnsureLock();
+
     VfsRegisterFs("ext2", &g_ext2FsOps);
 }
 

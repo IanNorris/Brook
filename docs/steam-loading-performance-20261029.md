@@ -155,3 +155,77 @@ metadata write volume on `/data`. More aggressive write coalescing, dirty-cache
 management and crash durability require a purposeful follow-up; they are beyond
 this two-hour pass. There is no demonstrated reason here to replace LZ4 or
 increase image-cache limits.
+
+## Metadata batching follow-up
+
+`opt/ext2-auto-sync-ops` configures the allocation/free operation threshold per
+mount at boot. Its default remains 256; valid decimal values are 1–65,536.
+Missing, zero, malformed or out-of-range input falls back to 256. For example:
+
+```
+-fw_cfg name=opt/ext2-auto-sync-ops,string=4096
+```
+
+This changes the operation-count batching of allocation bitmaps and group
+descriptors. It does not create a general write-behind data cache, change the
+five-second writable-mapping worker, or defer explicit `fsync`/mount sync.
+Larger values extend the unsynced allocation-metadata window; this is not a
+wall-clock interval, and ordinary writes, inode updates and directory writes
+remain synchronous.
+
+`/proc/ext2probe` reports one row per live physical-drive mount, with cumulative
+automatic, vnode-fsync and generic mount-sync counts and nanoseconds spent
+inside those sync bodies. Generic mount sync includes `sync()`, periodic
+shared-mapping writeback and unmount; it is not exclusively automatic or
+application initiated. Time waiting to acquire the filesystem lock and orphan
+cleanup before the inner sync body is not included. Counters are mount-lifetime
+snapshots under the filesystem lock; destroying and recreating a mount resets them.
+Use deltas around the workload, alongside `/proc/blkprobe` and QMP counters.
+
+The production-backend hosted test performs 4,096 allocation/free operations at both 256 and
+4,096 thresholds, checking 16 versus one automatic device flush. It also
+verifies a forced sync drains pending metadata before the larger threshold,
+and that a failed automatic flush retains dirty metadata, retries successfully
+and reports its deferred error. Invalid option parsing is covered. These
+fixtures subsequently pass independent filesystem checking.
+
+Two fresh private-image Steam controls use the same audited ELF
+`f8bf2b38ef598aa995b50e1a7ee638804ba27bec567fa1698bbe3a0256535bcb`,
+the same source and launch configuration as above, and verified effective
+thresholds in the guest. The 4,096-operation treatment ran first, followed by
+the 256-operation control; no host preparations/builds overlapped their timed
+launches. This is one pair, not a repeatability study:
+
+- **256:** first Steam window in 66.600 seconds; 70 automatic allocation-sync
+  calls across the writable mounts, taking 0.690 seconds in their sync bodies;
+  111 vnode-fsync calls taking 0.744 seconds; 42 generic mount-sync calls taking
+  0.165 seconds. Total inner sync-body time: 1.599 seconds.
+- **4,096:** window in 65.562 seconds; no automatic allocation-sync calls;
+  explicit/general syncs drained the metadata before reaching that threshold.
+  There were 105 vnode-fsync calls taking 0.715 seconds and 42 generic
+  mount-sync calls taking 0.318 seconds. Total inner sync-body time: 1.033 seconds.
+
+The data disk reports 104,993 versus 98,679 writes and 168,347,136 versus
+153,121,792 written bytes. Application activity and explicit-fsync counts vary
+too; do not attribute that entire difference or the roughly one-second launch
+gap to the batching knob. In particular, these sync counters exclude ordinary
+synchronous writes and any canonical-page writeback before the filesystem sync
+hook. They do not partition the remaining application wall time.
+
+Both runs closed Steam normally, completed checked shutdown with the original
+launch owner exiting 0, and passed all six offline data/Nix/tmp filesystem
+checks. The native partial-write probe and independent offline SHA256 extraction
+match the same 8,388,731-byte Linux-host oracle above at both thresholds. No
+inner sync errors, device completion timeouts or periodic-writeback failures
+were observed. Entry/start contract audits and the production ext2 hosted suite
+pass. Private receipts are `batch-final-256-raw/measurement/`,
+`batch-4096-raw/measurement/` and `batching-comparison.json` beneath the existing
+review directory.
+
+**Decision:** retain the 256-operation default. Eliminating automatic allocation
+flushes removes less than a second of measured direct sync work here; this
+does not justify expanding the unsynced-metadata window by default. The option
+and counters remain available for experiments. A bounded general write-behind
+cache for ordinary file/inode/directory writes is the more substantial next
+avenue, requiring explicit durability, ordering, eviction, pressure and
+failed-completion handling rather than just a larger bitmap batch.
