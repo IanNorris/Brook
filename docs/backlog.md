@@ -1,14 +1,18 @@
 # Recovery and VM-control backlog
 
-### Priority: survive memory exhaustion with controlled victim selection (29 October 2026)
+### Controlled memory exhaustion: bounded recovery implemented (29 October 2026)
 
-Implementation and acceptance in progress on `wip/oom-recovery-20261029`; see
-[recovery implementation and current evidence](oom-recovery.md). The pager
-can reclaim only eligible memory and has finite RAM/disk backing; it does not
-implement a system-wide OOM killer. `PmmAllocPage` currently returns failure when
-its physical allocator is exhausted. Recovery policy must execute outside PMM,
-heap, address-space, scheduler and device locks, not synchronously kill from
-inside an allocator or interrupt handler.
+Implemented on `wip/oom-recovery-20261029`; see
+[recovery implementation, limits and acceptance evidence](oom-recovery.md).
+The resident coordinator reclaims first, refuses low-headroom app admission,
+selects one eligible private-memory consumer and uses ordinary asynchronous
+termination. Retained user-mode messages support simple/technical detail, with
+a saved Settings preference. Bounded private tests cover paging disabled and
+full compressed/disk backing, independent memory/audio survival and actual
+headroom recovery. The following requirements remain the long-term checklist;
+the linked evidence distinguishes hosted coverage, native gates and limitations.
+Multiprocess grouping, shared/GPU-heavy attribution, priority controls and broader
+real-device stalled-cleanup stress remain follow-ups.
 
 - Try bounded existing reclaim first. If a new app cannot be admitted, fail its
   launch transactionally and unwind its resources before sacrificing another

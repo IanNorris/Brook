@@ -71,7 +71,12 @@ void RefillEmergency() {
 bool Score(AddressSpaceState* space,uint64_t deadline,uint64_t* pages) {
     *pages=0;uint64_t cursor=0;
     for(unsigned batch=0;batch<4096;++batch) {
-        if(ApicTickCount()>=deadline || !KMutexTryLock(&space->mutation))return false;
+        bool locked=false;
+        for(unsigned attempt=0;attempt<8 && ApicTickCount()<deadline;++attempt) {
+            if(KMutexTryLock(&space->mutation)){locked=true;break;}
+            SchedulerSleepMs(1);
+        }
+        if(!locked)return false;
         const MappingRange* range=nullptr;unsigned visited=0;
         for(auto* node=space->ranges.head;node && visited<4096;node=node->next,++visited) {
             const auto& candidate=node->range;
@@ -114,7 +119,7 @@ Choice Select() {
     return best;
 }
 bool Commit(const Choice& choice,OomPolicy& policy) {
-    if(!choice.score.Eligible())return false;
+    if(choice.deferred || !choice.score.Eligible())return false;
     auto* process=SchedulerFindProcessReference(choice.score.pid);
     if(!process)return false;
     bool exists=false;
@@ -157,7 +162,10 @@ void Worker(void*) {
             ExecPageCacheReclaimIdleStep(256);
         } else if(action==OomPolicy::Action::SelectVictim) {
             const auto choice=Select();
-            if(!Commit(choice,policy)) {
+            // A busy larger address space must not cause a readily measured
+            // small app to be chosen from an incomplete scan. Retry the whole
+            // bounded scan; persistent uncertainty produces a no-victim event.
+            if(choice.deferred || !Commit(choice,policy)) {
                 if(PmmGetFreePageCount()>OomPolicy::LowPages) {
                     (void)policy.Tick(ApicTickCount(),PmmGetFreePageCount());
                     continue;
@@ -224,9 +232,9 @@ bool OomRecoveryAdmitApplication(const char* executable,uint32_t uid) {
     SystemMessagePublish(rejected);return false;
 }
 void OomRecoveryStartWorker() {
-    // Explicit opt-in until native recovery/notification acceptance passes.
+    // Enabled by default; explicit escape hatch for diagnostics.
     char option[8]{};const auto n=FwCfgReadFile("opt/oom-recovery",option,sizeof(option));
-    if(n!=2 || option[0]!='o' || option[1]!='n')return;
+    if(n==3 && option[0]=='o' && option[1]=='f' && option[2]=='f')return;
     RefillEmergency();
     auto* worker=KernelThreadCreate("oom_recovery",Worker,nullptr,1);
     if(!worker){ReleaseEmergency();SerialPuts("oom: recovery worker unavailable\n");return;}

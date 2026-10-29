@@ -24,19 +24,28 @@ inline bool OomPreferCandidate(const OomCandidate& candidate,const OomCandidate&
 class OomPolicy {
 public:
     enum class Action { None, Reclaim, SelectVictim, CleanupComplete, CleanupStalled };
-    enum class Phase { Idle, Reclaiming, Selecting, Waiting, Stalled, Cooldown };
+    enum class Phase { Idle, Reclaiming, Selecting, Waiting, Stalled, Cooldown, Draining };
     static constexpr uint64_t LowPages=8*1024*1024/4096;
     static constexpr uint64_t HighPages=32*1024*1024/4096;
-    static constexpr uint64_t ReclaimMs=200, CleanupMs=10000, CooldownMs=5000, NoVictimMs=30000;
+    static constexpr uint64_t ReclaimMs=200, CleanupMs=10000, DrainMs=200, CooldownMs=5000, NoVictimMs=30000;
     Action Tick(uint64_t now,uint64_t freePages,bool victimGone=false) {
         if(now<lastNow_)now=lastNow_; // do not underflow elapsed time on clock reversal
         lastNow_=now;
         if(phase_==Phase::Waiting || phase_==Phase::Stalled) {
             // Headroom alone cannot prove victim cleanup. No second victim is
             // selected while the first's protected operations remain live.
-            if(victimGone){Enter(Phase::Cooldown,now);return Action::CleanupComplete;}
-            if(phase_==Phase::Waiting && Elapsed(now,CleanupMs)) {
+            if(victimGone)Enter(Phase::Draining,now);
+            else if(phase_==Phase::Waiting && Elapsed(now,CleanupMs)) {
                 Enter(Phase::Stalled,now);return Action::CleanupStalled;
+            }
+            if(phase_!=Phase::Draining)return Action::None;
+        }
+        if(phase_==Phase::Draining) {
+            // Destruction can precede the normal PMM quarantine drain. Give it
+            // a bounded opportunity; low headroom alone does not prove failure
+            // because another allocator may consume newly returned pages.
+            if(freePages>=HighPages || Elapsed(now,DrainMs)) {
+                Enter(Phase::Cooldown,now);return Action::CleanupComplete;
             }
             return Action::None;
         }

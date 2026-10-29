@@ -67,7 +67,7 @@ static int present(const BrookSystemMessage *record) {
     gtk_container_set_border_width(GTK_CONTAINER(window),20);
     GtkWidget *box=gtk_box_new(GTK_ORIENTATION_VERTICAL,16);gtk_container_add(GTK_CONTAINER(window),box);
     simple_label=gtk_label_new(safe_simple);gtk_label_set_line_wrap(GTK_LABEL(simple_label),TRUE);
-    gtk_label_set_xalign(GTK_LABEL(simple_label),0);gtk_label_set_selectable(GTK_LABEL(simple_label),TRUE);
+    gtk_label_set_xalign(GTK_LABEL(simple_label),0);gtk_label_set_selectable(GTK_LABEL(simple_label),FALSE);
     gtk_box_pack_start(GTK_BOX(box),simple_label,FALSE,FALSE,0);
     GtkWidget *details=gtk_expander_new("Technical details");
     GtkWidget *scroll=gtk_scrolled_window_new(NULL,NULL);

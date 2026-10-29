@@ -26,7 +26,7 @@ int main() {
     assert(policy.Tick(10201,0)==A::CleanupStalled);
     for(uint64_t t=10202;t<100000;t+=73)assert(policy.Tick(t,0)==A::None);
     assert(policy.CurrentPhase()==P::Stalled);
-    assert(policy.Tick(100000,0,true)==A::CleanupComplete);
+    assert(policy.Tick(100000,OomPolicy::HighPages,true)==A::CleanupComplete);
     assert(policy.Tick(100001,0)==A::None);
     assert(policy.Tick(105000,0)==A::Reclaim);
     assert(policy.Tick(105200,0)==A::SelectVictim);
@@ -37,7 +37,18 @@ int main() {
     assert(policy.Tick(1,0)==A::Reclaim);
     assert(policy.Tick(135400,0)==A::SelectVictim);
     assert(policy.CommitVictim(135400,0));
-    assert(policy.Tick(135401,1,true)==A::CleanupComplete);
+    assert(policy.Tick(135401,1,true)==A::None);
+    assert(policy.CurrentPhase()==P::Draining);
+    assert(policy.Tick(135600,1)==A::None);
+    assert(!policy.CommitVictim(135600,0));
+    assert(policy.Tick(135601,1)==A::CleanupComplete); // no increase: still report actual snapshot
+    OomPolicy drained;
+    assert(drained.Tick(0,0)==A::Reclaim);
+    assert(drained.Tick(200,0)==A::SelectVictim && drained.CommitVictim(200,0));
+    assert(drained.Tick(201,0,true)==A::None);
+    assert(drained.Tick(251,OomPolicy::HighPages)==A::CleanupComplete); // delayed return
+    assert(drained.Tick(252,0)==A::None); // subsequently consumed: keep cooldown
+
     OomPolicy reclaimed;
     assert(reclaimed.Tick(5,0)==A::Reclaim);
     assert(reclaimed.Tick(6,OomPolicy::HighPages)==A::None);
