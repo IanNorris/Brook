@@ -1,5 +1,8 @@
 # Paging and compression — staged implementation
 
+Current bounded acceptance: [29 October final audit](paging-compression-acceptance-20261029.md).
+The sections below retain chronological checkpoints and their original limits.
+
 Branch: `wip/paging-compression-20261028`. Goal: reduce memory-pressure failures
 and improve mixed-workload throughput without trading them for corrupt mappings
 or unbounded reclaim stalls. This records an opt-in experimental implementation;

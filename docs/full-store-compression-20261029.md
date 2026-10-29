@@ -329,3 +329,27 @@ clean application-shutdown acceptance result. See
 Accordingly, the throughput and staged responsiveness gates pass, but the
 final stability control remains incomplete. No overall goal completion is
 claimed at this checkpoint.
+
+## Final stability gate
+
+The diagnosed socket ticket-lock reuse deadlock is repaired and validated in
+`docs/socket-slot-lifetime-20261029.md`. Fresh raw and LZ4 store controls using
+the repaired kernel each pass 64 concurrent native loopback close/reuse sessions,
+authenticated Steam rendering, normal client exit, checked OS sync/shutdown,
+QEMU owner exit 0 and three clean read-only offline filesystem checks. Original
+source disks and the failed control remain untouched. Terra finds no obvious
+corruption in either capture; LZ4's featured carousel is blank at capture time,
+so complete asset loading is unverified.
+
+Window observations are 97.51 s raw and 89.25 s LZ4 after the same native
+loopback test. Guest first-desktop endpoints are 5,192/5,158 ms; host-observed
+launch-to-desktop endpoints are 11.329/11.123 s. These controls verify stability,
+not cold application performance: the native check has already loaded Python.
+Together with prior controls, there is still no demonstrated repeatable Steam
+startup or boot improvement. The retained full-store pressure and animation
+measurements establish the throughput/responsiveness result independently.
+
+The bounded paging/compression acceptance is now complete. Shared-address-space
+general paging, writable filesystem compression, compressed boot payloads and
+parallel driver initialization remain separate future projects. Earlier pending
+sections record the order of investigation rather than the final disposition.

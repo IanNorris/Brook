@@ -128,3 +128,20 @@ owner exits 0. Offline read-only checks of its data/Nix/tmp filesystems all exit
 matching LZ4-store control is still pending. Reusable native stress is
 `scripts/workloads/socket_close_reuse_check.py`; it uses only bounded loopback
 connections and exact bidirectional payload checks.
+
+## Final native result
+
+The matching `socket-fixed-lz4` control also passes all 64 concurrent native
+TCP close/reuse sessions, authenticated Store visual review, normal Steam
+shutdown (job wait status 0), checked guest sync/shutdown and original QEMU
+owner exit 0. Its window is observed at 89.25 s; the featured carousel is blank
+at the saved instant, so complete network asset loading is not claimed.
+Read-only offline data/Nix/tmp filesystem checks all exit 0 for both repaired
+controls (six checks total). Neither control needs force stop or disk repair.
+Both use the exact kernel SHA-256
+`d3c035c9913e1338cda0b1804f8c1a33b43a9cf388e40bcdf365effe360cc8d4`,
+module ABI 57 and fresh reflinks of the untouched original signed-in images.
+
+The original failed control remains preserved with its failed cleanup/fsck
+receipts. The new passes close this bounded repair gate; they are not a proof
+that every unrelated network data race or socket/API limitation is resolved.
