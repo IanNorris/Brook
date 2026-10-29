@@ -14,7 +14,7 @@
 namespace brook {
 // Source metadata and leaves are stable under AS.mutation. Destination is not
 // published to the scheduler until the operation's parent shootdown completes.
-static bool CloneLeaves(MappingTransaction& operation, AddressSpaceState* destination, uint16_t pid) {
+static bool CloneLeaves(MappingTransaction& operation, AddressSpaceState* destination, uint16_t pid,bool failAfterCow) {
     auto* source = operation.Space();
     constexpr uint64_t physicalMask = 0x000FFFFFFFFFF000ULL;
     auto* pml4 = reinterpret_cast<uint64_t*>(PhysToVirt(source->pageTable.pml4).raw());
@@ -63,6 +63,7 @@ static bool CloneLeaves(MappingTransaction& operation, AddressSpaceState* destin
                         auto* childLeaf=&childTable[i1];
                         VmmForkCommitCowShare(&pt[i1],childLeaf,*childLeaf,physical);
                         PmmUnrefPage(physical);
+                        if(failAfterCow)return false;
                     }
                 }
             }
@@ -74,20 +75,37 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
     if (!actor || !source || !destination || source->kernel || destination->kernel ||
         source==destination || destination->ranges.head) return false;
     for (;;) {
+        PageableMemoryFork paging(actor,source);
         MappingTransaction operation(actor,source);
         if(!operation.Lock())return false;
-        if(source->pagingAdmission.Exclusive())return false;
         uint64_t count=0, generation=source->generation;
         for (auto* node=source->ranges.head; node; node=node->next) ++count;
+        uint64_t regions=0,pages=0;
+        if(!PageableMemoryFork::BudgetLocked(source->ranges,regions,pages))return false;
         operation.Unlock();
         MappingRangePlan plan;
-        if (!plan.Prepare(count)) return false;
+        if (!plan.Prepare(count) || !paging.Prepare(regions,pages)) return false;
         if(!operation.Lock())return false;
-        if(source->pagingAdmission.Exclusive())return false;
         if (source->generation!=generation) { operation.Unlock(); continue; }
-        for (auto* node=source->ranges.head; node; node=node->next)
-            if (!plan.Insert(destination->ranges,node->range))
+        if(regions) {
+            if(!paging.CaptureLocked())return false;
+            operation.Unlock();
+            if(!paging.PrepareUnlocked(pid,destination))return false;
+            if(!operation.Lock())return false;
+            if(source->generation!=generation || !paging.ValidateLocked()){operation.Unlock();continue;}
+        }
+        if(source->pagingAdmission.Exclusive() && !destination->pagingAdmission.ClaimExclusive())return false;
+        for (auto* node=source->ranges.head; node; node=node->next) {
+            MappingRange range=node->range;
+            if(range.kind==MappingKind::Pageable) {
+                range.backing=paging.ChildBackingFor(range.backing);
+                if(!range.backing)KernelPanic("paging: missing prepared fork backing");
+            }
+            if (!plan.Insert(destination->ranges,range))
                 KernelPanic("mapping: preallocated fork metadata failed");
+        }
+        destination->pagingReclaimEnabled=source->pagingReclaimEnabled;
+        destination->pagingResidentTarget=source->pagingResidentTarget;
         destination->programBreak=source->programBreak;
         destination->programBreakLow=source->programBreakLow;
         destination->programBreakHigh=source->programBreakHigh;
@@ -96,7 +114,7 @@ bool UserMappingClone(Process* actor, AddressSpaceState* source, AddressSpaceSta
         destination->argumentEnd=source->argumentEnd;
         destination->membarrierPrivateRegistered=__atomic_load_n(
             &source->membarrierPrivateRegistered,__ATOMIC_ACQUIRE);
-        bool copied=CloneLeaves(operation,destination,pid);
+        bool copied=CloneLeaves(operation,destination,pid,paging.FailAfterCow());
         operation.Unlock();
         return copied;
     }

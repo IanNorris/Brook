@@ -987,3 +987,72 @@ fsck-results.json,fsck-partition-*.log} under the build evidence directory.
 Ordinary anonymous memory enrollment, remap, independent fork metadata and
 shared-AS/kernel-access exclusion remain separate prerequisites, not inferred
 from these private-mapping fixtures.
+
+## Fork independent pager state without materializing stored pages
+
+Fork now clones an experimental Pageable AS instead of rejecting it. CLONE_VM
+still rejects the exclusive AS: each mutable Region belongs to exactly one AS.
+Child fragments substitute one prepared child backing per source Region,
+deduplicated through a bounded allocated hash index. Backing-relative offsets,
+permissions and holes are preserved. Child accounting marks start clear.
+
+An outer preparation object owns cancellation protection, the source AS,
+source backing pins, entry snapshots, Recovery pins and prepared child backings
+through final transaction cleanup. Budgeting/capture runs under source mutation;
+allocation, immutable Stored-token retention and independent Recovery-frame
+copies run outside it. No store mutex is acquired while holding AS mutation.
+Final commit rechecks topology generation and every entry's state, token and
+Recovery identity, because fault publication need not change topology.
+Resident/hidden resident leaves use existing private COW cloning and parent TLB
+acknowledgement. Stored/Zero entries need no page-in. Child Recovery frames are
+copied rather than shared writable. Reclaim enablement/soft target are inherited;
+resident counts remain per-AS mapped-frame counts, not unique physical RAM.
+Before publication, the child also prepares page-table paths for each original
+Region, including nonresident pages. Copying populated leaves alone would leave
+distant Stored/Zero faults dependent on fresh table allocation under OOM.
+The original base derives from fragment begin minus backing offset; current
+pager remap remains excluded. Empty paths covering holes grant no access: no
+mapping range or leaf is created there. Supporting moved fragments later must
+replace this base invariant with preparation of their actual virtual spans.
+
+Preparation rollback releases only acquired ownership. Failure after partial
+leaf cloning preserves normal destination-AS teardown and parent COW shootdown;
+the parent remains usable through ordinary COW recovery. Root-only experimental
+control 20 selects a one-shot failure scoped to the source AS identity: stages
+1..5 stop after capture, first Stored retain, first Recovery copy, complete
+preparation, or first COW share respectively. Zero clears the control. These are
+deterministic cleanup probes, not an exhaustive allocator-failure enumeration.
+
+The fork fixture checks all five failure stages and eventual zero slots after
+failed-child teardown drains. It verifies mixed fragments with hidden, Stored,
+Resident, Recovery and Zero pages; unchanged backing-I/O counters at fork;
+concurrent parent/child writes and repeated pageout/refault; both unmap/exit
+orders; parent COW recovery; exec resetting admission so normal pthread creation
+works; and continuing CLONE_VM exclusion for the original exclusive AS. A sparse
+16 MiB case has only page zero populated before fork; after the parent unmaps,
+the child verifies reserve-backed zero faults in distant 2 MiB spans and cleanly
+retires their stored content.
+It uses the raw fork syscall to isolate cloning: libc signal-mask bookkeeping
+can still hit the conservative eager syscall-entry barrier.
+
+Final fresh raw/compressed VMs pass 31 native regression jobs, including the fork
+fixture before/after 256 MiB pressure and independent parent/child discard
+across two Regions split into 1280 nodes.
+Two focused raw/compressed runs additionally verify that a forked descendant
+receives SIGSEGV on an original-region hole despite the empty prepared paths.
+Eleven relevant host tests and compiled entry/startup mutation audits pass.
+Three normal-user compile/link/execute passes retain the unchanged 96 MiB
+ordinary-memory holder and pass; the holder verifies its bytes and releases.
+All five acceptance VMs sync/stop and the harnesses verify original owner exit
+0. The compiler VM's exported ext2 data/Nix/tmp partitions pass read-only fsck.
+Source disks/logs are retained; disposable filesystem exports can be removed.
+
+Evidence: paging-fork/{metadata.json,native-final.log,native-final-raw/,
+native-final-ram/,native-hole.log,native-hole-raw/,native-hole-ram/,
+compiler-accepted-results.json,compiler-accepted-0-lz4-96/,
+fsck-results.json,fsck-partition-*.log}. Earlier intermediate runs are retained
+but are not counted as final acceptance. Astra reviewed
+ownership, failure cleanup and lock ordering without finding a blocker. General
+anonymous enrollment, remap and shared-AS uaccess exclusion remain open. COW
+resident victims still skip eviction until independently writable/private; this
+checkpoint does not claim arbitrary shared-frame reclaim or an app speedup.

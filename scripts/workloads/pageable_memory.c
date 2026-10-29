@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -94,9 +95,13 @@ int main(int argc,char** argv) {
     // under an unknown handler lock. clock_gettime writes into this page.
     assert(syscall(SYS_clock_gettime,1,p)==0);assert(control(2,0)==baseline);
     for(unsigned j=0;j<4096;++j)p[j]=pattern(0,j);
-    // Fork is rejected for the entire opted-in AS (until exec).
-    assert(syscall(SYS_fork)==-1);
+    // Fork clones pager metadata; CLONE_VM remains excluded until exec.
+    long child=syscall(SYS_fork);assert(child>=0);
+    if(!child)_exit(0);
+    int child_status;assert(waitpid(child,&child_status,0)==child && WIFEXITED(child_status) && WEXITSTATUS(child_status)==0);
     pthread_t thread;assert(pthread_create(&thread,0,should_not_start,0)!=0);
+    // Resolve the parent COW leaf before exercising single-owner eviction.
+    p[0]=pattern(0,0);
     assert(control(1,address)==4096);
     assert(munmap(p,bytes)==0);assert(control(2,0)==baseline);
     long alternate=control(0,16384);assert(alternate>0);

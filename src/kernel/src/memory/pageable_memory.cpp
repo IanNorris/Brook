@@ -136,6 +136,8 @@ void AttachRamCompression() {
 }
 // Root-only one-shot failure controls for the explicitly boot-enabled test.
 unsigned injectedFailure=0;
+unsigned forkFailure=0;
+uint64_t forkFailureSpace=0;
 enum class State : uint8_t { Resident, Evicting, Stored, Recovery, Zero, Discarded };
 struct Entry { uint64_t slot;PhysicalAddress recovery;State state; };
 struct Region { uint64_t pages,heldFrames;bool accountingVisited;Entry entries[1]; };
@@ -346,6 +348,130 @@ int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false,Phy
 }
 
 }
+struct PageableMemoryFork::Record {
+    MappingBacking* parent;
+    MappingBacking* child;
+    Entry* snapshot;
+    uint64_t pages,captured,virtualBase;
+};
+PageableMemoryFork::PageableMemoryFork(Process* actor,AddressSpaceState* source):actor_(actor),source_(source) {
+    SchedulerKernelRegionEnter(actor_);AddressSpaceRef(source_);
+    if(ready && source_->pagingAdmission.Exclusive()) {
+        StoreGuard guard;
+        if(forkFailureSpace==source_->identity){failure_=forkFailure;forkFailure=0;forkFailureSpace=0;}
+    }
+}
+bool PageableMemoryFork::BudgetLocked(const MappingRangeTable& table,uint64_t& regions,uint64_t& pages) {
+    regions=pages=0;bool valid=true;
+    for(auto* node=table.head;node;node=node->next) {
+        const auto& range=node->range;
+        if(range.kind!=MappingKind::Pageable)continue;
+        if(!range.backing || range.backing->release!=ReleaseRegion){valid=false;continue;}
+        auto* region=static_cast<Region*>(range.backing->object);
+        if(!region->accountingVisited){region->accountingVisited=true;++regions;pages+=region->pages;}
+    }
+    for(auto* node=table.head;node;node=node->next)
+        if(node->range.kind==MappingKind::Pageable && node->range.backing && node->range.backing->release==ReleaseRegion)
+            static_cast<Region*>(node->range.backing->object)->accountingVisited=false;
+    return valid;
+}
+bool PageableMemoryFork::Prepare(uint64_t regions,uint64_t pages) {
+    if(!regions)return pages==0;
+    if(regions>~uint64_t{0}/(2*sizeof(uint64_t)) || regions>~uint64_t{0}/sizeof(Record) ||
+       pages>~uint64_t{0}/sizeof(Entry))return false;
+    indexCapacity_=1;while(indexCapacity_<regions*2)indexCapacity_*=2;
+    if(indexCapacity_>~uint64_t{0}/sizeof(uint64_t))return false;
+    records_=static_cast<Record*>(kmalloc(regions*sizeof(Record)));
+    snapshots_=kmalloc(pages*sizeof(Entry));index_=static_cast<uint64_t*>(kmalloc(indexCapacity_*sizeof(uint64_t)));
+    if(!records_ || !snapshots_ || !index_)return false;
+    memset(records_,0,regions*sizeof(Record));memset(index_,0,indexCapacity_*sizeof(uint64_t));
+    capacity_=regions;pageCapacity_=pages;return true;
+}
+PageableMemoryFork::Record* PageableMemoryFork::Find(MappingBacking* backing) const {
+    if(!indexCapacity_ || !index_)return nullptr;
+    uint64_t at=((reinterpret_cast<uint64_t>(backing)>>4)*0x9e3779b97f4a7c15ULL)&(indexCapacity_-1);
+    for(uint64_t visited=0;visited<indexCapacity_;++visited,at=(at+1)&(indexCapacity_-1)) {
+        const auto value=index_[at];if(!value)return nullptr;
+        if(records_[value-1].parent==backing)return &records_[value-1];
+    }
+    return nullptr;
+}
+bool PageableMemoryFork::CaptureLocked() {
+    for(auto* node=source_->ranges.head;node;node=node->next) {
+        const auto& range=node->range;if(range.kind!=MappingKind::Pageable)continue;
+        if(!source_->pagingAdmission.Exclusive() || !range.backing || range.backing->release!=ReleaseRegion)return false;
+        if(range.offset>range.begin)return false;
+        if(auto* existing=Find(range.backing)) {
+            if(existing->virtualBase!=range.begin-range.offset)return false;
+            continue;
+        }
+        auto* region=static_cast<Region*>(range.backing->object);
+        if(count_==capacity_ || region->pages>pageCapacity_-pageCount_)return false;
+        auto& record=records_[count_];record.parent=range.backing;MappingBackingRef(record.parent);
+        record.virtualBase=range.begin-range.offset;
+        record.pages=region->pages;record.snapshot=static_cast<Entry*>(snapshots_)+pageCount_;pageCount_+=record.pages;
+        uint64_t at=((reinterpret_cast<uint64_t>(range.backing)>>4)*0x9e3779b97f4a7c15ULL)&(indexCapacity_-1);
+        while(index_[at])at=(at+1)&(indexCapacity_-1);index_[at]=++count_;
+        for(uint64_t i=0;i<record.pages;++i) {
+            const auto entry=region->entries[i];if(entry.state==State::Evicting)return false;
+            record.snapshot[i]=entry;++record.captured;
+            if(entry.recovery)PmmRefPage(entry.recovery);
+        }
+    }
+    return failure_!=1;
+}
+bool PageableMemoryFork::PrepareUnlocked(uint16_t childPid,AddressSpaceState* destination) {
+    for(uint64_t n=0;n<count_;++n) {
+        auto& record=records_[n];
+        if(!record.pages || record.pages>(~uint64_t{0}-sizeof(Region))/sizeof(Entry))return false;
+        // CloneLeaves copies backed leaves only. Prepare paths for Stored/Zero
+        // pages too, before publication: their reserve-backed faults must not
+        // depend on a fresh page-table allocation under memory exhaustion.
+        constexpr uint64_t userEnd=0x0000800000000000ULL;
+        if(record.pages>userEnd/4096 || record.virtualBase>=userEnd || record.pages*4096>userEnd-record.virtualBase ||
+           !VmmPrepareRange(destination->pageTable,record.virtualBase,record.virtualBase+record.pages*4096))return false;
+        const auto bytes=sizeof(Region)+(record.pages-1)*sizeof(Entry);
+        auto* child=static_cast<Region*>(kmalloc(bytes));if(!child)return false;
+        memset(child,0,bytes);child->pages=record.pages;
+        record.child=MappingBackingCreate(child,ReleaseRegion);if(!record.child){kfree(child);return false;}
+        for(uint64_t i=0;i<record.pages;++i) {
+            const auto& original=record.snapshot[i];auto& entry=child->entries[i];entry.state=original.state;
+            if(original.state==State::Stored) {
+                {StoreGuard guard;if(!store.Retain(original.slot))return false;entry.slot=original.slot;}
+                if(failure_==2)return false;
+            } else if(original.state==State::Recovery) {
+                auto physical=PmmAllocPage(MemTag::User,childPid);if(!physical)return false;
+                memcpy(reinterpret_cast<void*>(PhysToVirt(physical).raw()),
+                    reinterpret_cast<const void*>(PhysToVirt(original.recovery).raw()),4096);
+                entry.recovery=physical;++child->heldFrames;if(failure_==3)return false;
+            } else if(original.state==State::Resident)++child->heldFrames;
+            else if(original.state!=State::Zero && original.state!=State::Discarded)return false;
+        }
+    }
+    return failure_!=4;
+}
+bool PageableMemoryFork::ValidateLocked() const {
+    for(uint64_t n=0;n<count_;++n) {
+        const auto& record=records_[n];auto* region=static_cast<Region*>(record.parent->object);
+        if(region->pages!=record.pages)return false;
+        for(uint64_t i=0;i<record.pages;++i) {
+            const auto& current=region->entries[i];const auto& original=record.snapshot[i];
+            if(current.state!=original.state || current.slot!=original.slot || current.recovery!=original.recovery)return false;
+        }
+    }
+    return true;
+}
+MappingBacking* PageableMemoryFork::ChildBackingFor(MappingBacking* backing) const {
+    auto* record=Find(backing);return record?record->child:nullptr;
+}
+PageableMemoryFork::~PageableMemoryFork() {
+    for(uint64_t n=0;n<count_;++n) {
+        auto& record=records_[n];
+        for(uint64_t i=0;i<record.captured;++i)if(record.snapshot[i].recovery)PmmUnrefPage(record.snapshot[i].recovery);
+        MappingBackingUnref(record.child);MappingBackingUnref(record.parent);
+    }
+    kfree(index_);kfree(snapshots_);kfree(records_);AddressSpaceUnref(source_);SchedulerKernelRegionLeave(actor_);
+}
 struct PageableMemoryRetirement::Page {
     MappingBacking* backing;
     Entry* entry;
@@ -459,6 +585,7 @@ void PageableMemoryStartReserveWorker() {
 int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) {
     if(!ready)return -95;
     if(!actor || !ProcessCapable(actor,nullptr,CapSysAdmin))return -1;
+    if(operation==20 && value<=5){StoreGuard guard;forkFailure=value;forkFailureSpace=value?actor->addressSpace->identity:0;return 0;}
     if(operation==0)return Map(actor,value);
     if(operation==1)return PageOut(actor,value);
     if(operation==2){StoreGuard guard;return store.Stats().stored;}

@@ -5,6 +5,34 @@ namespace brook {
 struct Process;
 struct AddressSpaceState;
 struct MappingRangeTable;
+struct MappingBacking;
+// Outer fork lifetime: source snapshots/pins and child storage outlive the
+// final transaction and its parent COW shootdown. No store lock is taken by
+// the Locked methods; token retention and Recovery copies happen unlocked.
+class PageableMemoryFork {
+public:
+    PageableMemoryFork(Process*,AddressSpaceState*);
+    ~PageableMemoryFork();
+    PageableMemoryFork(const PageableMemoryFork&) = delete;
+    PageableMemoryFork& operator=(const PageableMemoryFork&) = delete;
+    static bool BudgetLocked(const MappingRangeTable&,uint64_t& regions,uint64_t& pages);
+    bool Prepare(uint64_t regions,uint64_t pages);
+    bool CaptureLocked();
+    bool PrepareUnlocked(uint16_t childPid,AddressSpaceState* destination);
+    bool ValidateLocked() const;
+    MappingBacking* ChildBackingFor(MappingBacking*) const;
+    bool FailAfterCow() const{return failure_==5;}
+private:
+    struct Record;
+    Record* Find(MappingBacking*) const;
+    Record* records_=nullptr;
+    void* snapshots_=nullptr;
+    uint64_t* index_=nullptr;
+    uint64_t capacity_=0,count_=0,pageCapacity_=0,pageCount_=0,indexCapacity_=0;
+    Process* actor_;
+    AddressSpaceState* source_;
+    unsigned failure_=0;
+};
 // Declare before the mapping transaction. Capture/Commit run under AS mutation;
 // destruction releases captured slots/recovery refs only after transaction TLB
 // retirement. Preparation is fallible and must precede the mutation gate.
