@@ -7,6 +7,7 @@
 #include <fstream>
 #include <functional>
 #include <vector>
+#include <sys/stat.h>
 #include "../../kernel/src/fs/compressed_image.h"
 #include "../../third_party/lz4/lz4.h"
 using namespace brook;
@@ -89,7 +90,54 @@ static void ScalarCodecBoundaries() {
         }
     }
 }
+// File-backed verification for multi-GiB images: resident storage is the
+// bounded index, node state and two blocks, never the full image or file.
+struct StreamDisk {
+    std::FILE* file=nullptr;uint64_t bytes=0;
+    ~StreamDisk(){if(file)std::fclose(file);}
+    static int Read(void* p,uint64_t at,void* out,uint64_t n) {
+        auto& d=*static_cast<StreamDisk*>(p);
+        if(at>d.bytes || n>d.bytes-at || n>0x7fffffff || fseeko(d.file,static_cast<off_t>(at),SEEK_SET))return -5;
+        return static_cast<int>(std::fread(out,1,n,d.file));
+    }
+};
+static int streamVerify(const char* path) {
+    StreamDisk disk;disk.file=std::fopen(path,"rb");if(!disk.file)return 2;
+    struct stat info{};
+    if(fstat(fileno(disk.file),&info) || !S_ISREG(info.st_mode) || info.st_size<0)return 2;
+    disk.bytes=info.st_size;CompressedImageHeader h{};
+    if(StreamDisk::Read(&disk,0,&h,sizeof(h))!=sizeof(h) || !CompressedImageHeaderValid(h,disk.bytes))return 2;
+    std::vector<uint8_t> index(h.dataOffset-sizeof(h));
+    std::vector<CompressedImageNodeState> states(h.inodeCount);
+    std::array<uint8_t,65536> encoded{},decoded{},output{};CompressedImage image;
+    if(StreamDisk::Read(&disk,sizeof(h),index.data(),index.size())!=static_cast<int>(index.size()) ||
+       !image.Initialize(h,disk.bytes,index.data(),index.size(),states.data(),states.size(),{&disk,StreamDisk::Read,Decode},encoded.data(),decoded.data()))return 2;
+    std::puts("[");bool first=true;
+    for(uint32_t id=0;id<h.inodeCount;++id) {
+        const auto* node=image.Inode(id);if(node->kind!=CompressedImageKind::File)continue;
+        uint64_t at=0,hash=14695981039346656037ULL;
+        while(at<node->size) {
+            uint32_t amount=std::min<uint64_t>(output.size(),node->size-at);
+            if(image.Read(id,at,output.data(),amount)!=static_cast<int>(amount))return 3;
+            for(uint32_t i=0;i<amount;++i)hash=(hash^output[i])*1099511628211ULL;
+            at+=amount;
+        }
+        std::printf("%s{\"inode\":%u,\"size\":%llu,\"checksum\":%llu}",first?"":",\n",id,(unsigned long long)node->size,(unsigned long long)hash);first=false;
+    }
+    std::puts("\n]");return 0;
+}
+static void indexBudgetBoundaries() {
+    auto d=fixture();auto h=header(d);
+    h.dataOffset=COMPRESSED_IMAGE_INDEX_LIMIT;h.stringBytes=h.dataOffset-h.stringOffset;
+    h.imageBytes=h.dataOffset+4096;h.headerChecksum=CompressedImageChecksum(&h,136);
+    assert(CompressedImageHeaderValid(h,h.imageBytes));
+    h.dataOffset+=4096;h.stringBytes+=4096;h.imageBytes+=4096;
+    h.headerChecksum=CompressedImageChecksum(&h,136);
+    assert(!CompressedImageHeaderValid(h,h.imageBytes));
+}
 int main(int argc,char** argv) {
+    if(argc==3 && !std::strcmp(argv[1],"--streaming"))return streamVerify(argv[2]);
+    indexBudgetBoundaries();
     if(argc==2) {
         Disk d;std::ifstream stream(argv[1],std::ios::binary);d.bytes.assign(std::istreambuf_iterator<char>(stream),{});
         Reader r;if(!r.Init(d)){std::fputs("invalid compressed image\n",stderr);return 2;}

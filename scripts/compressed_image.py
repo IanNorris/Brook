@@ -19,14 +19,28 @@ HEADER = struct.Struct('<8sIIQQII9Q16sQQ16s')
 INODE = struct.Struct('<IIIIQQQQIIq')
 DIRENT = struct.Struct('<IIIHH')
 BLOCK = struct.Struct('<QIIIIQ')
-MAGIC, CHUNK, INDEX_LIMIT = b'BRKPACK1', 65536, 16 * 1024 * 1024
+MAGIC, CHUNK, INDEX_LIMIT = b'BRKPACK1', 65536, 32 * 1024 * 1024
 DIR, FILE, LINK = 1, 2, 3
 
-def checksum(data):
+def checksum_reference(data):
     value = 14695981039346656037
     for byte in data:
         value = ((value ^ byte) * 1099511628211) & ((1 << 64) - 1)
     return value
+
+_checksum_library = os.environ.get('BROOK_IMAGE_CHECKSUM_LIBRARY')
+_native_checksum = None
+if _checksum_library:
+    _checksum_handle = ctypes.CDLL(_checksum_library)
+    _native_checksum = _checksum_handle.brook_image_checksum
+    _native_checksum.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    _native_checksum.restype = ctypes.c_uint64
+
+def checksum(data):
+    if _native_checksum is not None:
+        payload = bytes(data)
+        return _native_checksum(payload, len(payload))
+    return checksum_reference(data)
 
 def align(value):
     return (value + 4095) & ~4095
@@ -37,7 +51,7 @@ def require(condition, message):
 
 class Codec:
     def __init__(self, path=None):
-        self.lib = ctypes.CDLL(path or ctypes.util.find_library('lz4') or 'liblz4.so.1')
+        self.lib = ctypes.CDLL(path or os.environ.get('BROOK_IMAGE_LZ4_LIBRARY') or ctypes.util.find_library('lz4') or 'liblz4.so.1')
         self.lib.LZ4_versionNumber.restype = ctypes.c_int
         require(self.lib.LZ4_versionNumber() == 11000, 'LZ4 1.10.0 required for this builder/reader')
         self.lib.LZ4_compressBound.argtypes = [ctypes.c_int]
@@ -225,7 +239,7 @@ class Image:
                     plain_bytes=sum(n.size for n in self.nodes if n.kind == FILE),
                     stored_bytes=sum(b[1] for b in self.blocks), integrity='FNV-1a64 corruption checks; not authentication')
 
-def build(source, destination, library=None, compress=True, paths=None):
+def build(source, destination, library=None, compress=True, paths=None, metadata=None):
     destination = Path(destination)
     require(not destination.exists(), 'refusing to replace existing image')
     selected = None
@@ -237,20 +251,47 @@ def build(source, destination, library=None, compress=True, paths=None):
             require(path.is_absolute() and path.parent == root_path, 'selected paths must be immediate children of the source root')
             selected.add(os.fsencode(path.name))
         require(selected, 'empty path selection')
+    if metadata is not None:
+        require(paths is None, 'metadata manifest requires the complete exported namespace')
+        require(metadata.get('export_format') == 'brook-ext2-source-metadata-v1' and isinstance(metadata.get('nodes'),dict), 'invalid source metadata manifest')
+    metadata_used = set()
+    source_to_host, host_to_source = {}, {}
+    def source_record(st,kind,path):
+        if metadata is None:
+            return None
+        key = os.fsdecode(path)
+        require(key in metadata['nodes'], 'source entry missing from metadata')
+        row = metadata['nodes'][key]
+        require(isinstance(row,dict), 'invalid source metadata record')
+        require(all(isinstance(row.get(k),int) and not isinstance(row[k],bool) for k in ['ino','mode','uid','gid','size','mtime']), 'invalid source metadata fields')
+        require(0 < row['ino'] <= 0xffffffff and 0 <= row['mode'] <= 0o177777 and 0 <= row['size'] < (1<<63), 'source inode metadata range')
+        expected = DIR if stat.S_ISDIR(row['mode']) else FILE if stat.S_ISREG(row['mode']) else LINK if stat.S_ISLNK(row['mode']) else 0
+        require(expected == kind, 'source metadata type mismatch')
+        require(0 <= row['uid'] <= 0xffffffff and 0 <= row['gid'] <= 0xffffffff and -(1<<63) <= row['mtime'] < (1<<63), 'source metadata range')
+        require(kind == DIR or row['size'] == st.st_size, 'source metadata size mismatch')
+        if kind == FILE:
+            identity = (st.st_dev,st.st_ino)
+            require(source_to_host.setdefault(row['ino'],identity)==identity and host_to_source.setdefault(identity,row['ino'])==row['ino'], 'exported hardlink topology differs from source')
+            require(isinstance(row.get('sha256'),str) and len(row['sha256'])==64 and all(c in '0123456789abcdef' for c in row['sha256']), 'missing source content digest')
+        metadata_used.add(key)
+        return row
     source = os.fsencode(source)
     codec = Codec(library) if compress else None
     root = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     nodes, entries, blocks, strings, hardlinks = [], [], [], bytearray(), {}
+    source_hashes = {}
     def add_string(value):
         at = len(strings)
         strings.extend(value)
         return at
-    def record(st, kind, size=0, first=0, count=0, target=0, target_size=0):
+    def record(st, kind, size=0, first=0, count=0, target=0, target_size=0, path=b''):
         require(0 <= st.st_uid <= 0xffffffff and 0 <= st.st_gid <= 0xffffffff, 'owner out of range')
-        # Normalize times and omit privileged mode bits. Content and metadata are
-        # deterministic for an unchanged tree and the pinned codec version.
-        return Node(kind, stat.S_IFMT(st.st_mode) | (st.st_mode & 0o777), st.st_uid, st.st_gid,
-                    size, first, count, target, target_size, 0, 0)
+        row = source_record(st,kind,path)
+        mode,uid,gid,mtime = (row['mode'],row['uid'],row['gid'],row['mtime']) if row else (st.st_mode,st.st_uid,st.st_gid,0)
+        # Preserve exporter-proven source ownership/mtime without host chown.
+        # Privileged mode bits remain omitted for the immutable nosuid image.
+        return Node(kind, stat.S_IFMT(mode) | (mode & 0o777), uid, gid,
+                    size, first, count, target, target_size, 0, mtime)
     with tempfile.TemporaryFile() as payload:
         def directory(fd, parent, path, depth, only=None):
             require(depth <= 128, 'tree too deep')
@@ -262,15 +303,20 @@ def build(source, destination, library=None, compress=True, paths=None):
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 kind = DIR if stat.S_ISDIR(st.st_mode) else FILE if stat.S_ISREG(st.st_mode) else LINK if stat.S_ISLNK(st.st_mode) else 0
                 require(kind, 'special files unsupported: '+repr(full))
+                original = source_record(st,kind,full)
                 known = hardlinks.get((st.st_dev, st.st_ino)) if kind == FILE else None
                 child = known if known is not None else len(nodes)
                 at = add_string(name)
                 entries.append((parent, child, at, len(name), 0))
                 if known is not None:
+                    if original:
+                        prior = nodes[known]
+                        require((prior.mode,prior.uid,prior.gid,prior.mtime)==(stat.S_IFMT(original['mode'])|(original['mode']&0o777),original['uid'],original['gid'],original['mtime']), 'hardlink metadata mismatch')
+                        require(original['sha256']==source_hashes[known], 'hardlink content metadata mismatch')
                     continue
                 nodes.append(None)
                 if kind == DIR:
-                    nodes[child] = record(st, kind)
+                    nodes[child] = record(st, kind, path=full)
                     sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                     try:
                         current = os.fstat(sub)
@@ -280,17 +326,22 @@ def build(source, destination, library=None, compress=True, paths=None):
                         os.close(sub)
                 elif kind == LINK:
                     target = os.readlink(name, dir_fd=fd)
+                    if original:
+                        require(isinstance(original.get('target'),str) and target==os.fsencode(original['target']), 'exported symlink differs from source')
                     require(0 < len(target) <= 4095 and b'\0' not in target, 'invalid symlink target')
-                    nodes[child] = record(st, kind, len(target), target=add_string(target), target_size=len(target))
+                    nodes[child] = record(st, kind, len(target), target=add_string(target), target_size=len(target), path=full)
                 else:
                     opened = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
                     with os.fdopen(opened, 'rb') as stream:
                         before = os.fstat(stream.fileno())
                         require((before.st_dev, before.st_ino, before.st_size) == (st.st_dev, st.st_ino, st.st_size), 'source file changed')
                         first, remaining = len(blocks), st.st_size
+                        digest = hashlib.sha256() if original else None
                         while remaining:
                             plain = stream.read(min(CHUNK, remaining))
                             require(len(plain) == min(CHUNK, remaining), 'source file truncated')
+                            if digest is not None:
+                                digest.update(plain)
                             encoded = codec.encode(plain) if codec else plain
                             use = compress and len(encoded) < len(plain)
                             data = encoded if use else plain
@@ -300,20 +351,25 @@ def build(source, destination, library=None, compress=True, paths=None):
                         after = os.fstat(stream.fileno())
                         require(not stream.read(1) and (before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
                                 (after.st_size, after.st_mtime_ns, after.st_ctime_ns), 'source file changed during packing')
-                    nodes[child] = record(st, kind, st.st_size, first, len(blocks)-first)
+                    if digest is not None:
+                        source_hashes[child] = digest.hexdigest()
+                        require(source_hashes[child]==original['sha256'], 'exported content differs from source digest')
+                    nodes[child] = record(st, kind, st.st_size, first, len(blocks)-first, path=full)
                     hardlinks[(st.st_dev, st.st_ino)] = child
         try:
             nodes.append(record(os.fstat(root), DIR))
             directory(root, 0, b'', 0, selected)
         finally:
             os.close(root)
+        if metadata is not None:
+            require(metadata_used == set(metadata['nodes']), 'metadata contains missing exported entries')
         entries.sort(key=lambda e:(e[0], bytes(strings[e[2]:e[2]+e[3]])))
         inode_at = HEADER.size
         entry_at = inode_at+len(nodes)*INODE.size
         block_at = entry_at+len(entries)*DIRENT.size
         strings_at = block_at+len(blocks)*BLOCK.size
         payload_at = align(strings_at+len(strings))
-        require(payload_at <= INDEX_LIMIT, 'resident index exceeds 16 MiB')
+        require(payload_at <= INDEX_LIMIT, 'resident index exceeds 32 MiB')
         index = bytearray().join(INODE.pack(*vars(n).values()) for n in nodes)
         index += b''.join(DIRENT.pack(*e) for e in entries)
         index += b''.join(BLOCK.pack(at+payload_at, stored, plain, kind, flags, digest) for at, stored, plain, kind, flags, digest in blocks)
@@ -433,6 +489,7 @@ def main():
         if action == 'build':
             sub.add_argument('source');sub.add_argument('image', type=Path)
             sub.add_argument('--codec', choices=('raw','lz4'), default='lz4')
+            sub.add_argument('--source-metadata',type=Path,help='Read-only ext2 exporter manifest; restore source owners/modes/mtime and verify content')
             sub.add_argument('--paths-file', type=Path, help='absolute immediate-child paths, e.g. nix-store -qR output')
         else:
             sub.add_argument('image', type=Path)
@@ -442,7 +499,8 @@ def main():
     args = parser.parse_args()
     if args.action == 'build':
         paths = args.paths_file.read_text().splitlines() if args.paths_file else None
-        print(json.dumps(build(args.source, args.image, args.lz4_library, args.codec == 'lz4', paths), indent=2));return
+        metadata = json.loads(args.source_metadata.read_text()) if args.source_metadata else None
+        print(json.dumps(build(args.source, args.image, args.lz4_library, args.codec == 'lz4', paths, metadata), indent=2));return
     image = Image(args.image, args.lz4_library)
     try:
         if args.action == 'list':

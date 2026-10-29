@@ -11,7 +11,7 @@ import tempfile
 import unittest
 import compressed_image as ci
 
-LIBRARY = os.environ.get('BROOK_IMAGE_TEST_LZ4_LIBRARY')
+LIBRARY = os.environ.get('BROOK_IMAGE_TEST_LZ4_LIBRARY') or os.environ.get('BROOK_IMAGE_LZ4_LIBRARY')
 CPP = Path(os.environ.get('BROOK_IMAGE_TEST_CPP', 'build/release/host_tests/test_compressed_image')).resolve()
 
 class Images(unittest.TestCase):
@@ -41,6 +41,25 @@ class Images(unittest.TestCase):
     def cpp(self, path):
         self.assertTrue(CPP.exists(), 'build test_compressed_image before running host tool tests')
         return subprocess.run([str(CPP),str(path)], capture_output=True, text=True)
+
+    def test_streaming_cpp_reader_matches_memory_reader(self):
+        regular = self.cpp(self.path)
+        streaming = subprocess.run([str(CPP),'--streaming',str(self.path)],capture_output=True,text=True)
+        self.assertEqual(regular.returncode,0,regular.stderr)
+        self.assertEqual(streaming.returncode,0,streaming.stderr)
+        self.assertEqual(json.loads(regular.stdout),json.loads(streaming.stdout))
+
+    def test_checksum_matches_python_reference(self):
+        if os.environ.get('BROOK_IMAGE_CHECKSUM_LIBRARY'):
+            self.assertIsNotNone(ci._native_checksum)
+        rng=random.Random(42)
+        for size in [0,1,7,255,4096,65536,65537]:
+            data=rng.randbytes(size)
+            for buffer in [data,bytearray(data),memoryview(data)]:
+                self.assertEqual(ci.checksum(buffer),ci.checksum_reference(buffer))
+        if ci._native_checksum is not None:
+            typed=memoryview(bytes(range(256))).cast('I')
+            self.assertEqual(ci.checksum(typed),ci.checksum_reference(bytes(typed)))
 
     def rehash(self, data):
         h = list(ci.HEADER.unpack_from(data));h[17] = ci.checksum(data[ci.HEADER.size:h[15]])

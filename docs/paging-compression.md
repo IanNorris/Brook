@@ -1444,3 +1444,10 @@ audit reports, filesystem check results and per-VM receipts are retained under
 clock-coalesced/. The next workload acceptance should include Steam's immutable
 package loading on private signed-in images without enabling this single-task
 policy for its shared address spaces.
+
+### Full installed-store acceptance
+
+See [full-store-compression-20261029.md](full-store-compression-20261029.md) for
+the safe ext2 export/metadata workflow, measured 21.12 MiB index and 32 MiB cap,
+optional native host checksum, bounded full-image verifier and private Steam
+comparison setup. General application/shared-AS paging remains unfinished.

@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--log-dir', type=Path, required=True)
     parser.add_argument('--skip-bootstrap', action='store_true',
                         help='Diagnostic: use the already staged client without testing its updater')
+    parser.add_argument('--shutdown', action='store_true', help='Forward a normal shutdown request to the running client through the same SteamRT')
     parser.add_argument('--launch-app', type=int,
                         help='Ask Steam to launch this installed numeric AppID after startup')
     parser.add_argument('--display', default=':0', help='An already running Xwayland display')
@@ -42,6 +43,8 @@ def main():
     parser.add_argument('--include-log-tail', action='store_true',
                         help='Opt in to exporting bounded raw log text; default reports paths and hashes only')
     args = parser.parse_args()
+    if args.shutdown and args.launch_app is not None:
+        parser.error('--shutdown and --launch-app are mutually exclusive')
     if args.launch_app is not None and not 0 < args.launch_app < 2 ** 32:
         parser.error('--launch-app must be an AppID between 1 and 4294967295')
     if os.geteuid() == 0:
@@ -126,6 +129,8 @@ def main():
                '-no-cef-sandbox', '-cef-disable-gpu', '-cef-disable-gpu-compositing']
     if args.skip_bootstrap:
         command.append('-skipinitialbootstrap')
+    if args.shutdown:
+        command.append('-shutdown')
     if args.launch_app is not None:
         command += ['-applaunch', str(args.launch_app)]
     args.log_dir.mkdir(parents=True, exist_ok=True)

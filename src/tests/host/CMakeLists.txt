@@ -66,6 +66,10 @@ target_link_libraries(test_page_store_compressed PRIVATE paging_lz4_host)
 add_host_test(test_compressed_image "${BROOK_ROOT}/src/kernel/src/fs/compressed_image.cpp")
 target_compile_options(test_compressed_image PRIVATE "-iquote${BROOK_ROOT}/src/shared")
 target_link_libraries(test_compressed_image PRIVATE paging_lz4_host)
+add_library(brook_image_checksum SHARED
+    "${BROOK_ROOT}/src/tests/test_compressed_image/checksum.cpp"
+    "${BROOK_ROOT}/src/kernel/src/fs/compressed_image.cpp")
+target_compile_options(brook_image_checksum PRIVATE -O2 "-iquote${BROOK_ROOT}/src/shared")
 add_host_test(test_compressed_vfs
     "${BROOK_ROOT}/src/kernel/src/fs/compressed_vfs.cpp"
     "${BROOK_ROOT}/src/kernel/src/fs/compressed_image.cpp"

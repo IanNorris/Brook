@@ -55,6 +55,7 @@ pkgs.mkShellNoCC {
     pkgs.dosfstools
     pkgs.util-linux      # sfdisk for portable GPT/VMware probe images
     pkgs.e2fsprogs        # debugfs for ext2 disk images
+    pkgs.lz4             # pinned host codec for immutable image tools
     pkgs.e2fsprogs.fuse2fs # fuse2fs for mounting ext2 images without sudo
     pkgs.fuse             # fusermount for fuse2fs
     pkgs.cacert           # standard root trust bundle in the guest initrd
@@ -81,6 +82,9 @@ pkgs.mkShellNoCC {
     export BROOK_DESKTOP_FONT_TTF="${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf"
     export HACK_FONT_TTF="${pkgs.hack-font}/share/fonts/truetype/Hack-Regular.ttf"
     export BROOK_CA_BUNDLE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+    # Python ctypes does not discover Nix store libraries through ldconfig.
+    export BROOK_IMAGE_LZ4_LIBRARY="${pkgs.lib.getLib pkgs.lz4}/lib/liblz4.so.1"
+    export BROOK_EXT2_LIBRARY="${pkgs.lib.getLib pkgs.e2fsprogs}/lib/libext2fs.so.2"
 
     echo "Brook dev shell ready (Clang $(clang --version | head -1))"
   '';

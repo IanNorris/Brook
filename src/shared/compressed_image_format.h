@@ -6,7 +6,7 @@ namespace brook {
 // format. Checksums detect accidental corruption, not malicious replacement.
 constexpr uint64_t COMPRESSED_IMAGE_MAGIC=0x314b4341504b5242ULL;
 constexpr uint32_t COMPRESSED_IMAGE_BLOCK=65536;
-constexpr uint64_t COMPRESSED_IMAGE_INDEX_LIMIT=16*1024*1024;
+constexpr uint64_t COMPRESSED_IMAGE_INDEX_LIMIT=32*1024*1024;
 struct CompressedImageHeader {
     uint64_t magic;
     uint32_t version,headerBytes;
