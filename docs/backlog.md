@@ -1,5 +1,57 @@
 # Recovery and VM-control backlog
 
+### Priority: survive memory exhaustion with controlled victim selection (29 October 2026)
+
+Confirmed outstanding after the bounded paging/compression acceptance. The pager
+can reclaim only eligible memory and has finite RAM/disk backing; it does not
+implement a system-wide OOM killer. `PmmAllocPage` currently returns failure when
+its physical allocator is exhausted. Recovery policy must execute outside PMM,
+heap, address-space, scheduler and device locks, not synchronously kill from
+inside an allocator or interrupt handler.
+
+- Try bounded existing reclaim first. If a new app cannot be admitted, fail its
+  launch transactionally and unwind its resources before sacrificing another
+  application. Do not treat an ordinary application ENOMEM, fragmentation,
+  contiguous-allocation failure or per-app limit as proof of global exhaustion.
+- For sustained global pressure with insufficient reclaim progress, select one
+  eligible victim using estimated reclaimable resident memory. Largest private
+  anonymous footprint is a useful starting score; huge virtual reservations,
+  reclaimable shared file cache and swapped bytes are not equivalent to RAM
+  that terminating this victim will release. Shared pages must not be counted
+  fully against every process. Existing PMM ownership is per address space,
+  not per allocating thread (`ProcessAddressSpacePid`).
+- Define the victim boundary explicitly: all relevant threads/address-space
+  users must exit before their memory is reclaimed. Account for multiprocess
+  browser/application ownership without blindly killing a shared launcher or
+  every descendant. Retain stable identities/references across scoring and
+  selection; revalidate eligibility at commit so PID reuse cannot change the
+  target. An address space shared with a protected service is ineligible.
+- Protect kernel tasks, idle/init, reclaim/page-in/storage workers and required
+  desktop/control services with explicit critical-service metadata. Neither a
+  process-name prefix nor UID 0 alone is an adequate criticality policy.
+- Request ordinary asynchronous process termination, preserving protected kernel
+  regions, mapping/TLB retirement, GPU/device fences, socket/FD cleanup and audio
+  teardown. Never directly free a victim's frames or bypass a blocked operation's
+  lifetime rules. Count memory returned to the allocator, not merely a queued
+  signal or a task marked dying, as recovery progress.
+- Keep the coordinator, victim selection, diagnostics and minimal notification
+  path allocation-free under pressure, with bounded resident emergency resources
+  for teardown and forward progress. Serialize victim selection, limit retries
+  and use pressure hysteresis. Wait for observable reclaim before escalating to
+  another victim; avoid kill storms when cleanup is delayed. If no safe victim
+  exists, reject allocations and report the condition without corrupting state.
+- Expose a clear notification identifying the terminated application and reason;
+  retain allocation demand, headroom, victim score/identity, reclaimed bytes and
+  cleanup outcome in logs/MCP diagnostics.
+- Acceptance: repeat with fresh low-RAM private VMs and bounded anonymous-memory
+  hogs, both with paging disabled and with disk/compressed backing exhausted.
+  Verify correct victim choice with shared-AS/CoW/file-cache controls, critical
+  service protection and selection-versus-exit/PID-reuse races. Include failed
+  launch rollback, simultaneous allocators, delayed protected/device cleanup and
+  no-eligible-victim cases. Desktop, terminal, audio/control plane and subsequent
+  app launch must survive; require byte integrity, checked shutdown and clean
+  filesystem checks. Native teardown must show actual recovered headroom.
+
 ### Historical branch disposition (28 October 2026)
 
 BRO-208 is closed by owner direction; its deleted issue database will not be
@@ -506,14 +558,11 @@ Double Commander's GTK2 build would add an older toolkit/X11 path.
   and syscall-return delivery. The failed disks are preserved and not reused.
   This invalidates full stability acceptance for that candidate, despite the
   preceding clean Chromium and Firefox workflow/quit results.
-- Define a user-facing memory-pressure response: reject/terminate the newly
-  launching app when its allocation cannot be satisfied, and consider reclaiming
-  the largest non-critical application when appropriate. Protect critical OS
-  services, preserve process-group cleanup and audio teardown, and expose a clear
-  launch-failure notification. This is future policy work; the immediate fault
-  signal-frame fix must contain failed user-stack writes without requiring an
-  OOM victim-selection policy. The 18 October STK/browser review exhausted all
-  physical pages and reproduced the unchecked signal-frame panic on RR.
+- The earlier user-facing memory-pressure response remains outstanding; see
+  the priority OOM recovery item at the top of this backlog. Its original
+  motivation was the 18 October STK/browser run exhausting physical pages.
+  Signal-frame failure containment and OOM victim-selection policy are distinct
+  requirements; paging/compression alone does not implement victim selection.
 - Panic observability: simultaneous raw user-fault dumps interleaved with the
   kernel fault text, so the bridge's serial regex missed the panic and observation
   attempted a dead guest TCP query. Preserve structured panic state independently
