@@ -381,6 +381,23 @@ uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address) {
     IrqSpinLockRelease(&lock,irq); return leaf;
 }
 
+bool VmmClearAccessedIfMatches(PageTable pt,VirtualAddress address,PhysicalAddress expected) {
+    if(!pt || (address.raw()&4095) || !expected)return false;
+    uint64_t irq=IrqSpinLockAcquire(&g_userPtLock);
+    bool large=false;auto* entry=WalkToPtr(pt,address,false,0,&large);bool changed=false;
+    if(entry && !large) {
+        uint64_t old=__atomic_load_n(entry,__ATOMIC_RELAXED);
+        while((old&(VMM_PRESENT|VMM_USER|VMM_ACCESSED))==(VMM_PRESENT|VMM_USER|VMM_ACCESSED) &&
+              !(old&PTE_COW_BIT) && VmmLeafPhysical(old)==expected) {
+            const uint64_t aged=old&~VMM_ACCESSED;
+            if(__atomic_compare_exchange_n(entry,&old,aged,false,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) {
+                changed=true;break;
+            }
+        }
+    }
+    IrqSpinLockRelease(&g_userPtLock,irq);return changed;
+}
+
 using LeafUpdate = uint64_t (*)(VirtualAddress,uint64_t,void*);
 static bool WalkLeafRange(uint64_t* table, unsigned level, uint64_t base,
                            uint64_t begin, uint64_t end, bool detach,

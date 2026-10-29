@@ -142,7 +142,8 @@ CAP_SYS_ADMIN is required. Operations are scalar: 0 maps a new RW/NX private
 region (aligned length, at most 16 MiB), 1 explicitly pages out one address,
 2 returns global stored slots, 3 samples free physical frames, and 4 selects a
 one-shot test failure (0 clear, 1 write error, 2 read error, 3 bad read checksum,
-4 short write, 5 short read, 6 write error plus rejected rollback publication).
+4 short write, 5 short read, 6 write error plus rejected rollback publication,
+7 rejected fault publication, 8 pre-detach ENOMEM).
 Failure controls are experimental diagnostics, not a proposed production ABI.
 
 A sticky AS admission interlock excludes CLONE_VM while the experiment is active
@@ -1368,3 +1369,78 @@ boots report desktop presentation at 6,045–6,424 guest milliseconds. These use
 not a representative installed Steam desktop or whole firmware-to-desktop
 latency. Neither kernel nor initrd is compressed in this comparison, so these
 observations establish no boot-payload compression gain.
+
+### Bounded accessed-bit clock experiment (29 October)
+
+`opt/page-store-executable-clock=1` enables a second-chance scan only for labeled
+application address spaces. It remains off by default; zero or absence keeps
+cursor/FIFO selection. The scan retains existing lease, recent-eight, COW,
+exclusive-admission and private-frame checks. It holds AS mutation for at most
+64 visits per batch, retains no range/PTE pointers across unlock/yield, performs
+at most two finite traversals from the original cursor and attempts at most one
+victim write. The second pass is permitted only after an actual Accessed clear
+and acknowledgement; reaccessed pages receive another chance.
+
+The VMM helper conditionally clears only Accessed on an expected present user
+4 KiB non-COW leaf. Its CAS loop preserves hardware Dirty updates, permissions,
+cache flags, ownership tags and the frame. Aging changes neither ownership nor
+mapping generation. The outer kernel-region/AS reference protects cancellation
+and lifetime through scans, acknowledgement and eviction.
+
+Brook deliberately acknowledges clears before a second sample or user resume.
+[Linux's x86 implementation](https://github.com/torvalds/linux/blob/master/arch/x86/mm/pgtable.c)
+accepts approximate base-page aging without an immediate flush. This experiment
+uses the stricter clear/acknowledge/reaccess sequence to keep its evidence
+independent of stale TLB Accessed state. Clears accumulate across unlocked scan
+batches. PageOut's successful-detach transaction performs a full acknowledgement
+for the same retained AS before storage I/O; that also satisfies earlier aging
+clears. A flag becomes true only after the transaction destructor finishes.
+An outer RAII guard supplies the fallback flush on pre-detach failure or no
+victim, and explicitly flushes before the second pass. Storage/rollback failure
+after acknowledged detach does not require a duplicate aging flush.
+
+Root control 22 adds selectors 13 scan visits, 14 actual Accessed clears,
+15 standalone aging acknowledgements, 16 second passes, 17 no-victim returns,
+and 18 pending-aging obligations satisfied by PageOut's acknowledgement.
+Control 24 ages one eligible Resident page and returns 1 for a clear, 0 for an
+already-cold leaf, or an error; it acknowledges before returning. Failure
+control 4 mode 8 injects one ENOMEM before PageOut reserves/detaches a victim,
+allowing deterministic validation of the pending-clear fallback. These remain
+root-only diagnostics on the explicitly enabled page store.
+
+Initial flushed clock comparisons reduce pageouts from 8,054 to 6,939 and Stored
+faults from 2,475 to 1,360 per compiler run, but add 1,264 standalone aging
+acknowledgements. Reusing PageOut's acknowledgement reduces that to one
+standalone acknowledgement plus 1,263 satisfied by eviction, without changing
+the victim/refault work. Two fresh forward/reverse pressured compiler runs per
+mode on the final kernel report:
+
+- FIFO: 3.907 / 3.563 s, 8,054 pageouts, 2,475 Stored faults, 653 raw page reads.
+- Clock: 3.492 / 3.803 s, 6,939 pageouts, 1,360 Stored faults, 190 raw page reads.
+
+Clock therefore reduces pageouts by 13.8%, Stored faults by 45.1% and raw reads
+by 70.9% on this workload. Scan visits increase from 8,371 to 30,165; 22,214
+Accessed clears and one second pass are observed. No victim/reclaim failure is
+reported. Sampled free memory remains about 26–27 MiB. Elapsed ranges overlap;
+these two observations do not establish a dependable throughput gain. Retain
+FIFO by default and the explicit clock experiment for further workload evidence.
+
+Native hardware checks cover clear/acknowledge/reaccess, cold versus hot
+selection, all-hot second-pass progress, pending clears on injected pre-detach
+failure, incompressible victim write failure, all-leased/no-victim behavior and
+cleanup. Hosted real-VMM tests verify unchanged Dirty/cache/owner bits and
+references and reject wrong frames, unaligned addresses, COW, hidden,
+supervisor and huge leaves. Evidence is under clock-eviction/ (initial) and
+clock-coalesced/ (final), including per-job and shutdown receipts. General
+application/shared-AS paging and wider workload acceptance remain unfinished.
+
+Final validation passes 45 native regression jobs plus six enrollment/clock
+jobs across raw and compressed-RAM configurations, twelve relevant host tests,
+both compiled entry/startup mutation audits, and all four compiler/output jobs.
+All eight final VMs complete checked sync/shutdown and original owner exit zero.
+Read-only data/Nix/tmp ext2 checks of the clock compiler VM pass. Astra found no
+ownership/locking/acknowledgement blocker. The final metadata, host-test and
+audit reports, filesystem check results and per-VM receipts are retained under
+clock-coalesced/. The next workload acceptance should include Steam's immutable
+package loading on private signed-in images without enabling this single-task
+policy for its shared address spaces.

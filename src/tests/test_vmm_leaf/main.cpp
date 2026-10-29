@@ -261,6 +261,7 @@ static void largeLeafAndBorrowedFrame() {
         VmmRangeStats census{};
         CHECK(!VmmMeasureRange(pt,va.raw(),va.raw()+4096,true,&census)&&!census.backedPages);
         CHECK(*large==saved&&!VmmDetachPage(pt,va));
+        CHECK(!VmmClearAccessedIfMatches(pt,va,candidate)&&*large==saved);
         CHECK(reinterpret_cast<uint64_t*>(pt.pml4.raw())[0]==rootEntry&&entries[1]==directoryEntry);
         CHECK(PmmGetRefCount(candidate)==1&&maps(candidate)==0);
         // Preflight must encounter the later large leaf before detaching an
@@ -299,6 +300,22 @@ static void occupiedAncestors() {
     CHECK(root[0]==ancestors[0]&&directory[1]==ancestors[1]&&pages[0]==ancestors[2]);
     CHECK(VmmTryMapPage(pt,va+0x200000,candidate,flags)==VmmMapResult::Mapped);
     CHECK((root[0]&VMM_USER)&&(directory[1]&VMM_USER)&&(pages[1]&VMM_USER));
+    VmmDestroyUserPageTable(pt);empty();
+}
+static void accessedLeafAging() {
+    auto pt=table();auto page=PmmAllocPage();
+    CHECK(!VmmClearAccessedIfMatches(pt,va,page));
+    CHECK(VmmTryMapPage(pt,va,page,flags|VMM_ACCESSED|VMM_DIRTY|VMM_LEAF_PAT,MemTag::User,37)==VmmMapResult::Mapped);
+    auto* entry=VmmGetPte(pt,va);CHECK(entry);const uint64_t saved=*entry;
+    CHECK(!VmmClearAccessedIfMatches(pt,va+1,page)&&*entry==saved);
+    CHECK(!VmmClearAccessedIfMatches(pt,va,PhysicalAddress(page.raw()+4096))&&*entry==saved);
+    CHECK(VmmClearAccessedIfMatches(pt,va,page)&&*entry==(saved&~VMM_ACCESSED));
+    CHECK(!VmmClearAccessedIfMatches(pt,va,page)&&*entry==(saved&~VMM_ACCESSED));
+    for(uint64_t rejected:{saved|PTE_COW_BIT,(saved&~VMM_PRESENT)|PTE_HIDDEN_BIT,saved&~VMM_USER}) {
+        *entry=rejected;CHECK(!VmmClearAccessedIfMatches(pt,va,page)&&*entry==rejected);
+    }
+    *entry=saved;
+    CHECK(VmmClearAccessedIfMatches(pt,va,page)&&PmmGetRefCount(page)==1&&maps(page)==1);
     VmmDestroyUserPageTable(pt);empty();
 }
 static void failureAndInPlace() {
@@ -2189,7 +2206,7 @@ static void robustExitQueue() {
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
     robustExitQueue();low32Mappings();pageableTableSkeleton();
-    competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
+    accessedLeafAging();competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();
     liveMappingClone();sharedMappingClone();borrowedDeviceCachePolicies();failedCloneAcknowledgement();sparseLiveRemap();preparedThreadStack();graphicsBufferMappings();

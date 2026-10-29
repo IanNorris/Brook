@@ -1,4 +1,5 @@
 #include "pageable_memory.h"
+#include "apic.h"
 #include "pageable_application_policy.h"
 #include "page_store.h"
 #include "compressed_page_pool.h"
@@ -25,10 +26,11 @@ namespace {
 PageStore store;
 KMutex storeLock;
 bool ready=false;
+bool applicationClock=false;
 PageableApplicationPolicy applicationPolicy;
 // Root-readable diagnostic totals survive worker exit. Held is a sampled
 // per-AS maximum, not an exact process or whole-system RSS high-water mark.
-uint64_t applicationStats[13]{};
+uint64_t applicationStats[19]{};
 uint64_t applicationBarriers[512]{};
 void ApplicationCount(AddressSpaceState* space,unsigned counter,uint64_t amount=1) {
     if(space->pagingApplication)__atomic_fetch_add(&applicationStats[counter],amount,__ATOMIC_RELAXED);
@@ -218,13 +220,16 @@ int64_t Map(Process* actor,uint64_t length,bool lazy=false) {
 // An optional handoff consumes the sole retained victim reference only after
 // stable storage and full TLB retirement. Same-AS fault reclaim can reuse it
 // directly without first discarding a frame into an already-full reserve.
-int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr) {
+int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr,bool* detachmentAcknowledged=nullptr) {
+    if(detachmentAcknowledged)*detachmentAcknowledged=false;
     if(handoff)*handoff={};
     if(page&4095)return -22;
     auto* space=actor->addressSpace;
     if(!space->pagingAdmission.Exclusive())return -95;
     Slot slot;
-    {StoreGuard guard;slot.token=store.Reserve();}
+    {StoreGuard guard;
+     if(injectedFailure==8){injectedFailure=0;return -12;}
+     slot.token=store.Reserve();}
     if(!slot.token)return -28;
     const uint64_t token=slot.token;
     Backing backing;Frame frame;uint64_t index=0;
@@ -250,7 +255,8 @@ int64_t PageOut(Process* actor,uint64_t page,PhysicalAddress* handoff=nullptr) {
         entry.slot=token;entry.state=State::Evicting;
         if(!op.Detach(VirtualAddress(page))){entry.slot=0;entry.state=State::Resident;return -12;}
         slot.token=0; // region now owns the slot; local backing pin keeps it live
-    } // full TLB ACK precedes both I/O and retirement of the old PTE ref
+    } // successful detach's destructor has completed the full-AS TLB ACK
+    if(detachmentAcknowledged)*detachmentAcknowledged=true;
     int result;bool rejectRollback=false;
     {StoreGuard guard;rejectRollback=injectedFailure==6;result=store.Store(token,reinterpret_cast<void*>(PhysToVirt(frame.physical).raw()));}
     // No preparation/allocation is needed for completion. Only this dedicated
@@ -314,23 +320,19 @@ uint64_t HeldFrames(AddressSpaceState* space) {
             static_cast<Region*>(node->range.backing->object)->accountingVisited=false;
     return total;
 }
-// One finite traversal, in batches of at most 64 metadata/page visits. A sole
-// admitted task cannot concurrently add ranges; never retain a range pointer
-// across unlock/yield/I/O. At most one victim write is attempted per call.
-int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false,PhysicalAddress* handoff=nullptr) {
-    if(handoff)*handoff={};
+// No range/PTE pointer survives an unlock. Retain actor/AS through the sweep
+// and its ACK in the outer caller. Aging does not change mapping generation.
+struct AgingFlush {
+    AddressSpaceState* space;bool changed=false;
+    void Flush(){if(changed){TlbShootdownFull(space->pageTable.pml4.raw(),space->tlbCpuMask);changed=false;ApplicationCount(space,15);}}
+    void CoveredByPageOut(){if(changed){changed=false;ApplicationCount(space,18);}}
+    ~AgingFlush(){Flush();}
+};
+uint64_t ScanVictim(Process* actor,uint64_t excluded,bool protectRecent,bool clock,uint64_t start,bool& cleared) {
     auto* space=actor->addressSpace;
-    uint64_t flags;__asm__ volatile("pushfq; popq %0":"=r"(flags));
-    if(!(flags&512))return -16; // no sleeping/I/O from an interrupt-disabled caller
-    KMutexLock(&space->mutation);
-    if(!space->pagingAdmission.Exclusive() || !space->pagingReclaimEnabled) {
-        KMutexUnlock(&space->mutation);return -95;
-    }
-    const uint64_t start=space->pagingReclaimCursor;
-    KMutexUnlock(&space->mutation);
     uint64_t cursor=start;bool wrapped=false;
     for(;;) {
-        uint64_t victim=0;bool done=false;
+        uint64_t victim=0,visits=0;bool done=false;
         KMutexLock(&space->mutation);
         for(unsigned visited=0;visited<64;++visited) {
             const auto* range=MappingRangeAtOrAfter(space->ranges,cursor);
@@ -340,6 +342,7 @@ int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false,Phy
             }
             const uint64_t page=range->begin>cursor?range->begin:cursor;
             if(wrapped && page>=start){done=true;break;}
+            ++visits;
             cursor=range->kind==MappingKind::Pageable?page+4096:range->end;
             space->pagingReclaimCursor=cursor;
             if(range->kind!=MappingKind::Pageable || !range->backing ||
@@ -355,13 +358,70 @@ int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false,Phy
             if(!(leaf&VMM_PRESENT) || !(leaf&VMM_USER) || (leaf&PTE_COW_BIT))continue;
             const auto physical=VmmLeafPhysical(leaf);
             if(PmmGetRefCount(physical)!=1 || PmmGetMapCount(physical)!=1)continue;
+            if(clock && (leaf&VMM_ACCESSED)) {
+                if(VmmClearAccessedIfMatches(space->pageTable,VirtualAddress(page),physical)) {
+                    cleared=true;ApplicationCount(space,14);
+                }
+                continue;
+            }
             victim=page;break;
         }
         KMutexUnlock(&space->mutation);
-        if(victim)return PageOut(actor,victim,handoff); // authoritative admission recheck
-        if(done)return -12;
+        ApplicationCount(space,13,visits);
+        if(victim || done)return victim; // caller owns the accumulated ACK obligation
         SchedulerYield();__asm__ volatile("sti":::"memory");
     }
+}
+// Two finite passes at most; only retry if the first actually cleared a leaf.
+int64_t ReclaimOne(Process* actor,uint64_t excluded,bool protectRecent=false,PhysicalAddress* handoff=nullptr) {
+    if(handoff)*handoff={};
+    auto* space=actor->addressSpace;
+    uint64_t flags;__asm__ volatile("pushfq; popq %0":"=r"(flags));
+    if(!(flags&512))return -16;
+    FaultLifetime lifetime(actor,space);AgingFlush aging{space};
+    KMutexLock(&space->mutation);
+    if(!space->pagingAdmission.Exclusive() || !space->pagingReclaimEnabled) {
+        KMutexUnlock(&space->mutation);return -95;
+    }
+    const uint64_t start=space->pagingReclaimCursor;
+    const bool clock=applicationClock && space->pagingApplication;
+    KMutexUnlock(&space->mutation);
+    uint64_t victim=ScanVictim(actor,excluded,protectRecent,clock,start,aging.changed);
+    if(!victim && clock && aging.changed) {
+        aging.Flush(); // a second scan must observe acknowledged cold samples
+        ApplicationCount(space,16);
+        victim=ScanVictim(actor,excluded,protectRecent,true,start,aging.changed);
+    }
+    if(victim) {
+        bool acknowledged=false;
+        const int64_t result=PageOut(actor,victim,handoff,&acknowledged);
+        // PageOut's successful-detach ACK covers earlier clears in this same
+        // retained AS, even if its subsequent write/rollback fails. Pre-detach
+        // failures retain the RAII fallback, including exhausted backing slots.
+        if(acknowledged)aging.CoveredByPageOut();
+        return result;
+    }
+    ApplicationCount(space,17);return -12;
+}
+int64_t AgeOne(Process* actor,uint64_t page) {
+    if(page&4095)return -22;
+    auto* space=actor->addressSpace;FaultLifetime lifetime(actor,space);AgingFlush flush{space};
+    KMutexLock(&space->mutation);
+    const auto* range=MappingRangeFind(space->ranges,page);int64_t result=-16;
+    if(space->pagingAdmission.Exclusive() && range && range->kind==MappingKind::Pageable &&
+       range->backing && range->backing->release==ReleaseRegion && !space->userAccess.CoversPage(page)) {
+        const auto* region=static_cast<Region*>(range->backing->object);
+        const auto index=(range->offset+page-range->begin)/4096;
+        const uint64_t leaf=VmmReadLeaf(space->pageTable,VirtualAddress(page));
+        if(index<region->pages && region->entries[index].state==State::Resident &&
+           (leaf&(VMM_PRESENT|VMM_USER))==(VMM_PRESENT|VMM_USER) && !(leaf&PTE_COW_BIT) &&
+           PmmGetRefCount(VmmLeafPhysical(leaf))==1 && PmmGetMapCount(VmmLeafPhysical(leaf))==1) {
+            flush.changed=VmmClearAccessedIfMatches(space->pageTable,VirtualAddress(page),VmmLeafPhysical(leaf));
+            result=flush.changed?1:0;
+            if(flush.changed)ApplicationCount(space,14);
+        }
+    }
+    KMutexUnlock(&space->mutation);return result;
 }
 
 }
@@ -670,6 +730,13 @@ void PageableMemoryBootInit() {
             SerialPuts("paging: invalid reserve-refill flag (worker disabled)\n");
     }
 
+    char clock[2]{};auto clockSize=FwCfgReadFile("opt/page-store-executable-clock",clock,sizeof(clock));
+    if(clockSize) {
+        applicationClock=clockSize==1 && clock[0]=='1';
+        if(!(clockSize==1 && (clock[0]=='0' || clock[0]=='1')))
+            SerialPuts("paging: invalid executable clock flag (FIFO retained)\n");
+        if(applicationClock)SerialPuts("paging: executable clock experiment enabled (acknowledged access-bit sweeps)\n");
+    }
     char executable[256]{};auto executableSize=FwCfgReadFile("opt/page-store-executable",executable,sizeof(executable));
     if(executableSize) {
         uint64_t mib=64;char target[8]{};
@@ -707,7 +774,8 @@ void PageableMemoryStartReserveWorker() {
 int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) {
     if(!ready)return -95;
     if(!actor || !ProcessCapable(actor,nullptr,CapSysAdmin))return -1;
-    if(operation==22 && value<13)return __atomic_load_n(&applicationStats[value],__ATOMIC_RELAXED);
+    if(operation==24)return AgeOne(actor,value);
+    if(operation==22 && value<19)return __atomic_load_n(&applicationStats[value],__ATOMIC_RELAXED);
     if(operation==23 && value<512)return __atomic_load_n(&applicationBarriers[value],__ATOMIC_RELAXED);
     if(operation==20 && value<=5){StoreGuard guard;forkFailure=value;forkFailureSpace=value?actor->addressSpace->identity:0;return 0;}
     if(operation==21 && value<=2){StoreGuard guard;growthFailure=value;growthFailureSpace=value?actor->addressSpace->identity:0;return 0;}
@@ -715,7 +783,7 @@ int64_t PageableMemoryControl(Process* actor,uint64_t operation,uint64_t value) 
     if(operation==1)return PageOut(actor,value);
     if(operation==2){StoreGuard guard;return store.Stats().stored;}
     if(operation==3)return PmmGetFreePageCount();
-    if(operation==4 && value<=7){StoreGuard guard;injectedFailure=value;return 0;}
+    if(operation==4 && value<=8){StoreGuard guard;injectedFailure=value;return 0;}
     if(operation==5){UserAccessScope lease(actor);if(!UserBufferReadable(value,4096))return -14;return PageOut(actor,value);}
     if(operation==6){KMutexLock(&actor->addressSpace->mutation);auto count=actor->addressSpace->userAccess.Count();KMutexUnlock(&actor->addressSpace->mutation);return count;}
     if(operation==7)return ReserveSize();

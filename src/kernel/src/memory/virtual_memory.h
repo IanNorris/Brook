@@ -25,6 +25,8 @@ static constexpr uint64_t VMM_USER         = (1ULL << 2);
 static constexpr uint64_t VMM_WRITE_THRU   = (1ULL << 3);  // PWT — write-through caching
 static constexpr uint64_t VMM_CACHE_DISABLE = (1ULL << 4); // PCD — disable caching (uncacheable)
 // Bit7 is PAT on a 4KiB leaf, PS on ancestors. Never copy it across levels.
+static constexpr uint64_t VMM_ACCESSED = (1ULL << 5);
+static constexpr uint64_t VMM_DIRTY = (1ULL << 6);
 static constexpr uint64_t VMM_LEAF_PAT = (1ULL << 7);
 static constexpr uint64_t VMM_LEAF_CACHE_MASK = VMM_WRITE_THRU | VMM_CACHE_DISABLE | VMM_LEAF_PAT;
 static constexpr uint64_t VMM_NO_EXEC      = (1ULL << 63); // requires EFER.NXE
@@ -109,6 +111,11 @@ uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr);
 uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected);
 PhysicalAddress VmmLeafPhysical(uint64_t leaf);
 uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address); // locked value snapshot, including hidden leaves
+// Clear only Accessed on an expected present user 4 KiB, non-COW leaf. No
+// ownership/reference change. Caller stabilizes its mapping under AS.mutation
+// and must acknowledge a TLB invalidation before relying on a new cold sample.
+// False includes already-cold, absent/hidden, huge and mismatched leaves.
+bool VmmClearAccessedIfMatches(PageTable,VirtualAddress,PhysicalAddress expected);
 // Visit only allocated user page tables intersecting [begin,end), never each
 // virtual page of an empty reservation. Huge user leaves are unsupported and
 // cause false before any mutation. Detach preflights capacity under the same
