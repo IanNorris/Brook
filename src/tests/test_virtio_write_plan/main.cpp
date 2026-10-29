@@ -14,7 +14,7 @@ struct Backend {
     struct Entry {uint64_t tag=0;bool valid=false;std::array<uint8_t,4096> data{};};
     std::vector<uint8_t> disk;
     std::array<Entry,CacheSlots> cache{};
-    unsigned reads=0,writes=0,scatter=0,failWrite=0;
+    unsigned reads=0,writes=0,scatter=0,failWrite=0,failScatter=0;
     bool scatterFails=false,partialScatter=false,failRead=false;
     Backend():disk(Blocks*4096) {for(unsigned i=0;i<disk.size();++i)disk[i]=(i*37+(i>>9))&255;}
     uint8_t* Cached(uint64_t block){auto& e=cache[block%CacheSlots];return e.valid&&e.tag==block?e.data.data():nullptr;}
@@ -27,7 +27,7 @@ struct Backend {
         return !fail;
     }
     int64_t ScatterWrite(uint64_t sector,uint32_t count,const uint8_t* data){
-        ++scatter;if(scatterFails){if(partialScatter)std::copy_n(data,count*512,disk.data()+sector*512);return -1;}
+        ++scatter;if(scatterFails || failScatter==scatter){if(partialScatter)std::copy_n(data,count*512,disk.data()+sector*512);return -1;}
         std::copy_n(data,count*512,disk.data()+sector*512);return count*512;
     }
     void Coherent(){for(auto& e:cache)if(e.valid)assert(std::equal(e.data.begin(),e.data.end(),disk.begin()+e.tag*4096));}
@@ -49,7 +49,7 @@ static void randomWrites(){
 int main(){
     randomWrites();
     Backend hit;hit.Load(0);std::array<uint8_t,1024> dma{};std::array<uint8_t,128> source;source.fill(0x53);
-    for(unsigned i=0;i<8;++i){auto r=VirtioPlanWrite(hit,128,source.data(),source.size(),dma.data(),2,8);assert(r.ok);hit.Coherent();}
+    for(unsigned i=0;i<8;++i){source.fill(0x53+i);auto r=VirtioPlanWrite(hit,(i%4)*128,source.data(),source.size(),dma.data(),2,8);assert(r.ok);hit.Coherent();}
     assert(!hit.reads&&hit.writes==8&&hit.Cached(0)); // eliminated repeated inode-size prereads
     Backend miss;miss.Load(0);std::array<uint8_t,2048> big;big.fill(0x6a);std::array<uint8_t,4096> wideDma{};
     auto before=miss.disk;auto r=VirtioPlanWrite(miss,3584,big.data(),big.size()-1,wideDma.data(),8,8);
@@ -66,6 +66,17 @@ int main(){
     auto saved=collision.cache[0].data;
     r=VirtioPlanWrite(collision,128,source.data(),128,dma.data(),2,8);
     assert(r.ok&&collision.reads==1&&collision.cache[0].data==saved&&collision.Cached(4));collision.Coherent();
+    // Explicit aligned cases: random byte offsets rarely select the SG path.
+    for(unsigned failAt:{0u,2u}) {
+        Backend aligned;for(unsigned b=0;b<4;++b)aligned.Load(b);
+        aligned.failScatter=failAt;aligned.partialScatter=true;
+        std::vector<uint8_t> data(37*512);
+        for(unsigned i=0;i<data.size();++i)data[i]=(i*13+(i>>8))&255;
+        auto expected=aligned.disk;std::copy(data.begin(),data.end(),expected.begin());
+        r=VirtioPlanWrite(aligned,0,data.data(),data.size(),dma.data(),2,8);
+        assert(r.ok&&r.bytes==data.size()&&aligned.disk==expected&&!aligned.reads);
+        assert(aligned.scatter==(failAt?2u:5u));aligned.Coherent();
+    }
     Backend readFail;readFail.failRead=true;
     r=VirtioPlanWrite(readFail,128,source.data(),128,dma.data(),2,8);assert(!r.ok&&!readFail.writes);
     r=VirtioPlanWrite(readFail,~uint64_t{0}-10,source.data(),128,dma.data(),2,8);assert(!r.ok);

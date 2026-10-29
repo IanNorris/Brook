@@ -133,8 +133,10 @@ void ProfilerSample(uint64_t interruptedRip, uint64_t interruptedCs, uint64_t in
     // Auto-stop after duration
     uint64_t now = ApicTickCount();
     if (g_profilerEndTick != 0 && now >= g_profilerEndTick) {
-        g_profilerEnabled = false;
-        g_profilerFlushReq = true;
+        // Publish the handoff before disabling sampling: status/start must
+        // not observe idle while the worker still owes a final drain.
+        __atomic_store_n(&g_profilerFlushReq,true,__ATOMIC_RELEASE);
+        __atomic_store_n(&g_profilerEnabled,false,__ATOMIC_RELEASE);
         // Wake the profiler thread promptly via pendingWakeup — we can't call
         // SchedulerUnblock from ISR context (it acquires g_readyLock), but
         // CheckBlockedWakeups checks pendingWakeup on the next timer tick.
@@ -674,7 +676,8 @@ void ProfilerStart(uint32_t durationMs)
         SerialPrintf("PROFILER: already running\n");
         return;
     }
-    if (__atomic_load_n(&g_profilerFlushing, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&g_profilerFlushReq, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&g_profilerFlushing, __ATOMIC_ACQUIRE)) {
         SerialPrintf("PROFILER: still flushing previous run, try again shortly\n");
         return;
     }
@@ -697,8 +700,8 @@ void ProfilerStart(uint32_t durationMs)
 void ProfilerStop()
 {
     if (!g_profilerEnabled) return;
-    g_profilerEnabled  = false;
-    g_profilerFlushReq = true;
+    __atomic_store_n(&g_profilerFlushReq,true,__ATOMIC_RELEASE);
+    __atomic_store_n(&g_profilerEnabled,false,__ATOMIC_RELEASE);
     if (g_profilerThread)
         SchedulerUnblock(g_profilerThread);
     SerialPrintf("PROFILER: stop requested\n");
@@ -706,7 +709,9 @@ void ProfilerStop()
 
 bool ProfilerIsRunning()
 {
-    return g_profilerEnabled || __atomic_load_n(&g_profilerFlushing, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(&g_profilerEnabled,__ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&g_profilerFlushReq,__ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&g_profilerFlushing,__ATOMIC_ACQUIRE);
 }
 
 } // namespace brook

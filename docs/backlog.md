@@ -1,5 +1,30 @@
 # Recovery and VM-control backlog
 
+### Steam loading and block completion follow-ups (29 October 2026)
+
+The bounded [loading performance pass](steam-loading-performance-20261029.md)
+reduces Steam time to its first main window by 20–24% across three paired
+controls. Cold Stardew loading remains variable. Investigate repeated SteamRT
+runtime/filesystem construction and metadata write volume on `/data` next;
+do not assume indexed-store compression addresses that traffic. Measure full
+menu readiness separately from window creation. Any future dirty-cache/write
+coalescing work needs explicit crash-durability and failed-completion tests.
+
+An exploratory profiled run under overlapping host image preparations reported
+a virtio-blk completion timeout/reset and periodic-sync EIO. Saved disks passed
+offline checks after checked sync and QMP termination, but normal client close
+did not complete. Six later quiet matched controls passed normal shutdown and
+all filesystem checks. Reproduce this completion-timeout/reset path with bounded
+host contention; host load has not been established as its cause. Preserve
+request/DMA ownership across timeout, reset, retry and late completion rather
+than merely extending the deadline.
+
+Profiler status now includes the pending-drain handoff and start rejects it;
+three consecutive native captures pass. Separately cover a capture that stops
+before its worker first runs: the existing legacy pending-flush branch clears
+the request without opening a writer. This needs deterministic scheduling
+coverage before changing the drain lifecycle.
+
 ### Controlled memory exhaustion: bounded recovery implemented (29 October 2026)
 
 Implemented on `wip/oom-recovery-20261029`; see
