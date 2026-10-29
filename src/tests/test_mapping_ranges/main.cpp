@@ -3,6 +3,8 @@
 #endif
 #include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -272,7 +274,39 @@ static void failedEditsAndReuse() {
     }
     MappingRangeDestroy(table); assert(!allocations);
 }
-int main() {
-    orderedAndDeletion(); mixedEdits(); backingAndExtend(); backedTransplant(); failedEditsAndReuse();
+static void rejectedInsertions() {
+    MappingRangeTable table{};
+    MappingRangePlan plan;assert(plan.Prepare(3));
+    mutation=true;
+    assert(plan.Insert(table,anonymous(0x10000,0x11000)));
+    assert(plan.Insert(table,anonymous(0x13000,0x14000)));
+    auto* root=table.root;auto* head=table.head;auto identity=table.nextIdentity;
+    assert(!plan.Insert(table,anonymous(0x10000,0x11000))); // duplicate
+    assert(!plan.Insert(table,anonymous(0xf000,0x12000))); // overlap from left
+    assert(!plan.Insert(table,anonymous(0x11000,0x14000))); // overlap successor
+    assert(table.root==root && table.head==head && table.nextIdentity==identity);
+    table.nextIdentity=~uint64_t{0};
+    assert(!plan.Insert(table,anonymous(0x11000,0x13000)));
+    table.nextIdentity=identity;
+    assert(plan.Insert(table,anonymous(0x11000,0x13000))); // exact adjacent gap
+    assert(!plan.Insert(table,anonymous(0x15000,0x16000))); // no prepared node
+    mutation=false;verify(table);MappingRangeDestroy(table);assert(!allocations);
+}
+static void forkInsertionBenchmark() {
+    constexpr unsigned Count=20000;
+    MappingRangeTable table{};MappingRangePlan plan;assert(plan.Prepare(Count));
+    auto start=std::chrono::steady_clock::now();
+    mutation=true;
+    for(unsigned i=0;i<Count;++i)assert(plan.Insert(table,anonymous(0x10000+uint64_t(i)*8192,0x11000+uint64_t(i)*8192)));
+    mutation=false;
+    auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+    assert(verify(table)<=22);
+    for(unsigned i=0;i<Count;i+=37)checkLookup(table,0x10000+uint64_t(i)*8192);
+    MappingRangeDestroy(table);assert(!allocations);
+    std::printf("MAPPING_FORK_INSERT_BENCH ranges=%u elapsed_ns=%lld\n",Count,(long long)ns);
+}
+int main(int argc,char** argv) {
+    if(argc==2 && !std::strcmp(argv[1],"--benchmark")){forkInsertionBenchmark();return 0;}
+    rejectedInsertions(); orderedAndDeletion(); mixedEdits(); backingAndExtend(); backedTransplant(); failedEditsAndReuse();
     std::puts("MAPPING_RANGE_INDEX_PASS ordered/random rotations, edits, lookup oracle, OOM, backing lifetime");
 }

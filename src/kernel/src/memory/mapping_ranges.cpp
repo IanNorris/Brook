@@ -169,10 +169,23 @@ bool MappingRangePlan::CanReplace(const MappingRangeTable& table, uint64_t begin
     return available_ >= needed && table.nextIdentity <= ~uint64_t{0} - needed;
 }
 bool MappingRangePlan::Insert(MappingRangeTable& table, const MappingRange& range) {
-    if (!MappingRangeValid(range)) return false;
-    for (auto* node = table.head; node && node->range.begin < range.end; node = node->next)
-        if (node->range.end > range.begin) return false;
-    return Replace(table,range.begin,range.end,&range);
+    if (!prepared_ || !available_ || table.nextIdentity==~uint64_t{0} || !MappingRangeValid(range)) return false;
+    // Disjoint insertion needs no split/retirement. Find its list predecessor
+    // through the existing AVL index instead of walking the whole prefix in
+    // Insert, CanReplace and Replace. Fork copies ranges in increasing order;
+    // those repeated walks otherwise make metadata construction quadratic.
+    MappingRangeNode* predecessor=nullptr;
+    for(auto* node=table.root;node;) {
+        if(range.end<=node->range.begin)node=node->left;
+        else if(range.begin>=node->range.end){predecessor=node;node=node->right;}
+        else return false;
+    }
+    auto* inserted=Take(range,range.begin,range.end,table);
+    InvalidateLookup(table);
+    auto** link=predecessor?&predecessor->next:&table.head;
+    inserted->next=*link;*link=inserted;
+    table.root=IndexInsert(table.root,inserted);
+    return true;
 }
 bool MappingRangePlan::CanProtect(const MappingRangeTable& table, uint64_t begin, uint64_t end,
                                   uint32_t protection) const {
