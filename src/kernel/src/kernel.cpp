@@ -838,6 +838,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::PageableMemoryStartReserveWorker();
         brook::FilePageCacheStartReclaimWorker();
         brook::FileObjectStartWriteback();
+        brook::Ext2StartWriteback();
         brook::OomRecoveryStartWorker();
 
         // BRO-179 forensic: arm PID/seq-encoded heap poison now that the per-CPU

@@ -75,7 +75,7 @@ extern "C" void kfree(void* p){if(p){std::lock_guard<std::mutex> lock(trackingLo
 PhysicalAddress PmmAllocPage(MemTag,uint16_t){
     void* p=nullptr;assert(posix_memalign(&p,4096,4096)==0);{std::lock_guard<std::mutex> lock(trackingLock);frames.insert(p);}return PhysicalAddress(reinterpret_cast<uint64_t>(p));
 }
-void PmmFreePage(PhysicalAddress p){void* memory=reinterpret_cast<void*>(p.raw());{std::lock_guard<std::mutex> lock(trackingLock);assert(frames.erase(memory)==1);}std::free(memory);}
+void PmmFreePage(PhysicalAddress p){if(!p)return;void* memory=reinterpret_cast<void*>(p.raw());{std::lock_guard<std::mutex> lock(trackingLock);assert(frames.erase(memory)==1);}std::free(memory);}
 void KRwLockInit(KRwLock* lock){*lock={};fsLocks[lock]=std::make_unique<std::shared_mutex>();}
 void KRwLockReadLock(KRwLock* lock){fsLocks.at(lock)->lock_shared();}
 void KRwLockReadUnlock(KRwLock* lock){fsLocks.at(lock)->unlock_shared();}
@@ -171,6 +171,47 @@ int main(int argc,char** argv){
     m->skipPermChecks=true;
     VfsObject *root=nullptr,*held=nullptr,*marker=nullptr,*link=nullptr,*parent=nullptr;
     assert(!Ext2RootObject(m,0,&root));
+    // Actual ext2 namespace/data paths with write-behind enabled on a private
+    // second disk, including sticky short-OUT and failed-unmount retention.
+    {
+        auto cachedDisk=disk;
+        Device cachedDevice{&diskOps,"host-ext2-writebehind",DeviceType::Block,&cachedDisk};
+        auto* savedDevice=g_ext2Devices[1];g_ext2Devices[1]=&cachedDevice;
+        g_ext2WritebackMiB=1;void* cacheMount=nullptr;assert(Ext2FsMount(1,&cacheMount));
+        g_ext2WritebackMiB=0;
+        auto* cm=static_cast<Ext2Mount*>(cacheMount);cm->skipPermChecks=true;
+        assert(cm->writeback.byteCapacity==1024*1024);
+        VfsObject* cr=nullptr;assert(!Ext2RootObject(cm,1,&cr));int error=0;
+        auto* file=Ext2ObjectCreate(cr,"writebehind",VFS_O_WRITE,0600,&error);
+        assert(file&&!error);
+        std::vector<uint8_t> expected(64*1024),actual(expected.size());
+        for(unsigned i=0;i<expected.size();++i)expected[i]=(i*37+(i>>8))&255;
+        uint64_t position=0;
+        assert(file->ops->write(file,expected.data(),expected.size(),&position)==static_cast<int>(expected.size()));
+        assert(cm->writeback.count && cachedDisk==disk); // accepted, not persisted
+        position=0;assert(file->ops->read(file,actual.data(),actual.size(),&position)==static_cast<int>(actual.size()));
+        assert(actual==expected);
+        failFlush=true;assert(file->ops->fsync(file)==-5);
+        assert(cm->writeback.count && cm->bgdtDirty);
+        assert(Ext2FsUnmount(cm)==-5 && g_ext2Mounts[1]==cm && cm->writeback.count);
+        failFlush=false;assert(file->ops->fsync(file)==-5); // report deferred failed admission once
+        assert(!file->ops->fsync(file));assert(!cm->writeback.count);
+        // A short OUT is sticky even after ordered replay repairs the bytes.
+        const uint8_t patch=0xab;position=321;expected[position]=patch;
+        assert(file->ops->write(file,&patch,1,&position)==1 && cm->writeback.count);
+        shortWriteOffset=cm->writeback.records[0].offset;
+        assert(file->ops->fsync(file)==-5 && cm->writeError==-5 && cm->writeback.count);
+        assert(file->ops->fsync(file)==-5 && !cm->writeback.count);
+        assert(Ext2FsUnmount(cm)==-5 && g_ext2Mounts[1]==cm);
+        // Test-only repair acknowledgment; production never clears this error.
+        cm->writeError=cm->deferredSyncError=0;
+        position=0;assert(file->ops->read(file,actual.data(),actual.size(),&position)==static_cast<int>(actual.size()));
+        assert(actual==expected);assert(!file->ops->fsync(file));
+        closeNode(file);VfsObjectRelease(cr);assert(!Ext2FsUnmount(cm));
+        Ext2WritebackProbe gone{};assert(!Ext2GetWritebackProbe(1,gone));g_ext2Devices[1]=savedDevice;
+        std::ofstream cached(std::string(argv[1])+".child-writebehind",std::ios::binary|std::ios::trunc);
+        cached.write(reinterpret_cast<char*>(cachedDisk.data()),cachedDisk.size());assert(cached);
+    }
     // Exact inode identity survives hash collisions and cross-mount aliases.
     // A retained hit must succeed even when allocating a candidate would fail.
     {

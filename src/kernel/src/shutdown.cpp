@@ -6,6 +6,7 @@
 #include "audio.h"
 #include "vfs.h"
 #include "memory/file_object.h"
+#include "ext2_vfs.h"
 #include "fw_cfg.h"
 #include "portio.h"
 #include "apic.h"
@@ -103,6 +104,7 @@ void Worker(void*) {
             const auto cleanup=ProcessGetCleanupStatus();uint32_t apps=0;
             if(closed&&!births&&!Census(&apps)&&!cleanup.liveUserAddressSpaces&&!cleanup.queuedProcesses&&!cleanup.queuedAddressSpaces&&!cleanup.activeFinalizers) {
                 FileObjectStopWriteback();
+                Ext2StopWriteback();
                 if(!DeviceCloseWrites()){SchedulerSleepMs(25);continue;}
                 SetPhase(selected,Phase::Syncing);AudioStop();
                 const int error=VfsSync(nullptr);

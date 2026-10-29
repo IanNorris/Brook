@@ -1352,6 +1352,19 @@ static Vnode* GenExt2probe() {
     *p=0;return MakeProcVnode(buf,static_cast<uint32_t>(p-buf));
 }
 
+static Vnode* GenExt2writeback() {
+    auto* buf=static_cast<char*>(kmalloc(8192));if(!buf)return nullptr;
+    char* p=AppendStr(buf,"pdrv capacity queued records inputs merges writes bytes drains capacityDrains syncDrains backgroundDrains errors\n");
+    for(uint8_t i=0;i<16;++i) {
+        Ext2WritebackProbe q{};if(!Ext2GetWritebackProbe(i,q))continue;
+        if(p-buf+1024>=8192)break;p=AppendU64(p,i);
+        const uint64_t values[]={q.capacity,q.queued,q.records,q.inputs,q.merges,q.writes,q.bytes,
+            q.drains,q.capacityDrains,q.syncDrains,q.backgroundDrains,q.errors};
+        for(auto v:values){*p++=' ';p=AppendU64(p,v);}*p++='\n';
+    }
+    *p=0;return MakeProcVnode(buf,static_cast<uint32_t>(p-buf));
+}
+
 struct ProcGlobalEntry {
     const char* name;
     Vnode* (*gen)();
@@ -1369,6 +1382,7 @@ static ProcGlobalEntry g_globalEntries[] = {
     { "diskstats", GenDiskstats },
     { "blkprobe", GenBlkprobe },
     { "ext2probe", GenExt2probe },
+    { "ext2writeback", GenExt2writeback },
     { "filesystems", GenFilesystems },
 };
 static constexpr uint32_t NUM_GLOBAL = sizeof(g_globalEntries) / sizeof(g_globalEntries[0]);

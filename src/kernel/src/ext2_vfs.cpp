@@ -7,6 +7,7 @@
 // symlink creation, and the VfsFsOps vtable.
 
 #include "ext2_vfs.h"
+#include "fs/write_behind_queue.h"
 #include "vfs.h"
 #include "vfs_object.h"
 #include "memory/file_object.h"
@@ -28,6 +29,7 @@
 #include "rtc.h"
 #ifndef BROOK_HOST_TEST
 #include "fw_cfg.h"
+#include "scheduler.h"
 #endif
 
 namespace brook {
@@ -227,6 +229,7 @@ struct Ext2Mount {
     uint8_t** inodeBitmapCache;   // [groupCount]
     bool*     inodeBitmapDirty;   // [groupCount]
     Ext2SyncProbe syncProbe;
+    WriteBehindQueue writeback;
     uint32_t  pendingMetaOps;     // ops since last auto-sync
     int       deferredSyncError;  // an automatic sync failure not yet reported
     // A failed data/pointer/inode write may have been partially committed or
@@ -310,6 +313,19 @@ struct Ext2DirentCacheEntry {
 };
 
 static uint32_t g_ext2AutoSyncOps = 256;
+static uint32_t g_ext2WritebackMiB = 0; // opt-in until native acceptance
+static uint32_t g_ext2WritebackMs = 1000;
+static bool g_ext2QueueAvailable = true;
+static uint32_t Ext2ParseBounded(const char* value,uint32_t length,
+                                uint32_t low,uint32_t high,uint32_t fallback) {
+    if(!length || length>5)return fallback;
+    uint32_t result=0;
+    for(uint32_t i=0;i<length;++i) {
+        if(value[i]<'0' || value[i]>'9')return fallback;
+        result=result*10+static_cast<uint32_t>(value[i]-'0');
+    }
+    return result>=low && result<=high?result:fallback;
+}
 // Bounded experimental batching knob; zero never disables durability progress.
 static uint32_t Ext2ParseAutoSyncOps(const char* value, uint32_t length) {
     if(!length || length>5)return 256;
@@ -320,7 +336,7 @@ static uint32_t Ext2ParseAutoSyncOps(const char* value, uint32_t length) {
     }
     return result && result<=65536 ? result : 256;
 }
-enum class Ext2SyncReason { Mount, Auto, Fsync };
+enum class Ext2SyncReason { Mount, Auto, Fsync, Background };
 
 struct Ext2OpenInode {
     Ext2Mount* mnt;
@@ -511,16 +527,25 @@ void Ext2ForceUnlockForPid(uint32_t pid)
 // Device I/O helpers
 // ---------------------------------------------------------------------------
 
-// Read exactly `len` bytes from device at `byteOffset`.
-static bool Ext2DevRead(Ext2Mount* mnt, uint64_t byteOffset, void* buf, uint64_t len)
-{
-    int r = mnt->dev->ops->read(mnt->dev, byteOffset, buf, len);
-    if (r != static_cast<int>(len))
-    {
-        SerialPrintf("ext2: DevRead FAIL off=%llu len=%llu got=%d\n", byteOffset, len, r);
-        return false;
+// This backend bypasses the queue: drains must never enqueue recursively.
+struct Ext2RawBackend {
+    Ext2Mount* mnt;
+    bool Read(uint64_t offset,void* buffer,uint64_t length) {
+        return mnt->dev->ops->read(mnt->dev,offset,buffer,length)==static_cast<int>(length);
     }
-    return true;
+    bool Write(uint64_t offset,const void* buffer,uint64_t length) {
+        if(DeviceWrite(mnt->dev,offset,buffer,length)==static_cast<int>(length))return true;
+        // Preserve the existing permanent error for incomplete data/pointer/
+        // inode writes. A flush-only failure instead remains retryable.
+        mnt->writeError=-5;return false;
+    }
+    bool Flush(){return DeviceFlush(mnt->dev)==0;}
+};
+static bool Ext2DevRead(Ext2Mount* mnt,uint64_t offset,void* buffer,uint64_t length) {
+    Ext2RawBackend io{mnt};
+    const bool ok=mnt->writeback.bytes?mnt->writeback.Read(io,offset,buffer,length):io.Read(offset,buffer,length);
+    if(!ok)SerialPrintf("ext2: DevRead FAIL off=%llu len=%llu\n",offset,length);
+    return ok;
 }
 
 // Forward declarations for block cache helpers (defined after dirent cache).
@@ -554,12 +579,22 @@ static uint32_t Ext2ResolvePath(Ext2Mount* mnt, uint32_t startIno,
 // Write exactly `len` bytes to device at `byteOffset`.
 static bool Ext2DevWrite(Ext2Mount* mnt, uint64_t byteOffset, const void* buf, uint64_t len)
 {
-    int r = DeviceWrite(mnt->dev, byteOffset, buf, len);
-    if (r == static_cast<int>(len)) return true;
-    // All write callers hold g_ext2Lock exclusively. Successful later I/O
-    // cannot establish that an earlier failed pointer/inode write was repaired.
-    mnt->writeError = -5;
-    return false;
+    Ext2RawBackend io{mnt};
+    if(!mnt->writeback.bytes)return io.Write(byteOffset,buf,len);
+    if(!g_ext2QueueAvailable) {
+        if((mnt->writeback.count || mnt->writeback.retry) &&
+           mnt->writeback.Drain(io)!=WriteBehindQueue::Result::Ok) {
+            mnt->deferredSyncError=-5;return false;
+        }
+        return io.Write(byteOffset,buf,len);
+    }
+    const bool ok=mnt->writeback.Write(io,byteOffset,buf,len,
+                                     mnt->writeback.count?mnt->writeback.oldestNs:RtcNowNs());
+    if(!ok) {
+        mnt->deferredSyncError=-5;
+        if(mnt->writeback.retry && !mnt->writeback.oldestNs)mnt->writeback.oldestNs=RtcNowNs();
+    }
+    return ok;
 }
 
 // --- Inode read cache helpers ---
@@ -848,7 +883,16 @@ static int Ext2Sync(Ext2Mount* mnt, Ext2SyncReason reason=Ext2SyncReason::Mount)
         if (!Ext2DevWrite(mnt, 1024 + __builtin_offsetof(Ext2Superblock, s_free_blocks_count),
                          totals, sizeof(totals))) result = -5;
     }
-    int flushError = DeviceFlush(mnt->dev);
+    int flushError=0;
+    if(mnt->writeback.bytes) {
+        if(reason==Ext2SyncReason::Background)++mnt->writeback.backgroundDrains;
+        else ++mnt->writeback.syncDrains;
+        Ext2RawBackend io{mnt};
+        if(mnt->writeback.Drain(io)!=WriteBehindQueue::Result::Ok) {
+            flushError=-5;
+            if(mnt->writeback.retry && !mnt->writeback.oldestNs)mnt->writeback.oldestNs=RtcNowNs();
+        }
+    } else flushError=DeviceFlush(mnt->dev);
     if (!result) result = flushError;
     // Retain dirty metadata until the complete write+flush succeeds. A retry
     // rewrites the same cached values even after a device flush failure.
@@ -3028,6 +3072,15 @@ static bool Ext2FsMount(uint8_t pdrv, void** mountPriv)
         if (mnt->blockCacheData) { kfree(mnt->blockCacheData); mnt->blockCacheData = nullptr; }
     }
 
+    if(g_ext2WritebackMiB) {
+        constexpr uint32_t slots=4096;
+        auto* rows=static_cast<WriteBehindQueue::Record*>(kmalloc(slots*sizeof(WriteBehindQueue::Record)));
+        const uint32_t size=g_ext2WritebackMiB*1024*1024;
+        auto* data=static_cast<uint8_t*>(kmalloc(size));
+        if(rows && data)mnt->writeback.Init(rows,slots,data,size);
+        else {if(rows)kfree(rows);if(data)kfree(data);}
+        SerialPrintf("ext2: pdrv %u write-behind %u bytes (requested %u MiB)\n",pdrv,mnt->writeback.byteCapacity,g_ext2WritebackMiB);
+    }
     *mountPriv = mnt;
     KRwLockWriteLock(&g_ext2Lock);
     g_ext2Mounts[pdrv] = mnt;
@@ -3095,6 +3148,8 @@ static int Ext2FsUnmount(void* mountPriv)
     if (mnt->inodeCache) kfree(mnt->inodeCache);
     if (mnt->direntCache) kfree(mnt->direntCache);
     if (mnt->bgdt) kfree(mnt->bgdt);
+    if(mnt->writeback.bytes)kfree(mnt->writeback.bytes);
+    if(mnt->writeback.records)kfree(mnt->writeback.records);
     kfree(mnt);
     return 0;
 }
@@ -3126,6 +3181,17 @@ bool Ext2GetSyncProbe(uint8_t pdrv,Ext2SyncProbe& out) {
     if(mnt) {out=mnt->syncProbe;out.pendingOps=mnt->pendingMetaOps;}
     KRwLockReadUnlock(&g_ext2Lock);
     return mnt!=nullptr;
+}
+
+bool Ext2GetWritebackProbe(uint8_t pdrv,Ext2WritebackProbe& out) {
+    if(pdrv>=EXT2_MAX_MOUNTS)return false;
+    KRwLockReadLock(&g_ext2Lock);auto* mnt=g_ext2Mounts[pdrv];
+    if(mnt) {
+        const auto& q=mnt->writeback;
+        out={q.byteCapacity,q.used,q.count,q.inputs,q.merges,q.backendWrites,q.backendBytes,
+             q.drains,q.capacityDrains,q.syncDrains,q.backgroundDrains,q.errors};
+    }
+    KRwLockReadUnlock(&g_ext2Lock);return mnt!=nullptr;
 }
 
 // Consumes hold on every path; no filesystem lock is held during allocation.
@@ -4602,9 +4668,51 @@ void Ext2ConfigureAutoSync() {
     char option[8]{};
     const uint32_t length=FwCfgReadFile("opt/ext2-auto-sync-ops",option,sizeof(option));
     g_ext2AutoSyncOps=Ext2ParseAutoSyncOps(option,length);
+    const auto size=FwCfgReadFile("opt/ext2-writeback-mib",option,sizeof(option));
+    g_ext2WritebackMiB=Ext2ParseBounded(option,size,0,16,0);
+    const auto age=FwCfgReadFile("opt/ext2-writeback-ms",option,sizeof(option));
+    g_ext2WritebackMs=Ext2ParseBounded(option,age,250,10000,1000);
     SerialPrintf("ext2: automatic sync every %u allocation/free operations\n",g_ext2AutoSyncOps);
 #endif
 }
+
+#ifndef BROOK_HOST_TEST
+static bool g_ext2WritebackEnabled=false;
+static bool g_ext2WritebackStarted=false;
+static void Ext2WritebackWorker(void*) {
+    for(;;) {
+        SchedulerSleepMs(250);
+        KRwLockWriteLock(&g_ext2Lock);
+        if(g_ext2WritebackEnabled) {
+            const uint64_t now=RtcNowNs();
+            for(uint32_t i=0;i<EXT2_MAX_MOUNTS;++i) {
+                auto* mnt=g_ext2Mounts[i];if(!mnt || (!mnt->writeback.count && !mnt->writeback.retry))continue;
+                const auto age=now>=mnt->writeback.oldestNs?now-mnt->writeback.oldestNs:0;
+                if(age<static_cast<uint64_t>(g_ext2WritebackMs)*1000000)continue;
+                const int error=Ext2Sync(mnt,Ext2SyncReason::Background);
+                if(error)mnt->deferredSyncError=error;
+            }
+        }
+        KRwLockWriteUnlock(&g_ext2Lock);
+    }
+}
+void Ext2StartWriteback() {
+    if(!g_ext2WritebackMiB || g_ext2WritebackStarted)return;
+    auto* worker=KernelThreadCreate("ext2-writeback",Ext2WritebackWorker,nullptr,3);
+    if(!worker) {
+        KRwLockWriteLock(&g_ext2Lock);g_ext2QueueAvailable=false;
+        for(uint32_t i=0;i<EXT2_MAX_MOUNTS;++i)if(auto* mnt=g_ext2Mounts[i]) {
+            const int error=Ext2Sync(mnt);if(error)mnt->deferredSyncError=error;
+        }
+        KRwLockWriteUnlock(&g_ext2Lock);
+        SerialPuts("ext2: writeback worker unavailable; using synchronous writes\n");return;
+    }
+    g_ext2WritebackEnabled=g_ext2WritebackStarted=true;SchedulerAddProcess(worker);
+}
+void Ext2StopWriteback() {
+    KRwLockWriteLock(&g_ext2Lock);g_ext2WritebackEnabled=false;KRwLockWriteUnlock(&g_ext2Lock);
+}
+#endif
 
 void Ext2VfsRegister()
 {

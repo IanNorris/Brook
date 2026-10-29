@@ -14,6 +14,13 @@ struct Ext2SyncProbe {
     uint32_t autoOps, pendingOps;
 };
 bool Ext2GetSyncProbe(uint8_t pdrv, Ext2SyncProbe& out);
+struct Ext2WritebackProbe {
+    uint64_t capacity, queued, records, inputs, merges, writes, bytes;
+    uint64_t drains, capacityDrains, syncDrains, backgroundDrains, errors;
+};
+bool Ext2GetWritebackProbe(uint8_t pdrv,Ext2WritebackProbe& out);
+void Ext2StartWriteback();
+void Ext2StopWriteback();
 
 // Register "ext2" filesystem driver with the VFS.
 void Ext2VfsRegister();
