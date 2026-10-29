@@ -1171,3 +1171,68 @@ must establish reachability under the current exclusive/prefault restrictions.
 General shared-AS enrollment additionally requires identity/permission stability
 and explicit asynchronous/device-buffer ownership. A single-thread executable
 whitelist would be an experiment, not a substitute for those requirements.
+
+### Application and boot comparisons requested on 29 October
+
+Include Steam startup using private copies of the preserved signed-in disks.
+Retain the original authenticated image and keep credentials, profiles and raw
+account-bearing logs outside Git. Historical Steam observations include 102.4 s
+and 173.5 s in `stardew-native64.md`; these are contextual observations, not
+matched compression controls. Record cold/warm state, image layout, host I/O
+pressure, request-to-window time, memory use and disk bytes for new comparisons.
+
+Include OS boot latency as a separate acceptance metric. Existing harnesses
+record host-observed boot durations; the compositor emits
+`BOOT: desktop presented in ... ms`. Preserve both endpoints: the compositor's
+guest duration is not the whole host launch-to-desktop interval. Break down
+loader payload reads, decompression, kernel initialization and desktop warm-up
+before attributing an improvement to compression. Current brookimg compression
+covers immutable Nix files, not the kernel or boot modules. Boot-payload
+compression therefore needs a separate loader implementation and matched
+uncompressed/compressed tests, including integrity and failure handling.
+
+If loader reads are significant, evaluate one contiguous compressed boot pack
+with explicit offsets/relocations and hardware-change fallback. Prior boot
+discovery may inform its contents but must not replace hardware discovery.
+Separately measure the driver dependency graph: after memory, interrupts and
+bus discovery, initialize independent graphics/network/audio paths concurrently
+where their dependencies permit. Desktop readiness need only await services it
+uses. Neither optimization is implemented by the current Nix-store format.
+
+### Atomic allocation capture and vectored-I/O leases (29 October)
+
+Memory-category strace records now print arguments, result and process name in
+one serial-lock acquisition. Split prefix/result output previously interleaved
+across CPUs, preventing reliable result attribution. The host analyzer
+`scripts/analyze_memory_trace.py` rejects incomplete, malformed, empty and
+suppressed captures. Its counts describe completed virtual-memory requests,
+not RSS, distinct bytes or lifetime peaks; candidate shapes are not admission
+proof. Four parser tests cover attribution, errors, exclusions and bad records.
+
+Two fresh unchanged-allocation C++ compile/link/run captures both pass. Each
+cc1plus has 123 successful mmap calls (107,826,276 requested bytes), including
+57 private anonymous RW, non-fixed/non-populated requests between 64 KiB and
+16 MiB totaling 93,757,440 bytes (89.414 MiB). All recorded memory calls parse;
+no errors/suppression are present in these compiler records. This supports a
+bounded real-allocator experiment, not general app paging. Detailed census
+sampling and tracing perturb timing; these runs are not performance controls.
+Evidence: application-allocation-profile-atomic/native/{trace.log,
+trace-census.log,trace-analysis.json,trace-census-analysis.json,captures.json}.
+
+readv/writev now retain an outer user-access scope while their nested scalar
+handlers run, covering descriptor rereads after the inner scopes unwind. The
+conservative entry prefault policy remains in place. This closes an explicit
+lifetime gap before wider enrollment; no naturally occurring crash under the
+current exclusive-AS/prefault policy has been demonstrated. It does not solve
+concurrent unmap/protection changes or asynchronous buffer ownership.
+
+The new native vector fixture verifies cold two-page descriptor arrays, 64
+disjoint payload buffers (registry overflow conservatively covers the AS),
+generic file reads/writes, append, stream/packet pipes, read-only destinations,
+invalid descriptors/counts, zero vectors and zero remaining leases. It passes
+before/after the 256 MiB pressure workload with raw and compressed-RAM backing.
+All 43 native jobs pass; both VMs sync/stop and original owners exit zero.
+Eleven relevant host tests and compiled entry/startup mutation audits pass.
+Evidence: vector-io-acceptance/{metadata.json,native.log,native-raw/,native-ram/,
+entry-audit.json,scheduler-audit.json}. Ordinary anonymous app paging remains
+disabled pending a scoped enrollment policy and further kernel-access work.

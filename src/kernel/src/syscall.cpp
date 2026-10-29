@@ -4682,6 +4682,9 @@ static int64_t sys_readv(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
                           uint64_t, uint64_t, uint64_t)
 {
     if (iovcnt > 1024) return -EINVAL;
+    // The generic loop rereads descriptors after nested sys_read scopes.
+    // Keep their pages excluded until the entire outer operation finishes.
+    UserAccessScope vectorAccess(ProcessCurrent());
     if (!UserBufferReadable(iovAddr, iovcnt * sizeof(iovec))) return -EFAULT;
     const auto* iov = reinterpret_cast<const iovec*>(iovAddr);
     Process* proc=ProcessCurrent();FdRef entry(proc,static_cast<int>(fd));
@@ -4711,6 +4714,7 @@ static int64_t sys_writev(uint64_t fd, uint64_t iovAddr, uint64_t iovcnt,
                            uint64_t, uint64_t, uint64_t)
 {
     if (iovcnt > 1024) return -EINVAL;
+    UserAccessScope vectorAccess(ProcessCurrent());
     if (!UserBufferReadable(iovAddr, iovcnt * sizeof(iovec))) return -EFAULT;
     const auto* iov = reinterpret_cast<const iovec*>(iovAddr);
     Process* proc = ProcessCurrent();
@@ -15515,6 +15519,21 @@ static int64_t SyscallDispatchTraced(uint64_t num, uint64_t a0, uint64_t a1,
     s_lastNum = num;
     s_lastA0  = a0;
     s_lastRet = ret;
+
+    // One SerialPrintf holds the serial lock for the complete record. A split
+    // prefix/result lets another CPU's syscall or debug output steal the result
+    // attribution, making allocation lifetimes impossible to reconstruct.
+    if(SyscallCategory(num)==SC_MEM) {
+        if(num==SYS_MMAP) {
+            if(isError)SerialPrintf("[strace:%u] mmap(0x%lx, %lu, 0x%lx, 0x%lx, %ld, 0x%lx) = %ld (err) comm=\"%s\"\n",proc->pid,a0,a1,a2,a3,(int64_t)a4,a5,ret,proc->name);
+            else SerialPrintf("[strace:%u] mmap(0x%lx, %lu, 0x%lx, 0x%lx, %ld, 0x%lx) = 0x%lx comm=\"%s\"\n",proc->pid,a0,a1,a2,a3,(int64_t)a4,a5,(uint64_t)ret,proc->name);
+        } else if(num==SYS_BRK) {
+            SerialPrintf("[strace:%u] brk(0x%lx, 0x%lx, 0x%lx) = 0x%lx comm=\"%s\"\n",proc->pid,a0,a1,a2,(uint64_t)ret,proc->name);
+        } else {
+            SerialPrintf("[strace:%u] %s(0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx, 0x%lx) = %ld comm=\"%s\"\n",proc->pid,name?name:"memory",a0,a1,a2,a3,a4,a5,ret,proc->name);
+        }
+        return ret;
+    }
 
     // Log entry — format depends on syscall type for readability
     if (num == SYS_OPEN || num == SYS_OPENAT) {
