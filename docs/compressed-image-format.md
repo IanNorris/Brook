@@ -35,8 +35,10 @@ checksum covers bytes from offset 160 through the payload boundary, including
 zero padding. Header checksum covers bytes [0,136), including the metadata
 checksum. Unknown features, unsupported versions and noncanonical table layouts
 fail closed. Image length may be smaller than its backing device, but may not
-exceed it. The complete serialized index including header/padding is capped at
-16 MiB before allocating it.
+exceed it. The reader caps the complete serialized index including header/padding
+at 32 MiB before allocating it. Readers built before the full-store checkpoint
+use a 16 MiB cap and reject larger indexes; stage the matching newer kernel.
+The layout and version remain unchanged, and smaller existing images still work.
 
 An inode records kind (1 directory, 2 regular, 3 textual symlink), full Unix mode,
 UID/GID, size, first block/count, symlink target offset/length, reserved zero word
@@ -149,8 +151,13 @@ kernel decode reuses the separately built freestanding scalar codec.
 
 Packing streams file payloads through a temporary file instead of retaining
 the complete data in RAM. It rejects source symlink traversal and source files
-that change during their read, preserves regular hardlinks, and normalizes
-timestamps to zero. It strips privileged mode bits. This is not an atomic
+that change during their read, preserves regular hardlinks, and normally
+normalizes timestamps to zero. With `--source-metadata`, the read-only ext2
+exporter's complete namespace/content manifest supplies original UID/GID, mode
+and whole-second mtime without privileged host chown. Packing verifies content,
+hardlink identity and literal symlinks against it. See
+[the full-store workflow](full-store-compression-20261029.md).
+It strips privileged mode bits. This is not an atomic
 snapshot of a changing source filesystem. Images are created exclusively and
 never overwrite an existing path. A failed build may leave an incomplete new
 output, which cannot pass validation.
@@ -158,8 +165,8 @@ output, which cannot pass validation.
 Extraction requires a newly created destination and uses directory-relative
 no-follow operations and exclusive file creation. It never follows image-created
 symlinks, including absolute/escaping targets; they are reproduced as text.
-It preserves regular hardlinks, modes without privileged bits, and normalized
-timestamps, and never restores ownership. Restrictive directory modes are
+It preserves regular hardlinks, modes without privileged bits, and the image's
+mtime seconds, and never restores ownership. Restrictive directory modes are
 applied after population. The newly created output tree must not be concurrently
 modified by another actor. A payload error fails the command and can leave an
 explicit partial new tree; it does not merge into existing files. Export produces

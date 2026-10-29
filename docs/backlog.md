@@ -1792,3 +1792,13 @@ automatic capability selection and the import/capture sequencing; rebuilding
 waylandd alone does not remove the source-level prerequisite. Preserve the
 lifetime/fence checks rather than bypassing the rejection. Private evidence is
 under `build/reviews/paging-steam-20261029/responsiveness/direct-setup-failed/`.
+
+### TCP socket slot lifetime and Steam exit (29 October)
+
+The final paging/compression acceptance exposed an epoll graph owner stranded
+on a socket ticket that was skipped by slot reset. Preserve permanent per-slot
+synchronization and cover complete packet/maintenance callback lifetimes before
+free/reuse; do not merely zero/reinitialize the lock or bypass protected exit.
+[Captured cause and bounded repair gates](socket-slot-lifetime-20261029.md).
+This is the current acceptance prerequisite, with the failed private VM stopped
+and its evidence preserved; it is not counted as a completed Steam control.

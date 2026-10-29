@@ -300,3 +300,32 @@ guest sync/shutdown, QEMU exit zero and original launch-owner exit zero. All six
 read-only ext2 checks of data/Nix/tmp pass afterward. Detailed traces, matched
 request receipts, visual evidence, phase analyses, comparison and filesystem
 reports are retained under `responsiveness/` in the ignored evidence directory.
+
+## Reverse-order startup observations and outstanding cleanup
+
+The reverse-order observations are 95.90 s LZ4 and 85.68 s raw to the Steam
+window title. Both saved frames show an authenticated Store without login/QR
+or an error screen; the featured carousel area is blank in the sampled images,
+so complete network asset loading is not established. Together with the first
+pair, raw spans 85.68–87.79 s and LZ4 85.26–95.90 s. There is no repeatable whole
+Steam startup improvement demonstrated by these samples.
+
+Reverse guest desktop-presented events are 5,160 ms LZ4 and 4,963 ms raw. Host
+launcher-to-observed-event times are 10.19 and 9.43 s, polled at 50 ms intervals;
+these include host setup/firmware and are not physical scanout timestamps.
+The first pair's guest times were 5,125 ms LZ4 and 5,060 ms raw. Boot remains
+around five seconds; this does not establish a boot-time gain from compression.
+
+The repeat LZ4 control completes normal client exit, checked sync/shutdown and
+original owner exit zero. The final raw control does not: its normal shutdown
+helper stays live because an existing socket-reuse bug strands a TCP receiver
+while it owns the global epoll graph mutex. The exact job is followed after the
+observation timeout; it is not retried or declared terminal from the timeout.
+Its process/lock/stack/profile evidence is preserved, and the cloned VM is stopped
+after the bridge's checked filesystem/device flush. This forced stop is not a
+clean application-shutdown acceptance result. See
+[the socket-lifetime diagnosis](socket-slot-lifetime-20261029.md).
+
+Accordingly, the throughput and staged responsiveness gates pass, but the
+final stability control remains incomplete. No overall goal completion is
+claimed at this checkpoint.
