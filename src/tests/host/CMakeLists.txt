@@ -54,6 +54,7 @@ endfunction()
 
 enable_testing()
 add_host_test(test_virtio_read_plan)
+add_host_test(test_virtio_write_plan)
 add_host_test(test_exec_stack_budget)
 add_host_test(test_page_store "${BROOK_ROOT}/src/kernel/src/memory/page_store.cpp" "${BROOK_ROOT}/src/kernel/src/memory/compressed_page_pool.cpp")
 add_host_test(test_compressed_page_pool "${BROOK_ROOT}/src/kernel/src/memory/compressed_page_pool.cpp")

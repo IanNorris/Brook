@@ -1,6 +1,7 @@
 #include "apic.h"
 #include "virtio_blk.h"
 #include "virtio_blk_read_plan.h"
+#include "virtio_blk_write_plan.h"
 #include "pci.h"
 #include "portio.h"
 #include "string.h"
@@ -1249,106 +1250,28 @@ static int VirtioBlkWrite(Device* dev, uint64_t offset, const void* buf, uint64_
     if (offset >= deviceBytes) return -1;
     if (len > deviceBytes - offset) len = deviceBytes - offset;
 
-    uint64_t startSector = offset / SECTOR_SIZE;
-    uint64_t endSector   = (offset + len + SECTOR_SIZE - 1) / SECTOR_SIZE;
-
-    // Detect partial first/last sectors that need read-modify-write.
-    bool partialFirst = (offset % SECTOR_SIZE) != 0;
-    bool partialLast  = ((offset + len) % SECTOR_SIZE) != 0 && endSector > startSector;
-    // Single-sector write that is partial on both ends:
-    if (endSector - startSector == 1 && ((offset % SECTOR_SIZE) != 0 || (offset + len) % SECTOR_SIZE != 0))
-        partialFirst = true;
-
-    const uint8_t* srcBytes = static_cast<const uint8_t*>(buf);
-    uint64_t bytesWritten = 0;
-    auto* dmaBuf = s->dmaBuf;
-
+    static_assert(VIRTIO_CACHE_BLOCK_SIZE==4096 && VIRTIO_CACHE_BLOCK_SECTORS==8);
+    struct Backend {
+        VirtioBlkState& state;
+        uint8_t* Cached(uint64_t block){uint8_t* data=nullptr;return CacheLookup(state,block,&data)?data:nullptr;}
+        void Invalidate(uint64_t first,uint64_t end){CacheInvalidateRange(state,first,end);}
+        bool Read(uint64_t sector,uint32_t count,uint8_t*) {
+            return SubmitRequest(state,VIRTIO_BLK_T_IN,sector,state.dmaBufPhys,count*SECTOR_SIZE);
+        }
+        bool Write(uint64_t sector,uint32_t count,const uint8_t*) {
+            return SubmitRequest(state,VIRTIO_BLK_T_OUT,sector,state.dmaBufPhys,count*SECTOR_SIZE);
+        }
+        int64_t ScatterWrite(uint64_t sector,uint32_t count,const uint8_t* source) {
+            return SubmitScatterGatherWrite(state,sector,count,source);
+        }
+    } io{*s};
     AcquireRequestLock(*s);
-
-    uint64_t sec = startSector;
-
-    // Fast path (BRO-169): a fully sector-aligned write needs no read-modify-write,
-    // so stream it to the device zero-copy via scatter-gather — the device reads
-    // straight from the source pages, skipping the bounce-buffer memcpy and lifting
-    // the 256 KB legacy-buffer cap (up to ~800 KB per round-trip). On any SG failure
-    // we simply fall through to the legacy loop below, which resumes from the
-    // already-written sector (still aligned, so it too needs no RMW).
-    if (!partialFirst && !partialLast &&
-        (offset % SECTOR_SIZE) == 0 && (len % SECTOR_SIZE) == 0)
-    {
-        // Cap each chunk so the worst-case descriptor count (mid pages + head +
-        // tail) stays within SG_MAX_DATA.
-        static constexpr uint32_t SG_CHUNK_SECTORS = (SG_MAX_DATA - 2) * 8;
-        while (sec < endSector)
-        {
-            uint32_t chunkSectors = static_cast<uint32_t>(endSector - sec);
-            if (chunkSectors > SG_CHUNK_SECTORS) chunkSectors = SG_CHUNK_SECTORS;
-
-            int sgResult = SubmitScatterGatherWrite(*s, sec, chunkSectors,
-                                                    srcBytes + bytesWritten);
-            if (sgResult <= 0)
-                break; // fall back to legacy bounce path for the remainder
-
-            CacheInvalidateRange(*s, sec, sec + chunkSectors);
-            sec          += chunkSectors;
-            bytesWritten += static_cast<uint64_t>(sgResult);
-        }
-
-        if (sec >= endSector)
-        {
-            ReleaseRequestLock(*s);
-            s->writeOps++;
-            s->writeBytes += bytesWritten;
-            return static_cast<int>(bytesWritten);
-        }
-    }
-
-    while (sec < endSector && bytesWritten < len)
-    {
-        uint32_t batch = static_cast<uint32_t>(endSector - sec);
-        if (batch > SECTORS_PER_DMA) batch = SECTORS_PER_DMA;
-        uint32_t dmaLen = batch * SECTOR_SIZE;
-
-        // Read-modify-write: pre-read sectors that will be partially overwritten
-        // so we don't zero out data we're not writing.
-        bool needPreRead = (partialFirst && sec == startSector) ||
-                           (partialLast && sec + batch == endSector);
-        if (needPreRead) {
-            if (!SubmitRequest(*s, VIRTIO_BLK_T_IN, sec, s->dmaBufPhys, dmaLen)) {
-                ReleaseRequestLock(*s);
-                return -1;
-            }
-        }
-        // No memset needed: when !needPreRead, all sectors in this batch
-        // are fully overwritten by the memcpy loop below.
-
-        for (uint32_t i = 0; i < batch && bytesWritten < len; ++i)
-        {
-            uint64_t sectorStart = (sec + i) * SECTOR_SIZE;
-            uint64_t copyStart   = (sectorStart < offset) ? (offset - sectorStart) : 0;
-            uint64_t copyEnd     = SECTOR_SIZE;
-            uint64_t remaining   = len - bytesWritten;
-            if (copyEnd - copyStart > remaining) copyEnd = copyStart + remaining;
-
-            uint8_t* dstSector = dmaBuf + (i * SECTOR_SIZE);
-            uint64_t n = copyEnd - copyStart;
-            memcpy(dstSector + copyStart, srcBytes + bytesWritten, n);
-            bytesWritten += n;
-        }
-
-        if (!SubmitRequest(*s, VIRTIO_BLK_T_OUT, sec, s->dmaBufPhys, dmaLen)) {
-            ReleaseRequestLock(*s);
-            return -1;
-        }
-
-        CacheInvalidateRange(*s, sec, sec + batch);
-        sec += batch;
-    }
-
+    const auto result=VirtioPlanWrite(io,offset,static_cast<const uint8_t*>(buf),len,s->dmaBuf,
+                                     SECTORS_PER_DMA,(SG_MAX_DATA-2)*8);
     ReleaseRequestLock(*s);
-    s->writeOps++;
-    s->writeBytes += bytesWritten;
-    return static_cast<int>(bytesWritten);
+    if(!result.ok)return -1;
+    s->writeOps++;s->writeBytes+=result.bytes;
+    return static_cast<int>(result.bytes);
 }
 
 static int VirtioBlkIoctl(Device* dev, uint32_t cmd, void* arg)
