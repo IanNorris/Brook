@@ -126,6 +126,7 @@ using VmmRetireLeaf = void (*)(VirtualAddress, uint64_t leaf, void* context);
 struct VmmRangeStats {
     uint64_t backedPages = 0, hiddenPages = 0, cowPages = 0, writablePages = 0;
     uint64_t multiplyMappedPages = 0, unknownMapCountPages = 0;
+    uint64_t exclusiveManagedPages = 0; // scoring estimate, not a pin or reclamation promise
     // 16 fractional bits; division uses user mapcount, not cache/staging refs.
     uint64_t proportionalUnits = 0;
     uint64_t tableEntriesVisited = 0, lockBatches = 0;
@@ -134,6 +135,11 @@ struct VmmRangeStats {
 // IRQ-lock hold. Caller retains the AS and stabilizes its range topology.
 // Unmanaged device leaves must pass accountRam=false; borrowed memfd is RAM.
 // Huge leaves are unsupported and fail with zero output.
+// Single bounded table-traversal batch for pressure workers. Caller retains the
+// AS and stabilizes topology for this call only. Resume by numeric next address,
+// never by retaining a mapping-node/PTE pointer across unlocked batches.
+bool VmmMeasureRangeStep(PageTable pt, uint64_t begin, uint64_t end,
+                         bool accountRam, VmmRangeStats* stats, uint64_t* next);
 bool VmmMeasureRange(PageTable pt, uint64_t begin, uint64_t end,
                      bool accountRam, VmmRangeStats* stats);
 bool VmmCountRangeLeaves(PageTable pt, uint64_t begin, uint64_t end, uint64_t* count);

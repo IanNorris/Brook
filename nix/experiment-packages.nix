@@ -7,6 +7,7 @@ let
   files = import ../tools/brook-files-pkg {};
   gallery = import ../tools/brook-gallery-pkg { inherit pkgs; };
   settings = import ../tools/brook-settings-pkg { inherit pkgs; };
+  message = import ../tools/brook-message-pkg { inherit pkgs; };
   fonts = import ../tools/brook-fonts-pkg {};
   cursors = import ../tools/brook-cursor-theme {};
   yquake = import ../tools/yquake2-brook-pkg { inherit pkgs; };
@@ -80,7 +81,7 @@ in {
       pkgs.python3 pkgs.ffmpeg.bin pkgs.wayland pkgs.mesa
       pkgs.libreoffice pkgs.gimp pkgs.qalculate-gtk pkgs.xfce.mousepad
       firefox chromium
-      waylandd calc player files settings gallery fonts cursors launchers session
+      waylandd calc player files settings message gallery fonts cursors launchers session
     ];
     ignoreCollisions = true;
   };

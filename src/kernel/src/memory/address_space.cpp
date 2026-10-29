@@ -24,6 +24,7 @@ static AddressSpaceState g_kernelSpace;
 static uint64_t g_identity;
 static IrqSpinLock g_cleanupLock;
 static IrqSpinLock g_registryLock;
+static AddressSpaceDestructionWatch* g_destructionWatch;
 static AddressSpaceState* g_publishedSpaces;
 static AddressSpaceState* g_spaceHead;
 static AddressSpaceState* g_spaceTail;
@@ -181,7 +182,24 @@ static bool BorrowedTeardownLeaf(VirtualAddress address, uint64_t, void* opaque)
     // its range record exists; borrowed leaves always publish metadata first.
     return false;
 }
+bool AddressSpaceWatchDestruction(AddressSpaceState* space,AddressSpaceDestructionWatch* watch) {
+    if(!space || space->kernel || !watch)return false;
+    const auto flags=IrqSpinLockAcquire(&g_cleanupLock);
+    const bool available=!g_destructionWatch;
+    if(available) {
+        watch->identity=space->identity;
+        __atomic_store_n(&watch->done,false,__ATOMIC_RELEASE);
+        g_destructionWatch=watch;
+    }
+    IrqSpinLockRelease(&g_cleanupLock,flags);return available;
+}
+void AddressSpaceCancelDestructionWatch(AddressSpaceDestructionWatch* watch) {
+    const auto flags=IrqSpinLockAcquire(&g_cleanupLock);
+    if(g_destructionWatch==watch)g_destructionWatch=nullptr;
+    IrqSpinLockRelease(&g_cleanupLock,flags);
+}
 static void DestroyAddressSpace(AddressSpaceState* space) {
+    const uint64_t destroyedIdentity=space->identity;
     // Refcount zero: no task/fault/job can enter this page table again. No
     // sleeping mutex is required, and all filesystem finalizers run here.
     TlbShootdownFull(space->pageTable.pml4.raw(), space->tlbCpuMask);
@@ -198,6 +216,12 @@ static void DestroyAddressSpace(AddressSpaceState* space) {
     const auto flags=IrqSpinLockAcquire(&g_cleanupLock);
     --g_cleanupStatus.liveUserAddressSpaces;
     ++g_cleanupStatus.completedAddressSpaces;
+    if(g_destructionWatch && g_destructionWatch->identity==destroyedIdentity) {
+        // Publish under the same guard as cancellation/reuse: an old callback
+        // cannot complete a newly registered watch. No allocation or wake here.
+        __atomic_store_n(&g_destructionWatch->done,true,__ATOMIC_RELEASE);
+        g_destructionWatch=nullptr;
+    }
     IrqSpinLockRelease(&g_cleanupLock,flags);
 }
 bool ProcessCleanupStep() {

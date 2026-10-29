@@ -9,7 +9,7 @@ let
   native = map (name: let f = import (../tools + "/${name}"); in
     f (if builtins.hasAttr "pkgs" (builtins.functionArgs f) then { inherit pkgs; } else {})) [
     "waylandd-pkg" "wayland-calc-pkg" "brook-player-pkg" "brook-files-pkg"
-    "brook-gallery-pkg" "brook-settings-pkg" "brook-session-pkg" "locale-brook-pkg"
+    "brook-gallery-pkg" "brook-settings-pkg" "brook-message-pkg" "brook-session-pkg" "locale-brook-pkg"
   ];
   launchers = pkgs.runCommand "brook-release-launchers" { meta.license = pkgs.lib.licenses.mit; } ''
     mkdir -p $out/bin

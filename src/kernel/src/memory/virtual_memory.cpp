@@ -532,6 +532,9 @@ static bool MeasureTable(uint64_t* table, unsigned level, uint64_t base,
                     if (!mappings) ++stats.unknownMapCountPages;
                     else {
                         if (mappings>1) ++stats.multiplyMappedPages;
+                        if (mappings==1 && !(entry&PTE_COW_BIT) &&
+                            PmmGetRefCount(VmmLeafPhysical(entry))==1)
+                            ++stats.exclusiveManagedPages;
                         stats.proportionalUnits += (4096ULL<<16)/mappings;
                     }
                 }
@@ -539,6 +542,22 @@ static bool MeasureTable(uint64_t* table, unsigned level, uint64_t base,
             walk.cursor=high;
         }
     }
+    return true;
+}
+bool VmmMeasureRangeStep(PageTable pt, uint64_t begin, uint64_t end,
+                         bool accountRam, VmmRangeStats* stats, uint64_t* next)
+{
+    if (!stats || !next) return false;
+    *stats={};*next=begin;
+    if (!ValidLeafRange(pt,begin,end)) return false;
+    VmmRangeStats measured{};
+    MeasureWalk walk{begin,4096,accountRam,&measured};
+    const uint64_t irq=IrqSpinLockAcquire(&g_userPtLock);
+    auto* table=reinterpret_cast<uint64_t*>(PhysToVirt(pt.pml4).raw());
+    const bool valid=MeasureTable(table,4,0,begin,end,walk);
+    IrqSpinLockRelease(&g_userPtLock,irq);
+    if (!valid || walk.cursor<=begin) return false;
+    measured.lockBatches=1;*stats=measured;*next=walk.cursor;
     return true;
 }
 bool VmmMeasureRange(PageTable pt, uint64_t begin, uint64_t end,

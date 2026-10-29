@@ -10,6 +10,7 @@
 #include "brook_theme.h"
 #include "brook_gtk_appearance.h"
 #include "brook_taskbar.h"
+#include "brook_user_experience.h"
 
 static GtkWidget *scale_choice,*preview,*status,*swatches[3];
 static GtkWidget *dark_switch,*opacity_slider,*opacity_value,*blur_choice,*performance;
@@ -17,6 +18,7 @@ static BrookGtkAppearance *appearance_style;
 static uint32_t selected_appearance=BROOK_APPEARANCE_DEFAULT;
 static uint32_t selected_metrics=BROOK_TASKBAR_DEFAULT;
 static GtkWidget *metric_choices[6];
+static GtkWidget *technical_details;
 static char *settings_path;
 static unsigned selected;
 static unsigned selected_scale=100;
@@ -95,6 +97,7 @@ static int save_appearance(unsigned theme,unsigned scale,uint32_t appearance,GEr
     g_key_file_set_integer(settings,"Desktop","opacity",brook_appearance_opacity(appearance));
     g_key_file_set_integer(settings,"Desktop","blur",brook_appearance_blur(appearance));
     g_key_file_set_integer(settings,"Desktop","taskbar_metrics",selected_metrics);
+    g_key_file_set_boolean(settings,"Experience","technical_details",gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(technical_details)));
     gsize length=0;char *contents=g_key_file_to_data(settings,&length,error);
     gboolean ok=contents&&g_file_set_contents_full(settings_path,contents,(gssize)length,
                     G_FILE_SET_CONTENTS_CONSISTENT|G_FILE_SET_CONTENTS_DURABLE,0600,error);
@@ -128,6 +131,10 @@ static int saved_matches_selection(void){
         (int)brook_appearance_opacity(selected_appearance),(int)brook_appearance_blur(selected_appearance),(int)selected_metrics};
     for(unsigned i=0;matches && i<7;++i){GError *error=NULL;int value=g_key_file_get_integer(file,"Desktop",names[i],&error);
         matches=!error && value==values[i];g_clear_error(&error);}
+    GError *experience_error=NULL;
+    gboolean experience=g_key_file_get_boolean(file,"Experience","technical_details",&experience_error);
+    matches=matches && !experience_error && experience==gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(technical_details));
+    g_clear_error(&experience_error);
     g_key_file_unref(file);return matches;
 }
 static void apply(GtkButton *button,gpointer unused) {
@@ -143,7 +150,7 @@ static void apply(GtkButton *button,gpointer unused) {
         syscall(BROOK_SYS_WM_TASKBAR_METRICS,1L,(long)selected_metrics)==0;
     GError *error=NULL;
     if(applied && save_appearance(selected,selected_scale,selected_appearance,&error)) {
-        gtk_label_set_text(GTK_LABEL(status),"Appearance applied and saved.");
+        gtk_label_set_text(GTK_LABEL(status),"Settings applied and saved.");
         printf("BROOK_SETTINGS_SAVED theme=%u scale=%u appearance=%u\n",selected,selected_scale,selected_appearance);fflush(stdout);return;
     }
     if(applied && saved_matches_selection()) {
@@ -171,8 +178,7 @@ static void realized(GtkWidget *widget,gpointer unused) {
 }
 
 int main(int argc,char **argv) {
-    const char *configured=g_getenv("BROOK_USER_SETTINGS");
-    settings_path=g_strdup(configured&&*configured?configured:"/data/home/.config/brook/settings.ini");
+    settings_path=g_strdup(brook_user_settings_path());
     g_set_prgname("brook-settings");g_set_application_name("Settings");
     gtk_init(&argc,&argv);
     g_object_set(gtk_settings_get_default(),"gtk-application-prefer-dark-theme",TRUE,NULL);
@@ -272,11 +278,16 @@ int main(int argc,char **argv) {
     gtk_container_add(GTK_CONTAINER(metrics_panel),metrics_grid);
     gtk_box_pack_start(GTK_BOX(box),metrics_panel,FALSE,FALSE,0);
 
+    technical_details=gtk_check_button_new_with_label("Show technical details in system messages");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(technical_details),brook_user_technical_details(settings_path));
+    gtk_widget_set_tooltip_text(technical_details,"Include diagnostic numbers by default. You can always expand details in a message.");
+    gtk_box_pack_start(GTK_BOX(box),technical_details,FALSE,FALSE,8);
+
     gtk_box_pack_start(GTK_BOX(outer),gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),FALSE,FALSE,0);
     GtkWidget *footer=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,12);gtk_container_set_border_width(GTK_CONTAINER(footer),20);gtk_box_pack_start(GTK_BOX(outer),footer,FALSE,FALSE,0);
     status=gtk_label_new("Choose a theme and scale.");gtk_label_set_line_wrap(GTK_LABEL(status),TRUE);gtk_label_set_xalign(GTK_LABEL(status),0);
     gtk_style_context_add_class(gtk_widget_get_style_context(status),"muted");gtk_box_pack_start(GTK_BOX(footer),status,TRUE,TRUE,0);
-    GtkWidget *button=gtk_button_new_with_label("Apply appearance");gtk_style_context_add_class(gtk_widget_get_style_context(button),"primary");
+    GtkWidget *button=gtk_button_new_with_label("Apply settings");gtk_style_context_add_class(gtk_widget_get_style_context(button),"primary");
     gtk_box_pack_end(GTK_BOX(footer),button,FALSE,FALSE,0);g_signal_connect(button,"clicked",G_CALLBACK(apply),NULL);
     controls_changed(NULL,NULL);gtk_widget_show_all(window);gtk_main();brook_gtk_appearance_free(appearance_style);g_free(settings_path);return 0;
 }

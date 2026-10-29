@@ -47,6 +47,16 @@ struct AddressSpaceState {
     uint64_t argumentStart, argumentEnd; // live, contiguous exec argument strings; mutation protects reads
 };
 
+// Single bounded recovery observer. The caller pins the AS while registering;
+// the watch itself must remain resident until canceled or completed. It owns
+// no AS reference, so it cannot prevent the destruction it is observing.
+struct AddressSpaceDestructionWatch {
+    uint64_t identity=0;
+    volatile bool done=false;
+};
+bool AddressSpaceWatchDestruction(AddressSpaceState*,AddressSpaceDestructionWatch*);
+void AddressSpaceCancelDestructionWatch(AddressSpaceDestructionWatch*);
+
 void AddressSpaceKernelInit();
 AddressSpaceState* AddressSpaceKernel(); // Immortal; initialized before APs/tasks.
 AddressSpaceState* AddressSpaceCreate(uint16_t allocationPid);

@@ -278,6 +278,10 @@ target_compile_options(test_socket_lifetime PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wn
 target_link_options(test_socket_lifetime PRIVATE -Wl,--gc-sections)
 set_tests_properties(test_socket_lifetime PROPERTIES TIMEOUT 20)
 
+add_host_test(test_oom_policy)
+add_host_test(test_system_message "${BROOK_ROOT}/tools/brook-message-pkg/message_format.c")
+target_compile_options(test_system_message PRIVATE "-iquote${BROOK_ROOT}/src/shared")
+
 add_host_test(test_kmutex)
 add_host_test(test_krwlock)
 add_host_test(test_ksemaphore)

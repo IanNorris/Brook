@@ -1996,6 +1996,23 @@ static void memoryCensus() {
     AddressSpaceUnref(late);CHECK(ProcessCleanupStep());
     CHECK(!AddressSpaceNextReference(0,AddressSpaceIdentityCeiling()));
 
+    auto* watched=AddressSpaceCreate(54);CHECK(watched);
+    AddressSpaceDestructionWatch completion{},other{};
+    CHECK(AddressSpaceWatchDestruction(watched,&completion));
+    CHECK(!AddressSpaceWatchDestruction(watched,&other));
+    Gate destructionAck;pendingAcknowledgement=&destructionAck;
+    AddressSpaceUnref(watched);
+    std::thread destroyer([&]{CHECK(ProcessCleanupStep());});
+    destructionAck.wait(1);CHECK(!__atomic_load_n(&completion.done,__ATOMIC_ACQUIRE));
+    destructionAck.release();destroyer.join();pendingAcknowledgement=nullptr;
+    CHECK(__atomic_load_n(&completion.done,__ATOMIC_ACQUIRE));
+    watched=AddressSpaceCreate(55);CHECK(watched);
+    CHECK(AddressSpaceWatchDestruction(watched,&completion));
+    AddressSpaceCancelDestructionWatch(&completion);
+    CHECK(AddressSpaceWatchDestruction(watched,&other));
+    AddressSpaceUnref(watched);CHECK(ProcessCleanupStep());
+    CHECK(other.done && !completion.done);
+
     auto pt=table();auto frame=PmmAllocPage();CHECK(frame);
     CHECK(VmmTryMapPage(pt,VirtualAddress(0x400000),frame,VMM_USER|PTE_COW_BIT)==VmmMapResult::Mapped);
     PmmRefPage(frame);
@@ -2009,6 +2026,7 @@ static void memoryCensus() {
     CHECK(VmmMeasureRange(pt,4096,0x400000000000ULL,true,&stats));
     CHECK(stats.backedPages==3&&stats.hiddenPages==1&&stats.cowPages==2);
     CHECK(stats.multiplyMappedPages==2&&stats.unknownMapCountPages==0);
+    CHECK(stats.exclusiveManagedPages==1);
     CHECK(stats.proportionalUnits==(8192ULL<<16));
     CHECK(stats.tableEntriesVisited<3000&&stats.lockBatches==1);
     PmmMapDec(privatePage); // deliberately missing accounting must be visible
@@ -2030,6 +2048,16 @@ static void memoryCensus() {
     CHECK(VmmMeasureRange(pt,4096,0x400000000000ULL,true,&stats));
     CHECK(stats.backedPages==5000&&stats.writablePages==5000&&stats.lockBatches>1);
     CHECK(stats.proportionalUnits==((4096ULL<<16)/5000)*5000&&!stats.unknownMapCountPages);
+    CHECK(!stats.exclusiveManagedPages);
+    uint64_t cursor=4096,totalBacked=0,totalExclusive=0,batches=0;
+    while(cursor<0x400000000000ULL) {
+        uint64_t next=cursor;VmmRangeStats batch{};
+        CHECK(VmmMeasureRangeStep(pt,cursor,0x400000000000ULL,true,&batch,&next));
+        CHECK(next>cursor && batch.tableEntriesVisited<=4096 && batch.lockBatches==1);
+        totalBacked+=batch.backedPages;totalExclusive+=batch.exclusiveManagedPages;
+        cursor=next;++batches;
+    }
+    CHECK(batches>1 && totalBacked==5000 && !totalExclusive);
     VmmDestroyUserPageTable(pt);
     PmmFreePage(root.pml4);VmmHostSetKernelRoot({});empty();CHECK(heapAllocations==0);
     std::puts("MEMORY CENSUS PASS lifetime/publication/ceiling/sparse/hidden/aliases/bounded-batches");
