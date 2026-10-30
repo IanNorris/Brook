@@ -528,6 +528,18 @@ target_compile_options(test_desktop_metrics PRIVATE "-iquote${BROOK_ROOT}/src/ke
 add_host_test(test_debug_job_wire)
 target_compile_options(test_debug_job_wire PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/src/kernel/src")
 
+add_host_test(test_debug_log_ring "${BROOK_ROOT}/src/kernel/src/debug_overlay.cpp")
+target_compile_options(test_debug_log_ring PRIVATE -UNDEBUG -DBROOK_HOST_TEST -DBROOK_DEBUG_RING_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
+
+add_host_test(test_debug_hardware "${BROOK_ROOT}/src/kernel/src/debug_hardware.cpp")
+target_compile_options(test_debug_hardware PRIVATE -UNDEBUG -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src"
+    "-iquote${BROOK_ROOT}/src/shared"
+    "-iquote${BROOK_ROOT}/src/shared/inc_km")
+
 add_host_test(test_debug_epoch "${BROOK_ROOT}/src/kernel/src/debug_epoch.cpp")
 target_compile_options(test_debug_epoch PRIVATE -UNDEBUG -DBROOK_HOST_TEST
     "-iquote${BROOK_ROOT}/src/kernel/src"

@@ -71,12 +71,51 @@ run failed in OVMF before Brook loaded, independently of the network driver.
 counters. It is diagnostic-only and should be absent from the normal desktop
 image so it does not obscure the final status.
 
+## Network-only hardware bridge checkpoint
+
+The existing MCP package now provides separate `hw_*` tools and a hardware
+registry. Attach a literal IP explicitly; nothing scans the LAN. The endpoint
+is pinned to a kernel boot identity. Generic requests are guarded in the kernel;
+structured jobs and semantic UI operations retain their existing boot checks,
+durable request IDs and recovery semantics. TCP reachability and identity
+mismatch are reported separately. No VM process, QMP socket or VM registry is
+required by the hardware bridge.
+
+Available tools cover diagnostics, memory/process/frame-interval statistics,
+kernel logs with line cursors and retention-loss reporting, structured guest
+commands with separate stdout/stderr and real exit status, app/window discovery,
+and semantic window actions with read-only recovery. The package reports QMP,
+raw input, raw framebuffer transfer, registers, raw memory and panic transport
+as unavailable. A dropped connection does not identify a panic.
+
+Kernel log snapshots exclude the current partial line. Review found that the
+512-slot ring retains only 511 completed lines because one slot is reserved for
+the current write; the readers and dropped-line counts now use that capacity.
+A native host test verifies wrapping plus an unfinished current line.
+
+The hardware MCP path passes a real stdio test through a QEMU guest TCP forward:
+logs/stats, UID-1000 guest execution with exit 17 and separate UTF-8 stdout/stderr,
+identical request recovery, app/window discovery, minimize/restore/maximize,
+and explicit reattachment after a guest reset. Old observations and mutation
+requests are rejected after reset. The bridge has no visible VM registry; QMP
+is held only by the test harness. This remains emulator/protocol acceptance,
+not physical Ethernet acceptance.
+
+```
+python3 scripts/test_hardware_bridge.py --output build/hardware/hardware-bridge-check
+```
+
+See [bridge instructions](../tools/vm_bridge/README.md#physical-hardware-over-tcp)
+for standalone calls and the MCP client reload needed to discover new tool names.
+The existing physical stick and its pinned panic-scanner ELF are unchanged by
+these disposable tests.
+
 ## Remaining core work
 
 - Complete physical USB integrity and Ethernet acceptance.
-- Provide a network-only host bridge with explicit capabilities and no QEMU or
-  host-desktop assumptions. Hardware post-panic TCP inspection is currently
-  unavailable: the panic path halts CPUs; retain the optical scanner fallback.
+- Exercise the network-only host bridge on the Dell once Ethernet works.
+  Hardware post-panic TCP inspection remains unavailable: the panic path halts
+  CPUs; retain the optical scanner fallback.
 - Mount an immutable compressed application image stored as an ordinary FAT32
   file, preserving Nix store symlinks and executable metadata. Provide writable
   RAM-backed session directories and a compact offline desktop package profile.

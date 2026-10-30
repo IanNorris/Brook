@@ -25,6 +25,9 @@ uint32_t DebugOverlayTotalLines();
 // Read pending lines using an external cursor (for independent consumers).
 // Caller manages *cursor across calls. Returns number of lines read.
 uint32_t DebugOverlayReadFrom(uint32_t* cursor, char* out, uint32_t maxLines, uint32_t lineLen);
+// One bounded snapshot, including retention loss. Reject future cursors.
+int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t maxLines,uint32_t lineLen,
+                          uint32_t* total,uint32_t* skipped);
 
 // Spawn the kernel console WM window.
 // Must be called after CompositorInit + WmInit + SchedulerInit.

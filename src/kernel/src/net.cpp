@@ -5,6 +5,7 @@
 #include "syscall_timing.h"
 #include "sched_decision_trace.h"
 #include "bridge_reply.h"
+#include "debug_hardware.h"
 // net.cpp — Brook OS network stack.
 //
 // Ethernet → ARP / IPv4 → ICMP / UDP
@@ -3935,6 +3936,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
         marker[p++]='\n';marker[p]=0;DebugChannelSend(marker);
         return;
     }
+    if (DebugHardwareHandleCommand(cmd,len)) return;
     if (DebugEpochHandleCommand(cmd)) return;
     if (DebugJobHandleCommand(cmd)) return;
     if (DebugUiHandleCommand(cmd)) return;

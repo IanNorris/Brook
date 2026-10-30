@@ -292,6 +292,7 @@ add_executable(kernel
     src/shutdown.cpp
     src/lifecycle_channel.cpp
     src/debug_epoch.cpp
+    src/debug_hardware.cpp
     src/debug_jobs.cpp
     src/debug_ui.cpp
     src/tcp.cpp

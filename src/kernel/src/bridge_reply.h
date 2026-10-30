@@ -18,6 +18,16 @@ template<void (*Send)(const char*)> struct BridgeReplyBuffer {
         while(n)append(digits[--n]);
     }
     void field(const char* name,uint64_t v){text("\"");text(name);text("\":");number(v);}
+    void quoted(const char* s){
+        append('"');
+        const char* hex="0123456789abcdef";
+        while(*s){const auto c=static_cast<unsigned char>(*s++);
+            if(c=='"'||c=='\\'){append('\\');append(c);}
+            else if(c<32){text("\\u00");append(hex[c>>4]);append(hex[c&15]);}
+            else append(c);
+        }
+        append('"');
+    }
     void send(){data[size]=0;Send(data);}
 };
 }

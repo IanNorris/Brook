@@ -78,18 +78,18 @@ uint32_t DebugOverlayRead(char* out, uint32_t maxLines, uint32_t lineLen)
 
     // How many completed lines are available since last read?
     uint32_t available = g_totalLines - g_readHead;
-    if (available > RING_LINES) available = RING_LINES; // wrapped
+    if (available > RING_LINES-1) available = RING_LINES-1; // wrapped
 
     uint32_t count = (available < maxLines) ? available : maxLines;
 
     // Start reading from the oldest unread line
     uint32_t startIdx;
-    if (g_totalLines <= RING_LINES)
+    if (g_totalLines <= RING_LINES-1)
         startIdx = g_readHead;
     else
     {
         // Ring has wrapped — oldest available is at g_writeHead
-        uint32_t oldest = g_totalLines - RING_LINES;
+        uint32_t oldest = g_totalLines - (RING_LINES-1);
         if (g_readHead < oldest) g_readHead = oldest;
         startIdx = g_readHead;
     }
@@ -120,16 +120,16 @@ uint32_t DebugOverlayReadFrom(uint32_t* cursor, char* out, uint32_t maxLines, ui
     SpinLockAcquire(&g_ringLock);
 
     uint32_t available = g_totalLines - *cursor;
-    if (available > RING_LINES) available = RING_LINES;
+    if (available > RING_LINES-1) available = RING_LINES-1;
 
     uint32_t count = (available < maxLines) ? available : maxLines;
 
     uint32_t startIdx;
-    if (g_totalLines <= RING_LINES)
+    if (g_totalLines <= RING_LINES-1)
         startIdx = *cursor;
     else
     {
-        uint32_t oldest = g_totalLines - RING_LINES;
+        uint32_t oldest = g_totalLines - (RING_LINES-1);
         if (*cursor < oldest) *cursor = oldest;
         startIdx = *cursor;
     }
@@ -150,6 +150,25 @@ uint32_t DebugOverlayReadFrom(uint32_t* cursor, char* out, uint32_t maxLines, ui
     return count;
 }
 
+int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t maxLines,uint32_t lineLen,
+                          uint32_t* total,uint32_t* skipped)
+{
+    if(!cursor || !out || !total || !skipped || !maxLines || lineLen<2)return -22;
+    SpinLockAcquire(&g_ringLock);
+    *total=g_totalLines;*skipped=0;
+    if(*cursor>*total){SpinLockRelease(&g_ringLock);return -22;}
+    const auto oldest=*total>RING_LINES-1?*total-(RING_LINES-1):0;
+    if(*cursor<oldest){*skipped=oldest-*cursor;*cursor=oldest;}
+    auto count=*total-*cursor;if(count>maxLines)count=maxLines;
+    for(uint32_t i=0;i<count;++i){
+        const char* src=g_ring[(*cursor+i)%RING_LINES];char* dst=out+i*lineLen;
+        uint32_t j=0;while(j<lineLen-1 && src[j]){dst[j]=src[j];++j;}dst[j]=0;
+    }
+    *cursor+=count;
+    SpinLockRelease(&g_ringLock);return count;
+}
+
+#ifndef BROOK_DEBUG_RING_TEST
 // --- Kernel console window thread ------------------------------------------
 
 static constexpr uint32_t CONSOLE_W      = 800;
@@ -472,4 +491,5 @@ void DebugTcpSpawn()
     SerialPrintf("DEBUG_TCP: spawned pid=%u\n", thread->pid);
 }
 
+#endif // BROOK_DEBUG_RING_TEST
 } // namespace brook

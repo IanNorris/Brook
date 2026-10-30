@@ -5,7 +5,7 @@ Reference-first artifacts, command jobs, semantic UI controls, selectable/action
 observations and cached screenshot views are implemented. See the roadmap for remaining work.
 
 A local Python MCP server for explicitly enabled Brook QEMU
-sessions. It observes and injects input into the selected VM through private
+sessions and boot-pinned physical machines. It observes and injects input into the selected VM through private
 QMP sockets and Brook's guest debug channel. It never captures the host desktop.
 
 ## Start and connect
@@ -694,3 +694,50 @@ Prepare the optional pinned encoder before VM launch with
 Use `vm_record` start/status/stop instead of looping still captures. The MCP
 server itself needs only Python; encoding runs in the prepared runtime. See
 [recording setup, evidence and limits](../../docs/vm-recording.md).
+
+## Physical hardware over TCP
+
+The same MCP server provides separate `hw_*` tools for an explicitly selected
+Brook machine. No VM process, QMP socket, hypervisor registry, host desktop or
+port scan is involved. Boot a current hardware image with Ethernet and the
+development debug interface enabled, then attach its literal IPv4 address:
+
+```sh
+python3 tools/vm_bridge/server.py --call hw_attach --arguments '{"host":"192.168.85.106"}'
+python3 tools/vm_bridge/server.py --call hw_doctor --arguments '{"session":"HARDWARE_SESSION_ID"}'
+```
+
+Use the actual IP shown by Brook; the address above is illustrative. Port 1234
+is the default. Hardware session records live under `build/hardware-bridge`
+(or `BROOK_HARDWARE_REGISTRY`) and persist across client reconnects. The endpoint
+is pinned to its guest boot identity. Reboot or IP reassignment invalidates old
+commands and references; call `hw_attach` explicitly again for the new boot.
+A stale-identity response is distinct from TCP unreachability. This development
+protocol assumes a trusted LAN; the boot token prevents stale targeting and is
+not authentication.
+
+`hw_stats`, `hw_logs`, `hw_apps` and `hw_windows` provide bounded observations.
+Log cursors count completed lines, report dropped retained lines, and exclude
+the current partial line. A line is capped at 160 columns. Pass `next_cursor`
+back as `cursor`; the same boot identity must remain attached.
+
+`hw_guest_run` and `hw_job` reuse the durable structured-command protocol,
+including request IDs, separate stdout/stderr, exit status and recovery without
+replay. Set an existing guest `cwd` (the minimal probe has no `/data/home`).
+`hw_window` and `hw_ui` reuse semantic window references and durable action IDs.
+`hw_command` exposes a single boot-guarded kernel debug command, without a host
+shell or automatic retry. Its command has at most 174 UTF-8 bytes after allowing
+for the boot envelope.
+
+`hw_doctor` explicitly reports unavailable QMP, raw input, framebuffer transfer,
+registers, raw memory and post-panic transport. A lost TCP connection is not proof
+of panic. Current hardware panics halt CPUs; retain the optical panic scanner.
+The existing `vm_*` tools retain their QEMU behavior and their separate registry.
+Reload the MCP client to discover newly added tool names; standalone CLI calls
+work from the updated source immediately.
+
+Acceptance: `python3 scripts/test_hardware_bridge.py --output build/hardware/hw-bridge-check`
+inside nix-shell after building the kernel. It tests MCP stdio through a QEMU
+TCP forward, with no VM registry visible to the bridge, then resets the guest to
+verify rejection of old boot identities. This is protocol acceptance, not proof
+that a particular physical Ethernet adapter works.

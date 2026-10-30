@@ -1,6 +1,6 @@
 ---
 name: brook-vm
-description: Control and inspect feature-enabled Brook QEMU VMs, including input, images, logs, CPU/context-switch profiling, OS statistics, guest launch and post-panic memory inspection. Never targets the host desktop.
+description: Inspect and control opted-in Brook QEMU VMs or boot-pinned physical guests. VM tools include input, images, logs, profiling and post-panic inspection; hardware tools use explicit guest TCP connections. Never targets the host desktop.
 ---
 
 Start with vm_sessions and vm_doctor; select an explicit live session. Attach
@@ -118,3 +118,17 @@ repeat reset just to recover a reply. Historical verification survives later
 pause/exit. Missing old epoch yields running_unverified, not a verified change.
 Older/custom launches without a known restoration policy refuse reset. Force
 allows unsynced reset only when explicitly authorized for that disposable run.
+
+
+For physical hardware, use the separate hw_* tools. Start with hw_sessions or
+hw_attach for a user-supplied literal IP, then hw_doctor; do not scan the LAN.
+Check identity_matches and capabilities. hw_attach pins one boot; explicitly
+reattach after reboot, preserving old operation IDs as historical evidence.
+Use hw_stats and hw_logs (line cursors with retention-loss reporting), hw_apps,
+hw_windows, hw_window and hw_ui without screenshots. hw_guest_run/hw_job use
+the same durable request semantics as their VM counterparts; select a real
+working directory on minimal images. hw_command sends one boot-guarded kernel
+debug command and never retries uncertain delivery. Hardware sessions have no
+QMP, host-desktop input, raw frame transfer, registers, raw memory or panic
+transport. TCP loss can mean reboot, panic or link failure; do not label it a
+panic without evidence. Keep the optical scanner available for real hardware.

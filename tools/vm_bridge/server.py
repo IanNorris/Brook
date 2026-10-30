@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Brook VM-only MCP over newline JSON-RPC; also usable as a JSON CLI.
+"""Brook VM and opt-in physical-guest MCP; also usable as a JSON CLI.
 
 No host desktop APIs, input daemons, clipboard, or arbitrary host shell tool.
 """
@@ -25,6 +25,8 @@ import zlib
 
 from common import ROOT, REGISTRY, QMP, artifact, load_session, process_identity, process_is_alive, recording_lock, session_lock, write_json
 from media import Delivery, PreviewLimitError, describe as describe_artifact, scoped_path
+from guest_transport import exchange, parse_guest_reply, validate_commands
+from hardware import Hardware
 from jobs import Jobs
 from ui import Ui
 from observation import Observations, StaleObservation, validate_selection
@@ -50,64 +52,15 @@ def panic_state(data):
     return bool(re.search(r"KERNEL PANIC|KERNEL FAULT", text))
 
 
-def parse_guest_reply(reply):
-    # A census is a framed JSON-lines stream, not just its first header.
-    # Keep single-object responses and surrounding human logs compatible.
-    lines = [line for line in reply.splitlines() if line.startswith("{")]
-    if not lines:
-        return {"reply": reply.strip()}
-    first = json.loads(lines[0])
-    if first.get("kind") != "memory_census":
-        return first
-    records = [json.loads(line) for line in lines[1:]]
-    if not records or records[-1].get("snapshot") != "rolling" or "spaces" not in records[-1]:
-        raise ValueError("Incomplete memory census response")
-    return {**first, "records": records[:-1], "summary": records[-1]}
-
-
 def guest(data, command, timeout=8):
-    return guest_batch(data, [command], timeout)[0]
+    return guest_batch(data,[command],timeout)[0]
 
 
 def guest_batch(data, commands, timeout=8):
-    """Bounded framed RPCs on one connection; never retry unknown delivery."""
     if panic_state(data):
         raise RuntimeError("Guest has panicked; use vm_debug for QEMU-level inspection")
-    if not isinstance(commands, list) or not 1 <= len(commands) <= 8:
-        raise ValueError("Guest batch must contain 1–8 commands")
-    frames=[]
-    for command in commands:
-        if not isinstance(command, str) or "\n" in command or "\r" in command or len(command.encode()) > 220:
-            raise ValueError("Guest command must fit one 220-byte protocol line")
-        token = str(int(uuid.uuid4().hex[:12], 16))
-        frames.append((token, command))
-    deadline = time.monotonic() + timeout
-    with socket.create_connection(("127.0.0.1", data["guest_debug_port"]), timeout=timeout) as s:
-        s.sendall(''.join(f'@{token} {command}\n' for token,command in frames).encode())
-        buffer = bytearray()
-        results=[]
-        received=0
-        while time.monotonic() < deadline:
-            s.settimeout(max(.1, deadline - time.monotonic()))
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            buffer.extend(chunk)
-            received+=len(chunk)
-            if received > 2 * 1024 * 1024:
-                raise ValueError("Guest reply exceeded bounded receive buffer")
-            # Replies use LF; the log stream may use CRLF. Consume only the
-            # next token's complete frame, including when recv coalesces them.
-            while len(results)<len(frames):
-                token=frames[len(results)][0]
-                begin,end=f'BRIDGE_BEGIN {token}\n'.encode(),f'BRIDGE_END {token}\n'.encode()
-                start=buffer.find(begin)
-                finish=buffer.find(end,start+len(begin)) if start>=0 else -1
-                if finish<0:break
-                results.append(parse_guest_reply(buffer[start+len(begin):finish].decode(errors='replace')))
-                del buffer[:finish+len(end)]
-            if len(results)==len(frames):return results
-    raise TimeoutError("No complete guest response; delivery/completion is unknown (not retried)")
+    validate_commands(commands)
+    return exchange("127.0.0.1",data["guest_debug_port"],commands,timeout)
 
 
 def png_rgb(width, height, rgb):
@@ -271,7 +224,7 @@ def doctor(session, **_):
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
-                  "generation": data["generation"], "server_version": "0.9.1",
+                  "generation": data["generation"], "server_version": "0.10.0",
                   "bridge_capabilities": {"artifact_delivery": {"revision": 1,
                       "default": "references", "include_image": True,
                       "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
@@ -1005,6 +958,19 @@ TOOLS={}
 def register(name,fn,description,props=None,required=None,readonly=False):
     TOOLS[name]=(fn,{"name":name,"description":description,"inputSchema":schema(props,required),
                     "annotations":{"readOnlyHint":readonly,"destructiveHint":not readonly,"openWorldHint":False}})
+hardware=Hardware()
+register("hw_attach",hardware.attach,"Attach an explicit physical Brook IPv4 endpoint and pin its boot; no network discovery or QEMU required",{"host":STR,"port":INT},["host"])
+register("hw_sessions",hardware.sessions,"List opted-in hardware sessions without probing the network",readonly=True)
+register("hw_doctor",hardware.doctor,"Report network reachability and supported hardware operations; QEMU and post-panic access stay explicitly unavailable",SESSION,["session"],True)
+register("hw_stats",hardware.stats,"Memory, processes and compositor intervals from a boot-pinned physical Brook session",{**SESSION,"audio_details":{"type":"boolean"}},["session"],True)
+register("hw_logs",hardware.logs,"Boot-pinned bounded kernel log lines with retention loss and a next cursor",{**SESSION,"cursor":INT,"limit":INT},["session"],True)
+register("hw_command",hardware.command,"Run one kernel debug command on the pinned hardware boot; no host shell, no automatic retry after uncertain delivery",{**SESSION,"command":STR},["session","command"])
+register("hw_guest_run",hardware.guest_run,"Structured guest argv with durable request identity and separate output; uses the same guarded jobs as VMs",{**SESSION,"request_id":STR,"argv":{"type":"array","items":STR},"cwd":STR,"env":{"type":"object"},"uid":INT,"wait_s":NUM},["session","request_id","argv"])
+register("hw_job",hardware.job,"Recover or observe an existing hardware job without replaying it",{**SESSION,"operation_id":STR,"stdout_offset":INT,"stderr_offset":INT,"output_limit":INT,"wait_s":NUM},["session","operation_id"],True)
+register("hw_windows",hardware.windows,"Semantic windows on the pinned physical guest; no screenshot or host desktop access",SESSION,["session"],True)
+register("hw_window",hardware.window,"Apply one semantic window action on the pinned physical guest; recover uncertain delivery through hw_ui",{**SESSION,"window":{"type":"object"},"action":{"type":"string","enum":["focus","minimize","maximize","restore","close"]},"request_id":STR,"restore_target":STR,"wait_for":STR,"wait_s":NUM},["session","window","action","request_id"])
+register("hw_ui",hardware.ui_status,"Observe or recover an existing hardware window operation without redispatch",{**SESSION,"operation_id":STR,"wait_s":NUM,"wait_for":STR},["session","operation_id"],True)
+register("hw_apps",hardware.apps,"Read the physical guest's installed application catalog",SESSION,["session"],True)
 register("vm_sessions",sessions,"Discover opted-in user/agent VM runs; no desktop discovery",readonly=True)
 register("vm_doctor",doctor,"VM transport and guest readiness; capabilities distinguish unsupported paths",SESSION,["session"],True)
 register("vm_start",start,"Boot a named experiment on new disk clones with playback off",{"scenario":STR,"gpu":STR})
@@ -1103,7 +1069,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.9.1"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.10.0"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":
