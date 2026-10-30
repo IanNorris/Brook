@@ -1,5 +1,9 @@
 #include "compressed_vfs.h"
 #include "compressed_image.h"
+#include "immutable_image_snapshot.h"
+#include "ramdisk.h"
+#include "memory/physical_memory.h"
+#include "memory/virtual_memory.h"
 #include "vfs.h"
 #include "vfs_object.h"
 #include "device.h"
@@ -284,7 +288,65 @@ bool CompressedVfsBindDevice(uint8_t drive,Device* device) {
     devices[drive]=device;return true;
 }
 void CompressedVfsRegister(){VfsRegisterFs("brookimg",&fsOps);}
+namespace {
+struct BootSnapshotIo {
+    Vnode* source;
+    void* allocate(uint64_t bytes){return reinterpret_cast<void*>(VmmAllocPages(bytes/4096).raw());}
+    void release(void* memory,uint64_t bytes){VmmFreePages(VirtualAddress(reinterpret_cast<uint64_t>(memory)),bytes/4096);}
+    int read(uint64_t offset,void* destination,uint32_t bytes){return VfsRead(source,destination,bytes,&offset);}
+};
+// One boot-lifetime device. Snapshot ownership is retained through filesystem
+// unmount, so no stale open/mapping can outlive its bytes. A later boot starts
+// fresh; there is no unbounded runtime snapshot creation API.
+bool bootSnapshotAttempted=false;
+bool MountBootSnapshot(const AppSnapshotPlan& plan) {
+    if(bootSnapshotAttempted)return false;
+    bootSnapshotAttempted=true;
+    auto* source=VfsOpen(plan.source,VFS_O_STREAM);if(!source)return false;
+    VnodeStat stat{};
+    if(VfsStat(source,&stat)||stat.isDir||stat.isSymlink||stat.size<plan.bytes||stat.size>AppSnapshotLimit) {
+        VfsClose(source);return false;
+    }
+    BootSnapshotIo io{source};AppSnapshotError error;
+    auto* memory=AppSnapshotCopy(io,plan,PmmGetFreePageCount()*4096,error);
+    VfsClose(source); // No USB FIL or compressed-file source survives publication.
+    if(!memory){KPrintf("brookimg: RAM snapshot copy failed reason=%u\n",unsigned(error));return false;}
+    auto* header=static_cast<CompressedImageHeader*>(memory);
+    if(!CompressedImageHeaderValid(*header,plan.bytes)||header->imageBytes!=plan.bytes) {
+        io.release(memory,plan.bytes);return false;
+    }
+    int slot=DEVICE_MAX-1;
+    while(slot>=0&&(devices[slot]||pendingFiles[slot]||__atomic_load_n(&live[slot],__ATOMIC_ACQUIRE)))--slot;
+    if(slot<0){io.release(memory,plan.bytes);return false;}
+    auto* device=ImmutableRamdiskCreate(memory,plan.bytes,512,"boot-app-ram");
+    if(!device){io.release(memory,plan.bytes);return false;}
+    if(!DeviceRegister(device)){RamdiskDestroyUnregistered(device);io.release(memory,plan.bytes);return false;}
+    devices[slot]=device;
+    if(!VfsMountConfigured("/nix","brookimg",slot,7)) {
+        // A failed private mount normally leaves no live objects. If an
+        // unexpected retained reference exists, preserve its backing instead
+        // of creating a dangling pointer while reporting recovery-only mode.
+        if(__atomic_load_n(&live[slot],__ATOMIC_ACQUIRE)) {
+            KPuts("brookimg: RAM snapshot retirement retained unexpectedly; preserving backing\n");return false;
+        }
+        devices[slot]=nullptr;DeviceUnregister(device);RamdiskDestroyUnregistered(device);io.release(memory,plan.bytes);return false;
+    }
+    FilePageCacheEnableReclaim();
+    KPrintf("brookimg: immutable RAM application snapshot ready bytes=%lu path=/nix source_closed=1\n",plan.bytes);
+    return true;
+}
+}
 void CompressedVfsBootMount() {
+    // Explicit trusted boot metadata: source /nix exact_bytes SHA256. Never
+    // fall back to mounting a writable USB file if snapshot preparation fails.
+    if(auto* config=VfsOpen("/etc/boot-app-snapshot",VFS_O_STREAM)) {
+        char record[257]{};uint64_t offset=0;
+        int count=VfsRead(config,record,sizeof(record),&offset);VfsClose(config);
+        AppSnapshotPlan plan{};
+        if(count<=0||!AppSnapshotParse(record,uint32_t(count),plan)||!MountBootSnapshot(plan))
+            KPuts("brookimg: RAM snapshot unavailable; applications disabled, retain maintenance recovery\n");
+        return;
+    }
     // A boot-local config keeps physical UEFI independent of QEMU fw_cfg.
     // One complete record: /media/usb/APPS.BRK /nix (optional final newline).
     if(auto* config=VfsOpen("/etc/boot-app-image",VFS_O_STREAM)) {

@@ -677,3 +677,43 @@ workflow in `build/hardware/msc-cache-update-workflow-20261030/result.json`.
 After the physical fsync failure, checked shutdown stopped with EIO (request
 `4a670abe9938438db6f809bc64957c2e`), so a clean physical sync is not claimed.
 Only the existing scratch file was written; activation was never dispatched.
+
+### Opt-in RAM application snapshots (not yet on the physical payload)
+
+A desktop that retains its immutable compressed application image in RAM can
+coexist with writable USB update slots. `/etc/boot-app-snapshot` selects this
+boot-only route using one record: permitted source path, `/nix`, exact image
+bytes and SHA-256. Allowed paths are the root APPS.BRK or the A/B update slot's
+APPS.BRK. The initial limit is512MiB, in4KiB units; admission leaves256MiB of
+initial free physical memory for indexes, kernel work and recovery. This is not
+a guarantee of post-cache headroom. Metadata and decoded/file caches allocate
+separately; acceptance records actual post-mount free memory.
+
+The kernel streams and verifies a complete private snapshot, closes the USB
+source, validates the compressed header and publishes an immutable RAM device.
+Its write operation always returns EROFS and the lifetime-stable RO ioctl reports
+one. Successful snapshots remain allocated for the boot lifetime, even if their
+filesystem is later detached. Failed allocations, reads, hashes and private
+mounts unwind. This is single-threaded boot setup, not a runtime snapshot API:
+DeviceUnregister does not drain arbitrary live device references. Snapshot
+failure leaves applications disabled and the RAM/network maintenance path
+available; it never falls back to mounting a mutable USB image.
+
+`test_ramdisk` checks immutable ops, writable regression behavior, overflow-safe
+end bounds and both factory allocation failures. `test_immutable_image_snapshot`
+checks metadata paths/limits, independent copy ownership, partial reads, EOF,
+read/alloc/hash failures and admission headroom. Actual QEMU acceptance is in
+`build/hardware/app-snapshot-qemu-v2-20261030/result.json`:
+
+- The entire2.2MiB USB source image was overwritten and its namespace detached
+  before a fresh ELF launch. The app then verified cross-block data, links,
+  permissions, private COW and read-only filesystem behavior from the snapshot.
+- Bad-hash, short-source and256MiB low-memory boots published no application
+  image while the hardware network/job bridge remained usable.
+- The512MiB positive boot had434036736 free bytes after mounting. This small
+  fixture is not acceptance of the full physical desktop image yet.
+
+The current Linux umount syscall supports MNT_DETACH only; this test does not
+claim a strict umount. Source closure is before publication in the boot code,
+and source overwrite makes the fresh execution test independent of namespace
+visibility or a retained cached source file.

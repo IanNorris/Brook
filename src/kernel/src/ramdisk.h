@@ -18,4 +18,11 @@ struct RamdiskPriv {
 // Create and return a ramdisk device.
 Device* RamdiskCreate(void* data, uint64_t size, uint32_t blockSize, const char* name);
 
+// Publish only after fully populating/verifying a private memory snapshot.
+// The caller owns the immutable backing and name for the entire device lifetime;
+// this factory takes no backing allocation ownership and exposes no writable ops.
+Device* ImmutableRamdiskCreate(const void* data,uint64_t size,uint32_t blockSize,const char* name);
+// Failure-path cleanup only: never call after registration/publication.
+void RamdiskDestroyUnregistered(Device* device);
+
 } // namespace brook
