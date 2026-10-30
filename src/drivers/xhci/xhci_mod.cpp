@@ -817,7 +817,8 @@ static uint64_t XhciSubmitCommand(XhciController& ctrl, uint64_t param,
 
 static void XhciPollDrainEvents();
 static Trb* XhciWaitForEvent(XhciController& ctrl,uint32_t type,uint32_t timeoutMs,
-                             Trb* output=nullptr,uint64_t token=0)
+                             Trb* output=nullptr,uint64_t token=0,
+                             const uint64_t* tokens=nullptr,unsigned tokenCount=0)
 {
     static Trb discarded; // wildcard drain is used only during single-threaded init
     if(!output)output=&discarded;
@@ -826,7 +827,11 @@ static Trb* XhciWaitForEvent(XhciController& ctrl,uint32_t type,uint32_t timeout
         XhciPollDrainEvents();
         const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
         const bool failed=ctrl.completionFailed;
-        const bool found=!failed && ctrl.completions.Take(type,token,*output);
+        bool found=false;
+        if(!failed) {
+            if(tokens)found=ctrl.completions.TakeAny(type,tokens,tokenCount,*output);
+            else found=ctrl.completions.Take(type,token,*output);
+        }
         IrqSpinLockRelease(&g_eventRingLock,saved);
         if(found)return output;
         if(failed)return nullptr;
@@ -2443,32 +2448,45 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
     if (!ring) return false;
 
     if(!len || len>65536)return false;
-    uint64_t physical=bufPhys,token=0;uint32_t remaining=len;
+    uint64_t physical=bufPhys,token=0,tokens[3]{};unsigned tokenCount=0;uint32_t remaining=len;
+    const uint32_t maxPacket=isIn?dev.bulkInMaxPacket:dev.bulkOutMaxPacket;
+    if(!maxPacket)return false;
+    Trb* first=nullptr;uint32_t firstControl=0;
     while(remaining) {
         if(enqueue>=XFER_RING_SIZE-1) {
+            tokens[tokenCount++]=ringPhys+(XFER_RING_SIZE-1)*sizeof(Trb);
             ring[XFER_RING_SIZE-1].control=TRB_TYPE_LINK|TRB_TC|(1u<<4)|(cycle?TRB_CYCLE:0);
             cycle=!cycle;enqueue=0;
         }
         const auto bytes=XhciDmaChunk(physical,remaining);
         auto& trb=ring[enqueue];token=ringPhys+enqueue*sizeof(Trb);
+        tokens[tokenCount++]=token;
         trb.param=physical;trb.status=bytes;
-        trb.control=TRB_TYPE_NORMAL|(remaining>bytes?(1u<<4):TRB_IOC)|(cycle?TRB_CYCLE:0);
+        if(ctrl.hciVersion>=0x100)trb.status|=XhciTdPackets(len,len-remaining+bytes,maxPacket)<<17;
+        const uint32_t control=TRB_TYPE_NORMAL|(remaining>bytes?(1u<<4):TRB_IOC)|
+            (isIn?TRB_ISP:0)|(cycle?TRB_CYCLE:0);
+        if(!first){first=&trb;firstControl=control;trb.control=control^TRB_CYCLE;}
+        else trb.control=control;
         ++enqueue;physical+=bytes;remaining-=bytes;
     }
     __asm__ volatile("mfence":::"memory");
+    __atomic_store_n(&first->control,firstControl,__ATOMIC_RELEASE);
+    __asm__ volatile("mfence":::"memory");
     XhciRingDoorbell(ctrl,dev.slotId,dci);
     Trb completion;
-    Trb* evt=XhciWaitForEvent(ctrl,TRB_TYPE_TRANSFER_EVENT,timeoutMs,&completion,token);
+    Trb* evt=XhciWaitForEvent(ctrl,TRB_TYPE_TRANSFER_EVENT,timeoutMs,&completion,0,tokens,tokenCount);
 
     if (!evt) {
-        SerialPrintf("xhci: bulk %s transfer timeout\n", isIn ? "IN" : "OUT");
+        KPrintf("xhci: bulk %s timeout slot=%u dci=%u bytes=%u mps=%u trbs=%u failed=%u dma_low=%x\n",
+            isIn?"IN":"OUT",dev.slotId,dci,len,maxPacket,tokenCount,ctrl.completionFailed?1u:0u,unsigned(bufPhys&65535));
         return false;
     }
 
     uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
-    if (cc != TRB_CC_SUCCESS || (evt->status&0xffffff)) {
-        SerialPrintf("xhci: bulk %s transfer failed (cc=%u)\n",
-                     isIn ? "IN" : "OUT", cc);
+    if (cc != TRB_CC_SUCCESS || (evt->status&0xffffff) || evt->param!=token) {
+        KPrintf("xhci: bulk %s failed cc=%u residue=%u slot=%u dci=%u bytes=%u mps=%u event=%lx last=%lx\n",
+            isIn?"IN":"OUT",cc,evt->status&0xffffff,dev.slotId,dci,len,maxPacket,evt->param,token);
+        KPrintf("xhci: bulk DMA low=%x tokens=%u first=%lx\n",unsigned(bufPhys&65535),tokenCount,tokens[0]);
         return false;
     }
 
@@ -2553,7 +2571,7 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
     // 1. Send CBW via Bulk OUT
     if (!XhciBulkTransfer(ctrl, dev, false, cbw, cbwPhys, sizeof(UsbMscCbw))) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
-        SerialPuts("xhci: MSC CBW send failed\n");
+        KPrintf("xhci: MSC CBW failed opcode=%x bytes=%u; transport quarantined\n",unsigned(cdb[0]),dataLen);
         return false;
     }
 
@@ -2561,7 +2579,8 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
     if (dataLen > 0 && data) {
         if (!XhciBulkTransfer(ctrl, dev, dataIn, data, dataPhys, dataLen)) {
             __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
-            SerialPrintf("xhci: MSC data %s failed\n", dataIn ? "IN" : "OUT");
+            const uint32_t lba=cdbLen>=10?(uint32_t(cdb[2])<<24)|(uint32_t(cdb[3])<<16)|(uint32_t(cdb[4])<<8)|cdb[5]:0;
+            KPrintf("xhci: MSC data %s failed opcode=%x bytes=%u tag=%u lba=%u; transport quarantined\n",dataIn?"IN":"OUT",unsigned(cdb[0]),dataLen,cbw->dCBWTag,lba);
             return false;
         }
     }
@@ -2575,20 +2594,20 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
 
     if (!XhciBulkTransfer(ctrl, dev, true, csw, cswPhys, sizeof(UsbMscCsw))) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
-        SerialPuts("xhci: MSC CSW receive failed\n");
+        KPrintf("xhci: MSC CSW failed opcode=%x bytes=%u; transport quarantined\n",unsigned(cdb[0]),dataLen);
         return false;
     }
 
     if (csw->dCSWSignature != CSW_SIGNATURE) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
-        SerialPrintf("xhci: MSC bad CSW signature 0x%08x\n", csw->dCSWSignature);
+        KPrintf("xhci: MSC bad CSW signature 0x%08x\n", csw->dCSWSignature);
         return false;
     }
 
     if(csw->bCSWStatus>1 || csw->dCSWTag!=cbw->dCBWTag || csw->dCSWDataResidue)__atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
     if (csw->bCSWStatus != 0 || csw->dCSWTag != cbw->dCBWTag ||
         csw->dCSWDataResidue != 0) {
-        SerialPrintf("xhci: MSC command failed (status=%u residue=%u)\n",
+        KPrintf("xhci: MSC command failed (status=%u residue=%u)\n",
                      csw->bCSWStatus, csw->dCSWDataResidue);
         return false;
     }

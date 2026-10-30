@@ -2,9 +2,21 @@
 #include <cassert>
 struct Event {uint64_t param;uint32_t status,control;};
 int main(){
+    assert(brook::XhciTdPackets(65536,32768,1024)==31);
+    assert(brook::XhciTdPackets(65536,61440,1024)==4);
+    assert(brook::XhciTdPackets(65536,65536,1024)==0);
+    assert(brook::XhciTdPackets(1500,512,1024)==2); // partial packet crosses TRBs
+    assert(brook::XhciTdPackets(1500,1024,1024)==1);
+    assert(brook::XhciTdPackets(13,13,1024)==0);
+    assert(brook::XhciTdPackets(512,256,0)==0);
+    assert(brook::XhciTdPackets(65536,61440,512)==8);
+    assert(brook::XhciTdPackets(65536,61440,64)==31);
     brook::XhciCompletionQueue<Event,3> q;Event out{};
     assert(q.Push({0x1000,1,32u<<10}));assert(q.Push({0x2000,2,33u<<10}));assert(q.Push({0x3000,3,32u<<10}));
     assert(!q.Push({0x4000,4,32u<<10}));
+    const uint64_t td[]{0x5000,0x3000};
+    assert(q.TakeAny(32u<<10,td,2,out) && out.param==0x3000);
+    assert(q.Push({0x3000,3,32u<<10}));
     assert(!q.Take(32u<<10,0x2000,out));
     assert(q.Take(32u<<10,0x3000,out) && out.status==3);
     assert(q.Take(33u<<10,0x2000,out) && out.status==2);

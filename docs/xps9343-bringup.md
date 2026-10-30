@@ -326,6 +326,37 @@ acceptance passes in `build/hardware/intel-route-ecm-20261030/result.json`.
 Only the next physical before/after port evidence can establish whether routing
 explains the Dell failure; `0x2a0` by itself does not prove it.
 
+The routing payload restored physical discovery on the next Dell boot. Firmware
+allowed additional USB2 selector bits and all four SuperSpeed terminations;
+the driver read back the requested settings. Four USB devices were enumerated,
+the FAT32 stick and application-image metadata mounted, and the Tecknet obtained
+an IPv4 address. A boot-pinned hardware bridge attached successfully from the
+development host. Logs, capabilities, memory/frame statistics and a UID-1000
+structured guest command with separate output and collected exit status were
+verified directly on the laptop. Private evidence is retained under
+`build/hardware/dell-live-20261030`.
+
+Physical USB file reads subsequently returned EIO, preventing the offline
+session executables from loading. The remote probe confirmed exit 3 with
+`USB_IO_OPEN: I/O error`; this alone does not identify the original transport
+failure after the storage path is quarantined.
+
+The following candidate fixes the xHCI >=1.0 TD packet-count field for large
+MSC reads split at a 64 KiB DMA boundary. It publishes the first Normal TRB's
+cycle only after the whole TD is prepared, requests short-packet events for IN,
+and matches failures against every submitted TD token. Success still requires
+the final token with zero residue; failures retain DMA/quarantine semantics.
+The packet formula follows Intel xHCI section 4.11.2.4. Host tests cover packet
+saturation, partial packets and matching a nonfinal token without discarding
+unrelated completions. Full QEMU USB acceptance passes at
+`build/hardware/msc-td-final-ecm-20261030/result.json`.
+
+The first MSC error is now visible in the kernel log with its completion code,
+residue, endpoint/slot, DMA boundary offset, tokens and command information.
+This candidate still needs a physical read-integrity pass; TD defects are
+established in the code, but their role in the observed Dell EIO remains to be
+verified.
+
 ### Validated reset and graceful manual power-off
 
 Power handling now separates graceful quiescence, reset and automatic power-off.
