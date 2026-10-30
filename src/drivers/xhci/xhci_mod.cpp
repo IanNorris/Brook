@@ -694,9 +694,7 @@ static bool XhciAllocRings(XhciController& ctrl)
 
     // Place a Link TRB at the last slot to wrap the ring
     Trb& link = ctrl.cmdRing[CMD_RING_SIZE - 1];
-    link.param = ctrl.cmdRingPhys;
-    link.status = 0;
-    link.control = TRB_TYPE_LINK | TRB_TC | (ctrl.cmdCycle ? TRB_CYCLE : 0);
+    XhciInitializeLink(link,ctrl.cmdRingPhys);
 
     SerialPrintf("xhci: command ring at phys=0x%lx (%u TRBs)\n",
                  ctrl.cmdRingPhys, CMD_RING_SIZE);
@@ -1029,9 +1027,10 @@ static bool XhciAllocTransferRing(Trb*& ring, uint64_t& ringPhys,
 
     // Set up Link TRB at the end pointing back to start
     Trb& link = ring[XFER_RING_SIZE - 1];
-    link.param = ringPhys;
-    link.status = 0;
-    link.control = TRB_TYPE_LINK | TRB_TC | TRB_CYCLE;
+    // Producer and endpoint DCS start at one. Keep the Link unowned until
+    // software actually wraps, so the consumer cannot cross a future submission
+    // gate before the producer has prepared the next lap.
+    XhciInitializeLink(link,ringPhys);
 
     enqueue = 0;
     cycle = true;
@@ -2451,11 +2450,12 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
     uint64_t physical=bufPhys,token=0,tokens[3]{};unsigned tokenCount=0;uint32_t remaining=len;
     const uint32_t maxPacket=isIn?dev.bulkInMaxPacket:dev.bulkOutMaxPacket;
     if(!maxPacket)return false;
-    Trb* first=nullptr;uint32_t firstControl=0;
+    XhciTdPublication publication;
     while(remaining) {
         if(enqueue>=XFER_RING_SIZE-1) {
             tokens[tokenCount++]=ringPhys+(XFER_RING_SIZE-1)*sizeof(Trb);
-            ring[XFER_RING_SIZE-1].control=TRB_TYPE_LINK|TRB_TC|(1u<<4)|(cycle?TRB_CYCLE:0);
+            publication.Stage(ring[XFER_RING_SIZE-1].control,
+                XhciLinkControl(cycle,(ring[XFER_RING_SIZE-2].control&(1u<<4))!=0));
             cycle=!cycle;enqueue=0;
         }
         const auto bytes=XhciDmaChunk(physical,remaining);
@@ -2465,12 +2465,11 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
         if(ctrl.hciVersion>=0x100)trb.status|=XhciTdPackets(len,len-remaining+bytes,maxPacket)<<17;
         const uint32_t control=TRB_TYPE_NORMAL|(remaining>bytes?(1u<<4):TRB_IOC)|
             (isIn?TRB_ISP:0)|(cycle?TRB_CYCLE:0);
-        if(!first){first=&trb;firstControl=control;trb.control=control^TRB_CYCLE;}
-        else trb.control=control;
+        publication.Stage(trb.control,control);
         ++enqueue;physical+=bytes;remaining-=bytes;
     }
     __asm__ volatile("mfence":::"memory");
-    __atomic_store_n(&first->control,firstControl,__ATOMIC_RELEASE);
+    publication.Publish();
     __asm__ volatile("mfence":::"memory");
     XhciRingDoorbell(ctrl,dev.slotId,dci);
     Trb completion;

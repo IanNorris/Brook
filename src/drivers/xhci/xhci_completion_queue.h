@@ -1,6 +1,23 @@
 #pragma once
 #include <stdint.h>
 namespace brook {
+constexpr uint32_t XhciLinkControl(bool cycle,bool chain) {
+    return (6u<<10)|2u|(chain?16u:0u)|(cycle?1u:0u);
+}
+template<class Trb> void XhciInitializeLink(Trb& link,uint64_t target) {
+    link.param=target;link.status=0;
+    link.control=XhciLinkControl(false,false); // producer/DCS initially one
+}
+// Hold the first ring element (which may be a Link) unowned until every
+// element in the submission is initialized. Its cycle predates any wrap.
+struct XhciTdPublication {
+    uint32_t* first=nullptr;uint32_t control=0;
+    void Stage(uint32_t& field,uint32_t value) {
+        if(!first){first=&field;control=value;value^=1u;}
+        __atomic_store_n(&field,value,__ATOMIC_RELEASE);
+    }
+    void Publish(){if(first)__atomic_store_n(first,control,__ATOMIC_RELEASE);}
+};
 // Caller serializes pump/lookup with an IRQ-safe lock. Preserve unrelated
 // endpoint completions instead of overwriting one controller-wide flag.
 template<class Event,unsigned Capacity=64> struct XhciCompletionQueue {

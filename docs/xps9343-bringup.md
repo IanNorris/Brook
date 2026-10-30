@@ -369,6 +369,32 @@ submitted TRB contents. Host byte-I/O tests now exercise both 4 KiB and 64 KiB
 capacities; the full offline QEMU read/IP/console acceptance passes for the
 control at `build/hardware/msc-page-desktop-test-20261030/result.json`.
 
+The physical 4 KiB control also failed at ring wrap: slot 6/DCI 3, one 4 KiB
+data TRB following a Link, USBSTS `0x10`, endpoint state Running. The submitted
+Link had CH set despite being between TDs. Transfer rings also initialized
+their Link with C=1, allowing hardware to cross before the producer prepared
+the next lap. A Link used later as a publication gate could consequently have
+already been consumed. Endpoint output-context dequeue is not assumed to be
+a live instruction pointer.
+
+The next candidate initializes command/transfer Links with C=0 while initial
+producer/DCS is one, inherits Link CH from its preceding transfer, and gates
+the first ring element even when it is a Link. Host consumer-model tests cover
+enqueue 254/255, split TDs, two full laps and polling during preparation. A
+negative control restoring the initially-owned Link makes the regression test
+fail, with core dumps disabled. The test establishes producer/consumer ownership
+invariants; physical read acceptance remains required. Evidence is under
+`build/hardware/msc-wrap-negative-control` and
+`build/hardware/msc-wrap-desktop-test-20261030`.
+
+The stick also intermittently failed in Dell firmware before any Brook code.
+All eight payload hashes and the x86-64 EFI application were correct. A
+non-modifying FAT check found only boot-sector byte 65's dirty bit. After
+metadata backup, managed repair changed exactly that byte from one to zero;
+the FAT check became clean and all file hashes still matched. The next firmware
+boot succeeded only on its third attempt, so the dirty flag is not established
+as the boot-failure cause. Preserve this as a separate pre-loader issue.
+
 ## Next: remote USB update and reboot
 
 The user requested remote updates so subsequent driver builds can be tested
