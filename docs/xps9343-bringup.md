@@ -395,6 +395,15 @@ the FAT check became clean and all file hashes still matched. The next firmware
 boot succeeded only on its third attempt, so the dirty flag is not established
 as the boot-failure cause. Preserve this as a separate pre-loader issue.
 
+The fresh ring-ownership payload passed physical read acceptance on the Dell:
+six byte-verified 8 MiB passes, final `USB_IO_PROBE_OK`, no transport error, and
+the compressed application image mounted. Mousepad and Files subsequently
+launched through the hardware bridge and registered visible windows. Terra's
+semantic receipts are in `build/hardware/dell-msc-wrap-live-20261030`; this is
+not a bridge screenshot or an independent visual-rendering check. The physical
+control still uses 4 KiB MSC chunks. Restoring the 64 KiB default remains a
+separate throughput/correctness test.
+
 ## Next: remote USB update and reboot
 
 The user requested remote updates so subsequent driver builds can be tested
@@ -443,6 +452,50 @@ references, failure at each write/flush/readback/selection step, paired fallback
 and real firmware reset into the selected verified kernel/initrd pair. Until
 these gates pass, the current bridge supports observation, execution and power,
 not remote boot-media updates.
+
+### Writable scratch gate prepared before boot-media updates
+
+`scripts/prepare_hardware_storage_test.py` derives a separate writable test
+payload from the accepted read-only desktop. It removes the read-only marker
+and compressed-image mount configuration in the new initrd before boot. USB
+is writable from initialization; the ordinary profile and its retained image
+source are unchanged. This explicit test profile mounts the test volume RW,
+unlike the eventual updater's normally-RO maintenance mount. Applications are
+not started and no automatic write test runs.
+
+The host preallocates a dedicated 1 MiB scratch file with a format stamp, nonce
+and header checksum. `tools/hardware_storage_probe.c` opens only an existing,
+single-link regular file of that size, rejects symlinks and mismatched headers,
+and writes only after validation. It never creates, truncates or deletes files.
+Preallocation is established by host provisioning, not proved by guest fstat.
+Successful write/fsync explicitly requests fresh-boot verification; it does not
+claim power-loss durability. Repeating the deterministic pattern is not an
+independent proof of another write, so preserve the initial zero-data control.
+
+Host negative controls cover nonce/header mismatch, symlinks, hard links,
+wrong size and corruption. QEMU acceptance writes and fsyncs the provisioned
+file, reaches checked shutdown, boots a new VM from the same private image,
+and verifies every payload byte. It then checks that all eight protected files
+retain their hashes and FAT remains consistent. Image hashing streams mcopy
+binary stdout; FAT checking uses bounded RAM instead of another SSD image.
+
+```
+# In nix-shell, after building the current kernel/xHCI module:
+python3 scripts/prepare_hardware_storage_test.py \
+  --base-probe build/hardware/offline-msc-wrap-20261030/probe \
+  --output build/hardware/storage-write-profile/probe
+python3 scripts/test_hardware_storage_write.py \
+  --probe build/hardware/storage-write-profile/probe \
+  --output build/hardware/storage-write-check
+```
+
+Final evidence: `build/hardware/hwio-host-v2-20261030/result.json` and
+`build/hardware/writable-storage-acceptance-v2-20261030/result.json`.
+The candidate `build/hardware/writable-storage-test-v2-20261030/probe` has not
+been staged on the physical stick. No physical USB write acceptance or remote
+update capability is claimed yet. After updates are implemented, confirm the
+selected payload generation as well as a changed boot identity; a kernel-only
+build ID cannot distinguish driver-only initrd changes.
 
 ### Validated reset and graceful manual power-off
 
