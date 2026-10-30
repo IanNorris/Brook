@@ -221,6 +221,7 @@ add_executable(kernel
     src/base45.cpp
     src/pci.cpp
     src/ramdisk.cpp
+    src/fat_image_device.cpp
     src/runtime.cpp
     src/syscall.cpp
     src/user_copy.cpp

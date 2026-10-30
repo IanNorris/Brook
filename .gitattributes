@@ -1,3 +1,5 @@
 # Unified context lines require a space prefix, including blank final context
 # lines and context before source tabs.
 *.patch whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+# FatFs's configuration overlay retains its upstream CRLF line endings.
+src/kernel/src/ffconf.h whitespace=cr-at-eol

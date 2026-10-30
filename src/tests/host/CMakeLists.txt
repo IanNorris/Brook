@@ -584,6 +584,7 @@ target_compile_options(test_fat_drive PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunct
 target_link_options(test_fat_drive PRIVATE -Wl,--gc-sections)
 add_executable(test_fat_objects
     "${BROOK_ROOT}/src/tests/test_fat_objects/main.cpp"
+    "${BROOK_ROOT}/src/kernel/src/fat_image_device.cpp"
     "${FATFS_OBJECT_HOST_DIR}/ff.c" "${FATFS_OBJECT_HOST_DIR}/ffunicode.c")
 target_include_directories(test_fat_objects PRIVATE "${FATFS_OBJECT_HOST_DIR}")
 target_compile_options(test_fat_objects PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections)
@@ -697,3 +698,17 @@ add_host_test(test_mouse_motion)
 target_compile_options(test_mouse_motion PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_link_options(test_mouse_motion PRIVATE -Wl,--gc-sections)
+
+add_executable(test_fat_image_ext2 "${BROOK_ROOT}/src/tests/test_fat_image_ext2/main.cpp"
+    "${BROOK_ROOT}/src/kernel/src/fatfs_vfs.cpp" "${BROOK_ROOT}/src/kernel/src/fat_image_device.cpp"
+    "${BROOK_ROOT}/src/kernel/src/fs_context.cpp" "${BROOK_ROOT}/src/kernel/src/vfs.cpp"
+    "${BROOK_ROOT}/src/kernel/src/memory/mapping_pin_registry.cpp"
+    "${FATFS_OBJECT_HOST_DIR}/ff.c" "${FATFS_OBJECT_HOST_DIR}/ffunicode.c")
+target_include_directories(test_fat_image_ext2 PRIVATE "${FATFS_OBJECT_HOST_DIR}")
+target_compile_options(test_fat_image_ext2 PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror;-Wno-unused-function;-Wno-unused-parameter;-Wno-attributes>"
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_fat_image_ext2 PRIVATE -Wl,--gc-sections)
+target_link_libraries(test_fat_image_ext2 PRIVATE Threads::Threads)
+add_test(NAME test_fat_image_ext2 COMMAND python3 "${BROOK_ROOT}/src/tests/test_fat_image_ext2/run.py" "$<TARGET_FILE:test_fat_image_ext2>")
+set_tests_properties(test_fat_image_ext2 PROPERTIES TIMEOUT 90)

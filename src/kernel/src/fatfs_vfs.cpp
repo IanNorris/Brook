@@ -69,6 +69,12 @@ static bool g_fatfsDebug = false;
 
 struct FatOpenFile;
 struct FatPathObject;
+struct FatImageLease {
+    Vnode* owner;
+    uint64_t bytes, identity;
+    int error;
+    DWORD* linkMap;
+};
 struct FatFsMountData {
     FATFS fs;
     uint8_t pdrv;
@@ -91,7 +97,21 @@ struct FatOpenFile {
     bool writable;
     bool closing;
     bool streaming;
+    FatImageLease* imageLease;
 };
+
+// Only live leases populate this table. Their retained vnode pins the FAT
+// mount/drive, so directory and mount-wide flush failures can find all affected
+// image owners without performing namespace lookup inside I/O.
+static FatFsMountData* g_imageLeaseMounts[FF_VOLUMES]{};
+static int FlushFatDriveLocked(uint8_t drive)
+{
+    const int error=FatFsFlushDrive(drive);
+    if(error && drive<FF_VOLUMES && g_imageLeaseMounts[drive])
+        for(auto* file=g_imageLeaseMounts[drive]->allFiles;file;file=file->allNext)
+            if(file->imageLease && !file->imageLease->error)file->imageLease->error=error;
+    return error;
+}
 
 static void RemoveWritableFile(FatOpenFile* file)
 {
@@ -118,6 +138,7 @@ static FRESULT CheckedFatSync(FIL* fil, bool closing);
 static int PrepareFatMutation(FatOpenFile* file, bool flushSelf = true)
 {
     if (file->mount->intrinsicReadOnly) return -30;
+    if (file->imageLease) return -16;
     for (auto* other = file->mount->allFiles; other; other = other->allNext) {
         if (!SameFatFile(&file->fil, &other->fil)) continue;
         if (other->cacheLoading) return -16;
@@ -278,6 +299,7 @@ static int FatFileRead(Vnode* vn, void* buf, uint64_t len, uint64_t* offset)
 {
     FIL* fil = static_cast<FIL*>(vn->priv);
     KMutexLock(&g_fatLock);
+    if (reinterpret_cast<FatOpenFile*>(fil)->imageLease) { KMutexUnlock(&g_fatLock); return -16; }
     if (*offset >= f_size(fil)) { KMutexUnlock(&g_fatLock); return 0; }
     if (f_tell(fil) != *offset) {
         FRESULT sres = f_lseek(fil, static_cast<FSIZE_t>(*offset));
@@ -351,9 +373,14 @@ static FRESULT CheckedFatSync(FIL* fil, bool closing)
 {
     // FatFS clears FA_MODIFIED even if sync_fs/CTRL_SYNC fails. Retain its
     // pre-call flags so a retry rewrites dirty data and directory metadata.
+    auto* file=reinterpret_cast<FatOpenFile*>(fil);
+    if(file->imageLease && file->imageLease->error)return FR_DISK_ERR;
     BYTE flags = fil->flag;
     FRESULT result = closing ? f_close(fil) : f_sync(fil);
-    if (result != FR_OK) fil->flag |= flags;
+    if (result != FR_OK) {
+        fil->flag |= flags;
+        if(file->imageLease && !file->imageLease->error)file->imageLease->error=FrToErrno(result);
+    }
     return result;
 }
 
@@ -391,11 +418,14 @@ static int FatFileFsync(Vnode* vn)
     if (vn->type != VnodeType::File) return -FVFS_EINVAL;
     FIL* fil = static_cast<FIL*>(vn->priv);
     KMutexLock(&g_fatLock);
+    if (auto* lease=reinterpret_cast<FatOpenFile*>(fil)->imageLease; lease && lease->error) {
+        KMutexUnlock(&g_fatLock);return lease->error;
+    }
     // f_sync flushes the file's cached window AND rewrites the directory
     // entry (size, first cluster, timestamps) + FAT, so the on-disk file is
     // valid even if the system loses power before f_close.
     FRESULT res = CheckedFatSync(fil, false);
-    int error = res == FR_OK ? FatFsFlushDrive(fil->obj.fs->pdrv) : FrToErrno(res);
+    int error = res == FR_OK ? FlushFatDriveLocked(fil->obj.fs->pdrv) : FrToErrno(res);
     KMutexUnlock(&g_fatLock);
     return error;
 }
@@ -404,7 +434,7 @@ static int FatDirFsync(Vnode* vn)
 {
     auto* dir = static_cast<DIR*>(vn->priv);
     KMutexLock(&g_fatLock);
-    int result = FatFsFlushDrive(dir->obj.fs->pdrv);
+    int result = FlushFatDriveLocked(dir->obj.fs->pdrv);
     KMutexUnlock(&g_fatLock);
     return result;
 }
@@ -413,7 +443,7 @@ static int FatCachedFsync(Vnode* vn)
 {
     auto* cached = static_cast<CachedFile*>(vn->priv);
     KMutexLock(&g_fatLock);
-    int result = FatFsFlushDrive(cached->fil->obj.fs->pdrv);
+    int result = FlushFatDriveLocked(cached->fil->obj.fs->pdrv);
     KMutexUnlock(&g_fatLock);
     return result;
 }
@@ -449,6 +479,35 @@ static bool FatFileIdentity(const FIL* fil, VnodeStat* st)
     st->ino = uint64_t{fil->dir_sect} * (FF_MAX_SS / 32) + (entry - window) / 32 + 1;
     st->dev = FatDeviceIdentity(fs);
     return true;
+}
+
+// Called under g_fatLock. Stable directory-slot identity covers SFN/LFN and
+// case aliases without a pathname registry.
+static bool FatImageIdentityLeased(FatFsMountData* mount, uint64_t identity)
+{
+    for (auto* file=mount->allFiles;file;file=file->allNext)
+        if (file->imageLease && file->imageLease->identity==identity) return true;
+    return false;
+}
+
+// Legacy pathname opens must check before f_open's CREATE_ALWAYS can mutate.
+// The temporary read-only FIL is only an identity probe, never an alias exposed
+// outside this mutex. Unknown I/O errors fail closed.
+static int FatImagePathAllowedLocked(FatFsMountData* mount,const char* path)
+{
+    bool any=false;
+    for(auto* file=mount->allFiles;file;file=file->allNext)if(file->imageLease){any=true;break;}
+    if(!any)return 0;
+    FILINFO stat{};FRESULT result=f_stat(path,&stat);
+    if(result==FR_NO_FILE || result==FR_NO_PATH)return 0;
+    if(result!=FR_OK)return FrToErrno(result);
+    if(stat.fattrib&AM_DIR)return 0;
+    FIL fil{};result=f_open(&fil,path,FA_READ);
+    if(result!=FR_OK)return FrToErrno(result);
+    VnodeStat identity{};int error=!FatFileIdentity(&fil,&identity)?-5:
+        FatImageIdentityLeased(mount,identity.ino)?-16:0;
+    const auto closed=f_close(&fil);
+    return error?error:closed==FR_OK?0:FrToErrno(closed);
 }
 
 static bool FatDirectoryIdentity(const DIR* dir, VnodeStat* st)
@@ -608,6 +667,13 @@ static const VnodeOps g_fatFileOps = {
     .space = FatSpace,
 };
 
+static const VnodeOps g_fatImageOwnerOps = {
+    .open=FatFileOpen,.read=FatFileRead,.write=FatFileWrite,.readdir=nullptr,
+    .close=FatFileClose,.stat=FatStat,.fsync=FatFileFsync,
+    .truncate=FatFileTruncate,.append=FatFileAppend,.space=FatSpace,
+    .deny_mapping=true,
+};
+
 static const VnodeOps g_fatDirOps = {
     .open = FatFileOpen, .read = nullptr, .write = nullptr,
     .readdir = FatDirReaddir, .close = FatFileClose, .stat = FatStat,
@@ -663,6 +729,7 @@ static int FatFsSyncLocked(FatFsMountData* data)
     auto** link = &data->writableFiles;
     while (*link) {
         auto* file = *link;
+        if(file->imageLease && file->imageLease->error && !result)result=file->imageLease->error;
         FRESULT error = CheckedFatSync(&file->fil, file->closing);
         if (error != FR_OK && !result) result = FrToErrno(error);
         if (file->closing && error == FR_OK) {
@@ -673,7 +740,7 @@ static int FatFsSyncLocked(FatFsMountData* data)
             link = &file->next;
         }
     }
-    int error = FatFsFlushDrive(data->pdrv);
+    int error = FlushFatDriveLocked(data->pdrv);
     return result ? result : error;
 }
 
@@ -773,7 +840,13 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
     KMutexLock(&g_fatLock);
     // FatFS keeps size/first-cluster metadata in each FIL. Publish pending
     // writers before opening another FIL, then all mutations update aliases.
+    if(FatImagePathAllowedLocked(mount,fatPath)) {
+        KMutexUnlock(&g_fatLock);kfree(file);return nullptr;
+    }
     for (auto* writer = file->mount->writableFiles; writer; writer = writer->next) {
+        if(writer->imageLease && writer->imageLease->error) {
+            KMutexUnlock(&g_fatLock);kfree(file);return nullptr;
+        }
         FRESULT sync = CheckedFatSync(&writer->fil, false);
         if (sync != FR_OK) { KMutexUnlock(&g_fatLock); kfree(file); return nullptr; }
     }
@@ -1110,6 +1183,7 @@ static void FatObjectDestroy(VfsObject* object)
 static int FatFlushWritersLocked(FatFsMountData* mount)
 {
     for(auto* writer=mount->writableFiles;writer;writer=writer->next) {
+        if(writer->imageLease && writer->imageLease->error)return writer->imageLease->error;
         FRESULT result=CheckedFatSync(&writer->fil,false);
         if(result!=FR_OK)return FrToErrno(result);
     }
@@ -1186,7 +1260,7 @@ static Vnode* FatObjectOpen(VfsObject* object,int flags,int* error)
     if(!node){*error=-12;return nullptr;}
     *node={};node->refCount=1;node->backendObject=object;
     KMutexLock(&g_fatLock);
-    *error=FatFlushWritersLocked(retained->mount);
+    *error=FatImageIdentityLeased(retained->mount,object->identity)?-16:FatFlushWritersLocked(retained->mount);
     if(!*error && directory) {
         auto* dir=static_cast<DIR*>(kmalloc(sizeof(DIR)));
         if(!dir)*error=-12;
@@ -1313,6 +1387,113 @@ static const VfsObjectOps g_fatObjectOps={
     .directory_path=FatObjectDirectoryPath,.object_path=FatObjectPath,.entry_parent=FatObjectEntryParent,
 };
 static const VfsObjectOps* FatObjectOperations(){return &g_fatObjectOps;}
+
+int FatFsAcquireImageLease(Vnode* node,uint64_t bytes,FatImageLease** out)
+{
+    if(!out)return -22;
+    *out=nullptr;
+    // Do not admit cached snapshots, directories or the read-only streaming
+    // source API. The boot caller opens this RW vnode privately, never as an FD.
+    if(!node || node->type!=VnodeType::File || node->ops!=&g_fatFileOps ||
+       !node->priv || bytes<512 || (bytes&511) || bytes>0xfffffe00ULL)return -22;
+    auto* lease=static_cast<FatImageLease*>(kmalloc(sizeof(FatImageLease)));
+    if(!lease)return -12;
+    *lease={};
+    constexpr uint32_t mapEntries=16384;
+    lease->linkMap=static_cast<DWORD*>(kmalloc(mapEntries*sizeof(DWORD)));
+    if(!lease->linkMap){kfree(lease);return -12;}
+    KMutexLock(&g_fatLock);
+    auto* file=static_cast<FatOpenFile*>(node->priv);
+    int error=0;VnodeStat identity{};
+    if(file->mount->intrinsicReadOnly)error=-30;
+    else if(!file->writable || file->streaming || !(file->fil.flag&FA_READ))error=-22;
+    else if(file->closing || file->cacheLoading || file->imageLease ||
+            __atomic_load_n(&node->refCount,__ATOMIC_ACQUIRE)!=1)error=-16;
+    else if(f_size(&file->fil)!=bytes || !FatFileIdentity(&file->fil,&identity))error=-22;
+    if(!error)for(auto* other=file->mount->allFiles;other;other=other->allNext)
+        if(other!=file && SameFatFile(&file->fil,&other->fil)){error=-16;break;}
+    if(!error) {
+        const auto synced=CheckedFatSync(&file->fil,false);
+        error=synced==FR_OK?FlushFatDriveLocked(file->mount->pdrv):FrToErrno(synced);
+    }
+    if(!error) {
+        // Fixed ownership lets us safely retain this bounded extent map. Do
+        // not repeatedly walk a multi-GB FAT chain for random ext2 blocks.
+        const auto mapped=f_object_image_map(&file->fil,lease->linkMap,mapEntries);
+        if(mapped!=FR_OK) {
+            file->fil.cltbl=nullptr;
+            error=mapped==FR_NOT_ENOUGH_CORE?-27:FrToErrno(mapped);
+        }
+    }
+    if(!error) {
+        lease->owner=node;lease->bytes=bytes;lease->identity=identity.ino;
+        VfsRetain(node);node->ops=&g_fatImageOwnerOps;file->imageLease=lease;
+        g_imageLeaseMounts[file->mount->pdrv]=file->mount;
+        *out=lease;
+    }
+    KMutexUnlock(&g_fatLock);
+    if(error){kfree(lease->linkMap);kfree(lease);}
+    return error;
+}
+
+// All mutable FIL cursor state is serialized, but offsets belong to each
+// caller. Limit each FAT critical section to64KiB. FatFs owns the partial-sector
+// buffer and RMW under this same mutex. Callers cannot grow the fixed file or
+// wrap FSIZE_t.
+static int FatImageTransfer(FatImageLease* lease,uint64_t offset,void* data,uint32_t bytes,bool write)
+{
+    if(!lease || (!data && bytes) || bytes>65536 || offset>lease->bytes || bytes>lease->bytes-offset)return -22;
+    KMutexLock(&g_fatLock);
+    auto* file=static_cast<FatOpenFile*>(lease->owner->priv);
+    int error=lease->error;
+    if(!error && file->imageLease!=lease)error=-22;
+    if(!error && bytes) {
+        FRESULT status=f_lseek(&file->fil,static_cast<FSIZE_t>(offset));
+        UINT done=0;
+        if(status==FR_OK)status=write?f_write(&file->fil,data,bytes,&done):f_read(&file->fil,data,bytes,&done);
+        if(status!=FR_OK)error=FrToErrno(status);
+        else if(done!=bytes || f_size(&file->fil)!=lease->bytes)error=-5;
+        if(error)lease->error=error;
+    }
+    KMutexUnlock(&g_fatLock);
+    return error?error:static_cast<int>(bytes);
+}
+int FatFsImageRead(FatImageLease* lease,uint64_t offset,void* out,uint32_t bytes)
+{return FatImageTransfer(lease,offset,out,bytes,false);}
+int FatFsImageWrite(FatImageLease* lease,uint64_t offset,const void* in,uint32_t bytes)
+{return FatImageTransfer(lease,offset,const_cast<void*>(in),bytes,true);}
+int FatFsImageFlush(FatImageLease* lease)
+{
+    if(!lease)return -22;
+    KMutexLock(&g_fatLock);
+    auto* file=static_cast<FatOpenFile*>(lease->owner->priv);
+    int error=lease->error;
+    if(!error) {
+        const auto synced=CheckedFatSync(&file->fil,false);
+        error=synced==FR_OK?FlushFatDriveLocked(file->mount->pdrv):FrToErrno(synced);
+        if(error)lease->error=error;
+    }
+    KMutexUnlock(&g_fatLock);
+    return error;
+}
+int FatFsReleaseImageLease(FatImageLease* lease)
+{
+    if(!lease)return -22;
+    if(int error=FatFsImageFlush(lease))return error;
+    Vnode* node=lease->owner;
+    KMutexLock(&g_fatLock);
+    auto* file=static_cast<FatOpenFile*>(node->priv);
+    file->imageLease=nullptr;file->fil.cltbl=nullptr;node->ops=&g_fatFileOps;
+    bool other=false;
+    for(auto* live=file->mount->allFiles;live;live=live->allNext)if(live->imageLease){other=true;break;}
+    if(!other)g_imageLeaseMounts[file->mount->pdrv]=nullptr;
+    KMutexUnlock(&g_fatLock);
+    // May release a retained namespace/object/mount. Never do this while FAT
+    // or an upper filesystem lock is held. Published devices keep their lease
+    // for the boot lifetime; this path is for unpublished setup/test cleanup.
+    VfsRelease(node);kfree(lease->linkMap);kfree(lease);return 0;
+}
+
 static int FatDirectoryObjectLocked(FatFsMountData* mount,const DIR* directory,VfsObject** out)
 {
     *out=nullptr;FF_OBJECT object{};

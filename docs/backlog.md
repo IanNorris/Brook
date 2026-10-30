@@ -1894,3 +1894,12 @@ free/reuse; do not merely zero/reinitialize the lock or bypass protected exit.
 [Captured cause and bounded repair gates](socket-slot-lifetime-20261029.md).
 This is the current acceptance prerequisite, with the failed private VM stopped
 and its evidence preserved; it is not counted as a completed Steam control.
+
+### Dell display power priority (30 October)
+
+Implement internal panel/backlight off/on, configurable idle blanking and
+keyboard/mouse wake while keeping the hardware debug bridge alive. Restore
+visibility for panic/optical diagnostics. Identify the actual firmware route
+before hardware writes; expose verified capability and manual bridge control.
+Full system sleep/suspend can wait. See the display-power priority in
+[xps9343-bringup.md](xps9343-bringup.md).

@@ -1245,3 +1245,74 @@ Required implementation boundaries before hardware use:
 No writable backing device or expanded USB store is implemented/deployed at
 this checkpoint. This design is the next concrete dependency for Gallery
 installation and persistent browser profiles.
+
+### Exclusive FAT image device primitives (2026-10-30)
+
+The next-store backend is implemented, but not yet connected to a boot marker
+or deployed on the Dell. `fat_image_device.cpp` creates an unpublished,
+fixed-size device from a privately owned uncached RW FAT vnode. Its lease pins
+that vnode/mount; existing aliases prevent admission and subsequent ordinary
+opens (including case/SFN/LFN aliases), reads, writes, resize, replacement,
+unlink and mmap are refused. Ordinary VFS_O_STREAM remains read-only. Published
+devices are boot-lifetime; unpublished cleanup checks registration, flushes and
+keeps failed state pinned. Ext2 drive slots now reject foreign rebinding.
+
+The fixed image size is512-byte aligned and below FAT32's single-file limit.
+Device I/O is byte-addressed: existing ext2 needs4-byte indirect-map reads and
+128-byte inode writes. Each exact FAT transfer is at most64KiB and holds the
+FAT mutex across seek and buffered partial-sector RMW. Multi-chunk requests are
+not atomic; upper ext2 serialization supplies ordering. All read/write/flush
+failures remain sticky, including errors observed through ordinary file,
+directory or mount-wide sync paths. No pathname lookup occurs in block I/O.
+
+A retained64KiB extent map avoids repeated full FAT-chain seeks. The new
+`f_object_image_map` validates at most the declared file's cluster count,
+requires an exact terminal EOC, rejects bad/reserved/short/excess/cyclic chains,
+and stops immediately when its extent capacity is exhausted. It deliberately
+does not use upstream CREATE_LINKMAP's potentially unbounded chain traversal.
+Kernel FatFs fast seeking is enabled; the object adapter remains configured
+for external locking, FAT16/FAT32 and non-exFAT operation.
+
+Validation:
+
+- Production FAT16/FAT32 fixtures exercise alias exclusion, allocation and
+  admission rollback, mapping policy, random byte/sector I/O, small partial and
+  sector-crossing writes,64KiB boundaries, adjacent concurrent partial updates,
+  registration guards and cleanup. Injected read/write/file-sync/mount-sync
+  errors remain visible to later I/O and release.
+- Timed private child fixtures cover self/two/longer cycles, short/excess/bad
+  chains and extent overflow, including8192 FAT32 fragments. Failed admission
+  publishes nothing and frees provisional state.
+- `test_fat_image_ext2` runs production VFS -> ext2 -> image device -> FAT16/32
+  against ordinary host images. Create, indirect-block data, partial writes,
+  fsync, lower flush failure and unmount/remount persistence pass. Extracted
+  ext2 and containing FAT pass offline checks. Its host file-cache shims bypass
+  cached mmap; actual executable mmap and USB transport still need QEMU gates.
+- All161 host tests pass in12.55s; kernel build and both compiled entry-state /
+  scheduler-start mutation audits pass. Logs are under
+  `build/hardware/fat-image-*20261030*`.
+
+Astra's review caught and resolved missing sync-error latching, the unbounded
+stock map builder, and the initially incorrect sector-only Device interface.
+Next: boot admission/fallback, complete writable-store builder and verified
+streaming provisioner, followed by actual USB/QEMU restart and mmap gates.
+No new USB store file or internal-SSD writes occurred in this pass.
+
+### Priority addition: internal display power (2026-10-30)
+
+The user requests panel/backlight power control as a priority; full system
+sleep/suspend remains deferred. After checkpointing the storage primitives,
+inspect the Dell's firmware-established display/backlight route before adding
+manual off/on and idle blanking with keyboard/mouse wake. Keep the network
+bridge usable while the display is off, and force the backlight on for optical
+panic diagnostics. This is a display-control subset, not native Intel3D work.
+
+Initial primary references are Linux's MIT-licensed Intel
+[backlight implementation](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/intel_backlight.c)
+and [register definitions](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/i915/display/intel_backlight_regs.h).
+They expose generation-specific PWM and panel AUX paths; neither the active
+Dell route nor the relevant register state has been verified yet. Begin with
+read-only PCI/register inventory. Do not infer a working DPMS capability from
+framebuffer blanking or claim complete panel/link shutdown from backlight-only
+control. Full ACPI sleep and speculative display-engine reinitialization are
+out of scope for this addition.

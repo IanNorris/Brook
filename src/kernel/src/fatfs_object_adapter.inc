@@ -203,3 +203,53 @@ FRESULT f_object_open (const FF_OBJECT* object, FIL* out, BYTE mode)
        flags or share locks are acquired here. */
     return FR_OK;
 }
+
+FRESULT f_object_image_map (FIL* fp, DWORD* table, UINT entries)
+{
+#if FF_USE_FASTSEEK
+    FATFS* fs;
+    FRESULT result;
+    DWORD cluster, previous = 0, run_start = 0, run_length = 0, steps, needed;
+    UINT at = 1;
+    if (!fp || !table || entries < 4 || fp->cltbl) return FR_INVALID_PARAMETER;
+    result = validate(&fp->obj, &fs);
+    if (result != FR_OK) return result;
+    if (fp->err) return (FRESULT)fp->err;
+    if ((fs->fs_type != FS_FAT16 && fs->fs_type != FS_FAT32) ||
+        !fs->csize || !fp->obj.objsize) return FR_INVALID_PARAMETER;
+    needed = (DWORD)((fp->obj.objsize - 1) / ((FSIZE_t)fs->csize * SS(fs)) + 1);
+    if (needed > fs->n_fatent - 2) return FR_INT_ERR;
+    cluster = fp->obj.sclust;
+    for (steps = 0; steps < needed; ++steps) {
+        DWORD next;
+        const DWORD reserved = fs->fs_type == FS_FAT16 ? 0xfff0 : 0x0ffffff0;
+        const DWORD eoc = fs->fs_type == FS_FAT16 ? 0xfff8 : 0x0ffffff8;
+        if (cluster < 2 || cluster >= fs->n_fatent || cluster >= reserved) return FR_INT_ERR;
+        if (!run_length) {
+            if (at + 2 >= entries) return FR_NOT_ENOUGH_CORE;
+            run_start = cluster; run_length = 1;
+        } else if (cluster == previous + 1) {
+            ++run_length;
+        } else {
+            table[at++] = run_length; table[at++] = run_start;
+            if (at + 2 >= entries) return FR_NOT_ENOUGH_CORE;
+            run_start = cluster; run_length = 1;
+        }
+        next = get_fat(&fp->obj, cluster);
+        if (next == 0xffffffff) return FR_DISK_ERR;
+        if (steps + 1 == needed) {
+            if (next < eoc) return FR_INT_ERR; /* no hidden allocation tail */
+        } else {
+            if (next < 2 || next >= fs->n_fatent || next >= reserved ||
+                next == cluster || (steps && next == previous)) return FR_INT_ERR;
+        }
+        previous = cluster; cluster = next;
+    }
+    table[at++] = run_length; table[at++] = run_start; table[at++] = 0;
+    table[0] = at; fp->cltbl = table;
+    return FR_OK;
+#else
+    (void)fp; (void)table; (void)entries;
+    return FR_INVALID_PARAMETER;
+#endif
+}

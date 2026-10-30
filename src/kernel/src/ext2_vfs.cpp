@@ -4741,11 +4741,14 @@ extern "C" void Ext2DumpLockState()
                         brook::g_ext2Lock.writeWaitHead);
 }
 
-// Bind a block device to an ext2 pdrv slot.
+// Boot-only binding. A drive slot cannot be redirected underneath retained
+// mounts, vnodes or page-cache identities. Repeating the same binding is safe.
 extern "C" bool Ext2BindDevice(uint8_t pdrv, brook::Device* dev)
 {
     if (pdrv >= brook::EXT2_MAX_MOUNTS || !dev) return false;
-    brook::g_ext2Devices[pdrv] = dev;
+    brook::Device* empty=nullptr;
+    if(!__atomic_compare_exchange_n(&brook::g_ext2Devices[pdrv],&empty,dev,false,
+                                    __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return empty==dev;
     brook::SerialPrintf("ext2: drive %u → '%s'\n", pdrv, dev->name);
     return true;
 }
