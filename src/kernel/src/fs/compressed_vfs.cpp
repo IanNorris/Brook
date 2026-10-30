@@ -3,6 +3,8 @@
 #include "vfs.h"
 #include "vfs_object.h"
 #include "device.h"
+#include "fatfs_vfs.h"
+#include "spinlock.h"
 #include "memory/heap.h"
 #include "memory/file_page_cache.h"
 #include "process.h"
@@ -12,12 +14,15 @@
 #include "string.h"
 #include "lz4.h"
 namespace brook {
+void WakeVfsCleanupWorker() __attribute__((weak));
 namespace {
 constexpr uint32_t None=~uint32_t{0};
 Device* devices[DEVICE_MAX]{};
 uint32_t live[DEVICE_MAX]{};
+Vnode* pendingFiles[DEVICE_MAX]{};
 struct Mount {
     Device* device;uint8_t drive;uint32_t references,cacheNamespace;
+    Vnode* source; Mount* retiredNext;
     KMutex io;
     CompressedImage image;
     void* index;CompressedImageNodeState* nodes;uint32_t* links;
@@ -26,13 +31,26 @@ struct Mount {
 struct Object { VfsObject base;Mount* mount;uint32_t inode,entry; };
 Object* Private(VfsObject* object){return static_cast<Object*>(object->priv);}
 void Retain(Mount* m){__atomic_add_fetch(&m->references,1,__ATOMIC_RELAXED);}
-void Drop(Mount* m) {
-    if(__atomic_sub_fetch(&m->references,1,__ATOMIC_ACQ_REL))return;
+IrqSpinLock retiredLock;
+Mount* retiredMounts=nullptr;
+void Destroy(Mount* m) {
+    // May release a FAT mount. Never run under the compressed I/O mutex or
+    // the VFS namespace mutation lock (including failed-mount unwinding).
+    if(m->source)VfsClose(m->source);
     __atomic_sub_fetch(&live[m->drive],1,__ATOMIC_RELEASE);
     kfree(m->index);kfree(m->nodes);kfree(m->links);kfree(m->encoded);kfree(m->decoded);kfree(m);
 }
-int DeviceRead(void* context,uint64_t offset,void* out,uint64_t bytes) {
+void Drop(Mount* m) {
+    if(__atomic_sub_fetch(&m->references,1,__ATOMIC_ACQ_REL))return;
+    if(!m->source){Destroy(m);return;}
+    const auto flags=IrqSpinLockAcquire(&retiredLock);
+    m->retiredNext=retiredMounts;retiredMounts=m;
+    IrqSpinLockRelease(&retiredLock,flags);
+    if(WakeVfsCleanupWorker)WakeVfsCleanupWorker();
+}
+int SourceRead(void* context,uint64_t offset,void* out,uint64_t bytes) {
     auto* m=static_cast<Mount*>(context);
+    if(m->source)return VfsRead(m->source,out,bytes,&offset);
     if(!DeviceIsRegistered(m->device))return -5;
     return m->device->ops->read(m->device,offset,out,bytes);
 }
@@ -176,20 +194,28 @@ const VfsObjectOps objectOps={ObjectDestroy,ObjectStat,ObjectAccess,ObjectLookup
     DirectoryPath,nullptr,ObjectPath,ObjectSpecial,ObjectEntryParent,ObjectLink};
 const VfsObjectOps* ObjectOps(){return &objectOps;}
 bool MountImage(uint8_t drive,void** out) {
-    if(!out || drive>=DEVICE_MAX || !devices[drive])return false;*out=nullptr;
-    auto* dev=devices[drive];if(!DeviceIsRegistered(dev) || dev->type!=DeviceType::Block || !dev->ops->read)return false;
-    uint64_t count=DeviceBlockCount(dev),bytes=DeviceBlockSize(dev);
-    if(!bytes || count>~uint64_t{0}/bytes)return false;bytes*=count;
-    CompressedImageHeader header{};
-    if(dev->ops->read(dev,0,&header,sizeof(header))!=sizeof(header) || !CompressedImageHeaderValid(header,bytes))return false;
+    if(!out || drive>=DEVICE_MAX || (!devices[drive] && !pendingFiles[drive]))return false;*out=nullptr;
+    auto* dev=devices[drive];auto* source=pendingFiles[drive];uint64_t bytes=0;
+    if(source) {
+        VnodeStat stat{};
+        if(!FatFsFileSourceReadOnly(source) || VfsStat(source,&stat) || stat.isDir || stat.isSymlink)return false;
+        bytes=stat.size;
+    } else {
+        if(!DeviceIsRegistered(dev) || dev->type!=DeviceType::Block || !dev->ops->read)return false;
+        uint64_t count=DeviceBlockCount(dev);bytes=DeviceBlockSize(dev);
+        if(!bytes || count>~uint64_t{0}/bytes)return false;bytes*=count;
+    }
     auto* m=static_cast<Mount*>(kmalloc(sizeof(Mount)));if(!m)return false;
-    memset(m,0,sizeof(*m));m->references=1;m->device=dev;m->drive=drive;KMutexInit(&m->io);
-    __atomic_add_fetch(&live[drive],1,__ATOMIC_RELAXED);
+    memset(m,0,sizeof(*m));m->references=1;m->device=dev;m->drive=drive;m->source=source;
+    if(source)pendingFiles[drive]=nullptr; // Ownership transfers exactly once.
+    KMutexInit(&m->io);__atomic_add_fetch(&live[drive],1,__ATOMIC_RELAXED);
+    CompressedImageHeader header{};
+    if(SourceRead(m,0,&header,sizeof(header))!=sizeof(header) || !CompressedImageHeaderValid(header,bytes)){Drop(m);return false;}
     m->index=kmalloc(header.dataOffset-sizeof(header));m->nodes=static_cast<CompressedImageNodeState*>(kmalloc(header.inodeCount*sizeof(CompressedImageNodeState)));
     m->links=static_cast<uint32_t*>(kmalloc(header.inodeCount*sizeof(uint32_t)));m->encoded=static_cast<uint8_t*>(kmalloc(65536));m->decoded=static_cast<uint8_t*>(kmalloc(65536));
     if(!m->index || !m->nodes || !m->links || !m->encoded || !m->decoded ||
-       dev->ops->read(dev,sizeof(header),m->index,header.dataOffset-sizeof(header))!=int(header.dataOffset-sizeof(header)) ||
-       !m->image.Initialize(header,bytes,m->index,header.dataOffset-sizeof(header),m->nodes,header.inodeCount,{m,DeviceRead,Decode},m->encoded,m->decoded)) {Drop(m);return false;}
+       SourceRead(m,sizeof(header),m->index,header.dataOffset-sizeof(header))!=int(header.dataOffset-sizeof(header)) ||
+       !m->image.Initialize(header,bytes,m->index,header.dataOffset-sizeof(header),m->nodes,header.inodeCount,{m,SourceRead,Decode},m->encoded,m->decoded)) {Drop(m);return false;}
     m->cacheNamespace=FilePageCacheAllocateNamespace();if(!m->cacheNamespace){Drop(m);return false;}
     for(uint32_t i=0;i<header.inodeCount;++i)m->links[i]=m->image.Inode(i)->kind==CompressedImageKind::Directory?2:m->image.State(i)->links;
     for(uint32_t i=0;i<header.direntCount;++i){auto* e=m->image.Entry(i);if(m->image.Inode(e->inode)->kind==CompressedImageKind::Directory)++m->links[e->parent];}
@@ -226,13 +252,52 @@ const VfsFsOps fsOps={.mount=MountImage,.unmount=UnmountImage,.open=OpenLegacy,.
     .open_mode_checked=OpenPath,.check_access=FsAccess,.check_access_real=FsRealAccess,
     .create_socket=FsSocket,.root_object=RootObject,.vnode_object=FromVnode};
 }
+bool CompressedVfsCleanupPending() {
+    const auto flags=IrqSpinLockAcquire(&retiredLock);bool pending=retiredMounts!=nullptr;
+    IrqSpinLockRelease(&retiredLock,flags);return pending;
+}
+void CompressedVfsCollectRetired() {
+    const auto flags=IrqSpinLockAcquire(&retiredLock);auto* list=retiredMounts;retiredMounts=nullptr;
+    IrqSpinLockRelease(&retiredLock,flags);
+    while(list){auto* next=list->retiredNext;Destroy(list);list=next;}
+}
+// Boot initialization is serialized. No pathname reopens or mutable backing
+// files: the retained streaming FIL owns the immutable source mount.
+bool CompressedVfsMountFile(const char* sourcePath,const char* targetPath) {
+    if(!sourcePath || !targetPath || sourcePath[0]!='/' || targetPath[0]!='/')return false;
+    auto* source=VfsOpen(sourcePath,VFS_O_STREAM);
+    if(!source)return false;
+    if(!FatFsFileSourceReadOnly(source)){VfsClose(source);return false;}
+    int slot=DEVICE_MAX-1;
+    while(slot>=0 && (devices[slot] || pendingFiles[slot] || __atomic_load_n(&live[slot],__ATOMIC_ACQUIRE)))--slot;
+    if(slot<0){VfsClose(source);return false;}
+    pendingFiles[slot]=source;
+    const bool result=VfsMountConfigured(targetPath,"brookimg",slot,7);
+    if(pendingFiles[slot]){VfsClose(pendingFiles[slot]);pendingFiles[slot]=nullptr;}
+    CompressedVfsCollectRetired();
+    return result;
+}
 const VfsFsOps* CompressedVfsOperations(){return &fsOps;}
 bool CompressedVfsBindDevice(uint8_t drive,Device* device) {
-    if(drive>=DEVICE_MAX || !device || __atomic_load_n(&live[drive],__ATOMIC_ACQUIRE))return false;
+    if(drive>=DEVICE_MAX || !device || pendingFiles[drive] || __atomic_load_n(&live[drive],__ATOMIC_ACQUIRE))return false;
     devices[drive]=device;return true;
 }
 void CompressedVfsRegister(){VfsRegisterFs("brookimg",&fsOps);}
 void CompressedVfsBootMount() {
+    // A boot-local config keeps physical UEFI independent of QEMU fw_cfg.
+    // One complete record: /media/usb/APPS.BRK /nix (optional final newline).
+    if(auto* config=VfsOpen("/etc/boot-app-image",VFS_O_STREAM)) {
+        char record[512]{};uint64_t offset=0;int count=VfsRead(config,record,sizeof(record),&offset);VfsClose(config);
+        bool valid=count>0 && count<int(sizeof(record));char* target=nullptr;
+        for(int i=0;valid && i<count;++i) {
+            if(record[i]==' ' && !target){record[i]=0;target=record+i+1;}
+            else if(record[i]=='\n' && i==count-1)record[i]=0;
+            else if(static_cast<unsigned char>(record[i])<=32)valid=false;
+        }
+        if(!valid || !target || !*target || !CompressedVfsMountFile(record,target))
+            SerialPuts("brookimg: application file mount failed\n");
+        else {FilePageCacheEnableReclaim();SerialPrintf("brookimg: application file ready source=%s path=%s readonly\n",record,target);}
+    }
     char device[32]{},path[64]{};auto n=FwCfgReadFile("opt/compressed-image-device",device,sizeof(device));
     if(!n || n>=sizeof(device))return;device[n]=0;
     auto length=FwCfgReadFile("opt/compressed-image-mount",path,sizeof(path));

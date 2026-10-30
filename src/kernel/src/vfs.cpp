@@ -29,7 +29,9 @@ namespace brook { bool ModuleRetainAddresses(const uintptr_t*,uint32_t) __attrib
 
 // Forward-declare SchedulerYield — weak so test builds link without the scheduler.
 namespace brook { __attribute__((weak)) void SchedulerYield();
-__attribute__((weak)) void WakeVfsCleanupWorker(); }
+__attribute__((weak)) void WakeVfsCleanupWorker();
+__attribute__((weak)) bool CompressedVfsCleanupPending();
+__attribute__((weak)) void CompressedVfsCollectRetired(); }
 
 namespace brook {
 
@@ -270,7 +272,7 @@ static void VfsRequestMountCleanup(bool wake=true) {
     __atomic_store_n(&g_mountCleanupPending,true,__ATOMIC_RELEASE);
     if(wake)VfsWakeMountCleanup();
 }
-bool VfsMountCleanupPending() { return __atomic_load_n(&g_mountCleanupPending,__ATOMIC_ACQUIRE); }
+bool VfsMountCleanupPending() { return __atomic_load_n(&g_mountCleanupPending,__ATOMIC_ACQUIRE) || (CompressedVfsCleanupPending && CompressedVfsCleanupPending()); }
 static void VfsMountDrop(MountEntry* mount) {
     const uint64_t before=__atomic_fetch_sub(&mount->referenceState,uint64_t{1},__ATOMIC_ACQ_REL);
     if(!(before&~MOUNT_DETACHED))__builtin_trap();
@@ -841,6 +843,7 @@ Vnode* VfsOpenMode(const char* path, int flags, uint16_t mode)
 Vnode* VfsOpenModeChecked(const char* path, int flags, uint16_t mode, int* error)
 {
     if (error) *error = 0;
+    if ((flags & VFS_O_STREAM) && flags != VFS_O_STREAM) { if(error)*error=-22;return nullptr; }
     if ((flags & VFS_O_METADATA) &&
         (flags & (VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC | VFS_O_READWRITE | VFS_O_APPEND))) {
         if (error) *error = -22;

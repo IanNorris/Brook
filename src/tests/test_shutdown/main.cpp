@@ -34,6 +34,7 @@ uint32_t WmSnapshotDebugWindows(WmDebugWindow* out,uint32_t,uint64_t* tick){*tic
 int WmApplyDebugAction(uint32_t target,uint64_t incarnation,WmDebugAction,uint32_t,WmDebugWindow*,uint32_t*){assert(target==window.id&&incarnation==window.incarnation);++closes;return 0;}
 ProcessCleanupStatus ProcessGetCleanupStatus(){return cleanup;}
 void FileObjectStopWriteback(){++writebackStops;writebackStopped=true;assert(!cleanup.liveUserAddressSpaces&&!cleanup.activeFinalizers);}
+void Ext2StopWriteback(){assert(writebackStopped);}
 bool DeviceCloseWrites(){assert(writebackStopped);++freezes;return canFreeze;}
 void AudioStop(){}
 int VfsSync(Vnode*){++syncs;return syncError;}

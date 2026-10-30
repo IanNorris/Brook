@@ -28,6 +28,9 @@ struct Device;
 // Complete all preceding writes through the device's volatile write cache.
 // No argument. Returns 0 only on completion, negative errno on failure.
 static constexpr uint32_t DEVICE_IOCTL_FLUSH = 0x42460001;
+// Stable for the lifetime of this registered device: 1 means all aliases reject
+// writes, 0 means writable, negative errno means the guarantee is unavailable.
+static constexpr uint32_t DEVICE_IOCTL_READ_ONLY = 0x42460002;
 
 // ---- Generic device operations ----
 struct DeviceOps {

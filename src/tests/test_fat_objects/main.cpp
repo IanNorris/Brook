@@ -13,10 +13,12 @@
 #include "fatfs_object.h"
 #include "diskio.h"
 static std::vector<unsigned char> disk;
-static bool failRead=false;
+static bool failRead=false, intrinsicReadOnly=false, driveAcquired=false;
+static unsigned diskReads=0;
 extern "C" DSTATUS disk_initialize(BYTE drive){return drive?STA_NOINIT:0;}
 extern "C" DSTATUS disk_status(BYTE drive){return drive?STA_NOINIT:0;}
 extern "C" DRESULT disk_read(BYTE drive,BYTE* out,LBA_t sector,UINT count){
+    ++diskReads;
     uint64_t offset=uint64_t(sector)*512,bytes=uint64_t(count)*512;
     if(drive || failRead || offset>disk.size() || bytes>disk.size()-offset)return RES_ERROR;
     std::memcpy(out,disk.data()+offset,bytes);return RES_OK;
@@ -58,6 +60,9 @@ void VmmFreePages(VirtualAddress address,uint64_t){
     void* p=reinterpret_cast<void*>(address.raw());{std::lock_guard<std::mutex> lock(allocationMutex);assert(pages.erase(p)==1);}std::free(p);
 }
 int FatFsFlushDrive(uint8_t){return 0;}
+bool FatFsAcquireDrive(uint8_t drive,bool* ro){if(drive || driveAcquired)return false;driveAcquired=true;*ro=intrinsicReadOnly;return true;}
+void FatFsReleaseDrive(uint8_t){assert(driveAcquired);driveAcquired=false;}
+bool FatFsDriveReadOnly(uint8_t){return intrinsicReadOnly;}
 extern "C" void SerialPrintf(const char*,...){}
 extern "C" void SerialPuts(const char*){}
 }
@@ -152,7 +157,44 @@ int main(int argc,char** argv){
     KMutexUnlock(&g_fatLock);release.join();assert(!FatObjectStat(fresh,&stat));VfsObjectRelease(fresh);
     assert(!FatFsUnlink(mount,0,"/retiring"));
     assert(FatFsUnmount(mount)==-16);VfsObjectRelease(root);assert(!FatFsUnmount(mount));
-    assert(allocations.empty() && pages.empty());
+    assert(allocations.empty() && pages.empty() && !driveAcquired);
+    // A large backing file must open without preloading or consulting an old
+    // whole-file cache. Exercise the actual production FAT adapter and FIL.
+    assert(FatFsMount(0,&privateMount));mount=static_cast<FatFsMountData*>(privateMount);
+    auto* large=FatFsOpen(mount,0,"/image.brk",VFS_O_WRITE|VFS_O_CREATE);assert(large);
+    std::vector<char> block(4096,'x');uint64_t at=0;
+    for(unsigned i=0;i<256;++i)assert(large->ops->write(large,block.data(),block.size(),&at)==4096);
+    closeNode(large);assert(!FatFsUnmount(mount));
+    intrinsicReadOnly=true;
+    assert(FatFsMount(0,&privateMount));mount=static_cast<FatFsMountData*>(privateMount);
+    void* duplicate=nullptr;assert(!FatFsMount(0,&duplicate));
+    const auto diskBefore=disk;const auto readsBefore=diskReads;
+    auto* stream=FatFsOpen(mount,0,"/image.brk",VFS_O_STREAM);assert(stream && FatFsFileSourceReadOnly(stream));
+    assert(pages.empty() && diskReads-readsBefore<32); // no 1 MiB preload
+    char probe[7];at=900000;assert(stream->ops->read(stream,probe,sizeof(probe),&at)==7);
+    for(char c:probe)assert(c=='x');
+    at=0;assert(stream->ops->write(stream,"bad",3,&at)==-30);
+    assert(stream->ops->truncate(stream,0)==-30);
+    assert(!FatFsOpen(mount,0,"/image.brk",VFS_O_WRITE));
+    assert(!FatFsOpen(mount,0,"/image.brk",VFS_O_STREAM|VFS_O_TRUNC));
+    assert(FatFsUnlink(mount,0,"/image.brk")==-30);
+    assert(FatFsMkdir(mount,0,"/bad",0755)==-30);
+    assert(FatFsRename(mount,0,"/image.brk","/bad")==-30);
+    assert(!FatRootObject(mount,0,&root));assert(!FatObjectChild(root,"image.brk",&file));
+    assert(FatObjectAccess(file,2,false)==-30);
+    assert(!FatObjectOpen(file,VFS_O_WRITE,&error) && error==-30);
+    auto* other=FatObjectOpen(file,VFS_O_STREAM,&error);assert(other && FatFsFileSourceReadOnly(other));closeNode(other);
+    VfsObjectRelease(file);VfsObjectRelease(root);
+    assert(FatFsUnmount(mount)==-16);closeNode(stream);
+    assert(!FatFsUnmount(mount) && !driveAcquired);
+    assert(disk==diskBefore && allocations.empty() && pages.empty());
+    intrinsicReadOnly=false;
+    // Ordinary readers can still populate a cache, but streaming must bypass it.
+    assert(FatFsMount(0,&privateMount));mount=static_cast<FatFsMountData*>(privateMount);
+    auto* cached=FatFsOpen(mount,0,"/image.brk",VFS_O_READ);assert(cached && cached->ops==&g_cachedFileOps);
+    stream=FatFsOpen(mount,0,"/image.brk",VFS_O_STREAM);assert(stream && stream->ops==&g_fatFileOps && !FatFsFileSourceReadOnly(stream));
+    closeNode(stream);closeNode(cached);assert(!FatFsUnmount(mount));
+    assert(allocations.empty() && pages.empty() && !driveAcquired);
     std::ofstream output(argv[1],std::ios::binary|std::ios::trunc);output.write(reinterpret_cast<char*>(disk.data()),disk.size());assert(output);output.close();
     std::puts("FAT_OBJECTS_PASS production-backend directory-pins/file-slot-pins/rename/independent-opens/fsync/rollback/final-release");
 }

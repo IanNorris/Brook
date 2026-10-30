@@ -140,3 +140,40 @@ independent preparation, then request combined physical testing. Stop and leave
 a checkpoint if reported remaining token quota reaches 5%; do not consume a
 quota reset. No quota-reading tool was exposed at this checkpoint, so discover
 one again if tool availability changes rather than inventing a percentage.
+
+
+### 2026-10-30: compressed applications on the existing FAT32 stick
+
+The kernel can mount an application image stored as a regular file on the USB
+FAT filesystem. `/etc/boot-app-image` contains one complete record, for example
+`/media/usb/APPS.BRK /nix`. The source must be an actual streaming FAT handle
+backed by a device that advertises a lifetime read-only guarantee; ordinary
+read-only mount flags, writable filesystems, cached file handles and recursive
+compressed sources are insufficient. The USB read-only boot marker establishes
+that guarantee before device registration. Partitions forward it and independent
+FAT aliases inherit it. Each active FAT instance holds its drive binding so a
+new mount cannot invalidate its retained FILs.
+
+`VFS_O_STREAM` bypasses both whole-file FAT cache lookup and preloading. The
+compressed mount retains its source vnode until its last object/FD/mapping is
+released, including after namespace detach. Source close is deferred to the
+existing VFS cleanup worker, outside the namespace mutation lock and compressed
+I/O mutex. Registered storage callbacks now pin their module providers.
+
+Validated with `scripts/test_usb_app_image.py` under QEMU/KVM using 512 MiB RAM,
+an MBR/FAT32 USB device and xHCI: ELF execution from the compressed file,
+cross-block reads, hardlinks/symlinks, permission checks, private COW mappings,
+read-only rejection, and continued reads after detaching both source and image
+mounts. Evidence: `build/hardware/usb-app-image-v3-20261030/result.json`.
+The native FAT adapter tests additionally cover a 1 MiB streaming open without
+preload, cached-reader bypass, mutation rejection before buffer changes, and
+retained mount refusal; drive tests cover alias policy and rebinding refusal.
+Compressed mount tests exercise initialization failures, short/error reads,
+slot reuse and exactly-once deferred source close.
+
+Prepare a disposable image with `scripts/make_uefi_probe.py --driver xhci
+--usb-read-only --media-mount /media/usb --application-image /path/APPS.BRK`.
+The generator sizes its FAT partition for the payload and verifies copied files
+with streaming hashes. It never writes to physical devices. This is preparation
+for an offline desktop image; it is not physical acceptance of USB reads or
+Ethernet. The physical stick and panic scanner remain on the prior known probe.

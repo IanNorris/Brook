@@ -8,4 +8,8 @@ const VfsFsOps* CompressedVfsOperations();
 bool CompressedVfsBindDevice(uint8_t drive,Device* device);
 void CompressedVfsRegister();
 void CompressedVfsBootMount();
+// Serialized boot-time setup only. Requires an intrinsically read-only FAT source.
+bool CompressedVfsMountFile(const char* sourcePath,const char* targetPath);
+bool CompressedVfsCleanupPending();
+void CompressedVfsCollectRetired();
 }

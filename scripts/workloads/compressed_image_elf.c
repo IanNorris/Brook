@@ -45,13 +45,20 @@ int main(int argc,char** argv) {
     assert(mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0)==MAP_FAILED && (errno==EACCES || errno==EROFS));
     pid_t child=fork();assert(child>=0);
     if(!child) {
-        assert(setuid(1000)==0);
+        assert(setuid(65534)==0); // distinct from host-built image owner as well as root
         assert(open(private,O_RDONLY)==-1 && errno==EACCES);
         assert(openat(dir,"private/denied",O_RDONLY)==-1 && errno==EACCES);
         execl(privateexe,"hello","--child",(char*)0);assert(errno==EACCES);_exit(0);
     }
     int status;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
     if(argc>2 && !strcmp(argv[2],"--detach")) {
+        // Optional physical-media acceptance: source FAT must stay retained
+        // after both source and compressed namespaces have been detached.
+        if(argc>3) {
+            char source[512];snprintf(source,sizeof(source),"%s/APPS.BRK",argv[3]);
+            assert(open(source,O_RDWR)==-1 && errno==EROFS);
+            assert(umount2(argv[3],MNT_DETACH)==0);
+        }
         assert(umount2(base,MNT_DETACH)==0);
         assert(pread(fd,bytes,17,65536)==17);for(unsigned i=0;i<17;++i)assert(bytes[i]==pattern(65536+i));
         via=openat(dir,"data.bin",O_RDONLY);assert(via>=0 && close(via)==0);

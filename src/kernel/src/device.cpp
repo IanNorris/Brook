@@ -3,6 +3,7 @@
 #include "spinlock.h"
 #include "write_admission.h"
 #include "process.h"
+#include "module.h"
 namespace brook { __attribute__((weak)) Process* ProcessCurrent(); }
 
 namespace brook {
@@ -110,6 +111,19 @@ bool DeviceRegister(Device* dev)
         return false;
     }
 
+    // Published device callbacks outlive their registering module's init call.
+    // Retain providers before taking the registry lock (module unload may race).
+    uintptr_t callbacks[6]; uint32_t count = 0;
+    if (dev->ops->read) callbacks[count++] = reinterpret_cast<uintptr_t>(dev->ops->read);
+    if (dev->ops->write) callbacks[count++] = reinterpret_cast<uintptr_t>(dev->ops->write);
+    if (dev->ops->ioctl) callbacks[count++] = reinterpret_cast<uintptr_t>(dev->ops->ioctl);
+    if (dev->ops->close) callbacks[count++] = reinterpret_cast<uintptr_t>(dev->ops->close);
+    if (dev->type == DeviceType::Block) {
+        auto* ops = reinterpret_cast<const BlockDeviceOps*>(dev->ops);
+        if (ops->block_count) callbacks[count++] = reinterpret_cast<uintptr_t>(ops->block_count);
+        if (ops->block_size) callbacks[count++] = reinterpret_cast<uintptr_t>(ops->block_size);
+    }
+    if (count && !ModuleRetainAddresses(callbacks, count)) return false;
     SpinLockAcquire(&g_deviceLock);
 
     if (g_deviceCount >= DEVICE_MAX)

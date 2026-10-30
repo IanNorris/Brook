@@ -567,6 +567,11 @@ target_compile_options(test_fat_object_adapter PRIVATE "$<$<COMPILE_LANGUAGE:CXX
 target_compile_options(test_fat_object_adapter PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
 add_test(NAME test_fat_object_adapter COMMAND python3 "${BROOK_ROOT}/src/tests/test_fat_object_adapter/run.py" "$<TARGET_FILE:test_fat_object_adapter>")
 set_tests_properties(test_fat_object_adapter PROPERTIES TIMEOUT 60)
+add_host_test(test_fat_drive "${BROOK_ROOT}/src/kernel/src/fatfs_glue.cpp")
+target_include_directories(test_fat_drive PRIVATE "${FATFS_OBJECT_HOST_DIR}")
+target_compile_options(test_fat_drive PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
+    "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
+target_link_options(test_fat_drive PRIVATE -Wl,--gc-sections)
 add_executable(test_fat_objects
     "${BROOK_ROOT}/src/tests/test_fat_objects/main.cpp"
     "${FATFS_OBJECT_HOST_DIR}/ff.c" "${FATFS_OBJECT_HOST_DIR}/ffunicode.c")

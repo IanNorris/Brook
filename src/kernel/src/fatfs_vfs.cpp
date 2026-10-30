@@ -76,6 +76,7 @@ struct FatFsMountData {
     FatOpenFile* allFiles;
     FatPathObject* objects;
     int deferredCloseError;
+    bool intrinsicReadOnly;
 };
 
 // FIL stays first so existing vnode/cache users can retain their FIL pointer.
@@ -89,6 +90,7 @@ struct FatOpenFile {
     bool cacheInvalidated;
     bool writable;
     bool closing;
+    bool streaming;
 };
 
 static void RemoveWritableFile(FatOpenFile* file)
@@ -115,6 +117,7 @@ static FRESULT CheckedFatSync(FIL* fil, bool closing);
 // Flush private sector windows before another FIL mutates the same allocation.
 static int PrepareFatMutation(FatOpenFile* file, bool flushSelf = true)
 {
+    if (file->mount->intrinsicReadOnly) return -30;
     for (auto* other = file->mount->allFiles; other; other = other->allNext) {
         if (!SameFatFile(&file->fil, &other->fil)) continue;
         if (other->cacheLoading) return -16;
@@ -569,7 +572,7 @@ static int FatSpaceFor(FATFS* expected, VfsSpace* out)
         return -FVFS_EIO;
     const uint64_t clusterBytes = uint64_t{fs->csize} * 512;
     *out = {0x4d44, clusterBytes, fs->n_fatent - 2, freeClusters, freeClusters,
-            0, 0, FatDeviceIdentity(fs), 255, clusterBytes, 0};
+            0, 0, FatDeviceIdentity(fs), 255, clusterBytes, FatFsDriveReadOnly(fs->pdrv) ? 1ULL : 0ULL};
     return 0;
 }
 static int FatSpace(Vnode* vn, VfsSpace* out)
@@ -612,6 +615,13 @@ static const VnodeOps g_fatDirOps = {
     .space = FatSpace,
 };
 
+bool FatFsFileSourceReadOnly(Vnode* node)
+{
+    if (!node || node->type != VnodeType::File || node->ops != &g_fatFileOps || !node->priv) return false;
+    auto* file = static_cast<FatOpenFile*>(node->priv);
+    return file->streaming && !file->writable && file->mount->intrinsicReadOnly;
+}
+
 // ---- VfsFsOps callbacks ----
 
 static bool FatFsMount(uint8_t pdrv, void** mountPriv)
@@ -621,6 +631,7 @@ static bool FatFsMount(uint8_t pdrv, void** mountPriv)
     if (!data) { SerialPuts("FATFS_VFS: kmalloc failed for FATFS\n"); return false; }
     __builtin_memset(data, 0, sizeof(FatFsMountData));
     data->pdrv = pdrv;
+    if (!FatFsAcquireDrive(pdrv, &data->intrinsicReadOnly)) { kfree(data); return false; }
 
     char fatPath[8];
     fatPath[0] = static_cast<char>('0' + pdrv);
@@ -635,6 +646,7 @@ static bool FatFsMount(uint8_t pdrv, void** mountPriv)
     if (res != FR_OK) {
         SerialPrintf("FATFS_VFS: f_mount failed (res=%u) for drive %u\n",
                      static_cast<unsigned>(res), pdrv);
+        FatFsReleaseDrive(pdrv);
         kfree(data);
         return false;
     }
@@ -693,6 +705,7 @@ static int FatFsUnmount(void* mountPriv)
     }
     KMutexUnlock(&g_fatLock);
     if (result) return result;
+    FatFsReleaseDrive(data->pdrv);
     kfree(data);
     return 0;
 }
@@ -703,13 +716,18 @@ static bool FatObjectPinnedLocked(FatFsMountData*,uint64_t);
 static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
                         const char* relPath, int flags)
 {
+    auto* mount = static_cast<FatFsMountData*>(mountPriv);
+    const int mutation = VFS_O_WRITE | VFS_O_READWRITE | VFS_O_CREATE | VFS_O_TRUNC | VFS_O_APPEND;
+    if ((mount->intrinsicReadOnly && (flags & mutation)) ||
+        ((flags & VFS_O_STREAM) && (flags & (mutation | VFS_O_METADATA | VFS_O_EXEC)))) return nullptr;
     char fatPath[256];
     BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
 
     auto* file = static_cast<FatOpenFile*>(kmalloc(sizeof(FatOpenFile)));
     if (!file) return nullptr;
     __builtin_memset(file, 0, sizeof(*file));
-    file->mount = static_cast<FatFsMountData*>(mountPriv);
+    file->mount = mount;
+    file->streaming = (flags & VFS_O_STREAM) != 0;
     auto* fil = &file->fil;
 
     BYTE mode = FA_READ;
@@ -718,7 +736,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
     if (flags & VFS_O_TRUNC)  mode |= FA_CREATE_ALWAYS;
 
     // Check shared cache first (read-only opens).
-    if (!(flags & VFS_O_METADATA) && !(mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS))) {
+    if (!(flags & (VFS_O_METADATA | VFS_O_STREAM)) && !(mode & (FA_WRITE | FA_CREATE_ALWAYS | FA_OPEN_ALWAYS))) {
         KMutexLock(&g_fatLock);
         CachedFile* existing = FileCacheLookup(fatPath);
         if (existing) {
@@ -778,7 +796,7 @@ static Vnode* FatFsOpen(void* mountPriv, uint8_t pdrv,
 
         static constexpr uint64_t CACHE_THRESHOLD = 64 * 1024;
         uint64_t fileSize = f_size(fil);
-        if (!(flags & VFS_O_METADATA) && !file->writable && fileSize >= CACHE_THRESHOLD) {
+        if (!(flags & (VFS_O_METADATA | VFS_O_STREAM)) && !file->writable && fileSize >= CACHE_THRESHOLD) {
             file->cacheLoading = true;
             auto* placeholder = static_cast<CachedFile*>(kmalloc(sizeof(CachedFile)));
             if (placeholder) {
@@ -998,6 +1016,7 @@ static bool FatPathOpenLocked(FatFsMountData* mount, const char* path,bool renam
 
 static int FatFsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
 {
+    if (static_cast<FatFsMountData*>(mountPriv)->intrinsicReadOnly) return -30;
     char fatPath[256];
     BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
     KMutexLock(&g_fatLock);
@@ -1009,8 +1028,9 @@ static int FatFsUnlink(void* mountPriv, uint8_t pdrv, const char* relPath)
     return res == FR_OK ? 0 : FrToErrno(res);
 }
 
-static int FatFsMkdir(void* /*mountPriv*/, uint8_t pdrv, const char* relPath, uint16_t /*mode*/)
+static int FatFsMkdir(void* mountPriv, uint8_t pdrv, const char* relPath, uint16_t /*mode*/)
 {
+    if (static_cast<FatFsMountData*>(mountPriv)->intrinsicReadOnly) return -30;
     char fatPath[256];
     BuildFatPath(fatPath, sizeof(fatPath), pdrv, relPath);
     KMutexLock(&g_fatLock);
@@ -1022,6 +1042,7 @@ static int FatFsMkdir(void* /*mountPriv*/, uint8_t pdrv, const char* relPath, ui
 static int FatFsRename(void* mountPriv, uint8_t pdrv,
                        const char* oldRelPath, const char* newRelPath)
 {
+    if (static_cast<FatFsMountData*>(mountPriv)->intrinsicReadOnly) return -30;
     char fatOld[256], fatNew[256];
     BuildFatPath(fatOld, sizeof(fatOld), pdrv, oldRelPath);
     BuildFatPath(fatNew, sizeof(fatNew), pdrv, newRelPath);
@@ -1117,6 +1138,7 @@ static int FatObjectStat(VfsObject* object,VnodeStat* stat)
 static int FatObjectAccess(VfsObject* object,uint8_t required,bool)
 {
     if(required&~7u)return -22;
+    if ((required & 2) && static_cast<FatPathObject*>(object->priv)->mount->intrinsicReadOnly) return -30;
     VnodeStat stat{};int error=FatObjectStat(object,&stat);
     if(error)return error;
     // FAT retains Brook's volume policy rather than inventing POSIX owners.
@@ -1148,13 +1170,15 @@ static int FatObjectReadlink(VfsObject*,char*,uint32_t){return -22;}
 static Vnode* FatObjectOpen(VfsObject* object,int flags,int* error)
 {
     int localError=0;if(!error)error=&localError;*error=0;
-    constexpr int allowed=VFS_O_WRITE|VFS_O_READWRITE|VFS_O_APPEND|VFS_O_METADATA|VFS_O_EXEC;
+    constexpr int allowed=VFS_O_WRITE|VFS_O_READWRITE|VFS_O_APPEND|VFS_O_METADATA|VFS_O_EXEC|VFS_O_STREAM;
     if((flags&~allowed) || ((flags&VFS_O_READWRITE) && !(flags&VFS_O_WRITE)) ||
        ((flags&VFS_O_METADATA) && (flags&~VFS_O_METADATA)) ||
        ((flags&VFS_O_EXEC) && (flags&(VFS_O_WRITE|VFS_O_READWRITE|VFS_O_APPEND)))) {
         *error=-22;return nullptr;
     }
     auto* retained=static_cast<FatPathObject*>(object->priv);
+    if ((flags & VFS_O_STREAM) && (flags & ~VFS_O_STREAM)) { *error=-22; return nullptr; }
+    if (retained->mount->intrinsicReadOnly && (flags & (VFS_O_WRITE|VFS_O_READWRITE|VFS_O_APPEND))) { *error=-30; return nullptr; }
     const bool directory=retained->directory;
     if(directory && (flags&VFS_O_WRITE)){*error=-21;return nullptr;}
     if(directory && (flags&VFS_O_EXEC)){*error=-13;return nullptr;}
@@ -1175,7 +1199,7 @@ static Vnode* FatObjectOpen(VfsObject* object,int flags,int* error)
         auto* file=static_cast<FatOpenFile*>(kmalloc(sizeof(FatOpenFile)));
         if(!file)*error=-12;
         else {
-            *file={};file->mount=retained->mount;
+            *file={};file->mount=retained->mount;file->streaming=(flags&VFS_O_STREAM)!=0;
             BYTE mode=(flags&VFS_O_WRITE)?FA_WRITE:FA_READ;
             if(flags&VFS_O_READWRITE)mode|=FA_READ;
             FRESULT result=f_object_open(&retained->location,&file->fil,mode);

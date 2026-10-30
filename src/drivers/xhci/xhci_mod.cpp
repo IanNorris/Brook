@@ -2742,6 +2742,7 @@ static int UsbMscWrite(Device* dev,uint64_t offset,const void* buf,uint64_t len)
 
 static int UsbMscIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
 {
+    if (cmd == DEVICE_IOCTL_READ_ONLY) return g_storageReadOnly ? 1 : 0;
     if (cmd != DEVICE_IOCTL_FLUSH) return -95;
     if(g_storageReadOnly)return 0;
     auto* st = static_cast<UsbMscState*>(dev->priv);

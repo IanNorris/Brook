@@ -17,7 +17,9 @@
 #include "sync/kmutex.h"
 #include "memory/file_page_cache.h"
 using namespace brook;
-namespace { std::atomic<int> allocations{0};int failAfter=-1;uint32_t actor=1000;std::mutex io;Device* registered=nullptr; }
+namespace { std::atomic<int> allocations{0};int failAfter=-1;uint32_t actor=1000;std::mutex io;Device* registered=nullptr;
+Vnode sourceNode{};Device* fileDevice=nullptr;bool sourceTrusted=true,sourceOpen=false;
+unsigned sourceCloses=0;void* fileMount=nullptr;bool mountAccepted=true;int shortRead=0; }
 namespace brook {
 extern "C" void* kmalloc(uint64_t size){if(failAfter==0){failAfter=-1;return nullptr;}if(failAfter>0)--failAfter;auto* p=malloc(size);if(p)++allocations;return p;}
 extern "C" void kfree(void* p){if(p){--allocations;free(p);}}
@@ -28,6 +30,12 @@ void KMutexLock(KMutex*){io.lock();}
 void KMutexUnlock(KMutex*){io.unlock();}
 extern "C" bool DeviceIsRegistered(Device* d){return d==registered;}
 extern "C" void SerialPrintf(const char*,...){}
+Vnode* VfsOpen(const char*,int flags){assert(flags==VFS_O_STREAM && !sourceOpen);sourceOpen=true;return &sourceNode;}
+void VfsClose(Vnode* node){assert(node==&sourceNode && sourceOpen);sourceOpen=false;++sourceCloses;}
+bool FatFsFileSourceReadOnly(Vnode* node){return node==&sourceNode && sourceOpen && sourceTrusted;}
+int VfsStat(Vnode*,VnodeStat* out){*out={};out->size=DeviceBlockCount(fileDevice)*512;return 0;}
+int VfsRead(Vnode* node,void* out,uint64_t bytes,uint64_t* at){assert(node==&sourceNode && sourceOpen);if(shortRead)return shortRead;int n=fileDevice->ops->read(fileDevice,*at,out,bytes);if(n>0)*at+=n;return n;}
+bool VfsMountConfigured(const char*,const char*,uint8_t slot,uint64_t attributes){assert(attributes==7);return mountAccepted && CompressedVfsOperations()->mount(slot,&fileMount);}
 }
 struct Disk {
     std::vector<uint8_t> bytes;int error=0;unsigned reads=0;
@@ -102,5 +110,23 @@ int main() {
     VfsObjectRelease(root);VfsObjectRelease(file);VfsObjectRelease(hard);VfsObjectRelease(dir);VfsObjectRelease(link);close(vn);assert(!allocations);
     assert(CompressedVfsBindDevice(0,&device));assert(fs->mount(0,&mount));assert(fs->root_object(mount,0,&root)==0);
     assert(root->ops->lookup(root,"file",&file,false)==0 && file->identity!=identity);VfsObjectRelease(file);VfsObjectRelease(root);assert(fs->unmount(mount)==0 && !allocations);
+    // Production file-backed path: early rejection, failed-mount ownership,
+    // retained handles after detach, and deferred close outside namespace locks.
+    fileDevice=&device;
+    sourceTrusted=false;unsigned closes=sourceCloses;
+    assert(!CompressedVfsMountFile("/source","/nix") && !sourceOpen && sourceCloses==closes+1);
+    sourceTrusted=true;mountAccepted=false;
+    assert(!CompressedVfsMountFile("/source","/nix") && !sourceOpen);mountAccepted=true;
+    for(int fail=0;fail<6;++fail){failAfter=fail;closes=sourceCloses;
+        assert(!CompressedVfsMountFile("/source","/nix") && !sourceOpen && !allocations && sourceCloses==closes+1);failAfter=-1;}
+    for(int failure : {-5,1}){shortRead=failure;assert(!CompressedVfsMountFile("/source","/nix") && !sourceOpen && !allocations);}shortRead=0;
+    assert(CompressedVfsMountFile("/source","/nix") && sourceOpen);
+    assert(fs->root_object(fileMount,0,&root)==0 && root->ops->lookup(root,"file",&file,false)==0);
+    vn=file->ops->open(file,0,&error);assert(vn);VfsObjectRelease(file);VfsObjectRelease(root);
+    closes=sourceCloses;assert(!fs->unmount(fileMount) && sourceOpen);
+    CompressedVfsCollectRetired();assert(sourceOpen && sourceCloses==closes);
+    at=0;assert(vn->ops->read(vn,bytes.data(),32,&at)==32);
+    close(vn);assert(CompressedVfsCleanupPending() && sourceOpen);
+    CompressedVfsCollectRetired();assert(!sourceOpen && sourceCloses==closes+1 && !allocations && !CompressedVfsCleanupPending());
     puts("compressed VFS: OOM cleanup/permissions/readonly/hardlinks/cache/retained-unmount/remount identities pass");
 }

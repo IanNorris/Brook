@@ -84,8 +84,11 @@ static uint32_t PartBlockSize(Device* /*dev*/)
 
 static int PartIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
 {
+    auto* parent = static_cast<PartitionPriv*>(dev->priv)->parent;
+    if (cmd == DEVICE_IOCTL_READ_ONLY)
+        return parent->ops && parent->ops->ioctl ? parent->ops->ioctl(parent, cmd, nullptr) : -95;
     if (cmd != DEVICE_IOCTL_FLUSH) return -95;
-    return DeviceFlush(static_cast<PartitionPriv*>(dev->priv)->parent);
+    return DeviceFlush(parent);
 }
 
 static BlockDeviceOps s_partOps = {

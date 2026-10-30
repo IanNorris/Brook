@@ -11,6 +11,7 @@
 #include "rtc.h"
 #include "device.h"
 #include "serial.h"
+#include "spinlock.h"
 
 // FatFS headers (C)
 extern "C" {
@@ -22,6 +23,9 @@ namespace brook {
 
 static constexpr uint8_t FATFS_MAX_DRIVES = FF_VOLUMES;
 static Device* g_fatfsDrives[FATFS_MAX_DRIVES] = {};
+static bool g_driveReadOnly[FATFS_MAX_DRIVES] = {};
+static bool g_driveMounted[FATFS_MAX_DRIVES] = {};
+static IrqSpinLock g_driveLock;
 // FatFS ignores some secondary-FAT/FSInfo write results. Report any such
 // failure at every checked sync until drive rebind: successful later I/O
 // cannot establish that the lost metadata was repaired. FLUSH-only failures
@@ -30,8 +34,12 @@ static uint32_t g_fatfsWriteErrors[FATFS_MAX_DRIVES] = {};
 
 static bool KernelPtrLooksCanonical(const void* ptr)
 {
+#ifdef BROOK_HOST_TEST
+    return ptr != nullptr;
+#else
     uint64_t v = reinterpret_cast<uint64_t>(ptr);
     return v != 0 && (v >> 47) == 0x1FFFFULL;
+#endif
 }
 
 static bool FatFsDeviceReady(uint8_t pdrv, Device** out)
@@ -82,10 +90,47 @@ bool FatFsBindDrive(uint8_t pdrv, Device* dev)
         SerialPrintf("FatFS: refusing invalid drive %u dev=%p\n", pdrv, dev);
         return false;
     }
+    const bool readOnly = dev->ops->ioctl && dev->ops->ioctl(dev, DEVICE_IOCTL_READ_ONLY, nullptr) == 1;
+    const auto flags = IrqSpinLockAcquire(&g_driveLock);
+    if (g_fatfsDrives[pdrv] == dev) {
+        IrqSpinLockRelease(&g_driveLock, flags);
+        return true; // Never erase a live drive's error latch.
+    }
+    if (g_driveMounted[pdrv]) {
+        IrqSpinLockRelease(&g_driveLock, flags);
+        return false;
+    }
     g_fatfsDrives[pdrv] = dev;
+    g_driveReadOnly[pdrv] = readOnly;
     __atomic_store_n(&g_fatfsWriteErrors[pdrv], 0, __ATOMIC_RELAXED);
+    IrqSpinLockRelease(&g_driveLock, flags);
     SerialPrintf("FatFS: drive %u → '%s'\n", pdrv, dev->name);
     return true;
+}
+
+bool FatFsAcquireDrive(uint8_t pdrv, bool* readOnly)
+{
+    if (pdrv >= FATFS_MAX_DRIVES || !readOnly) return false;
+    const auto flags = IrqSpinLockAcquire(&g_driveLock);
+    const bool valid = g_fatfsDrives[pdrv] && !g_driveMounted[pdrv];
+    if (valid) { g_driveMounted[pdrv] = true; *readOnly = g_driveReadOnly[pdrv]; }
+    IrqSpinLockRelease(&g_driveLock, flags);
+    return valid;
+}
+void FatFsReleaseDrive(uint8_t pdrv)
+{
+    if (pdrv >= FATFS_MAX_DRIVES) return;
+    const auto flags = IrqSpinLockAcquire(&g_driveLock);
+    g_driveMounted[pdrv] = false;
+    IrqSpinLockRelease(&g_driveLock, flags);
+}
+bool FatFsDriveReadOnly(uint8_t pdrv)
+{
+    if (pdrv >= FATFS_MAX_DRIVES) return false;
+    const auto flags = IrqSpinLockAcquire(&g_driveLock);
+    bool readOnly = g_driveReadOnly[pdrv];
+    IrqSpinLockRelease(&g_driveLock, flags);
+    return readOnly;
 }
 
 int FatFsFlushDrive(uint8_t pdrv)
@@ -109,14 +154,14 @@ DSTATUS disk_status(BYTE pdrv)
 {
     if (!brook::FatFsDeviceReady(pdrv, nullptr))
         return STA_NOINIT | STA_NODISK;
-    return 0; // drive present and initialised
+    return brook::FatFsDriveReadOnly(pdrv) ? STA_PROTECT : 0; // present and initialised
 }
 
 DSTATUS disk_initialize(BYTE pdrv)
 {
     if (!brook::FatFsDeviceReady(pdrv, nullptr))
         return STA_NOINIT;
-    return 0;
+    return brook::FatFsDriveReadOnly(pdrv) ? STA_PROTECT : 0;
 }
 
 DRESULT disk_read(BYTE pdrv, BYTE* buff, LBA_t sector, UINT count)
@@ -135,6 +180,7 @@ DRESULT disk_read(BYTE pdrv, BYTE* buff, LBA_t sector, UINT count)
 
 DRESULT disk_write(BYTE pdrv, const BYTE* buff, LBA_t sector, UINT count)
 {
+    if (brook::FatFsDriveReadOnly(pdrv)) return RES_WRPRT;
     brook::Device* dev = nullptr;
     if (!brook::FatFsDeviceReady(pdrv, &dev)) return RES_NOTRDY;
 

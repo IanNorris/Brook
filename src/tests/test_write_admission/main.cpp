@@ -3,7 +3,13 @@
 #include <cstdint>
 #include <thread>
 #include "device.h"
-namespace brook {struct Process;thread_local uintptr_t caller=1;Process* ProcessCurrent(){return reinterpret_cast<Process*>(caller);}}
+#include <cstdarg>
+namespace brook {
+static bool retainAllowed=true;static unsigned retainedCount=0;
+bool ModuleRetainAddresses(const uintptr_t* addresses,uint32_t count){retainedCount=count;for(unsigned i=0;i<count;++i)assert(addresses[i]);return retainAllowed;}
+extern "C" void SerialPuts(const char*){}
+extern "C" void SerialPrintf(const char*,...){}
+struct Process;thread_local uintptr_t caller=1;Process* ProcessCurrent(){return reinterpret_cast<Process*>(caller);}}
 namespace {
 std::atomic<bool> entered=false,release=false,hold=false;
 std::atomic<unsigned> writes=0;
@@ -15,6 +21,10 @@ brook::Device dev{&ops,"owned-fixture",brook::DeviceType::Block,nullptr};
 }
 int main() {
     using namespace brook;char data=0;
+    BlockDeviceOps registeredOps{nullptr,write,nullptr,nullptr,[](Device*)->uint64_t{return 1;},[](Device*)->uint32_t{return 512;}};
+    Device fixture{reinterpret_cast<DeviceOps*>(&registeredOps),"module-storage",DeviceType::Block,nullptr};
+    retainAllowed=false;assert(!DeviceRegister(&fixture) && !DeviceIsRegistered(&fixture) && retainedCount==3);
+    retainAllowed=true;assert(DeviceRegister(&fixture) && DeviceIsRegistered(&fixture));assert(DeviceUnregister(&fixture));
     hold=true;std::thread writer([&]{caller=2;assert(DeviceWrite(&dev,0,&data,1)==1);});
     while(!entered)std::this_thread::yield();
     assert(!DeviceCloseWrites());release=true;writer.join();hold=false;

@@ -732,8 +732,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         g_deferredCount = 0;
     }
 
-    brook::CompressedVfsBootMount();
-
     // ---- USB block devices: probe after xHCI module has loaded ----
     // The xHCI module registers "usb0", "usb1", etc. as block devices.
     // First scan each for GPT partition tables; then probe all resulting
@@ -777,6 +775,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             ProbeAndMountDevice(label, ud, nextPdrv++);
         }
     }
+
+    brook::CompressedVfsBootMount();
 
     // ---- IO Benchmark (uncomment to run before compositor starts) ----
     // RunIOBenchmarkSuite();

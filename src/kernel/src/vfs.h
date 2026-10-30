@@ -147,6 +147,8 @@ static constexpr int VFS_O_METADATA = 0x40;
 // Internal executable-image read: authorize execute rather than user data read.
 // The retained vnode is consumed by the loader, never returned as a readable FD.
 static constexpr int VFS_O_EXEC = 0x80;
+// Internal bounded-memory data read. FAT must bypass whole-file caches.
+static constexpr int VFS_O_STREAM = 0x100;
 
 // ---- Filesystem driver interface ----
 //

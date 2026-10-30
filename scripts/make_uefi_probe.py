@@ -17,7 +17,11 @@ import subprocess
 ROOT=Path(__file__).resolve().parents[1]
 
 def run(*args,**kw):return subprocess.run(list(map(str,args)),check=True,**kw)
-def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def sha(p):
+    h=hashlib.sha256()
+    with p.open('rb') as stream:
+        for chunk in iter(lambda:stream.read(1024*1024),b''):h.update(chunk)
+    return h.hexdigest()
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
@@ -27,6 +31,8 @@ def main():
     ap.add_argument('--usb-read-only',action='store_true')
     ap.add_argument('--media-mount',help='Mount marked USB filesystem at this path')
     ap.add_argument('--partition-table',choices=['gpt','mbr'],default='gpt')
+    ap.add_argument('--application-image',type=Path,help='Read-only BRKPACK application file to include on FAT32')
+    ap.add_argument('--application-mount',default='/nix')
     ap.add_argument('--input-probe',action='store_true',help='Request <=1280x720 and display keyboard/frame diagnostics')
     ap.add_argument('--display-width',type=int,default=0)
     ap.add_argument('--display-height',type=int,default=0)
@@ -43,6 +49,10 @@ def main():
     for name in args.driver:
         if not re.fullmatch('[a-z0-9_]+',name) or not (build/'kernel/drivers'/f'{name}.mod').is_file():ap.error('Invalid/missing driver: '+name)
     if args.media_mount and (not args.media_mount.startswith('/') or '..' in args.media_mount.split('/') or len(args.media_mount)>63):ap.error('Invalid media mount path')
+    if args.application_image:
+        if not args.usb_read_only or not args.media_mount:ap.error('Application image requires --usb-read-only and --media-mount')
+        if not args.application_image.is_file() or not 160<=args.application_image.stat().st_size<0xffffffff:ap.error('Invalid FAT32 application image size')
+        if not re.fullmatch(r'/[A-Za-z0-9_/-]+',args.application_mount) or '..' in args.application_mount.split('/'):ap.error('Invalid application mount')
     out.mkdir(parents=True,exist_ok=False)
     drivers=out/'build/kernel/drivers';drivers.mkdir(parents=True)
     for name in args.driver:shutil.copy2(build/'kernel/drivers'/f'{name}.mod',drivers/f'{name}.mod')
@@ -59,6 +69,13 @@ def main():
             current+='/'+part
             probe=subprocess.run(['mdir','-i',str(initrd),'::'+current],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             if probe.returncode:run('mmd','-i',initrd,'::'+current)
+    if args.application_image:
+        current=''
+        for part in args.application_mount.strip('/').split('/'):
+            current+='/'+part
+            if subprocess.run(['mdir','-i',str(initrd),'::'+current],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:run('mmd','-i',initrd,'::'+current)
+        marker=out/'boot-app-image';marker.write_text(args.media_mount+'/APPS.BRK '+args.application_mount+'\n')
+        run('mcopy','-i',initrd,marker,'::ETC/boot-app-image')
     run('mmd','-i',initrd,'::BOOT')
     startup=out/'INIT.RC';startup.write_text('set wm\nset vfb none\nkconsole\n'+('hwprobe on\n' if args.input_probe else ''))
     run('mcopy','-i',initrd,startup,'::BOOT/INIT.RC')
@@ -84,20 +101,25 @@ def main():
                     ('USB input requires the included xHCI driver.\n' if 'xhci' in args.driver else
                      'External USB keyboards require an xHCI driver payload.\n'))
     if args.media_mount:(payload/'BROOK.MNT').write_text(args.media_mount+'\n')
+    if args.application_image:shutil.copy2(args.application_image,payload/'APPS.BRK')
     files={str(p.relative_to(payload)):dict(bytes=p.stat().st_size,sha256=sha(p))
            for p in sorted(payload.rglob('*')) if p.is_file()}
     esp=out/'esp.img'
-    with esp.open('xb') as f:f.truncate(64*1024*1024)
+    mib=1024*1024
+    esp_bytes=max(64*mib,((sum(row['bytes'] for row in files.values())*5//4+64*mib+32*mib-1)//(32*mib))*(32*mib))
+    with esp.open('xb') as f:f.truncate(esp_bytes)
     run('mkfs.fat','-F','32','-n','BROOK_TEST',esp)
     run('mmd','-i',esp,'::EFI','::EFI/BOOT','::KERNEL')
     for name,row in files.items():
         run('mcopy','-i',esp,payload/name,'::/'+name)
-        content=subprocess.check_output(['mtype','-i',str(esp),'::/'+name])
-        if hashlib.sha256(content).hexdigest()!=row['sha256']:raise RuntimeError('FAT readback mismatch: '+name)
+        with subprocess.Popen(['mtype','-i',str(esp),'::/'+name],stdout=subprocess.PIPE) as reader:
+            digest=hashlib.sha256()
+            for chunk in iter(lambda:reader.stdout.read(1024*1024),b''):digest.update(chunk)
+            if reader.wait() or digest.hexdigest()!=row['sha256']:raise RuntimeError('FAT readback mismatch: '+name)
     disk=out/'probe.raw'
-    with disk.open('xb') as f:f.truncate(128*1024*1024)
-    partition=('label: gpt\nunit: sectors\n\nstart=2048,size=131072,type=U,name="Brook EFI"\n' if args.partition_table=='gpt' else
-               'label: dos\nunit: sectors\n\nstart=2048,size=131072,type=c,bootable\n')
+    with disk.open('xb') as f:f.truncate(esp_bytes+2*mib)
+    partition=(f'label: gpt\nunit: sectors\n\nstart=2048,size={esp_bytes//512},type=U,name="Brook EFI"\n' if args.partition_table=='gpt' else
+               f'label: dos\nunit: sectors\n\nstart=2048,size={esp_bytes//512},type=c,bootable\n')
     run('sfdisk','--no-reread','--no-tell-kernel',disk,input=partition,text=True)
     with disk.open('r+b') as dst,esp.open('rb') as src:
         dst.seek(1024*1024);shutil.copyfileobj(src,dst)

@@ -19,5 +19,10 @@ namespace brook {
 // Must be called before f_mount() for that drive.
 bool FatFsBindDrive(uint8_t pdrv, Device* dev);
 int FatFsFlushDrive(uint8_t pdrv);
+// One actual FatFS instance per drive. Keeps the binding and its immutable
+// read-only capability stable until the last retained mount is destroyed.
+bool FatFsAcquireDrive(uint8_t pdrv, bool* readOnly);
+void FatFsReleaseDrive(uint8_t pdrv);
+bool FatFsDriveReadOnly(uint8_t pdrv);
 
 } // namespace brook

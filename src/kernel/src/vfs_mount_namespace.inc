@@ -97,12 +97,15 @@ void VfsDrainMountCleanup()
     auto flags=IrqSpinLockAcquire(&g_namespaceRetirementLock);
     auto* retired=g_namespaceRetirements;g_namespaceRetirements=nullptr;
     IrqSpinLockRelease(&g_namespaceRetirementLock,flags);
-    FileMutationGuard transaction;
-    while(retired) {
-        auto* next=retired->retireNext;retired->retireNext=nullptr;
-        VfsRetireNamespaceLocked(retired);retired=next;
+    {
+        FileMutationGuard transaction;
+        while(retired) {
+            auto* next=retired->retireNext;retired->retireNext=nullptr;
+            VfsRetireNamespaceLocked(retired);retired=next;
+        }
+        VfsCollectRetiredMountsLocked();
     }
-    VfsCollectRetiredMountsLocked();
+    if(CompressedVfsCollectRetired)CompressedVfsCollectRetired();
 }
 struct VfsNamespaceCloneMap {
     struct Attachment { Attachment* next;MountEntry* oldMount;MountEntry* newMount; };
