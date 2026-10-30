@@ -1,5 +1,16 @@
 # Recovery and VM-control backlog
 
+### Dell Fn-key display wake mismatch (30 October 2026)
+
+Physical XPS13 9343 observation: after idle display-off, pressing Fn restores
+the backlight but leaves the image black. A subsequent ordinary key press or
+touchpad movement restores the image. Normal keyboard wake already passed.
+Investigate firmware/EC backlight restoration versus Brook's display-idle/input
+sequence and redraw state; a modifier-recognition difference is a hypothesis,
+not an established cause. Capture PWM/policy/input/frame state around Fn and
+ordinary-input wake before changing either path. Full system sleep is unrelated
+and remains deferred.
+
 ### Steam loading and block completion follow-ups (29 October 2026)
 
 An [opt-in bounded ext2 write-behind queue](ext2-write-behind.md) now covers
