@@ -29,12 +29,13 @@ for name in ['usb-read-only','boot-app-image']:run('mdel','-i',initrd,'::ETC/'+n
 for name in ['SNAPCHECK.ELF','HWSTATUS.ELF']:run('mcopy','-i',initrd,out/name,'::BOOT/'+name)
 rc=out/'INIT.RC';rc.write_text('set wm\nset vfb none\nkconsole\nrun --console --uid 0 /boot/HWSTATUS.ELF\n');run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 digest=hashlib.sha256(image.read_bytes()).hexdigest();results=[]
-for case,ram in [('independent',512),('bad-hash',512),('short-source',512),('low-memory',256)]:
+for case,ram in [('independent',512),('bad-hash',512),('short-source',512),('low-memory',256),('disabled',512)]:
     base=out/case;base.mkdir();disk=base/'private.raw';run('cp','--reflink=auto',probe/'probe.raw',disk)
     candidate=base/'INITRD.IMG';run('cp','--reflink=auto',initrd,candidate)
     marker=base/'boot-app-snapshot';size=image.stat().st_size+(4096 if case=='short-source' else 0)
     marker.write_text(f'/media/usb/APPS.BRK /nix {size} '+('0'*64 if case=='bad-hash' else digest)+'\n')
-    run('mcopy','-i',candidate,marker,'::ETC/boot-app-snapshot');run('mcopy','-o','-i',str(disk)+'@@1048576',candidate,'::INITRD.IMG')
+    if case!='disabled':run('mcopy','-i',candidate,marker,'::ETC/boot-app-snapshot')
+    run('mcopy','-o','-i',str(disk)+'@@1048576',candidate,'::INITRD.IMG')
     variables=base/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],variables);variables.chmod(0o600)
     with socket.socket() as reserve:reserve.bind(('127.0.0.1',0));port=reserve.getsockname()[1]
     argv=['qemu-system-x86_64','-machine','q35','-accel','kvm','-cpu','host','-smp','4','-m',str(ram),'-nodefaults',
@@ -55,11 +56,17 @@ for case,ram in [('independent',512),('bad-hash',512),('short-source',512),('low
             time.sleep(.1)
         else:raise TimeoutError(serial[-3000:])
         if case=='independent':assert 'immutable RAM application snapshot ready' in serial and 'source_closed=1' in serial
+        elif case=='disabled':assert 'immutable RAM application snapshot ready' not in serial
         else:assert 'RAM snapshot unavailable; applications disabled' in serial and 'immutable RAM application snapshot ready' not in serial
         q=Qmp(base/'qmp.sock');rpc=Rpc(base);rpc.request('initialize',{'protocolVersion':'2025-06-18'})
         attached=rpc.tool('hw_attach',{'host':'127.0.0.1','port':port});session=attached['session']
+        state=attached['guest']['app_snapshot'];assert attached['guest']['app_snapshot_api']==1
+        assert state['configured'] is (case!='disabled') and state['source_closed'] is (case!='disabled')
+        assert state['ready'] is (case=='independent')
+        assert state['bytes']==(0 if case=='disabled' else size) and (state['error']==0) is (case in ('independent','disabled'))
+        (base/'snapshot-caps.json').write_text(json.dumps(state,indent=2)+'\n')
         stats=rpc.tool('hw_stats',{'session':session});(base/'stats.json').write_text(json.dumps(stats,indent=2)+'\n')
-        ident=uuid.uuid4().hex;arguments=['/boot/SNAPCHECK.ELF']+([] if case=='independent' else ['recovery'])
+        ident=uuid.uuid4().hex;arguments=['/boot/SNAPCHECK.ELF']+([] if case=='independent' else ['disabled'] if case=='disabled' else ['recovery'])
         job=rpc.tool('hw_guest_run',{'session':session,'request_id':ident,'argv':arguments,'cwd':'/tmp','uid':0,'wait_s':2})
         end=time.monotonic()+60
         while job.get('state')!='completed':
@@ -68,6 +75,7 @@ for case,ram in [('independent',512),('bad-hash',512),('short-source',512),('low
         (base/'job.json').write_text(json.dumps(job,indent=2)+'\n');assert job.get('exit',{}).get('code')==0,job
         text=job.get('stdout',{}).get('text','')
         if case=='independent':assert 'APP_SNAPSHOT_SOURCE_OVERWRITTEN_NAMESPACE_DETACHED' in text and 'COMPRESSED_IMAGE_ELF_PASS' in text,job
+        elif case=='disabled':assert 'APP_SNAPSHOT_DISABLED_OK' in text,job
         else:assert 'APP_SNAPSHOT_RECOVERY_OK' in text,job
         shutdown=uuid.uuid4().hex;state=rpc.tool('hw_power',{'session':session,'request_id':shutdown,'operation':'shutdown'});end=time.monotonic()+30
         while state['state']!='ready':

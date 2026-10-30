@@ -8,6 +8,7 @@
 #include "shutdown.h"
 #include "net.h"
 #include "string.h"
+#include "fs/compressed_vfs.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -52,6 +53,12 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"build_id\":");r.quoted(BuildGitHash());r.text(",\"build_date\":");r.quoted(BuildDate());
         r.text(",");r.field("logical_cpus",SmpGetCpuCount());
         r.text(",\"audio_device\":");r.text(AudioAvailable()?"true":"false");
+        const auto snapshot=CompressedVfsAppSnapshotInfo();
+        r.text(",\"app_snapshot_api\":1,\"app_snapshot\":{\"configured\":");r.text(snapshot.configured?"true":"false");
+        r.text(",\"ready\":");r.text(snapshot.ready?"true":"false");
+        r.text(",\"source_closed\":");r.text(snapshot.sourceClosed?"true":"false");
+        r.text(",");r.field("bytes",snapshot.bytes);r.text(",");r.field("error",uint32_t(snapshot.error));
+        r.text(",\"source\":");r.quoted(snapshot.source);r.text("}");
         r.text(",\"power_api\":1,\"power\":{");PowerCaps(r);r.text("}");
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":false}\n");r.send();return true;
     }

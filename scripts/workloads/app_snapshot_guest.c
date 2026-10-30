@@ -8,6 +8,21 @@
 #include <sys/stat.h>
 #include <unistd.h>
 int main(int argc,char** argv) {
+    FILE* status=fopen("/proc/brook_app_snapshot","r");assert(status);
+    char record[320],version[32],source[64],hash[65];unsigned configured,ready,closed,error;unsigned long long bytes;
+    assert(fgets(record,sizeof(record),status)&&fclose(status)==0);
+    assert(sscanf(record,"%31s %u %u %u %llu %u %63s %64s",version,&configured,&ready,&closed,&bytes,&error,source,hash)==8);
+    assert(!strcmp(version,"BROOK_APP_SNAPSHOT_V1"));
+    if(argc==2&&!strcmp(argv[1],"disabled")) {
+        assert(!configured&&!ready&&!closed&&!bytes&&!error&&!strcmp(source,"-"));
+        puts("APP_SNAPSHOT_DISABLED_OK");return 0;
+    }
+    assert(configured==1&&closed==1);
+    assert(!strcmp(source,"/media/usb/APPS.BRK")&&bytes>0&&strlen(hash)==64);
+    if(argc==2&&!strcmp(argv[1],"recovery")){assert(ready==0&&error!=0);}
+    else {assert(ready==1&&error==0);}
+    printf("APP_SNAPSHOT_READINESS %s",record);
+
     if(argc==2&&!strcmp(argv[1],"recovery")) {
         struct stat st;assert(stat("/nix/hello",&st)==-1&&errno==ENOENT);
         puts("APP_SNAPSHOT_RECOVERY_OK no_application_mount");return 0;

@@ -815,3 +815,27 @@ upload server**, establishes no application dependency policy yet and changes
 neither the staged USB nor the current kernel/initrd-only protocol. A future
 application update must require present, parsed dependency metadata and the
 slot/provenance/commit gates described above.
+
+### Kernel-reported application snapshot readiness
+
+The new kernel reports finalized boot state at read-only
+`/proc/brook_app_snapshot` and in `bridge hardware caps` (`app_snapshot_api=1`).
+The report distinguishes configuration from successful RAM publication, records
+source closure, declared bytes, source path and a bounded error code; the proc
+record additionally carries the expected SHA-256. Ordinary file-backed/disabled
+boots never report snapshot readiness. `HWSTATUS.ELF` prints the versioned record
+when available. The host doctor reports API support separately from readiness.
+
+This closes an application-updater admission gap: the future helper can compare
+present initrd dependency metadata against the actual RAM snapshot rather than
+assuming a marker means the image was mounted. Boot state is written only in
+serialized initialization and immutable after user scheduling starts. It does
+not imply current window visibility or authorize an application-image overwrite
+by itself. Existing physical v5 and frozen desktop candidates are unchanged.
+
+Five QEMU cases pass in
+`build/hardware/app-snapshot-readiness-20261030/result.json`: independent RAM
+execution after source overwrite/detach, bad hash, short source, low memory and
+unconfigured snapshot. Each checks the proc report and boot-pinned hardware caps
+against actual publication. Eleven hardware-bridge contract tests pass,
+including API-supported-but-not-ready and legacy-no-API behavior.

@@ -34,7 +34,10 @@ class Endpoint:
                         if command.startswith('bridge epoch init '):
                             if self.epoch=='0'*32:self.epoch=command.split()[-1]
                             result={'boot_id':self.epoch}
-                        elif command=='bridge hardware caps':result={'hardware_api':1,'boot_guard':True,'logs_api':1,'boot_id':self.epoch,'power_api':1,'power':{'graceful_quiescence':True,'reset':True,'power_off':False}}
+                        elif command=='bridge hardware caps':
+                            result={'hardware_api':1,'boot_guard':True,'logs_api':1,'boot_id':self.epoch,'power_api':1,'power':{'graceful_quiescence':True,'reset':True,'power_off':False}}
+                            if hasattr(self,'snapshot'):
+                                result.update(app_snapshot_api=1,app_snapshot=self.snapshot)
                         elif command=='bridge job caps':result={'job_api':2}
                         elif command=='bridge ui caps':result={'ui_api':1,'apps_api':1,'boot_id':self.epoch}
                         elif command=='bridge stats':result={'process_count':7}
@@ -70,6 +73,17 @@ class HardwareTests(unittest.TestCase):
             self.assertTrue(doctor['capabilities']['command_jobs']);self.assertTrue(doctor['capabilities']['semantic_windows'])
             self.assertEqual(self.hardware.stats(session)['process_count'],7)
             logs=self.hardware.logs(session);self.assertEqual(logs['next_cursor'],2);self.assertEqual(logs['dropped_lines'],1)
+    def test_snapshot_support_does_not_imply_snapshot_readiness(self):
+        session=self.attach()
+        self.assertFalse(self.hardware.doctor(session)['capabilities']['ram_application_snapshot'])
+        self.endpoint.snapshot={'configured':False,'ready':False,'source_closed':False,'bytes':0,'error':0,'source':''}
+        doctor=self.hardware.doctor(session)
+        self.assertTrue(doctor['capabilities']['ram_application_snapshot'])
+        self.assertFalse(doctor['guest']['app_snapshot']['ready'])
+        self.endpoint.snapshot={'configured':True,'ready':True,'source_closed':True,'bytes':262602752,'error':0,'source':'/media/usb/APPS.BRK'}
+        doctor=self.hardware.doctor(session)
+        self.assertEqual(doctor['guest']['app_snapshot'],self.endpoint.snapshot)
+
     def test_reboot_blocks_commands_and_preserves_old_session(self):
         session=self.attach();old=self.hardware.load_session(session)['guest_boot_id'];self.endpoint.epoch='b'*32
         with self.assertRaises(HardwareBootChanged):self.hardware.stats(session)

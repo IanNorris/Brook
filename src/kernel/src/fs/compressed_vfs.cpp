@@ -25,6 +25,7 @@ constexpr uint32_t None=~uint32_t{0};
 Device* devices[DEVICE_MAX]{};
 uint32_t live[DEVICE_MAX]{};
 Vnode* pendingFiles[DEVICE_MAX]{};
+AppSnapshotBootInfo bootSnapshotInfo{};
 struct Mount {
     Device* device;uint8_t drive;uint32_t references,cacheNamespace;
     Vnode* source; Mount* retiredNext;
@@ -288,6 +289,7 @@ bool CompressedVfsBindDevice(uint8_t drive,Device* device) {
     devices[drive]=device;return true;
 }
 void CompressedVfsRegister(){VfsRegisterFs("brookimg",&fsOps);}
+AppSnapshotBootInfo CompressedVfsAppSnapshotInfo(){return bootSnapshotInfo;}
 namespace {
 struct BootSnapshotIo {
     Vnode* source;
@@ -302,19 +304,34 @@ bool bootSnapshotAttempted=false;
 bool MountBootSnapshot(const AppSnapshotPlan& plan) {
     if(bootSnapshotAttempted)return false;
     bootSnapshotAttempted=true;
+    bootSnapshotInfo.bytes=plan.bytes;
+    memcpy(bootSnapshotInfo.source,plan.source,sizeof(plan.source));
+    memcpy(bootSnapshotInfo.hash,plan.hash,sizeof(plan.hash));
+    bootSnapshotInfo.error=AppSnapshotBootError::Source;
     auto* source=VfsOpen(plan.source,VFS_O_STREAM);if(!source)return false;
     VnodeStat stat{};
     if(VfsStat(source,&stat)||stat.isDir||stat.isSymlink||stat.size<plan.bytes||stat.size>AppSnapshotLimit) {
-        VfsClose(source);return false;
+        VfsClose(source);bootSnapshotInfo.sourceClosed=true;return false;
     }
     BootSnapshotIo io{source};AppSnapshotError error;
     auto* memory=AppSnapshotCopy(io,plan,PmmGetFreePageCount()*4096,error);
     VfsClose(source); // No USB FIL or compressed-file source survives publication.
-    if(!memory){KPrintf("brookimg: RAM snapshot copy failed reason=%u\n",unsigned(error));return false;}
+    bootSnapshotInfo.sourceClosed=true;
+    if(!memory){
+        switch(error) {
+            case AppSnapshotError::Bounds:bootSnapshotInfo.error=AppSnapshotBootError::Bounds;break;
+            case AppSnapshotError::Memory:bootSnapshotInfo.error=AppSnapshotBootError::Memory;break;
+            case AppSnapshotError::Read:bootSnapshotInfo.error=AppSnapshotBootError::Read;break;
+            case AppSnapshotError::Hash:bootSnapshotInfo.error=AppSnapshotBootError::Hash;break;
+            default:bootSnapshotInfo.error=AppSnapshotBootError::Source;break;
+        }
+        KPrintf("brookimg: RAM snapshot copy failed reason=%u\n",unsigned(error));return false;}
+    bootSnapshotInfo.error=AppSnapshotBootError::Header;
     auto* header=static_cast<CompressedImageHeader*>(memory);
     if(!CompressedImageHeaderValid(*header,plan.bytes)||header->imageBytes!=plan.bytes) {
         io.release(memory,plan.bytes);return false;
     }
+    bootSnapshotInfo.error=AppSnapshotBootError::Device;
     int slot=DEVICE_MAX-1;
     while(slot>=0&&(devices[slot]||pendingFiles[slot]||__atomic_load_n(&live[slot],__ATOMIC_ACQUIRE)))--slot;
     if(slot<0){io.release(memory,plan.bytes);return false;}
@@ -322,6 +339,7 @@ bool MountBootSnapshot(const AppSnapshotPlan& plan) {
     if(!device){io.release(memory,plan.bytes);return false;}
     if(!DeviceRegister(device)){RamdiskDestroyUnregistered(device);io.release(memory,plan.bytes);return false;}
     devices[slot]=device;
+    bootSnapshotInfo.error=AppSnapshotBootError::Mount;
     if(!VfsMountConfigured("/nix","brookimg",slot,7)) {
         // A failed private mount normally leaves no live objects. If an
         // unexpected retained reference exists, preserve its backing instead
@@ -331,6 +349,7 @@ bool MountBootSnapshot(const AppSnapshotPlan& plan) {
         }
         devices[slot]=nullptr;DeviceUnregister(device);RamdiskDestroyUnregistered(device);io.release(memory,plan.bytes);return false;
     }
+    bootSnapshotInfo.error=AppSnapshotBootError::None;bootSnapshotInfo.ready=true;
     FilePageCacheEnableReclaim();
     KPrintf("brookimg: immutable RAM application snapshot ready bytes=%lu path=/nix source_closed=1\n",plan.bytes);
     return true;
@@ -340,6 +359,8 @@ void CompressedVfsBootMount() {
     // Explicit trusted boot metadata: source /nix exact_bytes SHA256. Never
     // fall back to mounting a writable USB file if snapshot preparation fails.
     if(auto* config=VfsOpen("/etc/boot-app-snapshot",VFS_O_STREAM)) {
+        if(bootSnapshotInfo.configured){VfsClose(config);return;}
+        bootSnapshotInfo.configured=true;bootSnapshotInfo.error=AppSnapshotBootError::Config;
         char record[257]{};uint64_t offset=0;
         int count=VfsRead(config,record,sizeof(record),&offset);VfsClose(config);
         AppSnapshotPlan plan{};

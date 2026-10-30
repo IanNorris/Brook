@@ -106,7 +106,7 @@ class Hardware:
         try:
             with self.session_lock(session) as data:
                 hardware,jobs,ui=self.guest_batch(data,['bridge hardware caps','bridge job caps','bridge ui caps'],5)
-            caps.update(diagnostics=True,logs=hardware.get('logs_api')==1,stats=True,
+            caps.update(ram_application_snapshot=hardware.get('app_snapshot_api')==1,diagnostics=True,logs=hardware.get('logs_api')==1,stats=True,
                 hardware_power=hardware.get('power_api')==1,power=hardware.get('power',{}),
                 command_jobs=jobs.get('job_api')==2,semantic_windows=ui.get('ui_api')==1,semantic_launch=ui.get('launch_api')==1,app_catalog=ui.get('apps_api')==1)
             result.update(reachable=True,identity_matches=True,guest=hardware,jobs=jobs,ui=ui)

@@ -26,6 +26,7 @@
 #include "module.h"
 #include "virtio_blk.h"
 #include "ext2_vfs.h"
+#include "fs/compressed_vfs.h"
 #include "string.h"
 
 namespace brook {
@@ -461,6 +462,19 @@ static Vnode* GenMeminfo()
         totalKB, freeKB, freeKB);
 
     return MakeProcVnode(buf, n);
+}
+
+// A read-only, versioned readiness record for RAM-resident maintenance tools.
+static Vnode* GenAppSnapshot()
+{
+    const auto state=CompressedVfsAppSnapshotInfo();
+    auto* buf=static_cast<char*>(kmalloc(320));if(!buf)return nullptr;
+    char hash[65]{};constexpr char digits[]="0123456789abcdef";
+    for(unsigned i=0;i<32;i++){hash[2*i]=digits[state.hash[i]>>4];hash[2*i+1]=digits[state.hash[i]&15];}
+    uint32_t n=ProcFmt(buf,320,"BROOK_APP_SNAPSHOT_V1 %u %u %u %lu %u %s %s\n",
+        state.configured?1u:0u,state.ready?1u:0u,state.sourceClosed?1u:0u,state.bytes,
+        uint32_t(state.error),state.source[0]?state.source:"-",hash);
+    return MakeProcVnode(buf,n);
 }
 
 // /proc/uptime — seconds idle_seconds
@@ -1373,6 +1387,7 @@ struct ProcGlobalEntry {
 static ProcGlobalEntry g_globalEntries[] = {
     { "stat",    GenStat },
     { "meminfo", GenMeminfo },
+    { "brook_app_snapshot", GenAppSnapshot },
     { "uptime",  GenUptime },
     { "version", GenVersion },
     { "loadavg", GenLoadavg },
