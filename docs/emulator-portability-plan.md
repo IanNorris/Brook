@@ -225,10 +225,14 @@ cleanup paused passed. This is correctness evidence, not a physical performance
 claim. In the subsequent Dell run, the user reports CPU usage falling to 1%
 and much smoother interaction. The 800x600 photo confirms HWFB cache=WC,
 HWMS draw=0 and copy=0 at timer resolution, with period=16 ms on the guest
-clock. The prior copy time was 80–141ms. Higher-resolution behavior and
-wall-clock timer accuracy remain unverified. A configuration-only repeat
+clock. The prior copy time was 80–141ms. Wall-clock timer accuracy remains
+unverified. A configuration-only repeat
 requests the largest linear GOP mode within 3840x2160, retaining the exact
-verified kernel/initrd/loader; actual selected geometry must be read from HWFRAME.
+verified kernel/initrd/loader. The subsequent physical photo confirms
+3200x1800, stride 3200, HWFB cache=WC, and visible HWMS draw=0 copy=0 period=16
+on the guest clock; taskbar CPU is 1% and memory 12%. The user confirms it
+remains very smooth at this resolution. This validates responsiveness, not
+independently calibrated panel refresh rate or timer accuracy.
 
 References: [Linux PAT alias rules](https://www.kernel.org/doc/html/latest/arch/x86/pat.html)
 and [Intel memory-type tables](https://cdrdv2-public.intel.com/812380/252046-sdm-change-document.pdf).
