@@ -1089,3 +1089,14 @@ The mouse-pass private guest reached the rendered scene and accepted a keyboard
 the harness terminated QEMU in cleanup. Do not count that run as a checked
 shutdown pass; the earlier software-game test completed checked shutdown.
 The failed shutdown log is `build/hardware/quake2-mouse-qemu.log`.
+
+Terra's private QMP check subsequently confirmed camera rotation from a raw
+relative x+120 event: fixed wall/beam edges shifted while the HUD and window
+stayed fixed. Before/after images are `terra-before-motion.png` and
+`terra-after-motion.png` beneath the mouse-pass test directory. Weapon clicks
+and release shortcuts were not independently exercised in that guest; their
+adapter behavior is covered by the host test. The final executable (SHA256
+`6ffb7112581e25f1ba0584b8b712cce0bf6c425ac649a0cdd1c23d02a8f976a3`)
+is installed on the Dell and launched into `base1`, with the earlier executable
+retained as `quake2.before-mouse`. Physical mouse acceptance remains pending.
+Installation/job evidence: `dell-quake2-mouse-install-20261030/result.json`.
