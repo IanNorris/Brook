@@ -5,7 +5,9 @@ namespace {
 struct Yield {};
 bool launched=true,jobsAllowed=true,jobsBusy=false,dispatching=false,gate=false,canFreeze=true;
 uint32_t births=0;unsigned closes=0,signals=0,syncs=0,freezes=0;
-unsigned writebackStops=0;
+unsigned writebackStops=0,powerWrites=0;
+bool terminalSleeps=false,lastRestart=false;
+brook::PlatformPowerPlan powerPlan;
 bool writebackStopped=false;
 int syncError=0;
 brook::ProcessCleanupStatus cleanup{};
@@ -13,14 +15,14 @@ brook::Process serviceTasks[2]{};unsigned signalPid=0;
 brook::DebugTaskSnapshot census[4]{};unsigned censusCount=0;
 brook::WmDebugWindow window{};bool visible=false;
 void step(){try{brook::Worker(nullptr);}catch(Yield&){} }
-void command(const char* id,const char* verb,const char* expected,int expectedError=0){char state[24];int error=123;brook::ShutdownCommand(id,verb,state,&error);assert(!strcmp(state,expected));assert(error==expectedError);}
+void command(const char* id,const char* verb,const char* expected,int expectedError=0){char state[24];int error=123;brook::ShutdownCommand(id,verb,state,&error);if(strcmp(state,expected)||error!=expectedError)std::fprintf(stderr,"power test %s: expected %s/%d got %s/%d\n",verb,expected,expectedError,state,error);assert(!strcmp(state,expected));assert(error==expectedError);}
 const char* id="11111111111111111111111111111111";
 const char* second="22222222222222222222222222222222";
 }
 namespace brook {
 Process* KernelThreadCreate(const char*,void(*)(void*),void*,uint8_t){return nullptr;}
 void SchedulerAddProcess(Process*){}
-extern "C" void SchedulerSleepMs(uint32_t){throw Yield{};}
+extern "C" void SchedulerSleepMs(uint32_t ms){if(terminalSleeps && ms!=25)return;throw Yield{};}
 uint32_t SchedulerSnapshotDebugTasks(DebugTaskSnapshot* out,uint32_t cap,uint32_t* total,uint64_t* begin,uint64_t* end){*total=censusCount;*begin=*end=0;for(unsigned i=0;i<censusCount&&i<cap;++i)out[i]=census[i];return censusCount;}
 uint32_t SchedulerSetUserBirthClosed(bool closed){gate=closed;return births;}
 void SchedulerUserBirthStatus(bool* closed,uint32_t* pending){*closed=gate;*pending=births;}
@@ -35,6 +37,9 @@ int WmApplyDebugAction(uint32_t target,uint64_t incarnation,WmDebugAction,uint32
 ProcessCleanupStatus ProcessGetCleanupStatus(){return cleanup;}
 void FileObjectStopWriteback(){++writebackStops;writebackStopped=true;assert(!cleanup.liveUserAddressSpaces&&!cleanup.activeFinalizers);}
 void Ext2StopWriteback(){assert(writebackStopped);}
+void PlatformPowerConfigure(){}
+const PlatformPowerPlan& PlatformPowerGetPlan(){return powerPlan;}
+bool PlatformPowerIssue(bool restart){assert(writebackStopped && gate && syncError==0);++powerWrites;lastRestart=restart;return true;}
 bool DeviceCloseWrites(){assert(writebackStopped);++freezes;return canFreeze;}
 void AudioStop(){}
 int VfsSync(Vnode*){++syncs;return syncError;}
@@ -44,9 +49,9 @@ uint32_t FwCfgReadFile(const char*,void*,uint32_t){return 0;}
 void SerialPrintf(const char*,...){}
 }
 int main(){
-    using namespace brook;workerStarted=true;
+    using namespace brook;workerStarted=false;
     command(id,"shutdown","unsupported",-95);assert(launched&&jobsAllowed);
-    powerOff=true;powerRestart=true;
+    workerStarted=true;powerOff=true;powerRestart=true;
     command(id,"shutdown","closing");assert(!launched&&!jobsAllowed);
     command(id,"shutdown","closing");command(id,"restart","conflict",-22);command(second,"restart","busy",-16);
     // A normal close is sent once. Keeping that window (save dialog or hung
@@ -83,6 +88,24 @@ step();assert(!signals&&!syncs&&!gate);
     command(third,"power_status","ready");assert(syncs==2&&gate);
     command(third,"cancel","too_late",-16);
     command(third,"commit","ready");assert(operations[current].commit);
+    // Mocked hardware writes are reached only after successful sync, once.
+    assert(!powerWrites);terminalSleeps=true;step();terminalSleeps=false;
+    assert(powerWrites==1 && !lastRestart && operations[current].phase==Phase::Failed);
+    current=-1;irreversible=false;powerOff=false;powerRestart=true;
+    const char* fourth="44444444444444444444444444444444";
+    command(fourth,"shutdown","closing");operations[current].automatic=true;ShutdownCompositorPoll();
+    for(unsigned i=0;i<10 && operations[current].phase!=Phase::Ready;++i)step();
+    command(fourth,"power_status","ready");assert(!strcmp(ShutdownRequestStatus(id),"Shutdown cancelled"));assert(!strcmp(ShutdownDesktopStatus(),"Safe to power off manually"));
+    command(fourth,"commit","ready",-95);step();assert(powerWrites==1 && operations[current].phase==Phase::Ready);
+    // Firmware reset availability is independent of automatic soft-off.
+    current=-1;irreversible=false;
+    const char* fifth="55555555555555555555555555555555";
+    command(fifth,"restart","closing");ShutdownCompositorPoll();
+    for(unsigned i=0;i<10 && operations[current].phase!=Phase::Ready;++i)step();
+    command(fifth,"commit","ready");terminalSleeps=true;step();terminalSleeps=false;
+    assert(powerWrites==2 && lastRestart);
+    current=-1;irreversible=false;powerRestart=false;
+    command("66666666666666666666666666666666","restart","unsupported",-95);assert(powerWrites==2);
     // Never execute the host's actual power I/O from this native fixture.
     std::puts("SHUTDOWN_COORDINATOR PASS");
 }

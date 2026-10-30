@@ -224,7 +224,7 @@ def doctor(session, **_):
                                                 "query-status","query-blockstats","stop","cont","quit"}],
                   "capture": "leased completed frame + QEMU memory; requires current kernel or cached panic metadata",
                   "kernel_panic_pipe": "unavailable", "guest_widget_tree": "unavailable",
-                  "generation": data["generation"], "server_version": "0.10.0",
+                  "generation": data["generation"], "server_version": "0.11.0",
                   "bridge_capabilities": {"artifact_delivery": {"revision": 1,
                       "default": "references", "include_image": True,
                       "preview_max_bytes": 8*1024*1024, "preview_max_images": 4}}}
@@ -964,13 +964,15 @@ register("hw_sessions",hardware.sessions,"List opted-in hardware sessions withou
 register("hw_doctor",hardware.doctor,"Report network reachability and supported hardware operations; QEMU and post-panic access stay explicitly unavailable",SESSION,["session"],True)
 register("hw_stats",hardware.stats,"Memory, processes and compositor intervals from a boot-pinned physical Brook session",{**SESSION,"audio_details":{"type":"boolean"}},["session"],True)
 register("hw_logs",hardware.logs,"Boot-pinned bounded kernel log lines with retention loss and a next cursor",{**SESSION,"cursor":INT,"limit":INT},["session"],True)
+register("hw_power",hardware.power,"Request, observe, cancel or commit graceful hardware shutdown/reset using a boot-pinned request identity; inspect power capabilities first",{**SESSION,"request_id":STR,"operation":{"type":"string","enum":["shutdown","restart","status","cancel","commit"]}},["session","request_id","operation"])
 register("hw_command",hardware.command,"Run one kernel debug command on the pinned hardware boot; no host shell, no automatic retry after uncertain delivery",{**SESSION,"command":STR},["session","command"])
 register("hw_guest_run",hardware.guest_run,"Structured guest argv with durable request identity and separate output; uses the same guarded jobs as VMs",{**SESSION,"request_id":STR,"argv":{"type":"array","items":STR},"cwd":STR,"env":{"type":"object"},"uid":INT,"wait_s":NUM},["session","request_id","argv"])
 register("hw_job",hardware.job,"Recover or observe an existing hardware job without replaying it",{**SESSION,"operation_id":STR,"stdout_offset":INT,"stderr_offset":INT,"output_limit":INT,"wait_s":NUM},["session","operation_id"],True)
 register("hw_windows",hardware.windows,"Semantic windows on the pinned physical guest; no screenshot or host desktop access",SESSION,["session"],True)
 register("hw_window",hardware.window,"Apply one semantic window action on the pinned physical guest; recover uncertain delivery through hw_ui",{**SESSION,"window":{"type":"object"},"action":{"type":"string","enum":["focus","minimize","maximize","restore","close"]},"request_id":STR,"restore_target":STR,"wait_for":STR,"wait_s":NUM},["session","window","action","request_id"])
-register("hw_ui",hardware.ui_status,"Observe or recover an existing hardware window operation without redispatch",{**SESSION,"operation_id":STR,"wait_s":NUM,"wait_for":STR},["session","operation_id"],True)
+register("hw_ui",hardware.ui_status,"Observe or recover an existing hardware UI request without redispatch",{**SESSION,"operation_id":STR,"wait_s":NUM,"wait_for":STR},["session","operation_id"],True)
 register("hw_apps",hardware.apps,"Read the physical guest's installed application catalog",SESSION,["session"],True)
+register("hw_launch",hardware.launch,"Launch an exact installed-app reference through the hardware guest's UI launcher once; recover via hw_ui without replay",{**SESSION,"app":{"type":"object"},"request_id":STR,"wait_for":{"type":"string","enum":["admitted","dispatched","window"]},"wait_s":NUM},["session","app","request_id"])
 register("vm_sessions",sessions,"Discover opted-in user/agent VM runs; no desktop discovery",readonly=True)
 register("vm_doctor",doctor,"VM transport and guest readiness; capabilities distinguish unsupported paths",SESSION,["session"],True)
 register("vm_start",start,"Boot a named experiment on new disk clones with playback off",{"scenario":STR,"gpu":STR})
@@ -1069,7 +1071,7 @@ def serve():
             if method=="initialize":
                 requested=params.get("protocolVersion")
                 version=requested if requested in {"2024-11-05","2025-03-26","2025-06-18"} else "2025-06-18"
-                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.10.0"}}
+                result={"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"brook-vm","version":"0.11.0"}}
             elif method=="ping":result={}
             elif method=="tools/list":result={"tools":[spec for fn,spec in TOOLS.values()]}
             elif method=="tools/call":

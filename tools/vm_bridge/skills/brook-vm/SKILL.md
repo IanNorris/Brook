@@ -132,3 +132,17 @@ debug command and never retries uncertain delivery. Hardware sessions have no
 QMP, host-desktop input, raw frame transfer, registers, raw memory or panic
 transport. TCP loss can mean reboot, panic or link failure; do not label it a
 panic without evidence. Keep the optical scanner available for real hardware.
+
+For physical power control, inspect hw_doctor's separate graceful-quiescence,
+reset and power_off capabilities. Use hw_power with a new request_id and
+operation=shutdown or restart, then operation=status on that same ID. Resolve
+save dialogs before proceeding. Cancel is supported only before the service/
+write-barrier stage. Commit is allowed only once the request is ready and the
+chosen hardware transition is supported. A machine without automatic power-off
+can still quiesce and report "Safe to power off manually"; do not claim its power
+has been removed. Never replay an uncertain mutation to recover a reply: query
+the same request ID. A reset ends the pinned boot; attach explicitly again.
+
+Use hw_apps references with hw_launch to exercise the normal installed-app UI
+launcher. Wait conditions distinguish admission, dispatch and a visible window;
+none claims application readiness. Recover the same request through hw_ui.

@@ -8,7 +8,7 @@
 #include "memory/file_object.h"
 #include "ext2_vfs.h"
 #include "fw_cfg.h"
-#include "portio.h"
+#include "platform_power.h"
 #include "apic.h"
 #include "compositor.h"
 #include "serial.h"
@@ -110,21 +110,27 @@ void Worker(void*) {
                 const int error=VfsSync(nullptr);
                 SetPhase(selected,error?Phase::Failed:Phase::Ready,error);
             }
-        }else if(op.phase==Phase::Ready&&(op.automatic||op.commit)) {
+        }else if(op.phase==Phase::Ready&&(op.automatic||op.commit)&&(op.restart?powerRestart:powerOff)) {
             SetPhase(selected,Phase::Committing);
             // Allow the UART reply and a final progress frame to be delivered.
             SchedulerSleepMs(500);
-            if(op.restart)outb(0xcf9,6);else outw(0x604,0x2000);
-            SchedulerSleepMs(1000);SetPhase(selected,Phase::Failed,-5);
+            // All fallible sync/cleanup precedes this single selected write.
+            // Keep the quiesced kernel available for diagnostics if it returns;
+            // the panic-only SMP halt API cannot provide recoverable failure.
+            if(PlatformPowerIssue(op.restart))SchedulerSleepMs(1000);
+            SetPhase(selected,Phase::Failed,-5);
         }
         SchedulerSleepMs(25);
     }
 }
 }
 void ShutdownConfigure() {
-    char mode[24]{};const auto n=FwCfgReadFile("opt/brook/power",mode,sizeof(mode)-1);
-    if(n==9&&!memcmp(mode,"q35-reset",9)){powerOff=true;powerRestart=true;}
-    else if(n==8&&!memcmp(mode,"q35-stop",8))powerOff=true;
+    PlatformPowerConfigure();
+    const auto& plan=PlatformPowerGetPlan();powerOff=plan.CanPowerOff();powerRestart=plan.CanReset();
+}
+ShutdownPowerCapabilities ShutdownGetPowerCapabilities() {
+    const auto& plan=PlatformPowerGetPlan();
+    return {workerStarted,powerRestart,powerOff,plan.ResetMethod(),plan.PowerOffMethod(),plan.ResetReason(),plan.PowerOffReason()};
 }
 void ShutdownStart() {
     auto* worker=KernelThreadCreate("shutdown",Worker,nullptr,3);
@@ -140,7 +146,7 @@ void ShutdownCommand(const char* id,const char* verb,char state[24],int* error) 
     const char* result=nullptr;
     if(start&&found>=0&&operations[found].restart!=restart){result="conflict";*error=-22;}
     else if(start&&found<0) {
-        if(!workerStarted||!powerOff||(restart&&!powerRestart)){result="unsupported";*error=-95;}
+        if(!workerStarted||(restart&&!powerRestart)){result="unsupported";*error=-95;}
         else if(current>=0&&(Active(operations[current].phase)||irreversible)){result="busy";*error=-16;}
         else if(empty<0){result="full";*error=-28;}
         else {
@@ -154,7 +160,10 @@ void ShutdownCommand(const char* id,const char* verb,char state[24],int* error) 
     if(!result) {
         auto& op=operations[found];
         if(!strcmp(verb,"cancel")) {if(op.phase==Phase::Closing)op.cancel=true;else if(op.phase!=Phase::Cancelled){result="too_late";*error=-16;}}
-        if(!strcmp(verb,"commit")) {if(op.phase==Phase::Ready||op.phase==Phase::Committing)op.commit=true;else {result="not_ready";*error=-16;}}
+        if(!strcmp(verb,"commit")) {if(op.phase==Phase::Ready||op.phase==Phase::Committing) {
+                if(op.restart?powerRestart:powerOff)op.commit=true;
+                else {result="ready";*error=-95;}
+            }else {result="not_ready";*error=-16;}}
         if(!result){result=Name(op.phase);*error=op.error;}
     }
     unsigned i=0;while(result[i]&&i<23){state[i]=result[i];++i;}state[i]=0;SpinLockRelease(&lock);
@@ -168,7 +177,7 @@ void ShutdownDesktopRequest(bool restart) {
     char id[33];const auto n=__atomic_add_fetch(&desktopSequence,1ULL,__ATOMIC_RELAXED);
     for(unsigned i=0;i<32;++i)id[i]=i<16?'d':"0123456789abcdef"[(n>>((31-i)*4))&15];id[32]=0;
     char state[24];int error;ShutdownCommand(id,restart?"restart":"shutdown",state,&error);
-    if(error)__atomic_store_n(&desktopNotice,error==-95?"Power operation unsupported by this VM launch":"Another shutdown operation is pending",__ATOMIC_RELEASE);
+    if(error)__atomic_store_n(&desktopNotice,error==-95?"Requested power transition is unavailable on this machine":"Another shutdown operation is pending",__ATOMIC_RELEASE);
     else __atomic_store_n(&desktopNotice,static_cast<const char*>(nullptr),__ATOMIC_RELEASE);
     if(!error){SpinLockAcquire(&lock);if(current>=0&&!strcmp(operations[current].id,id))operations[current].automatic=true;SpinLockRelease(&lock);}
 }
@@ -176,15 +185,30 @@ void ShutdownDesktopCancel() {
     char id[33]{};SpinLockAcquire(&lock);if(current>=0)memcpy(id,operations[current].id,33);SpinLockRelease(&lock);
     if(id[0]){char state[24];int error;ShutdownCommand(id,"cancel",state,&error);if(!error)__atomic_store_n(&desktopNotice,static_cast<const char*>(nullptr),__ATOMIC_RELEASE);}
 }
-const char* ShutdownDesktopStatus() {
-    SpinLockAcquire(&lock);const auto p=current<0?Phase::Empty:operations[current].phase;SpinLockRelease(&lock);
-    switch(p) {
+static const char* DescribePhase(Phase phase,bool restart) {
+    switch(phase) {
     case Phase::Closing:return "Closing apps - resolve save dialogs, or Cancel";
-    case Phase::Services:return "Stopping desktop services";case Phase::Cleanup:return "Waiting for process cleanup";
-    case Phase::Syncing:return "Saving filesystem changes";case Phase::Ready:return "Ready to power off / restart";
-    case Phase::Committing:return "Power transition";case Phase::Failed:return "Shutdown failed - inspect lifecycle status";
-    default:{const auto* notice=__atomic_load_n(&desktopNotice,__ATOMIC_ACQUIRE);return notice?notice:"Applications";}
+    case Phase::Services:return "Stopping desktop services";
+    case Phase::Cleanup:return "Waiting for process cleanup";
+    case Phase::Syncing:return "Saving filesystem changes";
+    case Phase::Ready:return restart?"Ready to restart":powerOff?"Ready to power off":"Safe to power off manually";
+    case Phase::Committing:return "Power transition";
+    case Phase::Failed:return "Shutdown failed - inspect lifecycle status";
+    case Phase::Cancelled:return "Shutdown cancelled";
+    default:return "Unknown shutdown request";
     }
+}
+const char* ShutdownRequestStatus(const char* id) {
+    Phase phase=Phase::Empty;bool restart=false;
+    SpinLockAcquire(&lock);
+    for(const auto& op:operations)if(op.id[0]&&!strcmp(op.id,id)){phase=op.phase;restart=op.restart;break;}
+    SpinLockRelease(&lock);return DescribePhase(phase,restart);
+}
+const char* ShutdownDesktopStatus() {
+    SpinLockAcquire(&lock);const auto phase=current<0?Phase::Empty:operations[current].phase;
+    const bool restart=current>=0&&operations[current].restart;SpinLockRelease(&lock);
+    if(phase!=Phase::Empty&&phase!=Phase::Cancelled)return DescribePhase(phase,restart);
+    const auto* notice=__atomic_load_n(&desktopNotice,__ATOMIC_ACQUIRE);return notice?notice:"Applications";
 }
 void ShutdownCompositorPoll() {
     SpinLockAcquire(&lock);const int selected=current;const bool closing=selected>=0&&operations[selected].phase==Phase::Closing&&!operations[selected].cancel&&admissionReady;

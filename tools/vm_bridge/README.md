@@ -741,3 +741,25 @@ inside nix-shell after building the kernel. It tests MCP stdio through a QEMU
 TCP forward, with no VM registry visible to the bridge, then resets the guest to
 verify rejection of old boot identities. This is protocol acceptance, not proof
 that a particular physical Ethernet adapter works.
+
+
+Hardware power control (`hw_power`, bridge 0.11.0) shares the graceful shutdown
+coordinator with the desktop and VM lifecycle channel. `hw_doctor` reports
+`graceful_quiescence`, `reset` and `power_off` independently, with method and
+unsupported-reason fields. The API accepts `request_id` and `operation`:
+`shutdown`, `restart`, `status`, `cancel` or `commit`. Kernel identities persist
+until reboot. Both the session envelope and power message check the boot token.
+There is no automatic mutation replay on timeout. Observe the existing request;
+explicitly reattach after reset. Unsupported automatic soft-off leaves a synced,
+quiesced machine displaying "Safe to power off manually".
+
+Firmware reset currently supports only a checksum-validated FADT byte System-I/O
+GAS. Explicit Q35 launch opt-in retains its emulator power-off method; failure of
+an advertised reset write never selects another port. Hardware S5/AML evaluation
+and automatic soft-off remain unsupported. These controls operate on the guest;
+they never use host desktop or host power-management commands.
+
+`hw_launch` mirrors the VM semantic launcher using exact references from
+`hw_apps`; `hw_ui` observes the same durable request without replay. This tests
+the normal launcher path, including its pending indicator and window tracking,
+rather than substituting an arbitrary command for an installed-app selection.

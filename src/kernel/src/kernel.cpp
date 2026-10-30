@@ -470,7 +470,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     }
 
     // ACPI: parse tables to get LAPIC/IOAPIC addresses.
-    bool acpiOk = brook::AcpiInit(bootProtocol->acpi.rsdpPhysical);
+    bool acpiOk = brook::AcpiInit(bootProtocol->acpi.rsdpPhysical,bootProtocol->memoryMap,bootProtocol->memoryMapCount);
     if (acpiOk)
     {
         // APIC: disable legacy PIC, enable LAPIC, calibrate + start timer.

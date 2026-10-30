@@ -253,3 +253,70 @@ runtime mounts (`build/hardware/usb-app-image-v4-retry-20261030/result.json`).
 Its first attempt stopped in OVMF's USB boot lookup before the Brook loader;
 the exact same image passed with fresh firmware variables on the bounded retry.
 That pre-loader startup variance is distinct from the kernel acceptance checks.
+
+### Validated reset and graceful manual power-off
+
+Power handling now separates graceful quiescence, reset and automatic power-off.
+The FADT signature is `FACP`. Discovery checks firmware-memory ranges, table
+lengths, RSDP/root/table checksums and MADT record bounds before using fields.
+Readable regions are copied from the boot map rather than retaining its array;
+explicit unusable RAM remains a distinct boot memory type and is rejected.
+Checksums use a 256-byte streaming buffer, with no firmware-sized allocation.
+Current discovery bounds are 1 MiB per SDT, 64 KiB per root table, 4 KiB per RSDP,
+512 captured firmware regions and the bootloader's 128 GiB identity-map ceiling.
+Invalid or unsupported tables disable the capability with a reason.
+
+The initial reset backend accepts only an advertised FADT byte System-I/O GAS
+(zero bit offset, unspecified/byte access size, valid nonzero 16-bit port).
+These fields follow [ACPI 6.6 reset register definitions](https://uefi.org/specs/ACPI/6.6/05_ACPI_Software_Programming_Model.html).
+The coordinator completes application/service cleanup, stops writeback, closes
+write admission and checks sync before issuing the single selected write. A
+returned/failed reset does not trigger another port; the quiesced kernel remains
+available for diagnostics. The panic-oriented AP halt API is not reused.
+
+Native soft-off still requires ACPI sleep-state evaluation/preparation and is
+not implemented. Shutdown can nevertheless complete cleanup and sync, then
+report **Safe to power off manually**. Unsupported commit leaves it ready;
+restart can be supported independently. Explicit Q35 launch opt-in retains its
+existing emulator power-off method. A stop-only Q35 launch explicitly disables
+reset, preserving its host lifecycle policy even when firmware advertises it.
+No `_S5` byte-pattern search or speculative hardware port fallback is used.
+
+MCP bridge 0.11.0 adds `hw_power` with boot-pinned request IDs and separate
+request/status/cancel/commit operations. `hw_doctor` returns the independent
+power capabilities and reasons. Uncertain mutations are not replayed to obtain
+an answer; observe the existing ID. Request descriptions belong to that ID,
+including historical cancelled operations. Client tool discovery needs a reload
+to expose newly added tool names; the standalone server CLI works immediately.
+
+Validation includes actual parser tests for malformed/truncated firmware tables,
+unsupported GAS, region lifetime and MADT bounds; mocked exact I/O dispatch;
+no write after failed sync; manual-ready shutdown; reset-only capability; boot
+identity rejection and uncertain-delivery recovery. Four native power/ACPI tests
+and 119 Python hardware/VM/job/UI/lifecycle contracts pass. End-to-end stdio MCP tests boot
+private copies of the offline image; QMP is used only for setup/evidence/cleanup,
+not to trigger the guest reset. See `scripts/test_hardware_power.py`.
+
+Physical reset and soft-off acceptance remain separate. The stick and scanner
+remain pinned to the already validated offline payload until a new physical
+copy is performed. Preserve that exact ELF; do not silently replace it when
+building later power kernels.
+
+
+Final power/launcher acceptance is recorded in
+`build/hardware/hardware-power-v4-20261030/result.json`. Its first case launches
+Mousepad using the installed catalog reference through `hw_launch`, observes its
+real window, and lets the shutdown coordinator close it. The other cases verify
+firmware reset without an emulator power opt-in and preserved Q35 stop-only
+policy plus explicit emulator power-off. These cases passed through the actual
+stdio MCP server. The frozen upgrade bundle is
+`build/hardware/offline-power-20261030/probe/payload`; it is prepared on the host,
+not yet copied to the powered-off stick. Scanner pinning stays unchanged until
+that transfer.
+
+For the next Ethernet control, cold-start the adapter on the Dell: disconnect
+it fully, connect it before boot, then look for the finite IP banner. The host
+comparison changed an already initialized adapter from vendor configuration 1
+to ECM configuration 2; cold-start behavior remains unmeasured. If no IP appears,
+capture configuration/notification/TX/RX evidence before trying vendor register
+changes. This is a test hypothesis, not a claim that cold startup fixes receive.

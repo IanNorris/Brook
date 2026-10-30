@@ -290,6 +290,7 @@ add_executable(kernel
     src/procfs_vfs.cpp
     src/net.cpp
     src/shutdown.cpp
+    src/platform_power.cpp
     src/lifecycle_channel.cpp
     src/debug_epoch.cpp
     src/debug_hardware.cpp

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "acpi_tables.h"
 
 // ACPI subsystem — parses RSDP → XSDT/RSDT → MADT without external libraries.
 //
@@ -30,13 +31,16 @@ struct MadtInfo
 // Initialise the ACPI subsystem from the RSDP physical address.
 // Locates and parses the MADT; stores results in an internal structure.
 // Returns true on success, false if RSDP is null or tables are corrupt.
-bool AcpiInit(uint64_t rsdpPhysical);
+struct MemoryDescriptor;
+bool AcpiInit(uint64_t rsdpPhysical,const MemoryDescriptor* memoryMap,uint32_t memoryMapCount);
+// Frozen descriptor only; discovery never writes hardware registers.
+const AcpiResetInfo& AcpiGetResetInfo();
 
 // Return parsed MADT information.  Valid only after AcpiInit() returns true.
 const MadtInfo& AcpiGetMadt();
 
-// Find a table by its 4-character signature (e.g. "HPET", "FADT").
-// Returns the physical address of the table header, or 0 if not found.
+// Find a table by its 4-character signature (e.g. "HPET", "FACP").
+// Returns the physical address of the table header, or 0 if not found/invalid. Tables have bounded lengths and checked checksums.
 uint64_t AcpiFindTable(const char* signature);
 
 } // namespace brook

@@ -1,47 +1,12 @@
 #include "acpi.h"
+#include "acpi_tables.h"
+#include "boot_protocol/boot_protocol.h"
 #include "serial.h"
 
 namespace brook {
-
-// ---------------------------------------------------------------------------
-// ACPI table header (common to all SDTs)
-// ---------------------------------------------------------------------------
-
-struct AcpiTableHeader
-{
-    char     signature[4];
-    uint32_t length;
-    uint8_t  revision;
-    uint8_t  checksum;
-    char     oemId[6];
-    char     oemTableId[8];
-    uint32_t oemRevision;
-    uint32_t creatorId;
-    uint32_t creatorRevision;
-} __attribute__((packed));
-
-// RSDP (Root System Description Pointer) — ACPI 2.0 format
-struct Rsdp
-{
-    char     signature[8];   // "RSD PTR "
-    uint8_t  checksum;       // covers first 20 bytes
-    char     oemId[6];
-    uint8_t  revision;       // 0 = ACPI 1.0, 2 = ACPI 2.0+
-    uint32_t rsdtAddress;    // physical address of RSDT (32-bit)
-    // ACPI 2.0 extension:
-    uint32_t length;
-    uint64_t xsdtAddress;    // physical address of XSDT (64-bit)
-    uint8_t  extChecksum;    // covers full structure
-    uint8_t  reserved[3];
-} __attribute__((packed));
-
-// XSDT — array of 64-bit table pointers after the header
-// RSDT — array of 32-bit table pointers after the header
-
-// MADT (Multiple APIC Description Table)
 struct MadtHeader
 {
-    AcpiTableHeader header;
+    AcpiSdtHeader header;
     uint32_t        localApicAddress;  // default LAPIC physical address
     uint32_t        flags;             // bit 0: legacy 8259 PICs installed
 } __attribute__((packed));
@@ -81,200 +46,95 @@ struct MadtLapicOverride
     uint64_t        lapicAddress;
 } __attribute__((packed));
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
 
-static MadtInfo  g_madt  = {};
-static bool      g_ready = false;
-
-// Physical address of XSDT (preferred) or RSDT.
-static uint64_t  g_sdtPhysical   = 0;
-static bool      g_useXsdt       = false;
-
-// ---------------------------------------------------------------------------
-// Checksum helpers
-// ---------------------------------------------------------------------------
-
-static bool VerifyChecksum(const void* data, uint32_t length)
+static MadtInfo g_madt{};
+static AcpiResetInfo g_reset{};
+static AcpiTableReader g_tables;
+struct FirmwareRegion {uint64_t begin,end;};
+static FirmwareRegion g_regions[512]{};
+static uint32_t g_regionCount=0;
+// The bootloader's identity map is bounded to 128 GiB. Firmware-table reads
+// additionally require reserved/ACPI memory from its captured memory map.
+static constexpr uint64_t IdentityLimit=128ULL*1024*1024*1024;
+static bool ReadFirmware(void*,uint64_t address,void* out,uint32_t bytes)
 {
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
-    uint8_t sum = 0;
-    for (uint32_t i = 0; i < length; i++) sum += p[i];
-    return sum == 0;
+    if(!out || !bytes || address>=IdentityLimit || bytes>IdentityLimit-address)return false;
+    const uint64_t end=address+bytes;uint64_t cursor=address;
+    while(cursor<end) {
+        uint64_t next=cursor;
+        for(uint32_t i=0;i<g_regionCount;++i)
+            if(cursor>=g_regions[i].begin && cursor<g_regions[i].end && g_regions[i].end>next)next=g_regions[i].end;
+        if(next==cursor)return false;
+        cursor=next<end?next:end;
+    }
+    __builtin_memcpy(out,reinterpret_cast<const void*>(address),bytes);return true;
 }
-
-static bool SigMatch(const char* a, const char* b, int n)
+static bool CaptureFirmwareRegions(const MemoryDescriptor* map,uint32_t count)
 {
-    for (int i = 0; i < n; i++)
-        if (a[i] != b[i]) return false;
-    return true;
+    g_regionCount=0;
+    if(!map || !count || count>4096)return false;
+    for(uint32_t i=0;i<count;++i) {
+        const auto& entry=map[i];
+        if(entry.type!=MemoryType::Reserved && entry.type!=MemoryType::AcpiReclaimable && entry.type!=MemoryType::AcpiNvs)continue;
+        if(entry.pageCount>~uint64_t{0}/4096)return false;
+        const uint64_t bytes=entry.pageCount*4096;
+        if(bytes>~uint64_t{0}-entry.physicalStart)return false;
+        if(!bytes || entry.physicalStart>=IdentityLimit)continue;
+        if(g_regionCount==sizeof(g_regions)/sizeof(g_regions[0]))return false;
+        const uint64_t end=entry.physicalStart+bytes;
+        g_regions[g_regionCount++]={entry.physicalStart,end<IdentityLimit?end:IdentityLimit};
+    }
+    return g_regionCount!=0;
 }
-
-// ---------------------------------------------------------------------------
-// MADT parser
-// ---------------------------------------------------------------------------
-
-static void ParseMadt(uint64_t madtPhys)
+static bool ParseMadt(uint64_t physical,const AcpiSdtHeader& header)
 {
-    const MadtHeader* madt = reinterpret_cast<const MadtHeader*>(madtPhys);
-
-    // Set LAPIC address from MADT header (may be overridden by type-5 entry).
-    g_madt.localApicPhysical = madt->localApicAddress;
-    g_madt.ioApicPhysical    = 0;
-    g_madt.ioApicGsiBase     = 0;
-    g_madt.processorCount    = 0;
-
-    const uint8_t* entry = reinterpret_cast<const uint8_t*>(madt) + sizeof(MadtHeader);
-    const uint8_t* end   = reinterpret_cast<const uint8_t*>(madt) + madt->header.length;
-
-    while (entry < end)
-    {
-        const MadtEntryHeader* hdr = reinterpret_cast<const MadtEntryHeader*>(entry);
-        if (hdr->length < 2) break;  // sanity guard
-
-        if (hdr->type == MADT_TYPE_LAPIC)
-        {
-            const MadtLapicEntry* lapic = reinterpret_cast<const MadtLapicEntry*>(entry);
-            if ((lapic->flags & 1) && g_madt.processorCount < ACPI_MAX_PROCESSORS)
-            {
-                uint32_t i = g_madt.processorCount++;
-                g_madt.apicIds[i]      = lapic->apicId;
-                g_madt.processorIds[i] = lapic->processorId;
+    if(header.length<sizeof(MadtHeader))return false;
+    // Find() checked the complete physical span and checksum before returning.
+    const auto* madt=reinterpret_cast<const MadtHeader*>(physical);
+    g_madt.localApicPhysical=madt->localApicAddress;
+    const uint8_t* entry=reinterpret_cast<const uint8_t*>(madt)+sizeof(MadtHeader);
+    const uint8_t* end=reinterpret_cast<const uint8_t*>(madt)+header.length;
+    while(entry<end) {
+        if(uint64_t(end-entry)<sizeof(MadtEntryHeader))return false;
+        const auto* item=reinterpret_cast<const MadtEntryHeader*>(entry);
+        if(item->length<sizeof(MadtEntryHeader) || item->length>uint64_t(end-entry))return false;
+        if(item->type==MADT_TYPE_LAPIC) {
+            if(item->length<sizeof(MadtLapicEntry))return false;
+            const auto* cpu=reinterpret_cast<const MadtLapicEntry*>(item);
+            if((cpu->flags&1) && g_madt.processorCount<ACPI_MAX_PROCESSORS) {
+                const auto i=g_madt.processorCount++;g_madt.apicIds[i]=cpu->apicId;g_madt.processorIds[i]=cpu->processorId;
             }
+        } else if(item->type==MADT_TYPE_IOAPIC) {
+            if(item->length<sizeof(MadtIoApicEntry))return false;
+            if(!g_madt.ioApicPhysical) {
+                const auto* io=reinterpret_cast<const MadtIoApicEntry*>(item);
+                g_madt.ioApicPhysical=io->ioApicAddress;g_madt.ioApicGsiBase=io->gsiBase;
+            }
+        } else if(item->type==MADT_TYPE_LAPIC_OVERRIDE) {
+            if(item->length<sizeof(MadtLapicOverride))return false;
+            g_madt.localApicPhysical=reinterpret_cast<const MadtLapicOverride*>(item)->lapicAddress;
         }
-        else if (hdr->type == MADT_TYPE_IOAPIC && g_madt.ioApicPhysical == 0)
-        {
-            const MadtIoApicEntry* ioapic = reinterpret_cast<const MadtIoApicEntry*>(entry);
-            g_madt.ioApicPhysical = ioapic->ioApicAddress;
-            g_madt.ioApicGsiBase  = ioapic->gsiBase;
-        }
-        else if (hdr->type == MADT_TYPE_LAPIC_OVERRIDE)
-        {
-            const MadtLapicOverride* ovr = reinterpret_cast<const MadtLapicOverride*>(entry);
-            g_madt.localApicPhysical = ovr->lapicAddress;
-        }
-
-        entry += hdr->length;
+        entry+=item->length;
     }
-
-    SerialPrintf("ACPI: MADT — %u processor(s), LAPIC @ 0x%p, IOAPIC @ 0x%p\n",
-                 g_madt.processorCount,
-                 reinterpret_cast<void*>(g_madt.localApicPhysical),
-                 reinterpret_cast<void*>(g_madt.ioApicPhysical));
-}
-
-// ---------------------------------------------------------------------------
-// SDT enumeration
-// ---------------------------------------------------------------------------
-
-// Get the number of table entries in the XSDT or RSDT.
-static uint32_t SdtEntryCount()
-{
-    const AcpiTableHeader* hdr = reinterpret_cast<const AcpiTableHeader*>(g_sdtPhysical);
-    uint32_t entryBytes = hdr->length - sizeof(AcpiTableHeader);
-    return g_useXsdt ? (entryBytes / 8) : (entryBytes / 4);
-}
-
-// Get the physical address of SDT entry i.
-static uint64_t SdtEntryPhys(uint32_t i)
-{
-    const uint8_t* base = reinterpret_cast<const uint8_t*>(g_sdtPhysical)
-                        + sizeof(AcpiTableHeader);
-    if (g_useXsdt)
-    {
-        uint64_t addr;
-        __builtin_memcpy(&addr, base + i * 8, 8);
-        return addr;
-    }
-    else
-    {
-        uint32_t addr;
-        __builtin_memcpy(&addr, base + i * 4, 4);
-        return static_cast<uint64_t>(addr);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-bool AcpiInit(uint64_t rsdpPhysical)
-{
-    if (rsdpPhysical == 0)
-    {
-        SerialPuts("ACPI: no RSDP in boot protocol\n");
-        return false;
-    }
-
-    const Rsdp* rsdp = reinterpret_cast<const Rsdp*>(rsdpPhysical);
-
-    // Verify RSDP signature.
-    if (!SigMatch(rsdp->signature, "RSD PTR ", 8))
-    {
-        SerialPuts("ACPI: RSDP signature invalid\n");
-        return false;
-    }
-
-    // Prefer XSDT (ACPI 2.0+) over RSDT.
-    if (rsdp->revision >= 2 && rsdp->xsdtAddress != 0)
-    {
-        g_sdtPhysical = rsdp->xsdtAddress;
-        g_useXsdt     = true;
-        SerialPrintf("ACPI: XSDT @ 0x%p\n",
-                     reinterpret_cast<void*>(g_sdtPhysical));
-    }
-    else
-    {
-        g_sdtPhysical = static_cast<uint64_t>(rsdp->rsdtAddress);
-        g_useXsdt     = false;
-        SerialPrintf("ACPI: RSDT @ 0x%p\n",
-                     reinterpret_cast<void*>(g_sdtPhysical));
-    }
-
-    // Validate SDT header checksum.
-    const AcpiTableHeader* sdtHdr =
-        reinterpret_cast<const AcpiTableHeader*>(g_sdtPhysical);
-    if (!VerifyChecksum(sdtHdr, sdtHdr->length))
-    {
-        SerialPuts("ACPI: SDT checksum failed\n");
-        return false;
-    }
-
-    // Find and parse the MADT.
-    uint64_t madtPhys = AcpiFindTable("APIC");  // MADT signature is "APIC"
-    if (madtPhys == 0)
-    {
-        SerialPuts("ACPI: MADT (APIC table) not found\n");
-        return false;
-    }
-
-    ParseMadt(madtPhys);
-    g_ready = true;
+    SerialPrintf("ACPI: MADT — %u processor(s), LAPIC @ 0x%p, IOAPIC @ 0x%p\n",g_madt.processorCount,
+        reinterpret_cast<void*>(g_madt.localApicPhysical),reinterpret_cast<void*>(g_madt.ioApicPhysical));
     return true;
 }
-
-const MadtInfo& AcpiGetMadt()
+bool AcpiInit(uint64_t rsdp,const MemoryDescriptor* map,uint32_t count)
 {
-    return g_madt;
-}
-
-uint64_t AcpiFindTable(const char* signature)
-{
-    if (g_sdtPhysical == 0) return 0;
-
-    uint32_t count = SdtEntryCount();
-    for (uint32_t i = 0; i < count; i++)
-    {
-        uint64_t tablePhys = SdtEntryPhys(i);
-        if (tablePhys == 0) continue;
-
-        const AcpiTableHeader* hdr =
-            reinterpret_cast<const AcpiTableHeader*>(tablePhys);
-        if (SigMatch(hdr->signature, signature, 4))
-            return tablePhys;
+    g_madt={};g_reset={};g_tables={};
+    if(!CaptureFirmwareRegions(map,count) || !g_tables.Init(ReadFirmware,nullptr,rsdp)) {
+        SerialPuts("ACPI: invalid/unreadable RSDP or root table\n");return false;
     }
-    return 0;
+    g_reset=g_tables.Reset();
+    SerialPrintf("ACPI: reset available=%u port=0x%x value=0x%x reason=%s\n",g_reset.available?1u:0u,g_reset.port,g_reset.value,g_reset.reason);
+    AcpiSdtHeader header{};const auto madt=g_tables.Find("APIC",&header);
+    if(!madt || !ParseMadt(madt,header)) {
+        g_madt={};SerialPuts("ACPI: MADT missing or malformed\n");return false;
+    }
+    return true;
 }
-
+const MadtInfo& AcpiGetMadt(){return g_madt;}
+const AcpiResetInfo& AcpiGetResetInfo(){return g_reset;}
+uint64_t AcpiFindTable(const char* signature){return g_tables.Find(signature);}
 } // namespace brook

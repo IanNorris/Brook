@@ -37,8 +37,9 @@ static brook::MemoryType ConvertMemoryType(UINT32 uefiType)
         case EfiConventionalMemory:
             return brook::MemoryType::Free;
         case EfiReservedMemoryType:
-        case EfiUnusableMemory:
             return brook::MemoryType::Reserved;
+        case EfiUnusableMemory:
+            return brook::MemoryType::Unusable;
         case EfiACPIReclaimMemory:
             return brook::MemoryType::AcpiReclaimable;
         case EfiACPIMemoryNVS:

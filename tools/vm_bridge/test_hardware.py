@@ -11,7 +11,7 @@ from hardware import Hardware,HardwareBootChanged
 class Endpoint:
     def __init__(self):
         self.listener=socket.socket();self.listener.bind(('127.0.0.1',0));self.listener.listen();self.listener.settimeout(.1)
-        self.port=self.listener.getsockname()[1];self.epoch='0'*32;self.stop=False;self.effects=0;self.commands=[]
+        self.port=self.listener.getsockname()[1];self.epoch='0'*32;self.stop=False;self.effects=0;self.commands=[];self.power_requests={};self.power_effects=0;self.power_drop=False
         self.thread=threading.Thread(target=self.serve);self.thread.start()
     def serve(self):
         while not self.stop:
@@ -34,10 +34,19 @@ class Endpoint:
                         if command.startswith('bridge epoch init '):
                             if self.epoch=='0'*32:self.epoch=command.split()[-1]
                             result={'boot_id':self.epoch}
-                        elif command=='bridge hardware caps':result={'hardware_api':1,'boot_guard':True,'logs_api':1,'boot_id':self.epoch}
+                        elif command=='bridge hardware caps':result={'hardware_api':1,'boot_guard':True,'logs_api':1,'boot_id':self.epoch,'power_api':1,'power':{'graceful_quiescence':True,'reset':True,'power_off':False}}
                         elif command=='bridge job caps':result={'job_api':2}
                         elif command=='bridge ui caps':result={'ui_api':1,'apps_api':1,'boot_id':self.epoch}
                         elif command=='bridge stats':result={'process_count':7}
+                        elif command.startswith('bridge hardware power '):
+                            _,_,_,request,verb,boot=command.split()
+                            if boot!=self.epoch:result={'boot_error':'Guest boot changed'}
+                            else:
+                                if verb in ('shutdown','restart') and request not in self.power_requests:
+                                    self.power_requests[request]='ready';self.power_effects+=1
+                                if self.power_drop and verb in ('shutdown','restart'):
+                                    self.power_drop=False;break
+                                result={'power_api':1,'request_id':request,'operation':verb,'state':self.power_requests.get(request,'missing'),'error':-95 if verb=='commit' else 0}
                         elif command.startswith('bridge hardware logs '):result={'logs_api':1,'lines':['hello "world"'],'next_cursor':2,'dropped_lines':1,'more':False}
                         elif command=='effect':self.effects+=1;break
                         else:result={'reply':command}
@@ -88,6 +97,31 @@ class HardwareTests(unittest.TestCase):
         session=self.attach();data=self.hardware.load_session(session);command='bridge job put '+'a'*32+' 0 '+'00'*64+' '+data['guest_boot_id']
         self.assertEqual(self.hardware.guarded(data,command),command)
         self.assertEqual(self.hardware.guarded(data,'bridge stats'),'bridge guard '+data['guest_boot_id']+' bridge stats')
+    def test_hardware_power_status_and_manual_commit(self):
+        session=self.attach();request='1'*32
+        caps=self.hardware.doctor(session)['capabilities'];self.assertTrue(caps['hardware_power']);self.assertFalse(caps['power']['power_off'])
+        self.assertEqual(self.hardware.power(session,request,'shutdown')['state'],'ready')
+        self.assertEqual(self.hardware.power(session,request,'status')['state'],'ready')
+        self.assertEqual(self.hardware.power(session,request,'commit')['error'],-95)
+        self.assertEqual(self.endpoint.power_effects,1)
+    def test_hardware_power_unknown_delivery_is_recovered_without_replay(self):
+        session=self.attach();request='2'*32;self.endpoint.power_drop=True
+        with self.assertRaises(TimeoutError):self.hardware.power(session,request,'shutdown')
+        self.assertEqual(self.endpoint.power_effects,1)
+        self.assertEqual(self.hardware.power(session,request,'status')['state'],'ready')
+        self.assertEqual(self.endpoint.power_effects,1)
+        self.endpoint.epoch='b'*32
+        with self.assertRaises(HardwareBootChanged):self.hardware.power(session,request,'commit')
+        self.assertEqual(self.endpoint.power_effects,1)
+    def test_hardware_power_validation_and_response_identity(self):
+        session=self.attach();count=len(self.endpoint.commands)
+        for request,operation in [('short','shutdown'),('1'*32,'invalid'),('1'*32,None)]:
+            with self.assertRaises(ValueError):self.hardware.power(session,request,operation)
+        self.assertEqual(len(self.endpoint.commands),count)
+        from jobs import GuestJobError
+        with patch.object(self.hardware,'guest',return_value={'reply':'unsupported'}),self.assertRaises(GuestJobError):
+            self.hardware.power(session,'1'*32,'shutdown')
+
     def test_session_symlinks_rejected(self):
         session=self.attach();file=Path(self.tmp.name)/session/'session.json';backup=file.with_suffix('.saved');file.rename(backup);file.symlink_to(backup)
         with self.assertRaises(ValueError):self.hardware.load_session(session)

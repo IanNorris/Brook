@@ -107,7 +107,8 @@ class Hardware:
             with self.session_lock(session) as data:
                 hardware,jobs,ui=self.guest_batch(data,['bridge hardware caps','bridge job caps','bridge ui caps'],5)
             caps.update(diagnostics=True,logs=hardware.get('logs_api')==1,stats=True,
-                command_jobs=jobs.get('job_api')==2,semantic_windows=ui.get('ui_api')==1,app_catalog=ui.get('apps_api')==1)
+                hardware_power=hardware.get('power_api')==1,power=hardware.get('power',{}),
+                command_jobs=jobs.get('job_api')==2,semantic_windows=ui.get('ui_api')==1,semantic_launch=ui.get('launch_api')==1,app_catalog=ui.get('apps_api')==1)
             result.update(reachable=True,identity_matches=True,guest=hardware,jobs=jobs,ui=ui)
         except HardwareBootChanged as error:
             result.update(reachable=True,identity_matches=False,error=str(error),note='Attach explicitly again to target the new guest boot.')
@@ -117,6 +118,17 @@ class Hardware:
 
     def command(self,session,command,**_):
         with self.session_lock(session) as data:return self.guest(data,command)
+
+    def power(self,session,request_id,operation,**_):
+        validate_id(request_id)
+        verbs={'shutdown':'shutdown','restart':'restart','status':'power_status','cancel':'cancel','commit':'commit'}
+        if not isinstance(operation,str) or operation not in verbs:raise ValueError('Expected shutdown, restart, status, cancel or commit')
+        with self.session_lock(session) as data:
+            result=self.guest(data,f"bridge hardware power {request_id} {verbs[operation]} {data['guest_boot_id']}")
+        if 'power_error' in result:raise GuestJobError(result['power_error'])
+        if result.get('power_api')!=1 or result.get('request_id')!=request_id or result.get('operation')!=verbs[operation]:
+            raise GuestJobError('Missing or mismatched power response; inspect this request ID before considering another mutation')
+        return {'session':session,'guest_boot_id':data['guest_boot_id'],**result}
 
     def stats(self,session,audio_details=False,**_):
         commands=['bridge stats']+(['audio stats'] if audio_details else [])
@@ -139,6 +151,8 @@ class Hardware:
 
     def windows(self,session,**_):return self.ui.windows(session)
     def apps(self,session,**_):return self.ui.apps(session)
+    def launch(self,session,app,request_id,wait_for='window',wait_s=2,_cancel=None,**_):
+        return self.ui.launch(session,app,request_id,wait_for,wait_s,_cancel)
 
     def window(self,session,window,action,request_id,restore_target=None,wait_for='applied',wait_s=2,_cancel=None,**_):
         return self.ui.submit(session,window,action,request_id,restore_target,wait_for,wait_s,_cancel)

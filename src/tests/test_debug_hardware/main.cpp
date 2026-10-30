@@ -1,9 +1,11 @@
 #include "debug_hardware.h"
 #include "bridge_reply.h"
+#include "shutdown.h"
 #include <cassert>
 #include <cstring>
 #include <string>
 std::string reply,dispatched;
+unsigned powerCalls=0;std::string powerVerb;
 namespace brook {
 void DebugChannelSend(const char* s){reply+=s;}
 void DebugEpochCopy(char out[33]){std::memset(out,'a',32);out[32]=0;}
@@ -12,6 +14,9 @@ void DebugHandleCommand(const char* s,uint32_t n){assert(n==std::strlen(s));disp
 const char* BuildGitHash(){return "test+build";}
 const char* BuildDate(){return "now";}
 bool AudioAvailable(){return false;}
+ShutdownPowerCapabilities ShutdownGetPowerCapabilities(){return {true,true,false,"acpi-io8","manual","firmware","S5 unavailable"};}
+const char* ShutdownRequestStatus(const char*){return "Safe to power off manually";}
+void ShutdownCommand(const char*,const char* verb,char state[24],int* error){++powerCalls;powerVerb=verb;std::strcpy(state,"ready");*error=std::strcmp(verb,"commit")?0:-95;}
 uint32_t SmpGetCpuCount(){return 4;}
 int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t limit,uint32_t stride,uint32_t* total,uint32_t* dropped){
     *total=2;*dropped=0;if(*cursor>2)return -22;
@@ -25,6 +30,13 @@ int main(){
     assert(!handle("bridge unrelated"));
     assert(handle("bridge hardware caps") && reply.find("\"hardware_api\":1")!=std::string::npos);
     assert(reply.find("\"panic_transport\":false")!=std::string::npos);
+    assert(reply.find("\"power_api\":1")!=std::string::npos && reply.find("\"power_off\":false")!=std::string::npos);
+    const std::string request(32,'1'),boot(32,'a');
+    assert(handle("bridge hardware power "+request+" shutdown "+boot) && powerCalls==1 && powerVerb=="shutdown");
+    assert(handle("bridge hardware power "+request+" commit "+boot) && powerCalls==2 && reply.find("\"error\":-95")!=std::string::npos);
+    for(const auto& bad : {"bridge hardware power short shutdown "+boot,"bridge hardware power "+request+" exec "+boot,"bridge hardware power "+request+" restart "+std::string(32,'b'),"bridge hardware power "+request+" restart "+boot+" more"}){
+        assert(handle(bad) && powerCalls==2);
+    }
     assert(handle("bridge guard "+std::string(32,'a')+" mem") && dispatched=="mem");
     for(const auto& command:{std::string("bridge guard short"),"bridge guard "+std::string(32,'b')+" mem","bridge guard "+std::string(32,'a')+" @1 mem","bridge guard "+std::string(32,'a')+" bridge guard "+std::string(32,'a')+" mem"}){
         assert(handle(command));assert(dispatched.empty());assert(reply.find("boot_error")!=std::string::npos);
