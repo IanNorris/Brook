@@ -3,6 +3,7 @@
 #include "shutdown.h"
 #include "fs/compressed_vfs.h"
 #include "vfs.h"
+#include "pci.h"
 #include <cassert>
 #include <cstring>
 #include <string>
@@ -33,6 +34,14 @@ ShutdownPowerCapabilities ShutdownGetPowerCapabilities(){return {true,true,false
 const char* ShutdownRequestStatus(const char*){return "Safe to power off manually";}
 void ShutdownCommand(const char*,const char* verb,char state[24],int* error){++powerCalls;powerVerb=verb;std::strcpy(state,"ready");*error=std::strcmp(verb,"commit")?0:-95;}
 uint32_t SmpGetCpuCount(){return 4;}
+uint32_t PciBootInventoryCount(){return 2;}
+uint32_t PciBootInventorySeen(){return 2;}
+bool PciBootInventoryRead(uint32_t index,PciBootEntry* out){
+    assert(out && index<2);*out={};out->device.bus=0;out->device.dev=index+2;
+    out->device.vendorId=0x8086;out->device.deviceId=0x1616;
+    out->device.classCode=3;out->device.bar[0]=0xf0000004;
+    out->command=7;return true;
+}
 int DebugOverlayReadRange(uint32_t* cursor,char* out,uint32_t limit,uint32_t stride,uint32_t* total,uint32_t* dropped){
     *total=2;*dropped=0;if(*cursor>2)return -22;
     unsigned count=2-*cursor;if(count>limit)count=limit;
@@ -45,6 +54,18 @@ int main(){
     assert(!handle("bridge unrelated"));
     assert(handle("bridge hardware caps") && reply.find("\"hardware_api\":1")!=std::string::npos);
     assert(reply.find("\"panic_transport\":false")!=std::string::npos);
+    assert(reply.find("\"pci_inventory_api\":1")!=std::string::npos);
+    assert(handle("bridge hardware pci 0 1"));
+    assert(reply.find("\"source\":\"boot_snapshot\"")!=std::string::npos);
+    assert(reply.find("\"vendor_id\":32902")!=std::string::npos);
+    assert(reply.find("\"raw_bars\":[4026531844,0,0,0,0,0]")!=std::string::npos);
+    assert(reply.find("\"next_cursor\":1")!=std::string::npos && reply.find("\"more\":true")!=std::string::npos);
+    assert(handle("bridge hardware pci 1 16") && reply.find("\"device\":3")!=std::string::npos && reply.find("\"more\":false")!=std::string::npos);
+    assert(handle("bridge hardware pci 2 16") && reply.find("\"devices\":[]")!=std::string::npos);
+    for(const auto* bad:{"0 0","0 17","3 1","4294967296 1","0 1 more","0 -1"}){
+        assert(handle(std::string("bridge hardware pci ")+bad));assert(reply.find("pci_error")!=std::string::npos);
+    }
+    assert(handle("bridge hardware caps"));
     assert(reply.find("\"power_api\":1")!=std::string::npos && reply.find("\"power_off\":false")!=std::string::npos);
     assert(reply.find("\"bulk_helper_api\":0")!=std::string::npos && !brook::openNodes);
     brook::binaryPresent=true;

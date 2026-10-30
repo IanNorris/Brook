@@ -1316,3 +1316,42 @@ read-only PCI/register inventory. Do not infer a working DPMS capability from
 framebuffer blanking or claim complete panel/link shutdown from backlight-only
 control. Full ACPI sleep and speculative display-engine reinitialization are
 out of scope for this addition.
+
+### Read-only boot PCI inventory (2026-10-30)
+
+`bridge hardware pci CURSOR COUNT` exposes the immutable initial PCI scan in
+pages of1..16 entries. It reports BDF, PCI IDs, class/revision/header, command,
+subsystem IDs for type0 headers, and the six raw configuration BAR dwords.
+For bridge/non-type0 headers, dwords beyond the header-defined BARs are not
+resources and must not be interpreted as such. The256-entry bound reports both
+stored and seen counts plus truncation. No runtime config-port access, BAR
+sizing writes or driver ABI changes are introduced by the debug command.
+
+Host parser/pagination regressions pass. The frozen candidate is
+`build/hardware/display-inventory-v1-20261030`; private QEMU acceptance is in
+`display-inventory-qemu-20261030/result.json` with six devices cross-checked
+against the serial scan, bounded pagination/invalid-limit checks and successful
+cooperative shutdown. Physical deployment/identification remains a separate
+gate. This is preparation for display/backlight controls, audio and read-only
+SSD inventory; it does not implement any display power transition.
+
+Physical inventory deployment passed: generation7/slotA, payload
+`desktop-ram-apps-856e39e666704004b1f8cac9f39a4b77`. Generation6/slotB remains
+accepted fallback; root recovery and APPS.BRK are unchanged. Evidence:
+`build/hardware/display-inventory-native-update-20261030/receipt.json`,
+`pci.json`, `doctor.json`. Session `24bd2e94a5d34326954306c81554f127`, boot
+`e10cc6bbc79c437692c0b537412a9771`. The scanner is pinned to the exact inventory
+ELF by `brook-panic-receiver-display-inventory-20261030.service` (HTTPS200).
+
+Actual relevant PCI functions (no controller reconfiguration):
+- GPU00:02.0 Intel8086:1616 revision09, subsystem1028:0665; memory decode
+  already enabled, BAR0 raw `f6000004,00000000` (MMIO base0xf6000000).
+- Audio00:03.0 Intel8086:160c and00:1b.0 Intel8086:9ca0, command0 at boot;
+  this PCI observation does not inventory ACPI-enumerated SST/I2C devices or
+  establish the internal speaker codec routing.
+- SATA00:1f.2 Intel8086:9c83, class01:06/prog-if01, BAR5 0xf7422000;
+  no disk sectors or partition tables were read/written by this inventory.
+
+Next display gate: read only the documented Broadwell/LPT backlight register
+state and establish whether firmware uses CPU PWM, PCH override or another
+route before enabling any manual off/on operation. Keep system sleep deferred.

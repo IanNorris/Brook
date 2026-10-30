@@ -4,6 +4,19 @@
 
 namespace brook {
 
+static PciBootEntry g_bootInventory[256]{};
+static uint32_t g_bootInventoryCount = 0, g_bootInventorySeen = 0;
+static bool g_bootInventoryCaptured = false;
+
+uint32_t PciBootInventoryCount() { return g_bootInventoryCount; }
+uint32_t PciBootInventorySeen() { return g_bootInventorySeen; }
+bool PciBootInventoryRead(uint32_t index, PciBootEntry* out)
+{
+    if (!out || index >= g_bootInventoryCount) return false;
+    *out = g_bootInventory[index];
+    return true;
+}
+
 // ---- PCI config space via CF8/CFC ----
 
 static constexpr uint16_t PCI_CONFIG_ADDR = 0xCF8;
@@ -164,6 +177,20 @@ void PciScanPrint()
                 uint32_t id = PciConfigRead32(bus, dev, fn, 0x00);
                 if ((id & 0xFFFF) == 0xFFFF) continue;
                 uint32_t cls = PciConfigRead32(bus, dev, fn, 0x08);
+                if (!g_bootInventoryCaptured) {
+                    ++g_bootInventorySeen;
+                    if (g_bootInventoryCount < sizeof(g_bootInventory)/sizeof(g_bootInventory[0])) {
+                        auto& entry = g_bootInventory[g_bootInventoryCount++];
+                        ReadDevice(bus, dev, fn, entry.device);
+                        entry.command = PciConfigRead16(bus, dev, fn, 0x04);
+                        entry.revision = static_cast<uint8_t>(cls);
+                        entry.headerType = PciConfigRead8(bus, dev, fn, 0x0e);
+                        if ((entry.headerType & 0x7f) == 0) {
+                            entry.subsystemVendor = PciConfigRead16(bus, dev, fn, 0x2c);
+                            entry.subsystemDevice = PciConfigRead16(bus, dev, fn, 0x2e);
+                        }
+                    }
+                }
                 SerialPrintf("  %02x:%02x.%x  %04x:%04x  class %02x:%02x\n",
                              bus, dev, fn,
                              static_cast<unsigned>(id & 0xFFFF),
@@ -173,6 +200,7 @@ void PciScanPrint()
             }
         }
     }
+    g_bootInventoryCaptured = true;
 }
 
 } // namespace brook

@@ -64,5 +64,18 @@ extern "C" void PciEnableMemSpace(const PciDevice& dev);
 // Print all devices found during a scan to serial (useful for debugging).
 extern "C" void PciScanPrint();
 
+// Immutable boot inventory, captured by the initial PciScanPrint before driver
+// probing. Debug readers never touch config ports or size/reprogram BARs.
+// Kept separate from PciDevice so loadable-driver ABI stays unchanged.
+struct PciBootEntry {
+    PciDevice device;
+    uint16_t command;
+    uint16_t subsystemVendor, subsystemDevice;
+    uint8_t revision, headerType;
+};
+uint32_t PciBootInventoryCount();
+uint32_t PciBootInventorySeen();
+bool PciBootInventoryRead(uint32_t index, PciBootEntry* out);
+
 } // namespace brook
 

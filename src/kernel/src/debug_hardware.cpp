@@ -10,6 +10,7 @@
 #include "string.h"
 #include "fs/compressed_vfs.h"
 #include "vfs.h"
+#include "pci.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -51,7 +52,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     if(!strcmp(command,"bridge hardware caps")){
         char boot[33];DebugEpochCopy(boot);
         Reply r;r.text("{\"hardware_api\":1,\"boot_guard\":true,\"logs_api\":1,\"boot_id\":");r.quoted(boot);
-        r.text(",\"build_id\":");r.quoted(BuildGitHash());r.text(",\"build_date\":");r.quoted(BuildDate());
+        r.text(",\"pci_inventory_api\":1,\"build_id\":");r.quoted(BuildGitHash());r.text(",\"build_date\":");r.quoted(BuildDate());
         r.text(",");r.field("logical_cpus",SmpGetCpuCount());
         r.text(",\"audio_device\":");r.text(AudioAvailable()?"true":"false");
         const auto snapshot=CompressedVfsAppSnapshotInfo();
@@ -70,6 +71,30 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         if(marker)VfsClose(marker);
         r.text(",\"completed_frame_copy_api\":1,\"bulk_helper_api\":");r.number(bulk?1:0);
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
+    }
+    constexpr char pciPrefix[]="bridge hardware pci ";
+    if(Prefix(command,pciPrefix)){
+        const char* p=command+sizeof(pciPrefix)-1;uint32_t cursor=0,limit=0;
+        const uint32_t count=PciBootInventoryCount();
+        if(!Decimal(p,cursor) || *p++!=' ' || !Decimal(p,limit) || *p || !limit || limit>16 || cursor>count){
+            DebugChannelSend("{\"pci_error\":\"Expected inventory cursor and count 1..16\"}\n");return true;
+        }
+        const uint32_t end=cursor+((count-cursor)<limit?(count-cursor):limit);
+        Reply r;r.text("{\"pci_inventory_api\":1,\"source\":\"boot_snapshot\",");r.field("total",count);
+        r.text(",");r.field("seen",PciBootInventorySeen());
+        r.text(",\"truncated\":");r.text(PciBootInventorySeen()>count?"true":"false");
+        r.text(",");r.field("next_cursor",end);r.text(",\"devices\":[");
+        for(uint32_t i=cursor;i<end;++i){
+            PciBootEntry entry{};PciBootInventoryRead(i,&entry);const auto& d=entry.device;
+            if(i!=cursor)r.text(",");r.text("{");r.field("bus",d.bus);r.text(",");r.field("device",d.dev);
+            r.text(",");r.field("function",d.fn);r.text(",");r.field("vendor_id",d.vendorId);r.text(",");r.field("device_id",d.deviceId);
+            r.text(",");r.field("class",d.classCode);r.text(",");r.field("subclass",d.subclass);r.text(",");r.field("prog_if",d.progIf);
+            r.text(",");r.field("revision",entry.revision);r.text(",");r.field("header_type",entry.headerType);
+            r.text(",");r.field("command",entry.command);r.text(",");r.field("subsystem_vendor",entry.subsystemVendor);
+            r.text(",");r.field("subsystem_device",entry.subsystemDevice);r.text(",\"raw_bars\":[");
+            for(unsigned b=0;b<6;++b){if(b)r.text(",");r.number(d.bar[b]);}r.text("]}");
+        }
+        r.text("],\"more\":");r.text(end<count?"true":"false");r.text("}\n");r.send();return true;
     }
     constexpr char powerPrefix[]="bridge hardware power ";
     if(Prefix(command,powerPrefix)){
