@@ -809,6 +809,16 @@ int VfsOpenExecutable(const char* path, Vnode** vnode, char* resolved, uint32_t 
     if (!vnode || !resolved || size<2) return -22;
     *vnode=nullptr;resolved[0]=0;
     if (!path || path[0]!='/') return -2;
+    // Retained/object-only filesystems (notably tmpfs) intentionally have no
+    // legacy pathname open callback. Use the same executable access checks as
+    // execve; do not fall back to a legacy open after a retained denial.
+    VfsPath root{};
+    const int retainedRoot=VfsPathRoot(&root);
+    if(!retainedRoot) {
+        const int error=VfsOpenExecutableAt(root,root,path,vnode,resolved,size);
+        VfsPathRelease(root);return error;
+    }
+    if(retainedRoot!=-95)return retainedRoot;
     FileMutationGuard lookup(false);
     if (int error=VfsResolvePath(path,resolved,size)) return error;
     char physicalRelative[512];

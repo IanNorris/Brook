@@ -340,6 +340,7 @@ static KMutex g_debugFrameLock{};
 static DebugFrameSnapshot g_debugFrame{};
 static uint32_t g_debugFrameNextToken;
 static uint64_t g_debugFrameDeadline;
+static uint64_t g_debugFrameOwner;
 static VirtualAddress g_debugFrameBuffer{};
 static uint64_t g_debugFramePages;
 static constexpr uint64_t DEBUG_FRAME_LEASE_MS=30000;
@@ -350,7 +351,7 @@ static void ExpireDebugFrameLocked()
         g_debugFrame={};
 }
 
-DebugFrameSnapshot CompositorRequestDebugFrame()
+DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner)
 {
     CompositorMutexGuard guard(&g_debugFrameLock);
     ExpireDebugFrameLocked();
@@ -362,27 +363,40 @@ DebugFrameSnapshot CompositorRequestDebugFrame()
         DebugFrameSnapshot failed{};failed.state=DebugFrameState::Failed;return failed;
     }
     g_debugFrame={};g_debugFrame.token=++g_debugFrameNextToken;
+    g_debugFrameOwner=owner;
     g_debugFrame.state=DebugFrameState::Pending;
     g_debugFrameDeadline=ApicTickCount()+DEBUG_FRAME_LEASE_MS;
     CompositorWake();
     return g_debugFrame;
 }
 
-DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token)
+DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token,uint64_t owner)
 {
     CompositorMutexGuard guard(&g_debugFrameLock);
     ExpireDebugFrameLocked();
-    if (!token || token!=g_debugFrame.token) {
+    if (!token || token!=g_debugFrame.token || owner!=g_debugFrameOwner) {
         DebugFrameSnapshot expired{};expired.token=token;expired.state=DebugFrameState::Expired;return expired;
     }
     return g_debugFrame;
 }
 
-bool CompositorReleaseDebugFrame(uint32_t token)
+bool CompositorReleaseDebugFrame(uint32_t token,uint64_t owner)
 {
     CompositorMutexGuard guard(&g_debugFrameLock);
-    if (!token || token!=g_debugFrame.token) return false;
+    ExpireDebugFrameLocked();
+    if (!token || token!=g_debugFrame.token || owner!=g_debugFrameOwner) return false;
     g_debugFrame={};return true;
+}
+int64_t CompositorReadDebugFrame(uint32_t token,uint64_t owner,uint64_t offset,void* destination,uint32_t bytes)
+{
+    CompositorMutexGuard guard(&g_debugFrameLock);
+    ExpireDebugFrameLocked();
+    if(!token || token!=g_debugFrame.token || owner!=g_debugFrameOwner)return -116;
+    if(g_debugFrame.state!=DebugFrameState::Ready)return -11;
+    const uint64_t length=uint64_t(g_debugFrame.width)*g_debugFrame.height*4;
+    if(!destination || bytes>65536 || offset>length || bytes>length-offset)return -22;
+    if(bytes)memcpy(destination,reinterpret_cast<const uint8_t*>(g_debugFrame.address)+offset,bytes);
+    return bytes;
 }
 
 // Sole writer: compositor, after a complete presentation. The debug command

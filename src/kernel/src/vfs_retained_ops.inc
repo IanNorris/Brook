@@ -392,7 +392,7 @@ int VfsLinkPathAt(const VfsPath& root,const VfsPath& source,
 {
     FileMutationGuard mutation;return VfsLinkObjectLocked(root,source,newStart,newText);
 }
-int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,const VfsPath& newStart,const char* newText)
+static int VfsRenameAtPolicy(const VfsPath& root,const VfsPath& oldStart,const char* oldText,const VfsPath& newStart,const char* newText,bool noReplace)
 {
     FileMutationGuard mutation;VfsOwnedWalk oldWalk,newWalk;
     if(int error=VfsWalkAtLocked(root,oldStart,oldText,oldWalk,{false,false,true}))return error;
@@ -405,6 +405,9 @@ int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
     if(int error=VfsMutationTargetLocked(oldParent,oldName,source))return error;
     if(!source.value)return -2;
     if(int error=VfsMutationTargetLocked(newParent,newName,target))return error;
+    // Lookup and mutation share FileMutationGuard: no competing VFS creator
+    // can insert a target between this check and the backend rename.
+    if(noReplace && target.value)return -17;
     VnodeStat oldStat{},newStat{};
     if(int error=VfsObjectStatLocked(source.value,&oldStat))return error;
     if(target.value)if(int error=VfsObjectStatLocked(target.value,&newStat))return error;
@@ -431,6 +434,10 @@ int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
     }
     return error;
 }
+int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,const VfsPath& newStart,const char* newText)
+{return VfsRenameAtPolicy(root,oldStart,oldText,newStart,newText,false);}
+int VfsRenameNoReplaceAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,const VfsPath& newStart,const char* newText)
+{return VfsRenameAtPolicy(root,oldStart,oldText,newStart,newText,true);}
 int VfsChmodAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode)
 {
     FileMutationGuard mutation;VfsOwnedWalk walk;

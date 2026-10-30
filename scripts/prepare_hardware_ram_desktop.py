@@ -32,11 +32,12 @@ run('cp','--reflink=auto',build/'kernel/BROOK.elf',out/'kernel.elf')
 initrd=out/'INITRD.IMG';run('cp','--reflink=auto',recovery/'payload/INITRD.IMG',initrd)
 for name in ['usb-read-only','boot-app-image']:run('mdel','-i',initrd,'::ETC/'+name)
 for name in ['xhci','sched_eevdf']:run('mcopy','-o','-i',initrd,build/'kernel/drivers'/f'{name}.mod','::DRIVERS/'+name.upper()+'.MOD')
-for name,source in [('HWSTATUS.ELF','tools/hardware_status.c'),('HWUPDATE.ELF','tools/hardware_update.c'),('HWIO.ELF','tools/hardware_storage_probe.c')]:
+for name,source in [('HWSTATUS.ELF','tools/hardware_status.c'),('HWUPDATE.ELF','tools/hardware_update.c'),('HWIO.ELF','tools/hardware_storage_probe.c'),('HWBULK.ELF','tools/hardware_bulk.c')]:
     run(os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',ROOT/source,'-o',out/name)
     run('mcopy','-o','-i',initrd,out/name,'::BOOT/'+name)
 apps=meta['files']['APPS.BRK'];payload_id='desktop-ram-apps-'+uuid.uuid4().hex
 markers={'hardware-maintenance':'RAM-resident updater enabled; application snapshot must remain immutable\n',
+    'hardware-bulk':'1\n',
     'hardware-update-key':key,'hardware-payload-id':payload_id+'\n',
     'boot-app-snapshot':f"/media/usb/APPS.BRK /nix {apps['bytes']} {apps['sha256']}\n"}
 for name,text in markers.items():

@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Binary transfer: metadata/receipts only on stdout, never file bytes/base64."""
+import argparse,json,sys
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1];sys.path[:0]=[str(ROOT/'tools'),str(ROOT/'tools/vm_bridge')]
+from hardware import Hardware
+from hardware_bulk_workflow import BulkRun
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--session',required=True);p.add_argument('--key-file',type=Path,required=True)
+    p.add_argument('--action',choices=['put','get','frame'],required=True)
+    p.add_argument('--source',type=Path);p.add_argument('--artifact-id');p.add_argument('--request-id')
+    p.add_argument('--keep-raw',action='store_true',help='Retain diagnostic BGRA bytes in addition to the PNG (frame only)')
+    p.add_argument('--output',type=Path,required=True);p.add_argument('--port',type=int,default=1236)
+    a=p.parse_args();r=BulkRun(Hardware(),a.output).execute(a.session,a.key_file,a.action,a.source,a.artifact_id,a.port,a.request_id,a.keep_raw)
+    print(json.dumps({'state':r['state'],'transaction_id':r['transaction_id'],'receipt':str(a.output.resolve()/'receipt.json'),
+        'artifact_path':r.get('artifact_path'),'transfer':r['transfer']},indent=2))
+if __name__=='__main__':main()

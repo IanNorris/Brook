@@ -9,6 +9,7 @@
 #include "net.h"
 #include "string.h"
 #include "fs/compressed_vfs.h"
+#include "vfs.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -60,7 +61,15 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",");r.field("bytes",snapshot.bytes);r.text(",");r.field("error",uint32_t(snapshot.error));
         r.text(",\"source\":");r.quoted(snapshot.source);r.text("}");
         r.text(",\"power_api\":1,\"power\":{");PowerCaps(r);r.text("}");
-        r.text(",\"panic_transport\":false,\"raw_frame_transfer\":false}\n");r.send();return true;
+        VnodeStat helper{},optin{};
+        auto* binary=VfsOpen("/boot/HWBULK.ELF",VFS_O_STREAM);
+        auto* marker=VfsOpen("/etc/hardware-bulk",VFS_O_STREAM);
+        const bool bulk=binary&&marker&&!VfsStat(binary,&helper)&&!helper.isDir&&helper.size>0&&
+            !VfsStat(marker,&optin)&&!optin.isDir&&optin.size>0;
+        if(binary)VfsClose(binary);
+        if(marker)VfsClose(marker);
+        r.text(",\"completed_frame_copy_api\":1,\"bulk_helper_api\":");r.number(bulk?1:0);
+        r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
     }
     constexpr char powerPrefix[]="bridge hardware power ";
     if(Prefix(command,powerPrefix)){

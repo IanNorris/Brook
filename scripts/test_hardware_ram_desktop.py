@@ -29,12 +29,14 @@ selector=out/'SELECT1.BIN';selector.write_bytes(record(2,1,kernel,initrd));run('
 config=out/'BROOK.CFG';config.write_text(f'TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nDISPLAY_WIDTH={a.width}\nDISPLAY_HEIGHT={a.height}\nUPDATE_SLOTS=1\n')
 run('mcopy','-o','-i',str(disk)+'@@1048576',config,'::BROOK.CFG')
 variables=out/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],variables);variables.chmod(0o600)
-with socket.socket() as reserve:reserve.bind(('127.0.0.1',0));port=reserve.getsockname()[1]
+with socket.socket() as reserve,socket.socket() as bulk_reserve:
+    reserve.bind(('127.0.0.1',0));port=reserve.getsockname()[1]
+    bulk_reserve.bind(('127.0.0.1',0));bulk_port=bulk_reserve.getsockname()[1]
 argv=['qemu-system-x86_64','-machine','q35','-accel','kvm','-cpu','host','-smp','4','-m','2048','-nodefaults',
     '-drive','if=pflash,format=raw,readonly=on,file='+os.environ['OVMF_CODE'],'-drive','if=pflash,format=raw,file='+str(variables),
     '-device','VGA,vgamem_mb=64','-device','qemu-xhci,id=usbc','-drive','if=none,id=stick,format=raw,file='+str(disk),
     '-device','usb-storage,bus=usbc.0,port=1,drive=stick,bootindex=1','-device','usb-net,bus=usbc.0,port=2,netdev=network',
-    '-netdev',f'user,id=network,restrict=on,hostfwd=tcp:127.0.0.1:{port}-:1234','-display','none','-serial','file:'+str(out/'serial.log'),
+    '-netdev',f'user,id=network,restrict=on,hostfwd=tcp:127.0.0.1:{port}-:1234,hostfwd=tcp:127.0.0.1:{bulk_port}-:1236','-display','none','-serial','file:'+str(out/'serial.log'),
     '-qmp','unix:'+str(out/'qmp.sock')+',server=on,wait=off',
     '-qmp','unix:'+str(out/'qmp-review.sock')+',server=on,wait=off','-no-reboot']
 (out/'argv.json').write_text(json.dumps(argv,indent=2)+'\n');log=(out/'qemu.log').open('x');owner=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT);q=None;rpc=None
@@ -55,7 +57,7 @@ try:
     # The harness holds its control monitor. Give reviewers an independent
     # endpoint so their greeting/capture cannot queue behind that connection.
     (out/'ready.json').write_text(json.dumps({**attached,'registry':str(out/'registry'),'qmp':str(out/'qmp-review.sock'),
-        'qemu_pid':owner.pid,'payload_id':m['payload_id'],'app_snapshot_bytes':m['application_image']['bytes'],
+        'qemu_pid':owner.pid,'bulk_port':bulk_port,'payload_id':m['payload_id'],'app_snapshot_bytes':m['application_image']['bytes'],
         'review_instruction':'Private headless QEMU only. Inspect semantic apps/windows, launch Mousepad and Files; optionally capture QMP frame. Write finish.json passed=true when finished.'},indent=2)+'\n')
     print('RAM_DESKTOP_QEMU_READY',str(out/'ready.json'),flush=True)
     end=time.monotonic()+600

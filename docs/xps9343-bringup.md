@@ -963,3 +963,61 @@ HWUPDATE. Reuse the existing completed-frame producer through a bounded,
 owner-bound userspace copy interface rather than exposing kernel addresses or
 streaming mutable scanout memory. The kernel debug console's older font path is
 also separate from the Wayland DPI correction.
+
+Short-term DPI backlog: scale the built-in desktop pointer and its hotspot with
+desktop DPI, and scale ordinary desktop pointer movement/provide sensitivity
+settings. The user reports the pointer is barely visible and movement too slow
+at native Dell resolution. Captured raw game deltas must remain independent.
+Client-provided Wayland cursors are already presentation-scaled; that does not
+fix the default kernel desktop arrow. Keep the binary-transfer milestone first.
+
+### Binary transfer and completed screenshots (2026-10-30)
+
+The prepared `bulk-desktop-update-v4-20261030` pair adds `HWBULK.ELF` and
+kernel completed-frame copy API1. `hw_transfer` and
+`scripts/hardware_transfer.py` launch one boot-pinned helper job, authenticate
+over TCP1236 with the provisioned key/boot/transaction, then stream bytes over
+that separate socket. MCP/stdout carry metadata, receipts and artifact paths;
+file bytes never pass through JSON or base64. The durable host receipt retains
+the original job ID after an uncertain reply; no operation is redispatched.
+
+PUT writes only generated names beneath `/data/.brook-transfer`. Exact
+length/SHA256, file flush and fresh readback precede explicit FINALIZE and
+atomic `renameat2(RENAME_NOREPLACE)` publication. A completed artifact is never
+overwritten, including a dangling symlink destination. Publication is recorded
+before sending its final acknowledgement. GET accepts only completed staging
+artifact IDs. Boot slots and activation remain exclusively in HWUPDATE.
+Storage is current-boot RAM, not power-loss durability or a general USB writer.
+The helper bounds each file at1GiB, each connection at10 minutes, and checks
+reported filesystem free space before a PUT. The tmpfs quota can be smaller.
+
+Root-only syscall0xB0E requests, inspects, reads and releases an immutable
+completed-frame lease. Tokens belong to the calling process incarnation.
+Metadata exposes dimensions, packed BGRA8 format, frame epoch/tick and size,
+never a kernel address. Reads copy at most64KiB into kernel scratch under the
+capture lock; user-memory copies occur after unlocking, protected by a kernel
+operation guard. The helper promptly copies the frame into its own bounded RAM
+and releases the30-second lease before network delivery. Capture is unavailable
+post-panic; optical panic recovery remains separate.
+
+The host verifies the full payload and final receipt before publication, then
+converts BGRA to PNG locally. Frame results keep only PNG by default; diagnostic
+raw bytes require `--keep-raw`/`keep_raw=true`. Hardware doctor reports helper,
+capture and transfer limits independently of QEMU/host-desktop capabilities.
+
+Two compatibility gaps were fixed during actual QEMU acceptance: tmpfs lacks
+hard links, so publication uses the newly implemented no-replace rename policy;
+the old global executable-open path could not run object-only tmpfs files, so
+it now uses retained executable opening when available and never falls back
+after a retained denial. Tests include racing publishers and object-only opens.
+
+Evidence:15 real receiver host cases in
+`build/hardware/bulk-host-tests-v4-20261030/result.json`, nine host workflow tests
+including lost replies/no redispatch and default PNG retention, existing hardware
+bridge tests, and `test_vfs_paths`. The exact kernel/initrd pair passed private
+QEMU acceptance and checked shutdown in `build/hardware/bulk-qemu-v3-20261030`.
+`bulk-qa/result.json` records file round trip, executing the transferred probe,
+owner/root/bounds/EFAULT/stale checks, capture contention/expiry and acquiring a
+new frame while another binary screenshot download is paused. Terra inspected
+the generated PNG: coherent desktop/colors and legible console, with some long
+console lines clipped by its viewport. Hardware deployment is the next gate.

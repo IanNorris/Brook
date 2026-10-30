@@ -58,9 +58,12 @@ struct DebugFrameSnapshot {
     uint64_t address, tick, epoch;
     DebugFrameState state;
 };
-DebugFrameSnapshot CompositorRequestDebugFrame();
-DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token);
-bool CompositorReleaseDebugFrame(uint32_t token);
+DebugFrameSnapshot CompositorRequestDebugFrame(uint64_t owner=0);
+DebugFrameSnapshot CompositorDebugFrameStatus(uint32_t token,uint64_t owner=0);
+bool CompositorReleaseDebugFrame(uint32_t token,uint64_t owner=0);
+// Destination must be kernel memory. Copies under the lease lock; callers
+// must copy to userspace only after this returns and releases that lock.
+int64_t CompositorReadDebugFrame(uint32_t token,uint64_t owner,uint64_t offset,void* destination,uint32_t bytes);
 
 // Allocate a per-process virtual framebuffer of size vfbWidth × vfbHeight.
 // The process sees this as its screen. The compositor blits it 1:1 at

@@ -464,6 +464,15 @@ static void testMountRestrictions(brook::MountNamespace* initial,const brook::Vf
     // Legacy initial-namespace opens use the same pre-activation check.
     auto loose=resolve(stableRoot,stableRoot,"loose-file");node(loose.object).mode=0020666;
     auto* initialMount=static_cast<MountEntry*>(stableRoot.attachment);
+    node(loose.object).mode=0;
+    const VfsFsOps* legacyOperations=initialMount->backing->fsOps;
+    VfsFsOps retainedOnly=*legacyOperations;retainedOnly.open=nullptr;retainedOnly.open_mode=nullptr;retainedOnly.open_mode_checked=nullptr;
+    {FileMutationGuard transaction;MountViewGuard view;initialMount->backing->fsOps=&retainedOnly;}
+    Vnode* retainedExecutable=nullptr;char retainedName[512];
+    assert(!VfsOpenExecutable("/loose-file",&retainedExecutable,retainedName,sizeof(retainedName)) && retainedExecutable && retainedExecutable->backendObject);
+    VfsClose(retainedExecutable);
+    {FileMutationGuard transaction;MountViewGuard view;initialMount->backing->fsOps=legacyOperations;}
+    node(loose.object).mode=0020666;
     {FileMutationGuard transaction;MountViewGuard view;initialMount->attributes=6;}
     assert(!VfsOpenModeChecked("/loose-file",VFS_O_READ,0666,&error)&&error==-13);
     Vnode* executable=nullptr;char name[512];assert(VfsOpenExecutable("/loose-file",&executable,name,sizeof(name))==-13&&!executable);
@@ -544,6 +553,23 @@ static void testFileBinds(brook::MountNamespace* initial,const brook::VfsPath& s
     char fileReport[512];assert(!VfsPathObjectPathFromCallback(bound,fileReport,sizeof(fileReport)) && !std::strcmp(fileReport,"/ns-b/value"));
     assert(VfsRemoveAt(root,b,"value",false)==-16);
     assert(VfsRenameAt(root,root,"loose-file",b,"value")==-16);
+    // No-replace checks share the retained mutation lock with publication.
+    Node noReplaceTarget{&mounts[6],903,false,&node(a.object),{},"dangling-target"};
+    node(a.object).children["no-replace-target"]=&noReplaceTarget;
+    assert(VfsRenameNoReplaceAt(root,a,"value",a,"no-replace-target")==-17);
+    assert(node(a.object).children["value"]==originalSource && node(a.object).children["no-replace-target"]==&noReplaceTarget);
+    assert(VfsRenameNoReplaceAt(root,a,"value",a,"value")==-17);
+    assert(VfsRenameNoReplaceAt(root,a,"missing",a,"no-replace-new")==-2);
+    node(a.object).children.erase("no-replace-target");
+    Node contenderA{&mounts[6],904,false,&node(a.object),{},{}},contenderB{&mounts[6],905,false,&node(a.object),{},{}};
+    node(a.object).children["publish-a"]=&contenderA;node(a.object).children["publish-b"]=&contenderB;
+    int resultA=0,resultB=0;
+    std::thread publishA([&]{resultA=VfsRenameNoReplaceAt(root,a,"publish-a",a,"published");});
+    std::thread publishB([&]{resultB=VfsRenameNoReplaceAt(root,a,"publish-b",a,"published");});
+    publishA.join();publishB.join();
+    assert((resultA==0 && resultB==-17)||(resultB==0 && resultA==-17));
+    assert(node(a.object).children["published"]==(resultA==0?&contenderA:&contenderB));
+    node(a.object).children.erase("published");node(a.object).children.erase("publish-a");node(a.object).children.erase("publish-b");
     assert(!VfsRenameAt(root,a,"value",a,"renamed"));
     assert(std::strcmp(static_cast<MountEntry*>(bound.attachment)->physicalRoot,"/ns-a/renamed")==0);
     Node replacement{&mounts[6],901,false,&node(a.object),{},{}};node(a.object).children["value"]=&replacement;

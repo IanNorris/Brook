@@ -959,6 +959,7 @@ def register(name,fn,description,props=None,required=None,readonly=False):
     TOOLS[name]=(fn,{"name":name,"description":description,"inputSchema":schema(props,required),
                     "annotations":{"readOnlyHint":readonly,"destructiveHint":not readonly,"openWorldHint":False}})
 hardware=Hardware()
+register("hw_transfer",hardware.transfer,"Transfer a staged file or completed screenshot over the authenticated binary socket; returns local paths/metadata only, never base64; frame defaults to PNG only; inspect the same hw_job after uncertain delivery",{**SESSION,"request_id":STR,"action":{"type":"string","enum":["put","get","frame"]},"key_file":STR,"output":STR,"source":STR,"artifact_id":STR,"port":INT,"keep_raw":{"type":"boolean"}},["session","request_id","action","key_file","output"])
 register("hw_attach",hardware.attach,"Attach an explicit physical Brook IPv4 endpoint and pin its boot; no network discovery or QEMU required",{"host":STR,"port":INT},["host"])
 register("hw_sessions",hardware.sessions,"List opted-in hardware sessions without probing the network",readonly=True)
 register("hw_doctor",hardware.doctor,"Report network reachability and supported hardware operations; QEMU and post-panic access stay explicitly unavailable",SESSION,["session"],True)

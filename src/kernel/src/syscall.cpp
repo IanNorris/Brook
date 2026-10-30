@@ -66,6 +66,7 @@
 #include "memory/object_cache.h"
 #include "epoll_diagnostics.h"
 #include "compositor.h"
+#include "../../shared/brook_debug_frame.h"
 #include "compositor_scene.h"
 #include "window.h"
 #include "gpu_app.h"
@@ -10647,9 +10648,16 @@ static int64_t sys_renameat2(uint64_t olddirfd, uint64_t oldAddr,
                               uint64_t newdirfd, uint64_t newAddr,
                               uint64_t flags, uint64_t)
 {
-    // Unsupported atomic rename policies must not silently replace a target.
-    if (flags) return -EINVAL;
-    return sys_renameat(olddirfd, oldAddr, newdirfd, newAddr, 0, 0);
+    // RENAME_NOREPLACE is checked under the same retained mutation lock as
+    // publication. Other atomic rename policies remain unsupported.
+    if (flags & ~uint64_t{1}) return -EINVAL;
+    if(!flags)return sys_renameat(olddirfd, oldAddr, newdirfd, newAddr, 0, 0);
+    char oldP[512],newP[512];
+    if(!CopyUserCString(oldAddr,oldP,sizeof(oldP)) || !CopyUserCString(newAddr,newP,sizeof(newP)))return -EFAULT;
+    AtLookup oldLookup,newLookup;
+    if(int error=oldLookup.Init(static_cast<int>(olddirfd),oldP))return error;
+    if(int error=newLookup.Init(static_cast<int>(newdirfd),newP))return error;
+    return VfsRenameNoReplaceAt(oldLookup.fs.root,oldLookup.start(),oldP,newLookup.start(),newP);
 }
 
 // ---------------------------------------------------------------------------
@@ -12162,6 +12170,44 @@ static int64_t sys_brook_wm_taskbar_metrics(uint64_t op,uint64_t value,uint64_t,
     if(op==0)return WmGetTaskbarMetrics();
     if(op!=1||value>0xffffffffULL)return -EINVAL;
     return WmSetTaskbarMetrics(static_cast<uint32_t>(value))?0:-EINVAL;
+}
+
+// Root-only completed-frame copy. The compositor lock never spans user memory
+// faults, network I/O or filesystem I/O. Process incarnation prevents PID reuse
+// from inheriting another process's capture; abandoned leases expire boundedly.
+static int64_t sys_brook_debug_frame(uint64_t op,uint64_t token,uint64_t destination,uint64_t length,uint64_t offset,uint64_t reserved)
+{
+    auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
+    if(proc->euid!=0)return -EPERM;
+    KernelOperationGuard operation(proc);
+    if(reserved || token>0xffffffffULL)return -EINVAL;
+    const uint64_t owner=proc->incarnation;
+    if(op==0){
+        if(token||destination||length||offset)return -EINVAL;
+        const auto frame=CompositorRequestDebugFrame(owner);
+        if(frame.state==DebugFrameState::Busy)return -16; // EBUSY
+        return frame.token?int64_t(frame.token):-EIO;
+    }
+    if(op==1){
+        if(offset || length!=sizeof(BrookDebugFrameInfo))return -EINVAL;
+        const auto frame=CompositorDebugFrameStatus(uint32_t(token),owner);
+        if(frame.state==DebugFrameState::Expired)return -116; // ESTALE
+        BrookDebugFrameInfo info{frame.token,uint32_t(frame.state),frame.width,frame.height,frame.stride,
+            BROOK_DEBUG_FRAME_BGRA8,uint64_t(frame.width)*frame.height*4,frame.tick,frame.epoch};
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
+    if(op==2){
+        if(!length || length>BROOK_DEBUG_FRAME_CHUNK)return -EINVAL;
+        void* staged=kmalloc(uint32_t(length));if(!staged)return -ENOMEM;
+        int64_t result=CompositorReadDebugFrame(uint32_t(token),owner,offset,staged,uint32_t(length));
+        if(result>0 && !CopyToUser(destination,staged,uint32_t(result)))result=-EFAULT;
+        kfree(staged);return result;
+    }
+    if(op==3){
+        if(destination||length||offset)return -EINVAL;
+        return CompositorReleaseDebugFrame(uint32_t(token),owner)?0:-116; // ESTALE
+    }
+    return -EINVAL;
 }
 
 // 0xB04: native desktop scale. Query requested (0), request (1), query applied (2).
@@ -15325,6 +15371,7 @@ void SyscallTableInit()
     g_syscallTable[0xB02]                = sys_brook_wm_theme;
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     g_syscallTable[0xB04]                = sys_brook_wm_scale;
+    g_syscallTable[BROOK_SYS_DEBUG_FRAME] = sys_brook_debug_frame;
     g_syscallTable[BROOK_SYS_SYSTEM_MESSAGE] = sys_brook_system_message;
     g_syscallTable[0xB40]                = sys_brook_pageable_memory;
     g_syscallTable[BROOK_SYS_WM_APPEARANCE] = sys_brook_wm_appearance;

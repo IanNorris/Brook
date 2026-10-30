@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import time
 import uuid
 
@@ -13,6 +14,8 @@ from common import ROOT,write_json
 from guest_transport import exchange
 from jobs import Jobs,GuestJobError,validate_id
 from ui import Ui
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
 class HardwareBootChanged(GuestJobError):
     pass
@@ -107,6 +110,12 @@ class Hardware:
             with self.session_lock(session) as data:
                 hardware,jobs,ui=self.guest_batch(data,['bridge hardware caps','bridge job caps','bridge ui caps'],5)
             caps.update(ram_application_snapshot=hardware.get('app_snapshot_api')==1,diagnostics=True,logs=hardware.get('logs_api')==1,stats=True,
+                completed_frame_copy=hardware.get('completed_frame_copy_api')==1,
+                binary_transfer=hardware.get('bulk_helper_api')==1,
+                frame_capture=hardware.get('completed_frame_copy_api')==1 and hardware.get('bulk_helper_api')==1,
+                binary_transfer_limits=({'file_bytes_max':1024**3,'guest_timeout_s':600,'storage':'current_boot_ram',
+                    'capture_chunk_bytes_max':65536,'capture_lease_s':30,'capture_width_max':4096,'capture_height_max':2160}
+                    if hardware.get('bulk_helper_api')==1 else None),
                 hardware_power=hardware.get('power_api')==1,power=hardware.get('power',{}),
                 command_jobs=jobs.get('job_api')==2,semantic_windows=ui.get('ui_api')==1,semantic_launch=ui.get('launch_api')==1,app_catalog=ui.get('apps_api')==1)
             result.update(reachable=True,identity_matches=True,guest=hardware,jobs=jobs,ui=ui)
@@ -118,6 +127,15 @@ class Hardware:
 
     def command(self,session,command,**_):
         with self.session_lock(session) as data:return self.guest(data,command)
+
+    def transfer(self,session,request_id,action,key_file,output,source=None,artifact_id=None,port=1236,keep_raw=False,**_):
+        # Payloads never pass through the MCP serializer. One job identity,
+        # binary socket, verified artifact, metadata-only result.
+        from hardware_bulk_workflow import BulkRun
+        result=BulkRun(self,output).execute(session,key_file,action,source,artifact_id,port,request_id,keep_raw)
+        return {'session':session,'state':result['state'],'transaction_id':result['transaction_id'],
+                'receipt_path':str(Path(output).absolute()/'receipt.json'),
+                'artifact_path':result.get('artifact_path'),'transfer':result['transfer']}
 
     def power(self,session,request_id,operation,**_):
         validate_id(request_id)

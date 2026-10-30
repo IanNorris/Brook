@@ -69,6 +69,8 @@ Vnode* VfsCreateFifoAt(const VfsPath& root,const VfsPath& start,const char* text
 Vnode* VfsCreateSocketAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode,uint16_t mask,int* error);
 int VfsRenameAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
                 const VfsPath& newStart,const char* newText);
+int VfsRenameNoReplaceAt(const VfsPath& root,const VfsPath& oldStart,const char* oldText,
+                         const VfsPath& newStart,const char* newText);
 int VfsChmodAt(const VfsPath& root,const VfsPath& start,const char* text,uint16_t mode);
 int VfsChownAt(const VfsPath& root,const VfsPath& start,const char* text,uint32_t uid,uint32_t gid,bool followFinal=true);
 int VfsSetTimesAt(const VfsPath& root,const VfsPath& start,const char* text,const VnodeTime* times,bool followFinal=true);
