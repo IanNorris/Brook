@@ -43,7 +43,8 @@ static constexpr uint32_t QR_PACKET_TYPE_CPU_STATE      = 0xA3000008; // per-CPU
 //
 // QR_PIXELS_PER_MODULE: 3 works well on high-DPI displays.
 //   Use 9 for low-DPI devices like Surface Go where the camera can't resolve
-//   small modules.  The kernel auto-selects based on framebuffer resolution.
+//   small modules. These are preferred sizes; layout reduces them to fit
+//   complete codes, including quiet borders, on small framebuffers.
 //
 // QR_CONTRAST: reduces white from 0xFFFFFF to avoid camera bloom on screens.
 //   2 → white = 0xDDDDDD (slightly off-white, good for most screens)

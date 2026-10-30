@@ -1,3 +1,4 @@
+#include "framebuffer_fence.h"
 #include "tty.h"
 #include "boot_logo.h"
 #include "font_atlas.h"
@@ -160,30 +161,38 @@ bool TtyInit(const Framebuffer& fb)
     uint64_t fbPages  = (fbBytes + 4095u) / 4096u;
     uint64_t physBase = fb.physicalBase;
 
-    // Allocate virtual address range for the framebuffer.
-    uint64_t fbVirt = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
-    if (fbVirt == 0)
-    {
-        SerialPuts("TTY: VmmAllocPages failed for framebuffer\n");
-        return false;
-    }
-
-    // VmmAllocPages backed each page with a fresh PMM page.
-    // Replace each with the matching framebuffer physical page.
-    for (uint64_t i = 0; i < fbPages; i++)
-    {
-        VirtualAddress virt(fbVirt + i * 4096u);
-        PhysicalAddress oldPhys = VmmVirtToPhys(KernelPageTable, virt);
-        VmmUnmapPage(KernelPageTable, virt);
-        if (oldPhys) PmmFreePage(oldPhys);
-
-        if (!VmmMapPage(KernelPageTable, virt, PhysicalAddress(physBase + i * 4096u),
-                        VMM_WRITABLE | VMM_NO_EXEC,
-                        MemTag::Device, KernelPid))
+    uint64_t fbVirt=VmmFramebufferMapping(physBase,fbBytes);
+    if(!fbVirt) {
+        uint64_t cacheFlags=0;
+        if(!VmmFramebufferCacheFlags(physBase,fbPages*4096,cacheFlags)) {
+            SerialPuts("TTY: framebuffer alias would mix cache types\n");return false;
+        }
+        // Allocate virtual address range for the framebuffer.
+        fbVirt = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
+        if (fbVirt == 0)
         {
-            SerialPuts("TTY: VmmMapPage failed for framebuffer page\n");
+            SerialPuts("TTY: VmmAllocPages failed for framebuffer\n");
             return false;
         }
+
+        // VmmAllocPages backed each page with a fresh PMM page.
+        // Replace each with the matching framebuffer physical page.
+        for (uint64_t i = 0; i < fbPages; i++)
+        {
+            VirtualAddress virt(fbVirt + i * 4096u);
+            PhysicalAddress oldPhys = VmmVirtToPhys(KernelPageTable, virt);
+            VmmUnmapPage(KernelPageTable, virt);
+            if (oldPhys) PmmFreePage(oldPhys);
+
+            if (!VmmMapPage(KernelPageTable, virt, PhysicalAddress(physBase + i * 4096u),
+                            VMM_WRITABLE | VMM_NO_EXEC | cacheFlags,
+                            MemTag::Device, KernelPid))
+            {
+                SerialPuts("TTY: VmmMapPage failed for framebuffer page\n");
+                return false;
+            }
+        }
+
     }
 
     g_fbPixels = reinterpret_cast<volatile uint32_t*>(fbVirt);
@@ -204,6 +213,7 @@ bool TtyInit(const Framebuffer& fb)
         for (uint32_t x = 0; x < g_fbWidth; x++)
             g_fbPixels[y * g_fbStride + x] = g_bgColor;
 
+    FramebufferWriteFence();
     SerialPrintf("TTY: %ux%u framebuffer mapped at virt 0x%p phys 0x%lx, "
                  "font %upx (lineHeight=%u ascent=%u)\n",
                  g_fbWidth, g_fbHeight,
@@ -262,6 +272,7 @@ void TtyPutChar(char c)
 {
     if (!g_fbPixels) return;
     if (g_displaySuppressed) return;   // logo is showing — skip FB writes
+    struct Fence { ~Fence() { FramebufferWriteFence(); } } fence;
 
     // ANSI escape sequence state machine
     if (g_ansiState == TTY_ESC) {
@@ -528,6 +539,7 @@ void TtyClear()
             g_fbPixels[(g_ry + y) * g_fbStride + (g_rx + x)] = g_bgColor;
     g_curX = 0;
     g_curY = 0;
+    FramebufferWriteFence();
     if (g_ttyUsingBackbuffer) CompositorMarkDirty();
 }
 
@@ -566,6 +578,8 @@ bool TtyGetFramebuffer(uint32_t** outPixels, uint32_t* outWidth,
     return true;
 }
 
+volatile uint32_t* TtyGetFramebufferMmio() { return g_fbMMIO; }
+
 bool TtyGetFramebufferPhys(uint64_t* outPhysBase, uint32_t* outWidth,
                            uint32_t* outHeight, uint32_t* outStride)
 {
@@ -586,27 +600,35 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
     uint64_t fbBytes = static_cast<uint64_t>(stridePixels) * 4 * h;
     uint64_t fbPages = (fbBytes + 4095u) / 4096u;
 
-    // Allocate virtual address range for the new framebuffer.
-    uint64_t fbVirt = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
-    if (fbVirt == 0) {
-        SerialPuts("TTY: TtyRemap VmmAllocPages failed\n");
-        return;
-    }
-
-    // Replace backing pages with framebuffer physical pages.
-    for (uint64_t i = 0; i < fbPages; i++) {
-        VirtualAddress virt(fbVirt + i * 4096u);
-        PhysicalAddress oldPhys = VmmVirtToPhys(KernelPageTable, virt);
-        VmmUnmapPage(KernelPageTable, virt);
-        if (oldPhys) PmmFreePage(oldPhys);
-
-        if (!VmmMapPage(KernelPageTable, virt, PhysicalAddress(newPhysBase + i * 4096u),
-                        VMM_WRITABLE | VMM_NO_EXEC,
-                        MemTag::Device, KernelPid))
-        {
-            SerialPrintf("TTY: TtyRemap VmmMapPage failed at page %lu\n", i);
+    uint64_t fbVirt=VmmFramebufferMapping(newPhysBase,fbBytes);
+    if(!fbVirt) {
+        uint64_t cacheFlags=0;
+        if(!VmmFramebufferCacheFlags(newPhysBase,fbPages*4096,cacheFlags)) {
+            SerialPuts("TTY: framebuffer alias would mix cache types\n");return;
+        }
+        // Allocate virtual address range for the new framebuffer.
+        fbVirt = VmmAllocPages(fbPages, VMM_WRITABLE, MemTag::Device, KernelPid).raw();
+        if (fbVirt == 0) {
+            SerialPuts("TTY: TtyRemap VmmAllocPages failed\n");
             return;
         }
+
+        // Replace backing pages with framebuffer physical pages.
+        for (uint64_t i = 0; i < fbPages; i++) {
+            VirtualAddress virt(fbVirt + i * 4096u);
+            PhysicalAddress oldPhys = VmmVirtToPhys(KernelPageTable, virt);
+            VmmUnmapPage(KernelPageTable, virt);
+            if (oldPhys) PmmFreePage(oldPhys);
+
+            if (!VmmMapPage(KernelPageTable, virt, PhysicalAddress(newPhysBase + i * 4096u),
+                            VMM_WRITABLE | VMM_NO_EXEC | cacheFlags,
+                            MemTag::Device, KernelPid))
+            {
+                SerialPrintf("TTY: TtyRemap VmmMapPage failed at page %lu\n", i);
+                return;
+            }
+        }
+
     }
 
     // Update TTY state atomically (no lock needed — caller ensures serialisation).
@@ -628,6 +650,7 @@ void TtyRemap(uint64_t newPhysBase, uint32_t w, uint32_t h, uint32_t stridePixel
         for (uint32_t x2 = 0; x2 < w; x2++)
             g_fbPixels[y2 * stridePixels + x2] = g_bgColor;
 
+    FramebufferWriteFence();
     if(BootLogoActive())BootLogoProgress(65,"Display");
 
     SerialPrintf("TTY: remapped to %ux%u at phys 0x%lx, virt 0x%lx\n",

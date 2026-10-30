@@ -342,6 +342,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                    static_cast<uint32_t>((brook::PmmGetFreePageCount() * 4096) / (1024*1024)));
 
     brook::VmmInit();
+    brook::VmmInitFramebufferMemory(bootProtocol);
     brook::HeapInit();
     brook::PmmEnableTracking();
 

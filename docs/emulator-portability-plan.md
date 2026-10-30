@@ -185,9 +185,47 @@ The final payload passed USB/UEFI boot under QEMU without VirtIO devices or KVM
 clock CPUID exposure, at 1280x720; three A presses and releases reached both raw
 counters and decoded events. Host tests cover mode-order permutations, auxiliary
 configuration preservation, controller timeouts and failed readback. Entry-state
-and scheduler-start audits passed. Physical resolution, keyboard response and
-redraw speed still need the next Dell test. No framebuffer PAT/cache alias change
+and scheduler-start audits passed. The user subsequently confirmed that both built-in keyboard and trackpad work
+on the Dell, and lower resolution improves the estimated redraw rate to 5–10 FPS.
+A subsequent photo confirms 800x600, stride 800. Guest-clock samples report
+draw=0 ms at timer resolution and copy=80–141 ms (one sample 133 ms), with
+periods around 96–157 ms. This makes framebuffer-store bandwidth the leading
+next target; bare-metal clock accuracy is not yet independently verified.
+No framebuffer PAT/cache alias change
 was made: compositor HHDM and TTY aliases must be considered together with MTRRs.
+
+## Early framebuffer write-combining probe (2026-10-30)
+
+The next payload holds resolution at 800x600 for comparison. Immediately after
+VMM setup, before heap/TTY/AP startup, it validates the GOP physical span and
+prepares replacement page tables for both retained identity and HHDM aliases.
+Only framebuffer pages change; adjacent mappings retain their original flags.
+Allocation or validation failure leaves the original mappings intact. A cache
+and global-TLB transition brackets an allocation-free commit.
+
+This first implementation is gated to Intel CPUs with supported PAT layout,
+enabled MTRRs and defined overlap behavior. Firmware MTRRs are never modified.
+Every AP must match the BSP's PAT/MTRR state before online admission, or remains
+parked. The TTY and compositor share the physical mapping. New raw /dev/fb0
+aliases inherit uniform cache flags; mixed-type spans are rejected. Managed
+application VFB RAM keeps write-back caching. Framebuffer write batches finish
+with SFENCE, including boot/panic paths. HWFB reports WC or unchanged.
+
+Host tests pass for boundary splits, adjacent mappings, allocation rollback,
+unsupported huge/PAT layouts, shared page tables, alias cache flags and MTRR
+validation. Existing VMM/PAT regressions and compiled entry/scheduler-start audits
+also pass. QEMU USB/UEFI checks pass at 800x600 with four CPUs for WC enabled,
+PAT-disabled fallback, decoded PS/2 events and a symbolicated panic. Visual
+review also exposed an existing low-resolution panic QR clipping bug: URL and
+payload codes now fit separate bounded cells, including a 2x2 grid for up to four
+pages, with diagnostic text kept out of the QR column. Layout tests cover
+640x480 through 3840x2160. The first
+fallback attempt hit a host QMP timeout during image cleanup; the repeat with
+cleanup paused passed. This is correctness evidence, not a physical performance
+claim. The next Dell run must compare HWMS copy times with the prior 80–141ms.
+
+References: [Linux PAT alias rules](https://www.kernel.org/doc/html/latest/arch/x86/pat.html)
+and [Intel memory-type tables](https://cdrdv2-public.intel.com/812380/252046-sdm-change-document.pdf).
 
 ## Sources
 

@@ -770,7 +770,7 @@ void CompositorInit()
         return;
     }
 
-    g_physFb       = reinterpret_cast<volatile uint32_t*>(PhysToVirt(PhysicalAddress(fbPhysBase)).raw());
+    g_physFb       = TtyGetFramebufferMmio();
     g_physFbWidth  = w;
     g_physFbHeight = h;
     g_physFbStride = strideBytes / 4; // convert byte stride to pixel stride
@@ -3675,6 +3675,7 @@ static void CompositorLoop()
         if(++count<=4 || loopEndTick-last>=2000 || keys.bytes!=lastBytes) {
             last=loopEndTick;lastBytes=keys.bytes;
             KPrintf("HWFRAME: %ux%u stride=%u frame=%lu\n",g_physFbWidth,g_physFbHeight,g_physFbStride,count);
+            KPrintf("HWFB: cache=%s\n",VmmFramebufferWriteCombining()?"WC":"unchanged");
             KPrintf("HWMS: draw=%lu copy=%lu period=%lu (guest clock)\n",
                     probePresentStart-loopStartTick,probePresentEnd-probePresentStart,periodMs);
             KPrintf("HWKBD: irq=%u bytes=%u status=0x%x last=0x%x\n",keys.irqs,keys.bytes,keys.status,keys.lastByte);

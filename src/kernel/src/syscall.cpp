@@ -4387,6 +4387,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                 return UserMappingCreate(proc,proc->addressSpace,request);
             }
             source->borrowedPhysical=!source->kernelBase;source->physicalBase=physical;
+            // Raw /dev/fb0 must agree with the kernel's physical cache type.
+            // Managed per-process VFB RAM keeps its ordinary write-back mapping.
+            if(source->borrowedPhysical && ((physical&4095) ||
+               !VmmFramebufferCacheFlags(physical,request.length,request.cacheFlags))) return -EINVAL;
             available=(available+4095)&~uint64_t{4095};
         }
         if (!available) return -EINVAL;

@@ -24,6 +24,9 @@ bool CpuInitExecuteDisable();
 void CpuInitMemoryTypes();
 // Query after SmpInit admission; a failure on any CPU disables this capability.
 extern "C" bool CpuWriteCombiningReady();
+// Early framebuffer WC gate: Intel PAT/MTRR state, never modifies MTRRs.
+bool CpuPrepareFramebufferWc(uint64_t begin, uint64_t end);
+bool CpuFramebufferWcCompatible();
 
 // Enable XSAVE-managed CPU state (CR4.OSXSAVE + XCR0 = x87|SSE|AVX) so
 // AVX/AVX2 instructions don't #UD in user space.  Called from CpuInitFpu

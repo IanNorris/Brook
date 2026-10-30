@@ -169,12 +169,13 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
 
     int y = static_cast<int>(bannerH) + 8;
     int leftMargin = 20;
+    const uint32_t textWidth=fbW*55/100>12?fbW*55/100-12:fbW;
 
     // 3. Error description
     if (info->message)
     {
         y += 4;
-        DrawString(fb, stride, fbW, fbH, leftMargin, y, info->message, FG_YELLOW);
+        DrawString(fb, stride, textWidth, fbH, leftMargin, y, info->message, FG_YELLOW);
         y += lineH;
     }
 
@@ -186,7 +187,7 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
             static_cast<uint32_t>(info->vector),
             static_cast<uint32_t>(info->errorCode),
             info->regs->cr2, info->regs->rip, fromUser);
-        DrawString(fb, stride, fbW, fbH, leftMargin, y, desc, FG_GREY);
+        DrawString(fb, stride, textWidth, fbH, leftMargin, y, desc, FG_GREY);
         y += lineH;
     }
 
@@ -196,19 +197,19 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
     if (info->regs)
     {
         const PanicCPURegs& r = *info->regs;
-        DrawString(fb, stride, fbW, fbH, leftMargin, y, "Registers:", FG_CYAN);
+        DrawString(fb, stride, textWidth, fbH, leftMargin, y, "Registers:", FG_CYAN);
         y += lineH;
 
         // RIP with symbol
         {
-            int x = DrawString(fb, stride, fbW, fbH, leftMargin, y, "  RIP ", FG_GREY);
+            int x = DrawString(fb, stride, textWidth, fbH, leftMargin, y, "  RIP ", FG_GREY);
             char hex[20]; Hex64(hex, r.rip);
-            x = DrawString(fb, stride, fbW, fbH, x, y, hex, FG_WHITE);
+            x = DrawString(fb, stride, textWidth, fbH, x, y, hex, FG_WHITE);
             const char* symName = nullptr; uint64_t symOff = 0;
             if (KsymFindByAddr(r.rip, &symName, &symOff))
             {
-                x = DrawString(fb, stride, fbW, fbH, x, y, "  ", FG_GREY);
-                x = DrawString(fb, stride, fbW, fbH, x, y, symName, FG_YELLOW);
+                x = DrawString(fb, stride, textWidth, fbH, x, y, "  ", FG_GREY);
+                x = DrawString(fb, stride, textWidth, fbH, x, y, symName, FG_YELLOW);
             }
             y += lineH;
         }
@@ -228,43 +229,43 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
         int col2X = leftMargin + 30 * glyphW; // second column
         for (int i = 0; i < 16; i += 2)
         {
-            DrawReg64(fb, stride, fbW, fbH, leftMargin, y,
+            DrawReg64(fb, stride, textWidth, fbH, leftMargin, y,
                       gprs[i].name, gprs[i].val, FG_WHITE);
             if (i + 1 < 16)
-                DrawReg64(fb, stride, fbW, fbH, col2X, y,
+                DrawReg64(fb, stride, textWidth, fbH, col2X, y,
                           gprs[i+1].name, gprs[i+1].val, FG_WHITE);
             y += lineH;
         }
 
         // RFLAGS
-        DrawReg64(fb, stride, fbW, fbH, leftMargin, y,
+        DrawReg64(fb, stride, textWidth, fbH, leftMargin, y,
                   "  RFLAGS ", r.rflags, FG_WHITE);
         y += lineH;
 
         // Control registers
-        DrawReg64(fb, stride, fbW, fbH, leftMargin, y,
+        DrawReg64(fb, stride, textWidth, fbH, leftMargin, y,
                   "  CR0 ", r.cr0, FG_WHITE);
-        DrawReg64(fb, stride, fbW, fbH, col2X, y,
+        DrawReg64(fb, stride, textWidth, fbH, col2X, y,
                   "  CR2 ", r.cr2, FG_WHITE);
         y += lineH;
-        DrawReg64(fb, stride, fbW, fbH, leftMargin, y,
+        DrawReg64(fb, stride, textWidth, fbH, leftMargin, y,
                   "  CR3 ", r.cr3, FG_WHITE);
-        DrawReg64(fb, stride, fbW, fbH, col2X, y,
+        DrawReg64(fb, stride, textWidth, fbH, col2X, y,
                   "  CR4 ", r.cr4, FG_WHITE);
         y += lineH;
 
         // Segment registers
         {
             char seg[8];
-            int x = DrawString(fb, stride, fbW, fbH, leftMargin, y, "  CS ", FG_GREY);
+            int x = DrawString(fb, stride, textWidth, fbH, leftMargin, y, "  CS ", FG_GREY);
             Hex16(seg, r.cs);
-            x = DrawString(fb, stride, fbW, fbH, x, y, seg, FG_WHITE);
-            x = DrawString(fb, stride, fbW, fbH, x, y, "  DS ", FG_GREY);
+            x = DrawString(fb, stride, textWidth, fbH, x, y, seg, FG_WHITE);
+            x = DrawString(fb, stride, textWidth, fbH, x, y, "  DS ", FG_GREY);
             Hex16(seg, r.ds);
-            x = DrawString(fb, stride, fbW, fbH, x, y, seg, FG_WHITE);
-            x = DrawString(fb, stride, fbW, fbH, x, y, "  SS ", FG_GREY);
+            x = DrawString(fb, stride, textWidth, fbH, x, y, seg, FG_WHITE);
+            x = DrawString(fb, stride, textWidth, fbH, x, y, "  SS ", FG_GREY);
             Hex16(seg, r.ss);
-            DrawString(fb, stride, fbW, fbH, x, y, seg, FG_WHITE);
+            DrawString(fb, stride, textWidth, fbH, x, y, seg, FG_WHITE);
             y += lineH;
         }
     }
@@ -274,7 +275,7 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
     // 5. Stack trace with symbols
     if (info->trace && info->trace->depth > 0)
     {
-        DrawString(fb, stride, fbW, fbH, leftMargin, y, "Stack Trace:", FG_CYAN);
+        DrawString(fb, stride, textWidth, fbH, leftMargin, y, "Stack Trace:", FG_CYAN);
         y += lineH;
 
         for (uint8_t i = 0; i < info->trace->depth && y + lineH < static_cast<int>(fbH) - 20; i++)
@@ -285,15 +286,15 @@ void PanicScreenRender(uint32_t* fb, uint32_t fbW, uint32_t fbH,
             prefix[4] = '0' + (i % 10);
             prefix[5] = ' '; prefix[6] = ' '; prefix[7] = '\0';
 
-            int x = DrawString(fb, stride, fbW, fbH, leftMargin, y, prefix, FG_GREY);
+            int x = DrawString(fb, stride, textWidth, fbH, leftMargin, y, prefix, FG_GREY);
             char hex[20]; Hex64(hex, info->trace->rip[i]);
-            x = DrawString(fb, stride, fbW, fbH, x, y, hex, FG_WHITE);
+            x = DrawString(fb, stride, textWidth, fbH, x, y, hex, FG_WHITE);
 
             const char* symName = nullptr; uint64_t symOff = 0;
             if (KsymFindByAddr(info->trace->rip[i], &symName, &symOff))
             {
-                x = DrawString(fb, stride, fbW, fbH, x, y, "  ", FG_GREY);
-                DrawString(fb, stride, fbW, fbH, x, y, symName, FG_YELLOW);
+                x = DrawString(fb, stride, textWidth, fbH, x, y, "  ", FG_GREY);
+                DrawString(fb, stride, textWidth, fbH, x, y, symName, FG_YELLOW);
             }
             y += lineH;
         }

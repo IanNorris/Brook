@@ -3,6 +3,9 @@
 #include "serial.h"
 #include "spinlock.h"
 #include "vmalloc_arena.h"
+#include "early_framebuffer_mapping.h"
+#include "boot_protocol/boot_protocol.h"
+#include "cpu.h"
 
 namespace brook {
 
@@ -273,6 +276,76 @@ void VmmInit()
 
     SerialPuts("VMM: direct physical map active at 0xFFFF800000000000\n");
     SerialPuts("VMM: initialized\n");
+}
+
+static bool g_framebufferWc=false;
+static EarlyFramebufferRange g_framebufferWcRange;
+bool VmmFramebufferWriteCombining() { return __atomic_load_n(&g_framebufferWc,__ATOMIC_ACQUIRE); }
+bool VmmFramebufferCacheFlags(uint64_t physical,uint64_t bytes,uint64_t& flags) {
+    return FramebufferAliasCacheFlags(g_framebufferWcRange,VmmFramebufferWriteCombining(),physical,bytes,flags);
+}
+uint64_t VmmFramebufferMapping(uint64_t physical,uint64_t bytes) {
+    constexpr uint64_t limit=16ull<<30;
+    return bytes && physical<limit && bytes<=limit-physical ? DIRECT_MAP_BASE+physical : 0;
+}
+
+void VmmInitFramebufferMemory(const BootProtocol* boot)
+{
+    if(!boot) return;
+    const auto& fb=boot->framebuffer;
+    EarlyFramebufferRange range;
+    if(!EarlyFramebufferBounds(fb.physicalBase,fb.width,fb.height,fb.stride,range)) {
+        SerialPuts("FBMEM: unchanged (unsupported framebuffer bounds)\n");return;
+    }
+    // The GOP framebuffer is an MMIO aperture, never live allocator/kernel RAM.
+    // A missing UEFI descriptor for a PCI hole is allowed; described RAM is not.
+    for(uint32_t i=0;i<boot->memoryMapCount;++i) {
+        const auto& d=boot->memoryMap[i];
+        if(d.pageCount>(~uint64_t{0}-d.physicalStart)/4096) {
+            SerialPuts("FBMEM: unchanged (invalid memory map)\n");return;
+        }
+        const uint64_t end=d.physicalStart+d.pageCount*4096;
+        if(d.physicalStart>=range.end || end<=range.begin) continue;
+        if(d.type!=MemoryType::Mmio && d.type!=MemoryType::Reserved && d.type!=MemoryType::Framebuffer) {
+            SerialPuts("FBMEM: unchanged (framebuffer overlaps described RAM)\n");return;
+        }
+    }
+    if(!CpuWriteCombiningReady() || !CpuPrepareFramebufferWc(range.begin,range.end)) {
+        SerialPuts("FBMEM: unchanged (Intel PAT/MTRR WC unavailable)\n");return;
+    }
+    struct Memory {
+        uint64_t flags=0,cr0=0,cr4=0;
+        uint64_t* table(uint64_t p) { return reinterpret_cast<uint64_t*>(PhysToVirt(PhysicalAddress(p)).raw()); }
+        uint64_t allocate() { return AllocTablePage().raw(); }
+        void release(uint64_t p) { PmmFreePage(PhysicalAddress(p)); }
+        void flushTlb() {
+            if(cr4&(1ull<<7)) __asm__ volatile("mov %0,%%cr4"::"r"(cr4&~(1ull<<7)):"memory");
+            uint64_t cr3;__asm__ volatile("mov %%cr3,%0; mov %0,%%cr3":"=r"(cr3)::"memory");
+            if(cr4&(1ull<<7)) __asm__ volatile("mov %0,%%cr4"::"r"(cr4):"memory");
+        }
+        void beginTransition() {
+            __asm__ volatile("pushfq; pop %0; cli":"=r"(flags)::"memory");
+            __asm__ volatile("mov %%cr0,%0":"=r"(cr0));
+            __asm__ volatile("mov %%cr4,%0":"=r"(cr4));
+            const uint64_t disabled=(cr0|(1ull<<30))&~(1ull<<29);
+            __asm__ volatile("mov %0,%%cr0; wbinvd"::"r"(disabled):"memory");
+            flushTlb();
+        }
+        void endTransition() {
+            __asm__ volatile("wbinvd":::"memory");flushTlb();
+            __asm__ volatile("mov %0,%%cr0"::"r"(cr0):"memory");
+            if(flags&(1ull<<9)) __asm__ volatile("sti":::"memory");
+        }
+    } memory;
+    static EarlyFramebufferPlan plan;
+    auto* root=memory.table(g_kernelCR3.raw());
+    if(!MapEarlyFramebufferWc(memory,root,range,plan)) {
+        SerialPrintf("FBMEM: unchanged (%s)\n",plan.failure);return;
+    }
+    g_framebufferWcRange=range;
+    __atomic_store_n(&g_framebufferWc,true,__ATOMIC_RELEASE);
+    SerialPrintf("FBMEM: effective=WC phys=0x%lx..0x%lx split-tables=%u aliases=identity+HHDM\n",
+                 range.begin,range.end,plan.count);
 }
 
 bool VmmMapPage(PageTable pt, VirtualAddress virtAddr, PhysicalAddress physAddr,

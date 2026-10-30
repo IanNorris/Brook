@@ -17,6 +17,7 @@
 //   that is NOT inside an interrupt handler (framebuffer writes are not re-entrant).
 
 namespace brook {
+volatile uint32_t* TtyGetFramebufferMmio();
 
 // Initialise the TTY: maps the framebuffer into virtual address space,
 // clears it to the default background colour, and resets the cursor.

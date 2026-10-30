@@ -7,6 +7,7 @@
 // codes if a single QR cannot hold it all.
 
 #include "panic_qr.h"
+#include "panic_qr_layout.h"
 #include "base45.h"
 #include "serial.h"
 #include "string.h"
@@ -331,7 +332,7 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
     // Scanning it opens the Brook panic scanner site, which then reads the dense
     // payload QR(s) below.  Kept separate so the payload stays full-density (see
     // PANIC_INGEST_URL note in panic_qr.h).  Failure here is non-fatal.
-    uint32_t urlBandH = 0;
+    uint32_t urlBandH = 60; // below panic banner; reserve footer below payload
     {
         static uint8_t urlQrBuf[qrcodegen_BUFFER_LEN_MAX];
         static uint8_t urlTmpBuf[qrcodegen_BUFFER_LEN_MAX];
@@ -341,12 +342,13 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
                                  qrcodegen_Mask_AUTO, true))
         {
             int urlSize = qrcodegen_getSize(urlQrBuf);
-            uint32_t urlPx = static_cast<uint32_t>(urlSize + 2 * QR_BORDER_WIDTH) * QR_PIXELS_PER_MODULE;
-            uint32_t urlX = qrAreaX + (qrAreaW > urlPx ? (qrAreaW - urlPx) / 2 : 0);
-            uint32_t urlY = 20;
-            RenderQRToFramebuffer(fbBase, fbWidth, fbHeight, fbStride, urlQrBuf,
-                                  urlX, urlY, QR_PIXELS_PER_MODULE);
-            urlBandH = urlY + urlPx + 16;  // reserve this band; payload QRs start below
+            const auto placement=FitPanicQr({qrAreaX,60,qrAreaW,fbHeight>100?fbHeight/4:0},
+                static_cast<uint32_t>(urlSize+2*QR_BORDER_WIDTH),QR_PIXELS_PER_MODULE,0,1);
+            if(placement.scale) {
+                RenderQRToFramebuffer(fbBase,fbWidth,fbHeight,fbStride,urlQrBuf,
+                                      placement.x,placement.y,placement.scale);
+                urlBandH=placement.y+placement.side+16;
+            }
             SerialPuts("PANIC QR: ingest URL QR rendered (" PANIC_INGEST_URL ")\n");
         }
     }
@@ -403,33 +405,16 @@ void PanicRenderQR(uint32_t* fbBase, uint32_t fbWidth, uint32_t fbHeight,
         int qrSize = qrcodegen_getSize(qrBuf);
         SerialPrintf("PANIC QR: page %u: QR %d modules\n", page, qrSize);
 
-        // Position this QR code — single page centred, multi-page stacked vertically.
-        // All payload QRs are kept below the static ingest-URL QR band at top.
-        uint32_t qrPixelSize = static_cast<uint32_t>(qrSize + 2 * QR_BORDER_WIDTH) * QR_PIXELS_PER_MODULE;
-        uint32_t startX = qrAreaX + (qrAreaW > qrPixelSize ? (qrAreaW - qrPixelSize) / 2 : 0);
-        uint32_t startY;
-        if (pageCount == 1)
-        {
-            // Centre vertically within the area below the URL band.
-            uint32_t availTop = urlBandH;
-            uint32_t availH = fbHeight > availTop ? fbHeight - availTop : 0;
-            startY = (availH > qrPixelSize + 100)
-                     ? availTop + (availH - qrPixelSize) / 2
-                     : (urlBandH ? urlBandH : QR_START_Y);
+        const uint32_t available=fbHeight>urlBandH+40?fbHeight-urlBandH-40:0;
+        const auto placement=FitPanicQr({qrAreaX,urlBandH,qrAreaW,available},
+            static_cast<uint32_t>(qrSize+2*QR_BORDER_WIDTH),QR_PIXELS_PER_MODULE,page,pageCount);
+        if(!placement.scale) {
+            SerialPrintf("PANIC QR: page %u cannot fit; serial dump retained\n",page);
+            continue;
         }
-        else
-        {
-            // Stack pages vertically with spacing, starting below the URL band.
-            uint32_t totalH = pageCount * qrPixelSize + (pageCount - 1) * 16;
-            uint32_t availTop = urlBandH;
-            uint32_t availH = fbHeight > availTop ? fbHeight - availTop : 0;
-            uint32_t baseY = (availH > totalH + 40)
-                             ? availTop + (availH - totalH) / 2
-                             : (urlBandH ? urlBandH : 20);
-            startY = baseY + page * (qrPixelSize + 16);
-        }
+        RenderQRToFramebuffer(fbBase,fbWidth,fbHeight,fbStride,qrBuf,
+                              placement.x,placement.y,placement.scale);
 
-        RenderQRToFramebuffer(fbBase, fbWidth, fbHeight, fbStride, qrBuf, startX, startY, QR_PIXELS_PER_MODULE);
     }
 
     SerialPuts("PANIC QR: rendered to framebuffer\n");

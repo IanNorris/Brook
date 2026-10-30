@@ -74,6 +74,14 @@ struct VmmAllocation
 
 // Initialise the VMM. Must be called after PmmInit().
 void VmmInit();
+struct BootProtocol;
+// Call immediately after VmmInit, before heap/TTY/AP startup. Failures retain
+// original mappings. First implementation accepts Intel PAT/MTRR only.
+void VmmInitFramebufferMemory(const BootProtocol* boot);
+bool VmmFramebufferWriteCombining();
+bool VmmFramebufferCacheFlags(uint64_t physical,uint64_t bytes,uint64_t& flags);
+// Shared HHDM alias for framebuffers within the 16GiB direct map, otherwise 0.
+uint64_t VmmFramebufferMapping(uint64_t physical, uint64_t bytes);
 #ifdef BROOK_HOST_TEST
 void VmmHostSetKernelRoot(PageTable root);
 #endif

@@ -2,6 +2,7 @@
 #include "gdt.h"
 #include "serial.h"
 #include "cpu_memory_type.h"
+#include "framebuffer_memory_type.h"
 #include "cpu_execute_disable.h"
 
 // ---------------------------------------------------------------------------
@@ -80,6 +81,50 @@ extern "C" bool CpuWriteCombiningReady()
 {
     return __atomic_load_n(&g_patInitialized, __ATOMIC_ACQUIRE) != 0 &&
            !__atomic_load_n(&g_patFailed, __ATOMIC_ACQUIRE);
+}
+
+static brook::FramebufferMtrrs g_framebufferMtrrs;
+static bool ReadFramebufferMtrrs(brook::FramebufferMtrrs& result)
+{
+    uint32_t a,b,c,d;
+    __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(0),"c"(0));
+    if(b!=0x756e6547 || d!=0x49656e69 || c!=0x6c65746e) return false; // GenuineIntel
+    __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(1),"c"(0));
+    if((d&((1u<<12)|(1u<<16)))!=((1u<<12)|(1u<<16))) return false;
+    uint64_t target=0,current=ReadMsr(0x277);
+    if(!brook::CpuPatWithWriteCombining(current,target) || current!=target) return false;
+    __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(0x80000000u),"c"(0));
+    if(a<0x80000008u) return false;
+    __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(0x80000008u),"c"(0));
+    result.physicalBits=a&255;
+    result.capability=ReadMsr(0xfe);result.defaults=ReadMsr(0x2ff);
+    result.count=result.capability&255;
+    if(result.count>32) return false;
+    for(unsigned i=0;i<result.count;++i) {
+        result.base[i]=ReadMsr(0x200+2*i);result.mask[i]=ReadMsr(0x201+2*i);
+    }
+    if(result.capability&(1ull<<8)) {
+        result.fixed[0]=ReadMsr(0x250);result.fixed[1]=ReadMsr(0x258);result.fixed[2]=ReadMsr(0x259);
+        for(unsigned i=0;i<8;++i) result.fixed[i+3]=ReadMsr(0x268+i);
+    }
+    return true;
+}
+
+bool CpuPrepareFramebufferWc(uint64_t begin,uint64_t end)
+{
+    if(ReadCr0()&((1ull<<30)|(1ull<<29))) return false;
+    brook::FramebufferMtrrs snapshot;
+    if(!ReadFramebufferMtrrs(snapshot) || !brook::FramebufferMtrrsAllowWc(snapshot,begin,end)) return false;
+    g_framebufferMtrrs=snapshot;
+    brook::SerialPrintf("CPU: framebuffer PAT=WC MTRR default=%u enabled=1 effective=WC (Intel)\n",
+                        static_cast<unsigned>(snapshot.defaults&255));
+    return true;
+}
+
+bool CpuFramebufferWcCompatible()
+{
+    brook::FramebufferMtrrs snapshot;
+    return ReadFramebufferMtrrs(snapshot) && brook::FramebufferMtrrsEqual(snapshot,g_framebufferMtrrs);
 }
 
 void CpuInitFpu()

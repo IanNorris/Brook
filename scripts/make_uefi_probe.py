@@ -23,7 +23,14 @@ def main():
     ap.add_argument('--build',type=Path,default=ROOT/'build/release')
     ap.add_argument('--output',type=Path,required=True)
     ap.add_argument('--input-probe',action='store_true',help='Request <=1280x720 and display keyboard/frame diagnostics')
-    args=ap.parse_args();build=args.build.resolve();out=args.output.resolve()
+    ap.add_argument('--display-width',type=int,default=0)
+    ap.add_argument('--display-height',type=int,default=0)
+    args=ap.parse_args()
+    if bool(args.display_width)!=bool(args.display_height) or not (0<=args.display_width<=16384 and 0<=args.display_height<=16384):
+        ap.error('Set both display bounds between 1 and 16384')
+    display_width=args.display_width or (1280 if args.input_probe else 0)
+    display_height=args.display_height or (720 if args.input_probe else 0)
+    build=args.build.resolve();out=args.output.resolve()
     for tool in ['mcopy','mmd','mtype','mkfs.fat','sfdisk']:
         if not shutil.which(tool):ap.error('Missing '+tool+'; run inside nix-shell')
     loader=build/'bootloader/BOOTX64.efi';kernel=build/'kernel/BROOK.elf'
@@ -41,7 +48,7 @@ def main():
     shutil.copy2(loader,payload/'EFI/BOOT/BOOTX64.EFI')
     shutil.copy2(kernel,payload/'KERNEL/BROOK.ELF')
     shutil.copy2(initrd,payload/'INITRD.IMG')
-    (payload/'BROOK.CFG').write_text('TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nLOG_MEMORY=0\nLOG_INTERRUPTS=0\n'+('DISPLAY_WIDTH=1280\nDISPLAY_HEIGHT=720\n' if args.input_probe else ''))
+    (payload/'BROOK.CFG').write_text('TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nLOG_MEMORY=0\nLOG_INTERRUPTS=0\n'+(f'DISPLAY_WIDTH={display_width}\nDISPLAY_HEIGHT={display_height}\n' if display_width else ''))
     (payload/'README.TXT').write_text(
         'Brook XPS 13 9343: first UEFI/kernel bring-up probe\n\n'
         'Use F12 and select the UEFI USB entry; Secure Boot must be disabled\n'
@@ -54,7 +61,7 @@ def main():
         'Scanner: https://khione:9001/ or https://192.168.85.8:9001/\n')
     if args.input_probe:
         with (payload/'README.TXT').open('a') as f:
-            f.write('\nInput probe: requests <=1280x720 GOP; fallback is smallest mode.\n'
+            f.write(f'\nInput probe: requests <={display_width}x{display_height} GOP; fallback is smallest mode.\n'
                     'Press plain A several times; HWKEY/HWKBD counters should change.\n'
                     'External USB keyboards still require the future xHCI driver gate.\n')
     files={str(p.relative_to(payload)):dict(bytes=p.stat().st_size,sha256=sha(p))

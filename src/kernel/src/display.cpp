@@ -1,3 +1,4 @@
+#include "framebuffer_fence.h"
 // display.cpp — Display device abstraction
 //
 // Manages the active display driver. Defaults to the UEFI GOP framebuffer
@@ -101,11 +102,13 @@ uint64_t DisplayGetFramebufferPhys()
 
 void DisplayFlush(uint32_t minY, uint32_t maxY)
 {
+    FramebufferWriteFence();
     g_activeDisplay->Flush(minY, maxY);
 }
 
 void DisplayPanicPresent()
 {
+    FramebufferWriteFence();
     if (g_activeDisplay && g_activeDisplay->PanicPresent)
         g_activeDisplay->PanicPresent();
 }
