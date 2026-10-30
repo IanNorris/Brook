@@ -25,7 +25,7 @@ int main(void) {
             char text[INET_ADDRSTRLEN];
             if(!inet_ntop(AF_INET,&address->sin_addr,text,sizeof(text)))continue;
             printf("HARDWARE_NETWORK_READY %s %s debug_tcp=1234\n",request.ifr_name,text);
-            puts("Share this IP for boot-pinned Brook hardware MCP access.\nHome/settings are RAM-only. Audio starts muted; internal Dell codec is not implemented.");
+            puts("Share this IP for boot-pinned Brook hardware MCP access.\nAudio starts muted; internal Dell codec is not implemented.");
             close(fd);return 0;
         }
         if(!attempt){puts("HARDWARE_NETWORK waiting for an IPv4 address (up to 60s)");fflush(stdout);}

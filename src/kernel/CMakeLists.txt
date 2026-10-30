@@ -222,6 +222,7 @@ add_executable(kernel
     src/pci.cpp
     src/ramdisk.cpp
     src/fat_image_device.cpp
+    src/writable_desktop.cpp
     src/runtime.cpp
     src/syscall.cpp
     src/user_copy.cpp

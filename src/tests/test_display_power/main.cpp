@@ -17,6 +17,10 @@ struct Device {
             ++d.writes;d.lastOffset=offset;d.lastValue=value;d.Reg(offset)=value^(d.corruptWrite?1:0);}};}
 };
 int main(){
+    uint32_t seconds=123;assert(DisplayIdleSecondsParse("300\n",4,seconds)&&seconds==300);
+    assert(DisplayIdleSecondsParse("0",1,seconds)&&seconds==0);
+    const char* invalidTimeouts[]={"","-1","86401","300\nmore","\n"};
+    for(const auto* bad:invalidTimeouts)assert(!DisplayIdleSecondsParse(bad,__builtin_strlen(bad),seconds));
     Device d;IntelBacklight b;
     assert(b.Probe(d.io()) && b.cpuRoute && !d.writes);b.PanicRestore(d.io());assert(!d.writes);
     const auto saved=d.registers;

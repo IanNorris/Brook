@@ -38,6 +38,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "scheduler.h"
 #include "procfs.h"
 #include "fatfs_vfs.h"
+#include "writable_desktop.h"
 #include "ext2_vfs.h"
 #include "fs/compressed_vfs.h"
 #include "memory/file_page_cache.h"
@@ -862,7 +863,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     brook::KLog("BOOT stage: USB filesystem probing complete");
     brook::KLog("BOOT stage: application image mount begin");
-    brook::CompressedVfsBootMount();
+    const auto writableDesktop=brook::WritableDesktopBootMount(&nextPdrv);
+    if(writableDesktop==brook::WritableDesktopBoot::Absent || writableDesktop==brook::WritableDesktopBoot::Fallback)
+        brook::CompressedVfsBootMount();
     brook::KLog("BOOT stage: application image mount complete");
     // Provision with boot-time kernel authority after every storage mount is
     // available, before scheduler kernel threads acquire ordinary credentials.

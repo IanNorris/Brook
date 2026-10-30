@@ -1475,8 +1475,72 @@ replace s_state. This plan is not implemented by the image-builder checkpoint.
 Next: boot-only image admission/home bind, strict header and clean-session
 handling, bounded direct USB streaming provisioning (not RAM staging), then
 private USB-QEMU execution/mmap/COW/install/restart tests before Dell activation.
-Successful writable admission must explicitly skip compressed mounting and enable
-file-page reclaim. Failed namespace cleanup must leave maintenance mode, not
+Successful writable admission must explicitly skip compressed mounting. The
+immutable file-page-cache reclaimer is unrelated: ext2 regular-file vnodes use
+cacheId0 and bypass it; ext2 has a separate bounded block cache. Failed namespace
+cleanup must leave maintenance mode, not
 silently stack another `/nix`. USB capacity was measured on the Dell as30307041280
 bytes available; the constraint is FAT32's single-file limit plus the247967744-byte
 free RAM `/data`, not total USB capacity.
+
+### Physical backlight acceptance and writable boot lifecycle (2026-10-30)
+
+The user physically confirmed that the Dell panel went dark and woke with a
+keyboard press. Runtime idle blanking is now five minutes. The final register
+sample followed additional input, so it does not independently measure which
+input preceded the timed restoration; the physical observation is the wake
+acceptance. Evidence: `build/hardware/backlight-live-observation-20261030/cycle.json`.
+Touchpad wake has the same input-sequence path but has not been separately
+physically reported. `/etc/display-idle-seconds` now provides an optional strict
+0..86400-second boot policy; absent configuration remains passive. The writable
+candidate preparer includes300seconds. This boot policy has not yet replaced the
+accepted Dell generation8 payload.
+
+`writable_desktop.cpp` now implements the image-specific lifecycle described
+above. It checks the boot record and matching USB `STORE.OK` identity, a clean
+supported ext2 header and group layout, then acquires an exclusive FAT file
+backing. The two-byte dirty marker is written and flushed before publishing
+`/nix`; the validated UID1000 home is bound at `/data/home`. Existing application
+or home mounts refuse admission rather than being overlaid. A failed private
+mount must be fully retired before immutable fallback is allowed; uncertain
+cleanup leaves maintenance mode. Once ext2 is bound, its device/lease remains
+pinned until reboot. Owned vnode references are dropped with `VfsRelease`, not
+the final-destruction `VfsClose` operation.
+
+Checked shutdown closes device write admission, stops writeback, and performs
+global VFS sync. Only that successful shutdown worker can write and flush the
+clean marker. A failed or unarmed session cannot be marked clean by fallback
+shutdown. This is a checked-session completion marker, not a substitute for
+filesystem consistency checking after an interrupted session.
+
+`scripts/prepare_hardware_writable_desktop.py` freezes a kernel/initrd, preserves
+the RAM application recovery snapshot, and records the expected mutable-image
+UUID/size. `scripts/test_hardware_writable_desktop.py` boots a private USB-style
+FAT disk with the ext2 file, using8CPUs/8GiB and software VGA. It never accesses
+physical disks or the host desktop. Its interactive review and storage acceptance
+are separate results.
+
+The v4 private-QEMU run passed UID1000 home writes, cross-page MAP_SHARED
+writeback/msync/fsync, forked MAP_PRIVATE isolation, exclusion of ordinary opens
+against the leased image, checked shutdown, fresh-process reboot and persistence,
+a second checked shutdown, and host `e2fsck -fn`. Evidence:
+`build/hardware/writable-desktop-qemu-v4-20261030/result.json` and `e2fsck.log`.
+Host lifecycle tests cover22 admission/failure scenarios; the strict planner,
+shutdown owner, write admission, debug capability, display policy and real
+FAT/ext2 backend tests also pass. Earlier private v1-v3 failures are retained as
+evidence; v4 fixes the namespace case and vnode-lifetime defects they exposed.
+
+Both Firefox and Chromium rendered HTTPS in the writable image; Chromium cold
+startup took minutes. Gallery search and install dispatch worked, but galculator
+installation failed: the checked-in index points to an unavailable hash, and
+nix-fetch cached its HTTP404 body as metadata. Full desktop acceptance is therefore
+**not passed**. Refreshing a pin-coherent index, validating HTTP/cache responses,
+package installation/launch, browser downloads and quit/relaunch, bounded direct
+USB provisioning and actual Dell execution remain required. No writable image
+has been activated on the Dell, and no internal SSD writes are authorized.
+
+The complete164-test host run passed163tests in parallel; `test_audio_delivery`
+hit its15-second timeout under that load and passed in10.04seconds when rerun
+alone. Both outcomes are retained in `writable-desktop-all-host-20261030.log` and
+`writable-desktop-audio-recheck-20261030.log`; this is not reported as an entirely
+clean parallel-suite result.

@@ -12,6 +12,7 @@
 #include "vfs.h"
 #include "pci.h"
 #include "display_power.h"
+#include "writable_desktop.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -62,6 +63,15 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"source_closed\":");r.text(snapshot.sourceClosed?"true":"false");
         r.text(",");r.field("bytes",snapshot.bytes);r.text(",");r.field("error",uint32_t(snapshot.error));
         r.text(",\"source\":");r.quoted(snapshot.source);r.text("}");
+        const auto store=WritableDesktopRead();
+        r.text(",\"writable_desktop_api\":1,\"writable_desktop\":{\"configured\":");r.text(store.configured?"true":"false");
+        r.text(",\"ready\":");r.text(store.ready?"true":"false");r.text(",\"source_pinned\":");r.text(store.pinned?"true":"false");
+        r.text(",\"stage\":");r.quoted(store.stage);
+        r.text(",\"dirty_session\":");r.text(store.dirty?"true":"false");r.text(",\"clean_finalized\":");r.text(store.clean?"true":"false");
+        r.text(",\"state_uncertain\":");r.text(store.stateUncertain?"true":"false");
+        r.text(",");r.field("bytes",store.bytes);r.text(",");r.field("drive",store.drive);
+        auto signedNumber=[&](int value){if(value<0){r.text("-");r.number(-int64_t(value));}else r.number(value);};
+        r.text(",\"error\":");signedNumber(store.error);r.text(",\"final_error\":");signedNumber(store.finalError);r.text("}");
         r.text(",\"power_api\":1,\"power\":{");PowerCaps(r);r.text("}");
         VnodeStat helper{},optin{};
         auto* binary=VfsOpen("/boot/HWBULK.ELF",VFS_O_STREAM);

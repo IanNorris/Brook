@@ -5,6 +5,7 @@
 #include "vfs.h"
 #include "pci.h"
 #include "display_power.h"
+#include "writable_desktop.h"
 #include <cassert>
 #include <cstring>
 #include <string>
@@ -13,6 +14,8 @@ unsigned powerCalls=0;std::string powerVerb;
 unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
 namespace brook {
 AppSnapshotBootInfo snapshot;
+WritableDesktopInfo writable;
+WritableDesktopInfo WritableDesktopRead(){return writable;}
 Vnode binaryNode{},markerNode{};
 bool binaryPresent=false,markerPresent=false,directory=false,statError=false;
 unsigned openNodes=0;
@@ -61,6 +64,7 @@ int main(){
     assert(reply.find("\"panic_transport\":false")!=std::string::npos);
     assert(reply.find("\"pci_inventory_api\":1")!=std::string::npos);
     assert(reply.find("\"backlight_api\":1")!=std::string::npos);
+    assert(reply.find("\"writable_desktop_api\":1")!=std::string::npos);
     assert(handle("bridge hardware backlight status") && !backlightCalls && reply.find("\"available\":false")!=std::string::npos);
     assert(handle("bridge hardware backlight off 10") && backlightCalls==1 && backlightSeconds==10 && !backlightOn);
     assert(reply.find("\"ok\":false")!=std::string::npos);

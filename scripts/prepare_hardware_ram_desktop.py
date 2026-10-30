@@ -13,8 +13,10 @@ p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--recovery-probe',type=Path,required=True);p.add_argument('--maintenance-probe',type=Path,required=True)
 p.add_argument('--output',type=Path,required=True);p.add_argument('--build',type=Path,default=ROOT/'build/release')
 p.add_argument('--waylandd',type=Path,help='Stage a tested replacement provider in the initrd; its runtime closure must already exist in APPS.BRK')
+p.add_argument('--display-idle-seconds',type=int,help='Opt in after physical panel/wake acceptance; 0 disables, maximum86400')
 a=p.parse_args();recovery=a.recovery_probe.resolve(strict=True);maintenance=a.maintenance_probe.resolve(strict=True);build=a.build.resolve(strict=True);out=a.output.resolve()
 if not os.environ.get('MUSL_CC'):p.error('Run in nix-shell with MUSL_CC')
+if a.display_idle_seconds is not None and not 0<=a.display_idle_seconds<=86400:p.error('Invalid display idle timeout')
 def sha(path):
     with path.open('rb') as source:return hashlib.file_digest(source,'sha256').hexdigest()
 def run(*argv):subprocess.run(list(map(str,argv)),check=True,cwd=ROOT,stdin=subprocess.DEVNULL)
@@ -40,6 +42,7 @@ markers={'hardware-maintenance':'RAM-resident updater enabled; application snaps
     'hardware-bulk':'1\n',
     'hardware-update-key':key,'hardware-payload-id':payload_id+'\n',
     'boot-app-snapshot':f"/media/usb/APPS.BRK /nix {apps['bytes']} {apps['sha256']}\n"}
+if a.display_idle_seconds is not None:markers['display-idle-seconds']=str(a.display_idle_seconds)+'\n'
 for name,text in markers.items():
     path=out/name;path.write_text(text)
     if name=='hardware-update-key':path.chmod(0o600)
@@ -63,7 +66,8 @@ manifest={'scope':'Opt-in RAM application desktop; kernel/initrd upload only','p
     'application_source':'/media/usb/APPS.BRK','application_image':apps,'application_snapshot_limit_bytes':512*1024**2,
     'initial_headroom_bytes':256*1024**2,'update_key_file':str(out/'hardware-update-key'),'recovery_probe':str(recovery),
     'maintenance_probe':str(maintenance),'physical_status':'Prepared; QEMU and physical acceptance required',
-    'ephemeral_home':True,'usb_read_only':False,'mutable_usb_application_mount':False}
+    'ephemeral_home':True,'usb_read_only':False,'mutable_usb_application_mount':False,
+    'display_idle_seconds':a.display_idle_seconds or 0}
 if provider_meta:manifest['wayland_provider_override']=provider_meta
 (out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
 print('HARDWARE_RAM_DESKTOP_PREPARED',out)

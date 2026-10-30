@@ -10,6 +10,7 @@ bool terminalSleeps=false,lastRestart=false;
 brook::PlatformPowerPlan powerPlan;
 bool writebackStopped=false;
 int syncError=0;
+int finalError=0;unsigned finalCalls=0;
 brook::ProcessCleanupStatus cleanup{};
 brook::Process serviceTasks[2]{};unsigned signalPid=0;
 brook::DebugTaskSnapshot census[4]{};unsigned censusCount=0;
@@ -43,6 +44,7 @@ bool PlatformPowerIssue(bool restart){assert(writebackStopped && gate && syncErr
 bool DeviceCloseWrites(){assert(writebackStopped);++freezes;return canFreeze;}
 void AudioStop(){}
 int VfsSync(Vnode*){++syncs;return syncError;}
+int WritableDesktopFinalSync(){assert(writebackStopped && canFreeze && !syncError);++finalCalls;return finalError;}
 void CompositorMarkDirty(){}
 void CompositorWake(){}
 uint32_t FwCfgReadFile(const char*,void*,uint32_t){return 0;}
@@ -76,7 +78,7 @@ step();assert(!signals&&!syncs&&!gate);
     cleanup.liveUserAddressSpaces=1;step();assert(!freezes&&!syncs&&!writebackStops);
     cleanup.liveUserAddressSpaces=0;cleanup.activeFinalizers=1;step();assert(!freezes&&!syncs&&!writebackStops);
     cleanup.activeFinalizers=0;canFreeze=false;step();assert(freezes==1&&!syncs);
-    canFreeze=true;syncError=-5;step();command(second,"power_status","failed",-5);assert(syncs==1);
+    canFreeze=true;syncError=-5;step();command(second,"power_status","failed",-5);assert(syncs==1 && !finalCalls);
     step();assert(syncs==1);command(second,"shutdown","failed",-5);
     // A fresh explicit attempt may retry a failed flush; no implicit retry.
     const char* third="33333333333333333333333333333333";
@@ -85,7 +87,7 @@ step();assert(!signals&&!syncs&&!gate);
     // must not undo the irreversible service/write-barrier stage after error.
     current=-1;irreversible=false;
     command(third,"shutdown","closing");ShutdownCompositorPoll();step();step();syncError=0;step();
-    command(third,"power_status","ready");assert(syncs==2&&gate);
+    command(third,"power_status","ready");assert(syncs==2&&gate && finalCalls==1);
     command(third,"cancel","too_late",-16);
     command(third,"commit","ready");assert(operations[current].commit);
     // Mocked hardware writes are reached only after successful sync, once.
@@ -106,6 +108,12 @@ step();assert(!signals&&!syncs&&!gate);
     assert(powerWrites==2 && lastRestart);
     current=-1;irreversible=false;powerRestart=false;
     command("66666666666666666666666666666666","restart","unsupported",-95);assert(powerWrites==2);
+    current=-1;irreversible=false;powerRestart=true;finalError=-5;
+    const char* failedClean="77777777777777777777777777777777";
+    command(failedClean,"restart","closing");ShutdownCompositorPoll();
+    for(unsigned i=0;i<10 && operations[current].phase!=Phase::Failed;++i)step();
+    command(failedClean,"power_status","failed",-5);const auto calls=finalCalls;step();
+    assert(finalCalls==calls && powerWrites==2); // no implicit clean-write retry or reset
     // Never execute the host's actual power I/O from this native fixture.
     std::puts("SHUTDOWN_COORDINATOR PASS");
 }

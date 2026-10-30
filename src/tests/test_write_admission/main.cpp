@@ -21,6 +21,7 @@ brook::Device dev{&ops,"owned-fixture",brook::DeviceType::Block,nullptr};
 }
 int main() {
     using namespace brook;char data=0;
+    assert(!DeviceFinalSyncOwner());
     BlockDeviceOps registeredOps{nullptr,write,nullptr,nullptr,[](Device*)->uint64_t{return 1;},[](Device*)->uint32_t{return 512;}};
     Device fixture{reinterpret_cast<DeviceOps*>(&registeredOps),"module-storage",DeviceType::Block,nullptr};
     retainAllowed=false;assert(!DeviceRegister(&fixture) && !DeviceIsRegistered(&fixture) && retainedCount==3);
@@ -29,9 +30,10 @@ int main() {
     while(!entered)std::this_thread::yield();
     assert(!DeviceCloseWrites());release=true;writer.join();hold=false;
     assert(DeviceCloseWrites());
-    unsigned old=writes;std::thread late([&]{caller=2;for(int i=0;i<1000;++i)assert(DeviceWrite(&dev,0,&data,1)==-30);assert(!DeviceReopenWrites());});late.join();
+    assert(DeviceFinalSyncOwner());
+    unsigned old=writes;std::thread late([&]{caller=2;assert(!DeviceFinalSyncOwner());for(int i=0;i<1000;++i)assert(DeviceWrite(&dev,0,&data,1)==-30);assert(!DeviceReopenWrites());});late.join();
     assert(writes==old);assert(DeviceWrite(&dev,0,&data,1)==1);assert(writes==old+1);
-    assert(DeviceCloseWrites());assert(DeviceReopenWrites());assert(DeviceWrite(&dev,0,&data,1)==1);
+    assert(DeviceCloseWrites());assert(DeviceReopenWrites());assert(!DeviceFinalSyncOwner());assert(DeviceWrite(&dev,0,&data,1)==1);
     assert(DeviceWrite(nullptr,0,&data,1)==-19);
     // Nested partition calls are independently admitted. Their outer call
     // keeps closure from overtaking an in-progress nested write.

@@ -24,6 +24,8 @@ void Ext2StopWriteback();
 
 // Register "ext2" filesystem driver with the VFS.
 void Ext2VfsRegister();
+// Boot-only admission check; a later bind still independently refuses reuse.
+bool Ext2DriveAvailable(uint8_t pdrv);
 // Call once after fw_cfg initialization and before mounting block devices.
 void Ext2ConfigureAutoSync();
 

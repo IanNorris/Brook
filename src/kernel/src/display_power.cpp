@@ -7,6 +7,7 @@
 #include "input.h"
 #include "spinlock.h"
 #include "serial.h"
+#include "vfs.h"
 
 namespace brook {
 namespace {
@@ -74,9 +75,16 @@ void DisplayPowerConfigure(const BootProtocol* boot) {
     if(!cpuPage || !pchPage){backlight.reason="Backlight register mapping failed";return;}
     backlight.Probe(io);
     policy.Reset(ApicTickCount(),InputLatestSequence());
-    // Passive until explicit manual/idle commands; do not assume a live PWM
-    // register is physically wired to the internal panel without observation.
-    SerialPrintf("backlight: %s available=%u (idle disabled)\n",backlight.reason,backlight.ready?1u:0u);
+    // The default stays passive. A hardware payload can opt in after physical
+    // acceptance, independently of user apps and the writable-store admission.
+    if(backlight.ready)if(auto* file=VfsOpen("/etc/display-idle-seconds",VFS_O_STREAM)){
+        char data[8]{};uint64_t offset=0;VnodeStat st{};uint32_t seconds=0;
+        const bool valid=!VfsStat(file,&st) && !st.isDir && st.size && st.size<=6 &&
+            VfsRead(file,data,st.size,&offset)==int(st.size) && DisplayIdleSecondsParse(data,st.size,seconds);
+        VfsRelease(file);if(valid)policy.timeoutSeconds=seconds;
+        else SerialPuts("backlight: invalid display-idle-seconds; idle disabled\n");
+    }
+    SerialPrintf("backlight: %s available=%u idle_seconds=%u\n",backlight.reason,backlight.ready?1u:0u,policy.timeoutSeconds);
 }
 DisplayPowerStatus DisplayPowerRead() {
     SpinLockAcquire(&lock);

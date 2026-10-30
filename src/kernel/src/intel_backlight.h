@@ -2,6 +2,12 @@
 #include <stdint.h>
 
 namespace brook {
+inline bool DisplayIdleSecondsParse(const char* text,uint32_t bytes,uint32_t& seconds){
+    if(!text || !bytes || bytes>6)return false;if(text[bytes-1]=='\n')--bytes;if(!bytes)return false;
+    uint32_t value=0;
+    for(uint32_t i=0;i<bytes;++i){if(text[i]<'0'||text[i]>'9')return false;value=value*10+text[i]-'0';if(value>86400)return false;}
+    seconds=value;return true;
+}
 // Broadwell/LPT register layout. Reference: Linux's MIT-licensed
 // drivers/gpu/drm/i915/display/intel_backlight{,_regs.h}. Preserve firmware
 // routing, frequency and polarity; this is not a modesetting/panel-link driver.

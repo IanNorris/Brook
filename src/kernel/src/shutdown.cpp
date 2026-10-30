@@ -7,6 +7,7 @@
 #include "vfs.h"
 #include "memory/file_object.h"
 #include "ext2_vfs.h"
+#include "writable_desktop.h"
 #include "fw_cfg.h"
 #include "platform_power.h"
 #include "apic.h"
@@ -107,7 +108,8 @@ void Worker(void*) {
                 Ext2StopWriteback();
                 if(!DeviceCloseWrites()){SchedulerSleepMs(25);continue;}
                 SetPhase(selected,Phase::Syncing);AudioStop();
-                const int error=VfsSync(nullptr);
+                int error=VfsSync(nullptr);
+                if(!error)error=WritableDesktopFinalSync();
                 SetPhase(selected,error?Phase::Failed:Phase::Ready,error);
             }
         }else if(op.phase==Phase::Ready&&(op.automatic||op.commit)&&(op.restart?powerRestart:powerOff)) {

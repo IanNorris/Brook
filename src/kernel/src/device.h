@@ -93,6 +93,9 @@ extern "C" int DeviceWrite(Device* dev,uint64_t offset,const void* data,uint64_t
 // or driver callback is executed under the admission lock.
 bool DeviceCloseWrites();
 bool DeviceReopenWrites();
+// Only the thread which closed and drained normal write admission may publish
+// clean-session completion, after its successful final filesystem sync.
+bool DeviceFinalSyncOwner();
 
 // Verify device registry integrity (canaries + checksum).  Returns true if OK.
 // Logs diagnostic details on corruption.  Safe to call from timer tick context.

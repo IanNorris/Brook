@@ -110,6 +110,7 @@ class Hardware:
             with self.session_lock(session) as data:
                 hardware,jobs,ui=self.guest_batch(data,['bridge hardware caps','bridge job caps','bridge ui caps'],5)
             caps.update(ram_application_snapshot=hardware.get('app_snapshot_api')==1,diagnostics=True,logs=hardware.get('logs_api')==1,stats=True,
+                writable_desktop=hardware.get('writable_desktop_api')==1,
                 completed_frame_copy=hardware.get('completed_frame_copy_api')==1,
                 binary_transfer=hardware.get('bulk_helper_api')==1,
                 frame_capture=hardware.get('completed_frame_copy_api')==1 and hardware.get('bulk_helper_api')==1,

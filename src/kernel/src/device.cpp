@@ -27,6 +27,10 @@ bool DeviceReopenWrites() {
     const auto caller=WriteCaller();SpinLockAcquire(&g_writeLock);
     const bool result=g_writes.Reopen(caller);SpinLockRelease(&g_writeLock);return result;
 }
+bool DeviceFinalSyncOwner() {
+    const auto caller=WriteCaller();SpinLockAcquire(&g_writeLock);
+    const bool result=g_writes.OwnedBy(caller);SpinLockRelease(&g_writeLock);return result;
+}
 
 // ---- Registry storage ----
 

@@ -628,6 +628,14 @@ target_compile_options(test_process_ids PRIVATE -UNDEBUG "-iquote${BROOK_ROOT}/s
 set_tests_properties(test_process_ids PROPERTIES TIMEOUT 15)
 
 add_host_test(test_write_admission "${BROOK_ROOT}/src/kernel/src/device.cpp")
+add_host_test(test_writable_desktop_plan)
+target_compile_options(test_writable_desktop_plan PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+add_executable(test_writable_desktop "${BROOK_ROOT}/src/tests/test_writable_desktop/main.cpp"
+    "${BROOK_ROOT}/src/kernel/src/writable_desktop.cpp")
+target_compile_options(test_writable_desktop PRIVATE -Wall -Wextra -Werror -O2 -DBROOK_HOST_TEST
+    "-iquote${BROOK_ROOT}/src/kernel/src")
+add_test(NAME test_writable_desktop COMMAND python3 "${BROOK_ROOT}/src/tests/test_writable_desktop/run.py" "$<TARGET_FILE:test_writable_desktop>")
+set_tests_properties(test_writable_desktop PROPERTIES TIMEOUT 90)
 target_compile_options(test_write_admission PRIVATE -UNDEBUG -DBROOK_HOST_TEST -ffunction-sections -fdata-sections
     "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 target_link_options(test_write_admission PRIVATE -Wl,--gc-sections)

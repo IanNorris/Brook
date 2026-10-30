@@ -13,5 +13,6 @@ public:
     bool Reopen(uintptr_t caller) { if(owner!=caller || active)return false;owner=0;return true; }
     uint64_t Active() const {return active;}
     bool Closed() const {return owner!=0;}
+    bool OwnedBy(uintptr_t caller) const {return owner && owner==caller;}
 };
 }

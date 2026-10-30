@@ -4726,6 +4726,10 @@ void Ext2SetSkipPermChecks(uint8_t pdrv, bool skip)
     if (pdrv >= EXT2_MAX_MOUNTS || !g_ext2Mounts[pdrv]) return;
     g_ext2Mounts[pdrv]->skipPermChecks = skip;
 }
+bool Ext2DriveAvailable(uint8_t pdrv)
+{
+    return pdrv<EXT2_MAX_MOUNTS && !__atomic_load_n(&g_ext2Devices[pdrv],__ATOMIC_ACQUIRE);
+}
 
 } // namespace brook
 
