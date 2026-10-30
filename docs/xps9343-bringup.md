@@ -930,3 +930,36 @@ These two checks are semantic, not visual/input proof. The review harness now
 provides a second QMP endpoint so screenshot/input inspection does not wait on
 the monitor connection already held by its shutdown controller. The active
 Dell remains on the previous accepted payload until handed back for update.
+
+The user subsequently handed over the Dell for ongoing work and restarts.
+Candidate2 is now physically accepted as generation4/slotB, with a new boot ID
+and the expected payload ID verified. The250MiB immutable RAM snapshot is ready
+with its USB source closed. Mousepad and Files both produce visible, doubled
+client dimensions (1600x1200 and2048x1400) fitting the actual3200x1800 display.
+Receipts: `build/hardware/dell-dpi-update-20261030/{receipt,doctor,apps-terra}.json`.
+Root recovery files and the previous working slotA remain intact.
+
+Measured Dell stages: early modules634ms, USB filesystem probing15ms,
+application-image mount13659ms, network21ms. The scheduler starts at15262ms,
+wallpaper at15351ms. This run was shorter than the previous25.57s observation;
+the previous run lacked stage measurements, so that difference has no proven
+cause. Detailed evidence is `dell-dpi-update-20261030/boot-timing.json`.
+The scanner now pins candidate ELF SHA256
+`fe33b74e86afae8baa46e9fbfd3547dbe958564fe495bd7e4dc3b628f7020539`.
+
+The independent review monitor produced actual QEMU screenshots at2560x1600.
+Terra observed readable Files/Mousepad content and text entered into Mousepad;
+exact click-to-caret alignment was not independently proven. Files' status line
+was partly clipped by the taskbar. That visual review exceeded its600s bound and
+the harness terminated its private VM; it is not a clean-shutdown acceptance.
+The two earlier semantic runs did complete checked shutdown. Native hardware
+frame capture is still unavailable; none is claimed from these QEMU images.
+
+Next requested milestone: software-rendered Quake2 on the Dell, using private
+game data outside Git. First add a separate binary transfer helper for large
+files and screenshots; MCP returns commands, receipts and artifact paths only.
+Keep file-transfer staging authority separate from boot-slot activation in
+HWUPDATE. Reuse the existing completed-frame producer through a bounded,
+owner-bound userspace copy interface rather than exposing kernel addresses or
+streaming mutable scanout memory. The kernel debug console's older font path is
+also separate from the Wayland DPI correction.
