@@ -865,3 +865,23 @@ The host updater now accepts `--boot-timeout-s` (default120, range1..900) for
 slower physical image loads. This changes only observation of the original
 restart; it never repeats activation/reset. Thirteen workflow tests pass,
 including a short configured deadline that still sends commit exactly once.
+
+### Physical new-kernel RAM desktop update passed
+
+The next network update installed a genuinely newer kernel plus the full RAM
+application desktop into generation3/slot A, preserving the working maintenance
+pair in slot B and the root recovery files. Checked reset returned with a new
+boot identity and the exact expected initrd ID. Both HWSTATUS and boot-pinned
+hardware caps report configured/ready/source_closed=true,262602752 bytes, error0
+and the expected root-image SHA-256. Cache probing again recovered the CSW stall
+and reported WCE0; no transport quarantine followed. Evidence:
+`build/hardware/dell-ram-desktop-update-v2-20261030/receipt.json`, `doctor.json`
+and captured boot logs. The scanner now uses the frozen new kernel with SHA256
+`f1b966a95ec5c245c0c494bf4ed2caed7caa3ced3a5d267bc8c14773db67d085`.
+
+The user observed a reboot taking over25 seconds. This boot newly snapshots and
+hashes the250MiB application image before starting the desktop; no component
+breakdown was measured, so do not attribute the entire delay to that copy.
+Physical graphical-app visibility and the remaining DPI mismatch still need
+review. The kernel/initrd network update/reset loop is physically established;
+standalone application-image upload remains future work.
