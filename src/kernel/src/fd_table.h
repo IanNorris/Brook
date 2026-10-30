@@ -58,6 +58,7 @@ enum class FdType : uint8_t
     SignalFd,      // Read pending signals for the calling task through a shared mask
     Path,          // O_PATH metadata-only VFS reference; never data I/O
     NetlinkSocket, // AF_NETLINK read-only NETLINK_ROUTE datagram endpoint
+    DebugConsole,  // Explicit diagnostic text output to serial + kernel log pane
 };
 
 struct FdEntry

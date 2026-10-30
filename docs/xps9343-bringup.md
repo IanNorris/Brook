@@ -254,6 +254,28 @@ Its first attempt stopped in OVMF's USB boot lookup before the Brook loader;
 the exact same image passed with fresh firmware variables on the bounded retry.
 That pre-loader startup variance is distinct from the kernel acceptance checks.
 
+### First offline physical boot: diagnostics and console resizing
+
+The first offline Dell boot reached the desktop but reported missing
+`/nix/profile/bin/waylandd`, `hardware-dbus` and `hardware-message`. This means
+the application image was unavailable; it does not establish an application
+compatibility failure. USB/controller initialization and image mounting need
+physical diagnosis before Ethernet or offline apps can be accepted.
+
+The original status programs wrote to inherited serial stdout, which is not
+the Kernel Console ring. `run --console` now explicitly routes stdout/stderr
+to serial and the visible ring. Ordinary output and redirected binary pipes
+keep their existing behavior. The hardware payload opts in for its USB read
+probe and finite IP-status program. Controller reset/allocation/start failures,
+the initial USB device count and application-image mount results are visible
+without a serial cable.
+
+Kernel Console previously resized its frame while retaining a fixed content
+buffer. It now reserves a screen-sized backing once, redraws the current
+viewport on size changes, and publishes tightly packed viewport dimensions
+for both software and GPU rendering. This costs one screen-sized allocation
+while the diagnostic console exists, without allocations on each drag.
+
 ### Validated reset and graceful manual power-off
 
 Power handling now separates graceful quiescence, reset and automatic power-off.

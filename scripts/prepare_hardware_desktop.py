@@ -65,8 +65,8 @@ rc=base/'INIT.RC';rc.write_text('set wm\nset vfb none\nsched eevdf\nkconsole\n'
  'run --service --once --uid 1000 /nix/profile/bin/waylandd\n'
  'run --service --once --uid 1000 /nix/profile/bin/hardware-dbus\n'
  'run --service --once --uid 1000 /nix/profile/bin/hardware-message\n'
- 'run --uid 1000 /boot/HWSTATUS.ELF\n'
- 'run --uid 1000 /boot/USBPROBE.ELF /media/usb/READTEST.BIN --concurrent\n')
+ 'run --console --uid 1000 /boot/HWSTATUS.ELF\n'
+ 'run --console --uid 1000 /boot/USBPROBE.ELF /media/usb/READTEST.BIN --concurrent\n')
 run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 readme=probe/'payload/README.TXT'
 readme.write_text("Brook Dell XPS 13 9343 offline hardware desktop\n\n"

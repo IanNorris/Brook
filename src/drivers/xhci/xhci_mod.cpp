@@ -3086,14 +3086,14 @@ static int XhciModuleInit()
     }
     KPrintf("xhci: firmware handoff complete legacy=0x%x\n",legacy);
     // Reset only after firmware releases ownership and halt is observed.
-    if (!XhciReset(ctrl)) return -1;
+    if (!XhciReset(ctrl)) {KPuts("xhci: controller reset failed; USB storage/network unavailable\n");return -1;}
     PciEnableBusMaster(ctrl.pciDev);
 
     // Allocate command/event rings and DCBAA
-    if (!XhciAllocRings(ctrl)) return -1;
+    if (!XhciAllocRings(ctrl)) {KPuts("xhci: ring allocation failed; USB storage/network unavailable\n");return -1;}
 
     // Start the controller
-    if (!XhciStartController(ctrl)) return -1;
+    if (!XhciStartController(ctrl)) {KPuts("xhci: controller start failed; USB storage/network unavailable\n");return -1;}
 
     ctrl.initialized = true;
     g_controllerCount = 1;
@@ -3103,6 +3103,7 @@ static int XhciModuleInit()
 
     // Scan ports and enumerate connected devices
     XhciScanPorts(ctrl);
+    if(g_storageReadOnly)KPrintf("xhci: initial port scan found %u USB devices\n",g_deviceCount);
 
     // Process any pending port status change events
     while (true) {
@@ -3313,7 +3314,7 @@ static int XhciModuleInit()
         }
     }
 
-    SerialPrintf("xhci: driver initialized (%u controller%s, %u device%s)\n",
+    KPrintf("xhci: driver initialized (%u controller%s, %u device%s)\n",
                  g_controllerCount, g_controllerCount > 1 ? "s" : "",
                  g_deviceCount, g_deviceCount > 1 ? "s" : "");
     return 0;

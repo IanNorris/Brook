@@ -1,4 +1,5 @@
 #include "process_fs.h"
+#include "kprintf.h"
 #include "mount_namespace.h"
 #include "tmpfs.h"
 #include "tmpfs_mount_options.h"
@@ -2018,6 +2019,22 @@ static int64_t WriteToPinnedFdByType(Process* proc,FdEntry* fde,uint64_t fd,
     // Debug serial writes directly, bypassing the async ring buffer.
     // Hold the serial lock across the entire write so multi-CPU output
     // doesn't interleave character-by-character.
+    if (fde->type == FdType::DebugConsole)
+    {
+        // Explicit opt-in; ordinary stdout and binary pipelines remain untouched.
+        const char* source=reinterpret_cast<const char*>(bufAddr);
+        char text[257];
+        for(uint64_t offset=0;offset<count;) {
+            uint32_t n=static_cast<uint32_t>(count-offset>256?256:count-offset);
+            if(userSource) {
+                n=static_cast<uint32_t>(CopyFromUserBytes(text,bufAddr+offset,n));
+                if(!n)return offset?static_cast<int64_t>(offset):-EFAULT;
+            } else memcpy(text,source+offset,n);
+            for(uint32_t i=0;i<n;++i)if(!text[i])text[i]='?';
+            text[n]=0;brook::KPuts(text);offset+=n;
+        }
+        return static_cast<int64_t>(count);
+    }
     if (fde->type == FdType::DebugSerial)
     {
         const char* buf = reinterpret_cast<const char*>(bufAddr);
@@ -8012,7 +8029,7 @@ static int64_t FstatKernel(uint64_t fd,LinuxStat* st)
 
     if (fde->type == FdType::DevKeyboard || fde->type == FdType::DevNull ||
         fde->type == FdType::DevUrandom || fde->type == FdType::DevDsp ||
-        fde->type == FdType::DebugSerial) {
+        fde->type == FdType::DebugSerial || fde->type == FdType::DebugConsole) {
         auto* raw = reinterpret_cast<uint8_t*>(st);
         memset(raw, 0, sizeof(LinuxStat));
         st->st_mode = 0020666; // S_IFCHR
@@ -9648,7 +9665,7 @@ static uint32_t EpollLeafReady(FdEntry* fde, uint32_t events)
         } else if (fde->type == FdType::Socket && fde->handle) {
             int si = static_cast<int>(reinterpret_cast<uintptr_t>(fde->handle)) - 1;
             writable = brook::SockPollReady(si, false, true);
-        } else if (fde->type == FdType::Vnode) {
+        } else if (fde->type == FdType::Vnode || fde->type == FdType::DebugConsole) {
             writable = true;
         } else if (fde->type == FdType::DevTty) {
             writable = true;

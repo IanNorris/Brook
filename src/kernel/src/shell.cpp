@@ -446,7 +446,8 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
                              uint32_t uidOverride = CredentialUnchanged,
                              uint32_t gidOverride = CredentialUnchanged,
                              bool strace = false, bool straceErrors = false,
-                             bool quiet = false, bool trackLaunch = true, bool service = false)
+                             bool quiet = false, bool trackLaunch = true, bool service = false,
+                             bool consoleOutput = false)
 {
     if(!ShutdownLaunchAllowed()) {
         KPrintf("shell: shutdown in progress\n");return -108;
@@ -531,6 +532,12 @@ static int SpawnProcess(const char* path, int argc, const char* const* argv,
     }
     proc->straceEnabled = strace || straceErrors;
     proc->straceErrorsOnly = straceErrors;
+    if(consoleOutput) {
+        for(unsigned fd=1;fd<=2;++fd) {
+            proc->fds[fd].type=FdType::DebugConsole;
+            proc->fds[fd].handle=nullptr;
+        }
+    }
     if (quiet) {
         proc->fds[1].type = FdType::DevNull;
         proc->fds[1].handle = nullptr;
@@ -1098,6 +1105,7 @@ static int ExecCommand(int argc, const char* const* argv)
         bool runOnce = false;
         bool quiet = false;
         bool service = false;
+        bool consoleOutput = false;
 
         // Parse flags before the path
         while (pathIdx < argc) {
@@ -1129,6 +1137,9 @@ static int ExecCommand(int argc, const char* const* argv)
                 // the launcher doesn't double-spawn the rendering server.
                 runOnce = true;
                 pathIdx++;
+            } else if (StrEq(argv[pathIdx], "--console")) {
+                consoleOutput=true;
+                pathIdx++;
             } else if (StrEq(argv[pathIdx], "--quiet")) {
                 quiet = true;
                 pathIdx++;
@@ -1139,7 +1150,7 @@ static int ExecCommand(int argc, const char* const* argv)
 
         if (pathIdx >= argc)
         {
-            KPrintf("usage: run [--as <name>] [--uid <uid>] [--gid <gid>] [--strace] [--quiet] [--once] [--service] <path> [args...]\n");
+            KPrintf("usage: run [--as <name>] [--uid <uid>] [--gid <gid>] [--strace] [--quiet|--console] [--once] [--service] <path> [args...]\n");
             return -1;
         }
 
@@ -1225,10 +1236,10 @@ static int ExecCommand(int argc, const char* const* argv)
             for (int i = 1; i < effArgc && i < 31; ++i)
                 newArgv[i] = effArgv[i];
             return SpawnProcess(shebangPath, effArgc, newArgv, uidOverride, gidOverride,
-                                strace, straceErrors, quiet, !runOnce, service);
+                                strace, straceErrors, quiet, !runOnce, service, consoleOutput);
         }
         return SpawnProcess(shebangPath, effArgc, effArgv, uidOverride, gidOverride,
-                            strace, straceErrors, quiet, !runOnce, service);
+                            strace, straceErrors, quiet, !runOnce, service, consoleOutput);
     }
 
     // Built-in: wait — block until all user processes finish

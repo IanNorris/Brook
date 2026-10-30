@@ -11,6 +11,7 @@
 #include "sync/kmutex.h"
 #include "fw_cfg.h"
 #include "serial.h"
+#include "kprintf.h"
 #include "string.h"
 #include "lz4.h"
 namespace brook {
@@ -295,8 +296,8 @@ void CompressedVfsBootMount() {
             else if(static_cast<unsigned char>(record[i])<=32)valid=false;
         }
         if(!valid || !target || !*target || !CompressedVfsMountFile(record,target))
-            SerialPuts("brookimg: application file mount failed\n");
-        else {FilePageCacheEnableReclaim();SerialPrintf("brookimg: application file ready source=%s path=%s readonly\n",record,target);}
+            KPuts("brookimg: application file mount failed (USB filesystem/image unavailable)\n");
+        else {FilePageCacheEnableReclaim();KPrintf("brookimg: application file ready source=%s path=%s readonly\n",record,target);}
     }
     char device[32]{},path[64]{};auto n=FwCfgReadFile("opt/compressed-image-device",device,sizeof(device));
     if(!n || n>=sizeof(device))return;device[n]=0;

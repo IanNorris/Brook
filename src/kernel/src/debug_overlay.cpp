@@ -16,6 +16,7 @@
 #include "net.h"
 #include "kprintf.h"
 #include "string.h"
+#include "tty.h"
 
 namespace brook {
 
@@ -224,8 +225,13 @@ static void KernelConsoleThread(void* /*arg*/)
 {
     Process* self = ProcessCurrent();
 
-    // Set up VFB via compositor
-    if (!CompositorSetupProcess(self, 20, 60, CONSOLE_W, CONSOLE_H, 1))
+    // Reserve one screen-sized backing for this diagnostic pane. Resizing only
+    // changes its viewport: no allocation per mouse motion, and no stale fixed
+    // 800x400 content under a larger frame. Kernel-owned pixels have no client
+    // that can acknowledge WM resize events.
+    uint32_t* screen=nullptr;uint32_t backingW=CONSOLE_W,backingH=CONSOLE_H,stride=0;
+    TtyGetFramebuffer(&screen,&backingW,&backingH,&stride);
+    if (!CompositorSetupProcess(self, 20, 60, backingW, backingH, 1))
     {
         SerialPuts("KCONSOLE: failed to set up VFB\n");
         return;
@@ -244,8 +250,9 @@ static void KernelConsoleThread(void* /*arg*/)
     const FontAtlas& fa = g_fontAtlas;
     uint32_t lineH = static_cast<uint32_t>(fa.lineHeight);
     uint32_t glyphW = (fa.glyphCount > 0) ? static_cast<uint32_t>(fa.glyphs[0].advance) : 8;
-    uint32_t visibleLines = (CONSOLE_H - 4) / lineH; // leave small margin
-    uint32_t maxCols = (CONSOLE_W - 4) / glyphW;
+    if(!lineH)lineH=16;
+    if(!glyphW)glyphW=8;
+    uint32_t width=0,height=0;
 
     // Local display buffer — stores what's currently rendered
     // We keep a full screen of lines and render on change.
@@ -256,8 +263,16 @@ static void KernelConsoleThread(void* /*arg*/)
     for (;;)
     {
         uint32_t nowTotal = DebugOverlayTotalLines();
-        if (nowTotal != lastTotal)
+        BrookWindowState geometry{};
+        if(consoleIdx<0 || WmSnapshotOwnedWindowState(self,static_cast<uint32_t>(consoleIdx+1),0,&geometry))return;
+        uint32_t nextW=geometry.width<backingW?geometry.width:backingW;
+        uint32_t nextH=geometry.height<backingH?geometry.height:backingH;
+        if (nowTotal != lastTotal || width!=nextW || height!=nextH)
         {
+            width=nextW;height=nextH;
+            uint32_t visibleLines=height>4?(height-4)/lineH:0;
+            if(visibleLines>64)visibleLines=64;
+            uint32_t maxCols=width>4?(width-4)/glyphW:0;
             // New content available — re-render the VFB.
             // Read all available lines from ring (up to visible count).
             // We want the LATEST visibleLines lines, not just new ones.
@@ -265,6 +280,7 @@ static void KernelConsoleThread(void* /*arg*/)
 
             uint32_t totalAvail = g_totalLines;
             uint32_t count = (totalAvail < visibleLines) ? totalAvail : visibleLines;
+            if(count>RING_LINES-1)count=RING_LINES-1;
 
             // Calculate start position: we want the last `count` lines
             uint32_t startLine;
@@ -290,9 +306,8 @@ static void KernelConsoleThread(void* /*arg*/)
 
             // Clear VFB to background
             uint32_t* vfb = self->fbVirtual;
-            uint32_t totalPixels = CONSOLE_W * CONSOLE_H;
-            for (uint32_t i = 0; i < totalPixels; i++)
-                vfb[i] = CONSOLE_BG;
+            for(uint32_t y=0;y<height;++y)
+                for(uint32_t x=0;x<width;++x)vfb[y*width+x]=CONSOLE_BG;
 
             // Render text lines
             for (uint32_t i = 0; i < dispCount; i++)
@@ -303,12 +318,17 @@ static void KernelConsoleThread(void* /*arg*/)
                 uint32_t col = 0;
                 for (const char* cp = line; *cp && col < maxCols; ++cp, ++col)
                 {
-                    RenderGlyph(vfb, CONSOLE_W, CONSOLE_W, CONSOLE_H,
+                    RenderGlyph(vfb, width, width, height,
                                 px, py, static_cast<int>(*cp));
                     px += static_cast<int>(glyphW);
                 }
             }
 
+            // Publish tightly packed viewport geometry for both software and
+            // GPU texture paths; allocation capacity remains screen-sized.
+            KMutexLock(&self->framebufferLock);
+            self->fbVfbWidth=width;self->fbVfbHeight=height;self->fbVfbStride=width;
+            KMutexUnlock(&self->framebufferLock);
             __atomic_store_n(&self->fbDirty, 1u, __ATOMIC_RELEASE);
             CompositorWake();
         }
