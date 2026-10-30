@@ -9,11 +9,14 @@ static long test_syscall(long number, ...) { (void)number; return 0; }
 #undef syscall
 
 int main(void) {
+    for (g_output_scale=1;g_output_scale<=2;++g_output_scale) {
+    for (unsigned x11=0;x11<=1;++x11) {
     for (unsigned version = 1; version <= 4; ++version) {
         int sockets[2];
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
         struct wl_display *display = wl_display_create(); assert(display);
         struct wl_client *client = wl_client_create(display, sockets[0]); assert(client);
+        if(x11)assert(xwayland_attach_client(client));
         assert(!g_outputs);
         output_bind(client, NULL, version, 0);
         assert(g_outputs && !g_outputs->next);
@@ -29,6 +32,7 @@ int main(void) {
             assert(size >= 8 && !(size & 3) && offset + size <= (size_t)bytes);
             assert(event[0] == object && opcode < 6);
             ++counts[opcode]; last = opcode;
+            if (opcode==WL_OUTPUT_SCALE) assert(size==12 && event[2]==(x11?1:g_output_scale));
             if (opcode == WL_OUTPUT_NAME || opcode == WL_OUTPUT_DESCRIPTION) {
                 assert(size >= 12 && event[2] && event[2] <= size - 12);
                 const char *value = (char *)&event[3];
@@ -46,6 +50,9 @@ int main(void) {
         wl_client_destroy(client); assert(!g_outputs);
         close(sockets[1]); wl_display_destroy(display);
     }
-    puts("OUTPUT_IDENTITY_PASS v1/v2/v3/v4 event versions, names and done ordering");
+    }
+    }
+    g_output_scale=1;
+    puts("OUTPUT_IDENTITY_PASS 1x/2x v1/v2/v3/v4 scale values, event versions, names and done ordering");
     return 0;
 }

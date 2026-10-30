@@ -885,3 +885,48 @@ breakdown was measured, so do not attribute the entire delay to that copy.
 Physical graphical-app visibility and the remaining DPI mismatch still need
 review. The kernel/initrd network update/reset loop is physically established;
 standalone application-image upload remains future work.
+
+### DPI provider candidate and boot timing (2026-10-30)
+
+The saved generation3 boot log reaches the scheduler at25570ms and fits the
+wallpaper at25669ms, consistent with the user's observation of over25 seconds.
+The next kernel logs timestamped boundaries around early driver loading, USB
+filesystem probing, application-image mounting and network setup. These are
+boot-only markers, not continuous profiling. A private QEMU run measured the
+application-image mount at11064ms; this is not a physical Dell breakdown.
+
+`waylandd` now separates logical surface geometry from physical presentation:
+integer output scale, scaled native buffers and subsurface destinations in
+both scene and software rendering, inverse absolute pointer coordinates with
+fixed-point fractions, logical resize configures, scaled popup placement and
+cursor images/hotspots. Raw relative mouse packets are unchanged. The
+authenticated Xwayland client's output and native-window bridge retain scale1.
+Client buffer scale and viewport source sampling remain independent of output
+scale, so a2x client buffer is sampled directly at physical resolution.
+
+`display-scale-test.c` exercises actual frontend handlers, CPU pixels, scene
+rectangles, resize, negative input-region edges and wire events; the output
+identity tests check advertised scales for native and attached Xwayland clients.
+The complete Nix provider checks pass. Initial private QEMU acceptance caught
+an asynchronous startup race: the requested200% setting had not yet been
+applied when the provider read100%. Initialization now honors the restored
+requested setting, and the test simulates that race. The first candidate was
+withheld from hardware.
+
+This initial provider fixes its scale at startup.100% and200% are the tested
+targets; intermediate settings are rounded to an integer and live scale changes
+require a provider restart. It does not add subsurface input routing or confined
+pointer support. `prepare_hardware_ram_desktop.py --waylandd /path/to/waylandd`
+can stage a tested provider in the initrd, retaining the root APPS.BRK image;
+its interpreter and shared-library closure must already exist in that image.
+Private QEMU acceptance is required before a hardware update.
+
+Candidate2 (`build/hardware/dpi-desktop-update-v2-20261030`) passed private
+QEMU launch/scale checks and checked shutdown at1920x1080 and at a requested
+3200x1800. The latter actually selected2560x1600; both app windows fit that
+mode. Receipts are `dpi-desktop-qemu-v2-20261030/result.json` and
+`dpi-desktop-qemu-native-20261030/result.json` under `build/hardware`.
+These two checks are semantic, not visual/input proof. The review harness now
+provides a second QMP endpoint so screenshot/input inspection does not wait on
+the monitor connection already held by its shutdown controller. The active
+Dell remains on the previous accepted payload until handed back for update.

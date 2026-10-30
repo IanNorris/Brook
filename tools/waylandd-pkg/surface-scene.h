@@ -124,21 +124,24 @@ static int surface_window(struct brook_surface *s,struct brook_view *view) {
     }
     if (!(s->xdg_toplevel || s->xdg_popup || xwayland)) return 1;
     if (!xwayland && !s->xdg_acked) return 1;
+    const uint32_t scale=surface_output_scale(s);
+    if (view->geometry.w>16384/scale || view->geometry.h>16384/scale) return 0;
+    const uint32_t width=view->geometry.w*scale,height=view->geometry.h*scale;
     struct brook_wm_create_out out={0};
     if (!s->wm_id) {
         int csd=s->xdg_popup || s->deco_csd || (s->xdg_toplevel && !s->deco_negotiated);
         unsigned flags=(csd?BROOK_WM_CREATE_FLAG_CSD:0)|(s->xdg_popup?BROOK_WM_CREATE_FLAG_NO_FOCUS:0);
         if (xwayland) flags=xwayland_surface_flags(s);
-        if (wm_create_window(view->geometry.w,view->geometry.h,s->title[0]?s->title:NULL,flags,&out) || !out.wm_id) return 0;
+        if (wm_create_window(width,height,s->title[0]?s->title:NULL,flags,&out) || !out.wm_id) return 0;
         s->wm_id=out.wm_id;s->scene_disabled=0;
         wm_register_client(s->wm_id,s->resource);
         if (s->app_id[0]) wm_set_app_id(s->wm_id,s->app_id);
         s->deco_pending=0;popup_apply_position(s);
-    } else if (s->vfb_w!=view->geometry.w || s->vfb_h!=view->geometry.h) {
-        if (wm_resize_vfb(s->wm_id,view->geometry.w,view->geometry.h,&out) || !out.vfb_user) return 0;
+    } else if (s->vfb_w!=width || s->vfb_h!=height) {
+        if (wm_resize_vfb(s->wm_id,width,height,&out) || !out.vfb_user) return 0;
     } else return 1;
     s->vfb=(uint32_t *)(uintptr_t)out.vfb_user;s->vfb_stride=out.vfb_stride;
-    s->vfb_w=view->geometry.w;s->vfb_h=view->geometry.h;
+    s->vfb_w=width;s->vfb_h=height;
     if (xwayland) xwayland_surface_created(s);
     return 1;
 }
@@ -234,14 +237,21 @@ static int surface_render(struct brook_surface *root) {
     if (!scene_ensure(root)) return 0;
     struct brook_draw draws[64];unsigned count=0;
     if (!surface_layers(root,draws,&count)) return 0;
+    const uint32_t scale=surface_output_scale(root);
+    /* Match the native scene-service bound in both backends, including
+     * partially visible subsurfaces rather than only the root window. */
+    for(unsigned i=0;i<count;++i)
+        if(draws[i].view->geometry.w>16384/scale || draws[i].view->geometry.h>16384/scale) return 0;
     if (root->scene) {
         struct SceneLayerDesc layers[64];unsigned n=0;
         for (unsigned i=0;i<count;++i) {
             struct brook_draw *d=&draws[i];struct brook_view *view=d->view;
             struct brook_image *image=view->image;const struct brook_geometry *g=&view->geometry;
-            if (d->x>=root->vfb_w || d->y>=root->vfb_h || d->x+g->w<=0 || d->y+g->h<=0) continue;
+            int64_t dx=d->x*scale,dy=d->y*scale;
+            uint32_t dw=g->w*scale,dh=g->h*scale;
+            if (dx>=root->vfb_w || dy>=root->vfb_h || dx+dw<=0 || dy+dh<=0) continue;
             if (!image_gpu(image,root->scene)) return 0;
-            layers[n++]=(struct SceneLayerDesc){image->version,g->sx,g->sy,g->sw,g->sh,(int32_t)d->x,(int32_t)d->y,g->w,g->h,255,0,0,root->vfb_w,root->vfb_h,SCENE_LAYER_FIXED8|(g->transform<<SCENE_LAYER_TRANSFORM_SHIFT)};
+            layers[n++]=(struct SceneLayerDesc){image->version,g->sx,g->sy,g->sw,g->sh,(int32_t)dx,(int32_t)dy,dw,dh,255,0,0,root->vfb_w,root->vfb_h,SCENE_LAYER_FIXED8|(g->transform<<SCENE_LAYER_TRANSFORM_SHIFT)};
         }
         struct ScenePresentDesc desc={(uintptr_t)layers,n,root->vfb_w,root->vfb_h,0};
         long result=scene_ctl(root->scene->fd,SCENE_CTL_PRESENT,&desc,sizeof(desc));
@@ -259,12 +269,14 @@ static int surface_render(struct brook_surface *root) {
         struct brook_draw *d=&draws[i];struct brook_view *view=d->view;
             struct brook_image *image=view->image;const struct brook_geometry *g=&view->geometry;
         if (!image->pixels) return 0; // Never read back a GPU producer as a fallback.
-        int64_t x0=d->x<0?-d->x:0,y0=d->y<0?-d->y:0,x1=g->w,y1=g->h;
-        if (d->x+x1>root->vfb_w) x1=(int64_t)root->vfb_w-d->x;
-        if (d->y+y1>root->vfb_h) y1=(int64_t)root->vfb_h-d->y;
+        int64_t dx=d->x*scale,dy=d->y*scale;
+        struct brook_geometry physical=*g;physical.w*=scale;physical.h*=scale;
+        int64_t x0=dx<0?-dx:0,y0=dy<0?-dy:0,x1=physical.w,y1=physical.h;
+        if (dx+x1>root->vfb_w) x1=(int64_t)root->vfb_w-dx;
+        if (dy+y1>root->vfb_h) y1=(int64_t)root->vfb_h-dy;
         for (int64_t y=y0;y<y1;++y) for (int64_t x=x0;x<x1;++x) {
-            uint32_t *out=&root->composite[(size_t)(d->y+y)*root->vfb_w+d->x+x];
-            uint32_t px,py;brook_geometry_pixel(g,image->width,image->height,x,y,&px,&py);
+            uint32_t *out=&root->composite[(size_t)(dy+y)*root->vfb_w+dx+x];
+            uint32_t px,py;brook_geometry_pixel(&physical,image->width,image->height,x,y,&px,&py);
             *out=pixel_over(image->pixels[(size_t)py*image->width+px],*out);
         }
     }

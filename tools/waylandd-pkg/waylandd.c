@@ -125,6 +125,10 @@ static int g_trace_frames;
 static uint64_t g_trace_surface_id, g_trace_ticks, g_trace_dispatches;
 static uint32_t g_trace_last_tick, g_trace_tick_max_ms, g_trace_last_report;
 static uint32_t g_trace_input_max_ms, g_trace_dispatch_max_ms;
+/* One output, fixed for this provider lifetime. Surface geometry stays logical;
+ * native WM buffers and coordinates stay physical. Xwayland's native window
+ * bridge has an explicit pixel contract and is deliberately not transformed. */
+static uint32_t g_output_scale=1;
 
 static uint32_t g_now_ms(void) {
     struct timespec ts;
@@ -195,6 +199,18 @@ static long wm_get_screen_info(uint32_t *w_out, uint32_t *h_out) {
     long rc = syscall(BROOK_SYS_WM_GET_SCREEN_INFO, (long)buf, 0, 0, 0, 0);
     if (rc == 0) { *w_out = buf[0]; *h_out = buf[1]; }
     return rc;
+}
+static void output_scale_init(void) {
+    long percent=syscall(0xB04,2L,0L,0L,0L,0L,0L);
+    long requested=syscall(0xB04,0L,0L,0L,0L,0L,0L);
+    /* Startup preferences are restored before the provider starts, but the
+     * compositor applies them asynchronously on its first frame. Honor that
+     * pending setting rather than freezing the previous 100% at this race. */
+    if(requested>=100 && requested<=400)percent=requested;
+    /* Initial support is integer scale. Match 100/200/300/400 percent exactly;
+     * report a bounded nearest integer for intermediate desktop settings. */
+    if (percent>=100 && percent<=400) g_output_scale=(uint32_t)(percent+50)/100;
+    fprintf(stderr,"[waylandd] output scale=%u desktop_percent=%ld (fixed until provider restart)\n",g_output_scale,percent);
 }
 
 /* ---------------- per-surface state ---------------- */
@@ -363,6 +379,7 @@ struct brook_surface {
     int     is_cursor;
     int32_t cursor_hot_x;
     int32_t cursor_hot_y;
+    uint32_t cursor_output_scale;
 
     /* Linked list of all surfaces — used by the input pump. */
     struct brook_surface *next;
@@ -387,6 +404,18 @@ static void xwayland_native_unmapped(struct brook_surface *);
 static void xwayland_pair_surfaces(void);
 static void xwayland_generation_lost(void);
 static int xwayland_accept_view(struct brook_surface *,uint32_t,uint32_t);
+static uint32_t surface_output_scale(const struct brook_surface *s) {
+    if (s->is_cursor && s->cursor_output_scale) return s->cursor_output_scale;
+    while (s->tree.parent) s=s->tree.parent->user;
+    return s->role==4?1:g_output_scale;
+}
+static wl_fixed_t surface_pointer_fixed(const struct brook_surface *s,int32_t physical) {
+    int64_t value=(int64_t)physical*256/surface_output_scale(s);
+    return value<INT32_MIN?INT32_MIN:value>INT32_MAX?INT32_MAX:(wl_fixed_t)value;
+}
+static int32_t pointer_fixed_floor(wl_fixed_t value) {
+    return (int32_t)(value>=0?(int64_t)value/256:-((-(int64_t)value+255)/256));
+}
 #include "surface-scene.h"
 #include "xwayland-shell.h"
 #include "xwayland-xwm.h"
@@ -476,7 +505,10 @@ static void positioner_compute_geometry(const struct brook_positioner *p,
 static void popup_apply_position(struct brook_surface *s) {
     if (!s || !s->xdg_popup || !s->wm_id || !s->popup_parent || !s->popup_parent->wm_id)
         return;
-    long rc = wm_move_relative(s->wm_id, s->popup_parent->wm_id, s->popup_x, s->popup_y);
+    const int64_t scale=surface_output_scale(s);
+    int64_t px=(int64_t)s->popup_x*scale,py=(int64_t)s->popup_y*scale;
+    if (px<INT32_MIN || px>INT32_MAX || py<INT32_MIN || py>INT32_MAX) return;
+    long rc = wm_move_relative(s->wm_id, s->popup_parent->wm_id, (int32_t)px, (int32_t)py);
     if (rc != 0) {
         fprintf(stderr, "[waylandd] WM_MOVE_RELATIVE popup=%u parent=%u at (%d,%d) failed rc=%ld errno=%d\n",
                 s->wm_id, s->popup_parent->wm_id, s->popup_x, s->popup_y, rc, errno);
@@ -599,7 +631,8 @@ static void surface_cursor_commit(struct brook_surface *s) {
     if (!view || !view->image->pixels) return;
     const struct brook_geometry *g=&view->geometry;
     const struct brook_image *image=view->image;
-    uint32_t dw=g->w>64?64:g->w,dh=g->h>64?64:g->h;
+    uint32_t scale=surface_output_scale(s);
+    uint32_t dw=g->w*scale>64?64:g->w*scale,dh=g->h*scale>64?64:g->h*scale;
     struct brook_geometry cursor=*g;cursor.w=dw;cursor.h=dh;
     uint32_t pixels[64*64];
     for (uint32_t y=0;y<dh;++y) for (uint32_t x=0;x<dw;++x) {
@@ -660,6 +693,7 @@ static void surface_commit(struct wl_client *c,struct wl_resource *r) {
         /* Keep the bounded GTK fallback, honoring committed client constraints.
          * Hints are advisory: never turn an absurd minimum into a huge SHM pool. */
         uint32_t screen_w=0,screen_h=0;wm_get_screen_info(&screen_w,&screen_h);
+        screen_w/=surface_output_scale(s);screen_h/=surface_output_scale(s);
         const int32_t cap_w=screen_w && screen_w<4096?(int32_t)screen_w:4096;
         const int32_t cap_h=screen_h && screen_h<2160?(int32_t)screen_h:2160;
         const int32_t width=toplevel_initial_axis(800,s->size_hints.min_w,s->size_hints.max_w,cap_w);
@@ -1391,6 +1425,7 @@ static void pointer_set_cursor(struct wl_client *c, struct wl_resource *r,
                 wl_resource_post_error(r,WL_POINTER_ERROR_ROLE,"surface already has a role");return;
             }
             cs->role=3;cs->is_cursor = 1;
+            cs->cursor_output_scale=sc->entered_surface?surface_output_scale(sc->entered_surface):g_output_scale;
             cs->cursor_hot_x = hx;
             cs->cursor_hot_y = hy;
         }
@@ -1636,7 +1671,7 @@ static void output_bind(struct wl_client *client, void *data,
     wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
                         w, h, 60000);
     if (version >= 2) {
-        wl_output_send_scale(r, 1);
+        wl_output_send_scale(r, client==g_xwayland_client?1:g_output_scale);
         if (version >= 4) {
             wl_output_send_name(r, "BROOK-1");
             wl_output_send_description(r, "Brook virtual display");
@@ -1693,7 +1728,7 @@ static void pointer_enter_if_needed(struct brook_seat_client *sc,
     }
     if (s) {
         wl_pointer_send_enter(sc->pointer, next_serial(), s->resource,
-                              wl_fixed_from_int(lx), wl_fixed_from_int(ly));
+                              surface_pointer_fixed(s,lx), surface_pointer_fixed(s,ly));
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
     }
@@ -1717,11 +1752,12 @@ static void dispatch_surface_event(struct brook_surface *s,
         pointer_relative_dispatch(s,sc,e);break;
     case EVT_MOUSE_MOVE: {
         if (!sc || !sc->pointer || pointer_surface_locked(s)) break;
-        sc->pointer_x=e->x;sc->pointer_y=e->y;
+        sc->pointer_x=pointer_fixed_floor(surface_pointer_fixed(s,e->x));
+        sc->pointer_y=pointer_fixed_floor(surface_pointer_fixed(s,e->y));
         pointer_enter_if_needed(sc, s, e->x, e->y);
         wl_pointer_send_motion(sc->pointer, now,
-                               wl_fixed_from_int(e->x),
-                               wl_fixed_from_int(e->y));
+                               surface_pointer_fixed(s,e->x),
+                               surface_pointer_fixed(s,e->y));
         if (wl_resource_get_version(sc->pointer) >= 5)
             wl_pointer_send_frame(sc->pointer);
         pointer_constraints_refresh();
@@ -1735,7 +1771,8 @@ static void dispatch_surface_event(struct brook_surface *s,
             break;
         }
         if(e->reserved && !pointer_event_token(s,e->reserved))break;
-        sc->pointer_x=e->x;sc->pointer_y=e->y;
+        sc->pointer_x=pointer_fixed_floor(surface_pointer_fixed(s,e->x));
+        sc->pointer_y=pointer_fixed_floor(surface_pointer_fixed(s,e->y));
         pointer_enter_if_needed(sc, s, e->x, e->y);
         /* scan: 0=left, 1=right, 2=middle  →  BTN_LEFT 0x110, etc. */
         uint32_t btn = 0x110 + (e->scan & 0x3);
@@ -1848,8 +1885,8 @@ static void dispatch_surface_event(struct brook_surface *s,
          * the new size — the client will allocate a fresh buffer at
          * those dimensions, ack_configure, and commit. */
         if (s->xdg_toplevel && s->xdg_surface) {
-            int32_t neww = e->x;
-            int32_t newh = e->y;
+            int32_t neww = e->x/(int32_t)surface_output_scale(s);
+            int32_t newh = e->y/(int32_t)surface_output_scale(s);
             s->toplevel_maximized=(e->reserved&WM_RESIZE_MAXIMIZED)!=0;
             s->toplevel_resizing=!s->toplevel_maximized && (e->reserved&WM_RESIZE_RESIZING)!=0;
             s->configure_width=neww;s->configure_height=newh;s->configure_size_pending=1;
@@ -1873,8 +1910,8 @@ static void toplevel_set_activated(struct brook_surface *surface, int active) {
     if (!surface->xdg_toplevel || !surface->xdg_surface ||
         surface->toplevel_activated == active) return;
     surface->toplevel_activated=active;
-    int32_t width=surface->window_geometry_w>0?surface->window_geometry_w:(int32_t)surface->vfb_w;
-    int32_t height=surface->window_geometry_h>0?surface->window_geometry_h:(int32_t)surface->vfb_h;
+    int32_t width=surface->window_geometry_w>0?surface->window_geometry_w:(int32_t)(surface->vfb_w/surface_output_scale(surface));
+    int32_t height=surface->window_geometry_h>0?surface->window_geometry_h:(int32_t)(surface->vfb_h/surface_output_scale(surface));
     if(surface->toplevel_maximized || surface->configure_size_pending) {
         width=surface->configure_width;height=surface->configure_height;
     }
@@ -2706,6 +2743,7 @@ static void dmabuf_bind(struct wl_client *client, void *data, uint32_t version,
 int main(int argc, char **argv)
 {
     fprintf(stderr, "[waylandd] starting (Phase D — kernel-WM unified)\n");
+    output_scale_init();
     int run_seconds = 0;
     const char *xwayland_server=NULL,*xwm_helper=NULL,*xdisplay=":0";
     for (int i = 1; i < argc; ++i) {

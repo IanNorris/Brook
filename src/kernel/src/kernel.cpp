@@ -791,7 +791,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     //   we prefer loading it from the virtio disk for demonstration.
     brook::KsymDump();
     brook::SerialPuts("module: Phase 1 — loading from /drivers (ramdisk)\n");
+    brook::KLog("BOOT stage: early modules begin");
     brook::ModuleDiscoverAndLoad("/drivers");
+    brook::KLog("BOOT stage: early modules complete");
 
     // Phase 2: load late modules from /boot/drivers (virtio disk).
     //   ps2_kbd.mod and virtio_blk.mod live here.
@@ -815,6 +817,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // The xHCI module registers "usb0", "usb1", etc. as block devices.
     // First scan each for GPT partition tables; then probe all resulting
     // partition sub-devices (usb0p1, usb0p2, ...) for filesystems.
+    brook::KLog("BOOT stage: USB filesystem probing begin");
     for (uint32_t i = 0; i < 4; ++i)
     {
         char name[8] = "usb";
@@ -855,7 +858,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
     }
 
+    brook::KLog("BOOT stage: USB filesystem probing complete");
+    brook::KLog("BOOT stage: application image mount begin");
     brook::CompressedVfsBootMount();
+    brook::KLog("BOOT stage: application image mount complete");
     // Provision with boot-time kernel authority after every storage mount is
     // available, before scheduler kernel threads acquire ordinary credentials.
     PrepareDesktopHome();
@@ -864,6 +870,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // RunIOBenchmarkSuite();
 
     // ---- Network (static config from BROOK.CFG, or DHCP) ----
+    brook::KLog("BOOT stage: network configuration begin");
     if (brook::NetGetIf()) {
         brook::BootLogoProgress(75, "Network");
         brook::NetIf* nif = brook::NetGetIf();
@@ -893,6 +900,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         }
     }
 
+    brook::KLog("BOOT stage: network configuration complete");
     ConfigureResolverFile();
 
     // ---- Syscall table ----

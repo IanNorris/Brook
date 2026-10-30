@@ -12,6 +12,7 @@ ROOT=Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--recovery-probe',type=Path,required=True);p.add_argument('--maintenance-probe',type=Path,required=True)
 p.add_argument('--output',type=Path,required=True);p.add_argument('--build',type=Path,default=ROOT/'build/release')
+p.add_argument('--waylandd',type=Path,help='Stage a tested replacement provider in the initrd; its runtime closure must already exist in APPS.BRK')
 a=p.parse_args();recovery=a.recovery_probe.resolve(strict=True);maintenance=a.maintenance_probe.resolve(strict=True);build=a.build.resolve(strict=True);out=a.output.resolve()
 if not os.environ.get('MUSL_CC'):p.error('Run in nix-shell with MUSL_CC')
 def sha(path):
@@ -42,8 +43,15 @@ for name,text in markers.items():
     path=out/name;path.write_text(text)
     if name=='hardware-update-key':path.chmod(0o600)
     run('mcopy','-o','-i',initrd,path,'::ETC/'+name)
+provider='/nix/profile/bin/waylandd';provider_meta=None
+if a.waylandd:
+    binary=a.waylandd.resolve(strict=True)
+    if not binary.is_file() or binary.read_bytes()[:4]!=b'\x7fELF':p.error('Replacement provider must be an ELF file')
+    run('cp',binary,out/'waylandd')
+    run('mcopy','-o','-i',initrd,out/'waylandd','::BOOT/waylandd')
+    provider='/boot/waylandd';provider_meta={'source':str(binary),'sha256':sha(binary)}
 rc=out/'INIT.RC';rc.write_text('set wm\nset vfb none\nsched eevdf\nkconsole\n'
-    'run --service --once --uid 1000 /nix/profile/bin/waylandd\n'
+    f'run --service --once --uid 1000 {provider}\n'
     'run --service --once --uid 1000 /nix/profile/bin/hardware-dbus\n'
     'run --service --once --uid 1000 /nix/profile/bin/hardware-message\n'
     'run --console --uid 1000 /boot/HWSTATUS.ELF\n')
@@ -55,5 +63,6 @@ manifest={'scope':'Opt-in RAM application desktop; kernel/initrd upload only','p
     'initial_headroom_bytes':256*1024**2,'update_key_file':str(out/'hardware-update-key'),'recovery_probe':str(recovery),
     'maintenance_probe':str(maintenance),'physical_status':'Prepared; QEMU and physical acceptance required',
     'ephemeral_home':True,'usb_read_only':False,'mutable_usb_application_mount':False}
+if provider_meta:manifest['wayland_provider_override']=provider_meta
 (out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
 print('HARDWARE_RAM_DESKTOP_PREPARED',out)

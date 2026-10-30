@@ -38,6 +38,11 @@ stdenv.mkDerivation {
 
   checkPhase = ''
     $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
+        display-scale-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
+        linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \
+        -L${wayland}/lib -lwayland-server -o display-scale-test
+    ./display-scale-test
+    $CC -O2 -UNDEBUG -Wall -Wextra -I${wayland.dev}/include -I. \
         pointer-constraints-test.c xdg-shell-protocol.c xdg-decoration-protocol.c viewporter-protocol.c \
         linux-dmabuf-unstable-v1-protocol.c kde-server-decoration-protocol.c text-input-v3-protocol.c xwayland-shell-v1-protocol.c relative-pointer-v1-protocol.c pointer-constraints-v1-protocol.c \
         -L${wayland}/lib -lwayland-server -o pointer-constraints-test
