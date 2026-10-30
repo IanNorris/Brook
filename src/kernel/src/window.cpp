@@ -2876,7 +2876,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
                                                uint16_t clientW,
                                                uint16_t clientH,
                                                const char* title,
-                                               bool focusable)
+                                               bool focusable,
+                                               bool nativeClient)
 {
     WmCreateWindowResult res = {};
     VfbGuard guard;
@@ -2898,10 +2899,13 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
     Window& w = g_windows[idx];
 
     // Allocate the VFB pages kernel-side.
-    // API-created windows may be relayed by a shared userspace compositor.
-    // Its PID is provider identity, never an inferred application identity.
-    w.clientPid=0;w.clientIncarnation=0;w.clientLaunchId=0;
-    w.clientOrigin=WmClientOrigin::Unknown;
+    // Shared display-server windows must prove their client separately.
+    // A native caller can explicitly identify only itself; retain the identity
+    // captured by CreateWindowLocked, never a userspace-supplied PID.
+    if (!nativeClient) {
+        w.clientPid=0;w.clientIncarnation=0;w.clientLaunchId=0;
+        w.clientOrigin=WmClientOrigin::Unknown;
+    }
     uint32_t stride = clientW;
     uint64_t bytes  = static_cast<uint64_t>(stride) * clientH * 4;
     uint64_t pages  = (bytes + 4095) / 4096;

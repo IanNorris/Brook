@@ -346,7 +346,8 @@ WmCreateWindowResult WmCreateWindowForProcess(Process* proc,
                                                uint16_t clientW,
                                                uint16_t clientH,
                                                const char* title,
-                                               bool focusable = true);
+                                               bool focusable = true,
+                                               bool nativeClient = false);
 
 void WmDestroyWindowById(Process* proc, uint32_t wmId);
 void WmSignalDirtyById(Process* proc, uint32_t wmId);

@@ -11859,6 +11859,7 @@ static int64_t sys_brook_input_grab(uint64_t enable, uint64_t, uint64_t,
 //   arg4 = flags:
 //          bit 0 requests initial client-side decoration/noChrome
 //          bit 1 creates a raised but non-keyboard-focusable popup/tool window
+//          bit 2 identifies this process itself as the native application client
 // Returns 0 on success, -errno on failure.
 struct BrookWmCreateOut {
     uint32_t wmId;
@@ -11886,12 +11887,13 @@ static int64_t sys_brook_wm_create_window(uint64_t cW, uint64_t cH,
         titleBuf[sizeof(titleBuf) - 1] = '\0';
     }
 
+    if (flags & ~7ull) return -EINVAL;
     bool focusable = (flags & 2u) == 0;
     auto res = brook::WmCreateWindowForProcess(proc,
                                                  static_cast<uint16_t>(cW),
                                                  static_cast<uint16_t>(cH),
                                                  titlePtr ? titleBuf : nullptr,
-                                                 focusable);
+                                                 focusable, (flags & 4u) != 0);
     if (res.wmId == 0) return -ENOMEM;
     if (flags & 1u) {
         brook::WmSetClientSideDecoration(static_cast<int>(res.wmId) - 1, true);

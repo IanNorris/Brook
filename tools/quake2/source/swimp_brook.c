@@ -212,7 +212,7 @@ static void fps_record_and_draw(void)
 int SWimp_Init(void *hInstance, void *wndProc)
 {
     struct brook_q2_window_out out = {0};
-    if (syscall(506, 640L, 480L, (long)"Quake II", (long)&out, 0L, 0L) < 0)
+    if (syscall(506, 640L, 480L, (long)"Quake II", (long)&out, 4L, 0L) < 0)
     {
         ri.Con_Printf(PRINT_ALL, "SWimp_Init: cannot create native window\n");
         return false;

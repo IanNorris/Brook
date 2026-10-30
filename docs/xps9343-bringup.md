@@ -1100,3 +1100,38 @@ adapter behavior is covered by the host test. The final executable (SHA256
 is installed on the Dell and launched into `base1`, with the earlier executable
 retained as `quake2.before-mouse`. Physical mouse acceptance remains pending.
 Installation/job evidence: `dell-quake2-mouse-install-20261030/result.json`.
+
+### Native-window identity and shutdown follow-up (2026-10-30)
+
+The earlier mouse-pass shutdown failure came from native Quake using the
+per-window API, whose default deliberately records an unknown client: a shared
+userspace compositor cannot identify an app merely by owning its buffer.
+`WmApplyDebugAction(Close)` therefore refused that window, leaving shutdown in
+`Closing apps`. This was an identity-policy mismatch, not evidence of a game
+save prompt or a filesystem sync stall.
+
+WM_CREATE_WINDOW flag bit2 now explicitly requests native self-origin. It
+retains only the calling process's kernel-recorded group/incarnation/launch
+identity; callers cannot supply another app's PID. The default remains unknown
+for display-server windows, with Unix-peer registration still required.
+Unrecognized flag bits fail with EINVAL. Quake requests native self-origin.
+
+`tools/hardware_native_window_probe.c` and
+`scripts/test_hardware_native_window.py` exercise the actual private guest:
+ordinary UID1000, unknown relay has no close capability, explicit native window
+has the correct client identity, semantic close reaches its event queue, and
+the original process exits0 after destroying its window. Evidence is
+`build/hardware/native-window-qemu-20261030/native-qa/result.json`. Existing
+window-surface, pointer-capture and shutdown host tests also pass.
+
+The candidate pair is frozen at
+`build/hardware/native-window-update-v1-20261030`; the Dell remains on the prior
+accepted bulk payload while this update is tested. No recovery slot or USB
+application image was modified during preparation.
+
+The same private guest then rendered Quake's demo with native client identity.
+Quake was deliberately left running when the harness requested shutdown: the
+cooperative close completed, application/service cleanup and sync reached
+`ready`, and QEMU exited successfully. Both `result.json` and `shutdown.json`
+in `native-window-qemu-20261030` confirm this corrected end-to-end gate. The
+physical Dell has not yet booted this candidate kernel.
