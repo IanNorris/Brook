@@ -1,4 +1,6 @@
 #include "chrome_material.h"
+#include "keyboard.h"
+#include "kprintf.h"
 #include "compositor_wake_sequence.h"
 #include "apic.h"
 #include "scene_damage.h"
@@ -48,6 +50,12 @@ struct CompositorMutexGuard {
     ~CompositorMutexGuard() { KMutexUnlock(mutex); }
 };
 
+
+static bool g_hardwareProbe=false;
+void CompositorSetHardwareProbe(bool enabled) {
+    __atomic_store_n(&g_hardwareProbe,enabled,__ATOMIC_RELEASE);
+    if(enabled) KPuts("HWPROBE: press plain A several times; key events need no terminal app\n");
+}
 
 // Cached physical framebuffer info.
 static volatile uint32_t* g_physFb       = nullptr;
@@ -2244,6 +2252,9 @@ static void CompositorInputWM()
         if (ev.type != InputEventType::KeyPress && ev.type != InputEventType::KeyRelease)
             continue;
 
+        if(__atomic_load_n(&g_hardwareProbe,__ATOMIC_ACQUIRE))
+            KPrintf("HWKEY: %s sc=0x%x mods=0x%x\n",
+                    ev.type==InputEventType::KeyPress?"down":"up",ev.scanCode,ev.modifiers);
         // --- Global hotkeys (work regardless of focus state) ---
         if (ev.type == InputEventType::KeyPress)
         {
@@ -3587,6 +3598,7 @@ static void CompositorLoop()
     // memcpy of window pixels into the framebuffer). The desktop layer
     // (wallpaper + chrome + taskbar) was rendered into g_backBuffer above and is
     // uploaded as a texture inside CompositorPresentGPU.
+    const uint64_t probePresentStart=ApicTickCount();
     if (CompositorGpuActive())
     {
         // Capture the desktop dirty span (decoration changes — wallpaper, chrome,
@@ -3633,6 +3645,7 @@ static void CompositorLoop()
         brook::DisplayFlush(minY, maxY);
     }
 
+    const uint64_t probePresentEnd=ApicTickCount();
     framePhase.Change(FramePhase::DebugCapture);
     CaptureCompletedDebugFrame(epoch,presented);
 
@@ -3655,6 +3668,18 @@ static void CompositorLoop()
     }
     uint64_t loopEndTick = ApicTickCount();
     uint64_t loopMs = loopEndTick - loopStartTick;
+    if(__atomic_load_n(&g_hardwareProbe,__ATOMIC_ACQUIRE)) {
+        static uint64_t count=0,last=0;
+        static uint32_t lastBytes=0;
+        const auto keys=KbdProbeSnapshot();
+        if(++count<=4 || loopEndTick-last>=2000 || keys.bytes!=lastBytes) {
+            last=loopEndTick;lastBytes=keys.bytes;
+            KPrintf("HWFRAME: %ux%u stride=%u frame=%lu\n",g_physFbWidth,g_physFbHeight,g_physFbStride,count);
+            KPrintf("HWMS: draw=%lu copy=%lu period=%lu (guest clock)\n",
+                    probePresentStart-loopStartTick,probePresentEnd-probePresentStart,periodMs);
+            KPrintf("HWKBD: irq=%u bytes=%u status=0x%x last=0x%x\n",keys.irqs,keys.bytes,keys.status,keys.lastByte);
+        }
+    }
     if (periodMs > 0)
     {
         SpinLockAcquire(&g_presentStatsLock);

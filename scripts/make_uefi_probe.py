@@ -22,6 +22,7 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--build',type=Path,default=ROOT/'build/release')
     ap.add_argument('--output',type=Path,required=True)
+    ap.add_argument('--input-probe',action='store_true',help='Request <=1280x720 and display keyboard/frame diagnostics')
     args=ap.parse_args();build=args.build.resolve();out=args.output.resolve()
     for tool in ['mcopy','mmd','mtype','mkfs.fat','sfdisk']:
         if not shutil.which(tool):ap.error('Missing '+tool+'; run inside nix-shell')
@@ -34,13 +35,13 @@ def main():
     run('bash',ROOT/'scripts/make_initrd.sh','--release',env=env)
     initrd=out/'build/esp/INITRD.IMG'
     run('mmd','-i',initrd,'::BOOT')
-    startup=out/'INIT.RC';startup.write_text('set wm\nset vfb none\nkconsole\n')
+    startup=out/'INIT.RC';startup.write_text('set wm\nset vfb none\nkconsole\n'+('hwprobe on\n' if args.input_probe else ''))
     run('mcopy','-i',initrd,startup,'::BOOT/INIT.RC')
     payload=out/'payload';(payload/'EFI/BOOT').mkdir(parents=True);(payload/'KERNEL').mkdir()
     shutil.copy2(loader,payload/'EFI/BOOT/BOOTX64.EFI')
     shutil.copy2(kernel,payload/'KERNEL/BROOK.ELF')
     shutil.copy2(initrd,payload/'INITRD.IMG')
-    (payload/'BROOK.CFG').write_text('TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nLOG_MEMORY=0\nLOG_INTERRUPTS=0\n')
+    (payload/'BROOK.CFG').write_text('TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nLOG_MEMORY=0\nLOG_INTERRUPTS=0\n'+('DISPLAY_WIDTH=1280\nDISPLAY_HEIGHT=720\n' if args.input_probe else ''))
     (payload/'README.TXT').write_text(
         'Brook XPS 13 9343: first UEFI/kernel bring-up probe\n\n'
         'Use F12 and select the UEFI USB entry; Secure Boot must be disabled\n'
@@ -51,6 +52,11 @@ def main():
         'Input may be unavailable; that is outside this first boot gate.\n'
         'If it stops, record the last message/progress and scan panic QR pages.\n'
         'Scanner: https://khione:9001/ or https://192.168.85.8:9001/\n')
+    if args.input_probe:
+        with (payload/'README.TXT').open('a') as f:
+            f.write('\nInput probe: requests <=1280x720 GOP; fallback is smallest mode.\n'
+                    'Press plain A several times; HWKEY/HWKBD counters should change.\n'
+                    'External USB keyboards still require the future xHCI driver gate.\n')
     files={str(p.relative_to(payload)):dict(bytes=p.stat().st_size,sha256=sha(p))
            for p in sorted(payload.rglob('*')) if p.is_file()}
     esp=out/'esp.img'

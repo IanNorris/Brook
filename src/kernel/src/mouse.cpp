@@ -260,6 +260,12 @@ IRQ_NAKED_HANDLER(MouseIrqHandler, MouseIrqHandlerInner)
 void MouseInit()
 {
     if (g_mouseInit) return;
+    struct InterruptGuard {
+        uint64_t flags;
+        InterruptGuard() { __asm__ volatile("pushfq; pop %0; cli":"=r"(flags)::"memory"); }
+        ~InterruptGuard() { if(flags & (1ull<<9)) __asm__ volatile("sti":::"memory"); }
+    } guard; // command-byte responses must not be consumed by IRQ1
+
 
     // VMware firmware/tools may leave the paravirtual pointer enabled. This
     // driver consumes ordinary relative PS/2 packets, not the backdoor queue.
@@ -283,7 +289,7 @@ void MouseInit()
     SerialPuts("MOUSE: initialising PS/2 auxiliary device\n");
 
     // Flush any stale bytes
-    while (inb(0x64) & 0x01) inb(0x60);
+    for (unsigned i=0;i<32 && (inb(0x64)&1);++i) (void)inb(0x60);
 
     // Enable the auxiliary (mouse) port on the 8042 controller first.
     CtrlCmd(0xA8);
@@ -389,7 +395,7 @@ void MouseInit()
     SerialPrintf("MOUSE: 8042 config after init = 0x%x\n", cfgAfter);
 
     // Flush any residual data from init
-    while (inb(0x64) & 0x01) inb(0x60);
+    for (unsigned i=0;i<32 && (inb(0x64)&1);++i) (void)inb(0x60);
 
     // Register with the input subsystem
     InputRegister(&g_mouseInputDev);

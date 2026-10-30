@@ -817,6 +817,11 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
+    if (StrEq(cmd,"hwprobe") && argc>=2) {
+        CompositorSetHardwareProbe(StrEq(argv[1],"on"));
+        return 0;
+    }
+
     // Built-in: set <key> [<value>]
     if (StrEq(cmd, "set") && argc >= 2)
     {

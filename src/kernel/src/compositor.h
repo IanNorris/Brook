@@ -195,4 +195,7 @@ uint32_t CompositorGetWindows(Process* caller, WmWindowDesc* out, uint32_t maxCo
 // Returns user-space address, or 0 on failure.
 uint64_t CompositorMapWindowVfb(Process* caller, uint32_t wmId);
 
+// Opt-in bare-metal probe: bounded frame/key counters in kernel console.
+void CompositorSetHardwareProbe(bool enabled);
+
 } // namespace brook

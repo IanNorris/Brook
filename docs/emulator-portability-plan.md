@@ -157,6 +157,38 @@ Required behavior:
   boot, display/input, bridge discovery, capture, guest command, clean shutdown,
   restart and filesystem integrity. Cross-compilation alone is insufficient.
 
+## Dell input and software-display probe (2026-10-30)
+
+The first physical boot reached the desktop with all four logical CPUs online.
+The user confirmed the internal pointer works, but reported very slow redraws
+and no response to Super+Enter. The RAM-only probe has no terminal executable,
+so that shortcut alone does not establish keyboard failure.
+
+The next probe explicitly configures i8042 IRQ1/translation, preserves auxiliary
+settings, and verifies the command byte with port 1 disabled before enabling it.
+Both keyboard and mouse initialization preserve the caller's interrupt state.
+Controller waits and stale-byte drains are bounded; keyboard reset, scan-set
+negotiation and USB driver bring-up remain separate work.
+
+`make_uefi_probe.py --input-probe` requests `DISPLAY_WIDTH=1280` and
+`DISPLAY_HEIGHT=720` in BROOK.CFG. GOP selection prefers the largest mode fitting
+both dimensions, or the smallest linear framebuffer if none fits. Without these
+settings the default remains 1920x1080, then 1280x720, then largest available.
+
+The optional `hwprobe on` command reports geometry, raw IRQ1/status/byte counters,
+decoded key actions and draw versus framebuffer-copy time in the kernel console.
+These durations use the guest clock and are diagnostic, not a wall-clock timing
+validation. Press plain A repeatedly and photograph HWKEY/HWKBD/HWMS lines.
+External USB keyboards are not supported by this module-free probe.
+
+The final payload passed USB/UEFI boot under QEMU without VirtIO devices or KVM
+clock CPUID exposure, at 1280x720; three A presses and releases reached both raw
+counters and decoded events. Host tests cover mode-order permutations, auxiliary
+configuration preservation, controller timeouts and failed readback. Entry-state
+and scheduler-start audits passed. Physical resolution, keyboard response and
+redraw speed still need the next Dell test. No framebuffer PAT/cache alias change
+was made: compositor HHDM and TTY aliases must be considered together with MTRRs.
+
 ## Sources
 
 - [Oracle emulated devices and paravirtualization providers](https://docs.oracle.com/en/virtualization/virtualbox/7.2/user/working-with-vms.html)

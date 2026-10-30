@@ -8,6 +8,7 @@
 #include "kprintf.h"
 #include "portio.h"
 #include "irq_wrapper.h"
+#include "ps2_keyboard_config.h"
 
 namespace brook {
 
@@ -396,9 +397,16 @@ static volatile bool g_superHeld = false;
 static volatile bool g_capsLock  = false;
 static volatile bool g_e0Prefix  = false; // E0-prefixed extended key pending
 
-// Drop the first few IRQs after init — UEFI/QEMU generates spurious scancodes
-// during keyboard reset that arrive after our flush in KbdInit.
-static volatile int g_settleCount = 2;
+// Probe counters are sampled outside IRQ context; never print from this path.
+// Do not discard the first real keys during firmware handoff.
+static uint32_t g_probeIrqs=0, g_probeBytes=0;
+static uint8_t g_probeStatus=0, g_probeByte=0;
+KbdProbeStats KbdProbeSnapshot() {
+    return {__atomic_load_n(&g_probeIrqs,__ATOMIC_RELAXED),
+            __atomic_load_n(&g_probeBytes,__ATOMIC_RELAXED),
+            __atomic_load_n(&g_probeStatus,__ATOMIC_RELAXED),
+            __atomic_load_n(&g_probeByte,__ATOMIC_RELAXED)};
+}
 
 // SysRq-style panic: Ctrl+ScrollLock fires a diagnostic kernel panic.
 // ScrollLock = scancode 0x46.  Only triggers on key-press (not release).
@@ -415,7 +423,9 @@ extern "C" void KbdIrqHandlerInner(void)
 {
     // Check that OBF is set and the byte is NOT from the auxiliary (mouse) port.
     // If bit 5 (AUXB) is set, this is mouse data — don't consume it here.
+    __atomic_add_fetch(&g_probeIrqs,1,__ATOMIC_RELAXED);
     uint8_t status = inb(0x64);
+    __atomic_store_n(&g_probeStatus,status,__ATOMIC_RELAXED);
     if (!(status & 0x01) || (status & 0x20))
     {
         ApicSendEoi();
@@ -423,24 +433,14 @@ extern "C" void KbdIrqHandlerInner(void)
     }
 
     uint8_t sc = inb(0x60); // read scan code from PS/2 data port
+    __atomic_store_n(&g_probeByte,sc,__ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_probeBytes,1,__ATOMIC_RELAXED);
 
     // Filter out keyboard self-test/command response codes that the i8042
     // generates during boot (UEFI handoff). These are NOT valid key scancodes.
-    // NOTE: 0xAA is both the keyboard self-test pass AND the Left Shift
-    // release (0x2A | 0x80).  Only filter it during the settle window;
-    // after that it's a real key release.
+    // 0xAA is also Left Shift release, so it must reach the decoder.
     if (sc == 0xFC || sc == 0xFE || sc == 0xFF || sc == 0x00)
     {
-        ApicSendEoi();
-        return;
-    }
-
-    // Drop spurious scancodes generated during UEFI→OS keyboard handoff.
-    // These arrive after KbdInit's flush because QEMU/firmware sends them
-    // asynchronously during the keyboard self-test/reset sequence.
-    if (g_settleCount > 0)
-    {
-        g_settleCount--;
         ApicSendEoi();
         return;
     }
@@ -623,6 +623,31 @@ static bool g_kbdInitialized = false;
 
 void KbdInit()
 {
+    if (g_kbdInitialized) return;
+    struct InterruptGuard {
+        uint64_t flags;
+        InterruptGuard() { __asm__ volatile("pushfq; pop %0; cli":"=r"(flags)::"memory"); }
+        ~InterruptGuard() { if(flags & (1ull<<9)) __asm__ volatile("sti":::"memory"); }
+    } guard;
+    struct Controller {
+        bool waitWrite() { for(unsigned i=0;i<100000;++i) { if(!(inb(0x64)&2)) return true; __asm__ volatile("pause"); } return false; }
+        void command(uint8_t b) { outb(0x64,b); }
+        void data(uint8_t b) { outb(0x60,b); }
+        void drain() { for(unsigned i=0;i<32 && (inb(0x64)&1);++i) (void)inb(0x60); }
+        bool readController(uint8_t& b) {
+            for(unsigned i=0;i<100000;++i) {
+                const auto status=inb(0x64);
+                if(status&1) { const auto value=inb(0x60); if(!(status&0x20)) { b=value; return true; } }
+                __asm__ volatile("pause");
+            }
+            return false;
+        }
+    } controller;
+    Ps2KeyboardConfig config;
+    const bool configured=ConfigurePs2Keyboard(controller,config);
+    KPrintf("KBD: controller old=0x%x requested=0x%x readback=0x%x stage=%u\n",
+            config.before,config.requested,config.after,config.stage);
+    if(!configured) { KPuts("KBD: controller configuration failed; IRQ1 remains masked\n"); return; }
     // Flush any stale bytes in the PS/2 output buffer.
     // UEFI firmware may leave residual scan codes during the handoff.
     for (int i = 0; i < 32; i++) {

@@ -53,6 +53,8 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_boot_mode_selection)
+add_host_test(test_ps2_keyboard_config)
 add_host_test(test_virtio_read_plan)
 add_host_test(test_virtio_write_plan)
 add_host_test(test_write_behind_queue)

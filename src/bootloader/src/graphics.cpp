@@ -1,5 +1,7 @@
 #include "graphics.h"
 #include "console.h"
+#include "config.h"
+#include "mode_selection.h"
 #include "Protocol/GraphicsOutput.h"
 
 namespace brook
@@ -21,7 +23,6 @@ bool GraphicsInit(EFI_BOOT_SERVICES* bootServices, brook::Framebuffer& outFrameb
     UINT32 bestMode    = gop->Mode->Mode; // current mode as fallback
     UINT32 bestWidth   = 0;
     UINT32 bestHeight  = 0;
-    bool   foundIdeal  = false;
 
     UINT32 maxMode = gop->Mode->MaxMode;
     for (UINT32 mode = 0; mode < maxMode; mode++)
@@ -38,32 +39,14 @@ bool GraphicsInit(EFI_BOOT_SERVICES* bootServices, brook::Framebuffer& outFrameb
         UINT32 w = info->HorizontalResolution;
         UINT32 h = info->VerticalResolution;
 
-        // Skip blt-only modes (no linear framebuffer)
-        if (info->PixelFormat == PixelBltOnly)
+        if (info->PixelFormat != PixelBltOnly &&
+            PreferMode(w,h,bestWidth,bestHeight,
+                       g_bootConfig.displayWidth,g_bootConfig.displayHeight))
         {
-            continue;
+            bestMode=mode; bestWidth=w; bestHeight=h;
         }
+        bootServices->FreePool(info);
 
-        // Prefer 1920x1080, then 1280x720, then largest
-        if (w == 1920 && h == 1080)
-        {
-            bestMode   = mode;
-            bestWidth  = w;
-            bestHeight = h;
-            foundIdeal = true;
-            break;
-        }
-
-        if (!foundIdeal)
-        {
-            if ((w == 1280 && h == 720) ||
-                (w * h > bestWidth * bestHeight))
-            {
-                bestMode   = mode;
-                bestWidth  = w;
-                bestHeight = h;
-            }
-        }
     }
 
     status = gop->SetMode(gop, bestMode);

@@ -28,6 +28,17 @@ static void TrimValue(const uint8_t* src, size_t len,
     *outLen   = end - start;
 }
 
+static uint32_t ParseDimension(const uint8_t* val, size_t len)
+{
+    if (!len || len > 5) return 0;
+    uint32_t result = 0;
+    for (size_t i=0;i<len;++i) {
+        if (val[i]<'0' || val[i]>'9') return 0;
+        result=result*10+(val[i]-'0');
+    }
+    return result <= 16384 ? result : 0;
+}
+
 static bool ParseBool(const uint8_t* val, size_t len)
 {
     return len > 0 && val[0] == '1';
@@ -53,6 +64,8 @@ void LoadConfig(EFI_HANDLE imageHandle, EFI_BOOT_SERVICES* bootServices)
         di++;
     }
     g_bootConfig.target[di]     = u'\0';
+    g_bootConfig.displayWidth   = 0;
+    g_bootConfig.displayHeight  = 0;
     g_bootConfig.debugText      = false;
     g_bootConfig.logMemory      = false;
     g_bootConfig.logInterrupts  = false;
@@ -99,6 +112,10 @@ void LoadConfig(EFI_HANDLE imageHandle, EFI_BOOT_SERVICES* bootServices)
             g_bootConfig.logMemory = ParseBool(trimmedVal, trimmedLen);
         } else if (KeyEquals(keyPtr, keyLen, "LOG_INTERRUPTS", 14)) {
             g_bootConfig.logInterrupts = ParseBool(trimmedVal, trimmedLen);
+        } else if (KeyEquals(keyPtr, keyLen, "DISPLAY_WIDTH", 13)) {
+            g_bootConfig.displayWidth=ParseDimension(trimmedVal,trimmedLen);
+        } else if (KeyEquals(keyPtr, keyLen, "DISPLAY_HEIGHT", 14)) {
+            g_bootConfig.displayHeight=ParseDimension(trimmedVal,trimmedLen);
         }
         // Unrecognised keys silently ignored
     }

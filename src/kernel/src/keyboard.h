@@ -23,6 +23,9 @@ static constexpr uint8_t KBD_IRQ_VECTOR = 33;
 // in the I/O APIC.
 extern "C" void KbdInit();
 
+struct KbdProbeStats { uint32_t irqs, bytes; uint8_t status, lastByte; };
+KbdProbeStats KbdProbeSnapshot();
+
 // Returns true if KbdInit() has been called successfully.
 // Callers that want to use the keyboard (e.g. an echo loop) should check
 // this before blocking on KbdGetChar().
