@@ -25,11 +25,12 @@ def hashes():
     for p in files:
         with p.open('rb') as stream:result[str(p.relative_to(out))]=hashlib.file_digest(stream,'sha256').hexdigest()
     return result
-def run_case(name,action,expected,unchanged=True):
+def run_case(name,action,expected,unchanged=True,failure=None):
     before=hashes()
     with socket.socket() as r:r.bind(('127.0.0.1',0));port=r.getsockname()[1]
     env={**os.environ,'BROOK_UPDATE_TEST_ROOT':str(out),'BROOK_UPDATE_TEST_KEY':str(out/'key'),
         'BROOK_UPDATE_TEST_LOCK':str(out/'lock'),'BROOK_UPDATE_TEST_PORT':str(port)}
+    if failure:env['BROOK_UPDATE_TEST_FAILURE']=failure
     with (out/(name+'.log')).open('w') as log:
         proc=subprocess.Popen([str(a.program.resolve()),boot,tx],env=env,stdout=log,stderr=subprocess.STDOUT)
         try:
@@ -67,6 +68,11 @@ for mode,expected in [('oversize',16),('interrupted',18),('corrupt',19),('staged
     results.append(run_case(mode,lambda port,m=mode:transfer(port,m),expected))
 results.append(run_case('activate',lambda port:transfer(port,'activate'),0,False))
 assert (out/'SELECT1.BIN').read_bytes()==record(2,1,kernel,initrd)
+def operational_failure(port):
+    with socket.create_connection(('127.0.0.1',port)) as c:
+        c.sendall(b'BRUPLOAD'+key.encode()+boot.encode()+tx.encode());assert line(c)['code']==27
+for failure in ['alloc','read']:
+    results.append(run_case('newest-'+failure+'-failure',operational_failure,27,failure=failure))
 # Valid metadata with a corrupt newest payload must preserve the older working
 # slot, choose the other slot, and advance beyond the damaged generation.
 with (out/'B/KERNEL.ELF').open('r+b') as f:f.write(b'bad')

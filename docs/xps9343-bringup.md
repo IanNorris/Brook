@@ -588,7 +588,10 @@ Canonical 128-byte records contain generation, slot, exact lengths, SHA-256
 hashes and CRC32. Both firmware and updater use the same bounded ELF validator,
 including when identifying which existing slot is active. A hash-valid invalid
 ELF must not cause the updater to overwrite the older working slot. Equal
-conflicting generations fail closed. Payloads are written/flushed first,
+conflicting generations fail closed. Updater allocation/open/read/close failures
+abort without selecting another slot; only successfully read, invalid content
+permits fallback. Host tests inject newest-slot allocation and read failures and
+verify that every slot/record remains unchanged. Payloads are written/flushed first,
 reopened O_RDWR with a new FAT FIL (bypassing whole-file RO caches), and checked.
 Only then is the other selection record written/flushed/read back. EFI verifies
 the entire required pair again before loading either. Invalid/missing pairs
@@ -607,16 +610,16 @@ Evidence:
   incremental hashing, CRC32, every single-byte record mutation and bounds.
 - `test_update_slots`: production selection code with missing/corrupt pairs,
   malformed ELF, ambiguous records, capacity limits and allocation cleanup.
-- `build/hardware/update-host-tests-v2-20261030/result.json`: real receiver,
+- `build/hardware/update-host-tests-v3-20261030/result.json`: real receiver,
   invalid authorization/boot, oversize/interrupted/corrupt/staged-only uploads,
   activation, corrupt and hash-valid malformed newest ELF, conflicting records.
-- `build/hardware/update-vm-acceptance-v2-20261030/result.json`: the production
+- `build/hardware/update-vm-acceptance-v3-20261030/result.json`: the production
   RAM helper receives a network upload in QEMU, activates generation 2, completes
   checked shutdown, then fresh EFI/QEMU boots the distinct updated initrd ID.
   All non-slot files remain unchanged and FAT checks clean.
 
 The prepared physical candidate is
-`build/hardware/update-bootstrap-v2-20261030/probe`. Before its first activation,
+`build/hardware/update-bootstrap-v3-20261030/probe`. Before its first activation,
 run the existing nonce/header scratch refusal and write/fsync gate on the Dell,
 restart, verify the scratch bytes, then test remote upload and guarded restart.
 A different guest boot epoch and the new initrd payload ID are the acceptance

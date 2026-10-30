@@ -40,13 +40,25 @@ static int pair_valid(const uint8_t* record) {
     if(!BrookUpdateRecordValid(record))return 0;
     unsigned slot=BrookUpdateGet32(record+16);uint8_t h[32];
     size_t kernel_size=(size_t)BrookUpdateGet64(record+24);
-    uint8_t* kernel=malloc(kernel_size);if(!kernel)return 0;
+    #ifdef BROOK_UPDATE_TEST
+    const char* failure=getenv("BROOK_UPDATE_TEST_FAILURE");
+    if(slot==1&&failure&&!strcmp(failure,"alloc")){errno=ENOMEM;return -1;}
+#endif
+    uint8_t* kernel=malloc(kernel_size);if(!kernel)return -1;
     int fd=open_existing(slot*2);int valid=0;
-    if(fd>=0){valid=!file_read(fd,kernel,kernel_size);if(close(fd))valid=0;}
-    if(valid)valid=BrookUpdateExecutable(kernel,kernel_size);
+    if(fd<0){free(kernel);return -1;}
+    int io=file_read(fd,kernel,kernel_size);
+#ifdef BROOK_UPDATE_TEST
+    if(slot==1&&failure&&!strcmp(failure,"read"))io=-1;
+#endif
+    if(close(fd))io=-1;
+    if(io){free(kernel);return -1;}
+    valid=BrookUpdateExecutable(kernel,kernel_size);
     free(kernel);if(!valid)return 0;
-    if(hash_file(slot*2,(size_t)BrookUpdateGet64(record+24),h)||!BrookUpdateEqual(h,record+40,32))return 0;
-    return !hash_file(slot*2+1,(size_t)BrookUpdateGet64(record+32),h)&&BrookUpdateEqual(h,record+72,32);
+    if(hash_file(slot*2,(size_t)BrookUpdateGet64(record+24),h))return -1;
+    if(!BrookUpdateEqual(h,record+40,32))return 0;
+    if(hash_file(slot*2+1,(size_t)BrookUpdateGet64(record+32),h))return -1;
+    return BrookUpdateEqual(h,record+72,32);
 }
 static int read_records(uint8_t record[2][128]) {
     for(unsigned i=0;i<2;i++) {
@@ -99,7 +111,9 @@ static int serve(int client,const char* key,const char* boot,const char* transac
     int active=-1;
     for(unsigned attempt=0;attempt<2;attempt++){
         int candidate=attempt?1-newest:newest;
-        if(pair_valid(records[candidate])){active=candidate;break;}
+        int eligibility=pair_valid(records[candidate]);
+        if(eligibility<0)return 27; // Ambiguous media/resource failure: never pick a victim slot.
+        if(eligibility==1){active=candidate;break;}
     }
     if(active<0)return 13;
     uint64_t generation=BrookUpdateGet64(records[newest]+8);
@@ -124,7 +138,7 @@ static int serve(int client,const char* key,const char* boot,const char* transac
     if(network_bytes(client,activate,8)||memcmp(activate,"ACTIVATE",8)){result=22;goto done;}
     // Only the inactive pair is modified, and selection is published last.
     if(write_file(slot*2,kernel,kb)||write_file(slot*2+1,initrd,ib)){result=23;goto done;}
-    if(!pair_valid(incoming)){result=24;goto done;}
+    if(pair_valid(incoming)!=1){result=24;goto done;}
     if(write_file(4+selector,incoming,128)){result=25;goto done;}
     // Reopen O_RDWR obtains a new FIL and bypasses FAT's whole-file RO cache.
     // Firmware independently rehashes both files before the next kernel load.
