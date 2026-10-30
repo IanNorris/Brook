@@ -756,3 +756,39 @@ The v5 live remote-update/guarded-reset workflow also passes in
 `build/hardware/msc-csw-update-workflow-20261030/result.json`. The v4 diagnostic
 run was quiesced, but checked shutdown again reported EIO due to quarantine
 (request25d2f13469004dec98580653f4bb2bbc). No activation was dispatched.
+
+### Remotely uploadable full RAM desktop
+
+`scripts/prepare_hardware_ram_desktop.py` freezes a new kernel/initrd from the
+accepted offline desktop and the provisioned maintenance key. It refreshes xHCI
+and EEVDF modules, embeds RAM updater/status/scratch tools, selects the existing
+root APPS.BRK by exact length/hash for a RAM snapshot and keeps home/settings
+volatile. It neither copies another application image nor accesses physical
+media. The accepted root recovery payload remains untouched. Automatic USB
+stress reads are omitted from this desktop's startup; they remain explicit
+acceptance jobs.
+
+The candidate is `build/hardware/ram-desktop-update-20261030`, payload
+`desktop-ram-apps-2ae017dcbfc34284ad59c7dcb4413c67`. Its manifest freezes both upload
+hashes and the application dependency. `test_hardware_ram_desktop.py` installs
+the exact pair in private slot B, then boots the full262602752-byte application
+snapshot under QEMU. Only the test's outer GOP configuration differs from the
+physical stick; the uploadable initrd is unchanged. Terra's semantic catalog
+launches registered Mousepad and Files as visible windows. No screenshot was
+obtained, so rendering was not visually verified. Checked shutdown passed;
+1637068800 bytes remained free in the2GiB guest after mounting. Evidence:
+`build/hardware/ram-desktop-qemu-20261030/result.json` and `apps-terra.json`.
+
+Do not activate this on the Dell until v5 cache/stall recovery and physical
+scratch write/fsync/fresh-boot readback pass. The current panic receiver still
+uses the accepted old ELF. Before testing the new kernel, pin the scanner to the
+candidate's frozen `kernel.elf`; do not point it at the mutable build output.
+The RAM desktop enables future USB updates without a live mutable application
+source, but the current upload protocol still updates only kernel/initrd.
+Application-image upload needs a separate dependency-aware extension: protect
+the selected pair's actual app source, bind a new image to the inactive slot,
+verify that the uploaded initrd references that exact image, stage/hash before
+writes, verify new app bytes before pair/selector commit and preserve root
+APPS.BRK. Creation needs provenance and disk-full/interruption handling; arbitrary
+existing files may not be adopted or deleted. Whole-device rewriting remains
+out of scope.

@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Freeze a remotely uploadable kernel/initrd desktop with RAM applications.
+
+No physical-device access or new application-image copy. The accepted USB
+APPS.BRK is snapshotted and SHA-256 verified at boot; no mutable USB application
+source remains open. Root recovery files are not modified. Home/settings stay
+volatile. Build the kernel/xHCI/EEVDF modules before running inside nix-shell.
+"""
+import argparse,hashlib,json,os,re,shutil,subprocess,uuid
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[1]
+p=argparse.ArgumentParser(description=__doc__)
+p.add_argument('--recovery-probe',type=Path,required=True);p.add_argument('--maintenance-probe',type=Path,required=True)
+p.add_argument('--output',type=Path,required=True);p.add_argument('--build',type=Path,default=ROOT/'build/release')
+a=p.parse_args();recovery=a.recovery_probe.resolve(strict=True);maintenance=a.maintenance_probe.resolve(strict=True);build=a.build.resolve(strict=True);out=a.output.resolve()
+if not os.environ.get('MUSL_CC'):p.error('Run in nix-shell with MUSL_CC')
+def sha(path):
+    with path.open('rb') as source:return hashlib.file_digest(source,'sha256').hexdigest()
+def run(*argv):subprocess.run(list(map(str,argv)),check=True,cwd=ROOT,stdin=subprocess.DEVNULL)
+meta=json.loads((recovery/'manifest.json').read_text());mm=json.loads((maintenance/'manifest.json').read_text())
+if meta.get('usb_read_only') is not True or mm.get('usb_read_only') is not False:p.error('Expected accepted RO desktop and RW maintenance inputs')
+for name in ['APPS.BRK','INITRD.IMG']:
+    path=recovery/'payload'/name;row=meta['files'][name]
+    if not path.is_file() or path.is_symlink() or path.stat().st_size!=row['bytes'] or sha(path)!=row['sha256']:p.error('Invalid recovery input: '+name)
+key=Path(mm['update_key_file']).read_text()
+if not re.fullmatch('[0-9a-f]{32}',key):p.error('Invalid provisioned maintenance key')
+for path in [build/'kernel/BROOK.elf',build/'kernel/drivers/xhci.mod',build/'kernel/drivers/sched_eevdf.mod']:
+    if not path.is_file():p.error('Build dependency missing: '+str(path))
+out.mkdir(parents=True,exist_ok=False)
+run('cp','--reflink=auto',build/'kernel/BROOK.elf',out/'kernel.elf')
+initrd=out/'INITRD.IMG';run('cp','--reflink=auto',recovery/'payload/INITRD.IMG',initrd)
+for name in ['usb-read-only','boot-app-image']:run('mdel','-i',initrd,'::ETC/'+name)
+for name in ['xhci','sched_eevdf']:run('mcopy','-o','-i',initrd,build/'kernel/drivers'/f'{name}.mod','::DRIVERS/'+name.upper()+'.MOD')
+for name,source in [('HWSTATUS.ELF','tools/hardware_status.c'),('HWUPDATE.ELF','tools/hardware_update.c'),('HWIO.ELF','tools/hardware_storage_probe.c')]:
+    run(os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',ROOT/source,'-o',out/name)
+    run('mcopy','-o','-i',initrd,out/name,'::BOOT/'+name)
+apps=meta['files']['APPS.BRK'];payload_id='desktop-ram-apps-'+uuid.uuid4().hex
+markers={'hardware-maintenance':'RAM-resident updater enabled; application snapshot must remain immutable\n',
+    'hardware-update-key':key,'hardware-payload-id':payload_id+'\n',
+    'boot-app-snapshot':f"/media/usb/APPS.BRK /nix {apps['bytes']} {apps['sha256']}\n"}
+for name,text in markers.items():
+    path=out/name;path.write_text(text)
+    if name=='hardware-update-key':path.chmod(0o600)
+    run('mcopy','-o','-i',initrd,path,'::ETC/'+name)
+rc=out/'INIT.RC';rc.write_text('set wm\nset vfb none\nsched eevdf\nkconsole\n'
+    'run --service --once --uid 1000 /nix/profile/bin/waylandd\n'
+    'run --service --once --uid 1000 /nix/profile/bin/hardware-dbus\n'
+    'run --service --once --uid 1000 /nix/profile/bin/hardware-message\n'
+    'run --console --uid 1000 /boot/HWSTATUS.ELF\n')
+run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
+files={name:{'bytes':(out/name).stat().st_size,'sha256':sha(out/name)} for name in ['kernel.elf','INITRD.IMG']}
+if files['kernel.elf']['bytes']>8*1024**2 or files['INITRD.IMG']['bytes']>64*1024**2:p.error('Upload exceeds bootstrap slot capacities')
+manifest={'scope':'Opt-in RAM application desktop; kernel/initrd upload only','payload_id':payload_id,'files':files,
+    'application_source':'/media/usb/APPS.BRK','application_image':apps,'application_snapshot_limit_bytes':512*1024**2,
+    'initial_headroom_bytes':256*1024**2,'update_key_file':str(out/'hardware-update-key'),'recovery_probe':str(recovery),
+    'maintenance_probe':str(maintenance),'physical_status':'Prepared; QEMU and physical acceptance required',
+    'ephemeral_home':True,'usb_read_only':False,'mutable_usb_application_mount':False}
+(out/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+print('HARDWARE_RAM_DESKTOP_PREPARED',out)
