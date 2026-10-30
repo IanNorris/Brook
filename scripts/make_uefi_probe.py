@@ -2,8 +2,8 @@
 """Prepare a RAM-only USB/UEFI bring-up payload and a disposable test disk.
 
 Does not open host devices. Copy payload/ to an existing FAT32 USB partition.
-No runtime drivers are included: this first gate tests firmware loading and
-kernel entry, not USB input/storage or installed applications.
+No runtime driver modules are included: this first gate tests firmware loading
+and kernel entry. Built-in PS/2 fallbacks may still provide input.
 """
 import argparse
 import hashlib
@@ -46,7 +46,7 @@ def main():
         'Use F12 and select the UEFI USB entry; Secure Boot must be disabled\n'
         'for this unsigned development loader. No installation is performed.\n'
         'This probe uses a RAM disk and firmware framebuffer. It includes no\n'
-        'runtime USB/input/storage/network/audio/accelerated display drivers.\n'
+        'runtime driver modules; built-in PS/2 input fallbacks may still respond.\n'
         'A desktop and kernel log window are the expected success screen.\n'
         'Input may be unavailable; that is outside this first boot gate.\n'
         'If it stops, record the last message/progress and scan panic QR pages.\n'

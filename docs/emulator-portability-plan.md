@@ -18,7 +18,8 @@ test image and verifies its FAT file contents against SHA256 hashes. The payload
 uses the removable-media `EFI/BOOT/BOOTX64.EFI` path, `KERNEL/BROOK.ELF`, root
 `INITRD.IMG` and `BROOK.CFG`. No runtime driver modules or user disks are packed;
 the expected success screen is a RAM-only software desktop and kernel console.
-Input, persistent USB storage and applications are later gates. Boot unsigned
+The built-in PS/2 fallbacks may still respond; input, persistent USB storage
+and applications need separate acceptance. Boot unsigned
 development images with Secure Boot disabled and select the UEFI USB entry.
 
 `DEBUG_TEXT=1` now enables the loader's existing console diagnostics and explicit
@@ -37,9 +38,21 @@ The first disposable probe boots through OVMF's USB storage path without VirtIO
 devices or KVM CPUID exposed and reaches the software desktop. A deliberate
 panic's actual emitted Base45 bytes pass HTTPS ingestion, LZ4 decoding and
 symbolication against the frozen ELF; Terra confirms coherent desktop/panic
-frames. Optical phone scanning and the Dell firmware boot remain physical gates.
+frames. The user subsequently booted this payload on the actual Dell XPS 13
+9343 on 30 October. Their photograph shows the desktop and kernel console;
+Terra reads APs 1–3 online, **4/4 CPUs online**, boot complete and the window
+manager enabled, with no obvious gross display corruption. This passes the
+first physical UEFI/kernel/RAM-desktop gate. It does not establish input,
+native USB storage, clock accuracy or sustained stability. The missing
+wallpaper is expected in this minimal payload. The photo remains a private chat
+attachment and has not been published into the repository.
+
+The user also confirmed phone connectivity to the scanner. It now runs as the
+`brook-panic-receiver.service` user unit so it survives command-session teardown;
+port 9001 was already covered by the host's configured 9000–9200 TCP range.
+Optical scanning of an actual hardware panic remains untested.
 Private hashes, USB copy receipt and VM evidence are under
-`build/hardware/xps9343-uefi-20261030/`. No physical-device boot is claimed yet.
+`build/hardware/xps9343-uefi-20261030/`.
 
 ## Deliverables and order
 
