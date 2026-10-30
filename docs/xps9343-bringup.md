@@ -1421,3 +1421,62 @@ with `on`/`idle 0`; automatic idle is left disabled. Evidence is in
 `backlight-before.json`, `timed-cycle.json`, `idle-cycle.json` and `doctor.json`.
 These are register/transport acceptance; physical panel darkness and waking
 from the built-in keyboard/touchpad are still pending user observation.
+
+### Writable network-desktop image builder (2026-10-30)
+
+`scripts/prepare_hardware_store.py` replaces the legacy mounted-image assembly
+for this candidate. It creates only a new regular-file output directory/image;
+no FUSE mount, physical device, stale-process killing or image replacement is
+performed. Build inside nix-shell with the already built pinned profile:
+
+```
+python3 scripts/prepare_hardware_store.py \
+  --profile build/hardware/network-profile-20261030 \
+  --output build/hardware/network-store-NEW
+```
+
+The complete434-path closure includes Firefox, Chromium, App Gallery and the
+offline desktop. Profile directories are real writable directories and its
+file exports link to existing store files; directory cycles and references
+outside the closure are rejected. Static nix-install/nix-fetch/nix-search and
+nar-unpack are rebuilt from source. The current checked-in package index and a
+seeded installed-package manifest are included. Package/profile/cache/launcher
+mutation directories and `/nix/home/brook` belong to UID/GID1000; prebuilt store
+contents and package helper executables belong to root. Inode-number ownership
+normalization is verified by reopening the image read-only, avoiding unsafe
+filename interpolation into debugfs commands. Package data stays under its
+original absolute Nix store paths. Builder inputs and image hashes are recorded;
+filesystem timestamps are not claimed to make the image bit-for-bit reproducible.
+
+Artifact: `build/hardware/network-store-v2-20261030/STORE.IMG`,4026531840bytes,
+UUID `cf16f1ae-68c5-5fac-89e9-382b8af5cd5c`,1058750464bytes free. Ext2 geometry
+is4096-byte blocks/128-byte inodes, compat0/incompat2/rocompat3. Clean `e2fsck -fn`
+passes. Read-only namespace validation checks51692paths and5019profile file
+links, writable profile/store/cache/home directories, and all four freshly built
+package tools have no ELF interpreter. The extracted nar-unpack passes its four
+existing archive tests. Evidence: `manifest.json`, `e2fsck.log`, and
+`validation/{result.json,nar-tests.log}` inside that artifact directory. Whole
+closure build scratch is removed after success; failed v1 stopped during Nix
+metadata evaluation and contains no image. No image has been provisioned to the
+Dell or claimed to execute there yet.
+
+Astra's boot-admission review identifies a necessary durability gate: the current
+ext2 driver does not validate feature masks/clean state or mark mutable sessions
+dirty/clean. Proposed narrow image-specific lifecycle: strict UUID/size/features/
+geometry validation, durably clear s_state before any mount/use, and set it clean
+only after full home+/nix admission, quiescence, stopped writeback, closed device
+write admission owned by the shutdown worker, and successful global VFS sync.
+Checked two-byte clean marking plus backing flush must complete before Ready.
+Failed admission or interrupted use remains dirty and requires an offline check;
+never clear it merely because immutable fallback later shuts down cleanly.
+Existing ext2 superblock updates modify separate free-count fields and do not
+replace s_state. This plan is not implemented by the image-builder checkpoint.
+
+Next: boot-only image admission/home bind, strict header and clean-session
+handling, bounded direct USB streaming provisioning (not RAM staging), then
+private USB-QEMU execution/mmap/COW/install/restart tests before Dell activation.
+Successful writable admission must explicitly skip compressed mounting and enable
+file-page reclaim. Failed namespace cleanup must leave maintenance mode, not
+silently stack another `/nix`. USB capacity was measured on the Dell as30307041280
+bytes available; the constraint is FAT32's single-file limit plus the247967744-byte
+free RAM `/data`, not total USB capacity.
