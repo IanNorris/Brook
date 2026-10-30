@@ -78,6 +78,34 @@ Reproduce the probe with `--driver xhci --usb-read-only --media-mount /media/usb
 overflow, ownership handoff, interrupt layouts and completion matching. Private
 runtime evidence is in `build/hardware/xps9343-usb-storage-v2-20261030/`.
 
+## Volume controls before hardware audio
+
+Settings now has a live master volume slider and mute checkbox. The kernel
+applies the level to mixed ALSA/OSS output and legacy diagnostic tones; reducing
+volume cannot amplify samples. Mute preserves the selected level. Changes act
+on future delivery batches: already queued device audio must drain first.
+Apply settings stores the level/mute alongside the existing user preferences.
+The shell also supports `volume`, `volume 20`, `volume mute` and `volume unmute`.
+
+All newly generated hardware probes contain `/etc/audio-muted`: the kernel
+sets 20% and mute before loading audio modules, and desktop preference restore
+retains that boot mute. A missing driver is shown as unavailable; controls do
+not imply that the Dell's internal audio is supported.
+
+Host mixer tests cover scaling, silence, signed endpoints, invalid values,
+combined streams and diagnostic tones. The real QEMU ICH9 HDA test captures
+WAV output privately: levels 25/50/100 produce amplitudes 2000/4000/8000 from an
+8000-amplitude source, and muted intervals produce zero. A second boot checks
+absent-device reporting. Reproduce after building the kernel inside nix-shell:
+
+```
+python3 scripts/test_audio_control.py --output build/hardware/audio-control-check
+```
+
+The GTK settings package builds with warnings treated as errors. Visual/input
+acceptance of that new panel in the fuller hardware image remains to be done.
+The known-good physical USB payload has not been replaced by these tests.
+
 ## Deliverables and order
 
 1. A usable persistent software-rendered desktop under VMware and VirtualBox.

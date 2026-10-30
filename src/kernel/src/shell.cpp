@@ -1388,6 +1388,28 @@ static int ExecCommand(int argc, const char* const* argv)
         return 0;
     }
 
+    // Session master control, also usable before the graphical settings app.
+    if (StrEq(cmd,"volume")) {
+        uint32_t control=AudioOutputControl();
+        if(argc>2){KPrintf("Usage: volume [0..100|mute|unmute]\n");return -1;}
+        if(argc==2){
+            if(StrEq(argv[1],"mute"))control|=BROOK_AUDIO_MUTED;
+            else if(StrEq(argv[1],"unmute"))control&=~BROOK_AUDIO_MUTED;
+            else {
+                const char* p=argv[1];unsigned value=0,digits=0;
+                while(*p>='0'&&*p<='9'&&digits<4){value=value*10+(*p++-'0');++digits;}
+                if(*p||!digits||value>100){KPrintf("Usage: volume [0..100|mute|unmute]\n");return -1;}
+                control=(control&BROOK_AUDIO_MUTED)|value;
+            }
+            AudioSetOutputControl(control);
+        }
+        KPrintf("Volume: %u%% %s (%s)\n",brook_audio_volume(control),
+            control&BROOK_AUDIO_MUTED?"muted":"unmuted",AudioAvailable()?"device ready":"no audio device");
+        SerialPrintf("AUDIO_OUTPUT level=%u muted=%u available=%u\n",brook_audio_volume(control),
+            !!(control&BROOK_AUDIO_MUTED),AudioAvailable());
+        return 0;
+    }
+
     // Built-in: beep [freq] [ms] — play a sine wave tone via HDA audio
     if (StrEq(cmd, "beep"))
     {
@@ -1596,6 +1618,7 @@ static void CmdHelp()
     KPrintf("  modload <path>     Load a kernel module\n");
     KPrintf("  modunload <name>   Unload a kernel module\n");
     KPrintf("  modlist            List loaded modules\n");
+    KPrintf("  volume [level|mute|unmute]  Master sound level, 0..100\n");
     KPrintf("  sched [policy]     Show/switch scheduler policy\n");
     KPrintf("  display [WxH]      Show/change display mode\n");
     KPrintf("  strace <pid|name|all> [off]  Syscall tracing\n");

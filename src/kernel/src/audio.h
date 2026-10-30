@@ -1,5 +1,6 @@
 #pragma once
 #include "../../shared/audio_queue.h"
+#include "../../shared/brook_audio_control.h"
 
 // Brook audio subsystem — minimal API for kernel audio output.
 //
@@ -89,6 +90,8 @@ void     AudioStop();
 bool     AudioIsPlaying();
 uint32_t AudioGetPosition();
 bool     AudioAvailable();
+uint32_t AudioOutputControl();
+bool     AudioSetOutputControl(uint32_t control);
 
 // --- Mixer API ---
 // All samples must be 44100 Hz, stereo, 16-bit signed LE before submission.

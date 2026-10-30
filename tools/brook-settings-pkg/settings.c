@@ -8,11 +8,15 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include "brook_theme.h"
+#include "brook_audio_control.h"
 #include "brook_gtk_appearance.h"
 #include "brook_taskbar.h"
 #include "brook_user_experience.h"
 
 static GtkWidget *scale_choice,*preview,*status,*swatches[3];
+static GtkWidget *volume_slider,*mute_check,*audio_status;
+static uint32_t audio_control=BROOK_AUDIO_DEFAULT;
+static int audio_supported;
 static GtkWidget *dark_switch,*opacity_slider,*opacity_value,*blur_choice,*performance;
 static BrookGtkAppearance *appearance_style;
 static uint32_t selected_appearance=BROOK_APPEARANCE_DEFAULT;
@@ -97,6 +101,7 @@ static int save_appearance(unsigned theme,unsigned scale,uint32_t appearance,GEr
     g_key_file_set_integer(settings,"Desktop","opacity",brook_appearance_opacity(appearance));
     g_key_file_set_integer(settings,"Desktop","blur",brook_appearance_blur(appearance));
     g_key_file_set_integer(settings,"Desktop","taskbar_metrics",selected_metrics);
+    if(audio_supported)g_key_file_set_integer(settings,"Audio","output",audio_control);
     g_key_file_set_boolean(settings,"Experience","technical_details",gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(technical_details)));
     gsize length=0;char *contents=g_key_file_to_data(settings,&length,error);
     gboolean ok=contents&&g_file_set_contents_full(settings_path,contents,(gssize)length,
@@ -124,6 +129,19 @@ static void controls_changed(GtkWidget *widget,gpointer unused){
 static void dark_changed(GObject *object,GParamSpec *property,gpointer unused){
     (void)object;(void)property;controls_changed(NULL,unused);
 }
+static void audio_changed(GtkWidget *widget,gpointer unused){
+    (void)widget;(void)unused;
+    const uint32_t value=(unsigned)(gtk_range_get_value(GTK_RANGE(volume_slider))+.5)|
+        (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(mute_check))?BROOK_AUDIO_MUTED:0);
+    if(syscall(BROOK_SYS_AUDIO_CONTROL,1L,(long)value)<0){
+        gtk_label_set_text(GTK_LABEL(audio_status),"Could not change output level.");return;
+    }
+    audio_control=value;
+    gtk_label_set_text(GTK_LABEL(audio_status),
+        syscall(BROOK_SYS_AUDIO_CONTROL,2L,0L)>0?
+        ((value&BROOK_AUDIO_MUTED)?"Muted. Apply settings to remember this level.":"Output level changed. Apply settings to remember it."):
+        "No audio device available. Level is ready for a future device.");
+}
 static int saved_matches_selection(void){
     GKeyFile *file=g_key_file_new();int matches=g_key_file_load_from_file(file,settings_path,0,NULL);
     const char* names[]={"theme","scale","dark","performance","opacity","blur","taskbar_metrics"};
@@ -134,6 +152,8 @@ static int saved_matches_selection(void){
     GError *experience_error=NULL;
     gboolean experience=g_key_file_get_boolean(file,"Experience","technical_details",&experience_error);
     matches=matches && !experience_error && experience==gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(technical_details));
+    if(audio_supported){GError *audio_error=NULL;int value=g_key_file_get_integer(file,"Audio","output",&audio_error);
+        matches=matches && !audio_error && value==(int)audio_control;g_clear_error(&audio_error);}
     g_clear_error(&experience_error);
     g_key_file_unref(file);return matches;
 }
@@ -160,7 +180,7 @@ static void apply(GtkButton *button,gpointer unused) {
     restored=(syscall(0xB04L,1L,previous_scale)==0)&&restored;
     restored=(syscall(BROOK_SYS_WM_APPEARANCE,1L,previous_appearance)==0)&&restored;
     restored=(syscall(BROOK_SYS_WM_TASKBAR_METRICS,1L,previous_metrics)==0)&&restored;
-    char *message=g_strdup_printf(restored?"Could not save; previous settings restored: %s":"Could not save or fully restore settings: %s",error?error->message:"apply failed");
+    char *message=g_strdup_printf(restored?"Could not save; previous appearance restored: %s":"Could not save or fully restore appearance: %s",error?error->message:"apply failed");
     gtk_label_set_text(GTK_LABEL(status),message);g_free(message);g_clear_error(&error);
 }
 
@@ -195,6 +215,9 @@ int main(int argc,char **argv) {
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),GTK_STYLE_PROVIDER(brook_css),GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(brook_css);
     selected_appearance=brook_appearance_read();appearance_style=brook_gtk_appearance_new(0);
+    long output=syscall(BROOK_SYS_AUDIO_CONTROL,0L,0L);
+    audio_supported=output>=0 && brook_audio_control_valid((uint32_t)output);
+    if(audio_supported)audio_control=(uint32_t)output;
     long metrics=syscall(BROOK_SYS_WM_TASKBAR_METRICS,0L,0L);
     if(metrics>=0 && brook_taskbar_metrics_valid((uint32_t)metrics))selected_metrics=(uint32_t)metrics;
     long active=syscall(0xB02L,0L,0L);selected=active>=0&&active<BROOK_THEME_COUNT?(unsigned)active:0;
@@ -216,6 +239,21 @@ int main(int argc,char **argv) {
     GtkWidget *box=gtk_box_new(GTK_ORIENTATION_VERTICAL,12);gtk_container_set_border_width(GTK_CONTAINER(box),26);GtkWidget *outer=gtk_box_new(GTK_ORIENTATION_VERTICAL,0);gtk_container_add(GTK_CONTAINER(window),outer);
     GtkWidget *scroll=gtk_scrolled_window_new(NULL,NULL);gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),GTK_POLICY_NEVER,GTK_POLICY_AUTOMATIC);
     gtk_box_pack_start(GTK_BOX(outer),scroll,TRUE,TRUE,0);gtk_container_add(GTK_CONTAINER(scroll),box);
+    GtkWidget *audio_panel=gtk_frame_new("Sound output");
+    GtkWidget *audio_box=gtk_box_new(GTK_ORIENTATION_VERTICAL,6);gtk_container_set_border_width(GTK_CONTAINER(audio_box),12);
+    gtk_container_add(GTK_CONTAINER(audio_panel),audio_box);gtk_box_pack_start(GTK_BOX(box),audio_panel,FALSE,FALSE,0);
+    GtkWidget *volume_label=gtk_label_new("Master volume");gtk_widget_set_halign(volume_label,GTK_ALIGN_START);gtk_box_pack_start(GTK_BOX(audio_box),volume_label,FALSE,FALSE,0);
+    volume_slider=gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,0,100,1);
+    gtk_scale_set_digits(GTK_SCALE(volume_slider),0);gtk_scale_set_value_pos(GTK_SCALE(volume_slider),GTK_POS_RIGHT);
+    gtk_range_set_value(GTK_RANGE(volume_slider),brook_audio_volume(audio_control));gtk_box_pack_start(GTK_BOX(audio_box),volume_slider,FALSE,FALSE,0);
+    mute_check=gtk_check_button_new_with_label("Mute all sound");gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(mute_check),(audio_control&BROOK_AUDIO_MUTED)!=0);
+    gtk_box_pack_start(GTK_BOX(audio_box),mute_check,FALSE,FALSE,0);
+    audio_status=gtk_label_new(!audio_supported?"Audio controls need a matching Brook kernel.":
+        syscall(BROOK_SYS_AUDIO_CONTROL,2L,0L)>0?((audio_control&BROOK_AUDIO_MUTED)?"Output is muted.":"Audio device ready."):"No audio device available.");
+    gtk_label_set_line_wrap(GTK_LABEL(audio_status),TRUE);gtk_label_set_xalign(GTK_LABEL(audio_status),0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(audio_status),"muted");gtk_box_pack_start(GTK_BOX(audio_box),audio_status,FALSE,FALSE,0);
+    gtk_widget_set_sensitive(volume_slider,audio_supported);gtk_widget_set_sensitive(mute_check,audio_supported);
+    g_signal_connect(volume_slider,"value-changed",G_CALLBACK(audio_changed),NULL);g_signal_connect(mute_check,"toggled",G_CALLBACK(audio_changed),NULL);
     GtkWidget *eyebrow=gtk_label_new("APPEARANCE");gtk_widget_set_halign(eyebrow,GTK_ALIGN_START);
     gtk_style_context_add_class(gtk_widget_get_style_context(eyebrow),"eyebrow");gtk_box_pack_start(GTK_BOX(box),eyebrow,FALSE,FALSE,0);
     GtkWidget *heading=gtk_label_new("Choose your\nmaterial.");gtk_label_set_justify(GTK_LABEL(heading),GTK_JUSTIFY_LEFT);gtk_widget_set_halign(heading,GTK_ALIGN_START);

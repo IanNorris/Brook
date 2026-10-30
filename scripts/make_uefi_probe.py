@@ -50,6 +50,7 @@ def main():
     env.pop('BROOK_PROVIDER_PAYLOAD',None)
     run('bash',ROOT/'scripts/make_initrd.sh','--release',env=env)
     initrd=out/'build/esp/INITRD.IMG'
+    marker=out/'audio-muted';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/audio-muted')
     if args.usb_read_only:
         marker=out/'usb-read-only';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/usb-read-only')
     if args.media_mount:

@@ -19,6 +19,9 @@
 #include "process.h"
 #include "apic.h"
 #include "kvmclock.h"
+#ifndef BROOK_HOST_TEST
+#include "vfs.h"
+#endif
 
 namespace brook {
 
@@ -85,6 +88,13 @@ extern "C" void AudioDeliveryTimingRecord(uint64_t token,const AudioDeliveryEven
 }
 
 static const AudioDriver* g_audioDriver = nullptr;
+static uint32_t g_outputControl = BROOK_AUDIO_DEFAULT;
+uint32_t AudioOutputControl() { return __atomic_load_n(&g_outputControl,__ATOMIC_ACQUIRE); }
+bool AudioSetOutputControl(uint32_t control) {
+    if (!brook_audio_control_valid(control)) return false;
+    __atomic_store_n(&g_outputControl,control,__ATOMIC_RELEASE);
+    return true;
+}
 static SpinLock g_mixerLock;
 static SpinLock g_audioTimingLock;
 static AudioServiceTimingModel g_audioTiming;
@@ -393,6 +403,13 @@ bool AudioMixerStagingSetFrameLimit(uint32_t frames) {
 uint32_t AudioMixerStagingFrameLimit(){return __atomic_load_n(&g_stagingFrameLimit,__ATOMIC_ACQUIRE);}
 void AudioMixerConfigureBoot() {
 #ifndef BROOK_HOST_TEST
+    // Set before driver registration: a hardware bring-up image never starts
+    // playback audibly merely because a driver appeared.
+    if (Vnode* marker=VfsOpen("/etc/audio-muted",0)) {
+        VfsClose(marker);
+        AudioSetOutputControl(BROOK_AUDIO_PROBE_DEFAULT);
+        SerialPuts("audio: hardware probe starts muted, level 20%\n");
+    }
     char option[6]{};
     const uint32_t size=FwCfgReadFile("opt/audio-staging-frames",option,sizeof(option));
     uint32_t frames=0;
@@ -602,6 +619,7 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
                 static_cast<uint32_t>(stream.write-stream.read),stream.inFlight,stream.capacity,
                 stream.stagingFrames};
     }
+    const uint32_t outputControl=AudioOutputControl();
     for (uint32_t i = 0; i < frames; ++i) {
         int32_t left = 0, right = 0;
         for (uint32_t slot = 0; slot < MIXER_MAX_STREAMS; ++slot) {
@@ -611,10 +629,8 @@ static uint32_t Prepare(Contribution* contributions, AudioMixPreparedStream* pre
             left += g_streams[slot].samples[index * 2];
             right += g_streams[slot].samples[index * 2 + 1];
         }
-        if (left > 32767) left = 32767; else if (left < -32768) left = -32768;
-        if (right > 32767) right = 32767; else if (right < -32768) right = -32768;
-        g_flushBuf[i * 2] = static_cast<int16_t>(left);
-        g_flushBuf[i * 2 + 1] = static_cast<int16_t>(right);
+        g_flushBuf[i * 2] = brook_audio_scale(left,outputControl);
+        g_flushBuf[i * 2 + 1] = brook_audio_scale(right,outputControl);
     }
     return frames;
 }
@@ -934,7 +950,28 @@ int AudioPlay(const void* samples, uint32_t byteCount,
               bool nonblock)
 {
     if (!g_audioDriver || !g_audioDriver->play) return -1;
-    return g_audioDriver->play(samples, byteCount, sampleRate, channels, bitsPerSample, nonblock);
+    const auto control=AudioOutputControl();
+    if (control==BROOK_AUDIO_DEFAULT)
+        return g_audioDriver->play(samples,byteCount,sampleRate,channels,bitsPerSample,nonblock);
+    // Legacy diagnostic tones bypass the mixer. Apply the same master level
+    // to a private copy, never mutate caller memory or its unaccepted suffix.
+    if (!samples || (bitsPerSample!=8 && bitsPerSample!=16) ||
+        (bitsPerSample==16 && (byteCount&1))) return -1;
+    auto* scaled=static_cast<uint8_t*>(kmalloc(byteCount?byteCount:1));
+    if (!scaled) return -1;
+    const auto* input=static_cast<const uint8_t*>(samples);
+    for (uint32_t i=0;i<byteCount;) {
+        if (bitsPerSample==16) {
+            const auto sample=static_cast<int16_t>(uint16_t(input[i])|(uint16_t(input[i+1])<<8));
+            const auto result=static_cast<uint16_t>(brook_audio_scale(sample,control));
+            scaled[i++]=result&255;scaled[i++]=result>>8;
+        } else {
+            scaled[i]=static_cast<uint8_t>(brook_audio_scale((int(input[i])-128)*256,control)/256+128);
+            ++i;
+        }
+    }
+    const int result=g_audioDriver->play(scaled,byteCount,sampleRate,channels,bitsPerSample,nonblock);
+    kfree(scaled);return result;
 }
 
 void AudioStop()

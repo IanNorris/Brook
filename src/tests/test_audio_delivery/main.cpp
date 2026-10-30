@@ -135,6 +135,36 @@ void writableThreshold() {
     CHECK(AudioMixerGetProgress(stream,&after) && after.writableFrames==32);
     CHECK(AudioMixerClose(stream));CHECK(!AudioMixerSetWritableFrames(stream,1));
 }
+void masterVolume() {
+    using namespace brook;
+    CHECK(AudioOutputControl()==BROOK_AUDIO_DEFAULT);
+    for(auto bad:{101u,127u,128u,0x200u,0xffffffffu}){
+        CHECK(!AudioSetOutputControl(bad));CHECK(AudioOutputControl()==BROOK_AUDIO_DEFAULT);
+    }
+    CHECK(brook_audio_control_setting(42,"output=356\r")==356);
+    CHECK(brook_audio_control_setting(42,"output=357")==42);
+    CHECK(brook_audio_control_setting(42,"output=100oops")==42);
+    CHECK(brook_audio_control_setting(42,"output=00000")==42);
+    const std::vector<int16_t> source={-32768,32767,-10001,10001};
+    for(auto setting:{0u,25u,50u,100u,static_cast<unsigned>(BROOK_AUDIO_MUTED|75)}){
+        CHECK(AudioSetOutputControl(setting));output.clear();limit=-1;
+        CHECK(AudioMixerSubmit(source.data(),2,primary)==2);finish(8);
+        std::vector<int16_t> expected;
+        for(auto s:source)expected.push_back(brook_audio_scale(s,setting));
+        CHECK(output==raw(expected));
+        output.clear();
+        CHECK(AudioPlay(source.data(),8,44100,2,16,true)==8);
+        CHECK(output==raw(expected));
+    }
+    // Attenuate the sum before saturation, retaining quiet multi-app detail.
+    CHECK(AudioSetOutputControl(50));output.clear();
+    const std::vector<int16_t> loud={30000,-30000};
+    CHECK(AudioMixerSubmit(loud.data(),1,primary)==1);
+    CHECK(AudioMixerSubmit(loud.data(),1,secondary)==1);finish(4);
+    CHECK(output==raw(loud));
+    CHECK(source==std::vector<int16_t>({-32768,32767,-10001,10001}));
+    CHECK(AudioSetOutputControl(BROOK_AUDIO_DEFAULT));output.clear();
+}
 void concurrentFlush() {
     std::vector<int16_t> first(80,1234),second(60,-2345);
     auto expected=raw(first),tail=raw(second);expected.insert(expected.end(),tail.begin(),tail.end());
@@ -303,6 +333,7 @@ int main() {
     CHECK(brook::AudioRegister(&driver));
     primary=brook::AudioMixerOpen();secondary=brook::AudioMixerOpen();
     CHECK(primary && secondary && primary!=secondary);
+    masterVolume();
     diagnosticSnapshot();
     writableThreshold();
     // The baseline must fail cleanly on lost partial data before concurrency.

@@ -1,5 +1,6 @@
 #include "chrome_material.h"
 #include "fw_cfg.h"
+#include "audio.h"
 // Brook window manager — z-ordered windows with chrome.
 //
 // Each process gets a Window that wraps its VFB with a title bar, border,
@@ -117,10 +118,12 @@ static void WmRestoreTheme()
     uint32_t selectedScale = 100;
     uint32_t appearance=WmGetAppearance();
     uint32_t taskbarMetrics=BROOK_TASKBAR_DEFAULT;
+    uint32_t audioControl=AudioOutputControl();
+    const bool forceMuted=(audioControl&BROOK_AUDIO_MUTED)!=0;
     Vnode* vn = VfsOpen("/data/home/.config/brook/settings.ini", 0);
     if (vn)
     {
-        char buf[513]; uint32_t done = 0; uint64_t offset = 0;
+        char buf[2049]; uint32_t done = 0; uint64_t offset = 0;
         bool failed = false;
         while (done < sizeof(buf))
         {
@@ -134,6 +137,7 @@ static void WmRestoreTheme()
         {
             buf[done] = 0;
             bool desktopSection = false;
+            bool audioSection = false;
             for (char* line = buf; *line;)
             {
                 char* end = line; while (*end && *end != '\n') ++end;
@@ -141,6 +145,8 @@ static void WmRestoreTheme()
                 char* p = line; while (*p == ' ' || *p == '\t') ++p;
                 if (*p == '[')
                 {
+                    audioSection=strncmp(p,"[Audio]",7)==0;
+                    if(audioSection){const char* tail=p+7;while(*tail==' '||*tail=='\t'||*tail=='\r')++tail;audioSection=!*tail;}
                     desktopSection = strncmp(p, "[Desktop]", 9) == 0;
                     if (desktopSection) {
                         p += 9;
@@ -148,6 +154,7 @@ static void WmRestoreTheme()
                         desktopSection = !*p;
                     }
                 }
+                else if(audioSection) audioControl=brook_audio_control_setting(audioControl,p);
                 else if (desktopSection && strncmp(p, "theme=", 6) == 0)
                 {
                     p += 6;
@@ -183,6 +190,7 @@ static void WmRestoreTheme()
     WmSetTaskbarMetrics(taskbarMetrics);
     WmSetScale(selectedScale);
     WmSetTheme(selected);
+    AudioSetOutputControl(audioControl|(forceMuted?BROOK_AUDIO_MUTED:0));
 }
 
 static Window   g_windows[WM_MAX_WINDOWS] = {};

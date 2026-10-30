@@ -7,6 +7,7 @@ pkgs.stdenv.mkDerivation {
   buildInputs = [ pkgs.gtk3 ];
   postPatch = ''
     cp ${../../src/shared/brook_theme.h} brook_theme.h
+    cp ${../../src/shared/brook_audio_control.h} brook_audio_control.h
     cp ${../../src/shared/brook_appearance.h} brook_appearance.h
     cp ${../../src/shared/brook_user_experience.h} brook_user_experience.h
     cp ${../../src/shared/brook_taskbar.h} brook_taskbar.h

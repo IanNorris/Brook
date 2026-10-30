@@ -12130,6 +12130,15 @@ static int64_t sys_brook_wm_appearance(uint64_t op,uint64_t value,uint64_t,uint6
     return WmSetAppearance(static_cast<uint32_t>(value))?0:-EINVAL;
 }
 
+// Global desktop master gain, including native ALSA/OSS applications.
+static int64_t sys_brook_audio_control(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t){
+    if(!ProcessCurrent())return -ESRCH;
+    if(op==0)return brook::AudioOutputControl();
+    if(op==2)return brook::AudioAvailable()?1:0;
+    if(op!=1||value>0xffffffffULL)return -EINVAL;
+    return brook::AudioSetOutputControl(static_cast<uint32_t>(value))?0:-EINVAL;
+}
+
 // 0xB0C: independently selectable taskbar telemetry widgets.
 static int64_t sys_brook_wm_taskbar_metrics(uint64_t op,uint64_t value,uint64_t,uint64_t,uint64_t,uint64_t){
     if(!ProcessCurrent())return -ESRCH;
@@ -15303,6 +15312,7 @@ void SyscallTableInit()
     g_syscallTable[0xB40]                = sys_brook_pageable_memory;
     g_syscallTable[BROOK_SYS_WM_APPEARANCE] = sys_brook_wm_appearance;
     g_syscallTable[BROOK_SYS_WM_TASKBAR_METRICS] = sys_brook_wm_taskbar_metrics;
+    g_syscallTable[BROOK_SYS_AUDIO_CONTROL] = sys_brook_audio_control;
 #ifdef BROOK_MAPPING_TEST_HOOKS
     g_syscallTable[0xB30]                = MappingFaultTestControl;
 #endif
