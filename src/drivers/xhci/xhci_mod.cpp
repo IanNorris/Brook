@@ -2479,6 +2479,13 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
     if (!evt) {
         KPrintf("xhci: bulk %s timeout slot=%u dci=%u bytes=%u mps=%u trbs=%u failed=%u dma_low=%x\n",
             isIn?"IN":"OUT",dev.slotId,dci,len,maxPacket,tokenCount,ctrl.completionFailed?1u:0u,unsigned(bufPhys&65535));
+        auto* endpoint=reinterpret_cast<volatile uint32_t*>(static_cast<uint8_t*>(dev.outputCtx)+dci*(ctrl.ctx64?64:32));
+        KPrintf("xhci: timeout USBSTS=%08x endpoint state=%u dequeue=%08x:%08x\n",
+            xhci_read32(ctrl.opBase,XHCI_OP_USBSTS),endpoint[0]&7,endpoint[3],endpoint[2]);
+        for(unsigned i=0;i<tokenCount;++i) {
+            const auto* entry=ring+(tokens[i]-ringPhys)/sizeof(Trb);
+            KPrintf("xhci: submitted token=%lx buffer=%lx status=%08x control=%08x\n",tokens[i],entry->param,entry->status,entry->control);
+        }
         return false;
     }
 
@@ -2535,6 +2542,7 @@ static constexpr uint8_t SCSI_SYNCHRONIZE_CACHE_10 = 0x35;
 static KMutex g_mscCommandLock{};
 static KMutex g_mscIoLock{};
 static bool g_storageReadOnly=false;
+static bool g_storagePageChunks=false;
 static uint32_t g_mscDeviceCount=0;
 
 static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
@@ -2729,7 +2737,7 @@ struct UsbMscByteTransport {
     UsbMscState* state;
     uint32_t blockSize() {return g_devices[state->devIndex].mscBlockSize;}
     uint64_t blockCount() {return g_devices[state->devIndex].mscSectorCount;}
-    uint32_t bounceBytes() {return 65536;}
+    uint32_t bounceBytes() {return g_storagePageChunks?4096:65536;}
     uint8_t* bounce() {return state->bounce;}
     bool usable() {return !__atomic_load_n(&g_devices[state->devIndex].mscQuarantined,__ATOMIC_ACQUIRE);}
     bool transfer(uint64_t lba,uint32_t count,bool read) {
@@ -3093,6 +3101,10 @@ static int XhciModuleInit()
     SerialPuts("xhci: initializing USB 3.0 host controller driver\n");
     if(auto* marker=VfsOpen("/etc/usb-read-only")) {
         g_storageReadOnly=true;VfsClose(marker);KPuts("xhci: physical storage probe is read-only\n");
+    }
+    if(auto* marker=VfsOpen("/etc/usb-msc-page-chunks")) {
+        g_storagePageChunks=true;VfsClose(marker);
+        KPuts("xhci: diagnostic MSC limit=4096 bytes (single data TRB)\n");
     }
 
     // Detect xHCI controllers on PCI bus

@@ -357,6 +357,67 @@ This candidate still needs a physical read-integrity pass; TD defects are
 established in the code, but their role in the observed Dell EIO remains to be
 verified.
 
+The physical TD candidate still timed out: READ(10), tag 177, LBA 107744,
+16,384-byte IN transfer, MaxPacket 1,024, three submitted tokens (two data TRBs
+and a Link), DMA low bits `e000`, completion-queue failure flag clear. The next
+diagnostic profile adds `/etc/usb-msc-page-chunks`, limiting MSC data transfers
+to 4,096 bytes while retaining a page-aligned bounce buffer. This distinguishes
+single-TRB transfers from a TD spanning the ring Link. It is a control, not
+proof that the multi-TRB path is repaired. The default remains 64 KiB.
+Timeout diagnostics additionally show USBSTS, endpoint state/dequeue and the
+submitted TRB contents. Host byte-I/O tests now exercise both 4 KiB and 64 KiB
+capacities; the full offline QEMU read/IP/console acceptance passes for the
+control at `build/hardware/msc-page-desktop-test-20261030/result.json`.
+
+## Next: remote USB update and reboot
+
+The user requested remote updates so subsequent driver builds can be tested
+without moving the stick between machines. This is planned work, not a current
+bridge capability. Reliable physical reads followed by checked scratch-file
+writes/flush/fresh-readback are prerequisites; the present transport timeout
+blocks enabling writes to a boot payload.
+
+The first implementation should be an opt-in maintenance profile. Its updater,
+network/debug service and dependencies live in initrd/RAM, and it does not mount
+the compressed application image from USB. The USB provider is writable from
+initialization, while the normal FAT mount remains read-only. Ordinary desktop
+boots keep their existing permanent read-only device guarantee: never toggle
+that guarantee beneath a retained compressed-image source. A future desktop
+that can enter maintenance without a dedicated boot needs an explicit RAM
+application source or another proven handoff mechanism.
+
+The update transaction stages a bounded, complete kernel/initrd pair in RAM and
+checks declared sizes and integrity before touching storage. Binary upload
+frames carry boot identity, transaction ID, length and offset; binary bytes
+must never enter the current line-command parser. An uncertain reply is
+recovered by querying the same transaction, without repeating commit. The
+existing boot token guards identity, not authentication; writing requires an
+explicit opt-in maintenance authorization established during provisioning.
+
+Before writing, quiesce filesystem consumers and require actual FAT binding
+release, not merely namespace detach. Mount the update volume exclusively RW,
+write only the inactive pre-created kernel/initrd pair, sync and flush, then
+verify through fresh reads bypassing caches. Only then publish a checksummed
+generation/selection record and flush again. Unmount successfully before using
+the existing guarded restart. Keep networking and scheduling alive during
+staging/writing; global shutdown happens afterward. Any transport failure stops
+the transaction and retains quarantine rather than booting an incomplete pair.
+
+The bootloader currently chooses a kernel path but always reads optional
+`INITRD.IMG`; it needs required paired-slot selection and pairwise fallback.
+Use two checksummed generation records and keep the bootloader itself outside
+the initial remote-update scope. Preallocated slot files reduce FAT allocation
+changes but do not make FAT or USB writes power-loss transactional. Missing or
+corrupt payload fallback differs from recovery after a valid kernel hangs;
+trial/confirmation or manual recovery remains a separate requirement.
+
+Acceptance should cover interrupted/repeated upload, stale boot identity,
+authorization failure, oversize and corrupted images, active filesystem
+references, failure at each write/flush/readback/selection step, paired fallback,
+and real firmware reset into the selected verified kernel/initrd pair. Until
+these gates pass, the current bridge supports observation, execution and power,
+not remote boot-media updates.
+
 ### Validated reset and graceful manual power-off
 
 Power handling now separates graceful quiescence, reset and automatic power-off.
