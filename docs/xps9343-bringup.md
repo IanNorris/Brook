@@ -792,3 +792,26 @@ writes, verify new app bytes before pair/selector commit and preserve root
 APPS.BRK. Creation needs provenance and disk-full/interruption handling; arbitrary
 existing files may not be adopted or deleted. Whole-device rewriting remains
 out of scope.
+
+### Read-only initrd dependency inspection groundwork
+
+`tools/update_initrd_reader.c` uses an isolated, read-only configuration of the
+vendored FatFs R0.16 parser against a bounded RAM image. It accepts only fixed
+boot metadata paths, returns exact bytes without truncation, checks declared
+FAT volume bounds, limits backend read traffic and preserves backend failures.
+No host device or kernel mount is used. The small CLI accepts regular images
+only; its build script copies unmodified vendor sources beside the separate
+configuration. Calls must remain single-threaded; the active flag is not a lock.
+
+`build/hardware/update-initrd-reader-v3-20261030/result.json` covers FAT12/16/32
+long filenames, unchanged input hashes, oversize/missing metadata, invalid paths,
+truncated/bad boot data, a bounded cyclic-directory case and the exact prepared
+RAM desktop's real snapshot marker. A cyclic lookup returned MISSING under the
+upstream directory bound; MISSING is not global filesystem-integrity proof and
+must never authorize overwriting a potentially referenced application image.
+Backend read limits do not prove a universal parser CPU-time bound; malformed
+fixtures also have host timeouts. This foundation is **not integrated into the
+upload server**, establishes no application dependency policy yet and changes
+neither the staged USB nor the current kernel/initrd-only protocol. A future
+application update must require present, parsed dependency metadata and the
+slot/provenance/commit gates described above.
