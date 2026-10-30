@@ -1,23 +1,38 @@
-/*
- * in_brook.c — Brook OS input (keyboard + mouse) for Quake 2
- *
- * Reads PS/2 scancodes from /dev/keyboard and mouse packets from /dev/mouse.
- * Both devices are opened non-blocking.
- */
+/* Brook native WM input; raw captured deltas are independent of desktop DPI. */
 
 #include "client.h"
 
 #include <stdio.h>
 #include <string.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
+#include <stdint.h>
 
-static int kb_fd = -1;
-static int mouse_fd = -1;
-static int mouse_active = 0;
-static float mouse_dx = 0;
-static float mouse_dy = 0;
+extern unsigned int brook_q2_window;
+static int mouse_active = 1;
+static uint32_t capture_token;
+static unsigned int buttons;
+static float mouse_dx, mouse_dy;
+struct brook_q2_event {
+    uint8_t type, scan, ascii, mods;
+    int16_t x, y;
+    uint32_t token;
+};
+
+static void release_buttons(void)
+{
+    unsigned int i;
+    for (i = 0; i < 3; ++i)
+        if (buttons & (1u << i)) Key_Event(K_MOUSE1 + i, false, Sys_Milliseconds());
+    buttons = 0;
+    mouse_dx = mouse_dy = 0;
+}
+static void release_capture(void)
+{
+    if (capture_token && brook_q2_window)
+        syscall(0xB0A, (long)brook_q2_window, 2L, (long)capture_token, 0L, 0L, 0L);
+    capture_token = 0;
+    release_buttons();
+}
 
 // PS/2 set 1 scancode → Quake 2 key mapping
 static int scancode_to_q2key(unsigned char sc)
@@ -82,100 +97,88 @@ static int scancode_to_q2key(unsigned char sc)
 
 void IN_Init(void)
 {
-    kb_fd = open("/dev/keyboard", O_RDONLY);
-    if (kb_fd >= 0)
-        ioctl(kb_fd, 1, (void *)1); /* non-blocking raw scancode mode */
-    else
-        Com_Printf("IN_Init: can't open /dev/keyboard\n");
-
-    mouse_fd = open("/dev/mouse", O_RDONLY);
-    if (mouse_fd >= 0)
-        ioctl(mouse_fd, 1, (void *)1); /* non-blocking mode */
-    else
-        Com_Printf("IN_Init: can't open /dev/mouse\n");
-
     mouse_active = 1;
-    Com_Printf("IN_Init: keyboard=%d mouse=%d\n", kb_fd, mouse_fd);
+    Com_Printf("Native WM input: click game to capture; Ctrl+Alt+Esc releases mouse\n");
 }
-
-void IN_Shutdown(void)
-{
-    if (kb_fd >= 0) { close(kb_fd); kb_fd = -1; }
-    if (mouse_fd >= 0) { close(mouse_fd); mouse_fd = -1; }
-    mouse_active = 0;
-}
-
-void IN_Commands(void)
-{
-    // Mouse button events could be generated here
-}
-
+void IN_Shutdown(void) { release_capture(); }
+void IN_Commands(void) { }
 void IN_Activate(qboolean active)
 {
     mouse_active = active;
+    if (!active) release_capture();
 }
+void IN_ActivateMouse(void) { mouse_active = 1; }
+void IN_DeactivateMouse(void) { IN_Activate(false); }
 
-void IN_ActivateMouse(void)
+static int native_key(unsigned char scan)
 {
-    mouse_active = 1;
+    static const int extended[] = {
+        K_UPARROW, K_DOWNARROW, K_LEFTARROW, K_RIGHTARROW,
+        K_HOME, K_END, K_INS, K_DEL, K_PGUP, K_PGDN
+    };
+    if (scan >= 0x80 && scan < 0x8a) return extended[scan - 0x80];
+    return scancode_to_q2key(scan);
 }
 
-void IN_DeactivateMouse(void)
-{
-    mouse_active = 0;
-}
-
-// Called from Sys_SendKeyEvents
 void Brook_SendKeyEvents(void)
 {
-    if (kb_fd < 0) return;
-
-    unsigned char buf[64];
-    ssize_t n;
-    while ((n = read(kb_fd, buf, sizeof(buf))) > 0)
+    struct brook_q2_event events[32];
+    long n, i;
+    if (!brook_q2_window) return;
+    if (capture_token && syscall(0xB0A, (long)brook_q2_window,
+            0L, (long)capture_token, 0L, 0L, 0L) != capture_token)
     {
-        for (ssize_t i = 0; i < n; i++)
-        {
-            unsigned char sc = buf[i];
-            // E0 prefix — skip it, next byte has the key
-            if (sc == 0xE0) continue;
-
-            int released = (sc & 0x80) != 0;
-            int key = scancode_to_q2key(sc & 0x7F);
-            if (key)
-                Key_Event(key, !released, Sys_Milliseconds());
-        }
+        capture_token = 0;
+        release_buttons();
     }
-
-    // Read mouse
-    if (mouse_fd < 0 || !mouse_active) return;
-
-    unsigned char mbuf[64];
-    while ((n = read(mouse_fd, mbuf, sizeof(mbuf))) > 0)
+    while ((n = syscall(510, (long)brook_q2_window, (long)events, 32L, 0L, 0L, 0L)) > 0)
     {
-        for (ssize_t i = 0; i + 2 < n; i += 3)
+        for (i = 0; i < n; ++i)
         {
-            unsigned char flags = mbuf[i];
-            int dx = (int)(signed char)mbuf[i + 1];
-            int dy = (int)(signed char)mbuf[i + 2];
-
-            if (flags & 0x10) dx |= ~0xFF;  // sign extend
-            if (flags & 0x20) dy |= ~0xFF;
-
-            mouse_dx += dx;
-            mouse_dy -= dy;  // invert Y
-
-            // Mouse buttons
-            if (flags & 0x01)
-                Key_Event(K_MOUSE1, true, Sys_Milliseconds());
-            if (flags & 0x02)
-                Key_Event(K_MOUSE2, true, Sys_Milliseconds());
+            struct brook_q2_event *e = &events[i];
+            if (e->type <= 1)
+            {
+                int key = native_key(e->scan);
+                if (key) Key_Event(key, e->type == 0, Sys_Milliseconds());
+            }
+            else if (e->type == 0x80) Cbuf_AddText("quit\n");
+            else if (e->type == 0x82)
+            {
+                release_capture();
+                Key_ClearStates();
+            }
+            else if (e->type == 6 && capture_token && e->token == capture_token)
+            {
+                mouse_dx += e->x;
+                mouse_dy += e->y;
+            }
+            else if ((e->type == 3 || e->type == 4) && e->scan < 3)
+            {
+                /* A fresh click is required after focus loss or manual release. */
+                if (e->type == 3 && e->scan == 0 && !capture_token &&
+                    mouse_active && cls.key_dest == key_game && !cl.attractloop)
+                {
+                    long token = syscall(0xB0A, (long)brook_q2_window, 1L, 0L, 0L, 0L, 0L);
+                    if (token > 0)
+                    {
+                        capture_token = (uint32_t)token;
+                        /* Capture's sequence fence may discard an already queued
+                         * release. Consume this click instead of starting fire. */
+                        continue;
+                    }
+                }
+                if (capture_token && e->token != capture_token) continue;
+                if (e->type == 3) buttons |= 1u << e->scan;
+                else buttons &= ~(1u << e->scan);
+                Key_Event(K_MOUSE1 + e->scan, e->type == 3, Sys_Milliseconds());
+            }
         }
     }
 }
-
 void IN_Frame(void)
 {
+    if (!mouse_active || cls.key_dest != key_game || cl.attractloop)
+        release_capture();
 }
 
 void IN_Move(usercmd_t *cmd)

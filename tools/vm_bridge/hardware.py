@@ -135,7 +135,7 @@ class Hardware:
         result=BulkRun(self,output).execute(session,key_file,action,source,artifact_id,port,request_id,keep_raw)
         return {'session':session,'state':result['state'],'transaction_id':result['transaction_id'],
                 'receipt_path':str(Path(output).absolute()/'receipt.json'),
-                'artifact_path':result.get('artifact_path'),'transfer':result['transfer']}
+                'artifact_path':result.get('artifact_path'),'binary_phase_s':result['binary_phase_s'],'transfer':result['transfer']}
 
     def power(self,session,request_id,operation,**_):
         validate_id(request_id)

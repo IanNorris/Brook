@@ -14,5 +14,5 @@ def main():
     p.add_argument('--output',type=Path,required=True);p.add_argument('--port',type=int,default=1236)
     a=p.parse_args();r=BulkRun(Hardware(),a.output).execute(a.session,a.key_file,a.action,a.source,a.artifact_id,a.port,a.request_id,a.keep_raw)
     print(json.dumps({'state':r['state'],'transaction_id':r['transaction_id'],'receipt':str(a.output.resolve()/'receipt.json'),
-        'artifact_path':r.get('artifact_path'),'transfer':r['transfer']},indent=2))
+        'artifact_path':r.get('artifact_path'),'binary_phase_s':r['binary_phase_s'],'transfer':r['transfer']},indent=2))
 if __name__=='__main__':main()

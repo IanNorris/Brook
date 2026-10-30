@@ -1,7 +1,7 @@
 /*
  * swimp_brook.c — Brook OS software renderer window implementation for Quake 2
  *
- * Maps the framebuffer and provides the palette-to-RGBA blit.
+ * Owns a native WM framebuffer and provides the palette-to-BGRA blit.
  * Replaces swimp_null.c / rw_x11.c / rw_svgalib.c
  */
 
@@ -12,15 +12,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <linux/fb.h>
 
 extern qboolean VID_GetModeInfo(int *width, int *height, int mode);
 
-static int fb_fd = -1;
+/* Use an owned WM window so input and pointer leases have an exact target. */
+unsigned int brook_q2_window;
+struct brook_q2_window_out {
+    uint32_t id, stride;
+    uint64_t pixels;
+};
 static uint32_t *fb_pixels = NULL;
 static unsigned int fb_width = 0;
 static unsigned int fb_height = 0;
@@ -210,38 +211,16 @@ static void fps_record_and_draw(void)
 
 int SWimp_Init(void *hInstance, void *wndProc)
 {
-    fb_fd = open("/dev/fb0", O_RDWR);
-    if (fb_fd < 0)
+    struct brook_q2_window_out out = {0};
+    if (syscall(506, 640L, 480L, (long)"Quake II", (long)&out, 0L, 0L) < 0)
     {
-        ri.Con_Printf(PRINT_ALL, "SWimp_Init: can't open /dev/fb0\n");
+        ri.Con_Printf(PRINT_ALL, "SWimp_Init: cannot create native window\n");
         return false;
     }
-
-    struct fb_var_screeninfo vinfo;
-    if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) < 0)
-    {
-        ri.Con_Printf(PRINT_ALL, "SWimp_Init: can't get fb info\n");
-        close(fb_fd);
-        fb_fd = -1;
-        return false;
-    }
-
-    fb_width = vinfo.xres;
-    fb_height = vinfo.yres;
-
-    size_t fb_size = fb_width * fb_height * (vinfo.bits_per_pixel / 8);
-    fb_pixels = (uint32_t *)mmap(NULL, fb_size, PROT_READ | PROT_WRITE,
-                                  MAP_SHARED, fb_fd, 0);
-    if (fb_pixels == MAP_FAILED)
-    {
-        ri.Con_Printf(PRINT_ALL, "SWimp_Init: mmap failed\n");
-        close(fb_fd);
-        fb_fd = -1;
-        return false;
-    }
-
-    ri.Con_Printf(PRINT_ALL, "SWimp_Init: framebuffer %ux%u bpp=%u\n",
-                  fb_width, fb_height, vinfo.bits_per_pixel);
+    brook_q2_window = out.id;
+    fb_pixels = (uint32_t *)(uintptr_t)out.pixels;
+    fb_width = 640;
+    fb_height = 480;
 
     return true;
 }
@@ -260,44 +239,13 @@ rserr_t SWimp_SetMode(int *pwidth, int *pheight, int mode, qboolean fullscreen)
         height = 240;
     }
 
-    // Ask the kernel to resize our VFB so we render 1:1 (no up/down scale).
-    if (fb_fd >= 0)
-    {
-        struct fb_var_screeninfo vinfo;
-        memset(&vinfo, 0, sizeof(vinfo));
-        if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) == 0)
-        {
-            vinfo.xres = width;
-            vinfo.yres = height;
-            vinfo.xres_virtual = width;
-            vinfo.yres_virtual = height;
-            if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo) == 0)
-            {
-                // Re-query the accepted size (kernel clamps to physical FB).
-                if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) == 0)
-                {
-                    // Drop old mmap and re-map at the new size.
-                    if (fb_pixels && fb_pixels != MAP_FAILED)
-                    {
-                        munmap(fb_pixels, fb_width * fb_height * 4);
-                        fb_pixels = NULL;
-                    }
-
-                    fb_width  = vinfo.xres;
-                    fb_height = vinfo.yres;
-
-                    size_t fb_size = (size_t)fb_width * fb_height * (vinfo.bits_per_pixel / 8);
-                    fb_pixels = (uint32_t *)mmap(NULL, fb_size, PROT_READ | PROT_WRITE,
-                                                  MAP_SHARED, fb_fd, 0);
-                    if (fb_pixels == MAP_FAILED)
-                    {
-                        ri.Con_Printf(PRINT_ALL, "SWimp_SetMode: re-mmap failed\n");
-                        fb_pixels = NULL;
-                    }
-                }
-            }
-        }
-    }
+    struct brook_q2_window_out out = {0};
+    if (!brook_q2_window || syscall(511, (long)brook_q2_window,
+            (long)width, (long)height, (long)&out, 0L, 0L) < 0)
+        return rserr_invalid_mode;
+    fb_pixels = (uint32_t *)(uintptr_t)out.pixels;
+    fb_width = width;
+    fb_height = height;
 
     // Clamp to framebuffer so we don't overrun the blit.
     if (fb_width && width > (int)fb_width) width = fb_width;
@@ -381,13 +329,11 @@ void SWimp_EndFrame(void)
         }
     }
 
-    // Signal compositor that a new frame is ready
-    if (fb_fd >= 0)
-        write(fb_fd, "", 1);
-
     // Frame diagnostics overlay (drawn after the scaled blit, so it's always
     // on top of the Q2 image).
     fps_record_and_draw();
+    if (brook_q2_window)
+        syscall(508, (long)brook_q2_window, 0L, 0L, 0L, 0L, 0L);
 }
 
 void SWimp_Shutdown(void)
@@ -398,17 +344,11 @@ void SWimp_Shutdown(void)
         sw_framebuffer = NULL;
     }
 
-    if (fb_pixels && fb_pixels != MAP_FAILED)
-    {
-        munmap(fb_pixels, fb_width * fb_height * 4);
-        fb_pixels = NULL;
-    }
-
-    if (fb_fd >= 0)
-    {
-        close(fb_fd);
-        fb_fd = -1;
-    }
+    if (brook_q2_window)
+        syscall(507, (long)brook_q2_window, 0L, 0L, 0L, 0L, 0L);
+    brook_q2_window = 0;
+    fb_pixels = NULL;
+    fb_width = fb_height = 0;
 }
 
 void SWimp_AppActivate(qboolean active)

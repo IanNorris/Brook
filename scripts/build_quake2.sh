@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BROOK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 Q2_SRC="$BROOK_ROOT/tools/quake2/source"
-BUILD_DIR="$BROOK_ROOT/build/quake2"
+BUILD_DIR="${BROOK_Q2_BUILD_DIR:-$BROOK_ROOT/build/quake2}"
 
 mkdir -p "$BUILD_DIR"
 

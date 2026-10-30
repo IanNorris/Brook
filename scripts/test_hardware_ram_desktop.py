@@ -13,6 +13,7 @@ from hardware_update_protocol import record,KERNEL_MAX,INITRD_MAX
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--desktop',required=True,type=Path);p.add_argument('--maintenance',required=True,type=Path);p.add_argument('--output',required=True,type=Path)
 p.add_argument('--width',type=int,default=1920);p.add_argument('--height',type=int,default=1080)
+p.add_argument('--memory-mb',type=int,default=2048,choices=[2048,4096,8192,16384])
 a=p.parse_args();desktop=a.desktop.resolve(strict=True);maintenance=a.maintenance.resolve(strict=True);out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
 if not (640<=a.width<=4096 and 480<=a.height<=2160):p.error('Private test display must be 640..4096 by 480..2160')
 m=json.loads((desktop/'manifest.json').read_text());mm=json.loads((maintenance/'manifest.json').read_text())
@@ -32,7 +33,7 @@ variables=out/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],variables);variable
 with socket.socket() as reserve,socket.socket() as bulk_reserve:
     reserve.bind(('127.0.0.1',0));port=reserve.getsockname()[1]
     bulk_reserve.bind(('127.0.0.1',0));bulk_port=bulk_reserve.getsockname()[1]
-argv=['qemu-system-x86_64','-machine','q35','-accel','kvm','-cpu','host','-smp','4','-m','2048','-nodefaults',
+argv=['qemu-system-x86_64','-machine','q35','-accel','kvm','-cpu','host','-smp','4','-m',str(a.memory_mb),'-nodefaults',
     '-drive','if=pflash,format=raw,readonly=on,file='+os.environ['OVMF_CODE'],'-drive','if=pflash,format=raw,file='+str(variables),
     '-device','VGA,vgamem_mb=64','-device','qemu-xhci,id=usbc','-drive','if=none,id=stick,format=raw,file='+str(disk),
     '-device','usb-storage,bus=usbc.0,port=1,drive=stick,bootindex=1','-device','usb-net,bus=usbc.0,port=2,netdev=network',

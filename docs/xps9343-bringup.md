@@ -1038,3 +1038,54 @@ the downloaded SHA256 matched the source. End-to-end times were10.09s upload
 and8.19s download, including job startup and polling—not wire-throughput numbers.
 Evidence: `dell-bulk-acceptance-20261030/roundtrip-result.json` and the retained
 MCP responses. The scanner uses the exact accepted bulk-payload kernel ELF.
+
+### Native software Quake II (2026-10-30)
+
+The existing static Brook Quake II port now runs on the physical Dell without
+Mesa or LLVM. A fresh source build and a caller-supplied private `pak0.pak`
+passed the private 8GiB QEMU test before binary transfer to the Dell's RAM home.
+The engine and PAK are moved within `/data`, avoiding a second copy of the
+176MiB PAK against tmpfs's quota. Neither paid game assets nor music are added
+to Git or the distributable image. The engine runs as UID1000. Internal Dell
+audio remains unavailable and is explicitly disabled for this test.
+
+`dell-quake2-software-20261030/result.json` records the physical run; successive
+binary captures show a changing textured 3D scene, weapon and HUD. Terra
+inspected the actual native capture, and the user subsequently played the game.
+This verifies gameplay rather than only a loading screen. The displayed FPS
+in a screenshot is a single observation, not a sustained benchmark.
+
+The binary phase for the native 3.66MB engine was5.53s and the184MB PAK273.93s,
+including streaming, hashing and verification but excluding helper startup and
+job polling. Private QEMU's PAK phase was6.75s. This isolates a substantial
+physical-network throughput gap. Source review identifies one outstanding
+2048-byte ECM receive TD and unprogrammed xHCI interrupt moderation as leads;
+measure completion/IRQ timing before attributing the gap or changing queues.
+
+The user's gameplay review found no mouse input. The old platform adapter
+attempted to open `/dev/mouse`, a device Brook does not implement, and lacked
+button-release handling. The revised adapter uses an owned native WM window,
+its keyboard/button/raw-relative event queue and revocable pointer lease.
+Click in gameplay captures; menus/focus loss release; Ctrl+Alt+Esc releases
+without an immediate automatic re-grab. Initial capture clicks are consumed
+so a kernel sequence fence cannot leave firing stuck on. Desktop DPI cursor
+size and movement sensitivity remain separate from raw game deltas.
+
+The host adapter test is:
+
+```sh
+cc -std=gnu99 -I tools/quake2/source \
+  tools/quake2/source/in_brook_test.c -o /tmp/brook-q2-input-test
+/tmp/brook-q2-input-test
+```
+
+It covers raw motion axes, complete button pairs, stale capture tokens, focus
+and menu release, manual revocation, extended keys and native close requests.
+Actual input acceptance is recorded separately under
+`quake2-mouse-qemu-20261030`; physical mouse behavior still requires review.
+
+The mouse-pass private guest reached the rendered scene and accepted a keyboard
+`map base1` command. Its later shutdown remained in `Closing apps` for90s and
+the harness terminated QEMU in cleanup. Do not count that run as a checked
+shutdown pass; the earlier software-game test completed checked shutdown.
+The failed shutdown log is `build/hardware/quake2-mouse-qemu.log`.
