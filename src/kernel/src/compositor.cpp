@@ -29,6 +29,7 @@
 #include "input.h"
 #include "net.h"
 #include "display.h"
+#include "display_power.h"
 #include "gpu_compositor.h"
 #include "gpu_quad_math.h"
 #include "frame_timing.h"
@@ -3753,6 +3754,7 @@ static void CompositorThreadFn(void* /*arg*/)
         const uint64_t frameGeneration=g_compositorWakeSequence.Snapshot();
         FrameTimingBegin();
         if (!g_compositorHalted) {
+            DisplayPowerTick(ApicTickCount(),InputLatestSequence());
             { FrameTimingScope phase(FramePhase::DeferredCaptures);DrainOwnedCaptures(); }
             { FrameTimingScope phase(FramePhase::SceneDrain);CompositorDrainScenes(); }
             CompositorLoop();

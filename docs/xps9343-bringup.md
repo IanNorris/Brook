@@ -1355,3 +1355,69 @@ Actual relevant PCI functions (no controller reconfiguration):
 Next display gate: read only the documented Broadwell/LPT backlight register
 state and establish whether firmware uses CPU PWM, PCH override or another
 route before enabling any manual off/on operation. Keep system sleep deferred.
+
+### Internal display/backlight control candidate (2026-10-30)
+
+The provider is deliberately narrower than a native graphics driver: the exact
+Dell1028:0665 / Intel8086:1616 GPU plus8086:9cc3 PCH, memory decode already on,
+with no BAR-sizing writes. It maps only the two register pages UC/NX after
+rejecting described RAM overlaps. These borrowed MMIO mappings are boot-lifetime.
+It reads firmware CPU/PCH PWM controls and duty/period without writes at boot.
+Only an enabled, plausible CPU PWM or explicit PCH override route is admitted;
+frequency, polarity, enable bits and routing remain untouched. The operation is
+zero PWM duty / restore original duty, not eDP-link power-down or system sleep.
+Primary implementation reference: Linux's MIT-licensed
+[intel_backlight.c](https://raw.githubusercontent.com/torvalds/linux/master/drivers/gpu/drm/i915/display/intel_backlight.c)
+and [register definitions](https://raw.githubusercontent.com/torvalds/linux/master/drivers/gpu/drm/i915/display/intel_backlight_regs.h).
+
+Boot-pinned `Hardware.command` accepts:
+- `bridge hardware backlight status`: firmware/current registers, availability,
+  logical on/uncertain state, idle timeout and restore deadline.
+- `bridge hardware backlight off 10`: ten-second timed restoration test; allowed
+  duration0..60, where0 stays off until input/on.
+- `bridge hardware backlight on`: restore the admitted original duty.
+- `bridge hardware backlight idle 300`: five-minute idle timeout;0 disables it
+  and restores the backlight. Maximum86400seconds.
+
+The production controller observes the existing input publication sequence from
+normal compositor context, waking on input without doing MMIO in an input IRQ.
+Manual control samples input before the MMIO operation, preserving input that
+arrives during a transition. Panic restore uses no normal lock and atomically
+published transition ownership; it restores only the still-compatible firmware
+route. Failed readback enters uncertain state and forces restoration/idle-disable
+on the next tick. External duty/routing changes are refused, including otherwise
+idempotent commands; a failed command cannot reset the idle policy.
+
+Astra reviewed route/period interpretation, ownership and wake/failure paths;
+the idempotent-duty finding is fixed with a regression test. Production core
+host tests cover CPU/PCH paths, preserved non-duty bits, invalid firmware,
+external writers, readback failures, panic restoration, timed/manual/input wake
+and idle reset/disable. The debug parser and compositor capture tests also pass.
+Evidence: `build/hardware/backlight-host-build-20261030.log` and
+`backlight-kernel-build-20261030.log`. Private QEMU boot and checked shutdown pass
+in `backlight-qemu-20261030/result.json`; its unsupported VGA device is never
+mapped, and power/idle mutations are refused. QEMU does not emulate this physical
+PWM path; those results do not prove the Dell panel switches off.
+
+Frozen candidate: `build/hardware/backlight-v1-20261030`. Automatic idle remains
+disabled by default until physical route/off/wake acceptance; no persistent
+settings or full suspend/resume behavior is claimed by this checkpoint.
+
+The candidate has now boot-verified on the Dell as generation8/slotB, payload
+`desktop-ram-apps-cfe9c5e5b9424c4bbe7794fc5145cb85`. Generation7/slotA remains
+accepted fallback; root recovery and APPS.BRK were not replaced. Session
+`f061048e48004232818cd055acec5d46`, boot
+`3bdb4219ee864479a56326a87a483714`. Scanner unit
+`brook-panic-receiver-backlight-20261030.service` uses the exact frozen ELF.
+
+The actual firmware state is PCH override: CPU control0xe0000000, PCH
+control0xc0000000, CPU/PCH data both0x03a903a9 (period/duty937). The first
+status read matched the boot snapshot. One timed `off 10` reached zero PCH
+duty with the period/control fields intact, network doctor stayed reachable,
+and the controller restored every original register after10.158seconds.
+A separate `idle 2` compositor-policy cycle then reached off and was restored
+with `on`/`idle 0`; automatic idle is left disabled. Evidence is in
+`build/hardware/backlight-native-update-20261030/receipt.json`,
+`backlight-before.json`, `timed-cycle.json`, `idle-cycle.json` and `doctor.json`.
+These are register/transport acceptance; physical panel darkness and waking
+from the built-in keyboard/touchpad are still pending user observation.

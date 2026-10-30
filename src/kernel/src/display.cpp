@@ -6,6 +6,7 @@
 // themselves to take over.
 
 #include "display.h"
+#include "display_power.h"
 #include "tty.h"
 #include "serial.h"
 
@@ -108,6 +109,7 @@ void DisplayFlush(uint32_t minY, uint32_t maxY)
 
 void DisplayPanicPresent()
 {
+    DisplayPowerPanicRestore();
     FramebufferWriteFence();
     if (g_activeDisplay && g_activeDisplay->PanicPresent)
         g_activeDisplay->PanicPresent();

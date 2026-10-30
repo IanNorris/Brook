@@ -263,6 +263,7 @@ add_executable(kernel
     src/vmware_clock.cpp
     src/vdso.cpp
     src/display.cpp
+    src/display_power.cpp
     src/gpu_compositor.cpp
     src/frame_timing.cpp
     src/gpu_app.cpp

@@ -4,11 +4,13 @@
 #include "fs/compressed_vfs.h"
 #include "vfs.h"
 #include "pci.h"
+#include "display_power.h"
 #include <cassert>
 #include <cstring>
 #include <string>
 std::string reply,dispatched;
 unsigned powerCalls=0;std::string powerVerb;
+unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
 namespace brook {
 AppSnapshotBootInfo snapshot;
 Vnode binaryNode{},markerNode{};
@@ -30,6 +32,9 @@ void DebugHandleCommand(const char* s,uint32_t n){assert(n==std::strlen(s));disp
 const char* BuildGitHash(){return "test+build";}
 const char* BuildDate(){return "now";}
 bool AudioAvailable(){return false;}
+DisplayPowerStatus DisplayPowerRead(){return {};}
+bool DisplayPowerSetOn(bool on,uint32_t seconds){++backlightCalls;backlightSeconds=seconds;backlightOn=on;return false;}
+bool DisplayPowerSetIdle(uint32_t seconds){++backlightCalls;backlightSeconds=seconds;return false;}
 ShutdownPowerCapabilities ShutdownGetPowerCapabilities(){return {true,true,false,"acpi-io8","manual","firmware","S5 unavailable"};}
 const char* ShutdownRequestStatus(const char*){return "Safe to power off manually";}
 void ShutdownCommand(const char*,const char* verb,char state[24],int* error){++powerCalls;powerVerb=verb;std::strcpy(state,"ready");*error=std::strcmp(verb,"commit")?0:-95;}
@@ -55,6 +60,15 @@ int main(){
     assert(handle("bridge hardware caps") && reply.find("\"hardware_api\":1")!=std::string::npos);
     assert(reply.find("\"panic_transport\":false")!=std::string::npos);
     assert(reply.find("\"pci_inventory_api\":1")!=std::string::npos);
+    assert(reply.find("\"backlight_api\":1")!=std::string::npos);
+    assert(handle("bridge hardware backlight status") && !backlightCalls && reply.find("\"available\":false")!=std::string::npos);
+    assert(handle("bridge hardware backlight off 10") && backlightCalls==1 && backlightSeconds==10 && !backlightOn);
+    assert(reply.find("\"ok\":false")!=std::string::npos);
+    assert(handle("bridge hardware backlight on") && backlightCalls==2 && backlightOn);
+    assert(handle("bridge hardware backlight idle 300") && backlightCalls==3 && backlightSeconds==300);
+    for(const auto* bad:{"off","off -1","off 61","off 1 more","idle 86401","idle 4294967296","unknown"}){
+        assert(handle(std::string("bridge hardware backlight ")+bad));assert(backlightCalls==3 && reply.find("\"ok\":false")!=std::string::npos);
+    }
     assert(handle("bridge hardware pci 0 1"));
     assert(reply.find("\"source\":\"boot_snapshot\"")!=std::string::npos);
     assert(reply.find("\"vendor_id\":32902")!=std::string::npos);

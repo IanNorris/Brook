@@ -11,6 +11,7 @@
 #include "fs/compressed_vfs.h"
 #include "vfs.h"
 #include "pci.h"
+#include "display_power.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -52,7 +53,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     if(!strcmp(command,"bridge hardware caps")){
         char boot[33];DebugEpochCopy(boot);
         Reply r;r.text("{\"hardware_api\":1,\"boot_guard\":true,\"logs_api\":1,\"boot_id\":");r.quoted(boot);
-        r.text(",\"pci_inventory_api\":1,\"build_id\":");r.quoted(BuildGitHash());r.text(",\"build_date\":");r.quoted(BuildDate());
+        r.text(",\"backlight_api\":1,\"pci_inventory_api\":1,\"build_id\":");r.quoted(BuildGitHash());r.text(",\"build_date\":");r.quoted(BuildDate());
         r.text(",");r.field("logical_cpus",SmpGetCpuCount());
         r.text(",\"audio_device\":");r.text(AudioAvailable()?"true":"false");
         const auto snapshot=CompressedVfsAppSnapshotInfo();
@@ -73,6 +74,30 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
     }
     constexpr char pciPrefix[]="bridge hardware pci ";
+    constexpr char backlightPrefix[]="bridge hardware backlight ";
+    if(Prefix(command,backlightPrefix)){
+        const char* p=command+sizeof(backlightPrefix)-1;bool ok=true;
+        if(!strcmp(p,"status")){}
+        else if(!strcmp(p,"on"))ok=DisplayPowerSetOn(true);
+        else if(Prefix(p,"off ")){p+=4;uint32_t seconds=0;
+            ok=Decimal(p,seconds) && !*p && seconds<=60 && DisplayPowerSetOn(false,seconds);}
+        else if(Prefix(p,"idle ")){p+=5;uint32_t seconds=0;
+            ok=Decimal(p,seconds) && !*p && seconds<=86400 && DisplayPowerSetIdle(seconds);}
+        else ok=false;
+        const auto status=DisplayPowerRead();Reply r;
+        r.text("{\"backlight_api\":1,\"ok\":");r.text(ok?"true":"false");
+        r.text(",\"mapped\":");r.text(status.mapped?"true":"false");
+        r.text(",\"available\":");r.text(status.available?"true":"false");
+        r.text(",\"on\":");r.text(status.on?"true":"false");
+        r.text(",\"state_uncertain\":");r.text(status.uncertain?"true":"false");
+        r.text(",");r.field("idle_seconds",status.idleSeconds);r.text(",");r.field("last_activity_ms",status.lastActivityMs);
+        r.text(",");r.field("restore_at_ms",status.restoreAtMs);r.text(",\"reason\":");r.quoted(status.reason);
+        auto registers=[&](const BacklightRegisters& v){r.text("{");r.field("cpu_control",v.cpuControl);
+            r.text(",");r.field("cpu_duty",v.cpuDuty);r.text(",");r.field("pch_control",v.pchControl);
+            r.text(",");r.field("pch_duty",v.pchDuty);r.text("}");};
+        r.text(",\"boot_registers\":");registers(status.original);r.text(",\"current_registers\":");registers(status.current);
+        r.text(",\"scope\":\"backlight PWM only; panel link and system remain running\"}\n");r.send();return true;
+    }
     if(Prefix(command,pciPrefix)){
         const char* p=command+sizeof(pciPrefix)-1;uint32_t cursor=0,limit=0;
         const uint32_t count=PciBootInventoryCount();
