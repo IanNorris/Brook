@@ -1175,3 +1175,73 @@ the saved cursor crop: a coherent white arrow with black outline, approximately
 22 visible pixels wide by32 tall (24x32 allocated), without obvious corruption.
 Evidence image: `pointer-qa/desktop-cursor-crop.png`. These results do not replace
 physical pointer-speed and external-device acceptance on the Dell.
+
+### Networked desktop / audio / SSD-preparation goal (2026-10-30)
+
+Work continues on `hardware/xps9343-desktop-audio` from main6311f468.
+Order: actual Dell Firefox/Chromium/App Gallery browsing and package install;
+internal SST/SSP/I2S plus RT286 audio with visible volume/mute and muted boot;
+then read-only internal-SSD inventory and reviewed installation/boot tooling.
+Internal SSD writes, repartitioning and formatting are outside this preparation
+scope. USB recovery and accepted application/boot payloads remain available.
+
+The DPI/pointer and cooperative-shutdown candidate was deployed using the
+existing boot-pinned updater. Generation6/slotB booted the expected initrd;
+generation5/slotA remains the prior accepted fallback. Root recovery and
+APPS.BRK were not replaced. New bridge session
+`b0a02b9629ca4fb4a9ad3082ffb9576b`, boot
+`3ed9fa9697404d1c9ac8a3d66771b099` verifies the262602752-byte immutable snapshot
+ready/source_closed with error0. Evidence:
+`build/hardware/dpi-pointer-native-update-20261030/receipt.json`, `doctor.json`
+and `screenshot/receipt.json`. The old Quake job was identified and terminated
+before reboot; its volatile game installation no longer exists after reboot.
+The scanner now uses the exact DPI candidate ELF. Physical pointer feel remains
+a separate user observation; a successful boot does not prove that acceptance.
+
+`nix/hardware-network-packages.nix` builds Firefox150.0.1, Chromium148.0.7778.96
+and App Gallery alongside the existing small desktop. It reuses the tested
+browser wrappers and the runtime Mesa/LLVM subset, uses a native Wayland/CPU
+route, sets the actual session-bus address and supplies explicit application
+entries. The accepted small profile remains unchanged. The candidate profile
+built successfully; all four launcher scripts pass `bash -n`. This is package
+preparation, not yet browser acceptance on QEMU or hardware.
+
+Measured closure:434 store paths,2893148043 regular-file bytes. Chromium accounts
+for700500611 bytes, Firefox377666699, Mesa264120497 and runtime LLVM194783344.
+Measurement: `build/hardware/network-profile-size-20261030.json`. A writable
+ext2 image just below FAT32's4GiB single-file limit can hold this closure with
+bounded installation headroom; calculate metadata and free blocks before
+publication. Do not raise the current512MiB immutable snapshot cap blindly.
+
+App Gallery's installer writes `/nix/store` and `/nix/profile`; neither can be
+writable in the accepted compressed `/nix` mount. Astra reviewed the current
+source and recommends a dedicated, fixed-size FAT-file-backed ext2 device.
+This preserves the tested ext2 package semantics without formatting the stick,
+using a whole multi-gigabyte RAM disk or implementing a general overlay FS.
+Seed the entire `/nix` namespace: an empty writable mount would hide the base.
+Materialize a writable profile, installer/index and a user-owned persistent
+home directory; retain the accepted immutable desktop as recovery.
+
+Required implementation boundaries before hardware use:
+
+- Typed exclusive uncached RW FAT backing lease; reject conflicting handles
+  and later writes, truncation, unlink, replacement or mappings through aliases.
+  Ordinary VFS_O_STREAM stays read-only. A resize pin alone is insufficient.
+- Block callbacks use an already-retained file and caller-local offsets. No
+  namespace lookup/open/close inside ext2/FAT I/O. Keep the lock order
+  namespace -> ext2 -> FAT -> USB and defer lower release outside those locks.
+- Fixed image bounds, exact transfers, sticky write errors, write-behind off
+  initially, and checked ext2 -> FAT file -> USB flush ordering.
+- Bind a fresh device slot once; do not replace live ext2 bindings. Keep the
+  device/backing for the boot lifetime initially.
+- A separate bounded streaming provisioner writes a new dedicated filename,
+  hashes, flushes and fresh-read verifies it before marking it usable. Current
+  RAM-only bulk staging quotas/timeouts cannot provision this multi-GB image.
+- QEMU must exercise the actual USB/FAT/ext2 stack: random writes, executable
+  mmap, installer activity, conflicting aliases, injected I/O/flush failures,
+  checked shutdown, reboot persistence and offline checks of both filesystems.
+  Accepted recovery/APPS/update-slot hashes must remain unchanged.
+
+No writable backing device or expanded USB store is implemented/deployed at
+this checkpoint. This design is the next concrete dependency for Gallery
+installation and persistent browser profiles.
