@@ -222,7 +222,13 @@ pages, with diagnostic text kept out of the QR column. Layout tests cover
 640x480 through 3840x2160. The first
 fallback attempt hit a host QMP timeout during image cleanup; the repeat with
 cleanup paused passed. This is correctness evidence, not a physical performance
-claim. The next Dell run must compare HWMS copy times with the prior 80–141ms.
+claim. In the subsequent Dell run, the user reports CPU usage falling to 1%
+and much smoother interaction. The 800x600 photo confirms HWFB cache=WC,
+HWMS draw=0 and copy=0 at timer resolution, with period=16 ms on the guest
+clock. The prior copy time was 80–141ms. Higher-resolution behavior and
+wall-clock timer accuracy remain unverified. A configuration-only repeat
+requests the largest linear GOP mode within 3840x2160, retaining the exact
+verified kernel/initrd/loader; actual selected geometry must be read from HWFRAME.
 
 References: [Linux PAT alias rules](https://www.kernel.org/doc/html/latest/arch/x86/pat.html)
 and [Intel memory-type tables](https://cdrdv2-public.intel.com/812380/252046-sdm-change-document.pdf).
