@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 namespace brook {
-enum class UsbScsiCache : uint8_t { Unknown, WriteThrough, WriteBack };
+enum class UsbScsiCache : uint8_t { Unknown, WriteThrough, WriteBack, AssumedWriteThrough };
 struct UsbScsiSense {bool valid=false,current=false;uint8_t key=0,asc=0,ascq=0;};
 inline UsbScsiSense UsbScsiParseSense(const uint8_t* data,uint32_t bytes) {
     UsbScsiSense result{};if(!data||!bytes)return result;
@@ -15,7 +15,7 @@ inline UsbScsiSense UsbScsiParseSense(const uint8_t* data,uint32_t bytes) {
     }else return result;
     result.valid=true;result.current=(format==0x70||format==0x72);return result;
 }
-inline UsbScsiCache UsbScsiModeCache6(const uint8_t* data,uint32_t bytes) {
+inline UsbScsiCache UsbScsiModeCache6(const uint8_t* data,uint32_t bytes,bool allPages=false) {
     if(!data||bytes<4)return UsbScsiCache::Unknown;
     const uint32_t total=uint32_t(data[0])+1;
     if(total<4||total>bytes||uint32_t(data[3])>total-4)return UsbScsiCache::Unknown;
@@ -32,13 +32,13 @@ inline UsbScsiCache UsbScsiModeCache6(const uint8_t* data,uint32_t bytes) {
         }
         offset+=length;
     }
-    return found;
+    return found==UsbScsiCache::Unknown&&allPages?UsbScsiCache::AssumedWriteThrough:found;
 }
 inline bool UsbScsiUnsupportedSync(const UsbScsiSense& sense) {
     return sense.valid&&sense.current&&sense.key==5&&sense.asc==0x20&&sense.ascq==0;
 }
 inline bool UsbScsiWriteThroughFlush(UsbScsiCache cache,const UsbScsiSense& sense) {
-    return cache==UsbScsiCache::WriteThrough&&UsbScsiUnsupportedSync(sense);
+    return (cache==UsbScsiCache::WriteThrough||cache==UsbScsiCache::AssumedWriteThrough)&&UsbScsiUnsupportedSync(sense);
 }
 inline bool UsbScsiShortInCompletion(bool input,bool singleDataTrb,bool allowed,
                                     uint32_t requested,uint32_t cc,uint32_t residue) {

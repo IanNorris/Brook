@@ -717,3 +717,42 @@ The current Linux umount syscall supports MNT_DETACH only; this test does not
 claim a strict umount. Source closure is before publication in the boot code,
 and source overwrite makes the fresh execution test independent of namespace
 visibility or a retained cached source file.
+
+### Confirmed unsupported sync and bounded BOT status recovery
+
+Physical v4 diagnostics confirmed current05/20/00 for opcode35. Its MODE SENSE6
+DBD1/page08 query then completed its data stage but stalled the13-byte CSW receive
+(cc6, residue13); the transport was correctly quarantined. This was not a new
+payload write. Evidence: `build/hardware/dell-flush-diagnostics-v4-20261030`.
+
+The next candidate follows the BOT status-stage recovery sequence: clear the
+bulk-IN halt through EP0, reset that xHCI endpoint, set its dequeue to the known
+software position after the failed TD, then retry only the CSW once. No CBW or
+write is replayed, and timeouts remain failures. Matching includes the slot,
+DCI and final TRB. Command completions must precede the retry. At ring index255,
+normalization skips the Link, toggles DCS and leaves that skipped Link unowned
+for the next lap. Recovery failure or another stalled CSW quarantines the device.
+See [USB BOT1.0 sections5.3.3 and6.7](https://www.usb.org/sites/default/files/usbmassbulk_10.pdf).
+
+The compatibility query now uses current MODE SENSE6 all-pages3f with DBD0.
+Diagnostic responses may contain padding; CSW-relevant bytes must actually have
+arrived, and parsing ignores the padding. Ordinary I/O still requires exact
+transfers and zero residue. Cache policy distinguishes reported WCE0/WCE1 from
+**assumed write-through**: only a successful, complete all-pages response with
+no caching page permits that narrower Linux-style default, and only alongside
+current05/20/00 for the unsupported flush. Unknown/truncated/malformed data and
+all other errors remain failures. Logs label the assumption explicitly; neither
+it nor scratch readback proves safety against sudden device power loss.
+
+`test_usb_bot_recovery` checks a successful retry, each failed recovery step,
+second stall/error, no timeout retry, both cycles at indices0/1/254/255, skipped
+Link ownership, original tag matching and padding/residue bounds. The frozen
+candidate is `build/hardware/update-bootstrap-v5-20261030/probe`: accepted kernel
+plus the same module ABI and new MSC driver only, excluding RAM-snapshot work.
+Private QEMU scratch write/flush/fresh-boot verification passes in
+`build/hardware/msc-csw-write-acceptance-20261030/result.json`. Actual stalled
+endpoint recovery and mode reporting still require the Dell test.
+The v5 live remote-update/guarded-reset workflow also passes in
+`build/hardware/msc-csw-update-workflow-20261030/result.json`. The v4 diagnostic
+run was quiesced, but checked shutdown again reported EIO due to quarantine
+(request25d2f13469004dec98580653f4bb2bbc). No activation was dispatched.

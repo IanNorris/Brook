@@ -24,6 +24,7 @@
 #include "xhci_msi.h"
 #include "xhci_completion_queue.h"
 #include "usb_scsi_cache.h"
+#include "usb_bot_recovery.h"
 #include "sync/kmutex.h"
 #include "vfs.h"
 #include "pci.h"
@@ -2439,8 +2440,10 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
 // Perform a bulk transfer (IN or OUT)
 static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
                               bool isIn, void* buf, uint64_t bufPhys,
-                              uint32_t len, uint32_t timeoutMs = 5000, uint32_t* shortInActual = nullptr)
+                              uint32_t len, uint32_t timeoutMs = 5000, uint32_t* shortInActual = nullptr,
+                              UsbBotReceive* status = nullptr)
 {
+    if(status)*status=UsbBotReceive::Failure;
     if(shortInActual)*shortInActual=0;
     if(shortInActual && (!isIn || len>192 || XhciDmaChunk(bufPhys,len)!=len))return false;
     Trb*&     ring    = isIn ? dev.bulkInRing    : dev.bulkOutRing;
@@ -2494,17 +2497,60 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
     }
 
     uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
+    const bool identity=evt->param==token&&((evt->control>>16)&31)==dci&&(evt->control>>24)==dev.slotId;
+    if(status&&identity&&cc==6&&(evt->status&0xffffff)<=len) {
+        *status=UsbBotReceive::Stall;return false;
+    }
     if (!UsbScsiShortInCompletion(isIn,XhciDmaChunk(bufPhys,len)==len,
-            shortInActual!=nullptr,len,cc,evt->status&0xffffff) || evt->param!=token) {
+            shortInActual!=nullptr,len,cc,evt->status&0xffffff) || !identity) {
         KPrintf("xhci: bulk %s failed cc=%u residue=%u slot=%u dci=%u bytes=%u mps=%u event=%lx last=%lx\n",
             isIn?"IN":"OUT",cc,evt->status&0xffffff,dev.slotId,dci,len,maxPacket,evt->param,token);
         KPrintf("xhci: bulk DMA low=%x tokens=%u first=%lx\n",unsigned(bufPhys&65535),tokenCount,tokens[0]);
         return false;
     }
 
+    if(status)*status=UsbBotReceive::Complete;
     if(shortInActual)*shortInActual=len-(evt->status&0xffffff);
     return true;
 }
+
+// Restore only the halted bulk-IN endpoint after an observed CSW STALL.
+// The MSC command lock guarantees no other TD is queued on these bulk rings.
+struct UsbMscCswReceive {
+    XhciController& controller;XhciDevice& device;void* buffer;uint64_t physical;
+    UsbBotDequeue position{};
+    UsbBotReceive receive() {
+        UsbBotReceive status;
+        XhciBulkTransfer(controller,device,true,buffer,physical,13,5000,nullptr,&status);
+        return status;
+    }
+    bool command(uint64_t param,uint32_t control) {
+        const auto token=XhciSubmitCommand(controller,param,0,control|(device.slotId<<24)|(device.bulkInDci<<16));
+        Trb event;auto* done=XhciWaitForEvent(controller,TRB_TYPE_CMD_COMPLETION,2000,&event,token);
+        return done&&(done->status>>24)==TRB_CC_SUCCESS&&(done->control>>24)==device.slotId;
+    }
+    bool clearHalt() {
+        UsbSetupPacket setup{};setup.bmRequestType=2;setup.bRequest=1; // standard endpoint CLEAR_FEATURE
+        setup.wIndex=device.bulkInAddr; // ENDPOINT_HALT feature selector is zero
+        return XhciControlTransfer(controller,device,setup,nullptr,0,0,0);
+    }
+    bool resetEndpoint(){return command(0,TRB_TYPE_RESET_EP);}
+    bool setDequeue() {
+        position=UsbBotNextDequeue(device.bulkInRingPhys,device.bulkInEnqueue,device.bulkInCycle,XFER_RING_SIZE);
+        if(!position.valid)return false;
+        if(position.skipLink) {
+            // Hardware skips this Link explicitly. Leave it unowned for the new
+            // lap, just as initial Links must be unowned before their first use.
+            __atomic_store_n(&device.bulkInRing[XFER_RING_SIZE-1].control,
+                XhciLinkControl(!position.cycle,false),__ATOMIC_RELEASE);
+        }
+        if(!command(position.pointer,16u<<TRB_TYPE_SHIFT))return false; // Set TR Dequeue Pointer
+        device.bulkInEnqueue=position.index;device.bulkInCycle=position.cycle;
+        KPrintf("xhci: MSC CSW stall recovered slot=%u dci=%u next=%u cycle=%u\n",
+            device.slotId,device.bulkInDci,position.index,position.cycle?1u:0u);
+        return true;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // USB Mass Storage Bulk-Only (BBB) protocol
@@ -2605,7 +2651,8 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
 
     memset(csw, 0, sizeof(UsbMscCsw));
 
-    if (!XhciBulkTransfer(ctrl, dev, true, csw, cswPhys, sizeof(UsbMscCsw))) {
+    UsbMscCswReceive receive{ctrl,dev,csw,cswPhys};
+    if (!UsbBotReceiveCsw(receive)) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         KPrintf("xhci: MSC CSW failed opcode=%x bytes=%u; transport quarantined\n",unsigned(cdb[0]),dataLen);
         return {};
@@ -2617,14 +2664,14 @@ static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
         return {};
     }
 
-    if(csw->bCSWStatus>1 || csw->dCSWTag!=cbw->dCBWTag ||
-       csw->dCSWDataResidue>dataLen || csw->dCSWDataResidue!=dataLen-actual) {
+    if(!UsbBotStatusValid(cbw->dCBWTag,csw->dCSWTag,csw->bCSWStatus,
+                          allowShort,dataLen,actual,csw->dCSWDataResidue)) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         KPrintf("xhci: MSC invalid CSW opcode=%x status=%u residue=%u actual=%u requested=%u; transport quarantined\n",
             unsigned(cdb[0]),csw->bCSWStatus,csw->dCSWDataResidue,actual,dataLen);
         return {};
     }
-    return {true,csw->bCSWStatus,actual,csw->dCSWDataResidue,{}};
+    return {true,csw->bCSWStatus,dataLen-csw->dCSWDataResidue,csw->dCSWDataResidue,{}};
 }
 
 static XhciMscResult XhciMscExecuteLocked(XhciController& ctrl,XhciDevice& dev,
@@ -2662,10 +2709,10 @@ static bool XhciMscCommand(XhciController& ctrl,XhciDevice& dev,
 }
 static UsbScsiCache XhciMscCacheLocked(XhciController& ctrl,XhciDevice& dev) {
     auto* data=static_cast<uint8_t*>(dev.mscCommandBuffer)+128;memset(data,0,192);
-    uint8_t request[6]{};request[0]=0x1a;request[1]=8;request[2]=8;request[4]=192;
+    uint8_t request[6]{};request[0]=0x1a;request[2]=0x3f;request[4]=192; // current all pages, DBD=0 for USB compatibility
     auto result=XhciMscExecuteLocked(ctrl,dev,request,6,data,dev.mscCommandBufferPhys+128,192,true,true);
-    auto cache=result.success()?UsbScsiModeCache6(data,result.actual):UsbScsiCache::Unknown;
-    KPrintf("xhci: MSC current cache mode=%u bytes=%u complete=%u (0=unknown 1=write-through 2=write-back)\n",
+    auto cache=result.success()?UsbScsiModeCache6(data,result.actual,true):UsbScsiCache::Unknown;
+    KPrintf("xhci: MSC current cache mode=%u bytes=%u complete=%u (0=unknown 1=reported-through 2=write-back 3=assumed-through)\n",
         unsigned(cache),result.actual,result.success()?1u:0u);
     return cache;
 }
@@ -2826,7 +2873,7 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
     auto* st = static_cast<UsbMscState*>(dev->priv);
     XhciDevice& udev = g_devices[st->devIndex];
     if(__atomic_load_n(&udev.mscQuarantined,__ATOMIC_ACQUIRE))return -5;
-    if(udev.mscUnsupportedSync&&udev.mscCache==UsbScsiCache::WriteThrough)return 0;
+    if(udev.mscUnsupportedSync&&(udev.mscCache==UsbScsiCache::WriteThrough||udev.mscCache==UsbScsiCache::AssumedWriteThrough))return 0;
     // IMMED=0, LBA=0 and length=0: wait for the entire device cache.
     uint8_t cdb[10] = {};cdb[0] = SCSI_SYNCHRONIZE_CACHE_10;
     auto result=XhciMscExecuteLocked(*st->ctrl,udev,cdb,sizeof(cdb),nullptr,0,0,false);
@@ -2835,7 +2882,10 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
         if(udev.mscCache==UsbScsiCache::Unknown)udev.mscCache=XhciMscCacheLocked(*st->ctrl,udev);
         if(!__atomic_load_n(&udev.mscQuarantined,__ATOMIC_ACQUIRE)&&UsbScsiWriteThroughFlush(udev.mscCache,result.sense)) {
             udev.mscUnsupportedSync=true;
-            KPuts("xhci: MSC flush uses explicitly reported write-through policy; unsupported opcode 35\n");return 0;
+            if(udev.mscCache==UsbScsiCache::WriteThrough)
+                KPuts("xhci: MSC flush uses reported write-through policy; unsupported opcode 35\n");
+            else KPuts("xhci: MSC flush assumes write-through: complete all-pages mode has no caching page; unsupported opcode 35\n");
+            return 0;
         }
     }
     return -5;

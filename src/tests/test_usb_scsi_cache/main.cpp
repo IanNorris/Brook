@@ -23,6 +23,13 @@ int main() {
     mode[4]=0x48;assert(UsbScsiModeCache6(mode,32)==UsbScsiCache::Unknown);mode[4]=8;
     mode[5]=30;assert(UsbScsiModeCache6(mode,32)==UsbScsiCache::Unknown);mode[5]=18;
     mode[4]=7;assert(UsbScsiModeCache6(mode,24)==UsbScsiCache::Unknown);
+    // A complete all-pages response may explicitly have no caching page. This
+    // is logged as an assumption, never mislabeled as device-reported WCE0.
+    uint8_t empty[4]={3,0,0,0};
+    assert(UsbScsiModeCache6(empty,4)==UsbScsiCache::Unknown);
+    assert(UsbScsiModeCache6(empty,4,true)==UsbScsiCache::AssumedWriteThrough);
+    assert(UsbScsiModeCache6(empty,3,true)==UsbScsiCache::Unknown);
+    assert(UsbScsiWriteThroughFlush(UsbScsiCache::AssumedWriteThrough,sense));
     // Honor a block descriptor rather than reading a fixed WCE offset.
     uint8_t blocks[32]{};blocks[0]=31;blocks[3]=8;blocks[12]=8;blocks[13]=18;
     assert(UsbScsiModeCache6(blocks,32)==UsbScsiCache::WriteThrough);
