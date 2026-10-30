@@ -53,6 +53,11 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_update_payload)
+add_host_test(test_update_slots "${BROOK_ROOT}/src/bootloader/src/update_slots.cpp")
+target_include_directories(test_update_slots PRIVATE
+    "${BROOK_ROOT}/vendor/uefi-headers/Include" "${BROOK_ROOT}/vendor/uefi-headers/Include/X64"
+    "${BROOK_ROOT}/src/shared/inc_km" "${BROOK_ROOT}/src/bootloader/src")
 add_host_test(test_usb_ecm_descriptors)
 add_host_test(test_xhci_completion_queue)
 add_host_test(test_partition_bounds)

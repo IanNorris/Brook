@@ -8,6 +8,7 @@
 #include "acpi.h"
 #include "elf_loader.h"
 #include "fs.h"
+#include "update_slots.h"
 #include "paging.h"
 #include "boot_protocol/boot_protocol.h"
 
@@ -49,7 +50,12 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
 
     // --- Load kernel ---
     UINTN kernelFileSize = 0;
-    uint8_t* kernelData = ReadFile(imageHandle, systemTable->BootServices,
+    uint8_t* kernelData = nullptr;
+    uint8_t* initrdData = nullptr;
+    UINTN initrdFileSize = 0;
+    bool updatePair = g_bootConfig.updateSlots && LoadUpdatePair(imageHandle,
+        systemTable->BootServices, kernelData, kernelFileSize, initrdData, initrdFileSize);
+    if (!updatePair) kernelData = ReadFile(imageHandle, systemTable->BootServices,
         g_bootConfig.target, &kernelFileSize);
     if (kernelData == nullptr)
     {
@@ -71,8 +77,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         reinterpret_cast<EFI_PHYSICAL_ADDRESS>(kernelData), kernelFileSize);
 
     // --- Load initrd (optional) ---
-    UINTN initrdFileSize = 0;
-    uint8_t* initrdData = ReadFile(imageHandle, systemTable->BootServices,
+    if (!updatePair) initrdData = ReadFile(imageHandle, systemTable->BootServices,
         u"INITRD.IMG", &initrdFileSize);
     if (initrdData != nullptr)
     {

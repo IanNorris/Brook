@@ -407,10 +407,8 @@ separate throughput/correctness test.
 ## Next: remote USB update and reboot
 
 The user requested remote updates so subsequent driver builds can be tested
-without moving the stick between machines. This is planned work, not a current
-bridge capability. Reliable physical reads followed by checked scratch-file
-writes/flush/fresh-readback are prerequisites; the present transport timeout
-blocks enabling writes to a boot payload.
+without moving the stick between machines. The first implementation is described below; physical acceptance is pending. Reliable physical reads now pass. Checked scratch-file writes/flush/fresh-readback
+on the Dell remain the gate before activating a remote boot-payload update.
 
 The first implementation should be an opt-in maintenance profile. Its updater,
 network/debug service and dependencies live in initrd/RAM, and it does not mount
@@ -563,3 +561,63 @@ comparison changed an already initialized adapter from vendor configuration 1
 to ECM configuration 2; cold-start behavior remains unmeasured. If no IP appears,
 capture configuration/notification/TX/RX evidence before trying vendor register
 changes. This is a test hypothesis, not a claim that cold startup fixes receive.
+
+### RAM maintenance updater implementation (2026-10-30)
+
+`prepare_hardware_update.py` combines the accepted read-only recovery payload
+with the tested RAM scratch profile. The kernel hashes must match. The root
+kernel, initrd, APPS.BRK and control data remain unchanged. Only the one-time
+bootstrap replaces EFI/config and adds preallocated A/B slots. `UPDATE_SLOTS=1`
+enables the new loader; otherwise legacy behavior remains. The maintenance
+provider/FAT are explicitly writable from initialization; it does not mount
+USB-backed applications. Normally-read-only remount/lease transitions are not
+implemented or claimed by this initial profile.
+
+`/boot/HWUPDATE.ELF BOOT_ID TRANSACTION_ID` requires the opt-in marker and a
+provisioned random key. It accepts one separate TCP connection on port 1235,
+checks key/boot/transaction, stages at most 8 MiB ELF plus 64 MiB initrd in RAM,
+and verifies SHA-256 before returning `staged`. An explicit ACTIVATE frame is
+required before any write. Only fixed existing slot/selection files are opened;
+there is no create, truncate, arbitrary destination or bootloader-writing API.
+A process lock rejects concurrent writers and remains after a failed write.
+The existing boot-pinned guest-job receipt resolves a lost activation reply;
+never resubmit an uncertain transaction under a new ID. The LAN protocol uses
+a shared secret, not TLS; it is an opt-in trusted-LAN maintenance interface.
+
+Canonical 128-byte records contain generation, slot, exact lengths, SHA-256
+hashes and CRC32. Both firmware and updater use the same bounded ELF validator,
+including when identifying which existing slot is active. A hash-valid invalid
+ELF must not cause the updater to overwrite the older working slot. Equal
+conflicting generations fail closed. Payloads are written/flushed first,
+reopened O_RDWR with a new FAT FIL (bypassing whole-file RO caches), and checked.
+Only then is the other selection record written/flushed/read back. EFI verifies
+the entire required pair again before loading either. Invalid/missing pairs
+fall back together, eventually to the root recovery payload. Candidate buffer
+allocation is fallible so resource failure can also fall back.
+
+This updates **kernel and initrd FAT disk image**. Updating the standalone
+compressed APPS.BRK image is still pending. It does not update the whole USB
+raw image, partition table or EFI executable. A valid kernel that hangs needs
+manual recovery; runtime trial/confirmation rollback is not implemented. Fixed
+slots and checked flushes do not make FAT/USB power-cut atomic.
+
+Evidence:
+
+- `test_update_payload`: SHA-256 published empty/abc/million-a vectors,
+  incremental hashing, CRC32, every single-byte record mutation and bounds.
+- `test_update_slots`: production selection code with missing/corrupt pairs,
+  malformed ELF, ambiguous records, capacity limits and allocation cleanup.
+- `build/hardware/update-host-tests-v2-20261030/result.json`: real receiver,
+  invalid authorization/boot, oversize/interrupted/corrupt/staged-only uploads,
+  activation, corrupt and hash-valid malformed newest ELF, conflicting records.
+- `build/hardware/update-vm-acceptance-v2-20261030/result.json`: the production
+  RAM helper receives a network upload in QEMU, activates generation 2, completes
+  checked shutdown, then fresh EFI/QEMU boots the distinct updated initrd ID.
+  All non-slot files remain unchanged and FAT checks clean.
+
+The prepared physical candidate is
+`build/hardware/update-bootstrap-v2-20261030/probe`. Before its first activation,
+run the existing nonce/header scratch refusal and write/fsync gate on the Dell,
+restart, verify the scratch bytes, then test remote upload and guarded restart.
+A different guest boot epoch and the new initrd payload ID are the acceptance
+proof; an activation acknowledgement or kernel build string alone is not.

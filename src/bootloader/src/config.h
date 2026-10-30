@@ -9,6 +9,7 @@ struct BootConfig {
     char16_t target[256];   // ELF path, default L"KERNEL\\BROOK.ELF"
     uint32_t displayWidth;  // preferred GOP bounds; both must be set
     uint32_t displayHeight;
+    bool updateSlots;      // opt-in paired A/B maintenance payloads
     bool debugText;
     bool logMemory;
     bool logInterrupts;

@@ -1,6 +1,6 @@
 #pragma once
 #include <Uefi.h>
-#include "boot_protocol/boot_protocol.h"
+#include "../../shared/boot_protocol/boot_protocol.h"
 
 namespace brook
 {

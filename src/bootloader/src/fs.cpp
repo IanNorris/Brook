@@ -15,7 +15,9 @@ uint8_t* ReadFile(
     EFI_HANDLE         imageHandle,
     EFI_BOOT_SERVICES* bootServices,
     const char16_t*    path,
-    UINTN*             outSize)
+    UINTN*             outSize,
+    UINTN              maximumSize,
+    UINTN              prefixSize)
 {
     EFI_GUID loadedImageGuid        = EFI_LOADED_IMAGE_PROTOCOL_GUID;
     EFI_GUID simpleFileSystemGuid   = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
@@ -61,8 +63,15 @@ uint8_t* ReadFile(
 
     EFI_FILE_INFO* info = (EFI_FILE_INFO*)infoBuffer;
     UINTN fileSize = (UINTN)info->FileSize;
+    if (!fileSize || info->FileSize > maximumSize || prefixSize > fileSize) {
+        file->Close(file);root->Close(root);return nullptr;
+    }
+    if (prefixSize) fileSize = prefixSize;
 
-    EFI_PHYSICAL_ADDRESS bufferAddr = AllocatePages(bootServices, EfiLoaderData, fileSize);
+    EFI_PHYSICAL_ADDRESS bufferAddr = 0;
+    status = bootServices->AllocatePages(AllocateAnyPages, EfiLoaderData,
+        (fileSize + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE, &bufferAddr);
+    if (EFI_ERROR(status)) { file->Close(file);root->Close(root);return nullptr; }
     uint8_t* buffer = (uint8_t*)bufferAddr;
 
     UINTN readSize = fileSize;

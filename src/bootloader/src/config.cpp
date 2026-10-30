@@ -67,6 +67,7 @@ void LoadConfig(EFI_HANDLE imageHandle, EFI_BOOT_SERVICES* bootServices)
     g_bootConfig.displayWidth   = 0;
     g_bootConfig.displayHeight  = 0;
     g_bootConfig.debugText      = false;
+    g_bootConfig.updateSlots    = false;
     g_bootConfig.logMemory      = false;
     g_bootConfig.logInterrupts  = false;
 
@@ -106,6 +107,8 @@ void LoadConfig(EFI_HANDLE imageHandle, EFI_BOOT_SERVICES* bootServices)
 
         if (KeyEquals(keyPtr, keyLen, "TARGET", 6)) {
             AsciiToUtf16(trimmedVal, trimmedLen, g_bootConfig.target, 256);
+        } else if (KeyEquals(keyPtr, keyLen, "UPDATE_SLOTS", 12)) {
+            g_bootConfig.updateSlots = ParseBool(trimmedVal, trimmedLen);
         } else if (KeyEquals(keyPtr, keyLen, "DEBUG_TEXT", 10)) {
             g_bootConfig.debugText = ParseBool(trimmedVal, trimmedLen);
         } else if (KeyEquals(keyPtr, keyLen, "LOG_MEMORY", 10)) {

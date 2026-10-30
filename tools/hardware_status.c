@@ -8,6 +8,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 int main(void) {
+    FILE* payload=fopen("/etc/hardware-payload-id","r");
+    if(payload){char id[96];if(fgets(id,sizeof(id),payload))printf("HARDWARE_PAYLOAD_ID %s",id);fclose(payload);}
+
     int fd=socket(AF_INET,SOCK_DGRAM,0);
     if(fd<0){perror("HARDWARE_NETWORK socket");return 1;}
     for(unsigned attempt=0;attempt<30;++attempt) {
