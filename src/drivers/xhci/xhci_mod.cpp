@@ -2111,13 +2111,11 @@ static void XhciKeyboardPoll(InputDevice* /*dev*/)
 // Byte 1: X displacement (signed int8)
 // Byte 2: Y displacement (signed int8)
 
-MODULE_IMPORT_SYMBOL(MouseGetPosition);
-MODULE_IMPORT_SYMBOL(MouseSetPosition);
+MODULE_IMPORT_SYMBOL(MouseMoveRelative);
 MODULE_IMPORT_SYMBOL(MouseSetButtons);
 MODULE_IMPORT_SYMBOL(MouseSetAvailable);
 
-extern "C" void MouseGetPosition(int32_t* x, int32_t* y);
-extern "C" void MouseSetPosition(int32_t x, int32_t y);
+extern "C" void MouseMoveRelative(int32_t dx, int32_t dy);
 extern "C" void MouseSetButtons(uint8_t buttons);
 extern "C" void MouseSetAvailable(bool available);
 
@@ -2132,11 +2130,8 @@ static void XhciProcessMouseReport(const uint8_t* report)
 
     // Update global mouse position via the kernel mouse API
     if (dx != 0 || dy != 0) {
-        int32_t mx = 0, my = 0;
-        MouseGetPosition(&mx, &my);
-        // USB boot protocol: positive Y = down (screen convention).
-        // No inversion needed — unlike PS/2 where positive Y = up.
-        MouseSetPosition(mx + dx, my + dy);
+        // Physical desktop gain is separate from the raw event payload.
+        MouseMoveRelative(dx, dy);
 
         InputEvent ev{};
         ev.type     = InputEventType::MouseRelativeMove;

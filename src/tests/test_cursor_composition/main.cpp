@@ -26,5 +26,18 @@ int main()
     CHECK(bounds.cursor.width==CursorCapacity && bounds.cursor.height==CursorCapacity);
     CHECK(bounds.before==0x12345678 && bounds.after==0x87654321);
     CHECK(bounds.cursor.hotX==source.hotX && bounds.cursor.hotY==source.hotY);
+    source={};source.width=12;source.height=16;source.hotX=3;source.hotY=5;
+    source.pixels[2*CursorCapacity+1]=0x80776655;
+    ScaleCursor(source,restored,200);
+    CHECK(restored.width==24 && restored.height==32 && restored.hotX==6 && restored.hotY==10);
+    CHECK(restored.pixels[4*CursorCapacity+2]==0x80776655);
+    CHECK(restored.pixels[5*CursorCapacity+3]==0x80776655);
+    ScaleCursor(source,restored,150);
+    CHECK(restored.width==18 && restored.height==24 && restored.hotX==4 && restored.hotY==7);
+    ScaleCursor(source,restored,100);CHECK(std::memcmp(&source,&restored,sizeof(source))==0);
+    source.width=source.height=CursorCapacity;
+    ScaleCursor(source,bounds.cursor,200);
+    CHECK(bounds.cursor.width==CursorCapacity && bounds.cursor.height==CursorCapacity);
+    CHECK(bounds.before==0x12345678 && bounds.after==0x87654321);
     std::puts("cursor composition: source preservation, animation, hotspot and bounds PASS");
 }

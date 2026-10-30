@@ -36,6 +36,7 @@ MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(SerialPuts);
 MODULE_IMPORT_SYMBOL(KPrintf);
 MODULE_IMPORT_SYMBOL(MouseSetPosition);
+MODULE_IMPORT_SYMBOL(MouseMoveRelative);
 MODULE_IMPORT_SYMBOL(MouseSetButtons);
 MODULE_IMPORT_SYMBOL(MouseSetAvailable);
 MODULE_IMPORT_SYMBOL(MouseSetBounds);
@@ -349,14 +350,7 @@ static void ProcessEvent(const VirtioInputEvent& ev)
     {
         if(ev.code==REL_X || ev.code==REL_Y) {
             const int32_t value=static_cast<int32_t>(ev.value);
-            int32_t x=0,y=0;MouseGetPosition(&x,&y);
-            // Clamp wide additions before handing them to cursor positioning;
-            // the queued raw delta preserves the complete signed input value.
-            int64_t nx=x,ny=y;
-            if(ev.code==REL_X)nx+=value;else ny+=value;
-            if(nx<0)nx=0;if(ny<0)ny=0;
-            if(nx>0x7fffffff)nx=0x7fffffff;if(ny>0x7fffffff)ny=0x7fffffff;
-            MouseSetPosition(static_cast<int32_t>(nx),static_cast<int32_t>(ny));
+            MouseMoveRelative(ev.code==REL_X?value:0,ev.code==REL_Y?value:0);
             InputEvent ie{};ie.type=InputEventType::MouseRelativeMove;
             ie.deltaX=ev.code==REL_X?value:0;ie.deltaY=ev.code==REL_Y?value:0;
             ie.scanCode=MouseGetButtons();InputDevicePush(&g_inputDev,ie);

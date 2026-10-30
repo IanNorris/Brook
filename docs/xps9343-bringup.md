@@ -1135,3 +1135,43 @@ cooperative close completed, application/service cleanup and sync reached
 `ready`, and QEMU exited successfully. Both `result.json` and `shutdown.json`
 in `native-window-qemu-20261030` confirm this corrected end-to-end gate. The
 physical Dell has not yet booted this candidate kernel.
+
+### Desktop pointer DPI follow-up (2026-10-30)
+
+The built-in12x16 arrow was always drawn in physical pixels, and relative
+mouse counts always advanced the desktop by one physical pixel. At200% DPI
+this made both the pointer image and the distance travelled too small.
+
+Compositor-owned arrows and their busy badge now follow applied desktop DPI;
+client cursor images remain physical pixels to avoid scaling GTK/Wayland's
+already-sized cursor twice. The same prepared frame/hotspot is used by CPU
+save/restore and GPU drawing. Scaling is bounded by the existing64x64 capacity.
+
+PS/2, USB boot mice and virtio relative mice now call `MouseMoveRelative` for
+scaled desktop positioning. Fractional carry preserves small150% movements.
+Explicit absolute positions (including tablets and capture-release warps) stay
+physical and reset that carry. Position/bounds updates use one short IRQ-safe
+lock so concurrent device updates do not lose motion. Input events still carry
+the original signed deltas; pointer-captured games do not receive DPI gain.
+
+`test_mouse_motion` exercises production mouse position functions, including
+fractional carry, DPI changes, absolute warps, bounds, wide signed deltas and
+concurrent updates. `test_cursor_composition` covers scaled dimensions,
+hotspots, alpha pixels and capacity guards; existing pointer-capture tests
+continue to pass. The RAM desktop preparation script stages the matching
+virtio-input module as well as xHCI and EEVDF.
+
+The frozen candidate pair is `build/hardware/dpi-pointer-update-v1-20261030`.
+It includes the previously tested native-window cooperative shutdown fix.
+Private QEMU input/visual acceptance and physical acceptance are separate gates;
+the Dell's current game run has not been replaced by this candidate.
+
+Private acceptance passed in
+`build/hardware/dpi-pointer-qemu-20261030/pointer-qa/result.json`: ten raw
+counts moved the desktop twenty pixels at200%, captured motion retained ten
+counts, Ctrl+Alt+Esc restored uncaptured movement, and native cooperative close
+exited0. The enclosing harness also completed checked shutdown. Terra inspected
+the saved cursor crop: a coherent white arrow with black outline, approximately
+22 visible pixels wide by32 tall (24x32 allocated), without obvious corruption.
+Evidence image: `pointer-qa/desktop-cursor-crop.png`. These results do not replace
+physical pointer-speed and external-device acceptance on the Dell.

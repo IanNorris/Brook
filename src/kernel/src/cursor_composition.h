@@ -9,6 +9,23 @@ struct CursorImage {
     uint32_t pixels[CursorCapacity * CursorCapacity]{};
 };
 
+// Scale only compositor-owned logical cursors. Client images are already in
+// physical pixels and must not pass through this a second time.
+inline void ScaleCursor(const CursorImage& source,CursorImage& frame,uint32_t percent)
+{
+    if (!percent) percent=100;
+    frame={};
+    frame.width=(source.width*percent+99)/100;
+    frame.height=(source.height*percent+99)/100;
+    if(frame.width>CursorCapacity)frame.width=CursorCapacity;
+    if(frame.height>CursorCapacity)frame.height=CursorCapacity;
+    frame.hotX=static_cast<int32_t>(static_cast<int64_t>(source.hotX)*percent/100);
+    frame.hotY=static_cast<int32_t>(static_cast<int64_t>(source.hotY)*percent/100);
+    for(uint32_t y=0;y<frame.height;++y)
+        for(uint32_t x=0;x<frame.width;++x)
+            frame.pixels[y*CursorCapacity+x]=source.pixels[(y*100/percent)*CursorCapacity+x*100/percent];
+}
+
 // Compose into a separate frame: client cursor pixels/hotspot survive busy
 // animation and are restored verbatim when the last pending launch resolves.
 inline void ComposeCursor(const CursorImage& source, CursorImage& frame,

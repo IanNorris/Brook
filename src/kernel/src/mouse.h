@@ -37,6 +37,9 @@ extern "C" void MouseSetBounds(uint32_t maxX, uint32_t maxY);
 // Get current button state bitmask.
 extern "C" uint8_t MouseGetButtons();
 
+// Apply DPI gain to desktop position only; callers publish raw input separately.
+extern "C" void MouseMoveRelative(int32_t dx, int32_t dy);
+
 // Set cursor position directly (used by absolute-positioning devices like virtio-tablet).
 extern "C" void MouseSetPosition(int32_t x, int32_t y);
 

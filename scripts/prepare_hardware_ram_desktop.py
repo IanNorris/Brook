@@ -25,13 +25,13 @@ for name in ['APPS.BRK','INITRD.IMG']:
     if not path.is_file() or path.is_symlink() or path.stat().st_size!=row['bytes'] or sha(path)!=row['sha256']:p.error('Invalid recovery input: '+name)
 key=Path(mm['update_key_file']).read_text()
 if not re.fullmatch('[0-9a-f]{32}',key):p.error('Invalid provisioned maintenance key')
-for path in [build/'kernel/BROOK.elf',build/'kernel/drivers/xhci.mod',build/'kernel/drivers/sched_eevdf.mod']:
+for path in [build/'kernel/BROOK.elf',build/'kernel/drivers/xhci.mod',build/'kernel/drivers/sched_eevdf.mod',build/'kernel/drivers/virtio_input.mod']:
     if not path.is_file():p.error('Build dependency missing: '+str(path))
 out.mkdir(parents=True,exist_ok=False)
 run('cp','--reflink=auto',build/'kernel/BROOK.elf',out/'kernel.elf')
 initrd=out/'INITRD.IMG';run('cp','--reflink=auto',recovery/'payload/INITRD.IMG',initrd)
 for name in ['usb-read-only','boot-app-image']:run('mdel','-i',initrd,'::ETC/'+name)
-for name in ['xhci','sched_eevdf']:run('mcopy','-o','-i',initrd,build/'kernel/drivers'/f'{name}.mod','::DRIVERS/'+name.upper()+'.MOD')
+for name in ['xhci','sched_eevdf','virtio_input']:run('mcopy','-o','-i',initrd,build/'kernel/drivers'/f'{name}.mod','::DRIVERS/'+name.upper()+'.MOD')
 for name,source in [('HWSTATUS.ELF','tools/hardware_status.c'),('HWUPDATE.ELF','tools/hardware_update.c'),('HWIO.ELF','tools/hardware_storage_probe.c'),('HWBULK.ELF','tools/hardware_bulk.c')]:
     run(os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',ROOT/source,'-o',out/name)
     run('mcopy','-o','-i',initrd,out/name,'::BOOT/'+name)

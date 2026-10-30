@@ -143,6 +143,7 @@ EXPORT_SYMBOL(MouseGetPosition);
 EXPORT_SYMBOL(MouseSetBounds);
 EXPORT_SYMBOL(MouseGetButtons);
 EXPORT_SYMBOL(MouseSetPosition);
+EXPORT_SYMBOL(MouseMoveRelative);
 EXPORT_SYMBOL(MouseSetButtons);
 EXPORT_SYMBOL(MouseSetAvailable);
 

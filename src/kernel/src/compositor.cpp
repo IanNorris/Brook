@@ -1461,6 +1461,8 @@ static SpinLock g_cursorSourceLock;
 static CursorImage g_cursorSource;
 static CursorImage g_cursorFrame;
 static bool g_cursorSourceReady = false;
+static bool g_cursorBuiltin = true;
+static CursorImage g_cursorLogicalFrame;
 
 // Saved pixels under the cursor (for restore before re-blit)
 static uint32_t g_cursorSave[CURSOR_MAX * CURSOR_MAX];
@@ -1480,13 +1482,17 @@ static void CursorLoadBuiltinPixels()
             g_cursorSource.pixels[row * CURSOR_MAX + col] = px == 1 ? 0xffffffffu : px == 2 ? 0xff000000u : 0;
         }
     g_cursorSourceReady = true;
+    g_cursorBuiltin = true;
 }
 
 static void CursorPrepareFrame(bool busy, uint64_t now)
 {
     SpinLockAcquire(&g_cursorSourceLock);
     if (!g_cursorSourceReady) CursorLoadBuiltinPixels();
-    ComposeCursor(g_cursorSource, g_cursorFrame, busy, now, WmCurrentPalette().borderActive);
+    if(g_cursorBuiltin && WmGetAppliedScale()!=100) {
+        ComposeCursor(g_cursorSource,g_cursorLogicalFrame,busy,now,WmCurrentPalette().borderActive);
+        ScaleCursor(g_cursorLogicalFrame,g_cursorFrame,WmGetAppliedScale());
+    } else ComposeCursor(g_cursorSource,g_cursorFrame,busy,now,WmCurrentPalette().borderActive);
     SpinLockRelease(&g_cursorSourceLock);
 }
 static int32_t  g_cursorSaveW = 0;
@@ -1596,6 +1602,7 @@ bool CompositorSetCursorImage(const uint32_t* pixels, uint32_t w, uint32_t h,
         g_cursorSource.hotX = hotX;
         g_cursorSource.hotY = hotY;
         g_cursorSourceReady = true;
+        g_cursorBuiltin = false;
     }
     SpinLockRelease(&g_cursorSourceLock);
     if (self) SchedulerKernelRegionLeave(self);

@@ -5,6 +5,8 @@
 // Updates cursor position and pushes events to the input subsystem.
 
 #include "mouse.h"
+#include "spinlock.h"
+#include "desktop_pointer_motion.h"
 #include "vmware_platform.h"
 #include "input.h"
 #include "compositor.h"
@@ -16,6 +18,7 @@
 #include "irq_wrapper.h"
 
 namespace brook {
+uint32_t WmGetAppliedScale();
 
 // ---------------------------------------------------------------------------
 // Port I/O
@@ -57,6 +60,9 @@ static void CtrlCmd(uint8_t cmd)
 // Mouse state
 // ---------------------------------------------------------------------------
 
+static IrqSpinLock g_pointerPositionLock;
+static int32_t g_fractionX=0,g_fractionY=0;
+static uint32_t g_motionScale=100;
 static volatile int32_t  g_mouseX   = 0;
 static volatile int32_t  g_mouseY   = 0;
 static volatile uint32_t g_maxX     = 1920;
@@ -172,18 +178,8 @@ extern "C" void MouseIrqHandlerInner(void)
         }
     }
 
-    // Update cursor position (Y is inverted in PS/2 protocol)
-    int32_t newX = g_mouseX + dx;
-    int32_t newY = g_mouseY - dy;
-
-    // Clamp to screen bounds
-    if (newX < 0) newX = 0;
-    if (newY < 0) newY = 0;
-    if (newX >= static_cast<int32_t>(g_maxX)) newX = static_cast<int32_t>(g_maxX) - 1;
-    if (newY >= static_cast<int32_t>(g_maxY)) newY = static_cast<int32_t>(g_maxY) - 1;
-
-    g_mouseX = newX;
-    g_mouseY = newY;
+    // Only the desktop position is scaled; the event below retains raw deltas.
+    MouseMoveRelative(dx, -dy);
 
     // Update button state (core 3 in stat, extras from wheel byte)
     g_prevButtons = g_buttons;
@@ -416,17 +412,30 @@ bool MouseIsAvailable()
 
 void MouseGetPosition(int32_t* x, int32_t* y)
 {
+    const auto flags=IrqSpinLockAcquire(&g_pointerPositionLock);
     if (x) *x = g_mouseX;
     if (y) *y = g_mouseY;
+    IrqSpinLockRelease(&g_pointerPositionLock,flags);
 }
 
 void MouseSetBounds(uint32_t maxX, uint32_t maxY)
 {
-    g_maxX = maxX;
-    g_maxY = maxY;
-    // Clamp current position
-    if (g_mouseX >= static_cast<int32_t>(maxX)) g_mouseX = static_cast<int32_t>(maxX) - 1;
-    if (g_mouseY >= static_cast<int32_t>(maxY)) g_mouseY = static_cast<int32_t>(maxY) - 1;
+    const auto flags=IrqSpinLockAcquire(&g_pointerPositionLock);
+    g_maxX=maxX?maxX:1;g_maxY=maxY?maxY:1;
+    if(g_mouseX>=static_cast<int32_t>(g_maxX))g_mouseX=static_cast<int32_t>(g_maxX)-1;
+    if(g_mouseY>=static_cast<int32_t>(g_maxY))g_mouseY=static_cast<int32_t>(g_maxY)-1;
+    g_fractionX=g_fractionY=0;
+    IrqSpinLockRelease(&g_pointerPositionLock,flags);
+}
+
+void MouseMoveRelative(int32_t dx,int32_t dy)
+{
+    const uint32_t percent=WmGetAppliedScale();
+    const auto flags=IrqSpinLockAcquire(&g_pointerPositionLock);
+    if(g_motionScale!=percent){g_fractionX=g_fractionY=0;g_motionScale=percent;}
+    g_mouseX=AdvanceDesktopPointer(g_mouseX,dx,g_maxX,percent,g_fractionX);
+    g_mouseY=AdvanceDesktopPointer(g_mouseY,dy,g_maxY,percent,g_fractionY);
+    IrqSpinLockRelease(&g_pointerPositionLock,flags);
 }
 
 uint8_t MouseGetButtons()
@@ -436,12 +445,14 @@ uint8_t MouseGetButtons()
 
 void MouseSetPosition(int32_t x, int32_t y)
 {
+    const auto flags=IrqSpinLockAcquire(&g_pointerPositionLock);
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x >= static_cast<int32_t>(g_maxX)) x = static_cast<int32_t>(g_maxX) - 1;
     if (y >= static_cast<int32_t>(g_maxY)) y = static_cast<int32_t>(g_maxY) - 1;
-    g_mouseX = x;
-    g_mouseY = y;
+    g_mouseX = x;g_mouseY = y;
+    g_fractionX=g_fractionY=0;
+    IrqSpinLockRelease(&g_pointerPositionLock,flags);
 }
 
 void MouseSetButtons(uint8_t buttons)
