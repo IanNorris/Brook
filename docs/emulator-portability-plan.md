@@ -3,6 +3,44 @@
 Status: proposed, 27 October 2026. Reviewed with Astra. Hyper-V is out of scope.
 Implementation is deferred while the existing qemu-wasm experiment is revisited.
 
+## First physical-hardware gate: XPS 13 9343 (30 October)
+
+Start with firmware loading and kernel entry, independently of native USB
+drivers. Build the loader/kernel, then run inside `nix-shell`:
+
+```
+python3 scripts/make_uefi_probe.py --output build/hardware/xps9343-probe
+```
+
+Copy the generated `payload/` contents onto the FAT32 USB partition. The builder
+does not open physical devices or format the stick. It creates a separate GPT
+test image and verifies its FAT file contents against SHA256 hashes. The payload
+uses the removable-media `EFI/BOOT/BOOTX64.EFI` path, `KERNEL/BROOK.ELF`, root
+`INITRD.IMG` and `BROOK.CFG`. No runtime driver modules or user disks are packed;
+the expected success screen is a RAM-only software desktop and kernel console.
+Input, persistent USB storage and applications are later gates. Boot unsigned
+development images with Secure Boot disabled and select the UEFI USB entry.
+
+`DEBUG_TEXT=1` now enables the loader's existing console diagnostics and explicit
+kernel-load/handoff milestones. The loader rejects successful-but-short file
+reads rather than handing incomplete contents to the ELF/initrd consumers.
+
+For phone diagnostics, start `tools/panic_receiver.py --port 9001 --elf
+<frozen-payload-kernel>`; keep that exact ELF unchanged while testing. The receiver
+saves reports and local inbox notifications under `crash_reports/` rather than
+the removed Enclave workspace. The panic URL QR currently targets
+`https://khione:9001/`; use the host's LAN address manually if name resolution
+is unavailable. The receiver uses its local certificate. The QR payload carries
+registers, stack and process/system state, not a complete serial boot transcript.
+
+The first disposable probe boots through OVMF's USB storage path without VirtIO
+devices or KVM CPUID exposed and reaches the software desktop. A deliberate
+panic's actual emitted Base45 bytes pass HTTPS ingestion, LZ4 decoding and
+symbolication against the frozen ELF; Terra confirms coherent desktop/panic
+frames. Optical phone scanning and the Dell firmware boot remain physical gates.
+Private hashes, USB copy receipt and VM evidence are under
+`build/hardware/xps9343-uefi-20261030/`. No physical-device boot is claimed yet.
+
 ## Deliverables and order
 
 1. A usable persistent software-rendered desktop under VMware and VirtualBox.

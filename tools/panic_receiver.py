@@ -28,13 +28,20 @@ SCANNER_HTML = SCRIPT_DIR / "panic_scanner.html"
 CRASH_DECODER = SCRIPT_DIR / "crash_decoder.py"
 WORKSPACE = Path(os.environ.get("BROOK_WORKSPACE", SCRIPT_DIR.parent))
 REPORTS_DIR = WORKSPACE / "crash_reports"
+DECODER_ELF = None
+
+def decoder_command(*args):
+    command = [sys.executable, str(CRASH_DECODER), *args]
+    if DECODER_ELF is not None:
+        command += ["--elf", str(DECODER_ELF)]
+    return command
 
 
 # ── Agent IPC notification ──────────────────────────────────────────────────
-INBOX_DIR = Path("/workspace/.enclave/inbox")
+INBOX_DIR = Path(os.environ.get("BROOK_PANIC_INBOX", str(REPORTS_DIR / "inbox")))
 
 def notify_agent(message: str) -> None:
-    """Notify the Enclave agent via file-based inbox."""
+    """Retain a local notification beside the crash reports."""
     try:
         INBOX_DIR.mkdir(parents=True, exist_ok=True)
         filename = f"{int(time.time() * 1000)}.json"
@@ -209,8 +216,7 @@ class PanicReceiverHandler(http.server.BaseHTTPRequestHandler):
             # Generate text report
             try:
                 result = subprocess.run(
-                    [sys.executable, str(CRASH_DECODER),
-                     "--hex", hex_data, "--no-color", "--save", str(report_path)],
+                    decoder_command("--hex", hex_data, "--no-color", "--save", str(report_path)),
                     capture_output=True, text=True, timeout=30,
                     cwd=str(WORKSPACE)
                 )
@@ -231,8 +237,7 @@ class PanicReceiverHandler(http.server.BaseHTTPRequestHandler):
             # Generate JSON report
             try:
                 result = subprocess.run(
-                    [sys.executable, str(CRASH_DECODER),
-                     "--hex", hex_data, "--json"],
+                    decoder_command("--hex", hex_data, "--json"),
                     capture_output=True, text=True, timeout=30,
                     cwd=str(WORKSPACE)
                 )
@@ -246,7 +251,7 @@ class PanicReceiverHandler(http.server.BaseHTTPRequestHandler):
             print()
             try:
                 result = subprocess.run(
-                    [sys.executable, str(CRASH_DECODER), "--hex", hex_data],
+                    decoder_command("--hex", hex_data),
                     timeout=30, cwd=str(WORKSPACE)
                 )
             except Exception:
@@ -378,7 +383,13 @@ def main():
     ap.add_argument("--port", type=int, default=8080, help="Listen port (default: 8080)")
     ap.add_argument("--bind", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     ap.add_argument("--no-tls", action="store_true", help="Disable HTTPS (camera won't work)")
+    ap.add_argument("--elf", type=Path, help="Exact frozen kernel ELF for this hardware test")
     args = ap.parse_args()
+    global DECODER_ELF
+    if args.elf is not None:
+        DECODER_ELF = args.elf.resolve()
+        if not DECODER_ELF.is_file():
+            ap.error("Kernel ELF not found: " + str(DECODER_ELF))
 
     # Ensure reports directory exists
     REPORTS_DIR.mkdir(exist_ok=True)

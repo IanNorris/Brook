@@ -20,6 +20,8 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
 
     // --- Config ---
     LoadConfig(imageHandle, systemTable->BootServices);
+    ConsoleSetQuiet(!g_bootConfig.debugText);
+    ConsolePrintLine(u"Brook UEFI: configuration loaded");
 
     // --- Graphics ---
     brook::Framebuffer framebuffer{};
@@ -34,6 +36,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
             framebuffer.format==brook::PixelFormat::Rgb8);
     };
     splash(1,true);
+    ConsolePrintLine(u"Brook UEFI: framebuffer ready");
 
     // --- ACPI ---
     brook::AcpiInfo acpi{};
@@ -42,6 +45,7 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
         Halt(EFI_NOT_FOUND, u"ACPI 2.0 not found");
     }
     splash(2);
+    ConsolePrintLine(u"Brook UEFI: ACPI located; reading kernel");
 
     // --- Load kernel ---
     UINTN kernelFileSize = 0;
@@ -58,6 +62,9 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     KernelEntryFn kernelVirtualEntry = LoadKernelElf(
         systemTable->BootServices, kernelData, kernelFileSize, kernelPhysBase, kernelPhysPages);
     splash(4);
+    ConsolePrint(u"Brook UEFI: kernel loaded; entry ");
+    ConsolePrintHex(reinterpret_cast<UINT64>(kernelVirtualEntry));
+    ConsolePrintLine(u"");
 
     // Free the temporary ELF file buffer (segments already copied out)
     FreePages(systemTable->BootServices,
@@ -87,6 +94,8 @@ extern "C" EFI_STATUS EFIAPI EfiMain(EFI_HANDLE imageHandle, EFI_SYSTEM_TABLE* s
     UINT32 memoryMapCount              = 0;
     UINTN mapKey = BuildMemoryMap(systemTable->BootServices, &memoryMap, &memoryMapCount);
     ConsolePrintLine(u"Memory map built");
+
+    ConsolePrintLine(u"Brook UEFI: leaving firmware and entering kernel");
 
     // --- Exit boot services ---
     EFI_STATUS status = systemTable->BootServices->ExitBootServices(imageHandle, mapKey);

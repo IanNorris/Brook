@@ -70,7 +70,7 @@ uint8_t* ReadFile(
     file->Close(file);
     root->Close(root);
 
-    if (EFI_ERROR(status))
+    if (EFI_ERROR(status) || readSize != fileSize)
     {
         FreePages(bootServices, bufferAddr, fileSize);
         return nullptr;
