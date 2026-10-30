@@ -11,6 +11,7 @@
 // Single-NIC, single-threaded receive path.
 
 #include "net.h"
+#include "module.h"
 #include "tcp.h"
 #include "epoll_diagnostics.h"
 #include "audio.h"
@@ -795,6 +796,11 @@ void NetInit()
 
 void NetRegisterIf(NetIf* nif)
 {
+    if(!nif || !nif->transmit)return;
+    const uintptr_t callbacks[]={reinterpret_cast<uintptr_t>(nif->transmit),reinterpret_cast<uintptr_t>(nif->poll)};
+    if(!ModuleRetainAddresses(callbacks,nif->poll?2:1)){
+        SerialPuts("net: interface callback provider unavailable\n");return;
+    }
     const uint64_t viewFlags=IrqSpinLockAcquire(&g_interfaceViewLock);
     if (g_netIfCount >= NET_MAX_IFS) {
         IrqSpinLockRelease(&g_interfaceViewLock,viewFlags);
@@ -1255,8 +1261,10 @@ bool DhcpDiscover(NetIf* nif)
         SerialPrintf("net: DHCP discover (attempt %d)\n", attempt + 1);
         DhcpSend(DHCP_DISCOVER, 0, 0);
 
-        // Wait up to 2 seconds, polling for packets
-        for (int i = 0; i < 2000000; i++) {
+        // A loop count is not elapsed time. USB adapters may still be bringing
+        // up the PHY; fast CPUs previously exhausted all retries in <1 second.
+        const auto started=ApicTickCount();
+        while (ApicTickCount()-started<2000) {
             // Poll the NIC for received packets (IRQ may not work during early boot)
             if (nif->poll) nif->poll(nif);
             __asm__ volatile("pause");

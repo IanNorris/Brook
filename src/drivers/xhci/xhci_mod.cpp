@@ -16,6 +16,8 @@
 
 #include "module_abi.h"
 #include "usb_block_bytes.h"
+#include "usb_ecm_descriptors.h"
+#include "net.h"
 #include "xhci_ownership.h"
 #include "xhci_msi.h"
 #include "xhci_completion_queue.h"
@@ -73,6 +75,9 @@ MODULE_IMPORT_SYMBOL(VfsClose);
 MODULE_IMPORT_SYMBOL(DeviceRegister);
 MODULE_IMPORT_SYMBOL(ApicSendEoi);
 MODULE_IMPORT_SYMBOL(ApicTickCount);
+MODULE_IMPORT_SYMBOL(NetRegisterIf);
+MODULE_IMPORT_SYMBOL(NetReceive);
+MODULE_IMPORT_SYMBOL(NetWakePollThread);
 
 using namespace brook;
 
@@ -866,7 +871,10 @@ static uint32_t XhciSlotSpeed(uint32_t speed)
 // Per-device state
 // ---------------------------------------------------------------------------
 
+struct UsbEcmState;
 struct XhciDevice {
+    UsbEcmConfiguration ecm;
+    UsbEcmState* network;
     uint32_t slotId;
     uint32_t portNum;       // 1-based
     uint32_t portSpeed;     // PORTSC speed field value
@@ -951,6 +959,24 @@ struct XhciDevice {
 
     void*    priv;          // driver-private (DMA report buffer for HID)
 };
+
+static constexpr unsigned ECM_RX_PACKETS=32;
+struct UsbEcmState {
+    NetIf interface;
+    XhciController* controller;XhciDevice* device;
+    uint8_t* rx;uint64_t rxPhysical,rxToken;
+    uint8_t* notification;uint64_t notificationPhysical,notificationToken;
+    bool linkKnown,linkUp;uint64_t notifications,reportTick;uint32_t notifyHeader[2];
+    uint8_t notificationSamples[16][16],notificationLengths[16];uint32_t notificationPrinted;
+    uint8_t* tx;uint64_t txPhysical;
+    struct Tx {uint64_t first,final;uint32_t bytes;bool active,dataDone;} sends[8];
+    uint8_t packets[ECM_RX_PACKETS][1514];uint16_t lengths[ECM_RX_PACKETS];uint32_t head,tail;bool rxArmed;
+    uint64_t dropped,received,transmitted;bool failed;
+    uint32_t faultStatus,faultDci;uint64_t faultToken;
+};
+static bool g_networkProbe=false;
+static bool XhciEcmCompletion(XhciDevice&,const Trb&);
+static bool XhciInitEcm(XhciController&,XhciDevice&);
 
 static XhciDevice g_devices[MAX_DEVICES];
 static uint32_t   g_deviceCount = 0;
@@ -1286,6 +1312,31 @@ static bool XhciConfigureDevice(XhciController& ctrl, XhciDevice& dev)
     uint64_t bufPhys;
     auto* buf = static_cast<uint8_t*>(AllocDmaBuffer(1, bufPhys));
     if (!buf) return false;
+
+    // ECM may be an alternate configuration (Realtek config 2; QEMU's
+    // config value 1 is also its second descriptor). Never select by index.
+    for(unsigned index=0;index<dev.numConfigurations && index<8;++index){
+        UsbSetupPacket probe{};probe.bmRequestType=0x80;probe.bRequest=USB_REQ_GET_DESCRIPTOR;
+        probe.wValue=(USB_DESC_CONFIG<<8)|index;probe.wLength=9;
+        if(!XhciControlTransfer(ctrl,dev,probe,buf,9,bufPhys,3))return false;
+        const unsigned bytes=unsigned(buf[2])|(unsigned(buf[3])<<8);
+        if(bytes<9 || bytes>4096)return false;
+        probe.wLength=bytes;
+        if(!XhciControlTransfer(ctrl,dev,probe,buf,bytes,bufPhys,3))return false;
+        UsbEcmConfiguration ecm{};
+        if(!UsbEcmParse(buf,bytes,dev.portSpeed==PORT_SPEED_SUPER,ecm))continue;
+        UsbSetupPacket select{};select.bRequest=USB_REQ_SET_CONFIG;select.wValue=ecm.value;
+        if(!XhciControlTransfer(ctrl,dev,select,nullptr,0,0,0))return false;
+        select={};select.bmRequestType=1;select.bRequest=11;select.wValue=ecm.alternate;select.wIndex=ecm.data;
+        if(!XhciControlTransfer(ctrl,dev,select,nullptr,0,0,0))return false;
+        dev.ecm=ecm;dev.bulkInAddr=ecm.in;dev.bulkOutAddr=ecm.out;
+        dev.bulkInMaxPacket=ecm.inPacket;dev.bulkOutMaxPacket=ecm.outPacket;
+        dev.interruptEpAddr=ecm.notify;dev.interruptMaxPacket=ecm.notifyPacket;dev.interruptInterval=ecm.notifyInterval;
+        dev.configured=true;
+        SerialPrintf("xhci: CDC-ECM config=%u control=%u data=%u alt=%u burst=%u/%u\n",
+            ecm.value,ecm.control,ecm.data,ecm.alternate,ecm.inBurst,ecm.outBurst);
+        return true;
+    }
 
     UsbSetupPacket setup = {};
     setup.bmRequestType = 0x80;
@@ -1645,6 +1696,7 @@ static void XhciEnumerateHubDevice(XhciController& ctrl, XhciDevice& hub,
             g_mousePresent = true;
     }
 
+    if(dev.ecm.value)XhciInitEcm(ctrl,dev);
     if (dev.isMassStorage && dev.bulkInAddr && dev.bulkOutAddr) {
         SerialPrintf("xhci: USB mass storage via hub (slot %u)\n", dev.slotId);
         XhciInitMassStorage(ctrl, dev, g_deviceCount - 1);
@@ -1710,11 +1762,16 @@ static bool XhciConfigureInterruptEndpoint(XhciController& ctrl, XhciDevice& dev
     slotCtx[2] = outSlot[2];
     slotCtx[3] = outSlot[3];
     // Update Context Entries to max DCI
-    slotCtx[0] = (slotCtx[0] & ~(0x1F << 27)) | (dev.intDci << 27);
+    if(dev.intDci>((slotCtx[0]>>27)&31))slotCtx[0] = (slotCtx[0] & ~(0x1F << 27)) | (dev.intDci << 27);
 
     // Endpoint Context for the interrupt IN endpoint
     auto* epCtx = reinterpret_cast<uint32_t*>(input + ctxSize * (dev.intDci + 1));
 
+    unsigned interval=dev.interruptInterval;
+    if(!interval)return false;
+    if(dev.portSpeed==PORT_SPEED_HIGH || dev.portSpeed==PORT_SPEED_SUPER){if(interval>16)return false;--interval;}
+    else{unsigned exponent=0;while(interval>1){interval>>=1;++exponent;}interval=exponent+3;}
+    epCtx[0]=interval<<16;
     // EP DW1: CErr=3, EP Type=7 (Interrupt IN), Max Packet Size
     epCtx[1] = (3 << 1) |      // CErr = 3
                (7 << 3) |      // EP Type = Interrupt IN
@@ -1726,7 +1783,7 @@ static bool XhciConfigureInterruptEndpoint(XhciController& ctrl, XhciDevice& dev
     epCtx[3] = static_cast<uint32_t>(trDqp >> 32);
 
     // EP DW4: Average TRB Length (8 for keyboard), Max ESIT Payload (8)
-    epCtx[4] = 8 | (8 << 16);
+    epCtx[4] = dev.interruptMaxPacket | (uint32_t(dev.interruptMaxPacket) << 16);
 
     __asm__ volatile("mfence" ::: "memory");
 
@@ -1983,7 +2040,7 @@ static void XhciPollDrainEvents()
     if(!g_controllerCount)return;
     auto& ctrl=g_controllers[0];if(!ctrl.initialized)return;
     const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
-    unsigned processed=0;
+    unsigned processed=0;bool wakeNetwork=false;
     while(processed<EVT_RING_SIZE) {
         const auto& source=ctrl.evtRing[ctrl.evtDequeue];
         if(bool(source.control&TRB_CYCLE)!=ctrl.evtCycle)break;
@@ -2002,6 +2059,7 @@ static void XhciPollDrainEvents()
                 const uint32_t cc=event.status>>24;
                 const bool interrupt=dev.intRingPhys && event.param>=dev.intRingPhys &&
                     event.param<dev.intRingPhys+XFER_RING_SIZE*sizeof(Trb) && dci==dev.intDci && slot==dev.slotId;
+                if(dev.network && XhciEcmCompletion(dev,event)){handled=true;wakeNetwork=true;}
                 if(interrupt && (dev.isKeyboard || dev.isMouse)) {
                     handled=true;
                     if((cc==TRB_CC_SUCCESS || cc==TRB_CC_SHORT_PACKET) && dev.priv) {
@@ -2026,6 +2084,7 @@ static void XhciPollDrainEvents()
         xhci_write32(ctrl.rtBase,XHCI_RT_IMAN,iman|1); // ack IP, preserve interrupt enable
     }
     IrqSpinLockRelease(&g_eventRingLock,saved);
+    if(wakeNetwork)NetWakePollThread();
 }
 
 static void XhciKeyboardPoll(InputDevice* /*dev*/)
@@ -2115,7 +2174,7 @@ static bool XhciConfigureBulkEndpoint(XhciController& ctrl, XhciDevice& dev,
                                        uint8_t epAddr, uint16_t maxPacket,
                                        Trb*& ring, uint64_t& ringPhys,
                                        uint32_t& enqueue, bool& cycle,
-                                       uint32_t& dci)
+                                       uint32_t& dci,uint8_t maxBurst=0)
 {
     uint8_t epNum = epAddr & 0x0F;
     bool isIn = (epAddr & 0x80) != 0;
@@ -2157,6 +2216,7 @@ static bool XhciConfigureBulkEndpoint(XhciController& ctrl, XhciDevice& dev,
     uint32_t epType = isIn ? 6 : 2;
     epCtx[1] = (3 << 1) |            // CErr = 3
                (epType << 3) |       // EP Type
+               (uint32_t(maxBurst)<<8) |
                (maxPacket << 16);     // Max Packet Size
 
     // TR Dequeue Pointer with DCS=1
@@ -2186,6 +2246,184 @@ static bool XhciConfigureBulkEndpoint(XhciController& ctrl, XhciDevice& dev,
     }
 
     SerialPrintf("xhci: bulk endpoint 0x%02x configured (DCI %u)\n", epAddr, dci);
+    return true;
+}
+
+// ECM owns bounded DMA slots for the lifetime of this controller. Idle IN
+// requests stay pending; there is no timeout on ordinary absence of traffic.
+static uint64_t XhciEcmTrb(XhciDevice& dev,bool input,uint64_t physical,uint32_t bytes,bool chain,bool publish=true){
+    auto* ring=input?dev.bulkInRing:dev.bulkOutRing;
+    auto& enqueue=input?dev.bulkInEnqueue:dev.bulkOutEnqueue;
+    auto& cycle=input?dev.bulkInCycle:dev.bulkOutCycle;
+    const auto ringPhysical=input?dev.bulkInRingPhys:dev.bulkOutRingPhys;
+    if(enqueue>=XFER_RING_SIZE-1){
+        ring[XFER_RING_SIZE-1].control=TRB_TYPE_LINK|TRB_TC|(ring[XFER_RING_SIZE-2].control&(1u<<4))|(cycle?TRB_CYCLE:0);
+        cycle=!cycle;enqueue=0;
+    }
+    auto& trb=ring[enqueue];const auto token=ringPhysical+enqueue*sizeof(Trb);
+    trb.param=physical;trb.status=bytes;
+    const auto control=TRB_TYPE_NORMAL|(input?(1u<<2):0)|(chain?(1u<<4):TRB_IOC)|(cycle?TRB_CYCLE:0);
+    __atomic_store_n(&trb.control,control^(publish?0u:TRB_CYCLE),__ATOMIC_RELEASE);
+    ++enqueue;return token;
+}
+static void XhciEcmReceiveArm(UsbEcmState& net){
+    net.rxToken=XhciEcmTrb(*net.device,true,net.rxPhysical,2048,false);net.rxArmed=true;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    XhciRingDoorbell(*net.controller,net.device->slotId,net.device->bulkInDci);
+}
+static void XhciEcmNotificationArm(UsbEcmState& net){
+    auto& dev=*net.device;
+    const auto index=dev.intEnqueue>=XFER_RING_SIZE-1?0:dev.intEnqueue;
+    net.notificationToken=dev.intRingPhys+index*sizeof(Trb);
+    XhciQueueInterruptIn(*net.controller,dev,net.notification,net.notificationPhysical,dev.ecm.notifyPacket);
+}
+// Called only by the shared event consumer while g_eventRingLock is held.
+static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
+    auto& net=*dev.network;
+    const unsigned dci=(event.control>>16)&31,slot=event.control>>24;
+    if(slot!=dev.slotId)return false;
+    const unsigned cc=event.status>>24,residue=event.status&0xffffff;
+    const auto fail=[&]{if(!net.failed){net.faultStatus=event.status;net.faultDci=dci;net.faultToken=event.param;net.failed=true;}};
+    if(net.failed && (dci==dev.intDci || dci==dev.bulkInDci || dci==dev.bulkOutDci))return true;
+    if(dci==dev.intDci){
+        if(net.failed)return true;
+        if(event.param!=net.notificationToken || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>dev.ecm.notifyPacket){fail();return true;}
+        const auto bytes=dev.ecm.notifyPacket-residue;
+        if(net.notifications<16){
+            const auto length=bytes<16?bytes:16;
+            net.notificationLengths[net.notifications]=length;
+            memcpy(net.notificationSamples[net.notifications],net.notification,length);
+        }
+        ++net.notifications;
+        const auto* b=net.notification;
+        if(bytes>=8)memcpy(net.notifyHeader,b,8);
+        if(bytes>=8 && b[0]==0xa1 && b[1]==0 && (b[4]==dev.ecm.control || b[4]==dev.ecm.data) && !b[5] && !b[6] && !b[7]){
+            net.linkKnown=true;net.linkUp=b[2]!=0 || b[3]!=0;
+        }
+        XhciEcmNotificationArm(net);return true;
+    }
+    if(dci==dev.bulkInDci){
+        if(net.failed)return true;
+        if(event.param!=net.rxToken || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>2048){fail();return true;}
+        net.rxArmed=false;
+        const unsigned bytes=2048-residue;
+        if(bytes>=14 && bytes<=1514){
+            if(net.tail-net.head<ECM_RX_PACKETS){const auto index=net.tail%ECM_RX_PACKETS;memcpy(net.packets[index],net.rx,bytes);net.lengths[index]=bytes;++net.tail;++net.received;}
+            else ++net.dropped;
+        }else if(bytes)++net.dropped;
+        // A full software queue backpressures USB instead of discarding a
+        // completed packet. The poll consumer rearms after making space.
+        if(net.tail-net.head<ECM_RX_PACKETS)XhciEcmReceiveArm(net);
+        return true;
+    }
+    if(dci==dev.bulkOutDci){
+        for(auto& tx:net.sends)if(tx.active && (event.param==tx.final || event.param==tx.first)){
+            if(cc!=TRB_CC_SUCCESS || residue){fail();return true;}
+            if(tx.first!=tx.final && event.param==tx.first){tx.dataDone=true;return true;}
+            if(tx.first!=tx.final && !tx.dataDone){fail();return true;}
+            tx.active=false;++net.transmitted;return true;
+        }
+        fail();return true;
+    }
+    return false;
+}
+static int XhciEcmTransmit(NetIf* nif,const void* frame,uint32_t bytes){
+    if(!frame || bytes<14 || bytes>1514)return -22;
+    auto& net=*static_cast<UsbEcmState*>(nif->driverPriv);auto& dev=*net.device;
+    const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+    if(net.failed || net.controller->completionFailed){IrqSpinLockRelease(&g_eventRingLock,saved);return -5;}
+    for(unsigned i=0;i<8;++i){auto& tx=net.sends[i];if(tx.active)continue;
+        auto* buffer=net.tx+i*2048;memcpy(buffer,frame,bytes);
+        const auto physical=net.txPhysical+i*2048;
+        const bool terminate=(bytes%dev.bulkOutMaxPacket)==0;
+        // A zero-length TRB chained into the data TD is not a USB ZLP:
+        // controllers may merge the TD into one exact-size USB transfer.
+        // Termination needs its own zero-length TD and completion ownership.
+        tx.first=XhciEcmTrb(dev,false,physical,bytes,false,!terminate);
+        tx.final=terminate?XhciEcmTrb(dev,false,physical,0,false):tx.first;
+        tx.bytes=bytes;tx.dataDone=false;tx.active=true;
+        if(terminate){
+            auto& head=dev.bulkOutRing[(tx.first-dev.bulkOutRingPhys)/sizeof(Trb)];
+            __atomic_fetch_xor(&head.control,TRB_CYCLE,__ATOMIC_RELEASE);
+        }
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        XhciRingDoorbell(*net.controller,dev.slotId,dev.bulkOutDci);
+        IrqSpinLockRelease(&g_eventRingLock,saved);return 0;
+    }
+    IrqSpinLockRelease(&g_eventRingLock,saved);return -11;
+}
+static void XhciEcmPoll(NetIf* nif){
+    auto& net=*static_cast<UsbEcmState*>(nif->driverPriv);
+    XhciPollDrainEvents();
+    const auto now=ApicTickCount();
+    if(g_networkProbe && now-net.reportTick>=1000){
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+        const auto rx=net.received,tx=net.transmitted,notifications=net.notifications,dropped=net.dropped;
+        const auto status=net.faultStatus,dci=net.faultDci;const auto token=net.faultToken;
+        const auto notification0=net.notifyHeader[0],notification1=net.notifyHeader[1];
+        const bool failed=net.failed,known=net.linkKnown,up=net.linkUp;net.reportTick=now;
+        IrqSpinLockRelease(&g_eventRingLock,saved);
+        SerialPrintf("xhci: ECM probe link=%s rx=%lu tx=%lu notify=%lu dropped=%lu failed=%u last=%u/%08x/%lx header=%08x/%08x\n",
+            known?(up?"up":"down"):"unknown",rx,tx,notifications,dropped,failed,dci,status,token,notification0,notification1);
+    }
+    if(g_networkProbe){
+        for(unsigned n=0;n<16;++n){
+            uint8_t sample[16]{};unsigned length=0,index=0;
+            const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+            if(net.notificationPrinted<16 && net.notificationPrinted<net.notifications){
+                index=net.notificationPrinted++;length=net.notificationLengths[index];
+                memcpy(sample,net.notificationSamples[index],length);
+            }
+            IrqSpinLockRelease(&g_eventRingLock,saved);
+            if(!length)break;
+            uint32_t words[4]{};memcpy(words,sample,length);
+            SerialPrintf("xhci: ECM notification %u bytes=%u data=%08x/%08x/%08x/%08x\n",
+                index,length,words[0],words[1],words[2],words[3]);
+        }
+    }
+    for(unsigned n=0;n<8;++n){
+        uint8_t frame[1514];unsigned bytes=0;
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+        if(net.head!=net.tail){const auto index=net.head%ECM_RX_PACKETS;bytes=net.lengths[index];memcpy(frame,net.packets[index],bytes);++net.head;}
+        if(!net.failed && !net.rxArmed && net.tail-net.head<ECM_RX_PACKETS)XhciEcmReceiveArm(net);
+        IrqSpinLockRelease(&g_eventRingLock,saved);
+        if(!bytes)break;
+        // Receive can immediately transmit an ACK. No USB lock is held here.
+        NetReceive(nif,frame,bytes);
+    }
+}
+static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
+    if(Vnode* marker=VfsOpen("/etc/usb-net-probe",0)){VfsClose(marker);g_networkProbe=true;}
+    auto* net=static_cast<UsbEcmState*>(kmalloc(sizeof(UsbEcmState)));if(!net)return false;
+    memset(net,0,sizeof(*net));net->controller=&ctrl;net->device=&dev;
+    net->rx=static_cast<uint8_t*>(AllocDmaBuffer(1,net->rxPhysical));
+    net->tx=static_cast<uint8_t*>(AllocDmaBuffer(4,net->txPhysical));
+    net->notification=static_cast<uint8_t*>(AllocDmaBuffer(1,net->notificationPhysical));
+    uint64_t physical=0;auto* scratch=static_cast<uint8_t*>(AllocDmaBuffer(1,physical));
+    if(!net->rx || !net->tx || !net->notification || !scratch)return false;
+    // String 0 gives the supported language. Read exact descriptor lengths,
+    // because the control path deliberately rejects unexplained short data.
+    UsbSetupPacket request{};request.bmRequestType=0x80;request.bRequest=USB_REQ_GET_DESCRIPTOR;
+    request.wValue=3u<<8;request.wLength=2;
+    if(!XhciControlTransfer(ctrl,dev,request,scratch,2,physical,3))return false;
+    unsigned length=scratch[0];if(length<4 || length>254 || (length&1))return false;
+    request.wLength=length;
+    if(!XhciControlTransfer(ctrl,dev,request,scratch,length,physical,3))return false;
+    unsigned language=unsigned(scratch[2])|(unsigned(scratch[3])<<8);
+    request.wValue=(3u<<8)|dev.ecm.macString;request.wIndex=language;request.wLength=26;
+    if(!XhciControlTransfer(ctrl,dev,request,scratch,26,physical,3) || !UsbEcmMac(scratch,26,net->interface.mac.b))return false;
+    if(!XhciConfigureBulkEndpoint(ctrl,dev,dev.bulkInAddr,dev.bulkInMaxPacket,dev.bulkInRing,dev.bulkInRingPhys,dev.bulkInEnqueue,dev.bulkInCycle,dev.bulkInDci,dev.ecm.inBurst))return false;
+    if(!XhciConfigureBulkEndpoint(ctrl,dev,dev.bulkOutAddr,dev.bulkOutMaxPacket,dev.bulkOutRing,dev.bulkOutRingPhys,dev.bulkOutEnqueue,dev.bulkOutCycle,dev.bulkOutDci,dev.ecm.outBurst))return false;
+    if(!XhciConfigureInterruptEndpoint(ctrl,dev))return false;
+    request={};request.bmRequestType=0x21;request.bRequest=0x43;request.wValue=0x000c;request.wIndex=dev.ecm.control;
+
+    if(!XhciControlTransfer(ctrl,dev,request,nullptr,0,0,0))return false;
+    net->interface.driverPriv=net;net->interface.transmit=XhciEcmTransmit;net->interface.poll=XhciEcmPoll;
+    const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+    dev.network=net;XhciEcmReceiveArm(*net);XhciEcmNotificationArm(*net);
+    IrqSpinLockRelease(&g_eventRingLock,saved);
+    NetRegisterIf(&net->interface);
+    SerialPrintf("xhci: CDC-ECM network interface ready slot=%u (carrier unverified)\n",dev.slotId);
     return true;
 }
 
@@ -2667,6 +2905,7 @@ static void XhciEnumeratePort(XhciController& ctrl, uint32_t portNum,
     }
 
     // If it's a mass storage device, initialize SCSI and register block device
+    if(dev.ecm.value)XhciInitEcm(ctrl,dev);
     if (dev.isMassStorage && dev.bulkInAddr && dev.bulkOutAddr) {
         SerialPrintf("xhci: USB mass storage detected on port %u (slot %u)\n",
                      portNum, dev.slotId);

@@ -53,6 +53,7 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_usb_ecm_descriptors)
 add_host_test(test_xhci_completion_queue)
 add_host_test(test_partition_bounds)
 add_host_test(test_xhci_ownership)
