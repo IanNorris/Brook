@@ -27,7 +27,7 @@ for operation in ['write','verify']:
         '-netdev',f'user,id=network,restrict=on,hostfwd=tcp:127.0.0.1:{port}-:1234',
         '-display','none','-serial','file:'+str(base/'serial.log'),'-qmp','unix:'+str(base/'qmp.sock')+',server=on,wait=off','-no-reboot']
     (base/'argv.json').write_text(json.dumps(argv,indent=2)+'\n')
-    log=(base/'qemu.log').open('x');owner=subprocess.Popen(argv,stdout=log,stderr=subprocess.STDOUT);q=None;rpc=None
+    log=(base/'qemu.log').open('x');owner=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT);q=None;rpc=None
     try:
         end=time.monotonic()+90
         while time.monotonic()<end:

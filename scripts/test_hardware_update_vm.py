@@ -31,7 +31,7 @@ for phase in (['upload'] if a.workflow else ['upload','verify']):
         '-display','none','-serial','file:'+str(base/'serial.log'),'-qmp','unix:'+str(base/'qmp.sock')+',server=on,wait=off','-no-reboot']
     if a.workflow:argv=argv[:-1]+['-action','reboot=reset']
     (base/'argv.json').write_text(json.dumps(argv,indent=2)+'\n')
-    log=(base/'qemu.log').open('x');owner=subprocess.Popen(argv,stdout=log,stderr=subprocess.STDOUT);q=None;rpc=None
+    log=(base/'qemu.log').open('x');owner=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT);q=None;rpc=None
     try:
         end=time.monotonic()+90
         while time.monotonic()<end:

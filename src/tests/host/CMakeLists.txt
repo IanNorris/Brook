@@ -53,6 +53,7 @@ function(add_host_test TEST_NAME)
 endfunction()
 
 enable_testing()
+add_host_test(test_usb_scsi_cache)
 add_host_test(test_update_payload)
 add_host_test(test_update_slots "${BROOK_ROOT}/src/bootloader/src/update_slots.cpp")
 target_include_directories(test_update_slots PRIVATE

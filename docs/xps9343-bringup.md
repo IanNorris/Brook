@@ -662,3 +662,18 @@ IN is restricted to single-data-TRB diagnostics at most192 bytes. A stall still
 quarantines; no endpoint/BOT halt recovery is claimed. This policy is deliberately
 stricter than Linux's broad compatibility defaults and shutdown handling:
 [Linux SCSI disk implementation](https://github.com/torvalds/linux/blob/master/drivers/scsi/sd.c).
+
+The diagnostic/policy candidate is
+`build/hardware/update-bootstrap-v4-20261030/probe`. It includes the freshly built
+xHCI module while retaining the exact accepted recovery kernel/root initrd.
+`test_usb_scsi_cache` covers fixed/descriptor and deferred sense, malformed and
+truncated caching pages, block descriptors, explicit WCE0/WCE1, unsupported vs
+other errors, and narrow short-completion eligibility. The private QEMU scratch
+write/flush/fresh-boot verification passes in
+`build/hardware/msc-cache-write-acceptance-20261030/result.json`. Real SanDisk
+cache reporting and corrected flush acceptance are still unverified.
+The diagnostic candidate also passes the live guarded remote-update/reset
+workflow in `build/hardware/msc-cache-update-workflow-20261030/result.json`.
+After the physical fsync failure, checked shutdown stopped with EIO (request
+`4a670abe9938438db6f809bc64957c2e`), so a clean physical sync is not claimed.
+Only the existing scratch file was written; activation was never dispatched.

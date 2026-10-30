@@ -23,6 +23,7 @@
 #include "xhci_intel_routing.h"
 #include "xhci_msi.h"
 #include "xhci_completion_queue.h"
+#include "usb_scsi_cache.h"
 #include "sync/kmutex.h"
 #include "vfs.h"
 #include "pci.h"
@@ -947,6 +948,8 @@ struct XhciDevice {
     KMutex controlLock;
     bool controlQuarantined;
     bool mscQuarantined;       // retained DMA buffers cannot be reused after transport failure
+    UsbScsiCache mscCache;      // reset to Unknown with each enumerated device
+    bool mscUnsupportedSync;    // only after current sense + explicit WCE=0
     uint32_t mscTag;            // CBW tag counter
     void* mscCommandBuffer;     // one persistent CBW/CSW page, serialized below
     uint64_t mscCommandBufferPhys;
@@ -2436,8 +2439,10 @@ static bool XhciInitEcm(XhciController& ctrl,XhciDevice& dev){
 // Perform a bulk transfer (IN or OUT)
 static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
                               bool isIn, void* buf, uint64_t bufPhys,
-                              uint32_t len, uint32_t timeoutMs = 5000)
+                              uint32_t len, uint32_t timeoutMs = 5000, uint32_t* shortInActual = nullptr)
 {
+    if(shortInActual)*shortInActual=0;
+    if(shortInActual && (!isIn || len>192 || XhciDmaChunk(bufPhys,len)!=len))return false;
     Trb*&     ring    = isIn ? dev.bulkInRing    : dev.bulkOutRing;
     uint32_t& enqueue = isIn ? dev.bulkInEnqueue : dev.bulkOutEnqueue;
     bool&     cycle   = isIn ? dev.bulkInCycle   : dev.bulkOutCycle;
@@ -2489,13 +2494,15 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
     }
 
     uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
-    if (cc != TRB_CC_SUCCESS || (evt->status&0xffffff) || evt->param!=token) {
+    if (!UsbScsiShortInCompletion(isIn,XhciDmaChunk(bufPhys,len)==len,
+            shortInActual!=nullptr,len,cc,evt->status&0xffffff) || evt->param!=token) {
         KPrintf("xhci: bulk %s failed cc=%u residue=%u slot=%u dci=%u bytes=%u mps=%u event=%lx last=%lx\n",
             isIn?"IN":"OUT",cc,evt->status&0xffffff,dev.slotId,dci,len,maxPacket,evt->param,token);
         KPrintf("xhci: bulk DMA low=%x tokens=%u first=%lx\n",unsigned(bufPhys&65535),tokenCount,tokens[0]);
         return false;
     }
 
+    if(shortInActual)*shortInActual=len-(evt->status&0xffffff);
     return true;
 }
 
@@ -2544,21 +2551,19 @@ static bool g_storageReadOnly=false;
 static bool g_storagePageChunks=false;
 static uint32_t g_mscDeviceCount=0;
 
-static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
-                            const uint8_t* cdb, uint8_t cdbLen,
-                            void* data, uint64_t dataPhys, uint32_t dataLen,
-                            bool dataIn)
+struct XhciMscResult {
+    bool transport=false;uint8_t status=0;uint32_t actual=0,residue=0;UsbScsiSense sense{};
+    bool success()const{return transport&&status==0;}
+};
+// Caller holds g_mscCommandLock through the original command and REQUEST SENSE.
+static XhciMscResult XhciMscCommandLocked(XhciController& ctrl,XhciDevice& dev,
+    const uint8_t* cdb,uint8_t cdbLen,void* data,uint64_t dataPhys,uint32_t dataLen,
+    bool dataIn,bool allowShort=false)
 {
-    // A BOT transaction comprises CBW, optional data, and CSW. Keep another
-    // read/write/flush from inserting commands between those phases.
-    struct CommandGuard {
-        CommandGuard() { KMutexLock(&g_mscCommandLock); }
-        ~CommandGuard() { KMutexUnlock(&g_mscCommandLock); }
-    } guard;
-    if(__atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE))return false;
+    if(__atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE))return {};
     if (!dev.mscCommandBuffer)
         dev.mscCommandBuffer = AllocDmaBuffer(1, dev.mscCommandBufferPhys);
-    if (!dev.mscCommandBuffer) return false;
+    if (!dev.mscCommandBuffer) return {};
     uint64_t cbwPhys = dev.mscCommandBufferPhys;
     auto* cbw = static_cast<UsbMscCbw*>(dev.mscCommandBuffer);
 
@@ -2579,16 +2584,17 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
     if (!XhciBulkTransfer(ctrl, dev, false, cbw, cbwPhys, sizeof(UsbMscCbw))) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         KPrintf("xhci: MSC CBW failed opcode=%x bytes=%u; transport quarantined\n",unsigned(cdb[0]),dataLen);
-        return false;
+        return {};
     }
 
     // 2. Data phase (if any)
+    uint32_t actual=dataLen;
     if (dataLen > 0 && data) {
-        if (!XhciBulkTransfer(ctrl, dev, dataIn, data, dataPhys, dataLen)) {
+        if (!XhciBulkTransfer(ctrl, dev, dataIn, data, dataPhys, dataLen,5000,allowShort?&actual:nullptr)) {
             __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
             const uint32_t lba=cdbLen>=10?(uint32_t(cdb[2])<<24)|(uint32_t(cdb[3])<<16)|(uint32_t(cdb[4])<<8)|cdb[5]:0;
             KPrintf("xhci: MSC data %s failed opcode=%x bytes=%u tag=%u lba=%u; transport quarantined\n",dataIn?"IN":"OUT",unsigned(cdb[0]),dataLen,cbw->dCBWTag,lba);
-            return false;
+            return {};
         }
     }
 
@@ -2602,24 +2608,66 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
     if (!XhciBulkTransfer(ctrl, dev, true, csw, cswPhys, sizeof(UsbMscCsw))) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         KPrintf("xhci: MSC CSW failed opcode=%x bytes=%u; transport quarantined\n",unsigned(cdb[0]),dataLen);
-        return false;
+        return {};
     }
 
     if (csw->dCSWSignature != CSW_SIGNATURE) {
         __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         KPrintf("xhci: MSC bad CSW signature 0x%08x\n", csw->dCSWSignature);
-        return false;
+        return {};
     }
 
-    if(csw->bCSWStatus>1 || csw->dCSWTag!=cbw->dCBWTag || csw->dCSWDataResidue)__atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
-    if (csw->bCSWStatus != 0 || csw->dCSWTag != cbw->dCBWTag ||
-        csw->dCSWDataResidue != 0) {
-        KPrintf("xhci: MSC command failed (status=%u residue=%u)\n",
-                     csw->bCSWStatus, csw->dCSWDataResidue);
-        return false;
+    if(csw->bCSWStatus>1 || csw->dCSWTag!=cbw->dCBWTag ||
+       csw->dCSWDataResidue>dataLen || csw->dCSWDataResidue!=dataLen-actual) {
+        __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
+        KPrintf("xhci: MSC invalid CSW opcode=%x status=%u residue=%u actual=%u requested=%u; transport quarantined\n",
+            unsigned(cdb[0]),csw->bCSWStatus,csw->dCSWDataResidue,actual,dataLen);
+        return {};
     }
+    return {true,csw->bCSWStatus,actual,csw->dCSWDataResidue,{}};
+}
 
-    return true;
+static XhciMscResult XhciMscExecuteLocked(XhciController& ctrl,XhciDevice& dev,
+    const uint8_t* cdb,uint8_t cdbLen,void* data,uint64_t dataPhys,uint32_t dataLen,
+    bool dataIn,bool allowShort=false)
+{
+    auto result=XhciMscCommandLocked(ctrl,dev,cdb,cdbLen,data,dataPhys,dataLen,dataIn,allowShort);
+    if(!result.transport||result.status==0)return result;
+    const uint8_t opcode=cdb[0];
+    KPrintf("xhci: MSC command failed opcode=%x status=%u residue=%u actual=%u\n",
+        unsigned(opcode),result.status,result.residue,result.actual);
+    // Sense uses separate bytes in the persistent command page. Do not recurse
+    // through this wrapper, reuse a live data buffer, or take the mutex again.
+    if(opcode!=3) {
+        auto* sense=static_cast<uint8_t*>(dev.mscCommandBuffer)+128;
+        memset(sense,0,18);uint8_t request[6]{};request[0]=3;request[4]=18;
+        const auto response=XhciMscCommandLocked(ctrl,dev,request,6,sense,
+            dev.mscCommandBufferPhys+128,18,true,true);
+        if(response.success())result.sense=UsbScsiParseSense(sense,response.actual);
+        KPrintf("xhci: MSC sense original=%x valid=%u current=%u key=%x asc=%x ascq=%x bytes=%u\n",
+            unsigned(opcode),result.sense.valid?1u:0u,result.sense.current?1u:0u,
+            unsigned(result.sense.key),unsigned(result.sense.asc),unsigned(result.sense.ascq),response.actual);
+    }
+    return result;
+}
+struct MscCommandGuard {
+    MscCommandGuard(){KMutexLock(&g_mscCommandLock);}
+    ~MscCommandGuard(){KMutexUnlock(&g_mscCommandLock);}
+};
+static bool XhciMscCommand(XhciController& ctrl,XhciDevice& dev,
+    const uint8_t* cdb,uint8_t cdbLen,void* data,uint64_t dataPhys,uint32_t dataLen,bool dataIn)
+{
+    MscCommandGuard guard;
+    return XhciMscExecuteLocked(ctrl,dev,cdb,cdbLen,data,dataPhys,dataLen,dataIn).success();
+}
+static UsbScsiCache XhciMscCacheLocked(XhciController& ctrl,XhciDevice& dev) {
+    auto* data=static_cast<uint8_t*>(dev.mscCommandBuffer)+128;memset(data,0,192);
+    uint8_t request[6]{};request[0]=0x1a;request[1]=8;request[2]=8;request[4]=192;
+    auto result=XhciMscExecuteLocked(ctrl,dev,request,6,data,dev.mscCommandBufferPhys+128,192,true,true);
+    auto cache=result.success()?UsbScsiModeCache6(data,result.actual):UsbScsiCache::Unknown;
+    KPrintf("xhci: MSC current cache mode=%u bytes=%u complete=%u (0=unknown 1=write-through 2=write-back)\n",
+        unsigned(cache),result.actual,result.success()?1u:0u);
+    return cache;
 }
 
 // SCSI INQUIRY — identify the device
@@ -2773,13 +2821,24 @@ static int UsbMscIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
     if (cmd == DEVICE_IOCTL_READ_ONLY) return g_storageReadOnly ? 1 : 0;
     if (cmd != DEVICE_IOCTL_FLUSH) return -95;
     if(g_storageReadOnly)return 0;
+    MscIoGuard ioGuard;
+    MscCommandGuard commandGuard;
     auto* st = static_cast<UsbMscState*>(dev->priv);
     XhciDevice& udev = g_devices[st->devIndex];
+    if(__atomic_load_n(&udev.mscQuarantined,__ATOMIC_ACQUIRE))return -5;
+    if(udev.mscUnsupportedSync&&udev.mscCache==UsbScsiCache::WriteThrough)return 0;
     // IMMED=0, LBA=0 and length=0: wait for the entire device cache.
-    uint8_t cdb[10] = {};
-    cdb[0] = SCSI_SYNCHRONIZE_CACHE_10;
-    return XhciMscCommand(*st->ctrl, udev, cdb, sizeof(cdb),
-                         nullptr, 0, 0, false) ? 0 : -5;
+    uint8_t cdb[10] = {};cdb[0] = SCSI_SYNCHRONIZE_CACHE_10;
+    auto result=XhciMscExecuteLocked(*st->ctrl,udev,cdb,sizeof(cdb),nullptr,0,0,false);
+    if(result.success())return 0;
+    if(UsbScsiUnsupportedSync(result.sense)) {
+        if(udev.mscCache==UsbScsiCache::Unknown)udev.mscCache=XhciMscCacheLocked(*st->ctrl,udev);
+        if(!__atomic_load_n(&udev.mscQuarantined,__ATOMIC_ACQUIRE)&&UsbScsiWriteThroughFlush(udev.mscCache,result.sense)) {
+            udev.mscUnsupportedSync=true;
+            KPuts("xhci: MSC flush uses explicitly reported write-through policy; unsupported opcode 35\n");return 0;
+        }
+    }
+    return -5;
 }
 
 static void UsbMscClose(Device* /*dev*/) {}

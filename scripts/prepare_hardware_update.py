@@ -24,7 +24,8 @@ for probe,m in [(recovery,meta),(scratch,sm)]:
     for name,row in m['files'].items():
         target=probe/'payload'/name
         if target.is_symlink() or sha(target)!=row['sha256'] or target.stat().st_size!=row['bytes']:p.error('Input mismatch: '+str(target))
-if meta['files']['KERNEL/BROOK.ELF']['sha256']!=sm['files']['KERNEL/BROOK.ELF']['sha256']:
+if (meta['files']['KERNEL/BROOK.ELF']['sha256']!=sm['files']['KERNEL/BROOK.ELF']['sha256'] or
+    sha(build/'kernel/BROOK.elf')!=meta['files']['KERNEL/BROOK.ELF']['sha256']):
     p.error('Recovery kernel and maintenance module profile must match')
 out.mkdir(parents=True,exist_ok=False)
 run('cp','--reflink=auto','-a',recovery/'payload',out/'payload')
@@ -36,6 +37,7 @@ config=out/'payload/BROOK.CFG';config.write_text(config.read_text()+'UPDATE_SLOT
 updates=out/'payload/UPDATES';updates.mkdir()
 for name in 'AB':(updates/name).mkdir()
 maintenance=out/'maintenance.img';run('cp','--reflink=auto',scratch/'payload/INITRD.IMG',maintenance)
+run('mcopy','-o','-i',maintenance,build/'kernel/drivers/xhci.mod','::DRIVERS/XHCI.MOD')
 for source,dest in [('tools/hardware_update.c','HWUPDATE.ELF'),('tools/hardware_status.c','HWSTATUS.ELF')]:
     binary=out/dest;run(os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',ROOT/source,'-o',binary)
     run('mcopy','-o','-i',maintenance,binary,'::BOOT/'+dest)
