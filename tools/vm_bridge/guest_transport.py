@@ -59,5 +59,3 @@ def exchange(host,port,commands,timeout=8):
                 del buffer[:finish+len(end)]
             if len(results)==len(frames):return results
     raise TimeoutError("No complete guest response; delivery/completion is unknown (not retried)")
-
-

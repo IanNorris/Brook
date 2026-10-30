@@ -1,12 +1,27 @@
 #include "debug_hardware.h"
 #include "bridge_reply.h"
 #include "shutdown.h"
+#include "fs/compressed_vfs.h"
+#include "vfs.h"
 #include <cassert>
 #include <cstring>
 #include <string>
 std::string reply,dispatched;
 unsigned powerCalls=0;std::string powerVerb;
 namespace brook {
+AppSnapshotBootInfo snapshot;
+Vnode binaryNode{},markerNode{};
+bool binaryPresent=false,markerPresent=false,directory=false,statError=false;
+unsigned openNodes=0;
+AppSnapshotBootInfo CompressedVfsAppSnapshotInfo(){return snapshot;}
+extern "C" Vnode* VfsOpen(const char* path,int){
+    if(!std::strcmp(path,"/boot/HWBULK.ELF")&&binaryPresent){++openNodes;return &binaryNode;}
+    if(!std::strcmp(path,"/etc/hardware-bulk")&&markerPresent){++openNodes;return &markerNode;}
+    return nullptr;
+}
+int VfsStat(Vnode*,VnodeStat* out){*out={};out->size=1;out->isDir=directory;return statError?-5:0;}
+extern "C" void VfsClose(Vnode*){assert(openNodes);--openNodes;}
+
 void DebugChannelSend(const char* s){reply+=s;}
 void DebugEpochCopy(char out[33]){std::memset(out,'a',32);out[32]=0;}
 bool DebugEpochMatches(const char* s){return std::string(s)==std::string(32,'a');}
@@ -31,6 +46,20 @@ int main(){
     assert(handle("bridge hardware caps") && reply.find("\"hardware_api\":1")!=std::string::npos);
     assert(reply.find("\"panic_transport\":false")!=std::string::npos);
     assert(reply.find("\"power_api\":1")!=std::string::npos && reply.find("\"power_off\":false")!=std::string::npos);
+    assert(reply.find("\"bulk_helper_api\":0")!=std::string::npos && !brook::openNodes);
+    brook::binaryPresent=true;
+    assert(handle("bridge hardware caps") && reply.find("\"bulk_helper_api\":0")!=std::string::npos && !brook::openNodes);
+    brook::markerPresent=true;
+    assert(handle("bridge hardware caps") && reply.find("\"bulk_helper_api\":1")!=std::string::npos && !brook::openNodes);
+    brook::directory=true;
+    assert(handle("bridge hardware caps") && reply.find("\"bulk_helper_api\":0")!=std::string::npos && !brook::openNodes);
+    brook::directory=false;brook::statError=true;
+    assert(handle("bridge hardware caps") && reply.find("\"bulk_helper_api\":0")!=std::string::npos && !brook::openNodes);
+    brook::statError=false;brook::snapshot.configured=true;brook::snapshot.sourceClosed=true;
+    brook::snapshot.error=brook::AppSnapshotBootError::Hash;
+    assert(handle("bridge hardware caps") && reply.find("\"ready\":false")!=std::string::npos);
+    brook::snapshot.error=brook::AppSnapshotBootError::None;brook::snapshot.ready=true;brook::snapshot.bytes=1234;
+    assert(handle("bridge hardware caps") && reply.find("\"ready\":true")!=std::string::npos && reply.find("\"bytes\":1234")!=std::string::npos);
     const std::string request(32,'1'),boot(32,'a');
     assert(handle("bridge hardware power "+request+" shutdown "+boot) && powerCalls==1 && powerVerb=="shutdown");
     assert(handle("bridge hardware power "+request+" commit "+boot) && powerCalls==2 && reply.find("\"error\":-95")!=std::string::npos);
