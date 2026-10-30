@@ -1,6 +1,8 @@
 #include "../../drivers/xhci/xhci_ownership.h"
 #include <cassert>
 #include "../../drivers/xhci/xhci_msi.h"
+#include "../../drivers/xhci/xhci_root_port.h"
+#include <vector>
 #include <map>
 struct Registers {
     std::map<unsigned,unsigned> values;unsigned byteWrites=0,fullWrites=0,polls=0,releaseAt=1;
@@ -9,7 +11,31 @@ struct Registers {
     void write(unsigned offset,unsigned value){assert(offset==0x44);values[offset]=value&~(7u<<29);++fullWrites;}
     bool wait(){if(++polls==releaseAt)values[0x40]&=~(1u<<16);return polls<8;}
 };
+struct RootPort {
+    uint32_t value=1u|(1u<<9)|(3u<<10)|(2u<<14)|(5u<<25);
+    uint64_t tick=0,completeAt=50;bool stuck=false,disconnect=false,inaccessible=false;
+    std::vector<uint32_t> writes;
+    uint32_t read(){return inaccessible?0xffffffffu:value;}
+    uint64_t now(){return tick;}
+    bool wait(){++tick;if(disconnect && tick==10)value&=~1u;
+        if(!stuck && tick==completeAt && (value&1))value=(value&~(1u<<4))|2u|(1u<<21);return true;}
+    void write(uint32_t v){writes.push_back(v);
+        assert(!(v&2)); // writing PED=1 would disable the port
+        value=(value&~((15u<<5)|(1u<<9)|(3u<<14)|(7u<<25)))|brook::XhciPortPersistent(v);
+        value&=~(v&(1u<<21));if(v&(1u<<4))value|=1u<<4;}
+};
 int main(){
+    static_assert(!(brook::XhciPortPersistent(~0u)&((1u<<1)|(1u<<4)|(1u<<16)|(127u<<17)|(1u<<31))));
+    RootPort port;auto persistent=brook::XhciPortPersistent(port.value);
+    assert(brook::XhciResetRootPort(port,1000) && port.tick==50 && (port.value&2));
+    assert(port.writes.size()==2 && port.writes[0]==(persistent|(1u<<4)) && port.writes[1]==(persistent|(1u<<21)));
+    RootPort stale;stale.value|=1u<<21;
+    assert(brook::XhciResetRootPort(stale,1000) && stale.tick==50 && stale.writes.size()==3);
+    assert(stale.writes.front()==(persistent|(1u<<21)));
+    RootPort timeout;timeout.stuck=true;assert(!brook::XhciResetRootPort(timeout,100) && timeout.tick==100 && timeout.writes.size()==1);
+    RootPort removed;removed.disconnect=true;assert(!brook::XhciResetRootPort(removed,100) && removed.tick==10);
+    RootPort invalid;invalid.inaccessible=true;assert(!brook::XhciResetRootPort(invalid,100) && invalid.writes.empty());
+    RootPort absent;absent.value&=~1u;assert(!brook::XhciResetRootPort(absent,100) && absent.writes.empty());
     unsigned legacy;
     brook::XhciMsiLayout layout;
     assert(brook::XhciMsiRegisters(0x80,0,layout) && layout.data==0x88 && !layout.upper);

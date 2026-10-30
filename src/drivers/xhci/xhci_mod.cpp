@@ -19,6 +19,7 @@
 #include "usb_ecm_descriptors.h"
 #include "net.h"
 #include "xhci_ownership.h"
+#include "xhci_root_port.h"
 #include "xhci_msi.h"
 #include "xhci_completion_queue.h"
 #include "sync/kmutex.h"
@@ -2930,7 +2931,22 @@ static void XhciEnumeratePort(XhciController& ctrl, uint32_t portNum,
 
 static void XhciScanPorts(XhciController& ctrl)
 {
-    SerialPrintf("xhci: scanning %u ports...\n", ctrl.maxPorts);
+    KPrintf("xhci: scanning %u root ports (PCI %x:%x)...\n",ctrl.maxPorts,
+        ctrl.pciDev.vendorId,ctrl.pciDev.deviceId);
+    // Firmware is no longer responsible for powering the root hub. Power all
+    // ports first, then allow connection/debounce/link training to settle once.
+    for(uint32_t port=0;port<ctrl.maxPorts;++port) {
+        const auto offset=XHCI_OP_PORTSC_BASE+port*0x10;
+        const auto state=xhci_read32(ctrl.opBase,offset);
+        KPrintf("xhci: port %u before power PORTSC=0x%08x\n",port+1,state);
+        if(state==0xffffffffu){KPuts("xhci: root port registers inaccessible\n");return;}
+        if(!(state&PORTSC_PP)) {
+            xhci_write32(ctrl.opBase,offset,XhciPortPersistent(state)|PORTSC_PP);
+            (void)xhci_read32(ctrl.opBase,offset); // flush posted MMIO write
+        }
+    }
+    const auto settle=ApicTickCount();
+    while(ApicTickCount()-settle<250)__asm__ volatile("pause");
 
     for (uint32_t port = 0; port < ctrl.maxPorts; port++) {
         uint32_t portsc = xhci_read32(ctrl.opBase,
@@ -2941,7 +2957,7 @@ static void XhciScanPorts(XhciController& ctrl)
         bool powered   = (portsc & PORTSC_PP) != 0;
         uint32_t speed = (portsc >> 10) & 0xF;
 
-        SerialPrintf("xhci: port %u: %s %s %s speed=%s (PORTSC=0x%08x)\n",
+        KPrintf("xhci: port %u: %s %s %s speed=%s (PORTSC=0x%08x)\n",
                      port + 1,
                      connected ? "CONNECTED" : "disconnected",
                      enabled ? "enabled" : "disabled",
@@ -2955,37 +2971,32 @@ static void XhciScanPorts(XhciController& ctrl)
             XhciEnumeratePort(ctrl, port + 1, speed);
         }
         else if (connected && !enabled) {
+            if(speed>=4) {
+                KPrintf("xhci: port %u disabled SuperSpeed link PLS=%u; warm recovery not attempted\n",port+1,(portsc>>5)&15);
+                continue;
+            }
             // Reset the port to enable it
             SerialPrintf("xhci: resetting port %u...\n", port + 1);
 
-            // Write PORTSC with PR=1, preserving PP, clearing W1C bits
-            uint32_t val = (portsc & ~PORTSC_W1C_MASK) | PORTSC_PR;
-            xhci_write32(ctrl.opBase, XHCI_OP_PORTSC_BASE + port * 0x10, val);
-
-            // Wait for reset to complete (PRC bit set)
-            for (int i = 0; i < 200; i++) {
-                portsc = xhci_read32(ctrl.opBase,
-                                      XHCI_OP_PORTSC_BASE + port * 0x10);
-                if (portsc & PORTSC_PRC) break;
-                for (volatile int d = 0; d < 100000; d++);
-            }
-
-            // Clear PRC by writing 1
-            portsc = xhci_read32(ctrl.opBase,
-                                  XHCI_OP_PORTSC_BASE + port * 0x10);
-            xhci_write32(ctrl.opBase, XHCI_OP_PORTSC_BASE + port * 0x10,
-                         (portsc & ~PORTSC_W1C_MASK) | PORTSC_PRC);
+            struct PortIo {
+                XhciController& controller;uint32_t offset;
+                uint32_t read(){return xhci_read32(controller.opBase,offset);}
+                void write(uint32_t value){xhci_write32(controller.opBase,offset,value);}
+                uint64_t now(){return ApicTickCount();}
+                bool wait(){__asm__ volatile("pause");return true;}
+            } io{ctrl,XHCI_OP_PORTSC_BASE+port*0x10};
+            const bool resetOk=XhciResetRootPort(io,1000);
 
             portsc = xhci_read32(ctrl.opBase,
                                   XHCI_OP_PORTSC_BASE + port * 0x10);
             speed = (portsc >> 10) & 0xF;
-            SerialPrintf("xhci: port %u after reset: %s speed=%s\n",
+            KPrintf("xhci: port %u after reset: %s speed=%s PORTSC=0x%08x\n",
                          port + 1,
                          (portsc & PORTSC_PED) ? "ENABLED" : "disabled",
-                         XhciSpeedString(speed));
+                         XhciSpeedString(speed),portsc);
 
             // If enabled, enumerate the device
-            if (portsc & PORTSC_PED) {
+            if (resetOk && (portsc & PORTSC_PED)) {
                 XhciEnumeratePort(ctrl, port + 1, speed);
             }
         }

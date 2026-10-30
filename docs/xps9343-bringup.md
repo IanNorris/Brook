@@ -276,6 +276,32 @@ viewport on size changes, and publishes tightly packed viewport dimensions
 for both software and GPU rendering. This costs one screen-sized allocation
 while the diagnostic console exists, without allocations on each drag.
 
+The next Dell photo established that the controller starts successfully but
+the root-port scan enumerates zero devices. The missing application files and
+IPv4 address are downstream of this failure, rather than independent package
+or DHCP failures. The next driver corrects two root-port issues:
+
+- Power unpowered ports, read back posted writes, and allow a shared 250 ms
+  settling interval before reading connection state.
+- Build PORTSC writes from persistent fields. PED is write-one-to-disable;
+  copying it from a completed reset into the PRC acknowledgement disabled the
+  port. Clear stale PRC first, then wait up to 1,000 ms of elapsed APIC time
+  for fresh completion, with disconnect and inaccessible-register checks.
+
+These semantics follow Intel's [xHCI specification](https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/extensible-host-controler-interface-usb-xhci.pdf).
+Disabled SuperSpeed links are reported separately rather than receiving this
+USB2 reset path; warm-reset recovery remains unimplemented. Each root port's
+raw status before power, after settling, and after a requested reset is shown
+in Kernel Console. This will distinguish absent links from reset/enumeration
+failures on the next physical boot.
+
+The host register model exercises PED write-one-to-disable, stale completion,
+timeouts, unplug and inaccessible registers. Full QEMU ECM acceptance passes
+with the updated driver, including bidirectional TCP/UDP, USB storage during
+traffic and continuing storage/keyboard operation after NIC removal. Evidence:
+`build/hardware/root-port-ecm-20261030/result.json`. Physical acceptance of the
+new root-port handling remains pending.
+
 ### Validated reset and graceful manual power-off
 
 Power handling now separates graceful quiescence, reset and automatic power-off.
