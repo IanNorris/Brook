@@ -21,7 +21,7 @@ os.link(source/'data.bin',source/'hard');(source/'link').symlink_to('data.bin')
 image=base/'APPS.BRK';env=dict(os.environ,BROOK_IMAGE_CHECKSUM_LIBRARY=str(ROOT/'build/release/host_tests/libbrook_image_checksum.so'))
 run('python3',ROOT/'scripts/compressed_image.py','build',source,image,env=env)
 probe=base/'probe'
-run('python3',ROOT/'scripts/make_uefi_probe.py','--output',probe,'--driver','xhci','--usb-read-only','--media-mount','/media/usb','--partition-table','mbr','--display-width','800','--display-height','600','--application-image',image)
+run('python3',ROOT/'scripts/make_uefi_probe.py','--output',probe,'--driver','xhci','--usb-read-only','--media-mount','/media/usb','--partition-table','mbr','--display-width','800','--display-height','600','--application-image',image,'--volatile-desktop')
 rc=base/'INIT.RC';rc.write_text('set wm\nset vfb none\nkconsole\nrun --uid 0 /nix/hello /nix --detach /media/usb\n')
 initrd=probe/'payload/INITRD.IMG';run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 run('mcopy','-o','-i',str(probe/'probe.raw')+'@@1048576',initrd,'::INITRD.IMG')

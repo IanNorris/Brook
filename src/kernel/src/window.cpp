@@ -33,6 +33,7 @@
 #include "terminal.h"
 #include "display.h"
 #include "vfs.h"
+#include "vfs_path.h"
 #include "memory/virtual_memory.h"
 #include "memory/user_mapping.h"
 #include "memory/physical_memory.h"
@@ -120,7 +121,9 @@ static void WmRestoreTheme()
     uint32_t taskbarMetrics=BROOK_TASKBAR_DEFAULT;
     uint32_t audioControl=AudioOutputControl();
     const bool forceMuted=(audioControl&BROOK_AUDIO_MUTED)!=0;
-    Vnode* vn = VfsOpen("/data/home/.config/brook/settings.ini", 0);
+    VfsPath root{};Vnode* vn=nullptr;
+    if(!VfsPathRoot(&root))vn=VfsOpenAt(root,root,"/data/home/.config/brook/settings.ini",0,0,0,nullptr);
+    VfsPathRelease(root);
     if (vn)
     {
         char buf[2049]; uint32_t done = 0; uint64_t offset = 0;

@@ -178,6 +178,55 @@ struct DeferredProbe {
 static DeferredProbe g_deferredProbes[16];
 static uint32_t g_deferredCount = 0;
 
+// Runs before scheduling for a volatile desktop, while the boot thread has
+// explicit kernel filesystem authority. The later persistent-data path keeps
+// its existing owners and never overwrites a user's settings.
+static void PrepareDesktopHome()
+{
+    brook::VfsPath root{};
+    if(brook::VfsPathRoot(&root))return;
+    brook::VnodeStat homeVolume{};
+    if (brook::VfsStatAt(root,root,"/data", &homeVolume) == 0 && homeVolume.isDir)
+    {
+        // Match experiment-image ownership for the current desktop UID.
+        // Preserve existing home ownership; this is not account migration.
+        uint32_t homeUid = brook::DesktopUid, homeGid = brook::DesktopGid;
+        const char* directories[] = {"/data/home", "/data/home/.cache",
+            "/data/home/.config", "/data/home/.config/brook", "/data/home/.local", "/data/home/.local/share"};
+        for (const char* directory : directories)
+        {
+            brook::VnodeStat st{};
+            if (brook::VfsStatAt(root,root,directory, &st) == 0 && st.isDir)
+            {
+                if (directory == directories[0]) { homeUid = st.uid; homeGid = st.gid; }
+                continue;
+            }
+            if (brook::VfsMkdirAt(root,root,directory, 0755,0) != 0)
+                brook::SerialPrintf("home: cannot create %s\n", directory);
+            else if (brook::VfsChownAt(root,root,directory, homeUid, homeGid) != 0)
+                brook::SerialPrintf("home: cannot set ownership of %s\n", directory);
+        }
+    }
+    else brook::SerialPuts("home: persistent /data volume unavailable\n");
+    const char* preferences="/data/home/.config/brook/settings.ini";
+    brook::VnodeStat exists{},defaults{};
+    if(brook::VfsStatAt(root,root,preferences,&exists)==-2 &&
+       !brook::VfsStatAt(root,root,"/etc/desktop-defaults.ini",&defaults) && !defaults.isDir && defaults.size>0 && defaults.size<=4096) {
+        char data[4096];uint64_t offset=0;auto* source=brook::VfsOpenAt(root,root,"/etc/desktop-defaults.ini",0,0,0,nullptr);
+        const int bytes=source?brook::VfsRead(source,data,defaults.size,&offset):-1;
+        if(source)brook::VfsClose(source);
+        if(bytes==int(defaults.size)) {
+            auto* target=brook::VfsOpenAt(root,root,preferences,brook::VFS_O_WRITE|brook::VFS_O_CREATE|brook::VFS_O_EXCL,0644,0,nullptr);
+            if(target) {
+                offset=0;const int result=brook::VfsWrite(target,data,bytes,&offset);brook::VfsClose(target);
+                if(result!=bytes)brook::VfsRemoveAt(root,root,preferences,false);
+                else brook::VfsChownAt(root,root,preferences,brook::DesktopUid,brook::DesktopGid);
+            }
+        }
+    }
+    brook::VfsPathRelease(root);
+}
+
 // Probe a block device for a filesystem (FAT, ext4, or ext2), read BROOK.MNT,
 // and mount at the specified path.  Returns true if mounted.
 // When allowDefer is true, devices that fail to mount or find BROOK.MNT are
@@ -185,8 +234,8 @@ static uint32_t g_deferredCount = 0;
 static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t pdrv,
                                 bool allowDefer = true)
 {
-    brook::FatFsBindDrive(pdrv, dev);
-    bool mounted = brook::VfsMount("/mnt/probe", "fatfs", pdrv);
+    const bool fatBound = brook::FatFsBindDrive(pdrv, dev);
+    bool mounted = fatBound && brook::VfsMount("/mnt/probe", "fatfs", pdrv);
     const char* fsType = "fatfs";
 
     if (!mounted) {
@@ -528,7 +577,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
                 bootProtocol->initrdSize, 512, "ramdisk0");
             if (rd && brook::DeviceRegister(rd))
             {
-                brook::FatFsBindDrive(0, rd);
+                if (!brook::FatFsBindDrive(0, rd)) KernelPanic("initrd: drive binding refused");
                 if (brook::VfsMount("/", "fatfs", 0))
                     brook::KPuts("initrd: mounted at /\n");
                 else
@@ -559,7 +608,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
             brook::Device* rd = brook::RamdiskCreate(dst, g_fatTestImageSize, 512, "ramdisk0");
             if (rd && brook::DeviceRegister(rd))
             {
-                brook::FatFsBindDrive(0, rd);
+                if (!brook::FatFsBindDrive(0, rd)) KernelPanic("embedded initrd: drive binding refused");
                 if (!brook::VfsMount("/", "fatfs", 0))
                     brook::KPuts("VFS: embedded ramdisk mount failed\n");
             }
@@ -622,6 +671,36 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::VfsPathRelease(target);brook::VfsPathRelease(root);
         if(error)KernelPanic("canonical /dev/shm tmpfs mount failed: %d",error);
         brook::SerialPrintf("VFS: canonical /dev/shm tmpfs ready (quota=%lu,global=%lu,01777,nodev,nosuid)\n",(unsigned long)desktopShmBytes,(unsigned long)tmpfsBudget);
+    }
+
+    // Optional read-only-media desktop: keep runtime sockets and user settings
+    // on bounded tmpfs instances. No persistent disk is replaced by default.
+    brook::VnodeStat volatileDesktop{};
+    if (brook::VfsStatPath("/etc/volatile-desktop", &volatileDesktop) == 0) {
+        const char* paths[] = {"/tmp", "/data"};
+        for (const char* path : paths) {
+            const uint16_t mode = path == paths[0] ? 01777 : 0755;
+            brook::VfsPath root{}, target{};
+            int error = brook::VfsPathRoot(&root);
+            brook::VnodeStat stat{};
+            if (!error) {
+                error = brook::VfsStatAt(root, root, path, &stat);
+                if (error == -2) error = brook::VfsMkdirAt(root, root, path, mode, 0);
+                if (!error) error = brook::VfsPathResolve(root, root, path, &target);
+            }
+            if (!error) {
+                const uint64_t quota = desktopShmBytes / 2 & ~uint64_t{4095};
+                auto* instance = brook::TmpfsCreate(0, 0, nullptr, 6, &error, mode, quota);
+                if (instance) {
+                    error = brook::VfsMountNamespaceMountFresh(brook::VfsMountNamespaceInitial(), target,
+                        "tmpfs", brook::TmpfsOperations(), instance, 0, 6);
+                    if (error) brook::TmpfsDestroy(instance);
+                }
+            }
+            brook::VfsPathRelease(target);brook::VfsPathRelease(root);
+            if (error) KernelPanic("volatile desktop mount failed path=%s error=%d", path, error);
+            brook::SerialPrintf("VFS: volatile desktop %s ready (RAM only, nodev,nosuid)\n", path);
+        }
     }
 
     // ---- QEMU fw_cfg ----
@@ -777,6 +856,9 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     }
 
     brook::CompressedVfsBootMount();
+    // Provision with boot-time kernel authority after every storage mount is
+    // available, before scheduler kernel threads acquire ordinary credentials.
+    PrepareDesktopHome();
 
     // ---- IO Benchmark (uncomment to run before compositor starts) ----
     // RunIOBenchmarkSuite();
@@ -898,33 +980,6 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
         // Start the profiler kernel thread (sampling disabled until ProfilerStart).
         brook::ProfilerInit();
-
-        // The desktop's current single account shares the persistent data
-        // volume. Create its home before launcher/terminal applications start.
-        // Do not create an ephemeral replacement when that volume is absent.
-        brook::VnodeStat homeVolume{};
-        if (brook::VfsStatPath("/data", &homeVolume) == 0 && homeVolume.isDir)
-        {
-            // Match experiment-image ownership for the current desktop UID.
-            // Preserve existing home ownership; this is not account migration.
-            uint32_t homeUid = brook::DesktopUid, homeGid = brook::DesktopGid;
-            const char* directories[] = {"/data/home", "/data/home/.cache",
-                "/data/home/.config", "/data/home/.local", "/data/home/.local/share"};
-            for (const char* directory : directories)
-            {
-                brook::VnodeStat st{};
-                if (brook::VfsStatPath(directory, &st) == 0 && st.isDir)
-                {
-                    if (directory == directories[0]) { homeUid = st.uid; homeGid = st.gid; }
-                    continue;
-                }
-                if (brook::VfsMkdir(directory, 0755) != 0)
-                    brook::SerialPrintf("home: cannot create %s\n", directory);
-                else if (brook::Ext2Chown(directory, homeUid, homeGid) != 0)
-                    brook::SerialPrintf("home: cannot set ownership of %s\n", directory);
-            }
-        }
-        else brook::SerialPuts("home: persistent /data volume unavailable\n");
 
         // Execute the boot script if present.
         // This may call ProfilerStart() via the "profile" command,

@@ -21,7 +21,7 @@ namespace
 {
 uint64_t GlobalBytes = 256ULL * 1024 * 1024;
 constexpr uint64_t InstanceInodes = 1024, GlobalInodes = 16384, GlobalMounts = 128;
-constexpr uint16_t Regular = 0100000, Directory = 0040000, Link = 0120000, Fifo = 0010000, TypeMask = 0170000;
+constexpr uint16_t Regular = 0100000, Directory = 0040000, Link = 0120000, Fifo = 0010000, Socket = 0140000, TypeMask = 0170000;
 struct Node;
 struct Entry
 {
@@ -958,7 +958,7 @@ Vnode *Create(VfsObject *o, const char *name, int flags, uint16_t mode, int *err
     (void) flags;
     return vn;
 }
-Vnode *CreateFifo(VfsObject *o, const char *name, uint16_t mode, int *error)
+Vnode *CreateSpecial(VfsObject *o, const char *name, uint16_t mode, uint16_t type, int *error)
 {
     *error = 0;
     auto *parent = Object(o);
@@ -972,7 +972,7 @@ Vnode *CreateFifo(VfsObject *o, const char *name, uint16_t mode, int *error)
         return nullptr;
     }
     uint32_t gid = (parent->mode & 02000) ? parent->gid : actor.gid;
-    auto *n = NewNode(parent->fs, Fifo | (mode & 07777), actor.uid, gid);
+    auto *n = NewNode(parent->fs, type | (mode & 07777), actor.uid, gid);
     if (!n)
     {
         *error = -28;
@@ -996,6 +996,16 @@ Vnode *CreateFifo(VfsObject *o, const char *name, uint16_t mode, int *error)
     }
     Publish(parent, e);
     return vn;
+}
+Vnode *CreateFifo(VfsObject *o, const char *name, uint16_t mode, int *error)
+{
+    return CreateSpecial(o,name,mode,Fifo,error);
+}
+Vnode *CreateSocket(VfsObject *o, const char *name, uint16_t mode, int *error)
+{
+    auto* node=CreateSpecial(o,name,mode,Socket,error);
+    if(!node && *error==-17)*error=-98; // bind uses EADDRINUSE
+    return node;
 }
 int Mkdir(VfsObject *o, const char *name, uint16_t mode)
 {
@@ -1203,7 +1213,7 @@ depth_checked:
 }
 const VfsObjectOps objectOps = {DestroyObject, StatObject, AccessObject, Child,  Parent,       Readlink,
                                 OpenObject,    Create,     Mkdir,        Remove, Rename,       Symlink,
-                                nullptr,       Times,      Chmod,        Chown,  DirectoryPath, nullptr, ObjectPath, CreateFifo, EntryParent};
+                                CreateSocket,  Times,      Chmod,        Chown,  DirectoryPath, nullptr, ObjectPath, CreateFifo, EntryParent};
 const VfsObjectOps *ObjectOperations()
 {
     return &objectOps;

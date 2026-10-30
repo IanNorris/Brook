@@ -14,7 +14,8 @@ static unsigned long free_kib(void){
     char* p=strstr(text,"MemFree:");return p?strtoul(p+8,0,10):0;
 }
 int main(int argc,char** argv){
-    if(argc!=2)return 2;
+    const int concurrent=argc==3 && !strcmp(argv[2],"--concurrent");
+    if(argc!=2 && !concurrent)return 2;
     printf("USB_IO_PROBE_BEGIN\n");fflush(stdout);
     int fd=open(argv[1],O_RDONLY);if(fd<0){perror("USB_IO_OPEN");return 3;}
     struct stat st;if(fstat(fd,&st) || st.st_size<100000)return 4;
@@ -35,8 +36,9 @@ int main(int argc,char** argv){
     for(unsigned i=0;i<17;++i)if(tiny[i]!=(unsigned char)(((511+i)*17+5)%251))return 8;
     if(pread(fd,tiny,1,st.st_size)!=0)return 9;
     close(fd);
-    if(warmed && last && warmed>last+4096){printf("USB_IO_MEMORY_GROWTH kib=%lu\n",warmed-last);return 10;}
-    fd=open(argv[1],O_WRONLY);if(fd>=0){close(fd);puts("USB_IO_NOT_READONLY");return 11;}
+    if(!concurrent && warmed && last && warmed>last+4096){printf("USB_IO_MEMORY_GROWTH kib=%lu\n",warmed-last);return 10;}
+    fd=open(argv[1],O_WRONLY);if(fd>=0 || errno!=EROFS){if(fd>=0)close(fd);printf("USB_IO_NOT_READONLY errno=%d\n",errno);return 11;}
+    if(concurrent)puts("USB_IO_MEMORY_NOTE other desktop processes are active; global free RAM is diagnostic only");
     printf("USB_IO_PROBE_OK bytes=%llu warmed_free=%lu final_free=%lu\n",(unsigned long long)st.st_size,warmed,last);fflush(stdout);
     return 0;
 }

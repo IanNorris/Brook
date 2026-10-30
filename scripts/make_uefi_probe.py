@@ -33,6 +33,7 @@ def main():
     ap.add_argument('--partition-table',choices=['gpt','mbr'],default='gpt')
     ap.add_argument('--application-image',type=Path,help='Read-only BRKPACK application file to include on FAT32')
     ap.add_argument('--application-mount',default='/nix')
+    ap.add_argument('--volatile-desktop',action='store_true',help='Mount bounded RAM-only /tmp and /data; changes lost on power off')
     ap.add_argument('--input-probe',action='store_true',help='Request <=1280x720 and display keyboard/frame diagnostics')
     ap.add_argument('--display-width',type=int,default=0)
     ap.add_argument('--display-height',type=int,default=0)
@@ -49,6 +50,7 @@ def main():
     for name in args.driver:
         if not re.fullmatch('[a-z0-9_]+',name) or not (build/'kernel/drivers'/f'{name}.mod').is_file():ap.error('Invalid/missing driver: '+name)
     if args.media_mount and (not args.media_mount.startswith('/') or '..' in args.media_mount.split('/') or len(args.media_mount)>63):ap.error('Invalid media mount path')
+    if args.volatile_desktop and not args.application_image:ap.error('Volatile desktop requires an application image')
     if args.application_image:
         if not args.usb_read_only or not args.media_mount:ap.error('Application image requires --usb-read-only and --media-mount')
         if not args.application_image.is_file() or not 160<=args.application_image.stat().st_size<0xffffffff:ap.error('Invalid FAT32 application image size')
@@ -61,6 +63,9 @@ def main():
     run('bash',ROOT/'scripts/make_initrd.sh','--release',env=env)
     initrd=out/'build/esp/INITRD.IMG'
     marker=out/'audio-muted';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/audio-muted')
+    if args.volatile_desktop:
+        run('mmd','-i',initrd,'::DATA')
+        marker=out/'volatile-desktop';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/volatile-desktop')
     if args.usb_read_only:
         marker=out/'usb-read-only';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/usb-read-only')
     if args.media_mount:
@@ -94,6 +99,8 @@ def main():
         'Input may be unavailable; that is outside this first boot gate.\n'
         'If it stops, record the last message/progress and scan panic QR pages.\n'
         'Scanner: https://khione:9001/ or https://192.168.85.8:9001/\n')
+    if args.volatile_desktop:
+        with (payload/'README.TXT').open('a') as f:f.write('\nOffline desktop: /tmp and /data are RAM ONLY. Home/settings changes are lost on shutdown.\n')
     if args.input_probe:
         with (payload/'README.TXT').open('a') as f:
             f.write(f'\nInput probe: requests <={display_width}x{display_height} GOP; fallback is smallest mode.\n'

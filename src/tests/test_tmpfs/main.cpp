@@ -317,6 +317,19 @@ int main()
         assert(!r->ops->remove(r,"renamed",false));assert(!fifo->ops->stat(fifo,&stat) && !stat.nlink);
         VfsClose(again);VfsObjectRelease(object);VfsClose(fifo);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
     }
+    {
+        auto* fs=make();auto* r=root(fs);int error=0;
+        auto* socket=r->ops->create_socket(r,"wayland-0",0600,&error);assert(socket && !error);
+        VnodeStat st{};assert(!socket->ops->stat(socket,&st) && (st.mode&0177777)==0140600 && st.uid==1000);
+        const auto inode=st.ino;
+        assert(!r->ops->create_socket(r,"wayland-0",0600,&error) && error==-98);
+        assert(!r->ops->remove(r,"wayland-0",false));
+        assert(!socket->ops->stat(socket,&st) && !st.nlink);
+        auto* replacement=r->ops->create_socket(r,"wayland-0",0600,&error);assert(replacement);
+        assert(!replacement->ops->stat(replacement,&st) && st.ino!=inode);
+        assert(!replacement->ops->read && !replacement->ops->write && replacement->ops->deny_mapping);
+        VfsClose(socket);VfsClose(replacement);VfsObjectRelease(r);assert(!TmpfsDestroy(fs));clean();
+    }
     // The boot budget scales without preallocating memory. Existing instances
     // pin the policy so accounting cannot shrink underneath live allocations.
     const uint64_t originalBudget=TmpfsMaximumBytes();

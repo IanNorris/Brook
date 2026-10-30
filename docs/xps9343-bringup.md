@@ -177,3 +177,79 @@ The generator sizes its FAT partition for the payload and verifies copied files
 with streaming hashes. It never writes to physical devices. This is preparation
 for an offline desktop image; it is not physical acceptance of USB reads or
 Ethernet. The physical stick and panic scanner remain on the prior known probe.
+
+### 2026-10-30: offline hardware desktop payload
+
+`nix/hardware-packages.nix` builds an explicit open-source offline profile:
+Bash/coreutils, curl/CA certificates, Vim, Mousepad, Files, Settings, Calculator,
+Wayland, fonts/cursors and the session/message services. No browser, Mesa/LLVM,
+Steam, account data or paid game assets are copied. Its 163-path, approximately
+519 MB closure becomes a 262,602,752-byte compressed application file; the
+prepared disposable disk is 450 MiB.
+
+Reproduce inside the development environment:
+
+```sh
+nix-build nix/hardware-packages.nix -A profile -o build/hardware/offline-profile
+cmake --build build/release --target kernel
+cmake --build build/release/kernel --target module_xhci module_sched_eevdf
+python3 scripts/prepare_hardware_desktop.py --output build/hardware/offline-desktop-new
+```
+
+The generator creates files and a disposable test image only. It does not open
+physical devices. Its initrd opts into `/etc/volatile-desktop`: bounded tmpfs
+instances for `/tmp` and `/data`, in addition to the existing `/dev/shm` instance.
+**Home and settings are ephemeral and disappear at shutdown.** A fresh home is
+created through retained VFS operations before scheduling starts, owned by
+UID 1000/GID 100. An optional bounded `/etc/desktop-defaults.ini` seeds settings
+only when none exist; the native-resolution payload selects 200% scale.
+Persistent homes retain their existing ownership and preferences.
+
+This testing found and fixed missing tmpfs socket inodes: Wayland and D-Bus can
+now bind, connect and retain socket identities through unlink/rebind. Ordinary
+socket file I/O/mapping stays disabled. Startup runs Wayland as the Brook user;
+D-Bus gets its own mode-0700 runtime directory, and the message watcher waits
+for the Wayland socket. Kernel home creation, Settings reads and debug-job cwd
+validation use retained paths, so they see tmpfs rather than hidden FAT paths.
+The wallpaper is center-covered and bilinearly fitted to the actual framebuffer
+once during boot; no scaling work is added to steady-state frames.
+
+The payload includes EEVDF, a finite IP/debug-port status banner, and six checked
+8 MiB USB reads. With desktop services running, global free-memory changes are
+diagnostic rather than a false leak assertion; the isolated probe retains its
+original memory-growth check. Write rejection must specifically return EROFS.
+Periodic `hwprobe` spam is disabled.
+
+Acceptance evidence:
+
+- `build/hardware/offline-desktop-review-v6-20261030/result.json`: fresh
+  3840×2160 QEMU/KVM software desktop, 200% scale, EEVDF, USB integrity, IP banner,
+  user-owned writable RAM home, Unix sockets and live Mousepad/Files/Settings.
+- Terra inspected both fresh desktop and the fitted 4K wallpaper. Images are
+  in that directory (`visual-qa.png`, `visual-qa-1280.png`). Settings' Apply action
+  was not exercised; title/status text clipping remains cosmetic follow-up work.
+- Nine selected tmpfs/VFS/FAT/mount/shutdown host tests pass in
+  `build/hardware/offline-host-tests.log`.
+
+The validated payload was copied to the existing FAT32/MBR USB without formatting
+or deleting unrelated files. All eight files passed readback hashing, and the
+stick was safely unmounted. Receipt and exact previous-file backup:
+`build/hardware/offline-desktop-v4-20261030/probe/usb-copy-receipt.json` and
+`usb-before/`. The new panic scanner service is
+`brook-panic-receiver-offline-20261030.service`, pinned to that payload's exact
+ELF; the earlier probe and its ELF remain preserved.
+
+**Physical acceptance remains pending.** In particular, the real Tecknet ECM
+path still has no verified receive traffic. Linux's
+[r8153 ECM driver](https://github.com/torvalds/linux/blob/master/drivers/net/usb/r8153_ecm.c)
+uses the standard CDC binding plus MII accessors; this supports continuing the
+bounded ECM investigation, not assuming networking is solved. The adapter is
+currently absent from the host, so further physical traces/PHY diagnostics wait
+for its return. Internal SST/RT286 audio and native Intel GPU acceleration remain
+unimplemented. D-Bus reports missing inotify support but runs its session socket.
+
+The updated isolated 512 MiB executable/detach test also passes with volatile
+runtime mounts (`build/hardware/usb-app-image-v4-retry-20261030/result.json`).
+Its first attempt stopped in OVMF's USB boot lookup before the Brook loader;
+the exact same image passed with fresh firmware variables on the bounded retry.
+That pre-loader startup variance is distinct from the kernel acceptance checks.

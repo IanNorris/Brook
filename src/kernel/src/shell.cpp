@@ -709,8 +709,44 @@ static void WallpaperLoaderThread(void* /*arg*/)
     if (st.size == expected && wpW > 0 && wpH > 0
         && wpW <= 3840 && wpH <= 2160)
     {
-        CompositorSetWallpaper(pixels + 2, wpW, wpH);
-        KLog("wallpaper: loaded (%ux%u)", wpW, wpH);
+        uint32_t displayW=0,displayH=0;
+        CompositorGetPhysDims(&displayW,&displayH);
+        uint32_t* fitted=nullptr;
+        if(displayW && displayH && uint64_t(displayW)*displayH<=16777216 &&
+           (displayW!=wpW || displayH!=wpH))
+            fitted=static_cast<uint32_t*>(kmalloc(uint64_t(displayW)*displayH*4));
+        if(fitted) {
+            // Center-cover and filter once at boot. Steady-state rendering still
+            // uses the pre-rendered wallpaper with no scaling cost per frame.
+            uint32_t cropW=wpW,cropH=wpH;
+            if(uint64_t(wpW)*displayH>uint64_t(wpH)*displayW)cropW=uint64_t(wpH)*displayW/displayH;
+            else cropH=uint64_t(wpW)*displayH/displayW;
+            if(!cropW)cropW=1;if(!cropH)cropH=1;
+            const uint64_t originX=uint64_t(wpW-cropW)<<15,originY=uint64_t(wpH-cropH)<<15;
+            const uint64_t stepX=displayW>1?(uint64_t(cropW-1)<<16)/(displayW-1):0;
+            const uint64_t stepY=displayH>1?(uint64_t(cropH-1)<<16)/(displayH-1):0;
+            const auto* image=pixels+2;
+            for(uint32_t y=0;y<displayH;++y) {
+                const uint64_t sy=originY+y*stepY;const uint32_t y0=sy>>16,y1=y0+1<wpH?y0+1:y0,fy=(sy>>8)&255;
+                for(uint32_t x=0;x<displayW;++x) {
+                    const uint64_t sx=originX+x*stepX;const uint32_t x0=sx>>16,x1=x0+1<wpW?x0+1:x0,fx=(sx>>8)&255;
+                    const uint32_t a=image[uint64_t(y0)*wpW+x0],b=image[uint64_t(y0)*wpW+x1];
+                    const uint32_t c=image[uint64_t(y1)*wpW+x0],d=image[uint64_t(y1)*wpW+x1];
+                    uint32_t color=0xff000000;
+                    for(unsigned shift=0;shift<24;shift+=8) {
+                        const uint32_t top=((a>>shift)&255)*(256-fx)+((b>>shift)&255)*fx;
+                        const uint32_t bottom=((c>>shift)&255)*(256-fx)+((d>>shift)&255)*fx;
+                        color|=((top*(256-fy)+bottom*fy)>>16)<<shift;
+                    }
+                    fitted[uint64_t(y)*displayW+x]=color;
+                }
+            }
+            kfree(pixels);CompositorSetWallpaper(fitted,displayW,displayH);
+            KLog("wallpaper: fitted once %ux%u to %ux%u",wpW,wpH,displayW,displayH);
+        } else {
+            CompositorSetWallpaper(pixels + 2, wpW, wpH);
+            KLog("wallpaper: loaded (%ux%u)", wpW, wpH);
+        }
     }
     else
     {
@@ -1767,8 +1803,10 @@ Process* ShellCreateDebugJob(int argc, const char* const* argv, const char* cwd,
     ShellDispatchGuard dispatch;
     if (argc<1 || argc>64 || envc<0 || envc>64 || argv[0][0]!='/' ||
         StrLen(argv[0])>=256 || StrLen(cwd)>=512 || cwd[0]!='/') return nullptr;
-    VnodeStat stat;
-    if (VfsStatPath(cwd,&stat)!=0 || !stat.isDir) return nullptr;
+    VnodeStat stat;VfsPath root{};
+    if(VfsPathRoot(&root))return nullptr;
+    const int cwdError=VfsStatAt(root,root,cwd,&stat);VfsPathRelease(root);
+    if(cwdError || !stat.isDir)return nullptr;
     char paths[5][256]{};char extra[4][256]{};
     const char* effective[80];int count=argc;
     for (int i=0;i<argc;++i) effective[i]=argv[i];
