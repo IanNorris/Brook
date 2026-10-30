@@ -255,7 +255,13 @@ static bool ProbeAndMountDevice(const char* label, brook::Device* dev, uint8_t p
     // before the ext4 module was loaded and re-probed the device).
     brook::VfsUnmount(mntPath);
 
-    if (brook::VfsMount(mntPath, fsType, pdrv)) {
+    uint32_t mountFlags=0;
+    if(dev->name && dev->name[0]=='u' && dev->name[1]=='s' && dev->name[2]=='b') {
+        if(auto* marker=brook::VfsOpen("/etc/usb-read-only")) {
+            mountFlags=1;brook::VfsClose(marker);
+        }
+    }
+    if (brook::VfsMountConfigured(mntPath, fsType, pdrv,mountFlags)) {
         brook::KPrintf("%s mounted at %s\n", label, mntPath);
 
         // /nix store must remain world-accessible regardless of user
@@ -740,7 +746,8 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
         brook::Device* ud = brook::DeviceFind(name);
         if (!ud) continue;
 
-        uint32_t parts = brook::GptProbeDevice(ud);
+        uint32_t parts = brook::GptProbeDevice(ud,true);
+        if(!parts)parts=brook::MbrProbeDevice(ud);
         if (parts > 0)
         {
             // Mount each GPT partition sub-device.

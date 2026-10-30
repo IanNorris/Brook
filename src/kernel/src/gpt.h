@@ -35,6 +35,7 @@ static constexpr uint32_t GPT_MAX_PARTITIONS = 32;
 
 // Probe a block device for GPT and register partition sub-devices.
 // Returns number of partitions registered.
-uint32_t GptProbeDevice(Device* parentDev);
+uint32_t GptProbeDevice(Device* parentDev,bool includeEsp=false);
+uint32_t MbrProbeDevice(Device* parentDev);
 
 } // namespace brook

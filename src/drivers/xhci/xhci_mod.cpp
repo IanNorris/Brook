@@ -15,6 +15,12 @@
 //   Phase 8: Interrupt-driven I/O (INTx, event ring ISR)
 
 #include "module_abi.h"
+#include "usb_block_bytes.h"
+#include "xhci_ownership.h"
+#include "xhci_msi.h"
+#include "xhci_completion_queue.h"
+#include "sync/kmutex.h"
+#include "vfs.h"
 #include "pci.h"
 #include "serial.h"
 #include "kprintf.h"
@@ -40,9 +46,11 @@ MODULE_IMPORT_SYMBOL(PciConfigRead32);
 MODULE_IMPORT_SYMBOL(PciConfigRead16);
 MODULE_IMPORT_SYMBOL(PciConfigRead8);
 MODULE_IMPORT_SYMBOL(PciConfigWrite16);
+MODULE_IMPORT_SYMBOL(PciConfigWrite32);
 MODULE_IMPORT_SYMBOL(SerialPrintf);
 MODULE_IMPORT_SYMBOL(SerialPuts);
 MODULE_IMPORT_SYMBOL(KPrintf);
+MODULE_IMPORT_SYMBOL(KPuts);
 MODULE_IMPORT_SYMBOL(VmmAllocPages);
 MODULE_IMPORT_SYMBOL(VmmVirtToPhys);
 MODULE_IMPORT_SYMBOL(VmmMapPage);
@@ -57,6 +65,11 @@ MODULE_IMPORT_SYMBOL(InputNextSequence);
 MODULE_IMPORT_SYMBOL(KbdPushChar);
 MODULE_IMPORT_SYMBOL(kmalloc);
 MODULE_IMPORT_SYMBOL(kfree);
+MODULE_IMPORT_SYMBOL(PmmFreePage);
+MODULE_IMPORT_SYMBOL(KMutexLock);
+MODULE_IMPORT_SYMBOL(KMutexUnlock);
+MODULE_IMPORT_SYMBOL(VfsOpen);
+MODULE_IMPORT_SYMBOL(VfsClose);
 MODULE_IMPORT_SYMBOL(DeviceRegister);
 MODULE_IMPORT_SYMBOL(ApicSendEoi);
 MODULE_IMPORT_SYMBOL(ApicTickCount);
@@ -413,19 +426,15 @@ struct XhciController {
     uint8_t  irqLine;
     uint8_t  irqVector;
 
-    // Interrupt-driven event completion (Phase 8)
-    // Command completion: ISR copies the completion TRB here and sets flag
-    volatile bool    cmdComplete;
-    Trb              cmdCompletionTrb;   // copy of the command completion event
-    // Transfer event: ISR copies here for non-HID transfer events (bulk, etc.)
-    volatile bool    xferComplete;
-    Trb              xferCompletionTrb;
-
+    XhciCompletionQueue<Trb> completions;
+    bool completionFailed;
     bool     initialized;
 };
 
 static XhciController g_controllers[MAX_CONTROLLERS];
 static uint32_t       g_controllerCount = 0;
+static IrqSpinLock g_eventRingLock;
+static IrqSpinLock g_commandRingLock;
 static volatile bool  g_irqActive = false;  // true once ISR is registered
 
 // ---------------------------------------------------------------------------
@@ -436,32 +445,17 @@ static volatile bool  g_irqActive = false;  // true once ISR is registered
 // physical addresses. Memory is zeroed. Returns nullptr on failure.
 static void* AllocDmaBuffer(uint32_t pages, uint64_t& outPhys)
 {
-    auto phys = PmmAllocPages(pages);
-    if (!phys) {
-        SerialPrintf("xhci: DMA alloc failed (%u pages)\n", pages);
+    if(!pages || pages>16384) return nullptr;
+    auto phys=PmmAllocPages(pages,MemTag::Device,KernelPid);
+    if(!phys)return nullptr;
+    const uint64_t bytes=uint64_t(pages)*4096;
+    if(phys.raw()>=(16ull<<30) || bytes>(16ull<<30)-phys.raw()) {
+        for(uint32_t i=0;i<pages;++i)PmmFreePage(phys+uint64_t(i)*4096);
         return nullptr;
     }
-    outPhys = phys.raw();
-
-    auto virt = VmmAllocPages(pages, VMM_WRITABLE | VMM_NO_EXEC,
-                              MemTag::Device, KernelPid);
-    if (!virt) {
-        SerialPrintf("xhci: VmmAllocPages failed (%u pages)\n", pages);
-        return nullptr;
-    }
-
-    for (uint32_t i = 0; i < pages; i++) {
-        VmmMapPage(KernelPageTable,
-                   VirtualAddress(virt.raw() + i * 4096),
-                   PhysicalAddress(outPhys + i * 4096),
-                   VMM_WRITABLE | VMM_NO_EXEC,
-                   MemTag::Device, KernelPid);
-    }
-
-    // Zero the buffer
-    auto* ptr = reinterpret_cast<uint8_t*>(virt.raw());
-    memset(ptr, 0, pages * 4096);
-
+    outPhys=phys.raw();
+    auto* ptr=reinterpret_cast<uint8_t*>(PhysToVirt(phys).raw());
+    memset(ptr,0,bytes);
     return ptr;
 }
 
@@ -549,7 +543,6 @@ static bool XhciPciDetect(XhciController& ctrl)
                  dev.vendorId, dev.deviceId, dev.bus, dev.dev, dev.fn);
 
     // Enable PCI bus master and memory space
-    PciEnableBusMaster(dev);
     PciEnableMemSpace(dev);
 
     // Map BAR0 (64-bit MMIO) — map a generous region to cover all register spaces
@@ -569,27 +562,35 @@ static bool XhciPciDetect(XhciController& ctrl)
     ctrl.maxPorts = (hcsParams1 >> 24) & 0xFF;
 
     uint32_t hcsParams2 = xhci_read32(ctrl.capBase, XHCI_CAP_HCSPARAMS2);
-    // Scratchpad count = bits 31:27 (high) << 5 | bits 25:21 (low)
-    uint32_t spHi = (hcsParams2 >> 27) & 0x1F;
-    uint32_t spLo = (hcsParams2 >> 21) & 0x1F;
-    ctrl.scratchpadCount = (spHi << 5) | spLo;
+    ctrl.scratchpadCount=XhciScratchpadCount(hcsParams2);
 
     uint32_t hccParams1 = xhci_read32(ctrl.capBase, XHCI_CAP_HCCPARAMS1);
     ctrl.ctx64 = (hccParams1 & HCC_CSZ) != 0;
+    if(!(hccParams1&HCC_AC64)) {
+        SerialPuts("xhci: 32-bit DMA controller unsupported by this probe\n");return false;
+    }
 
     // Operational registers are at capBase + capLength
     ctrl.opBase = ctrl.capBase + ctrl.capLength;
 
     // Doorbell offset
     uint32_t dboff = xhci_read32(ctrl.capBase, XHCI_CAP_DBOFF) & ~0x3;
+    if(ctrl.capLength<0x20 || uint32_t(ctrl.capLength)+XHCI_OP_PORTSC_BASE+ctrl.maxPorts*16>65536 ||
+       dboff>65536-(ctrl.maxSlots+1)*4) {
+        SerialPuts("xhci: invalid operational/doorbell register bounds\n");return false;
+    }
     ctrl.dbBase = ctrl.capBase + dboff;
 
     // Runtime register offset
     uint32_t rtsoff = xhci_read32(ctrl.capBase, XHCI_CAP_RTSOFF) & ~0x1F;
+    if(rtsoff>65536-0x40 || !ctrl.maxSlots || !ctrl.maxPorts || !ctrl.maxIntrs) {
+        SerialPuts("xhci: invalid runtime/capability bounds\n");return false;
+    }
     ctrl.rtBase = ctrl.capBase + rtsoff;
 
     // Read page size (PAGESIZE register, bit N means 2^(N+12) bytes)
     uint32_t psReg = xhci_read32(ctrl.opBase, XHCI_OP_PAGESIZE);
+    if(!(psReg&1)){SerialPuts("xhci: controller lacks 4KiB page support\n");return false;}
     ctrl.pageSize = 4096; // default
     for (int i = 0; i < 16; i++) {
         if (psReg & (1 << i)) {
@@ -613,17 +614,14 @@ static bool XhciPciDetect(XhciController& ctrl)
 
 static bool XhciReset(XhciController& ctrl)
 {
-    // Stop the controller if running
-    uint32_t cmd = xhci_read32(ctrl.opBase, XHCI_OP_USBCMD);
-    if (cmd & USBCMD_RS) {
-        xhci_write32(ctrl.opBase, XHCI_OP_USBCMD, cmd & ~USBCMD_RS);
-        // Wait for HCH (Halted)
-        for (int i = 0; i < 100; i++) {
-            if (xhci_read32(ctrl.opBase, XHCI_OP_USBSTS) & USBSTS_HCH)
-                break;
-            for (volatile int d = 0; d < 100000; d++);
-        }
+    uint32_t cmd=xhci_read32(ctrl.opBase,XHCI_OP_USBCMD);
+    xhci_write32(ctrl.opBase,XHCI_OP_USBCMD,cmd&~(USBCMD_RS|USBCMD_INTE));
+    bool halted=false;
+    for(unsigned i=0;i<100;++i) {
+        if(xhci_read32(ctrl.opBase,XHCI_OP_USBSTS)&USBSTS_HCH){halted=true;break;}
+        for(volatile int d=0;d<100000;++d){}
     }
+    if(!halted){SerialPuts("xhci: halt timed out; reset aborted\n");return false;}
 
     // Reset
     xhci_write32(ctrl.opBase, XHCI_OP_USBCMD, USBCMD_HCRST);
@@ -665,12 +663,13 @@ static bool XhciAllocRings(XhciController& ctrl)
 
         // Allocate each scratchpad page
         for (uint32_t i = 0; i < ctrl.scratchpadCount; i++) {
-            auto page = PmmAllocPages(1);
+            uint64_t scratchPhys=0;
+            auto* page=AllocDmaBuffer(1,scratchPhys);
             if (!page) {
                 SerialPrintf("xhci: scratchpad page %u alloc failed\n", i);
                 return false;
             }
-            ctrl.scratchpadArray[i] = page.raw();
+            ctrl.scratchpadArray[i] = scratchPhys;
         }
 
         // DCBAA[0] points to the scratchpad array
@@ -776,9 +775,10 @@ static void XhciRingDoorbell(XhciController& ctrl, uint32_t slot, uint32_t targe
     xhci_write32(ctrl.dbBase, slot * 4, target);
 }
 
-static bool XhciSubmitCommand(XhciController& ctrl, uint64_t param,
+static uint64_t XhciSubmitCommand(XhciController& ctrl, uint64_t param,
                                uint32_t status, uint32_t control)
 {
+    const auto saved=IrqSpinLockAcquire(&g_commandRingLock);
     uint32_t idx = ctrl.cmdEnqueue;
     if (idx >= CMD_RING_SIZE - 1) {
         // Wrap: the last TRB is a Link TRB
@@ -803,97 +803,29 @@ static bool XhciSubmitCommand(XhciController& ctrl, uint64_t param,
 
     // Ring the host controller doorbell (slot 0, target 0 = command ring)
     XhciRingDoorbell(ctrl, 0, 0);
-    return true;
+    const auto token=ctrl.cmdRingPhys+idx*sizeof(Trb);
+    IrqSpinLockRelease(&g_commandRingLock,saved);
+    return token;
 }
 
-// Poll the event ring for a command completion. Returns the completion
-// TRB or nullptr after timeout.
-// During init (before IRQ is active), polls the event ring directly.
-// After IRQ registration, waits on the completion flag set by the ISR.
-static Trb* XhciWaitForEvent(XhciController& ctrl, uint32_t expectedType,
-                              uint32_t timeoutMs)
+static void XhciPollDrainEvents();
+static Trb* XhciWaitForEvent(XhciController& ctrl,uint32_t type,uint32_t timeoutMs,
+                             Trb* output=nullptr,uint64_t token=0)
 {
-    if (g_irqActive && timeoutMs > 0) {
-        // Interrupt-driven mode: wait on the volatile completion flag
-        volatile bool* flag = nullptr;
-        Trb* result = nullptr;
-
-        if (expectedType == TRB_TYPE_CMD_COMPLETION) {
-            flag = &ctrl.cmdComplete;
-            result = &ctrl.cmdCompletionTrb;
-        } else if (expectedType == TRB_TYPE_TRANSFER_EVENT) {
-            flag = &ctrl.xferComplete;
-            result = &ctrl.xferCompletionTrb;
-        } else {
-            // For wildcard (type 0) or port status change, use polling fallback
-            flag = nullptr;
-        }
-
-        if (flag) {
-            uint64_t deadline = brook::ApicTickCount() + timeoutMs;
-            while (brook::ApicTickCount() < deadline) {
-                __asm__ volatile("" ::: "memory"); // compiler barrier
-                if (*flag) {
-                    *flag = false;
-                    return result;
-                }
-                // Yield briefly to avoid burning CPU
-                __asm__ volatile("pause" ::: "memory");
-            }
-            return nullptr;
-        }
-        // Fall through to polling for wildcard/port status events
-    }
-
-    // Direct polling — checks event ring at least once even with timeout=0.
-    // This is the path used by poll functions (timeout=0) and during init.
-    uint64_t deadline = brook::ApicTickCount() + timeoutMs;
-    bool firstPass = true;
-
-    while (firstPass || brook::ApicTickCount() < deadline) {
-        firstPass = false;
-        uint32_t idx = ctrl.evtDequeue;
-        Trb& evt = ctrl.evtRing[idx];
-
-        // Check cycle bit — if it matches our expected cycle, this is a new event
-        bool evtCycleBit = (evt.control & TRB_CYCLE) != 0;
-        if (evtCycleBit != ctrl.evtCycle) {
-            if (timeoutMs == 0) return nullptr; // single check — no event
-            for (volatile int d = 0; d < 10000; d++);
-            continue;
-        }
-
-        // We have a new event — advance dequeue
-        ctrl.evtDequeue++;
-        if (ctrl.evtDequeue >= EVT_RING_SIZE) {
-            ctrl.evtDequeue = 0;
-            ctrl.evtCycle = !ctrl.evtCycle;
-        }
-
-        // Update ERDP to tell controller we consumed this event
-        uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
-        // Set EHB (Event Handler Busy) bit to clear interrupt
-        xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
-
-        uint32_t type = evt.control & TRB_TYPE_MASK;
-
-        // Log the event
-        uint32_t cc = (evt.status >> TRB_CC_SHIFT) & 0xFF;
-
-        if (type == TRB_TYPE_PORT_STATUS_CHANGE) {
-            uint32_t portId = (evt.param >> 24) & 0xFF;
-            SerialPrintf("xhci: port %u status change (cc=%u)\n", portId, cc);
-        }
-
-        if (expectedType == 0 || type == expectedType) {
-            // Return a pointer to a static copy (event ring gets reused)
-            static Trb lastEvt;
-            lastEvt = evt;
-            return &lastEvt;
-        }
-    }
-
-    return nullptr; // timeout
+    static Trb discarded; // wildcard drain is used only during single-threaded init
+    if(!output)output=&discarded;
+    const auto start=ApicTickCount();
+    do {
+        XhciPollDrainEvents();
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+        const bool failed=ctrl.completionFailed;
+        const bool found=!failed && ctrl.completions.Take(type,token,*output);
+        IrqSpinLockRelease(&g_eventRingLock,saved);
+        if(found)return output;
+        if(failed)return nullptr;
+        __asm__ volatile("pause");
+    } while(ApicTickCount()-start<timeoutMs);
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -999,6 +931,9 @@ struct XhciDevice {
     bool     isHub;
 
     // Mass storage state
+    KMutex controlLock;
+    bool controlQuarantined;
+    bool mscQuarantined;       // retained DMA buffers cannot be reused after transport failure
     uint32_t mscTag;            // CBW tag counter
     void* mscCommandBuffer;     // one persistent CBW/CSW page, serialized below
     uint64_t mscCommandBufferPhys;
@@ -1028,9 +963,10 @@ static bool        g_mousePresent = false; // set when a mouse is successfully c
 static int XhciEnableSlot(XhciController& ctrl)
 {
     SerialPuts("xhci: sending Enable Slot command\n");
-    XhciSubmitCommand(ctrl, 0, 0, TRB_TYPE_ENABLE_SLOT);
+    const auto commandToken=XhciSubmitCommand(ctrl, 0, 0, TRB_TYPE_ENABLE_SLOT);
 
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 1000);
+    Trb completion;
+    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 1000,&completion,commandToken);
     if (!evt) {
         SerialPuts("xhci: Enable Slot timeout\n");
         return -1;
@@ -1164,10 +1100,11 @@ static bool XhciAddressDevice(XhciController& ctrl, XhciDevice& dev)
     SerialPrintf("xhci: addressing device on slot %u (port %u, speed=%s)\n",
                  dev.slotId, dev.portNum, XhciSpeedString(dev.portSpeed));
 
-    XhciSubmitCommand(ctrl, dev.inputCtxPhys, 0,
+    const auto commandToken=XhciSubmitCommand(ctrl, dev.inputCtxPhys, 0,
                       TRB_TYPE_ADDRESS_DEV | (dev.slotId << 24));
 
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 2000);
+    Trb completion;
+    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 2000,&completion,commandToken);
     if (!evt) {
         SerialPuts("xhci: Address Device timeout\n");
         return false;
@@ -1194,8 +1131,20 @@ static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
                                  void* data, uint32_t dataLen,
                                  uint64_t dataPhys, uint32_t dataDir)
 {
+    struct ControlGuard {
+        KMutex* mutex;
+        explicit ControlGuard(KMutex* m):mutex(m){KMutexLock(mutex);}
+        ~ControlGuard(){KMutexUnlock(mutex);}
+    } guard(&dev.controlLock);
+    if(dev.controlQuarantined || dataLen>65536 || (dataLen && (!data || !dataDir)) ||
+       dataLen!=setup.wLength || dataLen>65536-(dataPhys&65535))return false;
+    uint64_t dataToken=0;
     // 1. Setup TRB (Immediate Data)
     uint32_t idx = dev.ep0Enqueue;
+    if(idx>=XFER_RING_SIZE-1) {
+        dev.ep0Ring[XFER_RING_SIZE-1].control=TRB_TYPE_LINK|TRB_TC|(dev.ep0Cycle?TRB_CYCLE:0);
+        dev.ep0Cycle=!dev.ep0Cycle;idx=0;
+    }
 
     // Setup stage: 8 bytes of setup packet in param field (IDT)
     Trb& setupTrb = dev.ep0Ring[idx];
@@ -1220,6 +1169,7 @@ static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
             idx = 0;
         }
 
+        dataToken=dev.ep0RingPhys+idx*sizeof(Trb);
         Trb& dataTrb = dev.ep0Ring[idx];
         dataTrb.param = dataPhys;
         dataTrb.status = dataLen;
@@ -1238,6 +1188,7 @@ static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
         idx = 0;
     }
 
+    const auto statusToken=dev.ep0RingPhys+idx*sizeof(Trb);
     Trb& statusTrb = dev.ep0Ring[idx];
     statusTrb.param = 0;
     statusTrb.status = 0;
@@ -1254,20 +1205,32 @@ static bool XhciControlTransfer(XhciController& ctrl, XhciDevice& dev,
     // Ring doorbell for this slot, target = 1 (EP0 = DCI 1)
     XhciRingDoorbell(ctrl, dev.slotId, 1);
 
+    bool exact=true;
+    if(dataLen) {
+        Trb dataCompletion;
+        const auto* event=XhciWaitForEvent(ctrl,TRB_TYPE_TRANSFER_EVENT,2000,&dataCompletion,dataToken);
+        if(!event || ((event->status>>24)!=TRB_CC_SUCCESS && (event->status>>24)!=TRB_CC_SHORT_PACKET)) {
+            dev.controlQuarantined=true;return false;
+        }
+        exact=(event->status&0xffffff)==0;
+    }
     // Wait for transfer event
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, 2000);
+    Trb completion;
+    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, 2000,&completion,statusToken);
     if (!evt) {
+        dev.controlQuarantined=true;
         SerialPuts("xhci: control transfer timeout\n");
         return false;
     }
 
     uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
-    if (cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT_PACKET) {
+    if (cc != TRB_CC_SUCCESS) {
+        dev.controlQuarantined=true;
         SerialPrintf("xhci: control transfer failed (cc=%u)\n", cc);
         return false;
     }
 
-    return true;
+    return exact;
 }
 
 // ---------------------------------------------------------------------------
@@ -1768,10 +1731,11 @@ static bool XhciConfigureInterruptEndpoint(XhciController& ctrl, XhciDevice& dev
     __asm__ volatile("mfence" ::: "memory");
 
     // Submit Configure Endpoint command
-    XhciSubmitCommand(ctrl, dev.inputCtxPhys, 0,
+    const auto commandToken=XhciSubmitCommand(ctrl, dev.inputCtxPhys, 0,
                       TRB_TYPE_CONFIG_EP | (dev.slotId << 24));
 
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 2000);
+    Trb completion;
+    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 2000,&completion,commandToken);
     if (!evt) {
         SerialPuts("xhci: Configure Endpoint timeout\n");
         return false;
@@ -2013,86 +1977,55 @@ static void XhciProcessMouseReport(const uint8_t* report);
 // Unified event drain — processes all pending events on the event ring
 // and routes transfer completions to the correct device. Called from
 // both keyboard and mouse poll paths.
+static void XhciProcessMouseReport(const uint8_t* report);
 static void XhciPollDrainEvents()
 {
-    if (g_controllerCount == 0) return;
-    XhciController& ctrl = g_controllers[0];
-    if (!ctrl.initialized) return;
-
-    uint32_t processed = 0;
-    while (processed < EVT_RING_SIZE) {
-        uint32_t idx = ctrl.evtDequeue;
-        Trb& evt = ctrl.evtRing[idx];
-
-        bool evtCycleBit = (evt.control & TRB_CYCLE) != 0;
-        if (evtCycleBit != ctrl.evtCycle)
-            break; // no more events
-
-        // Advance dequeue
-        ctrl.evtDequeue++;
-        if (ctrl.evtDequeue >= EVT_RING_SIZE) {
-            ctrl.evtDequeue = 0;
-            ctrl.evtCycle = !ctrl.evtCycle;
-        }
-
-        uint32_t type = evt.control & TRB_TYPE_MASK;
-        uint32_t cc = (evt.status >> TRB_CC_SHIFT) & 0xFF;
-
-        if (type == TRB_TYPE_TRANSFER_EVENT) {
-            int devIdx = XhciMatchTransferEvent(evt);
-
-            if (devIdx >= 0) {
-                XhciDevice& dev = g_devices[devIdx];
-
-                if (dev.isKeyboard && dev.intRing &&
-                    (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET)) {
-                    auto* report = static_cast<uint8_t*>(dev.priv);
-                    if (report)
-                        XhciProcessKeyboardReport(report);
-                    if (dev.priv && g_kbdReportBufPhys)
-                        XhciQueueInterruptIn(ctrl, dev,
-                                              dev.priv, g_kbdReportBufPhys, 8);
+    if(!g_controllerCount)return;
+    auto& ctrl=g_controllers[0];if(!ctrl.initialized)return;
+    const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
+    unsigned processed=0;
+    while(processed<EVT_RING_SIZE) {
+        const auto& source=ctrl.evtRing[ctrl.evtDequeue];
+        if(bool(source.control&TRB_CYCLE)!=ctrl.evtCycle)break;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        const Trb event=source;
+        if(++ctrl.evtDequeue==EVT_RING_SIZE){ctrl.evtDequeue=0;ctrl.evtCycle=!ctrl.evtCycle;}
+        ++processed;
+        const uint32_t type=event.control&TRB_TYPE_MASK;
+        if(type!=TRB_TYPE_TRANSFER_EVENT && type!=TRB_TYPE_CMD_COMPLETION)continue;
+        bool handled=false;
+        if(type==TRB_TYPE_TRANSFER_EVENT) {
+            const int index=XhciMatchTransferEvent(event);
+            if(index>=0) {
+                auto& dev=g_devices[index];
+                const uint32_t dci=(event.control>>16)&31,slot=event.control>>24;
+                const uint32_t cc=event.status>>24;
+                const bool interrupt=dev.intRingPhys && event.param>=dev.intRingPhys &&
+                    event.param<dev.intRingPhys+XFER_RING_SIZE*sizeof(Trb) && dci==dev.intDci && slot==dev.slotId;
+                if(interrupt && (dev.isKeyboard || dev.isMouse)) {
+                    handled=true;
+                    if((cc==TRB_CC_SUCCESS || cc==TRB_CC_SHORT_PACKET) && dev.priv) {
+                        const uint32_t residue=event.status&0xffffff;
+                        if(dev.isKeyboard && !residue)XhciProcessKeyboardReport(static_cast<uint8_t*>(dev.priv));
+                        else if(dev.isMouse && residue<=1) {
+                            if(residue)static_cast<uint8_t*>(dev.priv)[3]=0;
+                            XhciProcessMouseReport(static_cast<uint8_t*>(dev.priv));
+                        }
+                        XhciQueueInterruptIn(ctrl,dev,dev.priv,dev.isKeyboard?g_kbdReportBufPhys:g_mouseReportBufPhys,dev.isKeyboard?8:4);
+                    }
                 }
-                else if (dev.isMouse && dev.intRing &&
-                         (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET)) {
-                    auto* report = static_cast<uint8_t*>(dev.priv);
-                    if (report)
-                        XhciProcessMouseReport(report);
-                    if (dev.priv && g_mouseReportBufPhys)
-                        XhciQueueInterruptIn(ctrl, dev,
-                                              dev.priv, g_mouseReportBufPhys, 4);
-                }
-                else {
-                    ctrl.xferCompletionTrb = evt;
-                    __asm__ volatile("" ::: "memory");
-                    ctrl.xferComplete = true;
-                }
-            } else {
-                ctrl.xferCompletionTrb = evt;
-                __asm__ volatile("" ::: "memory");
-                ctrl.xferComplete = true;
             }
         }
-        else if (type == TRB_TYPE_CMD_COMPLETION) {
-            ctrl.cmdCompletionTrb = evt;
-            __asm__ volatile("" ::: "memory");
-            ctrl.cmdComplete = true;
-        }
-
-        processed++;
+        if(!handled && !ctrl.completions.Push(event))ctrl.completionFailed=true;
     }
-
-    if (processed > 0) {
-        uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
-        xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
-
-        // Clear IMAN IP and USBSTS EINT so the controller can reassert
-        uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
-        if (sts & USBSTS_EINT)
-            xhci_write32(ctrl.opBase, XHCI_OP_USBSTS, USBSTS_EINT);
-        uint32_t iman = xhci_read32(ctrl.rtBase, XHCI_RT_IMAN);
-        xhci_write32(ctrl.rtBase, XHCI_RT_IMAN, iman | 0x3);
+    if(processed) {
+        xhci_write64(ctrl.rtBase,XHCI_RT_ERDP,ctrl.evtRingPhys+ctrl.evtDequeue*sizeof(Trb)|(1ull<<3));
+        const auto sts=xhci_read32(ctrl.opBase,XHCI_OP_USBSTS);
+        if(sts&USBSTS_EINT)xhci_write32(ctrl.opBase,XHCI_OP_USBSTS,USBSTS_EINT);
+        const auto iman=xhci_read32(ctrl.rtBase,XHCI_RT_IMAN);
+        xhci_write32(ctrl.rtBase,XHCI_RT_IMAN,iman|1); // ack IP, preserve interrupt enable
     }
+    IrqSpinLockRelease(&g_eventRingLock,saved);
 }
 
 static void XhciKeyboardPoll(InputDevice* /*dev*/)
@@ -2236,10 +2169,11 @@ static bool XhciConfigureBulkEndpoint(XhciController& ctrl, XhciDevice& dev,
 
     __asm__ volatile("mfence" ::: "memory");
 
-    XhciSubmitCommand(ctrl, dev.inputCtxPhys, 0,
+    const auto commandToken=XhciSubmitCommand(ctrl, dev.inputCtxPhys, 0,
                       TRB_TYPE_CONFIG_EP | (dev.slotId << 24));
 
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 2000);
+    Trb completion;
+    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_CMD_COMPLETION, 2000,&completion,commandToken);
     if (!evt) {
         SerialPuts("xhci: Configure Bulk EP timeout\n");
         return false;
@@ -2265,36 +2199,26 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
     bool&     cycle   = isIn ? dev.bulkInCycle   : dev.bulkOutCycle;
     uint32_t  dci     = isIn ? dev.bulkInDci     : dev.bulkOutDci;
 
+    const uint64_t ringPhys=isIn?dev.bulkInRingPhys:dev.bulkOutRingPhys;
     if (!ring) return false;
 
-    // Handle ring wrap
-    if (enqueue >= XFER_RING_SIZE - 1) {
-        ring[XFER_RING_SIZE - 1].control =
-            TRB_TYPE_LINK | TRB_TC | (cycle ? TRB_CYCLE : 0);
-        cycle = !cycle;
-        enqueue = 0;
+    if(!len || len>65536)return false;
+    uint64_t physical=bufPhys,token=0;uint32_t remaining=len;
+    while(remaining) {
+        if(enqueue>=XFER_RING_SIZE-1) {
+            ring[XFER_RING_SIZE-1].control=TRB_TYPE_LINK|TRB_TC|(1u<<4)|(cycle?TRB_CYCLE:0);
+            cycle=!cycle;enqueue=0;
+        }
+        const auto bytes=XhciDmaChunk(physical,remaining);
+        auto& trb=ring[enqueue];token=ringPhys+enqueue*sizeof(Trb);
+        trb.param=physical;trb.status=bytes;
+        trb.control=TRB_TYPE_NORMAL|(remaining>bytes?(1u<<4):TRB_IOC)|(cycle?TRB_CYCLE:0);
+        ++enqueue;physical+=bytes;remaining-=bytes;
     }
-
-    Trb& trb = ring[enqueue];
-    trb.param = bufPhys;
-    trb.status = len;
-    trb.control = TRB_TYPE_NORMAL | TRB_IOC | (cycle ? TRB_CYCLE : 0);
-    enqueue++;
-
-    __asm__ volatile("mfence" ::: "memory");
-
-    // Temporarily force polling mode for bulk transfers.  The ISR may race
-    // with XhciWaitForEvent for the same completion TRB (both dequeue from
-    // the event ring), causing missed events.  Polling is safe and fast for
-    // synchronous block I/O.
-    bool wasIrqActive = g_irqActive;
-    g_irqActive = false;
-
-    XhciRingDoorbell(ctrl, dev.slotId, dci);
-
-    Trb* evt = XhciWaitForEvent(ctrl, TRB_TYPE_TRANSFER_EVENT, timeoutMs);
-
-    g_irqActive = wasIrqActive;
+    __asm__ volatile("mfence":::"memory");
+    XhciRingDoorbell(ctrl,dev.slotId,dci);
+    Trb completion;
+    Trb* evt=XhciWaitForEvent(ctrl,TRB_TYPE_TRANSFER_EVENT,timeoutMs,&completion,token);
 
     if (!evt) {
         SerialPrintf("xhci: bulk %s transfer timeout\n", isIn ? "IN" : "OUT");
@@ -2302,7 +2226,7 @@ static bool XhciBulkTransfer(XhciController& ctrl, XhciDevice& dev,
     }
 
     uint32_t cc = (evt->status >> TRB_CC_SHIFT) & 0xFF;
-    if (cc != TRB_CC_SUCCESS && cc != TRB_CC_SHORT_PACKET) {
+    if (cc != TRB_CC_SUCCESS || (evt->status&0xffffff)) {
         SerialPrintf("xhci: bulk %s transfer failed (cc=%u)\n",
                      isIn ? "IN" : "OUT", cc);
         return false;
@@ -2350,7 +2274,10 @@ static constexpr uint8_t SCSI_WRITE_10         = 0x2A;
 static constexpr uint8_t SCSI_SYNCHRONIZE_CACHE_10 = 0x35;
 
 // Execute a SCSI command via BBB protocol
-static SpinLock g_mscCommandLock;
+static KMutex g_mscCommandLock{};
+static KMutex g_mscIoLock{};
+static bool g_storageReadOnly=false;
+static uint32_t g_mscDeviceCount=0;
 
 static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
                             const uint8_t* cdb, uint8_t cdbLen,
@@ -2360,9 +2287,10 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
     // A BOT transaction comprises CBW, optional data, and CSW. Keep another
     // read/write/flush from inserting commands between those phases.
     struct CommandGuard {
-        CommandGuard() { SpinLockAcquire(&g_mscCommandLock); }
-        ~CommandGuard() { SpinLockRelease(&g_mscCommandLock); }
+        CommandGuard() { KMutexLock(&g_mscCommandLock); }
+        ~CommandGuard() { KMutexUnlock(&g_mscCommandLock); }
     } guard;
+    if(__atomic_load_n(&dev.mscQuarantined,__ATOMIC_ACQUIRE))return false;
     if (!dev.mscCommandBuffer)
         dev.mscCommandBuffer = AllocDmaBuffer(1, dev.mscCommandBufferPhys);
     if (!dev.mscCommandBuffer) return false;
@@ -2384,6 +2312,7 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
 
     // 1. Send CBW via Bulk OUT
     if (!XhciBulkTransfer(ctrl, dev, false, cbw, cbwPhys, sizeof(UsbMscCbw))) {
+        __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         SerialPuts("xhci: MSC CBW send failed\n");
         return false;
     }
@@ -2391,6 +2320,7 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
     // 2. Data phase (if any)
     if (dataLen > 0 && data) {
         if (!XhciBulkTransfer(ctrl, dev, dataIn, data, dataPhys, dataLen)) {
+            __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
             SerialPrintf("xhci: MSC data %s failed\n", dataIn ? "IN" : "OUT");
             return false;
         }
@@ -2404,15 +2334,18 @@ static bool XhciMscCommand(XhciController& ctrl, XhciDevice& dev,
     memset(csw, 0, sizeof(UsbMscCsw));
 
     if (!XhciBulkTransfer(ctrl, dev, true, csw, cswPhys, sizeof(UsbMscCsw))) {
+        __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         SerialPuts("xhci: MSC CSW receive failed\n");
         return false;
     }
 
     if (csw->dCSWSignature != CSW_SIGNATURE) {
+        __atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
         SerialPrintf("xhci: MSC bad CSW signature 0x%08x\n", csw->dCSWSignature);
         return false;
     }
 
+    if(csw->bCSWStatus>1 || csw->dCSWTag!=cbw->dCBWTag || csw->dCSWDataResidue)__atomic_store_n(&dev.mscQuarantined,true,__ATOMIC_RELEASE);
     if (csw->bCSWStatus != 0 || csw->dCSWTag != cbw->dCBWTag ||
         csw->dCSWDataResidue != 0) {
         SerialPrintf("xhci: MSC command failed (status=%u residue=%u)\n",
@@ -2490,6 +2423,9 @@ static bool XhciMscReadCapacity(XhciController& ctrl, XhciDevice& dev)
                         (static_cast<uint32_t>(data[6]) << 8)  |
                         static_cast<uint32_t>(data[7]);
 
+    if(lastLba==0xffffffffu || blockLen<512 || blockLen>65536 || (blockLen&(blockLen-1))) {
+        SerialPuts("xhci: unsupported READ(10) capacity/block size\n");return false;
+    }
     dev.mscSectorCount = static_cast<uint64_t>(lastLba) + 1;
     dev.mscBlockSize = blockLen;
 
@@ -2516,6 +2452,9 @@ static uint32_t UsbMscBlockSize(Device* dev);
 struct UsbMscState {
     XhciController* ctrl;
     uint32_t devIndex;   // index into g_devices
+    uint8_t* bounce;
+    uint64_t bouncePhys;
+    char name[16];
 };
 
 static const BlockDeviceOps g_usbMscOps = {
@@ -2527,121 +2466,46 @@ static const BlockDeviceOps g_usbMscOps = {
     .block_size  = UsbMscBlockSize,
 };
 
-// Read sectors from USB mass storage
-static int UsbMscRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
-{
-    auto* st = static_cast<UsbMscState*>(dev->priv);
-    XhciDevice& udev = g_devices[st->devIndex];
-    uint32_t blockSize = udev.mscBlockSize;
-    if (blockSize == 0) return -1;
-
-    uint64_t startSector = offset / blockSize;
-    uint64_t sectorCount = len / blockSize;
-    if (sectorCount == 0) return 0;
-
-    // Limit to 128 sectors per transfer (64KB with 512B sectors)
-    static constexpr uint32_t MAX_SECTORS_PER_XFER = 128;
-
-    auto* dst = static_cast<uint8_t*>(buf);
-    uint64_t totalRead = 0;
-
-    while (sectorCount > 0) {
-        uint32_t batch = sectorCount > MAX_SECTORS_PER_XFER
-                             ? MAX_SECTORS_PER_XFER
-                             : static_cast<uint32_t>(sectorCount);
-        uint32_t xferLen = batch * blockSize;
-
-        // Allocate DMA buffer for the read
-        uint64_t dmaPhys;
-        auto* dmaBuf = static_cast<uint8_t*>(AllocDmaBuffer(
-            (xferLen + 4095) / 4096, dmaPhys));
-        if (!dmaBuf) return -1;
-
-        uint8_t cdb[10] = {};
-        cdb[0] = SCSI_READ_10;
-        cdb[2] = static_cast<uint8_t>((startSector >> 24) & 0xFF);
-        cdb[3] = static_cast<uint8_t>((startSector >> 16) & 0xFF);
-        cdb[4] = static_cast<uint8_t>((startSector >> 8)  & 0xFF);
-        cdb[5] = static_cast<uint8_t>(startSector & 0xFF);
-        cdb[7] = static_cast<uint8_t>((batch >> 8) & 0xFF);
-        cdb[8] = static_cast<uint8_t>(batch & 0xFF);
-
-        if (!XhciMscCommand(*st->ctrl, udev, cdb, 10,
-                            dmaBuf, dmaPhys, xferLen, true)) {
-            return static_cast<int>(totalRead);
-        }
-
-        // Copy from DMA buffer to caller's buffer
-        memcpy(dst, dmaBuf, xferLen);
-
-        dst += xferLen;
-        startSector += batch;
-        sectorCount -= batch;
-        totalRead += xferLen;
+struct UsbMscByteTransport {
+    UsbMscState* state;
+    uint32_t blockSize() {return g_devices[state->devIndex].mscBlockSize;}
+    uint64_t blockCount() {return g_devices[state->devIndex].mscSectorCount;}
+    uint32_t bounceBytes() {return 65536;}
+    uint8_t* bounce() {return state->bounce;}
+    bool usable() {return !__atomic_load_n(&g_devices[state->devIndex].mscQuarantined,__ATOMIC_ACQUIRE);}
+    bool transfer(uint64_t lba,uint32_t count,bool read) {
+        if(!usable())return false;
+        uint8_t cdb[10]{};cdb[0]=read?SCSI_READ_10:SCSI_WRITE_10;
+        cdb[2]=lba>>24;cdb[3]=lba>>16;cdb[4]=lba>>8;cdb[5]=lba;
+        cdb[7]=count>>8;cdb[8]=count;
+        return XhciMscCommand(*state->ctrl,g_devices[state->devIndex],cdb,10,
+            state->bounce,state->bouncePhys,count*blockSize(),read);
     }
-
-    return static_cast<int>(totalRead);
+    bool readBlocks(uint64_t lba,uint32_t count) {return transfer(lba,count,true);}
+    bool writeBlocks(uint64_t lba,uint32_t count) {return transfer(lba,count,false);}
+};
+struct MscIoGuard {
+    MscIoGuard(){KMutexLock(&g_mscIoLock);}
+    ~MscIoGuard(){KMutexUnlock(&g_mscIoLock);}
+};
+static int UsbMscRead(Device* dev,uint64_t offset,void* buf,uint64_t len) {
+    MscIoGuard guard;
+    UsbMscByteTransport io{static_cast<UsbMscState*>(dev->priv)};
+    if(!io.usable())return -5;
+    return UsbBlockReadBytes(io,offset,buf,len);
 }
-
-// Write sectors to USB mass storage
-static int UsbMscWrite(Device* dev, uint64_t offset, const void* buf, uint64_t len)
-{
-    auto* st = static_cast<UsbMscState*>(dev->priv);
-    XhciDevice& udev = g_devices[st->devIndex];
-    uint32_t blockSize = udev.mscBlockSize;
-    if (blockSize == 0) return -1;
-
-    uint64_t startSector = offset / blockSize;
-    uint64_t sectorCount = len / blockSize;
-    if (sectorCount == 0) return 0;
-
-    static constexpr uint32_t MAX_SECTORS_PER_XFER = 128;
-
-    auto* src = static_cast<const uint8_t*>(buf);
-    uint64_t totalWritten = 0;
-
-    while (sectorCount > 0) {
-        uint32_t batch = sectorCount > MAX_SECTORS_PER_XFER
-                             ? MAX_SECTORS_PER_XFER
-                             : static_cast<uint32_t>(sectorCount);
-        uint32_t xferLen = batch * blockSize;
-
-        uint64_t dmaPhys;
-        auto* dmaBuf = static_cast<uint8_t*>(AllocDmaBuffer(
-            (xferLen + 4095) / 4096, dmaPhys));
-        if (!dmaBuf) return -1;
-
-        // Copy data to DMA buffer
-        memcpy(dmaBuf, src, xferLen);
-
-        uint8_t cdb[10] = {};
-        cdb[0] = SCSI_WRITE_10;
-        cdb[2] = static_cast<uint8_t>((startSector >> 24) & 0xFF);
-        cdb[3] = static_cast<uint8_t>((startSector >> 16) & 0xFF);
-        cdb[4] = static_cast<uint8_t>((startSector >> 8)  & 0xFF);
-        cdb[5] = static_cast<uint8_t>(startSector & 0xFF);
-        cdb[7] = static_cast<uint8_t>((batch >> 8) & 0xFF);
-        cdb[8] = static_cast<uint8_t>(batch & 0xFF);
-
-        __asm__ volatile("mfence" ::: "memory");
-
-        if (!XhciMscCommand(*st->ctrl, udev, cdb, 10,
-                            dmaBuf, dmaPhys, xferLen, false)) {
-            return static_cast<int>(totalWritten);
-        }
-
-        src += xferLen;
-        startSector += batch;
-        sectorCount -= batch;
-        totalWritten += xferLen;
-    }
-
-    return static_cast<int>(totalWritten);
+static int UsbMscWrite(Device* dev,uint64_t offset,const void* buf,uint64_t len) {
+    if(g_storageReadOnly)return -30;
+    MscIoGuard guard;
+    UsbMscByteTransport io{static_cast<UsbMscState*>(dev->priv)};
+    if(!io.usable())return -5;
+    return UsbBlockWriteBytes(io,offset,buf,len);
 }
 
 static int UsbMscIoctl(Device* dev, uint32_t cmd, void* /*arg*/)
 {
     if (cmd != DEVICE_IOCTL_FLUSH) return -95;
+    if(g_storageReadOnly)return 0;
     auto* st = static_cast<UsbMscState*>(dev->priv);
     XhciDevice& udev = g_devices[st->devIndex];
     // IMMED=0, LBA=0 and length=0: wait for the entire device cache.
@@ -2716,12 +2580,18 @@ static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
     if (!state) return false;
     state->ctrl = &ctrl;
     state->devIndex = devIndex;
+    state->bounce=static_cast<uint8_t*>(AllocDmaBuffer(16,state->bouncePhys));
+    if(!state->bounce){kfree(state);return false;}
 
     auto* blkDev = static_cast<Device*>(kmalloc(sizeof(Device)));
     if (!blkDev) { kfree(state); return false; }
 
     blkDev->ops  = reinterpret_cast<const DeviceOps*>(&g_usbMscOps);
-    blkDev->name = "usb0";
+    const uint32_t index=g_mscDeviceCount;
+    state->name[0]='u';state->name[1]='s';state->name[2]='b';
+    uint32_t pos=3;if(index>=10)state->name[pos++]='0'+index/10;
+    state->name[pos++]='0'+index%10;state->name[pos]=0;
+    blkDev->name = state->name;
     blkDev->type = DeviceType::Block;
     blkDev->priv = state;
 
@@ -2732,6 +2602,7 @@ static bool XhciInitMassStorage(XhciController& ctrl, XhciDevice& dev,
         return false;
     }
 
+    ++g_mscDeviceCount;
     SerialPrintf("xhci: USB mass storage registered as '%s'\n", blkDev->name);
     return true;
 }
@@ -2928,112 +2799,7 @@ static int XhciMatchTransferEvent(const Trb& evt)
 // the MSI-X wrapper below.  Drains all pending event ring entries.
 static void XhciIrqHandler()
 {
-    if (g_controllerCount == 0) return;
-    XhciController& ctrl = g_controllers[0];
-    if (!ctrl.initialized) return;
-
-    // DEBUG: confirm xHCI ISR fires
-    static volatile uint32_t s_xhciIrqCount = 0;
-    uint32_t irqN = ++s_xhciIrqCount;
-
-    // Acknowledge the interrupt: clear USBSTS.EINT
-    uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
-    if (sts & USBSTS_EINT) {
-        xhci_write32(ctrl.opBase, XHCI_OP_USBSTS, USBSTS_EINT);
-    }
-
-    // Clear Interrupt Pending (IP) on Interrupter 0
-    uint32_t iman = xhci_read32(ctrl.rtBase, XHCI_RT_IMAN);
-    if (iman & 0x1) {
-        xhci_write32(ctrl.rtBase, XHCI_RT_IMAN, iman | 0x1); // W1C IP bit
-    }
-
-    // Process all pending events
-    uint32_t processed = 0;
-    while (processed < EVT_RING_SIZE) {
-        uint32_t idx = ctrl.evtDequeue;
-        Trb& evt = ctrl.evtRing[idx];
-
-        bool evtCycleBit = (evt.control & TRB_CYCLE) != 0;
-        if (evtCycleBit != ctrl.evtCycle)
-            break; // no more events
-
-        // Advance dequeue
-        ctrl.evtDequeue++;
-        if (ctrl.evtDequeue >= EVT_RING_SIZE) {
-            ctrl.evtDequeue = 0;
-            ctrl.evtCycle = !ctrl.evtCycle;
-        }
-
-        uint32_t type = evt.control & TRB_TYPE_MASK;
-        uint32_t cc = (evt.status >> TRB_CC_SHIFT) & 0xFF;
-
-        if (type == TRB_TYPE_CMD_COMPLETION) {
-            // Copy completion TRB and signal waiter
-            ctrl.cmdCompletionTrb = evt;
-            __asm__ volatile("" ::: "memory");
-            ctrl.cmdComplete = true;
-        }
-        else if (type == TRB_TYPE_TRANSFER_EVENT) {
-            int devIdx = XhciMatchTransferEvent(evt);
-
-            if (devIdx >= 0) {
-                XhciDevice& dev = g_devices[devIdx];
-
-                if (dev.isKeyboard && dev.intRing &&
-                    (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET)) {
-                    // Process keyboard HID report directly in ISR
-                    auto* report = static_cast<uint8_t*>(dev.priv);
-                    if (report)
-                        XhciProcessKeyboardReport(report);
-                    // Re-queue the interrupt IN transfer
-                    if (dev.priv && g_kbdReportBufPhys)
-                        XhciQueueInterruptIn(ctrl, dev,
-                                              dev.priv, g_kbdReportBufPhys, 8);
-                }
-                else if (dev.isMouse && dev.intRing &&
-                         (cc == TRB_CC_SUCCESS || cc == TRB_CC_SHORT_PACKET)) {
-                    // Process mouse HID report directly in ISR
-                    auto* report = static_cast<uint8_t*>(dev.priv);
-                    if (report)
-                        XhciProcessMouseReport(report);
-                    // Re-queue the interrupt IN transfer
-                    if (dev.priv && g_mouseReportBufPhys)
-                        XhciQueueInterruptIn(ctrl, dev,
-                                              dev.priv, g_mouseReportBufPhys, 4);
-                }
-                else {
-                    // Bulk or other transfer — signal waiter
-                    ctrl.xferCompletionTrb = evt;
-                    __asm__ volatile("" ::: "memory");
-                    ctrl.xferComplete = true;
-                }
-            } else {
-                // Unknown device — signal as generic transfer completion
-                ctrl.xferCompletionTrb = evt;
-                __asm__ volatile("" ::: "memory");
-                ctrl.xferComplete = true;
-            }
-        }
-        else if (type == TRB_TYPE_PORT_STATUS_CHANGE) {
-            // Log but don't do hot-plug enumeration in ISR
-            // (future: set flag for deferred hot-plug handling)
-        }
-
-        processed++;
-    }
-
-    // Update ERDP (write after processing all events for efficiency)
-    if (processed > 0) {
-        uint64_t erdpPhys = ctrl.evtRingPhys + ctrl.evtDequeue * sizeof(Trb);
-        xhci_write64(ctrl.rtBase, XHCI_RT_ERDP, erdpPhys | (1ULL << 3));
-    }
-
-    // DEBUG: report ISR activity
-    if (irqN <= 5 || (irqN & 0x3FF) == 0) {
-        SerialPrintf("XHCI_ISR: #%u eint=%u processed=%u\n",
-                     irqN, (sts & USBSTS_EINT) ? 1u : 0u, processed);
-    }
+    XhciPollDrainEvents();
 }
 
 // MSI-X IDT entry — compiler-generated interrupt stub.
@@ -3054,6 +2820,9 @@ IRQ_NAKED_HANDLER(XhciMsixIsr, XhciMsixIsrInner)
 static int XhciModuleInit()
 {
     SerialPuts("xhci: initializing USB 3.0 host controller driver\n");
+    if(auto* marker=VfsOpen("/etc/usb-read-only")) {
+        g_storageReadOnly=true;VfsClose(marker);KPuts("xhci: physical storage probe is read-only\n");
+    }
 
     // Detect xHCI controllers on PCI bus
     XhciController& ctrl = g_controllers[0];
@@ -3063,8 +2832,22 @@ static int XhciModuleInit()
         return 0; // not an error — just no hardware present
     }
 
-    // Reset the controller
+    struct OwnershipIo {
+        XhciController& ctrl;uint64_t deadline;
+        uint32_t read(uint32_t offset){return xhci_read32(ctrl.capBase,offset);}
+        void write(uint32_t offset,uint32_t value){xhci_write32(ctrl.capBase,offset,value);}
+        void writeByte(uint32_t offset,uint8_t value){*(ctrl.capBase+offset)=value;}
+        bool wait(){__asm__ volatile("pause");return ApicTickCount()<deadline;}
+    } ownership{ctrl,ApicTickCount()+1000};
+    uint32_t legacy=0;
+    const auto extended=(xhci_read32(ctrl.capBase,XHCI_CAP_HCCPARAMS1)>>16)*4;
+    if(!XhciAcquireFirmwareOwnership(ownership,extended,65536,legacy)) {
+        KPuts("xhci: firmware ownership handoff failed; controller untouched\n");return -1;
+    }
+    KPrintf("xhci: firmware handoff complete legacy=0x%x\n",legacy);
+    // Reset only after firmware releases ownership and halt is observed.
     if (!XhciReset(ctrl)) return -1;
+    PciEnableBusMaster(ctrl.pciDev);
 
     // Allocate command/event rings and DCBAA
     if (!XhciAllocRings(ctrl)) return -1;
@@ -3108,13 +2891,12 @@ static int XhciModuleInit()
     // does not support legacy INTx fallback, so we must program the MSI-X
     // table directly.  We configure a single entry (interrupter 0) to deliver
     // our chosen vector to the BSP's LAPIC.
-    ctrl.cmdComplete = false;
-    ctrl.xferComplete = false;
+    ctrl.completionFailed=false;
     bool msixConfigured = false;
     {
         uint8_t capPtr = static_cast<uint8_t>(
             PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev, ctrl.pciDev.fn, 0x34));
-        while (capPtr && capPtr != 0xFF) {
+        for(unsigned hops=0;capPtr>=0x40 && capPtr<=0xfc && !(capPtr&3) && hops<48;++hops) {
             uint8_t capId = PciConfigRead8(ctrl.pciDev.bus, ctrl.pciDev.dev,
                                            ctrl.pciDev.fn, capPtr);
             if (capId == 0x11) { // MSI-X capability
@@ -3179,6 +2961,7 @@ static int XhciModuleInit()
                 for (uint16_t i = 1; i < tableSize; i++)
                     table[i * 4 + 3] = 1; // mask
 
+                IdtInstallHandler(XHCI_IRQ_VECTOR,reinterpret_cast<void*>(XhciMsixIsr));
                 // Enable MSI-X (set bit 15), clear function mask (bit 14)
                 msgCtrl |= 0x8000;   // MSI-X Enable
                 msgCtrl &= ~0x4000;  // Clear Function Mask
@@ -3199,18 +2982,46 @@ static int XhciModuleInit()
         }
     }
 
-    if (!msixConfigured) {
+    bool msiConfigured=false;
+    if(!msixConfigured) {
+        uint8_t cap=PciConfigRead8(ctrl.pciDev.bus,ctrl.pciDev.dev,ctrl.pciDev.fn,0x34);
+        for(unsigned hops=0;cap>=0x40 && cap<=0xfc && !(cap&3) && hops<48;++hops) {
+            if(PciConfigRead8(ctrl.pciDev.bus,ctrl.pciDev.dev,ctrl.pciDev.fn,cap)==5) {
+                const auto control=PciConfigRead16(ctrl.pciDev.bus,ctrl.pciDev.dev,ctrl.pciDev.fn,cap+2);
+                XhciMsiLayout layout;
+                if(!XhciMsiRegisters(cap,control,layout))break;
+                const auto b=ctrl.pciDev.bus,d=ctrl.pciDev.dev,f=ctrl.pciDev.fn;
+                PciConfigWrite16(b,d,f,cap+2,control&~1u);
+                IdtInstallHandler(XHCI_IRQ_VECTOR,reinterpret_cast<void*>(XhciMsixIsr));
+                PciConfigWrite32(b,d,f,cap+4,0xfee00000u|(uint32_t(ApicGetId())<<12));
+                if(layout.upper)PciConfigWrite32(b,d,f,layout.upper,0);
+                PciConfigWrite16(b,d,f,layout.data,XHCI_IRQ_VECTOR);
+                if(layout.mask)PciConfigWrite32(b,d,f,layout.mask,PciConfigRead32(b,d,f,layout.mask)&~1u);
+                PciConfigWrite16(b,d,f,4,PciConfigRead16(b,d,f,4)|(1u<<10)); // INTx disable
+                PciConfigWrite16(b,d,f,cap+2,layout.enabled);
+                msiConfigured=true;SerialPrintf("xhci: MSI configured vector=%u LAPIC=%u\n",XHCI_IRQ_VECTOR,ApicGetId());
+                break;
+            }
+            cap=PciConfigRead8(ctrl.pciDev.bus,ctrl.pciDev.dev,ctrl.pciDev.fn,cap+1);
+        }
+    }
+    if (!msixConfigured && !msiConfigured) {
         // Fallback: legacy INTx via IOAPIC
         uint32_t intLine = PciConfigRead32(ctrl.pciDev.bus, ctrl.pciDev.dev,
                                             ctrl.pciDev.fn, 0x3C) & 0xFF;
+        if(intLine==0 || intLine>=24) {
+            SerialPuts("xhci: no usable interrupt route; polling mode retained\n");
+            ctrl.irqLine=0;
+        } else {
         ctrl.irqLine = static_cast<uint8_t>(intLine);
         ctrl.irqVector = IoApicRegisterHandler(ctrl.irqLine, XHCI_IRQ_VECTOR,
                                                 reinterpret_cast<void*>(XhciIrqHandler));
         SerialPrintf("xhci: legacy INTx — IRQ %u, vector %u\n",
                      ctrl.irqLine, ctrl.irqVector);
+        }
     }
 
-    g_irqActive = true;
+    g_irqActive = msixConfigured || msiConfigured || ctrl.irqVector;
     SerialPrintf("xhci: interrupt-driven mode active (MSI-X=%s)\n",
                  msixConfigured ? "yes" : "no");
 

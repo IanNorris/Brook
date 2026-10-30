@@ -54,6 +54,30 @@ Optical scanning of an actual hardware panic remains untested.
 Private hashes, USB copy receipt and VM evidence are under
 `build/hardware/xps9343-uefi-20261030/`.
 
+## USB storage checkpoint (30 October)
+
+The opt-in xHCI payload now completes two disposable QEMU tests using an MBR
+FAT32 USB disk, matching the physical stick's partition layout. Both read an
+8 MiB patterned file six times through a real user process, including unaligned
+reads and EOF, and reject write opens. Free memory is unchanged after warm-up.
+The second test injects USB keyboard activity during reads and verifies guest
+key events. This is emulator acceptance; the new driver has not yet been tested
+on the Dell or copied over its known-good probe.
+
+The driver now acquires firmware ownership before reset, observes controller
+halt, configures MSI-X/MSI or valid legacy interrupts, routes synchronous and
+HID completions through one event consumer, and uses reusable contiguous DMA
+buffers. Byte reads/writes respect sector boundaries. Transport failures
+quarantine DMA endpoints rather than reusing potentially active buffers; reset
+recovery and general hotplug are still open. The hardware image uses the
+`/etc/usb-read-only` marker to keep USB storage and its mounted filesystem
+read-only. Primary MBR partitions are supported without repartitioning.
+
+Reproduce the probe with `--driver xhci --usb-read-only --media-mount /media/usb
+--partition-table mbr`. Host tests cover byte/sector boundaries, capacity and
+overflow, ownership handoff, interrupt layouts and completion matching. Private
+runtime evidence is in `build/hardware/xps9343-usb-storage-v2-20261030/`.
+
 ## Deliverables and order
 
 1. A usable persistent software-rendered desktop under VMware and VirtualBox.

@@ -1,4 +1,5 @@
 #include "gpt.h"
+#include "partition_bounds.h"
 #include "kprintf.h"
 #include "serial.h"
 
@@ -57,17 +58,17 @@ static uint32_t      s_partPoolNext = 0;
 static int PartRead(Device* dev, uint64_t offset, void* buf, uint64_t len)
 {
     auto* pp = static_cast<PartitionPriv*>(dev->priv);
-    if (offset + len > pp->lengthBytes)
-        len = pp->lengthBytes - offset;
-    return pp->parent->ops->read(pp->parent, pp->startByte + offset, buf, len);
+    uint64_t physical,amount;
+    if(!PartitionIoSpan(pp->startByte,pp->lengthBytes,offset,len,physical,amount))return -22;
+    return pp->parent->ops->read(pp->parent,physical,buf,amount);
 }
 
 static int PartWrite(Device* dev, uint64_t offset, const void* buf, uint64_t len)
 {
     auto* pp = static_cast<PartitionPriv*>(dev->priv);
-    if (offset + len > pp->lengthBytes)
-        len = pp->lengthBytes - offset;
-    return DeviceWrite(pp->parent, pp->startByte + offset, buf, len);
+    uint64_t physical,amount;
+    if(!PartitionIoSpan(pp->startByte,pp->lengthBytes,offset,len,physical,amount))return -22;
+    return DeviceWrite(pp->parent,physical,buf,amount);
 }
 
 static uint64_t PartBlockCount(Device* dev)
@@ -108,7 +109,7 @@ static bool GuidEquals(const GptGuid& a, const GptGuid& b)
            *(uint64_t*)a.data4 == *(uint64_t*)b.data4;
 }
 
-uint32_t GptProbeDevice(Device* parentDev)
+uint32_t GptProbeDevice(Device* parentDev,bool includeEsp)
 {
     if (!parentDev || !parentDev->ops || !parentDev->ops->read)
         return 0;
@@ -153,14 +154,18 @@ uint32_t GptProbeDevice(Device* parentDev)
 
     for (uint32_t i = 0; i < entryCount && s_partPoolNext < PART_POOL_SIZE; ++i)
     {
+        if(uint64_t(i)*entrySize+sizeof(GptEntry)>static_cast<uint64_t>(n))break;
         auto* entry = reinterpret_cast<GptEntry*>(entryBuf + i * entrySize);
+        const uint64_t sectors=DeviceBlockCount(parentDev)*(DeviceBlockSize(parentDev)/512);
+        if(entry->startLba>entry->endLba || entry->endLba>=sectors ||
+           entry->endLba>~uint64_t{0}/512-1)continue;
 
         // Skip empty entries.
         if (GuidIsZero(entry->typeGuid))
             continue;
 
         // Skip the EFI System Partition (bootloader-only, kernel doesn't need it).
-        if (GuidEquals(entry->typeGuid, GPT_TYPE_EFI_SYSTEM))
+        if (!includeEsp && GuidEquals(entry->typeGuid, GPT_TYPE_EFI_SYSTEM))
             continue;
 
         partIdx++;
@@ -201,6 +206,27 @@ uint32_t GptProbeDevice(Device* parentDev)
         }
     }
 
+    return registered;
+}
+
+uint32_t MbrProbeDevice(Device* parentDev) {
+    if(!parentDev || parentDev->type!=DeviceType::Block || !parentDev->ops || !parentDev->ops->read)return 0;
+    const uint64_t blocks=DeviceBlockCount(parentDev);const uint32_t blockSize=DeviceBlockSize(parentDev);
+    if(blockSize<512 || blocks>~uint64_t{0}/blockSize)return 0;
+    uint8_t sector[512];if(parentDev->ops->read(parentDev,0,sector,512)!=512)return 0;
+    MbrPartition parts[4];const int count=MbrPartitions(sector,blocks*(blockSize/512),parts);
+    if(count<=0)return 0;
+    uint32_t registered=0;
+    for(int i=0;i<count && s_partPoolNext<PART_POOL_SIZE;++i) {
+        const uint32_t slot=s_partPoolNext++;
+        auto& pp=s_partPool[slot];pp.parent=parentDev;pp.startByte=parts[i].first*512;pp.lengthBytes=parts[i].count*512;
+        unsigned n=0;while(parentDev->name[n] && n<10){pp.name[n]=parentDev->name[n];++n;}
+        pp.name[n++]='p';pp.name[n++]='1'+i;pp.name[n]=0;
+        auto& device=s_partDevices[slot];device={reinterpret_cast<const DeviceOps*>(&s_partOps),pp.name,DeviceType::Block,&pp};
+        if(DeviceRegister(&device)) {
+            ++registered;SerialPrintf("mbr: %s LBA=%lu sectors=%lu\n",pp.name,parts[i].first,parts[i].count);
+        }
+    }
     return registered;
 }
 
