@@ -1021,3 +1021,20 @@ owner/root/bounds/EFAULT/stale checks, capture contention/expiry and acquiring a
 new frame while another binary screenshot download is paused. Terra inspected
 the generated PNG: coherent desktop/colors and legible console, with some long
 console lines clipped by its viewport. Hardware deployment is the next gate.
+
+Physical acceptance subsequently passed as generation5/slotA: changed boot ID
+and expected initrd payload verified, with previous working slotB retained.
+`build/hardware/dell-bulk-update-20261030/receipt.json` records activation/reset.
+The native binary capture returned3200x1800 /23040000 packed BGRA bytes with
+verified SHA256; the default result kept only its local PNG. Terra inspected
+that actual Dell image and found coherent colors/layout without gross corruption.
+The kernel console font remains small and some long lines clip, as already
+tracked separately. Native screenshot and receipt are under
+`build/hardware/dell-bulk-acceptance-20261030/screenshot`.
+
+The same actual Dell then passed a2056458-byte upload/download round trip via
+the MCP `call_tool` adapter. Both responses were metadata-only and under8KiB;
+the downloaded SHA256 matched the source. End-to-end times were10.09s upload
+and8.19s download, including job startup and polling—not wire-throughput numbers.
+Evidence: `dell-bulk-acceptance-20261030/roundtrip-result.json` and the retained
+MCP responses. The scanner uses the exact accepted bulk-payload kernel ELF.
