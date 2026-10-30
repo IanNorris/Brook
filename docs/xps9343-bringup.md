@@ -624,3 +624,41 @@ run the existing nonce/header scratch refusal and write/fsync gate on the Dell,
 restart, verify the scratch bytes, then test remote upload and guarded restart.
 A different guest boot epoch and the new initrd payload ID are the acceptance
 proof; an activation acknowledgement or kernel build string alone is not.
+
+### Host update orchestration and first physical write gate
+
+`scripts/hardware_update_device.py` starts the boot-pinned RAM receiver and saves
+all source hashes, transaction ID and power request ID before mutation. Its
+output directory is exclusive and cannot be reused. Activation and restart are
+explicit flags. A restart requires a declared expected initrd payload ID; the
+host observes a changed epoch, attaches a new session and runs HWSTATUS there
+before reporting `boot_verified`. A lost activation reply leaves a durable
+`needs_inspection` receipt and never triggers a restart. A lost reset reply is
+observed, never replayed. Reuse the recorded IDs to inspect uncertain delivery.
+
+Twelve dependency-injected state tests cover staged-only/activated operation,
+single-ID restart, missing reset acknowledgement, unchanged boot, wrong payload,
+lost upload reply, mismatched job receipt, stale session, unsupported reset,
+existing receipt and invalid key. Actual end-to-end live reset passed in
+`build/hardware/update-workflow-vm-20261030/result.json`; QEMU stayed alive while
+the guest's validated ACPI register reset it and the new payload was confirmed.
+
+The first physical maintenance boot was confirmed at 192.168.85.106 with payload
+`maintenance-bootstrap-5501ac9ce3064efc92a4718e7ad76d71`. Wrong-nonce refusal and
+initial zero-data verification passed. The 1 MiB scratch write reached fsync,
+which returned EIO. The USB driver logged CSW command failure status1/residue0;
+it did not yet include the original opcode or sense. No update activation was
+attempted, and no kernel/initrd slot changed. Evidence is in
+`build/hardware/dell-update-maintenance-20261030`.
+
+This is a device durability gate, not proof that SYNCHRONIZE CACHE is
+unsupported. The next driver reports original command/sense, distinguishes
+transport from command failure, and parses current cache mode data. Only current
+ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE (05/20/00) plus an explicit,
+complete WCE0 caching page permits treating unsupported flush as write-through.
+Unknown/malformed/missing cache data, deferred errors and all media/transport
+failures remain errors. Ordinary data I/O and CBW/CSW lengths stay exact; short
+IN is restricted to single-data-TRB diagnostics at most192 bytes. A stall still
+quarantines; no endpoint/BOT halt recovery is claimed. This policy is deliberately
+stricter than Linux's broad compatibility defaults and shutdown handling:
+[Linux SCSI disk implementation](https://github.com/torvalds/linux/blob/master/drivers/scsi/sd.c).
