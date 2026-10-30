@@ -20,6 +20,7 @@
 #include "net.h"
 #include "xhci_ownership.h"
 #include "xhci_root_port.h"
+#include "xhci_intel_routing.h"
 #include "xhci_msi.h"
 #include "xhci_completion_queue.h"
 #include "sync/kmutex.h"
@@ -3108,6 +3109,23 @@ static int XhciModuleInit()
 
     ctrl.initialized = true;
     g_controllerCount = 1;
+
+    struct RoutingIo {
+        const PciDevice& device;
+        uint32_t read(uint8_t offset){return PciConfigRead32(device.bus,device.dev,device.fn,offset);}
+        void write(uint8_t offset,uint32_t value){PciConfigWrite32(device.bus,device.dev,device.fn,offset,value);}
+    } routing{ctrl.pciDev};
+    XhciIntelRouteState route;
+    const uint32_t routeClass=(uint32_t(ctrl.pciDev.classCode)<<16)|(uint32_t(ctrl.pciDev.subclass)<<8)|ctrl.pciDev.progIf;
+    const auto routeResult=XhciEnableIntelRouting(ctrl.pciDev.vendorId,ctrl.pciDev.deviceId,routeClass,routing,route);
+    if(routeResult!=XhciIntelRouteResult::NotApplicable) {
+        KPrintf("xhci: Intel routing result=%u USB2=%08x->%08x mask=%08x SS=%08x->%08x mask=%08x\n",
+            static_cast<unsigned>(routeResult),route.usb2Before,route.usb2After,route.usb2Mask,
+            route.ssBefore,route.ssAfter,route.ssMask);
+        KPrintf("xhci: Intel read-only port-disable overrides USB2=%08x SS=%08x\n",routing.read(0xe4),routing.read(0xe8));
+        if(route.usb2Before==route.usb2After && route.ssBefore==route.ssAfter)
+            KPuts("xhci: Intel no routing change; connectivity still requires port evidence\n");
+    }
 
     // Small delay for port status to settle
     for (volatile int d = 0; d < 1000000; d++);

@@ -2,6 +2,7 @@
 #include <cassert>
 #include "../../drivers/xhci/xhci_msi.h"
 #include "../../drivers/xhci/xhci_root_port.h"
+#include "../../drivers/xhci/xhci_intel_routing.h"
 #include <vector>
 #include <map>
 struct Registers {
@@ -24,7 +25,27 @@ struct RootPort {
         value=(value&~((15u<<5)|(1u<<9)|(3u<<14)|(7u<<25)))|brook::XhciPortPersistent(v);
         value&=~(v&(1u<<21));if(v&(1u<<4))value|=1u<<4;}
 };
+struct Routing {
+    std::map<unsigned,unsigned> values{{0xd0,0x80000002},{0xd4,0x15},{0xd8,0x40000001},{0xdc,0xa}};
+    std::vector<std::pair<unsigned,unsigned>> writes;unsigned reads=0,ignoreOffset=0;bool ignore=false;
+    uint32_t read(unsigned offset){++reads;return values.at(offset);}
+    void write(unsigned offset,unsigned value){assert(offset==0xd8 || offset==0xd0);writes.push_back({offset,value});if(!ignore && offset!=ignoreOffset)values[offset]=value;}
+};
 int main(){
+    brook::XhciIntelRouteState route{};Routing routing;
+    assert(brook::XhciEnableIntelRouting(0x1b36,0x000d,0x0c0330,routing,route)==brook::XhciIntelRouteResult::NotApplicable && !routing.reads && routing.writes.empty());
+    assert(brook::XhciEnableIntelRouting(0x8086,0x1234,0x0c0330,routing,route)==brook::XhciIntelRouteResult::NotApplicable && !routing.reads);
+    assert(brook::XhciEnableIntelRouting(0x8086,0x9cb1,0x0c0330,routing,route)==brook::XhciIntelRouteResult::Ready);
+    assert((routing.writes==std::vector<std::pair<unsigned,unsigned>>{{0xd8,0x4000000b},{0xd0,0x80000017}}));
+    routing.writes.clear();assert(brook::XhciEnableIntelRouting(0x8086,0x9cb1,0x0c0330,routing,route)==brook::XhciIntelRouteResult::Ready && routing.writes.empty());
+    Routing wrongClass;assert(brook::XhciEnableIntelRouting(0x8086,0x9cb1,0x0c0320,wrongClass,route)==brook::XhciIntelRouteResult::NotApplicable && !wrongClass.reads);
+    Routing unavailable;unavailable.values[0xdc]=~0u;assert(brook::XhciEnableIntelRouting(0x8086,0x9cb1,0x0c0330,unavailable,route)==brook::XhciIntelRouteResult::Unavailable && unavailable.writes.empty());
+    Routing denied;denied.values[0xd4]=denied.values[0xdc]=0;assert(brook::XhciEnableIntelRouting(0x8086,0x9cb1,0x0c0330,denied,route)==brook::XhciIntelRouteResult::Ready && denied.writes.empty());
+    Routing failed;failed.ignore=true;assert(brook::XhciEnableIntelRouting(0x8086,0x9cb1,0x0c0330,failed,route)==brook::XhciIntelRouteResult::NotLatched && failed.writes.size()==1 && failed.writes[0].first==0xd8 && failed.values[0xd0]==0x80000002);
+    Routing partial;partial.ignoreOffset=0xd0;
+    assert(brook::XhciEnableIntelRouting(0x8086,0x9cb1,0x0c0330,partial,route)==brook::XhciIntelRouteResult::NotLatched && partial.writes.size()==2 && partial.values[0xd8]==0x4000000b && partial.values[0xd0]==0x80000002);
+    Routing reserved;reserved.values[0xd4]|=0x10000000;reserved.values[0xdc]|=0x10000000;
+    assert(brook::XhciEnableIntelRouting(0x8086,0x9cb1,0x0c0330,reserved,route)==brook::XhciIntelRouteResult::Ready && (reserved.values[0xd0]&0x10000000)==0 && (reserved.values[0xd8]&0x10000000)==0);
     static_assert(!(brook::XhciPortPersistent(~0u)&((1u<<1)|(1u<<4)|(1u<<16)|(127u<<17)|(1u<<31))));
     RootPort port;auto persistent=brook::XhciPortPersistent(port.value);
     assert(brook::XhciResetRootPort(port,1000) && port.tick==50 && (port.value&2));

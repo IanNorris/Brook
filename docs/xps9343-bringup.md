@@ -302,6 +302,30 @@ traffic and continuing storage/keyboard operation after NIC removal. Evidence:
 `build/hardware/root-port-ecm-20261030/result.json`. Physical acceptance of the
 new root-port handling remains pending.
 
+The following Dell boot reported PCI `8086:9cb1`, with all 15 ports at
+`PORTSC=0x000002a0` both before power and after settling. Thus PP was already
+set, but no connection was visible. Root-port fixes alone did not restore
+physical discovery.
+
+A narrowly gated Intel routing step now runs before any Brook USB enumeration,
+only for `8086:9cb1` with the xHCI PCI class. Intel's
+[9-series PCH datasheet, sections 16.1.36–39](https://www.intel.com/content/dam/www/public/us/en/documents/datasheets/9-series-chipset-pch-datasheet.pdf)
+documents USB2 routing at D0/D4 and SuperSpeed visibility at D8/DC. The driver
+preflights all four registers, preserves existing selector bits, and enables
+only firmware-permitted bits within the documented fields. It enables
+SuperSpeed first and verifies readback before switching USB2 routing. Failed
+readback stops further changes; there is no speculative rollback. Permission
+masks and write-once port-disable overrides are never written. Override values
+are reported read-only, together with routing before/after/mask values.
+
+Host tests cover unsupported devices/classes with no register access, missing
+registers, denied permissions, reserved fields, unchanged routes, failed
+SuperSpeed readback blocking USB2 writes, and partial routing without rollback.
+QEMU's generic controller remains unaffected; full USB Ethernet/storage/HID
+acceptance passes in `build/hardware/intel-route-ecm-20261030/result.json`.
+Only the next physical before/after port evidence can establish whether routing
+explains the Dell failure; `0x2a0` by itself does not prove it.
+
 ### Validated reset and graceful manual power-off
 
 Power handling now separates graceful quiescence, reset and automatic power-off.
