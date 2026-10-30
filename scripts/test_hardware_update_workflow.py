@@ -103,6 +103,15 @@ class Tests(unittest.TestCase):
         self.execute();self.bridge.calls.clear()
         with self.assertRaises(FileExistsError):self.execute()
         self.assertEqual(self.bridge.calls,[])
+    def test_configured_boot_observation_timeout_never_replays(self):
+        self.bridge.boot_changes=False
+        run=UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep)
+        with self.assertRaises(TimeoutError):
+            run.execute('original',self.key,self.kernel,self.initrd,True,True,'candidate',boot_timeout_s=3)
+        self.assertLess(self.clock.now,5)
+        self.assertEqual(sum(x[0]=='power' and x[3]=='commit' for x in self.bridge.calls),1)
+        self.assertEqual(self.receipt()['boot_timeout_s'],3)
+
     def test_invalid_key_never_launches(self):
         self.key.write_text('secret\n')
         with self.assertRaises(ValueError):self.execute()

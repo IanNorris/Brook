@@ -33,7 +33,8 @@ class UpdateRun:
             self.sleep(.1)
         raise TimeoutError('Inspect original guest job '+ident)
 
-    def execute(self,session,key_file,kernel_path,initrd_path,activate=False,restart=False,expected_payload_id=None,port=1235):
+    def execute(self,session,key_file,kernel_path,initrd_path,activate=False,restart=False,expected_payload_id=None,port=1235,boot_timeout_s=120):
+        if isinstance(boot_timeout_s,bool) or not isinstance(boot_timeout_s,int) or not 1<=boot_timeout_s<=900:raise ValueError('Boot observation timeout must be 1..900 seconds')
         if restart and (not activate or not expected_payload_id):raise ValueError('Restart requires activation and an expected payload ID')
         if expected_payload_id and (not re.fullmatch(r'[a-zA-Z0-9_.-]{1,95}',expected_payload_id)):raise ValueError('Invalid expected payload ID')
         if isinstance(port,bool) or not isinstance(port,int) or not 1<=port<=65535:raise ValueError('Invalid upload port')
@@ -49,7 +50,7 @@ class UpdateRun:
         self.output.mkdir(parents=True,exist_ok=False,mode=0o700)
         tx=uuid.uuid4().hex;power_id=uuid.uuid4().hex
         self.save(state='prepared',session=session,guest_boot_id=boot,transaction_id=tx,power_request_id=power_id,
-            activate_requested=activate,restart_requested=restart,expected_payload_id=expected_payload_id,
+            activate_requested=activate,restart_requested=restart,expected_payload_id=expected_payload_id,boot_timeout_s=boot_timeout_s,
             kernel={'path':str(Path(kernel_path).resolve()),'bytes':len(kernel),'sha256':hashlib.sha256(kernel).hexdigest()},
             initrd={'path':str(Path(initrd_path).resolve()),'bytes':len(initrd),'sha256':hashlib.sha256(initrd).hexdigest()})
         try:
@@ -83,7 +84,7 @@ class UpdateRun:
                 # The reset can drop its own acknowledgement. Observe, do not replay.
                 self.save(commit_reply_missing=True)
             self.save(state='awaiting_new_boot')
-            end=self.clock()+120;fresh=None
+            end=self.clock()+boot_timeout_s;fresh=None
             while self.clock()<end:
                 observed=self.bridge.doctor(session)
                 if observed.get('reachable') and observed.get('identity_matches') is False:

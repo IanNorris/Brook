@@ -839,3 +839,29 @@ execution after source overwrite/detach, bad hash, short source, low memory and
 unconfigured snapshot. Each checks the proc report and boot-pinned hardware caps
 against actual publication. Eleven hardware-bridge contract tests pass,
 including API-supported-but-not-ready and legacy-no-API behavior.
+
+### First successful physical remote update
+
+Physical v5 recovered the stalled CSW, completed MODE SENSE and **reported WCE0**
+(mode1,68 relevant bytes). The assumed-write-through compatibility branch was
+not needed for this SanDisk. The explicit scratch nonce/zero controls passed,
+then1MiB write/fsync succeeded. A bridge-requested checked ACPI reset returned
+with a different boot identity and the complete scratch pattern verified.
+Evidence: `build/hardware/dell-csw-recovery-v5-20261030/scratch-result.json`.
+
+The first actual network kernel/initrd update then passed: generation2, slot B,
+checked restart, changed boot ID and expected distinct initrd identity. This
+smoke test deliberately used the same accepted kernel while exercising both
+slot writes, validation and selection. It is not yet physical acceptance of a
+newly built kernel or the full RAM desktop. The complete durable receipt is
+`build/hardware/dell-first-remote-update-20261030/workflow/receipt.json`.
+
+The user reported that the stick was not recognized in its previous USB port;
+swapping it with Ethernet made both work. Preserve that arrangement for these
+comparisons and track the port/firmware-enumeration issue separately. The cause
+is not established by this successful boot.
+
+The host updater now accepts `--boot-timeout-s` (default120, range1..900) for
+slower physical image loads. This changes only observation of the original
+restart; it never repeats activation/reset. Thirteen workflow tests pass,
+including a short configured deadline that still sends commit exactly once.
