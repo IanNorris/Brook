@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Exercise the production SSD-store snapshot helper on private QEMU media.
+
+The source must be a stopped regular-file Dell-capacity QEMU fixture. A
+reflink clone is placed in maintenance mode by removing its store admission
+record from the clone's initrd; no physical device or user image is modified.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge'), str(ROOT / 'scripts')]
+from hardware import Hardware
+from hardware_bulk_protocol import download
+from test_hardware_power import Qmp
+
+
+def run(*args):
+    subprocess.run([str(x) for x in args], cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+
+
+def sha(path):
+    with path.open('rb') as f:
+        return hashlib.file_digest(f, 'sha256').hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for option in ('fixture', 'snapshot-helper', 'store', 'key-file', 'output'):
+        parser.add_argument('--' + option, required=True, type=Path)
+    a = parser.parse_args()
+    if a.fixture.is_symlink() or not a.fixture.is_file() or a.fixture.stat().st_size != 500118192 * 512:
+        raise ValueError('expected a stopped Dell-capacity regular-file QEMU fixture')
+    out = a.output.absolute(); out.mkdir(parents=True, exist_ok=False, mode=0o700)
+    disk = out / 'sata.raw'; run('cp', '--reflink=always', a.fixture, disk)
+    media = str(disk) + '@@1048576'; initrd = out / 'initrd.img'
+    run('mcopy', '-i', media, '::INITRD.IMG', initrd)
+    run('mdel', '-i', initrd, '::ETC/writable-desktop')
+    run('mcopy', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
+    run('mcopy', '-o', '-i', media, initrd, '::INITRD.IMG')
+    variables = out / 'VARS.fd'; shutil.copy2(os.environ['OVMF_VARS'], variables); variables.chmod(0o600)
+    ports = []
+    for _ in range(2):
+        with socket.socket() as s:
+            s.bind(('127.0.0.1', 0)); ports.append(s.getsockname()[1])
+    argv = ['qemu-system-x86_64', '-machine', 'q35', '-accel', 'kvm', '-cpu', 'host', '-smp', '4', '-m', '4096', '-nodefaults',
+            '-drive', 'if=pflash,format=raw,readonly=on,file=' + os.environ['OVMF_CODE'],
+            '-drive', 'if=pflash,format=raw,file=' + str(variables), '-device', 'VGA,vgamem_mb=64',
+            '-drive', f'if=none,id=sata,format=raw,file={disk}',
+            '-device', 'ide-hd,drive=sata,bus=ide.0,bootindex=1,serial=BROOK-SYSTEM-TEST01',
+            '-device', 'qemu-xhci,id=usbc', '-device', 'usb-net,bus=usbc.0,port=2,netdev=network',
+            '-netdev', f'user,id=network,restrict=on,hostfwd=tcp:127.0.0.1:{ports[0]}-:1234,hostfwd=tcp:127.0.0.1:{ports[1]}-:1236',
+            '-display', 'none', '-serial', 'file:' + str(out / 'serial.log'),
+            '-qmp', 'unix:' + str(out / 'qmp.sock') + ',server=on,wait=off', '-no-reboot']
+    (out / 'argv.json').write_text(json.dumps(argv, indent=2) + '\n')
+    with (out / 'qemu.log').open('x') as log:
+        owner = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        qmp = None
+        try:
+            deadline = time.monotonic() + 360
+            while time.monotonic() < deadline:
+                if owner.poll() is not None:
+                    raise RuntimeError('QEMU exited during maintenance boot')
+                serial = (out / 'serial.log').read_text(errors='replace') if (out / 'serial.log').exists() else ''
+                if 'PANIC_HEX:' in serial:
+                    raise RuntimeError('guest panic during maintenance boot')
+                if 'HARDWARE_NETWORK_READY' in serial and 'DEBUG_TCP: listening' in serial:
+                    break
+                time.sleep(.2)
+            else:
+                raise TimeoutError('maintenance boot did not reach debug interface')
+            h = Hardware(out / 'registry'); attached = h.attach('127.0.0.1', ports[0]); s = attached['session']
+            caps = h.command(s, 'bridge hardware caps')
+            assert not caps['writable_desktop']['ready'] and not caps['writable_desktop']['source_pinned']
+            assert 'ahci system: verified GPT entry' in serial and 'writable desktop: ready' not in serial
+            tx = uuid.uuid4().hex
+            h.guest_run(s, tx, ['/boot/HWSNAP.ELF', attached['guest_boot_id'], tx, 'get', uuid.uuid4().hex],
+                        cwd='/tmp', uid=0, wait_s=2)
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                job = h.job(s, tx, wait_s=2)
+                if 'HWBULK_LISTENING' in job.get('stdout', {}).get('text', ''):
+                    break
+                if job['state'] in ('completed', 'failed', 'lost', 'rejected'):
+                    raise RuntimeError('snapshot helper did not listen')
+            else:
+                raise TimeoutError('inspect original snapshot job ' + tx)
+            key = a.key_file.read_text()[:32]
+            result = download('127.0.0.1', ports[1], key, attached['guest_boot_id'], tx,
+                              out / 'snapshot.img', max_bytes=4026531840, timeout=3600)
+            job = h.job(s, tx, wait_s=20)
+            assert job.get('exit', {}).get('code') == 0
+            assert result['guest_path'] == '/media/system/STORE.IMG'
+            assert sha(out / 'snapshot.img') == result['sha256'] == sha(a.store)
+            request = uuid.uuid4().hex; state = h.power(s, request, 'shutdown'); deadline = time.monotonic() + 120
+            while state['state'] != 'ready':
+                if state['state'] in ('failed', 'unsupported') or time.monotonic() >= deadline:
+                    raise RuntimeError('shutdown did not reach ready')
+                time.sleep(.2); state = h.power(s, request, 'status')
+            qmp = Qmp(out / 'qmp.sock'); qmp.call('quit'); assert owner.wait(timeout=15) == 0
+            (out / 'result.json').write_text(json.dumps({'passed': True, 'store_mounted': False,
+                'independent_readback_sha256': result['sha256'], 'checked_shutdown': True}, indent=2) + '\n')
+            print('SYSTEM_STORE_SNAPSHOT_QEMU_PASS', flush=True)
+        finally:
+            if qmp:
+                qmp.close()
+            if owner.poll() is None:
+                owner.terminate(); owner.wait(timeout=15)
+
+
+if __name__ == '__main__':
+    main()

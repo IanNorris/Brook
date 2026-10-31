@@ -72,7 +72,11 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   that worked in a QEMU desktop with `/nix` is therefore not valid on the
   current Dell maintenance boot. A separate recovery initrd is being prepared
   with a fixed-path, read-only system-store snapshot helper; host and QEMU
-  transfer tests passed. No physical recovery write has been attempted.
+  transfer tests passed. The production helper also passed a full 3.75 GiB
+  snapshot from an unmounted store on a private QEMU SATA system volume, with
+  independent host readback (`system-store-snapshot-qemu-v2-20261031`). This
+  does not establish physical SSD snapshot or repair behavior. No physical
+  recovery write has been attempted.
 
 ## Remaining engineering gates
 
