@@ -12,6 +12,7 @@
 #include "vfs.h"
 #include "pci.h"
 #include "display_power.h"
+#include "ahci_observe.h"
 #include "writable_desktop.h"
 namespace brook {
 namespace {
@@ -84,6 +85,23 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
     }
     constexpr char pciPrefix[]="bridge hardware pci ";
+    if(!strcmp(command,"bridge hardware ahci")) {
+        const auto& a=AhciObserveRead();Reply r;
+        r.text("{\"ahci_observe_api\":1,\"requested\":");r.text(a.requested?"true":"false");
+        r.text(",\"valid\":");r.text(a.valid?"true":"false");r.text(",\"reason\":");r.quoted(a.reason);
+        r.text(",");r.field("controller_count",a.controllerCount);r.text(",");r.field("vendor",a.vendor);
+        r.text(",");r.field("device",a.device);r.text(",");r.field("bus",a.bus);
+        r.text(",");r.field("slot",a.slot);r.text(",");r.field("function",a.function);
+        r.text(",");r.field("bar",a.bar);r.text(",");r.field("capability",a.capability);
+        r.text(",");r.field("implemented",a.implemented);r.text(",");r.field("version",a.version);
+        r.text(",\"ports\":[");
+        for (uint32_t i=0;i<a.portCount;++i) {
+            const auto& p=a.ports[i];if(i)r.text(",");r.text("{");r.field("index",p.index);
+            r.text(",");r.field("status",p.status);r.text(",");r.field("signature",p.signature);
+            r.text(",");r.field("command",p.command);r.text(",");r.field("task_file",p.taskFile);r.text("}");
+        }
+        r.text("]}\n");r.send();return true;
+    }
     constexpr char backlightPrefix[]="bridge hardware backlight ";
     if(Prefix(command,backlightPrefix)){
         const char* p=command+sizeof(backlightPrefix)-1;bool ok=true;

@@ -1811,3 +1811,39 @@ After that update the user retried Galculator through App Gallery and confirmed
 it installed and launched. The physical bridge independently observed a
 `galculator` window and the new Galculator launcher entry. Browser HTTPS,
 interactive use, downloads and clean relaunch remain separate acceptance gates.
+
+### Internal SSD direction and read-only AHCI observation (2026-10-31)
+
+The user has asked to move Brook onto the internal SSD. The Dell's boot PCI
+inventory identifies Intel 8086:9c83 SATA AHCI; no Brook AHCI disk driver is
+present yet. The existing GPT probe is not sufficient to decide an install
+layout because it does not validate GPT CRCs. The intended progression is a
+read-only AHCI driver and disk inventory, followed by a layout based on the
+actual contents and a QEMU-tested installer. Preserve the existing SSD contents
+and the USB recovery path; a specific layout and any destructive operation must
+be settled from real inventory rather than assuming that the disk is empty.
+
+An opt-in `/etc/ahci-observe` boot probe snapshots only PCI/AHCI controller and
+port registers. It issues no ATA command, enables no bus mastering, and does
+not mount or read an SSD. Where memory decode was initially off, it temporarily
+sets only that PCI command bit and restores the original command. It refuses
+unavailable or mismatched readbacks, active bus mastering with decode disabled,
+unsafe MMIO ranges, and port layouts beyond its bounded register page. The
+hardware bridge exposes `bridge hardware ahci` as an immutable boot snapshot.
+The controller/port report is not SSD identity or partition information.
+
+Host tests cover PCI command preservation and fail-closed cases. A private QEMU
+SATA fixture reports an attached port with the probe enabled, while a separate
+boot confirms the probe remains disabled without its marker. The fixture's
+source SHA256 is unchanged after both QEMU runs. The exact full writable
+candidate additionally passed QEMU store creation, checked shutdown, fresh
+boot and ext2 checking. The physical Dell register snapshot remains pending.
+
+A separate bounded GPT validator checks primary/backup header and entry CRCs,
+geometry, matching copies, partition bounds and overlaps, and classifies a
+protective or hybrid MBR. Its host tests include an independently generated
+`sfdisk` GPT fixture. Invalid, missing or hybrid MBR classifications must never
+be treated as automatic permission to change a layout. A pure AHCI IDENTIFY /
+READ DMA EXT command planner is tested but is not yet connected to a driver or
+submitted to any hardware. Read-only controller ownership, DMA lifetime and
+actual sector reads are the next work; no internal SSD write has occurred.

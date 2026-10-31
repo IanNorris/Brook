@@ -25,6 +25,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "device.h"
 #include "pci.h"
 #include "display_power.h"
+#include "ahci_observe.h"
 #include "ramdisk.h"
 #include "fatfs_glue.h"
 #include "vfs.h"
@@ -723,6 +724,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     // If found, the drive is mounted at that path automatically.
     // Drives without BROOK.MNT are registered but not auto-mounted.
     brook::PciScanPrint();
+    brook::AhciObserveConfigure(bootProtocol);
     brook::DisplayPowerConfigure(bootProtocol);
     uint32_t vioCount = brook::VirtioBlkInitAll();
     // Shared pdrv counter: 0 = ramdisk, 1+ = everything else.

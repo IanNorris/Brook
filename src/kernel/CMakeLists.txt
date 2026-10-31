@@ -265,6 +265,7 @@ add_executable(kernel
     src/vdso.cpp
     src/display.cpp
     src/display_power.cpp
+    src/ahci_observe.cpp
     src/gpu_compositor.cpp
     src/frame_timing.cpp
     src/gpu_app.cpp

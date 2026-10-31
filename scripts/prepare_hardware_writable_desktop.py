@@ -26,6 +26,7 @@ def main():
     p.add_argument('--waylandd',type=Path)
     p.add_argument('--display-idle-seconds',type=int,default=300)
     p.add_argument('--tcp-egress-1200',action='store_true',help='Enable a temporary 1200-byte TCP payload ceiling for a known path-MTU problem')
+    p.add_argument('--ahci-observe',action='store_true',help='Opt in to the boot-time read-only AHCI register snapshot')
     p.add_argument('--build',type=Path,default=ROOT/'build/release')
     p.add_argument('--output',required=True,type=Path)
     a=p.parse_args();store=a.store.resolve(strict=True);out=a.output.absolute()
@@ -45,9 +46,13 @@ def main():
     if a.tcp_egress_1200:
         marker=out/'tcp-egress-1200';marker.write_text('1\n')
         subprocess.run(['mcopy','-o','-i',str(out/'INITRD.IMG'),str(marker),'::ETC/tcp-egress-1200'],check=True,cwd=ROOT)
+    if a.ahci_observe:
+        marker=out/'ahci-observe';marker.write_text('1\n')
+        subprocess.run(['mcopy','-o','-i',str(out/'INITRD.IMG'),str(marker),'::ETC/ahci-observe'],check=True,cwd=ROOT)
     manifest=json.loads((out/'manifest.json').read_text())
     manifest.update(scope='Writable desktop preferred; accepted immutable RAM fallback',
         ephemeral_home=False,mutable_usb_application_mount=True,tcp_egress_ceiling=1200 if a.tcp_egress_1200 else 1460,
+        ahci_observe=a.ahci_observe,
         home_persistence='persistent only after writable-store admission; RAM fallback remains volatile',
         writable_desktop={'source':'/media/usb/STORE.IMG','readiness':'/media/usb/STORE.OK',
             'bytes':m['bytes'],'uuid':m['uuid'],'initial_sha256':m['sha256'],
