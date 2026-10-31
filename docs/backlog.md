@@ -4,7 +4,8 @@
 
 Physical XPS13 9343 observation: after idle display-off, pressing Fn restores
 the backlight but leaves the image black. A subsequent ordinary key press or
-touchpad movement restores the image. Normal keyboard wake already passed.
+touchpad movement restores the image. The Windows key produces the same
+backlight-only wake; Ctrl restores the image. Normal keyboard wake already passed.
 Investigate firmware/EC backlight restoration versus Brook's display-idle/input
 sequence and redraw state; a modifier-recognition difference is a hypothesis,
 not an established cause. Capture PWM/policy/input/frame state around Fn and
