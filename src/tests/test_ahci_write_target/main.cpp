@@ -15,6 +15,11 @@ int main() {
     ++t.sectors;assert(!matches());--t.sectors;++t.logical;assert(!matches());--t.logical;
     ++t.physical;assert(!matches());--t.physical;info.model[0]='?';assert(!matches());info.model[0]='Q';
     info.serial[0]='?';assert(!matches());info.serial[0]='B';assert(matches());
+    const std::string padded="BRKAHCI1\n32902,10530,0,31,2,0,131072,512,512\nQEMU HARDDISK\n      TEST-SERIAL\n";
+    AhciWriteTarget paddedTarget{};assert(AhciWriteTargetParse(padded.data(),padded.size(),paddedTarget));
+    strcpy(info.serial,"      TEST-SERIAL");assert(AhciWriteTargetMatches(paddedTarget,32902,10530,0,31,2,0,info,true));
+    strcpy(info.serial,"TEST-SERIAL");assert(!AhciWriteTargetMatches(paddedTarget,32902,10530,0,31,2,0,info,true));
+    strcpy(info.serial,"     TEST-SERIAL");assert(!AhciWriteTargetMatches(paddedTarget,32902,10530,0,31,2,0,info,true));
     auto bad=[&](const std::string& s){AhciWriteTarget x=t;assert(!AhciWriteTargetParse(s.data(),s.size(),x));assert(!x.sectors && !x.model[0] && !x.serial[0]);};
     bad("");bad(valid.substr(0,valid.size()-1));bad(valid+"extra\n");
     bad("BRKAHCI2\n32902,10530,0,31,2,0,131072,512,512\nQEMU HARDDISK\nBROOK-AHCI-TEST-01\n");

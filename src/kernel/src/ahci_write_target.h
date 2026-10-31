@@ -24,14 +24,14 @@ inline bool AhciTargetNumber(const char*& p,const char* end,uint64_t& value,char
     if(p==end || *p++!=delimiter)return false;
     return true;
 }
-inline bool AhciTargetText(const char*& p,const char* end,char* out,unsigned capacity) {
+inline bool AhciTargetText(const char*& p,const char* end,char* out,unsigned capacity,bool allowLeadingSpace=false) {
     unsigned n=0;
     while(p<end && *p!='\n') {
         const unsigned char c=static_cast<unsigned char>(*p++);
         if(c<32 || c>126 || c=='?' || n+1>=capacity)return false;
         out[n++]=char(c);
     }
-    if(!n || out[0]==' ' || out[n-1]==' ' || p==end)return false;
+    if(!n || (!allowLeadingSpace && out[0]==' ') || out[n-1]==' ' || p==end)return false;
     ++p;out[n]=0;return true;
 }
 inline bool AhciWriteTargetParse(const char* data,uint32_t length,AhciWriteTarget& target) {
@@ -46,7 +46,7 @@ inline bool AhciWriteTargetParse(const char* data,uint32_t length,AhciWriteTarge
        parsed.logical!=512 || parsed.physical<512 || parsed.physical>16777216 ||
        (parsed.physical&(parsed.physical-1)))return false;
     if(!AhciTargetText(p,end,parsed.model,sizeof(parsed.model)) ||
-       !AhciTargetText(p,end,parsed.serial,sizeof(parsed.serial)) || p!=end)return false;
+       !AhciTargetText(p,end,parsed.serial,sizeof(parsed.serial),true) || p!=end)return false;
     target=parsed;return true;
 }
 inline bool AhciWriteTargetMatches(const AhciWriteTarget& t,uint16_t vendor,uint16_t device,
