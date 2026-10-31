@@ -1810,6 +1810,24 @@ and no function at 00:13.0, a possible alternate SST discovery route described
 in the [FreeBSD hardware investigation](https://github.com/spagu/acpi_intel_sst/blob/main/docs/RESEARCH_FINDINGS.md).
 This does not establish physical absence; the function may be hidden. No PCI
 configuration writes or sideband transactions were performed.
+All eleven captured SSDTs disassembled individually, with no `ADSP`, `ADB0`,
+`ADB1` or `ADI0` references found in their output. The referenced FreeBSD
+investigation reports that this laptop can hide the SST PCI function in ACPI
+mode and that enabling it involves platform-specific configuration and power
+sequencing. Those observations suggest a lead, not the register state of this
+particular boot. Brook must not assume the example addresses or touch sideband
+registers until its own resources and ownership are established.
+
+A read-only classifier now checks the two I²C0 windows against the captured
+UEFI memory descriptors without mapping or reading them. Host tests cover
+adjacent spans, gaps, overflow, excessive/malformed descriptors and reset;
+invalid optional MMIO telemetry does not prevent ACPI boot. The exact candidate
+passed the private QEMU writable-desktop/reboot gate and was activated on the
+Dell (`dell-audio-mmio-update-20261031`). On that boot the classifier was valid,
+but neither 4 KiB I²C window was covered by a descriptor marked `Mmio`.
+This does not prove those addresses are unusable: the firmware map may omit or
+classify device resources differently. No I²C or SST device register has been
+mapped or read. Desktop storage was ready and SSD inventory remained read-only.
 
 ### Passive-open MSS and hardware transfer profile (2026-10-31)
 

@@ -53,6 +53,10 @@ static AcpiTableReader g_tables;
 struct FirmwareRegion {uint64_t begin,end;bool nvs;};
 static FirmwareRegion g_regions[512]{};
 static uint32_t g_regionCount=0;
+struct MmioRegion {uint64_t begin,end;};
+static MmioRegion g_mmioRegions[512]{};
+static uint32_t g_mmioRegionCount=0;
+static bool g_mmioMapValid=false;
 // The bootloader's identity map is bounded to 128 GiB. Firmware-table reads
 // additionally require reserved/ACPI memory from its captured memory map.
 static constexpr uint64_t IdentityLimit=128ULL*1024*1024*1024;
@@ -76,17 +80,29 @@ static bool ReadFirmware(void*,uint64_t address,void* out,uint32_t bytes)
 }
 static bool CaptureFirmwareRegions(const MemoryDescriptor* map,uint32_t count)
 {
-    g_regionCount=0;
+    g_regionCount=0;g_mmioRegionCount=0;g_mmioMapValid=false;
     if(!map || !count || count>4096)return false;
+    g_mmioMapValid=true;
     for(uint32_t i=0;i<count;++i) {
         const auto& entry=map[i];
-        if(entry.type!=MemoryType::Reserved && entry.type!=MemoryType::AcpiReclaimable && entry.type!=MemoryType::AcpiNvs)continue;
-        if(entry.pageCount>~uint64_t{0}/4096)return false;
+        if(entry.type!=MemoryType::Reserved && entry.type!=MemoryType::AcpiReclaimable && entry.type!=MemoryType::AcpiNvs && entry.type!=MemoryType::Mmio)continue;
+        if(entry.pageCount>~uint64_t{0}/4096) {
+            if(entry.type==MemoryType::Mmio){g_mmioMapValid=false;g_mmioRegionCount=0;continue;}
+            return false;
+        }
         const uint64_t bytes=entry.pageCount*4096;
-        if(bytes>~uint64_t{0}-entry.physicalStart)return false;
+        if(bytes>~uint64_t{0}-entry.physicalStart) {
+            if(entry.type==MemoryType::Mmio){g_mmioMapValid=false;g_mmioRegionCount=0;continue;}
+            return false;
+        }
         if(!bytes || entry.physicalStart>=IdentityLimit)continue;
-        if(g_regionCount==sizeof(g_regions)/sizeof(g_regions[0]))return false;
         const uint64_t end=entry.physicalStart+bytes;
+        if(entry.type==MemoryType::Mmio) {
+            if(!g_mmioMapValid)continue;
+            if(g_mmioRegionCount==sizeof(g_mmioRegions)/sizeof(g_mmioRegions[0])){g_mmioMapValid=false;g_mmioRegionCount=0;continue;}
+            g_mmioRegions[g_mmioRegionCount++]={entry.physicalStart,end<IdentityLimit?end:IdentityLimit};continue;
+        }
+        if(g_regionCount==sizeof(g_regions)/sizeof(g_regions[0]))return false;
         g_regions[g_regionCount++]={entry.physicalStart,end<IdentityLimit?end:IdentityLimit,entry.type==MemoryType::AcpiNvs};
     }
     return g_regionCount!=0;
@@ -129,13 +145,13 @@ bool AcpiInit(uint64_t rsdp,const MemoryDescriptor* map,uint32_t count)
 {
     g_madt={};g_reset={};g_tables={};
     if(!CaptureFirmwareRegions(map,count) || !g_tables.Init(ReadFirmware,nullptr,rsdp)) {
-        SerialPuts("ACPI: invalid/unreadable RSDP or root table\n");return false;
+        g_mmioMapValid=false;SerialPuts("ACPI: invalid/unreadable RSDP or root table\n");return false;
     }
     g_reset=g_tables.Reset();
     SerialPrintf("ACPI: reset available=%u port=0x%x value=0x%x reason=%s\n",g_reset.available?1u:0u,g_reset.port,g_reset.value,g_reset.reason);
     AcpiSdtHeader header{};const auto madt=g_tables.Find("APIC",&header);
     if(!madt || !ParseMadt(madt,header)) {
-        g_madt={};SerialPuts("ACPI: MADT missing or malformed\n");return false;
+        g_madt={};g_mmioMapValid=false;SerialPuts("ACPI: MADT missing or malformed\n");return false;
     }
     return true;
 }
@@ -143,6 +159,18 @@ const MadtInfo& AcpiGetMadt(){return g_madt;}
 const AcpiResetInfo& AcpiGetResetInfo(){return g_reset;}
 uint64_t AcpiFindTable(const char* signature){return g_tables.Find(signature);}
 bool AcpiNvsContains(uint64_t address,uint32_t bytes){return ContainsFirmware(address,bytes,true);}
+bool AcpiMmioMapValid(){return g_mmioMapValid;}
+bool AcpiMmioContains(uint64_t address,uint32_t bytes) {
+    if(!g_mmioMapValid || !bytes || address>=IdentityLimit || bytes>IdentityLimit-address)return false;
+    const uint64_t end=address+bytes;uint64_t cursor=address;
+    while(cursor<end) {
+        uint64_t next=cursor;
+        for(uint32_t i=0;i<g_mmioRegionCount;++i)
+            if(cursor>=g_mmioRegions[i].begin && cursor<g_mmioRegions[i].end && g_mmioRegions[i].end>next)next=g_mmioRegions[i].end;
+        if(next==cursor)return false;cursor=next<end?next:end;
+    }
+    return true;
+}
 bool AcpiNvsRead(uint64_t address,void* out,uint32_t bytes) {
     if(!out || bytes>8 || !AcpiNvsContains(address,bytes))return false;
     const auto* source=reinterpret_cast<const volatile uint8_t*>(address);auto* target=static_cast<uint8_t*>(out);

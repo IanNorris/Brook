@@ -16,9 +16,14 @@
 std::string reply,dispatched;
 unsigned powerCalls=0;std::string powerVerb;
 unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
+bool audioProbePresent=false;
 namespace brook {
-bool DellAudioProbeRead(DellAudioFirmwareSnapshot&,const char*& reason){reason="not provisioned";return false;}
+bool DellAudioProbeRead(DellAudioFirmwareSnapshot& out,const char*& reason){
+    reason=audioProbePresent?"ok":"not provisioned";out.i2cBase0=0xfe103000;out.i2cBase1=0xfe104000;return audioProbePresent;
+}
 uint32_t AcpiInventoryCount(){return 1;}
+bool AcpiMmioMapValid(){return true;}
+bool AcpiMmioContains(uint64_t address,uint32_t bytes){return address==0xfe103000 && bytes==4096;}
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& h){
     if(index || offset>1024 || bytes>1024-offset)return false;
     h={};h.length=1024;if(bytes)std::memset(out,0xab,bytes);return true;
@@ -105,6 +110,9 @@ int main(){
     }
     assert(handle("bridge hardware acpi-info") && reply.find("\"tables\":1")!=std::string::npos);
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"ok\":false")!=std::string::npos);
+    audioProbePresent=true;
+    assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"i2c_base0_mmio_declared\":true")!=std::string::npos &&
+           reply.find("\"i2c_base1_mmio_declared\":false")!=std::string::npos);
     assert(handle("bridge hardware acpi 0 4 2") && reply.find("\"hex\":\"abab\"")!=std::string::npos);
     assert(handle("bridge hardware acpi 0 0 512"));
     assert(reply.find("\"hex\":\""+[](){std::string s;for(int i=0;i<512;++i)s+="ab";return s;}()+"\"")!=std::string::npos);

@@ -102,6 +102,22 @@ int main(){
     assert(!AcpiNvsRead(Firmware::address(f.memory),nvsRead,9));
     assert(!AcpiNvsRead(Firmware::address(f.memory)+65535,nvsRead,2));
     assert(!AcpiNvsContains(~0ULL,8) && !AcpiNvsContains(Firmware::address(f.memory),0));
+    MemoryDescriptor classified[3]={f.map,{0xfe103000,1,MemoryType::Mmio,0},{0xfe104000,1,MemoryType::Reserved,0}};
+    assert(AcpiInit(Firmware::address(f.rsdp),classified,3));
+    assert(AcpiMmioMapValid());
+    assert(AcpiMmioContains(0xfe103000,4096) && AcpiMmioContains(0xfe103ffc,4));
+    assert(!AcpiMmioContains(0xfe103fff,2) && !AcpiMmioContains(0xfe104000,4096));
+    assert(!AcpiMmioContains(~0ull,2) && !AcpiMmioContains(0xfe103000,0));
+    classified[2].type=MemoryType::Mmio;assert(AcpiInit(Firmware::address(f.rsdp),classified,3));
+    assert(AcpiMmioContains(0xfe103000,8192));
+    classified[2].physicalStart=0xfe104001;assert(AcpiInit(Firmware::address(f.rsdp),classified,3));
+    assert(!AcpiMmioContains(0xfe103000,8192));
+    classified[2].pageCount=~0ull;assert(AcpiInit(Firmware::address(f.rsdp),classified,3));
+    assert(!AcpiMmioMapValid() && !AcpiMmioContains(0xfe103000,4096));
+    MemoryDescriptor many[514]{};many[0]=f.map;
+    for(unsigned i=1;i<514;++i)many[i]={0x800000000ull+uint64_t(i)*4096,1,MemoryType::Mmio,0};
+    assert(AcpiInit(Firmware::address(f.rsdp),many,514) && !AcpiMmioMapValid());
+    assert(f.init() && AcpiMmioMapValid() && !AcpiMmioContains(0xfe103000,4096));
     f.reset();assert(f.init());f.map={};assert(AcpiFindTable("FACP")==Firmware::address(f.fadt)); // boot map was copied
     for(auto length : {0,1,7,65}){f.reset();f.madt[45]=length;f.madtCrc();assert(!f.init());assert(!AcpiGetMadt().processorCount);}
     f.reset();Firmware::put32(f.madt+4,43);f.madtCrc(43);assert(!f.init());

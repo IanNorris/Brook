@@ -46,6 +46,9 @@ uint64_t AcpiFindTable(const char* signature);
 // consumers must select audited fields and never accept caller addresses.
 bool AcpiNvsContains(uint64_t address,uint32_t bytes);
 bool AcpiNvsRead(uint64_t address,void* out,uint32_t bytes);
+// Classification only: this never maps or reads the indicated device range.
+bool AcpiMmioMapValid();
+bool AcpiMmioContains(uint64_t address,uint32_t bytes);
 // Read-only AML inventory: index 0 is DSDT; subsequent indices select only
 // validated SSDT entries. No caller-supplied physical addresses.
 uint32_t AcpiInventoryCount();

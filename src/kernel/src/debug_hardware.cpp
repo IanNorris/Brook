@@ -107,6 +107,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",");r.field("i2c_irq",s.i2cIrq);r.text(",");r.field("dsp_base0",s.dspBase0);
             r.text(",");r.field("dsp_base1",s.dspBase1);r.text(",");r.field("dsp_irq",s.dspIrq);
             r.text(",");r.field("i2c_base0",s.i2cBase0);r.text(",");r.field("i2c_base1",s.i2cBase1);
+            r.text(",\"mmio_map_valid\":");r.text(AcpiMmioMapValid()?"true":"false");
+            r.text(",\"i2c_base0_mmio_declared\":");r.text((s.i2cBase0 && !(s.i2cBase0&4095) && AcpiMmioContains(s.i2cBase0,4096))?"true":"false");
+            r.text(",\"i2c_base1_mmio_declared\":");r.text((s.i2cBase1 && !(s.i2cBase1&4095) && AcpiMmioContains(s.i2cBase1,4096))?"true":"false");
         }
         r.text("}\n");r.send();return true;
     }
