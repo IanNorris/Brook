@@ -16,7 +16,8 @@ inline bool AppSnapshotParse(const char* text,uint32_t length,AppSnapshotPlan& o
     for(uint32_t i=0;i<end;i++)result.source[i]=text[i];
     auto equal=[](const char* a,const char* b){while(*a&&*a==*b){a++;b++;}return *a==*b;};
     if(!equal(result.source,"/media/usb/APPS.BRK")&&!equal(result.source,"/media/usb/UPDATES/A/APPS.BRK")&&
-       !equal(result.source,"/media/usb/UPDATES/B/APPS.BRK"))return false;
+       !equal(result.source,"/media/usb/UPDATES/B/APPS.BRK")&&
+       !equal(result.source,"/media/system/APPS.BRK"))return false;
     uint32_t cursor=end+1;
     if(length-cursor<6||text[cursor]!='/'||text[cursor+1]!='n'||text[cursor+2]!='i'||text[cursor+3]!='x'||text[cursor+4]!=' ')return false;
     cursor+=5;uint32_t digits=0;

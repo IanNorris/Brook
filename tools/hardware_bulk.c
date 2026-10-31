@@ -18,7 +18,13 @@
 #include "../src/shared/update/payload.h"
 #include "../src/shared/brook_debug_frame.h"
 #include "../src/shared/brook_ahci_export.h"
+#ifdef BROOK_BULK_INSTALL_MEDIA
+#define BULK_LIMIT (2ULL*1024*1024*1024)
+#define BULK_ROOT "/media/usb"
+#else
 #define BULK_LIMIT (1024ULL*1024*1024)
+#define BULK_ROOT "/data/.brook-transfer"
+#endif
 static uint64_t deadline_ms;
 static int sliding_deadline;
 static uint64_t now_ms(void){struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts))return UINT64_MAX;return (uint64_t)ts.tv_sec*1000+(uint64_t)ts.tv_nsec/1000000;}
@@ -44,7 +50,9 @@ static int hash_fd(int fd,uint64_t bytes,uint8_t hash[32]){
     BrookShaFinish(&context,hash);return lseek(fd,0,SEEK_SET)<0?-1:0;
 }
 static int directory_open(const char* path){
+#ifndef BROOK_BULK_INSTALL_MEDIA
     if(mkdir(path,0755)&&errno!=EEXIST)return -1;
+#endif
     int fd=open(path,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);struct stat st;
     if(fd>=0&&(fstat(fd,&st)||st.st_uid!=geteuid()||(st.st_mode&0022))){close(fd);errno=EPERM;return -1;}
     return fd;
@@ -74,7 +82,17 @@ done:
 }
 static int serve(int client,int directory,const char* key,const char* boot,const char* tx,const char* action,const char* source){
     uint8_t header[104];int fd=-1,result=10,partial=0,published=0,saved_errno=0;uint8_t* frame=NULL;
+#ifdef BROOK_BULK_INSTALL_MEDIA
+    int file_created=0,cleanup_failed=0;
+#endif
     char temporary[48],final[48];snprintf(temporary,sizeof(temporary),"%s.part",tx);snprintf(final,sizeof(final),"%s.bin",tx);
+#ifdef BROOK_BULK_INSTALL_MEDIA
+    // FAT currently lacks rename-no-replace. Write an exclusive, narrowly
+    // named installer file directly; incomplete files are rejected later by
+    // the installer's boot-pinned full-package digest before any SSD write.
+    snprintf(temporary,sizeof(temporary),"%s",source);
+    snprintf(final,sizeof(final),"%s",source);
+#endif
     if(io_bytes(client,header,sizeof(header),0,1)||memcmp(header,"BRBULK01",8)||
        !BrookUpdateEqual(header+8,(const uint8_t*)key,32)||!BrookUpdateEqual(header+40,(const uint8_t*)boot,32)||
        !BrookUpdateEqual(header+72,(const uint8_t*)tx,32))goto done;
@@ -112,6 +130,9 @@ static int serve(int client,int directory,const char* key,const char* boot,const
         struct stat exists;
         if(!fstatat(directory,final,&exists,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT){result=14;goto done;}
         fd=openat(directory,temporary,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);if(fd<0){result=14;goto done;}partial=1;
+#ifdef BROOK_BULK_INSTALL_MEDIA
+        file_created=1;
+#endif
         uint8_t chunk[65536];uint64_t offset=0;BrookSha256 context;BrookShaInit(&context);
         while(offset<bytes){size_t n=bytes-offset>sizeof(chunk)?sizeof(chunk):(size_t)(bytes-offset);
             if(io_bytes(client,chunk,n,0,1)||io_bytes(fd,chunk,n,1,0)){result=15;goto done;}
@@ -120,14 +141,21 @@ static int serve(int client,int directory,const char* key,const char* boot,const
         BrookShaFinish(&context,hash);
         if(!BrookUpdateEqual(hash,meta+8,32)){result=16;goto done;}
         if(fsync(fd)||hash_fd(fd,bytes,hash)||!BrookUpdateEqual(hash,meta+8,32)){result=17;goto done;}
+#ifdef BROOK_BULK_INSTALL_MEDIA
+        /* Disk sync/readback may take longer than the network idle timeout. */
+        uint64_t checked_at=now_ms();if(checked_at==UINT64_MAX||checked_at>UINT64_MAX-120000){result=17;goto done;}
+        deadline_ms=checked_at+120000;
+#endif
         if(message(client,"{\"state\":\"staged\",\"published\":false}\n")){result=18;goto done;}
         uint8_t commit[8];if(io_bytes(client,commit,8,0,1)||memcmp(commit,"FINALIZE",8)){result=19;goto done;}
         /* Atomic no-replace publication; another transaction can never
          * replace an existing completed artifact, even under a race. */
+#ifndef BROOK_BULK_INSTALL_MEDIA
         if(syscall(SYS_renameat2,directory,temporary,directory,final,1)){result=20;goto done;}
+#endif
         partial=0;published=1;
         char published_hash[65];hex_hash(hash,published_hash);
-        printf("HWBULK_PUBLISHED {\"transaction_id\":\"%s\",\"published\":true,\"bytes\":%"PRIu64",\"sha256\":\"%s\",\"guest_path\":\"/data/.brook-transfer/%s.bin\"}\n",tx,bytes,published_hash,tx);fflush(stdout);
+        printf("HWBULK_PUBLISHED {\"transaction_id\":\"%s\",\"published\":true,\"bytes\":%"PRIu64",\"sha256\":\"%s\",\"guest_path\":\"" BULK_ROOT "/%s\"}\n",tx,bytes,published_hash,final);fflush(stdout);
 #ifdef BROOK_BULK_TEST
         if(getenv("BROOK_BULK_TEST_PUBLISHED_FAILURE")){result=21;goto done;}
 #endif
@@ -152,21 +180,44 @@ static int serve(int client,int directory,const char* key,const char* boot,const
     }
     char path[128];
     if(!strcmp(action,"frame") || !strcmp(action,"disk"))strcpy(path,"null");
-    else snprintf(path,sizeof(path),"\"/data/.brook-transfer/%s.bin\"",!strcmp(action,"get")?source:tx);
-    snprintf(text,sizeof(text),"{\"state\":\"completed\",\"transaction_id\":\"%s\",\"action\":\"%s\",\"bytes\":%"PRIu64",\"sha256\":\"%s\",\"guest_path\":%s,\"retention\":\"%s\"}\n",tx,action,bytes,digest,path,!strcmp(action,"disk")?"not_staged":"current_boot_ram");
+    else if(!strcmp(action,"get"))snprintf(path,sizeof(path),"\"" BULK_ROOT "/%s.bin\"",source);
+    else snprintf(path,sizeof(path),"\"" BULK_ROOT "/%s\"",final);
+    snprintf(text,sizeof(text),"{\"state\":\"completed\",\"transaction_id\":\"%s\",\"action\":\"%s\",\"bytes\":%"PRIu64",\"sha256\":\"%s\",\"guest_path\":%s,\"retention\":\"%s\"}\n",tx,action,bytes,digest,path,
+#ifdef BROOK_BULK_INSTALL_MEDIA
+        "usb_media"
+#else
+        !strcmp(action,"disk")?"not_staged":"current_boot_ram"
+#endif
+    );
     /* Original job receipt disambiguates a lost final TCP reply. */
     printf("HWBULK_COMPLETED %s",text);fflush(stdout);(void)message(client,text);result=0;
 done:
     saved_errno=errno;
-    free(frame);if(fd>=0)close(fd);if(partial)unlinkat(directory,temporary,0);
+    free(frame);if(fd>=0)close(fd);
+#ifdef BROOK_BULK_INSTALL_MEDIA
+    if(partial && unlinkat(directory,temporary,0))cleanup_failed=1;
+    if(result){char error[320];snprintf(error,sizeof(error),"{\"state\":\"failed\",\"code\":%d,\"errno\":%d,\"transaction_id\":\"%s\",\"published\":%s,\"file_created\":%s,\"target_may_exist\":%s}\n",result,saved_errno,tx,published?"true":"false",file_created?"true":"false",(published||file_created||cleanup_failed||result==14)?"true":"false");(void)message(client,error);}
+#else
+    if(partial)unlinkat(directory,temporary,0);
     if(result){char error[256];snprintf(error,sizeof(error),"{\"state\":\"failed\",\"code\":%d,\"errno\":%d,\"transaction_id\":\"%s\",\"published\":%s}\n",result,saved_errno,tx,published?"true":"false");(void)message(client,error);}
+#endif
     return result;
 }
 int main(int argc,char** argv){
+#ifdef BROOK_BULK_INSTALL_MEDIA
+    if(argc!=5 || !valid_id(argv[1]) || !valid_id(argv[2]) || strcmp(argv[3],"put") ||
+       (strcmp(argv[4],"INST0000.IMG") && strcmp(argv[4],"INST0001.IMG") &&
+        strcmp(argv[4],"INST0002.IMG") && strcmp(argv[4],"INST0003.IMG") &&
+        strcmp(argv[4],"INSTHASH.BIN")))return 2;
+#else
     if((argc!=4&&argc!=5)||!valid_id(argv[1])||!valid_id(argv[2])||
        (strcmp(argv[3],"put")&&strcmp(argv[3],"get")&&strcmp(argv[3],"frame")&&strcmp(argv[3],"disk"))||
        (!strcmp(argv[3],"get")?(argc!=5||!valid_id(argv[4])):argc!=4))return 2;
-    const char *root="/data/.brook-transfer",*keypath="/etc/hardware-update-key";unsigned port=1236;
+#endif
+    const char *root=BULK_ROOT,*keypath="/etc/hardware-update-key";unsigned port=1236;
+#ifdef BROOK_BULK_INSTALL_MEDIA
+    if(strcmp(argv[3],"put"))return 2;
+#endif
 #ifdef BROOK_BULK_TEST
     root=getenv("BROOK_BULK_TEST_ROOT");keypath=getenv("BROOK_BULK_TEST_KEY");const char* p=getenv("BROOK_BULK_TEST_PORT");
     if(!root||!keypath||!p)return 2;
@@ -187,7 +238,11 @@ int main(int argc,char** argv){
     puts("HWBULK_LISTENING bulk_api=1");fflush(stdout);
     struct pollfd wait={listener,POLLIN,0};if(poll(&wait,1,60000)<=0){result=6;goto done;}
     client=accept(listener,NULL,NULL);if(client<0){result=7;goto done;}
-    sliding_deadline=!strcmp(argv[3],"disk");uint64_t now=now_ms(),allowance=sliding_deadline?120000:600000;
+    sliding_deadline=!strcmp(argv[3],"disk");
+#ifdef BROOK_BULK_INSTALL_MEDIA
+    sliding_deadline=1;
+#endif
+    uint64_t now=now_ms(),allowance=sliding_deadline?120000:600000;
     if(now==UINT64_MAX || now>UINT64_MAX-allowance){result=8;goto done;}deadline_ms=now+allowance;
     result=serve(client,directory,key,argv[1],argv[2],argv[3],argc==5?argv[4]:NULL);
 done:

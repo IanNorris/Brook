@@ -1,6 +1,6 @@
 # Dell XPS 13 9343: internal SSD installation preparation
 
-This is an installation plan, not itself an installer. The user has explicitly
+The user has explicitly
 authorized wiping the old Ubuntu contents and installing Brook on this Dell's
 internal SSD. Physical writes still require an implementation that targets the
 observed SSD, preserves USB recovery, and passes the applicable tests below.
@@ -23,7 +23,16 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   physical SSD behavior and arbitrary power-loss recovery were not established.
 - A small QEMU install interrupted during payload copying was successfully
   restarted from USB. QEMU process exit is not proof of a physical power cut.
-  The installer worker and its synthetic-device admission are test-only.
+  That interruption test exercised the synthetic-device admission only.
+- The explicitly enabled physical-installer kernel now reserves the exact
+  identity-matched disk outside the normal registry, requires a boot-pinned
+  package digest and a boot-bound start key, and shares the shutdown gate.
+  Its full-size disposable QEMU installation passed independent comparisons of
+  the GPT and partition ranges. The installed disk booted without USB and
+  passed checked shutdown, restart, store persistence and filesystem checks.
+  A copy of the Dell candidate, with only the identity adapted for QEMU and
+  its test helper replaced, passed the same checks. Neither is physical SSD
+  write/flush acceptance or proof of arbitrary power-loss recovery.
 
 ## Remaining engineering gates
 
@@ -74,28 +83,28 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
    During transfer and the independent readback, `receipt.json` records phase
    and byte counts at approximately ten-second intervals. Transfer counts are
    progress indicators, not proof that the data has been durably verified.
-2. **Build a physical candidate.** Generate a new target-sized GPT and boot
-   payload using the Dell's freshly observed controller, port, model, serial,
+2. **Build a physical candidate.** A private target-sized GPT and boot
+   payload has been generated using the Dell's observed controller, port, model, serial,
    capacity, sector sizes and flush capability. The QEMU desktop image embeds
    `QEMU HARDDISK` and a synthetic serial; it must never be reused as the Dell's
    write-target record. Generate new disk/partition identifiers and a matching
    boot-volume selector together. Keep those and per-device records private.
-   Decide the partition/store sizes against actual application and user-data
-   needs; the 6 GiB / 4 GB store was a test fixture, not a final capacity
-   decision. FAT32 cannot contain a file of 4 GiB or more.
-3. **Implement actual installer admission and recovery.** The current installer
-   path admits only synthetic QEMU disks. Before any physical write, implement
+   The initial 6 GiB partition contains a 3.75 GiB store copied from the
+   repaired USB snapshot; further partition/store expansion remains future
+   work. FAT32 cannot contain a file of 4 GiB or more.
+3. **Installer admission and recovery.** The explicitly enabled physical path
+   implements
    exact physical target binding, source-device ancestry and exclusivity,
-   immutable source leases, a trusted package identity, pre-write verification
-   of the leased bytes and geometry, durable progress/failure reporting and a
-   tested recovery path. The v2 package checksum detects data changes but a
+   immutable source leases, a trusted package identity and pre-write verification
+   of the leased bytes and geometry. Physical recovery and durable install
+   progress after a lost boot remain unproven. The v2 package checksum detects data changes but a
    record stored with the package is not authentication. Refuse ambiguous
    targets, unverified packages, unsupported sector sizes, missing flush support
    and uncertain I/O. Preserve the USB's working A/B and root recovery files.
    The test installer now verifies source partition ancestry against the
    registered USB parent rather than trusting a device name; host tests and a
-   complete disposable QEMU install passed. This is a prerequisite, not a
-   production installer or proof of physical USB hotplug handling.
+   complete disposable QEMU install passed. This is not proof of physical USB
+   hotplug handling or SSD write/flush behavior.
 4. **Rehearse the exact candidate on disposable media.** Use the full desktop
    package and a QEMU disk of the same sector geometry, with the intended target
    and boot selectors adapted only to a synthetic identity. Verify negative
@@ -109,9 +118,8 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
    health, copy and verify the candidate on suitable storage, remeasure free USB
    space, and confirm the original USB recovery boot still works. The previous
    USB free-space observation was about 30.3 GB and may be stale. The Dell must
-   be reachable and physically observable; its most recent network loss has not
-   been diagnosed. Keep the verified backup separate from both the target and
-   installer media.
+   be reachable and physically observable. Keep the existing USB recovery
+   files and the separately repaired store snapshot.
 
 ## Eventual installation and acceptance
 

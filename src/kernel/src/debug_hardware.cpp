@@ -213,6 +213,33 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         return true;
     }
 #endif
+#if defined(BROOK_SSD_INSTALLER)
+    constexpr const char* installPrefix="bridge hardware ssd-install begin ";
+    if(Prefix(command,installPrefix) || !strcmp(command,"bridge hardware ssd-install begin")) {
+        const char* args=command+strlen("bridge hardware ssd-install begin");
+        bool allowed=false;
+        if(*args++==' ' && strlen(args)==65 && args[32]==' ') {
+            char boot[33]{};memcpy(boot,args,32);
+            auto* key=VfsOpen("/etc/ssd-install-key",VFS_O_STREAM);
+            if(key) {
+                VnodeStat st{};char expected[32]{};uint64_t offset=0;
+                if(!VfsStat(key,&st) && !st.isDir && !st.isSymlink && st.size==32 &&
+                   VfsRead(key,expected,32,&offset)==32 && DebugEpochMatches(boot)) {
+                    unsigned diff=0;for(unsigned i=0;i<32;++i)diff|=unsigned(expected[i]^args[33+i]);
+                    allowed=diff==0;
+                }
+                VfsRelease(key);
+            }
+        }
+        DebugChannelSend(allowed && SsdQemuInstallBegin()?"{\"ssd_install\":\"started\"}\n":"{\"ssd_install\":\"refused\"}\n");return true;
+    }
+    if(!strcmp(command,"bridge hardware ssd-install status")) {
+        const auto s=SsdQemuInstallStatus();Reply r;r.text("{\"ssd_install\":1,");r.field("state",s.state);
+        r.text(",");r.field("stage",s.stage);r.text(",");r.field("operations",s.operations);
+        r.text(",\"error\":");if(s.error<0){r.text("-");r.number(-int64_t(s.error));}else r.number(s.error);
+        r.text("}\n");r.send();return true;
+    }
+#endif
     if(!strcmp(command,"bridge hardware ahci-ro")) {
         const auto s=AhciReadOnlyGetStatus();Reply r;
         r.text("{\"ahci_ro_api\":1,\"requested\":");r.text(s.requested?"true":"false");

@@ -1,5 +1,5 @@
 #pragma once
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
 #include <stdint.h>
 namespace brook {
 struct SsdQemuStatus {uint32_t state,stage;uint64_t operations;int error;bool paused;};

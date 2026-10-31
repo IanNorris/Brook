@@ -16,6 +16,8 @@ int main() {
     AppSnapshotPlan plan{};std::string hash(64,'0');
     auto parse=[&](std::string text){return AppSnapshotParse(text.data(),text.size(),plan);};
     assert(parse("/media/usb/APPS.BRK /nix 131072 "+hash+"\n"));
+    assert(parse("/media/system/APPS.BRK /nix 131072 "+hash));
+    assert(!parse("/media/system/../APPS.BRK /nix 131072 "+hash));
     assert(!parse("/media/usb/../APPS.BRK /nix 131072 "+hash));
     assert(!parse("/media/usb/APPS.BRK /other 131072 "+hash));
     assert(!parse("/media/usb/APPS.BRK /nix 536875008 "+hash));

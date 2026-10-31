@@ -1,5 +1,5 @@
 #include "ssd_install_qemu.h"
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS) || defined(BROOK_SSD_INSTALLER)
 #include "ssd_install_preflight.h"
 #include "ssd_install_engine.h"
 #include "ssd_install_gate.h"
@@ -18,7 +18,8 @@
 
 namespace brook {
 namespace {
-// Test-kernel-only, one-shot worker. No generic disk-offset interface exists.
+// One-shot worker in either the disposable test kernel or the explicitly
+// enabled installer kernel. No generic disk-offset interface exists.
 SsdInstallGate gate;uint32_t state=0,stage=0,paused=0;uint64_t operations=0;int error=0;
 FatImageLease* retainedLease[4]{};
 struct Source {
@@ -37,7 +38,11 @@ struct Io {
     int flushTarget(){return DeviceFlush(target);}
 };
 int Run() {
+#if defined(BROOK_SSD_INSTALLER)
+    Device* target=AhciPhysicalInstallDevice();
+#else
     Device* target=AhciDisposableQemuInstallDevice();
+#endif
     if(!target || DeviceBlockSize(target)!=512)return -22;
     const uint64_t sectors=DeviceBlockCount(target);
     if(sectors!=131072 && sectors!=12587008 && sectors!=500118192)return -22;
@@ -45,6 +50,9 @@ int Run() {
     if(marker)VfsClose(marker);
     auto* desktopMarker=VfsOpen("/media/usb/INSTDSK.OK");const bool desktop=desktopMarker!=nullptr;
     if(desktopMarker)VfsClose(desktopMarker);
+#if defined(BROOK_SSD_INSTALLER)
+    if(!desktop || !compact || sectors!=500118192)return -22;
+#endif
     // Compact mode accepts only two recognized QEMU geometries until a
     // production source manifest and physical identity gate exist.
     if(desktop && (!compact || sectors!=500118192))return -22;
@@ -89,7 +97,12 @@ int Run() {
             if(VfsStat(expected,&expectedStat) || expectedStat.isDir || expectedStat.isSymlink ||
                expectedStat.size!=sizeof(trusted) || VfsRead(expected,trusted,sizeof(trusted),&expectedOffset)!=int(sizeof(trusted)) ||
                !SsdDigestVerifyExpectedPinned(source,data,sizeof(data),trusted,sizeof(trusted),compactGeometry,sourceBytes,a,65536))result=-5;
-        } else if(!result && !SsdDigestVerifyPinned(source,data,sizeof(data),compactGeometry,sourceBytes,a,65536))result=-5;
+        }
+#if defined(BROOK_SSD_INSTALLER)
+        else if(!result)result=-5; // trusted boot record is mandatory
+#else
+        else if(!result && !SsdDigestVerifyPinned(source,data,sizeof(data),compactGeometry,sourceBytes,a,65536))result=-5;
+#endif
         if(expected)VfsRelease(expected);
     }
     if(!result) {
@@ -112,15 +125,18 @@ int Run() {
             mbr,primary,backup,entries,copy,16384))result=-22;
         if(!result) {
             Io io{&source,target};SsdInstallEngine engine(geometry,true);SsdInstallStepResult step;
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
             auto* pauseMarker=VfsOpen("/etc/ahci-qemu-install-pause");const bool pauseTest=pauseMarker!=nullptr;
             if(pauseMarker)VfsClose(pauseMarker);
             auto* payloadMarker=VfsOpen("/etc/ahci-qemu-pause-payload");const bool pausePayload=payloadMarker!=nullptr;
             if(payloadMarker)VfsClose(payloadMarker);
             bool didPause=false;
+#endif
             do {
                 const auto before=engine.Stage();
                 __atomic_store_n(&stage,uint32_t(before),__ATOMIC_RELEASE);
                 step=engine.Step(io,a,b);__atomic_add_fetch(&operations,1ull,__ATOMIC_RELAXED);
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
                 if(!didPause && step==SsdInstallStepResult::Progress &&
                    ((pauseTest && __atomic_load_n(&operations,__ATOMIC_RELAXED)==1) ||
                     (pausePayload && before==SsdInstallStage::Payload))) {
@@ -128,6 +144,7 @@ int Run() {
                     __atomic_store_n(&paused,1u,__ATOMIC_RELEASE);
                     while(__atomic_load_n(&paused,__ATOMIC_ACQUIRE))SchedulerSleepMs(10);
                 }
+#endif
             } while(step==SsdInstallStepResult::Progress);
             if(step!=SsdInstallStepResult::Complete)result=-5;
             __atomic_store_n(&stage,uint32_t(engine.Stage()),__ATOMIC_RELEASE);
@@ -149,7 +166,11 @@ void Worker(void*) {
 }
 }
 bool SsdQemuInstallBegin() {
+#if defined(BROOK_SSD_INSTALLER)
+    if(!AhciPhysicalInstallDevice() || !ShutdownLaunchAllowed())return false;
+#else
     if(!AhciDisposableQemuInstallDevice() || !ShutdownLaunchAllowed())return false;
+#endif
     uint32_t initial=0;if(!__atomic_compare_exchange_n(&state,&initial,1u,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return false;
     if(!gate.Begin()) {
         __atomic_store_n(&state,4u,__ATOMIC_RELEASE);return false;

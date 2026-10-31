@@ -34,6 +34,9 @@ KMutex ioLock{};
 bool published=false;
 bool writeEnabled=false; // immutable after registration, even if quarantined
 bool exportEnabled=false; // immutable boot-only opt-in
+#if defined(BROOK_SSD_INSTALLER)
+bool physicalInstallMode=false;
+#endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool testWritable=false;
 bool testInstallMode=false;
@@ -304,6 +307,19 @@ void AhciReadOnlyInit() {
     const bool parsed=ReadWriteTarget(target,targetPresent);
     writeEnabled=parsed && AhciWriteTargetMatches(target,pci.vendorId,pci.deviceId,pci.bus,pci.dev,pci.fn,
         selected,info,AtaSupportsFlushExt(dma+dataOffset,512));
+#if defined(BROOK_SSD_INSTALLER)
+    // A physical installer build never exposes a writable general-purpose disk.
+    // Require an exact boot marker and no system-volume selector; the admitted
+    // target is reserved exclusively for the installer, outside the registry.
+    auto* installModeMarker=VfsOpen("/etc/ssd-install-mode",VFS_O_STREAM);
+    VnodeStat ms{},selector{};char mv[2]{};uint64_t mo=0;
+    const bool enabled=installModeMarker && !VfsStat(installModeMarker,&ms) && !ms.isDir && !ms.isSymlink && ms.size==2 &&
+        VfsRead(installModeMarker,mv,2,&mo)==2 && mv[0]=='1' && mv[1]=='\n' &&
+        VfsLstatPath("/etc/ahci-boot-volume",&selector)==-2;
+    if(installModeMarker)VfsRelease(installModeMarker);
+    physicalInstallMode=enabled && writeEnabled;
+    writeEnabled=physicalInstallMode;
+#endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     // Test hooks also require the exact disposable QEMU identity. They can be
     // enabled by the test marker or an already matched production policy.
@@ -319,7 +335,11 @@ void AhciReadOnlyInit() {
     if(testWritable)testInstallMode=installPresent;
 #endif
     KMutexInit(&ioLock);
+#if defined(BROOK_SSD_INSTALLER)
+    if(!physicalInstallMode && !DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
+#else
     if(!DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
+#endif
     status.ready=true;status.reason="read-only ATA device ready";
     if(targetPresent)status.reason=writeEnabled?"configured ATA device writable":"ATA write target rejected; device read-only";
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
@@ -342,12 +362,21 @@ AhciReadOnlyStatus AhciReadOnlyGetStatus() {
 }
 Device* AhciWriteAdmittedDevice() {
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
+#if defined(BROOK_SSD_INSTALLER)
+    if(physicalInstallMode)return nullptr;
+#endif
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     if(testInstallMode)return nullptr; // reserve the test target from boot mounts
 #endif
     KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);
     return result;
 }
+#if defined(BROOK_SSD_INSTALLER)
+Device* AhciPhysicalInstallDevice() {
+    if(!physicalInstallMode || !__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
+    KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);return result;
+}
+#endif
 int AhciReadOnlySector(uint64_t lba,void* output) {
     if(!output || !__atomic_load_n(&published,__ATOMIC_ACQUIRE))return -22;
     KMutexLock(&ioLock);
