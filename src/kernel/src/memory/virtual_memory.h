@@ -1,4 +1,5 @@
 #pragma once
+#include "kernel_alias_probe.h"
 
 #include <stdint.h>
 #include "address.h"
@@ -119,6 +120,9 @@ uint64_t VmmDetachPage(PageTable pt, VirtualAddress virtAddr);
 uint64_t VmmDetachPageIfMatches(PageTable pt, VirtualAddress virtAddr, PhysicalAddress expected);
 PhysicalAddress VmmLeafPhysical(uint64_t leaf);
 uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address); // locked value snapshot, including hidden leaves
+// Diagnostic only: two kernel-root aliases of one aligned physical page.
+// Does not inspect MTRRs, other address spaces/aliases or access device bytes.
+bool VmmInspectKernelAliases(uint64_t physical,KernelAliasMapping& identity,KernelAliasMapping& direct);
 // Clear only Accessed on an expected present user 4 KiB, non-COW leaf. No
 // ownership/reference change. Caller stabilizes its mapping under AS.mutation
 // and must acknowledge a TLB invalidation before relying on a new cold sample.

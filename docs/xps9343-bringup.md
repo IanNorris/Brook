@@ -1841,6 +1841,18 @@ ownership, cache-alias safety or absence of PCI/dynamic resource conflicts.
 No device register was read. The desktop store remained ready and SSD inventory
 read-only.
 
+The complete PCI boot snapshot contains no memory BAR base inside either I²C0
+window. BAR sizes were not probed, so this does not rule out overlapping
+apertures. A read-only kernel page-table inspector was tested with 4 KiB,
+2 MiB and 1 GiB leaves, PAT-bit positions, malformed entries and actual VMM
+root/classification handling; its exact candidate passed QEMU desktop/reboot
+checks and was deployed on the Dell (`dell-audio-alias-update-20261031`). For
+each I²C0 window, both the kernel-root identity and direct-map observations
+were present, mapped to the expected physical address, and used a 2 MiB leaf
+with PAT index 0. This is not the effective memory type: MTRRs, per-CPU PAT
+state, other aliases and device ownership were not established. No I²C or SST
+device memory was read or mapped by this diagnostic.
+
 ### Passive-open MSS and hardware transfer profile (2026-10-31)
 
 A 4 GB store upload to the Dell's USB stick ran at approximately 2.8 MB/s;

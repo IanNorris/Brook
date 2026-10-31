@@ -11,6 +11,7 @@
 #include <thread>
 #include <memory>
 #include <unordered_map>
+#include <sys/mman.h>
 #include "memory/mapping_transaction.h"
 #include "memory/user_mapping.h"
 #include "memory/mapping_access_timing.h"
@@ -18,6 +19,7 @@
 #include "memory/file_mapping_registry.h"
 #include "memory/virtual_memory.h"
 #include "memory/physical_memory.h"
+#include "acpi.h"
 #include "serial.h"
 #include "memory/address_space.h"
 #include "process.h"
@@ -32,6 +34,7 @@ constexpr size_t pageSize = 4096, pageCount = 4096;
 alignas(pageSize) unsigned char frames[pageCount][pageSize];
 struct Frame { unsigned refs=0, maps=0; } records[pageCount];
 std::mutex frameLock;
+uint64_t aliasTestBase=0;bool aliasTestDeny=false;
 std::atomic<bool> failAllocation{false};
 std::atomic<int> failFrameAfter{-1};
 std::atomic<int> heapAllocations{0};
@@ -93,6 +96,10 @@ extern "C" void KernelPanic(const char* format,...) {
     va_list args;va_start(args,format);std::vfprintf(stderr,format,args);va_end(args);std::abort();
 }
 namespace brook {
+bool AcpiClassifyBootRange(uint64_t address,uint32_t bytes,BootResourceClassification& result) {
+    result={};if(aliasTestDeny || !aliasTestBase || address<aliasTestBase || address-aliasTestBase>4*pageSize || bytes>4*pageSize-(address-aliasTestBase))return false;
+    result.types=1u<<uint32_t(MemoryType::Free);return true;
+}
 extern "C" void* kmalloc(uint64_t size) {
     int countdown=failHeapAfter.load();
     if(countdown>=0) { if(!countdown){failHeapAfter=-1;return nullptr;}--failHeapAfter; }
@@ -2288,9 +2295,22 @@ static void robustExitQueue() {
     CHECK(ProcessCleanupStep() && robustCleanups==2 && rawOwner.refCount==0);
     ProcessQueueRobustExit(&rawOwner);CHECK(!ProcessCleanupStep() && robustCleanups==2);
 }
+static void kernelAliasInspection() {
+    void* region=mmap(nullptr,4*pageSize,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_32BIT,-1,0);
+    CHECK(region!=MAP_FAILED);aliasTestBase=reinterpret_cast<uint64_t>(region);CHECK(aliasTestBase<1ull<<34);
+    auto* root=static_cast<uint64_t*>(region);auto* pdpt=root+512;auto* pd=pdpt+512;auto* pt=pd+512;
+    constexpr uint64_t target=0x12345000;
+    root[0]=(aliasTestBase+pageSize)|3;pdpt[0]=(aliasTestBase+2*pageSize)|3;
+    pd[(target>>21)&511]=(aliasTestBase+3*pageSize)|3;pt[(target>>12)&511]=target|3;
+    VmmHostSetKernelRoot(PageTable(PhysicalAddress(aliasTestBase)));KernelAliasMapping identity{},direct{};
+    CHECK(VmmInspectKernelAliases(target,identity,direct) && identity.present && direct.present &&
+          identity.physical==target && direct.physical==target && identity.pageShift==12 && identity.patIndex==0);
+    aliasTestDeny=true;CHECK(!VmmInspectKernelAliases(target,identity,direct) && !identity.present && !direct.present);
+    aliasTestDeny=false;VmmHostSetKernelRoot({});aliasTestBase=0;CHECK(!munmap(region,4*pageSize));
+}
 int main(int argc,char** argv) {
     if(argc==2 && !std::strcmp(argv[1],"--benchmark-mapping-lookup")) { rangeLookupBenchmark();return 0; }
-    robustExitQueue();low32Mappings();pageableTableSkeleton();
+    kernelAliasInspection();robustExitQueue();low32Mappings();pageableTableSkeleton();
     accessedLeafAging();competingInstallAndDetach();detachReinstall();largeLeafAndBorrowedFrame();occupiedAncestors();failureAndInPlace();
     cowRetirement(false);for(unsigned i=0;i<32;++i)cowRetirement(true);
     addressSpaceLifetime();consumingWaitCleanup();mappingTransactions();rangeTableEdits();rangeLookupCache();rangeSnapshotRetirement();rangeLeafOwnership();

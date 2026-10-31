@@ -83,6 +83,7 @@ add_host_test(test_ssd_install_segmented_source)
 add_host_test(test_dell_audio_firmware)
 add_host_test(test_boot_resource_map)
 target_compile_options(test_boot_resource_map PRIVATE "-iquote${BROOK_ROOT}/src/shared")
+add_host_test(test_kernel_alias_probe)
 add_executable(test_ahci_system_volume "${BROOK_ROOT}/src/tests/test_ahci_system_volume/main.cpp"
     "${BROOK_ROOT}/src/kernel/src/ahci_system_volume.cpp")
 target_include_directories(test_ahci_system_volume PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/fatfs-object-adapter")

@@ -6,6 +6,7 @@
 #include "early_framebuffer_mapping.h"
 #include "boot_protocol/boot_protocol.h"
 #include "cpu.h"
+#include "acpi.h"
 
 namespace brook {
 
@@ -452,6 +453,25 @@ uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address) {
     auto* entry = WalkToPtr(pt,address,false,0,&large);
     uint64_t leaf = !large && entry ? *entry : 0;
     IrqSpinLockRelease(&lock,irq); return leaf;
+}
+
+bool VmmInspectKernelAliases(uint64_t physical,KernelAliasMapping& identity,KernelAliasMapping& direct) {
+    identity={};direct={};
+    if(!physical || (physical&4095) || physical>=(16ull<<30))return false;
+    struct Tables {
+        bool readEntry(uint64_t page,uint16_t index,uint64_t& value) {
+            BootResourceClassification c{};
+            constexpr uint32_t allowed=(1u<<uint32_t(MemoryType::Free))|(1u<<uint32_t(MemoryType::BootData));
+            if(index>=512 || !AcpiClassifyBootRange(page,4096,c) || c.unreported || !c.types || (c.types&~allowed))return false;
+            const auto* entries=reinterpret_cast<const uint64_t*>(PhysToVirt(PhysicalAddress(page)).raw());
+            value=__atomic_load_n(entries+index,__ATOMIC_ACQUIRE);return true;
+        }
+    } tables;
+    const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
+    const bool ok=InspectKernelAlias(tables,g_kernelCR3.raw(),physical,identity) &&
+        InspectKernelAlias(tables,g_kernelCR3.raw(),DIRECT_MAP_BASE+physical,direct);
+    IrqSpinLockRelease(&g_kernelPtLock,irq);
+    if(!ok){identity={};direct={};}return ok;
 }
 
 bool VmmClearAccessedIfMatches(PageTable pt,VirtualAddress address,PhysicalAddress expected) {

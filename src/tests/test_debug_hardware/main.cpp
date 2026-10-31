@@ -10,6 +10,7 @@
 #include "ahci_observe.h"
 #include "acpi.h"
 #include "dell_audio_probe.h"
+#include "memory/virtual_memory.h"
 #include <cassert>
 #include <cstring>
 #include <string>
@@ -25,6 +26,7 @@ uint32_t AcpiInventoryCount(){return 1;}
 bool AcpiMmioMapValid(){return true;}
 bool AcpiMmioContains(uint64_t address,uint32_t bytes){return address==0xfe103000 && bytes==4096;}
 bool AcpiClassifyBootRange(uint64_t,uint32_t,BootResourceClassification& result){result={2,false};return true;}
+bool VmmInspectKernelAliases(uint64_t physical,KernelAliasMapping& a,KernelAliasMapping& b){a={true,21,0,physical};b=a;return true;}
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& h){
     if(index || offset>1024 || bytes>1024-offset)return false;
     h={};h.length=1024;if(bytes)std::memset(out,0xab,bytes);return true;
@@ -113,7 +115,8 @@ int main(){
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"ok\":false")!=std::string::npos);
     audioProbePresent=true;
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"i2c_base0_mmio_declared\":true")!=std::string::npos &&
-           reply.find("\"i2c_base1_mmio_declared\":false")!=std::string::npos && reply.find("\"types\":2")!=std::string::npos);
+           reply.find("\"i2c_base1_mmio_declared\":false")!=std::string::npos && reply.find("\"types\":2")!=std::string::npos &&
+           reply.find("\"i2c_base0_kernel_aliases\":{\"valid\":true")!=std::string::npos);
     assert(handle("bridge hardware acpi 0 4 2") && reply.find("\"hex\":\"abab\"")!=std::string::npos);
     assert(handle("bridge hardware acpi 0 0 512"));
     assert(reply.find("\"hex\":\""+[](){std::string s;for(int i=0;i<512;++i)s+="ab";return s;}()+"\"")!=std::string::npos);

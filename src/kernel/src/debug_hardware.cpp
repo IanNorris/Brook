@@ -18,6 +18,7 @@
 #include "ssd_install_qemu.h"
 #include "acpi.h"
 #include "dell_audio_probe.h"
+#include "memory/virtual_memory.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -117,6 +118,18 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",");r.field("types",c0.types);r.text(",\"unreported\":");r.text(c0.unreported?"true":"false");r.text("}");
             r.text(",\"i2c_base1_boot_map\":{\"valid\":");r.text(v1?"true":"false");
             r.text(",");r.field("types",c1.types);r.text(",\"unreported\":");r.text(c1.unreported?"true":"false");r.text("}");
+            auto aliases=[&](const char* name,uint64_t physical) {
+                KernelAliasMapping identity{},direct{};
+                const bool valid=VmmInspectKernelAliases(physical,identity,direct);
+                r.text(",\"");r.text(name);r.text("\":{\"valid\":");r.text(valid?"true":"false");
+                auto emit=[&](const char* field,const KernelAliasMapping& m) {
+                    r.text(",\"");r.text(field);r.text("\":{\"present\":");r.text(m.present?"true":"false");
+                    r.text(",\"matches\":");r.text((m.present && m.physical==physical)?"true":"false");
+                    r.text(",");r.field("page_shift",m.pageShift);r.text(",");r.field("pat_index",m.patIndex);r.text("}");
+                };
+                if(valid){emit("identity",identity);emit("direct",direct);}r.text("}");
+            };
+            aliases("i2c_base0_kernel_aliases",s.i2cBase0);aliases("i2c_base1_kernel_aliases",s.i2cBase1);
         }
         r.text("}\n");r.send();return true;
     }
