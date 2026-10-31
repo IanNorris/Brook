@@ -71,4 +71,5 @@ void AhciObserveConfigure(const BootProtocol* boot) {
     AhciObserveRegisters(io,observation);
 }
 const AhciObservation& AhciObserveRead() { return observation; }
+volatile uint32_t* AhciObserveMappedPage() { return observation.valid ? page : nullptr; }
 } // namespace brook

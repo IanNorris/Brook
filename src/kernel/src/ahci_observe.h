@@ -16,6 +16,8 @@ struct AhciObservation {
 // Physical register snapshot only: no AHCI commands, DMA, disk reads or writes.
 void AhciObserveConfigure(const BootProtocol* boot);
 const AhciObservation& AhciObserveRead();
+// Valid only for a successful observation; borrowed for this boot's lifetime.
+volatile uint32_t* AhciObserveMappedPage();
 
 inline bool AhciObserveBar(uint32_t raw, uint64_t& base) {
     if ((raw & 1u) || (raw & 6u)) return false; // BAR5 must be 32-bit MMIO

@@ -1861,3 +1861,9 @@ and packet-device flags, LBA48, capacity, 512-byte logical sectors, reported
 physical-sector ratio, and ATA word-swapped text. It has host tests but no
 physical data has been read. DMA capability, controller ownership and lifetime
 must also be established before using it for sector I/O.
+
+On 31 October the user confirmed the Dell's internal disk contains only an old,
+non-booting Ubuntu installation and explicitly authorized wiping it for Brook.
+The USB remains the recovery path. First identify the actual target and prove
+the driver and full-disk installation against disposable QEMU media; no
+internal SSD sectors have yet been written.

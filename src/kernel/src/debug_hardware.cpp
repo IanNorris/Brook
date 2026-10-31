@@ -13,6 +13,7 @@
 #include "pci.h"
 #include "display_power.h"
 #include "ahci_observe.h"
+#include "ahci_readonly.h"
 #include "writable_desktop.h"
 namespace brook {
 namespace {
@@ -22,6 +23,14 @@ bool Decimal(const char*& p,uint32_t& value){
     if(*p<'0'||*p>'9')return false;value=0;
     while(*p>='0'&&*p<='9'){
         unsigned digit=*p++-'0';if(value>(0xffffffffu-digit)/10)return false;value=value*10+digit;
+    }
+    return true;
+}
+bool Decimal64(const char*& p,uint64_t& value){
+    if(*p<'0'||*p>'9')return false;value=0;
+    while(*p>='0'&&*p<='9'){
+        unsigned digit=*p++-'0';if(value>(~uint64_t{0}-digit)/10)return false;
+        value=value*10+digit;
     }
     return true;
 }
@@ -85,6 +94,24 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
     }
     constexpr char pciPrefix[]="bridge hardware pci ";
+    if(!strcmp(command,"bridge hardware ahci-ro")) {
+        const auto s=AhciReadOnlyGetStatus();Reply r;
+        r.text("{\"ahci_ro_api\":1,\"requested\":");r.text(s.requested?"true":"false");
+        r.text(",\"ready\":");r.text(s.ready?"true":"false");r.text(",\"quarantined\":");r.text(s.quarantined?"true":"false");
+        r.text(",\"reason\":");r.quoted(s.reason);r.text(",");r.field("port",s.port);
+        r.text(",");r.field("sectors",s.sectors);r.text(",");r.field("logical_sector_bytes",s.logicalSectorBytes);
+        r.text(",");r.field("physical_sector_bytes",s.physicalSectorBytes);r.text(",\"model\":");r.quoted(s.model);
+        r.text("}\n");r.send();return true;
+    }
+    constexpr char sectorPrefix[]="bridge hardware ahci-sector ";
+    if(Prefix(command,sectorPrefix)) {
+        const char* p=command+sizeof(sectorPrefix)-1;uint64_t lba=0;uint8_t sector[512];
+        if(!Decimal64(p,lba) || *p){DebugChannelSend("{\"ahci_ro_error\":\"expected sector LBA\"}\n");return true;}
+        if(AhciReadOnlySector(lba,sector)!=512){DebugChannelSend("{\"ahci_ro_error\":\"sector read failed\"}\n");return true;}
+        Reply r;r.text("{\"ahci_ro_api\":1,");r.field("lba",lba);r.text(",\"hex\":\"");
+        const char* hex="0123456789abcdef";for(uint32_t i=0;i<512;++i){r.append(hex[sector[i]>>4]);r.append(hex[sector[i]&15]);}
+        r.text("\"}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware ahci")) {
         const auto& a=AhciObserveRead();Reply r;
         r.text("{\"ahci_observe_api\":1,\"requested\":");r.text(a.requested?"true":"false");
