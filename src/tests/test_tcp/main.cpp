@@ -380,6 +380,14 @@ static void TestPassiveHandshake()
 
 int main()
 {
+    uint8_t options[8] = {};
+    ASSERT_EQ(TcpWriteSynOptions(TCP_ACK, 7, options), 0u);
+    ASSERT_EQ(TcpWriteSynOptions(TCP_SYN | TCP_ACK, 7, options), 4u);
+    ASSERT_EQ(options[0], 2); ASSERT_EQ(options[1], 4);
+    ASSERT_EQ((options[2] << 8) | options[3], 1460);
+    ASSERT_EQ(TcpWriteSynOptions(TCP_SYN, 7, options), 8u);
+    ASSERT_EQ(options[4], 1); ASSERT_EQ(options[5], 3);
+    ASSERT_EQ(options[6], 3); ASSERT_EQ(options[7], 7);
     ASSERT_TRUE(Ipv4IsLoopback(htonl(0x7f000001)));
     ASSERT_TRUE(Ipv4IsLoopback(htonl(0x7f123456)));
     ASSERT_TRUE(!Ipv4IsLoopback(htonl(0x0a00020f)));

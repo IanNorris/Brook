@@ -2309,14 +2309,8 @@ static void TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t s
                                 const void* data, uint32_t dataLen,
                                 const char* why)
 {
-    // SYN packets include MSS option (4 bytes) + Window Scale option (3+1 bytes)
-    // This makes us look like a real Linux client and avoids CDNs defaulting
-    // to MSS=536 (which some servers use as a signal to reject the connection).
-    static constexpr uint16_t TCP_OPT_MSS = 1460;
-    bool isSyn = (flags & TCP_SYN) && !(flags & TCP_ACK); // SYN only, not SYN-ACK
-
-    // SYN options: MSS(4) + NOP(1) + WScale(3) = 8 bytes (word-aligned)
-    uint32_t optLen  = isSyn ? 8 : 0;
+    uint8_t options[8];
+    uint32_t optLen = TcpWriteSynOptions(flags, snapshot.windowScale, options);
     uint32_t tcpLen  = sizeof(TcpHeader) + optLen + dataLen;
     alignas(16) uint8_t buf[ETH_MTU];
     memset(buf, 0, tcpLen);
@@ -2331,21 +2325,7 @@ static void TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t s
     tcp->window = htons(snapshot.window);
     tcp->urgentPtr = 0;
 
-    // Write TCP options for SYN: MSS + NOP + Window Scale
-    if (isSyn) {
-        uint8_t* opts = buf + sizeof(TcpHeader);
-        // MSS option (kind=2, len=4, value=1460)
-        opts[0] = 2;
-        opts[1] = 4;
-        opts[2] = static_cast<uint8_t>(TCP_OPT_MSS >> 8);
-        opts[3] = static_cast<uint8_t>(TCP_OPT_MSS & 0xFF);
-        // NOP padding (kind=1)
-        opts[4] = 1;
-        // Window Scale option (kind=3, len=3, shift=tcpRcvWndScale)
-        opts[5] = 3;
-        opts[6] = 3;
-        opts[7] = snapshot.windowScale;
-    }
+    if (optLen) memcpy(buf + sizeof(TcpHeader), options, optLen);
 
     if (data && dataLen > 0)
         memcpy(buf + sizeof(TcpHeader) + optLen, data, dataLen);

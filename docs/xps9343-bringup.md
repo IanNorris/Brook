@@ -1717,3 +1717,57 @@ and `build/hardware/store-full-reboot-qemu-v1-20261031/result.json`.
 `scripts/test_hardware_store_reboot.py` reproduces the second-boot gate only on a
 stopped private disk under build/hardware. Browser interaction on the Dell and
 native transfer are separate from this QEMU result.
+
+### Internal speaker audio: prerequisites for the next gate (2026-10-31)
+
+The physical Broadwell Dell analog path needs SST DSP, SSP/I²S and the RT286
+codec; Brook's existing HDA backend alone does not establish that path. An
+independent review found no existing DesignWare LPSS I²C driver or AML resource
+and power-method evaluator in Brook. The archived i801 SMBus work is not the
+LPSS I²C controller. First obtain this Dell's ACPI tables read-only and establish
+actual SST, I²C, codec, interrupt and power resources before touching registers.
+The [FreeBSD SST project](https://github.com/spagu/acpi_intel_sst) targets this
+model and documents Dell-specific ACPI enablement; its assumptions must be
+checked on this machine, not applied blindly.
+
+A safe development sequence is bounded I²C ownership and muted codec identity;
+SST power/interrupt/DMA and firmware-ready diagnostics; silent DMA progress and
+stop; then low-volume playback and application/mute/clean-shutdown acceptance.
+The [Linux Broadwell SST driver](https://github.com/torvalds/linux/blob/master/sound/soc/intel/catpt/device.c)
+uses Intel firmware and a 31-bit DMA mask; verify the exact firmware, provenance,
+redistribution terms and device-specific configuration. Host tests and QEMU
+can exercise shared mixer, validation and failure handling, but cannot prove the
+Dell's analog sequencing.
+
+Brook's mixer contract is 44.1 kHz stereo S16; the FreeBSD reference describes
+48 kHz SSP. Verify DSP conversion or implement an explicit sample-rate boundary,
+including correct completion accounting, before registering a working backend.
+Startup remains muted and the user-visible volume control must precede speaker
+playback. Do not claim codec detection or functioning hardware audio until each
+physical gate has been observed.
+
+### Passive-open MSS and hardware transfer profile (2026-10-31)
+
+A 4 GB store upload to the Dell's USB stick ran at approximately 2.8 MB/s;
+host TCP reported receiver-window limitation for more than 98% of the observed
+period. A five-second Dell CPU profile is retained at
+`build/hardware/dell-transfer-profile-20261031/`: about 70% of four-core
+samples hit idle, while 22.7% hit an address consistent with xHCI restoring
+interrupts. The sampling method cannot distinguish time in interrupt-masked
+regions and this is not proof of the stick's write limit. The physical image
+still intentionally uses the diagnostic 4 KiB MSC limit after prior hardware
+failures. A separate small concurrent RAM upload attained 5.1 MB/s; repeat it
+alone before interpreting it as a network ceiling.
+
+The host also showed an MSS of 536 bytes for its incoming Brook connection.
+Brook's SYN-ACK had not advertised an MSS. The candidate now advertises 1460 on
+passive opens while leaving window scaling unnegotiated; active-open options are
+unchanged. TCP host tests pass and the isolated QEMU capture in
+`build/hardware/tcp-mss-qemu-v2-20261031/network.pcap` contains SYN-ACK option
+`02 04 05 b4` for the guest debug service. QEMU shut down cleanly. This validates
+the wire encoding, not Dell throughput; physical measurement is pending.
+
+Review also identified existing active-open window scaling follow-ups: SYN
+window advertisements must be unscaled, and a SYN-ACK without a valid scale
+option must disable both scaling directions. The MSS-only change does not
+address these separate negotiation issues.

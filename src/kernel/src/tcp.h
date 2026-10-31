@@ -12,6 +12,17 @@
 
 namespace brook {
 
+// Passive opens advertise MSS but do not negotiate window scaling until they
+// can parse the peer's scaling offer.
+inline uint32_t TcpWriteSynOptions(uint8_t flags, uint8_t windowScale, uint8_t* out)
+{
+    if (!(flags & TCP_SYN)) return 0;
+    out[0] = 2; out[1] = 4; out[2] = 1460 >> 8; out[3] = 1460 & 0xff;
+    if (flags & TCP_ACK) return 4;
+    out[4] = 1; out[5] = 3; out[6] = 3; out[7] = windowScale;
+    return 8;
+}
+
 // Calibration can move the LAPIC-derived clock backwards. Only a forward
 // interval shorter than half the counter range can expire a TCP timer. This
 // also preserves ordinary uint64 wraparound for short elapsed intervals.
