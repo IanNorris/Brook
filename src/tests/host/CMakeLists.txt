@@ -79,6 +79,7 @@ add_host_test(test_ssd_install_plan)
 add_host_test(test_ssd_install_preflight)
 add_host_test(test_ssd_install_engine)
 add_host_test(test_ssd_install_gate)
+add_host_test(test_ssd_install_segmented_source)
 add_executable(test_ahci_system_volume "${BROOK_ROOT}/src/tests/test_ahci_system_volume/main.cpp"
     "${BROOK_ROOT}/src/kernel/src/ahci_system_volume.cpp")
 target_include_directories(test_ahci_system_volume PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/fatfs-object-adapter")

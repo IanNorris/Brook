@@ -2024,6 +2024,14 @@ source identity, payload authenticity, failure recovery and a full-size image
 still require implementation and validation. No internal SSD write has
 occurred on the Dell, and its USB recovery remains the boot path.
 
+The present single-file source cannot carry the full desktop disk image on
+FAT32: the filesystem limits an individual file to less than 4 GiB. A tested
+segmented-source offset mapper now handles reads spanning fixed-size chunks,
+including offsets beyond 4 GiB. It is not yet connected to the worker: opening
+and retaining every segment, validating their sizes and identity, and exercising
+the full image in QEMU remain necessary. Splitting alone does not make an image
+authentic, immutable, or safe to install.
+
 The test-only kernel can also discover a GPT partition on the identified
 scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload
 created and fsynced a 150123-byte file, renamed it, and fsynced its directory.
