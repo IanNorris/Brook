@@ -12,4 +12,7 @@ void AhciReadOnlyInit();
 AhciReadOnlyStatus AhciReadOnlyGetStatus();
 // Internal diagnostic read: exactly one 512-byte sector. No writes exist.
 int AhciReadOnlySector(uint64_t lba, void* output);
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+int AhciDisposableQemuTest();
+#endif
 } // namespace brook

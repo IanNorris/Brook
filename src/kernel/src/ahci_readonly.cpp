@@ -12,6 +12,11 @@
 #include "memory/address.h"
 #include "apic.h"
 #include "string.h"
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+#include "ahci_write_plan.h"
+#include "ahci_byte_write.h"
+#include "ahci_test_admission.h"
+#endif
 
 namespace brook {
 namespace {
@@ -25,6 +30,14 @@ bool dma64=false;
 PciDevice pci{};
 KMutex ioLock{};
 bool published=false;
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+bool testWritable=false;
+bool TestKvm() {
+    uint32_t a,b,c,d;
+    __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(0x40000000u),"c"(0));
+    return b==0x4b4d564bu && c==0x564b4d56u && d==0x0000004du;
+}
+#endif
 static constexpr uint32_t pages=17, dataOffset=4096, tableOffset=1280, fisOffset=1024;
 
 struct CommandHeader {
@@ -56,6 +69,20 @@ struct PortIo {
         }
         return false;
     }
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    bool waitClearFlush(uint32_t offset,uint32_t mask) {
+        const uint64_t start=ApicTickCount();
+        for(uint64_t spins=0;spins<2000000000ull;++spins) {
+            const uint32_t value=read(offset);
+            if(value==0xffffffffu)return false;
+            if(!(value&mask))return true;
+            const uint64_t now=ApicTickCount();
+            if(now>=start && now-start>=30000)return false;
+            __asm__ volatile("pause");
+        }
+        return false;
+    }
+#endif
 } io;
 
 void PciCommand(uint16_t value) {
@@ -70,8 +97,15 @@ void Quarantine(const char* reason) {
 }
 
 bool Run(const AhciReadPlan& plan, uint32_t expected) {
-    if(!dma || status.quarantined || (plan.fis[2]!=0xec && plan.fis[2]!=0x25) ||
-       plan.commandFlags!=5 || plan.prdtEntries!=1 || plan.byteCountMinusOne+1!=expected)
+    bool valid=(plan.fis[2]==0xec || plan.fis[2]==0x25) && plan.commandFlags==5 &&
+        plan.prdtEntries==1 && expected && plan.byteCountMinusOne+1==expected;
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    const bool isFlush=testWritable && plan.fis[2]==0xea && plan.commandFlags==5 &&
+        !plan.prdtEntries && !expected;
+    valid=valid || isFlush || (testWritable && plan.fis[2]==0x35 &&
+        plan.commandFlags==(5u|(1u<<6)) && plan.prdtEntries==1 && expected && plan.byteCountMinusOne+1==expected);
+#endif
+    if(!dma || status.quarantined || !valid)
         return false;
     // Do not alter descriptors if hardware unexpectedly owns any slot.
     if (io.read(CI) != 0 || io.read(SACT) != 0) {
@@ -83,9 +117,15 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
     header->flags=plan.commandFlags;header->prdtEntries=plan.prdtEntries;
     header->tableLow=uint32_t(dmaPhys+tableOffset);header->tableHigh=uint32_t((dmaPhys+tableOffset)>>32);
     memcpy(dma+tableOffset,plan.fis,sizeof(plan.fis));
-    auto* prd=reinterpret_cast<Prdt*>(dma+tableOffset+128);
-    prd->low=plan.dmaLow;prd->high=plan.dmaHigh;prd->byteCountMinusOne=plan.byteCountMinusOne;
+    if(plan.prdtEntries) {
+        auto* prd=reinterpret_cast<Prdt*>(dma+tableOffset+128);
+        prd->low=plan.dmaLow;prd->high=plan.dmaHigh;prd->byteCountMinusOne=plan.byteCountMinusOne;
+    }
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    const auto result=isFlush ? SubmitNoData(io) : Submit(io,expected);
+#else
     const auto result=Submit(io,expected);
+#endif
     if(result!=Result::Ok) { Quarantine("AHCI command failed or timed out");return false; }
     const uint8_t* d2h=dma+fisOffset+0x40;
     if(d2h[0]==0x34 && (d2h[2]&1u)) { Quarantine("ATA device reported an error");return false; }
@@ -118,9 +158,40 @@ int Read(Device*,uint64_t offset,void* output,uint64_t length) {
     KMutexUnlock(&ioLock);
     return done?int(done):(length?-5:0);
 }
-int Write(Device*,uint64_t,const void*,uint64_t) { return -30; }
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+struct TestByteIo {
+    bool read(uint64_t lba,uint32_t count,uint8_t*) { return ReadBlocks(lba,count); }
+    bool write(uint64_t lba,uint32_t count,const uint8_t*) {
+        AhciReadPlan p{};return AhciPlanWrite(p,lba,count,status.sectors,dmaPhys+dataOffset,dma64) && Run(p,count*512);
+    }
+};
+#endif
+int Write(Device*,uint64_t offset,const void* data,uint64_t len) {
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(testWritable && __atomic_load_n(&published,__ATOMIC_ACQUIRE)) {
+        KMutexLock(&ioLock);TestByteIo bytes;
+        const int result=status.ready ? AhciByteWrite(bytes,offset,data,len,status.sectors,dma+dataOffset) : -5;
+        KMutexUnlock(&ioLock);return result;
+    }
+#else
+    (void)offset;(void)data;(void)len;
+#endif
+    return -30;
+}
 int Ioctl(Device*,uint32_t request,void*) {
-    if(request==DEVICE_IOCTL_READ_ONLY)return 1;
+    if(request==DEVICE_IOCTL_READ_ONLY) {
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+        if(testWritable)return 0;
+#endif
+        return 1;
+    }
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(request==DEVICE_IOCTL_FLUSH && testWritable) {
+        KMutexLock(&ioLock);AhciReadPlan plan{};
+        const bool ok=status.ready && AhciPlanFlush(plan,true) && Run(plan,0);
+        KMutexUnlock(&ioLock);return ok?0:-5;
+    }
+#endif
     if(request==DEVICE_IOCTL_FLUSH)return 0;
     return -95;
 }
@@ -217,9 +288,19 @@ void AhciReadOnlyInit() {
     }
     status.sectors=info.sectors;status.logicalSectorBytes=info.logicalSectorBytes;
     status.physicalSectorBytes=info.physicalSectorBytes;memcpy(status.model,info.model,sizeof(status.model));
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    // This build is only for disposable QEMU fixtures: require all conditions,
+    // including an otherwise unused per-image marker and exact ATA identity.
+    auto* testMarker=VfsOpen("/etc/ahci-qemu-write-test");
+    if(testMarker){VfsClose(testMarker);testWritable=AhciDisposableTestAdmission(true,TestKvm(),selected,info,
+        AtaSupportsFlushExt(dma+dataOffset,512));}
+#endif
     KMutexInit(&ioLock);
     if(!DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
     status.ready=true;status.reason="read-only ATA device ready";
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(testWritable)status.reason="disposable QEMU test ATA device writable";
+#endif
     __atomic_store_n(&published,true,__ATOMIC_RELEASE);
 }
 AhciReadOnlyStatus AhciReadOnlyGetStatus() {
@@ -234,4 +315,12 @@ int AhciReadOnlySector(uint64_t lba,void* output) {
     if(ok)memcpy(output,dma+dataOffset,512);KMutexUnlock(&ioLock);
     return ok?512:-5;
 }
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+int AhciDisposableQemuTest() {
+    if(!testWritable)return -30;
+    uint8_t bytes[1030];for(uint32_t i=0;i<sizeof(bytes);++i)bytes[i]=uint8_t((i*37u+11u)&255u);
+    const int written=DeviceWrite(&device,4096ull*512+7,bytes,sizeof(bytes));
+    return written==int(sizeof(bytes)) ? DeviceFlush(&device) : -5;
+}
+#endif
 } // namespace brook

@@ -94,6 +94,13 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
     }
     constexpr char pciPrefix[]="bridge hardware pci ";
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(!strcmp(command,"bridge hardware ahci-qemu-write-test")) {
+        const int result=AhciDisposableQemuTest();
+        DebugChannelSend(result==0?"{\"ahci_qemu_write\":\"ok\"}\n":"{\"ahci_qemu_write\":\"failed\"}\n");
+        return true;
+    }
+#endif
     if(!strcmp(command,"bridge hardware ahci-ro")) {
         const auto s=AhciReadOnlyGetStatus();Reply r;
         r.text("{\"ahci_ro_api\":1,\"requested\":");r.text(s.requested?"true":"false");

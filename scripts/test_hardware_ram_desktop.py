@@ -18,6 +18,7 @@ p.add_argument('--memory-mb',type=int,default=2048,choices=[2048,4096,8192,16384
 p.add_argument('--capture-network',action='store_true',help='Record the private QEMU network to network.pcap')
 p.add_argument('--allow-host-network',action='store_true',help='Permit QEMU user-network access to an explicit test server')
 p.add_argument('--sata-image',type=Path,help='Attach a regular-file SATA fixture with a disposable QEMU snapshot overlay')
+p.add_argument('--sata-qemu-scratch',type=Path,help='Copy a 64 MiB fixture into this test output and attach the copy writable with a test-only serial')
 a=p.parse_args();desktop=a.desktop.resolve(strict=True);maintenance=a.maintenance.resolve(strict=True);out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
 if not (640<=a.width<=4096 and 480<=a.height<=2160):p.error('Private test display must be 640..4096 by 480..2160')
 m=json.loads((desktop/'manifest.json').read_text());mm=json.loads((maintenance/'manifest.json').read_text())
@@ -62,6 +63,14 @@ if a.sata_image:
     if a.sata_image.is_symlink() or not a.sata_image.is_file():p.error('SATA test disk must be an existing regular file, not a symlink')
     argv += ['-drive',f'if=none,id=satatest,format=raw,snapshot=on,file={a.sata_image.resolve()}',
              '-device','ide-hd,drive=satatest,bus=ide.0']
+if a.sata_qemu_scratch:
+    if a.sata_image:p.error('Choose one SATA test disk mode')
+    if a.sata_qemu_scratch.is_symlink() or not a.sata_qemu_scratch.is_file() or a.sata_qemu_scratch.stat().st_size!=64*1024**2:
+        p.error('Scratch source must be a regular 64 MiB test fixture')
+    scratch=out/'sata-scratch.raw'
+    shutil.copyfile(a.sata_qemu_scratch,scratch)
+    argv += ['-drive',f'if=none,id=satatest,format=raw,file={scratch}',
+             '-device','ide-hd,drive=satatest,bus=ide.0,serial=BROOK-AHCI-TEST-01']
 (out/'argv.json').write_text(json.dumps(argv,indent=2)+'\n');log=(out/'qemu.log').open('x');owner=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT);q=None;rpc=None
 try:
     end=time.monotonic()+180

@@ -1890,3 +1890,18 @@ driver. Host tests cover request bounds, randomized unaligned writes against
 an oracle, failed prereads and uncertain writes, and flush failure evidence.
 Actual writable integration, serialization, durability, QEMU disk persistence,
 and full-disk installation rehearsal remain outstanding.
+
+The first write integration is available only in a separately built kernel
+(`BROOK_AHCI_WRITE_TEST_HOOKS=ON`). It admits only an explicitly marked KVM
+guest, port 0, the exact 64 MiB QEMU test disk model and serial, and an ATA
+device advertising FLUSH CACHE EXT. The normal kernel contains no write-test
+command and continues to reject SSD writes. The private QEMU harness copies
+the fixture before attaching it writable.
+
+On the final test kernel, a 1030-byte unaligned write and ATA flush succeeded;
+all 64 MiB of the stopped scratch image matched the original plus precisely
+the intended patch. A fresh QEMU process read the data back and refused a new
+write when the marker was absent. A disk with the wrong serial was also refused.
+The original fixture hash remained unchanged. These results validate a bounded
+test path, not a general writable driver, filesystem crash consistency, or SSD
+installation. Evidence: `build/hardware/atw3`, `atw4`, and `atw5`.
