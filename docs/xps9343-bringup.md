@@ -1754,8 +1754,24 @@ a private output directory and checks their lengths and checksums again. The
 collector and normal kernel captured seven QEMU firmware tables, including
 DSDT (`build/hardware/acpi-qemu-capture`). Invalid table slots are reported
 separately. Firmware tables can contain device-specific identifiers, so keep
-captures local. The interface has not yet been deployed or tested on the Dell;
-QEMU capture does not establish that the Dell's SST or codec resources work.
+captures local. The exact candidate passed the private QEMU writable-desktop,
+ACPI capture and clean reboot checks (`acpi-dell-candidate-qemu`), then was
+activated through the Dell's guarded USB A/B updater (`dell-acpi-update-20261031`).
+The new boot is reachable, its writable desktop store is ready and the SSD
+inventory remains read-only. The collector saved 27 validated tables locally
+(`dell-acpi-capture-20261031`); do not commit these machine-specific artifacts.
+
+Standalone ACPICA disassembly of the captured DSDT shows an `ADSP` SST device
+with conditional `INT3438`/`INT33C8` IDs and an `I2C0.ACD0` codec candidate with
+conditional `INT343A`/`INT33CA` IDs. Its resource template describes I²C address
+0x1c; the SST package describes I²S at 48 kHz, two channels and 24-bit samples.
+These are static firmware descriptions: `_STA`, controller BARs, interrupts,
+codec identity and power depend on runtime firmware state and remain unverified.
+The combined DSDT/SSDT decompilation encountered duplicate-object conflicts;
+the standalone DSDT disassembly succeeded. No device registers were touched.
+The new boot's read-only PCI inventory still shows the two HDA-class controllers
+but no obvious LPSS I²C or SST PCI function. Firmware may expose these through
+ACPI instead; the static DSDT does not prove that either device is enabled.
 
 ### Passive-open MSS and hardware transfer profile (2026-10-31)
 
