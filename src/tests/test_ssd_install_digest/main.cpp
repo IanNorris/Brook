@@ -18,6 +18,12 @@ int main(){
     std::memcpy(record+40,expected,32);Source source;source.bytes.resize(size);
     for(size_t i=0;i<size;++i)source.bytes[i]=uint8_t(i%251);
     uint8_t buffer[1024];assert(SsdDigestVerifyPinned(source,record,sizeof(record),geometry,size,buffer,sizeof(buffer)));
+    uint8_t trusted[SsdDigestRecordBytes];std::memcpy(trusted,record,sizeof(trusted));
+    assert(SsdDigestVerifyExpectedPinned(source,record,sizeof(record),trusted,sizeof(trusted),geometry,size,buffer,sizeof(buffer)));
+    trusted[40]^=1;auto savedReads=source.reads;
+    assert(!SsdDigestVerifyExpectedPinned(source,record,sizeof(record),trusted,sizeof(trusted),geometry,size,buffer,sizeof(buffer)) && source.reads==savedReads);
+    trusted[40]^=1;
+    assert(!SsdDigestVerifyExpectedPinned(source,record,sizeof(record),trusted,sizeof(trusted)-1,geometry,size,buffer,sizeof(buffer)) && source.reads==savedReads);
     source.bytes[100]^=1;assert(!SsdDigestVerifyPinned(source,record,sizeof(record),geometry,size,buffer,sizeof(buffer)));source.bytes[100]^=1;
     auto before=source.reads;assert(!SsdDigestVerifyPinned(source,record,sizeof(record),{69,34,1},size,buffer,sizeof(buffer)) && source.reads==before);
     assert(!SsdDigestVerifyPinned(source,record,sizeof(record)-1,geometry,size,buffer,sizeof(buffer)) && source.reads==before);

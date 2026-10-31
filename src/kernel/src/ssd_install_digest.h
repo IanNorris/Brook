@@ -29,4 +29,15 @@ template<class Source> bool SsdDigestVerifyPinned(Source& source,const uint8_t* 
     uint8_t digest[32];BrookShaFinish(&hash,digest);
     return BrookUpdateEqual(digest,record+SsdDigestHeaderBytes,32);
 }
+// A source-supplied checksum alone can be replaced with the source. A future
+// installer must provide the expected record from its boot-pinned manifest,
+// and must reject any mismatch before reading the payload or writing a target.
+template<class Source> bool SsdDigestVerifyExpectedPinned(Source& source,const uint8_t* record,uint32_t bytes,
+                                                           const uint8_t* expected,uint32_t expectedBytes,
+                                                           const SsdInstallGeometry& geometry,uint64_t packedBytes,
+                                                           uint8_t* buffer,uint32_t capacity) {
+    if(!expected || expectedBytes!=SsdDigestRecordBytes || !record || bytes!=SsdDigestRecordBytes ||
+       !BrookUpdateEqual(record,expected,SsdDigestRecordBytes))return false;
+    return SsdDigestVerifyPinned(source,record,bytes,geometry,packedBytes,buffer,capacity);
+}
 }

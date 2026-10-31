@@ -83,7 +83,14 @@ int Run() {
                VfsRead(record,data,sizeof(data),&off)!=int(sizeof(data)))result=-22;
             VfsRelease(record);
         }
-        if(!result && !SsdDigestVerifyPinned(source,data,sizeof(data),compactGeometry,sourceBytes,a,65536))result=-5;
+        auto* expected=VfsOpen("/etc/ssd-install-expected",VFS_O_STREAM);
+        if(!result && expected) {
+            uint8_t trusted[SsdDigestRecordBytes]{};VnodeStat expectedStat{};uint64_t expectedOffset=0;
+            if(VfsStat(expected,&expectedStat) || expectedStat.isDir || expectedStat.isSymlink ||
+               expectedStat.size!=sizeof(trusted) || VfsRead(expected,trusted,sizeof(trusted),&expectedOffset)!=int(sizeof(trusted)) ||
+               !SsdDigestVerifyExpectedPinned(source,data,sizeof(data),trusted,sizeof(trusted),compactGeometry,sourceBytes,a,65536))result=-5;
+        } else if(!result && !SsdDigestVerifyPinned(source,data,sizeof(data),compactGeometry,sourceBytes,a,65536))result=-5;
+        if(expected)VfsRelease(expected);
     }
     if(!result) {
         uint8_t* mbr=meta;uint8_t* primary=meta+512;uint8_t* backup=meta+1024;
