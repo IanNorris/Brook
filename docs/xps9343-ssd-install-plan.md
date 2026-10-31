@@ -56,6 +56,23 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   the Firefox HTTPS follow-up in `xps9343-bringup.md`), so this is not yet
   evidence of an SSD-specific failure. Physical screen and input observations
   are needed to distinguish a guest hang from an adapter or link failure.
+- The user subsequently confirmed that the desktop had hung without a
+  watchdog response. After the forced restart, the first boot reported an
+  xHCI controller reset failure; a subsequent boot had network access again.
+  The SSD system partition mounted, but the store was refused at
+  `header-and-dirty` and remains unmounted for maintenance. Do not bypass its
+  dirty check or run applications against it before filesystem recovery.
+- Source inspection found that the software watchdog thread was allocated
+  but never enqueued. A candidate fixes that and makes its per-CPU accounting
+  checks diagnostic only: it cannot detect a complete hard lockup while its
+  own scheduler or timer cannot run. A private QEMU boot confirmed the monitor
+  thread ran; independent hard-lockup detection remains future work.
+- The maintenance initrd's Bash is dynamically linked into the unavailable
+  `/nix`, and the RAM transfer helper creates non-executable files. A bootstrap
+  that worked in a QEMU desktop with `/nix` is therefore not valid on the
+  current Dell maintenance boot. A separate recovery initrd is being prepared
+  with a fixed-path, read-only system-store snapshot helper; host and QEMU
+  transfer tests passed. No physical recovery write has been attempted.
 
 ## Remaining engineering gates
 

@@ -11,6 +11,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#ifdef BROOK_BULK_SYSTEM_SNAPSHOT
+#include <sys/statfs.h>
+#endif
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -18,7 +21,13 @@
 #include "../src/shared/update/payload.h"
 #include "../src/shared/brook_debug_frame.h"
 #include "../src/shared/brook_ahci_export.h"
-#ifdef BROOK_BULK_INSTALL_MEDIA
+#if defined(BROOK_BULK_INSTALL_MEDIA) && defined(BROOK_BULK_SYSTEM_SNAPSHOT)
+#error incompatible bulk helper profiles
+#endif
+#ifdef BROOK_BULK_SYSTEM_SNAPSHOT
+#define BULK_LIMIT (4026531840ULL)
+#define BULK_ROOT "/media/system"
+#elif defined(BROOK_BULK_INSTALL_MEDIA)
 #define BULK_LIMIT (2ULL*1024*1024*1024)
 #define BULK_ROOT "/media/usb"
 #else
@@ -50,11 +59,20 @@ static int hash_fd(int fd,uint64_t bytes,uint8_t hash[32]){
     BrookShaFinish(&context,hash);return lseek(fd,0,SEEK_SET)<0?-1:0;
 }
 static int directory_open(const char* path){
-#ifndef BROOK_BULK_INSTALL_MEDIA
+#if !defined(BROOK_BULK_INSTALL_MEDIA) && !defined(BROOK_BULK_SYSTEM_SNAPSHOT)
     if(mkdir(path,0755)&&errno!=EEXIST)return -1;
 #endif
     int fd=open(path,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);struct stat st;
     if(fd>=0&&(fstat(fd,&st)||st.st_uid!=geteuid()||(st.st_mode&0022))){close(fd);errno=EPERM;return -1;}
+#if defined(BROOK_BULK_SYSTEM_SNAPSHOT) && !defined(BROOK_BULK_TEST)
+    // Reject the initrd's empty mountpoint or a different filesystem. The
+    // SSD system volume must be a distinct FAT mount beneath /media.
+    struct statfs fs;struct stat parent;
+    if(fd>=0&&(fstatfs(fd,&fs)||stat("/media",&parent)||
+               (uint64_t)fs.f_type!=0x4d44 || st.st_dev==parent.st_dev)){
+        close(fd);errno=EPERM;return -1;
+    }
+#endif
     return fd;
 }
 static int capture(uint8_t** output,uint64_t* bytes,struct BrookDebugFrameInfo* info){
@@ -81,6 +99,9 @@ done:
     return result;
 }
 static int serve(int client,int directory,const char* key,const char* boot,const char* tx,const char* action,const char* source){
+#ifdef BROOK_BULK_SYSTEM_SNAPSHOT
+    (void)source;
+#endif
     uint8_t header[104];int fd=-1,result=10,partial=0,published=0,saved_errno=0;uint8_t* frame=NULL;
 #ifdef BROOK_BULK_INSTALL_MEDIA
     int file_created=0,cleanup_failed=0;
@@ -160,10 +181,23 @@ static int serve(int client,int directory,const char* key,const char* boot,const
         if(getenv("BROOK_BULK_TEST_PUBLISHED_FAILURE")){result=21;goto done;}
 #endif
     }else if(!strcmp(action,"get")){
+#ifdef BROOK_BULK_SYSTEM_SNAPSHOT
+        const char *name="STORE.IMG";
+#else
         char name[48];snprintf(name,sizeof(name),"%s.bin",source);
+#endif
         fd=openat(directory,name,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);struct stat st;
         if(fd<0||fstat(fd,&st)||!S_ISREG(st.st_mode)||st.st_nlink!=1||st.st_size<0||(uint64_t)st.st_size>BULK_LIMIT){result=22;goto done;}
+#ifdef BROOK_BULK_SYSTEM_SNAPSHOT
+#ifndef BROOK_BULK_TEST
+        if((uint64_t)st.st_size!=BULK_LIMIT){result=22;goto done;}
+#endif
+#endif
         bytes=(uint64_t)st.st_size;if(hash_fd(fd,bytes,hash)){result=23;goto done;}
+#ifdef BROOK_BULK_SYSTEM_SNAPSHOT
+        uint64_t checked_at=now_ms();if(checked_at==UINT64_MAX||checked_at>UINT64_MAX-120000){result=23;goto done;}
+        deadline_ms=checked_at+120000;
+#endif
     }else{
         if(capture(&frame,&bytes,&info)){result=24;goto done;}
         BrookUpdateHash(frame,(size_t)bytes,hash);
@@ -180,11 +214,20 @@ static int serve(int client,int directory,const char* key,const char* boot,const
     }
     char path[128];
     if(!strcmp(action,"frame") || !strcmp(action,"disk"))strcpy(path,"null");
-    else if(!strcmp(action,"get"))snprintf(path,sizeof(path),"\"" BULK_ROOT "/%s.bin\"",source);
+    else if(!strcmp(action,"get"))
+#ifdef BROOK_BULK_SYSTEM_SNAPSHOT
+        snprintf(path,sizeof(path),"\"" BULK_ROOT "/STORE.IMG\"");
+#else
+        snprintf(path,sizeof(path),"\"" BULK_ROOT "/%s.bin\"",source);
+#endif
     else snprintf(path,sizeof(path),"\"" BULK_ROOT "/%s\"",final);
     snprintf(text,sizeof(text),"{\"state\":\"completed\",\"transaction_id\":\"%s\",\"action\":\"%s\",\"bytes\":%"PRIu64",\"sha256\":\"%s\",\"guest_path\":%s,\"retention\":\"%s\"}\n",tx,action,bytes,digest,path,
-#ifdef BROOK_BULK_INSTALL_MEDIA
+#if defined(BROOK_BULK_INSTALL_MEDIA) || defined(BROOK_BULK_SYSTEM_SNAPSHOT)
+#ifdef BROOK_BULK_SYSTEM_SNAPSHOT
+        "system_store_readonly"
+#else
         "usb_media"
+#endif
 #else
         !strcmp(action,"disk")?"not_staged":"current_boot_ram"
 #endif
@@ -204,7 +247,9 @@ done:
     return result;
 }
 int main(int argc,char** argv){
-#ifdef BROOK_BULK_INSTALL_MEDIA
+#ifdef BROOK_BULK_SYSTEM_SNAPSHOT
+    if(argc!=5 || !valid_id(argv[1]) || !valid_id(argv[2]) || strcmp(argv[3],"get") || !valid_id(argv[4]))return 2;
+#elif defined(BROOK_BULK_INSTALL_MEDIA)
     if(argc!=5 || !valid_id(argv[1]) || !valid_id(argv[2]) || strcmp(argv[3],"put") ||
        (strcmp(argv[4],"INST0000.IMG") && strcmp(argv[4],"INST0001.IMG") &&
         strcmp(argv[4],"INST0002.IMG") && strcmp(argv[4],"INST0003.IMG") &&
@@ -239,7 +284,7 @@ int main(int argc,char** argv){
     struct pollfd wait={listener,POLLIN,0};if(poll(&wait,1,60000)<=0){result=6;goto done;}
     client=accept(listener,NULL,NULL);if(client<0){result=7;goto done;}
     sliding_deadline=!strcmp(argv[3],"disk");
-#ifdef BROOK_BULK_INSTALL_MEDIA
+#if defined(BROOK_BULK_INSTALL_MEDIA) || defined(BROOK_BULK_SYSTEM_SNAPSHOT)
     sliding_deadline=1;
 #endif
     uint64_t now=now_ms(),allowance=sliding_deadline?120000:600000;

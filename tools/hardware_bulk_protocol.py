@@ -49,7 +49,7 @@ def upload(host,port,key,boot,transaction,path,finalize=True,*,max_bytes=LIMIT,t
             if (completed.get('state'),completed.get('transaction_id'),completed.get('action'),completed.get('bytes'),completed.get('sha256'))!=('completed',transaction,'put',sent,digest.hex()):raise ValueError('Final receipt mismatch')
             return completed
 
-def download(host,port,key,boot,transaction,path,action='get'):
+def download(host,port,key,boot,transaction,path,action='get',*,max_bytes=LIMIT,timeout=60):
     if action not in ('get','frame'):raise ValueError('Invalid download action')
     path=Path(path).absolute();partial=path.with_name(path.name+'.part')
     # Exclusive temporary creation; final no-replace publication occurs only
@@ -57,9 +57,9 @@ def download(host,port,key,boot,transaction,path,action='get'):
     fd=os.open(partial,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
     try:
         with os.fdopen(fd,'wb') as output,socket.create_connection((host,port),timeout=30) as connection:
-            connection.settimeout(60);authenticate(connection,key,boot,transaction);meta=line(connection)
+            connection.settimeout(timeout);authenticate(connection,key,boot,transaction);meta=line(connection)
             count=meta.get('bytes')
-            if meta.get('state')!='payload' or isinstance(count,bool) or not isinstance(count,int) or not 0<=count<=LIMIT:raise ValueError('Invalid binary extent')
+            if meta.get('state')!='payload' or isinstance(count,bool) or not isinstance(count,int) or not 0<=count<=max_bytes:raise ValueError('Invalid binary extent')
             digest=meta.get('sha256')
             if not isinstance(digest,str) or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):raise ValueError('Invalid payload hash')
             if action=='frame':
