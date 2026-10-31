@@ -1867,3 +1867,18 @@ non-booting Ubuntu installation and explicitly authorized wiping it for Brook.
 The USB remains the recovery path. First identify the actual target and prove
 the driver and full-disk installation against disposable QEMU media; no
 internal SSD sectors have yet been written.
+
+The read-only driver subsequently passed private QEMU SATA tests, including
+byte comparisons at the beginning, middle and end of a GPT fixture, rejected
+out-of-range reads, and an unchanged source-image checksum. The same opt-in
+payload passed the writable desktop's two checked shutdowns, reboot persistence
+and ext2 verification. UI acceptance was not part of that storage test.
+
+On the Dell, the read-only payload booted and identified the device on AHCI
+port 3 as `SAMSUNG SSD PM851 M.2 2280 256GB`, 500118192 logical sectors of
+512 bytes. Sector 0 contains a signed legacy MBR with one active Linux (0x83)
+partition beginning at sector 2048 and spanning 500115456 sectors; sector 1
+and the final sector do not contain GPT headers. This is an inventory, not a
+filesystem integrity check. The SSD has not been written. USB recovery remains
+in place; a QEMU-validated writable SATA driver and installation procedure
+are still required before installation.

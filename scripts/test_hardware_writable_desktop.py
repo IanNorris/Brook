@@ -50,6 +50,7 @@ def main():
     p.add_argument('--recovery',required=True,type=Path)
     p.add_argument('--output',required=True,type=Path)
     p.add_argument('--disk-template',type=Path,help='Private stopped regular-file disk to clone; caller must first observe its QEMU owner exited')
+    p.add_argument('--sata-image',type=Path,help='Attach a disposable SATA test disk using a QEMU snapshot')
     p.add_argument('--review-seconds',type=int,default=1200)
     a=p.parse_args();desktop=a.desktop.resolve(strict=True);recovery=a.recovery.resolve(strict=True)
     out=a.output.absolute();out.mkdir(parents=True,exist_ok=False)
@@ -95,6 +96,11 @@ def main():
             '-display','none','-serial','file:'+str(base/'serial.log'),
             '-qmp','unix:'+str(base/'qmp.sock')+',server=on,wait=off',
             '-qmp','unix:'+str(base/'qmp-review.sock')+',server=on,wait=off','-no-reboot']
+        if a.sata_image:
+            sata=a.sata_image.resolve(strict=True)
+            if not sata.is_file():raise ValueError('SATA test image must be a regular file')
+            argv += ['-drive',f'if=none,id=satatest,format=raw,snapshot=on,file={sata}',
+                     '-device','ide-hd,drive=satatest,bus=ide.0']
         save(base/'argv.json',argv);log=(base/'qemu.log').open('x');owner=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT);q=None;rpc=None
         try:
             end=time.monotonic()+300
