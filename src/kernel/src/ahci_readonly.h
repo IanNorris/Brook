@@ -7,7 +7,7 @@ struct AhciReadOnlyStatus {
     const char* reason="not requested";
     uint32_t port=0, logicalSectorBytes=0, physicalSectorBytes=0;
     uint64_t sectors=0;
-    char model[41]{};
+    char model[41]{}, serial[21]{};
 };
 void AhciReadOnlyInit();
 AhciReadOnlyStatus AhciReadOnlyGetStatus();

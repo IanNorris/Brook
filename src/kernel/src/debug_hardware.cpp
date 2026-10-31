@@ -108,6 +108,7 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"reason\":");r.quoted(s.reason);r.text(",");r.field("port",s.port);
         r.text(",");r.field("sectors",s.sectors);r.text(",");r.field("logical_sector_bytes",s.logicalSectorBytes);
         r.text(",");r.field("physical_sector_bytes",s.physicalSectorBytes);r.text(",\"model\":");r.quoted(s.model);
+        r.text(",\"serial\":");r.quoted(s.serial);
         r.text("}\n");r.send();return true;
     }
     constexpr char sectorPrefix[]="bridge hardware ahci-sector ";

@@ -6,6 +6,8 @@
 #include "pci.h"
 #include "display_power.h"
 #include "writable_desktop.h"
+#include "ahci_readonly.h"
+#include "ahci_observe.h"
 #include <cassert>
 #include <cstring>
 #include <string>
@@ -16,6 +18,11 @@ namespace brook {
 AppSnapshotBootInfo snapshot;
 WritableDesktopInfo writable;
 WritableDesktopInfo WritableDesktopRead(){return writable;}
+AhciReadOnlyStatus ahciStatus{};
+AhciObservation ahciObservation{};
+AhciReadOnlyStatus AhciReadOnlyGetStatus(){return ahciStatus;}
+const AhciObservation& AhciObserveRead(){return ahciObservation;}
+int AhciReadOnlySector(uint64_t lba,void* out){if(lba!=3)return -22;std::memset(out,0x5a,512);return 512;}
 Vnode binaryNode{},markerNode{};
 bool binaryPresent=false,markerPresent=false,directory=false,statError=false;
 unsigned openNodes=0;
@@ -65,6 +72,11 @@ int main(){
     assert(reply.find("\"pci_inventory_api\":1")!=std::string::npos);
     assert(reply.find("\"backlight_api\":1")!=std::string::npos);
     assert(reply.find("\"writable_desktop_api\":1")!=std::string::npos);
+    brook::ahciStatus.ready=true;std::strcpy(brook::ahciStatus.serial,"serial-123");
+    assert(handle("bridge hardware ahci-ro") && reply.find("\"serial\":\"serial-123\"")!=std::string::npos);
+    assert(handle("bridge hardware ahci-sector 3") && reply.find("5a5a5a5a")!=std::string::npos);
+    assert(handle("bridge hardware ahci-sector 4") && reply.find("ahci_ro_error")!=std::string::npos);
+    assert(handle("bridge hardware ahci") && reply.find("ahci_observe_api")!=std::string::npos);
     assert(handle("bridge hardware backlight status") && !backlightCalls && reply.find("\"available\":false")!=std::string::npos);
     assert(handle("bridge hardware backlight off 10") && backlightCalls==1 && backlightSeconds==10 && !backlightOn);
     assert(reply.find("\"ok\":false")!=std::string::npos);

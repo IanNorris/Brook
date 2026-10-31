@@ -1977,6 +1977,24 @@ clones from those negative tests were removed after their logs and hashes were
 saved. This proves a prepared QEMU image, not a guest-side installer or a Dell
 SSD installation. The Dell remains on the existing read-only USB boot.
 
+The tested read-only USB payload was subsequently deployed to the Dell and
+captured the internal SSD's full ATA identity in a local mode-0600 evidence
+file. Its model and capacity match the earlier inventory; no write-target or
+system-volume record was provisioned on the Dell. The debug response exposes
+the serial for exact target binding; it is not recorded in the repository.
+
+An unconnected installer operation planner now describes bounded sector writes
+for an exact-capacity, canonical 128-entry GPT disk. It invalidates the old
+backup and primary metadata with flushes, copies and verifies the selected
+payload, then writes and verifies each GPT copy before publishing and checking
+the protective MBR. Errors make the in-memory plan terminal. PMBR-last is not
+an atomic boot guarantee, and sectors outside the payload and GPT metadata
+retain old contents: this is not a secure erase. Source GPT/layout validation,
+source immutability, target exclusivity, persistent receipts, the streaming
+receiver and independent readback must be implemented before use. Planner tests
+cover ordering, boundary geometry, failure at every operation, untouched gaps,
+and a GPT produced independently by `sfdisk`.
+
 The test-only kernel can also discover a GPT partition on the identified
 scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload
 created and fsynced a 150123-byte file, renamed it, and fsynced its directory.

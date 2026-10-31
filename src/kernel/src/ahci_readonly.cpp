@@ -297,6 +297,7 @@ void AhciReadOnlyInit() {
     }
     status.sectors=info.sectors;status.logicalSectorBytes=info.logicalSectorBytes;
     status.physicalSectorBytes=info.physicalSectorBytes;memcpy(status.model,info.model,sizeof(status.model));
+    memcpy(status.serial,info.serial,sizeof(status.serial));
     AhciWriteTarget target{};bool targetPresent=false;
     const bool parsed=ReadWriteTarget(target,targetPresent);
     writeEnabled=parsed && AhciWriteTargetMatches(target,pci.vendorId,pci.deviceId,pci.bus,pci.dev,pci.fn,
