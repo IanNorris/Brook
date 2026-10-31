@@ -1760,6 +1760,15 @@ activated through the Dell's guarded USB A/B updater (`dell-acpi-update-20261031
 The new boot is reachable, its writable desktop store is ready and the SSD
 inventory remains read-only. The collector saved 27 validated tables locally
 (`dell-acpi-capture-20261031`); do not commit these machine-specific artifacts.
+That initial diagnostic interface permitted non-AML tables, including MSDM,
+which can contain an OEM license key. The retained local MSDM copy was removed.
+The interface was narrowed to DSDT/SSDT only, tested with a private QEMU desktop
+and a host MSDM-denial test, and then deployed through the guarded Dell updater
+(`dell-acpi-private-update-20261031`). On the new boot the DSDT is readable,
+the non-AML test slot is rejected, the store is ready and SSD inventory remains
+read-only. A fresh capture contains 12 AML tables and omits 15 other slots
+(`dell-acpi-aml-private-20261031`). The debug TCP interface is boot-bound, not
+authenticated; protect access to it and keep AML captures private.
 
 Standalone ACPICA disassembly of the captured DSDT shows an `ADSP` SST device
 with conditional `INT3438`/`INT33C8` IDs and an `I2C0.ACD0` codec candidate with

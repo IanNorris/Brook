@@ -58,7 +58,10 @@ int main(){
         uint8_t copy[8]{};assert(reader.CopyTable(reader.Dsdt(),0,copy,sizeof(copy)) && !std::memcmp(copy,"DSDT",4));
         assert(f.init() && AcpiInventoryCount()==3);
         assert(AcpiInventoryRead(0,0,copy,sizeof(copy),table) && !std::memcmp(copy,"DSDT",4));
-        assert(AcpiInventoryRead(1,0,copy,0,table) && !std::memcmp(table.signature,"FACP",4));
+        assert(!AcpiInventoryRead(1,0,copy,0,table)); // FADT is not an AML table
+        std::memcpy(f.fadt,"MSDM",4);f.fadtCrc();assert(!AcpiInventoryRead(1,0,copy,4,table));
+        std::memcpy(f.fadt,"SSDT",4);f.fadtCrc();assert(AcpiInventoryRead(1,0,copy,4,table) && !std::memcmp(copy,"SSDT",4));
+        std::memcpy(f.fadt,"FACP",4);f.fadtCrc();
         assert(!AcpiInventoryRead(3,0,copy,1,table) && !AcpiInventoryRead(0,60,copy,8,table));
         assert(!AcpiInventoryRead(0,0,copy,513,table) && !AcpiInventoryRead(0,0,nullptr,1,table));
         assert(!reader.CopyTable(reader.Dsdt(),60,copy,8) && !reader.CopyTable(reader.Dsdt(),UINT32_MAX,copy,1));

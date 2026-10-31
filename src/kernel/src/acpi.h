@@ -42,8 +42,8 @@ const MadtInfo& AcpiGetMadt();
 // Find a table by its 4-character signature (e.g. "HPET", "FACP").
 // Returns the physical address of the table header, or 0 if not found/invalid. Tables have bounded lengths and checked checksums.
 uint64_t AcpiFindTable(const char* signature);
-// Read-only diagnostic inventory: index 0 is DSDT and subsequent indices are
-// validated root-table entries. No caller-supplied physical addresses.
+// Read-only AML inventory: index 0 is DSDT; subsequent indices select only
+// validated SSDT entries. No caller-supplied physical addresses.
 uint32_t AcpiInventoryCount();
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& header);
 

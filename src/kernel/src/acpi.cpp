@@ -142,6 +142,11 @@ bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,A
     if(index>=AcpiInventoryCount() || bytes>512 || (bytes && !out))return false;
     const uint64_t address=index?g_tables.RootEntry(index-1,&header):g_tables.Dsdt(&header);
     if(!address || offset>header.length || bytes>header.length-offset)return false;
+    // Firmware tables such as MSDM can contain product keys. The audio
+    // investigation only needs AML, so do not expose arbitrary ACPI tables.
+    const char* s=header.signature;
+    if(!((s[0]=='D' && s[1]=='S' && s[2]=='D' && s[3]=='T') ||
+         (s[0]=='S' && s[1]=='S' && s[2]=='D' && s[3]=='T')))return false;
     return !bytes || g_tables.CopyTable(address,offset,out,bytes);
 }
 } // namespace brook
