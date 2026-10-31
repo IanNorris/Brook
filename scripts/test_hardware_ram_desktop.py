@@ -20,6 +20,7 @@ p.add_argument('--allow-host-network',action='store_true',help='Permit QEMU user
 p.add_argument('--sata-image',type=Path,help='Attach a regular-file SATA fixture with a disposable QEMU snapshot overlay')
 p.add_argument('--sata-qemu-scratch',type=Path,help='Copy a recognized fixture into this output and attach it with a test-only serial')
 p.add_argument('--installer-source',type=Path,help='Copy a recognized regular-file source into the private USB fixture for the test-only installer')
+p.add_argument('--installer-package',type=Path,help='Copy a verified compact test package into the private USB fixture')
 p.add_argument('--installer-segmented',action='store_true',help='Split the test source into two pinned FAT files')
 p.add_argument('--installer-compact',action='store_true',help='Use the compact layout for the recognized 64 MiB QEMU fixture')
 p.add_argument('--installer-omit-second',action='store_true',help='Omit the second source segment for a failure test')
@@ -43,9 +44,22 @@ if a.private_disk_mib:
     for child in staging.iterdir():run('mcopy','-s','-i',str(disk)+'@@1048576',child,'::/')
     shutil.rmtree(staging)
 else:run('cp','--reflink=auto',maintenance/'probe.raw',disk)
-if a.installer_segmented and not a.installer_source:p.error('segmented source requires --installer-source')
+if a.installer_source and a.installer_package:p.error('choose one installer source')
+if a.installer_segmented and not (a.installer_source or a.installer_package):p.error('segmented source requires an installer source')
 if a.installer_omit_second and not a.installer_segmented:p.error('omitting a segment requires --installer-segmented')
 if a.installer_compact and not a.installer_segmented:p.error('compact source requires --installer-segmented')
+if a.installer_package:
+    if not a.installer_compact or not a.installer_segmented or not a.sata_qemu_scratch:
+        p.error('package requires compact segmented source and SATA scratch')
+    from pack_ssd_install_source import verify_package
+    package=verify_package(a.installer_package)
+    if package['geometry'] != {'disk_sectors':131072,'payload_first':2048,'payload_sectors':126976} or package['segment_bytes']!=32*1024**2:
+        p.error('package does not match the recognized QEMU fixture')
+    for i,item in enumerate(package['segments']):
+        if i==1 and a.installer_omit_second:break
+        run('mcopy','-o','-i',str(disk)+'@@1048576',a.installer_package/item['name'],'::'+item['name'])
+    marker=out/'INSTCMP.OK';marker.write_text('test-only compact source\n')
+    run('mcopy','-o','-i',str(disk)+'@@1048576',marker,'::INSTCMP.OK')
 if a.installer_source:
     if not a.installer_segmented:p.error('the installer test kernel requires --installer-segmented')
     if not a.sata_qemu_scratch:p.error('installer source requires the private SATA scratch fixture')

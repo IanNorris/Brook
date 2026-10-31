@@ -2245,3 +2245,22 @@ also completed a valid compact install and booted its result without USB
 (`build/hardware/compact-installer-final-20261031`,
 `build/hardware/compact-sata-boot-final-20261031`). The original full-source
 fixture path still passed (`build/hardware/noncompact-installer-regression-20261031`).
+
+`scripts/pack_ssd_install_source.py` now builds a compact package from a stopped
+regular-file disk image. It validates the canonical protective MBR, both GPT
+headers and entry arrays and a single EFI partition, then emits bounded FAT-sized
+segments plus a geometry-bound checksum manifest. Absence of the manifest means
+the output is incomplete. Checksums detect corruption, not authenticity or
+installation authorization. The builder cannot enforce source immutability;
+its input must remain stopped and unchanged throughout packing. Its MBR check
+requires the protective entry in slot zero, which is stricter than the kernel.
+
+Host tests reject damaged metadata, modified segment bytes and modified manifest
+geometry. The generated 64 MiB fixture package installed and booted without USB
+in a fresh private QEMU process (`build/hardware/compact-package-qemu-20261031`,
+`build/hardware/compact-package-boot-20261031`); the stopped installed image
+matched the full source byte for byte. This is still the fixed test-only worker.
+The QEMU harness verifies package files before reopening them for copying, so
+it assumes they are not concurrently modified. A production path must verify
+pinned or staged bytes, bind a trusted package identity and geometry, establish
+source/target ownership, and retain USB recovery before any physical write.
