@@ -2364,3 +2364,16 @@ shutdown symptom but does not prove its cause: the VM differs in hardware,
 profile history and runtime conditions. It is not an interactive browsing or
 download acceptance test. The Dell remained absent from neighbour discovery;
 its physical state still needs inspection before more hardware tests.
+
+A test-only pause point now permits an interrupted-install rehearsal after the
+first payload operation. With the disposable 64 MiB QEMU target paused there,
+QMP `quit` stopped the guest without a guest shutdown. The stopped target had
+zeroed primary GPT/MBR sectors and a zeroed backup header. A fresh QEMU guest
+booted the separate USB recovery image, reinstalled a copy of that target from
+the same compact package, and completed checked shutdown (`int1`, `int2`). The
+recovered target matched the full source byte for byte and booted in another
+QEMU process without USB (`intboot`). The review harness's expected assertion
+when its guest was deliberately stopped is retained in the run output. This is
+one controlled guest interruption, not a host power-loss or arbitrary-write
+ordering test: QEMU and the host could still flush cached writes on exit. It is
+not evidence of physical SSD installation or crash consistency.

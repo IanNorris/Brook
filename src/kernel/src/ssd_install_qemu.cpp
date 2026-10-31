@@ -95,10 +95,17 @@ int Run() {
             Io io{&source,target};SsdInstallEngine engine(geometry,true);SsdInstallStepResult step;
             auto* pauseMarker=VfsOpen("/etc/ahci-qemu-install-pause");const bool pauseTest=pauseMarker!=nullptr;
             if(pauseMarker)VfsClose(pauseMarker);
+            auto* payloadMarker=VfsOpen("/etc/ahci-qemu-pause-payload");const bool pausePayload=payloadMarker!=nullptr;
+            if(payloadMarker)VfsClose(payloadMarker);
+            bool didPause=false;
             do {
-                __atomic_store_n(&stage,uint32_t(engine.Stage()),__ATOMIC_RELEASE);
+                const auto before=engine.Stage();
+                __atomic_store_n(&stage,uint32_t(before),__ATOMIC_RELEASE);
                 step=engine.Step(io,a,b);__atomic_add_fetch(&operations,1ull,__ATOMIC_RELAXED);
-                if(pauseTest && __atomic_load_n(&operations,__ATOMIC_RELAXED)==1 && step==SsdInstallStepResult::Progress) {
+                if(!didPause && step==SsdInstallStepResult::Progress &&
+                   ((pauseTest && __atomic_load_n(&operations,__ATOMIC_RELAXED)==1) ||
+                    (pausePayload && before==SsdInstallStage::Payload))) {
+                    didPause=true;
                     __atomic_store_n(&paused,1u,__ATOMIC_RELEASE);
                     while(__atomic_load_n(&paused,__ATOMIC_ACQUIRE))SchedulerSleepMs(10);
                 }
