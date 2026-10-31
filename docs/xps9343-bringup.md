@@ -2182,3 +2182,29 @@ extracted the file for a host-side byte comparison. The source fixture hash
 was unchanged. Evidence is in `build/hardware/atf3` and `atf4`; the workload
 and boot hook are for the opt-in disposable-QEMU kernel only. This test alone
 does not prove general filesystem crash recovery or booting from a physical SSD.
+
+### Dell I²C controller identification probe (2026-10-31)
+
+The opt-in `--dell-i2c-id-probe` payload adds a one-shot debug operation for
+one fixed DesignWare component identification register. It does not initialize
+or enable the controller, touch the codec, or change audio output. It requires
+the reviewed DSDT digest and matching firmware fields, the expected Dell PCI
+identity, a complete captured PCI inventory with no BAR base in the controller
+page, and an unreported boot-memory-map range. Immediately before the one
+load, it checks kernel mappings and the executing CPU's cache attributes under
+the page-table lock. A refusal or unexpected value is terminal for that boot.
+
+These checks do not establish PCI BAR extents, dynamic resource ownership, or
+controller power state. A powered-down device may return an unknown value, hang,
+or trigger a machine check. A hung load may hold the page-table lock; there is
+no software timeout or guaranteed recovery. The physical identification read
+has not been performed. The known-good USB boot and recovery payloads remain.
+
+Assertion-enabled host tests cover the admission checks, concurrent requests,
+and status while a request is in progress. A private QEMU desktop boot with
+the marker present refused the probe on unsupported firmware, reported the
+terminal state, and refused a second request. Its checked shutdown, fresh boot,
+and writable-store verification also passed; this does not establish physical
+controller behavior or audio playback. Evidence:
+`build/hardware/dell-i2c-host-debug-20261031` and
+`build/hardware/dell-i2c-id-qemu-20261031`.

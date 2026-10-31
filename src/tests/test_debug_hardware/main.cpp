@@ -10,6 +10,7 @@
 #include "ahci_observe.h"
 #include "acpi.h"
 #include "dell_audio_probe.h"
+#include "dell_i2c_probe.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
 #include <cassert>
@@ -21,6 +22,8 @@ unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
 bool audioProbePresent=false;
 bool CpuObserveMemoryTypes(uint64_t,uint64_t,brook::CpuMemoryTypeObservation& out){out={};out.patSlot0=6;out.page0.type=0;out.page1.type=0;return true;}
 namespace brook {
+DellI2cIdResult DellI2cIdProbe(uint32_t& value){value=0;return DellI2cIdResult::Disabled;}
+DellI2cIdStatus DellI2cIdProbeStatus(){return {};}
 bool DellAudioProbeRead(DellAudioFirmwareSnapshot& out,const char*& reason){
     reason=audioProbePresent?"ok":"not provisioned";out.i2cBase0=0xfe103000;out.i2cBase1=0xfe104000;return audioProbePresent;
 }
@@ -114,6 +117,8 @@ int main(){
         assert(handle(std::string("bridge hardware pci ")+bad));assert(reply.find("pci_error")!=std::string::npos);
     }
     assert(handle("bridge hardware acpi-info") && reply.find("\"tables\":1")!=std::string::npos);
+    assert(handle("bridge hardware dell-i2c-id start") && reply.find("\"result\":\"disabled\"")!=std::string::npos);
+    assert(handle("bridge hardware dell-i2c-id status") && reply.find("\"started\":false")!=std::string::npos);
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"ok\":false")!=std::string::npos);
     audioProbePresent=true;
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"i2c_base0_mmio_declared\":true")!=std::string::npos &&

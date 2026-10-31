@@ -18,6 +18,7 @@
 #include "ssd_install_qemu.h"
 #include "acpi.h"
 #include "dell_audio_probe.h"
+#include "dell_i2c_probe.h"
 #include "memory/virtual_memory.h"
 #include "cpu.h"
 namespace brook {
@@ -49,6 +50,12 @@ void PowerCaps(Reply& r){
     r.text(",\"reset\":");r.text(power.reset?"true":"false");r.text(",\"power_off\":");r.text(power.powerOff?"true":"false");
     r.text(",\"reset_method\":");r.quoted(power.resetMethod);r.text(",\"power_off_method\":");r.quoted(power.powerOffMethod);
     r.text(",\"reset_reason\":");r.quoted(power.resetReason);r.text(",\"power_off_reason\":");r.quoted(power.powerOffReason);
+}
+const char* I2cProbeResult(DellI2cIdResult result) {
+    switch(result){case DellI2cIdResult::Disabled:return "disabled";case DellI2cIdResult::AlreadyUsed:return "already_used";
+    case DellI2cIdResult::Refused:return "refused";case DellI2cIdResult::Unknown:return "unknown";
+    case DellI2cIdResult::Identified:return "identified";}
+    return "invalid";
 }
 
 }
@@ -99,6 +106,19 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
     }
     constexpr char pciPrefix[]="bridge hardware pci ";
+    if(!strcmp(command,"bridge hardware dell-i2c-id start")) {
+        uint32_t value=0;const auto result=DellI2cIdProbe(value);Reply r;r.text("{\"dell_i2c_id_api\":1,\"result\":");
+        r.quoted(I2cProbeResult(result));
+        if(result==DellI2cIdResult::Identified || result==DellI2cIdResult::Unknown){r.text(",");r.field("value",value);}
+        r.text(",\"pci_extent_ownership\":\"unresolved\"}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware dell-i2c-id status")) {
+        const auto status=DellI2cIdProbeStatus();Reply r;r.text("{\"dell_i2c_id_api\":1,\"started\":");r.text(status.started?"true":"false");
+        r.text(",\"completed\":");r.text(status.completed?"true":"false");
+        if(status.completed){r.text(",\"result\":");r.quoted(I2cProbeResult(status.result));
+            if(status.result==DellI2cIdResult::Identified || status.result==DellI2cIdResult::Unknown){r.text(",");r.field("value",status.value);}}
+        r.text(",\"pci_extent_ownership\":\"unresolved\"}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware dell-audio-firmware")) {
         DellAudioFirmwareSnapshot s{};const char* reason=nullptr;const bool ok=DellAudioProbeRead(s,reason);
         Reply r;r.text("{\"dell_audio_firmware_api\":1,\"ok\":");r.text(ok?"true":"false");

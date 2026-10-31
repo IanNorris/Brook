@@ -7,6 +7,7 @@
 #include "boot_protocol/boot_protocol.h"
 #include "cpu.h"
 #include "acpi.h"
+#include "dell_i2c_id_policy.h"
 
 namespace brook {
 
@@ -455,23 +456,53 @@ uint64_t VmmReadLeaf(PageTable pt, VirtualAddress address) {
     IrqSpinLockRelease(&lock,irq); return leaf;
 }
 
+struct AuditedAliasTables {
+    bool readEntry(uint64_t page,uint16_t index,uint64_t& value) {
+        BootResourceClassification c{};
+        constexpr uint32_t allowed=(1u<<uint32_t(MemoryType::Free))|(1u<<uint32_t(MemoryType::BootData));
+        if(index>=512 || !AcpiClassifyBootRange(page,4096,c) || c.unreported || !c.types || (c.types&~allowed))return false;
+        const auto* entries=reinterpret_cast<const uint64_t*>(PhysToVirt(PhysicalAddress(page)).raw());
+        value=__atomic_load_n(entries+index,__ATOMIC_ACQUIRE);return true;
+    }
+};
 bool VmmInspectKernelAliases(uint64_t physical,KernelAliasMapping& identity,KernelAliasMapping& direct) {
     identity={};direct={};
     if(!physical || (physical&4095) || physical>=(16ull<<30))return false;
-    struct Tables {
-        bool readEntry(uint64_t page,uint16_t index,uint64_t& value) {
-            BootResourceClassification c{};
-            constexpr uint32_t allowed=(1u<<uint32_t(MemoryType::Free))|(1u<<uint32_t(MemoryType::BootData));
-            if(index>=512 || !AcpiClassifyBootRange(page,4096,c) || c.unreported || !c.types || (c.types&~allowed))return false;
-            const auto* entries=reinterpret_cast<const uint64_t*>(PhysToVirt(PhysicalAddress(page)).raw());
-            value=__atomic_load_n(entries+index,__ATOMIC_ACQUIRE);return true;
-        }
-    } tables;
+    AuditedAliasTables tables;
     const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
     const bool ok=InspectKernelAlias(tables,g_kernelCR3.raw(),physical,identity) &&
         InspectKernelAlias(tables,g_kernelCR3.raw(),DIRECT_MAP_BASE+physical,direct);
     IrqSpinLockRelease(&g_kernelPtLock,irq);
     if(!ok){identity={};direct={};}return ok;
+}
+bool VmmDellI2cIdCriticalRead(uint32_t& value) {
+    value=0;
+    struct Io {
+        AuditedAliasTables tables;
+        bool evidence(DellI2cCriticalEvidence& e) {
+            KernelAliasMapping identity{},direct{},current{};
+            const uint64_t root=g_kernelCR3.raw(),active=ReadCR3()&PHYS_MASK;
+            // The debug service is a kernel thread. Refuse other roots rather
+            // than assume a process's copied kernel-half entry stays shared.
+            e.aliasesValid=active==root && InspectKernelAlias(tables,root,DellI2c0Page,identity) &&
+                InspectKernelAlias(tables,root,DIRECT_MAP_BASE+DellI2c0Page,direct) &&
+                InspectKernelAlias(tables,active,DIRECT_MAP_BASE+DellI2c0Page,current);
+            e.identityPresent=identity.present;e.identityMatches=identity.physical==DellI2c0Page;e.identityPat=identity.patIndex;
+            e.directPresent=direct.present;e.directMatches=direct.physical==DellI2c0Page;e.directPat=direct.patIndex;
+            e.currentDirectPresent=current.present;e.currentDirectMatches=current.physical==DellI2c0Page;e.currentDirectPat=current.patIndex;
+            CpuMemoryTypeObservation cpu{};e.cpuValid=CpuObserveMemoryTypes(DellI2c0Page,DellI2c0PrivatePage,cpu);
+            e.cacheDisabled=cpu.cacheDisabled;e.notWriteThrough=cpu.notWriteThrough;e.patSlot0=cpu.patSlot0;e.mtrrType=cpu.page0.type;
+            return true;
+        }
+        bool readComponent(uint32_t& result) {
+            // One fixed aligned volatile load through the existing direct map.
+            __asm__ volatile("lfence":::"memory");
+            result=*reinterpret_cast<const volatile uint32_t*>(DIRECT_MAP_BASE+DellI2c0Page+DellI2cComponentOffset);return true;
+        }
+    } io;
+    const uint64_t irq=IrqSpinLockAcquire(&g_kernelPtLock);
+    const bool ok=DellI2cIdCritical(io,value);
+    IrqSpinLockRelease(&g_kernelPtLock,irq);return ok;
 }
 
 bool VmmClearAccessedIfMatches(PageTable pt,VirtualAddress address,PhysicalAddress expected) {
