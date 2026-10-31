@@ -28,12 +28,14 @@ def main():
     p.add_argument('--tcp-egress-1200',action='store_true',help='Enable a temporary 1200-byte TCP payload ceiling for a known path-MTU problem')
     p.add_argument('--ahci-observe',action='store_true',help='Opt in to the boot-time read-only AHCI register snapshot')
     p.add_argument('--ahci-read-only',action='store_true',help='Enable experimental read-only SATA inventory (requires --ahci-observe)')
+    p.add_argument('--ahci-export',action='store_true',help='Opt in to root-only read-only AHCI export (requires --ahci-read-only)')
     p.add_argument('--dell-audio-dsdt',type=Path,help='Opt in to the reviewed Dell audio NVS snapshot for this exact DSDT')
     p.add_argument('--dell-i2c-id-probe',action='store_true',help='Opt in to one explicitly triggered Dell I2C0 identification read')
     p.add_argument('--build',type=Path,default=ROOT/'build/release')
     p.add_argument('--output',required=True,type=Path)
     a=p.parse_args()
     if a.ahci_read_only and not a.ahci_observe:p.error('--ahci-read-only requires --ahci-observe')
+    if a.ahci_export and not a.ahci_read_only:p.error('--ahci-export requires --ahci-read-only')
     if a.dell_i2c_id_probe and not a.dell_audio_dsdt:p.error('--dell-i2c-id-probe requires --dell-audio-dsdt')
     store=a.store.resolve(strict=True);out=a.output.absolute()
     m=json.loads((store/'manifest.json').read_text());image=store/'STORE.IMG'
@@ -58,6 +60,9 @@ def main():
     if a.ahci_read_only:
         marker=out/'ahci-read-only';marker.write_text('1\n')
         subprocess.run(['mcopy','-o','-i',str(out/'INITRD.IMG'),str(marker),'::ETC/ahci-read-only'],check=True,cwd=ROOT)
+    if a.ahci_export:
+        marker=out/'ahci-export';marker.write_text('1\n')
+        subprocess.run(['mcopy','-o','-i',str(out/'INITRD.IMG'),str(marker),'::ETC/ahci-export'],check=True,cwd=ROOT)
     audio_digest=None
     if a.dell_audio_dsdt:
         if a.dell_audio_dsdt.is_symlink() or not a.dell_audio_dsdt.is_file():p.error('DSDT must be a regular file')
@@ -73,7 +78,7 @@ def main():
     manifest=json.loads((out/'manifest.json').read_text())
     manifest.update(scope='Writable desktop preferred; accepted immutable RAM fallback',
         ephemeral_home=False,mutable_usb_application_mount=True,tcp_egress_ceiling=1200 if a.tcp_egress_1200 else 1460,
-        ahci_observe=a.ahci_observe,ahci_read_only=a.ahci_read_only,
+        ahci_observe=a.ahci_observe,ahci_read_only=a.ahci_read_only,ahci_export=a.ahci_export,
         dell_audio_dsdt_sha256=audio_digest,
         dell_i2c_id_probe=a.dell_i2c_id_probe,
         home_persistence='persistent only after writable-store admission; RAM fallback remains volatile',

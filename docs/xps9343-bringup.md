@@ -2397,3 +2397,29 @@ byte-identical target (`digbad`, `digmissing`, `digshort`). Host tests additiona
 exercise short source reads and geometry mismatches. Older v1 test packages do
 not have the required record and must be regenerated. These results do not
 establish physical SSD readiness or a power-loss guarantee.
+
+### Read-only AHCI export primitive (2026-10-31)
+
+The normal kernel has a boot-opted-in, root-only export syscall for its one
+initialized AHCI disk. `--ahci-export` requires the read-only AHCI boot path;
+the marker must contain exactly `1\n`, and export is disabled when the disk
+has write admission. Metadata reports model, serial, geometry and port; a
+boot-bound caller must separately pin the guest boot identity. Reads are
+sector-aligned, no larger than 64 KiB, and checked against capacity. AHCI I/O
+uses its existing mutex and kernel DMA; the syscall copies from separate kernel
+scratch into userspace only after the AHCI read returns. Quarantine makes the
+underlying read fail. This interface is disabled by default and has not been
+deployed to the Dell.
+
+Private QEMU tests (`exfinal`) read a complete 64 MiB disposable SATA snapshot
+through the syscall and produced the same SHA-256 as the host source. They
+covered UID1000 denial, bounds, the final sector, reserved arguments and bad
+user pointers; checked shutdown and writable-store reboot tests passed. Earlier
+equivalent kernels rejected absent and malformed markers (`exmissing`, `exmal`)
+and rejected a test disk with write admission (`exwrite`), whose source copy
+remained byte-identical. Hardware quarantine and injected device read failures
+were not exercised by these export tests. The caller still needs a binary
+streaming sender, boot/identity binding, disconnect handling, destination space
+checks, and an independent full-backup readback. This primitive alone is not a
+backup tool, does not provide an atomic disk snapshot, and does not establish
+that a physical backup is complete or restorable.

@@ -33,6 +33,7 @@ PciDevice pci{};
 KMutex ioLock{};
 bool published=false;
 bool writeEnabled=false; // immutable after registration, even if quarantined
+bool exportEnabled=false; // immutable boot-only opt-in
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool testWritable=false;
 bool testInstallMode=false;
@@ -324,6 +325,15 @@ void AhciReadOnlyInit() {
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     if(testWritable)status.reason="disposable QEMU test ATA device writable";
 #endif
+    if(!writeEnabled) {
+        auto* exportMarker=VfsOpen("/etc/ahci-export",VFS_O_STREAM);
+        if(exportMarker) {
+            VnodeStat st{};char value[2]{};uint64_t offset=0;
+            exportEnabled=!VfsStat(exportMarker,&st) && !st.isDir && !st.isSymlink && st.size==2 &&
+                VfsRead(exportMarker,value,2,&offset)==2 && value[0]=='1' && value[1]=='\n';
+            VfsRelease(exportMarker);
+        }
+    }
     __atomic_store_n(&published,true,__ATOMIC_RELEASE);
 }
 AhciReadOnlyStatus AhciReadOnlyGetStatus() {
@@ -345,6 +355,24 @@ int AhciReadOnlySector(uint64_t lba,void* output) {
     const bool ok=ReadBlocks(lba,1);
     if(ok)memcpy(output,dma+dataOffset,512);KMutexUnlock(&ioLock);
     return ok?512:-5;
+}
+bool AhciReadOnlyExportInfo(BrookAhciExportInfo& info) {
+    info={};if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE) || !exportEnabled || writeEnabled)return false;
+    KMutexLock(&ioLock);
+    const bool ready=status.ready && !status.quarantined;
+    if(ready) {
+        info.version=BROOK_AHCI_EXPORT_VERSION;info.logical_sector_bytes=status.logicalSectorBytes;
+        info.physical_sector_bytes=status.physicalSectorBytes;info.port=status.port;info.sectors=status.sectors;
+        memcpy(info.model,status.model,sizeof(info.model));memcpy(info.serial,status.serial,sizeof(info.serial));
+    }
+    KMutexUnlock(&ioLock);return ready;
+}
+int AhciReadOnlyExportRead(uint64_t offset,void* output,uint32_t length) {
+    if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE) || !exportEnabled || writeEnabled)return -30;
+    if(!output || !length || length>BROOK_AHCI_EXPORT_CHUNK || (length&511) || (offset&511) ||
+       offset>status.sectors*512 || length>status.sectors*512-offset)return -22;
+    const int result=Read(&device,offset,output,length);
+    return result==int(length)?result:-5;
 }
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool AhciDisposableQemuWritable() { return testWritable && !testInstallMode && __atomic_load_n(&published,__ATOMIC_ACQUIRE); }

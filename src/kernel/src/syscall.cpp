@@ -67,6 +67,7 @@
 #include "epoll_diagnostics.h"
 #include "compositor.h"
 #include "../../shared/brook_debug_frame.h"
+#include "ahci_readonly.h"
 #include "compositor_scene.h"
 #include "window.h"
 #include "gpu_app.h"
@@ -12212,6 +12213,33 @@ static int64_t sys_brook_debug_frame(uint64_t op,uint64_t token,uint64_t destina
     return -EINVAL;
 }
 
+// Boot-opted-in read-only export of the single initialized AHCI disk. Disk
+// data is copied to kernel-owned memory before touching the user buffer, so
+// neither the AHCI mutex nor its DMA buffer spans a user-memory fault.
+static int64_t sys_brook_ahci_export(uint64_t op,uint64_t destination,uint64_t length,uint64_t offset,uint64_t r0,uint64_t r1)
+{
+    auto* proc=ProcessCurrent();if(!proc)return -ESRCH;
+    if(proc->euid!=0)return -EPERM;
+    KernelOperationGuard operation(proc);
+    if(r0 || r1)return -EINVAL;
+    if(op==0) {
+        if(offset || length!=sizeof(BrookAhciExportInfo))return -EINVAL;
+        if(!destination)return -EFAULT;
+        BrookAhciExportInfo info{};if(!brook::AhciReadOnlyExportInfo(info))return -30;
+        return CopyToUser(destination,&info,sizeof(info))?0:-EFAULT;
+    }
+    if(op==1) {
+        if(!length || length>BROOK_AHCI_EXPORT_CHUNK || (length&511) || (offset&511))return -EINVAL;
+        if(!destination)return -EFAULT;
+        void* staged=kmalloc(uint32_t(length));if(!staged)return -ENOMEM;
+        const int read=brook::AhciReadOnlyExportRead(offset,staged,uint32_t(length));
+        int64_t result=read;
+        if(read>0 && !CopyToUser(destination,staged,uint32_t(read)))result=-EFAULT;
+        kfree(staged);return result;
+    }
+    return -EINVAL;
+}
+
 // 0xB04: native desktop scale. Query requested (0), request (1), query applied (2).
 static int64_t sys_brook_wm_scale(uint64_t op,uint64_t scale,uint64_t,uint64_t,uint64_t,uint64_t)
 {
@@ -15374,6 +15402,7 @@ void SyscallTableInit()
     g_syscallTable[0xB03]                = sys_brook_wm_refresh_apps;
     g_syscallTable[0xB04]                = sys_brook_wm_scale;
     g_syscallTable[BROOK_SYS_DEBUG_FRAME] = sys_brook_debug_frame;
+    g_syscallTable[BROOK_SYS_AHCI_EXPORT] = sys_brook_ahci_export;
     g_syscallTable[BROOK_SYS_SYSTEM_MESSAGE] = sys_brook_system_message;
     g_syscallTable[0xB40]                = sys_brook_pageable_memory;
     g_syscallTable[BROOK_SYS_WM_APPEARANCE] = sys_brook_wm_appearance;
