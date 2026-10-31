@@ -41,10 +41,16 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   state, but its power-off method is unsupported. A manual power-off and boot
   with USB removed was required for the first SSD boot test.
 - The user subsequently reported that Brook reached the desktop from the
-  internal SSD with the boot USB removed. The previous debug IP was not
-  reachable on the first follow-up, so network access, the mounted store,
-  application functionality and persistence across restart remain to be
-  independently checked on this physical boot.
+  internal SSD with the boot USB removed. The debug IP was initially
+  unreachable; after the user restarted, DHCP succeeded. The kernel log then
+  confirmed the GPT-selected SSD partition mounted at `/media/system` and the
+  persistent home store was ready. An ordinary-user test wrote, synced and
+  checked a unique file, then verified its contents after a checked restart;
+  the restarted SSD boot reacquired networking. Settings was launched from the
+  installed-app catalog and its window appeared in a captured completed frame;
+  App Gallery also produced a window. Firefox launch was dispatched, but no
+  window had yet been observed at the time of this note. The earlier missing
+  network on one boot remains unexplained.
 
 ## Remaining engineering gates
 
