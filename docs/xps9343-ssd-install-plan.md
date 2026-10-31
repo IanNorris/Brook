@@ -49,8 +49,9 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   the restarted SSD boot reacquired networking. Settings was launched from the
   installed-app catalog and its window appeared in a captured completed frame;
   App Gallery also produced a window. Firefox launch was dispatched, but no
-  window had yet been observed at the time of this note. The earlier missing
-  network on one boot remains unexplained.
+  window had been observed when the debug network became unreachable again.
+  The reason for that loss and the earlier missing network on one boot remain
+  unexplained; neither observation establishes that Firefox caused it.
 
 ## Remaining engineering gates
 
