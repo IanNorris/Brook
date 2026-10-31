@@ -32,20 +32,27 @@ inline bool WritableDesktopPlanSame(const WritableDesktopPlan& a,const WritableD
     if(a.bytes!=b.bytes)return false;
     for(unsigned i=0;i<16;++i)if(a.uuid[i]!=b.uuid[i])return false;return true;
 }
-// Exact builder geometry/features, not a general ext2 verifier. This bounds
-// every allocation and metadata range used during mount before trusting it.
-inline bool WritableDesktopHeaderValid(const uint8_t sb[1024],const WritableDesktopPlan& plan) {
-    if(StoreGet16(sb+56)!=0xef53 || StoreGet16(sb+58)!=1 || StoreGet32(sb+72)!=0 ||
+enum class WritableDesktopHeaderState { Invalid, NeedsCheck, Clean };
+// Exact builder geometry/features, not a general ext2 verifier. A NeedsCheck
+// result only identifies a candidate for offline checking; it does not prove
+// that the filesystem is consistent or authorize a repair or writable mount.
+inline WritableDesktopHeaderState WritableDesktopClassifyHeader(const uint8_t sb[1024],const WritableDesktopPlan& plan) {
+    const uint16_t state=StoreGet16(sb+58);
+    if(StoreGet16(sb+56)!=0xef53 || (state & ~uint16_t{3}) || StoreGet32(sb+72)!=0 ||
        StoreGet32(sb+76)!=1 || StoreGet16(sb+88)!=128 || StoreGet32(sb+20)!=0 ||
        StoreGet32(sb+24)!=2 || StoreGet32(sb+28)!=2 || StoreGet32(sb+32)!=32768 ||
        StoreGet32(sb+36)!=32768 || StoreGet32(sb+92)!=0 || StoreGet32(sb+96)!=2 ||
-       StoreGet32(sb+100)!=3 || StoreGet32(sb+84)!=11 || StoreGet16(sb+90)!=0)return false;
-    for(unsigned i=0;i<16;++i)if(sb[104+i]!=plan.uuid[i])return false;
+       StoreGet32(sb+100)!=3 || StoreGet32(sb+84)!=11 || StoreGet16(sb+90)!=0)return WritableDesktopHeaderState::Invalid;
+    for(unsigned i=0;i<16;++i)if(sb[104+i]!=plan.uuid[i])return WritableDesktopHeaderState::Invalid;
     const uint32_t blocks=StoreGet32(sb+4),inodes=StoreGet32(sb),ipg=StoreGet32(sb+40);
     if(uint64_t(blocks)*4096!=plan.bytes || StoreGet32(sb+8)!=0 || StoreGet32(sb+12)>blocks ||
-       StoreGet32(sb+16)>inodes || !ipg || ipg>32768 || ipg%32)return false;
+       StoreGet32(sb+16)>inodes || !ipg || ipg>32768 || ipg%32)return WritableDesktopHeaderState::Invalid;
     const uint32_t groups=(blocks+32767)/32768;
-    return groups && groups<=32 && inodes>=11 && uint64_t(ipg)*groups==inodes;
+    if(!groups || groups>32 || inodes<11 || uint64_t(ipg)*groups!=inodes)return WritableDesktopHeaderState::Invalid;
+    return state==1 ? WritableDesktopHeaderState::Clean : WritableDesktopHeaderState::NeedsCheck;
+}
+inline bool WritableDesktopHeaderValid(const uint8_t sb[1024],const WritableDesktopPlan& plan) {
+    return WritableDesktopClassifyHeader(sb,plan)==WritableDesktopHeaderState::Clean;
 }
 inline bool WritableDesktopGroupsValid(const uint8_t sb[1024],const uint8_t* gdt,uint32_t bytes) {
     const uint32_t blocks=StoreGet32(sb+4),groups=(blocks+32767)/32768;
@@ -78,10 +85,12 @@ struct WritableDesktopSession {
         if(dirty || armed || !io.read || !io.write || !io.flush)return -22;
         uint8_t sb[1024]{},gdt[1024]{};
         int r=io.read(io.context,1024,sb,sizeof(sb));if(r!=int(sizeof(sb)))return r<0?r:-5;
-        if(!WritableDesktopHeaderValid(sb,plan))return -22;
+        const auto header=WritableDesktopClassifyHeader(sb,plan);
+        if(header==WritableDesktopHeaderState::Invalid)return -22;
         const uint32_t bytes=((StoreGet32(sb+4)+32767)/32768)*32;
         r=io.read(io.context,4096,gdt,bytes);if(r!=int(bytes))return r<0?r:-5;
         if(!WritableDesktopGroupsValid(sb,gdt,bytes))return -22;
+        if(header==WritableDesktopHeaderState::NeedsCheck)return -117; // EUCLEAN; no write or mount
         const uint8_t state[2]={0,0};
         dirtyAttempted=true;
         r=io.write(io.context,1082,state,2);if(r!=2)return r<0?r:-5;

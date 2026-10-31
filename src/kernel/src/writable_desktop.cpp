@@ -128,7 +128,7 @@ WritableDesktopBoot WritableDesktopBootMount(uint8_t* nextDrive,WritableDesktopS
     info.pinned=true;
     info.stage="header-and-dirty";
     error=session.Begin(Io(),plan);
-    if(error){info.stateUncertain=session.dirtyAttempted;DestroyPrivate();return Fail(error);}
+    if(error){if(error==-117)info.stage="needs-filesystem-check";info.stateUncertain=session.dirtyAttempted;DestroyPrivate();return Fail(error);}
     info.dirty=true;
     info.stage="register";
     if(!DeviceRegister(image)){DestroyPrivate();return Fail(-12);}

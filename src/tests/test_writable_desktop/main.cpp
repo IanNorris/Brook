@@ -101,7 +101,7 @@ int main(int argc,char** argv){
     disk.assign(std::istreambuf_iterator<char>(file),{});assert(disk.size()==16*1024*1024);
     record="BRKSTORE1 16777216 cf16f1ae-68c5-5fac-89e9-382b8af5cd5c\n";
     if(Is("header"))disk[1080]=0;
-    if(Is("unclean"))disk[1082]=0;
+    if(Is("unclean")||Is("system-unclean"))disk[1082]=0;
     uint8_t drive=3;const auto sourceVolume=scenario.rfind("system-",0)==0?brook::WritableDesktopSource::System:brook::WritableDesktopSource::Usb;
     const auto result=brook::WritableDesktopBootMount(&drive,sourceVolume);auto info=brook::WritableDesktopRead();
     assert(!opens&&!roots);
@@ -115,11 +115,12 @@ int main(int argc,char** argv){
         else assert(error==-5&&!info.clean&&info.finalError==-5&&info.stateUncertain);
     } else {
         if(Is("absent"))assert(result==brook::WritableDesktopBoot::Absent&&!info.configured);
-        else if(Is("occupied")||Is("unmount")||Is("mount-cleanup")||Is("system-no-marker")||Is("system-absent"))assert(result==brook::WritableDesktopBoot::Maintenance);
+        else if(Is("occupied")||Is("unmount")||Is("mount-cleanup")||Is("system-no-marker")||Is("system-absent")||Is("system-unclean"))assert(result==brook::WritableDesktopBoot::Maintenance);
         else assert(result==brook::WritableDesktopBoot::Fallback);
         assert(!info.ready);const auto before=writes;owner=true;assert(!brook::WritableDesktopFinalSync()&&writes==before&&!cleans);
         if(Is("payload")||Is("home"))assert(unmounts==1&&!mounted&&!homeBound&&info.dirty);
-        if(Is("header")||Is("unclean"))assert(!leases&&!registered&&!writes);
+        if(Is("header")||Is("unclean")||Is("system-unclean"))assert(!leases&&!registered&&!writes);
+        if(Is("unclean")||Is("system-unclean"))assert(info.error==-117 && !std::strcmp(info.stage,"needs-filesystem-check"));
         if(Is("bind")||Is("register"))assert(!leases&&!registered&&!bound);
         if(Is("dirty-write")||Is("dirty-flush"))assert(info.stateUncertain);
     }

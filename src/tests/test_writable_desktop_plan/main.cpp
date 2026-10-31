@@ -43,6 +43,15 @@ int main(int argc,char** argv){
         WritableDesktopPlan out;assert(!WritableDesktopPlanParse(bad.c_str(),bad.size(),out));
     }
     Disk d;assert(WritableDesktopHeaderValid(d.sb,plan));assert(WritableDesktopGroupsValid(d.sb,d.gdt,32));
+    for(unsigned state : {0u,2u,3u}){
+        Disk dirty;Put16(dirty.sb+58,state);
+        assert(WritableDesktopClassifyHeader(dirty.sb,plan)==WritableDesktopHeaderState::NeedsCheck);
+        WritableDesktopSession session;assert(session.Begin(dirty.Io(),plan)==-117);
+        assert(dirty.reads==2 && !dirty.writes && !dirty.flushes && !session.dirtyAttempted);
+        dirty.sb[104]^=1;assert(WritableDesktopClassifyHeader(dirty.sb,plan)==WritableDesktopHeaderState::Invalid);
+    }
+    { Disk dirty;Put16(dirty.sb+58,0);Put32(dirty.gdt,1);WritableDesktopSession session;
+      assert(session.Begin(dirty.Io(),plan)==-22 && !dirty.writes); }
     const unsigned offsets[]={0,4,8,15,19,20,24,28,32,36,40,56,58,72,76,84,88,90,92,96,100,104};
     for(unsigned at:offsets){
         Disk invalid;invalid.sb[at]^=0x80;WritableDesktopSession s;

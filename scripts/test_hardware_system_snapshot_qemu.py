@@ -37,6 +37,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for option in ('fixture', 'snapshot-helper', 'store', 'key-file', 'output'):
         parser.add_argument('--' + option, required=True, type=Path)
+    parser.add_argument('--dirty-classification-kernel', type=Path,
+                        help='Instead verify that this kernel refuses a deliberately unclean store without changing it')
     a = parser.parse_args()
     if a.fixture.is_symlink() or not a.fixture.is_file() or a.fixture.stat().st_size != 500118192 * 512:
         raise ValueError('expected a stopped Dell-capacity regular-file QEMU fixture')
@@ -44,7 +46,16 @@ def main():
     disk = out / 'sata.raw'; run('cp', '--reflink=always', a.fixture, disk)
     media = str(disk) + '@@1048576'; initrd = out / 'initrd.img'
     run('mcopy', '-i', media, '::INITRD.IMG', initrd)
-    run('mdel', '-i', initrd, '::ETC/writable-desktop')
+    dirty_store = None
+    if a.dirty_classification_kernel:
+        dirty_store = out / 'dirty-store.img'
+        run('cp', '--reflink=always', a.store, dirty_store)
+        with dirty_store.open('r+b') as f:
+            f.seek(1082); f.write(b'\0\0'); f.flush(); os.fsync(f.fileno())
+        run('mcopy', '-o', '-i', media, dirty_store, '::STORE.IMG')
+        run('mcopy', '-o', '-i', media, a.dirty_classification_kernel, '::KERNEL/BROOK.ELF')
+    else:
+        run('mdel', '-i', initrd, '::ETC/writable-desktop')
     run('mcopy', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
     run('mcopy', '-o', '-i', media, initrd, '::INITRD.IMG')
     variables = out / 'VARS.fd'; shutil.copy2(os.environ['OVMF_VARS'], variables); variables.chmod(0o600)
@@ -82,6 +93,21 @@ def main():
             caps = h.command(s, 'bridge hardware caps')
             assert not caps['writable_desktop']['ready'] and not caps['writable_desktop']['source_pinned']
             assert 'ahci system: verified GPT entry' in serial and 'writable desktop: ready' not in serial
+            if dirty_store:
+                assert caps['writable_desktop']['stage'] == 'needs-filesystem-check'
+                assert caps['writable_desktop']['error'] == -117
+                request = uuid.uuid4().hex; state = h.power(s, request, 'shutdown'); deadline = time.monotonic() + 120
+                while state['state'] != 'ready':
+                    if state['state'] in ('failed', 'unsupported') or time.monotonic() >= deadline:
+                        raise RuntimeError('shutdown did not reach ready')
+                    time.sleep(.2); state = h.power(s, request, 'status')
+                qmp = Qmp(out / 'qmp.sock'); qmp.call('quit'); assert owner.wait(timeout=15) == 0
+                recovered = out / 'after-store.img'; run('mcopy', '-i', media, '::STORE.IMG', recovered)
+                assert sha(recovered) == sha(dirty_store)
+                (out / 'result.json').write_text(json.dumps({'passed': True, 'stage': 'needs-filesystem-check',
+                    'store_unmounted': True, 'store_bytes_unchanged': True, 'checked_shutdown': True}, indent=2) + '\n')
+                print('DIRTY_STORE_CLASSIFICATION_QEMU_PASS', flush=True)
+                return
             tx = uuid.uuid4().hex
             h.guest_run(s, tx, ['/boot/HWSNAP.ELF', attached['guest_boot_id'], tx, 'get', uuid.uuid4().hex],
                         cwd='/tmp', uid=0, wait_s=2)
