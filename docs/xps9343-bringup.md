@@ -2353,3 +2353,14 @@ was attempted after loss of contact. The Firefox job and closure request IDs
 are retained in `build/hardware/dell-firefox-https-review-20261031/`. The user
 has been asked to inspect the Dell when available. Browser interactivity,
 downloads, clean process exit and Chromium acceptance remain unproven.
+
+A comparison using the same Dell kernel/initrd and a private writable USB QEMU
+image loaded `https://example.com/` in Firefox twice. Each window displayed the
+expected page title, was closed through the compositor, and the corresponding
+original guest job completed with exit code zero and no live tasks. The QEMU
+writable-store create/reboot/ext2 checks also passed
+(`build/hardware/ff-close-qemu-20261031`). This narrows the observed Dell
+shutdown symptom but does not prove its cause: the VM differs in hardware,
+profile history and runtime conditions. It is not an interactive browsing or
+download acceptance test. The Dell remained absent from neighbour discovery;
+its physical state still needs inspection before more hardware tests.
