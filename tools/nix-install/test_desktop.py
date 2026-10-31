@@ -63,7 +63,7 @@ class DesktopTests(unittest.TestCase):
                 self.assertIn(f'{program}\t{identity}{wrapper} --test-argument\t', collect())
             runtime=root/'profile/bin/brook-run'
             runtime.write_text('#!/bin/sh\n');runtime.chmod(0o755)
-            for program in ('gimp-3.0','mousepad','openttd','gnome-commander','thunar'):
+            for program in ('gimp-3.0','mousepad','openttd','gnome-commander','thunar','galculator'):
                 executable=root/'profile/bin'/program
                 executable.write_text('#!/bin/sh\n');executable.chmod(0o755)
                 desktop=root/'profile/share/applications'/f'{program}.desktop'
@@ -71,6 +71,14 @@ class DesktopTests(unittest.TestCase):
                 self.assertIn(f'{program}\t--uid 1000 {runtime} {program} --argument\t',collect())
                 desktop.write_text(desktop.read_text()+'Terminal=true\n')
                 self.assertNotIn(f'{program}\t',collect())
+            for program in ('mousepad','brook-files','brook-settings','wayland-calc','brook-gallery'):
+                executable=root/'profile/bin'/program
+                executable.write_text('#!/bin/sh\n');executable.chmod(0o755)
+                desktop=root/'profile/share/applications'/f'{program}.desktop'
+                desktop.write_text(f'[Desktop Entry]\nName={program}\nExec={program} --argument %U\n')
+                wrapper=root/'profile/bin'/f'hardware-{program}'
+                wrapper.write_text('#!/bin/sh\n');wrapper.chmod(0o755)
+                self.assertIn(f'{program}\t--uid 1000 {wrapper} --argument\t',collect())
 
 
 if __name__ == '__main__':

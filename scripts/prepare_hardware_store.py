@@ -109,6 +109,13 @@ def main():
     profile = args.profile.resolve(strict=True)
     expression = args.expression.resolve(strict=True)
     index = args.index.resolve(strict=True)
+    index_metadata = json.loads(Path(str(index)+'.json').read_text())
+    if (index_metadata.get('format') != 1 or
+        index_metadata.get('index_sha256') != digest(index) or
+        index_metadata.get('nixpkgs_import_sha256') != digest(ROOT/'nix/nixpkgs.nix') or
+        index_metadata.get('system') != 'x86_64-linux' or
+        index_metadata.get('allow_unfree') is not False):
+        parser.error('Index provenance must match Brook\'s pinned x86_64-linux free package set; regenerate with tools/nix-index/gen-nix-index.py')
     size = args.size_mib*1024*1024
     if profile.parent != Path('/nix/store') or not profile.is_dir():
         parser.error('Profile must resolve to a built Nix store directory')
@@ -154,6 +161,7 @@ def main():
         raise ValueError('Profile CA bundle missing')
     (seed/'etc/ssl/certs/ca-bundle.crt').symlink_to('/nix/profile/etc/ssl/certs/ca-bundle.crt')
     shutil.copyfile(index, seed/'index/packages.idx')
+    (seed/'index/packages.idx.json').write_text(json.dumps(index_metadata, indent=2)+'\n')
     rows = []
     for p in metadata['packages']:
         fields = [p['name'], p['version'], p['store']]
@@ -168,14 +176,14 @@ def main():
     records = []
     for line in manifest.read_text().splitlines():
         fields = line.split('\t')
-        for name in ('mousepad', 'brook-files', 'brook-settings', 'wayland-calc'):
+        for name in ('mousepad', 'brook-files', 'brook-settings', 'wayland-calc', 'brook-gallery'):
             if fields[1].split(' ', 1)[0] in (name, '/nix/profile/bin/'+name):
                 fields[1] = '/nix/profile/bin/hardware-'+name
         records.append('\t'.join(fields))
     manifest.write_text('\n'.join(records)+'\n')
     (seed/'BROOK.MNT').write_text('/nix\n')
     identity = {'profile': str(profile), 'closure': sorted(closure),
-                'index_sha256': digest(index), 'tools': tools,
+                'index_sha256': digest(index), 'index_metadata': index_metadata, 'tools': tools,
                 'builder_sha256': digest(Path(__file__))}
     identifier = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(identity, sort_keys=True)))
     (seed/'.brook-store.json').write_text(json.dumps({'format': 1, 'uuid': identifier, **identity}, indent=2)+'\n')

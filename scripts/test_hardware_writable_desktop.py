@@ -75,9 +75,10 @@ def main():
     run('mcopy','-o','-i',media,desktop/'INITRD.IMG','::INITRD.IMG')
     cfg=out/'BROOK.CFG';cfg.write_text('TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nDISPLAY_WIDTH=1920\nDISPLAY_HEIGHT=1080\n')
     run('mcopy','-o','-i',media,cfg,'::BROOK.CFG')
-    if not a.disk_template:
-        run('mcopy','-i',media,image,'::STORE.IMG')
-        run('mcopy','-i',media,desktop/'writable-desktop','::STORE.OK')
+    # A template reuses the recovery/FAT layout, never its mutable application
+    # contents. Seed this new private clone from the verified candidate image.
+    run('mcopy','-o','-i',media,image,'::STORE.IMG')
+    run('mcopy','-o','-i',media,desktop/'writable-desktop','::STORE.OK')
     result={'scope':'private USB-QEMU writable desktop','phases':[]};token=uuid.uuid4().hex
     save(out/'result.json',result)
     for phase in ('create','verify'):
@@ -113,18 +114,20 @@ def main():
             h.guest_run(s,ident,['/boot/STOREQA.ELF',phase,token],cwd='/tmp',uid=1000,wait_s=2)
             job=wait_job(h,s,ident);save(base/'storage-job.json',job)
             assert job.get('exit',{}).get('code')==0 and 'WRITABLE_DESKTOP_' in job['stdout']['text'],job
-            if phase=='create':
+            if phase=='create' or result.get('review',{}).get('review_reboot') is True:
                 ready={**attached,'registry':str(base/'registry'),'qmp':str(base/'qmp-review.sock'),
                     'qemu_pid':owner.pid,'scope':'Private headless QEMU only; 8CPU/8GiB software graphics; user networking',
                     'instruction':'Review Firefox/Chromium/App Gallery; close launched apps and return via finish.json continue_storage_checks=true. Record ui_acceptance_passed separately with evidence and remaining failures. Physical host desktop and real Dell are out of scope.'}
-                save(out/'ready.json',ready);print('WRITABLE_DESKTOP_QEMU_READY',out/'ready.json',flush=True)
+                ready_file=out/('ready.json' if phase=='create' else 'reboot-ready.json')
+                finish_file=out/('finish.json' if phase=='create' else 'reboot-finish.json')
+                save(ready_file,ready);print('WRITABLE_DESKTOP_QEMU_READY',ready_file,flush=True)
                 end=time.monotonic()+a.review_seconds
-                while not (out/'finish.json').exists():
+                while not finish_file.exists():
                     assert owner.poll() is None,'QEMU exited during review'
                     assert time.monotonic()<end,'Review expired; preserve failure disk and inspect original VM'
                     time.sleep(.2)
-                reviewed=json.loads((out/'finish.json').read_text());assert reviewed.get('continue_storage_checks') is True,reviewed
-                result['review']=reviewed
+                reviewed=json.loads(finish_file.read_text());assert reviewed.get('continue_storage_checks') is True,reviewed
+                result['review' if phase=='create' else 'reboot_review']=reviewed
             shutdown=uuid.uuid4().hex;state=h.power(s,shutdown,'shutdown');end=time.monotonic()+120
             while state['state']!='ready':
                 assert state['state']!='failed' and time.monotonic()<end,state
@@ -144,6 +147,7 @@ def main():
     with recovered.open('rb') as f:f.seek(1082);assert f.read(2)==b'\1\0'
     recovered.unlink();result['passed']=True;result['storage_acceptance_passed']=True
     result['ui_acceptance_passed']=result['review'].get('ui_acceptance_passed') is True
+    if 'reboot_review' in result:result['ui_acceptance_passed'] &= result['reboot_review'].get('ui_acceptance_passed') is True
     result['standard_ext2_check']=True;save(out/'result.json',result)
     print('WRITABLE_DESKTOP_QEMU_PASS',flush=True)
 

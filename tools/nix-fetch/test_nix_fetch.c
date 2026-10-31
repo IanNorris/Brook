@@ -43,20 +43,20 @@ int main(void) {
     narinfo_cache_path(root_hash, root_metadata, sizeof(root_metadata));
     f = fopen(root_metadata, "w");
     assert(f);
-    fprintf(f, "StorePath: /nix/store/%s-existing\nURL: nar/unused\nReferences: %s-missing\n", root_hash, hash);
+    fprintf(f, "StorePath: /nix/store/%s-existing\nURL: nar/unused\nNarHash: sha256:test\nNarSize: 8\nReferences: %s-missing\n", root_hash, hash);
     assert(fclose(f) == 0);
     g_fetch_deps = 1;
     assert(fetch_package(root_hash, 0) < 0);
     /* Content-addressed leaf narinfos can omit References completely. */
     f = fopen(root_metadata, "w");
     assert(f);
-    fprintf(f, "StorePath: /nix/store/%s-existing\nURL: nar/unused\n", root_hash);
+    fprintf(f, "StorePath: /nix/store/%s-existing\nURL: nar/unused\nNarHash: sha256:test\nNarSize: 8\n", root_hash);
     assert(fclose(f) == 0);
     g_seen_count = 0;
     assert(fetch_package(root_hash, 0) == 0);
     assert(unlink(root_metadata) == 0);
     assert(rmdir(root_path) == 0);
-    assert(unlink(path) == 0);
+    assert(access(path, F_OK) < 0 && errno == ENOENT); /* invalid cache was removed */
     assert(rmdir(temp) == 0);
 
     g_seen_count = 0;

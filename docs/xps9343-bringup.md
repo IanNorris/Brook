@@ -1544,3 +1544,65 @@ hit its15-second timeout under that load and passed in10.04seconds when rerun
 alone. Both outcomes are retained in `writable-desktop-all-host-20261030.log` and
 `writable-desktop-audio-recheck-20261030.log`; this is not reported as an entirely
 clean parallel-suite result.
+
+### Package metadata and launcher refresh corrections (2026-10-30)
+
+The installer failure above had two independent causes. The old index's
+galculator hash returned404; evaluating Brook's pin instead gives
+`vf2yfk2x5qvgxm611mn2lhh35g09zgpv-galculator-2.1.4`, whose narinfo is available.
+The generator now uses one explicit pinned x86_64-linux/allowUnfree=false package
+set for both evaluation phases and writes provenance plus an index digest. The
+refreshed21674-entry index is checked in. The hardware-store builder checks that
+provenance against the current pin and includes it in the image identity.
+Availability of every indexed archive is not implied by pin coherence.
+
+nix-fetch now rejects HTTP errors for metadata and archives, validates bounded
+complete metadata against the requested store hash before caching, removes
+invalid legacy cache entries and retries them, and uses unique cache temporary
+files. Parallel prefetch writes only private staging files; any transport failure
+discards the batch, including peers that succeeded. `--fail-early` prevents a
+later successful URL from hiding an earlier failure. Validated metadata is
+published only after successful transport. This remains format/identity
+validation, not a new NAR signature-verification implementation.
+
+The existing C regression and `tools/nix-fetch/test_http.py` pass. The latter
+uses real curl and a loopback HTTP server for404/500, a poisoned existing cache,
+wrong hash, incomplete/oversized/NUL metadata, oversized-cache recovery,
+archive404 without installation publication, an interrupted multi-URL batch,
+successful batch publication and concurrent cache writers. Astra reviewed both
+the implementation and regression coverage. Evidence:
+`build/hardware/nix-fetch-{regression,http}-20261030.log`.
+
+The v5 image successfully installed galculator through Gallery over HTTPS and
+opened the actual calculator through brook-run. Its checked storage restart
+and e2fsck gate passed. The remaining menu-refresh failure was traced to an
+absent `/boot/SHORTCUTS`: first boot allows that source to be missing, but later
+refreshes retain the old snapshot when it disappears. Prepared desktop initrds
+now include an empty directory. The collector also preserves hardware-specific
+core-app wrappers after an installation and supplies galculator's GUI runtime.
+The real collector regression passes. These final menu fixes are being checked
+in the v6 candidate; full desktop/Dell acceptance remains pending.
+
+Direct provisioning will use a separate root one-shot fixed-file helper, sharing
+the updater's boot/key/transaction framing and exclusion lock. It must stream
+straight to a new USB STORE.IMG, without replacing any existing file or staging
+it in RAM; check exact size/hash and file sync; close and reopen RW without
+truncate for uncached FAT readback; recheck size/hash/header/GDT; and publish
+STORE.OK last with no-replace semantics after explicit finalization. On uncertain
+failure retain the incomplete image without a ready marker, rather than deleting
+or retrying by pathname. Preserve APPS and recovery/boot-slot hashes. Start with
+uncompressed64KiB chunks and progress timeouts; compression can follow. The
+existing600-second RAM bulk-uploader deadline is not adequate for a multi-GiB
+USB provisioning/readback operation.
+
+The v6 private-QEMU review now passes actual Gallery installation, automatic
+launcher-catalog refresh, launch from the newly installed Galculator entry and
+keyboard interaction (`2+2=4`). After checked shutdown and a fresh QEMU process,
+the installed launcher entry and executable remain present and launch again;
+the calculator again renders4. The refreshed menu retains hardware wrappers for
+Files, Settings, Mousepad and Gallery. Evidence:
+`build/hardware/writable-desktop-qemu-v6-20261030/review/` and `reboot-review/`.
+This is application installation/persistence acceptance in QEMU; browser
+interaction/download/relaunch and actual Dell execution remain separate gates.
+The final v6 storage result also passes both checked shutdowns, clean-marker
+finalization and `e2fsck -fn`; see its `result.json` and `e2fsck.log`.

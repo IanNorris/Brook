@@ -3,3 +3,5 @@
 *.patch whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
 # FatFs's configuration overlay retains its upstream CRLF line endings.
 src/kernel/src/ffconf.h whitespace=cr-at-eol
+# The generated TSV keeps its final field separator for empty descriptions.
+tools/nix-index/packages.idx whitespace=-blank-at-eol

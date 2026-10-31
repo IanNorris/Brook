@@ -32,6 +32,10 @@ for path in [build/'kernel/BROOK.elf',build/'kernel/drivers/xhci.mod',build/'ker
 out.mkdir(parents=True,exist_ok=False)
 run('cp','--reflink=auto',build/'kernel/BROOK.elf',out/'kernel.elf')
 initrd=out/'INITRD.IMG';run('cp','--reflink=auto',recovery/'payload/INITRD.IMG',initrd)
+# Launcher rebuilds distinguish an empty shortcuts directory from a vanished
+# source. Retain the empty source even when this desktop uses only Nix entries.
+if subprocess.run(['mdir','-i',str(initrd),'::BOOT/SHORTCUTS'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
+    run('mmd','-i',initrd,'::BOOT/SHORTCUTS')
 for name in ['usb-read-only','boot-app-image']:run('mdel','-i',initrd,'::ETC/'+name)
 for name in ['xhci','sched_eevdf','virtio_input']:run('mcopy','-o','-i',initrd,build/'kernel/drivers'/f'{name}.mod','::DRIVERS/'+name.upper()+'.MOD')
 for name,source in [('HWSTATUS.ELF','tools/hardware_status.c'),('HWUPDATE.ELF','tools/hardware_update.c'),('HWIO.ELF','tools/hardware_storage_probe.c'),('HWBULK.ELF','tools/hardware_bulk.c')]:

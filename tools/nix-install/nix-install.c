@@ -807,6 +807,20 @@ static void refresh_desktop_entries(void)
             const char *suffix=desktop_exec_binary(exec_cmd,binary,sizeof(binary));
             if (!suffix) continue;
             const char *base=strrchr(binary,'/');base=base?base+1:binary;
+            /* Small hardware images provide dedicated environment wrappers.
+             * Preserve them when rebuilding the initially host-made manifest. */
+            int hardware_wrapped = 0;
+            const char *hardware_programs[]={"mousepad", "brook-files", "brook-settings", "wayland-calc", "brook-gallery"};
+            for(size_t hi=0;hi<sizeof(hardware_programs)/sizeof(hardware_programs[0]);++hi) {
+                if(strcmp(base,hardware_programs[hi]))continue;
+                char wrapper[1200],arguments[sizeof(exec_cmd)];
+                snprintf(wrapper,sizeof(wrapper),PROFILE_BIN "/hardware-%s",base);
+                if(access(wrapper,X_OK)!=0)break;
+                snprintf(arguments,sizeof(arguments),"%s",suffix);
+                if(strlen(wrapper)+strlen(arguments)+12>=sizeof(exec_cmd))break;
+                snprintf(exec_cmd,sizeof(exec_cmd),"--uid 1000 %s%s",wrapper,arguments);
+                hardware_wrapped=1;break;
+            }
             const char *programs[] = {"chromium", "firefox", "codium", "vscodium", "vlc"};
             for (unsigned bi = 0; bi < sizeof(programs) / sizeof(programs[0]); ++bi) {
                 const char *program = programs[bi];
@@ -829,9 +843,9 @@ static void refresh_desktop_entries(void)
             /* Preserve the profile's GUI environment after every install, not
              * just in the host-generated initial index. Keep browsers/media
              * above on their more specific compatibility launchers. */
-            const char *gui_programs[]={"gimp", "gimp-3.0", "mousepad", "openttd",
+            const char *gui_programs[]={"gimp", "gimp-3.0", "mousepad", "openttd", "galculator",
                 "qalculate-gtk", "gnome-commander", "thunar"};
-            for(size_t gi=0;gi<sizeof(gui_programs)/sizeof(gui_programs[0]);++gi) {
+            for(size_t gi=0;!hardware_wrapped&&gi<sizeof(gui_programs)/sizeof(gui_programs[0]);++gi) {
                 if(strcmp(base,gui_programs[gi]))continue;
                 const char *runtime=PROFILE_BIN "/brook-run";
                 if(access(runtime,X_OK)!=0)break;

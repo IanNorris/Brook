@@ -145,46 +145,58 @@ static void narinfo_cache_init(void) {
     }
 }
 
-/* Read a cached narinfo from disk into buf.  Returns bytes read, 0
- * if not cached, -1 on error.  We keep it simple: if the file exists
- * and is parseable later, it's a hit. */
-static int narinfo_cache_load(const char *hash, char *buf, size_t bufsz) {
-    char path[MAX_PATH];
-    narinfo_cache_path(hash, path, sizeof(path));
+static int narinfo_valid(char *data, size_t size, const char *hash);
+
+/* Read a complete bounded file, rejecting errors, oversized data and NULs. */
+static int metadata_read(const char *path, char *buf, size_t bufsz) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
-
     size_t total = 0;
-    ssize_t r;
-    while (total < bufsz - 1 &&
-           (r = read(fd, buf + total, bufsz - 1 - total)) > 0) {
+    ssize_t r = 0;
+    while (total < bufsz - 1) {
+        r = read(fd, buf + total, bufsz - 1 - total);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
         total += (size_t)r;
     }
+    char extra;
+    if (r >= 0 && total == bufsz - 1) do { r = read(fd, &extra, 1); } while (r < 0 && errno == EINTR);
     close(fd);
-    if (total == 0) return 0;
+    if (r != 0 || !total || memchr(buf, '\0', total)) return -1;
     buf[total] = '\0';
     return (int)total;
 }
 
-/* Atomically write a narinfo to the cache.  Write to <path>.tmp then
- * rename to avoid leaving partial files if we get killed mid-write. */
+/* Invalid legacy entries (including HTTP error bodies) are misses, not a
+ * permanent failure. Only complete, matching metadata can be a cache hit. */
+static int narinfo_cache_load(const char *hash, char *buf, size_t bufsz) {
+    char path[MAX_PATH];
+    narinfo_cache_path(hash, path, sizeof(path));
+    int n = metadata_read(path, buf, bufsz);
+    if (n > 0 && narinfo_valid(buf, (size_t)n, hash)) return n;
+    if (n) unlink(path);
+    return 0;
+}
+
+/* Unique temporary files prevent concurrent writers sharing a partial file. */
 static void narinfo_cache_save(const char *hash, const char *data, size_t len) {
     narinfo_cache_init();
     if (g_cache_disabled) return;
 
     char path[MAX_PATH], tmp[MAX_PATH];
     narinfo_cache_path(hash, path, sizeof(path));
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
 
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = mkstemp(tmp);
     if (fd < 0) return;
     size_t written = 0;
     while (written < len) {
         ssize_t w = write(fd, data + written, len - written);
+        if (w < 0 && errno == EINTR) continue;
         if (w <= 0) { close(fd); unlink(tmp); return; }
         written += (size_t)w;
     }
-    close(fd);
+    if (close(fd) < 0) { unlink(tmp); return; }
     if (rename(tmp, path) < 0) unlink(tmp);
 }
 
@@ -217,32 +229,34 @@ static void batch_prefetch_narinfos(char hashes[][33], int n) {
     narinfo_cache_init();
     if (g_cache_disabled) return;
 
-    /* Build curl config file in /tmp.  Each entry: url= ... \n output= ... */
+    /* Publish nothing until curl completes successfully and each bounded
+     * staged response validates. A failed batch is retried by the normal walk. */
+    char staging[] = "/tmp/nix-fetch-batch-XXXXXX";
+    if (!mkdtemp(staging)) return;
     char cfg_path[MAX_PATH];
-    snprintf(cfg_path, sizeof(cfg_path), "/tmp/nix-fetch-batch-%d.cfg", (int)getpid());
+    snprintf(cfg_path, sizeof(cfg_path), "%s/curl.cfg", staging);
 
     FILE *f = fopen(cfg_path, "w");
-    if (!f) return;
+    if (!f) { rmdir(staging); return; }
 
     int written = 0;
     long t_build0 = now_ms();
     for (int i = 0; i < n; i++) {
-        /* Skip if cache file already exists */
-        char cache_path[MAX_PATH];
-        narinfo_cache_path(hashes[i], cache_path, sizeof(cache_path));
-        if (access(cache_path, F_OK) == 0) continue;
+        char cache_path[MAX_PATH], metadata[MAX_NARINFO];
+        if (narinfo_cache_load(hashes[i], metadata, sizeof(metadata)) > 0) continue;
+        snprintf(cache_path, sizeof(cache_path), "%s/%s", staging, hashes[i]);
         fprintf(f, "url = \"%s/%s.narinfo\"\n", g_cache_url, hashes[i]);
         fprintf(f, "output = \"%s\"\n", cache_path);
         written++;
     }
     fclose(f);
 
-    if (written == 0) { unlink(cfg_path); return; }
+    if (written == 0) { remove_tree(staging); return; }
 
     fprintf(stderr, "nix-fetch: prefetching %d narinfo(s) in one curl...\n", written);
     long t0 = now_ms();
     pid_t pid = fork();
-    if (pid < 0) { unlink(cfg_path); return; }
+    if (pid < 0) { remove_tree(staging); return; }
     if (pid == 0) {
         /* No stdout capture — outputs go to per-URL files via config.
          * -Z runs transfers in parallel (default cap 50, we limit via
@@ -256,30 +270,36 @@ static void batch_prefetch_narinfos(char hashes[][33], int n) {
          * Parallelism cap of 4 keeps load on cache.nixos.org modest
          * while collapsing the wall-clock by ~4x in the typical case. */
         if (g_cacert_path)
-            execlp(g_curl_path, "curl", "-4", "-sS", "--http1.1",
+            execlp(g_curl_path, "curl", "-4", "-sS", "--fail", "--fail-early", "--http1.1",
                    "-Z", "--parallel-max", "4",
+                   "--max-filesize", "32767",
                    "-H", "Connection: close",
                    "--connect-timeout", "15", "--max-time", "60",
                    "--cacert", g_cacert_path, "-K", cfg_path, (char*)NULL);
         else
-            execlp(g_curl_path, "curl", "-4", "-sS", "--http1.1",
+            execlp(g_curl_path, "curl", "-4", "-sS", "--fail", "--fail-early", "--http1.1",
                    "-Z", "--parallel-max", "4",
+                   "--max-filesize", "32767",
                    "-H", "Connection: close",
                    "--connect-timeout", "15", "--max-time", "60",
                    "-K", cfg_path, (char*)NULL);
         _exit(127);
     }
-    int status;
-    waitpid(pid, &status, 0);
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
     long t_done = now_ms();
-    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    int code = waited == pid && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     fprintf(stderr, "nix-fetch: batch prefetch %d narinfos: %ldms (build=%ldms curl exit=%d)\n",
             written, t_done - t0, t0 - t_build0, code);
-    unlink(cfg_path);
-    /* Even on partial failure, individual file contents are intact:
-     * curl writes each output file as it streams; failed URLs leave
-     * either no file (404) or a partial file (network).  The
-     * subsequent fetch_package call will re-validate on cache hit. */
+    if (!code) for (int i = 0; i < n; ++i) {
+        char path[MAX_PATH], data[MAX_NARINFO];
+        snprintf(path, sizeof(path), "%s/%s", staging, hashes[i]);
+        int bytes = metadata_read(path, data, sizeof(data));
+        if (bytes > 0 && narinfo_valid(data, (size_t)bytes, hashes[i]))
+            narinfo_cache_save(hashes[i], data, (size_t)bytes);
+    }
+    remove_tree(staging);
 }
 
 /* exec curl with optional --cacert; never returns on success */
@@ -302,13 +322,13 @@ static void exec_curl(const char *url) {
     // metadata bounded, but allow archive progress and bound actual stalls.
     const char *max_time = strstr(url, ".narinfo") ? "60" : "0";
     if (g_cacert_path)
-        execlp(g_curl_path, "curl", "-4", "-sSL", "--http1.1",
+        execlp(g_curl_path, "curl", "-4", "-sSL", "--fail", "--http1.1",
                "-H", "Connection: close",
                "--connect-timeout", "15", "--max-time", max_time,
                "--speed-time", "120", "--speed-limit", "1",
                "--cacert", g_cacert_path, url, (char*)NULL);
     else
-        execlp(g_curl_path, "curl", "-4", "-sSL", "--http1.1",
+        execlp(g_curl_path, "curl", "-4", "-sSL", "--fail", "--http1.1",
                "-H", "Connection: close",
                "--connect-timeout", "15", "--max-time", max_time,
                "--speed-time", "120", "--speed-limit", "1",
@@ -354,7 +374,7 @@ static int curl_fetch_once(const char *url, char *buf, size_t bufsz) {
     long t0 = now_ms();
     if (pipe(pfd) < 0) { perror("pipe"); return -1; }
     pid_t pid = fork();
-    if (pid < 0) { perror("fork"); return -1; }
+    if (pid < 0) { perror("fork"); close(pfd[0]); close(pfd[1]); return -1; }
 
     if (pid == 0) {
         close(pfd[0]);
@@ -366,20 +386,27 @@ static int curl_fetch_once(const char *url, char *buf, size_t bufsz) {
     close(pfd[1]);
     long t_fork = now_ms();
     size_t total = 0;
-    ssize_t n;
-    while (total < bufsz - 1 && (n = read(pfd[0], buf + total, bufsz - 1 - total)) > 0) {
+    ssize_t n = 0;
+    while (total < bufsz - 1) {
+        n = read(pfd[0], buf + total, bufsz - 1 - total);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
         total += n;
     }
+    char extra;
+    if (n >= 0 && total == bufsz - 1) do { n = read(pfd[0], &extra, 1); } while (n < 0 && errno == EINTR);
+    int read_failed = n != 0 || memchr(buf, '\0', total) != NULL;
     long t_read = now_ms();
     buf[total] = '\0';
     close(pfd[0]);
 
-    int status;
-    waitpid(pid, &status, 0);
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
     long t_done = now_ms();
     fprintf(stderr, "nix-fetch: timing url=%.40s fork=%ldms read=%ldms wait=%ldms total=%ldms bytes=%zu\n",
             url, t_fork - t0, t_read - t_fork, t_done - t_read, t_done - t0, total);
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || read_failed) {
         int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         fprintf(stderr, "nix-fetch: curl exited with status %d (url: %s)\n", code, url);
         if (total > 0)
@@ -427,6 +454,44 @@ static char *narinfo_field(char *narinfo, const char *field, char *out, size_t o
         return out;
     }
     return NULL;
+}
+
+static int narinfo_store_name_valid(const char *name) {
+    if (strlen(name) < 34 || name[32] != '-') return 0;
+    if (strspn(name, "0123456789abcdfghijklmnpqrsvwxyz") != 32) return 0;
+    for (const unsigned char *p = (const unsigned char *)name + 33; *p; ++p)
+        if (*p <= ' ' || *p == '/' || *p == 127) return 0;
+    return 1;
+}
+
+/* A matching, complete metadata envelope is required even for cached files.
+ * This validates format/identity; existing NAR extraction is not a signature
+ * verification implementation. */
+static int narinfo_valid(char *data, size_t size, const char *hash) {
+    if (!size || size >= MAX_NARINFO || data[size-1] != '\n' ||
+        memchr(data, '\0', size) || strlen(hash) != 32) return 0;
+    char path[MAX_PATH], url[MAX_PATH], compression[64], nar_hash[128], nar_size[32];
+    if (!narinfo_field(data, "StorePath", path, sizeof(path)) ||
+        strncmp(path, "/nix/store/", 11) || !narinfo_store_name_valid(path+11) ||
+        memcmp(path+11, hash, 32) ||
+        !narinfo_field(data, "URL", url, sizeof(url)) || strncmp(url, "nar/", 4) ||
+        !url[4] || strstr(url, "..") || strpbrk(url, " \t\r\n") ||
+        !narinfo_field(data, "NarHash", nar_hash, sizeof(nar_hash)) ||
+        strncmp(nar_hash, "sha256:", 7) || !nar_hash[7] ||
+        !narinfo_field(data, "NarSize", nar_size, sizeof(nar_size)) ||
+        !nar_size[0] || strspn(nar_size, "0123456789") != strlen(nar_size)) return 0;
+    char *end; errno = 0;
+    if (!strtoull(nar_size, &end, 10) || *end || errno) return 0;
+    if (narinfo_field(data, "Compression", compression, sizeof(compression))) {
+        if (strcmp(compression, "none") && strcmp(compression, "xz") && strcmp(compression, "zstd")) return 0;
+    } else if (strstr(data, "\nCompression:") || !strncmp(data, "Compression:", 12)) return 0;
+    char references[MAX_REFERENCES];
+    if (narinfo_field(data, "References", references, sizeof(references))) {
+        char *save = NULL;
+        for (char *ref = strtok_r(references, " \t", &save); ref; ref = strtok_r(NULL, " \t", &save))
+            if (!narinfo_store_name_valid(ref)) return 0;
+    } else if (strstr(data, "\nReferences:") || !strncmp(data, "References:", 11)) return 0;
+    return 1;
 }
 
 /* Run the download+decompress+unpack pipeline:
@@ -668,7 +733,7 @@ static int fetch_package(const char *hash, int force) {
     if (n <= 0) {
         printf("Fetching narinfo for %s...\n", hash);
         n = curl_fetch(url, narinfo, sizeof(narinfo));
-        if (n <= 0) {
+        if (n <= 0 || !narinfo_valid(narinfo, (size_t)n, hash)) {
             fprintf(stderr, "nix-fetch: failed to fetch narinfo for %s\n", hash);
             return -1;
         }

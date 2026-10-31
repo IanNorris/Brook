@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "nixpkgs_import": "nix/nixpkgs.nix",
+  "nixpkgs_import_sha256": "34d44d88e3adaca3e0da36cc799fad3583420d4cfb8dc1d127500973bbef0f7a",
+  "system": "x86_64-linux",
+  "allow_unfree": false,
+  "entries": 21674,
+  "index_sha256": "f67efc13fa2508894bae2edd4fc36609ecb37a8ec405a8812013a8cdc2497790",
+  "binary_cache_availability_checked": false
+}
