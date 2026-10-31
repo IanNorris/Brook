@@ -1686,3 +1686,22 @@ retained the failed transaction evidence; this is not a successful provisioning
 run. Evidence: `build/hardware/store-fat-create-qemu-v1-20261031/`, including
 `fat-create-diagnostic-result.json` and `store-qa/receipt.json`. Safe object-
 relative no-replace rename and its identity/alias tests remain the next gate.
+
+The previous marker-rename plan has been replaced for provisioning. After the
+image is fully synced, reopened, validated and hash-verified, explicit FINALIZE
+exclusively creates `STORE.OK` itself. Boot only accepts a complete matching
+record; an interrupted partial marker remains invalid, while a complete marker
+that appears before its flush acknowledgment still identifies an already durable
+and verified image. Creation immediately records `published=true`; file/directory
+flush and fresh readback are required before `durable=true`. Partial or uncertain
+markers are never automatically removed or retried. This avoids changing retained
+FAT object identity merely to publish a boot-only marker; general retained FAT
+rename remains unsupported and should be implemented separately.
+
+Private QEMU has now passed the complete16MiB provisioning workflow against the
+production FAT checks, followed by checked shutdown. Offline hashes confirm the
+written image and marker, original APPS.BRK, root EFI/kernel and inactive A
+slots/selectors, plus the expected prepared B slot. Evidence:
+`build/hardware/store-direct-marker-qemu-v1-20261031/{store-qa/receipt.json,media-verification.json,slot-verification.json}`.
+Astra reviewed the direct publication sequence. This is not yet proof of full-size
+transfer, subsequent writable-desktop admission or physical Dell acceptance.

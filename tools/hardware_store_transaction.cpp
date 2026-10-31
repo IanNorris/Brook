@@ -6,7 +6,6 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 static int failure() { return errno ? -errno : -EIO; }
@@ -60,19 +59,20 @@ int HardwareStoreTransaction::stage() {
 }
 int HardwareStoreTransaction::finalize() {
     if(!staged_)return -EINVAL;staged_=false;
-    int fd=openat(directory_,"STORE.TMP",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
-    if(fd<0)return failure();
-    int e=write_all(fd,record_,record_length_);if(!e && fsync(fd))e=failure();
-    if(close(fd)&&!e)e=failure();if(e)return e;
 #ifdef BROOK_STORE_TEST
     const char *inject=getenv("BROOK_STORE_TEST_FAILURE");
-    if(inject && !strcmp(inject,"before-rename"))return -EIO;
+    if(inject && !strcmp(inject,"before-create"))return -EIO;
 #endif
-    if(syscall(SYS_renameat2,directory_,"STORE.TMP",directory_,"STORE.OK",1))return failure();
+    // Boot is the only consumer and accepts only a complete matching record.
+    // The image was synced and rehashed before this exclusive creation.
+    int fd=openat(directory_,"STORE.OK",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
+    if(fd<0)return failure();
     published_=true;
 #ifdef BROOK_STORE_TEST
-    if(inject && !strcmp(inject,"after-rename"))return -EIO;
+    if(inject && !strcmp(inject,"after-create")){close(fd);return -EIO;}
 #endif
+    int e=write_all(fd,record_,record_length_);if(!e && fsync(fd))e=failure();
+    if(close(fd)&&!e)e=failure();if(e)return e;
     if(fsync(directory_))return failure();
     fd=openat(directory_,"STORE.OK",O_RDWR|O_NOFOLLOW|O_CLOEXEC);if(fd<0)return failure();
     char check[97];ssize_t n=read(fd,check,sizeof(check));e=(n==static_cast<ssize_t>(record_length_) && !memcmp(check,record_,record_length_))?0:-EIO;
