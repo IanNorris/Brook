@@ -50,6 +50,8 @@ def main():
                         help='Copy the production recovery shell into the disposable initrd')
     parser.add_argument('--network-roundtrip', action='store_true',
                         help='Also verify a binary RAM-only upload and download')
+    parser.add_argument('--xhci-module', type=Path,
+                        help='Use this xHCI module in the private QEMU boot')
     a = parser.parse_args()
     if (a.readonly_checker or a.preen_checker) and not a.dirty_classification_kernel:
         parser.error('checker tests require --dirty-classification-kernel')
@@ -72,6 +74,8 @@ def main():
     else:
         run('mdel', '-i', initrd, '::ETC/writable-desktop')
     run('mcopy', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
+    if a.xhci_module:
+        run('mcopy', '-o', '-i', initrd, a.xhci_module, '::DRIVERS/XHCI.MOD')
     if a.recovery_initrd:
         shell = out / 'busybox'
         run('mcopy', '-i', a.recovery_initrd, '::BOOT/BUSYBOX', shell)

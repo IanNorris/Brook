@@ -92,6 +92,14 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   The next checked restart selected the SSD payload and reported the persistent
   desktop store ready. The original Firefox-associated hang remains unresolved;
   this recovery does not prove that future crashes are handled automatically.
+- A subsequent clean power-off and SSD boot with the USB stick removed again
+  admitted the persistent store, but xHCI reset failed and no Ethernet address
+  was acquired. The user observed repeated reset failures and reported that
+  the Dell firmware's F12 menu also did not list either of two USB sticks.
+  That firmware observation has not yet been explained; it may be independent
+  of Brook's reset path. A controller reset candidate adds Intel's post-reset
+  quiet interval, bounded phase checks and on-screen phase/register diagnostics.
+  Host mocks and QEMU tests do not establish its behavior on the physical Dell.
 
 ## Installation plan and historical engineering gates
 

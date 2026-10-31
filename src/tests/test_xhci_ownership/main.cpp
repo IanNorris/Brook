@@ -1,4 +1,5 @@
 #include "../../drivers/xhci/xhci_ownership.h"
+#include "../../drivers/xhci/xhci_controller_reset.h"
 #include <cassert>
 #include "../../drivers/xhci/xhci_msi.h"
 #include "../../drivers/xhci/xhci_root_port.h"
@@ -31,7 +32,37 @@ struct Routing {
     uint32_t read(unsigned offset){++reads;return values.at(offset);}
     void write(unsigned offset,unsigned value){assert(offset==0xd8 || offset==0xd0);writes.push_back({offset,value});if(!ignore && offset!=ignoreOffset)values[offset]=value;}
 };
+struct ControllerReset {
+    uint64_t tick=0, resetAt=0; bool frozen=false, stuckHalt=false, stuckReset=false, stuckReady=false, invalid=false;
+    bool invalidAfterReset=false, initialReset=false, initialCnr=false, didReset=false, earlyAccess=false; unsigned writes=0;
+    uint32_t command(){if(didReset && tick-resetAt<2)earlyAccess=true;return (invalid || (didReset && invalidAfterReset))?~0u:((!didReset && initialReset) || (didReset && (stuckReset || tick-resetAt<3))?2u:0u);}
+    uint32_t status(){if(didReset && tick-resetAt<2)earlyAccess=true;return (invalid || (didReset && invalidAfterReset))?~0u:(stuckHalt?0u:(1u | (((!didReset && initialCnr) || (didReset && stuckReady))?(1u<<11):0u)));}
+    void writeCommand(uint32_t v){++writes;if(v&2){assert(!stuckHalt);didReset=true;resetAt=tick;}}
+    uint64_t now(){return tick;}
+    void pause(){if(!frozen)++tick;}
+};
 int main(){
+    using namespace brook;
+    ControllerReset ok;auto reset=XhciResetController(ok,true,20,100);
+    assert(reset.phase==XhciResetPhase::Complete && reset.error==XhciResetError::None && !ok.earlyAccess && ok.writes==2);
+    ControllerReset dead;dead.invalid=true;reset=XhciResetController(dead,true,20,100);
+    assert(reset.error==XhciResetError::Inaccessible && dead.writes==0);
+    ControllerReset initialCnr;initialCnr.initialCnr=true;reset=XhciResetController(initialCnr,true,20,100);
+    assert(reset.error==XhciResetError::InitiallyNotReady && initialCnr.writes==0);
+    ControllerReset initialReset;initialReset.initialReset=true;reset=XhciResetController(initialReset,true,20,100);
+    assert(reset.error==XhciResetError::InitiallyNotReady && initialReset.writes==0);
+    ControllerReset other;reset=XhciResetController(other,false,20,100);
+    assert(reset.phase==XhciResetPhase::Complete && reset.error==XhciResetError::None);
+    ControllerReset halt;halt.stuckHalt=true;reset=XhciResetController(halt,true,20,100);
+    assert(reset.phase==XhciResetPhase::Halt && reset.error==XhciResetError::Timeout && halt.writes==1 && !halt.didReset);
+    ControllerReset clock;clock.frozen=true;reset=XhciResetController(clock,true,20,10);
+    assert(reset.phase==XhciResetPhase::IntelQuiet && reset.error==XhciResetError::ClockStopped && !clock.earlyAccess);
+    ControllerReset stuck;stuck.stuckReset=true;reset=XhciResetController(stuck,true,20,100);
+    assert(reset.phase==XhciResetPhase::Reset && reset.error==XhciResetError::Timeout && !stuck.earlyAccess);
+    ControllerReset controllerGone;controllerGone.invalidAfterReset=true;reset=XhciResetController(controllerGone,true,20,100);
+    assert(reset.phase==XhciResetPhase::Reset && reset.error==XhciResetError::Inaccessible && !controllerGone.earlyAccess);
+    ControllerReset cnr;cnr.stuckReady=true;reset=XhciResetController(cnr,true,20,100);
+    assert(reset.phase==XhciResetPhase::Ready && reset.error==XhciResetError::Timeout && !cnr.earlyAccess);
     brook::XhciIntelRouteState route{};Routing routing;
     assert(brook::XhciEnableIntelRouting(0x1b36,0x000d,0x0c0330,routing,route)==brook::XhciIntelRouteResult::NotApplicable && !routing.reads && routing.writes.empty());
     assert(brook::XhciEnableIntelRouting(0x8086,0x1234,0x0c0330,routing,route)==brook::XhciIntelRouteResult::NotApplicable && !routing.reads);

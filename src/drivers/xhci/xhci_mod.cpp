@@ -19,6 +19,7 @@
 #include "usb_ecm_descriptors.h"
 #include "net.h"
 #include "xhci_ownership.h"
+#include "xhci_controller_reset.h"
 #include "xhci_root_port.h"
 #include "xhci_intel_routing.h"
 #include "xhci_msi.h"
@@ -623,31 +624,23 @@ static bool XhciPciDetect(XhciController& ctrl)
 
 static bool XhciReset(XhciController& ctrl)
 {
-    uint32_t cmd=xhci_read32(ctrl.opBase,XHCI_OP_USBCMD);
-    xhci_write32(ctrl.opBase,XHCI_OP_USBCMD,cmd&~(USBCMD_RS|USBCMD_INTE));
-    bool halted=false;
-    for(unsigned i=0;i<100;++i) {
-        if(xhci_read32(ctrl.opBase,XHCI_OP_USBSTS)&USBSTS_HCH){halted=true;break;}
-        for(volatile int d=0;d<100000;++d){}
+    struct ResetIo {
+        XhciController& ctrl;
+        uint32_t command() { return xhci_read32(ctrl.opBase,XHCI_OP_USBCMD); }
+        uint32_t status() { return xhci_read32(ctrl.opBase,XHCI_OP_USBSTS); }
+        void writeCommand(uint32_t value) { xhci_write32(ctrl.opBase,XHCI_OP_USBCMD,value); }
+        uint64_t now() { return ApicTickCount(); }
+        void pause() { __asm__ volatile("pause"); }
+    } io{ctrl};
+    const auto result = XhciResetController(io, ctrl.pciDev.vendorId==0x8086, 10000, 500000000);
+    if (result.error != XhciResetError::None) {
+        KPrintf("xhci: reset failed phase=%u error=%u USBCMD=0x%x USBSTS=0x%x\n",
+                static_cast<unsigned>(result.phase),static_cast<unsigned>(result.error),
+                result.command,result.status);
+        return false;
     }
-    if(!halted){SerialPuts("xhci: halt timed out; reset aborted\n");return false;}
-
-    // Reset
-    xhci_write32(ctrl.opBase, XHCI_OP_USBCMD, USBCMD_HCRST);
-
-    // Wait for reset to complete (HCRST clears and CNR clears)
-    for (int i = 0; i < 1000; i++) {
-        uint32_t sts = xhci_read32(ctrl.opBase, XHCI_OP_USBSTS);
-        uint32_t cmd2 = xhci_read32(ctrl.opBase, XHCI_OP_USBCMD);
-        if (!(cmd2 & USBCMD_HCRST) && !(sts & USBSTS_CNR)) {
-            SerialPuts("xhci: controller reset complete\n");
-            return true;
-        }
-        for (volatile int d = 0; d < 100000; d++);
-    }
-
-    SerialPuts("xhci: controller reset timeout!\n");
-    return false;
+    SerialPuts("xhci: controller reset complete\n");
+    return true;
 }
 
 static bool XhciAllocRings(XhciController& ctrl)
