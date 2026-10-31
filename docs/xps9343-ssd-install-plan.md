@@ -1,0 +1,94 @@
+# Dell XPS 13 9343: internal SSD installation preparation
+
+This is a preparation plan, not an installer or an instruction to write the
+current disk. The active bring-up goal keeps the Dell SSD read-only. The user
+has said the old Ubuntu installation may eventually be wiped; a later write
+phase must still satisfy the goal and technical prerequisites in force then.
+
+## What is known
+
+- Brook booted the Dell from its existing USB stick. The tested A/B USB payload
+  and root recovery path are the current way back into Brook.
+- A read-only AHCI probe identified a Samsung PM851 M.2 2280, 256 GB, on Intel
+  8086:9c83 SATA port 3: 500,118,192 logical sectors of 512 bytes. Record the
+  exact ATA serial and physical sector size privately from a fresh boot; do not
+  infer them from this model name or commit them to Git.
+- The last read-only inventory found a legacy MBR with one active Linux
+  partition. This was not a filesystem health check. The SSD has not been
+  written by Brook.
+- A disposable QEMU SATA disk with the same logical capacity received a 6 GiB
+  desktop partition and booted without USB. A separate clone passed two checked
+  boots and application-store persistence plus offline GPT/FAT/ext2 checks.
+  The persistence clone had its test helper replaced. Browser interaction,
+  physical SSD behavior and arbitrary power-loss recovery were not established.
+- A small QEMU install interrupted during payload copying was successfully
+  restarted from USB. QEMU process exit is not proof of a physical power cut.
+  The installer worker and its synthetic-device admission are test-only.
+
+## Remaining engineering gates
+
+1. **Back up the original disk and verify the backup.** Preserve the entire
+   256,060,514,304-byte logical device, not just its partition table. A raw
+   backup needs at least that much free destination space plus overhead; the
+   current host `/data` filesystem has less, so choose another sufficiently large
+   destination or verify actual compression and available space before relying on
+   it. A rescue environment must disable automount and mark the SSD block device
+   read-only before inspection or imaging. Record source identity, size, read
+   errors, backup length and a full-image digest in private local evidence.
+   Hash the complete source stream during acquisition, then independently read
+   back or decompress the stored backup and require the same byte count and hash.
+   Unreadable sectors require explicit handling and cannot be called a verified
+   full backup. Test the restore workflow against a disposable image. Record
+   UEFI boot mode, settings and relevant boot entries separately: disk imaging
+   does not preserve firmware NVRAM. Brook's current bulk
+   transfer is bounded and is not an established full-disk backup/restore tool;
+   a suitable independent rescue environment or new verified streaming tool is
+   still needed. A backup is for recovery, not a claim that a wiped SSD has been
+   securely erased.
+2. **Build a physical candidate.** Generate a new target-sized GPT and boot
+   payload using the Dell's freshly observed controller, port, model, serial,
+   capacity, sector sizes and flush capability. The QEMU desktop image embeds
+   `QEMU HARDDISK` and a synthetic serial; it must never be reused as the Dell's
+   write-target record. Generate new disk/partition identifiers and a matching
+   boot-volume selector together. Keep those and per-device records private.
+   Decide the partition/store sizes against actual application and user-data
+   needs; the 6 GiB / 4 GB store was a test fixture, not a final capacity
+   decision. FAT32 cannot contain a file of 4 GiB or more.
+3. **Implement actual installer admission and recovery.** The current installer
+   path admits only synthetic QEMU disks. Before any physical write, implement
+   exact physical target binding, source-device ancestry and exclusivity,
+   immutable source leases, a trusted package identity, pre-write verification
+   of the leased bytes and geometry, durable progress/failure reporting and a
+   tested recovery path. The v2 package checksum detects data changes but a
+   record stored with the package is not authentication. Refuse ambiguous
+   targets, unverified packages, unsupported sector sizes, missing flush support
+   and uncertain I/O. Preserve the USB's working A/B and root recovery files.
+4. **Rehearse the exact candidate on disposable media.** Use the full desktop
+   package and a QEMU disk of the same sector geometry, with the intended target
+   and boot selectors adapted only to a synthetic identity. Verify negative
+   identity/geometry/package cases perform zero target writes; compare installed
+   ranges independently, boot without USB, exercise the actual browsers and
+   Gallery, write and sync user data, shut down and verify it after a fresh boot.
+   Test interruptions at multiple phases and a separate recovery boot. A QMP
+   quit is only a guest-interruption test; do not claim it proves persistence
+   under host power loss.
+5. **Recheck the Dell and recovery media.** Confirm the target identity and
+   health, copy and verify the candidate on suitable storage, remeasure free USB
+   space, and confirm the original USB recovery boot still works. The previous
+   USB free-space observation was about 30.3 GB and may be stale. The Dell must
+   be reachable and physically observable; its most recent network loss has not
+   been diagnosed. Keep the verified backup separate from both the target and
+   installer media.
+
+## Eventual installation and acceptance
+
+Once the above gates and the then-current goal permit physical writes, use the
+reviewed installer for the uniquely identified SSD. Check its receipt and
+readback, then boot the SSD with USB removed while retaining the USB recovery
+stick. Verify UEFI boot selection, the expected kernel and store, browser and
+Gallery interaction, persistence through checked shutdown/restart, and that a
+second cold boot works. If any stage is uncertain, stop rather than replaying a
+write: retain the disk and receipts, boot the independent recovery media, and
+inspect whether the verified backup must be restored. A restore procedure must
+also identify its destination and verify written bytes; it is not implemented
+yet. Do not claim automatic rollback, secure erase or crash consistency.

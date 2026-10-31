@@ -1944,6 +1944,9 @@ interactive use, downloads and clean relaunch remain separate acceptance gates.
 
 ### Internal SSD direction and read-only AHCI observation (2026-10-31)
 
+The reviewed, still-preparatory [SSD installation plan](xps9343-ssd-install-plan.md)
+collects the outstanding backup, installer and acceptance requirements.
+
 The user has asked to move Brook onto the internal SSD. The Dell's boot PCI
 inventory identifies Intel 8086:9c83 SATA AHCI; no Brook AHCI disk driver is
 present yet. The existing GPT probe is not sufficient to decide an install
