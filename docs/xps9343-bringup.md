@@ -2377,3 +2377,20 @@ when its guest was deliberately stopped is retained in the run output. This is
 one controlled guest interruption, not a host power-loss or arbitrary-write
 ordering test: QEMU and the host could still flush cached writes on exit. It is
 not evidence of physical SSD installation or crash consistency.
+
+Compact package format v2 adds `INSTHASH.BIN`: a fixed geometry/length header
+and SHA-256 over that header followed by every packed source byte. The
+compile-gated QEMU worker now requires this record for every compact install,
+holds its segment leases while it hashes the staged bytes, and refuses errors
+before invoking any target operation. This closes a test-worker integrity gap;
+the record is supplied alongside the package and is not a signature, trusted
+identity or installation authorization. A production worker would need a
+trusted expected identity and independently established device ownership.
+
+An intact 64 MiB fixture passed guest verification, installation and USB-free
+boot (`digok`, `digboot`). Deliberate post-staging data corruption, a missing
+record and a truncated record each failed with zero installer operations and a
+byte-identical target (`digbad`, `digmissing`, `digshort`). Host tests additionally
+exercise short source reads and geometry mismatches. Older v1 test packages do
+not have the required record and must be regenerated. These results do not
+establish physical SSD readiness or a power-loss guarantee.

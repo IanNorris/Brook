@@ -40,10 +40,16 @@ class CompactPackage(unittest.TestCase):
             expected = image[:34*512] + image[first*512:(first+count)*512] + image[(sectors-33)*512:]
             self.assertEqual(actual, expected)
             self.assertEqual(hashlib.sha256(actual).hexdigest(), manifest['packed_sha256'])
+            record=(package/'INSTHASH.BIN').read_bytes()
+            self.assertEqual(hashlib.sha256(record[:40]+actual).digest(),record[40:])
+            self.assertEqual(hashlib.sha256(record).hexdigest(),manifest['install_record_sha256'])
             segment = package/manifest['segments'][0]['name']; original = segment.read_bytes(); data = bytearray(original); data[0] ^= 1; segment.write_bytes(data)
             with self.assertRaises(ValueError): packer.verify_segment(segment,manifest['segments'][0])
             with self.assertRaises(ValueError): packer.verify_package(package)
             segment.write_bytes(original)
+            record_path=package/'INSTHASH.BIN';tampered=bytearray(record);tampered[8]^=1;record_path.write_bytes(tampered)
+            with self.assertRaises(ValueError): packer.verify_package(package)
+            record_path.write_bytes(record)
             doc=json.loads((package/'manifest.json').read_text());doc['geometry']['payload_first']+=1
             (package/'manifest.json').write_text(json.dumps(doc))
             with self.assertRaises(ValueError): packer.verify_package(package)

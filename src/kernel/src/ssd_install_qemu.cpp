@@ -5,6 +5,7 @@
 #include "ssd_install_gate.h"
 #include "ssd_install_segmented_source.h"
 #include "ssd_install_compact_source.h"
+#include "ssd_install_digest.h"
 #include "ahci_readonly.h"
 #include "fatfs_vfs.h"
 #include "device.h"
@@ -73,6 +74,17 @@ int Run() {
     auto* meta=static_cast<uint8_t*>(kmalloc(34304));
     auto* a=static_cast<uint8_t*>(kmalloc(65536));auto* b=static_cast<uint8_t*>(kmalloc(65536));
     if(!meta || !a || !b)result=-12;
+    if(!result && compact) {
+        auto* record=VfsOpen("/media/usb/INSTHASH.BIN",VFS_O_STREAM);
+        uint8_t data[SsdDigestRecordBytes]{};VnodeStat st{};uint64_t off=0;
+        if(!record)result=-2;
+        else {
+            if(VfsStat(record,&st) || st.isDir || st.isSymlink || st.size!=sizeof(data) ||
+               VfsRead(record,data,sizeof(data),&off)!=int(sizeof(data)))result=-22;
+            VfsRelease(record);
+        }
+        if(!result && !SsdDigestVerifyPinned(source,data,sizeof(data),compactGeometry,sourceBytes,a,65536))result=-5;
+    }
     if(!result) {
         uint8_t* mbr=meta;uint8_t* primary=meta+512;uint8_t* backup=meta+1024;
         uint8_t* entries=meta+1536;uint8_t* copy=meta+17920;

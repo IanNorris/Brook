@@ -88,7 +88,8 @@ def pack(source, output, segment_bytes):
         if segment_count > 10000:
             raise ValueError('too many segments')
         output.mkdir(parents=True, exist_ok=False)
-        digest = hashlib.sha256(); files = []; span_index = 0; within = 0
+        header=struct.pack('<8sQQQQ',b'BRKSSD1\0',sectors,first,count,total)
+        digest = hashlib.sha256(); install_digest=hashlib.sha256(header); files = []; span_index = 0; within = 0
         for i in range(segment_count):
             size = min(segment_bytes, total - i * segment_bytes)
             name = f'INST{i:04}.IMG'; remaining = size; segment_hash = hashlib.sha256()
@@ -97,7 +98,7 @@ def pack(source, output, segment_bytes):
                     start, length = spans[span_index]
                     n = min(1024 * 1024, remaining, length - within)
                     data = read_exact(fd, start + within, n)
-                    stream.write(data); digest.update(data); segment_hash.update(data)
+                    stream.write(data); digest.update(data); install_digest.update(data); segment_hash.update(data)
                     remaining -= n; within += n
                     if within == length:
                         span_index += 1; within = 0
@@ -106,8 +107,12 @@ def pack(source, output, segment_bytes):
         after = os.fstat(fd)
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise ValueError('source changed during packing; discard output')
-        manifest = {'format': 'brook-ssd-compact-v1', 'geometry': geometry, 'sector_bytes': SECTOR,
-                    'segment_bytes': segment_bytes, 'packed_bytes': total, 'packed_sha256': digest.hexdigest(), 'segments': files}
+        record=header+install_digest.digest()
+        with (output/'INSTHASH.BIN').open('xb') as stream:
+            stream.write(record);stream.flush();os.fsync(stream.fileno())
+        manifest = {'format': 'brook-ssd-compact-v2', 'geometry': geometry, 'sector_bytes': SECTOR,
+                    'segment_bytes': segment_bytes, 'packed_bytes': total, 'packed_sha256': digest.hexdigest(),
+                    'install_record_sha256':hashlib.sha256(record).hexdigest(), 'segments': files}
         # This checksum binds the documented geometry and individual segment
         # hashes; it detects change but is not a signature or trusted approval.
         canonical = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()
@@ -124,7 +129,7 @@ def pack(source, output, segment_bytes):
         os.close(fd)
 
 
-def verify_segment(path, item, whole=None):
+def verify_segment(path, item, whole=None, bound=None):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         st = os.fstat(fd); size = item['bytes']
@@ -135,6 +140,7 @@ def verify_segment(path, item, whole=None):
             data = read_exact(fd, pos, min(1024 * 1024, size - pos))
             digest.update(data)
             if whole is not None: whole.update(data)
+            if bound is not None: bound.update(data)
             pos += len(data)
         if digest.hexdigest() != item['sha256']:
             raise ValueError('segment checksum mismatch')
@@ -156,7 +162,7 @@ def verify_package(directory):
         os.close(fd)
     claimed = manifest.pop('manifest_sha256')
     canonical = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()
-    if hashlib.sha256(canonical).hexdigest() != claimed or manifest['format'] != 'brook-ssd-compact-v1':
+    if hashlib.sha256(canonical).hexdigest() != claimed or manifest['format'] != 'brook-ssd-compact-v2':
         raise ValueError('manifest checksum or format')
     g = manifest['geometry']; sectors = g['disk_sectors']; first = g['payload_first']; count = g['payload_sectors']
     if not all(type(n) is int for n in (sectors, first, count)) or not 68 <= sectors <= 1 << 48 or not 34 <= first < sectors - 33 or not 0 < count <= sectors - 33 - first:
@@ -166,13 +172,22 @@ def verify_package(directory):
         manifest['sector_bytes'] != SECTOR or manifest['packed_bytes'] != total or
         not isinstance(files, list) or len(files) != (total + segment - 1) // segment or len(files) > 10000):
         raise ValueError('invalid package segmentation')
-    whole = hashlib.sha256()
+    header=struct.pack('<8sQQQQ',b'BRKSSD1\0',sectors,first,count,total)
+    record_fd=os.open(directory/'INSTHASH.BIN',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        st=os.fstat(record_fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size!=72:raise ValueError('invalid install record')
+        record=read_exact(record_fd,0,72)
+    finally:os.close(record_fd)
+    if record[:40]!=header or hashlib.sha256(record).hexdigest()!=manifest['install_record_sha256']:
+        raise ValueError('install record mismatch')
+    whole = hashlib.sha256(); bound=hashlib.sha256(header)
     for i, item in enumerate(files):
         name = f'INST{i:04}.IMG'; size = min(segment, total - i * segment)
         if item['name'] != name or item['bytes'] != size:
             raise ValueError('invalid segment description')
-        verify_segment(directory / name, item, whole)
-    if whole.hexdigest() != manifest['packed_sha256']:
+        verify_segment(directory / name, item, whole, bound)
+    if whole.hexdigest() != manifest['packed_sha256'] or bound.digest()!=record[40:]:
         raise ValueError('packed checksum mismatch')
     manifest['manifest_sha256'] = claimed
     return manifest
