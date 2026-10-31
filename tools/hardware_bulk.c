@@ -17,8 +17,10 @@
 #include <unistd.h>
 #include "../src/shared/update/payload.h"
 #include "../src/shared/brook_debug_frame.h"
+#include "../src/shared/brook_ahci_export.h"
 #define BULK_LIMIT (1024ULL*1024*1024)
 static uint64_t deadline_ms;
+static int sliding_deadline;
 static uint64_t now_ms(void){struct timespec ts;if(clock_gettime(CLOCK_MONOTONIC,&ts))return UINT64_MAX;return (uint64_t)ts.tv_sec*1000+(uint64_t)ts.tv_nsec/1000000;}
 static int valid_id(const char* p){if(strlen(p)!=32)return 0;for(unsigned i=0;i<32;i++)if(!((p[i]>='0'&&p[i]<='9')||(p[i]>='a'&&p[i]<='f')))return 0;return 1;}
 static int io_bytes(int fd,void* data,size_t size,int writing,int network){
@@ -29,6 +31,7 @@ static int io_bytes(int fd,void* data,size_t size,int writing,int network){
         ssize_t n=network?(writing?send(fd,p,size,MSG_NOSIGNAL|MSG_DONTWAIT):recv(fd,p,size,MSG_DONTWAIT)):(writing?write(fd,p,size):read(fd,p,size));
         if(n<0&&(errno==EINTR||(network&&(errno==EAGAIN||errno==EWOULDBLOCK))))continue;
         if(n<=0)return -1;
+        if(network && sliding_deadline)deadline_ms=now_ms()+120000;
         p+=n;size-=(size_t)n;
     }return 0;
 }
@@ -77,7 +80,29 @@ static int serve(int client,int directory,const char* key,const char* boot,const
        !BrookUpdateEqual(header+72,(const uint8_t*)tx,32))goto done;
     if(message(client,"{\"state\":\"ready\",\"bulk_api\":1}\n")){result=11;goto done;}
     uint8_t hash[32],meta[40];uint64_t bytes=0;struct BrookDebugFrameInfo info={0};
-    if(!strcmp(action,"put")){
+    if(!strcmp(action,"disk")){
+        struct BrookAhciExportInfo disk={0};
+        if(syscall(BROOK_SYS_AHCI_EXPORT,0L,(long)&disk,(long)sizeof(disk),0L,0L,0L) ||
+           disk.version!=BROOK_AHCI_EXPORT_VERSION || disk.logical_sector_bytes!=512 ||
+           !disk.sectors || disk.sectors>UINT64_MAX/512 || !memchr(disk.model,0,sizeof(disk.model)) ||
+           !memchr(disk.serial,0,sizeof(disk.serial))){result=28;goto done;}
+        bytes=disk.sectors*512;uint8_t identity[154]={0};memcpy(identity,"BRDISK01",8);
+        BrookUpdatePut64(identity+8,disk.sectors);BrookUpdatePut32(identity+16,disk.logical_sector_bytes);
+        BrookUpdatePut32(identity+20,disk.physical_sector_bytes);BrookUpdatePut32(identity+24,disk.port);
+        memcpy(identity+28,disk.model,strnlen(disk.model,sizeof(disk.model)));
+        memcpy(identity+69,disk.serial,strnlen(disk.serial,sizeof(disk.serial)));
+        memcpy(identity+90,boot,32);memcpy(identity+122,tx,32);
+        if(io_bytes(client,identity,sizeof(identity),1,1)){result=29;goto done;}
+        uint8_t proceed[8];if(io_bytes(client,proceed,sizeof(proceed),0,1)||memcmp(proceed,"READONLY",8)){result=30;goto done;}
+        uint8_t chunk[65536];uint64_t offset=0;BrookSha256 context;BrookShaInit(&context);
+        while(offset<bytes){size_t n=bytes-offset>sizeof(chunk)?sizeof(chunk):(size_t)(bytes-offset);
+            if(syscall(BROOK_SYS_AHCI_EXPORT,1L,(long)chunk,(long)n,(long)offset,0L,0L)!=(long)n){result=31;goto done;}
+            BrookShaAdd(&context,chunk,n);if(io_bytes(client,chunk,n,1,1)){result=32;goto done;}offset+=n;
+        }
+        struct BrookAhciExportInfo after={0};
+        if(syscall(BROOK_SYS_AHCI_EXPORT,0L,(long)&after,(long)sizeof(after),0L,0L,0L) || memcmp(&disk,&after,sizeof(disk))){result=33;goto done;}
+        BrookShaFinish(&context,hash);
+    }else if(!strcmp(action,"put")){
         if(io_bytes(client,meta,sizeof(meta),0,1)){result=12;goto done;}
         bytes=BrookUpdateGet64(meta);if(bytes>BULK_LIMIT){result=13;goto done;}
         struct statvfs space;
@@ -116,7 +141,7 @@ static int serve(int client,int directory,const char* key,const char* boot,const
         BrookUpdateHash(frame,(size_t)bytes,hash);
     }
     char text[512],digest[65];hex_hash(hash,digest);
-    if(strcmp(action,"put")){
+    if(strcmp(action,"put") && strcmp(action,"disk")){
         snprintf(text,sizeof(text),"{\"state\":\"payload\",\"bytes\":%"PRIu64",\"sha256\":\"%s\",\"width\":%u,\"height\":%u,\"format\":%u,\"frame_epoch\":%"PRIu64",\"frame_tick_ms\":%"PRIu64"}\n",bytes,digest,info.width,info.height,info.format,info.epoch,info.tick_ms);
         if(message(client,text)){result=25;goto done;}
         uint8_t chunk[65536];uint64_t offset=0;
@@ -126,9 +151,9 @@ static int serve(int client,int directory,const char* key,const char* boot,const
         }
     }
     char path[128];
-    if(!strcmp(action,"frame"))strcpy(path,"null");
+    if(!strcmp(action,"frame") || !strcmp(action,"disk"))strcpy(path,"null");
     else snprintf(path,sizeof(path),"\"/data/.brook-transfer/%s.bin\"",!strcmp(action,"get")?source:tx);
-    snprintf(text,sizeof(text),"{\"state\":\"completed\",\"transaction_id\":\"%s\",\"action\":\"%s\",\"bytes\":%"PRIu64",\"sha256\":\"%s\",\"guest_path\":%s,\"retention\":\"current_boot_ram\"}\n",tx,action,bytes,digest,path);
+    snprintf(text,sizeof(text),"{\"state\":\"completed\",\"transaction_id\":\"%s\",\"action\":\"%s\",\"bytes\":%"PRIu64",\"sha256\":\"%s\",\"guest_path\":%s,\"retention\":\"%s\"}\n",tx,action,bytes,digest,path,!strcmp(action,"disk")?"not_staged":"current_boot_ram");
     /* Original job receipt disambiguates a lost final TCP reply. */
     printf("HWBULK_COMPLETED %s",text);fflush(stdout);(void)message(client,text);result=0;
 done:
@@ -139,7 +164,7 @@ done:
 }
 int main(int argc,char** argv){
     if((argc!=4&&argc!=5)||!valid_id(argv[1])||!valid_id(argv[2])||
-       (strcmp(argv[3],"put")&&strcmp(argv[3],"get")&&strcmp(argv[3],"frame"))||
+       (strcmp(argv[3],"put")&&strcmp(argv[3],"get")&&strcmp(argv[3],"frame")&&strcmp(argv[3],"disk"))||
        (!strcmp(argv[3],"get")?(argc!=5||!valid_id(argv[4])):argc!=4))return 2;
     const char *root="/data/.brook-transfer",*keypath="/etc/hardware-update-key";unsigned port=1236;
 #ifdef BROOK_BULK_TEST
@@ -162,7 +187,7 @@ int main(int argc,char** argv){
     puts("HWBULK_LISTENING bulk_api=1");fflush(stdout);
     struct pollfd wait={listener,POLLIN,0};if(poll(&wait,1,60000)<=0){result=6;goto done;}
     client=accept(listener,NULL,NULL);if(client<0){result=7;goto done;}
-    deadline_ms=now_ms()+600000;
+    sliding_deadline=!strcmp(argv[3],"disk");deadline_ms=now_ms()+(sliding_deadline?120000:600000);
     result=serve(client,directory,key,argv[1],argv[2],argv[3],argc==5?argv[4]:NULL);
 done:
     if(client>=0)close(client);

@@ -2,11 +2,13 @@
 import hashlib,json,stat,uuid
 from pathlib import Path
 from hardware_update_workflow import UpdateRun
-from hardware_bulk_protocol import identifier,upload,download,frame_png,LIMIT
+from hardware_bulk_protocol import identifier,upload,download,disk_download,frame_png,LIMIT
 
 class BulkRun(UpdateRun):
-    def execute(self,session,key_file,action,source=None,artifact_id=None,port=1236,request_id=None,keep_raw=False):
-        if action not in ('put','get','frame'):raise ValueError('Expected put/get/frame')
+    def execute(self,session,key_file,action,source=None,artifact_id=None,port=1236,request_id=None,keep_raw=False,disk_identity=None,max_bytes=None):
+        if action not in ('put','get','frame','disk'):raise ValueError('Expected put/get/frame/disk')
+        if action=='disk' and (disk_identity is None or max_bytes is None):raise ValueError('Disk export requires a pinned identity and explicit maximum size')
+        if action!='disk' and (disk_identity is not None or max_bytes is not None):raise ValueError('Disk options require disk action')
         if not isinstance(keep_raw,bool) or (keep_raw and action!='frame'):raise ValueError('keep_raw is only for frame capture')
         if isinstance(port,bool) or not isinstance(port,int) or not 1<=port<=65535:raise ValueError('Invalid bulk port')
         if (action=='put')!=(source is not None):raise ValueError('Only put takes a host source path')
@@ -33,6 +35,10 @@ class BulkRun(UpdateRun):
             self.save(state='receiver_listening',job=listening)
             binary_start=self.clock()
             if action=='put':result=upload(data['host'],port,key,boot,tx,source)
+            elif action=='disk':
+                def event(name,details):
+                    self.save(state='disk_'+name,**({'artifact_path':details['artifact_path']} if 'artifact_path' in details else {}),**{'disk_'+name:details})
+                result=disk_download(data['host'],port,key,boot,tx,self.output/'disk.img',disk_identity,max_bytes,event)
             else:result=download(data['host'],port,key,boot,tx,self.output/'artifact.bin',action)
             self.save(state='binary_reply',transfer=result,binary_phase_s=self.clock()-binary_start)
             job=self.wait_job(session,tx,lambda r:r.get('state')=='completed')
@@ -48,10 +54,10 @@ class BulkRun(UpdateRun):
                 result['raw_artifact_path']=str(raw) if keep_raw else None
                 with Path(png).open('rb') as image:png_hash=hashlib.file_digest(image,'sha256').hexdigest()
                 self.save(artifact_path=png,artifact_sha256=png_hash,frame=result['payload'],transfer=result)
-            elif action=='get':self.save(artifact_path=result['artifact_path'])
+            elif action in ('get','disk'):self.save(artifact_path=result['artifact_path'])
             self.save(state='completed');return self.receipt
         except Exception as error:
-            stage=self.receipt.get('state');self.save(state='needs_inspection',last_stage=stage,error=str(error),
+            stage=self.receipt.get('state');self.save(state='published_needs_inspection' if stage in ('disk_published','disk_published_durability_uncertain') else 'needs_inspection',last_stage=stage,error=str(error),
                 recovery='Inspect the same transaction_id with hw_job. Do not redispatch a lost transfer under a new ID automatically.')
             try:self.save(job_observation=self.bridge.job(session,tx,wait_s=2))
             except Exception as observation:self.save(job_observation_error=str(observation))

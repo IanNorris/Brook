@@ -40,11 +40,29 @@ phase must still satisfy the goal and technical prerequisites in force then.
    Unreadable sectors require explicit handling and cannot be called a verified
    full backup. Test the restore workflow against a disposable image. Record
    UEFI boot mode, settings and relevant boot entries separately: disk imaging
-   does not preserve firmware NVRAM. Brook's current bulk
-   transfer is bounded and is not an established full-disk backup/restore tool;
-   a suitable independent rescue environment or new verified streaming tool is
-   still needed. A backup is for recovery, not a claim that a wiped SSD has been
+   does not preserve firmware NVRAM. The opt-in root-only AHCI export and bulk
+   `disk` action stream an entire read-only disk without staging it in guest
+   RAM. The host requires a separately observed same-boot identity and a size
+   ceiling, checks free space, validates the guest receipt, and independently
+   rereads the file before publication. A disposable 64 MiB QEMU disk matched
+   byte for byte; physical-disk acquisition and restore have not been tested.
+   This is not an atomic snapshot against changes outside Brook's read-only
+   admission, has no resume or automatic retry, and aborts on read error. Use a
+   private output directory and preserve its receipts: the image and identity
+   may contain personal data. The current host lacks space for a full raw image
+   of the Dell SSD. An independent rescue environment remains an alternative.
+   A backup is for recovery, not a claim that a wiped SSD has been
    securely erased.
+
+   For a QEMU rehearsal, capture `bridge hardware ahci-ro` from the pinned
+   boot, extract exactly `sectors`, `logical_sector_bytes`,
+   `physical_sector_bytes`, `port`, `model` and `serial` into a private JSON
+   identity file, then invoke `scripts/hardware_transfer.py --action disk`
+   with `--session`, `--key-file`, `--disk-identity`, `--max-bytes` and a new
+   private `--output` directory. Use the forwarded `--port` for QEMU. The
+   disk image and receipt will be inside that directory. Inspect the same
+   transaction if it fails; do not automatically restart it. A successful
+   guest receipt alone is insufficient without the completed host readback.
 2. **Build a physical candidate.** Generate a new target-sized GPT and boot
    payload using the Dell's freshly observed controller, port, model, serial,
    capacity, sector sizes and flush capability. The QEMU desktop image embeds

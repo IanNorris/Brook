@@ -85,6 +85,8 @@ def main():
     for phase in ('create','verify'):
         base=out/phase;base.mkdir();variables=base/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],variables);variables.chmod(0o600)
         with socket.socket() as reserve:reserve.bind(('127.0.0.1',0));port=reserve.getsockname()[1]
+        with socket.socket() as reserve:reserve.bind(('127.0.0.1',0));bulk_port=reserve.getsockname()[1]
+        if bulk_port==port:raise RuntimeError('QEMU port reservation collision; retry with a new test directory')
         argv=['qemu-system-x86_64','-machine','q35','-accel','kvm','-cpu','host','-smp','8','-m','8192','-nodefaults',
             '-drive','if=pflash,format=raw,readonly=on,file='+os.environ['OVMF_CODE'],
             '-drive','if=pflash,format=raw,file='+str(variables),'-device','VGA,vgamem_mb=64',
@@ -92,7 +94,7 @@ def main():
             '-device','usb-storage,bus=usbc.0,port=1,drive=stick,bootindex=1',
             '-device','virtio-tablet-pci',
             '-device','usb-net,bus=usbc.0,port=2,netdev=network',
-            '-netdev',f'user,id=network,hostfwd=tcp:127.0.0.1:{port}-:1234',
+            '-netdev',f'user,id=network,hostfwd=tcp:127.0.0.1:{port}-:1234,hostfwd=tcp:127.0.0.1:{bulk_port}-:1236',
             '-display','none','-serial','file:'+str(base/'serial.log'),
             '-qmp','unix:'+str(base/'qmp.sock')+',server=on,wait=off',
             '-qmp','unix:'+str(base/'qmp-review.sock')+',server=on,wait=off','-no-reboot']
@@ -121,7 +123,7 @@ def main():
             job=wait_job(h,s,ident);save(base/'storage-job.json',job)
             assert job.get('exit',{}).get('code')==0 and 'WRITABLE_DESKTOP_' in job['stdout']['text'],job
             if phase=='create' or result.get('review',{}).get('review_reboot') is True:
-                ready={**attached,'registry':str(base/'registry'),'qmp':str(base/'qmp-review.sock'),
+                ready={**attached,'registry':str(base/'registry'),'qmp':str(base/'qmp-review.sock'),'bulk_port':bulk_port,
                     'qemu_pid':owner.pid,'scope':'Private headless QEMU only; 8CPU/8GiB software graphics; user networking',
                     'instruction':'Review Firefox/Chromium/App Gallery; close launched apps and return via finish.json continue_storage_checks=true. Record ui_acceptance_passed separately with evidence and remaining failures. Physical host desktop and real Dell are out of scope.'}
                 ready_file=out/('ready.json' if phase=='create' else 'reboot-ready.json')
