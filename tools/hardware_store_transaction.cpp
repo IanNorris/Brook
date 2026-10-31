@@ -30,6 +30,7 @@ int HardwareStoreTransaction::begin(int directory,const char *record,size_t leng
     e=absent(directory,"STORE.TMP");if(e)return e;
     file_=openat(directory,"STORE.IMG",O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0644);
     if(file_<0)return failure();
+    created_=true;
     struct stat st{};if(fstat(file_,&st) || !S_ISREG(st.st_mode)){failed_=true;return -EIO;}
     device_=st.st_dev;inode_=st.st_ino;
     directory_=directory; size_=p.bytes; record_length_=length;

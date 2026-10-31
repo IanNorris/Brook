@@ -1628,3 +1628,22 @@ and symlink collisions, bad hash, and injected failures immediately before and
 after marker rename. Astra reviewed this component. The network receiver,
 exclusive access enforcement, long-running transfer timeouts and QEMU/native
 FAT acceptance are not implemented yet; this is not a deployable updater.
+
+`hardware_store_receiver.cpp` and `hardware_store_protocol.py` now provide a
+host-tested one-shot stream into the transaction core. It checks the fixed USB
+mount is writable FAT, distinct from `/media`, and has sufficient free space;
+authenticates the supplied key/boot/transaction; shares the updater lock; and
+retains that lock on failures after image creation. It bounds receive progress
+and total transfer time. Brook TCP currently may wait up to its existing30-second
+ACK timeout during a reply even with MSG_DONTWAIT; the application deadline is
+therefore not a strict bound on a send already in progress. The helper's boot
+binding depends on the existing boot-guarded job launcher, which must be used by
+its future workflow.
+
+Static musl host tests with private loopback and a16MiB ext2 image pass successful
+raw and host-client transfers, wrong key/boot, hash failure, interruption,
+existing marker and withheld finalization. Test mode bypasses the production
+FAT mount/device checks; these must be tested in QEMU. The receiver is not yet
+included in an initrd or wired to an MCP workflow, and no physical deployment
+has been performed. Native file ownership/exclusion, lost reply, write/sync
+failure and QEMU checked-boot acceptance remain required before deployment.

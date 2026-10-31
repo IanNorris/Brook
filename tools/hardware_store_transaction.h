@@ -17,6 +17,7 @@ public:
     int finalize();
     bool marker_published() const { return published_; }
     bool marker_durable() const { return durable_; }
+    bool image_created() const { return created_; }
 private:
     int directory_ = -1, file_ = -1;
     uint64_t size_ = 0, written_ = 0;
@@ -26,5 +27,5 @@ private:
     uint8_t digest_[32]{};
     BrookSha256 stream_{};
     bool begun_ = false, staged_ = false, attempted_ = false, failed_ = false;
-    bool published_ = false, durable_ = false;
+    bool published_ = false, durable_ = false, created_ = false;
 };
