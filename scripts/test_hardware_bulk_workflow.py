@@ -52,6 +52,20 @@ class Tests(unittest.TestCase):
         self.bridge.capture=0
         with self.assertRaises(RuntimeError):BulkRun(self.bridge,self.root/'result').execute('session',self.key,'frame')
         self.assertEqual(self.bridge.launches,[])
+    def test_disk_published_sync_failure_preserves_guest_receipt(self):
+        identity={'sectors':1,'logical_sector_bytes':512,'physical_sector_bytes':512,'port':0,'model':'test','serial':'test'}
+        def fail(host,port,key,boot,tx,path,expected,max_bytes,event):
+            event('guest_receipt',{'state':'completed','transaction_id':tx,'sha256':'1'*64})
+            event('published',{'artifact_path':str(path)})
+            event('published_durability_uncertain',{'artifact_path':str(path)})
+            raise OSError('directory sync failed')
+        with patch('hardware_bulk_workflow.disk_download',fail),self.assertRaises(OSError):
+            BulkRun(self.bridge,self.root/'result').execute('session',self.key,'disk',disk_identity=identity,max_bytes=512)
+        receipt=json.loads((self.root/'result/receipt.json').read_text())
+        self.assertEqual(receipt['state'],'published_needs_inspection')
+        self.assertEqual(receipt['disk_guest_receipt']['sha256'],'1'*64)
+        self.assertEqual(receipt['last_stage'],'disk_published_durability_uncertain')
+        self.assertEqual(len(self.bridge.launches),1)
     def test_oversize_source_prevents_launch(self):
         with self.source.open('wb') as f:f.truncate(1024**3+1)
         with self.assertRaises(ValueError):self.run_put()

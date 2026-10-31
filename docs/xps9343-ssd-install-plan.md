@@ -45,7 +45,11 @@ phase must still satisfy the goal and technical prerequisites in force then.
    RAM. The host requires a separately observed same-boot identity and a size
    ceiling, checks free space, validates the guest receipt, and independently
    rereads the file before publication. A disposable 64 MiB QEMU disk matched
-   byte for byte; physical-disk acquisition and restore have not been tested.
+   byte for byte. A fresh regular-file copy of that backup also booted in QEMU
+   with no USB storage attached and the base image unchanged
+   (`build/hardware/backup-restored-boot-qemu-20261031`); this is kernel boot
+   only, not a full desktop test. Physical-disk acquisition and restore have
+   not been tested.
    This is not an atomic snapshot against changes outside Brook's read-only
    admission, has no resume or automatic retry, and aborts on read error. Use a
    private output directory and preserve its receipts: the image and identity
