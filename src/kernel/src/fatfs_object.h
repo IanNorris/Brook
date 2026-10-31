@@ -22,6 +22,8 @@ FRESULT f_object_from_file(const FIL*,FF_OBJECT*);
 FRESULT f_object_info(const FF_OBJECT*,FF_OBJECT*);
 FRESULT f_object_opendir(const FF_OBJECT*,DIR*);
 FRESULT f_object_open(const FF_OBJECT*,FIL*,BYTE mode);
+/* Exclusively create one child relative to the exact retained directory. */
+FRESULT f_object_create(const FF_OBJECT*,const TCHAR* name,FIL*,BYTE mode);
 // Fixed-image CLMT: bounded by file length and caller capacity, with strict
 // chain validation. Unlike upstream CREATE_LINKMAP, cycles cannot hang it.
 FRESULT f_object_image_map(FIL*,DWORD* table,UINT entries);

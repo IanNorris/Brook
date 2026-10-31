@@ -115,6 +115,36 @@ int main(int argc,char** argv){
     assert(FatFsUnlink(mount,0,"/parent/moved/empty")==-16);
     assert(FatFsRename(mount,0,"/parent/moved/empty","/new-empty")==-16);
     int error=0;Vnode* first=FatObjectOpen(file,VFS_O_READ,&error);Vnode* second=FatObjectOpen(file,VFS_O_WRITE|VFS_O_READWRITE,&error);
+    for(long failure=0;failure<3;++failure){
+        const auto before=allocations.size();failAllocation=failure;
+        assert(!FatObjectCreate(held,"new retained.txt",VFS_O_WRITE,0600,&error) && error==-12);failAllocation=-1;
+        assert(allocations.size()==before);assert(FatObjectChild(held,"new retained.txt",&after)==-2 && !after);
+    }
+    Vnode* made=FatObjectCreate(held,"new retained.txt",VFS_O_WRITE|VFS_O_READWRITE,0600,&error);
+    assert(made && made->backendObject && !error);uint64_t atMade=0;
+    assert(made->ops->write(made,"ok",2,&atMade)==2);assert(!made->ops->fsync(made));closeNode(made);
+    assert(!FatObjectCreate(held,"NEW RETAINED.TXT",VFS_O_WRITE,0600,&error) && error==-17);
+    assert(!FatObjectChild(held,"new retained.txt",&after));VnodeStat madeStat{};
+    assert(!FatObjectStat(after,&madeStat) && madeStat.size==2);VfsObjectRelease(after);after=nullptr;
+    assert(!FatFsUnlink(mount,0,"/parent/moved/new retained.txt"));
+    Vnode* readCreator=FatObjectCreate(held,"readonly-create",VFS_O_READ,0600,&error);
+    assert(readCreator && !error);VfsObject* createdObject=readCreator->backendObject;
+    Vnode* writer=FatObjectOpen(createdObject,VFS_O_WRITE|VFS_O_READWRITE,&error);assert(writer && !error);
+    uint64_t writerAt=0;assert(writer->ops->write(writer,"safe",4,&writerAt)==4);assert(!writer->ops->fsync(writer));
+    closeNode(readCreator);closeNode(writer);
+    assert(!FatObjectChild(held,"readonly-create",&after));Vnode* checkCreated=FatObjectOpen(after,VFS_O_READ,&error);assert(checkCreated);
+    char createdBytes[4];uint64_t checkAt=0;assert(checkCreated->ops->read(checkCreated,createdBytes,4,&checkAt)==4 && !memcmp(createdBytes,"safe",4));
+    closeNode(checkCreated);VfsObjectRelease(after);after=nullptr;assert(!FatFsUnlink(mount,0,"/parent/moved/readonly-create"));
+    Vnode* failedCreator=FatObjectCreate(held,"readonly-failure",VFS_O_READ,0600,&error);assert(failedCreator);
+    failSync=true;closeNode(failedCreator);assert(mount->deferredCloseError!=0);
+    failSync=false;assert(FatFsSync(mount)!=0);assert(!FatFsSync(mount));
+    assert(!FatFsUnlink(mount,0,"/parent/moved/readonly-failure"));
+    Vnode* racers[2]{};int raceErrors[2]{};
+    std::thread left([&]{racers[0]=FatObjectCreate(held,"race-create",VFS_O_WRITE,0600,&raceErrors[0]);});
+    std::thread right([&]{racers[1]=FatObjectCreate(held,"RACE-CREATE",VFS_O_WRITE,0600,&raceErrors[1]);});
+    left.join();right.join();assert(bool(racers[0])!=bool(racers[1]));
+    assert(racers[0]?raceErrors[1]==-17:raceErrors[0]==-17);
+    closeNode(racers[0]?racers[0]:racers[1]);assert(!FatFsUnlink(mount,0,"/parent/moved/race-create"));
     assert(first && second && first->priv!=second->priv);
     char bytes[32]{};uint64_t offset=0;assert(first->ops->read(first,bytes,8,&offset)==8 && !std::memcmp(bytes,"original",8));
     uint64_t append=8;assert(second->ops->write(second,"-tail",5,&append)==5);assert(!second->ops->fsync(second));
@@ -190,6 +220,7 @@ int main(int argc,char** argv){
     assert(!FatRootObject(mount,0,&root));assert(!FatObjectChild(root,"image.brk",&file));
     assert(FatObjectAccess(file,2,false)==-30);
     assert(!FatObjectOpen(file,VFS_O_WRITE,&error) && error==-30);
+    assert(!FatObjectCreate(root,"forbidden",VFS_O_WRITE,0600,&error) && error==-30);
     auto* other=FatObjectOpen(file,VFS_O_STREAM,&error);assert(other && FatFsFileSourceReadOnly(other));closeNode(other);
     VfsObjectRelease(file);VfsObjectRelease(root);
     assert(FatFsUnmount(mount)==-16);closeNode(stream);

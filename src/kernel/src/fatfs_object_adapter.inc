@@ -204,6 +204,41 @@ FRESULT f_object_open (const FF_OBJECT* object, FIL* out, BYTE mode)
     return FR_OK;
 }
 
+/* g_fatLock and the outer VFS namespace transaction are held by the caller.
+ * Register only an absent child of this retained directory; do not resolve an
+ * absolute or remembered pathname. Bookkeeping must be allocated beforehand. */
+FRESULT f_object_create (const FF_OBJECT* parent, const TCHAR* name, FIL* out, BYTE mode)
+{
+    FATFS* fs; FRESULT res; DIR directory; const TCHAR* cursor=name; unsigned length=0;
+    DEF_NAMEBUFF
+    if (!out) return FR_INVALID_PARAMETER;
+    memset(out,0,sizeof *out);
+    if (!(mode & (FA_READ|FA_WRITE)) || (mode & ~(FA_READ|FA_WRITE))) return FR_INVALID_PARAMETER;
+    if (!name || !name[0]) return FR_INVALID_NAME;
+    for (;name[length];++length)
+        if (IsSeparator(name[length]) || name[length]==':' || (unsigned)name[length]<0x20 || length>=255) return FR_INVALID_NAME;
+    if ((name[0]=='.'&&!name[1]) || (name[0]=='.'&&name[1]=='.'&&!name[2])) return FR_INVALID_NAME;
+    res=object_validate(parent,&fs);if(res!=FR_OK)return res;
+    if (!(parent->object.attr&AM_DIR))return FR_NO_PATH;
+    memset(&directory,0,sizeof directory);directory.obj.fs=fs;directory.obj.sclust=parent->object.sclust;
+    INIT_NAMEBUFF(fs);
+    res=create_name(&directory,&cursor);
+    if(res==FR_OK && !(directory.fn[NSFLAG]&NS_LAST))res=FR_INVALID_NAME;
+    if(res==FR_OK)res=dir_find(&directory);
+    if(res==FR_OK)res=FR_EXIST;
+    else if(res==FR_NO_FILE)res=dir_register(&directory);
+    if(res==FR_OK){
+        DWORD time=GET_FATTIME();
+        st_32(directory.dir+DIR_CrtTime,time);st_32(directory.dir+DIR_ModTime,time);
+        directory.dir[DIR_Attr]=AM_ARC;st_clust(fs,directory.dir,0);
+        st_32(directory.dir+DIR_FileSize,0);fs->wflag=1;
+        out->obj.fs=fs;out->obj.id=fs->id;out->obj.attr=AM_ARC;
+        out->dir_sect=fs->winsect;out->dir_ptr=directory.dir;out->flag=mode|FA_MODIFIED;
+    }
+    FREE_NAMEBUFF();
+    return res;
+}
+
 FRESULT f_object_image_map (FIL* fp, DWORD* table, UINT entries)
 {
 #if FF_USE_FASTSEEK

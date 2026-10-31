@@ -1667,3 +1667,22 @@ replacement path deletes an existing destination. The next change must provide
 object-relative exclusive creation and absent-destination rename while preserving
 open/leased aliases, entry identity, read-only policy and namespace/FAT lock
 ordering. The receiver remains unproven for QEMU and has not been deployed.
+
+The FAT adapter and retained VFS backend now implement exclusive creation of a
+regular child relative to a retained directory. Vnode, FIL and identity objects
+are allocated before directory publication; FAT locking serializes collisions.
+Read-only creators still carry dirty creation metadata, so they participate in
+writer synchronization and failed-close recovery; an image lease additionally
+requires actual read/write FIL access. FAT16/FAT32 host tests pass renamed-parent
+and LFN handling, concurrent case-insensitive creation, collisions, allocation
+failures, read-only mounts, a read-only creator racing a writer, and deferred
+close/sync recovery. Astra reviewed both the adapter and backend change.
+
+The production `openat(O_CREAT|O_EXCL)` syscall now succeeds in private QEMU.
+A full16MiB receiver run created, streamed, synced, reopened and hash-verified
+the disposable image. Its final marker rename returned `-95`, as the retained
+FAT rename callback remains absent. The receiver reported `published=0` and
+retained the failed transaction evidence; this is not a successful provisioning
+run. Evidence: `build/hardware/store-fat-create-qemu-v1-20261031/`, including
+`fat-create-diagnostic-result.json` and `store-qa/receipt.json`. Safe object-
+relative no-replace rename and its identity/alias tests remain the next gate.

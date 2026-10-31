@@ -69,6 +69,18 @@ int main(int argc,char** argv){
     DIR directoryA{},directoryB{};assert(f_object_opendir(&held,&directoryA)==FR_OK && f_object_opendir(&held,&directoryB)==FR_OK);
     FILINFO a{},b{};assert(f_readdir(&directoryA,&a)==FR_OK && f_readdir(&directoryB,&b)==FR_OK && !std::strcmp(a.fname,b.fname));
     assert(f_closedir(&directoryA)==FR_OK && f_closedir(&directoryB)==FR_OK);
+    FIL created{};assert(f_object_create(&held,"Fresh retained child.txt",&created,FA_READ|FA_WRITE)==FR_OK);
+    assert(f_write(&created,"created",7,&count)==FR_OK && count==7);assert(f_sync(&created)==FR_OK);
+    assert(f_close(&created)==FR_OK);
+    assert(f_object_create(&held,"fresh RETAINED child.TXT",&created,FA_WRITE)==FR_EXIST && !created.obj.fs);
+    assert(f_object_lookup(&held,"Fresh retained child.txt",&after)==FR_OK);
+    assert(f_object_open(&after,&created,FA_READ)==FR_OK);
+    assert(f_read(&created,bytes,7,&count)==FR_OK && count==7 && !std::memcmp(bytes,"created",7));
+    assert(f_close(&created)==FR_OK);
+    assert(f_stat("0:/parent/moved/Fresh retained child.txt",nullptr)==FR_OK);
+    assert(f_stat("0:/dir/Fresh retained child.txt",nullptr)==FR_NO_FILE);
+    assert(f_object_create(&held,"bad/name",&created,FA_WRITE)==FR_INVALID_NAME && !created.obj.fs);
+    assert(f_object_create(&held,"empty",&created,FA_WRITE)==FR_EXIST && !created.obj.fs);
     assert(f_object_lookup(&file,"child",&after)==FR_NO_PATH && !after.object.fs);
     for(const char* invalid: {".","..","child/name","child\\name","0:name","name\nrest"})assert(f_object_lookup(&held,invalid,&after)==FR_INVALID_NAME && !after.object.fs);
     FF_OBJECT stale=file;--stale.object.id;

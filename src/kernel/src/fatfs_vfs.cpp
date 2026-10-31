@@ -1293,6 +1293,47 @@ static Vnode* FatObjectOpen(VfsObject* object,int flags,int* error)
     if(*error){kfree(node);return nullptr;}
     return node;
 }
+static Vnode* FatObjectCreate(VfsObject* parent,const char* name,int flags,uint16_t,int* error)
+{
+    int local=0;if(!error)error=&local;*error=0;
+    auto* dir=static_cast<FatPathObject*>(parent->priv);
+    if(!dir->directory){*error=-20;return nullptr;}
+    if(dir->mount->intrinsicReadOnly){*error=-30;return nullptr;}
+    // Allocate all objects before publishing the directory entry.
+    auto* node=static_cast<Vnode*>(kmalloc(sizeof(Vnode)));
+    auto* file=static_cast<FatOpenFile*>(kmalloc(sizeof(FatOpenFile)));
+    auto* identity=static_cast<FatPathObject*>(kmalloc(sizeof(FatPathObject)));
+    if(!node||!file||!identity){kfree(node);kfree(file);kfree(identity);*error=-12;return nullptr;}
+    *node={};*file={};node->refCount=1;file->mount=dir->mount;
+    BYTE mode=(flags&VFS_O_WRITE)?FA_WRITE:FA_READ;if(flags&VFS_O_READWRITE)mode|=FA_READ;
+    KMutexLock(&g_fatLock);
+    *error=FatFlushWritersLocked(dir->mount);
+    if(!*error){
+        FRESULT result=f_object_create(&dir->location,name,&file->fil,mode);
+        if(result!=FR_OK)*error=result==FR_EXIST?-17:FrToErrno(result);
+        else {
+            FF_OBJECT location{};result=f_object_from_file(&file->fil,&location);
+            if(result!=FR_OK){*error=FrToErrno(result);f_close(&file->fil);}
+            else {
+                uint64_t id=FatObjectIdentity(location);
+                if(FatObjectPinnedLocked(dir->mount,id)){*error=-16;f_close(&file->fil);}
+                else {
+                    *identity={{FatObjectOperations(),identity,id,1},dir->mount,location,false,dir->mount->objects};
+                    dir->mount->objects=identity;node->backendObject=&identity->object;
+                    file->allNext=dir->mount->allFiles;dir->mount->allFiles=file;
+                    // Creation leaves FA_MODIFIED even for an O_RDONLY handle.
+                    // Track it until close so aliases flush metadata and failed
+                    // closes retain the dirty FIL for checked mount sync.
+                    file->writable=true;file->next=dir->mount->writableFiles;dir->mount->writableFiles=file;
+                    node->ops=&g_fatFileOps;node->type=VnodeType::File;node->priv=&file->fil;
+                }
+            }
+        }
+    }
+    KMutexUnlock(&g_fatLock);
+    if(*error){kfree(node);kfree(file);kfree(identity);return nullptr;}
+    return node;
+}
 // Current-name reporting by cluster identity. The namespace transaction
 // excludes rename; the FAT mutex protects parent scans and the LFN workspace.
 // This string is never used to reopen or mutate a retained directory.
@@ -1383,7 +1424,7 @@ static int FatObjectDirectoryPath(VfsObject* object,char* out,uint32_t capacity)
 }
 static const VfsObjectOps g_fatObjectOps={
     .destroy=FatObjectDestroy,.stat=FatObjectStat,.access=FatObjectAccess,
-    .lookup=FatObjectChild,.parent=FatObjectParent,.readlink=FatObjectReadlink,.open=FatObjectOpen,
+    .lookup=FatObjectChild,.parent=FatObjectParent,.readlink=FatObjectReadlink,.open=FatObjectOpen,.create=FatObjectCreate,
     .directory_path=FatObjectDirectoryPath,.object_path=FatObjectPath,.entry_parent=FatObjectEntryParent,
 };
 static const VfsObjectOps* FatObjectOperations(){return &g_fatObjectOps;}
@@ -1406,7 +1447,7 @@ int FatFsAcquireImageLease(Vnode* node,uint64_t bytes,FatImageLease** out)
     auto* file=static_cast<FatOpenFile*>(node->priv);
     int error=0;VnodeStat identity{};
     if(file->mount->intrinsicReadOnly)error=-30;
-    else if(!file->writable || file->streaming || !(file->fil.flag&FA_READ))error=-22;
+    else if(!file->writable || file->streaming || !(file->fil.flag&FA_READ) || !(file->fil.flag&FA_WRITE))error=-22;
     else if(file->closing || file->cacheLoading || file->imageLease ||
             __atomic_load_n(&node->refCount,__ATOMIC_ACQUIRE)!=1)error=-16;
     else if(f_size(&file->fil)!=bytes || !FatFileIdentity(&file->fil,&identity))error=-22;
