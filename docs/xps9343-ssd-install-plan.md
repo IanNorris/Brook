@@ -77,6 +77,13 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   independent host readback (`system-store-snapshot-qemu-v2-20261031`). This
   does not establish physical SSD snapshot or repair behavior. No physical
   recovery write has been attempted.
+- The recovery USB was subsequently staged with the tested standalone
+  snapshot helper as generation 24 in slot B. Before staging, both prior
+  records and pairs were verified; generation 23 in slot A and the root
+  recovery pair were left untouched. The old slot B and both selection records
+  were saved and verified on host storage. The new slot and selection were
+  flushed and read back, then the USB was unmounted. A physical recovery boot
+  and actual SSD-store snapshot are still pending.
 
 ## Remaining engineering gates
 
