@@ -17,6 +17,7 @@
 #include "writable_desktop.h"
 #include "ssd_install_qemu.h"
 #include "acpi.h"
+#include "dell_audio_probe.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -96,6 +97,19 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
     }
     constexpr char pciPrefix[]="bridge hardware pci ";
+    if(!strcmp(command,"bridge hardware dell-audio-firmware")) {
+        DellAudioFirmwareSnapshot s{};const char* reason=nullptr;const bool ok=DellAudioProbeRead(s,reason);
+        Reply r;r.text("{\"dell_audio_firmware_api\":1,\"ok\":");r.text(ok?"true":"false");
+        r.text(",\"reason\":");r.quoted(reason?reason:"unavailable");
+        if(ok) {
+            r.text(",");r.field("osys",s.osys);r.text(",");r.field("pch_generation",s.pchGeneration);
+            r.text(",");r.field("codec_selection",s.codecSelection);r.text(",");r.field("i2c_mode",s.i2cMode);
+            r.text(",");r.field("i2c_irq",s.i2cIrq);r.text(",");r.field("dsp_base0",s.dspBase0);
+            r.text(",");r.field("dsp_base1",s.dspBase1);r.text(",");r.field("dsp_irq",s.dspIrq);
+            r.text(",");r.field("i2c_base0",s.i2cBase0);r.text(",");r.field("i2c_base1",s.i2cBase1);
+        }
+        r.text("}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware acpi-info")) {
         Reply r;r.text("{\"acpi_api\":1,");r.field("tables",AcpiInventoryCount());r.text("}\n");r.send();return true;
     }

@@ -28,6 +28,7 @@ def main():
     p.add_argument('--tcp-egress-1200',action='store_true',help='Enable a temporary 1200-byte TCP payload ceiling for a known path-MTU problem')
     p.add_argument('--ahci-observe',action='store_true',help='Opt in to the boot-time read-only AHCI register snapshot')
     p.add_argument('--ahci-read-only',action='store_true',help='Enable experimental read-only SATA inventory (requires --ahci-observe)')
+    p.add_argument('--dell-audio-dsdt',type=Path,help='Opt in to the reviewed Dell audio NVS snapshot for this exact DSDT')
     p.add_argument('--build',type=Path,default=ROOT/'build/release')
     p.add_argument('--output',required=True,type=Path)
     a=p.parse_args()
@@ -55,10 +56,20 @@ def main():
     if a.ahci_read_only:
         marker=out/'ahci-read-only';marker.write_text('1\n')
         subprocess.run(['mcopy','-o','-i',str(out/'INITRD.IMG'),str(marker),'::ETC/ahci-read-only'],check=True,cwd=ROOT)
+    audio_digest=None
+    if a.dell_audio_dsdt:
+        if a.dell_audio_dsdt.is_symlink() or not a.dell_audio_dsdt.is_file():p.error('DSDT must be a regular file')
+        table=a.dell_audio_dsdt.read_bytes()
+        if not 36<=len(table)<=1024*1024 or table[:4]!=b'DSDT' or int.from_bytes(table[4:8],'little')!=len(table) or sum(table)&255:
+            p.error('DSDT must have a bounded valid header and checksum')
+        audio_digest=hashlib.sha256(table).hexdigest();marker=out/'dell-audio-dsdt.sha256'
+        marker.write_text(audio_digest+'\n');marker.chmod(0o600)
+        subprocess.run(['mcopy','-o','-i',str(out/'INITRD.IMG'),str(marker),'::ETC/dell-audio-dsdt.sha256'],check=True,cwd=ROOT)
     manifest=json.loads((out/'manifest.json').read_text())
     manifest.update(scope='Writable desktop preferred; accepted immutable RAM fallback',
         ephemeral_home=False,mutable_usb_application_mount=True,tcp_egress_ceiling=1200 if a.tcp_egress_1200 else 1460,
         ahci_observe=a.ahci_observe,ahci_read_only=a.ahci_read_only,
+        dell_audio_dsdt_sha256=audio_digest,
         home_persistence='persistent only after writable-store admission; RAM fallback remains volatile',
         writable_desktop={'source':'/media/usb/STORE.IMG','readiness':'/media/usb/STORE.OK',
             'bytes':m['bytes'],'uuid':m['uuid'],'initial_sha256':m['sha256'],

@@ -9,6 +9,7 @@
 #include "ahci_readonly.h"
 #include "ahci_observe.h"
 #include "acpi.h"
+#include "dell_audio_probe.h"
 #include <cassert>
 #include <cstring>
 #include <string>
@@ -16,6 +17,7 @@ std::string reply,dispatched;
 unsigned powerCalls=0;std::string powerVerb;
 unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
 namespace brook {
+bool DellAudioProbeRead(DellAudioFirmwareSnapshot&,const char*& reason){reason="not provisioned";return false;}
 uint32_t AcpiInventoryCount(){return 1;}
 bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& h){
     if(index || offset>1024 || bytes>1024-offset)return false;
@@ -102,6 +104,7 @@ int main(){
         assert(handle(std::string("bridge hardware pci ")+bad));assert(reply.find("pci_error")!=std::string::npos);
     }
     assert(handle("bridge hardware acpi-info") && reply.find("\"tables\":1")!=std::string::npos);
+    assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"ok\":false")!=std::string::npos);
     assert(handle("bridge hardware acpi 0 4 2") && reply.find("\"hex\":\"abab\"")!=std::string::npos);
     assert(handle("bridge hardware acpi 0 0 512"));
     assert(reply.find("\"hex\":\""+[](){std::string s;for(int i=0;i<512;++i)s+="ab";return s;}()+"\"")!=std::string::npos);

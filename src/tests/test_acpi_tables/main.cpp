@@ -94,6 +94,14 @@ int main(){
     f.reset();f.rsdp[15]=0;Firmware::checksum(f.rsdp,20,8);assert(f.init());
     for(auto type : {MemoryType::Free,MemoryType::Mmio,MemoryType::Kernel,MemoryType::BootData,MemoryType::Unusable}){f.reset();f.map.type=type;assert(!f.init());}
     for(auto type : {MemoryType::Reserved,MemoryType::AcpiNvs}){f.reset();f.map.type=type;assert(f.init());}
+    f.reset();assert(f.init());uint8_t nvsRead[8]{};
+    assert(!AcpiNvsContains(Firmware::address(f.memory),1) && !AcpiNvsRead(Firmware::address(f.memory),nvsRead,1));
+    f.map.type=MemoryType::AcpiNvs;assert(f.init());
+    assert(AcpiNvsContains(Firmware::address(f.memory),65536));
+    assert(AcpiNvsRead(Firmware::address(f.memory),nvsRead,8) && !std::memcmp(nvsRead,f.memory,8));
+    assert(!AcpiNvsRead(Firmware::address(f.memory),nvsRead,9));
+    assert(!AcpiNvsRead(Firmware::address(f.memory)+65535,nvsRead,2));
+    assert(!AcpiNvsContains(~0ULL,8) && !AcpiNvsContains(Firmware::address(f.memory),0));
     f.reset();assert(f.init());f.map={};assert(AcpiFindTable("FACP")==Firmware::address(f.fadt)); // boot map was copied
     for(auto length : {0,1,7,65}){f.reset();f.madt[45]=length;f.madtCrc();assert(!f.init());assert(!AcpiGetMadt().processorCount);}
     f.reset();Firmware::put32(f.madt+4,43);f.madtCrc(43);assert(!f.init());

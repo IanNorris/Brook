@@ -42,6 +42,10 @@ const MadtInfo& AcpiGetMadt();
 // Find a table by its 4-character signature (e.g. "HPET", "FACP").
 // Returns the physical address of the table header, or 0 if not found/invalid. Tables have bounded lengths and checked checksums.
 uint64_t AcpiFindTable(const char* signature);
+// Kernel-internal NVS validation/read helpers. These are not debug commands;
+// consumers must select audited fields and never accept caller addresses.
+bool AcpiNvsContains(uint64_t address,uint32_t bytes);
+bool AcpiNvsRead(uint64_t address,void* out,uint32_t bytes);
 // Read-only AML inventory: index 0 is DSDT; subsequent indices select only
 // validated SSDT entries. No caller-supplied physical addresses.
 uint32_t AcpiInventoryCount();

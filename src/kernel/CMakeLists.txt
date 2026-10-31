@@ -270,6 +270,7 @@ add_executable(kernel
     src/ahci_readonly.cpp
     src/ahci_system_volume.cpp
     src/ssd_install_qemu.cpp
+    src/dell_audio_probe.cpp
     src/gpu_compositor.cpp
     src/frame_timing.cpp
     src/gpu_app.cpp

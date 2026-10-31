@@ -1782,6 +1782,35 @@ The new boot's read-only PCI inventory still shows the two HDA-class controllers
 but no obvious LPSS I²C or SST PCI function. Firmware may expose these through
 ACPI instead; the static DSDT does not prove that either device is enabled.
 
+An opt-in Dell audio firmware snapshot now checks a separately provisioned,
+reviewed DSDT digest, requires both complete firmware regions to lie in captured
+ACPI NVS, and reads only ten fixed fields twice using volatile loads. It never
+executes AML, accepts a caller address or accesses the reported device MMIO.
+Synthetic tests cover digest/layout failures, NVS denial and unstable values;
+the captured Dell DSDT passed the layout test. The exact candidate rejected the
+different QEMU DSDT and passed writable-desktop reboot checks before deployment
+through the guarded updater (`dell-audio-probe-update-20261031`).
+
+On the Dell, the two matching samples reported `OSYS=0`, `PCHG=2`, `CODS=1`, I²C0
+mode 1 and IRQ 7, with two nonzero I²C resource bases. `ADB0`, `ADB1` and
+`ADI0` were all zero. The DSDT's ADSP `_STA` tests `ADB0` and `OSYS`, so these
+values do not describe an available, initialized DSP in this boot. Two matching
+samples are not an atomic firmware snapshot. Brook does
+not run the firmware's AML initialization; these observations alone do not
+identify why the DSP resources are zero or justify writing firmware/device
+registers. The current desktop store is ready and SSD inventory remains
+read-only. Raw snapshot values are retained locally in
+`build/hardware/dell-audio-firmware-snapshot-20261031.json`.
+`PCHG=2` and `CODS=1` select the DSDT's Broadwell SST/`INT343A` branch;
+the two I²C addresses are 0xfe103000 and 0xfe104000. Neither their power state
+nor register accessibility has been tested. `OSYS=0` is consistent with the
+unexecuted `_SB._INI`, but changing OSYS alone cannot satisfy ADSP `_STA`
+because `ADB0` is zero. The complete boot PCI snapshot has 16 of 16 devices
+and no function at 00:13.0, a possible alternate SST discovery route described
+in the [FreeBSD hardware investigation](https://github.com/spagu/acpi_intel_sst/blob/main/docs/RESEARCH_FINDINGS.md).
+This does not establish physical absence; the function may be hidden. No PCI
+configuration writes or sideband transactions were performed.
+
 ### Passive-open MSS and hardware transfer profile (2026-10-31)
 
 A 4 GB store upload to the Dell's USB stick ran at approximately 2.8 MB/s;
