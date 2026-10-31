@@ -24,6 +24,7 @@ p.add_argument('--installer-package',type=Path,help='Copy a verified compact tes
 p.add_argument('--installer-segmented',action='store_true',help='Split the test source into two pinned FAT files')
 p.add_argument('--installer-compact',action='store_true',help='Use the compact layout for the recognized 64 MiB QEMU fixture')
 p.add_argument('--installer-omit-second',action='store_true',help='Omit the second source segment for a failure test')
+p.add_argument('--installer-force-desktop-marker',action='store_true',help='Test-only: mismatch the compact fixture and desktop marker')
 p.add_argument('--review-timeout',type=int,default=600,help='Maximum seconds to wait for the test reviewer (60..7200)')
 a=p.parse_args();desktop=a.desktop.resolve(strict=True);maintenance=a.maintenance.resolve(strict=True);out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
 if not (640<=a.width<=4096 and 480<=a.height<=2160):p.error('Private test display must be 640..4096 by 480..2160')
@@ -48,13 +49,17 @@ if a.installer_source and a.installer_package:p.error('choose one installer sour
 if a.installer_segmented and not (a.installer_source or a.installer_package):p.error('segmented source requires an installer source')
 if a.installer_omit_second and not a.installer_segmented:p.error('omitting a segment requires --installer-segmented')
 if a.installer_compact and not a.installer_segmented:p.error('compact source requires --installer-segmented')
+if a.installer_force_desktop_marker and not (a.installer_package and a.installer_compact):p.error('marker mismatch requires a compact package')
 if a.installer_package:
     if not a.installer_compact or not a.installer_segmented or not a.sata_qemu_scratch:
         p.error('package requires compact segmented source and SATA scratch')
     from pack_ssd_install_source import verify_package,verify_segment
     package=verify_package(a.installer_package)
-    if package['geometry'] not in ({'disk_sectors':131072,'payload_first':2048,'payload_sectors':126976},
-                                   {'disk_sectors':500118192,'payload_first':2048,'payload_sectors':126976}) or package['segment_bytes']!=32*1024**2:
+    layouts=({'disk_sectors':131072,'payload_first':2048,'payload_sectors':126976},
+             {'disk_sectors':500118192,'payload_first':2048,'payload_sectors':126976},
+             {'disk_sectors':500118192,'payload_first':2048,'payload_sectors':12582912})
+    large_desktop=package['geometry']==layouts[2]
+    if package['geometry'] not in layouts or package['segment_bytes']!=(2*1024**3 if large_desktop else 32*1024**2):
         p.error('package does not match the recognized QEMU fixture')
     for i,item in enumerate(package['segments']):
         if i==1 and a.installer_omit_second:break
@@ -67,6 +72,9 @@ if a.installer_package:
             staged.unlink(missing_ok=True)
     marker=out/'INSTCMP.OK';marker.write_text('test-only compact source\n')
     run('mcopy','-o','-i',str(disk)+'@@1048576',marker,'::INSTCMP.OK')
+    if large_desktop or a.installer_force_desktop_marker:
+        marker=out/'INSTDSK.OK';marker.write_text('test-only desktop fixture\n')
+        run('mcopy','-o','-i',str(disk)+'@@1048576',marker,'::INSTDSK.OK')
 if a.installer_source:
     if not a.installer_segmented:p.error('the installer test kernel requires --installer-segmented')
     if not a.sata_qemu_scratch:p.error('installer source requires the private SATA scratch fixture')

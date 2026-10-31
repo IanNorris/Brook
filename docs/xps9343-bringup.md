@@ -2284,3 +2284,28 @@ The result booted without USB using a QEMU snapshot overlay
 payload and gap ranges, not a hash of every byte of the 256 GB logical disk.
 This is a kernel-boot fixture, not a browser-capable desktop image. No physical
 SSD access or installation is authorized or performed by this test path.
+
+The Dell-capacity QEMU fixture has now also been exercised with a 6 GiB EFI
+partition containing the writable desktop store. A sparse copy of the earlier
+QEMU desktop image retained its test GPT identifiers; its AHCI target record
+was adjusted solely for the synthetic disk capacity. The resulting compact
+package contains three 2 GiB segments and a 34304-byte final segment. The
+compile-gated installer copied and read back the package on a separate sparse
+QEMU disk (`dell-capacity-desktop-install-qemu-20261031`). Independent host
+comparison matched the primary GPT, full 6 GiB payload and backup GPT against
+the source, with a sentinel preserved in an unused gap. A deliberately wrong
+desktop marker failed before any installer operation, and `qemu-img compare`
+reported the sparse target unchanged (`dell-compact-marker-mismatch-qemu-20261031`).
+
+The stopped installation was then reflinked to a separate private disk for two
+non-snapshot QEMU boots without USB. The first created and synced a test file;
+the second verified its contents, with checked shutdown and clean store
+finalization on both boots. Independent GPT, FAT and extracted ext2 checks passed
+(`build/hardware/dcp2`). The original fixture already contained an old fixed-name
+acceptance file, so the clone's initrd received an updated test helper that uses
+a unique per-run filename; kernel and application-store contents were retained.
+The helper replacement and embedded kernel/initrd hashes are recorded in the
+result. This tests storage persistence, not browser UI, physical SSD behavior,
+or authorization for physical installation. A previous clone test stopped on
+the pre-existing test filename; a second attempt failed before boot because its
+QMP socket path exceeded the host limit. Neither changed the stopped installation.

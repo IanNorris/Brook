@@ -17,11 +17,12 @@ from hardware import Hardware
 from test_hardware_power import Qmp
 def sha(path):
     with path.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
-def dell_fixture_sha(path):
+def dell_fixture_sha(path,desktop):
     # Bounded evidence only: GPT metadata, installed payload and one gap.
     # QEMU uses snapshot=on, so the base is not its writable overlay.
     digest=hashlib.sha256()
-    ranges=((0,34*512),(100*512,512),(2048*512,126976*512),((500118192-33)*512,33*512))
+    payload_sectors=12582912 if desktop else 126976
+    ranges=((0,34*512),(100*512,512),(2048*512,payload_sectors*512),((500118192-33)*512,33*512))
     with path.open('rb') as f:
         for offset,length in ranges:
             f.seek(offset);remaining=length
@@ -36,11 +37,10 @@ def main():
     p.add_argument('--desktop-store',action='store_true',help='Verify the full desktop system store is admitted')
     p.add_argument('--dell-capacity-fixture',action='store_true',help='Use the sparse Dell-capacity test fixture and bounded base-disk checks')
     a=p.parse_args();image=a.image.resolve(strict=True)
-    if a.desktop_store and a.dell_capacity_fixture:p.error('choose one fixture type')
     expected=500118192*512 if a.dell_capacity_fixture else 6*1024**3+2*1024**2 if a.desktop_store else 64*1024**2
     if a.image.is_symlink() or not image.is_file() or image.stat().st_size!=expected:
         p.error('Expected the specified private installer target size')
-    checksum=dell_fixture_sha if a.dell_capacity_fixture else sha
+    checksum=(lambda path: dell_fixture_sha(path,a.desktop_store)) if a.dell_capacity_fixture else sha
     out=a.output.absolute();out.mkdir(parents=True,exist_ok=False);original=checksum(image)
     variables=out/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],variables);variables.chmod(0o600)
     with socket.socket() as reserve:reserve.bind(('127.0.0.1',0));port=reserve.getsockname()[1]

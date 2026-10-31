@@ -8,10 +8,11 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-static const char* path="/data/home/.brook-storage-acceptance";
 static void check(int ok,const char* what){if(!ok){perror(what);exit(1);}}
 int main(int argc,char** argv){
     check((argc==3 || (argc==4 && !strcmp(argv[3],"system"))) && strlen(argv[2])==32,"arguments");
+    for(unsigned i=0;i<32;++i)check((argv[2][i]>='0'&&argv[2][i]<='9')||(argv[2][i]>='a'&&argv[2][i]<='f'),"token");
+    char path[96];check(snprintf(path,sizeof(path),"/data/home/.brook-storage-acceptance-%s",argv[2])>0,"path");
     int create=!strcmp(argv[1],"create");check(create||!strcmp(argv[1],"verify"),"operation");
     check(getuid()==1000,"ordinary desktop UID");
     struct stat st;check(!stat("/data/home",&st)&&st.st_uid==1000,"persistent home owner");

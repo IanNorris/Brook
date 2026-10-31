@@ -41,13 +41,16 @@ int Run() {
     if(sectors!=131072 && sectors!=12587008 && sectors!=500118192)return -22;
     auto* marker=VfsOpen("/media/usb/INSTCMP.OK");const bool compact=marker!=nullptr;
     if(marker)VfsClose(marker);
+    auto* desktopMarker=VfsOpen("/media/usb/INSTDSK.OK");const bool desktop=desktopMarker!=nullptr;
+    if(desktopMarker)VfsClose(desktopMarker);
     // Compact mode accepts only two recognized QEMU geometries until a
     // production source manifest and physical identity gate exist.
-    const SsdInstallGeometry compactGeometry{sectors,2048,126976};
+    if(desktop && (!compact || sectors!=500118192))return -22;
+    const SsdInstallGeometry compactGeometry{sectors,2048,desktop?12582912ull:126976ull};
     const SsdInstallCompactSource compactMap(compactGeometry,(34+compactGeometry.payloadSectors+33)*512);
     if((compact && sectors!=131072 && sectors!=500118192) || (!compact && sectors==500118192))return -22;
     const uint64_t sourceBytes=compact?compactMap.ExpectedSize():sectors*512;
-    const uint64_t segment=compact || sectors==131072?32ull*1024*1024:2ull*1024*1024*1024;
+    const uint64_t segment=(compact && !desktop) || sectors==131072?32ull*1024*1024:2ull*1024*1024*1024;
     const uint32_t count=uint32_t((sourceBytes-1)/segment+1);
     if(count>4)return -22;
     Source source{retainedLease,SsdInstallSegmentedSource(sourceBytes,segment,count),compact?&compactMap:nullptr};

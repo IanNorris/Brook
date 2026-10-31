@@ -32,33 +32,72 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--desktop',required=True,type=Path);p.add_argument('--recovery',required=True,type=Path)
     p.add_argument('--output',required=True,type=Path)
+    p.add_argument('--installed-dell-capacity-fixture',type=Path,help='Reflink a stopped, disposable Dell-capacity QEMU installation for persistence testing')
     a=p.parse_args();desktop=a.desktop.resolve(strict=True);recovery=a.recovery.resolve(strict=True)
     out=a.output.absolute();out.mkdir(parents=True,exist_ok=False)
     meta=json.loads((desktop/'manifest.json').read_text());store=Path(meta['writable_desktop']['store_artifact'])/'STORE.IMG'
     assert sha(store)==meta['writable_desktop']['initial_sha256']
     for name in ('kernel.elf','INITRD.IMG'):assert sha(desktop/name)==meta['files'][name]['sha256']
-    disk=out/'sata.raw';disk_bytes=6*1024**3+2*1024**2;sectors=disk_bytes//512
-    first=2048;count=sectors-4096;disk_guid=uuid.uuid4();part_guid=uuid.uuid4()
-    with disk.open('xb') as f:f.truncate(disk_bytes)
-    layout=f'label: gpt\nlabel-id: {disk_guid}\nunit: sectors\n\nstart={first},size={count},type=U,uuid={part_guid}\n'
-    run('sfdisk',disk,input=layout,text=True,stdout=subprocess.DEVNULL)
-    run('mkfs.fat','-F','32','--offset',str(first),disk,str(count//2),stdout=subprocess.DEVNULL)
+    disk=out/'sata.raw';first=2048
+    if a.installed_dell_capacity_fixture:
+        source=a.installed_dell_capacity_fixture
+        if source.is_symlink() or not source.is_file() or source.stat().st_size!=500118192*512:
+            p.error('expected a stopped disposable Dell-capacity regular-file fixture')
+        # A reflink is mandatory: do not accidentally allocate or modify a
+        # full-sized source. Caller must establish that its QEMU owner exited.
+        run('cp','--reflink=always',source,disk)
+        sectors=500118192;count=12582912
+        table=json.loads(run('sfdisk','--json',disk,capture_output=True,text=True).stdout)['partitiontable']
+        partitions=table.get('partitions',[])
+        if (table.get('label')!='gpt' or table.get('sectorsize')!=512 or len(partitions)!=1 or
+            partitions[0].get('start')!=first or partitions[0].get('size')!=count or
+            partitions[0].get('type','').lower()!='c12a7328-f81f-11d2-ba4b-00a0c93ec93b'):
+            raise ValueError('installed fixture GPT does not match the expected desktop geometry')
+    else:
+        disk_bytes=6*1024**3+2*1024**2;sectors=disk_bytes//512
+        count=sectors-4096;disk_guid=uuid.uuid4();part_guid=uuid.uuid4()
+        with disk.open('xb') as f:f.truncate(disk_bytes)
+        layout=f'label: gpt\nlabel-id: {disk_guid}\nunit: sectors\n\nstart={first},size={count},type=U,uuid={part_guid}\n'
+        run('sfdisk',disk,input=layout,text=True,stdout=subprocess.DEVNULL)
+        run('mkfs.fat','-F','32','--offset',str(first),disk,str(count//2),stdout=subprocess.DEVNULL)
+        media=str(disk)+'@@'+str(first*512)
+        initrd=out/'INITRD.IMG';shutil.copyfile(desktop/'INITRD.IMG',initrd)
+        run('mmd','-i',initrd,'::MEDIA/SYSTEM')
+        target=out/'write-target';target.write_text(f'BRKAHCI1\n32902,10530,0,31,2,0,{sectors},512,512\nQEMU HARDDISK\nBROOK-SYSTEM-TEST01\n')
+        selector=out/'boot-volume';selector.write_text(f'BRKESP1\n{disk_guid.bytes_le.hex()}\n{part_guid.bytes_le.hex()}\n{first},{count}\n')
+        run('mcopy','-i',initrd,target,'::ETC/ahci-write-target')
+        run('mcopy','-i',initrd,selector,'::ETC/ahci-boot-volume')
+        run('mcopy','-s','-i',media,recovery/'payload/EFI','::/')
+        run('mmd','-i',media,'::KERNEL')
+        run('mcopy','-i',media,desktop/'kernel.elf','::KERNEL/BROOK.ELF')
+        run('mcopy','-i',media,initrd,'::INITRD.IMG')
+        cfg=out/'BROOK.CFG';cfg.write_text('TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nDISPLAY_WIDTH=1920\nDISPLAY_HEIGHT=1080\n')
+        run('mcopy','-i',media,cfg,'::BROOK.CFG')
+        run('mcopy','-i',media,store,'::STORE.IMG')
+        run('mcopy','-i',media,desktop/'writable-desktop','::STORE.OK')
     media=str(disk)+'@@'+str(first*512)
-    initrd=out/'INITRD.IMG';shutil.copyfile(desktop/'INITRD.IMG',initrd)
-    run('mmd','-i',initrd,'::MEDIA/SYSTEM')
-    target=out/'write-target';target.write_text(f'BRKAHCI1\n32902,10530,0,31,2,0,{sectors},512,512\nQEMU HARDDISK\nBROOK-SYSTEM-TEST01\n')
-    selector=out/'boot-volume';selector.write_text(f'BRKESP1\n{disk_guid.bytes_le.hex()}\n{part_guid.bytes_le.hex()}\n{first},{count}\n')
-    run('mcopy','-i',initrd,target,'::ETC/ahci-write-target')
-    run('mcopy','-i',initrd,selector,'::ETC/ahci-boot-volume')
-    run('mcopy','-s','-i',media,recovery/'payload/EFI','::/')
-    run('mmd','-i',media,'::KERNEL')
-    run('mcopy','-i',media,desktop/'kernel.elf','::KERNEL/BROOK.ELF')
-    run('mcopy','-i',media,initrd,'::INITRD.IMG')
-    cfg=out/'BROOK.CFG';cfg.write_text('TARGET=KERNEL\\BROOK.ELF\nDEBUG_TEXT=1\nDISPLAY_WIDTH=1920\nDISPLAY_HEIGHT=1080\n')
-    run('mcopy','-i',media,cfg,'::BROOK.CFG')
-    run('mcopy','-i',media,store,'::STORE.IMG')
-    run('mcopy','-i',media,desktop/'writable-desktop','::STORE.OK')
     result={'scope':'private SATA-only GPT/FAT/store desktop','phases':[],'desktop_ui_acceptance':False}
+    if a.installed_dell_capacity_fixture:
+        # Replace only the test workload in the clone: older fixture stores
+        # contain the original fixed-name acceptance file. A per-run path
+        # avoids deleting pre-existing data while keeping the kernel/store.
+        test_initrd=out/'test-initrd.img';helper=out/'STOREQA.ELF'
+        run('mcopy','-i',media,'::INITRD.IMG',test_initrd)
+        run(os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',ROOT/'scripts/workloads/writable_desktop_check.c','-o',helper)
+        run('mcopy','-o','-i',test_initrd,helper,'::BOOT/STOREQA.ELF')
+        run('mcopy','-o','-i',media,test_initrd,'::INITRD.IMG')
+        result['test_helper_replaced_in_clone']=True
+        config=run('mtype','-i',media,'::BROOK.CFG',capture_output=True,text=True).stdout
+        lines=config.splitlines()
+        if [line for line in lines if line.startswith('TARGET=')]!=['TARGET=KERNEL\\BROOK.ELF'] or any(line.startswith('UPDATE_SLOTS=') for line in lines):
+            raise ValueError('installed fixture does not select its embedded kernel directly')
+        embedded={}
+        for source_name in ('KERNEL/BROOK.ELF','INITRD.IMG'):
+            local=out/('embedded-'+source_name.rsplit('/',1)[-1])
+            run('mcopy','-i',media,'::'+source_name,local)
+            embedded[source_name]={'bytes':local.stat().st_size,'sha256':sha(local)}
+            local.unlink()
+        result['installed_fixture_embedded_files']=embedded
     token=uuid.uuid4().hex
     for phase in ('create','verify'):
         base=out/phase;base.mkdir();variables=base/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],variables);variables.chmod(0o600)
