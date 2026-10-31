@@ -2387,6 +2387,26 @@ and its HTTPS health endpoint passed. Its current log is
 valid only if the Dell is still running that kernel; a later A/B reboot or
 update requires checking the boot receipt and changing the decoder ELF.
 
+After the user found the laptop unresponsive with its display off, it returned
+via USB with the network bridge reachable. The writable desktop store was
+refused at `header-and-dirty` with `-EINVAL`; this is consistent with the
+unclean stop but does not identify whether the header, clean-state flag or
+group metadata failed. Brook used the immutable RAM recovery application
+image. Preserve and inspect the USB store before any repair. The internal SSD
+has not been installed or written by this preparation goal and is not expected
+to boot Brook yet. Idle blanking was disabled for the current boot to keep a
+subsequent failure visible; this does not persist across boots.
+
+Panic presentation already restored the firmware backlight after rendering.
+The candidate additionally makes a best-effort restore earlier in fatal panic
+and exception paths, after the primary serial record and CPU-stop attempt but
+before screen rendering. The existing late restore remains. A mock backlight
+test, private QEMU writable-desktop reboot check, and a deliberate QEMU shell
+panic with serial diagnostics passed; QEMU does not emulate the Dell backlight,
+so this does not prove a physical wake. A deadlock that never reaches panic
+handling cannot be fixed by the panic path. CPU-stop can time out, and MMIO
+itself may fault or stall during corruption; the early restore is best effort.
+
 A comparison using the same Dell kernel/initrd and a private writable USB QEMU
 image loaded `https://example.com/` in Firefox twice. Each window displayed the
 expected page title, was closed through the compositor, and the corresponding

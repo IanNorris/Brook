@@ -7,6 +7,7 @@
 #include "panic_screen.h"
 #include "compositor.h"
 #include "display.h"
+#include "display_power.h"
 #include "smp.h"
 #include "build_info.h"
 #include "ksym_addrs.h"
@@ -374,6 +375,9 @@ __attribute__((noreturn)) extern "C" void KernelPanic(const char* fmt, ...)
     // Halt other CPUs AFTER serial output — if the NMI broadcast crashes,
     // we've already printed the full diagnostic to serial.
     brook::SmpHaltAllAPs();
+    // Make a dimmed physical display visible even if later diagnostics or
+    // framebuffer rendering fail before DisplayPanicPresent is reached.
+    brook::DisplayPowerPanicRestore();
 
     // Now that the APs are halted and the panic NMI handler has captured each
     // CPU's live spin RIP into g_haltedState, print a per-CPU section to serial

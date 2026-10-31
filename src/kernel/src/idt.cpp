@@ -3,6 +3,7 @@
 #include "serial.h"
 #include "panic.h"
 #include "display.h"
+#include "display_power.h"
 #include "panic_screen.h"
 #include "panic_qr.h"
 #include "process.h"
@@ -509,6 +510,10 @@ static void HandleException(uint8_t vector, InterruptFrame* frame, uint64_t erro
         }
         ExcPutsRaw("\n");
     }
+
+    // Preserve the core serial fault record before attempting optional MMIO.
+    if ((frame->cs & 3) == 0)
+        brook::DisplayPowerPanicRestore();
 
     // Human-readable exception description
     {
@@ -1166,9 +1171,11 @@ extern "C" void HandleExceptionFull(FullExceptionFrame* ef, uint64_t vector,
             // CPU cleanly now instead of entering the doomed render. Other
             // CPUs were already halted by SmpHaltAllAPs() above.
             ExcPutsRaw("  [RSVD-corrupt-table: halting; serial dump above is the record]\n");
+            brook::DisplayPowerPanicRestore();
             for (;;) __asm__ volatile("cli; hlt");
         }
 
+        brook::DisplayPowerPanicRestore();
         // Render visual panic screen with full register state + QR code
         {
             uint32_t physStride = 0;
