@@ -100,6 +100,18 @@ static BlockDeviceOps s_partOps = {
     .block_size  = PartBlockSize,
 };
 
+Device* PartitionParentDevice(Device* partition) {
+    if(!partition || !DeviceIsRegistered(partition))return nullptr;
+    for(uint32_t i=0;i<s_partPoolNext;++i) {
+        if(partition!=&s_partDevices[i])continue;
+        if(partition->ops!=reinterpret_cast<const DeviceOps*>(&s_partOps) ||
+           partition->priv!=&s_partPool[i])return nullptr;
+        Device* parent=s_partPool[i].parent;
+        return parent && DeviceIsRegistered(parent)?parent:nullptr;
+    }
+    return nullptr;
+}
+
 static bool GuidIsZero(const GptGuid& g)
 {
     return g.data1 == 0 && g.data2 == 0 && g.data3 == 0 &&

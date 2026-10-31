@@ -6,6 +6,7 @@
 #include "ssd_install_segmented_source.h"
 #include "ssd_install_compact_source.h"
 #include "ssd_install_digest.h"
+#include "ssd_install_source_identity.h"
 #include "ahci_readonly.h"
 #include "fatfs_vfs.h"
 #include "device.h"
@@ -67,8 +68,7 @@ int Run() {
         VfsRelease(node);if(result)break;
         Device* backing=FatFsImageLeaseDevice(retainedLease[i]);
         // Test fixture only: both segments must belong to the same USB device.
-        if(!backing || backing==target || !backing->name || backing->name[0]!='u' ||
-           backing->name[1]!='s' || backing->name[2]!='b' || (i && backing!=firstBacking)) {result=-22;break;}
+        if(!SsdInstallUsbSource(backing,target) || (i && backing!=firstBacking)) {result=-22;break;}
         firstBacking=backing;
     }
     auto* meta=static_cast<uint8_t*>(kmalloc(34304));

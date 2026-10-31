@@ -27,7 +27,12 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
 
 ## Remaining engineering gates
 
-1. **Back up the original disk and verify the backup.** Preserve the entire
+1. **Backup decision.** The user explicitly waived backing up the old Ubuntu
+   SSD. A physical read-only 64 MiB sample transferred at about 1.13 MiB/s;
+   extrapolating gives approximately 60 hours for a full image, without
+   accounting for verification or variation. No full SSD backup exists and
+   installation will destroy the old data. The separate USB store backup is
+   retained. If a backup is subsequently requested, preserve the entire
    256,060,514,304-byte logical device, not just its partition table. A raw
    backup needs at least that much free destination space plus overhead; the
    host `/data` had roughly 290 GiB available after cleanup; recheck the space
@@ -87,6 +92,10 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
    record stored with the package is not authentication. Refuse ambiguous
    targets, unverified packages, unsupported sector sizes, missing flush support
    and uncertain I/O. Preserve the USB's working A/B and root recovery files.
+   The test installer now verifies source partition ancestry against the
+   registered USB parent rather than trusting a device name; host tests and a
+   complete disposable QEMU install passed. This is a prerequisite, not a
+   production installer or proof of physical USB hotplug handling.
 4. **Rehearse the exact candidate on disposable media.** Use the full desktop
    package and a QEMU disk of the same sector geometry, with the intended target
    and boot selectors adapted only to a synthetic identity. Verify negative
