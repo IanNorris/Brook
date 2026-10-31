@@ -1925,3 +1925,10 @@ visibility for panic/optical diagnostics. Identify the actual firmware route
 before hardware writes; expose verified capability and manual bridge control.
 Full system sleep/suspend can wait. See the display-power priority in
 [xps9343-bringup.md](xps9343-bringup.md).
+
+### Taskbar launch spinner DPI (31 October)
+
+Scale the taskbar application-launch spinner with the configured desktop DPI.
+The Dell XPS high-DPI run showed the surrounding taskbar scaled while the
+pending-launch indicator remained small. Verify both default and high-DPI
+settings and ensure the indicator remains centered in its taskbar button.

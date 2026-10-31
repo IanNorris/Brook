@@ -1795,3 +1795,19 @@ checking (`tcp1200-writable-qemu-20261031/result.json`). Real Dell TLS, Gallery,
 and browser acceptance remain pending. The ceiling does not implement ICMP
 path-MTU discovery, peer-window flow control, or the separately tracked
 active-open handshake/window-scaling fixes.
+
+Physical network candidate: generation 11, slot A, bridge session
+`a72eca3f4c0b42b6b236bb0f304c4205` (actual boot identity in
+`build/hardware/dell-tcp1200-native-update-20261031/receipt.json`). The previous
+4 KiB writable desktop remains in slot B. The writable store mounted ready,
+and the boot log confirmed the 1200-byte TCP ceiling. An unmodified curl then
+repeated the previously failing request to `140.248.133.91` with the full
+1,559-byte TLS 1.3 ClientHello: certificate verification succeeded and the
+server returned HTTP/2 200. This is a direct physical success with the
+configured workaround; it does not establish the route's actual MTU or test
+all applications. The user is exercising Gallery installation separately.
+
+After that update the user retried Galculator through App Gallery and confirmed
+it installed and launched. The physical bridge independently observed a
+`galculator` window and the new Galculator launcher entry. Browser HTTPS,
+interactive use, downloads and clean relaunch remain separate acceptance gates.
