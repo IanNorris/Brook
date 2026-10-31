@@ -2333,3 +2333,23 @@ interrupt a single hung MMIO access. Host tests use a simulated register bus;
 this host's QEMU device list does not expose a DesignWare I²C controller.
 There is still no physical MMIO adapter, platform ownership or initialization,
 and this code has not sent an I²C transaction to the laptop.
+
+### Firefox HTTPS follow-up and lost hardware connection (2026-10-31)
+
+On the Dell boot pinned by the hardware bridge, a single Firefox launch as
+UID 1000 opened `https://example.com/`. The completed-frame capture at
+`build/hardware/dell-firefox-https-review-20261031/frame/screenshot.png`
+shows the site's title and rendered content. Some non-Latin characters display
+missing-glyph boxes; this is a separate font-coverage issue. The window closed
+through the compositor, but the original guest job still reported its leader
+alive with 115 live tasks after a further wait. Window disappearance alone does
+not establish a clean browser exit.
+
+The hardware bridge then returned `No route to host`. The host route still
+selected its LAN interface, but the Dell neighbour entry was FAILED; the
+existing panic receiver remains active. This is not sufficient to distinguish
+link loss, shutdown, a guest hang, or a panic. No reset or second browser launch
+was attempted after loss of contact. The Firefox job and closure request IDs
+are retained in `build/hardware/dell-firefox-https-review-20261031/`. The user
+has been asked to inspect the Dell when available. Browser interactivity,
+downloads, clean process exit and Chromium acceptance remain unproven.
