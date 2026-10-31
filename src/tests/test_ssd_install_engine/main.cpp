@@ -1,5 +1,6 @@
 #include "../../kernel/src/ssd_install_engine.h"
 #include "../../kernel/src/ssd_install_preflight.h"
+#include "../../kernel/src/ssd_install_compact_source.h"
 #include <cassert>
 #include <cstring>
 #include <fcntl.h>
@@ -16,6 +17,23 @@ struct Io {
         if(shortWrite){std::memcpy(target.data()+lba*512,data,n/2);return int(n/2);}
         if(!ignoreZero)std::memcpy(target.data()+lba*512,data,n);return int(n);}
     int flushTarget(){++flushes;return ++calls==failAt?-5:0;}
+};
+struct CompactIo {
+    SsdInstallCompactSource map;
+    std::vector<uint8_t> packed, target;
+    unsigned reads=0;
+    int readPacked(uint64_t offset,void* out,uint32_t n) {
+        ++reads;if(offset>packed.size() || n>packed.size()-offset)return -1;
+        std::memcpy(out,packed.data()+offset,n);return int(n);
+    }
+    int readSource(uint64_t lba,void* out,uint32_t n){return map.Read(*this,lba*512,out,n);}
+    int readTarget(uint64_t lba,void* out,uint32_t n){std::memcpy(out,target.data()+lba*512,n);return int(n);}
+    int writeTarget(uint64_t lba,const void* data,uint32_t n){std::memcpy(target.data()+lba*512,data,n);return int(n);}
+    int flushTarget(){return 0;}
+};
+struct MockPackedReader {
+    unsigned calls=0; uint64_t lastOffset=0; bool shortRead=false;
+    int readPacked(uint64_t offset,void*,uint32_t n) {++calls;lastOffset=offset;return shortRead?int(n/2):int(n);}
 };
 static Io makeIo(){Io io;io.source.resize(4096*512);io.target.assign(4096*512,0xa5);
     for(size_t i=0;i<io.source.size();++i)io.source[i]=uint8_t((i*31+17)&255);return io;}
@@ -60,6 +78,40 @@ int main(int argc,char** argv){
             (sector>=g.payloadFirst && sector<g.payloadFirst+g.payloadSectors) || sector>=g.diskSectors-33;
         for(unsigned j=0;j<512;++j){const auto at=sector*512+j;assert(io.target[at]==(written?io.source[at]:0xa5));}
     }
+    CompactIo compact{SsdInstallCompactSource(g,(34+g.payloadSectors+33)*512),{},std::vector<uint8_t>(g.diskSectors*512,0xa5)};
+    compact.packed.insert(compact.packed.end(),io.source.begin(),io.source.begin()+34*512);
+    compact.packed.insert(compact.packed.end(),io.source.begin()+g.payloadFirst*512,io.source.begin()+(g.payloadFirst+g.payloadSectors)*512);
+    compact.packed.insert(compact.packed.end(),io.source.end()-33*512,io.source.end());
+    assert(compact.map.Valid() && compact.map.ExpectedSize()==compact.packed.size());
+    SsdInstallEngine compactEngine(g,true);
+    while(compactEngine.Step(compact,a.data(),b.data())==SsdInstallStepResult::Progress){}
+    assert(compactEngine.Stage()==SsdInstallStage::Complete && compact.target==io.target);
+    const auto beforeReads=compact.reads;
+    assert(compact.map.Read(compact,33*512,a.data(),1024)==-1 && compact.reads==beforeReads);
+    assert(compact.map.Read(compact,(g.payloadFirst+g.payloadSectors)*512-1,a.data(),2)==-1 && compact.reads==beforeReads);
+    assert(compact.map.Read(compact,(g.diskSectors-33)*512-1,a.data(),2)==-1 && compact.reads==beforeReads);
+    assert(compact.map.Read(compact,g.diskSectors*512-1,a.data(),2)==-1 && compact.reads==beforeReads);
+    assert(!SsdInstallCompactSource(g,compact.packed.size()-1).Valid());
+    const SsdInstallGeometry physicalSize{500118192,2048,12582912};
+    const SsdInstallCompactSource physicalMap(physicalSize,(34+physicalSize.payloadSectors+33)*512);
+    assert(physicalMap.Valid() && physicalMap.ExpectedSize()<physicalSize.diskSectors*512);
+    const SsdInstallGeometry adjacent{100,34,33};
+    CompactIo contiguous{SsdInstallCompactSource(adjacent,100*512),std::vector<uint8_t>(100*512),{}};
+    for(size_t i=0;i<contiguous.packed.size();++i)contiguous.packed[i]=uint8_t(i/512);
+    assert(contiguous.map.Read(contiguous,33*512,a.data(),35*512)==35*512);
+    for(unsigned sector=0;sector<35;++sector)assert(a[sector*512]==sector+33);
+    assert(contiguous.map.Read(contiguous,0,nullptr,1)==-1);
+    assert(contiguous.map.Read(contiguous,UINT64_MAX,a.data(),1)==-1);
+    assert(contiguous.map.Read(contiguous,100*512,nullptr,0)==0);
+    assert(!SsdInstallCompactSource({67,34,1},0).Valid());
+    const SsdInstallCompactSource minimum({68,34,1},68*512);
+    MockPackedReader mock;assert(minimum.Valid());
+    assert(minimum.Read(mock,33*512,a.data(),3*512)==3*512 && mock.calls==3);
+    mock.shortRead=true;assert(minimum.Read(mock,0,a.data(),512)==-1);
+    const SsdInstallGeometry maximum{1ull<<48,34,1};
+    const SsdInstallCompactSource maximumMap(maximum,68*512);
+    mock.shortRead=false;assert(maximumMap.Valid());
+    assert(maximumMap.Read(mock,(maximum.diskSectors-1)*512,a.data(),512)==512 && mock.lastOffset==67*512);
     const unsigned total=io.calls;
     for(unsigned fail=1;fail<=total;++fail){auto broken=makeIo();broken.failAt=fail;SsdInstallEngine attempt(g,true);
         while(attempt.Step(broken,a.data(),b.data())==SsdInstallStepResult::Progress){}

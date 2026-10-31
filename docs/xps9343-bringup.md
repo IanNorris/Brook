@@ -2208,3 +2208,17 @@ and writable-store verification also passed; this does not establish physical
 controller behavior or audio playback. Evidence:
 `build/hardware/dell-i2c-host-debug-20261031` and
 `build/hardware/dell-i2c-id-qemu-20261031`.
+
+The current installer source maps the entire target-sized logical disk, which
+would otherwise require a 256 GB source for the Dell even when the installed
+partition is much smaller. An unconnected compact source mapper now represents
+only the primary GPT/MBR, the selected payload, and the backup GPT. It rejects
+logical gap reads before calling the source, checks exact packed length, and
+can wrap a segmented source. An assertion-enabled engine test compares its
+complete target bytes with the full-source result and verifies untouched gaps;
+boundary, short-read and maximum-geometry cases also pass. This is not yet a
+package builder or a QEMU/physical installer integration. The GPT describes the
+full target-sized logical geometry, while the packed source has a different
+length. Any future package verification must bind its geometry as well as its
+bytes, and independently validate source leases, target identity and both GPT
+copies before enabling writes.
