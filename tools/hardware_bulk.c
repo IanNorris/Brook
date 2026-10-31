@@ -27,11 +27,11 @@ static int io_bytes(int fd,void* data,size_t size,int writing,int network){
     uint8_t* p=data;
     while(size){
         if(network){uint64_t now=now_ms();if(now>=deadline_ms)return -1;uint64_t left=deadline_ms-now;int timeout=left>30000?30000:(int)left;
-            struct pollfd wait={fd,writing?POLLOUT:POLLIN,0};int n;do{n=poll(&wait,1,timeout);}while(n<0&&errno==EINTR);if(n<=0)return -1;}
+            struct pollfd wait={fd,writing?POLLOUT:POLLIN,0};int n;do{n=poll(&wait,1,timeout);}while(n<0&&errno==EINTR);if(n<0)return -1;if(n==0)continue;}
         ssize_t n=network?(writing?send(fd,p,size,MSG_NOSIGNAL|MSG_DONTWAIT):recv(fd,p,size,MSG_DONTWAIT)):(writing?write(fd,p,size):read(fd,p,size));
         if(n<0&&(errno==EINTR||(network&&(errno==EAGAIN||errno==EWOULDBLOCK))))continue;
         if(n<=0)return -1;
-        if(network && sliding_deadline)deadline_ms=now_ms()+120000;
+        if(network && sliding_deadline){uint64_t now=now_ms();if(now==UINT64_MAX || now>UINT64_MAX-120000)return -1;deadline_ms=now+120000;}
         p+=n;size-=(size_t)n;
     }return 0;
 }
@@ -187,7 +187,8 @@ int main(int argc,char** argv){
     puts("HWBULK_LISTENING bulk_api=1");fflush(stdout);
     struct pollfd wait={listener,POLLIN,0};if(poll(&wait,1,60000)<=0){result=6;goto done;}
     client=accept(listener,NULL,NULL);if(client<0){result=7;goto done;}
-    sliding_deadline=!strcmp(argv[3],"disk");deadline_ms=now_ms()+(sliding_deadline?120000:600000);
+    sliding_deadline=!strcmp(argv[3],"disk");uint64_t now=now_ms(),allowance=sliding_deadline?120000:600000;
+    if(now==UINT64_MAX || now>UINT64_MAX-allowance){result=8;goto done;}deadline_ms=now+allowance;
     result=serve(client,directory,key,argv[1],argv[2],argv[3],argc==5?argv[4]:NULL);
 done:
     if(client>=0)close(client);

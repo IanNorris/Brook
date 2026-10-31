@@ -1,9 +1,9 @@
 # Dell XPS 13 9343: internal SSD installation preparation
 
-This is a preparation plan, not an installer or an instruction to write the
-current disk. The active bring-up goal keeps the Dell SSD read-only. The user
-has said the old Ubuntu installation may eventually be wiped; a later write
-phase must still satisfy the goal and technical prerequisites in force then.
+This is an installation plan, not itself an installer. The user has explicitly
+authorized wiping the old Ubuntu contents and installing Brook on this Dell's
+internal SSD. Physical writes still require an implementation that targets the
+observed SSD, preserves USB recovery, and passes the applicable tests below.
 
 ## What is known
 
@@ -30,9 +30,9 @@ phase must still satisfy the goal and technical prerequisites in force then.
 1. **Back up the original disk and verify the backup.** Preserve the entire
    256,060,514,304-byte logical device, not just its partition table. A raw
    backup needs at least that much free destination space plus overhead; the
-   current host `/data` filesystem has less, so choose another sufficiently large
-   destination or verify actual compression and available space before relying on
-   it. A rescue environment must disable automount and mark the SSD block device
+   host `/data` had roughly 290 GiB available after cleanup; recheck the space
+   immediately before starting because it can change. A rescue environment must
+   disable automount and mark the SSD block device
    read-only before inspection or imaging. Record source identity, size, read
    errors, backup length and a full-image digest in private local evidence.
    Hash the complete source stream during acquisition, then independently read
@@ -53,8 +53,7 @@ phase must still satisfy the goal and technical prerequisites in force then.
    This is not an atomic snapshot against changes outside Brook's read-only
    admission, has no resume or automatic retry, and aborts on read error. Use a
    private output directory and preserve its receipts: the image and identity
-   may contain personal data. The current host lacks space for a full raw image
-   of the Dell SSD. An independent rescue environment remains an alternative.
+   may contain personal data. An independent rescue environment remains an alternative.
    A backup is for recovery, not a claim that a wiped SSD has been
    securely erased.
 
@@ -107,7 +106,7 @@ phase must still satisfy the goal and technical prerequisites in force then.
 
 ## Eventual installation and acceptance
 
-Once the above gates and the then-current goal permit physical writes, use the
+Once the applicable gates above are satisfied, use the
 reviewed installer for the uniquely identified SSD. Check its receipt and
 readback, then boot the SSD with USB removed while retaining the USB recovery
 stick. Verify UEFI boot selection, the expected kernel and store, browser and
