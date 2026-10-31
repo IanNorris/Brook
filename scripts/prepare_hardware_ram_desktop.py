@@ -41,6 +41,11 @@ for name in ['xhci','sched_eevdf','virtio_input']:run('mcopy','-o','-i',initrd,b
 for name,source in [('HWSTATUS.ELF','tools/hardware_status.c'),('HWUPDATE.ELF','tools/hardware_update.c'),('HWIO.ELF','tools/hardware_storage_probe.c'),('HWBULK.ELF','tools/hardware_bulk.c')]:
     run(os.environ['MUSL_CC'],'-static','-O2','-Wall','-Wextra','-Werror',ROOT/source,'-o',out/name)
     run('mcopy','-o','-i',initrd,out/name,'::BOOT/'+name)
+musl_cxx=os.environ.get('MUSL_CXX') or os.environ['MUSL_CC'].removesuffix('gcc')+'g++'
+run(musl_cxx,'-static','-std=c++17','-O2','-Wall','-Wextra','-Werror','-Wno-misleading-indentation',
+    ROOT/'tools/hardware_store_receiver.cpp',ROOT/'tools/hardware_store_transaction.cpp',
+    ROOT/'tools/hardware_store_validate.cpp','-o',out/'HWSTORE.ELF')
+run('mcopy','-o','-i',initrd,out/'HWSTORE.ELF','::BOOT/HWSTORE.ELF')
 apps=meta['files']['APPS.BRK'];payload_id='desktop-ram-apps-'+uuid.uuid4().hex
 markers={'hardware-maintenance':'RAM-resident updater enabled; application snapshot must remain immutable\n',
     'hardware-bulk':'1\n',

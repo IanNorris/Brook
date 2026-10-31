@@ -4,7 +4,7 @@ import hashlib,json,os,socket,struct,subprocess,sys,tempfile,uuid
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from hardware_bulk_protocol import line
-from hardware_store_protocol import provision
+from hardware_store_protocol import provision,prepare_source
 
 def reply(conn):
  try: return line(conn)
@@ -14,6 +14,10 @@ image=Path(sys.argv[1]).resolve(strict=True);binary=Path(sys.argv[2]).resolve(st
 record=b'BRKSTORE1 16777216 01234567-89ab-cdef-0123-456789abcdef'
 assert image.stat().st_size==16777216
 payload=image.read_bytes();digest=hashlib.sha256(payload).digest();key='1'*32;boot='2'*32
+for bad_record,bad_hash in ((record.replace(b'16777216',b'33554432'),digest.hex()),(record,'0'*64)):
+ try: prepare_source(image,bad_record,bad_hash)
+ except ValueError: pass
+ else: raise AssertionError('Preflight accepted a mismatched image or digest')
 with tempfile.TemporaryDirectory(prefix='brook-store-receiver-',dir='build/hardware') as temp:
  root=Path(temp).resolve();keyfile=root/'key';keyfile.write_text(key)
  for mode in ('success','client-success','wrong-auth','wrong-boot','wrong-hash','disconnect','collision','no-finalize'):

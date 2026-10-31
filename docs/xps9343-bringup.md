@@ -1647,3 +1647,23 @@ FAT mount/device checks; these must be tested in QEMU. The receiver is not yet
 included in an initrd or wired to an MCP workflow, and no physical deployment
 has been performed. Native file ownership/exclusion, lost reply, write/sync
 failure and QEMU checked-boot acceptance remain required before deployment.
+
+The receiver is now packaged in the candidate RAM initrd and a boot-pinned host
+workflow persists the transaction ID before dispatch, validates the entire source
+and record size before starting the receiver, and never automatically replays a
+lost mutation. A private QEMU FAT test first proved that insufficient capacity
+is rejected without a marker. A larger private FAT then reached the production
+create call, which returned `EOPNOTSUPP`; no image or marker was created. A
+separate guest diagnostic confirmed absent names return `ENOENT`, but
+`openat(O_CREAT|O_EXCL)` on `/media/usb` returns errno95. Evidence is under
+`build/hardware/store-provision-qemu-v{1,2}-20261031/`.
+
+Astra confirmed that the retained FAT object operations lack exclusive create
+and rename callbacks. The marker's no-replace rename is also unsupported in
+that interface. The legacy pathname callbacks do not provide the required
+retained-object semantics and cannot safely be substituted: retained source
+objects pin directory-slot identities that change on rename, and the legacy
+replacement path deletes an existing destination. The next change must provide
+object-relative exclusive creation and absent-destination rename while preserving
+open/leased aliases, entry identity, read-only policy and namespace/FAT lock
+ordering. The receiver remains unproven for QEMU and has not been deployed.
