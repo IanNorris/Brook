@@ -2337,6 +2337,28 @@ this host's QEMU device list does not expose a DesignWare I²C controller.
 There is still no physical MMIO adapter, platform ownership or initialization,
 and this code has not sent an I²C transaction to the laptop.
 
+The host's `linux-firmware-20261019` package contains the Broadwell CATPT base
+firmware, exposed as `intel/IntcSST2.bin` and linked to
+`intel/catpt/bdw/dsp_basefw.bin`. The locally decompressed 260608-byte artifact
+has SHA-256 `d1ae2cb6e0121c608adefac9d46a8b26e248fa6c7c39a0e26c6ad1e6c822932a`;
+it remains in ignored build output, not in the repository or a boot image.
+The upstream [firmware inventory](https://kernel.googlesource.com/pub/scm/linux/kernel/git/iwlwifi/linux-firmware/+/refs/tags/iwlwifi-fw-2025-05-28/WHENCE)
+references `LICENCE.IntcSST2`, which permits unmodified binary redistribution
+subject to conditions; consult the [full licence](https://git.ti.com/cgit/processor-firmware/ti-linux-firmware/tree/LICENCE.IntcSST2?id=8a4482899932791711133d3be037e7625e5973b9)
+before packaging. This is not a licensing determination for Brook.
+
+The new host-only `tools/catpt_firmware.py` inventories the published SST
+headers, module extents and WPT RAM-relative ranges, with bounded input and
+overlap checks, using the Linux [loader](https://github.com/torvalds/linux/blob/master/sound/soc/intel/catpt/loader.c),
+[platform descriptor](https://github.com/torvalds/linux/blob/master/sound/soc/intel/catpt/device.c)
+and [register definitions](https://github.com/torvalds/linux/blob/master/sound/soc/intel/catpt/registers.h).
+The real local image passed the structural checks with eight modules and 15
+blocks; tests also cover malformed lengths, IDs, overlaps and RAM boundaries.
+The tool inventories entry points, scratch sizes and reserved fields without
+validating their semantics. It does not establish provenance beyond the local
+package and hash, executable validity, firmware/device compatibility, or
+permission to initialize hardware; no loader, DMA or physical access is added.
+
 ### Firefox HTTPS follow-up and lost hardware connection (2026-10-31)
 
 On the Dell boot pinned by the hardware bridge, a single Firefox launch as
