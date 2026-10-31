@@ -2027,10 +2027,14 @@ occurred on the Dell, and its USB recovery remains the boot path.
 The present single-file source cannot carry the full desktop disk image on
 FAT32: the filesystem limits an individual file to less than 4 GiB. A tested
 segmented-source offset mapper now handles reads spanning fixed-size chunks,
-including offsets beyond 4 GiB. It is not yet connected to the worker: opening
-and retaining every segment, validating their sizes and identity, and exercising
-the full image in QEMU remain necessary. Splitting alone does not make an image
-authentic, immutable, or safe to install.
+including offsets beyond 4 GiB. The disposable QEMU worker now leases two
+exact-size 32 MiB segments from the same USB device before making any target
+writes. It installed the small fixture and booted the result without USB
+(`asi9`, `aib3`); omission of the second segment failed before the first disk
+operation and left the target byte-identical (`asi10`). The fixed two-segment
+worker is still a small-image rehearsal. General segment enumeration and
+identity, and a full desktop image test remain necessary. Splitting alone does
+not make an image authentic or safe to install.
 
 The test-only kernel can also discover a GPT partition on the identified
 scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload

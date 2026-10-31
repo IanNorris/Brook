@@ -3,6 +3,7 @@
 #include "ssd_install_preflight.h"
 #include "ssd_install_engine.h"
 #include "ssd_install_gate.h"
+#include "ssd_install_segmented_source.h"
 #include "ahci_readonly.h"
 #include "fatfs_vfs.h"
 #include "device.h"
@@ -16,10 +17,17 @@ namespace brook {
 namespace {
 // Test-kernel-only, one-shot worker. No generic disk-offset interface exists.
 SsdInstallGate gate;uint32_t state=0,stage=0,paused=0;uint64_t operations=0;int error=0;
-FatImageLease* retainedLease=nullptr;
+FatImageLease* retainedLease[2]{};
+struct Source {
+    FatImageLease** leases; SsdInstallSegmentedSource map;
+    int readSegment(uint32_t index,uint64_t offset,void* p,uint32_t n) {
+        return FatFsImageRead(leases[index],offset,p,n);
+    }
+    int read(uint64_t offset,void* p,uint32_t n) {return map.Read(*this,offset,p,n);}
+};
 struct Io {
-    FatImageLease* source;Device* target;
-    int readSource(uint64_t lba,void* p,uint32_t n){return FatFsImageRead(source,lba*512,p,n);}
+    Source* source;Device* target;
+    int readSource(uint64_t lba,void* p,uint32_t n){return source->read(lba*512,p,n);}
     int readTarget(uint64_t lba,void* p,uint32_t n){return target->ops->read(target,lba*512,p,n);}
     int writeTarget(uint64_t lba,const void* p,uint32_t n){return DeviceWrite(target,lba*512,p,n);}
     int flushTarget(){return DeviceFlush(target);}
@@ -27,16 +35,24 @@ struct Io {
 int Run() {
     Device* target=AhciDisposableQemuInstallDevice();
     if(!target || DeviceBlockCount(target)!=131072 || DeviceBlockSize(target)!=512)return -22;
-    auto* node=VfsOpen("/media/usb/INSTALL.IMG",VFS_O_WRITE|VFS_O_READWRITE);if(!node)return -2;
-    VnodeStat st{};FatImageLease* lease=nullptr;
-    int result=VfsStat(node,&st);
-    if(!result && (st.isDir || st.isSymlink || st.size!=131072ull*512))result=-22;
-    if(!result)result=FatFsAcquireImageLease(node,st.size,&lease);
-    VfsRelease(node);if(result)return result;
-    retainedLease=lease;Device* backing=FatFsImageLeaseDevice(lease);
-    // The rehearsal's source is the private USB device, never the SATA disk.
-    if(!backing || backing==target || !backing->name || backing->name[0]!='u' ||
-       backing->name[1]!='s' || backing->name[2]!='b')result=-22;
+    auto* node=VfsOpen("/media/usb/INST0000.IMG",VFS_O_WRITE|VFS_O_READWRITE);
+    if(!node)return -2;
+    const uint32_t count=2;
+    Source source{retainedLease,SsdInstallSegmentedSource(131072ull*512,32ull*1024*1024,count)};
+    int result=0;Device* firstBacking=nullptr;
+    for(uint32_t i=0;i<count;++i) {
+        if(i)node=VfsOpen("/media/usb/INST0001.IMG",VFS_O_WRITE|VFS_O_READWRITE);
+        if(!node){result=-2;break;}
+        VnodeStat st{};result=VfsStat(node,&st);
+        if(!result && (st.isDir || st.isSymlink || st.size!=source.map.ExpectedSize(i)))result=-22;
+        if(!result)result=FatFsAcquireImageLease(node,st.size,&retainedLease[i]);
+        VfsRelease(node);if(result)break;
+        Device* backing=FatFsImageLeaseDevice(retainedLease[i]);
+        // Test fixture only: both segments must belong to the same USB device.
+        if(!backing || backing==target || !backing->name || backing->name[0]!='u' ||
+           backing->name[1]!='s' || backing->name[2]!='b' || (i && backing!=firstBacking)) {result=-22;break;}
+        firstBacking=backing;
+    }
     auto* meta=static_cast<uint8_t*>(kmalloc(34304));
     auto* a=static_cast<uint8_t*>(kmalloc(65536));auto* b=static_cast<uint8_t*>(kmalloc(65536));
     if(!meta || !a || !b)result=-12;
@@ -44,10 +60,10 @@ int Run() {
         uint8_t* mbr=meta;uint8_t* primary=meta+512;uint8_t* backup=meta+1024;
         uint8_t* entries=meta+1536;uint8_t* copy=meta+17920;
         constexpr uint64_t sectors=131072;
-        if(FatFsImageRead(lease,0,mbr,512)!=512 || FatFsImageRead(lease,512,primary,512)!=512 ||
-           FatFsImageRead(lease,(sectors-1)*512,backup,512)!=512 ||
-           FatFsImageRead(lease,2*512,entries,16384)!=16384 ||
-           FatFsImageRead(lease,(sectors-33)*512,copy,16384)!=16384)result=-5;
+        if(source.read(0,mbr,512)!=512 || source.read(512,primary,512)!=512 ||
+           source.read((sectors-1)*512,backup,512)!=512 ||
+           source.read(2*512,entries,16384)!=16384 ||
+           source.read((sectors-33)*512,copy,16384)!=16384)result=-5;
         uint64_t first=0,last=0;
         if(!result)for(unsigned i=0;i<128;++i){const uint8_t* e=entries+i*128;
             if(!StrictAllZero(e,16)){first=StrictLe64(e+32);last=StrictLe64(e+40);break;}}
@@ -55,7 +71,7 @@ int Run() {
         if(!result && !SsdInstallPreflight(geometry,sectors,DeviceBlockCount(target),DeviceBlockSize(target),
             mbr,primary,backup,entries,copy,16384))result=-22;
         if(!result) {
-            Io io{lease,target};SsdInstallEngine engine(geometry,true);SsdInstallStepResult step;
+            Io io{&source,target};SsdInstallEngine engine(geometry,true);SsdInstallStepResult step;
             auto* pauseMarker=VfsOpen("/etc/ahci-qemu-install-pause");const bool pauseTest=pauseMarker!=nullptr;
             if(pauseMarker)VfsClose(pauseMarker);
             do {
@@ -71,9 +87,11 @@ int Run() {
         }
     }
     if(meta)kfree(meta);if(a)kfree(a);if(b)kfree(b);
-    const int release=FatFsReleaseImageLease(lease);
-    if(!release)retainedLease=nullptr;
-    if(!result && release)result=release;
+    for(uint32_t i=0;i<count;++i)if(retainedLease[i]) {
+        const int release=FatFsReleaseImageLease(retainedLease[i]);
+        if(!release)retainedLease[i]=nullptr;
+        if(!result && release)result=release;
+    }
     return result;
 }
 void Worker(void*) {

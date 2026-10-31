@@ -20,6 +20,8 @@ p.add_argument('--allow-host-network',action='store_true',help='Permit QEMU user
 p.add_argument('--sata-image',type=Path,help='Attach a regular-file SATA fixture with a disposable QEMU snapshot overlay')
 p.add_argument('--sata-qemu-scratch',type=Path,help='Copy a 64 MiB fixture into this test output and attach the copy writable with a test-only serial')
 p.add_argument('--installer-source',type=Path,help='Copy a 64 MiB regular-file source into the private USB fixture for the test-only installer')
+p.add_argument('--installer-segmented',action='store_true',help='Split the test source into two pinned FAT files')
+p.add_argument('--installer-omit-second',action='store_true',help='Omit the second source segment for a failure test')
 a=p.parse_args();desktop=a.desktop.resolve(strict=True);maintenance=a.maintenance.resolve(strict=True);out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
 if not (640<=a.width<=4096 and 480<=a.height<=2160):p.error('Private test display must be 640..4096 by 480..2160')
 m=json.loads((desktop/'manifest.json').read_text());mm=json.loads((maintenance/'manifest.json').read_text())
@@ -38,11 +40,24 @@ if a.private_disk_mib:
     for child in staging.iterdir():run('mcopy','-s','-i',str(disk)+'@@1048576',child,'::/')
     shutil.rmtree(staging)
 else:run('cp','--reflink=auto',maintenance/'probe.raw',disk)
+if a.installer_segmented and not a.installer_source:p.error('segmented source requires --installer-source')
+if a.installer_omit_second and not a.installer_segmented:p.error('omitting a segment requires --installer-segmented')
 if a.installer_source:
+    if not a.installer_segmented:p.error('the installer test kernel requires --installer-segmented')
     if not a.sata_qemu_scratch:p.error('installer source requires the private SATA scratch fixture')
     if a.installer_source.is_symlink() or not a.installer_source.is_file() or a.installer_source.stat().st_size!=64*1024**2:
         p.error('installer source must be a regular 64 MiB file')
-    run('mcopy','-o','-i',str(disk)+'@@1048576',a.installer_source,'::INSTALL.IMG')
+    with a.installer_source.open('rb') as source:
+        for i in range(2):
+            if i==1 and a.installer_omit_second:break
+            part=out/f'installer-part-{i}.tmp'
+            with part.open('xb') as target:
+                for _ in range(32):
+                    data=source.read(1024**2)
+                    if len(data)!=1024**2:raise ValueError('short installer source')
+                    target.write(data)
+            run('mcopy','-o','-i',str(disk)+'@@1048576',part,f'::INST{i:04}.IMG')
+            part.unlink()
 kernel=(desktop/'kernel.elf').read_bytes();initrd=(desktop/'INITRD.IMG').read_bytes()
 for name,capacity,data in [('KERNEL.ELF',KERNEL_MAX,kernel),('INITRD.IMG',INITRD_MAX,initrd)]:
     path=out/name
