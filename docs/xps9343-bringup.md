@@ -1942,6 +1942,22 @@ offline `e2fsck` also passed after the handoff change (`ath2`, `ath3`). This
 baseline does not yet mount the application store from SATA or test an
 installer; the Dell has not been updated with this handoff implementation.
 
+The SATA boot-volume selector now validates the protective MBR and both GPT
+copies, then requires the expected disk GUID, partition GUID, EFI partition
+type and exact sector span. Its record uses lowercase hexadecimal **on-disk
+GUID bytes**, not the usual displayed UUID byte order. Tests cover malformed
+selectors, damaged GPT copies, wrong type/identity/span, duplicate GUIDs and
+an independently generated `sfdisk` GPT image. This selector is not yet wired
+to disk discovery or mounting.
+
+Writable desktop admission now accepts a verified System volume at the fixed
+`/media/system` path as well as its existing USB source. System-source failure
+returns Maintenance rather than falling back to USB or a RAM image. Host tests
+cover both paths and missing system records; the existing USB-backed QEMU
+write/restart/e2fsck regression passed (`build/hardware/wds1`). No SATA volume
+is yet selected or mounted by the boot path; that integration and its full QEMU
+rehearsal remain outstanding.
+
 The test-only kernel can also discover a GPT partition on the identified
 scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload
 created and fsynced a 150123-byte file, renamed it, and fsynced its directory.

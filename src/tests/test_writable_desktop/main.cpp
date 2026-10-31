@@ -32,9 +32,11 @@ bool Is(const char* value){return scenario==value;}
 namespace brook {
 extern "C" Vnode* VfsOpen(const char* path,int flags){
     Vnode* node=nullptr;
-    if(!std::strcmp(path,"/etc/writable-desktop")){if(Is("absent"))return nullptr;assert(flags==VFS_O_STREAM);node=&config;}
-    else if(!std::strcmp(path,"/media/usb/STORE.OK")){if(Is("no-marker"))return nullptr;assert(flags==VFS_O_STREAM);node=&marker;}
-    else {assert(!std::strcmp(path,"/media/usb/STORE.IMG"));assert(flags==(VFS_O_WRITE|VFS_O_READWRITE));node=&source;}
+    if(!std::strcmp(path,"/etc/writable-desktop")){if(Is("absent")||Is("system-absent"))return nullptr;assert(flags==VFS_O_STREAM);node=&config;}
+    else if(!std::strcmp(path,"/media/usb/STORE.OK") || !std::strcmp(path,"/media/system/STORE.OK")){
+        assert((scenario.rfind("system-",0)==0)==(!std::strcmp(path,"/media/system/STORE.OK")));
+        if(Is("no-marker")||Is("system-no-marker"))return nullptr;assert(flags==VFS_O_STREAM);node=&marker;}
+    else {assert(!std::strcmp(path,scenario.rfind("system-",0)==0?"/media/system/STORE.IMG":"/media/usb/STORE.IMG"));assert(flags==(VFS_O_WRITE|VFS_O_READWRITE));node=&source;}
     ++opens;++node->refCount;return node;
 }
 extern "C" void VfsClose(Vnode* node){assert(opens&&node->refCount<=1);--opens;node->refCount=0;}
@@ -100,19 +102,20 @@ int main(int argc,char** argv){
     record="BRKSTORE1 16777216 cf16f1ae-68c5-5fac-89e9-382b8af5cd5c\n";
     if(Is("header"))disk[1080]=0;
     if(Is("unclean"))disk[1082]=0;
-    uint8_t drive=3;const auto result=brook::WritableDesktopBootMount(&drive);auto info=brook::WritableDesktopRead();
+    uint8_t drive=3;const auto sourceVolume=scenario.rfind("system-",0)==0?brook::WritableDesktopSource::System:brook::WritableDesktopSource::Usb;
+    const auto result=brook::WritableDesktopBootMount(&drive,sourceVolume);auto info=brook::WritableDesktopRead();
     assert(!opens&&!roots);
-    const bool ready=Is("ready")||Is("clean-write")||Is("clean-flush");
+    const bool ready=Is("ready")||Is("system-ready")||Is("clean-write")||Is("clean-flush");
     if(ready){
         assert(result==brook::WritableDesktopBoot::Ready&&info.ready&&info.pinned&&info.dirty&&drive==4);
         assert(mounted&&homeBound&&bound&&leases==1&&source.refCount==1);
         assert(brook::WritableDesktopFinalSync()==-1&&!cleans);owner=true;
         assert(!brook::VfsSync(nullptr));const int error=brook::WritableDesktopFinalSync();info=brook::WritableDesktopRead();
-        if(Is("ready")){assert(!error&&info.clean&&!info.dirty&&brook::StoreGet16(disk.data()+1082)==1);}
+        if(Is("ready")||Is("system-ready")){assert(!error&&info.clean&&!info.dirty&&brook::StoreGet16(disk.data()+1082)==1);}
         else assert(error==-5&&!info.clean&&info.finalError==-5&&info.stateUncertain);
     } else {
         if(Is("absent"))assert(result==brook::WritableDesktopBoot::Absent&&!info.configured);
-        else if(Is("occupied")||Is("unmount")||Is("mount-cleanup"))assert(result==brook::WritableDesktopBoot::Maintenance);
+        else if(Is("occupied")||Is("unmount")||Is("mount-cleanup")||Is("system-no-marker")||Is("system-absent"))assert(result==brook::WritableDesktopBoot::Maintenance);
         else assert(result==brook::WritableDesktopBoot::Fallback);
         assert(!info.ready);const auto before=writes;owner=true;assert(!brook::WritableDesktopFinalSync()&&writes==before&&!cleans);
         if(Is("payload")||Is("home"))assert(unmounts==1&&!mounted&&!homeBound&&info.dirty);

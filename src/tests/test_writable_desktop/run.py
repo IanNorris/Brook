@@ -9,5 +9,5 @@ with tempfile.TemporaryDirectory(prefix='brook-writable-boot-') as temp:
         '-O','none,filetype,sparse_super,large_file','-U','cf16f1ae-68c5-5fac-89e9-382b8af5cd5c',str(image)],check=True)
     for scenario in ('absent','bad-config','no-marker','bad-marker','occupied','slot','target',
         'lease','header','unclean','dirty-write','dirty-flush','register','bind','mount',
-        'mount-cleanup','payload','unmount','home','ready','clean-write','clean-flush'):
+        'mount-cleanup','payload','unmount','home','ready','clean-write','clean-flush','system-ready','system-no-marker','system-absent'):
         subprocess.run([sys.argv[1],str(image),scenario],check=True,timeout=10)

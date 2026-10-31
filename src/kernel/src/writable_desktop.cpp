@@ -14,6 +14,7 @@ WritableDesktopSession session;
 Device* image=nullptr;
 int finalError=0;
 bool finalClean=false,finalUncertain=false,attempted=false;
+bool fallbackAllowed=true;
 int Read(void* p,uint64_t off,void* data,uint32_t n){auto* d=static_cast<Device*>(p);return d->ops->read(d,off,data,n);}
 int Write(void* p,uint64_t off,const void* data,uint32_t n){return DeviceWrite(static_cast<Device*>(p),off,data,n);}
 int Flush(void* p){return DeviceFlush(static_cast<Device*>(p));}
@@ -77,18 +78,26 @@ WritableDesktopBoot Fail(int error,bool mounted=false,bool publishFailed=false) 
             return WritableDesktopBoot::Maintenance;
         }
     }
-    KPrintf("writable desktop: unavailable stage=%s error=%d; use accepted RAM applications\n",info.stage,error);
-    return WritableDesktopBoot::Fallback;
+    KPrintf("writable desktop: unavailable stage=%s error=%d; %s\n",info.stage,error,
+            fallbackAllowed?"use accepted RAM applications":"system volume requires maintenance");
+    return fallbackAllowed?WritableDesktopBoot::Fallback:WritableDesktopBoot::Maintenance;
 }
 void DestroyPrivate() {
     if(image && !FatImageDeviceDestroyUnregistered(image)){image=nullptr;info.pinned=false;}
 }
 }
-WritableDesktopBoot WritableDesktopBootMount(uint8_t* nextDrive) {
+WritableDesktopBoot WritableDesktopBootMount(uint8_t* nextDrive,WritableDesktopSource sourceVolume) {
     if(attempted)return info.ready?WritableDesktopBoot::Ready:WritableDesktopBoot::Maintenance;
     attempted=true;
+    if(sourceVolume!=WritableDesktopSource::Usb && sourceVolume!=WritableDesktopSource::System) {
+        info.stage="source";info.error=-22;return WritableDesktopBoot::Maintenance;
+    }
+    fallbackAllowed=sourceVolume==WritableDesktopSource::Usb;
     auto* config=VfsOpen("/etc/writable-desktop",VFS_O_STREAM);
-    if(!config)return WritableDesktopBoot::Absent;
+    if(!config) {
+        if(fallbackAllowed)return WritableDesktopBoot::Absent;
+        info.stage="record";info.error=-2;return WritableDesktopBoot::Maintenance;
+    }
     VfsRelease(config);info.configured=true;
     info.stage="namespace";
     if(!NamespaceClear()){
@@ -97,7 +106,9 @@ WritableDesktopBoot WritableDesktopBootMount(uint8_t* nextDrive) {
     }
     WritableDesktopPlan plan{},ready{};
     info.stage="record";
-    if(!Record("/etc/writable-desktop",plan) || !Record("/media/usb/STORE.OK",ready) || !WritableDesktopPlanSame(plan,ready))return Fail(-22);
+    const char* markerPath=sourceVolume==WritableDesktopSource::System?"/media/system/STORE.OK":"/media/usb/STORE.OK";
+    const char* imagePath=sourceVolume==WritableDesktopSource::System?"/media/system/STORE.IMG":"/media/usb/STORE.IMG";
+    if(!Record("/etc/writable-desktop",plan) || !Record(markerPath,ready) || !WritableDesktopPlanSame(plan,ready))return Fail(-22);
     info.bytes=plan.bytes;
     info.stage="drive-slot";
     if(!nextDrive || !Ext2DriveAvailable(*nextDrive))return Fail(-16);
@@ -106,7 +117,7 @@ WritableDesktopBoot WritableDesktopBootMount(uint8_t* nextDrive) {
     // Writable FAT opens are uncached already. STREAM is a read-only policy
     // and intentionally cannot be combined with these RW lease admissions.
     info.stage="source";
-    auto* source=VfsOpen("/media/usb/STORE.IMG",VFS_O_WRITE|VFS_O_READWRITE);
+    auto* source=VfsOpen(imagePath,VFS_O_WRITE|VFS_O_READWRITE);
     if(!source)return Fail(-2);
     info.stage="lease";
     int error=0;image=FatImageDeviceCreate(source,plan.bytes,"desktop-image",&error);
