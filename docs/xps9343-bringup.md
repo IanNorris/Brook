@@ -1924,6 +1924,24 @@ and an independent extracted-file check (`atp3`, `atp4`). These tests are not
 an installer, a crash-recovery guarantee, or authority to deploy a writable
 record to physical hardware before the full installation rehearsal.
 
+The SATA-only UEFI baseline exposed firmware-left receive engines on unused
+ports. Brook now checks every implemented port for active commands before
+changing AHCI registers, disables interrupts, stops idle firmware engines,
+rechecks quiescence, and only then disables bus mastering and installs its own
+DMA pointers. Firmware memory remains reserved. A task-file value from an
+initially fully stopped port can be stale; Brook still requires a bounded
+ready check after starting its own receive engine before issuing IDENTIFY.
+Failures do not restart firmware engines or recycle DMA memory.
+
+`scripts/test_hardware_sata_uefi_boot.py` builds a private SATA ESP and boots
+it through OVMF without USB storage. The final run reached the Brook desktop,
+identified the SATA disk read-only, matched five sectors against the source,
+performed checked shutdown and left the source hash unchanged
+(`build/hardware/asb6`). USB-boot SATA ext2 create, fresh-boot verification and
+offline `e2fsck` also passed after the handoff change (`ath2`, `ath3`). This
+baseline does not yet mount the application store from SATA or test an
+installer; the Dell has not been updated with this handoff implementation.
+
 The test-only kernel can also discover a GPT partition on the identified
 scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload
 created and fsynced a 150123-byte file, renamed it, and fsynced its directory.

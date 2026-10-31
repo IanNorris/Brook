@@ -132,7 +132,9 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         for (uint32_t i=0;i<a.portCount;++i) {
             const auto& p=a.ports[i];if(i)r.text(",");r.text("{");r.field("index",p.index);
             r.text(",");r.field("status",p.status);r.text(",");r.field("signature",p.signature);
-            r.text(",");r.field("command",p.command);r.text(",");r.field("task_file",p.taskFile);r.text("}");
+            r.text(",");r.field("command",p.command);r.text(",");r.field("task_file",p.taskFile);
+            r.text(",");r.field("issue",p.issue);r.text(",");r.field("active",p.active);
+            r.text(",");r.field("interrupt_enable",p.interruptEnable);r.text("}");
         }
         r.text("]}\n");r.send();return true;
     }

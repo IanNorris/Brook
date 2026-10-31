@@ -2,6 +2,7 @@
 #include "ahci_observe.h"
 #include "ahci_read_plan.h"
 #include "ahci_readonly_sequence.h"
+#include "ahci_firmware_handoff.h"
 #include "ahci_write_plan.h"
 #include "ahci_byte_write.h"
 #include "ahci_write_target.h"
@@ -52,8 +53,9 @@ struct Prdt { uint32_t low, high, reserved, byteCountMinusOne; };
 static_assert(sizeof(Prdt)==16,"AHCI PRDT size");
 
 struct PortIo {
-    uint32_t read(uint32_t offset) { return portRegs[offset/4]; }
-    void write(uint32_t offset,uint32_t value) { portRegs[offset/4]=value; }
+    volatile uint32_t* regs=nullptr;
+    uint32_t read(uint32_t offset) { return regs[offset/4]; }
+    void write(uint32_t offset,uint32_t value) { regs[offset/4]=value; }
     void fence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
     uint32_t transferred() {
         auto* hdr=reinterpret_cast<CommandHeader*>(dma);
@@ -84,6 +86,14 @@ struct PortIo {
         return false;
     }
 } io;
+struct HandoffIo {
+    PortIo port(uint32_t i) { return PortIo{hba+(0x100+i*0x80)/4}; }
+    bool disableInterrupts() {
+        const uint32_t ghc=hba[1];if(ghc==0xffffffffu || !(ghc&0x80000000u) || (ghc&1u))return false;
+        hba[1]=ghc&~2u;__atomic_thread_fence(__ATOMIC_SEQ_CST);
+        return ControllerModeReady(hba[1]);
+    }
+};
 
 void PciCommand(uint16_t value) {
     // Avoid echoing adjacent PCI status W1C bits.
@@ -225,24 +235,33 @@ void AhciReadOnlyInit() {
             }
         }
     }
-    // No global reset or link reset. Refuse all firmware-active engines and
-    // require exactly one active link before replacing any DMA pointers.
+    // No global or link reset. Require one active link, and stop only idle
+    // firmware engines before replacing any DMA pointers.
     uint32_t selected=0,active=0;const uint32_t maxPorts=(cap&31u)+1;
     for(uint32_t i=0;i<maxPorts;++i) if(pi&(1u<<i)) {
         auto* p=hba+(0x100+i*0x80)/4;
         const uint32_t cmd=p[CMD/4],ci=p[CI/4],sact=p[SACT/4],link=p[0x28/4];
-        if(cmd==0xffffffffu || ci==0xffffffffu || sact==0xffffffffu || link==0xffffffffu ||
-           (cmd&(ST|FRE|CR|FR)) || ci || sact) {
-            PciCommand(original);status.reason="AHCI port is not idle";return;
+        if(cmd==0xffffffffu || ci==0xffffffffu || sact==0xffffffffu || link==0xffffffffu) {
+            PciCommand(original);status.reason="AHCI port registers unavailable";return;
         }
         if((link&15u)==3 && ((link>>8)&15u)==1) {selected=i;++active;}
     }
     if(active!=1){PciCommand(original);status.reason="expected one active SATA link";return;}
+    HandoffIo handoff;uint32_t failurePort=0;
+    const auto stopped=QuiesceFirmware(handoff,pi,maxPorts,failurePort);
+    if(stopped!=HandoffResult::Ok) {
+        status.port=failurePort;
+        status.reason=stopped==HandoffResult::CommandsActive?"AHCI firmware command active":
+            stopped==HandoffResult::DeviceBusy?"AHCI firmware device busy":
+            stopped==HandoffResult::Interrupts?"AHCI interrupt handoff failed":
+            stopped==HandoffResult::StopFailed?"AHCI firmware engine did not stop":"AHCI firmware state invalid";
+        return;
+    }
     PciCommand(uint16_t((original|2u)&~4u));
     if(PciConfigRead16(pci.bus,pci.dev,pci.fn,4)!=uint16_t((original|2u)&~4u)) {
         PciCommand(original);status.reason="AHCI bus mastering could not be disabled";return;
     }
-    status.port=selected;portRegs=hba+(0x100+selected*0x80)/4;dma64=(cap&(1u<<31))!=0;
+    status.port=selected;portRegs=hba+(0x100+selected*0x80)/4;io.regs=portRegs;dma64=(cap&(1u<<31))!=0;
     const auto phys=PmmAllocPages(pages,MemTag::Device,KernelPid);
     if(!phys){PciCommand(original);status.reason="AHCI DMA allocation failed";return;}
     dmaPhys=phys.raw();

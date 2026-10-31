@@ -3,7 +3,7 @@
 
 namespace brook {
 struct BootProtocol;
-struct AhciObservedPort { uint32_t index, status, signature, command, taskFile; };
+struct AhciObservedPort { uint32_t index, status, signature, command, taskFile, issue, active, interruptEnable; };
 struct AhciObservation {
     bool requested, valid;
     const char* reason = "not requested";
@@ -55,6 +55,7 @@ template<class Io> void AhciObserveRegisters(Io& io, AhciObservation& out) {
             auto& p=out.ports[out.portCount++];const uint32_t off=0x100+i*0x80;
             p.index=i;p.status=io.read(off+0x28);p.signature=io.read(off+0x24);
             p.command=io.read(off+0x18);p.taskFile=io.read(off+0x20);
+            p.issue=io.read(off+0x38);p.active=io.read(off+0x34);p.interruptEnable=io.read(off+0x14);
         }
         out.valid=true;out.reason="read-only register snapshot";
     } else out.reason="invalid AHCI capability or port map";

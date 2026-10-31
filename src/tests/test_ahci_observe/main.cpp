@@ -6,7 +6,7 @@ struct Mock {
     bool lostReadback=false,failRestore=false;
     uint16_t command() {if(lostReadback && writes==1){lostReadback=false;return 0xffff;}return cmd;}
     void command(uint16_t v) {++writes;if ((v^cmd)&4)busMasterChanged=true;if((!refuse || !(v&2)) && !(failRestore && writes==2))cmd=v;}
-    uint32_t read(uint32_t off) {++reads;if(off==0)return 5;if(off==0x0c)return 1;if(off==0x10)return 0x10300;if(off==0x128)return 0x103;if(off==0x124)return 0x101;return 0;}
+    uint32_t read(uint32_t off) {++reads;if(off==0)return 5;if(off==0x0c)return 1;if(off==0x10)return 0x10300;if(off==0x128)return 0x103;if(off==0x124)return 0x101;if(off==0x138)return 4;if(off==0x134)return 8;if(off==0x114)return 16;return 0;}
 };
 int main() {
     uint64_t base=0;
@@ -23,6 +23,7 @@ int main() {
     Mock good;AhciObservation observed{};AhciObserveRegisters(good,observed);
     assert(observed.valid && observed.portCount==1 && observed.ports[0].status==0x103);
     assert(observed.ports[0].signature==0x101 && good.cmd==0 && good.writes==2 && !good.busMasterChanged);
+    assert(observed.ports[0].issue==4 && observed.ports[0].active==8 && observed.ports[0].interruptEnable==16);
     Mock fail;fail.refuse=true;AhciObservation rejected{};AhciObserveRegisters(fail,rejected);
     assert(!rejected.valid && fail.reads==0 && fail.cmd==0 && fail.writes==2 && !fail.busMasterChanged);
     Mock active;active.cmd=4;AhciObservation held{};AhciObserveRegisters(active,held);
