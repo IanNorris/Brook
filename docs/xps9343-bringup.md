@@ -2379,6 +2379,14 @@ are retained in `build/hardware/dell-firefox-https-review-20261031/`. The user
 has been asked to inspect the Dell when available. Browser interactivity,
 downloads, clean process exit and Chromium acceptance remain unproven.
 
+The phone scanner on port 9001 was subsequently found using an older kernel
+ELF. Its decoder was restarted with the exact kernel from the last confirmed
+Dell boot (`dell-audio-cache-update-20261031`, boot ID beginning `cdb35772`),
+and its HTTPS health endpoint passed. Its current log is
+`build/hardware/panic-receiver-current-20261031.log`. This symbol selection is
+valid only if the Dell is still running that kernel; a later A/B reboot or
+update requires checking the boot receipt and changing the decoder ELF.
+
 A comparison using the same Dell kernel/initrd and a private writable USB QEMU
 image loaded `https://example.com/` in Firefox twice. Each window displayed the
 expected page title, was closed through the compositor, and the corresponding
