@@ -731,6 +731,28 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     uint32_t vioCount = brook::VirtioBlkInitAll();
     // Shared pdrv counter: 0 = ramdisk, 1+ = everything else.
     uint8_t nextPdrv = 1;
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    // Only the identified disposable QEMU fixture can reach this path. This
+    // mount is for filesystem integration tests, not SSD boot admission.
+    if (brook::AhciDisposableQemuWritable()) {
+        auto* disk=brook::DeviceFind("ahci0");
+        const uint32_t parts=disk?brook::GptProbeDevice(disk):0;
+        auto* part=parts==1?brook::DeviceFind("ahci0p1"):nullptr;
+        brook::VfsPath root{};
+        int result=brook::VfsPathRoot(&root);
+        if(!result) {
+            brook::VnodeStat st{};result=brook::VfsStatAt(root,root,"/mnt/ahcitest",&st);
+            if(!result && !st.isDir)result=-20;
+            brook::VfsPathRelease(root);
+        }
+        const bool bound=!result && part && Ext2BindDevice(nextPdrv,part);
+        const bool mounted=bound && brook::VfsMountConfigured("/mnt/ahcitest","ext2",nextPdrv,0);
+        if(bound)++nextPdrv; // bindings stay occupied even when mounting fails
+        if(mounted) {
+            brook::SerialPuts("AHCI_QEMU_EXT2_MOUNTED\n");
+        } else brook::SerialPrintf("AHCI_QEMU_EXT2_NOT_MOUNTED path=%d parts=%u part=%u bound=%u\n",result,parts,part?1u:0u,bound?1u:0u);
+    }
+#endif
     if (vioCount > 0)
     {
         brook::KPrintf("virtio: found %u device(s)\n", vioCount);

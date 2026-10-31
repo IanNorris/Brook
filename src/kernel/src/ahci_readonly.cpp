@@ -316,6 +316,7 @@ int AhciReadOnlySector(uint64_t lba,void* output) {
     return ok?512:-5;
 }
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+bool AhciDisposableQemuWritable() { return testWritable && __atomic_load_n(&published,__ATOMIC_ACQUIRE); }
 int AhciDisposableQemuTest() {
     if(!testWritable)return -30;
     uint8_t bytes[1030];for(uint32_t i=0;i<sizeof(bytes);++i)bytes[i]=uint8_t((i*37u+11u)&255u);

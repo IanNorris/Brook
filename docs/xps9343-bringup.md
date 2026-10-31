@@ -1905,3 +1905,13 @@ write when the marker was absent. A disk with the wrong serial was also refused.
 The original fixture hash remained unchanged. These results validate a bounded
 test path, not a general writable driver, filesystem crash consistency, or SSD
 installation. Evidence: `build/hardware/atw3`, `atw4`, and `atw5`.
+
+The test-only kernel can also discover a GPT partition on the identified
+scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload
+created and fsynced a 150123-byte file, renamed it, and fsynced its directory.
+After checked shutdown, a new QEMU process verified its contents and EOF.
+Independent host `e2fsck -fn` checks after both boots passed, and `debugfs`
+extracted the file for a host-side byte comparison. The source fixture hash
+was unchanged. Evidence is in `build/hardware/atf3` and `atf4`; the workload
+and boot hook are for the opt-in disposable-QEMU kernel only. This does not
+yet prove general filesystem crash recovery or booting from an SSD.
