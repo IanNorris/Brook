@@ -19,6 +19,7 @@ p.add_argument('--capture-network',action='store_true',help='Record the private 
 p.add_argument('--allow-host-network',action='store_true',help='Permit QEMU user-network access to an explicit test server')
 p.add_argument('--sata-image',type=Path,help='Attach a regular-file SATA fixture with a disposable QEMU snapshot overlay')
 p.add_argument('--sata-qemu-scratch',type=Path,help='Copy a 64 MiB fixture into this test output and attach the copy writable with a test-only serial')
+p.add_argument('--installer-source',type=Path,help='Copy a 64 MiB regular-file source into the private USB fixture for the test-only installer')
 a=p.parse_args();desktop=a.desktop.resolve(strict=True);maintenance=a.maintenance.resolve(strict=True);out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
 if not (640<=a.width<=4096 and 480<=a.height<=2160):p.error('Private test display must be 640..4096 by 480..2160')
 m=json.loads((desktop/'manifest.json').read_text());mm=json.loads((maintenance/'manifest.json').read_text())
@@ -37,6 +38,11 @@ if a.private_disk_mib:
     for child in staging.iterdir():run('mcopy','-s','-i',str(disk)+'@@1048576',child,'::/')
     shutil.rmtree(staging)
 else:run('cp','--reflink=auto',maintenance/'probe.raw',disk)
+if a.installer_source:
+    if not a.sata_qemu_scratch:p.error('installer source requires the private SATA scratch fixture')
+    if a.installer_source.is_symlink() or not a.installer_source.is_file() or a.installer_source.stat().st_size!=64*1024**2:
+        p.error('installer source must be a regular 64 MiB file')
+    run('mcopy','-o','-i',str(disk)+'@@1048576',a.installer_source,'::INSTALL.IMG')
 kernel=(desktop/'kernel.elf').read_bytes();initrd=(desktop/'INITRD.IMG').read_bytes()
 for name,capacity,data in [('KERNEL.ELF',KERNEL_MAX,kernel),('INITRD.IMG',INITRD_MAX,initrd)]:
     path=out/name
@@ -98,7 +104,13 @@ try:
         assert time.monotonic()<end,'Semantic review timed out'
         time.sleep(.2)
     reviewed=json.loads((out/'finish.json').read_text())
-    shutdown=uuid.uuid4().hex;state=rpc.tool('hw_power',{'session':session,'request_id':shutdown,'operation':'shutdown'});end=time.monotonic()+90
+    shutdown=reviewed.get('shutdown_request_id')
+    if shutdown:
+        assert len(shutdown)==32 and all(c in '0123456789abcdef' for c in shutdown)
+        state=rpc.tool('hw_power',{'session':session,'request_id':shutdown,'operation':'status'})
+    else:
+        shutdown=uuid.uuid4().hex;state=rpc.tool('hw_power',{'session':session,'request_id':shutdown,'operation':'shutdown'})
+    end=time.monotonic()+180
     while state['state']!='ready':
         assert state['state']!='failed' and time.monotonic()<end,state
         state=rpc.tool('hw_power',{'session':session,'request_id':shutdown,'operation':'status'});time.sleep(.1)

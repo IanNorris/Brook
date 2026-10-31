@@ -77,6 +77,15 @@ static bool FatFsDeviceReady(uint8_t pdrv, Device** out)
     return true;
 }
 
+Device* FatFsBoundDevice(uint8_t pdrv)
+{
+    if(pdrv>=FATFS_MAX_DRIVES)return nullptr;
+    const auto flags=IrqSpinLockAcquire(&g_driveLock);
+    Device* result=g_fatfsDrives[pdrv];
+    IrqSpinLockRelease(&g_driveLock,flags);
+    return result;
+}
+
 bool FatFsBindDrive(uint8_t pdrv, Device* dev)
 {
     bool registered = DeviceIsRegistered(dev);

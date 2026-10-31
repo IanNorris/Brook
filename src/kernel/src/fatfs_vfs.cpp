@@ -1517,6 +1517,14 @@ int FatFsImageFlush(FatImageLease* lease)
     KMutexUnlock(&g_fatLock);
     return error;
 }
+Device* FatFsImageLeaseDevice(FatImageLease* lease)
+{
+    if(!lease)return nullptr;
+    KMutexLock(&g_fatLock);
+    auto* file=static_cast<FatOpenFile*>(lease->owner->priv);
+    Device* device=file && file->imageLease==lease?FatFsBoundDevice(file->mount->pdrv):nullptr;
+    KMutexUnlock(&g_fatLock);return device;
+}
 int FatFsReleaseImageLease(FatImageLease* lease)
 {
     if(!lease)return -22;

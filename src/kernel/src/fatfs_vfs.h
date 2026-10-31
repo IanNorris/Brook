@@ -8,6 +8,7 @@ namespace brook {
 
 struct Vnode;
 struct FatImageLease;
+struct Device;
 void FatFsVfsRegister();
 // True only for a streaming regular FIL whose retained drive binding is immutable.
 bool FatFsFileSourceReadOnly(Vnode* node);
@@ -20,6 +21,8 @@ int FatFsAcquireImageLease(Vnode* node, uint64_t bytes, FatImageLease** out);
 int FatFsImageRead(FatImageLease* lease, uint64_t offset, void* out, uint32_t bytes);
 int FatFsImageWrite(FatImageLease* lease, uint64_t offset, const void* in, uint32_t bytes);
 int FatFsImageFlush(FatImageLease* lease);
+// Borrowed backing binding while the lease is retained.
+Device* FatFsImageLeaseDevice(FatImageLease* lease);
 // No concurrent callers or published filesystem/device may remain. On error
 // the lease stays valid and pinned; never discard dirty state after failed sync.
 // Release performs VFS finalization outside the FAT mutex.

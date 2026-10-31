@@ -2005,8 +2005,24 @@ copying and makes all failures terminal. Host tests inject short I/O, failures
 at every operation and corrupted readback, including during payload and GPT
 verification. The engine also copied an independent `sfdisk` fixture to a new
 regular file; host verification checked GPT, payload and an untouched-gap
-sentinel. These are host-side tests: the engine has no guest-facing installer
-API and has not been run against a QEMU disk or the Dell.
+sentinel.
+
+A separate, compile-gated QEMU test kernel now exercises the engine in a
+one-shot worker against an exact-identity disposable 64 MiB SATA disk. It pins
+an exclusive lease on the USB-hosted source image, rejects another start, and
+holds shutdown until the worker finishes. The normal kernel has no installer
+debug commands. A missing source failed without changing the destination; a
+deliberately paused install held shutdown in cleanup until it completed
+(`build/hardware/asi5`, `asi7`). Host checks verified the final GPT and FAT,
+payload and untouched gaps. A fresh VM booted the resulting SATA disk without
+USB storage (`build/hardware/aib2`). This fixture contains boot files and the
+kernel desktop only, not the full application store.
+
+This is not a physical installer: the USB-name check is specific to the test
+fixture and does not establish general device ancestry. Production target and
+source identity, payload authenticity, failure recovery and a full-size image
+still require implementation and validation. No internal SSD write has
+occurred on the Dell, and its USB recovery remains the boot path.
 
 The test-only kernel can also discover a GPT partition on the identified
 scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload

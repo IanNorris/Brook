@@ -24,5 +24,7 @@ int FatFsFlushDrive(uint8_t pdrv);
 bool FatFsAcquireDrive(uint8_t pdrv, bool* readOnly);
 void FatFsReleaseDrive(uint8_t pdrv);
 bool FatFsDriveReadOnly(uint8_t pdrv);
+// Borrowed boot-lifetime binding; caller retains the FAT mount/lease.
+Device* FatFsBoundDevice(uint8_t pdrv);
 
 } // namespace brook

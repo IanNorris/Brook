@@ -15,6 +15,7 @@
 #include "ahci_observe.h"
 #include "ahci_readonly.h"
 #include "writable_desktop.h"
+#include "ssd_install_qemu.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -95,6 +96,18 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
     }
     constexpr char pciPrefix[]="bridge hardware pci ";
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(!strcmp(command,"bridge hardware ahci-qemu-install begin")) {
+        DebugChannelSend(SsdQemuInstallBegin()?"{\"install_test\":\"started\"}\n":"{\"install_test\":\"refused\"}\n");return true;
+    }
+    if(!strcmp(command,"bridge hardware ahci-qemu-install status")) {
+        const auto s=SsdQemuInstallStatus();Reply r;r.text("{\"install_test\":1,");r.field("state",s.state);
+        r.text(",");r.field("stage",s.stage);r.text(",");r.field("operations",s.operations);
+        r.text(",\"error\":");if(s.error<0){r.text("-");r.number(-int64_t(s.error));}else r.number(s.error);
+        r.text(",\"paused\":");r.text(s.paused?"true":"false");r.text("}\n");r.send();return true;
+    }
+    if(!strcmp(command,"bridge hardware ahci-qemu-install resume")) {
+        DebugChannelSend(SsdQemuInstallResume()?"{\"install_test\":\"resumed\"}\n":"{\"install_test\":\"not_paused\"}\n");return true;
+    }
     if(!strcmp(command,"bridge hardware ahci-qemu-write-test")) {
         const int result=AhciDisposableQemuTest();
         DebugChannelSend(result==0?"{\"ahci_qemu_write\":\"ok\"}\n":"{\"ahci_qemu_write\":\"failed\"}\n");

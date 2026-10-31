@@ -35,6 +35,7 @@ bool published=false;
 bool writeEnabled=false; // immutable after registration, even if quarantined
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool testWritable=false;
+bool testInstallMode=false;
 bool TestKvm() {
     uint32_t a,b,c,d;
     __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(0x40000000u),"c"(0));
@@ -310,6 +311,10 @@ void AhciReadOnlyInit() {
     testWritable=AhciDisposableTestAdmission(markerPresent || writeEnabled,TestKvm(),selected,info,
         AtaSupportsFlushExt(dma+dataOffset,512));
     writeEnabled=writeEnabled || testWritable;
+    if(testWritable) {
+        auto* installMarker=VfsOpen("/etc/ahci-qemu-install-test");
+        testInstallMode=installMarker!=nullptr;if(installMarker)VfsClose(installMarker);
+    }
 #endif
     KMutexInit(&ioLock);
     if(!DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
@@ -326,6 +331,9 @@ AhciReadOnlyStatus AhciReadOnlyGetStatus() {
 }
 Device* AhciWriteAdmittedDevice() {
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
+#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(testInstallMode)return nullptr; // reserve the test target from boot mounts
+#endif
     KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);
     return result;
 }
@@ -338,9 +346,13 @@ int AhciReadOnlySector(uint64_t lba,void* output) {
     return ok?512:-5;
 }
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-bool AhciDisposableQemuWritable() { return testWritable && __atomic_load_n(&published,__ATOMIC_ACQUIRE); }
+bool AhciDisposableQemuWritable() { return testWritable && !testInstallMode && __atomic_load_n(&published,__ATOMIC_ACQUIRE); }
+Device* AhciDisposableQemuInstallDevice() {
+    if(!testWritable || !testInstallMode || !__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
+    KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);return result;
+}
 int AhciDisposableQemuTest() {
-    if(!testWritable)return -30;
+    if(!testWritable || testInstallMode)return -30;
     uint8_t bytes[1030];for(uint32_t i=0;i<sizeof(bytes);++i)bytes[i]=uint8_t((i*37u+11u)&255u);
     const int written=DeviceWrite(&device,4096ull*512+7,bytes,sizeof(bytes));
     return written==int(sizeof(bytes)) ? DeviceFlush(&device) : -5;
