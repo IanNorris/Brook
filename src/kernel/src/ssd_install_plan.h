@@ -12,10 +12,10 @@ inline bool SsdInstallGeometryValid(const SsdInstallGeometry& g) {
         g.payloadFirst<g.diskSectors-33 && g.payloadSectors &&
         g.payloadSectors<=g.diskSectors-33-g.payloadFirst;
 }
-enum class SsdInstallAction : uint8_t { Zero,Copy,Verify,Flush,Done,Failed };
+enum class SsdInstallAction : uint8_t { Zero,Copy,Verify,VerifyZero,Flush,Done,Failed };
 struct SsdInstallOperation {SsdInstallAction action;uint64_t lba;uint32_t sectors;};
 enum class SsdInstallStage : uint8_t {
-    InvalidateBackup,InvalidatePrimary,Payload,VerifyPayload,Backup,VerifyBackup,
+    InvalidateBackup,VerifyInvalidBackup,InvalidatePrimary,VerifyInvalidPrimary,Payload,VerifyPayload,Backup,VerifyBackup,
     Primary,VerifyPrimary,Activate,VerifyActivation,Complete,Failed
 };
 class SsdInstallPlan {
@@ -30,8 +30,8 @@ class SsdInstallPlan {
     }
     void Range(uint64_t& first,uint64_t& count) const {
         switch(stage_) {
-        case SsdInstallStage::InvalidateBackup:first=geometry_.diskSectors-1;count=1;break;
-        case SsdInstallStage::InvalidatePrimary:first=0;count=34;break;
+        case SsdInstallStage::InvalidateBackup:case SsdInstallStage::VerifyInvalidBackup:first=geometry_.diskSectors-1;count=1;break;
+        case SsdInstallStage::InvalidatePrimary:case SsdInstallStage::VerifyInvalidPrimary:first=0;count=34;break;
         case SsdInstallStage::Payload:case SsdInstallStage::VerifyPayload:
             first=geometry_.payloadFirst;count=geometry_.payloadSectors;break;
         case SsdInstallStage::Backup:case SsdInstallStage::VerifyBackup:first=geometry_.diskSectors-33;count=33;break;
@@ -51,7 +51,8 @@ public:
         if(flush_)return {SsdInstallAction::Flush,0,0};
         uint64_t first=0,count=0;Range(first,count);const uint64_t left=count-cursor_;
         const auto action=stage_==SsdInstallStage::InvalidateBackup || stage_==SsdInstallStage::InvalidatePrimary ?
-            SsdInstallAction::Zero : Writes(stage_)?SsdInstallAction::Copy:SsdInstallAction::Verify;
+            SsdInstallAction::Zero : stage_==SsdInstallStage::VerifyInvalidBackup || stage_==SsdInstallStage::VerifyInvalidPrimary ?
+            SsdInstallAction::VerifyZero : Writes(stage_)?SsdInstallAction::Copy:SsdInstallAction::Verify;
         return {action,first+cursor_,uint32_t(left>128?128:left)};
     }
     // success means the caller has completed precisely this operation. Verify

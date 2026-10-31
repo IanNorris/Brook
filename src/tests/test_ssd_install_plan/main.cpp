@@ -40,7 +40,8 @@ int main(int argc,char** argv){
         actions.push_back(op);assert(p.Finish(op,true));assert(actions.size()<200);}
     assert(actions[0].action==SsdInstallAction::Zero && actions[0].lba==9999);
     assert(actions[1].action==SsdInstallAction::Flush);
-    assert(actions[2].action==SsdInstallAction::Zero && actions[2].lba==0 && actions[2].sectors==34);
+    assert(actions[2].action==SsdInstallAction::VerifyZero && actions[2].lba==9999);
+    assert(actions[3].action==SsdInstallAction::Zero && actions[3].lba==0 && actions[3].sectors==34);
     bool payloadVerified=false,backupVerified=false,primaryVerified=false,activation=false;
     std::vector<uint8_t> disk(geometry.diskSectors,0xa5),source(geometry.diskSectors),touched(geometry.diskSectors);
     for(size_t i=0;i<source.size();++i)source[i]=uint8_t((i*37+9)&255);
@@ -50,7 +51,7 @@ int main(int argc,char** argv){
         if(op.action==SsdInstallAction::Verify && op.lba==1)primaryVerified=true;
         if(op.action==SsdInstallAction::Copy && op.lba==geometry.diskSectors-33)assert(payloadVerified);
         if(op.action==SsdInstallAction::Copy && op.lba==0){assert(payloadVerified&&backupVerified&&primaryVerified);activation=true;}
-        if(op.action==SsdInstallAction::Copy || op.action==SsdInstallAction::Verify || op.action==SsdInstallAction::Zero)
+        if(op.action==SsdInstallAction::Copy || op.action==SsdInstallAction::Verify || op.action==SsdInstallAction::Zero || op.action==SsdInstallAction::VerifyZero)
             assert(op.sectors && op.sectors<=128 && op.lba<geometry.diskSectors && op.sectors<=geometry.diskSectors-op.lba);
         for(uint32_t i=0;i<op.sectors;++i){const auto sector=op.lba+i;
             const bool allowed=sector<34 || (sector>=geometry.payloadFirst && sector<geometry.payloadFirst+geometry.payloadSectors) ||
@@ -58,7 +59,8 @@ int main(int argc,char** argv){
             assert(allowed);
             if(op.action==SsdInstallAction::Zero){disk[sector]=0;touched[sector]=1;}
             if(op.action==SsdInstallAction::Copy){disk[sector]=source[sector];touched[sector]=1;}
-            if(op.action==SsdInstallAction::Verify)assert(disk[sector]==source[sector]);}
+            if(op.action==SsdInstallAction::Verify)assert(disk[sector]==source[sector]);
+            if(op.action==SsdInstallAction::VerifyZero)assert(disk[sector]==0);}
     }
     for(size_t i=0;i<disk.size();++i){const bool allowed=i<34 || (i>=geometry.payloadFirst && i<geometry.payloadFirst+geometry.payloadSectors) ||
         i>=geometry.diskSectors-33;if(!allowed){assert(!touched[i]);assert(disk[i]==0xa5);}}

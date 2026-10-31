@@ -1995,6 +1995,19 @@ receiver and independent readback must be implemented before use. Planner tests
 cover ordering, boundary geometry, failure at every operation, untouched gaps,
 and a GPT produced independently by `sfdisk`.
 
+The installer preflight now checks exact source/target capacity and 512-byte
+sectors, canonical table positions and sizes, both GPT checksums/copies, and a
+single EFI partition matching the complete planned payload range. It does not
+validate FAT contents, boot files, installer target selectors, or source
+ownership. An unconnected execution engine performs bounded copy, flush and
+readback steps; it verifies that old GPT signatures were cleared before
+copying and makes all failures terminal. Host tests inject short I/O, failures
+at every operation and corrupted readback, including during payload and GPT
+verification. The engine also copied an independent `sfdisk` fixture to a new
+regular file; host verification checked GPT, payload and an untouched-gap
+sentinel. These are host-side tests: the engine has no guest-facing installer
+API and has not been run against a QEMU disk or the Dell.
+
 The test-only kernel can also discover a GPT partition on the identified
 scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload
 created and fsynced a 150123-byte file, renamed it, and fsynced its directory.
