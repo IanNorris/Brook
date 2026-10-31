@@ -13,9 +13,10 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   8086:9c83 SATA port 3: 500,118,192 logical sectors of 512 bytes. Record the
   exact ATA serial and physical sector size privately from a fresh boot; do not
   infer them from this model name or commit them to Git.
-- The last read-only inventory found a legacy MBR with one active Linux
-  partition. This was not a filesystem health check. The SSD has not been
-  written by Brook.
+- The initial read-only inventory found a legacy MBR with one active Linux
+  partition. That was not a filesystem health check. The explicitly authorized
+  physical installation has since replaced the partition table and written the
+  Brook image; the old Ubuntu contents were not backed up.
 - A disposable QEMU SATA disk with the same logical capacity received a 6 GiB
   desktop partition and booted without USB. A separate clone passed two checked
   boots and application-store persistence plus offline GPT/FAT/ext2 checks.
@@ -33,6 +34,12 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   A copy of the Dell candidate, with only the identity adapted for QEMU and
   its test helper replaced, passed the same checks. Neither is physical SSD
   write/flush acceptance or proof of arbitrary power-loss recovery.
+- On the Dell, the identity-bound installer verified the complete source,
+  completed 196,624 copy, verification and metadata operations, and reported
+  success with no error. A checked reboot selected the still-connected USB;
+  it did not establish SSD boot. The guest reached a clean, safe-to-power-off
+  state, but its power-off method is unsupported. A manual power-off and boot
+  with USB removed is needed to verify the installed SSD.
 
 ## Remaining engineering gates
 
