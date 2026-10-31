@@ -11,6 +11,7 @@ struct Mock {
     void write(uint32_t off,uint32_t value){++writes;if(off==IS || off==SERR)regs[off/4]&=~value;else if(off==ignoredOffset){}else if(off==CMD && ignoreStop && !(value&ST)){}else if(off==CMD && ignoreFisStop && !(value&FRE)){}else regs[off/4]=value;if(off==CMD && unavailableAfterWrite)regs[off/4]=0xffffffffu;}
     void fence(){++fences;}
     bool waitClear(uint32_t off,uint32_t mask){if((off==CI&&stuckCi)||(mask==CR&&stuckCr)||(mask==FR&&stuckFr))return false;regs[off/4]&=~mask;if(off==CI)regs[IS/4]|=injectIs;return true;}
+    bool waitClearFlush(uint32_t off,uint32_t mask){return waitClear(off,mask);}
     uint32_t transferred(){return transferredBytes;}
 };
 int main(){
@@ -35,5 +36,14 @@ int main(){
     Mock unavailable;unavailable.unavailableAfterWrite=true;assert(Start(unavailable)==Result::DeviceError);
     Mock shortIo;shortIo.transferredBytes=511;assert(Submit(shortIo,512)==Result::ShortTransfer);
     Mock error;error.regs[TFD/4]=1;assert(Submit(error,512)==Result::DeviceError);
+    Mock flush;flush.transferredBytes=0;flush.regs[CMD/4]=ST|FRE;flush.injectIs=1;assert(SubmitNoData(flush)==Result::Ok);
+    Mock flushTimeout;flushTimeout.regs[CMD/4]=ST|FRE;flushTimeout.stuckCi=true;assert(SubmitNoData(flushTimeout)==Result::Timeout);
+    Mock flushError;flushError.regs[CMD/4]=ST|FRE;flushError.injectIs=1|(1u<<30);assert(SubmitNoData(flushError)==Result::DeviceError);
+    Mock flushUnexpected;flushUnexpected.regs[CMD/4]=ST|FRE;flushUnexpected.injectIs=1;assert(SubmitNoData(flushUnexpected)==Result::ShortTransfer);
+    Mock flushBusy;flushBusy.regs[CMD/4]=ST|FRE;flushBusy.regs[CI/4]=1;assert(SubmitNoData(flushBusy)==Result::Busy && flushBusy.writes==0);
+    Mock flushStopped;assert(SubmitNoData(flushStopped)==Result::DeviceError && flushStopped.writes==0);
+    Mock flushMissing;flushMissing.regs[CMD/4]=ST|FRE;flushMissing.transferredBytes=0;assert(SubmitNoData(flushMissing)==Result::DeviceError);
+    Mock flushIgnored;flushIgnored.regs[CMD/4]=ST|FRE;flushIgnored.ignoredOffset=CI;flushIgnored.transferredBytes=0;assert(SubmitNoData(flushIgnored)==Result::DeviceError);
+    Mock flushFault;flushFault.regs[CMD/4]=ST|FRE;flushFault.regs[TFD/4]=0x20;flushFault.injectIs=1;assert(SubmitNoData(flushFault)==Result::DeviceError);
     for(uint32_t bit:{24u,27u,28u,29u,30u}){Mock fatal;fatal.injectIs=1u<<bit;assert(Submit(fatal,512)==Result::DeviceError);}
 }

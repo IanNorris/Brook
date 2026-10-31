@@ -1882,3 +1882,11 @@ and the final sector do not contain GPT headers. This is an inventory, not a
 filesystem integrity check. The SSD has not been written. USB recovery remains
 in place; a QEMU-validated writable SATA driver and installation procedure
 are still required before installation.
+
+Write preparation currently consists of pure WRITE DMA EXT and FLUSH CACHE
+EXT command planners, capability admission, a bounded byte-write helper, and
+a no-data completion checker. They are not connected to the live read-only
+driver. Host tests cover request bounds, randomized unaligned writes against
+an oracle, failed prereads and uncertain writes, and flush failure evidence.
+Actual writable integration, serialization, durability, QEMU disk persistence,
+and full-disk installation rehearsal remain outstanding.
