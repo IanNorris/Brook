@@ -1606,3 +1606,12 @@ This is application installation/persistence acceptance in QEMU; browser
 interaction/download/relaunch and actual Dell execution remain separate gates.
 The final v6 storage result also passes both checked shutdowns, clean-marker
 finalization and `e2fsck -fn`; see its `result.json` and `e2fsck.log`.
+
+The read-only `tools/hardware_store_validate.cpp` adapter exposes the same strict
+record/header/group validation used by boot to a future C provisioner. It also
+checks the file type and exact extent and handles interrupted/short reads. A
+static musl build passed against the prepared v4 STORE.IMG; the regression also
+rejects a mismatched UUID, invalid descriptor, dirty state and truncated size.
+This checks admission metadata only: exclusive ownership, complete SHA256
+readback and filesystem consistency remain separate responsibilities. The direct
+USB transfer helper and its QEMU/physical acceptance are still outstanding.
