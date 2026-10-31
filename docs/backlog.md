@@ -1,5 +1,15 @@
 # Recovery and VM-control backlog
 
+### Retained FAT rename support (31 October 2026)
+
+Object-relative FAT `renameat` and `renameat2(RENAME_NOREPLACE)` remain
+unsupported. Implement them without reopening reconstructed paths, deleting an
+existing destination before replacement, or invalidating retained file/slot
+identities. Cover open and leased aliases, concurrent destination creation,
+partial I/O failure, LFN/SFN collisions and entry reuse. USB store provisioning
+uses a boot-only marker created exclusively after image verification, so it does
+not depend on this general filesystem feature.
+
 ### Dell Fn-key display wake mismatch (30 October 2026)
 
 Physical XPS13 9343 observation: after idle display-off, pressing Fn restores

@@ -1705,3 +1705,15 @@ slots/selectors, plus the expected prepared B slot. Evidence:
 `build/hardware/store-direct-marker-qemu-v1-20261031/{store-qa/receipt.json,media-verification.json,slot-verification.json}`.
 Astra reviewed the direct publication sequence. This is not yet proof of full-size
 transfer, subsequent writable-desktop admission or physical Dell acceptance.
+
+The complete4026531840-byte application image has now passed the isolated
+production receiver and boot-guarded workflow in QEMU. The tested writable
+kernel/initrd was activated through the updater in the inactive slot, then a
+fresh QEMU process booted the same private USB disk. The new boot mounted the
+writable image, exposed Firefox, Chromium and App Gallery, passed the ordinary
+UID1000 home/mmap/COW fixture and completed checked shutdown with a clean marker.
+Evidence: `build/hardware/store-full-image-qemu-v1-20261031/{store-full-qa,desktop-activation}/receipt.json`
+and `build/hardware/store-full-reboot-qemu-v1-20261031/result.json`.
+`scripts/test_hardware_store_reboot.py` reproduces the second-boot gate only on a
+stopped private disk under build/hardware. Browser interaction on the Dell and
+native transfer are separate from this QEMU result.
