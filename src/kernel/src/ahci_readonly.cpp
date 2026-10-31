@@ -2,6 +2,9 @@
 #include "ahci_observe.h"
 #include "ahci_read_plan.h"
 #include "ahci_readonly_sequence.h"
+#include "ahci_write_plan.h"
+#include "ahci_byte_write.h"
+#include "ahci_write_target.h"
 #include "ata_identify.h"
 #include "pci.h"
 #include "vfs.h"
@@ -13,8 +16,6 @@
 #include "apic.h"
 #include "string.h"
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-#include "ahci_write_plan.h"
-#include "ahci_byte_write.h"
 #include "ahci_test_admission.h"
 #endif
 
@@ -30,6 +31,7 @@ bool dma64=false;
 PciDevice pci{};
 KMutex ioLock{};
 bool published=false;
+bool writeEnabled=false; // immutable after registration, even if quarantined
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 bool testWritable=false;
 bool TestKvm() {
@@ -69,7 +71,6 @@ struct PortIo {
         }
         return false;
     }
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     bool waitClearFlush(uint32_t offset,uint32_t mask) {
         const uint64_t start=ApicTickCount();
         for(uint64_t spins=0;spins<2000000000ull;++spins) {
@@ -82,7 +83,6 @@ struct PortIo {
         }
         return false;
     }
-#endif
 } io;
 
 void PciCommand(uint16_t value) {
@@ -99,12 +99,10 @@ void Quarantine(const char* reason) {
 bool Run(const AhciReadPlan& plan, uint32_t expected) {
     bool valid=(plan.fis[2]==0xec || plan.fis[2]==0x25) && plan.commandFlags==5 &&
         plan.prdtEntries==1 && expected && plan.byteCountMinusOne+1==expected;
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-    const bool isFlush=testWritable && plan.fis[2]==0xea && plan.commandFlags==5 &&
+    const bool isFlush=writeEnabled && plan.fis[2]==0xea && plan.commandFlags==5 &&
         !plan.prdtEntries && !expected;
-    valid=valid || isFlush || (testWritable && plan.fis[2]==0x35 &&
+    valid=valid || isFlush || (writeEnabled && plan.fis[2]==0x35 &&
         plan.commandFlags==(5u|(1u<<6)) && plan.prdtEntries==1 && expected && plan.byteCountMinusOne+1==expected);
-#endif
     if(!dma || status.quarantined || !valid)
         return false;
     // Do not alter descriptors if hardware unexpectedly owns any slot.
@@ -121,11 +119,7 @@ bool Run(const AhciReadPlan& plan, uint32_t expected) {
         auto* prd=reinterpret_cast<Prdt*>(dma+tableOffset+128);
         prd->low=plan.dmaLow;prd->high=plan.dmaHigh;prd->byteCountMinusOne=plan.byteCountMinusOne;
     }
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     const auto result=isFlush ? SubmitNoData(io) : Submit(io,expected);
-#else
-    const auto result=Submit(io,expected);
-#endif
     if(result!=Result::Ok) { Quarantine("AHCI command failed or timed out");return false; }
     const uint8_t* d2h=dma+fisOffset+0x40;
     if(d2h[0]==0x34 && (d2h[2]&1u)) { Quarantine("ATA device reported an error");return false; }
@@ -158,40 +152,27 @@ int Read(Device*,uint64_t offset,void* output,uint64_t length) {
     KMutexUnlock(&ioLock);
     return done?int(done):(length?-5:0);
 }
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-struct TestByteIo {
+struct AhciByteIo {
     bool read(uint64_t lba,uint32_t count,uint8_t*) { return ReadBlocks(lba,count); }
     bool write(uint64_t lba,uint32_t count,const uint8_t*) {
         AhciReadPlan p{};return AhciPlanWrite(p,lba,count,status.sectors,dmaPhys+dataOffset,dma64) && Run(p,count*512);
     }
 };
-#endif
 int Write(Device*,uint64_t offset,const void* data,uint64_t len) {
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-    if(testWritable && __atomic_load_n(&published,__ATOMIC_ACQUIRE)) {
-        KMutexLock(&ioLock);TestByteIo bytes;
+    if(writeEnabled && __atomic_load_n(&published,__ATOMIC_ACQUIRE)) {
+        KMutexLock(&ioLock);AhciByteIo bytes;
         const int result=status.ready ? AhciByteWrite(bytes,offset,data,len,status.sectors,dma+dataOffset) : -5;
         KMutexUnlock(&ioLock);return result;
     }
-#else
-    (void)offset;(void)data;(void)len;
-#endif
     return -30;
 }
 int Ioctl(Device*,uint32_t request,void*) {
-    if(request==DEVICE_IOCTL_READ_ONLY) {
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-        if(testWritable)return 0;
-#endif
-        return 1;
-    }
-#if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-    if(request==DEVICE_IOCTL_FLUSH && testWritable) {
+    if(request==DEVICE_IOCTL_READ_ONLY)return writeEnabled?0:1;
+    if(request==DEVICE_IOCTL_FLUSH && writeEnabled) {
         KMutexLock(&ioLock);AhciReadPlan plan{};
         const bool ok=status.ready && AhciPlanFlush(plan,true) && Run(plan,0);
         KMutexUnlock(&ioLock);return ok?0:-5;
     }
-#endif
     if(request==DEVICE_IOCTL_FLUSH)return 0;
     return -95;
 }
@@ -199,6 +180,15 @@ uint64_t BlockCount(Device*) {return status.sectors;}
 uint32_t BlockSize(Device*) {return 512;}
 const BlockDeviceOps ops={Read,Write,Ioctl,nullptr,BlockCount,BlockSize};
 Device device{reinterpret_cast<const DeviceOps*>(&ops),"ahci0",DeviceType::Block,nullptr};
+bool ReadWriteTarget(AhciWriteTarget& target,bool& present) {
+    auto* node=VfsOpen("/etc/ahci-write-target",VFS_O_STREAM);
+    present=node!=nullptr;if(!node)return false;
+    VnodeStat st{};char record[192]{};uint64_t offset=0;
+    bool ok=!VfsStat(node,&st) && !st.isDir && !st.isSymlink && st.size && st.size<=sizeof(record);
+    if(ok)ok=VfsRead(node,record,st.size,&offset)==int(st.size) &&
+        AhciWriteTargetParse(record,uint32_t(st.size),target);
+    VfsRelease(node);return ok;
+}
 }
 
 void AhciReadOnlyInit() {
@@ -288,16 +278,23 @@ void AhciReadOnlyInit() {
     }
     status.sectors=info.sectors;status.logicalSectorBytes=info.logicalSectorBytes;
     status.physicalSectorBytes=info.physicalSectorBytes;memcpy(status.model,info.model,sizeof(status.model));
+    AhciWriteTarget target{};bool targetPresent=false;
+    const bool parsed=ReadWriteTarget(target,targetPresent);
+    writeEnabled=parsed && AhciWriteTargetMatches(target,pci.vendorId,pci.deviceId,pci.bus,pci.dev,pci.fn,
+        selected,info,AtaSupportsFlushExt(dma+dataOffset,512));
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
-    // This build is only for disposable QEMU fixtures: require all conditions,
-    // including an otherwise unused per-image marker and exact ATA identity.
+    // Test hooks also require the exact disposable QEMU identity. They can be
+    // enabled by the test marker or an already matched production policy.
     auto* testMarker=VfsOpen("/etc/ahci-qemu-write-test");
-    if(testMarker){VfsClose(testMarker);testWritable=AhciDisposableTestAdmission(true,TestKvm(),selected,info,
-        AtaSupportsFlushExt(dma+dataOffset,512));}
+    const bool markerPresent=testMarker!=nullptr;if(testMarker)VfsClose(testMarker);
+    testWritable=AhciDisposableTestAdmission(markerPresent || writeEnabled,TestKvm(),selected,info,
+        AtaSupportsFlushExt(dma+dataOffset,512));
+    writeEnabled=writeEnabled || testWritable;
 #endif
     KMutexInit(&ioLock);
     if(!DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}
     status.ready=true;status.reason="read-only ATA device ready";
+    if(targetPresent)status.reason=writeEnabled?"configured ATA device writable":"ATA write target rejected; device read-only";
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     if(testWritable)status.reason="disposable QEMU test ATA device writable";
 #endif

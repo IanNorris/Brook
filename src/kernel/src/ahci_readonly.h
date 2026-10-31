@@ -10,7 +10,8 @@ struct AhciReadOnlyStatus {
 };
 void AhciReadOnlyInit();
 AhciReadOnlyStatus AhciReadOnlyGetStatus();
-// Internal diagnostic read: exactly one 512-byte sector. No writes exist.
+// Internal diagnostic read: exactly one 512-byte sector. Write admission is a
+// separate boot-time identity policy; this diagnostic never writes.
 int AhciReadOnlySector(uint64_t lba, void* output);
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
 int AhciDisposableQemuTest();

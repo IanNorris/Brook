@@ -1906,6 +1906,24 @@ The original fixture hash remained unchanged. These results validate a bounded
 test path, not a general writable driver, filesystem crash consistency, or SSD
 installation. Evidence: `build/hardware/atw3`, `atw4`, and `atw5`.
 
+The AHCI block driver now has a default-off write mode selected once during
+boot by a strictly parsed `/etc/ahci-write-target` record. It requires an exact
+PCI identity and location, SATA port, model, serial, capacity, sector geometry,
+and advertised FLUSH CACHE EXT. Absent, malformed or mismatched records leave
+the device read-only. Successful admission itself performs no disk write and
+does not mount partitions; a quarantined writable device still reports its
+original writable guarantee and rejects further I/O. This target record has not
+been provisioned on the Dell.
+
+With QEMU test hooks disabled, a matching target was admitted and a mismatched
+serial rejected; both complete scratch-image hashes remained unchanged after
+boot and shutdown (`build/hardware/atp1`, `atp2`). With only the disposable
+QEMU mount/workload hooks enabled and no test-write marker, the same target
+policy passed ext2 write/fsync/rename, a fresh-process verify, host `e2fsck`
+and an independent extracted-file check (`atp3`, `atp4`). These tests are not
+an installer, a crash-recovery guarantee, or authority to deploy a writable
+record to physical hardware before the full installation rehearsal.
+
 The test-only kernel can also discover a GPT partition on the identified
 scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload
 created and fsynced a 150123-byte file, renamed it, and fsynced its directory.
