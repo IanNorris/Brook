@@ -2397,6 +2397,18 @@ has not been installed or written by this preparation goal and is not expected
 to boot Brook yet. Idle blanking was disabled for the current boot to keep a
 subsequent failure visible; this does not persist across boots.
 
+The returned USB was mounted read-only and `STORE.IMG` copied and checked by
+SHA-256. The host copy was marked unclean; `e2fsck -fn` reported inode and
+block bitmap discrepancies. A separate copy was repaired with `e2fsck -fy`
+and then passed `e2fsck -fn`. The repaired copy passed private QEMU writable
+store admission, persistence, checked shutdown and reboot tests
+(`dell-store-recovery-qemu-20261031`). It was staged on the USB, synced,
+read back after a read-only remount, then published as `STORE.IMG`. The old
+USB image remains as `STORE.BAD` and the host original remains in the private
+`dell-store-recovery-20261031` directory. The recovery and A/B boot files were
+not replaced. Physical boot and browser acceptance of the repaired store are
+still pending.
+
 Panic presentation already restored the firmware backlight after rendering.
 The candidate additionally makes a best-effort restore earlier in fatal panic
 and exception paths, after the primary serial record and CPU-stop attempt but
