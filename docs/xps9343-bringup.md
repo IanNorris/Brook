@@ -2322,3 +2322,14 @@ verified controller ownership, power, clock, reset, timing, FIFO/interrupt
 handling, a monotonic deadline and cleanup. An I²C request writes the read verb
 to the codec bus; it is not an MMIO-only observation. No codec or controller
 transaction has been performed on the Dell, and no audio playback is implied.
+
+The fixed codec transaction is now connected to an abstract DesignWare polling
+adapter. It reads raw interrupt and FIFO levels, preserves the abort source
+without clearing it, bounds both elapsed time and poll count, and refuses FIFO
+errors, impossible levels and inaccessible-register values. It never resets,
+enables, acknowledges or releases the controller; the caller must retain
+ownership and establish quiescence after every outcome. Its deadline cannot
+interrupt a single hung MMIO access. Host tests use a simulated register bus;
+this host's QEMU device list does not expose a DesignWare I²C controller.
+There is still no physical MMIO adapter, platform ownership or initialization,
+and this code has not sent an I²C transaction to the laptop.

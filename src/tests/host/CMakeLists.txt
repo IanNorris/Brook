@@ -90,6 +90,7 @@ target_link_libraries(test_dell_i2c_id_policy PRIVATE Threads::Threads)
 add_host_test(test_dell_i2c_probe "${BROOK_ROOT}/src/kernel/src/dell_i2c_probe.cpp")
 target_compile_options(test_dell_i2c_probe PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src" "-iquote${BROOK_ROOT}/src/shared" "-iquote${BROOK_ROOT}/src/shared/inc_km")
 add_host_test(test_dell_codec_id_transfer)
+add_host_test(test_dell_codec_i2c_poll)
 add_executable(test_ahci_system_volume "${BROOK_ROOT}/src/tests/test_ahci_system_volume/main.cpp"
     "${BROOK_ROOT}/src/kernel/src/ahci_system_volume.cpp")
 target_include_directories(test_ahci_system_volume PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/fatfs-object-adapter")
