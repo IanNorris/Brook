@@ -41,6 +41,7 @@ class CompactPackage(unittest.TestCase):
             self.assertEqual(actual, expected)
             self.assertEqual(hashlib.sha256(actual).hexdigest(), manifest['packed_sha256'])
             segment = package/manifest['segments'][0]['name']; original = segment.read_bytes(); data = bytearray(original); data[0] ^= 1; segment.write_bytes(data)
+            with self.assertRaises(ValueError): packer.verify_segment(segment,manifest['segments'][0])
             with self.assertRaises(ValueError): packer.verify_package(package)
             segment.write_bytes(original)
             doc=json.loads((package/'manifest.json').read_text());doc['geometry']['payload_first']+=1

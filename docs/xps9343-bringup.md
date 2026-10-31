@@ -2264,3 +2264,23 @@ The QEMU harness verifies package files before reopening them for copying, so
 it assumes they are not concurrently modified. A production path must verify
 pinned or staged bytes, bind a trusted package identity and geometry, establish
 source/target ownership, and retain USB recovery before any physical write.
+
+The private QEMU package path now reads each staged FAT file back and verifies
+its checksum before starting the guest (`compact-staged-package-qemu-20261031`,
+`compact-staged-package-boot-20261031`). This addresses the earlier copy gap
+for this private harness; it does not authenticate a package or pin files in a
+production installer.
+
+A second test-only admission recognizes an exact QEMU model/serial and a sparse
+500118192-sector disk matching the Dell's reported capacity. It requires KVM,
+port zero, the installer marker and a kernel built with disposable test hooks;
+tests reject the physical Samsung model and crossed serial/capacity pairs. A
+sparse regular-file source with a small 62 MiB EFI payload produced a 65046016
+byte compact package. The QEMU worker installed it onto a separate sparse disk;
+independent comparisons matched the primary GPT, payload and backup GPT and
+preserved a sentinel in the unused gap (`dell-capacity-install-qemu-20261031`).
+The result booted without USB using a QEMU snapshot overlay
+(`dell-capacity-boot-qemu-20261031`). Boot validation checks bounded GPT,
+payload and gap ranges, not a hash of every byte of the 256 GB logical disk.
+This is a kernel-boot fixture, not a browser-capable desktop image. No physical
+SSD access or installation is authorized or performed by this test path.

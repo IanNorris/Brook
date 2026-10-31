@@ -51,13 +51,20 @@ if a.installer_compact and not a.installer_segmented:p.error('compact source req
 if a.installer_package:
     if not a.installer_compact or not a.installer_segmented or not a.sata_qemu_scratch:
         p.error('package requires compact segmented source and SATA scratch')
-    from pack_ssd_install_source import verify_package
+    from pack_ssd_install_source import verify_package,verify_segment
     package=verify_package(a.installer_package)
-    if package['geometry'] != {'disk_sectors':131072,'payload_first':2048,'payload_sectors':126976} or package['segment_bytes']!=32*1024**2:
+    if package['geometry'] not in ({'disk_sectors':131072,'payload_first':2048,'payload_sectors':126976},
+                                   {'disk_sectors':500118192,'payload_first':2048,'payload_sectors':126976}) or package['segment_bytes']!=32*1024**2:
         p.error('package does not match the recognized QEMU fixture')
     for i,item in enumerate(package['segments']):
         if i==1 and a.installer_omit_second:break
         run('mcopy','-o','-i',str(disk)+'@@1048576',a.installer_package/item['name'],'::'+item['name'])
+        staged=out/f'staged-check-{i}.tmp'
+        try:
+            run('mcopy','-i',str(disk)+'@@1048576','::'+item['name'],staged)
+            verify_segment(staged,item)
+        finally:
+            staged.unlink(missing_ok=True)
     marker=out/'INSTCMP.OK';marker.write_text('test-only compact source\n')
     run('mcopy','-o','-i',str(disk)+'@@1048576',marker,'::INSTCMP.OK')
 if a.installer_source:
@@ -122,14 +129,17 @@ if a.sata_image:
              '-device','ide-hd,drive=satatest,bus=ide.0']
 if a.sata_qemu_scratch:
     if a.sata_image:p.error('Choose one SATA test disk mode')
-    if a.sata_qemu_scratch.is_symlink() or not a.sata_qemu_scratch.is_file() or a.sata_qemu_scratch.stat().st_size not in (64*1024**2,6*1024**3+2*1024**2):
+    if a.sata_qemu_scratch.is_symlink() or not a.sata_qemu_scratch.is_file() or a.sata_qemu_scratch.stat().st_size not in (64*1024**2,6*1024**3+2*1024**2,500118192*512):
         p.error('Scratch source must be a recognized regular-file test fixture')
     size=a.sata_qemu_scratch.stat().st_size
-    if size!=64*1024**2 and (not a.installer_source or a.installer_source.stat().st_size!=size):
+    if size==500118192*512 and (not a.installer_package or package['geometry']['disk_sectors']!=500118192):
+        p.error('Dell-capacity scratch requires the matching compact test package')
+    if size==6*1024**3+2*1024**2 and (not a.installer_source or a.installer_source.stat().st_size!=size):
         p.error('large scratch requires a matching installer source')
     scratch=out/'sata-scratch.raw'
     run('cp','--reflink=auto','--sparse=always',a.sata_qemu_scratch,scratch)
-    serial='BROOK-AHCI-TEST-01' if size==64*1024**2 else 'BROOK-AHCI-INSTALL06'
+    serial=('BROOK-AHCI-TEST-01' if size==64*1024**2 else
+            'BROOK-AHCI-DELL256' if size==500118192*512 else 'BROOK-AHCI-INSTALL06')
     argv += ['-drive',f'if=none,id=satatest,format=raw,file={scratch}',
              '-device',f'ide-hd,drive=satatest,bus=ide.0,serial={serial}']
 (out/'argv.json').write_text(json.dumps(argv,indent=2)+'\n');log=(out/'qemu.log').open('x');owner=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT);q=None;rpc=None

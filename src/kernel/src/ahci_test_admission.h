@@ -13,7 +13,8 @@ inline bool AhciDisposableTestAdmission(bool marker,bool kvm,uint32_t port,
 // the installer marker is present in a test kernel, never by raw write tests.
 inline bool AhciDisposableDesktopInstallAdmission(bool marker,bool kvm,uint32_t port,
                                                    const AtaIdentifyInfo& info,bool flushExt) {
-    return marker && kvm && port==0 && info.sectors==12587008 &&
-        !strcmp(info.model,"QEMU HARDDISK") && !strcmp(info.serial,"BROOK-AHCI-INSTALL06") && flushExt;
+    const bool fixture=(info.sectors==12587008 && !strcmp(info.serial,"BROOK-AHCI-INSTALL06")) ||
+        (info.sectors==500118192 && !strcmp(info.serial,"BROOK-AHCI-DELL256"));
+    return marker && kvm && port==0 && fixture && !strcmp(info.model,"QEMU HARDDISK") && flushExt;
 }
 }

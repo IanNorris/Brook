@@ -17,15 +17,31 @@ from hardware import Hardware
 from test_hardware_power import Qmp
 def sha(path):
     with path.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
+def dell_fixture_sha(path):
+    # Bounded evidence only: GPT metadata, installed payload and one gap.
+    # QEMU uses snapshot=on, so the base is not its writable overlay.
+    digest=hashlib.sha256()
+    ranges=((0,34*512),(100*512,512),(2048*512,126976*512),((500118192-33)*512,33*512))
+    with path.open('rb') as f:
+        for offset,length in ranges:
+            f.seek(offset);remaining=length
+            while remaining:
+                data=f.read(min(1024*1024,remaining))
+                if not data:raise ValueError('short sparse fixture')
+                digest.update(data);remaining-=len(data)
+    return digest.hexdigest()
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--image',required=True,type=Path);p.add_argument('--output',required=True,type=Path)
     p.add_argument('--desktop-store',action='store_true',help='Verify the full desktop system store is admitted')
+    p.add_argument('--dell-capacity-fixture',action='store_true',help='Use the sparse Dell-capacity test fixture and bounded base-disk checks')
     a=p.parse_args();image=a.image.resolve(strict=True)
-    expected=6*1024**3+2*1024**2 if a.desktop_store else 64*1024**2
+    if a.desktop_store and a.dell_capacity_fixture:p.error('choose one fixture type')
+    expected=500118192*512 if a.dell_capacity_fixture else 6*1024**3+2*1024**2 if a.desktop_store else 64*1024**2
     if a.image.is_symlink() or not image.is_file() or image.stat().st_size!=expected:
         p.error('Expected the specified private installer target size')
-    out=a.output.absolute();out.mkdir(parents=True,exist_ok=False);original=sha(image)
+    checksum=dell_fixture_sha if a.dell_capacity_fixture else sha
+    out=a.output.absolute();out.mkdir(parents=True,exist_ok=False);original=checksum(image)
     variables=out/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],variables);variables.chmod(0o600)
     with socket.socket() as reserve:reserve.bind(('127.0.0.1',0));port=reserve.getsockname()[1]
     argv=['qemu-system-x86_64','-machine','q35','-accel','kvm','-cpu','host','-smp','4','-m','4096','-nodefaults',
@@ -63,8 +79,8 @@ def main():
         finally:
             if q:q.close()
             if owner.poll() is None:owner.terminate();owner.wait(timeout=15)
-    assert sha(image)==original
-    (out/'result.json').write_text(json.dumps({'passed':True,'usb_storage_attached':False,'disk_sha256':original,
+    assert checksum(image)==original
+    (out/'result.json').write_text(json.dumps({'passed':True,'usb_storage_attached':False,('disk_sample_sha256' if a.dell_capacity_fixture else 'disk_sha256'):original,
         'scope':('installed desktop system store admission; no UI acceptance' if a.desktop_store else
                  'installed kernel boot only; no application store or full desktop acceptance')},indent=2)+'\n')
     print('INSTALLED_SATA_QEMU_BOOT_PASS',flush=True)

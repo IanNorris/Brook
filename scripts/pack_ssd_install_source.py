@@ -124,6 +124,24 @@ def pack(source, output, segment_bytes):
         os.close(fd)
 
 
+def verify_segment(path, item, whole=None):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd); size = item['bytes']
+        if not stat.S_ISREG(st.st_mode) or st.st_size != size:
+            raise ValueError('invalid segment file')
+        digest = hashlib.sha256(); pos = 0
+        while pos < size:
+            data = read_exact(fd, pos, min(1024 * 1024, size - pos))
+            digest.update(data)
+            if whole is not None: whole.update(data)
+            pos += len(data)
+        if digest.hexdigest() != item['sha256']:
+            raise ValueError('segment checksum mismatch')
+    finally:
+        os.close(fd)
+
+
 def verify_package(directory):
     # Checksums detect accidental change; the caller still needs a trusted
     # source of expected geometry and package identity before installation.
@@ -153,19 +171,7 @@ def verify_package(directory):
         name = f'INST{i:04}.IMG'; size = min(segment, total - i * segment)
         if item['name'] != name or item['bytes'] != size:
             raise ValueError('invalid segment description')
-        fd = os.open(directory / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_size != size:
-                raise ValueError('invalid segment file')
-            digest = hashlib.sha256(); pos = 0
-            while pos < size:
-                data = read_exact(fd, pos, min(1024 * 1024, size - pos))
-                digest.update(data); whole.update(data); pos += len(data)
-            if digest.hexdigest() != item['sha256']:
-                raise ValueError('segment checksum mismatch')
-        finally:
-            os.close(fd)
+        verify_segment(directory / name, item, whole)
     if whole.hexdigest() != manifest['packed_sha256']:
         raise ValueError('packed checksum mismatch')
     manifest['manifest_sha256'] = claimed
