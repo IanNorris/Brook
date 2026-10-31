@@ -4,6 +4,7 @@
 #include "cpu_memory_type.h"
 #include "framebuffer_memory_type.h"
 #include "cpu_execute_disable.h"
+#include "smp.h"
 
 // ---------------------------------------------------------------------------
 // CR0 / CR4 bit definitions
@@ -125,6 +126,25 @@ bool CpuFramebufferWcCompatible()
 {
     brook::FramebufferMtrrs snapshot;
     return ReadFramebufferMtrrs(snapshot) && brook::FramebufferMtrrsEqual(snapshot,g_framebufferMtrrs);
+}
+
+bool CpuObserveMemoryTypes(uint64_t page0,uint64_t page1,brook::CpuMemoryTypeObservation& out)
+{
+    out={};
+    struct InterruptGuard {
+        uint64_t flags;
+        InterruptGuard(){__asm__ volatile("pushfq; popq %0; cli":"=r"(flags)::"memory");}
+        ~InterruptGuard(){if(flags&(1ull<<9))__asm__ volatile("sti":::"memory");}
+    } guard;
+    brook::FramebufferMtrrs before{},after{};const auto cr0=ReadCr0();
+    if(!ReadFramebufferMtrrs(before))return false;
+    const uint64_t pat=ReadMsr(0x277);const auto cpu=brook::SmpCurrentCpuIndex();
+    if(!ReadFramebufferMtrrs(after) || !brook::FramebufferMtrrsEqual(before,after) ||
+       ((cr0^ReadCr0())&((1ull<<30)|(1ull<<29))) || ReadMsr(0x277)!=pat)return false;
+    brook::CpuMemoryTypeObservation result{};result.cpu=cpu;result.patSlot0=uint8_t(pat&255);
+    result.cacheDisabled=(cr0&(1ull<<30))!=0;result.notWriteThrough=(cr0&(1ull<<29))!=0;
+    if(!brook::MtrrObservePage(before,page0,result.page0) || !brook::MtrrObservePage(before,page1,result.page1))return false;
+    out=result;return true;
 }
 
 void CpuInitFpu()

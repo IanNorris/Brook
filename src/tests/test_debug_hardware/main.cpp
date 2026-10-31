@@ -11,6 +11,7 @@
 #include "acpi.h"
 #include "dell_audio_probe.h"
 #include "memory/virtual_memory.h"
+#include "cpu.h"
 #include <cassert>
 #include <cstring>
 #include <string>
@@ -18,6 +19,7 @@ std::string reply,dispatched;
 unsigned powerCalls=0;std::string powerVerb;
 unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
 bool audioProbePresent=false;
+bool CpuObserveMemoryTypes(uint64_t,uint64_t,brook::CpuMemoryTypeObservation& out){out={};out.patSlot0=6;out.page0.type=0;out.page1.type=0;return true;}
 namespace brook {
 bool DellAudioProbeRead(DellAudioFirmwareSnapshot& out,const char*& reason){
     reason=audioProbePresent?"ok":"not provisioned";out.i2cBase0=0xfe103000;out.i2cBase1=0xfe104000;return audioProbePresent;
@@ -116,7 +118,8 @@ int main(){
     audioProbePresent=true;
     assert(handle("bridge hardware dell-audio-firmware") && reply.find("\"i2c_base0_mmio_declared\":true")!=std::string::npos &&
            reply.find("\"i2c_base1_mmio_declared\":false")!=std::string::npos && reply.find("\"types\":2")!=std::string::npos &&
-           reply.find("\"i2c_base0_kernel_aliases\":{\"valid\":true")!=std::string::npos);
+           reply.find("\"i2c_base0_kernel_aliases\":{\"valid\":true")!=std::string::npos &&
+           reply.find("\"current_cpu_memory_types\":{\"valid\":true")!=std::string::npos);
     assert(handle("bridge hardware acpi 0 4 2") && reply.find("\"hex\":\"abab\"")!=std::string::npos);
     assert(handle("bridge hardware acpi 0 0 512"));
     assert(reply.find("\"hex\":\""+[](){std::string s;for(int i=0;i<512;++i)s+="ab";return s;}()+"\"")!=std::string::npos);

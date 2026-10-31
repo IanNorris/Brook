@@ -1853,6 +1853,29 @@ with PAT index 0. This is not the effective memory type: MTRRs, per-CPU PAT
 state, other aliases and device ownership were not established. No I²C or SST
 device memory was read or mapped by this diagnostic.
 
+The next read-only diagnostic samples PAT, CR0 and MTRR state on the CPU
+executing the command. It takes two matching MTRR snapshots, refuses malformed
+or unsupported ranges, and does not infer device ownership or a safe mapping.
+Synthetic tests cover range boundaries, invalid masks, unsupported types and
+overlap precedence. The actual MSR-read path also ran in an opt-in QEMU-only
+test kernel (`cache-msr-qemu-20261031`); the exact normal candidate passed the
+QEMU desktop/reboot gate and was deployed on the Dell
+(`dell-audio-cache-update-20261031`). Eight samples all ran on CPU 0: PAT slot
+0 contained type 6 (WB), CR0.CD and CR0.NW were clear, and each I²C page's
+MTRRs resolved to type 0 (UC), with both UC and WB variable ranges matching.
+The alias and CPU samples are separate and not atomic; other CPUs and other
+aliases were not inspected. This does not prove device decoding or authorize
+an I²C register access. The desktop store was ready and SSD inventory stayed
+read-only.
+Assuming those separately observed page-table attributes and CPU0 settings did
+not change between samples, Intel's UC-over-WB MTRR precedence and PAT/MTRR
+combination rules imply UC for the two observed CPU0 aliases. This is not a
+claim about other CPUs, other aliases, or hardware accessibility. See the
+[Intel SDM memory-type rules](https://cdrdv2-public.intel.com/835781/325462-sdm-vol-1-2abcd-3abcd-4.pdf).
+Unsupported PAT layouts, disabled MTRRs, inconsistent reads, malformed ranges
+or undefined overlap combinations produce an unknown result, not permission
+to access the device.
+
 ### Passive-open MSS and hardware transfer profile (2026-10-31)
 
 A 4 GB store upload to the Dell's USB stick ran at approximately 2.8 MB/s;

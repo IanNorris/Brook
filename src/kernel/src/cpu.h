@@ -1,6 +1,17 @@
 #pragma once
 
 #include <stdint.h>
+#include "mtrr_page_probe.h"
+
+namespace brook {
+struct CpuMemoryTypeObservation {
+    uint32_t cpu=0;uint8_t patSlot0=0;bool cacheDisabled=false,notWriteThrough=false;
+    MtrrPageObservation page0{},page1{};
+};
+}
+// Read-only diagnostic for two audited pages on the current CPU. This does not
+// establish other CPUs' configuration, alias safety or device ownership.
+bool CpuObserveMemoryTypes(uint64_t page0,uint64_t page1,brook::CpuMemoryTypeObservation& out);
 
 // CPU feature initialisation — call once very early in kernel boot, after GdtInit().
 //

@@ -19,6 +19,7 @@
 #include "acpi.h"
 #include "dell_audio_probe.h"
 #include "memory/virtual_memory.h"
+#include "cpu.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -130,6 +131,19 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
                 if(valid){emit("identity",identity);emit("direct",direct);}r.text("}");
             };
             aliases("i2c_base0_kernel_aliases",s.i2cBase0);aliases("i2c_base1_kernel_aliases",s.i2cBase1);
+            CpuMemoryTypeObservation memory{};const bool known=CpuObserveMemoryTypes(s.i2cBase0,s.i2cBase1,memory);
+            r.text(",\"current_cpu_memory_types\":{\"valid\":");r.text(known?"true":"false");
+            if(known) {
+                r.text(",");r.field("cpu",memory.cpu);r.text(",");r.field("pat_slot0",memory.patSlot0);
+                r.text(",\"cr0_cd\":");r.text(memory.cacheDisabled?"true":"false");
+                r.text(",\"cr0_nw\":");r.text(memory.notWriteThrough?"true":"false");
+                auto emit=[&](const char* field,const MtrrPageObservation& page) {
+                    r.text(",\"");r.text(field);r.text("\":{");r.field("mtrr_type",page.type);
+                    r.text(",");r.field("matched_types",page.matchedTypes);r.text(",\"used_default\":");r.text(page.usedDefault?"true":"false");r.text("}");
+                };
+                emit("base0",memory.page0);emit("base1",memory.page1);
+            }
+            r.text("}");
         }
         r.text("}\n");r.send();return true;
     }
@@ -151,6 +165,16 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text("\"}\n");r.send();return true;
     }
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
+    if(!strcmp(command,"bridge hardware cache-qemu-test")) {
+        uint64_t before=0,after=0;__asm__ volatile("pushfq; popq %0":"=r"(before)::"memory");
+        CpuMemoryTypeObservation o{};const bool ok=CpuObserveMemoryTypes(0x80000000,0x80001000,o);
+        __asm__ volatile("pushfq; popq %0":"=r"(after)::"memory");
+        Reply r;r.text("{\"cache_qemu_test\":1,\"valid\":");r.text(ok?"true":"false");
+        r.text(",\"if_preserved\":");r.text(((before^after)&(1ull<<9))?"false":"true");
+        if(ok){r.text(",");r.field("cpu",o.cpu);r.text(",");r.field("pat_slot0",o.patSlot0);
+            r.text(",");r.field("mtrr0",o.page0.type);r.text(",");r.field("mtrr1",o.page1.type);}
+        r.text("}\n");r.send();return true;
+    }
     if(!strcmp(command,"bridge hardware ahci-qemu-install begin")) {
         DebugChannelSend(SsdQemuInstallBegin()?"{\"install_test\":\"started\"}\n":"{\"install_test\":\"refused\"}\n");return true;
     }
