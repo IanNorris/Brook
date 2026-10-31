@@ -323,6 +323,11 @@ AhciReadOnlyStatus AhciReadOnlyGetStatus() {
     if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return status;
     KMutexLock(&ioLock);const auto copy=status;KMutexUnlock(&ioLock);return copy;
 }
+Device* AhciWriteAdmittedDevice() {
+    if(!__atomic_load_n(&published,__ATOMIC_ACQUIRE))return nullptr;
+    KMutexLock(&ioLock);Device* result=writeEnabled && status.ready?&device:nullptr;KMutexUnlock(&ioLock);
+    return result;
+}
 int AhciReadOnlySector(uint64_t lba,void* output) {
     if(!output || !__atomic_load_n(&published,__ATOMIC_ACQUIRE))return -22;
     KMutexLock(&ioLock);

@@ -35,6 +35,7 @@ namespace brook { void LifecycleChannelConfigure(); void LifecycleChannelStart()
 #include "mount_namespace.h"
 #include "virtio_blk.h"
 #include "gpt.h"
+#include "ahci_system_volume.h"
 #include "syscall.h"
 #include "process.h"
 #include "scheduler.h"
@@ -890,7 +891,10 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
 
     brook::KLog("BOOT stage: USB filesystem probing complete");
     brook::KLog("BOOT stage: application image mount begin");
-    const auto writableDesktop=brook::WritableDesktopBootMount(&nextPdrv);
+    const auto systemVolume=brook::AhciSystemVolumeMount(&nextPdrv);
+    const auto writableDesktop=systemVolume==brook::AhciSystemBoot::Maintenance ? brook::WritableDesktopBoot::Maintenance :
+        brook::WritableDesktopBootMount(&nextPdrv,systemVolume==brook::AhciSystemBoot::Ready ?
+            brook::WritableDesktopSource::System : brook::WritableDesktopSource::Usb);
     if(writableDesktop==brook::WritableDesktopBoot::Absent || writableDesktop==brook::WritableDesktopBoot::Fallback)
         brook::CompressedVfsBootMount();
     brook::KLog("BOOT stage: application image mount complete");

@@ -1939,7 +1939,7 @@ identified the SATA disk read-only, matched five sectors against the source,
 performed checked shutdown and left the source hash unchanged
 (`build/hardware/asb6`). USB-boot SATA ext2 create, fresh-boot verification and
 offline `e2fsck` also passed after the handoff change (`ath2`, `ath3`). This
-baseline does not yet mount the application store from SATA or test an
+baseline did not mount the application store from SATA or test an
 installer; the Dell has not been updated with this handoff implementation.
 
 The SATA boot-volume selector now validates the protective MBR and both GPT
@@ -1947,16 +1947,35 @@ copies, then requires the expected disk GUID, partition GUID, EFI partition
 type and exact sector span. Its record uses lowercase hexadecimal **on-disk
 GUID bytes**, not the usual displayed UUID byte order. Tests cover malformed
 selectors, damaged GPT copies, wrong type/identity/span, duplicate GUIDs and
-an independently generated `sfdisk` GPT image. This selector is not yet wired
-to disk discovery or mounting.
+an independently generated `sfdisk` GPT image. At this stage the selector was
+not yet wired to disk discovery or mounting.
 
 Writable desktop admission now accepts a verified System volume at the fixed
 `/media/system` path as well as its existing USB source. System-source failure
 returns Maintenance rather than falling back to USB or a RAM image. Host tests
 cover both paths and missing system records; the existing USB-backed QEMU
-write/restart/e2fsck regression passed (`build/hardware/wds1`). No SATA volume
-is yet selected or mounted by the boot path; that integration and its full QEMU
-rehearsal remain outstanding.
+write/restart/e2fsck regression passed (`build/hardware/wds1`). At that stage
+the SATA boot-volume integration and QEMU rehearsal remained outstanding.
+
+The system-volume selector is now wired into boot. An explicit selector must
+match the identity-admitted writable AHCI device and both validated GPT copies;
+only its exact EFI partition range is registered. The existing nonsymlink
+`/media/system` mountpoint must be unoccupied, FAT binding is pinned on failure,
+and selector/mount failures enter Maintenance without trying USB or RAM apps.
+The existing store transaction still validates its record and ext2 header,
+marks the store dirty before use, and marks it clean only after final sync.
+
+`scripts/test_hardware_sata_desktop.py` prepares a **host-created private GPT
+disk** with EFI boot files and a copy of the tested application store. In
+`build/hardware/asd2`, QEMU booted it without USB storage, admitted the SATA
+store, ran UID1000 mmap/COW and persistence checks, checked shutdown, then
+booted a fresh process and verified the data and another checked shutdown.
+Independent GPT, FAT and ext2 checks passed. GUI/browser acceptance was not
+part of this run. Wrong-GUID and USB mount-collision boots both entered
+Maintenance without modifying the SATA disk (`asr1`, `asr2`); temporary disk
+clones from those negative tests were removed after their logs and hashes were
+saved. This proves a prepared QEMU image, not a guest-side installer or a Dell
+SSD installation. The Dell remains on the existing read-only USB boot.
 
 The test-only kernel can also discover a GPT partition on the identified
 scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload
@@ -1965,5 +1984,5 @@ After checked shutdown, a new QEMU process verified its contents and EOF.
 Independent host `e2fsck -fn` checks after both boots passed, and `debugfs`
 extracted the file for a host-side byte comparison. The source fixture hash
 was unchanged. Evidence is in `build/hardware/atf3` and `atf4`; the workload
-and boot hook are for the opt-in disposable-QEMU kernel only. This does not
-yet prove general filesystem crash recovery or booting from an SSD.
+and boot hook are for the opt-in disposable-QEMU kernel only. This test alone
+does not prove general filesystem crash recovery or booting from a physical SSD.

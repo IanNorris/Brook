@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 namespace brook {
+struct Device;
 struct AhciReadOnlyStatus {
     bool requested=false, ready=false, quarantined=false;
     const char* reason="not requested";
@@ -10,6 +11,9 @@ struct AhciReadOnlyStatus {
 };
 void AhciReadOnlyInit();
 AhciReadOnlyStatus AhciReadOnlyGetStatus();
+// Boot-only, borrowed device pointer: available only for an identity-admitted,
+// ready writable disk. The registered device remains pinned for the boot.
+Device* AhciWriteAdmittedDevice();
 // Internal diagnostic read: exactly one 512-byte sector. Write admission is a
 // separate boot-time identity policy; this diagnostic never writes.
 int AhciReadOnlySector(uint64_t lba, void* output);

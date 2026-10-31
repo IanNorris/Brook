@@ -268,6 +268,7 @@ add_executable(kernel
     src/display_power.cpp
     src/ahci_observe.cpp
     src/ahci_readonly.cpp
+    src/ahci_system_volume.cpp
     src/gpu_compositor.cpp
     src/frame_timing.cpp
     src/gpu_app.cpp

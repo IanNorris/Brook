@@ -11,7 +11,7 @@
 static const char* path="/data/home/.brook-storage-acceptance";
 static void check(int ok,const char* what){if(!ok){perror(what);exit(1);}}
 int main(int argc,char** argv){
-    check(argc==3 && strlen(argv[2])==32,"arguments");
+    check((argc==3 || (argc==4 && !strcmp(argv[3],"system"))) && strlen(argv[2])==32,"arguments");
     int create=!strcmp(argv[1],"create");check(create||!strcmp(argv[1],"verify"),"operation");
     check(getuid()==1000,"ordinary desktop UID");
     struct stat st;check(!stat("/data/home",&st)&&st.st_uid==1000,"persistent home owner");
@@ -38,7 +38,7 @@ int main(int argc,char** argv){
     private[0]^=0xff;check(!munmap(private,8192),"private munmap");
     check(pread(fd,data,sizeof(data),0)==(ssize_t)sizeof(data)&&!memcmp(data,expected,sizeof(data)),"private mapping did not alter file");
     check(!close(fd),"close persistence file");
-    errno=0;fd=open("/media/usb/STORE.IMG",O_RDONLY);
+    errno=0;fd=open(argc==4?"/media/system/STORE.IMG":"/media/usb/STORE.IMG",O_RDONLY);
     check(fd<0 && errno==EBUSY,"exclusive backing alias refused");
     puts(create?"WRITABLE_DESKTOP_CREATE_PASS":"WRITABLE_DESKTOP_REBOOT_PASS");return 0;
 }
