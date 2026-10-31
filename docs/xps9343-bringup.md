@@ -2309,3 +2309,16 @@ result. This tests storage persistence, not browser UI, physical SSD behavior,
 or authorization for physical installation. A previous clone test stopped on
 the pre-existing test filename; a second attempt failed before boot because its
 QMP socket path exceeded the host limit. Neither changed the stopped installation.
+
+A standalone codec identity transaction state machine now describes the fixed
+RT286/RT288 vendor-parameter read: four big-endian request bytes, repeated
+START, four response bytes and STOP. It tracks outstanding reads against the RX
+FIFO depth and treats abort, early STOP, unexpected input, transport failure and
+explicit timeout as terminal. Host tests exercise those paths and both known
+vendor IDs. The protocol is based on Linux's [RL6347A codec transfer](https://github.com/torvalds/linux/blob/master/sound/soc/codecs/rl6347a.c)
+and [DesignWare master transfer](https://github.com/torvalds/linux/blob/master/drivers/i2c/busses/i2c-designware-master.c).
+This component is not connected to hardware: a real transport still needs
+verified controller ownership, power, clock, reset, timing, FIFO/interrupt
+handling, a monotonic deadline and cleanup. An I²C request writes the read verb
+to the codec bus; it is not an MMIO-only observation. No codec or controller
+transaction has been performed on the Dell, and no audio playback is implied.
