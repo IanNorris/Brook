@@ -1847,3 +1847,17 @@ be treated as automatic permission to change a layout. A pure AHCI IDENTIFY /
 READ DMA EXT command planner is tested but is not yet connected to a driver or
 submitted to any hardware. Read-only controller ownership, DMA lifetime and
 actual sector reads are the next work; no internal SSD write has occurred.
+
+The physical observer booted as generation 12/slot B, with the previous tested
+TCP-limited desktop retained in slot A. The writable USB store reopened ready.
+`build/hardware/dell-ahci-observe-native-update-20261031/ahci.json` records one
+Intel 8086:9c83 controller with port 3 DET=3, interface active, negotiated SATA
+speed code 3 (6 Gb/s), and signature 0x00000101. The probe issued no ATA command
+and did not read the SSD. This establishes an attached ATA device, not its
+model, capacity, health, partition layout, or suitability for installation.
+
+The standalone read-only ATA IDENTIFY parser checks response length, incomplete
+and packet-device flags, LBA48, capacity, 512-byte logical sectors, reported
+physical-sector ratio, and ATA word-swapped text. It has host tests but no
+physical data has been read. DMA capability, controller ownership and lifetime
+must also be established before using it for sector I/O.
