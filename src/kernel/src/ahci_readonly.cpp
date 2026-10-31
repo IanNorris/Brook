@@ -308,13 +308,14 @@ void AhciReadOnlyInit() {
     // enabled by the test marker or an already matched production policy.
     auto* testMarker=VfsOpen("/etc/ahci-qemu-write-test");
     const bool markerPresent=testMarker!=nullptr;if(testMarker)VfsClose(testMarker);
+    auto* installMarker=VfsOpen("/etc/ahci-qemu-install-test");
+    const bool installPresent=installMarker!=nullptr;if(installMarker)VfsClose(installMarker);
     testWritable=AhciDisposableTestAdmission(markerPresent || writeEnabled,TestKvm(),selected,info,
+        AtaSupportsFlushExt(dma+dataOffset,512)) ||
+        AhciDisposableDesktopInstallAdmission(installPresent,TestKvm(),selected,info,
         AtaSupportsFlushExt(dma+dataOffset,512));
     writeEnabled=writeEnabled || testWritable;
-    if(testWritable) {
-        auto* installMarker=VfsOpen("/etc/ahci-qemu-install-test");
-        testInstallMode=installMarker!=nullptr;if(installMarker)VfsClose(installMarker);
-    }
+    if(testWritable)testInstallMode=installPresent;
 #endif
     KMutexInit(&ioLock);
     if(!DeviceRegister(&device)){Quarantine("AHCI block registration failed");return;}

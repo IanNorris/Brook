@@ -18,12 +18,14 @@ p.add_argument('--memory-mb',type=int,default=2048,choices=[2048,4096,8192,16384
 p.add_argument('--capture-network',action='store_true',help='Record the private QEMU network to network.pcap')
 p.add_argument('--allow-host-network',action='store_true',help='Permit QEMU user-network access to an explicit test server')
 p.add_argument('--sata-image',type=Path,help='Attach a regular-file SATA fixture with a disposable QEMU snapshot overlay')
-p.add_argument('--sata-qemu-scratch',type=Path,help='Copy a 64 MiB fixture into this test output and attach the copy writable with a test-only serial')
-p.add_argument('--installer-source',type=Path,help='Copy a 64 MiB regular-file source into the private USB fixture for the test-only installer')
+p.add_argument('--sata-qemu-scratch',type=Path,help='Copy a recognized fixture into this output and attach it with a test-only serial')
+p.add_argument('--installer-source',type=Path,help='Copy a recognized regular-file source into the private USB fixture for the test-only installer')
 p.add_argument('--installer-segmented',action='store_true',help='Split the test source into two pinned FAT files')
 p.add_argument('--installer-omit-second',action='store_true',help='Omit the second source segment for a failure test')
+p.add_argument('--review-timeout',type=int,default=600,help='Maximum seconds to wait for the test reviewer (60..7200)')
 a=p.parse_args();desktop=a.desktop.resolve(strict=True);maintenance=a.maintenance.resolve(strict=True);out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
 if not (640<=a.width<=4096 and 480<=a.height<=2160):p.error('Private test display must be 640..4096 by 480..2160')
+if not 60<=a.review_timeout<=7200:p.error('review timeout must be 60..7200 seconds')
 m=json.loads((desktop/'manifest.json').read_text());mm=json.loads((maintenance/'manifest.json').read_text())
 assert m['application_image']['sha256']==mm['files']['APPS.BRK']['sha256']
 def run(*argv):subprocess.run(list(map(str,argv)),check=True,cwd=ROOT,stdin=subprocess.DEVNULL)
@@ -45,14 +47,16 @@ if a.installer_omit_second and not a.installer_segmented:p.error('omitting a seg
 if a.installer_source:
     if not a.installer_segmented:p.error('the installer test kernel requires --installer-segmented')
     if not a.sata_qemu_scratch:p.error('installer source requires the private SATA scratch fixture')
-    if a.installer_source.is_symlink() or not a.installer_source.is_file() or a.installer_source.stat().st_size!=64*1024**2:
-        p.error('installer source must be a regular 64 MiB file')
+    if a.installer_source.is_symlink() or not a.installer_source.is_file() or a.installer_source.stat().st_size not in (64*1024**2,6*1024**3+2*1024**2):
+        p.error('installer source must be a recognized 64 MiB or 6 GiB + 2 MiB regular file')
+    total=a.installer_source.stat().st_size
+    segment=32*1024**2 if total==64*1024**2 else 2*1024**3
     with a.installer_source.open('rb') as source:
-        for i in range(2):
+        for i in range((total+segment-1)//segment):
             if i==1 and a.installer_omit_second:break
             part=out/f'installer-part-{i}.tmp'
             with part.open('xb') as target:
-                for _ in range(32):
+                for _ in range(min(segment,total-i*segment)//1024**2):
                     data=source.read(1024**2)
                     if len(data)!=1024**2:raise ValueError('short installer source')
                     target.write(data)
@@ -86,12 +90,16 @@ if a.sata_image:
              '-device','ide-hd,drive=satatest,bus=ide.0']
 if a.sata_qemu_scratch:
     if a.sata_image:p.error('Choose one SATA test disk mode')
-    if a.sata_qemu_scratch.is_symlink() or not a.sata_qemu_scratch.is_file() or a.sata_qemu_scratch.stat().st_size!=64*1024**2:
-        p.error('Scratch source must be a regular 64 MiB test fixture')
+    if a.sata_qemu_scratch.is_symlink() or not a.sata_qemu_scratch.is_file() or a.sata_qemu_scratch.stat().st_size not in (64*1024**2,6*1024**3+2*1024**2):
+        p.error('Scratch source must be a recognized regular-file test fixture')
+    size=a.sata_qemu_scratch.stat().st_size
+    if size!=64*1024**2 and (not a.installer_source or a.installer_source.stat().st_size!=size):
+        p.error('large scratch requires a matching installer source')
     scratch=out/'sata-scratch.raw'
-    shutil.copyfile(a.sata_qemu_scratch,scratch)
+    run('cp','--reflink=auto','--sparse=always',a.sata_qemu_scratch,scratch)
+    serial='BROOK-AHCI-TEST-01' if size==64*1024**2 else 'BROOK-AHCI-INSTALL06'
     argv += ['-drive',f'if=none,id=satatest,format=raw,file={scratch}',
-             '-device','ide-hd,drive=satatest,bus=ide.0,serial=BROOK-AHCI-TEST-01']
+             '-device',f'ide-hd,drive=satatest,bus=ide.0,serial={serial}']
 (out/'argv.json').write_text(json.dumps(argv,indent=2)+'\n');log=(out/'qemu.log').open('x');owner=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT);q=None;rpc=None
 try:
     end=time.monotonic()+180
@@ -113,7 +121,7 @@ try:
         'qemu_pid':owner.pid,'bulk_port':bulk_port,'store_port':store_port,'payload_id':m['payload_id'],'app_snapshot_bytes':m['application_image']['bytes'],
         'review_instruction':'Private headless QEMU only. Inspect semantic apps/windows, launch Mousepad and Files; optionally capture QMP frame. Write finish.json passed=true when finished.'},indent=2)+'\n')
     print('RAM_DESKTOP_QEMU_READY',str(out/'ready.json'),flush=True)
-    end=time.monotonic()+600
+    end=time.monotonic()+a.review_timeout
     while not (out/'finish.json').exists():
         assert owner.poll() is None,'QEMU exited during review'
         assert time.monotonic()<end,'Semantic review timed out'

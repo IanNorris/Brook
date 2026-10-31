@@ -9,4 +9,11 @@ inline bool AhciDisposableTestAdmission(bool marker,bool kvm,uint32_t port,
     return marker && kvm && port==0 && info.sectors==131072 &&
         !strcmp(info.model,"QEMU HARDDISK") && !strcmp(info.serial,"BROOK-AHCI-TEST-01") && flushExt;
 }
+// A separate, exact-sized desktop-image fixture. This gate is only used when
+// the installer marker is present in a test kernel, never by raw write tests.
+inline bool AhciDisposableDesktopInstallAdmission(bool marker,bool kvm,uint32_t port,
+                                                   const AtaIdentifyInfo& info,bool flushExt) {
+    return marker && kvm && port==0 && info.sectors==12587008 &&
+        !strcmp(info.model,"QEMU HARDDISK") && !strcmp(info.serial,"BROOK-AHCI-INSTALL06") && flushExt;
+}
 }

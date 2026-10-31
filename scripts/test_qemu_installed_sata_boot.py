@@ -20,9 +20,11 @@ def sha(path):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--image',required=True,type=Path);p.add_argument('--output',required=True,type=Path)
+    p.add_argument('--desktop-store',action='store_true',help='Verify the full desktop system store is admitted')
     a=p.parse_args();image=a.image.resolve(strict=True)
-    if a.image.is_symlink() or not image.is_file() or image.stat().st_size!=64*1024**2:
-        p.error('Expected the regular 64 MiB private installer target')
+    expected=6*1024**3+2*1024**2 if a.desktop_store else 64*1024**2
+    if a.image.is_symlink() or not image.is_file() or image.stat().st_size!=expected:
+        p.error('Expected the specified private installer target size')
     out=a.output.absolute();out.mkdir(parents=True,exist_ok=False);original=sha(image)
     variables=out/'VARS.fd';shutil.copy2(os.environ['OVMF_VARS'],variables);variables.chmod(0o600)
     with socket.socket() as reserve:reserve.bind(('127.0.0.1',0));port=reserve.getsockname()[1]
@@ -30,7 +32,7 @@ def main():
           '-drive','if=pflash,format=raw,readonly=on,file='+os.environ['OVMF_CODE'],
           '-drive','if=pflash,format=raw,file='+str(variables),'-device','VGA,vgamem_mb=64',
           '-drive',f'if=none,id=sata,format=raw,snapshot=on,file={image}',
-          '-device','ide-hd,drive=sata,bus=ide.0,bootindex=1,serial=BROOK-AHCI-TEST-01',
+          '-device','ide-hd,drive=sata,bus=ide.0,bootindex=1,serial='+('BROOK-SYSTEM-TEST01' if a.desktop_store else 'BROOK-AHCI-TEST-01'),
           '-device','qemu-xhci,id=usbc','-device','usb-net,bus=usbc.0,port=2,netdev=network',
           '-netdev',f'user,id=network,restrict=on,hostfwd=tcp:127.0.0.1:{port}-:1234',
           '-display','none','-serial','file:'+str(out/'serial.log'),
@@ -48,7 +50,11 @@ def main():
                 time.sleep(.2)
             else:raise TimeoutError(serial[-4000:])
             h=Hardware(out/'registry');attached=h.attach('127.0.0.1',port);s=attached['session'];status=h.command(s,'bridge hardware ahci-ro')
-            assert status['ready'] and status['sectors']==131072 and status['reason']=='read-only ATA device ready',status
+            assert status['ready'] and status['sectors']==expected//512,status
+            if a.desktop_store:
+                doctor=h.doctor(s);(out/'doctor.json').write_text(json.dumps(doctor,indent=2)+'\n')
+                assert doctor['guest']['writable_desktop']['ready'] and not doctor['guest']['app_snapshot']['configured'],doctor
+            else:assert status['reason']=='read-only ATA device ready',status
             request=uuid.uuid4().hex;power=h.power(s,request,'shutdown');deadline=time.monotonic()+120
             while power['state']!='ready':
                 assert power['state']!='failed' and time.monotonic()<deadline,power
@@ -59,6 +65,7 @@ def main():
             if owner.poll() is None:owner.terminate();owner.wait(timeout=15)
     assert sha(image)==original
     (out/'result.json').write_text(json.dumps({'passed':True,'usb_storage_attached':False,'disk_sha256':original,
-        'scope':'installed kernel boot only; no application store or full desktop acceptance'},indent=2)+'\n')
+        'scope':('installed desktop system store admission; no UI acceptance' if a.desktop_store else
+                 'installed kernel boot only; no application store or full desktop acceptance')},indent=2)+'\n')
     print('INSTALLED_SATA_QEMU_BOOT_PASS',flush=True)
 if __name__=='__main__':main()

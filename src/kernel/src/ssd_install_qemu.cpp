@@ -17,7 +17,7 @@ namespace brook {
 namespace {
 // Test-kernel-only, one-shot worker. No generic disk-offset interface exists.
 SsdInstallGate gate;uint32_t state=0,stage=0,paused=0;uint64_t operations=0;int error=0;
-FatImageLease* retainedLease[2]{};
+FatImageLease* retainedLease[4]{};
 struct Source {
     FatImageLease** leases; SsdInstallSegmentedSource map;
     int readSegment(uint32_t index,uint64_t offset,void* p,uint32_t n) {
@@ -34,14 +34,17 @@ struct Io {
 };
 int Run() {
     Device* target=AhciDisposableQemuInstallDevice();
-    if(!target || DeviceBlockCount(target)!=131072 || DeviceBlockSize(target)!=512)return -22;
-    auto* node=VfsOpen("/media/usb/INST0000.IMG",VFS_O_WRITE|VFS_O_READWRITE);
-    if(!node)return -2;
-    const uint32_t count=2;
-    Source source{retainedLease,SsdInstallSegmentedSource(131072ull*512,32ull*1024*1024,count)};
+    if(!target || DeviceBlockSize(target)!=512)return -22;
+    const uint64_t sectors=DeviceBlockCount(target);
+    if(sectors!=131072 && sectors!=12587008)return -22;
+    const uint32_t count=sectors==131072?2:4;
+    const uint64_t segment=sectors==131072?32ull*1024*1024:2ull*1024*1024*1024;
+    Source source{retainedLease,SsdInstallSegmentedSource(sectors*512,segment,count)};
+    static const char* paths[]={"/media/usb/INST0000.IMG","/media/usb/INST0001.IMG",
+                                "/media/usb/INST0002.IMG","/media/usb/INST0003.IMG"};
     int result=0;Device* firstBacking=nullptr;
     for(uint32_t i=0;i<count;++i) {
-        if(i)node=VfsOpen("/media/usb/INST0001.IMG",VFS_O_WRITE|VFS_O_READWRITE);
+        auto* node=VfsOpen(paths[i],VFS_O_WRITE|VFS_O_READWRITE);
         if(!node){result=-2;break;}
         VnodeStat st{};result=VfsStat(node,&st);
         if(!result && (st.isDir || st.isSymlink || st.size!=source.map.ExpectedSize(i)))result=-22;
@@ -59,7 +62,6 @@ int Run() {
     if(!result) {
         uint8_t* mbr=meta;uint8_t* primary=meta+512;uint8_t* backup=meta+1024;
         uint8_t* entries=meta+1536;uint8_t* copy=meta+17920;
-        constexpr uint64_t sectors=131072;
         if(source.read(0,mbr,512)!=512 || source.read(512,primary,512)!=512 ||
            source.read((sectors-1)*512,backup,512)!=512 ||
            source.read(2*512,entries,16384)!=16384 ||

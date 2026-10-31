@@ -2032,9 +2032,16 @@ exact-size 32 MiB segments from the same USB device before making any target
 writes. It installed the small fixture and booted the result without USB
 (`asi9`, `aib3`); omission of the second segment failed before the first disk
 operation and left the target byte-identical (`asi10`). The fixed two-segment
-worker is still a small-image rehearsal. General segment enumeration and
-identity, and a full desktop image test remain necessary. Splitting alone does
-not make an image authentic or safe to install.
+worker was initially a small-image rehearsal. The test-only admission now also
+recognizes one exact 6 GiB + 2 MiB disposable QEMU target and four fixed source
+segments (three 2 GiB files and a 2 MiB final file). Brook copied and read back
+the previously prepared desktop image (`asi11`); an independent byte-for-byte
+comparison and GPT check passed. A fresh VM booted the installed disk without
+USB storage and admitted the writable application store (`aib4`). This did not
+exercise desktop apps or browser UI; it is not physical installation. General
+segment enumeration, device identity and installation authorization still
+require work. Splitting alone does not make an image authentic or safe to
+install.
 
 The test-only kernel can also discover a GPT partition on the identified
 scratch disk and mount it as ext2 at `/mnt/ahcitest`. A private workload
