@@ -23,6 +23,15 @@ static bool TcpSeqAfter(uint32_t a, uint32_t b)
     return static_cast<int32_t>(a - b) > 0;
 }
 
+// An ACK must not retire data we have not sent, or move the oldest
+// unacknowledged sequence backwards. The sender keeps less than 2^31 bytes
+// outstanding, so signed modular comparisons remain unambiguous.
+static void TcpAdvanceSendAck(Socket& s, uint32_t ack)
+{
+    if (TcpSeqAfter(ack, s.tcpSndUna) && !TcpSeqAfter(ack, s.tcpSndNxt))
+        s.tcpSndUna = ack;
+}
+
 TcpAction TcpProcessSegment(Socket& s,
                             uint32_t seq, uint32_t ack,
                             uint8_t flags,
@@ -96,7 +105,7 @@ TcpAction TcpProcessSegment(Socket& s,
         }
 
         if (flags & TCP_ACK)
-            s.tcpSndUna = ack;
+            TcpAdvanceSendAck(s, ack);
 
         if (dataLen > 0) {
             const uint8_t* dataPtr = data;
@@ -215,7 +224,7 @@ TcpAction TcpProcessSegment(Socket& s,
             return act;
         }
         if (flags & TCP_ACK)
-            s.tcpSndUna = ack;
+            TcpAdvanceSendAck(s, ack);
         break;
 
     default:

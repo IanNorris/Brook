@@ -302,6 +302,7 @@ static void TestCloseWaitAckUpdate()
     ASSERT_TRUE(!TcpCanSendData(TcpState::LastAck));
     Socket s = MakeEstablishedSocket();
     s.tcpState = TcpState::CloseWait;
+    s.tcpSndNxt = 1005;
 
     TcpAction act = TcpProcessSegment(s,
         /*seq=*/5001, /*ack=*/1005,
@@ -316,6 +317,45 @@ static void TestCloseWaitAckUpdate()
     ASSERT_TRUE(s.tcpRstRecv);
     ASSERT_TRUE(!s.connected);
     printf("  TestCloseWaitAckUpdate: OK\n");
+}
+
+static void TestEstablishedAckBounds()
+{
+    Socket s = MakeEstablishedSocket();
+    s.tcpSndUna = 1000; s.tcpSndNxt = 1100;
+    TcpProcessSegment(s, s.tcpRcvNxt, 1050, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 1050u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 1050, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 1050u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 1020, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 1050u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 1101, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 1050u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 1100, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 1100u);
+
+    s.tcpSndUna = 0xfffffff0u; s.tcpSndNxt = 0x20u;
+    TcpProcessSegment(s, s.tcpRcvNxt, 0x10u, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 0x10u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 0xfffffff8u, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 0x10u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 0x21u, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 0x10u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 0x20u, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 0x20u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 0x21u, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 0x20u);
+
+    s.tcpState = TcpState::CloseWait;
+    s.tcpSndUna = 0xfffffff0u; s.tcpSndNxt = 0x20u;
+    TcpProcessSegment(s, s.tcpRcvNxt, 0x10u, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 0x10u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 0xfffffff8u, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 0x10u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 0x21u, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 0x10u);
+    TcpProcessSegment(s, s.tcpRcvNxt, 0x20u, TCP_ACK, nullptr, 0);
+    ASSERT_EQ(s.tcpSndUna, 0x20u);
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +486,7 @@ int main()
     TestFinWait2ToTimeWait();
     TestLastAckToClosed();
     TestCloseWaitAckUpdate();
+    TestEstablishedAckBounds();
     TestChecksum();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

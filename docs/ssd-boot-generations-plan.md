@@ -15,8 +15,11 @@ hash-valid kernel that hangs. The installed SSD currently uses the direct
    label. Keep the store separate: selecting an older kernel must not silently
    roll back user data or promise backwards-compatible filesystem changes.
 2. Add an EFI menu before loading the kernel. Default to the last confirmed
-   generation after a short timeout; provide keyboard selection, a clear
+   generation after a roughly 2–3 second timeout; provide keyboard selection,
+   a key such as F5 to open or hold the menu, a clear
    recovery entry and a way to reach the menu without relying on a running OS.
+   Firmware keyboard support and held-key behavior must be checked on the Dell;
+   the visible timed menu is the fallback if a held key is not delivered.
    Validate the selected pair exactly as the current loader does. A missing or
    corrupt choice must offer another verified pair rather than mixing files.
 3. Publish new generations with write, flush and readback before updating a

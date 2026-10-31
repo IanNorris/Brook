@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'tools/vm_bridge'), str(ROOT / 'scripts')]
 from hardware import Hardware
 from hardware_bulk_protocol import download
+from hardware_bulk_workflow import BulkRun
 from test_hardware_power import Qmp
 
 
@@ -47,6 +48,8 @@ def main():
                         help='Test staging a RAM-only chmod helper through the recovery shell')
     parser.add_argument('--recovery-initrd', type=Path,
                         help='Copy the production recovery shell into the disposable initrd')
+    parser.add_argument('--network-roundtrip', action='store_true',
+                        help='Also verify a binary RAM-only upload and download')
     a = parser.parse_args()
     if (a.readonly_checker or a.preen_checker) and not a.dirty_classification_kernel:
         parser.error('checker tests require --dirty-classification-kernel')
@@ -114,6 +117,13 @@ def main():
             if dirty_store:
                 assert caps['writable_desktop']['stage'] == 'needs-filesystem-check'
                 assert caps['writable_desktop']['error'] == -117
+                if a.network_roundtrip:
+                    payload = out / 'network-payload.bin'
+                    payload.write_bytes(bytes(range(251)) * 8193)
+                    transfer = BulkRun(h, out / 'network-upload').execute(s, a.key_file, 'put', source=payload, port=ports[1])
+                    received = BulkRun(h, out / 'network-download').execute(s, a.key_file, 'get',
+                        artifact_id=transfer['transaction_id'], port=ports[1])
+                    assert sha(payload) == sha(Path(received['artifact_path']))
                 if a.chmod_bootstrap:
                     payload = a.chmod_bootstrap.read_bytes()
                     for offset in range(0, len(payload), 2048):
@@ -173,7 +183,8 @@ def main():
                     'store_unmounted': True, 'store_bytes_unchanged': not bool(a.preen_checker),
                     'checked_shutdown': True, 'readonly_checker_passed': bool(a.readonly_checker),
                     'disposable_preen_passed': bool(a.preen_checker),
-                    'chmod_bootstrap_passed': bool(a.chmod_bootstrap)}, indent=2) + '\n')
+                    'chmod_bootstrap_passed': bool(a.chmod_bootstrap),
+                    'network_roundtrip_passed': bool(a.network_roundtrip)}, indent=2) + '\n')
                 print('DIRTY_STORE_CLASSIFICATION_QEMU_PASS', flush=True)
                 return
             tx = uuid.uuid4().hex
