@@ -50,7 +50,9 @@ class DiskStream(unittest.TestCase):
                     else:
                         result=disk_download('unused',1,key,boot,tx,path,expected,len(payload),lambda *x:events.append(x))
                         self.assertEqual(path.read_bytes(),payload);self.assertEqual(result['independent_sha256'],digest)
-                        self.assertEqual([x[0] for x in events],['offer_validated','guest_receipt','published'])
+                        self.assertEqual([x[0] for x in events],['offer_validated','transferring','transferring','guest_receipt','verifying','verifying','published'])
+                        self.assertEqual(events[2][1],{'bytes_completed':len(payload),'total_bytes':len(payload)})
+                        self.assertEqual(events[5][1],{'bytes_completed':len(payload),'total_bytes':len(payload)})
                 if mode=='collision':self.assertEqual(path.read_bytes(),b'preserve')
                 elif mode=='fsync_dir':
                     self.assertEqual(path.read_bytes(),payload)

@@ -1,5 +1,5 @@
 """Bounded binary data plane. Public results contain metadata and paths only."""
-import hashlib,json,os,socket,stat,struct,zlib
+import hashlib,json,os,socket,stat,struct,time,zlib
 from pathlib import Path
 
 LIMIT=1024**3
@@ -121,18 +121,30 @@ def disk_download(host,port,key,boot,transaction,path,expected,max_bytes,on_even
             space=os.fstatvfs(output.fileno())
             if count>space.f_bavail*space.f_frsize:raise OSError('Insufficient destination space')
             on_event('offer_validated',{'identity':actual,'bytes':count})
-            connection.sendall(b'READONLY');remaining=count;hasher=hashlib.sha256()
+            on_event('transferring',{'bytes_completed':0,'total_bytes':count})
+            connection.sendall(b'READONLY');remaining=count;hasher=hashlib.sha256();last_progress=time.monotonic()
             while remaining:
                 data=connection.recv(min(65536,remaining))
                 if not data:raise ConnectionError('Truncated disk stream')
                 output.write(data);hasher.update(data);remaining-=len(data)
+                now=time.monotonic()
+                if now-last_progress>=10 or not remaining:
+                    on_event('transferring',{'bytes_completed':count-remaining,'total_bytes':count});last_progress=now
             completed=line(connection);digest=hasher.hexdigest()
             if (completed.get('state'),completed.get('transaction_id'),completed.get('action'),completed.get('bytes'),completed.get('sha256'))!=('completed',transaction,'disk',count,digest):
                 raise ValueError('Disk receipt or streaming checksum mismatch')
             connection.close() # The guest does not wait for the independent host reread.
             output.flush();os.fsync(output.fileno())
             on_event('guest_receipt',completed)
-            output.seek(0);independent=hashlib.file_digest(output,'sha256').hexdigest()
+            output.seek(0);check=hashlib.sha256();verified=0;last_progress=time.monotonic()
+            on_event('verifying',{'bytes_completed':0,'total_bytes':count})
+            while True:
+                data=output.read(1024*1024)
+                if not data:break
+                check.update(data);verified+=len(data);now=time.monotonic()
+                if now-last_progress>=10 or verified>=count:
+                    on_event('verifying',{'bytes_completed':verified,'total_bytes':count});last_progress=now
+            independent=check.hexdigest()
             if independent!=digest or os.fstat(output.fileno()).st_size!=count:raise ValueError('Independent backup readback failed')
         os.link(partial,path);published=True
         on_event('published',{'artifact_path':str(path),'bytes':count,'sha256':digest})

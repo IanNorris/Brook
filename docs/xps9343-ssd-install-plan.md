@@ -67,6 +67,9 @@ phase must still satisfy the goal and technical prerequisites in force then.
    disk image and receipt will be inside that directory. Inspect the same
    transaction if it fails; do not automatically restart it. A successful
    guest receipt alone is insufficient without the completed host readback.
+   During transfer and the independent readback, `receipt.json` records phase
+   and byte counts at approximately ten-second intervals. Transfer counts are
+   progress indicators, not proof that the data has been durably verified.
 2. **Build a physical candidate.** Generate a new target-sized GPT and boot
    payload using the Dell's freshly observed controller, port, model, serial,
    capacity, sector sizes and flush capability. The QEMU desktop image embeds
