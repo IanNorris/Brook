@@ -39,7 +39,11 @@ def main():
         parser.add_argument('--' + option, required=True, type=Path)
     parser.add_argument('--dirty-classification-kernel', type=Path,
                         help='Instead verify that this kernel refuses a deliberately unclean store without changing it')
+    parser.add_argument('--readonly-checker', type=Path,
+                        help='Also run a statically linked e2fsck -fn on the private dirty image')
     a = parser.parse_args()
+    if a.readonly_checker and not a.dirty_classification_kernel:
+        parser.error('--readonly-checker requires --dirty-classification-kernel')
     if a.fixture.is_symlink() or not a.fixture.is_file() or a.fixture.stat().st_size != 500118192 * 512:
         raise ValueError('expected a stopped Dell-capacity regular-file QEMU fixture')
     out = a.output.absolute(); out.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -57,6 +61,8 @@ def main():
     else:
         run('mdel', '-i', initrd, '::ETC/writable-desktop')
     run('mcopy', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
+    if a.readonly_checker:
+        run('mcopy', '-i', initrd, a.readonly_checker, '::BOOT/E2FSCK.ELF')
     run('mcopy', '-o', '-i', media, initrd, '::INITRD.IMG')
     variables = out / 'VARS.fd'; shutil.copy2(os.environ['OVMF_VARS'], variables); variables.chmod(0o600)
     ports = []
@@ -96,6 +102,20 @@ def main():
             if dirty_store:
                 assert caps['writable_desktop']['stage'] == 'needs-filesystem-check'
                 assert caps['writable_desktop']['error'] == -117
+                if a.readonly_checker:
+                    checker_id = uuid.uuid4().hex
+                    h.guest_run(s, checker_id, ['/boot/E2FSCK.ELF', '-f', '-n', '/media/system/STORE.IMG'],
+                                cwd='/tmp', uid=0, wait_s=2)
+                    deadline = time.monotonic() + 240
+                    while True:
+                        job = h.job(s, checker_id, wait_s=2)
+                        (out / 'checker-job.json').write_text(json.dumps(job, indent=2) + '\n')
+                        if job['state'] in ('completed', 'failed', 'lost', 'rejected'):
+                            break
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('checker did not finish; inspect original job ' + checker_id)
+                    if job['state'] != 'completed' or job.get('exit', {}).get('code') != 0:
+                        raise RuntimeError('read-only checker failed; see checker-job.json')
                 request = uuid.uuid4().hex; state = h.power(s, request, 'shutdown'); deadline = time.monotonic() + 120
                 while state['state'] != 'ready':
                     if state['state'] in ('failed', 'unsupported') or time.monotonic() >= deadline:
@@ -105,7 +125,8 @@ def main():
                 recovered = out / 'after-store.img'; run('mcopy', '-i', media, '::STORE.IMG', recovered)
                 assert sha(recovered) == sha(dirty_store)
                 (out / 'result.json').write_text(json.dumps({'passed': True, 'stage': 'needs-filesystem-check',
-                    'store_unmounted': True, 'store_bytes_unchanged': True, 'checked_shutdown': True}, indent=2) + '\n')
+                    'store_unmounted': True, 'store_bytes_unchanged': True, 'checked_shutdown': True,
+                    'readonly_checker_passed': bool(a.readonly_checker)}, indent=2) + '\n')
                 print('DIRTY_STORE_CLASSIFICATION_QEMU_PASS', flush=True)
                 return
             tx = uuid.uuid4().hex
