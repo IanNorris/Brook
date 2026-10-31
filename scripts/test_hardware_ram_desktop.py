@@ -16,6 +16,7 @@ p.add_argument('--width',type=int,default=1920);p.add_argument('--height',type=i
 p.add_argument('--private-disk-mib',type=int,default=0,help='Build a larger disposable FAT disk by copying the private probe files; 0 reflinks the probe')
 p.add_argument('--memory-mb',type=int,default=2048,choices=[2048,4096,8192,16384])
 p.add_argument('--capture-network',action='store_true',help='Record the private QEMU network to network.pcap')
+p.add_argument('--allow-host-network',action='store_true',help='Permit QEMU user-network access to an explicit test server')
 a=p.parse_args();desktop=a.desktop.resolve(strict=True);maintenance=a.maintenance.resolve(strict=True);out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
 if not (640<=a.width<=4096 and 480<=a.height<=2160):p.error('Private test display must be 640..4096 by 480..2160')
 m=json.loads((desktop/'manifest.json').read_text());mm=json.loads((maintenance/'manifest.json').read_text())
@@ -52,7 +53,7 @@ argv=['qemu-system-x86_64','-machine','q35','-accel','kvm','-cpu','host','-smp',
     '-drive','if=pflash,format=raw,readonly=on,file='+os.environ['OVMF_CODE'],'-drive','if=pflash,format=raw,file='+str(variables),
     '-device','VGA,vgamem_mb=64','-device','qemu-xhci,id=usbc','-drive','if=none,id=stick,format=raw,file='+str(disk),
     '-device','usb-storage,bus=usbc.0,port=1,drive=stick,bootindex=1','-device','usb-net,bus=usbc.0,port=2,netdev=network',
-    '-netdev',f'user,id=network,restrict=on,hostfwd=tcp:127.0.0.1:{port}-:1234,hostfwd=tcp:127.0.0.1:{bulk_port}-:1236,hostfwd=tcp:127.0.0.1:{store_port}-:1237','-display','none','-serial','file:'+str(out/'serial.log'),
+    '-netdev',f'user,id=network,restrict={"off" if a.allow_host_network else "on"},hostfwd=tcp:127.0.0.1:{port}-:1234,hostfwd=tcp:127.0.0.1:{bulk_port}-:1236,hostfwd=tcp:127.0.0.1:{store_port}-:1237','-display','none','-serial','file:'+str(out/'serial.log'),
     '-qmp','unix:'+str(out/'qmp.sock')+',server=on,wait=off',
     '-qmp','unix:'+str(out/'qmp-review.sock')+',server=on,wait=off','-no-reboot']
 if a.capture_network:argv += ['-object',f'filter-dump,id=netcapture,netdev=network,file={out / "network.pcap"}']

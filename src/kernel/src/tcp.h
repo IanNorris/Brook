@@ -23,6 +23,36 @@ inline uint32_t TcpWriteSynOptions(uint8_t flags, uint8_t windowScale, uint8_t* 
     return 8;
 }
 
+// RFC 879: the IPv4 default is 536 when no usable MSS is advertised.
+// For duplicate options retain the smallest valid value. Invalid and zero
+// values never turn into zero-length sends.
+inline uint16_t TcpPeerMss(const uint8_t* options, uint32_t length)
+{
+    uint16_t mss = 0;
+    for (uint32_t i = 0; i < length;) {
+        const uint8_t kind = options[i];
+        if (kind == 0) break;
+        if (kind == 1) { ++i; continue; }
+        if (i + 1 >= length) break;
+        const uint32_t n = options[i + 1];
+        if (n < 2 || n > length - i) break;
+        if (kind == 2 && n == 4) {
+            const uint16_t value = (uint16_t(options[i + 2]) << 8) | options[i + 3];
+            if (value && (!mss || value < mss)) mss = value;
+        }
+        i += n;
+    }
+    return mss ? mss : 536;
+}
+
+inline uint16_t TcpEgressLimit(uint16_t peerMss, uint16_t ceiling)
+{
+    uint16_t limit = peerMss ? peerMss : 536;
+    if (limit > 1460) limit = 1460;
+    if (limit > ceiling) limit = ceiling;
+    return limit;
+}
+
 // Calibration can move the LAPIC-derived clock backwards. Only a forward
 // interval shorter than half the counter range can expire a TCP timer. This
 // also preserves ordinary uint64 wraparound for short elapsed intervals.

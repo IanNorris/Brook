@@ -1771,3 +1771,27 @@ Review also identified existing active-open window scaling follow-ups: SYN
 window advertisements must be unscaled, and a SYN-ACK without a valid scale
 option must disable both scaling directions. The MSS-only change does not
 address these separate negotiation issues.
+
+The physical Nix-cache failure was narrowed further: stock curl resolved the
+host and connected but its 1,559-byte TLS 1.3 ClientHello timed out. A TLS 1.2
+ClientHello and a reduced-size TLS 1.3 ClientHello both received HTTP 200. A
+one-shot guest loopback CONNECT relay preserved the stock verified TLS 1.3
+handshake while forwarding writes of at most 1,200 bytes; that also received
+HTTP 200. The host fetched the same endpoint successfully. The physical retry
+through Gallery nevertheless failed without the workaround. A 15-second sample
+of a direct stalled curl request was 98% idle; the CPU profile alone cannot
+identify the missing packet or ACK.
+
+The TCP candidate parses peer MSS on active and passive handshakes, uses 536
+when no valid IPv4 MSS is advertised, and never exceeds the peer value or the
+Ethernet 1460-byte payload. The optional `/etc/tcp-egress-1200` marker caps
+outgoing payloads at 1200 on paths known to need it; the Dell candidate enables
+this as a workaround, not a claim of path-MTU discovery. Host tests cover MSS
+options and bounds. A private QEMU wire capture of a 1559-byte POST recorded
+outgoing 1200/513-byte segments including HTTP headers, with byte-exact body
+at the receiver and checked shutdown. The full writable candidate additionally
+passed private QEMU create, clean shutdown, fresh-process verification and ext2
+checking (`tcp1200-writable-qemu-20261031/result.json`). Real Dell TLS, Gallery,
+and browser acceptance remain pending. The ceiling does not implement ICMP
+path-MTU discovery, peer-window flow control, or the separately tracked
+active-open handshake/window-scaling fixes.

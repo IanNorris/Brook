@@ -388,6 +388,18 @@ int main()
     ASSERT_EQ(TcpWriteSynOptions(TCP_SYN, 7, options), 8u);
     ASSERT_EQ(options[4], 1); ASSERT_EQ(options[5], 3);
     ASSERT_EQ(options[6], 3); ASSERT_EQ(options[7], 7);
+    const uint8_t peer1200[] = {1, 2, 4, 0x04, 0xb0, 0};
+    const uint8_t duplicate[] = {2, 4, 0x05, 0xb4, 2, 4, 0x04, 0xb0};
+    const uint8_t zero[] = {2, 4, 0, 0};
+    const uint8_t truncated[] = {2, 4, 0x04};
+    ASSERT_EQ(TcpPeerMss(peer1200, sizeof(peer1200)), 1200);
+    ASSERT_EQ(TcpPeerMss(duplicate, sizeof(duplicate)), 1200);
+    ASSERT_EQ(TcpPeerMss(zero, sizeof(zero)), 536);
+    ASSERT_EQ(TcpPeerMss(truncated, sizeof(truncated)), 536);
+    ASSERT_EQ(TcpPeerMss(nullptr, 0), 536);
+    ASSERT_EQ(TcpEgressLimit(1460, 1200), 1200);
+    ASSERT_EQ(TcpEgressLimit(536, 1200), 536);
+    ASSERT_EQ(TcpEgressLimit(9000, 1460), 1460);
     ASSERT_TRUE(Ipv4IsLoopback(htonl(0x7f000001)));
     ASSERT_TRUE(Ipv4IsLoopback(htonl(0x7f123456)));
     ASSERT_TRUE(!Ipv4IsLoopback(htonl(0x0a00020f)));

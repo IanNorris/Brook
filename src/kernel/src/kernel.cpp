@@ -793,6 +793,7 @@ __attribute__((noreturn)) static void KernelMainBody(brook::BootProtocol* bootPr
     //   Keyboard is NOT here — it needs APIC which is already set up, but
     //   we prefer loading it from the virtio disk for demonstration.
     brook::KsymDump();
+    brook::NetConfigureBoot();
     brook::SerialPuts("module: Phase 1 — loading from /drivers (ramdisk)\n");
     brook::KLog("BOOT stage: early modules begin");
     brook::ModuleDiscoverAndLoad("/drivers");

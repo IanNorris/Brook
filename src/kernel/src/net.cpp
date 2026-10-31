@@ -783,6 +783,17 @@ void NetReceive(NetIf* nif, const void* frame, uint32_t len)
 // Network interface management
 // ---------------------------------------------------------------------------
 
+static uint16_t g_tcpEgressCeiling = 1460;
+
+void NetConfigureBoot()
+{
+    if (auto* marker = VfsOpen("/etc/tcp-egress-1200")) {
+        VfsClose(marker);
+        g_tcpEgressCeiling = 1200;
+        KPuts("net: TCP egress ceiling 1200 (boot configuration)\n");
+    }
+}
+
 void NetInit()
 {
     memset(g_arpCache, 0, sizeof(g_arpCache));
@@ -1608,6 +1619,7 @@ static int SockCreateOwned(int domain, int type, int protocol, uint32_t pid,
         ResetSocketPayload(socket);
         socket.domain = domain;
         socket.type = type;
+        socket.tcpPeerMss = 536;
         socket.protocol = protocol ? protocol : (type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP);
         socket.identity = {g_socketInodes.allocate(), uid, gid};
         socket.ownerPid = pid;
@@ -2469,6 +2481,8 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             s.tcpState == TcpState::SynSent) {
             const uint8_t* optPtr = static_cast<const uint8_t*>(payload) + sizeof(TcpHeader);
             const uint8_t* optEnd = static_cast<const uint8_t*>(payload) + dataOff;
+            if (ack == s.tcpSndNxt)
+                s.tcpPeerMss = TcpPeerMss(optPtr, static_cast<uint32_t>(optEnd - optPtr));
             while (optPtr < optEnd) {
                 uint8_t kind = *optPtr;
                 if (kind == 0) break;
@@ -2669,6 +2683,8 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             child.tcpState   = TcpState::SynRecv;
             child.tcpLastRxTick = ApicTickCount(); // passive-open deadline origin
             child.tcpRcvNxt  = seq + 1;
+            child.tcpPeerMss = TcpPeerMss(static_cast<const uint8_t*>(payload) + sizeof(TcpHeader),
+                                          dataOff - sizeof(TcpHeader));
             child.listenSockIdx = static_cast<int>(i);
 
             // Generate ISS for the server side
@@ -2925,12 +2941,15 @@ int SockSend(int sockIdx, const void* buf, uint32_t len)
     const uint8_t* data = static_cast<const uint8_t*>(buf);
     uint32_t sent = 0;
 
-    // Send in MSS-sized chunks (max ~1460 for Ethernet)
-    static constexpr uint32_t MSS = 1460;
+    // Snapshot the negotiated MSS; never hold the socket lock across network
+    // submission or an ACK wait. The optional ceiling is boot-time immutable.
+    SpinLockAcquire(&s.lock);
+    const uint32_t mss = TcpEgressLimit(s.tcpPeerMss, g_tcpEgressCeiling);
+    SpinLockRelease(&s.lock);
 
     while (sent < len) {
         uint32_t chunk = len - sent;
-        if (chunk > MSS) chunk = MSS;
+        if (chunk > mss) chunk = mss;
 
         uint32_t seq = s.tcpSndNxt;
         s.tcpSndNxt += chunk;
