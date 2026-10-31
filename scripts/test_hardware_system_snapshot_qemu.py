@@ -41,9 +41,13 @@ def main():
                         help='Instead verify that this kernel refuses a deliberately unclean store without changing it')
     parser.add_argument('--readonly-checker', type=Path,
                         help='Also run a statically linked e2fsck -fn on the private dirty image')
+    parser.add_argument('--preen-checker', type=Path,
+                        help='Run e2fsck -p on the disposable dirty image and verify it offline')
     a = parser.parse_args()
-    if a.readonly_checker and not a.dirty_classification_kernel:
-        parser.error('--readonly-checker requires --dirty-classification-kernel')
+    if (a.readonly_checker or a.preen_checker) and not a.dirty_classification_kernel:
+        parser.error('checker tests require --dirty-classification-kernel')
+    if a.readonly_checker and a.preen_checker:
+        parser.error('choose one checker mode')
     if a.fixture.is_symlink() or not a.fixture.is_file() or a.fixture.stat().st_size != 500118192 * 512:
         raise ValueError('expected a stopped Dell-capacity regular-file QEMU fixture')
     out = a.output.absolute(); out.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -61,8 +65,8 @@ def main():
     else:
         run('mdel', '-i', initrd, '::ETC/writable-desktop')
     run('mcopy', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
-    if a.readonly_checker:
-        run('mcopy', '-i', initrd, a.readonly_checker, '::BOOT/E2FSCK.ELF')
+    if a.readonly_checker or a.preen_checker:
+        run('mcopy', '-i', initrd, a.readonly_checker or a.preen_checker, '::BOOT/E2FSCK.ELF')
     run('mcopy', '-o', '-i', media, initrd, '::INITRD.IMG')
     variables = out / 'VARS.fd'; shutil.copy2(os.environ['OVMF_VARS'], variables); variables.chmod(0o600)
     ports = []
@@ -102,9 +106,10 @@ def main():
             if dirty_store:
                 assert caps['writable_desktop']['stage'] == 'needs-filesystem-check'
                 assert caps['writable_desktop']['error'] == -117
-                if a.readonly_checker:
+                if a.readonly_checker or a.preen_checker:
                     checker_id = uuid.uuid4().hex
-                    h.guest_run(s, checker_id, ['/boot/E2FSCK.ELF', '-f', '-n', '/media/system/STORE.IMG'],
+                    checker_args = ['-f', '-n'] if a.readonly_checker else ['-p']
+                    h.guest_run(s, checker_id, ['/boot/E2FSCK.ELF', *checker_args, '/media/system/STORE.IMG'],
                                 cwd='/tmp', uid=0, wait_s=2)
                     deadline = time.monotonic() + 240
                     while True:
@@ -114,8 +119,9 @@ def main():
                             break
                         if time.monotonic() >= deadline:
                             raise TimeoutError('checker did not finish; inspect original job ' + checker_id)
-                    if job['state'] != 'completed' or job.get('exit', {}).get('code') != 0:
-                        raise RuntimeError('read-only checker failed; see checker-job.json')
+                    acceptable = (0,) if a.readonly_checker else (0, 1)
+                    if job['state'] != 'completed' or job.get('exit', {}).get('code') not in acceptable:
+                        raise RuntimeError('checker failed; see checker-job.json')
                 request = uuid.uuid4().hex; state = h.power(s, request, 'shutdown'); deadline = time.monotonic() + 120
                 while state['state'] != 'ready':
                     if state['state'] in ('failed', 'unsupported') or time.monotonic() >= deadline:
@@ -123,10 +129,23 @@ def main():
                     time.sleep(.2); state = h.power(s, request, 'status')
                 qmp = Qmp(out / 'qmp.sock'); qmp.call('quit'); assert owner.wait(timeout=15) == 0
                 recovered = out / 'after-store.img'; run('mcopy', '-i', media, '::STORE.IMG', recovered)
-                assert sha(recovered) == sha(dirty_store)
+                if a.preen_checker:
+                    # Host verification is deliberately read-only and occurs after
+                    # QEMU has shut down, on the extracted disposable image.
+                    check = subprocess.run([str(a.preen_checker), '-f', '-n', str(recovered)],
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    (out / 'host-check.log').write_bytes(check.stdout)
+                    if check.returncode != 0:
+                        raise RuntimeError('offline host verification failed; see host-check.log')
+                    with recovered.open('rb') as f:
+                        f.seek(1082)
+                        assert f.read(2) == b'\x01\x00', 'preen did not mark image clean'
+                else:
+                    assert sha(recovered) == sha(dirty_store)
                 (out / 'result.json').write_text(json.dumps({'passed': True, 'stage': 'needs-filesystem-check',
-                    'store_unmounted': True, 'store_bytes_unchanged': True, 'checked_shutdown': True,
-                    'readonly_checker_passed': bool(a.readonly_checker)}, indent=2) + '\n')
+                    'store_unmounted': True, 'store_bytes_unchanged': not bool(a.preen_checker),
+                    'checked_shutdown': True, 'readonly_checker_passed': bool(a.readonly_checker),
+                    'disposable_preen_passed': bool(a.preen_checker)}, indent=2) + '\n')
                 print('DIRTY_STORE_CLASSIFICATION_QEMU_PASS', flush=True)
                 return
             tx = uuid.uuid4().hex
