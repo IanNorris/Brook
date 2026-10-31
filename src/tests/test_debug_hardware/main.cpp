@@ -8,6 +8,7 @@
 #include "writable_desktop.h"
 #include "ahci_readonly.h"
 #include "ahci_observe.h"
+#include "acpi.h"
 #include <cassert>
 #include <cstring>
 #include <string>
@@ -15,6 +16,11 @@ std::string reply,dispatched;
 unsigned powerCalls=0;std::string powerVerb;
 unsigned backlightCalls=0;uint32_t backlightSeconds=0;bool backlightOn=true;
 namespace brook {
+uint32_t AcpiInventoryCount(){return 1;}
+bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& h){
+    if(index || offset>1024 || bytes>1024-offset)return false;
+    h={};h.length=1024;if(bytes)std::memset(out,0xab,bytes);return true;
+}
 AppSnapshotBootInfo snapshot;
 WritableDesktopInfo writable;
 WritableDesktopInfo WritableDesktopRead(){return writable;}
@@ -94,6 +100,13 @@ int main(){
     assert(handle("bridge hardware pci 2 16") && reply.find("\"devices\":[]")!=std::string::npos);
     for(const auto* bad:{"0 0","0 17","3 1","4294967296 1","0 1 more","0 -1"}){
         assert(handle(std::string("bridge hardware pci ")+bad));assert(reply.find("pci_error")!=std::string::npos);
+    }
+    assert(handle("bridge hardware acpi-info") && reply.find("\"tables\":1")!=std::string::npos);
+    assert(handle("bridge hardware acpi 0 4 2") && reply.find("\"hex\":\"abab\"")!=std::string::npos);
+    assert(handle("bridge hardware acpi 0 0 512"));
+    assert(reply.find("\"hex\":\""+[](){std::string s;for(int i=0;i<512;++i)s+="ab";return s;}()+"\"")!=std::string::npos);
+    for(const auto* bad:{"0 0 513","1 0 1","0 1024 1","0 0 -1","0 0 1 extra","4294967296 0 0"}){
+        assert(handle(std::string("bridge hardware acpi ")+bad) && reply.find("acpi_error")!=std::string::npos);
     }
     assert(handle("bridge hardware caps"));
     assert(reply.find("\"power_api\":1")!=std::string::npos && reply.find("\"power_off\":false")!=std::string::npos);

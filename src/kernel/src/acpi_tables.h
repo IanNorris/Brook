@@ -49,6 +49,34 @@ public:
     bool ValidTable(uint64_t at,AcpiSdtHeader& out) const {
         return Header(at,out) && Checksum(at,out.length);
     }
+    bool Initialized() const {return root_!=0;}
+    uint32_t RootEntryCount() const {return root_?count_:0;}
+    // Indexed access keeps duplicate signatures (notably SSDTs) distinct.
+    uint64_t RootEntry(uint32_t index,AcpiSdtHeader* out=nullptr) const {
+        if(!root_ || index>=count_)return 0;
+        uint64_t address=0;AcpiSdtHeader header{};
+        if(!Copy(root_+sizeof(AcpiSdtHeader)+uint64_t(index)*entryBytes_,&address,entryBytes_) ||
+           !ValidTable(address,header))return 0;
+        if(out)*out=header;return address;
+    }
+    // DSDT is referenced by the validated FADT, not normally an XSDT entry.
+    uint64_t Dsdt(AcpiSdtHeader* out=nullptr) const {
+        AcpiSdtHeader fadt{},dsdt{};const uint64_t at=Find("FACP",&fadt);
+        if(!at || fadt.length<44)return 0;
+        uint32_t legacy=0;uint64_t extended=0;
+        if(!Copy(at+40,&legacy,sizeof(legacy)))return 0;
+        if(fadt.length>=148 && !Copy(at+140,&extended,sizeof(extended)))return 0;
+        const uint64_t address=extended?extended:legacy;
+        if(!ValidTable(address,dsdt) || !Equal(dsdt.signature,"DSDT",4))return 0;
+        if(out)*out=dsdt;return address;
+    }
+    // Only copy bytes from a table that is valid at the time of the request.
+    // This does not provide arbitrary physical-memory access.
+    bool CopyTable(uint64_t address,uint32_t offset,void* output,uint32_t bytes) const {
+        AcpiSdtHeader h{};
+        return output && bytes && ValidTable(address,h) && offset<=h.length &&
+            bytes<=h.length-offset && Copy(address+offset,output,bytes);
+    }
     uint64_t Find(const char* signature,AcpiSdtHeader* out=nullptr) const {
         if(!signature || !root_)return 0;
         for(uint32_t i=0;i<count_;++i) {

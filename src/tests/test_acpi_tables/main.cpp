@@ -40,6 +40,35 @@ struct Firmware {
 };
 int main(){
     Firmware f;assert(f.init());auto reset=AcpiGetResetInfo();assert(reset.available && reset.port==0xcf9 && reset.value==6);
+    // Enumeration retains duplicate root entries and exposes DSDT only via a
+    // checksum-validated FADT reference. Firmware spans remain bounded.
+    {
+        auto* dsdt=f.memory+16384;Firmware::header(dsdt,"DSDT",64);Firmware::checksum(dsdt,64,9);
+        Firmware::put32(f.fadt+40,Firmware::address(dsdt));Firmware::put64(f.fadt+140,Firmware::address(dsdt));f.fadtCrc();
+        AcpiTableReader reader;
+        auto read=[](void* ctx,uint64_t at,void* out,uint32_t n)->bool {
+            auto* firmware=static_cast<Firmware*>(ctx);const auto start=Firmware::address(firmware->memory);
+            if(at<start || at-start>65536 || n>65536-(at-start))return false;
+            std::memcpy(out,reinterpret_cast<void*>(at),n);return true;
+        };
+        assert(reader.Init(read,&f,Firmware::address(f.rsdp)) && reader.RootEntryCount()==2);
+        AcpiSdtHeader table{};assert(reader.RootEntry(0,&table)==Firmware::address(f.fadt));
+        assert(reader.RootEntry(1)==Firmware::address(f.madt) && !reader.RootEntry(2));
+        assert(reader.Dsdt(&table)==Firmware::address(dsdt) && table.length==64);
+        uint8_t copy[8]{};assert(reader.CopyTable(reader.Dsdt(),0,copy,sizeof(copy)) && !std::memcmp(copy,"DSDT",4));
+        assert(f.init() && AcpiInventoryCount()==3);
+        assert(AcpiInventoryRead(0,0,copy,sizeof(copy),table) && !std::memcmp(copy,"DSDT",4));
+        assert(AcpiInventoryRead(1,0,copy,0,table) && !std::memcmp(table.signature,"FACP",4));
+        assert(!AcpiInventoryRead(3,0,copy,1,table) && !AcpiInventoryRead(0,60,copy,8,table));
+        assert(!AcpiInventoryRead(0,0,copy,513,table) && !AcpiInventoryRead(0,0,nullptr,1,table));
+        assert(!reader.CopyTable(reader.Dsdt(),60,copy,8) && !reader.CopyTable(reader.Dsdt(),UINT32_MAX,copy,1));
+        dsdt[40]^=1;assert(!reader.Dsdt());dsdt[40]^=1;
+        Firmware::put64(f.fadt+140,0);f.fadtCrc();assert(reader.Dsdt()==Firmware::address(dsdt));
+        Firmware::put64(f.fadt+140,~0ull);f.fadtCrc();assert(!reader.Dsdt());
+        Firmware::put64(f.xsdt+44,Firmware::address(f.memory)+65536);Firmware::checksum(f.xsdt,52,9);
+        assert(!reader.RootEntry(1));
+        f.reset();
+    }
     auto madt=AcpiGetMadt();assert(madt.processorCount==1 && madt.apicIds[0]==2 && madt.ioApicPhysical==0xfec00000);
     // Optional FADT failures do not invalidate a sound MADT or issue I/O.
     f.fadt[200]^=1;f.noReset();assert(!AcpiFindTable("FACP"));

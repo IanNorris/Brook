@@ -16,6 +16,7 @@
 #include "ahci_readonly.h"
 #include "writable_desktop.h"
 #include "ssd_install_qemu.h"
+#include "acpi.h"
 namespace brook {
 namespace {
 using Reply=BridgeReplyBuffer<DebugChannelSend>;
@@ -95,6 +96,23 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
         r.text(",\"panic_transport\":false,\"raw_frame_transfer\":");r.text(bulk?"true":"false");r.text("}\n");r.send();return true;
     }
     constexpr char pciPrefix[]="bridge hardware pci ";
+    if(!strcmp(command,"bridge hardware acpi-info")) {
+        Reply r;r.text("{\"acpi_api\":1,");r.field("tables",AcpiInventoryCount());r.text("}\n");r.send();return true;
+    }
+    constexpr char acpiPrefix[]="bridge hardware acpi ";
+    if(Prefix(command,acpiPrefix)) {
+        const char* p=command+sizeof(acpiPrefix)-1;uint32_t index=0,offset=0,count=0;uint8_t data[512];AcpiSdtHeader header{};
+        if(!Decimal(p,index) || *p++!=' ' || !Decimal(p,offset) || *p++!=' ' || !Decimal(p,count) || *p || count>sizeof(data)) {
+            DebugChannelSend("{\"acpi_error\":\"Expected index, offset and byte count 0..512\"}\n");return true;
+        }
+        if(!AcpiInventoryRead(index,offset,data,count,header)) {
+            DebugChannelSend("{\"acpi_error\":\"Table unavailable or invalid range\"}\n");return true;
+        }
+        Reply r;r.text("{\"acpi_api\":1,");r.field("tables",AcpiInventoryCount());r.text(",");r.field("index",index);
+        r.text(",");r.field("offset",offset);r.text(",");r.field("length",header.length);r.text(",\"hex\":\"");
+        const char* hex="0123456789abcdef";for(uint32_t i=0;i<count;++i){r.append(hex[data[i]>>4]);r.append(hex[data[i]&15]);}
+        r.text("\"}\n");r.send();return true;
+    }
 #if defined(BROOK_AHCI_WRITE_TEST_HOOKS)
     if(!strcmp(command,"bridge hardware ahci-qemu-install begin")) {
         DebugChannelSend(SsdQemuInstallBegin()?"{\"install_test\":\"started\"}\n":"{\"install_test\":\"refused\"}\n");return true;

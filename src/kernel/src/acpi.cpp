@@ -137,4 +137,11 @@ bool AcpiInit(uint64_t rsdp,const MemoryDescriptor* map,uint32_t count)
 const MadtInfo& AcpiGetMadt(){return g_madt;}
 const AcpiResetInfo& AcpiGetResetInfo(){return g_reset;}
 uint64_t AcpiFindTable(const char* signature){return g_tables.Find(signature);}
+uint32_t AcpiInventoryCount(){return g_tables.Initialized()?g_tables.RootEntryCount()+1:0;}
+bool AcpiInventoryRead(uint32_t index,uint32_t offset,void* out,uint32_t bytes,AcpiSdtHeader& header) {
+    if(index>=AcpiInventoryCount() || bytes>512 || (bytes && !out))return false;
+    const uint64_t address=index?g_tables.RootEntry(index-1,&header):g_tables.Dsdt(&header);
+    if(!address || offset>header.length || bytes>header.length-offset)return false;
+    return !bytes || g_tables.CopyTable(address,offset,out,bytes);
+}
 } // namespace brook

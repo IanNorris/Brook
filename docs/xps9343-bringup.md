@@ -1746,6 +1746,17 @@ Startup remains muted and the user-visible volume control must precede speaker
 playback. Do not claim codec detection or functioning hardware audio until each
 physical gate has been observed.
 
+A read-only ACPI inventory is available over the boot-pinned hardware bridge.
+It exposes only checksum-validated DSDT/root-table entries in bounded chunks;
+it accepts no caller-supplied physical address and does not execute AML or
+probe device registers. `tools/hardware_acpi_inventory.py` saves the tables to
+a private output directory and checks their lengths and checksums again. The
+collector and normal kernel captured seven QEMU firmware tables, including
+DSDT (`build/hardware/acpi-qemu-capture`). Invalid table slots are reported
+separately. Firmware tables can contain device-specific identifiers, so keep
+captures local. The interface has not yet been deployed or tested on the Dell;
+QEMU capture does not establish that the Dell's SST or codec resources work.
+
 ### Passive-open MSS and hardware transfer profile (2026-10-31)
 
 A 4 GB store upload to the Dell's USB stick ran at approximately 2.8 MB/s;
