@@ -84,8 +84,16 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   were saved and verified on host storage. The new slot and selection were
   flushed and read back, then the USB was unmounted. A physical recovery boot
   and actual SSD-store snapshot are still pending.
+- Later, the Dell booted the recovery USB and the unmounted store was read
+  remotely. The user chose direct repair instead of completing the slow image
+  copy, accepting reinstall if needed. A standalone static `e2fsck` staged in
+  recovery RAM found inode and bitmap inconsistencies; automatic preen returned
+  1 (errors corrected), and a complete subsequent read-only check returned 0.
+  The next checked restart selected the SSD payload and reported the persistent
+  desktop store ready. The original Firefox-associated hang remains unresolved;
+  this recovery does not prove that future crashes are handled automatically.
 
-## Remaining engineering gates
+## Installation plan and historical engineering gates
 
 1. **Backup decision.** The user explicitly waived backing up the old Ubuntu
    SSD. A physical read-only 64 MiB sample transferred at about 1.13 MiB/s;

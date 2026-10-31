@@ -43,10 +43,26 @@ writes, failed flushes, interruption at each phase, failed reboot/admission and
 concurrent alias attempts. Verify both the containing FAT filesystem and the
 inner ext2 image after recovery. Test under QEMU and then on physical hardware.
 
-For the current Dell incident, first preserve the existing unmounted image and
-repair a separate copy. That evidence-preserving operation is distinct from
-implementing automatic boot recovery and must not be replaced by an untested
-in-place repair.
+When practical, preserve an unmounted image and repair a separate copy. That
+evidence-preserving operation is distinct from implementing automatic boot
+recovery; in-place repair still needs an independently tested checker and a
+clear decision about the value of the data at risk.
+
+## Dell recovery, 2026-10-31
+
+The user chose direct recovery over completing the image copy, accepting that
+the installation could be recreated if recovery failed. With the desktop store
+unmounted, a static `e2fsck -f -n` reported an inode deletion-time issue and
+block and inode bitmap inconsistencies. `e2fsck -p` exited 1 after correcting
+errors; a subsequent `e2fsck -f -n` completed all five passes with exit 0.
+After a checked restart, the SSD payload booted and the persistent desktop
+store reported `ready`. These checks do not establish the cause of the
+original hang or prove arbitrary interruption recovery. Automatic boot-time
+checking and safe ownership of the backing image remain unimplemented.
+
+The checker and a small chmod bootstrap were staged into RAM in the USB
+recovery environment. The same checker and staging approach were exercised on
+a disposable QEMU image first; no checker executable was written to the SSD.
 
 References: [Linux ext2 filesystem checking](https://docs.kernel.org/7.0/filesystems/ext2.html),
 [e2fsck manual and exit codes](https://man7.org/linux/man-pages/man8/e2fsck.8.html).

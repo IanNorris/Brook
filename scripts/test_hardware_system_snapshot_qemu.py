@@ -43,6 +43,10 @@ def main():
                         help='Also run a statically linked e2fsck -fn on the private dirty image')
     parser.add_argument('--preen-checker', type=Path,
                         help='Run e2fsck -p on the disposable dirty image and verify it offline')
+    parser.add_argument('--chmod-bootstrap', type=Path,
+                        help='Test staging a RAM-only chmod helper through the recovery shell')
+    parser.add_argument('--recovery-initrd', type=Path,
+                        help='Copy the production recovery shell into the disposable initrd')
     a = parser.parse_args()
     if (a.readonly_checker or a.preen_checker) and not a.dirty_classification_kernel:
         parser.error('checker tests require --dirty-classification-kernel')
@@ -65,6 +69,10 @@ def main():
     else:
         run('mdel', '-i', initrd, '::ETC/writable-desktop')
     run('mcopy', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
+    if a.recovery_initrd:
+        shell = out / 'busybox'
+        run('mcopy', '-i', a.recovery_initrd, '::BOOT/BUSYBOX', shell)
+        run('mcopy', '-o', '-i', initrd, shell, '::BOOT/BUSYBOX')
     if a.readonly_checker or a.preen_checker:
         run('mcopy', '-i', initrd, a.readonly_checker or a.preen_checker, '::BOOT/E2FSCK.ELF')
     run('mcopy', '-o', '-i', media, initrd, '::INITRD.IMG')
@@ -106,6 +114,25 @@ def main():
             if dirty_store:
                 assert caps['writable_desktop']['stage'] == 'needs-filesystem-check'
                 assert caps['writable_desktop']['error'] == -117
+                if a.chmod_bootstrap:
+                    payload = a.chmod_bootstrap.read_bytes()
+                    for offset in range(0, len(payload), 2048):
+                        encoded = ''.join('\\%03o' % byte for byte in payload[offset:offset + 2048])
+                        redirect = '>' if offset == 0 else '>>'
+                        script = "printf '%b' '" + encoded + "' " + redirect + ' /boot/STOREQA.ELF'
+                        ident = uuid.uuid4().hex
+                        h.guest_run(s, ident, ['/boot/busybox', 'sh', '-c', script], cwd='/tmp', uid=0, wait_s=2)
+                        job = h.job(s, ident, wait_s=20)
+                        if job['state'] != 'completed' or job.get('exit', {}).get('code') != 0:
+                            raise RuntimeError('bootstrap staging failed: ' + repr(job))
+                    for argv in (['/boot/busybox', 'sh', '-c', 'printf test > /tmp/chmod-probe'],
+                                 ['/boot/STOREQA.ELF', '/tmp/chmod-probe'],
+                                 ['/boot/busybox', 'sh', '-c', 'test -x /tmp/chmod-probe']):
+                        ident = uuid.uuid4().hex
+                        h.guest_run(s, ident, argv, cwd='/tmp', uid=0, wait_s=2)
+                        job = h.job(s, ident, wait_s=20)
+                        if job['state'] != 'completed' or job.get('exit', {}).get('code') != 0:
+                            raise RuntimeError('bootstrap verification failed: ' + repr(job))
                 if a.readonly_checker or a.preen_checker:
                     checker_id = uuid.uuid4().hex
                     checker_args = ['-f', '-n'] if a.readonly_checker else ['-p']
@@ -145,7 +172,8 @@ def main():
                 (out / 'result.json').write_text(json.dumps({'passed': True, 'stage': 'needs-filesystem-check',
                     'store_unmounted': True, 'store_bytes_unchanged': not bool(a.preen_checker),
                     'checked_shutdown': True, 'readonly_checker_passed': bool(a.readonly_checker),
-                    'disposable_preen_passed': bool(a.preen_checker)}, indent=2) + '\n')
+                    'disposable_preen_passed': bool(a.preen_checker),
+                    'chmod_bootstrap_passed': bool(a.chmod_bootstrap)}, indent=2) + '\n')
                 print('DIRTY_STORE_CLASSIFICATION_QEMU_PASS', flush=True)
                 return
             tx = uuid.uuid4().hex
