@@ -1,5 +1,6 @@
 #include "acpi.h"
 #include "acpi_tables.h"
+#include "boot_resource_map.h"
 #include "boot_protocol/boot_protocol.h"
 #include "serial.h"
 
@@ -50,6 +51,8 @@ struct MadtLapicOverride
 static MadtInfo g_madt{};
 static AcpiResetInfo g_reset{};
 static AcpiTableReader g_tables;
+static BootResourceMap g_bootResourceMap;
+static bool g_acpiReady=false;
 struct FirmwareRegion {uint64_t begin,end;bool nvs;};
 static FirmwareRegion g_regions[512]{};
 static uint32_t g_regionCount=0;
@@ -143,7 +146,7 @@ static bool ParseMadt(uint64_t physical,const AcpiSdtHeader& header)
 }
 bool AcpiInit(uint64_t rsdp,const MemoryDescriptor* map,uint32_t count)
 {
-    g_madt={};g_reset={};g_tables={};
+    g_madt={};g_reset={};g_tables={};g_acpiReady=false;g_bootResourceMap.Capture(map,count);
     if(!CaptureFirmwareRegions(map,count) || !g_tables.Init(ReadFirmware,nullptr,rsdp)) {
         g_mmioMapValid=false;SerialPuts("ACPI: invalid/unreadable RSDP or root table\n");return false;
     }
@@ -153,13 +156,17 @@ bool AcpiInit(uint64_t rsdp,const MemoryDescriptor* map,uint32_t count)
     if(!madt || !ParseMadt(madt,header)) {
         g_madt={};g_mmioMapValid=false;SerialPuts("ACPI: MADT missing or malformed\n");return false;
     }
-    return true;
+    g_acpiReady=true;return true;
 }
 const MadtInfo& AcpiGetMadt(){return g_madt;}
 const AcpiResetInfo& AcpiGetResetInfo(){return g_reset;}
 uint64_t AcpiFindTable(const char* signature){return g_tables.Find(signature);}
 bool AcpiNvsContains(uint64_t address,uint32_t bytes){return ContainsFirmware(address,bytes,true);}
 bool AcpiMmioMapValid(){return g_mmioMapValid;}
+bool AcpiClassifyBootRange(uint64_t address,uint32_t bytes,BootResourceClassification& result) {
+    if(!g_acpiReady){result={};return false;}
+    return g_bootResourceMap.Classify(address,bytes,result);
+}
 bool AcpiMmioContains(uint64_t address,uint32_t bytes) {
     if(!g_mmioMapValid || !bytes || address>=IdentityLimit || bytes>IdentityLimit-address)return false;
     const uint64_t end=address+bytes;uint64_t cursor=address;

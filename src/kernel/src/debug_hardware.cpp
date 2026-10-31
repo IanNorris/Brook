@@ -110,6 +110,13 @@ bool DebugHardwareHandleCommand(const char* command,uint32_t length){
             r.text(",\"mmio_map_valid\":");r.text(AcpiMmioMapValid()?"true":"false");
             r.text(",\"i2c_base0_mmio_declared\":");r.text((s.i2cBase0 && !(s.i2cBase0&4095) && AcpiMmioContains(s.i2cBase0,4096))?"true":"false");
             r.text(",\"i2c_base1_mmio_declared\":");r.text((s.i2cBase1 && !(s.i2cBase1&4095) && AcpiMmioContains(s.i2cBase1,4096))?"true":"false");
+            BootResourceClassification c0{},c1{};
+            const bool v0=s.i2cBase0 && !(s.i2cBase0&4095) && AcpiClassifyBootRange(s.i2cBase0,4096,c0);
+            const bool v1=s.i2cBase1 && !(s.i2cBase1&4095) && AcpiClassifyBootRange(s.i2cBase1,4096,c1);
+            r.text(",\"i2c_base0_boot_map\":{\"valid\":");r.text(v0?"true":"false");
+            r.text(",");r.field("types",c0.types);r.text(",\"unreported\":");r.text(c0.unreported?"true":"false");r.text("}");
+            r.text(",\"i2c_base1_boot_map\":{\"valid\":");r.text(v1?"true":"false");
+            r.text(",");r.field("types",c1.types);r.text(",\"unreported\":");r.text(c1.unreported?"true":"false");r.text("}");
         }
         r.text("}\n");r.send();return true;
     }

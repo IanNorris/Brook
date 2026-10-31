@@ -105,6 +105,9 @@ int main(){
     MemoryDescriptor classified[3]={f.map,{0xfe103000,1,MemoryType::Mmio,0},{0xfe104000,1,MemoryType::Reserved,0}};
     assert(AcpiInit(Firmware::address(f.rsdp),classified,3));
     assert(AcpiMmioMapValid());
+    BootResourceClassification observed{};
+    assert(AcpiClassifyBootRange(0xfe103000,4096,observed) && observed.types==(1u<<uint32_t(MemoryType::Mmio)) && !observed.unreported);
+    assert(AcpiClassifyBootRange(0xfe105000,4096,observed) && observed.types==0 && observed.unreported);
     assert(AcpiMmioContains(0xfe103000,4096) && AcpiMmioContains(0xfe103ffc,4));
     assert(!AcpiMmioContains(0xfe103fff,2) && !AcpiMmioContains(0xfe104000,4096));
     assert(!AcpiMmioContains(~0ull,2) && !AcpiMmioContains(0xfe103000,0));

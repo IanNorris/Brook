@@ -1829,6 +1829,18 @@ This does not prove those addresses are unusable: the firmware map may omit or
 classify device resources differently. No I²C or SST device register has been
 mapped or read. Desktop storage was ready and SSD inventory remained read-only.
 
+The subsequent boot-map snapshot preserves all Brook boot-protocol descriptor
+types and reports overlaps and gaps without granting device access. Host tests
+cover conflicting overlaps, adjacent spans, gaps, malformed/oversized maps,
+alignment, overflow and copied-map lifetime. The exact candidate passed the
+private QEMU writable-desktop and reboot gate, then booted on the Dell
+(`dell-audio-ownership-update-20261031`). Both full I²C0 windows were entirely
+unreported in the valid boot descriptor map: neither intersects any descriptor
+in that snapshot. This is a firmware-map observation, not proof of device
+ownership, cache-alias safety or absence of PCI/dynamic resource conflicts.
+No device register was read. The desktop store remained ready and SSD inventory
+read-only.
+
 ### Passive-open MSS and hardware transfer profile (2026-10-31)
 
 A 4 GB store upload to the Dell's USB stick ran at approximately 2.8 MB/s;
