@@ -1615,3 +1615,16 @@ rejects a mismatched UUID, invalid descriptor, dirty state and truncated size.
 This checks admission metadata only: exclusive ownership, complete SHA256
 readback and filesystem consistency remain separate responsibilities. The direct
 USB transfer helper and its QEMU/physical acceptance are still outstanding.
+
+The unintegrated `HardwareStoreTransaction` core now creates a new fixed-name
+image exclusively, writes bounded chunks, hashes the transfer, syncs and reopens
+RW, checks boot metadata and hashes the complete readback. Finalization creates
+and syncs a temporary marker, publishes it without replacement, syncs the
+directory and checks the marker. Its monotonic publication/durability status
+makes a failure after rename distinguishable from one before publication. The
+caller must retain the directory FD and shared update lock throughout. Static
+musl host tests with a16MiB real ext2 image pass successful publication, existing
+and symlink collisions, bad hash, and injected failures immediately before and
+after marker rename. Astra reviewed this component. The network receiver,
+exclusive access enforcement, long-running transfer timeouts and QEMU/native
+FAT acceptance are not implemented yet; this is not a deployable updater.
