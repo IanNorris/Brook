@@ -39,7 +39,12 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   success with no error. A checked reboot selected the still-connected USB;
   it did not establish SSD boot. The guest reached a clean, safe-to-power-off
   state, but its power-off method is unsupported. A manual power-off and boot
-  with USB removed is needed to verify the installed SSD.
+  with USB removed was required for the first SSD boot test.
+- The user subsequently reported that Brook reached the desktop from the
+  internal SSD with the boot USB removed. The previous debug IP was not
+  reachable on the first follow-up, so network access, the mounted store,
+  application functionality and persistence across restart remain to be
+  independently checked on this physical boot.
 
 ## Remaining engineering gates
 
