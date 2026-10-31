@@ -2222,3 +2222,26 @@ full target-sized logical geometry, while the packed source has a different
 length. Any future package verification must bind its geometry as well as its
 bytes, and independently validate source leases, target identity and both GPT
 copies before enabling writes.
+
+The compile-gated disposable-QEMU worker now accepts this compact layout for
+the exact 64 MiB fixture, split into two FAT files. The QEMU harness builds
+those segments from the full fixture; this fixed geometry is test-only and is
+not a general installer package format. In
+`build/hardware/compact-installer-qemu-v2-20261031`, the worker completed its
+copy, flush and independent readback; the stopped target matched the original
+image byte for byte. A new QEMU process then booted the installed SATA disk
+without USB (`build/hardware/compact-sata-boot-20261031`). A missing second
+segment failed before the first installer operation and the stopped target
+matched its original scratch disk (`build/hardware/compact-installer-missing-20261031`).
+These tests do not exercise a full desktop, general source authentication, or
+physical installation; the Dell SSD remains read-only.
+
+The final test kernel binds the parsed GPT payload span to the compact map
+before starting the installer engine. An independently generated valid GPT
+with a different partition start was rejected with zero installer operations;
+the stopped scratch disk was byte-identical to its input
+(`build/hardware/compact-installer-wrong-span-20261031`). The final kernel
+also completed a valid compact install and booted its result without USB
+(`build/hardware/compact-installer-final-20261031`,
+`build/hardware/compact-sata-boot-final-20261031`). The original full-source
+fixture path still passed (`build/hardware/noncompact-installer-regression-20261031`).

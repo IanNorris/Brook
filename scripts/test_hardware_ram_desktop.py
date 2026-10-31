@@ -21,6 +21,7 @@ p.add_argument('--sata-image',type=Path,help='Attach a regular-file SATA fixture
 p.add_argument('--sata-qemu-scratch',type=Path,help='Copy a recognized fixture into this output and attach it with a test-only serial')
 p.add_argument('--installer-source',type=Path,help='Copy a recognized regular-file source into the private USB fixture for the test-only installer')
 p.add_argument('--installer-segmented',action='store_true',help='Split the test source into two pinned FAT files')
+p.add_argument('--installer-compact',action='store_true',help='Use the compact layout for the recognized 64 MiB QEMU fixture')
 p.add_argument('--installer-omit-second',action='store_true',help='Omit the second source segment for a failure test')
 p.add_argument('--review-timeout',type=int,default=600,help='Maximum seconds to wait for the test reviewer (60..7200)')
 a=p.parse_args();desktop=a.desktop.resolve(strict=True);maintenance=a.maintenance.resolve(strict=True);out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
@@ -44,24 +45,41 @@ if a.private_disk_mib:
 else:run('cp','--reflink=auto',maintenance/'probe.raw',disk)
 if a.installer_segmented and not a.installer_source:p.error('segmented source requires --installer-source')
 if a.installer_omit_second and not a.installer_segmented:p.error('omitting a segment requires --installer-segmented')
+if a.installer_compact and not a.installer_segmented:p.error('compact source requires --installer-segmented')
 if a.installer_source:
     if not a.installer_segmented:p.error('the installer test kernel requires --installer-segmented')
     if not a.sata_qemu_scratch:p.error('installer source requires the private SATA scratch fixture')
     if a.installer_source.is_symlink() or not a.installer_source.is_file() or a.installer_source.stat().st_size not in (64*1024**2,6*1024**3+2*1024**2):
         p.error('installer source must be a recognized 64 MiB or 6 GiB + 2 MiB regular file')
-    total=a.installer_source.stat().st_size
-    segment=32*1024**2 if total==64*1024**2 else 2*1024**3
+    disk_bytes=a.installer_source.stat().st_size
+    if a.installer_compact and disk_bytes!=64*1024**2:p.error('compact mode only supports the 64 MiB fixture')
+    total=(34+126976+33)*512 if a.installer_compact else disk_bytes
+    segment=32*1024**2 if disk_bytes==64*1024**2 else 2*1024**3
     with a.installer_source.open('rb') as source:
+        if a.installer_compact:
+            # The test kernel accepts only this geometry; its GPT preflight
+            # independently checks the actual source before any writes.
+            ranges=[(0,34*512),(2048*512,126976*512),((131072-33)*512,33*512)]
+        else:ranges=[(0,total)]
+        range_index=0;within=0
         for i in range((total+segment-1)//segment):
             if i==1 and a.installer_omit_second:break
             part=out/f'installer-part-{i}.tmp'
             with part.open('xb') as target:
-                for _ in range(min(segment,total-i*segment)//1024**2):
-                    data=source.read(1024**2)
-                    if len(data)!=1024**2:raise ValueError('short installer source')
+                remaining=min(segment,total-i*segment)
+                while remaining:
+                    start,length=ranges[range_index]
+                    n=min(1024**2,remaining,length-within)
+                    source.seek(start+within);data=source.read(n)
+                    if len(data)!=n:raise ValueError('short installer source')
                     target.write(data)
+                    remaining-=n;within+=n
+                    if within==length:range_index+=1;within=0
             run('mcopy','-o','-i',str(disk)+'@@1048576',part,f'::INST{i:04}.IMG')
             part.unlink()
+    if a.installer_compact:
+        marker=out/'INSTCMP.OK';marker.write_text('test-only compact source\n')
+        run('mcopy','-o','-i',str(disk)+'@@1048576',marker,'::INSTCMP.OK')
 kernel=(desktop/'kernel.elf').read_bytes();initrd=(desktop/'INITRD.IMG').read_bytes()
 for name,capacity,data in [('KERNEL.ELF',KERNEL_MAX,kernel),('INITRD.IMG',INITRD_MAX,initrd)]:
     path=out/name

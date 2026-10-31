@@ -4,6 +4,7 @@
 #include "ssd_install_engine.h"
 #include "ssd_install_gate.h"
 #include "ssd_install_segmented_source.h"
+#include "ssd_install_compact_source.h"
 #include "ahci_readonly.h"
 #include "fatfs_vfs.h"
 #include "device.h"
@@ -19,11 +20,12 @@ namespace {
 SsdInstallGate gate;uint32_t state=0,stage=0,paused=0;uint64_t operations=0;int error=0;
 FatImageLease* retainedLease[4]{};
 struct Source {
-    FatImageLease** leases; SsdInstallSegmentedSource map;
+    FatImageLease** leases; SsdInstallSegmentedSource map; const SsdInstallCompactSource* compact;
     int readSegment(uint32_t index,uint64_t offset,void* p,uint32_t n) {
         return FatFsImageRead(leases[index],offset,p,n);
     }
-    int read(uint64_t offset,void* p,uint32_t n) {return map.Read(*this,offset,p,n);}
+    int readPacked(uint64_t offset,void* p,uint32_t n) {return map.Read(*this,offset,p,n);}
+    int read(uint64_t offset,void* p,uint32_t n) {return compact ? compact->Read(*this,offset,p,n) : readPacked(offset,p,n);}
 };
 struct Io {
     Source* source;Device* target;
@@ -37,9 +39,18 @@ int Run() {
     if(!target || DeviceBlockSize(target)!=512)return -22;
     const uint64_t sectors=DeviceBlockCount(target);
     if(sectors!=131072 && sectors!=12587008)return -22;
-    const uint32_t count=sectors==131072?2:4;
+    auto* marker=VfsOpen("/media/usb/INSTCMP.OK");const bool compact=marker!=nullptr;
+    if(marker)VfsClose(marker);
+    // Compact mode is intentionally limited to the recognized small QEMU
+    // fixture until a production source manifest and identity gate exist.
+    const SsdInstallGeometry compactGeometry{131072,2048,126976};
+    const SsdInstallCompactSource compactMap(compactGeometry,(34+compactGeometry.payloadSectors+33)*512);
+    if(compact && sectors!=131072)return -22;
+    const uint64_t sourceBytes=compact?compactMap.ExpectedSize():sectors*512;
     const uint64_t segment=sectors==131072?32ull*1024*1024:2ull*1024*1024*1024;
-    Source source{retainedLease,SsdInstallSegmentedSource(sectors*512,segment,count)};
+    const uint32_t count=uint32_t((sourceBytes-1)/segment+1);
+    if(count>4)return -22;
+    Source source{retainedLease,SsdInstallSegmentedSource(sourceBytes,segment,count),compact?&compactMap:nullptr};
     static const char* paths[]={"/media/usb/INST0000.IMG","/media/usb/INST0001.IMG",
                                 "/media/usb/INST0002.IMG","/media/usb/INST0003.IMG"};
     int result=0;Device* firstBacking=nullptr;
@@ -70,6 +81,11 @@ int Run() {
         if(!result)for(unsigned i=0;i<128;++i){const uint8_t* e=entries+i*128;
             if(!StrictAllZero(e,16)){first=StrictLe64(e+32);last=StrictLe64(e+40);break;}}
         const SsdInstallGeometry geometry{sectors,first,last>=first?last-first+1:0};
+        // Bind the compact map to the GPT before even the invalidation phase.
+        // A valid GPT with a different payload must never drive this map.
+        if(!result && compact && (geometry.diskSectors!=compactGeometry.diskSectors ||
+            geometry.payloadFirst!=compactGeometry.payloadFirst ||
+            geometry.payloadSectors!=compactGeometry.payloadSectors))result=-22;
         if(!result && !SsdInstallPreflight(geometry,sectors,DeviceBlockCount(target),DeviceBlockSize(target),
             mbr,primary,backup,entries,copy,16384))result=-22;
         if(!result) {
