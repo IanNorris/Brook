@@ -51,7 +51,11 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   App Gallery also produced a window. Firefox launch was dispatched, but no
   window had been observed when the debug network became unreachable again.
   The reason for that loss and the earlier missing network on one boot remain
-  unexplained; neither observation establishes that Firefox caused it.
+  unexplained; neither observation establishes that Firefox caused it. A prior
+  USB-booted Dell run also lost network contact after a Firefox session (see
+  the Firefox HTTPS follow-up in `xps9343-bringup.md`), so this is not yet
+  evidence of an SSD-specific failure. Physical screen and input observations
+  are needed to distinguish a guest hang from an adapter or link failure.
 
 ## Remaining engineering gates
 
