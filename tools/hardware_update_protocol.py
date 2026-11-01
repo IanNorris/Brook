@@ -51,3 +51,26 @@ def upload(host,port,key,boot_id,transaction_id,kernel,initrd,activate=False,*,p
         activated=line(connection)
         if activated.get('state')!='activated':raise RuntimeError(activated)
         return {'plan':plan,**activated}
+
+def promote(host,port,key,boot_id,transaction_id,expected_slot,kernel,initrd,activate=False):
+    """Select a verified older payload; caller must persist the transaction ID.
+
+    A missing reply after ACTIVATE is uncertain, never automatically retried.
+    The exact local payload identity must match the on-disk older selector.
+    """
+    for value in (key,boot_id,transaction_id):
+        if len(value)!=32 or any(c not in '0123456789abcdef' for c in value):raise ValueError('Expected 32 lowercase hex characters')
+    if expected_slot not in (0,1):raise ValueError('Expected slot 0 or 1')
+    with socket.create_connection((host,port),timeout=30) as connection:
+        connection.settimeout(180)
+        connection.sendall(b'BRPROMOT'+key.encode()+boot_id.encode()+transaction_id.encode())
+        plan=line(connection)
+        if plan.get('state')!='promote_ready' or plan.get('slot')!=expected_slot:raise RuntimeError(plan)
+        connection.sendall(record(plan['generation'],expected_slot,kernel,initrd))
+        staged=line(connection)
+        if staged.get('state')!='staged':raise RuntimeError(staged)
+        if not activate:return {'plan':plan,**staged}
+        connection.sendall(b'ACTIVATE')
+        result=line(connection)
+        if result.get('state')!='promoted' or result.get('generation')!=plan['generation'] or result.get('slot')!=expected_slot:raise RuntimeError(result)
+        return {'plan':plan,**result}

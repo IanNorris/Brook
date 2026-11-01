@@ -3,7 +3,7 @@
 import argparse,hashlib,json,os,socket,subprocess,sys,time,uuid
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
-from hardware_update_protocol import record,authenticate,line,upload,KERNEL_MAX,INITRD_MAX
+from hardware_update_protocol import record,authenticate,line,upload,promote as promote_client,KERNEL_MAX,INITRD_MAX
 p=argparse.ArgumentParser(description=__doc__);p.add_argument('--program',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
 a=p.parse_args();out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
 key=uuid.uuid4().hex;boot=uuid.uuid4().hex;tx=uuid.uuid4().hex
@@ -92,5 +92,66 @@ def conflict(port):
     with socket.create_connection(('127.0.0.1',port)) as c:
         c.sendall(b'BRUPLOAD'+key.encode()+boot.encode()+tx.encode());assert line(c)['code']==12
 results.append(run_case('conflicting-records',conflict,12))
+# Promotion rewrites only the newest selector; the older payload and selector
+# stay intact. A subsequent ordinary update must choose the opposite slot.
+kernel_b=bytearray(kernel);kernel_b[400]^=1;kernel_b=bytes(kernel_b)
+initrd_b=bytes([1])+initrd[1:]
+with (out/'B/KERNEL.ELF').open('r+b') as f:f.write(kernel_b)
+with (out/'B/INITRD.IMG').open('r+b') as f:f.write(initrd_b)
+(out/'SELECT0.BIN').write_bytes(record(7,0,kernel,initrd))
+(out/'SELECT1.BIN').write_bytes(record(8,1,kernel_b,initrd_b))
+def promote(port,mode):
+    with socket.create_connection(('127.0.0.1',port)) as c:
+        c.sendall(b'BRPROMOT'+key.encode()+boot.encode()+tx.encode())
+        plan=line(c);assert plan=={'state':'promote_ready','generation':9,'slot':0,'selector':1},plan
+        proposed=record(9,0,kernel,initrd)
+        if mode=='bad':proposed=record(9,1,kernel,initrd)
+        c.sendall(proposed)
+        if mode=='bad':assert line(c)['code']==16;return
+        assert line(c)['state']=='staged'
+        if mode=='staged':return
+        c.sendall(b'ACTIVATE')
+        result=line(c)
+        if mode=='write-failure':assert result['code']==25,result
+        else:assert result['state']=='promoted'
+results.append(run_case('promote-mismatched',lambda port:promote(port,'bad'),16))
+results.append(run_case('promote-staged',lambda port:promote(port,'staged'),22))
+saved_selector=(out/'SELECT0.BIN').read_bytes()
+saved_payloads={name:value for name,value in hashes().items() if name.startswith(('A/','B/'))}
+results.append(run_case('promote',lambda port:promote_client('127.0.0.1',port,key,boot,tx,0,kernel,initrd,True),0,False))
+assert (out/'SELECT0.BIN').read_bytes()==saved_selector
+assert (out/'SELECT1.BIN').read_bytes()==record(9,0,kernel,initrd)
+after_promotion=hashes();assert all(after_promotion[name]==value for name,value in saved_payloads.items())
+results.append(run_case('update-after-promotion',lambda port:transfer(port,'activate'),0,False))
+assert (out/'SELECT0.BIN').read_bytes()==record(10,1,kernel,initrd)
+assert (out/'SELECT1.BIN').read_bytes()==record(9,0,kernel,initrd)
+after_update=hashes();assert all(after_update[name]==value for name,value in saved_payloads.items() if name.startswith('A/'))
+# An uncertain publication must retain the update lock and the old selector.
+# A torn newer selector has an invalid CRC; the loader can still use the old
+# record, assuming unrelated FAT metadata was not damaged.
+import zlib
+for failure in ('selector-short','selector-fsync'):
+    (out/'SELECT0.BIN').write_bytes(record(7,0,kernel,initrd))
+    (out/'SELECT1.BIN').write_bytes(record(8,1,kernel,initrd))
+    results.append(run_case('promote-'+failure,lambda port:promote(port,'write-failure'),25,False,failure))
+    assert (out/'lock').exists()
+    assert (out/'SELECT0.BIN').read_bytes()==record(7,0,kernel,initrd)
+    newest=(out/'SELECT1.BIN').read_bytes()
+    if failure=='selector-short':assert zlib.crc32(newest[:124])!=struct.unpack_from('<I',newest,124)[0]
+    assert hashes()['A/KERNEL.ELF']==saved_payloads['A/KERNEL.ELF']
+    assert hashes()['A/INITRD.IMG']==saved_payloads['A/INITRD.IMG']
+    (out/'lock').unlink()
+def rejected_promotion(port,code):
+    with socket.create_connection(('127.0.0.1',port)) as c:
+        c.sendall(b'BRPROMOT'+key.encode()+boot.encode()+tx.encode());assert line(c)['code']==code
+(out/'SELECT0.BIN').write_bytes(record(7,0,kernel,initrd))
+(out/'SELECT1.BIN').write_bytes(record(8,0,kernel,initrd))
+results.append(run_case('promote-same-slot',lambda port:rejected_promotion(port,28),28))
+(out/'SELECT0.BIN').write_bytes(record(7,0,kernel_b,initrd))
+(out/'SELECT1.BIN').write_bytes(record(8,1,kernel,initrd))
+results.append(run_case('promote-invalid-older',lambda port:rejected_promotion(port,28),28))
+(out/'SELECT0.BIN').write_bytes(record(7,0,kernel,initrd))
+(out/'SELECT1.BIN').write_bytes(record(2**64-1,1,kernel,initrd))
+results.append(run_case('promote-generation-overflow',lambda port:rejected_promotion(port,14),14))
 (out/'result.json').write_text(json.dumps({'passed':True,'cases':results},indent=2)+'\n')
 print('HARDWARE_UPDATE_HOST_PASS')

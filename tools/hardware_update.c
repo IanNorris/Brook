@@ -73,6 +73,12 @@ static int read_records(uint8_t record[2][128]) {
 static int write_file(unsigned index,const uint8_t* bytes,size_t length) {
     int fd=open_existing(index);if(fd<0)return -1;
     int result=0;mutated=1;
+#ifdef BROOK_UPDATE_TEST
+    const char* failure=getenv("BROOK_UPDATE_TEST_FAILURE");
+    if(index>=4 && failure && !strcmp(failure,"selector-short")){
+        (void)write(fd,bytes,32);(void)fsync(fd);close(fd);return -1;
+    }
+#endif
     while(length) {
         size_t chunk=length>4096?4096:length;ssize_t n=write(fd,bytes,chunk);
         if(n<0&&errno==EINTR)continue;
@@ -80,6 +86,9 @@ static int write_file(unsigned index,const uint8_t* bytes,size_t length) {
         bytes+=n;length-=(size_t)n;
     }
     if(!result&&fsync(fd))result=-1;
+#ifdef BROOK_UPDATE_TEST
+    if(index>=4 && failure && !strcmp(failure,"selector-fsync"))result=-1;
+#endif
     if(close(fd))result=-1;
     return result;
 }
@@ -105,10 +114,12 @@ static int hex32(const char* p) {
 }
 static int serve(int client,const char* key,const char* boot,const char* transaction) {
     uint8_t header[104];
-    if(network_bytes(client,header,sizeof(header))||memcmp(header,"BRUPLOAD",8)||
+    if(network_bytes(client,header,sizeof(header))||
+       (memcmp(header,"BRUPLOAD",8)&&memcmp(header,"BRPROMOT",8))||
        !BrookUpdateEqual(header+8,(const uint8_t*)key,32)||
        !BrookUpdateEqual(header+40,(const uint8_t*)boot,32)||
        !BrookUpdateEqual(header+72,(const uint8_t*)transaction,32))return 10;
+    int promote=!memcmp(header,"BRPROMOT",8);
     uint8_t records[2][128];if(read_records(records))return 11;
     int newest=BrookUpdateNewest(records[0],records[1]);if(newest<0)return 12;
     int active=-1;
@@ -122,6 +133,29 @@ static int serve(int client,const char* key,const char* boot,const char* transac
     uint64_t generation=BrookUpdateGet64(records[newest]+8);
     if(generation==UINT64_MAX)return 14;
     generation++;
+    if(promote){
+        /* Promote only a separately recorded, verified older pair. Keep its
+         * existing selector untouched until the new selector is durable. */
+        unsigned older=1-(unsigned)newest;
+        if(active!=newest || pair_valid(records[older])!=1 ||
+           BrookUpdateGet32(records[older]+16)==BrookUpdateGet32(records[newest]+16))return 28;
+        uint8_t expected[128];memcpy(expected,records[older],sizeof(expected));
+        BrookUpdatePut64(expected+8,generation);BrookUpdatePut32(expected+124,BrookUpdateCrc(expected,124));
+        char plan[160];snprintf(plan,sizeof(plan),"{\"state\":\"promote_ready\",\"generation\":%" PRIu64 ",\"slot\":%u,\"selector\":%u}\n",
+                                generation,BrookUpdateGet32(expected+16),(unsigned)newest);
+        if(reply(client,plan))return 15;
+        uint8_t incoming[128],activate[8];
+        if(network_bytes(client,incoming,sizeof(incoming))||!BrookUpdateEqual(incoming,expected,sizeof(expected)))return 16;
+        if(reply(client,"{\"state\":\"staged\",\"storage_modified\":false}\n"))return 21;
+        if(network_bytes(client,activate,sizeof(activate))||memcmp(activate,"ACTIVATE",8))return 22;
+        if(write_file(4+(unsigned)newest,expected,sizeof(expected)))return 25;
+        if(read_records(records)||!BrookUpdateEqual(records[newest],expected,sizeof(expected))||pair_valid(expected)!=1)return 26;
+        printf("HWUPDATE_PROMOTED generation=%" PRIu64 " slot=%u transaction=%s reboot_required=1\n",
+               generation,BrookUpdateGet32(expected+16),transaction);fflush(stdout);
+        snprintf(plan,sizeof(plan),"{\"state\":\"promoted\",\"generation\":%" PRIu64 ",\"slot\":%u,\"reboot_required\":true}\n",
+                 generation,BrookUpdateGet32(expected+16));
+        (void)reply(client,plan);return 0;
+    }
     unsigned slot=1-BrookUpdateGet32(records[active]+16),selector=1-(unsigned)active;
     char plan[160];snprintf(plan,sizeof(plan),"{\"state\":\"ready\",\"generation\":%" PRIu64 ",\"slot\":%u,\"selector\":%u}\n",generation,slot,selector);
     if(reply(client,plan))return 15;

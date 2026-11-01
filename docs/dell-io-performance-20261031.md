@@ -265,3 +265,16 @@ Both receive depths passed the private QEMU USB Ethernet acceptance with the
 snapshot enabled, including traffic and USB storage/HID checks. This diagnostic
 kernel has not yet been installed on the Dell; preserve the currently accepted
 SSD recovery slot when planning its first physical comparison.
+
+A maintenance receiver prototype can promote an older, separately verified
+slot by publishing a newer selector for its unchanged payload. It requires an
+authenticated, boot-bound transaction, exact expected payload identity, and an
+explicit activation; it leaves the older selector and both payloads untouched.
+The subsequent ordinary update then targets the other slot. Private host tests
+cover distinct slot contents, mismatched identity, same-slot and invalid
+records, generation overflow, and simulated torn-selector and sync failures.
+An uncertain write retains the maintenance lock. The intact selector gives a
+fallback if the new record is damaged; it does not guarantee recovery from
+arbitrary FAT or device failure. This prototype has not been exercised in a
+guest or deployed on the Dell, and a lost activation reply must be inspected
+using the same transaction rather than retried automatically.
