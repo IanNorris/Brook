@@ -6,6 +6,7 @@
 // A second kernel thread streams the ring buffer over TCP on port 1234.
 
 #include "debug_overlay.h"
+#include "console_viewport.h"
 #include "font_atlas.h"
 #include "spinlock.h"
 #include "process.h"
@@ -257,9 +258,9 @@ static void KernelConsoleThread(void* /*arg*/)
     static char dispBuf[64][RING_COLS + 1];
     uint32_t dispCount = 0;
     uint32_t lastTotal = 0;
-    uint32_t lastScale = 0, viewEnd = 0;
+    uint32_t lastScale = 0;
     uint64_t incarnation = 0;
-    bool following = true;
+    ConsoleViewport view;
 
     for (;;)
     {
@@ -292,13 +293,8 @@ static void KernelConsoleThread(void* /*arg*/)
                 else if(events[i].scanCode==SC_EXT_END)lines=-static_cast<int>(RING_LINES);
             }
             if(!lines)continue;
-            if(following)viewEnd=nowTotal;
-            uint32_t oldest=nowTotal>RING_LINES-1?nowTotal-(RING_LINES-1):0;
-            uint32_t minEnd=oldest+((nowTotal-oldest)<visibleLines?(nowTotal-oldest):visibleLines);
-            int64_t end=static_cast<int64_t>(viewEnd)-lines;
-            if(end<minEnd)end=minEnd;
-            if(end>nowTotal)end=nowTotal;
-            viewEnd=static_cast<uint32_t>(end);following=viewEnd==nowTotal;scrolled=true;
+            view.Scroll(lines,nowTotal,RING_LINES-1,visibleLines);
+            scrolled=true;
         }
         if (nowTotal != lastTotal || width!=nextW || height!=nextH || scale!=lastScale || scrolled)
         {
@@ -309,13 +305,8 @@ static void KernelConsoleThread(void* /*arg*/)
             SpinLockAcquire(&g_ringLock);
 
             uint32_t totalAvail = g_totalLines;
-            uint32_t oldest=totalAvail>RING_LINES-1?totalAvail-(RING_LINES-1):0;
-            if(following || viewEnd>totalAvail)viewEnd=totalAvail;
-            uint32_t minEnd=oldest+((totalAvail-oldest)<visibleLines?(totalAvail-oldest):visibleLines);
-            if(viewEnd<minEnd)viewEnd=minEnd;
-            uint32_t count=viewEnd-oldest;
-            if(count>visibleLines)count=visibleLines;
-            uint32_t startLine=viewEnd-count;
+            uint32_t startLine,count;
+            view.Range(totalAvail,RING_LINES-1,visibleLines,startLine,count);
 
             for (uint32_t i = 0; i < count; i++)
             {

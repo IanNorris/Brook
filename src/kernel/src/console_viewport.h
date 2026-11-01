@@ -1,0 +1,38 @@
+#pragma once
+#include <stdint.h>
+
+namespace brook {
+// Absolute line positions keep the viewed history stable as new logs arrive.
+struct ConsoleViewport {
+    uint32_t end = 0;
+    bool following = true;
+
+    static uint32_t Oldest(uint32_t total, uint32_t retained) {
+        return total > retained ? total - retained : 0;
+    }
+    static uint32_t MinimumEnd(uint32_t total, uint32_t retained, uint32_t visible) {
+        const uint32_t oldest=Oldest(total,retained);
+        const uint32_t available=total-oldest;
+        return oldest+(available<visible?available:visible);
+    }
+    void Scroll(int lines, uint32_t total, uint32_t retained, uint32_t visible) {
+        if(following || end>total)end=total;
+        int64_t next=static_cast<int64_t>(end)-lines;
+        const uint32_t minimum=MinimumEnd(total,retained,visible);
+        if(next<minimum)next=minimum;
+        if(next>total)next=total;
+        end=static_cast<uint32_t>(next);
+        following=end==total;
+    }
+    void Range(uint32_t total, uint32_t retained, uint32_t visible,
+               uint32_t& start, uint32_t& count) {
+        const uint32_t oldest=Oldest(total,retained);
+        if(following || end>total)end=total;
+        const uint32_t minimum=MinimumEnd(total,retained,visible);
+        if(end<minimum)end=minimum;
+        count=end-oldest;
+        if(count>visible)count=visible;
+        start=end-count;
+    }
+};
+}

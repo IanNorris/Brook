@@ -1,8 +1,21 @@
 #include "debug_overlay.h"
+#include "console_viewport.h"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
 int main(){
+    // Follow, hold a historical position during writes, recover when that
+    // history wraps, and resume following at the newest line.
+    brook::ConsoleViewport view;uint32_t start=0,count=0;
+    view.Range(100,511,10,start,count);assert(start==90 && count==10 && view.following);
+    view.Scroll(9,100,511,10);view.Range(105,511,10,start,count);
+    assert(start==81 && count==10 && !view.following);
+    view.Scroll(1000,105,511,10);view.Range(800,511,10,start,count);
+    assert(start==289 && count==10 && !view.following);
+    view.Scroll(-1000,800,511,10);view.Range(805,511,10,start,count);
+    assert(start==795 && count==10 && view.following);
+    view.Range(3,511,10,start,count);assert(start==0 && count==3);
+    view.Range(3,511,0,start,count);assert(start==3 && count==0);
     brook::DebugOverlayInit();
     for(unsigned i=0;i<530;++i){char line[32];std::snprintf(line,sizeof(line),"L%03u\n",i);brook::DebugOverlayPuts(line);}
     brook::DebugOverlayPuts("PARTIAL");
