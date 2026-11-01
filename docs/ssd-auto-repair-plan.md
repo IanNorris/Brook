@@ -10,22 +10,32 @@ The repair must happen after the scheduler can run a user process: store
 admission currently runs before ordinary user processes can execute. On the
 verified system-volume path, a boot-only maintenance coordinator should:
 
-1. Take a kernel-issued, one-shot repair lease only if the bound SSD identity,
-   `STORE.OK` and configured image agree, and admission ended specifically at
-   `needs-filesystem-check` with no store device, backing lease or `/nix` or
-   `/data/home` mount left active. Other failures remain maintenance failures;
+1. Only when the bound SSD identity, `STORE.OK` and configured image agree,
+   and admission ended specifically at `needs-filesystem-check`, retain the
+   already-acquired `FatImageDevice` backing and exclusive FAT lease instead
+   of destroying it. Keep it unregistered, unbound to ext2 and unavailable
+   through ordinary pathname opens. Other failures remain maintenance failures;
    they must not trigger repair against a guessed disk or another file.
-2. Run the bundled checker on that exact, exclusively leased store with `-p`.
-   Save its exit status and output in the maintenance console. Never run a
-   second checker or admit the store concurrently. A lost helper or ambiguous
-   status is failure, not permission to retry a write automatically.
-3. Treat only documented successful preen outcomes as candidates for recovery,
+2. Before any checker writes, persist and flush an identity-bound pending
+   repair record. Normal store admission must respect that record even if an
+   interrupted checker has already marked ext2 clean. Suppress ordinary app
+   startup on this repair boot and start the coordinator only once the scheduler
+   and cleanup infrastructure can run it.
+3. Provide the checker a narrowly scoped descriptor over the retained device,
+   with bounded reads, writes, seek, stat and flush. Keep the exclusive lease
+   across both checker processes. Run the bundled checker with `-p`; save its
+   exit status and output in the maintenance console. Never run a second
+   checker or admit the store concurrently. A lost helper or ambiguous status
+   is failure, not permission to retry a write automatically. Timeout handling
+   must terminate and drain the checker and its I/O before ownership changes.
+4. Treat preen exit codes 0 and 1 as candidates for recovery,
    flush the backing file and its FAT volume, then run a separate read-only
    `-f -n` verification. The read-only check must exit cleanly. Interrupted,
    uncorrected, operational, usage and cancellation outcomes remain in
    maintenance; never turn them into a successful boot.
-4. Release the repair lease only after successful verification and checked
-   flush. A clean reboot is the first implementation's admission path: it
+5. Clear the identity-bound pending record only after successful verification
+   and checked flush; persist and verify its completion before releasing the
+   repair lease. A clean reboot is the first implementation's admission path: it
    rechecks SSD identity and `STORE.OK` and avoids resetting the existing
    boot-once mount state. Limit automatic repair/reboot attempts using durable,
    verified state so a recurring failure cannot create an endless reboot loop.
