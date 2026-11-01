@@ -480,3 +480,15 @@ The experimental flight remains boot-opt-in; its limits are documented in
 `docs/tcp-sender-pipeline-plan.md`. After the comparison, the Dell is on the
 same-kernel single-packet control as SSD generation 27; the independently
 verified recovery payload remains in slot B. Physical audio remains absent.
+
+The separately built fixed-four experiment was then booted as SSD generation
+29, retaining the verified recovery payload in slot B. Three 4 MiB local
+Dell-to-host RAM transfers took 0.981, 0.936 and 0.936 s with matching digests;
+observed TX-busy, RX-drop and covered ACK-failure counters did not rise.
+Three 100,000-byte Cloudflare uploads took 1.003, 0.960 and 0.922 s, all HTTP
+200; connection times were 69, 35 and 40 ms. Total time includes setup.
+The four-packet kernel differs from the earlier same-kernel one/two controls,
+so these sequential samples suggest scaling but do not isolate the marker.
+Neither fixed flight is suitable as a general congestion policy yet. The Dell
+was left on the opt-in experimental generation 29, and the separate recovery
+slot was not overwritten.
