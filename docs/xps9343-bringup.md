@@ -2395,6 +2395,18 @@ resource fields remain unresolved. The format follows Linux's
 [CATPT messages](https://github.com/torvalds/linux/blob/master/sound/soc/intel/catpt/messages.h)
 and [IPC driver](https://github.com/torvalds/linux/blob/master/sound/soc/intel/catpt/ipc.c).
 
+For a later Linux boot on this Dell, `scripts/dell_linux_audio_snapshot.py
+--output /tmp/brook-dell-audio.json` collects read-only ACPI/platform device
+metadata, sound registration, relevant filtered kernel messages, firmware and
+ACPI table hashes. Running as root may expose otherwise unreadable logs and
+table hashes. It does not access device memory or change driver state; absent
+and unreadable fields remain explicit. XZ firmware payloads are bounded and
+hashed separately from their stored file. Zstd firmware is identified and
+hashed in stored form, with its payload explicitly marked undecoded. A saved
+report can guide resource discovery but does not establish Brook ownership or
+authorize MMIO access. Host fixture tests are in
+`scripts/test_dell_linux_audio_snapshot.py`.
+
 ### Firefox HTTPS follow-up and lost hardware connection (2026-10-31)
 
 On the Dell boot pinned by the hardware bridge, a single Firefox launch as
