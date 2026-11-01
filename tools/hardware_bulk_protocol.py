@@ -4,10 +4,18 @@ API 1's explicit getz/framez actions select independently compressed 64 KiB
 chunks; get/frame retain their original uncompressed wire format. The digest
 and final receipt always describe the uncompressed payload.
 """
-import hashlib,json,os,socket,stat,struct,time,zlib
+import hashlib,json,os,platform,socket,stat,struct,sys,time,zlib
 from pathlib import Path
 
 LIMIT=1024**3
+def validate_pacing(rate):
+    if rate is not None and (isinstance(rate,bool) or not isinstance(rate,int) or not 0<rate<=0x7fffffff):
+        raise ValueError('Pacing rate must be a positive signed 32-bit byte-per-second value')
+    if rate is not None and sys.platform != 'linux':
+        raise OSError('SO_MAX_PACING_RATE is unavailable on this host')
+    if rate is not None and not hasattr(socket,'SO_MAX_PACING_RATE') and platform.machine() not in ('x86_64','amd64'):
+        raise OSError('SO_MAX_PACING_RATE is not known for this Linux architecture')
+
 def identifier(value):
     if not isinstance(value,str) or len(value)!=32 or any(c not in '0123456789abcdef' for c in value):
         raise ValueError('Expected 32 lowercase hex characters')
@@ -31,13 +39,18 @@ def authenticate(connection,key,boot,transaction):
     ready=line(connection)
     if ready!={'state':'ready','bulk_api':1}:raise ValueError('Unsupported bulk receiver')
 
-def upload(host,port,key,boot,transaction,path,finalize=True,*,max_bytes=LIMIT,timeout=60):
+def upload(host,port,key,boot,transaction,path,finalize=True,*,max_bytes=LIMIT,timeout=60,pace_bytes_per_second=None):
+    validate_pacing(pace_bytes_per_second)
     path=Path(path).resolve(strict=True)
     with path.open('rb') as source:
         before=os.fstat(source.fileno())
         if not stat.S_ISREG(before.st_mode) or not 0<=before.st_size<=max_bytes:raise ValueError('Source must be a regular file within the transfer limit')
         digest=hashlib.file_digest(source,'sha256').digest();source.seek(0)
         with socket.create_connection((host,port),timeout=30) as connection:
+            if pace_bytes_per_second is not None:
+                # Linux SO_MAX_PACING_RATE is bytes/second. Never silently
+                # ignore an unsupported option: this is a controlled test knob.
+                connection.setsockopt(socket.SOL_SOCKET,getattr(socket,'SO_MAX_PACING_RATE',47),pace_bytes_per_second)
             connection.settimeout(timeout);authenticate(connection,key,boot,transaction)
             connection.sendall(struct.pack('<Q',before.st_size)+digest)
             sent=0

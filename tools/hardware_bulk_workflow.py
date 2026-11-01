@@ -2,16 +2,18 @@
 import hashlib,json,stat,uuid
 from pathlib import Path
 from hardware_update_workflow import UpdateRun
-from hardware_bulk_protocol import identifier,upload,download,disk_download,frame_png,LIMIT
+from hardware_bulk_protocol import identifier,upload,download,disk_download,frame_png,validate_pacing,LIMIT
 
 class BulkRun(UpdateRun):
-    def execute(self,session,key_file,action,source=None,artifact_id=None,port=1236,request_id=None,keep_raw=False,disk_identity=None,max_bytes=None):
+    def execute(self,session,key_file,action,source=None,artifact_id=None,port=1236,request_id=None,keep_raw=False,disk_identity=None,max_bytes=None,pace_bytes_per_second=None):
         if action not in ('put','get','frame','disk','getz','framez'):raise ValueError('Expected put/get/frame/disk/getz/framez')
         if action=='disk' and (disk_identity is None or max_bytes is None):raise ValueError('Disk export requires a pinned identity and explicit maximum size')
         if action!='disk' and (disk_identity is not None or max_bytes is not None):raise ValueError('Disk options require disk action')
         if not isinstance(keep_raw,bool) or (keep_raw and action not in ('frame','framez')):raise ValueError('keep_raw is only for frame capture')
         if isinstance(port,bool) or not isinstance(port,int) or not 1<=port<=65535:raise ValueError('Invalid bulk port')
         if (action=='put')!=(source is not None):raise ValueError('Only put takes a host source path')
+        if pace_bytes_per_second is not None and action!='put':raise ValueError('Pacing applies only to host uploads')
+        validate_pacing(pace_bytes_per_second)
         if (action in ('get','getz'))!=(artifact_id is not None):raise ValueError('Only get takes a guest artifact ID')
         if artifact_id:identifier(artifact_id)
         tx=identifier(request_id) if request_id is not None else uuid.uuid4().hex
@@ -26,7 +28,7 @@ class BulkRun(UpdateRun):
             if not stat.S_ISREG(info.st_mode) or not 0<=info.st_size<=LIMIT:raise ValueError('Source must be a regular file of at most1GiB')
         self.output.mkdir(parents=True,exist_ok=False,mode=0o700)
         self.save(state='prepared',session=session,guest_boot_id=boot,transaction_id=tx,action=action,
-            source=str(source) if source else None,artifact_id=artifact_id)
+            source=str(source) if source else None,artifact_id=artifact_id,pace_bytes_per_second=pace_bytes_per_second)
         try:
             args=['/boot/HWBULKZ.ELF' if action in ('getz','framez') else '/boot/HWBULK.ELF',boot,tx,action]+([artifact_id] if artifact_id else [])
             self.save(state='receiver_launch_dispatched')
@@ -34,7 +36,9 @@ class BulkRun(UpdateRun):
             listening=self.wait_job(session,tx,lambda r:'HWBULK_LISTENING' in r.get('stdout',{}).get('text',''))
             self.save(state='receiver_listening',job=listening)
             binary_start=self.clock()
-            if action=='put':result=upload(data['host'],port,key,boot,tx,source)
+            if action=='put':
+                if pace_bytes_per_second is None:result=upload(data['host'],port,key,boot,tx,source)
+                else:result=upload(data['host'],port,key,boot,tx,source,pace_bytes_per_second=pace_bytes_per_second)
             elif action=='disk':
                 def event(name,details):
                     self.save(state='disk_'+name,**({'artifact_path':details['artifact_path']} if 'artifact_path' in details else {}),**{'disk_'+name:details})

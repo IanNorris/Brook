@@ -20,6 +20,24 @@ do not isolate TCP or establish steady-state link capacity. Receipts are under
 `build/hardware/network-ram-baseline-20261101-new-upload` and
 `build/hardware/network-ram-baseline-20261101-new-download`.
 
+Host TCP sampling during a repeated unpaced 4 MiB upload showed hundreds of
+retransmissions and over 600 KiB retransmitted before completion, while the
+peer's advertised receive window remained open. The same RAM-only upload with
+Linux host pacing caps of 4, 8 and 16 MB/s took 1.11, 0.60 and 0.34 seconds;
+a repeat at 16 MB/s took 0.59 seconds. A 32 MB/s cap took 1.55 seconds and
+the sampled connection showed retransmissions. All transfers verified their
+payload hashes. These are short single runs with one repeat, not a measured
+link capacity. Pacing reduces burst-related loss in these observations but
+does not establish whether loss occurs in the adapter, driver, TCP processing
+or another part of the path.
+
+`scripts/hardware_transfer.py` accepts `--pace-bytes-per-second 16000000` for
+an explicitly paced Linux host-to-guest upload. It remains opt-in and applies
+only to this helper's upload socket; it does not improve general downloads or
+browser traffic. Evidence includes `network-window-profile-ss-20261101.txt`
+and the `network-pace*m*-20261101` receipts and sampled host socket counters
+under `build/hardware/`.
+
 A read-and-SHA256 pass over the installed 230,212,616-byte Firefox libxul
 file took 1.886 s, followed by 1.897 s for a second pass, about 122 MB/s of
 file bytes per second including hashing. Cache state was not controlled and

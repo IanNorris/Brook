@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'tools'))
 from hardware_bulk_workflow import BulkRun
+from hardware_bulk_protocol import upload
 class Bridge:
     def __init__(self):self.launches=[];self.done=False;self.result={};self.matches=True;self.bulk=1;self.capture=1
     def load_session(self,session):return {'guest_boot_id':'a'*32,'host':'127.0.0.1'}
@@ -48,6 +49,48 @@ class Tests(unittest.TestCase):
         self.bridge.bulk=0
         with self.assertRaises(RuntimeError):self.run_put()
         self.assertEqual(self.bridge.launches,[])
+    def test_invalid_pacing_prevents_guest_launch(self):
+        for rate in (0, -1, True, 1 << 31):
+            with self.subTest(rate=rate), self.assertRaises(ValueError):
+                BulkRun(self.bridge,self.root/'result').execute('session',self.key,'put',self.source,pace_bytes_per_second=rate)
+        with self.assertRaises(ValueError):
+            BulkRun(self.bridge,self.root/'result').execute('session',self.key,'frame',pace_bytes_per_second=16000000)
+        self.assertEqual(self.bridge.launches,[])
+    @patch('hardware_bulk_protocol.sys.platform','linux')
+    @patch('hardware_bulk_protocol.platform.machine',return_value='x86_64')
+    def test_pacing_reaches_upload(self,_machine):
+        def paced(*args,**kwargs):
+            self.assertEqual(kwargs,{'pace_bytes_per_second':16000000})
+            return self.upload(*args)
+        with patch('hardware_bulk_workflow.upload',paced):
+            result=BulkRun(self.bridge,self.root/'result').execute('session',self.key,'put',self.source,pace_bytes_per_second=16000000)
+        self.assertEqual(result['state'],'completed')
+    @patch('hardware_bulk_protocol.sys.platform','linux')
+    @patch('hardware_bulk_protocol.platform.machine',return_value='x86_64')
+    def test_upload_pacing_socket_option_and_failure(self,_machine):
+        class Connection:
+            def __init__(self,fail=False):self.options=[];self.writes=[];self.fail=fail
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def settimeout(self,value):pass
+            def setsockopt(self,level,option,value):
+                self.options.append((level,option,value))
+                if self.fail:raise OSError('injected unsupported pacing')
+            def sendall(self,data):self.writes.append(data)
+        import socket
+        for rate in (None,16000000):
+            connection=Connection()
+            with patch('hardware_bulk_protocol.socket.create_connection',return_value=connection), \
+                 patch('hardware_bulk_protocol.authenticate') as auth, \
+                 patch('hardware_bulk_protocol.line',return_value={'state':'staged','published':False}):
+                upload('127.0.0.1',1236,'a'*32,'b'*32,'c'*32,self.source,False,pace_bytes_per_second=rate)
+            auth.assert_called_once()
+            self.assertEqual(connection.options, [] if rate is None else [(socket.SOL_SOCKET,getattr(socket,'SO_MAX_PACING_RATE',47),rate)])
+        connection=Connection(fail=True)
+        with patch('hardware_bulk_protocol.socket.create_connection',return_value=connection), \
+             patch('hardware_bulk_protocol.authenticate') as auth, self.assertRaises(OSError):
+            upload('127.0.0.1',1236,'a'*32,'b'*32,'c'*32,self.source,False,pace_bytes_per_second=16000000)
+        auth.assert_not_called();self.assertEqual(connection.writes,[])
     def test_absent_capture_prevents_launch(self):
         self.bridge.capture=0
         with self.assertRaises(RuntimeError):BulkRun(self.bridge,self.root/'result').execute('session',self.key,'frame')
