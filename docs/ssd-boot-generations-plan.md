@@ -102,5 +102,12 @@ The subsequent physical SSD-only cold boot reached the desktop but reported
 `phase=8 error=2 USBCMD=0x2 USBSTS=0x11`: the existing-reset wait timed out.
 Brook had not issued its own reset at that point. The reported USBSTS was an
 earlier sample, not a final reading, and does not establish the timeout state.
-The user is trying a full power disconnection. The `e2fsck` checker is bundled
-but automatic repair is not yet implemented.
+After a full power disconnection, Ethernet returned but the store was unclean
+and not mounted. A read-only `e2fsck -f -n` passed, `e2fsck -p` reported
+corrections to the unclean state, and a second `-f -n` passed. The QEMU-tested
+candidate deferring operational PAGESIZE reads until after reset was staged as
+generation 7 and booted on the Dell with Ethernet, the persistent store and
+the existing file check all working. On this successful boot PCI command was
+`0x6` and PMCSR `0x8` before and after handoff. This one warm boot does not
+prove the intermittent cold-boot failure is fixed. The `e2fsck` checker is
+bundled but automatic repair is not yet implemented.
