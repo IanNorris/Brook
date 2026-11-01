@@ -66,7 +66,12 @@ TcpAction TcpProcessSegment(Socket& s,
         break;
 
     case TcpState::SynSent:
-        if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
+        // An active open has consumed one sequence number for the SYN.
+        // Do not establish a connection or advance SND.UNA from an unrelated
+        // SYN-ACK: send-window accounting depends on this initial bound.
+        if (!(flags & TCP_RST) &&
+            (flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) &&
+            ack == s.tcpSndNxt) {
             s.tcpRcvNxt = seq + 1;
             s.tcpSndUna = ack;
             s.tcpState  = TcpState::Established;

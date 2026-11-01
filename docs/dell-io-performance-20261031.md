@@ -34,6 +34,14 @@ tested multi-segment sender. Do not infer that a faster sender alone fixes the
 entire transfer path: ACK validation, peer-window handling, concurrent writers,
 loss recovery and zero-window behavior are prerequisites.
 
+A first prerequisite rejects active-open SYN-ACKs that do not acknowledge the
+sent SYN; rejected handshakes also cannot set MSS, scale or the peer window.
+Host state-machine tests cover incorrect acknowledgments, wraparound and a
+SYN-ACK carrying RST; the kernel builds. This is not a windowed sender and has
+not been deployed to the Dell. Receive-path integration tests remain necessary,
+as do ordered established-window updates, correct scale negotiation and sender
+serialization before using the peer window to permit multiple segments.
+
 A private-QEMU comparison used the same kernel with an experimental boot-only
 switch to remove the post-ACK yield. A single 2,056,443-byte roundtrip took
 0.168 s upload and 0.303 s download with the existing yield, versus 0.201 s

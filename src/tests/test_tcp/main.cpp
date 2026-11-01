@@ -47,7 +47,7 @@ static Socket MakeSynSentSocket()
     Socket s = {};
     s.type       = SOCK_STREAM;
     s.tcpState   = TcpState::SynSent;
-    s.tcpSndNxt  = 1000;
+    s.tcpSndNxt  = 1001; // SYN has already consumed its sequence number
     s.tcpSndIss  = 1000;
     s.tcpSndUna  = 1000;
     s.tcpRcvNxt  = 0;
@@ -90,6 +90,28 @@ static void TestSynAck()
     ASSERT_TRUE(act.sendAck);      // must ACK to complete handshake
     ASSERT_TRUE(!act.enqueueData);
     printf("  TestSynAck: OK\n");
+}
+
+static void TestInvalidSynAck()
+{
+    for (uint32_t ack : {999u, 1000u, 1002u, 0xffffffffu}) {
+        Socket s = MakeSynSentSocket();
+        auto act = TcpProcessSegment(s, 5000, ack, TCP_SYN | TCP_ACK, nullptr, 0);
+        ASSERT_EQ(s.tcpState, TcpState::SynSent);
+        ASSERT_TRUE(!s.connected && !act.justConnected && !act.sendAck);
+        ASSERT_EQ(s.tcpSndUna, 1000u);
+        ASSERT_EQ(s.tcpRcvNxt, 0u);
+    }
+    Socket wrapped = MakeSynSentSocket();
+    wrapped.tcpSndIss = wrapped.tcpSndUna = 0xffffffffu;
+    wrapped.tcpSndNxt = 0;
+    auto act = TcpProcessSegment(wrapped, 5000, 0, TCP_SYN | TCP_ACK, nullptr, 0);
+    ASSERT_TRUE(act.justConnected && wrapped.connected);
+    ASSERT_EQ(wrapped.tcpSndUna, 0u);
+    Socket reset = MakeSynSentSocket();
+    act = TcpProcessSegment(reset, 5000, 1001, TCP_SYN | TCP_ACK | TCP_RST, nullptr, 0);
+    ASSERT_EQ(reset.tcpState, TcpState::Closed);
+    ASSERT_TRUE(reset.tcpRstRecv && !reset.connected && !act.justConnected);
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +497,7 @@ int main()
 
     TestPassiveHandshake();
     TestSynAck();
+    TestInvalidSynAck();
     TestSynRst();
     TestEstablishedReceive();
     TestEstablishedOOO();

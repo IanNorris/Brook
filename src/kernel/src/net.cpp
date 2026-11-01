@@ -2477,12 +2477,11 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
 
         // Parse TCP options from SYN-ACK to extract window scale (RFC 1323)
-        if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK) &&
-            s.tcpState == TcpState::SynSent) {
+        if ((flags & (TCP_SYN | TCP_ACK | TCP_RST)) == (TCP_SYN | TCP_ACK) &&
+            s.tcpState == TcpState::SynSent && ack == s.tcpSndNxt) {
             const uint8_t* optPtr = static_cast<const uint8_t*>(payload) + sizeof(TcpHeader);
             const uint8_t* optEnd = static_cast<const uint8_t*>(payload) + dataOff;
-            if (ack == s.tcpSndNxt)
-                s.tcpPeerMss = TcpPeerMss(optPtr, static_cast<uint32_t>(optEnd - optPtr));
+            s.tcpPeerMss = TcpPeerMss(optPtr, static_cast<uint32_t>(optEnd - optPtr));
             while (optPtr < optEnd) {
                 uint8_t kind = *optPtr;
                 if (kind == 0) break;
@@ -2497,10 +2496,15 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         }
 
         // Update peer's advertised window (apply scale for non-SYN segments)
-        if (flags & TCP_SYN)
-            s.tcpSndWnd = window;
-        else
-            s.tcpSndWnd = static_cast<uint32_t>(window) << s.tcpSndWndScale;
+        const bool validActiveHandshake = s.tcpState != TcpState::SynSent ||
+            ((flags & (TCP_SYN | TCP_ACK | TCP_RST)) == (TCP_SYN | TCP_ACK) &&
+             ack == s.tcpSndNxt);
+        if (validActiveHandshake) {
+            if (flags & TCP_SYN)
+                s.tcpSndWnd = window;
+            else
+                s.tcpSndWnd = static_cast<uint32_t>(window) << s.tcpSndWndScale;
+        }
 
         // Log TCP segments — per-socket counter so each new connection gets
         // fresh verbose logging (the old global static went silent after 3
