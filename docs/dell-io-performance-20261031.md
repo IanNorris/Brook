@@ -127,8 +127,10 @@ download took 3.635 seconds (`network-benchmark-rx8-physical-20261101`). The
 earlier unpaced control was 6.194–8.515 seconds, but used a different kernel
 and boot, so this is encouraging, not an isolated RX-depth result. Preserve
 generation 8; installing a second candidate in its slot would overwrite the
-known-good fallback. The physical test has not yet established behavior under
-device failure or confirmed a clean shutdown and subsequent persistence.
+known-good fallback. A checked warm restart subsequently returned on a new
+boot ID, with networking and the persistent store ready; the pre-existing
+SSD persistence fixture passed again. This does not establish cold-boot
+reliability or behavior under device failure.
 A further unpaced 4 MiB upload took 3.578 seconds; host `ss` sampled over
 874 KiB retransmitted before all bytes were acknowledged
 (`network-rx8-host-ss-20261101.txt`). Significant loss or delayed delivery
