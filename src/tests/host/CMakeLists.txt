@@ -331,6 +331,9 @@ add_host_test(test_virgl_submit)
 add_host_test(test_busybox_lookup)
 add_host_test(test_launcher_command)
 
+add_host_test(test_tcp_flight_control)
+target_compile_options(test_tcp_flight_control PRIVATE "-iquote${BROOK_ROOT}/src/kernel/src")
+
 add_host_test(test_tcp
     "${BROOK_ROOT}/src/kernel/src/tcp.cpp"
 )

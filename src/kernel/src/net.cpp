@@ -812,6 +812,7 @@ void NetReceive(NetIf* nif, const void* frame, uint32_t len)
 static uint16_t g_tcpEgressCeiling = 1460;
 static bool g_tcpTwoPacketFlight = false;
 static bool g_tcpFourPacketFlight = false;
+static bool g_tcpAdaptiveFlight = false;
 
 void NetConfigureBoot()
 {
@@ -825,6 +826,13 @@ void NetConfigureBoot()
             g_tcpFourPacketFlight = true;
             KPuts("net: four-packet TCP send flight enabled (experimental)\n");
         } else KPuts("net: conflicting flight markers; using two packets\n");
+    }
+    if (auto* marker = VfsOpen("/etc/tcp-adaptive-flight")) {
+        VfsClose(marker);
+        if (!g_tcpTwoPacketFlight && !g_tcpFourPacketFlight) {
+            g_tcpAdaptiveFlight = true;
+            KPuts("net: bounded adaptive TCP send flight enabled (experimental)\n");
+        } else KPuts("net: conflicting flight markers; fixed mode retained\n");
     }
     if (auto* marker = VfsOpen("/etc/tcp-recv-window-16k")) {
         VfsClose(marker);g_tcpReceiveWindowCap=16384;
@@ -2892,6 +2900,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     s.tcpRstRecv = false;
     s.connectError = 0;
     s.tcpSndWnd  = 65535; // assume full window until server tells us otherwise
+    s.tcpFlightControl = {};
     s.tcpSndWl1=s.tcpSndWl2=0;s.tcpSndWlValid=false;
     s.tcpSndWndScale = 0; // no peer scale until SYN-ACK parsed
     // Window scale: RX_BUF_SIZE=512KB needs shift 3 (÷8) to fit in uint16_t
@@ -3069,19 +3078,20 @@ public:
 // limit is an experiment, not a complete congestion-control implementation.
 static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
                                   uint32_t len, bool fromUser, uint32_t mss,
-                                  uint64_t deadline, unsigned initialLimit)
+                                  uint64_t deadline, unsigned initialLimit, bool adaptive)
 {
     struct Slot {
         uint8_t bytes[ETH_MTU];
         uint32_t seq = 0, len = 0, retries = 0;
         uint64_t retryAt = 0;
         bool submitted = false;
-    } slots[4];
+    } slots[8];
     unsigned head = 0, count = 0, limit = initialLimit;
     uint32_t reserved = 0, submitted = 0, acknowledged = 0;
     int deferredError = 0;
     SpinLockAcquire(&s.lock);
     const uint32_t base = s.tcpSndNxt;
+    if (adaptive) s.tcpFlightControl.Init(mss);
     SpinLockRelease(&s.lock);
     SocketWaitRegistration registration(s, self);
 
@@ -3119,9 +3129,12 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
             SpinLockRelease(&s.lock);
             return finish(-5); // ACK crossed a reservation rejected locally
         }
-        if (delta <= submitted) acknowledged = delta;
+        if (delta <= submitted && delta > acknowledged) {
+            if (adaptive) s.tcpFlightControl.Ack(delta-acknowledged, mss);
+            acknowledged = delta;
+        }
         while (count && TcpSeqAcked(una, slots[head].seq + slots[head].len)) {
-            head = (head + 1) % 4;
+            head = (head + 1) % 8;
             --count;
         }
         if (!TcpCanSendData(s.tcpState) || s.tcpRstRecv) {
@@ -3142,7 +3155,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
         // sequence range is allocated. On RTO send only the oldest suffix.
         int unsentIndex = -1;
         for (unsigned n=0;n<count;++n) {
-            const unsigned index = (head+n)%4;
+            const unsigned index = (head+n)%8;
             if (!slots[index].submitted) { unsentIndex = static_cast<int>(index); break; }
         }
         int sendIndex = -1;
@@ -3152,7 +3165,9 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
         if (sendIndex < 0 && unsentIndex >= 0 && now >= slots[unsentIndex].retryAt) {
             const Slot& slot = slots[unsentIndex];
             const uint32_t before = slot.seq - una;
-            if (before <= s.tcpSndWnd && slot.len <= s.tcpSndWnd-before) sendIndex = unsentIndex;
+            uint32_t window = s.tcpSndWnd;
+            if (adaptive && window > s.tcpFlightControl.cwnd) window = s.tcpFlightControl.cwnd;
+            if (before <= window && slot.len <= window-before) sendIndex = unsentIndex;
         }
         if (sendIndex >= 0) {
             Slot& slot = slots[sendIndex];
@@ -3160,7 +3175,10 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
             const uint32_t seq = slot.seq + offset, bytes = slot.len - offset;
             const auto snapshot = CaptureTcpTxLocked(s);
             const bool retry = slot.submitted;
-            if (retry) limit = 1;
+            if (retry) {
+                if (adaptive) s.tcpFlightControl.Loss(mss);
+                else limit = 1;
+            }
             SpinLockRelease(&s.lock);
             const int result = TcpSendSnapshot(s, snapshot, seq, TCP_ACK | TCP_PSH,
                                                slot.bytes + offset, bytes, retry ? "flight-retry" : "flight-submit");
@@ -3178,7 +3196,11 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
         }
 
         const uint32_t outstanding = s.tcpSndNxt - una;
-        const uint32_t credit = s.tcpSndWnd > outstanding ? s.tcpSndWnd - outstanding : 0;
+        uint32_t credit = s.tcpSndWnd > outstanding ? s.tcpSndWnd - outstanding : 0;
+        if (adaptive) {
+            const uint32_t congestionCredit = s.tcpFlightControl.cwnd > outstanding ? s.tcpFlightControl.cwnd-outstanding : 0;
+            if (credit > congestionCredit) credit = congestionCredit;
+        }
         // Do not stage another entry while any reservation has not reached
         // the NIC. In particular, never build a hole behind local EAGAIN.
         if (!deferredError && reserved < len && count < limit && credit && unsentIndex < 0) {
@@ -3186,7 +3208,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
             if (chunk > mss) chunk = mss;
             if (chunk > credit) chunk = credit;
             SpinLockRelease(&s.lock);
-            Slot& slot = slots[(head + count) % 4];
+            Slot& slot = slots[(head + count) % 8];
             uint64_t source;
             if (__builtin_add_overflow(reinterpret_cast<uint64_t>(data), static_cast<uint64_t>(reserved), &source)) {
                 if (count) { deferredError = -14; continue; }
@@ -3206,7 +3228,11 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
                 SpinLockRelease(&s.lock); return finish(-104);
             }
             const uint32_t currentOutstanding = s.tcpSndNxt - s.tcpSndUna;
-            const uint32_t currentCredit = s.tcpSndWnd > currentOutstanding ? s.tcpSndWnd-currentOutstanding : 0;
+            uint32_t currentCredit = s.tcpSndWnd > currentOutstanding ? s.tcpSndWnd-currentOutstanding : 0;
+            if (adaptive) {
+                const uint32_t congestionCredit = s.tcpFlightControl.cwnd > currentOutstanding ? s.tcpFlightControl.cwnd-currentOutstanding : 0;
+                if (currentCredit > congestionCredit) currentCredit = congestionCredit;
+            }
             if (chunk > currentCredit) chunk = currentCredit;
             if (!chunk) { SpinLockRelease(&s.lock); continue; }
             slot.seq = s.tcpSndNxt; slot.len = chunk; slot.retries = 0;
@@ -3257,9 +3283,10 @@ static int SockSendImpl(int sockIdx, const void* buf, uint32_t len, bool fromUse
     uint32_t sent = 0;
     uint8_t staged[ETH_MTU];
     if (!mss || mss > sizeof(staged)) return -22;
-    if ((g_tcpTwoPacketFlight || g_tcpFourPacketFlight) && len)
+    if ((g_tcpTwoPacketFlight || g_tcpFourPacketFlight || g_tcpAdaptiveFlight) && len)
         return TcpSendPacketFlight(s, self, data, len, fromUser, mss, deadline,
-                                   g_tcpFourPacketFlight ? 4 : 2);
+                                   g_tcpAdaptiveFlight ? 8 : g_tcpFourPacketFlight ? 4 : 2,
+                                   g_tcpAdaptiveFlight);
 
     // Snapshot the negotiated MSS; never hold the socket lock across network
     // submission or an ACK wait. The optional ceiling is boot-time immutable.
@@ -3685,6 +3712,7 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.tcpFinRecv = false;
     s.tcpRstRecv = false;
     s.tcpSndWnd  = 65535;
+    s.tcpFlightControl = {};
     s.tcpSndWl1=s.tcpSndWl2=0;s.tcpSndWlValid=false;
     s.tcpSndWndScale = 0;
     s.tcpRcvWndScale = 3;

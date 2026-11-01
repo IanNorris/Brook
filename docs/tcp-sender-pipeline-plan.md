@@ -106,3 +106,20 @@ the delay; the parser proves an observed chain before covering ACKs, not a
 general upper bound or a throughput result. The buffer batches rather than
 guaranteeing per-packet delay. Persistent congestion state, real-network
 loss behavior and physical four-packet performance remain to be tested.
+
+An independently opt-in `/etc/tcp-adaptive-flight` mode retains congestion
+state per connection, starts at two MSS and grows on newly acknowledged bytes
+to at most eight MSS. Retransmission timeout reduces the window to one MSS;
+the reduction is applied once until forward ACK progress. It respects the
+peer window and rechecks an unsubmitted tail against the reduced allowance.
+Conflicting fixed-flight markers take precedence. This is a bounded experiment,
+not full TCP congestion control: idle restart and zero-window persist are not
+implemented. Socket layout changed, so kernel and modules must use ABI 62.
+
+Hosted tests cover window growth, ACK grouping, loss, delayed submission and
+connection reuse. The USB Ethernet QEMU acceptance passed with a delayed
+packet queue and observed eight contiguous packets before their covering ACK;
+this does not establish behavior under arbitrary real-network congestion.
+The release build's eight-slot send function reserves 12,424 stack bytes;
+its caller reserves 1,592, against a 256 KiB kernel stack. These figures are
+individual compiler-generated frames, not a complete worst-case stack bound.

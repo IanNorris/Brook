@@ -22,6 +22,8 @@ std::atomic<unsigned> failDataAttempt{0};
 std::atomic<uint32_t> rejectDataSeq{0};
 std::atomic<unsigned> rejectDataRemaining{0};
 std::atomic<uint64_t> firstDataRetryTick{0};
+std::atomic<int> observeFlightControlSocket{-1};
+std::atomic<uint32_t> observedRetryCwnd{0},observedRetryThreshold{0};
 std::atomic<bool> ackUnsentOnFailure{false},shrinkWindowOnFailure{false};
 std::atomic<uint32_t> failureAckOverride{0};
 std::atomic<uint16_t> dataAckWindow{65535};
@@ -41,6 +43,7 @@ std::atomic<unsigned> capturedDataCount{0};
 std::atomic<uint32_t> capturedDataSeq[8]{};
 std::atomic<int> deadlineAckSocket{-1};
 std::atomic<uint64_t> deadlineAckTick{0};
+std::atomic<uint32_t> deadlineAckValue{0};
 std::atomic<bool> holdGatePoll{false}, gatePollWaiting{false}, releaseGatePoll{false};
 std::atomic<unsigned> rejectPureAcks{0},acceptedPureAcks{0};
 std::atomic<uint32_t> lastAck{0},lastWindow{0};
@@ -90,7 +93,8 @@ void SchedulerBlock(Process* p) {
         if(idx>=0) {
             auto& socket=g_sockets[idx];Ipv4Header ip{};ip.srcIp=socket.remoteIp;ip.dstIp=socket.localIp;
             TcpHeader ack{};ack.srcPort=socket.remotePort;ack.dstPort=socket.localPort;
-            ack.seqNum=htonl(socket.tcpRcvNxt);ack.ackNum=htonl(socket.tcpSndNxt);
+            ack.seqNum=htonl(socket.tcpRcvNxt);const uint32_t value=deadlineAckValue.exchange(0);
+            ack.ackNum=htonl(value?value:socket.tcpSndNxt);
             ack.flags=TCP_ACK;ack.dataOff=5<<4;ack.window=htons(65535);HandleTcp(&ip,&ack,sizeof(ack));
         }
     }
@@ -117,6 +121,10 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
         const unsigned index=capturedDataCount.fetch_add(1);
         if(index<8)capturedDataSeq[index]=ntohl(tcp->seqNum);
         if(index && ntohl(tcp->seqNum)==10)firstDataRetryTick=ticks.load();
+        if(index && observeFlightControlSocket.load()>=0){
+            const auto& control=g_sockets[observeFlightControlSocket.load()].tcpFlightControl;
+            observedRetryCwnd=control.cwnd;observedRetryThreshold=control.threshold;
+        }
         uint8_t* mutate=mutateUserOnSend.load();
         if(mutate){const unsigned n=stagedPayloadCount.fetch_add(1);if(n<2)stagedPayloads[n]=static_cast<const uint8_t*>(data)[sizeof(TcpHeader)];if(n==0)*mutate=9;}
         if(rejectDataRemaining.load() && ntohl(tcp->seqNum)==rejectDataSeq.load()){
@@ -524,6 +532,44 @@ int main() {
            capturedDataSeq[2]==1082 && capturedDataSeq[3]==1618 && capturedDataSeq[4]==546);
     assert(g_sockets[i].tcpSndUna==2154 && g_sockets[i].tcpSndNxt==2154);
     fourLossMode=false;g_tcpFourPacketFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // ACK-driven growth persists across calls, reaches a bounded eight-MSS
+    // flight, and is reset when the socket slot is reused.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;
+    for(unsigned n=0;n<6;++n){uint8_t data[536]{};acknowledgeDataCount=1;assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(g_sockets[i].tcpFlightControl.cwnd==8*536);
+    skipDataAcks=7;acknowledgeDataCount=1;capturedDataCount=0;
+    {uint8_t data[8*536]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(capturedDataCount==8 && g_sockets[i].tcpFlightControl.cwnd==8*536);
+    const int oldSlot=i;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    i=create();assert(i==oldSlot && g_sockets[i].tcpFlightControl.cwnd==0);SockClose(i);
+    // RTO reduces the flight before a retransmission and clears its recovery
+    // episode only after forward ACK progress.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;skipDataAcks=1;acknowledgeDataCount=1;capturedDataCount=0;observeFlightControlSocket=i;
+    {uint8_t data[536]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(observedRetryCwnd==536 && observedRetryThreshold==1072 && !g_sockets[i].tcpFlightControl.recovering);
+    observeFlightControlSocket=-1;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // An EAGAIN tail stays unsent after head RTO shrinks cwnd, until forward
+    // ACK progress grants credit again.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;capturedDataCount=0;skipDataAcks=2;acknowledgeDataCount=1;
+    rejectDataSeq=546;rejectDataRemaining=20;firstDataRetryTick=0;
+    deadlineAckTick=251;deadlineAckValue=546;deadlineAckSocket=i;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(deadlineAckSocket==-1 && capturedDataCount==23 && capturedDataSeq[0]==10 &&
+           capturedDataSeq[1]==546 && firstDataRetryTick==201 && lastDataSubmitTick>=251);
+    g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // Reconnecting an existing socket starts with fresh congestion state.
+    i=create();g_sockets[i].tcpFlightControl.Init(536);g_sockets[i].tcpFlightControl.Ack(536,536);
+    SockSetNonblock(i,true);
+    {SockAddrIn address{};address.sin_family=AF_INET;address.sin_addr=htonl(0x7f000001);address.sin_port=htons(200);
+     assert(SockConnect(i,&address)==-115);}
+    assert(g_sockets[i].tcpFlightControl.cwnd==0 && !g_sockets[i].tcpFlightControl.recovering);
+    SockClose(i);
     // A rejected second submission retries its original range and payload.
     waiter=new Process{};waiter->refCount=1;
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;

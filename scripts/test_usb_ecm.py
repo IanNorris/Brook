@@ -14,13 +14,14 @@ ap.add_argument('--tx-depth16',action='store_true',help='Exercise the opt-in six
 ap.add_argument('--tcp-window16',action='store_true',help='Exercise the opt-in 16 KiB TCP receive-window cap')
 ap.add_argument('--tcp-flight2',action='store_true',help='Exercise and capture the experimental two-packet TCP send flight')
 ap.add_argument('--tcp-flight4',action='store_true',help='Exercise and capture the experimental four-packet TCP send flight')
+ap.add_argument('--tcp-adaptive-flight',action='store_true',help='Exercise the bounded adaptive TCP send flight')
 ap.add_argument('--network-delay-us',type=int,default=0,help='Optional QEMU filter-buffer interval in microseconds (maximum 50000)')
 ap.add_argument('--send-concurrency',action='store_true',help='Also verify two guest writers share a TCP stream without interleaving')
 ap.add_argument('--send-close-race',action='store_true',help='Also close a shared descriptor while two guest writes are active')
 ap.add_argument('--send-user-copy',action='store_true',help='Also exercise send, writev and multi-iovec sendmsg')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
 if args.send_close_race and not args.send_concurrency:ap.error('--send-close-race requires --send-concurrency')
-if args.tcp_flight2 and args.tcp_flight4:ap.error('choose only one flight mode')
+if sum((args.tcp_flight2,args.tcp_flight4,args.tcp_adaptive_flight))>1:ap.error('choose only one flight mode')
 if not 0<=args.network_delay_us<=50000:ap.error('network delay must be between 0 and 50000 microseconds')
 def run(*cmd):subprocess.run(list(map(str,cmd)),check=True,cwd=ROOT)
 tcp=socket.socket();tcp.bind(('127.0.0.1',0));port=tcp.getsockname()[1];tcp.listen();tcp.settimeout(90)
@@ -73,6 +74,7 @@ if args.tx_depth16:run('mcopy','-i',initrd,marker,'::ETC/usb-net-tx16')
 if args.tcp_window16:run('mcopy','-i',initrd,marker,'::ETC/tcp-recv-window-16k')
 if args.tcp_flight2:run('mcopy','-i',initrd,marker,'::ETC/tcp-two-packet-flight')
 if args.tcp_flight4:run('mcopy','-i',initrd,marker,'::ETC/tcp-four-packet-flight')
+if args.tcp_adaptive_flight:run('mcopy','-i',initrd,marker,'::ETC/tcp-adaptive-flight')
 if args.send_user_copy:run('mcopy','-i',initrd,marker,'::ETC/tcp-egress-1200')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
@@ -125,6 +127,7 @@ try:
    if args.send_user_copy:assert 'ECM_USER_SEND_PATHS_OK' in serial,serial[-2500:]
    if args.tcp_flight2:assert 'two-packet TCP send flight enabled' in serial,serial[-2500:]
    if args.tcp_flight4:assert 'four-packet TCP send flight enabled' in serial,serial[-2500:]
+   if args.tcp_adaptive_flight:assert 'bounded adaptive TCP send flight enabled' in serial,serial[-2500:]
    assert f'rx_depth={8 if args.rx_depth8 else 1}' in serial, 'Unexpected ECM receive depth'
    assert f'tx_depth={16 if args.tx_depth16 else 8}' in serial, 'Unexpected ECM transmit depth'
    break
@@ -206,12 +209,13 @@ try:
  assert 64 in sizes and 1024 in sizes,sorted(set(sizes))
  if args.tcp_flight2:assert max_flight>=2,'capture did not observe two successive payload segments before their ACK'
  if args.tcp_flight4:assert max_flight>=4,'capture did not observe four successive payload segments before their ACK'
+ if args.tcp_adaptive_flight:assert max_flight>=4,'capture did not observe adaptive flight growth'
  if args.tcp_window16:
   assert any(flags&2 for _,flags,_ in windows) and any((flags&16) and not(flags&2) for _,flags,_ in windows),windows
   for flow,flags,window in windows:
    pair=scales.get(flow,{});shift=pair.get('guest') if pair.get('guest') is not None and pair.get('peer') is not None else 0
    assert (window if flags&2 else window<<shift)<=16384,(flow,flags,window,shift)
- result=dict(passed=True,rx_depth=8 if args.rx_depth8 else 1,tx_depth=16 if args.tx_depth16 else 8,tcp_window_cap=16384 if args.tcp_window16 else 0,tcp_flight2=args.tcp_flight2,tcp_flight4=args.tcp_flight4,network_delay_us=args.network_delay_us,max_flight_observed=max_flight,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
+ result=dict(passed=True,rx_depth=8 if args.rx_depth8 else 1,tx_depth=16 if args.tx_depth16 else 8,tcp_window_cap=16384 if args.tcp_window16 else 0,tcp_flight2=args.tcp_flight2,tcp_flight4=args.tcp_flight4,tcp_adaptive_flight=args.tcp_adaptive_flight,network_delay_us=args.network_delay_us,max_flight_observed=max_flight,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
   idle_rx_seconds=1.5,bridge_framed_reply=True,usb_storage_concurrent=True,usb_storage_after_nic_removal=True,usb_keyboard_after_nic_removal=True)
  (base/'result.json').write_text(json.dumps(result,indent=2)+'\n');print('USB_ECM_ACCEPTANCE_PASS',flush=True)
 finally:
