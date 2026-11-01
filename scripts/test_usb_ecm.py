@@ -9,6 +9,7 @@ import argparse,hashlib,json,os,shutil,socket,struct,subprocess,threading,time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--output',required=True,type=Path)
+ap.add_argument('--rx-depth8',action='store_true',help='Exercise the opt-in eight-request ECM receive path')
 args=ap.parse_args();base=args.output.resolve();base.mkdir(parents=True,exist_ok=False);out=base/'probe'
 def run(*cmd):subprocess.run(list(map(str,cmd)),check=True,cwd=ROOT)
 tcp=socket.socket();tcp.bind(('127.0.0.1',0));port=tcp.getsockname()[1];tcp.listen();tcp.settimeout(90)
@@ -49,6 +50,7 @@ initrd=out/'payload/INITRD.IMG';run('mcopy','-i',initrd,base/'ECMTEST.ELF','::BO
 rc=base/'INIT.RC';rc.write_text(f'set wm\nset vfb none\nkconsole\nhwprobe on\nrun /boot/ECMTEST.ELF {port}\n')
 run('mcopy','-o','-i',initrd,rc,'::BOOT/INIT.RC')
 marker=base/'usb-net-probe';marker.write_text('1\n');run('mcopy','-i',initrd,marker,'::ETC/usb-net-probe')
+if args.rx_depth8:run('mcopy','-i',initrd,marker,'::ETC/usb-net-rx8')
 media=str(out/'probe.raw')+'@@1048576';run('mcopy','-o','-i',media,initrd,'::INITRD.IMG')
 fixture=base/'READTEST.BIN';size=8*1024*1024;pattern=bytes((i*17+5)%251 for i in range(251))
 with fixture.open('xb') as f:
@@ -91,7 +93,9 @@ try:
   serial=(base/'serial.log').read_text(errors='replace') if (base/'serial.log').exists() else ''
   assert 'PANIC_HEX:' not in serial and 'ECM_TEST_FAIL' not in serial,serial[-2500:]
   assert not errors,errors
-  if 'ECM_NETWORK_INTEGRITY_OK' in serial:break
+  if 'ECM_NETWORK_INTEGRITY_OK' in serial:
+   assert f'rx_depth={8 if args.rx_depth8 else 1}' in serial, 'Unexpected ECM receive depth'
+   break
   time.sleep(.05)
  else:raise TimeoutError(serial[-3000:])
  with socket.create_connection(('127.0.0.1',debug_port),timeout=8) as s:
@@ -120,7 +124,7 @@ try:
   packet=raw[at:at+captured];at+=captured
   if len(packet)>=34 and packet[12:14]==b'\x08\x00' and packet[26:30]==bytes([10,0,2,15]):sizes.append(len(packet))
  assert 64 in sizes and 1024 in sizes,sorted(set(sizes))
- result=dict(passed=True,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
+ result=dict(passed=True,rx_depth=8 if args.rx_depth8 else 1,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
   idle_rx_seconds=1.5,bridge_framed_reply=True,usb_storage_concurrent=True,usb_storage_after_nic_removal=True,usb_keyboard_after_nic_removal=True)
  (base/'result.json').write_text(json.dumps(result,indent=2)+'\n');print('USB_ECM_ACCEPTANCE_PASS',flush=True)
 finally:

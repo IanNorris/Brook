@@ -63,6 +63,14 @@ interrupt interleavings or a duplicate after a token address has been reused.
 The refactored opt-in driver also passed early DHCP, ARP, a 4 MiB verified
 upload and clean shutdown in `ecm-rx8-qemu-v4-20261101`.
 
+`scripts/test_usb_ecm.py --rx-depth8` now exercises the opt-in path with
+TCP and UDP byte checks, exact 64- and 1,024-byte Ethernet frames, an idle
+interval, concurrent USB storage, and emulated NIC removal followed by USB
+storage and keyboard activity. Both depth eight and the default depth one
+passed (`ecm-rx8-fault-qemu-20261101` and `ecm-rx1-fault-qemu-20261101`). This
+does not prove the number of requests outstanding at removal, inject fatal
+completion codes, or deterministically schedule ring-wrap races.
+
 A read-and-SHA256 pass over the installed 230,212,616-byte Firefox libxul
 file took 1.886 s, followed by 1.897 s for a second pass, about 122 MB/s of
 file bytes per second including hashing. Cache state was not controlled and
