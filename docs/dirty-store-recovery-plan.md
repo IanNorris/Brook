@@ -40,6 +40,24 @@ The intended recovery path is:
    store only after its existing validation succeeds. This avoids rebinding a
    previously attempted ext2 drive or reusing retired cache state.
 
+The repair must be represented by a durable attempt record on the containing
+volume, tied to the store identity. Flush a `pending` record before the
+checker can write. An interrupted, malformed or failed record must prevent
+normal store admission even if `e2fsck` already set the ext2 clean bit. After
+preen, perform a checked flush, an independent read-only full check and identity
+revalidation before recording success and performing a checked reboot. Keep
+the image lease pinned across checker failure and do not automatically retry an
+ambiguous or interrupted attempt. An ordinary clean session can establish a
+new recovery epoch.
+
+The candidate's checker access must be a bounded capability to that retained
+lease, including the read, write, seek, stat and sync operations the actual
+checker uses. It must not release the lease and reopen a general pathname; an
+alias or another writer could otherwise race the repair. Trace the checker on
+the tested VM before settling on an FD or restricted vnode interface, and test
+alias rejection, failed flush, checker death and interruption after the checker
+sets the clean bit but before the durable success record.
+
 Before enabling automatic repair, test the actual checker and its syscall/I/O
 requirements with disposable images: unclean but consistent data, preen-safe
 repairs, errors requiring intervention, unsupported features, short reads and

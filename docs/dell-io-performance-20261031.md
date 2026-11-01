@@ -26,6 +26,13 @@ tested multi-segment sender. Do not infer that a faster sender alone fixes the
 entire transfer path: ACK validation, peer-window handling, concurrent writers,
 loss recovery and zero-window behavior are prerequisites.
 
+A private-QEMU comparison used the same kernel with an experimental boot-only
+switch to remove the post-ACK yield. A single 2,056,443-byte roundtrip took
+0.168 s upload and 0.303 s download with the existing yield, versus 0.201 s
+and 0.385 s without it. Both payload hashes matched. This small, single-run
+QEMU sample does not quantify Dell behavior, but provides no evidence to
+retain the change; the experiment was discarded.
+
 A random 8 MiB sample from the previously received portion of the SSD store
 compressed to 35.4% with zlib level 1 on the host, at about 66 MB/s of host
 CPU time. This is not a full-image or Dell CPU measurement. Optional bounded
