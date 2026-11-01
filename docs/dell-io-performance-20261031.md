@@ -61,3 +61,10 @@ use different network paths. These short samples do not measure peak or
 sustained bandwidth, but show that the Google browser-test result is not a
 universal limit on every download. An attempted request to a temporary host
 port timed out before connection, so it yielded no LAN throughput measurement.
+
+A follow-up single 4 MiB request to the same public endpoint completed in
+4.677 s on the Dell (about 7.2 Mbps including connection time) and 0.780 s
+on the host (about 43 Mbps). This longer sample establishes a gap for this
+request, not a controlled attribution: endpoint routing, caching and client
+behavior may differ. The Dell measurement is still much higher than the
+user's Chromium/Google speed-test estimate.
