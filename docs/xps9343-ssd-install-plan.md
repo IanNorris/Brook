@@ -100,6 +100,13 @@ observed SSD, preserves USB recovery, and passes the applicable tests below.
   of Brook's reset path. A controller reset candidate adds Intel's post-reset
   quiet interval, bounded phase checks and on-screen phase/register diagnostics.
   Host mocks and QEMU tests do not establish its behavior on the physical Dell.
+  A full power disconnection subsequently restored USB detection in both
+  firmware and Brook. On USB recovery boot, `e2fsck -f -n` found no filesystem
+  inconsistencies, `e2fsck -p` cleared the unclean state, and a second
+  read-only pass succeeded. The exact candidate recovery kernel and initrd
+  passed a QEMU USB/network roundtrip; the physical-device-bound initrd
+  correctly refused QEMU's different SSD identity. USB generation 25 was then
+  staged while retaining the previous generation and root recovery.
 
 ## Installation plan and historical engineering gates
 

@@ -52,17 +52,26 @@ def main():
                         help='Also verify a binary RAM-only upload and download')
     parser.add_argument('--xhci-module', type=Path,
                         help='Use this xHCI module in the private QEMU boot')
+    parser.add_argument('--candidate-initrd', type=Path,
+                        help='Use an already-prepared recovery initrd unchanged')
+    parser.add_argument('--expect-identity-refusal', action='store_true',
+                        help='Expect a physical-device-bound initrd to reject the private QEMU disk')
     a = parser.parse_args()
     if (a.readonly_checker or a.preen_checker) and not a.dirty_classification_kernel:
         parser.error('checker tests require --dirty-classification-kernel')
     if a.readonly_checker and a.preen_checker:
         parser.error('choose one checker mode')
+    if a.candidate_initrd and (not a.dirty_classification_kernel or a.xhci_module or a.recovery_initrd or a.readonly_checker or a.preen_checker):
+        parser.error('candidate initrd requires dirty mode and no initrd modifications')
+    if a.expect_identity_refusal and not a.candidate_initrd:
+        parser.error('identity refusal requires a candidate initrd')
     if a.fixture.is_symlink() or not a.fixture.is_file() or a.fixture.stat().st_size != 500118192 * 512:
         raise ValueError('expected a stopped Dell-capacity regular-file QEMU fixture')
     out = a.output.absolute(); out.mkdir(parents=True, exist_ok=False, mode=0o700)
     disk = out / 'sata.raw'; run('cp', '--reflink=always', a.fixture, disk)
     media = str(disk) + '@@1048576'; initrd = out / 'initrd.img'
-    run('mcopy', '-i', media, '::INITRD.IMG', initrd)
+    if a.candidate_initrd: shutil.copyfile(a.candidate_initrd, initrd)
+    else: run('mcopy', '-i', media, '::INITRD.IMG', initrd)
     dirty_store = None
     if a.dirty_classification_kernel:
         dirty_store = out / 'dirty-store.img'
@@ -73,7 +82,8 @@ def main():
         run('mcopy', '-o', '-i', media, a.dirty_classification_kernel, '::KERNEL/BROOK.ELF')
     else:
         run('mdel', '-i', initrd, '::ETC/writable-desktop')
-    run('mcopy', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
+    if not a.candidate_initrd:
+        run('mcopy', '-i', initrd, a.snapshot_helper, '::BOOT/HWSNAP.ELF')
     if a.xhci_module:
         run('mcopy', '-o', '-i', initrd, a.xhci_module, '::DRIVERS/XHCI.MOD')
     if a.recovery_initrd:
@@ -117,10 +127,15 @@ def main():
             h = Hardware(out / 'registry'); attached = h.attach('127.0.0.1', ports[0]); s = attached['session']
             caps = h.command(s, 'bridge hardware caps')
             assert not caps['writable_desktop']['ready'] and not caps['writable_desktop']['source_pinned']
-            assert 'ahci system: verified GPT entry' in serial and 'writable desktop: ready' not in serial
+            assert 'writable desktop: ready' not in serial
+            if a.expect_identity_refusal:
+                assert 'ahci system: disk identity or writable state failed' in serial
+            else:
+                assert 'ahci system: verified GPT entry' in serial
             if dirty_store:
-                assert caps['writable_desktop']['stage'] == 'needs-filesystem-check'
-                assert caps['writable_desktop']['error'] == -117
+                if not a.expect_identity_refusal:
+                    assert caps['writable_desktop']['stage'] == 'needs-filesystem-check'
+                    assert caps['writable_desktop']['error'] == -117
                 if a.network_roundtrip:
                     payload = out / 'network-payload.bin'
                     payload.write_bytes(bytes(range(251)) * 8193)
@@ -183,7 +198,7 @@ def main():
                         assert f.read(2) == b'\x01\x00', 'preen did not mark image clean'
                 else:
                     assert sha(recovered) == sha(dirty_store)
-                (out / 'result.json').write_text(json.dumps({'passed': True, 'stage': 'needs-filesystem-check',
+                (out / 'result.json').write_text(json.dumps({'passed': True, 'stage': 'identity-refused' if a.expect_identity_refusal else 'needs-filesystem-check',
                     'store_unmounted': True, 'store_bytes_unchanged': not bool(a.preen_checker),
                     'checked_shutdown': True, 'readonly_checker_passed': bool(a.readonly_checker),
                     'disposable_preen_passed': bool(a.preen_checker),
