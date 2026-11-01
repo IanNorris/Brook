@@ -355,11 +355,13 @@ int main() {
     // payload-bearing update, even when the ACK number itself is valid.
     i=create();setupTcp(i);g_sockets[i].rxCount=Socket::RX_BUF_SIZE;
     deliverControl(i,20,10,TCP_ACK,200);assert(g_sockets[i].tcpSndWnd==200);
+    auto clippedBefore=__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED);
     {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;
      struct {TcpHeader tcp;uint8_t byte;} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
      packet.tcp.seqNum=htonl(20);packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;
      packet.tcp.window=htons(300);packet.tcp.dataOff=5<<4;HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+1);}
-    assert(g_sockets[i].tcpSndWnd==200);SockClose(i);
+    assert(g_sockets[i].tcpSndWnd==200);
+    assert(__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED)==clippedBefore+1);SockClose(i);
     // An overlapping segment is trimmed by receive processing; the window
     // order retains its original sequence rather than the trimmed position.
     i=create();setupTcp(i);
@@ -368,6 +370,27 @@ int main() {
      packet.tcp.seqNum=htonl(19);packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;
      packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+2);}
     assert(g_sockets[i].tcpSndWnd==400 && g_sockets[i].tcpSndWl1==19 && g_sockets[i].tcpRcvNxt==21);
+    SockClose(i);
+    // Diagnostic counters reflect the actual OOO admission and overlap paths.
+    i=create();setupTcp(i);
+    auto arrivals=__atomic_load_n(&g_tcpReceiveDiagnostics.oooArrivals,__ATOMIC_RELAXED);
+    auto held=__atomic_load_n(&g_tcpReceiveDiagnostics.oooStored,__ATOMIC_RELAXED);
+    auto overlaps=__atomic_load_n(&g_tcpReceiveDiagnostics.oooOverlap,__ATOMIC_RELAXED);
+    {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;
+     struct {TcpHeader tcp;uint8_t byte;} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
+     packet.tcp.seqNum=htonl(21);packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;
+     packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
+     HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+1);HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+1);}
+    assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooArrivals,__ATOMIC_RELAXED)==arrivals+2);
+    assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooStored,__ATOMIC_RELAXED)==held+1);
+    assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooOverlap,__ATOMIC_RELAXED)==overlaps+1);
+    SockClose(i);
+    i=create();setupTcp(i);auto fullBefore=__atomic_load_n(&g_tcpReceiveDiagnostics.oooFull,__ATOMIC_RELAXED);
+    {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;
+     struct {TcpHeader tcp;uint8_t byte;} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
+     packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;
+     for(unsigned n=0;n<Socket::TCP_OOO_SLOT_COUNT+1;++n){packet.tcp.seqNum=htonl(21+n*2);HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+1);}}
+    assert(__atomic_load_n(&g_tcpReceiveDiagnostics.oooFull,__ATOMIC_RELAXED)==fullBefore+1);
     SockClose(i);
     assert(allocations == frees);
     std::puts("socket lifetime: PASS");

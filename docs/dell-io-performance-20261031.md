@@ -379,6 +379,29 @@ earlier local transfer was not established. A subsequent isolated Dell-to-host
 for each segment's ACK, consistent with a significant outbound limit but not
 proof of the cause of the browser result.
 
+Two 4 MiB HTTPS downloads from Cloudflare's speed-test endpoint with the cap
+enabled took 3.74 and 4.37 s. The latter reported 19 ms TCP connection time;
+16 KiB per 19 ms is only about 0.86 MB/s, consistent with a window-limited
+path but not proof of the bottleneck or a controlled uncapped comparison.
+The endpoint and route differ from the user's speed test. Do not make the
+fixed cap the general default based on local throughput: it can substantially
+limit higher-RTT connections. Investigate where uncapped bursts are lost and
+compare the same path before adopting any general policy.
+
+The uncapped diagnostic candidate adds boot-wide USB queue-credit-pressure and
+zero-outstanding transitions, dispatch try-lock misses, and TCP out-of-order
+admission/rejection and clipping counters. USB counts are sampled under the
+controller lock. Outstanding counts software-owned transfers whose completion
+events have not yet been consumed; pending events can mean the device
+has fewer requests armed than this value suggests. The pressure count measures
+transitions, not time or packets lost. TCP counters are global and sampled
+independently; overlap includes duplicate retransmissions, and clipping is
+recorded before the state-machine decision. Host tests exercise credit
+transitions and actual OOO-full/clipping paths; QEMU USB acceptance passed.
+These counters cannot by themselves prove where an individual packet was lost.
+The snapshot layout requires module ABI 60 and freshly rebuilt modules. This
+diagnostic kernel has not been installed on the Dell.
+
 As a prerequisite for a future bounded multi-segment sender, incoming TCP
 window updates now reject invalid ACK bounds, reset/no-ACK packets, stale
 ordering and sequence positions outside the pre-processing receive estimate.

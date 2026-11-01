@@ -32,3 +32,17 @@ struct UsbEcmRxCredits {
     // Caller must use an active slot returned by Find(), under that lock.
     void Complete(unsigned slot) { slots[slot].active = false; --outstanding; }
 };
+
+// Externally serialized observations after rearming. These count entries into
+// queue-credit pressure and into its zero-outstanding subset, not packets lost.
+struct UsbEcmRxPressure {
+    uint64_t entries,zeroEntries;
+    bool blocked,zero;
+    void Observe(unsigned depth,unsigned outstanding,uint32_t queued) {
+        bool next=outstanding<depth && queued+outstanding>=UsbEcmRxCredits::Capacity;
+        bool nextZero=next && !outstanding;
+        if(next&&!blocked)++entries;
+        if(nextZero&&!zero)++zeroEntries;
+        blocked=next;zero=nextZero;
+    }
+};

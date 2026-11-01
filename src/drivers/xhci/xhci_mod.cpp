@@ -984,6 +984,7 @@ struct UsbEcmState {
     UsbEcmTxSlots sends;
     uint8_t packets[ECM_RX_PACKETS][1514];uint16_t lengths[ECM_RX_PACKETS];uint32_t head,tail;
     uint64_t dropped,received,transmitted,txBusy;uint32_t queueHighWater;bool failed;
+    UsbEcmRxPressure rxPressure;uint64_t rxDispatchBusy;
     uint32_t faultStatus,faultDci;uint64_t faultToken;
 };
 static bool g_networkProbe=false;
@@ -2282,6 +2283,9 @@ static void XhciEcmReceiveArm(UsbEcmState& net){
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         XhciRingDoorbell(*net.controller,net.device->slotId,net.device->bulkInDci);
     }
+    // Count transitions, not polls. A full software queue can consume all
+    // receive credits without recording a dropped completed USB frame.
+    net.rxPressure.Observe(net.rxDepth,net.rxCredits.outstanding,net.tail-net.head);
 }
 static void XhciEcmNotificationArm(UsbEcmState& net){
     auto& dev=*net.device;
@@ -2368,8 +2372,9 @@ static bool XhciEcmSnapshot(NetIf* nif,NetDriverSnapshot* out){
     if(!nif || !out || !nif->driverPriv)return false;
     auto& net=*static_cast<UsbEcmState*>(nif->driverPriv);
     const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
-    *out={net.received,net.transmitted,net.dropped,net.txBusy,net.rxDepth,
-          net.rxCredits.outstanding,net.tail-net.head,net.queueHighWater,
+    *out={net.received,net.transmitted,net.dropped,net.txBusy,
+          net.rxPressure.entries,net.rxPressure.zeroEntries,net.rxDispatchBusy,net.rxDepth,
+          net.rxCredits.outstanding,net.tail-net.head,net.queueHighWater,net.txDepth,
           net.failed || net.controller->completionFailed};
     IrqSpinLockRelease(&g_eventRingLock,saved);return true;
 }
@@ -2411,7 +2416,9 @@ static void XhciEcmPoll(NetIf* nif){
         const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
         if(net.earlyDispatch){IrqSpinLockRelease(&g_eventRingLock,saved);return;}
         net.earlyDispatch=true;IrqSpinLockRelease(&g_eventRingLock,saved);
-    }else if(!KMutexTryLock(&net.dispatchLock))return;
+    }else if(!KMutexTryLock(&net.dispatchLock)){
+        const auto saved=IrqSpinLockAcquire(&g_eventRingLock);++net.rxDispatchBusy;IrqSpinLockRelease(&g_eventRingLock,saved);return;
+    }
     for(unsigned n=0;n<8;++n){
         uint8_t frame[1514];unsigned bytes=0;
         const auto saved=IrqSpinLockAcquire(&g_eventRingLock);

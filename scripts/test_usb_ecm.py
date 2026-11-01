@@ -122,6 +122,7 @@ try:
   assert report['tcp_ack_submit_failures']>=0,report
   assert report['tcp_recv_window_cap_bytes']==(16384 if args.tcp_window16 else 0),report
   assert stats['rx_depth']==(8 if args.rx_depth8 else 1),stats
+  assert stats['tx_depth']==(16 if args.tx_depth16 else 8),stats
   assert stats['rx_completed']>0 and stats['tx_completed']>0 and not stats['failed'],stats
   assert 0<=stats['rx_queued']<=stats['rx_queue_high_water']<=32,stats
   (base/'network-snapshot.json').write_text(json.dumps(stats,indent=2)+'\n')

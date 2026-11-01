@@ -242,6 +242,10 @@ static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t se
 // The caller retains a SocketBorrow across submission and retry scheduling.
 // Preserve any newer pending ACK and its earlier timer.
 static uint64_t g_tcpAckSubmissionFailures=0;
+struct TcpReceiveDiagnostics {
+    uint64_t oooArrivals,oooStored,oooOverlap,oooCapacity,oooOversize,oooFull,clippedSegments;
+};
+static TcpReceiveDiagnostics g_tcpReceiveDiagnostics{};
 static void TcpRequeueFailedAck(Socket& s)
 {
     __atomic_fetch_add(&g_tcpAckSubmissionFailures,1,__ATOMIC_RELAXED);
@@ -2254,6 +2258,7 @@ static bool TcpStoreOoo(Socket& s, uint32_t seq, const uint8_t* data,
     if (len == 0)
         return false;
     if (len > Socket::TCP_OOO_SLOT_SIZE) {
+        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooOversize,1,__ATOMIC_RELAXED);
         s.oooDropCount++;
         if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
             SerialPrintf("tcp: OOO TOOLARGE pid=%u seq=%u len=%u drop=%u\n",
@@ -2268,6 +2273,7 @@ static bool TcpStoreOoo(Socket& s, uint32_t seq, const uint8_t* data,
         uint32_t slotEnd = slot.seq + slot.len;
         bool disjoint = !TcpSeqBefore(seq, slotEnd) || !TcpSeqBefore(slot.seq, end);
         if (!disjoint) {
+            __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooOverlap,1,__ATOMIC_RELAXED);
             s.oooDropCount++;
             if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
                 SerialPrintf("tcp: OOO OVERLAP pid=%u seq=%u len=%u slotSeq=%u slotLen=%u drop=%u\n",
@@ -2277,6 +2283,7 @@ static bool TcpStoreOoo(Socket& s, uint32_t seq, const uint8_t* data,
     }
 
     if (len > TcpReceiveFree(s)) {
+        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooCapacity,1,__ATOMIC_RELAXED);
         s.oooDropCount++;
         if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
             SerialPrintf("tcp: OOO CAPACITY pid=%u seq=%u len=%u free=%u drop=%u bytes=%u\n",
@@ -2297,6 +2304,7 @@ static bool TcpStoreOoo(Socket& s, uint32_t seq, const uint8_t* data,
         slot.used = true;
         s.tcpOooBytes += len;
         s.oooHeldCount++;
+        __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooStored,1,__ATOMIC_RELAXED);
         if (s.oooHeldCount <= 5 || (s.oooHeldCount % 50) == 0) {
             int32_t gap = static_cast<int32_t>(seq - s.tcpRcvNxt);
             SerialPrintf("tcp: OOO HELD pid=%u seq=%u rcvNxt=%u gap=%d len=%u held=%u bytes=%u\n",
@@ -2306,6 +2314,7 @@ static bool TcpStoreOoo(Socket& s, uint32_t seq, const uint8_t* data,
         return true;
     }
 
+    __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooFull,1,__ATOMIC_RELAXED);
     s.oooDropCount++;
     if (s.oooDropCount <= 5 || (s.oooDropCount % 50) == 0)
         SerialPrintf("tcp: OOO FULL pid=%u seq=%u rcvNxt=%u len=%u drop=%u bytes=%u\n",
@@ -2561,6 +2570,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             uint32_t newBytes = dataLen - staleBytes;
             bufferWasFull = (newBytes > 0 && freeSpace == 0);
             if (newBytes > freeSpace) {
+                __atomic_fetch_add(&g_tcpReceiveDiagnostics.clippedSegments,1,__ATOMIC_RELAXED);
                 dataLen = staleBytes + freeSpace;
                 // If we clamped data away and this segment carries FIN,
                 // strip the FIN flag.  FIN occupies the sequence position
@@ -2582,9 +2592,11 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
 
         if (act.enqueueData && act.dataPtr && act.dataLen > 0)
             TcpEnqueueData(s, act.dataPtr, act.dataLen);
-        if (act.holdOooData && act.oooDataPtr && act.oooDataLen > 0)
+        if (act.holdOooData && act.oooDataPtr && act.oooDataLen > 0) {
+            __atomic_fetch_add(&g_tcpReceiveDiagnostics.oooArrivals,1,__ATOMIC_RELAXED);
             TcpStoreOoo(s, act.oooSeq, act.oooDataPtr,
                         act.oooDataLen, ApicTickCount());
+        }
         if (TcpDrainOoo(s))
             act.sendAck = true;
 
@@ -4009,14 +4021,25 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("tx_completed",s.transmitted);
             r.text(",");r.field("rx_dropped",s.dropped);
             r.text(",");r.field("tx_busy",s.txBusy);
+            r.text(",");r.field("rx_backpressure_entries",s.rxBackpressureEntries);
+            r.text(",");r.field("rx_zero_outstanding_entries",s.rxZeroOutstandingEntries);
+            r.text(",");r.field("rx_dispatch_busy",s.rxDispatchBusy);
             r.text(",");r.field("rx_depth",s.rxDepth);
             r.text(",");r.field("rx_outstanding",s.rxOutstanding);
             r.text(",");r.field("rx_queued",s.rxQueued);
             r.text(",");r.field("rx_queue_high_water",s.rxQueueHighWater);
+            r.text(",");r.field("tx_depth",s.txDepth);
             r.text(",\"failed\":");r.text(s.failed?"true":"false");r.text("}");
         }
         r.text(",");r.field("tcp_ack_submit_failures",__atomic_load_n(&g_tcpAckSubmissionFailures,__ATOMIC_RELAXED));
         r.text(",");r.field("tcp_recv_window_cap_bytes",g_tcpReceiveWindowCap==~uint32_t(0)?0:g_tcpReceiveWindowCap);
+        r.text(",\"tcp_receive\":{");r.field("ooo_arrivals",__atomic_load_n(&g_tcpReceiveDiagnostics.oooArrivals,__ATOMIC_RELAXED));
+        r.text(",");r.field("ooo_stored",__atomic_load_n(&g_tcpReceiveDiagnostics.oooStored,__ATOMIC_RELAXED));
+        r.text(",");r.field("ooo_overlap",__atomic_load_n(&g_tcpReceiveDiagnostics.oooOverlap,__ATOMIC_RELAXED));
+        r.text(",");r.field("ooo_capacity",__atomic_load_n(&g_tcpReceiveDiagnostics.oooCapacity,__ATOMIC_RELAXED));
+        r.text(",");r.field("ooo_oversize",__atomic_load_n(&g_tcpReceiveDiagnostics.oooOversize,__ATOMIC_RELAXED));
+        r.text(",");r.field("ooo_full",__atomic_load_n(&g_tcpReceiveDiagnostics.oooFull,__ATOMIC_RELAXED));
+        r.text(",");r.field("clipped_segments",__atomic_load_n(&g_tcpReceiveDiagnostics.clippedSegments,__ATOMIC_RELAXED));r.text("}");
         r.text("}\n");r.send();return;
     }
     if (NetStrEq(cmd, "bridge stats")) {

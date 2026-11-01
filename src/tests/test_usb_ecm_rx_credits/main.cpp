@@ -38,6 +38,15 @@ int main() {
     assert(!c.CanArm(0,9,0));
     assert(!c.CanArm(0,8,33));
 
+    UsbEcmRxPressure pressure{};
+    pressure.Observe(8,8,24);assert(!pressure.blocked && pressure.entries==0);
+    pressure.Observe(8,7,25);assert(pressure.blocked && pressure.entries==1 && !pressure.zero);
+    pressure.Observe(8,7,25);assert(pressure.entries==1);
+    pressure.Observe(8,0,32);assert(pressure.zero && pressure.zeroEntries==1);
+    pressure.Observe(8,1,31);assert(!pressure.zero && pressure.entries==1);
+    pressure.Observe(8,8,20);assert(!pressure.blocked);
+    pressure.Observe(8,0,32);assert(pressure.entries==2 && pressure.zeroEntries==2);
+
     // Reuse slots through many token-ring laps; stale tokens cannot complete
     // a live buffer while it has a different token.
     for (unsigned lap=0;lap<1024;++lap) {

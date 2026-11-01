@@ -81,7 +81,7 @@ namespace brook {
 // ABI 56 gives desktop draw callbacks signed destination origins. Matched
 // drivers preserve offscreen quads and support their full NDC range.
 // ABI 57 appends the proven backdrop-blur capability query.
-static constexpr uint32_t MODULE_ABI_VERSION = 59;
+static constexpr uint32_t MODULE_ABI_VERSION = 60;
 
 // Magic bytes at the start of every valid ModuleInfo.
 static constexpr uint32_t MODULE_MAGIC = 0x4B524F42; // 'BROK'

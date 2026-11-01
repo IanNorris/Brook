@@ -163,7 +163,9 @@ static inline uint32_t Ipv4Addr(uint8_t a, uint8_t b, uint8_t c, uint8_t d)
 
 struct NetDriverSnapshot {
     uint64_t received, transmitted, dropped, txBusy;
+    uint64_t rxBackpressureEntries, rxZeroOutstandingEntries, rxDispatchBusy;
     uint32_t rxDepth, rxOutstanding, rxQueued, rxQueueHighWater;
+    uint32_t txDepth;
     bool failed;
 };
 
