@@ -23,6 +23,34 @@ static bool TcpSeqAfter(uint32_t a, uint32_t b)
     return static_cast<int32_t>(a - b) > 0;
 }
 
+bool TcpUpdateSendWindow(Socket& s,uint32_t seq,uint32_t ack,uint8_t flags,
+                         uint16_t rawWindow,uint32_t segmentLength,uint32_t receiveWindow)
+{
+    if(flags&TCP_RST)return false;
+    if(s.tcpState==TcpState::SynSent) {
+        if((flags&(TCP_SYN|TCP_ACK))!=(TCP_SYN|TCP_ACK) || ack!=s.tcpSndNxt)return false;
+        const bool changed=s.tcpSndWnd!=rawWindow;
+        s.tcpSndWnd=rawWindow;s.tcpSndWl1=seq;s.tcpSndWl2=ack;s.tcpSndWlValid=true;return changed;
+    }
+    if(s.tcpState!=TcpState::SynRecv && s.tcpState!=TcpState::Established && s.tcpState!=TcpState::CloseWait)return false;
+    if(!(flags&TCP_ACK) || (flags&TCP_SYN))return false;
+    if(s.tcpState==TcpState::SynRecv && ack!=s.tcpSndNxt)return false;
+    if(TcpSeqBefore(ack,s.tcpSndUna) || TcpSeqAfter(ack,s.tcpSndNxt))return false;
+    // Use the pre-processing receive position. This is an admission bound,
+    // not a complete implementation of the last-advertised right edge.
+    const bool firstInWindow=!TcpSeqBefore(seq,s.tcpRcvNxt) &&
+        static_cast<uint32_t>(seq-s.tcpRcvNxt)<receiveWindow;
+    const uint32_t last=seq+(segmentLength?segmentLength-1:0);
+    const bool lastInWindow=segmentLength && !TcpSeqBefore(last,s.tcpRcvNxt) &&
+        static_cast<uint32_t>(last-s.tcpRcvNxt)<receiveWindow;
+    if(receiveWindow==0 ? (segmentLength!=0 || seq!=s.tcpRcvNxt) : !(firstInWindow||lastInWindow))return false;
+    if(s.tcpSndWlValid && (TcpSeqBefore(seq,s.tcpSndWl1) ||
+       (seq==s.tcpSndWl1 && TcpSeqBefore(ack,s.tcpSndWl2))))return false;
+    const uint32_t scaled=static_cast<uint32_t>(rawWindow)<<s.tcpSndWndScale;
+    const bool changed=s.tcpSndWnd!=scaled;
+    s.tcpSndWnd=scaled;s.tcpSndWl1=seq;s.tcpSndWl2=ack;s.tcpSndWlValid=true;return changed;
+}
+
 // An ACK must not retire data we have not sent, or move the oldest
 // unacknowledged sequence backwards. The sender keeps less than 2^31 bytes
 // outstanding, so signed modular comparisons remain unambiguous.

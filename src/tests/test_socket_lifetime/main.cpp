@@ -118,6 +118,12 @@ static void deliver(int i, bool fin = false) {
     packet.byte = 42;
     HandleTcp(&ip, &packet, sizeof(TcpHeader) + 1);
 }
+static void deliverControl(int i,uint32_t seq,uint32_t ack,uint8_t flags,uint16_t window) {
+    const auto& s=g_sockets[i];Ipv4Header ip{};ip.srcIp=s.remoteIp;ip.dstIp=s.localIp;
+    TcpHeader tcp{};tcp.srcPort=s.remotePort;tcp.dstPort=s.localPort;
+    tcp.seqNum=htonl(seq);tcp.ackNum=htonl(ack);tcp.flags=flags;tcp.window=htons(window);tcp.dataOff=5<<4;
+    HandleTcp(&ip,&tcp,sizeof(tcp));
+}
 int main() {
     // Queued RX ticket must finish before buffer retirement/reset.
     int i = create(); setupTcp(i);
@@ -293,6 +299,76 @@ int main() {
     std::thread closeDuringWindow([&]{SockClose(i);closed=true;});
     await([&]{return !published(i);});assert(reservedSlot(i) && !closed && frees==before && g_sockets[i].rxBuf);
     releaseTransmit=true;reader.join();closeDuringWindow.join();pauseTransmit=false;pauseOnlyPureAck=false;assert(closed);
+    // Real receive dispatch must ignore stale, future, unacknowledged and
+    // out-of-window advertisements, while accepting an equal-sequence reopen.
+    i=create();setupTcp(i);g_sockets[i].tcpSndNxt=12;g_sockets[i].tcpSndWnd=100;
+    deliverControl(i,20,10,TCP_ACK,50);
+    assert(g_sockets[i].tcpSndWnd==50 && g_sockets[i].tcpSndWlValid);
+    deliverControl(i,19,10,TCP_ACK,99);assert(g_sockets[i].tcpSndWnd==50);
+    deliverControl(i,20,9,TCP_ACK,99);assert(g_sockets[i].tcpSndWnd==50);
+    deliverControl(i,20,13,TCP_ACK,99);assert(g_sockets[i].tcpSndWnd==50);
+    deliverControl(i,20,10,0,99);assert(g_sockets[i].tcpSndWnd==50);
+    deliverControl(i,1000000,10,TCP_ACK,99);assert(g_sockets[i].tcpSndWnd==50);
+    deliverControl(i,20,10,TCP_ACK,0);assert(g_sockets[i].tcpSndWnd==0);
+    waiter=new Process{};waiter->refCount=1;SockSetPollWaiter(i,waiter);wakeCount=wakes;
+    deliverControl(i,20,10,TCP_ACK,80);
+    assert(g_sockets[i].tcpSndWnd==80 && wakes==wakeCount+1 && waiter->refCount==1);
+    deliverControl(i,20,10,TCP_RST|TCP_ACK,99);assert(g_sockets[i].tcpSndWnd==80);
+    SockClose(i);delete waiter;
+    // Sequence and ACK ordering use modular comparisons around wraparound.
+    i=create();setupTcp(i);g_sockets[i].tcpRcvNxt=0xfffffffeu;
+    g_sockets[i].tcpSndUna=0xfffffffeu;g_sockets[i].tcpSndNxt=2;
+    deliverControl(i,0xfffffffeu,0xfffffffeu,TCP_ACK,30);
+    deliverControl(i,0u,1u,TCP_ACK,40);assert(g_sockets[i].tcpSndWnd==40);
+    deliverControl(i,0xffffffffu,1u,TCP_ACK,50);assert(g_sockets[i].tcpSndWnd==40);
+    SockClose(i);
+    // Active-open SYN window is unscaled even when scaling is negotiated;
+    // subsequent acceptable ACK windows are scaled.
+    i=create();setupTcp(i);g_sockets[i].tcpState=TcpState::SynSent;
+    g_sockets[i].tcpSndUna=10;g_sockets[i].tcpSndNxt=11;g_sockets[i].tcpSndWnd=90;
+    deliverControl(i,70,9,TCP_SYN|TCP_ACK,1234);
+    assert(g_sockets[i].tcpState==TcpState::SynSent && g_sockets[i].tcpSndWnd==90 && !g_sockets[i].tcpSndWlValid);
+    {
+        Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;
+        struct {TcpHeader tcp;uint8_t option[4];} packet{};
+        packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);packet.tcp.seqNum=htonl(70);
+        packet.tcp.ackNum=htonl(11);packet.tcp.flags=TCP_SYN|TCP_ACK;packet.tcp.window=htons(1234);packet.tcp.dataOff=6<<4;
+        packet.option[0]=1;packet.option[1]=3;packet.option[2]=3;packet.option[3]=3;
+        HandleTcp(&packetIp,&packet,sizeof(packet));
+    }
+    assert(g_sockets[i].tcpState==TcpState::Established && g_sockets[i].tcpSndWnd==1234 && g_sockets[i].tcpSndWndScale==3);
+    deliverControl(i,71,11,TCP_ACK,30);assert(g_sockets[i].tcpSndWnd==240);
+    SockClose(i);
+    // A passive SYN supplies an unscaled initial window and its final ACK
+    // initializes ordering without negotiating scale.
+    i=create();g_sockets[i].listening=true;g_sockets[i].listenBacklog=4;
+    g_sockets[i].localPort=htons(100);g_sockets[i].tcpState=TcpState::Listen;
+    {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;TcpHeader packet{};
+     packet.srcPort=htons(200);packet.dstPort=htons(100);packet.seqNum=htonl(70);
+     packet.flags=TCP_SYN;packet.window=htons(1234);packet.dataOff=5<<4;HandleTcp(&packetIp,&packet,sizeof(packet));}
+    assert(g_sockets[i].acceptQueueCount==1);int child=g_sockets[i].acceptQueue[0];
+    assert(g_sockets[child].tcpSndWnd==1234 && !g_sockets[child].tcpSndWlValid);
+    deliverControl(child,71,g_sockets[child].tcpSndNxt,TCP_ACK,500);
+    assert(g_sockets[child].tcpState==TcpState::Established && g_sockets[child].tcpSndWnd==500 && g_sockets[child].tcpSndWlValid);
+    SockClose(i);
+    // A zero receive window permits an empty ACK at RCV.NXT, but not a
+    // payload-bearing update, even when the ACK number itself is valid.
+    i=create();setupTcp(i);g_sockets[i].rxCount=Socket::RX_BUF_SIZE;
+    deliverControl(i,20,10,TCP_ACK,200);assert(g_sockets[i].tcpSndWnd==200);
+    {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;
+     struct {TcpHeader tcp;uint8_t byte;} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
+     packet.tcp.seqNum=htonl(20);packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;
+     packet.tcp.window=htons(300);packet.tcp.dataOff=5<<4;HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+1);}
+    assert(g_sockets[i].tcpSndWnd==200);SockClose(i);
+    // An overlapping segment is trimmed by receive processing; the window
+    // order retains its original sequence rather than the trimmed position.
+    i=create();setupTcp(i);
+    {Ipv4Header packetIp{};packetIp.srcIp=2;packetIp.dstIp=1;
+     struct {TcpHeader tcp;uint8_t bytes[2];} packet{};packet.tcp.srcPort=htons(200);packet.tcp.dstPort=htons(100);
+     packet.tcp.seqNum=htonl(19);packet.tcp.ackNum=htonl(10);packet.tcp.flags=TCP_ACK;
+     packet.tcp.window=htons(400);packet.tcp.dataOff=5<<4;HandleTcp(&packetIp,&packet,sizeof(TcpHeader)+2);}
+    assert(g_sockets[i].tcpSndWnd==400 && g_sockets[i].tcpSndWl1==19 && g_sockets[i].tcpRcvNxt==21);
+    SockClose(i);
     assert(allocations == frees);
     std::puts("socket lifetime: PASS");
 }

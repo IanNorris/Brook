@@ -126,6 +126,11 @@ inline bool TcpPassiveOpenExpired(const Socket& socket, uint64_t now)
 }
 
 // Process an incoming TCP segment for a socket.
+// Caller holds socket.lock; receiveWindow is a bounded pre-processing estimate,
+// not a complete record of the last advertised right edge.
+bool TcpUpdateSendWindow(Socket& s,uint32_t seq,uint32_t ack,uint8_t flags,
+                         uint16_t rawWindow,uint32_t segmentLength,uint32_t receiveWindow);
+
 // Updates socket state (tcpState, tcpRcvNxt, tcpSndUna, connected, tcpFinRecv).
 // Returns a TcpAction describing what the caller should do.
 TcpAction TcpProcessSegment(Socket& s,

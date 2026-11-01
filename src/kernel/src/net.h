@@ -355,6 +355,8 @@ struct Socket {
     uint32_t  tcpRcvNxt;   // next expected receive sequence
     uint32_t  tcpSndIss;   // initial send sequence number
     uint32_t  tcpSndWnd;   // peer's advertised receive window (host-endian, scaled)
+    uint32_t  tcpSndWl1, tcpSndWl2; // sequence and ACK of last accepted window update
+    bool      tcpSndWlValid;
     uint16_t  tcpPeerMss;  // peer's SYN MSS, or the IPv4 default when absent
     uint8_t   tcpSndWndScale; // peer's window scale factor (0-14, from SYN-ACK)
     uint8_t   tcpRcvWndScale; // our window scale factor (advertised in SYN)

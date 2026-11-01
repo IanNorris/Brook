@@ -2516,16 +2516,10 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
             TcpAcceptActiveSynOptions(s, optPtr, dataOff - sizeof(TcpHeader));
         }
 
-        // Update peer's advertised window (apply scale for non-SYN segments)
-        const bool validActiveHandshake = s.tcpState != TcpState::SynSent ||
-            ((flags & (TCP_SYN | TCP_ACK | TCP_RST)) == (TCP_SYN | TCP_ACK) &&
-             ack == s.tcpSndNxt);
-        if (validActiveHandshake) {
-            if (flags & TCP_SYN)
-                s.tcpSndWnd = window;
-            else
-                s.tcpSndWnd = static_cast<uint32_t>(window) << s.tcpSndWndScale;
-        }
+        const uint32_t available=TcpReceiveFree(s);
+        const uint32_t receiveWindow=available<g_tcpReceiveWindowCap?available:g_tcpReceiveWindowCap;
+        const bool windowChanged=TcpUpdateSendWindow(s,seq,ack,flags,window,
+                                                     dataLen+((flags&TCP_FIN)?1u:0u),receiveWindow);
 
         // Log TCP segments — per-socket counter so each new connection gets
         // fresh verbose logging (the old global static went silent after 3
@@ -2604,7 +2598,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         bool shouldWake = (s.rxCount > prevRxCount)
                            || (s.tcpSndUna != prevSndUna)
                            || s.tcpRstRecv
-                           || s.tcpFinRecv || act.justConnected;
+                           || s.tcpFinRecv || act.justConnected || windowChanged;
         Process* waiter = nullptr;
         if (s.pollWaiter && shouldWake)
         {
@@ -2720,6 +2714,7 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
                               ntohs(srcPort) + ntohs(dstPort);
             child.tcpSndNxt = child.tcpSndIss + 1; // after SYN-ACK
             child.tcpSndUna = child.tcpSndIss;
+            child.tcpSndWnd = window; // passive SYN windows are unscaled
 
             const auto childSnapshot = CaptureTcpTxLocked(child);
             SpinLockRelease(&child.lock);
@@ -2845,6 +2840,7 @@ int SockConnect(int sockIdx, const SockAddrIn* addr)
     s.tcpRstRecv = false;
     s.connectError = 0;
     s.tcpSndWnd  = 65535; // assume full window until server tells us otherwise
+    s.tcpSndWl1=s.tcpSndWl2=0;s.tcpSndWlValid=false;
     s.tcpSndWndScale = 0; // no peer scale until SYN-ACK parsed
     // Window scale: RX_BUF_SIZE=512KB needs shift 3 (÷8) to fit in uint16_t
     s.tcpRcvWndScale = 3;
@@ -3360,6 +3356,7 @@ static void DebugChannelThreadFn(void* /*arg*/)
     s.tcpFinRecv = false;
     s.tcpRstRecv = false;
     s.tcpSndWnd  = 65535;
+    s.tcpSndWl1=s.tcpSndWl2=0;s.tcpSndWlValid=false;
     s.tcpSndWndScale = 0;
     s.tcpRcvWndScale = 3;
     s.tcpState   = TcpState::SynSent;

@@ -368,3 +368,24 @@ general browser or high-RTT speed claim. Host retransmission sampling and
 alternating the same build across boots remain outstanding. After the pause,
 the Dell was no longer reachable at its prior address, so this boot has not
 yet been reverified or cleanly shut down.
+
+After the Dell returned, another unpaced capped 4 MiB upload took 0.335 s.
+Host `ss` samples showed a 16,384-byte send window and no retransmissions in
+the observed samples; the final sample preceded socket closure, so it is not
+an end-to-end proof of zero retransmissions. The user's browser speed test
+reported 112 Mbps download and 0.34 Mbps upload; possible overlap with the
+earlier local transfer was not established. A subsequent isolated Dell-to-host
+4 MiB RAM transfer took 3.61 s with a matching digest. Brook's sender waits
+for each segment's ACK, consistent with a significant outbound limit but not
+proof of the cause of the browser result.
+
+As a prerequisite for a future bounded multi-segment sender, incoming TCP
+window updates now reject invalid ACK bounds, reset/no-ACK packets, stale
+ordering and sequence positions outside the pre-processing receive estimate.
+Active and passive handshakes initialize unscaled SYN windows; accepted window
+changes wake a registered waiter. Host tests exercise actual `HandleTcp`
+dispatch, handshakes, scaling, zero-window, wraparound, trimming and wakeups;
+QEMU USB Ethernet acceptance passed. Socket layout changes require module ABI
+59 and a fresh set of modules. This does not implement pipelining, complete TCP
+segment validation or advertised-right-edge tracking, and has not been deployed
+to the Dell. The ordering rules follow [RFC 9293](https://www.rfc-editor.org/rfc/rfc9293.html).
