@@ -552,6 +552,21 @@ int main() {
     {uint8_t data[536]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
     assert(observedRetryCwnd==536 && observedRetryThreshold==1072 && !g_sockets[i].tcpFlightControl.recovering);
     observeFlightControlSocket=-1;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    // A lost middle packet in an adaptive flight must recover the missing
+    // range, preserve later submitted bytes, and reduce the congestion window.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_sockets[i].tcpFlightControl.Init(536);
+    g_sockets[i].tcpFlightControl.Ack(2*536,536);
+    fourLossMode=true;fourLossCount=0;capturedDataCount=0;observeFlightControlSocket=i;
+    {uint8_t data[2144]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(fourLossCount==5 && capturedDataSeq[0]==10 && capturedDataSeq[1]==546 &&
+           capturedDataSeq[2]==1082 && capturedDataSeq[3]==1618 && capturedDataSeq[4]==546);
+    assert(observedRetryCwnd==536 && observedRetryThreshold>=2*536);
+    assert(g_sockets[i].tcpSndUna==2154 && g_sockets[i].tcpSndNxt==2154 &&
+           !g_sockets[i].tcpFlightControl.recovering);
+    observeFlightControlSocket=-1;fourLossMode=false;g_tcpAdaptiveFlight=false;
+    currentProcess=nullptr;SockClose(i);delete waiter;
     // An EAGAIN tail stays unsent after head RTO shrinks cwnd, until forward
     // ACK progress grants credit again.
     waiter=new Process{};waiter->refCount=1;

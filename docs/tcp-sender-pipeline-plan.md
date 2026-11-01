@@ -117,7 +117,10 @@ not full TCP congestion control: idle restart and zero-window persist are not
 implemented. Socket layout changed, so kernel and modules must use ABI 62.
 
 Hosted tests cover window growth, ACK grouping, loss, delayed submission and
-connection reuse. The USB Ethernet QEMU acceptance passed with a delayed
+connection reuse. An actual-sender host test also drops the second packet of a
+four-packet adaptive flight, verifies retransmission of the missing range and
+completion of the retained later bytes, and observes the reduced window. The
+USB Ethernet QEMU acceptance passed with a delayed
 packet queue and observed eight contiguous packets before their covering ACK;
 this does not establish behavior under arbitrary real-network congestion.
 The release build's eight-slot send function reserves 12,424 stack bytes;
