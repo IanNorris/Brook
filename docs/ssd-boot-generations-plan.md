@@ -167,3 +167,14 @@ enumerate the recovery stick, compare
 USB and SSD firmware boot paths with matched payloads. Do not
 replace the accepted EFI loader or force a controller reset to obtain this
 comparison.
+
+After further physical testing the user reported that an ordinary reboot did
+not always clear the failed state, and that the mouse also failed to respond
+on one run (keyboard status was uncertain). On the next boot xHCI and Ethernet
+worked, but the SSD store was classified as unclean and remained unmounted.
+The user noted that the input failure may have prevented a clean shutdown;
+the exact cause of the unclean state is not established. The bundled checker
+passed `-f -n`, returned 1 from `-p`, and passed a second `-f -n`. After a
+checked warm restart the store mounted and the pre-existing persistence fixture
+passed again. The USB recovery stick was attached, so this does not establish
+SSD-only cold-boot reliability or demonstrate automatic repair.
