@@ -257,6 +257,9 @@ records snapshots around each upload. The measurement requests themselves use
 the same network and can perturb small transfers. A high-water value is since
 boot, not specific to a single transfer. These counters cannot detect packets
 lost before USB completion or prove the cause of a TCP retransmission.
+The `NetIf` layout change increments the kernel module ABI to 58; any image
+using this kernel must package freshly rebuilt modules rather than retain ABI
+57 modules from an older initrd.
 
 Both receive depths passed the private QEMU USB Ethernet acceptance with the
 snapshot enabled, including traffic and USB storage/HID checks. This diagnostic

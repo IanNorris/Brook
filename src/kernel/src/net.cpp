@@ -810,8 +810,11 @@ void NetInit()
 void NetRegisterIf(NetIf* nif)
 {
     if(!nif || !nif->transmit)return;
-    const uintptr_t callbacks[]={reinterpret_cast<uintptr_t>(nif->transmit),reinterpret_cast<uintptr_t>(nif->poll)};
-    if(!ModuleRetainAddresses(callbacks,nif->poll?2:1)){
+    uintptr_t callbacks[3];uint32_t callbackCount=0;
+    callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->transmit);
+    if(nif->poll)callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->poll);
+    if(nif->snapshot)callbacks[callbackCount++]=reinterpret_cast<uintptr_t>(nif->snapshot);
+    if(!ModuleRetainAddresses(callbacks,callbackCount)){
         SerialPuts("net: interface callback provider unavailable\n");return;
     }
     const uint64_t viewFlags=IrqSpinLockAcquire(&g_interfaceViewLock);

@@ -2368,7 +2368,8 @@ static bool XhciEcmSnapshot(NetIf* nif,NetDriverSnapshot* out){
     auto& net=*static_cast<UsbEcmState*>(nif->driverPriv);
     const auto saved=IrqSpinLockAcquire(&g_eventRingLock);
     *out={net.received,net.transmitted,net.dropped,net.txBusy,net.rxDepth,
-          net.rxCredits.outstanding,net.tail-net.head,net.queueHighWater,net.failed};
+          net.rxCredits.outstanding,net.tail-net.head,net.queueHighWater,
+          net.failed || net.controller->completionFailed};
     IrqSpinLockRelease(&g_eventRingLock,saved);return true;
 }
 static void XhciEcmPoll(NetIf* nif){
