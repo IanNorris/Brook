@@ -52,7 +52,7 @@ def upload(host,port,key,boot_id,transaction_id,kernel,initrd,activate=False,*,p
         if activated.get('state')!='activated':raise RuntimeError(activated)
         return {'plan':plan,**activated}
 
-def promote(host,port,key,boot_id,transaction_id,expected_slot,kernel,initrd,activate=False):
+def promote(host,port,key,boot_id,transaction_id,expected_slot,kernel,initrd,activate=False,*,expected_generation=None):
     """Select a verified older payload; caller must persist the transaction ID.
 
     A missing reply after ACTIVATE is uncertain, never automatically retried.
@@ -65,7 +65,8 @@ def promote(host,port,key,boot_id,transaction_id,expected_slot,kernel,initrd,act
         connection.settimeout(180)
         connection.sendall(b'BRPROMOT'+key.encode()+boot_id.encode()+transaction_id.encode())
         plan=line(connection)
-        if plan.get('state')!='promote_ready' or plan.get('slot')!=expected_slot:raise RuntimeError(plan)
+        if (plan.get('state')!='promote_ready' or plan.get('slot')!=expected_slot or
+            (expected_generation is not None and plan.get('generation')!=expected_generation)):raise RuntimeError(plan)
         connection.sendall(record(plan['generation'],expected_slot,kernel,initrd))
         staged=line(connection)
         if staged.get('state')!='staged':raise RuntimeError(staged)

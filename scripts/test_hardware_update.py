@@ -116,6 +116,11 @@ def promote(port,mode):
         else:assert result['state']=='promoted'
 results.append(run_case('promote-mismatched',lambda port:promote(port,'bad'),16))
 results.append(run_case('promote-staged',lambda port:promote(port,'staged'),22))
+def reject_unexpected_generation(port):
+    try:promote_client('127.0.0.1',port,key,boot,tx,0,kernel,initrd,True,expected_generation=10)
+    except RuntimeError:pass
+    else:raise AssertionError('unexpected generation accepted')
+results.append(run_case('promote-generation-guard',reject_unexpected_generation,16))
 saved_selector=(out/'SELECT0.BIN').read_bytes()
 saved_payloads={name:value for name,value in hashes().items() if name.startswith(('A/','B/'))}
 results.append(run_case('promote',lambda port:promote_client('127.0.0.1',port,key,boot,tx,0,kernel,initrd,True),0,False))
