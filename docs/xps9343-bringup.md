@@ -2376,6 +2376,21 @@ and scratch fields. Linux's CATPT loader records INSTANCE state per module and
 handles state restoration differently from initial loading, so preserving that
 association is necessary for future work; the raw metadata remains unvalidated.
 
+An experimental `catpt_mailbox.h` now validates the firmware-ready mailbox
+description against an explicitly admitted aperture, including the shifted
+address, fixed-size configuration, firmware-info length and bounded inbox and
+outbox ranges inside a platform-admitted DSP RAM region. Overlap is rejected
+conservatively. The caller must check notification ownership, serialize access,
+and supply stable resources and callback lifetime. Admission and unavailable-
+resource rejection perform no device reads; fake-aperture host tests cover
+malformed and failing reads. The 4 KiB
+mailbox size limit is a Brook implementation bound, not a hardware claim.
+This component is not wired into discovery or interrupts and cannot transmit
+messages, boot the DSP or play audio. Runtime ownership and the Dell's zero DSP
+resource fields remain unresolved. The format follows Linux's
+[CATPT messages](https://github.com/torvalds/linux/blob/master/sound/soc/intel/catpt/messages.h)
+and [IPC driver](https://github.com/torvalds/linux/blob/master/sound/soc/intel/catpt/ipc.c).
+
 ### Firefox HTTPS follow-up and lost hardware connection (2026-10-31)
 
 On the Dell boot pinned by the hardware bridge, a single Firefox launch as
