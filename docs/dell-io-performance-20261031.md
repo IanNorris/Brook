@@ -79,6 +79,13 @@ does not establish that DMA has stopped or test a physical disconnect with
 known outstanding requests. The depth-eight QEMU integration workload passed
 again after this extraction (`ecm-rx8-completion-qemu-20261101`).
 
+The real `KMutexTryLock` implementation is now exercised in the cooperative
+scheduler lifetime harness for the ECM dispatch pattern: a recursive poll and
+a competing caller fail without disturbing ownership, a simulated kill is
+deferred while the dispatcher holds the lock, and a later caller acquires it
+after unlock and the cancellation boundary. The scheduler and kill are mocked;
+this is not a physical process-termination test inside `NetReceive`.
+
 `scripts/test_usb_ecm.py --rx-depth8` now exercises the opt-in path with
 TCP and UDP byte checks, exact 64- and 1,024-byte Ethernet frames, an idle
 interval, concurrent USB storage, and emulated NIC removal followed by USB

@@ -103,6 +103,26 @@ static void testMutex(bool delayedWake) {
     assert(!KMutexTryLock(&mutex)); KMutexUnlock(&mutex); boundary(recycled);
     assert(!recycled.refCount);
 }
+// The ECM dispatcher uses TryLock across NetReceive. Reentrant polls must
+// return without releasing the outer ownership; a pending kill must wait
+// until the owner has unlocked and reached its operation boundary.
+static void testTryDispatchCancellation() {
+    KMutex mutex{};KMutexInit(&mutex);
+    Process dispatcher{4,104}, contender{5,105}, next{6,106};
+    current=&dispatcher;assert(KMutexTryLock(&mutex));
+    assert(dispatcher.depth==1 && mutex.owner==&dispatcher);
+    kill(dispatcher);assert(dispatcher.pending && !dispatcher.terminal);
+    assert(!KMutexTryLock(&mutex)); // recursive poll does not block
+    assert(dispatcher.depth==1 && mutex.owner==&dispatcher);
+    current=&contender;assert(!KMutexTryLock(&mutex));
+    assert(!contender.depth && mutex.owner==&dispatcher);
+    boundary(contender);
+    current=&dispatcher;KMutexUnlock(&mutex);
+    assert(!mutex.locked && !dispatcher.depth && !dispatcher.terminal);
+    boundary(dispatcher);assert(dispatcher.terminal && !dispatcher.refCount);
+    current=&next;assert(KMutexTryLock(&mutex));KMutexUnlock(&mutex);boundary(next);
+    assert(!mutex.locked && !next.depth && !next.refCount);
+}
 static void testRw(bool writerOwner) {
     KRwLock rw{}; KRwLockInit(&rw);
     Process owner{3, 104}, waiter{4, 105}; current = &owner;
@@ -207,6 +227,7 @@ static void testDeferredReaderAdmission() {
 }
 int main() {
     alarm(30);
+    testTryDispatchCancellation();
     testDeferredReaderAdmission();
     testLargeReaderQueue(128,false,false);
     testLargeReaderQueue(129,false,false);
