@@ -79,6 +79,16 @@ does not establish that DMA has stopped or test a physical disconnect with
 known outstanding requests. The depth-eight QEMU integration workload passed
 again after this extraction (`ecm-rx8-completion-qemu-20261101`).
 
+An SSD-specific depth-eight candidate was prepared from the accepted physical
+initrd with a matched new kernel and xHCI module, an explicit marker and a
+distinct payload ID. The Dell's identity-bound system updater received the
+pair in staging-only mode and reported `storage_modified=false`
+(`dell-ecm-rx8-staging-20261101/receipt.json`). It was not activated or
+booted. The previous SSD generation and root recovery remain unchanged. The
+two-slot selector chooses the newest hash-valid generation; it does not
+automatically roll back a kernel that hangs, so recovery availability must be
+established before activation.
+
 The real `KMutexTryLock` implementation is now exercised in the cooperative
 scheduler lifetime harness for the ECM dispatch pattern: a recursive poll and
 a competing caller fail without disturbing ownership, a simulated kill is
