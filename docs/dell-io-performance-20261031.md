@@ -12,6 +12,14 @@ neither transfer used the SSD for its payload, SSD throughput cannot explain
 the measured network ceiling. These are single measurements, not sustained
 throughput guarantees.
 
+On a subsequent SSD-only boot after controller recovery, another random 4 MiB
+RAM-to-RAM sample took 5.037 s host-to-Dell and 3.636 s Dell-to-host in the
+binary phase (about 0.83 and 1.15 MB/s respectively). The returned SHA-256
+matched. These single measurements include helper and hashing overhead; they
+do not isolate TCP or establish steady-state link capacity. Receipts are under
+`build/hardware/network-ram-baseline-20261101-new-upload` and
+`build/hardware/network-ram-baseline-20261101-new-download`.
+
 A read-and-SHA256 pass over the installed 230,212,616-byte Firefox libxul
 file took 1.886 s, followed by 1.897 s for a second pass, about 122 MB/s of
 file bytes per second including hashing. Cache state was not controlled and
