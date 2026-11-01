@@ -514,3 +514,19 @@ than randomized; this is a useful control, not a strict link benchmark.
 During the Dell runs the observed RX-drop, TX-busy and ACK-submission-failure
 counters did not increase. The data does not distinguish the eight-MSS cap,
 per-send-call draining, ACK latency, scheduling or an unmeasured bottleneck.
+
+An opt-in instrumented adaptive build (generation 33) repeated the 1 MiB
+HTTPS upload in 2.007, 1.922 and 1.928 s, all HTTP 200. The aggregate probe
+includes bridge and job traffic as well as curl. Across the three intervals it
+recorded 127–128 slot-capacity waits and 129–130 congestion-limit waits per
+run, with a boot-wide observed maximum of 9,600 outstanding bytes. Each run
+had 64 calls larger than eight MSS and 275–291 call-drain wait observations;
+no retry attempts, local-busy or peer-window-wait observations were counted.
+Waits are observations rather than durations and the maximum is not a
+per-run delta. Of 981–985 eligible retired-slot samples per interval, aggregate
+latest-ACK latency was 12,193–12,274 guest ticks and aggregate delay from the
+latest ACK to sender observation was 2–14 ticks. Those are not individual RTT
+measurements; multiple ACKs can be combined before the sender runs. Together
+the counters support testing a larger bounded flight, while also showing why
+per-call drain behavior deserves attention. The diagnostic build is opt-in,
+with the verified recovery payload retained in slot B.
