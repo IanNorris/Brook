@@ -413,6 +413,8 @@ bool WmInputPushRelative(Window* window,const InputEvent& event);
 // Drain up to `max` events from the window's queue into `out`.  Returns
 // number of events actually written.  Non-blocking.
 uint32_t WmInputPop(Window* win, Window::WmInputEvent* out, uint32_t max);
+int WmInputPopOwned(Process* proc, uint32_t wmId, uint64_t incarnation,
+                    Window::WmInputEvent* out, uint32_t max);
 
 // Phase C — synthetic "WM event" types.  These share the same ring as
 // input events; clients distinguish via the `type` byte.  Values >= 0x80

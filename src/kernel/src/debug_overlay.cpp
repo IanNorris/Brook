@@ -17,6 +17,7 @@
 #include "kprintf.h"
 #include "string.h"
 #include "tty.h"
+#include "input.h"
 
 namespace brook {
 
@@ -180,10 +181,9 @@ static constexpr uint32_t CONSOLE_FG_G   = 0xE0;
 static constexpr uint32_t CONSOLE_FG_B   = 0xC0;
 
 // Render a single glyph into the VFB at pixel position (px, py).
-static void RenderGlyph(uint32_t* vfb, uint32_t stride, uint32_t w, uint32_t h,
+static void RenderGlyph(const FontAtlas& fa, uint32_t* vfb, uint32_t stride, uint32_t w, uint32_t h,
                          int px, int py, int codepoint)
 {
-    const FontAtlas& fa = g_fontAtlas;
     if (codepoint < static_cast<int>(fa.firstChar) ||
         codepoint >= static_cast<int>(fa.firstChar + fa.glyphCount))
         return;
@@ -241,17 +241,15 @@ static void KernelConsoleThread(void* /*arg*/)
     // back so it never occludes focused application windows: the kconsole thread
     // may create this window after apps have already launched, and a passive log
     // pane stealing the top z-order would otherwise hide them.
+    uint32_t initialW=WmMetric(CONSOLE_W), initialH=WmMetric(CONSOLE_H);
+    if(initialW>backingW)initialW=backingW;
+    if(initialH>backingH)initialH=backingH;
     int consoleIdx = WmCreateWindow(self, 20, 60,
-                   static_cast<uint16_t>(CONSOLE_W),
-                   static_cast<uint16_t>(CONSOLE_H), "Kernel Console", 1, false);
+                   static_cast<uint16_t>(initialW),
+                   static_cast<uint16_t>(initialH), "Kernel Console", 1, false);
     if (consoleIdx >= 0)
         WmSendToBack(consoleIdx);
 
-    const FontAtlas& fa = g_fontAtlas;
-    uint32_t lineH = static_cast<uint32_t>(fa.lineHeight);
-    uint32_t glyphW = (fa.glyphCount > 0) ? static_cast<uint32_t>(fa.glyphs[0].advance) : 8;
-    if(!lineH)lineH=16;
-    if(!glyphW)glyphW=8;
     uint32_t width=0,height=0;
 
     // Local display buffer — stores what's currently rendered
@@ -259,35 +257,55 @@ static void KernelConsoleThread(void* /*arg*/)
     static char dispBuf[64][RING_COLS + 1];
     uint32_t dispCount = 0;
     uint32_t lastTotal = 0;
+    uint32_t lastScale = 0, viewEnd = 0;
+    uint64_t incarnation = 0;
+    bool following = true;
 
     for (;;)
     {
         uint32_t nowTotal = DebugOverlayTotalLines();
         BrookWindowState geometry{};
-        if(consoleIdx<0 || WmSnapshotOwnedWindowState(self,static_cast<uint32_t>(consoleIdx+1),0,&geometry))return;
+        if(consoleIdx<0 || WmSnapshotOwnedWindowState(self,static_cast<uint32_t>(consoleIdx+1),incarnation,&geometry))return;
+        if(!incarnation)incarnation=geometry.incarnation;
         uint32_t nextW=geometry.width<backingW?geometry.width:backingW;
         uint32_t nextH=geometry.height<backingH?geometry.height:backingH;
-        if (nowTotal != lastTotal || width!=nextW || height!=nextH)
+        uint32_t scale=WmGetAppliedScale();
+        const FontAtlas& fa=WmDesktopFont();
+        uint32_t lineH=fa.lineHeight>0?static_cast<uint32_t>(fa.lineHeight):16;
+        uint32_t visibleLines=nextH>4?(nextH-4)/lineH:0;
+        if(visibleLines>64)visibleLines=64;
+        bool scrolled=false;
+        Window::WmInputEvent events[16];
+        int n=WmInputPopOwned(self,static_cast<uint32_t>(consoleIdx+1),incarnation,events,16);
+        if(n<0)return;
+        for(int i=0;i<n;++i) {
+            if(events[i].type!=static_cast<uint8_t>(InputEventType::MouseScroll))continue;
+            int dy=static_cast<int8_t>(events[i].scanCode);
+            if(!dy)continue;
+            if(following)viewEnd=nowTotal;
+            uint32_t oldest=nowTotal>RING_LINES-1?nowTotal-(RING_LINES-1):0;
+            uint32_t minEnd=oldest+((nowTotal-oldest)<visibleLines?(nowTotal-oldest):visibleLines);
+            int64_t end=static_cast<int64_t>(viewEnd)-static_cast<int64_t>(dy)*3;
+            if(end<minEnd)end=minEnd;
+            if(end>nowTotal)end=nowTotal;
+            viewEnd=static_cast<uint32_t>(end);following=viewEnd==nowTotal;scrolled=true;
+        }
+        if (nowTotal != lastTotal || width!=nextW || height!=nextH || scale!=lastScale || scrolled)
         {
             width=nextW;height=nextH;
-            uint32_t visibleLines=height>4?(height-4)/lineH:0;
-            if(visibleLines>64)visibleLines=64;
-            uint32_t maxCols=width>4?(width-4)/glyphW:0;
             // New content available — re-render the VFB.
             // Read all available lines from ring (up to visible count).
             // We want the LATEST visibleLines lines, not just new ones.
             SpinLockAcquire(&g_ringLock);
 
             uint32_t totalAvail = g_totalLines;
-            uint32_t count = (totalAvail < visibleLines) ? totalAvail : visibleLines;
-            if(count>RING_LINES-1)count=RING_LINES-1;
-
-            // Calculate start position: we want the last `count` lines
-            uint32_t startLine;
-            if (totalAvail <= RING_LINES)
-                startLine = (totalAvail > count) ? totalAvail - count : 0;
-            else
-                startLine = totalAvail - count;
+            uint32_t oldest=totalAvail>RING_LINES-1?totalAvail-(RING_LINES-1):0;
+            if(following || viewEnd>totalAvail)viewEnd=totalAvail;
+            uint32_t minEnd=oldest+((totalAvail-oldest)<visibleLines?(totalAvail-oldest):visibleLines);
+            if(viewEnd<minEnd)viewEnd=minEnd;
+            uint32_t count=viewEnd-oldest;
+            if(count>visibleLines)count=visibleLines;
+            uint32_t startLine=viewEnd-count;
 
             for (uint32_t i = 0; i < count; i++)
             {
@@ -303,6 +321,7 @@ static void KernelConsoleThread(void* /*arg*/)
 
             SpinLockRelease(&g_ringLock);
             lastTotal = nowTotal;
+            lastScale = scale;
 
             // Clear VFB to background
             uint32_t* vfb = self->fbVirtual;
@@ -315,12 +334,15 @@ static void KernelConsoleThread(void* /*arg*/)
                 int px = 4; // left margin
                 int py = 2 + static_cast<int>(i * lineH);
                 const char* line = dispBuf[i];
-                uint32_t col = 0;
-                for (const char* cp = line; *cp && col < maxCols; ++cp, ++col)
+                for (const char* cp = line; *cp; ++cp)
                 {
-                    RenderGlyph(vfb, width, width, height,
-                                px, py, static_cast<int>(*cp));
-                    px += static_cast<int>(glyphW);
+                    unsigned code=static_cast<unsigned char>(*cp);
+                    if(code<fa.firstChar || code>=fa.firstChar+fa.glyphCount)continue;
+                    int advance=fa.glyphs[code-fa.firstChar].advance;
+                    if(advance<=0)continue;
+                    if(px+advance>static_cast<int>(width))break;
+                    RenderGlyph(fa, vfb, width, width, height, px, py, code);
+                    px += advance;
                 }
             }
 

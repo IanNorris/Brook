@@ -79,7 +79,13 @@ kernel and initrd hashes, then initialized both SSD slots. The system updater
 verified and activated the new xHCI/checker payload as generation 3 in slot A.
 After a checked restart, the Dell reported that payload ID, a ready persistent
 store and working Ethernet; the earlier persistence fixture verified again.
-The legacy root pair and USB recovery remain available. The Dell was then
-cleanly shut down for an SSD-only boot test with the USB removed; that final
-observation is pending. The checker is bundled but automatic repair is not yet
-implemented.
+The legacy root pair and USB recovery remain available. After a clean shutdown,
+the Dell booted from the SSD without the USB, but Ethernet failed: the xHCI
+reset reported phase 0, error 4, USBCMD 0x2 and USBSTS 0x11. Disconnecting
+power and USB devices restored the controller. An updated bounded reset-wait
+candidate was then staged as generation 4 in slot B. One clean SSD-only warm
+restart reached that payload, mounted the persistent store and initialized
+xHCI and Ethernet. This is one successful restart, not proof that the
+intermittent controller failure is fixed; test further and verify persistence
+before calling SSD-only operation reliable. The checker is bundled but
+automatic repair is not yet implemented.
