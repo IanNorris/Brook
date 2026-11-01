@@ -18,6 +18,7 @@
 #include "usb_block_bytes.h"
 #include "usb_ecm_descriptors.h"
 #include "usb_ecm_rx_credits.h"
+#include "usb_ecm_trb_ring.h"
 #include "net.h"
 #include "xhci_ownership.h"
 #include "xhci_controller_reset.h"
@@ -2260,15 +2261,8 @@ static uint64_t XhciEcmTrb(XhciDevice& dev,bool input,uint64_t physical,uint32_t
     auto& enqueue=input?dev.bulkInEnqueue:dev.bulkOutEnqueue;
     auto& cycle=input?dev.bulkInCycle:dev.bulkOutCycle;
     const auto ringPhysical=input?dev.bulkInRingPhys:dev.bulkOutRingPhys;
-    if(enqueue>=XFER_RING_SIZE-1){
-        ring[XFER_RING_SIZE-1].control=TRB_TYPE_LINK|TRB_TC|(ring[XFER_RING_SIZE-2].control&(1u<<4))|(cycle?TRB_CYCLE:0);
-        cycle=!cycle;enqueue=0;
-    }
-    auto& trb=ring[enqueue];const auto token=ringPhysical+enqueue*sizeof(Trb);
-    trb.param=physical;trb.status=bytes;
-    const auto control=TRB_TYPE_NORMAL|(input?(1u<<2):0)|(chain?(1u<<4):TRB_IOC)|(cycle?TRB_CYCLE:0);
-    __atomic_store_n(&trb.control,control^(publish?0u:TRB_CYCLE),__ATOMIC_RELEASE);
-    ++enqueue;return token;
+    return UsbEcmPrepareTrb(ring,XFER_RING_SIZE,ringPhysical,enqueue,cycle,
+                            input,physical,bytes,chain,publish,[]{});
 }
 // Called under g_eventRingLock. A queued frame or an outstanding TD each
 // reserves one software-queue slot, so simultaneous completions cannot

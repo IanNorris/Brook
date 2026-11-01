@@ -66,6 +66,8 @@ target_include_directories(test_update_slots PRIVATE
 add_host_test(test_usb_ecm_descriptors)
 add_host_test(test_usb_ecm_rx_credits)
 target_compile_options(test_usb_ecm_rx_credits PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
+add_host_test(test_usb_ecm_trb_ring)
+target_compile_options(test_usb_ecm_trb_ring PRIVATE "-iquote${BROOK_ROOT}/src/drivers/xhci")
 add_host_test(test_xhci_completion_queue)
 add_host_test(test_partition_bounds)
 add_host_test(test_strict_gpt_inventory)

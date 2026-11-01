@@ -63,6 +63,14 @@ interrupt interleavings or a duplicate after a token address has been reused.
 The refactored opt-in driver also passed early DHCP, ARP, a 4 MiB verified
 upload and clean shutdown in `ecm-rx8-qemu-v4-20261101`.
 
+The shared ECM ring producer now has a deterministic consumer-interleaving
+test: over 30 wraps, the consumer follows a newly published Link before the
+next Normal TRB is prepared and stops on its old cycle, then observes it only
+after publication. It also checks TX immediate publication and a data/ZLP pair
+spanning a Link. The depth-eight QEMU TCP/UDP/storage/removal workload passed
+again after the extraction (`ecm-rx8-ring-qemu-20261101`). This is not a
+concurrent hardware memory-ordering proof or a fatal-completion test.
+
 `scripts/test_usb_ecm.py --rx-depth8` now exercises the opt-in path with
 TCP and UDP byte checks, exact 64- and 1,024-byte Ethernet frames, an idle
 interval, concurrent USB storage, and emulated NIC removal followed by USB
