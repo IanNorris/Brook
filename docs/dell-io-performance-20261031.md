@@ -285,3 +285,17 @@ network address; this does not establish which payload booted or why it is
 offline. Inspect the console before attempting another mutation. A lost
 activation reply must be inspected using the same transaction rather than
 retried automatically.
+
+The TCP receive path and delayed-ACK timer previously cleared pending ACK
+state before submitting the packet to the NIC. A busy USB transmit ring can
+return `-EAGAIN`, leaving no scheduled ACK until later traffic or a much slower
+window update. These two paths now requeue a failed ACK under the socket lock,
+preserve newer pending work, and take a fresh cumulative ACK/window snapshot
+at the next timer tick. Closed sockets discard pending ACK work. A boot-wide
+`tcp_ack_submit_failures` counter is available through `bridge network`.
+The socket-lifetime host test exercises the actual receive and timer code with
+an injected busy NIC, repeated failures, concurrent state advancement and a
+closed socket. This does not fix or count every possible ACK submission path,
+including the separate `SockRecv` window update, and does not establish that
+this was the Dell's dominant throughput bottleneck. Physical measurement is
+still required.

@@ -45,16 +45,16 @@ def main():
         modes=(('unpaced',None),('paced',a.pace_bytes_per_second))
         if i%2:modes=tuple(reversed(modes))
         for label,pace in modes:
-            before_driver=h.command(a.session,'bridge network')['network_driver_snapshot'] if a.driver_snapshot else None
-            if a.driver_snapshot and before_driver is None:raise RuntimeError('No network driver snapshot available')
+            before_network=h.command(a.session,'bridge network') if a.driver_snapshot else None
+            if a.driver_snapshot and before_network.get('network_driver_snapshot') is None:raise RuntimeError('No network driver snapshot available')
             result=BulkRun(h,a.output/f'{i}-{label}').execute(a.session,a.key_file,'put',snapshot,port=a.port,pace_bytes_per_second=pace)
-            after_driver=h.command(a.session,'bridge network')['network_driver_snapshot'] if a.driver_snapshot else None
+            after_network=h.command(a.session,'bridge network') if a.driver_snapshot else None
             transfer=result['transfer']
             if result['guest_boot_id']!=boot:raise RuntimeError('Guest boot changed; inspect receipts')
             if transfer['sha256']!=digest or transfer['bytes']!=size:raise RuntimeError('Source changed or upload digest mismatch; inspect receipts')
             rows.append(dict(round=i,mode=label,requested_pacing_bytes_per_second=pace,
                              bytes=size,sha256=digest,binary_phase_s=result['binary_phase_s'],
-                             transaction_id=result['transaction_id'],driver_before=before_driver,driver_after=after_driver))
+                             transaction_id=result['transaction_id'],network_before=before_network,network_after=after_network))
             print(json.dumps(rows[-1]),flush=True)
     artifact=rows[-1]['transaction_id']
     returned=BulkRun(h,a.output/'download').execute(a.session,a.key_file,'get',artifact_id=artifact,port=a.port)

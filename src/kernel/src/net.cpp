@@ -233,9 +233,23 @@ static TcpTxSnapshot CaptureTcpTxLocked(const Socket& s)
             TcpAdvertisedWindow(free, s.tcpRcvWndScale, 0),
             TcpAdvertisedWindow(free, s.tcpRcvWndScale, TCP_SYN), s.tcpRcvWndScale};
 }
-static void TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq,
+static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq,
                             uint8_t flags, const void* data, uint32_t dataLen,
                             const char* why);
+
+// The caller retains a SocketBorrow across submission and retry scheduling.
+// Preserve any newer pending ACK and its earlier timer.
+static uint64_t g_tcpAckSubmissionFailures=0;
+static void TcpRequeueFailedAck(Socket& s)
+{
+    __atomic_fetch_add(&g_tcpAckSubmissionFailures,1,__ATOMIC_RELAXED);
+    SpinLockAcquire(&s.lock);
+    if(s.type==SOCK_STREAM && s.tcpState!=TcpState::Closed && !s.tcpUnackedSegs) {
+        s.tcpUnackedSegs=1;
+        s.tcpLastDataTick=ApicTickCount();
+    }
+    SpinLockRelease(&s.lock);
+}
 
 // Forward declaration for TCP send (defined below)
 static void TcpSendSegment(Socket& s, uint8_t flags,
@@ -2121,7 +2135,8 @@ static void TcpStatsMaybeFlush()
         if (!borrow) continue;
         Socket& s = g_sockets[i];
         SpinLockAcquire(&s.lock);
-        bool delayed = s.type == SOCK_STREAM && s.tcpUnackedSegs > 0 &&
+        if(s.tcpState==TcpState::Closed)s.tcpUnackedSegs=0;
+        bool delayed = s.type == SOCK_STREAM && s.tcpState!=TcpState::Closed && s.tcpUnackedSegs > 0 &&
             TcpTimerElapsed(now, s.tcpLastDataTick, DELAYED_ACK_MS);
         bool keepalive = s.type == SOCK_STREAM && s.tcpState == TcpState::Established &&
             s.tcpLastRxTick != 0 && TcpTimerElapsed(now, s.tcpLastRxTick, WINDOW_KEEPALIVE_MS) &&
@@ -2130,9 +2145,11 @@ static void TcpStatsMaybeFlush()
         if (keepalive) s.tcpLastRxTick = now;
         const auto snapshot = CaptureTcpTxLocked(s);
         SpinLockRelease(&s.lock);
-        if (delayed || keepalive)
-            TcpSendSnapshot(s, snapshot, snapshot.nextSeq, TCP_ACK, nullptr, 0,
-                            delayed ? "delayed-ack-timer" : "wnd-keepalive");
+        if (delayed || keepalive) {
+            int result=TcpSendSnapshot(s, snapshot, snapshot.nextSeq, TCP_ACK, nullptr, 0,
+                                       delayed ? "delayed-ack-timer" : "wnd-keepalive");
+            if(result)TcpRequeueFailedAck(s);
+        }
     }
 
     if (!TcpTimerElapsed(now, g_tcpStatsLastTick, 5000)) return;
@@ -2326,7 +2343,7 @@ static bool TcpDrainOoo(Socket& s)
     return drained;
 }
 
-static void TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq, uint8_t flags,
+static int TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t seq, uint8_t flags,
                                 const void* data, uint32_t dataLen,
                                 const char* why)
 {
@@ -2377,6 +2394,7 @@ static void TcpSendSnapshot(Socket& s, const TcpTxSnapshot& snapshot, uint32_t s
     // re-enter this function, recursing once per socket needing service until
     // the kernel stack overflows (#DF) under many parallel connections.
     // Periodic maintenance is driven from the net_poll loop instead.
+    return sendResult;
 }
 
 static void TcpSendSegmentAtSeq(Socket& s, uint32_t seq, uint8_t flags,
@@ -2618,9 +2636,11 @@ void HandleTcp(const Ipv4Header* ip, const void* payload, uint32_t len)
         SpinLockRelease(&s.lock);
         if (act.sendSynAck)
             TcpSendSnapshot(s, snapshot, snapshot.iss, TCP_SYN | TCP_ACK, nullptr, 0, "synack-retry");
-        if (sendAck)
-            TcpSendSnapshot(s, snapshot, snapshot.nextSeq, TCP_ACK, nullptr, 0,
-                            bufferWasFull ? "rx-bufferfull" : "rx-action");
+        if (sendAck) {
+            int result=TcpSendSnapshot(s, snapshot, snapshot.nextSeq, TCP_ACK, nullptr, 0,
+                                       bufferWasFull ? "rx-bufferfull" : "rx-action");
+            if(result)TcpRequeueFailedAck(s);
+        }
 
         // Wake the waiter outside the lock — SchedulerUnblock may need the
         // scheduler lock which must not be acquired while holding s.lock.
@@ -3987,6 +4007,7 @@ void DebugHandleCommand(const char* cmd, uint32_t len)
             r.text(",");r.field("rx_queue_high_water",s.rxQueueHighWater);
             r.text(",\"failed\":");r.text(s.failed?"true":"false");r.text("}");
         }
+        r.text(",");r.field("tcp_ack_submit_failures",__atomic_load_n(&g_tcpAckSubmissionFailures,__ATOMIC_RELAXED));
         r.text("}\n");r.send();return;
     }
     if (NetStrEq(cmd, "bridge stats")) {

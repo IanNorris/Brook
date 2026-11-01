@@ -113,7 +113,8 @@ try:
    reply+=chunk
   assert b'BRIDGE_BEGIN 72' in reply and b'BRIDGE_END 72' in reply,reply
   line=next(line for line in reply.splitlines() if line.startswith(b'{'))
-  stats=json.loads(line)['network_driver_snapshot']
+  report=json.loads(line);stats=report['network_driver_snapshot']
+  assert report['tcp_ack_submit_failures']>=0,report
   assert stats['rx_depth']==(8 if args.rx_depth8 else 1),stats
   assert stats['rx_completed']>0 and stats['tx_completed']>0 and not stats['failed'],stats
   assert 0<=stats['rx_queued']<=stats['rx_queue_high_water']<=32,stats

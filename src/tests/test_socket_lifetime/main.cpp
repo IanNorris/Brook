@@ -13,6 +13,9 @@ std::atomic<unsigned> allocations{0}, frees{0}, wakes{0};
 std::atomic<int> failAllocation{-1};
 std::atomic<bool> pauseTransmit{false}, transmitting{false}, releaseTransmit{false};
 std::atomic<bool> acknowledgeFin{false};
+std::atomic<unsigned> rejectPureAcks{0},acceptedPureAcks{0};
+std::atomic<uint32_t> lastAck{0},lastWindow{0};
+std::atomic<int> updateAckSlot{-1};
 std::atomic<bool> pauseAllocation{false}, allocating{false}, releaseAllocation{false};
 std::atomic<uint64_t> ticks{1};
 thread_local brook::Process* currentProcess = nullptr;
@@ -43,6 +46,17 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
                                const void* data, uint32_t len) {
     assert(proto == IP_PROTO_TCP);
     const auto* tcp = static_cast<const TcpHeader*>(data);
+    if(tcp->flags==TCP_ACK && len==sizeof(TcpHeader)) {
+        if(rejectPureAcks.load()) {
+            --rejectPureAcks;
+            int slot=updateAckSlot.exchange(-1);
+            if(slot>=0){auto& socket=g_sockets[slot];SpinLockAcquire(&socket.lock);
+                ++socket.tcpRcvNxt;socket.tcpUnackedSegs=1;socket.tcpLastDataTick=7;
+                SpinLockRelease(&socket.lock);}
+            return -11;
+        }
+        ++acceptedPureAcks;lastAck=ntohl(tcp->ackNum);lastWindow=ntohs(tcp->window);
+    }
     if (pauseTransmit.load()) {
         transmitting = true;
         while (!releaseTransmit.load()) std::this_thread::yield();
@@ -228,6 +242,34 @@ int main() {
     assert(TcpWaitForDataAck(g_sockets[i], i, 10, &payload, 1) == -110);
     assert(waiter->refCount == 1 && g_sockets[i].pollWaiter == nullptr);
     currentProcess = nullptr; SockClose(i); delete waiter;
+    // A busy NIC must not lose a cumulative ACK. Exercise actual HandleTcp,
+    // real send failure and the production maintenance timer, without any
+    // later packet prompting the retry.
+    i=create();setupTcp(i);ticks=100;rejectPureAcks=2;acceptedPureAcks=0;
+    uint64_t failuresBefore=__atomic_load_n(&g_tcpAckSubmissionFailures,__ATOMIC_RELAXED);
+    deliver(i);deliver(i);
+    assert(g_sockets[i].tcpRcvNxt==22 && g_sockets[i].tcpUnackedSegs==1 && acceptedPureAcks==0);
+    ticks=141;TcpStatsMaybeFlush();assert(g_sockets[i].tcpUnackedSegs==1 && acceptedPureAcks==0);
+    // Receive progress and free-window changes may occur while the first ACK
+    // is in flight; a retry must use a fresh snapshot rather than stale bytes.
+    SpinLockAcquire(&g_sockets[i].lock);
+    g_sockets[i].tcpRcvNxt=25;g_sockets[i].rxCount=3;
+    const auto expectedWindow=TcpAdvertisedWindow(TcpReceiveFree(g_sockets[i]),g_sockets[i].tcpRcvWndScale,0);
+    SpinLockRelease(&g_sockets[i].lock);
+    ticks=182;TcpStatsMaybeFlush();
+    assert(acceptedPureAcks==1 && lastAck==25 && lastWindow==expectedWindow && g_sockets[i].tcpUnackedSegs==0);
+    assert(__atomic_load_n(&g_tcpAckSubmissionFailures,__ATOMIC_RELAXED)==failuresBefore+2);
+    SockClose(i);
+    i=create();setupTcp(i);ticks=200;rejectPureAcks=1;acceptedPureAcks=0;updateAckSlot=i;
+    deliver(i);deliver(i);
+    assert(g_sockets[i].tcpRcvNxt==23 && g_sockets[i].tcpUnackedSegs==1 && g_sockets[i].tcpLastDataTick==7);
+    ticks=201;TcpStatsMaybeFlush();assert(acceptedPureAcks==1 && lastAck==23);
+    SockClose(i);
+    i=create();setupTcp(i);ticks=300;rejectPureAcks=1;acceptedPureAcks=0;
+    deliver(i);deliver(i);assert(g_sockets[i].tcpUnackedSegs==1);
+    SpinLockAcquire(&g_sockets[i].lock);g_sockets[i].tcpState=TcpState::Closed;SpinLockRelease(&g_sockets[i].lock);
+    ticks=341;TcpStatsMaybeFlush();assert(acceptedPureAcks==0 && g_sockets[i].tcpUnackedSegs==0);
+    SockClose(i);
     assert(allocations == frees);
     std::puts("socket lifetime: PASS");
 }
