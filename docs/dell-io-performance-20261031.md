@@ -71,6 +71,14 @@ spanning a Link. The depth-eight QEMU TCP/UDP/storage/removal workload passed
 again after the extraction (`ecm-rx8-ring-qemu-20261101`). This is not a
 concurrent hardware memory-ordering proof or a fatal-completion test.
 
+The production receive-credit validator now has host coverage for fatal and
+unknown completion codes, unknown tokens, impossible residue and zero-byte
+short completions. Invalid completions leave the outstanding reservations
+unchanged; the surrounding driver records failure and stops rearming. This
+does not establish that DMA has stopped or test a physical disconnect with
+known outstanding requests. The depth-eight QEMU integration workload passed
+again after this extraction (`ecm-rx8-completion-qemu-20261101`).
+
 `scripts/test_usb_ecm.py --rx-depth8` now exercises the opt-in path with
 TCP and UDP byte checks, exact 64- and 1,024-byte Ethernet frames, an idle
 interval, concurrent USB storage, and emulated NIC removal followed by USB

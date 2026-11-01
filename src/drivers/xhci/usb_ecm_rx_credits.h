@@ -23,6 +23,12 @@ struct UsbEcmRxCredits {
             if (slots[i].active && slots[i].token == token) return static_cast<int>(i);
         return -1;
     }
+    // Keep all TDs pinned on an invalid token, error or impossible residue;
+    // endpoint recovery must first establish that DMA has stopped.
+    int CompletedSlot(uint64_t token, unsigned code, uint32_t residue) const {
+        if ((code != 1 && code != 13) || residue > 2048) return -1;
+        return Find(token);
+    }
     // Caller must use an active slot returned by Find(), under that lock.
     void Complete(unsigned slot) { slots[slot].active = false; --outstanding; }
 };

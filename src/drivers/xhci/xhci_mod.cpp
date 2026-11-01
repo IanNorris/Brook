@@ -2313,8 +2313,8 @@ static bool XhciEcmCompletion(XhciDevice& dev,const Trb& event){
     }
     if(dci==dev.bulkInDci){
         if(net.failed)return true;
-        const int rxSlot=net.rxCredits.Find(event.param);
-        if(rxSlot<0 || (cc!=TRB_CC_SUCCESS && cc!=TRB_CC_SHORT_PACKET) || residue>2048){fail();return true;}
+        const int rxSlot=net.rxCredits.CompletedSlot(event.param,cc,residue);
+        if(rxSlot<0){fail();return true;}
         net.rxCredits.Complete(static_cast<unsigned>(rxSlot));
         const unsigned bytes=2048-residue;
         if(bytes>=14 && bytes<=1514){
