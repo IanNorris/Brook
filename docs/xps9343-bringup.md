@@ -1791,6 +1791,13 @@ the captured Dell DSDT passed the layout test. The exact candidate rejected the
 different QEMU DSDT and passed writable-desktop reboot checks before deployment
 through the guarded updater (`dell-audio-probe-update-20261031`).
 
+On the later SSD generation 31 boot, the same guarded read-only snapshot again
+reported `OSYS=0`, `ADB0=0`, `ADB1=0` and `ADI0=0`. This confirms that this
+boot still does not expose the resources required by the DSP driver; it does
+not identify the firmware initialization or ownership sequence. A Linux
+reference boot on this laptop is the next comparison, not a reason to invent
+addresses or execute an unreviewed firmware initialization sequence.
+
 On the Dell, the two matching samples reported `OSYS=0`, `PCHG=2`, `CODS=1`, I²C0
 mode 1 and IRQ 7, with two nonzero I²C resource bases. `ADB0`, `ADB1` and
 `ADI0` were all zero. The DSDT's ADSP `_STA` tests `ADB0` and `OSYS`, so these
