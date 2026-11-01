@@ -111,3 +111,14 @@ the existing file check all working. On this successful boot PCI command was
 `0x6` and PMCSR `0x8` before and after handoff. This one warm boot does not
 prove the intermittent cold-boot failure is fixed. The `e2fsck` checker is
 bundled but automatic repair is not yet implemented.
+
+The next SSD-only cold boot with generation 7 again failed at phase 8:
+`error=2 USBCMD=0x2 USBSTS_last=0x11 USBSTS_now=0x11 valid=1`, after
+10,002 ms. This confirms that the pre-existing reset bit did not clear during
+the wait; it does not identify why. The successful warm boot's PCI and PMCSR
+values must not be assumed to apply to this failing boot. Linux performs Intel
+port routing after firmware handoff and before its readiness/reset sequence;
+Brook currently routes only after controller start. A controlled comparison of
+the failing boot's PCI power, ownership and routing state should precede any
+change to that ordering. No blind controller reset or PCI power-cycle recovery
+is established by this observation.

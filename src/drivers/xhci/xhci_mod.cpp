@@ -3252,6 +3252,14 @@ static int XhciModuleInit()
     if(legacy)KPrintf("xhci: ownership after handoff sem=0x%x ctl=0x%x\n",
                        ownership.read(legacy),ownership.read(legacy+4));
     XhciLogPciState(ctrl.pciDev,"after-handoff");
+    if(ctrl.pciDev.vendorId==0x8086 && ctrl.pciDev.deviceId==0x9cb1) {
+        const auto& dev=ctrl.pciDev;
+        KPrintf("xhci: routing before reset d0=%08x d4=%08x d8=%08x dc=%08x\n",
+                PciConfigRead32(dev.bus,dev.dev,dev.fn,0xd0),
+                PciConfigRead32(dev.bus,dev.dev,dev.fn,0xd4),
+                PciConfigRead32(dev.bus,dev.dev,dev.fn,0xd8),
+                PciConfigRead32(dev.bus,dev.dev,dev.fn,0xdc));
+    }
     // Reset only after firmware releases ownership and halt is observed.
     if (!XhciReset(ctrl)) {KPuts("xhci: controller reset failed; USB storage/network unavailable\n");return -1;}
     PciEnableBusMaster(ctrl.pciDev);
