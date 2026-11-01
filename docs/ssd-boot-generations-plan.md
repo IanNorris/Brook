@@ -135,3 +135,10 @@ port routing is not supported as the immediate explanation for this failure;
 the difference between firmware boot paths remains unresolved. The SSD store
 was mounted in that failed-xHCI boot, so it must be cleanly shut down before
 power is removed.
+
+A later physical SSD boot successfully initialized xHCI, acquired Ethernet,
+mounted the store and verified the existing test file. The user confirmed that
+the recovery USB was unplugged, so this is an SSD-only success, not the planned
+USB-presence comparison. The result confirms that the failure is intermittent;
+it does not establish its cause or a fix. The store was then cleanly synced
+for the next comparison.
