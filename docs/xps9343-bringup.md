@@ -1720,8 +1720,27 @@ native transfer are separate from this QEMU result.
 
 ### Internal speaker audio: prerequisites for the next gate (2026-10-31)
 
-The physical Broadwell Dell analog path needs SST DSP, SSP/I²S and the RT286
-codec; Brook's existing HDA backend alone does not establish that path. An
+**Updated 2026-11-01:** A Linux 6.12.76 live boot on this Dell exposes an
+analog ALC3263 PCM through the PCH HDA controller `8086:9ca0` at `00:1b.0`;
+the user confirmed audible speaker output. Linux reports SST/RT286 ACPI
+devices absent on this boot. The codec identifies as `10ec:0288`, subsystem
+`1028:0665`; its captured speaker path is pin `0x14`, selected input `0x0d`,
+then DAC `0x03`. This supersedes the earlier assumption that this particular
+boot requires enabling SST/I²S for speakers. The observed Linux state does
+not prove Brook has initialized the controller or that copying its mixer
+register values is sufficient. A guarded, non-playing probe and checked
+controller/codec initialization are the next steps. The full Linux reports
+remain private under `build/hardware/dell-linux-audio-live-20261101/`.
+The Python-free `scripts/dell_linux_audio_snapshot.sh` captured this live
+reference without installing software; its codec and mixer output is bounded,
+and missing optional tools are reported. A bounded host-tested speaker-route
+selector models the captured graph and the distinction between an observed
+selector position and a possible alternative. It is not yet connected to the
+driver, does not inspect mixer enable state, and does not establish playback.
+
+The earlier investigation treated the Broadwell analog path as requiring SST
+DSP, SSP/I²S and the RT286 codec; Brook's existing HDA backend still needs
+changes to establish the subsequently observed HDA speaker path. An
 independent review found no existing DesignWare LPSS I²C driver or AML resource
 and power-method evaluator in Brook. The archived i801 SMBus work is not the
 LPSS I²C controller. First obtain this Dell's ACPI tables read-only and establish
