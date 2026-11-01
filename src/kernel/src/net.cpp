@@ -36,8 +36,10 @@
 #include "profiler.h"
 #ifdef BROOK_SOCKET_LIFETIME_TEST
 #include <cstring>
+#include <new>
 #else
 #include "string.h"
+inline void* operator new(__SIZE_TYPE__,void* storage) noexcept { return storage; }
 #endif
 #include "loopback_queue.h"
 #include "ksym_addrs.h"
@@ -831,6 +833,7 @@ static uint16_t g_tcpEgressCeiling = 1460;
 static bool g_tcpTwoPacketFlight = false;
 static bool g_tcpFourPacketFlight = false;
 static bool g_tcpAdaptiveFlight = false;
+static bool g_tcpAdaptiveFlight16 = false;
 
 void NetConfigureBoot()
 {
@@ -855,6 +858,13 @@ void NetConfigureBoot()
             g_tcpAdaptiveFlight = true;
             KPuts("net: bounded adaptive TCP send flight enabled (experimental)\n");
         } else KPuts("net: conflicting flight markers; fixed mode retained\n");
+    }
+    if (auto* marker = VfsOpen("/etc/tcp-adaptive-flight16")) {
+        VfsClose(marker);
+        if (!g_tcpTwoPacketFlight && !g_tcpFourPacketFlight && !g_tcpAdaptiveFlight) {
+            g_tcpAdaptiveFlight = true;g_tcpAdaptiveFlight16 = true;
+            KPuts("net: bounded adaptive 16-slot TCP send flight enabled (experimental)\n");
+        } else KPuts("net: conflicting flight markers; existing mode retained\n");
     }
     if (auto* marker = VfsOpen("/etc/tcp-recv-window-16k")) {
         VfsClose(marker);g_tcpReceiveWindowCap=16384;
@@ -3109,7 +3119,19 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
         uint32_t seq = 0, len = 0, retries = 0;
         uint64_t retryAt = 0, firstSendAt = 0;
         bool submitted = false, wasRetried = false;
-    } slots[8];
+    } localSlots[8]{};
+    const unsigned capacity=initialLimit>8?16:8;
+    struct FlightAllocation {
+        void* storage=nullptr;
+        ~FlightAllocation() { if (storage) kfree(storage); }
+    } allocation;
+    Slot* slots=localSlots;
+    if (capacity>8) {
+        allocation.storage=kmalloc(sizeof(Slot)*capacity);
+        if (!allocation.storage) return -12;
+        slots=static_cast<Slot*>(allocation.storage);
+        for(unsigned n=0;n<capacity;++n) new (&slots[n]) Slot{};
+    }
     unsigned head = 0, count = 0, limit = initialLimit;
     uint32_t reserved = 0, submitted = 0, acknowledged = 0;
     int deferredError = 0;
@@ -3122,7 +3144,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
     }
     SpinLockAcquire(&s.lock);
     const uint32_t base = s.tcpSndNxt;
-    if (adaptive) s.tcpFlightControl.Init(mss);
+    if (adaptive) s.tcpFlightControl.Init(mss,initialLimit);
     SpinLockRelease(&s.lock);
     SocketWaitRegistration registration(s, self);
 
@@ -3161,7 +3183,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
             return finish(-5); // ACK crossed a reservation rejected locally
         }
         if (delta <= submitted && delta > acknowledged) {
-            if (adaptive) s.tcpFlightControl.Ack(delta-acknowledged, mss);
+            if (adaptive) s.tcpFlightControl.Ack(delta-acknowledged, mss,initialLimit);
             if (g_tcpSendProbe) TcpProbeAdd(g_tcpSendProbeStats.acked,delta-acknowledged);
             acknowledged = delta;
         }
@@ -3174,7 +3196,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
                 TcpProbeAdd(g_tcpSendProbeStats.rttTicks,g_tcpSendProbeAck[probeIndex].tick-slots[head].firstSendAt);
                 TcpProbeAdd(g_tcpSendProbeStats.resumeTicks,now-g_tcpSendProbeAck[probeIndex].tick);
             }
-            head = (head + 1) % 8;
+            head = (head + 1) % capacity;
             --count;
         }
         if (!TcpCanSendData(s.tcpState) || s.tcpRstRecv) {
@@ -3195,7 +3217,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
         // sequence range is allocated. On RTO send only the oldest suffix.
         int unsentIndex = -1;
         for (unsigned n=0;n<count;++n) {
-            const unsigned index = (head+n)%8;
+            const unsigned index = (head+n)%capacity;
             if (!slots[index].submitted) { unsentIndex = static_cast<int>(index); break; }
         }
         int sendIndex = -1;
@@ -3217,7 +3239,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
             const bool retry = slot.submitted;
             if (retry) {
                 if (g_tcpSendProbe) { slot.wasRetried=true;TcpProbeAdd(g_tcpSendProbeStats.retries); }
-                if (adaptive) s.tcpFlightControl.Loss(mss);
+                if (adaptive) s.tcpFlightControl.Loss(mss,initialLimit);
                 else limit = 1;
             } else if (g_tcpSendProbe) slot.firstSendAt=now;
             SpinLockRelease(&s.lock);
@@ -3258,7 +3280,7 @@ static int TcpSendPacketFlight(Socket& s, Process* self, const uint8_t* data,
             if (chunk > mss) chunk = mss;
             if (chunk > credit) chunk = credit;
             SpinLockRelease(&s.lock);
-            Slot& slot = slots[(head + count) % 8];
+            Slot& slot = slots[(head + count) % capacity];
             uint64_t source;
             if (__builtin_add_overflow(reinterpret_cast<uint64_t>(data), static_cast<uint64_t>(reserved), &source)) {
                 if (count) { deferredError = -14; continue; }
@@ -3343,7 +3365,7 @@ static int SockSendImpl(int sockIdx, const void* buf, uint32_t len, bool fromUse
     if (!mss || mss > sizeof(staged)) return -22;
     if ((g_tcpTwoPacketFlight || g_tcpFourPacketFlight || g_tcpAdaptiveFlight) && len)
         return TcpSendPacketFlight(s, self, data, len, fromUser, mss, deadline,
-                                   g_tcpAdaptiveFlight ? 8 : g_tcpFourPacketFlight ? 4 : 2,
+                                   g_tcpAdaptiveFlight ? (g_tcpAdaptiveFlight16?16:8) : g_tcpFourPacketFlight ? 4 : 2,
                                    g_tcpAdaptiveFlight);
 
     // Snapshot the negotiated MSS; never hold the socket lock across network

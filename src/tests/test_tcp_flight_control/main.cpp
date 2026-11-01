@@ -26,5 +26,9 @@ int main() {
     assert(batch.cwnd==before.cwnd && batch.additiveCredit==before.additiveCredit);
     batch.Loss(mss);assert(batch.additiveCredit==0);
     TcpFlightControl fresh{};fresh.Init(mss);assert(fresh.cwnd==2400 && !fresh.recovering);
+    TcpFlightControl wide{};wide.Init(mss,16);assert(wide.cwnd==2*mss && wide.threshold==16*mss);
+    wide.Ack(300000,mss,16);assert(wide.cwnd==16*mss);
+    wide.Loss(mss,16);assert(wide.cwnd==mss && wide.threshold==8*mss);
+    wide.Ack(300000,mss,16);assert(wide.cwnd==16*mss);
     std::puts("tcp flight control: PASS");
 }

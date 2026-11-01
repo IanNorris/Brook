@@ -145,6 +145,17 @@ not precise RTT samples. Ticks use the guest clock. Diagnostics are disabled
 by default and are not intended as a permanent congestion-control algorithm.
 Host tests cover full-flight waits, ACK batching and retransmission exclusion;
 the opt-in QEMU loss and concurrent-send run also validates bridge output.
+
+A separate `/etc/tcp-adaptive-flight16` experiment raises the adaptive cap
+to 16 MSS while retaining the two-MSS initial window. It allocates a bounded
+16-slot flight before reserving sequence space; allocation failure returns
+`ENOMEM`. The ordinary eight-slot path keeps its stack allocation. Conflicting
+markers retain the earlier selected mode. This does not alter call-tail
+draining or implement full TCP congestion control. Host tests cover growth,
+ring reuse, allocation failure, loss and EAGAIN, wrap, invalid ACK, user-copy
+failure, partial ACK, zero window and interruption. The QEMU USB Ethernet
+loss/concurrency test passed and observed a 16-packet flight. That is a
+controlled guest result, not evidence of physical throughput or fairness.
 The release build's eight-slot send function reserves 12,424 stack bytes;
 its caller reserves 1,592, against a 256 KiB kernel stack. These figures are
 individual compiler-generated frames, not a complete worst-case stack bound.

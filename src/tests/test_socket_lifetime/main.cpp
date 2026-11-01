@@ -40,7 +40,7 @@ std::atomic<uint8_t*> mutateUserOnSend{nullptr};
 std::atomic<unsigned> stagedPayloadCount{0};
 std::atomic<uint8_t> stagedPayloads[2]{};
 std::atomic<unsigned> capturedDataCount{0};
-std::atomic<uint32_t> capturedDataSeq[8]{};
+std::atomic<uint32_t> capturedDataSeq[64]{};
 std::atomic<int> deadlineAckSocket{-1};
 std::atomic<uint64_t> deadlineAckTick{0};
 std::atomic<uint32_t> deadlineAckValue{0};
@@ -122,7 +122,7 @@ int SocketLifetimeTestTransmit(uint32_t src, uint32_t dst, uint8_t proto,
     if ((tcp->flags & TCP_PSH) && len>sizeof(TcpHeader)) {
         lastDataSubmitTick=ticks.load();
         const unsigned index=capturedDataCount.fetch_add(1);
-        if(index<8)capturedDataSeq[index]=ntohl(tcp->seqNum);
+        if(index<64)capturedDataSeq[index]=ntohl(tcp->seqNum);
         if(index && ntohl(tcp->seqNum)==10)firstDataRetryTick=ticks.load();
         if(index && observeFlightControlSocket.load()>=0){
             const auto& control=g_sockets[observeFlightControlSocket.load()].tcpFlightControl;
@@ -547,6 +547,30 @@ int main() {
     assert(capturedDataCount==8 && g_sockets[i].tcpFlightControl.cwnd==8*536);
     const int oldSlot=i;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     i=create();assert(i==oldSlot && g_sockets[i].tcpFlightControl.cwnd==0);SockClose(i);
+    // The separate 16-slot mode starts at two MSS, grows across calls, and
+    // reuses the larger ring over several turns without leaking its buffer.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=true;
+    skipDataAcks=1;acknowledgeDataCount=1;capturedDataCount=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(capturedDataCount==2 && g_sockets[i].tcpFlightControl.cwnd==4*536);
+    for(unsigned n=0;n<12;++n){uint8_t data[536]{};acknowledgeDataCount=1;assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(g_sockets[i].tcpFlightControl.cwnd==16*536);
+    const unsigned wideFrees=frees.load();skipDataAcks=15;acknowledgeDataCount=40;capturedDataCount=0;
+    {uint8_t data[48*536]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(capturedDataCount==48 && frees==wideFrees+1);
+    for(unsigned n=1;n<48;++n)assert(capturedDataSeq[n]==capturedDataSeq[n-1]+536);
+    acknowledgeDataCount=0;g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;
+    currentProcess=nullptr;SockClose(i);delete waiter;
+    // Allocation failure precedes any sequence reservation or transmission.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=true;capturedDataCount=0;failAllocation=0;
+    {uint8_t data[536]{};assert(SockSend(i,data,sizeof(data))==-12);}
+    assert(capturedDataCount==0 && g_sockets[i].tcpSndNxt==10 && g_sockets[i].tcpSndUna==10);
+    failAllocation=-1;g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;
+    currentProcess=nullptr;SockClose(i);delete waiter;
     // RTO reduces the flight before a retransmission and clears its recovery
     // episode only after forward ACK progress.
     waiter=new Process{};waiter->refCount=1;
@@ -592,10 +616,11 @@ int main() {
     g_tcpSendProbe=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     // A lost middle packet in an adaptive flight must recover the missing
     // range, preserve later submitted bytes, and reduce the congestion window.
+    for(bool wide : {false,true}) {
     waiter=new Process{};waiter->refCount=1;
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
-    g_tcpAdaptiveFlight=true;g_sockets[i].tcpFlightControl.Init(536);
-    g_sockets[i].tcpFlightControl.Ack(2*536,536);
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=wide;g_sockets[i].tcpFlightControl.Init(536,wide?16:8);
+    g_sockets[i].tcpFlightControl.Ack(2*536,536,wide?16:8);
     fourLossMode=true;fourLossCount=0;capturedDataCount=0;observeFlightControlSocket=i;
     {uint8_t data[2144]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
     assert(fourLossCount==5 && capturedDataSeq[0]==10 && capturedDataSeq[1]==546 &&
@@ -603,19 +628,67 @@ int main() {
     assert(observedRetryCwnd==536 && observedRetryThreshold>=2*536);
     assert(g_sockets[i].tcpSndUna==2154 && g_sockets[i].tcpSndNxt==2154 &&
            !g_sockets[i].tcpFlightControl.recovering);
-    observeFlightControlSocket=-1;fourLossMode=false;g_tcpAdaptiveFlight=false;
+    observeFlightControlSocket=-1;fourLossMode=false;g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;
     currentProcess=nullptr;SockClose(i);delete waiter;
+    }
     // An EAGAIN tail stays unsent after head RTO shrinks cwnd, until forward
     // ACK progress grants credit again.
+    for(bool wide : {false,true}) {
     waiter=new Process{};waiter->refCount=1;
     i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
-    g_tcpAdaptiveFlight=true;capturedDataCount=0;skipDataAcks=2;acknowledgeDataCount=1;
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=wide;capturedDataCount=0;skipDataAcks=2;acknowledgeDataCount=1;
     rejectDataSeq=546;rejectDataRemaining=20;firstDataRetryTick=0;
     deadlineAckTick=251;deadlineAckValue=546;deadlineAckSocket=i;
     {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
     assert(deadlineAckSocket==-1 && capturedDataCount==23 && capturedDataSeq[0]==10 &&
            capturedDataSeq[1]==546 && firstDataRetryTick==201 && lastDataSubmitTick>=251);
-    g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    }
+    // Wide mode preserves wraparound, forged-ACK rejection, partial-copy and
+    // window-reopen behavior through its separately allocated flight buffer.
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=true;g_sockets[i].tcpSndNxt=g_sockets[i].tcpSndUna=0xffffff00u;
+    skipDataAcks=1;acknowledgeDataCount=1;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(g_sockets[i].tcpSndUna==0xffffff00u+1072u);
+    g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=true;failDataSubmissions=1;ackUnsentOnFailure=true;
+    {uint8_t data=0;assert(SockSend(i,&data,1)==-5);}
+    assert(g_sockets[i].tcpState==TcpState::Closed);
+    g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=true;failUserCopyAfter=1;deadlineAckTick=11;deadlineAckSocket=i;
+    {uint8_t data[1072]{};assert(SockSendUser(i,reinterpret_cast<uint64_t>(data),sizeof(data))==536);}
+    assert(g_sockets[i].tcpState==TcpState::Established);failUserCopyAfter=-1;
+    g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=0;
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=true;windowUpdateTick=11;windowUpdateSocket=i;acknowledgeDataCount=1;
+    {uint8_t data=0;assert(SockSend(i,&data,1)==1);}
+    assert(windowUpdateSocket==-1 && g_sockets[i].tcpSndNxt==11);
+    g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=true;flightPartialMode=1;flightPartialCount=0;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==sizeof(data));}
+    assert(flightPartialCount==3 && flightRetrySeq==20 && flightRetryLen==526);
+    flightPartialMode=0;g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=65535;
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=true;signalOnDataSend=true;
+    {uint8_t data[1072]{};assert(SockSend(i,data,sizeof(data))==-4);}
+    assert(g_sockets[i].tcpState==TcpState::Closed);
+    g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
+    waiter=new Process{};waiter->refCount=1;
+    i=create();setupTcp(i);currentProcess=waiter;ticks=1;g_sockets[i].tcpSndWnd=0;
+    g_tcpAdaptiveFlight=true;g_tcpAdaptiveFlight16=true;
+    {uint8_t data=0;assert(SockSend(i,&data,1)==-110);}
+    assert(g_sockets[i].tcpSndNxt==10 && g_sockets[i].tcpState==TcpState::Established);
+    g_tcpAdaptiveFlight16=false;g_tcpAdaptiveFlight=false;currentProcess=nullptr;SockClose(i);delete waiter;
     // Reconnecting an existing socket starts with fresh congestion state.
     i=create();g_sockets[i].tcpFlightControl.Init(536);g_sockets[i].tcpFlightControl.Ack(536,536);
     SockSetNonblock(i,true);

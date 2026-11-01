@@ -10,17 +10,17 @@ struct TcpFlightControl {
     uint64_t additiveCredit = 0;
     bool recovering = false;
 
-    void Init(uint32_t mss) {
-        const uint32_t cap = 8 * mss;
+    void Init(uint32_t mss, uint32_t capacity = 8) {
+        const uint32_t cap = capacity * mss;
         if (!cwnd) { cwnd = 2 * mss; threshold = cap; additiveCredit = 0; recovering = false; }
         if (cwnd > cap) cwnd = cap;
         if (threshold > cap) threshold = cap;
     }
-    void Ack(uint32_t bytes, uint32_t mss) {
-        Init(mss);
+    void Ack(uint32_t bytes, uint32_t mss, uint32_t capacity = 8) {
+        Init(mss, capacity);
         if (!bytes) return;
         recovering = false;
-        const uint32_t cap = 8 * mss;
+        const uint32_t cap = capacity * mss;
         if (cwnd < threshold) {
             uint32_t growth = threshold - cwnd;
             if (growth > bytes) growth = bytes;
@@ -43,8 +43,8 @@ struct TcpFlightControl {
         }
         if (cwnd >= cap) { cwnd = cap; additiveCredit = 0; }
     }
-    void Loss(uint32_t mss) {
-        Init(mss);
+    void Loss(uint32_t mss, uint32_t capacity = 8) {
+        Init(mss, capacity);
         if (recovering) return;
         threshold = cwnd / 2;
         if (threshold < 2 * mss) threshold = 2 * mss;
