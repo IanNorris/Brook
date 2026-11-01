@@ -5,7 +5,7 @@ Run inside nix-shell after building the kernel. Only disposable images are
 opened; no physical USB, host desktop or audio is used. The workload only contacts localhost services;
 the guest may also perform its ordinary boot-time DNS probe.
 """
-import argparse,hashlib,json,os,shutil,socket,struct,subprocess,threading,time
+import argparse,hashlib,json,os,shutil,socket,struct,subprocess,tempfile,threading,time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--output',required=True,type=Path)
@@ -16,6 +16,7 @@ ap.add_argument('--tcp-flight2',action='store_true',help='Exercise and capture t
 ap.add_argument('--tcp-flight4',action='store_true',help='Exercise and capture the experimental four-packet TCP send flight')
 ap.add_argument('--tcp-adaptive-flight',action='store_true',help='Exercise the bounded adaptive TCP send flight')
 ap.add_argument('--network-delay-us',type=int,default=0,help='Optional QEMU filter-buffer interval in microseconds (maximum 50000)')
+ap.add_argument('--drop-tcp-packet',action='store_true',help='Drop one guest TCP payload through a private QEMU packet relay')
 ap.add_argument('--send-concurrency',action='store_true',help='Also verify two guest writers share a TCP stream without interleaving')
 ap.add_argument('--send-close-race',action='store_true',help='Also close a shared descriptor while two guest writes are active')
 ap.add_argument('--send-user-copy',action='store_true',help='Also exercise send, writev and multi-iovec sendmsg')
@@ -99,6 +100,48 @@ qemu=['qemu-system-x86_64','-machine','q35','-accel','kvm','-cpu','host','-smp',
 # Place the capture on the guest side of the delay: backend-to-guest packets
 # must be recorded after the buffer releases them, not when the backend emits.
 if args.network_delay_us:qemu+=['-object',f'filter-buffer,id=delay,netdev=network,queue=tx,interval={args.network_delay_us}']
+loss=None;loss_sockets=None;loss_thread=None;loss_stop=threading.Event();loss_connections=[]
+if args.drop_tcp_packet:
+ # RX filter traversal is reversed: reinjection must pass the output filter
+ # without being redirected a second time. These sockets are private to QEMU.
+ loss_sockets=tempfile.TemporaryDirectory(prefix='brook-qemu-loss-')
+ loss={'seen':0,'dropped':0,'packet':None,'retransmitted':False,'errors':[]}
+ loss_out=Path(loss_sockets.name)/'out';loss_in=Path(loss_sockets.name)/'in'
+ qemu+=['-chardev',f'socket,id=lossout,path={loss_out},server=on,wait=off',
+        '-chardev',f'socket,id=lossin,path={loss_in},server=on,wait=off',
+        '-object','filter-redirector,id=lossin,netdev=network,queue=rx,indev=lossin',
+        '-object','filter-redirector,id=lossout,netdev=network,queue=rx,outdev=lossout']
+ def relay_loss():
+  try:
+   with socket.socket(socket.AF_UNIX) as incoming,socket.socket(socket.AF_UNIX) as outgoing:
+    loss_connections.extend((incoming,outgoing))
+    for sock,path in ((incoming,loss_out),(outgoing,loss_in)):
+     deadline=time.monotonic()+15
+     while True:
+      try:sock.connect(str(path));break
+      except (FileNotFoundError,ConnectionRefusedError):
+       if time.monotonic()>deadline:raise
+       time.sleep(.01)
+    incoming.settimeout(120);outgoing.settimeout(120)
+    while True:
+     header=exact(incoming,4);size=struct.unpack('!I',header)[0]
+     if not 14<=size<=65536:raise RuntimeError(f'Invalid packet length {size}')
+     packet=exact(incoming,size);drop=False
+     if packet[12:14]==b'\x08\x00' and len(packet)>=54 and packet[23]==6:
+      ihl=(packet[14]&15)*4;ip_total=struct.unpack_from('!H',packet,16)[0];offset=14+ihl
+      fragment=struct.unpack_from('!H',packet,20)[0]
+      if (packet[14]>>4)==4 and ihl>=20 and len(packet)>=offset+20 and not(fragment&0x3fff) and 14+ip_total<=len(packet) and struct.unpack_from('!H',packet,offset+2)[0]==port:
+       tcp_len=(packet[offset+12]>>4)*4;payload=ip_total-ihl-tcp_len
+       seq=struct.unpack_from('!I',packet,offset+4)[0]
+       if tcp_len>=20 and payload>=500 and packet[26:30]==bytes([10,0,2,15]):
+        flow=packet[26:34].hex()+packet[offset:offset+4].hex()
+        item={'flow':flow,'sequence':seq,'bytes':payload,'sha256':hashlib.sha256(packet[offset+tcp_len:14+ip_total]).hexdigest()}
+        loss['seen']+=1
+        if loss['packet']==item:loss['retransmitted']=True
+        if loss['seen']==2:loss['dropped']+=1;loss['packet']=item;drop=True
+     if not drop:outgoing.sendall(header+packet)
+  except BaseException as error:
+   if not loss_stop.is_set():loss['errors'].append(repr(error))
 qemu+=['-object','filter-dump,id=wire,netdev=network,file='+str(base/'wire.pcap')]
 # Explicit forwards reach private local echo services. slirp must allow UDP
 # replies to its host alias, which restrict=on blocks even for host forwarding.
@@ -113,6 +156,8 @@ class Qmp:
    if 'return' in answer:return answer['return']
    if 'error' in answer:raise RuntimeError(answer)
 log=(base/'qemu.log').open('x');owner=subprocess.Popen(qemu,stdout=log,stderr=subprocess.STDOUT);q=None
+if loss:
+ loss_thread=threading.Thread(target=relay_loss,daemon=True);loss_thread.start()
 try:
  deadline=time.monotonic()+120
  while time.monotonic()<deadline:
@@ -156,6 +201,8 @@ try:
   assert stats['rx_completed']>0 and stats['tx_completed']>0 and not stats['failed'],stats
   assert 0<=stats['rx_queued']<=stats['rx_queue_high_water']<=32,stats
   (base/'network-snapshot.json').write_text(json.dumps(stats,indent=2)+'\n')
+ if loss:
+  assert not loss['errors'] and loss['dropped']==1 and loss['retransmitted'],loss
  q.call('device_del',{'id':'usbnet'})
  q.call('human-monitor-command',{'command-line':'sendkey a 100'})
  deadline=time.monotonic()+10
@@ -164,7 +211,12 @@ try:
   if 'ECM_USB_STILL_ALIVE' in serial and 'HWKEY: down sc=0x1e' in serial:break
   time.sleep(.05)
  else:raise TimeoutError('USB/HID did not remain responsive after NIC removal')
+ loss_stop.set()
  q.call('quit');assert owner.wait(timeout=15)==0
+ if loss_thread:
+  loss_thread.join(5);assert not loss_thread.is_alive(),'Packet relay did not stop'
+  assert not loss['errors'],loss
+  (base/'loss-result.json').write_text(json.dumps(loss,indent=2)+'\n')
  for thread in threads:thread.join(2)
  assert not errors and set(completed)=={'tcp','udp'},(errors,completed)
  sizes=[];windows=[];scales={};pending={};max_flight=0;raw=(base/'wire.pcap').read_bytes();at=24
@@ -216,12 +268,18 @@ try:
    pair=scales.get(flow,{});shift=pair.get('guest') if pair.get('guest') is not None and pair.get('peer') is not None else 0
    assert (window if flags&2 else window<<shift)<=16384,(flow,flags,window,shift)
  result=dict(passed=True,rx_depth=8 if args.rx_depth8 else 1,tx_depth=16 if args.tx_depth16 else 8,tcp_window_cap=16384 if args.tcp_window16 else 0,tcp_flight2=args.tcp_flight2,tcp_flight4=args.tcp_flight4,tcp_adaptive_flight=args.tcp_adaptive_flight,network_delay_us=args.network_delay_us,max_flight_observed=max_flight,tcp_verified_bytes=262144,udp_verified_bytes=982,zero_length_termination_frames=[64,1024],
-  idle_rx_seconds=1.5,bridge_framed_reply=True,usb_storage_concurrent=True,usb_storage_after_nic_removal=True,usb_keyboard_after_nic_removal=True)
+  dropped_tcp_packet=bool(args.drop_tcp_packet),idle_rx_seconds=1.5,bridge_framed_reply=True,usb_storage_concurrent=True,usb_storage_after_nic_removal=True,usb_keyboard_after_nic_removal=True)
  (base/'result.json').write_text(json.dumps(result,indent=2)+'\n');print('USB_ECM_ACCEPTANCE_PASS',flush=True)
 finally:
+ loss_stop.set()
  if owner.poll() is None:
   try:
    if q:q.call('quit');owner.wait(timeout=10)
    else:owner.terminate();owner.wait(timeout=10)
   except BaseException:owner.kill();owner.wait(timeout=10)
+ for connection in loss_connections:
+  try:connection.shutdown(socket.SHUT_RDWR)
+  except OSError:pass
+ if loss_thread:loss_thread.join(5)
  tcp.close();udp.close();log.close()
+ if loss_sockets:loss_sockets.cleanup()

@@ -123,6 +123,13 @@ completion of the retained later bytes, and observes the reduced window. The
 USB Ethernet QEMU acceptance passed with a delayed
 packet queue and observed eight contiguous packets before their covering ACK;
 this does not establish behavior under arbitrary real-network congestion.
+An optional private QEMU packet relay also drops one guest-to-host TCP payload
+and confirms that a subsequent packet has the same flow, sequence, length and
+payload hash. The delayed-ACK USB Ethernet run passed this loss check along
+with the 256 KiB echo, concurrent-send, close-stress and user-copy checks. Its
+packet capture records the guest's transmission attempt, not proof that the
+dropped packet reached the backend; the echo proves the test stream survived.
+This single controlled drop does not measure general loss handling or fairness.
 The release build's eight-slot send function reserves 12,424 stack bytes;
 its caller reserves 1,592, against a 256 KiB kernel stack. These figures are
 individual compiler-generated frames, not a complete worst-case stack bound.
