@@ -354,4 +354,17 @@ fixed before network initialization and may reduce performance over paths with
 higher RTT. Host TCP tests and QEMU USB networking passed with and without the
 cap; the QEMU packet capture checked the effective negotiated window after
 scaling. They did not establish non-shrinking-window correctness or exercise a
-full zero-window/reopen scenario. Physical testing is still outstanding.
+full zero-window/reopen scenario.
+
+The capped candidate was then activated in slot A as generation 15, leaving
+the verified recovery image in slot B. The Dell reported the expected payload,
+RX depth eight and the 16,384-byte cap. Three unpaced 4 MiB uploads took
+0.280, 0.282 and 0.277 s; paced runs took 0.345, 0.346 and 0.348 s. Every
+transfer passed its digest check, and the observed USB queue-full and covered
+ACK-failure counters remained zero. One 4 MiB download took 3.63 s. These
+are local RAM-transfer binary-phase times: the unpaced improvement over the
+earlier TX16 run is strong evidence of burst sensitivity on this path, not a
+general browser or high-RTT speed claim. Host retransmission sampling and
+alternating the same build across boots remain outstanding. After the pause,
+the Dell was no longer reachable at its prior address, so this boot has not
+yet been reverified or cleanly shut down.
