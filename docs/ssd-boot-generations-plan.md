@@ -151,12 +151,16 @@ USB presence alone therefore did not prevent the failure. Firmware's failure
 to list the stick is evidence of an earlier USB problem, but does not by itself
 prove when HCRST was asserted or whether that is the sole firmware issue.
 
-The next non-writing control is to inspect the current Dell F2 USB and Fastboot
-settings, retain UEFI and the current disk settings, and try Thorough Fastboot
-if that option is present. Dell's [USB boot guidance for newer systems](https://www.dell.com/support/kbdoc/en-us/000131221/how-to-boot-to-an-external-device-using-usb-type-c-connection)
+The user checked the Dell's settings: BIOS version A15, Fastboot already set to
+Thorough, USB boot support enabled, and legacy boot disabled. No setting was
+changed. These observations rule out disabled USB boot and a non-Thorough
+Fastboot setting as explanations for the failed F12 observation; UEFI remains
+the intended boot mode. Dell's [USB boot guidance for newer systems](https://www.dell.com/support/kbdoc/en-us/000131221/how-to-boot-to-an-external-device-using-usb-type-c-connection)
 recommends Thorough; it is not proof of the 9343's exact settings or of a fix.
 The [9343 service manual](https://downloads.dell.com/manuals/all-products/esuprt_laptop/esuprt_xps_laptop/xps-13-9343-laptop_service%20manual_en-us.pdf)
-does not enumerate Fastboot settings. If firmware can enumerate the recovery
-stick, compare USB and SSD firmware boot paths with matched payloads. Do not
+does not enumerate Fastboot settings. The next control is a clean shutdown and
+F12 check with the recovery stick connected and the Ethernet adapter removed;
+its result is pending. If firmware can enumerate the recovery stick, compare
+USB and SSD firmware boot paths with matched payloads. Do not
 replace the accepted EFI loader or force a controller reset to obtain this
 comparison.
