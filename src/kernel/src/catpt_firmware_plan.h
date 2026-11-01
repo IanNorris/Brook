@@ -5,12 +5,20 @@ namespace brook {
 // Offline WPT firmware inventory only: no physical addresses, MMIO, firmware
 // execution or claim that INSTANCE blocks share DRAM loading semantics.
 // Deliberately caps the plan at 256 blocks, unlike the Python inventory. The
-// local plan uses about 4 KiB of stack; check stack budget before kernel use.
+// local plan uses about 4.4 KiB of stack; check stack budget before kernel use.
 enum class CatptRegion : uint8_t { Iram=1, Dram=2, Instance=3 };
 struct CatptBlockPlan { uint32_t source, size, offset; CatptRegion region; };
+// Raw metadata only: entry-point adjustment and state/restore semantics are
+// device-loader responsibilities and are not validated by this inventory.
+struct CatptModulePlan {
+    uint32_t firstBlock,blocks,entry,persistent,scratch;
+    uint16_t slot,id;
+};
 struct CatptFirmwarePlan {
     static constexpr uint32_t MaxBlocks=256;
+    static constexpr uint32_t MaxModules=16;
     uint32_t imageBytes=0,modules=0,blocks=0;
+    CatptModulePlan module[MaxModules]{};
     CatptBlockPlan block[MaxBlocks]{};
 };
 inline uint16_t CatptGet16(const uint8_t* p) { return uint16_t(p[0]) | uint16_t(p[1])<<8; }
@@ -24,7 +32,7 @@ inline bool CatptBuildPlan(const uint8_t* image,uint32_t bytes,CatptFirmwarePlan
     if(!image || bytes<Header || bytes>MaxImage || !CatptSignature(image) ||
        CatptGet32(image+4)!=bytes-Header || CatptGet32(image+12)!=254)return false;
     const uint32_t count=CatptGet32(image+8);
-    if(!count || count>256 || count>(bytes-Header)/Module)return false;
+    if(!count || count>CatptFirmwarePlan::MaxModules || count>(bytes-Header)/Module)return false;
     CatptFirmwarePlan plan{};plan.imageBytes=bytes;plan.modules=count;
     uint32_t at=Header;uint32_t seen=0;
     for(uint32_t m=0;m<count;++m) {
@@ -32,6 +40,8 @@ inline bool CatptBuildPlan(const uint8_t* image,uint32_t bytes,CatptFirmwarePlan
         const uint32_t size=CatptGet32(image+at+4),blocks=CatptGet32(image+at+8);
         const uint32_t id=CatptGet16(image+at+14);
         if(id>15 || (seen&(1u<<id)))return false;
+        plan.module[m]={plan.blocks,blocks,CatptGet32(image+at+16),CatptGet32(image+at+20),
+                        CatptGet32(image+at+24),CatptGet16(image+at+12),static_cast<uint16_t>(id)};
         seen|=1u<<id;at+=Module;
         if(size>bytes-at || blocks>size/Block)return false;
         const uint32_t end=at+size;

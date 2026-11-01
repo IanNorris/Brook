@@ -11,11 +11,20 @@ def fixture(blocks):
     module=struct.pack('<4sIIHHIII',b'$SST',len(body),len(blocks),0,0,0,0,0)+body
     return struct.pack('<4s7I',b'$SST',len(module),1,254,0,0,0,0)+module
 
+def multi_fixture():
+    def module(mid,slot,entry,persistent,scratch,blocks):
+        body=b''.join(struct.pack('<4I',kind,len(data),offset,0)+data for kind,offset,data in blocks)
+        return struct.pack('<4sIIHHIII',b'$SST',len(body),len(blocks),slot,mid,entry,persistent,scratch)+body
+    contents=(module(3,7,0x1234,0x70,0x40,[(1,0,b'abcd')])+
+              module(4,8,0x2345,0x80,0x50,[])+
+              module(5,9,0x3456,0x90,0x60,[(2,8,b'efgh')]))
+    return struct.pack('<4s7I',b'$SST',len(contents),3,254,0,0,0,0)+contents
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--runner',type=Path,required=True);p.add_argument('--firmware',type=Path)
     a=p.parse_args();runner=a.runner.resolve(strict=True)
     samples=[fixture([(1,0,b'abcd')]),fixture([(1,0x4fffc,b'abcd'),(2,0x9fffc,b'efgh')]),
-             fixture([(2,0,b'abcd'),(3,4,b'efgh')]),fixture([]),
+             fixture([(2,0,b'abcd'),(3,4,b'efgh')]),fixture([]),multi_fixture(),
              fixture([(2,i,b'x') for i in range(256)])]
     if a.firmware:samples.append(a.firmware.read_bytes())
     bad=[];base=samples[0]
@@ -51,10 +60,16 @@ def main():
             assert (r.returncode==0)==(info is not None),(len(data),r.stdout,r.stderr)
             if info:
                 accepted+=1
-                expected=[(dict(iram=1,dram=2,instance=3)[b['type']],b['payload_offset'],b['size'],b['ram_offset']) for m in info['modules'] for b in m['blocks']]
-                observed=[tuple(map(int,line.split())) for line in r.stdout.splitlines()]
-                assert observed==expected,(observed,expected)
-                assert f"modules={info['module_count']} blocks={len(expected)}" in r.stderr
+                blocks=[(dict(iram=1,dram=2,instance=3)[b['type']],b['payload_offset'],b['size'],b['ram_offset']) for m in info['modules'] for b in m['blocks']]
+                modules=[];first=0
+                for m in info['modules']:
+                    modules.append((m['id'],m['slot'],m['entry'],m['persistent'],m['scratch'],first,len(m['blocks'])));first+=len(m['blocks'])
+                observedModules=[];observedBlocks=[]
+                for line in r.stdout.splitlines():
+                    tag,*values=line.split();assert tag in ('M','B')
+                    (observedModules if tag=='M' else observedBlocks).append(tuple(map(int,values)))
+                assert observedModules==modules and observedBlocks==blocks,(observedModules,modules,observedBlocks,blocks)
+                assert f"modules={info['module_count']} blocks={len(blocks)}" in r.stderr
             else:
                 rejected+=1
                 assert r.returncode==1 and r.stdout.strip()=='invalid'

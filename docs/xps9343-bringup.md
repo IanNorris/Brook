@@ -2363,7 +2363,7 @@ A freestanding C++ planner now validates the same WPT image layout and returns
 bounded source offsets, lengths, RAM offsets and explicit IRAM/DRAM/INSTANCE
 classifications. It builds the entire plan before publishing it and never
 accesses hardware or runs copy callbacks. It deliberately rejects more than
-256 blocks and uses about 4 KiB of local stack; neither constraint is part of
+256 blocks and uses about 4.4 KiB of local stack; neither constraint is part of
 the Python inventory, and kernel integration must account for the stack budget.
 The image must stay immutable while the plan is used. Differential host tests
 matched the local eight-module, 15-block firmware against the Python inventory,
@@ -2371,6 +2371,10 @@ plus boundary, corruption and deterministic mutation fixtures. A mock memory
 copy checks payload bytes and untouched gaps; treating INSTANCE as DRAM there
 is only a test model, not validated hardware loading behavior. The firmware is
 not packaged and no DSP execution or codec initialization is implemented.
+The planner also preserves per-module IDs, block spans and raw entry, persistent
+and scratch fields. Linux's CATPT loader records INSTANCE state per module and
+handles state restoration differently from initial loading, so preserving that
+association is necessary for future work; the raw metadata remains unvalidated.
 
 ### Firefox HTTPS follow-up and lost hardware connection (2026-10-31)
 

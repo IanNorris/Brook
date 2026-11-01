@@ -25,11 +25,15 @@ int main(int argc,char** argv) {
     // Mock copies are performed only after the whole plan was validated.
     std::vector<uint8_t> iram(0x50000,0xa5),dram(0xa0000,0xa5);
     std::vector<bool> iramTouched(iram.size()),dramTouched(dram.size());
+    for(uint32_t i=0;i<p.modules;++i) {
+        const auto& m=p.module[i];
+        std::printf("M %u %u %u %u %u %u %u\n",m.id,m.slot,m.entry,m.persistent,m.scratch,m.firstBlock,m.blocks);
+    }
     for(uint32_t i=0;i<p.blocks;++i) {
         const auto& b=p.block[i];auto& target=b.region==brook::CatptRegion::Iram?iram:dram;
         auto& touched=b.region==brook::CatptRegion::Iram?iramTouched:dramTouched;
         for(uint32_t j=0;j<b.size;++j){target[b.offset+j]=data[b.source+j];touched[b.offset+j]=true;}
-        std::printf("%u %u %u %u\n",unsigned(b.region),b.source,b.size,b.offset);
+        std::printf("B %u %u %u %u\n",unsigned(b.region),b.source,b.size,b.offset);
     }
     for(uint32_t i=0;i<p.blocks;++i) {
         const auto& b=p.block[i];const auto& target=b.region==brook::CatptRegion::Iram?iram:dram;
