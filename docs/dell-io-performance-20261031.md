@@ -51,3 +51,13 @@ and 0.086 s with independent zlib chunks; both SHA-256 digests matched. The
 host-to-Dell upload took 3.646 s. The compression comparison is a single
 best-case diagnostic-data sample, not a browser network improvement or a
 claim about throughput for already-compressed data.
+
+On the same date, a Dell curl request for the 19,559-byte local panic-scanner
+page completed over HTTPS in 0.059 s (including 0.054 s TLS setup). A single
+256 KiB HTTPS download from Cloudflare's speed-test endpoint completed on the
+Dell in 0.215 s, approximately 9.8 Mbps including connection time; a separate
+host request took 0.399 s. The host and Dell may reach different servers or
+use different network paths. These short samples do not measure peak or
+sustained bandwidth, but show that the Google browser-test result is not a
+universal limit on every download. An attempted request to a temporary host
+port timed out before connection, so it yielded no LAN throughput measurement.
