@@ -2,8 +2,10 @@
 """State/receipt regression tests; no network, VM or physical device."""
 import json,sys,tempfile,unittest
 from pathlib import Path
+from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 from hardware_update_workflow import UpdateRun
+from hardware_update_protocol import upload
 
 class Clock:
     def __init__(self):self.now=0
@@ -65,6 +67,43 @@ class Tests(unittest.TestCase):
             'original',self.key,self.kernel,self.initrd,True,helper='system')
         self.assertEqual(result['helper'],'system')
         self.assertEqual([x for x in self.bridge.calls if x[0]=='run'][0][3][0],'/boot/HWUPSYS.ELF')
+    def test_invalid_pacing_prevents_launch(self):
+        for rate in (0,-1,True,1<<31):
+            with self.subTest(rate=rate),self.assertRaises(ValueError):
+                UpdateRun(self.bridge,self.output,self.uploader,self.clock.time,self.clock.sleep).execute(
+                    'original',self.key,self.kernel,self.initrd,pace_bytes_per_second=rate)
+        self.assertEqual(self.bridge.calls,[])
+    @patch('hardware_bulk_protocol.sys.platform','linux')
+    @patch('hardware_bulk_protocol.platform.machine',return_value='x86_64')
+    def test_paced_update_passes_cap_and_records_it(self,_machine):
+        def paced(*args,**kwargs):
+            self.assertEqual(kwargs,{'pace_bytes_per_second':16000000})
+            return self.uploader(*args)
+        result=UpdateRun(self.bridge,self.output,paced,self.clock.time,self.clock.sleep).execute(
+            'original',self.key,self.kernel,self.initrd,True,helper='system',pace_bytes_per_second=16000000)
+        self.assertEqual(result['pace_bytes_per_second'],16000000)
+    @patch('hardware_bulk_protocol.sys.platform','linux')
+    @patch('hardware_bulk_protocol.platform.machine',return_value='x86_64')
+    def test_paced_staging_never_activates_or_restarts(self,_machine):
+        def paced(*args,**kwargs):
+            self.assertEqual(kwargs,{'pace_bytes_per_second':16000000})
+            return self.uploader(*args)
+        result=UpdateRun(self.bridge,self.output,paced,self.clock.time,self.clock.sleep).execute(
+            'original',self.key,self.kernel,self.initrd,helper='system',pace_bytes_per_second=16000000)
+        self.assertEqual(result['state'],'staged_only');self.assertFalse(result['storage_modified'])
+        self.assertFalse(self.bridge.activated)
+        self.assertFalse(any(call[0]=='power' for call in self.bridge.calls))
+    @patch('hardware_bulk_protocol.sys.platform','linux')
+    @patch('hardware_bulk_protocol.platform.machine',return_value='x86_64')
+    def test_socket_pacing_failure_precedes_authentication(self,_machine):
+        class Conn:
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def setsockopt(self,*args):raise OSError('injected pacing failure')
+        with patch('hardware_update_protocol.socket.create_connection',return_value=Conn()), \
+             patch('hardware_update_protocol.authenticate') as auth,self.assertRaises(OSError):
+            upload('127.0.0.1',1235,'1'*32,'a'*32,'b'*32,bytes(64),bytes(512),pace_bytes_per_second=16000000)
+        auth.assert_not_called()
     def test_staged_only_does_not_restart(self):
         self.assertEqual(self.execute(False)['state'],'staged_only')
         self.assertFalse(self.receipt()['storage_modified'])

@@ -8,6 +8,7 @@ boot epoch and the expected payload ID from a new boot-pinned guest job.
 import hashlib,json,os,re,time,uuid
 from pathlib import Path
 from hardware_update_protocol import upload,read_payload,KERNEL_MAX,INITRD_MAX
+from hardware_bulk_protocol import validate_pacing
 
 class UpdateRun:
     def __init__(self,bridge,output,uploader=upload,clock=time.monotonic,sleep=time.sleep):
@@ -33,9 +34,10 @@ class UpdateRun:
             self.sleep(.1)
         raise TimeoutError('Inspect original guest job '+ident)
 
-    def execute(self,session,key_file,kernel_path,initrd_path,activate=False,restart=False,expected_payload_id=None,port=1235,boot_timeout_s=120,helper='usb'):
+    def execute(self,session,key_file,kernel_path,initrd_path,activate=False,restart=False,expected_payload_id=None,port=1235,boot_timeout_s=120,helper='usb',pace_bytes_per_second=None):
         helpers={'usb':'/boot/HWUPDATE.ELF','system':'/boot/HWUPSYS.ELF'}
         if helper not in helpers:raise ValueError('Expected usb or system update helper')
+        validate_pacing(pace_bytes_per_second)
         if isinstance(boot_timeout_s,bool) or not isinstance(boot_timeout_s,int) or not 1<=boot_timeout_s<=900:raise ValueError('Boot observation timeout must be 1..900 seconds')
         if restart and (not activate or not expected_payload_id):raise ValueError('Restart requires activation and an expected payload ID')
         if expected_payload_id and (not re.fullmatch(r'[a-zA-Z0-9_.-]{1,95}',expected_payload_id)):raise ValueError('Invalid expected payload ID')
@@ -52,7 +54,7 @@ class UpdateRun:
         self.output.mkdir(parents=True,exist_ok=False,mode=0o700)
         tx=uuid.uuid4().hex;power_id=uuid.uuid4().hex
         self.save(state='prepared',session=session,guest_boot_id=boot,transaction_id=tx,power_request_id=power_id,
-            activate_requested=activate,restart_requested=restart,expected_payload_id=expected_payload_id,boot_timeout_s=boot_timeout_s,helper=helper,
+            activate_requested=activate,restart_requested=restart,expected_payload_id=expected_payload_id,boot_timeout_s=boot_timeout_s,helper=helper,pace_bytes_per_second=pace_bytes_per_second,
             kernel={'path':str(Path(kernel_path).resolve()),'bytes':len(kernel),'sha256':hashlib.sha256(kernel).hexdigest()},
             initrd={'path':str(Path(initrd_path).resolve()),'bytes':len(initrd),'sha256':hashlib.sha256(initrd).hexdigest()})
         try:
@@ -60,8 +62,10 @@ class UpdateRun:
             self.bridge.guest_run(session,tx,[helpers[helper],boot,tx],cwd='/tmp',uid=0,wait_s=2)
             listening=self.wait_job(session,tx,lambda r:'HWUPDATE_LISTENING' in r.get('stdout',{}).get('text',''))
             self.save(state='receiver_listening',job=listening)
-            result=self.uploader(data['host'],port,key,boot,tx,kernel,initrd,activate)
-            self.save(state='upload_reply',upload=result)
+            upload_start=self.clock()
+            if pace_bytes_per_second is None:result=self.uploader(data['host'],port,key,boot,tx,kernel,initrd,activate)
+            else:result=self.uploader(data['host'],port,key,boot,tx,kernel,initrd,activate,pace_bytes_per_second=pace_bytes_per_second)
+            self.save(state='upload_reply',upload=result,upload_phase_s=self.clock()-upload_start)
             job=self.wait_job(session,tx,lambda r:r.get('state')=='completed')
             self.save(job=job)
             if not activate:

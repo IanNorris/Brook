@@ -1,6 +1,7 @@
 """Host side of the opt-in RAM maintenance upload protocol; no implicit retries."""
 import hashlib, json, socket, struct, zlib
 from pathlib import Path
+from hardware_bulk_protocol import apply_pacing,validate_pacing
 KERNEL_MAX=8*1024*1024
 INITRD_MAX=64*1024*1024
 
@@ -35,8 +36,10 @@ def authenticate(connection,key,boot_id,transaction_id):
     if plan.get('state')!='ready':raise RuntimeError(plan)
     return plan
 
-def upload(host,port,key,boot_id,transaction_id,kernel,initrd,activate=False):
+def upload(host,port,key,boot_id,transaction_id,kernel,initrd,activate=False,*,pace_bytes_per_second=None):
+    validate_pacing(pace_bytes_per_second)
     with socket.create_connection((host,port),timeout=30) as connection:
+        apply_pacing(connection,pace_bytes_per_second)
         connection.settimeout(180)
         plan=authenticate(connection,key,boot_id,transaction_id)
         connection.sendall(record(plan['generation'],plan['slot'],kernel,initrd))

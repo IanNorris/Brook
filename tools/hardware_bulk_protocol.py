@@ -16,6 +16,11 @@ def validate_pacing(rate):
     if rate is not None and not hasattr(socket,'SO_MAX_PACING_RATE') and platform.machine() not in ('x86_64','amd64'):
         raise OSError('SO_MAX_PACING_RATE is not known for this Linux architecture')
 
+def apply_pacing(connection,rate):
+    validate_pacing(rate)
+    if rate is not None:
+        connection.setsockopt(socket.SOL_SOCKET,getattr(socket,'SO_MAX_PACING_RATE',47),rate)
+
 def identifier(value):
     if not isinstance(value,str) or len(value)!=32 or any(c not in '0123456789abcdef' for c in value):
         raise ValueError('Expected 32 lowercase hex characters')
@@ -50,7 +55,7 @@ def upload(host,port,key,boot,transaction,path,finalize=True,*,max_bytes=LIMIT,t
             if pace_bytes_per_second is not None:
                 # Linux SO_MAX_PACING_RATE is bytes/second. Never silently
                 # ignore an unsupported option: this is a controlled test knob.
-                connection.setsockopt(socket.SOL_SOCKET,getattr(socket,'SO_MAX_PACING_RATE',47),pace_bytes_per_second)
+                apply_pacing(connection,pace_bytes_per_second)
             connection.settimeout(timeout);authenticate(connection,key,boot,transaction)
             connection.sendall(struct.pack('<Q',before.st_size)+digest)
             sent=0

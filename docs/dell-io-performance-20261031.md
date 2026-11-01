@@ -111,6 +111,15 @@ two-slot selector chooses the newest hash-valid generation; it does not
 automatically roll back a kernel that hangs, so recovery availability must be
 established before activation.
 
+The update workflow also supports the same opt-in Linux pacing cap, with an
+explicit USB or system helper target; activation and restart remain separate
+options. On the Dell, the 3.96 MB kernel and 32 MiB initrd passed a paced
+staging-only transfer in 3.13 seconds for connection, authentication,
+transfer and verification together. The guest reported no storage change
+(`dell-ecm-rx8-paced-staging-20261101/receipt.json`). No boot selection was
+changed. Workflow tests cover invalid pacing, error handling, and the fact
+that paced staging alone cannot activate or restart.
+
 While that physical comparison was pending, the five existing Dell audio
 prerequisite host tests were rebuilt and passed in the pinned Nix shell:
 firmware snapshot, I2C identity policy and probe, codec ID transaction, and
